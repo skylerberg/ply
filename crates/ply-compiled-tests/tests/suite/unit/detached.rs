@@ -8,7 +8,7 @@ use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEAD, INSTANCE_VARS};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
 use ply_compiled::frames::{PlyFrame, held_across};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
-use ply_compiled::native::{Answered, I64};
+use ply_compiled::native::{I64, Returned};
 use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_perform};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ thread_local! {
     /// Whether each clause ran on a stack whose chain was null.
     static CLAUSES_UNRECORDED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     /// What each continuation a clause was handed says of itself: whether its descriptor has no
-    /// typed entry, and whether sharing and keeping it answer 0.
+    /// typed entry, and whether sharing and keeping it return 0.
     static TOKENS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
     /// The clause's record in the running `handle`'s instance.
     static STOP: Cell<*const Word> = const { Cell::new(std::ptr::null()) };
@@ -99,7 +99,7 @@ static FLIP_OP: PlyOp = PlyOp {
 };
 
 /// The body: its own box held across a runtime frame holding a value of every kind, across a
-/// compiled frame holding a box, across `amb.flip()`. Answers 1 for `true` and 2 for `false`.
+/// compiled frame holding a box, across `amb.flip()`. Returns 1 for `true` and 2 for `false`.
 unsafe extern "C" fn body(ctx: *mut Ctx, _block: Word, _args: *const Word) -> Word {
     unsafe { holding_a_box(ctx, HELD[0], || through_a_runtime_frame(ctx)) }
 }
@@ -187,7 +187,7 @@ unsafe extern "C" fn never(ctx: *mut Ctx, _block: Word, args: *const Word) -> Wo
     imm(42)
 }
 
-/// `amb.flip() resume k -> Parked(k)`, the continuation the handle's answer.
+/// `amb.flip() resume k -> Parked(k)`, the continuation the handle's result.
 unsafe extern "C" fn parks(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
     unsafe {
         clause_ran(ctx, *args);
@@ -279,17 +279,17 @@ unsafe fn handled(ctx: *mut Ctx, clause: &'static PlyFnDesc) -> Word {
     let body = closure(ctx, &BODY);
     let (instance, record) = instance(ctx, closure(ctx, clause));
     STOP.set(record);
-    let answer =
+    let result =
         unsafe { rt_detached_open(ctx, Block::of(body), Block::of(0), Block::of(instance)) };
     unsafe { Block::of(instance).let_go_function(ctx) };
-    unsafe { std::mem::transmute::<Handed, Word>(answer) }
+    unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
 
 fn failure(ctx: *mut Ctx) -> String {
     unsafe { (*ctx).take_failure() }.map_or_else(String::new, |d| d.message)
 }
 
-/// What the continuation a clause is handed says of itself: a block with no typed entry, crossing
+/// What the continuation a clause is handed says of itself: a block with no typed entry, marshalled
 /// nowhere.
 const TOKEN: (bool, bool) = (true, true);
 
@@ -301,9 +301,9 @@ fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
     let ctx = &raw mut owned;
     unsafe {
         (*ctx).begin();
-        let answer = handled(ctx, &ONCE);
+        let result = handled(ctx, &ONCE);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-        assert_eq!(imm_value(answer), 10);
+        assert_eq!(imm_value(result), 10);
         assert_eq!(taken(&SEEN), [1; 5]);
         assert_eq!(taken(&CLAUSES_UNRECORDED), [true]);
         assert_eq!(taken(&TOKENS), [TOKEN]);
@@ -315,7 +315,7 @@ fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
 }
 
 #[test]
-fn a_second_resumption_of_a_stop_is_refused_and_everything_comes_back_once() {
+fn a_second_resumption_of_a_stop_is_rejected_and_everything_comes_back_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
@@ -340,9 +340,9 @@ fn a_body_whose_continuation_dies_unresumed_gives_back_what_it_held_once() {
     let ctx = &raw mut owned;
     unsafe {
         (*ctx).begin();
-        let answer = handled(ctx, &NEVER);
+        let result = handled(ctx, &NEVER);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-        assert_eq!(imm_value(answer), 42);
+        assert_eq!(imm_value(result), 42);
         assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
         assert_eq!(taken(&TOKENS), [TOKEN]);
         assert_eq!(freed(), HELD);

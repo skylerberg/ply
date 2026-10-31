@@ -311,7 +311,7 @@ fn gathered(s: State, p: Partial, fin: Bool) -> Step / {abort.raise} =
     let whole = Bytes::concat_all(p.parts);
     match if p.compressed { inflated(s, whole) }
       else { Ok({ bytes: whole, inflater: s.inflater }) } {
-      Err(why) -> failed({ ..s, partial: None }, why),
+      Err(reason) -> failed({ ..s, partial: None }, reason),
       Ok(read) -> {
         let next = { ..s, partial: None, inflater: read.inflater };
         match p.opcode {
@@ -602,9 +602,9 @@ pub fn check_response(
   };
   let server_none = params.contains("server_no_context_takeover");
   let client_none = params.contains("client_no_context_takeover");
-  if head.status != 101 { Err("the server answered " ++ head.status.to_string()) }
+  if head.status != 101 { Err("the server responded " ++ head.status.to_string()) }
   else if !has_token(h, "upgrade", "websocket") || !has_token(h, "connection", "upgrade") {
-    Err("the answer does not switch to WebSocket")
+    Err("the response does not switch to WebSocket")
   } else if http::header(h, "sec-websocket-accept") != Some(accept_key(key)) {
     Err("the accept key is not this request's")
   } else if match protocol { Some(p) -> !options.protocols.contains(p), None -> false } {
@@ -790,7 +790,7 @@ pub fn serve_connection<[l] | e>(
             )
           } else { () },
         },
-        http::Refused(r) -> {
+        http::HeadRejected(r) -> {
           send_all[l](
             h,
             http::encode(http::Get, http::Http11, false, http::error_response(r)),
@@ -816,12 +816,12 @@ fn serve_messages<[l] | e>(
     let r = receive[l](s, options.idle_timeout_ms);
     match r.got {
       Message(m) -> {
-        let answered = respond(m).fold(
+        let returned = respond(m).fold(
           { session: r.session, sent: true },
           |at: { session: Session, sent: Bool }, out: Message|
             if at.sent { send[l](at.session, out, options.idle_timeout_ms) } else { at },
         );
-        serve_messages[l](answered.session, options, respond, left - 1)
+        serve_messages[l](returned.session, options, respond, left - 1)
       },
       TimedOut -> {
         close[l](r.session, 1001, "idle", options.idle_timeout_ms);
@@ -865,14 +865,14 @@ pub fn connect<[l]>(
         try { net::dial_tls[l](h, p, ["http/1.1"], [], limits.connect_timeout_ms) }
       } else { try { net::dial[l](h, p, [], limits.connect_timeout_ms) } };
       match initial_state {
-        Err(why) -> Err(NoConnection(why)),
+        Err(reason) -> Err(NoConnection(reason)),
         Ok(c) -> {
           let target = (if url::url_path(to) == "" { "/" } else { url::url_path(to) })
             ++ (match url::url_query(to) { Some(q) -> "?" ++ q, None -> "" });
           let key = base64_encode(token_bytes(16));
-          let answered = finish_handshake[l](c, authority, target, key, options, limits);
-          match answered { Err(_) -> net.close[l](c), Ok(_) -> () };
-          answered
+          let returned = finish_handshake[l](c, authority, target, key, options, limits);
+          match returned { Err(_) -> net.close[l](c), Ok(_) -> () };
+          returned
         },
       }
     },
@@ -901,11 +901,11 @@ fn finish_handshake<[l]>(
               buffer: got.buf.slice(head.consumed, got.buf.len()),
               negotiated: agreed,
             }),
-          Err(why) -> Err(Declined(why)),
+          Err(reason) -> Err(Declined(reason)),
         },
-        _ -> Err(Declined("the answer is not HTTP")),
+        _ -> Err(Declined("the response is not HTTP")),
       },
-      _ -> Err(Declined("no answer came")),
+      _ -> Err(Declined("no response came")),
     }
   }
 
@@ -1067,7 +1067,7 @@ test "a request that is not a handshake is rejected, and another version learns 
   }
 }
 
-fn answer_head(extra: String) -> http::ResponseHead / {abort.raise} =
+fn result_head(extra: String) -> http::ResponseHead / {abort.raise} =
   match http::parse_response_head(
       Bytes::of_string(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
@@ -1120,7 +1120,7 @@ test "a client accepts a 101 that matches its request, and nothing else: {c.what
     },
   ] {
   let options = { ..default_options(), protocols: ["chat"] };
-  assert_eq(check_response(answer_head(c.extra), "dGhlIHNhbXBsZSBub25jZQ==", options), c.negotiated)
+  assert_eq(check_response(result_head(c.extra), "dGhlIHNhbXBsZSBub25jZQ==", options), c.negotiated)
 }
 
 test "a client that keeps no context asks both ends to keep none, and enforces that on its server" {
@@ -1133,7 +1133,7 @@ test "a client that keeps no context asks both ends to keep none, and enforces t
   );
   assert_eq(
     check_response(
-      answer_head("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n"),
+      result_head("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n"),
       "dGhlIHNhbXBsZSBub25jZQ==",
       options,
     ),
@@ -1143,7 +1143,7 @@ test "a client that keeps no context asks both ends to keep none, and enforces t
 
 test "an accept key for another request is rejected" {
   assert_eq(
-    check_response(answer_head(""), "AQIDBAUGBwgJCgsMDQ4PEA==", default_options()),
+    check_response(result_head(""), "AQIDBAUGBwgJCgsMDQ4PEA==", default_options()),
     Err("the accept key is not this request's"),
   )
 }
@@ -1188,59 +1188,59 @@ fn closed_on(code: Int, reason: String) -> Frame = close_frame(code, reason)
 
 fn invalid_utf8() -> Bytes = b"\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5\xed\xa0\x80"
 
-type Case = { case: String, said: Bytes, answered: List<Frame> }
+type Case = { case: String, said: Bytes, returned: List<Frame> }
 
 fn autobahn() -> List<Case> / {abort.raise} =
   [
     {
       case: "1.1.1 an empty text message",
       said: client_says([text(""), closing(1000)]),
-      answered: [text(""), closing(1000)],
+      returned: [text(""), closing(1000)],
     },
     {
       case: "1.2.1 a binary message",
       said: client_says([frame(true, Binary, b"\x00\xff"), closing(1000)]),
-      answered: [frame(true, Binary, b"\x00\xff"), closing(1000)],
+      returned: [frame(true, Binary, b"\x00\xff"), closing(1000)],
     },
     {
       case: "2.1 a ping with no payload",
       said: client_says([frame(true, Ping, b""), closing(1000)]),
-      answered: [frame(true, Pong, b""), closing(1000)],
+      returned: [frame(true, Pong, b""), closing(1000)],
     },
     {
       case: "2.3 a ping with a binary payload",
       said: client_says([frame(true, Ping, b"\x00\xff\xfe\xfd"), closing(1000)]),
-      answered: [frame(true, Pong, b"\x00\xff\xfe\xfd"), closing(1000)],
+      returned: [frame(true, Pong, b"\x00\xff\xfe\xfd"), closing(1000)],
     },
     {
       case: "2.5 a ping of 126 bytes",
       said: client_says([frame(true, Ping, bytes_of(126))]),
-      answered: [closed_on(1002, "a control frame is fragmented or longer than 125 bytes")],
+      returned: [closed_on(1002, "a control frame is fragmented or longer than 125 bytes")],
     },
     {
       case: "2.6 a pong nobody asked for",
       said: client_says([frame(true, Pong, b"x"), closing(1000)]),
-      answered: [closing(1000)],
+      returned: [closing(1000)],
     },
     {
       case: "3.1 a frame with RSV2 set",
       said: b"\xa1\x80".concat(key()),
-      answered: [closed_on(1002, "a reserved bit is set")],
+      returned: [closed_on(1002, "a reserved bit is set")],
     },
     {
       case: "4.1.1 a reserved opcode for data",
       said: b"\x83\x80".concat(key()),
-      answered: [closed_on(1002, "a reserved opcode")],
+      returned: [closed_on(1002, "a reserved opcode")],
     },
     {
       case: "4.2.1 a reserved opcode for control",
       said: b"\x8b\x80".concat(key()),
-      answered: [closed_on(1002, "a reserved opcode")],
+      returned: [closed_on(1002, "a reserved opcode")],
     },
     {
       case: "5.1 a fragmented ping",
       said: client_says([frame(false, Ping, b"x")]),
-      answered: [closed_on(1002, "a control frame is fragmented or longer than 125 bytes")],
+      returned: [closed_on(1002, "a control frame is fragmented or longer than 125 bytes")],
     },
     {
       case: "5.3 a text message in two fragments",
@@ -1249,7 +1249,7 @@ fn autobahn() -> List<Case> / {abort.raise} =
         frame(true, Continuation, b"ment"),
         closing(1000),
       ]),
-      answered: [text("fragment"), closing(1000)],
+      returned: [text("fragment"), closing(1000)],
     },
     {
       case: "5.6 a ping between fragments",
@@ -1259,72 +1259,72 @@ fn autobahn() -> List<Case> / {abort.raise} =
         frame(true, Continuation, b"b"),
         closing(1000),
       ]),
-      answered: [frame(true, Pong, b"p"), text("ab"), closing(1000)],
+      returned: [frame(true, Pong, b"p"), text("ab"), closing(1000)],
     },
     {
       case: "5.9 a continuation with nothing to continue",
       said: client_says([frame(true, Continuation, b"x")]),
-      answered: [closed_on(1002, "a continuation with no message to continue")],
+      returned: [closed_on(1002, "a continuation with no message to continue")],
     },
     {
       case: "5.18 a new message inside a fragmented one",
       said: client_says([frame(false, Text, b"a"), text("b")]),
-      answered: [closed_on(1002, "a new message inside a fragmented one")],
+      returned: [closed_on(1002, "a new message inside a fragmented one")],
     },
     {
       case: "6.3.1 text that is not UTF-8",
       said: client_says([frame(true, Text, invalid_utf8())]),
-      answered: [closed_on(1007, "a text message is not UTF-8")],
+      returned: [closed_on(1007, "a text message is not UTF-8")],
     },
     {
       case: "7.1.1 a message, a close, and nothing after it",
       said: client_says([text("Hello"), closing(1000), text("late")]),
-      answered: [text("Hello"), closing(1000)],
+      returned: [text("Hello"), closing(1000)],
     },
     {
       case: "7.3.1 a close with no code",
       said: client_says([frame(true, Close, b"")]),
-      answered: [frame(true, Close, b"")],
+      returned: [frame(true, Close, b"")],
     },
     {
       case: "7.3.2 a close of one byte",
       said: client_says([frame(true, Close, b"\x03")]),
-      answered: [closed_on(1002, "a close of one byte")],
+      returned: [closed_on(1002, "a close of one byte")],
     },
     {
       case: "7.5.1 a close whose reason is not UTF-8",
       said: client_says([frame(true, Close, b"\x03\xe8".concat(invalid_utf8()))]),
-      answered: [closed_on(1007, "a close reason is not UTF-8")],
+      returned: [closed_on(1007, "a close reason is not UTF-8")],
     },
     {
       case: "7.7.4 a close of code 3000",
       said: client_says([closing(3000)]),
-      answered: [closing(3000)],
+      returned: [closing(3000)],
     },
     {
       case: "7.7.13 a close of code 4999",
       said: client_says([closing(4999)]),
-      answered: [closing(4999)],
+      returned: [closing(4999)],
     },
     {
       case: "7.9.1 a close of code 0",
       said: client_says([frame(true, Close, b"\x00\x00")]),
-      answered: [closed_on(1002, "a close code no endpoint may send")],
+      returned: [closed_on(1002, "a close code no endpoint may send")],
     },
     {
       case: "7.9.3 a close of code 1004",
       said: client_says([frame(true, Close, b"\x03\xec")]),
-      answered: [closed_on(1002, "a close code no endpoint may send")],
+      returned: [closed_on(1002, "a close code no endpoint may send")],
     },
     {
       case: "7.13.2 a close of code 5000",
       said: client_says([frame(true, Close, b"\x13\x88")]),
-      answered: [closed_on(1002, "a close code no endpoint may send")],
+      returned: [closed_on(1002, "a close code no endpoint may send")],
     },
     {
       case: "9.1 a frame past the limit",
       said: client_says([frame(true, Binary, bytes_of(65))]),
-      answered: [closed_on(1009, "a frame is longer than the limit")],
+      returned: [closed_on(1009, "a frame is longer than the limit")],
     },
     {
       case: "9.2 a message past the limit",
@@ -1333,7 +1333,7 @@ fn autobahn() -> List<Case> / {abort.raise} =
         frame(false, Continuation, bytes_of(64)),
         frame(true, Continuation, b"x"),
       ]),
-      answered: [closed_on(1009, "a message is longer than the limit")],
+      returned: [closed_on(1009, "a message is longer than the limit")],
     },
     {
       case: "9.3 a message in too many fragments",
@@ -1344,17 +1344,17 @@ fn autobahn() -> List<Case> / {abort.raise} =
         frame(false, Continuation, b"d"),
         frame(true, Continuation, b"e"),
       ]),
-      answered: [closed_on(1009, "a message is in more fragments than the limit")],
+      returned: [closed_on(1009, "a message is in more fragments than the limit")],
     },
     {
       case: "an unmasked frame from a client",
       said: encode_frame(text("x"), None),
-      answered: [closed_on(1002, "a client's frame is not masked")],
+      returned: [closed_on(1002, "a client's frame is not masked")],
     },
   ]
 
 test "Autobahn {c.case}: an echo server responds as the suite expects" for c: Case in autobahn() {
-  assert_eq(echoed("", c.said, small()), server_says(c.answered))
+  assert_eq(echoed("", c.said, small()), server_says(c.returned))
 }
 
 // --- Tests: permessage-deflate ----------------------------------------------
@@ -1565,7 +1565,7 @@ test "a compressed message that would decompress past the limit fails the connec
 
 test "a client opens a session, sends masked frames, and reads its server's reply and close" {
   let wanted = with_rand(rand(7), || base64_encode(token_bytes(16))).value;
-  let answer = Bytes::concat_all([
+  let result = Bytes::concat_all([
     Bytes::of_string(
       "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
         ++ accept_key(wanted)
@@ -1579,7 +1579,7 @@ test "a client opens a session, sends masked frames, and reads its server's repl
       dns::with_name(dns::table(), "chat.example", [ip::read("192.0.2.40")]),
     ),
     ip::read_socket("192.0.2.40:80"),
-    [[Sends(answer)]],
+    [[Sends(result)]],
   );
   let options = { ..default_options(), compression: false };
   let ran = net::on_mem(world, ||

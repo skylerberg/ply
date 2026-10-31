@@ -1,9 +1,9 @@
 //! Entering a compiled unit: the unit opened once from its library and shared by every thread that
 //! enters it, a root entered on a fresh context of its own through its `R#entered`, its arguments
-//! the PLV1 list the root reads, and how the entry ended, its answer the PLV1 the root wrote,
-//! untouched. No front end is read: which root to enter, what its arguments are and what its answer
+//! the PLV1 list the root reads, and how the entry ended, its result the PLV1 the root wrote,
+//! untouched. No front end is read: which root to enter, what its arguments are and what its result
 //! or failure means are the entering program's. The natives `std.machine` declares are here, each
-//! taking and answering the flat format of [`crate::flat`].
+//! taking and returning the flat format of [`crate::flat`].
 //!
 //! A unit opened here has no source, so a span the runtime makes is a site: its [`SourceId`] is the
 //! index of its root in the unit's roots, which [`Opened::root_named`] names, and its offsets are
@@ -12,7 +12,7 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, lent};
+use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, borrowed};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
@@ -94,24 +94,24 @@ pub trait Binder: Send + Sync {
     /// The facts a run's disclosures print under `grants`, written as `std.machine`'s `Hosting`.
     fn hosting(&self, grants: &Grants, w: &mut Writer);
 
-    /// The first read `trace` holds that no longer answers as it did under `grants`, as a person
+    /// The first read `trace` holds that no longer returns what it did under `grants`, as a person
     /// reads it, the reads it made to say so entered into `caller`, the asking run's record.
     fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String>;
 }
 
 /// The host binding an entry runs under: what serves the operations its program performs that no
-/// handler of its own answers.
+/// handler of its own handles.
 pub trait Bound: Send + Sync {
     fn binding(&self) -> Arc<HostBinding>;
 
-    /// What makes the reactor a pending host answer is waited on with, on the thread that enters.
+    /// What makes the reactor a pending host response is waited on with, on the thread that enters.
     fn runtime_factory(&self) -> RuntimeFactory;
 
     /// The code `process.exit` asked for, once asked.
     fn requested_exit(&self) -> Option<i32>;
 
-    /// The trace a pass of an entry is filed with, of what `recorder` came to, read against the
-    /// world this binding lends: none where nothing could stand in for the run. `host` is whether
+    /// The trace a pass of an entry is recorded with, of what `recorder` came to, read against the
+    /// world this binding grants: none where nothing could stand in for the run. `host` is whether
     /// the entry reached a host handler.
     fn traced(&self, recorder: &Recorder, host: bool) -> Option<String>;
 
@@ -134,14 +134,14 @@ pub struct Watch<'a> {
 pub struct Run {
     /// Milliseconds of wall clock the entry may take; 0 is no clock.
     pub timeout_ms: u64,
-    /// The schedule its `simulate` regions take and the steps each interleaving may take; the
+    /// The schedule its simulations take and the steps each interleaving may take; the
     /// default seed where none is named.
     pub seed: Option<(Seed, u32)>,
-    /// One of several runs of one test a search makes: reaching the host is refused.
+    /// One of several runs of one test a search makes: reaching the host is rejected.
     pub re_executed: bool,
     /// Whether to read the wall clock for how long the entry took.
     pub measure: bool,
-    /// Whether the entry is a test's: its usage counts every perform, those its own handlers answer
+    /// Whether the entry is a test's: its usage counts every perform, those its own handlers handle
     /// included, and the objects it leaves live.
     pub tested: bool,
 }
@@ -161,17 +161,17 @@ impl Run {
 
 /// How an entry ended.
 pub enum Ended {
-    /// The root answered: its answer's PLV1.
-    Answered(Vec<u8>),
-    /// A raise nothing answered, a runtime error, the clock run out, or an answer the boundary
-    /// refuses.
+    /// The root returned: its result's PLV1.
+    Returned(Vec<u8>),
+    /// A raise nothing handled, a runtime error, the clock run out, or a result the boundary
+    /// rejects.
     Failed(Diagnostic),
     /// A Rust unwind out of the entry, with what it said.
     Panicked(String),
     /// The unit is entered at no such root.
     NoRoot,
-    /// The answer holds what no run but its own can hold, which is why.
-    Unanswerable(&'static str),
+    /// The result holds what no run but its own can hold, and the text says why.
+    NotReturnable(&'static str),
 }
 
 /// What an entry cost and reached, whatever it came to.
@@ -182,33 +182,33 @@ pub struct Usage {
     /// Whether it reached a nondeterministic host handler.
     pub host: bool,
     /// The operations it performed: every one where the run counted them, else those a handler
-    /// the runtime keeps answered.
+    /// the runtime keeps handled.
     pub performs: u64,
     pub held: Held,
     pub updates: u64,
     pub updates_in_place: u64,
-    /// Objects of the program's still live once a test's entry answered and gave back what its
+    /// Objects of the program's still live once a test's entry returned and gave back what its
     /// bodies held: each one nothing let go of. 0 for any other entry.
     pub live: u64,
 }
 
-/// What a run still held when an entry's root body returned, before the run's region drained its
+/// What a run still held when an entry's root body returned, before the run's scheduler drained its
 /// other tasks: what grows with the work a long-running program does if anything is never given
 /// back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     /// Native objects the runtime made, such as a task's handle.
     pub native_objects: u64,
-    /// Tasks the run's region still holds.
+    /// Tasks the run's scheduler still holds.
     pub scheduled: u64,
-    /// Task stacks the run's region still keeps, its tasks' and those it keeps for its next ones.
+    /// Task stacks the run's scheduler still keeps, its tasks' and those kept for its next ones.
     pub task_stacks: u64,
     /// Frame tables kept for stacks that are or were running.
     pub frame_tables: u64,
 }
 
 /// How an entry ended, what it used, what its host runtime warned of as it ended, the interleaving
-/// its `simulate` regions took as `std.internal.schedule` wrote it, and the trace of what it read
+/// its simulations took as `std.internal.schedule` wrote it, and the trace of what it read
 /// where it was recorded.
 pub struct Outcome {
     pub ended: Ended,
@@ -232,7 +232,7 @@ impl Outcome {
 
 /// `root` of `opened` entered on a fresh context on this thread, its arguments `arguments`, the
 /// PLV1 list its `R#entered` reads, under `bound` where it names one and else no host, its reads
-/// recorded as `watch` says. A Rust unwind out of the Rust around the compiled call is answered as
+/// recorded as `watch` says. A Rust unwind out of the Rust around the compiled call is returned as
 /// [`Ended::Panicked`], the thread as the entry found it and the entry's context left unreleased;
 /// one inside a runtime function compiled code calls aborts the process, as any unwind out of an
 /// `extern "C"` function does.
@@ -325,7 +325,7 @@ pub fn enter(
     outcome
 }
 
-/// What `enter` answers, run on a thread of its own with a program's stack, so how deeply an entry
+/// What `enter` returns, run on a thread of its own with a program's stack, so how deeply an entry
 /// may nest does not hang on what its caller left of its own stack: `None` where no thread could be
 /// made or the work unwound.
 pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T> {
@@ -348,7 +348,7 @@ struct Last {
 }
 
 /// An entry a Rust unwind left: its host runtime and the pool are told it is over, and its context
-/// is never released, since its heap, its regions and its detached bodies are the dead entry's and
+/// is never released, since its heap, schedulers and detached bodies are the dead entry's and
 /// letting them go would release through whichever context now runs on this thread.
 fn abandoned(mut ctx: Box<Ctx>) {
     if let Some(rt) = ctx.runtime.clone() {
@@ -391,9 +391,9 @@ fn entered(
     let ended = if ctx.failed != 0 {
         failure(ctx)
     } else {
-        answered(ctx, root)
+        ended_with_result(ctx, root)
     };
-    if run.tested && matches!(ended, Ended::Answered(_)) {
+    if run.tested && matches!(ended, Ended::Returned(_)) {
         last.live = ctx.left_live() as u64;
     }
     ctx.end();
@@ -401,7 +401,7 @@ fn entered(
     (ended, last)
 }
 
-/// What an entry leaves once its root returned, its run's region drained: its host runtime told
+/// What an entry leaves once its root returned, its run's scheduler drained: its host runtime told
 /// the entry is over.
 fn returned(ctx: &mut Ctx) -> Last {
     let held = ctx.held_at_root.take().unwrap_or(Held {
@@ -422,19 +422,19 @@ fn returned(ctx: &mut Ctx) -> Last {
     }
 }
 
-/// How an entry whose root returned ended: its answer's bytes, or why the boundary keeps it.
-fn answered(ctx: &mut Ctx, root: &str) -> Ended {
+/// How an entry whose root returned ended: its result's bytes, or why the boundary keeps it.
+fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
     match crate::rt::close_entry(ctx) {
-        Ok(EntryBytes::Bytes(bytes)) => Ended::Answered(bytes),
+        Ok(EntryBytes::Bytes(bytes)) => Ended::Returned(bytes),
         Ok(EntryBytes::Function) => {
-            Ended::Unanswerable("its answer holds a function the program wrote")
+            Ended::NotReturnable("its result holds a function the program wrote")
         }
         Ok(EntryBytes::Escaping(escapee)) => {
-            let boundary = ply_core::Boundary::EntryAnswer { name: root };
-            Ended::Failed(ply_core::escape::refused(&boundary, &escapee, Span::DUMMY))
+            let boundary = ply_core::Boundary::EntryResult { name: root };
+            Ended::Failed(ply_core::escape::rejected(&boundary, &escapee, Span::DUMMY))
         }
-        Ok(EntryBytes::Holding) => Ended::Unanswerable("its answer holds a handle of its run"),
-        Err(why) => Ended::Failed(crate::rt::err_crossing(&why)),
+        Ok(EntryBytes::Holding) => Ended::NotReturnable("its result holds a handle of its run"),
+        Err(reason) => Ended::Failed(crate::rt::err_marshalling(&reason)),
     }
 }
 
@@ -513,7 +513,7 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
     ]
 }
 
-/// What programs hold by the handles the natives answer: never 0, which names none.
+/// What programs hold by the handles the natives return: never 0, which names none.
 struct Handles<T> {
     next: i64,
     by: HashMap<i64, T>,
@@ -554,7 +554,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// `open`: `result(opened, string)`, `opened := int unit, int roots, int nanos, int threads`.
 unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    let library = unsafe { lent(p, n) };
+    let library = unsafe { borrowed(p, n) };
     let mut w = Writer::new();
     match std::str::from_utf8(library)
         .map_err(|_| "the library's path is not UTF-8".to_string())
@@ -570,8 +570,8 @@ unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
                 .count(nanos)
                 .count(threads as u64);
         }
-        Err(why) => {
-            w.tag(1).str(&why);
+        Err(reason) => {
+            w.tag(1).str(&reason);
         }
     }
     unsafe { &mut *ctx }.given(w.finish())
@@ -582,11 +582,11 @@ unsafe extern "C" fn rt_unit_close(_ctx: *mut Ctx, unit: I64) {
     units().by.remove(&unit.0);
 }
 
-/// `bind`: `result(int, list(failure))`. A binding lends the host, so it is refused unless the
-/// caller is lent `machine`.
+/// `bind`: `result(int, list(failure))`. A binding grants the host, so it is rejected unless the
+/// caller is granted `machine`.
 unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
+    let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
     if !allowed(c, "machine.bind") {
@@ -602,9 +602,9 @@ unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
             let binding = bindings().keep(bound);
             w.tag(0).int(binding);
         }
-        Err(refused) => {
+        Err(rejected) => {
             w.tag(1)
-                .list(refused.iter(), |w, d| write_failure(w, d, None));
+                .list(rejected.iter(), |w, d| write_failure(w, d, None));
         }
     }
     c.given(w.finish())
@@ -624,7 +624,7 @@ unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> TakenBytes {
 /// `hosting`: the disclosures' facts under the grants.
 unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
+    let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
     let Some(binder) = BINDER.get() else {
@@ -644,7 +644,7 @@ unsafe extern "C" fn rt_unit_moved(
     tn: I64,
 ) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { lent(gp, gn) }, read_grants) else {
+    let Some(grants) = read_or_fail(c, unsafe { borrowed(gp, gn) }, read_grants) else {
         return TakenBytes(0);
     };
     if !allowed(c, "machine.moved") {
@@ -653,7 +653,7 @@ unsafe extern "C" fn rt_unit_moved(
     let Some(binder) = BINDER.get() else {
         return TakenBytes(c.fail(err_no_binder()));
     };
-    let trace = String::from_utf8_lossy(unsafe { lent(tp, tn) }).into_owned();
+    let trace = String::from_utf8_lossy(unsafe { borrowed(tp, tn) }).into_owned();
     let caller = ply_host::observe::of(&*c.host_runtime());
     let moved = binder.moved(&grants, &trace, caller.as_deref());
     let mut w = Writer::new();
@@ -676,22 +676,22 @@ unsafe extern "C" fn rt_unit_enter(
     run_n: I64,
 ) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(asked) = read_or_fail(c, unsafe { lent(run_p, run_n) }, read_run) else {
+    let Some(asked) = read_or_fail(c, unsafe { borrowed(run_p, run_n) }, read_run) else {
         return TakenBytes(0);
     };
     if (asked.run.timeout_ms > 0 || asked.run.measure) && !allowed(c, "machine.enter") {
         return TakenBytes(0);
     }
-    let root = String::from_utf8_lossy(unsafe { lent(root_p, root_n) }).into_owned();
-    let arguments = unsafe { lent(arguments_p, arguments_n) }.to_vec();
+    let root = String::from_utf8_lossy(unsafe { borrowed(root_p, root_n) }).into_owned();
+    let arguments = unsafe { borrowed(arguments_p, arguments_n) }.to_vec();
     let Some(opened) = units().get(unit.0) else {
-        return TakenBytes(c.fail(err_unheld("unit", unit.0)));
+        return TakenBytes(c.fail(err_unknown_handle("unit", unit.0)));
     };
     let bound = match asked.binding {
         0 => None,
         handle => match bindings().get(handle) {
             Some(bound) => Some(bound),
-            None => return TakenBytes(c.fail(err_unheld("binding", handle))),
+            None => return TakenBytes(c.fail(err_unknown_handle("binding", handle))),
         },
     };
     let caller = ply_host::observe::of(&*c.host_runtime());
@@ -713,7 +713,7 @@ unsafe extern "C" fn rt_unit_enter(
     c.given(w.finish())
 }
 
-/// Whether the caller is lent `machine`, the context failed where it is not.
+/// Whether the caller is granted `machine`, the context failed where it is not.
 fn allowed(c: &mut Ctx, op: &str) -> bool {
     if c.binding.grants().allows("machine") {
         return true;
@@ -722,10 +722,10 @@ fn allowed(c: &mut Ctx, op: &str) -> bool {
         Diagnostic::error(
             codes::CAPABILITY_UNDECLARED,
             format!(
-                "`{op}` lends the host to the run it makes, and this run is not lent `machine`"
+                "`{op}` passes the host to the run it makes, and this run is not granted `machine`"
             ),
         )
-        .note("`--allow machine` lends it; `hermetic_machine` needs no grant"),
+        .note("`--allow machine` grants it; `hermetic_machine` needs no grant"),
     );
     false
 }
@@ -738,8 +738,8 @@ fn read_or_fail<T>(
     let mut r = Reader::new(bytes);
     match read(&mut r).and_then(|t| r.end().map(|()| t)) {
         Ok(t) => Some(t),
-        Err(why) => {
-            c.fail(err_unread(&why));
+        Err(reason) => {
+            c.fail(err_unread(&reason));
             None
         }
     }
@@ -805,7 +805,7 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
 /// int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place, int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
-        Ended::Answered(bytes) => {
+        Ended::Returned(bytes) => {
             w.tag(0).bytes(bytes);
         }
         Ended::Failed(d) => {
@@ -818,8 +818,8 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         Ended::NoRoot => {
             w.tag(3);
         }
-        Ended::Unanswerable(why) => {
-            w.tag(4).str(why);
+        Ended::NotReturnable(reason) => {
+            w.tag(4).str(reason);
         }
     }
     w.option(exit, |w, code| {
@@ -882,21 +882,21 @@ fn write_site(w: &mut Writer, opened: Option<&Opened>, span: Span) {
 }
 
 #[cold]
-fn err_unread(why: &str) -> Diagnostic {
+fn err_unread(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("`std.machine` handed the runtime bytes it does not read: {why}"),
+        format!("`std.machine` handed the runtime bytes it does not read: {reason}"),
     )
     .note("the module writes the format the runtime reads; this is Ply's fault")
 }
 
 #[cold]
-fn err_unheld(what: &str, handle: i64) -> Diagnostic {
+fn err_unknown_handle(what: &str, handle: i64) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("no {what} is held as {handle}"),
     )
-    .note("a handle is one `std.machine` answered and has not let go; this is Ply's fault")
+    .note("a handle is one `std.machine` returned and has not let go; this is Ply's fault")
 }
 
 #[cold]

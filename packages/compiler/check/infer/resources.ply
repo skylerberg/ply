@@ -1,6 +1,7 @@
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
-                             Field, Row, Atom, Scheme, is_label_or_row, type_args, instantiate,
-                             unify, resolve_row, substitution_new, row_empty, atoms_union)
+                             Field, Effects, Effect, Scheme, is_label_or_effects, type_args,
+                             instantiate, unify, resolve_effects, substitution_new, no_effects,
+                             effects_union)
 import compiler.check.infer.checker (Checker, ConstructorInfo, resolve, definition_of)
 import std.list
 
@@ -34,7 +35,7 @@ fn holds_resource(checker: Checker, kept: List<Int>, ty: Type) -> Bool =
   match ty {
     VariableType(v) -> kept.contains(v),
     NamedType(c) ->
-      !is_label_or_row(ty)
+      !is_label_or_effects(ty)
         && (checker.resource_types.contains(c.name)
         || c.args.any(|a: Type| holds_resource(checker, kept, a))),
     FunctionType(f) -> f.once,
@@ -44,18 +45,18 @@ fn holds_resource(checker: Checker, kept: List<Int>, ty: Type) -> Bool =
         || n.fields.any(|x: Field| holds_resource(checker, kept, x.ty)),
   }
 
-pub fn release_atoms(checker: Checker, ty: Type) -> List<Atom> / {abort.raise} =
+pub fn release_effect_list(checker: Checker, ty: Type) -> List<Effect> / {abort.raise} =
   iterate(
-    { todo: [resolve(checker, ty)], seen: [], atoms: [] },
+    { todo: [resolve(checker, ty)], seen: [], listed: [] },
     checker.constructors.fold(256, |n: Int, x: ConstructorInfo| n + 4 * (x.fields.len() + 1)),
     |w: ReleaseSearch|
       match w.todo {
-        [] -> Stop(w.atoms),
+        [] -> Stop(w.listed),
         [t, ..rest] -> Continue(release_search_step(checker, { ..w, todo: rest }, t)),
       },
   )
 
-type ReleaseSearch = { todo: List<Type>, seen: List<Bytes>, atoms: List<Atom> }
+type ReleaseSearch = { todo: List<Type>, seen: List<Bytes>, listed: List<Effect> }
 
 fn release_search_step(
   checker: Checker,
@@ -67,15 +68,15 @@ fn release_search_step(
       None -> None,
       Some(by) -> match definition_of(checker, by) {
         None -> Some([]),
-        Some(f) -> Some(release_row(checker, f.scheme, ty).atoms),
+        Some(f) -> Some(release_effects(checker, f.scheme, ty).listed),
       },
     };
   let reading = |xs: List<Type>| { ..w, todo: w.todo.concat(xs) };
-  let stated = |atoms: List<Atom>| { ..w, atoms: atoms_union(w.atoms, atoms) };
+  let stated = |effects: List<Effect>| { ..w, listed: effects_union(w.listed, effects) };
   match ty {
     NamedType(c) -> match own(c.name) {
-      Some(atoms) -> stated(atoms),
-      None -> if is_label_or_row(ty) || w.seen.contains(c.name)
+      Some(effects) -> stated(effects),
+      None -> if is_label_or_effects(ty) || w.seen.contains(c.name)
           || !checker.resource_types.contains(c.name) { reading(type_args(c.args)) } else {
         let fields = checker.constructors.filter(|x: ConstructorInfo| x.type_name == c.name).fold(
           [],
@@ -85,7 +86,7 @@ fn release_search_step(
       },
     },
     NominalType(n) -> match own(n.name) {
-      Some(atoms) -> stated(atoms),
+      Some(effects) -> stated(effects),
       None -> reading(n.fields.map(|x: Field| x.ty)),
     },
     RecordType(fs) -> reading(fs.map(|x: Field| x.ty)),
@@ -93,16 +94,19 @@ fn release_search_step(
   }
 }
 
-fn release_row(checker: Checker, scheme: Scheme, held: Type) -> Row / {abort.raise} = {
+fn release_effects(checker: Checker, scheme: Scheme, held: Type) -> Effects / {abort.raise} = {
   let o = instantiate(scheme, checker.fresh);
   match o.ty {
     FunctionType(f) -> match f.params.at(0) {
       Some(p) -> {
         let u = unify(substitution_new(), o.fresh, p, held);
-        match u.error { Some(_) -> row_empty(), None -> resolve_row(u.substitution, f.effects) }
+        match u.error {
+          Some(_) -> no_effects(),
+          None -> resolve_effects(u.substitution, f.effects),
+        }
       },
-      None -> row_empty(),
+      None -> no_effects(),
     },
-    _ -> row_empty(),
+    _ -> no_effects(),
   }
 }

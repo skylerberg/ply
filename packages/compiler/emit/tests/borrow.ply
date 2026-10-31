@@ -5,11 +5,11 @@ import compiler.check.infer.definitions (Extern, program_natives)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.published (analyse)
 import compiler.front.facts (Analysis)
-import compiler.front.seam (Analysed, Refused)
+import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text, site_owner_text)
 import compiler.emit.lower (root_lowered, group_lowered)
 import compiler.emit.specialisations (tail_loop_of)
-import compiler.emit.emit_harness (filed_in)
+import compiler.emit.emit_harness (recorded_in)
 import compiler.emit.lower.module_context (ModuleContext, Root, module_context_in)
 import compiler.emit.borrow_inference (OwnershipSignature, InferenceTarget, inference_targets_of,
                                        declared_borrows, infer_signatures, ownership_text,
@@ -51,7 +51,7 @@ fn analysed(src: Bytes) -> Analysis / {abort.raise} = analysed_as(b"m", src)
 
 fn analysed_as(name: Bytes, src: Bytes) -> Analysis / {abort.raise} =
   match analyse(parse_all([{ name: name, src: src }])) {
-    Refused(diagnostics) ->
+    Rejected(diagnostics) ->
       panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
     Analysed(a) -> a,
   }
@@ -62,7 +62,7 @@ fn emitter_input(
   names: List<Bytes>,
 ) -> { setting: ModuleContext, roots: List<Root> } / {abort.raise} =
   match module_context_in(a, module) {
-    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
     Ok(read) ->
       {
         setting: { ..read.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
@@ -78,7 +78,7 @@ fn lowered_functions(a: Analysis, s: ModuleContext, roots: List<Root>) -> List<F
     m.insert(site_owner_text(roots.get(i).key), i));
   let read_of = |full: Bytes|
     match named.get(root_name(Named(full))) {
-      Some(r) -> Some({ code: r.code, filed: filed_in(a, full) }),
+      Some(r) -> Some({ code: r.code, recorded: recorded_in(a, full) }),
       None -> None,
     };
   roots.fold([], |acc: List<Fn>, r: Root| {
@@ -130,7 +130,7 @@ fn ownership_texts(
 fn with_ownership(f: Fn, params: List<ParamOwnership>) -> Fn =
   { ..f, convention: handed_at(f.convention, params) }
 
-test "a reader lends, a builder and a keeper give, and a borrowed answer reaches its callers" {
+test "a reader borrows, a builder and a keeper give, and a borrowed result reaches its callers" {
   let names = [
     b"size",
     b"mirror",
@@ -145,16 +145,16 @@ test "a reader lends, a builder and a keeper give, and a borrowed answer reaches
     b"pinged",
   ];
   assert_eq(ownership_texts(inferred_ownership(corpus(), b"m", []), names), [
-    { name: b"size", handing: b"[lent] owned" },
+    { name: b"size", handing: b"[borrowed] owned" },
     { name: b"mirror", handing: b"[given] owned" },
-    { name: b"label", handing: b"[lent] borrowed(0 part)" },
-    { name: b"labels", handing: b"[lent] owned" },
-    { name: b"pick", handing: b"[lent, lent, lent] borrowed(1, 2)" },
+    { name: b"label", handing: b"[borrowed] borrowed(0 part)" },
+    { name: b"labels", handing: b"[borrowed] owned" },
+    { name: b"pick", handing: b"[borrowed, borrowed, borrowed] borrowed(1, 2)" },
     { name: b"picked", handing: b"[given, given] owned" },
     { name: b"stash", handing: b"[given] owned" },
-    { name: b"spin", handing: b"[lent, lent] owned" },
-    { name: b"ping", handing: b"[lent, lent] owned" },
-    { name: b"pong", handing: b"[lent, lent] owned" },
+    { name: b"spin", handing: b"[borrowed, borrowed] owned" },
+    { name: b"ping", handing: b"[borrowed, borrowed] owned" },
+    { name: b"pong", handing: b"[borrowed, borrowed] owned" },
     { name: b"pinged", handing: b"[given] owned" },
   ])
 }
@@ -170,12 +170,12 @@ test "an update or a literal of a record a type variable lays out takes what it 
     [
       { name: b"renamed", handing: b"[given, given] owned" },
       { name: b"wrapped", handing: b"[given, given] owned" },
-      { name: b"label_of", handing: b"[lent] owned" },
+      { name: b"label_of", handing: b"[borrowed] owned" },
     ],
   )
 }
 
-test "lending costs no reuse: each body handed as inferred resets what it resets with every parameter given" {
+test "borrowing costs no reuse: each body handed as inferred resets what it resets with every parameter given" {
   let lendings = inference_inputs(analysed(corpus()), b"m", []);
   let inferred = infer_signatures(lendings, Map::new(), Map::new()).handed;
   let resets = |l: InferenceTarget, params: List<ParamOwnership>|
@@ -214,14 +214,14 @@ test "every body written against the handings inferred for it and its callees is
   assert_eq(
     functions.fold([], |acc: List<{ root: Bytes, reason: Bytes }>, f: Fn|
       match ownership_fault(insert_reference_counts(with_conventions(f, inferred))) {
-        Some(why) -> acc.push({ root: root_text(root_name(f.key)), reason: why }),
+        Some(reason) -> acc.push({ root: root_text(root_name(f.key)), reason: reason }),
         None -> acc,
       }),
     [],
   )
 }
 
-test "a tail group lent as inferred passes the ownership check where a member hands another a value it made" {
+test "a tail group borrowing as inferred passes the ownership check where a member hands another a value it made" {
   let a = analysed(corpus());
   let names = [b"m.hop", b"m.skip"];
   let s = emitter_input(a, b"m", names);
@@ -241,13 +241,13 @@ test "a tail group lent as inferred passes the ownership check where a member ha
     );
   assert_eq(checked(|n: RootName| match inferred.get(n) { Some(h) -> h.params, None -> [] }), None);
   assert_eq(ownership_texts(inferred, [b"hop", b"skip"]), [
-    { name: b"hop", handing: b"[given, lent] owned" },
-    { name: b"skip", handing: b"[given, lent] owned" },
+    { name: b"hop", handing: b"[given, borrowed] owned" },
+    { name: b"skip", handing: b"[given, borrowed] owned" },
   ]);
   assert(checked(|_: RootName| [BorrowedParam, BorrowedParam]) != None)
 }
 
-test "a function parameter its declaration does not lend is inferred as any other: lent where only called, given where held" {
+test "a function parameter not declared borrowed is inferred as any other: borrowed where only called, given where held" {
   assert_eq(
     ownership_texts(inferred_ownership(corpus(), b"m", []), [
       b"twice",
@@ -256,15 +256,15 @@ test "a function parameter its declaration does not lend is inferred as any othe
       b"later",
     ]),
     [
-      { name: b"twice", handing: b"[lent, lent] owned" },
-      { name: b"apply_kept", handing: b"[lent, lent] owned" },
-      { name: b"apply_step", handing: b"[lent, lent] owned" },
+      { name: b"twice", handing: b"[borrowed, borrowed] owned" },
+      { name: b"apply_kept", handing: b"[borrowed, borrowed] owned" },
+      { name: b"apply_step", handing: b"[borrowed, borrowed] owned" },
       { name: b"later", handing: b"[given] owned" },
     ],
   )
 }
 
-test "the prelude's map read and list read lend what they read, and answer an item they wrap afresh" {
+test "the prelude's map read and list read borrow what they read, and return an item they wrap afresh" {
   let inferred = infer_signatures(
     inference_inputs(analysed_as(prelude_module(), prelude_source::text()), prelude_module(), [
       b"std.prelude.List::at",
@@ -274,8 +274,8 @@ test "the prelude's map read and list read lend what they read, and answer an it
     Map::new(),
     Map::new(),
   ).handed;
-  assert_eq(shown_text(inferred, b"std.prelude.Map::get"), b"[lent, lent] owned");
-  assert_eq(shown_text(inferred, b"std.prelude.List::at"), b"[lent, lent] owned")
+  assert_eq(shown_text(inferred, b"std.prelude.Map::get"), b"[borrowed, borrowed] owned");
+  assert_eq(shown_text(inferred, b"std.prelude.List::at"), b"[borrowed, borrowed] owned")
 }
 
 fn evidence_array_corpus() -> Bytes =
@@ -335,7 +335,7 @@ test "a call of a specialisation whose words go as one array is written against 
   assert_eq(
     functions.fold([], |acc: List<{ root: Bytes, reason: Bytes }>, f: Fn|
       match ownership_fault(insert_reference_counts(with_conventions(f, inferred))) {
-        Some(why) -> acc.push({ root: root_text(root_name(f.key)), reason: why }),
+        Some(reason) -> acc.push({ root: root_text(root_name(f.key)), reason: reason }),
         None -> acc,
       }),
     [],

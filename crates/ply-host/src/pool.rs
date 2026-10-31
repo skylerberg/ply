@@ -1,6 +1,6 @@
 //! Where a host operation goes when it has to wait. A [`Pool`] runs it on a thread, and the [`Run`]
-//! that submitted it holds it until it takes the answer: an operation is its run's alone, so one
-//! run's answers, kept or abandoned, never wake another's wait. Every pool mints from one count of
+//! that submitted it holds it until it takes the result: an operation is its run's alone, so one
+//! run's results, kept or abandoned, never wake another's wait. Every pool mints from one count of
 //! tokens.
 
 use crate::jobs::Failure;
@@ -19,12 +19,12 @@ pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 /// mint the same one, and none mints 0, which a zeroed `Pending` carries.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// What a job answered: its bytes, or why it answered none.
+/// What a job returned: its bytes, or why it returned none.
 pub type JobOutput = Result<Vec<u8>, Failure>;
 
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
-/// Rung whenever an answer is filed with a run it is handed to, and by a stop, so one wait covers
+/// Rung whenever a result is recorded with a run it is handed to, and by a stop, so one wait covers
 /// every pool and the stop at once: separate condition variables cannot be waited on together.
 #[derive(Default)]
 pub struct Bell {
@@ -62,8 +62,8 @@ impl Bell {
 }
 
 /// One run's operations, of whichever pool runs each: an operation is the run's from its
-/// submission until the run takes its answer. The run holds this, and each operation's job holds it
-/// weakly, so the answer of a job that finishes after its run has ended is dropped, and what an
+/// submission until the run takes its result. The run holds this, and each operation's job holds it
+/// weakly, so the result of a job that finishes after its run has ended is dropped, and what an
 /// ended run left goes with it. What its jobs read for a `Secret` is kept here too, until the run
 /// takes it or its entry point ends, and so is the record a test's reads are entered into.
 pub struct Run {
@@ -76,7 +76,7 @@ pub struct Run {
 /// A secret's bytes as a job read them, wiped when they are dropped.
 pub type Kept = Zeroizing<Vec<u8>>;
 
-/// What was read for a `Secret` and not yet taken, each under the number its job answered, wiped
+/// What was read for a `Secret` and not yet taken, each under the number its job returned, wiped
 /// as each is dropped.
 #[derive(Default)]
 struct Secrets {
@@ -84,17 +84,17 @@ struct Secrets {
     kept: HashMap<i64, Kept>,
 }
 
-/// An operation a run holds, until its answer is taken.
+/// An operation a run holds, until its result is taken.
 struct Held {
     span: Span,
     what: &'static str,
     /// Whether the run collects it with `resolved`, rather than waiting for it alone.
     watched: bool,
-    answer: Option<JobOutput>,
+    result: Option<JobOutput>,
 }
 
 impl Run {
-    /// A run whose answers ring `bell` as they are filed.
+    /// A run whose results ring `bell` as they are recorded.
     pub fn new(bell: Arc<Bell>) -> Arc<Run> {
         Arc::new(Run {
             held: Mutex::new(HashMap::new()),
@@ -118,7 +118,7 @@ impl Run {
         lock(&self.recorder).clone()
     }
 
-    /// Keeps `secret` for this run under a number nothing else of it is kept under, answered.
+    /// Keeps `secret` for this run under a number nothing else of it is kept under, returned.
     pub fn keep_secret(&self, secret: Kept) -> i64 {
         let mut secrets = lock(&self.secrets);
         secrets.last += 1;
@@ -145,7 +145,7 @@ impl Run {
                 span,
                 what,
                 watched: false,
-                answer: None,
+                result: None,
             },
         );
     }
@@ -154,8 +154,8 @@ impl Run {
         lock(&self.held).remove(&token);
     }
 
-    /// `job` run on this thread, its answer held as an operation's until the run takes it: for a
-    /// job no other task of the run could go on beside. Its ticket is answered as it is handed.
+    /// `job` run on this thread, its result held as an operation's until the run takes it: for a
+    /// job no other task of the run could go on beside. Its ticket is resolved as it is handed.
     pub fn done_here(
         &self,
         span: Span,
@@ -169,16 +169,16 @@ impl Run {
         Pending { token, label }
     }
 
-    /// Files a job's answer and rings the bell, after the answer is in place, so a wait that
+    /// Records a job's result and rings the bell, after the result is in place, so a wait that
     /// woke finds it.
-    fn file(&self, token: u64, answer: JobOutput) {
+    fn file(&self, token: u64, result: JobOutput) {
         if let Some(held) = lock(&self.held).get_mut(&token) {
-            held.answer = Some(answer);
+            held.result = Some(result);
         }
         self.bell.ring();
     }
 
-    /// Has `answered` name `pending` once it is answered; refuses a token this run did not submit.
+    /// Has `returned` name `pending` once it has returned; rejects a token this run did not submit.
     pub fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
         match lock(&self.held).get_mut(&pending.token) {
             Some(held) => {
@@ -189,29 +189,29 @@ impl Run {
         }
     }
 
-    /// Whether a watched operation has been answered and not collected.
+    /// Whether a watched operation has returned and not collected.
     pub fn ready(&self) -> bool {
         lock(&self.held)
             .values()
-            .any(|held| held.watched && held.answer.is_some())
+            .any(|held| held.watched && held.result.is_some())
     }
 
-    /// The watched operations answered and not yet taken, ascending, their answers left for `taken`.
-    pub fn answered(&self) -> Vec<u64> {
+    /// The watched operations returned, not yet taken, ascending, their results left for `taken`.
+    pub fn returned(&self) -> Vec<u64> {
         let mut tokens: Vec<u64> = (lock(&self.held).iter())
-            .filter(|(_, h)| h.watched && h.answer.is_some())
+            .filter(|(_, h)| h.watched && h.result.is_some())
             .map(|(token, _)| *token)
             .collect();
         tokens.sort_unstable();
         tokens
     }
 
-    /// The bytes a native's job answered `pending` where it has answered, which are then taken.
+    /// The bytes a native's job returned for `pending` where it has returned, which are then taken.
     pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
             None => return Err(err_unowned(pending)),
-            Some(h) if h.answer.is_none() => return Ok(None),
+            Some(h) if h.result.is_none() => return Ok(None),
             Some(_) => {}
         }
         let taken = held.remove(&pending.token);
@@ -220,14 +220,14 @@ impl Run {
             Some(Held {
                 span,
                 what,
-                answer: Some(answer),
+                result: Some(result),
                 ..
-            }) => bytes_of(span, what, answer).map(Some),
+            }) => bytes_of(span, what, result).map(Some),
             _ => Ok(None),
         }
     }
 
-    /// The bytes a native's job answered `pending` once it has answered, waiting for at most
+    /// The bytes a native's job returned for `pending` once it has returned, waiting for at most
     /// `bound` where one is given: `None` where the bound passed first.
     pub fn block_on(
         &self,
@@ -237,8 +237,8 @@ impl Run {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
             let seen = self.bell.rung();
-            if let Some(answer) = self.taken(pending)? {
-                return Ok(Some(answer));
+            if let Some(result) = self.taken(pending)? {
+                return Ok(Some(result));
             }
             match until {
                 None => self.bell.wait_past(seen),
@@ -253,7 +253,7 @@ impl Run {
         }
     }
 
-    /// Waits until a watched operation is answered, `stop` says to stop waiting, or `bound`
+    /// Waits until a watched operation has returned, `stop` says to stop waiting, or `bound`
     /// passes; `false`, at once, where no bound is given and the run watches nothing, so nothing
     /// would end the wait.
     pub fn park(&self, bound: Option<Duration>, stop: &dyn Fn() -> bool) -> bool {
@@ -282,18 +282,20 @@ impl Run {
     }
 }
 
-/// The bytes a native's job answered, which is all one answers.
-fn bytes_of(span: Span, what: &str, answer: JobOutput) -> Result<Vec<u8>, Diagnostic> {
-    answer.map_err(|failure| match failure {
+/// The bytes a native's job returned, which is all one returns.
+fn bytes_of(span: Span, what: &str, result: JobOutput) -> Result<Vec<u8>, Diagnostic> {
+    result.map_err(|failure| match failure {
         Failure::Said(message) => failed(span, what, &message),
-        Failure::Refused(diagnostic) => diagnostic,
+        Failure::Rejected(diagnostic) => diagnostic,
     })
 }
 
 #[cold]
 fn failed(span: Span, what: &str, message: &str) -> Diagnostic {
-    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what} failed: {message}"))
-        .primary(span, "this operation reached the host and the host refused")
+    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what} failed: {message}")).primary(
+        span,
+        "this operation reached the host and the host rejected it",
+    )
 }
 
 struct Shared {
@@ -303,7 +305,7 @@ struct Shared {
     queue: Option<Queue>,
 }
 
-/// A job and the run it answers.
+/// A job and the run it returns to.
 struct Entry {
     token: u64,
     run: Weak<Run>,
@@ -355,7 +357,7 @@ impl Pool {
 
     /// A pool whose operations wait their turn for one of `threads` threads, however many are
     /// submitted: for work that fills a core, where a thread each would finish none sooner and a
-    /// bound on how many wait would refuse a burst. A thread is started when an operation first
+    /// bound on how many wait would reject a burst. A thread is started when an operation first
     /// needs one, and ends when the pool is dropped.
     pub fn queued(threads: usize) -> Pool {
         Pool::over(Some(Queue {
@@ -374,7 +376,7 @@ impl Pool {
         }
     }
 
-    /// `job` run for `run`, which holds the operation as `what` until it takes the answer.
+    /// `job` run for `run`, which holds the operation as `what` until it takes the result.
     ///
     /// # Errors
     /// No thread could be had for it: the pool's bound was reached, or one could not start.
@@ -453,13 +455,13 @@ impl Pool {
     }
 }
 
-/// What `job` answered: one that panics is answered as one that failed.
+/// What `job` returned: one that panics counts as one that failed.
 fn outcome_of(job: Job) -> JobOutput {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
         .unwrap_or_else(|_| Err(Failure::Said("the host panicked doing it".to_string())))
 }
 
-/// Runs a job, gives back its thread with `freed`, and files its answer with its run where the run
+/// Runs a job, gives back its thread with `freed`, and records its result in its run where the run
 /// has not ended: what every pool's threads do with a job.
 fn finish(entry: Entry, freed: impl FnOnce()) {
     let outcome = outcome_of(entry.job);
@@ -501,7 +503,7 @@ fn err_unowned(pending: &Pending) -> Diagnostic {
         format!("the run holds no pending token `{pending}`"),
     )
     .primary(Span::DUMMY, "this token belongs to no operation of this run")
-    .note("a token is the run's that submitted its operation, until the run takes the answer; one another run submitted, or one already answered, is none of this one's")
+    .note("a token is the run's that submitted its operation, until the run takes the result; one another run submitted, or one whose result was taken, is none of this one's")
     .note("this is Ply's fault: report it with the program that produced it")
 }
 
@@ -516,7 +518,7 @@ pub(crate) fn err_nothing_outstanding() -> Diagnostic {
         Span::DUMMY,
         "no task is enabled and no host operation is pending",
     )
-    .note("waiting here would never return, so it is refused instead")
+    .note("waiting here would never return, so it is rejected instead")
     .note("this is Ply's fault: report it with the program that produced it")
 }
 
@@ -537,10 +539,10 @@ fn err_bounded(what: &str, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn err_no_thread(what: &str, why: &std::io::Error, span: Span) -> Diagnostic {
+fn err_no_thread(what: &str, reason: &std::io::Error, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{what} could not start: {why}"),
+        format!("{what} could not start: {reason}"),
     )
     .primary(span, "the host could not spawn a thread for this operation")
 }

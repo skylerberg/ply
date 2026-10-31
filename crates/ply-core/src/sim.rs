@@ -1,4 +1,4 @@
-//! Seeds, the ids of regions, tasks and channels, and what a region reads of a perform it answers.
+//! Seeds, scheduler, task and channel ids, and what a scheduler reads of a perform it handles.
 
 use std::fmt;
 
@@ -25,11 +25,11 @@ impl fmt::Display for Seed {
     }
 }
 
-/// A region of one entry, numbered in the order the entry opens them.
+/// A scheduler of one entry, numbered in the order the entry opens them.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct SimId(pub u32);
 
-/// Never reused within a region, and wide enough that a server spawning without pause never wraps.
+/// Never reused in a scheduler, and wide enough that a server spawning without pause never wraps.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TaskId(pub u64);
 
@@ -39,7 +39,7 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// A channel of one region, numbered as [`TaskId`] numbers tasks.
+/// A channel of one scheduler, numbered as [`TaskId`] numbers tasks.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChanId(pub u64);
 
@@ -49,10 +49,10 @@ impl fmt::Display for ChanId {
     }
 }
 
-/// Default scheduling steps per interleaving before the region is [`crate::codes::DEADLOCK`].
+/// Default scheduling steps per interleaving before the scheduler is [`crate::codes::DEADLOCK`].
 pub const DEFAULT_STEPS: u32 = 100_000;
 
-/// The operations of `task`, which a region's scheduler answers.
+/// The operations of `task`, which a scheduler handles.
 pub const TASK_OPS: &[&str] = &[
     "spawn", "join", "yield", "cancel", "await", "channel", "send", "recv", "close", "select",
 ];

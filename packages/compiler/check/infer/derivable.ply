@@ -5,12 +5,12 @@ import compiler.syntax.items (Item, FunctionItem, FnDefinition, Deriver, EqDeriv
                               KeyInstance, ShowInstance)
 import compiler.check.types (Type, VariableType, NamedType, RecordType, FunctionType, Field,
                              ints_insert, ints_union, is_rigid_type, type_text, printer_new,
-                             print_type, NominalType, arg_label, arg_row)
+                             print_type, NominalType, arg_label, arg_effects)
 import compiler.check.resolve.tables (Diagnostic, Label, qualify, default_binder, error_at,
                                       label_at)
 import compiler.check.typed (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
-import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat,
-                                          Unconstrained, HoldsSecret, HoldsNative, refusal_note,
+import compiler.check.infer.derivability (DeriveRejection, HoldsFunction, HoldsHandle, HoldsFloat,
+                                          Unconstrained, HoldsSecret, HoldsNative, rejection_note,
                                           secret_reason, float_reason)
 import std.bytes
 import std.option
@@ -44,7 +44,7 @@ pub fn native_notes(blocker: Bytes, deriver: Deriver) -> List<Bytes> =
   ]
 
 pub fn secret_notes(deriver: Deriver) -> List<Bytes> =
-  match refusal_note(HoldsSecret, deriver) {
+  match rejection_note(HoldsSecret, deriver) {
     Some(n) -> [secret_reason(deriver), n],
     None -> [secret_reason(deriver)],
   }
@@ -54,8 +54,8 @@ pub fn handle_type_name(ty: Type) -> Bytes = match ty { NamedType(c) -> c.name, 
 fn param_name(params: List<RigidParam>, v: Int, fallback: Bytes) -> Bytes =
   params.fold(fallback, |acc: Bytes, p: RigidParam| if p.var == v { p.name } else { acc })
 
-fn why_notes_for_map_key(
-  w: DeriveRefusal,
+fn reason_notes_for_map_key(
+  w: DeriveRejection,
   b: Blocker,
   blocker: Bytes,
   params: List<RigidParam>,
@@ -87,8 +87,8 @@ fn why_notes_for_map_key(
       ],
   }
 
-fn why_notes_for_constraint(
-  w: DeriveRefusal,
+fn reason_notes_for_constraint(
+  w: DeriveRejection,
   deriver: Deriver,
   b: Blocker,
   blocker: Bytes,
@@ -147,7 +147,7 @@ fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
                       _ -> None,
                     },
                   });
-                let answered = match by {
+                let returned = match by {
                   None -> None,
                   Some(f) -> {
                     let s = written_signature({ ..checker, module: i }, f);
@@ -156,15 +156,25 @@ fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
                       Some(p) -> match own_params(p, type_name) {
                         Some(own) -> if variables_of_type(s.sig.ret).all(|v: Int|
                             own.params.contains(v)) {
-                          Some({ params: own.params, rows: own.rows, result: s.sig.ret })
+                          Some({
+                            params: own.params,
+                            effect_params: own.effect_params,
+                            result: s.sig.ret,
+                          })
                         } else { None },
                         None -> None,
                       },
                     }
                   },
                 };
-                shapes.insert(type_name, match answered {
-                  Some(a) -> { ..shape, params: a.params, rows: a.rows, fields: [a.result] },
+                shapes.insert(type_name, match returned {
+                  Some(a) ->
+                    {
+                      ..shape,
+                      params: a.params,
+                      effect_params: a.effect_params,
+                      fields: [a.result],
+                    },
                   None -> { ..shape, fields: [] },
                 })
               },
@@ -391,7 +401,7 @@ pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
                       ]),
                   },
                   with_alias_note(
-                    why_notes_for_map_key(blocked.reason, blocked, blocker, site.params),
+                    reason_notes_for_map_key(blocked.reason, blocked, blocker, site.params),
                     site.via,
                   ).concat(match site.carrier {
                     None -> [],
@@ -499,7 +509,7 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                       ]),
                     ),
                   ],
-                  why_notes_for_constraint(
+                  reason_notes_for_constraint(
                     blocked.reason,
                     site.deriver,
                     blocked,
@@ -530,7 +540,7 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   walked.checker
 }
 
-pub fn settled_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
+pub fn resolved_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
   match ty {
     VariableType(v) -> match checker.witnessed.get(v) {
       Some(w) -> Some(ParamWitness(w.param)),
@@ -698,7 +708,7 @@ pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Der
             acc.insert(name, {
               ..shape,
               params: x.params,
-              rows: x.rows,
+              effect_params: x.effect_params,
               fields: if keyed { [x.results] } else { [] },
             }),
           None -> acc,
@@ -720,18 +730,18 @@ pub fn shapes_for(shapes: DeriverShapes, deriver: Deriver) -> Shapes =
   else if deriver == ShowDeriver { shapes.shown }
   else { shapes.plain }
 
-pub type OwnParams = { params: List<Int>, rows: List<Int> }
+pub type OwnParams = { params: List<Int>, effect_params: List<Int> }
 
 pub fn own_params(ty: Type, type_name: Bytes) -> Option<OwnParams> =
   match ty {
     NamedType(c) -> if c.name != type_name { None } else {
-      c.args.fold(Some({ params: [], rows: [] }), |acc: Option<OwnParams>, a: Type|
+      c.args.fold(Some({ params: [], effect_params: [] }), |acc: Option<OwnParams>, a: Type|
         match acc {
           None -> None,
-          Some(own) -> match arg_row(a) {
-            Some(row) -> match row.tail {
-              Some(v) -> if row.atoms.len() > 0 || own.rows.contains(v) { None }
-              else { Some({ ..own, rows: own.rows.push(v) }) },
+          Some(own) -> match arg_effects(a) {
+            Some(found) -> match found.variable {
+              Some(v) -> if found.listed.len() > 0 || own.effect_params.contains(v) { None }
+              else { Some({ ..own, effect_params: own.effect_params.push(v) }) },
               None -> None,
             },
             None -> match arg_label(a) {

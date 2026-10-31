@@ -5,7 +5,7 @@
 //! statement waiting on another connection's lock holds no scheduler, and a fold's statement
 //! stays open between its pages without leaving that thread.
 //!
-//! What the natives hand and answer is flat. A value is its kind's byte, 0 for null, 1 an integer,
+//! What the natives hand and return is flat. A value is its kind's byte, 0 for null, 1 an integer,
 //! 2 a float and 3 text, each number in eight bytes, the most significant first, and 4 bytes,
 //! then its bytes; a statement's values are parts. Limits are five integers. A failure is parts of
 //! its kind, its name and its detail. A reply is parts: the columns, the rows, each parts of its
@@ -51,14 +51,14 @@ enum Ask {
     Close,
 }
 
-enum Answer {
+enum Response {
     Reply(Reply),
     Done(bool),
 }
 
 struct Command {
     ask: Ask,
-    answer: Sender<Answer>,
+    result: Sender<Response>,
 }
 
 /// A connection a run holds open, under the root it was opened under.
@@ -68,8 +68,8 @@ struct Handle {
     commands: Sender<Command>,
 }
 
-/// The connections a run holds open, each under the number `sqlite.open` answered. A number is
-/// never answered twice, so one that was closed names nothing afterwards.
+/// The connections a run holds open, each under the number `sqlite.open` returned. A number is
+/// never returned twice, so one that was closed names nothing afterwards.
 #[derive(Default)]
 struct Connections {
     last: i64,
@@ -217,7 +217,7 @@ impl SqliteHost {
         Box::new(move || {
             let done = commands_of(&connections, &root, id)
                 .and_then(|commands| asked(&commands, Ask::Finish));
-            Ok(vec![u8::from(matches!(done, Some(Answer::Done(true))))])
+            Ok(vec![u8::from(matches!(done, Some(Response::Done(true))))])
         })
     }
 
@@ -359,7 +359,7 @@ fn placed(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagno
 }
 
 /// The connection `id` names under `root`. One another root opened is not open under this one,
-/// and answers as a number that names nothing does.
+/// and returns as a number that names nothing does.
 fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option<Sender<Command>> {
     lock(connections)
         .open
@@ -368,16 +368,16 @@ fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option
         .map(|handle| handle.commands.clone())
 }
 
-/// What a connection's thread answers `ask`; `None` when the thread is gone.
-fn asked(commands: &Sender<Command>, ask: Ask) -> Option<Answer> {
-    let (answer, answered) = channel();
-    commands.send(Command { ask, answer }).ok()?;
-    answered.recv().ok()
+/// What a connection's thread returns for `ask`; `None` when the thread is gone.
+fn asked(commands: &Sender<Command>, ask: Ask) -> Option<Response> {
+    let (result, returned) = channel();
+    commands.send(Command { ask, result }).ok()?;
+    returned.recv().ok()
 }
 
 fn reply_of(connections: &Mutex<Connections>, root: &Path, id: i64, ask: Ask) -> Reply {
     match commands_of(connections, root, id).and_then(|commands| asked(&commands, ask)) {
-        Some(Answer::Reply(reply)) => reply,
+        Some(Response::Reply(reply)) => reply,
         _ => Reply::failed(Failure::new(
             "closed",
             "",
@@ -454,21 +454,21 @@ fn opened(
         ));
     }
     let (commands, inbox) = channel();
-    let (answered, answer) = channel();
+    let (returned, result) = channel();
     let at = target.to_path_buf();
     std::thread::Builder::new()
         .name("ply-host-sqlite-connection".to_string())
         .spawn(move || match connect(&at, mode, options) {
             Err(failure) => {
-                let _ = answered.send(Err(failure));
+                let _ = returned.send(Err(failure));
             }
             Ok(engine) => {
-                let _ = answered.send(Ok(()));
+                let _ = returned.send(Ok(()));
                 serve(engine, inbox);
             }
         })
         .map_err(|e| Failure::new("unopened", "", format!("no thread for the connection: {e}")))?;
-    match answer.recv() {
+    match result.recv() {
         Ok(Ok(())) => {}
         Ok(Err(failure)) => return Err(failure),
         Err(_) => {
@@ -498,11 +498,11 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
     // Whether a fold's statement ran to its end and has not been finished.
     let mut folded = false;
     let mut next: Option<Command> = None;
-    while let Some(Command { ask, answer }) = next.take().or_else(|| commands.recv().ok()) {
+    while let Some(Command { ask, result }) = next.take().or_else(|| commands.recv().ok()) {
         let said = match ask {
             Ask::Close => {
                 drop(engine);
-                let _ = answer.send(Answer::Done(true));
+                let _ = result.send(Response::Done(true));
                 return;
             }
             Ask::Run {
@@ -510,22 +510,22 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                 params,
                 limits,
                 reads_only,
-            } => Answer::Reply(engine.run(&sql, &params, limits, reads_only)),
-            Ask::Control(step) => Answer::Reply(engine.control(step)),
-            Ask::Backup(to) => Answer::Reply(engine.backup(&to)),
-            Ask::Fetch(_) if folded => Answer::Reply(Reply::default()),
-            Ask::Fetch(_) => Answer::Reply(Reply::failed(Failure::new(
+            } => Response::Reply(engine.run(&sql, &params, limits, reads_only)),
+            Ask::Control(step) => Response::Reply(engine.control(step)),
+            Ask::Backup(to) => Response::Reply(engine.backup(&to)),
+            Ask::Fetch(_) if folded => Response::Reply(Reply::default()),
+            Ask::Fetch(_) => Response::Reply(Reply::failed(Failure::new(
                 "closed",
                 "",
                 "no fold is open on this connection",
             ))),
-            Ask::Finish => Answer::Done(std::mem::take(&mut folded)),
+            Ask::Finish => Response::Done(std::mem::take(&mut folded)),
             Ask::Cursor {
                 sql,
                 params,
                 limits,
             } => {
-                let mut waiting = Some(answer);
+                let mut waiting = Some(result);
                 let mut opened = false;
                 let mut finished = false;
                 engine.paged(&sql, &params, limits, true, |page| {
@@ -534,7 +534,7 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                     finished = !opened && page.failure.is_some();
                     opened = true;
                     if let Some(to) = waiting.take() {
-                        let _ = to.send(Answer::Reply(page));
+                        let _ = to.send(Response::Reply(page));
                     }
                     if over {
                         return None;
@@ -544,17 +544,17 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                             Err(_) => return None,
                             Ok(Command {
                                 ask: Ask::Fetch(rows),
-                                answer,
+                                result,
                             }) => {
-                                waiting = Some(answer);
+                                waiting = Some(result);
                                 return Some(rows.max(0));
                             }
                             Ok(Command {
                                 ask: Ask::Finish,
-                                answer,
+                                result,
                             }) => {
                                 finished = true;
-                                let _ = answer.send(Answer::Done(true));
+                                let _ = result.send(Response::Done(true));
                                 return None;
                             }
                             Ok(close @ Command { ask: Ask::Close, .. }) => {
@@ -562,8 +562,8 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                                 next = Some(close);
                                 return None;
                             }
-                            Ok(Command { answer, .. }) => {
-                                let _ = answer.send(Answer::Reply(Reply::failed(Failure::new(
+                            Ok(Command { result, .. }) => {
+                                let _ = result.send(Response::Reply(Reply::failed(Failure::new(
                                     "refused",
                                     "",
                                     "a fold is reading this connection: nothing else runs on it until the fold ends",
@@ -576,7 +576,7 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                 continue;
             }
         };
-        let _ = answer.send(said);
+        let _ = result.send(said);
     }
 }
 

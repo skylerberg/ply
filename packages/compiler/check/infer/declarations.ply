@@ -1,21 +1,21 @@
 import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, is_bare)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
-                                    UnitTypeExpression, InvalidTypeExpression, RowExpression,
-                                    AtomExpression, WriteMode, type_span, mode_text, is_raise,
+                                    UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
+                                    EffectExpression, WriteMode, type_span, mode_text, is_raise,
                                     identifier_names)
 import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, FnDefinition,
                               TypeDefinition, AliasBody, SumBody, VariantDefinition, OpDefinition,
                               Constraint, Deriver, OrdDeriver, NumericDeriver, IntegerDeriver,
                               is_predicate, NominalBody, ExternBody, constraint_written)
 import compiler.syntax.expressions (Param)
-import compiler.check.types (NamedResource, SingletonResource, ResourceVariable, AnyResource, Atom,
-                             Row, Type, VariableType, NamedType, FunctionType, RecordType, Field,
-                             Scheme, atoms_covered, atoms_insert, row_empty, row_open, unit_type,
-                             fn_type, fields_sorted, field_get, ints_insert, mark_rigid_type,
-                             mark_rigid_row, free_variables, env_bind_global, env_lookup,
-                             env_locals, InScope, label_type, applied_args, apply_arguments,
-                             NominalType, owning_fn_type)
+import compiler.check.types (NamedResource, SingletonResource, ResourceVariable, AnyResource,
+                             Effect, Effects, Type, VariableType, NamedType, FunctionType,
+                             RecordType, Field, Scheme, effects_cover, effects_insert, no_effects,
+                             open_effects, unit_type, fn_type, fields_sorted, field_get,
+                             ints_insert, mark_rigid_type, mark_rigid_effects, free_variables,
+                             env_bind_global, env_lookup, env_locals, InScope, label_type,
+                             applied_args, apply_arguments, NominalType, owning_fn_type)
 import compiler.check.known (scoped_name, scoped_type, task_name, chan_name, map_parts)
 import compiler.check.resolve.tables (ParsedModule, Binding, TypeSpace, EffectSpace, qualify,
                                       default_binder, backticked)
@@ -29,12 +29,13 @@ import compiler.check.infer.checker (Location, DeclaredAlias, DeclaredExtern, De
                                      EffectInfo, Signature, Assumption, OpenScope, Brand, HoldsOf,
                                      Tasks, RigidParam, MapKeySite, Checker, DefinitionConstraint,
                                      ConstraintSite, insert_constraint, dedup_constraints, WithType,
-                                     WithVar, WithRow, WithName, WithTypes, WithAtom, scoped_effect,
-                                     is_scoped_effect, location_of, module_name, scope_of,
-                                     report_error_at, report_error_at_and, supplied, new_type,
-                                     new_type_var, new_row, new_row_var, resolve, is_prelude_effect,
-                                     seed_atom, builtin_type_arity, add_constructor, constructor_of,
-                                     add_effect, effect_of, channel_ops, mode_eq, ConstructorInfo)
+                                     WithVar, WithEffects, WithName, WithTypes, WithEffect,
+                                     scoped_effect, is_scoped_effect, location_of, module_name,
+                                     scope_of, report_error_at, report_error_at_and, supplied,
+                                     new_type, new_type_var, new_effects, new_effect_variable,
+                                     resolve, is_prelude_effect, seed_effect, builtin_type_arity,
+                                     add_constructor, constructor_of, add_effect, effect_of,
+                                     channel_ops, mode_eq, ConstructorInfo)
 import compiler.check.infer.names (global, unresolved_in_derived, exporter, simple_name_of)
 
 fn type_param(checker: Checker, ident: Identifier) -> { checker: Checker, ty: Type } =
@@ -100,27 +101,27 @@ fn convert_type_within(
       let ps: WithTypes = convert_types_within(checker, f.params, room);
       let r: WithType = convert_type_within(ps.checker, f.ret, room);
       let eff = match f.effects {
-        Some(row) -> convert_row(r.checker, row),
-        None -> { checker: r.checker, row: row_empty() },
+        Some(effects) -> convert_effects(r.checker, effects),
+        None -> { checker: r.checker, effects: no_effects() },
       };
-      { checker: eff.checker, ty: owning_fn_type(ps.types, f.kept, f.once, r.ty, eff.row) }
+      { checker: eff.checker, ty: owning_fn_type(ps.types, f.kept, f.once, r.ty, eff.effects) }
     },
     NamedTypeExpression(c) ->
-      convert_constructor(checker, c.name, c.args, c.labels, c.rows, c.span, room),
+      convert_constructor(checker, c.name, c.args, c.labels, c.effect_arguments, c.span, room),
   }
 
-type LabelRowArguments = { labels: List<Type>, rows: List<Row> }
+type LabelAndEffectsArguments = { labels: List<Type>, effect_arguments: List<Effects> }
 
-fn convert_label_row_arguments(
+fn convert_label_and_effects_arguments(
   checker: Checker,
   labels: List<Identifier>,
-  rows: List<RowExpression>,
-) -> { checker: Checker, over: LabelRowArguments } / {abort.raise} = {
-  let converted = rows.fold(
-    { checker: checker, rows: [] },
-    |acc: { checker: Checker, rows: List<Row> }, row: RowExpression| {
-      let o = convert_row(acc.checker, row);
-      { checker: o.checker, rows: acc.rows.push(o.row) }
+  written: List<EffectsExpression>,
+) -> { checker: Checker, over: LabelAndEffectsArguments } / {abort.raise} = {
+  let converted = written.fold(
+    { checker: checker, effect_arguments: [] },
+    |acc: { checker: Checker, effect_arguments: List<Effects> }, effects: EffectsExpression| {
+      let o = convert_effects(acc.checker, effects);
+      { checker: o.checker, effect_arguments: acc.effect_arguments.push(o.effects) }
     },
   );
   {
@@ -131,7 +132,7 @@ fn convert_label_row_arguments(
           Some(v) -> VariableType(v),
           None -> label_type(label.name),
         }),
-      rows: converted.rows,
+      effect_arguments: converted.effect_arguments,
     },
   }
 }
@@ -139,8 +140,8 @@ fn convert_label_row_arguments(
 fn bind_declaration_params(
   checker: Checker,
   declaration: TypeDeclaration,
-) -> { checker: Checker, labels: List<Int>, rows: List<Int> } = {
-  let closed: Checker = { ..checker, label_params: Map::new(), row_params: Map::new() };
+) -> { checker: Checker, labels: List<Int>, effect_params: List<Int> } = {
+  let closed: Checker = { ..checker, label_params: Map::new(), effect_params: Map::new() };
   let labels = declaration.labels.fold(
     { checker: closed, vars: [] },
     |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
@@ -151,17 +152,17 @@ fn bind_declaration_params(
       }
     },
   );
-  let rows = declaration.rows.fold(
+  let effects = declaration.effect_params.fold(
     { checker: labels.checker, vars: [] },
     |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
-      let o: WithVar = new_row_var(acc.checker);
+      let o: WithVar = new_effect_variable(acc.checker);
       {
-        checker: { ..o.checker, row_params: o.checker.row_params.insert(name, o.var) },
+        checker: { ..o.checker, effect_params: o.checker.effect_params.insert(name, o.var) },
         vars: acc.vars.push(o.var),
       }
     },
   );
-  { checker: rows.checker, labels: labels.vars, rows: rows.vars }
+  { checker: effects.checker, labels: labels.vars, effect_params: effects.vars }
 }
 
 fn convert_types(
@@ -212,20 +213,20 @@ fn arity_error(
   )
 }
 
-fn refuse_label_row_count(
+fn reject_label_and_effects_count(
   checker: Checker,
   span: Span,
   name: Bytes,
   labels: Int,
-  rows: Int,
-  over: LabelRowArguments,
+  effects: Int,
+  over: LabelAndEffectsArguments,
 ) -> Checker / {abort.raise} =
   if over.labels.len() != labels {
     arity_error(checker, span, name, labels, over.labels.len(), b"label arguments", [
       b"a label argument is bracketed among the type arguments, where a binder writes `[l]`: `T<a, [conn]>`",
     ])
   } else {
-    arity_error(checker, span, name, rows, over.rows.len(), b"effects arguments", [
+    arity_error(checker, span, name, effects, over.effect_arguments.len(), b"effects arguments", [
       b"an effects argument follows `|`, where a binder writes its effect variable: `T<a | {}>` holds functions that perform nothing",
     ])
   }
@@ -235,11 +236,11 @@ fn convert_constructor(
   name: QName,
   args: List<TypeExpression>,
   labels: List<Identifier>,
-  rows: List<RowExpression>,
+  effect_arguments: List<EffectsExpression>,
   span: Span,
   room: Int,
 ) -> { checker: Checker, ty: Type } / {abort.raise} =
-  if is_bare(name) && args.len() == 0 && labels.len() == 0 && rows.len() == 0
+  if is_bare(name) && args.len() == 0 && labels.len() == 0 && effect_arguments.len() == 0
       && checker.type_params.contains(name.name.name) {
     {
       checker: checker,
@@ -247,17 +248,17 @@ fn convert_constructor(
     }
   } else {
     let converted: WithTypes = convert_types_within(checker, args, room);
-    let written = convert_label_row_arguments(converted.checker, labels, rows);
+    let written = convert_label_and_effects_arguments(converted.checker, labels, effect_arguments);
     let c: Checker = written.checker;
-    let over: LabelRowArguments = written.over;
+    let over: LabelAndEffectsArguments = written.over;
     match if is_bare(name) { builtin_type_arity(name.name.name) } else { None } {
       Some(arity) -> if converted.types.len() != arity {
         new_type(
           arity_error(c, span, name.name.name, arity, converted.types.len(), b"type arguments", []),
         )
       } else if name.name.name == scoped_name() {
-        if over.labels.len() != 1 || over.rows.len() != 0 {
-          new_type(refuse_label_row_count(c, span, name.name.name, 1, 0, over))
+        if over.labels.len() != 1 || over.effect_arguments.len() != 0 {
+          new_type(reject_label_and_effects_count(c, span, name.name.name, 1, 0, over))
         } else {
           let label = match c.label_params.get(labels.get(0).name) {
             Some(v) -> VariableType(v),
@@ -265,8 +266,8 @@ fn convert_constructor(
           };
           { checker: c, ty: scoped_type(label, converted.types.get(0)) }
         }
-      } else if labels.len() > 0 || rows.len() > 0 {
-        new_type(refuse_label_row_count(c, span, name.name.name, 0, 0, over))
+      } else if labels.len() > 0 || effect_arguments.len() > 0 {
+        new_type(reject_label_and_effects_count(c, span, name.name.name, 0, 0, over))
       } else {
         let built = NamedType({ name: name.name.name, args: converted.types });
         { checker: note_parts(c, span, own_parts(c.carrying, built, [])), ty: built }
@@ -291,14 +292,14 @@ fn convert_constructor(
                 ),
               )
             } else if over.labels.len() != declaration.labels.len()
-                || over.rows.len() != declaration.rows.len() {
+                || over.effect_arguments.len() != declaration.effect_params.len() {
               new_type(
-                refuse_label_row_count(
+                reject_label_and_effects_count(
                   g.checker,
                   span,
                   name.name.name,
                   declaration.labels.len(),
-                  declaration.rows.len(),
+                  declaration.effect_params.len(),
                   over,
                 ),
               )
@@ -307,7 +308,7 @@ fn convert_constructor(
                 DeclaredSum -> {
                   let built = NamedType({
                     name: qualified,
-                    args: applied_args(converted.types, over.labels, over.rows),
+                    args: applied_args(converted.types, over.labels, over.effect_arguments),
                   });
                   {
                     checker: note_type_constraints(
@@ -324,7 +325,7 @@ fn convert_constructor(
                     checker: note_type_constraints(g.checker, span, qualified, converted.types),
                     ty: NamedType({
                       name: qualified,
-                      args: applied_args(converted.types, over.labels, over.rows),
+                      args: applied_args(converted.types, over.labels, over.effect_arguments),
                     }),
                   },
                 DeclaredRecord(body) -> {
@@ -335,8 +336,8 @@ fn convert_constructor(
                       let built = apply_arguments(
                         r.ty,
                         r.type_variables,
-                        r.row_variables,
-                        applied_args(converted.types, over.labels, over.rows),
+                        r.effect_variables,
+                        applied_args(converted.types, over.labels, over.effect_arguments),
                       );
                       {
                         checker: note_type_constraints(
@@ -379,7 +380,7 @@ fn convert_constructor(
                       relocated_keys(sites, before, g.checker.module, span, name.name.name)
                     } else { sites };
                   let memo = declaration.params.len() == 0 && declaration.labels.len() == 0
-                    && declaration.rows.len() == 0;
+                    && declaration.effect_params.len() == 0;
                   match if memo { g.checker.aliases.get(qualified) } else { None } {
                     Some(m) -> {
                       let assumed = assumed_for(g.checker, OrdDeriver);
@@ -407,26 +408,27 @@ fn convert_constructor(
                         declaration,
                       );
                       let body: WithType = convert_type_within(own.checker, alias, room - 1);
-                      let o: WithType = if own.labels.len() == 0 && own.rows.len() == 0 { body }
-                      else {
+                      let o: WithType = if own.labels.len() == 0 && own.effect_params.len() == 0 {
+                        body
+                      } else {
                         {
                           checker: body.checker,
                           ty: apply_arguments(
                             body.ty,
                             own.labels,
-                            own.rows,
-                            applied_args([], over.labels, over.rows),
+                            own.effect_params,
+                            applied_args([], over.labels, over.effect_arguments),
                           ),
                         }
                       };
                       let kept = memo && o.checker.fresh == g.checker.fresh
                         && o.checker.diagnostics.len() == g.checker.diagnostics.len()
-                        && o.checker.refused_atoms.len() == g.checker.refused_atoms.len();
+                        && o.checker.rejected_effects.len() == g.checker.rejected_effects.len();
                       {
                         checker: {
                           ..o.checker,
                           type_params: saved,
-                          row_params: g.checker.row_params,
+                          effect_params: g.checker.effect_params,
                           label_params: g.checker.label_params,
                           alias_stack: o.checker.alias_stack.take(o.checker.alias_stack.len() - 1),
                           module: g.checker.module,
@@ -522,18 +524,18 @@ fn declared_record(
           args: applied_args(
             vars.vars.map(|v: Int| VariableType(v)),
             own.labels.map(|v: Int| VariableType(v)),
-            own.rows.map(row_open),
+            own.effect_params.map(open_effects),
           ),
           fields: fields,
         }),
         type_variables: vars.vars.concat(own.labels),
-        row_variables: own.rows,
+        effect_variables: own.effect_params,
       };
       {
         checker: {
           ..checked,
           type_params: checker.type_params,
-          row_params: checker.row_params,
+          effect_params: checker.effect_params,
           label_params: checker.label_params,
           alias_stack: checker.alias_stack,
           module: checker.module,
@@ -603,8 +605,8 @@ fn unknown_type(checker: Checker, qname: QName) -> Checker / {abort.raise} =
     },
   }
 
-fn row_param(checker: Checker, ident: Identifier) -> { checker: Checker, v: Option<Int> } =
-  match checker.row_params.get(ident.name) {
+fn effect_param(checker: Checker, ident: Identifier) -> { checker: Checker, v: Option<Int> } =
+  match checker.effect_params.get(ident.name) {
     Some(v) -> { checker: checker, v: Some(v) },
     None ->
       {
@@ -626,47 +628,51 @@ fn row_param(checker: Checker, ident: Identifier) -> { checker: Checker, v: Opti
       },
   }
 
-fn convert_row(
+fn convert_effects(
   checker: Checker,
-  row: RowExpression,
-) -> { checker: Checker, row: Row } / {abort.raise} = {
-  let o = convert_bounded_row(checker, row);
-  { checker: refuse_marks(o.checker, row), row: o.r }
+  effects: EffectsExpression,
+) -> { checker: Checker, effects: Effects } / {abort.raise} = {
+  let o = convert_bounded_effects(checker, effects);
+  { checker: reject_marks(o.checker, effects), effects: o.r }
 }
 
-fn convert_bounded_row(
+fn convert_bounded_effects(
   checker: Checker,
-  row: RowExpression,
-) -> { checker: Checker, r: Row, bounded: List<Atom> } / {abort.raise} = {
-  let atoms = row.atoms.fold(
-    { checker: checker, atoms: [], bounded: [] },
-    |acc: { checker: Checker, atoms: List<Atom>, bounded: List<Atom> }, atom: AtomExpression| {
-      let o: WithAtom = convert_atom(acc.checker, atom);
-      match o.atom {
+  effects: EffectsExpression,
+) -> { checker: Checker, r: Effects, bounded: List<Effect> } / {abort.raise} = {
+  let converted = effects.listed.fold(
+    { checker: checker, listed: [], bounded: [] },
+    |acc: { checker: Checker, listed: List<Effect>, bounded: List<Effect> }, entry: EffectExpression| {
+      let o: WithEffect = convert_effect(acc.checker, entry);
+      match o.entry {
         Some(x) ->
           {
             checker: o.checker,
-            atoms: atoms_insert(acc.atoms, x),
-            bounded: if atom.bounded { atoms_insert(acc.bounded, x) } else { acc.bounded },
+            listed: effects_insert(acc.listed, x),
+            bounded: if entry.bounded { effects_insert(acc.bounded, x) } else { acc.bounded },
           },
         None -> { ..acc, checker: o.checker },
       }
     },
   );
-  let tail = match row.tail {
-    Some(t) -> row_param(atoms.checker, t),
-    None -> { checker: atoms.checker, v: None },
+  let tail = match effects.variable {
+    Some(t) -> effect_param(converted.checker, t),
+    None -> { checker: converted.checker, v: None },
   };
-  { checker: tail.checker, r: { atoms: atoms.atoms, tail: tail.v }, bounded: atoms.bounded }
+  {
+    checker: tail.checker,
+    r: { listed: converted.listed, variable: tail.v },
+    bounded: converted.bounded,
+  }
 }
 
-fn refuse_marks(checker: Checker, row: RowExpression) -> Checker = {
-  let marked = row.atoms.fold(checker, |c: Checker, atom: AtomExpression|
-    if atom.bounded { refuse_mark(c, atom.span) } else { c });
-  if row.tail_bounded { refuse_mark(marked, row.span) } else { marked }
+fn reject_marks(checker: Checker, effects: EffectsExpression) -> Checker = {
+  let marked = effects.listed.fold(checker, |c: Checker, entry: EffectExpression|
+    if entry.bounded { reject_mark(c, entry.span) } else { c });
+  if effects.variable_bounded { reject_mark(marked, effects.span) } else { marked }
 }
 
-fn refuse_mark(checker: Checker, span: Span) -> Checker =
+fn reject_mark(checker: Checker, span: Span) -> Checker =
   report_error_at(
     checker,
     b"E0466",
@@ -678,14 +684,17 @@ fn refuse_mark(checker: Checker, span: Span) -> Checker =
     ],
   )
 
-fn is_refused_atom(checker: Checker, s: Span) -> Bool =
-  checker.refused_atoms.fold(false, |acc: Bool, x: Location|
+fn is_rejected_effect(checker: Checker, s: Span) -> Bool =
+  checker.rejected_effects.fold(false, |acc: Bool, x: Location|
     acc || (x.module == checker.module && x.span == s))
 
-fn mark_refused_atom(checker: Checker, s: Span) -> Checker =
-  { ..checker, refused_atoms: checker.refused_atoms.push({ module: checker.module, span: s }) }
+fn mark_rejected_effect(checker: Checker, s: Span) -> Checker =
+  {
+    ..checker,
+    rejected_effects: checker.rejected_effects.push({ module: checker.module, span: s }),
+  }
 
-fn refuse_any_label(
+fn reject_any_label(
   checker: Checker,
   span: Span,
   eff: Bytes,
@@ -702,17 +711,17 @@ fn refuse_any_label(
     b"declared without `[r]`",
     [],
   );
-  mark_refused_atom(reported, span)
+  mark_rejected_effect(reported, span)
 }
 
-pub fn convert_atom(
+pub fn convert_effect(
   checker: Checker,
-  a: AtomExpression,
-) -> { checker: Checker, atom: Option<Atom> } / {abort.raise} =
-  if is_refused_atom(checker, a.span) { { checker: checker, atom: None } } else {
+  a: EffectExpression,
+) -> { checker: Checker, entry: Option<Effect> } / {abort.raise} =
+  if is_rejected_effect(checker, a.span) { { checker: checker, entry: None } } else {
     let e: WithName = effect_name(checker, a.effect_name);
     match e.name {
-      None -> { checker: mark_refused_atom(e.checker, a.span), atom: None },
+      None -> { checker: mark_rejected_effect(e.checker, a.span), entry: None },
       Some(eff) -> {
         let resource = if a.every { AnyResource } else {
           match a.resource {
@@ -724,20 +733,20 @@ pub fn convert_atom(
           }
         };
         let info = effect_of(e.checker, eff);
-        let label_less: { checker: Checker, refused: Bool } = match a.op {
+        let label_less: { checker: Checker, rejected: Bool } = match a.op {
           Some(op) -> match info {
             Some(i) -> match op_named(i, op.name) {
               Some(o) -> if a.every && !o.resource_param {
-                { checker: refuse_any_label(e.checker, a.span, eff, o.name, o.at), refused: true }
-              } else { { checker: e.checker, refused: false } },
-              None -> { checker: e.checker, refused: false },
+                { checker: reject_any_label(e.checker, a.span, eff, o.name, o.at), rejected: true }
+              } else { { checker: e.checker, rejected: false } },
+              None -> { checker: e.checker, rejected: false },
             },
-            None -> { checker: e.checker, refused: false },
+            None -> { checker: e.checker, rejected: false },
           },
-          None -> { checker: e.checker, refused: false },
+          None -> { checker: e.checker, rejected: false },
         };
         let named_context: Checker = label_less.checker;
-        let atom: Option<Atom> = if label_less.refused { None } else {
+        let entry: Option<Effect> = if label_less.rejected { None } else {
           match a.op {
             Some(op) -> match info {
               Some(i) -> match op_named(i, op.name) {
@@ -761,8 +770,8 @@ pub fn convert_atom(
             },
           }
         };
-        match atom {
-          Some(_) -> { checker: named_context, atom: atom },
+        match entry {
+          Some(_) -> { checker: named_context, entry: entry },
           None -> {
             let known = match info {
               Some(i) -> match a.op {
@@ -806,7 +815,7 @@ pub fn convert_atom(
               label,
               help,
             );
-            { checker: mark_refused_atom(reported, a.span), atom: None }
+            { checker: mark_rejected_effect(reported, a.span), entry: None }
           },
         }
       },
@@ -868,7 +877,7 @@ fn unknown_effect(checker: Checker, qname: QName) -> Checker / {abort.raise} = {
         n,
         b"` is a value in scope, so this looks like a field call rather than a perform: write `(",
         n,
-        b".<field>)(..)` to call a function held in a record",
+        b".<field>)(..)` to call a function stored in a record",
       ]),
       b"`a.b(c)` is an effect operation; parentheses make it a field access",
     ])
@@ -942,7 +951,7 @@ fn record_type(
           types: s.checker.types.insert(name, {
             params: identifier_names(definition.generics.types),
             labels: identifier_names(definition.generics.labels),
-            rows: identifier_names(definition.generics.effects),
+            effect_params: identifier_names(definition.generics.effects),
             constraints: dedup_constraints(s.constraints),
             declared: declared,
             opaque: definition.opaque,
@@ -1077,9 +1086,9 @@ fn scope_reach(ty: Type) -> Option<Bytes> =
     NamedType(c) -> first_reason(c.args, scope_reach),
     RecordType(fs) -> first_reason(fs, |f: Field| scope_reach(f.ty)),
     NominalType(n) -> first_reason(n.fields, |f: Field| scope_reach(f.ty)),
-    FunctionType(f) -> if f.effects.atoms.fold(false, |b: Bool, atom: Atom|
-        b || atom.effect == scoped_effect()) { Some(b"`Scoped`") }
-    else if row_reaches_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
+    FunctionType(f) -> if f.effects.listed.fold(false, |b: Bool, entry: Effect|
+        b || entry.effect == scoped_effect()) { Some(b"`Scoped`") }
+    else if effects_reach_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
       match first_reason(f.params, scope_reach) { Some(b) -> Some(b), None -> scope_reach(f.ret) }
     },
   }
@@ -1278,7 +1287,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                 args: applied_args(
                   vars.vars.map(|v: Int| VariableType(v)),
                   own.labels.map(|v: Int| VariableType(v)),
-                  own.rows.map(row_open),
+                  own.effect_params.map(open_effects),
                 ),
               });
               let walked: Checker = range(0, variants.len()).fold(c1, |cc: Checker, index: Int| {
@@ -1307,10 +1316,10 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                         ),
                     );
                     let ty = if fs.types.len() == 0 { result }
-                    else { fn_type(fs.types, result, row_empty()) };
+                    else { fn_type(fs.types, result, no_effects()) };
                     let sc = {
                       type_variables: vars.vars,
-                      row_variables: own.rows,
+                      effect_variables: own.effect_params,
                       keep_variables: [],
                       label_variables: own.labels,
                       ty: ty,
@@ -1332,7 +1341,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
               {
                 ..walked,
                 type_params: Map::new(),
-                row_params: Map::new(),
+                effect_params: Map::new(),
                 label_params: Map::new(),
                 collecting: c.collecting,
               }
@@ -1343,7 +1352,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
       _ -> c,
     })
 
-pub fn refuse_irregular(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
+pub fn reject_irregular(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let generic = parsed.module.items.fold([], |acc: List<TypeDefinition>, item: Item|
     match item {
       TypeItem(definition) -> match definition.body {
@@ -1372,7 +1381,7 @@ pub fn refuse_irregular(checker: Checker, parsed: ParsedModule) -> Checker / {ab
             b"` holds itself at a type grown from its own parameters",
           ]),
           b"declared here",
-          [b"a sum may hold itself at its own parameters, or through a function"],
+          [b"a sum may contain itself at its own parameters, or through a function"],
         )
       })
   }
@@ -1602,16 +1611,16 @@ pub fn member_scheme(
   definition: FnDefinition,
   sig: Signature,
 ) -> Scheme / {abort.raise} = {
-  let free = free_variables(checker.substitution, sig.fn_type, { types: [], rows: [] });
+  let free = free_variables(checker.substitution, sig.fn_type, { types: [], effect_variables: [] });
   {
     type_variables: definition.generics.types.fold([], |vs: List<Int>, ident: Identifier|
       match sig.type_params.get(ident.name) {
         Some(VariableType(v)) -> if free.types.contains(v) { vs.push(v) } else { vs },
         _ -> vs,
       }),
-    row_variables: definition.generics.effects.fold([], |vs: List<Int>, ident: Identifier|
-      match sig.row_params.get(ident.name) {
-        Some(v) -> if free.rows.contains(v) { vs.push(v) } else { vs },
+    effect_variables: definition.generics.effects.fold([], |vs: List<Int>, ident: Identifier|
+      match sig.effect_params.get(ident.name) {
+        Some(v) -> if free.effect_variables.contains(v) { vs.push(v) } else { vs },
         None -> vs,
       }),
     keep_variables: definition.generics.kept.fold([], |vs: List<Int>, ident: Identifier|
@@ -1633,26 +1642,32 @@ pub fn written_signature(
     ..outer,
     scope: outer.scope + 1,
     type_params: Map::new(),
-    row_params: Map::new(),
+    effect_params: Map::new(),
     label_params: Map::new(),
   };
   let types: Checker = bind_type_params(checker, definition.generics.types);
-  let rows: Checker = definition.generics.effects.fold(types, |c: Checker, p: Identifier| {
-    let o: WithVar = new_row_var(c);
-    {
-      ..o.checker,
-      substitution: mark_rigid_row(o.checker.substitution, o.var),
-      row_params: o.checker.row_params.insert(p.name, o.var),
-    }
-  });
-  let labels: Checker = definition.generics.labels.fold(rows, |c: Checker, p: Identifier| {
-    let o: WithVar = new_type_var(c);
-    {
-      ..o.checker,
-      substitution: mark_rigid_type(o.checker.substitution, o.var),
-      label_params: o.checker.label_params.insert(p.name, o.var),
-    }
-  });
+  let with_effects: Checker = definition.generics.effects.fold(
+    types,
+    |c: Checker, p: Identifier| {
+      let o: WithVar = new_effect_variable(c);
+      {
+        ..o.checker,
+        substitution: mark_rigid_effects(o.checker.substitution, o.var),
+        effect_params: o.checker.effect_params.insert(p.name, o.var),
+      }
+    },
+  );
+  let labels: Checker = definition.generics.labels.fold(
+    with_effects,
+    |c: Checker, p: Identifier| {
+      let o: WithVar = new_type_var(c);
+      {
+        ..o.checker,
+        substitution: mark_rigid_type(o.checker.substitution, o.var),
+        label_params: o.checker.label_params.insert(p.name, o.var),
+      }
+    },
+  );
   let assumed: Checker = note_witness_params(
     { ..labels, assumed: constraints_in_force(labels, definition.constraints) },
     definition.constraints,
@@ -1679,37 +1694,37 @@ pub fn written_signature(
     },
     None -> new_type(params.checker),
   };
-  let declared: { checker: Checker, r: Option<Row>, bounded: List<Atom> } = match definition.effects {
+  let declared: { checker: Checker, r: Option<Effects>, bounded: List<Effect> } = match definition.effects {
     Some(r) -> {
-      let o = convert_bounded_row(ret.checker, r);
+      let o = convert_bounded_effects(ret.checker, r);
       { checker: o.checker, r: Some(o.r), bounded: o.bounded }
     },
-    None -> { checker: ret.checker, r: Some(row_empty()), bounded: [] },
+    None -> { checker: ret.checker, r: Some(no_effects()), bounded: [] },
   };
-  let row: WithRow = match declared.r {
-    Some(r) -> { checker: declared.checker, row: r },
-    None -> new_row(declared.checker),
+  let effects: WithEffects = match declared.r {
+    Some(r) -> { checker: declared.checker, effects: r },
+    None -> new_effects(declared.checker),
   };
-  let c: Checker = row.checker;
+  let c: Checker = effects.checker;
   {
-    checker: { ..c, type_params: Map::new(), row_params: Map::new(), label_params: Map::new() },
+    checker: { ..c, type_params: Map::new(), effect_params: Map::new(), label_params: Map::new() },
     sig: {
       type_params: c.type_params,
-      row_params: c.row_params,
+      effect_params: c.effect_params,
       label_params: c.label_params,
       fn_type: owning_fn_type(
         params.types,
         range(0, definition.params.len()).filter(|i: Int| definition.params.get(i).keep),
         false,
         ret.ty,
-        row.row,
+        effects.effects,
       ),
       params: params.types,
       ret: ret.ty,
       declared: declared.r,
-      published_row: row.row,
+      published_effects: effects.effects,
       bounded: declared.bounded,
-      tail_bounded: match definition.effects { Some(r) -> r.tail_bounded, None -> false },
+      variable_bounded: match definition.effects { Some(r) -> r.variable_bounded, None -> false },
       scope: c.scope,
     },
   }
@@ -1742,7 +1757,7 @@ pub fn check_scoped_placement(
       b"a `Scoped` is written where it would be kept",
       b"a scoped value is passed down, never kept",
       [
-        b"a scoped value is a parameter of a definition, a lambda or a function type: it is not returned, held in another value or bound by an annotation",
+        b"a scoped value is a parameter of a definition, a lambda or a function type: it is not returned, stored in another value or bound by an annotation",
         b"read it where it is passed, with `Scoped::get`, and keep what the read answers",
       ],
     )
@@ -1946,17 +1961,17 @@ pub fn note_witness_params(checker: Checker, cs: List<Constraint>) -> Checker =
 
 pub fn is_scheduler_handle(name: Bytes) -> Bool = name == task_name() || name == chan_name()
 
-pub fn task_op(op: Bytes) -> Atom =
+pub fn task_op(op: Bytes) -> Effect =
   { effect: b"task", resource: SingletonResource, mode: WriteMode, op: Some(op) }
 
-pub fn row_reaches_brand(row: Row, brand: Brand) -> Bool =
+pub fn effects_reach_brand(effects: Effects, brand: Brand) -> Bool =
   match brand {
     HoldsOf(r) ->
-      row.atoms.fold(false, |b: Bool, atom: Atom|
-        b || (atom.effect == scoped_effect() && atom.resource == NamedResource(r))),
+      effects.listed.fold(false, |b: Bool, entry: Effect|
+        b || (entry.effect == scoped_effect() && entry.resource == NamedResource(r))),
     Tasks ->
       [b"join", b"await", b"cancel"].concat(channel_ops()).fold(
-        atoms_covered(row.atoms, seed_atom()),
-        |b: Bool, op: Bytes| b || atoms_covered(row.atoms, task_op(op)),
+        effects_cover(effects.listed, seed_effect()),
+        |b: Bool, op: Bytes| b || effects_cover(effects.listed, task_op(op)),
       ),
   }

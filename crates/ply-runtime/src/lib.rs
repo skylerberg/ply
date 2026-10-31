@@ -1,6 +1,6 @@
 //! The runtime a native Ply program is linked with. The program's `main` calls [`ply_native_enter`]
 //! with its unit's descriptor; this binds the runtime to the unit and enters the program's entry
-//! with the command line, its pack's shipped modules and its environment lent.
+//! with the command line, its pack's shipped modules and its environment granted.
 
 use ply_compiled::c::descriptor::Descriptor;
 use std::ffi::{c_char, c_int};
@@ -27,7 +27,7 @@ pub extern "C" fn ply_runtime_described() -> *const c_char {
         .as_ptr()
 }
 
-/// Runs the linked program, whose unit lays `unit` out, and answers its exit code. The command
+/// Runs the linked program, whose unit lays `unit` out, and returns its exit code. The command
 /// line is read from the process, as Rust's own `main` reads it.
 ///
 /// # Safety
@@ -45,14 +45,14 @@ pub unsafe extern "C" fn ply_native_enter(
 unsafe fn run(unit: *const Descriptor) -> c_int {
     ply_host::time::mark_start(std::time::Instant::now());
     // Rust's own `main` does this before any user code, so a write to a closed pipe is an error the
-    // program answers rather than a signal that ends it; entered from C, the runtime does it here.
+    // program handles rather than a signal that ends it; entered from C, the runtime does it here.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    if let Err(why) = unsafe { ply_compiled::c::linked::install(unit) } {
-        eprintln!("ply: {why}");
+    if let Err(reason) = unsafe { ply_compiled::c::linked::install(unit) } {
+        eprintln!("ply: {reason}");
         return 2;
     }
-    if let Err(why) = ply_launcher::install_own_pack() {
-        eprintln!("ply: {why}");
+    if let Err(reason) = ply_launcher::install_own_pack() {
+        eprintln!("ply: {reason}");
         return 2;
     }
     let program = match ply_launcher::linked_program() {
@@ -66,8 +66,8 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
     // The launcher's own flags, taken out before the program parses the line.
     let count = match ply_launcher::count::flag(&mut argv) {
         Ok(count) => count,
-        Err(why) => {
-            eprintln!("ply: {why}");
+        Err(reason) => {
+            eprintln!("ply: {reason}");
             return 2;
         }
     };

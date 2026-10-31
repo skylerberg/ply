@@ -22,7 +22,7 @@ fn nearest(r: &BigFloat) -> f64 {
     let m = (u128::from(words[n_words - 1]) << 64) | u128::from(words[n_words - 2]);
     let mut sticky = inexact || words[..n_words - 2].iter().any(|w| *w != 0);
     let e = i64::from(e);
-    // How many leading bits the answer keeps: 53, fewer for a subnormal.
+    // How many leading bits the result keeps: 53, fewer for a subnormal.
     let kept = (e + 1074).min(53);
     let (mut q, half) = if kept < 0 {
         sticky = true;
@@ -54,7 +54,7 @@ fn nearest(r: &BigFloat) -> f64 {
     if sign == Sign::Neg { -f } else { f }
 }
 
-/// The correctly rounded answer `r` approximates to `p` bits, or `None` where it lies too near a
+/// The correctly rounded result `r` approximates to `p` bits, or `None` where it lies too near a
 /// midpoint between two `Float`s for `p` bits to say which side.
 fn decided(r: &BigFloat, p: usize) -> Option<f64> {
     if r.is_nan() {
@@ -78,7 +78,7 @@ fn precision(x: f64) -> usize {
     256 + (x.abs().log2().max(0.0) as usize)
 }
 
-/// A `Float` function the runtime answers correctly rounded.
+/// A `Float` function the runtime computes correctly rounded.
 #[derive(Clone, Copy, Debug)]
 enum Function {
     Sqrt,
@@ -207,8 +207,8 @@ impl Rng {
     }
 }
 
-/// What the runtime's function for builtin `b` answers over `x`, and `y` where it takes two.
-fn answered(b: Function, x: f64, y: f64) -> f64 {
+/// What the runtime's function for builtin `b` returns over `x`, and `y` where it takes two.
+fn returned(b: Function, x: f64, y: f64) -> f64 {
     match b {
         Function::Sqrt => x.sqrt(),
         Function::Exp => float::exp(x),
@@ -228,7 +228,7 @@ fn answered(b: Function, x: f64, y: f64) -> f64 {
 }
 
 #[test]
-fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
+fn every_float_function_returns_the_nearest_float_to_the_exact_value() {
     let functions = [
         Function::Sqrt,
         Function::Exp,
@@ -255,11 +255,11 @@ fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
                 continue;
             };
             judged += 1;
-            let got = answered(b, x, y);
+            let got = returned(b, x, y);
             assert_eq!(
                 bits(got),
                 bits(want),
-                "`{}({x:e}, {y:e})` answered {got:e}, and the nearest Float is {want:e}",
+                "`{}({x:e}, {y:e})` returned {got:e}, and the nearest Float is {want:e}",
                 b.name()
             );
         }

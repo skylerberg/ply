@@ -24,15 +24,15 @@ fn done(engine: &mut Engine, sql: &str) -> Reply {
     reply
 }
 
-fn refused(engine: &mut Engine, sql: &str) -> Failure {
+fn rejected(engine: &mut Engine, sql: &str) -> Failure {
     let reply = run(engine, sql);
     reply
         .failure
-        .unwrap_or_else(|| panic!("`{sql}` ran, and answered {:?}", reply.rows))
+        .unwrap_or_else(|| panic!("`{sql}` ran, and returned {:?}", reply.rows))
 }
 
 fn kind(engine: &mut Engine, sql: &str) -> &'static str {
-    refused(engine, sql).kind
+    rejected(engine, sql).kind
 }
 
 fn text(s: &str) -> Scalar {
@@ -136,7 +136,7 @@ fn a_statement_cannot_reach_another_file() {
         "SELECT readfile('/etc/passwd')",
         "SELECT writefile('/tmp/ply-sqlite-escape', 'x')",
     ] {
-        let failure = refused(&mut engine, sql);
+        let failure = rejected(&mut engine, sql);
         assert!(
             failure.kind == "refused" || failure.kind == "statement",
             "{sql}: {failure:?}"
@@ -180,7 +180,7 @@ fn a_statement_cannot_change_what_the_connection_was_opened_with() {
 }
 
 #[test]
-fn time_and_randomness_are_refused_wherever_they_are_written() {
+fn time_and_randomness_are_rejected_wherever_they_are_written() {
     let mut engine = empty();
     for sql in [
         "SELECT random()",
@@ -212,7 +212,7 @@ fn time_and_randomness_are_refused_wherever_they_are_written() {
 }
 
 #[test]
-fn a_date_function_that_reads_no_clock_answers() {
+fn a_date_function_that_reads_no_clock_returns() {
     let mut engine = empty();
     for (sql, wanted) in [
         (
@@ -244,7 +244,7 @@ fn a_date_function_that_reads_no_clock_answers() {
 }
 
 #[test]
-fn a_view_or_a_trigger_cannot_smuggle_a_refused_function() {
+fn a_view_or_a_trigger_cannot_smuggle_a_rejected_function() {
     let mut engine = empty();
     done(&mut engine, "CREATE TABLE a (x INTEGER) STRICT");
     run(&mut engine, "CREATE VIEW dice AS SELECT random() AS r");
@@ -384,7 +384,7 @@ fn a_constraint_failure_says_its_kind_and_what_it_names() {
         ("INSERT INTO c (p, n) VALUES (9, 1)", "foreign_key", ""),
         ("INSERT INTO c (p, n) VALUES (1, 'many')", "datatype", "c.n"),
     ] {
-        let failure = refused(&mut engine, sql);
+        let failure = rejected(&mut engine, sql);
         assert_eq!(
             (failure.kind, failure.name.as_str()),
             (kind, name),
@@ -420,7 +420,7 @@ fn a_query_only_reads_and_a_statement_is_one() {
 }
 
 #[test]
-fn each_limit_refuses_what_passes_it() {
+fn each_limit_rejects_what_passes_it() {
     let mut engine = empty();
     done(&mut engine, "CREATE TABLE t (a INTEGER) STRICT");
     done(&mut engine, "INSERT INTO t VALUES (1), (2), (3)");
@@ -498,7 +498,7 @@ fn each_limit_refuses_what_passes_it() {
         Some(("steps", String::new()))
     );
     assert_eq!(first(&done(&mut engine, "SELECT 7")), Scalar::Int(7));
-    // A write refused for what it answered leaves nothing behind.
+    // A write rejected for what it returned leaves nothing behind.
     assert_eq!(
         limited(
             &mut engine,
@@ -511,7 +511,7 @@ fn each_limit_refuses_what_passes_it() {
 }
 
 #[test]
-fn a_strict_connection_refuses_a_table_that_is_not() {
+fn a_strict_connection_rejects_a_table_that_is_not() {
     let mut strict = Engine::memory(b"", true).unwrap();
     assert_eq!(kind(&mut strict, "CREATE TABLE loose (a)"), "refused");
     assert_eq!(
@@ -529,7 +529,7 @@ fn a_strict_connection_refuses_a_table_that_is_not() {
 }
 
 #[test]
-fn the_largest_row_id_is_refused() {
+fn the_largest_row_id_is_rejected() {
     let mut engine = empty();
     done(
         &mut engine,
@@ -615,7 +615,7 @@ fn a_statement_is_read_a_page_at_a_time() {
     );
 }
 
-/// One statement over `image` as the twin runs it, every table `STRICT`.
+/// One statement over `image` as the fake runs it, every table `STRICT`.
 fn over(image: &[u8], sql: &str, params: &[Scalar], reads_only: bool) -> (Reply, Option<Vec<u8>>) {
     ply_core::sqlite::run_over(image, sql, params, roomy(), reads_only, true)
 }

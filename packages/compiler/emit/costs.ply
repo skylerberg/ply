@@ -22,7 +22,7 @@ import compiler.check.infer (BodyFacts, body_facts_bin, types_named)
 import compiler.check.typed (TypedBody, witness_param)
 import compiler.front.facts (Analysis, cuts_of)
 import compiler.front.rows (Rows, KnownDefinitionRow, KnownTestRow, Cut)
-import compiler.front.seam (InferredFacts, Analysed, Refused)
+import compiler.front.emitter_input (InferredFacts, Analysed, Rejected)
 import compiler.front.published (analyse, rows_of, inferred_facts)
 import compiler.front (analyse_pulling_std)
 import compiler.store.hash.encoding (hex)
@@ -308,7 +308,7 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
         ),
         owner: unknown(
           HandlerResult,
-          b"the value a handler answered, which the handler may still hold",
+          b"the value a handler returned, which the handler may still keep",
         ),
       },
     CodeHandle(h) -> {
@@ -323,13 +323,13 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
         barrier(env, cl.params + (if cl.resume { 1 } else { 0 }), [], cl.body, acc));
       {
         state: match h.ret { Some(r) -> barrier(env, 1, [], r.body, clauses), None -> clauses },
-        owner: unknown(HandlerResult, b"the value a `handle` answered"),
+        owner: unknown(HandlerResult, b"the value a `handle` returned"),
       }
     },
     CodeSimulate(x) ->
       {
         state: barrier(env, 0, [], x.body, poison(env, state, x.captures, x.body, x.at)),
-        owner: unknown(HandlerResult, b"the value a `simulate` answered"),
+        owner: unknown(HandlerResult, b"the value a `simulate` returned"),
       },
   }
 
@@ -565,11 +565,11 @@ fn held(op: Bytes) -> Bytes = if op == b"Array::set" { b"array" } else { b"list"
 fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: List<Owner>) -> Owner =
   match builtin {
     None -> match callee {
-      None -> unknown(CallResult, b"the value a call answered, which the callee may also hold"),
+      None -> unknown(CallResult, b"the value a call returned, which the callee may also keep"),
       Some(d) -> match env.tables.rets.at(d) {
         Some(ReturnOfParam(k)) -> match args.at(k) {
           Some(o) -> o,
-          None -> unknown(CallResult, b"a call answering an argument it was not given"),
+          None -> unknown(CallResult, b"a call returning an argument it was not given"),
         },
         Some(SharedReturn(reason)) -> BlockedOwner(reason),
         Some(UnsureReturn(reason)) -> UnknownOwner(reason),
@@ -579,7 +579,7 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
     Some(b) -> if b == b"Scoped::get" {
       blocked(ContainerElement, b"`Scoped::get` returns a copy of what the scope still holds")
     } else if b == b"Map::get" || reads_entries(b) {
-      blocked(MapEntry, Bytes::concat_all([b"`", b, b"` answers a clone the map still holds"]))
+      blocked(MapEntry, Bytes::concat_all([b"`", b, b"` returns a clone the map still contains"]))
     } else if b == b"Map::pop_first" || b == b"Map::pop_last" || b == b"Map::split" {
       owner_at(args, 0)
     } else if b == b"List::at" {
@@ -587,16 +587,16 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
     } else if b == b"Array::at" || b == b"Array::get" {
       blocked(
         ContainerElement,
-        Bytes::concat_all([b"`", b, b"` answers a clone the array still holds"]),
+        Bytes::concat_all([b"`", b, b"` returns a clone the array still contains"]),
       )
     } else if b == b"bracket" {
-      unknown(CallResult, b"`bracket` answers whatever its body answered")
+      unknown(CallResult, b"`bracket` returns whatever its body returned")
     } else {
       match prelude_callback_use(b) {
         Some(it) -> if it.result == Folded {
           unknown(
             CallResult,
-            Bytes::concat_all([b"`", b, b"` answers whatever its callback answered"]),
+            Bytes::concat_all([b"`", b, b"` returns whatever its callback returned"]),
           )
         } else { FreshOwner },
         None -> FreshOwner,
@@ -762,7 +762,7 @@ fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} =
         sites: [],
         demands: [],
         escaped: [],
-        ret: unknown(CallResult, b"the value a call answered, which the callee may also hold"),
+        ret: unknown(CallResult, b"the value a call returned, which the callee may also keep"),
         reads: [],
         looked: [],
       },
@@ -788,7 +788,7 @@ fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} =
     },
   }
 
-fn settle(program: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
+fn resolve(program: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
   range(0, program.bodies.len()).fold(start_tables(program.definitions), |acc: Tables, i: Int| {
     let b: Body = program.bodies.get(i);
     let f: WalkResult = found.get(i);
@@ -828,7 +828,7 @@ type Run = {
   failed: Bool,
 }
 
-type Settled = { run: Run, tables: Tables, rounds: Int }
+type Resolved = { run: Run, tables: Tables, rounds: Int }
 
 fn still_valid(f: WalkResult, rets: List<ReturnOwnership>) -> Bool =
   f.reads.fold(true, |acc: Bool, r: ReturnRead| acc && rets.at(r.callee) == Some(r.ret))
@@ -985,8 +985,8 @@ fn iterate(
   readers: Map<Int, List<Int>>,
   tables: Tables,
   rounds: Int,
-) -> Settled / {abort.raise} = {
-  let next = settle(run.prog, run.found, tables);
+) -> Resolved / {abort.raise} = {
+  let next = resolve(run.prog, run.found, tables);
   let moved = moved_readers(readers, tables, next);
   let walked = evaluate(p, run, |i: Int| moved.contains(i), next);
   if walked.failed || next == tables || rounds + 1 >= 24 {
@@ -1649,7 +1649,7 @@ pub type Costing = { report: Report, kept: List<Option<Bytes>>, walked: Int, low
 
 pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
   let n = p.analysis.modules.len();
-  let refused = {
+  let rejected = {
     report: { ok: false, rounds: 0, definitions: [], unkept: [] },
     kept: range(0, n).map(|_: Int| None),
     walked: 0,
@@ -1658,15 +1658,15 @@ pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.r
   let start = started(p, kept);
   let tables = start_tables(start.prog.definitions);
   let first = evaluate(p, start, |_: Int| true, tables);
-  if first.failed { refused } else {
-    let settled = iterate(p, first, readers_of(first.found), tables, 0);
-    if settled.run.failed { refused } else {
+  if first.failed { rejected } else {
+    let resolved = iterate(p, first, readers_of(first.found), tables, 0);
+    if resolved.run.failed { rejected } else {
       {
-        report: report_of(settled.run, settled.tables, settled.rounds),
-        kept: cache_entries(settled.run, n),
-        walked: settled.run.made.fold(0, |acc: Int, xs: List<WalkResult>|
+        report: report_of(resolved.run, resolved.tables, resolved.rounds),
+        kept: cache_entries(resolved.run, n),
+        walked: resolved.run.made.fold(0, |acc: Int, xs: List<WalkResult>|
           if xs.len() > 0 { acc + 1 } else { acc }),
-        lowered: settled.run.lowered,
+        lowered: resolved.run.lowered,
       }
     }
   }
@@ -1788,7 +1788,7 @@ fn embeds_by_module(embeds: List<ModuleEmbed>) -> Map<Bytes, Bytes> =
             Bytes::concat_all(
               files.map(|f: EmbedFile| Bytes::concat_all([f.name, b"\x00", f.digest, b"\x00"])),
             ),
-          Err(why) -> b"!".concat(why),
+          Err(reason) -> b"!".concat(reason),
         },
         b"\x00",
       ]),
@@ -1813,13 +1813,13 @@ fn loose_by_module(
             match acc.get(i) { Some(was) -> was, None -> b"" },
             l.owner,
             b"\x00",
-            bin::encode(filed_facts_of(l.facts), body_facts_bin()),
+            bin::encode(recorded_facts_of(l.facts), body_facts_bin()),
           ]),
         ),
     })
 }
 
-fn filed_facts_of(f: BodyFacts) -> BodyFacts / {abort.raise} =
+fn recorded_facts_of(f: BodyFacts) -> BodyFacts / {abort.raise} =
   {
     members: f.members.map(|x: MemberSite| { ..x, module: 0 }),
     types: types_named(f.types, f.bodies),
@@ -1834,7 +1834,7 @@ fn checked(
   match analyse(
       parse_all(range(0, names.len()).map(|i: Int| { name: names.get(i), src: sources.get(i) })),
     ) {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) ->
       cost_input_of(
         {
@@ -1864,7 +1864,7 @@ test "an update comes back with its place, its verdict, why, and the edit that w
   assert_eq(src.slice(s.start, s.end), b"xs.push(n)");
   assert_eq(s.op, b"List::push");
   assert_eq(s.verdict, b"copies");
-  assert_eq(s.reason, b"`Map::get` answers a clone the map still holds");
+  assert_eq(s.reason, b"`Map::get` returns a clone the map still contains");
   assert_eq(s.fix, b"`Map::update`");
   assert_eq(s.param, 0 - 1)
 }
@@ -1877,12 +1877,12 @@ test "an entry read off a map is a clone, and one popped from it is owned as the
   let peeked = site_of(b"peek");
   assert_eq([peeked.verdict, peeked.reason, peeked.fix], [
     b"copies",
-    b"`.value` was read out of a record something else still holds: `Map::first` answers a clone the map still holds",
+    b"`.value` was read out of a record something else still holds: `Map::first` returns a clone the map still contains",
     b"`Map::update`",
   ]);
   assert_eq(
     site_of(b"near").reason,
-    b"`.value` was read out of a record something else still holds: `Map::floor` answers a clone the map still holds",
+    b"`.value` was read out of a record something else still holds: `Map::floor` returns a clone the map still contains",
   );
   let taken = site_of(b"take");
   assert_eq([taken.verdict, taken.reason], [
@@ -1922,7 +1922,7 @@ test "an array or list element replaced in place is an update, and one read out 
   assert_eq([bumped.op, bumped.verdict], [b"List::set", b"reuses"])
 }
 
-test "a hold answers a clone, and what its region answers or hands its release is owned by no one known" {
+test "a scoped value returns a clone, and what its scope returns or hands its release is owned by no one known" {
   let src = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_scope[r](xs, |l: List<Int>| ()) { h -> h.get().push(n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = List::push(with_scope[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_scope[r](xs, |l: List<Int>| { let grown = l.push(n); () }) { h -> n }\n";
   let r = reported([b"m"], [src]);
   assert(r.ok);
@@ -1953,12 +1953,12 @@ test "a `returns` clause is shown of its body, and one the body does not keep is
   assert(r.ok);
   assert_eq(r.unkept.map(|u: Unkept| (u.name, u.said, u.results)), [
     (b"m.pick", b"its parameter `ys`", b"its parameter `xs`"),
-    (b"m.folded", b"fresh", b"`List::fold` answers whatever its callback answered"),
+    (b"m.folded", b"fresh", b"`List::fold` returns whatever its callback returned"),
   ]);
   assert_eq(src.slice(r.unkept.get(0).start, r.unkept.get(0).end), b"ys")
 }
 
-test "a function a builtin calls back is handed what its entry says, and a fold answers what it answered" {
+test "a function a builtin calls back is handed what its entry says, and a fold returns what its callback returned" {
   let src = Bytes::concat_all([
     b"fn grown(xs: List<Int>) -> List<Int> = xs.fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
     b"fn each(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|ys: List<Int>| ys.push(1))\n",
@@ -1974,11 +1974,11 @@ test "a function a builtin calls back is handed what its entry says, and a fold 
     b"an element the list being walked still holds",
   ]);
   assert_eq(r.unkept.map(|u: Unkept| (u.name, u.results)), [
-    (b"m.values", b"`Map::fold` answers whatever its callback answered"),
+    (b"m.values", b"`Map::fold` returns whatever its callback returned"),
   ])
 }
 
-test "another package's definition answers what its `returns` clause says, its body unread" {
+test "another package's definition returns what its `returns` clause says, its body unread" {
   let lib = Bytes::concat_all([
     b"pub fn made(n: Int) -> List<Int> returns fresh = range(0, n).fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
     b"pub fn plain(n: Int) -> List<Int> = range(0, n)\n",
@@ -2017,7 +2017,7 @@ fn made_fresh() -> Bytes = b"pub fn mk(n: Int) -> List<Int> = range(0, n)\n"
 fn made_shared() -> Bytes =
   b"pub fn mk(n: Int) -> List<Int> = match table().get(0) { Some(xs) -> xs, None -> range(0, n) }\n"
 
-test "a run that takes what earlier runs walked answers as a run from nothing, and walks only what moved" {
+test "a run that takes what earlier runs walked returns what a run from nothing returns, and walks only what moved" {
   let first = costed_over(Map::new(), layered(made_fresh()));
   assert(first.costing.walked > 0 && first.costing.lowered > 0);
   let again = costed_over(first.store, layered(made_fresh()));
@@ -2040,7 +2040,7 @@ fn checked_pulling(user: List<Source>, shipped: List<Source>) -> CostInput / {ab
     |acc: Map<Bytes, Bytes>, x: Source| acc.insert(x.name, x.src),
   );
   match analyse_pulling_std(user, shipped).out {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) ->
       cost_input_of(
         w,

@@ -166,19 +166,19 @@ fn run_all<[c]>(
   runs: List<List<String>>,
 ) -> Result<Unit, String> / {compilers.write[c], toolchain.read, abort.raise} = {
   let jobs = toolchain.jobs();
-  let refusal = |run: { job: Int, args: List<String> }|
+  let rejection = |run: { job: Int, args: List<String> }|
     match compilers.wait[c](run.job) {
       None -> None,
       Some(err) ->
         Some(
-          "the C compiler refused `" ++ String::join(run.args, " ") ++ "`:\n"
+          "the C compiler rejected `" ++ String::join(run.args, " ") ++ "`:\n"
             ++ String::of_bytes_lossy(err),
         ),
     };
-  let refused = iterate(
-    { next: 0, running: [], refused: [], stopped: false },
+  let rejected = iterate(
+    { next: 0, running: [], rejected: [], stopped: false },
     2 * runs.len() + 2,
-    |s: { next: Int, running: List<{ job: Int, args: List<String> }>, refused: List<String>, stopped: Bool }|
+    |s: { next: Int, running: List<{ job: Int, args: List<String> }>, rejected: List<String>, stopped: Bool }|
       if !s.stopped && s.next < runs.len() && s.running.len() < jobs {
         match compilers.start[c](runs.get(s.next)) {
           Ok(job) ->
@@ -187,33 +187,36 @@ fn run_all<[c]>(
               next: s.next + 1,
               running: s.running.push({ job: job, args: runs.get(s.next) }),
             }),
-          Err(why) ->
+          Err(reason) ->
             Continue({
               ..s,
-              refused: s.refused.push("the C compiler could not be started: " ++ why),
+              rejected: s.rejected.push("the C compiler could not be started: " ++ reason),
               stopped: true,
             }),
         }
       } else {
         match s.running {
-          [] -> Stop(s.refused),
+          [] -> Stop(s.rejected),
           [first, ..rest] ->
             Continue({
               ..s,
               running: rest,
-              refused: match refusal(first) { Some(why) -> s.refused.push(why), None -> s.refused },
+              rejected: match rejection(first) {
+                Some(reason) -> s.rejected.push(reason),
+                None -> s.rejected,
+              },
             }),
         }
       },
   );
-  match refused {
+  match rejected {
     [] -> Ok(()),
-    [why] -> Err(why),
+    [reason] -> Err(reason),
     _ ->
       Err(
-        "the C compiler refused " ++ refused.len().to_string() ++ " of " ++ runs.len().to_string()
+        "the C compiler rejected " ++ rejected.len().to_string() ++ " of " ++ runs.len().to_string()
           ++ " runs:\n\n"
-          ++ String::join(refused, "\n\n"),
+          ++ String::join(rejected, "\n\n"),
       ),
   }
 }
@@ -225,7 +228,7 @@ fn source_digest(head: Bytes, part: Bytes) -> String / {abort.raise} =
 
 fn source_path(digest: String) -> String = "src/" ++ digest ++ ".c"
 
-fn unkept(s: Source) -> String =
+fn uncached(s: Source) -> String =
   "the C of part `" ++ s.label ++ "` is no longer kept in the toolchain's cache"
 
 pub type WrittenPart = { label: String, digest: String, size: Int, text: Option<Bytes> }
@@ -233,7 +236,7 @@ pub type WrittenPart = { label: String, digest: String, size: Int, text: Option<
 pub fn written_part(head: Bytes, label: String, text: Bytes) -> WrittenPart / {abort.raise} =
   { label: label, digest: source_digest(head, text), size: text.len(), text: Some(text) }
 
-pub fn holds_source(digest: String) -> Bool / {toolchain.read} =
+pub fn is_source_cached(digest: String) -> Bool / {toolchain.read} =
   toolchain.exists(source_path(digest))
 
 pub fn cache_sources(
@@ -242,7 +245,7 @@ pub fn cache_sources(
 ) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
   let landed = written.fold(true, |ok: Bool, w: WrittenPart|
     ok
-      && (holds_source(w.digest)
+      && (is_source_cached(w.digest)
       || (match w.text {
         None -> false,
         Some(t) -> toolchain.write_file(source_path(w.digest), head.concat(t)),
@@ -255,7 +258,7 @@ pub fn cache_sources(
   }
 }
 
-pub fn kept_text(
+pub fn cache_text(
   text: Bytes,
 ) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
   let cut = split(text);
@@ -268,14 +271,14 @@ pub fn read_back(
 ) -> Result<Bytes, String> / {toolchain.read, abort.raise} =
   match sources.fold(Ok([head]), |acc: Result<List<Bytes>, String>, s: Source|
       match acc {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(texts) -> match toolchain.read_file(source_path(s.digest)) {
-          None -> Err(unkept(s)),
+          None -> Err(uncached(s)),
           Some(c) -> if c.starts_with(head) { Ok(texts.push(c.slice(head.len(), c.len()))) }
           else { Err("the C of part `" ++ s.label ++ "` was kept after another head") },
         },
       }) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(texts) -> Ok(Bytes::concat_all(texts)),
   }
 
@@ -302,7 +305,7 @@ pub fn parse_manifest(text: Bytes) -> Option<List<Source>> =
     })
 
 pub fn sources_cached(sources: List<Source>) -> Bool / {toolchain.read} =
-  sources.fold(true, |ok: Bool, s: Source| ok && holds_source(s.digest))
+  sources.fold(true, |ok: Bool, s: Source| ok && is_source_cached(s.digest))
 
 fn object_path(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
   "obj/" ++ cache_key(t, flags, [Bytes::of_string(s.digest)]) ++ ".o"
@@ -318,8 +321,8 @@ pub fn objects<[c]>(
   let cache = toolchain.cache();
   let targets = sources.map(|s: Source| object_path(t, flags, s));
   let missing = range(0, targets.len()).filter(|i: Int| !toolchain.exists(targets.get(i)));
-  match missing.find(|i: Int| !holds_source(sources.get(i).digest)) {
-    Some(i) -> Err(unkept(sources.get(i))),
+  match missing.find(|i: Int| !is_source_cached(sources.get(i).digest)) {
+    Some(i) -> Err(uncached(sources.get(i))),
     None -> {
       let object = |i: Int| work ++ "/" ++ i.to_string() ++ ".o";
       let runs = missing.map(|i: Int|
@@ -330,7 +333,7 @@ pub fn objects<[c]>(
           cache ++ "/" ++ source_path(sources.get(i).digest),
         ]));
       match run_all[c](runs) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(_) -> {
           let placed = missing.fold(true, |ok: Bool, i: Int|
             ok && toolchain.rename(object(i), targets.get(i)));
@@ -355,7 +358,7 @@ fn link_shared<[c]>(
     match run_all[c]([
         t.support_flags.concat(["-shared", "-o", cache ++ "/" ++ made].concat(objects)),
       ]) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(_) -> match toolchain.read_file(made) {
         None -> Err("the C compiler linked no library"),
         Some(linked) -> if toolchain.write_file(made, with_stack_header(linked))
@@ -444,7 +447,7 @@ pub fn library<[c]>(
           None -> Err("the toolchain's cache has no room to compile in"),
           Some(work) -> {
             let built = match objects[c](t, sources, flags, work) {
-              Err(why) -> Err(why),
+              Err(reason) -> Err(reason),
               Ok(compiled) -> link_shared[c](t, compiled.paths, work),
             };
             toolchain.remove_tree(work);
@@ -470,11 +473,11 @@ pub fn executable<[c]>(
     Err("the program's `main` could not be written")
   } else {
     match run_all[c]([t.support_flags.concat(compile_flags(t).concat(["-c", "-o", o, c]))]) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(_) -> match run_all[c]([
           t.support_flags.concat(["-o", out, o].concat(objects)).concat(libraries),
         ]) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(_) -> Ok(out),
       },
     }
@@ -715,34 +718,34 @@ fn run_all_with(
     toolchain.exists(path) -> panic("a run reads no cache"),
     toolchain.read_file(path) -> panic("a run reads no cache"),
     toolchain.libraries() -> panic("a run links no library"),
-    return answer -> { result: answer, started: started },
+    return result -> { result: result, started: started },
   }
 
-test "a compile runs every part, and fails once with what the compiler said of each part it refused" {
+test "a compile runs every part, and fails once with what the compiler said of each part it rejected" {
   let runs = [["-c", "a.c"], ["-c", "b.c"], ["-c", "c.c"]];
   let said = |file: String|
     if file == "b.c" { None } else { Some(Bytes::of_string(file ++ ":1: error: no")) };
   let r = run_all_with(runs, said);
   assert_eq(r.started, 3);
   match r.result {
-    Ok(_) -> assert(false, Some("a compile two parts refused succeeded")),
-    Err(why) -> {
-      let text = Bytes::of_string(why);
+    Ok(_) -> assert(false, Some("a compile two parts rejected succeeded")),
+    Err(reason) -> {
+      let text = Bytes::of_string(reason);
       let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
       assert(
-        text.starts_with(b"the C compiler refused 2 of 3 runs")
+        text.starts_with(b"the C compiler rejected 2 of 3 runs")
           && at(b"`-c a.c`:\na.c:1: error: no") >= 0
           && at(b"`-c c.c`:\nc.c:1: error: no") >= 0
           && at(b"b.c") < 0,
-        Some(why),
+        Some(reason),
       );
-      assert(at(b"a.c:1") < at(b"c.c:1"), Some(why))
+      assert(at(b"a.c:1") < at(b"c.c:1"), Some(reason))
     },
   };
   assert_eq(
     run_all_with(runs, |file: String|
       if file == "c.c" { Some(Bytes::of_string("bad")) } else { None }).result,
-    Err("the C compiler refused `-c c.c`:\nbad"),
+    Err("the C compiler rejected `-c c.c`:\nbad"),
   );
   assert_eq(run_all_with(runs, |_: String| None).result, Ok(()))
 }
@@ -783,9 +786,9 @@ test "a compiler compiles for x86-64 Linux where it preprocesses the probe, and 
   assert_eq(fits.runs, [["-E", "/cache/probe/x86_64_linux.c"]]);
   assert(!probe_with(true, Ok(0), Some(b"x86_64_linux.c:2: error: #error")).fits, None);
   assert(!probe_with(true, Err("no `tcc` is installed"), None).fits, None);
-  let unkept = probe_with(false, Ok(0), None);
-  assert(!unkept.fits, None);
-  assert_eq(unkept.runs, [])
+  let uncached = probe_with(false, Ok(0), None);
+  assert(!uncached.fits, None);
+  assert_eq(uncached.runs, [])
 }
 
 fn in_test_cache(path: String) -> String / {abort.raise} = path.slice("/cache/".len(), path.len())
@@ -836,7 +839,7 @@ fn built_over<a>(
     return made -> { made: made, written: written, runs: runs, files: files },
   }
 
-test "a build compiles each source whose object the cache does not hold from the C kept for it, a part taken back among them" {
+test "a build compiles each source whose object is not cached from the C stored for it, a part read back from the cache among them" {
   let t = toolchain_of({ path: "cc", identity: b"cc 1", support_flags: [] }, "-O2", false);
   let head = b"#include <x>\n";
   let fresh = [written_part(head, "a", b"int a;\n"), written_part(head, "a", b"int b;\n")];
@@ -848,7 +851,7 @@ test "a build compiles each source whose object the cache does not hold from the
   );
   let build = ||
     match cache_sources(head, fresh.push(built).push(taken)) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(sources) -> objects[cc](t, sources, [], "work"),
     };
   let first = built_over(held, build);
@@ -866,8 +869,8 @@ test "a build compiles each source whose object the cache does not hold from the
 
 test "a unit compiled again from its sources starts no compiler and writes nothing" {
   let compiled = ||
-    match kept_text(unit_text()) {
-      Err(why) -> Err(why),
+    match cache_text(unit_text()) {
+      Err(reason) -> Err(reason),
       Ok(sources) -> library[cc](development(), sources),
     };
   let first = built_over(Map::new(), compiled);
@@ -878,7 +881,7 @@ test "a unit compiled again from its sources starts no compiler and writes nothi
   assert_eq(again.written, [])
 }
 
-test "keeping a unit's parts writes each new one's C, takes each the cache holds, and refuses one it lost" {
+test "caching a unit's parts writes each new one's C, reuses each one already cached, and rejects one the cache lost" {
   let fresh = { label: "a", digest: "aa", size: 2, text: Some(b"a\n") };
   let beside = { label: "c", digest: "cc", size: 2, text: Some(b"c\n") };
   let taken = { label: "b", digest: "bb", size: 9, text: None };
@@ -895,11 +898,11 @@ test "a unit's C read back from its kept sources holds its parts, and keeps as t
   let sources = first.made.expect("the parts are kept");
   let again = built_over(first.files, ||
     match read_back(cut.head, sources) {
-      Err(why) -> Err(why),
-      Ok(back) -> kept_text(back).map(|s: List<Source>| { back: back, sources: s }),
+      Err(reason) -> Err(reason),
+      Ok(back) -> cache_text(back).map(|s: List<Source>| { back: back, sources: s }),
     });
   match again.made {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(r) -> {
       assert_eq(r.sources, sources);
       assert_eq(again.written, []);

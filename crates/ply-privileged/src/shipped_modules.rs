@@ -81,7 +81,7 @@ pub fn data(name: &str) -> Option<&'static [u8]> {
 
 /// Each shipped file by the name the launcher lays it out under, `<module>.ply` or a data file's
 /// name, a space, and its bytes' BLAKE3 digest in hex: a line each, ascending by name. What the
-/// shipped modules' answers were made over, and what a run holds them to. No bytes are read.
+/// shipped modules' cached results were made over, and what a run holds them to. No bytes are read.
 pub fn digests() -> String {
     let mut lines: Vec<String> = names()
         .into_iter()

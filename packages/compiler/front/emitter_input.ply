@@ -1,0 +1,1195 @@
+import compiler.syntax.parsing (Span, no_module)
+import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause, CostClause, SpaceClause,
+                              spec_kind_text, InstanceKind, KeyInstance, ShowInstance,
+                              ReleaseInstance)
+import compiler.syntax.type_syntax (mode_text)
+import compiler.emit.code (dump)
+import compiler.check.types (Effect, Type, NamedType, FunctionType, RecordType, VariableType,
+                             effect_list_text, positional_effects_text, read_effects, Printer,
+                             printer_new, print_type, Field, canonical_effects, canonical_scheme,
+                             canonical_type, bool_type, int_type, bytes_type, unit_type,
+                             NominalType, TypeTable, variables_in)
+import compiler.check.known (fixed_widths, list_item, array_element, columns_row, map_parts)
+import compiler.check.resolve.tables (Diagnostic, qualify)
+import compiler.store.hash.forms (HashOutput, by_name, of_key)
+import compiler.store.hash.encoding (hex)
+import compiler.store.hash (digest)
+import compiler.check.infer (CheckOutput, BodyFacts, decode_facts, facts_by_owner, encode_facts,
+                             no_body_facts, body_facts_bin, is_pure_definition, types_named)
+import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInfo, LawInfo,
+                                     LawBinder, EffectInfo, OpInfo, ConstructorInfo, CheckCache,
+                                     empty_cache, CachedDefinition, CachedTest, CachedFacts,
+                                     WitnessOrder, listing_type, witness_order_bin, witness_params,
+                                     InstanceInfo, NumericInfo)
+import compiler.check.typed (TypedBody, TypedExpression, TypedHandle, TypedClause,
+                             typed_expression_nodes)
+import compiler.emit.keys (RootKey, Named, TestCases, Clause, Requires, Ensures, LawPart, LawGuard,
+                           LawBody, root_name, root_text, part_name, test_key, test_owner, law_key,
+                           law_owner)
+import compiler.front.pkg (LockedPackage)
+import compiler.check.resolve.scopes (PackageDependencies)
+import std.bin
+import std.hash (blake3)
+import std.list
+import compiler.expand.embed (ModuleEmbed)
+import std.bytes (ascii_of_int)
+import compiler.front.rows (span_at, location_span, WrittenFunction, written_functions,
+                            written_function_of, SpannedName, OutlinedEffect, OutlinedFunction,
+                            OutlinedLaw, OutlinedTest, OutlinedType, OutlineItem, Outline,
+                            module_row, imports_resolved, Cut, KeyRow, EmitterRoot,
+                            EmitterConstructor, FunctionWidths, ListWidths, MapWidths, NoWidths,
+                            RecordWidths, SumWidths, VariableWidths, FixedWidth, Widths,
+                            FieldWidths, EffectHash, KnownDefinitionRow, KnownTestRow, Rows,
+                            ModuleSpan, DefinitionRow, TestRow, LawRow, OpRow, EffectRow,
+                            ConstructorRow, HashRow, DefinitionHashRow, LawHashRow, TestHashRow,
+                            HashTableRow, OrdinalRow, Dump, normalized_diagnostic)
+import compiler.front.facts (outlines_of, effect_visibility, effect_hosts, effect_public_of,
+                             type_rows, test_label_spans, law_literals, Frame, CheckedProgram,
+                             Analysis, TaggedSite, tagged_of, root_tagged, TypedConst,
+                             typed_consts_of, root_consts, StatementSite, statements_of,
+                             root_statements)
+
+pub fn merge_cuts(a: List<Cut>, b: List<Cut>) -> List<Cut> / {abort.raise} =
+  iterate(
+    { out: [], i: 0, j: 0 },
+    a.len() + b.len() + 1,
+    |x: { out: List<Cut>, i: Int, j: Int }|
+      match ((a.at(x.i), b.at(x.j))) {
+        (None, None) -> Stop(x),
+        (Some(c), None) -> Continue({ ..x, out: x.out.push(c), i: x.i + 1 }),
+        (None, Some(c)) -> Continue({ ..x, out: x.out.push(c), j: x.j + 1 }),
+        (Some(c), Some(d)) -> if c.start <= d.start {
+          Continue({ ..x, out: x.out.push(c), i: x.i + 1 })
+        } else { Continue({ ..x, out: x.out.push(d), j: x.j + 1 }) },
+      },
+  ).out
+
+fn definition_row(
+  definition_info: DefinitionInfo,
+  w: WrittenFunction,
+) -> DefinitionRow / {abort.raise} =
+  {
+    name: definition_info.name,
+    module: definition_info.module,
+    simple_name: definition_info.simple_name,
+    public: w.public,
+    reuse: w.reuse,
+    effects: canonical_effects(definition_info.effects),
+    performed: canonical_effects(definition_info.performed),
+    constraints: definition_info.constraints,
+    effect_aliases: definition_info.effect_aliases,
+    params: w.params.map(|param: SpannedName|
+      { name: param.name, at: span_at(definition_info.at.module, param.span) }),
+    spec: definition_info.spec.map(|spec: SpecInfo|
+      {
+        kind: spec_kind_text(spec.kind),
+        index: spec.index,
+        effects: canonical_effects(spec.effects),
+        at: span_at(definition_info.at.module, spec.span),
+      }),
+    at: location_span(definition_info.at),
+    literals: w.literals,
+  }
+
+fn test_row(test_info: TestInfo, name_at: Location) -> TestRow / {abort.raise} =
+  {
+    key: test_info.key,
+    name: test_info.name,
+    module: test_info.module,
+    index: test_info.index,
+    nondet: test_info.nondet,
+    effects: canonical_effects(test_info.effects),
+    at: location_span(test_info.at),
+    name_at: location_span(name_at),
+  }
+
+fn law_row(law_info: LawInfo, lits: List<Bytes>) -> LawRow / {abort.raise} =
+  {
+    key: law_info.key,
+    name: law_info.name,
+    module: law_info.module,
+    index: law_info.index,
+    binders: law_info.binders.map(|b: LawBinder|
+      { name: b.name, at: span_at(law_info.at.module, b.span), ty: canonical_type(b.ty) }),
+    has_guard: law_info.has_guard,
+    effects: canonical_effects(law_info.effects),
+    at: location_span(law_info.at),
+    literals: lits,
+  }
+
+fn op_row(module: Int, op_info: OpInfo, width_sums: WidthSums) -> OpRow / {abort.raise} =
+  {
+    name: op_info.name,
+    mode: mode_text(op_info.mode),
+    resource_param: op_info.resource_param,
+    kept: op_info.kept,
+    params: op_info.params.map(canonical_type),
+    ret: canonical_type(op_info.ret),
+    scheme: match op_info.scheme { Some(sc) -> Some(canonical_scheme(sc)), None -> None },
+    at: span_at(module, op_info.at.span),
+    carries: widths_of_all(width_sums, [], op_info.params).map(grounded),
+  }
+
+fn effect_row(
+  effect_info: EffectInfo,
+  public: Bool,
+  hosts: Map<Bytes, Bytes>,
+  read: AllBodyFacts,
+  width_sums: WidthSums,
+) -> EffectRow / {abort.raise} = {
+  let host = hosts.get(effect_info.name);
+  {
+    name: effect_info.name,
+    module: effect_info.module,
+    simple_name: effect_info.simple_name,
+    public: public,
+    nondet: effect_info.nondet,
+    operations: effect_info.operations.map(|op_info: OpInfo|
+      op_row(effect_info.at.module, op_info, width_sums)),
+    at: location_span(effect_info.at),
+    host: host,
+    waits: match host { Some(handler) -> waited(read, handler, effect_info.name), None -> [] },
+  }
+}
+
+fn waited(read: AllBodyFacts, handler: Bytes, served: Bytes) -> List<Bytes> / {abort.raise} =
+  match decode_facts(encoded_facts(read, handler), 0, handler) {
+    None -> [],
+    Some(f) ->
+      f.bodies.flat_map(|b: TypedBody<Bytes>| typed_expression_nodes(b.body)).fold(
+        [],
+        |acc: List<Bytes>, e: TypedExpression<Bytes>|
+          match e.node {
+            TypedHandle(h) ->
+              h.clauses.fold(acc, |ops: List<Bytes>, c: TypedClause<Bytes>|
+                if c.effect == served
+                    && c.effects.listed.any(|a: Effect| a.effect == b"std.internal.native.wait") {
+                  ops.push(c.op)
+                } else { ops }),
+            _ -> acc,
+          },
+      ),
+  }
+
+fn constructor_row(constructor_info: ConstructorInfo) -> ConstructorRow / {abort.raise} =
+  {
+    name: constructor_info.name,
+    module: constructor_info.module,
+    simple_name: constructor_info.simple_name,
+    type_name: constructor_info.type_name,
+    index: constructor_info.index,
+    arity: constructor_info.arity,
+    fields: constructor_info.fields.map(canonical_type),
+    scheme: canonical_scheme(constructor_info.scheme),
+    at: location_span(constructor_info.at),
+  }
+
+fn by_name_many(xs: List<{ name: Bytes, hashes: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
+  xs.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
+    acc.insert(x.name, x.hashes))
+
+pub fn by_name_names(xs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
+  xs.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
+    acc.insert(x.name, x.names))
+
+type HashTables = {
+  definitions: Map<Bytes, Bytes>,
+  own: Map<Bytes, Bytes>,
+  declarations: Map<Bytes, Bytes>,
+  specs: Map<Bytes, List<Bytes>>,
+  spec_texts: Map<Bytes, List<Bytes>>,
+  dependencies: Map<Bytes, List<Bytes>>,
+}
+
+fn hash_tables(hashes: HashOutput) -> HashTables =
+  {
+    definitions: by_name(hashes.definitions),
+    own: by_name(hashes.own),
+    declarations: by_name(hashes.declarations),
+    specs: by_name_many(hashes.specs),
+    spec_texts: by_name_many(hashes.spec_texts),
+    dependencies: by_name_names(hashes.dependencies),
+  }
+
+fn hex_one(m: Map<Bytes, Bytes>, name: Bytes) -> Option<Bytes> / {abort.raise} =
+  match m.get(name) { Some(h) -> Some(hex(h)), None -> None }
+
+fn hex_many(m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> / {abort.raise} =
+  match m.get(name) { Some(hs) -> hs.map(hex), None -> [] }
+
+fn names_of(m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
+  match m.get(name) { Some(ns) -> ns, None -> [] }
+
+fn definition_hash_row(tables: HashTables, name: Bytes) -> HashRow / {abort.raise} =
+  {
+    name: name,
+    definition: hex_one(tables.definitions, name),
+    own: hex_one(tables.own, name),
+    declaration: hex_one(tables.declarations, name),
+    specs: hex_many(tables.specs, name),
+    spec_texts: hex_many(tables.spec_texts, name),
+    dependencies: names_of(tables.dependencies, name),
+  }
+
+fn hash_rows(outlines: List<Outline>, hashes: HashOutput) -> List<HashTableRow> / {abort.raise} = {
+  let t = hash_tables(hashes);
+  let definition = |acc: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, name: Bytes|
+    match acc.seen.get(name) {
+      Some(_) -> acc,
+      None ->
+        {
+          ..acc,
+          seen: acc.seen.insert(name, true),
+          frames: acc.frames.push(DefinitionHashRow(definition_hash_row(t, name))),
+        },
+    };
+  outlines.fold(
+    { seen: Map::new(), frames: [] },
+    |acc: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, o: Outline|
+      o.items.fold(
+        acc,
+        |a: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, item: OutlineItem|
+          match item {
+            OutlinedFunction(f) -> definition(a, qualify(o.name, f.name)),
+            OutlinedType(x) -> definition(a, qualify(o.name, x.name)),
+            OutlinedEffect(x) -> definition(a, qualify(o.name, x.name)),
+            OutlinedTest(x) -> {
+              let key = qualify(o.name, x.name);
+              {
+                ..a,
+                frames: a.frames.push(
+                  TestHashRow({
+                    key: key,
+                    hash: hex(of_key(hashes.tests, key)),
+                    text: b"",
+                    dependencies: names_of(t.dependencies, key),
+                  }),
+                ),
+              }
+            },
+            OutlinedLaw(x) -> {
+              let key = qualify(o.name, x.name);
+              {
+                ..a,
+                frames: a.frames.push(
+                  LawHashRow({
+                    key: key,
+                    hash: hex(of_key(hashes.laws, key)),
+                    text: hex(of_key(hashes.law_texts, key)),
+                    dependencies: names_of(t.dependencies, key),
+                  }),
+                ),
+              }
+            },
+          },
+      ),
+  ).frames
+}
+
+fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.raise} = {
+  let (params, ret, effects) = match definition_info.scheme.ty {
+    FunctionType(f) -> (f.params, f.ret, f.effects.listed),
+    other -> ([], other, []),
+  };
+  let printed = params.fold(
+    { p: printer_new(), texts: [] },
+    |acc: { p: Printer, texts: List<Bytes> }, ty: Type| {
+      let out = print_type(acc.p, ty);
+      { p: out.printer, texts: acc.texts.push(out.text) }
+    },
+  );
+  let pure = if is_pure_definition(definition_info) { b"true" } else { b"false" };
+  Bytes::concat_all([
+    b"(",
+    Bytes::join(printed.texts, b", "),
+    b") -> ",
+    print_type(printed.p, ret).text,
+    b" / ",
+    effect_list_text(canonical_effects(effects), b", "),
+    b" ",
+    pure,
+  ])
+}
+
+fn clause_key(definition: Bytes, kind: SpecKind, k: Int) -> RootKey =
+  Clause({
+    definition: Named(definition),
+    kind: if kind == RequiresClause { Requires } else { Ensures },
+    n: k,
+  })
+
+pub fn test_root_at(dump: Dump, i: Int) -> Option<RootKey> / {abort.raise} =
+  match dump.tests.at(i) { Some(t) -> Some(test_key(t.module, t.name)), None -> None }
+
+fn root_inputs_digest(
+  published: Map<Bytes, Bytes>,
+  dependencies: Map<Bytes, List<Bytes>>,
+  declarations: Map<Bytes, Bytes>,
+  key: Bytes,
+  owner: Option<Bytes>,
+) -> Bytes / {abort.raise} = {
+  let owner_text = match owner {
+    Some(o) -> match published.get(o) { Some(text) -> text, None -> b"" },
+    None -> b"",
+  };
+  let names = match dependencies.get(key) {
+    Some(ns) -> Map::of_entries(ns.map(|n: Bytes| { key: n, value: () })).keys(),
+    None -> [],
+  };
+  let each = names.map(|name: Bytes| {
+    let text = match published.get(name) { Some(t) -> t, None -> b"" };
+    let declaration = match declarations.get(name) { Some(h) -> h, None -> b"" };
+    Bytes::concat_all([name, b"\x00", text, declaration, b"\x00"])
+  });
+  hex(blake3(Bytes::concat_all([owner_text, b"\x00"].concat(each)))).slice(0, 32)
+}
+
+fn function_key_rows(
+  published: Map<Bytes, Bytes>,
+  own: Map<Bytes, Bytes>,
+  sentences: Map<Bytes, List<Bytes>>,
+  dependencies: Map<Bytes, List<Bytes>>,
+  declarations: Map<Bytes, Bytes>,
+  a: List<KeyRow>,
+  name: Bytes,
+  spec: List<SpecKind>,
+) -> List<KeyRow> / {abort.raise} =
+  match own.get(name) {
+    None -> a,
+    Some(owner) -> {
+      let read = root_inputs_digest(published, dependencies, declarations, name, Some(name));
+      let sents = match sentences.get(name) { Some(s) -> s, None -> [] };
+      let clauses = range(0, spec.len()).fold(
+        { out: a, requires: 0, ensures: 0 },
+        |b: { out: List<KeyRow>, requires: Int, ensures: Int }, i: Int| {
+          let kind = spec.get(i);
+          if kind == CostClause || kind == SpaceClause { b } else {
+            let text = spec_kind_text(kind);
+            let k = if kind == RequiresClause { b.requires } else { b.ensures };
+            let sentence = match sents.at(i) { Some(s) -> s, None -> owner };
+            {
+              out: b.out.push({
+                root: root_text(root_name(clause_key(name, kind, k))),
+                key: Bytes::concat_all([
+                  hex(sentence),
+                  b"#",
+                  text,
+                  b"#",
+                  ascii_of_int(k),
+                  b"+",
+                  read,
+                ]),
+              }),
+              requires: if kind == RequiresClause { b.requires + 1 } else { b.requires },
+              ensures: if kind == EnsuresClause { b.ensures + 1 } else { b.ensures },
+            }
+          }
+        },
+      );
+      clauses.out.push({ root: name, key: Bytes::concat_all([hex(owner), b"+", read]) })
+    },
+  }
+
+pub fn root_keys(
+  outlines: List<Outline>,
+  checked: CheckOutput,
+  hashes: HashOutput,
+  within: Option<TestRunScope> = None,
+) -> List<KeyRow> / {abort.raise} = {
+  let own = by_name(hashes.own);
+  let sentences = by_name_many(hashes.spec_texts);
+  let dependencies = by_name_names(hashes.dependencies);
+  let declarations = by_name(hashes.declarations);
+  let owned = |name: Bytes| match within { Some(w) -> w.owners.contains(name), None -> true };
+  let tested = |key: Bytes| match within { Some(w) -> w.tests.contains(key), None -> true };
+  let read = match within {
+    None -> None,
+    Some(w) ->
+      Some(
+        w.owners.keys().concat(w.tests.keys()).fold(
+          Map::new(),
+          |acc: Map<Bytes, Bool>, name: Bytes|
+            List::fold(
+              match dependencies.get(name) { Some(ns) -> ns, None -> [] },
+              acc.insert(name, true),
+              |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true),
+            ),
+        ),
+      ),
+  };
+  let published = Map::of_entries(
+    checked.definitions.filter(|d: DefinitionInfo|
+      match read { Some(r) -> r.contains(d.name), None -> true }).map(|d: DefinitionInfo|
+      { key: d.name, value: emitted_signature_text(d) }),
+  );
+  let guarded = checked.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: LawInfo|
+    acc.insert(l.key, l.has_guard));
+  outlines.fold([], |acc: List<KeyRow>, o: Outline|
+    o.items.fold(acc, |a: List<KeyRow>, item: OutlineItem|
+      match item {
+        OutlinedFunction(f) -> if !owned(qualify(o.name, f.name)) { a } else {
+          function_key_rows(
+            published,
+            own,
+            sentences,
+            dependencies,
+            declarations,
+            a,
+            qualify(o.name, f.name),
+            f.spec,
+          )
+        },
+        OutlinedTest(t) -> {
+          let name = qualify(o.name, t.name);
+          if !tested(name) { a } else {
+            let read = root_inputs_digest(published, dependencies, declarations, name, None);
+            let root = test_key(o.name, t.name);
+            let run = a.push({ root: root_text(root_name(root)), key: b"test+".concat(read) });
+            if !t.cases { run } else {
+              run.push({ root: root_text(root_name(TestCases(root))), key: b"cases+".concat(read) })
+            }
+          }
+        },
+        OutlinedLaw(l) -> match within {
+          Some(_) -> a,
+          None -> {
+            let name = qualify(o.name, l.name);
+            match hashes.law_texts.get(name) {
+              None -> a,
+              Some(text) -> {
+                let read = root_inputs_digest(published, dependencies, declarations, name, None);
+                List::fold(
+                  if guarded.get(name) == Some(true) { [LawGuard, LawBody] } else { [LawBody] },
+                  a,
+                  |b: List<KeyRow>, part: LawPart|
+                    b.push({
+                      root: root_text(root_name(law_key(o.name, l.name, part))),
+                      key: Bytes::concat_all([hex(text), b"#", part_name(part), b"+", read]),
+                    }),
+                )
+              },
+            }
+          },
+        },
+        _ -> a,
+      }))
+}
+
+pub fn no_module_span() -> ModuleSpan = { module: no_module(), start: 0, end: 0 }
+
+type EmitTables = {
+  functions: List<EmitterRoot>,
+  tests: List<EmitterRoot>,
+  specs: List<EmitterRoot>,
+}
+
+fn emitter_constructors_of(
+  outlines: List<Outline>,
+  checked: CheckOutput,
+  width_sums: WidthSums,
+) -> List<EmitterConstructor> / {abort.raise} = {
+  let prelude = checked.constructors.filter(|constructor_info: ConstructorInfo|
+    constructor_info.module.len() == 0);
+  let rest = outlines.fold([], |acc: List<ConstructorInfo>, o: Outline|
+    acc.concat(
+      checked.constructors.filter(|constructor_info: ConstructorInfo|
+        constructor_info.module == o.name),
+    ));
+  prelude.concat(rest).map(|constructor_info: ConstructorInfo|
+    {
+      name: constructor_info.name,
+      arity: constructor_info.arity,
+      fields: widths_of_all(
+        width_sums,
+        constructor_info.scheme.type_variables,
+        constructor_info.fields,
+      ),
+      key: instance_by(checked, constructor_info.type_name, KeyInstance),
+      show: instance_by(checked, constructor_info.type_name, ShowInstance),
+      numeric: checked.numeric_types.fold([], |acc: List<Bytes>, x: NumericInfo|
+        if x.type_name == constructor_info.type_name { x.functions } else { acc }),
+      release: instance_by(checked, constructor_info.type_name, ReleaseInstance),
+    })
+}
+
+fn instance_by(checked: CheckOutput, type_name: Bytes, kind: InstanceKind) -> Option<Bytes> =
+  checked.instances.fold(None, |acc: Option<Bytes>, x: InstanceInfo|
+    if x.type_name == type_name && x.kind == kind { Some(x.by) } else { acc })
+
+pub fn constructors_read(
+  checked: CheckOutput,
+) -> { rows: List<ConstructorRow>, keyed: List<Bytes>, numeric: List<Bytes>, released: Map<Bytes, Bytes> } / {abort.raise} =
+  {
+    rows: checked.constructors.map(constructor_row),
+    keyed: checked.constructors.filter(|c: ConstructorInfo|
+      instance_by(checked, c.type_name, KeyInstance) != None).map(|c: ConstructorInfo| c.name),
+    released: checked.instances.fold(Map::new(), |m: Map<Bytes, Bytes>, x: InstanceInfo|
+      if x.kind == ReleaseInstance { m.insert(x.type_name, x.by) } else { m }),
+    numeric: checked.constructors.filter(|c: ConstructorInfo|
+      checked.numeric_types.any(|x: NumericInfo| x.type_name == c.type_name)).map(
+      |c: ConstructorInfo| c.name,
+    ),
+  }
+
+fn width_number(name: Bytes) -> Option<Int> =
+  fixed_widths().find_index(|w: { name: Bytes, bits: Int, signed: Bool }| w.name == name)
+
+type WidthSums = { sums: Map<Bytes, Bool> }
+
+fn width_sums_of(constructors: List<ConstructorInfo>) -> WidthSums = {
+  let held = holding_widths(constructors, []);
+  {
+    sums: Map::of_entries(
+      constructors.map(|constructor_info: ConstructorInfo|
+        { key: constructor_info.type_name, value: held.contains(constructor_info.type_name) }),
+    ),
+  }
+}
+
+fn holding_widths(constructors: List<ConstructorInfo>, held: List<Bytes>) -> List<Bytes> =
+  range(0, constructors.len() + 1).fold(
+    { held: held, done: false },
+    |st: { held: List<Bytes>, done: Bool }, i: Int|
+      if st.done { st } else {
+        let grown = constructors.fold(
+          st.held,
+          |a: List<Bytes>, constructor_info: ConstructorInfo|
+            if a.contains(constructor_info.type_name) { a }
+            else if constructor_info.fields.fold(false, |b: Bool, ty: Type|
+                b || reaches_width(ty, a)) { a.push(constructor_info.type_name) }
+            else { a },
+        );
+        { held: grown, done: grown.len() == st.held.len() }
+      },
+  ).held
+
+fn reaches_width(t: Type, held: List<Bytes>) -> Bool =
+  match t {
+    VariableType(_) -> false,
+    NamedType(c) ->
+      width_number(c.name) != None || held.contains(c.name)
+        || c.args.fold(false, |b: Bool, a: Type| b || reaches_width(a, held)),
+    FunctionType(_) -> false,
+    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || reaches_width(field.ty, held)),
+    NominalType(n) ->
+      n.fields.fold(false, |b: Bool, field: Field| b || reaches_width(field.ty, held)),
+  }
+
+fn has_no_widths(widths_of: Widths) -> Bool = match widths_of { NoWidths -> true, _ -> false }
+
+fn widths_of(width_sums: WidthSums, vars: List<Int>, ty: Type) -> Widths / {abort.raise} =
+  match ty {
+    VariableType(v) -> VariableWidths(var_number(vars, v)),
+    NamedType(c) -> match width_number(c.name) {
+      Some(n) -> FixedWidth(n),
+      None -> {
+        let args = widths_of_all(width_sums, vars, c.args);
+        let plain = args.fold(true, |b: Bool, a: Widths| b && has_no_widths(a));
+        if list_item(ty) != None || array_element(ty) != None || columns_row(ty) != None {
+          if plain { NoWidths } else { ListWidths(args.get(0)) }
+        } else if map_parts(ty) != None {
+          if plain { NoWidths } else { MapWidths(args.get(0), args.get(1)) }
+        } else {
+          match width_sums.sums.get(c.name) {
+            Some(holds) -> if holds || !plain { SumWidths(args) } else { NoWidths },
+            None -> NoWidths,
+          }
+        }
+      },
+    },
+    FunctionType(f) -> {
+      let params = widths_of_all(width_sums, vars, f.params);
+      let ret = widths_of(width_sums, vars, f.ret);
+      if has_no_widths(ret) && params.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) {
+        NoWidths
+      } else { FunctionWidths(params, ret) }
+    },
+    RecordType(fs) -> record_widths(width_sums, vars, fs),
+    NominalType(n) -> record_widths(width_sums, vars, n.fields),
+  }
+
+fn record_widths(
+  width_sums: WidthSums,
+  vars: List<Int>,
+  fs: List<Field>,
+) -> Widths / {abort.raise} = {
+  let fields = fs.map(|f: Field| { name: f.name, carry: widths_of(width_sums, vars, f.ty) });
+  if fields.fold(true, |b: Bool, f: FieldWidths| b && has_no_widths(f.carry)) { NoWidths }
+  else { RecordWidths(fields) }
+}
+
+fn widths_of_all(
+  width_sums: WidthSums,
+  vars: List<Int>,
+  types: List<Type>,
+) -> List<Widths> / {abort.raise} = types.map(|ty: Type| widths_of(width_sums, vars, ty))
+
+fn grounded(c: Widths) -> Widths =
+  match c {
+    VariableWidths(_) -> NoWidths,
+    ListWidths(x) -> {
+      let g = grounded(x);
+      if has_no_widths(g) { NoWidths } else { ListWidths(g) }
+    },
+    MapWidths(k, v) -> {
+      let gk = grounded(k);
+      let gv = grounded(v);
+      if has_no_widths(gk) && has_no_widths(gv) { NoWidths } else { MapWidths(gk, gv) }
+    },
+    RecordWidths(fs) -> {
+      let gs = fs.map(|f: FieldWidths| { name: f.name, carry: grounded(f.carry) });
+      if gs.fold(true, |b: Bool, f: FieldWidths| b && has_no_widths(f.carry)) { NoWidths }
+      else { RecordWidths(gs) }
+    },
+    SumWidths(ps) -> SumWidths(ps.map(grounded)),
+    FunctionWidths(ps, r) -> {
+      let gs = ps.map(grounded);
+      let gr = grounded(r);
+      if has_no_widths(gr) && gs.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) { NoWidths }
+      else { FunctionWidths(gs, gr) }
+    },
+    other -> other,
+  }
+
+fn var_number(vars: List<Int>, v: Int) -> Int / {abort.raise} =
+  range(0, vars.len()).fold(vars.len() + v, |acc: Int, i: Int|
+    if acc >= vars.len() && vars.get(i) == v { i } else { acc })
+
+fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
+  match ty {
+    FunctionType(f) -> { params: f.params, ret: f.ret },
+    other -> { params: [], ret: other },
+  }
+
+fn emitter_root(
+  width_sums: WidthSums,
+  vars: List<Int>,
+  witnesses: List<Int>,
+  root: RootKey,
+  params: List<Type>,
+  result: Type,
+  labels: Int,
+  pure: Bool,
+  place: ModuleSpan,
+) -> EmitterRoot / {abort.raise} = {
+  let taken = witnesses.map(|w: Int| int_type()).concat(params);
+  {
+    root: root_text(root_name(root)),
+    arity: taken.len() + labels,
+    pure: pure,
+    at: place,
+    params: widths_of_all(width_sums, vars, taken),
+    result: widths_of(width_sums, vars, result),
+    witnesses: witnesses,
+  }
+}
+
+fn proposition_root(
+  width_sums: WidthSums,
+  vars: List<Int>,
+  witnesses: List<Int>,
+  root: RootKey,
+  params: List<Type>,
+  place: ModuleSpan,
+) -> EmitterRoot / {abort.raise} =
+  emitter_root(width_sums, vars, witnesses, root, params, bool_type(), 0, false, place)
+
+fn witness_variables(definition: DefinitionInfo) -> List<Int> =
+  witness_params(definition.constraints)
+
+fn emitter_roots(
+  outlines: List<Outline>,
+  checked: CheckOutput,
+  width_sums: WidthSums,
+  within: Option<TestRunScope> = None,
+) -> List<EmitterRoot> / {abort.raise} = {
+  let owned = |name: Bytes| match within { Some(w) -> w.owners.contains(name), None -> true };
+  let definitions = Map::of_entries(
+    checked.definitions.map(|d: DefinitionInfo| { key: d.name, value: d }),
+  );
+  let laws = Map::of_entries(checked.laws.map(|l: LawInfo| { key: l.key, value: l }));
+  let tests = Map::of_entries(checked.tests.map(|t: TestInfo| { key: t.key, value: t }));
+  let walked = outlines.fold(
+    { functions: [], tests: [], specs: [] },
+    |acc: EmitTables, o: Outline| {
+      let items = o.items.fold(
+        { functions: [], tests: [], specs: [] },
+        |a: EmitTables, item: OutlineItem|
+          match item {
+            OutlinedFunction(f) -> {
+              let name = qualify(o.name, f.name);
+              match if owned(name) { definitions.get(name) } else { None } {
+                None -> a,
+                Some(definition) -> {
+                  let sig = emit_signature(definition.scheme.ty);
+                  let vars = definition.scheme.type_variables;
+                  let witnesses = witness_variables(definition);
+                  let place = span_at(definition.at.module, definition.at.span);
+                  let fn_row = emitter_root(
+                    width_sums,
+                    vars,
+                    witnesses,
+                    Named(name),
+                    sig.params,
+                    sig.ret,
+                    definition.scheme.label_variables.len(),
+                    is_pure_definition(definition),
+                    place,
+                  );
+                  let clauses = f.spec.fold(
+                    { rows: [], requires: 0, ensures: 0 },
+                    |b: { rows: List<EmitterRoot>, requires: Int, ensures: Int }, kind: SpecKind| {
+                      match kind {
+                        RequiresClause -> {
+                          let root = clause_key(name, kind, b.requires);
+                          let row = proposition_root(
+                            width_sums,
+                            vars,
+                            witnesses,
+                            root,
+                            sig.params,
+                            place,
+                          );
+                          { rows: b.rows.push(row), requires: b.requires + 1, ensures: b.ensures }
+                        },
+                        EnsuresClause -> {
+                          let root = clause_key(name, kind, b.ensures);
+                          let row = proposition_root(
+                            width_sums,
+                            vars,
+                            witnesses,
+                            root,
+                            sig.params.push(sig.ret),
+                            place,
+                          );
+                          { rows: b.rows.push(row), requires: b.requires, ensures: b.ensures + 1 }
+                        },
+                        CostClause -> b,
+                        SpaceClause -> b,
+                      }
+                    },
+                  );
+                  { ..a, functions: a.functions.push(fn_row), specs: a.specs.concat(clauses.rows) }
+                },
+              }
+            },
+            OutlinedTest(t) -> {
+              let place = match tests.get(qualify(o.name, t.name)) {
+                Some(x) -> span_at(x.at.module, x.at.span),
+                None -> no_module_span(),
+              };
+              let root = test_key(o.name, t.name);
+              let taken = if !t.cases { [] } else { [int_type(), bytes_type()] };
+              let row = emitter_root(width_sums, [], [], root, taken, unit_type(), 0, false, place);
+              let listed = if !t.cases { a.specs } else {
+                a.specs.push(
+                  emitter_root(
+                    width_sums,
+                    [],
+                    [],
+                    TestCases(root),
+                    [],
+                    listing_type(),
+                    0,
+                    false,
+                    place,
+                  ),
+                )
+              };
+              { ..a, tests: a.tests.push(row), specs: listed }
+            },
+            OutlinedLaw(l) -> match within {
+              Some(_) -> a,
+              None -> {
+                let name = qualify(o.name, l.name);
+                let law = laws.get(name);
+                let guarded = match law { Some(x) -> x.has_guard, None -> false };
+                let binders = match law {
+                  Some(x) -> x.binders.map(|b: LawBinder| b.ty),
+                  None -> [],
+                };
+                let vars = variables_in(binders);
+                let place = match law {
+                  Some(x) -> span_at(x.at.module, x.at.span),
+                  None -> no_module_span(),
+                };
+                let rows = List::map(
+                  if guarded { [LawGuard, LawBody] } else { [LawBody] },
+                  |part: LawPart| {
+                    proposition_root(
+                      width_sums,
+                      vars,
+                      [],
+                      law_key(o.name, l.name, part),
+                      binders,
+                      place,
+                    )
+                  },
+                );
+                { ..a, specs: a.specs.concat(rows) }
+              },
+            },
+            _ -> a,
+          },
+      );
+      {
+        functions: acc.functions.concat(items.functions),
+        tests: acc.tests.concat(items.tests),
+        specs: acc.specs.concat(items.specs),
+      }
+    },
+  );
+  walked.functions.concat(walked.tests).concat(walked.specs)
+}
+
+fn ordinal_row(o: Outline) -> OrdinalRow =
+  {
+    module: o.name,
+    items: o.items.fold([], |acc: List<Bytes>, item: OutlineItem|
+      match item {
+        OutlinedFunction(f) -> {
+          let rooted = f.spec.filter(|kind: SpecKind| kind != CostClause && kind != SpaceClause);
+          let kinds = if rooted.len() == 0 { b"" }
+          else { b" ".concat(Bytes::join(rooted.map(spec_kind_text), b",")) };
+          acc.push(Bytes::concat_all([b"fn ", qualify(o.name, f.name), kinds]))
+        },
+        OutlinedTest(t) -> acc.push(b"test ".concat(qualify(o.name, t.name))),
+        OutlinedLaw(l) -> acc.push(b"law ".concat(qualify(o.name, l.name))),
+        _ -> acc,
+      }),
+  }
+
+fn in_source_order(definitions: List<DefinitionInfo>) -> List<DefinitionInfo> =
+  definitions.sort_by(|a: DefinitionInfo, b: DefinitionInfo|
+    if a.at.module != b.at.module { a.at.module < b.at.module }
+    else if a.at.span.start != b.at.span.start { a.at.span.start < b.at.span.start }
+    else { match compare_values(a.name, b.name) { Greater -> false, _ -> true } })
+
+fn tables(
+  warnings: List<Diagnostic>,
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  imports: List<List<Bytes>>,
+  unimported: List<List<Bytes>>,
+  checked: CheckOutput,
+  hashes: HashOutput,
+  packages: List<PackageDependencies>,
+  pins: List<LockedPackage>,
+  module_packages: List<Int>,
+  embeds: List<ModuleEmbed>,
+  within: Option<TestRunScope> = None,
+) -> Dump / {abort.raise} = {
+  let functions = written_functions(outlines);
+  let effs = effect_visibility(outlines);
+  let hosts = effect_hosts(outlines);
+  let read = all_body_facts(checked);
+  let names = test_label_spans(outlines);
+  let lits = law_literals(outlines);
+  let width_sums = width_sums_of(checked.constructors);
+  {
+    diagnostics: warnings.map(normalized_diagnostic),
+    order: order,
+    packages: packages,
+    pins: pins,
+    module_packages: module_packages,
+    modules: range(0, outlines.len()).map(|i: Int|
+      module_row(
+        i,
+        outlines.get(i),
+        match imports.at(i) { Some(xs) -> xs, None -> [] },
+        match unimported.at(i) { Some(xs) -> xs, None -> [] },
+      )),
+    definitions: in_source_order(checked.definitions).map(|definition_info: DefinitionInfo|
+      definition_row(definition_info, written_function_of(functions, definition_info.name))),
+    types: type_rows(outlines),
+    tests: range(0, checked.tests.len()).map(|i: Int| test_row(checked.tests.get(i), names.get(i))),
+    laws: range(0, checked.laws.len()).map(|i: Int| law_row(checked.laws.get(i), lits.get(i))),
+    effects: checked.effects.map(|effect_info: EffectInfo|
+      effect_row(effect_info, effect_public_of(effs, effect_info), hosts, read, width_sums)),
+    constructors: checked.constructors.map(constructor_row),
+    hashes: hash_rows(outlines, hashes),
+    hashes_digest: digest(hashes),
+    keys: root_keys(outlines, checked, hashes, within),
+    emitter_roots: emitter_roots(outlines, checked, width_sums, within),
+    emitter_constructors: emitter_constructors_of(outlines, checked, width_sums),
+    ordinals: outlines.map(ordinal_row),
+    bodies: hashes.bodies,
+    embeds: embeds,
+    rows: rows_from(checked, hashes),
+    walked: bin::encode(
+      inferred_facts_of(outlines.map(|o: Outline| o.name), checked),
+      inferred_facts_bin(),
+    ),
+    derived: outlines.filter(|o: Outline| o.derived.len() > 0).map(|o: Outline|
+      { module: o.name, derivations: o.derived }),
+  }
+}
+
+pub fn checked_program_of(w: Analysis) -> CheckedProgram / {abort.raise} =
+  {
+    frame: {
+      outlines: outlines_of(w),
+      order: w.r.order.map(|i: Int| w.modules.get(i).name),
+      imports: imports_resolved(w.modules, w.r),
+      unimported: w.unimported,
+      hashes: w.hashes,
+      warnings: w.warnings,
+      manifest: w.manifest,
+      packages: w.packages,
+      pins: w.pins,
+      module_packages: w.module_packages,
+      embeds: w.embeds,
+      embed_items: w.embed_items,
+      tagged: root_tagged(
+        w.module_packages,
+        w.hashes,
+        range(0, w.modules.len()).fold([], |acc: List<TaggedSite>, i: Int|
+          acc.concat(tagged_of(w, i))),
+      ),
+      statements: root_statements(
+        w.module_packages,
+        w.hashes,
+        range(0, w.modules.len()).fold([], |acc: List<StatementSite>, i: Int|
+          acc.concat(statements_of(w, i))),
+      ),
+      consts: root_consts(
+        w.module_packages,
+        range(0, w.modules.len()).fold([], |acc: List<TypedConst>, i: Int|
+          acc.concat(typed_consts_of(w, i))),
+      ),
+    },
+    checked: w.checked,
+  }
+
+pub fn view_dump(v: CheckedProgram, within: Option<TestRunScope>) -> Dump / {abort.raise} = {
+  let f = v.frame;
+  tables(
+    f.warnings,
+    f.outlines,
+    f.order,
+    f.imports,
+    f.unimported,
+    v.checked,
+    f.hashes,
+    f.packages,
+    f.pins,
+    f.module_packages,
+    f.embeds,
+    within,
+  )
+}
+
+pub type AnalysisOutcome = | Rejected(List<Diagnostic>) | Analysed(Analysis)
+
+pub type ConstSite = { module: Int, span: Span, name: Bytes, hash: Bytes }
+
+pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
+  let named = frame.consts.fold(Map::new(), |acc: Map<Bytes, Bool>, c: TypedConst|
+    if c.type_name == type_name { acc.insert(c.name, true) } else { acc });
+  let hashed = by_name(frame.hashes.definitions);
+  range(0, frame.outlines.len()).fold([], |acc: List<ConstSite>, i: Int| {
+    let o = frame.outlines.get(i);
+    o.items.fold(acc, |sites: List<ConstSite>, item: OutlineItem|
+      match item {
+        OutlinedFunction(f) -> {
+          let name = qualify(o.name, f.name);
+          match if f.constant && named.contains(name) { hashed.get(name) } else { None } {
+            Some(h) -> sites.push({ module: i, span: f.name_span, name: name, hash: h }),
+            None -> sites,
+          }
+        },
+        _ -> sites,
+      })
+  })
+}
+
+fn known_definitions(
+  rows: List<KnownDefinitionRow>,
+) -> Map<Bytes, CachedDefinition> / {abort.raise} =
+  rows.fold(Map::new(), |acc: Map<Bytes, CachedDefinition>, row: KnownDefinitionRow|
+    match ((read_effects(row.effects), read_effects(row.performed), read_effects(row.scaling))) {
+      (Some(effects), Some(performed), Some(scaling)) ->
+        acc.insert(row.name, {
+          effects: effects,
+          performed: performed,
+          scaling: scaling,
+          repeats: row.repeats,
+          ending: row.ending,
+          summary: row.summary,
+          raises: row.raises,
+          facts: row.facts,
+        }),
+      _ -> acc,
+    })
+
+fn known_tests(rows: List<KnownTestRow>) -> Map<Bytes, CachedTest> / {abort.raise} =
+  rows.fold(Map::new(), |acc: Map<Bytes, CachedTest>, r: KnownTestRow|
+    match read_effects(r.effects) {
+      None -> acc,
+      Some(effects) -> acc.insert(r.key, { effects: effects, facts: r.facts }),
+    })
+
+pub fn known_from_rows(rows: Rows, root: Int) -> CheckCache / {abort.raise} =
+  {
+    ..empty_cache(),
+    definitions: known_definitions(rows.definitions),
+    tests: known_tests(rows.tests),
+    root: root,
+    types: rows.types,
+  }
+
+fn effect_hashes_of(declarations: Map<Bytes, Bytes>, effects: List<Effect>) -> List<EffectHash> =
+  effects.fold(Map::new(), |acc: Map<Bytes, Bytes>, entry: Effect|
+    match declarations.get(entry.effect) {
+      Some(h) -> acc.insert(entry.effect, h),
+      None -> acc,
+    }).fold([], |acc: List<EffectHash>, name: Bytes, hash: Bytes|
+    acc.push({ name: name, hash: hash }))
+
+pub fn definition_known_row(
+  declarations: Map<Bytes, Bytes>,
+  definition_info: DefinitionInfo,
+  hash: Bytes,
+  read: AllBodyFacts,
+) -> KnownDefinitionRow / {abort.raise} =
+  {
+    name: definition_info.name,
+    hash: hash,
+    effect_hashes: effect_hashes_of(
+      declarations,
+      definition_info.effects.concat(definition_info.performed),
+    ),
+    effects: positional_effects_text(
+      definition_info.effects,
+      definition_info.scheme.label_variables,
+    ),
+    performed: positional_effects_text(
+      definition_info.performed,
+      definition_info.scheme.label_variables,
+    ),
+    scaling: positional_effects_text(
+      definition_info.scaling,
+      definition_info.scheme.label_variables,
+    ),
+    repeats: definition_info.repeats,
+    ending: definition_info.ending,
+    summary: definition_info.summary,
+    raises: definition_info.raises,
+    facts: encoded_facts(read, definition_info.name),
+    scheme: canonical_scheme(definition_info.scheme),
+  }
+
+fn test_known_row(
+  declarations: Map<Bytes, Bytes>,
+  test_info: TestInfo,
+  hash: Bytes,
+  owner: Bytes,
+  read: AllBodyFacts,
+) -> KnownTestRow / {abort.raise} =
+  {
+    key: test_info.key,
+    hash: hash,
+    effect_hashes: effect_hashes_of(declarations, test_info.effects),
+    effects: effect_list_text(test_info.effects, b","),
+    owner: owner,
+    facts: encoded_facts(read, owner),
+  }
+
+type AllBodyFacts = { kept: Map<Bytes, Bytes>, walked: Map<Bytes, BodyFacts> }
+
+pub fn all_body_facts(checked: CheckOutput) -> AllBodyFacts / {abort.raise} =
+  {
+    kept: checked.cached.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: CachedFacts|
+      acc.insert(k.name, k.facts)),
+    walked: facts_by_owner(checked.facts),
+  }
+
+fn encoded_facts(read: AllBodyFacts, owner: Bytes) -> Bytes / {abort.raise} =
+  match read.kept.get(owner) {
+    Some(recorded) -> recorded,
+    None -> encode_facts(match read.walked.get(owner) { Some(f) -> f, None -> no_body_facts() }),
+  }
+
+pub fn types_of_rows(
+  table: TypeTable,
+  definitions: List<KnownDefinitionRow>,
+  tests: List<KnownTestRow>,
+) -> TypeTable / {abort.raise} = {
+  let bodies = |acc: List<TypedBody<Bytes>>, recorded: Bytes|
+    match decode_facts(recorded, 0, b"") { Some(f) -> acc.concat(f.bodies), None -> acc };
+  types_named(
+    table,
+    tests.fold(
+      definitions.fold([], |acc: List<TypedBody<Bytes>>, r: KnownDefinitionRow|
+        bodies(acc, r.facts)),
+      |acc: List<TypedBody<Bytes>>, r: KnownTestRow| bodies(acc, r.facts),
+    ),
+  )
+}
+
+pub type InferredFacts = {
+  modules: List<Bytes>,
+  pure: List<Bytes>,
+  orders: List<WitnessOrder>,
+  law_facts: List<{ owner: Bytes, facts: BodyFacts }>,
+}
+
+derive bin for InferredFacts
+
+pub fn inferred_facts_of(
+  modules: List<Bytes>,
+  checked: CheckOutput,
+) -> InferredFacts / {abort.raise} = {
+  let laws = checked.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: LawInfo|
+    acc.insert(law_owner(l.module, l.name), true));
+  {
+    modules: modules,
+    pure: checked.facts.pure,
+    orders: checked.facts.orders,
+    law_facts: facts_by_owner(checked.facts).fold(
+      [],
+      |acc: List<{ owner: Bytes, facts: BodyFacts }>, owner: Bytes, f: BodyFacts|
+        if laws.contains(owner) {
+          acc.push({ owner: owner, facts: { ..f, types: types_named(f.types, f.bodies) } })
+        } else { acc },
+    ),
+  }
+}
+
+pub fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} = {
+  let keyed = by_name(hashes.definitions);
+  let declarations = by_name(hashes.declarations);
+  let read = all_body_facts(checked);
+  let definitions = checked.definitions.fold(
+    [],
+    |acc: List<KnownDefinitionRow>, definition_info: DefinitionInfo|
+      match keyed.get(definition_info.name) {
+        Some(x) -> acc.push(definition_known_row(declarations, definition_info, x, read)),
+        None -> acc,
+      },
+  );
+  let tests = test_rows(checked, hashes, declarations, read);
+  {
+    definitions: definitions,
+    tests: tests,
+    types: types_of_rows(checked.facts.types, definitions, tests),
+  }
+}
+
+fn test_rows(
+  checked: CheckOutput,
+  hashes: HashOutput,
+  declarations: Map<Bytes, Bytes>,
+  read: AllBodyFacts,
+) -> List<KnownTestRow> / {abort.raise} = {
+  checked.tests.map(|t: TestInfo|
+    test_known_row(
+      declarations,
+      t,
+      of_key(hashes.tests, t.key),
+      test_owner(t.module, t.name),
+      read,
+    ))
+}
+
+pub type TestRunScope = { owners: Map<Bytes, Bool>, tests: Map<Bytes, Bool> }

@@ -393,7 +393,9 @@ fn told(bytes: &[u8]) -> &'static str {
         Some(tag::CTOR) => "a variant",
         Some(tag::MAP) => "a `Map`",
         Some(tag::FUN) => "a function",
-        Some(tag::HANDLE) if bytes.get(at + 1).copied() == Some(shown::HOLD as u8) => "a `Hold`",
+        Some(tag::HANDLE) if bytes.get(at + 1).copied() == Some(shown::SCOPED as u8) => {
+            "a `Scoped`"
+        }
         Some(tag::HANDLE) => "a `Secret`",
         _ => "a value",
     }

@@ -39,12 +39,12 @@ pub fn not_a_byte(span: Span, what: &str, byte: i64) -> Diagnostic {
         format!("`{what}` was given {byte}, which is not a byte"),
     )
     .primary(span, "a byte is `0` to `255`")
-    .note("`Bytes::at` answers in that range, and so does a byte literal's element")
+    .note("`Bytes::at` returns values in that range, and so does a byte literal's element")
 }
 
 /// `byte_of_int` given `n`, which is no byte.
 #[cold]
-pub fn byte_of_int_refused(span: Span, n: i64) -> Diagnostic {
+pub fn byte_of_int_rejected(span: Span, n: i64) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, format!("`byte_of_int` was given {n}"))
         .primary(span, "a byte is 0 to 255")
         .note("mask the value before the call if that is what you meant: `n & 0xFF`")
@@ -153,15 +153,15 @@ pub fn assert_failure(message: Option<&str>, span: Span) -> Diagnostic {
     }
 }
 
-/// A hold reached after its region let it go, which only a continuation captured inside the region
+/// A scoped value used after its scope let it go, which only a continuation captured in the scope
 /// and resumed after the release can do.
 #[cold]
-pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
+pub fn scoped_released(span: Span, doing: &str) -> Diagnostic {
     Diagnostic::error(
-        codes::HOLD_RELEASED,
-        format!("a hold is {doing} after its region released what it held"),
+        codes::SCOPED_VALUE_RELEASED,
+        format!("a scoped value is {doing} after its scope released what it held"),
     )
-    .primary(span, "the hold holds nothing now")
+    .primary(span, "the scoped value holds nothing now")
     .note("a `with_scope` releases its value once, when its body first ends; a continuation captured inside the body and resumed after that runs the rest of the body against a value already released")
     .note("resume a continuation captured inside a `with_scope` at most once, or open the `with_scope` after the choice the continuation replays")
 }

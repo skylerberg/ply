@@ -1,6 +1,6 @@
 //! The sockets `std.net` and `std.udp` open, in one table: TCP, TLS and Unix streams, listeners and
 //! datagram sockets, each under the handle and the resource label the program uses it by. The real
-//! handlers' natives call in here, and an operation that waits answers a job for the process's
+//! handlers' natives call in here, and an operation that waits returns a job for the process's
 //! waiting pool.
 
 mod socket;
@@ -8,7 +8,7 @@ pub mod wire;
 
 pub use socket::TcpHost;
 pub(crate) use socket::apply;
-pub use wire::{Credentials, Endpoint, Probing, Refusal, SocketOption};
+pub use wire::{Credentials, Endpoint, NetError, Probing, SocketOption};
 
 use ply_core::{Diagnostic, Span, codes};
 use std::collections::BTreeMap;
@@ -99,7 +99,10 @@ pub(crate) fn bind(what: &str, port: u16, span: Span) -> Result<std::net::TcpLis
             codes::RUNTIME_ERROR,
             format!("{what} could not bind 127.0.0.1:{port}: {e}"),
         )
-        .primary(span, "this listen reached the host and the host refused")
+        .primary(
+            span,
+            "this listen reached the host and the host rejected it",
+        )
     })
 }
 
@@ -133,10 +136,10 @@ fn not_a_stream(handle: i64, span: Span) -> Diagnostic {
 
 /// An upgrade of something that is not a plaintext TCP connection at rest.
 #[cold]
-fn not_upgradable(what: &str, handle: i64, why: &str, span: Span) -> Diagnostic {
+fn not_upgradable(what: &str, handle: i64, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{what} cannot secure socket {handle}: {why}"),
+        format!("{what} cannot secure socket {handle}: {reason}"),
     )
     .primary(span, "an upgrade takes a plaintext connection nothing else is waiting on")
     .note("the handle is the secured connection afterwards, so a read or a write still in flight on the plaintext would be one the upgrade could not account for")

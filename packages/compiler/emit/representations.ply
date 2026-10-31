@@ -3,9 +3,9 @@ import compiler.syntax.type_syntax (Mode)
 import compiler.emit.code (Lambda)
 import compiler.check.resolve.tables (qualify)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
-                             Field, Scheme, Row, Atom, int_type, encode_type, named_type,
+                             Field, Scheme, Effects, Effect, int_type, encode_type, named_type,
                              option_type, list_type, string_type, bytes_type, bool_type, float_type,
-                             unit_type, map_type, row_empty, is_label_or_row, atoms_union)
+                             unit_type, map_type, no_effects, is_label_or_effects, effects_union)
 import compiler.check.known (is_int, is_bool, is_float, is_decimal, is_bytes, is_char, list_item,
                              array_element, columns_row, int_name, bool_name, char_name,
                              decimal_name, float_name, unit_name, columns_name, task_name,
@@ -38,7 +38,7 @@ pub type Constructors = {
   unkept: Map<Bytes, Unkept>,
   sum_layouts: Map<Bytes, SumLayout>,
   released: Map<Bytes, Bytes>,
-  release_rows: Map<Bytes, Row>,
+  release_effects_by_type: Map<Bytes, Effects>,
 }
 
 pub type SumConstructor = { name: Bytes, index: Int, fields: List<Type>, params: List<Int> }
@@ -67,7 +67,7 @@ pub fn constructors_of(
     unkept: unkept_of(sums),
     sum_layouts: Map::new(),
     released: Map::new(),
-    release_rows: Map::new(),
+    release_effects_by_type: Map::new(),
   }
 
 pub fn with_released(
@@ -78,29 +78,32 @@ pub fn with_released(
   {
     ..constructors,
     released: released,
-    release_rows: released.fold(Map::new(), |m: Map<Bytes, Row>, ty: Bytes, by: Bytes|
-      match scheme_of(by) {
-        Some(sc) -> match sc.ty {
-          FunctionType(f) -> m.insert(ty, { atoms: f.effects.atoms, tail: None }),
-          _ -> m,
+    release_effects_by_type: released.fold(
+      Map::new(),
+      |m: Map<Bytes, Effects>, ty: Bytes, by: Bytes|
+        match scheme_of(by) {
+          Some(sc) -> match sc.ty {
+            FunctionType(f) -> m.insert(ty, { listed: f.effects.listed, variable: None }),
+            _ -> m,
+          },
+          None -> m,
         },
-        None -> m,
-      }),
+    ),
   }
 
-pub fn release_row(constructors: Constructors, ty: Type) -> Row / {abort.raise} =
-  if constructors.release_rows.len() == 0 { row_empty() } else {
-    let atoms = iterate(
-      { todo: [ty], seen: [], atoms: [] },
+pub fn release_effects(constructors: Constructors, ty: Type) -> Effects / {abort.raise} =
+  if constructors.release_effects_by_type.len() == 0 { no_effects() } else {
+    let effects = iterate(
+      { todo: [ty], seen: [], listed: [] },
       constructors.sums.fold(256, |n: Int, _: Bytes, cs: List<SumConstructor>|
         cs.fold(n, |m: Int, k: SumConstructor| m + 4 * (k.fields.len() + 1))),
-      |w: { todo: List<Type>, seen: List<Bytes>, atoms: List<Atom> }|
+      |w: { todo: List<Type>, seen: List<Bytes>, listed: List<Effect> }|
         match w.todo {
-          [] -> Stop(w.atoms),
+          [] -> Stop(w.listed),
           [t, ..rest] -> match t {
-            NamedType(c) -> if is_label_or_row(t) { Continue({ ..w, todo: rest }) } else {
-              match constructors.release_rows.get(c.name) {
-                Some(r) -> Continue({ ..w, todo: rest, atoms: atoms_union(w.atoms, r.atoms) }),
+            NamedType(c) -> if is_label_or_effects(t) { Continue({ ..w, todo: rest }) } else {
+              match constructors.release_effects_by_type.get(c.name) {
+                Some(r) -> Continue({ ..w, todo: rest, listed: effects_union(w.listed, r.listed) }),
                 None -> {
                   let args = rest.concat(c.args);
                   if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
@@ -124,7 +127,7 @@ pub fn release_row(constructors: Constructors, ty: Type) -> Row / {abort.raise} 
           },
         },
     );
-    { atoms: atoms, tail: None }
+    { listed: effects, variable: None }
   }
 
 pub fn holds_resource(constructors: Constructors, ty: Type) -> Bool / {abort.raise} =
@@ -138,7 +141,7 @@ pub fn holds_resource(constructors: Constructors, ty: Type) -> Bool / {abort.rai
           [] -> Stop(false),
           [t, ..rest] -> match t {
             VariableType(_) -> Stop(true),
-            NamedType(c) -> if is_label_or_row(t) { Continue({ ..w, todo: rest }) }
+            NamedType(c) -> if is_label_or_effects(t) { Continue({ ..w, todo: rest }) }
             else if constructors.released.contains(c.name) { Stop(true) } else {
               let args = rest.concat(c.args);
               if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
@@ -507,7 +510,7 @@ pub type TypeShape =
 pub fn type_variables(ty: Type) -> List<Int> =
   match ty {
     VariableType(v) -> if v >= 0 { [v] } else { [] },
-    NamedType(c) -> if is_label_or_row(ty) { [] } else {
+    NamedType(c) -> if is_label_or_effects(ty) { [] } else {
       c.args.fold({ at: 0, vs: [] }, |acc: { at: Int, vs: List<Int> }, a: Type|
         {
           at: acc.at + 1,
@@ -983,8 +986,8 @@ pub fn word_form(constructors: Constructors, ty: Type) -> WordForm / {abort.rais
 
 pub fn word_type() -> Type = NamedType({ name: b"_", args: [] })
 
-pub fn parallel_results_type(answers: List<Type>) -> Type =
-  NamedType({ name: parallel_results_name(), args: answers })
+pub fn parallel_results_type(results: List<Type>) -> Type =
+  NamedType({ name: parallel_results_name(), args: results })
 
 pub fn parallel_results_name() -> Bytes = b"?gathered"
 
@@ -1012,7 +1015,7 @@ pub fn has_variables(ty: Type) -> Bool =
   match ty {
     VariableType(_) -> true,
     NamedType(c) ->
-      !is_label_or_row(ty)
+      !is_label_or_effects(ty)
         && c.args.fold({ at: 0, any: false }, |acc: { at: Int, any: Bool }, a: Type|
           { at: acc.at + 1, any: acc.any || (!is_scope_label(c, acc.at) && has_variables(a)) }).any,
     FunctionType(f) ->
@@ -1125,14 +1128,14 @@ test "a specialisation's root spells its layouts and the lambdas it runs" {
     None,
   );
   let u32 = [width_type({ bits: 32, signed: false })];
-  let lent = |nth: Int| [{ param: 1, owner: Named(b"app.main"), nth: nth }];
-  let handed = root_name(specialisation_key(b"m.f", u32, lent(0)));
+  let borrowed = |nth: Int| [{ param: 1, owner: Named(b"app.main"), nth: nth }];
+  let handed = root_name(specialisation_key(b"m.f", u32, borrowed(0)));
   assert(
     root_text(handed).index_of(b"app.main") != None
       && handed != root_name(specialisation_key(b"m.f", u32, [])),
     None,
   );
-  assert(handed != root_name(specialisation_key(b"m.f", u32, lent(3))), None)
+  assert(handed != root_name(specialisation_key(b"m.f", u32, borrowed(3))), None)
 }
 
 fn case_of(name: Bytes, index: Int, fields: List<Type>, params: List<Int>) -> SumConstructor =
@@ -1218,7 +1221,7 @@ test "a type lays a value out in its words, a record in its fields' and a sum by
           once: false,
           params: [int_type()],
           ret: int_type(),
-          effects: row_empty(),
+          effects: no_effects(),
         }),
       ),
     ),

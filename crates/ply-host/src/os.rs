@@ -1,6 +1,6 @@
 //! What the machine and the process a program runs in say of themselves, as the natives `std.os`'s
 //! host handler calls read it. None of it reads the environment, so no variable a user sets changes
-//! an answer.
+//! a result.
 
 /// The processors this process may run on at once: what its affinity mask and its control
 /// group's quota leave of the machine's, where the platform says.
@@ -81,8 +81,8 @@ pub fn user_name(id: i64) -> Option<String> {
     unsafe {
         let mut entry: libc::passwd = std::mem::zeroed();
         let mut found: *mut libc::passwd = std::ptr::null_mut();
-        let answered = libc::getpwuid_r(id, &mut entry, text.as_mut_ptr(), text.len(), &mut found);
-        (answered == 0 && !found.is_null() && !entry.pw_name.is_null()).then(|| {
+        let returned = libc::getpwuid_r(id, &mut entry, text.as_mut_ptr(), text.len(), &mut found);
+        (returned == 0 && !found.is_null() && !entry.pw_name.is_null()).then(|| {
             std::ffi::CStr::from_ptr(entry.pw_name)
                 .to_string_lossy()
                 .into_owned()
@@ -96,7 +96,7 @@ pub fn user_name(_id: i64) -> Option<String> {
 }
 
 /// The file this process is running, as an absolute path with its links followed, so two
-/// processes of one program answer alike however each was started.
+/// processes of one program respond alike however each was started.
 pub fn executable() -> Option<String> {
     let started_as = std::env::current_exe().ok()?;
     let path = started_as.canonicalize().ok()?;

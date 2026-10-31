@@ -1,14 +1,14 @@
-//! The runtime's part of `bracket`, and the refusals and notes compiled code over data raises or makes.
+//! `bracket`'s runtime part, and the rejections and notes compiled code over data raises or makes.
 
 use super::*;
 use crate::native::Addr;
 
-/// `bracket(acquire, release, body)`: `body` given what `acquire` answered and `cleanup` given it
+/// `bracket(acquire, release, body)`: `body` given what `acquire` returned and `cleanup` given it
 /// after, however `body` ends: by returning, by a raise or a clause that did not resume it unwinding
 /// through, or by a cancel. It runs where the bracket stands, with the handlers around it, and a
 /// failure in it replaces whatever was unwinding. Each closure is let go once called. `held` is the
-/// type of what `acquire` answers, which both take a count of, and `answer` the type of what `body`
-/// answers, let go of where `cleanup` fails. A value a clause unwinds with is abandoned with the
+/// type of what `acquire` returns, which both take a count of, and `result` the type of what `body`
+/// returns, let go of where `cleanup` fails. A value a clause unwinds with is abandoned with the
 /// unwind, uncounted: its type is not known here. What this holds across each call is in a record
 /// on the stack's chain, so a body abandoned at a stop under the call lets it go.
 pub unsafe extern "C" fn rt_with_cleanup(
@@ -17,11 +17,11 @@ pub unsafe extern "C" fn rt_with_cleanup(
     body: Block,
     cleanup: Block,
     held: *const PlyType,
-    answer: *const PlyType,
+    result: *const PlyType,
 ) -> Handed {
     use crate::frames::{Held, held_across};
     let c = unsafe { &mut *ctx };
-    // The three share the bracket's row: each is handed the words its caller set for it.
+    // The three share the bracket's effects: each is handed the words its caller set for it.
     let words = (c.entering_desc, c.entering_words);
     let entering = move || {
         let c = unsafe { &mut *ctx };
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         return Handed::of(0);
     }
     let held = unsafe { Carried::new(Handed::of(acquired), held) };
-    let (answered, body, cleanup, held) = if cancelled {
+    let (returned, body, cleanup, held) = if cancelled {
         c.failed = FAILED_CANCELLED;
         (None, body, cleanup, held)
     } else {
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         else {
             unreachable!("a record gives back what it held");
         };
-        let r = unsafe { Carried::new(Handed::of(r), answer) };
+        let r = unsafe { Carried::new(Handed::of(r), result) };
         (Some(r), body, cleanup, held)
     };
     unsafe { body.let_go_function(ctx) };
@@ -92,13 +92,13 @@ pub unsafe extern "C" fn rt_with_cleanup(
         unsafe { cleanup.let_go_function(ctx) };
         return Handed::of(0);
     };
-    let answered = answered.filter(|_| ending == 0);
+    let returned = returned.filter(|_| ending == 0);
     let (f, given) = (cleanup.word(), held.handed().word());
     let call = || {
         entering();
         unsafe { Block::of(f).call(ctx, &[given]) }
     };
-    let (cleanup, answered) = match answered {
+    let (cleanup, returned) = match returned {
         Some(a) => {
             let (_, back) =
                 unsafe { held_across(ctx, [Held::Closure(cleanup), Held::Carried(a)], call) };
@@ -117,12 +117,12 @@ pub unsafe extern "C" fn rt_with_cleanup(
     };
     unsafe { cleanup.let_go_function(ctx) };
     if !aside.taken_up(unsafe { &mut *ctx }) {
-        if let Some(a) = answered {
+        if let Some(a) = returned {
             a.release(ctx);
         }
         return Handed::of(0);
     }
-    answered.map_or(Handed::of(0), Carried::handed)
+    returned.map_or(Handed::of(0), Carried::handed)
 }
 
 /// What is going on where a release runs, set aside while it runs: a `bracket` holds it across its
@@ -193,7 +193,7 @@ impl Unwinding {
 
 /// Sets aside the failure going on, where it is one a release runs during (a raise, a clause that
 /// did not resume, a cancel), so emitted code can let go of a resource on the failure's way out:
-/// answers 1, the failure written into the words at `held`, or 0 where nothing is failing or the
+/// returns 1, the failure written into the words at `held`, or 0 where nothing is failing or the
 /// failure is the run's, which releases nothing. The release runs where the failure stands, with the
 /// handlers around it, as a `bracket`'s does.
 pub unsafe extern "C" fn rt_unwind_hold(ctx: *mut Ctx, held: Word) -> Word {
@@ -230,11 +230,11 @@ fn cancel_carried(c: &mut Ctx) {
     c.failed = FAILED_CANCELLED;
 }
 
-/// A builtin emitted code writes in place whose refusal of its operands it hands the runtime:
-/// through [`rt_refused`] where the refusal names numbers, and through
+/// A builtin emitted code writes in place whose rejection of its operands it hands the runtime:
+/// through [`rt_refused`] where the rejection names numbers, and through
 /// [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Refused {
+pub enum Rejected {
     ArrayNew,
     ColumnsNew,
     ArrayOfList,
@@ -263,89 +263,89 @@ pub enum Refused {
     SecretRsaJwk,
 }
 
-/// Every [`Refused`], each numbered by its place here as emitted code numbers it.
-pub const REFUSED: [Refused; 26] = [
-    Refused::ArrayNew,
-    Refused::ColumnsNew,
-    Refused::ArrayOfList,
-    Refused::ColumnsOfList,
-    Refused::ArrayGet,
-    Refused::ArraySet,
-    Refused::ColumnsGet,
-    Refused::ColumnsSet,
-    Refused::BytesAt,
-    Refused::BytesU32Le,
-    Refused::BytesSlice,
-    Refused::StringSlice,
-    Refused::ByteOfInt,
-    Refused::BytesIndexOfByte,
-    Refused::BytesIndexOfFrom,
-    Refused::BytesScan,
-    Refused::BytesScanUntil,
-    Refused::Range,
-    Refused::BytesSplit,
-    Refused::StringSplit,
-    Refused::StringFind,
-    Refused::Assert,
-    Refused::BytesPosition,
-    Refused::SecretDecode,
-    Refused::SecretEncode,
-    Refused::SecretRsaJwk,
+/// Every [`Rejected`], each numbered by its place here as emitted code numbers it.
+pub const REJECTED: [Rejected; 26] = [
+    Rejected::ArrayNew,
+    Rejected::ColumnsNew,
+    Rejected::ArrayOfList,
+    Rejected::ColumnsOfList,
+    Rejected::ArrayGet,
+    Rejected::ArraySet,
+    Rejected::ColumnsGet,
+    Rejected::ColumnsSet,
+    Rejected::BytesAt,
+    Rejected::BytesU32Le,
+    Rejected::BytesSlice,
+    Rejected::StringSlice,
+    Rejected::ByteOfInt,
+    Rejected::BytesIndexOfByte,
+    Rejected::BytesIndexOfFrom,
+    Rejected::BytesScan,
+    Rejected::BytesScanUntil,
+    Rejected::Range,
+    Rejected::BytesSplit,
+    Rejected::StringSplit,
+    Rejected::StringFind,
+    Rejected::Assert,
+    Rejected::BytesPosition,
+    Rejected::SecretDecode,
+    Rejected::SecretEncode,
+    Rejected::SecretRsaJwk,
 ];
 
-impl Refused {
+impl Rejected {
     /// Its name in the prelude.
     pub fn name(self) -> &'static str {
         match self {
-            Refused::ArrayNew => "Array::new",
-            Refused::ColumnsNew => "Columns::new",
-            Refused::ArrayOfList => "Array::of_list",
-            Refused::ColumnsOfList => "Columns::of_list",
-            Refused::ArrayGet => "Array::get",
-            Refused::ArraySet => "Array::set",
-            Refused::ColumnsGet => "Columns::get",
-            Refused::ColumnsSet => "Columns::set",
-            Refused::BytesAt => "Bytes::at",
-            Refused::BytesU32Le => "Bytes::u32_le",
-            Refused::BytesSlice => "Bytes::slice",
-            Refused::StringSlice => "String::slice",
-            Refused::ByteOfInt => "byte_of_int",
-            Refused::BytesIndexOfByte => "Bytes::index_of_byte",
-            Refused::BytesIndexOfFrom => "Bytes::index_of_from",
-            Refused::BytesScan => "Bytes::scan",
-            Refused::BytesScanUntil => "Bytes::scan_until",
-            Refused::Range => "range",
-            Refused::BytesSplit => "Bytes::split",
-            Refused::StringSplit => "String::split",
-            Refused::StringFind => "String::find",
-            Refused::Assert => "assert",
-            Refused::BytesPosition => "Bytes::position",
-            Refused::SecretDecode => "Secret::decode",
-            Refused::SecretEncode => "Secret::encode",
-            Refused::SecretRsaJwk => "Secret::rsa_jwk",
+            Rejected::ArrayNew => "Array::new",
+            Rejected::ColumnsNew => "Columns::new",
+            Rejected::ArrayOfList => "Array::of_list",
+            Rejected::ColumnsOfList => "Columns::of_list",
+            Rejected::ArrayGet => "Array::get",
+            Rejected::ArraySet => "Array::set",
+            Rejected::ColumnsGet => "Columns::get",
+            Rejected::ColumnsSet => "Columns::set",
+            Rejected::BytesAt => "Bytes::at",
+            Rejected::BytesU32Le => "Bytes::u32_le",
+            Rejected::BytesSlice => "Bytes::slice",
+            Rejected::StringSlice => "String::slice",
+            Rejected::ByteOfInt => "byte_of_int",
+            Rejected::BytesIndexOfByte => "Bytes::index_of_byte",
+            Rejected::BytesIndexOfFrom => "Bytes::index_of_from",
+            Rejected::BytesScan => "Bytes::scan",
+            Rejected::BytesScanUntil => "Bytes::scan_until",
+            Rejected::Range => "range",
+            Rejected::BytesSplit => "Bytes::split",
+            Rejected::StringSplit => "String::split",
+            Rejected::StringFind => "String::find",
+            Rejected::Assert => "assert",
+            Rejected::BytesPosition => "Bytes::position",
+            Rejected::SecretDecode => "Secret::decode",
+            Rejected::SecretEncode => "Secret::encode",
+            Rejected::SecretRsaJwk => "Secret::rsa_jwk",
         }
     }
 
-    /// Whether its refusal raises for `abort.raise` to answer, as the prelude declares it, rather
+    /// Whether its rejection raises for `abort.raise` to handle, as the prelude declares it, rather
     /// than ending the run.
     pub fn raises(self) -> bool {
         !matches!(
             self,
-            Refused::ArrayOfList | Refused::ColumnsOfList | Refused::Range
+            Rejected::ArrayOfList | Rejected::ColumnsOfList | Rejected::Range
         )
     }
 }
 
-/// The refusal [`REFUSED`] numbers `what`.
-pub(crate) fn refused_numbered(what: I64) -> Option<Refused> {
+/// The rejection [`REJECTED`] numbers `what`.
+pub(crate) fn rejected_numbered(what: I64) -> Option<Rejected> {
     usize::try_from(what.0)
         .ok()
-        .and_then(|at| REFUSED.get(at).copied())
+        .and_then(|at| REJECTED.get(at).copied())
 }
 
-/// The refusal `d` of `r`: raised for `abort.raise` to answer where `r` raises, else failing the
+/// The rejection `d` of `r`: raised for `abort.raise` to handle where `r` raises, else failing the
 /// run.
-pub(crate) fn refuse(c: &mut Ctx, r: Refused, d: Diagnostic) {
+pub(crate) fn refuse(c: &mut Ctx, r: Rejected, d: Diagnostic) {
     if r.raises() {
         raise_error(c, d);
     } else {
@@ -353,21 +353,21 @@ pub(crate) fn refuse(c: &mut Ctx, r: Refused, d: Diagnostic) {
     }
 }
 
-/// The entry failed as Ply's fault: emitted code handed a refusal `what` that names no builtin the
-/// native refuses.
-pub(crate) fn refused_unknown(c: &mut Ctx, what: I64) {
+/// The entry failed as Ply's fault: emitted code handed a rejection `what` that names no builtin
+/// the native rejects.
+pub(crate) fn rejected_unknown(c: &mut Ctx, what: I64) {
     c.fail(
         Diagnostic::error(
             codes::INTERNAL_ERROR,
-            format!("a refused operation numbered {}, which none is", what.0),
+            format!("a rejected operation numbered {}, which none is", what.0),
         )
         .note("this is Ply's fault, not the program's"),
     );
 }
 
-/// An operation emitted code writes in place, refused numbers among its operands: left in the
-/// context as [`refuse`] leaves the builtin's own refusal of them. `what` numbers the builtin as
-/// [`REFUSED`] does, and `a`, `b` and `c` are what its refusal names: `Array::new`, `Columns::new`,
+/// An operation emitted code writes in place, rejected numbers among its operands: left in the
+/// context as [`refuse`] leaves the builtin's own rejection of them. `what` numbers the builtin as
+/// [`REJECTED`] does; `a`, `b` and `c` are what its rejection names: `Array::new`, `Columns::new`,
 /// `Array::of_list` and `Columns::of_list` a length `a`; `Array::get`, `Array::set`,
 /// `Columns::get`, `Columns::set`, `Bytes::at` and `Bytes::u32_le` an index `a` into `b` elements or
 /// bytes; `Bytes::slice` and `String::slice` a range `a..b` of `c` bytes or characters;
@@ -381,38 +381,41 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
     let cx = unsafe { &mut *ctx };
     let site = cx.site();
     let len = |n: I64| usize::try_from(n.0).unwrap_or(0);
-    let Some(r) = refused_numbered(what) else {
-        refused_unknown(cx, what);
+    let Some(r) = rejected_numbered(what) else {
+        rejected_unknown(cx, what);
         return Raises(());
     };
     let name = r.name();
-    let refused = match r {
-        Refused::ArrayNew | Refused::ColumnsNew | Refused::ArrayOfList | Refused::ColumnsOfList => {
-            said::array_length(site, name, a.0)
-        }
-        Refused::ArrayGet | Refused::ArraySet | Refused::ColumnsGet | Refused::ColumnsSet => {
+    let rejected = match r {
+        Rejected::ArrayNew
+        | Rejected::ColumnsNew
+        | Rejected::ArrayOfList
+        | Rejected::ColumnsOfList => said::array_length(site, name, a.0),
+        Rejected::ArrayGet | Rejected::ArraySet | Rejected::ColumnsGet | Rejected::ColumnsSet => {
             said::out_of_range(site, name, a.0, len(b), "elements")
         }
-        Refused::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
+        Rejected::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
         // Told at the last index it would read, as the builtin tells it.
-        Refused::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
-        Refused::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
-        Refused::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
-        Refused::ByteOfInt => said::byte_of_int_refused(site, a.0),
-        Refused::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
-        Refused::BytesIndexOfFrom | Refused::BytesPosition => {
+        Rejected::BytesU32Le => {
+            said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes")
+        }
+        Rejected::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
+        Rejected::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
+        Rejected::ByteOfInt => said::byte_of_int_rejected(site, a.0),
+        Rejected::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
+        Rejected::BytesIndexOfFrom | Rejected::BytesPosition => {
             said::start_outside(a.0, len(b), site, name)
         }
-        Refused::BytesScan | Refused::BytesScanUntil => {
+        Rejected::BytesScan | Rejected::BytesScanUntil => {
             if usize::try_from(a.0).is_ok_and(|from| from <= len(b)) {
                 said::negative_budget(site, name, c.0)
             } else {
                 said::start_outside(a.0, len(b), site, name)
             }
         }
-        Refused::Range => said::range_too_long(site, a.0, b.0),
-        Refused::BytesSplit | Refused::StringSplit => said::empty_separator(site, name),
-        Refused::SecretRsaJwk => ply_core::crypto::misuse(
+        Rejected::Range => said::range_too_long(site, a.0, b.0),
+        Rejected::BytesSplit | Rejected::StringSplit => said::empty_separator(site, name),
+        Rejected::SecretRsaJwk => ply_core::crypto::misuse(
             site,
             "`Secret::rsa_jwk`",
             format!(
@@ -421,15 +424,15 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
             ),
         ),
         _ => {
-            refused_unknown(cx, what);
+            rejected_unknown(cx, what);
             return Raises(());
         }
     };
-    refuse(cx, r, refused);
+    refuse(cx, r, rejected);
     Raises(())
 }
 
-/// `assert_eq` found its two values unequal: raised for `abort.raise` to answer, showing the actual
+/// `assert_eq` found its two values unequal: raised for `abort.raise` to handle, showing the actual
 /// value, the `n` PLV1 bytes at `actual`, and the expected, the `m` at `expected`, which the CLI
 /// renders, noting where the two first part.
 #[allow(improper_ctypes_definitions)]
@@ -450,14 +453,14 @@ pub unsafe extern "C" fn rt_assert_failed(
     .note(format!("expected: {e}"))
     .note(format!("actual:   {a}"))
     .showing(vec![
-        unsafe { lent(expected, m) }.to_vec(),
-        unsafe { lent(actual, n) }.to_vec(),
+        unsafe { borrowed(expected, m) }.to_vec(),
+        unsafe { borrowed(actual, n) }.to_vec(),
     ]);
     raise_error(c, d);
     Raises(())
 }
 
-/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a step answer
+/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a step result
 /// that is no `Iter`, which its type rules out.
 pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -473,7 +476,7 @@ pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
             error(format!("`iterate` did not stop within its budget of {n}")),
         ),
         _ => ctx.fail(
-            error("the step given to `iterate` answered neither `Continue` nor `Stop`")
+            error("the step given to `iterate` returned neither `Continue` nor `Stop`")
                 .note("this is Ply's fault, not the program's"),
         ),
     };

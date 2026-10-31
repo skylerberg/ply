@@ -1,8 +1,8 @@
 mod codec;
 mod crypto;
+mod effects;
 mod escape;
 mod float;
-mod footprint;
 mod host;
 mod rc;
 mod sim;

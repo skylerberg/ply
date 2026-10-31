@@ -43,12 +43,12 @@ import compiler.emit.lower.module_context (Root)
 import compiler.emit.code (Code, code_children)
 import compiler.unit (requested_roots)
 import compiler.emit (diagnostics_text, emit_program, emit_root_results, lowered_roots, zip_sources,
-                      scope_of, answered)
+                      scope_of, returned)
 import compiler.emit.print.count_functions (allocates, release_fn, free_fn, call_start, calls_dup,
                                             calls_release, releases_word, counts_any)
 import compiler.emit.typed_ir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get,
                                CapturePath, Declaration, Convert, ZeroOperand, Lambda, Closure, Fn)
-import compiler.front.seam
+import compiler.front.emitter_input
 
 fn printed_name(k: RootKey) -> Bytes = root_text(root_name(k))
 
@@ -56,7 +56,7 @@ fn emitted_name(e: EmittedRoot) -> Bytes = root_text(e.name)
 
 fn output_name(a: RootOutput) -> Bytes = root_text(a.name)
 
-test "a definition generic over rows is settled by its callers, and printed at each row they hand words for" {
+test "a definition generic over effects is resolved by its callers, and printed at each set of effects they hand words for" {
   let src = Bytes::concat_all([
     b"effect log {\n  write note(n: Int) -> Unit\n}\n",
     b"fn apply<|e>(f: () -> Int / e) -> Int / e = f()\n",
@@ -65,10 +65,10 @@ test "a definition generic over rows is settled by its callers, and printed at e
     b"fn twice<|e>(f: () -> Int / e) -> Int / e = apply(f) + apply(f)\n",
   ]);
   let log = [{ effect: b"m.log", resource: SingletonResource }];
-  let at_log = keys::specialisation_key_with_rows(b"m.apply", [], [], [log]);
-  let at_none = keys::specialisation_key_with_rows(b"m.apply", [], [], [[]]);
-  let twice_log = keys::specialisation_key_with_rows(b"m.twice", [], [], [log]);
-  let answers = outputs_at([b"m"], [src], [], [
+  let at_log = keys::specialisation_key_with_effects(b"m.apply", [], [], [log]);
+  let at_none = keys::specialisation_key_with_effects(b"m.apply", [], [], [[]]);
+  let twice_log = keys::specialisation_key_with_effects(b"m.twice", [], [], [log]);
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.apply"),
     Named(b"m.logged"),
     Named(b"m.plain"),
@@ -76,27 +76,36 @@ test "a definition generic over rows is settled by its callers, and printed at e
     at_none,
     twice_log,
   ]);
-  let body = |k: RootKey| output_body(answers, printed_name(k));
+  let body = |k: RootKey| output_body(results, printed_name(k));
   assert_eq(body(Named(b"m.apply")).text, b"");
   assert_eq(printed_name(at_log), b"m.apply@/{m.log}");
-  assert_eq(body(Named(b"m.logged")).tables.generics.calls.map(|g: GenericCall| g.rows), [[log]]);
-  assert_eq(body(Named(b"m.plain")).tables.generics.calls.map(|g: GenericCall| g.rows), [[[]]]);
-  assert_eq(body(twice_log).tables.generics.calls.map(|g: GenericCall| g.rows), [[log], [log]]);
+  assert_eq(
+    body(Named(b"m.logged")).tables.generics.calls.map(|g: GenericCall| g.effect_evidence),
+    [[log]],
+  );
+  assert_eq(
+    body(Named(b"m.plain")).tables.generics.calls.map(|g: GenericCall| g.effect_evidence),
+    [[[]]],
+  );
+  assert_eq(body(twice_log).tables.generics.calls.map(|g: GenericCall| g.effect_evidence), [
+    [log],
+    [log],
+  ]);
   assert([at_log, at_none, twice_log].all(|k: RootKey| body(k).text.len() > 0), None)
 }
 
-test "a handle in a definition generic over rows forwards what it does not answer to the word its row variable was handed" {
+test "a handle in a definition generic over effects forwards what it does not handle to the word its effect variable was handed" {
   let src = Bytes::concat_all([
     b"effect d {\n  write begin() -> Int\n  write rollback(reason: String) -> Unit\n}\n",
     b"fn attempt<|e>(body: () -> Int / {d.rollback | e}) -> Int / e =\n",
     b"  handle { body() } with { d.rollback(r) resume k -> 0 }\n",
     b"fn nested() -> Int / {d.begin} = attempt(|| attempt(|| d.begin()))\n",
   ]);
-  let at_d = keys::specialisation_key_with_rows(b"m.attempt", [], [], [
+  let at_d = keys::specialisation_key_with_effects(b"m.attempt", [], [], [
     [{ effect: b"m.d", resource: SingletonResource }],
   ]);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.nested"), at_d]);
-  let text = output_body(answers, printed_name(at_d)).text;
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.nested"), at_d]);
+  let text = output_body(results, printed_name(at_d)).text;
   assert(
     text.len() > 0 && text.index_of(b"ctx->bridge") == None,
     Some(String::of_bytes_lossy(text)),
@@ -228,7 +237,7 @@ test "a body names each root it defines by a placeholder, never by its symbol" {
   )
 }
 
-test "a cycle whose members' handles answer and unwind runs as one loop" {
+test "a cycle whose members' handles return a value or unwind runs as one loop" {
   let src = Bytes::concat_all([
     b"effect stop { raise halt() }\n",
     b"fn a(n: Int) -> Int / {clock.read, diverges} = if n <= 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> clock.now(), } } else { b(n - 1) }\n",
@@ -296,7 +305,7 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   assert_eq(bodies.map(|body: Bytes| body.index_of(b"return")), [None, None])
 }
 
-test "what a continuation answers a clause off its tail is held as its type holds it" {
+test "what a continuation returns to a clause off its tail is held as its type holds it" {
   let src = Bytes::concat_all([
     b"effect ask { read get() -> Int }\n",
     b"fn f(n: Int) -> Result<Int, String> = handle { let y = ask.get(); if y > n { Ok(y) } else { Err(\"low\") } } with { ask.get() resume k -> match k(1) { Ok(v) -> Ok(v + 1), Err(m) -> Err(m) } }\n",
@@ -329,25 +338,25 @@ test "every `parallel` block hands the runtime its branches alike, wherever it i
     Named(b"m.reads"),
     Named(b"m.handled"),
     Named(b"m.nested"),
-    keys::specialisation_key_with_rows(b"m.open", [], [], [[]]),
+    keys::specialisation_key_with_effects(b"m.open", [], [], [[]]),
   ];
   let names = keys.map(printed_name);
-  let answers = outputs_at([b"m"], [src], [], keys);
+  let results = outputs_at([b"m"], [src], [], keys);
   let calls = |helper: Bytes|
-    names.map(|n: Bytes| output_body(answers, n).text.index_of(helper) != None);
+    names.map(|n: Bytes| output_body(results, n).text.index_of(helper) != None);
   assert_eq(calls(b"rt_branches_p(ctx, "), [true, true, true, true, true])
 }
 
-test "the emitter answers each root it was asked for, a body's tables as values" {
+test "the emitter returns each root it was asked for, a body's tables as values" {
   let src = b"fn greet() -> Bytes = b\"hi\"\nfn twice(x: Int) -> Int = x + x\nfn guarded() -> Option<Instant> / {clock.read} = handle { Some(clock.now()) } with { clock.now() -> clock.now(), }\n";
   let wanted = [b"m.greet", b"m.twice", b"m.guarded"];
-  let answers = outputs_at([b"m"], [src], [b"Some"], wanted.map(Named));
-  assert_eq(answers.map(output_name), wanted);
-  let greet = answers.get(0).result;
+  let results = outputs_at([b"m"], [src], [b"Some"], wanted.map(Named));
+  assert_eq(results.map(output_name), wanted);
+  let greet = results.get(0).result;
   assert_eq(greet.tables.statics, statics_of(BytesDatum(b"hi")));
   assert_eq(greet.tables.members, []);
   assert_eq(greet.tables.defined, [{ entered: true, head: word_prototype(0) }]);
-  assert_eq(answers.get(2).result.tables.handles, [b"clock#now"])
+  assert_eq(results.get(2).result.tables.handles, [b"clock#now"])
 }
 
 test "guarded arms and every literal pattern are emitted" {
@@ -355,7 +364,7 @@ test "guarded arms and every literal pattern are emitted" {
   assert_eq(emit_all_program([{ name: b"m", src: src }], [], true).len(), 3)
 }
 
-test "an operator is compiled at the type the checker settled, whatever holds its operands" {
+test "an operator is compiled at the type the checker resolved, whatever holds its operands" {
   let src = Bytes::concat_all([
     b"fn bytes(xs: List<U8>) -> U8 = match xs { [a, b, ..] -> a + b, _ -> 0u8 }\n",
     b"fn ints(xs: List<Int>) -> Int = match xs { [a, b, ..] -> a + b, _ -> 0 }\n",
@@ -488,7 +497,7 @@ test "a record holds a record wider than the registers in place, wherever it is 
   )
 }
 
-test "a definition takes and answers a float as itself, and a call says the head it was written to" {
+test "a definition takes and returns a float as itself, and a call says the head it was written to" {
   let src = b"fn half(x: Float) -> Float = x / 2.0\nfn quarter(x: Float) -> Float = half(half(x))\nfn same(x: Int) -> Int = x\n";
   let out = emit_all_program([{ name: b"m", src: src }], [], true);
   let floats = { result: b"double", params: [b"double"] };
@@ -529,20 +538,20 @@ test "a lambda run in another root reads its parameters and captures at their ty
     b"fn offset(k: Int, xs: List<Int>) -> List<Int> = bumped(xs, |x: Int| { let j = k - 1; x + j })\n",
     b"fn stepped(f: Fld) -> Int / {abort.raise} = iterate(f, 9, |t: Fld| if t.n > 3 { Stop(t.n) } else { Continue({ ..t, n: t.n + 1 }) })\n",
   ]);
-  let lent = |definition: Bytes, owner: Bytes|
+  let borrowed = |definition: Bytes, owner: Bytes|
     specialisation_key(definition, [], [{ param: 1, owner: Named(owner), nth: 0 }]);
   let loops = [
-    lent(b"m.each", b"m.mapped"),
-    lent(b"m.total", b"m.folded"),
-    lent(b"m.bumped", b"m.captured"),
-    lent(b"m.bumped", b"m.offset"),
+    borrowed(b"m.each", b"m.mapped"),
+    borrowed(b"m.total", b"m.folded"),
+    borrowed(b"m.bumped", b"m.captured"),
+    borrowed(b"m.bumped", b"m.offset"),
   ];
   let keys = [b"m.mapped", b"m.folded", b"m.captured", b"m.offset", b"m.stepped"].map(Named).concat(
     loops,
   );
   let names = keys.map(printed_name);
-  let answers = outputs_at([b"m"], [src], [b"Stop", b"Continue"], keys);
-  let text = |name: Bytes| output_body(answers, name).text;
+  let results = outputs_at([b"m"], [src], [b"Stop", b"Continue"], keys);
+  let text = |name: Bytes| output_body(results, name).text;
   assert_eq(loops.map(|k: RootKey| calls_a_value(body_code(text(printed_name(k))))), [
     false,
     false,
@@ -551,7 +560,7 @@ test "a lambda run in another root reads its parameters and captures at their ty
   ])
 }
 
-test "a lambda another root lent reads its captures at the types the checker filed for their reads" {
+test "a lambda borrowed from another root reads its captures at the types the checker recorded for their reads" {
   let src = Bytes::concat_all([
     b"type Fld = { name: Bytes, n: Int }\n",
     b"fn bumped(xs: List<Int>, g: (Int) -> Int) -> List<Int> = xs.map(g)\n",
@@ -620,13 +629,13 @@ fn zero_variables(b: Block) -> List<Var> =
       _ -> acc,
     })
 
-test "a `()` an arm answers or a call is handed is a `Unit`, and so are its join and its box" {
+test "a `()` an arm returns or a call is handed is a `Unit`, and so are its join and its box" {
   let src = Bytes::concat_all([
     b"fn same(b: Bool) -> Unit = if b { () } else { () }\n",
     b"fn whole(xs: List<Int>, b: Bool) -> Int = { if b { xs.fold((), |_: Unit, x: Int| if x == 0 { () } else { () }); () }; 1 }\n",
   ]);
   match program_of(src) {
-    Err(why) -> assert_eq(why, b""),
+    Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let held = |name: Bytes| {
         let f = lowered_root(p, name);
@@ -642,29 +651,29 @@ test "a `()` an arm answers or a call is handed is a `Unit`, and so are its join
   }
 }
 
-fn lending() -> Bytes =
+fn borrowing() -> Bytes =
   b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\n"
 
-test "a lambda handed to a definition that calls it is run in place by the root it settles on" {
-  let lent = [{ param: 1, owner: Named(b"m.scaled"), nth: 0 }];
-  let total = printed_name(specialisation_key(b"m.total", [], lent));
-  let each = printed_name(specialisation_key(b"m.each", [], lent));
-  let answers = outputs_at([b"m"], [lending()], [], [
+test "a lambda handed to a definition that calls it is run in place by the root it resolves to" {
+  let borrowed = [{ param: 1, owner: Named(b"m.scaled"), nth: 0 }];
+  let total = printed_name(specialisation_key(b"m.total", [], borrowed));
+  let each = printed_name(specialisation_key(b"m.each", [], borrowed));
+  let results = outputs_at([b"m"], [borrowing()], [], [
     Named(b"m.each"),
     Named(b"m.total"),
     Named(b"m.scaled"),
-    specialisation_key(b"m.total", [], lent),
-    specialisation_key(b"m.each", [], lent),
+    specialisation_key(b"m.total", [], borrowed),
+    specialisation_key(b"m.each", [], borrowed),
   ]);
   let body = |name: Bytes|
-    answers.fold(None, |acc: Option<Output>, a: RootOutput|
+    results.fold(None, |acc: Option<Output>, a: RootOutput|
       if output_name(a) != name { acc } else { Some(a.result) });
   let generics = |name: Bytes|
     match body(name) { Some(b) -> b.tables.generics, None -> no_generics() };
   assert_eq(generics(b"m.each").called, [1]);
   assert_eq(generics(b"m.total").passes, [{ param: 1, callee: Named(b"m.each"), at: 1 }]);
-  assert_eq(generics(b"m.scaled").calls.map(|g: GenericCall| g.functions), [lent]);
-  assert_eq(generics(total).calls.map(|g: GenericCall| g.functions), [lent]);
+  assert_eq(generics(b"m.scaled").calls.map(|g: GenericCall| g.functions), [borrowed]);
+  assert_eq(generics(total).calls.map(|g: GenericCall| g.functions), [borrowed]);
   match body(each) {
     Some(b) -> {
       assert(!calls_a_value(body_code(b.text)), None);
@@ -680,18 +689,18 @@ test "a lambda a specialisation was handed is handed on from a closure it makes,
     b"fn later(f: keep (Int) -> Int) -> List<() -> Int> = [|| each(f, 1)]\n",
     b"fn scaled(k: Int) -> List<() -> Int> = later(|x: Int| x * k)\n",
   ]);
-  let lent = [{ param: 0, owner: Named(b"m.scaled"), nth: 0 }];
-  let later = specialisation_key(b"m.later", [], lent);
-  let answers = outputs_at([b"m"], [src], [], [
+  let borrowed = [{ param: 0, owner: Named(b"m.scaled"), nth: 0 }];
+  let later = specialisation_key(b"m.later", [], borrowed);
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.each"),
     Named(b"m.later"),
     Named(b"m.scaled"),
     later,
   ]);
   assert_eq(
-    output_body(answers, printed_name(later)).tables.generics.calls.map(|g: GenericCall|
+    output_body(results, printed_name(later)).tables.generics.calls.map(|g: GenericCall|
       g.functions),
-    [lent],
+    [borrowed],
   )
 }
 
@@ -703,17 +712,17 @@ test "a lambda run in place reads its own slots, never the parameters of the roo
     b"fn named(prefix: Bytes, xs: List<Item>) -> List<Bytes> = walk(xs, |acc: List<Bytes>, item: Item| match item { ISchema(d) -> { let kept = acc.push(prefix ++ d.name); match d.guard { Some(_) -> kept.push(prefix), None -> kept } }, _ -> acc }, 0, [], None)\n",
   ]);
   let walk = specialisation_key(b"m.walk", [], [{ param: 1, owner: Named(b"m.named"), nth: 0 }]);
-  let answers = outputs_at([b"m"], [src], [b"Some", b"None", b"m.ISchema", b"m.IOther"], [
+  let results = outputs_at([b"m"], [src], [b"Some", b"None", b"m.ISchema", b"m.IOther"], [
     Named(b"m.named"),
     walk,
   ]);
-  let code = body_code(output_body(answers, printed_name(walk)).text);
+  let code = body_code(output_body(results, printed_name(walk)).text);
   let maybe_joins = code.split(b"\n").filter(|l: Bytes|
     l.index_of(b"PlyMaybe ") != None && l.index_of(b" = 0;") != None);
   assert(maybe_joins == [], Some(String::of_bytes_lossy(code)))
 }
 
-test "a function value a let binds to a lambda is called directly, runs in place at its one call, and is lent where it is handed" {
+test "a function value a let binds to a lambda is called directly, runs in place at its one call, and is passed borrowed where it is handed" {
   let src = Bytes::concat_all([
     b"fn walked(n: Int, x: Float, f: (Float) -> Float) -> Float = if n <= 0 { x } else { walked(n - 1, f(x), f) }\n",
     b"fn called(k: Float) -> Float = { let f = |x: Float| x * k; let g = f; f(1.0) + g(2.0) }\n",
@@ -722,27 +731,27 @@ test "a function value a let binds to a lambda is called directly, runs in place
     b"fn half(x: Float) -> Float = x * 0.5\n",
     b"fn halved(n: Int) -> Float = walked(n, 1.0, half)\n",
   ]);
-  let lent = [{ param: 2, owner: Named(b"m.handed"), nth: 0 }];
-  let walked = printed_name(specialisation_key(b"m.walked", [], lent));
+  let borrowed = [{ param: 2, owner: Named(b"m.handed"), nth: 0 }];
+  let walked = printed_name(specialisation_key(b"m.walked", [], borrowed));
   let named = [{ param: 2, owner: Named(b"m.halved"), nth: 0 }];
   let halving = printed_name(specialisation_key(b"m.walked", [], named));
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [],
     [b"m.walked", b"m.called", b"m.nested", b"m.handed", b"m.half", b"m.halved"].map(Named).concat(
-      [specialisation_key(b"m.walked", [], lent), specialisation_key(b"m.walked", [], named)],
+      [specialisation_key(b"m.walked", [], borrowed), specialisation_key(b"m.walked", [], named)],
     ),
   );
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   assert(!calls_a_value(body_code(body(b"m.called").text)), None);
   assert(!calls_a_value(body(b"m.nested").text), None);
-  assert_eq(body(b"m.handed").tables.generics.calls.map(|g: GenericCall| g.functions), [lent]);
+  assert_eq(body(b"m.handed").tables.generics.calls.map(|g: GenericCall| g.functions), [borrowed]);
   assert(!calls_a_value(body_code(body(walked).text)), None);
   assert(body_code(body(walked).text).index_of(b"ply_loop") != None, None);
   assert_eq(body(b"m.halved").tables.generics.calls.map(|g: GenericCall| g.functions), [named]);
@@ -760,11 +769,11 @@ test "a lambda a let binds is written once however often it is called, each call
     b"}\n",
     b"fn walked(xs: List<Int>, ys: List<Int>, k: Int) -> Int = { let f = |x: Int| x * 104729 + k; let a = xs.map(f); let b = ys.map(f); a.len() + b.len() }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.deep"), Named(b"m.walked")]);
-  let deep = output_body(answers, b"m.deep").text;
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.deep"), Named(b"m.walked")]);
+  let deep = output_body(results, b"m.deep").text;
   assert_eq(deep.split(b"7919").len(), 2);
   assert(!calls_a_value(deep), Some(String::of_bytes_lossy(deep)));
-  let walked = output_body(answers, b"m.walked");
+  let walked = output_body(results, b"m.walked");
   assert_eq(walked.text.split(b"104729").len(), 2);
   assert(!calls_a_value(walked.text), Some(String::of_bytes_lossy(walked.text)));
   assert(
@@ -782,25 +791,28 @@ test "a known lambda called rather than run in place is handed the words its bod
     b"fn twice(x: Int) -> Int / {noted.note} = { let note = |n: Int| { noted.note(n); n }; note(x) + note(x + 1) }\n",
   ]);
   let noted = [{ effect: b"m.noted", resource: SingletonResource }];
-  let lent = keys::specialisation_key_with_rows(
+  let borrowed = keys::specialisation_key_with_effects(
     b"m.spread",
     [],
     [{ param: 1, owner: Named(b"m.mentions"), nth: 0 }],
     [noted],
   );
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.mentions"), lent, Named(b"m.twice")]);
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.mentions"), borrowed, Named(b"m.twice")]);
   let wordless = |text: Bytes|
     text.split(b"\n").filter(|l: Bytes|
       (l.index_of(b"->typed)(ctx") != None || l.index_of(b"_typed(ctx") != None)
         && l.ends_with(b", 0);"));
-  assert_eq(output_body(answers, printed_name(lent)).text.index_of(b"->typed)(ctx") != None, true);
-  assert_eq(wordless(output_body(answers, printed_name(lent)).text), []);
-  let own = output_body(answers, b"m.twice").text;
+  assert_eq(
+    output_body(results, printed_name(borrowed)).text.index_of(b"->typed)(ctx") != None,
+    true,
+  );
+  assert_eq(wordless(output_body(results, printed_name(borrowed)).text), []);
+  let own = output_body(results, b"m.twice").text;
   assert(own.index_of(b"_lambda0_typed(ctx") != None, Some(String::of_bytes_lossy(own)));
   assert_eq(wordless(own), [])
 }
 
-test "a definition at type arguments that are all known lends its lambdas as a plain one does" {
+test "a definition at type arguments that are all known passes its lambdas borrowed as a plain one does" {
   let src = Bytes::concat_all([
     b"fn some<a>(xs: List<a>, f: (a) -> Bool, i: Int) -> Bool = match xs.at(i) { Some(x) -> if f(x) { true } else { some(xs, f, i + 1) }, None -> false }\n",
     b"fn holds<a>(xs: List<a>, x: a) -> Bool = some(xs, |y: a| y == x, 0)\n",
@@ -809,17 +821,17 @@ test "a definition at type arguments that are all known lends its lambdas as a p
   let int = int_type();
   let held = specialisation_key(b"m.holds", [int], []);
   let holds = printed_name(held);
-  let lent = [{ param: 1, owner: held, nth: 0 }];
-  let somed = specialisation_key(b"m.some", [int], lent);
+  let borrowed = [{ param: 1, owner: held, nth: 0 }];
+  let somed = specialisation_key(b"m.some", [int], borrowed);
   let some = printed_name(somed);
-  let answers = outputs_at([b"m"], [src], [b"Some", b"None"], [Named(b"m.has_three"), held, somed]);
+  let results = outputs_at([b"m"], [src], [b"Some", b"None"], [Named(b"m.has_three"), held, somed]);
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
-  assert_eq(body(holds).tables.generics.calls.map(|g: GenericCall| g.functions), [lent]);
+  assert_eq(body(holds).tables.generics.calls.map(|g: GenericCall| g.functions), [borrowed]);
   assert(!calls_a_value(body_code(body(some).text)), None);
   assert(body_code(body(some).text).index_of(b"ply_loop") != None, None);
   assert_eq(
@@ -836,7 +848,7 @@ test "a closure lets go of a sum it captured by the case the sum's words hold, a
     ) {
     Some(a) ->
       Bytes::concat_all(a.result.tables.shared.map(|f: SharedFn| f.text).push(a.result.text)),
-    None -> panic("no answer"),
+    None -> panic("no result"),
   };
   let named = match text.index_of(b"_desc = { ") {
     Some(i) -> text.slice(i + 10, text.len()),
@@ -861,9 +873,9 @@ test "a closure lets go of a sum it captured by the case the sum's words hold, a
 test "only a definition of no parameters has an entry by words, which a constant read runs it through" {
   let src = b"fn id<a>(x: a) -> a = x\nfn twice(n: Int) -> Int = id(n) + id(n)\nfn ten() -> Int = twice(5)\n";
   let at = specialisation_key(b"m.id", [int_type()], []);
-  let answers = outputs_at([b"m"], [src], [], [at, Named(b"m.twice"), Named(b"m.ten")]);
-  assert_eq(answers.map(output_name), [printed_name(at), b"m.twice", b"m.ten"]);
-  let bodies = answers.map(|a: RootOutput| a.result);
+  let results = outputs_at([b"m"], [src], [], [at, Named(b"m.twice"), Named(b"m.ten")]);
+  assert_eq(results.map(output_name), [printed_name(at), b"m.twice", b"m.ten"]);
+  let bodies = results.map(|a: RootOutput| a.result);
   assert_eq(bodies.map(|b: Output| b.tables.defined.map(|d: DefinitionSymbol| d.entered)), [
     [false],
     [false],
@@ -873,14 +885,14 @@ test "only a definition of no parameters has an entry by words, which a constant
 }
 
 test "a body that hands a lambda on is the same wherever its definition stands, and so are the roots it names" {
-  let lent = [{ param: 1, owner: Named(b"m.scaled"), nth: 0 }];
+  let borrowed = [{ param: 1, owner: Named(b"m.scaled"), nth: 0 }];
   let wanted = [
     Named(b"m.scaled"),
-    specialisation_key(b"m.total", [], lent),
-    specialisation_key(b"m.each", [], lent),
+    specialisation_key(b"m.total", [], borrowed),
+    specialisation_key(b"m.each", [], borrowed),
   ];
   let emitted = |above: Bytes|
-    outputs_at([b"m"], [above.concat(lending())], [], wanted).map(|a: RootOutput|
+    outputs_at([b"m"], [above.concat(borrowing())], [], wanted).map(|a: RootOutput|
       { name: a.name, text: a.result.text, calls: a.result.tables.calls });
   assert_eq(
     emitted(b"// a comment, and a definition, above them\nfn aside() -> Int = 7\n"),
@@ -890,12 +902,12 @@ test "a body that hands a lambda on is the same wherever its definition stands, 
 
 test "a definition's call of itself is written to the head of the root it names" {
   let src = b"fn deepened<a>(x: a, n: Int) -> a where numeric(a) = if n <= 0 { x } else { deepened(x, n - 1) + x }\n";
-  let answers = outputs_at([b"m"], [src], [], [
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.deepened"),
     specialised_at(b"m.deepened", [b"Float"]),
   ]);
   let heads = |name: Bytes|
-    answers.filter(|a: RootOutput| output_name(a) == name).map(|a: RootOutput|
+    results.filter(|a: RootOutput| output_name(a) == name).map(|a: RootOutput|
       {
         own: a.result.tables.defined.map(|d: DefinitionSymbol| d.head),
         called: a.result.tables.generics.expects.map(|e: ExpectedPrototype| e.head),
@@ -1059,11 +1071,11 @@ test "every number builtin is code the emitter writes, at every type it is calle
       acc.concat([b"m.bits", b"m.whole"].map(|d: Bytes| specialised_at(d, [t])))),
   );
   let wanted = concrete.concat(generic);
-  let answers = outputs_at([b"m"], [src], [b"m.Length"], wanted);
-  assert_eq(answers.len(), wanted.len())
+  let results = outputs_at([b"m"], [src], [b"m.Length"], wanted);
+  assert_eq(results.len(), wanted.len())
 }
 
-test "observe answers its value hidden from the C compiler behind the head's barrier, at any type, calling nothing" {
+test "observe returns its value hidden from the C compiler behind the head's barrier, at any type, calling nothing" {
   let src = Bytes::concat_all([
     b"type Shape = | Dot | Line(Int)\n",
     b"fn seen<a>(x: a) -> a = observe(x)\n",
@@ -1079,14 +1091,14 @@ test "observe answers its value hidden from the C compiler behind the head's bar
   let seen = [specialised_at(b"m.seen", [b"String"]), specialised_at(b"m.seen", [b"Float"])];
   let named = [b"m.text", b"m.point", b"m.shape", b"m.apply", b"m.constant", b"m.nothing"];
   let pairs = [b"m.amount", b"m.wide"];
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Shape"],
     named.concat(pairs).map(Named).concat(seen),
   );
   let text = |name: Bytes|
-    match answers.filter(|a: RootOutput| output_name(a) == name) { [a] -> a.result.text, _ -> b"" };
+    match results.filter(|a: RootOutput| output_name(a) == name) { [a] -> a.result.text, _ -> b"" };
   let lacking = |names: List<Bytes>, part: Bytes|
     names.filter(|n: Bytes| text(n).index_of(part) == None);
   assert_eq(
@@ -1138,7 +1150,7 @@ test "a secret's builtins are written over the natives of its handle, none over 
   )
 }
 
-test "the crypto operations call their natives over machine words, the natives answering what they refuse" {
+test "the crypto operations call their natives over machine words, the natives returning what they reject" {
   let crypto = Bytes::concat_all([
     b"pub fn crypto_seal(cipher: String, key: Secret<Bytes>, nonce: Bytes, associated: Bytes, plaintext: Bytes) -> Bytes / {abort.raise} = {\n",
     b"  let sealed = crypto_sealed(cipher, key, nonce, associated, plaintext);\n",
@@ -1162,7 +1174,7 @@ test "the crypto operations call their natives over machine words, the natives a
     { name: b"crypto_verify", natives: [b"crypto_verified"] },
     { name: b"crypto_agree", natives: [b"crypto_agrees", b"crypto_agreed"] },
   ];
-  let answers = outputs_at(
+  let results = outputs_at(
     [module],
     [crypto],
     [b"Some", b"None"],
@@ -1170,7 +1182,7 @@ test "the crypto operations call their natives over machine words, the natives a
   );
   assert_eq(
     roots.filter(|r: { name: Bytes, natives: List<Bytes> }| {
-      let code = body_code(output_body(answers, qualify(module, r.name)).text);
+      let code = body_code(output_body(results, qualify(module, r.name)).text);
       r.natives.any(|n: Bytes| code.index_of(builtin_helper(n).concat(b"_p(")) == None)
     }).map(|r: { name: Bytes, natives: List<Bytes> }| r.name),
     [],
@@ -1190,7 +1202,7 @@ test "a record rebuilt from another's fields is written into the constructor tha
   assert_eq(has(b"ply_alloc("), [false, false])
 }
 
-test "what an operation answers and what a clause is handed are read by their types" {
+test "what an operation returns and what a clause is handed are read by their types" {
   let src = Bytes::concat_all([
     b"type P = { x: Int, y: Int }\n",
     b"effect store { read held() -> P\n write keep(p: P) -> Unit }\n",
@@ -1352,15 +1364,15 @@ test "two values of a declared sum are compared through a root written from its 
     b"type TK = | Punct(Bytes) | Num(Int, Float) | Pair(TK, TK) | Eof\n",
     b"fn same(a: TK, b: TK) -> Bool = a == b\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [b"m.Punct", b"m.Num", b"m.Pair", b"m.Eof"], [
+  let results = outputs_at([b"m"], [src], [b"m.Punct", b"m.Num", b"m.Pair", b"m.Eof"], [
     Named(b"m.same"),
     in_module_m(keys::Equal, NamedType({ name: b"m.TK", args: [] })),
   ]);
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result.text,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let eq = body(b"m.TK#eq");
   assert(eq.index_of(b"memcmp(((unsigned char *)&ply_words(") != None, None);
@@ -1398,14 +1410,14 @@ test "the program walk forms a type's drop, dup, copy and boxed case's drop root
   assert_eq(wanted.map(kind_of), wanted.map(|_: RootKey| Ok(Plain)))
 }
 
-test "a boxed case's root asked alone is answered, though its name spells no module" {
+test "a boxed case's root asked alone is returned, though its name spells no module" {
   let src = b"type TK = | Punct(Bytes) | Pair(TK, TK) | Eof\n";
   let kept = in_module_m(
     keys::OnCase({ op: keys::Keep, case: 1 }),
     NamedType({ name: b"m.TK", args: [] }),
   );
   let d = dump_of(analyse(parse_all(zip_sources([b"m"], [src]))));
-  let answers = emit_root_results(
+  let results = emit_root_results(
     [b"m"],
     [src],
     loaded_constructors(d, [b"m.Punct", b"m.Pair", b"m.Eof"]),
@@ -1417,7 +1429,7 @@ test "a boxed case's root asked alone is answered, though its name spells no mod
     d.effects,
     d.walked,
   );
-  assert_eq(answers.map(|a: RootOutput| { name: a.name, body: { true } }), [
+  assert_eq(results.map(|a: RootOutput| { name: a.name, body: { true } }), [
     { name: root_name(kept), body: true },
   ])
 }
@@ -1442,7 +1454,7 @@ test "a sum of one word laying a sum of one word in place is let go of, shared a
   ).concat(
     [b"m.said", b"m.maybe", b"m.hue"].map(Named),
   );
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [
@@ -1459,11 +1471,11 @@ test "a sum of one word laying a sum of one word in place is let go of, shared a
     wanted,
   );
   let text = |k: RootKey|
-    match answers.find(|a: RootOutput| a.name == root_name(k)) {
+    match results.find(|a: RootOutput| a.name == root_name(k)) {
       Some(a) -> body_code(a.result.text),
-      None -> b"no answer",
+      None -> b"no result",
     };
-  assert_eq(wanted.filter(|k: RootKey| text(k) == b"no answer").map(root_name), []);
+  assert_eq(wanted.filter(|k: RootKey| text(k) == b"no result").map(root_name), []);
   [todo, maybe].fold((), |_: Unit, t: Type|
     assert_eq(
       [keys::Share, keys::Keep].map(|op: TypeOp|
@@ -1471,7 +1483,7 @@ test "a sum of one word laying a sum of one word in place is let go of, shared a
       [true, true],
     ));
   assert_eq(
-    match answers.find(|a: RootOutput| a.name == root_name(Named(b"m.hue"))) {
+    match results.find(|a: RootOutput| a.name == root_name(Named(b"m.hue"))) {
       Some(a) ->
         a.result.tables.calls.filter(|k: RootKey|
           match k { Generated(w, _) -> w.ty == hues, _ -> false }),
@@ -1543,7 +1555,7 @@ test "a generic definition comparing its type argument is emitted again at each 
     b"fn tokens(k: TK) -> Bool = same(k, Eof)\n",
     b"fn texts(s: String) -> Bool = same(s, \"x\")\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [b"m.Punct", b"m.Eof", b"Less", b"Equal", b"Greater"], [
+  let results = outputs_at([b"m"], [src], [b"m.Punct", b"m.Eof", b"Less", b"Equal", b"Greater"], [
     Named(b"m.same"),
     Named(b"m.order"),
     Named(b"m.tokens"),
@@ -1552,10 +1564,10 @@ test "a generic definition comparing its type argument is emitted again at each 
     specialised_at(b"m.order", [b"m.TK"]),
   ]);
   let tables = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let has = |name: Bytes, text: Bytes| tables(name).text.index_of(text) != None;
   assert_eq(tables(b"m.same").tables.generics.needs, [{ var: 0, reads: Exact }]);
@@ -1566,7 +1578,7 @@ test "a generic definition comparing its type argument is emitted again at each 
       args: parsed_types([b"m.TK"]),
       carried: [0],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ]);
   assert_eq(tables(b"m.same").text, b"");
@@ -1581,17 +1593,17 @@ test "two values of a declared sum are ordered through a root written from its c
     b"type TK = | Punct(Bytes) | Num(Int, Bytes) | Pair(TK, TK) | Eof\n",
     b"fn order(a: TK, b: TK) -> Ordering = compare(a, b)\n",
   ]);
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Punct", b"m.Num", b"m.Pair", b"m.Eof", b"Less", b"Equal", b"Greater"],
     [Named(b"m.order"), in_module_m(Order, NamedType({ name: b"m.TK", args: [] }))],
   );
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result.text,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let cmp = body(b"m.TK#cmp");
   assert(cmp.index_of(b"builtin_compare") == None, None);
@@ -1617,7 +1629,7 @@ test "a root written from a type orders and reflects by the language's builtins,
     in_module_m(Show, NamedType({ name: b"m.Named", args: [] })),
   ];
   let named = printed_name(in_module_m(Show, NamedType({ name: b"m.Named", args: [] })));
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [
@@ -1637,10 +1649,10 @@ test "a root written from a type orders and reflects by the language's builtins,
     shipped: [value_fixture()],
   );
   let tables = |root: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == root { Some(a) } else { acc }) {
       Some(a) -> a.result.tables,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   [printed_name(in_module_m(Order, tk)), printed_name(in_module_m(Reflect, tk))].fold(
     (),
@@ -1716,7 +1728,7 @@ test "a value is reflected as its type says: a scalar as its constructor, a sum 
     b"m.reflect#{a:Int,b:m.TK}",
     b"m.shown#m.Dated",
   ]);
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Punct", b"m.Num", b"m.Pair", b"m.Eof", b"m.Dated"].concat(values),
@@ -1724,10 +1736,10 @@ test "a value is reflected as its type says: a scalar as its constructor, a sum 
     shipped: [value_fixture()],
   );
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result.text,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let calls = |name: Bytes, root: Bytes|
     body(name).index_of(symbol_of(root).concat(b"(ctx, ")) != None;
@@ -1739,7 +1751,7 @@ test "a value is reflected as its type says: a scalar as its constructor, a sum 
   [sum, record, told].fold((), |_: Unit, n: Bytes| assert(body(n).index_of(b"@@T") == None, None));
   assert(calls(record, sum));
   let tables = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result.tables,
       None -> no_tables(),
@@ -1778,17 +1790,17 @@ test "a value is digested through a root written for its type, its parts encoded
   let sum = printed_name(written.get(0));
   let record = printed_name(written.get(1));
   let keyed = printed_name(written.get(2));
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Punct", b"m.Pair", b"m.Eof", b"m.Money"],
     [b"m.hashed", b"m.held", b"m.priced"].map(Named).concat(written),
   );
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let has = |name: Bytes, text: Bytes| body(name).text.index_of(text) != None;
   [
@@ -1833,7 +1845,8 @@ fn reached_from(definitions: Bytes, start: List<RootKey>) -> List<RootOutput> / 
   let shipped = [value_fixture()];
   let analysed = analyse_pulling_std_with(zip_sources([b"m"], [src]), shipped, no_rows()).out;
   match analysed {
-    seam::Refused(diagnostics) -> panic(String::of_bytes_lossy(diagnostics_text(diagnostics))),
+    emitter_input::Rejected(diagnostics) ->
+      panic(String::of_bytes_lossy(diagnostics_text(diagnostics))),
     _ -> (),
   };
   let d = dump_of(analysed);
@@ -1855,7 +1868,7 @@ fn reached_from(definitions: Bytes, start: List<RootKey>) -> List<RootOutput> / 
     64,
     |w: { results: List<RootOutput>, next: List<RootKey> }|
       if w.next.len() == 0 { Stop(w.results) } else {
-        let all = w.results.concat(answered(s, w.next, Map::new()));
+        let all = w.results.concat(returned(s, w.next, Map::new()));
         let held = all.map(|a: RootOutput| a.name);
         Continue({
           results: all,
@@ -1871,7 +1884,7 @@ fn reached_from(definitions: Bytes, start: List<RootKey>) -> List<RootOutput> / 
   )
 }
 
-test "compare, reflect, shown and digest are written at every settled type, none crossing to the runtime" {
+test "compare, reflect, shown and digest are written at every resolved type, none marshalled to the runtime" {
   let both = [
     b"Int",
     b"Bool",
@@ -1911,8 +1924,8 @@ test "compare, reflect, shown and digest are written at every settled type, none
     range(0, all.len()).map(|i: Int| {
       let t = all.get(i);
       let n = ascii_of_int(i);
-      let one = |f: Bytes, answer: Bytes, call: Bytes|
-        Bytes::concat_all([b"fn ", f, n, b"(a: ", t, b") -> ", answer, b" = ", call, b"(a)\n"]);
+      let one = |f: Bytes, result: Bytes, call: Bytes|
+        Bytes::concat_all([b"fn ", f, n, b"(a: ", t, b") -> ", result, b" = ", call, b"(a)\n"]);
       let two = |f: Bytes, call: Bytes|
         Bytes::concat_all([
           b"fn ",
@@ -1939,7 +1952,7 @@ test "compare, reflect, shown and digest are written at every settled type, none
   );
   let named = range(0, all.len()).fold([], |acc: List<Bytes>, i: Int|
     acc.concat(functions(i).map(|f: Bytes| Bytes::concat_all([b"m.", f, ascii_of_int(i)]))));
-  let settled = [b"{a:Int,b:m.Shape}", b"List<m.Shape>", b"m.Tree<Int>"].fold(
+  let resolved = [b"{a:Int,b:m.Shape}", b"List<m.Shape>", b"m.Tree<Int>"].fold(
     [],
     |acc: List<RootKey>, t: Bytes|
       acc.concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(|g: Bytes| specialised_at(g, [t]))),
@@ -1951,17 +1964,19 @@ test "compare, reflect, shown and digest are written at every settled type, none
     unit_type(),
     RecordType([]),
   ].map(|t: Type| in_module_m(Order, t));
-  let answers = reached_from(
+  let results = reached_from(
     definitions,
-    named.map(Named).concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(Named)).concat(settled).concat(
+    named.map(Named).concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(Named)).concat(
+      resolved,
+    ).concat(
       kept,
     ),
   );
-  assert_eq(answers.fold([], |acc: List<Bytes>, a: RootOutput| { acc }), []);
+  assert_eq(results.fold([], |acc: List<Bytes>, a: RootOutput| { acc }), []);
   let columns = columns_type(
     RecordType([{ name: b"x", ty: int_type() }, { name: b"y", ty: bool_type() }]),
   );
-  let names = answers.map(output_name);
+  let names = results.map(output_name);
   assert_eq(
     [in_module_m(Reflect, columns), in_module_m(Show, columns), in_module_m(Digest, columns)].map(
       printed_name,
@@ -2006,17 +2021,17 @@ test "a keyed sum is compared and ordered by its key through roots its module wr
     in_module_m(Order, name),
     in_module_m(keys::Equal, bag),
   ];
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Name", b"m.Bag"],
     [b"m.same", b"m.ordered", b"m.bags", b"m.top"].map(Named).concat(roots),
   );
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+      None -> panic(String::of_bytes_lossy(b"no result for ".concat(name))),
     };
   [
     { at: b"m.same", root: roots.get(0) },
@@ -2030,7 +2045,7 @@ test "a keyed sum is compared and ordered by its key through roots its module wr
   assert(body(printed_name(roots.get(1))).tables.calls.contains(Named(b"m.folded")), None)
 }
 
-test "a type's stated arithmetic is called through roots its module writes, and a generic body is settled at the type" {
+test "a type's stated arithmetic is called through roots its module writes, and a generic body is resolved at the type" {
   let src = Bytes::concat_all([
     b"type Length = | Metres(Int) | Millimetres(Int)\n",
     b"key for Length by millimetres\n",
@@ -2051,7 +2066,7 @@ test "a type's stated arithmetic is called through roots its module writes, and 
   let neg = in_module_m(keys::NumericFunction(b"neg"), length);
   let of_int = in_module_m(keys::NumericFunction(b"of_int"), length);
   let at_length = specialised_at(b"m.total", [b"m.Length"]);
-  let answers = outputs_at([b"m"], [src], [b"m.Length"], [
+  let results = outputs_at([b"m"], [src], [b"m.Length"], [
     Named(b"m.grown"),
     Named(b"m.shorter"),
     Named(b"m.all"),
@@ -2063,10 +2078,10 @@ test "a type's stated arithmetic is called through roots its module writes, and 
     in_module_m(Order, length),
   ]);
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+      None -> panic(String::of_bytes_lossy(b"no result for ".concat(name))),
     };
   let unasked = |name: Bytes|
     assert(body(name).text.index_of(b"rt_binary_p") == None, Some(String::of_bytes_lossy(name)));
@@ -2091,7 +2106,7 @@ test "a type's stated arithmetic is called through roots its module writes, and 
   [b"m.grown", b"m.shorter", printed_name(at_length)].fold((), |_: Unit, n: Bytes| unasked(n))
 }
 
-test "a generic body another module defines is settled at a type whose module states its arithmetic" {
+test "a generic body another module defines is resolved at a type whose module states its arithmetic" {
   let generic = Bytes::concat_all([
     b"pub fn sign<a>(n: a) -> Int where numeric(a) = {\n",
     b"  let zero: a = numeric_of_int(0);\n",
@@ -2112,15 +2127,15 @@ test "a generic body another module defines is settled at a type whose module st
     b"fn signed(l: Length) -> Int = g::sign(l)\n",
   ]);
   let at = specialised_at(b"g.sign", [b"m.Length"]);
-  let answers = outputs_at([b"g", b"m"], [generic, src], [b"m.Length"], [Named(b"m.signed"), at]);
-  match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+  let results = outputs_at([b"g", b"m"], [generic, src], [b"m.Length"], [Named(b"m.signed"), at]);
+  match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
       if output_name(a) == printed_name(at) { Some(a) } else { acc }) {
     Some(a) ->
       assert(
         a.result.text.index_of(b"numeric_binary") == None,
         Some(String::of_bytes_lossy(a.result.text)),
       ),
-    None -> panic("no answer for the specialisation"),
+    None -> panic("no result for the specialisation"),
   }
 }
 
@@ -2135,17 +2150,17 @@ test "`assert_eq` compares as `==` does, and only where they differ hands the ru
   ]);
   let name = NamedType({ name: b"m.Name", args: [] });
   let at_name = specialised_at(b"m.either", [b"m.Name"]);
-  let answers = outputs_at([b"m"], [src], [b"m.Name"], [
+  let results = outputs_at([b"m"], [src], [b"m.Name"], [
     Named(b"m.same"),
     Named(b"m.names"),
     at_name,
     in_module_m(keys::Equal, name),
   ]);
   let body = |n: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == n { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(n))),
+      None -> panic(String::of_bytes_lossy(b"no result for ".concat(n))),
     };
   [b"m.same", printed_name(at_name)].fold((), |_: Unit, n: Bytes| {
     let said = Some(String::of_bytes_lossy(n));
@@ -2167,24 +2182,24 @@ test "a generic sum is shown by the function its module states, at the sum's arg
     b"pub fn written<a>(d: Deque<a>) -> String = match d { Deque(front, _) -> \"deque\" }\n",
   ]);
   let key = in_module_m(Show, NamedType({ name: b"m.Deque", args: [int_type()] }));
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Deque", b"std.value.VShown"],
     [key],
     shipped: [value_fixture()],
   );
-  let body = match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+  let body = match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
       if a.name == root_name(key) { Some(a) } else { acc }) {
     Some(a) -> a.result,
-    None -> panic("no answer"),
+    None -> panic("no result"),
   };
   assert_eq(body.tables.generics.calls.map(|g: GenericCall| { callee: g.callee, args: g.args }), [
     { callee: Named(b"m.written"), args: [int_type()] },
   ])
 }
 
-test "a generic keyed sum is digested as its key, which its function answers at the sum's arguments" {
+test "a generic keyed sum is digested as its key, which its function returns at the sum's arguments" {
   let src = Bytes::concat_all([
     b"pub type Deque<a> = | Deque(List<a>, List<a>)\n",
     b"key for Deque by to_list\n",
@@ -2192,11 +2207,11 @@ test "a generic keyed sum is digested as its key, which its function answers at 
     b"fn hashed(d: Deque<Int>) -> Bytes = digest(d)\n",
   ]);
   let key = in_module_m(Digest, NamedType({ name: b"m.Deque", args: [int_type()] }));
-  let answers = outputs_at([b"m"], [src], [b"m.Deque"], [Named(b"m.hashed"), key]);
-  let body = match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+  let results = outputs_at([b"m"], [src], [b"m.Deque"], [Named(b"m.hashed"), key]);
+  let body = match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
       if a.name == root_name(key) { Some(a) } else { acc }) {
     Some(a) -> a.result,
-    None -> panic("no answer"),
+    None -> panic("no result"),
   };
   assert(!body.tables.calls.contains(key), None);
   assert_eq(body.tables.generics.calls.map(|g: GenericCall| { callee: g.callee, args: g.args }), [
@@ -2243,12 +2258,12 @@ test "an update of a record held as its box writes the fields it sets, in the bo
 test "a root written over a string's bytes makes a text block, whichever byte builtin makes it" {
   let src = b"fn parts(s: String) -> List<String> / {abort.raise} = s.split(\",\")\n";
   let written = [in_module_m(ContainerWalk(b"split_from"), string_type())];
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.parts")].concat(written));
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.parts")].concat(written));
   let made = written.map(|k: RootKey|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if a.name == root_name(k) { Some(a) } else { acc }) {
       Some(a) -> [b"))->len = ", b"))->room = "].map(|f: Bytes| a.result.text.index_of(f) != None),
-      None -> panic("no answer"),
+      None -> panic("no result"),
     });
   assert_eq(made, [[true, true]])
 }
@@ -2284,7 +2299,7 @@ test "an array is made, written and listed into as the type of its elements lays
   assert_eq(has(b"rt_note_update_p(ctx, "), [false, true, false, false])
 }
 
-test "a parameter a tail call hands a part of what calling it answered is given, not lent" {
+test "a parameter a tail call hands a part of what calling it returned is given, not borrowed" {
   let src = Bytes::concat_all([
     b"type Step = | Over | More(Bytes, () -> Step)\n",
     b"fn pulled(k: () -> Step, fuel: Int) -> Bytes =\n",
@@ -2299,8 +2314,8 @@ test "a body generic over a label alone lays nothing out by it, so it is emitted
     b"fn held_byte<[r]>(h: Scoped<Bytes, [r]>, i: Int) -> Int / {scoped.read[r]} =\n",
     b"  if 0 <= i && i < h.get().len() { h.get().at(i) } else { -1 }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.held_byte")]);
-  assert_eq(answers.map(|a: RootOutput| a.result.tables.generics.needs), [[]])
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.held_byte")]);
+  assert_eq(results.map(|a: RootOutput| a.result.tables.generics.needs), [[]])
 }
 
 test "a root written where its module declares the prelude's constructor names still builds and matches the prelude's" {
@@ -2318,13 +2333,13 @@ test "a root written where its module declares the prelude's constructor names s
   let ordering = ordering_type();
   let roots = [maybe, either, ordering].fold([], |acc: List<RootKey>, t: Type|
     acc.push(in_module_m(Lift, t)).push(in_module_m(Lower, t)));
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Equal", b"m.Less", b"m.Greater", b"m.Some", b"m.None", b"m.Ok", b"m.Err", b"m.Name"],
     [b"m.maybe", b"m.either", b"m.order", b"m.ordered"].map(Named).concat(roots),
   );
-  assert(answers.len() > 0, None)
+  assert(results.len() > 0, None)
 }
 
 test "a list pattern reads its items and its rest in place, whatever the items' type lays out" {
@@ -2343,7 +2358,7 @@ test "a list pattern reads its items and its rest in place, whatever the items' 
   assert_eq([has(b"rt_list_at_p("), has(b"rt_list_rest_p(")], [[false, false], [false, false]])
 }
 
-test "a body over a sum of label and row parameters as well as types, specialised at its types, reads none" {
+test "a body over a sum of label and effect parameters as well as types, specialised at its types, reads none" {
   let src = Bytes::concat_all([
     b"effect log { write note[l](line: String) -> Unit }\n",
     b"type Pipe<a, b, [l], [k] | e, f> = | Pipe((a) -> b / {log.note[l] | e}, (b) -> Unit / {log.note[k] | f})\n",
@@ -2351,18 +2366,18 @@ test "a body over a sum of label and row parameters as well as types, specialise
     b"  match p { Pipe(turn, sink) -> sink(turn(x)) }\n",
     b"fn go(p: Pipe<Int, String, [app], [db] | {}, {}>) -> Unit / {log.note[app], log.note[db]} = through(p, 41)\n",
   ]);
-  let spec = keys::specialisation_key_with_rows(
+  let spec = keys::specialisation_key_with_effects(
     b"m.through",
     parsed_types([b"Int", b"String"]).map(keys::KeyType),
     [],
     [[]],
   );
-  let answers = outputs_at([b"m"], [src], [b"m.Pipe"], [Named(b"m.through"), Named(b"m.go"), spec]);
+  let results = outputs_at([b"m"], [src], [b"m.Pipe"], [Named(b"m.through"), Named(b"m.go"), spec]);
   let needs = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result.tables.generics.needs,
-      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+      None -> panic(String::of_bytes_lossy(b"no result for ".concat(name))),
     };
   assert_eq(needs(printed_name(spec)), [])
 }
@@ -2373,17 +2388,17 @@ test "an array of options holds each as its word form, and a generic one is made
     b"fn filled<a>(n: Int, x: a) -> Array<a> / {abort.raise} = Array::new(n, x)\n",
     b"fn ints(n: Int) -> Array<Int> / {abort.raise} = filled(n, 7)\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.opts"),
     Named(b"m.filled"),
     Named(b"m.ints"),
     specialised_at(b"m.filled", [b"Int"]),
   ]);
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   assert_eq(body(b"m.filled").tables.generics.needs, [{ var: 0, reads: Layout }]);
   assert(body(b"m.filled@Int").text.index_of(array_allocation()) != None, None)
@@ -2441,11 +2456,11 @@ test "a list, an array or a map is compared and digested by roots written for it
     walk(b"equal_from", trees),
   ];
   let constructors = [b"Less", b"Equal", b"Greater", b"Some", b"None", b"m.Leaf", b"m.Node"];
-  let answers = outputs_at([b"m"], [src], constructors, roots);
+  let results = outputs_at([b"m"], [src], constructors, roots);
   let body = |k: RootKey|
-    match answers.find(|a: RootOutput| a.name == root_name(k)) {
+    match results.find(|a: RootOutput| a.name == root_name(k)) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let counting = [
     keys::Drop,
@@ -2512,7 +2527,7 @@ test "a list, an array or a map is compared and digested by roots written for it
   )
 }
 
-test "a string's builtin that is refused hands the runtime the words it was refused, and crosses nothing" {
+test "a string's builtin that fails hands the runtime the words it failed on, and marshals nothing" {
   let src = Bytes::concat_all([
     b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
     b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
@@ -2528,7 +2543,7 @@ test "a string's builtin that is refused hands the runtime the words it was refu
     b"fn told(c: Bool, m: String) -> Unit / {abort.raise} = assert(c, Some(m))\n",
     b"fn untold(c: Bool) -> Unit / {abort.raise} = assert(c, None)\n",
   ]);
-  let refusals = [
+  let rejections = [
     { name: b"m.at", code: 8, text: false },
     { name: b"m.word", code: 9, text: false },
     { name: b"m.cut", code: 10, text: false },
@@ -2543,27 +2558,27 @@ test "a string's builtin that is refused hands the runtime the words it was refu
     { name: b"m.told", code: 21, text: true },
     { name: b"m.untold", code: 21, text: true },
   ];
-  let names = refusals.map(|r: { name: Bytes, code: Int, text: Bool }| r.name);
-  let answers = outputs_at([b"m"], [src], [b"Some", b"None"], names.map(|n: Bytes| Named(n)));
-  let crossings = [keys::Lower, keys::Lift];
-  let wrong = refusals.filter(|r: { name: Bytes, code: Int, text: Bool }| {
-    let b = output_body(answers, r.name);
+  let names = rejections.map(|r: { name: Bytes, code: Int, text: Bool }| r.name);
+  let results = outputs_at([b"m"], [src], [b"Some", b"None"], names.map(|n: Bytes| Named(n)));
+  let marshallings = [keys::Lower, keys::Lift];
+  let wrong = rejections.filter(|r: { name: Bytes, code: Int, text: Bool }| {
+    let b = output_body(results, r.name);
     let native = if r.text { b"builtin_elaborated_refused_text_p(ctx, INT64_C(" }
     else { b"builtin_elaborated_refused_p(ctx, INT64_C(" };
     body_code(b.text).index_of(native.concat(ascii_of_int(r.code)).concat(b"), ")) == None
       || b.tables.calls.any(|c: RootKey|
-        match c { Generated(w, _) -> crossings.contains(w.op), _ -> false })
+        match c { Generated(w, _) -> marshallings.contains(w.op), _ -> false })
   });
   assert_eq(wrong.map(|r: { name: Bytes, code: Int, text: Bool }| r.name), []);
-  let told = body_code(output_body(answers, b"m.told").text);
+  let told = body_code(output_body(results, b"m.told").text);
   assert(told.index_of(b"INT64_C(-1), ") != None, Some(String::of_bytes_lossy(told)))
 }
 
-fn output_body(answers: List<RootOutput>, name: Bytes) -> Output / {abort.raise} =
-  match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+fn output_body(results: List<RootOutput>, name: Bytes) -> Output / {abort.raise} =
+  match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
       if output_name(a) == name { Some(a) } else { acc }) {
     Some(a) -> a.result,
-    None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+    None -> panic(String::of_bytes_lossy(b"no result for ".concat(name))),
   }
 
 fn calls_a_value(code: Bytes) -> Bool =
@@ -2581,16 +2596,16 @@ test "a list's map, filter and fold over a lambda are a loop in the caller, the 
     b"fn known(xs: List<Int>, k: Int) -> List<Int> = { let f = |x: Int| x + k; xs.map(f) }\n",
     b"fn by(xs: List<Int>, f: (Int) -> Int) -> List<Int> = xs.map(f)\n",
   ]);
-  let generic = row_generic_at(b"std.prelude.mapped_from", [b"Int", b"Int"]);
+  let generic = effects_generic_at(b"std.prelude.mapped_from", [b"Int", b"Int"]);
   let callers = [b"m.bumped", b"m.kept", b"m.summed", b"m.handled", b"m.named", b"m.known"];
-  let answers = outputs_at([b"m"], [src], [], callers.push(b"m.by").map(Named).push(generic));
+  let results = outputs_at([b"m"], [src], [], callers.push(b"m.by").map(Named).push(generic));
   let call = |name: Bytes|
-    output_body(answers, name).tables.generics.calls.map(|g: GenericCall|
+    output_body(results, name).tables.generics.calls.map(|g: GenericCall|
       { callee: g.callee, borrowed: g.functions.len() });
   let push = [{ callee: Named(b"std.prelude.List::push"), borrowed: 0 }];
   assert_eq(callers.map(call), [push, push, [], push, [], push]);
   assert_eq(call(b"m.by"), [{ callee: Named(b"std.prelude.List::map"), borrowed: 0 }]);
-  let calling = |name: Bytes| calls_a_value(body_code(output_body(answers, name).text));
+  let calling = |name: Bytes| calls_a_value(body_code(output_body(results, name).text));
   assert_eq(callers.map(calling), [false, false, false, true, false, false]);
   assert(calling(printed_name(generic)), None)
 }
@@ -2636,17 +2651,17 @@ test "a map's value is read by `std.prelude`'s `Map::get` down its tree, its key
     specialisation_key(qualify(prelude_module(), name), [bytes_type(), bytes_type()], []);
   let keys = [at(b"Map::get"), at(b"found_under")];
   let read = keys.map(printed_name);
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"Some", b"None", b"Less", b"Equal", b"Greater"],
     [Named(b"m.priced")].concat(keys),
   );
   assert_eq(
-    output_body(answers, b"m.priced").tables.generics.calls.map(|g: GenericCall| g.callee),
+    output_body(results, b"m.priced").tables.generics.calls.map(|g: GenericCall| g.callee),
     [Named(b"std.prelude.Map::get")],
   );
-  let code = |name: Bytes| body_code(output_body(answers, name).text);
+  let code = |name: Bytes| body_code(output_body(results, name).text);
   assert_eq(
     read.filter(|n: Bytes|
       code(n).index_of(b"rt_map_") != None || code(n).index_of(b"builtin_compare") != None),
@@ -2711,8 +2726,8 @@ test "emitted code reads and writes no field of a block's header but its count" 
 test "two maps are compared by a root that walks `std.prelude`'s `Map::entries`" {
   let src = b"fn same(a: Map<Int, Bytes>, b: Map<Int, Bytes>) -> Bool = a == b\n";
   let root = in_module_m(ContainerWalk(b"equal"), map_type(int_type(), bytes_type()));
-  let answers = outputs_at([b"m"], [src], [b"Some", b"None"], [Named(b"m.same"), root]);
-  let body = output_body(answers, printed_name(root));
+  let results = outputs_at([b"m"], [src], [b"Some", b"None"], [Named(b"m.same"), root]);
+  let body = output_body(results, printed_name(root));
   assert(
     body.tables.generics.calls.any(|g: GenericCall| g.callee == Named(b"std.prelude.Map::entries")),
     None,
@@ -2730,14 +2745,14 @@ test "two columns are compared and ordered by roots that read each record in pla
   );
   let equal = in_module_m(ContainerWalk(b"equal"), columns);
   let ordered = in_module_m(ContainerWalk(b"ordered"), columns);
-  let answers = outputs_at([b"m"], [src], [], [
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.same"),
     Named(b"m.ordered"),
     equal,
     ordered,
   ]);
-  assert(output_body(answers, b"m.same").tables.calls.contains(equal), None);
-  assert(output_body(answers, b"m.ordered").tables.calls.contains(ordered), None)
+  assert(output_body(results, b"m.same").tables.calls.contains(equal), None);
+  assert(output_body(results, b"m.ordered").tables.calls.contains(ordered), None)
 }
 
 test "an `Iter` compares as its type's root, by its case and then its payload, wherever it is compared" {
@@ -2758,7 +2773,7 @@ test "an `Iter` compares as its type's root, by its case and then its payload, w
   let at = specialisation_key(b"m.same", [iter], []);
   let ok = specialisation_key(b"m.wrapped", [iter], []);
   let results = in_module_m(ContainerWalk(b"equal"), result_type(iter, int_type()));
-  let answers = outputs_at([b"m"], [src], [b"Stop", b"Continue", b"Ok", b"Err"], [
+  let outputs = outputs_at([b"m"], [src], [b"Stop", b"Continue", b"Ok", b"Err"], [
     Named(b"m.steps"),
     Named(b"m.through"),
     Named(b"m.kept"),
@@ -2778,7 +2793,7 @@ test "an `Iter` compares as its type's root, by its case and then its payload, w
     printed_name(results),
     printed_name(coded),
   ].fold((), |_: Unit, n: Bytes|
-    assert(output_body(answers, n).text != b"", Some(String::of_bytes_lossy(n))))
+    assert(output_body(outputs, n).text != b"", Some(String::of_bytes_lossy(n))))
 }
 
 test "a shipped module's generic body compares an `Iter` it is specialised at as its type's root" {
@@ -2795,7 +2810,7 @@ test "a shipped module's generic body compares an `Iter` it is specialised at as
   let iter = iter_type(string_type(), int_type());
   let coded = specialisation_key(b"std.probe.trips", [iter], []);
   let direct = specialisation_key(b"std.probe.direct", [iter], []);
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"Stop", b"Continue", b"Ok", b"Err"],
@@ -2803,10 +2818,10 @@ test "a shipped module's generic body compares an `Iter` it is specialised at as
     shipped: [shipped],
   );
   [printed_name(direct), printed_name(coded)].fold((), |_: Unit, n: Bytes|
-    assert(output_body(answers, n).text != b"", Some(String::of_bytes_lossy(n))))
+    assert(output_body(results, n).text != b"", Some(String::of_bytes_lossy(n))))
 }
 
-test "a byte `byte_of_int` answers is the unit's own, so a loop appending bytes allocates none" {
+test "a byte `byte_of_int` returns is the unit's own, so a loop appending bytes allocates none" {
   let src = b"fn bytes(t: Bytes, at: Int, out: Bytes) -> Bytes / {abort.raise} = if at >= t.len() { out } else { bytes(t, at + 1, out ++ byte_of_int(t.at(at) ^ 1)) }\n";
   let text = body_code(
     output_body(outputs_at([b"m"], [src], [], [Named(b"m.bytes")]), b"m.bytes").text,
@@ -2824,9 +2839,9 @@ test "a conversion the runtime calls through a type's descriptor probes the stac
     |acc: List<RootKey>, op: TypeOp|
       acc.concat([in_module_m(op, int_type()), in_module_m(op, pair)]),
   );
-  let answers = outputs_at([b"m"], [b"pub type P = { a: Bytes, n: Int }\n"], [], worded);
+  let results = outputs_at([b"m"], [b"pub type P = { a: Bytes, n: Int }\n"], [], worded);
   worded.fold((), |_: Unit, k: RootKey| {
-    let text = output_body(answers, printed_name(k)).text;
+    let text = output_body(results, printed_name(k)).text;
     assert(
       text.index_of(probed_fn().concat(b"(ctx)")) != None,
       Some(String::of_bytes_lossy(printed_name(k))),
@@ -2839,12 +2854,12 @@ test "a sum held as its words hands on each counted word it is matched apart int
     b"type S = | S(Map<Int, (Int, Int)>, Map<(Int, Int), Int>, Int)\n",
     b"fn inserted(s: S, i: Int) -> S = match s { S(places, order, next) -> S(places.insert(i, (i, next)), order.insert((i, next), i), next + 1) }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [b"S"], [Named(b"m.inserted")]);
-  let text = body_code(output_body(answers, b"m.inserted").text);
+  let results = outputs_at([b"m"], [src], [b"S"], [Named(b"m.inserted")]);
+  let text = body_code(output_body(results, b"m.inserted").text);
   assert(!calls_dup(text), Some(String::of_bytes_lossy(text)))
 }
 
-test "a lambda a call lends is laid out on the caller's stack with its descriptor, whoever the callee is" {
+test "a lambda a call passes borrowed is laid out on the caller's stack with its descriptor, whoever the callee is" {
   let src = Bytes::concat_all([
     b"fn apply(f: (Int) -> Int, x: Int) -> Int = f(x)\n",
     b"fn held(f: keep (Int) -> Int) -> List<(Int) -> Int> = [f]\n",
@@ -2856,8 +2871,8 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
     b"fn bare(n: Int) -> Int = apply(|x: Int| x + 1, n)\n",
   ]);
   let names = [b"m.applied", b"m.updated", b"m.kept", b"m.passed", b"m.bare"];
-  let answers = outputs_at([b"m"], [src], [], names.map(Named));
-  let code = |name: Bytes| body_code(output_body(answers, name).text);
+  let results = outputs_at([b"m"], [src], [], names.map(Named));
+  let code = |name: Bytes| body_code(output_body(results, name).text);
   let has = |text: Bytes| names.map(|n: Bytes| code(n).index_of(text) != None);
   assert_eq(has(b"[PLY_HEADER / 8 + "), [true, true, false, false, false]);
   assert_eq(has(b"ply_alloc("), [false, false, true, true, false]);
@@ -2865,7 +2880,7 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
   assert_eq(has(b"ply_rel_int"), [false, false, false, false, false])
 }
 
-test "a list literal only read or lent lies in the frame, and one answered or stored is a block of its own" {
+test "a list literal only read or borrowed lies in the frame, and one returned or stored is a block of its own" {
   let src = Bytes::concat_all([
     b"fn total(xs: List<Bytes>) -> Int = match xs { [b, ..] -> b.len(), [] -> 0 }\n",
     b"fn joined(a: Bytes, b: Bytes) -> Int = total([a, b, a])\n",
@@ -2874,8 +2889,8 @@ test "a list literal only read or lent lies in the frame, and one answered or st
     b"fn nested(n: Int) -> List<List<Int>> = [[n], [n + 1]]\n",
   ]);
   let names = [b"m.joined", b"m.counted", b"m.answered", b"m.nested"];
-  let answers = outputs_at([b"m"], [src], [], names.push(b"m.total").map(Named));
-  let code = |name: Bytes| body_code(output_body(answers, name).text);
+  let results = outputs_at([b"m"], [src], [], names.push(b"m.total").map(Named));
+  let code = |name: Bytes| body_code(output_body(results, name).text);
   let has = |text: Bytes| names.map(|n: Bytes| code(n).index_of(text) != None);
   assert_eq(has(b"_f[PLY_HEADER / 8 + "), [true, true, false, false]);
   assert_eq(has(b"ply_list_room("), [false, false, true, true])
@@ -2893,9 +2908,9 @@ test "a function's frame takes its list literals up to its cap, the last made go
     b"])\n",
   ]);
   let names = [b"m.four", b"m.past_a_leaf"];
-  let answers = outputs_at([b"m"], [src], [], names.push(b"m.total").map(Named));
+  let results = outputs_at([b"m"], [src], [], names.push(b"m.total").map(Named));
   let count = |name: Bytes, text: Bytes|
-    Bytes::split(body_code(output_body(answers, name).text), text).len() - 1;
+    Bytes::split(body_code(output_body(results, name).text), text).len() - 1;
   assert_eq(names.map(|n: Bytes| count(n, b"_f[PLY_HEADER / 8 + ")), [3, 0]);
   assert_eq(names.map(|n: Bytes| count(n, b"ply_list_room(")), [1, 1])
 }
@@ -2905,11 +2920,11 @@ test "a lambda a `std.prelude` function hands on to a native is laid out with th
     b"pub fn guarded(f: (Int) -> Int) -> Int = bracket(|| 1, |_: Int| (), f)\n",
     b"pub fn raised(n: Int) -> Int = guarded(|v: Int| v + n)\n",
   ]);
-  let answers = outputs_at([prelude_module()], [src], [], [
+  let results = outputs_at([prelude_module()], [src], [], [
     Named(b"std.prelude.guarded"),
     Named(b"std.prelude.raised"),
   ]);
-  let code = |name: Bytes| body_code(output_body(answers, name).text);
+  let code = |name: Bytes| body_code(output_body(results, name).text);
   assert(code(b"std.prelude.guarded").index_of(b"rt_with_cleanup_p(ctx") != None, None);
   assert(
     code(b"std.prelude.raised").index_of(b"[PLY_HEADER / 8 + 0] = (Word)(intptr_t)&") != None,
@@ -2934,18 +2949,18 @@ test "a lambda that captures nothing is one value made once, wherever it goes" {
   assert_eq(text.split(b"extern PlyFnBlock ").len(), 3)
 }
 
-test "a lambda inside a lambda another root runs is lent as its owner's" {
+test "a lambda inside a lambda another root runs is passed borrowed as its owner's" {
   let src = Bytes::concat_all([
     b"fn rows(xss: List<List<Int>>, g: (List<Int>) -> List<Int>) -> List<List<Int>> = xss.map(g)\n",
     b"fn row(xs: List<Int>, g: (Int) -> Int) -> List<Int> = xs.map(g)\n",
     b"fn nested(xss: List<List<Int>>) -> List<List<Int>> = rows(xss, |xs: List<Int>| row(xs, |x: Int| x + 1))\n",
   ]);
   let outer = specialisation_key(b"m.rows", [], [{ param: 1, owner: Named(b"m.nested"), nth: 0 }]);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.nested"), outer]);
-  let body = match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.nested"), outer]);
+  let body = match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
       if a.name == root_name(outer) { Some(a) } else { acc }) {
     Some(a) -> a.result,
-    None -> panic("no answer"),
+    None -> panic("no result"),
   };
   assert(
     body.tables.generics.calls.map(|g: GenericCall| g.functions).contains([
@@ -3049,7 +3064,7 @@ test "a record holding a small record in place crosses a call as its leaves" {
   ])
 }
 
-test "compare at a number, a character or a string orders in C and answers its constructor" {
+test "compare at a number, a character or a string orders in C and returns its constructor" {
   let src = Bytes::concat_all([
     b"fn by_name(a: Bytes, b: Bytes) -> Bool = compare(a, b) == Less\n",
     b"fn by_int(a: Int, b: Int) -> Ordering = compare(a, b)\n",
@@ -3063,20 +3078,20 @@ test "compare at a number, a character or a string orders in C and answers its c
   assert_eq(has(b"memcmp(((unsigned char *)&ply_words("), [true, false, true, false])
 }
 
-test "a root written to order two values answers `Equal` at once for one object" {
+test "a root written to order two values returns `Equal` at once for one object" {
   let src = b"type T = | Leaf(Int) | Node(List<T>)\nfn order(a: T, b: T) -> Ordering = compare(a, b)\nfn listed(a: List<T>, b: List<T>) -> Ordering = compare(a, b)\n";
   let lists = list_type(NamedType({ name: b"m.T", args: [] }));
   let written = [
     in_module_m(Order, NamedType({ name: b"m.T", args: [] })),
     in_module_m(ContainerWalk(b"ordered"), lists),
   ];
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"Less", b"Equal", b"Greater", b"Some", b"None", b"m.Leaf", b"m.Node"],
     [Named(b"m.order"), Named(b"m.listed")].concat(written),
   );
-  let code = |k: RootKey| body_code(output_body(answers, printed_name(k)).text);
+  let code = |k: RootKey| body_code(output_body(results, printed_name(k)).text);
   assert_eq(written.map(|k: RootKey| code(k).index_of(b"(p0) == (p1)") != None), [false, true])
 }
 
@@ -3100,7 +3115,7 @@ test "a root written for a type names the prelude's constructors, whatever its m
     in_module_m(ContainerWalk(b"ordered_from"), list_type(name)),
   ];
   let own = [b"Equal", b"Less", b"Greater", b"Some", b"None", b"Ok", b"Err"];
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     own.map(|c: Bytes| b"m.".concat(c)).concat(own).push(b"m.Name"),
@@ -3109,7 +3124,7 @@ test "a root written for a type names the prelude's constructors, whatever its m
     ),
   );
   written.fold((), |_: Unit, k: RootKey| {
-    let text = output_body(answers, printed_name(k)).text;
+    let text = output_body(results, printed_name(k)).text;
     assert_eq(
       own.filter(|c: Bytes| text.index_of(Bytes::concat_all([b"@@Tm.", c, b"@@"])) != None),
       [],
@@ -3260,7 +3275,7 @@ test "a record a pattern binds is read at the offsets its checked type gives" {
   assert_eq(out.len(), 1)
 }
 
-test "the emitter writes an embed out as the front end's answer says it was read: by its digest" {
+test "the emitter writes an embed out as the front end's result says it was read: by its digest" {
   let src = b"fn data() -> Bytes = embed(\"d.txt\")\n";
   let want = { path: b"d.txt", dir: false };
   let d = dump_of(
@@ -3302,7 +3317,7 @@ test "a shipped module's extern over machine types is called over machine words,
       no_rows(),
     ).out,
   );
-  let answers_of = |key: RootKey|
+  let results_of = |key: RootKey|
     emit_root_results(
       names,
       sources,
@@ -3315,12 +3330,12 @@ test "a shipped module's extern over machine types is called over machine words,
       d.effects,
       d.walked,
     );
-  match answers_of(Named(b"m.g")).find(|a: RootOutput| a.name == root_name(Named(b"m.g"))) {
+  match results_of(Named(b"m.g")).find(|a: RootOutput| a.name == root_name(Named(b"m.g"))) {
     Some(a) -> assert_eq(body_code(a.result.text).split(b"builtin_doubled_p(ctx, ").len(), 3),
-    None -> panic("no answer"),
+    None -> panic("no result"),
   };
   let said = handle {
-    answers_of(Named(b"m.f"));
+    results_of(Named(b"m.f"));
     b""
   } with {
     abort.raise(m) -> Bytes::of_string(m),
@@ -3426,16 +3441,16 @@ test "each extern written in place is written over the runtime's objects as the 
     probes.index_of(i.name.slice(b"std.prelude.".len(), i.name.len()).concat(b"(")) == None);
   assert_eq(unprobed.map(|i: { name: Bytes, op: Intrinsic }| i.name), []);
   let roots = calls.map(|c: { name: Bytes, src: Bytes }| b"std.prelude.probe_".concat(c.name));
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"std.prelude"],
     [prelude_source::text().concat(probes)],
     [b"Some", b"None"],
     roots.map(Named),
   );
   let code = |name: Bytes|
-    match answers.find(|a: RootOutput| output_name(a) == b"std.prelude.probe_".concat(name)) {
+    match results.find(|a: RootOutput| output_name(a) == b"std.prelude.probe_".concat(name)) {
       Some(a) -> body_code(a.result.text),
-      None -> panic("no answer for probe_" ++ String::of_bytes_lossy(name)),
+      None -> panic("no result for probe_" ++ String::of_bytes_lossy(name)),
     };
   assert_eq(
     calls.filter(|c: { name: Bytes, src: Bytes }| code(c.name).index_of(b"builtin_") != None).map(
@@ -3475,7 +3490,7 @@ test "each extern written in place is written over the runtime's objects as the 
   );
   let copy = |t: Type| keys::generated_key(keys::Copy, t, b"std.prelude");
   let copied = |name: Bytes, t: Type|
-    match answers.find(|a: RootOutput| output_name(a) == b"std.prelude.probe_".concat(name)) {
+    match results.find(|a: RootOutput| output_name(a) == b"std.prelude.probe_".concat(name)) {
       Some(a) ->
         a.result.tables.calls.contains(copy(t)) && has(name, symbol_of(printed_name(copy(t)))),
       None -> false,
@@ -3492,19 +3507,19 @@ test "each extern written in place is written over the runtime's objects as the 
   )
 }
 
-test "a write that answers a record whose field the record holds in place hands the field whole" {
+test "a write that returns a record whose field the record holds in place hands the field whole" {
   let probes = Bytes::concat_all([
     b"\nfn probe_key(n: MapNode<{ a: Int, b: Int }, Int>) -> { a: Int, b: Int } = MapNode::pair_take(n, 1).key\n",
     b"fn probe_sum(n: MapNode<{ a: Int, b: Int }, Int>) -> Int = { let t = MapNode::pair_take(n, 1); t.key.a + t.key.b + t.value }\n",
   ]);
   let names = [b"std.prelude.probe_key", b"std.prelude.probe_sum"];
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"std.prelude"],
     [prelude_source::text().concat(probes)],
     [b"Some", b"None"],
     names.map(Named),
   );
-  let code = names.map(|n: Bytes| body_code(output_body(answers, n).text));
+  let code = names.map(|n: Bytes| body_code(output_body(results, n).text));
   assert_eq(code.filter(|c: Bytes| c.index_of(b" 0 = 0;") != None).len(), 0);
   assert_eq(code.filter(|c: Bytes| c.index_of(b"builtin_") != None).len(), 0);
   let text = code.get(0);
@@ -3530,18 +3545,18 @@ test "a list's item is read by `std.prelude`'s one `List::at`, from the tail or 
   ]);
   let read = b"std.prelude.List::at";
   let at_string = printed_name(specialised_at(read, [b"String"]));
-  let answers = outputs_at([b"m"], [src], [b"Some", b"None"], [
+  let results = outputs_at([b"m"], [src], [b"Some", b"None"], [
     Named(b"m.third"),
     Named(b"m.listed"),
     Named(read),
     specialised_at(read, [b"String"]),
   ]);
   let called = |name: Bytes|
-    output_body(answers, name).tables.generics.calls.map(|g: GenericCall| g.callee);
+    output_body(results, name).tables.generics.calls.map(|g: GenericCall| g.callee);
   assert_eq([called(b"m.third"), called(b"m.listed")], [[Named(read)], [Named(read)]]);
-  assert(output_body(answers, read).tables.generics.needs.any(|n: Need| n.reads == Layout), None);
-  assert_eq(output_body(answers, read).text, b"");
-  let code = |name: Bytes| body_code(output_body(answers, name).text);
+  assert(output_body(results, read).tables.generics.needs.any(|n: Need| n.reads == Layout), None);
+  assert_eq(output_body(results, read).text, b"");
+  let code = |name: Bytes| body_code(output_body(results, name).text);
   assert_eq(
     [b"m.listed", at_string].map(|n: Bytes|
       code(n).index_of(b"rt_list_") == None && code(n).index_of(b"builtin_list_") == None),
@@ -3555,16 +3570,16 @@ test "a list's item is read by `std.prelude`'s one `List::at`, from the tail or 
   assert(code(at_string).index_of(b"ply_words(") != None, None)
 }
 
-test "a read of a list counts nothing it reads through it, but its answer once where it lets the list go" {
+test "a read of a list counts nothing it reads through it, but its result once where it lets the list go" {
   let at = specialised_at(b"std.prelude.List::at", [b"String"]);
   let read = printed_name(at);
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [b"fn second(xs: List<String>) -> Option<String> = xs.at(1)\n"],
     [b"Some", b"None"],
     [Named(b"m.second"), at],
   );
-  let text = body_code(output_body(answers, read).text);
+  let text = body_code(output_body(results, read).text);
   assert(
     text.split(b"\n").filter(|l: Bytes| calls_dup(l)).len() == 1,
     Some(String::of_bytes_lossy(text)),
@@ -3577,7 +3592,7 @@ test "`ListNode::leaf_of` is read down the list's trie in place, its leaf its pa
   let names = [b"std.prelude"];
   let sources = [prelude_source::text().concat(probe)];
   let d = dump_of(analyse(parse_all(zip_sources(names, sources))));
-  let answers = emit_root_results(
+  let results = emit_root_results(
     names,
     sources,
     constructors_of([b"Some", b"None"], [], [], constructor_sums(d.constructors)),
@@ -3589,7 +3604,7 @@ test "`ListNode::leaf_of` is read down the list's trie in place, its leaf its pa
     d.effects,
     d.walked,
   );
-  let code = body_code(output_body(answers, root).text);
+  let code = body_code(output_body(results, root).text);
   assert(
     code.index_of(b"builtin_") == None
       && (code.index_of(item_fn()) != None || code.index_of(leaf_fn()) != None)
@@ -3603,8 +3618,8 @@ fn in_module_m(op: TypeOp, ty: Type) -> RootKey = keys::generated_key(op, ty, b"
 fn specialised_at(definition: Bytes, args: List<Bytes>) -> RootKey / {abort.raise} =
   specialisation_key(definition, parsed_types(args), [])
 
-fn row_generic_at(definition: Bytes, args: List<Bytes>) -> RootKey / {abort.raise} =
-  keys::specialisation_key_with_rows(definition, parsed_types(args).map(keys::KeyType), [], [[]])
+fn effects_generic_at(definition: Bytes, args: List<Bytes>) -> RootKey / {abort.raise} =
+  keys::specialisation_key_with_effects(definition, parsed_types(args).map(keys::KeyType), [], [[]])
 
 fn parsed_types(ss: List<Bytes>) -> List<Type> / {abort.raise} =
   ss.map(|s: Bytes|
@@ -3664,12 +3679,12 @@ test "a generic definition reached at a type held apart from a word is emitted a
     specialised_at(b"m.twice", [b"Float"]),
     specialised_at(b"m.down", [b"Int"]),
   ]);
-  let answers = outputs_at([b"m"], [src], [], wanted);
+  let results = outputs_at([b"m"], [src], [], wanted);
   let body = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let has = |name: Bytes, text: Bytes| body(name).text.index_of(text) != None;
   assert(has(b"m.go", b"@@g0@@"));
@@ -3679,7 +3694,7 @@ test "a generic definition reached at a type held apart from a word is emitted a
       args: parsed_types([b"Float"]),
       carried: [0],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ]);
   assert_eq(body(b"m.same").tables.generics.calls, [
@@ -3688,7 +3703,7 @@ test "a generic definition reached at a type held apart from a word is emitted a
       args: parsed_types([b"String"]),
       carried: [],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ]);
   assert(body(b"m.twice").tables.generics.needs.contains({ var: 0, reads: Scalar }), None);
@@ -3701,19 +3716,19 @@ test "a generic definition reached at a type held apart from a word is emitted a
   assert_eq(body(b"m.down@Int").tables.calls, [])
 }
 
-test "a call carries a variable that changes how a parameter or the answer holding it is held" {
+test "a call carries a variable that changes how a parameter or the result holding it is held" {
   let src = Bytes::concat_all([
     b"fn first<a>(xs: List<a>) -> Option<a> = xs.at(0)\n",
     b"fn rest<a>(xs: List<a>) -> List<a> = xs\n",
     b"fn floats(xs: List<Float>) -> Float = match first(xs) { Some(x) -> x, None -> 0.0 }\n",
     b"fn tails(xs: List<Float>) -> Int = rest(xs).len()\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.floats"), Named(b"m.tails")]);
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.floats"), Named(b"m.tails")]);
   let calls = |name: Bytes|
-    match answers.fold(None, |acc: Option<RootOutput>, a: RootOutput|
+    match results.fold(None, |acc: Option<RootOutput>, a: RootOutput|
         if output_name(a) == name { Some(a) } else { acc }) {
       Some(a) -> a.result.tables.generics.calls,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   assert_eq(calls(b"m.floats"), [
     {
@@ -3721,7 +3736,7 @@ test "a call carries a variable that changes how a parameter or the answer holdi
       args: parsed_types([b"Float"]),
       carried: [0],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ]);
   assert_eq(calls(b"m.tails"), [
@@ -3730,12 +3745,12 @@ test "a call carries a variable that changes how a parameter or the answer holdi
       args: parsed_types([b"Float"]),
       carried: [],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ])
 }
 
-test "a contract's clauses read the parameters, and an `ensures` the answer, at the types the scheme gives them" {
+test "a contract's clauses read the parameters, and an `ensures` the result, at the types the scheme gives them" {
   let src = Bytes::concat_all([
     b"type Account = { name: String, balance: Int }\n",
     b"fn adjusted(account: Account, amount: Int) -> Account\n",
@@ -3758,9 +3773,9 @@ test "a contract's clauses read the parameters, and an `ensures` the answer, at 
     clause(b"m.kept", Ensures, 0),
   ];
   let wanted = keyed.map(root_name);
-  let answers = outputs_at([b"m"], [src], [], keyed);
-  assert_eq(answers.fold([], |acc: List<Bytes>, r: RootOutput| { acc }), []);
-  assert_eq(wanted.filter(|w: RootName| !answers.any(|r: RootOutput| r.name == w)), [])
+  let results = outputs_at([b"m"], [src], [], keyed);
+  assert_eq(results.fold([], |acc: List<Bytes>, r: RootOutput| { acc }), []);
+  assert_eq(wanted.filter(|w: RootName| !results.any(|r: RootOutput| r.name == w)), [])
 }
 
 test "a call inside a recursive group names its callee in the caller's variables, however each numbers its own" {
@@ -3768,11 +3783,11 @@ test "a call inside a recursive group names its callee in the caller's variables
     b"fn f<a, b>(x: a, y: b, n: Int) -> b = if n <= 0 { y } else { let r = g(y, x, n - 1); r }\n",
     b"fn g<c, d>(x: c, y: d, n: Int) -> c = if n <= 0 { x } else { let r = f(y, x, n - 1); r }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [
+  let results = outputs_at([b"m"], [src], [], [
     specialised_at(b"m.f", [b"Int", b"String"]),
     specialised_at(b"m.g", [b"String", b"Int"]),
   ]);
-  let tables = |name: Bytes| output_body(answers, name).tables;
+  let tables = |name: Bytes| output_body(results, name).tables;
   let called = |name: Bytes|
     tables(name).generics.calls.map(|g: GenericCall| { callee: g.callee, args: g.args });
   assert_eq(called(b"m.f@Int,String"), [
@@ -3787,8 +3802,8 @@ test "a call inside a recursive group names its callee in the caller's variables
   ])
 }
 
-fn loops_in(answers: List<RootOutput>, name: Bytes) -> Bool / {abort.raise} =
-  output_body(answers, name).text.index_of(b"goto ply_loop;") != None
+fn loops_in(results: List<RootOutput>, name: Bytes) -> Bool / {abort.raise} =
+  output_body(results, name).text.index_of(b"goto ply_loop;") != None
 
 test "a tail loop runs at the types it is called at, each member at the arguments its caller names it at" {
   let src = Bytes::concat_all([
@@ -3797,7 +3812,7 @@ test "a tail loop runs at the types it is called at, each member at the argument
     b"fn pong<a>(x: a, n: Int) -> a = if n <= 0 { x } else { ping(x, n - 1) }\n",
     b"fn go() -> Float = { let _ = spin(1.5, 7, 3); ping(1.5, 3) }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.go"),
     Named(b"m.spin"),
     specialised_at(b"m.spin", [b"Float", b"Int"]),
@@ -3805,22 +3820,22 @@ test "a tail loop runs at the types it is called at, each member at the argument
     Named(b"m.pong"),
     specialised_at(b"m.pong", [b"Float"]),
   ]);
-  let body = |name: Bytes| output_body(answers, name);
-  let loops = |name: Bytes| loops_in(answers, name);
+  let body = |name: Bytes| output_body(results, name);
+  let loops = |name: Bytes| loops_in(results, name);
   assert_eq(body(b"m.go").tables.generics.calls, [
     {
       callee: Named(b"m.spin"),
       args: parsed_types([b"Float", b"Int"]),
       carried: [0, 1],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
     {
       callee: Named(b"m.ping"),
       args: parsed_types([b"Float"]),
       carried: [0],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ]);
   assert_eq(body(b"m.spin").text, b"");
@@ -3849,17 +3864,17 @@ test "a tail loop whose members number their variables apart runs as one at the 
     b"fn f<a, b>(x: a, y: b, n: Int) -> b = if n <= 0 { y } else { g(y, x, n - 1) }\n",
     b"fn g<c, d>(x: c, y: d, n: Int) -> c = if n <= 0 { x } else { f(y, x, n - 1) }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [specialised_at(b"m.g", [b"String", b"Int"])]);
-  let looped = output_body(answers, b"m.f@Int,String");
+  let results = outputs_at([b"m"], [src], [], [specialised_at(b"m.g", [b"String", b"Int"])]);
+  let looped = output_body(results, b"m.f@Int,String");
   assert_eq(looped.tables.members.map(printed_name), [b"m.f@Int,String", b"m.g@String,Int"]);
-  assert(loops_in(answers, b"m.f@Int,String"));
+  assert(loops_in(results, b"m.f@Int,String"));
   assert_eq(looped.tables.generics.needs, [])
 }
 
 fn types_in(c: Code) -> List<Type> =
   code_children(c).fold([c.ty], |acc: List<Type>, x: Code| acc.concat(types_in(x)))
 
-test "a type nothing in the program settles is `Unit`, so a body of no type variable reads none" {
+test "a type nothing in the program resolves is `Unit`, so a body of no type variable reads none" {
   let src = Bytes::concat_all([
     b"fn empty() -> Int = { let xs = []; xs.len() }\n",
     b"fn wrapped(n: Int) -> Bool = match Ok(n) { Ok(_) -> true, Err(_) -> false }\n",
@@ -3869,7 +3884,7 @@ test "a type nothing in the program settles is `Unit`, so a body of no type vari
     b"fn pair(n: Int) -> Int = match (n, []) { (k, _) -> k }\n",
   ]);
   match program_of(src) {
-    Err(why) -> assert_eq(why, b""),
+    Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let open = p.roots.filter(|r: Root| types_in(r.code).any(has_variables));
       assert_eq(open.map(|r: Root| printed_name(r.key)), []);
@@ -3885,31 +3900,31 @@ test "a tail loop through calls written on a value runs as one at its types" {
     b"fn Countdown::even_at<a>(c: Countdown, x: a) -> a = if c.left <= 0 { x } else { let next: Countdown = { left: c.left - 1 }; next.odd_at(x) }\n",
     b"fn Countdown::odd_at<a>(c: Countdown, x: a) -> a = if c.left <= 0 { x } else { let next: Countdown = { left: c.left - 1 }; next.even_at(x) }\n",
   ]);
-  let answers = outputs_at([b"m"], [src], [], [specialised_at(b"m.Countdown::odd_at", [b"Float"])]);
-  let looped = output_body(answers, b"m.Countdown::even_at@Float");
+  let results = outputs_at([b"m"], [src], [], [specialised_at(b"m.Countdown::odd_at", [b"Float"])]);
+  let looped = output_body(results, b"m.Countdown::even_at@Float");
   assert_eq(looped.tables.members.map(printed_name), [
     b"m.Countdown::even_at@Float",
     b"m.Countdown::odd_at@Float",
   ]);
-  assert(loops_in(answers, b"m.Countdown::even_at@Float"))
+  assert(loops_in(results, b"m.Countdown::even_at@Float"))
 }
 
 test "a generic definition reached at a record type reads the record where its layout puts it" {
   let src = b"fn first<a, b>(p: { l: a, r: b }) -> a = p.l\nfn pick(q: { l: { x: Float, y: Float }, r: Int }) -> Float = first(q).x\n";
   let at = specialised_at(b"m.first", [b"{x:Float,y:Float}", b"Int"]);
   let laid = printed_name(at);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.pick"), Named(b"m.first"), at]);
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.pick"), Named(b"m.first"), at]);
   let text = |name: Bytes|
-    match answers.fold(None, |acc: Option<Bytes>, a: RootOutput|
+    match results.fold(None, |acc: Option<Bytes>, a: RootOutput|
         if output_name(a) == name { Some(a.result.text) } else { acc }) {
       Some(t) -> t,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   let tables = |name: Bytes|
-    match answers.fold(None, |acc: Option<Tables>, a: RootOutput|
+    match results.fold(None, |acc: Option<Tables>, a: RootOutput|
         if output_name(a) == name { Some(a.result.tables) } else { acc }) {
       Some(t) -> t,
-      None -> panic("no answer"),
+      None -> panic("no result"),
     };
   assert_eq(tables(b"m.pick").generics.calls, [
     {
@@ -3917,7 +3932,7 @@ test "a generic definition reached at a record type reads the record where its l
       args: parsed_types([b"{x:Float,y:Float}", b"Int"]),
       carried: [0, 1],
       functions: [],
-      rows: [],
+      effect_evidence: [],
     },
   ]);
   assert_eq(text(b"m.first"), b"");
@@ -3927,7 +3942,7 @@ test "a generic definition reached at a record type reads the record where its l
   )
 }
 
-test "a generic call carrying a record that holds a sum of several words hands it as the specialisation it settles on takes it" {
+test "a generic call carrying a record that holds a sum of several words hands it as the specialisation it resolves to takes it" {
   let src = Bytes::concat_all([
     b"type Term = | Num(Int) | Name(Bytes)\n",
     b"fn put<a>(xs: List<a>, x: a) -> List<a> = xs.push(x)\n",
@@ -3935,11 +3950,11 @@ test "a generic call carrying a record that holds a sum of several words hands i
   ]);
   let at = specialised_at(b"m.put", [b"{name:Bytes,term:m.Term}"]);
   let laid = printed_name(at);
-  let answers = outputs_at([b"m"], [src], [b"m.Num", b"m.Name"], [Named(b"m.added"), at]);
+  let results = outputs_at([b"m"], [src], [b"m.Num", b"m.Name"], [Named(b"m.added"), at]);
   let body = |name: Bytes|
-    match answers.find(|a: RootOutput| output_name(a) == name) {
+    match results.find(|a: RootOutput| output_name(a) == name) {
       Some(a) -> a.result,
-      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+      None -> panic(String::of_bytes_lossy(b"no result for ".concat(name))),
     };
   assert_eq(body(b"m.added").tables.generics.calls.map(|g: GenericCall| g.carried), [[0]]);
   let written = body(b"m.added").tables.generics.expects.map(|e: ExpectedPrototype| e.head);
@@ -3960,16 +3975,16 @@ test "a constructor rebuilt from the one its parameter matched, one field change
     |acc: List<RootKey>, args: List<Bytes>|
       acc.push(specialised_at(b"m.shifted", args)).push(specialised_at(b"m.joined", args)),
   );
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"m.Leaf", b"m.Node", b"m.Less", b"m.Greater", b"m.Same"],
     ats.push(Named(b"m.shifted")).push(Named(b"m.joined")),
   );
-  assert_eq(answers.fold([], |acc: List<Bytes>, a: RootOutput| { acc }), [])
+  assert_eq(results.fold([], |acc: List<Bytes>, a: RootOutput| { acc }), [])
 }
 
-test "a call that knows both variables of a record its callee takes and answers carries both, and the record crosses as its fields" {
+test "a call that knows both variables of a record its callee takes and returns carries both, and the record crosses as its fields" {
   let src = Bytes::concat_all([
     b"fn top<k, v>(es: List<{ key: k, value: v }>, d: { key: k, value: v }) -> { key: k, value: v } =\n",
     b"  match es.at(0) { Some(e) -> e, None -> d }\n",
@@ -3977,11 +3992,11 @@ test "a call that knows both variables of a record its callee takes and answers 
   ]);
   let at = specialised_at(b"m.top", [b"Int", b"Int"]);
   let laid = printed_name(at);
-  let answers = outputs_at([b"m"], [src], [], [Named(b"m.used"), at]);
+  let results = outputs_at([b"m"], [src], [], [Named(b"m.used"), at]);
   let body = |name: Bytes|
-    match answers.find(|a: RootOutput| output_name(a) == name) {
+    match results.find(|a: RootOutput| output_name(a) == name) {
       Some(a) -> a.result,
-      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+      None -> panic(String::of_bytes_lossy(b"no result for ".concat(name))),
     };
   assert_eq(body(b"m.used").tables.generics.calls.map(|g: GenericCall| g.carried), [[0, 1]]);
   let written = body(b"m.used").tables.generics.expects.map(|e: ExpectedPrototype| e.head);
@@ -3989,17 +4004,17 @@ test "a call that knows both variables of a record its callee takes and answers 
   assert(written.all(|h: Prototype| h.params.len() > 2 && h.result != b"Word"), Some(f"{written}"))
 }
 
-test "an operator the checker filed at a definition's variable is done at the type it is at" {
+test "an operator the checker recorded at a definition's variable is done at the type it is at" {
   let src = b"fn same<a>(x: a, y: a) -> Bool = x == y\nfn floats(x: Float, y: Float) -> Bool = same(x, y)\n";
-  let answers = outputs_at([b"m"], [src], [], [
+  let results = outputs_at([b"m"], [src], [], [
     Named(b"m.same"),
     Named(b"m.floats"),
     specialised_at(b"m.same", [b"Float"]),
   ]);
-  let texts = answers.map(|a: RootOutput| a.result.text);
-  assert_eq(answers.map(output_name), [b"m.same@Float", b"m.same", b"m.floats"]);
+  let texts = results.map(|a: RootOutput| a.result.text);
+  assert_eq(results.map(output_name), [b"m.same@Float", b"m.same", b"m.floats"]);
   assert_eq(texts.get(1), b"");
-  let same = match answers.at(1) { Some(a) -> a.result.tables.generics.needs, None -> [] };
+  let same = match results.at(1) { Some(a) -> a.result.tables.generics.needs, None -> [] };
   assert_eq(same, [{ var: 0, reads: Exact }])
 }
 
@@ -4067,18 +4082,19 @@ fn site_fixture_outputs(sources: List<Source>, d: Dump) -> List<RootOutput> / {a
     d.walked,
   )
 
-test "a body is lowered from what its row files of it, walked now or published from the row" {
+test "a body is lowered from what its row records of it, walked now or published from the row" {
   let walked = dump_of(analyse(parse_all(site_fixture(b""))));
-  let filed = walked.rows.definitions.fold(b"", |acc: Bytes, row: KnownDefinitionRow|
+  let recorded = walked.rows.definitions.fold(b"", |acc: Bytes, row: KnownDefinitionRow|
     if row.name == b"a.moved" { row.facts } else { acc });
-  match decode_facts(filed, 0, b"a.moved") {
-    None -> panic("the row files what the walk read"),
+  match decode_facts(recorded, 0, b"a.moved") {
+    None -> panic("the row records what the walk read"),
     Some(f) -> assert(f.bodies.len() > 0),
   };
   let seeded = analyse_with(parse_all(site_fixture(b"")), walked.rows);
   match seeded {
-    seam::Refused(_) -> panic("the program checks"),
-    seam::Analysed(w) -> assert_eq(front::not_written(w.checked.seeded), [b"b.twice", b"a.moved"]),
+    emitter_input::Rejected(_) -> panic("the program checks"),
+    emitter_input::Analysed(w) ->
+      assert_eq(front::not_written(w.checked.seeded), [b"b.twice", b"a.moved"]),
   };
   assert_eq(
     site_fixture_outputs(site_fixture(b""), dump_of(seeded)),
@@ -4086,7 +4102,10 @@ test "a body is lowered from what its row files of it, walked now or published f
   )
 }
 
-fn analysed_with_rows(sources: List<Source>, rows: Rows) -> seam::AnalysisOutcome / {abort.raise} =
+fn analysed_with_rows(
+  sources: List<Source>,
+  rows: Rows,
+) -> emitter_input::AnalysisOutcome / {abort.raise} =
   analyse_pulling_std_with(sources, [], rows).out
 
 test "a body published from its row is lowered where its definition moved to" {
@@ -4094,8 +4113,8 @@ test "a body published from its row is lowered where its definition moved to" {
   let after = site_fixture(b"// a comment, and a definition, above it\nfn aside() -> Int = 7\n");
   let seeded = analysed_with_rows(after, before.rows);
   match seeded {
-    seam::Refused(_) -> panic("the program checks"),
-    seam::Analysed(w) -> {
+    emitter_input::Rejected(_) -> panic("the program checks"),
+    emitter_input::Analysed(w) -> {
       assert_eq(front::not_written(w.checked.seeded), [b"b.twice", b"a.moved"]);
       assert_eq(
         w.checked.seeded.filter(|n: Bytes| front::written_reach().contains(n)),
@@ -4123,7 +4142,7 @@ test "a body published from its row lets go of what it owns where its definition
   )
 }
 
-test "a body's row files the same sites wherever its definition stands" {
+test "a body's row records the same sites wherever its definition stands" {
   let facts_of = |sources: List<Source>| {
     let d = dump_of(analysed_with_rows(sources, no_rows()));
     d.rows.definitions.fold(b"", |acc: Bytes, row: KnownDefinitionRow|
@@ -4141,7 +4160,7 @@ test "a body's row files the same sites wherever its definition stands" {
   )
 }
 
-test "a module's roots are lowered only from an answer that holds what its check read" {
+test "a module's roots are lowered only from a result that holds what its check read" {
   let sources = site_fixture(b"");
   let d = dump_of(analyse(parse_all(sources)));
   let said = |dump: Dump|
@@ -4153,10 +4172,10 @@ test "a module's roots are lowered only from an answer that holds what its check
     };
   let unread = said({ ..d, rows: { ..d.rows, definitions: [] } });
   assert(unread.contains(b"nothing its check read"), Some(String::of_bytes_lossy(unread)));
-  assert(said({ ..d, walked: b"" }) != b"", Some("an answer with nothing read lowers nothing"))
+  assert(said({ ..d, walked: b"" }) != b"", Some("a result with nothing read lowers nothing"))
 }
 
-test "a wanted body is lowered though the answer holds nothing of a test beside it" {
+test "a wanted body is lowered though the result holds nothing of a test beside it" {
   let sources = site_fixture(b"");
   let d = dump_of(analyse(parse_all(sources)));
   let call = |wanted: List<RootKey>|
@@ -4179,7 +4198,7 @@ test "a wanted body is lowered though the answer holds nothing of a test beside 
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert(said != b"", Some("a test the answer holds nothing of is not lowered from a guess"))
+  assert(said != b"", Some("a test the result contains nothing of is not lowered from a guess"))
 }
 
 fn append_start() -> Bytes = b"{ int64_t sl = "
@@ -4223,8 +4242,8 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     Named,
   );
   let names = keyed.map(printed_name);
-  let answers = outputs_at([b"m"], [src], [b"Stop", b"Continue", b"m.T"], keyed);
-  let code = |name: Bytes| body_code(output_body(answers, name).text);
+  let results = outputs_at([b"m"], [src], [b"Stop", b"Continue", b"m.T"], keyed);
+  let code = |name: Bytes| body_code(output_body(results, name).text);
   assert_eq(
     names.filter(|n: Bytes| {
       let body = code(n);
@@ -4346,7 +4365,7 @@ test "a constant tree is static boxes, its leaves and cases laid as the printer 
   assert_eq([b"m.small", b"m.broad"].filter(|n: Bytes| counts_any(text(n))), [])
 }
 
-test "a handle whose body answers a constant holds it as it holds any answer, whatever its clauses" {
+test "a handle whose body returns a constant holds it as it holds any result, whatever its clauses" {
   let src = Bytes::concat_all([
     b"effect amb {\n  write flip() -> Bool\n}\n",
     b"fn branched() -> String = handle { if amb.flip() { \"a\" } else { \"b\" } } with { amb.flip() resume k -> k(true) }\n",
@@ -4378,7 +4397,7 @@ test "a record an arm holds back is joined as its fields however deep it lies, p
   ])
 }
 
-test "a byte `byte_of_int` answers is handed to a list with no count taken again" {
+test "a byte `byte_of_int` returns is handed to a list with no count taken again" {
   let out = emit_all_program(
     [{ name: b"m", src: b"fn wrap(n: Int) -> List<Bytes> / {abort.raise} = [byte_of_int(n)]\n" }],
     [],
@@ -4405,7 +4424,7 @@ test "a scalar parameter arrives as itself and holds no count for a self tail ca
   assert_eq(out.map(|e: EmittedRoot| releases_word(e.text, b"p0")), [false, false, false])
 }
 
-test "an accumulator read more than once is still answered as its fields at the body's tail" {
+test "an accumulator read more than once is still returned as its fields at the body's tail" {
   let src = Bytes::concat_all([
     b"type S = { i: Int, tag: Bytes }\n",
     b"fn narrow(s: S, x: Int) -> S = { ..s, i: x }\n",
@@ -4480,13 +4499,13 @@ test "a root written for a type is called at the head it is defined at, a record
     in_module_m(keys::Lower, boxed),
     in_module_m(Digest, wide),
   ];
-  let answers = outputs_at(
+  let results = outputs_at(
     [b"m"],
     [src],
     [b"Some", b"None"],
     written.concat([b"m.same", b"m.hashed"].map(Named)),
   );
-  let tables = answers.map(|a: RootOutput| { name: output_name(a), tables: a.result.tables });
+  let tables = results.map(|a: RootOutput| { name: output_name(a), tables: a.result.tables });
   let defined = tables.fold(
     Map::new(),
     |m: Map<Bytes, { result: Bytes, params: List<Bytes> }>, t: { name: Bytes, tables: Tables }| {
@@ -4545,9 +4564,10 @@ fn emit_all_program(
   release: Bool,
 ) -> List<EmittedRoot> / {abort.raise} =
   match analyse(parse_all(sources)) {
-    seam::Refused(diagnostics) -> panic(String::of_bytes_lossy(diagnostics_text(diagnostics))),
-    seam::Analysed(w) -> {
-      let d = dump_of(seam::Analysed(w));
+    emitter_input::Rejected(diagnostics) ->
+      panic(String::of_bytes_lossy(diagnostics_text(diagnostics))),
+    emitter_input::Analysed(w) -> {
+      let d = dump_of(emitter_input::Analysed(w));
       emit_program(
         sources,
         loaded_constructors(d, constructors),
@@ -4620,7 +4640,7 @@ test "a body that names a constructor calls no root for it, whatever key or show
     assert_eq(calls(src).map(|c: { name: Bytes, calls: List<Bytes> }| c.calls), [[], [], [], []]))
 }
 
-fn lending_corpus() -> Bytes =
+fn borrowing_corpus() -> Bytes =
   Bytes::concat_all([
     b"type T = | Leaf | Node(T, Int, T)\n",
     b"fn weight(t: T) -> Int = match t { Leaf -> 0, Node(_, n, _) -> n }\n",
@@ -4629,10 +4649,10 @@ fn lending_corpus() -> Bytes =
     b"fn both(t: T) -> T = if weight(t) > 0 { grown(t) } else { t }\n",
   ])
 
-fn published_signature(definition: Bytes, lent: List<Bool>) -> PublishedSignature =
-  { definition: root_name(Named(definition)), borrowed: lent, borrowed_from: None }
+fn published_signature(definition: Bytes, borrowed: List<Bool>) -> PublishedSignature =
+  { definition: root_name(Named(definition)), borrowed: borrowed, borrowed_from: None }
 
-test "a payload read out of a value gathered of constants holds no count, beside arms whose answers do" {
+test "a payload read out of a value gathered of constants holds no count, beside arms whose results do" {
   let src = Bytes::concat_all([
     b"type V = | VInt(Int) | VStr(String)\n",
     b"fn render(v: V) -> String = match v { VInt(n) -> n.to_string(), VStr(s) -> s.len().to_string() }\n",
@@ -4646,7 +4666,7 @@ test "a payload read out of a value gathered of constants holds no count, beside
   ])
 }
 
-test "a specialisation reads what it is lent as its definition reads it, and answers as it does" {
+test "a specialisation reads what it borrows as its definition reads it, and returns as it does" {
   let src = Bytes::concat_all([
     b"type Named<a> = { data: a, name: String }\n",
     b"fn name_of<a>(x: Named<a>) -> String = x.name\n",
@@ -4659,10 +4679,10 @@ test "a specialisation reads what it is lent as its definition reads it, and ans
     specialised_at(b"m.err_or", [b"Int"]),
   ]);
   let wanted = keyed.map(printed_name);
-  let answers = outputs_at([b"m"], [src], [b"Ok", b"Err"], keyed);
-  assert_eq(answers.map(output_name).sort(), wanted.sort());
+  let results = outputs_at([b"m"], [src], [b"Ok", b"Err"], keyed);
+  assert_eq(results.map(output_name).sort(), wanted.sort());
   let borrowed = |name: Bytes|
-    answers.fold([], |acc: List<PublishedSignature>, a: RootOutput|
+    results.fold([], |acc: List<PublishedSignature>, a: RootOutput|
       if output_name(a) != name { acc } else { acc.concat(a.result.tables.handings) });
   assert_eq(borrowed(b"m.name_of"), [published_signature(b"m.name_of", [true])]);
   assert_eq(borrowed(b"m.err_or"), [
@@ -4674,8 +4694,8 @@ test "a specialisation reads what it is lent as its definition reads it, and ans
   ])
 }
 
-test "a parameter a body only reads is lent: neither it nor a caller counts it for the call" {
-  let out = emit_all_program([{ name: b"m", src: lending_corpus() }], [], true);
+test "a parameter a body only reads is borrowed: neither it nor a caller counts it for the call" {
+  let out = emit_all_program([{ name: b"m", src: borrowing_corpus() }], [], true);
   assert_eq(out.len(), 4);
   let code = out.map(|e: EmittedRoot| body_code(e.text));
   assert_eq(code.map(counts_any), [false, false, false, true]);
@@ -4694,9 +4714,9 @@ test "a parameter a body only reads is lent: neither it nor a caller counts it f
   ])
 }
 
-test "a body is written against the handing another answer publishes for its callee, and says it assumed it" {
+test "a body is written against the handing another result publishes for its callee, and says it assumed it" {
   let twice = |published: List<PublishedSignature>|
-    match outputs_at([b"m"], [lending_corpus()], [], [Named(b"m.twice")], [], published) {
+    match outputs_at([b"m"], [borrowing_corpus()], [], [Named(b"m.twice")], [], published) {
       [a] ->
         Some({
           counted: calls_dup(body_code(a.result.text)),

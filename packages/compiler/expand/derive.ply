@@ -2,8 +2,8 @@ import compiler.syntax.parsing (Span, Identifier, QName, span_to, span_between)
 import compiler.syntax.node_ids (numbered)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
-                                    UnitTypeExpression, InvalidTypeExpression, RowExpression,
-                                    AtomExpression, type_span)
+                                    UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
+                                    EffectExpression, type_span)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
                                  PatternRange, PatternConstructor, PatternRecord, PatternList,
                                  PatternOr, PatternInvalid)
@@ -56,7 +56,7 @@ fn retarget_fn(definition: FnDefinition, span: Span) -> FnDefinition =
     },
     params: definition.params.map(|param: Param| retarget_param(param, span)),
     ret: match definition.ret { Some(t) -> Some(retarget_type(t, span)), None -> None },
-    effects: match definition.effects { Some(r) -> Some(retarget_row(r, span)), None -> None },
+    effects: match definition.effects { Some(r) -> Some(retarget_effects(r, span)), None -> None },
     constraints: definition.constraints.map(|c: Constraint|
       { deriver: c.deriver, deriver_span: span, param: identifier_at(c.param, span), span: span }),
     spec: definition.spec.map(|c: SpecClause|
@@ -94,7 +94,7 @@ fn retarget_type(t: TypeExpression, span: Span) -> TypeExpression =
         name: qualified_name_at(c.name, span),
         args: c.args.map(|a: TypeExpression| retarget_type(a, span)),
         labels: c.labels.map(|l: Identifier| identifier_at(l, span)),
-        rows: c.rows.map(|r: RowExpression| retarget_row(r, span)),
+        effect_arguments: c.effect_arguments.map(|r: EffectsExpression| retarget_effects(r, span)),
       }),
     FunctionTypeExpression(f) ->
       FunctionTypeExpression({
@@ -102,7 +102,7 @@ fn retarget_type(t: TypeExpression, span: Span) -> TypeExpression =
         span: span,
         params: f.params.map(|p: TypeExpression| retarget_type(p, span)),
         ret: retarget_type(f.ret, span),
-        effects: match f.effects { Some(r) -> Some(retarget_row(r, span)), None -> None },
+        effects: match f.effects { Some(r) -> Some(retarget_effects(r, span)), None -> None },
       }),
     RecordTypeExpression(r) ->
       RecordTypeExpression({
@@ -114,21 +114,21 @@ fn retarget_type(t: TypeExpression, span: Span) -> TypeExpression =
     InvalidTypeExpression(_) -> InvalidTypeExpression({ span: span }),
   }
 
-fn retarget_row(row: RowExpression, span: Span) -> RowExpression =
+fn retarget_effects(effects: EffectsExpression, span: Span) -> EffectsExpression =
   {
-    atoms: row.atoms.map(|atom: AtomExpression|
+    listed: effects.listed.map(|entry: EffectExpression|
       {
-        effect_name: qualified_name_at(atom.effect_name, span),
-        mode: atom.mode,
-        op: optional_identifier_at(atom.op, span),
-        resource: optional_identifier_at(atom.resource, span),
-        every: atom.every,
-        bounded: atom.bounded,
+        effect_name: qualified_name_at(entry.effect_name, span),
+        mode: entry.mode,
+        op: optional_identifier_at(entry.op, span),
+        resource: optional_identifier_at(entry.resource, span),
+        every: entry.every,
+        bounded: entry.bounded,
         span: span,
       }),
-    aliases: row.aliases.map(|qname: QName| qualified_name_at(qname, span)),
-    tail: optional_identifier_at(row.tail, span),
-    tail_bounded: row.tail_bounded,
+    aliases: effects.aliases.map(|qname: QName| qualified_name_at(qname, span)),
+    variable: optional_identifier_at(effects.variable, span),
+    variable_bounded: effects.variable_bounded,
     span: span,
   }
 
@@ -352,15 +352,15 @@ pub type DeriverRequest = { module: Bytes, declaration: Bytes }
 
 pub type DeriverFailure = { code: Bytes, message: Bytes, notes: List<Bytes> }
 
-pub type Refusal = { message: Bytes, at: Option<Bytes>, notes: List<Bytes> }
+pub type Rejection = { message: Bytes, at: Option<Bytes>, notes: List<Bytes> }
 
-pub type DeriverResponse = | Generated(Bytes) | Declined(Refusal) | Failed(DeriverFailure)
+pub type DeriverResponse = | Generated(Bytes) | Declined(Rejection) | Failed(DeriverFailure)
 
 derive bin for DeriverRequest
 
 derive bin for DeriverFailure
 
-derive bin for Refusal
+derive bin for Rejection
 
 derive bin for DeriverResponse
 
@@ -407,7 +407,7 @@ fn new_expander(
   path: Bytes,
   module: Module,
   previous: List<Derivation>,
-  answers: List<ItemResponse>,
+  results: List<ItemResponse>,
 ) -> Expander =
   {
     m: m,
@@ -419,7 +419,7 @@ fn new_expander(
         _ -> acc,
       }),
     taken: previous,
-    results: answers,
+    results: results,
     claimed: [],
     generated: [],
     diagnostics: [],
@@ -484,7 +484,7 @@ fn derive_one(expander: Expander, definition: DeriveDefinition) -> Expander / {a
         None -> unknown_deriver(expander, definition),
         Some(a) -> match a.result {
           Generated(text) -> add_generated_source(expander, definition, [text]),
-          Declined(refused) -> report_derive_error(expander, definition, target, refused),
+          Declined(rejected) -> report_derive_error(expander, definition, target, rejected),
           Failed(u) ->
             report(
               expander,
@@ -516,12 +516,12 @@ fn add_generated_source(
         Bytes::concat_all([
           b"the `",
           definition.deriver,
-          b"` deriver answered source that is not functions",
+          b"` deriver returned source that is not functions",
         ]),
         b"this derivation",
         [
-          b"a deriver answers the functions it derives and nothing else, each read into the module as if written there",
-          b"it answered: ".concat(source),
+          b"a deriver returns the functions it derives and nothing else, each read into the module as if written there",
+          b"it returned: ".concat(source),
         ],
       ),
     )
@@ -587,14 +587,14 @@ fn report_derive_error(
   expander: Expander,
   definition: DeriveDefinition,
   target: TypeDefinition,
-  refused: Refusal,
+  rejected: Rejection,
 ) -> Expander / {abort.raise} =
   report(
     expander,
     error_at_and(
       b"E0206",
       expander.m,
-      derive_error_span(target, refused.at),
+      derive_error_span(target, rejected.at),
       Bytes::concat_all([
         b"`",
         definition.deriver,
@@ -602,11 +602,11 @@ fn report_derive_error(
         definition.target.name,
         b"`",
       ]),
-      refused.message,
+      rejected.message,
       expander.m,
       definition.span,
       b"required by this derivation",
-      refused.notes,
+      rejected.notes,
     ),
   )
 
@@ -710,14 +710,14 @@ pub fn expand_derives<| e>(
   if !module.items.any(|item: Item| match item { DeriveItem(_) -> true, _ -> false }) {
     { module: module, derived: [], diagnostics: [] }
   } else {
-    let answers = deriver_requests(path, module, previous).map(
+    let results = deriver_requests(path, module, previous).map(
       |x: { span: Span, ask: DeriverRequest }|
         {
           span: x.span,
           result: match library { Some(run) -> run(x.ask), None -> no_runner_failure() },
         },
     );
-    let ex = run_expander(new_expander(m, path, module, previous, answers));
+    let ex = run_expander(new_expander(m, path, module, previous, results));
     {
       module: {
         doc: module.doc,
@@ -734,7 +734,7 @@ pub fn expand_derives<| e>(
 
 fn expand_with_response(
   src: Bytes,
-  answer: DeriverResponse,
+  result: DeriverResponse,
 ) -> { expansion: Expansion, asked: List<DeriverRequest> } / {abort.raise} =
   handle {
     let x = expand_derives(
@@ -743,7 +743,7 @@ fn expand_with_response(
       parse(src).node,
       library: Some(|ask: DeriverRequest| {
         request_log.record(ask);
-        answer
+        result
       }),
     );
     { expansion: x, asked: [] }
@@ -793,10 +793,10 @@ test "a library derivation asks its module's deriver with the module's types, an
   ])
 }
 
-test "a library deriver's refusal, failure, or text that is not functions each report at the derivation" {
+test "a library deriver's rejection, failure, or text that is not functions each report at the derivation" {
   let src = b"import lib.mapping as mapping\ntype Box<a> = | Box(a) | Empty\nderive mapping for Box\n";
-  let codes = |answer: DeriverResponse|
-    expand_with_response(src, answer).expansion.diagnostics.map(|d: Diagnostic| d.code);
+  let codes = |result: DeriverResponse|
+    expand_with_response(src, result).expansion.diagnostics.map(|d: Diagnostic| d.code);
   let report_derive_error = expand_with_response(
     src,
     Declined({ message: b"no", at: Some(b"Empty"), notes: [b"why"] }),

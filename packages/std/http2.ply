@@ -1585,7 +1585,7 @@ type Stream = {
   more: Bool,
   /// A server responded before the request ended, so the stream is reset once the response is sent.
   reset_after: Bool,
-  answered: Bool,
+  returned: Bool,
   since: Int,
   /// When its output began to wait on a closed window, or -1.
   stalled: Int,
@@ -1917,7 +1917,7 @@ fn report(k: ConnectionState) -> ReceiveResult =
     events: k.events.filter(|e: Event|
       match e {
         Requested(r) ->
-          !k.over && (match k.streams.get(r.stream) { Some(st) -> !st.answered, None -> false }),
+          !k.over && (match k.streams.get(r.stream) { Some(st) -> !st.returned, None -> false }),
         _ -> true,
       }),
   }
@@ -2050,7 +2050,7 @@ fn on_data(
       else if flow > st.recv_window { reset_stream(counted, s, FlowControlError, t) }
       else if counted.role == Client && st.status == 0 {
         fail_stream(counted, st, "DATA before the response's head", t)
-      } else if counted.role == Server && st.answered { discard_data(counted, st, end, flow, t) }
+      } else if counted.role == Server && st.returned { discard_data(counted, st, end, flow, t) }
       else { accept_data(counted, st, data, end, flow, t) },
     }
   }
@@ -2117,12 +2117,12 @@ fn remote_ended(k: ConnectionState, st: Stream, t: Int) -> ConnectionState / {ab
         )
       },
       Client -> {
-        let answer = Responded({
+        let result = Responded({
           stream: st.id,
           response: { status: st.status, headers: st.headers, body: Bytes::concat_all(st.body) },
         });
-        if st.phase == LocalClosed { event(drop_stream(k, st, false, t), answer) }
-        else { event(store_stream(k, { ..st, phase: RemoteClosed }), answer) }
+        if st.phase == LocalClosed { event(drop_stream(k, st, false, t), result) }
+        else { event(store_stream(k, { ..st, phase: RemoteClosed }), result) }
       },
     },
   }
@@ -2308,7 +2308,7 @@ fn fresh_stream(k: ConnectionState, s: Int, phase: Phase, request: Request, t: I
     sending: false,
     more: false,
     reset_after: false,
-    answered: false,
+    returned: false,
     since: t,
     stalled: -1,
   }
@@ -2322,7 +2322,7 @@ fn trailers_in(
   t: Int,
 ) -> ConnectionState / {abort.raise} =
   if st.phase == RemoteClosed { reset_stream(k, st.id, StreamClosed, t) }
-  else if k.role == Server && st.answered { discard_data(k, st, end_stream, 0, t) }
+  else if k.role == Server && st.returned { discard_data(k, st, end_stream, 0, t) }
   else if !end_stream || d.size > k.limits.max_header_list_size {
     match k.role {
       Server -> reset_stream(k, st.id, ProtocolError, t),
@@ -2401,7 +2401,7 @@ fn reject_request(
   t: Int,
 ) -> ConnectionState / {abort.raise} =
   match k.streams.get(st.id) {
-    Some(current) -> if current.answered { reset_stream(k, st.id, Cancel, t) }
+    Some(current) -> if current.returned { reset_stream(k, st.id, Cancel, t) }
     else { send_response(k, current, plain_text(status, reason ++ "\n"), t) },
     None -> k,
   }
@@ -2617,7 +2617,7 @@ fn gathered(
       if g.wrong != None { g } else { field_gathered(g, f, allowed, trailing) },
   )
 
-fn wrong(g: Gathering, why: String) -> Gathering = { ..g, wrong: Some(why) }
+fn wrong(g: Gathering, reason: String) -> Gathering = { ..g, wrong: Some(reason) }
 
 fn field_gathered(
   g: Gathering,
@@ -2626,7 +2626,7 @@ fn field_gathered(
   trailing: Bool,
 ) -> Gathering / {abort.raise} =
   match field_flaw(f) {
-    Some(why) -> wrong(g, why),
+    Some(reason) -> wrong(g, reason),
     None -> if f.name.at(0) == b':' {
       let name = String::of_bytes(f.name);
       if trailing { wrong(g, "the pseudo-header `" ++ name ++ "` among trailers") }
@@ -2664,7 +2664,7 @@ fn with_cookies(g: Gathering) -> Headers =
 fn request_of(fields: List<Field>) -> Head / {abort.raise} = {
   let g = gathered(fields, [b":method", b":scheme", b":authority", b":path"], false);
   match g.wrong {
-    Some(why) -> Malformed(why),
+    Some(reason) -> Malformed(reason),
     None -> match g.pseudo.get(b":method") {
       None -> Malformed("no `:method`"),
       Some(m) -> if m == b"CONNECT" { Rejected(501, "CONNECT is not served") }
@@ -2717,7 +2717,7 @@ type ResponseHead = { status: Int, headers: Headers, expected: Option<Int> }
 fn response_of(fields: List<Field>) -> Result<ResponseHead, String> / {abort.raise} = {
   let g = gathered(fields, [b":status"], false);
   match g.wrong {
-    Some(why) -> Err(why),
+    Some(reason) -> Err(reason),
     None -> match g.pseudo.get(b":status") {
       None -> Err("no `:status`"),
       Some(s) -> match s.int_of_ascii() {
@@ -2732,7 +2732,7 @@ fn response_of(fields: List<Field>) -> Result<ResponseHead, String> / {abort.rai
 
 fn trailers_of(fields: List<Field>) -> Result<Headers, String> / {abort.raise} = {
   let g = gathered(fields, [], true);
-  match g.wrong { Some(why) -> Err(why), None -> Ok(with_cookies(g)) }
+  match g.wrong { Some(reason) -> Err(reason), None -> Ok(with_cookies(g)) }
 }
 
 /// The fields a message's header map is sent as. A field the protocol computes or the connection
@@ -2846,7 +2846,7 @@ fn send_response(
     let headed = emit_headers(k, st.id, fields, body.len() == 0);
     let queued = {
       ..st,
-      answered: true,
+      returned: true,
       out: body,
       sent: 0,
       sending: body.len() > 0,
@@ -2939,9 +2939,9 @@ pub fn respond(
 ) -> Connection / {abort.raise} = {
   let k = state_of(c);
   match k.role {
-    Client -> panic("a client answers no request"),
+    Client -> panic("a client handles no request"),
     Server -> match k.streams.get(stream) {
-      Some(st) -> if st.answered || k.over { c }
+      Some(st) -> if st.returned || k.over { c }
       else { Connection(pump(send_response(k, st, r, ms(now)), ms(now))) },
       None -> c,
     },
@@ -2963,9 +2963,9 @@ pub fn respond_head(
   let k = state_of(c);
   let t = ms(now);
   match k.role {
-    Client -> panic("a client answers no request"),
+    Client -> panic("a client handles no request"),
     Server -> match k.streams.get(stream) {
-      Some(st) -> if st.answered || k.over { c } else if status < 200 || status > 999 {
+      Some(st) -> if st.returned || k.over { c } else if status < 200 || status > 999 {
         panic("a response's status is 200 to 999, not " ++ status.to_string())
       } else {
         let has_no_body = status == 204 || status == 304 || st.request.method == "HEAD";
@@ -2978,7 +2978,7 @@ pub fn respond_head(
         let headed = emit_headers(k, st.id, fields, has_no_body);
         let queued = {
           ..st,
-          answered: true,
+          returned: true,
           out: b"",
           sent: 0,
           sending: !has_no_body,
@@ -3129,7 +3129,7 @@ fn timed_out(k: ConnectionState, s: Int, t: Int) -> ConnectionState / {abort.rai
       }
     } else if t - st.since < k.limits.request_timeout_ms { k } else {
       match k.role {
-        Server -> if !st.answered && st.phase == Open {
+        Server -> if !st.returned && st.phase == Open {
           reject_request(
             k,
             st,
@@ -3156,7 +3156,7 @@ fn stream_deadline(k: ConnectionState, st: Stream) -> Int =
   min(
     if st.stalled >= 0 { st.stalled + k.limits.stall_ms } else { largest_window() * 4096 },
     match k.role {
-      Server -> if !st.answered && st.phase == Open { st.since + k.limits.request_timeout_ms }
+      Server -> if !st.returned && st.phase == Open { st.since + k.limits.request_timeout_ms }
       else { largest_window() * 4096 },
       Client -> if st.phase != RemoteClosed { st.since + k.limits.request_timeout_ms }
       else { largest_window() * 4096 },
@@ -3901,7 +3901,7 @@ fn first_value(h: Headers, name: String) -> Option<String> =
 
 type Served = { connection: Connection, frames: List<String>, events: List<Event> }
 
-fn answered_all(
+fn returned_all(
   c: Connection,
   events: List<Event>,
   app: (Request) -> Response / {abort.raise},
@@ -3929,7 +3929,7 @@ fn after(
   app: (Request) -> Response / {abort.raise},
   t: Int,
 ) -> Served / {abort.raise} = {
-  let out = take_output(answered_all(r.connection, r.events, app, t));
+  let out = take_output(returned_all(r.connection, r.events, app, t));
   {
     connection: out.connection,
     frames: s.frames.concat(frames_in(out.bytes).map(shown)),
@@ -4805,7 +4805,7 @@ fn carried(
       let back = receive(c.connection, down.slice(0, m), at(x.step + 1));
       Continue({
         client: back.connection,
-        server: answered_all(heard.connection, heard.events, app, x.step + 1),
+        server: returned_all(heard.connection, heard.events, app, x.step + 1),
         up: up.slice(n, up.len()),
         down: down.slice(m, down.len()),
         events: x.events.concat(back.events),
@@ -4814,7 +4814,7 @@ fn carried(
     }
   })
 
-fn answers(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
+fn results(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
   events.fold([], |acc: List<(Int, Int, String)>, e: Event|
     match e {
       Responded(a) ->
@@ -4832,10 +4832,10 @@ test "a client's requests reach a server, and the responses come back on their s
     [],
     50,
   );
-  assert_eq(answers(e.events), [(1, 200, "GET /a "), (3, 200, "POST /b xyz"), (5, 200, "")]);
+  assert_eq(results(e.events), [(1, 200, "GET /a "), (3, 200, "POST /b xyz"), (5, 200, "")]);
   match e.events.filter(|x: Event| match x { Responded(a) -> a.stream == 5, _ -> false }) {
     [Responded(a)] -> assert_eq(first_value(a.response.headers, "content-length"), Some("8")),
-    _ -> panic("an answer on stream 5"),
+    _ -> panic("a response on stream 5"),
   };
   assert_eq(open_streams(e.client), 0);
   assert_eq(open_streams(e.server), 0)
@@ -4850,7 +4850,7 @@ test "a request's trailers reach the server's application" {
     [],
     50,
   );
-  assert_eq(answers(e.events), [(1, 200, "3")])
+  assert_eq(results(e.events), [(1, 200, "3")])
 }
 
 test "a client rejects a response whose head is malformed, and a server's PUSH_PROMISE" {
@@ -4864,7 +4864,7 @@ test "a client rejects a response whose head is malformed, and a server's PUSH_P
     headers(1, [(":status", "200"), (":path", "/")], true),
   ]);
   let r = receive(sent, reply, at(1));
-  assert_eq(answers(r.events), [
+  assert_eq(results(r.events), [
     (1, 0, "the pseudo-header `:path`, which this message does not take"),
   ]);
   let pushed = receive(
@@ -4892,7 +4892,7 @@ test "a client learns which of its streams a GOAWAY left unprocessed, and opens 
     ]),
     at(1),
   );
-  assert_eq(answers(told.events), [(3, 0 - 1, "REFUSED_STREAM")]);
+  assert_eq(results(told.events), [(3, 0 - 1, "REFUSED_STREAM")]);
   assert_eq(request(told.connection, asking("GET", "/c", b""), at(2)) == None, true)
 }
 
@@ -4946,7 +4946,7 @@ test "a server sends no more DATA than its client's windows allow, however they 
       );
       let start = take_output(server(default_limits(), at(0)));
       let first = receive(start.connection, opening([InitialWindowSize(w)]).concat(gets), at(1));
-      let out = take_output(answered_all(first.connection, first.events, sized, 1));
+      let out = take_output(returned_all(first.connection, first.events, sized, 1));
       let opened_ledger = tallied(
         { connection: out.connection, sent: Map::new(), granted: Map::new(), held: true },
         out.bytes,
@@ -4998,7 +4998,7 @@ fn multiplexed(
   inbox: Chan<(Int, Response)>,
   fuel: Int,
 ) -> Ends / {task.spawn, task.send, task.select, task.recv, abort.raise} =
-  if fuel <= 0 || answers(e.events).len() >= 2 { e } else {
+  if fuel <= 0 || results(e.events).len() >= 2 { e } else {
     let c = take_output(e.client);
     let s = take_output(e.server);
     let heard = receive(s.connection, c.bytes, at(1));
@@ -5006,7 +5006,7 @@ fn multiplexed(
     let back = receive(c.connection, s.bytes, at(1));
     let quiet = c.bytes.len() == 0 && s.bytes.len() == 0;
     let ready = match task.select([(inbox, None)], quiet) {
-      Some((_, Some(answer))) -> Some(answer),
+      Some((_, Some(result))) -> Some(result),
       _ -> None,
     };
     let server_now = match ready {
@@ -5029,7 +5029,7 @@ test "two responses larger than their windows finish under every interleaving of
       inbox,
       40,
     );
-    assert_eq(answers(e.events).sort(), [
+    assert_eq(results(e.events).sort(), [
       (1, 200, String::of_bytes(b"x".repeat(50))),
       (3, 200, String::of_bytes(b"x".repeat(45))),
     ])

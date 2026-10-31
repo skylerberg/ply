@@ -1,5 +1,5 @@
 import compiler.front.facts (Analysis)
-import compiler.front.seam (Analysed, Refused)
+import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.rows (module_of)
 import compiler.store.hash.encoding (hex)
 import compiler.check.infer.checker (DefinitionInfo)
@@ -11,7 +11,7 @@ import compiler.load (SourceFile)
 import compiler.syntax.parsing
 import compiler.check.resolve
 import compiler.check.resolve.tables (ParsedModule, qualify)
-import compiler.check.types (row_text, scheme_text)
+import compiler.check.types (effects_text, scheme_text)
 import compiler.unit (shipped)
 import std.bytes
 import std.list
@@ -26,7 +26,7 @@ pub type Limits = new { files: Int, bytes: Int }
 pub type InputError = | TooManyFiles(Int) | TooManyBytes(Int) | NotAModule(String, String)
 
 pub effect checker {
-  raise fail(why: InputError)
+  raise fail(reason: InputError)
 }
 
 pub effect set Shipped = {shipped.names, shipped.module, shipped.report_reached}
@@ -62,7 +62,7 @@ fn validate_sources(
     sources.map(|source: Source|
       match module_of(source.path) {
         Ok(module) -> { path: source.path, name: module, text: source.text },
-        Err(why) -> checker.fail(NotAModule(source.path, why)),
+        Err(reason) -> checker.fail(NotAModule(source.path, reason)),
       })
   }
 }
@@ -138,7 +138,7 @@ fn function(
     path: file_at(files, definition.at.module).path,
     span: { start: definition.at.span.start, end: definition.at.span.end },
     signature: String::of_bytes_lossy(scheme_text(definition.scheme)),
-    row: String::of_bytes_lossy(row_text({ atoms: definition.effects, tail: None })),
+    row: String::of_bytes_lossy(effects_text({ listed: definition.effects, variable: None })),
     hash: hash_in(tables, definition.name),
     references: references_in(tables, definition.name),
   }
@@ -221,21 +221,21 @@ pub fn checked(
   limits: Limits,
 ) -> CheckResult / {checker.fail, Shipped, abort.raise} = {
   let own = validate_sources(sources, limits);
-  let answered = load::analyse_in_memory(own, Map::new());
-  match answered.out {
-    Refused(diagnostics) ->
+  let returned = load::analyse_in_memory(own, Map::new());
+  match returned.out {
+    Rejected(diagnostics) ->
       {
         ok: false,
         diagnostics: diagnostics.map(|diagnostic: tables::Diagnostic|
-          diagnostic_of(answered.files, diagnostic)),
+          diagnostic_of(returned.files, diagnostic)),
         definitions: [],
       },
     Analysed(analysis) ->
       {
         ok: true,
         diagnostics: analysis.warnings.map(|diagnostic: tables::Diagnostic|
-          diagnostic_of(answered.files, diagnostic)),
-        definitions: definitions_of(answered.files, own.map(|f: SourceFile| f.name), analysis),
+          diagnostic_of(returned.files, diagnostic)),
+        definitions: definitions_of(returned.files, own.map(|f: SourceFile| f.name), analysis),
       },
   }
 }
@@ -334,21 +334,21 @@ fn shipped_reach(
   }
 }
 
-test "a program that checks answers each definition's kind, place, type, row, hash and references" {
-  let answered = alone(shop());
-  assert(answered.ok);
-  assert_eq(answered.diagnostics, []);
-  assert_eq(names_of(answered).filter(|n: String| !n.starts_with("std.")).sort(), [
+test "a program that checks returns each definition's kind, place, type, effects, hash and references" {
+  let returned = alone(shop());
+  assert(returned.ok);
+  assert_eq(returned.diagnostics, []);
+  assert_eq(names_of(returned).filter(|n: String| !n.starts_with("std.")).sort(), [
     "main.basket",
     "main.main",
     "shop.prices.Price",
     "shop.prices.cents",
     "shop.prices.total",
   ]);
-  let shipped = shipped_reach(answered, ["main", "shop.prices"]);
+  let shipped = shipped_reach(returned, ["main", "shop.prices"]);
   assert(shipped.listed.len() > 0);
   assert_eq(shipped.listed, shipped.reached);
-  let total = found(answered, "shop.prices.total");
+  let total = found(returned, "shop.prices.total");
   assert_eq(total.kind, Function);
   assert_eq(total.module, "shop.prices");
   assert_eq(total.simple_name, "total");
@@ -363,23 +363,23 @@ test "a program that checks answers each definition's kind, place, type, row, ha
   assert(
     total.references.any(|r: String|
       r.starts_with("std.")
-        && (match definition(answered, r) {
+        && (match definition(returned, r) {
           Some(d) -> d.simple_name == "List::fold",
           None -> false,
         })),
   );
-  assert_eq(found(answered, "shop.prices.Price").kind, Type);
-  assert_eq(callers(answered, "shop.prices.total"), ["main.main"]);
-  assert_eq(callers(answered, "shop.prices.cents"), ["shop.prices.total"])
+  assert_eq(found(returned, "shop.prices.Price").kind, Type);
+  assert_eq(callers(returned, "shop.prices.total"), ["main.main"]);
+  assert_eq(callers(returned, "shop.prices.cents"), ["shop.prices.total"])
 }
 
-test "a program that does not check answers its diagnostics as values, placed in the source they are about" {
-  let answered = alone([
+test "a program that does not check returns its diagnostics as values, placed in the source they are about" {
+  let returned = alone([
     { path: "m.ply", text: b"fn one() -> Int = 1\n\nfn two() -> Int = \"two\"\n" },
   ]);
-  assert(!answered.ok);
-  assert_eq(answered.definitions, []);
-  match answered.diagnostics.at(0) {
+  assert(!returned.ok);
+  assert_eq(returned.definitions, []);
+  match returned.diagnostics.at(0) {
     None -> panic("a type error is reported"),
     Some(d) -> {
       assert_eq(d.code, "E0201");
@@ -404,7 +404,7 @@ test "a syntax error is the parser's diagnostic, and a warning leaves the progra
   assert_eq(unused.diagnostics.map(|d: Diagnostic| d.severity), [Warning])
 }
 
-test "sources past a limit, and a path that names no module, are refused before anything is read" {
+test "sources past a limit, and a path that names no module, are rejected before anything is read" {
   let two: List<Source> = [
     { path: "a.ply", text: b"fn a() -> Int = 1\n" },
     { path: "b.ply", text: b"fn b() -> Int = 2\n" },
@@ -417,11 +417,11 @@ test "sources past a limit, and a path that names no module, are refused before 
   })
 }
 
-test "an import of a shipped module is an error where none ships, as `check_alone` answers" {
-  let answered = alone([
+test "an import of a shipped module is an error where none ships, as `check_alone` returns" {
+  let returned = alone([
     { path: "m.ply", text: b"import std.list\n\nfn main() -> Int = [1].at_or(0, 2)\n" },
   ]);
-  assert_eq(answered.diagnostics.map(|d: Diagnostic| d.code), ["E0106"])
+  assert_eq(returned.diagnostics.map(|d: Diagnostic| d.code), ["E0106"])
 }
 
 test "a rename, a reformat and a comment move no hash, and an edit moves what reaches it" {

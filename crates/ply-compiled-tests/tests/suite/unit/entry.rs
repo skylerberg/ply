@@ -1,5 +1,5 @@
-//! A unit entered at a root on a context of its own, with no front end: the answer as the bytes its
-//! `R#entered` wrote, a failure as the entry's own, and what can never leave its run refused. Each
+//! A unit entered at a root on a context of its own, with no front end: the result as the bytes its
+//! `R#entered` wrote, a failure as the entry's own, and what can never leave its run rejected. Each
 //! unit here is written by hand (`crate::units`), so no program is compiled.
 
 use crate::units::{self, Def, def, int_entry, lifting, native};
@@ -75,7 +75,7 @@ pub fn encoded_defs() -> Vec<Def> {
             "m.fail#entered",
             0,
             &format!(
-                // An `assert` failing with the text it was handed, numbered as `REFUSED` numbers it.
+                // An `assert` failing with its message, numbered as `REJECTED` numbers it.
                 "{}  {}(ctx, 21, (Word)(intptr_t)buf, n, 0, 0);\n  return 0;",
                 lifting(&string_read()),
                 native("?refused_text"),
@@ -142,48 +142,48 @@ fn a_root_that_takes_nothing_is_handed_the_empty_list() {
     assert_eq!(entry::NO_ARGUMENTS, ints(&[]));
 }
 
-/// The bytes `root` answered over `arguments`.
-fn answered(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Result<Vec<u8>, String> {
+/// The bytes `root` returned over `arguments`.
+fn returned(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Result<Vec<u8>, String> {
     match entry::enter(opened, root, arguments, run, None, None).ended {
-        Ended::Answered(bytes) => Ok(bytes),
+        Ended::Returned(bytes) => Ok(bytes),
         Ended::Failed(d) => Err(format!("failed: {d}")),
-        Ended::Panicked(why) => Err(format!("panicked: {why}")),
+        Ended::Panicked(reason) => Err(format!("panicked: {reason}")),
         Ended::NoRoot => Err("no root".to_string()),
-        Ended::Unanswerable(why) => Err(format!("unanswerable: {why}")),
+        Ended::NotReturnable(reason) => Err(format!("not returnable: {reason}")),
     }
 }
 
-/// The `Int` the bytes of an answer are.
+/// The `Int` the bytes of a result are.
 fn int_of(bytes: &[u8]) -> i64 {
-    let mut r = Reader::new(bytes).expect("the answer opens with the format");
+    let mut r = Reader::new(bytes).expect("the result opens with the format");
     r.expect(tag::INT).expect("an `Int`");
     let n = r.int().expect("an `Int`'s body");
-    r.end().expect("the `Int` is the whole answer");
+    r.end().expect("the `Int` is the whole result");
     n
 }
 
-/// What `root` answered over the `Int`s `xs`, read as the `Int` it answers.
-fn int_answered(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i64, String> {
-    answered(opened, root, ints(xs), run).map(|bytes| int_of(&bytes))
+/// What `root` returned over the `Int`s `xs`, read as the `Int` it returns.
+fn int_returned(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i64, String> {
+    returned(opened, root, ints(xs), run).map(|bytes| int_of(&bytes))
 }
 
 /// A root is entered through its `R#entered`: the arguments cross in as their list's encoding, and
-/// the answer out as the bytes the entry wrote, whatever its type.
+/// the result out as the bytes the entry wrote, whatever its type.
 #[test]
-fn a_root_answers_the_bytes_its_entry_wrote() {
+fn a_root_returns_the_bytes_its_entry_wrote() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
     };
-    assert_eq!(int_answered(&opened, "m.double", &[21], &run()), Ok(42));
-    let greeted = answered(
+    assert_eq!(int_returned(&opened, "m.double", &[21], &run()), Ok(42));
+    let greeted = returned(
         &opened,
         "m.greet",
         arguments(1, |w| w.str("héllo".as_bytes())),
         &run(),
     )
-    .expect("`m.greet` answers");
-    let mut r = Reader::new(&greeted[..]).expect("the answer opens with the format");
+    .expect("`m.greet` returns");
+    let mut r = Reader::new(&greeted[..]).expect("the result opens with the format");
     r.expect(tag::RECORD).unwrap();
     assert_eq!(r.count().unwrap(), 2);
     assert_eq!(r.symbol().unwrap().as_str(), "length");
@@ -204,7 +204,7 @@ fn a_unit_is_entered_only_at_its_roots() {
     };
     for root in ["m.helper", "m.double#entered", "m.nothing"] {
         assert_eq!(
-            int_answered(&opened, root, &[1], &run()),
+            int_returned(&opened, root, &[1], &run()),
             Err("no root".to_string()),
             "{root}"
         );
@@ -215,22 +215,22 @@ fn a_unit_is_entered_only_at_its_roots() {
 /// A function the program wrote, or a runtime object written as a handle, cannot leave the entry
 /// that holds it.
 #[test]
-fn an_answer_holding_a_function_or_a_handle_stays_in_its_run() {
+fn a_result_holding_a_function_or_a_handle_stays_in_its_run() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
     };
     assert_eq!(
-        answered(&opened, "m.closure", ints(&[]), &run()),
-        Err("unanswerable: its answer holds a function the program wrote".to_string())
+        returned(&opened, "m.closure", ints(&[]), &run()),
+        Err("not returnable: its result holds a function the program wrote".to_string())
     );
     assert_eq!(
-        answered(&opened, "m.keep", ints(&[]), &run()),
-        Err("unanswerable: its answer holds a handle of its run".to_string())
+        returned(&opened, "m.keep", ints(&[]), &run()),
+        Err("not returnable: its result holds a handle of its run".to_string())
     );
 }
 
-/// A raise inside an entry is the entry's alone, whatever crossings it left open, and the next entry
+/// A raise in an entry is the entry's alone, whatever marshalling it left open, and the next entry
 /// of the unit runs as if it had not happened.
 #[test]
 fn a_raise_ends_its_entry_and_no_other() {
@@ -239,10 +239,10 @@ fn a_raise_ends_its_entry_and_no_other() {
         return;
     };
     for _ in 0..2 {
-        let raised = answered(&opened, "m.fail", arguments(1, |w| w.str(b"no")), &run())
+        let raised = returned(&opened, "m.fail", arguments(1, |w| w.str(b"no")), &run())
             .expect_err("a failed assertion raises");
         assert!(raised.contains("no"), "{raised}");
-        assert_eq!(int_answered(&opened, "m.double", &[5], &run()), Ok(10));
+        assert_eq!(int_returned(&opened, "m.double", &[5], &run()), Ok(10));
     }
 }
 
@@ -256,10 +256,10 @@ fn an_entry_inside_another_runs_on_a_context_of_its_own() {
     };
     let mut outer = crate::bare::context();
     outer.begin();
-    assert_eq!(int_answered(&opened, "m.double", &[8], &run()), Ok(16));
+    assert_eq!(int_returned(&opened, "m.double", &[8], &run()), Ok(16));
     assert_eq!(outer.heap.live(), 0);
     outer.end();
-    assert_eq!(int_answered(&opened, "m.double", &[9], &run()), Ok(18));
+    assert_eq!(int_returned(&opened, "m.double", &[9], &run()), Ok(18));
 }
 
 /// An entry on a program thread nests on that thread's stack, however little stack the thread that
@@ -276,7 +276,7 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
         .spawn(move || {
             entry::on_program_thread(|| {
                 match entry::enter(&opened, "m.ladder", ints(&[100_000]), &deep, None, None).ended {
-                    Ended::Answered(bytes) => Some(bytes),
+                    Ended::Returned(bytes) => Some(bytes),
                     _ => None,
                 }
             })
@@ -287,7 +287,7 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
     assert_eq!(asked.flatten().map(|bytes| int_of(&bytes)), Some(100_000));
 }
 
-/// A test's entry that answered says how many of its objects nothing let go of, and any other entry
+/// A test's entry that returned says how many of its objects nothing let go of, and any other entry
 /// counts none.
 #[test]
 fn a_tests_entry_counts_the_objects_it_left_live() {
@@ -311,7 +311,7 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
     let live = |root: &str, tested: bool| {
         let run = Run { tested, ..run() };
         let o = entry::enter(&opened, root, ints(&[1]), &run, None, None);
-        assert!(matches!(o.ended, Ended::Answered(_)), "`{root}` answered");
+        assert!(matches!(o.ended, Ended::Returned(_)), "`{root}` returned");
         o.usage.live
     };
     assert_eq!([live("m.kept", true), live("m.freed", true)], [1, 0]);
@@ -322,19 +322,19 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
     );
 }
 
-/// A task in an entry's answer is refused at the boundary as a continuation is: the region it is a
+/// A task an entry returns is rejected at the boundary like a continuation: the scheduler it is a
 /// key into ended before the entry did.
 #[test]
-fn a_task_in_an_entrys_answer_is_refused_at_the_boundary() {
+fn a_task_in_an_entrys_result_is_rejected_at_the_boundary() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
     };
     match entry::enter(&opened, "m.spawned", ints(&[]), &run(), None, None).ended {
         Ended::Failed(d) => {
-            assert_eq!(d.code, ply_core::codes::REGION_ESCAPE_AT_BOUNDARY, "{d}");
-            assert!(d.message.contains("`m.spawned` answered a `Task`"), "{d}");
+            assert_eq!(d.code, ply_core::codes::SCHEDULER_ESCAPE_AT_BOUNDARY, "{d}");
+            assert!(d.message.contains("`m.spawned` returned a `Task`"), "{d}");
         }
-        _ => panic!("the boundary did not refuse the task"),
+        _ => panic!("the boundary did not reject the task"),
     }
 }

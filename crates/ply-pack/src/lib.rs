@@ -1,5 +1,5 @@
 //! What a native Ply program carries after its code: the shipped modules a load of another program
-//! compiles against, what they answer below [`ANSWERS`], and the program's own front end, each a
+//! compiles against, their results below [`ANSWERS`], and the program's own front end, each a
 //! file keyed by its path. `ply bootstrap` appends one to every program it links; the program maps
 //! it back at startup.
 //!
@@ -18,7 +18,7 @@ const MODULE: &str = ".ply";
 /// The compiler's own modules, `emit/roots.ply` being `compiler.emit.roots`.
 pub const COMPILER: &str = "compiler";
 
-/// What every shipped module answers, as `ply std --answers` writes it: a file of zstd frames and
+/// Shipped modules' cached results, as `ply std --answers` writes them: a file of zstd frames and
 /// its index, itself one frame.
 pub const ANSWERS: &str = "answers";
 
@@ -86,10 +86,10 @@ impl Pack {
             .map(|entry| &self.mapped[entry.at..entry.at + entry.len])
     }
 
-    /// What the zstd frame `len` bytes long at `offset` of the answers' file `path` holds; a `len`
+    /// What the zstd frame `len` bytes long at `offset` of the cached file `path` holds; a `len`
     /// of 0 reads to the file's end. `None` where there is no such file, the range runs past it, or
     /// its bytes are not whole frames.
-    pub fn answer(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
+    pub fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
         let file = self.bytes(&format!("{ANSWERS}/{path}"))?;
         let end = if len == 0 {
             file.len()

@@ -1,6 +1,6 @@
 //! What this runtime says of itself to a compiler that emits code for it, in the form
 //! `compiler.emit.abi.runtime_of` reads: what a unit emitted against it is a function of, each
-//! native and helper it binds with what its function's type takes and answers, where it lays out
+//! native and helper it binds with what its function's type takes and returns, where it lays out
 //! what emitted code reads in place, each as a named integer, and the diagnostic codes it raises.
 
 use super::prelude::{machine_natives, own_helpers};
@@ -67,7 +67,7 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("count.shared", heap::SHARED as usize),
         ("pointer_floor", heap::POINTER_FLOOR as usize),
         ("release_depth", crate::rt::RELEASE_DEPTH as usize),
-        ("hold.held", crate::rt::HOLD_HELD),
+        ("hold.held", crate::rt::SCOPED_VALUE),
         ("closure.descriptor", heap::CLOSURE_CODE),
         ("failed.target", crate::rt::FAILED_TARGET as usize),
         ("failed.pending", crate::rt::FAILED_PENDING as usize),
@@ -83,8 +83,8 @@ fn facts() -> Vec<(&'static str, usize)> {
 }
 
 fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
-    let answer = s.answer.map_or("-", Machine::name);
-    let _ = write!(out, "{kind} {name} {} {answer}", u8::from(s.raises));
+    let result = s.result.map_or("-", Machine::name);
+    let _ = write!(out, "{kind} {name} {} {result}", u8::from(s.raises));
     for p in s.params {
         let _ = write!(out, " {}", p.name());
     }

@@ -67,7 +67,7 @@ impl Driver {
     fn exit(&self, who: EntryPoint, channel: &str, id: i64) -> Result<(), Diagnostic> {
         self.trace
             .exit((who.machine, who.task), channel, id, Outcome::Ok)
-            .map_err(|why| err_unbalanced(Span::DUMMY, "`trace.exit`", id, &why))
+            .map_err(|reason| err_unbalanced(Span::DUMMY, "`trace.exit`", id, &reason))
     }
 
     fn event(&self, who: EntryPoint, channel: &str, name: &str) {
@@ -261,7 +261,7 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
         .expect_err("a forged span is `E0445`");
     assert_eq!(alone.code, codes::SPAN_UNBALANCED);
     assert!(
-        rendered(&alone).contains("no `trace.enter` in this entry point has answered that id"),
+        rendered(&alone).contains("no `trace.enter` in this entry point has returned that id"),
         "{}",
         rendered(&alone)
     );
@@ -302,14 +302,14 @@ fn a_span_open_on_another_task_of_the_same_entry_point_still_names_it() {
     let d = driver();
     let mine = entry_point();
     let theirs = d.enter(mine.in_task(1), "orders", "place_order");
-    let refused = d
+    let rejected = d
         .exit(mine.in_task(2), "orders", theirs)
         .expect_err("another task's span is `E0445`");
-    assert_eq!(refused.code, codes::SPAN_UNBALANCED);
+    assert_eq!(rejected.code, codes::SPAN_UNBALANCED);
     assert!(
-        rendered(&refused).contains("task @1"),
+        rendered(&rejected).contains("task @1"),
         "{}",
-        rendered(&refused)
+        rendered(&rejected)
     );
 }
 
@@ -366,7 +366,7 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
                 for _ in 0..100 {
                     assert_eq!(shared.get("SERVICE_REGION"), Some("eu"));
                     assert_eq!(shared.get("SERVICE_PORT"), Some("8137"));
-                    // The `SSecret` gate: `config.get` answers `None` whatever the sources hold.
+                    // The `SSecret` gate: `config.get` returns `None` whatever the sources hold.
                     assert_eq!(shared.get("SERVICE_API_KEY"), None);
                     assert_eq!(shared.get("NOTHING_SUPPLIED"), None);
                 }
@@ -400,7 +400,7 @@ fn listen(net: &TcpHost) -> i64 {
         .expect("a loopback port")
 }
 
-/// What a listener's next `accept` answers, its job run here.
+/// What a listener's next `accept` returns, its job run here.
 fn accepted(net: &TcpHost, listener: i64) -> i64 {
     let job = net
         .accept(LISTENER, listener, Span::DUMMY)
@@ -440,7 +440,7 @@ fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
     assert!(!untouched.second_requested());
 }
 
-/// `ply test` builds exactly such a `Host`; the park loop and the deadlock check read this answer.
+/// `ply test` builds exactly such a `Host`; the park loop and the deadlock check read this result.
 #[test]
 fn a_host_with_no_coordinator_is_never_stopping() {
     let stopping = Shutdown::new(Bounds::default());
@@ -488,7 +488,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     assert_eq!(
         accepted(&net, listener),
         0,
-        "a run that was already stopping when the socket table arrived answers 0, which is what \
+        "a run that was already stopping when the socket table arrived returns 0, which is what \
          ends a sequential accept loop"
     );
     assert_eq!(
@@ -531,7 +531,7 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     assert_eq!(
         accepted(&net, listener),
         0,
-        "a listener the drain closed answers 0, which is what ends a sequential accept loop"
+        "a listener the drain closed returns 0, which is what ends a sequential accept loop"
     );
 }
 
@@ -547,7 +547,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
 
     impl Accepting for SlowToWake {
         fn stop_accepting(&self) -> usize {
-            // The socket table's flag goes up and `net.accept` answers `0` from here.
+            // The socket table's flag goes up and `net.accept` returns `0` from here.
             self.stopped.fetch_add(1, Ordering::Release);
             1
         }
@@ -575,7 +575,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
     assert!(shutdown.request(ShutdownSignal::Terminate));
 
-    // Wait until the run stops: every `net.accept` answers `0`.
+    // Wait until the run stops: every `net.accept` returns `0`.
     let until = Instant::now() + Duration::from_secs(5);
     while net.stopped.load(Ordering::Acquire) == 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(1));

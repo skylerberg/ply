@@ -22,10 +22,10 @@ pub struct Detached {
     resumer_sp: usize,
     resumer_current: usize,
     request: Option<Stopped>,
-    answer: Word,
+    result: Word,
     /// Owned here, not by the entry frame, which never returns where the body is abandoned.
     body: Word,
-    /// The block whose objects the body and clauses hold for what their rows take around the
+    /// The block whose objects the body and clauses hold for what their effects take around the
     /// `handle`, kept as the body is.
     forwards: Option<Word>,
     starting: Option<Word>,
@@ -152,7 +152,7 @@ enum Stopped {
     Failed,
 }
 
-/// `rt_detached_open`: runs the body of a `handle` on a fresh stack until it stops or ends; answers
+/// `rt_detached_open`: runs the body of a `handle` on a fresh stack until it stops or ends; returns
 /// the `handle`'s value, its landing the body's own. Takes `body` and `forwards`, the body's
 /// forwarding block where it has one; holds `instance`, the counted block of the `handle`'s
 /// instance, once more, writing the body's place into its head.
@@ -192,7 +192,7 @@ pub(crate) unsafe fn open_over(
         resumer_sp: 0,
         resumer_current: 0,
         request: None,
-        answer: 0,
+        result: 0,
         body,
         forwards,
         starting: Some(body),
@@ -289,8 +289,8 @@ fn vars_let_go(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
 }
 
 /// `rt_detached_perform`: the body of the `handle` the instance of clause record `record` belongs
-/// to stops at a perform the clause answers off its tail, `args` its words and `resource` its
-/// label's field-table entry; the clause runs where the body was entered or resumed from. Answers
+/// to stops at a perform the clause handles off its tail, `args` its words and `resource` its
+/// label's field-table entry; the clause runs where the body was entered or resumed from. Returns
 /// what `k` is resumed with.
 pub(crate) unsafe fn stop_over(
     ctx: *mut Ctx,
@@ -325,12 +325,12 @@ pub(crate) unsafe fn stop_over(
     unsafe { stopped(ctx, id, closure, bound) }
 }
 
-/// Runs the body from where it stopped, `answer` returned from its `perform`, until it stops again.
+/// Runs the body from where it stopped, `result` returned from its `perform`, until it stops again.
 pub(crate) unsafe fn resume(
     ctx: *mut Ctx,
     id: usize,
     capture: Option<usize>,
-    answer: Option<Word>,
+    result: Option<Word>,
 ) -> Word {
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
@@ -365,8 +365,8 @@ pub(crate) unsafe fn resume(
     }
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
-    if let Some(a) = answer {
-        d.answer = a;
+    if let Some(a) = result {
+        d.result = a;
     }
     d.resumer_current = c.current;
     d.state = State::Running;
@@ -395,7 +395,7 @@ pub(crate) unsafe fn resume(
             let r = call_clause(ctx, closure, args);
             let c = unsafe { &mut *ctx };
             c.kept_back(here);
-            settle(c, id);
+            release_if_finished(c, id);
             drain(ctx);
             r
         }
@@ -424,7 +424,7 @@ pub(crate) unsafe fn resume(
 
 /// A finished body over an instance lets go of it once no clause of its `handle` runs, since a
 /// running clause reads its variables through it.
-fn settle(c: &mut Ctx, id: usize) {
+fn release_if_finished(c: &mut Ctx, id: usize) {
     let running = clause_running(c, id);
     let d = &mut c.detached[id];
     if d.state == State::Done
@@ -462,10 +462,10 @@ fn give_back(c: &mut Ctx, id: usize) {
     if let Some(block) = c.detached[id].forwards.take() {
         unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
     }
-    settle(c, id);
+    release_if_finished(c, id);
 }
 
-/// Records the stop the body just made, and answers its capture's index.
+/// Records the stop the body just made, and returns its capture's index.
 fn capture_stop(ctx: *mut Ctx, id: usize) -> usize {
     let d = &mut unsafe { &mut *ctx }.detached[id];
     d.captures.push(Capture { vars: Vec::new() });
@@ -474,7 +474,7 @@ fn capture_stop(ctx: *mut Ctx, id: usize) -> usize {
     k
 }
 
-/// The body's perform: hands the clause to whoever resumed the body, and answers what `k` got.
+/// The body's perform: hands the clause to whoever resumed the body, and returns what `k` got.
 /// Nothing that needs letting go may be owned across the switch: a body abandoned here never
 /// returns to let it go.
 unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>) -> Word {
@@ -488,7 +488,7 @@ unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>) -> W
     let from = &mut d.sp as *mut usize;
     unsafe { switch_keeping(ctx, from, to) };
     let c = unsafe { &mut *ctx };
-    std::mem::take(&mut c.detached[id].answer)
+    std::mem::take(&mut c.detached[id].result)
 }
 
 extern "C" fn entry(arg: usize) {
@@ -510,7 +510,7 @@ extern "C" fn entry(arg: usize) {
         c.frames = frames::base();
         (id, body)
     };
-    // The body ends in its `handle`'s landing, which answers what unwinds to it.
+    // The body ends in its `handle`'s landing, which returns what unwinds to it.
     let r = call_fun(ctx, body, &[]);
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
@@ -592,7 +592,7 @@ unsafe extern "C" fn token_released(ctx: *mut Ctx, k: Handed) -> Word {
     0
 }
 
-/// A continuation is its entry's: it crosses to no other thread and is kept past no entry.
+/// A continuation is its entry's: it is marshalled to no other thread and is kept past no entry.
 unsafe extern "C" fn crosses_nowhere(_ctx: *mut Ctx, _k: Word) -> Word {
     0
 }
@@ -699,7 +699,7 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
 }
 
 /// `E0505`: a continuation resumed after it was resumed once. Its type is a `once` function, so
-/// the check refuses a program that could.
+/// the check rejects a program that could.
 #[cold]
 #[inline(never)]
 fn err_resumed_again() -> Diagnostic {
@@ -707,7 +707,7 @@ fn err_resumed_again() -> Diagnostic {
         codes::INTERNAL_ERROR,
         "a continuation was resumed a second time",
     )
-    .note("a continuation is a `once` function, so the check should have refused a second call")
+    .note("a continuation is a `once` function, so the check should have rejected a second call")
     .note("this is Ply's fault, not the program's")
 }
 

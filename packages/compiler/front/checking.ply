@@ -13,7 +13,7 @@ import compiler.store.packs
 import compiler.unit (definition_hash)
 import compiler.front.owner_checks
 import compiler.check.types (tables_joined)
-import compiler.front.seam (AnalysisOutcome, Analysed, Refused)
+import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
 import compiler.front.rows (Rows, Outline)
 import compiler.front (Published, published, ShippedWants, shipped_wants_bin)
 import compiler.front.published (no_rows, decode_rows, analyse, analyse_with, squats)
@@ -61,8 +61,8 @@ pub type LoadInputs = {
 
 fn embedding_of(read: EmbedBytesResult) -> Embedding =
   match read {
-    Ok(files) -> { files: files.map(|f: EmbedBytes| embed_file(f.name, f.bytes)), refused: None },
-    Err(why) -> { files: [], refused: Some(why) },
+    Ok(files) -> { files: files.map(|f: EmbedBytes| embed_file(f.name, f.bytes)), rejected: None },
+    Err(reason) -> { files: [], rejected: Some(reason) },
   }
 
 pub fn load_inputs_of(
@@ -210,13 +210,13 @@ pub fn facts_of_result(a: ModuleResult) -> ModuleFacts / {abort.raise} =
 pub fn checked_program_from_results(
   frame: Frame,
   reads: TableReads,
-  answers: Map<Bytes, ModuleResult>,
+  results: Map<Bytes, ModuleResult>,
 ) -> CheckedProgram / {abort.raise} =
   checked_program_over(
     frame,
     reads,
     frame.outlines.map(|o: Outline|
-      match answers.get(o.name) { Some(a) -> tables_of_result(a), None -> no_module_tables() }),
+      match results.get(o.name) { Some(a) -> tables_of_result(a), None -> no_module_tables() }),
   )
 
 pub type LoadResults = { results: List<CheckedModule>, pulled: List<Bytes> }
@@ -229,16 +229,16 @@ pub fn query_load(
   run: Run,
 ) -> { run: Run, value: LoadResults } / {RunEffects, abort.raise} = {
   let cycles = cycles_among(qs, run, own);
-  if cycles.refused.len() > 0 {
-    { run: cycles.run, value: { results: cycles.refused, pulled: [] } }
+  if cycles.rejected.len() > 0 {
+    { run: cycles.run, value: { results: cycles.rejected, pulled: [] } }
   } else {
     let ask = |r: Run, named: ModuleKey| {
       let a = query_output(qs, r, module_query(), bin::encode(named, module_key_bin()));
       {
         run: a.run,
-        answered: {
+        returned: {
           module: named.module,
-          result: decoded(a.output, module_result_bin(), "a module's answer"),
+          result: decoded(a.output, module_result_bin(), "a module's result"),
         },
       }
     };
@@ -248,13 +248,13 @@ pub fn query_load(
       own.map(|n: Bytes| { module: n, shipped: false, tested: false }),
     );
     let asked_own = ordered.order.fold(
-      { run: ordered.run, answered: Map::new(), written: Map::new(), stopped: Map::new() },
-      |acc: { run: Run, answered: Map<Bytes, CheckedModule>, written: Map<Bytes, List<Bytes>>, stopped: Map<Bytes, Bool> }, n: ModuleKey| {
+      { run: ordered.run, returned: Map::new(), written: Map::new(), stopped: Map::new() },
+      |acc: { run: Run, returned: Map<Bytes, CheckedModule>, written: Map<Bytes, List<Bytes>>, stopped: Map<Bytes, Bool> }, n: ModuleKey| {
         let imports = match ordered.edges.get(n.module) { Some(ms) -> ms, None -> [] };
         if imports.fold(false, |b: Bool, m: Bytes| b || acc.stopped.contains(m)) {
           {
             ..acc,
-            answered: acc.answered.insert(n.module, {
+            returned: acc.returned.insert(n.module, {
               module: n.module,
               result: { ..absent(n.module), imports: imports },
             }),
@@ -264,9 +264,9 @@ pub fn query_load(
           let a = ask(acc.run, n);
           {
             run: a.run,
-            answered: acc.answered.insert(n.module, a.answered),
-            written: acc.written.insert(n.module, a.answered.result.shape.written),
-            stopped: if a.answered.result.refused.len() == 0 { acc.stopped }
+            returned: acc.returned.insert(n.module, a.returned),
+            written: acc.written.insert(n.module, a.returned.result.shape.written),
+            stopped: if a.returned.result.rejected.len() == 0 { acc.stopped }
             else { acc.stopped.insert(n.module, true) },
           }
         }
@@ -275,9 +275,9 @@ pub fn query_load(
     let first = {
       run: asked_own.run,
       results: own.map(|n: Bytes|
-        match asked_own.answered.get(n) {
+        match asked_own.returned.get(n) {
           Some(a) -> a,
-          None -> panic("each own module is answered"),
+          None -> panic("each own module is checked"),
         }),
       written: asked_own.written,
     };
@@ -297,8 +297,8 @@ pub fn query_load(
                 {
                   ..acc,
                   run: a.run,
-                  results: acc.results.push(a.answered),
-                  written: acc.written.insert(n, a.answered.result.shape.written),
+                  results: acc.results.push(a.returned),
+                  written: acc.written.insert(n, a.returned.result.shape.written),
                 }
               },
             ),
@@ -378,27 +378,27 @@ pub fn shipped_all(
   qs: Map<Bytes, CheckQuery>,
   shipped: List<Bytes>,
   run: Run,
-) -> { run: Run, refused: List<CheckedModule> } / {RunEffects, abort.raise} = {
+) -> { run: Run, rejected: List<CheckedModule> } / {RunEffects, abort.raise} = {
   let ordered = dependencies_first(
     qs,
     run,
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   );
   let asked = ordered.order.fold(
-    { run: ordered.run, refused: [] },
-    |acc: { run: Run, refused: List<CheckedModule> }, named: ModuleKey| {
+    { run: ordered.run, rejected: [] },
+    |acc: { run: Run, rejected: List<CheckedModule> }, named: ModuleKey| {
       let at = bin::encode(named, module_key_bin());
       let m = query_output(qs, acc.run, module_query(), at);
-      let a = decoded(m.output, module_result_bin(), "a module's answer");
+      let a = decoded(m.output, module_result_bin(), "a module's result");
       {
         run: [hashes_query(), wants_query()].fold(m.run, |r: Run, query: Bytes|
           query_output(qs, r, query, at).run),
-        refused: if a.refused.len() == 0 { acc.refused }
-        else { acc.refused.push({ module: named.module, result: a }) },
+        rejected: if a.rejected.len() == 0 { acc.rejected }
+        else { acc.rejected.push({ module: named.module, result: a }) },
       }
     },
   );
-  { run: declaring_in(qs, b"std", asked.run).run, refused: asked.refused }
+  { run: declaring_in(qs, b"std", asked.run).run, rejected: asked.rejected }
 }
 
 pub fn wanted_all(
@@ -485,7 +485,7 @@ fn dependencies_first(
   { run: read.run, order: order, edges: read.edges }
 }
 
-pub fn packages_refused(
+pub fn packages_rejected(
   packages: PackageSources,
   root_modules: List<Bytes>,
   modules: Int,
@@ -521,7 +521,7 @@ pub fn cycles_among(
   qs: Map<Bytes, CheckQuery>,
   run: Run,
   own: List<Bytes>,
-) -> { run: Run, refused: List<CheckedModule> } / {RunEffects, abort.raise} = {
+) -> { run: Run, rejected: List<CheckedModule> } / {RunEffects, abort.raise} = {
   let read = own.fold(
     { run: run, edges: Map::new() },
     |acc: { run: Run, edges: Map<Bytes, List<ImportOf>> }, m: Bytes| {
@@ -566,7 +566,7 @@ pub fn cycles_among(
           )
         },
     );
-  let refused = own.sort_by(|a: Bytes, b: Bytes|
+  let rejected = own.sort_by(|a: Bytes, b: Bytes|
     match compare_values(a, b) { Greater -> false, _ -> true }).fold(
     { done: Map::new(), out: [] },
     |acc: { done: Map<Bytes, Bool>, out: List<CheckedModule> }, m: Bytes|
@@ -612,14 +612,14 @@ pub fn cycles_among(
               done: path.fold(acc.done, |d: Map<Bytes, Bool>, p: Bytes| d.insert(p, true)),
               out: acc.out.push({
                 module: closing,
-                result: { ..absent(closing), refused: [diagnostic] },
+                result: { ..absent(closing), rejected: [diagnostic] },
               }),
             }
           },
         }
       },
   ).out;
-  { run: read.run, refused: refused }
+  { run: read.run, rejected: rejected }
 }
 
 pub fn entry_hash(
@@ -643,9 +643,9 @@ pub fn entry_hash(
     }
   }
 
-pub fn root_warnings(answers: List<CheckedModule>, root: Int) -> List<Diagnostic> =
+pub fn root_warnings(results: List<CheckedModule>, root: Int) -> List<Diagnostic> =
   range(0, root).fold([], |acc: List<Diagnostic>, i: Int|
-    match answers.at(i) {
+    match results.at(i) {
       None -> acc,
       Some(a) ->
         acc.concat(
@@ -654,20 +654,20 @@ pub fn root_warnings(answers: List<CheckedModule>, root: Int) -> List<Diagnostic
         ),
     })
 
-pub fn refused_first(answers: List<CheckedModule>) -> List<CheckedModule> = {
-  let refused = answers.fold(Map::new(), |acc: Map<Bytes, Bool>, a: CheckedModule|
-    if a.result.refused.len() > 0 { acc.insert(a.module, true) } else { acc });
-  answers.filter(|a: CheckedModule|
-    a.result.refused.len() > 0
-      && !a.result.imports.fold(false, |b: Bool, m: Bytes| b || refused.contains(m)))
+pub fn rejected_first(results: List<CheckedModule>) -> List<CheckedModule> = {
+  let rejected = results.fold(Map::new(), |acc: Map<Bytes, Bool>, a: CheckedModule|
+    if a.result.rejected.len() > 0 { acc.insert(a.module, true) } else { acc });
+  results.filter(|a: CheckedModule|
+    a.result.rejected.len() > 0
+      && !a.result.imports.fold(false, |b: Bool, m: Bytes| b || rejected.contains(m)))
 }
 
-pub type OutcomeSummary = | RefusalSummary(List<Bytes>) | PublicationSummary(Published)
+pub type OutcomeSummary = | RejectionSummary(List<Bytes>) | PublicationSummary(Published)
 
 pub fn outcome_summary(outcome: AnalysisOutcome) -> OutcomeSummary / {abort.raise} =
   match outcome {
-    Refused(ds) ->
-      RefusalSummary(
+    Rejected(ds) ->
+      RejectionSummary(
         ds.map(|d: Diagnostic| Bytes::concat_all([d.code, b": ", d.message])).sort_by(
           |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true },
         ),
@@ -681,35 +681,35 @@ pub fn nothing_embedded(package: Int, module: Bytes, want: EmbedRequest) -> Embe
 pub fn nothing_derived(ask: Bytes) -> Option<Bytes> / {abort.raise} = None
 
 pub fn over_decoding<a | e>(
-  held: MemoryStore,
+  store: MemoryStore,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
-) -> { held: MemoryStore, value: a } / {abort.raise | e} =
-  with_memory_store(held, read, world, look, || with_decode_cache(work))
+) -> { store: MemoryStore, value: a } / {abort.raise | e} =
+  with_memory_store(store, read, world, look, || with_decode_cache(work))
 
 pub fn queried_over(
-  held: MemoryStore,
+  store: MemoryStore,
   sources: List<Source>,
-) -> { held: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} =
-  queried_under(fresh_registry(), held, sources)
+) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} =
+  queried_under(fresh_registry(), store, sources)
 
 pub fn queried_under(
   qs: Map<Bytes, CheckQuery>,
-  held: MemoryStore,
+  store: MemoryStore,
   sources: List<Source>,
-) -> { held: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
   let w = inputs_alone(sources);
   let done = over_decoding(
-    held,
+    store,
     prelude_frames,
     b"",
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     || query_alone(qs, w),
   );
   {
-    held: done.held,
+    store: done.store,
     run: done.value.run,
     fixing: done.value.fixing,
     results: done.value.results,
@@ -739,9 +739,18 @@ fn lookup_input_shipping(
   derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> Option<Bytes> / {abort.raise} = {
   let all = with_prelude_source(shipped);
-  let held = |name: Bytes|
+  let source_text = |name: Bytes|
     match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.src), None -> None };
-  lookup_input(w, held, held, || all.map(|s: Source| s.name), nothing_embedded, derived, kind, at)
+  lookup_input(
+    w,
+    source_text,
+    source_text,
+    || all.map(|s: Source| s.name),
+    nothing_embedded,
+    derived,
+    kind,
+    at,
+  )
 }
 
 fn query_alone(
@@ -749,7 +758,7 @@ fn query_alone(
   w: LoadInputs,
 ) -> { run: Run, results: List<CheckedModule>, fixing: CachedHashes } / {RunEffects, abort.raise} = {
   let all = query_load(qs, w.own, [], false, start_run(qs));
-  if refused_first(all.value.results).len() > 0 {
+  if rejected_first(all.value.results).len() > 0 {
     { run: all.run, results: all.value.results, fixing: no_cached_hashes() }
   } else {
     let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
@@ -759,13 +768,13 @@ fn query_alone(
 
 fn outcome_of(
   sources: List<Source>,
-  answers: List<CheckedModule>,
+  results: List<CheckedModule>,
 ) -> AnalysisOutcome / {abort.raise} =
-  match refused_first(answers) {
+  match rejected_first(results) {
     [] ->
       analyse_with(
         parse_all(sources),
-        answers.fold(no_rows(), |acc: Rows, a: CheckedModule| {
+        results.fold(no_rows(), |acc: Rows, a: CheckedModule| {
           let r = rows_of_result(a.result);
           {
             definitions: acc.definitions.concat(r.definitions),
@@ -775,8 +784,8 @@ fn outcome_of(
         }),
       ),
     first ->
-      Refused(
-        first.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.refused)),
+      Rejected(
+        first.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.rejected)),
       ),
   }
 
@@ -839,66 +848,70 @@ effect raced {
 
 pub fn files_apart(steps: List<Step>, company: StoreSharing) -> List<Bytes> / {abort.raise} =
   range(0, steps.len()).fold(
-    { tree: fs::mem_of([]), held: empty_memory_store(), off: [] },
-    |s: { tree: fs::MemFs, held: MemoryStore, off: List<Bytes> }, i: Int| {
+    { tree: fs::mem_of([]), store: empty_memory_store(), off: [] },
+    |s: { tree: fs::MemFs, store: MemoryStore, off: List<Bytes> }, i: Int| {
       let step = steps.get(i);
-      let filed = queried_in(s.tree, step.sources, company, i);
-      let held = queried_over(s.held, step.sources);
-      let agrees = outcome_summary(filed.outcome) == outcome_summary(held.outcome)
-        && filed.fixing == held.fixing
-        && (company != Alone || executed_count(filed.run) == executed_count(held.run));
-      { tree: filed.tree, held: held.held, off: if agrees { s.off } else { s.off.push(step.what) } }
+      let recorded = queried_in(s.tree, step.sources, company, i);
+      let queried = queried_over(s.store, step.sources);
+      let agrees = outcome_summary(recorded.outcome) == outcome_summary(queried.outcome)
+        && recorded.fixing == queried.fixing
+        && (company != Alone || executed_count(recorded.run) == executed_count(queried.run));
+      {
+        tree: recorded.tree,
+        store: queried.store,
+        off: if agrees { s.off } else { s.off.push(step.what) },
+      }
     },
   ).off
 
 pub type Step = { what: Bytes, sources: List<Source> }
 
-test "every query whose answers the toolchain ships keeps its answers" {
+test "every query whose results the toolchain ships caches its results" {
   assert_eq(shipped_queries().filter(|n: Bytes| digest_only_queries().contains(n)), [])
 }
 
 fn stored_results(name: Bytes) -> List<Bytes> / {abort.raise} = {
-  let held = fixed_over(
+  let store = fixed_over(
     empty_memory_store(),
     layered(b"pub fn step(n: Int) -> Int = n + 1\n"),
     [],
-  ).held;
-  memo::current_records(held).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
+  ).store;
+  memo::current_records(store).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
     if r.query != name { acc }
-    else { match held.outputs.get(r.output) { Some(out) -> acc.push(out), None -> acc } })
+    else { match store.outputs.get(r.output) { Some(out) -> acc.push(out), None -> acc } })
 }
 
-fn read_back<a>(answers: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
-  answers.len() > 0
-    && answers.fold(true, |ok: Bool, b: Bytes| {
-      let value = decoded(b, codec, "a kept answer");
+fn read_back<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
+  results.len() > 0
+    && results.fold(true, |ok: Bool, b: Bytes| {
+      let value = decoded(b, codec, "a cached result");
       ok && bin::encode(value, codec) == b && bin::round_trips(value, codec)
     })
 
-test "a module's answer reads back as it was filed" {
+test "a module's result reads back as it was recorded" {
   assert(read_back(stored_results(module_query()), module_result_bin()))
 }
 
-test "a module read for its owners reads back as it was filed" {
+test "a module read for its owners reads back as it was recorded" {
   assert(read_back(stored_results(owners_query()), owners_result_bin()))
 }
 
-test "what hashing fixed of a group reads back as it was filed" {
+test "what hashing fixed of a group reads back as it was recorded" {
   assert(read_back(stored_results(group_hash_query()), group_hashes_bin()))
 }
 
-test "a module's imports read back as they were filed" {
+test "a module's imports read back as they were recorded" {
   assert(read_back(stored_results(imports_query()), imports_of_bin()))
 }
 
-test "a module's hashes read back as they were filed" {
+test "a module's hashes read back as they were recorded" {
   assert(read_back(stored_results(hashes_query()), hash_result_bin()))
 }
 
 fn embedding_queried(
   src: Bytes,
   files: Map<Bytes, Bytes>,
-) -> { held: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
+) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
   let w = inputs_alone([{ name: b"m", src: src }]);
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
@@ -913,7 +926,7 @@ fn embedding_queried(
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
     || query_alone(fresh_registry(), w),
   );
-  { held: done.held, results: done.value.results, fixing: done.value.fixing }
+  { store: done.store, results: done.value.results, fixing: done.value.fixing }
 }
 
 fn fixed_hash(fixing: CachedHashes, name: Bytes) -> Option<Bytes> =
@@ -923,26 +936,25 @@ fn fixed_hash(fixing: CachedHashes, name: Bytes) -> Option<Bytes> =
 fn two_embeds() -> Bytes =
   b"pub fn a() -> Bytes = embed(\"a.bin\")\npub fn b() -> Bytes = embed(\"b.bin\")\n"
 
-test "a module's answers know a file it embeds by its digest, and none holds the file's bytes" {
+test "a module's results know a file it embeds by its digest, and none holds the file's bytes" {
   let line = Bytes::concat_all(range(0, 10).map(|_: Int| b"0123456789"));
   let big = Bytes::concat_all(
     range(0, 1000).map(|i: Int| Bytes::concat_all([Bytes::of_string(i.to_string()), b":", line])),
   );
   let src = b"pub fn data() -> Bytes = embed(\"big.bin\")\npub fn size() -> Int = data().len()\ntest \"sized\" { assert(size() > 0) }\n";
   let done = embedding_queried(src, Map::new().insert(b"big.bin", big));
-  assert_eq(refused_first(done.results), []);
+  assert_eq(rejected_first(done.results), []);
   assert(fixed_hash(done.fixing, b"m.data") != None);
   assert_eq(
     done.results.map(|a: CheckedModule| a.result.shape.embeds.map(|e: ModuleEmbed| e.read)),
     [[Ok([embed_file(b"", big)])]],
   );
-  let largest = done.held.outputs.fold(0, |most: Int, _: Bytes, answer: Bytes|
-    if answer.len() > most { answer.len() } else { most });
+  let largest = done.store.outputs.fold(0, |most: Int, _: Bytes, result: Bytes|
+    if result.len() > most { result.len() } else { most });
   assert(
     largest < big.len() / 10,
     Some(
-      "an answer of " ++ largest.to_string() ++ " bytes, beside a file of "
-        ++ big.len().to_string(),
+      "a result of " ++ largest.to_string() ++ " bytes, beside a file of " ++ big.len().to_string(),
     ),
   )
 }
@@ -960,7 +972,7 @@ test "an embedded file's bytes move the definition that embeds it, and no other"
 }
 
 type Load = {
-  held: MemoryStore,
+  store: MemoryStore,
   run: Run,
   results: List<CheckedModule>,
   fixing: CachedHashes,
@@ -969,14 +981,14 @@ type Load = {
 }
 
 pub fn fixed_over(
-  held: MemoryStore,
+  store: MemoryStore,
   sources: List<Source>,
   shipped: List<Source>,
   derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
-) -> Load / {abort.raise} = fixed_beside(held, prelude_pack(), sources, shipped, derived: derived)
+) -> Load / {abort.raise} = fixed_beside(store, prelude_pack(), sources, shipped, derived: derived)
 
 pub fn fixed_beside(
-  held: MemoryStore,
+  store: MemoryStore,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
@@ -988,7 +1000,7 @@ pub fn fixed_beside(
   );
   handle {
     let done = over_decoding(
-      held,
+      store,
       |path: String, offset: Int, len: Int| {
         let found = packs::frame_in(packed, path, offset, len);
         match found { Some(b) -> fetching.fetched(b), None -> () };
@@ -1009,7 +1021,7 @@ pub fn fixed_beside(
       },
     );
     {
-      held: done.held,
+      store: done.store,
       run: done.value.run,
       results: done.value.results,
       fixing: done.value.fixing,
@@ -1022,7 +1034,7 @@ pub fn fixed_beside(
     },
     return d ->
       {
-        held: d.held,
+        store: d.store,
         run: d.run,
         results: d.results,
         fixing: d.fixing,
@@ -1043,7 +1055,7 @@ pub fn layered(lib: Bytes) -> List<Source> =
     { name: b"aside", src: b"pub fn alone() -> Int = 7\n" },
   ]
 
-test "a group that reads one that refuses waits for it unchecked, and its module says what a check of it whole says" {
+test "a group that reads one that fails waits for it unchecked, and its module says what checking it whole says" {
   let source = |body: Bytes|
     [
       {
@@ -1057,22 +1069,22 @@ test "a group that reads one that refuses waits for it unchecked, and its module
       },
     ];
   let cold = queried_over(empty_memory_store(), source(b"n + 1"));
-  let broken = queried_over(cold.held, source(b"n + true"));
+  let broken = queried_over(cold.store, source(b"n + true"));
   assert_eq(
     outcome_summary(broken.outcome),
     outcome_summary(analyse(parse_all(source(b"n + true")))),
   );
-  let waiting = memo::current_records(broken.held).fold(
+  let waiting = memo::current_records(broken.store).fold(
     [],
     |acc: List<Bytes>, _key: Bytes, r: Record|
       if r.query != group_query() { acc } else {
-        match broken.held.outputs.get(r.output) {
+        match broken.store.outputs.get(r.output) {
           None -> acc,
           Some(out) -> {
             let a = owner_checks::decode_group(
-              decoded(out, owner_checks::encoded_group_bin(), "a group's answer"),
+              decoded(out, owner_checks::encoded_group_bin(), "a group's result"),
             );
-            if a.refused.any(|d: Diagnostic| d.message.index_of(b" waits on ") != None) {
+            if a.rejected.any(|d: Diagnostic| d.message.index_of(b" waits on ") != None) {
               acc.concat(decoded(r.input, group_key_bin(), "a group's names").owners)
             } else { acc }
           },
@@ -1088,11 +1100,11 @@ test "a group that reads one that refuses waits for it unchecked, and its module
 }
 
 pub fn shipped_store(shipped: List<Source>) -> MemoryStore / {abort.raise} =
-  shipped_store_results(shipped).held
+  shipped_store_results(shipped).store
 
 fn shipped_store_results(
   shipped: List<Source>,
-) -> { held: MemoryStore, value: List<CheckedModule> } / {abort.raise} = {
+) -> { store: MemoryStore, value: List<CheckedModule> } / {abort.raise} = {
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   over_decoding(
     empty_memory_store(),
@@ -1101,18 +1113,18 @@ fn shipped_store_results(
     |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
     || {
       let qs = fresh_registry();
-      shipped_all(qs, with_prelude_source(shipped).map(|s: Source| s.name), start_run(qs)).refused
+      shipped_all(qs, with_prelude_source(shipped).map(|s: Source| s.name), start_run(qs)).rejected
     },
   )
 }
 
-test "answering the shipped modules names each one that refuses" {
-  let refused = shipped_store_results([
+test "computing the shipped modules' results names each one that fails" {
+  let rejected = shipped_store_results([
     { name: b"std.a", src: b"pub fn a() -> Int = 1\n" },
     { name: b"std.b", src: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
   ]).value;
-  assert_eq(refused.map(|x: CheckedModule| x.module), [b"std.b"]);
-  assert_eq(refused.map(|x: CheckedModule| x.result.refused.map(|d: Diagnostic| d.code)), [
+  assert_eq(rejected.map(|x: CheckedModule| x.module), [b"std.b"]);
+  assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), [
     [b"E0202"],
   ])
 }
@@ -1125,24 +1137,24 @@ test "a compiler module imports another below the compiler's root by its full na
       src: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
     },
   ];
-  let refused = shipped_store_results(shipped).value;
-  assert_eq(refused.map(|x: CheckedModule| x.result.refused.map(|d: Diagnostic| d.code)), []);
+  let rejected = shipped_store_results(shipped).value;
+  assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), []);
   let user = [
     { name: b"main", src: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n" },
   ];
   let f = fixed_over(empty_memory_store(), user, shipped);
   assert_eq(
-    f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.refused)),
+    f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.rejected)),
     [],
   )
 }
 
-pub fn pack_of(held: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} =
+pub fn pack_of(store: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} =
   Some(
     memo::pack_memory_store(
       {
-        ..held,
-        records: memo::current_records(held).fold(
+        ..store,
+        records: memo::current_records(store).fold(
           Map::new(),
           |acc: Map<Bytes, Record>, k: Bytes, r: Record|
             if shipped_queries().contains(r.query) { acc.insert(k, r) } else { acc },
@@ -1164,12 +1176,12 @@ test "a load fetches a module's read from a pack for what the read offered nothi
       ),
     },
   ];
-  let held = shipped_store(shipped);
-  let read = memo::current_records(held).fold(b"", |found: Bytes, _: Bytes, r: Record|
+  let store = shipped_store(shipped);
+  let read = memo::current_records(store).fold(b"", |found: Bytes, _: Bytes, r: Record|
     if r.query == owners_query() { r.output } else { found });
-  let read_bytes = match held.outputs.get(read) { Some(o) -> o, None -> b"" };
+  let read_bytes = match store.outputs.get(read) { Some(o) -> o, None -> b"" };
   let user = [{ name: b"main", src: b"import std.many (f0)\npub fn main() -> Int = f0()\n" }];
-  let load = fixed_beside(empty_memory_store(), pack_of(held), user, shipped);
+  let load = fixed_beside(empty_memory_store(), pack_of(store), user, shipped);
   let fetches = load.fetched.filter(|b: Bytes| b == read_bytes).len();
   assert(fetches > 0, Some("the read is short enough to be kept inside its record"));
   assert(fetches < owners, Some(f"the read was fetched {fetches.to_string()} times"))
@@ -1200,12 +1212,12 @@ test "a shipped module's imports are checked as an importer reads it, without wh
   ];
   let f = fixed_over(empty_memory_store(), user, shipped);
   assert_eq(
-    f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.refused)),
+    f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.rejected)),
     [],
   )
 }
 
-test "a module refuses with what its refusing groups say, and nothing a group reading them says" {
+test "a module fails with what its failing groups say, and nothing a group reading them says" {
   let sources = [
     {
       name: b"app",
@@ -1215,22 +1227,22 @@ test "a module refuses with what its refusing groups say, and nothing a group re
   let f = fixed_over(empty_memory_store(), sources, []);
   assert_eq(
     f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.refused.map(|d: Diagnostic| d.message))),
+      acc.concat(a.result.rejected.map(|d: Diagnostic| d.message))),
     [b"unknown name `missing`"],
   )
 }
 
-test "an import that names no module refuses its module, though nothing reads it" {
+test "an import that names no module fails its module, though nothing reads it" {
   let sources = [{ name: b"app", src: b"import nonesuch\npub fn f() -> Int = 1\n" }];
   let f = fixed_over(empty_memory_store(), sources, []);
   assert_eq(
     f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.refused.map(|d: Diagnostic| d.code))),
+      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0106"],
   )
 }
 
-test "two imports that bind one module name refuse their module, though nothing reads either" {
+test "two imports that bind one module name fail their module, though nothing reads either" {
   let sources = [
     { name: b"net", src: b"pub fn x() -> Int = 1\n" },
     { name: b"lib.net", src: b"pub fn y() -> Int = 2\n" },
@@ -1239,12 +1251,12 @@ test "two imports that bind one module name refuse their module, though nothing 
   let f = fixed_over(empty_memory_store(), sources, []);
   assert_eq(
     f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.refused.map(|d: Diagnostic| d.code))),
+      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0110"],
   )
 }
 
-test "a name two imports select refuses their module, though its module exports it" {
+test "a name two imports select fails their module, though its module exports it" {
   let sources = [
     { name: b"base", src: b"pub type T = | A | B\npub fn f() -> T = A\n" },
     {
@@ -1255,12 +1267,12 @@ test "a name two imports select refuses their module, though its module exports 
   let f = fixed_over(empty_memory_store(), sources, []);
   assert_eq(
     f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.refused.map(|d: Diagnostic| d.code))),
+      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0110"],
   )
 }
 
-test "a name a module selects that its module does not declare refuses the module" {
+test "a name a module selects that its module does not declare fails the module" {
   let sources = [
     { name: b"lib", src: b"pub fn used() -> Int = 1\n" },
     { name: b"app", src: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
@@ -1268,7 +1280,7 @@ test "a name a module selects that its module does not declare refuses the modul
   let f = fixed_over(empty_memory_store(), sources, []);
   assert_eq(
     f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.refused.map(|d: Diagnostic| d.code))),
+      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0101"],
   )
 }

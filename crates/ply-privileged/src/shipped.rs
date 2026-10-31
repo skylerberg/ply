@@ -50,7 +50,7 @@ pub fn module_digest(name: &str) -> Option<String> {
     crate::shipped_modules::digest_of(name)
 }
 
-/// Installs what this binary ships for the runtime's natives to answer, once.
+/// Installs what this binary ships for the runtime's natives to serve, once.
 pub fn install() {
     ply_compiled::hosted::shipped::install(Box::new(Shipping));
 }
@@ -68,8 +68,8 @@ impl ply_compiled::hosted::shipped::Ships for Shipping {
             .or_else(|| crate::shipped_modules::data(name))
     }
 
-    fn answer(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
-        ply_pack::installed().answer(path, offset, len)
+    fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
+        ply_pack::installed().result(path, offset, len)
     }
 
     fn digests(&self) -> String {

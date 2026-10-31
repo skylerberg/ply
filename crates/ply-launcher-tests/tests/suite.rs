@@ -61,14 +61,14 @@ fn a_line_without_the_flag_keeps_its_words() {
 /// suite that runs its tests in parallel.
 #[test]
 fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
-    let (answer, counted, sites) = ply_launcher::count::window(
+    let (result, counted, sites) = ply_launcher::count::window(
         || {
             let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
             v.iter().sum::<u64>()
         },
         false,
     );
-    assert_eq!(answer, (0..64u64).map(|n| n * 2).sum::<u64>());
+    assert_eq!(result, (0..64u64).map(|n| n * 2).sum::<u64>());
     assert!(counted.allocations > 0, "a vector allocates");
     assert!(counted.bytes >= 64 * 8);
     assert!(
@@ -102,7 +102,7 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
     // And the same work again at the run's default sample: every allocation is still counted, one
     // in `SAMPLED` is walked, and the rows come back scaled up so they read in the totals' units.
     // Their sum is near the total rather than equal to it, which is the trade the report states.
-    let (answer, counted, sites) = ply_launcher::count::window_sampled(
+    let (result, counted, sites) = ply_launcher::count::window_sampled(
         || {
             let mut v: Vec<Vec<u64>> = Vec::new();
             for n in 0..4096u64 {
@@ -112,7 +112,7 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
         },
         ply_launcher::count::SAMPLED,
     );
-    assert_eq!(answer, 4096);
+    assert_eq!(result, 4096);
     assert!(
         counted.allocations >= 4096,
         "4096 vectors allocate at least once each: {}",

@@ -4,7 +4,7 @@
 use super::{Nondeterministic, asked};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use ply_core::{Diagnostic, codes};
 use ply_host::jobs::Work;
 use ply_host::native::found;
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn rt_dns_lookup(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some(name) = c.text(unsafe { lent(p, n) }) else {
+            let Some(name) = c.text(unsafe { borrowed(p, n) }) else {
                 return I64(0);
             };
             let name = name.to_string();
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn rt_dns_reverse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some(address) = ply_host::dns::address_of(unsafe { lent(p, n) }) else {
+            let Some(address) = ply_host::dns::address_of(unsafe { borrowed(p, n) }) else {
                 c.fail(Diagnostic::error(
                     codes::INTERNAL_ERROR,
                     "`dns.reverse` was handed bytes that are no address",

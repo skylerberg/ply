@@ -105,18 +105,18 @@ fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
     let second = (id, Some(TaskId(2)));
     let opened = enter(&mut spans, first, "http", "request");
 
-    let Err(why) = spans.exit(second, opened, &channel("http"), Outcome::Ok) else {
+    let Err(reason) = spans.exit(second, opened, &channel("http"), Outcome::Ok) else {
         panic!("task 2 closed task 1's span");
     };
-    assert!(matches!(why, Unbalanced::OtherOwner(owner) if owner == first));
+    assert!(matches!(reason, Unbalanced::OtherOwner(owner) if owner == first));
 
-    let diagnostic = err_unbalanced(Span::DUMMY, "`trace.exit`", opened, &why);
+    let diagnostic = err_unbalanced(Span::DUMMY, "`trace.exit`", opened, &reason);
     assert_eq!(diagnostic.code, codes::SPAN_UNBALANCED);
     assert!(
         diagnostic.notes.iter().any(|n| n.contains("task @1")),
-        "the refusal must name the task that holds it: {diagnostic:?}"
+        "the rejection must name the task that holds it: {diagnostic:?}"
     );
-    // And the span is still open, because refusing is not closing.
+    // And the span is still open, because rejecting is not closing.
     assert_eq!(spans.depth(first), 1);
 }
 
@@ -145,7 +145,7 @@ fn the_three_ways_an_exit_names_a_span_that_is_not_open_are_told_apart() {
         panic!("the channel disagrees");
     };
     assert!(matches!(elsewhere, Unbalanced::OtherChannel(_)));
-    assert_eq!(spans.depth(owner), 1, "a refusal closes nothing");
+    assert_eq!(spans.depth(owner), 1, "a rejection closes nothing");
 }
 
 #[test]

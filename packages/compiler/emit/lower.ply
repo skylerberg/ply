@@ -15,7 +15,7 @@ import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Fn, Metered, fal
                                operand_var)
 import compiler.emit.lower.module_context (ModuleContext, Root)
 import compiler.emit.keys (Named, root_name, root_text, module_of)
-import compiler.check.types (Type, row_empty)
+import compiler.check.types (Type, no_effects)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, ToConstructor, ToBuiltin,
                                  ToDefinition, ToValue, ToInlinedBody, LoweredArm, GroupMember,
                                  initial_lowering, unreachable, enter_block, exit_block, joined,
@@ -42,7 +42,7 @@ import compiler.emit.lower.evidence (evidence_parameters, root_body_start, entry
                                      words_of, evidence_parameter_types, performed_by,
                                      captured_evidence_for)
 import compiler.emit.evidence (evidence_type)
-import compiler.emit.output (RowGeneric)
+import compiler.emit.output (EffectsGeneric)
 import compiler.emit.statics (folded)
 
 pub fn root_lowered(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
@@ -93,7 +93,7 @@ fn stack_closure(plan: HandlePlan, k: LoweredValue) -> LoweredValue =
 fn spawned(context: Context, state: Lowering, x: Code) -> LoweredValue / {abort.raise} =
   match x.node {
     CodeLambda(l) -> {
-      let held = captured_evidence_for(context, state, words_of(context, l.row), l.at);
+      let held = captured_evidence_for(context, state, words_of(context, l.effects), l.at);
       let frame = {
         params: l.params,
         size: l.size,
@@ -202,10 +202,10 @@ pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
     root_body_start(context, initial_lowering(params), params, declared, h),
     context.performs,
   );
-  let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: RowGeneric }) }
+  let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: EffectsGeneric }) }
   else { begun.st };
   let out = lowered(begun.context, start, body, true);
-  let answered = if falls_through(out.st.insts) { represented_as(out, conv.result, body.span) }
+  let returned = if falls_through(out.st.insts) { represented_as(out, conv.result, body.span) }
   else { out };
   folded(context.setting.constructors, {
     key: context.key,
@@ -213,13 +213,13 @@ pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
     params: params,
     convention: conv,
     result_type: context.result_type,
-    body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
-    else { answered.st.insts },
-    lambdas: answered.st.lambdas,
+    body: if falls_through(returned.st.insts) { returned.st.insts.push(Return(returned.arg)) }
+    else { returned.st.insts },
+    lambdas: returned.st.lambdas,
     base: context.base,
     members: [],
-    links: answered.st.links,
-    statics: answered.st.statics,
+    links: returned.st.links,
+    statics: returned.st.statics,
   })
 }
 
@@ -511,7 +511,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
             Some(x) -> match x.node {
               CodeLambda(l) -> lowered(e.context, e.st, l.body, false),
               CodeKnownLambda(k) -> if k.in_place { lowered(e.context, e.st, k.lambda.body, false) }
-              else { known_run(e.context, e.st, k, a.row, x.span) },
+              else { known_run(e.context, e.st, k, a.effects, x.span) },
               NDefinition(_) -> named_function_call(e.context, e.st, x, how),
               _ -> unreachable(no_lambda),
             },
@@ -533,8 +533,8 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         let called = reads_noted(context, args.st, args.read);
         match a.function.node {
           CodeKnownLambda(k) ->
-            known_applied(context, called, k, f.arg, args.args, a.row, tail, c.span),
-          _ -> applied(context, called, f.arg, args.args, a.row, tail, c.span),
+            known_applied(context, called, k, f.arg, args.args, a.effects, tail, c.span),
+          _ -> applied(context, called, f.arg, args.args, a.effects, tail, c.span),
         }
       },
       Some(t) -> {
@@ -697,7 +697,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         resumes: None,
         body: l.body,
         ty: l.ty,
-        words: words_of(context, l.row),
+        words: words_of(context, l.effects),
         held: no_captured_evidence(),
       };
       let o = lambda_body_start(context, state, frame, l.at);
@@ -710,13 +710,13 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         captures: x.captures,
         resumes: None,
         body: x.body,
-        ty: { params: [], kept: [], once: false, ret: x.body.ty, effects: row_empty() },
-        words: words_of(context, x.row),
+        ty: { params: [], kept: [], once: false, ret: x.body.ty, effects: no_effects() },
+        words: words_of(context, x.effects),
         held: no_captured_evidence(),
       };
       let o = lambda_body_start(context, state, frame, x.at);
       let k = closure(context, state, lowered(o.context, o.st, x.body, true), frame, Metered, x.at);
-      simulate_called(context, k.st, k.arg, x.row, c.span)
+      simulate_called(context, k.st, k.arg, x.effects, c.span)
     },
     CodeParallel(pr) -> {
       let bs = pr.branches.fold(
@@ -733,7 +733,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       let clauses = h.clauses.fold(
         { st: plan.st, out: [] },
         |acc: { st: Lowering, out: List<Arg> }, cl: CodeClause| {
-          let held = clause_captured_evidence(context, acc.st, plan, cl.row, cl.at);
+          let held = clause_captured_evidence(context, acc.st, plan, cl.effects, cl.at);
           let frame = clause_frame(cl, held.held);
           let o = lambda_body_start(context, held.st, frame, cl.at);
           let k = stack_closure(
@@ -752,7 +752,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       );
       let ret = match h.ret {
         Some(r) -> {
-          let held = clause_captured_evidence(context, clauses.st, plan, r.row, r.at);
+          let held = clause_captured_evidence(context, clauses.st, plan, r.effects, r.at);
           let frame = return_frame(r, held.held);
           let o = lambda_body_start(context, held.st, frame, r.at);
           let k = stack_closure(
@@ -765,15 +765,15 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       };
       let body = if detaches(h.clauses) {
         let objects = instance_objects(context, ret.st, h, plan, c.span);
-        let answer = c.ty;
-        let frame = body_frame(context, h, plan, objects.words, answer);
+        let result = c.ty;
+        let frame = body_frame(context, h, plan, objects.words, result);
         let at = detached_closure_span(c.span);
         let o = lambda_body_start(context, objects.st, frame, at);
         let inner = lowered(o.context, enter_block(o.st), h.body, false);
         closure(
           context,
           objects.st,
-          detached_landing(o.context, o.st, inner, h, plan, answer, at),
+          detached_landing(o.context, o.st, inner, h, plan, result, at),
           frame,
           Metered,
           at,

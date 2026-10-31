@@ -1,6 +1,6 @@
-//! Where what a run keeps between runs, apart from the compiled objects, is kept: the builder and
+//! Where what a run caches between runs, apart from compiled objects, is stored: the builder and
 //! the programs it built for this binary, the rows that seed their next builds, and the front-end
-//! answers `ply run` files, each a stage under one root that `sweep` keeps to its budget.
+//! results `ply run` records, each a stage under one root that `sweep` keeps to its budget.
 
 use std::path::PathBuf;
 
@@ -11,8 +11,8 @@ pub fn stage_dir(identity: &str) -> PathBuf {
     stage_root().join(identity)
 }
 
-/// The directory every stage is kept under, which `sweep` keeps to its budget: the one
+/// The directory every stage is stored under, which `sweep` keeps to its budget: the one
 /// `PLY_C_STAGE` names, or the user's own.
 pub fn stage_root() -> PathBuf {
-    super::kept_dir("stage", "PLY_C_STAGE")
+    super::cache_dir_for("stage", "PLY_C_STAGE")
 }

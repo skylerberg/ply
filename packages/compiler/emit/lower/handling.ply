@@ -5,14 +5,14 @@ import compiler.emit.code (Code, CodeHandler, CodeClause, CodeReturn, CodeStatem
                            CodeParallel, CodeHandle, CodeLambda, slots_read, all_read,
                            pattern_slots)
 import compiler.emit.keys (Evidence)
-import compiler.emit.evidence (evidence_type, instance_block_type, row_descriptor_type)
+import compiler.emit.evidence (evidence_type, instance_block_type, effects_descriptor_type)
 import compiler.syntax.parsing (Span)
 import compiler.syntax.expressions (scheduler_module)
 import compiler.syntax.items (is_shipped)
-import compiler.check.types (Type, FunctionType, RecordType, Row, Resource, NamedResource,
+import compiler.check.types (Type, FunctionType, RecordType, Effects, Resource, NamedResource,
                              SingletonResource, AnyResource, ResourceVariable, int_type,
-                             string_type, fields_sorted, row_empty)
-import compiler.check.infer.expression (kept_type, crossing_variables, crossing_own)
+                             string_type, fields_sorted, no_effects)
+import compiler.check.infer.expression (kept_type, marshalling_variables, marshalling_own)
 import compiler.emit.typing (unknown_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, RaiseMode, InvalidMode, is_raise)
@@ -28,8 +28,8 @@ import compiler.emit.typed_ir (AsInt, AsWord, AsImmediate, Arg, VarOperand, Zero
 import compiler.emit.typed_ir.handling (Perform, Label, Parallel, UnspecialisedBuiltin, Clause,
                                         SchedulerEvidence, Instance, HeapInstance, InstanceAddress,
                                         Entering, AllocateForwarding, SetForwarding, ObjectAt,
-                                        RowMapping, Slot, ClauseSlot, CopiedSlot, ForwardedSlot,
-                                        KeyedSlot, KeyedRow, ClauseEntry, Answers, Schedules,
+                                        EffectsMapping, Slot, ClauseSlot, CopiedSlot, ForwardedSlot,
+                                        KeyedSlot, KeyedRow, ClauseEntry, Results, Schedules,
                                         Suspends, Resumes, Raises, HandleInstance, Returning,
                                         raise_offset)
 import compiler.emit.lower.marshalling (operation_descriptor, type_descriptor, effect_of, own_types)
@@ -39,7 +39,7 @@ import compiler.emit.lower.base (Context, Lowering, LoweredValue, Frame, Evidenc
                                  emitted, exit_block, type_of, represented_as, static_added)
 import compiler.emit.lower.evidence (words_of, evidence_for, outer_evidence, bridged,
                                      captured_evidence_for, label_resource, function_value_evidence,
-                                     row_descriptor, label_value)
+                                     effects_descriptor, label_value)
 import compiler.emit.lower.representation (representation_of)
 import compiler.emit.lower.data (record_literal_as)
 
@@ -50,7 +50,7 @@ pub fn performed(
   label: Option<Arg>,
   written: Option<Code>,
   args: List<Arg>,
-  answer: Type,
+  result: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match effect_of(context, p.effect) {
@@ -93,7 +93,7 @@ pub fn performed(
           { st: w.st, args: acc.args.push(w.arg) }
         },
       );
-      let ty = answer;
+      let ty = result;
       {
         {
           let out = if is_raise(mode) { { ty: ty, marked: None } }
@@ -136,14 +136,14 @@ pub fn performed(
                 uses: uses,
               }),
           };
-          let answered = represented_as(
+          let returned = represented_as(
             bound_as(d.st, out.ty, AsWord, op, at),
             representation_of(context.setting, out.ty),
             at,
           );
           match out.marked {
-            None -> answered,
-            Some(m) -> kept_conversion(context, answered.st, answered.arg, m, false, at),
+            None -> returned,
+            Some(m) -> kept_conversion(context, returned.st, returned.arg, m, false, at),
           }
         }
       }
@@ -152,7 +152,7 @@ pub fn performed(
 
 fn kept_type_parameters(global: Bytes, op: EffectOperation) -> List<Int> / {abort.raise} =
   if global.index_of(b".") == None || is_shipped(global) { [] }
-  else { crossing_own(op.params, op.ret, op.mode, op.own) }
+  else { marshalling_own(op.params, op.ret, op.mode, op.own) }
 
 fn names_kept(declared: Type, kept: List<Int>) -> Bool =
   type_variables(declared).any(|v: Int| kept.contains(v))
@@ -175,10 +175,10 @@ fn kept_argument(
 fn kept_result_type(
   declared: Type,
   kept: List<Int>,
-  filed: Type,
+  recorded: Type,
 ) -> { ty: Type, marked: Option<Type> } / {abort.raise} =
-  if !names_kept(declared, kept) { { ty: filed, marked: None } } else {
-    let marked_type = mark_type_params(declared, filed, kept).marked;
+  if !names_kept(declared, kept) { { ty: recorded, marked: None } } else {
+    let marked_type = mark_type_params(declared, recorded, kept).marked;
     { ty: dynamic_form(marked_type), marked: Some(marked_type) }
   }
 
@@ -187,15 +187,15 @@ pub fn scheduler_perform_call(
   p: { effect: Bytes, op: Bytes, resource: Bytes },
   codes: List<Code>,
   args: List<Arg>,
-  answer: Type,
+  result: Type,
   at: Span,
-) -> Option<{ name: Bytes, types: List<Type>, rows: List<Row> }> / {abort.raise} =
+) -> Option<{ name: Bytes, types: List<Type>, rows: List<Effects> }> / {abort.raise} =
   match effect_of(context, p.effect) {
     Some(named) -> {
-      let t = { ty: answer };
-      let crossing = match prelude_effects().find(|e: EffectInfo| e.name == named.global) {
+      let t = { ty: result };
+      let marshalling = match prelude_effects().find(|e: EffectInfo| e.name == named.global) {
         Some(e) -> match e.operations.find(|o: OpInfo| o.name == p.op) {
-          Some(o) -> crossing_variables(o),
+          Some(o) -> marshalling_variables(o),
           None -> [],
         },
         None -> [],
@@ -203,27 +203,27 @@ pub fn scheduler_perform_call(
       let en = match effect_of(context, named.global) { Some(e) -> e, None -> named };
       let declared = op_declared(en, p.op);
       let types = own_types(declared, args.map(type_of), t.ty);
-      if crossing.len() == 0 || types.any(|x: Option<Type>| x == None)
-          || crossing.all(|i: Int| types.at(i) == Some(Some(kept_type()))) { None } else {
+      if marshalling.len() == 0 || types.any(|x: Option<Type>| x == None)
+          || marshalling.all(|i: Int| types.at(i) == Some(Some(kept_type()))) { None } else {
         Some({
           name: Bytes::concat_all([scheduler_module(), b"::crossing_", p.op]),
           types: types.fold([], |acc: List<Type>, x: Option<Type>|
             match x { Some(y) -> acc.push(y), None -> acc }),
-          rows: range(0, declared.params.len()).fold([], |acc: List<Row>, i: Int|
+          rows: range(0, declared.params.len()).fold([], |acc: List<Effects>, i: Int|
             match declared.params.at(i) {
-              Some(FunctionType(f)) -> if f.effects.tail == None { acc } else {
+              Some(FunctionType(f)) -> if f.effects.variable == None { acc } else {
                 acc.push(match codes.at(i) {
                   Some(c) -> match c.node {
-                    CodeLambda(l) -> l.row,
+                    CodeLambda(l) -> l.effects,
                     _ -> match args.at(i) {
                       Some(a) -> match type_of(a) {
                         FunctionType(g) -> g.effects,
-                        _ -> row_empty(),
+                        _ -> no_effects(),
                       },
-                      None -> row_empty(),
+                      None -> no_effects(),
                     },
                   },
-                  None -> row_empty(),
+                  None -> no_effects(),
                 })
               },
               _ -> acc,
@@ -471,11 +471,11 @@ fn forwarding_header(
     st,
     evidence_type(),
     AsImmediate,
-    Op({ op: OfHandling(RowMapping), args: [], uses: reads(0) }),
+    Op({ op: OfHandling(EffectsMapping), args: [], uses: reads(0) }),
     at,
   );
-  let d = static_added(mapped.st, row_descriptor(outer.map(|w: EvidenceWord| w.evidence)));
-  let desc = bound_as(d.st, row_descriptor_type(), AsImmediate, Static(d.name), at);
+  let d = static_added(mapped.st, effects_descriptor(outer.map(|w: EvidenceWord| w.evidence)));
+  let desc = bound_as(d.st, effects_descriptor_type(), AsImmediate, Static(d.name), at);
   let words = bridged(desc.st, outer.map(|w: EvidenceWord| w.word), at);
   let headed = set(
     set(set(set(words.st, 1, mapped.arg), 2, desc.arg), 3, IntOperand(outer.len())),
@@ -517,11 +517,11 @@ pub fn clause_captured_evidence(
   context: Context,
   st: Lowering,
   plan: HandlePlan,
-  row: Row,
+  effects: Effects,
   at: Span,
 ) -> { st: Lowering, held: CapturedEvidence } / {abort.raise} = {
   let around = match plan.forwarding { Some(f) -> { ..context, words: f.outer }, None -> context };
-  let words = captured_evidence_for(around, st, words_of(context, row), at);
+  let words = captured_evidence_for(around, st, words_of(context, effects), at);
   {
     st: words.st,
     held: {
@@ -541,9 +541,9 @@ fn handle_keys(
       Some(e) -> e,
       None -> { global: cl.effect, operations: [] },
     };
-    let answered = { effect: en.global, resource: clause_resource(context, cl) };
-    if acc.any(|k: { evidence: Evidence, effect: EffectName }| k.evidence == answered) { acc }
-    else { acc.push({ evidence: answered, effect: en }) }
+    let returned = { effect: en.global, resource: clause_resource(context, cl) };
+    if acc.any(|k: { evidence: Evidence, effect: EffectName }| k.evidence == returned) { acc }
+    else { acc.push({ evidence: returned, effect: en }) }
   })
 
 pub fn enter_handle(
@@ -635,7 +635,7 @@ fn plan_key(
   };
   let plain = outer.len() == 0
     || (outer.len() == 1 && outer.get(0).evidence.resource == AnyResource);
-  let answering = |op: Bytes|
+  let returning = |op: Bytes|
     range(0, clauses.len()).filter(|c: Int|
       match clauses.at(c) {
         Some(cl) ->
@@ -650,7 +650,7 @@ fn plan_key(
     key: k,
     outer: outer,
     slots: k.effect.operations.map(|op: EffectOperation| {
-      let all = answering(op.name);
+      let all = returning(op.name);
       if !every { match all.at(0) { Some(c) -> ByClause(c), None -> ByWord } } else {
         let reach = all.fold(
           { out: [], closed: false },
@@ -688,8 +688,8 @@ fn write_object(
   let clause_slot = |c: Int| {
     let cl = clauses.get(c);
     let entry = match entry_of(clause_mode(context, cl)) {
-      Answers -> if module_of(context.key) == scheduler_module() && !cl.binds_label { Schedules }
-      else { Answers },
+      Results -> if module_of(context.key) == scheduler_module() && !cl.binds_label { Schedules }
+      else { Results },
       other -> other,
     };
     ClauseSlot({ entry: entry, record: i.layout.records.get(c), labelled: cl.binds_label })
@@ -767,7 +767,7 @@ fn entry_of(mode: Int) -> ClauseEntry =
   if mode == 3 { Raises }
   else if mode == 1 { Resumes }
   else if mode == 2 { Suspends }
-  else { Answers }
+  else { Results }
 
 fn may_stop(c: Clause) -> Bool = match entry_of(c.mode) { Resumes -> true, _ -> false }
 
@@ -787,7 +787,7 @@ pub fn body_frame(
   h: CodeHandler,
   plan: HandlePlan,
   own: List<EvidenceWord>,
-  answer: Type,
+  result: Type,
 ) -> Frame = {
   let inside = bound_in(h.body);
   let reads = slots_read(h.body).fold([], |acc: List<Int>, r: Int|
@@ -798,7 +798,7 @@ pub fn body_frame(
     captures: reads.map(|r: Int| { src: r, destination: r }),
     resumes: None,
     body: h.body,
-    ty: { params: [], kept: [], once: false, ret: answer, effects: row_empty() },
+    ty: { params: [], kept: [], once: false, ret: result, effects: no_effects() },
     words: [],
     held: {
       words: own.concat(match plan.forwarding { Some(f) -> f.outer, None -> [] }),
@@ -823,7 +823,7 @@ pub fn handle_assembled(
     Some(r) -> return_type_of(type_of(r)),
     None -> if detached { return_type_of(type_of(body.arg)) } else { type_of(body.arg) },
   };
-  let answer_rep = if detached { AsWord } else { representation_of(context.setting, ty) };
+  let result_rep = if detached { AsWord } else { representation_of(context.setting, ty) };
   let inner = if detached { { outer: body.st, block: [], word: None } }
   else if !falls_through(body.st.insts) {
     { outer: exit_block(st, body.st), block: body.st.insts, word: None }
@@ -843,7 +843,7 @@ pub fn handle_assembled(
         { outer: exit_block(st, given), block: given.insts, word: None }
       },
       None -> {
-        let w = represented_as(body, answer_rep, at);
+        let w = represented_as(body, result_rep, at);
         { outer: exit_block(st, w.st), block: w.st.insts, word: Some(w.arg) }
       },
     }
@@ -869,19 +869,19 @@ pub fn handle_assembled(
   let i = plan.instance;
   let held = all.args.push(i.word).concat(match i.block { Some(b) -> [b], None -> [] });
   let forwarded = held.concat(match plan.forwarding { Some(f) -> [f.word], None -> [] });
-  let answer = if laid.clauses.any(may_stop) {
+  let result = if laid.clauses.any(may_stop) {
     let d = type_descriptor(context, laid.st, ty, at);
     { st: d.st, args: [d.arg] }
   } else { { st: laid.st, args: [] } };
-  let taken = forwarded.concat(answer.args);
+  let taken = forwarded.concat(result.args);
   let site = {
-    st: answer.st,
+    st: result.st,
     args: taken,
     takes: range(0, taken.len()).map(|k: Int| all.at == Some(k)),
     instance: {
       ..i.layout,
       operand: all.args.len(),
-      result: if answer.args.len() == 0 { None } else { Some(forwarded.len()) },
+      result: if result.args.len() == 0 { None } else { Some(forwarded.len()) },
       heap: match i.block { Some(_) -> Some(all.args.len() + 1), None -> None },
     },
     detached: match ((all.at, plan.forwarding)) {
@@ -889,7 +889,7 @@ pub fn handle_assembled(
       _ -> None,
     },
   };
-  let a = fresh(site.st, ty, answer_rep);
+  let a = fresh(site.st, ty, result_rep);
   match laid.unknown {
     Some(name) -> unreachable(b"an effect the lowering does not resolve: ".concat(name)),
     None -> if escapes(inner.block, false, false) {
@@ -929,7 +929,7 @@ pub fn detached_landing(
   body: LoweredValue,
   h: CodeHandler,
   plan: HandlePlan,
-  answer: Type,
+  result: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match context.instance {
@@ -941,7 +941,7 @@ pub fn detached_landing(
         let w = represented_as(body, AsWord, at);
         { outer: exit_block(before, w.st), block: w.st.insts, word: Some(w.arg) }
       };
-      let a = fresh(inner.outer, answer, AsWord);
+      let a = fresh(inner.outer, result, AsWord);
       if escapes(inner.block, false, false) {
         unreachable(b"a handle body that leaves other than by its end")
       } else {
@@ -966,7 +966,7 @@ pub fn detached_landing(
         );
         represented_as(
           { st: out, arg: VarOperand(a.var) },
-          representation_of(context.setting, answer),
+          representation_of(context.setting, result),
           at,
         )
       }
@@ -982,7 +982,7 @@ pub fn parallel_block(
   context: Context,
   st: Lowering,
   branches: List<Arg>,
-  performs: Row,
+  performs: Effects,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let closures = branches.fold(
@@ -1032,15 +1032,15 @@ pub fn parallel_block(
       suspends: true,
     },
   });
-  let answers = branches.map(|b: Arg| return_type_of(type_of(b)));
-  let gathered = bound_as(words.st, parallel_results_type(answers), AsWord, op, at);
+  let results = branches.map(|b: Arg| return_type_of(type_of(b)));
+  let gathered = bound_as(words.st, parallel_results_type(results), AsWord, op, at);
   match gathered.arg {
     VarOperand(record) -> {
       let parts = range(0, branches.len()).fold(
         { st: gathered.st, fields: [] },
         |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, i: Int| {
           let name = b"_".concat(ascii_of_int(i));
-          let t = answers.get(i);
+          let t = results.get(i);
           let w = bound_as(
             acc.st,
             t,
@@ -1054,7 +1054,7 @@ pub fn parallel_block(
       );
       record_literal_as(context, parts.st, parts.fields, ty, at)
     },
-    _ -> unreachable(b"a parallel block's answers bound to no variable"),
+    _ -> unreachable(b"a parallel block's results bound to no variable"),
   }
 }
 

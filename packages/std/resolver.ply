@@ -1,5 +1,5 @@
 //! A stub resolver: it sends one question to a DNS server over UDP, and again over TCP when the
-//! answer was truncated.
+//! response was truncated.
 //!
 //! `dns.lookup` queries the system's resolver, which returns addresses and nothing else. This
 //! module queries the records that mail and service discovery need (MX, TXT, SRV), and those behind
@@ -7,18 +7,18 @@
 //! turn, going round the list `attempts` times, with each exchange under a deadline of `timeout_ms`
 //! on the clock. It returns the records of the requested kind, each with its time to live.
 //! `resolve_system` queries the servers `dns.servers` lists. A question's id is drawn from
-//! `entropy`. An answer is accepted only when it comes from the server queried, carries that id,
+//! `entropy`. A response is accepted only when it comes from the server queried, carries that id,
 //! and repeats the question, so a datagram from anywhere else is ignored and does not extend the
-//! wait. An answer too long for a datagram is marked as truncated, and is requested again over TCP.
+//! wait. A response too long for a datagram is marked truncated, and is requested again over TCP.
 //!
 //! A failure is `std.dns`'s `Failure`: `NoSuchName` when the server reports that the name does not
 //! exist, `NoData` when it exists but has no records of the kind, `ServerFailure` when every server
-//! that answered refused the query or failed, and `TimedOut` when none answered.
+//! that responded refused the query or failed, and `TimedOut` when none responded.
 //!
 //! This module also has the message format, `encode` and `decode`, and neither raises. A message
 //! that does not parse is `None`, a name follows at most as many compression pointers as it could
 //! have labels, and nothing past the answer section is read. With them, a test's server is a
-//! function from a question to an answer, which `std.udp`'s fake runs under any loss, duplication
+//! function from a question to a response, which `std.udp`'s fake runs under any loss, duplication
 //! and reordering a network causes.
 
 import std.bytes (u16_be, u32_be)
@@ -51,7 +51,7 @@ pub type Kind =
   | Srv
   /// The name of an address, queried at its `in-addr.arpa` or `ip6.arpa` name.
   | Ptr
-  /// The servers that answer for the name.
+  /// The servers authoritative for the name.
   | Ns
 
 /// Where a service is: lower `priority` first, `weight` shares load among equals.
@@ -82,7 +82,7 @@ pub type Record = { name: String, ttl: Duration, data: Data }
 /// What a message asks.
 pub type Question = { name: String, kind: Kind }
 
-/// A DNS message, as far as a stub resolver reads one: its id, whether it is an answer, whether
+/// A DNS message, as far as a stub resolver reads one: its id, whether it is a response, whether
 /// it was truncated to fit a datagram, whether recursion is requested, its response code, its
 /// question, and its answer section.
 pub type Message = {
@@ -92,7 +92,7 @@ pub type Message = {
   recursion: Bool,
   code: Int,
   question: Option<Question>,
-  results: List<Record>,
+  answers: List<Record>,
 }
 
 fn kind_code(kind: Kind) -> Int =
@@ -199,7 +199,7 @@ fn flags_of(m: Message) -> Int =
 /// a count past sixteen bits, a name or a string longer than the format allows.
 pub fn encode(m: Message) -> Option<Bytes> / {abort.raise} = {
   let request = question_bytes(m.question)?;
-  let answers = m.results.fold(Some([]), |so_far: Option<List<Bytes>>, r: Record|
+  let answers = m.answers.fold(Some([]), |so_far: Option<List<Bytes>>, r: Record|
     match so_far {
       None -> None,
       Some(parts) -> match record_bytes(r) { Some(bytes) -> Some(parts.push(bytes)), None -> None },
@@ -229,13 +229,13 @@ pub fn question(id: Int, name: String, kind: Kind) -> Message =
     recursion: true,
     code: 0,
     question: Some({ name: name, kind: kind }),
-    results: [],
+    answers: [],
   }
 
-/// The answer to `request` containing `answers`, with response code `code`: what a server sends
+/// The response to `request` containing `results`, with response code `code`: what a server sends
 /// back.
-pub fn answer(request: Message, code: Int, answers: List<Record>) -> Message =
-  { ..request, response: true, code: code, results: answers }
+pub fn response(request: Message, code: Int, answers: List<Record>) -> Message =
+  { ..request, response: true, code: code, answers: answers }
 
 // --- Reading ----------------------------------------------------------------
 
@@ -376,7 +376,7 @@ pub fn decode(b: Bytes) -> Option<Message> / {abort.raise} = {
     recursion: flags & 0x0100 != 0,
     code: flags & 15,
     question: request.question,
-    results: answers,
+    answers: answers,
   })
 }
 
@@ -385,8 +385,8 @@ pub fn decode(b: Bytes) -> Option<Message> / {abort.raise} = {
 /// Whether a record's data is of the kind a question asks for.
 fn of_kind(data: Data, kind: Kind) -> Bool = kind_of_code(data_code(data)) == Some(kind)
 
-/// Whether `m` answers `request`: an answer with its id, to its question.
-fn answers_to(m: Message, request: Message) -> Bool / {abort.raise} =
+/// Whether `m` responds to `request`: a response with its id, to its question.
+fn responds_to(m: Message, request: Message) -> Bool / {abort.raise} =
   m.response && m.id == request.id
     && (match m.question {
       Some(theirs) -> match request.question {
@@ -402,11 +402,11 @@ fn same_name(a: String, b: String) -> Bool / {abort.raise} =
 fn without_trailing_dot(name: String) -> String / {abort.raise} =
   if name.ends_with(".") { name.slice(0, name.len() - 1) } else { name }
 
-/// The most datagrams one exchange skips: answers to other questions, late or forged.
+/// The most datagrams one exchange skips: responses to other questions, late or forged.
 fn max_stray_datagrams() -> Int = 8
 
-/// The answer to `request` among the datagrams `socket` receives from `server` before `end`.
-fn receive_answer<[l]>(
+/// The response to `request` among the datagrams `socket` receives from `server` before `end`.
+fn receive_result<[l]>(
   socket: Int,
   server: SocketAddress,
   request: Message,
@@ -420,7 +420,7 @@ fn receive_answer<[l]>(
           Err(_) -> Stop(None),
           Ok(d) -> if d.from != server { Continue(read + 1) } else {
             match decode(d.payload) {
-              Some(m) -> if answers_to(m, request) { Stop(Some(m)) } else { Continue(read + 1) },
+              Some(m) -> if responds_to(m, request) { Stop(Some(m)) } else { Continue(read + 1) },
               None -> Continue(read + 1),
             }
           },
@@ -429,7 +429,7 @@ fn receive_answer<[l]>(
     })
 
 /// One question sent to one server over its own datagram socket, which is closed however the
-/// exchange ends, and its answer if one arrives before `end`.
+/// exchange ends, and its response if one arrives before `end`.
 fn exchange_over_udp<[l]>(
   server: SocketAddress,
   request: Message,
@@ -446,7 +446,7 @@ fn exchange_over_udp<[l]>(
           None -> None,
           Some(left) -> match udp.send_to[l](socket, server, query, left) {
             Err(_) -> None,
-            Ok(_) -> receive_answer[l](socket, server, request, end),
+            Ok(_) -> receive_result[l](socket, server, request, end),
           },
         },
       },
@@ -470,7 +470,7 @@ fn read_exactly<[k]>(
     })
 
 /// The same question over a connection, where each message is prefixed with its length, and its
-/// answer if all of it arrives before `end`.
+/// response if all of it arrives before `end`.
 fn exchange_over_tcp<[k]>(
   server: SocketAddress,
   request: Message,
@@ -491,7 +491,7 @@ fn exchange_over_tcp<[k]>(
       ),
   }
 
-/// A question sent with its length prefix on an open connection, and the answer read by its own
+/// A question sent with its length prefix on an open connection, and the response read by its own
 /// length prefix.
 fn exchange_on_connection<[k]>(
   conn: Int,
@@ -503,7 +503,7 @@ fn exchange_on_connection<[k]>(
   if !send_all[k](conn, u16_be(query.len()).concat(query), left) { None } else {
     let size = read_exactly[k](conn, 2, end)?.u16_be_at(0)?;
     let m = decode(read_exactly[k](conn, size, end)?)?;
-    if answers_to(m, request) { Some(m) } else { None }
+    if responds_to(m, request) { Some(m) } else { None }
   }
 }
 
@@ -514,7 +514,7 @@ fn deadline_after(timeout_ms: Int) -> Instant / {clock.read} =
 /// The records of `kind` at `name`, queried from `servers` in turn, going through the whole list
 /// `attempts` times. `timeout_ms` is a deadline on the clock for each exchange, over a datagram or
 /// a connection alike: whatever else a socket receives in that time, the wait is no longer.
-/// Datagrams use the label `l`, and the connection that requests a truncated answer again uses `k`.
+/// Datagrams use the label `l`, and the connection that retries a truncated response uses `k`.
 /// A name that is not ASCII is rejected as `dns.lookup` rejects one, and `timeout_ms <= 0` is a
 /// runtime error.
 pub fn resolve<[l], [k]>(
@@ -556,7 +556,7 @@ pub fn resolve<[l], [k]>(
               None -> Continue({ tried: s.tried + 1, worst: s.worst }),
               Some(m) -> if m.code == 3 { Stop(Err(NoSuchName)) }
               else if m.code != 0 { Continue({ tried: s.tried + 1, worst: ServerFailure }) } else {
-                let found = m.results.filter(|r: Record| of_kind(r.data, kind));
+                let found = m.answers.filter(|r: Record| of_kind(r.data, kind));
                 Stop(if found.len() == 0 { Err(NoData) } else { Ok(found) })
               },
             }
@@ -624,7 +624,7 @@ test "a question is written as the format writes it" {
   assert_eq(encode(question(65536, "example.com", A)), None)
 }
 
-test "an answer is read with its names' pointers followed" {
+test "a response is read with its names' pointers followed" {
   // `example.com MX 10 mail.example.com`, the owner and the host's ending both pointing back
   // at the question's name.
   let b = Bytes::concat_all([
@@ -641,13 +641,13 @@ test "an answer is read with its names' pointers followed" {
       recursion: true,
       code: 0,
       question: Some({ name: "example.com", kind: Mx }),
-      results: [test_record("example.com", 300, Exchange(10, "mail.example.com"))],
+      answers: [test_record("example.com", 300, Exchange(10, "mail.example.com"))],
     }),
   )
 }
 
 test "every kind of record is read back as it was written" {
-  let m = answer(question(9, "example.org", Txt), 0, [
+  let m = response(question(9, "example.org", Txt), 0, [
     test_record("example.org", 60, Address(ip::read("192.0.2.1"))),
     test_record("example.org", 60, Address(ip::read("2001:db8::1"))),
     test_record("www.example.org", 3600, Alias("example.org")),
@@ -663,13 +663,13 @@ test "every kind of record is read back as it was written" {
     test_record("", 5, Opaque(99, b"\x01\x02")),
   ]);
   assert_eq(decode(encode_or_panic(m)), Some(m));
-  let cut = { ..m, truncated: true, code: 2, results: [] };
+  let cut = { ..m, truncated: true, code: 2, answers: [] };
   assert_eq(decode(encode_or_panic(cut)), Some(cut))
 }
 
 fn asking_one() -> Bytes = b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
 
-fn answering_one() -> Bytes = b"\x00\x01\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+fn returning_one() -> Bytes = b"\x00\x01\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
 
 test "{c.what} is no message" for c: { what: String, bytes: Bytes } in [
     { what: "a header cut short", bytes: b"\x12\x34\x01\x00\x00\x01" },
@@ -687,24 +687,24 @@ test "{c.what} is no message" for c: { what: String, bytes: Bytes } in [
       bytes: asking_one().concat(b"\x01a\x00\x00\xff\x00\x01"),
     },
     {
-      what: "an answer counted and not there",
-      bytes: answering_one().concat(b"\x01a\x00\x00\x01\x00\x01"),
+      what: "a result counted and not there",
+      bytes: returning_one().concat(b"\x01a\x00\x00\x01\x00\x01"),
     },
     {
       what: "an address of five bytes",
-      bytes: answering_one().concat(
+      bytes: returning_one().concat(
         b"\x01a\x00\x00\x01\x00\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x05\x01\x02\x03\x04\x05",
       ),
     },
     {
       what: "a name that ends short of its record",
-      bytes: answering_one().concat(
+      bytes: returning_one().concat(
         b"\x01a\x00\x00\x05\x00\x01\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x05\x00\x04\xc0\x0c\x00\x00",
       ),
     },
     {
       what: "a string that runs past its record",
-      bytes: answering_one().concat(
+      bytes: returning_one().concat(
         b"\x01a\x00\x00\x10\x00\x01\xc0\x0c\x00\x10\x00\x01\x00\x00\x00\x05\x00\x02\x05a",
       ),
     },
@@ -720,14 +720,14 @@ fn mail() -> List<Record> =
     test_record("example.org", 300, Exchange(10, "mail.example.org")),
   ]
 
-/// What a server that answers every question with `code` and `records` sends back for `query`.
+/// What a server that responds to every question with `code` and `records` sends back for `query`.
 fn replies(query: Bytes, code: Int, records: List<Record>) -> List<Bytes> / {abort.raise} =
   match decode(query) {
-    Some(request) -> [encode_or_panic(answer(request, code, records))],
+    Some(request) -> [encode_or_panic(response(request, code, records))],
     None -> [],
   }
 
-/// A server that answers every question with `mail`.
+/// A server that responds to every question with `mail`.
 fn mail_server(query: Bytes) -> List<Bytes> / {abort.raise} = replies(query, 0, mail())
 
 /// A server that fails every question.
@@ -760,7 +760,7 @@ test "a name's mail exchanges are queried and come back with their time to live"
       { preference: 10, host: "mail.example.org" },
       { preference: 20, host: "backup.example.org" },
     ]);
-    // One question and its answer were exchanged, and the socket that sent it is closed.
+    // One question and its response were exchanged, and the socket that sent it is closed.
     assert_eq(ran.udp.met.len(), 2);
     assert_eq(ran.udp.closed, [1])
   }
@@ -777,28 +777,28 @@ test "a question that is lost is sent again, as often as allowed and no more" {
   }
 }
 
-/// The replies from a server that sends `max_stray_datagrams` answers to other questions before
+/// The replies from a server that sends `max_stray_datagrams` responses to other questions before
 /// the real one.
 fn forging(max_stray_datagrams: Int, query: Bytes) -> List<Bytes> / {abort.raise} =
   match decode(query) {
     Some(request) -> {
       let other = { ..request, id: (request.id + 1) % 65536 };
-      let elsewhere = answer(question(request.id, "example.net", Mx), 0, [
+      let elsewhere = response(question(request.id, "example.net", Mx), 0, [
         test_record("example.net", 300, Exchange(0, "mallory.example")),
       ]);
       range(0, max_stray_datagrams).map(|i: Int|
         if i % 2 == 0 {
           encode_or_panic(
-            answer(other, 0, [test_record("example.org", 300, Exchange(0, "mallory.example"))]),
+            response(other, 0, [test_record("example.org", 300, Exchange(0, "mallory.example"))]),
           )
         } else { encode_or_panic(elsewhere) }).push(
-        encode_or_panic(answer(request, 0, mail())),
+        encode_or_panic(response(request, 0, mail())),
       )
     },
     None -> [],
   }
 
-test "an answer with another id is ignored in favor of the one that answers the question" {
+test "a response with another id is ignored in favor of the one that answers the question" {
   simulate {
     let world = udp::mem_with_responder(udp::mem_empty(), server(), |query: Bytes|
       forging(2, query));
@@ -820,7 +820,7 @@ fn arriving<a | e>(
     },
   }
 
-test "datagrams that are not the answer do not extend the wait for it" {
+test "datagrams that are not the response do not extend the wait for it" {
   simulate {
     let world = udp::mem_with_responder(udp::mem_empty(), server(), |query: Bytes|
       forging(3, query));
@@ -837,7 +837,7 @@ test "datagrams that are not the answer do not extend the wait for it" {
                 timeout_ms,
               ))).value).value).value;
     let began = clock.now();
-    // The answer is the fourth datagram, 800 milliseconds in: past one deadline, inside the other.
+    // The response is the fourth datagram, 800 ms in: past one deadline, inside the other.
     assert_eq(request(500), Err(TimedOut));
     assert_eq(clock.now(), after(began, millis(600)));
     assert_eq(request(1000), Ok(mail()))
@@ -887,7 +887,7 @@ test "a server that fails is skipped for the next one" {
   }
 }
 
-test "an answer truncated to fit a datagram is requested again over a connection" {
+test "a response truncated to fit a datagram is requested again over a connection" {
   let long = [
     test_record(
       "example.org",
@@ -898,7 +898,7 @@ test "an answer truncated to fit a datagram is requested again over a connection
   let cut = |query: Bytes|
     match decode(query) {
       Some(request) -> {
-        let short = answer(request, 0, []);
+        let short = response(request, 0, []);
         [encode_or_panic({ ..short, truncated: true })]
       },
       None -> [],
@@ -911,7 +911,7 @@ test "an answer truncated to fit a datagram is requested again over a connection
     net::mem_serving(net::mem_empty(), server(), [
       [
         Expects(exchange_on_connection(encode_or_panic(request))),
-        Sends(exchange_on_connection(encode_or_panic(answer(request, 0, long)))),
+        Sends(exchange_on_connection(encode_or_panic(response(request, 0, long)))),
       ],
     ]),
     3,
@@ -923,7 +923,7 @@ test "an answer truncated to fit a datagram is requested again over a connection
     assert_eq(texts(long), [b"v=spf1 include:_spf.example.net ~all"]);
     assert_eq(net::mem_unmet(ran.net, 1), []);
     assert_eq(ran.net.closed, [1]);
-    // With nobody answering on the connection, the truncated answer counts as no answer.
+    // With nobody responding on the connection, the truncated response counts as no response.
     assert_eq(resolve_over(world, net::mem_empty(), [server()], Txt, 1, 7).result, Err(TimedOut))
   }
 }
@@ -972,7 +972,7 @@ test "the system's servers are the ones queried" {
   }
 }
 
-test "the addresses of an answer carry their time to live" {
+test "the addresses of a response carry their time to live" {
   let records = [
     test_record("www.example.org", 30, Alias("example.org")),
     test_record("example.org", 120, Address(ip::read("192.0.2.1"))),

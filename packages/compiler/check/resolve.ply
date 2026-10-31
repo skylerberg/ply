@@ -1,5 +1,5 @@
 import compiler.syntax.parsing (Span, dummy_span, span_key)
-import compiler.syntax.type_syntax (AtomExpression, mode_text)
+import compiler.syntax.type_syntax (EffectExpression, mode_text)
 import compiler.syntax.items (Item, FunctionItem, FnDefinition, ImportDeclaration, parse,
                               dump_module)
 import std.list
@@ -276,7 +276,7 @@ test "two modules resolve each name to the definition it names, wherever it is w
   )
 }
 
-fn first_row(expanded: ResolvedProgram, m: Int) -> List<Bytes> / {abort.raise} = {
+fn first_effects(expanded: ResolvedProgram, m: Int) -> List<Bytes> / {abort.raise} = {
   let f = expanded.modules.get(m).module.items.fold(
     None,
     |acc: Option<FnDefinition>, item: Item|
@@ -287,13 +287,16 @@ fn first_row(expanded: ResolvedProgram, m: Int) -> List<Bytes> / {abort.raise} =
     Some(d) -> match d.effects {
       None -> [],
       Some(r) ->
-        r.atoms.map(|atom: AtomExpression|
+        r.listed.map(|entry: EffectExpression|
           Bytes::concat_all([
-            match atom.effect_name.module { Some(b) -> b.name.concat(b"::"), None -> b"" },
-            atom.effect_name.name.name,
+            match entry.effect_name.module { Some(b) -> b.name.concat(b"::"), None -> b"" },
+            entry.effect_name.name.name,
             b".",
-            match atom.op { Some(o) -> o.name, None -> mode_text(atom.mode) },
-            match atom.resource { Some(l) -> Bytes::concat_all([b"[", l.name, b"]"]), None -> b"" },
+            match entry.op { Some(o) -> o.name, None -> mode_text(entry.mode) },
+            match entry.resource {
+              Some(l) -> Bytes::concat_all([b"[", l.name, b"]"]),
+              None -> b"",
+            },
           ])),
     },
   }
@@ -302,7 +305,7 @@ fn first_row(expanded: ResolvedProgram, m: Int) -> List<Bytes> / {abort.raise} =
 fn resolve_or_panic(sources: List<Source>) -> ResolvedProgram / {abort.raise} =
   match resolve(sources) {
     ResolveSucceeded(x) -> x,
-    ResolveFailed(ds) -> panic(String::of_bytes(b"refused: ".concat(dump_diagnostics(ds)))),
+    ResolveFailed(ds) -> panic(String::of_bytes(b"rejected: ".concat(dump_diagnostics(ds)))),
   }
 
 test "a module below `std.internal` is imported by the toolchain's modules alone" {
@@ -337,14 +340,14 @@ test "a `pub` set is named by import or through its module, and means what it me
     { name: b"base", src: store_base() },
     { name: b"app", src: b"import base (Reads)\nfn f() -> Int / {Reads} = 1" },
   ]);
-  assert_eq(first_row(by_name, 0), [b"store.read[orders]", b"log.write"]);
-  assert_eq(first_row(by_name, 1), [b"@base::store.read[orders]", b"log.write"]);
+  assert_eq(first_effects(by_name, 0), [b"store.read[orders]", b"log.write"]);
+  assert_eq(first_effects(by_name, 1), [b"@base::store.read[orders]", b"log.write"]);
   assert(find_module_binding(by_name.r.scopes.get(1).modules, b"@base") != None);
   let through = resolve_or_panic([
     { name: b"base", src: store_base() },
     { name: b"app", src: b"import base\nfn f() -> Int / {base::Reads} = 1" },
   ]);
-  assert_eq(first_row(through, 1), [b"@base::store.read[orders]", b"log.write"])
+  assert_eq(first_effects(through, 1), [b"@base::store.read[orders]", b"log.write"])
 }
 
 test "a set may include another module's, and a third module names the whole of it" {
@@ -353,10 +356,10 @@ test "a set may include another module's, and a third module names the whole of 
     { name: b"mid", src: b"import base (Reads)\npub effect set All = {Reads, clock.read}" },
     { name: b"app", src: b"import mid (All)\nfn f() -> Int / {All} = 1" },
   ]);
-  assert_eq(first_row(x, 2), [b"@base::store.read[orders]", b"clock.read", b"log.write"])
+  assert_eq(first_effects(x, 2), [b"@base::store.read[orders]", b"clock.read", b"log.write"])
 }
 
-test "a set is refused where it is named when nothing declares it, its module keeps it, or it names itself" {
+test "a set is rejected where it is named when nothing declares it, its module keeps it private, or it names itself" {
   assert_eq(error_codes([{ name: b"app", src: b"fn f() -> Int / {Nope} = 1" }]), [b"E0114"]);
   let hidden = b"effect set Hidden = {log.write}\n";
   assert_eq(
@@ -393,7 +396,7 @@ test "a set is refused where it is named when nothing declares it, its module ke
 fn lib_and_app(lib: Bytes, app: Bytes) -> List<Source> =
   [{ name: b"lib", src: lib }, { name: b"app", src: app }]
 
-test "a missing module, an import cycle and two modules of one name are refused" {
+test "a missing module, an import cycle and two modules of one name are rejected" {
   assert_eq(
     error_codes([{ name: b"app", src: b"import nowhere\nimport std.nowhere\nfn f() -> Int = 1" }]),
     [b"E0106", b"E0106"],
@@ -416,7 +419,7 @@ test "a missing module, an import cycle and two modules of one name are refused"
   )
 }
 
-test "an imported name is refused when its module keeps or lacks it, the importer declares it, or another import binds it" {
+test "an imported name is rejected when its module keeps it private or lacks it, the importer declares it, or another import binds it" {
   assert_eq(
     error_codes(
       lib_and_app(
@@ -474,7 +477,7 @@ test "an opaque sum's constructors stay with its module: the type is imported, a
     [
       {
         code: b"E0107",
-        notes: [b"`lib` answers one from `mint`", b"`lib` reads one with `spent`"],
+        notes: [b"`lib` returns one from `mint`", b"`lib` reads one with `spent`"],
       },
     ],
   );
@@ -532,7 +535,7 @@ test "a call resolves with its parameters left to their defaults, and a local of
   )
 }
 
-test "a named argument is refused when it names no parameter or one twice, or leaves one unfilled" {
+test "a named argument is rejected when it names no parameter or one twice, or leaves one unfilled" {
   assert_eq(
     error_codes(
       lib_and_app(defaults_lib(), b"import lib (greet)\nfn e() -> Bytes = greet(nope: 1)"),
@@ -563,7 +566,7 @@ test "a named argument is refused when it names no parameter or one twice, or le
   )
 }
 
-test "a default is refused when it calls, names a parameter, or names what its module keeps" {
+test "a default is rejected when it calls, names a parameter, or names what its module keeps private" {
   assert_eq(
     error_codes(
       lib_and_app(

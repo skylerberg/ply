@@ -63,7 +63,7 @@ import std.time (after, as_millis, as_nanos, between, millis, nanos, seconds)
 /// Why a socket operation failed.
 pub type Error =
   /// Nothing is listening where the connection was sent.
-  | Refused
+  | Rejected
   /// No route leads to the address.
   | Unreachable
   /// The deadline passed first.
@@ -223,13 +223,13 @@ pub nondet effect net {
 /// Errors from opening or upgrading a socket.
 pub effect socket {
   /// A connection did not open, or an upgrade did not complete.
-  raise fail(why: Error)
+  raise fail(reason: Error)
 }
 
 /// An error as a sentence.
-pub fn error_message(why: Error) -> String =
-  match why {
-    Refused -> "nothing is listening there",
+pub fn error_message(reason: Error) -> String =
+  match reason {
+    Rejected -> "nothing is listening there",
     Unreachable -> "no route leads there",
     TimedOut -> "the deadline passed first",
     Reset -> "the peer ended the connection",
@@ -285,7 +285,10 @@ pub fn dial_address<[l]>(
   options: List<SocketOption>,
   timeout_ms: Int,
 ) -> Int / {net.connect_to[l], socket.fail} =
-  match net.connect_to[l](to, options, timeout_ms) { Ok(c) -> c, Err(why) -> socket.fail(why) }
+  match net.connect_to[l](to, options, timeout_ms) {
+    Ok(c) -> c,
+    Err(reason) -> socket.fail(reason),
+  }
 
 /// A connection to `name` at `port`. Its addresses are looked up through `dns`, ordered by
 /// `dns::interleave`, and tried one at a time until one connects. `timeout_ms` is one deadline on
@@ -352,7 +355,7 @@ fn reached<[l]>(
         None -> socket.fail(TimedOut),
         Some(left) -> match net.connect_to[l](to, options, max(left / addresses.len(), 1)) {
           Ok(c) -> c,
-          Err(why) -> if rest.len() == 0 { socket.fail(why) }
+          Err(reason) -> if rest.len() == 0 { socket.fail(reason) }
           else { reached[l](rest, port, options, end) },
         },
       },
@@ -369,7 +372,7 @@ pub fn secure<[l]>(
 ) -> UpgradeResult / {net.start_tls[l], socket.fail} =
   match net.start_tls[l](conn, name, alpn, unread, timeout_ms) {
     Ok(secured) -> secured,
-    Err(why) -> socket.fail(why),
+    Err(reason) -> socket.fail(reason),
   }
 
 /// Secures `conn` as its server, or raises why it could not: `net.serve_tls`, with its rules.
@@ -382,7 +385,7 @@ pub fn secure_accepted<[l]>(
 ) -> UpgradeResult / {net.serve_tls[l], socket.fail} =
   match net.serve_tls[l](conn, credential, alpn, unread, timeout_ms) {
     Ok(secured) -> secured,
-    Err(why) -> socket.fail(why),
+    Err(reason) -> socket.fail(reason),
   }
 
 /// A TLS connection to `name` at `port`, dialled as `dial` dials and then secured as `name`,
@@ -404,9 +407,9 @@ pub fn dial_tls<[l]>(
   };
   match secured {
     Ok(_) -> c,
-    Err(why) -> {
+    Err(reason) -> {
       net.close[l](c);
-      socket.fail(why)
+      socket.fail(reason)
     },
   }
 }
@@ -416,11 +419,11 @@ pub fn listening<[l]>(
   at: SocketAddress,
   options: List<SocketOption>,
 ) -> Int / {net.listen_on[l], socket.fail} =
-  match net.listen_on[l](at, options) { Ok(s) -> s, Err(why) -> socket.fail(why) }
+  match net.listen_on[l](at, options) { Ok(s) -> s, Err(reason) -> socket.fail(reason) }
 
 /// A listener on the Unix socket at `path` under `root`, or raises why it could not open.
 pub fn listening_unix<[l]>(root: String, path: String) -> Int / {net.listen_unix[l], socket.fail} =
-  match net.listen_unix[l](root, path) { Ok(s) -> s, Err(why) -> socket.fail(why) }
+  match net.listen_unix[l](root, path) { Ok(s) -> s, Err(reason) -> socket.fail(reason) }
 
 /// A connection to the Unix socket at `path` under `root`, or raises why it could not open.
 pub fn dial_unix<[l]>(
@@ -428,7 +431,10 @@ pub fn dial_unix<[l]>(
   path: String,
   timeout_ms: Int,
 ) -> Int / {net.connect_unix[l], socket.fail} =
-  match net.connect_unix[l](root, path, timeout_ms) { Ok(c) -> c, Err(why) -> socket.fail(why) }
+  match net.connect_unix[l](root, path, timeout_ms) {
+    Ok(c) -> c,
+    Err(reason) -> socket.fail(reason),
+  }
 
 /// A connection as a source. Each pull is one `recv` within `timeout_ms`, the source ends when the
 /// peer finishes sending, and a deadline raises `TimedOut`. Its `close` closes the connection, so
@@ -447,8 +453,8 @@ pub fn reading<[l]>(
   }
 
 /// A connection as a sink. A push sends everything it is given, each write within `timeout_ms`.
-/// Its `close` ends this end's sending and leaves the connection open for reading, so hold it
-/// inside the hold of the connection's source.
+/// Its `close` ends this end's sending and leaves the connection open for reading, so open it
+/// inside the scope of the connection's source.
 pub fn writing<[l]>(
   conn: Int,
   timeout_ms: Int,
@@ -477,7 +483,7 @@ pub type Step =
   /// It does its half of a TLS handshake here, and what follows is read only once secured.
   | Upgrades
   /// It fails a TLS handshake here with this error.
-  | Refuses(Error)
+  | Rejects(Error)
   /// It sends nothing before one deadline passes.
   | Stalls
   /// It sends nothing more and stays connected: every read from here on is a deadline.
@@ -587,9 +593,9 @@ pub fn mem_server_certificate(n: MemNet, name: String, der: Bytes) -> MemNet =
 pub fn mem_serving(n: MemNet, at: SocketAddress, scripts: List<List<Step>>) -> MemNet =
   { ..n, reaches: n.reaches.insert(ip::render_socket(at), Serving(scripts)) }
 
-/// The network with every connection to `at` failing with `why`.
-pub fn mem_failing(n: MemNet, at: SocketAddress, why: Error) -> MemNet =
-  { ..n, reaches: n.reaches.insert(ip::render_socket(at), Failing(why)) }
+/// The network with every connection to `at` failing with `reason`.
+pub fn mem_failing(n: MemNet, at: SocketAddress, reason: Error) -> MemNet =
+  { ..n, reaches: n.reaches.insert(ip::render_socket(at), Failing(reason)) }
 
 /// The network with a peer on the Unix socket at `path` under `root`.
 pub fn mem_serving_unix(
@@ -982,8 +988,8 @@ fn opened(
           },
           result: Ok(n.next),
         },
-      Some(Failing(why)) -> { net: n, result: Err(why) },
-      _ -> { net: n, result: Err(Refused) },
+      Some(Failing(reason)) -> { net: n, result: Err(reason) },
+      _ -> { net: n, result: Err(Rejected) },
     },
   }
 }
@@ -1300,14 +1306,14 @@ fn upgraded(
       result: Ok({ protocol: alpn.at(0) }),
     }
   };
-  let over = |why: Error| {
+  let over = |reason: Error| {
     {
       net: parted(
         with_conn(n, conn, { ..c, script: [], fed: false, gone: true, ended: true, joined: None }),
         c.joined,
         true,
       ),
-      result: Err(why),
+      result: Err(reason),
     }
   };
   if c.secured != None {
@@ -1325,7 +1331,7 @@ fn upgraded(
       [Upgrades, ..rest] -> secured(rest),
       [Sends(_), ..] -> over(Injected),
       [Repeats(_), ..] -> over(Injected),
-      [Refuses(why), ..] -> over(why),
+      [Rejects(reason), ..] -> over(reason),
       [] -> if c.joined != None { secured([]) } else { over(Reset) },
       _ -> over(TimedOut),
     }
@@ -1513,7 +1519,7 @@ pub type RunResult<a> = { value: a, net: MemNet }
 /// Runs `go` over `start`, with every `net` operation under every label handled by the fake and
 /// every `dns` operation by the fake's table. Tests use it for code that opens, serves or secures
 /// connections. Code that starts tasks, as `dial` does to limit its lookup, runs in a `simulate`
-/// region opened inside `go`, so that the fake's handler encloses the scheduler.
+/// block opened inside `go`, so that the fake's handler encloses the scheduler.
 pub fn on_mem<a | e>(
   start: MemNet,
   go: () -> a / {net.read[*], net.write[*], dns.lookup, dns.reverse, dns.servers | e},
@@ -1972,12 +1978,12 @@ pub fn encode_options(options: List<SocketOption>) -> Bytes / {abort.raise} =
 pub fn decode_options(flat: Bytes) -> List<SocketOption> / {abort.raise} =
   parts(flat).map(decode_option)
 
-/// The error a socket native wrote: its kind's byte, `Refused` 1 to `Other` 11 in declaration
+/// The error a socket native wrote: its kind's byte, `Rejected` 1 to `Other` 11 in declaration
 /// order, then `Handshake`'s reason, or `Other`'s code and message as parts.
 fn decode_socket_error(flat: Bytes) -> Error / {abort.raise} = {
   let rest = flat.slice(1, flat.len());
   match flat.at(0) {
-    1 -> Refused,
+    1 -> Rejected,
     2 -> Unreachable,
     3 -> TimedOut,
     4 -> Reset,
@@ -2033,13 +2039,13 @@ test "an address, an option and an error read back as the host's natives write t
   ];
   assert_eq(decode_options(encode_options(options)), options);
   assert_eq(decode_options(encode_options([])), []);
-  let refused = |kind: Bytes| decode_result(b"\x00".concat(kind), |_: Bytes| ());
-  assert_eq(refused(b"\x01"), Err(Refused));
-  assert_eq(refused(b"\x09"), Err(Untrusted));
-  assert_eq(refused(b"\x0Ano shared cipher"), Err(Handshake("no shared cipher")));
+  let rejected = |kind: Bytes| decode_result(b"\x00".concat(kind), |_: Bytes| ());
+  assert_eq(rejected(b"\x01"), Err(Rejected));
+  assert_eq(rejected(b"\x09"), Err(Untrusted));
+  assert_eq(rejected(b"\x0Ano shared cipher"), Err(Handshake("no shared cipher")));
   assert_eq(
-    refused(b"\x0B".concat(encode_parts([i64_be(61), b"refused by the system"]))),
-    Err(Other(61, "refused by the system")),
+    rejected(b"\x0B".concat(encode_parts([i64_be(61), b"rejected by the system"]))),
+    Err(Other(61, "rejected by the system")),
   );
   assert_eq(decode_result(b"\x01".concat(i64_be(7)), decode_int), Ok(7))
 }
@@ -2131,7 +2137,7 @@ fn relayed(script: List<Step>) -> MemNet / {ip.fail, abort.raise} =
 fn to_relay() -> Int / {net.connect_to[relay], ip.fail, abort.raise} =
   match net.connect_to[relay](ip::read_socket("192.0.2.25:25"), [], 1000) {
     Ok(c) -> c,
-    Err(_) -> panic("the relay refused"),
+    Err(_) -> panic("the relay rejected"),
   }
 
 test "a scripted peer sends its lines in order, waits to receive the program's, and ends" {
@@ -2296,16 +2302,16 @@ test "plaintext sent after the go-ahead is rejected, whether it is in the socket
     || {
       let c = to_relay();
       let _go_ahead = net.recv[relay](c, 512, 1000);
-      let refused = net.start_tls[relay](c, "mail.example", [], b"", 1000);
+      let rejected = net.start_tls[relay](c, "mail.example", [], b"", 1000);
       {
         c: c,
-        refused: refused,
+        rejected: rejected,
         read: net.recv[relay](c, 512, 1000),
         wrote: net.send[relay](c, b"AUTH", 1000),
       }
     },
   );
-  assert_eq(waiting.value.refused, Err(Injected));
+  assert_eq(waiting.value.rejected, Err(Injected));
   // The connection is over: nothing injected is ever read as if it were secured.
   assert_eq(waiting.value.read, Some(b""));
   assert_eq(waiting.value.wrote, Some(0));
@@ -2330,14 +2336,14 @@ test "an upgrade whose peer {c.told} returns {c.shown}" for c: { told: String, s
     },
     {
       told: "shows a certificate not trusted",
-      script: [Refuses(Untrusted)],
+      script: [Rejects(Untrusted)],
       alpn: [],
       shown: "Untrusted",
       result: Err(Untrusted),
     },
     {
       told: "fails the handshake",
-      script: [Refuses(Handshake("no cipher suite in common"))],
+      script: [Rejects(Handshake("no cipher suite in common"))],
       alpn: [],
       shown: "why",
       result: Err(Handshake("no cipher suite in common")),
@@ -2370,7 +2376,7 @@ test "an upgrade whose peer {c.told} returns {c.shown}" for c: { told: String, s
 }
 
 test "a failed connection or upgrade is raised by the functions that open one" {
-  let ran = on_mem(relayed([Refuses(Untrusted)]), || {
+  let ran = on_mem(relayed([Rejects(Untrusted)]), || {
     let c = to_relay();
     let upgrade: Result<UpgradeResult, Error> = try {
       secure[relay](c, "mail.example", [], b"", 1000)
@@ -2384,7 +2390,7 @@ test "a failed connection or upgrade is raised by the functions that open one" {
     { upgrade: upgrade, nobody: nobody, beyond: beyond }
   });
   assert_eq(ran.value.upgrade, Err(Untrusted));
-  assert_eq(ran.value.nobody, Err(Refused));
+  assert_eq(ran.value.nobody, Err(Rejected));
   assert_eq(ran.value.beyond, Err(PermissionDenied))
 }
 
@@ -2474,7 +2480,7 @@ test "a connection to the program's own listener joins the two ends" {
     let quiet = net.recv[conn](server, 64, 1000);
     let asked = net.send[client](client, b"ping", 1000);
     let heard = net.recv[conn](server, 64, 1000);
-    let answered = net.send[conn](server, b"pong", 1000);
+    let returned = net.send[conn](server, b"pong", 1000);
     net.close_write[client](client);
     let after_end = net.send[client](client, b"more", 1000);
     let ended = net.recv[conn](server, 64, 1000);
@@ -2484,7 +2490,7 @@ test "a connection to the program's own listener joins the two ends" {
       quiet: quiet,
       asked: asked,
       heard: heard,
-      answered: answered,
+      returned: returned,
       after_end: after_end,
       ended: ended,
       reply: reply,
@@ -2496,7 +2502,7 @@ test "a connection to the program's own listener joins the two ends" {
   assert_eq(ran.value.quiet, None);
   assert_eq(ran.value.asked, Some(4));
   assert_eq(ran.value.heard, Some(b"ping"));
-  assert_eq(ran.value.answered, Some(4));
+  assert_eq(ran.value.returned, Some(4));
   assert_eq(ran.value.after_end, Some(0));
   assert_eq(ran.value.ended, Some(b""));
   assert_eq(ran.value.reply, Some(b"pong"));
@@ -2552,12 +2558,12 @@ test "a name connects where the network's table says, each address tried in the 
     Err(Other(0, "a name is ASCII: an internationalized name is looked up by its A-labels")),
   );
   // The last address tried is the one whose error is raised: the peer has no script left.
-  assert_eq(ran.value.spent, Err(Refused))
+  assert_eq(ran.value.spent, Err(Rejected))
 }
 
 /// Runs `go` over a network where a connection to one of `dead` never responds, which costs its
 /// caller the whole deadline it gave, and a connection to any other address succeeds at once.
-fn unanswered<a | e>(
+fn pending<a | e>(
   dead: List<SocketAddress>,
   go: () -> a / {net.connect_to[db] | e},
 ) -> a / {clock.write | e} =
@@ -2580,16 +2586,16 @@ test "a dial is one deadline: an address that does not respond costs its share o
     dns::on_table(names, ||
       task::unbounded(|| {
         // The first of three is given a third, and the second responds.
-        assert_eq(unanswered(at(1), || dial[db]("db.example", 5432, [], 900)), 7);
+        assert_eq(pending(at(1), || dial[db]("db.example", 5432, [], 900)), 7);
         assert_eq(since(), 300);
         // Half of what the first left, then all of what the second left: the deadline and no more.
         let none: Result<Int, Error> = try {
-          unanswered(at(3), || dial[db]("db.example", 5432, [], 1000))
+          pending(at(3), || dial[db]("db.example", 5432, [], 1000))
         };
         assert_eq((none, since()), (Err(TimedOut), 1300));
         // Under a deadline that is earlier than its own, the shares are of that one.
         let held = task::timeout(millis(300), ||
-          unanswered(at(1), || dial[db]("db.example", 5432, [], 900)));
+          pending(at(1), || dial[db]("db.example", 5432, [], 900)));
         assert_eq((held, since()), (task::Done(7), 1400))
       }))
   }
@@ -2599,19 +2605,19 @@ test "a TLS connection by name is dialled, secured, and closed when it does not 
   let names = dns::with_name(dns::table(), "api.example", [ip::read("192.0.2.7")]);
   let world = mem_serving(mem_resolving(mem_empty(), names), ip::read_socket("192.0.2.7:443"), [
     [Upgrades, Sends(b"ok")],
-    [Refuses(Untrusted)],
+    [Rejects(Untrusted)],
   ]);
   let ran = on_mem(world, ||
     simulate {
       task::unbounded(|| {
         let c = dial_tls[api]("api.example", 443, ["h2"], [], 1000);
-        let refused: Result<Int, Error> = try { dial_tls[api]("api.example", 443, [], [], 1000) };
-        { c: c, read: net.recv[api](c, 16, 1000), refused: refused }
+        let rejected: Result<Int, Error> = try { dial_tls[api]("api.example", 443, [], [], 1000) };
+        { c: c, read: net.recv[api](c, 16, 1000), rejected: rejected }
       })
     });
   assert_eq(ran.value.read, Some(b"ok"));
   assert_eq(mem_secured(ran.net, ran.value.c), Some("api.example"));
-  assert_eq(ran.value.refused, Err(Untrusted));
+  assert_eq(ran.value.rejected, Err(Untrusted));
   assert_eq(ran.net.closed, [2])
 }
 
@@ -2696,7 +2702,7 @@ test "a socket keeps the options it was opened with and the ones set on it since
         1000,
       ) {
       Ok(c) -> c,
-      Err(_) -> panic("the relay refused"),
+      Err(_) -> panic("the relay rejected"),
     };
     let opened = net.options[relay](c);
     let set = net.set_option[relay](c, Linger(Some(Duration(0))));
@@ -2738,7 +2744,7 @@ test "a Unix socket is a path one listener owns until it closes, and its far end
   });
   assert_eq(ran.value.twice, Err(AddressInUse));
   assert_eq(ran.value.taken, Err(AddressInUse));
-  assert_eq(ran.value.nobody, Err(Refused));
+  assert_eq(ran.value.nobody, Err(Rejected));
   assert_eq(ran.value.ends, [None, None]);
   assert_eq(ran.value.owners, [None, Some(who)]);
   assert_eq(ran.value.read, [Some(b"hello"), Some(b"{}")]);
@@ -2746,7 +2752,7 @@ test "a Unix socket is a path one listener owns until it closes, and its far end
   assert_eq(ran.value.again, Ok(6))
 }
 
-test "a connection is read and written as streams, and its hold closes it" {
+test "a connection is read and written as streams, and its scope closes it" {
   let script = [Expects(b"PING\n"), ExpectsEnd, Sends(b"one\ntw"), Sends(b"o\nthree")];
   let ran = on_mem(relayed(script), || {
     let c = to_relay();

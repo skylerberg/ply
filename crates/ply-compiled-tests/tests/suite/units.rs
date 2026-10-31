@@ -71,9 +71,9 @@ fn head() -> String {
     }
     out.push_str("} PlyCtx;\n");
     for h in helpers() {
-        let (answer, params) = signature(h.args(), h.answers());
+        let (result, params) = signature(h.args(), h.results());
         out.push_str(&format!(
-            "extern {answer} (*{})({params});\n",
+            "extern {result} (*{})({params});\n",
             pointer(h.name)
         ));
     }
@@ -84,24 +84,24 @@ fn head() -> String {
 fn bound() -> String {
     let mut out = String::new();
     for h in helpers() {
-        let (answer, params) = signature(h.args(), h.answers());
-        out.push_str(&format!("{answer} (*{})({params});\n", pointer(h.name)));
+        let (result, params) = signature(h.args(), h.results());
+        out.push_str(&format!("{result} (*{})({params});\n", pointer(h.name)));
     }
     out.push_str("void ply_bind(void **fns) {\n");
     for (i, h) in helpers().iter().enumerate() {
-        let (answer, params) = signature(h.args(), h.answers());
+        let (result, params) = signature(h.args(), h.results());
         let p = pointer(h.name);
-        out.push_str(&format!("  {p} = ({answer} (*)({params}))fns[{i}];\n"));
+        out.push_str(&format!("  {p} = ({result} (*)({params}))fns[{i}];\n"));
     }
     out.push_str("}\n");
     out
 }
 
 /// A helper's C return type and parameters: the context, then `args` words.
-fn signature(args: usize, answers: bool) -> (&'static str, String) {
+fn signature(args: usize, results: bool) -> (&'static str, String) {
     let params = std::iter::once("PlyCtx*").chain(std::iter::repeat_n("Word", args));
     (
-        if answers { "Word" } else { "void" },
+        if results { "Word" } else { "void" },
         params.collect::<Vec<_>>().join(", "),
     )
 }
@@ -117,7 +117,7 @@ pub fn lifting(read: &str) -> String {
     )
 }
 
-/// The C of an `R#entered` that reads one `Int`, calls `root` over it and writes the `Int` it answers.
+/// The C of an `R#entered` that reads an `Int`, calls `root` on it and writes the `Int` it returns.
 pub fn int_entry(root: &str) -> String {
     format!(
         "{}  Word r = {}(ctx, ply_imm(n));\n  if (ctx->failed) return 0;\n  {}(ctx, ply_imm_value(r));\n  return 0;",
@@ -175,7 +175,7 @@ pub fn exports_of(defs: &[Def]) -> Laid {
                 .map(|h| HelperShape {
                     name: h.name.to_string(),
                     args: h.args(),
-                    answers: h.answers(),
+                    results: h.results(),
                 })
                 .collect(),
             constants: Vec::new(),
@@ -288,7 +288,7 @@ pub fn library(dir: &Path, text: &str) -> Option<PathBuf> {
     };
     assert!(
         out.status.success(),
-        "the C compiler refused the unit:\n{}",
+        "the C compiler rejected the unit:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     Some(lib)
@@ -306,7 +306,7 @@ pub fn opened(
     Some(ply_compiled::c::load_opened(&lib).map_err(|e| format!("{e:#}")))
 }
 
-/// One entry of `native`'s `name`: what it answered as a word, or what it raised.
+/// One entry of `native`'s `name`: what it returned as a word, or what it raised.
 pub fn entered(
     native: &ply_compiled::c::Native,
     name: &str,
@@ -317,12 +317,12 @@ pub fn entered(
         .unwrap_or_else(|| panic!("the unit does not take `{name}`"));
     let mut ctx = native.context();
     ctx.begin();
-    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let result = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
     let raised = ctx.take_failure().map(|d| d.message);
     ctx.end();
     if failed == 0 {
-        Ok(answer)
+        Ok(result)
     } else {
         Err(raised.unwrap_or_default())
     }

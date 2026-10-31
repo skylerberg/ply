@@ -8,7 +8,7 @@
 //! written.
 
 use crate::heap::{self, HEADER, Heap, IMMORTAL, Obj, SHARED, Word};
-use crate::native::{Answered, Machine, Taken};
+use crate::native::{Machine, Returned, Taken};
 use crate::rt::Ctx;
 
 /// A block emitted code made, or a runtime object it held the last count of, as a native takes it.
@@ -58,7 +58,7 @@ impl Block {
     /// Gives back a runtime handle whose last holder was the caller.
     ///
     /// # Safety
-    /// The block is a live handle the runtime made, a bridge, a native object or a hold; `ctx` is
+    /// The block is a live runtime handle, a bridge, a native object or a scoped value; `ctx` is
     /// the running entry's.
     pub unsafe fn free_handle(self, ctx: *mut Ctx) {
         unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap, ctx) }
@@ -135,7 +135,7 @@ fn payload(bytes: Word) -> usize {
 pub struct Handed(Word);
 
 impl Handed {
-    /// The word a call of compiled code passes or answers.
+    /// The word a call of compiled code passes or returns.
     pub(crate) fn word(self) -> Word {
         self.0
     }
@@ -146,7 +146,7 @@ impl Handed {
 }
 
 /// A runtime object compiled code holds, which the runtime lays out and so may read: a bridge (a
-/// task, a channel or a credential), what a native made, or a hold.
+/// task, a channel or a credential), what a native made, or a scoped value.
 #[repr(transparent)]
 pub struct Handle(Word);
 
@@ -160,8 +160,8 @@ impl Handle {
     }
 }
 
-/// A `Secret`'s handle: the runtime object holding the credential ([`crate::secret::Sealed`]), lent
-/// to a native that takes it and owned by the code a native answers it to.
+/// A `Secret`'s handle: the runtime object holding the credential ([`crate::secret::Sealed`]),
+/// borrowed by a native that takes it and owned by the code a native returns it to.
 #[repr(transparent)]
 pub struct SecretHandle(Word);
 
@@ -176,8 +176,8 @@ impl SecretHandle {
 }
 
 /// `type#T`: a type's descriptor, static data emitted code lays out, through which the runtime
-/// counts and crosses a value of the type it holds as a [`Carried`]. Each entry takes the value's
-/// word form; what `inc`, `dec` and `lower` answer is unread.
+/// counts and marshals a value of the type it holds as a [`Carried`]. Each entry takes the value's
+/// word form; what `inc`, `dec` and `lower` return is unread.
 #[repr(C)]
 pub struct PlyType {
     /// The low 64 bits of the digest of the type's spelling, which tells two types apart.
@@ -189,11 +189,11 @@ pub struct PlyType {
     pub inc: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
     /// One holder fewer, the last releasing the value as its type does.
     pub dec: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    /// Appends the value's encoding to the context's lowering, borrowing it: the runtime's refusal
+    /// Appends the value's encoding to the context's lowering, borrowing it: the runtime's error
     /// where no diagnostic shows a value of the type.
     pub lower: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    /// Reads a value of the type from the context's lifting, answering its word form: the runtime's
-    /// refusal for every type but `String`.
+    /// Reads a value of the type from the context's lifting, returning its word form: the runtime's
+    /// error for every type but `String`.
     pub lift: unsafe extern "C" fn(*mut Ctx) -> Word,
 }
 
@@ -218,13 +218,13 @@ unsafe impl Sync for PlyKept {}
 
 /// `op#effect.op@T1..Tk`: an operation at its perform's type arguments, static data emitted code
 /// lays out and hands an operation's entry, through whose types the runtime crosses what the
-/// perform passes and is answered.
+/// perform passes and is returned.
 #[repr(C)]
 pub struct PlyOp {
     /// The effect's and the operation's names, by their places in the unit's field table.
     pub effect: i64,
     pub op: i64,
-    /// What the operation answers.
+    /// What the operation returns.
     pub answer: *const PlyType,
     /// Which parameters are the operation's own type parameter, bit `i` for parameter `i`: those
     /// the runtime keeps as [`Carried`] values rather than reading.
@@ -249,7 +249,7 @@ impl PlyOp {
         unsafe { types(self.vars, self.vars_len) }
     }
 
-    pub fn answer(&self) -> &'static PlyType {
+    pub fn result(&self) -> &'static PlyType {
         unsafe { &*self.answer }
     }
 
@@ -271,7 +271,7 @@ unsafe fn types<'a>(at: *const *const PlyType, n: i64) -> &'a [&'static PlyType]
 /// A function value emitted code made, which the runtime calls and lets go of through the
 /// [`PlyFnDesc`] its block names.
 impl Block {
-    /// What the function answers for `args`, each a word form it takes; the block is borrowed.
+    /// What the function returns for `args`, each a word form it takes; the block is borrowed.
     ///
     /// # Safety
     /// The block is a closure emitted code laid out, and live; `ctx` is the running entry's.
@@ -366,8 +366,8 @@ pub type DropRoot = unsafe extern "C" fn(*mut Ctx, Handed) -> Word;
 
 /// A keep root, `keep#T`, as emitted code writes one: given a value of its type, which it borrows,
 /// a copy of it on the unit's persistent heap, immortal, that outlives every entry (a value already
-/// immortal answered as itself); or 0 where the value may not outlive the entry that made it, as
-/// one holding a continuation, a hold, a task, a channel or a secret may not.
+/// immortal returned as itself); or 0 where the value may not outlive the entry that made it, as
+/// one holding a continuation, a scoped value, a task, a channel or a secret may not.
 pub type KeepRoot = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 
 /// A function value's descriptor, static data emitted code lays out per lambda, which the first word
@@ -386,7 +386,7 @@ pub struct PlyFnDesc {
     pub release: DropRoot,
     /// Marks the block and what it holds shared, before a thread other than the one that made it
     /// may hold it: anything but 0, or 0 where a capture cannot cross threads. A block is marked
-    /// only once everything it holds is, so one marked already is answered for without a walk.
+    /// only once everything it holds is, so one marked already returns without a walk.
     pub share: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
     /// The block copied to outlive every entry, as a memoized constant does; 0 where a capture may
     /// not outlive the entry that made it.
@@ -429,7 +429,7 @@ unsafe impl Taken for *const Handed {
 }
 
 // SAFETY: each is returned as one machine word, as an `int64_t` is.
-unsafe impl Answered for Block {
+unsafe impl Returned for Block {
     const MACHINE: Option<Machine> = Some(Machine::Block);
     const RAISES: bool = false;
     fn of(w: Word) -> Block {
@@ -437,7 +437,7 @@ unsafe impl Answered for Block {
     }
 }
 
-unsafe impl Answered for Handed {
+unsafe impl Returned for Handed {
     const MACHINE: Option<Machine> = Some(Machine::Handed);
     const RAISES: bool = false;
     fn of(w: Word) -> Handed {
@@ -445,7 +445,7 @@ unsafe impl Answered for Handed {
     }
 }
 
-unsafe impl Answered for Handle {
+unsafe impl Returned for Handle {
     const MACHINE: Option<Machine> = Some(Machine::Handle);
     const RAISES: bool = false;
     fn of(w: Word) -> Handle {
@@ -453,7 +453,7 @@ unsafe impl Answered for Handle {
     }
 }
 
-unsafe impl Answered for SecretHandle {
+unsafe impl Returned for SecretHandle {
     const MACHINE: Option<Machine> = Some(Machine::Secret);
     const RAISES: bool = false;
     fn of(w: Word) -> SecretHandle {

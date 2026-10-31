@@ -1,5 +1,5 @@
 //! The families this binary serves itself, as the runtime's natives bind them: a binding from what
-//! a run is lent alone, what the families register and the facts a run's disclosures print, and the
+//! a run is granted alone, what families register and the facts a run's disclosures print, and the
 //! world a trace of the run's reads is read against.
 
 use crate::hosts::Hosts;
@@ -24,7 +24,7 @@ struct Binder;
 impl ply_compiled::entry::Binder for Binder {
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>> {
         let hosts = Hosts::granted(&grants)?;
-        Ok(Arc::new(Lent {
+        Ok(Arc::new(Borrowed {
             world: Worldly::of(&grants),
             hosts,
         }))
@@ -37,10 +37,12 @@ impl ply_compiled::entry::Binder for Binder {
     /// `named := string name, string path`; `sink := string sink, string destination,
     /// option(string) level`.
     fn hosting(&self, grants: &Grants, w: &mut Writer) {
-        let mut refusals = Vec::new();
-        let credentials = credentials_of(grants).map_err(|d| refusals.extend(d)).ok();
-        let roots = roots_of(grants).map_err(|d| refusals.push(d)).ok();
-        w.list(refusals.iter(), |w, d| {
+        let mut rejections = Vec::new();
+        let credentials = credentials_of(grants)
+            .map_err(|d| rejections.extend(d))
+            .ok();
+        let roots = roots_of(grants).map_err(|d| rejections.push(d)).ok();
+        w.list(rejections.iter(), |w, d| {
             ply_compiled::entry::write_failure(w, d, None)
         });
         w.option(credentials.as_ref(), |w, c| {
@@ -128,12 +130,12 @@ fn roots_of(grants: &Grants) -> Result<ply_host::fs::Roots, Diagnostic> {
 }
 
 /// A binding and the world its runs' traces are read against.
-struct Lent {
+struct Borrowed {
     hosts: Hosts,
     world: Worldly,
 }
 
-impl Bound for Lent {
+impl Bound for Borrowed {
     fn binding(&self) -> Arc<HostBinding> {
         self.hosts.binding()
     }
@@ -155,7 +157,7 @@ impl Bound for Lent {
     }
 }
 
-/// What a trace is read against: the roots a run is lent, what the run binds apart from the
+/// What a trace is read against: the roots a run is granted, what the run binds apart from the
 /// program, and the plain value of each configuration key it is given.
 #[derive(Clone)]
 struct Worldly {
@@ -201,7 +203,7 @@ impl Worldly {
 }
 
 /// What a run binds apart from the program, which a pass's key covers: the roots, programs and
-/// families it is lent, by name.
+/// families it is granted, by name.
 fn binding_digest(grants: &Grants) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in ["fs", "exec", "allow"] {

@@ -162,17 +162,17 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
     let f = fixture();
     let first = f.enter_as(Some(TaskId(1)), "http", "request");
 
-    let why = f
+    let reason = f
         .exit_as(Some(TaskId(2)), "http", first, Outcome::Ok)
         .expect_err("task 2 must not close task 1's span");
-    let refused = err_unbalanced(Span::DUMMY, "`trace.exit`", first, &why);
-    assert_eq!(refused.code, codes::SPAN_UNBALANCED);
+    let rejected = err_unbalanced(Span::DUMMY, "`trace.exit`", first, &reason);
+    assert_eq!(rejected.code, codes::SPAN_UNBALANCED);
     assert!(
-        refused.notes.iter().any(|n| n.contains("task @1")),
-        "{refused:?}"
+        rejected.notes.iter().any(|n| n.contains("task @1")),
+        "{rejected:?}"
     );
 
-    // Nothing was recorded for the refusal, and the span is still task 1's to close.
+    // Nothing was recorded for the rejection, and the span is still task 1's to close.
     assert_eq!(f.kinds(), [RecordKind::Enter]);
     f.exit_as(Some(TaskId(1)), "http", first, Outcome::Ok)
         .expect("task 1 closes its own span");
@@ -180,13 +180,13 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
 }
 
 #[test]
-fn a_span_closed_on_another_channel_is_refused() {
+fn a_span_closed_on_another_channel_is_rejected() {
     let f = fixture();
     let id = enter(&f, "http", "request");
-    let why = f
+    let reason = f
         .exit_as(None, "db", id, Outcome::Ok)
         .expect_err("the channel is part of the span");
-    assert!(matches!(why, Unbalanced::OtherChannel(_)), "{why:?}");
+    assert!(matches!(reason, Unbalanced::OtherChannel(_)), "{reason:?}");
     exit(&f, "http", id);
 }
 
@@ -490,10 +490,10 @@ fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
     let id = trace.enter((machine, Some(TaskId(1))), "http", "request", &[]);
     assert_eq!(trace.open_spans(), 1);
 
-    let why = trace
+    let reason = trace
         .exit((machine, Some(TaskId(2))), "http", id, Outcome::Ok)
         .expect_err("the other task still may not close it");
-    assert!(matches!(why, Unbalanced::OtherOwner(_)), "{why:?}");
+    assert!(matches!(reason, Unbalanced::OtherOwner(_)), "{reason:?}");
 
     let warning = trace
         .end_entry_point(machine)
@@ -668,7 +668,7 @@ fn fields_read_each_kind_as_the_real_handler_writes_it() {
 }
 
 #[test]
-fn fields_read_refuses_bytes_the_real_handler_never_writes() {
+fn fields_read_rejects_bytes_the_real_handler_never_writes() {
     let unpaired = parts(&[b"n"]);
     assert_eq!(fields_read(&unpaired), None, "a name with no field");
     let unknown = parts(&[b"n", b"\x09"]);

@@ -4,7 +4,7 @@ import std.cli (Parsed, has, parse_nat, value, values_of)
 import surface
 import machine
 import compiler.front.diagnostics (parse_all)
-import compiler.front.seam (Analysed, Refused)
+import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (CheckedProgram)
 import compiler.front.published (analyse)
 import compiler.front.rows (ModuleSpan)
@@ -17,13 +17,13 @@ import compiler.syntax.type_syntax (ReadMode, WriteMode)
 import diagnostic (SourceText, RuntimeDiagnostic, editor_location_json, runtime_diagnostic_json,
                    shown, all_to_json, all_to_text)
 import mutants (Coverage, MutationReport, Survivor)
-import report (CommandOutput, indent, ok_code, compile_error, count_of, refused, warned_lines)
+import report (CommandOutput, indent, ok_code, compile_error, count_of, rejected, warned_lines)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null)
 import std.term (Style, plain, bold, dim, green, red, yellow, ansi, styles)
 import tester (SelectedCase, BindingReport, Options, TestUnit, ListingFailure)
 import changes (ChangeDiff)
-import testing.schedule (Atom, Counts, ScheduledTest, counts, group_by_conflict, isolation_of,
+import testing.schedule (Effect, Counts, ScheduledTest, counts, group_by_conflict, isolation_of,
                          isolation_word, parallelism, shared)
 import testing.delta (kind_word)
 import testing.diagnose (RankedChange)
@@ -33,14 +33,14 @@ import std.bytes
 import std.string
 import std.fmt (fixed_point)
 import claims (location_text)
-import signature (atom_texts)
+import signature (effect_texts)
 import proof.context (set_of)
 import proof.obligation (plural)
 import std.option
 
-pub type PrintedAtom = { atom: Atom, text: String }
+pub type PrintedEffect = { entry: Effect, text: String }
 
-pub type Refusal = { diagnostics: List<Diagnostic>, places: List<SourceText> }
+pub type Rejection = { diagnostics: List<Diagnostic>, places: List<SourceText> }
 
 pub type Phases = { read_us: Int, front_end_us: Int, write_back_us: Int }
 
@@ -62,7 +62,7 @@ pub type Case = {
   nondet: Bool,
   hash: Option<String>,
   effects: String,
-  atoms: List<PrintedAtom>,
+  listed: List<PrintedEffect>,
   seeded: Bool,
 }
 
@@ -105,17 +105,18 @@ pub fn group_of_class(analysis: CheckedProgram, class: List<Int>) -> Group / {ab
     tests: class,
     effects: outside_effects_text(
       canonical(
-        class.fold([], |acc: List<types::Atom>, i: Int|
+        class.fold([], |acc: List<types::Effect>, i: Int|
           match test_at(analysis, i) { Some(t) -> acc.concat(t.effects), None -> acc }),
       ),
     ),
   }
 
-fn atoms_of(case: Case) -> List<Atom> = case.atoms.map(|print_lines: PrintedAtom| print_lines.atom)
+fn effects_of(case: Case) -> List<Effect> =
+  case.listed.map(|print_lines: PrintedEffect| print_lines.entry)
 
 fn shared_texts(case: Case) -> List<String> =
-  case.atoms.filter(|print_lines: PrintedAtom| shared([print_lines.atom]).len() > 0).map(
-    |print_lines: PrintedAtom| print_lines.text,
+  case.listed.filter(|print_lines: PrintedEffect| shared([print_lines.entry]).len() > 0).map(
+    |print_lines: PrintedEffect| print_lines.text,
   )
 
 pub fn shared_of(case: Case) -> String = "{" ++ String::join(shared_texts(case), ", ") ++ "}"
@@ -125,7 +126,7 @@ pub fn classes_of(program: Program, runs: List<Int>) -> List<List<Int>> / {abort
 
 fn scheduled_of(program: Program, running: Map<Int, Bool>) -> List<ScheduledTest> =
   program.cases.filter(|case: Case| running.contains(case.index)).map(|case: Case|
-    { index: case.index, contended_atoms: shared(atoms_of(case)) })
+    { index: case.index, contended_effects: shared(effects_of(case)) })
 
 pub fn all_classes(program: Program, options: Options) -> List<List<Int>> / {abort.raise} =
   match options.mutate {
@@ -133,8 +134,8 @@ pub fn all_classes(program: Program, options: Options) -> List<List<Int>> / {abo
     Some(_) -> classes_of(program, program.cases.map(|case: Case| case.index)),
   }
 
-fn reach_of(reaches: List<Int>, case: Case) -> { atoms: List<Atom>, host: Bool } =
-  { atoms: atoms_of(case), host: covers(reaches, case.index) }
+fn reach_of(reaches: List<Int>, case: Case) -> { listed: List<Effect>, host: Bool } =
+  { listed: effects_of(case), host: covers(reaches, case.index) }
 
 pub fn counts_of(program: Program, reaches: List<Int>) -> Counts =
   counts(program.cases.map(|case: Case| reach_of(reaches, case)))
@@ -166,7 +167,7 @@ pub fn run_decision_of(
     at: class_numbers(classes),
     classes: groups,
     parallelism: parallelism(
-      program.cases.map(|case: Case| shared(atoms_of(case))),
+      program.cases.map(|case: Case| shared(effects_of(case))),
       scheduled_of(program, running),
       classes,
     ),
@@ -393,14 +394,14 @@ fn reason_key(reason: String) -> String = String::join(reason.split(" "), "_")
 fn reason_text(reason: String) -> String =
   if reason == "new" { "this hash has never gone green, so nothing is known about it" }
   else if reason == "changed" {
-    "something its last pass read has changed since, so that pass no longer answers for it"
+    "something its last pass read has changed since, so that pass no longer vouches for it"
   } else if reason == "previous failure" {
     "the cache holds a failure, and a failure is never trusted"
   } else if reason == "cached" {
     "this exact hash already passed; re-running cannot reveal anything new"
   } else if reason == "same code" {
     "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
-  } else { "no hash was produced, so the cache cannot answer for it" }
+  } else { "no hash was produced, so the cache cannot vouch for it" }
 
 pub fn isolated_as(reaches: List<Int>, case: Case) -> String =
   isolation_word(isolation_of(reach_of(reaches, case)))
@@ -614,7 +615,7 @@ fn run_phases_json(phases: Phases, x: TimeSpent) -> Json =
     }),
   )
 
-fn explain_atoms(isolation: String, case: Case) -> String =
+fn explain_effects(isolation: String, case: Case) -> String =
   if isolation == "isolated" { "" } else { " " ++ shared_of(case) }
 
 fn case_line(
@@ -633,7 +634,7 @@ fn case_line(
     ++ " "
     ++ dim(
       style,
-      "isolation: " ++ isolation ++ explain_atoms(isolation, case)
+      "isolation: " ++ isolation ++ explain_effects(isolation, case)
         ++ (if case.seeded { " · searched" } else { "" })
         ++ (match changed_read_of(decided, case.index) {
           Some(what) -> " · moved: " ++ what,
@@ -643,13 +644,13 @@ fn case_line(
 }
 
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
-  let filed = match program.stored_under {
+  let recorded = match program.stored_under {
     Some(stamp) ->
-      "a pass is filed under its test's hash and the runtime stamp " ++ short_of(Some(stamp))
+      "a pass is recorded under its test's hash and the runtime stamp " ++ short_of(Some(stamp))
         ++ ", and under the code the test ran, with what its run read",
-    None -> "no pass is filed: `--no-cache` reads and writes none",
+    None -> "no pass is recorded: `--no-cache` reads and writes none",
   };
-  ["", indent() ++ dim(style, "key"), indent() ++ "  " ++ dim(style, filed)]
+  ["", indent() ++ dim(style, "key"), indent() ++ "  " ++ dim(style, recorded)]
 }
 
 fn reasons_seen(program: Program, decided: RunDecision) -> List<String> =
@@ -658,7 +659,7 @@ fn reasons_seen(program: Program, decided: RunDecision) -> List<String> =
     if acc.contains(reason) { acc } else { acc.push(reason) }
   })
 
-fn why_lines(style: Style, program: Program, decided: RunDecision) -> List<String> = {
+fn reason_lines(style: Style, program: Program, decided: RunDecision) -> List<String> = {
   let seen = reasons_seen(program, decided);
   if seen.len() == 0 { [] } else {
     ["", indent() ++ dim(style, "why")].concat(
@@ -776,7 +777,7 @@ pub fn explain_lines(
   [""].concat(
     program.cases.map(|case: Case| case_line(style, program, reaches, case, decision)),
   ).concat(
-    why_lines(style, program, decision).concat(key_lines(style, program)),
+    reason_lines(style, program, decision).concat(key_lines(style, program)),
   ).concat(
     search_lines(style, program, decision),
   ).concat(
@@ -1163,12 +1164,12 @@ pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / 
       { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
       { key: "host", value: Bool(covers(report.reaches, case.index)) },
       { key: "shared_effects", value: strings(shared_texts(case)) },
-      { key: "contends", value: Array(shared(atoms_of(case)).map(atom_json)) },
+      { key: "contends", value: Array(shared(effects_of(case)).map(effect_json)) },
       { key: "seeded", value: Bool(case.seeded) },
     ]),
   )
 
-fn atom_json(a: Atom) -> Json =
+fn effect_json(a: Effect) -> Json =
   object([
     { key: "effect", value: Str(a.effect) },
     { key: "resource", value: Str(a.resource) },
@@ -1535,19 +1536,19 @@ pub fn test_output(
   }
 }
 
-pub fn unbound(style: Style, refusal: Refusal) -> CommandOutput / {abort.raise} = {
+pub fn unbound(style: Style, rejection: Rejection) -> CommandOutput / {abort.raise} = {
   let tally = indent() ++ red(style, "no host handler was bound") ++ " ("
-    ++ count_of(refusal.diagnostics.len(), "error")
+    ++ count_of(rejection.diagnostics.len(), "error")
     ++ ")";
   {
     json: object([
       { key: "command", value: Str("test") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: int(compile_error()) },
-      { key: "diagnostics", value: all_to_json(refusal.diagnostics, refusal.places) },
+      { key: "diagnostics", value: all_to_json(rejection.diagnostics, rejection.places) },
     ]),
     lines: [],
-    errs: all_to_text(style, refusal.diagnostics, refusal.places).push(tally),
+    errs: all_to_text(style, rejection.diagnostics, rejection.places).push(tally),
     code: compile_error(),
   }
 }
@@ -1564,7 +1565,7 @@ fn resource_rank(r: types::Resource) -> Int =
 
 fn mode_rank(m: type_syntax::Mode) -> Int = match m { ReadMode -> 0, WriteMode -> 1, _ -> 2 }
 
-fn atom_before(a: types::Atom, b: types::Atom) -> Bool =
+fn effect_before(a: types::Effect, b: types::Effect) -> Bool =
   if a.effect != b.effect { compare(a.effect, b.effect) == Less }
   else if resource_rank(a.resource) != resource_rank(b.resource) {
     resource_rank(a.resource) < resource_rank(b.resource)
@@ -1582,10 +1583,11 @@ fn atom_before(a: types::Atom, b: types::Atom) -> Bool =
     }
   }
 
-pub fn canonical(atoms: List<types::Atom>) -> List<types::Atom> = dedup(atoms.sort_by(atom_before))
+pub fn canonical(effects: List<types::Effect>) -> List<types::Effect> =
+  dedup(effects.sort_by(effect_before))
 
-pub fn outside_effects_text(atoms: List<types::Atom>) -> String / {abort.raise} =
-  "{" ++ String::join(atom_texts(atoms), ", ") ++ "}"
+pub fn outside_effects_text(effects: List<types::Effect>) -> String / {abort.raise} =
+  "{" ++ String::join(effect_texts(effects), ", ") ++ "}"
 
 pub fn with_sim(options: Json, sim: Json) -> Json =
   match options { Object(members) -> Object(members.insert("sim", sim)), other -> other }
@@ -1661,27 +1663,31 @@ test "every reason has an explanation of its own" {
   )
 }
 
-test "a load that refuses tallies its errors and binds nothing" {
-  let answer = refused(plain(), "test", [error_with_labels(b"E0201", b"type mismatch", [], [])], [
-  ]);
-  assert_eq(answer.code, 2);
-  assert_eq(answer.errs, ["Error[E0201]: type mismatch", "   compilation failed (1 error)"])
+test "a load that fails tallies its errors and binds nothing" {
+  let result = rejected(
+    plain(),
+    "test",
+    [error_with_labels(b"E0201", b"type mismatch", [], [])],
+    [],
+  );
+  assert_eq(result.code, 2);
+  assert_eq(result.errs, ["Error[E0201]: type mismatch", "   compilation failed (1 error)"])
 }
 
 test "a binding that does not match the program is a start-up failure naming no line" {
-  let answer = unbound(plain(), {
+  let result = unbound(plain(), {
     diagnostics: [error_with_labels(b"E0412", b"a nondet effect in a det test", [], [])],
     places: [],
   });
-  assert_eq(answer.code, 2);
-  assert_eq(answer.errs, [
+  assert_eq(result.code, 2);
+  assert_eq(result.errs, [
     "Error[E0412]: a nondet effect in a det test",
     "   no host handler was bound (1 error)",
   ])
 }
 
 test "a program cannot declare either effect the scheduler reads a name of" {
-  let refused = |name: String|
+  let rejected = |name: String|
     match analyse(
         parse_all([
           {
@@ -1695,8 +1701,8 @@ test "a program cannot declare either effect the scheduler reads a name of" {
         ]),
       ) {
       Analysed(_) -> false,
-      Refused(_) -> true,
+      Rejected(_) -> true,
     };
-  assert(refused("scoped"));
-  assert(refused("sim"))
+  assert(rejected("scoped"));
+  assert(rejected("sim"))
 }

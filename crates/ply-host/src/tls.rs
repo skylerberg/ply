@@ -68,8 +68,8 @@ impl CredentialSpec {
     }
 }
 
-fn malformed(text: &str, why: &str) -> String {
-    format!("`{text}` is not a TLS credential: {why}; write `--tls NAME=CERT.pem,KEY.pem`")
+fn malformed(text: &str, reason: &str) -> String {
+    format!("`{text}` is not a TLS credential: {reason}; write `--tls NAME=CERT.pem,KEY.pem`")
 }
 
 /// A loaded credential; nothing outside this module can take the key back out.
@@ -81,7 +81,7 @@ pub struct Credential {
     chooser: Arc<Chooser>,
 }
 
-/// One certificate a credential answers with, and when its two files last changed.
+/// One certificate a credential responds with, and when its two files last changed.
 #[derive(Debug)]
 struct Loaded {
     spec: CredentialSpec,
@@ -129,7 +129,7 @@ impl Chooser {
         self.refresh(true);
     }
 
-    /// The leaf each certificate answers with now, in the order given.
+    /// The leaf each certificate responds with now, in the order given.
     pub fn leaves(&self) -> Vec<Vec<u8>> {
         lock(&self.loaded)
             .iter()
@@ -191,13 +191,13 @@ struct Certified {
 
 fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
     let chain =
-        certificates(&spec.certificate).map_err(|why| err_invalid(&spec.certificate, why))?;
+        certificates(&spec.certificate).map_err(|reason| err_invalid(&spec.certificate, reason))?;
     let key = private_key(&spec.key)?;
     let fingerprint = fingerprint(&chain[0]);
     let certificates = chain.len();
     let key =
         CertifiedKey::from_der(chain, key, &provider()).map_err(|e| err_mismatch(spec, &e))?;
-    // rustls refuses a key that does not match the leaf certificate's public key.
+    // rustls rejects a key that does not match the leaf certificate's public key.
     key.keys_match().map_err(|e| err_mismatch(spec, &e))?;
     Ok(Certified {
         key: Arc::new(key),
@@ -220,7 +220,7 @@ impl Credential {
         &self.chooser
     }
 
-    /// The configuration a listener under this name answers with.
+    /// The configuration a listener under this name responds with.
     pub fn config(&self) -> &Arc<ServerConfig> {
         &self.config
     }
@@ -233,7 +233,7 @@ pub struct Credentials {
     client: Option<Arc<ClientConfig>>,
     /// The same, presenting each credential to a server that asks a client for a certificate.
     presenting: BTreeMap<String, Arc<ClientConfig>>,
-    /// The credentials whose listeners refuse a client that presents no certificate.
+    /// The credentials whose listeners reject a client that presents no certificate.
     required: Vec<String>,
     trusted: usize,
 }
@@ -260,7 +260,7 @@ impl Credentials {
         for path in trusted {
             match certificates(path) {
                 Ok(chain) => anchors.extend(chain),
-                Err(why) => diagnostics.push(err_untrusted(path, why)),
+                Err(reason) => diagnostics.push(err_untrusted(path, reason)),
             }
         }
         for spec in specs {
@@ -325,7 +325,7 @@ impl Credentials {
         })
     }
 
-    /// Whether the listener of the credential `name` refuses a client that presents no certificate.
+    /// Whether the listener of the credential `name` rejects a client that presents no certificate.
     pub fn requires_client(&self, name: &str) -> bool {
         self.required.iter().any(|r| r == name)
     }
@@ -383,7 +383,7 @@ impl fmt::Debug for Credentials {
 }
 
 /// What every listener of a run shares: the client verifiers the trusted certificates make, one
-/// that serves a client presenting no certificate and one that refuses it, and one ticket key,
+/// that serves a client presenting no certificate and one that rejects it, and one ticket key,
 /// which rotates, so a session one listener began resumes at another.
 struct Shared {
     verifier: Option<Arc<dyn ClientCertVerifier>>,
@@ -434,7 +434,7 @@ impl Shared {
 }
 
 /// What verifies a client's certificate against `anchors`, none where there are none: one that
-/// serves a client presenting no certificate, or where `required` one that refuses it.
+/// serves a client presenting no certificate, or where `required` one that rejects it.
 fn client_verifier(
     anchors: &[CertificateDer<'static>],
     required: bool,
@@ -609,10 +609,10 @@ impl Stream {
 
 /// Why a handshake asked to complete within a deadline did not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Unsettled {
+pub enum Unfinished {
     Expired,
     /// One of the `REASON_` strings.
-    Refused(&'static str),
+    Rejected(&'static str),
 }
 
 /// The configuration `config` with `alpn` as the protocols it offers, none when `alpn` is empty.
@@ -719,18 +719,18 @@ impl Session {
                 peer: Mutex::new(None),
                 agreed: Mutex::new(None),
             },
-            None => Session::refused(socket, handshakes, REASON_CONFIGURATION),
+            None => Session::rejected(socket, handshakes, REASON_CONFIGURATION),
         }
     }
 
     /// A session that never starts: the connection is ended, counted under `reason`, and reads as
     /// a peer done sending.
-    pub fn refused(
+    pub fn rejected(
         socket: Arc<TcpStream>,
         handshakes: Arc<Handshakes>,
         reason: &'static str,
     ) -> Session {
-        handshakes.refused(reason);
+        handshakes.rejected(reason);
         let _ = socket.shutdown(Shutdown::Both);
         Session {
             socket,
@@ -749,7 +749,7 @@ impl Session {
 
     /// What a completed handshake leaves to be read without the session: its length, the peer's
     /// certificate and the protocol.
-    fn settled(&self, stream: &Stream, took: u64) {
+    fn finished(&self, stream: &Stream, took: u64) {
         lock(&self.took).get_or_insert(took);
         *lock(&self.peer) = stream.peer_leaf();
         *lock(&self.agreed) = stream.protocol();
@@ -777,18 +777,18 @@ impl Session {
         &self.socket
     }
 
-    /// The handshake, completed within `timeout` in all, answering the application protocol it
+    /// The handshake, completed within `timeout` in all, returning the application protocol it
     /// agreed on. A handshake that does not complete ends the connection, a deadline included:
     /// an upgrade that timed out has left bytes of a handshake on the wire.
-    pub fn settle_within(&self, timeout: Duration) -> Result<Option<String>, Unsettled> {
+    pub fn finish_within(&self, timeout: Duration) -> Result<Option<String>, Unfinished> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
         let Some(stream) = guard.as_mut() else {
-            return Err(Unsettled::Refused(REASON_CONFIGURATION));
+            return Err(Unfinished::Rejected(REASON_CONFIGURATION));
         };
         loop {
             if !stream.is_handshaking() {
-                self.settled(stream, began.elapsed().as_micros() as u64);
+                self.finished(stream, began.elapsed().as_micros() as u64);
                 return Ok(stream.protocol());
             }
             let Some(left) = timeout
@@ -796,24 +796,24 @@ impl Session {
                 .filter(|d| !d.is_zero())
             else {
                 self.finish(&mut guard, Some(REASON_SLOW));
-                return Err(Unsettled::Expired);
+                return Err(Unfinished::Expired);
             };
             let _ = self.socket.set_read_timeout(Some(left));
             let _ = self.socket.set_write_timeout(Some(left));
             match stream.complete_io() {
                 Ok((0, 0)) if stream.is_handshaking() => {
                     self.finish(&mut guard, Some(REASON_GONE));
-                    return Err(Unsettled::Refused(REASON_GONE));
+                    return Err(Unfinished::Rejected(REASON_GONE));
                 }
                 Ok(_) => {}
                 Err(e) if expired(&e) => {
                     self.finish(&mut guard, Some(REASON_SLOW));
-                    return Err(Unsettled::Expired);
+                    return Err(Unfinished::Expired);
                 }
                 Err(e) => {
-                    let why = reason(true, &e);
-                    self.finish(&mut guard, Some(why));
-                    return Err(Unsettled::Refused(why));
+                    let reason = reason(true, &e);
+                    self.finish(&mut guard, Some(reason));
+                    return Err(Unfinished::Rejected(reason));
                 }
             }
         }
@@ -836,12 +836,12 @@ impl Session {
         let _ = self.socket.shutdown(Shutdown::Write);
     }
 
-    /// The handshake, completed now rather than when a request needs it, answering what it took in
+    /// The handshake, completed now rather than when a request needs it, returning what it took in
     /// microseconds.
     ///
-    /// `None` when this connection has none to complete: a session whose configuration refused to
+    /// `None` when this connection has none to complete: a session whose configuration failed to
     /// start, or one whose handshake failed, which closes the connection the way the read/write path
-    /// would. A session that already handshook answers what that earlier handshake took.
+    /// would. A session that already handshook returns what that earlier handshake took.
     pub fn handshake(&self) -> Option<u64> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
@@ -858,13 +858,13 @@ impl Session {
                 }
                 Ok(_) if !stream.is_handshaking() => {
                     let took = began.elapsed().as_micros() as u64;
-                    self.settled(stream, took);
+                    self.finished(stream, took);
                     return Some(took);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    let refused = (!expired(&e)).then(|| reason(true, &e));
-                    self.finish(&mut guard, refused);
+                    let rejected = (!expired(&e)).then(|| reason(true, &e));
+                    self.finish(&mut guard, rejected);
                     return None;
                 }
             }
@@ -920,8 +920,8 @@ impl Session {
                 payload.len()
             }
             Err(e) => {
-                let refused = (!expired(&e)).then(|| reason(handshaking, &e));
-                self.finish(&mut guard, refused);
+                let rejected = (!expired(&e)).then(|| reason(handshaking, &e));
+                self.finish(&mut guard, rejected);
                 0
             }
         }
@@ -942,13 +942,13 @@ impl Session {
     /// the number is the handshake's own and not the wait before it.
     fn completed(&self, began: Instant, was_handshaking: bool, stream: &Stream) {
         if was_handshaking && !stream.is_handshaking() {
-            self.settled(stream, began.elapsed().as_micros() as u64);
+            self.finished(stream, began.elapsed().as_micros() as u64);
         }
     }
 
-    fn finish(&self, guard: &mut MutexGuard<'_, Option<Stream>>, refused: Option<&'static str>) {
-        if let Some(reason) = refused {
-            self.handshakes.refused(reason);
+    fn finish(&self, guard: &mut MutexGuard<'_, Option<Stream>>, rejected: Option<&'static str>) {
+        if let Some(reason) = rejected {
+            self.handshakes.rejected(reason);
         }
         **guard = None;
         let _ = self.socket.shutdown(Shutdown::Both);
@@ -964,7 +964,7 @@ pub const REASON_PARAMETERS: &str =
 pub const REASON_ALPN: &str = "no application protocol in common (this listener offers http/1.1)";
 pub const REASON_ALERT: &str = "the peer sent a fatal alert and gave up";
 pub const REASON_MISBEHAVED: &str = "the peer sent a TLS message the protocol does not allow";
-pub const REASON_CERTIFICATE: &str = "the peer's certificate was refused";
+pub const REASON_CERTIFICATE: &str = "the peer's certificate was rejected";
 pub const REASON_GONE: &str = "the peer went away mid-handshake";
 pub const REASON_TRANSPORT: &str = "the connection failed mid-handshake";
 pub const REASON_SLOW: &str = "the handshake did not complete before its deadline";
@@ -981,7 +981,7 @@ fn expired(error: &io::Error) -> bool {
     )
 }
 
-/// Why a handshake was refused, as one of a fixed set of strings.
+/// Why a handshake was rejected, as one of a fixed set of strings.
 pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
     if !handshaking {
         return REASON_TRANSPORT;
@@ -1031,7 +1031,7 @@ pub struct Handshakes {
 #[derive(Default)]
 struct Counts {
     completed: u64,
-    refused: BTreeMap<&'static str, u64>,
+    rejected: BTreeMap<&'static str, u64>,
 }
 
 impl Handshakes {
@@ -1039,19 +1039,19 @@ impl Handshakes {
         lock(&self.counts).completed += 1;
     }
 
-    pub fn refused(&self, reason: &'static str) {
-        *lock(&self.counts).refused.entry(reason).or_default() += 1;
+    pub fn rejected(&self, reason: &'static str) {
+        *lock(&self.counts).rejected.entry(reason).or_default() += 1;
     }
 
     /// Reasons sort by descending count, then text, so one failure always prints one order.
     pub fn snapshot(&self) -> HandshakeCounts {
         let counts = lock(&self.counts);
         let mut reasons: Vec<(&'static str, u64)> =
-            counts.refused.iter().map(|(r, n)| (*r, *n)).collect();
+            counts.rejected.iter().map(|(r, n)| (*r, *n)).collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         HandshakeCounts {
             completed: counts.completed,
-            refused: reasons.iter().map(|(_, n)| n).sum(),
+            rejected: reasons.iter().map(|(_, n)| n).sum(),
             reasons,
         }
     }
@@ -1060,13 +1060,13 @@ impl Handshakes {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HandshakeCounts {
     pub completed: u64,
-    pub refused: u64,
+    pub rejected: u64,
     pub reasons: Vec<(&'static str, u64)>,
 }
 
 impl HandshakeCounts {
     pub fn is_empty(&self) -> bool {
-        self.completed == 0 && self.refused == 0
+        self.completed == 0 && self.rejected == 0
     }
 }
 
@@ -1125,13 +1125,13 @@ fn err_unreadable(path: &Path, error: &io::Error) -> Diagnostic {
 }
 
 #[cold]
-fn err_invalid(path: &Path, why: String) -> Diagnostic {
+fn err_invalid(path: &Path, reason: String) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
-        format!("`{}` is not usable TLS material: {why}", path.display()),
+        format!("`{}` is not usable TLS material: {reason}", path.display()),
     )
     .note("`--tls NAME=CERT,KEY` wants a certificate chain in PEM, leaf first, and a private key in PKCS#8, PKCS#1 or SEC1")
-    .note("credentials are loaded before anything runs, so this is refused rather than discovered on the first handshake")
+    .note("credentials are loaded before anything runs, so this is rejected rather than discovered on the first handshake")
 }
 
 #[cold]
@@ -1144,7 +1144,7 @@ fn err_mismatch(spec: &CredentialSpec, error: &TlsError) -> Diagnostic {
             spec.certificate.display()
         ),
     )
-    .note(format!("rustls refused the pair: {error}"))
+    .note(format!("rustls rejected the pair: {error}"))
     .note("the private key's public half must match the public key of the first certificate in the chain")
     .note("check that the two files are from the same issuance, and that the chain is leaf first")
 }
@@ -1159,13 +1159,13 @@ fn err_trust(ignored: usize) -> Diagnostic {
 }
 
 #[cold]
-fn err_untrusted(path: &Path, why: String) -> Diagnostic {
+fn err_untrusted(path: &Path, reason: String) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
-        format!("`{}` is not a certificate to trust: {why}", path.display()),
+        format!("`{}` is not a certificate to trust: {reason}", path.display()),
     )
     .note(TRUSTED)
-    .note("roots are loaded before anything runs, so this is refused rather than discovered on the first handshake")
+    .note("roots are loaded before anything runs, so this is rejected rather than discovered on the first handshake")
 }
 
 #[cold]

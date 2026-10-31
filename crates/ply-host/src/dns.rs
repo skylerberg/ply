@@ -1,9 +1,9 @@
 //! The system's resolver, which `std.dns`'s host handler asks off the program's thread. The resolver
 //! has its own patience and cannot be interrupted, so a caller that stops waiting (`std.dns`'s
 //! `resolve` cancels the task that asked) leaves the question on its thread until the system
-//! answers it.
+//! responds to it.
 //!
-//! An answer is flat: byte 1 and then each address's bytes or each name as parts, or byte 0, the
+//! A result is flat: byte 1 and then each address's bytes or each name as parts, or byte 0, the
 //! failure's kind (`NoSuchName` 1, `NoData` 2, `ServerFailure` 3, `Other` 4), and for `Other` its
 //! code and the resolver's words as parts.
 
@@ -13,7 +13,7 @@ use std::net::IpAddr;
 /// Where the system's resolver keeps the servers it asks.
 pub const RESOLVER_CONFIGURATION: &str = "/etc/resolv.conf";
 
-/// A `std.dns.Failure` the system's resolver can answer with: a deadline is its caller's.
+/// A `std.dns.Failure` the system's resolver can respond with: a deadline is its caller's.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Failure {
     NoSuchName,
@@ -89,7 +89,7 @@ mod system {
             libc::EAI_NODATA => Failure::NoData,
             libc::EAI_AGAIN | libc::EAI_FAIL => Failure::ServerFailure,
             other => {
-                // SAFETY: the answer is a static, terminated string for any code.
+                // SAFETY: the result is a static, terminated string for any code.
                 let text = unsafe { CStr::from_ptr(libc::gai_strerror(other)) };
                 Failure::Other(i64::from(other), text.to_string_lossy().into_owned())
             }
@@ -107,7 +107,7 @@ mod system {
         // One socket type, or every address comes back once for each.
         hints.ai_socktype = libc::SOCK_STREAM;
         let mut list: *mut libc::addrinfo = std::ptr::null_mut();
-        // SAFETY: `name` is terminated, `hints` is initialised, and `list` receives the answer.
+        // SAFETY: `name` is terminated, `hints` is initialised, and `list` receives the result.
         let code = unsafe {
             libc::getaddrinfo(
                 name.as_ptr(),
@@ -122,7 +122,7 @@ mod system {
         let mut found = Vec::new();
         let mut entry = list;
         while !entry.is_null() {
-            // SAFETY: `entry` is a node of the list the call answered, valid until it is freed.
+            // SAFETY: `entry` is a node of the list the call returned, valid until it is freed.
             let info = unsafe { &*entry };
             let address = match info.ai_family {
                 libc::AF_INET => {
@@ -146,7 +146,7 @@ mod system {
             }
             entry = info.ai_next;
         }
-        // SAFETY: `list` is what the call answered, freed once.
+        // SAFETY: `list` is what the call returned, freed once.
         unsafe { libc::freeaddrinfo(list) };
         if found.is_empty() {
             return Err(Failure::NoData);
@@ -204,7 +204,7 @@ mod system {
     pub fn names(_: IpAddr) -> Result<Vec<String>, Failure> {
         Err(Failure::Other(
             0,
-            "this platform's resolver answers no reverse lookup".to_string(),
+            "this platform's resolver does no reverse lookup".to_string(),
         ))
     }
 }

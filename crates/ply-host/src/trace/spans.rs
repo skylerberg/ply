@@ -162,7 +162,7 @@ impl Spans {
     ) -> Result<Vec<Closing>, Unbalanced> {
         let stack: &[OpenSpan] = self.open.get(&owner).map_or(&[], Vec::as_slice);
         let Some(at) = stack.iter().position(|open| open.id == id) else {
-            return Err(self.why(owner, id));
+            return Err(self.reason(owner, id));
         };
         if stack[at].channel != *channel {
             return Err(Unbalanced::OtherChannel(stack[at].channel.clone()));
@@ -251,7 +251,7 @@ impl Spans {
         self.open.len()
     }
 
-    fn why(&self, owner: Owner, id: i64) -> Unbalanced {
+    fn reason(&self, owner: Owner, id: i64) -> Unbalanced {
         let next = self.next.get(&owner.0).copied().unwrap_or(1);
         if id < 1 || id >= next {
             return Unbalanced::NeverOpened;
@@ -267,16 +267,16 @@ impl Spans {
 
 #[cold]
 #[inline(never)]
-pub fn err_unbalanced(span: Span, operation: &str, id: i64, why: &Unbalanced) -> Diagnostic {
+pub fn err_unbalanced(span: Span, operation: &str, id: i64, reason: &Unbalanced) -> Diagnostic {
     let diagnostic = Diagnostic::error(
         codes::SPAN_UNBALANCED,
         format!("{operation} names span {id}, which is not open on this task"),
     )
     .primary(span, "this span is not open here");
-    let diagnostic = match why {
+    let diagnostic = match reason {
         Unbalanced::NeverOpened => diagnostic
-            .note("no `trace.enter` in this entry point has answered that id")
-            .note("a `Span` is an ordinary record, so one can be built rather than entered; pass the value `trace.enter` answered"),
+            .note("no `trace.enter` in this entry point has returned that id")
+            .note("a `Span` is an ordinary record, so one can be built rather than entered; pass the value `trace.enter` returned"),
         Unbalanced::AlreadyClosed => diagnostic
             .note("it was closed by an earlier `trace.exit`, or by the `trace.exit` of a span below it")
             .note("closing a span closes every span opened above it, so an inner `exit` after an outer one has nothing left to close"),
@@ -286,7 +286,7 @@ pub fn err_unbalanced(span: Span, operation: &str, id: i64, why: &Unbalanced) ->
             .note("open and close a span in one task, and pass what it measured across the boundary as a field"),
         Unbalanced::OtherChannel(channel) => diagnostic
             .note(format!("it is open on channel `{}`", label(channel)))
-            .note("a channel is part of a span's identity because it is part of the atom the row carries"),
+            .note("a channel is part of a span's identity, because the trace records it as part of the span's effect"),
     };
     diagnostic.note("silently accepting an unbalanced exit is how one request's timing lands under another request's span")
 }

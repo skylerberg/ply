@@ -1,9 +1,9 @@
-//! What a program can observe of a `Float`, and the functions over one the prelude answers with.
+//! What a program can observe of a `Float`, and the functions over one the prelude computes with.
 //!
 //! A program sees one NaN. Hardware does not agree on the NaN an operation makes, so a value may
 //! carry any, and every place its bits become observable — [`bits`], an encoding, an order —
 //! reads every NaN as [`CANONICAL_NAN_BITS`]. The math functions are CORE-MATH's, correctly
-//! rounded, so each answer is the one the specification fixes on every machine.
+//! rounded, so each result is the one the specification fixes on every machine.
 
 /// The bits every NaN reads as.
 pub const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
@@ -41,7 +41,7 @@ pub fn total_cmp(x: f64, y: f64) -> std::cmp::Ordering {
     key(x).cmp(&key(y))
 }
 
-/// Each named function, answered by CORE-MATH's correctly rounded one.
+/// Each named function, computed by CORE-MATH's correctly rounded one.
 macro_rules! correctly_rounded {
     ($($name:ident = $cr:ident($($a:ident),+);)+) => {
         unsafe extern "C" {

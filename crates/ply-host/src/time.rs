@@ -1,5 +1,5 @@
 //! The run's clocks: the system's wall clock, and a monotonic one counting from when the process
-//! started, which `std.time`'s natives read and a production region's sleeps are deadlines on.
+//! started, which `std.time`'s natives read and a production scheduler's sleeps are deadlines on.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +18,7 @@ pub fn mark_start(at: Instant) {
 }
 
 /// Milliseconds since the Unix epoch on the system's clock; a clock set before it reads `0` rather
-/// than refusing.
+/// than failing.
 pub fn wall_clock_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -41,7 +41,7 @@ impl TimeHost {
     }
 
     /// Nanoseconds since this run's clock was started: what `std.time` and the language's `clock`
-    /// read, and what a production region's sleeps are deadlines on.
+    /// read, and what a production scheduler's sleeps are deadlines on.
     pub fn elapsed_ns(&self) -> i64 {
         i64::try_from(self.started.elapsed().as_nanos()).unwrap_or(i64::MAX)
     }

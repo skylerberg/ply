@@ -1,12 +1,12 @@
 //! `std.sqlite`'s natives: the run's databases, each under the root its label names, every
-//! operation a ticket of a job on the process's waiting pool, and the twin's statement over an
-//! image, which reaches no host. What they are handed and answer is flat as `ply_host::sqlite`
+//! operation a ticket of a job on the process's waiting pool, and the fake's statement over an
+//! image, which reaches no host. What they are handed and return is flat as `ply_host::sqlite`
 //! reads and writes it.
 
 use super::{Nondeterministic, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use ply_core::sqlite::{Control, FUNCTIONS, Limits, Mode, Options, Scalar, run_over};
 use ply_host::native::{found, parts};
 use ply_host::sqlite::{SqliteHost, limits_read, reply_written, root_of, scalars_read};
@@ -62,7 +62,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// One statement over the database the image at `image_at` holds, as the twin runs it: parts of
+/// One statement over the database the image at `image_at` holds, as the fake runs it: parts of
 /// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
 /// what it is handed, so it asks the host nothing.
 #[allow(clippy::too_many_arguments)]
@@ -83,14 +83,14 @@ pub unsafe extern "C" fn rt_sqlite_run(
     let Some((sql, params, limits)) = statement(
         c,
         "sqlite_run",
-        unsafe { lent(sql_at, sql_n) },
-        unsafe { lent(params_at, params_n) },
-        unsafe { lent(limits_at, limits_n) },
+        unsafe { borrowed(sql_at, sql_n) },
+        unsafe { borrowed(params_at, params_n) },
+        unsafe { borrowed(limits_at, limits_n) },
     ) else {
         return TakenBytes(0);
     };
     let (reply, left) = run_over(
-        unsafe { lent(image_at, image_n) },
+        unsafe { borrowed(image_at, image_n) },
         &sql,
         &params,
         limits,
@@ -159,11 +159,11 @@ pub unsafe extern "C" fn rt_sqlite_open(
         I64(0),
         |c: &mut Ctx| {
             let what = "`sqlite.open`";
-            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            let Some((databases, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
                 return I64(0);
             };
-            let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
+            let Some(path) = c.text(unsafe { borrowed(path_at, path_n) }) else {
                 return I64(0);
             };
             let path = path.to_string();
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn rt_sqlite_close(
         I64(0),
         |c: &mut Ctx| {
             let what = "`sqlite.close`";
-            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            let Some((databases, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
                 return I64(0);
             };
@@ -210,7 +210,7 @@ pub unsafe extern "C" fn rt_sqlite_close(
     )
 }
 
-/// The ticket of a statement run on a connection: its reply. `reads_only` refuses one that could
+/// The ticket of a statement run on a connection: its reply. `reads_only` rejects one that could
 /// write, and `cursor` opens it to be fetched a page at a time.
 #[allow(clippy::too_many_arguments)]
 fn ran(
@@ -226,15 +226,15 @@ fn ran(
     cursor: bool,
 ) -> I64 {
     asked(ctx, native, Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((databases, root)) = rooted(c, unsafe { lent(label.0, label.1) }, what) else {
+        let Some((databases, root)) = rooted(c, unsafe { borrowed(label.0, label.1) }, what) else {
             return I64(0);
         };
         let Some((sql, params, limits)) = statement(
             c,
             native,
-            unsafe { lent(sql.0, sql.1) },
-            unsafe { lent(params.0, params.1) },
-            unsafe { lent(limits.0, limits.1) },
+            unsafe { borrowed(sql.0, sql.1) },
+            unsafe { borrowed(params.0, params.1) },
+            unsafe { borrowed(limits.0, limits.1) },
         ) else {
             return I64(0);
         };
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn rt_sqlite_control(
         I64(0),
         |c: &mut Ctx| {
             let what = "`sqlite.control`";
-            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            let Some((databases, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
                 return I64(0);
             };
@@ -387,11 +387,11 @@ pub unsafe extern "C" fn rt_sqlite_backup(
         I64(0),
         |c: &mut Ctx| {
             let what = "`sqlite.backup`";
-            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            let Some((databases, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
                 return I64(0);
             };
-            let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
+            let Some(path) = c.text(unsafe { borrowed(path_at, path_n) }) else {
                 return I64(0);
             };
             let job = databases.backup(root, conn.0, path.to_string(), c.site());
@@ -415,7 +415,7 @@ pub unsafe extern "C" fn rt_sqlite_fetch(
         I64(0),
         |c: &mut Ctx| {
             let what = "`sqlite.fetch`";
-            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            let Some((databases, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
                 return I64(0);
             };
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn rt_sqlite_finish(
         I64(0),
         |c: &mut Ctx| {
             let what = "`sqlite.finish`";
-            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            let Some((databases, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
                 return I64(0);
             };

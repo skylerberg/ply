@@ -49,10 +49,10 @@ pub fn linked_program() -> Result<Program, Diagnostic> {
 }
 
 #[cold]
-fn unlinked(why: String) -> Diagnostic {
+fn unlinked(reason: String) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("this executable's program cannot be entered: {why}"),
+        format!("this executable's program cannot be entered: {reason}"),
     )
     .primary(
         ply_core::Span::DUMMY,
@@ -80,7 +80,7 @@ pub fn install_own_pack() -> Result<(), String> {
     }
 }
 
-/// What the `ply` program is lent: every family; its roots, `cwd` at `root`, `shipped` at the
+/// What the `ply` program is granted: every family; its roots, `cwd` at `root`, `shipped` at the
 /// shipped modules and `abs` at the filesystem's root (the program is the tool, so a path that
 /// leaves the working directory is addressed under `abs`); its command line; the `git` on `PATH`
 /// for its `process.spawn[git]`, which fetches a git dependency, and is unbound where none can be
@@ -128,8 +128,8 @@ const DIGESTS: &str = "digests";
 
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
-/// The runtime's side of what kept answers are a function of beyond their own keys, as `name hex`
-/// lines: a query's answer is the evaluator's, and a pass or a claim's evidence the whole runtime's.
+/// The runtime's side of what cached results are a function of beyond their own keys, as `name hex`
+/// lines: a query's result is the evaluator's, and a pass or claim's evidence the whole runtime's.
 /// The program adds its own side to each, from the definitions it is told it has.
 pub fn stamps() -> String {
     let stamp = |parts: &[&str]| {
@@ -240,7 +240,7 @@ pub struct Launched {
 }
 
 impl Launched {
-    fn refused(d: Diagnostic) -> Launched {
+    fn rejected(d: Diagnostic) -> Launched {
         Launched {
             code: Err(d.to_string()),
             warnings: Vec::new(),
@@ -248,7 +248,7 @@ impl Launched {
     }
 }
 
-/// Enter the program on the command's own big-stack thread, lent every family.
+/// Enter the program on the command's own big-stack thread, granted every family.
 pub fn run(
     program: Program,
     root: &Path,
@@ -260,9 +260,9 @@ pub fn run(
     let definitions = program.definitions;
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
-        Err(refused) => return Launched::refused(refused),
+        Err(rejected) => return Launched::rejected(rejected),
     };
-    ply_host::observe::laid_out(&shipped, ply_compiled::c::kept_dirs());
+    ply_host::observe::laid_out(&shipped, ply_compiled::c::cache_dirs());
     let reporting = reporting();
     ply_privileged::shipped::stamp(stamps());
     ply_privileged::shipped::entered(&program.entry, definitions);
@@ -278,7 +278,7 @@ pub fn run(
                 Some(asked) => {
                     let (launched, counted, sites) =
                         crate::count::window_sampled(launch, asked.every());
-                    // The entry's answer stands: the run happened, and a count that could not
+                    // The entry's result stands: the run happened, and a count that could not
                     // be written is reported rather than replacing what the program did.
                     if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
                     {
@@ -302,7 +302,7 @@ pub fn run(
             }
             Err(panic) => std::panic::resume_unwind(panic),
         },
-        Err(e) => Launched::refused(
+        Err(e) => Launched::rejected(
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("the program could not be started on a thread of its own: {e}"),
@@ -316,17 +316,17 @@ pub fn run(
 fn entered(entry: &str, grants: &Grants) -> Launched {
     let opened = match Opened::linked() {
         Ok(opened) => opened,
-        Err(why) => {
-            return Launched::refused(Diagnostic::error(
+        Err(reason) => {
+            return Launched::rejected(Diagnostic::error(
                 codes::BACKEND_UNAVAILABLE,
-                format!("the program linked into this executable could not be bound: {why}"),
+                format!("the program linked into this executable could not be bound: {reason}"),
             ));
         }
     };
     let hosts = match ply_privileged::hosts::Hosts::granted(grants) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
-            return Launched::refused(diagnostics.into_iter().next().unwrap_or_else(|| {
+            return Launched::rejected(diagnostics.into_iter().next().unwrap_or_else(|| {
                 Diagnostic::error(
                     codes::INTERNAL_ERROR,
                     "the program's hosts could not be bound, and nothing said why",
@@ -347,7 +347,7 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
     let _ = hosts.torn_down();
     let code = match (hosts.requested_exit(), outcome.ended) {
         (Some(code), _) => Ok(code),
-        (None, Ended::Answered(_)) => Ok(0),
+        (None, Ended::Returned(_)) => Ok(0),
         (None, Ended::Failed(d)) => Err(placed(&d, &opened)),
         (None, Ended::Panicked(message)) => Err(format!(
             "Error[{}]: the program panicked: {message}\n  = this is Ply's fault, not the program's",
@@ -357,8 +357,8 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
             "Error[{}]: this executable's program is entered at no `{entry}`",
             codes::INTERNAL_ERROR
         )),
-        (None, Ended::Unanswerable(why)) => Err(format!(
-            "Error[{}]: `{entry}` answered, and {why}",
+        (None, Ended::NotReturnable(reason)) => Err(format!(
+            "Error[{}]: `{entry}` returned, and {reason}",
             codes::INTERNAL_ERROR
         )),
     };

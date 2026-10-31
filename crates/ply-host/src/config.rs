@@ -1,4 +1,4 @@
-//! What `config.get` and `config.secret` answer from: the snapshot the program resolved before
+//! What `config.get` and `config.secret` return from: the snapshot the program resolved before
 //! anything was bound, which the run's runtime hands `std.config`'s natives.
 
 use std::collections::BTreeMap;

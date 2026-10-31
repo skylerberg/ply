@@ -57,7 +57,7 @@ pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
 }
 
 /// 1 where the signal numbered `which` (`SIGHUP` 0, `SIGUSR1` 1, `SIGUSR2` 2, `SIGWINCH` 3) has
-/// arrived since it was last asked about. An ask takes the arrival it answers. A run that listens
+/// arrived since it was last asked about. An ask takes the arrival it returns. A run that listens
 /// for no stop hears no signal, and its ask installs nothing.
 pub unsafe extern "C" fn rt_signal_arrived(ctx: *mut Ctx, which: I64) -> I64 {
     asked(

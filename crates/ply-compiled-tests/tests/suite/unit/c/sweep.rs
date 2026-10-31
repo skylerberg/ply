@@ -1,5 +1,5 @@
 use ply_compiled::c::sweep::{
-    ANSWERED, BEGUN, REUSED, STAMP, STORES, USED, claim, due, finished, sweep, sweep_stages, used,
+    BEGUN, RETURNED, REUSED, STAMP, STORES, USED, claim, due, finished, sweep, sweep_stages, used,
 };
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -36,7 +36,7 @@ fn a_cache_inside_its_budget_is_left_alone() {
 }
 
 #[test]
-fn an_answer_is_swept_with_the_objects() {
+fn a_cached_result_is_swept_with_the_objects() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["bodies/old", "obj/b.o", "bodies/new"];
     stock(dir.path(), &names, 100);
@@ -69,7 +69,7 @@ fn a_file_at_any_depth_is_swept() {
 }
 
 #[test]
-fn an_object_is_as_removable_as_an_answer() {
+fn an_object_is_as_removable_as_a_cached_result() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["old.dylib", "obj/older.o", "bodies/new"];
     stock(dir.path(), &names, 100);
@@ -242,7 +242,7 @@ fn stage(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
 
 /// A cached front of `size` bytes under the stage-directory entry `under`, last used `ago` before
 /// `now`.
-fn filed(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago: Duration) {
+fn cache_file(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago: Duration) {
     let dir = root.join(under);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(name), vec![b'x'; size]).unwrap();
@@ -251,7 +251,7 @@ fn filed(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago
 
 /// An opened artifact's cached front.
 fn front(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
-    filed(root, ANSWERED, name, size, now, ago);
+    cache_file(root, RETURNED, name, size, now, ago);
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -264,7 +264,7 @@ fn a_stage_directory_inside_its_budget_is_left_alone() {
     front(root.path(), "front.a", 100, now, 5 * HOUR);
     assert_eq!(sweep_stages(root.path(), 1_000, now), 0);
     assert!(root.path().join("stage-a").exists());
-    assert!(root.path().join(ANSWERED).join("front.a").exists());
+    assert!(root.path().join(RETURNED).join("front.a").exists());
 }
 
 /// A stage goes whole and a front goes on its own, least recently used first, and whatever a run
@@ -284,8 +284,8 @@ fn stages_and_fronts_go_least_recently_used_first() {
         .map(|n| root.path().join(n).exists())
         .collect();
     assert_eq!(left, vec![false, false, true]);
-    assert!(!root.path().join(ANSWERED).join("front.oldest").exists());
-    assert!(root.path().join(ANSWERED).join("front.fresh").exists());
+    assert!(!root.path().join(RETURNED).join("front.oldest").exists());
+    assert!(root.path().join(RETURNED).join("front.fresh").exists());
 }
 
 /// A stage is written once and used by every run after, so its use, not its writing, is its age.
@@ -304,10 +304,10 @@ fn a_stage_used_lately_outlives_one_written_later() {
     assert!(!root.path().join("written-late").exists());
 }
 
-/// A store of kept records is its segments and manifest together, written over many runs and read
+/// A store of cached records is its segments and manifest together, written over many runs and read
 /// by more: it goes whole, by when a run last used it, and never a segment of it alone.
 #[test]
-fn a_store_of_kept_records_goes_whole_by_its_last_use() {
+fn a_store_of_cached_records_goes_whole_by_its_last_use() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
     let store = |name: &str, written: Duration, used: Duration| {
@@ -352,45 +352,45 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
     std::fs::write(root.path().join(STAMP), vec![b'x'; 100]).unwrap();
     set(&root.path().join(STAMP), now - 5 * HOUR);
     sweep_stages(root.path(), 0, now);
-    assert!(root.path().join(ANSWERED).join("front.1234.tmp").exists());
+    assert!(root.path().join(RETURNED).join("front.1234.tmp").exists());
     assert!(root.path().join(STAMP).exists());
 }
 
-/// An answer `ply run` or `ply check` filed goes on its own, like an artifact's front, and never as
-/// one stage holding every answer: the least recently used go first, and the directory stays.
+/// A result `ply run` or `ply check` cached goes on its own, like an artifact's front, and never as
+/// one stage holding every result: the least recently used go first, and the directory stays.
 #[test]
-fn a_reused_answer_goes_on_its_own_least_recently_used_first() {
+fn a_reused_cached_result_goes_on_its_own_least_recently_used_first() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
-    filed(root.path(), REUSED, "old", 100, now, 6 * HOUR);
+    cache_file(root.path(), REUSED, "old", 100, now, 6 * HOUR);
     front(root.path(), "front.mid", 100, now, 4 * HOUR);
     stage(root.path(), "stage-a", 100, now, 2 * HOUR);
-    filed(root.path(), REUSED, "fresh", 100, now, HOUR / 4);
+    cache_file(root.path(), REUSED, "fresh", 100, now, HOUR / 4);
     assert_eq!(sweep_stages(root.path(), 250, now), 200);
     let reused = root.path().join(REUSED);
     assert!(
         !reused.join("old").exists(),
-        "the answer used longest ago goes first"
+        "the cached result used longest ago goes first"
     );
-    assert!(!root.path().join(ANSWERED).join("front.mid").exists());
+    assert!(!root.path().join(RETURNED).join("front.mid").exists());
     assert!(
         root.path().join("stage-a").exists(),
         "the rest fits once two have gone"
     );
     assert!(
         reused.join("fresh").exists(),
-        "an answer used within the hour stays"
+        "a cached result used within the hour stays"
     );
 }
 
-/// An answer half written belongs to a run still writing it, and the directory is no stage to
+/// A cached result half written belongs to a run still writing it, and the directory is no stage to
 /// remove whole however far over budget its files are.
 #[test]
-fn a_reused_answer_being_written_is_never_swept() {
+fn a_reused_cached_result_being_written_is_never_swept() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
-    filed(root.path(), REUSED, "k.1234.0.tmp", 100, now, 5 * HOUR);
-    filed(root.path(), REUSED, "k", 100, now, 5 * HOUR);
+    cache_file(root.path(), REUSED, "k.1234.0.tmp", 100, now, 5 * HOUR);
+    cache_file(root.path(), REUSED, "k", 100, now, 5 * HOUR);
     assert_eq!(sweep_stages(root.path(), 0, now), 100);
     let reused = root.path().join(REUSED);
     assert!(reused.join("k.1234.0.tmp").exists());

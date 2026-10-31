@@ -17,7 +17,7 @@ pub struct Tables {
     pub fields: Vec<Symbol>,
     /// Every compiled function's finalized address by index, for building native closures.
     pub functions: Vec<usize>,
-    /// Each pure nullary function's memoized answer by index, as an immortal word; `0` is none.
+    /// Each pure nullary function's memoized result by index, as an immortal word; `0` is none.
     pub memo: Box<[AtomicI64]>,
     /// Owns the memo's blocks for as long as the unit lives.
     pub immortals: Mutex<Heap>,
@@ -42,7 +42,7 @@ impl Tables {
     }
 
     /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s
-    /// answer. The first kept stays; one another thread keeps after it stays in the unit's
+    /// result. The first kept stays; one another thread keeps after it stays in the unit's
     /// persistent heap, unread.
     pub fn keep(&self, index: usize, kept: Word) {
         if let Some(slot) = self.memo.get(index) {

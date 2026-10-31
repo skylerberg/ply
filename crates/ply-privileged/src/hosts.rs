@@ -1,4 +1,4 @@
-//! The binding a run is lent, from its grants alone, and the operations of the families this
+//! The binding a run is granted, from its grants alone, and the operations of the families this
 //! runtime serves itself.
 
 use ply_compiled::entry::Grants;
@@ -18,9 +18,9 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    /// The binding of every family this runtime serves itself, from what a run is lent alone: no
-    /// program's rows are read. Its roots, its programs and its command line narrow what they
-    /// serve. A run lent `drain LEAD_MS DRAIN_MS` drains on `INT` or `TERM`; one lent `end` ends
+    /// The binding of every family this runtime serves itself, from what a run is granted alone: no
+    /// program's effects are read. Its roots, its programs and its command line narrow what they
+    /// serve. A run given `drain LEAD_MS DRAIN_MS` drains on `INT` or `TERM`; one given `end` ends
     /// its children and exits at once.
     pub fn granted(grants: &Grants) -> Result<Hosts, Vec<Diagnostic>> {
         let pairs = |name: &'static str| {
@@ -125,7 +125,7 @@ impl Hosts {
         if !handshakes.is_empty() {
             report("handshakes", &|w| {
                 w.count(handshakes.completed)
-                    .count(handshakes.refused)
+                    .count(handshakes.rejected)
                     .list(handshakes.reasons.iter(), |w, (reason, n)| {
                         w.str(reason).count(*n);
                     });
@@ -191,7 +191,7 @@ impl ply_compiled::entry::Bound for Hosts {
     }
 }
 
-/// The configuration a run is lent: each `config KEY VALUE secret|plain` entry, pinned where a
+/// The configuration a run is granted: each `config KEY VALUE secret|plain` entry, pinned where a
 /// `schema` entry names the function that requires it.
 fn configured(grants: &Grants) -> Arc<Snapshot> {
     let values = grants

@@ -163,7 +163,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     freed
 }
 
-/// The C cache's entry holding the stores of kept records: each a directory of segments named by
+/// The C cache's entry holding the stores of cached records: each a directory of segments named by
 /// a manifest, which goes whole by its [`USED`], since a segment alone is no entry.
 pub const STORES: &str = "bodies";
 
@@ -190,24 +190,24 @@ fn removed(path: &Path) -> bool {
     }
 }
 
-/// The stage-directory entry holding one runnable per program the builder answered for in memory,
+/// The stage-directory entry holding one runnable per program the builder returned in memory,
 /// each swept on its own.
-pub const ANSWERED: &str = "answered";
+pub const RETURNED: &str = "answered";
 
-/// The stage-directory entry holding one file per answer a command takes back over an unchanged walk
-/// (`ply run`'s front end, `ply check`'s answer), each swept on its own.
+/// The stage-directory entry holding one file per cached result a command takes back over an
+/// unchanged walk (`ply run`'s front end, `ply check`'s result), each swept on its own.
 pub const REUSED: &str = "reused";
 
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 2] = [ANSWERED, REUSED];
+const BY_FILE: [&str; 2] = [RETURNED, REUSED];
 
 /// An entry used within this long is never swept: a run may be reading it, or about to open what
 /// it just wrote.
 const RECENT: Duration = Duration::from_secs(3600);
 
 /// Records that a stage directory or a cached file was just used. A file is opened for reading
-/// only: an object a loader has mapped may refuse a writer. A mark younger than [`MARKED`] stands,
+/// only: an object a loader has mapped may reject a writer. A mark younger than [`MARKED`] stands,
 /// since the sweep orders entries by hours.
 pub fn used(path: &Path) {
     let marked = if path.is_dir() {

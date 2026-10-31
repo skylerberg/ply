@@ -12,14 +12,14 @@ use ply_core::Symbol;
 pub struct HelperShape {
     pub name: String,
     pub args: usize,
-    pub answers: bool,
+    pub results: bool,
 }
 
 /// A digest of the runtime's whole helper table, for cache keys (stricter than serving needs).
 pub fn helpers_digest() -> String {
     let mut h = blake3::Hasher::new();
     for helper in helpers() {
-        h.update(format!("{} {} {}\n", helper.name, helper.args(), helper.answers()).as_bytes());
+        h.update(format!("{} {} {}\n", helper.name, helper.args(), helper.results()).as_bytes());
     }
     h.finalize().to_hex().to_string()
 }
@@ -53,22 +53,22 @@ pub struct Exports {
 
 /// What opens a line after a unit's tables naming a root `R` the unit is entered at through the
 /// definition `R#entered` it takes, which takes no words: the runtime opens a lowering for the
-/// answer and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
-/// writes its answer. The runtime enters no root such a line does not name.
+/// result and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
+/// writes its result. The runtime enters no root such a line does not name.
 pub const ENTERED: &str = "entered ";
 
 impl Exports {
     /// The address of each helper the unit binds, in its order; a unit recording one this runtime
-    /// lacks, or has under another shape, is refused.
+    /// lacks, or has under another shape, is rejected.
     pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
         let said = |h: &HelperShape| {
             format!(
                 "taking {} and {}",
                 h.args,
-                if h.answers {
-                    "answering"
+                if h.results {
+                    "returning"
                 } else {
-                    "answering nothing"
+                    "returning nothing"
                 }
             )
         };
@@ -76,7 +76,7 @@ impl Exports {
             .iter()
             .map(
                 |mine| match helpers().iter().find(|h| h.name == mine.name) {
-                    Some(h) if h.args() == mine.args && h.answers() == mine.answers => {
+                    Some(h) if h.args() == mine.args && h.results() == mine.results => {
                         Ok(h.address as *mut std::ffi::c_void)
                     }
                     Some(h) => Err(Unserved(format!(
@@ -86,7 +86,7 @@ impl Exports {
                         said(&HelperShape {
                             name: h.name.to_string(),
                             args: h.args(),
-                            answers: h.answers(),
+                            results: h.results(),
                         }),
                     ))),
                     None => Err(Unserved(format!(
@@ -101,7 +101,7 @@ impl Exports {
     pub fn encode(&self) -> String {
         let mut out = format!("helpers {}\n", self.helpers.len());
         for h in &self.helpers {
-            out.push_str(&format!("{} {} {}\n", h.name, h.args, u8::from(h.answers)));
+            out.push_str(&format!("{} {} {}\n", h.name, h.args, u8::from(h.results)));
         }
         out.push_str(&format!("constants {}\n", self.constants.len()));
         for (name, slot) in &self.constants {
@@ -123,7 +123,7 @@ impl Exports {
             let mut parts = line(s, &mut at)?.split(' ');
             let name = parts.next()?.to_string();
             let args = parts.next()?.parse().ok()?;
-            let answers = match parts.next()? {
+            let results = match parts.next()? {
                 "1" => true,
                 "0" => false,
                 _ => return None,
@@ -131,7 +131,7 @@ impl Exports {
             helpers.push(HelperShape {
                 name,
                 args,
-                answers,
+                results,
             });
         }
         let n = count(line(s, &mut at)?, "constants")?;
@@ -141,7 +141,7 @@ impl Exports {
             constants.push((name.to_string(), slot.parse().ok()?));
         }
         let modules = count(line(s, &mut at)?, "modules")?;
-        // A unit the last release wrote lists what its emitter refused, two lines each.
+        // A unit the last release wrote lists what its emitter rejected, two lines each.
         let mut past = at;
         if let Some(n) = line(s, &mut past).and_then(|l| count(l, "refused")) {
             for _ in 0..2 * n {

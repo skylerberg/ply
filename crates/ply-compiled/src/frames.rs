@@ -103,7 +103,7 @@ unsafe extern "C" fn held_each<const N: usize>(ctx: *mut Ctx, slots: *mut Word, 
 
 /// Runs `call`, which enters compiled code that may stop the body whose stack this frame is on,
 /// with `held` in a record on that stack's chain, so a body abandoned under the call lets go of
-/// them. Answers what `call` answered and `held`, the caller's again. A stack that records nothing
+/// them. Returns what `call` returned and `held`, the caller's again. A stack that records nothing
 /// links nothing.
 ///
 /// # Safety

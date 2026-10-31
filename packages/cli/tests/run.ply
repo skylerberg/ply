@@ -17,7 +17,7 @@ import config_schema
 import configuration
 import machine
 import compiler.front.facts (CheckedProgram, pulled_at)
-import compiler.front.seam (TestRunScope)
+import compiler.front.emitter_input (TestRunScope)
 import compiler.unit (shipped)
 import compiler.check.infer.checker (DefinitionInfo, EffectInfo, TestInfo, prelude_effects)
 import compiler.check.resolve.tables (Diagnostic)
@@ -29,7 +29,7 @@ import mutants (targets)
 import paths
 import program (TimedLoad, loaded_analysis, modules_of, own_diagnostics, timed_over,
                 timed_uncached_over, unchanged, program_view, encoded_command_line, cached_command)
-import report (CommandOutput, ok_code, printed, refused, reuse_members, with_front_end)
+import report (CommandOutput, ok_code, printed, rejected, reuse_members, with_front_end)
 import sources (Embed, File, Project, imported_reader, load_resolved, shipped_imported)
 import std.process (process)
 import std.json (Object, Str, Bool, object, int, parse_string)
@@ -48,7 +48,7 @@ import std.bin
 import testing.select (Row, Stands, by_code, code_keys, decide, to_run)
 import std.bytes
 import std.string
-import signature (atom_texts)
+import signature (effect_texts)
 import proof.context (set_of)
 import std.option
 import tests.report (Entry, Case, group_of_class, classes_of, run_decision_of, Program, TimeSpent,
@@ -61,7 +61,7 @@ import tests.cases (CacheTarget, cached_output_bin, all_cached, Scope, scope_of,
                     codes_of, passed_by_code, concluded_run, search_of, sim_json)
 import semantics (semantics)
 
-pub type Iteration = { result: CommandOutput, held: Option<TimedLoad>, embeds: List<Embed> }
+pub type Iteration = { result: CommandOutput, cached_load: Option<TimedLoad>, embeds: List<Embed> }
 
 pub fn run(
   flags: Flags,
@@ -73,11 +73,11 @@ pub fn run(
 fn load_or_reuse(
   flags: Flags,
   options: Options,
-  held: Option<TimedLoad>,
+  cached_load: Option<TimedLoad>,
   project: Project,
   started: Int,
 ) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_reached} = {
-  let reused = match held {
+  let reused = match cached_load {
     Some(t) -> if unchanged(project, t.program) { Some(t) } else { None },
     None -> None,
   };
@@ -92,7 +92,7 @@ fn load_or_reuse(
 pub fn run_once(
   flags: Flags,
   options: Options,
-  held: Option<TimedLoad>,
+  cached_load: Option<TimedLoad>,
   argv: Option<List<String>>,
 ) -> Iteration / {semantics.cached, shipped.read_pack, process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} = {
   let s: Style = style_of(flags);
@@ -100,7 +100,7 @@ pub fn run_once(
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   let key = match argv {
-    Some(line) -> if held == None && caches_output(flags, options) {
+    Some(line) -> if cached_load == None && caches_output(flags, options) {
       Some(command_key(module_queries::program_digest(), encoded_command_line(line, flags.paths)))
     } else { None },
     None -> None,
@@ -110,9 +110,9 @@ pub fn run_once(
     None -> None,
   };
   match taken {
-    Some(answer) -> { result: answer, held: None, embeds: [] },
+    Some(result) -> { result: result, cached_load: None, embeds: [] },
     None -> {
-      let t: TimedLoad = load_or_reuse(flags, options, held, project, started);
+      let t: TimedLoad = load_or_reuse(flags, options, cached_load, project, started);
       over_load(flags, options, s, t, begun, match key {
         Some(k) -> Some({ key: k, project: project, passes: [], after: false }),
         None -> None,
@@ -126,9 +126,9 @@ fn caches_output(flags: Flags, options: Options) -> Bool =
     && options.machine.config.files.len() == 0
     && options.machine.config.schema == None
 
-fn pass_keys_in_scope(answering: List<List<Bytes>>, scope: Scope) -> List<Bytes> =
+fn pass_keys_in_scope(returning: List<List<Bytes>>, scope: Scope) -> List<Bytes> =
   scope.visible.fold([], |acc: List<Bytes>, i: Int|
-    acc.concat(match answering.at(i) { Some(ks) -> ks, None -> [] }))
+    acc.concat(match returning.at(i) { Some(ks) -> ks, None -> [] }))
 
 fn cached_output(
   flags: Flags,
@@ -146,10 +146,10 @@ fn cached_output(
     Some(k) -> {
       let importing = imported_reader();
       let stands = results::with_result_cache(results::store_for(flags.paths, false), || {
-        let held = result_cache.passes(k.passes);
-        let now = views::shipped_state_of(views::views_in(traces_of(held)), |m: Bytes|
+        let passes = result_cache.passes(k.passes);
+        let now = views::shipped_state_of(views::views_in(traces_of(passes)), |m: Bytes|
           shipped_imported(importing, m));
-        held.fold(true, |all: Bool, h: Option<Bytes>|
+        passes.fold(true, |all: Bool, h: Option<Bytes>|
           all && h != None && pass_status(now, h, options, supplied) == Some(Stands))
       });
       match if stands { Some(parse_string(k.json)) } else { None } {
@@ -202,23 +202,23 @@ fn over_load(
     None ->
       {
         result: with_front_end(
-          refused(s, "test", t.program.diagnostics, t.program.places),
+          rejected(s, "test", t.program.diagnostics, t.program.places),
           reuse_members(t.program.tallies, t.program.lost),
         ),
-        held: None,
+        cached_load: None,
         embeds: t.program.embeds,
       },
     Some(w) -> match config_schema::schema_error(w, options.machine.config.schema) {
       Some(d) ->
         {
           result: unbound(s, { diagnostics: [d], places: t.program.places }),
-          held: None,
+          cached_load: None,
           embeds: t.program.embeds,
         },
       None ->
         {
           result: tests_over(flags, s, options, t, w, begun, keeping),
-          held: Some(t),
+          cached_load: Some(t),
           embeds: t.program.embeds,
         },
     },
@@ -274,8 +274,8 @@ pub fn case_view(
   i: Int,
   test_info: TestInfo,
 ) -> Case / {abort.raise} = {
-  let atoms = canonical(test_info.effects);
-  let texts = atom_texts(atoms);
+  let effects = canonical(test_info.effects);
+  let texts = effect_texts(effects);
   {
     index: i,
     entry: entry_of(i, test_info.key),
@@ -284,12 +284,12 @@ pub fn case_view(
     module: String::of_bytes_lossy(test_info.module),
     nondet: test_info.nondet,
     hash: hash_at(analysis, i),
-    effects: outside_effects_text(atoms),
-    atoms: range(0, atoms.len()).map(|j: Int|
-      match atoms.at(j) {
+    effects: outside_effects_text(effects),
+    listed: range(0, effects.len()).map(|j: Int|
+      match effects.at(j) {
         Some(a) ->
           {
-            atom: {
+            entry: {
               effect: String::of_bytes_lossy(a.effect),
               resource: String::of_bytes_lossy(types::resource_text(a.resource)),
               writes: mode_writes(a.mode),
@@ -297,7 +297,7 @@ pub fn case_view(
             },
             text: texts.at_or(j, ""),
           },
-        None -> { atom: { effect: "", resource: "", writes: false, nondet: false }, text: "" },
+        None -> { entry: { effect: "", resource: "", writes: false, nondet: false }, text: "" },
       }),
     seeded: seeded_of(test_info.effects),
   }
@@ -320,7 +320,7 @@ fn program_of(
   root: String,
   scope: Scope,
   opened: List<Diagnostic>,
-  filed_under: Option<String>,
+  recorded_under: Option<String>,
   unit: TestUnit,
 ) -> Program / {abort.raise} = {
   let declared = declared_effects(analysis);
@@ -334,7 +334,7 @@ fn program_of(
     });
   {
     root: root,
-    stored_under: filed_under,
+    stored_under: recorded_under,
     unit: unit,
     files: timed.program.places.map(|place: SourceText| place.path),
     places: timed.program.places,
@@ -373,14 +373,14 @@ fn tests_over(
     None -> Ok(None),
   };
   match aimed {
-    Err(d) -> refused(style, "test", [d], timed.program.places),
+    Err(d) -> rejected(style, "test", [d], timed.program.places),
     Ok(targeted) -> {
       let loaded_at = time.elapsed_us();
       let unkept = broken_promises(timed.program, analysis.frame);
       let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, analysis.frame) };
       let promised_at = time.elapsed_us();
       let spent = { ..no_time_spent(), before_us: begun, promises_us: promised_at - loaded_at };
-      if broken.len() > 0 { refused(style, "test", broken, timed.program.places) }
+      if broken.len() > 0 { rejected(style, "test", broken, timed.program.places) }
       else { selected(flags, style, options, timed, analysis, targeted, spent, keeping) }
     },
   }
@@ -526,7 +526,7 @@ fn decided_run(
     options.shard,
     named_modules(flags.paths, timed.program.files),
   );
-  let filed_under = if flags.no_cache { None } else { Some(shipped_stamps().runtime) };
+  let recorded_under = if flags.no_cache { None } else { Some(shipped_stamps().runtime) };
   let p = program_of(
     options,
     timed,
@@ -535,7 +535,7 @@ fn decided_run(
     root_of(flags.paths),
     scope,
     opened,
-    filed_under,
+    recorded_under,
     tester::no_unit(testing),
   );
   let searching = machine::sim_plan_of(options.sim);
@@ -565,12 +565,12 @@ fn decided_run(
         else { code_keys(first, codes_of(handed, e, over.entries), search) },
         None -> Map::new(),
       };
-      let answered = by_code(
+      let returned = by_code(
         first,
         passed_by_code(first, keyed, load_or_reuse, options, supplied),
         search,
       );
-      let decisions = answered.decisions;
+      let decisions = returned.decisions;
       let classes = classes_of(p, to_run(decisions).filter(|i: Int| visible.contains(i)));
       let decided = run_decision_of(
         p,
@@ -593,22 +593,22 @@ fn decided_run(
         Err(diagnostics) -> unbound(style, { diagnostics: diagnostics, places: p.places }),
         Ok(made_unit) -> {
           let binding = time.elapsed_us();
-          let refused = |diagnostics: List<Diagnostic>| {
+          let rejected = |diagnostics: List<Diagnostic>| {
             tester::close_unit(made_unit);
             unbound(style, { diagnostics: diagnostics, places: p.places })
           };
           match configuration::resolve_configuration(options.machine.config, |name: String|
               schema_of(made_unit, name)) {
-            Err(diagnostics) -> refused(diagnostics),
+            Err(diagnostics) -> rejected(diagnostics),
             Ok(r) -> match tester::bound(
                 testing,
                 handed.dump,
                 configuration::run_configuration(r.configuration),
               ) {
-              Err(diagnostics) -> refused(diagnostics),
+              Err(diagnostics) -> rejected(diagnostics),
               Ok(bound_testing) -> {
                 let bound = time.elapsed_us();
-                let answer = concluded_run(
+                let result = concluded_run(
                   flags,
                   style,
                   options,
@@ -621,11 +621,11 @@ fn decided_run(
                   decided,
                   keyed,
                   {
-                    refiled: answered.refiled,
+                    refiled: returned.refiled,
                     kept: if flags.json { None } else {
                       match keeping {
                         Some(k) ->
-                          Some({ ..k, passes: pass_keys_in_scope(asked.answering, scope) }),
+                          Some({ ..k, passes: pass_keys_in_scope(asked.returning, scope) }),
                         None -> None,
                       }
                     },
@@ -642,7 +642,7 @@ fn decided_run(
                   },
                 );
                 match keeping {
-                  Some(k) -> if flags.json && answer.code == ok_code() {
+                  Some(k) -> if flags.json && result.code == ok_code() {
                     let again = cases_of(
                       rows_of(analysis),
                       search,
@@ -651,8 +651,8 @@ fn decided_run(
                       supplied,
                       load_or_reuse,
                     );
-                    let settled = decide(again.cases);
-                    if all_cached(settled, scope) {
+                    let resolved = decide(again.cases);
+                    if all_cached(resolved, scope) {
                       let next = program_of(
                         options,
                         timed,
@@ -661,7 +661,7 @@ fn decided_run(
                         root_of(flags.paths),
                         scope,
                         [],
-                        filed_under,
+                        recorded_under,
                         tester::no_unit({ ..bound_testing, binding: 0 }),
                       );
                       let _ = concluded_run(
@@ -673,10 +673,10 @@ fn decided_run(
                         analysis,
                         over.judged,
                         scope,
-                        settled,
+                        resolved,
                         run_decision_of(
                           next,
-                          settled,
+                          resolved,
                           search,
                           sim_json(searching, options.sim),
                           [],
@@ -687,7 +687,7 @@ fn decided_run(
                           refiled: [],
                           kept: Some({
                             ..k,
-                            passes: pass_keys_in_scope(again.answering, scope),
+                            passes: pass_keys_in_scope(again.returning, scope),
                             after: true,
                           }),
                         },
@@ -702,7 +702,7 @@ fn decided_run(
                   None -> (),
                 };
                 tester::close_unit(made_unit);
-                answer
+                result
               },
             },
           }

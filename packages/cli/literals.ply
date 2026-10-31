@@ -1,6 +1,6 @@
 import compiler.syntax.expressions (TaggedPart)
 import compiler.front.facts (CheckedProgram, Frame, TaggedSite)
-import compiler.front.seam (TestRunScope)
+import compiler.front.emitter_input (TestRunScope)
 import compiler.store.hash.forms (FunctionNamed, reach)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (length_prefixed)
@@ -21,7 +21,7 @@ import program (TimedLoad, loaded_analysis, program_view, runs_statements)
 import sources
 import statements
 import statements (CheckSite, CheckResult, Unchecked, check_sites, check_statements,
-                   check_result_key, check_result_bin, misfits, schemas_refused)
+                   check_result_key, check_result_bin, misfits, schemas_rejected)
 import std.bin
 import std.fs (fs)
 import std.hash (blake3)
@@ -150,15 +150,15 @@ fn literal_error(
 ) -> Option<Diagnostic> / {abort.raise} =
   match verdict {
     Accepted -> None,
-    Rejected(why) -> {
+    Rejected(reason) -> {
       let src = match places.at(site.module) { Some(place) -> place.text, None -> b"" };
       Some(
         error_at(
           b"E0153",
           site.module,
-          rejection_span(src, site, why.part, why.offset),
-          parser_name(site).concat(b" refuses this literal"),
-          Bytes::of_string(why.message),
+          rejection_span(src, site, reason.part, reason.offset),
+          parser_name(site).concat(b" rejects this literal"),
+          Bytes::of_string(reason.message),
           [call_note(site)],
         ),
       )
@@ -174,8 +174,8 @@ fn literal_error(
             b" raised on this literal: ",
             Bytes::of_string(message),
           ]),
-          b"its parser gave no answer",
-          [call_note(site), b"a parser answers `Err` of a text it refuses, saying where and why"],
+          b"its parser returned no result",
+          [call_note(site), b"a parser returns `Err` of a text it rejects, saying where and why"],
         ),
       ),
     TimedOut ->
@@ -185,7 +185,7 @@ fn literal_error(
           site.module,
           site.span,
           Bytes::concat_all([parser_name(site), b" did not finish this literal in time"]),
-          b"its parser gave no answer",
+          b"its parser returned no result",
           [call_note(site), time_given(b"a check gives each literal's parser")],
         ),
       ),
@@ -211,12 +211,12 @@ fn statement_errors(
 ) -> List<Diagnostic> / {evaluation.statements, abort.raise} =
   if !runs_statements(timed.program, frame) { [] } else {
     let asks = check_sites(frame).filter(|a: CheckSite| a.site.module < timed.program.files.len());
-    let refused = schemas_refused(asks);
-    if asks.len() == 0 { refused } else {
+    let rejected = schemas_rejected(asks);
+    if asks.len() == 0 { rejected } else {
       match evaluation.statements(timed, frame, asks.map(|a: CheckSite| a.asked)) {
-        Err(diagnostics) -> refused.concat(diagnostics),
+        Err(diagnostics) -> rejected.concat(diagnostics),
         Ok(judgements) ->
-          range(0, asks.len()).fold(refused, |acc: List<Diagnostic>, i: Int|
+          range(0, asks.len()).fold(rejected, |acc: List<Diagnostic>, i: Int|
             match judgements.at(i) { Some(j) -> acc.concat(misfits(asks.get(i), j)), None -> acc }),
       }
     }
@@ -264,12 +264,12 @@ fn verdict_of(called: CallResult) -> Verdict / {abort.raise} =
                 offset: offset,
                 message: message,
               }),
-            _ -> Raised("it answered " ++ render(value)),
+            _ -> Raised("it returned " ++ render(value)),
           },
-          _ -> Raised("it answered " ++ render(value)),
+          _ -> Raised("it returned " ++ render(value)),
         }
       },
-      _ -> Raised("it answered " ++ render(value)),
+      _ -> Raised("it returned " ++ render(value)),
     },
   }
 
@@ -301,7 +301,7 @@ fn evaluate(
     match units::library_over(emit.unit(front, offered), cc::development()) {
       Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
-        Err(why) -> Err([machine::unit_load_error(why)]),
+        Err(reason) -> Err([machine::unit_load_error(reason)]),
         Ok(opened) -> {
           let roots = machine::roots_of(front.dump);
           let call = |name: Bytes, args: List<Value>|
@@ -312,10 +312,10 @@ fn evaluate(
               args,
               machine::evaluation_run(),
             );
-          let answered = asked.map(|a: EvaluationRequest|
+          let returned = asked.map(|a: EvaluationRequest|
             verdict_of(call(a.callee, [argument_of(a)])));
           entering::machine.close(opened.unit);
-          Ok(answered)
+          Ok(returned)
         },
       },
     }
@@ -349,7 +349,7 @@ fn toolchain_key(definitions: Bytes, runtime: Bytes, version: String) -> Bytes /
 
 fn toolchain_roots() -> List<Bytes> = compiler_roots().push(b"literals.with_evaluation_cache")
 
-type KeyedRequest = { asked: EvaluationRequest, key: Bytes, kept: Option<Verdict> }
+type KeyedRequest = { asked: EvaluationRequest, key: Bytes, cached: Option<Verdict> }
 
 pub fn with_evaluation_cache<a | e>(
   body: () -> a / {evaluation.verdicts, evaluation.statements | e},
@@ -380,7 +380,7 @@ pub fn with_evaluation_cache<a | e>(
           {
             asked: a,
             key: key,
-            kept: match record_store.get[lit](key) {
+            cached: match record_store.get[lit](key) {
               None -> None,
               Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
                 Ok(v) -> Some(v),
@@ -389,7 +389,7 @@ pub fn with_evaluation_cache<a | e>(
             },
           }
         });
-        let open = sought.filter(|s: KeyedRequest| s.kept == None);
+        let open = sought.filter(|s: KeyedRequest| s.cached == None);
         if open.len() == 0 { Ok(merge_verdicts(sought, [])) } else {
           match program_view(timed.program) {
             None -> Err(timed.program.diagnostics),
@@ -430,7 +430,7 @@ fn evaluate_and_cache(
 
 fn cacheable(v: Verdict) -> Bool = match v { TimedOut -> false, _ -> true }
 
-type KeyedStatement = { asked: statements::StatementCheck, key: Bytes, kept: Option<CheckResult> }
+type KeyedStatement = { asked: statements::StatementCheck, key: Bytes, cached: Option<CheckResult> }
 
 fn judgements(
   toolchain: Bytes,
@@ -443,7 +443,7 @@ fn judgements(
     {
       asked: a,
       key: key,
-      kept: match record_store.get[lit](key) {
+      cached: match record_store.get[lit](key) {
         None -> None,
         Some(bytes) -> match bin::decode(bytes, check_result_bin()) {
           Ok(j) -> Some(j),
@@ -452,9 +452,9 @@ fn judgements(
       },
     }
   });
-  let open = keyed.filter(|k: KeyedStatement| k.kept == None);
+  let open = keyed.filter(|k: KeyedStatement| k.cached == None);
   if open.len() == 0 {
-    Ok(keyed.map(|k: KeyedStatement| match k.kept { Some(j) -> j, None -> Unchecked }))
+    Ok(keyed.map(|k: KeyedStatement| match k.cached { Some(j) -> j, None -> Unchecked }))
   } else {
     match match program_view(timed.program) {
         None -> Err(timed.program.diagnostics),
@@ -479,7 +479,7 @@ fn judgements(
           keyed.fold(
             { out: [], next: 0 },
             |acc: { out: List<CheckResult>, next: Int }, k: KeyedStatement|
-              match k.kept {
+              match k.cached {
                 Some(j) -> { out: acc.out.push(j), next: acc.next },
                 None ->
                   {
@@ -499,7 +499,7 @@ fn judgements(
 
 fn merge_verdicts(sought: List<KeyedRequest>, found: List<Verdict>) -> List<Verdict> =
   sought.fold({ out: [], next: 0 }, |acc: { out: List<Verdict>, next: Int }, s: KeyedRequest|
-    match s.kept {
+    match s.cached {
       Some(v) -> { out: acc.out.push(v), next: acc.next },
       None ->
         {
@@ -536,8 +536,8 @@ test "a character of a literal's text is placed where its source spells it" {
   assert_eq(source_span_at(braced, all, 3), Some(span_between(9, 10)))
 }
 
-test "a parser's answer is read as its verdict, and the clock stopping it is told from a raise" {
-  let answered = |v: Value| verdict_of({ result: Ok(v), warnings: [] });
+test "a parser's result is read as its verdict, and the clock stopping it is told apart from a raise" {
+  let returned = |v: Value| verdict_of({ result: Ok(v), warnings: [] });
   let failed = |code: String|
     verdict_of({
       result: Err({ diagnostic: diagnostic_of("error", code, "m", [], []), values: [] }),
@@ -545,9 +545,9 @@ test "a parser's answer is read as its verdict, and the clock stopping it is tol
     });
   assert_eq(failed("W0612"), TimedOut);
   assert_eq(failed("E0502"), Raised("m"));
-  assert_eq(answered(VCtor("Ok", [VInt(1)])), Accepted);
+  assert_eq(returned(VCtor("Ok", [VInt(1)])), Accepted);
   assert_eq(
-    answered(
+    returned(
       VCtor("Err", [
         VRecord([{ name: "message", value: VStr("odd") }, { name: "offset", value: VInt(2) }]),
       ]),
@@ -555,7 +555,7 @@ test "a parser's answer is read as its verdict, and the clock stopping it is tol
     Rejected({ part: 0, offset: 2, message: "odd" }),
   );
   assert_eq(
-    answered(
+    returned(
       VCtor("Err", [
         VRecord([
           { name: "message", value: VStr("odd") },
@@ -566,10 +566,10 @@ test "a parser's answer is read as its verdict, and the clock stopping it is tol
     ),
     Rejected({ part: 1, offset: 2, message: "odd" }),
   );
-  assert_eq(answered(VInt(1)), Raised("it answered 1"))
+  assert_eq(returned(VInt(1)), Raised("it returned 1"))
 }
 
-test "a refused literal is placed inside its text, and one past it at the whole literal" {
+test "a rejected literal is placed inside its text, and one past it at the whole literal" {
   let site = a_site(b"abz");
   let places = [{ path: "main.ply", text: b"hex\"abz\"" }];
   let labelled = |verdict: Verdict|
@@ -593,7 +593,7 @@ test "a refused literal is placed inside its text, and one past it at the whole 
   assert_eq(labelled(Raised("boom")), Some({ code: b"E0154", start: 0, end: 8 }))
 }
 
-test "a refusal of a literal with holes is placed in the text it names, or on the hole after it" {
+test "a rejection of a literal with holes is placed in the text it names, or on the hole after it" {
   let src = b"sh\"ab {x} cd{y}\"";
   let site = {
     module: 0,
@@ -621,9 +621,9 @@ test "a refusal of a literal with holes is placed in the text it names, or on th
 test "verdicts kept come back in the order they were sought, the rest from what was found" {
   let a: EvaluationRequest = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
   let sought = [
-    { asked: a, key: b"1", kept: None },
-    { asked: a, key: b"2", kept: Some(Accepted) },
-    { asked: a, key: b"3", kept: None },
+    { asked: a, key: b"1", cached: None },
+    { asked: a, key: b"2", cached: Some(Accepted) },
+    { asked: a, key: b"3", cached: None },
   ];
   assert_eq(merge_verdicts(sought, [TimedOut, Raised("x")]), [TimedOut, Accepted, Raised("x")])
 }

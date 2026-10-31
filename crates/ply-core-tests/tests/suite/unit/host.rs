@@ -1,8 +1,8 @@
 use ply_core::host::*;
 
-/// A run's binding keeps what the run is lent, which the natives of the host handlers read.
+/// A run's binding keeps what the run is granted, which the natives of the host handlers read.
 #[test]
-fn a_granted_binding_keeps_what_its_run_is_lent() {
+fn a_granted_binding_keeps_what_its_run_is_granted() {
     let binding = HostBinding::granted(Grants::default().with("allow", &["toolchain"]));
     assert!(binding.is_granted());
     assert!(binding.grants().allows("toolchain"));
@@ -10,7 +10,7 @@ fn a_granted_binding_keeps_what_its_run_is_lent() {
 }
 
 #[test]
-fn an_unbound_binding_is_lent_nothing() {
+fn an_unbound_binding_is_granted_nothing() {
     let binding = HostBinding::unbound();
     assert!(!binding.is_granted());
     assert_eq!(binding.grants(), &Grants::default());
@@ -23,7 +23,7 @@ fn host_use_records_what_actually_happened() {
     use_.record(Determinism::Deterministic);
     assert!(
         !use_.acted(),
-        "a deterministic handler answers a re-run the same"
+        "a deterministic handler returns the same on a re-run"
     );
     use_.record(Determinism::Nondeterministic);
     assert_eq!(use_.operations, 2);

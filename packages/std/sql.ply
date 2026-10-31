@@ -579,8 +579,8 @@ pub fn sql_tokenize_summary(
 
 // --- The parser --------------------------------------------------------------------
 
-/// What a statement does and which tables its text reaches. The effect row of the definition that
-/// reached the call site is checked against `written` and `read`, so a construct the parser cannot
+/// What a statement does and which tables its text reaches. The effects of the definition that
+/// reached the call site are checked against `written` and `read`, so a construct the parser cannot
 /// account for is rejected rather than run with effects that under-report.
 pub type SqlScan = { kind: StatementKind, tables: SqlTables }
 
@@ -593,29 +593,29 @@ type SqlParser = { tokens: List<SqlTokenAt>, ctes: List<String>, depth: Int, end
 
 fn sql_max_depth() -> Int = 32
 
-fn sql_refuse(where_: String, at: Int, why: String) -> DbError =
+fn sql_refuse(where_: String, at: Int, reason: String) -> DbError =
   db_error(
     "0A000",
     "",
-    "the database driver refuses this statement: " ++ where_ ++ sql_byte_marker() ++ at.to_string()
+    "the database driver rejects this statement: " ++ where_ ++ sql_byte_marker() ++ at.to_string()
       ++ ". "
-      ++ why,
+      ++ reason,
   )
 
-fn sql_refuse_token(t: SqlTokenAt, why: String) -> DbError =
-  sql_refuse("`" ++ t.text ++ "`", t.at, why)
+fn sql_refuse_token(t: SqlTokenAt, reason: String) -> DbError =
+  sql_refuse("`" ++ t.text ++ "`", t.at, reason)
 
-fn sql_refuse_here(parser: SqlParser, why: String) -> DbError =
+fn sql_refuse_here(parser: SqlParser, reason: String) -> DbError =
   match sql_head(parser.tokens) {
-    Some(t) -> sql_refuse_token(t, why),
-    None -> sql_refuse("the statement ends", parser.end_pos, why),
+    Some(t) -> sql_refuse_token(t, reason),
+    None -> sql_refuse("the statement ends", parser.end_pos, reason),
   }
 
 fn sql_refuse_stacked(at: Int) -> DbError =
   db_error(
     "0A000",
     "",
-    "the database driver refuses this statement: `Statement` holds more than one statement, and a `;` is"
+    "the database driver rejects this statement: `Statement` holds more than one statement, and a `;` is"
       ++ sql_byte_marker()
       ++ at.to_string()
       ++ ". One `Statement` is one statement, which is what removes the stacked-statement payload an injected fragment would otherwise become",
@@ -2163,7 +2163,7 @@ fn check_label(site: Site, scan: SqlScan) -> List<Finding> / {abort.raise} =
 
 fn check_operation(site: Site, scan: SqlScan, returns: Bool) -> List<Finding> = {
   let writes = scan_writes(scan) || (match scan.kind { Pragma -> true, _ -> false });
-  let wrong = |why: String| [{ kind: OperationMismatch, at: 0, message: why }];
+  let wrong = |reason: String| [{ kind: OperationMismatch, at: 0, message: reason }];
   match site.operation {
     Reads -> if scan_writes(scan) {
       wrong(
@@ -2172,18 +2172,18 @@ fn check_operation(site: Site, scan: SqlScan, returns: Bool) -> List<Finding> = 
     } else { [] },
     Writes -> if !writes {
       wrong(
-        "the statement only reads, and the call writes and answers a count: perform it as a query",
+        "the statement only reads, and the call writes and returns a count: perform it as a query",
       )
     } else if returns {
       wrong(
-        "the statement answers rows through `returning`, and the call answers a count: perform it as `returning`",
+        "the statement returns rows through `returning`, and the call returns a count: perform it as `returning`",
       )
     } else { [] },
     WritesRows -> if !writes {
       wrong("the statement only reads, and the call writes: perform it as a query")
     } else if !returns {
       wrong(
-        "the statement answers no rows, and the call reads the rows its `returning` names: add `returning`, or perform it as `execute`",
+        "the statement returns no rows, and the call reads the rows its `returning` names: add `returning`, or perform it as `execute`",
       )
     } else { [] },
     Either -> [],
@@ -2245,7 +2245,7 @@ fn check_against_schema(
       let shaped = match site.row {
         None -> [],
         Some(fields) -> if judged.j.findings.len() > 0 { [] }
-        else { check_row_fields(fields, judged.answered) },
+        else { check_row_fields(fields, judged.returned) },
       };
       let bound = match site.given {
         None -> [],
@@ -3366,7 +3366,7 @@ type CheckState = {
 
 type TypeResult = { j: CheckState, t: ExpressionType }
 
-type ResultColumns = { j: CheckState, answered: List<ResultColumn> }
+type ResultColumns = { j: CheckState, returned: List<ResultColumn> }
 
 type Target = { what: String, ty: ValueType }
 
@@ -3530,7 +3530,7 @@ fn check_expression(
       ColumnExpression(r) -> match lookup_column(scope, r) {
         Found(t) -> { j: j, t: t },
         Unknown -> type_result(j, UnknownType, true),
-        Missing(why) -> type_result(add_finding(j, Undeclared, r.at, why), UnknownType, true),
+        Missing(reason) -> type_result(add_finding(j, Undeclared, r.at, reason), UnknownType, true),
       },
       PlaceholderExpression(p) ->
         type_result(record_placeholder(j, p.n, p.at, want, what), want, false),
@@ -3549,7 +3549,7 @@ fn check_expression(
       InListExpression(i) -> check_in_list(j, scope, i.value, i.items, left - 1),
       InSelectExpression(i) -> {
         let q = check_select(j, scope, i.query, left - 1);
-        let column = match q.answered { [a, ..] -> a.ty, [] -> UnknownType };
+        let column = match q.returned { [a, ..] -> a.ty, [] -> UnknownType };
         type_result(
           check_expression(q.j, scope, i.value, column, "an expression", left - 1).j,
           BoolType,
@@ -3559,7 +3559,7 @@ fn check_expression(
       ExistsExpression(q) -> type_result(check_select(j, scope, q, left - 1).j, BoolType, false),
       SubqueryExpression(q) -> {
         let s = check_select(j, scope, q, left - 1);
-        match s.answered {
+        match s.returned {
           [a, ..] -> type_result(s.j, a.ty, true),
           [] -> type_result(s.j, UnknownType, true),
         }
@@ -3884,7 +3884,7 @@ fn check_select(
   q: SelectQuery,
   left: Int,
 ) -> ResultColumns / {abort.raise} =
-  if left <= 0 { { j: j, answered: [] } } else {
+  if left <= 0 { { j: j, returned: [] } } else {
     let bound = bind_sources(j, q.sources);
     let scope = [bound.level].concat(outer);
     let conditioned = check_conditions(
@@ -3897,7 +3897,7 @@ fn check_select(
       check_expression(acc, scope, g, UnknownType, "", left - 1).j);
     let had = check_conditions(grouped, scope, option_to_list(q.having), left - 1);
     let items = check_result_columns(had, scope, bound.level, q.items, left - 1);
-    let names = items.answered.map(|a: ResultColumn| a.name);
+    let names = items.returned.map(|a: ResultColumn| a.name);
     let ordered = q.order.fold(items.j, |acc: CheckState, o: QueryExpression|
       match o {
         ColumnExpression(r) -> if r.table == "" && names.contains(r.column) { acc }
@@ -3907,7 +3907,7 @@ fn check_select(
       });
     let bounded = q.bounds.fold(ordered, |acc: CheckState, b: QueryExpression|
       check_expression(acc, scope, b, IntType, "a `limit` or an `offset`", left - 1).j);
-    { j: bounded, answered: items.answered }
+    { j: bounded, returned: items.returned }
   }
 
 fn check_result_columns(
@@ -3917,7 +3917,7 @@ fn check_result_columns(
   items: List<SelectItem>,
   left: Int,
 ) -> ResultColumns / {abort.raise} =
-  items.fold({ j: j, answered: [] }, |acc: ResultColumns, item: SelectItem|
+  items.fold({ j: j, returned: [] }, |acc: ResultColumns, item: SelectItem|
     match item {
       Wildcard(a) ->
         {
@@ -3925,24 +3925,17 @@ fn check_result_columns(
             acc.j,
             SelectStar,
             a.at,
-            "`*` answers whatever columns "
+            "`*` returns whatever columns "
               ++ (if a.table == "" { "the tables have" } else { "`" ++ a.table ++ "` has" })
-              ++ " when the statement runs, so a column added to the schema changes every row it answers: name the columns",
+              ++ " when the statement runs, so a column added to the schema changes every row it returns: name the columns",
           ),
-          answered: acc.answered.concat(every_column(level, a.table)),
+          returned: acc.returned.concat(every_column(level, a.table)),
         },
       ExpressionItem(o) -> {
-        let t = check_expression(
-          acc.j,
-          scope,
-          o.value,
-          UnknownType,
-          "an answered expression",
-          left,
-        );
+        let t = check_expression(acc.j, scope, o.value, UnknownType, "a returned expression", left);
         {
           j: t.j,
-          answered: acc.answered.push({
+          returned: acc.returned.push({
             name: result_column_name(j.dialect, j.sql, o.value, o.name, o.from, o.to),
             ty: t.t.ty,
             nullable: t.t.nullable,
@@ -4040,12 +4033,12 @@ fn type_check_statement(
             check_value_row(acc, columns.targets, tuple, i.target.at, left - 1)),
         BySelect(q) -> {
           let a = check_select(columns.j, [], q, left - 1);
-          if columns.targets.len() == 0 || a.answered.len() == columns.targets.len() { a.j } else {
+          if columns.targets.len() == 0 || a.returned.len() == columns.targets.len() { a.j } else {
             add_finding(
               a.j,
               ValueMismatch,
               i.target.at,
-              "the `select` answers " ++ count_text(a.answered.len(), "column") ++ " for "
+              "the `select` returns " ++ count_text(a.returned.len(), "column") ++ " for "
                 ++ count_text(columns.targets.len(), "column"),
             )
           }
@@ -4186,11 +4179,11 @@ fn check_assignment(
 
 // --- The statement against its call -------------------------------------------------------
 
-fn row_mismatch(why: String) -> Finding = { kind: RowMismatch, at: 0, message: why }
+fn row_mismatch(reason: String) -> Finding = { kind: RowMismatch, at: 0, message: reason }
 
 /// Checks the row type's fields against the columns the statement returns, by name.
-fn check_row_fields(fields: List<Field>, answered: List<ResultColumn>) -> List<Finding> = {
-  let named = answered.fold(
+fn check_row_fields(fields: List<Field>, returned: List<ResultColumn>) -> List<Finding> = {
+  let named = returned.fold(
     { seen: [], found: [] },
     |acc: { seen: List<String>, found: List<Finding> }, a: ResultColumn|
       if acc.seen.contains(a.name) {
@@ -4198,30 +4191,30 @@ fn check_row_fields(fields: List<Field>, answered: List<ResultColumn>) -> List<F
           seen: acc.seen,
           found: acc.found.push(
             row_mismatch(
-              "the statement answers two columns named `" ++ a.name ++ "`: name one with `as`",
+              "the statement returns two columns named `" ++ a.name ++ "`: name one with `as`",
             ),
           ),
         }
       } else { { seen: acc.seen.push(a.name), found: acc.found } },
   );
   let fielded = fields.fold(named.found, |acc: List<Finding>, f: Field|
-    match answered.find(|a: ResultColumn| a.name == f.name) {
+    match returned.find(|a: ResultColumn| a.name == f.name) {
       None ->
         acc.push(
           row_mismatch(
-            "the row type's field `" ++ f.name ++ "` is no column the statement answers",
+            "the row type's field `" ++ f.name ++ "` is no column the statement returns",
           ),
         ),
       Some(a) -> match field_mismatch(f.kind, a) {
         None -> acc,
-        Some(why) -> acc.push(row_mismatch(why)),
+        Some(reason) -> acc.push(row_mismatch(reason)),
       },
     });
-  answered.fold(fielded, |acc: List<Finding>, a: ResultColumn|
+  returned.fold(fielded, |acc: List<Finding>, a: ResultColumn|
     if fields.find(|f: Field| f.name == a.name) == None {
       acc.push(
         row_mismatch(
-          "the statement answers `" ++ a.name ++ "`, and the row type has no field for it",
+          "the statement returns `" ++ a.name ++ "`, and the row type has no field for it",
         ),
       )
     } else { acc })
@@ -4354,12 +4347,12 @@ pub type RowCodec<a> = {
 /// count, or a row could not be read.
 pub type FetchError = | Refused(DbError) | UnexpectedCount(Int) | InvalidRow(RowError)
 
-/// Each row of `answer`, read by `codec`.
+/// Each row of `result`, read by `codec`.
 pub fn decode_rows<a>(
-  answer: QueryResult,
+  result: QueryResult,
   codec: RowCodec<a>,
 ) -> Result<List<a>, FetchError> / {abort.raise} =
-  match answer {
+  match result {
     Failed(e) -> Err(Refused(e)),
     Count(n) -> Err(UnexpectedCount(n)),
     Rows(rows) ->
@@ -4999,7 +4992,7 @@ test "malformed input gets a result and never a panic" {
 
 test "the payloads that change a statement's shape are rejected" {
   assert(scan_refused("select * from items where sku = '' ; drop table items --'"));
-  // Accepted here: the injected table is in the scan, so the effect row check rejects it.
+  // Accepted here: the injected table is in the scan, so the effects check rejects it.
   assert_eq(scan_names("select * from items where sku = '' union select * from pg_shadow --'"), [
     "items",
     "pg_shadow",

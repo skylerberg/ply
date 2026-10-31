@@ -14,24 +14,24 @@ fn listen(host: &TcpHost, port: u16) -> i64 {
         .expect("a loopback port")
 }
 
-/// What a listener's next `accept` answers once it does, its job waiting on a thread of its own as
+/// What a listener's next `accept` returns once it does, its job waiting on a thread of its own as
 /// a run's would.
 fn accepting(host: &TcpHost, listener: i64) -> mpsc::Receiver<i64> {
     let job = host
         .accept(LISTENER, listener, Span::DUMMY)
         .expect("the accept is taken");
-    let (answered, answer) = mpsc::channel();
+    let (returned, result) = mpsc::channel();
     std::thread::spawn(move || {
         let handle = ply_host::native::int_of(&job().expect("the accept ran")).expect("a handle");
-        let _ = answered.send(handle);
+        let _ = returned.send(handle);
     });
-    answer
+    result
 }
 
 fn accepted(host: &TcpHost, listener: i64) -> i64 {
     accepting(host, listener)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the accept answered")
+        .expect("the accept returned")
 }
 
 fn bounds(lead_ms: u64, drain_ms: u64) -> Bounds {
@@ -107,7 +107,7 @@ fn a_drain_that_runs_out_says_so() {
 
 /// A second signal means a person has decided to stop waiting.
 #[test]
-fn a_second_signal_is_refused_rather_than_started_again() {
+fn a_second_signal_is_rejected_rather_than_started_again() {
     let shutdown = Shutdown::new(bounds(0, 5_000));
     assert!(
         shutdown.request(ShutdownSignal::Terminate),
@@ -132,7 +132,7 @@ fn the_exit_codes_are_the_shell_convention() {
 }
 
 #[test]
-fn accept_answers_zero_once_the_run_has_stopped_accepting() {
+fn accept_returns_zero_once_the_run_has_stopped_accepting() {
     let host = Arc::new(TcpHost::new());
     let listener = listen(&host, 0);
     assert!(listener > 0);
@@ -145,7 +145,7 @@ fn accept_answers_zero_once_the_run_has_stopped_accepting() {
     assert_eq!(
         accepted(&host, listener),
         0,
-        "a listener the drain closed answers 0, which is what ends a sequential accept loop"
+        "a listener the drain closed returns 0, which is what ends a sequential accept loop"
     );
     // And again, because a program that loops until zero may ask twice.
     assert_eq!(accepted(&host, listener), 0);
@@ -171,14 +171,14 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     let listener = listen(&host, 0);
 
     // Parked, with nothing connecting: exactly an idle service.
-    let answer = accepting(&host, listener);
+    let result = accepting(&host, listener);
     assert_eq!(
         host.accepts_in_flight(),
         1,
         "the accept is counted as parked"
     );
     assert!(
-        answer.recv_timeout(Duration::from_millis(100)).is_err(),
+        result.recv_timeout(Duration::from_millis(100)).is_err(),
         "nothing is connecting, so it is still waiting"
     );
 
@@ -187,11 +187,11 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     shutdown.request(ShutdownSignal::Terminate);
     until_stopped_accepting(&shutdown);
 
-    let answered = answer
+    let returned = result
         .recv_timeout(Duration::from_secs(10))
         .expect("the parked accept returned, so an idle service observes a stop");
     assert_eq!(
-        answered, 0,
+        returned, 0,
         "the connection the drain dialled is closed rather than served"
     );
     let until = Instant::now() + Duration::from_secs(2);
@@ -211,7 +211,7 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     let listener = listen(&host, 0);
     let address = host.local_addr(listener).expect("a bound address");
 
-    let answer = accepting(&host, listener);
+    let result = accepting(&host, listener);
 
     let shutdown = Shutdown::new(bounds(0, 5_000));
     shutdown.attach_net(Arc::clone(&host) as Arc<dyn Accepting>);
@@ -221,7 +221,7 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     let mut client = TcpStream::connect_timeout(&address, Duration::from_millis(500))
         .or_else(|_| TcpStream::connect(address));
     assert_eq!(
-        answer
+        result
             .recv_timeout(Duration::from_secs(10))
             .expect("the accept returned"),
         0
@@ -317,7 +317,7 @@ fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
     let _ = shutdown.arrived(Asked::User2);
     assert!(
         !shutdown.arrived(Asked::User2).expect("installed"),
-        "arrivals are not counted: nothing is owed once they were answered"
+        "arrivals are not counted: nothing is owed once an ask returned them"
     );
     assert!(
         !shutdown.stopping(),

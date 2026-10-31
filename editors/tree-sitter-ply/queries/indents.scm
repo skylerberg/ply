@@ -29,7 +29,7 @@
   (function_type)
   (type_arguments)
   (generic_parameters)
-  (row)
+  (effects_list)
   (effect_set)
   (match_expression)
   (handle_expression)

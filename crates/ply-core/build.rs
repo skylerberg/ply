@@ -1,5 +1,5 @@
 //! Compiles the CORE-MATH functions (upstream `85430b3e`) the prelude's `exp`, `ln`, `sin` and the
-//! rest answer with. Each is correctly rounded, so its answer is fixed by the specification and
+//! rest compute with. Each is correctly rounded, so its result is fixed by the specification and
 //! not by this compiler, these flags or this machine.
 
 const FUNCTIONS: [&str; 13] = [

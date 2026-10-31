@@ -8,31 +8,31 @@ use ply_core::host::Pending;
 use ply_core::{Diagnostic, Span};
 use std::sync::{Arc, OnceLock};
 
-/// What a native's operation does on a thread of its own: its answer flat, or why it failed.
+/// What a native's operation does on a thread of its own: its result flat, or why it failed.
 pub type Job = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
 
-/// Why a native's job answered nothing.
+/// Why a native's job returned nothing.
 #[derive(Debug)]
 pub enum Failure {
     /// What the system said, which the run's failure names the job by.
     Said(String),
-    /// A refusal of the job's own, which fails the run as it stands.
-    Refused(Diagnostic),
+    /// A rejection of the job's own, which fails the run as it stands.
+    Rejected(Diagnostic),
 }
 
-/// A job whose failure may be a refusal of its own.
-pub type Refusing = Box<dyn FnOnce() -> Result<Vec<u8>, Failure> + Send>;
+/// A job whose failure may be a rejection of its own.
+pub type FallibleJob = Box<dyn FnOnce() -> Result<Vec<u8>, Failure> + Send>;
 
 /// Which of the process's pools a job waits for a thread in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Work {
     /// It fills a core: in line for as many threads as the machine has cores, so a burst is a
-    /// line rather than a refusal and more at once would finish none sooner.
+    /// line rather than a rejection and more at once would finish none sooner.
     Computing,
     /// It waits on something outside the process: a thread of its own, a bounded number at once.
     Waiting,
     /// It reads or writes the file system: in line for one of a bounded number of threads, so a
-    /// burst of small operations is a line rather than a refusal.
+    /// burst of small operations is a line rather than a rejection.
     Filing,
 }
 
@@ -51,8 +51,8 @@ fn jobs() -> &'static Jobs {
     })
 }
 
-/// `job` run for `run` on a thread of `work`'s pool, named `label`, answering the token a wait
-/// reads its bytes by. A job that answers why it failed, or panics, fails the run that waits on
+/// `job` run for `run` on a thread of `work`'s pool, named `label`, returning the token a wait
+/// reads its bytes by. A job that returns why it failed, or panics, fails the run that waits on
 /// it, naming `what`.
 ///
 /// # Errors
@@ -70,7 +70,7 @@ pub fn submit(
     })
 }
 
-/// `job` run for `run` on this thread, its ticket answered as it is handed: for a job no other task
+/// `job` run for `run` on this thread, its ticket resolved as it is handed: for a job no other task
 /// of the run could go on beside, which a thread of a pool would only make wait longer. As
 /// [`refusing`] runs it otherwise.
 pub fn done_here(
@@ -83,7 +83,7 @@ pub fn done_here(
     run.done_here(span, label, what, job)
 }
 
-/// `job` as [`submit`] runs it, where the job may refuse with a diagnostic of its own.
+/// `job` as [`submit`] runs it, where the job may fail with a diagnostic of its own.
 ///
 /// # Errors
 /// As [`submit`].

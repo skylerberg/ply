@@ -3,8 +3,8 @@ import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, Litera
                                  LiteralString, LiteralBytes, LiteralEmbedded, LiteralFloat,
                                  LiteralDecimal, LiteralChar, LiteralUnit, LiteralInvalid)
 import compiler.syntax.expressions (simulate_closure_span)
-import compiler.check.types (Type, VariableType, FunctionType, FunctionSignature, Row, Atom,
-                             row_empty, unit_type, int_type, string_type, fn_type)
+import compiler.check.types (Type, VariableType, FunctionType, FunctionSignature, Effects, Effect,
+                             no_effects, unit_type, int_type, string_type, fn_type)
 import compiler.check.typed (TypedExpression, pattern_binders, TypedLiteral, TypedRead, TypedUnary,
                              TypedBinary, TypedCall, TypedIf, TypedMatch, TypedBlock, TypedList,
                              TypedRecord, TypedUpdate, TypedFieldRead, TypedPerform, TypedLambda,
@@ -32,21 +32,21 @@ derive children for Code
 pub type Node =
   | CodeLiteral(SourceLiteral)
   | CodeVar({ name: Bytes, slot: Int })
-  | NDefinition({ full: Bytes, args: List<Type>, rows: List<Row>, labels: List<FilledLabel> })
+  | NDefinition({ full: Bytes, args: List<Type>, effect_arguments: List<Effects>, labels: List<FilledLabel> })
   | NConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<Type> })
-  | NBuiltin({ name: Bytes, args: List<Type>, rows: List<Row> })
+  | NBuiltin({ name: Bytes, args: List<Type>, effect_arguments: List<Effects> })
   | CodeUnary({ op: Bytes, operand: Code })
   | CodeBinary({ op: Bytes, lhs: Code, rhs: Code })
-  | CodeApply({ function: Code, args: List<Code>, row: Row })
+  | CodeApply({ function: Code, args: List<Code>, effects: Effects })
   | CodeIf({ cond: Code, then_branch: Code, else_branch: Code })
   | CodeBlock({ statements: List<CodeStatement>, tail: Option<Code> })
   | CodeList({ items: List<Code> })
   | CodeRecord({ fields: List<CodeField> })
   | CodeMatch({ scrutinee: Code, arms: List<CodeArm> })
-  | CodePerform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Code>, atom: Atom, args: List<Code> })
+  | CodePerform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Code>, entry: Effect, args: List<Code> })
   | CodeLabel(Bytes)
   | CodeLambda(Lambda)
-  | CodeSimulate({ size: Int, captures: List<Capture>, body: Code, at: Span, row: Row })
+  | CodeSimulate({ size: Int, captures: List<Capture>, body: Code, at: Span, effects: Effects })
   | CodeParallel({ branches: List<Code> })
   | CodeHandle(CodeHandler)
   | CodeFieldRead({ base: Code, field: Bytes })
@@ -69,7 +69,7 @@ pub type Lambda = {
   body: Code,
   at: Span,
   ty: FunctionSignature,
-  row: Row,
+  effects: Effects,
 }
 
 pub type CodeField = { name: Bytes, value: Code }
@@ -89,7 +89,12 @@ pub type CodeArm = { pattern: CodePattern, guard: Option<Code>, body: Code }
 
 pub type Capture = { src: Int, destination: Int }
 
-pub type CodeHandler = { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn>, row: Row }
+pub type CodeHandler = {
+  body: Code,
+  clauses: List<CodeClause>,
+  ret: Option<CodeReturn>,
+  effects: Effects,
+}
 
 pub type CodeClause = {
   effect: Bytes,
@@ -104,8 +109,8 @@ pub type CodeClause = {
   body: Code,
   at: Span,
   ty: FunctionSignature,
-  row: Row,
-  resumed: Row,
+  effects: Effects,
+  resumed: Effects,
 }
 
 pub type CodeReturn = {
@@ -114,7 +119,7 @@ pub type CodeReturn = {
   body: Code,
   at: Span,
   ty: FunctionSignature,
-  row: Row,
+  effects: Effects,
 }
 
 pub type CodeStatement =
@@ -458,7 +463,7 @@ fn push_frame(stack: Stack, frame: Frame) -> Stack = { ..stack, frames: stack.fr
 fn pop_frame(stack: Stack) -> Stack =
   { ..stack, frames: range(0, stack.frames.len() - 1).map(|j: Int| frame_at(stack, j)) }
 
-fn failing(stack: Stack, why: Bytes) -> Stack = { ..stack, failed: stack.failed.push(why) }
+fn failing(stack: Stack, reason: Bytes) -> Stack = { ..stack, failed: stack.failed.push(reason) }
 
 fn binding_depth(stack: Stack, name: Bytes) -> Option<Int> =
   range(0, stack.frames.len()).fold(None, |acc: Option<Int>, i: Int| {
@@ -633,7 +638,15 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
       ReadLocal(name) -> read_local(stack, name, e.ty, e.span),
       ReadDefinition(d) ->
         {
-          code: at(e, NDefinition({ full: d.full, args: d.args, rows: d.rows, labels: d.labels })),
+          code: at(
+            e,
+            NDefinition({
+              full: d.full,
+              args: d.args,
+              effect_arguments: d.effect_arguments,
+              labels: d.labels,
+            }),
+          ),
           stack: stack,
         },
       ReadConstructor(c) ->
@@ -642,7 +655,13 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
           stack: stack,
         },
       ReadBuiltin(b) ->
-        { code: at(e, NBuiltin({ name: b.name, args: b.args, rows: b.rows })), stack: stack },
+        {
+          code: at(
+            e,
+            NBuiltin({ name: b.name, args: b.args, effect_arguments: b.effect_arguments }),
+          ),
+          stack: stack,
+        },
     },
     TypedUnary(u) -> {
       let o = lower_in(u.operand, stack);
@@ -723,7 +742,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
           CodeApply({
             function: fu.code,
             args: with_labels(ws.codes.concat(r.codes), ls.codes),
-            row: c.row,
+            effects: c.effects,
           }),
         ),
         stack: ls.stack,
@@ -746,7 +765,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
             op: p.op,
             resource: name,
             label: match lb { Some(o) -> Some(o.code), None -> None },
-            atom: p.atom,
+            entry: p.entry,
             args: r.codes,
           }),
         ),
@@ -754,7 +773,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
       }
     },
     TypedLambda(l) ->
-      snapshotted(e, stack, |st: Stack| lower_lambda(l.params, l.body, l.row, st, e.span)),
+      snapshotted(e, stack, |st: Stack| lower_lambda(l.params, l.body, l.effects, st, e.span)),
     TypedSimulate(t) ->
       snapshotted(e, stack, |st: Stack| {
         let b = lower_in(t.body, push_frame(st, empty_frame()));
@@ -767,7 +786,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
               captures: inner.captures,
               body: b.code,
               at: simulate_closure_span(e.span),
-              row: t.row,
+              effects: t.effects,
             }),
           ),
           stack: pop_frame(b.stack),
@@ -779,7 +798,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
           let o = lower_lambda(
             [],
             t.body,
-            t.row,
+            t.effects,
             sq.stack,
             synthetic_span(t.body.span, role_branch()),
           );
@@ -788,7 +807,8 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
         { code: at(e, CodeParallel({ branches: r.codes })), stack: r.stack }
       }),
     TypedHandle(h) ->
-      snapshotted(e, stack, |st: Stack| handled(e, h.body, h.clauses, h.ret, h.vars, h.row, st)),
+      snapshotted(e, stack, |st: Stack|
+        handled(e, h.body, h.clauses, h.ret, h.vars, h.effects, st)),
     TypedBlock(b) ->
       lower_from(b.statements, 0, { statements: [], stack: stack }, depth_of(stack), b.tail, e.ty),
   }
@@ -1053,7 +1073,7 @@ fn projected_var(e: TypedExpression<Type>, stack: Stack, inner: List<Bytes>) -> 
 fn lower_lambda(
   params: List<TypedParam<Type>>,
   body: TypedExpression<Type>,
-  row: Row,
+  effects: Effects,
   stack: Stack,
   at: Span,
 ) -> Lowered / {abort.raise} = {
@@ -1070,7 +1090,7 @@ fn lower_lambda(
         body: b.code,
         at: at,
         ty: value,
-        row: row,
+        effects: effects,
       }),
       span: dummy_span(),
       ty: FunctionType(value),
@@ -1085,7 +1105,7 @@ fn closure_type(params: List<TypedParam<Type>>, ret: Type) -> FunctionSignature 
     kept: [],
     once: false,
     ret: ret,
-    effects: row_empty(),
+    effects: no_effects(),
   }
 
 fn params_noted(stack: Stack, params: List<TypedParam<Type>>, depth: Int, from: Int) -> Stack =
@@ -1104,7 +1124,7 @@ fn handled(
   clauses: List<TypedClause<Type>>,
   ret: Option<TypedReturn<Type>>,
   vars: List<TypedHandlerVar<Type>>,
-  row: Row,
+  effects: Effects,
   stack: Stack,
 ) -> Lowered / {abort.raise} = {
   let depth = depth_of(stack);
@@ -1190,14 +1210,14 @@ fn handled(
             }),
             c.body.ty,
           ),
-          row: c.row,
+          effects: c.effects,
           resumed: c.resumed,
         }),
         stack: { ..pop_frame(cb.stack), held: outer_held },
       }
     },
   );
-  let answered = match ret {
+  let returned = match ret {
     None -> { ret: None, stack: cls.stack },
     Some(r) -> {
       let entered = params_noted(
@@ -1215,7 +1235,7 @@ fn handled(
           body: rb.code,
           at: r.span,
           ty: closure_type([r.binder], r.body.ty),
-          row: r.row,
+          effects: r.effects,
         }),
         stack: { ..pop_frame(rb.stack), held: outer_held },
       }
@@ -1223,12 +1243,12 @@ fn handled(
   };
   let installed_handle = at(
     e,
-    CodeHandle({ body: started, clauses: cls.clauses, ret: answered.ret, row: row }),
+    CodeHandle({ body: started, clauses: cls.clauses, ret: returned.ret, effects: effects }),
   );
   {
     code: if made.statements.len() == 0 { installed_handle }
     else { at(e, CodeBlock({ statements: made.statements, tail: Some(installed_handle) })) },
-    stack: answered.stack,
+    stack: returned.stack,
   }
 }
 
@@ -1317,12 +1337,12 @@ fn hidden_call(name: Bytes, args: List<Code>, ty: Type) -> Code =
   {
     node: CodeApply({
       function: {
-        node: NBuiltin({ name: name, args: [], rows: [] }),
+        node: NBuiltin({ name: name, args: [], effect_arguments: [] }),
         span: dummy_span(),
-        ty: fn_type(args.map(|a: Code| a.ty), ty, row_empty()),
+        ty: fn_type(args.map(|a: Code| a.ty), ty, no_effects()),
       },
       args: args,
-      row: row_empty(),
+      effects: no_effects(),
     }),
     span: dummy_span(),
     ty: ty,

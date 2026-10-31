@@ -119,7 +119,7 @@ pub type Error =
   /// Another store has the directory's lock.
   | Locked
   /// The lock no longer belongs to this store: it sat past the age at which a lock is considered
-  /// dead and another store took it, or its own region closed. Nothing was written.
+  /// dead and another store took it, or its own scope ended. Nothing was written.
   | LockLost
   /// The `Store` value is behind its log. Either another value of the same store committed or
   /// compacted after it, and that newer value can still commit, or an operation through it raised
@@ -147,10 +147,10 @@ pub type Error =
 /// What a store raises.
 pub effect key_value {
   /// The store could not do what was requested.
-  raise fail(why: Error)
+  raise fail(reason: Error)
 }
 
-fn fail<a>(why: Error) -> a / {key_value.fail} = key_value.fail(why)
+fn fail<a>(reason: Error) -> a / {key_value.fail} = key_value.fail(reason)
 
 /// One step of a batch: a value put under a key, or a key deleted.
 pub type Op = | Put(Bytes, Bytes) | Delete(Bytes)
@@ -633,7 +633,7 @@ fn write_whole<[l]>(
   let wrote: Result<Unit, (String, fs::FileError)> = try[files.fail] {
     fs::write_atomic[l](path, body, durability)
   };
-  match wrote { Ok(_) -> (), Err((at, why)) -> fail(Failed(at, why)) }
+  match wrote { Ok(_) -> (), Err((at, reason)) -> fail(Failed(at, reason)) }
 }
 
 /// Cuts the segment at `path` to its first `keep` bytes, by copying it next to itself and renaming
@@ -655,7 +655,7 @@ fn truncate<[l]>(
           else { fail(Failed(path, fs::operation_failed("write_chunk"))) },
         }))
   };
-  match wrote { Ok(_) -> (), Err((at, why)) -> fail(Failed(at, why)) }
+  match wrote { Ok(_) -> (), Err((at, reason)) -> fail(Failed(at, reason)) }
 }
 
 /// The length of the file at `path`.
@@ -880,9 +880,9 @@ pub fn open<[l]>(
     };
     match read {
       Ok(store) -> store,
-      Err(why) -> {
+      Err(reason) -> {
         fs.unlock[l](lock_path(dir));
-        fail(why)
+        fail(reason)
       },
     }
   }
@@ -1282,7 +1282,7 @@ fn rewrite_as_base<[l]>(
     })
   };
   match wrote {
-    Err((at, why)) -> fail(Failed(at, why)),
+    Err((at, reason)) -> fail(Failed(at, reason)),
     Ok(done) -> {
       let all = done.index.fold(Map::new(), |m: Map<Bytes, Bool>, key: Bytes, _: Slot|
         m.insert(key, true));
@@ -1439,7 +1439,7 @@ fn listed<a | e>(found: Seq<a | e>) -> List<a> / {abort.raise | e} = {
   match all { Ok(list) -> list, Err(_) -> panic("a sequence longer than a test reads") }
 }
 
-fn why<a>(r: Result<a, Error>) -> Option<Error> = match r { Ok(_) -> None, Err(w) -> Some(w) }
+fn reason<a>(r: Result<a, Error>) -> Option<Error> = match r { Ok(_) -> None, Err(w) -> Some(w) }
 
 /// A store's contents in the form a map gives them: its entries in key order, and how many batches
 /// it took.
@@ -1547,7 +1547,7 @@ test "a store's files follow the format its module documents" {
     b"v",
   ]);
   let log = header(0, 1, 0).concat(by_hand(64, 64, batch_body));
-  let found = match over.value { Ok(read) -> read, Err(_) -> panic("the store refused") };
+  let found = match over.value { Ok(read) -> read, Err(_) -> panic("the store rejected") };
   assert_eq(found.log, Some(log));
   let lock = match found.lock { Some(bytes) -> bytes, None -> b"" };
   assert_eq(lock.len(), 48);
@@ -1607,10 +1607,10 @@ test "a key, a value or a batch past a store's limits is rejected, and nothing i
   assert_eq(tried([Put(b"a", b"v".repeat(60)), Put(b"b", b"v".repeat(60))]), Err(Unfit(Batch)));
   assert_eq(tried([Put(b"a", b"v".repeat(47)), Put(b"b", b"v".repeat(47))]), Ok(Some(214)));
   let unwritten = session(mem_empty(), 1, small(), |s: Store| {
-    let refused: Result<Store, Error> = try[key_value.fail] {
+    let rejected: Result<Store, Error> = try[key_value.fail] {
       put[d](s, b"k", b"v".repeat(65), Fast)
     };
-    (why(refused), fs.file_size[d]("db/00000001.log"))
+    (reason(rejected), fs.file_size[d]("db/00000001.log"))
   });
   assert_eq(unwritten.value, Ok((Some(Unfit(Value)), Some(64))))
 }
@@ -1758,7 +1758,7 @@ test "a full segment has a hint that opening reads instead, and a hint for anoth
   let whole = held(state.tree);
   assert_eq(whole.value, match state.value {
     Ok(all) -> Ok((all, { entries: 6, total: 234, live: 234, segments: 3, sequence: 6 })),
-    Err(refusal) -> Err(refusal),
+    Err(rejection) -> Err(rejection),
   });
   assert_eq(held(damaged(state.tree, "db/00000001.log", 70)).value, whole.value);
   let unhinted = held(mem_remove(state.tree, hint).fs);
@@ -1904,38 +1904,47 @@ test "damage that a sync had covered is reported where it is, and what no sync c
   assert_eq(held(damaged(late, log, 100)), Err(Corrupt("00000001.log", 64)));
   assert_eq(held(damaged(late, log, 150)), Err(Corrupt("00000001.log", 115)));
   assert_eq(held(damaged(late, log, 200)), Ok([b"a", b"b"]));
-  let refused = session(damaged(late, log, 100), 2, roomy(), |s: Store| ());
-  assert_eq(mem_read(refused.tree, log), mem_read(damaged(late, log, 100), log));
-  assert_eq(fs::listed_names(mem_list(refused.tree, "db")), Some(["00000001.log"]))
+  let rejected = session(damaged(late, log, 100), 2, roomy(), |s: Store| ());
+  assert_eq(mem_read(rejected.tree, log), mem_read(damaged(late, log, 100), log));
+  assert_eq(fs::listed_names(mem_list(rejected.tree, "db")), Some(["00000001.log"]))
 }
 
 test "a directory that is not a complete store is rejected with what is wrong with it" {
   let state = six().tree;
-  let why_not = |tree: MemFs, shape: Bytes|
-    why(opened(tree, 2, small(), Manual, shape, |s: Store| ()).value);
-  assert_eq(why_not(state, raw()), None);
-  assert_eq(why_not(state, b"\x01".repeat(32)), Some(OtherShape));
-  assert_eq(why_not(damaged(state, "db/00000003.log", 0), raw()), Some(Corrupt("00000003.log", 0)));
-  assert_eq(why_not(damaged(state, "db/00000003.log", 8), raw()), Some(OtherFormat(254)));
+  let failure_of = |tree: MemFs, shape: Bytes|
+    reason(opened(tree, 2, small(), Manual, shape, |s: Store| ()).value);
+  assert_eq(failure_of(state, raw()), None);
+  assert_eq(failure_of(state, b"\x01".repeat(32)), Some(OtherShape));
   assert_eq(
-    why_not(damaged(state, "db/00000003.log", 16), raw()),
+    failure_of(damaged(state, "db/00000003.log", 0), raw()),
+    Some(Corrupt("00000003.log", 0)),
+  );
+  assert_eq(failure_of(damaged(state, "db/00000003.log", 8), raw()), Some(OtherFormat(254)));
+  assert_eq(
+    failure_of(damaged(state, "db/00000003.log", 16), raw()),
     Some(Corrupt("00000003.log", 16)),
   );
-  assert_eq(why_not(mem_remove(state, "db/00000002.log").fs, raw()), Some(Missing("00000002.log")));
-  assert_eq(why_not(mem_remove(state, "db/00000001.log").fs, raw()), Some(Missing("00000001.log")));
+  assert_eq(
+    failure_of(mem_remove(state, "db/00000002.log").fs, raw()),
+    Some(Missing("00000002.log")),
+  );
+  assert_eq(
+    failure_of(mem_remove(state, "db/00000001.log").fs, raw()),
+    Some(Missing("00000001.log")),
+  );
   let lost = mem_remove(shortened(state, "db/00000001.log", 131), "db/00000001.hint").fs;
-  assert_eq(why_not(lost, raw()), Some(Corrupt("00000002.log", 24)));
+  assert_eq(failure_of(lost, raw()), Some(Corrupt("00000002.log", 24)));
   let packed = session(state, 2, small(), |s: Store| {
     compact[d](s);
     ()
   }).tree;
-  assert_eq(why_not(packed, raw()), None);
+  assert_eq(failure_of(packed, raw()), None);
   let base = "db/00000004.log";
   let size = mem_size(packed, base).expect("the base");
   let truncate = mem_remove(shortened(packed, base, size - 36), "db/00000004.hint").fs;
-  assert_eq(why_not(truncate, raw()), Some(Corrupt("00000004.log", size - 36)));
+  assert_eq(failure_of(truncate, raw()), Some(Corrupt("00000004.log", size - 36)));
   assert_eq(
-    why_not(mem_remove(damaged(packed, base, size - 40), "db/00000004.hint").fs, raw()),
+    failure_of(mem_remove(damaged(packed, base, size - 40), "db/00000004.hint").fs, raw()),
     Some(Corrupt("00000004.log", 256)),
   )
 }
@@ -1956,7 +1965,7 @@ test "one store has a directory at a time, and a value of a store that is closed
     let again: Result<Store, Error> = try[key_value.fail] { compact[d](s2) };
     let cleared: Result<Store, Error> = try[key_value.fail] { discard[d](s2) };
     {
-      refusals: [why(second), why(behind), why(late), why(again), why(cleared)],
+      rejections: [reason(second), reason(behind), reason(late), reason(again), reason(cleared)],
       unwritten: unwritten,
       held: keys_of(scan[d](snapshot(put[d](packed, b"e", b"5", Fast)), None, None)),
     }
@@ -1964,22 +1973,22 @@ test "one store has a directory at a time, and a value of a store that is closed
   assert_eq(
     over.value,
     Ok({
-      refusals: [Some(Locked), Some(Stale), Some(Stale), Some(Stale), Some(Stale)],
+      rejections: [Some(Locked), Some(Stale), Some(Stale), Some(Stale), Some(Stale)],
       unwritten: true,
       held: [b"a", b"c", b"e"],
     }),
   );
   let is_base = session(mem_empty(), 1, roomy(), |s: Store| put[d](s, b"a", b"1", Fast));
-  let stray = match is_base.value { Ok(s) -> s, Err(_) -> panic("the store refused") };
+  let stray = match is_base.value { Ok(s) -> s, Err(_) -> panic("the store rejected") };
   let alone = on_mem[d](is_base.tree, ||
     with_rand(rand(2), || {
       let late: Result<Store, Error> = try[key_value.fail] { put[d](stray, b"b", b"2", Fast) };
-      why(late)
+      reason(late)
     }).value);
   assert_eq(alone.value, Some(LockLost));
   let beside_another = session(is_base.tree, 3, roomy(), |s: Store| {
     let late: Result<Store, Error> = try[key_value.fail] { put[d](stray, b"b", b"2", Fast) };
-    (why(late), keys_of(scan[d](snapshot(s), None, None)))
+    (reason(late), keys_of(scan[d](snapshot(s), None, None)))
   });
   assert_eq(beside_another.value, Ok((Some(LockLost), [b"a"])))
 }
@@ -1990,11 +1999,11 @@ test "a commit the file system failed, or one that finds its next segment starte
     let s1 = put[d](s0, b"a", b"1", Fast);
     fs.rename[d](log, "db/aside");
     fs.create_dir[d](log);
-    let refused: Result<Store, Error> = try[key_value.fail] { put[d](s1, b"b", b"2", Fast) };
+    let rejected: Result<Store, Error> = try[key_value.fail] { put[d](s1, b"b", b"2", Fast) };
     fs.remove[d](log);
     fs.rename[d]("db/aside", log);
     let retried: Result<Store, Error> = try[key_value.fail] { put[d](s1, b"b", b"2", Fast) };
-    (why(refused), why(retried))
+    (reason(rejected), reason(retried))
   });
   assert_eq(over.value, Ok((Some(Failed("db/00000001.log", fs::Other(0, "append"))), Some(Stale))));
   let again = session(over.tree, 2, roomy(), |s: Store| shown[d](put[d](s, b"b", b"2", Fast)));
@@ -2012,7 +2021,7 @@ test "a commit the file system failed, or one that finds its next segment starte
       put[d](segment_full, b"c", b"3", Fast)
     };
     let packed: Result<Store, Error> = try[key_value.fail] { compact[d](segment_full) };
-    (why(begun), why(packed), fs.read_file[d]("db/00000002.log"))
+    (reason(begun), reason(packed), fs.read_file[d]("db/00000002.log"))
   });
   assert_eq(planted.value, Ok((Some(Stale), Some(Stale), Some(b"another writer's"))))
 }
@@ -2026,7 +2035,7 @@ test "a frame written past another writer's fails as stale, and is not a batch t
     close[d](put[d](open[d]("db", roomy(), Manual, raw(), 1), b"theirs", b"2", Fast));
     fs.write_file[d]("db/lock", match held { Some(bytes) -> bytes, None -> b"" });
     let ours: Result<Store, Error> = try[key_value.fail] { put[d](s1, b"ours", b"3", Fast) };
-    (why(ours), fs.file_size[d](log))
+    (reason(ours), fs.file_size[d](log))
   });
   assert_eq(over.value, Ok((Some(Stale), Some(213))));
   let again = session(mem_remove(over.tree, "db/lock").fs, 2, roomy(), |s: Store|
@@ -2150,7 +2159,7 @@ fn rivalled(read_ms: Int) -> Over<Rivalry> / {abort.raise} =
             put[d](s, Bytes::of_string(i.to_string()), b"value", Fast))
         };
         match filled {
-          Err(refusal) -> { packed: Some(refusal), taken: false, idle: None },
+          Err(rejection) -> { packed: Some(rejection), taken: false, idle: None },
           Ok(segment_full) -> {
             let packed: Result<Store, Error> = try[key_value.fail] { compact[d](segment_full) };
             let taken = rival.taken();
@@ -2158,7 +2167,7 @@ fn rivalled(read_ms: Int) -> Over<Rivalry> / {abort.raise} =
             let idle: Result<Store, Error> = try[key_value.fail] {
               put[d](match packed { Ok(s) -> s, Err(_) -> segment_full }, b"late", b"l", Fast)
             };
-            { packed: why(packed), taken: taken, idle: why(idle) }
+            { packed: reason(packed), taken: taken, idle: reason(idle) }
           },
         }
       })).value)
@@ -2213,7 +2222,7 @@ test "values of a type are put and read through their codecs, and a store writte
     }),
   );
   let reopened = |shape: Bytes|
-    why(opened(over.tree, 2, small(), Manual, shape, |s: Store| ()).value);
+    reason(opened(over.tree, 2, small(), Manual, shape, |s: Store| ()).value);
   assert_eq(reopened(shape_of(lists)), None);
   assert_eq(reopened(shape_of(counts)), Some(OtherShape));
   assert_eq(reopened(raw()), Some(OtherShape));
@@ -2298,7 +2307,7 @@ test "two tasks that add to one count by compare-and-set lose no addition, where
                     if swapped.done { Stop(attempt) } else { Continue(attempt + 1) }
                   }))
               };
-              why(tried)
+              reason(tried)
             };
             let first = task.spawn(adding);
             let second = task.spawn(adding);
@@ -2331,7 +2340,7 @@ test "a reader sees all of a batch or none of it, wherever its reads fall among 
                   task.yield()
                 })
               };
-              why(wrote)
+              reason(wrote)
             });
             let reader = task.spawn(|| {
               let read: Result<Bool, Error> = try[key_value.fail] {
@@ -2493,7 +2502,7 @@ fn survived(
   )
 }
 
-law "a store that dies at any write of three steps opens to a prefix of them, with every step that answered and, after a loss of power, every durable one"
+law "a store that dies at any write of three steps opens to a prefix of them, with every step that returned and, after a loss of power, every durable one"
   forall (first: Act, second: Act, third: Act) {
     survived([first, second, third], small()).broken == None
   }
@@ -2539,7 +2548,7 @@ test "a compaction that dies at any of its writes, a renewal of its lock among t
         put[d](s, Bytes::of_string(Int::to_string(100 + i)), b"v", if i == 69 { Durable }
         else { Fast })),
     ));
-  let held = match state.value { Ok(found) -> found, Err(_) -> panic("the store refused") };
+  let held = match state.value { Ok(found) -> found, Err(_) -> panic("the store rejected") };
   assert_eq(held.pairs.len(), 70);
   let died = crashes(
     1,
@@ -2585,7 +2594,7 @@ fn after(steps: List<Step>) -> Shown / {abort.raise} = {
       steps.fold(s0, |s: Store, step: Step|
         match step { Tidy -> compact[d](s), _ -> batch[d](s, step_ops(step), Fast) }),
     ));
-  match ran.value { Ok(found) -> found, Err(_) -> panic("the store refused") }
+  match ran.value { Ok(found) -> found, Err(_) -> panic("the store rejected") }
 }
 
 fn and_then(steps: List<Step>, step: Step) -> List<Step> = steps.push(step)

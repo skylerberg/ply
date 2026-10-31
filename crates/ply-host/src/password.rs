@@ -30,7 +30,7 @@ pub const MAX_BCRYPT_COST: i64 = 16;
 
 pub const MAX_PBKDF2_ITERATIONS: i64 = 10_000_000;
 
-/// The longest hash any of these answers, in bytes.
+/// The longest hash any of these returns, in bytes.
 pub const MAX_LENGTH: i64 = 64;
 
 /// The bytes of a password bcrypt reads, its terminating zero among them.
@@ -406,14 +406,14 @@ fn narrow(n: i64) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("{n}, which no parameter of a hash reaches"))
 }
 
-/// The refusal of `what` (`kdf.argon2`, ..) asked for `why`, which ends the run where it was asked.
+/// The rejection of `what` (`kdf.argon2`, ..) for `reason`, which ends the run where it was asked.
 #[cold]
-pub fn refused(what: &str, why: &str, span: Span) -> Diagnostic {
+pub fn rejected(what: &str, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{what} was asked for {why}"),
+        format!("{what} was asked for {reason}"),
     )
     .primary(span, "performed here")
     .note("the host bounds what one hash may cost before it starts one")
-    .note("`std.password` holds the parameters of a stored hash to the same bounds and answers a refusal, so only a perform of the operation itself reaches this")
+    .note("`std.password` holds the parameters of a stored hash to the same bounds and returns an error, so only a perform of the operation itself reaches this")
 }

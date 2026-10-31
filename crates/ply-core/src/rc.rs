@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct RcStats {
-    /// Updates that answer a compound argument with one element changed.
+    /// Updates that return a compound argument with one element changed.
     pub updates: u64,
     pub updates_in_place: u64,
     /// Slots copied by the updates that did not rewrite in place.

@@ -14,8 +14,8 @@ import std.string
 import std.time (time)
 import std.list
 
-/// The status line and headers both programs answer with, as Ply source. The `HEAD` token in the
-/// sources below is replaced with it, so an edit cannot leave the two answers disagreeing.
+/// The status line and headers both programs respond with, as Ply source. The `HEAD` token in the
+/// sources below is replaced with it, so an edit cannot leave the two responses disagreeing.
 fn response_head() -> String =
   \\b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: "
 
@@ -24,8 +24,8 @@ fn server_source() -> String =
   \\import std.net (net)
   \\import std.signal (signal)
   \\
-  \\// What a readiness probe reads. Its row says exactly what it consults, and a
-  \\// route whose row is empty is a route that checks nothing.
+  \\// What a readiness probe reads. Its effects say exactly what it consults, and a
+  \\// route with no effects is a route that checks nothing.
   \\pub fn body() -> Bytes / {signal.read} =
   \\  if signal.stopping() { b"draining" } else { b"ok" }
   \\
@@ -59,7 +59,7 @@ fn server_source() -> String =
 
 fn port_attempts() -> Int = 3
 
-/// A token this test's server echoes in its answer, so a probe cannot read another run's server
+/// A token this test's server echoes in its response, so a probe cannot read another run's server
 /// on the same port as this one.
 fn nonce(port: Int) -> String / {time.elapsed_us} =
   port.to_string() ++ "-" ++ time.elapsed_us().to_string()
@@ -87,12 +87,12 @@ fn start_with(
 fn attempt(
   source: String,
   flags: List<String>,
-  refused: List<String>,
+  rejected: List<String>,
 ) -> Server / {Network, PlyProcess, WorkingDirectory, Clock, abort.raise, diverges} =
-  if refused.len() == port_attempts() {
+  if rejected.len() == port_attempts() {
     panic(
-      "`ply run` never answered a probe, on " ++ port_attempts().to_string() ++ " ports:\n\n"
-        ++ String::join(refused, "\n\n"),
+      "`ply run` never responded to a probe, on " ++ port_attempts().to_string() ++ " ports:\n\n"
+        ++ String::join(rejected, "\n\n"),
     )
   } else {
     let port = reserve_port();
@@ -103,7 +103,7 @@ fn attempt(
     );
     write_project([{ path: "main.ply", text: text }]);
     let server = start_server(["run"].concat(flags), [], port);
-    // The probe is a whole request and response, and the answer has to carry this test's token.
+    // The probe is a whole request and response, and the response has to carry this test's token.
     let probed = connected(server, |c: Int| {
       send(c, the_request());
       String::of_bytes_lossy(net::drain[client](c, b"", 20000)).contains(token)
@@ -113,9 +113,9 @@ fn attempt(
         hang_up(c);
         server
       },
-      Err(why) -> {
+      Err(reason) -> {
         stop(server);
-        attempt(source, flags, refused.push(why))
+        attempt(source, flags, rejected.push(reason))
       },
     }
   }
@@ -168,8 +168,8 @@ fn finish(server: Server) -> RunOutput / {PlyProcess, abort.raise} = {
   { code: match f.ended { Exited(c) -> c, Signalled(_) -> -1 }, out: stdout(r), err: stderr(r) }
 }
 
-// Two runs can be handed the same port, and the one that loses the bind answers the winner's probe
-// with what looks like readiness. The token in the answer is what tells them apart, so this holds
+// Two runs can be handed the same port, and the loser of the bind responds to the winner's probe
+// with what looks like readiness. The token in the response is what tells them apart, so this holds
 // `ready` to it rather than to the status line.
 test/nondet "a 200 OK from another server is not readiness" {
   let decoy = net.listen[decoy](0);
@@ -181,14 +181,14 @@ test/nondet "a 200 OK from another server is not readiness" {
   let _ = net::send_all[decoy](c, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok", 5000);
   net.close[decoy](c);
   net.close[decoy](decoy);
-  let answer = read_until_closed(probe, 5000);
+  let result = read_until_closed(probe, 5000);
   assert(
-    answer.contains("200 OK"),
-    Some("the decoy did not answer the probe, so this test proves nothing: " ++ answer),
+    result.contains("200 OK"),
+    Some("the decoy did not respond to the probe, so this test proves nothing: " ++ result),
   );
   assert(
-    !answer.contains("the-token-this-test-asked-for"),
-    Some("a server that is not this test's read as ready:\n\n" ++ answer),
+    !result.contains("the-token-this-test-asked-for"),
+    Some("a server that is not this test's read as ready:\n\n" ++ result),
   )
 }
 
@@ -200,15 +200,15 @@ test/nondet "a request in flight at the signal gets its response and the run exi
   time.sleep_ms(200);
   signal_to(server, Terminate);
   time.sleep_ms(200);
-  let answer = request(held);
+  let result = request(held);
   assert(
-    answer.contains("200 OK"),
-    Some("the in-flight request was dropped by the drain: " ++ answer),
+    result.contains("200 OK"),
+    Some("the in-flight request was dropped by the drain: " ++ result),
   );
   assert(
-    answer.ends_with("draining"),
+    result.ends_with("draining"),
     Some(
-      "the route read the stop flag and answered `" ++ answer
+      "the route read the stop flag and responded `" ++ result
         ++ "`, so `signal.stopping()` did not reach the handler",
     ),
   );
@@ -236,16 +236,16 @@ test/nondet "a connection opened after the stop gets no response" {
   let server = start(["--drain-ms", "30000"]);
   assert(request(connect(server)).contains("200 OK"), None);
   signal_to(server, Terminate);
-  // The stop dials the parked `accept` awake and it answers `0`, so this connection is refused or
+  // The stop dials the parked `accept` awake and it returns `0`, so this connection is refused or
   // accepted and closed.
   time.sleep_ms(400);
   match dial(server.port, 500) {
     Some(late) -> {
       let _ = net::send_all[client](late, the_request(), 3000);
-      let answer = read_until_closed(late, 3000);
+      let result = read_until_closed(late, 3000);
       assert(
-        answer == "",
-        Some("a connection opened after the run stopped accepting was answered " ++ answer),
+        result == "",
+        Some("a connection opened after the run stopped accepting got a response " ++ result),
       )
     },
     None -> (),
@@ -262,12 +262,12 @@ test/nondet "a drain that expires reports W0608 and exits three" {
   // drain.
   time.sleep_ms(200);
   signal_to(server, Terminate);
-  let answer = read_until_closed(held, 30000);
+  let result = read_until_closed(held, 30000);
   assert(
-    answer == "",
+    result == "",
     Some(
       "Ply has no cancellation, so a request live at the deadline gets nothing rather than a partial response; this client read "
-        ++ answer,
+        ++ result,
     ),
   );
   let done = finish(server);
@@ -293,10 +293,10 @@ test/nondet "the drain fixture abandons a request still reading its body" {
   send(f.held, b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n");
   time.sleep_ms(200);
   signal_to(f.server, Terminate);
-  let answer = read_until_closed(f.held, 30000);
+  let result = read_until_closed(f.held, 30000);
   assert(
-    answer == "",
-    Some("a request live at the deadline is closed with no response; this client read " ++ answer),
+    result == "",
+    Some("a request live at the deadline is closed with no response; this client read " ++ result),
   );
   let done = finish(f.server);
   let report = match json::parse_string(done.out) {
@@ -361,10 +361,10 @@ test/nondet "during the lead the run still accepts and already says it is stoppi
   signal_to(server, Terminate);
   time.sleep_ms(300);
   // Inside the lead a new connection is still accepted, and the route reads the flag and sheds.
-  let answer = request(connect(server));
+  let result = request(connect(server));
   assert(
-    answer.contains("200 OK") && answer.ends_with("draining"),
-    Some("the lead phase stopped accepting, or the flag had not reached the program: " ++ answer),
+    result.contains("200 OK") && result.ends_with("draining"),
+    Some("the lead phase stopped accepting, or the flag had not reached the program: " ++ result),
   );
   let done = finish(server);
   assert(done.code == 0, Some(output(done)));
@@ -435,8 +435,8 @@ test/nondet "a spawned task still serving at the signal finishes and the run exi
   time.sleep_ms(200);
   signal_to(server, Terminate);
   time.sleep_ms(300);
-  let answer = request(held);
-  assert(answer.contains("200 OK"), Some("a task in flight at the signal was dropped: " ++ answer));
+  let result = request(held);
+  assert(result.contains("200 OK"), Some("a task in flight at the signal was dropped: " ++ result));
   let done = finish(server);
   assert(done.code == 0, Some("a clean drain exits 0\n\n" ++ output(done)));
   assert(!output(done).contains("W0608"), Some(output(done)))
@@ -449,10 +449,10 @@ test/nondet "a task blocked on a host handler does not outlast the drain" {
   time.sleep_ms(200);
   let signalled = time.elapsed_ms();
   signal_to(server, Terminate);
-  let answer = read_until_closed(held, 30000);
+  let result = read_until_closed(held, 30000);
   assert(
-    answer == "",
-    Some("Ply has no cancellation, so the blocked task is not handed a 503: " ++ answer),
+    result == "",
+    Some("Ply has no cancellation, so the blocked task is not handed a 503: " ++ result),
   );
   let done = finish(server);
   let waited = time.elapsed_ms() - signalled;

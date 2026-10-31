@@ -44,7 +44,7 @@ struct Output {
     held: Vec<u8>,
     /// Standard output's reader has gone away, and it takes nothing more.
     gone: bool,
-    /// Bytes a write had answered for went nowhere, and no answer since has said so.
+    /// Bytes a write had returned success for went nowhere, and no result since has said so.
     untold: bool,
 }
 
@@ -63,7 +63,7 @@ impl Output {
         wrote
     }
 
-    /// What an operation that answers for the stream is refused with, which tells its caller.
+    /// What an operation that reports on the stream fails with, which tells its caller.
     fn told(&mut self, wrote: Result<()>) -> Result<()> {
         if wrote.is_err() {
             self.untold = false;
@@ -95,8 +95,8 @@ pub fn flush_out() -> Result<()> {
 }
 
 /// Writes what standard output's buffer holds ahead of something that must come after it. Nobody
-/// is answered here, so bytes that go nowhere are owed a telling: [`settle`] ends the process
-/// over them unless a later answer told the program first.
+/// gets a response here, so bytes that go nowhere are owed a telling: [`settle`] ends the process
+/// over them unless a later result told the program first.
 pub fn make_way() {
     let mut out = lock(&HELD_OUT);
     if !out.gone && !out.held.is_empty() && out.written().is_err_and(|e| reader_gone(&e)) {
@@ -173,7 +173,7 @@ impl Input {
 }
 
 /// What comes next on standard input, at most `max` bytes: what a line read left unread first,
-/// else one read of the stream, so a short answer is not the end and an empty one is. Standard
+/// else one read of the stream, so a short result is not the end and an empty one is. Standard
 /// output's buffer is written first, so a prompt is seen before its answer is waited for.
 pub fn read(max: usize) -> Result<Vec<u8>> {
     read_within(max, None).map(Option::unwrap_or_default)
@@ -314,7 +314,7 @@ struct Terminal {
     mode: Mode,
 }
 
-/// Puts standard input's terminal in `mode` and answers the mode it was in; `None`, and nothing
+/// Puts standard input's terminal in `mode` and returns the mode it was in; `None`, and nothing
 /// changes, when standard input is not a terminal.
 pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
     let mut terminal = lock(&TERMINAL);
@@ -352,8 +352,8 @@ pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
 }
 
 /// Leaves the process's streams as a program that ended should: what standard output's buffer
-/// holds written, and the terminal as it was found. Answers whether bytes the program was
-/// answered for went nowhere without its being told, which is how a closed pipe ends a program.
+/// holds written, and the terminal as it was found. Returns whether bytes the program was
+/// given success for went nowhere without it being told, which is how a closed pipe ends a program.
 pub fn settle() -> bool {
     make_way();
     let untold = std::mem::take(&mut lock(&HELD_OUT).untold);

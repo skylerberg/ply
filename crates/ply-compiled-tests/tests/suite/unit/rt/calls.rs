@@ -1,6 +1,6 @@
 //! Reads of a pure nullary definition, as emitted code writes one: the first evaluates the
 //! definition and keeps its value for good through the type's keep root, and each later read
-//! answers that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
+//! returns that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
 //! roots here are written as emitted code writes them, over blocks laid out as it lays one.
 
 use crate::bare::{context_of, helper};
@@ -71,7 +71,7 @@ unsafe extern "C" fn forty_two(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn the_first_read_evaluates_and_keeps_and_each_later_one_answers_the_copy() {
+fn the_first_read_evaluates_and_caches_and_each_later_one_returns_the_copy() {
     let mut ctx = defining(forty_two);
     let c: *mut Ctx = &mut ctx;
     let first = read(c, keep_box);
@@ -85,7 +85,7 @@ fn the_first_read_evaluates_and_keeps_and_each_later_one_answers_the_copy() {
     assert_eq!(FORTY_TWOS.load(Ordering::SeqCst), 1, "evaluated once");
     assert_ne!(second, first);
     assert_eq!((held(second), count(second)), (42, IMMORTAL));
-    assert_eq!(third, second, "every later read answers the one copy kept");
+    assert_eq!(third, second, "every later read returns the one copy kept");
     let_go(c, first);
     assert_eq!(
         ctx.heap.live(),
@@ -103,7 +103,7 @@ unsafe extern "C" fn seven(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_value_its_keep_root_refuses_is_kept_nowhere_and_each_read_evaluates_it() {
+fn a_value_its_keep_root_rejects_is_cached_nowhere_and_each_read_evaluates_it() {
     let mut ctx = defining(seven);
     let c: *mut Ctx = &mut ctx;
     let first = read(c, keeps_nothing);
@@ -119,7 +119,7 @@ fn a_value_its_keep_root_refuses_is_kept_nowhere_and_each_read_evaluates_it() {
 
 static NINES: AtomicUsize = AtomicUsize::new(0);
 
-/// Fails the first time it is evaluated, and answers a box of 9 after.
+/// Fails the first time it is evaluated, and returns a box of 9 after.
 unsafe extern "C" fn nine_after_a_failure(ctx: *mut Ctx, _args: *const Word) -> Word {
     if NINES.fetch_add(1, Ordering::SeqCst) == 0 {
         unsafe { (*ctx).failed = 1 };
@@ -129,7 +129,7 @@ unsafe extern "C" fn nine_after_a_failure(ctx: *mut Ctx, _args: *const Word) -> 
 }
 
 #[test]
-fn an_evaluation_that_fails_answers_0_keeps_nothing_and_the_next_read_evaluates_again() {
+fn an_evaluation_that_fails_returns_0_caches_nothing_and_the_next_read_evaluates_again() {
     let mut ctx = defining(nine_after_a_failure);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(read(c, keep_box), 0);
@@ -171,7 +171,7 @@ unsafe extern "C" fn eleven(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept() {
+fn contexts_reading_one_definition_at_once_each_return_it_and_one_copy_is_cached() {
     let mut ctx = defining(eleven);
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let readers: Vec<_> = (0..4)
@@ -184,23 +184,23 @@ fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept()
                 let c: *mut Ctx = &mut mine;
                 barrier.wait();
                 let w = read(c, keep_box);
-                let answered = held(w);
+                let returned = held(w);
                 let_go(c, w);
                 assert_eq!(mine.heap.live(), 0);
                 mine.end();
-                answered
+                returned
             })
         })
         .collect();
     for reader in readers {
-        assert_eq!(reader.join().expect("a reader answers"), 11);
+        assert_eq!(reader.join().expect("a reader returns"), 11);
     }
     let kept = ctx.tables.memoized(0).expect("a copy was kept");
     let c: *mut Ctx = &mut ctx;
     assert_eq!(
         read(c, keep_box),
         kept,
-        "a later read answers the copy kept first"
+        "a later read returns the copy kept first"
     );
     ctx.end();
 }
@@ -249,7 +249,7 @@ unsafe extern "C" fn ten(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_constant_is_evaluated_once_and_every_later_read_answers_the_copy() {
+fn a_constant_is_evaluated_once_and_every_later_read_returns_the_copy() {
     let mut ctx = defining(ten);
     let c: *mut Ctx = &mut ctx;
     let first = read_const(c);
@@ -263,17 +263,17 @@ fn a_constant_is_evaluated_once_and_every_later_read_answers_the_copy() {
     ctx.end();
 }
 
-/// `Bytes::at` refused, left pending as a raise of `abort.raise`.
-unsafe extern "C" fn refusing(ctx: *mut Ctx, _args: *const Word) -> Word {
-    let refused: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
+/// `Bytes::at`'s rejection, left pending as a raise of `abort.raise`.
+unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
+    let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
         helper(&builtin_helper_name("?refused"));
-    unsafe { refused(ctx, 8, 5, 2, 0) };
+    unsafe { rejected(ctx, 8, 5, 2, 0) };
     0
 }
 
 #[test]
 fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
-    let mut ctx = defining(refusing);
+    let mut ctx = defining(failing);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(read_const(c), 0);
     assert_eq!(ctx.failed, FAILED, "a plain failure, no raise pending");

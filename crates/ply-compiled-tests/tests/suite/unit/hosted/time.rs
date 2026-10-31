@@ -29,7 +29,7 @@ fn a_wait_parks_the_asking_thread() {
 }
 
 /// `clock` reads the run's monotonic clock, the one `std.time` reads, and outside a task of the
-/// run's region its sleep waits the thread, a span at or below zero not at all.
+/// run's scheduler its sleep waits the thread, a span at or below zero not at all.
 #[test]
 fn the_language_clock_reads_the_run_and_its_sleep_waits_the_thread_outside_a_task() {
     let mut ctx = context();

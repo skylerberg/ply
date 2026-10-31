@@ -453,13 +453,13 @@ pub type Error =
 /// The error this module raises.
 pub effect smtp {
   /// The session cannot continue, or the message is not sent.
-  raise fail(why: Error)
+  raise fail(reason: Error)
 }
 
 /// Whether the session an error came from can still send: `true` for a message rejected before
 /// any of it was sent, `false` once the exchange itself failed.
-pub fn usable(why: Error) -> Bool =
-  match why {
+pub fn usable(reason: Error) -> Bool =
+  match reason {
     NoRecipients -> true,
     TooLarge(_, _) -> true,
     MissingExtension(_) -> true,
@@ -924,7 +924,7 @@ pub type Link = new {
   nonce: String,
 }
 
-/// Which command an expected reply answers.
+/// Which command an expected reply responds to.
 type Expect =
   | ForGreeting
   | ForEhlo
@@ -971,7 +971,7 @@ type Command = { words: String, expect: Expect }
 /// How the server has replied to `DATA` and to the message after it.
 type DataState = | Unasked | Go | Stopped(Reply) | Ended(Reply)
 
-/// The reply that ended a transaction early, and the command it answered.
+/// The reply that ended a transaction early, and the command it responded to.
 type EarlyEnd = { stage: Stage, by: Reply }
 
 /// A message on its way: the commands not yet sent, the bytes that follow `DATA`, and the
@@ -981,7 +981,7 @@ type Transaction = {
   payload: Bytes,
   recipients: List<Address>,
   mail: Option<Reply>,
-  refused: List<Delivery>,
+  rejected: List<Delivery>,
   taken: List<Address>,
   data: DataState,
   cut: Option<EarlyEnd>,
@@ -1058,12 +1058,12 @@ pub type Next =
 
 /// One step of an engine: its new state, what to write to the server first, what to do after
 /// that, the lines of the exchange this step read and wrote, and how many whole replies it read.
-pub type Turn = { engine: Engine, out: Wire, next: Next, said: List<Line>, answered: Int }
+pub type Turn = { engine: Engine, out: Wire, next: Next, said: List<Line>, returned: Int }
 
 fn state(e: Engine) -> State = match e { Engine(s) -> s }
 
 fn turn(s: State, out: Wire, next: Next, reply_of: List<Line>, replies_read: Int) -> Turn =
-  { engine: Engine(s), out: out, next: next, said: reply_of, answered: replies_read }
+  { engine: Engine(s), out: out, next: next, said: reply_of, returned: replies_read }
 
 /// An engine for a newly made connection, waiting for the server's greeting.
 pub fn start(c: Config, link: Link) -> Turn =
@@ -1221,7 +1221,7 @@ fn handle_auth_reply(s: State, r: Reply) -> State / {smtp.fail, abort.raise} =
           match base64_decode(if reply_of == "=" { "" } else { reply_of }) {
             None -> smtp.fail(BadAuth(sasl::BadChallenge)),
             Some(challenge) -> match try[sasl.fail] { sasl::respond(p.exchange, challenge) } {
-              Err(why) -> smtp.fail(BadAuth(why)),
+              Err(reason) -> smtp.fail(BadAuth(reason)),
               Ok(a) ->
                 {
                   ..s,
@@ -1270,7 +1270,7 @@ fn handle_transaction_reply(
     let after = match awaited {
       ForMail -> if kind == Completed { j } else { { ..j, mail: Some(r) } },
       ForRcpt(a) -> if kind == Completed { { ..j, taken: j.taken.push(a) } }
-      else { { ..j, refused: j.refused.push({ recipient: a, outcome: failure(AtRcpt, r) }) } },
+      else { { ..j, rejected: j.rejected.push({ recipient: a, outcome: failure(AtRcpt, r) }) } },
       ForData -> { ..j, data: if kind == Intermediate { Go } else { Stopped(r) } },
       _ -> { ..j, data: Ended(r) },
     };
@@ -1360,7 +1360,7 @@ fn authenticate(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {sm
               port: s.link.port,
             })
           } {
-          Err(why) -> smtp.fail(BadAuth(why)),
+          Err(reason) -> smtp.fail(BadAuth(reason)),
           Ok(b) -> {
             let words = "AUTH " ++ sasl::mechanism_name(m);
             let inline = match b.first {
@@ -1459,7 +1459,7 @@ fn finish_transaction(
 fn recipient_outcome(j: Transaction, a: Address) -> Outcome / {abort.raise} =
   match j.mail {
     Some(r) -> failure(AtMail, r),
-    None -> match j.refused.find(|d: Delivery| d.recipient == a) {
+    None -> match j.rejected.find(|d: Delivery| d.recipient == a) {
       Some(d) -> d.outcome,
       None -> match j.data {
         Ended(r) if j.taken.contains(a) -> if class_of(r.code) == Completed { Accepted(r) }
@@ -1467,7 +1467,7 @@ fn recipient_outcome(j: Transaction, a: Address) -> Outcome / {abort.raise} =
         Stopped(r) if j.taken.contains(a) -> failure(AtData, r),
         _ -> match j.cut {
           Some(c) -> Temporary(c.stage, c.by),
-          None -> panic("a recipient the server never answered for"),
+          None -> panic("a recipient the server never responded for"),
         },
       },
     },
@@ -1523,7 +1523,7 @@ pub fn mail(
     Some(c) -> if s.over { smtp.fail(Closed(Mail)) }
     else if !ready(s) { smtp.fail(NotReady) } else {
       match send_error(c, envelope, data, dsn_request, shape) {
-        Some(why) -> smtp.fail(why),
+        Some(reason) -> smtp.fail(reason),
         None -> {
           let steps = commands_of(c, envelope, dsn_request, shape, s.sent > 0);
           let now = if c.pipelining { steps } else { steps.take(1) };
@@ -1535,7 +1535,7 @@ pub fn mail(
                 payload: payload_of(data),
                 recipients: envelope.recipients,
                 mail: None,
-                refused: [],
+                rejected: [],
                 taken: [],
                 data: Unasked,
                 cut: None,
@@ -1576,7 +1576,7 @@ fn send_error(
 ) -> Option<Error> / {abort.raise} =
   if envelope.recipients.len() == 0 { Some(NoRecipients) } else {
     match message_error(data) {
-      Some(why) -> Some(why),
+      Some(reason) -> Some(reason),
       None -> if shape.eight_bit && !c.eight_bit { Some(MissingExtension(EightBitMime)) }
       else if shape.utf8 && !c.utf8 { Some(MissingExtension(SmtpUtf8)) }
       else if requests_reports(dsn_request) && !c.dsn { Some(MissingExtension(Notices)) }
@@ -1692,7 +1692,7 @@ fn upgrade<[l]>(
       Ok(_) -> None,
       Err(net::Injected) -> Some(Injected),
       Err(net::TimedOut) -> Some(TimedOut(Handshake)),
-      Err(why) -> Some(HandshakeFailed(why)),
+      Err(reason) -> Some(HandshakeFailed(reason)),
     },
   }
 
@@ -1720,13 +1720,13 @@ fn drive<[l] | e>(
       Over -> { engine: t.engine, said: all_said },
       Secure -> if left <= 0 { smtp.fail(TimedOut(Handshake)) } else {
         match secure(h, unread(t.engine)) {
-          Some(why) -> smtp.fail(why),
+          Some(reason) -> smtp.fail(reason),
           None -> drive[l](h, tls_started(t.engine), all_said, None, secure, left - 1),
         }
       },
       Await(p) -> {
         let until = match end {
-          Some(kept) if !wrote && t.answered == 0 -> kept,
+          Some(kept) if !wrote && t.returned == 0 -> kept,
           _ -> deadline_after(timeout(waits, p)),
         };
         match read_by[l](h, min(read_size(), read_limit(t.engine)), until) {
@@ -1762,9 +1762,9 @@ fn established<[l] | e>(
 ) -> Session / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.fail, abort.raise | e} =
   match try[smtp.fail] { drive[l](h, start(c, link), [], None, secure, 16 * max_reads()) } {
     Ok(d) -> { handle: h, engine: d.engine, kept: trim_transcript(c.limits, [], d.said) },
-    Err(why) -> {
+    Err(reason) -> {
       net.close[l](h);
-      smtp.fail(why)
+      smtp.fail(reason)
     },
   }
 
@@ -1796,9 +1796,9 @@ pub fn open_tls<[l]>(
 ) -> Session / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise} = {
   let h = connected[l](host, port, c);
   match upgrade[l](h, host, b"", c.timeouts.connect_ms) {
-    Some(why) -> {
+    Some(reason) -> {
       net.close[l](h);
-      smtp.fail(why)
+      smtp.fail(reason)
     },
     None ->
       established[l](
@@ -1873,7 +1873,7 @@ pub fn send<[l]>(
 ) -> SendResult / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise} =
   match try[email.unwritable] { email::write_fresh(d, email::repertoire_for(d)) } {
     Ok(data) -> submit[l](s, email::envelope(d), data, dsn_request),
-    Err(why) -> smtp.fail(Unwritable(why)),
+    Err(reason) -> smtp.fail(Unwritable(reason)),
   }
 
 /// Forwards a message that was read to everyone its fields name, as `std.email`'s
@@ -1893,7 +1893,7 @@ pub fn relay<[l]>(
         email::render(email::without(email::without(m, "Bcc"), "Resent-Bcc")),
         dsn_request,
       ),
-    Err(why) -> smtp.fail(Unreadable(why)),
+    Err(reason) -> smtp.fail(Unreadable(reason)),
   }
 
 /// Sends `QUIT` and waits for the server's reply, for as long as `Timeouts.quit_ms` allows. A
@@ -1932,9 +1932,9 @@ pub fn with_session_tls<a, [l] | e>(
 ) -> a / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise | e} =
   with_scope[session](open_tls[l](host, port, c), |s: Session| close[l](s)) { held -> {
     let s = held.get();
-    let answer_of = body(s);
+    let result_of = body(s);
     farewell[l](s);
-    answer_of
+    result_of
   } }
 
 /// `with_session_tls` over a connection that starts in the clear, opened as `open` opens one.
@@ -1946,9 +1946,9 @@ pub fn with_session<a, [l] | e>(
 ) -> a / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise | e} =
   with_scope[session](open[l](host, port, c), |s: Session| close[l](s)) { held -> {
     let s = held.get();
-    let answer_of = body(s);
+    let result_of = body(s);
     farewell[l](s);
-    answer_of
+    result_of
   } }
 
 /// What the server offered when the session was opened.
@@ -2072,7 +2072,7 @@ fn result_is_ok_some(r: Option<Reply>) -> Bool = r != None
 /// Whether `given` is rejected, or is a reply within `limits` that writes as bytes that read back
 /// as it; `false` if reading it fails any other way. What is written may be longer than what was
 /// read, by the U+FFFD that replaces each byte that is not text.
-fn reads_or_refuses(given: Bytes, limits: Limits) -> Bool =
+fn reads_or_rejects(given: Bytes, limits: Limits) -> Bool =
   match try[abort.raise] {
       match parse_reply(given, limits) {
         Err(_) -> true,
@@ -2089,8 +2089,8 @@ test "any bytes are a reply within the limits or are rejected, and a reply read 
     let tight: Limits = { line: 24, reply: 60, scram_iterations: 1, transcript: 0 };
     let lined = Bytes::concat_all([b"250-", data, b"\r\n250 ", data, b"\r\n"]);
     let n = lined.len() + 1;
-    reads_or_refuses(data, tight) && reads_or_refuses(lined, tight)
-      && reads_or_refuses(lined.slice(0, (cut % n + n) % n), tight)
+    reads_or_rejects(data, tight) && reads_or_rejects(lined, tight)
+      && reads_or_rejects(lined.slice(0, (cut % n + n) % n), tight)
   })
 }
 
@@ -2480,10 +2480,10 @@ fn onward(
           mail(t.engine, envelope, data, dsn_request)
         } {
         Ok(next_turn) -> Onward(Ok(next_turn), beats, rest, { ..here, delivering: true }),
-        Err(why) -> if !usable(why) { Halt(Err(why)) } else {
+        Err(reason) -> if !usable(reason) { Halt(Err(reason)) } else {
           Onward(Ok({ ..t, out: Open(b""), said: [] }), beats, rest, {
             ..here,
-            outcomes: here.outcomes.push("refused: " ++ show(why)),
+            outcomes: here.outcomes.push("rejected: " ++ show(reason)),
           })
         },
       },
@@ -2516,7 +2516,7 @@ fn replay(
   match onward(t, beats, acts, here) {
     Halt(how) -> replay_result(here, how),
     Onward(next_turn, beats_left, acts_left, now) -> match next_turn {
-      Err(why) -> replay_result(now, Err(why)),
+      Err(reason) -> replay_result(now, Err(reason)),
       Ok(turned) -> if left <= 0 { replay_result(now, Err(NotReady)) }
       else { replay(turned, beats_left, acts_left, now, left - 1) },
     },
@@ -2797,7 +2797,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Ok(["Jones@foo.com temporary RCPT 552", "Green@foo.com permanent RCPT 550"]),
     },
     {
-      what: "a pipelined DATA given leave with no recipient taken is answered with no message",
+      what: "a pipelined DATA given leave with no recipient taken is responded to with no message",
       client: setup(),
       secure: true,
       acts: [deliver(["Green"]), deliver(["Jones"])],
@@ -2826,7 +2826,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Ok(["Green@foo.com permanent RCPT 550", "Jones@foo.com permanent DATA 554"]),
     },
     {
-      what: "a message refused once it was read, for good and then for now",
+      what: "a message rejected once it was read, for good and then for now",
       client: setup(),
       secure: true,
       acts: [deliver(["Jones", "Brown"]), deliver(["Jones"])],
@@ -2887,7 +2887,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Ok(["Jones@foo.com temporary RCPT 421", "Brown@foo.com temporary RCPT 421"]),
     },
     {
-      what: "a message past the size the server takes is refused before a byte of it is sent, and the session goes on",
+      what: "a message past the size the server takes is rejected before a byte of it is sent, and the session goes on",
       client: setup(),
       secure: true,
       acts: [
@@ -2909,7 +2909,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
         \\C: .
         \\S: 250 OK
       ,
-      ended: Ok(["refused: TooLarge(38, 30)", "Jones@foo.com accepted 250"]),
+      ended: Ok(["rejected: TooLarge(38, 30)", "Jones@foo.com accepted 250"]),
     },
     {
       what: "addresses and bytes outside ASCII go only to a server that takes them, and are declared",
@@ -3020,11 +3020,11 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
         \\S: 221 Bye
       ,
       ended: Ok([
-        "refused: MissingExtension(SmtpUtf8)",
-        "refused: MissingExtension(EightBitMime)",
-        "refused: MissingExtension(Notices)",
-        "refused: NoRecipients",
-        "refused: Unsendable({at: 1, reason: BareLineFeed})",
+        "rejected: MissingExtension(SmtpUtf8)",
+        "rejected: MissingExtension(EightBitMime)",
+        "rejected: MissingExtension(Notices)",
+        "rejected: NoRecipients",
+        "rejected: Unsendable({at: 1, reason: BareLineFeed})",
       ]),
     },
     {
@@ -3093,7 +3093,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
         "Bob@Example.COM accepted 250",
         "\"john doe\"@example.org accepted 250",
         "Alice@Example.ORG accepted 250",
-        "refused: BadEnvelopeId",
+        "rejected: BadEnvelopeId",
       ]),
     },
   ]
@@ -3189,7 +3189,7 @@ fn failings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Err(NoMechanism),
     },
     {
-      what: "a server that refuses EHLO, to a client not asked to fall back",
+      what: "a server that rejects EHLO, to a client not asked to fall back",
       client: tls_as(setup(), Plain),
       secure: false,
       acts: [],
@@ -3222,7 +3222,7 @@ fn failings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Err(Unsolicited),
     },
     {
-      what: "a server that offers STARTTLS and then refuses it, where TLS is required",
+      what: "a server that offers STARTTLS and then rejects it, where TLS is required",
       client: setup(),
       secure: false,
       acts: [],
@@ -3371,7 +3371,7 @@ fn failings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Err(Denied(reply_of(535, ["5.7.8 Authentication credentials invalid"]))),
     },
     {
-      what: "RFC 7628: a token refused is explained, answered with one byte, and then refused",
+      what: "RFC 7628: a token rejected is explained, responded to with one byte, and then rejected",
       client: given(setup(), Bearer("ya29.token")),
       secure: true,
       acts: [],
@@ -3422,7 +3422,7 @@ fn failings() -> List<RecordingCase> / {email.fail, abort.raise} =
       ended: Err(BadAuth(sasl::BadChallenge)),
     },
     {
-      what: "a server that answers a command with a code no command of the kind has",
+      what: "a server that responds to a command with a code no command of the kind has",
       client: setup(),
       secure: true,
       acts: [deliver(["Jones"])],
@@ -3555,7 +3555,7 @@ fn provings() -> List<AuthCase> / {abort.raise} =
       ],
     },
     {
-      what: "OAUTHBEARER: RFC 7628's message, and its one byte to a refusal",
+      what: "OAUTHBEARER: RFC 7628's message, and its one byte to a rejection",
       client: given(setup(), Bearer("ya29.token")),
       secure: true,
       exchange:
@@ -3957,7 +3957,7 @@ test "a session's credential reaches the server whole in its line, and no plain 
       assert(v.text.contains("C: AUTH PLAIN ****"));
       assert(!v.text.contains("AHRp"))
     },
-    Err(why) -> panic("the session was refused: " ++ show(why)),
+    Err(reason) -> panic("the session was rejected: " ++ show(reason)),
   };
   let plain = String::of_bytes_lossy(net::mem_sent(ran.net, 1));
   assert_eq(plain, "EHLO client.example\r\nQUIT\r\n");
@@ -4014,9 +4014,9 @@ fn acted<[l]>(
             } {
             Ok(sent) ->
               { session: sent.session, outcomes: done.outcomes.concat(sent.deliveries.map(told)) },
-            Err(why) -> if usable(why) {
-              { ..done, outcomes: done.outcomes.push("refused: " ++ show(why)) }
-            } else { smtp.fail(why) },
+            Err(reason) -> if usable(reason) {
+              { ..done, outcomes: done.outcomes.push("rejected: " ++ show(reason)) }
+            } else { smtp.fail(reason) },
           },
         }
       },
@@ -4082,7 +4082,7 @@ test "a connection that starts in the clear is rejected when its server is not v
     net::Sends(b"250-mx.example\r\n250 STARTTLS\r\n"),
     net::Sends(b"220 2.0.0 Ready to start TLS\r\n"),
   ];
-  let untrusted = on_mx(serving(587, [offer.push(net::Refuses(net::Untrusted))]), ||
+  let untrusted = on_mx(serving(587, [offer.push(net::Rejects(net::Untrusted))]), ||
     secured(open[mail]("mx.example", 587, client()).engine));
   assert_eq(untrusted.value, Err(HandshakeFailed(net::Untrusted)));
   assert_eq(untrusted.net.closed, [1]);
@@ -4111,7 +4111,7 @@ test "a server that cannot be reached, is not the one named, or hangs up at once
   let gone = on_mx(serving(25, []), open_one);
   assert_eq(gone.value, Err(Unreachable));
   assert_eq(gone.net.closed, []);
-  let untrusted = on_mx(serving(465, [[net::Refuses(net::Untrusted)]]), open_one);
+  let untrusted = on_mx(serving(465, [[net::Rejects(net::Untrusted)]]), open_one);
   assert_eq(untrusted.value, Err(HandshakeFailed(net::Untrusted)));
   assert_eq(untrusted.net.closed, [1]);
   let hung = on_mx(serving(465, [[net::Upgrades, net::Leaves]]), open_one);
@@ -4257,7 +4257,7 @@ test "a draft is sent to everyone it goes to, its blind copies among them, as th
       time.now_ms() -> 880127706123,
     } {
     Ok(made) -> made,
-    Err(_) -> panic("the draft was refused"),
+    Err(_) -> panic("the draft was rejected"),
   };
   let ran = on_mx(
     serving(465, [
@@ -4306,10 +4306,10 @@ test "a message read is sent on as the bytes it was read from, to everyone it na
     b"Subject: no one\r\n\r\nHi.\r\n",
     email::default_limits(),
   ).message;
-  let refused = on_mx(serving(465, [greeted]), ||
+  let rejected = on_mx(serving(465, [greeted]), ||
     relay[mail](open_tls[mail]("mx.example", 465, client()), nameless).deliveries.len());
-  assert_eq(refused.value, Err(Unreadable({ at: 0, reason: email::Missing("from") })));
-  assert_eq(net::mem_sent(refused.net, 1), b"EHLO client.example\r\n")
+  assert_eq(rejected.value, Err(Unreadable({ at: 0, reason: email::Missing("from") })));
+  assert_eq(net::mem_sent(rejected.net, 1), b"EHLO client.example\r\n")
 }
 
 test "a session keeps the newest lines of its exchange, and no credential among them" {
@@ -4379,7 +4379,7 @@ test "no address and no parameter writes a line of its own: a message's commands
                 original: original,
               })
             } {
-            Err(why) -> usable(why),
+            Err(reason) -> usable(reason),
             Ok(t) -> {
               let lines = marked("", open_bytes(t.out));
               whole_lines(open_bytes(t.out)) && lines.len() == envelope.recipients.len() + 2

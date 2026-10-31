@@ -1,15 +1,15 @@
 //! The natives over machine data that strings and byte strings emitted code lays out reach the
 //! runtime through: each takes the bytes it reads as an address and a count, borrowed for the call,
-//! and answers raw integers, a `Float`'s bits, a runtime object, or bytes left as the context's
+//! and returns raw integers, a `Float`'s bits, a runtime object, or bytes left as the context's
 //! taken bytes, which emitted code copies out into a block of its own. None reads or makes a string,
-//! a byte string or a list. A native whose builtin can fail answers a value that says so, and
-//! emitted code hands the refusal to [`rt_refused`](crate::rt::rt_refused), or to
-//! [`rt_refused_text`] where it names text. What each answers is what the value builtin of the same
-//! name answers.
+//! a byte string or a list. A native whose builtin can fail returns a value that says so, and
+//! emitted code hands the rejection to [`rt_refused`](crate::rt::rt_refused), or to
+//! [`rt_refused_text`] where it names text. What each returns is what the value builtin of the same
+//! name returns.
 
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, F64, I64, Raises};
-use crate::rt::{Ctx, Refused, lent, refuse, refused_numbered, refused_unknown};
+use crate::rt::{Ctx, Rejected, borrowed, refuse, rejected_numbered, rejected_unknown};
 use ply_core::builtins::{assert_failure, not_found};
 use ply_core::{Decimal, Diagnostic, Span, codes};
 
@@ -39,7 +39,7 @@ pub fn natives() -> Vec<MachineNative> {
     .collect()
 }
 
-/// Each `Float` function as compiled code calls it: its operands' bits in, its answer's out,
+/// Each `Float` function as compiled code calls it: its operands' bits in, its result's out,
 /// computed as the value builtin of the same name computes it.
 macro_rules! float_functions {
     ($($name:literal => $f:ident = $($math:ident)::+ ($($a:ident),+);)+) => {
@@ -72,17 +72,17 @@ float_functions! {
 
 #[cold]
 #[inline(never)]
-fn err_machine(why: &str) -> Diagnostic {
+fn err_machine(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a string's bytes handed to the runtime: {why}"),
+        format!("a string's bytes handed to the runtime: {reason}"),
     )
     .primary(Span::DUMMY, "in compiled code")
     .note("this is Ply's fault, not the program's")
 }
 
 impl Ctx {
-    /// The UTF-8 a string lends, which emitted code only ever makes valid.
+    /// The UTF-8 of a string, borrowed, which emitted code only ever makes valid.
     pub(crate) fn text<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a str> {
         match std::str::from_utf8(bytes) {
             Ok(s) => Some(s),
@@ -94,7 +94,7 @@ impl Ctx {
     }
 }
 
-/// The encoding `digest` hashes of a scalar, left as taken bytes, answering their count: `kind` 0 a
+/// The encoding `digest` hashes of a scalar, left as taken bytes, returning their count: `kind` 0 a
 /// `()`, 1 a `Bool` that is `lo`, 2 an `Int` or a narrower width that reads as `lo`, 3 the width at
 /// `t` in [`ply_core::INT_TYPES`] whose bits are `lo` and above them `hi`, 4 the `Char` of scalar
 /// value `lo`, 5 the `Decimal` whose two words are `lo` and `hi`.
@@ -134,10 +134,10 @@ pub unsafe extern "C" fn rt_scalar_encoded(
 }
 
 /// The encoding `digest` hashes of the string, where `text` is not 0, or else the byte string, of
-/// the `n` bytes at `p`, left as taken bytes, answering their count.
+/// the `n` bytes at `p`, left as taken bytes, returning their count.
 pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I64) -> I64 {
     let c = unsafe { &mut *ctx };
-    let bytes = unsafe { lent(p, n) };
+    let bytes = unsafe { borrowed(p, n) };
     if text.0 != 0 && c.text(bytes).is_none() {
         return I64(0);
     }
@@ -146,11 +146,11 @@ pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I
 
 /// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let digest = blake3::hash(unsafe { lent(p, n) });
+    let digest = blake3::hash(unsafe { borrowed(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
 }
 
-/// Fails the run: two functions were compared for equality, which no function has. Answers 0.
+/// Fails the run: two functions were compared for equality, which no function has. Returns 0.
 pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
     c.fail(
@@ -163,8 +163,8 @@ pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
     I64(0)
 }
 
-/// [`rt_refused`](crate::rt::rt_refused) for a builtin whose refusal names text, `what` numbered as
-/// [`REFUSED`](crate::rt::REFUSED) numbers it: `String::find`, which did not find the `m` bytes at
+/// [`rt_refused`](crate::rt::rt_refused) for a builtin whose rejection names text, `what` numbered
+/// as [`REJECTED`](crate::rt::REJECTED) numbers it: `String::find`, not finding the `m` bytes at
 /// `q` among the `n` at `p`; `String::of_bytes`, given the `n` bytes at `p`, which are not UTF-8;
 /// `assert`, whose message is the string of `n` bytes at `p`, or none where `n` is below 0;
 /// `Secret::decode` and `Secret::encode`, whose encoding, the `n` bytes at `p`, is none they read or
@@ -180,48 +180,49 @@ pub unsafe extern "C" fn rt_refused_text(
 ) -> Raises {
     let c = unsafe { &mut *ctx };
     let site = c.site();
-    let Some(r) = refused_numbered(what) else {
-        refused_unknown(c, what);
+    let Some(r) = rejected_numbered(what) else {
+        rejected_unknown(c, what);
         return Raises(());
     };
-    let refused = match r {
-        Refused::StringFind => {
-            let (Some(s), Some(needle)) =
-                (c.text(unsafe { lent(p, n) }), c.text(unsafe { lent(q, m) }))
-            else {
+    let rejected = match r {
+        Rejected::StringFind => {
+            let (Some(s), Some(needle)) = (
+                c.text(unsafe { borrowed(p, n) }),
+                c.text(unsafe { borrowed(q, m) }),
+            ) else {
                 return Raises(());
             };
             not_found(site, s, needle)
         }
-        Refused::Assert => {
+        Rejected::Assert => {
             let message = if n.0 < 0 {
                 None
             } else {
-                match c.text(unsafe { lent(p, n) }) {
+                match c.text(unsafe { borrowed(p, n) }) {
                     Some(s) => Some(s),
                     None => return Raises(()),
                 }
             };
             assert_failure(message, site)
         }
-        Refused::SecretDecode | Refused::SecretEncode => {
-            let Some(encoding) = c.text(unsafe { lent(p, n) }) else {
+        Rejected::SecretDecode | Rejected::SecretEncode => {
+            let Some(encoding) = c.text(unsafe { borrowed(p, n) }) else {
                 return Raises(());
             };
-            let (what, does) = if r == Refused::SecretDecode {
+            let (what, does) = if r == Rejected::SecretDecode {
                 ("`Secret::decode`", "reads")
             } else {
                 ("`Secret::encode`", "writes")
             };
-            let why = format!("`{encoding}` is no encoding it {does}");
-            ply_core::crypto::misuse(site, what, why)
+            let reason = format!("`{encoding}` is no encoding it {does}");
+            ply_core::crypto::misuse(site, what, reason)
         }
         _ => {
-            refused_unknown(c, what);
+            rejected_unknown(c, what);
             return Raises(());
         }
     };
-    refuse(c, r, refused);
+    refuse(c, r, rejected);
     Raises(())
 }
 

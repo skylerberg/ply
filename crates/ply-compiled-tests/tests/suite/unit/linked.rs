@@ -27,10 +27,10 @@ fn a_linked_program_loads_from_the_descriptor_its_main_hands_over() {
     unsafe { install(unit) }.expect("a descriptor installs");
     let native = ply_compiled::c::load_linked().expect("the linked unit loads");
     assert_eq!(native.names(), ["m.seven"]);
-    let answer = units::entered(&native, "m.seven", &[]).expect("it answers");
-    assert_eq!(imm_value(answer), 7);
+    let result = units::entered(&native, "m.seven", &[]).expect("it returns");
+    assert_eq!(imm_value(result), 7);
     assert!(
         unsafe { install(unit) }.is_err(),
-        "a second descriptor is refused"
+        "a second descriptor is rejected"
     );
 }

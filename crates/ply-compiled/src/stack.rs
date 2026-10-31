@@ -107,7 +107,7 @@ impl Stack {
     }
 
     /// Names this stack as the one this thread runs on, which a computation's first frame on it
-    /// does before anything else, and answers the floor compiled code honours there.
+    /// does before anything else, and returns the floor compiled code honours there.
     ///
     /// # Safety
     /// The stack outlives its time as the running one.

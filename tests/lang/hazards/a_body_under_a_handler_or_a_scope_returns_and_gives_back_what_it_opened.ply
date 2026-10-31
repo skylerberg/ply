@@ -1,0 +1,153 @@
+import hazards.pure
+
+effect acc {
+  write put(v: Int) -> Unit
+  read got() -> Int
+}
+
+fn counted(n: Int) -> Int =
+  handle {
+    acc.put(pure::step(n));
+    acc.put(acc.got() + pure::mix(n, 2));
+    acc.got()
+  } with {
+    var c = 0,
+    acc.put(v) -> {
+      c = v;
+    },
+    acc.got() -> c,
+  }
+
+test "a definition that handles its own variable returns what it set there" {
+  assert_eq(counted(0), 35);
+  assert_eq(counted(1), 69);
+  assert_eq(counted(7), 273);
+  assert_eq(counted(0 - 3), 0 - 67)
+}
+
+effect halt {
+  write stop(code: Int) -> Int
+}
+
+fn failing(n: Int) -> Int / {abort.raise} =
+  with_scope[held](n, |x: Int| ()) { c -> pure::share(c.get(), 0) }
+
+fn timed_out(n: Int) -> Int =
+  handle {
+    with_scope[gone](n, |x: Int| ()) { c -> halt.stop(c.get() + 1) }
+  } with {
+    halt.stop(code) resume k -> 0 - code,
+  }
+
+fn caught<a>(f: () -> a / {abort.raise}) -> Result<a, String> =
+  handle { f() } with { abort.raise(m) -> Err(m), return v -> Ok(v) }
+
+// Both leave past the close the body ends with: a scope either kept would unbalance the entry, which
+// the runtime rejects as it ends.
+test "a with_scope left by a failure or by an unwind closes its scope" {
+  range(0, 32).fold((), |u: Unit, n: Int| {
+    assert_eq(caught(|| failing(n)), Err("division by zero"));
+    assert_eq(timed_out(n), 0 - (n + 1))
+  })
+}
+
+fn each(xs: List<Int>, f: (Int) -> Int) -> List<Int> = xs.map(f)
+
+fn total(xs: List<Int>) -> Int = xs.fold(0, |a, b| a + b)
+
+// Nothing in `Int -> Int` says a callback is under it.
+fn tripled(n: Int) -> Int = total(each([n, n + 1], |x| pure::step(x)))
+
+test "a higher-order builtin under a plain signature returns" {
+  assert_eq(tripled(0), 5);
+  assert_eq(tripled(1), 11);
+  assert_eq(tripled(5), 35);
+  assert_eq(total([]), 0);
+  assert_eq(total([0, 1, 2]), 3)
+}
+
+fn fadd(a: Float, b: Float) -> Float = a + b
+
+fn fless(a: Float, b: Float) -> Bool = a < b
+
+fn float_inside(n: Int) -> Int = if 1.5 + 1.5 > 2.0 { n } else { n * 2 }
+
+fn decimal_inside(n: Int) -> Int = if 1.5m + 1.5m > 2.0m { n } else { n * 2 }
+
+fn float_arith_inside(n: Int) -> Int = if 0.1 + 0.2 == 0.3 { n } else { n * 2 }
+
+test "a float or decimal inside a plain signature is never a wrong result" {
+  assert_eq(fadd(0.1, 0.2), 0.30000000000000004);
+  assert_eq(fless(1.5, 1.5), false);
+  [1, 7].fold((), |u: Unit, n: Int| {
+    assert_eq(float_inside(n), n);
+    assert_eq(decimal_inside(n), n);
+    assert_eq(float_arith_inside(n), 2 * n)
+  })
+}
+
+test "a nullary constructor pattern is a test and not a binding" {
+  assert_eq(pure::tagged(1), 7);
+  assert_eq(pure::tagged(2), 99)
+}
+
+test "a raise inside an entry leaves the next call whole" {
+  range(0, 2).fold((), |u: Unit, i: Int| {
+    assert_eq(caught(|| pure::share(1, 0)), Err("division by zero"));
+    assert_eq(pure::seeded(), 80);
+    assert_eq(pure::step(5), 16)
+  })
+}
+
+effect tally {
+  read base[r]() -> Int
+  write note[r](what: Int) -> Unit
+}
+
+fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
+  let b = tally.base[log]();
+  tally.note[log](pure::step(n));
+  pure::mix(b, n)
+}
+
+fn handled(n: Int) -> Int =
+  handle {
+    measured(n)
+  } with {
+    var noted = 0,
+    tally.base[log]() -> 7,
+    tally.note[log](what) -> {
+      noted = noted + what;
+    },
+    return out -> pure::mix(out, noted),
+  }
+
+test "a body under a live handler stack returns through it" {
+  assert_eq(handled(0), 6744);
+  assert_eq(handled(3), 8478);
+  assert_eq(handled(11), 13102)
+}
+
+fn raced(n: Int) -> Int / {sim.read, abort.raise} = {
+  let base = pure::step(n);
+  handle {
+    simulate {
+      let a = task.spawn(|| acc.put(acc.got() + pure::step(n)));
+      let b = task.spawn(|| acc.put(acc.got() + pure::mix(n, 3)));
+      task.join(a);
+      task.join(b);
+      acc.got()
+    }
+  } with {
+    var c = base,
+    acc.put(v) -> {
+      c = v;
+    },
+    acc.got() -> c,
+  }
+}
+
+test "a simulation whose tasks race on a handler's variable returns both writes" {
+  assert_eq(raced(1), 90);
+  assert_eq(raced(4), 201)
+}

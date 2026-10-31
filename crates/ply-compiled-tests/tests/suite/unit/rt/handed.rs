@@ -14,7 +14,7 @@ use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
 use ply_compiled::rt::{BRIDGE, Ctx, FAILED_TARGET};
-use ply_core::{EffectAtom, Mode, Resource};
+use ply_core::{Effect, Mode, Resource};
 use std::cell::Cell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -108,15 +108,15 @@ fn op(params: &'static Params) -> PlyOp {
     }
 }
 
-/// A perform through the bridge, as emitted code performs through it where nothing between answers.
+/// A perform through the bridge, as emitted code performs where nothing between handles it.
 fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
     let entry = BRIDGE.slot.entry;
-    let answer = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
-    unsafe { std::mem::transmute::<Handed, Word>(answer) }
+    let result = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
+    unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
 
 #[test]
-fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
+fn an_unhandled_raise_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
     let mut ctx = naming(&["m", "boom"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -137,7 +137,7 @@ fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_i
 type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 
 #[test]
-fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation() {
+fn an_unhandled_raise_waits_for_the_code_whose_clause_handles_its_operation() {
     let mut ctx = naming(&["m", "boom", "other"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -158,7 +158,7 @@ fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation
 }
 
 #[test]
-fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
+fn an_unhandled_panic_says_its_message_lowered_through_its_type() {
     let mut ctx = naming(&["abort", "raise"]);
     ctx.begin();
     let message: &str = "it broke";
@@ -169,7 +169,7 @@ fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
 }
 
 /// A host operation's arguments cross as their types lower them, and are let go through those
-/// types whatever the host makes of them: here, nothing answers.
+/// types whatever the host makes of them: here, nothing handles them.
 #[test]
 fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go() {
     let mut ctx = naming(&["m", "ask"]);
@@ -181,7 +181,7 @@ fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go
     assert_eq!(ctx.heap.live(), 0, "the argument was not let go");
     assert_eq!(
         ctx.performed,
-        [EffectAtom::operation(
+        [Effect::operation(
             "m",
             Resource::Singleton,
             Mode::Read,
@@ -229,7 +229,7 @@ unsafe extern "C" fn acquire(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Wor
     boxed(unsafe { &mut *ctx }, 5)
 }
 
-/// Takes what was acquired and lets it go; answers 7, or unwinds where it was acquired as 6.
+/// Takes what was acquired and lets it go; returns 7, or unwinds where it was acquired as 6.
 unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let held = unsafe { *args };
     let n = unsafe { *(held as *const Word).byte_add(HEADER) };
@@ -272,8 +272,8 @@ fn a_bracket_of_emitted_closures_cleans_up_what_it_acquired_and_lets_every_closu
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
-    let answer = bracket(&mut ctx, &ACQUIRE);
-    assert_eq!((answer, ctx.failed), (7, 0));
+    let result = bracket(&mut ctx, &ACQUIRE);
+    assert_eq!((result, ctx.failed), (7, 0));
     assert_eq!(CLEANED.with(Cell::get), 5);
     assert_eq!(ctx.heap.live(), 0);
     ctx.end();
@@ -289,8 +289,8 @@ fn a_bracket_cleans_up_after_a_body_that_unwinds() {
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
-    let answer = bracket(&mut ctx, &ACQUIRE_SIX);
-    assert_eq!((answer, ctx.failed), (0, FAILED_TARGET));
+    let result = bracket(&mut ctx, &ACQUIRE_SIX);
+    assert_eq!((result, ctx.failed), (0, FAILED_TARGET));
     assert_eq!(CLEANED.with(Cell::get), 6);
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
@@ -334,7 +334,7 @@ fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
     ctx.begin();
     LIFTED.with(|l| l.borrow_mut().clear());
     let label = unsafe { helper::<LabelString>("rt_label_string")(&mut ctx, 3, &STRING_T) };
-    super::crossing::unfailed(&mut ctx);
+    super::marshalling::unfailed(&mut ctx);
     assert_eq!(LIFTED.with(|l| l.borrow().clone()), "files");
     unsafe { box_dec(&mut ctx, label) };
     assert_eq!(ctx.heap.live(), 0, "the label was not let go");

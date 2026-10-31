@@ -71,8 +71,8 @@ struct Descent {
     stack: *const Stack,
     /// Each frame's pad, from the top down.
     frames: Vec<usize>,
-    /// Whether an extension the floor asked for was refused.
-    refused: bool,
+    /// Whether an extension the floor asked for was rejected.
+    rejected: bool,
     /// What it counts to at the bottom.
     counts: usize,
 }
@@ -84,7 +84,7 @@ fn descend(d: &mut Descent, levels: usize) {
     let at = &pad as *const [u8; PAD] as usize;
     let stack = unsafe { &*d.stack };
     if at < stack.floor() && !stack.extend() {
-        d.refused = true;
+        d.rejected = true;
         return;
     }
     d.frames.push(at);
@@ -108,7 +108,7 @@ fn descent(stack: &Stack, counts: usize) -> Descent {
     Descent {
         stack,
         frames: Vec::with_capacity(LEVELS + 1),
-        refused: false,
+        rejected: false,
         counts,
     }
 }
@@ -148,10 +148,10 @@ fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
     run_task();
     assert_eq!(with(|p| p.log.clone()), [10]);
     let stopped = with(|p| p.task);
-    let (frames, refused) = unsafe { ((*d).frames.clone(), (*d).refused) };
+    let (frames, rejected) = unsafe { ((*d).frames.clone(), (*d).rejected) };
     assert!(
-        !refused,
-        "the stack refused to extend within its reservation"
+        !rejected,
+        "the stack failed to extend within its reservation"
     );
     assert_eq!(frames.len(), LEVELS + 1);
     assert!(

@@ -13,18 +13,18 @@ import units (emit)
 import program (TimedLoad, loaded_analysis, in_root_package, own_diagnostics, timed_load,
                 timed_uncached, whole_of, program_view)
 import std.machine as entering
-import proof.obligation (Binding, Certificate, InternalError, Frame, Gap, Open, Outcome, Proved,
-                         Pure, Raised, Refuted, Stuck, Unproved, Vacuous, frame_summary, plural,
-                         stuck_summary)
+import proof.obligation (Binding, Certificate, InternalError, Frame, Reason, Open, Outcome, Proved,
+                         Pure, Raised, Refuted, Stopped, Unproved, Vacuous, frame_summary, plural,
+                         stopped_summary)
 import proof.decide (StaticResult)
 import proof.keys (claim_key, run_key)
 import proof.evidence (evidence_bytes)
 import std.bytes
 import proof.prover_input (ProverInputResult, empty_prover_input, prover_input_of)
 import claims (OwnClaims, LoadResult, Options, proof_store, discharging, decisions, Claim,
-               Collection, DischargeResult, discharge_on_unit, Refusal, Row, Verdicts, NotCompiled,
-               CacheUnavailable, a_claim, a_counter, a_fault, a_span, a_place, a_plan, carried_by,
-               claimed_part, exit_code_of, collected_part, collection_of, coverage_head,
+               Collection, DischargeResult, discharge_on_unit, Rejection, Row, Verdicts,
+               NotCompiled, CacheUnavailable, a_claim, a_counter, a_fault, a_span, a_place, a_plan,
+               carried_by, claimed_part, exit_code_of, collected_part, collection_of, coverage_head,
                coverage_json, decide_claims, count_internal_errors, diagnostics_of, count_proved,
                no_static_prover, obligation_json, once_each, own_claims, plan_json, proved,
                quantifier, failure_output, count_refuted, bindings_text, row_head, rows_of, seconds,
@@ -76,10 +76,10 @@ fn detail_lines(style: Style, row: Row) -> List<String> =
       ].concat(
         schema_lines(style, row.claim),
       ),
-    Unproved(gap) -> match gap {
+    Unproved(reason) -> match reason {
       Raised(raise) -> if raise.bindings.len() == 0 { [] }
       else { [detail_indent() ++ dim(style, "it raises at " ++ bindings_text(raise.bindings))] },
-      Open(o) -> o.stuck.map(|s: Stuck| detail_indent() ++ dim(style, stuck_summary(s))),
+      Open(o) -> o.stopped.map(|s: Stopped| detail_indent() ++ dim(style, stopped_summary(s))),
       _ -> [],
     },
     InternalError(f) -> if f.bindings.len() == 0 { [] }
@@ -200,7 +200,7 @@ fn document(
       key: "obligations",
       value: Array(
         rows.map(|row: Row|
-          obligation_json(row, collection.places, match v.reaches {
+          obligation_json(row, collection.places, match v.static_prover_results {
             Some(_) -> true,
             None -> false,
           })),
@@ -234,7 +234,7 @@ fn prove_collection<| e>(
   collection: Collection,
   use_cache: Bool,
   statics: StaticProver,
-  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Refusal> / {discharging.decided | e},
+  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> CommandOutput / {process.out[proc], abort.raise, proof_store.record, proof_store.cached | e} = {
   let wanted = selected_claims(collection, flags);
   printed(opening_lines(style, collection, wanted));
@@ -244,14 +244,14 @@ fn prove_collection<| e>(
       wanted,
       use_cache,
       statics,
-      flags.reach,
-      |runs: List<Int>, settled: List<StaticResult>| discharge(collection, runs, settled),
+      flags.static_prover,
+      |runs: List<Int>, resolved: List<StaticResult>| discharge(collection, runs, resolved),
     )
   } with {
     decisions.known(row) -> printed(row_lines(style, flags, collection.places, row)),
   };
   match fixture_discharge {
-    Err(why) -> failure_output(style, "prove", why),
+    Err(reason) -> failure_output(style, "prove", reason),
     Ok(v) ->
       prove_output(
         style,
@@ -301,8 +301,8 @@ pub fn run(
                 },
                 own_claims(w, built),
                 static_prover_of(w, built.world, owned),
-                |collection: Collection, runs: List<Int>, settled: List<StaticResult>|
-                  discharge_on_unit(loaded_analysis(t, v), collection, runs, settled),
+                |collection: Collection, runs: List<Int>, resolved: List<StaticResult>|
+                  discharge_on_unit(loaded_analysis(t, v), collection, runs, resolved),
               )),
             reuse_members(t.program.tallies, t.program.lost),
           )
@@ -320,7 +320,7 @@ fn prove_over<| e>(
   got: LoadResult,
   mine: OwnClaims,
   statics: StaticProver,
-  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Refusal> / {discharging.decided | e},
+  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> CommandOutput / {process.out[proc], abort.raise, proof_store.record, proof_store.cached | e} =
   prove_collection(
     style,
@@ -344,10 +344,10 @@ pub fn a_collection(claims: List<Claim>) -> Collection =
     lanes: None,
   }
 
-fn got_of(c: Result<Collection, Refusal>) -> Result<LoadResult, Refusal> =
-  match c { Ok(x) -> Ok(collected_part(x)), Err(why) -> Err(why) }
+fn got_of(c: Result<Collection, Rejection>) -> Result<LoadResult, Rejection> =
+  match c { Ok(x) -> Ok(collected_part(x)), Err(reason) -> Err(reason) }
 
-fn mine_of(c: Result<Collection, Refusal>) -> OwnClaims =
+fn mine_of(c: Result<Collection, Rejection>) -> OwnClaims =
   match c {
     Ok(x) -> claimed_part(x),
     Err(_) ->
@@ -366,27 +366,27 @@ fn verdicts(outcomes: List<Outcome>) -> DischargeResult =
 
 fn prove_fixture(
   flags: Flags,
-  c: Result<Collection, Refusal>,
-  v: Result<DischargeResult, Refusal>,
+  c: Result<Collection, Rejection>,
+  v: Result<DischargeResult, Rejection>,
 ) -> CommandOutput / {abort.raise} = prove_fixture_cached(flags, c, v, [None, None])
 
 fn prove_fixture_cached(
   flags: Flags,
-  c: Result<Collection, Refusal>,
-  v: Result<DischargeResult, Refusal>,
+  c: Result<Collection, Rejection>,
+  v: Result<DischargeResult, Rejection>,
   cache_contents: List<Option<String>>,
 ) -> CommandOutput / {abort.raise} = prove_fixture_with_reach(flags, c, v, cache_contents, None)
 
 fn prove_fixture_with_reach(
   flags: Flags,
-  c: Result<Collection, Refusal>,
-  v: Result<DischargeResult, Refusal>,
+  c: Result<Collection, Rejection>,
+  v: Result<DischargeResult, Rejection>,
   cache_contents: List<Option<String>>,
-  reach: Option<claims::Reach>,
+  static_prover: Option<claims::StaticProverResult>,
 ) -> CommandOutput / {abort.raise} =
   handle {
     match got_of(c) {
-      Err(why) -> failure_output(style_of(flags), "prove", why),
+      Err(reason) -> failure_output(style_of(flags), "prove", reason),
       Ok(got) ->
         prove_over(
           style_of(flags),
@@ -394,8 +394,8 @@ fn prove_fixture_with_reach(
           claims::no_options(),
           got,
           mine_of(c),
-          no_static_prover(reach),
-          |collection: Collection, runs: List<Int>, _settled: List<StaticResult>|
+          no_static_prover(static_prover),
+          |collection: Collection, runs: List<Int>, _resolved: List<StaticResult>|
             fixture_discharge(v, runs),
         ),
     }
@@ -408,7 +408,7 @@ fn prove_fixture_with_reach(
       range(0, keys.len()).map(|j: Int|
         cached_evidence(cache_contents.at_or(j, None), certificate_for(c, v, keys.at_or(j, "")))),
     proof_store.record(entries) -> [],
-    return answer -> { ..answer, lines: printed.concat(answer.lines) },
+    return result -> { ..result, lines: printed.concat(result.lines) },
   }
 
 fn bare() -> Flags / {abort.raise} = from_argv("prove", [])
@@ -418,10 +418,10 @@ fn one_claim() -> List<Claim> = [a_claim("m.one", Ensures(0))]
 fn one_proved() -> List<Outcome> = [proved([Congruence], 2)]
 
 test "the coverage line leads, each claim prints as it is decided, and the tally closes" {
-  let answer = prove_fixture(bare(), Ok(a_collection(one_claim())), Ok(verdicts(one_proved())));
-  assert_eq(answer.code, 0);
-  assert_eq(answer.errs, []);
-  assert_eq(answer.lines, [
+  let result = prove_fixture(bare(), Ok(a_collection(one_claim())), Ok(verdicts(one_proved())));
+  assert_eq(result.code, 0);
+  assert_eq(result.errs, []);
+  assert_eq(result.lines, [
     "   1 definition · 1 carry an obligation · 0 do not",
     "",
     "   ✓ proved         m.one ensures #0                         congruence · 2 steps",
@@ -431,13 +431,13 @@ test "the coverage line leads, each claim prints as it is decided, and the tally
 }
 
 test "a refuted claim is exit 1, and says where it fails" {
-  let answer = prove_fixture(
+  let result = prove_fixture(
     bare(),
     Ok(a_collection(one_claim())),
     Ok(verdicts([Refuted(a_counter())])),
   );
-  assert_eq(answer.code, 1);
-  assert_eq(answer.lines, [
+  assert_eq(result.code, 1);
+  assert_eq(result.lines, [
     "   1 definition · 1 carry an obligation · 0 do not",
     "",
     "   ✗ refuted        m.one ensures #0                         m.ply:1:4",
@@ -461,7 +461,7 @@ test "only the head and each claim print before the run ends" {
           got,
           mine_of(Ok(a_collection(one_claim()))),
           no_static_prover(None),
-          |collection: Collection, runs: List<Int>, _settled: List<StaticResult>|
+          |collection: Collection, runs: List<Int>, _resolved: List<StaticResult>|
             fixture_discharge(Ok(verdicts(one_proved())), runs),
         ),
     }
@@ -472,7 +472,7 @@ test "only the head and each claim print before the run ends" {
     },
     proof_store.cached(keys) -> keys.map(|_key: String| None),
     proof_store.record(entries) -> [],
-    return _answer -> lines,
+    return _result -> lines,
   };
   assert_eq(printed, [
     "   1 definition · 1 carry an obligation · 0 do not",
@@ -482,11 +482,11 @@ test "only the head and each claim print before the run ends" {
 }
 
 fn fixture_discharge(
-  v: Result<DischargeResult, Refusal>,
+  v: Result<DischargeResult, Rejection>,
   runs: List<Int>,
-) -> Result<DischargeResult, Refusal> / {discharging.decided} =
+) -> Result<DischargeResult, Rejection> / {discharging.decided} =
   match v {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(d) ->
       Ok({
         ..d,
@@ -515,8 +515,8 @@ fn cached_evidence(word: Option<String>, c: Option<Certificate>) -> Option<Bytes
   }
 
 fn certificate_for(
-  c: Result<Collection, Refusal>,
-  v: Result<DischargeResult, Refusal>,
+  c: Result<Collection, Rejection>,
+  v: Result<DischargeResult, Rejection>,
   key: String,
 ) -> Option<Certificate> / {abort.raise} =
   match ((c, v)) {
@@ -536,31 +536,31 @@ fn certificate_for(
   }
 
 test "a vacuous claim is exit 1" {
-  let answer = prove_fixture(
+  let result = prove_fixture(
     bare(),
     Ok(a_collection(one_claim())),
     Ok(verdicts([Vacuous({ guard: a_span() })])),
   );
-  assert_eq(answer.code, 1);
+  assert_eq(result.code, 1);
   assert_eq(
-    answer.lines.at_or(answer.lines.len() - 1, ""),
+    result.lines.at_or(result.lines.len() - 1, ""),
     "   1 obligation · 1 vacuous, 0 proved (0.00s)",
   );
-  assert(to_string(answer.json).contains("\"ok\":false"))
+  assert(to_string(result.json).contains("\"ok\":false"))
 }
 
 test "a claim nothing proved is exit 1, and says where the prover stopped" {
-  let answer = prove_fixture(
+  let result = prove_fixture(
     bare(),
     Ok(a_collection(one_claim())),
     Ok(
       verdicts([
-        Unproved(Open({ spent: false, stuck: [{ kind: "recursive_call", about: Some("m.f") }] })),
+        Unproved(Open({ spent: false, stopped: [{ kind: "recursive_call", about: Some("m.f") }] })),
       ]),
     ),
   );
-  assert_eq(answer.code, 1);
-  assert_eq(answer.lines, [
+  assert_eq(result.code, 1);
+  assert_eq(result.lines, [
     "   1 definition · 1 carry an obligation · 0 do not",
     "",
     "   ✗ unproved       m.one ensures #0                         no proof",
@@ -569,7 +569,7 @@ test "a claim nothing proved is exit 1, and says where the prover stopped" {
     "   1 not covered by a claim that holds: m.one",
     "   1 obligation · 1 unproved, 0 proved (0.00s)",
   ]);
-  let text = to_string(answer.json);
+  let text = to_string(result.json);
   assert(text.contains("\"reason_kind\":\"open\""));
   assert(text.contains("\"unproved\":1"));
   assert(text.contains("E0474"));
@@ -577,23 +577,23 @@ test "a claim nothing proved is exit 1, and says where the prover stopped" {
 }
 
 test "a claim Ply failed on is a defect in Ply and exit 1, never the program's gap" {
-  let answer = prove_fixture(
+  let result = prove_fixture(
     bare(),
     Ok(a_collection(one_claim())),
     Ok(verdicts([InternalError(a_fault())])),
   );
-  assert_eq(answer.code, 1);
+  assert_eq(result.code, 1);
   assert(
-    answer.lines.at_or(2, "").contains(
+    result.lines.at_or(2, "").contains(
       "Ply failed rather than the program, so this is an internal error in Ply: the unit is entered at no `m.law`",
     ),
   );
-  assert_eq(answer.lines.at_or(3, ""), "       at b = true");
+  assert_eq(result.lines.at_or(3, ""), "       at b = true");
   assert_eq(
-    answer.lines.at_or(answer.lines.len() - 1, ""),
+    result.lines.at_or(result.lines.len() - 1, ""),
     "   1 obligation · 1 internal error in Ply, 0 proved (0.00s)",
   );
-  let text = to_string(answer.json);
+  let text = to_string(result.json);
   assert(text.contains("\"outcome\":\"internal_error\""));
   assert(text.contains("\"internal_error\":1"));
   assert(text.contains("\"unproved\":0"));
@@ -605,15 +605,15 @@ test "a claim Ply failed on is a defect in Ply and exit 1, never the program's g
 
 test "`--filter` decides what is discharged at all, and says how much it left out" {
   let two = [a_claim("m.one", Ensures(0)), a_claim("m.two", Ensures(0))];
-  let answer = prove_fixture(
+  let result = prove_fixture(
     from_argv("prove", ["--filter=two"]),
     Ok(a_collection(two)),
     Ok(verdicts(one_proved().concat(one_proved()))),
   );
-  assert_eq(answer.lines.filter(|l: String| l.contains("m.two ensures #0")).len(), 1);
-  assert_eq(answer.lines.filter(|l: String| l.contains("m.one ensures #0")).len(), 0);
-  assert_eq(answer.lines.at_or(1, ""), "   1 filtered out");
-  assert(answer.lines.contains("   1 not covered by a claim that holds: m.one"))
+  assert_eq(result.lines.filter(|l: String| l.contains("m.two ensures #0")).len(), 1);
+  assert_eq(result.lines.filter(|l: String| l.contains("m.one ensures #0")).len(), 0);
+  assert_eq(result.lines.at_or(1, ""), "   1 filtered out");
+  assert(result.lines.contains("   1 not covered by a claim that holds: m.one"))
 }
 
 test "`--filter` repeated discharges what any of them names, and leaves out the rest" {
@@ -622,28 +622,28 @@ test "`--filter` repeated discharges what any of them names, and leaves out the 
     a_claim("m.two", Ensures(0)),
     a_claim("m.three", Ensures(0)),
   ];
-  let answer = prove_fixture(
+  let result = prove_fixture(
     from_argv("prove", ["--filter=one", "--filter=three"]),
     Ok(a_collection(three)),
     Ok(verdicts(one_proved().concat(one_proved()))),
   );
   assert_eq(
-    answer.lines.filter(|l: String|
+    result.lines.filter(|l: String|
       l.contains("m.one ensures #0") || l.contains("m.three ensures #0")).len(
     ),
     2,
   );
-  assert_eq(answer.lines.filter(|l: String| l.contains("m.two ensures #0")).len(), 0);
-  assert(answer.lines.contains("   1 filtered out"))
+  assert_eq(result.lines.filter(|l: String| l.contains("m.two ensures #0")).len(), 0);
+  assert(result.lines.contains("   1 filtered out"))
 }
 
 test "the object keys off `command` and `exit_code`, and carries the plan it ran under" {
-  let answer = prove_fixture(
+  let result = prove_fixture(
     from_argv("prove", ["--json"]),
     Ok(a_collection(one_claim())),
     Ok(verdicts(one_proved())),
   );
-  let text = to_string(answer.json);
+  let text = to_string(result.json);
   assert(text.contains("\"command\":\"prove\""));
   assert(text.contains("\"schema_version\":1"));
   assert(text.contains("\"exit_code\":0"));
@@ -655,16 +655,16 @@ test "the object keys off `command` and `exit_code`, and carries the plan it ran
   assert(text.contains("\"label\":\"m.one ensures #0\""))
 }
 
-test "`--explain` says where each answer came from, and what the frame covers untouched" {
+test "`--explain` says where each result came from, and what the frame covers untouched" {
   let wide = { ..a_claim("m.wide", Ensures(0)), unperformed: ["db.read[rows]"] };
-  let answer = prove_fixture_cached(
+  let result = prove_fixture_cached(
     from_argv("prove", ["--explain"]),
     Ok(a_collection([wide])),
     Ok(verdicts(one_proved())),
     [Some("proof"), None],
   );
-  assert_eq(answer.lines.at_or(3, ""), "       from: cached proof");
-  assert_eq(answer.lines.at_or(4, ""), "       frame covers, body never touches: db.read[rows]")
+  assert_eq(result.lines.at_or(3, ""), "       from: cached proof");
+  assert_eq(result.lines.at_or(4, ""), "       frame covers, body never touches: db.read[rows]")
 }
 
 test "an instantiation names its schema: under `--json`, under `--explain`, and where it is refuted" {
@@ -680,7 +680,7 @@ test "an instantiation names its schema: under `--json`, under `--explain`, and 
     Ok(a_collection([made])),
     Ok(verdicts(one_proved())),
   );
-  let says = |answer: CommandOutput| answer.lines.contains("       schema: lib.round_trip");
+  let says = |result: CommandOutput| result.lines.contains("       schema: lib.round_trip");
   assert(says(explained));
   assert(
     says(prove_fixture(bare(), Ok(a_collection([made])), Ok(verdicts([Refuted(a_counter())])))),
@@ -697,8 +697,8 @@ test "an instantiation names its schema: under `--json`, under `--explain`, and 
 fn proved_by_run() -> List<Outcome> =
   [Proved({ rules: [Congruence], steps: 2, guard_satisfiable: true, sorts: [], ran: true })]
 
-test "under `--static-prover` each obligation carries what the static tier answered and where it stopped" {
-  let reach = {
+test "under `--static-prover` each obligation carries what the static tier returned and where it stopped" {
+  let static_prover = {
     decision: "open",
     steps: 12,
     blockers: [{ kind: "division", about: None }, { kind: "recursive_call", about: Some("m.f") }],
@@ -710,7 +710,7 @@ test "under `--static-prover` each obligation carries what the static tier answe
     Ok(a_collection(one_claim())),
     Ok(verdicts(proved_by_run())),
     [None, None],
-    Some(reach),
+    Some(static_prover),
   );
   assert(to_string(fresh.json).contains(said));
   let cached = prove_fixture_with_reach(
@@ -718,7 +718,7 @@ test "under `--static-prover` each obligation carries what the static tier answe
     Ok(a_collection(one_claim())),
     Ok(verdicts(proved_by_run())),
     [None, Some("run")],
-    Some(reach),
+    Some(static_prover),
   );
   assert(to_string(cached.json).contains("\"cached\":1"));
   assert(to_string(cached.json).contains(said));
@@ -731,32 +731,32 @@ test "under `--static-prover` each obligation carries what the static tier answe
 }
 
 test "a proof a run helped make is read back from under the key of what the claim executes" {
-  let answer = prove_fixture_cached(
+  let result = prove_fixture_cached(
     from_argv("prove", ["--explain", "--json"]),
     Ok(a_collection(one_claim())),
     Ok(verdicts(proved_by_run())),
     [None, Some("run")],
   );
-  assert(answer.lines.filter(|l: String| l == "       from: cached proof").len() == 1);
-  assert(to_string(answer.json).contains("\"cached\":1"));
-  assert(to_string(answer.json).contains("\"warnings\":[]"))
+  assert(result.lines.filter(|l: String| l == "       from: cached proof").len() == 1);
+  assert(to_string(result.json).contains("\"cached\":1"));
+  assert(to_string(result.json).contains("\"warnings\":[]"))
 }
 
-test "an entry under the wrong key is refused, and the refusal is a warning the run reports" {
-  let answer = prove_fixture_cached(
+test "an entry under the wrong key is rejected, and the rejection is a warning the run reports" {
+  let result = prove_fixture_cached(
     from_argv("prove", ["--explain", "--json"]),
     Ok(a_collection(one_claim())),
     Ok(verdicts(one_proved())),
     [None, Some("proof")],
   );
-  assert(answer.lines.filter(|l: String| l == "       from: cache refused").len() == 1);
-  let text = to_string(answer.json);
+  assert(result.lines.filter(|l: String| l == "       from: cache rejected").len() == 1);
+  let text = to_string(result.json);
   assert(text.contains("\"cached\":0"));
   assert(text.contains("W0602"));
   assert(text.contains("holds a proof read off the claim alone under a run key for `"))
 }
 
-test "a program that does not load is the load's own refusal, tallied and exit 2" {
+test "a program that does not load is the load's own rejection, tallied and exit 2" {
   let d: Diagnostic = {
     code: b"E0201",
     notes: 0,
@@ -767,14 +767,14 @@ test "a program that does not load is the load's own refusal, tallied and exit 2
     severity: b"error",
     fixes: [],
   };
-  let answer = prove_fixture(
+  let result = prove_fixture(
     bare(),
     Err(NotCompiled({ diagnostics: [d], places: [] })),
     Ok(verdicts([])),
   );
-  assert_eq(answer.code, 2);
-  assert_eq(answer.lines, []);
-  assert_eq(answer.errs, ["Error[E0201]: type mismatch", "   compilation failed (1 error)"])
+  assert_eq(result.code, 2);
+  assert_eq(result.lines, []);
+  assert_eq(result.errs, ["Error[E0201]: type mismatch", "   compilation failed (1 error)"])
 }
 
 test "a cache that would not open at all is reported without a compilation tally" {
@@ -788,11 +788,11 @@ test "a cache that would not open at all is reported without a compilation tally
     severity: b"error",
     fixes: [],
   };
-  let answer = prove_fixture(
+  let result = prove_fixture(
     bare(),
     Err(CacheUnavailable({ diagnostics: [d], places: [] })),
     Ok(verdicts([])),
   );
-  assert_eq(answer.code, 2);
-  assert_eq(answer.errs, ["Error[E0501]: could not open the cache"])
+  assert_eq(result.code, 2);
+  assert_eq(result.errs, ["Error[E0501]: could not open the cache"])
 }

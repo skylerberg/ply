@@ -1,5 +1,5 @@
 import compiler.syntax.parsing (Span)
-import compiler.check.types (Type, FunctionType, Row, Field, record_fields, unit_type)
+import compiler.check.types (Type, FunctionType, Effects, Field, record_fields, unit_type)
 import compiler.check.typed (TypedParam, pattern_binders, TypedPattern, TypedWild, TypedBinder,
                              TypedCase, TypedRecordPattern, TypedListPattern, TypedOr,
                              TypedFieldPattern, Holder, HeldByBinder, HeldByNode, ReleasePlace,
@@ -40,11 +40,11 @@ pub type Release = {
   ty: Type,
   at: Span,
   place: ReleasePlace,
-  row: Option<Row>,
-  answered: List<Bytes>,
+  effects: Option<Effects>,
+  returned: List<Bytes>,
 }
 
-type ReleaseContext = { row: Option<Row>, answered: List<Bytes> }
+type ReleaseContext = { effects: Option<Effects>, returned: List<Bytes> }
 
 pub type OwnershipResult = {
   diagnostics: List<Diagnostic>,
@@ -54,11 +54,11 @@ pub type OwnershipResult = {
 
 pub type OwnedValue = {
   held: Holder,
-  row: Option<Row>,
+  effects: Option<Effects>,
   ty: Type,
   at: Span,
   name: Bytes,
-  answered: List<Bytes>,
+  returned: List<Bytes>,
 }
 
 type Usage = | Moved(Bytes) | Borrowed | Read | Dropped | Called
@@ -79,8 +79,8 @@ type Binding = {
   taken: List<Bytes>,
   borrows: List<Int>,
   holds: List<Int>,
-  row: Option<Row>,
-  answered: List<Bytes>,
+  effects: Option<Effects>,
+  returned: List<Bytes>,
 }
 
 type Consumption = { at: Span, how: Bytes }
@@ -108,7 +108,7 @@ type Scope = {
   handles: List<EnclosingHandle>,
   frame: Int,
   body: Int,
-  row: Option<Row>,
+  effects: Option<Effects>,
   result: Usage,
 }
 
@@ -127,7 +127,7 @@ pub fn check_ownership(
         handles: [],
         frame: 0,
         body: 0,
-        row: None,
+        effects: None,
         result: Moved(b"answered"),
       },
       st: {
@@ -159,11 +159,11 @@ pub fn check_ownership(
       let bind = walked.bindings.get(holder_key(r.held));
       let x = {
         held: r.held,
-        row: r.row,
+        effects: r.effects,
         ty: r.ty,
         at: match bind { Some(b) -> b.at, None -> r.at },
         name: match bind { Some(b) -> b.name, None -> b"a value" },
-        answered: r.answered,
+        returned: r.returned,
       };
       if acc.contains(x) { acc } else { acc.push(x) }
     }),
@@ -219,7 +219,7 @@ fn release_binding(
   place: ReleasePlace,
   value: List<ReleaseTarget>,
 ) -> OwnershipState = {
-  let w = { row: b.row, answered: b.answered };
+  let w = { effects: b.effects, returned: b.returned };
   let held = released_values(state, b);
   let holders = held.map(|x: ReleaseTarget| x.owning_package);
   let check_ownership = state.bindings.fold([], |acc: List<ReleaseTarget>, key: Int, x: Binding|
@@ -362,8 +362,8 @@ fn add_releases(
         ty: x.ty,
         at: at,
         place: place,
-        row: w.row,
-        answered: w.answered,
+        effects: w.effects,
+        returned: w.returned,
       })),
   }
 
@@ -482,16 +482,16 @@ fn bind_as(
         taken: [],
         borrows: [],
         holds: [],
-        row: w.row,
-        answered: w.answered,
+        effects: w.effects,
+        returned: w.returned,
       }),
     }
   }
 
 fn release_context(s: Scope) -> ReleaseContext =
   {
-    row: s.row,
-    answered: s.handles.fold([], |acc: List<Bytes>, h: EnclosingHandle|
+    effects: s.effects,
+    returned: s.handles.fold([], |acc: List<Bytes>, h: EnclosingHandle|
       if h.body == s.body { acc.concat(h.operations) } else { acc }),
   }
 
@@ -718,7 +718,7 @@ fn walk(
         usage,
       ),
     WalkedList(items) -> {
-      let how = Moved(b"held in a list");
+      let how = Moved(b"stored in a list");
       let held = items.fold(state, |acc: OwnershipState, x: Walked|
         put_in_flight(f, s, acc, walk(f, s, acc, x, how), x, how));
       check_new_value(f, { ..held, in_flight: state.in_flight }, e, usage)
@@ -762,7 +762,7 @@ fn walk(
         e.span,
       ),
     WalkedParallel(ts) -> {
-      let how = Moved(b"answered by a branch");
+      let how = Moved(b"returned by a branch");
       let held = ts.fold(state, |acc: OwnershipState, t: WalkedThunk|
         {
           ..walk(f, isolated_scope(s, t.body.span), { ..acc, in_flight: [] }, t.body, how),
@@ -811,7 +811,7 @@ fn release_after_handler(
   )
 }
 
-fn in_record() -> Usage = Moved(b"held in a record")
+fn in_record() -> Usage = Moved(b"stored in a record")
 
 fn check_overwritten_fields(
   f: Facts,
@@ -827,13 +827,13 @@ fn check_overwritten_fields(
   let written = sets.filter(|x: WalkedField| resources.contains(x.name));
   let held = binding_read(s, state, base);
   let moved = match held { Some(b) -> b.taken, None -> [] };
-  let refused = written.fold(state, |acc: OwnershipState, x: WalkedField|
+  let rejected = written.fold(state, |acc: OwnershipState, x: WalkedField|
     if moved.contains(x.name) { acc } else { report(acc, written_over(f, x.name, x.value.span)) });
   match held {
     Some(b) -> if moved.len() > 0 && moved.all(|n: Bytes| sets.any(|x: WalkedField| x.name == n)) {
-      store_binding(refused, { ..b, taken: [] })
-    } else { refused },
-    None -> refused,
+      store_binding(rejected, { ..b, taken: [] })
+    } else { rejected },
+    None -> rejected,
   }
 }
 
@@ -1037,7 +1037,7 @@ fn walk_lambda(
   s: Scope,
   state: OwnershipState,
   e: Walked,
-  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row },
+  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, effects: Effects },
   fun: EnclosingFunction,
   given: List<Int>,
 ) -> { st: OwnershipState, captured: Captures } / {abort.raise} = {
@@ -1048,7 +1048,7 @@ fn walk_lambda(
       block: [],
       frame: e.span.site,
       body: e.span.site,
-      row: Some(l.row),
+      effects: Some(l.effects),
     },
     st: { ..state, in_flight: [] },
   };
@@ -1130,7 +1130,7 @@ fn bind_lambda(
   name: Bytes,
   at: Span,
   e: Walked,
-  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row },
+  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, effects: Effects },
 ) -> ScopedState / {abort.raise} = {
   let local: EnclosingFunction = { span: e.span, held: false, local: true };
   let first = walk_lambda(f, b.s, b.st, e, l, local, []);
@@ -1326,12 +1326,12 @@ fn join_paths(
         None -> x,
       });
     let last = letting(ended, late, ReleaseAfter, owned_result(f, branch, ReleaseAfter, usage));
-    let lent = match usage { Borrowed -> true, Read -> true, _ -> false };
-    let refused = if !lent || !resource_at(f, branch) { [] } else {
+    let borrowed = match usage { Borrowed -> true, Read -> true, _ -> false };
+    let rejected = if !borrowed || !resource_at(f, branch) { [] } else {
       late.filter(|b: Binding| may_return_binding(branch, b.key)).map(|b: Binding|
         new_resource_dropped(f, branch, usage))
     };
-    { first: first.releases, last: last.releases, refused: refused }
+    { first: first.releases, last: last.releases, rejected: rejected }
   });
   let merged = ends.fold(
     { st: before, at: 0 },
@@ -1351,7 +1351,7 @@ fn join_paths(
               None -> m.insert(key, b),
             }),
           diagnostics: acc.diagnostics.concat(x.diagnostics.drop(before.diagnostics.len())).concat(
-            mine.refused,
+            mine.rejected,
           ),
           releases: acc.releases.concat(mine.first).concat(
             x.releases.drop(before.releases.len()).filter(|r: Release| !fails(r)),
@@ -1421,8 +1421,8 @@ fn walk_match(
         taken: [],
         borrows: [],
         holds: [],
-        row: s.row,
-        answered: release_context(s).answered,
+        effects: s.effects,
+        returned: release_context(s).returned,
       })
     } else { walk(f, s, state, scrutinee, if through { Borrowed } else { Read }) },
   };
@@ -1538,13 +1538,13 @@ fn walk_handle(
   s: Scope,
   state: OwnershipState,
   e: Walked,
-  h: { body: Walked, row: Row, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> },
+  h: { body: Walked, effects: Effects, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> },
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
   let ops = h.clauses.map(|c: WalkedClause| Bytes::concat_all([c.effect, b".", c.op]));
   let vars = h.vars.fold({ s: s, st: state }, |acc: ScopedState, v: WalkedHandlerVar| {
     let held = resource_at(f, v.init);
-    let walked = walk(f, acc.s, acc.st, v.init, if held { Moved(b"held by a handler's variable") }
+    let walked = walk(f, acc.s, acc.st, v.init, if held { Moved(b"stored in a handler's variable") }
     else { Read });
     { ..acc, st: if held { report(walked, handler_variable_resource(f, v)) } else { walked } }
   });
@@ -1555,7 +1555,7 @@ fn walk_handle(
       { ..s, handles: s.handles.push({ operations: ops, body: s.body }) },
       vars.st,
       h.body,
-      match h.ret { Some(_) -> Moved(b"answered to the `return` clause"), None -> usage },
+      match h.ret { Some(_) -> Moved(b"returned to the `return` clause"), None -> usage },
     ),
     e.span,
     release_context(s),
@@ -1709,7 +1709,7 @@ fn consumed_borrowed(f: Facts, b: Binding, span: Span, how: Bytes) -> Diagnostic
     b.at,
     b"borrowed here",
     [
-      b"a resource handed to a parameter is lent to the call unless the parameter is written `keep`: the body may use it and lend it on, and its caller lets it go",
+      b"a resource handed to a parameter is borrowed by the call unless the parameter is written `keep`: the body may use it and pass it on borrowed, and its caller lets it go",
       b"write `keep` before the parameter's type to take it",
     ],
   )
@@ -1749,9 +1749,11 @@ fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diagnostic =
     b"E0322",
     f.module,
     v.span,
-    Bytes::concat_all([b"the handler's variable ", quoted(v.name), b" would hold a resource"]),
+    Bytes::concat_all([b"the handler's variable ", quoted(v.name), b" would keep a resource"]),
     b"nothing lets a handler's variable go where its `handle` ends",
-    [b"bind the resource with `let` around the `handle`, and lend it to the clauses that use it"],
+    [
+      b"bind the resource with `let` around the `handle`, and pass it borrowed to the clauses that use it",
+    ],
   )
 
 fn moved_through(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic =
@@ -1791,12 +1793,12 @@ fn fallback_consumed(f: Facts, b: Binding, at: Span) -> Diagnostic =
     f.module,
     at,
     Bytes::concat_all([quoted(b.name), b" is consumed by an `else` its block goes on past"]),
-    b"this `else` answers its block and consumes it",
+    b"this `else` returns from its block and consumes it",
     f.module,
     b.at,
     b"owned from here, outside that block",
     [
-      b"an `else` answers the block it is in, which the code after goes on owning what is bound outside it: consume it after the block",
+      b"an `else` returns from the block it is in, which the code after goes on owning what is bound outside it: consume it after the block",
     ],
   )
 
@@ -1826,7 +1828,7 @@ fn borrowing_function_kept(f: Facts, b: Binding, span: Span) -> Diagnostic =
     b.at,
     b"bound here",
     [
-      b"a function that borrows a resource is called, or lent to a call, while the resource is: consume the resource inside it to move it in instead",
+      b"a function that borrows a resource is called, or passed borrowed to a call, while the resource is: consume the resource inside it to move it in instead",
     ],
   )
 
@@ -1839,7 +1841,7 @@ fn borrowed_past(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) -> Di
     b"borrowed here",
     f.module,
     fun.span,
-    b"this function may be kept, answered or held in a value",
+    b"this function may be kept, returned or stored in a value",
     [
       b"a function that borrows a resource may be called only while the resource is: consume the resource inside it to move it in instead",
     ],
@@ -1874,7 +1876,7 @@ fn new_resource_dropped(f: Facts, e: Walked, usage: Usage) -> Diagnostic =
     e.span,
     b"a resource is made here and nothing holds it",
     match usage {
-      Borrowed -> b"lent to a call, which never keeps it",
+      Borrowed -> b"borrowed by a call, which never keeps it",
       Read -> b"read as a copy",
       _ -> b"its value is dropped",
     },

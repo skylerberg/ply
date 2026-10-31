@@ -1,10 +1,10 @@
 //! What `std.fs`'s host handler asks the host through its natives: the files under the roots the
 //! run names, each operation's path confined to its root by a walk that follows its links here.
-//! Each operation is a job that answers flat: a byte 1 or 0 for whether it did what it was asked,
-//! a kind as [`Kind::number`] numbers it, a refusal as [`Refusal::flat`] writes it, and anything
+//! Each operation is a job that returns flat: a byte 1 or 0 for whether it did what it was asked,
+//! a kind as [`Kind::number`] numbers it, an error as [`FileError::flat`] writes it, and anything
 //! that may be absent found.
 
-use crate::jobs::{Failure, Refusing};
+use crate::jobs::{Failure, FallibleJob};
 use crate::native::{found, found_read, int, parts};
 use crate::pool::Run;
 use ply_core::crypto::Framing;
@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-/// The most one read answers. A larger file is read a range at a time with `fs.read_at`, so this
+/// The most one read returns. A larger file is read a range at a time with `fs.read_at`, so this
 /// bounds a single call rather than a file.
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 
-/// How long `fs.lock` waits for a holder to release before answering `false`.
+/// How long `fs.lock` waits for a holder to release before returning `false`.
 pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 const LOCK_POLL: Duration = Duration::from_millis(2);
@@ -173,11 +173,11 @@ impl Op {
         }
     }
 
-    /// What the operation answers of a path that leads nowhere: what it answers where nothing is.
+    /// What the operation returns of a path that leads nowhere: what it returns where nothing is.
     fn nothing(self) -> Vec<u8> {
         match self {
             Op::Kind | Op::Resolved => vec![Kind::Missing.number()],
-            Op::Open | Op::Link => tried(Err(Refusal::NotFound)),
+            Op::Open | Op::Link => tried(Err(FileError::NotFound)),
             // Absent, or not done.
             _ => vec![0],
         }
@@ -217,8 +217,8 @@ impl RootSpec {
     }
 }
 
-fn malformed(text: &str, why: &str) -> String {
-    format!("`{text}` is not a filesystem root: {why}; write `--fs NAME=PATH`")
+fn malformed(text: &str, reason: &str) -> String {
+    format!("`{text}` is not a filesystem root: {reason}; write `--fs NAME=PATH`")
 }
 
 /// What `--fs NAME=PATH` bound, resolved once.
@@ -342,8 +342,8 @@ struct OpenFile {
     how: Opening,
 }
 
-/// The files a run holds open, each under the descriptor `fs.open` answered. A descriptor is never
-/// answered twice, so one that was closed names nothing afterwards.
+/// The files a run holds open, each under the descriptor `fs.open` returned. A descriptor is never
+/// returned twice, so one that was closed names nothing afterwards.
 #[derive(Default)]
 struct Descriptors {
     last: i64,
@@ -380,7 +380,7 @@ impl FsHost {
     /// The job of `op` on `path` under the root `label` names, handed `second` beside it.
     ///
     /// # Errors
-    /// No root is bound to `label`, or a range asks for more than one read answers.
+    /// No root is bound to `label`, or a range asks for more than one read returns.
     pub fn asked(
         &self,
         op: Op,
@@ -388,7 +388,7 @@ impl FsHost {
         path: String,
         second: Second,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let root = self.root(op, label, span)?;
         if let Second::Range { len, .. } = second
             && len as u64 > MAX_READ_BYTES
@@ -407,14 +407,14 @@ impl FsHost {
     /// under this one, and neither is one opened the other way.
     ///
     /// # Errors
-    /// No root is bound to `label`, or a read asks for more than one read answers.
+    /// No root is bound to `label`, or a read asks for more than one read returns.
     pub fn on_file(
         &self,
         label: &str,
         descriptor: i64,
         chunk: Chunk,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let op = match chunk {
             Chunk::Read(_) => Op::ReadChunk,
             Chunk::Write(_) => Op::WriteChunk,
@@ -463,22 +463,22 @@ fn open_file(
     root: &Path,
     target: &Path,
     how: Opening,
-) -> Result<i64, Refusal> {
+) -> Result<i64, FileError> {
     use std::os::unix::fs::OpenOptionsExt;
     // A directory opens for reading, and only its first read says it is one.
     if how != Opening::Create && std::fs::symlink_metadata(target).is_ok_and(|meta| !meta.is_file())
     {
-        return Err(Refusal::NotAFile);
+        return Err(FileError::NotAFile);
     }
     let mut options = OpenOptions::new();
     match how {
         Opening::Read => options.read(true),
         Opening::Write => options.write(true).create(true).truncate(true),
         Opening::Append => options.append(true).create(true),
-        // `O_EXCL` refuses whatever is at the name, a link included, so nothing is written through one.
+        // `O_EXCL` rejects anything at the name, links included, so nothing is written through one.
         Opening::Create => options.write(true).create_new(true).mode(0o600),
     };
-    let file = unfollowed(&mut options, target).map_err(|e| refusal(&e))?;
+    let file = unfollowed(&mut options, target).map_err(|e| rejection(&e))?;
     let mut held = descriptors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -513,12 +513,12 @@ fn run(
         Second::Opening(Opening::Create) => Last::Kept,
         _ => op.last(),
     };
-    let Some(target) = walked(root, path, last, span).map_err(Failure::Refused)? else {
+    let Some(target) = walked(root, path, last, span).map_err(Failure::Rejected)? else {
         return Ok(op.nothing());
     };
-    // A second path of the root, where it leads; what the operation answers where it leads nowhere.
+    // A second path of the root, where it leads; what the operation returns where it leads nowhere.
     let other = |to: &str, last: Last| -> Result<Option<PathBuf>, Failure> {
-        walked(root, to, last, span).map_err(Failure::Refused)
+        walked(root, to, last, span).map_err(Failure::Rejected)
     };
     let unhanded = |what: &str| {
         Err(Failure::Said(format!(
@@ -532,7 +532,7 @@ fn run(
         }
         (Op::ReadFile, _) => match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
-                return Err(Failure::Refused(too_large(meta.len(), path, span)));
+                return Err(Failure::Rejected(too_large(meta.len(), path, span)));
             }
             Ok(meta) if meta.is_file() => found_read(meta.len() as usize, |out| {
                 unfollowed(OpenOptions::new().read(true), &target)
@@ -586,7 +586,7 @@ fn run(
             },
         ) => match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
-                return Err(Failure::Refused(too_large(meta.len(), path, span)));
+                return Err(Failure::Rejected(too_large(meta.len(), path, span)));
             }
             Ok(meta) if meta.is_file() => {
                 let read = read_private(&target, meta.len())
@@ -628,7 +628,7 @@ fn run(
         (Op::Mode, _) => found(mode_of(&target).map(|bits| int(i64::from(bits)))),
         (Op::SetMode, Second::Mode(bits)) => done(set_mode(&target, bits)),
         (Op::Symlink, Second::Target(to)) => {
-            link_stays(root, &target, &to, span).map_err(Failure::Refused)?;
+            link_stays(root, &target, &to, span).map_err(Failure::Rejected)?;
             done(std::os::unix::fs::symlink(&to, &target).is_ok())
         }
         (Op::ReadLink, _) => found(
@@ -638,7 +638,7 @@ fn run(
         ),
         (Op::Walk, _) => match walk(path, &target) {
             Ok(entries) => found(entries.map(|entries| entries_flat(&entries))),
-            Err(bytes) => return Err(Failure::Refused(walk_too_large(bytes, path, span))),
+            Err(bytes) => return Err(Failure::Rejected(walk_too_large(bytes, path, span))),
         },
         (Op::SetModified, Second::Millis(ms)) => done(set_modified(&target, ms)),
         (Op::Stat, _) => found(stat_of(&target).map(Stat::flat)),
@@ -651,7 +651,7 @@ fn run(
                 let entries: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
                 parts(&entries)
             })),
-            Err(bytes) => return Err(Failure::Refused(walk_too_large(bytes, path, span))),
+            Err(bytes) => return Err(Failure::Rejected(walk_too_large(bytes, path, span))),
         },
         (Op::Space, _) => found(space_of(&target).map(Space::flat)),
         (Op::Link, Second::Path(to)) => match other(&to, Last::Kept)? {
@@ -701,7 +701,7 @@ impl Kind {
 
 /// Why the file system would not do what an operation asked.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Refusal {
+pub enum FileError {
     NotFound,
     Denied,
     NotAFile,
@@ -712,30 +712,30 @@ pub enum Refusal {
     Other(i64, String),
 }
 
-impl Refusal {
+impl FileError {
     /// One byte, `NotFound` 0 to `NoSpace` 5 as declared, or 6 for `Other` and then its number
     /// and its words as parts.
     pub fn flat(self) -> Vec<u8> {
         match self {
-            Refusal::NotFound => vec![0],
-            Refusal::Denied => vec![1],
-            Refusal::NotAFile => vec![2],
-            Refusal::NotADirectory => vec![3],
-            Refusal::Exists => vec![4],
-            Refusal::NoSpace => vec![5],
-            Refusal::Other(code, text) => {
+            FileError::NotFound => vec![0],
+            FileError::Denied => vec![1],
+            FileError::NotAFile => vec![2],
+            FileError::NotADirectory => vec![3],
+            FileError::Exists => vec![4],
+            FileError::NoSpace => vec![5],
+            FileError::Other(code, text) => {
                 [&[6u8][..], &parts(&[&int(code)[..], text.as_bytes()])].concat()
             }
         }
     }
 }
 
-/// What an operation the file system may refuse answers: byte 1 and what it made, or byte 0 and
+/// What an operation the file system may reject returns: byte 1 and what it made, or byte 0 and
 /// why it made nothing.
-fn tried(made: Result<Vec<u8>, Refusal>) -> Vec<u8> {
+fn tried(made: Result<Vec<u8>, FileError>) -> Vec<u8> {
     match made {
         Ok(made) => [&[1u8][..], &made].concat(),
-        Err(why) => [&[0u8][..], &why.flat()].concat(),
+        Err(reason) => [&[0u8][..], &reason.flat()].concat(),
     }
 }
 
@@ -790,16 +790,16 @@ impl Space {
     }
 }
 
-/// Why the file system refused.
-fn refusal(e: &std::io::Error) -> Refusal {
+/// Why the file system rejected an operation.
+fn rejection(e: &std::io::Error) -> FileError {
     match e.kind() {
-        ErrorKind::NotFound => Refusal::NotFound,
-        ErrorKind::PermissionDenied => Refusal::Denied,
-        ErrorKind::AlreadyExists => Refusal::Exists,
-        ErrorKind::NotADirectory => Refusal::NotADirectory,
-        ErrorKind::IsADirectory => Refusal::NotAFile,
-        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => Refusal::NoSpace,
-        _ => Refusal::Other(e.raw_os_error().map_or(0, i64::from), e.to_string()),
+        ErrorKind::NotFound => FileError::NotFound,
+        ErrorKind::PermissionDenied => FileError::Denied,
+        ErrorKind::AlreadyExists => FileError::Exists,
+        ErrorKind::NotADirectory => FileError::NotADirectory,
+        ErrorKind::IsADirectory => FileError::NotAFile,
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => FileError::NoSpace,
+        _ => FileError::Other(e.raw_os_error().map_or(0, i64::from), e.to_string()),
     }
 }
 
@@ -853,7 +853,7 @@ fn space_of(target: &Path) -> Option<Space> {
     let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
     let mut held = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is NUL-terminated and `held` is room for one `statvfs`, which the call fills
-    // when it answers zero.
+    // when it returns zero.
     let room = unsafe {
         if libc::statvfs(path.as_ptr(), held.as_mut_ptr()) != 0 {
             return None;
@@ -872,11 +872,11 @@ fn space_of(target: &Path) -> Option<Space> {
 
 /// `to` made another name for the file at `existing`, which is read without following a link:
 /// only a file takes a second name here.
-fn hard_link(existing: &Path, to: &Path) -> Result<(), Refusal> {
+fn hard_link(existing: &Path, to: &Path) -> Result<(), FileError> {
     match std::fs::symlink_metadata(existing) {
-        Err(e) => Err(refusal(&e)),
-        Ok(meta) if !meta.is_file() => Err(Refusal::NotAFile),
-        Ok(_) => std::fs::hard_link(existing, to).map_err(|e| refusal(&e)),
+        Err(e) => Err(rejection(&e)),
+        Ok(meta) if !meta.is_file() => Err(FileError::NotAFile),
+        Ok(_) => std::fs::hard_link(existing, to).map_err(|e| rejection(&e)),
     }
 }
 
@@ -1020,7 +1020,7 @@ fn link_stays(root: &Path, link: &Path, target: &str, span: Span) -> Result<(), 
 }
 
 /// Every entry under `dir`, depth first and each directory's names in byte order, a symlink listed
-/// and never followed. `Err` carries the bytes of paths gathered once they pass what one answer
+/// and never followed. `Err` carries the bytes of paths gathered once they pass what one result
 /// holds.
 fn walk(dir: &str, target: &Path) -> Result<Option<Vec<(String, Kind)>>, u64> {
     if !std::fs::metadata(target).is_ok_and(|m| m.is_dir()) {
@@ -1145,9 +1145,9 @@ fn set_modified(target: &Path, ms: i64) -> bool {
 }
 
 /// Costs the size of what is new rather than the size of the file, which is the point of it. The
-/// answer is the offset the bytes landed at: `O_APPEND` puts them at the end atomically, and the
+/// result is the offset the bytes landed at: `O_APPEND` puts them at the end atomically, and the
 /// descriptor's position afterwards is the end of what *this* write produced, so a second appender
-/// racing this one moves neither the bytes nor the answer.
+/// racing this one moves neither the bytes nor the result.
 fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
     let mut file = unfollowed(OpenOptions::new().append(true).create(true), target).ok()?;
     // A write of nothing writes nothing, leaving the descriptor at 0 rather than at the end.
@@ -1293,7 +1293,7 @@ pub fn confine(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, D
 
 /// The walk behind [`confine`]: each name looked at in turn and each link followed here rather
 /// than by the system, so that a link to where nothing is has somewhere it leads. Under
-/// `Last::Kept` the last name is not looked at, and a link there is the answer's last name.
+/// `Last::Kept` the last name is not looked at, and a link there is the result's last name.
 /// `None` for more links than a path may pass through, and for a link that steps back out of a
 /// name that is not there, which the system resolves to nothing.
 fn walked(root: &Path, path: &str, last: Last, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
@@ -1375,33 +1375,33 @@ fn steps(path: &Path) -> impl DoubleEndedIterator<Item = OsString> + '_ {
     })
 }
 
-/// The file at `target` opened as `options` ask, and refused where its name is a link: the path a
-/// walk answered had none there, so one there now was put there since.
+/// The file at `target` opened as `options` ask, and rejected where its name is a link: the path a
+/// walk returned had none there, so one there now was put there since.
 fn unfollowed(options: &mut OpenOptions, target: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_NOFOLLOW).open(target)
 }
 
 #[cold]
-fn escapes(root: &Path, path: &str, why: &str, span: Span) -> Diagnostic {
+fn escapes(root: &Path, path: &str, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_PATH_ESCAPES_ROOT,
         format!("`{path}` leaves the root it was given"),
     )
-    .primary(span, why.to_string())
+    .primary(span, reason.to_string())
     .note(format!("the root is `{}`", root.display()))
-    .note("a resource label names a root and an operation reaches only what is under it; a path that leaves one is refused before the operation runs")
+    .note("a resource label names a root and an operation reaches only what is under it; a path that leaves one is rejected before the operation runs")
 }
 
 #[cold]
 fn too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_FILE_TOO_LARGE,
-        format!("a read of `{path}` would answer {bytes} bytes"),
+        format!("a read of `{path}` would return {bytes} bytes"),
     )
-    .primary(span, "this is more than one read answers")
+    .primary(span, "this is more than one read returns")
     .note(format!(
-        "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+        "a read returns one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("read it a range at a time with `fs.read_at(path, offset, len)`, which is also what keeps the cost of reading a large file proportional to the part that is wanted")
 }
@@ -1410,11 +1410,11 @@ fn too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
 fn walk_too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_FILE_TOO_LARGE,
-        format!("a walk of `{path}` would answer more than {bytes} bytes of paths"),
+        format!("a walk of `{path}` would return more than {bytes} bytes of paths"),
     )
-    .primary(span, "this is more than one walk answers")
+    .primary(span, "this is more than one walk returns")
     .note(format!(
-        "a walk answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+        "a walk returns one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("walk the tree a directory at a time with `fs.list_dir`")
 }
@@ -1425,9 +1425,9 @@ fn chunk_too_large(max: u64, span: Span) -> Diagnostic {
         codes::FS_FILE_TOO_LARGE,
         format!("`fs.read_chunk` was asked for {max} bytes"),
     )
-    .primary(span, "this is more than one read answers")
+    .primary(span, "this is more than one read returns")
     .note(format!(
-        "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+        "a read returns one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("ask for a smaller chunk: a read costs at most the chunk it asks for, whatever the file holds")
 }

@@ -157,7 +157,7 @@ fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 #[test]
-fn a_configuration_read_stands_while_its_key_answers_as_it_did() {
+fn a_configuration_read_stands_while_its_key_returns_what_it_did() {
     let recorder = Recorder::default();
     recorder.configured("SERVICE_REGION", Some("eu"));
     recorder.configured("SERVICE_ABSENT", None);
@@ -204,7 +204,7 @@ fn a_nested_run_s_configuration_is_its_caller_s_handing_and_no_read_of_the_calle
 }
 
 #[test]
-fn shipped_modules_and_the_program_are_held_at_the_binary_s_digests() {
+fn shipped_modules_and_the_program_are_recorded_at_the_binary_s_digests() {
     let recorder = Recorder::default();
     recorder.shipped("std.list");
     recorder.shipped("std.gone");
@@ -381,7 +381,7 @@ fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_i
     let _other = recorder.child_trace();
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
     assert_eq!(lines(&trace), ["file\tcwd\ta.ply\t", "shipped\tstd.list"]);
-    // The child's binary answered, not ours.
+    // The child's binary responded, not ours.
     assert!(trace.contains("shipped\tstd.list\tits own digest\n"));
     let unfinished = recorder.child_trace();
     std::fs::write(&unfinished, "read\tfile\t/x\n").unwrap();
@@ -406,7 +406,7 @@ fn checking_a_trace_enters_what_it_read_into_the_asker_s_record() {
 }
 
 #[test]
-fn a_trace_naming_a_root_the_run_is_not_lent_is_never_answered() {
+fn a_trace_naming_a_root_the_run_is_not_granted_never_yields_a_cached_result() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ply"), b"one").unwrap();
     let roots = rooted(dir.path());

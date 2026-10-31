@@ -27,20 +27,20 @@ import signature (provenance)
 import std.bytes
 import proof.keys (claim_key, run_key)
 import diagnostic (SourceText, Position, position_of, values_json)
-import report (CommandOutput, indent, ok_code, count_of, reported, refused)
+import report (CommandOutput, indent, ok_code, count_of, reported, rejected)
 import std.json (Json, Null, Str, Bool, Number, Array, Object, Member, object, int, strings,
                  to_string)
 import std.term (Style, plain, dim, red, green, yellow)
-import proof.obligation (Binding, Builds, CacheRefused, Certificate, Change, Changed, ClaimRow,
+import proof.obligation (Binding, Builds, CacheRejected, Certificate, Change, Changed, ClaimRow,
                          Cost, Counterexample, Coverage, Definition, InternalError, Ensures, Fault,
-                         Frame, Fresh, FromProof, Gap, Judgement, PointFailed, PointFaulted,
+                         Frame, Fresh, FromProof, Reason, Judgement, PointFailed, PointFaulted,
                          PointHeld, PointRaised, PointRejected, Kind, Law, Laws, ChangeState, Never,
                          NoWitness, Open, Outcome, Proved, Pure, Raised, CacheStatus, ClaimSnapshot,
-                         Refuted, Space, Stuck, Uncached, Unchanged, UnhandledEffect, Unproved,
+                         Refuted, Space, Stopped, Uncached, Unchanged, UnhandledEffect, Unproved,
                          Vacuous, Writes, WrittenLaw, certificate_summary, coverage, fault_message,
-                         fault_notes, fault_summary, cache_writes, frame_summary, gap_summary,
-                         gap_word, hits, is_proved, laws_of, cache_status_word, select, specified,
-                         stuck_summary, vacuity_summary, verdict_of, plural)
+                         fault_notes, fault_summary, cache_writes, frame_summary, reason_summary,
+                         reason_word, hits, is_proved, laws_of, cache_status_word, select,
+                         specified, stopped_summary, vacuity_summary, verdict_of, plural)
 import std.value (Value, VBool, VInt, VList, render)
 import std.value
 import std.machine as entering
@@ -76,9 +76,9 @@ pub fn options_from(p: Parsed) -> Options / {abort.raise} =
     sim: machine::sim_options_from(p),
   }
 
-pub type Refused = { diagnostics: List<Diagnostic>, places: List<SourceText> }
+pub type Rejected = { diagnostics: List<Diagnostic>, places: List<SourceText> }
 
-pub type Refusal = | NotCompiled(Refused) | CacheUnavailable(Refused)
+pub type Rejection = | NotCompiled(Rejected) | CacheUnavailable(Rejected)
 
 pub type Claim = {
   key: String,
@@ -186,13 +186,16 @@ pub type DischargeResult = {
   warnings: List<Diagnostic>,
 }
 
-pub type Reach = {
+pub type StaticProverResult = {
   decision: String,
   steps: Int,
   blockers: List<{ kind: String, about: Option<String> }>,
 }
 
-pub type StaticResults = { settled: List<StaticResult>, reaches: Option<List<Option<Reach>>> }
+pub type StaticResults = {
+  resolved: List<StaticResult>,
+  static_prover_results: Option<List<Option<StaticProverResult>>>,
+}
 
 pub type StaticProver = {
   result: (List<Int>, List<Int>, Bool, Int) -> StaticResults / {abort.raise},
@@ -204,13 +207,14 @@ pub fn static_prover_of(
   owned: keep (Bytes) -> Bool,
 ) -> StaticProver =
   {
-    result: |wanted: List<Int>, runs: List<Int>, reach: Bool, budget: Int| {
+    result: |wanted: List<Int>, runs: List<Int>, static_prover: Bool, budget: Int| {
       let obligation = |i: Int| world.obligations.at(i);
-      let asked = somes(List::map(if reach { wanted } else { runs }, obligation));
+      let asked = somes(List::map(if static_prover { wanted } else { runs }, obligation));
       if asked.len() == 0 {
         {
-          settled: runs.map(|_i: Int| not_attempted()),
-          reaches: if reach { Some(wanted.map(|_i: Int| None)) } else { None },
+          resolved: runs.map(|_i: Int| not_attempted()),
+          static_prover_results: if static_prover { Some(wanted.map(|_i: Int| None)) }
+          else { None },
         }
       } else {
         let p: Prover = prover_of(
@@ -218,11 +222,11 @@ pub fn static_prover_of(
           world,
           budget,
         );
-        if !reach {
+        if !static_prover {
           {
-            settled: runs.map(|i: Int|
+            resolved: runs.map(|i: Int|
               match obligation(i) { Some(o) -> static_result(p, o), None -> not_attempted() }),
-            reaches: None,
+            static_prover_results: None,
           }
         } else {
           let found = wanted.map(|i: Int|
@@ -236,16 +240,19 @@ pub fn static_prover_of(
               },
           );
           {
-            settled: runs.map(|i: Int|
+            resolved: runs.map(|i: Int|
               match obligation(i) {
                 Some(o) ->
                   static_result_for(o, match by_index.get(i) { Some(d) -> d, None -> None }),
                 None -> not_attempted(),
               }),
-            reaches: Some(
+            static_prover_results: Some(
               found.map(|f: Option<{ o: Obligation, d: Option<Diagnosis> }>|
                 match f {
-                  Some(x) -> match x.d { Some(d) -> Some(reach_of(d)), None -> None },
+                  Some(x) -> match x.d {
+                    Some(d) -> Some(static_prover_result_of(d)),
+                    None -> None,
+                  },
                   None -> None,
                 }),
             ),
@@ -255,16 +262,16 @@ pub fn static_prover_of(
     },
   }
 
-pub fn no_static_prover(reach: Option<Reach>) -> StaticProver =
+pub fn no_static_prover(static_prover: Option<StaticProverResult>) -> StaticProver =
   {
     result: |wanted: List<Int>, runs: List<Int>, asked: Bool, budget: Int|
       {
-        settled: runs.map(|_i: Int| not_attempted()),
-        reaches: if asked { Some(wanted.map(|_i: Int| reach)) } else { None },
+        resolved: runs.map(|_i: Int| not_attempted()),
+        static_prover_results: if asked { Some(wanted.map(|_i: Int| static_prover)) } else { None },
       },
   }
 
-fn reach_of(d: Diagnosis) -> Reach =
+fn static_prover_result_of(d: Diagnosis) -> StaticProverResult =
   {
     decision: decision_word(d.decision),
     steps: steps_of(d.decision),
@@ -276,7 +283,7 @@ fn reach_of(d: Diagnosis) -> Reach =
 
 pub type Verdicts = {
   outcomes: List<Outcome>,
-  reaches: Option<List<Option<Reach>>>,
+  static_prover_results: Option<List<Option<StaticProverResult>>>,
   reasons: List<CacheStatus>,
   coverage: Coverage,
   cached: Int,
@@ -287,7 +294,12 @@ pub type Verdicts = {
 
 pub type AcceptResult = { definitions: Int, stored: Bool, warnings: List<Diagnostic> }
 
-pub type Row = { claim: Claim, outcome: Outcome, reason: CacheStatus, reach: Option<Reach> }
+pub type Row = {
+  claim: Claim,
+  outcome: Outcome,
+  reason: CacheStatus,
+  static_prover: Option<StaticProverResult>,
+}
 
 pub fn seconds(ms: Decimal) -> String / {abort.raise} = ms.div(1000m, 2, HalfUp).to_string()
 
@@ -365,7 +377,7 @@ pub fn quantifier(claim: Claim, bindings: List<Binding>) -> String =
 pub fn detail_of(row: Row, places: List<SourceText>) -> String / {abort.raise} =
   match row.outcome {
     Proved(c) -> certificate_summary(c),
-    Unproved(gap) -> gap_summary(gap),
+    Unproved(reason) -> reason_summary(reason),
     Vacuous(_) -> vacuity_summary(),
     Refuted(_) -> match location_text(places, row.claim.at) { Some(at) -> at, None -> "" },
     InternalError(f) -> fault_summary(f),
@@ -413,7 +425,7 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, verdicts: Verdicts) -> Li
             claim: c,
             outcome: o,
             reason: match verdicts.reasons.at(i) { Some(r) -> r, None -> Fresh },
-            reach: match verdicts.reaches {
+            static_prover: match verdicts.static_prover_results {
               Some(reached) -> match reached.at(i) { Some(r) -> r, None -> None },
               None -> None,
             },
@@ -424,7 +436,7 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, verdicts: Verdicts) -> Li
 pub fn laws_in(collection: Collection) -> Laws =
   laws_of(collection.definitions.map(|definition: Definition| definition.name), collection.laws)
 
-fn refusal_warning(text: String) -> Diagnostic = {
+fn rejection_warning(text: String) -> Diagnostic = {
   let d: Diagnostic = error_with_labels(b"W0602", Bytes::of_string(text), [], [
     b"the obligation was discharged again, so no claim rests on it",
     b"run `ply cache clear` if it happens again",
@@ -463,9 +475,9 @@ pub fn decide_claims<| e>(
   wanted: List<Int>,
   use_cache: Bool,
   statics: StaticProver,
-  reach: Bool,
-  discharge: (List<Int>, List<StaticResult>) -> Result<DischargeResult, Refusal> / {discharging.decided | e},
-) -> Result<Verdicts, Refusal> / {abort.raise, proof_store.cached, proof_store.record, decisions.known | e} = {
+  static_prover: Bool,
+  discharge: (List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
+) -> Result<Verdicts, Rejection> / {abort.raise, proof_store.cached, proof_store.record, decisions.known | e} = {
   let asked = wanted.map(|i: Int| claim_at(collection.claims, i));
   let keys = asked.map(|claim: Claim|
     {
@@ -473,20 +485,20 @@ pub fn decide_claims<| e>(
       ran: run_key(Bytes::of_hex(claim.run_key)).hex_of(),
     });
   let held = keys.map(|k: { bare: String, ran: String }| proof_store.cached([k.bare, k.ran]));
-  let answers = range(0, keys.len()).map(|i: Int| {
+  let results = range(0, keys.len()).map(|i: Int| {
     let k = keys_at(keys, i);
     let h = match held.at(i) { Some(texts) -> texts, None -> [] };
     verdict_of(k.bare, k.ran, evidence_kind(cached_at(h, 0)), evidence_kind(cached_at(h, 1)))
   });
-  let selection = select(answers, use_cache);
+  let selection = select(results, use_cache);
   let runs = selection.to_discharge.map(|at: Int| match wanted.at(at) { Some(i) -> i, None -> -1 });
-  let static_answers = (statics.result)(wanted, runs, reach, collection.plan.prove_budget);
+  let static_results = (statics.result)(wanted, runs, static_prover, collection.plan.prove_budget);
   let row_at = |at: Int, outcome: Outcome|
     {
       claim: claim_at(asked, at),
       outcome: outcome,
       reason: match selection.reasons.at(at) { Some(r) -> r, None -> Fresh },
-      reach: match static_answers.reaches {
+      static_prover: match static_results.static_prover_results {
         Some(reached) -> match reached.at(at) { Some(r) -> r, None -> None },
         None -> None,
       },
@@ -510,28 +522,28 @@ pub fn decide_claims<| e>(
   let place_of = range(0, runs.len()).fold(Map::new(), |acc: Map<Int, Int>, k: Int|
     acc.insert(runs.at_or(k, -1), selection.to_discharge.at_or(k, -1)));
   let ran = handle {
-    discharge(runs, static_answers.settled)
+    discharge(runs, static_results.resolved)
   } with {
     discharging.decided(claim, outcome) ->
       decisions.known(row_at(place_of.get_or(claim, -1), outcome)),
   };
   match ran {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(d) -> {
       let all = merge_outcomes(asked, kept, selection.to_discharge, d.outcomes);
       range(d.outcomes.len(), selection.to_discharge.len()).fold((), |_: Unit, k: Int| {
         let at = selection.to_discharge.at_or(k, -1);
         decisions.known(row_at(at, all.at_or(at, missing_outcome(claim_at(asked, at)))))
       });
-      let filed = cache_writes(
+      let recorded = cache_writes(
         keys,
         all.map(|o: Outcome| match o { Proved(c) -> Some(c.ran), _ -> None }),
         selection.to_discharge,
         use_cache,
       );
-      let stored = if filed.len() == 0 { [] } else {
+      let stored = if recorded.len() == 0 { [] } else {
         proof_store.record(
-          filed.fold(
+          recorded.fold(
             [],
             |acc: List<{ key: String, evidence: Bytes }>, f: { at: Int, key: String }|
               match all.at(f.at) {
@@ -543,7 +555,7 @@ pub fn decide_claims<| e>(
       };
       Ok({
         outcomes: all,
-        reaches: static_answers.reaches,
+        static_prover_results: static_results.static_prover_results,
         reasons: selection.reasons,
         coverage: coverage(
           collection.definitions.map(|definition: Definition| definition.name),
@@ -553,7 +565,7 @@ pub fn decide_claims<| e>(
         cached: hits(selection),
         specified: carried_by(collection),
         duration_ms: d.duration_ms,
-        warnings: selection.warnings.map(refusal_warning).concat(d.warnings).concat(stored),
+        warnings: selection.warnings.map(rejection_warning).concat(d.warnings).concat(stored),
       })
     },
   }
@@ -595,7 +607,7 @@ fn missing_outcome(claim: Claim) -> Outcome =
     code: "E0505",
     message: "no evidence was read back or made for `" ++ claim.owner ++ "`",
     notes: [
-      "the program chose what the cache answered from the store this run reads; this is Ply's fault",
+      "the program chose what the cache returned from the store this run reads; this is Ply's fault",
     ],
     values: [],
     bindings: [],
@@ -613,18 +625,18 @@ pub fn discharge_on_unit(
   front: LoadedAnalysis,
   collection: Collection,
   runs: List<Int>,
-  settled: List<StaticResult>,
-) -> Result<DischargeResult, Refusal> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.compiled, discharging.decided, abort.raise} =
+  resolved: List<StaticResult>,
+) -> Result<DischargeResult, Rejection> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.compiled, discharging.decided, abort.raise} =
   if runs.len() == 0 { Ok({ outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] }) } else {
     let broken = |diagnostics: List<Diagnostic>|
       Err(NotCompiled({ diagnostics: diagnostics, places: collection.places }));
     match units::whole_library(front, cc::development()) {
       Err(diagnostics) -> broken(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
-        Err(why) -> broken([machine::unit_load_error(why)]),
+        Err(reason) -> broken([machine::unit_load_error(reason)]),
         Ok(o) -> {
           let p = proof_context_of(o.unit, front, collection);
-          let d = discharge_runs(collection, p, runs, settled);
+          let d = discharge_runs(collection, p, runs, resolved);
           entering::machine.close(o.unit);
           Ok(d)
         },
@@ -636,13 +648,13 @@ pub fn discharge_runs(
   collection: Collection,
   p: ProofContext,
   runs: List<Int>,
-  settled: List<StaticResult>,
+  resolved: List<StaticResult>,
 ) -> DischargeResult / {entering::machine.enter, time.elapsed_ms, discharging.decided, abort.raise} = {
   let started = time.elapsed_ms();
   let asked = range(0, runs.len()).fold([], |acc: List<ClaimToDischarge>, k: Int|
-    match ((runs.at(k), settled.at(k))) {
+    match ((runs.at(k), resolved.at(k))) {
       (Some(i), Some(s)) -> match collection.world.obligations.at(i) {
-        Some(o) -> acc.push({ claim: i, obligation: o, settled: s }),
+        Some(o) -> acc.push({ claim: i, obligation: o, resolved: s }),
         None -> acc,
       },
       _ -> acc,
@@ -854,8 +866,8 @@ fn proposition_holds(
     },
   }
 
-fn as_boolean(answer: Result<Value, Judgement>) -> Result<Bool, Judgement> =
-  match answer {
+fn as_boolean(result: Result<Value, Judgement>) -> Result<Bool, Judgement> =
+  match result {
     Ok(VBool(b)) -> Ok(b),
     Ok(other) ->
       Err(
@@ -891,7 +903,7 @@ fn result_of_entry(
   match ended {
     entering::Returned(bytes) -> match value::decode(bytes) {
       Some(v) -> Ok(v),
-      None -> Err(ply_fault("`" ++ root ++ "` answered bytes that are no value")),
+      None -> Err(ply_fault("`" ++ root ++ "` returned bytes that are no value")),
     },
     entering::Failed(f) -> if machine::is_internal_error(Bytes::of_string(f.code)) {
       Err(
@@ -905,7 +917,8 @@ fn result_of_entry(
     } else { Err(PointRaised({ message: f.message, values: f.values.map(entering::value_of) })) },
     entering::Panicked(message) -> Err(ply_fault("`" ++ root ++ "` panicked: " ++ message)),
     entering::NoRoot -> Err(ply_fault("the unit is entered at no `" ++ root ++ "`")),
-    entering::UnencodableResult(why) -> Err(ply_fault("`" ++ root ++ "` answered, and " ++ why)),
+    entering::UnencodableResult(reason) ->
+      Err(ply_fault("`" ++ root ++ "` returned, and " ++ reason)),
   }
 
 fn ply_fault(message: String) -> Judgement =
@@ -1101,9 +1114,9 @@ fn counterexample_json(context: Counterexample) -> Json =
     { key: "seed", value: match context.seed { Some(text) -> Str(text), None -> Null } },
   ])
 
-fn stuck_json(stuck: List<Stuck>) -> Json =
+fn stopped_json(stopped: List<Stopped>) -> Json =
   Array(
-    stuck.map(|s: Stuck|
+    stopped.map(|s: Stopped|
       object([
         { key: "kind", value: Str(s.kind) },
         { key: "about", value: match s.about { Some(a) -> Str(a), None -> Null } },
@@ -1115,15 +1128,15 @@ fn outcome_members(outcome: Outcome) -> List<Member> / {abort.raise} =
     Proved(c) -> [{ key: "certificate", value: certificate_json(c) }],
     Refuted(context) -> [{ key: "counterexample", value: counterexample_json(context) }],
     Vacuous(_) -> [{ key: "vacuity", value: Str(vacuity_summary()) }],
-    Unproved(gap) ->
+    Unproved(reason) ->
       [
-        { key: "reason", value: Str(gap_summary(gap)) },
-        { key: "reason_kind", value: Str(gap_word(gap)) },
-      ].concat(match gap {
+        { key: "reason", value: Str(reason_summary(reason)) },
+        { key: "reason_kind", value: Str(reason_word(reason)) },
+      ].concat(match reason {
         Raised(r) ->
           [{ key: "values", value: values_json(r.values) }].concat(if r.bindings.len() == 0 { [] }
           else { [{ key: "raised_at", value: bindings_json(r.bindings) }] }),
-        Open(o) -> [{ key: "stopped_at", value: stuck_json(o.stuck) }],
+        Open(o) -> [{ key: "stopped_at", value: stopped_json(o.stopped) }],
         _ -> [],
       }),
     InternalError(f) -> [{ key: "internal_error", value: fault_json(f) }],
@@ -1164,7 +1177,7 @@ pub fn obligation_json(row: Row, places: List<SourceText>, reached: Bool) -> Jso
         value: match location_text(places, row.claim.at) { Some(at) -> Str(at), None -> Null },
       },
       { key: "outcome", value: Str(outcome_word(row.outcome)) },
-    ].concat(if reached { [{ key: "static_prover", value: reach_json(row.reach) }] }
+    ].concat(if reached { [{ key: "static_prover", value: static_prover_json(row.static_prover) }] }
     else { [] }).concat(
       kind_members(row.claim),
     ).concat(
@@ -1172,17 +1185,17 @@ pub fn obligation_json(row: Row, places: List<SourceText>, reached: Bool) -> Jso
     ),
   )
 
-fn reach_json(v: Option<Reach>) -> Json =
+fn static_prover_json(v: Option<StaticProverResult>) -> Json =
   match v {
     None -> Null,
-    Some(reach) ->
+    Some(static_prover) ->
       object([
-        { key: "decision", value: Str(reach.decision) },
-        { key: "steps", value: int(reach.steps) },
+        { key: "decision", value: Str(static_prover.decision) },
+        { key: "steps", value: int(static_prover.steps) },
         {
           key: "blockers",
           value: Array(
-            reach.blockers.map(|b: { kind: String, about: Option<String> }|
+            static_prover.blockers.map(|b: { kind: String, about: Option<String> }|
               object([
                 { key: "kind", value: Str(b.kind) },
                 { key: "about", value: match b.about { Some(a) -> Str(a), None -> Null } },
@@ -1244,18 +1257,18 @@ fn vacuity(row: Row, guard: ModuleSpan) -> Diagnostic =
     ],
   )
 
-fn unproved(row: Row, gap: Gap) -> Diagnostic / {abort.raise} =
+fn unproved(row: Row, reason: Reason) -> Diagnostic / {abort.raise} =
   error_at(
     b"E0474",
     row.claim.at.module,
     span_of(row.claim.at),
-    Bytes::of_string(label_of(row.claim) ++ " is not proved: " ++ gap_summary(gap)),
+    Bytes::of_string(label_of(row.claim) ++ " is not proved: " ++ reason_summary(reason)),
     b"nothing proves this claim",
     List::concat(
-      match gap {
+      match reason {
         Raised(raise) -> if raise.bindings.len() == 0 { [] }
         else { [Bytes::of_string("it raises at " ++ bindings_text(raise.bindings))] },
-        Open(o) -> o.stuck.map(|s: Stuck| Bytes::of_string(stuck_summary(s))),
+        Open(o) -> o.stopped.map(|s: Stopped| Bytes::of_string(stopped_summary(s))),
         _ -> [],
       },
       [
@@ -1283,17 +1296,17 @@ pub fn diagnostics_of(rows: List<Row>) -> List<Diagnostic> / {abort.raise} =
       Proved(_) -> acc,
       Refuted(context) -> acc.push(refutation(row, context)),
       Vacuous(v) -> acc.push(vacuity(row, v.guard)),
-      Unproved(gap) -> acc.push(unproved(row, gap)),
+      Unproved(reason) -> acc.push(unproved(row, reason)),
       InternalError(f) -> acc.push(internal_error(row, f)),
     })
 
 pub fn failure_output(
   style: Style,
   command: String,
-  why: Refusal,
+  reason: Rejection,
 ) -> CommandOutput / {abort.raise} =
-  match why {
-    NotCompiled(r) -> refused(style, command, r.diagnostics, r.places),
+  match reason {
+    NotCompiled(r) -> rejected(style, command, r.diagnostics, r.places),
     CacheUnavailable(r) -> reported(style, command, r.diagnostics, r.places),
   }
 
@@ -1392,12 +1405,12 @@ test "a rule with fields of its own is read from the tag the prover wrote it und
 }
 
 test "a gap says what stands between the claim and a proof, and a vacuity what the guard admits" {
-  assert_eq(gap_summary(UnhandledEffect(None)), "no handler for what it performs");
+  assert_eq(reason_summary(UnhandledEffect(None)), "no handler for what it performs");
   assert_eq(
-    gap_summary(UnhandledEffect(Some("{db.read[rows]}"))),
+    reason_summary(UnhandledEffect(Some("{db.read[rows]}"))),
     "performs {db.read[rows]}: no handler",
   );
-  assert_eq(gap_summary(Open({ spent: false, stuck: [] })), "no proof");
+  assert_eq(reason_summary(Open({ spent: false, stopped: [] })), "no proof");
   assert_eq(vacuity_summary(), "the guard admits no value")
 }
 
@@ -1406,7 +1419,7 @@ test "a row is the outcome, the claim and what it rests on, in fixed columns" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved([Congruence], 2),
     reason: Fresh,
-    reach: None,
+    static_prover: None,
   };
   assert_eq(
     row_head(plain(), r, [a_place()]),
@@ -1419,7 +1432,7 @@ test "a refuted claim is E0419 over the claim, and one nothing proved is E0474 o
     claim: a_claim("m.short", Law(Some("a batch is small"))),
     outcome: Refuted(a_counter()),
     reason: Fresh,
-    reach: None,
+    static_prover: None,
   };
   let ds = diagnostics_of([refuted]);
   assert_eq(ds.len(), 1);
@@ -1435,19 +1448,19 @@ test "a refuted claim is E0419 over the claim, and one nothing proved is E0474 o
     b"forall (xs: List<Int>)",
     b"replay with `--seed 7:0.1`",
   ]);
-  let gap: Row = {
+  let reason: Row = {
     claim: a_claim("m.stored", Ensures(0)),
     outcome: Unproved(UnhandledEffect(Some("{db.read[rows]}"))),
     reason: Fresh,
-    reach: None,
+    static_prover: None,
   };
-  let e: Diagnostic = match diagnostics_of([gap]) { [x] -> x, _ -> panic("one diagnostic") };
+  let e: Diagnostic = match diagnostics_of([reason]) { [x] -> x, _ -> panic("one diagnostic") };
   assert_eq(e.code, b"E0474");
   assert_eq(e.severity, b"error");
   assert_eq(e.message, b"m.stored ensures #0 is not proved: performs {db.read[rows]}: no handler");
-  assert_eq(exit_code_of([gap]), failure_code());
+  assert_eq(exit_code_of([reason]), failure_code());
   assert(
-    row_head(plain(), gap, [a_place()]).starts_with("   ✗ unproved       m.stored ensures #0"),
+    row_head(plain(), reason, [a_place()]).starts_with("   ✗ unproved       m.stored ensures #0"),
   )
 }
 
@@ -1457,14 +1470,14 @@ test "an unproved claim says where the prover stopped, and a cost bound is named
     outcome: Unproved(
       Open({
         spent: false,
-        stuck: [
+        stopped: [
           { kind: "lambda", about: None },
           { kind: "unbounded", about: Some("its steps outgrow the bound") },
         ],
       }),
     ),
     reason: Fresh,
-    reach: None,
+    static_prover: None,
   };
   let d: Diagnostic = match diagnostics_of([open]) { [x] -> x, _ -> panic("one diagnostic") };
   assert_eq(d.code, b"E0474");
@@ -1496,7 +1509,7 @@ test "Ply's failure is its own error over the claim, never the program's gap" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: InternalError(a_fault()),
     reason: Fresh,
-    reach: None,
+    static_prover: None,
   };
   let d: Diagnostic = match diagnostics_of([r]) { [x] -> x, _ -> panic("one diagnostic") };
   assert_eq(d.code, b"E0505");
@@ -1527,10 +1540,11 @@ test "a claim a run raised on carries in its document each value the raise names
     claim: a_claim("m.one", Ensures(0)),
     outcome: Unproved(Raised({ message: "raised", values: [VInt(3)], bindings: [] })),
     reason: Fresh,
-    reach: None,
+    static_prover: None,
   };
-  let defect = { ..raised, outcome: InternalError({ ..a_fault(), values: [VInt(4)] }) };
-  let texts = [raised, defect].map(|r: Row| to_string(obligation_json(r, [a_place()], false)));
+  let internal_error = { ..raised, outcome: InternalError({ ..a_fault(), values: [VInt(4)] }) };
+  let texts = [raised, internal_error].map(|r: Row|
+    to_string(obligation_json(r, [a_place()], false)));
   assert(texts.at_or(0, "").contains("\"values\":[\"3\"]"));
   assert(texts.at_or(1, "").contains("\"values\":[\"4\"]"))
 }
@@ -1553,7 +1567,7 @@ test "a claim that holds raises nothing at all" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved([], 1),
     reason: FromProof,
-    reach: None,
+    static_prover: None,
   };
   assert_eq(diagnostics_of([held]).len(), 0)
 }

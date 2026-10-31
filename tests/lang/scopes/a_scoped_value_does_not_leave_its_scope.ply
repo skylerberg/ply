@@ -1,0 +1,162 @@
+//! What the checker rejects of a scoped value: every way out of its scope, another scope's name,
+//! and every use of it as data.
+
+import compiler.check.infer (check_dump)
+
+fn head() -> String =
+  \\effect box { write put<a>(x: a) -> Unit }
+  \\fn peek<[r]>(h: Scoped<Int, [r]>) -> Int / {scoped.read[r]} = h.get()
+  \\fn free(x: Int) -> Unit = ()
+  \\
+
+fn checked(body: Bytes) -> String / {abort.raise} =
+  check_dump([{ name: b"m", src: Bytes::of_string(head()).concat(body) }])
+
+fn accepted(body: Bytes) -> Bool / {abort.raise} = !checked(body).starts_with("K;1;X;")
+
+fn rejected(body: Bytes, code: String) -> Bool / {abort.raise} =
+  !accepted(body) && checked(body).contains("!" ++ code ++ ":")
+
+test "a scoped value is read inside its scope, by the body and by what the body hands it to" {
+  assert(accepted(b""));
+  assert(accepted(b"fn f() -> Int = with_scope[r](1, free) { h -> h.get() + peek(h) }"));
+  assert(
+    accepted(
+      b"fn f() -> List<Int> = with_scope[r](1, free) { h -> [1, 2].map(|n: Int| n + peek(h)) }",
+    ),
+  )
+}
+
+test "a scoped value, or a closure that reads one, is rejected where it would leave the scope" {
+  assert(rejected(b"fn f() -> Int = { let k = with_scope[r](1, free) { h -> h }; 0 }", "E0446"));
+  assert(rejected(b"fn f() -> Int = { let k = with_scope[r](1, free) { h -> [h] }; 0 }", "E0446"));
+  assert(
+    rejected(b"fn f() -> Int = { let k = with_scope[r](1, free) { h -> || h.get() }; 0 }", "E0446"),
+  );
+  assert(
+    rejected(b"fn f() -> Int = { let k = with_scope[r](1, free) { h -> || peek(h) }; 0 }", "E0446"),
+  )
+}
+
+test "a scoped value is rejected in an operation and in an older scheduler's task" {
+  assert(
+    rejected(b"fn f() -> Unit / {box.put} = with_scope[r](1, free) { h -> box.put(h) }", "E0446"),
+  );
+  assert(
+    rejected(
+      b"fn f() -> Unit / {box.put} = with_scope[r](1, free) { h -> box.put(|| h.get()) }",
+      "E0446",
+    ),
+  );
+  assert(
+    rejected(
+      b"fn f() -> Int / {task.spawn} = with_scope[r](1, free) { h -> { let t = task.spawn(|| h.get()); 0 } }",
+      "E0446",
+    ),
+  )
+}
+
+test "reading a scoped value is in the effects of whatever does it, and only a scope handles it" {
+  assert(rejected(b"fn f<[r]>(h: Scoped<Int, [r]>) -> Int = h.get()", "E0302"));
+  assert(rejected(b"fn f<[r]>(h: Scoped<Int, [r]>) -> () -> Int = || h.get()", "E0302"));
+  assert(rejected(b"fn f<[r]>() -> Unit / {scoped.read[r]} = scoped.read()", "E0103"));
+  assert(rejected(b"effect scoped { read get() -> Int }", "E0105"))
+}
+
+test "a scoped value's scope has a name of its own" {
+  assert(
+    rejected(
+      b"fn f() -> Int = with_scope[r](1, free) { a -> with_scope[r](2, free) { b -> 0 } }",
+      "E0330",
+    ),
+  );
+  assert(
+    accepted(
+      b"fn f() -> Int = with_scope[r](1, free) { a -> with_scope[s](2, free) { b -> a.get() + b.get() } }",
+    ),
+  )
+}
+
+test "a declaration is outside every scope, so none mentions a scoped value" {
+  assert(rejected(b"type Kept<[r]> = Kept(Scoped<Int, [r]>)", "E0446"));
+  assert(rejected(b"type Kept<[r]> = new { held: Scoped<Int, [r]> }", "E0446"));
+  assert(rejected(b"effect io { write send[r](h: Scoped<Int, [r]>) -> Unit }", "E0446"));
+  assert(rejected(b"type Reader<[r]> = Reader(() -> Int / {scoped.read[r]})", "E0446"));
+  assert(
+    accepted(
+      b"type Kept<t> = Kept(t)\nfn f() -> Int = with_scope[r](1, free) { h -> match Kept(h) { Kept(x) -> x.get() } }",
+    ),
+  )
+}
+
+test "a function a scoped value holds may perform less than the type the scoped value meets says" {
+  let shared = |callback: Bytes|
+    Bytes::concat_all([
+      b"effect a { write x() -> Unit }\neffect b { write y() -> Unit }\n",
+      b"fn both<[r] | e>(h: Scoped<() -> Unit / e, [r]>, g: () -> Unit / e) -> Unit / {scoped.read[r] | e} = { h.get()(); g() }\n",
+      b"fn f() -> Unit / {a.x} = with_scope[r](|| a.x(), |k: () -> Unit / {a.x}| ()) { h -> both(h, ",
+      callback,
+      b") }",
+    ]);
+  assert(accepted(shared(b"|| a.x()")));
+  // The scoped value's function and the callback share one effect list, which `f` did not write.
+  assert(rejected(shared(b"|| b.y()"), "E0302"))
+}
+
+test "a lazy sequence whose steps read a scoped value is built and pulled inside the scope, and rejected leaving it" {
+  let stepped = |body: Bytes|
+    Bytes::concat_all([
+      b"type Step<a | e> = | Done | Yield(a, () -> Step<a | e> / e)\n",
+      b"fn ended<a | e>() -> () -> Step<a | e> / e = || Done\n",
+      b"fn pulls<[r]>(h: Scoped<Int, [r]>) -> () -> Step<Int | {scoped.read[r]}> / {scoped.read[r]} = || Yield(h.get(), ended())\n",
+      body,
+    ]);
+  assert(
+    accepted(
+      stepped(
+        b"fn f() -> Int = with_scope[r](1, free) { h -> match pulls(h)() { Yield(x, _) -> x, Done -> 0 } }",
+      ),
+    ),
+  );
+  assert(
+    rejected(
+      stepped(b"fn f() -> Int = { let s = with_scope[r](1, free) { h -> pulls(h) }; 0 }"),
+      "E0446",
+    ),
+  );
+  // A step it returned holds the rest of the sequence, and says so in the effects it is given.
+  assert(
+    rejected(
+      stepped(b"fn f() -> Int = { let s = with_scope[r](1, free) { h -> pulls(h)() }; 0 }"),
+      "E0446",
+    ),
+  )
+}
+
+test "a scoped value is not data: it is not compared, ordered, hashed or derived over" {
+  assert(
+    rejected(b"fn f<[r], [s]>(a: Scoped<Int, [r]>, b: Scoped<Int, [s]>) -> Bool = a == b", "E0201"),
+  );
+  assert(
+    rejected(
+      b"fn f<[r], [s]>(a: Scoped<Int, [r]>, b: Scoped<Int, [s]>) -> Bool = [a] != [b]",
+      "E0201",
+    ),
+  );
+  assert(
+    rejected(b"fn f<[r], [s]>(a: Scoped<Int, [r]>, b: Scoped<Int, [s]>) -> Bool = a < b", "E0201"),
+  );
+  assert(
+    rejected(
+      b"fn f<[r], [s]>(a: Scoped<Int, [r]>, b: Scoped<Int, [s]>) -> Ordering = compare(a, b)",
+      "E0206",
+    ),
+  );
+  assert(rejected(b"fn f<[r]>(a: Scoped<Int, [r]>) -> Bytes = digest(a)", "E0206"));
+  assert(
+    rejected(
+      b"fn f<[r]>(a: Scoped<Int, [r]>) -> Map<Scoped<Int, [r]>, Int> = Map::new().insert(a, 1)",
+      "E0206",
+    ),
+  )
+}

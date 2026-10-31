@@ -7,7 +7,7 @@
 use super::{Determinism, Nondeterministic, asked, from_host, text_at, texts_at};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use ply_core::{Diagnostic, codes};
 use ply_host::jobs::Work;
 use ply_host::native::{int, parts_of};
@@ -80,29 +80,29 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// What `answer` answers of the run's process host, where the native may ask the host for an
-/// answer of `determinism`; `refused`, with the run failed, where the run was lent no process host, or
-/// `answer` refuses. `op` and `reach` name what a refusal names.
+/// What `result` returns of the run's process host, where the native may ask the host for a
+/// response of `determinism`; `rejected`, with the run failed, where the run was granted no
+/// process host, or `result` fails. `op` and `reach` name what a rejection names.
 fn hosted<R: Copy>(
     ctx: *mut Ctx,
     native: &'static str,
     op: &'static str,
     determinism: Determinism,
     reach: Reach,
-    refused: R,
-    answer: impl FnOnce(&mut Ctx, &ProcessHost) -> Result<R, Diagnostic>,
+    rejected: R,
+    result: impl FnOnce(&mut Ctx, &ProcessHost) -> Result<R, Diagnostic>,
 ) -> R {
-    asked(ctx, native, determinism, refused, |c| {
+    asked(ctx, native, determinism, rejected, |c| {
         let Some(found) = from_host(c, |facilities| facilities.process().cloned()) else {
-            return refused;
+            return rejected;
         };
-        let answered = match found {
-            Some(host) => answer(c, &host),
+        let returned = match found {
+            Some(host) => result(c, &host),
             None => Err(withheld(op, reach, c.site())),
         };
-        answered.unwrap_or_else(|d| {
+        returned.unwrap_or_else(|d| {
             c.fail(d);
-            refused
+            rejected
         })
     })
 }
@@ -116,7 +116,7 @@ fn stream_of(number: I64) -> Stream {
     }
 }
 
-/// The environment lent as parts at `p`, each variable's name then its value, and, where the run
+/// The environment borrowed as parts at `p`, each variable's name and value, and, where the run
 /// asking is observed, where a `ply` the child is reports what it read.
 fn environment_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<(String, String)>> {
     let texts = texts_at(c, p, n)?;
@@ -205,7 +205,7 @@ pub unsafe extern "C" fn rt_process_write(ctx: *mut Ctx, stream: I64, p: Addr, n
         Reach::Own,
         I64(0),
         |c, host| {
-            let bytes = unsafe { lent(p, n) };
+            let bytes = unsafe { borrowed(p, n) };
             Ok(I64(i64::from(host.write(
                 stream_of(stream),
                 bytes,
@@ -324,7 +324,7 @@ pub unsafe extern "C" fn rt_process_spawn(
     )
 }
 
-/// How a child is wired, lent as parts: three bytes, 1 where it reads input and each output
+/// How a child is wired, borrowed as parts: three bytes, 1 where it reads input and each output
 /// stream's number (`Keep` 0, `Discard` 1, `Inherit` 2, `Lines` 3 and `File` 4), then the path
 /// of each stream that is a file.
 fn wiring_of(wiring: &[u8]) -> Option<Io> {
@@ -376,13 +376,13 @@ pub unsafe extern "C" fn rt_process_start(
             ) else {
                 return Ok(TakenBytes(0));
             };
-            let wiring = wiring_of(unsafe { lent(wp, wn) });
+            let wiring = wiring_of(unsafe { borrowed(wp, wn) });
             let Some(io) = super::handed(c, "process_start", "a wiring", wiring) else {
                 return Ok(TakenBytes(0));
             };
             let said = match host.start(&label, &args, &dir, &env, &io, c.site())? {
                 Ok(handle) => [&[1u8][..], &int(handle)].concat(),
-                Err(why) => [&[0u8][..], why.as_bytes()].concat(),
+                Err(reason) => [&[0u8][..], reason.as_bytes()].concat(),
             };
             if let Some(recorder) = observe::of(&*c.host_runtime()) {
                 for output in [&io.out, &io.err] {
@@ -476,7 +476,7 @@ pub unsafe extern "C" fn rt_process_input(
             let Some(label) = text_at(c, lp, ln) else {
                 return Ok(I64(0));
             };
-            let bytes = unsafe { lent(p, n) }.to_vec();
+            let bytes = unsafe { borrowed(p, n) }.to_vec();
             let job = host.input(&label, child.0, bytes, c.site())?;
             Ok(c.submitted("process_input", "`process.input`", Work::Waiting, job))
         },

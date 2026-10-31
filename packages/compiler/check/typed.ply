@@ -1,6 +1,6 @@
 import compiler.syntax.parsing (Span, span_bin)
 import compiler.syntax.patterns (SourceLiteral, source_literal_bin)
-import compiler.check.types (Type, Row, Atom, row_bin, atom_bin)
+import compiler.check.types (Type, Effects, Effect, effects_bin, effect_bin)
 import std.bin
 import std.derive.children
 import std.list
@@ -17,7 +17,7 @@ pub type TypedNode<t> =
   | TypedRead(Reading<t>)
   | TypedUnary({ op: Bytes, operand: TypedExpression<t>, witness: Option<Bytes> })
   | TypedBinary({ op: Bytes, lhs: TypedExpression<t>, rhs: TypedExpression<t>, witness: Option<Bytes> })
-  | TypedCall({ callee: TypedExpression<t>, args: List<TypedExpression<t>>, row: Row })
+  | TypedCall({ callee: TypedExpression<t>, args: List<TypedExpression<t>>, effects: Effects })
   | TypedIf({ cond: TypedExpression<t>, then_branch: TypedExpression<t>, else_branch: TypedExpression<t> })
   | TypedMatch({ scrutinee: TypedExpression<t>, arms: List<TypedArm<t>> })
   | TypedBlock({ statements: List<TypedStatement<t>>, tail: Option<TypedExpression<t>> })
@@ -25,17 +25,17 @@ pub type TypedNode<t> =
   | TypedRecord(List<TypedField<t>>)
   | TypedUpdate({ base: TypedExpression<t>, sets: List<TypedField<t>>, copies: List<Bytes> })
   | TypedFieldRead({ base: TypedExpression<t>, field: Bytes })
-  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<TypedExpression<t>> })
-  | TypedLambda({ params: List<TypedParam<t>>, body: TypedExpression<t>, row: Row })
+  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, entry: Effect, args: List<TypedExpression<t>> })
+  | TypedLambda({ params: List<TypedParam<t>>, body: TypedExpression<t>, effects: Effects })
   | TypedSimulate(TypedThunk<t>)
   | TypedParallel(List<TypedThunk<t>>)
-  | TypedHandle({ body: TypedExpression<t>, row: Row, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
+  | TypedHandle({ body: TypedExpression<t>, effects: Effects, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
 
 pub type Reading<t> =
   | ReadLocal(Bytes)
-  | ReadDefinition({ full: Bytes, args: List<t>, rows: List<Row>, labels: List<FilledLabel>, witnesses: List<NumericWitness> })
+  | ReadDefinition({ full: Bytes, args: List<t>, effect_arguments: List<Effects>, labels: List<FilledLabel>, witnesses: List<NumericWitness> })
   | ReadConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<t> })
-  | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row>, witnesses: List<NumericWitness> })
+  | ReadBuiltin({ name: Bytes, args: List<t>, effect_arguments: List<Effects>, witnesses: List<NumericWitness> })
 
 pub type FilledLabel = | LabelNamed(Bytes) | LabelParam(Int)
 
@@ -45,7 +45,7 @@ pub fn witness_param(param: Bytes) -> Bytes = b"?w_".concat(param)
 
 pub type TypedParam<t> = { name: Bytes, ty: t, span: Span }
 
-pub type TypedThunk<t> = { body: TypedExpression<t>, row: Row }
+pub type TypedThunk<t> = { body: TypedExpression<t>, effects: Effects }
 
 pub type TypedField<t> = { name: Bytes, value: TypedExpression<t> }
 
@@ -116,12 +116,17 @@ pub type TypedClause<t> = {
   label: Option<TypedParam<t>>,
   resume: Option<TypedParam<t>>,
   body: TypedExpression<t>,
-  row: Row,
-  resumed: Row,
+  effects: Effects,
+  resumed: Effects,
   span: Span,
 }
 
-pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpression<t>, row: Row, span: Span }
+pub type TypedReturn<t> = {
+  binder: TypedParam<t>,
+  body: TypedExpression<t>,
+  effects: Effects,
+  span: Span,
+}
 
 pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpression<t>, span: Span }
 
@@ -220,8 +225,8 @@ pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
 
 pub type Retyping<a, b, s> = {
   ty: (a, s) -> { ty: b, state: s } / {abort.raise},
-  row: (Row) -> Row / {abort.raise},
-  atom: (Atom) -> Atom / {abort.raise},
+  effects: (Effects) -> Effects / {abort.raise},
+  entry: (Effect) -> Effect / {abort.raise},
   span: (Span) -> Span,
 }
 
@@ -337,7 +342,7 @@ fn retyped_thunk<a, b, s>(
   r: Retyping<a, b, s>,
 ) -> Retyped<TypedThunk<b>, s> / {abort.raise} = {
   let o = retyped(t.body, state, r);
-  { out: { body: o.out, row: (r.row)(t.row) }, state: o.state }
+  { out: { body: o.out, effects: (r.effects)(t.effects) }, state: o.state }
 }
 
 fn retyped_reading<a, b, s>(
@@ -353,7 +358,7 @@ fn retyped_reading<a, b, s>(
         out: ReadDefinition({
           full: d.full,
           args: args.out,
-          rows: d.rows.map(r.row),
+          effect_arguments: d.effect_arguments.map(r.effects),
           labels: d.labels,
           witnesses: d.witnesses,
         }),
@@ -373,7 +378,7 @@ fn retyped_reading<a, b, s>(
         out: ReadBuiltin({
           name: f.name,
           args: args.out,
-          rows: f.rows.map(r.row),
+          effect_arguments: f.effect_arguments.map(r.effects),
           witnesses: f.witnesses,
         }),
         state: args.state,
@@ -506,8 +511,8 @@ fn retyped_clause<a, b, s>(
       label: label.out,
       resume: resume.out,
       body: body.out,
-      row: (r.row)(c.row),
-      resumed: (r.row)(c.resumed),
+      effects: (r.effects)(c.effects),
+      resumed: (r.effects)(c.resumed),
       span: (r.span)(c.span),
     },
     state: body.state,
@@ -540,7 +545,10 @@ fn retyped_node<a, b, s>(
     TypedCall(c) -> {
       let f = retyped(c.callee, state, r);
       let args = retyped_all(c.args, f.state, r);
-      { out: TypedCall({ callee: f.out, args: args.out, row: (r.row)(c.row) }), state: args.state }
+      {
+        out: TypedCall({ callee: f.out, args: args.out, effects: (r.effects)(c.effects) }),
+        state: args.state,
+      }
     },
     TypedIf(i) -> {
       let c = retyped(i.cond, state, r);
@@ -596,7 +604,7 @@ fn retyped_node<a, b, s>(
           effect: p.effect,
           op: p.op,
           resource: p.resource,
-          atom: (r.atom)(p.atom),
+          entry: (r.entry)(p.entry),
           args: args.out,
         }),
         state: args.state,
@@ -606,7 +614,7 @@ fn retyped_node<a, b, s>(
       let params = retyped_params(l.params, state, r);
       let body = retyped(l.body, params.state, r);
       {
-        out: TypedLambda({ params: params.out, body: body.out, row: (r.row)(l.row) }),
+        out: TypedLambda({ params: params.out, body: body.out, effects: (r.effects)(l.effects) }),
         state: body.state,
       }
     },
@@ -652,7 +660,7 @@ fn retyped_node<a, b, s>(
             out: Some({
               binder: binder.out,
               body: rbody.out,
-              row: (r.row)(rc.row),
+              effects: (r.effects)(rc.effects),
               span: (r.span)(rc.span),
             }),
             state: rbody.state,
@@ -663,7 +671,7 @@ fn retyped_node<a, b, s>(
       {
         out: TypedHandle({
           body: body.out,
-          row: (r.row)(h.row),
+          effects: (r.effects)(h.effects),
           clauses: clauses.out,
           ret: ret.out,
           vars: vars.out,

@@ -90,18 +90,18 @@ fn a_block_freed_under_another_context_goes_back_to_the_heap_it_came_from() {
 
 /// A debug build knows each block's size class, which is all a free relies on.
 #[test]
-fn a_block_freed_at_another_size_than_it_was_allocated_at_is_refused() {
+fn a_block_freed_at_another_size_than_it_was_allocated_at_is_rejected() {
     if !cfg!(debug_assertions) {
         return;
     }
     let mut ctx = context();
     let w = alloc(&mut ctx, 40);
     let heap = &raw mut ctx.heap;
-    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         std::mem::transmute::<Word, Block>(w).free(heap, sized(20))
     }))
     .expect_err("a block of 40 bytes was freed as larger");
-    let said = refused.downcast_ref::<String>().expect("a message");
+    let said = rejected.downcast_ref::<String>().expect("a message");
     assert!(
         said.contains(&format!(
             "was freed as {} bytes, and its block was taken as 40",
@@ -160,17 +160,17 @@ fn a_native_object_is_given_back_with_what_it_holds() {
     assert_eq!(ctx.heap.natives(), 0);
 }
 
-/// `drop#Hold<a>` reads what a hold holds at the payload word the description reports, and empties
-/// it there before the hold is given back.
+/// `drop#Scoped<a>` reads what a scoped value holds at the payload word the description reports,
+/// and empties it there before the scoped value is given back.
 #[test]
-fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
+fn a_scoped_value_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     use ply_compiled::c::builtin_helper_name;
     let mut ctx = context();
     ctx.begin();
     let held = alloc(&mut ctx, sized(1));
     let made: Counted = helper(&builtin_helper_name("?hold_made"));
     let h = unsafe { made(&mut ctx, held) };
-    let at = ply_compiled::rt::HOLD_HELD;
+    let at = ply_compiled::rt::SCOPED_VALUE;
     assert_eq!(unsafe { word_at(obj(h), at) }, held);
     unsafe { *(h as *mut Word).byte_add(HEADER).add(at) = 0 };
     free(&mut ctx, held, sized(1));

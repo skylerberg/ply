@@ -1,7 +1,8 @@
-import compiler.check.types (Atom, Row, NamedResource, SingletonResource, Type, VariableType,
-                             NamedType, FunctionType, Scheme, Printer, printer_new, reserve_atoms,
-                             print_atom_list, print_row, print_scheme, atom_text, atom_covers,
-                             atoms_covered, row_empty, row_closed, row_is_pure, named_type)
+import compiler.check.types (Effect, Effects, NamedResource, SingletonResource, Type, VariableType,
+                             NamedType, FunctionType, Scheme, Printer, printer_new, reserve_effects,
+                             print_effect_list, print_effects, print_scheme, effect_text,
+                             effect_covers, effects_cover, no_effects, closed_effects, is_pure,
+                             named_type)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode)
 import compiler.check.infer.checker (DefinitionInfo, RaiseReason, RequirementNotShown,
                                      UnguardedBuiltin, RaisingCall, ZeroDivisor, RefutableLet,
@@ -15,11 +16,11 @@ import compiler.syntax.parsing (dummy_span, span_between)
 
 pub fn width() -> Int = 80
 
-pub type RowText = { atoms: List<String>, tail: Option<String> }
+pub type EffectsText = { listed: List<String>, variable: Option<String> }
 
-pub type SplitSignature = { head: String, row: Option<RowText> }
+pub type SplitSignature = { head: String, effects: Option<EffectsText> }
 
-pub type SetLine = { name: String, atoms: List<String>, used_by: Int }
+pub type SetLine = { name: String, listed: List<String>, used_by: Int }
 
 pub type Provenance = {
   aliases: List<String>,
@@ -34,40 +35,44 @@ fn trim_end(s: String) -> String / {abort.raise} =
       if end > 0 && s.slice(end - 1, end) == " " { end - 1 } else { end }),
   )
 
-fn without_row(scheme: Scheme) -> SplitSignature / {abort.raise} =
-  { head: String::of_bytes_lossy(print_scheme(printer_new(), scheme).text), row: None }
+fn without_effects(scheme: Scheme) -> SplitSignature / {abort.raise} =
+  { head: String::of_bytes_lossy(print_scheme(printer_new(), scheme).text), effects: None }
 
 fn lifted(
   scheme: Scheme,
   params: List<Type>,
   ret: Type,
-  effects: Row,
+  effects: Effects,
 ) -> SplitSignature / {abort.raise} = {
-  let reserved: Printer = reserve_atoms(printer_new(), effects.atoms);
+  let reserved: Printer = reserve_effects(printer_new(), effects.listed);
   let head = print_scheme(reserved, {
     ..scheme,
     ty: match scheme.ty {
-      FunctionType(f) -> FunctionType({ ..f, params: params, ret: ret, effects: row_empty() }),
-      _ -> FunctionType({ kept: [], once: false, params: params, ret: ret, effects: row_empty() }),
+      FunctionType(f) -> FunctionType({ ..f, params: params, ret: ret, effects: no_effects() }),
+      _ -> FunctionType({ kept: [], once: false, params: params, ret: ret, effects: no_effects() }),
     },
   });
-  let listed = print_atom_list(head.printer, effects.atoms);
-  let tail = match effects.tail {
+  let listed = print_effect_list(head.printer, effects.listed);
+  let variable = match effects.variable {
     None -> None,
     Some(v) ->
-      Some(String::of_bytes_lossy(print_row(listed.printer, { atoms: [], tail: Some(v) }).text)),
+      Some(
+        String::of_bytes_lossy(
+          print_effects(listed.printer, { listed: [], variable: Some(v) }).text,
+        ),
+      ),
   };
   {
     head: String::of_bytes_lossy(head.text),
-    row: Some({ atoms: listed.texts.map(String::of_bytes_lossy), tail: tail }),
+    effects: Some({ listed: listed.texts.map(String::of_bytes_lossy), variable: variable }),
   }
 }
 
 pub fn split(scheme: Scheme) -> SplitSignature / {abort.raise} =
   match scheme.ty {
-    FunctionType(f) -> if row_is_pure(f.effects) { without_row(scheme) }
+    FunctionType(f) -> if is_pure(f.effects) { without_effects(scheme) }
     else { lifted(scheme, f.params, f.ret, f.effects) },
-    _ -> without_row(scheme),
+    _ -> without_effects(scheme),
   }
 
 type Filling = { lines: List<String>, line: String, column: Int }
@@ -97,18 +102,18 @@ pub fn fill(
     out.lines.push(trim_end(out.line))
   }
 
-fn row_lines(indent: Int, gutter: String, r: RowText) -> List<String> / {abort.raise} = {
+fn effects_lines(indent: Int, gutter: String, r: EffectsText) -> List<String> / {abort.raise} = {
   let max_width = width() - indent;
-  match r.tail {
-    Some(t) -> if r.atoms.len() == 0 { [gutter ++ "/ " ++ t] } else {
-      let tailed = fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, " | " ++ t ++ "}", max_width);
+  match r.variable {
+    Some(t) -> if r.listed.len() == 0 { [gutter ++ "/ " ++ t] } else {
+      let tailed = fill(gutter ++ "/ {", gutter ++ "   ", r.listed, " | " ++ t ++ "}", max_width);
       if tailed.fold(true, |fits: Bool, l: String| fits && l.len() <= max_width) { tailed } else {
-        fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, "", max_width).push(
+        fill(gutter ++ "/ {", gutter ++ "   ", r.listed, "", max_width).push(
           gutter ++ "   | " ++ t ++ "}",
         )
       }
     },
-    None -> fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, "}", max_width),
+    None -> fill(gutter ++ "/ {", gutter ++ "   ", r.listed, "}", max_width),
   }
 }
 
@@ -127,18 +132,18 @@ pub fn counted_lines(
   call_at: Option<String>,
 ) -> List<String> / {abort.raise} = {
   let sp: SplitSignature = split(definition_info.scheme);
-  let marked = match ((sp.row, definition_info.scheme.ty)) {
+  let marked = match ((sp.effects, definition_info.scheme.ty)) {
     (Some(r), FunctionType(f)) ->
       {
         ..sp,
-        row: Some({
-          atoms: range(0, r.atoms.len()).map(|i: Int|
-            r.atoms.at_or(i, "") ++ " "
-              ++ (match f.effects.atoms.at(i) {
-                Some(a) -> class_of(atoms_covered(definition_info.scaling, a)),
+        effects: Some({
+          listed: range(0, r.listed.len()).map(|i: Int|
+            r.listed.at_or(i, "") ++ " "
+              ++ (match f.effects.listed.at(i) {
+                Some(a) -> class_of(effects_cover(definition_info.scaling, a)),
                 None -> "",
               })),
-          tail: match r.tail {
+          variable: match r.variable {
             Some(t) -> Some(t ++ " " ++ class_of(definition_info.repeats.len() > 0)),
             None -> None,
           },
@@ -177,9 +182,10 @@ fn split_lines(
 ) -> List<String> / {abort.raise} = {
   let first = label.pad_right(label_width, " ") ++ " : ";
   let heads = head_lines(width() - indent, first, sp.head);
-  match sp.row {
+  match sp.effects {
     None -> heads,
-    Some(r) -> heads.concat(row_lines(indent, " ".repeat(label_column(label_width, label) + 3), r)),
+    Some(r) ->
+      heads.concat(effects_lines(indent, " ".repeat(label_column(label_width, label) + 3), r)),
   }
 }
 
@@ -261,7 +267,7 @@ fn bumped(uses: Map<Bytes, Int>, name: Bytes) -> Map<Bytes, Int> =
 
 fn counted(sets: List<EffectSetRow>, definitions: List<DefinitionInfo>) -> Map<Bytes, Int> =
   definitions.fold(Map::new(), |acc: Map<Bytes, Int>, definition_info: DefinitionInfo|
-    reached(sets, definition_info.row_aliases).fold(acc, bumped))
+    reached(sets, definition_info.effect_aliases).fold(acc, bumped))
 
 pub fn effect_sets(
   sets: List<EffectSetRow>,
@@ -271,29 +277,29 @@ pub fn effect_sets(
   sets.map(|s: EffectSetRow|
     {
       name: String::of_bytes_lossy(s.name),
-      atoms: s.atoms.map(|a: Atom| String::of_bytes_lossy(atom_text(a))),
+      listed: s.listed.map(|a: Effect| String::of_bytes_lossy(effect_text(a))),
       used_by: match uses.get(s.name) { Some(k) -> k, None -> 0 },
     })
 }
 
 pub fn set_lines(v: SetLine, indent: Int) -> List<String> / {abort.raise} =
-  ["effect set " ++ v.name].concat(fill("  = {", "     ", v.atoms, "}", width() - indent)).concat([
-    "  used by " ++ count_of(v.used_by, "definition"),
-  ])
+  ["effect set " ++ v.name].concat(fill("  = {", "     ", v.listed, "}", width() - indent)).concat(
+    ["  used by " ++ count_of(v.used_by, "definition")],
+  )
 
-fn performs(performed: List<Atom>, declared: Atom) -> Bool =
-  performed.fold(false, |acc: Bool, p: Atom| acc || atom_covers(declared, p))
+fn performs(performed: List<Effect>, declared: Effect) -> Bool =
+  performed.fold(false, |acc: Bool, p: Effect| acc || effect_covers(declared, p))
 
 pub fn provenance(definition_info: DefinitionInfo) -> Provenance / {abort.raise} = {
-  let undone = definition_info.effects.filter(|a: Atom| !performs(definition_info.performed, a));
-  let unperformed = print_atom_list(printer_new(), undone).texts.map(String::of_bytes_lossy);
+  let undone = definition_info.effects.filter(|a: Effect| !performs(definition_info.performed, a));
+  let unperformed = print_effect_list(printer_new(), undone).texts.map(String::of_bytes_lossy);
   let performed: Option<List<String>> = if unperformed.len() == 0 { None } else {
     Some(
-      print_atom_list(printer_new(), definition_info.performed).texts.map(String::of_bytes_lossy),
+      print_effect_list(printer_new(), definition_info.performed).texts.map(String::of_bytes_lossy),
     )
   };
   {
-    aliases: definition_info.row_aliases.map(String::of_bytes_lossy),
+    aliases: definition_info.effect_aliases.map(String::of_bytes_lossy),
     performed: performed,
     unperformed: unperformed,
   }
@@ -308,8 +314,8 @@ pub fn provenance_lines(p: Provenance, indent: Int) -> List<String> / {abort.rai
   else { fill("  written as     / {", "                     ", p.aliases, "}", max_width) };
   let performed = match p.performed {
     None -> written,
-    Some(atoms) ->
-      written.concat(fill("  body performs  {", "                  ", atoms, "}", max_width)),
+    Some(effects) ->
+      written.concat(fill("  body performs  {", "                  ", effects, "}", max_width)),
   };
   if p.unperformed.len() == 0 { performed } else {
     performed.concat(fill("  declared, not performed: ", "    ", p.unperformed, "", max_width))
@@ -317,13 +323,14 @@ pub fn provenance_lines(p: Provenance, indent: Int) -> List<String> / {abort.rai
 }
 
 pub fn raise_text(nonreturn_reason: RaiseReason) -> String = {
-  let an_atom = |name: Bytes| "`" ++ String::of_bytes_lossy(name) ++ "`";
+  let an_effect = |name: Bytes| "`" ++ String::of_bytes_lossy(name) ++ "`";
   match nonreturn_reason {
     RequirementNotShown(u) ->
-      an_atom(u.callee) ++ " requires " ++ an_atom(u.needs) ++ ", which nothing on the way shows",
+      an_effect(u.callee) ++ " requires " ++ an_effect(u.needs)
+        ++ ", which nothing on the way shows",
     UnguardedBuiltin(name) ->
-      an_atom(name) ++ " can raise, and states no `requires` a call could show",
-    RaisingCall(name) -> "calls " ++ an_atom(name) ++ ", whose effects name the raise",
+      an_effect(name) ++ " can raise, and states no `requires` a call could show",
+    RaisingCall(name) -> "calls " ++ an_effect(name) ++ ", whose effects name the raise",
     ZeroDivisor -> "divides by a value nothing on the way shows is other than zero",
     RefutableLet -> "a `let` whose pattern can miss",
     RaisingOperation -> "performs an operation that raises",
@@ -342,16 +349,16 @@ pub fn raise_kind(nonreturn_reason: RaiseReason) -> String =
     RaisingFunctionValue -> "handed",
   }
 
-pub fn atom_texts(atoms: List<Atom>) -> List<String> / {abort.raise} =
-  print_atom_list(printer_new(), atoms).texts.map(String::of_bytes_lossy)
+pub fn effect_texts(effects: List<Effect>) -> List<String> / {abort.raise} =
+  print_effect_list(printer_new(), effects).texts.map(String::of_bytes_lossy)
 
 /// Effects as a signature writes them: `{a, b}`.
 pub fn braced(effects: List<String>) -> String = "{" ++ String::join(effects, ", ") ++ "}"
 
-fn fn_scheme(effects: Row, row_variables: List<Int>) -> Scheme =
+fn fn_scheme(effects: Effects, row_variables: List<Int>) -> Scheme =
   {
     type_variables: [],
-    row_variables: row_variables,
+    effect_variables: row_variables,
     keep_variables: [],
     label_variables: [],
     ty: FunctionType({
@@ -363,7 +370,7 @@ fn fn_scheme(effects: Row, row_variables: List<Int>) -> Scheme =
     }),
   }
 
-fn an_atom(eff: Bytes, mode: Mode, resource: Option<Bytes>) -> Atom =
+fn an_effect(eff: Bytes, mode: Mode, resource: Option<Bytes>) -> Effect =
   {
     effect: eff,
     mode: mode,
@@ -371,22 +378,22 @@ fn an_atom(eff: Bytes, mode: Mode, resource: Option<Bytes>) -> Atom =
     resource: match resource { Some(r) -> NamedResource(r), None -> SingletonResource },
   }
 
-test "a pure definition prints no row at all" {
-  assert_eq(definition_lines(5, 12, "endpoint_of", fn_scheme(row_empty(), [])), [
+test "a pure definition prints no effects at all" {
+  assert_eq(definition_lines(5, 12, "endpoint_of", fn_scheme(no_effects(), [])), [
     "endpoint_of  : (Request) -> Response",
   ])
 }
 
-test "a long row wraps inside the brace and aligns" {
-  let row = row_closed([
-    an_atom(b"db", ReadMode, Some(b"inventory")),
-    an_atom(b"db", ReadMode, Some(b"orders")),
-    an_atom(b"db", ReadMode, Some(b"users")),
-    an_atom(b"db", WriteMode, Some(b"orders")),
-    an_atom(b"http", WriteMode, Some(b"outbound")),
-    an_atom(b"log", WriteMode, None),
+test "a long list of effects wraps inside the brace and aligns" {
+  let effects = closed_effects([
+    an_effect(b"db", ReadMode, Some(b"inventory")),
+    an_effect(b"db", ReadMode, Some(b"orders")),
+    an_effect(b"db", ReadMode, Some(b"users")),
+    an_effect(b"db", WriteMode, Some(b"orders")),
+    an_effect(b"http", WriteMode, Some(b"outbound")),
+    an_effect(b"log", WriteMode, None),
   ]);
-  assert_eq(definition_lines(5, 12, "create_order", fn_scheme(row, [])), [
+  assert_eq(definition_lines(5, 12, "create_order", fn_scheme(effects, [])), [
     "create_order : (Request) -> Response",
     "               / {db.read[inventory], db.read[orders], db.write[orders],",
     "                  db.read[users], http.write[outbound], log.write}",
@@ -397,7 +404,7 @@ test "a long head wraps between its parameters and aligns" {
   let node = NamedType({ name: b"std.prelude.ListNode", args: [VariableType(1)] });
   let sc: Scheme = {
     type_variables: [1],
-    row_variables: [],
+    effect_variables: [],
     keep_variables: [],
     label_variables: [],
     ty: FunctionType({
@@ -405,7 +412,7 @@ test "a long head wraps between its parameters and aligns" {
       once: false,
       params: [node, named_type(b"Int"), named_type(b"Int"), node],
       ret: node,
-      effects: row_empty(),
+      effects: no_effects(),
     }),
   };
   assert_eq(definition_lines(5, 13, "trie_inserted", sc), [
@@ -415,7 +422,7 @@ test "a long head wraps between its parameters and aligns" {
   assert_eq(
     definition_lines(5, 4, "path", {
       ..sc,
-      ty: FunctionType({ kept: [], once: false, params: [], ret: node, effects: row_empty() }),
+      ty: FunctionType({ kept: [], once: false, params: [], ret: node, effects: no_effects() }),
     }),
     ["path : <a>() -> std.prelude.ListNode<a>"],
   );
@@ -426,13 +433,16 @@ test "a long head wraps between its parameters and aligns" {
   ])
 }
 
-test "a row variable survives the split with one name" {
-  let row: Row = { atoms: [an_atom(b"net", WriteMode, Some(b"conn"))], tail: Some(3) };
-  assert_eq(definition_lines(5, 4, "serve", fn_scheme(row, [3])), [
+test "an effect variable survives the split with one name" {
+  let effects: Effects = {
+    listed: [an_effect(b"net", WriteMode, Some(b"conn"))],
+    variable: Some(3),
+  };
+  assert_eq(definition_lines(5, 4, "serve", fn_scheme(effects, [3])), [
     "serve : <| e>(Request) -> Response",
     "        / {net.write[conn] | e}",
   ]);
-  assert_eq(definition_lines(5, 3, "run", fn_scheme({ atoms: [], tail: Some(0) }, [0])), [
+  assert_eq(definition_lines(5, 3, "run", fn_scheme({ listed: [], variable: Some(0) }, [0])), [
     "run : <| e>(Request) -> Response",
     "      / e",
   ])
@@ -441,7 +451,7 @@ test "a row variable survives the split with one name" {
 test "a type variable keeps its letter across the split" {
   let sc: Scheme = {
     type_variables: [1],
-    row_variables: [2],
+    effect_variables: [2],
     keep_variables: [],
     label_variables: [],
     ty: FunctionType({
@@ -449,42 +459,46 @@ test "a type variable keeps its letter across the split" {
       once: false,
       params: [VariableType(1)],
       ret: VariableType(1),
-      effects: { atoms: [an_atom(b"log", WriteMode, None)], tail: Some(2) },
+      effects: { listed: [an_effect(b"log", WriteMode, None)], variable: Some(2) },
     }),
   };
   assert_eq(definition_lines(5, 2, "id", sc), ["id : <a | e>(a) -> a", "     / {log.write | e}"])
 }
 
-fn counted_definition(row: Row, scaling: List<Atom>, repeats: List<Int>) -> DefinitionInfo =
+fn counted_definition(
+  effects: Effects,
+  scaling: List<Effect>,
+  repeats: List<Int>,
+) -> DefinitionInfo =
   {
-    ..definition_of([], row.atoms, row.atoms),
-    scheme: fn_scheme(row, match row.tail { Some(v) -> [v], None -> [] }),
+    ..definition_of([], effects.listed, effects.listed),
+    scheme: fn_scheme(effects, match effects.variable { Some(v) -> [v], None -> [] }),
     scaling: scaling,
     repeats: repeats,
   }
 
-test "each atom and the effect variable print with how many times a call performs them" {
-  let query = an_atom(b"db", ReadMode, Some(b"orders"));
-  let log = an_atom(b"log", WriteMode, None);
-  let row: Row = { atoms: [query, log], tail: Some(3) };
-  assert_eq(counted_lines(5, 4, "find", counted_definition(row, [query], [0]), None), [
+test "each effect and the effect variable print with how many times a call performs them" {
+  let query = an_effect(b"db", ReadMode, Some(b"orders"));
+  let log = an_effect(b"log", WriteMode, None);
+  let effects: Effects = { listed: [query, log], variable: Some(3) };
+  assert_eq(counted_lines(5, 4, "find", counted_definition(effects, [query], [0]), None), [
     "find : <| e>(Request) -> Response",
     "       / {db.read[orders] scaling, log.write bounded | e scaling}",
   ]);
-  assert_eq(counted_lines(5, 4, "find", counted_definition(row, [], []), None), [
+  assert_eq(counted_lines(5, 4, "find", counted_definition(effects, [], []), None), [
     "find : <| e>(Request) -> Response",
     "       / {db.read[orders] bounded, log.write bounded | e bounded}",
   ])
 }
 
-test "a row variable too wide to sit beside the last atom takes a line of its own" {
-  let long = an_atom(
+test "an effect variable too wide to sit beside the last effect takes a line of its own" {
+  let long = an_effect(
     b"a_very_long_effect_name_that_fills_a_line",
     WriteMode,
     Some(b"a_long_label"),
   );
-  let row: Row = { atoms: [long], tail: Some(3) };
-  assert_eq(counted_lines(5, 4, "wide", counted_definition(row, [long], [0]), None), [
+  let effects: Effects = { listed: [long], variable: Some(3) };
+  assert_eq(counted_lines(5, 4, "wide", counted_definition(effects, [long], [0]), None), [
     "wide : <| e>(Request) -> Response",
     "       / {a_very_long_effect_name_that_fills_a_line.write[a_long_label] scaling",
     "          | e scaling}",
@@ -494,7 +508,7 @@ test "a row variable too wide to sit beside the last atom takes a line of its ow
 fn a_site(caller: Bytes) -> Site = { caller: caller, span: span_between(4, 9) }
 
 test "a definition that may not return says by which call, and where" {
-  let pure: Row = { atoms: [], tail: None };
+  let pure: Effects = { listed: [], variable: None };
   let looping = {
     ..counted_definition(pure, [], []),
     ending: Diverges({ at: a_site(b"m.spin"), through: None, loop: [a_site(b"m.spin")] }),
@@ -535,7 +549,7 @@ test "the set block names the set and spells out its expansion" {
   let view: SetLine = {
     name: "Web",
     used_by: 4,
-    atoms: [
+    listed: [
       "db.read[inventory]",
       "db.read[orders]",
       "db.read[users]",
@@ -550,7 +564,7 @@ test "the set block names the set and spells out its expansion" {
     "     http.write[outbound], log.write}",
     "  used by 4 definitions",
   ]);
-  assert_eq(set_lines({ name: "Web", atoms: ["log.write"], used_by: 1 }, 5), [
+  assert_eq(set_lines({ name: "Web", listed: ["log.write"], used_by: 1 }, 5), [
     "effect set Web",
     "  = {log.write}",
     "  used by 1 definition",
@@ -559,24 +573,24 @@ test "the set block names the set and spells out its expansion" {
 
 fn definition_of(
   aliases: List<Bytes>,
-  declared: List<Atom>,
-  performed: List<Atom>,
+  declared: List<Effect>,
+  performed: List<Effect>,
 ) -> DefinitionInfo =
   {
     name: b"m.create_order",
     module: b"m",
     simple_name: b"create_order",
-    scheme: fn_scheme(row_empty(), []),
+    scheme: fn_scheme(no_effects(), []),
     effects: declared,
     performed: performed,
     scaling: [],
     repeats: [],
     bounded: [],
-    tail_bounded: false,
+    variable_bounded: false,
     ending: Terminates,
     summary: unknown_summary(),
     raises: [],
-    row_aliases: aliases,
+    effect_aliases: aliases,
     constraints: [],
     spec: [],
     at: { module: 0, span: dummy_span() },
@@ -587,11 +601,11 @@ test "provenance names the alias and the difference the alias hides" {
     definition_of(
       [b"Web"],
       [
-        an_atom(b"db", ReadMode, Some(b"orders")),
-        an_atom(b"db", ReadMode, Some(b"users")),
-        an_atom(b"log", WriteMode, None),
+        an_effect(b"db", ReadMode, Some(b"orders")),
+        an_effect(b"db", ReadMode, Some(b"users")),
+        an_effect(b"log", WriteMode, None),
       ],
-      [an_atom(b"db", ReadMode, Some(b"users")), an_atom(b"log", WriteMode, None)],
+      [an_effect(b"db", ReadMode, Some(b"users")), an_effect(b"log", WriteMode, None)],
     ),
   );
   assert_eq(provenance_lines(p, 5), [
@@ -602,7 +616,7 @@ test "provenance names the alias and the difference the alias hides" {
 }
 
 test "an alias the body uses completely reports only how it was written" {
-  let exact = [an_atom(b"log", WriteMode, None)];
+  let exact = [an_effect(b"log", WriteMode, None)];
   let p = provenance(definition_of([b"Web"], exact, exact));
   assert_eq(provenance_lines(p, 5), ["  written as     / {Web}"]);
   assert_eq(p.unperformed, []);
@@ -611,12 +625,12 @@ test "an alias the body uses completely reports only how it was written" {
   assert_eq(provenance_lines(bare, 5), [])
 }
 
-test "a written row wider than its body is reported without any alias" {
+test "declared effects wider than the body's are reported without any alias" {
   let p = provenance(
     definition_of(
       [],
-      [an_atom(b"db", ReadMode, Some(b"orders")), an_atom(b"log", WriteMode, None)],
-      [an_atom(b"log", WriteMode, None)],
+      [an_effect(b"db", ReadMode, Some(b"orders")), an_effect(b"log", WriteMode, None)],
+      [an_effect(b"log", WriteMode, None)],
     ),
   );
   assert_eq(provenance_lines(p, 5), [
@@ -629,24 +643,24 @@ test "a set is used by every definition that reaches it, through another set or 
   let reads: EffectSetRow = {
     name: b"Reads",
     includes: [],
-    atoms: [an_atom(b"m.store", ReadMode, Some(b"orders"))],
+    listed: [an_effect(b"m.store", ReadMode, Some(b"orders"))],
   };
   let web: EffectSetRow = {
     name: b"Web",
     includes: [b"Reads"],
-    atoms: [
-      an_atom(b"m.store", ReadMode, Some(b"orders")),
-      an_atom(b"m.store", WriteMode, Some(b"orders")),
+    listed: [
+      an_effect(b"m.store", ReadMode, Some(b"orders")),
+      an_effect(b"m.store", WriteMode, Some(b"orders")),
     ],
   };
-  let unused: EffectSetRow = { name: b"Unused", includes: [], atoms: [] };
+  let unused: EffectSetRow = { name: b"Unused", includes: [], listed: [] };
   let lines = effect_sets([reads, web, unused], [
     definition_of([b"Reads"], [], []),
     definition_of([b"Web"], [], []),
   ]);
   assert_eq(lines.map(|l: SetLine| l.name), ["Reads", "Web", "Unused"]);
   assert_eq(lines.map(|l: SetLine| l.used_by), [2, 1, 0]);
-  assert_eq(match lines.at(1) { Some(l) -> l.atoms, None -> [] }, [
+  assert_eq(match lines.at(1) { Some(l) -> l.listed, None -> [] }, [
     "m.store.read[orders]",
     "m.store.write[orders]",
   ])

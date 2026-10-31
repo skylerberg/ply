@@ -3,7 +3,7 @@
 //! step; what is not read leaves a `cost` clause to its fit.
 
 import compiler.front.diagnostics (parse_all)
-import compiler.front.seam (Analysed, Refused)
+import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.published (ClaimClause, analyse)
 import compiler.syntax.items (SpecKind, CostClause, SpaceClause, parse)
 import compiler.syntax.expressions (prelude_module)
@@ -22,7 +22,7 @@ import compiler.check.callbacks (CallbackUse, Mapped, Filtered, Updated, callbac
                                  prelude_callback_use)
 import compiler.syntax.patterns (LiteralInt)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
-                             Field, int_type, row_empty)
+                             Field, int_type, no_effects)
 import context (Context, Definition, claims_read, context, ctor, signature, is_recursive,
                 reaches_key)
 import domain (FunctionSort, NamedSort)
@@ -117,7 +117,7 @@ fn degree(m: Monomial) -> Int = m.fold(0, |acc: Int, _k: Int, v: Int| acc + v)
 
 fn top_degree(p: Polynomial) -> Int = p.fold(0, |acc: Int, m: Monomial| max(acc, degree(m)))
 
-/// `times`, refused past what a clause states, where reading further only costs.
+/// `times`, rejected past what a clause states, where reading further only costs.
 pub fn product(a: Polynomial, b: Polynomial) -> Result<Polynomial, String> =
   if a.len() * b.len() > 256 || top_degree(a) + top_degree(b) > 8 {
     Err("steps past any bound a clause states")
@@ -162,7 +162,10 @@ pub fn at_args(
           match r {
             Err(_) -> r,
             Ok(q) -> match List::at(if k < 0 { funs } else { args }, param_of_key(k)) {
-              Some(Some(s)) -> match power(s, v) { Ok(sv) -> product(q, sv), Err(why) -> Err(why) },
+              Some(Some(s)) -> match power(s, v) {
+                Ok(sv) -> product(q, sv),
+                Err(reason) -> Err(reason),
+              },
               _ ->
                 Err(if k < 0 {
                   "a callee's steps grow with a function it is given whose steps are not read"
@@ -170,7 +173,7 @@ pub fn at_args(
             },
           }) {
         Ok(q) -> Ok(plus(sofar, q)),
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
       },
     })
 
@@ -326,7 +329,7 @@ pub fn steps(context: Context, definition: String) -> Result<Polynomial, String>
   }
 }
 
-/// The first of `definitions` that takes, answers or builds a value of a type that states a `key` or a
+/// The first of `definitions` that takes, returns or builds a value of a type stating a `key` or a
 /// `numeric`, or that holds one: comparing two, or an operator over them, is a call no body shows.
 pub fn holding_keyed(context: Context, definitions: List<String>) -> Option<String> =
   if context.keyed_types.len() == 0 { None } else {
@@ -437,13 +440,13 @@ fn steps_of(
           missed: None,
         };
         match walk(env, body) {
-          Err(why) -> Err(why),
+          Err(reason) -> Err(reason),
           Ok(w) -> if !is_recursive(context, definition) { Ok(plus(constant(), w.cost)) }
           else if !context.self_recursive.contains(definition) {
             Err("`" ++ definition ++ "` is in a group with others")
           } else {
             match descent(definition, w.calls, w.back, w.cost, "steps grow") {
-              Err(why) -> Err(why),
+              Err(reason) -> Err(reason),
               Ok(None) -> Ok(plus(constant(), w.cost)),
               // At most as many calls as the descent bounds enter with an element left to take or
               // the index short of its limit, and at most one without, which takes no path that
@@ -459,10 +462,10 @@ fn steps_of(
                   OnIndex(f) -> { ..env, missed: Some(f) },
                 };
                 match walk(last, body) {
-                  Err(why) -> Err(why),
+                  Err(reason) -> Err(reason),
                   Ok(e) -> match product(descent_calls(d), plus(constant(), w.cost)) {
                     Ok(chain) -> Ok(plus(chain, plus(constant(), e.cost))),
-                    Err(why) -> Err(why),
+                    Err(reason) -> Err(reason),
                   },
                 }
               },
@@ -688,13 +691,13 @@ fn walk(env: Env, c: Code) -> Result<CostSummary, String> / {abort.raise} =
       Ok({ ..no_cost(), fun: fun_named(env, String::of_bytes_lossy(fname)) }),
     CodeLabel(_) -> Ok(no_cost()),
     CodeUnary(u) -> match walk(env, u.operand) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(w) -> Ok({ ..w, of: Other, fun: None }),
     },
     CodeBinary(b) -> match walk(env, b.lhs) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(l) -> match walk(env, b.rhs) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(r) ->
           Ok({
             ..then(l, r),
@@ -705,7 +708,7 @@ fn walk(env: Env, c: Code) -> Result<CostSummary, String> / {abort.raise} =
       },
     },
     CodeIf(i) -> match walk(env, i.cond) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(cond) -> {
         let slots = |k: Int| slot_at(env, k).of;
         let branch = |truth: Bool, c: Code| {
@@ -715,8 +718,8 @@ fn walk(env: Env, c: Code) -> Result<CostSummary, String> / {abort.raise} =
           } else { None }
         };
         match ((branch(true, i.then_branch), branch(false, i.else_branch))) {
-          (Some(Err(why)), _) -> Err(why),
-          (_, Some(Err(why))) -> Err(why),
+          (Some(Err(reason)), _) -> Err(reason),
+          (_, Some(Err(reason))) -> Err(reason),
           (Some(Ok(t)), Some(Ok(e))) -> Ok(then(cond, either(t, e))),
           (Some(Ok(t)), None) -> Ok(then(cond, t)),
           (None, Some(Ok(e))) -> Ok(then(cond, e)),
@@ -726,30 +729,30 @@ fn walk(env: Env, c: Code) -> Result<CostSummary, String> / {abort.raise} =
     },
     CodeBlock(b) -> block(env, b.statements, b.tail),
     CodeList(l) -> match all(env, l.items) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(w) -> Ok({ ..w, size: Some(constant()), of: Other, fun: None }),
     },
     CodeRecord(r) -> match all(env, r.fields.map(|f: CodeField| f.value)) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(w) -> Ok({ ..w, size: None, of: Other, fun: None }),
     },
     CodeFieldRead(f) -> match walk(env, f.base) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(w) -> Ok({ ..w, size: None, of: Other, fun: None }),
     },
     CodeUpdate(u) -> match all(env, u.sets.map(|f: CodeField| f.value).push(u.base)) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(w) -> Ok({ ..w, size: None, of: Other, fun: None }),
     },
     CodeMatch(m) -> match walk(env, m.scrutinee) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(s) -> match arms(
           env,
           s,
           index_bound_of(|k: Int| slot_at(env, k).of, m.scrutinee),
           m.arms,
         ) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(a) -> Ok(then(s, a)),
       },
     },
@@ -760,7 +763,7 @@ fn walk(env: Env, c: Code) -> Result<CostSummary, String> / {abort.raise} =
       Err("an operation whose handler the bound does not read")
     } else {
       match all(env, p.args) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(w) -> Ok({ ..add(w, constant()), size: None, of: Other, fun: None }),
       }
     },
@@ -781,10 +784,10 @@ fn all(env: Env, cs: List<Code>) -> Result<CostSummary, String> / {abort.raise} 
   cs.fold(Ok(no_cost()), |acc: Result<CostSummary, String>, c: Code|
     match acc {
       Err(_) -> acc,
-      Ok(sofar) -> match walk(env, c) { Ok(w) -> Ok(then(sofar, w)), Err(why) -> Err(why) },
+      Ok(sofar) -> match walk(env, c) { Ok(w) -> Ok(then(sofar, w)), Err(reason) -> Err(reason) },
     })
 
-/// The size of an `Int` an operator answers: a sum or difference is bounded by both, a product by
+/// The size of an `Int` an operator returns: a sum or difference is bounded by both, a product by
 /// their product, and a quotient or remainder by its left.
 pub fn arithmetic(op: Bytes, l: Option<Polynomial>, r: Option<Polynomial>) -> Option<Polynomial> =
   match ((l, r)) {
@@ -808,7 +811,7 @@ fn block(
         Ok(s) -> match st {
           CodeDo(d) -> match walk(s.env, d.code) {
             Ok(w) -> Ok({ env: s.env, w: then(s.w, w) }),
-            Err(why) -> Err(why),
+            Err(reason) -> Err(reason),
           },
           CodeLet(l) -> match walk(s.env, l.value) {
             Ok(w) ->
@@ -816,7 +819,7 @@ fn block(
                 env: bind(s.env, l.slot, { size: w.size, of: w.of, fun: w.fun }),
                 w: then(s.w, w),
               }),
-            Err(why) -> Err(why),
+            Err(reason) -> Err(reason),
           },
           CodeLetDestructure(l) -> match walk(s.env, l.value) {
             Ok(w) ->
@@ -824,16 +827,16 @@ fn block(
                 env: bound(s.env, l.pattern, { size: w.size, of: w.of, fun: w.fun }),
                 w: then(s.w, w),
               }),
-            Err(why) -> Err(why),
+            Err(reason) -> Err(reason),
           },
         },
       },
   );
   match ran {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(s) -> match tail {
       None -> Ok({ ..s.w, size: None, of: Other, fun: None }),
-      Some(t) -> match walk(s.env, t) { Ok(w) -> Ok(then(s.w, w)), Err(why) -> Err(why) },
+      Some(t) -> match walk(s.env, t) { Ok(w) -> Ok(then(s.w, w)), Err(reason) -> Err(reason) },
     },
   }
 }
@@ -894,7 +897,7 @@ pub fn index_bound_of(slots: (Int) -> ParameterRelation, c: Code) -> Option<Inde
     _ -> None,
   }
 
-/// A pattern only an answer of `Some` matches.
+/// A pattern only a `Some` value matches.
 pub fn takes_some(p: CodePattern) -> Bool =
   match p { CodeConstructorPattern(c) -> c.name == b"Some", _ -> false }
 
@@ -1034,9 +1037,9 @@ fn arms(
               fun: scrutinee.fun,
             });
             match match arm.guard { None -> Ok(no_cost()), Some(g) -> walk(inside, g) } {
-              Err(why) -> Err(why),
+              Err(reason) -> Err(reason),
               Ok(g) -> match walk(inside, arm.body) {
-                Err(why) -> Err(why),
+                Err(reason) -> Err(reason),
                 Ok(b) -> {
                   let guards = then(sofar.guards, g);
                   let path = then(guards, b);
@@ -1050,7 +1053,7 @@ fn arms(
           },
         },
     ) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(found) -> Ok(match found.taken { Some(w) -> w, None -> no_cost() }),
   }
 
@@ -1060,7 +1063,7 @@ fn application(
   args: List<Code>,
 ) -> Result<CostSummary, String> / {abort.raise} =
   match Result::traverse(args, |a: Code| walk(env, a)) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(walked) -> {
       let given = { ..walked.fold(no_cost(), then), size: None, of: Other, fun: None };
       let sizes = walked.map(|w: CostSummary| w.size);
@@ -1089,9 +1092,9 @@ fn application(
           } else if env.context.claims.definitions.contains(name)
               && !by_entry(env.context, name, CostClause) {
             match read(env, name) {
-              Err(why) -> Err(why),
+              Err(reason) -> Err(reason),
               Ok(p) -> match at_args(p, sizes, funs) {
-                Err(why) -> Err(why),
+                Err(reason) -> Err(reason),
                 Ok(q) ->
                   Ok({
                     ..add(given, plus(constant(), q)),
@@ -1111,7 +1114,7 @@ fn application(
             l.body,
             sizes.map(|s: Option<Polynomial>| s),
           ) {
-          Err(why) -> Err(why),
+          Err(reason) -> Err(reason),
           Ok(w) -> Ok({ ..add(then(given, w), constant()), of: Other, fun: None }),
         },
         _ -> Err("a call of a computed function the bound does not read"),
@@ -1167,12 +1170,12 @@ fn builtin(
         None -> Err("a builtin called without its callback"),
         Some(cb) -> callback_steps(env, cb, it.params.len()),
       } {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(body) -> match calls_made(it, sizes) {
         None -> Err("an iteration over a value whose size is not read"),
         Some(n) -> match product(n, plus(constant(), body)) {
           Ok(p) -> Ok({ ..add(one, p), size: result_size(it, sizes) }),
-          Err(why) -> Err(why),
+          Err(reason) -> Err(reason),
         },
       },
     },
@@ -1205,7 +1208,7 @@ pub fn calls_made(it: CallbackUse, sizes: List<Option<Polynomial>>) -> Option<Po
       match ((acc, sizes.at(k))) { (Some(p), Some(Some(s))) -> Some(plus(p, s)), _ -> None },
   )
 
-/// The size of what a call of `it`'s function answers, at the sizes of its arguments: a list as
+/// The size of what a call of `it`'s function returns, at the sizes of its arguments: a list as
 /// long as what it walks at most, or the argument it updates.
 pub fn result_size(it: CallbackUse, sizes: List<Option<Polynomial>>) -> Option<Polynomial> = {
   let at = |k: Int| match sizes.at(k) { Some(s) -> s, None -> None };
@@ -1250,7 +1253,7 @@ fn callback_steps(env: Env, cb: Code, arity: Int) -> Result<Polynomial, String> 
         l.body,
         range(0, arity).map(|_i: Int| None),
       ) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(w) -> if w.calls > 0 { Err("a call back inside an iteration") } else { Ok(w.cost) },
     },
     CodeVar(f) -> match slot_at(env, f.slot).fun {
@@ -1263,7 +1266,7 @@ fn callback_steps(env: Env, cb: Code, arity: Int) -> Result<Polynomial, String> 
       else if name == env.own { Err("a call back inside an iteration") }
       else if env.context.claims.definitions.contains(name) {
         match read(env, name) {
-          Err(why) -> Err(why),
+          Err(reason) -> Err(reason),
           Ok(p) ->
             at_args(p, range(0, arity).map(|_i: Int| None), range(0, arity).map(|_i: Int| None)),
         }
@@ -1283,7 +1286,7 @@ pub fn context_owning(
   owned: (Bytes) -> Bool,
 ) -> Context / {abort.raise} =
   match analyse(parse_all(sources)) {
-    Refused(ds) ->
+    Rejected(ds) ->
       panic(
         "the fixture checks: "
           ++ String::of_bytes_lossy(
@@ -1310,7 +1313,7 @@ fn shown_in(context: Context, name: String) -> Result<Bool, String> / {abort.rai
         match stated_cost(b, d.params, d.cost_parameters) {
           None -> Err("the bound is not read"),
           Some(bound) -> match steps(context, name) {
-            Err(why) -> Err(why),
+            Err(reason) -> Err(reason),
             Ok(p) -> Ok(dominated(p, bound)),
           },
         }
@@ -1478,7 +1481,7 @@ test "the prelude's `map`, `filter` and `fold` take the steps their `cost` bound
   )
 }
 
-test "a call of the prelude's `map` costs what its bound states, and answers a list no longer" {
+test "a call of the prelude's `map` costs what its bound states, and returns a list no longer" {
   let costed = |bound: Bytes|
     context_owning(
       [
@@ -1506,16 +1509,16 @@ test "a call of the prelude's `map` costs what its bound states, and answers a l
 fn coded(n: Node) -> Code = { node: n, span: dummy_span(), ty: int_type() }
 
 fn called(f: Node, arg: Code) -> Code =
-  coded(CodeApply({ function: coded(f), args: [arg], row: row_empty() }))
+  coded(CodeApply({ function: coded(f), args: [arg], effects: no_effects() }))
 
 fn length(k: Int) -> Code =
   called(
-    NBuiltin({ name: b"List::len", args: [], rows: [] }),
+    NBuiltin({ name: b"List::len", args: [], effect_arguments: [] }),
     coded(CodeVar({ name: b"xs", slot: k })),
   )
 
 fn logged_of(c: Code) -> Code =
-  called(NDefinition({ full: b"std.math.ilog2", args: [], rows: [], labels: [] }), c)
+  called(NDefinition({ full: b"std.math.ilog2", args: [], effect_arguments: [], labels: [] }), c)
 
 fn op(name: Bytes, l: Code, r: Code) -> Code = coded(CodeBinary({ op: name, lhs: l, rhs: r }))
 
@@ -1689,7 +1692,7 @@ test "a definition that holds a value compared by a key leaves its steps unread"
       rest,
     );
   let unread = |r: Result<Bool, String>|
-    match r { Err(why) -> why.contains("compared by its type's `key`"), Ok(_) -> false };
+    match r { Err(reason) -> reason.contains("compared by its type's `key`"), Ok(_) -> false };
   assert(
     unread(
       shown(

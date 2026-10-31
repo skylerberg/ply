@@ -1,6 +1,6 @@
-import compiler.check.types (Atom, Row, Resource, NamedResource, SingletonResource,
+import compiler.check.types (Effect, Effects, Resource, NamedResource, SingletonResource,
                              ResourceVariable, AnyResource, Scheme, Type, FunctionType, NamedType,
-                             atom_lt, resource_covers, fn_type, unit_type, row_empty)
+                             effect_lt, resource_covers, fn_type, unit_type, no_effects)
 import compiler.syntax.type_syntax (ReadMode)
 import compiler.emit.keys (Evidence)
 import compiler.emit.typed_ir (Var)
@@ -8,7 +8,7 @@ import std.bytes (ascii_of_int)
 
 pub fn evidence_type() -> Type = NamedType({ name: b"?evidence", args: [] })
 
-pub fn instance_block_type() -> Type = fn_type([], unit_type(), row_empty())
+pub fn instance_block_type() -> Type = fn_type([], unit_type(), no_effects())
 
 pub fn evidence_array_type() -> Type = NamedType({ name: evidence_array_name(), args: [] })
 
@@ -24,10 +24,10 @@ pub fn evidence_array_length(t: Type) -> Option<Int> / {abort.raise} =
 
 fn evidence_array_name() -> Bytes = b"?evidence_words"
 
-pub fn row_descriptor_type() -> Type = NamedType({ name: b"?row", args: [] })
+pub fn effects_descriptor_type() -> Type = NamedType({ name: b"?row", args: [] })
 
 pub fn is_evidence(t: Type) -> Bool =
-  t == evidence_type() || t == row_descriptor_type()
+  t == evidence_type() || t == effects_descriptor_type()
     || (match t { NamedType(c) -> c.name == evidence_array_name(), _ -> false })
 
 pub fn declared_arity(params: List<Var>) -> Int = params.filter(|v: Var| !is_evidence(v.ty)).len()
@@ -38,10 +38,10 @@ pub fn evidence_param_count(n: Int) -> Int = if n <= max_evidence_params() { n }
 
 pub fn needs_evidence(name: Bytes) -> Bool = name != b"diverges" && name != b"scoped"
 
-fn as_atom(w: Evidence) -> Atom =
+fn as_effect(w: Evidence) -> Effect =
   { effect: w.effect, resource: w.resource, mode: ReadMode, op: None }
 
-pub fn precedes(a: Evidence, b: Evidence) -> Bool = atom_lt(as_atom(a), as_atom(b))
+pub fn precedes(a: Evidence, b: Evidence) -> Bool = effect_lt(as_effect(a), as_effect(b))
 
 pub fn sorted_by_evidence<a>(xs: List<a>, by: (a) -> Evidence) -> List<a> =
   xs.fold([], |out: List<a>, x: a| {
@@ -49,9 +49,9 @@ pub fn sorted_by_evidence<a>(xs: List<a>, by: (a) -> Evidence) -> List<a> =
     out.take(at).push(x).concat(out.drop(at))
   })
 
-pub fn evidence_for_atoms(atoms: List<Atom>) -> List<Evidence> =
+pub fn evidence_for_effects(effects: List<Effect>) -> List<Evidence> =
   sorted_by_evidence(
-    atoms.fold([], |ws: List<Evidence>, a: Atom|
+    effects.fold([], |ws: List<Evidence>, a: Effect|
       if !needs_evidence(a.effect) { ws } else {
         let w = { effect: a.effect, resource: a.resource };
         if ws.contains(w) { ws } else { ws.push(w) }
@@ -62,29 +62,29 @@ pub fn evidence_for_atoms(atoms: List<Atom>) -> List<Evidence> =
 pub fn covers(have: Evidence, want: Evidence) -> Bool =
   have.effect == want.effect && resource_covers(have.resource, want.resource)
 
-pub fn offset_labels(row: List<Evidence>, labels: Int) -> List<Evidence> =
-  row.map(|w: Evidence|
+pub fn offset_labels(effects: List<Evidence>, labels: Int) -> List<Evidence> =
+  effects.map(|w: Evidence|
     match w.resource {
       ResourceVariable(k) -> { ..w, resource: ResourceVariable(labels + k) },
       _ -> w,
     })
 
-pub fn passed_label_count(rows: List<List<Evidence>>) -> Int =
-  rows.fold(0, |n: Int, r: List<Evidence>|
+pub fn passed_label_count(effect_evidence: List<List<Evidence>>) -> Int =
+  effect_evidence.fold(0, |n: Int, r: List<Evidence>|
     r.fold(n, |m: Int, w: Evidence|
       match w.resource { ResourceVariable(k) -> if k + 1 > m { k + 1 } else { m }, _ -> m }))
 
 pub type KeyedEvidence = { key: Evidence, from: Int }
 
 pub fn renumber_labels(
-  rows: List<List<Evidence>>,
-) -> { rows: List<List<KeyedEvidence>>, sources: List<Int> } / {abort.raise} =
-  rows.fold(
-    { rows: [], sources: [] },
-    |acc: { rows: List<List<KeyedEvidence>>, sources: List<Int> }, r: List<Evidence>| {
+  effect_evidence: List<List<Evidence>>,
+) -> { effect_evidence: List<List<KeyedEvidence>>, sources: List<Int> } / {abort.raise} =
+  effect_evidence.fold(
+    { effect_evidence: [], sources: [] },
+    |acc: { effect_evidence: List<List<KeyedEvidence>>, sources: List<Int> }, r: List<Evidence>| {
       let done = range(0, r.len()).fold(
-        { row: [], sources: acc.sources },
-        |inner: { row: List<KeyedEvidence>, sources: List<Int> }, i: Int| {
+        { evidence: [], sources: acc.sources },
+        |inner: { evidence: List<KeyedEvidence>, sources: List<Int> }, i: Int| {
           let w = r.get(i);
           match w.resource {
             ResourceVariable(p) -> {
@@ -94,11 +94,14 @@ pub fn renumber_labels(
                 Some(k) ->
                   {
                     ..inner,
-                    row: inner.row.push({ key: { ..w, resource: ResourceVariable(k) }, from: i }),
+                    evidence: inner.evidence.push({
+                      key: { ..w, resource: ResourceVariable(k) },
+                      from: i,
+                    }),
                   },
                 None ->
                   {
-                    row: inner.row.push({
+                    evidence: inner.evidence.push({
                       key: { ..w, resource: ResourceVariable(inner.sources.len()) },
                       from: i,
                     }),
@@ -106,63 +109,72 @@ pub fn renumber_labels(
                   },
               }
             },
-            _ -> { ..inner, row: inner.row.push({ key: w, from: i }) },
+            _ -> { ..inner, evidence: inner.evidence.push({ key: w, from: i }) },
           }
         },
       );
       {
-        rows: acc.rows.push(sorted_by_evidence(done.row, |k: KeyedEvidence| k.key)),
+        effect_evidence: acc.effect_evidence.push(
+          sorted_by_evidence(done.evidence, |k: KeyedEvidence| k.key),
+        ),
         sources: done.sources,
       }
     },
   )
 
-pub fn key_rows_of(rows: List<List<KeyedEvidence>>) -> List<List<Evidence>> =
-  rows.map(|r: List<KeyedEvidence>| r.map(|k: KeyedEvidence| k.key))
+pub fn key_effects_of(effect_evidence: List<List<KeyedEvidence>>) -> List<List<Evidence>> =
+  effect_evidence.map(|r: List<KeyedEvidence>| r.map(|k: KeyedEvidence| k.key))
 
-pub fn declared_row(s: Scheme) -> Row =
-  match s.ty { FunctionType(f) -> in_scheme(s, f.effects), _ -> { atoms: [], tail: None } }
+pub fn declared_effects(s: Scheme) -> Effects =
+  match s.ty { FunctionType(f) -> in_scheme(s, f.effects), _ -> { listed: [], variable: None } }
 
-pub fn in_scheme(s: Scheme, row: Row) -> Row =
+pub fn in_scheme(s: Scheme, effects: Effects) -> Effects =
   {
-    atoms: row.atoms.map(|a: Atom|
+    listed: effects.listed.map(|a: Effect|
       match a.resource {
         ResourceVariable(v) -> { ..a, resource: ResourceVariable(index_in(s.label_variables, v)) },
         _ -> a,
       }),
-    tail: match row.tail { Some(v) -> Some(index_in(s.row_variables, v)), None -> None },
+    variable: match effects.variable {
+      Some(v) -> Some(index_in(s.effect_variables, v)),
+      None -> None,
+    },
   }
 
 fn index_in(vs: List<Int>, v: Int) -> Int =
   range(0, vs.len()).fold(0 - 1, |found: Int, i: Int|
     if found < 0 && vs.at(i) == Some(v) { i } else { found })
 
-pub type RowEvidence = { evidence: Evidence, through: Bool }
+pub type EffectsEvidence = { evidence: Evidence, through: Bool }
 
-pub fn row_evidence(row: Row, rows: List<List<Evidence>>, labels: Int) -> List<RowEvidence> =
+pub fn effects_evidence(
+  effects: Effects,
+  effect_evidence: List<List<Evidence>>,
+  labels: Int,
+) -> List<EffectsEvidence> =
   sorted_by_evidence(
-    evidence_for_atoms(row.atoms).map(|e: Evidence| { evidence: e, through: false }).concat(
-      match row.tail {
-        Some(t) -> match rows.at(t) {
+    evidence_for_effects(effects.listed).map(|e: Evidence| { evidence: e, through: false }).concat(
+      match effects.variable {
+        Some(t) -> match effect_evidence.at(t) {
           Some(r) -> offset_labels(r, labels).map(|e: Evidence| { evidence: e, through: true }),
           None -> [],
         },
         None -> [],
       },
     ),
-    |o: RowEvidence| o.evidence,
+    |o: EffectsEvidence| o.evidence,
   )
 
-test "a row's words are one per effect and resource of an answered effect, in order" {
-  let atom = |e: Bytes, op: Bytes, r: Resource|
+test "the effects' words are one per effect and resource of a handled effect, in order" {
+  let entry = |e: Bytes, op: Bytes, r: Resource|
     { effect: e, resource: r, mode: ReadMode, op: Some(op) };
-  let ws = evidence_for_atoms([
-    atom(b"m.log", b"note", SingletonResource),
-    atom(b"diverges", b"x", SingletonResource),
-    atom(b"m.log", b"put", SingletonResource),
-    atom(b"m.net", b"send", NamedResource(b"conn")),
-    atom(b"abort", b"raise", SingletonResource),
-    atom(b"m.net", b"send", ResourceVariable(0)),
+  let ws = evidence_for_effects([
+    entry(b"m.log", b"note", SingletonResource),
+    entry(b"diverges", b"x", SingletonResource),
+    entry(b"m.log", b"put", SingletonResource),
+    entry(b"m.net", b"send", NamedResource(b"conn")),
+    entry(b"abort", b"raise", SingletonResource),
+    entry(b"m.net", b"send", ResourceVariable(0)),
   ]);
   assert_eq(ws, [
     { effect: b"abort", resource: SingletonResource },
@@ -178,30 +190,33 @@ test "a caller's labels are numbered as the callee's key holds them, once each, 
     [w(NamedResource(b"a")), w(ResourceVariable(3))],
     [w(ResourceVariable(1)), w(ResourceVariable(3))],
   ]);
-  assert_eq(key_rows_of(k.rows), [
+  assert_eq(key_effects_of(k.effect_evidence), [
     [w(NamedResource(b"a")), w(ResourceVariable(0))],
     [w(ResourceVariable(0)), w(ResourceVariable(1))],
   ]);
-  assert_eq(k.rows.map(|r: List<KeyedEvidence>| r.map(|x: KeyedEvidence| x.from)), [
+  assert_eq(k.effect_evidence.map(|r: List<KeyedEvidence>| r.map(|x: KeyedEvidence| x.from)), [
     [0, 1],
     [1, 0],
   ]);
   assert_eq(k.sources, [3, 1]);
-  assert_eq(passed_label_count(key_rows_of(k.rows)), 2);
+  assert_eq(passed_label_count(key_effects_of(k.effect_evidence)), 2);
   assert_eq(offset_labels([w(ResourceVariable(1))], 1), [w(ResourceVariable(2))])
 }
 
-test "words through a row variable stand apart from the row's own, alike ones in the order they came" {
+test "words through an effect variable stand apart from those of the listed effects, alike ones in the order they came" {
   let log = { effect: b"m.log", resource: SingletonResource };
-  let row = {
-    atoms: [{ effect: b"m.log", resource: SingletonResource, mode: ReadMode, op: Some(b"note") }],
-    tail: Some(0),
+  let effects = {
+    listed: [{ effect: b"m.log", resource: SingletonResource, mode: ReadMode, op: Some(b"note") }],
+    variable: Some(0),
   };
-  assert_eq(row_evidence(row, [[log, { effect: b"abort", resource: SingletonResource }]], 0), [
-    { evidence: { effect: b"abort", resource: SingletonResource }, through: true },
-    { evidence: log, through: false },
-    { evidence: log, through: true },
-  ]);
+  assert_eq(
+    effects_evidence(effects, [[log, { effect: b"abort", resource: SingletonResource }]], 0),
+    [
+      { evidence: { effect: b"abort", resource: SingletonResource }, through: true },
+      { evidence: log, through: false },
+      { evidence: log, through: true },
+    ],
+  );
   assert_eq(
     covers({ effect: b"m.net", resource: AnyResource }, {
       effect: b"m.net",

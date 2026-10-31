@@ -10,9 +10,9 @@ import compiler.check.known (array_name, bool_name, bytes_name, char_name, colum
                              none_constructor, ok_constructor, option_name, result_name,
                              some_constructor, string_name, unit_name, ordering_type)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
-                             Field, Scheme, Row, Atom, int_type, bytes_type, bool_type, unit_type,
-                             string_type, float_type, list_type, option_type, fn_type, monomorphic,
-                             row_empty, row_open, arg_row, fields_sorted)
+                             Field, Scheme, Effects, Effect, int_type, bytes_type, bool_type,
+                             unit_type, string_type, float_type, list_type, option_type, fn_type,
+                             monomorphic, no_effects, open_effects, arg_effects, fields_sorted)
 import compiler.emit.typing (unknown_type)
 import std.list
 import std.list (zip)
@@ -24,7 +24,7 @@ import compiler.emit.keys (RootKey, Generated, TypeOp, Reflect, Show, Digest, Co
                            Lift, Keeping, Opening, root_name, root_text, op_name)
 import compiler.emit.representations (Constructors, SumConstructor, OpenShape, Definition,
                                       EmitParam, at_args, kind_of, runtime_object, holds_resource,
-                                      constructor_fields_at, release_row)
+                                      constructor_fields_at, release_effects)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.marks (marked_type, marked_key, without_marks, dynamic_form, has_marks)
 import compiler.store.hash.template (emitted_code)
@@ -77,7 +77,7 @@ pub fn container_definitions(module: Bytes, t: Type) -> List<Definition> / {abor
       pure: true,
       constant: false,
       arity: typed.params.len(),
-      scheme: Some(monomorphic(fn_type(typed.params, typed.ret, row_empty()))),
+      scheme: Some(monomorphic(fn_type(typed.params, typed.ret, no_effects()))),
       witnesses: 0,
       borrowed: [],
       root: root,
@@ -103,7 +103,7 @@ pub type GeneratedRoot = {
   params: List<EmitParam>,
   code: Code,
   here: List<Definition>,
-  performs: Row,
+  performs: Effects,
 }
 
 pub fn container_code(
@@ -114,7 +114,7 @@ pub fn container_code(
 ) -> GeneratedRoot / {abort.raise} =
   if strings_root(op) {
     let s = strings_code(module, op, t);
-    { params: s.params, code: s.code, here: s.here, performs: row_empty() }
+    { params: s.params, code: s.code, here: s.here, performs: no_effects() }
   } else {
     let e = container_walk_code(module, constructors, op, t);
     let word = |n: Bytes|
@@ -132,7 +132,7 @@ pub fn container_code(
       else { [word(b"a")] },
       code: e.code,
       here: e.here,
-      performs: row_empty(),
+      performs: no_effects(),
     }
   }
 
@@ -491,7 +491,13 @@ fn container_walk_code(
 pub fn name_in_module(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
-pub type InstanceFn = { full: Bytes, args: List<Type>, fn_type: Type, ret: Type, rows: List<Row> }
+pub type InstanceFn = {
+  full: Bytes,
+  args: List<Type>,
+  fn_type: Type,
+  ret: Type,
+  effect_arguments: List<Effects>,
+}
 
 pub fn key_instance(
   module: Bytes,
@@ -554,11 +560,11 @@ fn instance_for(
                 if written.at(i) == Some(VariableType(v)) {
                   match c.args.at(i) { Some(t) -> t, None -> found }
                 } else { found }));
-            let rows = sc.row_variables.map(|v: Int|
-              range(0, written.len()).fold(row_empty(), |found: Row, i: Int|
+            let effect_arguments = sc.effect_variables.map(|v: Int|
+              range(0, written.len()).fold(no_effects(), |found: Effects, i: Int|
                 match ((written.at(i), c.args.at(i))) {
-                  (Some(w), Some(given)) -> if arg_row(w) == Some(row_open(v)) {
-                    match arg_row(given) { Some(r) -> r, None -> found }
+                  (Some(w), Some(given)) -> if arg_effects(w) == Some(open_effects(v)) {
+                    match arg_effects(given) { Some(r) -> r, None -> found }
                   } else { found },
                   _ -> found,
                 }));
@@ -567,7 +573,7 @@ fn instance_for(
               args: args,
               fn_type: at_args(sc.ty, sc.type_variables, args),
               ret: at_args(fn_type.ret, sc.type_variables, args),
-              rows: rows,
+              effect_arguments: effect_arguments,
             })
           },
           _ -> None,
@@ -580,7 +586,10 @@ fn instance_for(
 
 fn stated_call(s: InstanceFn, args: List<Code>) -> Code =
   applied(
-    bare(NDefinition({ full: s.full, args: s.args, rows: s.rows, labels: [] }), s.fn_type),
+    bare(
+      NDefinition({ full: s.full, args: s.args, effect_arguments: s.effect_arguments, labels: [] }),
+      s.fn_type,
+    ),
     args,
     s.ret,
   )
@@ -970,7 +979,7 @@ pub fn let_go_code(
                 items,
                 [ty, int_type()],
                 unit_type(),
-                release_row(constructors, ty),
+                release_effects(constructors, ty),
               ),
             ],
           }
@@ -1013,7 +1022,7 @@ pub fn let_go_code(
       _ -> { code: unit_code(), here: [] },
     },
   };
-  generated_root(module, key, [ty], unit_type(), body, release_row(constructors, ty))
+  generated_root(module, key, [ty], unit_type(), body, release_effects(constructors, ty))
 }
 
 pub fn let_go_items_code(
@@ -1051,7 +1060,7 @@ pub fn let_go_items_code(
       ),
       here: [],
     },
-    release_row(constructors, ty),
+    release_effects(constructors, ty),
   )
 }
 
@@ -1104,12 +1113,12 @@ pub fn marshal_root(
         ContainerWalk(c) -> match if dynamic_loops().contains(c) { dynamic_loop(module, c, marked) }
           else { marshal_loop(module, c, w.ty, marked) } {
           Some(r) -> r,
-          None -> uncrossed(b"a root no crossing runs"),
+          None -> uncrossed(b"a root no marshalling runs"),
         },
-        _ -> uncrossed(b"a root no crossing runs"),
+        _ -> uncrossed(b"a root no marshalling runs"),
       }
     },
-    _ -> uncrossed(b"a root no crossing runs"),
+    _ -> uncrossed(b"a root no marshalling runs"),
   }
 
 fn dynamic_loops() -> List<Bytes> =
@@ -1188,7 +1197,7 @@ fn dynamic_code(
       uncrossed(b"a value of a runtime object an operation's own type parameter stands in")
     } else {
       match constructors.sums.get(c.name) {
-        None -> uncrossed(b"a kept crossing of a type no root writes: ".concat(c.name)),
+        None -> uncrossed(b"a kept marshalling of a type no root writes: ".concat(c.name)),
         Some(cs) -> {
           let arms = cs.fold(
             { arms: [], slot: 1 },
@@ -1224,7 +1233,7 @@ fn dynamic_code(
     RecordType(fs) -> dynamic_record(a, fs, into, keeping),
     NominalType(x) -> dynamic_record(a, x.fields, into, keeping),
     FunctionType(f) -> dynamic_function(f.params, f.ret, from, into, keeping),
-    VariableType(_) -> uncrossed(b"a kept crossing at a type variable"),
+    VariableType(_) -> uncrossed(b"a kept marshalling at a type variable"),
   }
 }
 
@@ -1265,7 +1274,7 @@ fn dynamic_function(
   let called = applied(slot_code(b"f", n, from), args, dynamic_side(ret, !keeping));
   let ty = match into {
     FunctionType(g) -> g,
-    _ -> { params: params, kept: [], once: false, ret: ret, effects: row_empty() },
+    _ -> { params: params, kept: [], once: false, ret: ret, effects: no_effects() },
   };
   {
     code: bare(
@@ -1276,7 +1285,7 @@ fn dynamic_function(
         body: dynamic_part(called, ret, keeping),
         at: placed(0),
         ty: ty,
-        row: row_empty(),
+        effects: no_effects(),
       }),
       FunctionType(ty),
     ),
@@ -1348,7 +1357,7 @@ fn dynamic_loop(module: Bytes, op: Bytes, over: Type) -> Option<GeneratedRoot> /
   }
 }
 
-fn uncrossed<a>(why: Bytes) -> a / {abort.raise} = panic(String::of_bytes_lossy(why))
+fn uncrossed<a>(reason: Bytes) -> a / {abort.raise} = panic(String::of_bytes_lossy(reason))
 
 fn marshal_loop(
   module: Bytes,
@@ -1392,11 +1401,11 @@ pub fn runtime_entry_code(
   root: RootKey,
   callee: RootKey,
   at: List<Type>,
-  rows: List<Row>,
+  rows: List<Effects>,
   params: List<Type>,
-  answer: Type,
-  row: Row,
-  hosts: List<{ call: Bytes, effect: Bytes, adds: List<Atom> }>,
+  result: Type,
+  effects: Effects,
+  hosts: List<{ call: Bytes, effect: Bytes, adds: List<Effect> }>,
   pure: Bool = false,
 ) -> GeneratedRoot / {abort.raise} = {
   let key = keys::EntryPoint(root);
@@ -1415,25 +1424,35 @@ pub fn runtime_entry_code(
     slot_code(b"p".concat(ascii_of_int(i)), i, params.get(i)));
   let direct = applied(
     bare(
-      NDefinition({ full: qualified_root(module, callee), args: at, rows: rows, labels: [] }),
-      fn_type(params, answer, { atoms: row.atoms, tail: None }),
+      NDefinition({
+        full: qualified_root(module, callee),
+        args: at,
+        effect_arguments: rows,
+        labels: [],
+      }),
+      fn_type(params, result, { listed: effects.listed, variable: None }),
     ),
     reads,
-    answer,
+    result,
   );
   let generic = at.len() > 0 || rows.len() > 0;
   let called = hosts.reverse().fold(
-    { code: direct, atoms: row.atoms, n: 0 },
-    |inner: { code: Code, atoms: List<Atom>, n: Int }, host: { call: Bytes, effect: Bytes, adds: List<Atom> }| {
-      let performs = { atoms: inner.atoms, tail: None };
-      let lambda_type = { params: [], kept: [], once: false, ret: answer, effects: row_empty() };
-      let left = inner.atoms.filter(|a: Atom| a.effect != host.effect);
-      let leaves = { atoms: left, tail: None };
+    { code: direct, listed: effects.listed, n: 0 },
+    |inner: { code: Code, listed: List<Effect>, n: Int }, host: { call: Bytes, effect: Bytes, adds: List<Effect> }| {
+      let performs = { listed: inner.listed, variable: None };
+      let lambda_type = { params: [], kept: [], once: false, ret: result, effects: no_effects() };
+      let left = inner.listed.filter(|a: Effect| a.effect != host.effect);
+      let leaves = { listed: left, variable: None };
       {
         code: applied(
           bare(
-            NDefinition({ full: host.call, args: [answer], rows: [leaves], labels: [] }),
-            fn_type([FunctionType({ ..lambda_type, effects: performs })], answer, leaves),
+            NDefinition({
+              full: host.call,
+              args: [result],
+              effect_arguments: [leaves],
+              labels: [],
+            }),
+            fn_type([FunctionType({ ..lambda_type, effects: performs })], result, leaves),
           ),
           [
             bare(
@@ -1444,22 +1463,22 @@ pub fn runtime_entry_code(
                 body: inner.code,
                 at: placed(inner.n),
                 ty: lambda_type,
-                row: performs,
+                effects: performs,
               }),
               FunctionType(lambda_type),
             ),
           ],
-          answer,
+          result,
         ),
-        atoms: host.adds.fold(left, |acc: List<Atom>, a: Atom|
+        listed: host.adds.fold(left, |acc: List<Effect>, a: Effect|
           if acc.contains(a) { acc } else { acc.push(a) }),
         n: inner.n + 1,
       }
     },
   );
   {
-    ..generated_root(module, key, [], unit_type(), { code: block_code(read.push(CodeDo({ code: native_call(b"?lift_close", [], unit_type()) })), builtin_call(b"?lower", [answer], [called.code], unit_type())), here: if generic { [] } else { [called_definition(module, callee, params, answer, { atoms: row.atoms, tail: None }, pure)] } }),
-    performs: { atoms: called.atoms, tail: None },
+    ..generated_root(module, key, [], unit_type(), { code: block_code(read.push(CodeDo({ code: native_call(b"?lift_close", [], unit_type()) })), builtin_call(b"?lower", [result], [called.code], unit_type())), here: if generic { [] } else { [called_definition(module, callee, params, result, { listed: effects.listed, variable: None }, pure)] } }),
+    performs: { listed: called.listed, variable: None },
   }
 }
 
@@ -1467,18 +1486,18 @@ pub fn called_definition(
   module: Bytes,
   root: RootKey,
   params: List<Type>,
-  answer: Type,
-  row: Row,
+  result: Type,
+  effects: Effects,
   pure: Bool,
 ) -> Definition / {abort.raise} =
   {
     name: name_in_module(module, root_text(root_name(root))),
-    ret: Some(kind_of(answer).kind),
+    ret: Some(kind_of(result).kind),
     return_type: OpenShape([]),
     pure: pure,
     constant: false,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, answer, row))),
+    scheme: Some(monomorphic(fn_type(params, result, effects))),
     witnesses: 0,
     borrowed: [],
     root: root,
@@ -1564,7 +1583,7 @@ fn lowering_code(
       }
     } else {
       match constructors.sums.get(c.name) {
-        None -> uncrossed(b"a crossing of a type no root writes: ".concat(c.name)),
+        None -> uncrossed(b"marshalling of a type no root writes: ".concat(c.name)),
         Some(cs) -> {
           let arms = cs.fold(
             { arms: [], slot: 1 },
@@ -1598,7 +1617,7 @@ fn lowering_code(
     RecordType(fs) -> record_lowered(a, fs),
     NominalType(x) -> record_lowered(a, x.fields),
     FunctionType(_) -> alone(out(b"?out_fun", [a, bytes_code(b"")])),
-    VariableType(_) -> uncrossed(b"a crossing at a type variable"),
+    VariableType(_) -> uncrossed(b"marshalling at a type variable"),
   }
 }
 
@@ -1639,7 +1658,7 @@ fn lifting_code(
   let counted = |t: Int| native_call(b"?in_count", [int_code(t)], int_type());
   match ty {
     NamedType(c) -> if (c.name == b"^" && c.args.len() == 1) || runtime_object(c.name) {
-      uncrossed(b"a lifting of a value the runtime keeps, which `crosses` refuses")
+      uncrossed(b"a lifting of a value the runtime keeps, which `crosses` rejects")
     } else if c.args.len() == 0 && c.name == unit_name() { alone(sequence([tag, unit_code()])) }
     else if c.args.len() == 0 && c.name == bool_name() {
       alone(binary_of(b"eq", tag, int_code(tag_true())))
@@ -1712,7 +1731,7 @@ fn lifting_code(
       }
     } else {
       match constructors.sums.get(c.name) {
-        None -> uncrossed(b"a crossing of a type no root reads: ".concat(c.name)),
+        None -> uncrossed(b"marshalling of a type no root reads: ".concat(c.name)),
         Some(cs) -> {
           let made = cs.map(|sc: SumConstructor| {
             let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
@@ -1748,8 +1767,8 @@ fn lifting_code(
     },
     RecordType(fs) -> record_lifted(held, fs),
     NominalType(x) -> record_lifted(held, x.fields),
-    FunctionType(_) -> uncrossed(b"a function crossing back from the runtime"),
-    VariableType(_) -> uncrossed(b"a crossing at a type variable"),
+    FunctionType(_) -> uncrossed(b"a function marshalled back from the runtime"),
+    VariableType(_) -> uncrossed(b"marshalling at a type variable"),
   }
 }
 
@@ -2026,9 +2045,9 @@ fn generated_root(
   module: Bytes,
   key: RootKey,
   params: List<Type>,
-  answer: Type,
+  result: Type,
   body: { code: Code, here: List<Definition> },
-  row: Row = { atoms: [], tail: None },
+  effects: Effects = { listed: [], variable: None },
 ) -> GeneratedRoot / {abort.raise} =
   {
     params: range(0, params.len()).map(|i: Int| {
@@ -2037,8 +2056,8 @@ fn generated_root(
       { name: param_name(key, i), kind: k.kind, ty: k.ty, of: Some(t), lambda: None }
     }),
     code: body.code,
-    here: [definition_of(module, key, params, answer, row)].concat(body.here),
-    performs: row_empty(),
+    here: [definition_of(module, key, params, result, effects)].concat(body.here),
+    performs: no_effects(),
   }
 
 fn param_name(key: RootKey, i: Int) -> Bytes =
@@ -2060,17 +2079,17 @@ fn definition_of(
   module: Bytes,
   key: RootKey,
   params: List<Type>,
-  answer: Type,
-  row: Row = { atoms: [], tail: None },
+  result: Type,
+  effects: Effects = { listed: [], variable: None },
 ) -> Definition / {abort.raise} =
   {
     name: name_in_module(module, root_text(root_name(key))),
-    ret: Some(kind_of(answer).kind),
+    ret: Some(kind_of(result).kind),
     return_type: OpenShape([]),
-    pure: row.atoms.len() == 0,
+    pure: effects.listed.len() == 0,
     constant: false,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, answer, row))),
+    scheme: Some(monomorphic(fn_type(params, result, effects))),
     witnesses: 0,
     borrowed: [],
     root: key,
@@ -2082,8 +2101,13 @@ fn qualified_root(module: Bytes, key: RootKey) -> Bytes / {abort.raise} =
 fn call_of(module: Bytes, key: RootKey, args: List<Code>, ret: Type) -> Code / {abort.raise} =
   applied(
     bare(
-      NDefinition({ full: qualified_root(module, key), args: [], rows: [], labels: [] }),
-      fn_type(args.map(|a: Code| a.ty), ret, row_empty()),
+      NDefinition({
+        full: qualified_root(module, key),
+        args: [],
+        effect_arguments: [],
+        labels: [],
+      }),
+      fn_type(args.map(|a: Code| a.ty), ret, no_effects()),
     ),
     args,
     ret,

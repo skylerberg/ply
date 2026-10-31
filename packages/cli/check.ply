@@ -20,10 +20,10 @@ import std.bytes
 import compiler.store.hash.encoding (hex)
 import std.bin
 import std.hash (blake3)
-import report (CommandOutput, ok_code, count_of, indent, refused, reuse_members, warning_lines,
+import report (CommandOutput, ok_code, count_of, indent, rejected, reuse_members, warning_lines,
                with_front_end)
 import signature (SetLine, Provenance, counted_lines, effect_sets, head_lines, provenance,
-                  provenance_lines, set_lines, atom_texts, raise_text, raise_kind)
+                  provenance_lines, set_lines, effect_texts, raise_text, raise_kind)
 import signature
 import std.term (Style, bold, dim, green, plain)
 import compiler.emit.costs (Report, Costing)
@@ -34,8 +34,8 @@ import compiler.check.infer.checker (DefinitionInfo, TestInfo, EffectInfo, OpInf
                                      RequirementNotShown, UnguardedBuiltin, RaisingCall)
 import compiler.check.infer (dump_flag)
 import compiler.check.resolve.tables (Diagnostic, Label)
-import compiler.check.types (Atom, Type, NamedType, printer_new, print_atom_list, scheme_text,
-                             row_text, type_text, atom_text, named_type)
+import compiler.check.types (Effect, Type, NamedType, printer_new, print_effect_list, scheme_text,
+                             type_text, effect_text, named_type)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise)
 import std.fs (fs)
 import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, parse_string,
@@ -43,7 +43,7 @@ import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, p
 import std.time (time)
 import std.list
 import std.string
-import definitions (scheme_of)
+import definitions (scheme_of, listed_effects_text)
 import proof.obligation (plural)
 import compiler.front.interface (length_prefixed)
 import compiler.syntax.parsing (dummy_span, span_between)
@@ -77,9 +77,6 @@ pub fn quoted(s: String) -> String = {
 
 fn mode_text(m: Mode) -> String =
   match m { ReadMode -> "read", WriteMode -> "write", InvalidMode -> "", RaiseMode -> "raise" }
-
-fn effects_text(atoms: List<Atom>) -> String / {abort.raise} =
-  String::of_bytes_lossy(row_text({ atoms: atoms, tail: None }))
 
 fn module_definitions(name: String, definitions: List<DefinitionInfo>) -> List<DefinitionInfo> =
   definitions.filter(|definition_info: DefinitionInfo|
@@ -309,7 +306,7 @@ fn test_line(style: Style, test_info: TestInfo) -> String / {abort.raise} = {
   let kind = if test_info.nondet { "test/nondet" } else { "test" };
   nested_indent() ++ dim(style, kind) ++ " " ++ quoted(String::of_bytes_lossy(test_info.name))
     ++ " : "
-    ++ dim(style, effects_text(test_info.effects))
+    ++ dim(style, listed_effects_text(test_info.effects))
 }
 
 fn module_block(
@@ -373,7 +370,7 @@ fn type_lines(
 fn set_json(v: SetLine) -> Json =
   object([
     { key: "name", value: Str(v.name) },
-    { key: "expansion", value: Array(json_strings(v.atoms)) },
+    { key: "expansion", value: Array(json_strings(v.listed)) },
     { key: "used_by", value: int(v.used_by) },
   ])
 
@@ -406,12 +403,14 @@ fn provenance_fields(
   [
     {
       key: "written_as",
-      value: Array(json_strings(definition_info.row_aliases.map(String::of_bytes_lossy))),
+      value: Array(json_strings(definition_info.effect_aliases.map(String::of_bytes_lossy))),
     },
     {
       key: "performed",
       value: Array(
-        json_strings(definition_info.performed.map(|a: Atom| String::of_bytes_lossy(atom_text(a)))),
+        json_strings(
+          definition_info.performed.map(|a: Effect| String::of_bytes_lossy(effect_text(a))),
+        ),
       ),
     },
     {
@@ -438,8 +437,8 @@ fn definition_json(
     { key: "simple_name", value: Str(String::of_bytes_lossy(definition_info.simple_name)) },
     { key: "hash", value: Str(String::of_bytes(hex(hash))) },
     { key: "type", value: Str(scheme_of(definition_info)) },
-    { key: "effects", value: Array(json_strings(atom_texts(definition_info.effects))) },
-    { key: "scaling", value: Array(json_strings(atom_texts(definition_info.scaling))) },
+    { key: "effects", value: Array(json_strings(effect_texts(definition_info.effects))) },
+    { key: "scaling", value: Array(json_strings(effect_texts(definition_info.scaling))) },
     { key: "repeats", value: Array(definition_info.repeats.map(|i: Int| int(i))) },
     { key: "ending", value: ending_json(program, located, definition_info) },
   ];
@@ -492,7 +491,7 @@ fn test_json(hash: Bytes, test_info: TestInfo) -> Json / {abort.raise} =
     { key: "module", value: Str(String::of_bytes_lossy(test_info.module)) },
     { key: "hash", value: Str(String::of_bytes(hex(hash))) },
     { key: "nondet", value: Bool(test_info.nondet) },
-    { key: "outside_effects", value: Array(json_strings(atom_texts(test_info.effects))) },
+    { key: "outside_effects", value: Array(json_strings(effect_texts(test_info.effects))) },
   ])
 
 fn operation_json(o: OpInfo) -> Json / {abort.raise} =
@@ -667,7 +666,7 @@ fn checked(
     else { [] },
   };
   let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, frame) };
-  if broken.len() > 0 { refused(style, "check", broken, timed.program.places) } else {
+  if broken.len() > 0 { rejected(style, "check", broken, timed.program.places) } else {
     check_output(
       style,
       flags,
@@ -735,10 +734,10 @@ fn merged_members(front: Json, said: List<Member>) -> Json =
     _ -> object(said),
   }
 
-fn refused_load(flags: Flags, timed: TimedLoad) -> CommandOutput / {abort.raise} = {
+fn rejected_load(flags: Flags, timed: TimedLoad) -> CommandOutput / {abort.raise} = {
   let style = style_of(flags);
   let said = with_front_end(
-    refused(style, "check", timed.program.diagnostics, timed.program.places),
+    rejected(style, "check", timed.program.diagnostics, timed.program.places),
     [{ key: "phases", value: phases_json(timed) }].concat(
       reuse_members(timed.program.tallies, timed.program.lost),
     ),
@@ -751,13 +750,13 @@ fn check_now(
   flags: Flags,
   project: Project,
   started: Int,
-) -> { result: CommandOutput, filed: Option<CommandOutput>, program: Program } / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_reached, toolchain.reuse_dir} = {
+) -> { result: CommandOutput, recorded: Option<CommandOutput>, program: Program } / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_reached, toolchain.reuse_dir} = {
   let t: TimedLoad = timed_over(flags.paths, project, started, flags.verify_dependencies);
   match t.program.frame {
-    None -> { result: refused_load(flags, t), filed: None, program: t.program },
+    None -> { result: rejected_load(flags, t), recorded: None, program: t.program },
     Some(f) -> {
-      let answer = checked(style_of(flags), flags, t, f);
-      { result: answer, filed: Some(answer), program: t.program }
+      let result = checked(style_of(flags), flags, t, f);
+      { result: result, recorded: Some(result), program: t.program }
     },
   }
 }
@@ -771,13 +770,13 @@ pub fn run(
     let key = command_key(module_queries::program_digest(), command_identity(flags));
     let shown = key.hex_of();
     match decode_output(cached_command(flags.paths, project, key)) {
-      Some(answer) -> if !flags.json { answer } else {
-        with_front_end_member(answer, |_: Json|
+      Some(result) -> if !flags.json { result } else {
+        with_front_end_member(result, |_: Json|
           object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(shown) }]))
       },
       None -> {
         let now = check_now(flags, project, started);
-        let filed = match now.filed {
+        let recorded = match now.recorded {
           Some(own) -> cache_command(flags.paths, project, key, now.program, encode_output(own)),
           None -> false,
         };
@@ -786,7 +785,7 @@ pub fn run(
             merged_members(front, [
               { key: "reused", value: Bool(false) },
               { key: "key", value: Str(shown) },
-              { key: "filed", value: Bool(filed) },
+              { key: "filed", value: Bool(recorded) },
             ]))
         }
       },
@@ -794,7 +793,7 @@ pub fn run(
   }
 }
 
-test "a check is asked under its paths, root and the flags that shape its answer, and reads back whole" {
+test "a check is cached under its paths, root and the flags that shape its result, and reads back whole" {
   let flags = { ..no_flags(), paths: [paths::here()] };
   let base = command_identity(flags);
   assert_eq(command_identity(flags), base);
@@ -804,14 +803,14 @@ test "a check is asked under its paths, root and the flags that shape its answer
   assert(command_identity({ ..flags, color: true }) != base);
   assert(command_identity({ ..flags, verify_dependencies: true }) != base);
   assert(command_identity({ ..flags, paths: [paths::at_cwd("app")] }) != base);
-  let answer: CommandOutput = {
+  let result: CommandOutput = {
     json: object([{ key: "ok", value: Bool(true) }]),
     lines: ["   checked 1 module"],
     errs: ["a note"],
     code: 0,
   };
-  assert_eq(decode_output(Some(encode_output(answer))), Some(answer));
-  assert_eq(decode_output(Some(b"not an answer")), None)
+  assert_eq(decode_output(Some(encode_output(result))), Some(result));
+  assert_eq(decode_output(Some(b"not a result")), None)
 }
 
 test "a share is a tenth of a percent, and a run that took no time at all is not a division" {

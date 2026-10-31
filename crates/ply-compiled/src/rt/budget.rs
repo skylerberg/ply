@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// The slow path of a prologue or a loop's restart, for a frame below `ctx.stack_floor`: ends an
 /// entry whose wall clock ran out, which the watchdog marks by raising its floor past every frame;
 /// otherwise makes room below the floor of the stack it runs on and lowers the floor to match.
-/// Answers 1, or 0 with the context failed for a spent clock, a call nesting past what the native
+/// Returns 1, or 0 with the context failed for a spent clock, a call nesting past what the native
 /// stack holds, on a thread's own stack, whose floor is final, on a runtime stack whose reservation
 /// is spent, and on a stack the runtime does not know.
 pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
@@ -58,7 +58,7 @@ pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
 
 /// Runs `call`, which begins compiled code, where that code can make room as it nests: here, on a
 /// stack the runtime knows, or else, on a segment a Rust recursion grew onto, on a runtime stack of
-/// its own for the call's duration. Answers 0 with the context failed when no stack can be had.
+/// its own for the call's duration. Returns 0 with the context failed when no stack can be had.
 pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
     if let Some(floor) = floor_here() {
         unsafe { (*ctx).stack_floor.store(floor, Relaxed) };
@@ -71,13 +71,13 @@ pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
         ctx,
         stack: &stack,
         call: Some(call),
-        answer: 0,
+        result: 0,
         back: 0,
     };
     let handover = &raw mut hop;
     let sp = stack.prepare(hopped::<F>, handover as usize);
     unsafe { switch_keeping(ctx, &raw mut (*handover).back, sp) };
-    unsafe { (*handover).answer }
+    unsafe { (*handover).result }
 }
 
 /// What [`on_known_stack`] hands the stack it hops onto, from its own frame, which outlives the hop.
@@ -85,7 +85,7 @@ struct Hop<'a, F> {
     ctx: *mut Ctx,
     stack: &'a Stack,
     call: Option<F>,
-    answer: Word,
+    result: Word,
     back: usize,
 }
 
@@ -98,9 +98,9 @@ extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
         (*(*hop).ctx).frames = std::ptr::null_mut();
         (*hop).call.take().expect("a hop runs its call once")
     };
-    let answer = call();
+    let result = call();
     let to = unsafe {
-        (*hop).answer = answer;
+        (*hop).result = result;
         (*hop).back
     };
     let mut spent = 0;
@@ -240,7 +240,7 @@ pub(crate) fn floor_here() -> Option<usize> {
 }
 
 /// [`floor_here`], or above every address on a stack the runtime does not know, where a probe then
-/// asks [`rt_stack_more`], which refuses.
+/// asks [`rt_stack_more`], which fails.
 pub(crate) fn stack_floor() -> usize {
     floor_here().unwrap_or(usize::MAX)
 }
@@ -302,7 +302,7 @@ pub(super) fn stack_of_this_thread() -> (usize, usize) {
 }
 
 /// Assumes a spawned thread's default stack below this frame, and every address above that the
-/// thread's: refusing early beats overflowing.
+/// thread's: failing early beats overflowing.
 #[cfg(not(target_os = "macos"))]
 pub(super) fn fallback_stack() -> (usize, usize) {
     let here = 0u8;

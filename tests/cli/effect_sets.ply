@@ -1,19 +1,19 @@
 //! `effect set`s as `ply check --types` prints them: the expansion and never the alias, wrapped at
-//! a fixed column, with the alias, its uses and what a row declares beyond its body under
+//! a fixed column, with the alias, its uses and the effects declared beyond its body under
 //! `--explain`, which also says where a body can raise.
 
 import harness (spawned, scratch, write_program, in_memory, one_module_tree, on_disk, all_output,
                 stdout, json_of, at, nth, items, str, int, json_text, Hermetic, Shipped)
 import cli.report (count_of)
-import cli.signature (width, definition_lines, set_lines, provenance_lines, atom_texts)
-import compiler.check.types (Atom, Row, Scheme, NamedResource, fn_type, named_type)
+import cli.signature (width, definition_lines, set_lines, provenance_lines, effect_texts)
+import compiler.check.types (Effect, Effects, Scheme, NamedResource, fn_type, named_type)
 import compiler.syntax.type_syntax (ReadMode, WriteMode)
 import std.fs (MemFs)
 import std.json (Json, Null, Array, Str)
 import std.string
 
 /// Two `effect set`s, an endpoint that performs less than it declares, and endpoints that write
-/// their rows out.
+/// their effects out.
 fn service() -> String =
   \\effect store {
   \\  read  all[table]() -> List<Int>
@@ -85,8 +85,8 @@ fn own_definitions(report: Json) -> List<Json> =
   items(at(report, "definitions")).filter(|d: Json| str(at(d, "name")).starts_with("m."))
 
 /// What module `m`'s block of the text must say that the `--json` report under the same flags says:
-/// each definition by name with its row's effects and, under `--explain`, each set with its
-/// expansion and its uses, each alias a row was written as, what a row declares beyond what its
+/// each definition by name with its effects and, under `--explain`, each set with its
+/// expansion and its uses, each alias written in effects, the effects declared beyond what its
 /// body performs, and each place a body can raise. Where and how the text lays these out is
 /// `cli.signature`'s.
 fn expected_facts(report: Json) -> List<String> / {abort.raise} = {
@@ -105,7 +105,7 @@ fn expected_facts(report: Json) -> List<String> / {abort.raise} = {
     let unperformed = strings_at(d, "declared_not_performed");
     let undone = match unperformed {
       [] -> [],
-      [atom, ..] -> ["declared, not performed: " ++ atom].concat(strings_at(d, "performed")),
+      [first, ..] -> ["declared, not performed: " ++ first].concat(strings_at(d, "performed")),
     };
     acc.push(name.slice(2, name.len()) ++ " ").concat(strings_at(d, "effects")).concat(
       strings_at(d, "written_as").map(|alias: String| "{" ++ alias),
@@ -122,25 +122,25 @@ fn assert_text_matches_report(text: String, report: Json) -> Unit / {abort.raise
   expected_facts(report).fold((), |u: Unit, fact: String|
     assert(text.contains(fact), Some("`" ++ fact ++ "` is not in:\n" ++ text)))
 
-test "a service's per-endpoint footprints are legible in one command" {
+test "a service's per-endpoint effects are legible in one command" {
   let report = json_types(one_module_tree(service()), []);
   assert_eq(
     own_definitions(report).map(|d: Json|
-      { name: str(at(d, "name")), atoms: strings_at(d, "effects").sort() }),
+      { name: str(at(d, "name")), listed: strings_at(d, "effects").sort() }),
     [
-      { name: "m.table", atoms: [] },
-      { name: "m.health", atoms: [] },
-      { name: "m.list_orders", atoms: ["m.store.read[orders]", "m.store.read[users]"] },
+      { name: "m.table", listed: [] },
+      { name: "m.health", listed: [] },
+      { name: "m.list_orders", listed: ["m.store.read[orders]", "m.store.read[users]"] },
       {
         name: "m.create_order",
-        atoms: [
+        listed: [
           "m.store.read[inventory]",
           "m.store.read[orders]",
           "m.store.read[users]",
           "m.store.write[orders]",
         ],
       },
-      { name: "m.audit", atoms: ["m.store.read[audit]", "m.store.write[audit]"] },
+      { name: "m.audit", listed: ["m.store.read[audit]", "m.store.write[audit]"] },
     ],
   );
   assert_text_matches_report(block(service(), []), report)
@@ -164,9 +164,9 @@ test "no signature line runs past the column it wraps at" {
       assert(columns(line) <= width(), Some(columns(line).to_string() ++ " columns: " ++ line))))
 }
 
-/// Atom `i` of a row: a label of a few letters, or one wider than any line where `i` is 8 past a
-/// multiple of 9, so the rows hold atoms of many widths and some that no column fits.
-fn atom_at(i: Int) -> Atom =
+/// Effect number `i`: a label of a few letters, or one wider than any line where `i` is 8 past a
+/// multiple of 9, so effect lists hold effects of many widths and some that no column fits.
+fn effect_at(i: Int) -> Effect =
   {
     effect: Bytes::of_string("e" ++ i.to_string()),
     resource: NamedResource(
@@ -176,25 +176,30 @@ fn atom_at(i: Int) -> Atom =
     op: None,
   }
 
-fn scheme_of(row: Row) -> Scheme =
+fn scheme_of(effects: Effects) -> Scheme =
   {
     type_variables: [],
-    row_variables: match row.tail { Some(v) -> [v], None -> [] },
+    effect_variables: match effects.variable { Some(v) -> [v], None -> [] },
     label_variables: [],
     keep_variables: [],
-    ty: fn_type([named_type(b"Request")], named_type(b"Response"), row),
+    ty: fn_type([named_type(b"Request")], named_type(b"Response"), effects),
   }
 
-test "no line a row, a set or a provenance is laid out on runs past the column but one atom wider" {
+test "no line effects, a set or a provenance are laid out on runs past the column, unless it holds one wider effect" {
   let indent = 5;
   let room = width() - indent;
   range(1, 41).fold((), |u: Unit, n: Int| {
-    let atoms = range(0, n).map(atom_at);
-    let texts = atom_texts(atoms);
+    let listed = range(0, n).map(effect_at);
+    let texts = effect_texts(listed);
     let laid = [
-      definition_lines(indent, 12, "create_order", scheme_of({ atoms: atoms, tail: None })),
-      definition_lines(indent, 12, "create_order", scheme_of({ atoms: atoms, tail: Some(3) })),
-      set_lines({ name: "Web", atoms: texts, used_by: n }, indent),
+      definition_lines(indent, 12, "create_order", scheme_of({ listed: listed, variable: None })),
+      definition_lines(
+        indent,
+        12,
+        "create_order",
+        scheme_of({ listed: listed, variable: Some(3) }),
+      ),
+      set_lines({ name: "Web", listed: texts, used_by: n }, indent),
       provenance_lines({ aliases: ["Web"], performed: Some(texts), unperformed: texts }, indent),
     ].fold(
       [],
@@ -232,7 +237,7 @@ test "an included set counts the definitions that reach it" {
   }
 }
 
-// Two runs over one tree, so the block is a function of the program and of nothing a run keeps.
+// Two runs over one tree, so the block is a function of the program and of nothing a run caches.
 test "explain prints the same bytes on every run" {
   scratch(|| {
     write_program(service());
@@ -291,7 +296,7 @@ test "the JSON provenance is the same on every run" {
 }
 
 /// A read a condition holds inside both of its bounds, one it holds inside neither, a caller of
-/// that one which also divides, and a row naming a raise its body cannot make.
+/// that one which also divides, and effects naming a raise its body cannot make.
 fn reads() -> String =
   \\pub fn peek(b: Bytes, i: Int) -> Int =
   \\  if i < 0 || i >= b.len() { 0 - 1 } else { b.at(i) }
@@ -303,7 +308,7 @@ fn reads() -> String =
   \\pub fn wide(b: Bytes) -> Int / {abort.raise} = peek(b, 0)
   \\
 
-test "explain says where a body can raise and why, and which row names a raise no body makes" {
+test "explain says where a body can raise and why, and which effects name a raise no body makes" {
   let report = json_types(one_module_tree(reads()), ["--explain"]);
   let text = block(reads(), ["--explain"]);
   assert_text_matches_report(text, report);
@@ -336,28 +341,28 @@ test "the JSON report files each raise with its place, its kind and the clause i
   )
 }
 
-/// A law schema and a law over it: the compiler makes a definition of the schema with the row every
+/// A law schema and a law over it: the compiler defines the schema with the effects every
 /// schema has, so that any law body fits it.
 fn schema() -> String =
   \\pub law schema settles<a | e>(f: (a) -> a / e) forall (x: a) { f(f(x)) == f(x) }
   \\
   \\fn clamped(n: Int) -> Int = if n < 0 { 0 } else { n }
   \\
-  \\law "clamping settles" = settles(clamped)
+  \\law "clamping resolves" = settles(clamped)
   \\
 
-test "a law schema's definition names no row as unperformed, since no one wrote its row" {
+test "a law schema's definition names no effect as unperformed, since no one wrote its effects" {
   let explained = json_types(one_module_tree(schema()), ["--explain"]);
   match items(at(explained, "definitions")).filter(|d: Json| str(at(d, "name")) == "m.settles") {
     [d, ..] -> {
       assert(at(d, "effects") != Array([]), Some(json_text(d)));
       assert(at(d, "declared_not_performed") == Array([]), Some(json_text(d)))
     },
-    [] -> panic("m.settles: " ++ json_text(explained)),
+    [] -> panic("m.resolves: " ++ json_text(explained)),
   }
 }
 
-// The second run takes each definition from the rows the first filed, which hold its raises.
+// The second run takes each definition from the records the first stored, which hold its raises.
 test "a run that walks no body says what the run that walked them said of their raises" {
   scratch(|| {
     write_program(reads());
@@ -372,7 +377,7 @@ test "a run that walks no body says what the run that walked them said of their 
   })
 }
 
-test/nondet "prove explain names what an over-broad row gave up" {
+test/nondet "prove explain names what over-broad effects gave up" {
   write_program(
     \\effect store {
     \\  read  all[table]() -> List<Int>
@@ -389,11 +394,11 @@ test/nondet "prove explain names what an over-broad row gave up" {
   let text = stdout(spawned(["prove", "--explain"]));
   assert(
     text.contains("frame covers, body never touches:"),
-    Some("an `ensures` under a wider row must say what it gave up:\n" ++ text),
+    Some("an `ensures` under wider effects must say what it gave up:\n" ++ text),
   );
   assert(text.contains("m.store.read[users]"), Some(text));
   assert(!text.contains("Web"), Some("the alias name is provenance, never the claim:\n" ++ text));
-  // A row exactly its body's gives nothing up, so the line is absent rather than empty.
+  // Effects that are exactly its body's give nothing up, so the line is absent rather than empty.
   write_program("pub fn double(x: Int) -> Int\n  ensures result >= x\n  = x + x\n");
   let tight = stdout(spawned(["prove", "--explain"]));
   assert(!tight.contains("frame covers"), Some(tight))

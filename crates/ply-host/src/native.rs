@@ -1,4 +1,4 @@
-//! The flat forms a native answers structured data in, which `std.internal.native` reads. Told:
+//! The flat forms a native returns structured data in, which `std.internal.native` reads. Told:
 //! byte 1 and then the text, or byte 0 and then why the system said nothing. Found: byte 1 and then
 //! the bytes, or the one byte 0. Parts: each part behind its count, four bytes, most significant
 //! first. An integer is eight bytes, most significant first.

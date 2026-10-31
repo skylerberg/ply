@@ -1,6 +1,6 @@
 //! What `std.process`'s host handler asks the host through its natives: the arguments, the two
 //! output streams, standard input, the exit code, and the programs a run may start, to completion
-//! or beside it. Each answer that is structured is flat: a child's ending as [`Finished::flat`]
+//! or beside it. Each result that is structured is flat: a child's ending as [`Finished::flat`]
 //! writes it, a line heard as [`Heard::flat`] does.
 
 mod children;
@@ -8,10 +8,10 @@ mod children;
 pub(crate) use children::Children;
 pub use children::{Ended, Finished, Heard, Io, Output, Signal};
 
-use crate::jobs::{Failure, Job, Refusing};
+use crate::jobs::{Failure, FallibleJob, Job};
 use crate::native::found;
 use crate::stdio;
-use children::{Child, Launch, Refusal, Unusable};
+use children::{Child, Launch, ProcessError, Unusable};
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,10 +19,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// The effect, by the program-wide name a refusal names its module by.
+/// The effect, by the program-wide name a rejection names its module by.
 const EFFECT: &str = "std.process.process";
 
-/// What serves the effect, for a refusal to name.
+/// What serves the effect, for a rejection to name.
 const SERVED_BY: &str = "std.process::served";
 
 /// The effect whose raise says a standard stream's reader went away, and that raise.
@@ -134,8 +134,8 @@ impl ExecSpec {
     }
 }
 
-fn malformed(text: &str, why: &str) -> String {
-    format!("`{text}` is not an executable: {why}; write `--exec NAME=PATH`")
+fn malformed(text: &str, reason: &str) -> String {
+    format!("`{text}` is not an executable: {reason}; write `--exec NAME=PATH`")
 }
 
 /// What `--exec NAME=PATH` bound, resolved once: the only programs this run can start.
@@ -181,7 +181,7 @@ impl Executables {
             )
             .primary(span, "this file has no execute permission")
             .note(
-                "a spawn would fail at the first call; it is refused before anything runs instead",
+                "a spawn would fail at the first call; it is rejected before anything runs instead",
             ));
         }
         self.bound.insert(name.to_string(), resolved);
@@ -302,9 +302,9 @@ impl ProcessHost {
         std::process::exit(stdio::BROKEN_PIPE_STATUS);
     }
 
-    /// What this host makes of a raise no clause answered: an unanswered `pipe.broken` ends the
+    /// What this host makes of a raise no clause handled: an unhandled `pipe.broken` ends the
     /// process as the closed pipe would have.
-    pub fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+    pub fn unhandled(&self, effect: &Symbol, op: &Symbol) {
         if self.owns_the_streams() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
             self.end_of_broken_pipe();
         }
@@ -343,10 +343,10 @@ impl ProcessHost {
     }
 
     /// `text` and a line ending written to `stream`. A stream whose reader has gone ends the
-    /// process, since a line answers nothing its writer could be told by.
+    /// process, since a line returns nothing its writer could be told by.
     ///
     /// # Errors
-    /// The host is not the run's own process, or the stream refused the write.
+    /// The host is not the run's own process, or the stream rejected the write.
     pub fn line(&self, stream: Stream, text: &str, span: Span) -> Result<(), Diagnostic> {
         let op = match stream {
             Stream::Out => "out",
@@ -363,7 +363,7 @@ impl ProcessHost {
     /// Whether `bytes` reached `stream`: `false` once its reader has gone away.
     ///
     /// # Errors
-    /// The host is not the run's own process, or the stream refused the write.
+    /// The host is not the run's own process, or the stream rejected the write.
     pub fn write(&self, stream: Stream, bytes: &[u8], span: Span) -> Result<bool, Diagnostic> {
         let op = match stream {
             Stream::Out => "out_bytes",
@@ -376,7 +376,7 @@ impl ProcessHost {
     /// Whether what standard output's buffer held reached it: `false` once its reader has gone.
     ///
     /// # Errors
-    /// The host is not the run's own process, or the stream refused the write.
+    /// The host is not the run's own process, or the stream rejected the write.
     pub fn flush(&self, span: Span) -> Result<bool, Diagnostic> {
         self.own("flush", span)?;
         taken("flush", self.sink.flush(), span)
@@ -437,7 +437,7 @@ impl ProcessHost {
         dir: &str,
         env: &[(String, String)],
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let program = self.program("spawn", label, span)?;
         let io = Io {
             input: false,
@@ -459,14 +459,14 @@ impl ProcessHost {
             let (_, child) = started.map_err(Failure::Said)?;
             match child.wait(None) {
                 Ok(Some(exit)) => Ok(exit.flat()),
-                Err(Refusal::TooMuch { out, err }) => Err(Failure::Refused(too_much(
+                Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(too_much(
                     "spawn", &program, out, err, span,
                 ))),
-                Err(Refusal::Unreaped(why)) => Err(Failure::Said(format!(
-                    "`{}`'s ending could not be read: {why}",
+                Err(ProcessError::Unreaped(reason)) => Err(Failure::Said(format!(
+                    "`{}`'s ending could not be read: {reason}",
                     program.display()
                 ))),
-                Ok(None) | Err(Refusal::Spent) => Err(Failure::Said(format!(
+                Ok(None) | Err(ProcessError::Spent) => Err(Failure::Said(format!(
                     "`{}` was waited on by something other than its spawn",
                     program.display()
                 ))),
@@ -516,7 +516,7 @@ impl ProcessHost {
         let at = Resource::Named(Symbol::new(label));
         self.children
             .get(handle, &at)
-            .map_err(|why| unusable(op, handle, &at, why, span))
+            .map_err(|reason| unusable(op, handle, &at, reason, span))
     }
 
     /// The job of how the child ended and what its streams hold, found once it has: none while it
@@ -530,12 +530,12 @@ impl ProcessHost {
         handle: i64,
         timeout_ms: i64,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let child = self.child("wait", label, handle, span)?;
         let deadline = deadline(timeout_ms);
         Ok(Box::new(move || match child.wait(deadline) {
             Ok(exit) => Ok(found(exit.map(Finished::flat))),
-            Err(refusal) => Err(refused("wait", handle, &child, refusal, span)),
+            Err(rejection) => Err(rejected("wait", handle, &child, rejection, span)),
         }))
     }
 
@@ -591,23 +591,23 @@ impl ProcessHost {
         handle: i64,
         timeout_ms: i64,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let child = self.child("output_line", label, handle, span)?;
         let deadline = deadline(timeout_ms);
         Ok(Box::new(move || match child.next_line(deadline) {
             Ok(heard) => Ok(heard.flat()),
-            Err(refusal) => Err(refused("output_line", handle, &child, refusal, span)),
+            Err(rejection) => Err(rejected("output_line", handle, &child, rejection, span)),
         }))
     }
 }
 
-/// Where an operation about the run's own process is served, for a refusal to say.
+/// Where an operation about the run's own process is served, for a rejection to say.
 const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
 /// Where an operation on a program `--exec` binds is served.
 const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
 
-/// `process.<op>` refused in a run whose host serves none of what `reach` names.
+/// `process.<op>` rejected in a run whose host serves none of what `reach` names.
 #[cold]
 pub fn withheld(op: &'static str, reach: Reach, span: Span) -> Diagnostic {
     let served = match reach {
@@ -629,15 +629,21 @@ fn deadline(ms: i64) -> Option<Instant> {
     Instant::now().checked_add(Duration::from_millis(ms))
 }
 
-fn refused(op: &'static str, handle: i64, child: &Child, refusal: Refusal, span: Span) -> Failure {
-    match refusal {
-        Refusal::Spent => Failure::Refused(raced(op, handle, span)),
-        Refusal::TooMuch { out, err } => {
-            Failure::Refused(too_much(op, child.program(), out, err, span))
+fn rejected(
+    op: &'static str,
+    handle: i64,
+    child: &Child,
+    rejection: ProcessError,
+    span: Span,
+) -> Failure {
+    match rejection {
+        ProcessError::Spent => Failure::Rejected(raced(op, handle, span)),
+        ProcessError::TooMuch { out, err } => {
+            Failure::Rejected(too_much(op, child.program(), out, err, span))
         }
-        Refusal::Unreaped(why) => {
-            Failure::Said(format!("child {handle}'s ending could not be read: {why}"))
-        }
+        ProcessError::Unreaped(reason) => Failure::Said(format!(
+            "child {handle}'s ending could not be read: {reason}"
+        )),
     }
 }
 
@@ -698,13 +704,13 @@ fn too_much(op: &str, program: &Path, out: usize, err: usize, span: Span) -> Dia
 }
 
 #[cold]
-fn unusable(op: &str, handle: i64, at: &Resource, why: Unusable, span: Span) -> Diagnostic {
-    match why {
+fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) -> Diagnostic {
+    match reason {
         Unusable::Unknown => Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!("`process.{op}` was given {handle}, and no child has that handle"),
         )
-        .primary(span, "`process.start` never answered this handle")
+        .primary(span, "`process.start` never returned this handle")
         .note("handles ascend and are never reused, so a stale one names nothing rather than whatever started next"),
         Unusable::Spent => Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -723,7 +729,7 @@ fn unusable(op: &str, handle: i64, at: &Resource, why: Unusable, span: Span) -> 
     }
 }
 
-/// Another `process.wait` on the same child answered while this one was waiting.
+/// Another `process.wait` on the same child returned while this one was waiting.
 #[cold]
 fn raced(op: &str, handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -760,7 +766,7 @@ fn err_write(op: &str, e: &std::io::Error, span: Span) -> Diagnostic {
         codes::RUNTIME_ERROR,
         format!("`process.{op}` could not write: {e}"),
     )
-    .primary(span, "the stream refused what was written")
+    .primary(span, "the stream rejected what was written")
     .note("the descriptor is closed, or what it is open on took nothing")
 }
 

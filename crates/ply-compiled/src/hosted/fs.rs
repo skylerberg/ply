@@ -1,13 +1,13 @@
 //! `std.fs`'s natives: each operation on a path under the root its label names, or on a file a
 //! run holds open there, a job of the run's on the filing pool, and confined to its root there.
-//! Each answers what `ply_host::fs` writes of it. A read is no function of its arguments: asking
-//! twice may answer otherwise.
+//! Each returns what `ply_host::fs` writes of it. A read is no function of its arguments: asking
+//! twice may return otherwise.
 
 use super::{Nondeterministic, asked, from_host, handed, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use crate::secret;
 use ply_core::crypto::Framing;
 use ply_host::fs::{Chunk, Op, Opening, Second};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// The ticket of `op` on the path at `pp` under the root the label at `lp` names, handed what
 /// `second` reads beside the path; 0, with the run failed, where it reads nothing.
-fn filed(
+fn ticket_of(
     ctx: *mut Ctx,
     native: &'static str,
     op: Op,
@@ -74,7 +74,7 @@ macro_rules! on_paths {
         $(
             #[doc = concat!("The ticket of `", $name, "` on the path at `pp` under the root the label at `lp` names.")]
             pub unsafe extern "C" fn $native(ctx: *mut Ctx, lp: Addr, ln: I64, pp: Addr, pn: I64) -> I64 {
-                filed(ctx, $name, Op::$op, (lp, ln), (pp, pn), |_| Some(Second::None))
+                ticket_of(ctx, $name, Op::$op, (lp, ln), (pp, pn), |_| Some(Second::None))
             }
         )+
 
@@ -195,7 +195,7 @@ pub unsafe extern "C" fn rt_fs_rename(
     tp: Addr,
     tn: I64,
 ) -> I64 {
-    filed(ctx, "fs_rename", Op::Rename, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_rename", Op::Rename, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Path)
     })
 }
@@ -210,7 +210,7 @@ pub unsafe extern "C" fn rt_fs_copy(
     tp: Addr,
     tn: I64,
 ) -> I64 {
-    filed(ctx, "fs_copy", Op::Copy, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_copy", Op::Copy, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Path)
     })
 }
@@ -225,7 +225,7 @@ pub unsafe extern "C" fn rt_fs_link(
     tp: Addr,
     tn: I64,
 ) -> I64 {
-    filed(ctx, "fs_link", Op::Link, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_link", Op::Link, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Path)
     })
 }
@@ -240,7 +240,7 @@ pub unsafe extern "C" fn rt_fs_symlink(
     tp: Addr,
     tn: I64,
 ) -> I64 {
-    filed(ctx, "fs_symlink", Op::Symlink, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_symlink", Op::Symlink, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Target)
     })
 }
@@ -255,7 +255,7 @@ pub unsafe extern "C" fn rt_fs_temp_dir(
     xp: Addr,
     xn: I64,
 ) -> I64 {
-    filed(ctx, "fs_temp_dir", Op::TempDir, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_temp_dir", Op::TempDir, (lp, ln), (pp, pn), |c| {
         text_at(c, xp, xn).map(Second::Name)
     })
 }
@@ -270,13 +270,13 @@ pub unsafe extern "C" fn rt_fs_write_file(
     bp: Addr,
     bn: I64,
 ) -> I64 {
-    filed(
+    ticket_of(
         ctx,
         "fs_write_file",
         Op::WriteFile,
         (lp, ln),
         (pp, pn),
-        |_| Some(Second::Body(unsafe { lent(bp, bn) }.to_vec())),
+        |_| Some(Second::Body(unsafe { borrowed(bp, bn) }.to_vec())),
     )
 }
 
@@ -290,8 +290,8 @@ pub unsafe extern "C" fn rt_fs_append(
     bp: Addr,
     bn: I64,
 ) -> I64 {
-    filed(ctx, "fs_append", Op::Append, (lp, ln), (pp, pn), |_| {
-        Some(Second::Body(unsafe { lent(bp, bn) }.to_vec()))
+    ticket_of(ctx, "fs_append", Op::Append, (lp, ln), (pp, pn), |_| {
+        Some(Second::Body(unsafe { borrowed(bp, bn) }.to_vec()))
     })
 }
 
@@ -305,7 +305,7 @@ pub unsafe extern "C" fn rt_fs_read_at(
     offset: I64,
     len: I64,
 ) -> I64 {
-    filed(ctx, "fs_read_at", Op::ReadAt, (lp, ln), (pp, pn), |_| {
+    ticket_of(ctx, "fs_read_at", Op::ReadAt, (lp, ln), (pp, pn), |_| {
         Some(Second::Range {
             offset: offset.0,
             len: len.0,
@@ -322,7 +322,7 @@ pub unsafe extern "C" fn rt_fs_set_mode(
     pn: I64,
     bits: I64,
 ) -> I64 {
-    filed(ctx, "fs_set_mode", Op::SetMode, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_set_mode", Op::SetMode, (lp, ln), (pp, pn), |c| {
         let bits = u32::try_from(bits.0).ok().filter(|bits| *bits <= 0o777);
         handed(c, "fs_set_mode", "a mode", bits).map(Second::Mode)
     })
@@ -337,7 +337,7 @@ pub unsafe extern "C" fn rt_fs_set_modified(
     pn: I64,
     ms: I64,
 ) -> I64 {
-    filed(
+    ticket_of(
         ctx,
         "fs_set_modified",
         Op::SetModified,
@@ -356,7 +356,7 @@ pub unsafe extern "C" fn rt_fs_scan(
     pn: I64,
     deep: I64,
 ) -> I64 {
-    filed(ctx, "fs_scan", Op::Scan, (lp, ln), (pp, pn), |_| {
+    ticket_of(ctx, "fs_scan", Op::Scan, (lp, ln), (pp, pn), |_| {
         Some(Second::Deep(deep.0 != 0))
     })
 }
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn rt_fs_open(
     pn: I64,
     how: I64,
 ) -> I64 {
-    filed(ctx, "fs_open", Op::Open, (lp, ln), (pp, pn), |c| {
+    ticket_of(ctx, "fs_open", Op::Open, (lp, ln), (pp, pn), |c| {
         handed(c, "fs_open", "an opening", Opening::of(how.0)).map(Second::Opening)
     })
 }
@@ -396,7 +396,7 @@ pub unsafe extern "C" fn rt_fs_write_chunk(
     bp: Addr,
     bn: I64,
 ) -> I64 {
-    let body = unsafe { lent(bp, bn) }.to_vec();
+    let body = unsafe { borrowed(bp, bn) }.to_vec();
     on_file(ctx, "fs_write_chunk", lp, ln, file, Chunk::Write(body))
 }
 
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn rt_fs_write_secret(
     ap: Addr,
     an: I64,
 ) -> I64 {
-    filed(
+    ticket_of(
         ctx,
         "fs_write_secret",
         Op::WriteSecret,
@@ -434,14 +434,14 @@ pub unsafe extern "C" fn rt_fs_write_secret(
             let framing = Framing::named(&encoding, Op::WriteSecret.what(), c.site())
                 .map_err(|d| c.fail(d))
                 .ok()?;
-            let (before, after) = unsafe { (lent(bp, bn), lent(ap, an)) };
+            let (before, after) = unsafe { (borrowed(bp, bn), borrowed(ap, an)) };
             Some(Second::Sealed(framing.framed(before, held.bytes(), after)))
         },
     )
 }
 
 /// The ticket of `fs.read_secret`: the secret between the bytes at `bp` and those at `ap`, in the
-/// encoding named at `ep`, kept by the run under the number answered, found.
+/// encoding named at `ep`, kept by the run under the number returned, found.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_fs_read_secret(
     ctx: *mut Ctx,
@@ -456,7 +456,7 @@ pub unsafe extern "C" fn rt_fs_read_secret(
     ap: Addr,
     an: I64,
 ) -> I64 {
-    filed(
+    ticket_of(
         ctx,
         "fs_read_secret",
         Op::ReadSecret,
@@ -468,7 +468,7 @@ pub unsafe extern "C" fn rt_fs_read_secret(
                 .map_err(|d| c.fail(d))
                 .ok()?;
             let keeper = from_host(c, |facilities| Arc::downgrade(facilities.run()))?;
-            let (before, after) = unsafe { (lent(bp, bn), lent(ap, an)) };
+            let (before, after) = unsafe { (borrowed(bp, bn), borrowed(ap, an)) };
             Some(Second::Frame {
                 before: before.to_vec(),
                 framing,

@@ -15,8 +15,8 @@ import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, Patt
                                  PatternOr, pattern_span)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
-                                    UnitTypeExpression, InvalidTypeExpression, RowExpression,
-                                    AtomExpression, type_span)
+                                    UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
+                                    EffectExpression, type_span)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, ExternItem, DeriveItem, InstanceItem, NumericItem,
                               EffectSetItem, HostInstance, NumericOp, FnDefinition, TypeDefinition,
@@ -208,20 +208,25 @@ fn operation(w: Walk, eff: QName, op: Identifier) -> Walk / {abort.raise} =
 fn walk_type(w: Walk, t: TypeExpression) -> Walk / {abort.raise} =
   match t {
     NamedTypeExpression(c) ->
-      c.rows.fold(c.args.fold(named_in(w, TypeSpace, c.name), walk_type), walk_row),
+      c.effect_arguments.fold(c.args.fold(named_in(w, TypeSpace, c.name), walk_type), walk_effects),
     FunctionTypeExpression(f) ->
-      walk_effects(walk_type(f.params.fold(w, walk_type), f.ret), f.effects),
+      walk_optional_effects(walk_type(f.params.fold(w, walk_type), f.ret), f.effects),
     RecordTypeExpression(r) ->
       r.fields.fold(w, |acc: Walk, field: { name: Identifier, ty: TypeExpression }|
         walk_type(labelled(acc, field.name, false, type_span(field.ty)), field.ty)),
     _ -> w,
   }
 
-fn walk_row(w: Walk, r: RowExpression) -> Walk / {abort.raise} = walk_atoms(w, r.atoms, r.aliases)
+fn walk_effects(w: Walk, r: EffectsExpression) -> Walk / {abort.raise} =
+  walk_effect_list(w, r.listed, r.aliases)
 
-fn walk_atoms(w: Walk, atoms: List<AtomExpression>, sets: List<QName>) -> Walk / {abort.raise} =
+fn walk_effect_list(
+  w: Walk,
+  effects: List<EffectExpression>,
+  sets: List<QName>,
+) -> Walk / {abort.raise} =
   sets.fold(
-    atoms.fold(w, |acc: Walk, a: AtomExpression|
+    effects.fold(w, |acc: Walk, a: EffectExpression|
       match a.op {
         Some(op) -> operation(acc, a.effect_name, op),
         None -> named_in(acc, EffectSpace, a.effect_name),
@@ -229,8 +234,8 @@ fn walk_atoms(w: Walk, atoms: List<AtomExpression>, sets: List<QName>) -> Walk /
     |acc: Walk, set: QName| named_in(acc, SetSpace, set),
   )
 
-fn walk_effects(w: Walk, r: Option<RowExpression>) -> Walk / {abort.raise} =
-  match r { Some(x) -> walk_row(w, x), None -> w }
+fn walk_optional_effects(w: Walk, r: Option<EffectsExpression>) -> Walk / {abort.raise} =
+  match r { Some(x) -> walk_effects(w, x), None -> w }
 
 fn walk_optional_type(w: Walk, t: Option<TypeExpression>) -> Walk / {abort.raise} =
   match t { Some(x) -> walk_type(w, x), None -> w }
@@ -396,7 +401,7 @@ fn walk_expression(w: Walk, e: Expression) -> Walk / {abort.raise} =
 
 fn walk_fn(w: Walk, f: FnDefinition) -> Walk / {abort.raise} = {
   let params = walk_params(named_in(w, ValueSpace, bare(f.name)), f.params);
-  let typed = walk_effects(walk_optional_type(params, f.ret), f.effects);
+  let typed = walk_optional_effects(walk_optional_type(params, f.ret), f.effects);
   let returned = match f.returns {
     Some(ReturnsParam(p)) -> noted(typed, p, local(typed, p.name).unwrap_or(Unbound), false),
     _ -> typed,
@@ -423,7 +428,7 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
     FunctionItem(f) -> walk_fn(w, f),
     ExternItem(x) -> {
       let params = walk_params(named_in(w, ValueSpace, bare(x.name)), x.params);
-      let typed = walk_effects(walk_type(params, x.ret), x.effects);
+      let typed = walk_optional_effects(walk_type(params, x.ret), x.effects);
       popped(x.spec.fold(typed, |acc: Walk, s: SpecClause| walk_spec(acc, x.params, s)))
     },
     TypeItem(t) -> {
@@ -473,7 +478,7 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
     NumericItem(d) ->
       d.operations.fold(named_in(w, TypeSpace, bare(d.target)), |acc: Walk, x: NumericOp|
         named_in(acc, ValueSpace, bare(x.by))),
-    EffectSetItem(d) -> walk_atoms(named_in(w, SetSpace, bare(d.name)), d.atoms, d.includes),
+    EffectSetItem(d) -> walk_effect_list(named_in(w, SetSpace, bare(d.name)), d.listed, d.includes),
   }
 
 fn import_references(

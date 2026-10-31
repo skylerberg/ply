@@ -145,9 +145,9 @@ pub(super) enum Unusable {
     Elsewhere(Resource),
 }
 
-/// Why a job on a child answered no value.
+/// Why a job on a child returned no value.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) enum Refusal {
+pub(super) enum ProcessError {
     /// Another `wait` handed the child back first.
     Spent,
     /// A stream outgrew the bound: everything the child wrote to each.
@@ -307,20 +307,20 @@ impl Child {
     /// Once the child has ended and every stream the host collects has ended too, its ending and
     /// what those streams hold; `None` at the deadline, and no deadline waits for as long as it
     /// takes.
-    pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Finished>, Refusal> {
+    pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Finished>, ProcessError> {
         let mut state = self.lock();
         loop {
             if state.spent {
-                return Err(Refusal::Spent);
+                return Err(ProcessError::Spent);
             }
             if let Some(ended) = state.ended.clone()
                 && !state.out.open
                 && !state.err.open
             {
                 state.spent = true;
-                let ended = ended.map_err(Refusal::Unreaped)?;
+                let ended = ended.map_err(ProcessError::Unreaped)?;
                 if state.out.overflowed || state.err.overflowed {
-                    return Err(Refusal::TooMuch {
+                    return Err(ProcessError::TooMuch {
                         out: state.out.written,
                         err: state.err.written,
                     });
@@ -337,8 +337,8 @@ impl Child {
     }
 
     /// The next line any `Lines` stream took, `Quiet` at the deadline, and `Closed` once every
-    /// `Lines` stream has ended and each of its lines has been answered.
-    pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, Refusal> {
+    /// `Lines` stream has ended and each of its lines has been returned.
+    pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, ProcessError> {
         let mut state = self.lock();
         loop {
             // A `wait` has handed back whatever was unread.
@@ -346,7 +346,7 @@ impl Child {
                 return Ok(Heard::Closed);
             }
             if state.lines_overflowed() {
-                return Err(Refusal::TooMuch {
+                return Err(ProcessError::TooMuch {
                     out: state.out.written,
                     err: state.err.written,
                 });
@@ -389,7 +389,7 @@ impl Child {
         self.lock().stdin = None;
     }
 
-    /// Delivers `signal`, answering `false` when the child had already ended.
+    /// Delivers `signal`, returning `false` when the child had already ended.
     pub(super) fn signal(&self, signal: Signal) -> std::io::Result<bool> {
         let mut state = self.lock();
         if state.ended.is_some() {
@@ -432,7 +432,7 @@ struct State {
     stdin: Option<Arc<ChildStdin>>,
     out: CollectedStream,
     err: CollectedStream,
-    /// Lines the `Lines` streams took and no `output_line` has answered, in the order they arrived.
+    /// Lines the `Lines` streams took and no `output_line` has returned, in the order they arrived.
     lines: VecDeque<(Stream, Vec<u8>)>,
     spent: bool,
 }
@@ -602,7 +602,7 @@ fn text_of(line: &[u8]) -> String {
     String::from_utf8_lossy(line).into_owned()
 }
 
-/// A sink that refuses a line has nowhere else to put it, and the child is not the one to tell.
+/// A sink that rejects a line has nowhere else to put it, and the child is not the one to tell.
 fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
     let _ = sink.line(to, &text_of(line));
 }
@@ -751,7 +751,7 @@ fn watch(child: &Child) {
 fn until_ended(pid: u32) {
     loop {
         // SAFETY: `info` is plain data the call only writes, and `WNOWAIT` leaves the child unreaped.
-        let answered = unsafe {
+        let returned = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             libc::waitid(
                 libc::P_PID,
@@ -760,7 +760,7 @@ fn until_ended(pid: u32) {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if answered == 0 || std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+        if returned == 0 || std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
             return;
         }
     }
@@ -834,7 +834,7 @@ fn signal_of(_: &ExitStatus) -> i64 {
     0
 }
 
-/// Waits for a change, or answers `None` once `deadline` has passed; no deadline waits forever.
+/// Waits for a change, or returns `None` once `deadline` has passed; no deadline waits forever.
 fn until<'a>(
     changed: &Condvar,
     state: MutexGuard<'a, State>,
