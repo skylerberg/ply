@@ -719,7 +719,7 @@ toolchain_embeds() {
   inputs=$(toolchain_inputs "$scope")
   trees=$(grep -vxF -- "$TOOLCHAIN_WORKSPACE" <<< "$inputs" || true)
   if [[ -z $trees ]]; then
-    echo "FAIL: $TOOLCHAIN_WORKSPACE places no part of the toolchain, so the toolchain key is held to nothing" >&2
+    echo "FAIL: $TOOLCHAIN_WORKSPACE lists no part of the toolchain, so the toolchain key would cover no files" >&2
     return 1
   fi
   while IFS=: read -r file target; do
@@ -727,12 +727,12 @@ toolchain_embeds() {
       echo "FAIL: $file embeds $target, outside every path the $scope toolchain key hashes" >&2
       bad=$((bad + 1))
     elif [ ! -e "$root/$target" ]; then
-      echo "FAIL: $file embeds $target, which the tree does not hold" >&2
+      echo "FAIL: $file embeds $target, which is not in the tree" >&2
       bad=$((bad + 1))
     fi
   done < <(embeds_from <<< "$inputs")
   if [ "$bad" -eq 0 ]; then
-    printf 'toolchain key (%s): the %d paths a bootstrap reads Ply from hold every file they embed\n' "$scope" "$(grep -c . <<< "$inputs")"
+    printf 'toolchain key (%s): the %d paths that a bootstrap reads Ply from contain every file they embed\n' "$scope" "$(grep -c . <<< "$inputs")"
   fi
   return $((bad > 0))
 }
@@ -878,10 +878,10 @@ cmd_prune_check() {
     prune_plan 200 "ply-stores-stdlib- ply-stores-proofs-" "ply-built- ply-c-runs-stdlib- v0-rust-" "tcc-" |
     cut -f1,2 | LC_ALL=C sort -n | tr '\t\n' ' ;')
   if [[ $got != "$want" ]]; then
-    echo "FAIL: of the listing it is held to, \`supersede\` would delete '$got' and should delete '$want'" >&2
+    echo "FAIL: in its test listing, \`supersede\` would delete '$got' but should delete '$want'" >&2
     return 1
   fi
-  echo "cache pruning: each rule of \`supersede\` decides the listing it is held to"
+  echo "cache pruning: each rule of \`supersede\` gives the expected result on its test listing"
 }
 
 # Fails unless every action the workflows use is listed in ACTIONS and every action listed there is
@@ -1066,7 +1066,7 @@ cmd_verify() {
 
   local runs_job runs_command
   if [[ ! -f "$root/$CLI_SUITE/ply.pkg" ]]; then
-    echo "FAIL: $CLI_SUITE holds no ply.pkg, and a run tests it as a package" >&2
+    echo "FAIL: $CLI_SUITE has no ply.pkg, but a run tests it as a package" >&2
     failures=$((failures + 1))
   fi
   local listed

@@ -396,7 +396,7 @@ LOG
     "the chain past a job stamped as ending before it starts and one that took no time"
 
   [ "$fail" -eq 0 ] || exit 1
-  echo "self-test: the epochs, a duration, an action's own time, a pause, a cache line and the chain all hold"
+  echo "self-test: the epochs, a duration, an action's own time, a pause, a cache line and the chain all pass"
 }
 
 [ $# -gt 0 ] || die "usage: ci-timings.sh {runs [N]|jobs [RUN] [NAME]|why [RUN] [NAME]|tests [RUN] [N]|--self-test}"

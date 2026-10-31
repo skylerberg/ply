@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: ci-warm.sh used MARK | pack TAR | shared NAME | handed NAME | foreign. The C cache and the
+# Usage: ci-warm.sh used MARK | pack TAR | shared NAME | this-run NAME | foreign. The C cache and the
 # stages are the directories that hold the C compiler's outputs and the `ply` programs' cached
 # results.
 #
@@ -9,14 +9,14 @@
 # according to its `.used`.
 #
 # `pack TAR` writes the C cache and the stages into the single file TAR. The same run's other jobs
-# download it with `handed`, and runs on other branches download it with `shared`.
+# download it with `this-run`, and runs on other branches download it with `shared`.
 #
 # `shared NAME` downloads the artifact NAME, which an earlier run of the same sources packed with
 # `pack`, and copies its files into the C cache and the stages. A cache is readable only from its
 # own branch and main, but an artifact is readable from every run. It sets the step output `found`.
 # If no artifact exists or the download fails, the run builds what it needs.
 #
-# `handed NAME` does the same for the artifact NAME that this run's `build-ply` job packed for the
+# `this-run NAME` does the same for the artifact NAME that this run's `build-ply` job packed for the
 # run's other jobs.
 #
 # `foreign` deletes the files that another toolchain's run left in the C cache and the stages,
@@ -114,20 +114,20 @@ case "${1:-}" in
       echo "no stage came back: this run builds its own"
     fi
     ;;
-  handed)
-    name=${2:?usage: ci-warm.sh handed NAME}
+  this-run)
+    name=${2:?usage: ci-warm.sh this-run NAME}
     if laid "${GITHUB_RUN_ID:?the run whose artifact this is}" "$name"; then
       echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     else
-      echo "the stage $name did not come back: this job starts from the cache"
+      echo "could not download the stage $name: this job starts from the cache"
     fi
     ;;
   foreign)
     [ -d "$stage" ] && find "$stage" -mindepth 1 -maxdepth 1 ! -name memo-std -exec rm -rf {} +
-    echo "kept $(megabytes "$cache") MB of another toolchain's C cache and $(megabytes "$stage") MB of its std records, and none of its stages"
+    echo "kept $(megabytes "$cache") MB of the C cache and $(megabytes "$stage") MB of the std records from another toolchain, and deleted its stages"
     ;;
   *)
-    echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | handed NAME | foreign" >&2
+    echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | this-run NAME | foreign" >&2
     exit 2
     ;;
 esac

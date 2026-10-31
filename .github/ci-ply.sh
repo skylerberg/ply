@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the `ply` commands of CI jobs, and saves and restores the caches they use. The subcommands
-# are `run`, `nightly`, `mark`, `keep`, `restore`, `compact`, `hand` and `handed`. The usage message
+# are `run`, `nightly`, `mark`, `keep`, `restore`, `compact`, `pack` and `unpack`. The usage message
 # at the end of the script lists their arguments, and the comment above each step of the script says
 # what that step does.
 set -uo pipefail
@@ -155,7 +155,7 @@ summed() {
 # even though the report named a stored result for them, which happens when that result is missing
 # from every store. The expression yields nothing for a report that has no queries, such as one
 # copied from a cached result.
-answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) answers taken, \([.front_end.queries[].run] | add // 0) run and \(.front_end.lost // 0) lost" else "" end)'
+answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) query results reused, \([.front_end.queries[].run] | add // 0) computed and \(.front_end.lost // 0) lost" else "" end)'
 
 # Succeeds if some report reports a stored result that it needed but could not find in any store.
 # This happens only when a store is damaged, so stores that are intact never cause it, whatever
@@ -171,7 +171,7 @@ spent() {
   jq -r --argjson wall "$2" '
     def s(ms): (ms / 1000 | floor | tostring) + "s";
     (.phases // {}) as $p
-    | (if .front_end.reused then "spent: a kept answer, read in \(s(.front_end.phases.total // 0)); it was filed by a run that spent " else "spent: " end)
+    | (if .front_end.reused then "spent: read a cached result in \(s(.front_end.phases.total // 0)); the run that cached it spent " else "spent: " end)
       + "before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))" + '"$answers"'
   ' "$1" 2>/dev/null
 }
@@ -256,7 +256,7 @@ proofs_of() {
   discharging=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
   cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
-  echo "proved: $all claims, $cached from the cache, the rest discharged in $((discharging / 1000))s of the $((($(now_ms) - started) / 1000))s the prove took$(jq -r "$answers" "$out" 2>/dev/null)"
+  echo "proved: $all claims, $cached from the cache, the rest proved in $((discharging / 1000))s of the $((($(now_ms) - started) / 1000))s that the prove took$(jq -r "$answers" "$out" 2>/dev/null)"
   if [ "$all" -eq 0 ]; then
     echo "the run $id proved no claim" >&2
     status=1
@@ -425,7 +425,7 @@ case "${1:-}" in
       "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
     done
     ;;
-  hand)
+  pack)
     file=${2:?a file}
     kept=()
     for dir in $(store_dirs); do
@@ -435,10 +435,10 @@ case "${1:-}" in
     tar -cf - -C "$root" "${kept[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
     echo "packed ${#kept[@]} stores, $(du -sh "$file" | cut -f1): ${kept[*]}"
     ;;
-  handed)
+  unpack)
     name=${2:?an artifact}
     run=$("$root/.github/artifact-run.sh" "$name") || run=
-    [ -n "$run" ] || { echo "no run has handed over $name"; exit 0; }
+    [ -n "$run" ] || { echo "no run of this workflow uploaded the artifact $name"; exit 0; }
     dir=$(mktemp -d)
     if gh run download "$run" -n "$name" -D "$dir" && mkdir "$dir/unpacked" &&
       zstd -d -c "$dir/stores.tar.zst" | tar -xf - -C "$dir/unpacked"; then
@@ -458,7 +458,7 @@ case "${1:-}" in
     rm -rf "$dir"
     ;;
   *)
-    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME" >&2
+    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | pack FILE | unpack NAME" >&2
     exit 2
     ;;
 esac

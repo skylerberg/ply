@@ -20,6 +20,6 @@ for awk in awk gawk mawk; do
   ln -sf "$(command -v "$awk")" "$shim/awk"
   PATH="$shim:$PATH" .github/ci-shards.sh verify > /dev/null
   PATH="$shim:$PATH" .github/ci-timings.sh --self-test > /dev/null
-  echo "under $awk: the tables hold and the timings tool passes its self-test"
+  echo "under $awk: the CI tables are consistent and the timings tool passes its self-test"
 done
 echo "actionlint and shellcheck found nothing"
