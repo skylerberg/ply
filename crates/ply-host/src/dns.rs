@@ -204,7 +204,7 @@ mod system {
     pub fn names(_: IpAddr) -> Result<Vec<String>, Failure> {
         Err(Failure::Other(
             0,
-            "this platform's resolver answers no reverse lookup".to_string(),
+            "this platform's resolver does no reverse lookup".to_string(),
         ))
     }
 }

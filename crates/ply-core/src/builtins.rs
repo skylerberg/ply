@@ -39,7 +39,7 @@ pub fn not_a_byte(span: Span, what: &str, byte: i64) -> Diagnostic {
         format!("`{what}` was given {byte}, which is not a byte"),
     )
     .primary(span, "a byte is `0` to `255`")
-    .note("`Bytes::at` answers in that range, and so does a byte literal's element")
+    .note("`Bytes::at` returns values in that range, and so does a byte literal's element")
 }
 
 /// `byte_of_int` given `n`, which is no byte.
@@ -158,10 +158,10 @@ pub fn assert_failure(message: Option<&str>, span: Span) -> Diagnostic {
 #[cold]
 pub fn scoped_released(span: Span, doing: &str) -> Diagnostic {
     Diagnostic::error(
-        codes::HOLD_RELEASED,
-        format!("a hold is {doing} after its region released what it held"),
+        codes::SCOPED_VALUE_RELEASED,
+        format!("a scoped value is {doing} after its scope released what it held"),
     )
-    .primary(span, "the hold holds nothing now")
+    .primary(span, "the scoped value holds nothing now")
     .note("a `with_scope` releases its value once, when its body first ends; a continuation captured inside the body and resumed after that runs the rest of the body against a value already released")
     .note("resume a continuation captured inside a `with_scope` at most once, or open the `with_scope` after the choice the continuation replays")
 }

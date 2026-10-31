@@ -28,7 +28,7 @@ fn rejected(engine: &mut Engine, sql: &str) -> Failure {
     let reply = run(engine, sql);
     reply
         .failure
-        .unwrap_or_else(|| panic!("`{sql}` ran, and answered {:?}", reply.rows))
+        .unwrap_or_else(|| panic!("`{sql}` ran, and returned {:?}", reply.rows))
 }
 
 fn kind(engine: &mut Engine, sql: &str) -> &'static str {
@@ -180,7 +180,7 @@ fn a_statement_cannot_change_what_the_connection_was_opened_with() {
 }
 
 #[test]
-fn time_and_randomness_are_refused_wherever_they_are_written() {
+fn time_and_randomness_are_rejected_wherever_they_are_written() {
     let mut engine = empty();
     for sql in [
         "SELECT random()",
@@ -212,7 +212,7 @@ fn time_and_randomness_are_refused_wherever_they_are_written() {
 }
 
 #[test]
-fn a_date_function_that_reads_no_clock_answers() {
+fn a_date_function_that_reads_no_clock_returns() {
     let mut engine = empty();
     for (sql, wanted) in [
         (
@@ -244,7 +244,7 @@ fn a_date_function_that_reads_no_clock_answers() {
 }
 
 #[test]
-fn a_view_or_a_trigger_cannot_smuggle_a_refused_function() {
+fn a_view_or_a_trigger_cannot_smuggle_a_rejected_function() {
     let mut engine = empty();
     done(&mut engine, "CREATE TABLE a (x INTEGER) STRICT");
     run(&mut engine, "CREATE VIEW dice AS SELECT random() AS r");
@@ -420,7 +420,7 @@ fn a_query_only_reads_and_a_statement_is_one() {
 }
 
 #[test]
-fn each_limit_refuses_what_passes_it() {
+fn each_limit_rejects_what_passes_it() {
     let mut engine = empty();
     done(&mut engine, "CREATE TABLE t (a INTEGER) STRICT");
     done(&mut engine, "INSERT INTO t VALUES (1), (2), (3)");
@@ -511,7 +511,7 @@ fn each_limit_refuses_what_passes_it() {
 }
 
 #[test]
-fn a_strict_connection_refuses_a_table_that_is_not() {
+fn a_strict_connection_rejects_a_table_that_is_not() {
     let mut strict = Engine::memory(b"", true).unwrap();
     assert_eq!(kind(&mut strict, "CREATE TABLE loose (a)"), "refused");
     assert_eq!(
@@ -529,7 +529,7 @@ fn a_strict_connection_refuses_a_table_that_is_not() {
 }
 
 #[test]
-fn the_largest_row_id_is_refused() {
+fn the_largest_row_id_is_rejected() {
     let mut engine = empty();
     done(
         &mut engine,

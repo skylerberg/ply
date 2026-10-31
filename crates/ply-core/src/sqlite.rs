@@ -511,7 +511,7 @@ impl Engine {
             ..Reply::default()
         }) else {
             drop(stmt);
-            self.settle(guarded, false);
+            self.close_savepoint(guarded, false);
             return;
         };
         stmt.reset_status(StatementStatus::VmStep);
@@ -565,7 +565,7 @@ impl Engine {
                 None => {
                     drop(rows);
                     drop(stmt);
-                    self.settle(guarded, false);
+                    self.close_savepoint(guarded, false);
                     return;
                 }
             }
@@ -584,7 +584,7 @@ impl Engine {
             }
             Err(failure) => reply.failure = Some(failure),
         }
-        if let Some(failure) = self.settle(guarded, reply.failure.is_none()) {
+        if let Some(failure) = self.close_savepoint(guarded, reply.failure.is_none()) {
             reply.failure.get_or_insert(failure);
         }
         if reply.failure.is_some() {
@@ -688,7 +688,7 @@ impl Engine {
         // The one statement that writes another file and asks the authorizer nothing first.
         if first_word_is(sql, "vacuum") {
             return Err(Failure::rejected(
-                "a connection reaches its own database and no other file: `VACUUM` is refused, and a backup is how a copy is made",
+                "a connection reaches its own database and no other file: `VACUUM` is rejected, and a backup is how a copy is made",
             ));
         }
         Ok(())
@@ -699,7 +699,7 @@ impl Engine {
     fn left_behind(&self, sql: &str) -> Option<Failure> {
         if self.guard.last_row_id_taken.load(Ordering::Relaxed) {
             return Some(Failure::rejected(format!(
-                "a row id of {} is refused: past it the engine draws row ids at random",
+                "a row id of {} is rejected: past it the engine draws row ids at random",
                 i64::MAX
             )));
         }
@@ -727,7 +727,7 @@ impl Engine {
     }
 
     /// Closes the savepoint a statement ran in: kept, or rolled back to.
-    fn settle(&self, guarded: bool, kept: bool) -> Option<Failure> {
+    fn close_savepoint(&self, guarded: bool, kept: bool) -> Option<Failure> {
         if !guarded || self.conn.is_autocommit() {
             return None;
         }
@@ -987,7 +987,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
 fn rejection(action: AuthAction<'_>) -> Option<String> {
     match action {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Some(
-            "a connection reaches its own database and no other file: `ATTACH`, `DETACH` and `VACUUM` are refused"
+            "a connection reaches its own database and no other file: `ATTACH`, `DETACH` and `VACUUM` are rejected"
                 .to_string(),
         ),
         AuthAction::Pragma {
@@ -1011,7 +1011,7 @@ fn rejection(action: AuthAction<'_>) -> Option<String> {
                 None
             } else {
                 Some(format!(
-                    "the function `{name}` is not one a statement may call: what it answers is not a function of the database and the values bound"
+                    "the function `{name}` is not one a statement may call: what it returns is not a function of the database and the values bound"
                 ))
             }
         }
@@ -1026,11 +1026,11 @@ fn rejection(action: AuthAction<'_>) -> Option<String> {
         | AuthAction::DropTempIndex { .. }
         | AuthAction::DropTempTrigger { .. }
         | AuthAction::DropTempView { .. } => Some(
-            "temporary tables, indexes, triggers and views are refused: they belong to a connection, not to the database"
+            "temporary tables, indexes, triggers and views are rejected: they belong to a connection, not to the database"
                 .to_string(),
         ),
         AuthAction::CreateVtable { module_name, .. } | AuthAction::DropVtable { module_name, .. } => {
-            Some(format!("virtual tables are refused, `{module_name}`'s among them"))
+            Some(format!("virtual tables are rejected, `{module_name}`'s among them"))
         }
         AuthAction::Unknown { code, .. } => Some(format!(
             "the engine asked leave for an action this build does not know (code {code})"
@@ -1086,7 +1086,7 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
     }
     UNGUARDED.with(|unguarded| {
         let Some(conn) = unguarded else {
-            return refuse(format!("{REJECTED}`{name}` could not be answered"));
+            return refuse(format!("{REJECTED}`{name}` could not be evaluated"));
         };
         let holes: Vec<String> = (1..=args.len()).map(|i| format!("?{i}")).collect();
         let mut stmt = conn.prepare_cached(&format!("SELECT {name}({})", holes.join(", ")))?;

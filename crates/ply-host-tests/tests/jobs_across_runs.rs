@@ -74,7 +74,7 @@ fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
     });
     match heard.recv_timeout(Duration::from_secs(10)) {
         Ok(Err(message)) => assert!(message.contains("`a waiting job`"), "{message}"),
-        Ok(Ok(())) => panic!("a job that panicked was answered"),
+        Ok(Ok(())) => panic!("a job that panicked returned a result"),
         Err(_) => panic!("a waiting job panicked and the run waiting on it was never woken"),
     }
 }
@@ -94,6 +94,6 @@ fn one_runs_token_is_none_of_anothers() {
     assert!(job_bytes(&*theirs, &ticket).is_err(), "nor wait on it");
     match job_bytes(&*mine, &ticket) {
         Ok(bytes) => assert_eq!(bytes, b"mine"),
-        Err(d) => panic!("the run that submitted it was not answered: {}", d.message),
+        Err(d) => panic!("the run that submitted it got no result: {}", d.message),
     }
 }

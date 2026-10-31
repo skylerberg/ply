@@ -151,7 +151,7 @@ fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
     let (frames, rejected) = unsafe { ((*d).frames.clone(), (*d).rejected) };
     assert!(
         !rejected,
-        "the stack refused to extend within its reservation"
+        "the stack failed to extend within its reservation"
     );
     assert_eq!(frames.len(), LEVELS + 1);
     assert!(

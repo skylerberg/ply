@@ -14,7 +14,7 @@ use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
 use ply_compiled::rt::{BRIDGE, Ctx, FAILED_TARGET};
-use ply_core::{EffectAtom, Mode, Resource};
+use ply_core::{Effect, Mode, Resource};
 use std::cell::Cell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -116,7 +116,7 @@ fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
 }
 
 #[test]
-fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
+fn an_unhandled_raise_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
     let mut ctx = naming(&["m", "boom"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -137,7 +137,7 @@ fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_i
 type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 
 #[test]
-fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation() {
+fn an_unhandled_raise_waits_for_the_code_whose_clause_handles_its_operation() {
     let mut ctx = naming(&["m", "boom", "other"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -158,7 +158,7 @@ fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation
 }
 
 #[test]
-fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
+fn an_unhandled_panic_says_its_message_lowered_through_its_type() {
     let mut ctx = naming(&["abort", "raise"]);
     ctx.begin();
     let message: &str = "it broke";
@@ -181,7 +181,7 @@ fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go
     assert_eq!(ctx.heap.live(), 0, "the argument was not let go");
     assert_eq!(
         ctx.performed,
-        [EffectAtom::operation(
+        [Effect::operation(
             "m",
             Resource::Singleton,
             Mode::Read,

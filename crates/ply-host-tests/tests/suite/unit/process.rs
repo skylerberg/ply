@@ -1,5 +1,5 @@
 use ply_core::{Diagnostic, HostRuntime, Span, Symbol, codes};
-use ply_host::jobs::{Failure, Refusing};
+use ply_host::jobs::{Failure, FallibleJob};
 use ply_host::native::{int_of, parts_of};
 use ply_host::process::*;
 use std::rc::Rc;
@@ -25,7 +25,7 @@ fn host(argv: &[&str]) -> Arc<ProcessHost> {
 const S: Span = Span::DUMMY;
 
 #[test]
-fn args_answers_the_vector_it_was_given() {
+fn args_returns_the_vector_it_was_given() {
     let host = host(&["a", "b c"]);
     assert_eq!(host.args(S).expect("a run's own process"), ["a", "b c"]);
 }
@@ -69,9 +69,9 @@ fn bytes_are_written_as_they_are_and_a_line_keeps_its_place_among_them() {
 
 /// Only a host that writes the process's own streams ends the process over them.
 #[test]
-fn a_host_whose_streams_are_captured_leaves_an_unanswered_raise_to_the_run() {
+fn a_host_whose_streams_are_captured_leaves_an_unhandled_raise_to_the_run() {
     let host = host(&[]);
-    host.unanswered(&Symbol::new(PIPE_EFFECT), &Symbol::new(PIPE_BROKEN));
+    host.unhandled(&Symbol::new(PIPE_EFFECT), &Symbol::new(PIPE_BROKEN));
     host.settle();
 }
 
@@ -135,7 +135,7 @@ fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
 }
 
 /// What a job returned, run on this thread.
-fn ran(job: Refusing) -> Result<Vec<u8>, Diagnostic> {
+fn ran(job: FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
         Failure::Said(reason) => panic!("the job failed: {reason}"),
@@ -177,7 +177,7 @@ fn spawn(
 }
 
 #[test]
-fn a_spawn_answers_with_the_code_and_everything_both_streams_took() {
+fn a_spawn_returns_the_code_and_everything_both_streams_took() {
     let host = spawning("sh", SH);
     let done = spawn(
         &host,
@@ -276,7 +276,7 @@ fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
 
 /// The table the run was given is the whole result, and asking again reads the same one.
 #[test]
-fn bound_answers_whether_the_run_bound_a_program_to_the_label() {
+fn bound_returns_whether_the_run_bound_a_program_to_the_label() {
     let shell = spawning("sh", SH);
     for _ in 0..2 {
         assert!(shell.bound("sh"));
@@ -375,7 +375,7 @@ fn launched(
 /// `sh -c script` under `[sh]`, running.
 fn start(host: &Arc<ProcessHost>, script: &str, dir: &str, io: Io) -> i64 {
     launched(host, "sh", script, dir, io)
-        .expect("a start answers")
+        .expect("a start returns")
         .unwrap_or_else(|reason| panic!("not started: {reason}"))
 }
 
@@ -406,7 +406,7 @@ fn signal(host: &Arc<ProcessHost>, child: i64, which: Signal) -> Result<bool, Di
 
 fn input(host: &Arc<ProcessHost>, child: i64, bytes: &[u8]) -> Result<bool, Diagnostic> {
     let job = host.input("sh", child, bytes.to_vec(), S)?;
-    Ok(job().expect("a write answers") == [1])
+    Ok(job().expect("a write returns") == [1])
 }
 
 fn heard(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> Heard {
@@ -492,7 +492,7 @@ fn a_terminated_child_ends_by_the_signal() {
 }
 
 #[test]
-fn a_signal_to_a_child_that_has_ended_answers_false() {
+fn a_signal_to_a_child_that_has_ended_returns_false() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -510,7 +510,7 @@ fn a_signal_to_a_child_that_has_ended_answers_false() {
 }
 
 #[test]
-fn a_child_fed_over_its_input_answers_what_it_read() {
+fn a_child_fed_over_its_input_responds_with_what_it_read() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -588,7 +588,7 @@ fn a_quiet_child_is_quiet_until_it_speaks_and_closed_once_it_is_done() {
     assert_eq!(
         heard(&host, child, 0),
         Heard::Closed,
-        "the end is not a one-shot answer"
+        "the end is not a one-shot result"
     );
     let done = wait(&host, child, 10_000)
         .expect("a wait")
@@ -664,7 +664,7 @@ fn a_file_output_lands_in_the_childs_directory_and_starts_empty() {
 }
 
 #[test]
-fn kept_output_past_the_bound_is_drained_and_refused_at_the_wait() {
+fn kept_output_past_the_bound_is_drained_and_rejected_at_the_wait() {
     let host = spawning("sh", SH);
     let over = MAX_CAPTURE_BYTES + 1;
     let child = start(
@@ -681,12 +681,12 @@ fn kept_output_past_the_bound_is_drained_and_refused_at_the_wait() {
         "{}",
         rejected.message
     );
-    let again = wait(&host, child, 0).expect_err("the refusal spent the handle");
+    let again = wait(&host, child, 0).expect_err("the rejection spent the handle");
     assert_eq!(again.code, codes::RUNTIME_ERROR);
 }
 
 #[test]
-fn a_spent_handle_and_one_never_answered_are_refusals_rather_than_children() {
+fn a_spent_handle_and_one_never_returned_are_rejections_rather_than_children() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -767,7 +767,7 @@ fn a_start_of_an_unbound_label_names_the_flag_that_would_bind_it() {
 }
 
 #[test]
-fn a_child_that_cannot_start_is_an_answer_rather_than_a_diagnostic() {
+fn a_child_that_cannot_start_is_a_result_rather_than_a_diagnostic() {
     let host = spawning("sh", SH);
     let nowhere = launched(
         &host,
@@ -776,7 +776,7 @@ fn a_child_that_cannot_start_is_an_answer_rather_than_a_diagnostic() {
         "/a/directory/that/is/not/there",
         wired(false, Output::Keep, Output::Keep),
     )
-    .expect("a start answers")
+    .expect("a start returns")
     .expect_err("there is no such directory to start in");
     assert!(nowhere.contains("could not be started"), "{nowhere}");
     let unopened = launched(
@@ -790,7 +790,7 @@ fn a_child_that_cannot_start_is_an_answer_rather_than_a_diagnostic() {
             Output::Keep,
         ),
     )
-    .expect("a start answers")
+    .expect("a start returns")
     .expect_err("there is no such directory to write in");
     assert!(unopened.contains("could not be opened"), "{unopened}");
 }

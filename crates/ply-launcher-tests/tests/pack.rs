@@ -97,7 +97,7 @@ fn a_pack_lists_the_modules_and_the_data_below_a_root() {
 }
 
 #[test]
-fn an_answer_is_the_frame_a_range_of_the_answers_file_holds() {
+fn a_cached_result_is_the_frame_a_range_of_the_cached_results_file_holds() {
     let one = framed(b"one record");
     let two = framed(b"another");
     let store = [one.clone(), two.clone()].concat();
@@ -198,7 +198,7 @@ fn a_binary_with_no_pack_carries_none() {
 }
 
 #[test]
-fn a_torn_pack_is_refused_rather_than_read() {
+fn a_torn_pack_is_rejected_rather_than_read() {
     let whole = binary(b"code", &[("a", b"1"), ("b", b"2")]);
     let mut lying = whole.clone();
     let trailer = lying.len() - 24;
@@ -218,7 +218,7 @@ fn a_torn_pack_is_refused_rather_than_read() {
 }
 
 #[test]
-fn a_table_out_of_order_is_refused() {
+fn a_table_out_of_order_is_rejected() {
     let mut data = b"12".to_vec();
     let mut table = 2u32.to_le_bytes().to_vec();
     for (path, at) in [("b", 0u64), ("a", 1u64)] {
@@ -234,6 +234,6 @@ fn a_table_out_of_order_is_refused() {
     data.extend_from_slice(&pack_len.to_le_bytes());
     data.extend_from_slice(&table_len.to_le_bytes());
     data.extend_from_slice(b"PLYPACK1");
-    let rejected = read(&data).err().expect("an unsorted table is refused");
+    let rejected = read(&data).err().expect("an unsorted table is rejected");
     assert!(rejected.contains("ascending"), "{rejected}");
 }

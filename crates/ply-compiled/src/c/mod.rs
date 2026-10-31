@@ -36,15 +36,15 @@ pub fn bodies_dir() -> std::path::PathBuf {
 
 /// Every directory a run caches in for the next one: the compiled objects and the stages. What is
 /// there is a product of its key, so no result depends on finding it.
-pub fn kept_dirs() -> Vec<std::path::PathBuf> {
+pub fn cache_dirs() -> Vec<std::path::PathBuf> {
     vec![load::cache_dir(), stage::stage_root()]
 }
 
 /// The directory a run caches `kind` of what it caches in: the one the variable `named` names, else
 /// `ply/<kind>` under the user's caches, which a restart of the machine leaves as they were.
-pub(crate) fn kept_dir(kind: &str, named: &str) -> std::path::PathBuf {
+pub(crate) fn cache_dir_for(kind: &str, named: &str) -> std::path::PathBuf {
     let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
-    kept_root(
+    cache_root_for(
         kind,
         var(named),
         var("HOME"),
@@ -57,7 +57,7 @@ pub(crate) fn kept_dir(kind: &str, named: &str) -> std::path::PathBuf {
 /// [`kept_dir`] of what the environment holds: `named` where it is set, else `ply/<kind>` under
 /// the user's caches, which are `Library/Caches` under `home` on macOS and `xdg`, when it is an
 /// absolute path, or `.cache` under `home` elsewhere; under `temp` for a user with no home.
-pub fn kept_root(
+pub fn cache_root_for(
     kind: &str,
     named: Option<std::path::PathBuf>,
     home: Option<std::path::PathBuf>,

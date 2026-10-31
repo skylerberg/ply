@@ -359,7 +359,7 @@ pub(crate) fn rejected_unknown(c: &mut Ctx, what: I64) {
     c.fail(
         Diagnostic::error(
             codes::INTERNAL_ERROR,
-            format!("a refused operation numbered {}, which none is", what.0),
+            format!("a rejected operation numbered {}, which none is", what.0),
         )
         .note("this is Ply's fault, not the program's"),
     );
@@ -387,15 +387,18 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
     };
     let name = r.name();
     let rejected = match r {
-        Rejected::ArrayNew | Rejected::ColumnsNew | Rejected::ArrayOfList | Rejected::ColumnsOfList => {
-            said::array_length(site, name, a.0)
-        }
+        Rejected::ArrayNew
+        | Rejected::ColumnsNew
+        | Rejected::ArrayOfList
+        | Rejected::ColumnsOfList => said::array_length(site, name, a.0),
         Rejected::ArrayGet | Rejected::ArraySet | Rejected::ColumnsGet | Rejected::ColumnsSet => {
             said::out_of_range(site, name, a.0, len(b), "elements")
         }
         Rejected::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
         // Told at the last index it would read, as the builtin tells it.
-        Rejected::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
+        Rejected::BytesU32Le => {
+            said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes")
+        }
         Rejected::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
         Rejected::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
         Rejected::ByteOfInt => said::byte_of_int_rejected(site, a.0),
@@ -473,7 +476,7 @@ pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
             error(format!("`iterate` did not stop within its budget of {n}")),
         ),
         _ => ctx.fail(
-            error("the step given to `iterate` answered neither `Continue` nor `Stop`")
+            error("the step given to `iterate` returned neither `Continue` nor `Stop`")
                 .note("this is Ply's fault, not the program's"),
         ),
     };

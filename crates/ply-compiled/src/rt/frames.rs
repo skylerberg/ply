@@ -9,7 +9,7 @@ pub const FAILED: i64 = 1;
 pub const FAILED_OUT_OF_STACK: i64 = 3;
 
 /// The harness stopped the entry at its wall clock, which is not a verdict on the program.
-pub const FAILED_ABANDONED: i64 = 5;
+pub const FAILED_TIMED_OUT: i64 = 5;
 
 /// The task was cancelled: it unwinds to its entry, which reports it cancelled rather than failed.
 pub const FAILED_CANCELLED: i64 = 7;
@@ -48,7 +48,7 @@ pub(crate) fn release_fun(f: Word) {
 /// what is kept in [`Ctx::stacks`] is let go with the stack instead.
 pub(crate) enum Kept {
     /// The pending raise a `bracket`'s release runs during, and the failure it carries.
-    Pending(Unanswered, Option<Diagnostic>),
+    Pending(Unhandled, Option<Diagnostic>),
     /// The arguments a clause emitted code made is called with, which it takes as it is entered.
     Args(Vec<Word>),
     /// A clause of the `handle` of the detached body at this index running, which reads the

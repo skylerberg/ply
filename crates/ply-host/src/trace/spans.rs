@@ -275,8 +275,8 @@ pub fn err_unbalanced(span: Span, operation: &str, id: i64, reason: &Unbalanced)
     .primary(span, "this span is not open here");
     let diagnostic = match reason {
         Unbalanced::NeverOpened => diagnostic
-            .note("no `trace.enter` in this entry point has answered that id")
-            .note("a `Span` is an ordinary record, so one can be built rather than entered; pass the value `trace.enter` answered"),
+            .note("no `trace.enter` in this entry point has returned that id")
+            .note("a `Span` is an ordinary record, so one can be built rather than entered; pass the value `trace.enter` returned"),
         Unbalanced::AlreadyClosed => diagnostic
             .note("it was closed by an earlier `trace.exit`, or by the `trace.exit` of a span below it")
             .note("closing a span closes every span opened above it, so an inner `exit` after an outer one has nothing left to close"),
@@ -286,7 +286,7 @@ pub fn err_unbalanced(span: Span, operation: &str, id: i64, reason: &Unbalanced)
             .note("open and close a span in one task, and pass what it measured across the boundary as a field"),
         Unbalanced::OtherChannel(channel) => diagnostic
             .note(format!("it is open on channel `{}`", label(channel)))
-            .note("a channel is part of a span's identity because it is part of the atom the row carries"),
+            .note("a channel is part of a span's identity, because the trace records it as part of the span's effect"),
     };
     diagnostic.note("silently accepting an unbalanced exit is how one request's timing lands under another request's span")
 }

@@ -66,9 +66,9 @@ impl Exports {
                 "taking {} and {}",
                 h.args,
                 if h.results {
-                    "answering"
+                    "returning"
                 } else {
-                    "answering nothing"
+                    "returning nothing"
                 }
             )
         };

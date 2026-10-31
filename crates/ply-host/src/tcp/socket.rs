@@ -1,6 +1,6 @@
 //! The socket table over TCP and Unix sockets, plaintext or TLS, and datagram sockets.
 
-use super::wire::{self, Credentials, Endpoint, Probing, NetError, SocketOption};
+use super::wire::{self, Credentials, Endpoint, NetError, Probing, SocketOption};
 use super::{
     Handles, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener, not_a_stream,
     not_upgradable, unknown_handle,
@@ -904,12 +904,14 @@ fn presented(options: &[SocketOption]) -> Option<String> {
 /// The handshake of an upgrade, completed within its deadline: the protocol agreed found, or why
 /// not.
 fn finished(session: &tls::Session, timeout: Duration) -> Vec<u8> {
-    let outcome = session.finish_within(timeout).map_err(|reason| match reason {
-        tls::Unfinished::Expired => NetError::TimedOut,
-        tls::Unfinished::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
-        tls::Unfinished::Rejected(tls::REASON_GONE) => NetError::Reset,
-        tls::Unfinished::Rejected(reason) => NetError::Handshake(reason.to_string()),
-    });
+    let outcome = session
+        .finish_within(timeout)
+        .map_err(|reason| match reason {
+            tls::Unfinished::Expired => NetError::TimedOut,
+            tls::Unfinished::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
+            tls::Unfinished::Rejected(tls::REASON_GONE) => NetError::Reset,
+            tls::Unfinished::Rejected(reason) => NetError::Handshake(reason.to_string()),
+        });
     wire::result(outcome.map(found))
 }
 

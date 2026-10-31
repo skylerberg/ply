@@ -114,7 +114,7 @@ fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
     assert_eq!(diagnostic.code, codes::SPAN_UNBALANCED);
     assert!(
         diagnostic.notes.iter().any(|n| n.contains("task @1")),
-        "the refusal must name the task that holds it: {diagnostic:?}"
+        "the rejection must name the task that holds it: {diagnostic:?}"
     );
     // And the span is still open, because rejecting is not closing.
     assert_eq!(spans.depth(first), 1);
@@ -145,7 +145,7 @@ fn the_three_ways_an_exit_names_a_span_that_is_not_open_are_told_apart() {
         panic!("the channel disagrees");
     };
     assert!(matches!(elsewhere, Unbalanced::OtherChannel(_)));
-    assert_eq!(spans.depth(owner), 1, "a refusal closes nothing");
+    assert_eq!(spans.depth(owner), 1, "a rejection closes nothing");
 }
 
 #[test]

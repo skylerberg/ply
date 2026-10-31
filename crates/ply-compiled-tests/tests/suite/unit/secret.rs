@@ -232,7 +232,7 @@ fn an_rsa_jwk_is_the_document_its_numbers_came_from_and_numbers_that_disagree_ar
 }
 
 #[test]
-fn a_keyed_hash_answers_under_the_hash_its_name_names() {
+fn a_keyed_hash_returns_under_the_hash_its_name_names() {
     let mut ctx = context();
     let key = sealed(&mut ctx, b"key", false);
     let hmac = |ctx: &mut Ctx, hash: &str| {
@@ -255,7 +255,7 @@ fn a_keyed_hash_answers_under_the_hash_its_name_names() {
 
 /// RFC 5869's first case: the key HKDF extracts, and the bytes it expands that key to.
 #[test]
-fn hkdf_extracts_and_expands_as_rfc_5869_does_and_refuses_a_length_past_its_bound() {
+fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_bound() {
     let mut ctx = context();
     let (hp, hn) = borrowed(b"SHA-256");
     let ikm = sealed(&mut ctx, &[0x0b; 22], false);

@@ -99,7 +99,7 @@ module.exports = grammar({
       field('name', choice($.identifier, $.qualified_name)),
       optional($.generic_parameters),
       field('parameters', $.parameter_list),
-      optional(seq('->', field('return_type', $._type), optional($.effect_row))),
+      optional(seq('->', field('return_type', $._type), optional($.effects_annotation))),
       repeat($._spec_clause),
       optional(seq('=', field('body', $._expression))),
     ),
@@ -111,7 +111,7 @@ module.exports = grammar({
       optional($.generic_parameters),
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type))),
-      optional($.effect_row),
+      optional($.effects_annotation),
       repeat($._spec_clause),
     ),
 
@@ -161,13 +161,13 @@ module.exports = grammar({
 
     generic_parameters: $ => choice(
       seq('<', $.type_gt),
-      seq('<', commaSep1($._generic_parameter), optional(seq('|', optional(commaSep1($.row_parameter)))), $.type_gt),
-      seq('<', '|', commaSep1($.row_parameter), $.type_gt),
+      seq('<', commaSep1($._generic_parameter), optional(seq('|', optional(commaSep1($.effect_parameter)))), $.type_gt),
+      seq('<', '|', commaSep1($.effect_parameter), $.type_gt),
     ),
     _generic_parameter: $ => choice($.type_parameter, $.label_parameter),
     type_parameter: $ => seq(optional($.keep_marker), $.identifier),
     label_parameter: $ => seq('[', commaSep1($.identifier), ']'),
-    row_parameter: $ => $.identifier,
+    effect_parameter: $ => $.identifier,
 
     // --- Types --------------------------------------------------------------
 
@@ -224,8 +224,8 @@ module.exports = grammar({
     ),
 
     type_arguments: $ => choice(
-      seq('<', commaSep1($._type_argument), optional(seq('|', optional(commaSep1($.row)))), $.type_gt),
-      seq('<', '|', commaSep1($.row), $.type_gt),
+      seq('<', commaSep1($._type_argument), optional(seq('|', optional(commaSep1($.effects_list)))), $.type_gt),
+      seq('<', '|', commaSep1($.effects_list), $.type_gt),
     ),
     _type_argument: $ => choice($._type, $.label_argument),
     label_argument: $ => seq('[', $.identifier, ']'),
@@ -238,7 +238,7 @@ module.exports = grammar({
       ')',
       '->',
       field('return_type', $._type),
-      optional($.effect_row),
+      optional($.effects_annotation),
       optional($.cost_clause),
       optional($.space_clause),
     )),
@@ -286,10 +286,10 @@ module.exports = grammar({
       $.effect_set,
     ),
     effect_set: $ => seq('{', commaSep1($._effect_set_entry), '}'),
-    _effect_set_entry: $ => choice($.atom, $.qualified_name, $.identifier),
+    _effect_set_entry: $ => choice($.effect, $.qualified_name, $.identifier),
 
-    // An atom is `effect.mode[resource]`, or `effect.mode` for a singleton.
-    atom: $ => choice(
+    // `name.mode[resource]`, or `name.mode` for a singleton.
+    effect: $ => choice(
       'diverges',
       seq(
         field('effect', choice($.qualified_name, $.identifier)),
@@ -299,17 +299,17 @@ module.exports = grammar({
       ),
     ),
 
-    effect_row: $ => seq('/', choice($.row, seq($.row, 'bounded'))),
-    row: $ => choice(
-      seq('{', optional($._row_body), '}'),
-      $.row_variable,
+    effects_annotation: $ => seq('/', choice($.effects_list, seq($.effects_list, 'bounded'))),
+    effects_list: $ => choice(
+      seq('{', optional($._effects_list_body), '}'),
+      $.effect_variable,
     ),
-    _row_body: $ => seq(
-      commaSep1($.row_atom),
-      optional(seq('|', choice('diverges', $.row_variable), optional('bounded'))),
+    _effects_list_body: $ => seq(
+      commaSep1($.listed_effect),
+      optional(seq('|', choice('diverges', $.effect_variable), optional('bounded'))),
     ),
-    row_atom: $ => seq(choice($.atom, $.qualified_name, $.identifier), optional('bounded')),
-    row_variable: $ => $.identifier,
+    listed_effect: $ => seq(choice($.effect, $.qualified_name, $.identifier), optional('bounded')),
+    effect_variable: $ => $.identifier,
 
     // --- Tests and laws -----------------------------------------------------
 

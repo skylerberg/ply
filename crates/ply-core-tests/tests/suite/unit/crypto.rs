@@ -48,7 +48,7 @@ fn an_hmac_is_rfc_4231s_and_each_scheme_makes_a_public_key_and_a_signature() {
 }
 
 #[test]
-fn a_hash_the_runtime_does_not_key_answers_nothing() {
+fn a_hash_the_runtime_does_not_key_returns_nothing() {
     let key = [7; 32];
     let results = |hash: &str| {
         [
@@ -117,7 +117,7 @@ fn each_encoding_says_what_it_does_and_one_it_does_not_have_does_nothing() {
 }
 
 #[test]
-fn a_misuse_is_refused_and_the_refusal_names_no_key() {
+fn a_misuse_is_rejected_and_the_rejection_names_no_key() {
     let short = b"hunter2hunter2";
     let key = [7; 32];
     let rejections = [
@@ -137,7 +137,7 @@ fn a_misuse_is_refused_and_the_refusal_names_no_key() {
 }
 
 #[test]
-fn a_key_that_is_none_of_its_scheme_answers_nothing() {
+fn a_key_that_is_none_of_its_scheme_returns_nothing() {
     let short = b"short";
     assert_eq!(crypto::public("ed25519", short), Ok(None));
     assert_eq!(crypto::public("p256", &[0; 32]), Ok(None));
@@ -273,7 +273,9 @@ fn a_frame_reads_back_what_it_wrote_and_nothing_it_did_not() {
     assert!(hex.unframed(b"AB", b"", b"").is_none());
     assert!(hex.unframed(b"abc", b"", b"").is_none());
     for rejected in ["rot13", "base32-typed", "RAW", ""] {
-        let d = named(rejected).err().unwrap_or_else(|| panic!("{rejected}"));
+        let d = named(rejected)
+            .err()
+            .unwrap_or_else(|| panic!("{rejected}"));
         assert_eq!(d.code, codes::RUNTIME_ERROR);
         assert!(d.message.contains("`fs.write_secret`"), "{}", d.message);
     }

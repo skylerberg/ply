@@ -288,7 +288,7 @@ pub fn library(dir: &Path, text: &str) -> Option<PathBuf> {
     };
     assert!(
         out.status.success(),
-        "the C compiler refused the unit:\n{}",
+        "the C compiler rejected the unit:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     Some(lib)

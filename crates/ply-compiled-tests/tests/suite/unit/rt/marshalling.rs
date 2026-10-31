@@ -261,7 +261,7 @@ fn the_natives_read_what_the_codec_writes() {
 /// What a descriptor lifts or lowers by where the runtime never asks it to fails the entry, saying
 /// which.
 #[test]
-fn a_descriptors_refusal_fails_the_entry() {
+fn a_descriptors_rejection_fails_the_entry() {
     for (rejection, said) in [
         ("rt_never_lifted", "lifts only a `String`"),
         ("rt_never_shown", "does not lower it"),
@@ -270,7 +270,7 @@ fn a_descriptors_refusal_fails_the_entry() {
         ctx.begin();
         let rejected: unsafe extern "C" fn(*mut Ctx) = helper(rejection);
         unsafe { rejected(&mut ctx) };
-        assert_ne!(ctx.failed, 0, "{rejection} refused nothing");
+        assert_ne!(ctx.failed, 0, "{rejection} rejected nothing");
         let reason = format!("{:?}", ctx.take_failure());
         assert!(reason.contains(said), "{reason}");
         ctx.end();
@@ -382,7 +382,7 @@ fn a_128_bit_widths_two_words_box_as_its_two_words() {
 /// Marshalling begun inside another works on a frame of its own, and the outer one goes on where it
 /// was.
 #[test]
-fn a_crossing_inside_a_crossing_leaves_the_outer_as_it_was() {
+fn marshalling_inside_marshalling_leaves_the_outer_as_it_was() {
     let mut ctx = context();
     let inner_bytes = written(|w| w.int(7));
     let mut written_inside = Vec::new();
@@ -483,16 +483,16 @@ fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
     let secret = sealed(&mut ctx, b"hunter2", true);
     let c: *mut Ctx = &mut ctx;
     let bytes = unsafe {
-        let hold = native::<A1>("?hold_made")(c, imm(42));
+        let scoped = native::<A1>("?hold_made")(c, imm(42));
         native::<N0>("?shown_open")(c);
         native::<N2>("?out_count")(c, tag::LIST as Word, 3);
         native::<N1>("?out_handle")(c, secret);
-        native::<N1>("?out_handle")(c, hold);
+        native::<N1>("?out_handle")(c, scoped);
         native::<N2>("?out_carried")(c, 40, &raw const PAIR as Word);
         let n = native::<A0>("?lower_close")(c);
         let mut out = vec![0u8; n as usize];
         native::<N2>("?taken")(c, out.as_mut_ptr() as Word, n);
-        helper::<N1>("rt_handle_free")(c, hold);
+        helper::<N1>("rt_handle_free")(c, scoped);
         out
     };
     unfailed(&mut ctx);

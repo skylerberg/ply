@@ -8,7 +8,7 @@ pub mod wire;
 
 pub use socket::TcpHost;
 pub(crate) use socket::apply;
-pub use wire::{Credentials, Endpoint, Probing, NetError, SocketOption};
+pub use wire::{Credentials, Endpoint, NetError, Probing, SocketOption};
 
 use ply_core::{Diagnostic, Span, codes};
 use std::collections::BTreeMap;
@@ -99,7 +99,10 @@ pub(crate) fn bind(what: &str, port: u16, span: Span) -> Result<std::net::TcpLis
             codes::RUNTIME_ERROR,
             format!("{what} could not bind 127.0.0.1:{port}: {e}"),
         )
-        .primary(span, "this listen reached the host and the host refused")
+        .primary(
+            span,
+            "this listen reached the host and the host rejected it",
+        )
     })
 }
 

@@ -35,7 +35,7 @@ fn submitted(pool: &Pool, run: &Arc<Run>, result: i64) -> Pending {
 fn returned(run: &Run, pending: Pending) -> Vec<u8> {
     run.block_on(&pending, None)
         .unwrap_or_else(|d| panic!("{d:?}"))
-        .expect("an unbounded wait ends answered")
+        .expect("an unbounded wait ends with a result")
 }
 
 /// What `run` takes once a watched operation has returned: each returned token beside its
@@ -51,7 +51,7 @@ fn collected(run: &Run) -> Vec<(u64, Result<Vec<u8>, Diagnostic>)> {
                 token,
                 label: "a test job",
             };
-            let result = run.taken(&pending).map(|v| v.expect("answered"));
+            let result = run.taken(&pending).map(|v| v.expect("returned"));
             (token, result)
         })
         .collect()
@@ -76,11 +76,11 @@ fn a_run_collects_its_own_operations_and_none_of_anothers() {
     assert_eq!(
         collected(&theirs)
             .into_iter()
-            .map(|(token, result)| (token, result.expect("answered")))
+            .map(|(token, result)| (token, result.expect("returned")))
             .collect::<Vec<_>>(),
         [(b.token, written(2))]
     );
-    assert!(mine.returned().is_empty(), "an answer is handed back once");
+    assert!(mine.returned().is_empty(), "a result is handed back once");
 }
 
 /// A job that finishes after its run has ended returns to no one, and keeps no thread.
@@ -144,7 +144,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
 /// A pool that gives each operation a thread rejects the one past its bound; a queued one has no
 /// such bound, and serves each in its turn.
 #[test]
-fn a_queued_pool_answers_more_operations_than_a_thread_each_would_be_given() {
+fn a_queued_pool_handles_more_operations_than_a_thread_each_would_be_given() {
     let pool = Pool::queued(2);
     let asking = run();
     let asked: Vec<(i64, Pending)> = (0..4 * MAX_BLOCKING_OPERATIONS as i64)
@@ -192,7 +192,7 @@ fn a_queued_pool_runs_no_more_at_once_than_it_has_threads() {
 /// A job that panics fails its own operation, whichever pool runs it, and a queued pool's thread
 /// goes on to the next.
 #[test]
-fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
+fn a_job_that_panics_fails_its_own_operation_and_the_next_is_handled() {
     for pool in [Pool::queued(1), Pool::new()] {
         let asking = run();
         let broken = pool
@@ -201,7 +201,7 @@ fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
                 Span::DUMMY,
                 "test",
                 "a test job",
-                Box::new(|| -> JobOutput { panic!("a job's own defect") }),
+                Box::new(|| -> JobOutput { panic!("a job's own internal error") }),
             )
             .expect("the pool takes the job");
         let after = submitted(&pool, &asking, 7);
@@ -243,7 +243,7 @@ fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
 
 /// A park waits for the run's own watched result, through every ring of a bell other runs share.
 #[test]
-fn a_park_wakes_for_its_own_answer_and_not_for_anothers() {
+fn a_park_wakes_for_its_own_result_and_not_for_anothers() {
     let bell = Arc::new(Bell::default());
     let (mine, theirs) = (Run::new(Arc::clone(&bell)), Run::new(Arc::clone(&bell)));
     let pool = Pool::new();
@@ -265,7 +265,7 @@ fn a_park_wakes_for_its_own_answer_and_not_for_anothers() {
     assert!(mine.park(None, &|| false), "it watches one");
     assert!(
         mine.ready(),
-        "a park ends at the run's own answer, not at another run's ring"
+        "a park ends at the run's own result, not at another run's ring"
     );
     assert!(
         !run().park(None, &|| false),
@@ -279,7 +279,7 @@ fn secret(text: &str) -> Kept {
 
 /// What is read for a `Secret` is its run's, taken once, by that run alone.
 #[test]
-fn a_secret_is_taken_once_and_by_the_run_that_kept_it() {
+fn a_secret_is_taken_once_and_by_the_run_that_stored_it() {
     let (mine, theirs) = (run(), run());
     let kept = mine.keep_secret(secret("hunter2"));
     assert_ne!(kept, mine.keep_secret(secret("other")));

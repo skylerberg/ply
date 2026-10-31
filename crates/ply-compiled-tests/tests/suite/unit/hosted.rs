@@ -230,7 +230,7 @@ fn a_failed_job_fails_the_run_that_waits_on_it() {
 /// run is recorded as having asked the host and read nothing of it; one past its bounds is rejected
 /// before any job starts, saying which number and nothing of the password.
 #[test]
-fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_refused() {
+fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_rejected() {
     let mut ctx = context();
     let (password_at, password_len) = addr(b"");
     let secret = unsafe { rt_secret_of(&mut ctx, password_at, password_len, I64(0)) };
@@ -261,7 +261,7 @@ fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_refused(
     let other = unsafe { rt_secret_of(&mut ctx, other_at, other_len, I64(0)) };
     let rejected = unsafe { rt_kdf_bcrypt(&mut ctx, other, salt_at, salt_len, I64(31)) };
     assert_eq!(rejected.0, 0);
-    let failed = ctx.take_failure().expect("the cost was refused");
+    let failed = ctx.take_failure().expect("the cost was rejected");
     assert!(
         failed.message.contains("a cost of 31"),
         "{}",

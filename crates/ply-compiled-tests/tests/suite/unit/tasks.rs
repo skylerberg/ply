@@ -1,10 +1,10 @@
 use crate::bare::context;
 use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
-use ply_compiled::native::{Addr, Returned, I64};
+use ply_compiled::native::{Addr, I64, Returned};
 use ply_compiled::rt::{Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, rt_taken};
 use ply_compiled::tasks::{
-    self, RETURNED, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, Scheduler, Shield,
+    self, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, RETURNED, Scheduler, Shield,
     Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
     rt_tickets_park, ticket_taken,
 };
@@ -121,7 +121,10 @@ fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     assert_eq!(unsafe { (*c).failed }, 0);
     assert_eq!(ended(3), FAILED);
     assert_eq!(unsafe { (*c).failed }, 0);
-    assert!(!scheduler.restore(1, None), "an unwound task leaves nothing");
+    assert!(
+        !scheduler.restore(1, None),
+        "an unwound task leaves nothing"
+    );
     assert!(scheduler.restore(2, None));
     assert_eq!(unsafe { (*c).failed }, FAILED_TARGET);
     unsafe { (*c).failed = 0 };
@@ -137,7 +140,7 @@ unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
 }
 
 #[test]
-fn a_region_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
+fn a_scheduler_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, false);
     let r: *mut Scheduler = &mut *scheduler;
@@ -156,7 +159,7 @@ fn a_region_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
     assert_eq!(
         scheduler.stacks(),
         3,
-        "the stacks wait for the region's next tasks"
+        "the stacks wait for the scheduler's next tasks"
     );
     for id in 4..=5 {
         scheduler.start(id, body(asks_once, r));
@@ -175,7 +178,7 @@ fn a_region_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
 }
 
 #[test]
-fn a_task_the_region_never_ran_lets_go_of_its_body() {
+fn a_task_the_scheduler_never_ran_lets_go_of_its_body() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -222,7 +225,7 @@ fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
 }
 
 #[test]
-fn a_regions_failure_reads_as_the_scheduler_writes_it() {
+fn a_schedulers_failure_reads_as_the_scheduler_writes_it() {
     let ctx = context();
     // What `std.internal.schedule`'s `failure_bytes` writes, pinned there.
     let bytes = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
@@ -246,7 +249,7 @@ fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
 }
 
 #[test]
-fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
+fn a_watched_ticket_wakes_the_park_and_its_result_is_taken_in_bytes() {
     let mut ctx = context();
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
@@ -279,7 +282,7 @@ fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
     let n = ticket_taken(&mut ctx, I64(watched as i64));
     assert_eq!(taken(&mut ctx, n.0), b"watched");
     let n = unsafe { rt_tickets_answered(&mut ctx) };
-    assert_eq!(taken(&mut ctx, n.0), b"", "a ticket taken is answered once");
+    assert_eq!(taken(&mut ctx, n.0), b"", "a ticket taken is resolved once");
     assert!(ctx.take_failure().is_none());
     assert_ne!(unwatched, watched, "each job has a ticket of its own");
     let earlier = unsafe { rt_host_now(&mut ctx) }.0;
@@ -288,7 +291,7 @@ fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
 }
 
 #[test]
-fn a_ticket_another_run_handed_out_is_refused() {
+fn a_ticket_another_run_handed_out_is_rejected() {
     let mut ctx = context();
     ctx.set_host(
         Arc::new(ply_core::HostBinding::unbound()),
@@ -349,18 +352,18 @@ fn let_go(ctx: &mut Ctx, w: Word) {
 
 /// What `std.internal.trail`'s `touches_of` reads, pinned there too.
 #[test]
-fn a_steps_footprint_is_written_as_the_trail_reads_it_and_taken_once() {
+fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
     let mut ctx = context();
-    ctx.effects.push((
-        tasks::Touched::Atom {
+    ctx.accesses.push((
+        tasks::Touched::Effect {
             effect: ply_core::Symbol::new("log"),
             resource: Some(ply_core::Symbol::new("x")),
             write: true,
         },
         [3, 1, 2],
     ));
-    ctx.effects.push((
-        tasks::Touched::Hold {
+    ctx.accesses.push((
+        tasks::Touched::ScopedValue {
             id: 9,
             write: false,
         },
@@ -461,14 +464,19 @@ fn block(f: &'static Immortal) -> Block {
 }
 
 /// Stacks for a scheduler, a task handle in it, and `f` made a body of task 1 returning into it,
-/// the effects' descriptor and its words `row` and `words`.
-fn started(ctx: &mut Ctx, f: &'static Immortal, row: &[Word], words: &mut [Word]) -> (Word, Word) {
+/// the effects descriptor `descriptor` and its words `words`.
+fn started(
+    ctx: &mut Ctx,
+    f: &'static Immortal,
+    descriptor: &[Word],
+    words: &mut [Word],
+) -> (Word, Word) {
     let c: *mut Ctx = ctx;
     let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1), I64(-1), I64(0), I64(0)) });
     let scheduler = unsafe { tasks::rt_stacks_region(c, handle(s)) };
     let t = word_of(unsafe { tasks::rt_task_made(c, scheduler) });
     let b = word_of(unsafe {
-        tasks::rt_task_body(c, handle(t), block(f), row.as_ptr(), words.as_ptr())
+        tasks::rt_task_body(c, handle(t), block(f), descriptor.as_ptr(), words.as_ptr())
     });
     // The body copied the words it was handed.
     words.iter_mut().for_each(|w| *w = 0);
@@ -479,15 +487,18 @@ fn started(ctx: &mut Ctx, f: &'static Immortal, row: &[Word], words: &mut [Word]
 }
 
 #[test]
-fn a_task_runs_its_body_with_the_words_its_maker_held_and_answers_into_its_handle() {
+fn a_task_runs_its_body_with_the_words_its_maker_held_and_returns_into_its_handle() {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
-    let row = [1, 0, -1];
-    let (s, t) = started(&mut ctx, &RESULTS_FIVE, &row, &mut [77]);
+    let descriptor = [1, 0, -1];
+    let (s, t) = started(&mut ctx, &RESULTS_FIVE, &descriptor, &mut [77]);
     assert_eq!(unsafe { tasks::rt_task_said(c, handle(t), I64(1)) }.0, 1);
     let ended = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     assert_eq!(ended.0, FINISHED);
-    assert_eq!(ENTERED.with(|e| e.take()), [row.as_ptr() as Word, 77]);
+    assert_eq!(
+        ENTERED.with(|e| e.take()),
+        [descriptor.as_ptr() as Word, 77]
+    );
     assert_eq!(
         unsafe { tasks::rt_task_said(c, handle(t), I64(2)) }.0,
         RETURNED

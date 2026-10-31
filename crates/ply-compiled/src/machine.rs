@@ -186,9 +186,10 @@ pub unsafe extern "C" fn rt_refused_text(
     };
     let rejected = match r {
         Rejected::StringFind => {
-            let (Some(s), Some(needle)) =
-                (c.text(unsafe { borrowed(p, n) }), c.text(unsafe { borrowed(q, m) }))
-            else {
+            let (Some(s), Some(needle)) = (
+                c.text(unsafe { borrowed(p, n) }),
+                c.text(unsafe { borrowed(q, m) }),
+            ) else {
                 return Raises(());
             };
             not_found(site, s, needle)

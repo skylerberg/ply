@@ -180,7 +180,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
 }
 
 #[test]
-fn a_span_closed_on_another_channel_is_refused() {
+fn a_span_closed_on_another_channel_is_rejected() {
     let f = fixture();
     let id = enter(&f, "http", "request");
     let reason = f
@@ -668,7 +668,7 @@ fn fields_read_each_kind_as_the_real_handler_writes_it() {
 }
 
 #[test]
-fn fields_read_refuses_bytes_the_real_handler_never_writes() {
+fn fields_read_rejects_bytes_the_real_handler_never_writes() {
     let unpaired = parts(&[b"n"]);
     assert_eq!(fields_read(&unpaired), None, "a name with no field");
     let unknown = parts(&[b"n", b"\x09"]);

@@ -136,7 +136,7 @@ fn a_name_repeated_in_every_row_is_written_once_and_read_back_by_its_number() {
 }
 
 #[test]
-fn bytes_that_do_not_hold_what_is_read_are_refused() {
+fn bytes_that_do_not_hold_what_is_read_are_rejected() {
     assert!(Reader::new(&b""[..]).is_err());
     assert!(Reader::new(&b"PLV2"[..]).is_err());
     assert!(read(FORMAT).byte().unwrap_err().contains("ends early"));
@@ -184,7 +184,7 @@ fn bytes_that_do_not_hold_what_is_read_are_refused() {
 }
 
 #[test]
-fn a_name_read_by_a_number_it_was_not_given_is_refused() {
+fn a_name_read_by_a_number_it_was_not_given_is_rejected() {
     let bytes = written(|w| {
         w.name(b"first");
         w.varint(2);

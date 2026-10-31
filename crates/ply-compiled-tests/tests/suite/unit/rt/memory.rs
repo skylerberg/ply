@@ -90,7 +90,7 @@ fn a_block_freed_under_another_context_goes_back_to_the_heap_it_came_from() {
 
 /// A debug build knows each block's size class, which is all a free relies on.
 #[test]
-fn a_block_freed_at_another_size_than_it_was_allocated_at_is_refused() {
+fn a_block_freed_at_another_size_than_it_was_allocated_at_is_rejected() {
     if !cfg!(debug_assertions) {
         return;
     }
@@ -160,10 +160,10 @@ fn a_native_object_is_given_back_with_what_it_holds() {
     assert_eq!(ctx.heap.natives(), 0);
 }
 
-/// `drop#Hold<a>` reads what a scoped value holds at the payload word the description reports,
+/// `drop#Scoped<a>` reads what a scoped value holds at the payload word the description reports,
 /// and empties it there before the scoped value is given back.
 #[test]
-fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
+fn a_scoped_value_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     use ply_compiled::c::builtin_helper_name;
     let mut ctx = context();
     ctx.begin();

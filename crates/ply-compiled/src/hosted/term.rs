@@ -195,5 +195,5 @@ fn unset(mode: Mode, e: &std::io::Error, span: Span) -> Diagnostic {
         codes::RUNTIME_ERROR,
         format!("`term.mode` could not put the terminal in `{mode:?}`: {e}"),
     )
-    .primary(span, "the terminal refused its settings")
+    .primary(span, "the terminal rejected its settings")
 }

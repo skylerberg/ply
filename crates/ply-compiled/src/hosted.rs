@@ -236,10 +236,10 @@ fn granted<R>(
             Diagnostic::error(
                 codes::CAPABILITY_UNDECLARED,
                 format!(
-                    "the native `{native}` is the family `{family}`'s, which this run is not lent"
+                    "the native `{native}` is the family `{family}`'s, which this run is not granted"
                 ),
             )
-            .note(format!("`--allow {family}` lends it")),
+            .note(format!("`--allow {family}` grants it")),
         );
         return rejected;
     }
@@ -573,8 +573,11 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
         let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
-        let work =
-            password::Work::bcrypt(password.bytes(), unsafe { borrowed(salt_at, salt_len) }, cost.0);
+        let work = password::Work::bcrypt(
+            password.bytes(),
+            unsafe { borrowed(salt_at, salt_len) },
+            cost.0,
+        );
         c.hashed("kdf_bcrypt", "`kdf.bcrypt`", work)
     })
 }

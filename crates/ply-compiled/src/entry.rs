@@ -171,7 +171,7 @@ pub enum Ended {
     /// The unit is entered at no such root.
     NoRoot,
     /// The result holds what no run but its own can hold, and the text says why.
-    Unanswerable(&'static str),
+    NotReturnable(&'static str),
 }
 
 /// What an entry cost and reached, whatever it came to.
@@ -427,13 +427,13 @@ fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
     match crate::rt::close_entry(ctx) {
         Ok(EntryBytes::Bytes(bytes)) => Ended::Returned(bytes),
         Ok(EntryBytes::Function) => {
-            Ended::Unanswerable("its answer holds a function the program wrote")
+            Ended::NotReturnable("its result holds a function the program wrote")
         }
         Ok(EntryBytes::Escaping(escapee)) => {
             let boundary = ply_core::Boundary::EntryResult { name: root };
             Ended::Failed(ply_core::escape::rejected(&boundary, &escapee, Span::DUMMY))
         }
-        Ok(EntryBytes::Holding) => Ended::Unanswerable("its answer holds a handle of its run"),
+        Ok(EntryBytes::Holding) => Ended::NotReturnable("its result holds a handle of its run"),
         Err(reason) => Ended::Failed(crate::rt::err_marshalling(&reason)),
     }
 }
@@ -685,13 +685,13 @@ unsafe extern "C" fn rt_unit_enter(
     let root = String::from_utf8_lossy(unsafe { borrowed(root_p, root_n) }).into_owned();
     let arguments = unsafe { borrowed(arguments_p, arguments_n) }.to_vec();
     let Some(opened) = units().get(unit.0) else {
-        return TakenBytes(c.fail(err_unheld("unit", unit.0)));
+        return TakenBytes(c.fail(err_unknown_handle("unit", unit.0)));
     };
     let bound = match asked.binding {
         0 => None,
         handle => match bindings().get(handle) {
             Some(bound) => Some(bound),
-            None => return TakenBytes(c.fail(err_unheld("binding", handle))),
+            None => return TakenBytes(c.fail(err_unknown_handle("binding", handle))),
         },
     };
     let caller = ply_host::observe::of(&*c.host_runtime());
@@ -722,10 +722,10 @@ fn allowed(c: &mut Ctx, op: &str) -> bool {
         Diagnostic::error(
             codes::CAPABILITY_UNDECLARED,
             format!(
-                "`{op}` lends the host to the run it makes, and this run is not lent `machine`"
+                "`{op}` passes the host to the run it makes, and this run is not granted `machine`"
             ),
         )
-        .note("`--allow machine` lends it; `hermetic_machine` needs no grant"),
+        .note("`--allow machine` grants it; `hermetic_machine` needs no grant"),
     );
     false
 }
@@ -818,7 +818,7 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         Ended::NoRoot => {
             w.tag(3);
         }
-        Ended::Unanswerable(reason) => {
+        Ended::NotReturnable(reason) => {
             w.tag(4).str(reason);
         }
     }
@@ -891,12 +891,12 @@ fn err_unread(reason: &str) -> Diagnostic {
 }
 
 #[cold]
-fn err_unheld(what: &str, handle: i64) -> Diagnostic {
+fn err_unknown_handle(what: &str, handle: i64) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("no {what} is held as {handle}"),
     )
-    .note("a handle is one `std.machine` answered and has not let go; this is Ply's fault")
+    .note("a handle is one `std.machine` returned and has not let go; this is Ply's fault")
 }
 
 #[cold]

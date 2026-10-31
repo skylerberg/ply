@@ -292,8 +292,10 @@ fn bytes_of(span: Span, what: &str, result: JobOutput) -> Result<Vec<u8>, Diagno
 
 #[cold]
 fn failed(span: Span, what: &str, message: &str) -> Diagnostic {
-    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what} failed: {message}"))
-        .primary(span, "this operation reached the host and the host refused")
+    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what} failed: {message}")).primary(
+        span,
+        "this operation reached the host and the host rejected it",
+    )
 }
 
 struct Shared {
@@ -501,7 +503,7 @@ fn err_unowned(pending: &Pending) -> Diagnostic {
         format!("the run holds no pending token `{pending}`"),
     )
     .primary(Span::DUMMY, "this token belongs to no operation of this run")
-    .note("a token is the run's that submitted its operation, until the run takes the answer; one another run submitted, or one already answered, is none of this one's")
+    .note("a token is the run's that submitted its operation, until the run takes the result; one another run submitted, or one whose result was taken, is none of this one's")
     .note("this is Ply's fault: report it with the program that produced it")
 }
 
@@ -516,7 +518,7 @@ pub(crate) fn err_nothing_outstanding() -> Diagnostic {
         Span::DUMMY,
         "no task is enabled and no host operation is pending",
     )
-    .note("waiting here would never return, so it is refused instead")
+    .note("waiting here would never return, so it is rejected instead")
     .note("this is Ply's fault: report it with the program that produced it")
 }
 

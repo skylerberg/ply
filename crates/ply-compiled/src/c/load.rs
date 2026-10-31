@@ -82,7 +82,7 @@ unsafe impl Send for Library {}
 /// nothing there. `super::sweep` is what bounds it, once a launch, and `PLY_C_CACHE_MAX` is the
 /// bound.
 pub fn cache_dir() -> std::path::PathBuf {
-    super::kept_dir("cache", "PLY_C_CACHE")
+    super::cache_dir_for("cache", "PLY_C_CACHE")
 }
 
 impl Library {

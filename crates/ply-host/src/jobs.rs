@@ -21,7 +21,7 @@ pub enum Failure {
 }
 
 /// A job whose failure may be a rejection of its own.
-pub type Refusing = Box<dyn FnOnce() -> Result<Vec<u8>, Failure> + Send>;
+pub type FallibleJob = Box<dyn FnOnce() -> Result<Vec<u8>, Failure> + Send>;
 
 /// Which of the process's pools a job waits for a thread in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

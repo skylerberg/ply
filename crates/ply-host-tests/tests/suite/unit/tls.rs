@@ -92,7 +92,7 @@ fn a_generated_certificate_loads_and_is_reported_by_name_and_fingerprint() {
 }
 
 #[test]
-fn a_key_that_does_not_match_the_leaf_is_refused_before_anything_runs() {
+fn a_key_that_does_not_match_the_leaf_is_rejected_before_anything_runs() {
     let mine = material();
     let other = material();
     let diagnostic = one(load(CredentialSpec {
@@ -136,7 +136,7 @@ fn a_file_that_cannot_be_read_names_the_file() {
 }
 
 #[test]
-fn a_malformed_pem_a_certificate_free_file_and_a_key_free_file_are_each_refused() {
+fn a_malformed_pem_a_certificate_free_file_and_a_key_free_file_are_each_rejected() {
     let material = material();
 
     let garbage = material.write("garbage.pem", "-----BEGIN CERTIFICATE-----\nnot base64!\n");
@@ -314,7 +314,7 @@ fn passed(from: &mut rustls::Connection, to: &mut rustls::Connection) -> Result<
 }
 
 #[test]
-fn one_name_holds_several_certificates_and_a_client_is_answered_with_the_one_for_its_name() {
+fn one_name_holds_several_certificates_and_a_client_is_sent_the_one_for_its_name() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (first, a) = issued_into(dir.path(), "a", &["a.example"]);
     let (second, b) = issued_into(dir.path(), "b", &["b.example"]);
@@ -408,7 +408,7 @@ fn a_client_certificate_the_run_trusts_is_who_the_client_is_and_none_is_still_se
 }
 
 #[test]
-fn a_listener_that_requires_a_client_certificate_refuses_a_client_without_one() {
+fn a_listener_that_requires_a_client_certificate_rejects_a_client_without_one() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
     let (_, caller) = issued_into(dir.path(), "caller", &["caller.example"]);
@@ -561,7 +561,7 @@ fn the_argument_shape_is_a_usage_error_with_the_form_in_it() {
         let message = CredentialSpec::parse(bad).expect_err(bad);
         assert!(
             message.contains("--tls NAME=CERT.pem,KEY.pem"),
-            "`{bad}` was refused without the form: {message}"
+            "`{bad}` was rejected without the form: {message}"
         );
     }
 }
@@ -730,7 +730,7 @@ fn a_request_over_tls_reads_and_writes_the_same_bytes_the_plaintext_path_would()
 }
 
 #[test]
-fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
+fn a_client_offering_only_h2_is_rejected_and_one_offering_http_1_1_is_served() {
     let material = material();
     let peer = peer(&material);
     let rejected = speak(peer.port(), material.der.clone(), vec!["h2".to_string()], 0);
@@ -739,7 +739,7 @@ fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
     assert_eq!(
         session.read(4096),
         Some(Vec::new()),
-        "a refused handshake reads as end of stream"
+        "a rejected handshake reads as end of stream"
     );
     assert!(rejected.join().expect("the client finished").is_err());
 
@@ -818,7 +818,7 @@ fn a_client_that_disconnects_mid_handshake_is_counted_as_the_peer_going_away() {
 
 /// Nothing reached the program and rustls keeps its partial record, so the next read resumes.
 #[test]
-fn a_read_deadline_answers_none_and_leaves_the_session_open() {
+fn a_read_deadline_returns_none_and_leaves_the_session_open() {
     let material = material();
     let peer = peer(&material);
     let port = peer.port();

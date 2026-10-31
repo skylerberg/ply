@@ -34,9 +34,9 @@ codes! {
     /// `trace.exit` naming a span not open on the performing task's stack.
     SPAN_UNBALANCED = "E0445";
     /// A scoped value read or let go after its scope released what it held.
-    HOLD_RELEASED = "E0331";
+    SCOPED_VALUE_RELEASED = "E0331";
     /// A task, channel or continuation marshalled across a runtime boundary, unchecked by any type.
-    REGION_ESCAPE_AT_BOUNDARY = "E0449";
+    SCHEDULER_ESCAPE_AT_BOUNDARY = "E0449";
     BACKEND_UNAVAILABLE = "E0450";
     /// An `fs` operation named a resource label the run bound no root to.
     FS_ROOT_UNBOUND = "E0451";

@@ -5,7 +5,7 @@
 use ply_core::{Span, codes};
 use ply_host::jobs::Job;
 use ply_host::native::{int_of, parts_of};
-use ply_host::tcp::wire::{Endpoint, Probing, NetError, SocketOption};
+use ply_host::tcp::wire::{Endpoint, NetError, Probing, SocketOption};
 use ply_host::tcp::{TcpHost, Upgrade};
 use ply_host::{CredentialSpec, Credentials};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -30,7 +30,7 @@ fn outcome(result: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
     match result.split_first() {
         Some((1, rest)) => Ok(rest.to_vec()),
         Some((0, rest)) => Err(rest.to_vec()),
-        _ => panic!("no answer: {result:?}"),
+        _ => panic!("not a result: {result:?}"),
     }
 }
 
@@ -684,7 +684,7 @@ fn an_upgrade_agrees_on_a_protocol_both_ends_name() {
 }
 
 #[test]
-fn plaintext_ahead_of_a_handshake_is_refused_and_ends_the_connection() {
+fn plaintext_ahead_of_a_handshake_is_rejected_and_ends_the_connection() {
     let material = material();
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
@@ -747,11 +747,11 @@ fn plaintext_ahead_of_a_handshake_is_refused_and_ends_the_connection() {
         .filter(|(reason, _)| *reason == ply_host::tls::REASON_INJECTED)
         .map(|(_, n)| *n)
         .sum();
-    assert_eq!(injected, 3, "each refusal is counted under its reason");
+    assert_eq!(injected, 3, "each rejection is counted under its reason");
 }
 
 #[test]
-fn a_server_the_client_cannot_verify_as_its_name_is_refused() {
+fn a_server_the_client_cannot_verify_as_its_name_is_rejected() {
     let material = material();
     for (trusting, name) in [(false, "localhost"), (true, "mail.example")] {
         let net = material.net(trusting);
@@ -778,11 +778,11 @@ fn a_server_the_client_cannot_verify_as_its_name_is_refused() {
         )
         .expect("the upgrade is taken");
     let rejected = finished(ran(started)).expect_err("no server is verified as that");
-    assert_eq!(rejected[0], 10, "a handshake refused for its reason");
+    assert_eq!(rejected[0], 10, "a handshake rejected for its reason");
     assert_eq!(
         net.recv("conn", server, 64, LONG),
         Some(Vec::new()),
-        "the refusal ended the connection"
+        "the rejection ended the connection"
     );
     net.close("client", client);
     net.close("conn", server);
@@ -814,7 +814,7 @@ fn a_peer_that_never_handshakes_is_a_deadline_on_the_whole_handshake() {
 }
 
 #[test]
-fn an_upgrade_is_refused_under_a_read_still_waiting_and_twice() {
+fn an_upgrade_is_rejected_under_a_read_still_waiting_and_twice() {
     let material = material();
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
@@ -964,7 +964,7 @@ fn a_datagram_crosses_loopback_names_its_sender_and_says_where_it_was_cut() {
     assert_eq!(
         received(&net, "socket", server, 4, LONG),
         Ok((here.clone(), b"0123".to_vec(), true)),
-        "six bytes of it are gone, and the answer says so"
+        "six bytes of it are gone, and the result says so"
     );
     assert_eq!(
         received(&net, "socket", server, 4, LONG),
@@ -1083,7 +1083,7 @@ fn the_flat_forms_read_back_as_they_are_written() {
 #[test]
 fn localhost_resolves_to_loopback_each_address_once_and_a_name_that_cannot_exist_fails() {
     let result = ply_host::dns::lookup("localhost");
-    let (kind, rest) = result.split_first().expect("an answer");
+    let (kind, rest) = result.split_first().expect("a result");
     assert_eq!(*kind, 1, "every machine names itself");
     let found: Vec<IpAddr> = parts_of(rest)
         .expect("parts")

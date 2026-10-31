@@ -12,7 +12,7 @@ fn every_family() -> Grants {
 }
 
 #[test]
-fn every_family_lent_binds_one_handler_for_each_operation() {
+fn every_family_granted_binds_one_handler_for_each_operation() {
     for grants in [every_family(), every_family().with("spawning", &[])] {
         if let Err(rejected) = Hosts::granted(&grants) {
             let said: Vec<String> = rejected.iter().map(|d| d.message.clone()).collect();

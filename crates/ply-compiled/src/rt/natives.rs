@@ -27,37 +27,46 @@ pub unsafe extern "C" fn rt_hold_made(ctx: *mut Ctx, held: Handed) -> crate::emi
 /// type does. Fails the entry where the scoped value has let go.
 pub unsafe extern "C" fn rt_hold_read(ctx: *mut Ctx, h: crate::emitted::Handle) -> Handed {
     let c = unsafe { &mut *ctx };
-    Handed::of(held_in(c, &h, Mode::Read).map_or(0, |o| unsafe { word_at(o, SCOPED_VALUE) }))
+    Handed::of(
+        live_scoped_object(c, &h, Mode::Read).map_or(0, |o| unsafe { word_at(o, SCOPED_VALUE) }),
+    )
 }
 
 /// What the borrowed scoped value `h` holds, taken out of it, which lets it go. Fails the entry
 /// has let go already.
 pub unsafe extern "C" fn rt_hold_taken(ctx: *mut Ctx, h: crate::emitted::Handle) -> Handed {
     let c = unsafe { &mut *ctx };
-    Handed::of(held_in(c, &h, Mode::Write).map_or(0, |o| unsafe {
-        let held = word_at(o, SCOPED_VALUE);
-        set_word(o, SCOPED_VALUE, 0);
-        set_word(o, SCOPED_RELEASE, heap::imm(1));
-        held
-    }))
+    Handed::of(
+        live_scoped_object(c, &h, Mode::Write).map_or(0, |o| unsafe {
+            let held = word_at(o, SCOPED_VALUE);
+            set_word(o, SCOPED_VALUE, 0);
+            set_word(o, SCOPED_RELEASE, heap::imm(1));
+            held
+        }),
+    )
 }
 
 /// The object of scoped value `h`, a read of it (`mode`) noted for a simulation; none where it
 /// has let go, or is no scoped value, which fails the entry.
-fn held_in(c: &mut Ctx, h: &crate::emitted::Handle, mode: Mode) -> Option<*mut heap::Obj> {
+fn live_scoped_object(
+    c: &mut Ctx,
+    h: &crate::emitted::Handle,
+    mode: Mode,
+) -> Option<*mut heap::Obj> {
     let Some(o) = scoped_object(h.word()) else {
         c.fail(
-            error("a hold that is no runtime hold").note("this is Ply's fault, not the program's"),
+            error("a scoped value that is no runtime scoped value")
+                .note("this is Ply's fault, not the program's"),
         );
         return None;
     };
     if let Some(id) = scoped_id(h.word()) {
-        c.touched(crate::tasks::Touched::Hold {
+        c.touched(crate::tasks::Touched::ScopedValue {
             id,
             write: mode == Mode::Write,
         });
     }
-    if hold_let_go(o) {
+    if scoped_let_go(o) {
         let site = c.site();
         c.fail(scoped_released(
             site,
@@ -94,7 +103,7 @@ pub(crate) fn scoped_word(heap: &mut Heap, held: Option<Word>, id: u64) -> Word 
 }
 
 /// Whether the scoped value `o` has let go of what it held.
-pub(crate) fn hold_let_go(o: *mut heap::Obj) -> bool {
+pub(crate) fn scoped_let_go(o: *mut heap::Obj) -> bool {
     heap::imm_value(unsafe { word_at(o, SCOPED_RELEASE) }) != 0
 }
 
@@ -111,7 +120,10 @@ pub(crate) fn scoped_id(w: Word) -> Option<u64> {
 
 /// The entry of a scoped value, which nothing calls: a scoped value is no function.
 pub(super) unsafe extern "C" fn rt_hold_entry(ctx: *mut Ctx, _args: *const i64) -> i64 {
-    let d = Diagnostic::error(codes::INTERNAL_ERROR, "a hold was called as a function")
-        .note("this is Ply's fault, not the program's");
+    let d = Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a scoped value was called as a function",
+    )
+    .note("this is Ply's fault, not the program's");
     unsafe { &mut *ctx }.fail(d)
 }

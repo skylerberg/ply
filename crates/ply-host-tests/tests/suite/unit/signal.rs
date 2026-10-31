@@ -31,7 +31,7 @@ fn accepting(host: &TcpHost, listener: i64) -> mpsc::Receiver<i64> {
 fn accepted(host: &TcpHost, listener: i64) -> i64 {
     accepting(host, listener)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the accept answered")
+        .expect("the accept returned")
 }
 
 fn bounds(lead_ms: u64, drain_ms: u64) -> Bounds {
@@ -107,7 +107,7 @@ fn a_drain_that_runs_out_says_so() {
 
 /// A second signal means a person has decided to stop waiting.
 #[test]
-fn a_second_signal_is_refused_rather_than_started_again() {
+fn a_second_signal_is_rejected_rather_than_started_again() {
     let shutdown = Shutdown::new(bounds(0, 5_000));
     assert!(
         shutdown.request(ShutdownSignal::Terminate),
@@ -132,7 +132,7 @@ fn the_exit_codes_are_the_shell_convention() {
 }
 
 #[test]
-fn accept_answers_zero_once_the_run_has_stopped_accepting() {
+fn accept_returns_zero_once_the_run_has_stopped_accepting() {
     let host = Arc::new(TcpHost::new());
     let listener = listen(&host, 0);
     assert!(listener > 0);
@@ -145,7 +145,7 @@ fn accept_answers_zero_once_the_run_has_stopped_accepting() {
     assert_eq!(
         accepted(&host, listener),
         0,
-        "a listener the drain closed answers 0, which is what ends a sequential accept loop"
+        "a listener the drain closed returns 0, which is what ends a sequential accept loop"
     );
     // And again, because a program that loops until zero may ask twice.
     assert_eq!(accepted(&host, listener), 0);
@@ -317,7 +317,7 @@ fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
     let _ = shutdown.arrived(Asked::User2);
     assert!(
         !shutdown.arrived(Asked::User2).expect("installed"),
-        "arrivals are not counted: nothing is owed once they were answered"
+        "arrivals are not counted: nothing is owed once an ask returned them"
     );
     assert!(
         !shutdown.stopping(),

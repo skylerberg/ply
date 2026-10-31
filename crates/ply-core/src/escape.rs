@@ -28,7 +28,7 @@ impl Handle {
                  it"
             }
             Handle::Task | Handle::Channel => {
-                "a task or a channel is a key into the region that made it, which ends before the \
+                "a task or a channel is a key into the scheduler that made it, which ends before the \
                  entry does"
             }
         }
@@ -38,11 +38,11 @@ impl Handle {
     fn unseen(self) -> &'static str {
         match self {
             Handle::Continuation => {
-                "no type records that a function is a continuation, so it is refused at the \
+                "no type records that a function is a continuation, so it is rejected at the \
                  boundary instead of wherever it would be resumed"
             }
             Handle::Task | Handle::Channel => {
-                "a value may carry it out of its region, which no check stops, so it is refused \
+                "a value may carry it out of its scheduler, which no check stops, so it is rejected \
                  at the boundary instead of wherever it would be joined"
             }
         }
@@ -52,12 +52,12 @@ impl Handle {
     fn instead(self) -> &'static str {
         match self {
             Handle::Continuation => {
-                "resume the continuation before the entry answers, and answer with what it \
-                 answers"
+                "resume the continuation before the entry returns, and return what it \
+                 returns"
             }
             Handle::Task | Handle::Channel => {
-                "join the task, or drain the channel, inside the region that made it, and answer \
-                 with what that gives"
+                "join the task, or drain the channel, inside the scheduler that made it, and \
+                 return what that gives"
             }
         }
     }
@@ -88,21 +88,21 @@ impl Boundary<'_> {
     fn headline(&self, handle: Handle, reached: &str) -> String {
         let what = handle.noun();
         match self {
-            Boundary::EntryResult { name } => format!("`{name}` answered {what}{reached}"),
+            Boundary::EntryResult { name } => format!("`{name}` returned {what}{reached}"),
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
-            Boundary::EntryResult { .. } => "answered here",
+            Boundary::EntryResult { .. } => "returned here",
         }
     }
 
     fn outlives(&self) -> &'static str {
         match self {
             Boundary::EntryResult { .. } => {
-                "an entry point's answer goes to its caller, which keeps it after the entry has \
-                 ended and closed every region it opened"
+                "an entry point's result goes to its caller, which keeps it after the entry has \
+                 ended and closed every scheduler it opened"
             }
         }
     }
@@ -119,7 +119,7 @@ impl Boundary<'_> {
 #[inline(never)]
 pub fn rejected(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {
     Diagnostic::error(
-        codes::REGION_ESCAPE_AT_BOUNDARY,
+        codes::SCHEDULER_ESCAPE_AT_BOUNDARY,
         boundary.headline(escapee.handle, &escapee.reached()),
     )
     .primary(span, boundary.label())

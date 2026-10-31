@@ -20,7 +20,7 @@ fn hex(text: &str) -> Vec<u8> {
 
 /// RFC 9106 section 5: one password, salt, secret and associated data under each variant.
 #[test]
-fn argon2_answers_rfc_9106s_vectors() {
+fn argon2_returns_rfc_9106s_vectors() {
     let vectors = [
         (
             "argon2d",
@@ -37,7 +37,7 @@ fn argon2_answers_rfc_9106s_vectors() {
     ];
     for (variant, tag) in vectors {
         let made = password::argon2(variant, &[1; 32], &[2; 16], &[3; 8], &[4; 12], 32, 3, 4, 32)
-            .unwrap_or_else(|reason| panic!("{variant} was refused: {reason}"));
+            .unwrap_or_else(|reason| panic!("{variant} was rejected: {reason}"));
         assert_eq!(made, hex(tag), "{variant}");
     }
 }
@@ -45,7 +45,7 @@ fn argon2_answers_rfc_9106s_vectors() {
 /// The reference implementation's own vector, with neither a secret nor associated data: the
 /// tag of `$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc`.
 #[test]
-fn argon2id_without_a_key_is_what_the_reference_implementation_answers() {
+fn argon2id_without_a_key_is_what_the_reference_implementation_returns() {
     let made = password::argon2(
         "argon2id",
         b"password",
@@ -66,7 +66,7 @@ fn argon2id_without_a_key_is_what_the_reference_implementation_answers() {
 
 /// RFC 7914 section 12, without its last vector, which fills a gigabyte.
 #[test]
-fn scrypt_answers_rfc_7914s_vectors() {
+fn scrypt_returns_rfc_7914s_vectors() {
     let vectors: [(&str, &str, i64, i64, i64, &str); 3] = [
         (
             "",
@@ -98,7 +98,7 @@ fn scrypt_answers_rfc_7914s_vectors() {
     ];
     for (secret, salt, log_n, r, p, tag) in vectors {
         let made = password::scrypt(secret.as_bytes(), salt.as_bytes(), log_n, r, p, 64)
-            .unwrap_or_else(|reason| panic!("N = 2^{log_n} was refused: {reason}"));
+            .unwrap_or_else(|reason| panic!("N = 2^{log_n} was rejected: {reason}"));
         assert_eq!(made, hex(tag), "N = 2^{log_n}, r = {r}, p = {p}");
     }
 }
@@ -107,7 +107,7 @@ fn scrypt_answers_rfc_7914s_vectors() {
 /// `$2a$06$m0CrhHm10qJ3lXRY.5zDGO3rS2KdeeWLuGmsfGlMfOxih58VYVfxe` and
 /// `$2a$08$aTsUwsyowQuzRrDqFflhgekJ8d9/7Z3GV3UcgvzQW3J5zMyrTvlz.`.
 #[test]
-fn bcrypt_answers_jbcrypts_vectors() {
+fn bcrypt_returns_jbcrypts_vectors() {
     let vectors: [(&str, i64, &str, &str); 3] = [
         (
             "",
@@ -130,7 +130,7 @@ fn bcrypt_answers_jbcrypts_vectors() {
     ];
     for (secret, cost, salt, tag) in vectors {
         let made = password::bcrypt(secret.as_bytes(), &hex(salt), cost)
-            .unwrap_or_else(|reason| panic!("cost {cost} was refused: {reason}"));
+            .unwrap_or_else(|reason| panic!("cost {cost} was rejected: {reason}"));
         assert_eq!(made, hex(tag), "`{secret}` at cost {cost}");
     }
 }
@@ -155,7 +155,7 @@ fn bcrypt_reads_seventy_two_bytes_of_a_password() {
 
 /// RFC 6070's second vector under SHA-1 and RFC 7914 section 11's first under SHA-256.
 #[test]
-fn pbkdf2_answers_the_rfcs_vectors() {
+fn pbkdf2_returns_the_rfcs_vectors() {
     assert_eq!(
         password::pbkdf2("SHA-1", b"password", b"salt", 2, 20).expect("within the bounds"),
         hex("ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957")
@@ -174,16 +174,16 @@ const PASSWORD: &[u8] = b"correct horse battery staple";
 /// What was asked, rejected, with no `Work` made of it and so nothing computed.
 fn rejected(asked: Result<Work, String>, names: &str) {
     let reason = match asked {
-        Ok(_) => panic!("nothing refused what should say `{names}`"),
+        Ok(_) => panic!("nothing rejected what should say `{names}`"),
         Err(reason) => reason,
     };
     assert!(
         reason.contains(names),
-        "the refusal does not say `{names}`: {reason}"
+        "the rejection does not say `{names}`: {reason}"
     );
     assert!(
         !reason.contains("correct") && !reason.contains("staple"),
-        "the refusal holds the password: {reason}"
+        "the rejection holds the password: {reason}"
     );
 }
 

@@ -96,7 +96,7 @@ pub struct Slot {
 }
 
 /// The bridge: what code that holds no word for an effect performs it through: an operation is
-/// unhandled, and a raise is left unanswered.
+/// unhandled, and a raise is left pending.
 pub static BRIDGE: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
@@ -158,7 +158,7 @@ unsafe fn at_entry(
     let (effect, name) = named_op(c, described);
     let args = args_of(args.cast(), described.params_len);
     if mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()) {
-        return Handed::of(unanswered(c, &effect, &name, raised_of(args, described)));
+        return Handed::of(pending_raise(c, &effect, &name, raised_of(args, described)));
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
     if unhandled {
@@ -205,7 +205,7 @@ fn raised_of(args: &[Word], described: &PlyOp) -> Raised {
 /// A perform of `effect.op` on `resource` in `mode` noted where this entry's performs are read: in
 /// its trace, and as a scheduler's step access.
 fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>, mode: Mode) {
-    let atom = EffectAtom::operation(
+    let performed = Effect::operation(
         effect.clone(),
         resource
             .cloned()
@@ -213,12 +213,12 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
         mode,
         op.clone(),
     );
-    c.touched(crate::tasks::Touched::Atom {
+    c.touched(crate::tasks::Touched::Effect {
         effect: effect.clone(),
         resource: resource.cloned(),
         write: mode == Mode::Write,
     });
-    c.performed.push(atom);
+    c.performed.push(performed);
 }
 
 /// Notes a perform of the operation `op` describes, on the field-table entry `resource` (negative
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn rt_task_abandons(ctx: *mut Ctx, op: *const PlyOp) -> Wo
     let c = unsafe { &mut *ctx };
     let (effect, name) = named_op(c, unsafe { &*op });
     let site = c.site();
-    c.fail(err_task_abandoned(&effect, &name, site))
+    c.fail(err_task_not_resumed(&effect, &name, site))
 }
 
 /// Rejects a clause resuming off its tail that would stop a detached body another task began, the
@@ -264,14 +264,14 @@ pub unsafe extern "C" fn rt_task_raises(
     let described = unsafe { &*op };
     let (effect, name) = named_op(c, described);
     let args = args_of(args.cast(), described.params_len);
-    unanswered(c, &effect, &name, raised_of(args, described))
+    pending_raise(c, &effect, &name, raised_of(args, described))
 }
 
 /// A task's perform handled by a clause, of a `handle` around its spawn, that stopped the body
 /// rather than resume it: what it would abandon is the spawner's, not the task's.
 #[cold]
 #[inline(never)]
-fn err_task_abandoned(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
+fn err_task_not_resumed(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("`{effect}.{op}` was performed in a task, and its handler did not resume it"),
@@ -302,7 +302,7 @@ fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
 /// A raise no `handle` handles, left pending for the code around it, as [`Ctx::pend`] says, with
 /// what the entry fails with should nothing take it: `abort.raise` a panic of its message, any other
 /// raise naming the operation and what it carried. Takes the arguments.
-pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised) -> i64 {
+pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised) -> i64 {
     if c.failed != 0 {
         args.release();
         return 0;
@@ -331,9 +331,9 @@ pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised
     };
     let d = Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("`{effect}.{op}` was raised{with}, and nothing answers it"),
+        format!("`{effect}.{op}` was raised{with}, and nothing handles it"),
     )
-    .note("a `try` around the call answers it as an `Err`, and a `handle` clause as it likes")
+    .note("a `try` around the call handles it as an `Err`, and a `handle` clause as it likes")
     .showing(carried)
     .primary(c.site(), "raised here");
     c.pend_raised(d, effect.clone(), op.clone(), args)
@@ -369,7 +369,7 @@ pub unsafe extern "C" fn rt_pending_raised(
         return Handed::of(0);
     }
     let message = match c.pending.take() {
-        Some(Unanswered::Abort(message)) => message,
+        Some(Unhandled::Abort(message)) => message,
         other => {
             c.pending = other;
             return Handed::of(0);
@@ -392,7 +392,7 @@ pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I6
     }
     let named = |s: &Symbol, i: I64| c.tables.fields.get(i.0 as usize) == Some(s);
     let ours = match &c.pending {
-        Some(Unanswered::Raised {
+        Some(Unhandled::Raised {
             effect: e, op: o, ..
         }) => named(e, effect) && named(o, op),
         _ => false,
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I6
     if !ours {
         return Handed::of(0);
     }
-    let Some(Unanswered::Raised { args, .. }) = c.pending.take() else {
+    let Some(Unhandled::Raised { args, .. }) = c.pending.take() else {
         unreachable!("the pending raise was just read");
     };
     c.failed = 0;

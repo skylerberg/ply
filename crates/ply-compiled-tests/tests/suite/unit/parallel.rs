@@ -188,7 +188,7 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
 /// Each branch's closure block is taken and let go once it has run, and its result written
 /// over it, at once on threads of their own where the closures may cross.
 #[test]
-fn branches_emitted_code_made_answer_in_their_slots_and_are_let_go() {
+fn branches_emitted_code_made_return_in_their_slots_and_are_let_go() {
     let mut ctx = context();
     ctx.begin();
     let [a, b] = branches(&mut ctx, [&FIRST, &SECOND]);
@@ -203,7 +203,7 @@ fn branches_emitted_code_made_answer_in_their_slots_and_are_let_go() {
 /// A branch's closure is marked shared by its descriptor, which walks what it captures on the
 /// way: one the runtime marked first would cross with its captures counted as this thread's.
 #[test]
-fn a_branch_crossing_threads_is_marked_by_its_descriptor() {
+fn a_branch_marshalled_across_threads_is_marked_by_its_descriptor() {
     if !multicore() {
         return;
     }
@@ -238,7 +238,7 @@ fn a_failing_branch_in_turn_leaves_0_and_those_after_it_are_let_go_unrun() {
 /// At once, a branch that returned after one before it failed leaves its result in its slot
 /// for emitted code, which knows its type, to let go.
 #[test]
-fn a_branch_that_answered_past_one_that_failed_is_left_for_emitted_code() {
+fn a_branch_that_returned_past_one_that_failed_is_left_for_emitted_code() {
     if !multicore() {
         return;
     }

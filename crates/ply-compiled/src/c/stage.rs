@@ -14,5 +14,5 @@ pub fn stage_dir(identity: &str) -> PathBuf {
 /// The directory every stage is stored under, which `sweep` keeps to its budget: the one
 /// `PLY_C_STAGE` names, or the user's own.
 pub fn stage_root() -> PathBuf {
-    super::kept_dir("stage", "PLY_C_STAGE")
+    super::cache_dir_for("stage", "PLY_C_STAGE")
 }

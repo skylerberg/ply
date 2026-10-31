@@ -395,7 +395,7 @@ pub(crate) unsafe fn resume(
             let r = call_clause(ctx, closure, args);
             let c = unsafe { &mut *ctx };
             c.kept_back(here);
-            settle(c, id);
+            release_if_finished(c, id);
             drain(ctx);
             r
         }
@@ -424,7 +424,7 @@ pub(crate) unsafe fn resume(
 
 /// A finished body over an instance lets go of it once no clause of its `handle` runs, since a
 /// running clause reads its variables through it.
-fn settle(c: &mut Ctx, id: usize) {
+fn release_if_finished(c: &mut Ctx, id: usize) {
     let running = clause_running(c, id);
     let d = &mut c.detached[id];
     if d.state == State::Done
@@ -462,7 +462,7 @@ fn give_back(c: &mut Ctx, id: usize) {
     if let Some(block) = c.detached[id].forwards.take() {
         unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
     }
-    settle(c, id);
+    release_if_finished(c, id);
 }
 
 /// Records the stop the body just made, and returns its capture's index.
@@ -707,7 +707,7 @@ fn err_resumed_again() -> Diagnostic {
         codes::INTERNAL_ERROR,
         "a continuation was resumed a second time",
     )
-    .note("a continuation is a `once` function, so the check should have refused a second call")
+    .note("a continuation is a `once` function, so the check should have rejected a second call")
     .note("this is Ply's fault, not the program's")
 }
 

@@ -8,7 +8,7 @@
 //! written.
 
 use crate::heap::{self, HEADER, Heap, IMMORTAL, Obj, SHARED, Word};
-use crate::native::{Returned, Machine, Taken};
+use crate::native::{Machine, Returned, Taken};
 use crate::rt::Ctx;
 
 /// A block emitted code made, or a runtime object it held the last count of, as a native takes it.

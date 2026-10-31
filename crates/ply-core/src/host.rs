@@ -101,7 +101,7 @@ pub trait HostRuntime {
 
     /// Called with a raise no clause handles, before the entry fails with it: a host whose own
     /// the raise is may end the run its way here and never return.
-    fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+    fn unhandled(&self, effect: &Symbol, op: &Symbol) {
         let _ = (effect, op);
     }
 }
@@ -246,13 +246,13 @@ pub fn err_host_in_search(span: Span, operation: &str, path: &'static str) -> Di
 pub fn err_host_in_simulation(span: Span, operation: &str, scheduler: Span) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_IN_SIMULATION,
-        format!("`{operation}` reached the host boundary from inside a `simulate` region"),
+        format!("`{operation}` reached the host boundary from inside a `simulate` block"),
     )
     .primary(span, "performed here, against a real resource")
-    .secondary(scheduler, "this region re-runs its body once per interleaving")
-    .note("the search runs the region whole for every schedule it explores, so this operation would be performed once per interleaving")
+    .secondary(scheduler, "this simulation re-runs its body once per interleaving")
+    .note("the search runs the simulation whole for every schedule it explores, so this operation would be performed once per interleaving")
     .note("and the result would then be reported as a proof over every interleaving")
-    .note("handle the operation with a test double inside the region, or hoist it out of the region entirely")
+    .note("handle the operation with a test double inside the simulation, or hoist it out of the simulation entirely")
 }
 
 #[cold]
@@ -262,7 +262,7 @@ fn err_no_clock(what: &str) -> Diagnostic {
         codes::INTERNAL_ERROR,
         format!("this run's host runtime cannot {what}"),
     )
-    .note("`clock.now` reads the clock a run's `HostRuntime` keeps, and a production region's sleeps are deadlines on it, so a runtime that keeps none answers neither")
+    .note("`clock.now` reads the clock a run's `HostRuntime` keeps, and a production scheduler's sleeps are deadlines on it, so a runtime that keeps none handles neither")
 }
 
 /// An operation of an effect that no handler of the program, no host handler and no host family
@@ -299,6 +299,6 @@ pub fn err_withheld(
     .primary(span, "no handler here, and this run bound none")
     .note(format!("`{path}` serves this {served}"))
     .note(format!(
-        "handle `{operation}` over `{module}`'s twin, which is what makes a test that reads it `det`, cached and hermetic"
+        "handle `{operation}` over `{module}`'s fake, which is what makes a test that reads it `det`, cached and hermetic"
     ))
 }

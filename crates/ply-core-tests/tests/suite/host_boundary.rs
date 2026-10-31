@@ -8,7 +8,7 @@ use ply_core::{Span, Symbol, codes};
 /// A run that withholds an operation names the handler that serves it, where it serves it, and the
 /// fake a test handles it with.
 #[test]
-fn a_withheld_refusal_names_the_handler_and_where_it_serves() {
+fn a_withheld_rejection_names_the_handler_and_where_it_serves() {
     let d = err_withheld(
         Span::DUMMY,
         "std.process.process.out[proc]",
@@ -23,5 +23,5 @@ fn a_withheld_refusal_names_the_handler_and_where_it_serves() {
         notes.contains("`test::out` serves this under `ply run`"),
         "{notes}"
     );
-    assert!(notes.contains("`std.process`'s twin"), "{notes}");
+    assert!(notes.contains("`std.process`'s fake"), "{notes}");
 }

@@ -524,7 +524,8 @@ pub unsafe extern "C" fn rt_crypto_sealed(
     let Some(held) = held(c, &key) else {
         return TakenBytes(0);
     };
-    let (nonce, associated, plaintext) = unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(tp, tn)) };
+    let (nonce, associated, plaintext) =
+        unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(tp, tn)) };
     let cipher = unsafe { name(cp, cn) };
     let sealed = crypto::seal(cipher, &held.bytes, nonce, associated, plaintext);
     c.given(sealed.unwrap_or_default())
@@ -551,7 +552,8 @@ pub unsafe extern "C" fn rt_crypto_opened(
     let Some(held) = held(c, &key) else {
         return TakenBytes(0);
     };
-    let (nonce, associated, sealed) = unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(sp, sn)) };
+    let (nonce, associated, sealed) =
+        unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(sp, sn)) };
     let cipher = unsafe { name(cp, cn) };
     let opened = crypto::open(cipher, &held.bytes, nonce, associated, sealed);
     c.given(opened.map_or_else(|_| Vec::new(), found))
@@ -608,7 +610,8 @@ pub unsafe extern "C" fn rt_crypto_verified(
     sp: Addr,
     sn: I64,
 ) -> I64 {
-    let (public, message, signature) = unsafe { (borrowed(kp, kn), borrowed(mp, mn), borrowed(sp, sn)) };
+    let (public, message, signature) =
+        unsafe { (borrowed(kp, kn), borrowed(mp, mn), borrowed(sp, sn)) };
     match crypto::verify(unsafe { name(p, n) }, public, message, signature) {
         Ok(holds) => I64(i64::from(holds)),
         Err(_) => I64(-1),

@@ -8,7 +8,7 @@ mod children;
 pub(crate) use children::Children;
 pub use children::{Ended, Finished, Heard, Io, Output, Signal};
 
-use crate::jobs::{Failure, Job, Refusing};
+use crate::jobs::{Failure, FallibleJob, Job};
 use crate::native::found;
 use crate::stdio;
 use children::{Child, Launch, ProcessError, Unusable};
@@ -181,7 +181,7 @@ impl Executables {
             )
             .primary(span, "this file has no execute permission")
             .note(
-                "a spawn would fail at the first call; it is refused before anything runs instead",
+                "a spawn would fail at the first call; it is rejected before anything runs instead",
             ));
         }
         self.bound.insert(name.to_string(), resolved);
@@ -304,7 +304,7 @@ impl ProcessHost {
 
     /// What this host makes of a raise no clause handled: an unhandled `pipe.broken` ends the
     /// process as the closed pipe would have.
-    pub fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+    pub fn unhandled(&self, effect: &Symbol, op: &Symbol) {
         if self.owns_the_streams() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
             self.end_of_broken_pipe();
         }
@@ -437,7 +437,7 @@ impl ProcessHost {
         dir: &str,
         env: &[(String, String)],
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let program = self.program("spawn", label, span)?;
         let io = Io {
             input: false,
@@ -530,7 +530,7 @@ impl ProcessHost {
         handle: i64,
         timeout_ms: i64,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let child = self.child("wait", label, handle, span)?;
         let deadline = deadline(timeout_ms);
         Ok(Box::new(move || match child.wait(deadline) {
@@ -591,7 +591,7 @@ impl ProcessHost {
         handle: i64,
         timeout_ms: i64,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let child = self.child("output_line", label, handle, span)?;
         let deadline = deadline(timeout_ms);
         Ok(Box::new(move || match child.next_line(deadline) {
@@ -629,15 +629,21 @@ fn deadline(ms: i64) -> Option<Instant> {
     Instant::now().checked_add(Duration::from_millis(ms))
 }
 
-fn rejected(op: &'static str, handle: i64, child: &Child, rejection: ProcessError, span: Span) -> Failure {
+fn rejected(
+    op: &'static str,
+    handle: i64,
+    child: &Child,
+    rejection: ProcessError,
+    span: Span,
+) -> Failure {
     match rejection {
         ProcessError::Spent => Failure::Rejected(raced(op, handle, span)),
         ProcessError::TooMuch { out, err } => {
             Failure::Rejected(too_much(op, child.program(), out, err, span))
         }
-        ProcessError::Unreaped(reason) => {
-            Failure::Said(format!("child {handle}'s ending could not be read: {reason}"))
-        }
+        ProcessError::Unreaped(reason) => Failure::Said(format!(
+            "child {handle}'s ending could not be read: {reason}"
+        )),
     }
 }
 
@@ -704,7 +710,7 @@ fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) 
             codes::RUNTIME_ERROR,
             format!("`process.{op}` was given {handle}, and no child has that handle"),
         )
-        .primary(span, "`process.start` never answered this handle")
+        .primary(span, "`process.start` never returned this handle")
         .note("handles ascend and are never reused, so a stale one names nothing rather than whatever started next"),
         Unusable::Spent => Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -760,7 +766,7 @@ fn err_write(op: &str, e: &std::io::Error, span: Span) -> Diagnostic {
         codes::RUNTIME_ERROR,
         format!("`process.{op}` could not write: {e}"),
     )
-    .primary(span, "the stream refused what was written")
+    .primary(span, "the stream rejected what was written")
     .note("the descriptor is closed, or what it is open on took nothing")
 }
 

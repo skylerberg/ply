@@ -339,9 +339,9 @@ impl HostRuntime for Facilities {
         }
     }
 
-    fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+    fn unhandled(&self, effect: &Symbol, op: &Symbol) {
         if let Some(process) = &self.process {
-            process.unanswered(effect, op);
+            process.unhandled(effect, op);
         }
     }
 

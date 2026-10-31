@@ -415,5 +415,5 @@ pub fn rejected(what: &str, reason: &str, span: Span) -> Diagnostic {
     )
     .primary(span, "performed here")
     .note("the host bounds what one hash may cost before it starts one")
-    .note("`std.password` holds the parameters of a stored hash to the same bounds and answers a refusal, so only a perform of the operation itself reaches this")
+    .note("`std.password` holds the parameters of a stored hash to the same bounds and returns an error, so only a perform of the operation itself reaches this")
 }

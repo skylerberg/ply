@@ -82,7 +82,7 @@ fn rejected(ctx: &mut Ctx) {
 /// Through the bridge, which handles no raise, the entry fails as the runtime left it failing:
 /// `left`'s code, message and notes, not a `panic:` made of its text.
 fn raised_on_keeps(ctx: &mut Ctx) {
-    assert_eq!(ctx.failed, FAILED_PENDING, "nothing answers the refusal");
+    assert_eq!(ctx.failed, FAILED_PENDING, "nothing handles the rejection");
     let left = ctx
         .diagnostic
         .clone()
@@ -91,7 +91,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
     assert_eq!(message, 0, "nothing is handed over to the bridge");
     assert_eq!(
         ctx.failed, FAILED_PENDING,
-        "nothing answers it the second time"
+        "nothing handles it the second time"
     );
     let now = ctx.diagnostic.clone().expect("the entry fails");
     assert_eq!(
@@ -104,7 +104,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
 }
 
 #[test]
-fn a_refusal_raised_on_through_the_bridge_keeps_its_note() {
+fn a_rejection_raised_on_through_the_bridge_keeps_its_note() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     rejected(&mut ctx);

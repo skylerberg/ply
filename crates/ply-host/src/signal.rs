@@ -506,7 +506,7 @@ pub fn err_unheard(what: &str, which: Asked, e: &std::io::Error, span: Span) -> 
         format!("{what} could not listen for SIG{}: {e}", which.name()),
     )
     .primary(span, "asking about a signal installs its handler")
-    .note("without the handler the signal would do what the platform does with it, so the ask is refused rather than answered `false`")
+    .note("without the handler the signal would do what the platform does with it, so the ask fails rather than returning `false`")
 }
 
 /// The guarded state has no invariant a panicking caller can break, so recovering is correct.

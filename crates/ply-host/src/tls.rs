@@ -964,7 +964,7 @@ pub const REASON_PARAMETERS: &str =
 pub const REASON_ALPN: &str = "no application protocol in common (this listener offers http/1.1)";
 pub const REASON_ALERT: &str = "the peer sent a fatal alert and gave up";
 pub const REASON_MISBEHAVED: &str = "the peer sent a TLS message the protocol does not allow";
-pub const REASON_CERTIFICATE: &str = "the peer's certificate was refused";
+pub const REASON_CERTIFICATE: &str = "the peer's certificate was rejected";
 pub const REASON_GONE: &str = "the peer went away mid-handshake";
 pub const REASON_TRANSPORT: &str = "the connection failed mid-handshake";
 pub const REASON_SLOW: &str = "the handshake did not complete before its deadline";
@@ -1131,7 +1131,7 @@ fn err_invalid(path: &Path, reason: String) -> Diagnostic {
         format!("`{}` is not usable TLS material: {reason}", path.display()),
     )
     .note("`--tls NAME=CERT,KEY` wants a certificate chain in PEM, leaf first, and a private key in PKCS#8, PKCS#1 or SEC1")
-    .note("credentials are loaded before anything runs, so this is refused rather than discovered on the first handshake")
+    .note("credentials are loaded before anything runs, so this is rejected rather than discovered on the first handshake")
 }
 
 #[cold]
@@ -1144,7 +1144,7 @@ fn err_mismatch(spec: &CredentialSpec, error: &TlsError) -> Diagnostic {
             spec.certificate.display()
         ),
     )
-    .note(format!("rustls refused the pair: {error}"))
+    .note(format!("rustls rejected the pair: {error}"))
     .note("the private key's public half must match the public key of the first certificate in the chain")
     .note("check that the two files are from the same issuance, and that the chain is leaf first")
 }
@@ -1165,7 +1165,7 @@ fn err_untrusted(path: &Path, reason: String) -> Diagnostic {
         format!("`{}` is not a certificate to trust: {reason}", path.display()),
     )
     .note(TRUSTED)
-    .note("roots are loaded before anything runs, so this is refused rather than discovered on the first handshake")
+    .note("roots are loaded before anything runs, so this is rejected rather than discovered on the first handshake")
 }
 
 #[cold]

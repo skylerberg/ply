@@ -1,4 +1,4 @@
-use ply_compiled::c::kept_root;
+use ply_compiled::c::cache_root_for;
 use std::path::PathBuf;
 
 fn path(p: &str) -> Option<PathBuf> {
@@ -6,9 +6,9 @@ fn path(p: &str) -> Option<PathBuf> {
 }
 
 #[test]
-fn a_named_directory_is_the_one_kept_in() {
+fn a_named_directory_is_the_one_cached_in() {
     assert_eq!(
-        kept_root(
+        cache_root_for(
             "stage",
             path("/named"),
             path("/home/u"),
@@ -21,9 +21,9 @@ fn a_named_directory_is_the_one_kept_in() {
 }
 
 #[test]
-fn what_a_run_keeps_is_kept_under_the_users_caches() {
+fn what_a_run_caches_is_stored_under_the_users_caches() {
     assert_eq!(
-        kept_root(
+        cache_root_for(
             "stage",
             None,
             path("/Users/u"),
@@ -34,7 +34,7 @@ fn what_a_run_keeps_is_kept_under_the_users_caches() {
         PathBuf::from("/Users/u/Library/Caches/ply/stage")
     );
     assert_eq!(
-        kept_root(
+        cache_root_for(
             "cache",
             None,
             path("/home/u"),
@@ -45,7 +45,7 @@ fn what_a_run_keeps_is_kept_under_the_users_caches() {
         PathBuf::from("/xdg/ply/cache")
     );
     assert_eq!(
-        kept_root("cache", None, path("/home/u"), None, false, "/tmp".into()),
+        cache_root_for("cache", None, path("/home/u"), None, false, "/tmp".into()),
         PathBuf::from("/home/u/.cache/ply/cache")
     );
 }
@@ -54,7 +54,7 @@ fn what_a_run_keeps_is_kept_under_the_users_caches() {
 #[test]
 fn a_relative_cache_home_is_not_one() {
     assert_eq!(
-        kept_root(
+        cache_root_for(
             "stage",
             None,
             path("/home/u"),
@@ -67,13 +67,13 @@ fn a_relative_cache_home_is_not_one() {
 }
 
 #[test]
-fn a_user_with_no_home_keeps_it_under_the_temp_directory() {
+fn a_user_with_no_home_caches_it_under_the_temp_directory() {
     assert_eq!(
-        kept_root("stage", None, None, None, false, "/tmp".into()),
+        cache_root_for("stage", None, None, None, false, "/tmp".into()),
         PathBuf::from("/tmp/ply/stage")
     );
     assert_eq!(
-        kept_root("cache", None, path(""), None, true, "/tmp".into()),
+        cache_root_for("cache", None, path(""), None, true, "/tmp".into()),
         PathBuf::from("/tmp/ply/cache")
     );
 }

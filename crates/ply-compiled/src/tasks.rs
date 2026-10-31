@@ -11,7 +11,7 @@ use crate::flat::Reader;
 use crate::heap::{self, Native, Word, native_of};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{
-    Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, Unanswered, borrowed, no_stack_to_take,
+    Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, Unhandled, borrowed, no_stack_to_take,
     switch_keeping,
 };
 use crate::stack::{Stack, switch};
@@ -67,7 +67,7 @@ pub enum Shield {
 struct Stashed {
     failed: i64,
     diagnostic: Option<Diagnostic>,
-    pending: Option<Unanswered>,
+    pending: Option<Unhandled>,
     target: Word,
 }
 
@@ -286,7 +286,7 @@ pub unsafe fn resume(scheduler: *mut Scheduler, id: u64, result: Message) -> Mes
     let Some(slot) = r.slots.get_mut(&id) else {
         c.fail(Diagnostic::error(
             codes::INTERNAL_ERROR,
-            format!("the region was asked to run @{id}, which it does not hold"),
+            format!("the scheduler was asked to run @{id}, which it does not hold"),
         ));
         return ended(FAILED);
     };
@@ -330,7 +330,7 @@ pub unsafe fn to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
         let c = unsafe { &mut *r.ctx };
         c.fail(Diagnostic::error(
             codes::INTERNAL_ERROR,
-            "a task asked its region something while no task of it was running",
+            "a task asked its scheduler something while no task of it was running",
         ));
         return ended(FAILED);
     };
@@ -966,7 +966,8 @@ pub unsafe extern "C" fn rt_stacks_opened(
     let id = i64::from(c.entered_sims);
     c.entered_sims += 1;
     let mut scheduler = Scheduler::open(ctx, seeded.0 != 0);
-    c.schedulers.push((&mut *scheduler, [root.0, start.0, end.0]));
+    c.schedulers
+        .push((&mut *scheduler, [root.0, start.0, end.0]));
     c.rearm_recording();
     let stacks = Stacks {
         scheduler: Some(scheduler),
@@ -982,7 +983,7 @@ pub unsafe extern "C" fn rt_stacks_opened(
 /// `which`; a root of -1 where there is none.
 pub unsafe extern "C" fn rt_stacks_outer(ctx: *mut Ctx, s: Handle, which: I64) -> I64 {
     let c = unsafe { &*ctx };
-    let scheduler = object::<Stacks>(ctx, &s, "a region's stacks").map(|s| s.scheduler());
+    let scheduler = object::<Stacks>(ctx, &s, "a scheduler's stacks").map(|s| s.scheduler());
     let outer = (c.schedulers.iter())
         .take_while(|(r, _)| Some(*r) != scheduler)
         .filter(|(r, _)| unsafe { (**r).is_seeded() })
@@ -1007,7 +1008,7 @@ pub unsafe extern "C" fn rt_program_resumed(
     ctx: *mut Ctx,
     body: Handed,
     _handed: *const PlyType,
-    _answered: *const PlyType,
+    _returned: *const PlyType,
 ) -> Handed {
     unsafe { &mut *ctx }.program_entered();
     body
@@ -1061,12 +1062,12 @@ pub(crate) fn unshielded(c: &mut Ctx, entered: Option<Bracketed>) -> bool {
 /// its resource where it names one, or a scoped value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Touched {
-    Atom {
+    Effect {
         effect: ply_core::Symbol,
         resource: Option<ply_core::Symbol>,
         write: bool,
     },
-    Hold {
+    ScopedValue {
         id: u64,
         write: bool,
     },
@@ -1075,7 +1076,7 @@ pub enum Touched {
 /// The trail the entry's last seeded scheduler left, as it wrote it; none before its first.
 pub unsafe extern "C" fn rt_trail_entered(ctx: *mut Ctx) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let kept = c.trail_kept.clone().unwrap_or_default();
+    let kept = c.last_trail.clone().unwrap_or_default();
     c.given(kept)
 }
 
@@ -1105,7 +1106,7 @@ pub unsafe extern "C" fn rt_seeded_steps(ctx: *mut Ctx) -> I64 {
 /// `m` bytes at `q` hold as its outcome's, each as the scheduler wrote it, which this never reads.
 pub unsafe extern "C" fn rt_trail_left(ctx: *mut Ctx, p: Addr, n: I64, q: Addr, m: I64) {
     let c = unsafe { &mut *ctx };
-    c.trail_kept = Some(unsafe { borrowed(p, n) }.to_vec());
+    c.last_trail = Some(unsafe { borrowed(p, n) }.to_vec());
     c.interleaving = Some(unsafe { borrowed(q, m) }.to_vec());
 }
 
@@ -1133,20 +1134,20 @@ pub unsafe extern "C" fn rt_site_placed(
     c.given(bytes)
 }
 
-/// How many accesses the running seeded step touched since its effects were last taken.
+/// How many accesses the running seeded step touched since they were last taken.
 pub unsafe extern "C" fn rt_footprint_held(ctx: *mut Ctx) -> I64 {
-    I64(unsafe { &*ctx }.effects.len() as i64)
+    I64(unsafe { &*ctx }.accesses.len() as i64)
 }
 
 /// What the running seeded step touched since this was last asked, each access beside where it was
 /// made, as `std.internal.trail` reads a `List<Touch>`; what it held is let go.
 pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let touched = std::mem::take(&mut c.effects);
+    let touched = std::mem::take(&mut c.accesses);
     let mut w = crate::flat::Writer::new();
     w.list(touched.iter(), |w, (t, site)| {
         match t {
-            Touched::Atom {
+            Touched::Effect {
                 effect,
                 resource,
                 write,
@@ -1158,7 +1159,7 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
                 };
                 w.tag(u64::from(*write)).tag(0);
             }
-            Touched::Hold { id, write } => {
+            Touched::ScopedValue { id, write } => {
                 w.tag(2).count(*id).tag(u64::from(*write));
             }
         }
@@ -1170,7 +1171,7 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
 
 /// The id of the scheduler `s` holds the stacks of, among its entry's schedulers.
 pub unsafe extern "C" fn rt_stacks_region(ctx: *mut Ctx, s: Handle) -> I64 {
-    I64(object::<Stacks>(ctx, &s, "a region's stacks").map_or(-1, |s| s.id))
+    I64(object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(-1, |s| s.id))
 }
 
 /// The body `body`, to return into the handle `t`, with the descriptor of its effects and the
@@ -1248,7 +1249,7 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
     else {
         return;
     };
-    let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         started.release(ctx);
         return;
     };
@@ -1277,7 +1278,7 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
 /// `n`, and `kept` where one is given: the code of what it asked, which the `asked_*` natives read
 /// the rest of.
 fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) -> I64 {
-    let Some(stacks) = object::<Stacks>(ctx, s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
         return I64(tasks_failed(ctx, kept));
     };
     let scheduler = stacks.scheduler();
@@ -1295,7 +1296,7 @@ fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) ->
         site: [0; 3],
     };
     let asked = unsafe { resume(scheduler, task, result) };
-    let stacks = object::<Stacks>(ctx, s, "a region's stacks").expect("the stacks it resumed");
+    let stacks = object::<Stacks>(ctx, s, "a scheduler's stacks").expect("the stacks it resumed");
     let left = std::mem::replace(&mut stacks.asked, asked);
     if left.word != 0 {
         heap::release_object(ctx, left.word);
@@ -1348,7 +1349,7 @@ pub unsafe extern "C" fn rt_task_resumed_raising(
             format!("the scheduler wrote a failure the runtime does not read: {reason}"),
         )
     });
-    if let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks")
+    if let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks")
         && let Some(scheduler) = stacks.scheduler.as_mut()
     {
         scheduler.raising = Some(d);
@@ -1359,7 +1360,7 @@ pub unsafe extern "C" fn rt_task_resumed_raising(
 /// What the task the loop last resumed asked: its `i`th number.
 pub unsafe extern "C" fn rt_asked_number(ctx: *mut Ctx, s: Handle, i: I64) -> I64 {
     I64(
-        object::<Stacks>(ctx, &s, "a region's stacks").map_or(0, |s| {
+        object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| {
             usize::try_from(i.0)
                 .ok()
                 .and_then(|i| s.asked.numbers.get(i).copied())
@@ -1371,7 +1372,7 @@ pub unsafe extern "C" fn rt_asked_number(ctx: *mut Ctx, s: Handle, i: I64) -> I6
 /// Where the task the loop last resumed stood as it asked: its root, start or end by `i`.
 pub unsafe extern "C" fn rt_asked_site(ctx: *mut Ctx, s: Handle, i: I64) -> I64 {
     I64(
-        object::<Stacks>(ctx, &s, "a region's stacks").map_or(0, |s| {
+        object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| {
             usize::try_from(i.0)
                 .ok()
                 .and_then(|i| s.asked.site.get(i).copied())
@@ -1386,7 +1387,7 @@ pub unsafe extern "C" fn rt_asked_kept(ctx: *mut Ctx, s: Handle) -> Handle {
 }
 
 fn taken_word(ctx: *mut Ctx, s: &Handle, of: impl FnOnce(&mut Stacks) -> &mut Message) -> Handle {
-    let Some(stacks) = object::<Stacks>(ctx, s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
         return Handle::of(0);
     };
     let w = std::mem::take(&mut of(stacks).word);
@@ -1404,7 +1405,7 @@ fn taken_word(ctx: *mut Ctx, s: &Handle, of: impl FnOnce(&mut Stacks) -> &mut Me
 /// resumes it with, which `heard_*` read the rest of. A task resumed to unwind or to raise leaves
 /// the context failed so, its clause never running on.
 fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) -> I64 {
-    let Some(stacks) = object::<Stacks>(ctx, s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
         return I64(tasks_failed(ctx, kept));
     };
     let scheduler = stacks.scheduler();
@@ -1419,7 +1420,7 @@ fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) 
         site: [c.performed_root, c.performed_start, c.performed_end],
     };
     let heard = unsafe { to_loop(scheduler, request) };
-    let stacks = object::<Stacks>(ctx, s, "a region's stacks").expect("the stacks it ran under");
+    let stacks = object::<Stacks>(ctx, s, "a scheduler's stacks").expect("the stacks it ran under");
     let left = std::mem::replace(&mut stacks.heard, heard);
     if left.word != 0 {
         heap::release_object(ctx, left.word);
@@ -1452,7 +1453,7 @@ pub unsafe extern "C" fn rt_task_yielded_kept(
 
 /// The number the loop resumed the running task with.
 pub unsafe extern "C" fn rt_heard_number(ctx: *mut Ctx, s: Handle) -> I64 {
-    I64(object::<Stacks>(ctx, &s, "a region's stacks").map_or(0, |s| s.heard.numbers[0]))
+    I64(object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| s.heard.numbers[0]))
 }
 
 /// The value the loop resumed the running task with, taken.
@@ -1462,7 +1463,7 @@ pub unsafe extern "C" fn rt_heard_kept(ctx: *mut Ctx, s: Handle) -> Handle {
 
 /// Lets go of task `id`: its stack back to the scheduler, a body never run let go, and its handle.
 pub unsafe extern "C" fn rt_task_freed(ctx: *mut Ctx, s: Handle, id: I64) {
-    let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         return;
     };
     let Ok(n) = u64::try_from(id.0) else {
@@ -1493,7 +1494,7 @@ pub unsafe extern "C" fn rt_task_restored(
     n: I64,
 ) -> I64 {
     let note = (n.0 > 0).then(|| String::from_utf8_lossy(unsafe { borrowed(p, n) }).into_owned());
-    let restored = object::<Stacks>(ctx, &s, "a region's stacks").is_some_and(|stacks| {
+    let restored = object::<Stacks>(ctx, &s, "a scheduler's stacks").is_some_and(|stacks| {
         let Ok(task) = u64::try_from(id.0) else {
             return false;
         };
@@ -1508,12 +1509,13 @@ pub unsafe extern "C" fn rt_task_restored(
 /// The brackets task `id` stands in: how many `acquire`s, how many `release`s, and whether a
 /// cancel waits for it to leave them (1), by `which`.
 pub unsafe extern "C" fn rt_task_shields(ctx: *mut Ctx, s: Handle, id: I64, which: I64) -> I64 {
-    let shields = object::<Stacks>(ctx, &s, "a region's stacks").map_or(Shields::default(), |s| {
-        let task = u64::try_from(id.0).unwrap_or(u64::MAX);
-        s.scheduler
-            .as_ref()
-            .map_or(Shields::default(), |r| r.shields(task))
-    });
+    let shields =
+        object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(Shields::default(), |s| {
+            let task = u64::try_from(id.0).unwrap_or(u64::MAX);
+            s.scheduler
+                .as_ref()
+                .map_or(Shields::default(), |r| r.shields(task))
+        });
     I64(match which.0 {
         0 => i64::from(shields.acquiring),
         1 => i64::from(shields.releasing),
@@ -1523,7 +1525,7 @@ pub unsafe extern "C" fn rt_task_shields(ctx: *mut Ctx, s: Handle, id: I64, whic
 
 /// Whether a cancel of task `id` waits for it to leave the brackets it stands in.
 pub unsafe extern "C" fn rt_task_held_back(ctx: *mut Ctx, s: Handle, id: I64, stopping: I64) {
-    if let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks")
+    if let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks")
         && let (Ok(task), Some(r)) = (u64::try_from(id.0), &mut stacks.scheduler)
     {
         r.hold_back(task, stopping.0 != 0);
@@ -1532,7 +1534,7 @@ pub unsafe extern "C" fn rt_task_held_back(ctx: *mut Ctx, s: Handle, id: I64, st
 
 /// Records on task `id`'s handle that it ended cancelled.
 pub unsafe extern "C" fn rt_task_settled(ctx: *mut Ctx, s: Handle, id: I64) {
-    let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         return;
     };
     if let Some(t) = u64::try_from(id.0)
@@ -1573,7 +1575,7 @@ pub unsafe extern "C" fn rt_task_answer(ctx: *mut Ctx, t: Handle) -> Handle {
         None => {
             internal(
                 unsafe { &mut *ctx },
-                "a task's answer was read before it answered",
+                "a task's result was read before it returned",
             );
             Handle::of(0)
         }
@@ -1626,7 +1628,7 @@ pub fn failure_of(c: &Ctx, bytes: &[u8]) -> Result<Diagnostic, String> {
         c if c == codes::NESTED_SIMULATION => Diagnostic::error(codes::NESTED_SIMULATION, message),
         c if c == codes::RUNTIME_ERROR => Diagnostic::error(codes::RUNTIME_ERROR, message),
         c if c == codes::INTERNAL_ERROR => Diagnostic::error(codes::INTERNAL_ERROR, message),
-        other => return Err(format!("`{other}` is no code a region fails with")),
+        other => return Err(format!("`{other}` is no code a scheduler fails with")),
     };
     let labelled = labels
         .into_iter()
@@ -1712,7 +1714,7 @@ fn taken(c: &mut Ctx, run: &Run, token: I64) -> TakenBytes {
         Ok(None) => {
             c.fail(Diagnostic::error(
                 codes::INTERNAL_ERROR,
-                format!("ticket {} was taken before it was answered", token.0),
+                format!("ticket {} was taken before it was resolved", token.0),
             ));
             return TakenBytes(0);
         }
@@ -1747,7 +1749,7 @@ pub unsafe extern "C" fn rt_tickets_park(ctx: *mut Ctx, deadline: I64) -> I64 {
 /// Notes what the run held as its root's body returned, before the scheduler whose stacks `s` holds
 /// drains its other tasks: `scheduled` tasks the scheduler still holds, and the stacks it keeps.
 pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I64) {
-    let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks") else {
+    let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         return;
     };
     let task_stacks = stacks.scheduler.as_ref().map_or(0, |r| r.stacks());

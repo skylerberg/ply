@@ -128,7 +128,7 @@ pub fn records_into(runtime: &dyn HostRuntime, recorder: &Arc<Recorder>) {
 /// a data file one embeds, or of the program beside them.
 static SHIPPED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-static KEPT: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static CACHE_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 /// The directory a front end keeps its store in, beside what it loads.
 const STORE: &str = ".ply-cache";
@@ -138,15 +138,16 @@ const VCS: &str = ".git";
 
 /// Where this `ply` lays its shipped modules out as files, and the directories it caches what one
 /// run leaves for the next in.
-pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
+pub fn laid_out(shipped_dir: &Path, cache_dirs: Vec<PathBuf>) {
     let _ = SHIPPED_DIR.set(resolved(shipped_dir));
-    keeps(kept);
+    set_cache_dirs(cache_dirs);
 }
 
 /// The directories this process caches what one run leaves for the next in.
-pub fn keeps(kept: Vec<PathBuf>) {
-    let _ = KEPT.set(
-        kept.into_iter()
+pub fn set_cache_dirs(cache_dirs: Vec<PathBuf>) {
+    let _ = CACHE_DIRS.set(
+        cache_dirs
+            .into_iter()
             .flat_map(|dir| [resolved(&dir), dir])
             .collect(),
     );
@@ -178,10 +179,10 @@ pub fn at_exit(f: extern "C" fn()) {
     }
 }
 
-fn is_kept(path: &Path) -> bool {
+fn is_ignored(path: &Path) -> bool {
     path.components()
         .any(|c| c.as_os_str() == STORE || c.as_os_str() == VCS)
-        || KEPT
+        || CACHE_DIRS
             .get()
             .is_some_and(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
 }
@@ -237,7 +238,7 @@ impl Recorder {
                 _ => self.ran_program(),
             };
         }
-        if is_kept(path) {
+        if is_ignored(path) {
             return;
         }
         self.observed().reads.insert((how, path.to_path_buf()));

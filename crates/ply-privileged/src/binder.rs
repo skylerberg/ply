@@ -38,7 +38,9 @@ impl ply_compiled::entry::Binder for Binder {
     /// option(string) level`.
     fn hosting(&self, grants: &Grants, w: &mut Writer) {
         let mut rejections = Vec::new();
-        let credentials = credentials_of(grants).map_err(|d| rejections.extend(d)).ok();
+        let credentials = credentials_of(grants)
+            .map_err(|d| rejections.extend(d))
+            .ok();
         let roots = roots_of(grants).map_err(|d| rejections.push(d)).ok();
         w.list(rejections.iter(), |w, d| {
             ply_compiled::entry::write_failure(w, d, None)

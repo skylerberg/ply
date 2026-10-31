@@ -228,7 +228,7 @@ fn returned(b: Function, x: f64, y: f64) -> f64 {
 }
 
 #[test]
-fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
+fn every_float_function_returns_the_nearest_float_to_the_exact_value() {
     let functions = [
         Function::Sqrt,
         Function::Exp,
@@ -259,7 +259,7 @@ fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
             assert_eq!(
                 bits(got),
                 bits(want),
-                "`{}({x:e}, {y:e})` answered {got:e}, and the nearest Float is {want:e}",
+                "`{}({x:e}, {y:e})` returned {got:e}, and the nearest Float is {want:e}",
                 b.name()
             );
         }

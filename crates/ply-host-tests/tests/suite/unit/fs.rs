@@ -29,18 +29,18 @@ fn a_path_under_the_root_resolves() {
 }
 
 #[test]
-fn an_absolute_path_and_a_parent_component_are_refused() {
+fn an_absolute_path_and_a_parent_component_are_rejected() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     for path in ["/etc/passwd", "../secrets", "src/../../secrets"] {
-        let rejection = confine(&real, path, span()).expect_err("it should be refused");
+        let rejection = confine(&real, path, span()).expect_err("it should be rejected");
         assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT, "for `{path}`");
     }
 }
 
 /// The half a lexical check cannot do.
 #[test]
-fn a_symlink_out_of_the_root_is_refused() {
+fn a_symlink_out_of_the_root_is_rejected() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let outside = root();
@@ -48,26 +48,26 @@ fn a_symlink_out_of_the_root_is_refused() {
     std::fs::write(outside_real.join("secrets"), b"s").unwrap();
     std::os::unix::fs::symlink(&outside_real, real.join("link")).unwrap();
 
-    let rejection = confine(&real, "link/secrets", span()).expect_err("it should be refused");
+    let rejection = confine(&real, "link/secrets", span()).expect_err("it should be rejected");
     assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
 /// A not-yet-existing target still traverses its parent's link, so the nearest ancestor is checked.
 #[test]
-fn a_write_through_a_symlinked_directory_is_refused() {
+fn a_write_through_a_symlinked_directory_is_rejected() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let outside = root();
     let outside_real = outside.path().canonicalize().unwrap();
     std::os::unix::fs::symlink(&outside_real, real.join("out")).unwrap();
 
-    let rejection = confine(&real, "out/artifact.plyx", span()).expect_err("it should be refused");
+    let rejection = confine(&real, "out/artifact.plyx", span()).expect_err("it should be rejected");
     assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
 /// A link to where nothing is resolves to nothing, so it is held by where it leads.
 #[test]
-fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_refused() {
+fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_rejected() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let outside = root();
@@ -171,7 +171,7 @@ fn a_lock_older_than_the_stale_age_is_broken_and_taken() {
 }
 
 #[test]
-fn a_lock_with_no_directory_to_sit_in_is_refused_without_waiting() {
+fn a_lock_with_no_directory_to_sit_in_is_rejected_without_waiting() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let held = Mutex::new(BTreeSet::new());
@@ -192,7 +192,7 @@ fn rooted(at: &Path) -> FsHost {
 }
 
 /// What a job returned, run on this thread.
-fn ran(job: ply_host::jobs::Refusing) -> Result<Vec<u8>, Diagnostic> {
+fn ran(job: ply_host::jobs::FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
         Failure::Said(reason) => panic!("the job failed: {reason}"),
@@ -216,7 +216,7 @@ fn perform(fs: &FsHost, op: Op, path: &str, second: Second) -> Result<Vec<u8>, D
 }
 
 fn on(fs: &FsHost, op: Op, path: &str, second: Second) -> Vec<u8> {
-    perform(fs, op, path, second).unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message))
+    perform(fs, op, path, second).unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message))
 }
 
 fn body(bytes: &[u8]) -> Second {
@@ -275,7 +275,7 @@ fn read_at(fs: &FsHost, path: &str, offset: i64, len: i64) -> Option<Vec<u8>> {
 
 /// What a flush of an append-only cache does, and what its cost is: the frame, not the file.
 #[test]
-fn an_append_creates_the_log_and_answers_where_each_frame_landed() {
+fn an_append_creates_the_log_and_returns_where_each_frame_landed() {
     let dir = root();
     let fs = rooted(dir.path());
 
@@ -292,7 +292,7 @@ fn an_append_creates_the_log_and_answers_where_each_frame_landed() {
 }
 
 #[test]
-fn an_append_with_no_directory_to_hold_it_answers_none() {
+fn an_append_with_no_directory_to_hold_it_returns_none() {
     let dir = root();
     let fs = rooted(dir.path());
     assert_eq!(append(&fs, "absent/frontend.dat", b"frame"), None);
@@ -302,7 +302,7 @@ fn an_append_with_no_directory_to_hold_it_answers_none() {
 }
 
 #[test]
-fn a_ranged_read_answers_what_is_there_and_is_short_past_the_end() {
+fn a_ranged_read_returns_what_is_there_and_is_short_past_the_end() {
     let dir = root();
     let fs = rooted(dir.path());
     std::fs::write(
@@ -342,11 +342,11 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
             len: MAX_READ_BYTES as i64 + 1,
         },
     )
-    .expect_err("more than one read answers");
+    .expect_err("more than one read returns");
     assert_eq!(rejected.code, codes::FS_FILE_TOO_LARGE);
     assert!(
         rejected.notes.iter().any(|n| n.contains("fs.read_at")),
-        "the refusal should name what reads a large file: {:?}",
+        "the rejection should name what reads a large file: {:?}",
         rejected.notes
     );
     // The bound is reachable, so the largest allowed call is not itself rejected.
@@ -354,7 +354,7 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
 }
 
 #[test]
-fn a_sync_flushes_a_file_or_a_directory_and_answers_false_for_neither() {
+fn a_sync_flushes_a_file_or_a_directory_and_returns_false_for_neither() {
     let dir = root();
     let fs = rooted(dir.path());
     assert_eq!(append(&fs, "frontend.dat", b"frame"), Some(0));
@@ -368,7 +368,7 @@ fn a_sync_flushes_a_file_or_a_directory_and_answers_false_for_neither() {
 
 /// Every operation names its root by its label, and a label no root is bound to reaches no file.
 #[test]
-fn every_operation_refuses_a_label_no_root_is_bound_to() {
+fn every_operation_rejects_a_label_no_root_is_bound_to() {
     let dir = root();
     let fs = rooted(dir.path());
     for op in Op::ALL {
@@ -475,7 +475,7 @@ fn a_temporary_directory_is_new_each_time_and_named_as_the_root_names_it() {
 }
 
 #[test]
-fn canonical_answers_the_real_path_and_nothing_for_a_missing_one() {
+fn canonical_returns_the_real_path_and_nothing_for_a_missing_one() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -512,7 +512,7 @@ fn a_mode_reads_and_sets_the_nine_bits() {
 }
 
 #[test]
-fn a_link_is_made_inside_the_root_and_one_out_of_it_is_refused() {
+fn a_link_is_made_inside_the_root_and_one_out_of_it_is_rejected() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -676,19 +676,19 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
 
 fn opened(fs: &FsHost, label: &str, path: &str, how: Opening) -> Result<i64, Vec<u8>> {
     let said = asked(fs, Op::Open, label, path, Second::Opening(how))
-        .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message));
+        .unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message));
     match said.split_first() {
         Some((1, descriptor)) => Ok(int_of(descriptor).expect("eight bytes")),
         Some((0, reason)) => Err(reason.to_vec()),
-        _ => panic!("not what an open answers: {said:?}"),
+        _ => panic!("not what an open returns: {said:?}"),
     }
 }
 
 fn on_file(fs: &FsHost, label: &str, descriptor: i64, chunk: Chunk) -> Vec<u8> {
     ran(fs
         .on_file(label, descriptor, chunk, span())
-        .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message)))
-    .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message))
+        .unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message)))
+    .unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message))
 }
 
 fn chunk(fs: &FsHost, label: &str, descriptor: i64, max: u64) -> Option<Vec<u8>> {
@@ -761,7 +761,7 @@ fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
     let over = fs
         .on_file("cache", file, Chunk::Read(MAX_READ_BYTES + 1), span())
         .map(|_| ())
-        .expect_err("more than one read answers");
+        .expect_err("more than one read returns");
     assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
     // The rejection did not move the descriptor.
     assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
@@ -903,7 +903,7 @@ fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
 
 /// A secret read after its run ended is kept by no one, and returns as one not there.
 #[test]
-fn a_secret_read_for_a_run_that_has_ended_is_kept_by_no_one() {
+fn a_secret_read_for_a_run_that_has_ended_is_stored_by_no_one() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -924,7 +924,7 @@ fn a_secret_read_for_a_run_that_has_ended_is_kept_by_no_one() {
 }
 
 #[test]
-fn a_secret_write_refuses_an_unknown_encoding_and_a_path_out_of_the_root() {
+fn a_secret_write_rejects_an_unknown_encoding_and_a_path_out_of_the_root() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -967,7 +967,7 @@ fn linked(fs: &FsHost, path: &str, to: &str) -> Result<(), Vec<u8>> {
     match said.split_first() {
         Some((1, [])) => Ok(()),
         Some((0, reason)) => Err(reason.to_vec()),
-        _ => panic!("not what a link answers: {said:?}"),
+        _ => panic!("not what a link returns: {said:?}"),
     }
 }
 
@@ -1120,7 +1120,7 @@ fn a_file_takes_a_second_name_and_nothing_else_does() {
 }
 
 #[test]
-fn the_room_of_a_file_system_is_answered_for_a_path_that_names_something() {
+fn the_room_of_a_file_system_is_returned_for_a_path_that_names_something() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -1320,7 +1320,7 @@ fn no_operation_reaches_through_a_link_out_of_the_root() {
                 } else {
                     let rejected = result
                         .err()
-                        .unwrap_or_else(|| panic!("{said} was not refused"));
+                        .unwrap_or_else(|| panic!("{said} was not rejected"));
                     assert_eq!(rejected.code, codes::FS_PATH_ESCAPES_ROOT, "{said}");
                 }
                 assert_eq!(
@@ -1354,7 +1354,10 @@ fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
             Err(FileError::Exists.flat())
         );
         assert_eq!(linked(&fs, "named", name), Err(FileError::NotAFile.flat()));
-        assert_eq!(linked(&fs, name, "plain.txt"), Err(FileError::Exists.flat()));
+        assert_eq!(
+            linked(&fs, name, "plain.txt"),
+            Err(FileError::Exists.flat())
+        );
         assert!(!did(on(
             &fs,
             Op::Symlink,

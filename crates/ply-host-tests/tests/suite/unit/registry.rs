@@ -3,7 +3,7 @@ use ply_core::host::Pending;
 use ply_host::Host;
 
 #[test]
-fn a_runtime_refuses_a_token_it_did_not_mint() {
+fn a_runtime_rejects_a_token_it_did_not_mint() {
     let runtime = Host::new().runtime();
     let stray = Pending {
         token: 0,
@@ -12,7 +12,7 @@ fn a_runtime_refuses_a_token_it_did_not_mint() {
     assert_eq!(
         (ply_host::registry::run_of(&*runtime).expect("a host made the runtime"))
             .watch(&stray)
-            .expect_err("a token nothing minted is refused")
+            .expect_err("a token nothing minted is rejected")
             .code,
         codes::INTERNAL_ERROR
     );

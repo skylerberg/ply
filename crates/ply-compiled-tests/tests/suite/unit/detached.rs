@@ -8,7 +8,7 @@ use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEAD, INSTANCE_VARS};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
 use ply_compiled::frames::{PlyFrame, held_across};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
-use ply_compiled::native::{Returned, I64};
+use ply_compiled::native::{I64, Returned};
 use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_perform};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -315,7 +315,7 @@ fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
 }
 
 #[test]
-fn a_second_resumption_of_a_stop_is_refused_and_everything_comes_back_once() {
+fn a_second_resumption_of_a_stop_is_rejected_and_everything_comes_back_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {

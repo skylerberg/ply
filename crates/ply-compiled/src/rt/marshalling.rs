@@ -116,7 +116,7 @@ impl Lifting {
 pub(crate) fn err_marshalling(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a value crossing between compiled code and the runtime: {reason}"),
+        format!("a value marshalled between compiled code and the runtime: {reason}"),
     )
     .primary(Span::DUMMY, "in compiled code")
     .note("this is Ply's fault, not the program's")
@@ -129,7 +129,7 @@ impl Ctx {
         }
         match self.marshallings.last_mut() {
             Some(Marshalling::Lowering(l)) => Ok(l),
-            _ => unreachable!("the innermost crossing is a lowering"),
+            _ => unreachable!("the innermost marshalling is a lowering"),
         }
     }
 
@@ -144,7 +144,7 @@ impl Ctx {
         }
         match self.marshallings.last_mut() {
             Some(Marshalling::Lifting(l)) => Ok(l),
-            _ => unreachable!("the innermost crossing is a lifting"),
+            _ => unreachable!("the innermost marshalling is a lifting"),
         }
     }
 
@@ -195,7 +195,10 @@ pub unsafe extern "C" fn rt_out_tag(ctx: *mut Ctx, t: I64) {
     match u8::try_from(t.0) {
         Ok(t @ (tag::UNIT | tag::FALSE | tag::TRUE)) => c.write(|l| l.w.tag(t)),
         _ => {
-            c.fail(err_marshalling(&format!("tag {} is not a value alone", t.0)));
+            c.fail(err_marshalling(&format!(
+                "tag {} is not a value alone",
+                t.0
+            )));
         }
     }
 }
@@ -542,7 +545,7 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
         return I64(0);
     }
     let Some(Marshalling::Lowering(l)) = c.marshallings.pop() else {
-        unreachable!("the innermost crossing is a lowering");
+        unreachable!("the innermost marshalling is a lowering");
     };
     if l.handles > 0 {
         c.fail(err_marshalling("a value the bytes hold only a handle of"));
@@ -598,7 +601,7 @@ impl Ctx {
     /// Ends the innermost lifting; an error where bytes are left.
     fn close_lifting(&mut self) -> Result<(), String> {
         let Some(Marshalling::Lifting(l)) = self.marshallings.pop() else {
-            unreachable!("the innermost crossing is a lifting");
+            unreachable!("the innermost marshalling is a lifting");
         };
         l.r.end()
     }
@@ -626,10 +629,10 @@ fn lowering(
     let c = unsafe { &mut *ctx };
     if c.marshallings.len() != depth + 1 {
         c.marshallings.truncate(depth + 1);
-        return Err("a lowering left a crossing of its own open".into());
+        return Err("a lowering left a marshalling of its own open".into());
     }
     let Some(Marshalling::Lowering(l)) = c.marshallings.pop() else {
-        return Err("a lowering ended a crossing it did not begin".into());
+        return Err("a lowering ended a marshalling it did not begin".into());
     };
     Ok(l)
 }
@@ -651,7 +654,9 @@ fn lifted_from(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
     let c = unsafe { &mut *ctx };
     if c.marshallings.len() != depth + 1 {
         c.marshallings.truncate(depth + 1);
-        c.fail(err_marshalling("a lifting left a crossing of its own open"));
+        c.fail(err_marshalling(
+            "a lifting left a marshalling of its own open",
+        ));
     }
     if let Err(reason) = c.close_lifting() {
         c.fail(err_marshalling(&reason));
@@ -824,15 +829,15 @@ fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
     if open != 1 {
         c.marshallings.clear();
         return Err(match open {
-            0 => "the entry ended the lowering its answer was to be written into".into(),
+            0 => "the entry ended the lowering its result was to be written into".into(),
             _ => format!(
-                "the entry left {} crossings open past its answer's",
+                "the entry left {} marshallings open past its result's",
                 open - 1
             ),
         });
     }
     match c.marshallings.pop() {
         Some(Marshalling::Lowering(l)) => Ok(l),
-        _ => Err("the entry ended the lowering its answer was to be written into".into()),
+        _ => Err("the entry ended the lowering its result was to be written into".into()),
     }
 }

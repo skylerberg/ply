@@ -44,7 +44,7 @@ fn rejected_text(what: Word, p: Option<&[u8]>, q: &[u8]) -> Diagnostic {
 }
 
 #[test]
-fn a_length_refused_raises_as_the_operation_of_that_length_does() {
+fn a_length_rejected_raises_as_the_operation_of_that_length_does() {
     for (what, name, n) in [
         (0, "Array::new", -1),
         (1, "Columns::new", 1 << 27),
@@ -59,7 +59,7 @@ fn a_length_refused_raises_as_the_operation_of_that_length_does() {
 }
 
 #[test]
-fn an_index_refused_raises_as_the_operation_of_that_index_does() {
+fn an_index_rejected_raises_as_the_operation_of_that_index_does() {
     for (what, name, n) in [
         (4, "Array::get", 3),
         (5, "Array::set", -1),
@@ -124,7 +124,7 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
         let failed = (*c).failed;
         if failed == FAILED_PENDING {
             helper::<Pending>("rt_pending_raised")(c, &STRING_T, 0);
-            assert_eq!((*c).failed, 0, "the clause answered the raise");
+            assert_eq!((*c).failed, 0, "the clause handled the raise");
         }
         failed
     };
@@ -135,7 +135,7 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
 }
 
 #[test]
-fn a_refusal_is_a_raise_where_its_builtin_raises_and_fails_the_run_where_it_fails() {
+fn a_rejection_is_a_raise_where_its_builtin_raises_and_fails_the_run_where_it_fails() {
     let numbers = |what: Word, a: Word, b: Word| {
         failed_under_a_clause(|c| unsafe {
             helper::<Rejected>(&builtin_helper_name("?refused"))(c, what, a, b, 0)

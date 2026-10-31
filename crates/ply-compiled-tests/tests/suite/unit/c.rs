@@ -173,7 +173,7 @@ fn a_units_table_reads_as_a_unit_writes_it() {
 /// The last release's units list what their emitter rejected after their modules: that table reads
 /// as the same table without the list, since the release's builder runs on this runtime.
 #[test]
-fn a_table_listing_refusals_reads_as_one_without_them() {
+fn a_table_listing_rejections_reads_as_one_without_them() {
     let listed = "helpers 0\nconstants 0\nmodules 3\nrefused 1\nm.f\nwhy\nfields 1\nop\n\
                   entered m.main\n";
     let bare = "helpers 0\nconstants 0\nmodules 3\nfields 1\nop\nentered m.main\n";
@@ -184,7 +184,7 @@ fn a_table_listing_refusals_reads_as_one_without_them() {
 /// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
 /// another shape, rejects the unit by name rather than binding it to nothing.
 #[test]
-fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_name() {
+fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_rejected_by_name() {
     let mut retired = units::exports_of(&[]);
     retired.helpers.push(HelperShape {
         name: "rt_retired".to_string(),
@@ -193,7 +193,7 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_n
     });
     let rejected = retired
         .bound()
-        .expect_err("a helper the runtime lacks is refused");
+        .expect_err("a helper the runtime lacks is rejected");
     assert!(rejected.to_string().contains("`rt_retired`"), "{rejected}");
     let mut reshaped = units::exports_of(&[]);
     reshaped.helpers[0].args += 1;
@@ -221,7 +221,7 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_n
 }
 
 #[test]
-fn a_unit_compiles_loads_binds_and_answers() {
+fn a_unit_compiles_loads_binds_and_returns() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let probe = def(
         "m.probe",
@@ -234,7 +234,7 @@ fn a_unit_compiles_loads_binds_and_answers() {
     let native = loaded.expect("the unit loads");
     assert_eq!(native.names(), ["m.probe"]);
     assert_eq!(native.arity("m.probe"), Some(2));
-    let result = units::entered(&native, "m.probe", &[imm(20), imm(22)]).expect("it answers");
+    let result = units::entered(&native, "m.probe", &[imm(20), imm(22)]).expect("it returns");
     assert_eq!(imm_value(result), 42);
 }
 
@@ -316,7 +316,7 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
 /// it, so a program nests as deeply as its stack's reservation holds. An entry begun where the
 /// runtime knows no stack is given one of its own.
 #[test]
-fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_answers() {
+fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
     let Some((result, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
         return;
     };
@@ -386,7 +386,7 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
     let failed = ctx.failed;
     let said = ctx.take_failure().map(|d| d.message).unwrap_or_default();
     ctx.end();
-    assert_eq!(failed, ply_compiled::rt::FAILED_ABANDONED, "{said}");
+    assert_eq!(failed, ply_compiled::rt::FAILED_TIMED_OUT, "{said}");
     assert!(said.contains("timed out after 20 ms"), "{said}");
 }
 

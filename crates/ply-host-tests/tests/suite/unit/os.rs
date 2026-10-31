@@ -11,8 +11,8 @@ fn said(program: &str, args: &[&str]) -> String {
 
 #[cfg(unix)]
 #[test]
-fn the_process_and_the_machine_answer_as_the_systems_own_tools_do() {
-    assert_eq!(name().expect("uname answers"), said("uname", &["-sr"]));
+fn the_process_and_the_machine_return_what_the_systems_own_tools_do() {
+    assert_eq!(name().expect("uname returns"), said("uname", &["-sr"]));
     assert_eq!(
         hostname().expect("the kernel names the machine"),
         said("uname", &["-n"])

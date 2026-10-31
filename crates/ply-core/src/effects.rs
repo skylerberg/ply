@@ -61,7 +61,7 @@ pub fn label_var_name(v: u32) -> String {
 
 /// Ordering is structural so effects are canonical, which content addressing depends on.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct EffectAtom {
+pub struct Effect {
     pub effect: Symbol,
     pub resource: Resource,
     pub mode: Mode,
@@ -69,9 +69,9 @@ pub struct EffectAtom {
     pub op: Option<Symbol>,
 }
 
-impl EffectAtom {
+impl Effect {
     pub fn new(effect: impl Into<Symbol>, resource: Resource, mode: Mode) -> Self {
-        EffectAtom {
+        Effect {
             effect: effect.into(),
             resource,
             mode,
@@ -86,7 +86,7 @@ impl EffectAtom {
         mode: Mode,
         op: impl Into<Symbol>,
     ) -> Self {
-        EffectAtom {
+        Effect {
             effect: effect.into(),
             resource,
             mode,
@@ -95,7 +95,7 @@ impl EffectAtom {
     }
 }
 
-impl fmt::Display for EffectAtom {
+impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.op {
             Some(op) => write!(f, "{}.{}{}", self.effect, op, self.resource),

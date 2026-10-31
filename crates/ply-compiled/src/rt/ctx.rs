@@ -77,7 +77,7 @@ pub struct Ctx {
     pub(super) free_stacks: Vec<usize>,
     pub(crate) current: usize,
     /// Every effect a compiled `perform` performed since the entry began, for the machine's trace.
-    pub performed: Vec<EffectAtom>,
+    pub performed: Vec<Effect>,
     /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
@@ -105,15 +105,15 @@ pub struct Ctx {
     /// shields its running task in and a seeded step records what it touched for.
     pub(crate) schedulers: Vec<(*mut crate::tasks::Scheduler, [i64; 3])>,
     /// What the running seeded step touched, each beside where it was made.
-    pub effects: Vec<(crate::tasks::Touched, [i64; 3])>,
+    pub accesses: Vec<(crate::tasks::Touched, [i64; 3])>,
     /// The trail the entry's last seeded scheduler left, and its schedulers' interleaving, each as
     /// the scheduler wrote it.
-    pub(crate) trail_kept: Option<Vec<u8>>,
+    pub(crate) last_trail: Option<Vec<u8>>,
     /// What the run held as its root's body returned, where the run's scheduler noted it.
     pub(crate) held_at_root: Option<crate::entry::Held>,
     pub interleaving: Option<Vec<u8>>,
     /// The raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
-    pub(crate) pending: Option<Unanswered>,
+    pub(crate) pending: Option<Unhandled>,
     /// The words of the raise `rt_pending_raised_at` last handed compiled code, with a word to
     /// spare past them, as a perform's arguments have.
     pub(crate) pending_words: Vec<Word>,
@@ -140,13 +140,13 @@ pub struct Ctx {
 pub(crate) struct BranchFailure {
     code: i64,
     diagnostic: Option<Diagnostic>,
-    pending: Option<Unanswered>,
+    pending: Option<Unhandled>,
 }
 
 /// A raise no clause handles in place, left for the code around the failure, whose innermost
 /// `handle` handling it takes it: `abort.raise` of a message, or another raise with what it
 /// carries.
-pub(crate) enum Unanswered {
+pub(crate) enum Unhandled {
     Abort(String),
     Raised {
         effect: Symbol,
@@ -155,10 +155,10 @@ pub(crate) enum Unanswered {
     },
 }
 
-impl Unanswered {
+impl Unhandled {
     /// Lets go of what the raise carries.
     pub(crate) fn release(self) {
-        if let Unanswered::Raised { args, .. } = self {
+        if let Unhandled::Raised { args, .. } = self {
             args.release();
         }
     }
@@ -242,8 +242,8 @@ impl Ctx {
             sim_steps: ply_core::sim::DEFAULT_STEPS,
             entered_sims: 0,
             schedulers: Vec::new(),
-            effects: Vec::new(),
-            trail_kept: None,
+            accesses: Vec::new(),
+            last_trail: None,
             held_at_root: None,
             interleaving: None,
             pending: None,
@@ -367,8 +367,8 @@ impl Ctx {
         self.starting_detached = None;
         self.entered_sims = 0;
         self.schedulers.clear();
-        self.effects.clear();
-        self.trail_kept = None;
+        self.accesses.clear();
+        self.last_trail = None;
         self.held_at_root = None;
         self.interleaving = None;
         self.scoped_made = 0;
@@ -428,7 +428,7 @@ impl Ctx {
         .primary(Span::DUMMY, "still running here")
         .note("the clock says nothing about the program, so this run decided nothing")
         .note("`--timeout MS` sets the clock; 0 is no clock");
-        self.fail_with(FAILED_ABANDONED, d);
+        self.fail_with(FAILED_TIMED_OUT, d);
         true
     }
 
@@ -595,7 +595,7 @@ impl Ctx {
         if self.failed != 0 {
             return 0;
         }
-        self.pending = Some(Unanswered::Abort(message));
+        self.pending = Some(Unhandled::Abort(message));
         self.fail_with(FAILED_PENDING, d)
     }
 
@@ -612,7 +612,7 @@ impl Ctx {
             args.release();
             return 0;
         }
-        self.pending = Some(Unanswered::Raised { effect, op, args });
+        self.pending = Some(Unhandled::Raised { effect, op, args });
         self.fail_with(FAILED_PENDING, d)
     }
 
@@ -649,14 +649,15 @@ impl Ctx {
     /// of a `task` or `clock` operation.
     pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
         // The scheduler orders what its own operations touch itself.
-        if let crate::tasks::Touched::Atom { effect, .. } = &touched
+        if let crate::tasks::Touched::Effect { effect, .. } = &touched
             && matches!(effect.as_str(), "task" | "clock")
         {
             return;
         }
-        let stepping = (self.schedulers.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
+        let stepping =
+            (self.schedulers.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
         if stepping {
-            self.effects
+            self.accesses
                 .push((touched, [self.site_root, self.site_start, self.site_end]));
         }
     }
@@ -714,11 +715,11 @@ impl Ctx {
         // A raise left pending is over once its failure is taken: what it carries goes back, and
         // the host hears of one nothing handled, which may end the run its way.
         match self.pending.take() {
-            Some(Unanswered::Raised { effect, op, args }) => {
-                self.host_runtime().unanswered(&effect, &op);
+            Some(Unhandled::Raised { effect, op, args }) => {
+                self.host_runtime().unhandled(&effect, &op);
                 args.release();
             }
-            Some(Unanswered::Abort(_)) | None => {}
+            Some(Unhandled::Abort(_)) | None => {}
         }
         self.diagnostic.take()
     }

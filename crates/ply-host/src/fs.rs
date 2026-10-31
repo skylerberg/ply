@@ -4,7 +4,7 @@
 //! a kind as [`Kind::number`] numbers it, an error as [`FileError::flat`] writes it, and anything
 //! that may be absent found.
 
-use crate::jobs::{Failure, Refusing};
+use crate::jobs::{Failure, FallibleJob};
 use crate::native::{found, found_read, int, parts};
 use crate::pool::Run;
 use ply_core::crypto::Framing;
@@ -388,7 +388,7 @@ impl FsHost {
         path: String,
         second: Second,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let root = self.root(op, label, span)?;
         if let Second::Range { len, .. } = second
             && len as u64 > MAX_READ_BYTES
@@ -414,7 +414,7 @@ impl FsHost {
         descriptor: i64,
         chunk: Chunk,
         span: Span,
-    ) -> Result<Refusing, Diagnostic> {
+    ) -> Result<FallibleJob, Diagnostic> {
         let op = match chunk {
             Chunk::Read(_) => Op::ReadChunk,
             Chunk::Write(_) => Op::WriteChunk,
@@ -1390,18 +1390,18 @@ fn escapes(root: &Path, path: &str, reason: &str, span: Span) -> Diagnostic {
     )
     .primary(span, reason.to_string())
     .note(format!("the root is `{}`", root.display()))
-    .note("a resource label names a root and an operation reaches only what is under it; a path that leaves one is refused before the operation runs")
+    .note("a resource label names a root and an operation reaches only what is under it; a path that leaves one is rejected before the operation runs")
 }
 
 #[cold]
 fn too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_FILE_TOO_LARGE,
-        format!("a read of `{path}` would answer {bytes} bytes"),
+        format!("a read of `{path}` would return {bytes} bytes"),
     )
-    .primary(span, "this is more than one read answers")
+    .primary(span, "this is more than one read returns")
     .note(format!(
-        "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+        "a read returns one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("read it a range at a time with `fs.read_at(path, offset, len)`, which is also what keeps the cost of reading a large file proportional to the part that is wanted")
 }
@@ -1410,11 +1410,11 @@ fn too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
 fn walk_too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_FILE_TOO_LARGE,
-        format!("a walk of `{path}` would answer more than {bytes} bytes of paths"),
+        format!("a walk of `{path}` would return more than {bytes} bytes of paths"),
     )
-    .primary(span, "this is more than one walk answers")
+    .primary(span, "this is more than one walk returns")
     .note(format!(
-        "a walk answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+        "a walk returns one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("walk the tree a directory at a time with `fs.list_dir`")
 }
@@ -1425,9 +1425,9 @@ fn chunk_too_large(max: u64, span: Span) -> Diagnostic {
         codes::FS_FILE_TOO_LARGE,
         format!("`fs.read_chunk` was asked for {max} bytes"),
     )
-    .primary(span, "this is more than one read answers")
+    .primary(span, "this is more than one read returns")
     .note(format!(
-        "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+        "a read returns one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("ask for a smaller chunk: a read costs at most the chunk it asks for, whatever the file holds")
 }

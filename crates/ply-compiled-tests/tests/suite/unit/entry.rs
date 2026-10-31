@@ -149,16 +149,16 @@ fn returned(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Resul
         Ended::Failed(d) => Err(format!("failed: {d}")),
         Ended::Panicked(reason) => Err(format!("panicked: {reason}")),
         Ended::NoRoot => Err("no root".to_string()),
-        Ended::Unanswerable(reason) => Err(format!("unanswerable: {reason}")),
+        Ended::NotReturnable(reason) => Err(format!("not returnable: {reason}")),
     }
 }
 
 /// The `Int` the bytes of a result are.
 fn int_of(bytes: &[u8]) -> i64 {
-    let mut r = Reader::new(bytes).expect("the answer opens with the format");
+    let mut r = Reader::new(bytes).expect("the result opens with the format");
     r.expect(tag::INT).expect("an `Int`");
     let n = r.int().expect("an `Int`'s body");
-    r.end().expect("the `Int` is the whole answer");
+    r.end().expect("the `Int` is the whole result");
     n
 }
 
@@ -170,7 +170,7 @@ fn int_returned(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i6
 /// A root is entered through its `R#entered`: the arguments cross in as their list's encoding, and
 /// the result out as the bytes the entry wrote, whatever its type.
 #[test]
-fn a_root_answers_the_bytes_its_entry_wrote() {
+fn a_root_returns_the_bytes_its_entry_wrote() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
@@ -182,8 +182,8 @@ fn a_root_answers_the_bytes_its_entry_wrote() {
         arguments(1, |w| w.str("héllo".as_bytes())),
         &run(),
     )
-    .expect("`m.greet` answers");
-    let mut r = Reader::new(&greeted[..]).expect("the answer opens with the format");
+    .expect("`m.greet` returns");
+    let mut r = Reader::new(&greeted[..]).expect("the result opens with the format");
     r.expect(tag::RECORD).unwrap();
     assert_eq!(r.count().unwrap(), 2);
     assert_eq!(r.symbol().unwrap().as_str(), "length");
@@ -215,18 +215,18 @@ fn a_unit_is_entered_only_at_its_roots() {
 /// A function the program wrote, or a runtime object written as a handle, cannot leave the entry
 /// that holds it.
 #[test]
-fn an_answer_holding_a_function_or_a_handle_stays_in_its_run() {
+fn a_result_holding_a_function_or_a_handle_stays_in_its_run() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
     };
     assert_eq!(
         returned(&opened, "m.closure", ints(&[]), &run()),
-        Err("unanswerable: its answer holds a function the program wrote".to_string())
+        Err("not returnable: its result holds a function the program wrote".to_string())
     );
     assert_eq!(
         returned(&opened, "m.keep", ints(&[]), &run()),
-        Err("unanswerable: its answer holds a handle of its run".to_string())
+        Err("not returnable: its result holds a handle of its run".to_string())
     );
 }
 
@@ -311,7 +311,7 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
     let live = |root: &str, tested: bool| {
         let run = Run { tested, ..run() };
         let o = entry::enter(&opened, root, ints(&[1]), &run, None, None);
-        assert!(matches!(o.ended, Ended::Returned(_)), "`{root}` answered");
+        assert!(matches!(o.ended, Ended::Returned(_)), "`{root}` returned");
         o.usage.live
     };
     assert_eq!([live("m.kept", true), live("m.freed", true)], [1, 0]);
@@ -325,16 +325,16 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
 /// A task an entry returns is rejected at the boundary like a continuation: the scheduler it is a
 /// key into ended before the entry did.
 #[test]
-fn a_task_in_an_entrys_answer_is_refused_at_the_boundary() {
+fn a_task_in_an_entrys_result_is_rejected_at_the_boundary() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
     };
     match entry::enter(&opened, "m.spawned", ints(&[]), &run(), None, None).ended {
         Ended::Failed(d) => {
-            assert_eq!(d.code, ply_core::codes::REGION_ESCAPE_AT_BOUNDARY, "{d}");
-            assert!(d.message.contains("`m.spawned` answered a `Task`"), "{d}");
+            assert_eq!(d.code, ply_core::codes::SCHEDULER_ESCAPE_AT_BOUNDARY, "{d}");
+            assert!(d.message.contains("`m.spawned` returned a `Task`"), "{d}");
         }
-        _ => panic!("the boundary did not refuse the task"),
+        _ => panic!("the boundary did not reject the task"),
     }
 }

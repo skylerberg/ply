@@ -261,7 +261,7 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
         .expect_err("a forged span is `E0445`");
     assert_eq!(alone.code, codes::SPAN_UNBALANCED);
     assert!(
-        rendered(&alone).contains("no `trace.enter` in this entry point has answered that id"),
+        rendered(&alone).contains("no `trace.enter` in this entry point has returned that id"),
         "{}",
         rendered(&alone)
     );
@@ -488,7 +488,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     assert_eq!(
         accepted(&net, listener),
         0,
-        "a run that was already stopping when the socket table arrived answers 0, which is what \
+        "a run that was already stopping when the socket table arrived returns 0, which is what \
          ends a sequential accept loop"
     );
     assert_eq!(
@@ -531,7 +531,7 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     assert_eq!(
         accepted(&net, listener),
         0,
-        "a listener the drain closed answers 0, which is what ends a sequential accept loop"
+        "a listener the drain closed returns 0, which is what ends a sequential accept loop"
     );
 }
 

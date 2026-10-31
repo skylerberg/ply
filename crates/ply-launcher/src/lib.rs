@@ -262,7 +262,7 @@ pub fn run(
         Ok(shipped) => shipped,
         Err(rejected) => return Launched::rejected(rejected),
     };
-    ply_host::observe::laid_out(&shipped, ply_compiled::c::kept_dirs());
+    ply_host::observe::laid_out(&shipped, ply_compiled::c::cache_dirs());
     let reporting = reporting();
     ply_privileged::shipped::stamp(stamps());
     ply_privileged::shipped::entered(&program.entry, definitions);
@@ -357,8 +357,8 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
             "Error[{}]: this executable's program is entered at no `{entry}`",
             codes::INTERNAL_ERROR
         )),
-        (None, Ended::Unanswerable(reason)) => Err(format!(
-            "Error[{}]: `{entry}` answered, and {reason}",
+        (None, Ended::NotReturnable(reason)) => Err(format!(
+            "Error[{}]: `{entry}` returned, and {reason}",
             codes::INTERNAL_ERROR
         )),
     };
