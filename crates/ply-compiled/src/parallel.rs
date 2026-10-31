@@ -10,6 +10,18 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 
+/// The machine whose branch this thread runs, or 0: what a thread started to run on its behalf is to
+/// [`inherit_branch`].
+pub(crate) fn thread_branch() -> u64 {
+    BRANCH_OF.with(Cell::get)
+}
+
+/// Counts this thread as running a branch of `machine`, as the thread that started it and waits for
+/// it does: a block here must not wait for the pool thread that waits for this one.
+pub(crate) fn inherit_branch(machine: u64) {
+    BRANCH_OF.with(|of| of.set(machine));
+}
+
 /// A branch's closure called with nothing.
 fn call(ctx: *mut Ctx, f: Word) -> Word {
     unsafe { Block::of(f).call(ctx, &[]) }
