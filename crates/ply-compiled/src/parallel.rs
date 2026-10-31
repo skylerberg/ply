@@ -92,7 +92,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     let nested = PARALLEL_ENTRY_ID.with(|of| of.get() != 0 && of.get() != c.id.0);
     let at_once = !nested && allowed && shared_only(words);
     match pool() {
-        Some(pool) if n >= 2 && without_drain && share(ctx, branches) => unsafe {
+        Some(pool) if n >= 2 && at_once && share(ctx, branches) => unsafe {
             in_parallel(ctx, pool, branches, words)
         },
         _ => unsafe { in_order(ctx, branches, words) },
