@@ -156,6 +156,20 @@ impl Ctx {
         self.refusing(native, what, work, move || job().map_err(Failure::Said))
     }
 
+    /// The ticket of `job` as [`Ctx::submitted`] hands one, but always on `work`'s pool: for a job
+    /// the program goes on beside, submitting others before it waits on any.
+    fn queued(
+        &mut self,
+        native: &'static str,
+        what: &'static str,
+        work: Work,
+        job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+    ) -> I64 {
+        self.ticketed(native, what, work, false, move || {
+            job().map_err(Failure::Said)
+        })
+    }
+
     /// The ticket of `job` as [`Ctx::submitted`] hands one, where the job may fail with a
     /// diagnostic of its own.
     fn refusing(
@@ -165,8 +179,20 @@ impl Ctx {
         work: Work,
         job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
     ) -> I64 {
-        let span = self.site();
         let here = work != Work::Waiting && crate::tasks::production_task(self).is_none();
+        self.ticketed(native, what, work, here, job)
+    }
+
+    /// The ticket of `job`, run on this thread where `here` and on `work`'s pool otherwise.
+    fn ticketed(
+        &mut self,
+        native: &'static str,
+        what: &'static str,
+        work: Work,
+        here: bool,
+        job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
+    ) -> I64 {
+        let span = self.site();
         let runtime = self.host_runtime();
         let submitted = ply_host::registry::run_of(&*runtime).and_then(|run| {
             if here {
