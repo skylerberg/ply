@@ -68,7 +68,7 @@ pub type Renaming = {
   declared_records: Map<Bytes, Record>,
   modules: Map<String, ModuleMove>,
   declared: Map<DefinitionKey, String>,
-  locals: Map<String, Map<Int, Bytes>>,
+  locals: Map<Bytes, Map<Int, Bytes>>,
   parameters: Map<Bytes, Map<Bytes, Bytes>>,
   rejections: List<Failure>,
 }
@@ -85,17 +85,21 @@ pub fn local_binders(r: Read, line: LocalLine) -> List<LocalBinder> / {abort.rai
       else { all.push({ owner: e.owner, site: binders.get(k).identifier_id, first: k == 0 }) })
   })
 
+fn local_key(path: String, owner: Bytes) -> Bytes =
+  Bytes::concat_all([Bytes::of_string(path), b"\x00", owner])
+
 fn with_local_lines(rn: Renaming, r: Read) -> Renaming / {abort.raise} = {
   let path = displayed(r.file.at);
   rn.renames.locals.filter(|line: LocalLine| line.file == path).fold(
     rn,
     |named: Renaming, line: LocalLine|
       local_binders(r, line).fold(named, |done: Renaming, b: LocalBinder| {
-        let sites = done.locals.get(path).unwrap_or(Map::new());
+        let key = local_key(path, b.owner);
+        let sites = done.locals.get(key).unwrap_or(Map::new());
         let parameters = done.parameters.get(b.owner).unwrap_or(Map::new());
         {
           ..done,
-          locals: done.locals.insert(path, sites.insert(b.site, line.new)),
+          locals: done.locals.insert(key, sites.insert(b.site, line.new)),
           parameters: if b.first {
             done.parameters.insert(b.owner, parameters.insert(line.old, line.new))
           } else { done.parameters },
@@ -442,9 +446,15 @@ pub fn shared_names(rn: Renaming, loads: List<Loaded>) -> List<SharedName> / {ab
         ))
     }))
 
-fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abort.raise} =
+fn reference_new(
+  rn: Renaming,
+  l: Loaded,
+  r: Read,
+  owner: Bytes,
+  x: Reference,
+) -> Bytes / {abort.raise} =
   match x.target {
-    Local(binder) -> match rn.locals.get(displayed(r.file.at)).and_then(
+    Local(binder) -> match rn.locals.get(local_key(displayed(r.file.at), owner)).and_then(
         |sites: Map<Int, Bytes>| sites.get(binder),
       ) {
       Some(new) -> new,
@@ -585,7 +595,8 @@ pub fn uses_renamed(rn: Renaming, l: Loaded, r: Read) -> Bool / {abort.raise} =
       e.names.references.any(|x: Reference|
           match x.target {
             Local(_) -> false,
-            _ -> !is_synthetic_site(x.identifier_id) && reference_new(rn, l, r, x) != x.name,
+            _ ->
+              !is_synthetic_site(x.identifier_id) && reference_new(rn, l, r, e.owner, x) != x.name,
           })
         || e.names.members.any(|m: Member| member_new(rn, l, r, e.owner, m) != m.name))
 
@@ -614,7 +625,7 @@ pub fn edited_of(rn: Renaming, l: Loaded, r: Read) -> Edited / {abort.raise} = {
         if x.shorthand { m.insert(x.start, true) } else { m });
       let referred = e.names.references.fold(known, |done: Edited, x: Reference|
         if is_synthetic_site(x.identifier_id) { done } else {
-          let new = reference_new(rn, l, r, x);
+          let new = reference_new(rn, l, r, e.owner, x);
           let field = fields.get(x.start).unwrap_or(x.name);
           if x.shorthand && field != new {
             {
