@@ -81,7 +81,7 @@ pub fn ownership_fault(f: Fn) -> Option<Bytes> = {
     Some(v) ->
       Some(
         Bytes::concat_all([
-          b"a variable used represented otherwise than it was bound: v",
+          b"a variable is stored differently where it is used than where it is defined: v",
           ascii_of_int(v.id),
         ]),
       ),
@@ -194,12 +194,12 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
   let dead = uncounted_variables(f);
   let own = if f.members.len() == 0 {
     if !parameters_match_convention(f) {
-      Some(b"a parameter represented otherwise than its convention takes it")
+      Some(b"a parameter is passed differently than its function's calling convention requires")
     } else if unborrowed(f.params, f.convention) {
-      Some(b"a root returning borrowed of other than a counted parameter it borrows")
+      Some(b"a function returns a borrowed value without borrowing from a reference-counted parameter")
     } else { body_fault(f, top, parameter_state(f.params, f.convention, dead), f.body) }
   } else if f.members.any(|m: Member| unborrowed(m.params, m.convention)) {
-    Some(b"a root returning borrowed of other than a counted parameter it borrows")
+    Some(b"a function returns a borrowed value that does not borrow from a reference-counted parameter")
   } else {
     match f.body {
       [Case(c)] ->
@@ -209,7 +209,7 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
             match reason {
               Some(_) -> reason,
               None -> match f.members.at(a.when) {
-                None -> Some(b"an arm of no member of the group"),
+                None -> Some(b"a branch refers to a function that is not in the tail-call cycle"),
                 Some(m) ->
                   body_fault(
                     f,
@@ -225,7 +225,7 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
               },
             },
         ),
-      _ -> Some(b"a tail group whose body is no case on its member's place"),
+      _ -> Some(b"the body of a tail-call cycle is not a single match that selects which function to run"),
     }
   };
   f.lambdas.fold({ n: 0, reason: own }, |s: { n: Int, reason: Option<Bytes> }, l: Lambda|
@@ -320,7 +320,7 @@ fn pass_arguments(w: CheckState, args: List<Arg>, handed: List<ParamOwnership>) 
         match operand_var(a) {
           Some(v) -> if !is_refcounted(v.representation)
               || borrowed_from_parameters(acc.path_state, v) { read_of(acc, v) } else {
-            faulted(acc, b"a value borrowed by a body started again that does not outlast it: v", v)
+            faulted(acc, b"a borrowed value is passed to a tail call that may outlive the borrow: v", v)
           },
           None -> acc,
         }
@@ -356,18 +356,18 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
       match i {
         Let(l) -> check_let(context, acc, l.var, l.value, l.unwind),
         Do(d) -> match token_in(read_args(d.value)) {
-          Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
+          Some(t) -> faulted(acc, b"a reuse token (reserved memory) is used as a value: v", t),
           None -> if partly_taken_argument(acc.path_state, read_args(d.value)) != None {
-            { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
+            { ..acc, fault: Some(b"a block is used after one of its fields was moved out of it") }
           } else if escaping(acc.path_state, d.value) != None {
             {
               ..acc,
               fault: Some(
-                b"a closure on this frame's stack handed beyond the call that borrows it",
+                b"a closure on this frame's stack escapes the call that borrows it",
               ),
             }
           } else if results_count(d.value) {
-            { ..acc, fault: Some(b"a value whose count nothing holds") }
+            { ..acc, fault: Some(b"a value has a reference count that nothing releases") }
           } else {
             match or_else(bytes_fault(acc.path_state, None, d.value), uses_fault(None, d.value)) {
               Some(f) -> faulted(acc, f.reason, f.v),
@@ -378,7 +378,7 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
         Declaration(v) -> { ..acc, path_state: declared(acc.path_state, v.id) },
         Assign(s) -> match acc.path_state.joins.get(s.var.id) {
           Some(false) -> if !same_rep(s.arg, s.var.representation) {
-            faulted(acc, b"a join set from a value represented otherwise: v", s.var)
+            faulted(acc, b"a variable assigned in several branches receives a value with a different representation than the variable: v", s.var)
           } else {
             let set = |w: CheckState|
               {
@@ -453,11 +453,11 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           }
         },
         Case(c) -> if !names_each(c.test, c.arms.map(|a: { when: Int, body: Block }| a.when)) {
-          faulted(acc, b"a case arm for a constructor its test does not name: v", c.on)
+          faulted(acc, b"a case arm for a constructor that the case test does not name: v", c.on)
         } else if !test_fits_representation(c.test, c.on.representation) {
-          faulted(acc, b"a case testing as a number a value represented otherwise: v", c.on)
+          faulted(acc, b"a case that tests a value as a number, but the value is not stored as a number: v", c.on)
         } else if !sum_tested(c.test, c.on.representation) {
-          faulted(acc, b"a case on a sum testing other constructors than the sum's: v", c.on)
+          faulted(acc, b"a case on a sum type that tests constructors the sum type does not have: v", c.on)
         } else {
           let read = read_of(acc, c.on);
           c.arms.fold(
@@ -512,7 +512,7 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           }
         },
         Miss -> match context.arm {
-          None -> { ..acc, fault: Some(b"an arm's miss outside a match") },
+          None -> { ..acc, fault: Some(b"a failed match in an arm appears outside any match") },
           Some(entry) -> {
             let handed = {
               ..scoped(acc.path_state, entry),
@@ -532,12 +532,12 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
                   missed: Some({ ..m, taken: merge_taken(m.taken, handed.taken) }),
                   live: false,
                 }
-              } else { { ..acc, fault: Some(b"the misses of an arm own different counts") } },
+              } else { { ..acc, fault: Some(b"the arms of a match end with different reference counts") } },
             }
           },
         },
         Loop(l) -> if !l.state.all(|c: LoopVariable| same_rep(c.init, c.var.representation)) {
-          { ..acc, fault: Some(b"a loop's state set from values represented otherwise") }
+          { ..acc, fault: Some(b"a loop's state is initialized with values whose representation differs from the state's representation") }
         } else {
           let fed = carried_inits(l.state).fold(acc, pass_argument);
           let start = carried_variables(l.state).fold(fed.path_state, |h: PathState, s: Var|
@@ -578,29 +578,29 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           None -> { ..acc, fault: Some(b"a loop's next pass outside a loop") },
           Some(lp) -> if args.len() != lp.state.len()
               || !arguments_match_variables(args, lp.state) {
-            { ..acc, fault: Some(b"a loop's next pass represented otherwise than its state") }
+            { ..acc, fault: Some(b"a loop's next pass passes values stored differently from the loop's state") }
           } else {
             ended(
               args.fold(acc, pass_argument),
               lp.entry_counts,
-              b"a count represented otherwise than the loop represents it where it passes again: v",
+              b"a reference count differs between where the loop starts its next pass and where the loop expects it: v",
             )
           },
         },
         Done(a) -> match context.looped {
           None -> { ..acc, fault: Some(b"a loop's result outside a loop") },
           Some(lp) -> if !same_rep(a, lp.result.representation) {
-            { ..acc, fault: Some(b"a loop's result represented otherwise") }
+            { ..acc, fault: Some(b"a loop's result stored differently from the loop's result variable") }
           } else {
             {
-              ..ended(pass_argument(acc, a), lp.entry_counts, b"a count represented otherwise than the loop represents it where it is left: v"),
+              ..ended(pass_argument(acc, a), lp.entry_counts, b"a reference count differs between where the loop is exited and where the loop expects it: v"),
               done: true,
             }
           },
         },
         Return(a) -> if context.handled { fault_leaving_handle(acc) }
         else if !same_rep(a, context.result) {
-          { ..acc, fault: Some(b"a result represented otherwise than the root returns it") }
+          { ..acc, fault: Some(b"a result stored differently from the way the function returns it") }
         } else {
           ended(
             match context.returned {
@@ -608,27 +608,27 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
               BorrowedResult(from) -> check_borrowed_result(acc, a, from),
             },
             Map::new(),
-            b"a count still owned where the body returns: v",
+            b"a reference count not released before the body returns: v",
           )
         },
         Restart(args) -> if context.handled { fault_leaving_handle(acc) }
         else if !arguments_match_parameters(f, context.member, args) {
-          { ..acc, fault: Some(b"a restart's arguments represented otherwise than its parameters") }
+          { ..acc, fault: Some(b"a restart whose arguments are stored differently from the parameters it restarts") }
         } else {
           ended(
             pass_arguments(acc, args, parameter_ownership(f, context.member)),
             Map::new(),
-            b"a count still owned where the body restarts: v",
+            b"a reference count not released before the body restarts: v",
           )
         },
         Jump(e) -> if context.handled { fault_leaving_handle(acc) }
         else if !arguments_match_parameters(f, Some(e.member), e.args) {
-          { ..acc, fault: Some(b"a group's member entered with arguments represented otherwise") }
+          { ..acc, fault: Some(b"a call into a function of a mutually recursive group with arguments stored differently from its parameters") }
         } else {
           ended(
             pass_arguments(acc, e.args, parameter_ownership(f, Some(e.member))),
             Map::new(),
-            b"a count still owned where the body enters its group: v",
+            b"a reference count not released before the body calls into a function of its mutually recursive group: v",
           )
         },
         Fail(x) ->
@@ -639,13 +639,13 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
               consumed,
             ),
             context.failure_counts,
-            b"a count represented otherwise than the handle around represents it where the body fails: v",
+            b"a reference count differs between where the body fails and where the enclosing handle expects it: v",
           ),
         Handle(_) -> check_handle(f, context, acc, i),
         Inc(n) -> if !is_refcounted(n.var.representation)
             || acc.path_state.uncounted.contains(n.var.id) {
-          faulted(acc, b"a count taken of a value that holds none: v", n.var)
-        } else if is_token(n.var) { faulted(acc, b"a count taken of a reuse token: v", n.var) }
+          faulted(acc, b"a reference count is incremented for a value that has no reference count: v", n.var)
+        } else if is_token(n.var) { faulted(acc, b"a reference count is incremented on a reuse token, which is a block of memory set aside for reuse: v", n.var) }
         else {
           let read = read_of(acc, n.var);
           if read.fault != None { read } else {
@@ -663,11 +663,11 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           }
         },
         Dec(v) -> if !is_refcounted(v.representation) || acc.path_state.uncounted.contains(v.id) {
-          faulted(acc, b"a count let go of a value that holds none: v", v)
-        } else if is_token(v) { faulted(acc, b"a reuse token let go as a value: v", v) }
+          faulted(acc, b"a reference count is decremented for a value that has no reference count: v", v)
+        } else if is_token(v) { faulted(acc, b"a reference count is decremented on a reuse token, which is a block of memory set aside for reuse: v", v) }
         else { consumed(acc, v) },
         Reset(r) -> if !is_token(r.token) {
-          faulted(acc, b"cells kept as other than a reuse token: v", r.token)
+          faulted(acc, b"a block of memory is set aside for reuse in a variable that is not a reuse token: v", r.token)
         } else {
           let c = consumed(acc, r.of);
           {
@@ -679,12 +679,12 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           }
         },
         Free(r) -> if !is_token(r.of) {
-          faulted(acc, b"a block freed that is no reuse token: v", r.of)
+          faulted(acc, b"a block of memory is freed through a variable that is not a reuse token: v", r.of)
         } else { consumed(acc, r.of) },
         Destructure(o) -> if !is_flat(o.of.representation) {
           block_opened(context, acc, o.of, o.words)
         } else if o.words.map(|w: Var| w.representation) != parts_of(o.of.representation) {
-          faulted(acc, b"a value opened into words represented otherwise than its parts: v", o.of)
+          faulted(acc, b"a value split into fields stored differently from the fields of its type: v", o.of)
         } else {
           let c = consumed(acc, o.of);
           let read_arg = o.words.fold(c, |x: CheckState, v: Var|
@@ -741,14 +741,14 @@ fn check_bound_value(
   unwind: List<Var>,
 ) -> CheckState =
   match token_in(read_args(value)) {
-    Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
+    Some(t) -> faulted(acc, b"a reuse token, which is a block of memory set aside for reuse, is read as if it were a value: v", t),
     None -> match word_read(acc, y, value) {
       Some(w) -> w,
       None -> match escaping(acc.path_state, value) {
         Some(c) ->
           faulted(
             acc,
-            b"a closure on this frame's stack handed beyond the call that borrows it: v",
+            b"a closure stored on this function's stack is passed somewhere that can use it after the function returns: v",
             c,
           ),
         None -> match stack_captures(value) {
@@ -811,7 +811,7 @@ fn check_bound_value(
 fn check_handle(f: Fn, context: Enclosing, acc: CheckState, i: Inst) -> CheckState =
   match i {
     Handle(x) -> match token_in(x.args) {
-      Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
+      Some(t) -> faulted(acc, b"a reuse token, which is a block of memory set aside for reuse, is read as if it were a value: v", t),
       None -> if partly_taken_argument(acc.path_state, x.args) != None {
         { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
       } else if (x.site.detached != None || x.site.instance.heap != None)
@@ -823,7 +823,7 @@ fn check_handle(f: Fn, context: Enclosing, acc: CheckState, i: Inst) -> CheckSta
         {
           ..acc,
           fault: Some(
-            b"a closure on this frame's stack handed to a handle whose instance may outlive it",
+            b"a closure stored on this function's stack is passed to a handle that can run after the function returns",
           ),
         }
       } else {
@@ -843,7 +843,7 @@ fn check_handle(f: Fn, context: Enclosing, acc: CheckState, i: Inst) -> CheckSta
           {
             ..h,
             fault: Some(
-              b"a handle whose landing releases other than what it holds across its body",
+              b"a handle that, when its body fails, releases different reference counts than the handle owns while the body runs",
             ),
           }
         } else if x.site.detached != None { after } else {
@@ -874,7 +874,7 @@ fn check_handle(f: Fn, context: Enclosing, acc: CheckState, i: Inst) -> CheckSta
             {
               ..h,
               fault: Some(
-                b"a handle's body that ends holding other counts than the handle holds across it",
+                b"a handle's body that ends with different reference counts than the handle owns while the body runs",
               ),
             }
           } else { after }
@@ -892,13 +892,13 @@ fn field_fault(
 ) -> Option<{ reason: Bytes, v: Var }> =
   match value {
     Take(t) -> if !can_take(t.of.representation, t.path) {
-      Some({ reason: b"a field taken out of other than a block's word: v", v: t.of })
+      Some({ reason: b"a field taken out of a value that is not a pointer to a block: v", v: t.of })
     } else if is_inline_record(t.of, t.path, y) {
-      Some({ reason: b"a field taken that its block holds in place: v", v: y })
+      Some({ reason: b"a field taken from a record that is stored inside its block, not separately: v", v: y })
     } else if count(h, t.of) == 0 {
       Some({ reason: b"a field taken out of a block this body does not own: v", v: t.of })
     } else if across.contains(t.of.id) {
-      Some({ reason: b"a field taken out of a block a loop holds across its passes: v", v: t.of })
+      Some({ reason: b"a field taken out of a block that stays in use across the passes of a loop: v", v: t.of })
     } else if is_path_taken(h, t.of, t.path) {
       Some({ reason: b"a field taken twice out of its block: v", v: t.of })
     } else { None },
@@ -928,7 +928,7 @@ fn uses_fault(y: Option<Var>, value: Rvalue) -> Option<{ reason: Bytes, v: Var }
   let unmatched = |args: List<Arg>, uses: OperationSignature|
     if uses.takes.len() == args.len() { None } else {
       Some({
-        reason: b"an operation whose uses name other than its operands: v",
+        reason: b"an operation whose signature takes a different number of arguments than the operation is given: v",
         v: match y { Some(a) -> a, None -> first_var(args, unknown_var()) },
       })
     };
@@ -943,7 +943,7 @@ fn bytes_fault(h: PathState, y: Option<Var>, value: Rvalue) -> Option<{ reason: 
   match value {
     Get(g) -> match g.path {
       PayloadPath -> if g.of.representation != AsWord {
-        Some({ reason: b"a block's bytes read out of other than a block's word: v", v: g.of })
+        Some({ reason: b"a block's bytes read from a value that is not a pointer to a block: v", v: g.of })
       } else {
         match y {
           Some(a) -> if a.representation != AsAddress {
@@ -967,7 +967,7 @@ fn bytes_fault(h: PathState, y: Option<Var>, value: Rvalue) -> Option<{ reason: 
             && !o.uses.takes.any(|t: Bool| t)
             && (match y { Some(a) -> a.representation == AsWord, None -> false }) { None } else {
           Some({
-            reason: b"the bytes a marshalling returned taken other than as a block of their own: v",
+            reason: b"the bytes returned by a foreign call used as something other than a separate block: v",
             v: named,
           })
         },
@@ -987,10 +987,10 @@ fn string_fault(
 ) -> Option<{ reason: Bytes, v: Var }> = {
   let kinds = string_operands(op);
   if kinds.len() != args.len() {
-    Some({ reason: b"an operation over bytes handed other than its operands: v", v: named })
+    Some({ reason: b"an operation over bytes is given a different number of arguments than the operation requires: v", v: named })
   } else if uses != string_signature(op) {
     Some({
-      reason: b"an operation over bytes taking or returning otherwise than its rule: v",
+      reason: b"an operation over bytes that takes or returns a type other than the one its signature requires: v",
       v: named,
     })
   } else {
@@ -1015,7 +1015,7 @@ fn string_fault(
         };
         if read_arg { None } else {
           Some({
-            reason: b"an operation over bytes returning otherwise than its rule: v",
+            reason: b"an operation over bytes that returns a type other than the one its signature requires: v",
             v: named,
           })
         }
@@ -1033,28 +1033,28 @@ fn operand_fault(
   match kind {
     ReadsAddress -> match a {
       VarOperand(v) -> if points_into(v.representation) { None } else {
-        Some({ reason: b"an operation over bytes reading through other than an address: v", v: v })
+        Some({ reason: b"an operation over bytes that reads memory through a value that is not an address: v", v: v })
       },
       _ ->
         Some({
-          reason: b"an operation over bytes reading through other than an address: v",
+          reason: b"an operation over bytes that reads memory through a value that is not an address: v",
           v: named,
         }),
     },
     Number -> if is_refcounted(operand_representation(a)) {
-      Some({ reason: b"an operation over bytes handed a counted value as a number: v", v: named })
+      Some({ reason: b"an operation over bytes given a reference-counted value where it needs a number: v", v: named })
     } else { None },
     _ -> match a {
       VarOperand(v) -> if v.representation != AsWord {
         Some({
-          reason: b"an operation over bytes handed a block represented otherwise than as its word: v",
+          reason: b"an operation over bytes given a block that is not stored as a plain pointer: v",
           v: v,
         })
       } else if kind == WritesBlock && count(h, v) == 0 {
-        Some({ reason: b"a block written into that this body holds no count of: v", v: v })
+        Some({ reason: b"bytes written into a block that this body has no reference count for: v", v: v })
       } else { None },
       _ ->
-        Some({ reason: b"an operation over bytes handed a block no variable holds: v", v: named }),
+        Some({ reason: b"an operation over bytes given a block that no variable refers to: v", v: named }),
     },
   }
 
@@ -1171,7 +1171,7 @@ fn case_position_exists(of: Var, p: { case: Int, at: Int }) -> Bool =
 
 fn block_opened(context: Enclosing, acc: CheckState, of: Var, parts: List<Var>) -> CheckState =
   if !opens_as(context, of, parts) {
-    faulted(acc, b"a value opened that is not owned only here: v", of)
+    faulted(acc, b"a value split into fields that other code may still use: v", of)
   } else {
     parts.fold(consumed(acc, of), |x: CheckState, v: Var|
       if is_refcounted(v.representation) {
@@ -1273,15 +1273,15 @@ fn joined(before: CheckState, a: CheckState, b: CheckState) -> CheckState =
           None -> false,
         };
         let done = a.done || b.done;
-        if both { { ..a, fault: Some(b"the misses of an arm own different counts") } }
+        if both { { ..a, fault: Some(b"two branches of the same expression finish with different owned values or different unassigned variables") } }
         else if a.live && b.live {
           let ah = joined_paths(before.path_state, a.path_state, b.path_state);
           let bh = joined_paths(before.path_state, b.path_state, a.path_state);
           let ours = scoped(ah, before.path_state);
           if ah.owned_counts != bh.owned_counts {
-            { ..a, fault: Some(b"the paths out of a branch own different counts") }
+            { ..a, fault: Some(b"the branches of an expression finish with different owned values") }
           } else if ours.unset != scoped(bh, before.path_state).unset {
-            { ..a, fault: Some(b"the paths out of a branch set different joins") }
+            { ..a, fault: Some(b"the branches of an expression assign different variables") }
           } else {
             {
               ..a,
@@ -1339,11 +1339,11 @@ fn consume_arg(w: CheckState, a: Arg) -> CheckState =
 
 fn pass_argument(w: CheckState, a: Arg) -> CheckState =
   match a {
-    VarOperand(v) -> if is_token(v) { faulted(w, b"a reuse token read as a value: v", v) }
+    VarOperand(v) -> if is_token(v) { faulted(w, b"a reusable memory slot used as an ordinary value: v", v) }
     else if partly_taken_argument(w.path_state, [a]) != None {
-      faulted(w, b"a block used whole after a field was taken out of it: v", v)
+      faulted(w, b"a value used as a whole after one of its fields was moved out: v", v)
     } else if w.path_state.stacks.contains(v.id) {
-      faulted(w, b"a closure on this frame's stack handed beyond the call that borrows it: v", v)
+      faulted(w, b"a closure stored on this function's stack passed to a call that takes ownership of it: v", v)
     } else { consumed(w, v) },
     _ -> w,
   }
@@ -1385,9 +1385,9 @@ fn word_read(w: CheckState, y: Var, value: Rvalue) -> Option<CheckState> =
       Some(ws) ->
         Some(match g.path {
           LeafPath(k) -> match ws.at(k) {
-            None -> faulted(w, b"a read past the words of an opened value: v", y),
+            None -> faulted(w, b"a field read beyond the fields of a destructured value: v", y),
             Some(word) -> if word.representation != y.representation {
-              faulted(w, b"a word of an opened value read as other than it is represented: v", y)
+              faulted(w, b"a field of a destructured value read with a different layout than it is stored with: v", y)
             } else if !is_refcounted(word.representation) { w } else {
               let r = read_of(w, word);
               if r.fault != None { r } else {
@@ -1398,7 +1398,7 @@ fn word_read(w: CheckState, y: Var, value: Rvalue) -> Option<CheckState> =
               }
             },
           },
-          _ -> faulted(w, b"an opened value read other than by its words: v", y),
+          _ -> faulted(w, b"a destructured value read other than by field: v", y),
         }),
     },
     _ -> None,
@@ -1616,7 +1616,7 @@ fn consumed_one(w: CheckState, v: Var) -> CheckState =
   if w.fault != None { w }
   else if w.path_state.unset.contains(v.id) { unset_read(w, v) }
   else if points_into(v.representation) {
-    faulted(w, b"an address handed on beyond its block: v", v)
+    faulted(w, b"a pointer into another value's memory passed where ownership is taken: v", v)
   } else if !is_refcounted(v.representation) { w } else {
     let n = count(w.path_state, v);
     if n > 0 {
@@ -1630,8 +1630,8 @@ fn consumed_one(w: CheckState, v: Var) -> CheckState =
       }
     } else if w.path_state.uncounted.contains(v.id) || w.path_state.pending.contains(v.id) { w }
     else if w.path_state.borrowed_from.contains(v.id) {
-      faulted(w, b"a borrowed value consumed with no count of its own: v", v)
-    } else { faulted(w, b"a value consumed with no count left: v", v) }
+      faulted(w, b"a borrowed value passed where ownership is taken, but the function does not own it: v", v)
+    } else { faulted(w, b"a value passed where ownership is taken, but no owned reference to it remains: v", v) }
   }
 
 fn read_one(w: CheckState, v: Var) -> CheckState =
@@ -1645,23 +1645,23 @@ fn read_one(w: CheckState, v: Var) -> CheckState =
       Some(bs) -> if bs.all(|b: Int|
           w.path_state.borrowed.contains(b) || w.path_state.owned_counts.contains(b)
             || w.path_state.borrowed_from.contains(b)) { w }
-      else { faulted(w, b"a value read after what it was read out of was let go: v", v) },
-      None -> faulted(w, b"a value read with no count left: v", v),
+      else { faulted(w, b"a value read after the value it was borrowed from was released: v", v) },
+      None -> faulted(w, b"a value read after all references that own it were released: v", v),
     }
   }
 
 fn unset_read(w: CheckState, v: Var) -> CheckState =
-  faulted(w, b"a join read before it is set: v", v)
+  faulted(w, b"a variable read before it is assigned: v", v)
 
 fn failing(context: Enclosing, w: CheckState, value: Rvalue, unwind: List<Var>) -> CheckState =
   if w.fault != None || !may_leave(value) {
     if unwind.len() > 0 && w.fault == None {
-      { ..w, fault: Some(b"a release on the way out of a value that neither fails nor stops") }
+      { ..w, fault: Some(b"cleanup code on the failure path of an operation that cannot fail or pause") }
     } else { w }
   } else {
     let released = with_released(context.failure_counts, unwind);
     if released == counts_with_pending(w.path_state, released) { w }
-    else { { ..w, fault: Some(b"a failure path that releases other than what it holds") } }
+    else { { ..w, fault: Some(b"a failure path that releases different values than the function owns at that point") } }
   }
 
 pub fn may_leave(value: Rvalue) -> Bool = fails(value) || may_suspend(value)
@@ -1675,7 +1675,7 @@ fn result(w: CheckState, v: Var, a: Provenance) -> CheckState =
   else {
     match a {
       Owns -> if points_into(v.representation) {
-        faulted(w, b"an address represented as a count of its own: v", v)
+        faulted(w, b"a pointer into another value's memory given its own reference count: v", v)
       } else {
         {
           ..w,
@@ -1727,13 +1727,13 @@ fn check_borrowed_result(
   match operand_var(a) {
     None -> w,
     Some(v) -> if !is_refcounted(v.representation) { w } else if count(w.path_state, v) > 0 {
-      faulted(w, b"a borrowed result owning a count of its own: v", v)
+      faulted(w, b"a borrowed result that owns a reference count: v", v)
     } else if owners_of(w.path_state, v).all(|b: Int|
         match w.path_state.borrowed.get(b) {
           Some(place) -> from.any(|x: { param: Int, whole: Bool }| x.param == place),
           None -> false,
         }) { read_of(w, v) } else {
-      faulted(w, b"a borrowed result read out of other than the parameters its root names: v", v)
+      faulted(w, b"a borrowed result that borrows from something other than the parameters the function says it borrows from: v", v)
     },
   }
 
@@ -1751,49 +1751,49 @@ fn ended(w: CheckState, kept: Map<Int, Int>, reason: Bytes) -> CheckState = {
 }
 
 fn fault_leaving_handle(w: CheckState) -> CheckState =
-  { ..w, fault: Some(b"a body that leaves its root from inside a handle") }
+  { ..w, fault: Some(b"a function body that returns from inside a `handle`") }
 
 fn representation_fault(v: Var, value: Rvalue) -> Option<Bytes> =
   match value {
     Call(c) -> call_representation_fault(v, c.args, c.convention),
     Apply(c) -> call_representation_fault(v, c.args, c.convention),
     Convert(p) -> if p.to != v.representation {
-      Some(b"a value packed otherwise than its variable holds it: v")
+      Some(b"a value converted to a different layout than its variable has: v")
     } else { None },
     IfUnique(x) -> if x.representation != v.representation {
-      Some(b"a last holder's test returned otherwise than its value is represented: v")
+      Some(b"a check for a sole owner returned a different layout than its value has: v")
     } else { None },
     Aggregate(g) -> match v.representation {
       AsSum(s) -> match g.parts.at(0) {
         Some(IntOperand(k)) -> if k >= 0 && k < s.cases.len() { None }
-        else { Some(b"a sum gathered as a case it does not have: v") },
-        _ -> Some(b"a sum gathered from other than its case's place: v"),
+        else { Some(b"a tagged value constructed with a variant it does not have: v") },
+        _ -> Some(b"a tagged value constructed with a variant index that is not an integer: v"),
       },
       AsFlattened(_) -> if g.parts.fold([], |rs: List<Representation>, a: Arg|
             rs.concat(parts_of(operand_representation(a))))
           == parts_of(v.representation) { None }
-      else { Some(b"a record gathered from parts represented otherwise than its leaves: v") },
+      else { Some(b"a record constructed from parts whose layouts differ from the record's fields: v") },
       _ -> None,
     },
     Update(u) -> if v.representation != AsWord || u.of.representation != AsWord {
-      Some(b"a record written over other than in its box: v")
+      Some(b"a record updated in place that is not stored in a single heap allocation: v")
     } else if record_fields(u.of.ty) != record_fields(v.ty) {
-      Some(b"a record written over the box of a record of other fields: v")
+      Some(b"a record updated in place from a record with different fields: v")
     } else { None },
     Get(g) -> match g.path {
       CasePath(p) -> if case_position_exists(g.of, p) { None }
-      else { Some(b"a case's payload read past what the case lays: v") },
+      else { Some(b"a case's payload read beyond the fields the case has: v") },
       _ -> None,
     },
     Allocate(m) -> if v.representation != AsWord {
-      Some(b"a value made represented otherwise than as its word: v")
+      Some(b"an allocated value that is not stored as a single pointer: v")
     } else {
       match m.reuse {
-        Some(t) -> if !is_token(t) { Some(b"a value made in cells no reset kept: v") }
+        Some(t) -> if !is_token(t) { Some(b"a value allocated into memory reused from something that is not a reusable memory slot: v") }
         else if !reuses_cells(m.made) {
-          Some(b"a value made in cells its printer does not take: v")
+          Some(b"a value allocated into reused memory that its type cannot reuse: v")
         } else if t.representation != AsReuseToken(allocation_words(m.made))
-            || allocation_words(m.made) == 0 { Some(b"a value made in cells of another size: v") }
+            || allocation_words(m.made) == 0 { Some(b"a value allocated into reused memory of a different size: v") }
         else { None },
         None -> None,
       }
@@ -1803,11 +1803,11 @@ fn representation_fault(v: Var, value: Rvalue) -> Option<Bytes> =
 
 fn call_representation_fault(v: Var, args: List<Arg>, conv: Convention) -> Option<Bytes> =
   if conv.result != v.representation {
-    Some(b"a call's result bound otherwise than its convention represents it: v")
+    Some(b"a call's result bound with a different layout than the function returns: v")
   } else if !arguments_match_representations(args, reps_of(conv)) {
-    Some(b"a call's operand represented otherwise than its convention takes it: v")
+    Some(b"a call's argument passed with a different layout than the function expects: v")
   } else if !borrows_from_borrowed(args.map(operand_representation), conv) {
-    Some(b"a call's result borrowed of other than a counted operand it passes borrowed: v")
+    Some(b"a call's result borrows from an argument that the function does not take by borrowing: v")
   } else { None }
 
 fn borrows_from_borrowed(read_arg: List<Representation>, conv: Convention) -> Bool =
@@ -1921,7 +1921,7 @@ test "a record is written over only in the box of a record of its own fields" {
   assert_eq(over([b"p", b"texts"]), None);
   assert_eq(
     over([b"p", b"text"]),
-    Some(b"a record written over the box of a record of other fields: v1"),
+    Some(b"a record updated in place from a record with different fields: v1"),
   )
 }
 
@@ -1931,7 +1931,7 @@ test "a count is consumed exactly once on every path, or the body is rejected" {
   assert_eq(ownership_fault(root_of([p], [], AsWord, [Return(VarOperand(p))])), None);
   assert_eq(
     ownership_fault(root_of([p], [], AsInt, [Return(IntOperand(0))])),
-    Some(b"a count still owned where the body returns: v0"),
+    Some(b"a reference count not released before the body returns: v0"),
   );
   assert_eq(
     ownership_fault(
@@ -1940,7 +1940,7 @@ test "a count is consumed exactly once on every path, or the body is rejected" {
         Return(VarOperand(r)),
       ]),
     ),
-    Some(b"a value consumed with no count left: v0"),
+    Some(b"a value passed where ownership is taken, but no owned reference to it remains: v0"),
   );
   assert_eq(
     ownership_fault(
@@ -1976,7 +1976,7 @@ test "what a failing call's path releases is exactly what the path holds across 
   assert_eq(ownership_fault(root_of([p], [], AsWord, body([p]))), None);
   assert_eq(
     ownership_fault(root_of([p], [], AsWord, body([]))),
-    Some(b"a failure path that releases other than what it holds"),
+    Some(b"a failure path that releases different values than the function owns at that point"),
   )
 }
 
@@ -2005,7 +2005,7 @@ test "a branch tests a Bool, and a case a number, held as one, never a word that
   assert_eq(ownership_fault(cased(flag(0))), None);
   assert_eq(
     ownership_fault(cased(boxed)),
-    Some(b"a case testing as a number a value represented otherwise: v0"),
+    Some(b"a case that tests a value as a number, but the value is not stored as a number: v0"),
   )
 }
 
@@ -2023,7 +2023,7 @@ test "a variable is used held as it was bound, which its C names follow" {
         body({ ..n, representation: AsFlattened([{ name: b"a", representation: AsWord }]) }),
       ),
     ),
-    Some(b"a variable used represented otherwise than it was bound: v1"),
+    Some(b"a variable is stored differently where it is used than where it is defined: v1"),
   );
   let may_leave = { ..n, representation: AsFlattened([{ name: b"a", representation: AsWord }]) };
   let listed = Allocate({ made: ListAllocation(1), args: [VarOperand(p)], reuse: None });
@@ -2034,7 +2034,7 @@ test "a variable is used held as it was bound, which its C names follow" {
         Return(VarOperand(may_leave)),
       ]),
     ),
-    Some(b"a value made represented otherwise than as its word: v1"),
+    Some(b"an allocated value that is not stored as a single pointer: v1"),
   )
 }
 
@@ -2084,7 +2084,7 @@ test "the paths out of a branch hold the same counts and set the same joins" {
         Return(IntOperand(0)),
       ]),
     ),
-    Some(b"the paths out of a branch own different counts"),
+    Some(b"the branches of an expression finish with different owned values"),
   );
   assert_eq(
     ownership_fault(
@@ -2106,7 +2106,7 @@ test "the paths out of a branch hold the same counts and set the same joins" {
         Return(VarOperand(s)),
       ]),
     ),
-    Some(b"a count taken of a value that holds none: v1"),
+    Some(b"a reference count is incremented for a value that has no reference count: v1"),
   );
   assert_eq(
     ownership_fault(
@@ -2121,7 +2121,7 @@ test "the paths out of a branch hold the same counts and set the same joins" {
         Return(VarOperand(j)),
       ]),
     ),
-    Some(b"the paths out of a branch set different joins"),
+    Some(b"the branches of an expression assign different variables"),
   );
   let early = |read: Inst|
     ownership_fault(
@@ -2134,10 +2134,10 @@ test "the paths out of a branch hold the same counts and set the same joins" {
       ]),
     );
   assert_eq(early(SiteScope(None)), None);
-  assert_eq(early(Return(VarOperand(j))), Some(b"a join read before it is set: v2"));
+  assert_eq(early(Return(VarOperand(j))), Some(b"a variable read before it is assigned: v2"));
   assert_eq(
     early(If({ cond: VarOperand(j), then: [], otherwise: [] })),
-    Some(b"a join read before it is set: v2"),
+    Some(b"a variable read before it is assigned: v2"),
   )
 }
 
@@ -2157,7 +2157,7 @@ test "a borrowed value is read only while what it was read out of is held" {
     );
   assert_eq(
     ownership_fault(read_after([Dec(p)])),
-    Some(b"a value read after what it was read out of was let go: v1"),
+    Some(b"a value read after the value it was borrowed from was released: v1"),
   );
   assert_eq(
     ownership_fault(
@@ -2178,7 +2178,7 @@ test "a borrowed value is read only while what it was read out of is held" {
         Return(VarOperand(x)),
       ]),
     ),
-    Some(b"a borrowed value consumed with no count of its own: v1"),
+    Some(b"a borrowed value passed where ownership is taken, but the function does not own it: v1"),
   )
 }
 
@@ -2202,7 +2202,7 @@ test "a match's next arm starts from what the arm before held where it missed" {
       }),
     ]);
   assert_eq(ownership_fault(arms([Dec(p)])), None);
-  assert_eq(ownership_fault(arms([])), Some(b"a count still owned where the body returns: v0"));
+  assert_eq(ownership_fault(arms([])), Some(b"a reference count not released before the body returns: v0"));
   assert_eq(
     ownership_fault(
       root_of([p, q], [], AsWord, [
@@ -2215,11 +2215,11 @@ test "a match's next arm starts from what the arm before held where it missed" {
         }),
       ]),
     ),
-    Some(b"the misses of an arm own different counts"),
+    Some(b"two branches of the same expression finish with different owned values or different unassigned variables"),
   );
   assert_eq(
     ownership_fault(root_of([p], [], AsWord, [Miss])),
-    Some(b"an arm's miss outside a match"),
+    Some(b"a failed match in an arm appears outside any match"),
   )
 }
 
@@ -2251,7 +2251,7 @@ test "a loop holds the same counts across each of its passes, and a count it lef
   assert_eq(ownership_fault(looped([Inc({ var: p, n: 1 })])), None);
   assert_eq(
     ownership_fault(looped([])),
-    Some(b"a failure path that releases other than what it holds"),
+    Some(b"a failure path that releases different values than the function owns at that point"),
   );
   assert_eq(
     ownership_fault(
@@ -2295,11 +2295,11 @@ test "a handle's body leaves to its landing what the handle holds across it" {
   assert_eq(ownership_fault(handled([], [])), None);
   assert_eq(
     ownership_fault(handled([], [p])),
-    Some(b"a failure path that releases other than what it holds"),
+    Some(b"a failure path that releases different values than the function owns at that point"),
   );
   assert_eq(
     ownership_fault(landed([], [], [])),
-    Some(b"a handle whose landing releases other than what it holds across its body"),
+    Some(b"a handle that, when its body fails, releases different reference counts than the handle owns while the body runs"),
   );
   assert_eq(
     ownership_fault(
@@ -2333,7 +2333,7 @@ test "a handle's body leaves to its landing what the handle holds across it" {
       ),
     ),
     Some(
-      b"a count represented otherwise than the handle around represents it where the body fails: v0",
+      b"a reference count differs between where the body fails and where the enclosing handle expects it: v0",
     ),
   );
   assert_eq(
@@ -2343,7 +2343,7 @@ test "a handle's body leaves to its landing what the handle holds across it" {
         [],
       ),
     ),
-    Some(b"a body that leaves its root from inside a handle"),
+    Some(b"a function body that returns from inside a `handle`"),
   )
 }
 
@@ -2394,7 +2394,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
       Allocate({ made: CaseAllocation({ case: 0, skip: 0, words: 0 }), args: [], reuse: None }),
       [v, token],
     ),
-    Some(b"a release on the way out of a value that neither fails nor stops"),
+    Some(b"cleanup code on the failure path of an operation that cannot fail or pause"),
   );
   let stopping = |unwind: List<Var>|
     failing(
@@ -2406,7 +2406,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
       unwind,
     );
   assert_eq(stopping([v, token]), None);
-  assert_eq(stopping([v]), Some(b"a failure path that releases other than what it holds"));
+  assert_eq(stopping([v]), Some(b"a failure path that releases different values than the function owns at that point"));
   assert_eq(
     ownership_fault(
       root_of([r, v], [], AsWord, [
@@ -2416,7 +2416,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         Return(VarOperand(n)),
       ]),
     ),
-    Some(b"a reuse token let go as a value: v3"),
+    Some(b"a reference count is decremented on a reuse token, which is a block of memory set aside for reuse: v3"),
   );
   assert_eq(
     ownership_fault(
@@ -2427,7 +2427,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         Return(VarOperand(n)),
       ]),
     ),
-    Some(b"a reuse token read as a value: v3"),
+    Some(b"a reusable memory slot used as an ordinary value: v3"),
   );
   assert_eq(
     ownership_fault(
@@ -2437,13 +2437,13 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         Return(VarOperand(n)),
       ]),
     ),
-    Some(b"cells kept as other than a reuse token: v3"),
+    Some(b"a block of memory is set aside for reuse in a variable that is not a reuse token: v3"),
   );
   assert_eq(
     ownership_fault(
       root_of([r, v], [], AsWord, [Dec(r), bind(n, made(Some(v)), []), Return(VarOperand(n))]),
     ),
-    Some(b"a value made in cells no reset kept: v2"),
+    Some(b"a value allocated into memory reused from something that is not a reusable memory slot: v2"),
   );
   let wide = { ..token, representation: AsReuseToken(2) };
   assert_eq(
@@ -2454,7 +2454,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         Return(VarOperand(n)),
       ]),
     ),
-    Some(b"a value made in cells of another size: v2"),
+    Some(b"a value allocated into reused memory of a different size: v2"),
   );
   assert_eq(
     ownership_fault(
@@ -2468,7 +2468,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         Return(VarOperand(n)),
       ]),
     ),
-    Some(b"a value made in cells its printer does not take: v2"),
+    Some(b"a value allocated into reused memory that its type cannot reuse: v2"),
   )
 }
 
@@ -2502,7 +2502,7 @@ test "an opened value is its parts, each word counted on its own and read only b
   );
   assert_eq(
     ownership_fault(root_of([s], [], AsWord, [opened, Dec(w0), leaf].concat(called))),
-    Some(b"a value read with no count left: v1"),
+    Some(b"a value read after all references that own it were released: v1"),
   );
   assert_eq(
     ownership_fault(
@@ -2515,20 +2515,20 @@ test "an opened value is its parts, each word counted on its own and read only b
         ),
       ),
     ),
-    Some(b"an opened value read other than by its words: v4"),
+    Some(b"a destructured value read other than by field: v4"),
   );
   assert_eq(
     ownership_fault(
       root_of([s], [], AsWord, [Destructure({ of: s, words: [w0, w2] }), Dec(w2)].concat(called)),
     ),
-    Some(b"a value opened into words represented otherwise than its parts: v0"),
+    Some(b"a value split into fields stored differently from the fields of its type: v0"),
   );
   let k = int(6);
   assert_eq(
     ownership_fault(
       root_of([k], [], AsWord, [Destructure({ of: k, words: [w2] }), Return(VarOperand(w2))]),
     ),
-    Some(b"a value opened that is not owned only here: v6"),
+    Some(b"a value split into fields that other code may still use: v6"),
   )
 }
 
@@ -2551,7 +2551,7 @@ test "a field taken out of its block is never read again, nor the block used who
   );
   assert_eq(
     ownership_fault(root_of([p], [], AsWord, [take, Dec(x), Return(VarOperand(p))])),
-    Some(b"a block used whole after a field was taken out of it: v0"),
+    Some(b"a block is used after one of its fields was moved out of it: v0"),
   );
   assert_eq(
     ownership_fault(root_of([p], [0], AsWord, [take, Return(VarOperand(x))])),
@@ -2570,8 +2570,8 @@ test "a field taken out of its block is never read again, nor the block used who
         Return(VarOperand(reader)),
       ]),
     );
-  assert_eq(placed({ ..x, ty: inner }), Some(b"a field taken that its block holds in place: v1"));
-  assert_eq(placed(x), Some(b"a field taken that its block holds in place: v1"));
+  assert_eq(placed({ ..x, ty: inner }), Some(b"a field taken from a record that is stored inside its block, not separately: v1"));
+  assert_eq(placed(x), Some(b"a field taken from a record that is stored inside its block, not separately: v1"));
   assert_eq(
     ownership_fault(
       root_of([holder], [], AsWord, [
@@ -2593,7 +2593,7 @@ test "a field taken out of its block is never read again, nor the block used who
         Return(VarOperand(p)),
       ]),
     ),
-    Some(b"a value whose count nothing holds"),
+    Some(b"a value has a reference count that nothing releases"),
   )
 }
 
@@ -2656,7 +2656,7 @@ test "a join declared inside a branch is the branch's own, which the paths out o
         Return(VarOperand(outer)),
       ]),
     ),
-    Some(b"the paths out of a branch set different joins"),
+    Some(b"the branches of an expression assign different variables"),
   )
 }
 
@@ -2720,7 +2720,7 @@ test "an arm's misses hand the next arm only the joins declared before the match
         }),
       ]),
     ),
-    Some(b"the misses of an arm own different counts"),
+    Some(b"two branches of the same expression finish with different owned values or different unassigned variables"),
   )
 }
 
@@ -2818,7 +2818,7 @@ test "a field taken before any miss is taken for the next arm, a read by name is
     );
   assert_eq(handed(false, None), None);
   let outlives = Some(
-    b"a closure on this frame's stack handed to a handle whose instance may outlive it",
+    b"a closure stored on this function's stack is passed to a handle that can run after the function returns",
   );
   assert_eq([handed(true, None), handed(false, Some(0))], [outlives, outlives])
 }
@@ -2837,7 +2837,7 @@ test "a case arm on a constructor is one its test names" {
   assert_eq(ownership_fault(cased(1)), None);
   assert_eq(
     ownership_fault(cased(2)),
-    Some(b"a case arm for a constructor its test does not name: v0"),
+    Some(b"a case arm for a constructor that the case test does not name: v0"),
   )
 }
 
@@ -2858,13 +2858,13 @@ test "an operand is held as its operation takes it, and a counted result is held
   });
   assert_eq(
     ownership_fault(root_of([p], [], AsWord, [bind(r, int_call, []), Return(VarOperand(r))])),
-    Some(b"a call's operand represented otherwise than its convention takes it: v2"),
+    Some(b"a call's argument passed with a different layout than the function expects: v2"),
   );
   assert_eq(
     ownership_fault(
       root_of([p], [], AsWord, [bind(n, call_of([VarOperand(p)], []), []), Return(VarOperand(p))]),
     ),
-    Some(b"a call's result bound otherwise than its convention represents it: v1"),
+    Some(b"a call's result bound with a different layout than the function returns: v1"),
   );
   assert_eq(
     ownership_fault(
@@ -2873,11 +2873,11 @@ test "an operand is held as its operation takes it, and a counted result is held
         Return(IntOperand(0)),
       ]),
     ),
-    Some(b"a value whose count nothing holds"),
+    Some(b"a value has a reference count that nothing releases"),
   );
   assert_eq(
     ownership_fault(root_of([p], [], AsWord, [Dec(n), Return(VarOperand(p))])),
-    Some(b"a count let go of a value that holds none: v1"),
+    Some(b"a reference count is decremented for a value that has no reference count: v1"),
   );
   let retained = Op({
     op: OfContainers(Retain),
@@ -2886,7 +2886,7 @@ test "an operand is held as its operation takes it, and a counted result is held
   });
   assert_eq(
     ownership_fault(root_of([p], [], AsWord, [bind(r, retained, []), Return(VarOperand(r))])),
-    Some(b"an operation whose uses name other than its operands: v2"),
+    Some(b"an operation whose signature takes a different number of arguments than the operation is given: v2"),
   )
 }
 
@@ -2914,7 +2914,7 @@ test "a root holds a parameter as its convention takes it or as a view of the li
     ownership_fault(
       walk([bind(w, call_of([], []), [view]), Dec(view), Restart([VarOperand(w), VarOperand(n)])]),
     ),
-    Some(b"a restart's arguments represented otherwise than its parameters"),
+    Some(b"a restart whose arguments are stored differently from the parameters it restarts"),
   );
   assert_eq(
     ownership_fault({
@@ -2926,7 +2926,7 @@ test "a root holds a parameter as its convention takes it or as a view of the li
         returned: OwnedResult,
       },
     }),
-    Some(b"a parameter represented otherwise than its convention takes it"),
+    Some(b"a parameter is passed differently than its function's calling convention requires"),
   )
 }
 
@@ -2972,7 +2972,7 @@ test "a record is gathered from its leaves' values in order, a record it holds a
   assert_eq(gathered({ id: 0, ty: ty, representation: inner }), None);
   assert_eq(
     gathered(word(0)),
-    Some(b"a record gathered from parts represented otherwise than its leaves: v2"),
+    Some(b"a record constructed from parts whose layouts differ from the record's fields: v2"),
   )
 }
 
@@ -2991,7 +2991,7 @@ test "an address into a block's bytes is read out of a block's word, only while 
   assert_eq(read([byte, Dec(b), Return(VarOperand(n))]), None);
   assert_eq(
     read([Dec(b), byte, Return(VarOperand(n))]),
-    Some(b"a value read after what it was read out of was let go: v1"),
+    Some(b"a value read after the value it was borrowed from was released: v1"),
   );
   assert_eq(
     ownership_fault(root_of([b], [0], AsInt, [addressed, byte, Return(VarOperand(n))])),
@@ -3005,11 +3005,11 @@ test "an address into a block's bytes is read out of a block's word, only while 
       Dec(w),
       Return(IntOperand(0)),
     ]),
-    Some(b"an address handed on beyond its block: v1"),
+    Some(b"a pointer into another value's memory passed where ownership is taken: v1"),
   );
   assert_eq(
     ownership_fault(root_of([b], [], AsAddress, [addressed, Dec(b), Return(VarOperand(a))])),
-    Some(b"an address handed on beyond its block: v1"),
+    Some(b"a pointer into another value's memory passed where ownership is taken: v1"),
   );
   assert_eq(
     ownership_fault(
@@ -3018,7 +3018,7 @@ test "an address into a block's bytes is read out of a block's word, only while 
         Return(IntOperand(0)),
       ]),
     ),
-    Some(b"a block's bytes read out of other than a block's word: v2"),
+    Some(b"a block's bytes read from a value that is not a pointer to a block: v2"),
   );
   assert_eq(
     read([bind(n, Get({ of: b, path: PayloadPath }), []), Dec(b), Return(VarOperand(n))]),
@@ -3061,7 +3061,7 @@ test "an operation over bytes is handed, takes and returns as its rule says, and
   );
   assert_eq(
     checked([b, fresh], [1], AsInt, [addressed, copied, Dec(b), Return(IntOperand(0))]),
-    Some(b"a block written into that this body holds no count of: v3"),
+    Some(b"bytes written into a block that this body has no reference count for: v3"),
   );
   let taking = Op({
     op: OfStrings(ByteRead),
@@ -3072,19 +3072,19 @@ test "an operation over bytes is handed, takes and returns as its rule says, and
     checked([b], [], AsInt, [addressed, bind(n, value, []), Dec(b), Return(VarOperand(n))]);
   assert_eq(
     reads(taking),
-    Some(b"an operation over bytes taking or returning otherwise than its rule: v2"),
+    Some(b"an operation over bytes that takes or returns a type other than the one its signature requires: v2"),
   );
   assert_eq(
     reads(bytes_op(ByteRead, [VarOperand(b), IntOperand(0)])),
-    Some(b"an operation over bytes reading through other than an address: v0"),
+    Some(b"an operation over bytes that reads memory through a value that is not an address: v0"),
   );
   assert_eq(
     reads(bytes_op(ByteRead, [VarOperand(a), VarOperand(b)])),
-    Some(b"an operation over bytes handed a counted value as a number: v2"),
+    Some(b"an operation over bytes given a reference-counted value where it needs a number: v2"),
   );
   assert_eq(
     reads(bytes_op(ByteRead, [VarOperand(a)])),
-    Some(b"an operation over bytes handed other than its operands: v2"),
+    Some(b"an operation over bytes is given a different number of arguments than the operation requires: v2"),
   );
   assert_eq(
     checked([b, grown], [], AsWord, [
@@ -3097,7 +3097,7 @@ test "an operation over bytes is handed, takes and returns as its rule says, and
       Dec(b),
       Return(IntOperand(0)),
     ]),
-    Some(b"an operation over bytes returning otherwise than its rule: v3"),
+    Some(b"an operation over bytes that returns a type other than the one its signature requires: v3"),
   )
 }
 
@@ -3116,7 +3116,7 @@ test "the bytes a marshalling call returned are taken as a block of their own, f
   assert_eq(consume_arg(owned, t), None);
   assert_eq(
     consume_arg({ ..owned, owned: false }, t),
-    Some(b"the bytes a marshalling returned taken other than as a block of their own: v1"),
+    Some(b"the bytes returned by a foreign call used as something other than a separate block: v1"),
   )
 }
 
@@ -3133,17 +3133,17 @@ test "a last holder's test takes its value's count, which its result holds only 
   assert_eq(tested([Restart([VarOperand(n)])], [Return(IntOperand(0))]), None);
   assert_eq(
     tested([Restart([VarOperand(n)])], [Dec(n), Return(IntOperand(0))]),
-    Some(b"a value consumed with no count left: v1"),
+    Some(b"a value passed where ownership is taken, but no owned reference to it remains: v1"),
   );
   assert_eq(
     tested([Return(IntOperand(0))], [Return(IntOperand(0))]),
-    Some(b"a count still owned where the body returns: v1"),
+    Some(b"a reference count not released before the body returns: v1"),
   );
   assert_eq(
     ownership_fault(
       root_of([x], [], AsInt, [bind(n, IfUnique(x), []), Dec(n), Dec(x), Return(IntOperand(0))]),
     ),
-    Some(b"a value consumed with no count left: v0"),
+    Some(b"a value passed where ownership is taken, but no owned reference to it remains: v0"),
   );
   assert_eq(
     ownership_fault(
@@ -3164,7 +3164,7 @@ test "a last holder's test takes its value's count, which its result holds only 
         Return(IntOperand(0)),
       ]),
     ),
-    Some(b"a last holder's test returned otherwise than its value is represented: v1"),
+    Some(b"a check for a sole owner returned a different layout than its value has: v1"),
   )
 }
 
@@ -3177,17 +3177,17 @@ test "a block of a laid type opened is consumed, and the counted words it holds 
   assert_eq(opened([Dec(w), Return(IntOperand(0))]), None);
   assert_eq(
     opened([Return(IntOperand(0))]),
-    Some(b"a count still owned where the body returns: v1"),
+    Some(b"a reference count not released before the body returns: v1"),
   );
   assert_eq(
     opened([Dec(w), Dec(b), Return(IntOperand(0))]),
-    Some(b"a value consumed with no count left: v0"),
+    Some(b"a value passed where ownership is taken, but no owned reference to it remains: v0"),
   );
   assert_eq(
     ownership_fault(
       root_of([b], [0], AsInt, [Destructure({ of: b, words: [w] }), Dec(w), Return(IntOperand(0))]),
     ),
-    Some(b"a borrowed value consumed with no count of its own: v0"),
+    Some(b"a borrowed value passed where ownership is taken, but the function does not own it: v0"),
   )
 }
 
@@ -3246,7 +3246,7 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
     ownership_fault(
       root_of([o], [], AsInt, [Destructure({ of: o, words: [s] }), Dec(s), Return(IntOperand(0))]),
     ),
-    Some(b"a value opened that is not owned only here: v0"),
+    Some(b"a value split into fields that other code may still use: v0"),
   );
   let n = { ..word(3), representation: boxed };
   assert_eq(
@@ -3271,11 +3271,11 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
       ]),
     );
   assert_eq(read({ case: 1, at: 0 }), None);
-  assert_eq(read({ case: 1, at: 1 }), Some(b"a case's payload read past what the case lays: v2"));
-  assert_eq(read({ case: 0, at: 0 }), Some(b"a case's payload read past what the case lays: v2"));
+  assert_eq(read({ case: 1, at: 1 }), Some(b"a case's payload read beyond the fields the case has: v2"));
+  assert_eq(read({ case: 0, at: 0 }), Some(b"a case's payload read beyond the fields the case has: v2"));
   assert_eq(
     ownership_fault(on([some_constructor(), none_constructor()], [Dec(o), Return(IntOperand(0))])),
-    Some(b"a case on a sum testing other constructors than the sum's: v0"),
+    Some(b"a case on a sum type that tests constructors the sum type does not have: v0"),
   );
   let gathered = { ..word(4), representation: maybe };
   let gather = |parts: List<Arg>|
@@ -3289,9 +3289,9 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
   assert_eq(gather([IntOperand(1), VarOperand(s)]), None);
   assert_eq(
     gather([IntOperand(2), VarOperand(s)]),
-    Some(b"a sum gathered as a case it does not have: v4"),
+    Some(b"a tagged value constructed with a variant it does not have: v4"),
   );
-  assert_eq(gather([VarOperand(s)]), Some(b"a sum gathered from other than its case's place: v4"))
+  assert_eq(gather([VarOperand(s)]), Some(b"a tagged value constructed with a variant index that is not an integer: v4"))
 }
 
 test "a word read out of a sum whose case lays it as its one counted word holds the sum's count" {
@@ -3321,7 +3321,7 @@ test "a word read out of a sum whose case lays it as its one counted word holds 
   assert_eq(handed([Pointer, layout::any_integer()]), None);
   assert_eq(
     handed([Pointer, Pointer]),
-    Some(b"a borrowed value consumed with no count of its own: v1"),
+    Some(b"a borrowed value passed where ownership is taken, but the function does not own it: v1"),
   );
   let word_sum = { ..word(2), representation: laid([Pointer]) };
   let wide = { ..word(3), representation: laid([Pointer, Pointer]) };
@@ -3366,10 +3366,10 @@ test "a result borrowed is read out of counted operands the call passes borrowed
         Return(VarOperand(r)),
       ]),
     ),
-    Some(b"a borrowed value consumed with no count of its own: v1"),
+    Some(b"a borrowed value passed where ownership is taken, but the function does not own it: v1"),
   );
   let rejected = Some(
-    b"a call's result borrowed of other than a counted operand it passes borrowed: v1",
+    b"a call's result borrows from an argument that the function does not take by borrowing: v1",
   );
   assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [1], [0])), rejected);
   assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [0, 1], [1])), rejected);
@@ -3380,7 +3380,7 @@ test "a result borrowed is read out of counted operands the call passes borrowed
       ..given,
       convention: { ..given.convention, returned: BorrowedResult([{ param: from, whole: true }]) },
     });
-  let unborrowed = Some(b"a root returning borrowed of other than a counted parameter it borrows");
+  let unborrowed = Some(b"a function returns a borrowed value that does not borrow from a reference-counted parameter");
   assert_eq(returning(0), unborrowed);
   assert_eq(returning(1), unborrowed)
 }
@@ -3417,7 +3417,7 @@ test "a result handed back borrowed holds no count and is read out of only the b
   assert_eq(gathered([IntOperand(0)]), None);
   assert_eq(
     gathered([IntOperand(1), VarOperand(q)]),
-    Some(b"a borrowed result read out of other than the parameters its root names: v3"),
+    Some(b"a borrowed result that borrows from something other than the parameters the function says it borrows from: v3"),
   );
   let flat = { ..word(4), representation: AsFlattened([{ name: b"s", representation: AsWord }]) };
   assert_eq(
@@ -3429,11 +3429,11 @@ test "a result handed back borrowed holds no count and is read out of only the b
   );
   assert_eq(
     returning([0, 1], [0], [read(q), Return(VarOperand(y))]),
-    Some(b"a borrowed result read out of other than the parameters its root names: v2"),
+    Some(b"a borrowed result that borrows from something other than the parameters the function says it borrows from: v2"),
   );
   assert_eq(
     returning([0, 1], [0], [read(p), Inc({ var: y, n: 1 }), Return(VarOperand(y))]),
-    Some(b"a borrowed result owning a count of its own: v2"),
+    Some(b"a borrowed result that owns a reference count: v2"),
   )
 }
 
@@ -3459,7 +3459,7 @@ test "a join set to borrowed values on every path is borrowed of each, and read 
     ownership_fault(
       root_of([c, p, q], [2], AsWord, body([Inc({ var: j, n: 1 }), Return(VarOperand(j))])),
     ),
-    Some(b"the paths out of a branch own different counts"),
+    Some(b"the branches of an expression finish with different owned values"),
   );
   let x = word(5);
   let z = word(6);
@@ -3479,7 +3479,7 @@ test "a join set to borrowed values on every path is borrowed of each, and read 
   );
   assert_eq(
     given([Dec(p), bind(r, call_of([VarOperand(j)], [0]), [q]), Dec(q), Return(VarOperand(r))]),
-    Some(b"a value read after what it was read out of was let go: v3"),
+    Some(b"a value read after the value it was borrowed from was released: v3"),
   )
 }
 
@@ -3499,7 +3499,7 @@ test "a boxed case is made in the cells of a reuse token of as many words, its t
   assert_eq(made(CaseAllocation({ case: 1, skip: 1, words: 1 })), None);
   assert_eq(
     made(CaseAllocation({ case: 1, skip: 1, words: 2 })),
-    Some(b"a value made in cells of another size: v2"),
+    Some(b"a value allocated into reused memory of a different size: v2"),
   )
 }
 
@@ -3521,6 +3521,6 @@ test "a value walked to copy is consumed for the copy it returns, and one walked
   assert_eq(check_block(Copy, r, []), None);
   assert_eq(check_block(Keep, r, [Dec(p)]), None);
   assert_eq(check_block(Share, n, [Dec(p)]), None);
-  assert_eq(check_block(Copy, r, [Dec(p)]), Some(b"a value consumed with no count left: v0"));
-  assert_eq(check_block(Keep, r, []), Some(b"a count still owned where the body returns: v0"))
+  assert_eq(check_block(Copy, r, [Dec(p)]), Some(b"a value passed where ownership is taken, but no owned reference to it remains: v0"));
+  assert_eq(check_block(Keep, r, []), Some(b"a reference count not released before the body returns: v0"))
 }

@@ -235,8 +235,8 @@ pub fn error_message(reason: Error) -> String =
     Reset -> "the peer ended the connection",
     NameNotFound -> "the name has no address",
     AddressInUse -> "the address is already bound",
-    PermissionDenied -> "this run may not do that",
-    Injected -> "plaintext was waiting where a TLS handshake was to begin",
+    PermissionDenied -> "the operating system denied permission for this network operation",
+    Injected -> "plaintext data arrived where a TLS handshake was expected",
     Untrusted -> "the peer's certificate is not trusted for that name",
     Handshake(reason) -> reason,
     Other(code, text) -> text ++ " (" ++ code.to_string() ++ ")",
@@ -784,7 +784,7 @@ fn advance_script(c: MemConn) -> MemConn / {abort.raise} =
     [ExpectsEnd, ..rest] -> if c.ended { advance_script({ ..c, script: rest }) } else { c },
     [ExpectsSecret(_), ..] -> if c.unheard.len() == 0 { c } else {
       panic(
-        "the peer was to hear a credential and the program sent \""
+        "the scripted peer expected a credential but the program sent \""
           ++ String::of_bytes_lossy(c.unheard)
           ++ "\"",
       )
@@ -796,8 +796,8 @@ fn advance_script(c: MemConn) -> MemConn / {abort.raise} =
         advance_script({ ..c, script: rest, unheard: c.unheard.slice(wanted, c.unheard.len()) })
       } else if expected.starts_with(c.unheard) { c } else {
         panic(
-          "the peer was to hear \"" ++ String::of_bytes_lossy(expected)
-            ++ "\" and the program sent \""
+          "the scripted peer expected to receive \"" ++ String::of_bytes_lossy(expected)
+            ++ "\" but the program sent \""
             ++ String::of_bytes_lossy(c.unheard)
             ++ "\"",
         )
@@ -1190,7 +1190,7 @@ pub fn sent_secret(
   let written = if encoding == "raw" { secret } else {
     match try[abort.raise] { Secret::encode(encoding, secret) } {
       Ok(text) -> text.bytes(),
-      Err(_) -> panic("`net.send_secret` knows no encoding `" ++ encoding ++ "`"),
+      Err(_) -> panic("`net.send_secret` does not support the encoding `" ++ encoding ++ "`"),
     }
   };
   Secret::of_bytes(before).concat(written).concat(Secret::of_bytes(after))
@@ -1217,8 +1217,8 @@ pub fn mem_send_secret(
   let c = advance_script(conn_of(n, label, conn));
   if c.ended || c.gone { { net: with_conn(n, conn, c), result: false } } else if c.joined != None {
     panic(
-      "the fake cannot hand a credential to the program's own end of socket " ++ conn.to_string()
-        ++ ": nothing in Ply opens it",
+      "the in-memory network cannot send a credential to the program's own end of socket " ++ conn.to_string()
+        ++ ": that end would read the credential as plain bytes, so send it to a scripted peer instead",
     )
   } else {
     let kept = { ..c, sent_secrets: c.sent_secrets.push(framed) };
@@ -1226,12 +1226,12 @@ pub fn mem_send_secret(
       [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: false },
       [Expects(expected), ..] ->
         panic(
-          "the peer was to hear \"" ++ String::of_bytes_lossy(expected)
-            ++ "\" and the program sent a credential",
+          "the scripted peer expected to receive \"" ++ String::of_bytes_lossy(expected)
+            ++ "\" but the program sent a credential",
         ),
       [ExpectsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
         { net: with_conn(n, conn, advance_script({ ..kept, script: rest })), result: true }
-      } else { panic("the peer was to hear one credential and the program sent another") },
+      } else { panic("the scripted peer expected one credential but the program sent a different credential") },
       _ -> { net: with_conn(n, conn, kept), result: true },
     }
   }
@@ -1875,7 +1875,7 @@ fn decode_credentials(flat: Bytes) -> PeerCredentials / {abort.raise} =
   match parts(flat) {
     [user, group, process] ->
       { user: decode_int(user), group: decode_int(group), process: process.i64_be_at(0) },
-    _ -> panic("a socket native wrote no credentials"),
+    _ -> panic("the host's socket function returned malformed credentials"),
   }
 
 /// A socket address as the host's socket natives read and write one: parts of its address's bytes,
@@ -1897,9 +1897,9 @@ pub fn decode_address(flat: Bytes) -> SocketAddress / {abort.raise} =
           match ip::in_zone(at, String::of_bytes_lossy(zone)) { Some(zoned) -> zoned, None -> at }
         }
       },
-      None -> panic("a socket native wrote no address"),
+      None -> panic("the host's socket function returned a malformed address"),
     },
-    _ -> panic("a socket native wrote no address"),
+    _ -> panic("the host's socket function returned a malformed address"),
   }
 
 /// A socket option as the host's socket natives read and write one: its setting's byte, as
@@ -1970,7 +1970,7 @@ fn decode_probing(flat: Bytes) -> Probing / {abort.raise} =
         interval: match interval.i64_be_at(0) { Some(n) -> Some(nanos(n)), None -> None },
         count: count.i64_be_at(0),
       },
-    _ -> panic("a socket native wrote no probing"),
+    _ -> panic("the host's socket function returned malformed keep-alive probe settings"),
   }
 
 fn decode_group(flat: Bytes) -> (Ip, Option<String>) / {abort.raise} =
@@ -1978,9 +1978,9 @@ fn decode_group(flat: Bytes) -> (Ip, Option<String>) / {abort.raise} =
     [address, interface] -> match ip::of_bytes(address) {
       Some(group) ->
         (group, if interface.len() == 0 { None } else { Some(String::of_bytes_lossy(interface)) }),
-      None -> panic("a socket native wrote no group"),
+      None -> panic("the host's socket function returned a malformed multicast group"),
     },
-    _ -> panic("a socket native wrote no group"),
+    _ -> panic("the host's socket function returned a malformed multicast group"),
   }
 
 /// `options` as the host's socket natives read them: each one encoded, as parts.
@@ -2150,7 +2150,7 @@ fn relayed(script: List<Step>) -> MemNet / {ip.fail, abort.raise} =
 fn to_relay() -> Int / {net.connect_to[relay], ip.fail, abort.raise} =
   match net.connect_to[relay](ip::read_socket("192.0.2.25:25"), [], 1000) {
     Ok(c) -> c,
-    Err(_) -> panic("the relay rejected"),
+    Err(_) -> panic("the connection to the relay peer was rejected"),
   }
 
 test "a scripted peer sends its lines in order, waits to receive the program's, and ends" {
@@ -2180,7 +2180,7 @@ test "a program that sends what its peer did not expect fails at that send" {
     on_mem(relayed([Expects(b"EHLO x\r\n")]), ||
       net.send[relay](to_relay(), b"HELO x\r\n", 1000)).value
   };
-  assert_eq(failed, Err("the peer was to hear \"EHLO x\r\n\" and the program sent \"HELO x\r\n\""))
+  assert_eq(failed, Err("the scripted peer expected to receive \"EHLO x\r\n\" but the program sent \"HELO x\r\n\""))
 }
 
 fn plain_auth() -> Bytes = b"AUTH PLAIN AGFkYQBodW50ZXIy\r\n"
@@ -2235,15 +2235,15 @@ test "a credential the peer did not expect fails at its send, and reveals neithe
   assert_eq(sent([ExpectsSecret(plain_auth())], "base64"), Ok(true));
   assert_eq(
     sent([ExpectsSecret(plain_auth())], "raw"),
-    Err("the peer was to hear one credential and the program sent another"),
+    Err("the scripted peer expected one credential but the program sent a different credential"),
   );
   assert_eq(
     sent([Expects(b"AUTH PLAIN\r\n")], "base64"),
-    Err("the peer was to hear \"AUTH PLAIN\r\n\" and the program sent a credential"),
+    Err("the scripted peer expected to receive \"AUTH PLAIN\r\n\" but the program sent a credential"),
   );
   assert_eq(sent([Sends(b"220 ready\r\n")], "base64"), Ok(true));
   assert_eq(sent([Blocks], "base64"), Ok(false));
-  assert_eq(sent([], "rot13"), Err("`net.send_secret` knows no encoding `rot13`"));
+  assert_eq(sent([], "rot13"), Err("`net.send_secret` does not support the encoding `rot13`"));
   let pending: Result<Bool, String> = try[abort.raise] {
     on_mem(relayed([ExpectsSecret(plain_auth())]), || {
       let c = to_relay();
@@ -2251,7 +2251,7 @@ test "a credential the peer did not expect fails at its send, and reveals neithe
       net.send_secret[relay](c, b"", Secret::of_bytes(plain_auth()), "raw", b"", 1000)
     }).value
   };
-  assert_eq(pending, Err("the peer was to hear a credential and the program sent \"AUTH\""))
+  assert_eq(pending, Err("the scripted peer expected a credential but the program sent \"AUTH\""))
 }
 
 test "a read and a write move no more than a short network lets them" {
@@ -2568,7 +2568,7 @@ test "a name connects where the network's table says, each address tried in the 
   // A name that is not ASCII is rejected as `dns.lookup` rejects it, and nothing is looked up.
   assert_eq(
     ran.value.foreign,
-    Err(Other(0, "a name is ASCII: an internationalized name is looked up by its A-labels")),
+    Err(Other(0, "the name must be ASCII: convert an internationalized name to its ASCII form (`xn--` Punycode) before the lookup")),
   );
   // The last address tried is the one whose error is raised: the peer has no script left.
   assert_eq(ran.value.spent, Err(Rejected))
@@ -2715,7 +2715,7 @@ test "a socket keeps the options it was opened with and the ones set on it since
         1000,
       ) {
       Ok(c) -> c,
-      Err(_) -> panic("the relay rejected"),
+      Err(_) -> panic("the connection to the relay peer was rejected"),
     };
     let opened = net.options[relay](c);
     let set = net.set_option[relay](c, Linger(Some(Duration(0))));
@@ -2821,7 +2821,7 @@ test "the fake rejects {c.what} with the host's message" for c: { misuse: String
     {
       misuse: "encoding",
       what: "a credential in an encoding it does not write",
-      says: "`net.send_secret` knows no encoding `rot13`",
+      says: "`net.send_secret` does not support the encoding `rot13`",
     },
     { misuse: "none", what: "a read of no bytes", says: "`net.recv` was asked for 0 bytes" },
     {

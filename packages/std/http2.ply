@@ -384,7 +384,7 @@ fn unpadded(flags: Int, payload: Bytes) -> Unpadded / {http2.violated} =
   } else {
     let pad = payload.at(0);
     if pad >= payload.len() {
-      violation(ProtocolError, 0, "padding as long as the frame that carries it")
+      violation(ProtocolError, 0, "the padding length must be less than the length of the frame payload")
     } else { { body: payload.slice(1, payload.len() - pad), padding: Some(pad) } }
   }
 
@@ -561,8 +561,8 @@ fn integer_rest(
   shift: Int,
   fuel: Int,
 ) -> DecodedInteger / {http2.violated, abort.raise} =
-  if fuel <= 0 { compression_error("an integer of more than five continuation octets") }
-  else if at >= b.len() { compression_error("an integer that runs past the end of its block") }
+  if fuel <= 0 { compression_error("an integer that is longer than six bytes") }
+  else if at >= b.len() { compression_error("an integer that continues past the end of the header block") }
   else {
     let octet = b.at(at);
     let v = value + ((octet & 127) << shift);
@@ -1156,8 +1156,8 @@ fn field_at(t: Table, index: Int) -> Field / {http2.violated, abort.raise} =
   else if index <= static_count() { static_table().fields.get(index - 1) } else {
     match t.entries.get(t.newest - (index - static_count() - 1)) {
       Some(f) -> if index - static_count() <= t.count { f }
-      else { compression_error("index " ++ index.to_string() ++ " past the tables") },
-      None -> compression_error("index " ++ index.to_string() ++ " past the tables"),
+      else { compression_error("index " ++ index.to_string() ++ " is larger than the static and dynamic tables together") },
+      None -> compression_error("index " ++ index.to_string() ++ " is larger than the static and dynamic tables together"),
     }
   }
 
@@ -1205,7 +1205,7 @@ pub fn decode(d: Decoder, block: Bytes) -> DecodeResult / {http2.violated, abort
         let first = block.at(r.at);
         if first & 0xE0 == 0x20 { Continue(size_update(d, block, r)) }
         else if d.owed && !r.started && r.updates == 0 {
-          compression_error("a block that does not open with the table size update it owes")
+          compression_error("a header block must start with a dynamic table size update, and this one does not")
         } else { Continue(read_representation(block, r, first)) }
       },
   );
@@ -2018,7 +2018,7 @@ fn on_frame(
     ResetFrame(r) -> on_reset(k, r.stream, r.code, t),
     SettingsFrame(s) -> if s.ack { on_settings_ack(k) } else { on_settings(k, s.settings, t) },
     PushPromiseFrame(_) ->
-      violation(ProtocolError, 0, "a PUSH_PROMISE, which this end does not take"),
+      violation(ProtocolError, 0, "a PUSH_PROMISE frame, which this endpoint does not accept"),
     PingFrame(p) -> on_ping(k, p.ack, p.data, t),
     GoAwayFrame(g) -> on_goaway(k, g.last_stream, g.code, g.debug, t),
     WindowUpdateFrame(w) -> on_window_update(k, w.stream, w.increment, t),
@@ -2058,7 +2058,7 @@ fn on_data(
       Some(st) -> if st.phase == RemoteClosed { reset_stream(counted, s, StreamClosed, t) }
       else if flow > st.recv_window { reset_stream(counted, s, FlowControlError, t) }
       else if counted.role == Client && st.status == 0 {
-        fail_stream(counted, st, "DATA before the response's head", t)
+        fail_stream(counted, st, "DATA arrived before the response headers", t)
       } else if counted.role == Server && st.returned { discard_data(counted, st, end, flow, t) }
       else { accept_data(counted, st, data, end, flow, t) },
     }
@@ -2112,7 +2112,7 @@ fn remote_ended(k: ConnectionState, st: Stream, t: Int) -> ConnectionState / {ab
     // The response to HEAD, a 204 and a 304 carry the length another response's body would have.
     Some(n) if n != st.received && !(k.role == Client && has_no_body(st)) -> match k.role {
       Server -> reset_stream(k, st.id, ProtocolError, t),
-      Client -> fail_stream(k, st, "a body of other than its content-length", t),
+      Client -> fail_stream(k, st, "the body length differs from the content-length", t),
     },
     _ -> match k.role {
       Server -> {
@@ -2219,7 +2219,7 @@ fn field_block(
           match read.closed.get(s) {
             Some(true) -> read,
             Some(false) -> violation(StreamClosed, 0, "HEADERS on a closed stream"),
-            None -> violation(ProtocolError, 0, "a new stream numbered below one already opened"),
+            None -> violation(ProtocolError, 0, "a new stream has a lower number than a stream that was already opened"),
           }
         },
       }
@@ -2468,7 +2468,7 @@ fn setting_applied(
     HeaderTableSize(n) ->
       { ..k, encoder: with_capacity(k.encoder, min(n, k.limits.max_table_size)) },
     EnablePush(on) -> if on && k.role == Client {
-      violation(ProtocolError, 0, "a server's SETTINGS_ENABLE_PUSH of 1")
+      violation(ProtocolError, 0, "the server sent SETTINGS_ENABLE_PUSH with the value 1")
     } else { k },
     MaxConcurrentStreams(n) -> { ..k, peer_streams: n },
     InitialWindowSize(n) -> {
@@ -2478,7 +2478,7 @@ fn setting_applied(
           violation(
             FlowControlError,
             0,
-            "SETTINGS_INITIAL_WINDOW_SIZE that takes a window past 2^31-1",
+            "SETTINGS_INITIAL_WINDOW_SIZE would raise a stream's window above 2^31-1",
           )
         } else { acc.insert(id, { ..st, send_window: st.send_window + delta }) });
       { ..k, peer_window: n, streams: moved }
@@ -2639,10 +2639,10 @@ fn field_gathered(
     Some(reason) -> wrong(g, reason),
     None -> if f.name.at(0) == b':' {
       let name = String::of_bytes(f.name);
-      if trailing { wrong(g, "the pseudo-header `" ++ name ++ "` among trailers") }
-      else if g.regular { wrong(g, "the pseudo-header `" ++ name ++ "` after a regular field") }
+      if trailing { wrong(g, "the pseudo-header `" ++ name ++ "` is not allowed in trailers") }
+      else if g.regular { wrong(g, "the pseudo-header `" ++ name ++ "` comes after a regular field, but pseudo-headers must come first") }
       else if !allowed.contains(f.name) {
-        wrong(g, "the pseudo-header `" ++ name ++ "`, which this message does not take")
+        wrong(g, "the pseudo-header `" ++ name ++ "` is not allowed in this kind of message")
       } else if g.pseudo.contains(f.name) { wrong(g, "`" ++ name ++ "` twice") }
       else { { ..g, pseudo: g.pseudo.insert(f.name, f.value) } }
     } else {
@@ -2655,7 +2655,7 @@ fn regular_gathered(
   name: String,
   value: String,
 ) -> CollectedHeaders / {abort.raise} =
-  if connection_specific(name) { wrong(g, "the connection-specific field `" ++ name ++ "`") }
+  if connection_specific(name) { wrong(g, "the field `" ++ name ++ "` is connection-specific, which HTTP/2 does not allow") }
   else if name == "te" && value != "trailers" { wrong(g, "`te` other than `trailers`") }
   else if name == "cookie" { { ..g, cookies: g.cookies.push(value) } }
   else if name == "content-length" {
@@ -2710,7 +2710,7 @@ fn request_head(
     None -> match hosts { [h] -> h, _ -> "" },
   };
   if path == "" { Malformed("an empty `:path`") } else if path == "*" && method != "OPTIONS" {
-    Malformed("a `:path` of `*` with other than OPTIONS")
+    Malformed("a `:path` of `*` in a request whose method is not OPTIONS")
   } else if path != "*" && !path.starts_with("/") { Malformed("a `:path` that is not a path") }
   else if path.contains("#") { Malformed("a `:path` with a fragment") }
   else if authority.contains("@") { Malformed("an `:authority` with userinfo") }
@@ -2770,7 +2770,7 @@ fn sent_fields(headers: Headers, request: Bool) -> List<Field> / {abort.raise} =
     } else if name == "keep-alive" || name == "proxy-connection" || name == "upgrade" { acc } else {
       e.value.fold(acc, |fs: List<Field>, v: String|
         if v.contains("\r") || v.contains("\n") || v.contains("\0") {
-          panic("the value of `" ++ e.key ++ "` holds CR, LF or NUL, which would split the message")
+          panic("the value of `" ++ e.key ++ "` contains CR, LF or NUL, which would split the message")
         } else if name == "te" && (!request || v.ascii_trim() != "trailers") { fs }
         else { fs.push({ name: raw, value: Bytes::of_string(v.ascii_trim()) }) })
     }
@@ -3118,7 +3118,7 @@ pub fn tick(c: Connection, now: Instant) -> ReceiveResult / {abort.raise} = {
       close_with_error(
         k,
         ProtocolError,
-        "a field block not ended within " ++ l.request_timeout_ms.to_string() ++ " ms",
+        "the headers were not completed within " ++ l.request_timeout_ms.to_string() ++ " ms",
       ),
     )
   } else {
@@ -3144,7 +3144,7 @@ fn timed_out(k: ConnectionState, s: Int, t: Int) -> ConnectionState / {abort.rai
             k,
             st,
             Cancel,
-            "the server's window stayed shut for " ++ k.limits.stall_ms.to_string() ++ " ms",
+            "the server accepted no more request data for " ++ k.limits.stall_ms.to_string() ++ " ms",
             t,
           ),
       }
@@ -3165,7 +3165,7 @@ fn timed_out(k: ConnectionState, s: Int, t: Int) -> ConnectionState / {abort.rai
             k,
             st,
             Cancel,
-            "no whole response within " ++ k.limits.request_timeout_ms.to_string() ++ " ms",
+            "no complete response arrived within " ++ k.limits.request_timeout_ms.to_string() ++ " ms",
             t,
           )
         } else { k },
@@ -3720,18 +3720,18 @@ test "a Huffman string that contains EOS, or is padded wrong, is rejected" {
 
 test "a block that names what no table contains, or runs past its end, is rejected" {
   assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("80")), "index 0");
-  assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("be")), "index 62 past the tables");
+  assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("be")), "index 62 is larger than the static and dynamic tables together");
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("400a6375")),
     "a string that runs past the end of its block",
   );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("ff")),
-    "an integer that runs past the end of its block",
+    "an integer that continues past the end of the header block",
   );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("ff8080808080")),
-    "an integer of more than five continuation octets",
+    "an integer that is longer than six bytes",
   );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("ffffffffff0f")),
@@ -3757,7 +3757,7 @@ test "table size updates come first, at most as many as allowed, and within the 
   let lowered = with_ceiling(decoded(decoder(4096, 2), Bytes::of_hex("82")).decoder, 100);
   assert_eq(
     decode_result_text(lowered, Bytes::of_hex("82")),
-    "a block that does not open with the table size update it owes",
+    "a header block must start with a dynamic table size update, and this one does not",
   );
   assert_eq(decoded(lowered, Bytes::of_hex("3f4582")).decoder.table.capacity, 100)
 }
@@ -4909,7 +4909,7 @@ test "a client rejects a response whose head is malformed, and a server's PUSH_P
   ]);
   let r = receive(sent, reply, at(1));
   assert_eq(results(r.events), [
-    (1, 0, "the pseudo-header `:path`, which this message does not take"),
+    (1, 0, "the pseudo-header `:path` is not allowed in this kind of message"),
   ]);
   let pushed = receive(
     sent,

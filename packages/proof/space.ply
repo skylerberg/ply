@@ -143,11 +143,11 @@ pub fn space_bound(
     Some(n) ->
       Err(
         "`" ++ n
-          ++ "` holds a value compared by its type's `key`, which a comparison calls and no body shows",
+          ++ "` stores a value compared by its type's `key` function, and the `space` bound cannot see the code that calls `key`",
       ),
     None -> match known.get(definition) {
       Some(k) -> match space_use_for(k, true) { Ok(s) -> Ok(s.space), Err(reason) -> Err(reason) },
-      None -> Err("`" ++ definition ++ "` reaches definitions that call each other"),
+      None -> Err("`" ++ definition ++ "` is part of a cycle of definitions that call each other"),
     },
   }
 }
@@ -172,7 +172,7 @@ fn known_of(
 ) -> KnownSpace / {abort.raise} =
   match context.claims.definitions.get(definition) {
     None -> {
-      let reason = "`" ++ definition ++ "` has no body here to read";
+      let reason = "`" ++ definition ++ "` has no body in the program, so its space cannot be analyzed";
       { unshared_arguments: Err(reason), any_arguments: Err(reason) }
     },
     Some(d) -> match moved.get(definition) {
@@ -181,7 +181,7 @@ fn known_of(
           unshared_arguments: promised(definition, d),
           any_arguments: Err(
             "`" ++ definition
-              ++ "` is handed a value something else owns, and its `space` bound is for arguments owned alone",
+              ++ "` may be called with arguments shared with other values, and its `space` bound assumes arguments that are not shared",
           ),
         },
       Some(Err(reason)) -> { unshared_arguments: Err(reason), any_arguments: Err(reason) },
@@ -216,7 +216,7 @@ fn promised(definition: String, d: Definition) -> Result<SpaceUse, String> =
     None ->
       Err(
         "`" ++ definition
-          ++ "` has no body here to read, and no `space` bound to read as its space",
+          ++ "` has no body in the program to analyze, and no `space` bound to use instead",
       ),
   }
 
@@ -287,11 +287,11 @@ fn body_space(
     Err(reason) -> Err(reason),
     Ok(w) -> if !is_recursive(context, definition) { Ok({ space: w.space, holders: w.holders }) }
     else if !context.self_recursive.contains(definition) {
-      Err("`" ++ definition ++ "` is in a group with others")
+      Err("`" ++ definition ++ "` is part of a cycle of definitions that call each other")
     } else if w.recursive_space == zero() {
       if growth_preserved(w.space, w.recursive_call_arguments) {
         Ok({ space: w.space, holders: w.holders })
-      } else { Err("`" ++ definition ++ "` hands on a parameter its space grows with, changed") }
+      } else { Err("`" ++ definition ++ "` calls itself with a changed value of a parameter, and its space grows with the size of that parameter") }
     } else {
       match recursion_descent(
           definition,
@@ -585,10 +585,10 @@ fn walk(env: Env, st: State, c: Code) -> Result<SpaceSummary, String> / {abort.r
       },
     },
     CodeApply(a) -> application(env, st, a.function, a.args),
-    CodeKnownLambda(_) -> panic("only the emitter writes a read as a known lambda"),
+    CodeKnownLambda(_) -> panic("the compiler creates known lambdas after the space analysis runs, so the analysis never sees one"),
     // A raise ends the call; any other operation runs a handler the bound does not read.
     CodePerform(p) -> if p.effect != b"abort" {
-      Err("an operation whose handler the bound does not read")
+      Err("an operation run by a handler, which the `space` bound leaves out")
     } else {
       match walk_all(env, st, p.args, |_i: Int| Some(Shared)) {
         Err(reason) -> Err(reason),
@@ -616,9 +616,9 @@ fn walk(env: Env, st: State, c: Code) -> Result<SpaceSummary, String> / {abort.r
         holders: OnlyPartsShared,
       })
     },
-    CodeSimulate(_) -> Err("a simulation the bound does not read"),
-    CodeParallel(_) -> Err("a `parallel` block the bound does not read"),
-    CodeHandle(_) -> Err("a handler the bound does not read"),
+    CodeSimulate(_) -> Err("a simulation, which the `space` bound leaves out"),
+    CodeParallel(_) -> Err("a `parallel` block, which the `space` bound leaves out"),
+    CodeHandle(_) -> Err("a handler, which the `space` bound leaves out"),
   }
 
 /// A literal is a constant, held by the program where it is text.
@@ -688,7 +688,7 @@ fn binary(
 fn appended(a: SpaceSummary, b: SpaceSummary) -> Result<SpaceSummary, String> =
   match if a.holders != Shared { b.size }
     else { match ((a.size, b.size)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None } } {
-    None -> Err("an append whose size is not read"),
+    None -> Err("an append where the size of an operand is unknown"),
     Some(p) ->
       Ok({
         ..as_value(allocated(then(a, { ..b, state: mark_shared(b.state, b.read, OnlyPartsShared) }), p), if is_unshared(a) && is_unshared(b) { Unshared } else { OnlyPartsShared }, false),
@@ -947,7 +947,7 @@ fn application(
         Err(reason) -> Err(reason),
         Ok(a) -> match slot_at(a.walked.state, k).fun {
           Some(p) -> Ok(as_value(allocated(a.walked, p), Shared, false)),
-          None -> Err("a call of a function value whose space is not read"),
+          None -> Err("a call of a function value whose space is unknown"),
         },
       }
     },
@@ -974,12 +974,12 @@ fn application(
           a.all.map(|w: SpaceSummary| { ..slot_of(w), relation: Other, holders: sharing_of(w) }),
         ) {
         Err(reason) -> Err(reason),
-        Ok(w) -> if w.calls > 0 { Err("a call back inside a function value") } else {
+        Ok(w) -> if w.calls > 0 { Err("a recursive call inside a function value") } else {
           Ok(as_value(allocated(a.walked, plus(constant(), w.space)), sharing_of(w), w.is_number))
         },
       },
     },
-    _ -> Err("a call of a computed function the bound does not read"),
+    _ -> Err("a call of a computed function, which the `space` bound leaves out"),
   }
 
 /// A call back into the definition being read: a frame of its own unless it is a tail call, which
@@ -989,7 +989,7 @@ fn called_back(
   st: State,
   args: List<Code>,
 ) -> Result<SpaceSummary, String> / {abort.raise} =
-  if env.lambda { Err("a call back inside a function value") } else {
+  if env.lambda { Err("a recursive call inside a function value") } else {
     match walk_all(env, st, args, |_i: Int| Some(Shared)) {
       Err(reason) -> Err(reason),
       Ok(a) -> {
@@ -1060,7 +1060,7 @@ fn called(
           && (at_or(numbers, i) || at_or(functions, i)
           || (match a.all.at(i) { Some(w) -> is_unshared(w), None -> false })));
       match env.known.get(name) {
-        None -> Err("`" ++ name ++ "` reaches definitions that call each other"),
+        None -> Err("`" ++ name ++ "` is part of a cycle of definitions that call each other"),
         Some(k) -> match space_use_for(k, alone_all) {
           Err(reason) -> Err(reason),
           Ok(s) -> match at_args(
@@ -1307,7 +1307,7 @@ fn builtin(
   args: List<Code>,
 ) -> Result<SpaceSummary, String> / {abort.raise} =
   match env.results.get(name) {
-    None -> Err("`" ++ name ++ "` has no body here to read"),
+    None -> Err("`" ++ name ++ "` has no body in the program, so its space cannot be analyzed"),
     Some(result) -> match walk_all(env, st, args, |i: Int| held_after_call(name, result, i)) {
       Err(reason) -> Err(reason),
       Ok(a) -> match contained_by(name, result, a.walked.state, a.all) {
@@ -1332,7 +1332,7 @@ fn object(
 fn over(name: String, s: Option<Polynomial>, extra: Polynomial) -> Result<Polynomial, String> =
   match s {
     Some(p) -> Ok(plus(p, extra)),
-    None -> Err("`" ++ name ++ "` over a value whose size is not read"),
+    None -> Err("`" ++ name ++ "` over a value whose size is unknown"),
   }
 
 /// An update of the first argument: in place, making `extra`, where it is held once; else a copy of
@@ -1375,7 +1375,7 @@ fn iterated(
   params: List<Slot>,
 ) -> Result<Polynomial, String> / {abort.raise} =
   match times {
-    None -> Err("an iteration over a value whose size is not read"),
+    None -> Err("an iteration over a value whose size is unknown"),
     Some(n) -> match callback(env, st, args, position, params) {
       Err(reason) -> Err(reason),
       Ok(cb) -> product(n, cb.space),
@@ -1480,7 +1480,7 @@ fn contained_by(
   } else if name == "range" {
     match ((arg(0).size, arg(1).size)) {
       (Some(lo), Some(hi)) -> object(plus(lo, hi), Unshared, Some(plus(lo, hi))),
-      _ -> Err("`range` over a value whose size is not read"),
+      _ -> Err("`range` over a value whose size is unknown"),
     }
   } else if name == "Map::new" { object(constant(), Unshared, Some(constant())) }
   else if name == "Array::new" || name == "Columns::new" {
@@ -1495,7 +1495,7 @@ fn contained_by(
   else if name == "Map::merge" {
     match ((arg(0).size, arg(1).size)) {
       (Some(x), Some(y)) -> object(plus(plus(x, y), constant()), OnlyPartsShared, Some(plus(x, y))),
-      _ -> Err("`Map::merge` over a value whose size is not read"),
+      _ -> Err("`Map::merge` over a value whose size is unknown"),
     }
   } else if name == "List::at" || name == "Array::at" || name == "Columns::at" || name == "Map::get"
       || name == "Map::first"
@@ -1557,7 +1557,7 @@ fn valued_by(name: String, st: State, all: List<SpaceSummary>) -> Result<Allocat
       || name == "rotr"
       || name == "rotl" { Ok({ space: zero(), holders: Unshared, is_number: true, size: None }) }
   else if name == "panic" { object(constant(), Shared, None) }
-  else { Err("`" ++ name ++ "` holds what the bound does not read") }
+  else { Err("`" ++ name ++ "` is a function that the `space` bound leaves out") }
 }
 
 /// A fold: its first call is handed the seed, and each after it what the one before returned, so
@@ -1572,8 +1572,8 @@ fn folded(
   slots: List<Slot>,
 ) -> Result<Allocation, String> / {abort.raise} =
   match ((threaded(it), callback_calls(it, all.map(|w: SpaceSummary| w.size)))) {
-    (_, None) -> Err("an iteration over a value whose size is not read"),
-    (None, _) -> Err("a fold threads nothing through the function it is handed"),
+    (_, None) -> Err("an iteration over a value whose size is unknown"),
+    (None, _) -> Err("a fold whose callback receives no accumulated value"),
     (Some(k), Some(n)) -> {
       let seed = match all.at(k) { Some(w) -> w, None -> empty_summary(st) };
       match threaded_calls(env, st, all, args, it, slots, k) {
@@ -1641,23 +1641,23 @@ fn callback(
     Some(cb) -> match cb.node {
       CodeLambda(l) -> match lambda_walk(env, outer, l.params, l.captures, l.body, params) {
         Err(reason) -> Err(reason),
-        Ok(w) -> if w.calls > 0 { Err("a call back inside an iteration") }
+        Ok(w) -> if w.calls > 0 { Err("a recursive call inside an iteration") }
         else { Ok({ space: w.space, holders: sharing_of(w), number: w.is_number }) },
       },
       CodeVar(f) -> {
         let k = f.slot;
         match slot_at(outer, k).fun {
           Some(p) -> Ok({ space: p, holders: Shared, number: false }),
-          None -> Err("a callback whose space is not read"),
+          None -> Err("a callback whose space is unknown"),
         }
       },
       NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
         let name = String::of_bytes_lossy(fname);
         if ctor(env.context, name) != None {
           Ok({ space: constant(), holders: OnlyPartsShared, number: false })
-        } else if name == env.definition { Err("a call back inside an iteration") } else {
+        } else if name == env.definition { Err("a recursive call inside an iteration") } else {
           match env.known.get(name) {
-            None -> Err("a callback the bound does not read"),
+            None -> Err("a callback, which the `space` bound leaves out"),
             Some(k) -> match k.any_arguments {
               Err(reason) -> Err(reason),
               Ok(s) -> match at_args(
@@ -1673,7 +1673,7 @@ fn callback(
           }
         }
       },
-      _ -> Err("a callback the bound does not read"),
+      _ -> Err("a callback, which the `space` bound leaves out"),
     },
   }
 
@@ -1686,12 +1686,12 @@ fn shown(src: Bytes, definition: String) -> Result<Bool, String> / {abort.raise}
 /// The space of `name` in `context` against its first `space` clause.
 fn within_clause(context: Context, name: String) -> Result<Bool, String> / {abort.raise} =
   match context.claims.definitions.get(name) {
-    None -> panic("a definition of the fixture"),
+    None -> panic("the fixture has no definition with that name"),
     Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == SpaceClause) {
       [c, ..] -> {
         let b = c.clause.code;
         match space_clause_bound(b, d.params, d.space_parameters) {
-          None -> Err("the bound is not read"),
+          None -> Err("the `space` clause is not in a form the analysis can use"),
           Some(bind_pattern) -> match space_bound(context, name) {
             Err(reason) -> Err(reason),
             Ok(p) -> Ok(dominated_space(p, bind_pattern)),
@@ -1719,7 +1719,7 @@ test "a fold that makes nothing holds no space, and a map holds a list as long a
 
 test "a recursion that hands its function parameter on changed holds what no space name bounds" {
   let f = b"fn copier(y: Int) -> Int = [y, y, y].len()\nfn f(xs: List<Int>, i: Int, g: (Int) -> Int space s, acc: Int) -> Int space xs.len() * s = if i >= xs.len() { acc } else { f(xs, i + 1, copier, acc + g(i)) }\n";
-  assert_eq(shown(f, "f"), Err("`m.f` hands on a parameter its space grows with, changed"));
+  assert_eq(shown(f, "f"), Err("`m.f` changes a parameter when it calls itself, and its space grows with, changed"));
   assert(
     shown(f.concat(b"fn h(xs: List<Int>) -> Int space 0 = f(xs, 0, |y: Int| y + 1, 0)\n"), "h")
       != Ok(true),
@@ -1747,7 +1747,7 @@ test "a function parameter's space name stands for what each call of it holds" {
       b"fn each(xs: List<Int>, g: (Int) -> List<Int>) -> List<List<Int>> space xs.len() = xs.map(g)",
       "each",
     ),
-    Err("a callback whose space is not read"),
+    Err("a callback whose space is unknown"),
   );
   // At a call the name stands for what the function given holds.
   let walk = b"fn walk(xs: List<Int>, i: Int, g: (Int) -> List<Int> space s, acc: List<List<Int>>) -> List<List<Int>> = if i >= xs.len() { acc } else { walk(xs, i + 1, g, acc.push(g(i))) }\n";
@@ -1805,7 +1805,7 @@ test "a tail call back that builds what its match let go of holds nothing more" 
       "twice",
     ),
     Err(
-      "`m.twice` does not call itself on a part of one list parameter, or on an index moved toward a limit it holds it short of, every time",
+      "`m.twice` does not always call itself with the tail of one list parameter, or with an index that moves toward a fixed limit",
     ),
   );
   // A subject read again after its match is not let go.
@@ -1817,7 +1817,7 @@ test "a tail call back that builds what its match let go of holds nothing more" 
       "kept",
     ),
     Err(
-      "`m.kept` does not call itself on a part of one list parameter, or on an index moved toward a limit it holds it short of, every time",
+      "`m.kept` does not always call itself with the tail of one list parameter, or with an index that moves toward a fixed limit",
     ),
   )
 }
@@ -1917,7 +1917,7 @@ test "another package's definition holds what its `space` bound says, for argume
   assert_eq(
     space_bound(context, "app.g"),
     Err(
-      "`base.ones` is handed a value something else owns, and its `space` bound is for arguments owned alone",
+      "`base.ones` may be called with arguments shared with other values, and its `space` bound assumes arguments that are not shared",
     ),
   )
 }
