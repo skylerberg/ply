@@ -225,7 +225,7 @@ pub struct PlyOp {
     pub effect: i64,
     pub op: i64,
     /// What the operation returns.
-    pub result: *const PlyType,
+    pub answer: *const PlyType,
     /// Which parameters are the operation's own type parameter, bit `i` for parameter `i`: those
     /// the runtime keeps as [`Carried`] values rather than reading.
     pub own: u64,
@@ -250,7 +250,7 @@ impl PlyOp {
     }
 
     pub fn result(&self) -> &'static PlyType {
-        unsafe { &*self.result }
+        unsafe { &*self.answer }
     }
 
     /// Whether parameter `i` is the operation's own type parameter.

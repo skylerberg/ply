@@ -99,7 +99,7 @@ fn op(params: &'static Params) -> PlyOp {
     PlyOp {
         effect: 0,
         op: 1,
-        result: &raw const TEXT_T,
+        answer: &raw const TEXT_T,
         own: 0,
         params_len: 1,
         params: params.0.as_ptr(),

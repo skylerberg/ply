@@ -90,7 +90,7 @@ unsafe fn holding_a_box(ctx: *mut Ctx, marker: Word, call: impl FnOnce() -> Word
 static FLIP_OP: PlyOp = PlyOp {
     effect: AMB,
     op: FLIP,
-    result: std::ptr::null(),
+    answer: std::ptr::null(),
     own: 0,
     params_len: 0,
     params: std::ptr::null(),
