@@ -1646,7 +1646,7 @@ type ConnectionState = {
   resets: Int,
   settings: Int,
   pings: Int,
-  empty: Int,
+  empty_frames: Int,
   /// The last stream named in a final `GOAWAY` sent and in one received, or -1.
   goaway_sent: Int,
   goaway_received: Int,
@@ -1737,7 +1737,7 @@ fn new_connection(role: Role, limits: Limits, now: Instant) -> Connection / {abo
     resets: 0,
     settings: 0,
     pings: 0,
-    empty: 0,
+    empty_frames: 0,
     goaway_sent: -1,
     goaway_received: -1,
     draining: -1,
@@ -1797,17 +1797,17 @@ fn rate_text(n: Int, l: Limits) -> String =
 /// The connection with its counts reset where their window has passed.
 fn roll_window(k: ConnectionState, t: Int) -> ConnectionState =
   if t - k.window_start >= k.limits.window_ms {
-    { ..k, window_start: t, resets: 0, settings: 0, pings: 0, empty: 0 }
+    { ..k, window_start: t, resets: 0, settings: 0, pings: 0, empty_frames: 0 }
   } else { k }
 
 fn count_empty_frame(k: ConnectionState, t: Int) -> ConnectionState / {http2.violated} = {
   let r = roll_window(k, t);
-  if r.empty >= r.limits.max_empty_frames {
+  if r.empty_frames >= r.limits.max_empty_frames {
     enhance_your_calm(
       "more than " ++ rate_text(r.limits.max_empty_frames, r.limits)
         ++ " of frames that carry nothing",
     )
-  } else { { ..r, empty: r.empty + 1 } }
+  } else { { ..r, empty_frames: r.empty_frames + 1 } }
 }
 
 /// Whether the peer opens a stream of this number: clients open the odd ones.
@@ -2576,8 +2576,8 @@ type CollectedHeaders = {
   regular: Bool,
   headers: Headers,
   cookies: List<String>,
-  length: Option<Int>,
-  wrong: Option<String>,
+  content_length: Option<Int>,
+  malformed_reason: Option<String>,
 }
 
 /// A field name's octets after its colon, if any: lowercase, and a token's (RFC 9113 §8.2.1).
@@ -2619,14 +2619,15 @@ fn collect_headers(
       regular: false,
       headers: Map::new(),
       cookies: [],
-      length: None,
-      wrong: None,
+      content_length: None,
+      malformed_reason: None,
     },
     |g: CollectedHeaders, f: Field|
-      if g.wrong != None { g } else { field_gathered(g, f, allowed, trailing) },
+      if g.malformed_reason != None { g } else { field_gathered(g, f, allowed, trailing) },
   )
 
-fn wrong(g: CollectedHeaders, reason: String) -> CollectedHeaders = { ..g, wrong: Some(reason) }
+fn wrong(g: CollectedHeaders, reason: String) -> CollectedHeaders =
+  { ..g, malformed_reason: Some(reason) }
 
 fn field_gathered(
   g: CollectedHeaders,
@@ -2660,9 +2661,9 @@ fn regular_gathered(
   else if name == "content-length" {
     match Bytes::of_string(value).int_of_ascii() {
       None -> wrong(g, "a `content-length` that is not a number"),
-      Some(n) -> if g.length != None && g.length != Some(n) {
+      Some(n) -> if g.content_length != None && g.content_length != Some(n) {
         wrong(g, "two `content-length` fields that differ")
-      } else { { ..g, length: Some(n), headers: field_added(g.headers, name, value) } },
+      } else { { ..g, content_length: Some(n), headers: field_added(g.headers, name, value) } },
     }
   } else { { ..g, headers: field_added(g.headers, name, value) } }
 
@@ -2676,7 +2677,7 @@ fn with_cookies(g: CollectedHeaders) -> Headers =
 
 fn request_of(fields: List<Field>) -> Head / {abort.raise} = {
   let g = collect_headers(fields, [b":method", b":scheme", b":authority", b":path"], false);
-  match g.wrong {
+  match g.malformed_reason {
     Some(reason) -> Malformed(reason),
     None -> match g.pseudo.get(b":method") {
       None -> Malformed("no `:method`"),
@@ -2725,7 +2726,7 @@ fn request_head(
         trailers: Map::new(),
         body: b"",
       },
-      g.length,
+      g.content_length,
     )
   }
 }
@@ -2734,14 +2735,14 @@ type ResponseHead = { status: Int, headers: Headers, expected: Option<Int> }
 
 fn response_of(fields: List<Field>) -> Result<ResponseHead, String> / {abort.raise} = {
   let g = collect_headers(fields, [b":status"], false);
-  match g.wrong {
+  match g.malformed_reason {
     Some(reason) -> Err(reason),
     None -> match g.pseudo.get(b":status") {
       None -> Err("no `:status`"),
       Some(s) -> match s.int_of_ascii() {
         Some(n) -> if s.len() != 3 || n < 100 { Err("a `:status` that is not three digits") }
         else if n == 101 { Err("a 101, which HTTP/2 does not use") }
-        else { Ok({ status: n, headers: with_cookies(g), expected: g.length }) },
+        else { Ok({ status: n, headers: with_cookies(g), expected: g.content_length }) },
         None -> Err("a `:status` that is not three digits"),
       },
     },
@@ -2750,7 +2751,7 @@ fn response_of(fields: List<Field>) -> Result<ResponseHead, String> / {abort.rai
 
 fn trailers_of(fields: List<Field>) -> Result<Headers, String> / {abort.raise} = {
   let g = collect_headers(fields, [], true);
-  match g.wrong { Some(reason) -> Err(reason), None -> Ok(with_cookies(g)) }
+  match g.malformed_reason { Some(reason) -> Err(reason), None -> Ok(with_cookies(g)) }
 }
 
 /// The fields a message's header map is sent as. A field the protocol computes or the connection
@@ -2874,7 +2875,7 @@ fn send_response(
     else { store_stream({ ..headed, buffered: headed.buffered + body.len() }, queued) }
   }
 
-type PumpRound = { k: ConnectionState, moved: Bool }
+type PumpRound = { connection: ConnectionState, sent_data: Bool }
 
 /// Sends `DATA` for every stream with data to send, one frame for each in turn, starting after the
 /// stream the last round ended at, until no window allows more.
@@ -2882,7 +2883,7 @@ fn send_pending_data(k: ConnectionState, t: Int) -> ConnectionState / {abort.rai
   if k.over { k } else {
     let done = iterate(k, k.buffered + k.streams.len() + 2, |p: ConnectionState| {
       let r = one_round(p, t);
-      if r.moved && !r.k.over { Continue(r.k) } else { Stop(r.k) }
+      if r.sent_data && !r.connection.over { Continue(r.connection) } else { Stop(r.connection) }
     });
     mark_stalls(done, t)
   }
@@ -2891,15 +2892,15 @@ fn one_round(k: ConnectionState, t: Int) -> PumpRound / {abort.raise} = {
   let ids = k.streams.keys().filter(|s: Int|
     match k.streams.get(s) { Some(st) -> st.sending, None -> false });
   let ordered = ids.filter(|s: Int| s > k.turn).concat(ids.filter(|s: Int| s <= k.turn));
-  ordered.fold({ k: k, moved: false }, |p: PumpRound, s: Int|
-    match p.k.streams.get(s) {
-      Some(st) -> if st.sending && !p.k.over { stream_step(p, st, t) } else { p },
+  ordered.fold({ connection: k, sent_data: false }, |p: PumpRound, s: Int|
+    match p.connection.streams.get(s) {
+      Some(st) -> if st.sending && !p.connection.over { stream_step(p, st, t) } else { p },
       None -> p,
     })
 }
 
 fn stream_step(p: PumpRound, st: Stream, t: Int) -> PumpRound / {abort.raise} = {
-  let k = p.k;
+  let k = p.connection;
   let left = st.out.len() - st.sent;
   if left <= 0 && st.more { p } else if left > 0 {
     let n = min(min(left, st.send_window), min(k.send_window, k.peer_frame));
@@ -2916,19 +2917,19 @@ fn stream_step(p: PumpRound, st: Stream, t: Int) -> PumpRound / {abort.raise} = 
       );
       let moved = { ..st, sent: st.sent + n, send_window: st.send_window - n, stalled: -1 };
       {
-        k: if last { sending_finished(sent, moved, t) } else { store_stream(sent, moved) },
-        moved: true,
+        connection: if last { sending_finished(sent, moved, t) } else { store_stream(sent, moved) },
+        sent_data: true,
       }
     }
   } else if st.trailers_out != [] {
     let sent = emit_headers({ ..k, turn: st.id }, st.id, st.trailers_out, true);
-    { k: sending_finished(sent, { ..st, trailers_out: [] }, t), moved: true }
+    { connection: sending_finished(sent, { ..st, trailers_out: [] }, t), sent_data: true }
   } else {
     let sent = emit_frame(
       { ..k, turn: st.id },
       DataFrame({ stream: st.id, data: b"", end_stream: true, padding: None }),
     );
-    { k: sending_finished(sent, st, t), moved: true }
+    { connection: sending_finished(sent, st, t), sent_data: true }
   }
 }
 
@@ -3433,7 +3434,7 @@ type Example = {
   section: String,
   wire: String,
   fields: List<{ name: String, value: String }>,
-  table: Int,
+  table_size: Int,
 }
 
 type Scenario = { name: String, capacity: Int, examples: List<Example> }
@@ -3450,7 +3451,7 @@ fn stories() -> List<Scenario> =
           section: "C.2.1",
           wire: "400a637573746f6d2d6b65790d637573746f6d2d686561646572",
           fields: [{ name: "custom-key", value: "custom-header" }],
-          table: 55,
+          table_size: 55,
         },
       ],
     },
@@ -3462,7 +3463,7 @@ fn stories() -> List<Scenario> =
           section: "C.2.2",
           wire: "040c2f73616d706c652f70617468",
           fields: [{ name: ":path", value: "/sample/path" }],
-          table: 0,
+          table_size: 0,
         },
       ],
     },
@@ -3474,7 +3475,7 @@ fn stories() -> List<Scenario> =
           section: "C.2.3",
           wire: "100870617373776f726406736563726574",
           fields: [{ name: "password", value: "secret" }],
-          table: 0,
+          table_size: 0,
         },
       ],
     },
@@ -3482,7 +3483,12 @@ fn stories() -> List<Scenario> =
       name: "C.2.4",
       capacity: 4096,
       examples: [
-        { section: "C.2.4", wire: "82", fields: [{ name: ":method", value: "GET" }], table: 0 },
+        {
+          section: "C.2.4",
+          wire: "82",
+          fields: [{ name: ":method", value: "GET" }],
+          table_size: 0,
+        },
       ],
     },
     {
@@ -3498,7 +3504,7 @@ fn stories() -> List<Scenario> =
             { name: ":path", value: "/" },
             { name: ":authority", value: "www.example.com" },
           ],
-          table: 57,
+          table_size: 57,
         },
         {
           section: "C.3.2",
@@ -3510,7 +3516,7 @@ fn stories() -> List<Scenario> =
             { name: ":authority", value: "www.example.com" },
             { name: "cache-control", value: "no-cache" },
           ],
-          table: 110,
+          table_size: 110,
         },
         {
           section: "C.3.3",
@@ -3522,7 +3528,7 @@ fn stories() -> List<Scenario> =
             { name: ":authority", value: "www.example.com" },
             { name: "custom-key", value: "custom-value" },
           ],
-          table: 164,
+          table_size: 164,
         },
       ],
     },
@@ -3539,7 +3545,7 @@ fn stories() -> List<Scenario> =
             { name: ":path", value: "/" },
             { name: ":authority", value: "www.example.com" },
           ],
-          table: 57,
+          table_size: 57,
         },
         {
           section: "C.4.2",
@@ -3551,7 +3557,7 @@ fn stories() -> List<Scenario> =
             { name: ":authority", value: "www.example.com" },
             { name: "cache-control", value: "no-cache" },
           ],
-          table: 110,
+          table_size: 110,
         },
         {
           section: "C.4.3",
@@ -3563,7 +3569,7 @@ fn stories() -> List<Scenario> =
             { name: ":authority", value: "www.example.com" },
             { name: "custom-key", value: "custom-value" },
           ],
-          table: 164,
+          table_size: 164,
         },
       ],
     },
@@ -3580,7 +3586,7 @@ fn stories() -> List<Scenario> =
             { name: "date", value: "Mon, 21 Oct 2013 20:13:21 GMT" },
             { name: "location", value: "https://www.example.com" },
           ],
-          table: 222,
+          table_size: 222,
         },
         {
           section: "C.5.2",
@@ -3591,7 +3597,7 @@ fn stories() -> List<Scenario> =
             { name: "date", value: "Mon, 21 Oct 2013 20:13:21 GMT" },
             { name: "location", value: "https://www.example.com" },
           ],
-          table: 222,
+          table_size: 222,
         },
         {
           section: "C.5.3",
@@ -3607,7 +3613,7 @@ fn stories() -> List<Scenario> =
               value: "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1",
             },
           ],
-          table: 215,
+          table_size: 215,
         },
       ],
     },
@@ -3624,7 +3630,7 @@ fn stories() -> List<Scenario> =
             { name: "date", value: "Mon, 21 Oct 2013 20:13:21 GMT" },
             { name: "location", value: "https://www.example.com" },
           ],
-          table: 222,
+          table_size: 222,
         },
         {
           section: "C.6.2",
@@ -3635,7 +3641,7 @@ fn stories() -> List<Scenario> =
             { name: "date", value: "Mon, 21 Oct 2013 20:13:21 GMT" },
             { name: "location", value: "https://www.example.com" },
           ],
-          table: 222,
+          table_size: 222,
         },
         {
           section: "C.6.3",
@@ -3651,7 +3657,7 @@ fn stories() -> List<Scenario> =
               value: "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1",
             },
           ],
-          table: 215,
+          table_size: 215,
         },
       ],
     },
@@ -3665,7 +3671,7 @@ test "RFC 7541's example {s.name} decodes block by block to its fields and its t
       got.fields.map(text_field),
       e.fields.map(|f: { name: String, value: String }| f.name ++ ": " ++ f.value),
     );
-    assert_eq(got.decoder.table.size, e.table);
+    assert_eq(got.decoder.table.size, e.table_size);
     got.decoder
   });
   ()
@@ -4788,7 +4794,7 @@ test "a drain whose PING never returns names the last stream after drain_ms" {
 type ConnectedPair = {
   client: Connection,
   server: Connection,
-  up: Bytes,
+  to_server: Bytes,
   to_client: Bytes,
   events: List<Event>,
   step: Int,
@@ -4798,7 +4804,7 @@ fn connected_pair(l: Limits) -> ConnectedPair / {abort.raise} =
   {
     client: client(l, at(0)),
     server: server(l, at(0)),
-    up: b"",
+    to_server: b"",
     to_client: b"",
     events: [],
     step: 0,
@@ -4828,10 +4834,10 @@ fn carried(
   iterate(e, budget + 1, |x: ConnectedPair| {
     let c = take_output(x.client);
     let s = take_output(x.server);
-    let up = x.up.concat(c.bytes);
+    let up = x.to_server.concat(c.bytes);
     let down = x.to_client.concat(s.bytes);
     if (up.len() == 0 && down.len() == 0) || x.step >= budget {
-      Stop({ ..x, client: c.connection, server: s.connection, up: up, to_client: down })
+      Stop({ ..x, client: c.connection, server: s.connection, to_server: up, to_client: down })
     } else {
       let n = piece(cuts, x.step, up.len());
       let heard = receive(s.connection, up.slice(0, n), at(x.step + 1));
@@ -4840,7 +4846,7 @@ fn carried(
       Continue({
         client: back.connection,
         server: returned_all(heard.connection, heard.events, app, x.step + 1),
-        up: up.slice(n, up.len()),
+        to_server: up.slice(n, up.len()),
         to_client: down.slice(m, down.len()),
         events: x.events.concat(back.events),
         step: x.step + 1,
@@ -4949,7 +4955,12 @@ fn response_of_size(r: Request) -> Response / {abort.raise} =
 fn non_negative(n: Int, below: Int) -> Int / {abort.raise} =
   if n < 0 { 0 - n % below } else { n % below }
 
-type Ledger = { connection: Connection, sent: Map<Int, Int>, granted: Map<Int, Int>, held: Bool }
+type Ledger = {
+  connection: Connection,
+  sent: Map<Int, Int>,
+  granted: Map<Int, Int>,
+  within_window: Bool,
+}
 
 fn tallied(l: Ledger, bytes: Bytes, window: Int) -> Ledger / {abort.raise} =
   frames_in(bytes).fold(l, |x: Ledger, f: Frame|
@@ -4962,7 +4973,8 @@ fn tallied(l: Ledger, bytes: Bytes, window: Int) -> Ledger / {abort.raise} =
         {
           ..x,
           sent: sent,
-          held: x.held && at_least(sent.get(d.stream)) <= window + at_least(x.granted.get(d.stream))
+          within_window: x.within_window
+            && at_least(sent.get(d.stream)) <= window + at_least(x.granted.get(d.stream))
             && at_least(sent.get(0)) <= default_window() + at_least(x.granted.get(0)),
         }
       },
@@ -4986,7 +4998,7 @@ test "a server sends no more DATA than its client's windows allow, however they 
       let first = receive(start.connection, opening([InitialWindowSize(w)]).concat(gets), at(1));
       let out = take_output(returned_all(first.connection, first.events, response_of_size, 1));
       let opened_ledger = tallied(
-        { connection: out.connection, sent: Map::new(), granted: Map::new(), held: true },
+        { connection: out.connection, sent: Map::new(), granted: Map::new(), within_window: true },
         out.bytes,
         w,
       );
@@ -5009,7 +5021,7 @@ test "a server sends no more DATA than its client's windows allow, however they 
           w,
         )
       });
-      end.held
+      end.within_window
     },
   )
 }

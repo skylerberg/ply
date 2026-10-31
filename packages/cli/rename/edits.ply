@@ -7,14 +7,15 @@ import compiler.check.resolve.tables (Declarations, Declaration, Namespace, Valu
                                       bindings_in, qualify, module_of_name)
 import compiler.check.resolve.bindings (written, Reference, Member, Local, Definition, Operation,
                                         ModuleQualifier, Unbound, FieldName, CalledName,
-                                        ArgumentName)
-import compiler.check.member (CallsFunction)
+                                        ArgumentName, FieldOf, RecordAt, RecordFields, TypeNamed)
+import compiler.check.member (MemberTarget, CallsFunction)
 import compiler.syntax.lexer (lex, Token, Comment, Identifier)
 import compiler.syntax.items (Module, ImportDeclaration, ModuleAlias, member_of, member_name)
 import compiler.syntax.parsing (is_synthetic_site)
-import rename.lines (Moved, OperationLine, Renames, field_name, joined, renamed, shown)
+import rename.lines (Moved, MemberLine, Renames, field_name, joined, renamed, shown)
 import rename.strings (line_at)
-import rename.programs (Entry, Library, Loaded, Read, DefinitionKey, root_relative, key_of,
+import rename.programs (Entry, Library, Loaded, Read, DefinitionKey, Record, PlainRecord,
+                        NewRecordType, DeclaredRecord, plain_record, root_relative, key_of,
                         module_path, name_in, package_of)
 
 type Applying = { at: Int, parts: List<Bytes> }
@@ -32,18 +33,18 @@ type Spaces = {
   values: Map<DefinitionKey, Bytes>,
   types: Map<DefinitionKey, Bytes>,
   effects: Map<DefinitionKey, Bytes>,
-  sets: Map<DefinitionKey, Bytes>,
+  effect_sets: Map<DefinitionKey, Bytes>,
 }
 
 fn no_spaces() -> Spaces =
-  { values: Map::new(), types: Map::new(), effects: Map::new(), sets: Map::new() }
+  { values: Map::new(), types: Map::new(), effects: Map::new(), effect_sets: Map::new() }
 
 fn names_in_namespace(s: Spaces, namespace: Namespace) -> Map<DefinitionKey, Bytes> =
   match namespace {
     ValueSpace -> s.values,
     TypeSpace -> s.types,
     EffectSpace -> s.effects,
-    SetSpace -> s.sets,
+    SetSpace -> s.effect_sets,
   }
 
 fn with_entry(s: Spaces, namespace: Namespace, key: DefinitionKey, value: Bytes) -> Spaces =
@@ -51,16 +52,20 @@ fn with_entry(s: Spaces, namespace: Namespace, key: DefinitionKey, value: Bytes)
     ValueSpace -> { ..s, values: s.values.insert(key, value) },
     TypeSpace -> { ..s, types: s.types.insert(key, value) },
     EffectSpace -> { ..s, effects: s.effects.insert(key, value) },
-    SetSpace -> { ..s, sets: s.sets.insert(key, value) },
+    SetSpace -> { ..s, effect_sets: s.effect_sets.insert(key, value) },
   }
 
-pub type ModuleMove = { to: RootedPath, before: List<Bytes>, after: List<Bytes> }
+pub type ModuleMove = { to: RootedPath, before: List<Bytes>, new_parts: List<Bytes> }
+
+pub type RecordRenames = { path: String, declared: DeclaredRecord, renamed: Map<Bytes, Bytes> }
 
 pub type Renaming = {
   pwd: String,
   renames: Renames,
   definitions: Spaces,
   operations: Map<DefinitionKey, Map<Bytes, Bytes>>,
+  records: Map<Record, RecordRenames>,
+  declared_records: Map<Bytes, Record>,
   modules: Map<String, ModuleMove>,
   declared: Map<DefinitionKey, String>,
   rejections: List<Failure>,
@@ -128,9 +133,9 @@ fn with_operations(rn: Renaming, r: Read, declarations: Declarations) -> Renamin
       Some(declared) -> {
         let effect_key = { file: absolute(rn.pwd, r.file.at), name: declared.name };
         e.operations.fold(acc, |into: Renaming, op: Bytes| {
-          let new = match rn.renames.operations.find(|o: OperationLine|
-              o.file == path && o.effect_name == e.name && o.op == op) {
-            Some(o) -> o.new,
+          let new = match rn.renames.members.find(|m: MemberLine|
+              m.file == path && m.of == e.name && m.member == op) {
+            Some(m) -> m.new,
             None -> renamed(rn.renames, op),
           };
           if new == op { into } else {
@@ -144,6 +149,45 @@ fn with_operations(rn: Renaming, r: Read, declarations: Declarations) -> Renamin
           }
         })
       },
+    })
+}
+
+fn with_record_fields(rn: Renaming, r: Read) -> Renaming / {abort.raise} = {
+  let path = displayed(r.file.at);
+  rn.renames.members.fold(rn, |acc: Renaming, m: MemberLine|
+    if m.file != path { acc } else {
+      match r.records.find(|d: DeclaredRecord| d.name == m.of && d.fields.contains(m.member)) {
+        None -> acc,
+        Some(d) -> {
+          let before = acc.records.get(d.record).unwrap_or({
+            path: path,
+            declared: d,
+            renamed: Map::new(),
+          });
+          match before.renamed.get(m.member) {
+            Some(other) -> if other == m.new { acc } else {
+              {
+                ..acc,
+                rejections: acc.rejections.push({
+                  path: path,
+                  reason: shown(m.of) ++ " has the same fields as " ++ shown(before.declared.name)
+                    ++ ", so its field "
+                    ++ shown(m.member)
+                    ++ " cannot have two new names",
+                }),
+              }
+            },
+            None ->
+              {
+                ..acc,
+                records: acc.records.insert(d.record, {
+                  ..before,
+                  renamed: before.renamed.insert(m.member, m.new),
+                }),
+              },
+          }
+        },
+      }
     })
 }
 
@@ -178,7 +222,7 @@ fn with_move(rn: Renaming, r: Read, package: RootedPath) -> Renaming / {abort.ra
       modules: rn.modules.insert(absolute(rn.pwd, at), {
         to: child(package, String::join(new, "/") ++ ".ply"),
         before: parts.map(Bytes::of_string),
-        after: new.map(Bytes::of_string),
+        new_parts: new.map(Bytes::of_string),
       }),
     }
   }
@@ -194,7 +238,7 @@ pub fn moved_name(name: Bytes, move: Option<ModuleMove>) -> Bytes / {abort.raise
       let named = name.split(b".");
       let kept = named.len() - m.before.len();
       if kept < 0 || named.drop(kept) != m.before { name }
-      else { joined(named.take(kept).concat(m.after), b".") }
+      else { joined(named.take(kept).concat(m.new_parts), b".") }
     },
   }
 
@@ -234,6 +278,11 @@ pub fn renaming_of(
       renames: renames,
       definitions: no_spaces(),
       operations: Map::new(),
+      records: Map::new(),
+      declared_records: loads.fold(Map::new(), |acc: Map<Bytes, Record>, l: Loaded|
+        l.reads.concat(l.unrenamed).fold(acc, |into: Map<Bytes, Record>, r: Read|
+          r.records.fold(into, |m: Map<Bytes, Record>, d: DeclaredRecord|
+            m.insert(qualify(r.name, d.name), d.record)))),
       modules: Map::new(),
       declared: Map::new(),
       rejections: [],
@@ -241,7 +290,10 @@ pub fn renaming_of(
     |acc: Renaming, l: Loaded|
       l.reads.fold(acc, |rn: Renaming, r: Read| {
         let declarations = l.declarations.get(r.index);
-        let named = with_operations(with_definitions(rn, r, declarations), r, declarations);
+        let named = with_record_fields(
+          with_operations(with_definitions(rn, r, declarations), r, declarations),
+          r,
+        );
         match package_of(r.file.at, libraries) {
           Some(package) -> with_move(named, r, package),
           None -> named,
@@ -274,7 +326,7 @@ pub type Edit = { start: Int, end: Int, text: Bytes, names: List<Bytes> }
 pub type Edited = {
   edits: List<Edit>,
   renamed: Map<Bytes, List<Bytes>>,
-  kept: Map<Bytes, Bool>,
+  unchanged: Map<Bytes, Bool>,
   failures: List<Failure>,
 }
 
@@ -283,7 +335,7 @@ fn qualifier_new(rn: Renaming, l: Loaded, r: Read, text: Bytes, m: Int) -> Bytes
     None -> text,
     Some(move) -> if r.imports.any(|i: { declaration: ImportDeclaration, target: Int }|
         match i.declaration.kind { ModuleAlias(a) -> a.name == text, _ -> false }) { text }
-    else { move.after.at(move.after.len() - 1).unwrap_or(text) },
+    else { move.new_parts.at(move.new_parts.len() - 1).unwrap_or(text) },
   }
 
 fn definition_new(
@@ -358,10 +410,39 @@ fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abo
     Unbound -> x.name,
   }
 
+fn typed_record(r: Read, owner: Bytes, site: Int) -> Option<Record> / {abort.raise} =
+  r.typed_records.get(owner).and_then(|sites: Map<Int, Record>| sites.get(site))
+
+fn record_of(rn: Renaming, r: Read, owner: Bytes, of: FieldOf) -> Option<Record> / {abort.raise} =
+  match of {
+    RecordAt(site) -> typed_record(r, owner, site),
+    RecordFields(fields) -> Some(plain_record(fields)),
+    TypeNamed(name) -> rn.declared_records.get(name),
+  }
+
+fn field_new(rn: Renaming, record: Option<Record>, name: Bytes) -> Bytes / {abort.raise} =
+  match record.and_then(|x: Record| rn.records.get(x)).and_then(|x: RecordRenames|
+      x.renamed.get(name)) {
+    Some(new) -> new,
+    None -> field_name(rn.renames, name),
+  }
+
+fn record_unknown(rn: Renaming, r: Read, owner: Bytes, m: Member) -> Bool / {abort.raise} =
+  rn.records.values().any(|x: RecordRenames| x.renamed.contains(m.name))
+    && (match m.kind {
+      FieldName(of) -> record_of(rn, r, owner, of) == None,
+      CalledName(call) -> match r.calls.get(owner).and_then(|calls: Map<Int, MemberTarget>|
+          calls.get(call)) {
+        Some(CallsFunction(_)) -> false,
+        _ -> typed_record(r, owner, call) == None,
+      },
+      ArgumentName(_) -> false,
+    })
+
 fn member_new(rn: Renaming, l: Loaded, r: Read, owner: Bytes, m: Member) -> Bytes / {abort.raise} = {
   let calls = r.calls.get(owner).unwrap_or(Map::new());
   match m.kind {
-    FieldName -> field_name(rn.renames, m.name),
+    FieldName(of) -> field_new(rn, record_of(rn, r, owner, of), m.name),
     CalledName(call) -> match calls.get(call) {
       Some(CallsFunction(callee)) -> match key_of(l, callee).and_then(|k: DefinitionKey|
           rn.definitions.values.get(k)) {
@@ -371,7 +452,7 @@ fn member_new(rn: Renaming, l: Loaded, r: Read, owner: Bytes, m: Member) -> Byte
           None -> unqualified_name(n),
         },
       },
-      _ -> field_name(rn.renames, m.name),
+      _ -> field_new(rn, typed_record(r, owner, call), m.name),
     },
     ArgumentName(a) -> {
       let callee = match calls.get(a.call) {
@@ -400,7 +481,7 @@ fn noted_edit(
   name: Bytes,
   new: Bytes,
 ) -> Edited / {abort.raise} =
-  if new == name { { ..edited, kept: edited.kept.insert(name, true) } }
+  if new == name { { ..edited, unchanged: edited.unchanged.insert(name, true) } }
   else if text.slice(start, end) != name {
     {
       ..edited,
@@ -426,12 +507,12 @@ fn import_edits(rn: Renaming, l: Loaded, r: Read) -> List<Edit> / {abort.raise} 
         range(0, move.before.len()).fold(acc, |edits: List<Edit>, j: Int|
           match i.declaration.path.at(offset + j) {
             Some(part) -> if part.name != move.before.get(j)
-                || move.before.get(j) == move.after.get(j) { edits } else {
+                || move.before.get(j) == move.new_parts.get(j) { edits } else {
               edits.push({
                 start: part.span.start,
                 end: part.span.end,
-                text: move.after.get(j),
-                names: [move.after.get(j)],
+                text: move.new_parts.get(j),
+                names: [move.new_parts.get(j)],
               })
             },
             None -> edits,
@@ -446,7 +527,7 @@ pub fn uses_renamed(rn: Renaming, l: Loaded, r: Read) -> Bool / {abort.raise} =
       e.names.references.any(|x: Reference|
           match x.target {
             Local(_) -> false,
-            _ -> !is_synthetic_site(x.site) && reference_new(rn, l, r, x) != x.name,
+            _ -> !is_synthetic_site(x.identifier_id) && reference_new(rn, l, r, x) != x.name,
           })
         || e.names.members.any(|m: Member| member_new(rn, l, r, e.owner, m) != m.name))
 
@@ -454,20 +535,33 @@ pub fn edited_of(rn: Renaming, l: Loaded, r: Read) -> Edited / {abort.raise} = {
   let text = r.file.text;
   let path = displayed(r.file.at);
   r.entries.fold(
-    { edits: import_edits(rn, l, r), renamed: Map::new(), kept: Map::new(), failures: [] },
+    { edits: import_edits(rn, l, r), renamed: Map::new(), unchanged: Map::new(), failures: [] },
     |acc: Edited, e: Entry| {
       let fields = e.names.members.fold(Map::new(), |m: Map<Int, Bytes>, x: Member|
-        match x.kind { FieldName -> m.insert(x.start, member_new(rn, l, r, e.owner, x)), _ -> m });
+        match x.kind {
+          FieldName(_) -> m.insert(x.start, member_new(rn, l, r, e.owner, x)),
+          _ -> m,
+        });
+      let known = e.names.members.fold(acc, |done: Edited, x: Member|
+        if !record_unknown(rn, r, e.owner, x) { done } else {
+          {
+            ..done,
+            failures: done.failures.push({
+              path: path ++ ":" ++ line_at(text, x.start).to_string(),
+              reason: "cannot tell which record type has the field " ++ shown(x.name) ++ " here",
+            }),
+          }
+        });
       let shorthands = e.names.references.fold(Map::new(), |m: Map<Int, Bool>, x: Reference|
         if x.shorthand { m.insert(x.start, true) } else { m });
-      let referred = e.names.references.fold(acc, |done: Edited, x: Reference|
-        if is_synthetic_site(x.site) { done } else {
+      let referred = e.names.references.fold(known, |done: Edited, x: Reference|
+        if is_synthetic_site(x.identifier_id) { done } else {
           let new = reference_new(rn, l, r, x);
           let field = fields.get(x.start).unwrap_or(x.name);
           if x.shorthand && field != new {
             {
               ..done,
-              kept: done.kept.insert(x.name, true),
+              unchanged: done.unchanged.insert(x.name, true),
               edits: done.edits.push({
                 start: x.start,
                 end: x.end,
@@ -500,7 +594,7 @@ pub fn comment_edits(
         lexed.tokens.fold(edits, |done: List<Edit>, t: Token|
           match t.kind {
             Identifier(n) -> match edited.renamed.get(n) {
-              Some([new]) -> if edited.kept.contains(n) { done } else {
+              Some([new]) -> if edited.unchanged.contains(n) { done } else {
                 done.push({ start: from + t.start, end: from + t.end, text: new, names: [] })
               },
               _ -> done,
@@ -543,3 +637,61 @@ pub fn split_names(rn: Renaming, loads: List<Loaded>) -> List<SplitName> / {abor
         },
       )
     }))
+
+pub fn record_clashes(rn: Renaming, loads: List<Loaded>) -> List<Failure> / {abort.raise} = {
+  let plain = loads.fold(Map::new(), |acc: Map<Record, Bool>, l: Loaded|
+    l.reads.concat(l.unrenamed).fold(acc, |into: Map<Record, Bool>, r: Read| {
+      let typed = r.typed_records.values().fold(
+        into,
+        |m: Map<Record, Bool>, sites: Map<Int, Record>|
+          sites.values().fold(m, |found: Map<Record, Bool>, x: Record| found.insert(x, true)),
+      );
+      let declared = r.records.fold(typed, |m: Map<Record, Bool>, d: DeclaredRecord|
+        m.insert(d.record, true));
+      r.entries.fold(declared, |m: Map<Record, Bool>, e: Entry|
+        e.names.members.fold(m, |found: Map<Record, Bool>, x: Member|
+          match x.kind {
+            FieldName(RecordFields(fields)) -> found.insert(plain_record(fields), true),
+            _ -> found,
+          }))
+    }));
+  let unnamed = loads.fold([], |acc: List<Failure>, l: Loaded|
+    l.reads.fold(acc, |found: List<Failure>, r: Read| {
+      let path = displayed(r.file.at);
+      r.records.fold(found, |into: List<Failure>, d: DeclaredRecord|
+        match rn.records.get(d.record) {
+          None -> into,
+          Some(x) ->
+            x.renamed.fold(into, |missing: List<Failure>, field: Bytes, new: Bytes|
+              if rn.renames.members.any(|m: MemberLine|
+                  m.file == path && m.of == d.name && m.member == field && m.new == new) { missing }
+              else {
+                missing.push({
+                  path: path,
+                  reason: shown(d.name) ++ " has the same fields as " ++ shown(x.declared.name)
+                    ++ ", so it is the same record type: rename the field in both, with the line `"
+                    ++ path
+                    ++ " "
+                    ++ String::of_bytes_lossy(Bytes::concat_all([d.name, b".", field, b" ", new]))
+                    ++ "`",
+                })
+              }),
+        })
+    }));
+  rn.records.fold(unnamed, |acc: List<Failure>, record: Record, x: RecordRenames| {
+    let after = x.declared.fields.map(|f: Bytes| x.renamed.get(f).unwrap_or(f));
+    let named = |reason: String|
+      {
+        path: x.path,
+        reason: "renaming the fields of " ++ shown(x.declared.name) ++ " " ++ reason,
+      };
+    match after.find(|f: Bytes| after.filter(|g: Bytes| g == f).len() > 1) {
+      Some(twice) -> acc.push(named("gives it two fields named " ++ shown(twice))),
+      None -> match record {
+        PlainRecord(_) -> if !plain.contains(plain_record(after)) { acc }
+        else { acc.push(named("makes it the same type as another record with the same fields")) },
+        NewRecordType(_) -> acc,
+      },
+    }
+  })
+}

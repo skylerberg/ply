@@ -41,7 +41,7 @@ type Borrow = { param: Bytes, span: Span }
 
 type Escape = { borrowed: List<Borrow>, place: EscapeKind }
 
-type Findings = { escapes: List<Escape>, read: List<Bytes> }
+type Findings = { escapes: List<Escape>, read_parameters: List<Bytes> }
 
 type ValueSummary = { seen: Findings, borrowed: List<Borrow>, results: List<Bytes> }
 
@@ -77,7 +77,7 @@ pub fn escape_diagnostics(
     ).diagnostics
   }
 
-fn no_findings() -> Findings = { escapes: [], read: [] }
+fn no_findings() -> Findings = { escapes: [], read_parameters: [] }
 
 fn report_escape(
   module: Int,
@@ -191,7 +191,7 @@ fn union(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
   b.fold(a, |acc: List<Bytes>, p: Bytes| acc.push_unique(p))
 
 fn with_reads(seen: Findings, params: List<Bytes>) -> Findings =
-  { ..seen, read: union(seen.read, params) }
+  { ..seen, read_parameters: union(seen.read_parameters, params) }
 
 fn no_borrows(seen: Findings) -> ValueSummary = { seen: seen, borrowed: [], results: [] }
 
@@ -240,10 +240,10 @@ fn walk(s: Scope, seen: Findings, e: Walked) -> ValueSummary / {abort.raise} =
     WalkedBinary(b) -> no_borrows(walk_discarded(s, walk_discarded(s, seen, b.lhs), b.rhs)),
     WalkedUnary(u) -> no_borrows(walk_discarded(s, seen, u.operand)),
     WalkedLambda(l) -> {
-      let body = walk_escaping(s, { ..seen, read: [] }, l.body, Returned);
+      let body = walk_escaping(s, { ..seen, read_parameters: [] }, l.body, Returned);
       {
-        seen: with_reads({ ..body, read: seen.read }, body.read),
-        borrowed: body.read.map(|p: Bytes| { param: p, span: e.span }),
+        seen: with_reads({ ..body, read_parameters: seen.read_parameters }, body.read_parameters),
+        borrowed: body.read_parameters.map(|p: Bytes| { param: p, span: e.span }),
         results: [],
       }
     },
@@ -385,19 +385,20 @@ fn walk_handle(
 ) -> ValueSummary / {abort.raise} = {
   let inits = vars.fold(seen, |acc: Findings, v: WalkedHandlerVar|
     walk_escaping(s, acc, v.init, Stored));
-  let b = walk(s, { ..inits, read: [] }, body);
+  let b = walk(s, { ..inits, read_parameters: [] }, body);
   let returning = match ret {
     Some(r) -> bind_local(s, r.binder.span.site, local_of(b)),
     None -> s,
   };
   let caught = clauses.fold(
-    union(b.seen.read, match ret {
-      Some(r) -> walk(returning, no_findings(), r.body).seen.read,
+    union(b.seen.read_parameters, match ret {
+      Some(r) -> walk(returning, no_findings(), r.body).seen.read_parameters,
       None -> [],
     }),
-    |acc: List<Bytes>, c: WalkedClause| union(acc, walk(s, no_findings(), c.body).seen.read),
+    |acc: List<Bytes>, c: WalkedClause|
+      union(acc, walk(s, no_findings(), c.body).seen.read_parameters),
   );
-  let after = with_reads({ ..b.seen, read: inits.read }, caught);
+  let after = with_reads({ ..b.seen, read_parameters: inits.read_parameters }, caught);
   let returned: ValueSummary = match ret {
     Some(r) -> walk(returning, after, r.body),
     None -> { seen: after, borrowed: b.borrowed, results: b.results },
@@ -411,7 +412,7 @@ fn walk_handle(
     s.room,
   );
   clauses.fold(returned, |acc: ValueSummary, c: WalkedClause|
-    match c.resume {
+    match c.continuation {
       Some(k) -> merge(acc, walk(resumed(c, k, results), acc.seen, c.body)),
       None -> { ..acc, seen: walk_escaping(s, acc.seen, c.body, Returned) },
     })
@@ -425,7 +426,7 @@ fn handle_returns(
 ) -> List<Bytes> / {abort.raise} =
   if room <= 0 { known } else {
     let next = clauses.fold(known, |acc: List<Bytes>, c: WalkedClause|
-      match c.resume {
+      match c.continuation {
         Some(k) -> {
           let v = walk(resumed(c, k, known), no_findings(), c.body);
           union(acc, union(borrowed_parameters(v.borrowed), v.results))

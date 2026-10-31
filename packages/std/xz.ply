@@ -1329,10 +1329,10 @@ type Block = {
   state: Int,
   rep0: Int,
   rep1: Int,
-  r23: Int,
+  older_reps: Int,
   props: Int,
   begun: Bool,
-  sum: RunningCheck,
+  running_check: RunningCheck,
 }
 
 fn no_block() -> Block =
@@ -1348,10 +1348,10 @@ fn no_block() -> Block =
     state: 0,
     rep0: 0,
     rep1: 0,
-    r23: 0,
+    older_reps: 0,
     props: -1,
     begun: false,
-    sum: NoCheck,
+    running_check: NoCheck,
   }
 
 /// A reader's state apart from its two buffers: its position in the input and how much it has
@@ -1365,7 +1365,7 @@ type ReaderState = {
   at: Int,
   base: Int,
   sent: Int,
-  cut: Int,
+  dropped_bytes: Int,
   streams: Int,
   phase: Int,
   need: Int,
@@ -1389,7 +1389,7 @@ fn decoder(limits: Limits, input: Bytes) -> Decoder =
       at: 0,
       base: 0,
       sent: 0,
-      cut: 0,
+      dropped_bytes: 0,
       streams: 0,
       phase: 0,
       need: 0,
@@ -1470,7 +1470,7 @@ fn block_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
       let dict = filters(d.input, plain.next, end, (flags & 3) + 1, where);
       if d.input.scan(dict.next, b"\x00", end - dict.next) != end { fail(where, Header) }
       else if dict.value > core.limits.window || dict.value > 0x7FFF_FFFF { fail(where, Window) }
-      else if plain.value > core.limits.output - core.cut - d.history.len() {
+      else if plain.value > core.limits.output - core.dropped_bytes - d.history.len() {
         fail(where, OverLimit)
       } else {
         {
@@ -1488,8 +1488,8 @@ fn block_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
               dict: dict.value,
               floor: d.history.len(),
               from: where + head,
-              start: core.cut + d.history.len(),
-              sum: running_check(core.check),
+              start: core.dropped_bytes + d.history.len(),
+              running_check: running_check(core.check),
             },
           },
         }
@@ -1509,7 +1509,7 @@ fn plain_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
     let block = core.block;
     if have < 3 + size { needing_input(d, 3 + size) }
     else if control == 2 && !block.begun { fail(core.base + at, Chunk) }
-    else if size > core.limits.output - core.cut - d.history.len() {
+    else if size > core.limits.output - core.dropped_bytes - d.history.len() {
       fail(core.base + at, OverLimit)
     } else {
       let piece = d.input.slice(at + 3, at + 3 + size);
@@ -1526,7 +1526,7 @@ fn plain_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
             floor: floor,
             begun: true,
             props: if control == 1 { -1 } else { block.props },
-            sum: update_check(block.sum, piece),
+            running_check: update_check(block.running_check, piece),
           },
         },
       }
@@ -1558,8 +1558,9 @@ fn coded_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
     let block = core.block;
     if have < head + packed { needing_input(d, head + packed) }
     else if (mode < 3 && !block.begun) || (mode < 2 && block.props < 0) { fail(where, Chunk) }
-    else if plain > core.limits.output - core.cut - d.history.len() { fail(where, OverLimit) }
-    else if packed < 5 || d.input.at(at + head) != 0 { fail(where + head, Code) } else {
+    else if plain > core.limits.output - core.dropped_bytes - d.history.len() {
+      fail(where, OverLimit)
+    } else if packed < 5 || d.input.at(at + head) != 0 { fail(where + head, Code) } else {
       let props = if mode >= 2 { decode_properties(sizes.at(5), where) } else { block.props };
       let lc = props & 15;
       let lp = props >>> 4 & 15;
@@ -1580,7 +1581,7 @@ fn coded_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
         if fresh { 0 } else { block.state },
         if fresh { 0 } else { block.rep0 },
         if fresh { 0 } else { block.rep1 },
-        if fresh { 0 } else { block.r23 },
+        if fresh { 0 } else { block.older_reps },
         (1 << (props >>> 8)) - 1 | (1 << lp) - 1 << 4 | lc << 8 | (floor & 15) << 12
           | before + plain << 16,
         Array::of_list([floor, block.dict, where + head, packed]),
@@ -1604,8 +1605,11 @@ fn coded_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
               state: done.state,
               rep0: done.rep0,
               rep1: done.rep1,
-              r23: done.r23,
-              sum: update_check(block.sum, done.out.slice(before, done.out.len())),
+              older_reps: done.r23,
+              running_check: update_check(
+                block.running_check,
+                done.out.slice(before, done.out.len()),
+              ),
             },
           },
         }
@@ -1633,12 +1637,12 @@ fn block_end(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let packed = where - block.from;
   let pad = 4 - packed % 4 & 3;
   let size = check_size(core.check);
-  let plain = core.cut + d.history.len() - block.start;
+  let plain = core.dropped_bytes + d.history.len() - block.start;
   if have < pad + size { needing_input(d, pad + size) }
   else if d.input.scan(at, b"\x00", pad) != at + pad { fail(where, Header) }
   else if (block.packed >= 0 && block.packed != packed)
       || (block.plain >= 0 && block.plain != plain) { fail(where, Size) }
-  else if d.input.slice(at + pad, at + pad + size) != check_of(block.sum, core.check) {
+  else if d.input.slice(at + pad, at + pad + size) != check_of(block.running_check, core.check) {
     fail(where + pad, Checksum)
   } else {
     {
@@ -1785,7 +1789,7 @@ fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
         core: {
           ..core,
           sent: n - dead,
-          cut: core.cut + dead,
+          dropped_bytes: core.dropped_bytes + dead,
           block: { ..block, floor: block.floor - dead },
         },
       },
@@ -2089,6 +2093,6 @@ test "a file is read in a history its dictionary bounds, however long it is" {
     { d: decoder(large_limits(), b""), most: 0 },
     |at: { d: Decoder, most: Int }, chunk: Bytes| largest_history(feed(at.d, chunk), at.most, 1000),
   );
-  assert_eq(read.d.core.cut + read.d.history.len(), 340000);
+  assert_eq(read.d.core.dropped_bytes + read.d.history.len(), 340000);
   assert(read.most < 140000, Some(read.most.to_string()))
 }

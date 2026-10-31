@@ -1510,7 +1510,13 @@ fn check_archive<[r] | e>(
 
 /// An unpacking under way: its reader's position, the plan so far, how many members and
 /// operations came before, and the extraction.
-type UnpackState = { reading: ReaderState, plan: Plan, index: Int, operations: Int, x: Extraction }
+type UnpackState = {
+  reading: ReaderState,
+  plan: Plan,
+  index: Int,
+  operation_count: Int,
+  extraction: Extraction,
+}
 
 /// Reads a file member's data to its end and writes it through `opened`, when that is a descriptor.
 /// Returns the reader's state afterwards, and whether every write succeeded.
@@ -1552,25 +1558,35 @@ fn unpack_member<[l], [r] | e>(
   let p = plan_member(s.plan, s.index, h);
   let own = p.steps.len() - 1;
   enumerate(p.steps).fold(
-    { reading: r, plan: p, index: s.index + 1, operations: s.operations + p.steps.len(), x: s.x },
+    {
+      reading: r,
+      plan: p,
+      index: s.index + 1,
+      operation_count: s.operation_count + p.steps.len(),
+      extraction: s.extraction,
+    },
     |u: UnpackState, o: { index: Int, value: Operation }| {
-      let at = s.operations + o.index;
+      let at = s.operation_count + o.index;
       let modified = if o.index == own { Some(h.modified) } else { None };
       match o.value {
         WriteFile(path, mode, _) ->
           bracket(
-            || open_new_file[l](u.x, path),
+            || open_new_file[l](u.extraction, path),
             |opened: Result<Int, OperationOutcome>| close_new_file[l](opened),
             |opened: Result<Int, OperationOutcome>| {
               let poured = write_member_data[l](u.reading, source, limits, window, opened);
               let outcome = match opened {
                 Err(barring) -> barring,
-                Ok(_) -> finish_file[l](u.x, path, poured.written, mode, modified),
+                Ok(_) -> finish_file[l](u.extraction, path, poured.written, mode, modified),
               };
-              { ..u, reading: poured.reading, x: record_outcome(u.x, at, path, outcome) }
+              {
+                ..u,
+                reading: poured.reading,
+                extraction: record_outcome(u.extraction, at, path, outcome),
+              }
             },
           ),
-        other -> { ..u, x: apply_operation[l](u.x, at, other, modified) },
+        other -> { ..u, extraction: apply_operation[l](u.extraction, at, other, modified) },
       }
     },
   )
@@ -1587,14 +1603,14 @@ fn unpack_source<[l], [r] | e>(
       reading: initial_reader(),
       plan: empty_plan(),
       index: 0,
-      operations: 0,
-      x: begin_extraction[l](into),
+      operation_count: 0,
+      extraction: begin_extraction[l](into),
     },
     max_reads(limits, window),
     |s: UnpackState| {
       let next = read_next(s.reading, source, limits, window);
       match next.event {
-        Finished -> Stop(finish_extraction[l](s.x)),
+        Finished -> Stop(finish_extraction[l](s.extraction)),
         Began(h, _) -> Continue(unpack_member[l](s, next.reading, h, source, limits, window)),
         _ -> Continue({ ..s, reading: next.reading }),
       }
@@ -1738,7 +1754,7 @@ type PackState = {
   index: Int,
   bytes: Int,
   data: Int,
-  firsts: Map<Int, { device: Int, name: String }>,
+  first_names: Map<Int, { device: Int, name: String }>,
 }
 
 /// Writes into the sink the archive of what `paths` name beneath the directory `dir` under the root
@@ -1764,11 +1780,11 @@ pub fn pack<[l], [r] | e>(
   let found = gather_paths[l](top, paths);
   if found.len() > options.entries { unwritable(options.entries, TooMany) } else { () };
   let done = found.fold(
-    { index: 0, bytes: 0, data: 0, firsts: Map::new() },
+    { index: 0, bytes: 0, data: 0, first_names: Map::new() },
     |p: PackState, name: String, stat: fs::Stat| {
       let full = full_path(top, name);
       let first = if stat.kind != fs::File || stat.links < 2 { None } else {
-        match p.firsts.get(stat.id) {
+        match p.first_names.get(stat.id) {
           Some(named) -> if named.device == stat.device { Some(named.name) } else { None },
           None -> None,
         }
@@ -1783,8 +1799,8 @@ pub fn pack<[l], [r] | e>(
         index: p.index + 1,
         bytes: p.bytes + head.len() + padded(size),
         data: p.data + size,
-        firsts: if h.kind != File || stat.links < 2 { p.firsts }
-        else { p.firsts.insert(stat.id, { device: stat.device, name: name }) },
+        first_names: if h.kind != File || stat.links < 2 { p.first_names }
+        else { p.first_names.insert(stat.id, { device: stat.device, name: name }) },
       }
     },
   );

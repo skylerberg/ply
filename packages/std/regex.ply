@@ -226,7 +226,7 @@ type Node =
 
 /// What is being parsed: its code points, whether it is a pattern over bytes, and the most
 /// instructions it may compile to.
-type Source = { text: Array<Int>, bytes: Bool, limit: Int }
+type Source = { text: Array<Int>, matches_bytes: Bool, limit: Int }
 
 /// What one step of the parse read: the node, the instructions it will compile to, where the next
 /// character is, the flags in effect there, and the names of every group opened so far.
@@ -270,7 +270,7 @@ fn meta(c: Int) -> Meta =
 fn code_point_at(s: Source, at: Int) -> Int = match s.text.at(at) { Some(c) -> c, None -> -1 }
 
 /// The greatest code point a character of the subject can be.
-fn max_code_point(s: Source) -> Int = if s.bytes { 0xFF } else { 0x10FFFF }
+fn max_code_point(s: Source) -> Int = if s.matches_bytes { 0xFF } else { 0x10FFFF }
 
 fn ignores_case(flags: Int) -> Bool = flags & 1 != 0
 
@@ -494,7 +494,7 @@ fn class_with_flags(
   flags: Int,
   negated: Bool,
 ) -> List<Interval> / {abort.raise} = {
-  let cased = if ignores_case(flags) { canonical(folded(set, s.bytes)) } else { set };
+  let cased = if ignores_case(flags) { canonical(folded(set, s.matches_bytes)) } else { set };
   if negated { complement(cased, max_code_point(s)) } else { cased }
 }
 
@@ -512,7 +512,7 @@ fn property(
   let end = if braced { name_end(s.text, from) }
   else if is_letter(code_point_at(s, from)) { from + 1 }
   else { from };
-  if s.bytes || end == from || (braced && code_point_at(s, end) != b'}') {
+  if s.matches_bytes || end == from || (braced && code_point_at(s, end) != b'}') {
     fail(at, UnicodeProperty)
   } else {
     match named_property(name_text(s.text, from, end)) {
@@ -571,9 +571,9 @@ fn leaf(
 /// The instructions a node that takes one character, or none, compiles to.
 fn node_size(s: Source, node: Node) -> Int / {abort.raise} =
   match node {
-    Literal(c) -> if s.bytes { 1 } else { utf8_bytes(c).len() },
-    Class(set) -> if is_flat(set, s.bytes) { 1 }
-    else { class_fragment(set, s.bytes, false).insts.len() },
+    Literal(c) -> if s.matches_bytes { 1 } else { utf8_bytes(c).len() },
+    Class(set) -> if is_flat(set, s.matches_bytes) { 1 }
+    else { class_fragment(set, s.matches_bytes, false).insts.len() },
     Looking(_) -> 1,
     _ -> 0,
   }
@@ -685,9 +685,9 @@ fn any(s: Source, flags: Int) -> List<Interval> =
 /// The node for one literal character: the class of its case orbit if case is ignored and it has
 /// another case.
 fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.fail, abort.raise} =
-  if s.bytes && c > 0xFF { fail(at, NotAByte) }
+  if s.matches_bytes && c > 0xFF { fail(at, NotAByte) }
   else if !ignores_case(flags) { Literal(c) } else {
-    match canonical(folded([interval(c, c)], s.bytes)) {
+    match canonical(folded([interval(c, c)], s.matches_bytes)) {
       [only] if only.lo == only.hi -> Literal(c),
       orbit -> Class(orbit),
     }
@@ -833,7 +833,7 @@ fn escape_sequence(
       leaf(s, Class(canonical(named.items)), named.at, flags, groups)
     },
     b'k' -> fail(at, Backreference),
-    b'C' -> if s.bytes { leaf(s, Class([interval(0, 0xFF)]), at + 2, flags, groups) }
+    b'C' -> if s.matches_bytes { leaf(s, Class([interval(0, 0xFF)]), at + 2, flags, groups) }
     else { fail(at, HalfCharacter) },
     _ -> match perl_class(c, flags) {
       Some(set) -> leaf(s, Class(class_with_flags(s, set, 0, c < 97)), at + 2, flags, groups),
@@ -984,7 +984,7 @@ fn flag_group(
       b'm' -> 2,
       b's' -> 4,
       b'U' -> 8,
-      b'u' -> if s.bytes { 0 } else { 16 },
+      b'u' -> if s.matches_bytes { 0 } else { 16 },
       _ -> 0,
     };
     if bit != 0 {
@@ -1130,7 +1130,7 @@ fn class_range(
 fn class_code(s: Source, at: Int) -> { code: Int, at: Int } / {regex.fail} = {
   let one = if code_point_at(s, at) == b'\\' { escape_code(s, at) }
   else { { code: code_point_at(s, at), at: at + 1 } };
-  if s.bytes && one.code > 0xFF { fail(at, NotAByte) } else { one }
+  if s.matches_bytes && one.code > 0xFF { fail(at, NotAByte) } else { one }
 }
 
 // --- A tree as the pattern that parses to it -----------------------------------
@@ -1292,11 +1292,11 @@ fn utf8_sequence(lo: Int, hi: Int) -> List<Interval> = {
 /// cuts so far.
 type FragmentBuilder = { insts: List<Inst>, known: Map<List<List<Interval>>, Int>, cuts: List<Int> }
 
-type BuilderEntry = { building: FragmentBuilder, place: Int }
+type BuilderEntry = { building: FragmentBuilder, entry: Int }
 
 /// Runs that start with one range, and the place that consumes what follows it: `-1` if nothing
 /// follows.
-type Arm = { head: Interval, place: Int }
+type Arm = { first_interval: Interval, place: Int }
 
 /// Whether a class is one instruction: any class over bytes, and over text one within ASCII.
 fn is_flat(set: List<Interval>, bytes: Bool) -> Bool =
@@ -1387,7 +1387,7 @@ fn build_fragment(
   let seqs = if reversed { forward.map(|q: List<Interval>| q.reverse()).sort() } else { forward };
   if seqs.len() == 0 { { insts: [Fail], entry: 0, cuts: [] } } else {
     let made = branch({ insts: [], known: Map::new(), cuts: [] }, seqs, 4);
-    { insts: made.building.insts, entry: made.place, cuts: made.building.cuts }
+    { insts: made.building.insts, entry: made.entry, cuts: made.building.cuts }
   }
 }
 
@@ -1398,22 +1398,25 @@ fn branch(
   depth: Int,
 ) -> BuilderEntry / {abort.raise} =
   match b.known.get(seqs) {
-    Some(place) -> { building: b, place: place },
+    Some(place) -> { building: b, entry: place },
     None -> if depth <= 0 { panic("a character is at most four bytes") } else {
       let armed = group_by_head(seqs).fold(
         { building: b, arms: [] },
         |acc: { building: FragmentBuilder, arms: List<Arm> }, g: { head: Interval, tails: List<List<Interval>> }|
           if g.tails.len() == 0 {
-            { building: acc.building, arms: acc.arms.push({ head: g.head, place: -1 }) }
+            { building: acc.building, arms: acc.arms.push({ first_interval: g.head, place: -1 }) }
           } else {
             let below = branch(acc.building, g.tails, depth - 1);
-            { building: below.building, arms: acc.arms.push({ head: g.head, place: below.place }) }
+            {
+              building: below.building,
+              arms: acc.arms.push({ first_interval: g.head, place: below.entry }),
+            }
           },
       );
       let made = dispatch(armed.building, armed.arms);
       {
-        building: { ..made.building, known: made.building.known.insert(seqs, made.place) },
-        place: made.place,
+        building: { ..made.building, known: made.building.known.insert(seqs, made.entry) },
+        entry: made.entry,
       }
     },
   }
@@ -1440,28 +1443,35 @@ fn group_by_head(
 fn dispatch(b: FragmentBuilder, arms: List<Arm>) -> BuilderEntry / {abort.raise} = {
   let cut = {
     ..b,
-    cuts: arms.fold(b.cuts, |cs: List<Int>, a: Arm| cs.push(a.head.lo).push(a.head.hi + 1)),
+    cuts: arms.fold(b.cuts, |cs: List<Int>, a: Arm|
+      cs.push(a.first_interval.lo).push(a.first_interval.hi + 1)),
   };
-  let sorted = arms.sort_by(|x: Arm, y: Arm| x.head.lo <= y.head.lo);
+  let sorted = arms.sort_by(|x: Arm, y: Arm| x.first_interval.lo <= y.first_interval.lo);
   let apart = sorted.fold(
     { ok: true, next: 0 },
     |rewrite_case: { ok: Bool, next: Int }, a: Arm|
-      { ok: rewrite_case.ok && a.head.lo >= rewrite_case.next, next: a.head.hi + 1 },
+      {
+        ok: rewrite_case.ok && a.first_interval.lo >= rewrite_case.next,
+        next: a.first_interval.hi + 1,
+      },
   ).ok;
   match sorted {
-    [one] -> add_instruction(cut, Range(one.head.lo, one.head.hi, one.place)),
+    [one] -> add_instruction(cut, Range(one.first_interval.lo, one.first_interval.hi, one.place)),
     _ -> if apart { add_instruction(cut, switch(sorted)) } else {
-      arms.reverse().fold({ building: cut, place: -2 }, |acc: BuilderEntry, a: Arm| {
-        let one = add_instruction(acc.building, Range(a.head.lo, a.head.hi, a.place));
-        if acc.place == -2 { one }
-        else { add_instruction(one.building, Split(one.place, acc.place)) }
+      arms.reverse().fold({ building: cut, entry: -2 }, |acc: BuilderEntry, a: Arm| {
+        let one = add_instruction(
+          acc.building,
+          Range(a.first_interval.lo, a.first_interval.hi, a.place),
+        );
+        if acc.entry == -2 { one }
+        else { add_instruction(one.building, Split(one.entry, acc.entry)) }
       })
     },
   }
 }
 
 fn add_instruction(b: FragmentBuilder, inst: Inst) -> BuilderEntry =
-  { building: { ..b, insts: b.insts.push(inst) }, place: b.insts.len() }
+  { building: { ..b, insts: b.insts.push(inst) }, entry: b.insts.len() }
 
 /// A `Switch` over arms that are in order and share no byte.
 fn switch(arms: List<Arm>) -> Inst / {abort.raise} = {
@@ -1471,9 +1481,9 @@ fn switch(arms: List<Arm>) -> Inst / {abort.raise} = {
     |rewrite_case: { at: Int, parts: List<Bytes> }, a: Arm| {
       let arm = match places.index_of(a.place) { Some(i) -> i + 1, None -> 0 };
       {
-        at: a.head.hi + 1,
-        parts: rewrite_case.parts.push(run_of(0, a.head.lo - rewrite_case.at)).push(
-          run_of(arm, a.head.hi - a.head.lo + 1),
+        at: a.first_interval.hi + 1,
+        parts: rewrite_case.parts.push(run_of(0, a.first_interval.lo - rewrite_case.at)).push(
+          run_of(arm, a.first_interval.hi - a.first_interval.lo + 1),
         ),
       }
     },
@@ -1495,17 +1505,17 @@ fn run_of(b: Int, n: Int) -> Bytes / {abort.raise} =
 /// instruction accepts changes, each class's fragment, and what kind of program it is.
 type Emitter = {
   insts: List<Inst>,
-  cuts: Map<Int, Unit>,
+  boundaries: Map<Int, Unit>,
   classes: Map<List<Interval>, ClassFragment>,
   bytes: Bool,
   reversed: Bool,
 }
 
 /// A program so far, and where what was just written starts.
-type EmitResult = { e: Emitter, entry: Int }
+type EmitResult = { emitter: Emitter, entry: Int }
 
 fn emit_instruction(e: Emitter, inst: Inst) -> EmitResult =
-  { e: { ..e, insts: e.insts.push(inst) }, entry: e.insts.len() }
+  { emitter: { ..e, insts: e.insts.push(inst) }, entry: e.insts.len() }
 
 fn fork(first: Int, other: Int, greedy: Bool) -> Inst =
   if greedy { Split(first, other) } else { Split(other, first) }
@@ -1529,39 +1539,39 @@ fn look_bits(look: Assertion, reversed: Bool) -> Int =
 fn emit(e: Emitter, node: Node, next: Int, depth: Int) -> EmitResult / {abort.raise} =
   if depth <= 0 { panic("a parsed pattern nests no deeper than its groups") } else {
     match node {
-      Empty -> { e: e, entry: next },
+      Empty -> { emitter: e, entry: next },
       Literal(c) -> emit_literal(e, c, next),
       Class(set) -> emit_class(e, set, next),
       Looking(look) -> emit_instruction(e, Check(look_bits(look, e.reversed), next)),
       Concat(items) ->
         List::fold(
           if e.reversed { items } else { items.reverse() },
-          { e: e, entry: next },
-          |acc: EmitResult, n: Node| emit(acc.e, n, acc.entry, depth - 1),
+          { emitter: e, entry: next },
+          |acc: EmitResult, n: Node| emit(acc.emitter, n, acc.entry, depth - 1),
         ),
       Alternate(items) -> {
         let arms = items.fold(
           { e: e, entries: [] },
           |acc: { e: Emitter, entries: List<Int> }, n: Node| {
             let one = emit(acc.e, n, next, depth - 1);
-            { e: one.e, entries: acc.entries.push(one.entry) }
+            { e: one.emitter, entries: acc.entries.push(one.entry) }
           },
         );
-        arms.entries.reverse().fold({ e: arms.e, entry: -1 }, |acc: EmitResult, entry: Int|
-          if acc.entry < 0 { { e: acc.e, entry: entry } }
-          else { emit_instruction(acc.e, Split(entry, acc.entry)) })
+        arms.entries.reverse().fold({ emitter: arms.e, entry: -1 }, |acc: EmitResult, entry: Int|
+          if acc.entry < 0 { { emitter: acc.emitter, entry: entry } }
+          else { emit_instruction(acc.emitter, Split(entry, acc.entry)) })
       },
       Capture(index, _, sub) -> if e.reversed { emit(e, sub, next, depth - 1) } else {
         let epsilon_closure = emit_instruction(e, Save(2 * index + 1, next));
-        let body = emit(epsilon_closure.e, sub, epsilon_closure.entry, depth - 1);
-        emit_instruction(body.e, Save(2 * index, body.entry))
+        let body = emit(epsilon_closure.emitter, sub, epsilon_closure.entry, depth - 1);
+        emit_instruction(body.emitter, Save(2 * index, body.entry))
       },
       Repeat(sub, least, most, greedy) -> if most >= 0 {
         let tail = optional(e, sub, greedy, next, next, most - least, depth - 1);
-        copies(tail.e, sub, tail.entry, least, depth - 1)
+        copies(tail.emitter, sub, tail.entry, least, depth - 1)
       } else if least == 0 { star(e, sub, greedy, next, depth - 1) } else {
         let last = plus(e, sub, greedy, next, depth - 1);
-        copies(last.e, sub, last.entry, least - 1, depth - 1)
+        copies(last.emitter, sub, last.entry, least - 1, depth - 1)
       },
     }
   }
@@ -1573,10 +1583,10 @@ fn emit_literal(e: Emitter, c: Int, next: Int) -> EmitResult =
     let bytes = if e.bytes { [c] } else { utf8_bytes(c) };
     List::fold(
       if e.reversed { bytes } else { bytes.reverse() },
-      { e: e, entry: next },
+      { emitter: e, entry: next },
       |acc: EmitResult, b: Int|
         emit_instruction(
-          { ..acc.e, cuts: acc.e.cuts.insert(b, ()).insert(b + 1, ()) },
+          { ..acc.emitter, boundaries: acc.emitter.boundaries.insert(b, ()).insert(b + 1, ()) },
           Range(b, b, acc.entry),
         ),
     )
@@ -1589,14 +1599,14 @@ fn emit_class(e: Emitter, set: List<Interval>, next: Int) -> EmitResult / {abort
   let base = e.insts.len();
   let insts = t.insts.fold(e.insts, |acc: List<Inst>, i: Inst| acc.push(relocate(i, base, next)));
   {
-    e: match known {
+    emitter: match known {
       Some(_) -> { ..e, insts: insts },
       None ->
         {
           ..e,
           insts: insts,
           classes: e.classes.insert(set, t),
-          cuts: t.cuts.fold(e.cuts, |cuts: Map<Int, Unit>, c: Int| cuts.insert(c, ())),
+          boundaries: t.cuts.fold(e.boundaries, |cuts: Map<Int, Unit>, c: Int| cuts.insert(c, ())),
         },
     },
     entry: base + t.entry,
@@ -1622,12 +1632,15 @@ fn relocate(i: Inst, base: Int, next: Int) -> Inst =
 fn star(e: Emitter, sub: Node, greedy: Bool, next: Int, depth: Int) -> EmitResult / {abort.raise} =
   if nullable(sub) {
     let more = plus(e, sub, greedy, next, depth);
-    emit_instruction(more.e, fork(more.entry, next, greedy))
+    emit_instruction(more.emitter, fork(more.entry, next, greedy))
   } else {
     let hole = emit_instruction(e, Fail);
-    let body = emit(hole.e, sub, hole.entry, depth);
+    let body = emit(hole.emitter, sub, hole.entry, depth);
     {
-      e: { ..body.e, insts: body.e.insts.set(hole.entry, fork(body.entry, next, greedy)) },
+      emitter: {
+        ..body.emitter,
+        insts: body.emitter.insts.set(hole.entry, fork(body.entry, next, greedy)),
+      },
       entry: hole.entry,
     }
   }
@@ -1635,9 +1648,12 @@ fn star(e: Emitter, sub: Node, greedy: Bool, next: Int, depth: Int) -> EmitResul
 /// `sub` one or more times.
 fn plus(e: Emitter, sub: Node, greedy: Bool, next: Int, depth: Int) -> EmitResult / {abort.raise} = {
   let hole = emit_instruction(e, Fail);
-  let body = emit(hole.e, sub, hole.entry, depth);
+  let body = emit(hole.emitter, sub, hole.entry, depth);
   {
-    e: { ..body.e, insts: body.e.insts.set(hole.entry, fork(body.entry, next, greedy)) },
+    emitter: {
+      ..body.emitter,
+      insts: body.emitter.insts.set(hole.entry, fork(body.entry, next, greedy)),
+    },
     entry: body.entry,
   }
 }
@@ -1653,16 +1669,16 @@ fn optional(
   count: Int,
   depth: Int,
 ) -> EmitResult / {abort.raise} =
-  if count <= 0 { { e: e, entry: tail } } else {
+  if count <= 0 { { emitter: e, entry: tail } } else {
     let body = emit(e, sub, tail, depth);
-    let fork = emit_instruction(body.e, fork(body.entry, next, greedy));
-    optional(fork.e, sub, greedy, next, fork.entry, count - 1, depth)
+    let fork = emit_instruction(body.emitter, fork(body.entry, next, greedy));
+    optional(fork.emitter, sub, greedy, next, fork.entry, count - 1, depth)
   }
 
 fn copies(e: Emitter, sub: Node, next: Int, count: Int, depth: Int) -> EmitResult / {abort.raise} =
-  if count <= 0 { { e: e, entry: next } } else {
+  if count <= 0 { { emitter: e, entry: next } } else {
     let one = emit(e, sub, next, depth);
-    copies(one.e, sub, one.entry, count - 1, depth)
+    copies(one.emitter, sub, one.entry, count - 1, depth)
   }
 
 /// Whether every match of `node` starts where the subject does.
@@ -1710,9 +1726,9 @@ fn byte_classes(cuts: Map<Int, Unit>) -> { classes: Bytes, count: Int } / {abort
 /// What a search can skip to. `first` is every byte a match can start with, and is empty when a
 /// match may be empty, when a look comes before its first byte, or when any byte can start one.
 /// `lead` is the bytes every match starts with, and `exact` whether they are the whole of every
-/// match. `held` is a text every match contains somewhere, and is empty if none is known beyond
+/// match. `required` is a text every match contains somewhere, and is empty if none is known beyond
 /// `lead`.
-type Prefilter = { first: Bytes, lead: Bytes, exact: Bool, held: Bytes }
+type Prefilter = { first: Bytes, prefix: Bytes, exact: Bool, required: Bytes }
 
 fn prefilter(insts: Array<Inst>, start: Int, tree: Node, bytes: Bool) -> Prefilter / {abort.raise} = {
   let n = insts.len();
@@ -1730,9 +1746,9 @@ fn prefilter(insts: Array<Inst>, start: Int, tree: Node, bytes: Bool) -> Prefilt
   let inside = required_literal(tree, bytes);
   {
     first: if first.len() >= 256 { b"" } else { first },
-    lead: lead,
+    prefix: lead,
     exact: led.whole,
-    held: if inside == lead { b"" } else { inside },
+    required: if inside == lead { b"" } else { inside },
   }
 }
 
@@ -1882,7 +1898,7 @@ type Automaton = {
 type Compiled = {
   pattern: String,
   options: Options,
-  bytes: Bool,
+  matches_bytes: Bool,
   tree: Node,
   /// Each group's name, by its number.
   names: List<Option<String>>,
@@ -1893,7 +1909,7 @@ type Compiled = {
   insts: Array<Inst>,
   start: Int,
   search: Int,
-  opening: Prefilter,
+  prefilter: Prefilter,
   /// The search for where the leftmost match ends, the one for the longest end from a known
   /// start, and the one that reads a match backwards from its end to its start.
   finder: Automaton,
@@ -1907,40 +1923,55 @@ type Compiled = {
 fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.fail, abort.raise} = {
   let s = {
     text: Array::of_list(pattern.code_points()),
-    bytes: bytes,
+    matches_bytes: bytes,
     limit: max(0, min(o.size_limit, 0x1000000)),
   };
   let p = alternation(s, 0, 0, [None], 200);
   if p.at < s.text.len() { fail(p.at, UnopenedGroup) } else {
     let ahead = emit(
-      { insts: [Match], cuts: Map::new(), classes: Map::new(), bytes: bytes, reversed: false },
+      {
+        insts: [Match],
+        boundaries: Map::new(),
+        classes: Map::new(),
+        bytes: bytes,
+        reversed: false,
+      },
       Capture(0, None, p.node),
       0,
       1000,
     );
     let sought = if anchored(p.node) { ahead } else {
-      let hole = emit_instruction(ahead.e, Fail);
-      let skip = emit_class(hole.e, [interval(0, max_code_point(s))], hole.entry);
+      let hole = emit_instruction(ahead.emitter, Fail);
+      let skip = emit_class(hole.emitter, [interval(0, max_code_point(s))], hole.entry);
       {
-        e: { ..skip.e, insts: skip.e.insts.set(hole.entry, Split(ahead.entry, skip.entry)) },
+        emitter: {
+          ..skip.emitter,
+          insts: skip.emitter.insts.set(hole.entry, Split(ahead.entry, skip.entry)),
+        },
         entry: hole.entry,
       }
     };
     let behind = emit(
-      { insts: [Match], cuts: sought.e.cuts, classes: Map::new(), bytes: bytes, reversed: true },
+      {
+        insts: [Match],
+        boundaries: sought.emitter.boundaries,
+        classes: Map::new(),
+        bytes: bytes,
+        reversed: true,
+      },
       p.node,
       0,
       1000,
     );
     let looks = looks_of(p.node);
-    let lined = if looks & 3 != 0 { behind.e.cuts.insert(10, ()).insert(11, ()) }
-    else { behind.e.cuts };
+    let lined = if looks & 3 != 0 { behind.emitter.boundaries.insert(10, ()).insert(11, ()) }
+    else { behind.emitter.boundaries };
     let cuts = if looks & 48 != 0 {
       [48, 58, 65, 91, 95, 96, 97, 123].fold(lined, |cuts: Map<Int, Unit>, c: Int|
         cuts.insert(c, ()))
     } else { lined };
     let told = byte_classes(cuts);
-    let insts = Array::of_list(sought.e.insts);
+    let insts = Array::of_list(sought.emitter.insts);
     let finder = {
       insts: insts,
       entry: sought.entry,
@@ -1953,7 +1984,7 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.fail,
     {
       pattern: pattern,
       options: o,
-      bytes: bytes,
+      matches_bytes: bytes,
       tree: p.node,
       names: p.groups,
       numbers: range(0, p.groups.len()).fold(Map::new(), |m: Map<String, Int>, i: Int|
@@ -1961,12 +1992,12 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.fail,
       insts: insts,
       start: ahead.entry,
       search: sought.entry,
-      opening: prefilter(insts, ahead.entry, p.node, bytes),
+      prefilter: prefilter(insts, ahead.entry, p.node, bytes),
       finder: finder,
       longest_finder: { ..finder, entry: ahead.entry, first_wins: false },
       reverse: {
         ..finder,
-        insts: Array::of_list(behind.e.insts),
+        insts: Array::of_list(behind.emitter.insts),
         entry: behind.entry,
         first_wins: false,
       },
@@ -2460,8 +2491,8 @@ type States = {
 /// The states one call's searches have made of each automaton: the one that finds where the
 /// leftmost match ends, the one that reads it back to its start, and the one that stretches it
 /// to the longest. `stamp` is a number no walk of a program has yet marked its places with, and
-/// `spent` whether a search ran out of room, after which the call follows every state at once.
-type SearchCache = { stamp: Int, ahead: States, back: States, stretch: States, spent: Bool }
+/// `overflowed` whether a search ran out of room, after which the call follows every state at once.
+type SearchCache = { stamp: Int, ahead: States, back: States, stretch: States, overflowed: Bool }
 
 fn empty_states(room: Int, base: Int) -> States =
   { ids: Map::new(), keys: [[], []], starts: [-1, -1, -1, -1], room: room + 2, base: base }
@@ -2474,12 +2505,18 @@ fn empty_search_cache() -> SearchCache =
     ahead: empty_states(0, 0),
     back: empty_states(0, 0),
     stretch: empty_states(0, 0),
-    spent: false,
+    overflowed: false,
   }
 
 /// What following places without taking a byte reached: the places that take one, ask a look or
 /// match, in order; every look asked; and whether a match ended the walk.
-type Closure = { seen: Array<Int>, stack: Array<Int>, out: List<Int>, needs: Int, sealed: Bool }
+type Closure = {
+  seen: Array<Int>,
+  stack: Array<Int>,
+  out: List<Int>,
+  asked_looks: Int,
+  sealed: Bool,
+}
 
 /// Follows the places on the stack through every instruction that takes no byte, under the
 /// looks `have`: a place not yet reached under this `stamp` joins `out`. A look stays in `out`
@@ -2497,7 +2534,7 @@ fn epsilon_closure(
   needs: Int,
   fuel: Int,
 ) -> Closure / {abort.raise} =
-  if sp <= 0 { { seen: seen, stack: stack, out: out, needs: needs, sealed: false } }
+  if sp <= 0 { { seen: seen, stack: stack, out: out, asked_looks: needs, sealed: false } }
   else if fuel <= 0 { panic("a program is walked once a state") } else {
     let pc = stack.get(sp - 1);
     if seen.get(pc) == stamp {
@@ -2561,7 +2598,7 @@ fn epsilon_closure(
         Fail ->
           epsilon_closure(insts, have, cut, stamp, marked, stack, sp - 1, out, needs, fuel - 1),
         Match -> if cut {
-          { seen: marked, stack: stack, out: out.push(pc), needs: needs, sealed: true }
+          { seen: marked, stack: stack, out: out.push(pc), asked_looks: needs, sealed: true }
         } else {
           epsilon_closure(
             insts,
@@ -2606,7 +2643,7 @@ fn reclose(
   needs: Int,
 ) -> Closure / {abort.raise} =
   match key.at(i) {
-    None -> { seen: seen, stack: stack, out: out, needs: needs, sealed: false },
+    None -> { seen: seen, stack: stack, out: out, asked_looks: needs, sealed: false },
     Some(pc) -> {
       let c = epsilon_closure(
         a.insts,
@@ -2620,7 +2657,7 @@ fn reclose(
         needs,
         4 * a.insts.len() + 4,
       );
-      reclose(a, key, i + 1, have, stamp, c.seen, c.stack, c.out, c.needs)
+      reclose(a, key, i + 1, have, stamp, c.seen, c.stack, c.out, c.asked_looks)
     },
   }
 
@@ -2678,9 +2715,9 @@ fn advance(
           4 * a.insts.len() + 4,
         );
         if c.sealed {
-          { seen: c.seen, stack: c.stack, out: c.out, needs: c.needs, matched: matched }
+          { seen: c.seen, stack: c.stack, out: c.out, needs: c.asked_looks, matched: matched }
         } else {
-          advance(a, places, i + 1, b, after, stamp, c.seen, c.stack, c.out, c.needs, matched)
+          advance(a, places, i + 1, b, after, stamp, c.seen, c.stack, c.out, c.asked_looks, matched)
         }
       }
     },
@@ -2739,7 +2776,7 @@ fn transition(
   let after = if b == 10 && a.lines { 1 } else { 0 };
   let again = needs & before & ~flags != 0;
   let walked = if again { reclose(a, key, 2, before, stamp, seen, stack, [], 0) }
-  else { { seen: seen, stack: stack, out: key, needs: 0, sealed: false } };
+  else { { seen: seen, stack: stack, out: key, asked_looks: 0, sealed: false } };
   let relocate = advance(
     a,
     walked.out,
@@ -2809,7 +2846,13 @@ fn start_state(
       0,
       4 * a.insts.len() + 4,
     );
-    let made = state_of(a, s, have | (if kind == 2 { 64 } else { 0 }), walked.needs, walked.out);
+    let made = state_of(
+      a,
+      s,
+      have | (if kind == 2 { 64 } else { 0 }),
+      walked.asked_looks,
+      walked.out,
+    );
     {
       seen: walked.seen,
       stack: walked.stack,
@@ -2953,7 +2996,7 @@ fn search_forward(
     quick,
     home,
     o.first,
-    o.lead,
+    o.prefix,
     n - i + 1,
   );
   match read.hit {
@@ -3114,16 +3157,16 @@ fn search(
   explored: SearchCache,
   want: Int,
 ) -> Hit / {abort.raise} =
-  if re.opening.exact {
-    let found = if re.opening.lead.len() == 0 { Some(from) }
-    else { hay.index_of_from(re.opening.lead, from) };
+  if re.prefilter.exact {
+    let found = if re.prefilter.prefix.len() == 0 { Some(from) }
+    else { hay.index_of_from(re.prefilter.prefix, from) };
     match found {
       Some(at) ->
         capture_known_match(
           re,
           hay,
           at,
-          at + re.opening.lead.len(),
+          at + re.prefilter.prefix.len(),
           table,
           seen,
           stack,
@@ -3135,7 +3178,7 @@ fn search(
     }
   } else if lacks_required(re, hay, from) {
     { table: table, seen: seen, stack: stack, explored: explored, slots: Array::of_list([]) }
-  } else if explored.spent || re.wide || re.options.state_limit <= 0
+  } else if explored.overflowed || re.wide || re.options.state_limit <= 0
       || hay.len() - from <= re.options.short {
     by_threads(re, hay, from, table, seen, stack, explored, want)
   } else if table.len() > 0 { by_states(re, hay, from, table, seen, stack, explored, want) } else {
@@ -3153,7 +3196,7 @@ fn search(
         ahead: empty_states(rows - 2, 0),
         back: empty_states(rows - 2, rows * re.finder.stride),
         stretch: empty_states(rows - 2, 2 * rows * re.finder.stride),
-        spent: false,
+        overflowed: false,
       },
       want,
     )
@@ -3167,7 +3210,7 @@ fn state_capacity(re: Compiled, hay: Bytes) -> Int / {abort.raise} =
 
 /// Whether the text every match holds stands nowhere from `from` on, so that no match does.
 fn lacks_required(re: Compiled, hay: Bytes, from: Int) -> Bool / {abort.raise} =
-  re.opening.held.len() > 0 && hay.index_of_from(re.opening.held, from) == None
+  re.prefilter.required.len() > 0 && hay.index_of_from(re.prefilter.required, from) == None
 
 fn by_threads(
   re: Compiled,
@@ -3253,11 +3296,12 @@ fn by_states(
       table,
       first.seen,
       first.stack,
-      { ..explored, stamp: explored.stamp + 1, spent: true },
+      { ..explored, stamp: explored.stamp + 1, overflowed: true },
       want,
     )
   } else {
-    let home = if re.opening.lead.len() > 1 || re.opening.first.len() > 0 { first.to } else { -1 };
+    let home = if re.prefilter.prefix.len() > 1 || re.prefilter.first.len() > 0 { first.to }
+    else { -1 };
     let end = search_forward(
       re.finder,
       table,
@@ -3271,12 +3315,12 @@ fn by_states(
       -1,
       false,
       home,
-      re.opening,
+      re.prefilter,
       hay.len() - from + 3,
     );
     let kept = { ..explored, stamp: end.stamp, ahead: end.states };
     if end.at == -2 {
-      by_threads(re, hay, from, end.table, end.seen, end.stack, { ..kept, spent: true }, want)
+      by_threads(re, hay, from, end.table, end.seen, end.stack, { ..kept, overflowed: true }, want)
     } else if end.at < 0 {
       {
         table: end.table,
@@ -3310,7 +3354,7 @@ fn find_start(
       table,
       first.seen,
       first.stack,
-      { ..explored, stamp: explored.stamp + 1, spent: true },
+      { ..explored, stamp: explored.stamp + 1, overflowed: true },
       want,
     )
   } else {
@@ -3330,7 +3374,16 @@ fn find_start(
     );
     let kept = { ..explored, stamp: start.stamp, back: start.states };
     if start.at == -2 {
-      by_threads(re, hay, from, start.table, start.seen, start.stack, { ..kept, spent: true }, want)
+      by_threads(
+        re,
+        hay,
+        from,
+        start.table,
+        start.seen,
+        start.stack,
+        { ..kept, overflowed: true },
+        want,
+      )
     } else if start.at < 0 { panic("a match read backwards from its end has a start") }
     else if re.options.longest {
       find_longest_end(re, hay, start.at, start.table, start.seen, start.stack, kept, want)
@@ -3369,7 +3422,7 @@ fn find_longest_end(
       table,
       first.seen,
       first.stack,
-      { ..explored, stamp: explored.stamp + 1, spent: true },
+      { ..explored, stamp: explored.stamp + 1, overflowed: true },
       want,
     )
   } else {
@@ -3386,12 +3439,12 @@ fn find_longest_end(
       -1,
       false,
       -1,
-      re.opening,
+      re.prefilter,
       hay.len() - start + 3,
     );
     let kept = { ..explored, stamp: end.stamp, stretch: end.states };
     if end.at == -2 {
-      by_threads(re, hay, start, end.table, end.seen, end.stack, { ..kept, spent: true }, want)
+      by_threads(re, hay, start, end.table, end.seen, end.stack, { ..kept, overflowed: true }, want)
     } else if end.at < 0 { panic("a match stretched from its start has an end") }
     else { capture_known_match(re, hay, start, end.at, end.table, end.seen, end.stack, kept, want) }
   }
@@ -3399,8 +3452,9 @@ fn find_longest_end(
 
 /// Whether a match stands anywhere in `hay`.
 fn has_match(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
-  if re.opening.exact { re.opening.lead.len() == 0 || hay.index_of(re.opening.lead) != None }
-  else { !lacks_required(re, hay, 0) && has_match_by_states(re, hay) }
+  if re.prefilter.exact {
+    re.prefilter.prefix.len() == 0 || hay.index_of(re.prefilter.prefix) != None
+  } else { !lacks_required(re, hay, 0) && has_match_by_states(re, hay) }
 
 /// Whether the pattern's automaton finds a match in `hay`, nothing asked of the subject first:
 /// one state at a time, or by every state at once where the subject is short or the states
@@ -3422,7 +3476,7 @@ fn has_match_by_states(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
       false,
     );
     if first.to < 0 { has_match_by_threads(re, hay) } else {
-      let home = if re.opening.lead.len() > 1 || re.opening.first.len() > 0 { first.to }
+      let home = if re.prefilter.prefix.len() > 1 || re.prefilter.first.len() > 0 { first.to }
       else { -1 };
       let end = search_forward(
         a,
@@ -3437,7 +3491,7 @@ fn has_match_by_states(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
         -1,
         true,
         home,
-        re.opening,
+        re.prefilter,
         hay.len() + 3,
       );
       if end.at == -2 { has_match_by_threads(re, hay) } else { end.at >= 0 }
@@ -3456,7 +3510,7 @@ fn has_match_by_threads(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
 /// Where the character at `at` ends: the next byte over bytes, and the next character's first
 /// over text.
 fn next_char_start(re: Compiled, hay: Bytes, at: Int) -> Int / {abort.raise} =
-  if re.bytes || at >= hay.len() { at + 1 } else {
+  if re.matches_bytes || at >= hay.len() { at + 1 } else {
     let lead = hay.at(at);
     if lead < 0x80 { at + 1 }
     else if lead < 0xE0 { at + 2 }
@@ -4448,34 +4502,34 @@ test "two patterns are one where they are written alike, and one is shown as wri
 
 test "a search skips to where a match can start, and a pattern that is plain text is searched as text" {
   let anywhere = inner(must("[0-9]+x"));
-  assert_eq(anywhere.opening.first, b"0123456789");
-  assert_eq(anywhere.opening.lead, b"");
+  assert_eq(anywhere.prefilter.first, b"0123456789");
+  assert_eq(anywhere.prefilter.prefix, b"");
   let led = inner(must("abc[0-9]"));
-  assert_eq(led.opening.lead, b"abc");
-  assert(!led.opening.exact);
+  assert_eq(led.prefilter.prefix, b"abc");
+  assert(!led.prefilter.exact);
   let exact = inner(must("a\\.b"));
-  assert_eq(exact.opening.lead, b"a.b");
-  assert(exact.opening.exact);
-  assert_eq(inner(must("a*b")).opening.first, b"ab");
-  assert_eq(inner(must("a*")).opening.first, b"");
-  assert_eq(inner(must("\\ba")).opening.first, b"");
-  assert_eq(inner(must("(?i)k")).opening.first, b"Kk\xe2");
-  assert_eq(inner(must("(?i)x")).opening.first, b"Xx");
-  assert_eq(inner(must(".")).opening.first.len(), 178);
-  assert_eq(inner(must("\\w+@example\\.com")).opening.held, b"@example.com");
-  assert_eq(inner(must("(\\d+)(?:ab)+\u{e9}|x")).opening.held, b"");
-  assert_eq(inner(must("\\d(?:ab)+c\u{e9}\\d")).opening.held, b"c\xc3\xa9");
-  assert_eq(inner(must("\\d(?:ab){0,2}(c)\\d")).opening.held, b"c");
-  assert_eq(inner(must("(?i)abc\\d")).opening.held, b"");
-  assert_eq(inner(must("abc\\d")).opening.held, b"");
-  assert_eq(byte_inner(must_bytes("\\d\\xFF\\x00")).opening.held, b"\xff\x00");
+  assert_eq(exact.prefilter.prefix, b"a.b");
+  assert(exact.prefilter.exact);
+  assert_eq(inner(must("a*b")).prefilter.first, b"ab");
+  assert_eq(inner(must("a*")).prefilter.first, b"");
+  assert_eq(inner(must("\\ba")).prefilter.first, b"");
+  assert_eq(inner(must("(?i)k")).prefilter.first, b"Kk\xe2");
+  assert_eq(inner(must("(?i)x")).prefilter.first, b"Xx");
+  assert_eq(inner(must(".")).prefilter.first.len(), 178);
+  assert_eq(inner(must("\\w+@example\\.com")).prefilter.required, b"@example.com");
+  assert_eq(inner(must("(\\d+)(?:ab)+\u{e9}|x")).prefilter.required, b"");
+  assert_eq(inner(must("\\d(?:ab)+c\u{e9}\\d")).prefilter.required, b"c\xc3\xa9");
+  assert_eq(inner(must("\\d(?:ab){0,2}(c)\\d")).prefilter.required, b"c");
+  assert_eq(inner(must("(?i)abc\\d")).prefilter.required, b"");
+  assert_eq(inner(must("abc\\d")).prefilter.required, b"");
+  assert_eq(byte_inner(must_bytes("\\d\\xFF\\x00")).prefilter.required, b"\xff\x00");
   let mail = must("\\w+@example\\.com");
   let absent = run_of_a(100000);
   assert_eq(find(mail, absent), None);
   assert_eq(find(mail, absent ++ "@example.com"), Some({ start: 0, end: 100012 }));
   assert(!is_match(mail, absent));
   assert_eq(find_all(mail, "a@example.com b@example.org c@example.com").len(), 2);
-  assert_eq(byte_inner(must_bytes("(?s).a")).opening.first, b"")
+  assert_eq(byte_inner(must_bytes("(?s).a")).prefilter.first, b"")
 }
 
 fn run_of_a(n: Int) -> String / {abort.raise} = String::of_bytes(run_of(97, n))
@@ -4503,7 +4557,9 @@ test "`{pattern}` finds nothing in a run of a's, by every state at once, one sta
   assert(!is_match(must(pattern), text))
 }
 
-test "every match of `(a*)*b` holds a `b`" { assert_eq(inner(must("(a*)*b")).opening.held, b"b") }
+test "every match of `(a*)*b` holds a `b`" {
+  assert_eq(inner(must("(a*)*b")).prefilter.required, b"b")
+}
 
 /// A `GeneratedCase` as a test draws one.
 fn generated_cases() -> gen::Gen<GeneratedCase> =

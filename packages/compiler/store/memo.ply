@@ -37,7 +37,7 @@ pub type Query<| e> = {
   name: Bytes,
   hash: Bytes,
   body: (Bytes) -> Bytes / {memo.read, abort.raise | e},
-  kept: Bool,
+  persistent: Bool,
   summarized: Bool,
 }
 
@@ -366,9 +366,9 @@ fn fetch_output<| e>(
   if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
     let s = verify_key(queries, run, q, key, input, left - 1);
     match memo_store.output(s.head) {
-      Some(o) -> { run: s.run, output: o, head: s.head },
-      None -> if s.run.open.contains(key) { abort.raise(reuse_cycle_message()) } else {
-        let e = execute(queries, s.run, q, key, input, left - 1);
+      Some(o) -> { run: s.run_index, output: o, head: s.head },
+      None -> if s.run_index.open.contains(key) { abort.raise(reuse_cycle_message()) } else {
+        let e = execute(queries, s.run_index, q, key, input, left - 1);
         if e.head != s.head {
           panic(
             "the query `" ++ String::of_bytes_lossy(q.name)
@@ -376,7 +376,11 @@ fn fetch_output<| e>(
           )
         };
         {
-          run: { ..e.run, lost: if q.kept { incremented(e.run.lost, q.name) } else { e.run.lost } },
+          run: {
+            ..e.run_index,
+            lost: if q.persistent { incremented(e.run_index.lost, q.name) }
+            else { e.run_index.lost },
+          },
           output: match memo_store.output(e.head) {
             Some(o) -> o,
             None -> panic("a store does not contain a result it was just handed to cache"),
@@ -387,8 +391,8 @@ fn fetch_output<| e>(
     }
   }
 
-fn reuse(run: Run, name: Bytes, output: Bytes) -> { run: Run, head: Bytes } =
-  { run: { ..run, took: incremented(run.took, name) }, head: output }
+fn reuse(run: Run, name: Bytes, output: Bytes) -> { run_index: Run, head: Bytes } =
+  { run_index: { ..run, took: incremented(run.took, name) }, head: output }
 
 fn verify_key<| e>(
   queries: Map<Bytes, Query<| e>>,
@@ -397,37 +401,38 @@ fn verify_key<| e>(
   key: Bytes,
   input: Bytes,
   left: Int,
-) -> { run: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
+) -> { run_index: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
   if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
     match run.resolved.get(key) {
-      Some(h) -> { run: run, head: h },
+      Some(h) -> { run_index: run, head: h },
       None -> {
         let step = { query: q.name, input: input };
         if run.open.contains(key) {
           if !run.checking_reuse { report_cycle(run, step) } else {
             match memo_store.output_digest(key) {
-              Some(h) -> { run: { ..run, provisional: run.provisional.insert(key, h) }, head: h },
+              Some(h) ->
+                { run_index: { ..run, provisional: run.provisional.insert(key, h) }, head: h },
               None -> abort.raise(reuse_cycle_message()),
             }
           }
         } else {
           let opened = { ..run, open: run.open.insert(key, true), trail: run.trail.push(step) };
           let done = checked(queries, opened, q, key, input, left - 1);
-          let early = match done.run.provisional.get(key) {
+          let early = match done.run_index.provisional.get(key) {
             Some(h) -> h != done.head,
             None -> false,
           };
           {
-            run: {
-              ..done.run,
-              resolved: (if early { run.resolved } else { done.run.resolved }).insert(
+            run_index: {
+              ..done.run_index,
+              resolved: (if early { run.resolved } else { done.run_index.resolved }).insert(
                 key,
                 done.head,
               ),
-              provided: if early { run.provided } else { done.run.provided },
-              open: done.run.open.remove(key),
+              provided: if early { run.provided } else { done.run_index.provided },
+              open: done.run_index.open.remove(key),
               trail: run.trail,
-              provisional: done.run.provisional.remove(key),
+              provisional: done.run_index.provisional.remove(key),
             },
             head: done.head,
           }
@@ -443,7 +448,7 @@ fn checked<| e>(
   key: Bytes,
   input: Bytes,
   left: Int,
-) -> { run: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
+) -> { run_index: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
   match memo_store.output_digest(key) {
     None -> execute(queries, run, q, key, input, left),
     Some(out) -> if memo_store.has_trusted_record(key) { reuse(run, q.name, out) } else {
@@ -471,7 +476,7 @@ fn restore_or_run<| e>(
   key: Bytes,
   input: Bytes,
   left: Int,
-) -> { run: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} = {
+) -> { run_index: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} = {
   let earlier = record_if_unchanged(queries, run, memo_store.record(previous_key(key)), left);
   let cycle_to_switched = match earlier.record {
     Some(_) -> earlier,
@@ -519,7 +524,7 @@ fn reuse_cycle_message() -> String = "a judgment reached a record being computed
 fn report_cycle(
   run: Run,
   step: { query: Bytes, input: Bytes },
-) -> { run: Run, head: Bytes } / {abort.raise} =
+) -> { run_index: Run, head: Bytes } / {abort.raise} =
   panic(
     "the query `" ++ String::of_bytes_lossy(step.query) ++ "` asks for its own result, through"
       ++ run.trail.push(step).fold("", |acc: String, s: { query: Bytes, input: Bytes }|
@@ -543,7 +548,7 @@ fn dependencies_unchanged<| e>(
             None -> { run: acc.run, ok: false },
             Some(aq) -> {
               let a = verify_key(queries, acc.run, aq, key_of(aq, input), input, left - 1);
-              { run: a.run, ok: a.head == digest }
+              { run: a.run_index, ok: a.head == digest }
             },
           },
         }
@@ -554,25 +559,25 @@ fn query_dependency_id(name: Bytes, input: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.asked\x00", length_prefixed(name), input]))
 
 type Summing = {
-  work: List<Dependency>,
+  pending: List<Dependency>,
   seen: Map<Bytes, Bool>,
   summary: List<Dependency>,
   whole: Bool,
 }
 
 fn add_to_summary(x: Summing, rest: List<Dependency>, id: Bytes, r: Dependency) -> Summing =
-  if x.seen.contains(id) { { ..x, work: rest } }
-  else { { ..x, work: rest, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
+  if x.seen.contains(id) { { ..x, pending: rest } }
+  else { { ..x, pending: rest, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
 
 fn summary_of<| e>(
   queries: Map<Bytes, Query<| e>>,
   reads: List<Dependency>,
 ) -> Option<List<Dependency>> / {memo_store.read, abort.raise} = {
   let made = iterate(
-    { work: reads, seen: Map::new(), summary: [], whole: true },
+    { pending: reads, seen: Map::new(), summary: [], whole: true },
     100000000,
     |x: Summing|
-      match x.work {
+      match x.pending {
         [] -> Stop(x),
         [r, ..rest] -> match r {
           ExternalDependency(kind, at, _) ->
@@ -583,7 +588,7 @@ fn summary_of<| e>(
               Continue(add_to_summary(x, rest, query_dependency_id(name, input), r))
             } else {
               let id = query_dependency_id(name, input);
-              if x.seen.contains(id) { Continue({ ..x, work: rest }) } else {
+              if x.seen.contains(id) { Continue({ ..x, pending: rest }) } else {
                 let defined = add_to_summary(
                   { ..x, seen: x.seen.insert(id, true) },
                   rest,
@@ -592,7 +597,8 @@ fn summary_of<| e>(
                 );
                 match memo_store.record(key_of(aq, input)) {
                   None -> Stop({ ..defined, whole: false }),
-                  Some(below) -> Continue({ ..defined, work: below.reads.concat(defined.work) }),
+                  Some(below) ->
+                    Continue({ ..defined, pending: below.reads.concat(defined.pending) }),
                 }
               }
             },
@@ -635,7 +641,7 @@ fn would_reuse<| e>(
             else { would_reuse_reads(queries, run, q.name, rec.summary, left - 1) };
             let d = if s.ok { s }
             else { would_reuse_reads(queries, s.run, q.name, rec.reads, left - 1) };
-            { run: d.run, ok: d.ok && (q.kept || memo_store.output(rec.output) != None) }
+            { run: d.run, ok: d.ok && (q.persistent || memo_store.output(rec.output) != None) }
           },
         };
         let j = if current_records.ok { current_records } else {
@@ -703,7 +709,7 @@ fn would_reuse_reads<| e>(
                     { run: w.run, ok: w.ok && memo_store.output_digest(asked) == Some(digest) }
                   } else {
                     let a = verify_key(queries, acc.run, q, asked, input, left);
-                    { run: a.run, ok: a.head == digest }
+                    { run: a.run_index, ok: a.head == digest }
                   },
                 }
               },
@@ -722,7 +728,7 @@ fn execute<| e>(
   key: Bytes,
   input: Bytes,
   left: Int,
-) -> { run: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
+) -> { run_index: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
   if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
     let begun: Execution = {
       run: {
@@ -754,7 +760,7 @@ fn execute<| e>(
       let akey = key_of(aq, asked);
       let a = if whole { fetch_output(queries, s.run, aq, akey, asked, left - 1) } else {
         let h = verify_key(queries, s.run, aq, akey, asked, left - 1);
-        { run: h.run, output: b"", head: h.head }
+        { run: h.run_index, output: b"", head: h.head }
       };
       {
         st: { ..s, run: a.run, reads: s.reads.push(QueryDependency(name, asked, a.head)) },
@@ -839,9 +845,9 @@ fn execute<| e>(
     let summary = if !q.summarized { [] }
     else { match summary_of(queries, s.reads) { Some(made) -> made, None -> [] } };
     let rec = { query: q.hash, input: input, reads: s.reads, output: d, summary: summary };
-    if q.kept { keep_previous(key, rec) };
-    memo_store.put(key, rec, ran.output, q.kept);
-    { run: s.run, head: d }
+    if q.persistent { keep_previous(key, rec) };
+    memo_store.put(key, rec, ran.output, q.persistent);
+    { run_index: s.run, head: d }
   }
 
 pub fn cached_output<| e>(
@@ -1109,7 +1115,7 @@ fn test_world(files: List<{ at: Bytes, text: Bytes }>) -> TestEnvironment =
   }
 
 fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> Query<| {}> =
-  { name: name, hash: hash, body: body, kept: true, summarized: false }
+  { name: name, hash: hash, body: body, persistent: true, summarized: false }
 
 fn length_of(input: Bytes) -> Bytes / {memo.read} =
   match memo.external(b"file", input) {
@@ -1760,7 +1766,7 @@ test "a query that caches no long results keeps its records, and a run that need
   let text = b"word ".repeat(1000);
   let q = test_queries(b"h1").insert(b"length", {
     ..query(b"length", b"h1", read_file),
-    kept: false,
+    persistent: false,
   });
   let first = run_query(q, test_world([{ at: b"a", text: text }]), b"longer", b"a");
   assert_eq(first.output, b"long ".concat(text));
@@ -1773,7 +1779,7 @@ test "a query that caches no long results keeps its records, and a run that need
   assert_eq([whole.executed, whole.lost], [1, 0]);
   let short = test_queries(b"h1").insert(b"length", {
     ..query(b"length", b"h1", length_of),
-    kept: false,
+    persistent: false,
   });
   let held = run_query(short, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   assert(held.world.store.outputs.contains(digest_of(Some(b"4"))))

@@ -31,9 +31,9 @@ fn t_texts() -> Int = 17
 // --- Records ----------------------------------------------------------------
 
 /// What a test last passed at: its hash, the era it passed in, and where a walk of that era's module
-/// records starts to find what it reached: at what `of` references, or at what its cases run where
+/// records starts to find what it reached: at what `walk_start` references, or at what its cases run where
 /// `case` says.
-pub type PassRecord = { test_hash: Bytes, era: Bytes, of: Bytes, case: Bool }
+pub type PassRecord = { test_hash: Bytes, era: Bytes, walk_start: Bytes, case: Bool }
 
 type Named<a> = { name: Bytes, value: a }
 
@@ -42,7 +42,7 @@ pub type Review = { definition: Bytes, specs: List<Bytes> }
 
 /// The build the versioned groups were recorded by: its runtime's digest, and the one a pass
 /// recorded under the code its test ran is checked against, which no compiler change moves.
-pub type Stamps = { runtime: String, code: String }
+pub type Stamps = { runtime_digest: String, code: String }
 
 derive bin for PassRecord
 derive bin for Named
@@ -88,19 +88,19 @@ pub fn open_cache<[r]>(dir: String, stamps: Stamps) -> Cache / {fs.read[r], abor
 fn stamps_key() -> Bytes = named_key(b"stamps")
 
 /// A versioned group of tables, and the stamp its entries were recorded under.
-type Group = { what: String, was: String, now: String, tables: List<Int> }
+type Group = { what: String, stored_stamp: String, now: String, tables: List<Int> }
 
 fn groups(was: Stamps, now: Stamps) -> List<Group> =
   [
     {
       what: "the test results and discharged obligations",
-      was: was.runtime,
-      now: now.runtime,
+      stored_stamp: was.runtime_digest,
+      now: now.runtime_digest,
       tables: [passed_table(), pass_records_table(), seen_table(), evidence_table()],
     },
     {
       what: "the passes recorded under the code their tests ran",
-      was: was.code,
+      stored_stamp: was.code,
       now: now.code,
       tables: [code_passes_table()],
     },
@@ -130,11 +130,12 @@ fn check_stamps<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r], abort.raise}
   match was {
     Known(st) -> if st == now { s } else {
       write_stamps(
-        groups(st, now).filter(|g: Group| g.was != g.now).fold(s, |s1: Store, g: Group|
+        groups(st, now).filter(|g: Group| g.stored_stamp != g.now).fold(s, |s1: Store, g: Group|
           warn(
             clear_group(s1, g),
             OtherVersion,
-            g.what ++ " were recorded by another build (" ++ short_stamp(g.was) ++ "; this one is "
+            g.what ++ " were recorded by another build (" ++ short_stamp(g.stored_stamp)
+              ++ "; this one is "
               ++ short_stamp(g.now)
               ++ "), so they are recorded again",
           )),
@@ -159,7 +160,7 @@ pub fn with_upstream<[u]>(
 ) -> Cache / {fs.read[u], abort.raise} = {
   let under = |stamp: String|
     { root: root, schema: blake3(schema() ++ Bytes::of_string(stamp)), publish: publish };
-  let upstream_store = under(cache.stamps.runtime);
+  let upstream_store = under(cache.stamps.runtime_digest);
   let code_upstream_store = under(cache.stamps.code);
   {
     ..cache,
@@ -563,7 +564,7 @@ pub type Counts = {
   texts: Int,
   passed: Int,
   pass_records: Int,
-  eras: Int,
+  snapshots: Int,
   modules: Int,
   seen: Int,
   evidence: Int,
@@ -575,7 +576,7 @@ pub fn counts(cache: Cache) -> Counts / {abort.raise} =
     texts: keys(cache.store, t_texts()).len(),
     passed: keys(cache.store, passed_table()).len(),
     pass_records: keys(cache.store, pass_records_table()).len(),
-    eras: keys(cache.store, snapshots_table()).len(),
+    snapshots: keys(cache.store, snapshots_table()).len(),
     modules: keys(cache.store, modules_table()).len(),
     seen: keys(cache.store, seen_table()).len(),
     evidence: keys(cache.store, evidence_table()).len(),
@@ -583,7 +584,7 @@ pub fn counts(cache: Cache) -> Counts / {abort.raise} =
   }
 
 /// How many definition texts, eras and module records a prune dropped.
-pub type PruneCounts = { texts: Int, eras: Int, modules: Int }
+pub type PruneCounts = { texts: Int, snapshots: Int, modules: Int }
 
 /// The tests whose pass record names each era, each by where a walk of it starts, and the hash
 /// each test passed at.
@@ -624,7 +625,10 @@ pub fn prune<[r]>(
           let snapshot = n.value.era;
           let tests = match acc.eras.get(snapshot) { Some(ts) -> ts, None -> [] };
           {
-            eras: acc.eras.insert(snapshot, tests.push({ key: n.value.of, case: n.value.case })),
+            eras: acc.eras.insert(
+              snapshot,
+              tests.push({ key: n.value.walk_start, case: n.value.case }),
+            ),
             tests: acc.tests.insert(n.value.test_hash, true),
             cache: got.cache,
           }
@@ -675,7 +679,7 @@ pub fn prune<[r]>(
   let texts = swept(gone_modules.cache, t_texts(), |k: Bytes|
     live.hashes.contains(k) || passed.tests.contains(k));
   {
-    pruned: { texts: texts.gone, eras: gone_eras.gone, modules: gone_modules.gone },
+    pruned: { texts: texts.gone, snapshots: gone_eras.gone, modules: gone_modules.gone },
     cache: texts.cache,
   }
 }
@@ -697,7 +701,7 @@ pub fn compact_cache<[r]>(cache: Cache) -> Cache / {fs.read[r], fs.write[r], abo
 
 // --- Tests ------------------------------------------------------------------
 
-fn test_stamps() -> Stamps = { runtime: "runtime", code: "code" }
+fn test_stamps() -> Stamps = { runtime_digest: "runtime", code: "code" }
 
 /// A module record holding one definition of each of `names`, each under the hash its name keys,
 /// and the test `m.t`, which references the first.
@@ -720,7 +724,7 @@ fn module_record_holding(names: List<String>) -> Bytes / {abort.raise} =
 
 /// The pass record of a test that passed in the era of `modules`.
 fn record_in(modules: List<Bytes>) -> PassRecord =
-  { test_hash: name_key("t"), era: snapshot_digest(modules), of: b"m.t", case: false }
+  { test_hash: name_key("t"), era: snapshot_digest(modules), walk_start: b"m.t", case: false }
 
 test "every table round-trips through a flush and a reopen" {
   let m = module_record_holding(["m.f"]);
@@ -810,7 +814,7 @@ test "prune keeps what each test reached in the era it last passed in, and drops
     }
   });
   // `m.stale` is in an era a test last passed in, and no test of that era reached it.
-  assert_eq(run.value.pruned, { texts: 2, eras: 1, modules: 1 });
+  assert_eq(run.value.pruned, { texts: 2, snapshots: 1, modules: 1 });
   // The test's own text stays with its pass record.
   assert_eq(run.value.texts, [true, false, false, true]);
   assert_eq(run.value.modules, [true, false])
@@ -890,10 +894,10 @@ test "a pass recorded under the code its test ran outlives another runtime stamp
     let _recorded = flush_cache[mem](
       put_passed_code(put_passed(a, name_key("result"), b""), name_key("code"), b""),
     );
-    let moved = open_cache[mem]("cache", { ..test_stamps(), runtime: "another" });
+    let moved = open_cache[mem]("cache", { ..test_stamps(), runtime_digest: "another" });
     let recoded = open_cache[mem]("cache", {
       ..test_stamps(),
-      runtime: "another",
+      runtime_digest: "another",
       code: "another",
     });
     [
@@ -912,7 +916,7 @@ test "a pass recorded under its code is shared under a schema of its own, which 
       put_passed_code(put_passed(a, name_key("pass"), b""), name_key("code"), b""),
     );
     let b = with_upstream[mem](
-      open_cache[mem]("two/cache", { ..test_stamps(), runtime: "another" }),
+      open_cache[mem]("two/cache", { ..test_stamps(), runtime_digest: "another" }),
       "shared",
       true,
     );
@@ -977,7 +981,7 @@ test "entries recorded under another build's stamp are dropped group by group, a
     );
     let c1 = put_review(c0, b"m.f", { definition: name_key("m.f"), specs: [] });
     let written = flush_cache[mem](c1);
-    let moved = { ..test_stamps(), runtime: "elsewhere" };
+    let moved = { ..test_stamps(), runtime_digest: "elsewhere" };
     let r = open_cache[mem]("cache", moved);
     let warned = messages(r.store.warnings);
     let refiled = flush_cache[mem](open_cache[mem]("cache", moved));
@@ -1006,7 +1010,7 @@ test "a pass or a claim's evidence recorded by another runtime is not believed" 
       b"evidence",
     );
     let written = flush_cache[mem](c0);
-    let r = open_cache[mem]("cache", { ..test_stamps(), runtime: "another runtime" });
+    let r = open_cache[mem]("cache", { ..test_stamps(), runtime_digest: "another runtime" });
     {
       warned: messages(r.store.warnings).len(),
       passed: passed[mem](r, name_key("t")).value,
@@ -1024,7 +1028,7 @@ test "an upstream serves cached results only to the runtime that published to it
     let published = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
     let same = with_upstream[mem](open_cache[mem]("two/cache", test_stamps()), "shared", true);
     let other = with_upstream[mem](
-      open_cache[mem]("three/cache", { ..test_stamps(), runtime: "another runtime" }),
+      open_cache[mem]("three/cache", { ..test_stamps(), runtime_digest: "another runtime" }),
       "shared",
       true,
     );

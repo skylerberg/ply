@@ -2469,17 +2469,22 @@ pub fn serve_draining<[l] | e>(
 
 /// Where a connection's requests come from: its far end, and the certificate its client presented,
 /// which is read after the handshake of a connection that is secured when first read.
-type ClientIdentity = { peer: Option<SocketAddress>, certificate: Option<Bytes>, looked: Bool }
+type ClientIdentity = {
+  peer: Option<SocketAddress>,
+  certificate: Option<Bytes>,
+  certificate_fetched: Bool,
+}
 
 fn client_identity_of<[l]>(c: Int) -> ClientIdentity / {net.peer_address[l]} =
-  { peer: net.peer_address[l](c), certificate: None, looked: false }
+  { peer: net.peer_address[l](c), certificate: None, certificate_fetched: false }
 
 /// `o` with the certificate the client presented, read once its connection has carried a request.
 fn with_client_certificate<[l]>(
   c: Int,
   o: ClientIdentity,
 ) -> ClientIdentity / {net.peer_certificate[l]} =
-  if o.looked { o } else { { ..o, certificate: net.peer_certificate[l](c), looked: true } }
+  if o.certificate_fetched { o }
+  else { { ..o, certificate: net.peer_certificate[l](c), certificate_fetched: true } }
 
 /// Whether `stop` is closed: what a draining serving loop checks between requests.
 pub fn stopped_by(stop: Chan<Unit>) -> Bool / {task.select} =
@@ -5253,7 +5258,7 @@ type ForwardedCase = {
   peer: String,
   forwarded: String,
   trusted: List<String>,
-  client: Option<String>,
+  expected_client: Option<String>,
 }
 
 test "from {c.peer} with `{c.forwarded}`, trusting {c.trusted}, the client is read past the trusted proxies only" for c: ForwardedCase in [
@@ -5262,64 +5267,74 @@ test "from {c.peer} with `{c.forwarded}`, trusting {c.trusted}, the client is re
       peer: "203.0.113.9:4000",
       forwarded: "for=192.0.2.1",
       trusted: [],
-      client: Some("203.0.113.9"),
+      expected_client: Some("203.0.113.9"),
     },
     {
       peer: "203.0.113.9:4000",
       forwarded: "for=192.0.2.1",
       trusted: ["10.0.0.0/8"],
-      client: Some("203.0.113.9"),
+      expected_client: Some("203.0.113.9"),
     },
     {
       peer: "10.0.0.5:4000",
       forwarded: "for=192.0.2.1",
       trusted: ["10.0.0.0/8"],
-      client: Some("192.0.2.1"),
+      expected_client: Some("192.0.2.1"),
     },
     // The client wrote the first hop itself; the proxy appended what it saw.
     {
       peer: "10.0.0.5:4000",
       forwarded: "for=127.0.0.1, for=198.51.100.7",
       trusted: ["10.0.0.0/8"],
-      client: Some("198.51.100.7"),
+      expected_client: Some("198.51.100.7"),
     },
     {
       peer: "10.0.0.5:4000",
       forwarded: "for=198.51.100.7, for=10.0.0.9",
       trusted: ["10.0.0.0/8"],
-      client: Some("198.51.100.7"),
+      expected_client: Some("198.51.100.7"),
     },
     {
       peer: "10.0.0.5:4000",
       forwarded: "for=10.0.0.8, for=10.0.0.9",
       trusted: ["10.0.0.0/8"],
-      client: Some("10.0.0.8"),
+      expected_client: Some("10.0.0.8"),
     },
-    { peer: "10.0.0.5:4000", forwarded: "", trusted: ["10.0.0.0/8"], client: Some("10.0.0.5") },
-    { peer: "10.0.0.5:4000", forwarded: "for=unknown", trusted: ["10.0.0.0/8"], client: None },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "",
+      trusted: ["10.0.0.0/8"],
+      expected_client: Some("10.0.0.5"),
+    },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=unknown",
+      trusted: ["10.0.0.0/8"],
+      expected_client: None,
+    },
     {
       peer: "10.0.0.5:4000",
       forwarded: "for=198.51.100.7, for=_hidden",
       trusted: ["10.0.0.0/8"],
-      client: None,
+      expected_client: None,
     },
     {
       peer: "10.0.0.5:4000",
       forwarded: "for=198.51.100.7, garbage",
       trusted: ["10.0.0.0/8"],
-      client: None,
+      expected_client: None,
     },
     {
       peer: "[::ffff:10.0.0.5]:4000",
       forwarded: "for=\"[2001:db8::7]\"",
       trusted: ["10.0.0.0/8"],
-      client: Some("2001:db8::7"),
+      expected_client: Some("2001:db8::7"),
     },
     {
       peer: "[2001:db8:1::5]:4000",
       forwarded: "for=192.0.2.1",
       trusted: ["2001:db8:1::/48"],
-      client: Some("192.0.2.1"),
+      expected_client: Some("192.0.2.1"),
     },
   ] {
   let bare = request_to(Get, "example.org", "/", b"");
@@ -5332,7 +5347,7 @@ test "from {c.peer} with `{c.forwarded}`, trusting {c.trusted}, the client is re
     Some(address) -> Some(ip::render(address)),
     None -> None,
   };
-  assert_eq(client, c.client)
+  assert_eq(client, c.expected_client)
 }
 
 /// The response each of two clients of a TLS listener gets, the first presenting `der`: the
@@ -6262,7 +6277,7 @@ test "an HTTP/2 request reads as this module's, its target split at the query" {
     trailers: empty_headers(),
     body: b"",
   };
-  let star = stream_request(wire, { peer: None, certificate: None, looked: true });
+  let star = stream_request(wire, { peer: None, certificate: None, certificate_fetched: true });
   assert_eq((star.method, star.path, star.query, star.authority, star.version), (
     Options,
     "*",
@@ -6273,7 +6288,7 @@ test "an HTTP/2 request reads as this module's, its target split at the query" {
   let pathed = stream_request({ ..wire, method: "PURGE", target: "/p/q?r=1&s" }, {
     peer: None,
     certificate: None,
-    looked: true,
+    certificate_fetched: true,
   });
   assert_eq((pathed.method, pathed.target, pathed.path, pathed.query), (
     Other("PURGE"),

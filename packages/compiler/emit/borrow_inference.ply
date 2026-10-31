@@ -44,10 +44,10 @@ pub type InferredOwnership = { signature: OwnershipSignature, reason: OwnershipR
 
 pub type InferenceTarget = {
   definition: RootName,
-  f: Fn,
+  member: Fn,
   group: List<RootName>,
   borrowed: List<Int>,
-  whole: Fn,
+  enclosing: Fn,
 }
 
 pub fn all_owned(arity: Int) -> OwnershipSignature =
@@ -76,8 +76,8 @@ pub fn group_signatures(
   let plain = inferred_from(group, published, group.map(|_: InferenceTarget| Map::new()));
   let borrowing = range(0, group.len()).fold(Map::new(), |m: Map<RootName, Bool>, k: Int|
     match ((group.at(k), plain.at(k))) {
-      (Some(l), Some(x)) -> if borrows_counted(l, x.signature) && may_reuse(l.whole) {
-        m.insert(root_name(l.whole.key), true)
+      (Some(l), Some(x)) -> if borrows_counted(l, x.signature) && may_reuse(l.enclosing) {
+        m.insert(root_name(l.enclosing.key), true)
       } else { m },
       _ -> m,
     });
@@ -85,14 +85,14 @@ pub fn group_signatures(
     let placed = borrowing.fold(
       Map::new(),
       |m: Map<RootName, Map<Int, Span>>, name: RootName, _: Bool|
-        match group.find(|l: InferenceTarget| root_name(l.whole.key) == name) {
-          Some(l) -> m.insert(name, reused_params(l.whole)),
+        match group.find(|l: InferenceTarget| root_name(l.enclosing.key) == name) {
+          Some(l) -> m.insert(name, reused_params(l.enclosing)),
           None -> m,
         },
     );
     let resets = group.map(|l: InferenceTarget|
-      match placed.get(root_name(l.whole.key)) {
-        Some(r) -> by_place(r, l.f.params),
+      match placed.get(root_name(l.enclosing.key)) {
+        Some(r) -> by_place(r, l.member.params),
         None -> Map::new(),
       });
     if resets.all(|r: Map<Int, Span>| r.len() == 0) { plain }
@@ -101,7 +101,7 @@ pub fn group_signatures(
 }
 
 pub fn reset_params(l: InferenceTarget) -> Map<Int, Span> =
-  by_place(reused_params(l.whole), l.f.params)
+  by_place(reused_params(l.enclosing), l.member.params)
 
 fn inferred_from(
   group: List<InferenceTarget>,
@@ -115,7 +115,7 @@ fn inferred_from(
           acc.push(first_guess(l, match resets.at(k) { Some(r) -> r, None -> Map::new() })),
         None -> acc,
       }),
-    group.fold(2, |n: Int, m: InferenceTarget| n + 3 * m.f.params.len() + 2),
+    group.fold(2, |n: Int, m: InferenceTarget| n + 3 * m.member.params.len() + 2),
     |cur: List<InferredOwnership>| {
       let next = round(group, published, cur);
       if signatures_of(next) == signatures_of(cur) { Stop(next) } else { Continue(next) }
@@ -123,12 +123,12 @@ fn inferred_from(
   )
 
 fn borrows_counted(l: InferenceTarget, h: OwnershipSignature) -> Bool =
-  range(0, l.f.params.len()).any(|k: Int|
-    (match l.f.params.at(k) { Some(p) -> is_refcounted(p.representation), None -> false })
+  range(0, l.member.params.len()).any(|k: Int|
+    (match l.member.params.at(k) { Some(p) -> is_refcounted(p.representation), None -> false })
       && h.params.at(k) == Some(BorrowedParam))
 
 pub type InferenceResult = {
-  handed: Map<RootName, OwnershipSignature>,
+  signatures: Map<RootName, OwnershipSignature>,
   groups: Map<RootName, List<RootKey>>,
 }
 
@@ -145,18 +145,18 @@ pub fn infer_signatures(
       match at.get(d) { Some(k) -> acc.push(k), None -> acc }));
   let calls = graph::of(lendings.len(), |k: Int| match out.at(k) { Some(xs) -> xs, None -> [] });
   graph::components(calls).fold(
-    { handed: published, groups: Map::new() },
+    { signatures: published, groups: Map::new() },
     |done: InferenceResult, comp: List<Int>| {
       let group = comp.fold([], |g: List<InferenceTarget>, k: Int|
         match lendings.at(k) { Some(l) -> g.push(l), None -> g });
-      let definitions = group.map(|l: InferenceTarget| l.f.key);
-      let hs = signatures_of(group_signatures(group, done.handed));
+      let definitions = group.map(|l: InferenceTarget| l.member.key);
+      let hs = signatures_of(group_signatures(group, done.signatures));
       range(0, group.len()).fold(done, |s: InferenceResult, k: Int|
         match group.at(k) {
           Some(l) -> match hs.at(k) {
             Some(h) ->
               {
-                handed: s.handed.insert(l.definition, h),
+                signatures: s.signatures.insert(l.definition, h),
                 groups: s.groups.insert(l.definition, definitions),
               },
             None -> s,
@@ -173,8 +173,8 @@ fn with_declared_borrows(
   lendings: List<InferenceTarget>,
 ) -> Map<RootName, OwnershipSignature> =
   lendings.fold(published, |look: Map<RootName, OwnershipSignature>, l: InferenceTarget| {
-    let generics = generics_of(l.f);
-    vals_folded(l.f.body, look, |m: Map<RootName, OwnershipSignature>, v: Rvalue|
+    let generics = generics_of(l.member);
+    vals_folded(l.member.body, look, |m: Map<RootName, OwnershipSignature>, v: Rvalue|
       match v {
         Call(c) -> match callee_definition(generics, c.callee) {
           Some(d) -> if m.contains(d) { m } else {
@@ -379,10 +379,10 @@ fn targets_of(declared: Map<RootName, List<Int>>, f: Fn) -> List<InferenceTarget
     let name = root_name(g.key);
     {
       definition: name,
-      f: g,
+      member: g,
       group: group,
       borrowed: match declared.get(name) { Some(ps) -> ps, None -> [] },
-      whole: f,
+      enclosing: f,
     }
   };
   if f.members.len() == 0 { [borrowing(f, [])] } else {
@@ -426,7 +426,7 @@ fn by_place(resets: Map<Int, Span>, params: List<Var>) -> Map<Int, Span> =
 
 fn reused_params(f: Fn) -> Map<Int, Span> = {
   let giving = |c: Convention|
-    { ..c, params: c.params.map(|p: ParamTaking| { ..p, handed: OwnedParam }) };
+    { ..c, params: c.params.map(|p: ParamTaking| { ..p, ownership: OwnedParam }) };
   let counted_form = insert_reference_counts({
     ..f,
     convention: giving(f.convention),
@@ -435,7 +435,7 @@ fn reused_params(f: Fn) -> Map<Int, Span> = {
   let params = f.members.fold(f.params, |ps: List<Var>, m: Member| ps.concat(m.params));
   collect_memory_reuse(
     {
-      held: params.fold(Map::new(), |h: Map<Int, List<Int>>, p: Var| h.insert(p.id, [p.id])),
+      sources: params.fold(Map::new(), |h: Map<Int, List<Int>>, p: Var| h.insert(p.id, [p.id])),
       tokens: Map::new(),
       at: Map::new(),
     },
@@ -443,7 +443,7 @@ fn reused_params(f: Fn) -> Map<Int, Span> = {
   ).at
 }
 
-type Reuse = { held: Map<Int, List<Int>>, tokens: Map<Int, List<Int>>, at: Map<Int, Span> }
+type Reuse = { sources: Map<Int, List<Int>>, tokens: Map<Int, List<Int>>, at: Map<Int, Span> }
 
 fn collect_memory_reuse(r: Reuse, b: Block) -> Reuse =
   b.fold(r, |acc: Reuse, i: Inst|
@@ -452,7 +452,7 @@ fn collect_memory_reuse(r: Reuse, b: Block) -> Reuse =
         let from = value_sources(acc, l.value);
         {
           ..acc,
-          held: if from.len() == 0 { acc.held } else { acc.held.insert(l.var.id, from) },
+          sources: if from.len() == 0 { acc.sources } else { acc.sources.insert(l.var.id, from) },
           at: match l.value {
             Allocate(m) -> match m.reuse {
               Some(t) ->
@@ -469,12 +469,15 @@ fn collect_memory_reuse(r: Reuse, b: Block) -> Reuse =
       Assign(x) ->
         {
           ..acc,
-          held: acc.held.insert(x.var.id, joined(var_sources(acc, x.var), arg_sources(acc, x.arg))),
+          sources: acc.sources.insert(
+            x.var.id,
+            joined(var_sources(acc, x.var), arg_sources(acc, x.arg)),
+          ),
         },
       Destructure(o) ->
         {
           ..acc,
-          held: o.words.fold(acc.held, |h: Map<Int, List<Int>>, w: Var|
+          sources: o.words.fold(acc.sources, |h: Map<Int, List<Int>>, w: Var|
             h.insert(w.id, var_sources(acc, o.of))),
         },
       Reset(x) -> { ..acc, tokens: acc.tokens.insert(x.token.id, var_sources(acc, x.of)) },
@@ -506,7 +509,7 @@ fn value_sources(r: Reuse, value: Rvalue) -> List<Int> =
   }
 
 fn var_sources(r: Reuse, v: Var) -> List<Int> =
-  match r.held.get(v.id) { Some(ps) -> ps, None -> [] }
+  match r.sources.get(v.id) { Some(ps) -> ps, None -> [] }
 
 fn arg_sources(r: Reuse, a: Arg) -> List<Int> =
   match operand_var(a) { Some(v) -> var_sources(r, v), None -> [] }
@@ -548,18 +551,18 @@ type MemberResult = {
   borrowing: InferenceTarget,
   cur: InferredOwnership,
   walk: Walk,
-  gone: ConsumedParams,
+  consumed_params: ConsumedParams,
 }
 
 fn first_guess(m: InferenceTarget, resets: Map<Int, Span>) -> InferredOwnership = {
-  let n = declared_arity(m.f.params);
+  let n = declared_arity(m.member.params);
   let reset = |k: Int| !m.borrowed.contains(k) && resets.contains(k);
   {
     signature: {
       params: range(0, n).map(|k: Int| if reset(k) { OwnedParam } else { BorrowedParam }),
-      result: if n > 0 && is_refcounted(m.f.convention.result) && !has_variables(m.f.result_type) {
-        BorrowedResult([])
-      } else { OwnedResult },
+      result: if n > 0 && is_refcounted(m.member.convention.result)
+          && !has_variables(m.member.result_type) { BorrowedResult([]) }
+      else { OwnedResult },
     },
     reason: {
       params: range(0, n).map(|k: Int| if reset(k) { resets.get(k) } else { None }),
@@ -585,7 +588,7 @@ fn round(
       },
   );
   let reps = group.fold(Map::new(), |m: Map<RootName, List<Representation>>, l: InferenceTarget|
-    m.insert(l.definition, l.f.params.map(|p: Var| p.representation)));
+    m.insert(l.definition, l.member.params.map(|p: Var| p.representation)));
   let found = range(0, group.len()).fold([], |acc: List<MemberResult>, k: Int|
     match group.at(k) {
       Some(l) -> match cur.at(k) {
@@ -593,22 +596,22 @@ fn round(
           let w = member_walk(
             {
               signatures: look,
-              generics: generics_of(l.f),
+              generics: generics_of(l.member),
               definition: l.definition,
               group: l.group,
               framed: Map::new(),
             },
-            l.f,
+            l.member,
           );
           acc.push({
             borrowing: l,
             cur: c,
             walk: w,
-            gone: consumed_in(
+            consumed_params: consumed_in(
               c.signature,
               look,
               reps,
-              l.f.params.map(|p: Var| p.representation),
+              l.member.params.map(|p: Var| p.representation),
               w,
             ),
           })
@@ -618,13 +621,13 @@ fn round(
       None -> acc,
     });
   let jumps = found.fold([], |js: List<RequiredOwnedParam>, x: MemberResult|
-    js.concat(x.gone.jumped));
+    js.concat(x.consumed_params.jumped));
   found.map(|x: MemberResult|
     resolved(
       x.borrowing,
       x.cur,
       x.walk,
-      jumps.fold(x.gone.own, |g: Map<Int, Span>, j: RequiredOwnedParam|
+      jumps.fold(x.consumed_params.own, |g: Map<Int, Span>, j: RequiredOwnedParam|
         if j.to == x.borrowing.definition { first_at(g, j.param, j.at) } else { g }),
     ))
 }
@@ -820,7 +823,7 @@ fn resolved(
   w: Walk,
   gone: Map<Int, Span>,
 ) -> InferredOwnership = {
-  let n = declared_arity(m.f.params);
+  let n = declared_arity(m.member.params);
   let given = |k: Int|
     !m.borrowed.contains(k) && (cur.signature.params.at(k) == Some(OwnedParam) || gone.contains(k));
   let params = range(0, n).map(|k: Int| if given(k) { OwnedParam } else { BorrowedParam });
@@ -1204,7 +1207,8 @@ fn reads(op: TypeOp, k: Int) -> Bool =
 fn callee_definition(generics: List<RootName>, c: Callee) -> Option<RootName> =
   match c { Root(k) -> key_definition(k), Generic(i) -> generics.at(i) }
 
-fn called(l: InferenceTarget) -> List<RootName> = calls_in(generics_of(l.f), l.group, l.f.body)
+fn called(l: InferenceTarget) -> List<RootName> =
+  calls_in(generics_of(l.member), l.group, l.member.body)
 
 fn calls_in(generics: List<RootName>, acc: List<RootName>, b: Block) -> List<RootName> =
   vals_folded(b, acc, |a: List<RootName>, v: Rvalue| call_named(generics, a, v))
@@ -1262,13 +1266,13 @@ pub fn signatures_from(ps: List<PublishedSignature>) -> Map<RootName, OwnershipS
 
 pub type InferredFn = {
   form: Fn,
-  handings: List<PublishedSignature>,
+  own_signatures: List<PublishedSignature>,
   assumed: List<PublishedSignature>,
   group: List<RootKey>,
 }
 
 pub fn inferred_fn(f: Fn, s: InferenceResult) -> InferredFn / {abort.raise} = {
-  let borrowed = with_stack_blocks(with_conventions(f, s.handed), s.handed);
+  let borrowed = with_stack_blocks(with_conventions(f, s.signatures), s.signatures);
   let own = if borrowed.members.len() == 0 {
     [{ key: borrowed.key, convention: borrowed.convention }]
   } else { borrowed.members.map(|m: Member| { key: m.key, convention: m.convention }) };
@@ -1291,7 +1295,7 @@ pub fn inferred_fn(f: Fn, s: InferenceResult) -> InferredFn / {abort.raise} = {
         Specialisation(_, _) -> {
           let d = root_name(unspecialised(o.key));
           acc.push(
-            published_of(d, match s.handed.get(d) {
+            published_of(d, match s.signatures.get(d) {
               Some(h) -> h,
               None -> all_owned(o.convention.params.len()),
             }),
@@ -1302,11 +1306,11 @@ pub fn inferred_fn(f: Fn, s: InferenceResult) -> InferredFn / {abort.raise} = {
   );
   {
     form: borrowed,
-    handings: definitions.fold([], |acc: List<PublishedSignature>, d: RootKey| {
+    own_signatures: definitions.fold([], |acc: List<PublishedSignature>, d: RootKey| {
       let n = root_name(d);
-      match s.handed.get(n) { Some(h) -> acc.push(published_of(n, h)), None -> acc }
+      match s.signatures.get(n) { Some(h) -> acc.push(published_of(n, h)), None -> acc }
     }),
-    assumed: assumed_in(borrowed, generics_of(borrowed), s.handed, |d: RootName|
+    assumed: assumed_in(borrowed, generics_of(borrowed), s.signatures, |d: RootName|
       !inside.contains(d)).fold(
       specialised,
       |a: List<PublishedSignature>, p: PublishedSignature|
@@ -1365,7 +1369,7 @@ fn definition_of(
     links: no_links(),
     statics: [],
   };
-  { definition: of_m(name), f: f, group: [], borrowed: [], whole: f }
+  { definition: of_m(name), member: f, group: [], borrowed: [], enclosing: f }
 }
 
 fn of_m(name: Bytes) -> RootName = root_name(Named(qualify(b"m", name)))
@@ -1555,8 +1559,8 @@ test "a closure laid on this frame's stack only reads its captures, whatever its
       [
         {
           ..f,
-          f: {
-            ..f.f,
+          member: {
+            ..f.member,
             lambdas: [
               Closure({
                 body: lambda,
@@ -1813,7 +1817,7 @@ test "every recursion group is resolved after the groups it calls" {
     bind(r, call_of(b"keeps", [VarOperand(s)])),
     Return(VarOperand(r)),
   ]);
-  let handed = infer_signatures([hands, keeps], Map::new(), Map::new()).handed;
+  let handed = infer_signatures([hands, keeps], Map::new(), Map::new()).signatures;
   assert_eq(handed.get(of_m(b"hands")), Some({ params: [OwnedParam], result: OwnedResult }));
   assert_eq(handed.get(of_m(b"keeps")), Some({ params: [OwnedParam], result: OwnedResult }))
 }
@@ -1878,7 +1882,11 @@ test "a result read out of what is borrowed is borrowed of it, and one made on a
       bind(o, Aggregate({ parts: [IntOperand(1), VarOperand(x)] })),
       Return(VarOperand(o)),
     ]);
-    { ..l, f: { ..l.f, result_type: result }, whole: { ..l.whole, result_type: result } }
+    {
+      ..l,
+      member: { ..l.member, result_type: result },
+      enclosing: { ..l.enclosing, result_type: result },
+    }
   };
   assert_eq([string_type(), VariableType(0)].map(|t: Type| infer_group_signatures([some(t)])), [
     [{ params: [BorrowedParam], result: BorrowedResult([{ param: 0, whole: true }]) }],
@@ -2011,7 +2019,7 @@ test "a body is written against its own handing and each callee's, a callee noth
     bind(r, call_of(b"look", [VarOperand(s)])),
     bind(q, call_of(b"other", [VarOperand(r)])),
     Return(VarOperand(q)),
-  ]).f;
+  ]).member;
   let read = { params: [BorrowedParam], result: BorrowedResult([{ param: 0, whole: false }]) };
   let handed = Map::new().insert(of_m(b"f"), {
     params: [BorrowedParam],
@@ -2079,7 +2087,13 @@ test "a body is written against its own handing and each callee's, a callee noth
     links: {
       ..no_links(),
       generics: [
-        { callee: Named(b"m.look"), args: [], carried: [], functions: [], effect_evidence: [] },
+        {
+          callee: Named(b"m.look"),
+          args: [],
+          specialised_variables: [],
+          functions: [],
+          effect_evidence: [],
+        },
       ],
     },
   };
@@ -2096,7 +2110,7 @@ test "a body is written against its own handing and each callee's, a callee noth
 
 test "only a definition's own form is read, each borrowing what its declaration borrows" {
   let s = string_var(0);
-  let f = definition_of(b"f", [s], AsWord, [Return(VarOperand(s))]).f;
+  let f = definition_of(b"f", [s], AsWord, [Return(VarOperand(s))]).member;
   let typed = NamedType({ name: b"m.T", args: [] });
   let forms = [
     f,

@@ -166,7 +166,7 @@ fn bind_guarded_value(
           bound.guards,
           value,
         );
-        { ..bound, guards: guards::bind(r.g, v.name.span.site, r.value) }
+        { ..bound, guards: guards::bind(r.guards, v.name.span.site, r.value) }
       },
     },
     _ -> bound,
@@ -181,7 +181,7 @@ fn ranged_lambda(
 ) -> Option<RangeArgument> / {abort.raise} =
   match prelude_callback_use(builtin) {
     None -> None,
-    Some(it) -> match ((it.over, it.params.last())) {
+    Some(it) -> match ((it.iterated_parameters, it.params.last())) {
       ([k], Some(Element)) -> match args.at(k) {
         Some(CallExpression(r)) -> match r.args {
           [lo, hi] -> if prelude_name_of(checker, r.function) != b"range" { None }
@@ -903,20 +903,36 @@ fn infer_args(
         None -> acc.checker,
       };
       let o: Inference = if looped {
-        let inner: Inference = infer({ ..ranging, over: Some(span), maybe: [] }, x, hint);
-        { ..inner, checker: { ..inner.checker, over: acc.checker.over, maybe: acc.checker.maybe } }
+        let inner: Inference = infer(
+          { ..ranging, over: Some(span), pending_iterations: [] },
+          x,
+          hint,
+        );
+        {
+          ..inner,
+          checker: {
+            ..inner.checker,
+            over: acc.checker.over,
+            pending_iterations: acc.checker.pending_iterations,
+          },
+        }
       } else {
         match waits {
           Some(g) -> if !lambda { infer(ranging, x, hint) } else {
             let inner: Inference = infer(
               {
                 ..ranging,
-                maybe: [{ callee: g, param: Some(i), span: span }].concat(ranging.maybe),
+                pending_iterations: [{ callee: g, param: Some(i), span: span }].concat(
+                  ranging.pending_iterations,
+                ),
               },
               x,
               hint,
             );
-            { ..inner, checker: { ..inner.checker, maybe: acc.checker.maybe } }
+            {
+              ..inner,
+              checker: { ..inner.checker, pending_iterations: acc.checker.pending_iterations },
+            }
           },
           None -> infer(ranging, x, hint),
         }
@@ -981,8 +997,8 @@ fn callee_repeats(
     {
       params: match prelude_callback_use(builtin) {
         None -> [],
-        Some(it) -> if it.over.len() == 0 { [] }
-        else if it.over.fold(true, |all: Bool, k: Int|
+        Some(it) -> if it.iterated_parameters.len() == 0 { [] }
+        else if it.iterated_parameters.fold(true, |all: Bool, k: Int|
             all && (match args.at(k) { Some(x) -> fixed_size(checker, x), None -> false })) { [] }
         else { [it.callback] },
       },
@@ -1099,18 +1115,18 @@ fn record_repeated_variable(
         repeated_variables: checker.repeated_variables.push({
           var: v,
           over: Some(span),
-          maybe: [],
+          pending_iterations: [],
         }),
       }
     } else {
-      let waits = maybe.concat(checker.maybe);
+      let waits = maybe.concat(checker.pending_iterations);
       if checker.over == None && waits.len() == 0 { checker } else {
         {
           ..checker,
           repeated_variables: checker.repeated_variables.push({
             var: v,
             over: checker.over,
-            maybe: waits,
+            pending_iterations: waits,
           }),
         }
       }
@@ -1368,9 +1384,9 @@ fn infer_here(
             match d.rest.get(k) {
               FromName(j) -> {
                 let x = a.named.get(j).value;
-                let i = d.before + a.args.len() + k;
+                let i = d.parameter_offset + a.args.len() + k;
                 let expected = match d.params.at(i) {
-                  Some(p) -> Some({ ty: p, met: d.met }),
+                  Some(p) -> Some({ ty: p, met: d.equations }),
                   None -> None,
                 };
                 let o: Inference = match ((d.waits, x)) {
@@ -1378,14 +1394,20 @@ fn infer_here(
                     let inner: Inference = infer(
                       {
                         ..acc.checker,
-                        maybe: [{ callee: g, param: Some(i), span: a.span }].concat(
-                          acc.checker.maybe,
+                        pending_iterations: [{ callee: g, param: Some(i), span: a.span }].concat(
+                          acc.checker.pending_iterations,
                         ),
                       },
                       x,
                       expected,
                     );
-                    { ..inner, checker: { ..inner.checker, maybe: acc.checker.maybe } }
+                    {
+                      ..inner,
+                      checker: {
+                        ..inner.checker,
+                        pending_iterations: acc.checker.pending_iterations,
+                      },
+                    }
                   },
                   _ -> infer(acc.checker, x, expected),
                 };
@@ -1743,7 +1765,7 @@ fn tag_fn(
           tag_uses: named.tag_uses.push({
             owner: named.current_definition,
             name: name,
-            t: t,
+            literal: t,
             callee: callee,
           }),
         }
@@ -2320,7 +2342,7 @@ fn read_global(
           {
             ..constrained,
             member_sites: constrained.member_sites.push({
-              reaches: [],
+              imported_modules: [],
               named: [],
               module: constrained.module,
               site: at.site,
@@ -2338,7 +2360,7 @@ fn read_global(
       {
         ..constrained,
         member_sites: constrained.member_sites.push({
-          reaches: [],
+          imported_modules: [],
           named: [],
           module: constrained.module,
           site: at.site,
@@ -2952,11 +2974,11 @@ type MemberCall = {
   callee: MemberTarget,
   at: Span,
   params: List<Type>,
-  before: Int,
-  met: Equations,
+  parameter_offset: Int,
+  equations: Equations,
   waits: Option<Bytes>,
   rest: List<Slot>,
-  reaches: List<Bytes>,
+  imported_modules: List<Bytes>,
 }
 
 type TrailingArguments = { checker: Checker, rest: List<TrailingArgument>, effects: Effects }
@@ -2986,11 +3008,11 @@ fn member_target(
       callee: d,
       at: callee,
       params: [],
-      before: 0,
-      met: NoEquations,
+      parameter_offset: 0,
+      equations: NoEquations,
       waits: None,
       rest: [],
-      reaches: [],
+      imported_modules: [],
     };
   let of_type = |m: { qname: QName, callee: Bytes }| {
     let filled = member_args(b.checker, span, m.callee, base, args, named);
@@ -3017,14 +3039,14 @@ fn member_target(
       }),
       at: callee,
       params: params,
-      before: 1,
-      met: match params.at(0) {
+      parameter_offset: 1,
+      equations: match params.at(0) {
         Some(p) -> Equation({ expected: p, found: b.ty, before: NoEquations }),
         None -> NoEquations,
       },
       waits: if names { callee_repeats(ready, function, [base].concat(args)).waits } else { None },
       rest: filled.rest,
-      reaches: filled.reaches,
+      imported_modules: filled.reaches,
     }
   };
   let field = match record_fields(ty) { Some(fs) -> field_get(fs, name.name), None -> None };
@@ -3132,7 +3154,7 @@ fn infer_member_call(
             name: b"",
             callee: CallsField,
             owner: o.checker.current_definition,
-            reaches: [],
+            imported_modules: [],
             named: [],
           }),
         }
@@ -3158,7 +3180,7 @@ fn infer_member_call(
           name: m.qname.name.name,
           callee: CallsFunction(m.callee),
           owner: o.checker.current_definition,
-          reaches: d.reaches,
+          imported_modules: d.imported_modules,
           named: range(0, d.rest.len()).fold(
             [],
             |acc: List<{ arg: Int, at: Int }>, k: Int|
@@ -3238,7 +3260,7 @@ fn note_labels(
         named: span.end,
         callee: callee,
         vars: vars,
-        written: vars.filter(|v: Int| !scopes.contains(v)),
+        explicit_vars: vars.filter(|v: Int| !scopes.contains(v)),
         params: checker.label_params,
         called: false,
         owner: checker.current_definition,
@@ -3284,13 +3306,13 @@ fn fill_labels(
 ) -> Checker / {abort.raise} =
   match app {
     None -> if labels.len() == 0 { checker } else { wrong_labels(checker, labels, None, 0, 0) },
-    Some(a) -> if labels.len() > 0 && labels.len() != a.written.len() {
+    Some(a) -> if labels.len() > 0 && labels.len() != a.explicit_vars.len() {
       wrong_labels(
         { ..checker, label_apps: checker.label_apps.take(checker.label_apps.len() - 1) },
         labels,
         Some(a.callee),
-        a.written.len(),
-        a.vars.len() - a.written.len(),
+        a.explicit_vars.len(),
+        a.vars.len() - a.explicit_vars.len(),
       )
     } else {
       let marked: Checker = {
@@ -3306,7 +3328,7 @@ fn fill_labels(
           Some(w) -> VariableType(w),
           None -> label_type(labels.get(i).name),
         };
-        with_unified(c, unify(c.substitution, c.fresh, VariableType(a.written.get(i)), want))
+        with_unified(c, unify(c.substitution, c.fresh, VariableType(a.explicit_vars.get(i)), want))
       })
     },
   }
@@ -3910,7 +3932,7 @@ fn applied_call(
                 waiting(g, |h: { listed: List<Effect>, vars: List<Int> }| h.listed.contains(entry)),
               ),
           };
-          record_perform_under(cc, entry, span, source, cc.over, own.concat(cc.maybe))
+          record_perform_under(cc, entry, span, source, cc.over, own.concat(cc.pending_iterations))
         });
       let variable_waits = match ((repeats.waits, effects.variable)) {
         (Some(g), Some(v)) ->
@@ -4184,9 +4206,7 @@ fn bind_pattern(
                 },
             },
         );
-        let pattern = record_pattern_of(bound.fields, if r.rest {
-          Some({ span: r.span, ty: scrutinee })
-        } else { None });
+        let pattern = record_pattern_of(bound.fields, r.rest, r.span, scrutinee);
         if r.rest { { checker: bound.checker, out: bound.out, pattern: pattern } } else {
           let named = r.fields.map(|f: { name: Identifier, pattern: Pattern }| f.name.name);
           let omitted = known.filter(|field: Field| !named.contains(field.name));
@@ -4242,7 +4262,7 @@ fn bind_pattern(
             b"record pattern",
           ).checker,
           out: fs.out,
-          pattern: record_pattern_of(fs.fields, None),
+          pattern: record_pattern_of(fs.fields, false, r.span, scrutinee),
         }
       },
     },
@@ -4685,7 +4705,7 @@ fn clause_resource_for(
   clause: HandleClause,
   span: Span,
 ) -> WithResource / {abort.raise} =
-  if !clause.every_label { resource_for(checker, info, op_info, clause.resource, span) }
+  if !clause.wildcard_label { resource_for(checker, info, op_info, clause.resource, span) }
   else if op_info.resource_param { { checker: checker, resource: Some(AnyResource) } } else {
     {
       checker: report_error_at_and(
@@ -5363,7 +5383,7 @@ fn infer_handle(
                         effect: hit.info.name,
                         op: hit.op.name,
                         resource: match clause.resource { Some(r) -> Some(r.name), None -> None },
-                        every_label: clause.every_label,
+                        every_label: clause.wildcard_label,
                       },
                       params_typed(
                         clause.params.map(|i: Identifier| { name: i.name, span: i.span }),
@@ -5790,7 +5810,7 @@ fn try_block_node(
                   None -> acc,
                 }),
             ),
-            span: at.carried,
+            span: at.arguments_record,
             ty: carried,
           },
       };
@@ -5809,7 +5829,7 @@ fn try_block_node(
                   every_label: false,
                   params: params,
                   label: None,
-                  resume: None,
+                  continuation: None,
                   body: returned(
                     err,
                     carried,
@@ -5818,7 +5838,7 @@ fn try_block_node(
                     at.err,
                   ),
                   effects: no_effects(),
-                  resumed: no_effects(),
+                  continuation_effects: no_effects(),
                   span: at.clause,
                 },
               ],
@@ -5832,7 +5852,7 @@ fn try_block_node(
                   at.ok,
                 ),
                 effects: no_effects(),
-                span: at.ret,
+                span: at.early_return,
               }),
               vars: [],
             }),
@@ -6044,7 +6064,7 @@ fn close_scope(checker: Checker) -> ClosedScope / {abort.raise} = {
 
 fn spawn_sites_of(args: List<Expression>, types: List<Type>) -> List<SpawnSite> / {abort.raise} =
   range(0, args.len()).map(|i: Int|
-    { span: expression_span(args.get(i)), ty: types.get(i), around: [] })
+    { span: expression_span(args.get(i)), ty: types.get(i), enclosing_clauses: [] })
 
 fn spawned_under(
   checker: Checker,
@@ -6061,8 +6081,9 @@ fn spawned_under(
           ..r,
           spawns: range(0, r.spawns.len()).map(|j: Int| {
             let s = r.spawns.get(j);
-            if j >= before.get(i) && j < after.get(i) { { ..s, around: s.around.concat(clauses) } }
-            else { s }
+            if j >= before.get(i) && j < after.get(i) {
+              { ..s, enclosing_clauses: s.enclosing_clauses.concat(clauses) }
+            } else { s }
           }),
         }
       }),
@@ -6551,7 +6572,7 @@ fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.rai
         [],
         |acc: List<OrderedKey>, p: OrderedPart|
           order_needs(p.key, checker.type_shapes).fold(acc, |b: List<OrderedKey>, v: Int|
-            b.push({ key: VariableType(v), whole: p.key, carrier: p.carrier })),
+            b.push({ key: VariableType(v), whole_key: p.key, container: p.container })),
       ),
     ),
     span,
@@ -6605,7 +6626,7 @@ fn note_constraints(
             params: params,
             called: false,
             owner: checker.current_definition,
-            stated: None,
+            written_on_type: None,
           })
         });
       { ..checker, constrained_uses: checker.constrained_uses.concat(sites) }

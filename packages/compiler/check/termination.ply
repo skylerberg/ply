@@ -42,7 +42,7 @@ pub type Termination =
 
 pub type Site = { caller: Bytes, span: Span }
 
-pub type Place = { param: Int, path: List<Bytes> }
+pub type Place = { parameter_index: Int, path: List<Bytes> }
 
 pub type Base =
   | PlaceBase(Place)
@@ -74,7 +74,7 @@ pub type Group = {
   params: List<List<Type>>,
   resolve: (Int, QName) -> Callee / {abort.raise},
   binders: List<Map<Int, Int>>,
-  stated: (Int, Span) -> List<Callee> / {abort.raise},
+  implicit_callees: (Int, Span) -> List<Callee> / {abort.raise},
   ending_of: (Bytes) -> Termination / {abort.raise},
   summary_of: (Bytes) -> Option<Summary>,
 }
@@ -112,7 +112,7 @@ type Findings = {
   calls: List<Call>,
   uses: List<Use>,
   outside: List<ExternalCall>,
-  lost: Option<Span>,
+  too_deep_at: Option<Span>,
 }
 
 type MemberContext = { group: Group, current: Int, depth: Int, results: List<Option<Term>> }
@@ -137,7 +137,7 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   let lost = range(0, seen.len()).fold(None, |acc: Option<Site>, i: Int|
     match acc {
       Some(_) -> acc,
-      None -> match seen.get(i).lost { Some(span) -> Some(site(g, i, span)), None -> None },
+      None -> match seen.get(i).too_deep_at { Some(span) -> Some(site(g, i, span)), None -> None },
     });
   let own = match lost {
     Some(s) -> Diverges({ at: s, through: None, loop: [] }),
@@ -343,7 +343,7 @@ fn measures_of(
   let sized = range(0, g.definitions.get(member).params.len()).fold(
     [],
     |acc: List<Measure>, i: Int| {
-      let p = { param: i, path: [] };
+      let p = { parameter_index: i, path: [] };
       let size = acc.push(SizeMeasure(p));
       if place_is_collection(g, member, p) { size.push(ElementMeasure(p)) } else { size }
     },
@@ -448,8 +448,8 @@ type MeasureValue =
 
 fn measure_at_call(c: Call, m: Measure) -> MeasureValue =
   match m {
-    SizeMeasure(q) -> SizeValue(along(arg(c, q.param), q.path)),
-    ElementMeasure(q) -> ElementValue(along(arg(c, q.param), q.path)),
+    SizeMeasure(q) -> SizeValue(along(arg(c, q.parameter_index), q.path)),
+    ElementMeasure(q) -> ElementValue(along(arg(c, q.parameter_index), q.path)),
     DifferenceMeasure(d) ->
       DifferenceValue({ hi: substituted(c.args, d.hi), lo: substituted(c.args, d.lo) }),
     StatedMeasure -> StatedValue,
@@ -470,8 +470,8 @@ fn substituted(args: List<Term>, b: Option<Base>) -> Option<Linear> =
 
 fn base_at(args: List<Term>, b: Base) -> Option<Term> =
   match b {
-    PlaceBase(q) -> Some(along(argument_term(args, q.param), q.path)),
-    LengthBase(n) -> match along(argument_term(args, n.of.param), n.of.path) {
+    PlaceBase(q) -> Some(along(argument_term(args, q.parameter_index), q.path)),
+    LengthBase(n) -> match along(argument_term(args, n.of.parameter_index), n.of.path) {
       Exactly(l) -> match l.base {
         Some(PlaceBase(p)) -> if l.k != 0 { None }
         else { Some(Exactly({ base: Some(LengthBase({ name: n.name, of: p })), k: 0 })) },
@@ -659,7 +659,7 @@ fn record_relation(
   }
 
 fn within(q: Place, p: Place) -> Bool =
-  q.param == p.param && q.path.len() > p.path.len() && prefix(p.path, q.path)
+  q.parameter_index == p.parameter_index && q.path.len() > p.path.len() && prefix(p.path, q.path)
 
 fn prefix(a: List<Bytes>, b: List<Bytes>) -> Bool =
   match a {
@@ -694,7 +694,7 @@ fn atomic(t: Type) -> Bool =
   }
 
 fn place_type(g: Group, member: Int, p: Place) -> Option<Type> / {abort.raise} =
-  match g.params.get(member).at(p.param) {
+  match g.params.get(member).at(p.parameter_index) {
     None -> None,
     Some(t) ->
       p.path.fold(Some(t), |acc: Option<Type>, f: Bytes|
@@ -839,7 +839,7 @@ fn with_part(xs: Term, x: Term) -> Term =
       PartsOf(p) -> if part_of(x, p) { PartsOf(p) } else {
         match part_place(x) {
           Some(q) -> if within(p, q) { PartsOf(q) }
-          else if q.param != p.param { parts_of_places([p, q]) }
+          else if q.parameter_index != p.parameter_index { parts_of_places([p, q]) }
           else { UnknownTerm },
           None -> UnknownTerm,
         }
@@ -854,17 +854,18 @@ fn with_part(xs: Term, x: Term) -> Term =
 
 fn parts_of_places(places: List<Place>) -> Term = {
   let widest = places.fold([], |acc: List<Place>, p: Place|
-    match acc.find(|q: Place| q.param == p.param) {
+    match acc.find(|q: Place| q.parameter_index == p.parameter_index) {
       Some(q) ->
         acc.map(|r: Place|
-          if r.param == p.param { { param: p.param, path: common_prefix(q.path, p.path) } }
-          else { r }),
+          if r.parameter_index == p.parameter_index {
+            { parameter_index: p.parameter_index, path: common_prefix(q.path, p.path) }
+          } else { r }),
       None -> acc.push(p),
     });
   match widest {
     [] -> NoParts,
     [one] -> PartsOf(one),
-    _ -> PartsOfAny(widest.sort_by_key(|q: Place| q.param)),
+    _ -> PartsOfAny(widest.sort_by_key(|q: Place| q.parameter_index)),
   }
 }
 
@@ -891,7 +892,7 @@ fn iterated_result(
   }
 
 fn iterated_argument(it: CallbackUse, args: List<Expression>) -> Option<Expression> =
-  match it.over.at(0) { Some(k) -> args.at(k), None -> None }
+  match it.iterated_parameters.at(0) { Some(k) -> args.at(k), None -> None }
 
 fn callback_lambda(
   context: MemberContext,
@@ -975,7 +976,8 @@ fn term_of_expression(context: MemberContext, scope: Scope, e: Expression) -> Te
     },
     NameExpression(v) -> match local_of(context, scope, v.name) {
       Some(KnownTerm(t)) -> t,
-      Some(FunctionParam(i)) -> Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 }),
+      Some(FunctionParam(i)) ->
+        Exactly({ base: Some(PlaceBase({ parameter_index: i, path: [] })), k: 0 }),
       Some(LetLambda(_)) -> UnknownTerm,
       None -> match callee_of(context, scope, v.name) {
         ConstructorCallee -> NoParts,
@@ -1213,9 +1215,9 @@ fn term_at_call(context: MemberContext, t: Term, args: List<Term>) -> Term / {ab
         None -> UnknownTerm,
       },
     },
-    Below(p) -> below(along(argument_term(args, p.param), p.path)),
-    Inside(p) -> tail(along(argument_term(args, p.param), p.path)),
-    PartsOf(p) -> collection_of_parts(along(argument_term(args, p.param), p.path)),
+    Below(p) -> below(along(argument_term(args, p.parameter_index), p.path)),
+    Inside(p) -> tail(along(argument_term(args, p.parameter_index), p.path)),
+    PartsOf(p) -> collection_of_parts(along(argument_term(args, p.parameter_index), p.path)),
     RecordTerm(r) ->
       RecordTerm({
         base: match r.base { Some(b) -> Some(term_at_call(context, b, args)), None -> None },
@@ -1224,11 +1226,11 @@ fn term_at_call(context: MemberContext, t: Term, args: List<Term>) -> Term / {ab
       }),
     NoParts -> NoParts,
     Wrapped(x) -> Wrapped(term_at_call(context, x, args)),
-    SameLength(p) -> same_length(along(argument_term(args, p.param), p.path)),
+    SameLength(p) -> same_length(along(argument_term(args, p.parameter_index), p.path)),
     UnknownTerm -> UnknownTerm,
     PartsOfAny(ps) ->
       ps.fold(NoParts, |acc: Term, p: Place|
-        join(acc, collection_of_parts(along(argument_term(args, p.param), p.path)))),
+        join(acc, collection_of_parts(along(argument_term(args, p.parameter_index), p.path)))),
   }
 
 fn same_length(t: Term) -> Term =
@@ -1387,8 +1389,8 @@ fn joined_parts(a: Term, b: Term) -> Term =
   else if b == NoParts { widened(a) } else {
     match place_of(a) {
       Some(p) -> match place_of(b) {
-        Some(q) -> if p.param != q.param { parts_of_places([p, q]) } else {
-          let c = { param: p.param, path: common_prefix(p.path, q.path) };
+        Some(q) -> if p.parameter_index != q.parameter_index { parts_of_places([p, q]) } else {
+          let c = { parameter_index: p.parameter_index, path: common_prefix(p.path, q.path) };
           if !(lies_within_place(a, c) && lies_within_place(b, c)) { PartsOf(c) }
           else if below_kind(a) && below_kind(b) { Below(c) }
           else { Inside(c) }
@@ -1449,8 +1451,9 @@ fn entry_scope(context: MemberContext, definition: FnDefinition) -> Scope / {abo
     locals: range(0, definition.params.len()).fold(Map::new(), |m: Map<Int, Local>, i: Int|
       m.insert(
         definition.params.get(i).name.span.site,
-        if function_param(context.group, context.current, i) { FunctionParam(i) }
-        else { KnownTerm(Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 })) },
+        if function_param(context.group, context.current, i) { FunctionParam(i) } else {
+          KnownTerm(Exactly({ base: Some(PlaceBase({ parameter_index: i, path: [] })), k: 0 }))
+        },
       )),
     facts: [],
   }
@@ -1639,7 +1642,7 @@ fn comparison_facts(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> 
 fn walk_definition(context: MemberContext, definition: FnDefinition) -> Findings / {abort.raise} = {
   let s = entry_scope(context, definition);
   let defaults = definition.params.fold(
-    { calls: [], uses: [], outside: [], lost: None },
+    { calls: [], uses: [], outside: [], too_deep_at: None },
     |acc: Findings, p: Param| match p.default { Some(d) -> walk(context, s, acc, d), None -> acc },
   );
   walk(context, s, defaults, definition.body)
@@ -1674,7 +1677,7 @@ fn summary(context: MemberContext, x: Findings) -> Summary / {abort.raise} = {
 
 fn forwards_parameter(c: Call, i: Int) -> Bool =
   match c.args.at(i) {
-    Some(Exactly(l)) -> l.k == 0 && l.base == Some(PlaceBase({ param: i, path: [] })),
+    Some(Exactly(l)) -> l.k == 0 && l.base == Some(PlaceBase({ parameter_index: i, path: [] })),
     _ -> false,
   }
 
@@ -1893,19 +1896,22 @@ fn walk_implicit_calls(
   span: Span,
   operands: List<Term>,
 ) -> Findings / {abort.raise} =
-  context.group.stated(context.current, span).fold(acc, |seen: Findings, callee: Callee|
-    match callee {
-      GroupMember(m) -> {
-        let params = context.group.definitions.get(m).params;
-        let calls = if params.len() == operands.len() { [operands] }
-        else if params.len() == 1 && operands.len() > 0 { operands.map(|t: Term| [t]) }
-        else { [params.map(|_: Param| UnknownTerm)] };
-        calls.fold(seen, |a: Findings, args: List<Term>|
-          add_call(a, { callee: m, args: args, facts: s.facts, span: span }))
+  context.group.implicit_callees(context.current, span).fold(
+    acc,
+    |seen: Findings, callee: Callee|
+      match callee {
+        GroupMember(m) -> {
+          let params = context.group.definitions.get(m).params;
+          let calls = if params.len() == operands.len() { [operands] }
+          else if params.len() == 1 && operands.len() > 0 { operands.map(|t: Term| [t]) }
+          else { [params.map(|_: Param| UnknownTerm)] };
+          calls.fold(seen, |a: Findings, args: List<Term>|
+            add_call(a, { callee: m, args: args, facts: s.facts, span: span }))
+        },
+        DefinedCallee(n) -> add_external_call(seen, n, span),
+        _ -> seen,
       },
-      DefinedCallee(n) -> add_external_call(seen, n, span),
-      _ -> seen,
-    })
+  )
 
 fn walk_tagged_call(
   context: MemberContext,
@@ -1984,7 +1990,10 @@ fn lambda_escapes(
   }
 
 fn too_deep(acc: Findings, body: Expression) -> Findings =
-  match acc.lost { Some(_) -> acc, None -> { ..acc, lost: Some(expression_span(body)) } }
+  match acc.too_deep_at {
+    Some(_) -> acc,
+    None -> { ..acc, too_deep_at: Some(expression_span(body)) },
+  }
 
 fn walk_call(
   context: MemberContext,

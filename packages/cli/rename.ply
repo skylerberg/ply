@@ -16,12 +16,12 @@ import compiler.check.resolve.tables (Source, Declaration, Namespace, declaratio
                                       describe_namespace)
 import compiler.check.resolve.bindings (Reference, Member, Local, FieldName)
 import compiler.syntax.lexer (lex, Token)
-import rename.lines (Moved, OperationLine, Renames, keyword_rejection, renamed, renames_of, shown)
+import rename.lines (Moved, MemberLine, Renames, keyword_rejection, renamed, renames_of, shown)
 import rename.strings (Mention, mentions_in, module_mentions, qualified_edits)
-import rename.programs (Entry, Library, Loaded, Read, libraries_of, loads_of)
+import rename.programs (Entry, Library, Loaded, Read, DeclaredRecord, libraries_of, loads_of)
 import rename.edits (Edit, Edited, ModuleMove, SharedName, applied, comment_edits, edited_of,
                      shared_names, split_names, SplitName, moved_name, unqualified_name,
-                     qualified_renames, renaming_of, uses_renamed)
+                     qualified_renames, record_clashes, renaming_of, uses_renamed)
 import rename.verify (Renamed, retargeted_calls, verified)
 import program (ParsedSources)
 
@@ -50,7 +50,7 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
     |acc: Map<Bytes, Bool>, x: { load: Loaded, read: Read }|
       x.read.entries.fold(acc, |into: Map<Bytes, Bool>, e: Entry|
         e.names.members.fold(into, |found: Map<Bytes, Bool>, m: Member|
-          if m.kind == FieldName { found.insert(m.name, true) } else { found })),
+          match m.kind { FieldName(_) -> found.insert(m.name, true), _ -> found })),
   );
   let missing = |path: String| { path: path, reason: "is not among the files being renamed" };
   let declares = |x: { load: Loaded, read: Read }, name: Bytes|
@@ -67,15 +67,17 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
         Some(x) -> if declares(x, old) { found }
         else { found.push({ path: file, reason: "binds no " ++ shown(old) }) },
       })).concat(
-    renames.operations.fold([], |acc: List<Failure>, o: OperationLine|
-      match by_path.get(o.file) {
-        None -> acc.push(missing(o.file)),
+    renames.members.fold([], |acc: List<Failure>, m: MemberLine|
+      match by_path.get(m.file) {
+        None -> acc.push(missing(m.file)),
         Some(x) -> if x.read.effects.any(|e: { name: Bytes, operations: List<Bytes> }|
-            e.name == o.effect_name && e.operations.contains(o.op)) { acc } else {
+              e.name == m.of && e.operations.contains(m.member))
+            || x.read.records.any(|d: DeclaredRecord|
+              d.name == m.of && d.fields.contains(m.member)) { acc } else {
           acc.push({
-            path: o.file,
-            reason: "declares no operation "
-              ++ shown(Bytes::concat_all([o.effect_name, b".", o.op])),
+            path: m.file,
+            reason: "declares no effect operation or record field "
+              ++ shown(Bytes::concat_all([m.of, b".", m.member])),
           })
         },
       }),
@@ -161,6 +163,8 @@ fn planned(
     taken,
   ).concat(
     retargeted_calls(rn, loads),
+  ).concat(
+    record_clashes(rn, loads),
   ).concat(
     loads.fold([], |acc: List<Failure>, l: Loaded|
       l.unrenamed.fold(acc, |found: List<Failure>, r: Read|
@@ -340,7 +344,7 @@ fn rejected_with(reason: String) -> CommandOutput =
 pub fn run(
   flags: Flags,
 ) -> CommandOutput / {env.working_directory, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
-  match flags.map {
+  match flags.renames_file {
     None -> rejected_with("list the renames in a file and pass it with `--map FILE`"),
     Some(map) -> match read_file(rooted_path(map)) {
       None -> rejected_with(map ++ ": could not read"),

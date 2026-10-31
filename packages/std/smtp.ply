@@ -482,7 +482,7 @@ fn nothing_read() -> Partial = { digits: -1, lines: [], size: 0 }
 
 /// What reading at a buffer found: a whole reply or none, what was read of the next one, and
 /// where the unread bytes start.
-type ReplyScan = { whole: Option<Reply>, partial: Partial, at: Int }
+type ReplyScan = { whole: Option<Reply>, partial: Partial, unread_start: Int }
 
 fn printable(raw: Bytes) -> String =
   String::of_chars(
@@ -501,7 +501,7 @@ fn scan_reply(
   match held.index_of_from(b"\n", at) {
     None -> if held.len() - at > limits.line { smtp.fail(LineTooLong) }
     else if p.size + held.len() - at > limits.reply { smtp.fail(ReplyTooLarge) }
-    else { { whole: None, partial: p, at: at } },
+    else { { whole: None, partial: p, unread_start: at } },
     Some(end) -> {
       let size = p.size + end + 1 - at;
       if end + 1 - at > limits.line { smtp.fail(LineTooLong) }
@@ -522,7 +522,7 @@ fn scan_reply(
             {
               whole: Some({ code: Code(digits), lines: texts }),
               partial: nothing_read(),
-              at: end + 1,
+              unread_start: end + 1,
             }
           } else if left <= 0 { smtp.fail(ReplyTooLarge) } else {
             scan_reply(
@@ -543,7 +543,7 @@ fn scan_reply(
 pub fn read_reply(data: Bytes, limits: Limits) -> Reply / {smtp.fail, abort.raise} = {
   let t = scan_reply(data, 0, nothing_read(), limits, data.len());
   match t.whole {
-    Some(r) -> if t.at == data.len() { r } else { smtp.fail(Unsolicited) },
+    Some(r) -> if t.unread_start == data.len() { r } else { smtp.fail(Unsolicited) },
     None -> smtp.fail(BadLine),
   }
 }
@@ -982,9 +982,9 @@ type Transaction = {
   recipients: List<Address>,
   mail: Option<Reply>,
   rejected: List<Delivery>,
-  taken: List<Address>,
+  accepted_recipients: List<Address>,
   data: DataState,
-  cut: Option<EarlyEnd>,
+  ended_early: Option<EarlyEnd>,
 }
 
 type AuthExchange = { exchange: Exchange, pending_response: Option<sasl::Response> }
@@ -993,7 +993,7 @@ type State = {
   config: Config,
   link: Link,
   offered: Option<Capabilities>,
-  held: Bytes,
+  unparsed: Bytes,
   partial: Partial,
   pending: List<Expect>,
   todo: NextAction,
@@ -1072,7 +1072,7 @@ pub fn start(c: Config, link: Link) -> Turn =
       config: c,
       link: link,
       offered: None,
-      held: b"",
+      unparsed: b"",
       partial: nothing_read(),
       pending: [ForGreeting],
       todo: Idle,
@@ -1104,11 +1104,11 @@ pub fn deliveries(e: Engine) -> List<Delivery> = state(e).done
 
 /// The bytes the engine was fed and has not yet read as a line. They are passed to whatever
 /// starts TLS on the connection, which rejects the upgrade if there are any.
-pub fn unread(e: Engine) -> Bytes = state(e).held
+pub fn unread(e: Engine) -> Bytes = state(e).unparsed
 
 /// How many bytes of the reply being read the engine stores: at most `Limits.reply`, since it
 /// rejects any byte past that.
-pub fn buffered_size(e: Engine) -> Int = state(e).partial.size + state(e).held.len()
+pub fn buffered_size(e: Engine) -> Int = state(e).partial.size + state(e).unparsed.len()
 
 /// How many bytes a transport may read for the engine now: what is left of `Limits.reply` for
 /// the reply being read, and never less than the one byte that shows a reply to be too large.
@@ -1128,9 +1128,9 @@ fn ready(s: State) -> Bool = s.pending.len() == 0 && s.todo == Idle && !s.over
 /// no usable mechanism, or a rejected credential.
 pub fn feed(e: Engine, data: Bytes) -> Turn / {smtp.fail, abort.raise} = {
   let s = state(e);
-  let held = s.held.concat(data);
+  let held = s.unparsed.concat(data);
   if s.todo == StartHandshake && s.pending.len() == 0 { smtp.fail(Injected) }
-  else { absorb({ ..s, held: b"" }, held, 0, [], 0, held.len() + 1) }
+  else { absorb({ ..s, unparsed: b"" }, held, 0, [], 0, held.len() + 1) }
 }
 
 /// `left` bounds the rounds: each takes a reply.
@@ -1151,7 +1151,7 @@ fn absorb(
       match t.whole {
         None ->
           turn(
-            { ..s, held: held.slice(t.at, held.len()), partial: t.partial },
+            { ..s, unparsed: held.slice(t.unread_start, held.len()), partial: t.partial },
             Open(b""),
             Await(phase_of(awaited)),
             reply_of,
@@ -1161,7 +1161,7 @@ fn absorb(
           absorb(
             handle_reply({ ..s, pending: s.pending.drop(1), partial: nothing_read() }, awaited, r),
             held,
-            t.at,
+            t.unread_start,
             reply_of.concat(reply_lines(r)),
             replies_read + 1,
             left - 1,
@@ -1264,7 +1264,7 @@ fn handle_transaction_reply(
     {
       ..s,
       pending: [],
-      job: Some({ ..j, queue: [], cut: Some({ stage: stage, by: r }) }),
+      job: Some({ ..j, queue: [], ended_early: Some({ stage: stage, by: r }) }),
       todo: Advance,
       over: true,
     }
@@ -1273,8 +1273,9 @@ fn handle_transaction_reply(
   } else {
     let after = match awaited {
       ForMail -> if kind == Completed { j } else { { ..j, mail: Some(r) } },
-      ForRcpt(a) -> if kind == Completed { { ..j, taken: j.taken.push(a) } }
-      else { { ..j, rejected: j.rejected.push({ recipient: a, outcome: failure(AtRcpt, r) }) } },
+      ForRcpt(a) -> if kind == Completed {
+        { ..j, accepted_recipients: j.accepted_recipients.push(a) }
+      } else { { ..j, rejected: j.rejected.push({ recipient: a, outcome: failure(AtRcpt, r) }) } },
       ForData -> { ..j, data: if kind == Intermediate { ReadyForData } else { Stopped(r) } },
       _ -> { ..j, data: Ended(r) },
     };
@@ -1413,7 +1414,7 @@ fn advance(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {abort.r
     None -> turn({ ..s, todo: Idle }, Open(b""), Ready, reply_of, replies_read),
     Some(j) -> match j.queue {
       [next_step, ..later] -> if s.over || j.mail != None
-          || (next_step.expect == ForData && j.taken.len() == 0) {
+          || (next_step.expect == ForData && j.accepted_recipients.len() == 0) {
         finish_transaction(s, j, reply_of, replies_read)
       } else {
         turn(
@@ -1427,7 +1428,8 @@ fn advance(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {abort.r
       _ -> if j.data != ReadyForData || s.over { finish_transaction(s, j, reply_of, replies_read) }
       else {
         // A server that gives the go-ahead with no recipient accepted is sent only the final dot.
-        let body = if j.mail == None && j.taken.len() > 0 { j.payload } else { b".\r\n" };
+        let body = if j.mail == None && j.accepted_recipients.len() > 0 { j.payload }
+        else { b".\r\n" };
         turn(
           { ..s, job: Some({ ..j, data: Unasked }), pending: [ForEnd], todo: Advance },
           Open(body),
@@ -1467,10 +1469,11 @@ fn recipient_outcome(j: Transaction, a: Address) -> Outcome / {abort.raise} =
     None -> match j.rejected.find(|d: Delivery| d.recipient == a) {
       Some(d) -> d.outcome,
       None -> match j.data {
-        Ended(r) if j.taken.contains(a) -> if class_of(r.code) == Completed { Accepted(r) }
-        else { failure(AtEnd, r) },
-        Stopped(r) if j.taken.contains(a) -> failure(AtData, r),
-        _ -> match j.cut {
+        Ended(r) if j.accepted_recipients.contains(a) -> if class_of(r.code) == Completed {
+          Accepted(r)
+        } else { failure(AtEnd, r) },
+        Stopped(r) if j.accepted_recipients.contains(a) -> failure(AtData, r),
+        _ -> match j.ended_early {
           Some(c) -> Temporary(c.stage, c.by),
           None -> panic("a recipient the server never responded for"),
         },
@@ -1483,7 +1486,7 @@ fn recipient_outcome(j: Transaction, a: Address) -> Outcome / {abort.raise} =
 /// engine that did not request TLS.
 pub fn tls_started(e: Engine) -> Turn / {smtp.fail, abort.raise} = {
   let s = state(e);
-  if s.todo != StartHandshake || s.pending.len() > 0 || s.held.len() > 0 { smtp.fail(NotReady) }
+  if s.todo != StartHandshake || s.pending.len() > 0 || s.unparsed.len() > 0 { smtp.fail(NotReady) }
   else {
     take_next_action(
       { ..s, link: { ..s.link, secure: true }, offered: None, todo: SayHello },
@@ -1541,9 +1544,9 @@ pub fn mail(
                 recipients: envelope.recipients,
                 mail: None,
                 rejected: [],
-                taken: [],
+                accepted_recipients: [],
                 data: Unasked,
-                cut: None,
+                ended_early: None,
               }),
               pending: now.map(|step: Command| step.expect),
               todo: Advance,
@@ -2592,7 +2595,7 @@ type TestCredential = | Nobody | TimPassword | Pencil | Bearer(String)
 type Setup = {
   name: String,
   tls: TlsPolicy,
-  held: TestCredential,
+  credential: TestCredential,
   mechanisms: Option<List<Mechanism>>,
   exposure: Exposure,
   helo: Bool,
@@ -2602,7 +2605,7 @@ fn setup() -> Setup =
   {
     name: "client.example",
     tls: RequireTls,
-    held: Nobody,
+    credential: Nobody,
     mechanisms: None,
     exposure: Protected,
     helo: false,
@@ -2612,7 +2615,7 @@ fn named_as(name: String) -> Setup = { ..setup(), name: name }
 
 fn tls_as(s: Setup, policy: TlsPolicy) -> Setup = { ..s, tls: policy }
 
-fn given(s: Setup, h: TestCredential) -> Setup = { ..s, held: h }
+fn given(s: Setup, h: TestCredential) -> Setup = { ..s, credential: h }
 
 fn mechs(s: Setup, order: List<Mechanism>) -> Setup = { ..s, mechanisms: Some(order) }
 
@@ -2621,7 +2624,7 @@ fn clear_password(s: Setup) -> Setup = { ..s, exposure: PasswordInClear }
 fn helo(s: Setup) -> Setup = { ..s, helo: true }
 
 fn configured(s: Setup) -> Config / {abort.raise} = {
-  let held = match s.held {
+  let held = match s.credential {
     Nobody -> Ok(None),
     TimPassword -> try[sasl.fail] { Some(tim_password()) },
     Pencil -> try[sasl.fail] { Some(user_password()) },

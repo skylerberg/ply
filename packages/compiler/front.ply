@@ -195,11 +195,11 @@ pub type ShippedData = { name: Bytes, bytes: Bytes }
 derive bin for ShippedData
 
 pub type ShippedInputs = {
-  read: List<Source>,
+  sources: List<Source>,
   unread: List<Bytes>,
   data: List<ShippedData>,
   asked: List<Bytes>,
-  pulls: List<ModuleDependencies>,
+  dependencies: List<ModuleDependencies>,
 }
 
 pub type ModuleDependencies = { name: Bytes, pulls: Dependencies }
@@ -243,7 +243,7 @@ pub fn shipped_inputs_of_pulled<| e>(
   let lookup_or_empty = found.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source|
     acc.insert(s.name, true));
   {
-    read: found,
+    sources: found,
     unread: listed.filter(|n: Bytes| !lookup_or_empty.contains(n)),
     data: found.fold([], |acc: List<ShippedData>, source: Source|
       wants_of(source).data.fold(acc, |a: List<ShippedData>, name: Bytes|
@@ -251,7 +251,7 @@ pub fn shipped_inputs_of_pulled<| e>(
           match read_data(name) { Some(bytes) -> a.push({ name: name, bytes: bytes }), None -> a }
         })),
     asked: required,
-    pulls: [],
+    dependencies: [],
   }
 }
 
@@ -295,11 +295,11 @@ pub fn shipped_inputs_of<| e>(
   let lookup_or_empty = needed.found.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source|
     acc.insert(s.name, true));
   {
-    read: needed.found,
+    sources: needed.found,
     unread: listed.filter(|name: Bytes| !lookup_or_empty.contains(name)),
     data: needed.data,
     asked: required,
-    pulls: own.concat(needed.pulls),
+    dependencies: own.concat(needed.pulls),
   }
 }
 
@@ -521,7 +521,7 @@ type PullState = {
   pulled: List<Bytes>,
   embeds: List<ModuleEmbed>,
   diagnostics: List<Diagnostic>,
-  cuts: List<StubCuts>,
+  stubbable_bodies: List<StubCuts>,
   unimported: Map<Bytes, List<Bytes>>,
 }
 
@@ -593,8 +593,9 @@ fn pull_rounds(
         {
           ..acc,
           parsed: acc.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
-          cuts: if tested { acc.cuts }
-          else { acc.cuts.push({ name: o.parsed.name, cuts: cuts_of(o.parsed.module) }) },
+          stubbable_bodies: if tested { acc.stubbable_bodies } else {
+            acc.stubbable_bodies.push({ name: o.parsed.name, cuts: cuts_of(o.parsed.module) })
+          },
           pulled: acc.pulled.push(name),
           embeds: acc.embeds.concat(o.embeds),
         }
@@ -887,7 +888,7 @@ fn pulled_load(
       parsed: assembled,
       pulled: [],
       embeds: [],
-      cuts: read.cuts,
+      stubbable_bodies: read.cuts,
       diagnostics: [],
       unimported: unimported,
     },
@@ -949,7 +950,7 @@ pub fn load_with_shipped(
         x.unimported,
         fixed,
         load.embeds_at.concat(x.embeds),
-        x.cuts,
+        x.stubbable_bodies,
         checked,
       ) {
       Err(diagnostics) -> Err(diagnostics),
@@ -1514,7 +1515,7 @@ test "a program's tables made from what its modules' checks said of each are the
         w.warnings,
         w.manifest,
         w.packages,
-        w.pins,
+        w.locked_packages,
         w.module_packages,
         w.embeds,
       );
@@ -1540,7 +1541,7 @@ test "a program's tables made from what its modules' checks said of each are the
       assert_eq(made.emitter_roots, whole.emitter_roots);
       assert_eq(made.emitter_constructors, whole.emitter_constructors);
       assert_eq(made.rows, whole.rows);
-      assert_eq(made.walked, whole.walked);
+      assert_eq(made.inferred_facts, whole.inferred_facts);
       assert_eq(made, whole)
     },
   }
@@ -1589,7 +1590,7 @@ test "a program's tables made from its modules' facts, each shipped module's cut
     cut.warnings,
     cut.manifest,
     cut.packages,
-    cut.pins,
+    cut.locked_packages,
     cut.module_packages,
     cut.embeds,
   );
@@ -1813,8 +1814,8 @@ test "a shipped result carries neither what a load walked nor what it warned of"
   assert(d.diagnostics.len() > 0, Some("the program warns of something"));
   let shipped = runtime_dump(d);
   assert_eq(shipped.diagnostics, []);
-  assert_eq(shipped.walked, b"");
-  assert_eq(runtime_dump({ ..d, walked: b"another walk", diagnostics: [] }), shipped);
+  assert_eq(shipped.inferred_facts, b"");
+  assert_eq(runtime_dump({ ..d, inferred_facts: b"another walk", diagnostics: [] }), shipped);
   assert(d.bodies.len() > 0 && d.keys.len() > 0, Some("the program has bodies and keys"));
   assert_eq(shipped.bodies, []);
   assert_eq(shipped.rows, no_rows());
@@ -2151,7 +2152,7 @@ test "an effect set and its expansion are one program: the same hashes, bodies a
     let rows = rows_of(analysis_of(sources));
     {
       definitions: rows.definitions.map(|row: KnownDefinitionRow| { ..row, hash: b"", facts: b"" }),
-      tests: rows.tests.map(|row: KnownTestRow| { ..row, hash: b"", facts: b"" }),
+      tests: rows.tests.map(|row: KnownTestRow| { ..row, hash: b"", body_facts: b"" }),
     }
   };
   assert_eq(published(aliased), published(expanded));
@@ -2692,7 +2693,7 @@ test "every load reads `std.prelude`, keeping the functions it writes in Ply tha
   assert_eq(viewed(b"pub fn less(a: Int, b: Int) -> Bool = a < b\n"), []);
   assert_eq(viewed(b"pub fn equal(a: Int, b: Int) -> Bool = a == b\n"), declaration_sources);
   assert_eq(
-    emitted_code().calls.concat(emitted_code().lifts).filter(|n: Bytes|
+    emitted_code().calls.concat(emitted_code().insert_calls).filter(|n: Bytes|
       !builtins().any(|b: Builtin| b.body && b.name == n)),
     [],
   )
@@ -2800,7 +2801,7 @@ fn pulled_by(
 test "a load reads the shipped modules it imports and what those import, and no other" {
   let p = pulled_by([{ name: b"m", src: b"import std.a\npub fn f() -> Int = 1" }]);
   assert_eq(p.asked, [b"std.a", b"std.c"]);
-  assert_eq(p.shipping.read.map(|s: Source| s.name), [b"std.a", b"std.c"]);
+  assert_eq(p.shipping.sources.map(|s: Source| s.name), [b"std.a", b"std.c"]);
   assert_eq(p.shipping.unread, [b"std.b", b"std.d"])
 }
 
@@ -2812,7 +2813,7 @@ test "a load asked for a shipped module reads and pulls it, and what it imports,
   let pull_rounds = |required: List<Bytes>|
     analyse_pulling_std_with(
       user,
-      p.shipping.read,
+      p.shipping.sources,
       no_rows(),
       unread: p.shipping.unread,
       reached: false,
@@ -2942,7 +2943,7 @@ test "a load reads a compiler module's imports of its own package and the module
     |name: Bytes| None,
     dependencies_of,
   );
-  assert_eq(s.read.map(|t: Source| t.name), [
+  assert_eq(s.sources.map(|t: Source| t.name), [
     b"compiler.fmt",
     b"compiler.words.table",
     b"compiler.lexer",
@@ -2969,7 +2970,7 @@ test "a load reads the library's module text and data file a compiler module emb
     |name: Bytes| if name == b"std/oid/names.txt" { Some(b"2.5.4.3 cn\n") } else { None },
     dependencies_of,
   );
-  assert_eq(s.read.map(|t: Source| t.name), [b"compiler.fmt", b"std.words"]);
+  assert_eq(s.sources.map(|t: Source| t.name), [b"compiler.fmt", b"std.words"]);
   assert_eq(s.data.map(|d: { name: Bytes, bytes: Bytes }| d.name), [b"std/oid/names.txt"])
 }
 
@@ -3027,7 +3028,12 @@ test "given only what a load reads, the front end pulls and returns as it does o
   let user = [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }];
   let p = pulled_by(user);
   let whole = analyse_pulling_std(user, shipped_modules());
-  let lazy = analyse_pulling_std_with(user, p.shipping.read, no_rows(), unread: p.shipping.unread);
+  let lazy = analyse_pulling_std_with(
+    user,
+    p.shipping.sources,
+    no_rows(),
+    unread: p.shipping.unread,
+  );
   assert_eq(lazy.pulled, whole.pulled);
   assert_eq(dump_of(lazy.out), dump_of(whole.out))
 }
@@ -3035,7 +3041,7 @@ test "given only what a load reads, the front end pulls and returns as it does o
 test "a module that does not ship is reported listing every one that does, read or not" {
   let user = [{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }];
   let p = pulled_by(user);
-  assert_eq(p.shipping.read, []);
+  assert_eq(p.shipping.sources, []);
   let lazy = analyse_pulling_std_with(user, [], no_rows(), unread: p.shipping.unread);
   let whole = analyse_pulling_std(user, shipped_modules());
   assert_eq(dump_of(lazy.out), dump_of(whole.out))
@@ -3291,7 +3297,7 @@ pub type Published = { dump: Dump, schemes: List<{ name: Bytes, scheme: Scheme }
 
 pub fn published(outcome: AnalysisOutcome) -> Published / {abort.raise} =
   {
-    dump: { ..dump_of(outcome), walked: b"" },
+    dump: { ..dump_of(outcome), inferred_facts: b"" },
     schemes: match outcome {
       Rejected(_) -> [],
       Analysed(w) ->
@@ -3363,7 +3369,7 @@ test "a definition generic over effects is published from its rows, ending in th
 test "rows recorded under a hash this program no longer has are walked instead" {
   let rows = rows_of(analysis_of(effect_sources()));
   let stale = rows.definitions.map(|row: KnownDefinitionRow|
-    { ..row, hash: b"moved", effects: b"nowhere.read", performed: b"nowhere.read" });
+    { ..row, hash: b"moved", effects: b"nowhere.read", performed_effects: b"nowhere.read" });
   let walked = analyse_with(parse_all(effect_sources()), { ..rows, definitions: stale, tests: [] });
   assert_eq(seeded_of(walked), []);
   assert_eq(published(walked), published(analyse(parse_all(effect_sources()))))
@@ -3452,8 +3458,8 @@ fn wrong_effect_rows(sources: List<Source>) -> List<KnownDefinitionRow> / {abort
           hash: lookup_or_empty(definitions, n),
           effect_hashes: witness,
           effects: b"m.other.write",
-          performed: b"m.other.write",
-          scaling: b"",
+          performed_effects: b"m.other.write",
+          repeated_effects: b"",
           repeats: [],
           ending: Terminates,
           summary: unknown_summary(),
@@ -3599,7 +3605,7 @@ fn hash_of(sources: List<Source>, name: Bytes) -> Bytes / {abort.raise} =
     ) {
     ResolveFailed(_) -> b"",
     ResolveSucceeded(x) -> match by_name(
-        hash_index(build_index(x.modules, x.r).index).definitions,
+        hash_index(build_index(x.modules, x.resolution).index).definitions,
       ).get(
         name,
       ) {
@@ -3943,7 +3949,7 @@ test "the pins read off the closure are the pins an analysis returns, embeds inc
   ];
   let analysed = checked_analysis(
     analyse_pulling_std_with(user, [], no_rows(), embedding, reads).out,
-  ).pins;
+  ).locked_packages;
   assert_eq(analysed.len(), 1);
   assert_eq(locked_packages(user, embedding, reads), Ok(analysed))
 }
@@ -3970,9 +3976,9 @@ test "a dependency is pinned by what its modules embed as well as by their text"
         ],
       None -> [],
     };
-    checked_analysis(analyse_pulling_std_with(user, [], no_rows(), changed, reads).out).pins.map(
-      |pin: LockedPackage| pin.digest,
-    )
+    checked_analysis(
+      analyse_pulling_std_with(user, [], no_rows(), changed, reads).out,
+    ).locked_packages.map(|pin: LockedPackage| pin.digest)
   };
   assert(embedding_lib(Some(b"one")) != embedding_lib(Some(b"two")))
 }

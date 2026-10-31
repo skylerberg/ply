@@ -574,7 +574,7 @@ pub type Lookup<a> =
   | NeedMore(Int)
 
 /// An end record's numbers, or its zip64 record's.
-type EndRecord = { disk: Int, first: Int, here: Int, entries: Int, size: Int, at: Int }
+type EndRecord = { disk: Int, first: Int, disk_entries: Int, entries: Int, size: Int, at: Int }
 
 /// The position of each end record signature in `tail` from `from` on that has room for a record
 /// after it.
@@ -621,7 +621,7 @@ fn from_end_record(
   let narrow: EndRecord = {
     disk: u16(tail, p + 4),
     first: u16(tail, p + 6),
-    here: u16(tail, p + 8),
+    disk_entries: u16(tail, p + 8),
     entries: u16(tail, p + 10),
     size: Int::of_u32(tail.u32_le(p + 12)),
     at: Int::of_u32(tail.u32_le(p + 16)),
@@ -636,7 +636,7 @@ fn from_end_record(
       else if record < base { NeedMore(length - record) }
       else { from_zip64_end_record(tail, base, record, where, narrow, comment, limits) },
     }
-  } else if narrow.disk == 0xFFFF || narrow.first == 0xFFFF || narrow.here == 0xFFFF
+  } else if narrow.disk == 0xFFFF || narrow.first == 0xFFFF || narrow.disk_entries == 0xFFFF
       || narrow.entries == 0xFFFF
       || narrow.size == zip64_marker()
       || narrow.at == zip64_marker() { fail(where, BadZip64) }
@@ -661,14 +661,14 @@ fn from_zip64_end_record(
     let zip64: EndRecord = {
       disk: Int::of_u32(tail.u32_le(r + 16)),
       first: Int::of_u32(tail.u32_le(r + 20)),
-      here: zip64_number(record, tail, r + 24),
+      disk_entries: zip64_number(record, tail, r + 24),
       entries: zip64_number(record, tail, r + 32),
       size: zip64_number(record, tail, r + 40),
       at: zip64_number(record, tail, r + 48),
     };
     let same = |short: Int, mark: Int, long: Int| short == mark || short == long;
     if same(narrow.disk, 0xFFFF, zip64.disk) && same(narrow.first, 0xFFFF, zip64.first)
-        && same(narrow.here, 0xFFFF, zip64.here)
+        && same(narrow.disk_entries, 0xFFFF, zip64.disk_entries)
         && same(narrow.entries, 0xFFFF, zip64.entries)
         && same(narrow.size, zip64_marker(), zip64.size)
         && same(narrow.at, zip64_marker(), zip64.at) {
@@ -686,7 +686,7 @@ fn directory_of(
   comment: Bytes,
   limits: Limits,
 ) -> Lookup<Directory> / {zip.fail} =
-  if end.disk != 0 || end.first != 0 || end.here != end.entries { fail(where, Split) }
+  if end.disk != 0 || end.first != 0 || end.disk_entries != end.entries { fail(where, Split) }
   else if checked_add(end.at, end.size) != Some(close) || end.entries > end.size / 46 {
     fail(where, BadDirectory)
   } else if end.entries > limits.entries { fail(where, TooMany) }
@@ -1160,7 +1160,7 @@ type HeaderFields = {
   method: Int,
   stamp: Int,
   crc: Int,
-  stored: Int,
+  stored_size: Int,
   size: Int,
   external: Int,
   extra: Bytes,
@@ -1177,7 +1177,7 @@ fn header_fields(e: Entry, deflated: Bool, stored: Int) -> HeaderFields = {
     method: if deflated { 8 } else { 0 },
     stamp: match dos_time_or_zero(h.modified) { Some(stamped) -> stamped, None -> 0 },
     crc: Int::of_u32(crc32(e.data)),
-    stored: stored,
+    stored_size: stored,
     size: e.data.len(),
     external: (bits << 12 | h.mode) << 16 | (if h.kind == Directory { 0x10 } else { 0 }),
     extra: Bytes::concat_all(
@@ -1199,8 +1199,8 @@ fn zip64_field(numbers: List<Int>) -> Bytes =
 
 /// A member's own header, with a zip64 field of both sizes if either overflows its field.
 fn local_header(i: HeaderFields) -> Bytes = {
-  let zip64_number = i.stored >= zip64_marker() || i.size >= zip64_marker();
-  let extra = zip64_field(if zip64_number { [i.size, i.stored] } else { [] }).concat(i.extra);
+  let zip64_number = i.stored_size >= zip64_marker() || i.size >= zip64_marker();
+  let extra = zip64_field(if zip64_number { [i.size, i.stored_size] } else { [] }).concat(i.extra);
   Bytes::concat_all([
     b"PK\x03\x04",
     u16_le(if zip64_number { 45 } else { i.needs }),
@@ -1209,7 +1209,7 @@ fn local_header(i: HeaderFields) -> Bytes = {
     u16_le(i.stamp & 0xFFFF),
     u16_le(i.stamp >> 16),
     u32_le(i.crc),
-    if zip64_number { u32_le(zip64_marker()) } else { u32_le(i.stored) },
+    if zip64_number { u32_le(zip64_marker()) } else { u32_le(i.stored_size) },
     if zip64_number { u32_le(zip64_marker()) } else { u32_le(i.size) },
     u16_le(i.name.len()),
     u16_le(extra.len()),
@@ -1221,7 +1221,7 @@ fn local_header(i: HeaderFields) -> Bytes = {
 /// The directory's header for the member at `at`, with a zip64 field of each number that
 /// overflows its field, and of no other.
 fn central_header(i: HeaderFields, at: Int) -> Bytes = {
-  let numbers = [i.size, i.stored, at].filter(|n: Int| n >= zip64_marker());
+  let numbers = [i.size, i.stored_size, at].filter(|n: Int| n >= zip64_marker());
   let extra = zip64_field(numbers).concat(i.extra);
   let needs = if numbers.len() == 0 { i.needs } else { 45 };
   Bytes::concat_all([
@@ -1233,7 +1233,7 @@ fn central_header(i: HeaderFields, at: Int) -> Bytes = {
     u16_le(i.stamp & 0xFFFF),
     u16_le(i.stamp >> 16),
     u32_le(i.crc),
-    u32_field(i.stored),
+    u32_field(i.stored_size),
     u32_field(i.size),
     u16_le(i.name.len()),
     u16_le(extra.len()),
@@ -2081,7 +2081,7 @@ test "a member's own header agrees with what the directory records for it" {
 
 test "a data descriptor is read in each of its forms, and must match the directory" {
   let listed = { ..header_fields(file("a", b"x"), false, 1), flags: 8 };
-  let is_local_header = { ..listed, crc: 0, stored: 0, size: 0 };
+  let is_local_header = { ..listed, crc: 0, stored_size: 0, size: 0 };
   let sum = u32_le(listed.crc);
   let short = Bytes::concat_all([sum, u32_le(1), u32_le(1)]);
   let long = Bytes::concat_all([sum, u64_le(1), u64_le(1)]);
@@ -2214,23 +2214,28 @@ test "a number that overflows a header's field is written in a zip64 field, and 
     b"\x07\x00\x00\x00",
     45,
   ));
-  assert_eq(widths({ ..small, size: far, stored: far }, far), (28, ones.concat(ones), ones, 45));
+  assert_eq(widths({ ..small, size: far, stored_size: far }, far), (
+    28,
+    ones.concat(ones),
+    ones,
+    45,
+  ));
   assert_eq(
     read_central_header(
-      central_header({ ..small, size: far, stored: far + 1 }, far + 2),
+      central_header({ ..small, size: far, stored_size: far + 1 }, far + 2),
       0,
       0,
     ).wide,
     { size: far, stored: far + 1, at: far + 2, disk: 0 },
   );
-  assert_eq(read_central_header(central_header({ ..small, stored: far }, 3), 0, 0).wide, {
+  assert_eq(read_central_header(central_header({ ..small, stored_size: far }, 3), 0, 0).wide, {
     size: 0,
     stored: far,
     at: 3,
     disk: 0,
   });
   // A member's own header stores both sizes in zip64 if either overflows its field.
-  let is_local_header = local_header({ ..small, stored: far });
+  let is_local_header = local_header({ ..small, stored_size: far });
   assert_eq(is_local_header.len(), 31 + 20);
   assert_eq((u16(is_local_header, 4), is_local_header.slice(18, 26)), (45, ones.concat(ones)));
   assert_eq(

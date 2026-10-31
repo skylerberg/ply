@@ -764,8 +764,8 @@ type Machine = {
   link: UrlLayout,
   url: UrlState,
   word: Bytes,
-  held: List<Bytes>,
-  stray: Option<InvalidCharacter>,
+  tag_attributes: List<Bytes>,
+  first_invalid_character: Option<InvalidCharacter>,
 }
 
 fn no_tag() -> PartialTag = { name: [], end: false, attributes: [], closing: false }
@@ -812,8 +812,8 @@ fn machine(input: Bytes, s: Start, limits: Limits, switching: Bool, ended: Bool)
     link: NoUrl,
     url: NotInUrl,
     word: b"",
-    held: [],
-    stray: None,
+    tag_attributes: [],
+    first_invalid_character: None,
   }
 
 /// The bytes of `input` as the standard's decoder reads them: unchanged if they are UTF-8, and
@@ -1108,7 +1108,7 @@ fn new_tag(m: Machine, end: Bool, mode: Mode) -> Machine =
     tag: { name: [], end: end, attributes: [], closing: false },
     attribute: no_attribute(),
     name_size: 0,
-    held: [],
+    tag_attributes: [],
   }
 
 fn tag_open(m: Machine) -> Machine / {abort.raise} = {
@@ -2113,7 +2113,7 @@ fn linked_step(link: UrlLayout, t: UrlScan, c: Int) -> UrlScan / {abort.raise} =
 fn scan_url(m: Machine, piece: Bytes) -> Machine / {abort.raise} = {
   let start = max(m.at - piece.len(), 0);
   let read = iterate(
-    { i: 0, t: { url: m.url, word: m.word, broken: false }, stray: m.stray },
+    { i: 0, t: { url: m.url, word: m.word, broken: false }, stray: m.first_invalid_character },
     piece.len() + 1,
     |s: { i: Int, t: UrlScan, stray: Option<InvalidCharacter> }|
       if s.i >= piece.len() { Stop(s) } else {
@@ -2127,20 +2127,21 @@ fn scan_url(m: Machine, piece: Bytes) -> Machine / {abort.raise} = {
         Continue({ i: s.i + 1, t: { ..t, broken: false }, stray: stray })
       },
   );
-  { ..m, url: read.t.url, word: read.t.word, stray: read.stray }
+  { ..m, url: read.t.url, word: read.t.word, first_invalid_character: read.stray }
 }
 
 /// Records a stray at the end of a `<meta http-equiv=refresh>` whose `content` has a hole read
 /// before the tag declared the refresh, so the hole was not read as part of a URL.
 fn check_refresh_hole(m: Machine) -> Machine =
-  if m.held.len() == 0 || Bytes::concat_all(m.tag.name) != b"meta" || !m.held.contains(b"content")
+  if m.tag_attributes.len() == 0 || Bytes::concat_all(m.tag.name) != b"meta"
+      || !m.tag_attributes.contains(b"content")
       || !refresh_declared(m) { m } else {
-    match m.stray {
+    match m.first_invalid_character {
       Some(_) -> m,
       None ->
         {
           ..m,
-          stray: Some({
+          first_invalid_character: Some({
             message: "a hole in a refresh's `content` stands before its `http-equiv`, where no URL is read: write `http-equiv` first",
             offset: m.at,
           }),
@@ -2193,7 +2194,10 @@ fn feed(m: Machine, text: Bytes) -> Machine / {abort.raise} = {
     checked: [],
     checked_at: 0,
     checked_to: held_back.len(),
-    stray: match m.stray { Some(s) -> Some({ ..s, offset: s.offset - m.at }), None -> None },
+    first_invalid_character: match m.first_invalid_character {
+      Some(s) -> Some({ ..s, offset: s.offset - m.at }),
+      None -> None,
+    },
   }
 }
 
@@ -2226,7 +2230,7 @@ fn first_problem(
     String::of_bytes_lossy(text.slice(0, min(max(byte - skipped, 0), text.len()))).len();
   let earliest = d.problems.fold(None, |best: Option<Problem>, p: Problem|
     match best { Some(b) -> if p.offset < b.offset { Some(p) } else { best }, None -> Some(p) });
-  match ((earliest, d.m.stray)) {
+  match ((earliest, d.m.first_invalid_character)) {
     (Some(p), Some(s)) -> if s.offset < p.offset {
       Some({ message: s.message, offset: chars(s.offset) })
     } else { Some({ message: explain(p.error), offset: chars(p.offset) }) },
@@ -2248,7 +2252,12 @@ pub fn run(
   let d = drain(feed(m, bytes));
   match first_problem(d, bytes, m.input.len() - m.at) {
     Some(amiss) -> Err(amiss),
-    None -> Ok({ markup: text, from: from, to: Context({ ..d.m, problems: [], stray: None }) }),
+    None ->
+      Ok({
+        markup: text,
+        from: from,
+        to: Context({ ..d.m, problems: [], first_invalid_character: None }),
+      }),
   }
 }
 
@@ -2285,7 +2294,7 @@ fn in_value(m: Machine, place: Place) -> Result<HolePosition, String> = {
         place: place,
         url: None,
         listed: false,
-        m: { ..m, held: m.held.push(Bytes::concat_all(m.attribute.name)) },
+        m: { ..m, tag_attributes: m.tag_attributes.push(Bytes::concat_all(m.attribute.name)) },
       }),
     UrlStart | AfterDelay | AfterKey -> at(Start, HoleInFirstPart),
     SchemeLetters | HoleInFirstPart | UrlKey -> at(First, HoleInFirstPart),
@@ -2396,7 +2405,7 @@ fn normalize_state(m: Machine) -> Machine / {abort.raise} = {
     {
       ..s,
       tag: { ..s.tag, attributes: names_only(s.tag.attributes) },
-      held: unique_sorted(s.held),
+      tag_attributes: unique_sorted(s.tag_attributes),
       temp: b"",
     };
   let unlinked = |s: Machine| { ..named_reference(s), link: NoUrl, url: NotInUrl, word: b"" };
@@ -2406,7 +2415,7 @@ fn normalize_state(m: Machine) -> Machine / {abort.raise} = {
         ..cleared,
         tag: no_tag(),
         attribute: no_attribute(),
-        held: [],
+        tag_attributes: [],
         last_start: b"",
         temp: b"",
         link: NoUrl,
@@ -2424,14 +2433,14 @@ fn normalize_state(m: Machine) -> Machine / {abort.raise} = {
         ..cleared,
         tag: { ..no_tag(), name: m.tag.name, end: true },
         attribute: no_attribute(),
-        held: [],
+        tag_attributes: [],
       },
     _ ->
       {
         ..cleared,
         tag: no_tag(),
         attribute: no_attribute(),
-        held: [],
+        tag_attributes: [],
         link: NoUrl,
         url: NotInUrl,
         word: b"",
@@ -2473,9 +2482,9 @@ pub fn join(a: Context, b: Context) -> Option<Context> / {abort.raise} = {
   let xs = resolved(x0);
   let ys = resolved(y0);
   let attributes = names_only(xs.tag.attributes.concat(ys.tag.attributes));
-  let held = unique_sorted(xs.held.concat(ys.held));
-  let x = { ..xs, tag: { ..xs.tag, attributes: attributes }, held: held };
-  let y = { ..ys, tag: { ..ys.tag, attributes: attributes }, held: held };
+  let held = unique_sorted(xs.tag_attributes.concat(ys.tag_attributes));
+  let x = { ..xs, tag: { ..xs.tag, attributes: attributes }, tag_attributes: held };
+  let y = { ..ys, tag: { ..ys.tag, attributes: attributes }, tag_attributes: held };
   let barred = |s: Machine|
     s.url != UrlStart && s.url != SchemeLetters && s.url != HoleInFirstPart && s.url != InPath
       && s.url != InQuery

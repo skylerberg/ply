@@ -460,7 +460,7 @@ pub type Constructor = { name: Bytes, arity: Int }
 
 pub type UnitContents = {
   bodies: List<UnitBody>,
-  offered: List<RequestedRoot>,
+  requested: List<RequestedRoot>,
   named: Map<RootName, List<RootName>>,
 }
 
@@ -729,7 +729,7 @@ fn position_in(m: Map<Bytes, Int>, key: Bytes) -> Int / {abort.raise} =
     None -> panic("the unit's tables contain everything its bodies name"),
   }
 
-type Hole = { open: Int, close: Int, kind: Int, digits: Bytes }
+type Hole = { open_position: Int, close_position: Int, kind: Int, digits: Bytes }
 
 fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
   iterate({ from: 0, out: [] }, text.len() + 1, |s: { from: Int, out: List<Hole> }|
@@ -741,8 +741,8 @@ fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
           Continue({
             from: close + 2,
             out: s.out.push({
-              open: open,
-              close: close,
+              open_position: open,
+              close_position: close,
               kind: text.at(open + 2),
               digits: text.slice(open + 3, close),
             }),
@@ -798,13 +798,22 @@ fn resolved(
           b"]",
         ])
       };
-      { from: h.close + 2, out: s.out.push(text.slice(s.from, h.open)).push(value) }
+      {
+        from: h.close_position + 2,
+        out: s.out.push(text.slice(s.from, h.open_position)).push(value),
+      }
     },
   );
   Bytes::concat_all(walk_levels.out.push(text.slice(walk_levels.from, text.len())))
 }
 
-type IncludedRoot = { name: RootName, arity: Int, symbol: Bytes, entry: Bytes, head: Prototype }
+type IncludedRoot = {
+  name: RootName,
+  arity: Int,
+  symbol: Bytes,
+  entry: Bytes,
+  prototype: Prototype,
+}
 
 fn count_line(label: Bytes, n: Int) -> Bytes =
   Bytes::concat_all([label, b" ", ascii_of_int(n), b"\n"])
@@ -1149,7 +1158,7 @@ fn part_written<| e>(
     p.group.fold([], |acc: List<RootName>, m: BodyHoles|
       acc.concat(reaches_of(m.body.name, m.body.tables))),
   ).map(|name: RootName|
-    match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" });
+    match taken.get(name) { Some(t) -> prototype(t.symbol, t.prototype), None -> b"" });
   let called = p.group.fold(Map::new(), |acc: Map<Bytes, Bool>, m: BodyHoles|
     m.body.tables.natives.fold(acc, |x: Map<Bytes, Bool>, n: Bytes| x.insert(n, true)));
   let natives = machine.filter(|n: Native| called.contains(n.name));
@@ -1270,7 +1279,7 @@ pub fn produce<| e>(
       arity: match offers.get(n) { Some(o) -> o.arity, None -> 0 },
       symbol: symbol_named(n),
       entry: entry(n),
-      head: published(n).head,
+      prototype: published(n).head,
     });
   s.bodies.fold((), |_u: Unit, k: UnitBody|
     k.tables.generics.expects.fold((), |_v: Unit, e: ExpectedPrototype|
@@ -1341,7 +1350,7 @@ pub fn produce<| e>(
   {
     parts: written.parts.concat(tail),
     taken: names,
-    made: { bodies: s.bodies, offered: offered, named: named },
+    made: { bodies: s.bodies, requested: offered, named: named },
     records: written.records,
   }
 }
@@ -1377,7 +1386,7 @@ pub fn codes(made: UnitContents) -> Map<RootName, Bytes> / {abort.raise} = {
   let n = bodies.len();
   let index = range(0, n).fold(Map::new(), |acc: Map<RootName, Int>, i: Int|
     body_names(bodies.get(i)).fold(acc, |m: Map<RootName, Int>, name: RootName| m.insert(name, i)));
-  let roots = made.offered.fold(
+  let roots = made.requested.fold(
     Map::new(),
     |acc: Map<RootName, RequestedRoot>, o: RequestedRoot| acc.insert(o.name, o),
   );
@@ -1425,7 +1434,7 @@ type Program = {
   marshalling: MarshalledSums,
   declared: Map<Bytes, Bytes>,
   digests: Map<Bytes, Bytes>,
-  stated: Map<Bytes, Bool>,
+  constructor_functions: Map<Bytes, Bool>,
 }
 
 fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program / {abort.raise} = {
@@ -1493,7 +1502,7 @@ fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program
         Some(t) -> acc.insert(m, blake3(t)),
         None -> acc,
       }),
-    stated: stated_functions(dump),
+    constructor_functions: stated_functions(dump),
   }
 }
 
@@ -1594,7 +1603,8 @@ fn root_cache_key(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> /
       None -> None,
     },
     Named(n) -> match definition_cache_key(program, root_name(k)) {
-      Some(m) -> Some(if program.stated.contains(n) { m.concat(b"\x00stated") } else { m }),
+      Some(m) ->
+        Some(if program.constructor_functions.contains(n) { m.concat(b"\x00stated") } else { m }),
       None -> None,
     },
     Clause(c) -> match c.definition {
@@ -1926,15 +1936,19 @@ fn scope_of_modules(
     dump.embeds,
     dump.rows,
     dump.effects,
-    dump.walked,
+    dump.inferred_facts,
     derived: dump.derived,
   )
 }
 
-type EmitterScope = { scope: Option<emit::Scope>, covered: Map<Bytes, Bool>, ahead: List<RootKey> }
+type EmitterScope = {
+  scope: Option<emit::Scope>,
+  covered: Map<Bytes, Bool>,
+  expected_roots: List<RootKey>,
+}
 
 fn initial_emitter_scope(ahead: List<RootKey>) -> EmitterScope =
-  { scope: None, covered: Map::new(), ahead: ahead }
+  { scope: None, covered: Map::new(), expected_roots: ahead }
 
 fn emit_scoped(
   dump: Dump,
@@ -1959,14 +1973,18 @@ fn emit_scoped(
       { scope: scope_of_modules(dump, p, constructors, offered, covered), covered: covered }
     },
     None -> {
-      let covered = modules_asked(p, roots.concat(scope.ahead));
+      let covered = modules_asked(p, roots.concat(scope.expected_roots));
       { scope: scope_of_modules(dump, p, constructors, offered, covered), covered: covered }
     },
   };
   let batch_count = batches(p, roots);
   let a = results_in_parallel(scoped.scope, batch_count, 0, batch_count.len(), 64, handed, done);
   {
-    state: { scope: Some(scoped.scope), covered: scoped.covered, ahead: scope.ahead },
+    state: {
+      scope: Some(scoped.scope),
+      covered: scoped.covered,
+      expected_roots: scope.expected_roots,
+    },
     results: decoded_results(a),
     found: a.found,
   }
@@ -2191,7 +2209,7 @@ type EmissionProgress<s> = {
   stored: Map<RootName, Stored>,
   keys: Map<RootName, RootKey>,
   published: Map<RootName, PublishedSignature>,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership: Map<RootName, OwnershipSignature>,
   cached: Int,
   asked: Int,
   added: List<RootKey>,
@@ -2201,9 +2219,9 @@ type EmissionProgress<s> = {
   unread: List<RootName>,
   unresolved: List<RootName>,
   emitter: s,
-  unkept: List<Record>,
+  unstored_records: List<Record>,
   dependents: Map<RootName, List<RootName>>,
-  offered: Map<RootName, Bool>,
+  requested: Map<RootName, Bool>,
 }
 
 pub type LevelTally = {
@@ -2243,7 +2261,7 @@ fn walk_levels<s | e>(
       stored: Map::new(),
       keys: Map::new(),
       published: Map::new(),
-      handed: Map::new(),
+      ownership: Map::new(),
       cached: 0,
       asked: 0,
       added: [],
@@ -2253,9 +2271,9 @@ fn walk_levels<s | e>(
       unread: [],
       unresolved: [],
       emitter: emitter,
-      unkept: [],
+      unstored_records: [],
       dependents: Map::new(),
-      offered: offered.map(root_name).fold(Map::new(), |m: Map<RootName, Bool>, n: RootName|
+      requested: offered.map(root_name).fold(Map::new(), |m: Map<RootName, Bool>, n: RootName|
         m.insert(n, true)),
     },
     |w: EmissionProgress<s>, l: Int|
@@ -2363,8 +2381,8 @@ fn walk_level<s | e>(
       }
     },
   );
-  if walk_levels.walk.unkept.len() > 0 { keep(walk_levels.walk.unkept) };
-  { ..walk_levels, walk: { ..walk_levels.walk, unkept: [] } }
+  if walk_levels.walk.unstored_records.len() > 0 { keep(walk_levels.walk.unstored_records) };
+  { ..walk_levels, walk: { ..walk_levels.walk, unstored_records: [] } }
 }
 
 fn stale_here<s>(w: EmissionProgress<s>, changed: List<RootName>) -> List<RootKey> =
@@ -2392,7 +2410,7 @@ fn dependents_with(
       })))
 
 type AskProgress<s> = {
-  fresh: Map<RootName, Output>,
+  emitted: Map<RootName, Output>,
   cached: Map<RootName, Output>,
   asked: Int,
   pending: List<RootKey>,
@@ -2424,7 +2442,7 @@ fn with_results<s | e>(
   let missed = keys.values().filter(|k: RootKey| !cached.contains(root_name(k)));
   let resolved = iterate(
     {
-      fresh: Map::new(),
+      emitted: Map::new(),
       cached: cached,
       asked: 0,
       pending: missed,
@@ -2433,22 +2451,22 @@ fn with_results<s | e>(
     },
     cached.len() + 2,
     |t: AskProgress<s>| {
-      let now = t.fresh.fold(t.cached, |m: Map<RootName, Output>, n: RootName, a: Output|
+      let now = t.emitted.fold(t.cached, |m: Map<RootName, Output>, n: RootName, a: Output|
         m.insert(n, a));
       let moved = stale_of(now, published_signatures(w.published, now), keys);
       let asking = t.pending.concat(moved);
       if asking.len() == 0 { Stop(t) } else {
-        let got = ask(t.emitter, asking, merged_ownership(w.handed, now), {
+        let got = ask(t.emitter, asking, merged_ownership(w.ownership, now), {
           before: w.results,
           now: now,
         });
         let results = results_by_name(got.results);
         let found = got.found.fold(t.found, |m: Map<RootName, RootKey>, k: RootKey|
           if keys.contains(root_name(k)) { m } else { m.insert(root_name(k), k) });
-        let stood = moved.fold(t.fresh, |m: Map<RootName, Output>, k: RootKey|
+        let stood = moved.fold(t.emitted, |m: Map<RootName, Output>, k: RootKey|
           m.remove(root_name(k)));
         Continue({
-          fresh: results.fold(stood, |m: Map<RootName, Output>, n: RootName, a: Output|
+          emitted: results.fold(stood, |m: Map<RootName, Output>, n: RootName, a: Output|
             m.insert(n, a)),
           cached: moved.fold(t.cached, |m: Map<RootName, Output>, k: RootKey|
             m.remove(root_name(k))),
@@ -2461,13 +2479,13 @@ fn with_results<s | e>(
     },
   );
   let reached = reachable_found_roots(
-    resolved.fresh.fold(resolved.cached, |acc: Map<RootName, Output>, n: RootName, a: Output|
+    resolved.emitted.fold(resolved.cached, |acc: Map<RootName, Output>, n: RootName, a: Output|
       acc.insert(n, a)),
     names,
     resolved.found,
   );
   let body_names = missed.fold(
-    resolved.found.fold(resolved.fresh, |acc: Map<RootName, Output>, n: RootName, _: RootKey|
+    resolved.found.fold(resolved.emitted, |acc: Map<RootName, Output>, n: RootName, _: RootKey|
       if reached.contains(n) { acc } else { acc.remove(n) }),
     |acc: Map<RootName, Output>, k: RootKey|
       if acc.contains(root_name(k)) { acc } else {
@@ -2507,11 +2525,11 @@ fn with_results<s | e>(
     ),
     added: w.added.concat(reached.values()),
     published: published_signatures(w.published, all),
-    handed: merged_ownership(w.handed, all),
+    ownership: merged_ownership(w.ownership, all),
     dependents: dependents_with(w.dependents, all),
     cached: w.cached + all.len() - body_names.len(),
     asked: w.asked + resolved.asked,
-    unkept: w.unkept.concat(r.records),
+    unstored_records: w.unstored_records.concat(r.records),
     known: r.known,
     unread: w.unread.concat(now),
     unresolved: w.unresolved.concat(now),
@@ -2558,7 +2576,7 @@ fn missing_callees<s>(w: EmissionProgress<s>) -> Map<RootName, RootKey> =
           match c {
             Generated(_, _) -> unheld(m, c),
             Clause(_) -> unheld(m, c),
-            Named(_) -> if w.offered.contains(root_name(c)) { m } else { unheld(m, c) },
+            Named(_) -> if w.requested.contains(root_name(c)) { m } else { unheld(m, c) },
             _ -> m,
           });
         b.tables.generics.calls.fold(written, |m: Map<RootName, RootKey>, g: GenericCall|
@@ -2806,7 +2824,7 @@ fn extended_called(
   let alone = bodies.fold(Map::new(), |acc: Map<RootName, Generics>, n: RootName, t: Tables|
     if t.members.len() <= 1 { acc.insert(n, t.generics) } else { acc });
   let start = alone.fold(closed, |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
-    acc.insert(n, g.called));
+    acc.insert(n, g.called_parameters));
   let calls_count = |called: Map<RootName, List<Int>>|
     alone.fold(0, |c: Int, n: RootName, _: Generics|
       c + (match called.get(n) { Some(cs) -> cs.len(), None -> 0 }));
@@ -2864,8 +2882,9 @@ fn call_specialisation(
     let loader_tables = || KeyLayout({ key: layout_key(constructors, arg), at: arg });
     if has_variables(arg) { open }
     else if ns.contains({ var: j, reads: Exact }) { KeyType(arg) }
-    else if call.carried.contains(j) || ns.contains({ var: j, reads: Layout }) { loader_tables() }
-    else if ns.contains({ var: j, reads: Scalar }) && is_scalar_type(arg) { loader_tables() }
+    else if call.specialised_variables.contains(j) || ns.contains({ var: j, reads: Layout }) {
+      loader_tables()
+    } else if ns.contains({ var: j, reads: Scalar }) && is_scalar_type(arg) { loader_tables() }
     else if ns.contains({ var: j, reads: Scalar }) && numeric_sum(constructors, arg) {
       KeyType(arg)
     } else { open }
@@ -3096,8 +3115,8 @@ fn placeholders_named(text: Bytes, roots: List<RootName>) -> Bytes / {abort.rais
     { from: 0, out: [] },
     |s: { from: Int, out: List<Bytes> }, h: Hole|
       {
-        from: h.close + 2,
-        out: s.out.push(text.slice(s.from, h.open)).push(
+        from: h.close_position + 2,
+        out: s.out.push(text.slice(s.from, h.open_position)).push(
           symbol_of(root_text(roots.get(digits(h.digits)))),
         ),
       },
@@ -3244,7 +3263,7 @@ test "a generic call resolves on each argument its callee's code needs, and leav
       {
         callee: Named(callee),
         args: [parsed_type(arg)],
-        carried: [],
+        specialised_variables: [],
         functions: [],
         effect_evidence: [],
       },
@@ -3271,7 +3290,10 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
   let body = |called: List<Int>, passes: List<ForwardedParameter>|
     {
       text: b"",
-      tables: { ..no_tables(), generics: { ..no_generics(), called: called, passes: passes } },
+      tables: {
+        ..no_tables(),
+        generics: { ..no_generics(), called_parameters: called, passes: passes },
+      },
     };
   let results = by_definition([
     { key: b"m.each", value: body([1], []) },
@@ -3286,7 +3308,7 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
         {
           callee: Named(callee),
           args: [],
-          carried: [],
+          specialised_variables: [],
           functions: [{ param: param, owner: Named(b"m.main"), nth: 0 }],
           effect_evidence: [],
         },
@@ -3312,14 +3334,14 @@ test "a generic body needs what its callees need of what it hands them, through 
           {
             callee: Named(b"m.add"),
             args: [parsed_type(b"'0")],
-            carried: [],
+            specialised_variables: [],
             functions: [],
             effect_evidence: [],
           },
           {
             callee: Named(b"m.lay"),
             args: [parsed_type(b"{v:'1}")],
-            carried: [],
+            specialised_variables: [],
             functions: [],
             effect_evidence: [],
           },
@@ -3334,7 +3356,7 @@ test "a generic body needs what its callees need of what it hands them, through 
           {
             callee: Named(b"m.wrap"),
             args: [parsed_type(b"List<_>"), parsed_type(b"'0")],
-            carried: [],
+            specialised_variables: [],
             functions: [],
             effect_evidence: [],
           },
@@ -3350,7 +3372,7 @@ test "a generic body needs what its callees need of what it hands them, through 
           {
             callee: Named(b"m.same"),
             args: [parsed_type(b"List<'0>")],
-            carried: [],
+            specialised_variables: [],
             functions: [],
             effect_evidence: [],
           },
@@ -3380,7 +3402,7 @@ test "a generic body whose needs or its callees' read a variable's layout or typ
           {
             callee: Named(b"m.same"),
             args: [parsed_type(b"List<'0>")],
-            carried: [],
+            specialised_variables: [],
             functions: [],
             effect_evidence: [],
           },
@@ -3486,7 +3508,7 @@ fn program_calling_f_at(
     let call = {
       callee: Named(b"m.f"),
       args: [parsed_type(arg)],
-      carried: [],
+      specialised_variables: [],
       functions: [],
       effect_evidence: [],
     };
@@ -4449,7 +4471,7 @@ test "a call written against a handing its callee does not publish fails the bui
     produced: {
       parts: [],
       taken: [],
-      made: { bodies: [], offered: [], named: Map::new() },
+      made: { bodies: [], requested: [], named: Map::new() },
       records: [],
     },
     roots: [],
@@ -5613,7 +5635,7 @@ test "a part reads as it would were each root its bodies define written as its s
   let unit = |texts: List<Bytes>|
     fresh(
       constructors,
-      made.offered,
+      made.requested,
       1,
       results_by_name(
         range(0, made.bodies.len()).map(|i: Int| {
@@ -6153,7 +6175,7 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
         arity: 0,
         symbol: b"f",
         entry: b"e",
-        head: word_prototype(0),
+        prototype: word_prototype(0),
       },
     ]),
     Bytes::concat_all([
@@ -6398,7 +6420,7 @@ test "a walk grows its scope once, over what is left, where a cached body's call
     let edited = parted_program(b"f(f(x))", b"1");
     let warm = walk_in_store(edited);
     let scoped = warm.walk.emitter.scoped;
-    assert(!modules_asked(warm.program, scoped.ahead).contains(b"k"), None);
+    assert(!modules_asked(warm.program, scoped.expected_roots).contains(b"k"), None);
     assert(scoped.covered.contains(b"k"), None);
     assert_eq(warm.walk.emitter.built, 2);
     let cold = with_body_store(|| walk_in_store(edited)).walk;

@@ -33,7 +33,7 @@ import compiler.expand.rewrite.shared (bare_names_read)
 
 pub fn implicit_binder(module: Bytes) -> Bytes = b"@".concat(module)
 
-type Member = { entry: EffectExpression, home: Int }
+type Member = { entry: EffectExpression, defining_module: Int }
 
 type SetNode = {
   definition: EffectSetDefinition,
@@ -137,7 +137,7 @@ fn diverges_expression(qname: QName) -> EffectExpression =
     mode: ReadMode,
     op: None,
     resource: None,
-    every: false,
+    resource_wildcard: false,
     bounded: false,
     span: qname.span,
   }
@@ -232,59 +232,69 @@ fn set_includes(resolved: Resolution, table: SetTable) -> SetTable / {abort.rais
   })
 
 type SetSearch = {
-  color: List<Int>,
+  visit_state: List<Int>,
   path: List<Int>,
   work: List<{ node: Int, next: Int }>,
-  t: SetTable,
+  table: SetTable,
 }
 
 fn set_cycles(table: SetTable) -> SetTable / {abort.raise} = {
   let n = table.nodes.len();
   let steps = table.nodes.fold(0, |acc: Int, node: SetNode| acc + node.includes.len());
-  let start: SetSearch = { color: range(0, n).map(|i: Int| 0), path: [], work: [], t: table };
+  let start: SetSearch = {
+    visit_state: range(0, n).map(|i: Int| 0),
+    path: [],
+    work: [],
+    table: table,
+  };
   let done = range(0, n).fold(start, |d: SetSearch, root: Int|
-    if d.color.get(root) != 0 { d } else {
+    if d.visit_state.get(root) != 0 { d } else {
       let opened: SetSearch = {
         ..d,
-        color: d.color.set(root, 1),
+        visit_state: d.visit_state.set(root, 1),
         path: d.path.push(root),
         work: [{ node: root, next: 0 }],
       };
       iterate(opened, 2 * (n + steps) + 4, |x: SetSearch|
         if x.work.len() == 0 { Stop(x) } else { Continue(set_search_step(x)) })
     });
-  done.t
+  done.table
 }
 
 fn set_search_step(d: SetSearch) -> SetSearch / {abort.raise} = {
   let top = d.work.get(d.work.len() - 1);
   let rest = d.work.take(d.work.len() - 1);
-  let out = d.t.nodes.get(top.node).includes;
+  let out = d.table.nodes.get(top.node).includes;
   if top.next >= out.len() {
-    { ..d, color: d.color.set(top.node, 2), work: rest, path: d.path.take(d.path.len() - 1) }
+    {
+      ..d,
+      visit_state: d.visit_state.set(top.node, 2),
+      work: rest,
+      path: d.path.take(d.path.len() - 1),
+    }
   } else {
     let advanced = rest.push({ node: top.node, next: top.next + 1 });
     match out.get(top.next) {
       None -> { ..d, work: advanced },
       Some(target) -> {
-        let c = d.color.get(target);
+        let c = d.visit_state.get(target);
         if c == 0 {
           {
             ..d,
             work: advanced.push({ node: target, next: 0 }),
-            color: d.color.set(target, 1),
+            visit_state: d.visit_state.set(target, 1),
             path: d.path.push(target),
           }
         } else if c == 1 {
           let st = match position(d.path, target) { Some(p) -> p, None -> 0 };
           let cycle = d.path.drop(st);
           let t2 = {
-            ..d.t,
-            diagnostics: d.t.diagnostics.push(set_cycle(d.t, cycle)),
-            nodes: cycle.fold(d.t.nodes, |ns: List<SetNode>, i: Int|
+            ..d.table,
+            diagnostics: d.table.diagnostics.push(set_cycle(d.table, cycle)),
+            nodes: cycle.fold(d.table.nodes, |ns: List<SetNode>, i: Int|
               ns.set(i, { ..ns.get(i), cyclic: true })),
           };
-          { ..d, work: advanced, t: t2 }
+          { ..d, work: advanced, table: t2 }
         } else { { ..d, work: advanced } }
       },
     }
@@ -353,7 +363,7 @@ fn effect_owner(
 
 fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise} = {
   let a = member.entry;
-  let eff = match effect_owner(resolved, member.home, a.effect_name) {
+  let eff = match effect_owner(resolved, member.defining_module, a.effect_name) {
     Some(o) -> qualify(resolved.scopes.get(o.target).module, o.name),
     None -> match a.effect_name.module {
       Some(b) -> Bytes::concat_all([b.name, b"::", a.effect_name.name.name]),
@@ -367,7 +377,7 @@ fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise} = {
     b" ",
     match a.op { Some(o) -> o.name, None -> b"" },
     b" ",
-    if a.every { b"*" } else { match a.resource { Some(x) -> x.name, None -> b"" } },
+    if a.resource_wildcard { b"*" } else { match a.resource { Some(x) -> x.name, None -> b"" } },
   ])
 }
 
@@ -420,7 +430,7 @@ fn set_expand_step(resolved: Resolution, x: SetWork) -> SetWork / {abort.raise} 
     { ..x, work: pushed }
   } else {
     let own = node.definition.listed.map(|entry: EffectExpression|
-      { entry: entry, home: node.module });
+      { entry: entry, defining_module: node.module });
     let all = node.includes.fold(own, |acc: List<Member>, e: Option<Int>|
       match e {
         Some(i) ->
@@ -452,7 +462,7 @@ fn effect_with_span(entry: EffectExpression, span: Span) -> EffectExpression =
     mode: entry.mode,
     op: match entry.op { Some(o) -> Some({ name: o.name, span: span }), None -> None },
     resource: match entry.resource { Some(x) -> Some({ name: x.name, span: span }), None -> None },
-    every: entry.every,
+    resource_wildcard: entry.resource_wildcard,
     bounded: entry.bounded,
     span: span,
   }
@@ -465,9 +475,9 @@ fn localize_member(
   member: Member,
   span: Span,
 ) -> LocalizedEffect / {abort.raise} =
-  if member.home == m { { entry: member.entry, bind: None } } else {
+  if member.defining_module == m { { entry: member.entry, bind: None } } else {
     let moved = effect_with_span(member.entry, span);
-    match effect_owner(resolved, member.home, member.entry.effect_name) {
+    match effect_owner(resolved, member.defining_module, member.entry.effect_name) {
       None -> { entry: moved, bind: None },
       Some(o) -> {
         let module = resolved.scopes.get(o.target).module;
@@ -926,7 +936,7 @@ fn expand_effects_in_expression(
               effect_name: c.effect_name,
               op: c.op,
               resource: c.resource,
-              every_label: c.every_label,
+              wildcard_label: c.wildcard_label,
               label_binder: c.label_binder,
               resume: c.resume,
               body: o.e,
@@ -1245,8 +1255,8 @@ fn instantiate_law(
               },
               of: Some({
                 ..i,
-                home: Some(home.name),
-                shown: schema.binders.map(|binder: Binder| binder.name.name),
+                module: Some(home.name),
+                argument_names: schema.binders.map(|binder: Binder| binder.name.name),
                 identities: schema_identities(schema),
               }),
               body: call(name, at),
@@ -1262,7 +1272,7 @@ fn plural_count(n: Int, what: Bytes) -> Bytes =
   Bytes::concat_all([ascii_of_int(n), b" ", what, if n == 1 { b"" } else { b"s" }])
 
 type LawInstantiation = {
-  r: Resolution,
+  resolution: Resolution,
   modules: List<ParsedModule>,
   diagnostics: List<Diagnostic>,
 }
@@ -1272,12 +1282,12 @@ pub fn instantiate_laws(
   modules: List<ParsedModule>,
 ) -> LawInstantiation / {abort.raise} =
   range(0, modules.len()).fold(
-    { r: r, modules: [], diagnostics: [] },
+    { resolution: r, modules: [], diagnostics: [] },
     |acc: LawInstantiation, m: Int| {
       let mod: ParsedModule = modules.get(m);
       if !has_schema_law(mod.module) { { ..acc, modules: acc.modules.push(mod) } } else {
         let walked = mod.module.items.fold(
-          { r: acc.r, items: [], diagnostics: acc.diagnostics },
+          { r: acc.resolution, items: [], diagnostics: acc.diagnostics },
           |w: { r: Resolution, items: List<Item>, diagnostics: List<Diagnostic> }, item: Item|
             match item {
               LawItem(d) -> match d.of {
@@ -1295,7 +1305,7 @@ pub fn instantiate_laws(
             },
         );
         {
-          r: walked.r,
+          resolution: walked.r,
           modules: acc.modules.push({ ..mod, module: { ..mod.module, items: walked.items } }),
           diagnostics: walked.diagnostics,
         }
@@ -1303,17 +1313,24 @@ pub fn instantiate_laws(
     },
   )
 
-type SetExpansion = { r: Resolution, modules: List<ParsedModule>, diagnostics: List<Diagnostic> }
+type SetExpansion = {
+  resolution: Resolution,
+  modules: List<ParsedModule>,
+  diagnostics: List<Diagnostic>,
+}
 
 pub fn expand_sets(r: Resolution, modules: List<ParsedModule>) -> SetExpansion / {abort.raise} = {
   let t = set_expand_all(r, set_cycles(set_includes(r, set_table(modules))));
   range(0, modules.len()).fold(
-    { r: r, modules: [], diagnostics: t.diagnostics },
+    { resolution: r, modules: [], diagnostics: t.diagnostics },
     |acc: SetExpansion, m: Int| {
       let o = expand_module_sets(r, t, m, modules.get(m));
       {
-        r: o.expander.reached.fold(acc.r, |rr: Resolution, binding: ModuleBinding|
-          add_module_binding(rr, m, binding.binder, binding.target)),
+        resolution: o.expander.reached.fold(
+          acc.resolution,
+          |rr: Resolution, binding: ModuleBinding|
+            add_module_binding(rr, m, binding.binder, binding.target),
+        ),
         modules: acc.modules.push(o.module),
         diagnostics: concat_diagnostics(acc.diagnostics, o.expander.diagnostics),
       }

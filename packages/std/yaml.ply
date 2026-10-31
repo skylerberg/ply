@@ -229,7 +229,7 @@ type Span = { from: Int, to: Int }
 /// between tokens. `indent` is the column of the innermost open block collection, and `indents`
 /// those around it. `asked` are the columns of the block mappings whose last key is written after
 /// `?` and has no `:` yet. `pending_key_token` is the first token before which a candidate on this line may
-/// still put a key, and `required` is the position of a candidate that must become a key.
+/// still put a key, and `key_required_at` is the position of a candidate that must become a key.
 type Scanner = {
   src: Bytes,
   scalar: Int,
@@ -242,14 +242,14 @@ type Scanner = {
   tab_skipped: Bool,
   indent: Int,
   indents: Stack<Int>,
-  open: Int,
+  open_blocks: Int,
   flow_level: Int,
   levels: Stack<FlowLevel>,
   block_simple_key: Option<SimpleKey>,
-  asked: Stack<Int>,
+  explicit_key_columns: Stack<Int>,
   allow_key: Bool,
   pending_key_token: Int,
-  required: Int,
+  key_required_at: Int,
   after_json: Bool,
   tokens: List<Token>,
   comments: List<Span>,
@@ -330,14 +330,14 @@ fn scanner(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
         tab_skipped: false,
         indent: -1,
         indents: Empty,
-        open: 0,
+        open_blocks: 0,
         flow_level: 0,
         levels: Empty,
         block_simple_key: None,
-        asked: Empty,
+        explicit_key_columns: Empty,
         allow_key: true,
         pending_key_token: -1,
-        required: -1,
+        key_required_at: -1,
         after_json: false,
         tokens: [],
         comments: [],
@@ -382,7 +382,7 @@ fn missing_colon<a>(at: Int) -> a / {fault.at} =
 /// The scanner on the line that starts at `start`, `lines` below. A candidate that must be a key
 /// has no `:` on its line by now.
 fn on_line(s: Scanner, start: Int, lines: Int) -> Scanner / {fault.at, abort.raise} =
-  if s.required >= 0 { missing_colon(s.required) } else {
+  if s.key_required_at >= 0 { missing_colon(s.key_required_at) } else {
     {
       ..s,
       pos: start,
@@ -431,8 +431,8 @@ fn end_deeper_blocks(s: Scanner, col: Int) -> Scanner =
       ..s,
       indent: u.indent,
       indents: u.indents,
-      asked: no_deeper_than(s.asked, col),
-      open: s.open - u.ends,
+      explicit_key_columns: no_deeper_than(s.explicit_key_columns, col),
+      open_blocks: s.open_blocks - u.ends,
       tokens: range(0, u.ends).fold(s.tokens, |tokens: List<Token>, _: Int|
         tokens.push({ token: BlockEndToken, from: s.pos, to: s.pos })),
     }
@@ -454,8 +454,8 @@ fn without_explicit_key(asked: Stack<Int>, col: Int) -> Stack<Int> =
 
 /// The scanner with a block collection open at `col`, which is written at `at`.
 fn roll(s: Scanner, col: Int, at: Int) -> Scanner / {fault.at} =
-  if s.open + s.flow_level >= s.depth { fail(at, TooDeep) }
-  else { { ..s, indents: Top(s.indent, s.indents), indent: col, open: s.open + 1 } }
+  if s.open_blocks + s.flow_level >= s.depth { fail(at, TooDeep) }
+  else { { ..s, indents: Top(s.indent, s.indents), indent: col, open_blocks: s.open_blocks + 1 } }
 
 fn none_at(at: Int) -> Token = { token: PlaceholderToken, from: at, to: at }
 
@@ -472,13 +472,13 @@ fn save_simple_key(s: Scanner) -> Scanner =
       ..noted,
       tokens: s.tokens.push(none_at(s.pos)).push(none_at(s.pos)),
       pending_key_token: if s.pending_key_token < 0 { slot } else { s.pending_key_token },
-      required: if s.flow_level == 0 && s.indent == col { s.pos } else { s.required },
+      key_required_at: if s.flow_level == 0 && s.indent == col { s.pos } else { s.key_required_at },
     }
   }
 
 /// The scanner with no candidate at its level. Fails if that candidate had to be a key.
 fn remove_simple_key(s: Scanner) -> Scanner / {fault.at} =
-  if s.flow_level == 0 && s.required >= 0 { missing_colon(s.required) } else {
+  if s.flow_level == 0 && s.key_required_at >= 0 { missing_colon(s.key_required_at) } else {
     let key = simple_key(s);
     { ..with_simple_key(s, None), pending_key_token: blocked_without(s, key) }
   }
@@ -493,7 +493,7 @@ fn scan_token(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
 }
 
 fn finish(s: Scanner) -> Scanner / {fault.at} =
-  if s.required >= 0 { missing_colon(s.required) } else {
+  if s.key_required_at >= 0 { missing_colon(s.key_required_at) } else {
     let ended = end_deeper_blocks(s, -1);
     { ..with_token(ended, StreamEndToken, s.pos, s.pos), ended: true, pending_key_token: -1 }
   }
@@ -660,7 +660,7 @@ fn percent_pieces(
 // --- Indicators -------------------------------------------------------------
 
 fn flow_start(s: Scanner, map: Bool) -> Scanner / {fault.at} =
-  if s.open + s.flow_level >= s.depth { fail(s.pos, TooDeep) } else {
+  if s.open_blocks + s.flow_level >= s.depth { fail(s.pos, TooDeep) } else {
     let noted = save_simple_key(s);
     let inside = {
       ..noted,
@@ -738,8 +738,9 @@ fn key_indicator(s: Scanner) -> Scanner / {fault.at} =
     } else { cleared };
     let asking = {
       ..start_collection,
-      asked: if has_explicit_key(start_collection.asked, col) { start_collection.asked }
-      else { Top(col, start_collection.asked) },
+      explicit_key_columns: if has_explicit_key(start_collection.explicit_key_columns, col) {
+        start_collection.explicit_key_columns
+      } else { Top(col, start_collection.explicit_key_columns) },
     };
     finish_token(with_token(asking, KeyToken, s.pos, s.pos + 1), s.pos + 1, true)
   }
@@ -774,10 +775,16 @@ fn value_indicator(s: Scanner) -> Scanner / {fault.at, abort.raise} =
         let start_collection = if cleared.indent < col {
           with_token(roll(cleared, col, s.pos), BlockMappingStartToken, s.pos, s.pos)
         } else { cleared };
-        let results = has_explicit_key(start_collection.asked, col);
+        let results = has_explicit_key(start_collection.explicit_key_columns, col);
         finish_token(
           with_token(
-            { ..start_collection, asked: without_explicit_key(start_collection.asked, col) },
+            {
+              ..start_collection,
+              explicit_key_columns: without_explicit_key(
+                start_collection.explicit_key_columns,
+                col,
+              ),
+            },
             ValueToken,
             s.pos,
             s.pos + 1,
@@ -811,9 +818,10 @@ fn after_key(s: Scanner, locate: SimpleKey) -> Scanner / {fault.at, abort.raise}
       ..with_simple_key(start_collection, None),
       tokens: marked,
       pending_key_token: blocked_without(s, Some(locate)),
-      required: if s.flow_level == 0 { -1 } else { s.required },
-      asked: if s.flow_level == 0 { without_explicit_key(start_collection.asked, locate.column) }
-      else { start_collection.asked },
+      key_required_at: if s.flow_level == 0 { -1 } else { s.key_required_at },
+      explicit_key_columns: if s.flow_level == 0 {
+        without_explicit_key(start_collection.explicit_key_columns, locate.column)
+      } else { start_collection.explicit_key_columns },
     };
     finish_token(with_token(cleared, ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
   }
@@ -1281,7 +1289,7 @@ type State =
 /// The parser's state: the scanner, the next token to read, what it is in the middle of and what
 /// that is inside, the document's tag handles, and the events so far.
 ///
-/// `bare` is whether a directive or a document with no `---` may start: at the start of the
+/// `implicit_start_allowed` is whether a directive or a document with no `---` may start: at the start of the
 /// stream and after `...`.
 type Parser = {
   scan: Scanner,
@@ -1291,7 +1299,7 @@ type Parser = {
   handles: Map<String, String>,
   declared: Map<String, Unit>,
   versioned: Bool,
-  bare: Bool,
+  implicit_start_allowed: Bool,
   open: Int,
   events: List<Event>,
   done: Bool,
@@ -1308,7 +1316,7 @@ fn parser(scan: Scanner) -> Parser =
     handles: default_handles(),
     declared: Map::new(),
     versioned: false,
-    bare: true,
+    implicit_start_allowed: true,
     open: 0,
     events: [],
     done: false,
@@ -1411,10 +1419,10 @@ fn is_directive(token: TokenKind) -> Bool =
 
 fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.token {
-    DocumentEndToken -> { ..consume(p), bare: true },
+    DocumentEndToken -> { ..consume(p), implicit_start_allowed: true },
     StreamEndToken -> emitted({ ..p, state: AtEnd, done: true }, StreamEnd, t.from, t.to),
     DocumentStartToken -> explicit_start(p, t),
-    _ -> if !p.bare {
+    _ -> if !p.implicit_start_allowed {
       fail(
         t.from,
         Expected(if is_directive(t.token) { "`...` to end the document before a directive" }
@@ -1422,7 +1430,7 @@ fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
       )
     } else if is_directive(t.token) { apply_directive({ ..p, state: AfterDirectives }, t) } else {
       emitted(
-        pushed({ ..p, state: AtDocumentContent, bare: false }, AtDocumentEnd),
+        pushed({ ..p, state: AtDocumentContent, implicit_start_allowed: false }, AtDocumentEnd),
         DocumentStart(false),
         t.from,
         t.from,
@@ -1432,7 +1440,10 @@ fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
 
 fn explicit_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   emitted(
-    pushed({ ..consume(p), state: AtDocumentContent, bare: false }, AtDocumentEnd),
+    pushed(
+      { ..consume(p), state: AtDocumentContent, implicit_start_allowed: false },
+      AtDocumentEnd,
+    ),
     DocumentStart(true),
     t.from,
     t.to,
@@ -1480,7 +1491,7 @@ fn document_end(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} = {
       handles: default_handles(),
       declared: Map::new(),
       versioned: false,
-      bare: explicit,
+      implicit_start_allowed: explicit,
     },
     DocumentEnd(explicit),
     t.from,
@@ -1809,24 +1820,24 @@ pub fn mapping(entries: List<Entry>) -> Yaml = Mapping(unique(entries))
 /// An entry of a mapping under a string key, which is what most mappings have.
 pub fn entry(key: String, value: Yaml) -> Entry = { key: String(key), value: value }
 
-type UniqueEntries = { seen: Map<Canonical, Unit>, kept: List<Entry> }
+type UniqueEntries = { seen: Map<Canonical, Unit>, unique: List<Entry> }
 
 /// The entries with one for each key: its last value, at the key's first position.
 fn unique(entries: List<Entry>) -> List<Entry> = {
   let last = Map::of_entries(entries.map(|e: Entry| { key: canonical(e.key), value: e.value }));
   if last.len() == entries.len() { entries } else {
-    entries.fold({ seen: Map::new(), kept: [] }, |s: UniqueEntries, e: Entry| {
+    entries.fold({ seen: Map::new(), unique: [] }, |s: UniqueEntries, e: Entry| {
       let k = canonical(e.key);
       if s.seen.contains(k) { s } else {
         {
           seen: s.seen.insert(k, ()),
-          kept: s.kept.push({
+          unique: s.unique.push({
             key: e.key,
             value: match last.get(k) { Some(v) -> v, None -> e.value },
           }),
         }
       }
-    }).kept
+    }).unique
   }
 }
 

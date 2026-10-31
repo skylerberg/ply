@@ -48,7 +48,7 @@ type CostSummary = {
   of: ParameterRelation,
   fun: Option<Polynomial>,
   calls: Int,
-  back: List<List<ParameterRelation>>,
+  recursive_arguments: List<List<ParameterRelation>>,
 }
 
 /// `Same(i)` is parameter `i` itself; `Part(i)`, a tail a list pattern took off it; `Toward`, an
@@ -68,7 +68,7 @@ pub type Limit = | InBounds(Int) | Length(Int) | Literal(Int)
 pub type Descent = | OnTail(Int) | OnIndex(IndexBound)
 
 /// `own` is the definition whose calls back are counted rather than bounded; `known`, the steps of
-/// what it calls; `first_order`, whether each builtin calls nothing back; `empty`, a list parameter
+/// what it calls; `first_order`, whether each builtin calls nothing back; `empty_list_parameter`, a list parameter
 /// known empty; `found`, what holds an index short on the path; `missed`, a fact that fails.
 type Env = {
   context: Context,
@@ -76,7 +76,7 @@ type Env = {
   own: String,
   known: Map<String, Result<Polynomial, String>>,
   first_order: Map<String, Bool>,
-  empty: Option<Int>,
+  empty_list_parameter: Option<Int>,
   found: List<IndexBound>,
   missed: Option<IndexBound>,
 }
@@ -435,7 +435,7 @@ fn steps_of(
           own: definition,
           known: known,
           first_order: first_order,
-          empty: None,
+          empty_list_parameter: None,
           found: [],
           missed: None,
         };
@@ -445,7 +445,13 @@ fn steps_of(
           else if !context.self_recursive.contains(definition) {
             Err("`" ++ definition ++ "` is in a group with others")
           } else {
-            match recursion_descent(definition, w.calls, w.back, w.cost, "steps grow") {
+            match recursion_descent(
+                definition,
+                w.calls,
+                w.recursive_arguments,
+                w.cost,
+                "steps grow",
+              ) {
               Err(reason) -> Err(reason),
               Ok(None) -> Ok(plus(constant(), w.cost)),
               // At most as many calls as the descent bounds enter with an element left to take or
@@ -456,7 +462,7 @@ fn steps_of(
                   OnTail(p) ->
                     {
                       ..env,
-                      empty: Some(p),
+                      empty_list_parameter: Some(p),
                       slots: env.slots.set(p, { size: Some(zero()), of: Same(p), fun: None }),
                     },
                   OnIndex(f) -> { ..env, missed: Some(f) },
@@ -639,7 +645,8 @@ pub fn growth_preserved(p: Polynomial, back: List<List<ParameterRelation>>) -> B
             && (match args.at(q) { Some(Same(j)) -> j == q, Some(Part(j)) -> j == q, _ -> false })),
   )
 
-fn no_cost() -> CostSummary = { cost: zero(), size: None, of: Other, fun: None, calls: 0, back: [] }
+fn no_cost() -> CostSummary =
+  { cost: zero(), size: None, of: Other, fun: None, calls: 0, recursive_arguments: [] }
 
 fn sized(p: Polynomial) -> CostSummary = { ..no_cost(), size: Some(p) }
 
@@ -652,7 +659,7 @@ fn then(a: CostSummary, b: CostSummary) -> CostSummary =
     of: b.of,
     fun: b.fun,
     calls: a.calls + b.calls,
-    back: a.back.concat(b.back),
+    recursive_arguments: a.recursive_arguments.concat(b.recursive_arguments),
   }
 
 /// Either branch: the steps of the larger, and a size that bounds both.
@@ -663,7 +670,7 @@ fn combine_branches(a: CostSummary, b: CostSummary) -> CostSummary =
     of: Other,
     fun: match ((a.fun, b.fun)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
     calls: if a.calls > b.calls { a.calls } else { b.calls },
-    back: a.back.concat(b.back),
+    recursive_arguments: a.recursive_arguments.concat(b.recursive_arguments),
   }
 
 fn slot_at(env: Env, k: Int) -> Slot =
@@ -873,7 +880,7 @@ fn bound(env: Env, pattern: CodePattern, of: Slot) -> Env / {abort.raise} =
 
 /// An arm that takes a head off the list known to be empty is never taken.
 fn needs_head(env: Env, scrutinee: CostSummary, pattern: CodePattern) -> Bool =
-  match ((env.empty, scrutinee.of, pattern)) {
+  match ((env.empty_list_parameter, scrutinee.of, pattern)) {
     (Some(p), Same(i), CodeListPattern(l)) -> p == i && l.items.len() > 0,
     _ -> false,
   }
@@ -1088,7 +1095,7 @@ fn application(
               size: None,
               of: Other,
               calls: given.calls + 1,
-              back: given.back.push(ofs),
+              recursive_arguments: given.recursive_arguments.push(ofs),
             })
           } else if ctor(env.context, name) != None {
             Ok({ ..given, size: None, of: Other, fun: None })
@@ -1205,8 +1212,8 @@ pub fn by_entry(context: Context, definition: String, kind: SpecKind) -> Bool =
 
 /// How many calls of the function a call of `it`'s function makes, at the sizes of its arguments.
 pub fn callback_calls(it: CallbackUse, sizes: List<Option<Polynomial>>) -> Option<Polynomial> =
-  it.over.fold(
-    Some(if it.over.len() == 0 { constant() } else { zero() }),
+  it.iterated_parameters.fold(
+    Some(if it.iterated_parameters.len() == 0 { constant() } else { zero() }),
     |acc: Option<Polynomial>, k: Int|
       match ((acc, sizes.at(k))) { (Some(p), Some(Some(s))) -> Some(plus(p, s)), _ -> None },
   )
@@ -1216,8 +1223,8 @@ pub fn callback_calls(it: CallbackUse, sizes: List<Option<Polynomial>>) -> Optio
 pub fn result_size(it: CallbackUse, sizes: List<Option<Polynomial>>) -> Option<Polynomial> = {
   let at = |k: Int| match sizes.at(k) { Some(s) -> s, None -> None };
   match it.result {
-    Mapped -> match it.over.at(0) { Some(k) -> at(k), None -> None },
-    Filtered -> match it.over.at(0) { Some(k) -> at(k), None -> None },
+    Mapped -> match it.iterated_parameters.at(0) { Some(k) -> at(k), None -> None },
+    Filtered -> match it.iterated_parameters.at(0) { Some(k) -> at(k), None -> None },
     Updated(k) -> at(k),
     _ -> None,
   }

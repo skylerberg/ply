@@ -63,7 +63,7 @@ pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
   effects.fold(false, |found: Bool, a: types::Effect| found || a.effect == b"sim")
 
 pub fn entry_of(index: Int, key: Bytes) -> Entry =
-  { test: index, of: key, case: None, unlisted: None }
+  { test: index, key: key, case: None, unlisted: None }
 
 type SearchOptions = { plan: plan::Plan, measuring: Bool, lanes: Option<Int> }
 
@@ -282,7 +282,7 @@ pub fn conclude_tests(
           key: t.key,
           seeded: uses_simulation(t.effects),
           hash: test_hash_at(analysis, i),
-          of: match entry { Some(e) -> e.of, None -> t.key },
+          start: match entry { Some(e) -> e.key, None -> t.key },
           case: match entry { Some(e) -> e.case != None, None -> false },
         })
       },
@@ -304,7 +304,7 @@ pub fn conclusion_of(done: JobResult) -> conclude::TestResult<RuntimeDiagnostic>
     index: done.test,
     status: done.status,
     failure: done.failure,
-    host: done.usage.host,
+    host: done.usage.used_host,
     trace: done.trace,
     searched: match done.searched {
       Some(x) ->
@@ -327,8 +327,8 @@ fn cost_of(c: Option<search::Cost>) -> Option<Cost> =
     Some(x) ->
       Some({
         explored: x.explored,
-        bounded: x.bounded,
-        rendered: (if x.bounded { ">= " } else { "" }) ++ x.explored.to_string(),
+        bounded: x.stopped_early,
+        rendered: (if x.stopped_early { ">= " } else { "" }) ++ x.explored.to_string(),
       }),
   }
 
@@ -344,7 +344,7 @@ fn explored_of(e: Exploration) -> SearchSummary / {abort.raise} =
     explored: e.explored,
     exhaustive: e.exhaustive,
     exhausted: e.exhausted,
-    blind: cost_of(e.blind),
+    clockless: cost_of(e.no_clocks),
     naive: cost_of(e.naive),
     reduction_tenths: reduction_tenths_of(e),
     steps: e.steps,
@@ -436,7 +436,12 @@ fn failed_of(
     },
     race: match e {
       Some(x) -> match x.race {
-        Some(race) -> Some({ left: site_of(race.left), right: site_of(race.right), step: race.at }),
+        Some(race) ->
+          Some({
+            left: site_of(race.left),
+            right: site_of(race.right),
+            step: race.scheduling_point,
+          }),
         None -> None,
       },
       None -> None,
@@ -457,7 +462,7 @@ fn escapes_of(
   let unbound = |index: Int|
     match result_at(done, index) {
       Some(d) ->
-        d.usage.host
+        d.usage.used_host
           && (match d.trace {
             Some(trace) -> !String::contains("\n" ++ String::of_bytes_lossy(trace), "\nbinding\t"),
             None -> false,
@@ -539,7 +544,7 @@ pub fn run_report_of(
     digest: hosted.digest,
     handshakes: [],
     hosts: hosted.hosts,
-    reaches: hosted.reaches.filter(|i: Int| case_of(program, i) != None),
+    tests_using_host: hosted.host_test_indices.filter(|i: Int| case_of(program, i) != None),
     workers: match options.jobs {
       Some(n) -> if n > 0 { n } else { hosted.cores },
       None -> hosted.cores,
@@ -563,7 +568,7 @@ pub fn run_report_of(
       duration_us: elapsed,
     },
     simulation: c.simulation,
-    escapes: escapes_of(analysis, c, done),
+    unbound_pass_diagnostics: escapes_of(analysis, c, done),
     warnings: teardown.concat(c.notices.map(notice_of)).concat(said),
     mutants: None,
     coverage: if options.coverage { Some(coverage(analysis)) } else { None },
@@ -583,7 +588,7 @@ pub fn mutated(
   match targeted {
     None -> report,
     Some(definitions) -> if !green_run(report) { report } else {
-      let queue = mutation_queue(timed.program.places, analysis, definitions);
+      let queue = mutation_queue(timed.program.source_texts, analysis, definitions);
       let every = all_classes(program, options);
       let judged = range(0, min(options.mutate_budget, queue.mutants.len())).map(|id: Int|
         mutant_verdict(timed, analysis, program, queue, id, every, search_options));
@@ -591,7 +596,7 @@ pub fn mutated(
         ..report,
         mutants: Some(
           mutants(
-            timed.program.places,
+            timed.program.source_texts,
             analysis,
             queue,
             judged,
@@ -827,7 +832,7 @@ test "a replay is one command whatever the test is called" {
 
 test "a bounded count renders as a lower bound, and a reduction needs the naive search" {
   assert_eq(
-    cost_of(Some({ explored: 4096, bounded: true })),
+    cost_of(Some({ explored: 4096, stopped_early: true })),
     Some({ explored: 4096, bounded: true, rendered: ">= 4096" }),
   );
   assert_eq(cost_of(None), None);
@@ -836,7 +841,7 @@ test "a bounded count renders as a lower bound, and a reduction needs the naive 
     exhaustive: true,
     exhausted: false,
     naive: None,
-    blind: None,
+    no_clocks: None,
     steps: 8,
     virtual_time: 0,
     failure: None,
@@ -844,12 +849,15 @@ test "a bounded count renders as a lower bound, and a reduction needs the naive 
   };
   assert_eq(reduction_tenths_of(e), None);
   assert_eq(
-    reduction_tenths_of({ ..e, naive: Some({ explored: 120, bounded: false }) }),
+    reduction_tenths_of({ ..e, naive: Some({ explored: 120, stopped_early: false }) }),
     Some(100),
   );
-  assert_eq(reduction_tenths_of({ ..e, naive: Some({ explored: 40, bounded: false }) }), Some(33));
   assert_eq(
-    reduction_tenths_of({ ..e, explored: 0, naive: Some({ explored: 40, bounded: false }) }),
+    reduction_tenths_of({ ..e, naive: Some({ explored: 40, stopped_early: false }) }),
+    Some(33),
+  );
+  assert_eq(
+    reduction_tenths_of({ ..e, explored: 0, naive: Some({ explored: 40, stopped_early: false }) }),
     None,
   );
   assert_eq(
@@ -871,7 +879,7 @@ fn loaded_from(
   handle {
     match read_packages[t]("p") {
       Err(_) -> panic("the program is read"),
-      Ok(p) -> match analyse_in_memory(p.own.files, Map::new()).out {
+      Ok(p) -> match analyse_in_memory(p.main_package.files, Map::new()).out {
         Analysed(w) -> {
           let whole = checked_program_of(w);
           let texts = files.fold(
@@ -915,7 +923,7 @@ fn store_passing(
           key: t.key,
           seeded: false,
           hash: test_hash_at(view, i),
-          of: t.key,
+          start: t.key,
           case: false,
         }),
       None -> acc,
@@ -947,7 +955,7 @@ fn store_passing(
   handle {
     store_history(view, program.sources, program.modules, c.store_update)
   } with {
-    var store = tables::open_cache[mem]("cache", { runtime: "runtime", code: "code" }),
+    var store = tables::open_cache[mem]("cache", { runtime_digest: "runtime", code: "code" }),
     result_cache.unstored(hashes) -> results::unstored_in(store, hashes),
     result_cache.history(texts, modules) -> {
       store = results::store_pass(store, texts, modules);
@@ -993,16 +1001,16 @@ test "a run after one definition is edited files its module's record and the tex
   let after = program(b"n + 2");
   let counted = run_in_memory(mem_empty(), || {
     let held = ||
-      tables::counts(tables::open_cache[mem]("cache", { runtime: "runtime", code: "code" }));
+      tables::counts(tables::open_cache[mem]("cache", { runtime_digest: "runtime", code: "code" }));
     store_passing(before);
     let first = held();
     store_passing(after);
     { first: first, second: held() }
   }).value;
   assert_eq(counted.first.modules, before.modules.len());
-  assert_eq(counted.first.eras, 1);
+  assert_eq(counted.first.snapshots, 1);
   assert(counted.first.texts > 0);
   assert_eq(counted.second.modules - counted.first.modules, 1);
-  assert_eq(counted.second.eras - counted.first.eras, 1);
+  assert_eq(counted.second.snapshots - counted.first.snapshots, 1);
   assert_eq(counted.second.texts - counted.first.texts, 3)
 }

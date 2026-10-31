@@ -65,16 +65,16 @@ type OpenStore = {
   looked: Map<Bytes, ExternalRead>,
   manifest: Manifest,
   tables: Map<Bytes, Bytes>,
-  lost: List<Bytes>,
+  unreadable_segments: List<Bytes>,
   known: Map<Bytes, Option<KeyState>>,
-  mine: Map<Bytes, OwnRow>,
+  written_rows: Map<Bytes, OwnRow>,
   out: SegmentWriter,
   results: Map<Bytes, Bytes>,
   inlined: Map<Bytes, Bytes>,
   named: Map<Bytes, Bytes>,
   read: Map<Bytes, Bytes>,
-  held: Map<Bytes, Bytes>,
-  holding: Int,
+  cached_outputs: Map<Bytes, Bytes>,
+  cached_size: Int,
   unread: Map<Bytes, Bool>,
   transient: Map<Bytes, Bytes>,
   pack: packs::PackReader,
@@ -85,8 +85,14 @@ type OpenStore = {
 fn max_cached_size() -> Int = 268435456
 
 fn cache_output(o: OpenStore, name: Bytes, result: Bytes) -> OpenStore =
-  if o.held.contains(name) || o.holding + result.len() > max_cached_size() { o }
-  else { { ..o, held: o.held.insert(name, result), holding: o.holding + result.len() } }
+  if o.cached_outputs.contains(name) || o.cached_size + result.len() > max_cached_size() { o }
+  else {
+    {
+      ..o,
+      cached_outputs: o.cached_outputs.insert(name, result),
+      cached_size: o.cached_size + result.len(),
+    }
+  }
 
 fn open_store(m: Manifest, now: Int) -> OpenStore =
   {
@@ -95,16 +101,16 @@ fn open_store(m: Manifest, now: Int) -> OpenStore =
     looked: Map::new(),
     manifest: m,
     tables: Map::new(),
-    lost: [],
+    unreadable_segments: [],
     known: Map::new(),
-    mine: Map::new(),
+    written_rows: Map::new(),
     out: segments::new_writer(),
     results: Map::new(),
     inlined: Map::new(),
     named: Map::new(),
     read: Map::new(),
-    held: Map::new(),
-    holding: 0,
+    cached_outputs: Map::new(),
+    cached_size: 0,
     unread: Map::new(),
     transient: Map::new(),
     pack: packs::empty_reader(),
@@ -128,7 +134,9 @@ fn table<[r]>(
           open: {
             ..o,
             tables: o.tables.insert(name, b""),
-            lost: if o.lost.contains(seg.token) { o.lost } else { o.lost.push(seg.token) },
+            unreadable_segments: if o.unreadable_segments.contains(seg.token) {
+              o.unreadable_segments
+            } else { o.unreadable_segments.push(seg.token) },
           },
           rows: b"",
         },
@@ -269,7 +277,7 @@ fn tables_of(
 
 fn location_bytes(offset: Int, size: Int) -> Bytes = u64_le(offset).concat(u32_le(size))
 
-fn wrote_nothing(o: OpenStore) -> Bool = o.mine.len() == 0
+fn wrote_nothing(o: OpenStore) -> Bool = o.written_rows.len() == 0
 
 fn commit<[r]>(
   dir: String,
@@ -278,7 +286,7 @@ fn commit<[r]>(
   o: OpenStore,
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
   if wrote_nothing(o) { () } else {
-    let told = o.mine.fold(Map::new(), |acc: Map<Bytes, KeyRow>, key: Bytes, x: OwnRow| {
+    let told = o.written_rows.fold(Map::new(), |acc: Map<Bytes, KeyRow>, key: Bytes, x: OwnRow| {
       let lies = match x.frame { Some(f) -> f, None -> { offset: 0, size: 0 } };
       acc.insert(key, {
         row: {
@@ -291,18 +299,18 @@ fn commit<[r]>(
         query: x.query,
       })
     });
-    let seen = o.mine.fold(
+    let seen = o.written_rows.fold(
       o.own.fold(Map::new(), |seen: Map<Bytes, Int>, query: Bytes, _: Bool|
         seen.insert(query, o.now)),
       |seen: Map<Bytes, Int>, _: Bytes, x: OwnRow| last_seen(seen, x.query, x.seen),
     );
     match segments::finish[r](dir, schema(), token, o.out, tables_of(told, seen, o.results)) {
       None -> (),
-      Some(seg) -> match segments::commit[r](dir, schema(), seg, without: o.lost) {
+      Some(seg) -> match segments::commit[r](dir, schema(), seg, without: o.unreadable_segments) {
         Committed(m) -> {
           let from = segments::merge_start(m);
           if from < m.segments.len() - 1 {
-            let own = o.mine.fold(o.own, |acc: Map<Bytes, Bool>, _: Bytes, x: OwnRow|
+            let own = o.written_rows.fold(o.own, |acc: Map<Bytes, Bool>, _: Bytes, x: OwnRow|
               acc.insert(x.query, true));
             merge_segments[r](
               dir,
@@ -661,13 +669,14 @@ pub fn with_memo_store<a, [r] | e>(
       },
     };
   let standing_at = |o: OpenStore, key: Bytes|
-    if !o.trusted || o.mine.contains(key) { { open: o, bytes: None } } else { packed_at(o, key) };
+    if !o.trusted || o.written_rows.contains(key) { { open: o, bytes: None } }
+    else { packed_at(o, key) };
   let packed_result = |o: OpenStore, digest: Bytes| {
     let found = packs::output(o.pack, read, digest);
     { open: { ..o, pack: found.reading }, result: found.bytes }
   };
   let held = |o: OpenStore, key: Bytes|
-    match o.mine.get(key) {
+    match o.written_rows.get(key) {
       Some(x) -> { open: o, held: Some(x.result) },
       None -> {
         let k = key_state[r](dir, o, key);
@@ -692,7 +701,7 @@ pub fn with_memo_store<a, [r] | e>(
       None -> { open: h0.open, bytes: None },
       Some(result) -> {
         let o = h0.open;
-        let lies = match match o.mine.get(key) { Some(x) -> x.frame, None -> None } {
+        let lies = match match o.written_rows.get(key) { Some(x) -> x.frame, None -> None } {
           Some(f) -> { open: o, at: Some({ token: token, offset: f.offset, size: f.size }) },
           None -> frame_row[r](dir, o, key, result),
         };
@@ -764,7 +773,7 @@ pub fn with_memo_store<a, [r] | e>(
         {
           ..o3,
           out: segments::flush_when_full[r](dir, schema(), token, o3.out),
-          mine: o3.mine.insert(key, {
+          written_rows: o3.written_rows.insert(key, {
             result: name,
             query: rec.query.blake3(),
             seen: o3.now,
@@ -835,7 +844,7 @@ pub fn with_memo_store<a, [r] | e>(
           Some(a) -> Some(a),
           None -> match packs::output_key(digest) {
             None -> None,
-            Some(name) -> match st.held.get(name) {
+            Some(name) -> match st.cached_outputs.get(name) {
               Some(a) -> Some(a),
               None -> {
                 let o = st;
@@ -1175,7 +1184,7 @@ fn quoted(input: Bytes) -> Bytes / {memo.read} =
   Bytes::concat_all([b"\"", memo.fetch(b"text", input), b"\""])
 
 fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> memo::Query<| {}> =
-  { name: name, hash: hash, body: body, kept: true, summarized: false }
+  { name: name, hash: hash, body: body, persistent: true, summarized: false }
 
 fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query<| {}>> =
   Map::new().insert(b"text", query(b"text", b"t1", memo::read_file)).insert(
@@ -1207,7 +1216,7 @@ fn run_named_query<[r]>(
 ) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
   let queries = test_queries(b"").insert(b"text", {
     ..query(b"text", b"t1", memo::read_file),
-    kept: lasting,
+    persistent: lasting,
   });
   with_memo_store[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), || {
     let a = query_output(queries, start_run(queries), name, b"a");

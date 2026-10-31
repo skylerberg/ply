@@ -106,7 +106,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
         },
     ),
     emits_notes: false,
-    frame: dummy_span(),
+    frame_span: dummy_span(),
     captured: [],
     allows_lambda_inlining: false,
     written: [],
@@ -115,7 +115,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
     labels: h.labels,
     label_names: labels_among(r.params, h.labels).map(|p: EmitParam| p.name),
     label_values: [],
-    handed: [],
+    evidence_arguments: [],
     instance: None,
     kept: [],
     performs: r.performs,
@@ -125,7 +125,8 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
 
 fn param_effects_of(setting: ModuleContext, r: Root) -> List<Option<Effects>> =
   match match definition_of(r.key) {
-      Some(full_name) -> definition_full(setting.module, setting.here, setting.imports, full_name),
+      Some(full_name) ->
+        definition_full(setting.module, setting.definitions, setting.imports, full_name),
       None -> None,
     } {
     Some(d) -> match d.definition.scheme {
@@ -161,7 +162,7 @@ pub fn convention(context: Context) -> Convention / {abort.raise} = {
       call_signature(context.setting, context.key, context.types, context.result_type),
     ),
     h.hidden,
-    h.own.len(),
+    h.declared.len(),
   )
 }
 
@@ -172,7 +173,7 @@ fn call_signature(
   result: Type,
 ) -> Signature / {abort.raise} = {
   let own = unspecialised(key);
-  match s.here.fold(None, |acc: Option<Signature>, d: Definition|
+  match s.definitions.fold(None, |acc: Option<Signature>, d: Definition|
       if d.root == own { call_signature_at(s, d, key_types(key)) } else { acc }) {
     Some(c) -> c,
     None -> { params: types, result: result },
@@ -368,7 +369,7 @@ fn walk_of(
         Some(t) -> {
           let ranged = b != EntryFolding
             && (match args.at(0) { Some(c) -> range_ends(context, c) != None, None -> false });
-          Some({ by: b, at: n, over: t.over, held: t.held, ranged: ranged })
+          Some({ kind: b, at: n, over: t.over, accumulator: t.held, ranged: ranged })
         },
         None -> None,
       }
@@ -432,7 +433,7 @@ fn inlined_here(context: Context, f: Code, n: Int) -> Bool / {abort.raise} =
     CodeLambda(l) -> l.params == n,
     CodeKnownLambda(k) -> k.lambda.params == n && frame_of(context, k.owner, k.nth) != None,
     NDefinition(_) ->
-      named_arity(context.setting.module, context.setting.here, context.setting.imports, f)
+      named_arity(context.setting.module, context.setting.definitions, context.setting.imports, f)
         == Some(n),
     _ -> false,
   }
@@ -452,7 +453,7 @@ pub fn named_function_call(
   match ((f.node, how)) {
     (NDefinition(v), WalkFunction(w)) -> match ((
         defined(context, v.full),
-        named_lambda(f, walk_arity(w.by)).body.node,
+        named_lambda(f, walk_arity(w.kind)).body.node,
       )) {
       (Some(d), CodeApply(a)) -> {
         let read = range(0, a.args.len()).fold(
@@ -496,7 +497,7 @@ pub fn global_value(
           },
           _ -> [],
         },
-        held: no_captured_evidence(),
+        captured_evidence: no_captured_evidence(),
       };
       let o = lambda_body_start(context, st, frame, at);
       let params = range(0, frame.params).fold([], |acc: List<Arg>, j: Int|
@@ -543,7 +544,7 @@ pub fn continuation_closure(
           body: { node: CodeVar({ name: b"resume", slot: n }), span: at, ty: t },
           ty: f,
           words: effects_evidence(f.effects, context.effect_evidence, context.labels),
-          held: no_captured_evidence(),
+          captured_evidence: no_captured_evidence(),
         };
         let o = lambda_body_start(context, st, frame, at);
         let resumed_by = match o.st.env.get(n) {
@@ -793,7 +794,7 @@ fn enter_known_lambda(
               setting: {
                 ..context.setting,
                 module: bl.module,
-                here: bl.here,
+                definitions: bl.module_definitions,
                 imports: bl.imports,
                 effects: bl.effects,
               },
@@ -847,7 +848,7 @@ fn enter_walk(
     (false, Some(Some(xs)), _) -> if operand_representation(xs) != AsWord {
       unreachable(b"a walk over a list stored other than as its word")
     } else {
-      match w.by {
+      match w.kind {
         EntryFolding -> {
           let e = map_traversal_variables(context, made.st, w);
           let r = entry_read(context, enter_block(e.st), v, e.vars, w, at);
@@ -863,9 +864,9 @@ fn enter_walk(
     },
     _ -> unreachable(b"a walk over no list"),
   };
-  let params = match w.by {
-    Folding -> [VarOperand(v.held)].concat(read.args),
-    EntryFolding -> [VarOperand(v.held)].concat(read.args),
+  let params = match w.kind {
+    Folding -> [VarOperand(v.accumulator)].concat(read.args),
+    EntryFolding -> [VarOperand(v.accumulator)].concat(read.args),
     _ -> read.args,
   };
   let o = match f.node {
@@ -965,7 +966,7 @@ fn entry_read(
           ]),
         },
       ],
-      rest: [Done(VarOperand(v.held))],
+      rest: [Done(VarOperand(v.accumulator))],
     }),
   );
   let read = emitted(
@@ -1057,7 +1058,7 @@ fn enter_inlined_lambda(
   let inner = {
     ..context,
     result_type: t.ret,
-    frame: l.at,
+    frame_span: l.at,
     captured: l.captures.map(|c: Capture| c.destination),
   };
   let taken = range(0, params.len()).fold(
@@ -1147,7 +1148,7 @@ fn inlined_in_frame(
       let inner = {
         ..context,
         result_type: typed.ret,
-        frame: k.lambda.at,
+        frame_span: k.lambda.at,
         captured: k.lambda.captures.map(|c: Capture| c.destination),
         words: match lender {
           Some(_) -> parameter_function_words(context, closure),
@@ -1178,7 +1179,7 @@ fn parameter_function_words(context: Context, closure: Var) -> List<EvidenceWord
   range(0, wanted.len()).fold([], |acc: List<EvidenceWord>, i: Int|
     match ((wanted.at(i), words.at(i))) {
       (Some(o), Some(w)) ->
-        acc.push({ evidence: o.evidence, word: w, through: false, handled: false }),
+        acc.push({ evidence: o.evidence, word: w, inherited: false, handled: false }),
       _ -> acc,
     })
 }
@@ -1216,7 +1217,13 @@ pub fn exit_inlined(
     },
     StepLoop(v) -> match ((lowered.args.at(0), lowered.args.at(1))) {
       (Some(Some(seed)), Some(Some(budget))) -> {
-        let ended = { state: v.state, left: v.spent, result: v.result, next: body.st.next, at: at };
+        let ended = {
+          state: v.state,
+          left: v.left_after,
+          result: v.result,
+          next: body.st.next,
+          at: at,
+        };
         let pass = match fused(body.st.insts, body.arg, ended) {
           Some(f) -> f,
           None -> iter_tested(context, body.st.insts, body.arg, ended),
@@ -1247,7 +1254,7 @@ fn end_site_scope(insts: Block, from: Int, back: Lowering) -> Lowering =
     emitted(back, SiteScope(None))
   } else { back }
 
-pub type WalkVariables = { at: Var, held: Var, result: Var, item: Var }
+pub type WalkVariables = { at: Var, accumulator: Var, result: Var, item: Var }
 
 fn walk_variables(
   context: Context,
@@ -1255,11 +1262,11 @@ fn walk_variables(
   w: Walk,
 ) -> { st: Lowering, vars: WalkVariables } = {
   let p = fresh(st, int_type(), AsInt);
-  let h = fresh(p.st, w.held, representation_of(context.setting, w.held));
-  let a = fresh(h.st, w.held, representation_of(context.setting, w.held));
+  let h = fresh(p.st, w.accumulator, representation_of(context.setting, w.accumulator));
+  let a = fresh(h.st, w.accumulator, representation_of(context.setting, w.accumulator));
   let item = match w.over.at(0) { Some(t) -> t, None -> unknown_type() };
   let x = fresh(a.st, item, representation_of(context.setting, item));
-  { st: x.st, vars: { at: p.var, held: h.var, result: a.var, item: x.var } }
+  { st: x.st, vars: { at: p.var, accumulator: h.var, result: a.var, item: x.var } }
 }
 
 fn exit_walk(
@@ -1282,9 +1289,9 @@ fn exit_walk(
     at,
   );
   let went = |s: Lowering, held: Arg| emitted(s, Next([after.arg, held]));
-  let item = match w.by {
+  let item = match w.kind {
     Mapping -> {
-      let o = list_push(context, after.st, VarOperand(v.held), body.arg, w.held, at);
+      let o = list_push(context, after.st, VarOperand(v.accumulator), body.arg, w.accumulator, at);
       went(o.st, o.arg)
     },
     Filtering -> {
@@ -1292,9 +1299,9 @@ fn exit_walk(
       let o = list_push(
         context,
         enter_block(k.st),
-        VarOperand(v.held),
+        VarOperand(v.accumulator),
         VarOperand(v.item),
-        w.held,
+        w.accumulator,
         at,
       );
       emitted(
@@ -1302,22 +1309,22 @@ fn exit_walk(
         If({
           cond: k.arg,
           then: went(o.st, o.arg).insts,
-          otherwise: [Next([after.arg, VarOperand(v.held)])],
+          otherwise: [Next([after.arg, VarOperand(v.accumulator)])],
         }),
       )
     },
     _ -> {
-      let h = represented_as({ st: after.st, arg: body.arg }, v.held.representation, at);
+      let h = represented_as({ st: after.st, arg: body.arg }, v.accumulator.representation, at);
       went(h.st, h.arg)
     },
   };
   let looped = |s: Lowering, n: Arg| {
-    let first = match w.by {
+    let first = match w.kind {
       Folding -> match lowered.args.at(1) {
-        Some(Some(init)) -> represented_as({ st: s, arg: init }, v.held.representation, at),
+        Some(Some(init)) -> represented_as({ st: s, arg: init }, v.accumulator.representation, at),
         _ -> unreachable(b"a fold with no first accumulator"),
       },
-      _ -> empty_list_with_capacity(context, s, w.held, n, at),
+      _ -> empty_list_with_capacity(context, s, w.accumulator, n, at),
     };
     let ended = fresh(first.st, bool_type(), AsBool);
     let pass = [
@@ -1327,13 +1334,17 @@ fn exit_walk(
         at: at,
         unwind: [],
       }),
-      If({ cond: VarOperand(ended.var), then: [Done(VarOperand(v.held))], otherwise: item.insts }),
+      If({
+        cond: VarOperand(ended.var),
+        then: [Done(VarOperand(v.accumulator))],
+        otherwise: item.insts,
+      }),
     ];
     {
       st: emitted(
         ended.st,
         Loop({
-          state: [{ var: v.at, init: IntOperand(0) }, { var: v.held, init: first.arg }],
+          state: [{ var: v.at, init: IntOperand(0) }, { var: v.accumulator, init: first.arg }],
           body: pass,
           result: v.result,
         }),
@@ -1384,11 +1395,11 @@ fn exit_map_walk(
     );
   let done_next = plus_one(back, v.at);
   let place_next = plus_one(done_next.st, e.place);
-  let h = represented_as({ st: place_next.st, arg: body.arg }, v.held.representation, at);
+  let h = represented_as({ st: place_next.st, arg: body.arg }, v.accumulator.representation, at);
   let item = emitted(h.st, Next([done_next.arg, VarOperand(e.leaf), place_next.arg, h.arg]));
   match ((lowered.args.at(0), lowered.args.at(1))) {
     (Some(Some(m)), Some(Some(init))) -> {
-      let seed = represented_as({ st: outside(item), arg: init }, v.held.representation, at);
+      let seed = represented_as({ st: outside(item), arg: init }, v.accumulator.representation, at);
       let root = intrinsic_call(
         context,
         seed.st,
@@ -1397,7 +1408,7 @@ fn exit_map_walk(
         option_type(map_node(w)),
         at,
       );
-      let result = fresh(root.st, w.held, representation_of(context.setting, w.held));
+      let result = fresh(root.st, w.accumulator, representation_of(context.setting, w.accumulator));
       let reads = |op: ContainerOp|
         Op({ op: OfContainers(op), args: [m], uses: typed_ir::reads(1) });
       let opened_root = emitted(
@@ -1426,7 +1437,7 @@ fn exit_map_walk(
         }),
         If({
           cond: VarOperand(ended.var),
-          then: [Done(VarOperand(v.held))],
+          then: [Done(VarOperand(v.accumulator))],
           otherwise: item.insts,
         }),
       ];
@@ -1437,7 +1448,7 @@ fn exit_map_walk(
             { var: v.at, init: IntOperand(0) },
             { var: e.node, init: first.arg },
             { var: e.i, init: IntOperand(0) },
-            { var: v.held, init: seed.arg },
+            { var: v.accumulator, init: seed.arg },
           ],
           body: pass,
           result: v.result,
@@ -1483,7 +1494,7 @@ fn list_push(
 
 fn prelude_defined(context: Context, name: Bytes) -> Option<NamedDefinition> =
   if context.setting.module == prelude_module() {
-    match context.setting.here.find(|d: Definition| d.name == name) {
+    match context.setting.definitions.find(|d: Definition| d.name == name) {
       Some(d) -> Some({ full: prelude_named(name), definition: d }),
       None -> None,
     }
@@ -1511,7 +1522,7 @@ fn enter_step(
         Some(Some(budget)) -> {
           let v = step_variables(context, st, t.state, t.result);
           let begun = budget_checked(
-            note_frame_entry({ ..context, frame: l.at }, enter_block(v.st), at),
+            note_frame_entry({ ..context, frame_span: l.at }, enter_block(v.st), at),
             v.left,
             budget,
             at,
@@ -1533,14 +1544,14 @@ fn enter_step(
                 context: {
                   ..context,
                   result_type: t.result,
-                  frame: l.at,
+                  frame_span: l.at,
                   captured: l.captures.map(|cap: Capture| cap.destination),
                 },
                 st: { ..begun.st, env: env },
                 looped: StepLoop({
                   state: v.state,
                   left: v.left,
-                  spent: begun.spent,
+                  left_after: begun.spent,
                   result: v.result,
                 }),
               },
@@ -1704,7 +1715,7 @@ fn function_parts(t: Type, arity: Int) -> Option<{ ty: Type, params: List<Type>,
     _ -> None,
   }
 
-pub type StepVariables = { state: Var, left: Var, spent: Var, result: Var }
+pub type StepVariables = { state: Var, left: Var, left_after: Var, result: Var }
 
 fn step_variables(
   context: Context,
@@ -1961,11 +1972,11 @@ pub fn lambda_body_start(
   );
   let given = {
     ..caps,
-    env: range(0, s.own.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
-      match s.own.at(j) { Some(p) -> m.insert(j, VarOperand(p)), None -> m }),
+    env: range(0, s.parameters.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
+      match s.parameters.at(j) { Some(p) -> m.insert(j, VarOperand(p)), None -> m }),
   };
-  let read = read_evidence_words(given, s.words, frame.words, at);
-  let inside = substitute_evidence_vars(frame.held, s.holding);
+  let read = read_evidence_words(given, s.evidence_parameters, frame.words, at);
+  let inside = substitute_evidence_vars(frame.captured_evidence, s.held_evidence);
   {
     context: {
       ..context,
@@ -1975,7 +1986,7 @@ pub fn lambda_body_start(
       result: s.result,
       result_type: s.ret,
       parameter_positions: Map::new(),
-      frame: at,
+      frame_span: at,
       captured: frame.captures.map(|c: Capture| c.destination),
       words: inside.words.concat(read.words),
       label_values: label_values_at(
@@ -2043,8 +2054,8 @@ pub fn closure(
   };
   let unraised = exit_function(outer, returned.st);
   let exit_inlined = frame_labels(context, frame);
-  let raising = match substitute_evidence_vars(frame.held, s.holding).words.find(
-      |w: EvidenceWord| w.evidence.effect == b"abort" && !w.through,
+  let raising = match substitute_evidence_vars(frame.captured_evidence, s.held_evidence).words.find(
+      |w: EvidenceWord| w.evidence.effect == b"abort" && !w.inherited,
     ) {
     Some(w) -> match w.word {
       VarOperand(v) -> pending_abort_raise(context, unraised, v),
@@ -2067,7 +2078,7 @@ pub fn closure(
         words: {
           descriptor: own.name,
           count: frame.words.len(),
-          left: frame.words.fold([], |acc: List<Int>, o: EffectsEvidence|
+          resource_captures: frame.words.fold([], |acc: List<Int>, o: EffectsEvidence|
             match o.evidence.resource {
               ResourceVariable(p) -> match zip(exit_inlined, s.labels).find(
                   |l: { first: Int, second: Var }| l.first == p,
@@ -2101,11 +2112,11 @@ pub fn closure(
     s.ty,
     AsWord,
     Allocate({
-      made: ClosureAllocation({ nth: nth, captures: laid.len(), params: s.own.len() }),
+      made: ClosureAllocation({ nth: nth, captures: laid.len(), params: s.parameters.len() }),
       args: captures_in_order(
         caps.args,
         exit_inlined.map(|p: Int| label_value(context, p)),
-        evidence_values_of(frame.held),
+        evidence_values_of(frame.captured_evidence),
       ),
       reuse: None,
     }),
@@ -2192,7 +2203,7 @@ pub fn tail_group_root(
         kind: Metered,
         params: [which],
         convention: {
-          params: [{ handed: OwnedParam, representation: AsInt }],
+          params: [{ ownership: OwnedParam, representation: AsInt }],
           result: AsWord,
           destination_passing: false,
           returned: typed_ir::OwnedResult,
@@ -2311,9 +2322,9 @@ type Reference = { st: Lowering, callee: Callee, args: List<Type>, given: List<T
 type ClosureLayout = {
   captured: List<Var>,
   labels: List<Var>,
-  holding: EvidenceValues<Var>,
-  own: List<Var>,
-  words: List<Var>,
+  held_evidence: EvidenceValues<Var>,
+  parameters: List<Var>,
+  evidence_parameters: List<Var>,
   result: Representation,
   ty: Type,
   ret: Type,
@@ -2326,9 +2337,10 @@ fn captures_in_order<a>(
 ) -> List<a> = note_captures.concat(labels).concat(listed_evidence_values(holding))
 
 fn shape_captures(s: ClosureLayout) -> List<Var> =
-  captures_in_order(s.captured, s.labels, s.holding)
+  captures_in_order(s.captured, s.labels, s.held_evidence)
 
-fn shape_params(s: ClosureLayout) -> List<Var> = shape_captures(s).concat(s.own).concat(s.words)
+fn shape_params(s: ClosureLayout) -> List<Var> =
+  shape_captures(s).concat(s.parameters).concat(s.evidence_parameters)
 
 fn shape_convention(s: ClosureLayout) -> Convention = {
   let params = shape_params(s);
@@ -2373,14 +2385,18 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
     frame_labels(context, frame).map(|_: Int| { ty: int_type(), representation: AsInt }),
   );
   let uncounted = { ty: evidence_type(), representation: AsImmediate };
-  let words_held = numbered(labels.next, frame.held.words.map(|_: EvidenceWord| uncounted));
-  let instance = numbered(words_held.next, match frame.held.instance {
+  let words_held = numbered(
+    labels.next,
+    frame.captured_evidence.words.map(|_: EvidenceWord| uncounted),
+  );
+  let instance = numbered(words_held.next, match frame.captured_evidence.instance {
     Some(_) -> [uncounted],
     None -> [],
   });
   let kept = numbered(
     instance.next,
-    frame.held.kept.map(|_: Arg| { ty: instance_block_type(), representation: AsWord }),
+    frame.captured_evidence.kept.map(|_: Arg|
+      { ty: instance_block_type(), representation: AsWord }),
   );
   let own = numbered(
     kept.next,
@@ -2399,9 +2415,9 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
   {
     captured: note_captures.vars,
     labels: labels.vars,
-    holding: { words: words_held.vars, instance: instance.vars.at(0), kept: kept.vars },
-    own: own.vars,
-    words: words.vars,
+    held_evidence: { words: words_held.vars, instance: instance.vars.at(0), kept: kept.vars },
+    parameters: own.vars,
+    evidence_parameters: words.vars,
     result: if frame.resumes != None { AsWord } else { representation_of(context.setting, f.ret) },
     ty: FunctionType(f),
     ret: f.ret,
@@ -2414,7 +2430,8 @@ fn frame_labels(context: Context, frame: Frame) -> List<Int> =
     frame.body,
     caller_filled_labels(
       frame.words.concat(
-        frame.held.words.map(|w: EvidenceWord| { evidence: w.evidence, through: w.through }),
+        frame.captured_evidence.words.map(|w: EvidenceWord|
+          { evidence: w.evidence, from_variable: w.inherited }),
       ),
     ),
   )
@@ -2573,7 +2590,7 @@ fn constant_read(
   }
 
 fn borrows_outlive_jump(context: Context, d: NamedDefinition, args: List<Arg>) -> Bool = {
-  let own = context.setting.here.fold([], |acc: List<Int>, h: Definition|
+  let own = context.setting.definitions.fold([], |acc: List<Int>, h: Definition|
     if Some(qualify(context.setting.module, h.name)) == definition_of(context.key) { h.borrowed }
     else { acc });
   d.definition.borrowed.all(|k: Int|
@@ -2626,7 +2643,7 @@ fn tail_jump_with_evidence(
         given.effect_evidence,
       )
       && (passed_as_given(context, given) || given.words.len() <= max_evidence_params()) {
-    let e = if passed_as_given(context, given) { { st: st, args: context.handed } }
+    let e = if passed_as_given(context, given) { { st: st, args: context.evidence_arguments } }
     else { passed_evidence_arguments(st, given, at) };
     let h = all_represented_as(e.st, args.concat(e.args), parameter_representations(context), at);
     Some({
@@ -2933,7 +2950,7 @@ fn reference_to(
           generics: st.links.generics.push({
             callee: Named(d.full),
             args: given,
-            carried: match d.definition.scheme {
+            specialised_variables: match d.definition.scheme {
               Some(sc) -> specialised_variables(s, sc, given, d.definition.arity),
               None -> [],
             },
@@ -3035,7 +3052,11 @@ fn note_forwarded_functions(
                     ..acc,
                     links: {
                       ..acc.links,
-                      passes: acc.links.passes.push({ param: j, callee: callee, at: i }),
+                      forwarded_parameters: acc.links.forwarded_parameters.push({
+                        param: j,
+                        callee: callee,
+                        at: i,
+                      }),
                     },
                   }
                 } else { acc },
@@ -3096,7 +3117,7 @@ fn fn_args(
           } else { acc },
           NDefinition(_) -> match named_arity(
               context.setting.module,
-              context.setting.here,
+              context.setting.definitions,
               context.setting.imports,
               c,
             ) {
@@ -3111,7 +3132,7 @@ fn fn_args(
 }
 
 fn passed_as_given(context: Context, given: EvidenceArguments) -> Bool / {abort.raise} =
-  given.wanted == evidence_parameters(context.setting, context.key).own
+  given.wanted == evidence_parameters(context.setting, context.key).declared
 
 fn labelled_param(d: Definition, j: Int) -> Bool =
   match d.scheme {
@@ -3148,8 +3169,11 @@ fn allows_lambda_inlining(context: Context) -> Bool / {abort.raise} =
     Specialisation(a, _) ->
       a.borrowed.len() == 0
         && key_types(context.key).all(|t: Type| t != unknown_type() && !has_variables(t)),
-    Named(n) -> match context.setting.here.fold(None, |acc: Option<Definition>, d: Definition|
-        if qualify(context.setting.module, d.name) == n { Some(d) } else { acc }) {
+    Named(n) -> match context.setting.definitions.fold(
+        None,
+        |acc: Option<Definition>, d: Definition|
+          if qualify(context.setting.module, d.name) == n { Some(d) } else { acc },
+      ) {
       Some(d) -> match d.scheme { Some(sc) -> sc.type_variables.len() == 0, None -> true },
       None -> false,
     },
@@ -3158,7 +3182,12 @@ fn allows_lambda_inlining(context: Context) -> Bool / {abort.raise} =
 
 fn inlinable_lambdas_of(context: Context) -> List<Lambda> / {abort.raise} =
   lambdas_of(context.body).concat(
-    named_in(context.setting.module, context.setting.here, context.setting.imports, context.body),
+    named_in(
+      context.setting.module,
+      context.setting.definitions,
+      context.setting.imports,
+      context.body,
+    ),
   )
 
 fn named_arity(
@@ -3519,7 +3548,12 @@ fn iterate_inlinable(args: List<Code>) -> Bool =
     })
 
 fn defined(context: Context, full_name: Bytes) -> Option<NamedDefinition> =
-  definition_full(context.setting.module, context.setting.here, context.setting.imports, full_name)
+  definition_full(
+    context.setting.module,
+    context.setting.definitions,
+    context.setting.imports,
+    full_name,
+  )
 
 pub fn definition_full(
   module: Bytes,
@@ -3546,7 +3580,7 @@ fn last_of(definitions: List<Definition>, named: (Definition) -> Bool) -> Option
     if named(d) { Some(d) } else { acc })
 
 fn definition_named(context: Context, name: Bytes) -> Option<NamedDefinition> / {abort.raise} =
-  definition_in(context.setting.module, context.setting.here, context.setting.imports, name)
+  definition_in(context.setting.module, context.setting.definitions, context.setting.imports, name)
 
 pub fn definition_in(
   module: Bytes,

@@ -2364,7 +2364,7 @@ Expr Expression
 
 It renames each definition, local variable, effect operation, record field and module with the old
 name, where it is declared and wherever it is used. A record field is renamed in every record type
-that has it, since records are structural.
+that has it.
 
 A line can be narrower:
 
@@ -2372,7 +2372,13 @@ A line can be narrower:
 | --- | --- |
 | `packages/cli/build.ply Made BuildOutput` | only what that file declares under the name, and its uses |
 | `packages/std/fs.ply fs.read_file load_file` | one operation of an effect the file declares |
+| `packages/shop/order.ply Order.held quantity` | one field of a record type the file declares |
 | `.held cached` | only the record field |
+
+Records are structural, so `ply rename` tells records apart by their field names. A record type's
+field is renamed in every record with the same field names: literals, reads, updates, patterns and
+written record types. When two declared types have the same field names, the map must rename the
+field in both. A `new` record type's field is renamed only in that type.
 | `packages/app/old_name.ply new_name` | a module: the file moves, and imports follow |
 | `packages/compiler/emit/old/ new` | a directory of modules |
 

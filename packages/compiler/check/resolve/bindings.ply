@@ -39,7 +39,7 @@ pub type Refers =
   | Unbound
 
 pub type Reference = {
-  site: Int,
+  identifier_id: Int,
   start: Int,
   end: Int,
   name: Bytes,
@@ -49,7 +49,12 @@ pub type Reference = {
 
 pub type Member = { start: Int, end: Int, name: Bytes, kind: MemberKind }
 
-pub type MemberKind = | FieldName | CalledName(Int) | ArgumentName({ call: Int, callee: Refers })
+pub type MemberKind =
+  | FieldName(FieldOf)
+  | CalledName(Int)
+  | ArgumentName({ call: Int, callee: Refers })
+
+pub type FieldOf = | RecordAt(Int) | RecordFields(List<Bytes>) | TypeNamed(Bytes)
 
 pub type Written = { references: List<Reference>, members: List<Member> }
 
@@ -85,7 +90,7 @@ fn empty_walk() -> Walk =
 
 fn reference(name: Identifier, refers: Refers, shorthand: Bool) -> Reference =
   {
-    site: name.span.site,
+    identifier_id: name.span.site,
     start: name.span.start,
     end: name.span.end,
     name: name.name,
@@ -181,17 +186,22 @@ fn made_field(name: Identifier, at: Span) -> Bool =
 fn pun(field: Identifier, name: Identifier) -> Bool =
   name.name == field.name && name.span.start == field.span.start
 
-fn labelled(w: Walk, field: Identifier, punned: Bool, at: Span) -> Walk =
-  if !punned && made_field(field, at) { w } else { member(w, field, FieldName) }
+fn labelled(w: Walk, field: Identifier, punned: Bool, at: Span, of: FieldOf) -> Walk =
+  if !punned && made_field(field, at) { w } else { member(w, field, FieldName(of)) }
 
-fn walk_field(w: Walk, field: RecordLiteralField) -> Walk / {abort.raise} =
-  match field.value {
-    NameExpression(v) -> {
-      let punned = v.name.module == None && pun(field.name, v.name.name);
-      value_named(labelled(w, field.name, punned, v.span), v.name, punned)
-    },
-    _ -> walk_expression(labelled(w, field.name, false, expression_span(field.value)), field.value),
-  }
+fn walk_fields(w: Walk, fields: List<RecordLiteralField>, of: FieldOf) -> Walk / {abort.raise} =
+  fields.fold(w, |acc: Walk, field: RecordLiteralField|
+    match field.value {
+      NameExpression(v) -> {
+        let punned = v.name.module == None && pun(field.name, v.name.name);
+        value_named(labelled(acc, field.name, punned, v.span, of), v.name, punned)
+      },
+      _ ->
+        walk_expression(
+          labelled(acc, field.name, false, expression_span(field.value), of),
+          field.value,
+        ),
+    })
 
 fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
   record_reference(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
@@ -214,10 +224,23 @@ fn walk_type(w: Walk, t: TypeExpression) -> Walk / {abort.raise} =
     FunctionTypeExpression(f) ->
       walk_optional_effects(walk_type(f.params.fold(w, walk_type), f.ret), f.effects),
     RecordTypeExpression(r) ->
-      r.fields.fold(w, |acc: Walk, field: { name: Identifier, ty: TypeExpression }|
-        walk_type(labelled(acc, field.name, false, type_span(field.ty)), field.ty)),
+      walk_record_type(
+        w,
+        r.fields,
+        RecordFields(
+          r.fields.map(|field: { name: Identifier, ty: TypeExpression }| field.name.name),
+        ),
+      ),
     _ -> w,
   }
+
+fn walk_record_type(
+  w: Walk,
+  fields: List<{ name: Identifier, ty: TypeExpression }>,
+  of: FieldOf,
+) -> Walk / {abort.raise} =
+  fields.fold(w, |acc: Walk, field: { name: Identifier, ty: TypeExpression }|
+    walk_type(labelled(acc, field.name, false, type_span(field.ty), of), field.ty))
 
 fn walk_effects(w: Walk, r: EffectsExpression) -> Walk / {abort.raise} =
   walk_effect_list(w, r.listed, r.aliases)
@@ -253,11 +276,16 @@ fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
         match field.pattern {
           PatternVariable(v) -> {
             let punned = pun(field.name, v.name);
-            binder(labelled(acc, field.name, punned, v.span), v.name, punned, again)
+            binder(
+              labelled(acc, field.name, punned, v.span, RecordAt(r.span.site)),
+              v.name,
+              punned,
+              again,
+            )
           },
           _ ->
             walk_pattern(
-              labelled(acc, field.name, false, pattern_span(field.pattern)),
+              labelled(acc, field.name, false, pattern_span(field.pattern), RecordAt(r.span.site)),
               field.pattern,
               again,
             ),
@@ -278,8 +306,23 @@ fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
 fn walk_params(w: Walk, ps: List<Param>) -> Walk / {abort.raise} =
   ps.fold(ps.fold(pushed(w), |acc: Walk, p: Param| bound(acc, p.name)), |acc: Walk, p: Param| {
     let typed = walk_optional_type(acc, p.ty);
-    match p.default { Some(d) -> walk_expression(typed, d), None -> typed }
+    match p.default { Some(d) -> walk_default(typed, d, p.ty), None -> typed }
   })
+
+fn walk_default(w: Walk, default: Expression, ty: Option<TypeExpression>) -> Walk / {abort.raise} =
+  match ((default, ty)) {
+    (RecordExpression(r), Some(RecordTypeExpression(t))) ->
+      walk_fields(
+        w,
+        r.fields,
+        RecordFields(t.fields.map(|f: { name: Identifier, ty: TypeExpression }| f.name.name)),
+      ),
+    (RecordExpression(r), Some(NamedTypeExpression(n))) -> match (w.find)(TypeSpace, n.name) {
+      Some(b) -> walk_fields(w, r.fields, TypeNamed(b.qualified)),
+      None -> walk_expression(w, default),
+    },
+    _ -> walk_expression(w, default),
+  }
 
 fn walk_spec(w: Walk, ps: List<Param>, s: SpecClause) -> Walk / {abort.raise} = {
   let named = |of: (Param) -> Option<Identifier>|
@@ -361,10 +404,12 @@ fn walk_expression(w: Walk, e: Expression) -> Walk / {abort.raise} =
       let statements = b.statements.fold(pushed(w), walk_statement);
       popped(match b.tail { Some(t) -> walk_expression(statements, t), None -> statements })
     },
-    RecordExpression(r) -> r.fields.fold(w, walk_field),
-    RecordUpdateExpression(u) -> u.fields.fold(walk_expression(w, u.base), walk_field),
+    RecordExpression(r) -> walk_fields(w, r.fields, RecordAt(r.span.site)),
+    RecordUpdateExpression(u) ->
+      walk_fields(walk_expression(w, u.base), u.fields, RecordAt(u.span.site)),
     PropagateExpression(t) -> walk_expression(w, t.operand),
-    FieldExpression(f) -> member(walk_expression(w, f.base), f.field, FieldName),
+    FieldExpression(f) ->
+      member(walk_expression(w, f.base), f.field, FieldName(RecordAt(f.span.site))),
     ListExpression(l) -> l.items.fold(w, walk_expression),
     PerformExpression(p) -> match if p.effect_name.module == None {
         find_local(w, p.effect_name.name.name)
@@ -445,6 +490,15 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
       let declared = named_in(w, TypeSpace, bare(t.name));
       match t.body {
         AliasBody(x) -> walk_type(declared, x),
+        NominalBody(RecordTypeExpression(r)) ->
+          walk_record_type(
+            declared,
+            r.fields,
+            TypeNamed(match (w.find)(TypeSpace, bare(t.name)) {
+              Some(b) -> b.qualified,
+              None -> t.name.name,
+            }),
+          ),
         NominalBody(x) -> walk_type(declared, x),
         SumBody(variants) ->
           variants.fold(declared, |acc: Walk, v: VariantDefinition|
@@ -483,7 +537,7 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
       named_in(
         named_in(w, if d.kind == HostInstance { EffectSpace } else { TypeSpace }, bare(d.target)),
         ValueSpace,
-        bare(d.by),
+        bare(d.function),
       ),
     NumericItem(d) ->
       d.operations.fold(named_in(w, TypeSpace, bare(d.target)), |acc: Walk, x: NumericOp|
