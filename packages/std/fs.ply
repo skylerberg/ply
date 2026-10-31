@@ -891,13 +891,13 @@ pub fn mem_append(tree: MemFs, path: String, body: Bytes) -> AppendResult / {abo
 /// as hard links to it.
 pub fn mem_copy(tree: MemFs, from: String, to: String) -> WriteResult / {abort.raise} =
   match key_of(tree, from, true) {
-    Some(src) -> match key_of(tree, to, true) {
-      Some(destination) -> match tree.files.get(src) {
-        Some(body) -> if src == destination || one_file(tree, src, destination) {
+    Some(source) -> match key_of(tree, to, true) {
+      Some(destination) -> match tree.files.get(source) {
+        Some(body) -> if source == destination || one_file(tree, source, destination) {
           { fs: tree, ok: true }
-        } else if readable(tree, src) && can_write_file(tree, destination) {
+        } else if readable(tree, source) && can_write_file(tree, destination) {
           {
-            fs: with_mode(stored(tree, destination, body), destination, mode_at(tree, src)),
+            fs: with_mode(stored(tree, destination, body), destination, mode_at(tree, source)),
             ok: true,
           }
         } else { { fs: tree, ok: false } },
@@ -968,26 +968,29 @@ pub fn mem_sync_all(tree: MemFs) -> MemFs =
 /// are unchanged, and no descriptor or lock survives. In the returned tree everything counts as
 /// synced, so a second crash changes nothing.
 pub fn mem_crashed(tree: MemFs) -> MemFs = {
-  let kept = tree.synced_names.fold(Map::new(), |m: Map<String, Int>, key: String, id: Int|
-    if kind_at(tree, parent_of(key)) != Dir || tree.dirs.contains(key) || tree.links.contains(key) {
-      m
-    } else { m.insert(key, id) });
-  let stands = |key: String|
-    kept.contains(key) || tree.dirs.contains(key) || tree.links.contains(key);
-  let counted = kept.fold(Map::new(), |n: Map<Int, Int>, _key: String, id: Int|
+  let surviving_names = tree.synced_names.fold(
+    Map::new(),
+    |m: Map<String, Int>, key: String, id: Int|
+      if kind_at(tree, parent_of(key)) != Dir || tree.dirs.contains(key)
+          || tree.links.contains(key) { m }
+      else { m.insert(key, id) },
+  );
+  let survives = |key: String|
+    surviving_names.contains(key) || tree.dirs.contains(key) || tree.links.contains(key);
+  let counted = surviving_names.fold(Map::new(), |n: Map<Int, Int>, _key: String, id: Int|
     n.insert(id, match n.get(id) { Some(names) -> names + 1, None -> 1 }));
   mem_sync_all({
     ..tree,
-    files: kept.fold(Map::new(), |m: Map<String, Body>, key: String, id: Int|
+    files: surviving_names.fold(Map::new(), |m: Map<String, Body>, key: String, id: Int|
       m.insert(key, match tree.synced_bodies.get(id) { Some(body) -> body, None -> Plain(b"") })),
-    ids: tree.ids.fold(kept, |m: Map<String, Int>, key: String, id: Int|
+    ids: tree.ids.fold(surviving_names, |m: Map<String, Int>, key: String, id: Int|
       if tree.files.contains(key) || m.contains(key) { m } else { m.insert(key, id) }),
     shared: counted.fold(Map::new(), |n: Map<Int, Int>, id: Int, names: Int|
       if names > 1 { n.insert(id, names) } else { n }),
     modes: tree.modes.fold(Map::new(), |m: Map<String, Mode>, key: String, mode: Mode|
-      if stands(key) { m.insert(key, mode) } else { m }),
+      if survives(key) { m.insert(key, mode) } else { m }),
     modified: tree.modified.fold(Map::new(), |m: Map<String, Int>, key: String, at: Int|
-      if stands(key) { m.insert(key, at) } else { m }),
+      if survives(key) { m.insert(key, at) } else { m }),
     locks: Map::new(),
     opened: Map::new(),
   })
@@ -1071,11 +1074,13 @@ pub fn mem_remove_tree(f: MemFs, path: String) -> WriteResult / {abort.raise} =
 /// two hard-link names of the same file, nothing changes and the call succeeds.
 pub fn mem_rename(tree: MemFs, from: String, to: String) -> WriteResult / {abort.raise} =
   match key_of(tree, from, false) {
-    Some(src) -> match key_of(tree, to, false) {
-      Some(destination) -> if kind_at(tree, src) != Missing
-          && (src == destination || one_file(tree, src, destination)) { { fs: tree, ok: true } }
-      else if movable(tree, src, destination) { { fs: moved(tree, src, destination), ok: true } }
-      else { { fs: tree, ok: false } },
+    Some(source) -> match key_of(tree, to, false) {
+      Some(destination) -> if kind_at(tree, source) != Missing
+          && (source == destination || one_file(tree, source, destination)) {
+        { fs: tree, ok: true }
+      } else if movable(tree, source, destination) {
+        { fs: moved(tree, source, destination), ok: true }
+      } else { { fs: tree, ok: false } },
       None -> { fs: tree, ok: false },
     },
     None -> { fs: tree, ok: false },
@@ -1085,24 +1090,26 @@ fn one_file(tree: MemFs, a: String, b: String) -> Bool =
   tree.files.contains(a) && tree.files.contains(b) && tree.ids.get(a) != None
     && tree.ids.get(a) == tree.ids.get(b)
 
-fn movable(tree: MemFs, src: String, destination: String) -> Bool = {
-  let from = kind_at(tree, src);
+fn movable(tree: MemFs, source: String, destination: String) -> Bool = {
+  let from = kind_at(tree, source);
   let to = kind_at(tree, destination);
-  src != "" && destination != "" && from != Missing && kind_at(tree, parent_of(destination)) == Dir
-    && writable(tree, parent_of(src))
+  source != "" && destination != "" && from != Missing
+    && kind_at(tree, parent_of(destination)) == Dir
+    && writable(tree, parent_of(source))
     && writable(tree, parent_of(destination))
-    && !String::starts_with(destination ++ "/", src ++ "/")
+    && !String::starts_with(destination ++ "/", source ++ "/")
     && (to == Missing || (from != Dir && to != Dir))
 }
 
-fn moved(f: MemFs, src: String, destination: String) -> MemFs / {abort.raise} = {
+fn moved(f: MemFs, source: String, destination: String) -> MemFs / {abort.raise} = {
   let cleared = if kind_at(f, destination) == Missing { f } else { dropped(f, destination) };
-  let under_destination = |k: String| destination ++ k.slice(src.len(), k.len());
+  let under_destination = |k: String| destination ++ k.slice(source.len(), k.len());
   let keyed = all_keys(cleared).fold(cleared, |t: MemFs, k: String|
-    if k == src || k.starts_with(src ++ "/") { rekeyed(t, k, under_destination(k)) } else { t });
-  let durable = if kind_at(f, src) != Dir { keyed.synced_names } else {
+    if k == source || k.starts_with(source ++ "/") { rekeyed(t, k, under_destination(k)) }
+    else { t });
+  let durable = if kind_at(f, source) != Dir { keyed.synced_names } else {
     keyed.synced_names.keys().fold(keyed.synced_names, |m: Map<String, Int>, k: String|
-      if k.starts_with(src ++ "/") { moved_key(m, k, under_destination(k)) } else { m })
+      if k.starts_with(source ++ "/") { moved_key(m, k, under_destination(k)) } else { m })
   };
   { ..keyed, synced_names: durable, clock: keyed.clock + 1 }
 }
@@ -1167,34 +1174,34 @@ pub fn mem_symlink(tree: MemFs, path: String, target: String) -> WriteResult / {
 pub fn mem_link(tree: MemFs, path: String, to: String) -> LinkResult / {abort.raise} =
   match key_of(tree, to, false) {
     None -> { fs: tree, done: Err(NotFound) },
-    Some(src) -> match key_of(tree, path, false) {
+    Some(source) -> match key_of(tree, path, false) {
       None -> { fs: tree, done: Err(NotFound) },
-      Some(destination) -> match link_error(tree, src, destination) {
+      Some(destination) -> match link_error(tree, source, destination) {
         Some(reason) -> { fs: tree, done: Err(reason) },
-        None -> { fs: with_hard_link(with_id(tree, src), src, destination), done: Ok(()) },
+        None -> { fs: with_hard_link(with_id(tree, source), source, destination), done: Ok(()) },
       },
     },
   }
 
-fn link_error(tree: MemFs, src: String, destination: String) -> Option<FileError> =
-  match kind_at(tree, src) {
+fn link_error(tree: MemFs, source: String, destination: String) -> Option<FileError> =
+  match kind_at(tree, source) {
     Missing -> Some(NotFound),
     File -> if kind_at(tree, destination) != Missing { Some(Exists) }
     else { create_error(tree, destination) },
     _ -> Some(NotAFile),
   }
 
-fn with_hard_link(tree: MemFs, src: String, destination: String) -> MemFs = {
+fn with_hard_link(tree: MemFs, source: String, destination: String) -> MemFs = {
   let carried = |m: Map<String, Int>|
-    match m.get(src) { Some(x) -> m.insert(destination, x), None -> m };
-  let id = match tree.ids.get(src) { Some(n) -> n, None -> 0 };
+    match m.get(source) { Some(x) -> m.insert(destination, x), None -> m };
+  let id = match tree.ids.get(source) { Some(n) -> n, None -> 0 };
   {
     ..tree,
-    files: match tree.files.get(src) {
+    files: match tree.files.get(source) {
       Some(b) -> tree.files.insert(destination, b),
       None -> tree.files,
     },
-    modes: match tree.modes.get(src) {
+    modes: match tree.modes.get(source) {
       Some(m) -> tree.modes.insert(destination, m),
       None -> tree.modes,
     },
@@ -1459,7 +1466,7 @@ fn run_on_mem<a, [l] | e>(
   left: Int,
   go: () -> a / {fs.read[l], fs.write[l] | e},
 ) -> CountedRunResult<a> / {abort.raise | e bounded} = {
-  let kept = |r: MemRun, w: WriteResult| {
+  let apply_write = |r: MemRun, w: WriteResult| {
     let c = apply_change(r, w.fs);
     { run: c.run, ok: c.made && w.ok }
   };
@@ -1501,13 +1508,13 @@ fn run_on_mem<a, [l] | e>(
     },
     fs.write_file[l](p, body) -> {
       run = count_operation(run);
-      let k = kept(run, mem_write(run.tree, p, body));
+      let k = apply_write(run, mem_write(run.tree, p, body));
       run = k.run;
       k.ok
     },
     fs.write_secret[l](p, before, secret, encoding, after) -> {
       run = count_operation(run);
-      let k = kept(
+      let k = apply_write(
         run,
         mem_write_secret(run.tree, p, {
           before: before,
@@ -1532,49 +1539,49 @@ fn run_on_mem<a, [l] | e>(
     },
     fs.create_dir[l](p) -> {
       run = count_operation(run);
-      let k = kept(run, mem_create_dir(run.tree, p));
+      let k = apply_write(run, mem_create_dir(run.tree, p));
       run = k.run;
       k.ok
     },
     fs.remove[l](p) -> {
       run = count_operation(run);
-      let k = kept(run, mem_remove(run.tree, p));
+      let k = apply_write(run, mem_remove(run.tree, p));
       run = k.run;
       k.ok
     },
     fs.rename[l](from, to) -> {
       run = count_operation(run);
-      let k = kept(run, mem_rename(run.tree, from, to));
+      let k = apply_write(run, mem_rename(run.tree, from, to));
       run = k.run;
       k.ok
     },
     fs.sync[l](p) -> {
       run = count_operation(run);
-      let k = kept(run, mem_sync(run.tree, p));
+      let k = apply_write(run, mem_sync(run.tree, p));
       run = k.run;
       k.ok
     },
     fs.lock[l](p) -> {
       run = count_operation(run);
-      let k = kept(run, mem_lock(run.tree, p));
+      let k = apply_write(run, mem_lock(run.tree, p));
       run = k.run;
       k.ok
     },
     fs.unlock[l](p) -> {
       run = count_operation(run);
-      let k = kept(run, mem_unlock(run.tree, p));
+      let k = apply_write(run, mem_unlock(run.tree, p));
       run = k.run;
       k.ok
     },
     fs.copy[l](from, to) -> {
       run = count_operation(run);
-      let k = kept(run, mem_copy(run.tree, from, to));
+      let k = apply_write(run, mem_copy(run.tree, from, to));
       run = k.run;
       k.ok
     },
     fs.remove_tree[l](p) -> {
       run = count_operation(run);
-      let k = kept(run, mem_remove_tree(run.tree, p));
+      let k = apply_write(run, mem_remove_tree(run.tree, p));
       run = k.run;
       k.ok
     },
@@ -1595,13 +1602,13 @@ fn run_on_mem<a, [l] | e>(
     },
     fs.set_mode[l](p, mode) -> {
       run = count_operation(run);
-      let k = kept(run, mem_set_mode(run.tree, p, mode));
+      let k = apply_write(run, mem_set_mode(run.tree, p, mode));
       run = k.run;
       k.ok
     },
     fs.symlink[l](p, target) -> {
       run = count_operation(run);
-      let k = kept(run, mem_symlink(run.tree, p, target));
+      let k = apply_write(run, mem_symlink(run.tree, p, target));
       run = k.run;
       k.ok
     },
@@ -1615,7 +1622,7 @@ fn run_on_mem<a, [l] | e>(
     },
     fs.set_modified[l](p, ms) -> {
       run = count_operation(run);
-      let k = kept(run, mem_set_modified(run.tree, p, ms));
+      let k = apply_write(run, mem_set_modified(run.tree, p, ms));
       run = k.run;
       k.ok
     },
@@ -1639,7 +1646,7 @@ fn run_on_mem<a, [l] | e>(
     },
     fs.write_chunk[l](file, body) -> {
       run = count_operation(run);
-      let k = kept(run, mem_write_chunk(run.tree, file, body));
+      let k = apply_write(run, mem_write_chunk(run.tree, file, body));
       run = k.run;
       k.ok
     },
@@ -1984,7 +1991,7 @@ fn plan_copy<[s], [d]>(
   how: CopyOptions,
 ) -> CopyPlan / {fs.stat[s], fs.scan[s], fs.stat[d], fs.scan[d], fs.remove_tree[d], files.fail, abort.raise} = {
   let source = normalize(from);
-  let dest = normalize(to);
+  let destination = normalize(to);
   let beneath = |top: String, seen: List<ScanEntry>|
     seen.map(|entry: ScanEntry|
       { ..entry, path: entry.path.slice(under(top, "").len(), entry.path.len()) });
@@ -2000,16 +2007,16 @@ fn plan_copy<[s], [d]>(
   if entries.len() > how.entries || sized > how.bytes { files.fail(from, LimitExceeded) }
   else { () };
   let nothing: Map<String, Kind> = Map::new();
-  let held = match fs.stat[d](dest) {
+  let destination_kinds = match fs.stat[d](destination) {
     None -> nothing,
     Some(found) -> match how.existing {
       Reject -> files.fail(to, Exists),
-      Replace -> if fs.remove_tree[d](dest) { nothing }
+      Replace -> if fs.remove_tree[d](destination) { nothing }
       else { files.fail(to, operation_failed("remove_tree")) },
       Merge -> if found.kind != Dir { nothing.insert("", found.kind) } else {
-        match fs.scan[d](dest, true) {
+        match fs.scan[d](destination, true) {
           Some(seen) ->
-            beneath(dest, seen).fold(
+            beneath(destination, seen).fold(
               nothing.insert("", Dir),
               |m: Map<String, Kind>, entry: ScanEntry| m.insert(entry.path, entry.stat.kind),
             ),
@@ -2018,7 +2025,7 @@ fn plan_copy<[s], [d]>(
       },
     },
   };
-  { source: source, dest: dest, entries: entries, destination_kinds: held }
+  { source: source, dest: destination, entries: entries, destination_kinds: destination_kinds }
 }
 
 fn placed<a, [s], [d]>(
@@ -2027,11 +2034,11 @@ fn placed<a, [s], [d]>(
   c: CopyState<a>,
   entry: ScanEntry,
 ) -> PreparedEntry<a> / {fs.read_link[s], fs.remove[d], fs.create_dir[d], fs.symlink[d], fs.link[d], files.fail} = {
-  let src = below(found.source, entry.path);
+  let source = below(found.source, entry.path);
   let destination = below(found.dest, entry.path);
   let before = found.destination_kinds.get(entry.path);
   let done = |copy: CopyState<a>|
-    { copy: copy, from: src, to: destination, needs_bytes: false, skipped: false };
+    { copy: copy, from: source, to: destination, needs_bytes: false, skipped: false };
   match before {
     None -> (),
     Some(kind) -> if kind != Dir {
@@ -2044,8 +2051,8 @@ fn placed<a, [s], [d]>(
     Dir -> if before == Some(Dir) || fs.create_dir[d](destination) {
       done({ ..c, dirs: c.dirs.push({ path: destination, stat: entry.stat }) })
     } else { files.fail(destination, operation_failed("create_dir")) },
-    Symlink -> match fs.read_link[s](src) {
-      None -> files.fail(src, NotFound),
+    Symlink -> match fs.read_link[s](source) {
+      None -> files.fail(source, NotFound),
       Some(target) -> if resolve_target(segments(parent_of(destination)), target) == None {
         match how.outside_link {
           RejectLink -> files.fail(destination, CrossesRoot),
@@ -2684,9 +2691,9 @@ test "`write_secret` on the in-memory filesystem stores a secret that `read_file
   assert(mem_read_secret(tree, "keys/old", b"pl", "raw", b"n") == Some(Secret::of_bytes(b"ai")));
   assert(mem_read_secret(tree, "keys/old", b"", "hex", b"") == None);
   assert(mem_read_secret(tree, "keys/typed", b"key ", "hex", b"") == None);
-  let held = |path: String, size: Int|
+  let is_private_file = |path: String, size: Int|
     mem_size(ran.tree, path) == Some(size) && mem_mode(ran.tree, path) == Some(owner_only());
-  assert(held("keys/new", 13) && held("keys/old", 4));
+  assert(is_private_file("keys/new", 13) && is_private_file("keys/old", 4));
   assert(
     mem_framed_secret(ran.tree, "keys/new")
       == Some({ before: b"key ", secret: key, encoding: "hex", after: b"\n" }),
@@ -2764,12 +2771,12 @@ test "append, sync and write-then-rename work through a handler backed by the in
 
 test "a lock has one holder at a time, and only its holder releases it" {
   let dir = mem_create_dir(mem_empty(), "cache");
-  let held = mem_lock(dir.fs, "cache/lock");
-  assert(held.ok);
-  assert(mem_exists(held.fs, "cache/lock"));
-  assert(!mem_lock(held.fs, "cache/lock").ok);
+  let locked = mem_lock(dir.fs, "cache/lock");
+  assert(locked.ok);
+  assert(mem_exists(locked.fs, "cache/lock"));
+  assert(!mem_lock(locked.fs, "cache/lock").ok);
   assert(!mem_unlock(mem_write(dir.fs, "cache/lock", b"").fs, "cache/lock").ok);
-  let freed = mem_unlock(held.fs, "cache/lock");
+  let freed = mem_unlock(locked.fs, "cache/lock");
   assert(freed.ok);
   assert(!mem_exists(freed.fs, "cache/lock"));
   assert(!mem_unlock(freed.fs, "cache/lock").ok);
@@ -2812,15 +2819,15 @@ fn mode_of(text: String) -> Mode / {abort.raise} =
 
 test "a copy carries a file's bytes and mode, and never a directory" {
   let base = mem_create_dir(mem_of([{ path: "a.txt", body: b"x" }]), "d").fs;
-  let held = mem_set_mode(base, "a.txt", mode_of("rw-------")).fs;
-  let copied = mem_copy(held, "a.txt", "b.txt");
+  let with_mode = mem_set_mode(base, "a.txt", mode_of("rw-------")).fs;
+  let copied = mem_copy(with_mode, "a.txt", "b.txt");
   assert(copied.ok);
   assert_eq(mem_read(copied.fs, "b.txt"), Some(b"x"));
   assert_eq(mem_mode(copied.fs, "b.txt"), Some(mode_of("rw-------")));
-  assert(!mem_copy(held, "d", "e").ok);
-  assert(!mem_copy(held, "a.txt", "d").ok);
-  assert(!mem_copy(held, "a.txt", "absent/b.txt").ok);
-  assert(!mem_copy(held, "absent.txt", "c.txt").ok)
+  assert(!mem_copy(with_mode, "d", "e").ok);
+  assert(!mem_copy(with_mode, "a.txt", "d").ok);
+  assert(!mem_copy(with_mode, "a.txt", "absent/b.txt").ok);
+  assert(!mem_copy(with_mode, "absent.txt", "c.txt").ok)
 }
 
 test "`mem_remove_tree` deletes a directory and its contents, deletes a symlink inside without following it, and fails for the root" {
@@ -3264,8 +3271,8 @@ test "after a simulated power loss, a file contains its last synced bytes, and a
   assert_eq(after(mem_sync(renamed, "d").fs, "d/young"), Some(b"old"));
   assert_eq(after(mem_rename(base, "d", "e").fs, "e/old"), Some(b"old"));
   assert(!mem_sync(base, "d/absent").ok);
-  let held = mem_open(base, "d/old", ToRead);
-  assert_eq(mem_crashed(mem_lock(held.fs, "d/lock").fs).opened.len(), 0)
+  let opened = mem_open(base, "d/old", ToRead);
+  assert_eq(mem_crashed(mem_lock(opened.fs, "d/lock").fs).opened.len(), 0)
 }
 
 test "`on_mem_counted` returns how many filesystem operations ran, counting a read the same as a write" {

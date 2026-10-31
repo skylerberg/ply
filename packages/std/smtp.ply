@@ -482,22 +482,22 @@ fn printable(raw: Bytes) -> String =
   )
 
 fn scan_reply(
-  held: Bytes,
+  buffer: Bytes,
   at: Int,
   p: Partial,
   limits: Limits,
   left: Int,
 ) -> ReplyScan / {smtp.fail, abort.raise} =
-  match held.index_of_from(b"\n", at) {
-    None -> if held.len() - at > limits.line { smtp.fail(LineTooLong) }
-    else if p.size + held.len() - at > limits.reply { smtp.fail(ReplyTooLarge) }
+  match buffer.index_of_from(b"\n", at) {
+    None -> if buffer.len() - at > limits.line { smtp.fail(LineTooLong) }
+    else if p.size + buffer.len() - at > limits.reply { smtp.fail(ReplyTooLarge) }
     else { { whole: None, partial: p, unread_start: at } },
     Some(end) -> {
       let size = p.size + end + 1 - at;
       if end + 1 - at > limits.line { smtp.fail(LineTooLong) }
       else if size > limits.reply { smtp.fail(ReplyTooLarge) }
-      else if end == at || held.peek(end - 1) != b'\r' { smtp.fail(BadLine) } else {
-        let line = held.slice(at, end - 1);
+      else if end == at || buffer.peek(end - 1) != b'\r' { smtp.fail(BadLine) } else {
+        let line = buffer.slice(at, end - 1);
         let n = line.len();
         let digits = match line.slice(0, min(n, 3)).int_of_ascii() {
           Some(d) -> if n >= 3 && d >= 200 && d <= 599 { d } else { -1 },
@@ -516,7 +516,7 @@ fn scan_reply(
             }
           } else if left <= 0 { smtp.fail(ReplyTooLarge) } else {
             scan_reply(
-              held,
+              buffer,
               end + 1,
               { digits: digits, lines: texts, size: size },
               limits,
@@ -634,13 +634,15 @@ pub fn capabilities(r: Reply) -> Capabilities / {abort.raise} =
   })
 
 fn mechanisms_in(c: Capabilities, offered: List<String>) -> Capabilities =
-  offered.filter(|named: String| named != "").fold(c, |held: Capabilities, named: String|
+  offered.filter(|named: String| named != "").fold(c, |capabilities: Capabilities, named: String|
     match sasl::mechanism_named(named) {
-      Some(m) -> { ..held, auth: held.auth.push_unique(m) },
+      Some(m) -> { ..capabilities, auth: capabilities.auth.push_unique(m) },
       None ->
         {
-          ..held,
-          unsupported_mechanisms: held.unsupported_mechanisms.push_unique(named.ascii_upper()),
+          ..capabilities,
+          unsupported_mechanisms: capabilities.unsupported_mechanisms.push_unique(
+            named.ascii_upper(),
+          ),
         },
     })
 
@@ -837,7 +839,8 @@ pub fn with_tls(c: Config, policy: TlsPolicy) -> Config = { ..c, tls: policy }
 
 /// Returns `c` set to authenticate with `credential` by `AUTH`. A session fails when the server
 /// offers no mechanism that the credential and the configuration both accept.
-pub fn with_credential(c: Config, held: Credential) -> Config = { ..c, credential: Some(held) }
+pub fn with_credential(c: Config, credential: Credential) -> Config =
+  { ..c, credential: Some(credential) }
 
 /// Returns `c` set to use only the mechanisms in `order`, choosing the first one the server offers
 /// that works with the credential. By default `c` uses the mechanisms of `std.sasl`, in their
@@ -1101,29 +1104,29 @@ fn ready(s: State) -> Bool = s.pending.len() == 0 && s.todo == Idle && !s.over
 /// unavailable, no usable authentication mechanism, or a rejected credential.
 pub fn feed(e: Engine, data: Bytes) -> Turn / {smtp.fail, abort.raise} = {
   let s = state(e);
-  let held = s.unparsed.concat(data);
+  let input = s.unparsed.concat(data);
   if s.todo == StartHandshake && s.pending.len() == 0 { smtp.fail(Injected) }
-  else { absorb({ ..s, unparsed: b"" }, held, 0, [], 0, held.len() + 1) }
+  else { absorb({ ..s, unparsed: b"" }, input, 0, [], 0, input.len() + 1) }
 }
 
 fn absorb(
   s: State,
-  held: Bytes,
+  input: Bytes,
   at: Int,
   reply_of: List<Line>,
   replies_read: Int,
   left: Int,
 ) -> Turn / {smtp.fail, abort.raise} =
   match s.pending.first() {
-    None -> if at < held.len() && !s.over {
+    None -> if at < input.len() && !s.over {
       smtp.fail(if s.todo == StartHandshake { Injected } else { Unsolicited })
     } else { take_next_action(s, reply_of, replies_read) },
     Some(awaited) -> if left <= 0 { smtp.fail(Unsolicited) } else {
-      let t = scan_reply(held, at, s.partial, s.config.limits, held.len());
+      let t = scan_reply(input, at, s.partial, s.config.limits, input.len());
       match t.whole {
         None ->
           turn(
-            { ..s, unparsed: held.slice(t.unread_start, held.len()), partial: t.partial },
+            { ..s, unparsed: input.slice(t.unread_start, input.len()), partial: t.partial },
             Open(b""),
             Await(phase_of(awaited)),
             reply_of,
@@ -1132,7 +1135,7 @@ fn absorb(
         Some(r) ->
           absorb(
             handle_reply({ ..s, pending: s.pending.drop(1), partial: nothing_read() }, awaited, r),
-            held,
+            input,
             t.unread_start,
             reply_of.concat(reply_lines(r)),
             replies_read + 1,
@@ -1181,11 +1184,11 @@ fn handle_auth_reply(s: State, r: Reply) -> State / {smtp.fail, abort.raise} =
     None -> smtp.fail(Unsolicited),
     Some(p) -> if number(r.code) == 334 {
       match p.pending_response {
-        Some(kept) ->
+        Some(response) ->
           {
             ..s,
             authentication: Some({ exchange: p.exchange, pending_response: None }),
-            todo: Respond(kept),
+            todo: Respond(response),
           },
         None -> {
           let reply_of = r.lines.at_or(0, "").ascii_trim();
@@ -1302,10 +1305,10 @@ fn send_command(
 fn authenticate(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {smtp.fail} =
   match s.config.credential {
     None -> turn({ ..s, todo: Idle }, Open(b""), Ready, reply_of, replies_read),
-    Some(held) -> {
+    Some(credential) -> {
       let server_takes = match s.offered { Some(c) -> c.auth, None -> [] };
       let fit = s.config.mechanisms.filter(|m: Mechanism|
-        server_takes.contains(m) && sasl::supports(held, m));
+        server_takes.contains(m) && sasl::supports(credential, m));
       let safe = fit.filter(|m: Mechanism|
         s.link.secure || !sasl::reveals(m) || s.config.exposure == PasswordInClear);
       match safe.first() {
@@ -1314,7 +1317,7 @@ fn authenticate(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {sm
           None -> smtp.fail(NoMechanism),
         },
         Some(m) -> match try[sasl.fail] {
-            sasl::begin(m, held, {
+            sasl::begin(m, credential, {
               nonce: s.link.nonce,
               max_iterations: s.config.limits.scram_iterations,
               host: s.link.host,
@@ -1661,7 +1664,7 @@ fn drive<[l] | e>(
       },
       Await(p) -> {
         let until = match end {
-          Some(kept) if !wrote && t.returned == 0 -> kept,
+          Some(end_time) if !wrote && t.returned == 0 -> end_time,
           _ -> deadline_after(timeout(waits, p)),
         };
         match read_by[l](h, min(read_size(), read_limit(t.engine)), until) {
@@ -1681,8 +1684,8 @@ fn drive<[l] | e>(
   }
 }
 
-fn trim_transcript(limits: Limits, kept: List<Line>, reply_of: List<Line>) -> List<Line> = {
-  let lines = kept.concat(reply_of);
+fn trim_transcript(limits: Limits, earlier_lines: List<Line>, reply_of: List<Line>) -> List<Line> = {
+  let lines = earlier_lines.concat(reply_of);
   lines.drop(lines.len() - max(limits.transcript, 0))
 }
 
@@ -1860,8 +1863,8 @@ pub fn with_session_tls<a, [l] | e>(
   c: Config,
   body: (Session) -> a / e,
 ) -> a / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise | e} =
-  with_scope[session](open_tls[l](host, port, c), |s: Session| close[l](s)) { held -> {
-    let s = held.get();
+  with_scope[session](open_tls[l](host, port, c), |s: Session| close[l](s)) { scoped_session -> {
+    let s = scoped_session.get();
     let result_of = body(s);
     send_quit[l](s);
     result_of
@@ -1875,8 +1878,8 @@ pub fn with_session<a, [l] | e>(
   c: Config,
   body: (Session) -> a / e,
 ) -> a / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise | e} =
-  with_scope[session](open[l](host, port, c), |s: Session| close[l](s)) { held -> {
-    let s = held.get();
+  with_scope[session](open[l](host, port, c), |s: Session| close[l](s)) { scoped_session -> {
+    let s = scoped_session.get();
     let result_of = body(s);
     send_quit[l](s);
     result_of
@@ -2006,7 +2009,7 @@ fn reads_or_rejects(given: Bytes, limits: Limits) -> Bool =
           given.len() <= limits.reply && parse_reply(render_reply(r), default_limits()) == Ok(r),
       }
     } {
-    Ok(held) -> held,
+    Ok(accepted) -> accepted,
     Err(_) -> false,
   }
 
@@ -2058,7 +2061,7 @@ test "the enhanced status {show(s.text)} is a class, a subject and a detail, or 
   ) { assert_eq(option_parts(read_status(s.text)), s.expect) }
 
 fn option_parts(s: Option<Status>) -> Option<List<Int>> =
-  match s { Some(held) -> Some(status_parts(held)), None -> None }
+  match s { Some(status) -> Some(status_parts(status)), None -> None }
 
 test "`enhanced_status` returns the status code at the start of a reply's text, only if its first digit matches the first digit of the reply code" {
   assert_eq(show(enhanced_status(reply_of(550, ["5.1.1 No such user"]))), "Some(5.1.1)");
@@ -2515,13 +2518,13 @@ fn clear_password(s: Setup) -> Setup = { ..s, exposure: PasswordInClear }
 fn helo(s: Setup) -> Setup = { ..s, helo: true }
 
 fn configured(s: Setup) -> Config / {abort.raise} = {
-  let held = match s.credential {
+  let credential_result = match s.credential {
     Nobody -> Ok(None),
     TimPassword -> try[sasl.fail] { Some(tim_password()) },
     Pencil -> try[sasl.fail] { Some(user_password()) },
     Bearer(token) -> try[sasl.fail] { Some(sasl::bearer("tim", Secret::of_string(token).bytes())) },
   };
-  match ((try[smtp.fail] { config(s.name, default_limits()) }, held)) {
+  match ((try[smtp.fail] { config(s.name, default_limits()) }, credential_result)) {
     (Ok(bare), Ok(credential)) -> {
       let c = with_exposure(with_tls(bare, s.tls), s.exposure);
       let given = match credential { Some(k) -> with_credential(c, k), None -> c };
@@ -3676,9 +3679,12 @@ fn driven_as(chunks: List<Bytes>, envelope: Envelope, secure: Bool, shape: Int) 
         Err(_) -> None,
         Ok(bare) -> match try[sasl.fail] { sasl::password("user", Secret::of_bytes(b"pencil")) } {
           Err(_) -> None,
-          Ok(held) -> {
+          Ok(credential) -> {
             let c = with_exposure(
-              with_tls(if kind % 2 == 0 { bare } else { with_credential(bare, held) }, policy),
+              with_tls(
+                if kind % 2 == 0 { bare } else { with_credential(bare, credential) },
+                policy,
+              ),
               if kind % 4 < 2 { Protected } else { PasswordInClear },
             );
             run_engine(start(c, link(secure)), chunks, envelope, b"", 40)
@@ -4194,7 +4200,7 @@ test "`relay` sends a message that was read as its original bytes to every recip
 
 test "a session's transcript contains only the newest lines up to its limit, and never a credential" {
   let envelope = email::envelope_of(ReturnTo(test_sender()), test_recipients(["Jones", "Green"]));
-  let kept = |most: Int| {
+  let transcript_for_limit = |most: Int| {
     let limits: Limits = { ..default_limits(), transcript: most };
     let c = with_credential(config("client.example", limits), tim_password());
     on_mx(serving(465, [implicit(submission())]), || {
@@ -4203,7 +4209,7 @@ test "a session's transcript contains only the newest lines up to its limit, and
     }).value
   };
   assert_eq(
-    kept(100),
+    transcript_for_limit(100),
     Ok(
       \\S: 220 mx.example ESMTP
       \\C: EHLO client.example
@@ -4226,14 +4232,14 @@ test "a session's transcript contains only the newest lines up to its limit, and
     ),
   );
   assert_eq(
-    kept(3),
+    transcript_for_limit(3),
     Ok(
       \\S: 354 End data with <CR><LF>.<CR><LF>
       \\*: 42 octets of message
       \\S: 250 2.0.0 Ok: queued as 4F2A91
     ),
   );
-  assert_eq(kept(0), Ok(""))
+  assert_eq(transcript_for_limit(0), Ok(""))
 }
 
 test "no address and no parameter writes a line of its own: a message's commands are one line each" {

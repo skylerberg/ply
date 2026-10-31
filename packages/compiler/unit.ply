@@ -600,16 +600,17 @@ fn runtime_enters(p: Program, k: RootKey) -> Bool =
       runtime_enters(p, c.definition)
         && (match c.definition {
           Named(n) -> match p.schemes.get(n) {
-            Some(sc) -> emit::judgeable(p.marshalling, sc),
+            Some(scheme) -> emit::judgeable(p.marshalling, scheme),
             None -> false,
           },
           _ -> false,
         }),
     Named(n) -> match ((p.schemes.get(n), p.roots.get(root_name(k)))) {
-      (Some(sc), Some(r)) ->
-        emit::enterable(p.marshalling, sc)
-          && (sc.type_variables.len() == 0 || r.witnesses.len() == 0),
-      (Some(sc), None) -> emit::enterable(p.marshalling, sc) && sc.type_variables.len() == 0,
+      (Some(scheme), Some(r)) ->
+        emit::enterable(p.marshalling, scheme)
+          && (scheme.type_variables.len() == 0 || r.witnesses.len() == 0),
+      (Some(scheme), None) ->
+        emit::enterable(p.marshalling, scheme) && scheme.type_variables.len() == 0,
       _ -> false,
     },
     _ -> false,
@@ -1451,7 +1452,7 @@ pub fn codes(made: UnitContents) -> Map<RootName, Bytes> / {abort.raise} = {
     b.tables.calls.fold([], |accumulator: List<Int>, c: RootKey|
       match index.get(root_name(c)) { Some(j) -> accumulator.push(j), None -> accumulator }));
   let components = graph::components({ out: adj });
-  let reached = components.fold(Map::new(), |done: Map<Int, Bytes>, comp: List<Int>| {
+  let downstream_digests = components.fold(Map::new(), |done: Map<Int, Bytes>, comp: List<Int>| {
     let inside = comp.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
     let below = comp.fold([], |accumulator: List<Bytes>, i: Int|
       adj.get(i).fold(accumulator, |a: List<Bytes>, j: Int|
@@ -1463,7 +1464,9 @@ pub fn codes(made: UnitContents) -> Map<RootName, Bytes> / {abort.raise} = {
     comp.fold(done, |m: Map<Int, Bytes>, i: Int| m.insert(i, digest))
   });
   range(0, n).fold(Map::new(), |accumulator: Map<RootName, Bytes>, i: Int| {
-    let code = blake3(own.get(i).concat(match reached.get(i) { Some(d) -> d, None -> b"" }));
+    let code = blake3(
+      own.get(i).concat(match downstream_digests.get(i) { Some(d) -> d, None -> b"" }),
+    );
     body_names(bodies.get(i)).fold(accumulator, |m: Map<RootName, Bytes>, name: RootName|
       m.insert(name, code))
   })
@@ -1706,7 +1709,7 @@ fn types_digest(dump: Dump) -> Bytes / {abort.raise} =
             match c.release {
               Some(f) ->
                 f.concat(b"\x00").concat(match definition_scheme(dump, f) {
-                  Some(sc) -> type_text(sc.ty),
+                  Some(scheme) -> type_text(scheme.ty),
                   None -> b"",
                 }),
               None -> b"",
@@ -2034,7 +2037,7 @@ fn emit_scoped(
   offered: List<RootKey>,
   scope: EmitterScope,
   roots: List<RootKey>,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership: Map<RootName, OwnershipSignature>,
   done: KnownResults,
 ) -> EmitterReply<EmitterScope> / {abort.raise} = {
   let needed = modules_asked(p, roots);
@@ -2055,7 +2058,7 @@ fn emit_scoped(
     },
   };
   let batch_count = batches(p, roots);
-  let a = results_in_parallel(scoped.scope, batch_count, 0, batch_count.len(), 64, handed, done);
+  let a = results_in_parallel(scoped.scope, batch_count, 0, batch_count.len(), 64, ownership, done);
   {
     state: {
       scope: Some(scoped.scope),
@@ -2104,13 +2107,13 @@ fn results_in_parallel(
   lo: Int,
   hi: Int,
   depth_left: Int,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership: Map<RootName, OwnershipSignature>,
   done: KnownResults,
 ) -> EncodedBatches / {abort.raise} =
   if hi - lo <= 1 {
     match batch_count.at(lo) {
       Some(roots) -> {
-        let a = results_closed(scope, roots, handed, done);
+        let a = results_closed(scope, roots, ownership, done);
         { packed: [bin::encode(a.results, bin::list_bin(root_output_bin()))], found: a.found }
       },
       None -> { packed: [], found: [] },
@@ -2119,8 +2122,8 @@ fn results_in_parallel(
   else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      results_in_parallel(scope, batch_count, lo, mid, depth_left - 1, handed, done),
-      results_in_parallel(scope, batch_count, mid, hi, depth_left - 1, handed, done),
+      results_in_parallel(scope, batch_count, lo, mid, depth_left - 1, ownership, done),
+      results_in_parallel(scope, batch_count, mid, hi, depth_left - 1, ownership, done),
     };
     {
       packed: halves._0.packed.concat(halves._1.packed),
@@ -2145,7 +2148,7 @@ type KnownResults = { before: Map<RootName, Output>, now: Map<RootName, Output> 
 fn results_closed(
   scope: emit::Scope,
   roots: List<RootKey>,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership: Map<RootName, OwnershipSignature>,
   done: KnownResults,
 ) -> BatchResults / {abort.raise} = {
   let done_already = |n: RootName| done.before.contains(n) || done.now.contains(n);
@@ -2160,7 +2163,7 @@ fn results_closed(
     64,
     |st: { out: BatchResults, asking: List<RootKey>, seen: Map<RootName, Bool>, first: Bool }|
       if st.asking.len() == 0 { Stop(st) } else {
-        let got = emit::root_outputs(scope, st.asking, handed);
+        let got = emit::root_outputs(scope, st.asking, ownership);
         let next = got.fold(
           { keys: [], seen: st.seen },
           |accumulator: { keys: List<RootKey>, seen: Map<RootName, Bool> }, a: RootOutput|
@@ -2191,14 +2194,17 @@ fn results_closed(
 }
 
 fn merged_ownership(
-  handed: Map<RootName, OwnershipSignature>,
+  ownership: Map<RootName, OwnershipSignature>,
   results: Map<RootName, Output>,
 ) -> Map<RootName, OwnershipSignature> =
-  results.fold(handed, |accumulator: Map<RootName, OwnershipSignature>, _: RootName, a: Output|
-    signatures_from(a.tables.handings).fold(
-      accumulator,
-      |m: Map<RootName, OwnershipSignature>, n: RootName, h: OwnershipSignature| m.insert(n, h),
-    ))
+  results.fold(
+    ownership,
+    |accumulator: Map<RootName, OwnershipSignature>, _: RootName, a: Output|
+      signatures_from(a.tables.handings).fold(
+        accumulator,
+        |m: Map<RootName, OwnershipSignature>, n: RootName, h: OwnershipSignature| m.insert(n, h),
+      ),
+  )
 
 fn published_signatures(
   before: Map<RootName, PublishedSignature>,
@@ -2244,13 +2250,13 @@ fn stale_of(
 
 fn without_partial_groups(
   cached: Map<RootName, Output>,
-  asked: List<RootName>,
+  requested: List<RootName>,
 ) -> Map<RootName, Output> / {abort.raise} =
   iterate(cached, cached.len() + 1, |k: Map<RootName, Output>| {
     let split = k.fold([], |accumulator: List<RootName>, n: RootName, a: Output|
       if a.tables.group.any(|g: RootKey| {
           let member = root_name(g);
-          asked.contains(member) && !k.contains(member)
+          requested.contains(member) && !k.contains(member)
         }) { accumulator.push(n) }
       else { accumulator });
     if split.len() == 0 { Stop(k) }
@@ -2514,11 +2520,11 @@ fn with_results<s | e>(
     if w.results.contains(root_name(k)) { accumulator }
     else { accumulator.insert(root_name(k), k) });
   let names = keys.keys();
-  let asked = names.fold(Map::new(), |accumulator: Map<RootName, Bool>, n: RootName|
+  let requested_names = names.fold(Map::new(), |accumulator: Map<RootName, Bool>, n: RootName|
     accumulator.insert(n, true));
   let materials = materials_of(p, types, keys);
   let looked = look(materials);
-  let standing_now = fully_cached_results(looked.results, asked);
+  let standing_now = fully_cached_results(looked.results, requested_names);
   let stale = stale_of(standing_now, published_signatures(w.published, standing_now), keys);
   let cached = without_partial_groups(
     stale.fold(standing_now, |m: Map<RootName, Output>, k: RootKey| m.remove(root_name(k))),
@@ -2539,9 +2545,9 @@ fn with_results<s | e>(
       let now = t.emitted.fold(t.cached, |m: Map<RootName, Output>, n: RootName, a: Output|
         m.insert(n, a));
       let moved = stale_of(now, published_signatures(w.published, now), keys);
-      let asking = t.pending.concat(moved);
-      if asking.len() == 0 { Stop(t) } else {
-        let got = ask(t.emitter, asking, merged_ownership(w.ownership, now), {
+      let requests = t.pending.concat(moved);
+      if requests.len() == 0 { Stop(t) } else {
+        let got = ask(t.emitter, requests, merged_ownership(w.ownership, now), {
           before: w.results,
           now: now,
         });
@@ -2555,7 +2561,7 @@ fn with_results<s | e>(
             m.insert(n, a)),
           cached: moved.fold(t.cached, |m: Map<RootName, Output>, k: RootKey|
             m.remove(root_name(k))),
-          asked: t.asked + asking.len() + found.len() - t.found.len(),
+          asked: t.asked + requests.len() + found.len() - t.found.len(),
           pending: [],
           emitter: got.state,
           found: found,
@@ -2563,7 +2569,7 @@ fn with_results<s | e>(
       }
     },
   );
-  let reached = reachable_found_roots(
+  let reachable_roots = reachable_found_roots(
     resolved.emitted.fold(
       resolved.cached,
       |accumulator: Map<RootName, Output>, n: RootName, a: Output| accumulator.insert(n, a),
@@ -2575,7 +2581,7 @@ fn with_results<s | e>(
     resolved.found.fold(
       resolved.emitted,
       |accumulator: Map<RootName, Output>, n: RootName, _: RootKey|
-        if reached.contains(n) { accumulator } else { accumulator.remove(n) },
+        if reachable_roots.contains(n) { accumulator } else { accumulator.remove(n) },
     ),
     |accumulator: Map<RootName, Output>, k: RootKey|
       if accumulator.contains(root_name(k)) { accumulator } else {
@@ -2597,7 +2603,7 @@ fn with_results<s | e>(
   let now = all.keys();
   let r = results_to_cache(
     p.keys,
-    reached.fold(materials, |m: Map<RootName, Bytes>, n: RootName, k: RootKey|
+    reachable_roots.fold(materials, |m: Map<RootName, Bytes>, n: RootName, k: RootKey|
       match root_cache_key(p, types, k) { Some(x) -> m.insert(n, x), None -> m }),
     body_names,
     looked.known.fold(w.known, |m: Map<Bytes, Bool>, d: Bytes, _: Bool| m.insert(d, true)),
@@ -2612,12 +2618,12 @@ fn with_results<s | e>(
       |accumulator: Map<RootName, Stored>, n: RootName, _: Output|
         match looked.stored.get(n) { Some(s) -> accumulator.insert(n, s), None -> accumulator },
     ),
-    keys: reached.fold(
+    keys: reachable_roots.fold(
       keys.fold(w.keys, |accumulator: Map<RootName, RootKey>, n: RootName, k: RootKey|
         accumulator.insert(n, k)),
       |accumulator: Map<RootName, RootKey>, n: RootName, k: RootKey| accumulator.insert(n, k),
     ),
-    added: w.added.concat(reached.values()),
+    added: w.added.concat(reachable_roots.values()),
     published: published_signatures(w.published, all),
     ownership: merged_ownership(w.ownership, all),
     dependents: dependents_with(w.dependents, all),
@@ -2735,8 +2741,8 @@ pub fn emitted<| e>(
       keep,
       phases,
       initial_emitter_scope,
-      |scope: EmitterScope, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults|
-        emit_scoped(dump, p, constructors, offered, scope, roots, handed, done),
+      |scope: EmitterScope, roots: List<RootKey>, ownership: Map<RootName, OwnershipSignature>, done: KnownResults|
+        emit_scoped(dump, p, constructors, offered, scope, roots, ownership, done),
     );
     {
       let c = compiled(all.results, all.keys, all.stored);
@@ -2964,13 +2970,13 @@ fn with_callee_needs(
     match call.args.at(need.var) {
       None -> a,
       Some(arg) -> {
-        let vars = match need.reads {
+        let variables = match need.reads {
           Exact -> type_variables(arg),
           Layout -> layout_variables(arg),
           Scalar -> match arg { VariableType(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
           EffectsGeneric -> [],
         };
-        vars.fold(a, |m: Map<RootName, List<Need>>, v: Int| {
+        variables.fold(a, |m: Map<RootName, List<Need>>, v: Int| {
           let had = match m.get(n) { Some(ns) -> ns, None -> [] };
           let more = { var: v, reads: need.reads };
           if had.contains(more) { m } else { m.insert(n, had.push(more)) }
@@ -3019,7 +3025,7 @@ fn generic_calls_specialised(
   constructors: Constructors,
 ) -> { results: Map<RootName, Output>, named: Map<RootName, List<RootName>>, unemitted: Map<RootName, Bool> } / {abort.raise} = {
   let unemitted = unemitted_generics(results, keys, needs);
-  let asked = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
+  let canonical_key = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
   let named = results.fold(
     Map::new(),
     |accumulator: Map<RootName, List<RootName>>, n: RootName, a: Output|
@@ -3027,7 +3033,7 @@ fn generic_calls_specialised(
         accumulator.insert(
           n,
           a.tables.generics.calls.map(|g: GenericCall|
-            root_name(asked(call_specialisation(g, needs, called, constructors)))),
+            root_name(canonical_key(call_specialisation(g, needs, called, constructors)))),
         )
       },
   );
@@ -3036,7 +3042,7 @@ fn generic_calls_specialised(
     |accumulator: Map<RootName, Output>, n: RootName, a: Output|
       accumulator.insert(n, if a.tables.generics.calls.len() == 0 { a } else {
         let resolved = a.tables.generics.calls.map(|g: GenericCall|
-          asked(call_specialisation(g, needs, called, constructors)));
+          canonical_key(call_specialisation(g, needs, called, constructors)));
         let roots = resolved.map(root_name);
         let calls = resolved.fold(a.tables.calls, |cs: List<RootKey>, r: RootKey|
           if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) });
@@ -3547,18 +3553,18 @@ test "a generic function that reads a type variable's size, layout or exact type
       value: generic_body([], [{ var: 0, reads: Exact }]),
     },
   ]);
-  let said = handle {
+  let message = handle {
     with_unemitted_rejected(open.results, open.keys, Map::new());
     b""
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert(said.index_of(b"still reads a type variable's layout or type") != None, None)
+  assert(message.index_of(b"still reads a type variable's layout or type") != None, None)
 }
 
 test "a body that calls a function missing from its unit, such as a generic function, fails with an internal error" {
   let calling = { text: b"", tables: { ..no_tables(), calls: [Named(b"m.same")] } };
-  let said = handle {
+  let message = handle {
     taken_bodies(by_definition([{ key: b"m.main", value: calling }]), Map::new(), [
       definition_root(b"m.main"),
     ]);
@@ -3566,7 +3572,7 @@ test "a body that calls a function missing from its unit, such as a generic func
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert_eq(said, b"`m.main` calls `m.same`, which is not part of the same compiled program")
+  assert_eq(message, b"`m.main` calls `m.same`, which is not part of the same compiled program")
 }
 
 test "a call to mutually recursive generic functions at a type compiles to their specialisations for that type, whichever one is called" {
@@ -4336,7 +4342,7 @@ test "an embedded file is emitted once, byte for byte, from the file contents gi
 test "two statics with the same name but different contents make the unit fail with an error" {
   let a = statics_of(StringDatum(b"a")).get(0);
   let forged = { name: a.name, layout: statics_of(StringDatum(b"b")).get(0).layout };
-  let said = handle {
+  let error_message = handle {
     fresh_unit(
       [
         { key: b"m.f", value: with_statics(one_body(b"m.f", []), [a]) },
@@ -4348,7 +4354,7 @@ test "two statics with the same name but different contents make the unit fail w
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert(said.starts_with(b"two statics of one name contain different content"), None)
+  assert(error_message.starts_with(b"two statics of one name contain different content"), None)
 }
 
 test "a cached body is reused only when each callee it calls still has the key it had when the body was cached" {
@@ -4438,8 +4444,12 @@ test "a specialisation's scope includes the module declaring its type argument, 
   let p = program_of(dump, sources_in_order(dump, user), requested_roots(dump).keys);
   let at = specialisation_key(b"g.first", [NamedType({ name: b"s.E", args: [] })], []);
   assert_eq(modules_lowered([at]).keys(), [b"g"]);
-  let asked = modules_asked(p, [at]);
-  assert(asked.contains(b"s") && asked.contains(b"g") && !asked.contains(b"m"), None)
+  let scoped_modules = modules_asked(p, [at]);
+  assert(
+    scoped_modules.contains(b"s") && scoped_modules.contains(b"g")
+      && !scoped_modules.contains(b"m"),
+    None,
+  )
 }
 
 test "roots generated for types are split into separate batches, however many types one module generates roots for" {
@@ -4506,11 +4516,11 @@ test "a root's cached result changes with what its module embeds, and with no ot
       Named(b"a.f"),
     ),
   );
-  let spec = |p: Program, lender: Bytes|
+  let spec = |p: Program, owner_name: Bytes|
     root_cache_key(
       p,
       b"",
-      specialisation_key(b"c.h", [], [{ param: 0, owner: Named(lender), nth: 0 }]),
+      specialisation_key(b"c.h", [], [{ param: 0, owner: Named(owner_name), nth: 0 }]),
     );
   assert(spec(embedding(b"one"), b"a.f") != spec(embedding(b"two"), b"a.f"), None);
   assert(spec(embedding(b"one"), b"a.f") != spec(embedding(b"one"), b"b.g"), None)
@@ -4572,15 +4582,15 @@ test "a root generated from a type is cached under a key made from its module's 
 }
 
 test "a call that assumes a borrowing signature different from the callee's declared one fails the build and names both functions" {
-  let handing = |definition: Bytes, borrowed: List<Bool>|
+  let signature = |definition: Bytes, borrowed: List<Bool>|
     { definition: definition_root(definition), borrowed: borrowed, borrowed_from: None };
   let body = |handings: List<PublishedSignature>, assumed: List<PublishedSignature>|
     { text: b"", tables: { ..no_tables(), handings: handings, assumed: assumed } };
   let results = by_definition([
-    { key: b"m.caller", value: body([], [handing(b"m.callee", [true])]) },
-    { key: b"m.callee", value: body([handing(b"m.callee", [false])], []) },
-    { key: b"m.fine", value: body([], [handing(b"m.callee", [false])]) },
-    { key: b"m.alone", value: body([], [handing(b"m.unpublished", [false])]) },
+    { key: b"m.caller", value: body([], [signature(b"m.callee", [true])]) },
+    { key: b"m.callee", value: body([signature(b"m.callee", [false])], []) },
+    { key: b"m.fine", value: body([], [signature(b"m.callee", [false])]) },
+    { key: b"m.alone", value: body([], [signature(b"m.unpublished", [false])]) },
   ]);
   let wrong = signature_mismatches(results, results.keys());
   assert_eq(wrong.map(|m: SignatureMismatch| m.caller), [definition_root(b"m.caller")]);
@@ -4611,7 +4621,7 @@ test "a call that assumes a borrowing signature different from the callee's decl
 }
 
 test "a body compiled against a borrowing signature that later changed is compiled again, together with its recursion group" {
-  let handing = |definition: Bytes, borrowed: List<Bool>|
+  let signature = |definition: Bytes, borrowed: List<Bool>|
     { definition: definition_root(definition), borrowed: borrowed, borrowed_from: None };
   let body = |handings: List<PublishedSignature>, assumed: List<PublishedSignature>, group: List<Bytes>|
     {
@@ -4621,13 +4631,13 @@ test "a body compiled against a borrowing signature that later changed is compil
   let entries = [
     {
       key: b"m.f",
-      value: body([handing(b"m.f", [true])], [handing(b"m.h", [true])], [b"m.f", b"m.g"]),
+      value: body([signature(b"m.f", [true])], [signature(b"m.h", [true])], [b"m.f", b"m.g"]),
     },
-    { key: b"m.g", value: body([handing(b"m.g", [false])], [], [b"m.f", b"m.g"]) },
-    { key: b"m.h", value: body([handing(b"m.h", [false])], [], []) },
-    { key: b"m.k", value: body([], [handing(b"m.h", [false])], []) },
-    { key: b"m.n", value: body([], [handing(b"m.absent", [true])], []) },
-    { key: b"m.o", value: body([], [handing(b"m.absent", [false])], []) },
+    { key: b"m.g", value: body([signature(b"m.g", [false])], [], [b"m.f", b"m.g"]) },
+    { key: b"m.h", value: body([signature(b"m.h", [false])], [], []) },
+    { key: b"m.k", value: body([], [signature(b"m.h", [false])], []) },
+    { key: b"m.n", value: body([], [signature(b"m.absent", [true])], []) },
+    { key: b"m.o", value: body([], [signature(b"m.absent", [false])], []) },
   ];
   let results = by_definition(entries);
   let keys = by_definition(
@@ -4663,10 +4673,10 @@ test "compiling roots in several batches returns the same outputs as `emit::root
     |_: List<Record>| (),
     None,
     |_: List<RootKey>| 0,
-    |asks: Int, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults| {
+    |request_count: Int, roots: List<RootKey>, signatures: Map<RootName, OwnershipSignature>, done: KnownResults| {
       let batch_count = batches(p, roots);
-      let a = results_in_parallel(scope, batch_count, 0, batch_count.len(), 64, handed, done);
-      { state: asks + 1, results: decoded_results(a), found: a.found }
+      let a = results_in_parallel(scope, batch_count, 0, batch_count.len(), 64, signatures, done);
+      { state: request_count + 1, results: decoded_results(a), found: a.found }
     },
   );
   assert(
@@ -4786,7 +4796,7 @@ test "no drop function is generated for lists of scalars, whose memory the runti
   assert_eq(
     taken.filter(|n: Bytes|
       [b"Int", b"Float", b"Decimal", b"U128"].any(|t: Bytes|
-        [b"drop#", b"dup#", b"release#"].any(|op: Bytes| n.ends_with(op.concat(t))))),
+        [b"drop#", b"dup#", b"release#"].any(|prefix: Bytes| n.ends_with(prefix.concat(t))))),
     [],
   )
 }
@@ -4903,7 +4913,7 @@ test "a root the emitter returns no output for makes its unit fail with an inter
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(declared_signature) };
-  let said = first_said(
+  let diagnostic = first_said(
     emitted(
       runtime,
       dump,
@@ -4915,10 +4925,10 @@ test "a root the emitter returns no output for makes its unit fail with an inter
     ),
     dump,
   );
-  assert_eq(said.at(0), Some(b"E0505"));
+  assert_eq(diagnostic.at(0), Some(b"E0505"));
   assert(
-    said.any(|n: Bytes| n.index_of(b"the emitter returned nothing for `m.absent`") != None),
-    Some(String::of_bytes_lossy(Bytes::join(said, b"\n"))),
+    diagnostic.any(|n: Bytes| n.index_of(b"the emitter returned nothing for `m.absent`") != None),
+    Some(String::of_bytes_lossy(Bytes::join(diagnostic, b"\n"))),
   )
 }
 
@@ -4991,12 +5001,15 @@ test "a constant that can fail with `abort.raise` still has a function-table ent
     Err(reason) -> assert_eq(reason, b""),
     Ok(e) -> {
       let text = unit_text(e.produced.parts);
-      let said = Some(String::of_bytes_lossy(text));
+      let output_text = Some(String::of_bytes_lossy(text));
       assert(
         text.index_of(Bytes::concat_all([b"(void *)&", entry_symbol(b"m.limit"), b",\n"])) != None,
-        said,
+        output_text,
       );
-      assert(text.index_of(b"(void *)&,") == None && text.index_of(b"extern char ;") == None, said)
+      assert(
+        text.index_of(b"(void *)&,") == None && text.index_of(b"extern char ;") == None,
+        output_text,
+      )
     },
   }
 }
@@ -5093,10 +5106,13 @@ test "a generic function's `ensures` clause is compiled once for each type the f
     ) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(e) -> {
-      let judged = [EntryPoint(clause(Named(b"m.none"))), clause(claims_key(b"m.none", 1))].map(
+      let clause_roots = [
+        EntryPoint(clause(Named(b"m.none"))),
+        clause(claims_key(b"m.none", 1)),
+      ].map(
         root_name,
       );
-      assert(judged.all(|n: RootName| e.produced.taken.contains(n)), None)
+      assert(clause_roots.all(|n: RootName| e.produced.taken.contains(n)), None)
     },
   }
 }
@@ -5480,11 +5496,11 @@ test "a build fails with an internal error when asked to compile a definition th
       |_: List<Record>| (),
     );
   [offers.keys, []].fold((), |_: Unit, offered: List<RootKey>| {
-    let said = first_said(made(offered), dump);
-    assert_eq(said.at(0), Some(b"E0505"));
+    let diagnostic = first_said(made(offered), dump);
+    assert_eq(diagnostic.at(0), Some(b"E0505"));
     assert(
-      said.any(|n: Bytes| n.index_of(b"offered `m.one` with no typed effects") != None),
-      Some(String::of_bytes_lossy(Bytes::join(said, b"\n"))),
+      diagnostic.any(|n: Bytes| n.index_of(b"offered `m.one` with no typed effects") != None),
+      Some(String::of_bytes_lossy(Bytes::join(diagnostic, b"\n"))),
     )
   })
 }
@@ -5493,7 +5509,7 @@ test "a build reports how many definitions it requested at each dependency level
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   with_body_store(|| {
-    let told = |r: LevelTally|
+    let record_level = |r: LevelTally|
       body_store.put([
         {
           key: ascii_of_int(r.place),
@@ -5514,12 +5530,15 @@ test "a build reports how many definitions it requested at each dependency level
         [Named(b"m.one"), Named(b"m.two")],
         |_: Bytes| None,
         |_: List<Record>| (),
-        phases: Some({ now: || 0, outcome: told }),
+        phases: Some({ now: || 0, outcome: record_level }),
       ) {
       Err(reason) -> panic(String::of_bytes_lossy(reason)),
       Ok(e) -> {
-        let said = match body_store.get(b"told") { Some(b) -> b.split(b","), None -> [] };
-        let order = said.filter(|p: Bytes| p.len() > 0).map(|p: Bytes| digits(p));
+        let recorded_levels = match body_store.get(b"told") {
+          Some(b) -> b.split(b","),
+          None -> [],
+        };
+        let order = recorded_levels.filter(|p: Bytes| p.len() > 0).map(|p: Bytes| digits(p));
         assert(
           order.len() > 0 && range(1, order.len()).all(|i: Int| order.get(i - 1) < order.get(i)),
           None,
@@ -5593,9 +5612,9 @@ test "a unit whose bodies define their own `extern fn` declarations does not req
   let program = [{ name: b"std.prelude", src: prelude_source::text().concat(calls) }];
   match unit_against_runtime(program, [], implemented) {
     Ok(c) -> {
-      let asked = intrinsics().map(|i: { name: Bytes, op: Intrinsic }|
+      let helper_calls = intrinsics().map(|i: { name: Bytes, op: Intrinsic }|
         builtin_helper(i.name.slice(b"std.prelude.".len(), i.name.len())).concat(b"_p(ctx, "));
-      assert_eq(asked.filter(|t: Bytes| c.index_of(t) != None), [])
+      assert_eq(helper_calls.filter(|t: Bytes| c.index_of(t) != None), [])
     },
     Err(diagnostics) -> assert_eq(diagnostics.map(|d: Diagnostic| d.code), []),
   }
@@ -5903,7 +5922,7 @@ test "a build declares a standard library `extern fn` with the runtime's low-lev
     result: Some(abi::Taken),
     raises: false,
   };
-  let told = {
+  let native_request = {
     name: b"told",
     params: [abi::I64, abi::F64, abi::I64, abi::I64],
     result: Some(abi::I64),
@@ -5913,7 +5932,7 @@ test "a build declares a standard library `extern fn` with the runtime's low-lev
   match unit_against_runtime(
       program,
       native,
-      declared_natives().map(declared_signature).push(named).push(told).push(noted),
+      declared_natives().map(declared_signature).push(named).push(native_request).push(noted),
     ) {
     Err(diagnostics) -> assert_eq(diagnostics.map(|d: Diagnostic| d.code), []),
     Ok(text) -> {
@@ -6087,7 +6106,7 @@ fn with_body_store<a | e>(
 
 fn unit_in_file_store<[r]>(
   user: List<{ name: Bytes, src: Bytes }>,
-  told: keep (LevelTally) -> Unit / {abort.raise},
+  report_level: keep (LevelTally) -> Unit / {abort.raise},
 ) -> Emission / {fs.read[r], fs.write[r], abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   with_record_store[r, ans]("s", ||
@@ -6099,7 +6118,7 @@ fn unit_in_file_store<[r]>(
         requested_roots(dump).keys,
         |k: Bytes| record_store.get[ans](k),
         |rs: List<Record>| record_store.put[ans](rs),
-        phases: Some({ now: || 0, outcome: told }),
+        phases: Some({ now: || 0, outcome: report_level }),
       ) {
       Ok(e) -> e,
       Err(reason) -> panic(String::of_bytes_lossy(reason)),
@@ -6463,8 +6482,8 @@ fn walk_in_store(
     |rs: List<Record>| body_store.put(rs),
     None,
     |ahead: List<RootKey>| { scoped: initial_emitter_scope(ahead), built: 0, asked: [] },
-    |emitter: CountingEmitter, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults| {
-      let a = emit_scoped(dump, p, constructors, offered, emitter.scoped, roots, handed, done);
+    |emitter: CountingEmitter, roots: List<RootKey>, signatures: Map<RootName, OwnershipSignature>, done: KnownResults| {
+      let a = emit_scoped(dump, p, constructors, offered, emitter.scoped, roots, signatures, done);
       let grew = match emitter.scoped.scope {
         None -> true,
         Some(_) -> a.state.covered.len() > emitter.scoped.covered.len(),

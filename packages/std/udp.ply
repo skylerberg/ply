@@ -186,9 +186,9 @@ pub fn mem_bind(
   options: List<SocketOption>,
 ) -> FakeStep<Result<Int, Error>> / {abort.raise} = {
   let address = ip::socket_ip(at);
-  let asked = ip::socket_port(at);
+  let requested_port = ip::socket_port(at);
   if !bindable(at) { { udp: u, result: Err(PermissionDenied) } } else {
-    let here = ip::socket_at(address, if asked == 0 { u.port } else { asked });
+    let here = ip::socket_at(address, if requested_port == 0 { u.port } else { requested_port });
     let taken = u.sockets.fold(false, |found: Bool, _handle: Int, s: MemSocket|
       found || s.at == here);
     if taken { { udp: u, result: Err(AddressInUse) } } else {
@@ -205,7 +205,7 @@ pub fn mem_bind(
         udp: {
           ..u,
           next: u.next + 1,
-          port: if asked == 0 { u.port + 1 } else { u.port },
+          port: if requested_port == 0 { u.port + 1 } else { u.port },
           sockets: u.sockets.insert(u.next, s),
         },
         result: Ok(u.next),
@@ -284,7 +284,9 @@ fn source(s: MemSocket, to: SocketAddress) -> SocketAddress / {abort.raise} =
   } else { s.at }
 
 fn broadcasts(s: MemSocket) -> Bool =
-  s.options.filter(|held: SocketOption| match held { net::Broadcast(on) -> on, _ -> false }).len()
+  s.options.filter(|option: SocketOption|
+      match option { net::Broadcast(on) -> on, _ -> false }).len(
+    )
     > 0
 
 fn is_broadcast(address: Ip) -> Bool =
@@ -391,7 +393,7 @@ pub fn mem_set_option(
   option: SocketOption,
 ) -> FakeStep<Result<Unit, Error>> / {abort.raise} = {
   let s = socket_of(u, label, socket);
-  let joined = |group: Ip| s.groups.filter(|held: Ip| held == group).len() > 0;
+  let joined = |group: Ip| s.groups.filter(|member: Ip| member == group).len() > 0;
   match option {
     net::JoinGroup(group, _) -> if !ip::is_multicast(group) {
       { udp: u, result: Err(Other(0, "that address is no multicast group")) }
@@ -401,7 +403,7 @@ pub fn mem_set_option(
       { udp: u, result: Err(Other(0, "that group was not joined")) }
     } else {
       {
-        udp: with_socket(u, socket, { ..s, groups: s.groups.filter(|held: Ip| held != group) }),
+        udp: with_socket(u, socket, { ..s, groups: s.groups.filter(|member: Ip| member != group) }),
         result: Ok(()),
       }
     },
@@ -488,8 +490,8 @@ fn host_handler<a | e>(
       net::decode_result(udp_connect(label, socket, net::encode_address(to)), |_: Bytes| ()),
     udp.send_to[*label](socket, to, payload, timeout_ms) -> {
       check_timeout("send_to", timeout_ms);
-      let asked = udp_send_to(label, socket, net::encode_address(to), payload, timeout_ms);
-      net::decode_result(job_wait(asked), decode_int)
+      let send_job = udp_send_to(label, socket, net::encode_address(to), payload, timeout_ms);
+      net::decode_result(job_wait(send_job), decode_int)
     },
     udp.send[*label](socket, payload, timeout_ms) -> {
       check_timeout("send", timeout_ms);
@@ -570,9 +572,9 @@ test "a datagram goes from one of the program's sockets to another and reports i
     let server = bind_socket[server]("127.0.0.1:5353");
     let client = bind_socket[client]("127.0.0.1:0");
     let sent = udp.send_to[client](client, ip::read_socket("127.0.0.1:5353"), b"ping", 1000);
-    let heard = udp.recv_from[server](server, 512, 1000);
+    let received = udp.recv_from[server](server, 512, 1000);
     let quiet = udp.recv_from[server](server, 512, 1000);
-    { sent: sent, output_lines: heard, quiet: quiet, here: udp.local_address[client](client) }
+    { sent: sent, output_lines: received, quiet: quiet, here: udp.local_address[client](client) }
   });
   assert_eq(ran.value.sent, Ok(4));
   assert_eq(
@@ -607,14 +609,14 @@ test "a connected socket sends to its remote address, receives only from it, and
     let _stray = udp.send_to[c](c, ip::read_socket("127.0.0.1:9001"), b"stray", 1000);
     let _reply = udp.send_to[b](b, ip::read_socket("127.0.0.1:9001"), b"reply", 1000);
     let sent = udp.send[a](a, b"hello", 1000);
-    let heard = payload_of(udp.recv_from[a](a, 64, 1000));
-    let reached = payload_of(udp.recv_from[b](b, 64, 1000));
+    let a_received = payload_of(udp.recv_from[a](a, 64, 1000));
+    let b_received = payload_of(udp.recv_from[b](b, 64, 1000));
     udp.close[b](b);
     let _lost = udp.send[a](a, b"again", 1000);
     {
       sent: sent,
-      output_lines: heard,
-      reached: reached,
+      output_lines: a_received,
+      reached: b_received,
       after: payload_of(udp.recv_from[a](a, 64, 1000)),
     }
   });
@@ -659,7 +661,7 @@ test "a broadcast send fails until the broadcast option is set, and a socket tha
     let joined = udp.set_option[member](member, net::JoinGroup(group, None));
     let twice = udp.set_option[member](member, net::JoinGroup(group, None));
     let _during = udp.send_to[sender](sender, ip::read_socket("239.1.2.3:4000"), b"news", 1000);
-    let heard = payload_of(udp.recv_from[member](member, 64, 1000));
+    let member_received = payload_of(udp.recv_from[member](member, 64, 1000));
     let left = udp.set_option[member](member, net::LeaveGroup(group, None));
     let again = udp.set_option[member](member, net::LeaveGroup(group, None));
     let _after = udp.send_to[sender](sender, ip::read_socket("239.1.2.3:4000"), b"late", 1000);
@@ -670,7 +672,7 @@ test "a broadcast send fails until the broadcast option is set, and a socket tha
       before: before,
       joined: joined,
       twice: twice,
-      output_lines: heard,
+      output_lines: member_received,
       left: left,
       reprinted: again,
       quiet: payload_of(udp.recv_from[member](member, 64, 1000)),

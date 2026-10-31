@@ -145,14 +145,14 @@ fn cached_output(
     None -> None,
     Some(k) -> {
       let importing = imported_reader();
-      let stands = results::with_result_cache(results::store_for(flags.paths, false), || {
+      let still_valid = results::with_result_cache(results::store_for(flags.paths, false), || {
         let passes = result_cache.passes(k.pass_keys);
         let now = views::shipped_state_of(views::views_in(traces_of(passes)), |m: Bytes|
           shipped_imported(importing, m));
         passes.fold(true, |all: Bool, h: Option<Bytes>|
           all && h != None && pass_status(now, h, options, supplied) == Some(Passing))
       });
-      match if stands { Some(parse_string(k.json)) } else { None } {
+      match if still_valid { Some(parse_string(k.json)) } else { None } {
         None -> None,
         Some(Err(_)) -> None,
         Some(Ok(json)) -> {
@@ -196,7 +196,7 @@ fn run_loaded_program(
   s: Style,
   t: TimedLoad,
   begun: Int,
-  keeping: Option<CacheTarget>,
+  cache_target: Option<CacheTarget>,
 ) -> Iteration / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, shipped.read_pack, Derives, abort.raise, shipped.report_view_used, evaluation.verdicts, evaluation.statements} =
   match program_view(t.program) {
     None ->
@@ -217,7 +217,7 @@ fn run_loaded_program(
         },
       None ->
         {
-          result: tests_over(flags, s, options, t, w, begun, keeping),
+          result: tests_over(flags, s, options, t, w, begun, cache_target),
           cached_load: Some(t),
           embeds: t.program.embeds,
         },
@@ -363,7 +363,7 @@ fn tests_over(
   timed: TimedLoad,
   analysis: CheckedProgram,
   begun: Int,
-  keeping: Option<CacheTarget>,
+  cache_target: Option<CacheTarget>,
 ) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, Derives, abort.raise, shipped.report_view_used} = {
   let aimed: Result<Option<List<DefinitionInfo>>, Diagnostic> = match options.mutate {
     Some(query) -> match targets(analysis, query) {
@@ -381,7 +381,7 @@ fn tests_over(
       let promised_at = time.elapsed_us();
       let spent = { ..no_time_spent(), before_us: begun, promises_us: promised_at - loaded_at };
       if broken.len() > 0 { rejected(style, "test", broken, timed.program.source_texts) }
-      else { selected(flags, style, options, timed, analysis, targeted, spent, keeping) }
+      else { selected(flags, style, options, timed, analysis, targeted, spent, cache_target) }
     },
   }
 }
@@ -394,14 +394,14 @@ fn selected(
   analysis: CheckedProgram,
   targeted: Option<List<DefinitionInfo>>,
   spent: TimeSpent,
-  keeping: Option<CacheTarget>,
+  cache_target: Option<CacheTarget>,
 ) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, Derives, abort.raise, shipped.report_view_used} = {
   let configuring = time.elapsed_us();
   let testing = tester::start_run(options);
   results::with_result_cache(results::store_for(flags.paths, flags.no_cache), || {
     let opened = if flags.no_cache { [] } else { result_cache.open_warnings() };
     let hashed = hashed_by_kind(analysis);
-    let asked = over_cases(
+    let listing_requests = over_cases(
       analysis,
       flags.filters,
       named_modules(flags.paths, timed.program.files),
@@ -409,12 +409,13 @@ fn selected(
       { test: i, hash: listing_hash(analysis, timed.program.source_texts, hashed, i) });
     let place = listings_at(flags.paths);
     let stamp = Bytes::of_string(shipped_stamps().runtime_digest);
-    let kept = if flags.no_cache { Map::new() }
-    else if place.label == "cwd" { case_listings::cached_listings[cwd](place.dir, stamp, asked) }
-    else { case_listings::cached_listings[abs](place.dir, stamp, asked) };
-    let unkept = asked.filter(|a: case_listings::ListingRequest| !kept.contains(a.test));
+    let cached_listings = if flags.no_cache { Map::new() } else if place.label == "cwd" {
+      case_listings::cached_listings[cwd](place.dir, stamp, listing_requests)
+    } else { case_listings::cached_listings[abs](place.dir, stamp, listing_requests) };
+    let unkept = listing_requests.filter(|a: case_listings::ListingRequest|
+      !cached_listings.contains(a.test));
     let to_list = unkept.map(|a: case_listings::ListingRequest| a.test);
-    let handing = time.elapsed_us();
+    let handoff_start = time.elapsed_us();
     let whole = if options.machine.config.schema != None { Some(loaded_analysis(timed, analysis)) }
     else { None };
     let analysis_for = |within: TestRunScope|
@@ -431,7 +432,7 @@ fn selected(
         if flags.no_cache { () } else if place.label == "cwd" {
           case_listings::cache_listings[cwd](place.dir, stamp, unkept, found)
         } else { case_listings::cache_listings[abs](place.dir, stamp, unkept, found) };
-        let cases = kept.fold(
+        let cases = cached_listings.fold(
           found,
           |accumulator: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int, listed: List<ListedCase>|
             accumulator.insert(i, Ok(listed)),
@@ -445,9 +446,9 @@ fn selected(
           analysis_for,
           opened,
           targeted,
-          { ..spent, store_us: handing - configuring, handoff_us: listing - handing },
+          { ..spent, store_us: handoff_start - configuring, handoff_us: listing - handoff_start },
           listing,
-          keeping,
+          cache_target,
         )
       },
     }
@@ -516,7 +517,7 @@ fn decided_run(
   targeted: Option<List<DefinitionInfo>>,
   spent: TimeSpent,
   listing: Int,
-  keeping: Option<CacheTarget>,
+  cache_target: Option<CacheTarget>,
 ) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.working_directory, env.variables, MachineAccess, result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing, emit.unit, emit.compiled, shipped.read_pack, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], Derives, abort.raise, shipped.report_view_used} = {
   let options = testing.options;
   let analysis = over.analysis;
@@ -543,16 +544,23 @@ fn decided_run(
   let search = search_of(searching);
   let load_or_reuse = views::loaded_texts(timed.program.shipping, timed.program.prune_unreached);
   let supplied = configuration::supplied(options.machine.config);
-  let asked = cases_of(rows_of(analysis), search, flags.no_cache, options, supplied, load_or_reuse);
-  let first = decide(asked.cases);
+  let selection = cases_of(
+    rows_of(analysis),
+    search,
+    flags.no_cache,
+    options,
+    supplied,
+    load_or_reuse,
+  );
+  let first = decide(selection.cases);
   let building = time.elapsed_us();
   let visible = set_of(scope.visible);
   let running = to_run(first).filter(|i: Int| visible.contains(i));
   let within = run_within(over, running);
-  let handed = analysis_for(within);
+  let scoped_analysis = analysis_for(within);
   let unit_at = time.elapsed_us();
   let emitted = run_unit(
-    handed,
+    scoped_analysis,
     over,
     running,
     within.owners,
@@ -563,7 +571,7 @@ fn decided_run(
     Ok(unit) -> {
       let keyed = match unit {
         Some(e) -> if flags.no_cache { Map::new() }
-        else { code_keys(first, codes_of(handed, e, over.entries), search) },
+        else { code_keys(first, codes_of(scoped_analysis, e, over.entries), search) },
         None -> Map::new(),
       };
       let returned = by_code(
@@ -588,7 +596,7 @@ fn decided_run(
       };
       let made = match units::library_of(to_compile, options.machine.profile) {
         Err(diagnostics) -> Err(diagnostics),
-        Ok(library) -> tester::unit_of(testing, handed, library, true),
+        Ok(library) -> tester::unit_of(testing, scoped_analysis, library, true),
       };
       match made {
         Err(diagnostics) -> unbound(style, { diagnostics: diagnostics, places: p.places }),
@@ -603,7 +611,7 @@ fn decided_run(
             Err(diagnostics) -> rejected(diagnostics),
             Ok(r) -> match tester::bind_test_run(
                 testing,
-                handed.dump,
+                scoped_analysis.dump,
                 configuration::run_configuration(r.configuration),
               ) {
               Err(diagnostics) -> rejected(diagnostics),
@@ -624,9 +632,9 @@ fn decided_run(
                   {
                     written_passes: returned.written_passes,
                     kept: if flags.json { None } else {
-                      match keeping {
+                      match cache_target {
                         Some(k) ->
-                          Some({ ..k, passes: pass_keys_in_scope(asked.returning, scope) }),
+                          Some({ ..k, passes: pass_keys_in_scope(selection.returning, scope) }),
                         None -> None,
                       }
                     },
@@ -642,7 +650,7 @@ fn decided_run(
                     bind_us: bound - binding,
                   },
                 );
-                match keeping {
+                match cache_target {
                   Some(k) -> if flags.json && result.code == ok_code() {
                     let again = cases_of(
                       rows_of(analysis),

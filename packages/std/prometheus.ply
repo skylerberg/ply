@@ -101,12 +101,13 @@ pub fn sanitized_label(text: String) -> Label = {
 fn sanitized(text: String, allowed: Bytes) -> String =
   match try[abort.raise] {
       let raw = Bytes::of_string(text);
-      let kept = Bytes::concat_all(
+      let sanitized_bytes = Bytes::concat_all(
         range(0, raw.len()).map(|i: Int|
           if allowed.index_of_byte(raw.at(i)) == None { b"_" } else { raw.slice(i, i + 1) }),
       );
-      if kept.len() == 0 || is_digit(kept.at(0)) { String::of_bytes(b"_".concat(kept)) }
-      else { String::of_bytes(kept) }
+      if sanitized_bytes.len() == 0 || is_digit(sanitized_bytes.at(0)) {
+        String::of_bytes(b"_".concat(sanitized_bytes))
+      } else { String::of_bytes(sanitized_bytes) }
     } {
     Ok(made) -> made,
     Err(_) -> "_",
@@ -124,8 +125,8 @@ pub opaque type Labels = | Labels(List<Pair>)
 /// Labels from these pairs. A name given more than once takes its last value.
 pub fn labels(given: List<Pair>) -> Labels =
   Labels(
-    given.fold(Map::new(), |held: Map<Label, String>, p: Pair|
-      held.insert(p.label, p.value)).entries(
+    given.fold(Map::new(), |by_label: Map<Label, String>, p: Pair|
+      by_label.insert(p.label, p.value)).entries(
     ).map(|e: { key: Label, value: String }| -> Pair { { label: e.key, value: e.value } }),
   )
 
@@ -173,10 +174,10 @@ pub fn as_text_format(s: Snapshot) -> Snapshot =
       {
         ..f,
         unit: "",
-        series: f.series.map(|held: Series| -> Series {
+        series: f.series.map(|series: Series| -> Series {
           {
-            labels: held.labels,
-            value: match held.value {
+            labels: series.labels,
+            value: match series.value {
               CounterValue(v, _) -> CounterValue(v, None),
               GaugeValue(v) -> GaugeValue(v),
               HistogramValue(buckets, sum) ->
@@ -241,8 +242,8 @@ pub fn describe(r: Registry, n: Name, kind: Kind, help: String, unit: String) ->
   let key = family_name(n, kind);
   if unit != "" && !key.ends_with("_" ++ unit) { rejecting(r) } else {
     match r.families.get(key) {
-      Some(held) -> if held.kind != kind { rejecting(r) }
-      else { { ..r, families: r.families.insert(key, { ..held, help: help, unit: unit }) } },
+      Some(family) -> if family.kind != kind { rejecting(r) }
+      else { { ..r, families: r.families.insert(key, { ..family, help: help, unit: unit }) } },
       None ->
         {
           ..r,
@@ -274,9 +275,13 @@ pub fn with_bounds(r: Registry, n: Name, bounds: List<Float>) -> Registry = {
       _ -> true,
     });
   match described.families.get(name_text(n)) {
-    Some(held) -> if held.kind != Histogram || held.series.len() > 0 || !ascending { rejecting(r) }
-    else {
-      { ..described, families: described.families.insert(name_text(n), { ..held, bounds: bounds }) }
+    Some(family) -> if family.kind != Histogram || family.series.len() > 0 || !ascending {
+      rejecting(r)
+    } else {
+      {
+        ..described,
+        families: described.families.insert(name_text(n), { ..family, bounds: bounds }),
+      }
     },
     None -> rejecting(r),
   }
@@ -293,16 +298,16 @@ fn update_series(
   let known = match r.families.get(key) { Some(_) -> r, None -> describe(r, n, kind, "", "") };
   match known.families.get(key) {
     None -> rejecting(r),
-    Some(held) -> if held.kind != kind { rejecting(r) } else {
-      let before = held.series.get(ls);
-      if before == None && held.series.len() >= max(known.max_series, 1) {
+    Some(family) -> if family.kind != kind { rejecting(r) } else {
+      let before = family.series.get(ls);
+      if before == None && family.series.len() >= max(known.max_series, 1) {
         { ..known, dropped: known.dropped + 1 }
       } else {
         {
           ..known,
           families: known.families.insert(key, {
-            ..held,
-            series: held.series.insert(ls, step(held, before)),
+            ..family,
+            series: family.series.insert(ls, step(family, before)),
           }),
         }
       }
@@ -312,7 +317,7 @@ fn update_series(
 
 fn exemplar_within_limit(e: Option<Exemplar>) -> Option<Exemplar> =
   match e {
-    Some(held) -> if pairs(held.labels).fold(0, |n: Int, p: Pair|
+    Some(exemplar) -> if pairs(exemplar.labels).fold(0, |n: Int, p: Pair|
           n + label_text(p.label).len() + p.value.len())
         > 128 { None }
     else { e },
@@ -362,10 +367,10 @@ pub fn observe_with(
   exemplar: Option<Exemplar>,
 ) -> Registry =
   if value.is_nan() { rejecting(r) } else {
-    update_series(r, n, Histogram, ls, |held: FamilyState, before: Option<Slot>| {
-      let at = telemetry::bucket_of(held.bounds, value);
+    update_series(r, n, Histogram, ls, |family: FamilyState, before: Option<Slot>| {
+      let at = telemetry::bucket_of(family.bounds, value);
       let marked = |seen: List<Option<Exemplar>>|
-        range(0, held.bounds.len() + 1).map(|i: Int| -> Option<Exemplar> {
+        range(0, family.bounds.len() + 1).map(|i: Int| -> Option<Exemplar> {
           let old = match seen.at(i) { Some(e) -> e, None -> None };
           if i == at { match exemplar_within_limit(exemplar) { Some(e) -> Some(e), None -> old } }
           else { old }
@@ -373,11 +378,11 @@ pub fn observe_with(
       match before {
         Some(HistogramSlot(counts, seen, sum)) ->
           HistogramSlot(
-            telemetry::add_to_buckets(held.bounds, counts, value),
+            telemetry::add_to_buckets(family.bounds, counts, value),
             marked(seen),
             sum + value,
           ),
-        _ -> HistogramSlot(telemetry::add_to_buckets(held.bounds, [], value), marked([]), value),
+        _ -> HistogramSlot(telemetry::add_to_buckets(family.bounds, [], value), marked([]), value),
       }
     })
   }
@@ -386,31 +391,31 @@ pub fn observe_with(
 /// order of their labels.
 pub fn snapshot(r: Registry) -> Snapshot =
   {
-    families: r.families.values().map(|held: FamilyState| -> Family {
+    families: r.families.values().map(|family: FamilyState| -> Family {
       {
-        name: held.name,
-        help: held.help,
-        unit: held.unit,
-        kind: held.kind,
-        series: held.series.entries().map(|e: { key: Labels, value: Slot }| -> Series {
-          { labels: e.key, value: slot_value(held, e.value) }
+        name: family.name,
+        help: family.help,
+        unit: family.unit,
+        kind: family.kind,
+        series: family.series.entries().map(|e: { key: Labels, value: Slot }| -> Series {
+          { labels: e.key, value: slot_value(family, e.value) }
         }),
       }
     }),
   }
 
-fn slot_value(held: FamilyState, slot: Slot) -> Value =
+fn slot_value(family: FamilyState, slot: Slot) -> Value =
   match slot {
     CounterSlot(total, seen) -> CounterValue(total, seen),
     GaugeSlot(level) -> GaugeValue(level),
     HistogramSlot(counts, seen, sum) ->
       HistogramValue(
-        range(0, held.bounds.len() + 1).fold(
+        range(0, family.bounds.len() + 1).fold(
           { total: 0, out: [] },
           |accumulator: { total: Int, out: List<Bucket> }, i: Int| {
             let total = accumulator.total + (match counts.at(i) { Some(n) -> n, None -> 0 });
             let bucket: Bucket = {
-              le: match held.bounds.at(i) { Some(bound) -> bound, None -> Float::infinity() },
+              le: match family.bounds.at(i) { Some(bound) -> bound, None -> Float::infinity() },
               count: total,
               exemplar: match seen.at(i) { Some(e) -> e, None -> None },
             };
@@ -487,8 +492,9 @@ fn escaped_help(text: String, openmetrics: Bool) -> String = {
   if openmetrics { replaced(base, "\"", "\\\"") } else { base }
 }
 
-fn written_labels(held: List<Pair>, le: Option<Float>, openmetrics: Bool) -> String = {
-  let own = held.map(|p: Pair| label_text(p.label) ++ "=\"" ++ escaped_value(p.value) ++ "\"");
+fn written_labels(label_pairs: List<Pair>, le: Option<Float>, openmetrics: Bool) -> String = {
+  let own = label_pairs.map(|p: Pair|
+    label_text(p.label) ++ "=\"" ++ escaped_value(p.value) ++ "\"");
   let every = match le {
     Some(bound) -> own.push("le=\"" ++ number(bound, openmetrics) ++ "\""),
     None -> own,
@@ -498,9 +504,10 @@ fn written_labels(held: List<Pair>, le: Option<Float>, openmetrics: Bool) -> Str
 
 fn written_exemplar(e: Option<Exemplar>, openmetrics: Bool) -> String =
   match ((openmetrics, e)) {
-    (true, Some(held)) -> {
-      let inside = written_labels(pairs(held.labels), None, openmetrics);
-      " # " ++ (if inside == "" { "{}" } else { inside }) ++ " " ++ number(held.value, openmetrics)
+    (true, Some(exemplar)) -> {
+      let inside = written_labels(pairs(exemplar.labels), None, openmetrics);
+      " # " ++ (if inside == "" { "{}" } else { inside }) ++ " "
+        ++ number(exemplar.value, openmetrics)
     },
     _ -> "",
   }
@@ -513,9 +520,9 @@ fn kind_text(kind: Kind, openmetrics: Bool) -> String =
     Untyped -> if openmetrics { "unknown" } else { "untyped" },
   }
 
-fn series_lines(base: String, held: Series, openmetrics: Bool) -> List<String> = {
-  let own = pairs(held.labels);
-  match held.value {
+fn series_lines(base: String, series: Series, openmetrics: Bool) -> List<String> = {
+  let own = pairs(series.labels);
+  match series.value {
     CounterValue(total, seen) ->
       [
         base ++ "_total" ++ written_labels(own, None, openmetrics) ++ " "
@@ -547,8 +554,8 @@ fn family_lines(f: Family, openmetrics: Bool) -> List<String> = {
     else { ["# HELP " ++ titled ++ " " ++ escaped_help(f.help, openmetrics)] },
     ["# TYPE " ++ titled ++ " " ++ kind_text(f.kind, openmetrics)],
   ).concat(if openmetrics && f.unit != "" { ["# UNIT " ++ titled ++ " " ++ f.unit] } else { [] });
-  f.series.fold(head, |lines: List<String>, held: Series|
-    lines.concat(series_lines(base, held, openmetrics)))
+  f.series.fold(head, |lines: List<String>, series: Series|
+    lines.concat(series_lines(base, series, openmetrics)))
 }
 
 fn rendered(s: Snapshot, openmetrics: Bool) -> Bytes = {
@@ -860,16 +867,17 @@ fn sample_of(line: Bytes, at: Int) -> SampleRead / {prometheus.fail, abort.raise
   let stop = line.skip(0, name_bytes());
   let named = String::of_bytes(line.slice(0, stop));
   if name(named) == None { fail(BadName, at) } else {
-    let held = if stop < line.len() && line.at(stop) == b'{' { labels_read(line, stop, at) } else {
+    let read_labels = if stop < line.len() && line.at(stop) == b'{' { labels_read(line, stop, at) }
+    else {
       let none: LabelsRead = { pairs: [], le: None, next: stop };
       none
     };
-    let value = token(line, held.next);
+    let value = token(line, read_labels.next);
     if value.text.len() == 0 { fail(BadValue, at) } else {
       {
         name: named,
-        labels: labels(held.pairs),
-        le: held.le,
+        labels: labels(read_labels.pairs),
+        le: read_labels.le,
         value: value.text,
         exemplar: exemplar_of(line, value.next, at),
       }
@@ -885,9 +893,9 @@ fn exemplar_of(
   match line.index_of_from(b" # {", min(from, line.len())) {
     None -> None,
     Some(hash) -> {
-      let held = labels_read(line, hash + 3, at);
-      let value = token(line, held.next);
-      let made: Exemplar = { labels: labels(held.pairs), value: number_of(value.text, at) };
+      let read_labels = labels_read(line, hash + 3, at);
+      let value = token(line, read_labels.next);
+      let made: Exemplar = { labels: labels(read_labels.pairs), value: number_of(value.text, at) };
       Some(made)
     },
   }
@@ -1079,17 +1087,17 @@ pub fn recording<a | e>(
   handle {
     body()
   } with {
-    var held = start,
+    var registry = start,
     trace.count[*c](name, delta, fields) -> {
-      held = record_count(held, c, name, delta, fields);
+      registry = record_count(registry, c, name, delta, fields);
     },
     trace.gauge[*c](name, value, fields) -> {
-      held = record_gauge(held, c, name, value, fields);
+      registry = record_gauge(registry, c, name, value, fields);
     },
     trace.time[*c](name, micros, fields) -> {
-      held = record_time(held, c, name, micros, fields);
+      registry = record_time(registry, c, name, micros, fields);
     },
-    prometheus.registry() -> held,
+    prometheus.registry() -> registry,
   }
 
 /// Whether an `Accept` field prefers OpenMetrics to the text format: whichever of
@@ -1101,10 +1109,13 @@ pub fn prefers_openmetrics(accept: String) -> Bool = {
     |best: { open: Float, text: Float }, range_text: String| {
       let parts = string_split_whole(range_text, ";").map(|part: String|
         part.ascii_trim().ascii_lower());
-      let q = parts.fold(1.0, |held: Float, part: String|
+      let q = parts.fold(1.0, |weight: Float, part: String|
         if part.starts_with("q=") {
-          match Float::of_string(replaced(part, "q=", "")) { Some(weight) -> weight, None -> held }
-        } else { held });
+          match Float::of_string(replaced(part, "q=", "")) {
+            Some(weight) -> weight,
+            None -> weight,
+          }
+        } else { weight });
       match parts {
         ["application/openmetrics-text", ..] -> { open: max_float(best.open, q), text: best.text },
         ["text/plain", ..] -> { open: best.open, text: max_float(best.text, q) },
@@ -1200,7 +1211,10 @@ fn described() -> Registry =
   )
 
 fn applied(r: Registry, s: Step) -> Registry = {
-  let ls = match label_sets().at(s.label_set_index) { Some(held) -> held, None -> no_labels() };
+  let ls = match label_sets().at(s.label_set_index) {
+    Some(label_set) -> label_set,
+    None -> no_labels(),
+  };
   let value = match values().at(s.value) { Some(v) -> v, None -> 0.0 };
   let seen = if s.marked { Some(sample_exemplar(value)) } else { None };
   if s.kind == 0 {
@@ -1222,7 +1236,7 @@ fn applied(r: Registry, s: Step) -> Registry = {
 }
 
 fn registries() -> Gen<Registry> =
-  gen::map(gen::list_of(steps(), 14), |ops: List<Step>| ops.fold(described(), applied))
+  gen::map(gen::list_of(steps(), 14), |script: List<Step>| script.fold(described(), applied))
 
 test "a snapshot reads back from OpenMetrics" {
   gen::check(registries(), |r: Registry| {
@@ -1534,18 +1548,21 @@ fn traced<[c]>() -> Unit / {trace.count[c], trace.gauge[c], trace.time[c]} = {
 
 fn scraped(accept: Option<String>, path: String) -> Option<Response<| {}>> / {abort.raise} = {
   let request = http::request_to(http::Get, "shop.example", path, b"");
-  let asking = match accept {
+  let scrape_request = match accept {
     Some(a) -> { ..request, headers: http::set_header(request.headers, "accept", a) },
     None -> request,
   };
   recording(registry(100), || {
     traced[orders]();
-    scrape(asking)
+    scrape(scrape_request)
   })
 }
 
 test "a trace's counts, gauges and timings are scraped as a page, in the format the scrape prefers" {
-  let text = match scraped(None, "/metrics") { Some(res) -> res, None -> panic("no page") };
+  let text = match scraped(None, "/metrics") {
+    Some(response) -> response,
+    None -> panic("no page"),
+  };
   assert_eq(http::header(text.headers, "content-type"), Some(text_content_type()));
   assert_eq(
     String::of_bytes(http::whole_bytes(text.body)),
@@ -1578,7 +1595,7 @@ test "a trace's counts, gauges and timings are scraped as a page, in the format 
       ),
       "/metrics",
     ) {
-    Some(res) -> res,
+    Some(response) -> response,
     None -> panic("no page"),
   };
   assert_eq(http::header(openmetrics.headers, "content-type"), Some(openmetrics_content_type()));

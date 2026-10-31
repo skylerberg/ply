@@ -88,7 +88,8 @@ fn moved_tables(t: ModuleTables, m: Relocation) -> ModuleTables =
       {
         ..x,
         at: moved_location(x.at, m),
-        operations: x.operations.map(|op: OpInfo| { ..op, at: moved_location(op.at, m) }),
+        operations: x.operations.map(|operation: OpInfo|
+          { ..operation, at: moved_location(operation.at, m) }),
       }),
     constructors: t.constructors.map(|c: ConstructorInfo| { ..c, at: moved_location(c.at, m) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: moved_location(x.at, m) }),
@@ -130,13 +131,13 @@ fn group_offset(spots: List<ItemRange>, p: Int) -> Int =
     if p >= x.at && p <= x.at + x.len { x.rel + (p - x.at) } else { accumulator })
 
 fn owner_result(
-  said: ModuleCheck,
+  module_check: ModuleCheck,
   share: OwnerPart,
   spots: List<ItemRange>,
 ) -> OwnerResult / {abort.raise} = {
-  let slot = said.slot;
-  let t = said.facts.tables;
-  let kept = {
+  let slot = module_check.slot;
+  let t = module_check.facts.tables;
+  let owner_tables = {
     ..t,
     definitions: share.definitions,
     tests: share.tests,
@@ -159,11 +160,11 @@ fn owner_result(
   let first_law = lowest(share.laws.map(|l: LawInfo| l.index));
   offset_indexes(
     {
-      tables: moved_tables(kept, back),
+      tables: moved_tables(owner_tables, back),
       rows: {
         definitions: share.rows.map(|r: KnownDefinitionRow| { ..r, hash: b"" }),
         tests: [],
-        types: types_of_rows(said.rows.types, share.rows, []),
+        types: types_of_rows(module_check.rows.types, share.rows, []),
       },
       rejected: [],
       warnings: share.warnings.map(|d: Diagnostic| moved_diagnostic(own_labels(d), back)),
@@ -307,7 +308,7 @@ fn with_definition_types(
 
 fn encode_group_with_types(
   a: GroupResult,
-  held: List<InternedType>,
+  interned_types: List<InternedType>,
   at: List<Int>,
 ) -> Bytes / {abort.raise} =
   bin::encode(
@@ -317,7 +318,7 @@ fn encode_group_with_types(
           owner: m.owner,
           entry: match m.entry { Some(e) -> bin::encode(e, owner_interface_bin()), None -> b"" },
         }),
-      types: held,
+      types: interned_types,
       at: at,
       rest: with_definition_types(
         { ..a, members: a.members.map(|m: MemberResult| { ..m, entry: None }) },
@@ -473,22 +474,23 @@ pub fn inference_result(
 }
 
 pub fn inference_results(
-  said: ModuleCheck,
+  module_check: ModuleCheck,
   module: Bytes,
   members: List<OwnerText>,
-  stands: (ItemAt) -> Int / {abort.raise},
+  item_offset: (ItemAt) -> Int / {abort.raise},
 ) -> List<InferenceResult> / {abort.raise} = {
   let alone = members.map(|o: OwnerText| { members: [o], items: item_layout([o]) });
-  let cut = group_results(said, module, alone, stands);
+  let cut = group_results(module_check, module, alone, item_offset);
   range(0, members.len()).map(|i: Int| {
     let o = members.get(i);
     let result = match cut.get(i).members { [m, ..] -> m.result, [] -> no_owner_result() };
-    let spots = item_ranges(alone.get(i).items, o.owner, stands);
+    let spots = item_ranges(alone.get(i).items, o.owner, item_offset);
     let own = result.tables.definitions.map(|d: DefinitionInfo| d.name);
     inference_result_from(
       result,
-      said.analysis.bodies.filter(|b: CheckedBody| own.contains(b.name)).map(|b: CheckedBody|
-        relocated_body(b, 0, |p: Int| group_offset(spots, p))),
+      module_check.analysis.bodies.filter(|b: CheckedBody| own.contains(b.name)).map(
+        |b: CheckedBody| relocated_body(b, 0, |p: Int| group_offset(spots, p)),
+      ),
     )
   })
 }
@@ -541,14 +543,14 @@ pub fn signature_check_of(result: GroupResult) -> SignatureCheck / {abort.raise}
   }
 
 pub fn signature_check_from(
-  said: ModuleCheck,
+  module_check: ModuleCheck,
   owners: List<Bytes>,
 ) -> SignatureCheck / {abort.raise} =
   {
     shown: owners.map(|o: Bytes|
       {
         owner: o,
-        entry: match said.shown.entries.get(o) {
+        entry: match module_check.shown.entries.get(o) {
           Some(e) -> bin::encode({ ..e, rows: [] }, owner_interface_bin()),
           None -> b"",
         },
@@ -577,19 +579,20 @@ pub fn supplied_bodies(
   offset: Int,
 ) -> (Int) -> BodyChecking / {abort.raise} =
   |slot: Int| {
-    let handed = members.fold(
+    let combined = members.fold(
       { bodies: Map::new(), sites: [] },
       |accumulator: { bodies: Map<Bytes, ReusedBody>, sites: List<MemberSite> }, m: OwnerInference| {
         let base = offset + base_of(items, m.owner);
         let recorded = m.typed.recorded.fold(
           Map::new(),
-          |held: Map<Bytes, Bytes>, k: CachedFacts| held.insert(k.name, k.facts),
+          |recorded_facts: Map<Bytes, Bytes>, k: CachedFacts|
+            recorded_facts.insert(k.name, k.facts),
         );
         {
           bodies: m.typed.bodies.fold(
             accumulator.bodies,
-            |held: Map<Bytes, ReusedBody>, b: CheckedBody|
-              held.insert(b.name, {
+            |reused_bodies: Map<Bytes, ReusedBody>, b: CheckedBody|
+              reused_bodies.insert(b.name, {
                 body: relocated_body(b, slot, |p: Int| base + p),
                 facts: match recorded.get(b.name) { Some(f) -> f, None -> b"" },
               }),
@@ -600,7 +603,7 @@ pub fn supplied_bodies(
         }
       },
     );
-    ReuseBodies(handed.bodies, handed.sites)
+    ReuseBodies(combined.bodies, combined.sites)
   }
 
 pub fn finalized_result(
@@ -618,7 +621,8 @@ pub fn finalized_result(
           let to = { from: 0, to: 0, by: |p: Int| base + p };
           let clauses = w.typed.clauses.fold(
             Map::new(),
-            |held: Map<Bytes, List<SpecInfo>>, c: Clauses| held.insert(c.name, c.spec),
+            |accumulator: Map<Bytes, List<SpecInfo>>, c: Clauses|
+              accumulator.insert(c.name, c.spec),
           );
           {
             ..m,
@@ -674,16 +678,16 @@ pub fn module_check_of(
 pub type GroupLayout = { members: List<OwnerText>, items: List<ItemAt> }
 
 pub fn group_results(
-  said: ModuleCheck,
+  module_check: ModuleCheck,
   module: Bytes,
   groups: List<GroupLayout>,
-  stands: (ItemAt) -> Int / {abort.raise},
+  item_position: (ItemAt) -> Int / {abort.raise},
 ) -> List<GroupResult> / {abort.raise} = {
-  let w = said.analysis;
-  let slot = said.slot;
+  let w = module_check.analysis;
+  let slot = module_check.slot;
   let prefix = module.concat(b".");
-  let t = said.facts.tables;
-  let shape = said.facts.shape;
+  let t = module_check.facts.tables;
+  let shape = module_check.facts.shape;
   let members = groups.fold(
     [],
     |accumulator: List<OwnerText>, g: { members: List<OwnerText>, items: List<ItemAt> }|
@@ -702,7 +706,7 @@ pub fn group_results(
     |accumulator: List<ItemAt>, g: { members: List<OwnerText>, items: List<ItemAt> }|
       accumulator.concat(g.items),
   ).fold(Map::new(), |accumulator: Map<Int, { end: Int, owner: Bytes }>, x: ItemAt| {
-    let p = stands(x);
+    let p = item_position(x);
     accumulator.insert(p, { end: p + x.len, owner: x.owner })
   });
   let owning = |m: Int, here: Int, s: Span|
@@ -753,7 +757,7 @@ pub fn group_results(
     definition_named(Bytes::concat_all([module, b".", x.name])));
   let member_sites = List::group_by(t.facts.members, |x: MemberSite| owned(x.module, x.owner));
   let cached = List::group_by(t.cached, |k: CachedFacts| owner_of_cached(k.name));
-  let rows = List::group_by(said.rows.definitions, |r: KnownDefinitionRow|
+  let rows = List::group_by(module_check.rows.definitions, |r: KnownDefinitionRow|
     definition_named(r.name));
   let warnings = w.warnings.filter(|d: Diagnostic| d.code != b"W0611").fold(
     Map::new(),
@@ -817,8 +821,12 @@ pub fn group_results(
       members: g.members.map(|o: OwnerText|
         {
           owner: o.owner,
-          result: owner_result(said, share_of(o.owner), item_ranges(g.items, o.owner, stands)),
-          entry: said.shown.entries.get(o.owner),
+          result: owner_result(
+            module_check,
+            share_of(o.owner),
+            item_ranges(g.items, o.owner, item_position),
+          ),
+          entry: module_check.shown.entries.get(o.owner),
         }),
       rejected: [],
       forms: {
@@ -1372,14 +1380,14 @@ fn assembled_alone(
 }
 
 fn read_back(a: GroupResult) -> GroupResult / {abort.raise} = {
-  let kept = encode_group(a);
-  let shown = group_interfaces(kept);
+  let encoded = encode_group(a);
+  let shown = group_interfaces(encoded);
   a.members.fold((), |_: Unit, m: MemberResult|
     assert_eq(
       shown.get(m.owner),
       Some(match m.entry { Some(e) -> bin::encode(e, owner_interface_bin()), None -> b"" }),
     ));
-  match bin::decode(kept, encoded_group_bin()) {
+  match bin::decode(encoded, encoded_group_bin()) {
     Ok(k) -> {
       let back = decode_group(k);
       assert_eq(back, a);
@@ -1447,7 +1455,7 @@ test "a module result assembled from its definitions' results equals the module'
 }
 
 test "a definition's check result lists the files embedded by that definition only, not by other definitions" {
-  let src = b"pub fn a() -> Bytes = embed(\"x.txt\")\n\npub fn b() -> Bytes = embed(\"y.txt\")\n\npub fn c() -> Int = 1\n";
+  let source = b"pub fn a() -> Bytes = embed(\"x.txt\")\n\npub fn b() -> Bytes = embed(\"y.txt\")\n\npub fn c() -> Int = 1\n";
   let file = |path: Bytes|
     {
       root: b"",
@@ -1456,7 +1464,7 @@ test "a definition's check result lists the files embedded by that definition on
       read: Ok([embed_file(b"", path)]),
     };
   let w = match analyse_pulling_std_with(
-      [{ name: b"m", src: src }],
+      [{ name: b"m", src: source }],
       [],
       no_rows(),
       embeds: [file(b"x.txt"), file(b"y.txt")],
@@ -1464,12 +1472,12 @@ test "a definition's check result lists the files embedded by that definition on
     Analysed(w) -> w,
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
   };
-  let said = module_check_of(w, 0, src);
-  let reads = owner_texts(w.modules.get(0), parse(src).node, src);
-  let held = |owner: Bytes| {
+  let module_check = module_check_of(w, 0, source);
+  let reads = owner_texts(w.modules.get(0), parse(source).node, source);
+  let embed_keys = |owner: Bytes| {
     let members = reads.filter(|o: OwnerText| o.owner == owner);
     group_results(
-      said,
+      module_check,
       b"m",
       [{ members: members, items: item_layout(members) }],
       |x: ItemAt| x.to,
@@ -1477,9 +1485,9 @@ test "a definition's check result lists the files embedded by that definition on
       0,
     ).embeds.map(|e: ModuleEmbed| e.key)
   };
-  assert_eq(held(b"a"), [b"file:x.txt"]);
-  assert_eq(held(b"b"), [b"file:y.txt"]);
-  assert_eq(held(b"c"), [])
+  assert_eq(embed_keys(b"a"), [b"file:x.txt"]);
+  assert_eq(embed_keys(b"b"), [b"file:y.txt"]);
+  assert_eq(embed_keys(b"c"), [])
 }
 
 fn core_fixture() -> Bytes =

@@ -119,9 +119,9 @@ fn inferred_from(
         None -> accumulator,
       }),
     group.fold(2, |n: Int, m: InferenceTarget| n + 3 * m.member.params.len() + 2),
-    |cur: List<InferredOwnership>| {
-      let next = round(group, published, cur);
-      if signatures_of(next) == signatures_of(cur) { Stop(next) } else { Continue(next) }
+    |current: List<InferredOwnership>| {
+      let next = round(group, published, current);
+      if signatures_of(next) == signatures_of(current) { Stop(next) } else { Continue(next) }
     },
   )
 
@@ -224,17 +224,23 @@ pub fn ownership_text(h: OwnershipSignature) -> Bytes =
     },
   ])
 
-pub fn with_conventions(f: Fn, handed: Map<RootName, OwnershipSignature>) -> Fn / {abort.raise} = {
+pub fn with_conventions(
+  f: Fn,
+  published_signatures: Map<RootName, OwnershipSignature>,
+) -> Fn / {abort.raise} = {
   let own = |k: RootKey, c: Convention|
     match key_definition(k) {
-      Some(d) -> match handed.get(d) { Some(h) -> convention_for(c, h, root_text(d)), None -> c },
+      Some(d) -> match published_signatures.get(d) {
+        Some(h) -> convention_for(c, h, root_text(d)),
+        None -> c,
+      },
       None -> match k {
         Generated(x, _) ->
           convention_for(c, generated_signature(x.op, c.params.len()), root_text(root_name(k))),
         _ -> c,
       },
     };
-  let called = calls_with_conventions(f, generics_of(f), handed);
+  let called = calls_with_conventions(f, generics_of(f), published_signatures);
   {
     ..called,
     convention: if f.members.len() == 0 { own(f.key, f.convention) } else { f.convention },
@@ -284,14 +290,20 @@ fn convention_for(c: Convention, h: OwnershipSignature, what: Bytes) -> Conventi
 fn calls_with_conventions(
   f: Fn,
   generics: List<RootName>,
-  handed: Map<RootName, OwnershipSignature>,
+  published_signatures: Map<RootName, OwnershipSignature>,
 ) -> Fn / {abort.raise} =
   {
     ..f,
-    body: block_with_conventions(root_text(root_name(f.key)), generics, handed, f.body),
+    body: block_with_conventions(
+      root_text(root_name(f.key)),
+      generics,
+      published_signatures,
+      f.body,
+    ),
     lambdas: f.lambdas.map(|l: Lambda|
       match l {
-        Closure(c) -> Closure({ ..c, body: calls_with_conventions(c.body, generics, handed) }),
+        Closure(c) ->
+          Closure({ ..c, body: calls_with_conventions(c.body, generics, published_signatures) }),
       }),
   }
 
@@ -300,41 +312,60 @@ fn generics_of(f: Fn) -> List<RootName> = f.links.generics.map(|g: GenericCall| 
 fn block_with_conventions(
   within: Bytes,
   generics: List<RootName>,
-  handed: Map<RootName, OwnershipSignature>,
+  published_signatures: Map<RootName, OwnershipSignature>,
   b: Block,
 ) -> Block / {abort.raise} =
   b.map(|i: Inst|
     match i {
-      Let(l) -> Let({ ..l, value: value_with_conventions(within, generics, handed, l.value) }),
-      Do(d) -> Do({ ..d, value: value_with_conventions(within, generics, handed, d.value) }),
+      Let(l) ->
+        Let({
+          ..l,
+          value: value_with_conventions(within, generics, published_signatures, l.value),
+        }),
+      Do(d) ->
+        Do({ ..d, value: value_with_conventions(within, generics, published_signatures, d.value) }),
       If(x) ->
         If({
           ..x,
-          then: block_with_conventions(within, generics, handed, x.then),
-          otherwise: block_with_conventions(within, generics, handed, x.otherwise),
+          then: block_with_conventions(within, generics, published_signatures, x.then),
+          otherwise: block_with_conventions(within, generics, published_signatures, x.otherwise),
         }),
       Case(c) ->
         Case({
           ..c,
           arms: c.arms.map(|a: { when: Int, body: Block }|
-            { when: a.when, body: block_with_conventions(within, generics, handed, a.body) }),
-          rest: block_with_conventions(within, generics, handed, c.rest),
+            {
+              when: a.when,
+              body: block_with_conventions(within, generics, published_signatures, a.body),
+            }),
+          rest: block_with_conventions(within, generics, published_signatures, c.rest),
         }),
       Match(m) ->
         Match({
-          arms: m.arms.map(|a: Block| block_with_conventions(within, generics, handed, a)),
-          rest: block_with_conventions(within, generics, handed, m.rest),
+          arms: m.arms.map(|a: Block|
+            block_with_conventions(within, generics, published_signatures, a)),
+          rest: block_with_conventions(within, generics, published_signatures, m.rest),
         }),
-      Loop(l) -> Loop({ ..l, body: block_with_conventions(within, generics, handed, l.body) }),
-      Handle(h) -> Handle({ ..h, body: block_with_conventions(within, generics, handed, h.body) }),
-      CleanupScope(Some(xs)) -> CleanupScope(Some(cleanups_with_conventions(generics, handed, xs))),
-      Fail(x) -> Fail({ ..x, resource: cleanups_with_conventions(generics, handed, x.resource) }),
+      Loop(l) ->
+        Loop({ ..l, body: block_with_conventions(within, generics, published_signatures, l.body) }),
+      Handle(h) ->
+        Handle({
+          ..h,
+          body: block_with_conventions(within, generics, published_signatures, h.body),
+        }),
+      CleanupScope(Some(xs)) ->
+        CleanupScope(Some(cleanups_with_conventions(generics, published_signatures, xs))),
+      Fail(x) ->
+        Fail({
+          ..x,
+          resource: cleanups_with_conventions(generics, published_signatures, x.resource),
+        }),
       _ -> i,
     })
 
 fn cleanups_with_conventions(
   generics: List<RootName>,
-  handed: Map<RootName, OwnershipSignature>,
+  published_signatures: Map<RootName, OwnershipSignature>,
   xs: List<Unwinding>,
 ) -> List<Unwinding> / {abort.raise} =
   xs.map(|x: Unwinding|
@@ -342,7 +373,7 @@ fn cleanups_with_conventions(
       ..x,
       convention: convention_for(
         x.convention,
-        signature_at(handed, generics, Root(x.callee), 1),
+        signature_at(published_signatures, generics, Root(x.callee), 1),
         root_text(root_name(x.callee)),
       ),
     })
@@ -350,7 +381,7 @@ fn cleanups_with_conventions(
 fn value_with_conventions(
   within: Bytes,
   generics: List<RootName>,
-  handed: Map<RootName, OwnershipSignature>,
+  published_signatures: Map<RootName, OwnershipSignature>,
   v: Rvalue,
 ) -> Rvalue / {abort.raise} =
   match v {
@@ -359,7 +390,7 @@ fn value_with_conventions(
         ..c,
         convention: convention_for(
           c.convention,
-          signature_at(handed, generics, c.callee, c.args.len()),
+          signature_at(published_signatures, generics, c.callee, c.args.len()),
           Bytes::concat_all([
             match c.callee {
               Root(k) -> root_text(root_name(k)),
@@ -586,13 +617,16 @@ fn signatures_of(xs: List<InferredOwnership>) -> List<OwnershipSignature> =
 fn round(
   group: List<InferenceTarget>,
   published: Map<RootName, OwnershipSignature>,
-  cur: List<InferredOwnership>,
+  current: List<InferredOwnership>,
 ) -> List<InferredOwnership> = {
   let look = range(0, group.len()).fold(
     published,
     |m: Map<RootName, OwnershipSignature>, k: Int|
       match group.at(k) {
-        Some(l) -> match cur.at(k) { Some(c) -> m.insert(l.definition, c.signature), None -> m },
+        Some(l) -> match current.at(k) {
+          Some(c) -> m.insert(l.definition, c.signature),
+          None -> m,
+        },
         None -> m,
       },
   );
@@ -600,7 +634,7 @@ fn round(
     m.insert(l.definition, l.member.params.map(|p: Var| p.representation)));
   let found = range(0, group.len()).fold([], |accumulator: List<MemberResult>, k: Int|
     match group.at(k) {
-      Some(l) -> match cur.at(k) {
+      Some(l) -> match current.at(k) {
         Some(c) -> {
           let w = member_walk(
             {
@@ -665,10 +699,10 @@ fn walk_dropping_escapes(
 ) -> { walk: Walk, framed: Map<Int, Bool> } = {
   let w = walk_block({ ..s, framed: framed }, start, b);
   let gone = escaping_blocks(w);
-  let kept = framed.fold(Map::new(), |m: Map<Int, Bool>, id: Int, _: Bool|
+  let retained_frames = framed.fold(Map::new(), |m: Map<Int, Bool>, id: Int, _: Bool|
     if gone.contains(id) { m } else { m.insert(id, true) });
-  if kept.len() == framed.len() || room <= 0 { { walk: w, framed: framed } }
-  else { walk_dropping_escapes(s, start, b, kept, room - 1) }
+  if retained_frames.len() == framed.len() || room <= 0 { { walk: w, framed: framed } }
+  else { walk_dropping_escapes(s, start, b, retained_frames, room - 1) }
 }
 
 fn block_base(id: Int) -> Int = 0 - 1 - id
@@ -830,23 +864,25 @@ fn consumed_in(
 
 fn resolved(
   m: InferenceTarget,
-  cur: InferredOwnership,
+  current: InferredOwnership,
   w: Walk,
   gone: Map<Int, Span>,
 ) -> InferredOwnership = {
   let n = declared_arity(m.member.params);
   let given = |k: Int|
-    !m.borrowed.contains(k) && (cur.signature.params.at(k) == Some(OwnedParam) || gone.contains(k));
+    !m.borrowed.contains(k)
+      && (current.signature.params.at(k) == Some(OwnedParam) || gone.contains(k));
   let params = range(0, n).map(|k: Int| if given(k) { OwnedParam } else { BorrowedParam });
-  let result = if cur.signature.result == OwnedResult {
-    { returned: OwnedResult, at: cur.reason.result }
+  let result = if current.signature.result == OwnedResult {
+    { returned: OwnedResult, at: current.reason.result }
   } else { result_ownership_of(w.uses, params) };
   {
     signature: { params: params, result: result.returned },
     reason: {
       params: range(0, n).map(|k: Int|
-        if !given(k) { None }
-        else { match cur.reason.params.at(k) { Some(Some(at)) -> Some(at), _ -> gone.get(k) } }),
+        if !given(k) { None } else {
+          match current.reason.params.at(k) { Some(Some(at)) -> Some(at), _ -> gone.get(k) }
+        }),
       result: result.at,
     },
   }
@@ -932,15 +968,15 @@ fn used(w: Walk, d: Action) -> Walk = { ..w, uses: w.uses.push({ does: d, at: w.
 fn consumed(w: Walk, a: Arg) -> Walk =
   if is_refcounted(operand_representation(a)) { used(w, Consumes(arg_origin(w, a))) } else { w }
 
-fn taken(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
-  ops.fold(w, |accumulator: Walk, o: { arg: Arg, takes: Bool }|
+fn taken(w: Walk, operands: List<{ arg: Arg, takes: Bool }>) -> Walk =
+  operands.fold(w, |accumulator: Walk, o: { arg: Arg, takes: Bool }|
     if o.takes { consumed(accumulator, o.arg) } else { accumulator })
 
 fn passed_owned(w: Walk, a: Arg) -> Walk =
   if is_refcounted(operand_representation(a)) { used(w, PassesOn(arg_origin(w, a))) } else { w }
 
-fn passed_owned_operands(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
-  ops.fold(w, |accumulator: Walk, o: { arg: Arg, takes: Bool }|
+fn passed_owned_operands(w: Walk, operands: List<{ arg: Arg, takes: Bool }>) -> Walk =
+  operands.fold(w, |accumulator: Walk, o: { arg: Arg, takes: Bool }|
     if o.takes { passed_owned(accumulator, o.arg) } else { accumulator })
 
 fn jumped(w: Walk, to: RootName, args: List<Arg>) -> Walk =
@@ -1198,14 +1234,15 @@ fn signature_at(
     },
   }
 
-pub fn generated_signature(op: TypeOp, arity: Int) -> OwnershipSignature =
+pub fn generated_signature(operation: TypeOp, arity: Int) -> OwnershipSignature =
   {
-    params: range(0, arity).map(|k: Int| if reads(op, k) { BorrowedParam } else { OwnedParam }),
+    params: range(0, arity).map(|k: Int|
+      if reads(operation, k) { BorrowedParam } else { OwnedParam }),
     result: OwnedResult,
   }
 
-fn reads(op: TypeOp, k: Int) -> Bool =
-  match op {
+fn reads(operation: TypeOp, k: Int) -> Bool =
+  match operation {
     Equal -> true,
     Order -> true,
     NumericFunction(_) -> true,
@@ -1252,7 +1289,7 @@ fn vals_folded<s>(b: Block, accumulator: s, on: (s, Rvalue) -> s) -> s =
 fn assumed_in(
   f: Fn,
   generics: List<RootName>,
-  handed: Map<RootName, OwnershipSignature>,
+  signatures: Map<RootName, OwnershipSignature>,
   outside: (RootName) -> Bool,
 ) -> List<PublishedSignature> = {
   let added = |a: List<PublishedSignature>, p: PublishedSignature|
@@ -1260,14 +1297,15 @@ fn assumed_in(
   let own = vals_folded(f.body, [], |a: List<PublishedSignature>, v: Rvalue|
     match v {
       Call(c) -> match callee_definition(generics, c.callee) {
-        Some(d) -> if !outside(d) { a }
-        else { added(a, published_of(d, signature_at(handed, generics, c.callee, c.args.len()))) },
+        Some(d) -> if !outside(d) { a } else {
+          added(a, published_of(d, signature_at(signatures, generics, c.callee, c.args.len())))
+        },
         None -> a,
       },
       _ -> a,
     });
   f.lambdas.fold(own, |a: List<PublishedSignature>, l: Lambda|
-    match l { Closure(c) -> assumed_in(c.body, generics, handed, outside).fold(a, added) })
+    match l { Closure(c) -> assumed_in(c.body, generics, signatures, outside).fold(a, added) })
 }
 
 pub fn published_of(definition: RootName, h: OwnershipSignature) -> PublishedSignature =
@@ -1777,14 +1815,14 @@ test "a record parameter passed by reference stays borrowed across a restart onl
 test "in a recursion group, a parameter passed between members is borrowed, and becomes owned once any member stores it" {
   let s = string_var(0);
   let y = int(1);
-  let kept = string_var(2);
-  let passing = |name: Bytes, to: Bytes, keeps: Bool|
+  let stored = string_var(2);
+  let passing = |name: Bytes, to: Bytes, stores: Bool|
     definition_of(
       name,
       [s],
       AsInt,
-      (if keeps {
-        [bind(kept, made_of(CaseAllocation({ case: 0, skip: 0, words: 1 }), [VarOperand(s)]))]
+      (if stores {
+        [bind(stored, made_of(CaseAllocation({ case: 0, skip: 0, words: 1 }), [VarOperand(s)]))]
       } else { [] }).concat([bind(y, call_of(to, [VarOperand(s)])), Return(VarOperand(y))]),
     );
   let borrows = { params: [BorrowedParam], result: OwnedResult };
@@ -1833,17 +1871,17 @@ test "in a group of tail-calling functions, a parameter that receives a value an
 test "every recursion group is resolved after the groups it calls" {
   let s = string_var(0);
   let r = string_var(1);
-  let keeps = definition_of(b"keeps", [s], AsWord, [
+  let storing = definition_of(b"keeps", [s], AsWord, [
     bind(r, made_of(ListAllocation(1), [VarOperand(s)])),
     Return(VarOperand(r)),
   ]);
-  let hands = definition_of(b"hands", [s], AsWord, [
+  let passing = definition_of(b"hands", [s], AsWord, [
     bind(r, call_of(b"keeps", [VarOperand(s)])),
     Return(VarOperand(r)),
   ]);
-  let handed = infer_signatures([hands, keeps], Map::new(), Map::new()).signatures;
-  assert_eq(handed.get(of_m(b"hands")), Some({ params: [OwnedParam], result: OwnedResult }));
-  assert_eq(handed.get(of_m(b"keeps")), Some({ params: [OwnedParam], result: OwnedResult }))
+  let signatures = infer_signatures([passing, storing], Map::new(), Map::new()).signatures;
+  assert_eq(signatures.get(of_m(b"hands")), Some({ params: [OwnedParam], result: OwnedResult }));
+  assert_eq(signatures.get(of_m(b"keeps")), Some({ params: [OwnedParam], result: OwnedResult }))
 }
 
 test "a parameter declared borrowed stays borrowed, and a parameter the function stores is inferred as owned" {
@@ -1924,7 +1962,7 @@ test "an item read from a borrowed list is borrowed from that list, so a caller 
   let x = string_var(2);
   let ys = string_var(3);
   let y = string_var(4);
-  let kept = string_var(5);
+  let stored = string_var(5);
   let read = Native({
     name: b"rt_list_at",
     args: [VarOperand(xs), VarOperand(i)],
@@ -1940,20 +1978,20 @@ test "an item read from a borrowed list is borrowed from that list, so a caller 
     ]),
     [item],
   );
-  let keeping = |callee: Bytes, handing: OwnershipSignature|
+  let storing_caller = |callee: Bytes, callee_signature: OwnershipSignature|
     resolved_with(
       [
         definition_of(b"keep", [ys], AsWord, [
           bind(y, call_of(callee, [VarOperand(ys), IntOperand(0)])),
-          bind(kept, made_of(ListAllocation(1), [VarOperand(y)])),
-          Return(VarOperand(kept)),
+          bind(stored, made_of(ListAllocation(1), [VarOperand(y)])),
+          Return(VarOperand(stored)),
         ]),
       ],
-      [{ name: callee, signature: handing }],
+      [{ name: callee, signature: callee_signature }],
     );
-  assert_eq(keeping(b"at", item), [{ params: [BorrowedParam], result: OwnedResult }]);
+  assert_eq(storing_caller(b"at", item), [{ params: [BorrowedParam], result: OwnedResult }]);
   assert_eq(
-    keeping(b"same", {
+    storing_caller(b"same", {
       params: [BorrowedParam, BorrowedParam],
       result: BorrowedResult([{ param: 0, whole: true }]),
     }),
@@ -1965,9 +2003,9 @@ test "a function generated for a type borrows the values it only reads, and a ge
   let p = string_var(0);
   let q = string_var(1);
   let same = bool_var(2);
-  let written = |op: TypeOp, args: List<Arg>|
+  let written = |operation: TypeOp, args: List<Arg>|
     Call({
-      callee: Root(keys::generated_key(op, NamedType({ name: b"m.T", args: [] }), b"m")),
+      callee: Root(keys::generated_key(operation, NamedType({ name: b"m.T", args: [] }), b"m")),
       args: args,
       convention: {
         params: owned_params(args.map(operand_representation)),
@@ -2003,7 +2041,7 @@ test "a function generated for a type borrows the values it only reads, and a ge
       ContainerWalk(b"lower_entries"),
       ContainerWalk(b"lift_items"),
       ContainerWalk(b"lift_entries"),
-    ].map(|op: TypeOp| generated_signature(op, 2).params),
+    ].map(|operation: TypeOp| generated_signature(operation, 2).params),
     [
       [BorrowedParam, BorrowedParam],
       [OwnedParam, OwnedParam],
@@ -2014,8 +2052,8 @@ test "a function generated for a type borrows the values it only reads, and a ge
     ],
   );
   assert_eq(
-    [ContainerWalk(b"equal_from"), ContainerWalk(b"digest_from")].map(|op: TypeOp|
-      generated_signature(op, 3).params),
+    [ContainerWalk(b"equal_from"), ContainerWalk(b"digest_from")].map(|operation: TypeOp|
+      generated_signature(operation, 3).params),
     [[BorrowedParam, BorrowedParam, BorrowedParam], [BorrowedParam, OwnedParam, BorrowedParam]],
   )
 }
@@ -2048,30 +2086,30 @@ test "a body is compiled against its own inferred ownership and each callee's, a
     Return(VarOperand(q)),
   ]).member;
   let read = { params: [BorrowedParam], result: BorrowedResult([{ param: 0, whole: false }]) };
-  let handed = Map::new().insert(of_m(b"f"), {
+  let signatures = Map::new().insert(of_m(b"f"), {
     params: [BorrowedParam],
     result: OwnedResult,
   }).insert(
     of_m(b"look"),
     read,
   );
-  let written = with_conventions(f, handed);
+  let written = with_conventions(f, signatures);
   assert_eq(param_ownerships(written.convention), [BorrowedParam]);
   assert_eq(
     calls_written(written.body).map(|c: Convention|
       { params: param_ownerships(c), result: c.returned }),
     [read, all_owned(1)],
   );
-  let said = handle {
-    with_conventions(f, handed.insert(of_m(b"look"), all_owned(2)));
+  let message = handle {
+    with_conventions(f, signatures.insert(of_m(b"look"), all_owned(2)));
     b""
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert_eq(said, b"a handing of 2 parameters, but the function has only 1: m.look in m.f");
+  assert_eq(message, b"a handing of 2 parameters, but the function has only 1: m.look in m.f");
   let at = { ..f, key: keys::specialisation_key(b"m.f", [], []) };
-  assert_eq(param_ownerships(with_conventions(at, handed).convention), [BorrowedParam]);
-  let borrowing = handed.insert(of_m(b"f"), read);
+  assert_eq(param_ownerships(with_conventions(at, signatures).convention), [BorrowedParam]);
+  let borrowing = signatures.insert(of_m(b"f"), read);
   let scalar = {
     ..at,
     params: [int(0)],
@@ -2088,11 +2126,11 @@ test "a body is compiled against its own inferred ownership and each callee's, a
     ],
     [read.result, OwnedResult],
   );
-  let for_type = |op: TypeOp|
+  let for_type = |operation: TypeOp|
     param_ownerships(
       with_conventions(
-        { ..f, key: keys::generated_key(op, NamedType({ name: b"m.T", args: [] }), b"m") },
-        handed,
+        { ..f, key: keys::generated_key(operation, NamedType({ name: b"m.T", args: [] }), b"m") },
+        signatures,
       ).convention,
     );
   assert_eq([for_type(Equal), for_type(Drop)], [[BorrowedParam], [OwnedParam]]);
@@ -2124,7 +2162,7 @@ test "a body is compiled against its own inferred ownership and each callee's, a
       ],
     },
   };
-  match with_conventions(rooted, handed).lambdas {
+  match with_conventions(rooted, signatures).lambdas {
     [Closure(c)] ->
       assert_eq(
         calls_written(c.body.body).map(|x: Convention|

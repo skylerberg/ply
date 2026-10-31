@@ -319,11 +319,17 @@ fn parameter_ownership(f: Fn, member: Option<Int>) -> List<ParamOwnership> =
     Some(i) -> match f.members.at(i) { Some(m) -> param_ownerships(m.convention), None -> [] },
   }
 
-fn pass_arguments(w: CheckState, args: List<Arg>, handed: List<ParamOwnership>) -> CheckState =
+fn pass_arguments(
+  w: CheckState,
+  args: List<Arg>,
+  parameter_ownerships: List<ParamOwnership>,
+) -> CheckState =
   range(0, args.len()).fold(w, |accumulator: CheckState, i: Int|
     match args.at(i) {
       None -> accumulator,
-      Some(a) -> if handed.at(i) != Some(BorrowedParam) { pass_argument(accumulator, a) } else {
+      Some(a) -> if parameter_ownerships.at(i) != Some(BorrowedParam) {
+        pass_argument(accumulator, a)
+      } else {
         match operand_var(a) {
           Some(v) -> if !is_refcounted(v.representation)
               || borrowed_from_parameters(accumulator.path_state, v) { read_of(accumulator, v) }
@@ -557,7 +563,7 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           None ->
             { ..accumulator, fault: Some(b"a failed match in an arm appears outside any match") },
           Some(entry) -> {
-            let handed = {
+            let missed_state = {
               ..scoped(accumulator.path_state, entry),
               taken: accumulator.path_state.taken.fold(
                 Map::new(),
@@ -568,11 +574,12 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
               ),
             };
             match accumulator.missed {
-              None -> { ..accumulator, missed: Some(handed), live: false },
-              Some(m) -> if m.owned_counts == handed.owned_counts && m.unset == handed.unset {
+              None -> { ..accumulator, missed: Some(missed_state), live: false },
+              Some(m) -> if m.owned_counts == missed_state.owned_counts
+                  && m.unset == missed_state.unset {
                 {
                   ..accumulator,
-                  missed: Some({ ..m, taken: merge_taken(m.taken, handed.taken) }),
+                  missed: Some({ ..m, taken: merge_taken(m.taken, missed_state.taken) }),
                   live: false,
                 }
               } else {
@@ -1084,7 +1091,7 @@ fn bytes_fault(h: PathState, y: Option<Var>, value: Rvalue) -> Option<{ reason: 
     Op(o) -> {
       let named = match y { Some(a) -> a, None -> first_var(o.args, unknown_var()) };
       match o.op {
-        OfStrings(op) -> string_fault(h, y, named, op, o.args, o.uses),
+        OfStrings(string_operation) -> string_fault(h, y, named, string_operation, o.args, o.uses),
         OfContainers(CopyOut) -> if o.args.len() == 1
             && o.args.all(|a: Arg| !is_refcounted(operand_representation(a)))
             && o.uses.owned
@@ -1105,17 +1112,17 @@ fn string_fault(
   h: PathState,
   y: Option<Var>,
   named: Var,
-  op: StringOp,
+  string_operation: StringOp,
   args: List<Arg>,
   uses: OperationSignature,
 ) -> Option<{ reason: Bytes, v: Var }> = {
-  let kinds = string_operands(op);
+  let kinds = string_operands(string_operation);
   if kinds.len() != args.len() {
     Some({
       reason: b"an operation over bytes is given a different number of arguments than the operation requires: v",
       v: named,
     })
-  } else if uses != string_signature(op) {
+  } else if uses != string_signature(string_operation) {
     Some({
       reason: b"an operation over bytes that takes or returns a type other than the one its signature requires: v",
       v: named,
@@ -1136,7 +1143,7 @@ fn string_fault(
       Some(_) -> operand,
       None -> {
         let result = match y { Some(a) -> a.representation, None -> AsInt };
-        let read_arg = match string_result(op) {
+        let read_arg = match string_result(string_operation) {
           OwnBlock -> y != None && result == AsWord,
           _ -> !is_refcounted(result),
         };
@@ -1483,8 +1490,8 @@ fn scoped(h: PathState, outer: PathState) -> PathState =
 fn declared(h: PathState, id: Int) -> PathState =
   { ..h, joins: h.joins.insert(id, false), unset: h.unset.insert(id, true) }
 
-fn used(w: CheckState, ops: List<{ arg: Arg, takes: Bool }>) -> CheckState =
-  ops.fold(w, |accumulator: CheckState, o: { arg: Arg, takes: Bool }|
+fn used(w: CheckState, operands: List<{ arg: Arg, takes: Bool }>) -> CheckState =
+  operands.fold(w, |accumulator: CheckState, o: { arg: Arg, takes: Bool }|
     if o.takes { consume_arg(accumulator, o.arg) } else { read_arg(accumulator, o.arg) })
 
 fn consume_arg(w: CheckState, a: Arg) -> CheckState =
@@ -1925,12 +1932,12 @@ fn check_borrowed_result(
     },
   }
 
-fn ended(w: CheckState, kept: Map<Int, Int>, reason: Bytes) -> CheckState = {
-  let read_arg = counts_with_pending(w.path_state, kept);
+fn ended(w: CheckState, expected_counts: Map<Int, Int>, reason: Bytes) -> CheckState = {
+  let read_arg = counts_with_pending(w.path_state, expected_counts);
   if w.fault != None { w }
-  else if read_arg == kept { { ..w, live: false } } else {
-    let odd = read_arg.keys().concat(kept.keys()).filter(|id: Int|
-      read_arg.get(id) != kept.get(id));
+  else if read_arg == expected_counts { { ..w, live: false } } else {
+    let odd = read_arg.keys().concat(expected_counts.keys()).filter(|id: Int|
+      read_arg.get(id) != expected_counts.get(id));
     match odd.at(0) {
       Some(id) -> { ..w, fault: Some(reason.concat(ascii_of_int(id))), live: false },
       None -> { ..w, live: false },
@@ -2022,10 +2029,10 @@ fn arguments_match_representations(args: List<Arg>, reps: List<Representation>) 
         None -> false,
       })
 
-fn arguments_match_variables(args: List<Arg>, vars: List<Var>) -> Bool =
+fn arguments_match_variables(args: List<Arg>, variables: List<Var>) -> Bool =
   range(0, args.len()).all(|i: Int|
     match args.at(i) {
-      Some(a) -> match vars.at(i) { Some(v) -> same_rep(a, v.representation), None -> false },
+      Some(a) -> match variables.at(i) { Some(v) -> same_rep(a, v.representation), None -> false },
       None -> false,
     })
 
@@ -2945,7 +2952,7 @@ test "when a `Handle` has a `return` clause, the body's returned value is passed
   let p = word(0);
   let r = word(1);
   let a = word(2);
-  let handled = |ret: Option<Int>|
+  let handled = |return_clause: Option<Int>|
     ownership_fault(
       root_of([p], [], AsWord, [
         Handle({
@@ -2963,7 +2970,7 @@ test "when a `Handle` has a `return` clause, the body's returned value is passed
           ],
           args: [],
           uses: { takes: [], owned: false, fails: true, suspends: false },
-          site: { clauses: [], ret: ret, detached: None, instance: empty_instance(0) },
+          site: { clauses: [], ret: return_clause, detached: None, instance: empty_instance(0) },
           result: a,
           unwind: [p],
         }),
@@ -3011,7 +3018,7 @@ test "a field taken in a failed match arm cannot be read in the next arm, a fiel
     }),
     [],
   );
-  let handed = |detached: Bool, heap: Option<Int>|
+  let handle_fault = |detached: Bool, heap: Option<Int>|
     ownership_fault(
       root_of([p], [], AsWord, [
         laid,
@@ -3033,11 +3040,11 @@ test "a field taken in a failed match arm cannot be read in the next arm, a fiel
         Return(VarOperand(a)),
       ]),
     );
-  assert_eq(handed(false, None), None);
+  assert_eq(handle_fault(false, None), None);
   let outlives = Some(
     b"a closure stored on this function's stack is passed to a handle that can run after the function returns",
   );
-  assert_eq([handed(true, None), handed(false, Some(0))], [outlives, outlives])
+  assert_eq([handle_fault(true, None), handle_fault(false, Some(0))], [outlives, outlives])
 }
 
 test "a `Case` arm for a constructor must be one that the case's tag test names" {
@@ -3195,8 +3202,8 @@ test "an `Aggregate` builds a flattened record from its parts in order, and a pa
   )
 }
 
-fn bytes_op(op: StringOp, args: List<Arg>) -> Rvalue =
-  Op({ op: OfStrings(op), args: args, uses: string_signature(op) })
+fn bytes_op(string_operation: StringOp, args: List<Arg>) -> Rvalue =
+  Op({ op: OfStrings(string_operation), args: args, uses: string_signature(string_operation) })
 
 fn address(id: Int) -> Var = { ..int(id), representation: AsAddress }
 
@@ -3543,7 +3550,7 @@ test "reading a pointer word out of a sum case with a single pointer word is che
       cases: [b"m.T"],
     });
   let y = word(1);
-  let handed = |classes: List<WordClass>| {
+  let sum_fault = |classes: List<WordClass>| {
     let t = { ..word(0), representation: laid(classes) };
     ownership_fault(
       root_of([t], [], AsWord, [
@@ -3552,9 +3559,9 @@ test "reading a pointer word out of a sum case with a single pointer word is che
       ]),
     )
   };
-  assert_eq(handed([Pointer, layout::any_integer()]), None);
+  assert_eq(sum_fault([Pointer, layout::any_integer()]), None);
   assert_eq(
-    handed([Pointer, Pointer]),
+    sum_fault([Pointer, Pointer]),
     Some(b"a borrowed value passed where ownership is taken, but the function does not own it: v1"),
   );
   let word_sum = { ..word(2), representation: laid([Pointer]) };
@@ -3747,13 +3754,13 @@ test "a type-directed loop that copies a value uses up the original and returns 
   let p = word(0);
   let r = word(1);
   let n = int(2);
-  let check_block = |op: TypeOp, result: Var, rest: List<Inst>|
+  let check_block = |type_operation: TypeOp, result: Var, rest: List<Inst>|
     ownership_fault(
       root_of(
         [p],
         [],
         result.representation,
-        [bind(result, WalkLoop({ of: p, op: op }), [])].concat(rest).push(
+        [bind(result, WalkLoop({ of: p, op: type_operation }), [])].concat(rest).push(
           Return(VarOperand(result)),
         ),
       ),

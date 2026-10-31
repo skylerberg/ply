@@ -237,7 +237,7 @@ pub nondet effect net {
 /// Errors from opening or upgrading a socket.
 pub effect socket {
   /// A connection did not open, or an upgrade did not complete.
-  raise fail(reason: Error)
+  raise fail(connection: Error)
 }
 
 /// Returns a short English description of `reason`.
@@ -377,13 +377,13 @@ fn connect_first_address<[l]>(
 /// Secures `conn` as a TLS client, as `net.start_tls` does, but raises `socket.fail` with the error
 /// instead of returning `Err`.
 pub fn secure<[l]>(
-  conn: Int,
+  connection: Int,
   name: String,
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
 ) -> UpgradeResult / {net.start_tls[l], socket.fail} =
-  match net.start_tls[l](conn, name, alpn, unread, timeout_ms) {
+  match net.start_tls[l](connection, name, alpn, unread, timeout_ms) {
     Ok(secured) -> secured,
     Err(reason) -> socket.fail(reason),
   }
@@ -392,13 +392,13 @@ pub fn secure<[l]>(
 /// and returns the negotiated protocol. Fails with the error `net.serve_tls` returns. `unread` must
 /// be empty.
 pub fn secure_accepted<[l]>(
-  conn: Int,
+  connection: Int,
   credential: String,
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
 ) -> UpgradeResult / {net.serve_tls[l], socket.fail} =
-  match net.serve_tls[l](conn, credential, alpn, unread, timeout_ms) {
+  match net.serve_tls[l](connection, credential, alpn, unread, timeout_ms) {
     Ok(secured) -> secured,
     Err(reason) -> socket.fail(reason),
   }
@@ -455,16 +455,16 @@ pub fn dial_unix<[l]>(
 /// most `timeout_ms` and fails with `TimedOut` if nothing arrives. The source ends when the peer
 /// finishes sending. Closing the source closes the connection.
 pub fn reading<[l]>(
-  conn: Int,
+  connection: Int,
   timeout_ms: Int,
 ) -> Source<| {net.recv[l], net.close[l], socket.fail}> =
   {
     pull: |size: Int|
-      match net.recv[l](conn, size, timeout_ms) {
+      match net.recv[l](connection, size, timeout_ms) {
         Some(bytes) -> bytes,
         None -> socket.fail(TimedOut),
       },
-    close: || net.close[l](conn),
+    close: || net.close[l](connection),
   }
 
 /// Returns a sink that writes to the connection `conn`. Each push sends all of its bytes, and each
@@ -472,12 +472,12 @@ pub fn reading<[l]>(
 /// for reading, so create the sink inside the scope of the source that reads from the same
 /// connection.
 pub fn writing<[l]>(
-  conn: Int,
+  connection: Int,
   timeout_ms: Int,
 ) -> Sink<| {net.send[l], net.close_write[l], abort.raise}> =
   {
-    push: |bytes: Bytes| bytes.len() == 0 || send_all[l](conn, bytes, timeout_ms),
-    close: || net.close_write[l](conn),
+    push: |bytes: Bytes| bytes.len() == 0 || send_all[l](connection, bytes, timeout_ms),
+    close: || net.close_write[l](connection),
   }
 
 /// What the far end of a scripted connection does next.
@@ -679,27 +679,27 @@ pub fn mem_credential(n: MemNet, name: String) -> MemNet =
 pub fn mem_chunk_limit(n: MemNet, most: Int) -> MemNet = { ..n, chunk_limit: most }
 
 /// Everything the program sent on `conn` except credentials, whether or not it is still open.
-pub fn mem_sent(n: MemNet, conn: Int) -> Bytes =
-  match n.conns.get(conn) { Some(c) -> c.sent, None -> b"" }
+pub fn mem_sent(n: MemNet, connection: Int) -> Bytes =
+  match n.conns.get(connection) { Some(c) -> c.sent, None -> b"" }
 
 /// Returns each secret the program sent on `conn` with `send_secret`, in order. Each is still a
 /// `Secret` in the form `send_secret` frames it, so a test can compare it as a whole with the
 /// secret it expects.
-pub fn mem_sent_secrets(n: MemNet, conn: Int) -> List<Secret<Bytes>> =
-  match n.conns.get(conn) { Some(c) -> c.sent_secrets, None -> [] }
+pub fn mem_sent_secrets(n: MemNet, connection: Int) -> List<Secret<Bytes>> =
+  match n.conns.get(connection) { Some(c) -> c.sent_secrets, None -> [] }
 
 /// What `conn`'s far end has yet to do: empty when the program has run its script to the end.
-pub fn mem_remaining_script(n: MemNet, conn: Int) -> List<Step> =
-  match n.conns.get(conn) { Some(c) -> c.script, None -> [] }
+pub fn mem_remaining_script(n: MemNet, connection: Int) -> List<Step> =
+  match n.conns.get(connection) { Some(c) -> c.script, None -> [] }
 
 /// Returns the deadline given to each read of `conn`, in milliseconds and in order. A test of a
 /// timeout can add them up.
-pub fn mem_deadlines(n: MemNet, conn: Int) -> List<Int> =
-  match n.conns.get(conn) { Some(c) -> c.deadlines, None -> [] }
+pub fn mem_deadlines(n: MemNet, connection: Int) -> List<Int> =
+  match n.conns.get(connection) { Some(c) -> c.deadlines, None -> [] }
 
 /// The name or credential `conn` was secured as, or `None` for plaintext.
-pub fn mem_secured(n: MemNet, conn: Int) -> Option<String> =
-  match n.conns.get(conn) { Some(c) -> c.tls_name, None -> None }
+pub fn mem_secured(n: MemNet, connection: Int) -> Option<String> =
+  match n.conns.get(connection) { Some(c) -> c.tls_name, None -> None }
 
 fn unix_key(root: String, path: String) -> String = "unix:" ++ root ++ "/" ++ path
 
@@ -749,10 +749,14 @@ fn option_checked(option: SocketOption) -> SocketOption / {abort.raise} = {
 fn no_socket<a>(id: Int) -> a / {abort.raise} =
   panic("there is no open socket with handle " ++ id.to_string())
 
-fn claimed(id: Int, held: Option<String>, label: String) -> Option<String> / {abort.raise} =
-  match held {
+fn claimed(
+  id: Int,
+  current_label: Option<String>,
+  label: String,
+) -> Option<String> / {abort.raise} =
+  match current_label {
     None -> Some(label),
-    Some(first) -> if first == label { held } else {
+    Some(first) -> if first == label { current_label } else {
       panic(
         "socket " ++ id.to_string() ++ " is being used as `net[" ++ label ++ "]` and `net[" ++ first
           ++ "]`",
@@ -901,8 +905,15 @@ pub fn mem_listen_tls(
   port: Int,
   credential: String,
 ) -> StepResult<Int> / {abort.raise} = {
-  let held = credentialed(n, credential);
-  let bound = bind(n, label, ip::loopback_v4(), port_checked("listen_tls", port), Some(held), []);
+  let configured_credential = credentialed(n, credential);
+  let bound = bind(
+    n,
+    label,
+    ip::loopback_v4(),
+    port_checked("listen_tls", port),
+    Some(configured_credential),
+    [],
+  );
   match bound.result {
     Ok(id) -> { net: bound.net, result: id },
     Err(_) ->
@@ -911,7 +922,7 @@ pub fn mem_listen_tls(
 }
 
 fn credentialed(n: MemNet, credential: String) -> String / {abort.raise} =
-  if n.credentials.filter(|held: String| held == credential).len() > 0 { credential }
+  if n.credentials.filter(|configured: String| configured == credential).len() > 0 { credential }
   else { panic("no TLS credential named `" ++ credential ++ "` was configured for this run") }
 
 pub fn mem_listen_on(
@@ -1121,28 +1132,29 @@ pub fn mem_accept(n: MemNet, label: String, listener: Int) -> StepResult<Int> / 
 pub fn mem_recv(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
   max: Int,
   timeout_ms: Int,
 ) -> StepResult<Option<Bytes>> / {abort.raise} = {
   deadline("recv", timeout_ms);
   let wanted = checked_read_size(max);
-  let asked = advance_script(conn_of(n, label, conn));
-  let c = { ..asked, deadlines: asked.deadlines.push(timeout_ms) };
+  let advanced = advance_script(conn_of(n, label, connection));
+  let c = { ..advanced, deadlines: advanced.deadlines.push(timeout_ms) };
   let most = if n.chunk_limit > 0 { min(wanted, n.chunk_limit) } else { wanted };
   match c.script {
-    [] -> { net: with_conn(n, conn, c), result: if c.may_send_more { None } else { Some(b"") } },
+    [] ->
+      { net: with_conn(n, connection, c), result: if c.may_send_more { None } else { Some(b"") } },
     [Sends(bytes), ..rest] -> if bytes.len() > most {
       let left = bytes.slice(most, bytes.len());
       {
-        net: with_conn(n, conn, { ..c, script: [Sends(left)].concat(rest) }),
+        net: with_conn(n, connection, { ..c, script: [Sends(left)].concat(rest) }),
         result: Some(bytes.slice(0, most)),
       }
-    } else { { net: with_conn(n, conn, { ..c, script: rest }), result: Some(bytes) } },
+    } else { { net: with_conn(n, connection, { ..c, script: rest }), result: Some(bytes) } },
     [Repeats(bytes), ..] ->
-      { net: with_conn(n, conn, c), result: Some(bytes.slice(0, min(most, bytes.len()))) },
-    [Stalls, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: None },
-    _ -> { net: with_conn(n, conn, c), result: None },
+      { net: with_conn(n, connection, c), result: Some(bytes.slice(0, min(most, bytes.len()))) },
+    [Stalls, ..rest] -> { net: with_conn(n, connection, { ..c, script: rest }), result: None },
+    _ -> { net: with_conn(n, connection, c), result: None },
   }
 }
 
@@ -1151,16 +1163,16 @@ pub fn mem_recv(
 pub fn mem_send(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
   payload: Bytes,
   timeout_ms: Int,
 ) -> StepResult<Option<Int>> / {abort.raise} = {
   deadline("send", timeout_ms);
   check_nonempty_write("send", payload.len() == 0);
-  let c = advance_script(conn_of(n, label, conn));
-  if c.ended || c.gone { { net: with_conn(n, conn, c), result: Some(0) } } else {
+  let c = advance_script(conn_of(n, label, connection));
+  if c.ended || c.gone { { net: with_conn(n, connection, c), result: Some(0) } } else {
     match c.script {
-      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: None },
+      [Blocks, ..rest] -> { net: with_conn(n, connection, { ..c, script: rest }), result: None },
       _ -> {
         let size = if n.chunk_limit > 0 { min(payload.len(), n.chunk_limit) }
         else { payload.len() };
@@ -1170,7 +1182,7 @@ pub fn mem_send(
           sent: c.sent.concat(part),
           unheard: c.unheard.concat(part),
         });
-        { net: passed_on(with_conn(n, conn, mine), c.joined, part), result: Some(size) }
+        { net: passed_on(with_conn(n, connection, mine), c.joined, part), result: Some(size) }
       },
     }
   }
@@ -1203,7 +1215,7 @@ pub fn sent_secret(
 pub fn mem_send_secret(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
   before: Bytes,
   secret: Secret<Bytes>,
   encoding: String,
@@ -1213,30 +1225,34 @@ pub fn mem_send_secret(
   deadline("send_secret", timeout_ms);
   let framed = sent_secret(before, secret, encoding, after);
   check_nonempty_write("send_secret", framed.is_empty());
-  let c = advance_script(conn_of(n, label, conn));
-  if c.ended || c.gone { { net: with_conn(n, conn, c), result: false } } else if c.joined != None {
+  let c = advance_script(conn_of(n, label, connection));
+  if c.ended || c.gone { { net: with_conn(n, connection, c), result: false } }
+  else if c.joined != None {
     panic(
       "the in-memory network cannot send a credential to the program's own end of socket "
-        ++ conn.to_string()
+        ++ connection.to_string()
         ++ ": that end would read the credential as plain bytes, so send it to a scripted peer instead",
     )
   } else {
-    let kept = { ..c, sent_secrets: c.sent_secrets.push(framed) };
+    let with_secret = { ..c, sent_secrets: c.sent_secrets.push(framed) };
     match c.script {
-      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: false },
+      [Blocks, ..rest] -> { net: with_conn(n, connection, { ..c, script: rest }), result: false },
       [Expects(expected), ..] ->
         panic(
           "the scripted peer expected to receive \"" ++ String::of_bytes_lossy(expected)
             ++ "\" but the program sent a credential",
         ),
       [ExpectsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
-        { net: with_conn(n, conn, advance_script({ ..kept, script: rest })), result: true }
+        {
+          net: with_conn(n, connection, advance_script({ ..with_secret, script: rest })),
+          result: true,
+        }
       } else {
         panic(
           "the scripted peer expected one credential but the program sent a different credential",
         )
       },
-      _ -> { net: with_conn(n, conn, kept), result: true },
+      _ -> { net: with_conn(n, connection, with_secret), result: true },
     }
   }
 }
@@ -1265,10 +1281,18 @@ fn signal_far_end(n: MemNet, other: Option<Int>, closed: Bool) -> MemNet =
     },
   }
 
-pub fn mem_close_write(n: MemNet, label: String, conn: Int) -> StepResult<Unit> / {abort.raise} = {
-  let c = conn_of(n, label, conn);
+pub fn mem_close_write(
+  n: MemNet,
+  label: String,
+  connection: Int,
+) -> StepResult<Unit> / {abort.raise} = {
+  let c = conn_of(n, label, connection);
   {
-    net: signal_far_end(with_conn(n, conn, advance_script({ ..c, ended: true })), c.joined, false),
+    net: signal_far_end(
+      with_conn(n, connection, advance_script({ ..c, ended: true })),
+      c.joined,
+      false,
+    ),
     result: (),
   }
 }
@@ -1279,8 +1303,11 @@ pub fn mem_close(n: MemNet, label: String, socket: Int) -> StepResult<Unit> / {a
   match n.conns.get(socket) {
     Some(_) -> {
       let c = conn_of(n, label, socket);
-      let kept = with_conn(n, socket, { ..c, gone: true, ended: true, joined: None });
-      { net: { ..signal_far_end(kept, c.joined, true), closed: n.closed.push(socket) }, result: () }
+      let closed_network = with_conn(n, socket, { ..c, gone: true, ended: true, joined: None });
+      {
+        net: { ..signal_far_end(closed_network, c.joined, true), closed: n.closed.push(socket) },
+        result: (),
+      }
     },
     None -> {
       let _l = listener_of(n, label, socket);
@@ -1295,24 +1322,29 @@ fn upgraded(
   n: MemNet,
   operation: String,
   label: String,
-  conn: Int,
+  connection: Int,
   who: String,
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
 ) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} = {
   deadline(operation, timeout_ms);
-  let c = advance_script(conn_of(n, label, conn));
+  let c = advance_script(conn_of(n, label, connection));
   let secured = |rest: List<Step>| {
     {
-      net: with_conn(n, conn, { ..c, script: rest, tls_name: Some(who), negotiated: alpn.at(0) }),
+      net: with_conn(n, connection, {
+        ..c,
+        script: rest,
+        tls_name: Some(who),
+        negotiated: alpn.at(0),
+      }),
       result: Ok({ protocol: alpn.at(0) }),
     }
   };
   let over = |reason: Error| {
     {
       net: signal_far_end(
-        with_conn(n, conn, {
+        with_conn(n, connection, {
           ..c,
           script: [],
           may_send_more: false,
@@ -1328,12 +1360,12 @@ fn upgraded(
   };
   if c.tls_name != None {
     panic(
-      "`net." ++ operation ++ "` cannot secure socket " ++ conn.to_string()
+      "`net." ++ operation ++ "` cannot secure socket " ++ connection.to_string()
         ++ ": it is already TLS",
     )
   } else if c.local == None && c.peer == None {
     panic(
-      "`net." ++ operation ++ "` cannot secure socket " ++ conn.to_string()
+      "`net." ++ operation ++ "` cannot secure socket " ++ connection.to_string()
         ++ ": it is a Unix socket",
     )
   } else if unread.len() > 0 { over(Injected) } else {
@@ -1351,36 +1383,36 @@ fn upgraded(
 pub fn mem_start_tls(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
   name: String,
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
 ) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} =
-  upgraded(n, "start_tls", label, conn, name, alpn, unread, timeout_ms)
+  upgraded(n, "start_tls", label, connection, name, alpn, unread, timeout_ms)
 
 /// Returns the result of securing the connection as a TLS server with `credential`. Fails when
 /// `credential` was not added to the network with `mem_credential`.
 pub fn mem_serve_tls(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
   credential: String,
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
 ) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} =
-  upgraded(n, "serve_tls", label, conn, credentialed(n, credential), alpn, unread, timeout_ms)
+  upgraded(n, "serve_tls", label, connection, credentialed(n, credential), alpn, unread, timeout_ms)
 
 /// What `net.handshake` returns over the network: a secured connection has none left to complete,
 /// and a plaintext one has none at all.
 pub fn mem_handshake(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
 ) -> StepResult<Option<Int>> / {abort.raise} = {
-  let c = conn_of(n, label, conn);
-  { net: with_conn(n, conn, c), result: if c.tls_name == None { None } else { Some(0) } }
+  let c = conn_of(n, label, connection);
+  { net: with_conn(n, connection, c), result: if c.tls_name == None { None } else { Some(0) } }
 }
 
 fn setting(option: SocketOption) -> Int =
@@ -1403,8 +1435,12 @@ fn setting(option: SocketOption) -> Int =
 /// set on a socket. A group joined or left, or a credential to present, is not a setting, and is
 /// not stored.
 pub fn with_option(options: List<SocketOption>, option: SocketOption) -> List<SocketOption> =
-  if setting(option) >= 9 { options }
-  else { options.filter(|held: SocketOption| setting(held) != setting(option)).push(option) }
+  if setting(option) >= 9 { options } else {
+    options.filter(|existing_option: SocketOption|
+      setting(existing_option) != setting(option)).push(
+      option,
+    )
+  }
 
 /// What `net.set_option` returns over the network. It stores each setting, and no setting changes
 /// its behavior, since it has no kernel to tune.
@@ -1412,9 +1448,9 @@ pub fn mem_set_option(
   n: MemNet,
   label: String,
   socket: Int,
-  asked: SocketOption,
+  requested_option: SocketOption,
 ) -> StepResult<Result<Unit, Error>> / {abort.raise} = {
-  let option = option_checked(asked);
+  let option = option_checked(requested_option);
   match n.conns.get(socket) {
     Some(_) -> {
       let c = conn_of(n, label, socket);
@@ -1464,12 +1500,12 @@ pub fn mem_local_port(n: MemNet, label: String, socket: Int) -> Option<Int> / {a
 pub fn mem_peer_address(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
 ) -> Option<SocketAddress> / {abort.raise} =
-  match n.conns.get(conn) {
-    Some(_) -> conn_of(n, label, conn).peer,
+  match n.conns.get(connection) {
+    Some(_) -> conn_of(n, label, connection).peer,
     None -> {
-      let _l = listener_of(n, label, conn);
+      let _l = listener_of(n, label, connection);
       None
     },
   }
@@ -1478,28 +1514,32 @@ pub fn mem_peer_address(
 /// its client presents: the one given to `mem_calling_with_certificate`, or the one named by the
 /// `Presenting` option on the program's own client. A client gets the certificate that
 /// `mem_server_certificate` registered for the name the connection was secured as.
-pub fn mem_peer_certificate(n: MemNet, label: String, conn: Int) -> Option<Bytes> / {abort.raise} =
-  match n.conns.get(conn) {
+pub fn mem_peer_certificate(
+  n: MemNet,
+  label: String,
+  connection: Int,
+) -> Option<Bytes> / {abort.raise} =
+  match n.conns.get(connection) {
     Some(_) -> {
-      let c = conn_of(n, label, conn);
+      let c = conn_of(n, label, connection);
       match c.tls_name {
         Some(name) -> if c.accepted { c.client_certificate } else { n.leaves.get(name) },
         None -> None,
       }
     },
     None -> {
-      let _l = listener_of(n, label, conn);
+      let _l = listener_of(n, label, connection);
       None
     },
   }
 
 /// Returns the application protocol of the connection: the first protocol offered when it was
 /// upgraded, or `http/1.1` for a connection opened by `connect_tls`.
-pub fn mem_protocol(n: MemNet, label: String, conn: Int) -> Option<String> / {abort.raise} =
-  match n.conns.get(conn) {
-    Some(_) -> conn_of(n, label, conn).negotiated,
+pub fn mem_protocol(n: MemNet, label: String, connection: Int) -> Option<String> / {abort.raise} =
+  match n.conns.get(connection) {
+    Some(_) -> conn_of(n, label, connection).negotiated,
     None -> {
-      let _l = listener_of(n, label, conn);
+      let _l = listener_of(n, label, connection);
       None
     },
   }
@@ -1507,12 +1547,12 @@ pub fn mem_protocol(n: MemNet, label: String, conn: Int) -> Option<String> / {ab
 pub fn mem_peer_credentials(
   n: MemNet,
   label: String,
-  conn: Int,
+  connection: Int,
 ) -> Option<PeerCredentials> / {abort.raise} =
-  match n.conns.get(conn) {
-    Some(_) -> conn_of(n, label, conn).credentials,
+  match n.conns.get(connection) {
+    Some(_) -> conn_of(n, label, connection).credentials,
     None -> {
-      let _l = listener_of(n, label, conn);
+      let _l = listener_of(n, label, connection);
       None
     },
   }
@@ -1573,18 +1613,18 @@ pub fn on_mem<a | e>(
       t = s.net;
       s.result
     },
-    net.handshake[*label](conn) -> {
-      let s = mem_handshake(t, label, conn);
+    net.handshake[*label](connection) -> {
+      let s = mem_handshake(t, label, connection);
       t = s.net;
       s.result
     },
-    net.start_tls[*label](conn, name, alpn, unread, timeout_ms) -> {
-      let s = mem_start_tls(t, label, conn, name, alpn, unread, timeout_ms);
+    net.start_tls[*label](connection, name, alpn, unread, timeout_ms) -> {
+      let s = mem_start_tls(t, label, connection, name, alpn, unread, timeout_ms);
       t = s.net;
       s.result
     },
-    net.serve_tls[*label](conn, credential, alpn, unread, timeout_ms) -> {
-      let s = mem_serve_tls(t, label, conn, credential, alpn, unread, timeout_ms);
+    net.serve_tls[*label](connection, credential, alpn, unread, timeout_ms) -> {
+      let s = mem_serve_tls(t, label, connection, credential, alpn, unread, timeout_ms);
       t = s.net;
       s.result
     },
@@ -1593,23 +1633,23 @@ pub fn on_mem<a | e>(
       t = s.net;
       s.result
     },
-    net.recv[*label](conn, max, timeout_ms) -> {
-      let s = mem_recv(t, label, conn, max, timeout_ms);
+    net.recv[*label](connection, max, timeout_ms) -> {
+      let s = mem_recv(t, label, connection, max, timeout_ms);
       t = s.net;
       s.result
     },
-    net.send[*label](conn, payload, timeout_ms) -> {
-      let s = mem_send(t, label, conn, payload, timeout_ms);
+    net.send[*label](connection, payload, timeout_ms) -> {
+      let s = mem_send(t, label, connection, payload, timeout_ms);
       t = s.net;
       s.result
     },
-    net.send_secret[*label](conn, before, secret, encoding, after, timeout_ms) -> {
-      let s = mem_send_secret(t, label, conn, before, secret, encoding, after, timeout_ms);
+    net.send_secret[*label](connection, before, secret, encoding, after, timeout_ms) -> {
+      let s = mem_send_secret(t, label, connection, before, secret, encoding, after, timeout_ms);
       t = s.net;
       s.result
     },
-    net.close_write[*label](conn) -> {
-      t = mem_close_write(t, label, conn).net;
+    net.close_write[*label](connection) -> {
+      t = mem_close_write(t, label, connection).net;
     },
     net.close[*label](socket) -> {
       t = mem_close(t, label, socket).net;
@@ -1621,10 +1661,10 @@ pub fn on_mem<a | e>(
     },
     net.local_port[*label](socket) -> mem_local_port(t, label, socket),
     net.local_address[*label](socket) -> mem_local_address(t, label, socket),
-    net.peer_address[*label](conn) -> mem_peer_address(t, label, conn),
-    net.peer_credentials[*label](conn) -> mem_peer_credentials(t, label, conn),
-    net.peer_certificate[*label](conn) -> mem_peer_certificate(t, label, conn),
-    net.protocol[*label](conn) -> mem_protocol(t, label, conn),
+    net.peer_address[*label](connection) -> mem_peer_address(t, label, connection),
+    net.peer_credentials[*label](connection) -> mem_peer_credentials(t, label, connection),
+    net.peer_certificate[*label](connection) -> mem_peer_certificate(t, label, connection),
+    net.protocol[*label](connection) -> mem_protocol(t, label, connection),
     net.options[*label](socket) -> mem_options(t, label, socket),
     dns.lookup(name) -> dns::table_lookup(t.names, name),
     dns.reverse(address) -> dns::table_reverse(t.names, address),
@@ -1660,48 +1700,60 @@ fn host_handler<a | e>(
     },
     net.connect_to[*label](to, options, timeout_ms) -> {
       deadline("connect_to", timeout_ms);
-      let asked = net_connect_to(label, encode_address(to), encode_options(options), timeout_ms);
-      decode_result(job_wait(asked), decode_int)
+      let connect_job = net_connect_to(
+        label,
+        encode_address(to),
+        encode_options(options),
+        timeout_ms,
+      );
+      decode_result(job_wait(connect_job), decode_int)
     },
     net.connect_unix[*label](root, path, timeout_ms) -> {
       deadline("connect_unix", timeout_ms);
       decode_result(job_wait(net_connect_unix(label, root, path, timeout_ms)), decode_int)
     },
-    net.handshake[*label](conn) -> int_found(job_wait(net_handshake(label, conn))),
-    net.start_tls[*label](conn, name, alpn, unread, timeout_ms) -> {
+    net.handshake[*label](connection) -> int_found(job_wait(net_handshake(label, connection))),
+    net.start_tls[*label](connection, name, alpn, unread, timeout_ms) -> {
       deadline("start_tls", timeout_ms);
-      let asked = net_start_tls(label, conn, name, encode_texts(alpn), unread.len(), timeout_ms);
-      decode_result(job_wait(asked), decode_upgrade_result)
-    },
-    net.serve_tls[*label](conn, credential, alpn, unread, timeout_ms) -> {
-      deadline("serve_tls", timeout_ms);
-      let asked = net_serve_tls(
+      let start_tls_job = net_start_tls(
         label,
-        conn,
+        connection,
+        name,
+        encode_texts(alpn),
+        unread.len(),
+        timeout_ms,
+      );
+      decode_result(job_wait(start_tls_job), decode_upgrade_result)
+    },
+    net.serve_tls[*label](connection, credential, alpn, unread, timeout_ms) -> {
+      deadline("serve_tls", timeout_ms);
+      let serve_tls_job = net_serve_tls(
+        label,
+        connection,
         credential,
         encode_texts(alpn),
         unread.len(),
         timeout_ms,
       );
-      decode_result(job_wait(asked), decode_upgrade_result)
+      decode_result(job_wait(serve_tls_job), decode_upgrade_result)
     },
     net.accept[*label](listener) -> decode_int(job_wait(net_accept(label, listener))),
-    net.recv[*label](conn, max, timeout_ms) -> {
+    net.recv[*label](connection, max, timeout_ms) -> {
       deadline("recv", timeout_ms);
-      found(job_wait(net_recv(label, conn, checked_read_size(max), timeout_ms)))
+      found(job_wait(net_recv(label, connection, checked_read_size(max), timeout_ms)))
     },
-    net.send[*label](conn, payload, timeout_ms) -> {
+    net.send[*label](connection, payload, timeout_ms) -> {
       deadline("send", timeout_ms);
       check_nonempty_write("send", payload.len() == 0);
-      int_found(job_wait(net_send(label, conn, payload, timeout_ms)))
+      int_found(job_wait(net_send(label, connection, payload, timeout_ms)))
     },
-    net.send_secret[*label](conn, before, secret, encoding, after, timeout_ms) -> {
+    net.send_secret[*label](connection, before, secret, encoding, after, timeout_ms) -> {
       deadline("send_secret", timeout_ms);
       let framed = sent_secret(before, secret, encoding, after);
       check_nonempty_write("send_secret", framed.is_empty());
-      job_wait(net_send_secret(label, conn, framed, timeout_ms)) == b"\x01"
+      job_wait(net_send_secret(label, connection, framed, timeout_ms)) == b"\x01"
     },
-    net.close_write[*label](conn) -> net_close_write(label, conn),
+    net.close_write[*label](connection) -> net_close_write(label, connection),
     net.close[*label](socket) -> net_close(label, socket),
     net.set_option[*label](socket, option) ->
       decode_result(net_set_option(label, socket, encode_option(option)), |_: Bytes| ()),
@@ -1710,57 +1762,59 @@ fn host_handler<a | e>(
       if at < 0 { None } else { Some(at) }
     },
     net.local_address[*label](socket) -> address_found(net_local_address(label, socket)),
-    net.peer_address[*label](conn) -> address_found(net_peer_address(label, conn)),
-    net.peer_credentials[*label](conn) -> match found(net_peer_credentials(label, conn)) {
+    net.peer_address[*label](connection) -> address_found(net_peer_address(label, connection)),
+    net.peer_credentials[*label](connection) -> match found(
+        net_peer_credentials(label, connection),
+      ) {
       Some(flat) -> Some(decode_credentials(flat)),
       None -> None,
     },
-    net.peer_certificate[*label](conn) -> found(net_peer_certificate(label, conn)),
-    net.protocol[*label](conn) -> text_found(net_protocol(label, conn)),
+    net.peer_certificate[*label](connection) -> found(net_peer_certificate(label, connection)),
+    net.protocol[*label](connection) -> text_found(net_protocol(label, connection)),
     net.options[*label](socket) -> decode_options(net_options(label, socket)),
   }
 
-extern fn net_listen(label: String, port: Int) -> Int / {native.read}
+extern fn net_listen(label: String, connection: Int) -> Int / {native.read}
 
-extern fn net_listen_tls(label: String, port: Int, credential: String) -> Int / {native.read}
+extern fn net_listen_tls(label: String, connection: Int, credential: String) -> Int / {native.read}
 
-extern fn net_listen_on(label: String, at: Bytes, options: Bytes) -> Bytes / {native.read}
+extern fn net_listen_on(label: String, connection: Bytes, options: Bytes) -> Bytes / {native.read}
 
-extern fn net_listen_unix(label: String, root: String, path: String) -> Bytes / {native.read}
+extern fn net_listen_unix(label: String, connection: String, path: String) -> Bytes / {native.read}
 
 extern fn net_connect(
   label: String,
-  host: String,
+  connection: String,
   port: Int,
   timeout_ms: Int,
 ) -> Int / {native.read}
 
 extern fn net_connect_tls(
   label: String,
-  host: String,
+  connection: String,
   port: Int,
   timeout_ms: Int,
 ) -> Int / {native.read}
 
 extern fn net_connect_to(
   label: String,
-  to: Bytes,
+  connection: Bytes,
   options: Bytes,
   timeout_ms: Int,
 ) -> Int / {native.read}
 
 extern fn net_connect_unix(
   label: String,
-  root: String,
+  connection: String,
   path: String,
   timeout_ms: Int,
 ) -> Int / {native.read}
 
-extern fn net_handshake(label: String, conn: Int) -> Int / {native.read}
+extern fn net_handshake(label: String, connection: Int) -> Int / {native.read}
 
 extern fn net_start_tls(
   label: String,
-  conn: Int,
+  connection: Int,
   name: String,
   alpn: Bytes,
   unread: Int,
@@ -1769,45 +1823,50 @@ extern fn net_start_tls(
 
 extern fn net_serve_tls(
   label: String,
-  conn: Int,
+  connection: Int,
   credential: String,
   alpn: Bytes,
   unread: Int,
   timeout_ms: Int,
 ) -> Int / {native.read}
 
-extern fn net_accept(label: String, listener: Int) -> Int / {native.read}
+extern fn net_accept(label: String, connection: Int) -> Int / {native.read}
 
-extern fn net_recv(label: String, conn: Int, max: Int, timeout_ms: Int) -> Int / {native.read}
+extern fn net_recv(label: String, connection: Int, max: Int, timeout_ms: Int) -> Int / {native.read}
 
-extern fn net_send(label: String, conn: Int, payload: Bytes, timeout_ms: Int) -> Int / {native.read}
+extern fn net_send(
+  label: String,
+  connection: Int,
+  payload: Bytes,
+  timeout_ms: Int,
+) -> Int / {native.read}
 
 extern fn net_send_secret(
   label: String,
-  conn: Int,
+  connection: Int,
   framed: Secret<Bytes>,
   timeout_ms: Int,
 ) -> Int / {native.read}
 
-extern fn net_close_write(label: String, conn: Int) -> Unit / {native.read}
+extern fn net_close_write(label: String, connection: Int) -> Unit / {native.read}
 
-extern fn net_close(label: String, socket: Int) -> Unit / {native.read}
+extern fn net_close(label: String, connection: Int) -> Unit / {native.read}
 
-extern fn net_set_option(label: String, socket: Int, option: Bytes) -> Bytes / {native.read}
+extern fn net_set_option(label: String, connection: Int, option: Bytes) -> Bytes / {native.read}
 
-extern fn net_local_port(label: String, socket: Int) -> Int / {native.read}
+extern fn net_local_port(label: String, connection: Int) -> Int / {native.read}
 
-extern fn net_local_address(label: String, socket: Int) -> Bytes / {native.read}
+extern fn net_local_address(label: String, connection: Int) -> Bytes / {native.read}
 
-extern fn net_peer_address(label: String, conn: Int) -> Bytes / {native.read}
+extern fn net_peer_address(label: String, connection: Int) -> Bytes / {native.read}
 
-extern fn net_peer_credentials(label: String, conn: Int) -> Bytes / {native.read}
+extern fn net_peer_credentials(label: String, connection: Int) -> Bytes / {native.read}
 
-extern fn net_peer_certificate(label: String, conn: Int) -> Bytes / {native.read}
+extern fn net_peer_certificate(label: String, connection: Int) -> Bytes / {native.read}
 
-extern fn net_protocol(label: String, conn: Int) -> Bytes / {native.read}
+extern fn net_protocol(label: String, connection: Int) -> Bytes / {native.read}
 
-extern fn net_options(label: String, socket: Int) -> Bytes / {native.read}
+extern fn net_options(label: String, connection: Int) -> Bytes / {native.read}
 
 fn int_found(encoded: Bytes) -> Option<Int> / {abort.raise} =
   match found(encoded) { Some(flat) -> Some(decode_int(flat)), None -> None }
@@ -1857,8 +1916,8 @@ pub fn decode_address(flat: Bytes) -> SocketAddress / {abort.raise} =
 /// Encodes `asked` for the host's socket natives. The first byte is the option's number from
 /// `setting`. The rest is its value: a flag is one byte, a size is eight bytes, and an option that
 /// may be unset is byte 0 for unset, or byte 1 followed by its value.
-pub fn encode_option(asked: SocketOption) -> Bytes / {abort.raise} = {
-  let option = option_checked(asked);
+pub fn encode_option(requested_option: SocketOption) -> Bytes / {abort.raise} = {
+  let option = option_checked(requested_option);
   byte_of_int(setting(option)).concat(match option {
     NoDelay(on) -> encode_flag(on),
     KeepAlive(None) -> b"\x00",
@@ -2230,7 +2289,7 @@ test "`net.start_tls` secures the connection when the peer upgrades, and later d
   let ran = on_mem(relayed(script), || {
     let c = to_relay();
     let go_ahead = net.recv[relay](c, 512, 1000);
-    let held = net.recv[relay](c, 512, 1000);
+    let read_before_upgrade = net.recv[relay](c, 512, 1000);
     let before = net.handshake[relay](c);
     let secured = net.start_tls[relay](c, "mail.example", [], b"", 1000);
     let after = net.handshake[relay](c);
@@ -2238,7 +2297,7 @@ test "`net.start_tls` secures the connection when the peer upgrades, and later d
     {
       c: c,
       go_ahead: go_ahead,
-      held: held,
+      held: read_before_upgrade,
       before: before,
       secured: secured,
       after: after,
@@ -2323,10 +2382,10 @@ test "`net.start_tls` against a peer that {c.outcome} returns {c.shown}" for c: 
     { outcome: "is gone", script: [], alpn: [], shown: "Reset", result: Err(Reset) },
   ] {
   let ran = on_mem(relayed(c.script), || {
-    let conn = to_relay();
+    let connection = to_relay();
     {
-      result: net.start_tls[relay](conn, "db.example", c.alpn, b"", 1000),
-      after: net.send[relay](conn, b"x", 1000),
+      result: net.start_tls[relay](connection, "db.example", c.alpn, b"", 1000),
+      after: net.send[relay](connection, b"x", 1000),
     }
   });
   assert_eq(ran.value.result, c.result);
@@ -2363,7 +2422,7 @@ test "`net.accept` returns each waiting client with its own address, then report
     let first = net.accept[listener](l);
     let second = net.accept[listener](l);
     let third = net.accept[listener](l);
-    let heard = net.recv[conn](first, 64, 1000);
+    let received = net.recv[conn](first, 64, 1000);
     let encoded = net.send[conn](first, b"yo", 1000);
     {
       first: first,
@@ -2375,7 +2434,7 @@ test "`net.accept` returns each waiting client with its own address, then report
         net.peer_address[conn](second),
         net.peer_address[listener](l),
       ],
-      output_lines: heard,
+      output_lines: received,
       said: encoded,
       ended: net.recv[conn](first, 64, 1000),
     }
@@ -2395,7 +2454,7 @@ test "`net.accept` returns each waiting client with its own address, then report
 }
 
 test "`net.serve_tls` upgrades a client that sent STARTTLS using the named server credential, and fails if the caller's unread buffer holds bytes the client sent before the upgrade" {
-  let asking = [
+  let client_script = [
     Sends(b"STARTTLS\r\n"),
     Expects(b"220 go ahead\r\n"),
     Upgrades,
@@ -2412,15 +2471,15 @@ test "`net.serve_tls` upgrades a client that sent STARTTLS using the named serve
       { c: c, secured: secured, next: net.recv[conn](c, 512, 1000) }
     })
   };
-  let ran = host_handler(asking, b"");
+  let ran = host_handler(client_script, b"");
   assert_eq(ran.value.secured, Ok({ protocol: None }));
   assert_eq(ran.value.next, Some(b"EHLO x\r\n"));
   assert_eq(mem_secured(ran.net, ran.value.c), Some("mail"));
-  let injected = host_handler(asking, b"MAIL FROM:<mallory@example>\r\n");
+  let injected = host_handler(client_script, b"MAIL FROM:<mallory@example>\r\n");
   assert_eq(injected.value.secured, Err(Injected));
   assert_eq(injected.value.next, Some(b""));
   let unheld: Result<Result<UpgradeResult, Error>, String> = try[abort.raise] {
-    on_mem(mem_calling(mem_empty(), client, asking), || {
+    on_mem(mem_calling(mem_empty(), client, client_script), || {
       let c = net.accept[listener](net.listen[listener](2525));
       net.serve_tls[conn](c, "mail", [], b"", 1000)
     }).value
@@ -2435,8 +2494,8 @@ test "a connection to the program's own listener passes bytes and end-of-stream 
     let client = dial_address[client](here, [], 1000);
     let server = net.accept[listener](l);
     let quiet = net.recv[conn](server, 64, 1000);
-    let asked = net.send[client](client, b"ping", 1000);
-    let heard = net.recv[conn](server, 64, 1000);
+    let ping_sent = net.send[client](client, b"ping", 1000);
+    let received = net.recv[conn](server, 64, 1000);
     let returned = net.send[conn](server, b"pong", 1000);
     net.close_write[client](client);
     let after_end = net.send[client](client, b"more", 1000);
@@ -2445,8 +2504,8 @@ test "a connection to the program's own listener passes bytes and end-of-stream 
     net.close[client](client);
     {
       quiet: quiet,
-      asked: asked,
-      output_lines: heard,
+      asked: ping_sent,
+      output_lines: received,
       returned: returned,
       after_end: after_end,
       ended: ended,
@@ -2549,9 +2608,9 @@ test "`dial` uses one deadline for all of a name's addresses, and an unresponsiv
           pending(at(3), || dial[db]("db.example", 5432, [], 1000))
         };
         assert_eq((none, since()), (Err(TimedOut), 1300));
-        let held = task::timeout(millis(300), ||
+        let timed_dial = task::timeout(millis(300), ||
           pending(at(1), || dial[db]("db.example", 5432, [], 900)));
-        assert_eq((held, since()), (task::Done(7), 1400))
+        assert_eq((timed_dial, since()), (task::Done(7), 1400))
       }))
   }
 }
@@ -2788,38 +2847,52 @@ test "the simulated network rejects {c.what} with the same error message as the 
   ] {
   let failed: Result<Unit, String> = try[abort.raise] {
     on_mem(relayed([Upgrades]), || {
-      let conn = to_relay();
-      if c.misuse == "label" { net.close[other](conn) } else if c.misuse == "closed" {
-        net.close[relay](conn);
-        net.close[relay](conn)
+      let connection = to_relay();
+      if c.misuse == "label" { net.close[other](connection) } else if c.misuse == "closed" {
+        net.close[relay](connection);
+        net.close[relay](connection)
       } else if c.misuse == "deadline" {
-        let _read = net.recv[relay](conn, 16, 0);
+        let _read = net.recv[relay](connection, 16, 0);
         ()
       } else if c.misuse == "nothing" {
-        let _sent = net.send[relay](conn, b"", 1000);
+        let _sent = net.send[relay](connection, b"", 1000);
         ()
       } else if c.misuse == "no secret" {
-        let _sent = net.send_secret[relay](conn, b"", Secret::of_bytes(b""), "raw", b"", 1000);
+        let _sent = net.send_secret[relay](
+          connection,
+          b"",
+          Secret::of_bytes(b""),
+          "raw",
+          b"",
+          1000,
+        );
         ()
       } else if c.misuse == "encoding" {
-        let _sent = net.send_secret[relay](conn, b"", Secret::of_bytes(b"k"), "rot13", b"", 1000);
+        let _sent = net.send_secret[relay](
+          connection,
+          b"",
+          Secret::of_bytes(b"k"),
+          "rot13",
+          b"",
+          1000,
+        );
         ()
       } else if c.misuse == "none" {
-        let _read = net.recv[relay](conn, 0, 1000);
+        let _read = net.recv[relay](connection, 0, 1000);
         ()
       } else if c.misuse == "listener" {
         let _read = net.recv[listener](net.listen[listener](8080), 16, 1000);
         ()
       } else if c.misuse == "accept" {
-        let _taken = net.accept[relay](conn);
+        let _taken = net.accept[relay](connection);
         ()
       } else if c.misuse == "bound" {
         let _first = net.listen[listener](8080);
         let _second = net.listen[listener](8080);
         ()
       } else {
-        let _once = net.start_tls[relay](conn, "mail.example", [], b"", 1000);
-        let _twice = net.start_tls[relay](conn, "mail.example", [], b"", 1000);
+        let _once = net.start_tls[relay](connection, "mail.example", [], b"", 1000);
+        let _twice = net.start_tls[relay](connection, "mail.example", [], b"", 1000);
         ()
       }
     }).value

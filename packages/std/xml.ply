@@ -638,21 +638,21 @@ type Run = { bytes: Bytes, next: Int }
 
 fn text_run(c: Cursor, i: Int, pieces: List<Bytes>, left: Int) -> Run / {xml.fail, abort.raise} = {
   let stop = c.data.skip_until(i, b"<&]\r");
-  let held = if stop > i { pieces.push(piece(c, i, stop)) } else { pieces };
+  let extended_pieces = if stop > i { pieces.push(piece(c, i, stop)) } else { pieces };
   if left <= 0 { panic("more pieces of text than bytes") } else {
     match c.data.peek(stop) {
       b'&' -> {
         let name_out = reference(c, stop);
-        text_run(c, name_out.next, held.push(name_out.bytes), left - 1)
+        text_run(c, name_out.next, extended_pieces.push(name_out.bytes), left - 1)
       },
-      b']' -> square_brackets(c, stop, held, left),
+      b']' -> square_brackets(c, stop, extended_pieces, left),
       b'\r' -> {
         let next = if c.data.peek(stop + 1) == b'\n' { stop + 2 } else { stop + 1 };
-        text_run(c, next, held.push(b"\n"), left - 1)
+        text_run(c, next, extended_pieces.push(b"\n"), left - 1)
       },
-      b'<' -> if c.data.starts_at(stop, b"<![CDATA[") { section(c, stop, held, left) }
-      else { { bytes: joined(held), next: stop } },
-      _ -> { bytes: joined(held), next: stop },
+      b'<' -> if c.data.starts_at(stop, b"<![CDATA[") { section(c, stop, extended_pieces, left) }
+      else { { bytes: joined(extended_pieces), next: stop } },
+      _ -> { bytes: joined(extended_pieces), next: stop },
     }
   }
 }
@@ -660,20 +660,20 @@ fn text_run(c: Cursor, i: Int, pieces: List<Bytes>, left: Int) -> Run / {xml.fai
 fn square_brackets(
   c: Cursor,
   i: Int,
-  held: List<Bytes>,
+  pieces: List<Bytes>,
   left: Int,
 ) -> Run / {xml.fail, abort.raise} = {
   let end = c.data.skip(i, b"]");
   if end - i >= 2 && c.data.peek(end) == b'>' { fail(c, end - 2, CDataEnd) }
   else if left <= 0 { panic("more pieces of text than bytes") }
-  else { text_run(c, end, held.push(piece(c, i, end)), left - 1) }
+  else { text_run(c, end, pieces.push(piece(c, i, end)), left - 1) }
 }
 
-fn section(c: Cursor, i: Int, held: List<Bytes>, left: Int) -> Run / {xml.fail, abort.raise} =
+fn section(c: Cursor, i: Int, pieces: List<Bytes>, left: Int) -> Run / {xml.fail, abort.raise} =
   match c.data.index_of_from(b"]]>", i + 9) {
     None -> fail(c, i, Truncated),
     Some(end) -> if left <= 0 { panic("more pieces of text than bytes") }
-    else { text_run(c, end + 3, held.push(line_ends(piece(c, i + 9, end))), left - 1) },
+    else { text_run(c, end + 3, pieces.push(line_ends(piece(c, i + 9, end))), left - 1) },
   }
 
 fn reference(c: Cursor, i: Int) -> Run / {xml.fail, abort.raise} =
@@ -779,17 +779,17 @@ fn value(
   left: Int,
 ) -> Run / {xml.fail, abort.raise} = {
   let stop = c.data.skip_until(i, if quote == b'"' { b"\"<&\t\n\r" } else { b"'<&\t\n\r" });
-  let held = if stop > i { pieces.push(piece(c, i, stop)) } else { pieces };
+  let extended_pieces = if stop > i { pieces.push(piece(c, i, stop)) } else { pieces };
   let b = c.data.peek(stop);
-  if b == quote { { bytes: joined(held), next: stop + 1 } }
+  if b == quote { { bytes: joined(extended_pieces), next: stop + 1 } }
   else if b < 0 { fail(c, stop, Truncated) }
   else if b == b'<' { fail(c, stop, LessThanInValue) }
   else if left <= 0 { panic("more pieces of a value than bytes") } else if b == b'&' {
     let name_out = reference(c, stop);
-    value(c, name_out.next, quote, held.push(name_out.bytes), left - 1)
+    value(c, name_out.next, quote, extended_pieces.push(name_out.bytes), left - 1)
   } else {
     let paired = b == b'\r' && c.data.peek(stop + 1) == b'\n';
-    value(c, if paired { stop + 2 } else { stop + 1 }, quote, held.push(b" "), left - 1)
+    value(c, if paired { stop + 2 } else { stop + 1 }, quote, extended_pieces.push(b" "), left - 1)
   }
 }
 
@@ -912,11 +912,18 @@ fn resolve(
       let q = qname(c, raw.at, raw.name);
       let namespace = if q.prefix == "" { "" } else { bound_to(c, raw.at, q.prefix, scope) };
       let name_out: Name = { namespace: namespace, local: q.local, prefix: Spelling(q.prefix) };
-      let held = r.attributes.push({ name: name_out, value: raw.value });
-      if namespace == "" { { ..r, attributes: held, plain: r.plain.insert(raw.name, name_out) } }
-      else if r.expanded.contains((namespace, q.local)) {
+      let extended_attributes = r.attributes.push({ name: name_out, value: raw.value });
+      if namespace == "" {
+        { ..r, attributes: extended_attributes, plain: r.plain.insert(raw.name, name_out) }
+      } else if r.expanded.contains((namespace, q.local)) {
         fail(c, raw.at, DuplicateAttribute(String::of_bytes(raw.name)))
-      } else { { ..r, attributes: held, expanded: r.expanded.insert((namespace, q.local), ()) } }
+      } else {
+        {
+          ..r,
+          attributes: extended_attributes,
+          expanded: r.expanded.insert((namespace, q.local), ()),
+        }
+      }
     },
   }
 
@@ -1067,9 +1074,11 @@ fn declared_standalone(
 ) -> Option<Bool> / {xml.fail, abort.raise} =
   match p {
     None -> None,
-    Some(said) -> if said.name == b"standalone" && said.value == b"yes" { Some(true) }
-    else if said.name == b"standalone" && said.value == b"no" { Some(false) }
-    else { fail(c, said.at, BadDeclaration) },
+    Some(pseudo_attribute) -> if pseudo_attribute.name == b"standalone"
+        && pseudo_attribute.value == b"yes" { Some(true) }
+    else if pseudo_attribute.name == b"standalone" && pseudo_attribute.value == b"no" {
+      Some(false)
+    } else { fail(c, pseudo_attribute.at, BadDeclaration) },
   }
 
 type Frame = { start: Start, children: List<Node> }
@@ -1248,7 +1257,7 @@ pub fn write(d: Document, layout: Layout) -> Bytes / {xml.unwritable, abort.rais
   };
   let line = if look.flat { b"" } else { b"\n" };
   let head = match spelling_value(d.declaration) {
-    Some(said) -> [declaration_out(said), line],
+    Some(declaration_spelling) -> [declaration_out(declaration_spelling), line],
     None -> [],
   };
   let before = d.before.fold(head, |out: List<Bytes>, m: Miscellaneous|
@@ -1541,8 +1550,8 @@ fn within(e: Element, name: Name, found: List<Element>) -> List<Element> =
 /// All the text inside `e`, at any depth, in document order, with nothing between the pieces.
 pub fn text(e: Element) -> String = String::of_bytes_lossy(Bytes::concat_all(append_text(e, [])))
 
-fn append_text(e: Element, said: List<Bytes>) -> List<Bytes> =
-  e.children.fold(said, |accumulator: List<Bytes>, n: Node|
+fn append_text(e: Element, pieces: List<Bytes>) -> List<Bytes> =
+  e.children.fold(pieces, |accumulator: List<Bytes>, n: Node|
     match n {
       Element(child) -> append_text(child, accumulator),
       Text(t) -> accumulator.push(Bytes::of_string(t)),
@@ -1589,11 +1598,11 @@ pub fn without_indentation(e: Element) -> Element = {
   let laid_out = e.children.fold(true, |all: Bool, n: Node| all && blank(n));
   {
     ..e,
-    children: e.children.fold([], |kept: List<Node>, n: Node|
+    children: e.children.fold([], |nodes: List<Node>, n: Node|
       match n {
-        Element(child) -> kept.push(Element(without_indentation(child))),
-        Text(_) -> if laid_out { kept } else { kept.push(n) },
-        Miscellaneous(_) -> kept.push(n),
+        Element(child) -> nodes.push(Element(without_indentation(child))),
+        Text(_) -> if laid_out { nodes } else { nodes.push(n) },
+        Miscellaneous(_) -> nodes.push(n),
       }),
   }
 }
@@ -1914,13 +1923,13 @@ fn sprouted(nodes: List<Node>, n: Int) -> List<Node> = {
         Miscellaneous(Instruction("p" ++ Int::to_string(k % 3), ["", "a", "b c"].at_or(k % 3, ""))),
       ),
     _ -> {
-      let kept = nodes.len() - min(k % 4, nodes.len());
-      nodes.take(kept).push(
+      let wrap_start = nodes.len() - min(k % 4, nodes.len());
+      nodes.take(wrap_start).push(
         Element(
           element(
             names().at_or(k / 4 % 8, name("a")),
             attribute_sets().at_or(k / 32 % 5, []),
-            nodes.drop(kept),
+            nodes.drop(wrap_start),
           ),
         ),
       )
@@ -2612,8 +2621,8 @@ test "a cursor stops, skips an element, or builds a subtree exactly where the ca
     match next(skip_element) {
       Some(step) -> match step.event {
         StartElement(open_element) -> {
-          let kept = subtree(open_element, step.rest);
-          { element: kept.element, at: kept.rest.at }
+          let subtree_result = subtree(open_element, step.rest);
+          { element: subtree_result.element, at: subtree_result.rest.at }
         },
         _ -> { element: plain("none", []), at: 0 },
       },

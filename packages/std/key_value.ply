@@ -274,8 +274,8 @@ fn record(kind: Int, key: Bytes, version: Bytes, value: Bytes) -> Bytes / {abort
     value,
   ])
 
-fn op_bytes(op: Op) -> Bytes / {abort.raise} =
-  match op {
+fn op_bytes(operation: Op) -> Bytes / {abort.raise} =
+  match operation {
     Put(key, value) -> record(1, key, b"", value),
     Delete(key) -> record(2, key, b"", b""),
   }
@@ -339,21 +339,21 @@ fn apply_frame(
   }
 }
 
-fn is_whole_frame(held: Bytes, p: Int, at: Int, limits: Limits) -> Bool / {abort.raise} = {
-  let size = held.len();
-  if p + head_size() > size || held.slice(p, p + 4) != frame_magic() { false } else {
-    let length = read_u32(held, p + 4);
+fn is_whole_frame(segment_bytes: Bytes, p: Int, at: Int, limits: Limits) -> Bool / {abort.raise} = {
+  let size = segment_bytes.len();
+  if p + head_size() > size || segment_bytes.slice(p, p + 4) != frame_magic() { false } else {
+    let length = read_u32(segment_bytes, p + 4);
     let ends = p + head_size() + length;
     length <= longest_body(limits) && ends <= size
       && checksum(
         Bytes::concat_all([
           u64_le(at),
-          held.slice(p + 4, p + 8),
-          held.slice(p + 16, p + 24),
-          held.slice(p + 24, ends),
+          segment_bytes.slice(p + 4, p + 8),
+          segment_bytes.slice(p + 16, p + 24),
+          segment_bytes.slice(p + 24, ends),
         ]),
       )
-      == held.slice(p + 8, p + 16)
+      == segment_bytes.slice(p + 8, p + 16)
   }
 }
 
@@ -479,7 +479,7 @@ fn hint_bytes(
 ) -> Bytes / {abort.raise} = {
   let entries = touched.fold([], |out: List<Bytes>, key: Bytes, put: Bool|
     out.push(hint_entry(key, if put { index.get(key) } else { None })));
-  let said = Bytes::concat_all([
+  let body = Bytes::concat_all([
     hint_magic(),
     u32_le(format_version()),
     u32_le(0),
@@ -490,7 +490,7 @@ fn hint_bytes(
     u64_le(weight),
     Bytes::concat_all(entries),
   ]);
-  said.concat(checksum(said))
+  body.concat(checksum(body))
 }
 
 fn apply_hint(
@@ -551,10 +551,10 @@ fn take_lock<[l]>(
   dir: String,
   tries: Int,
 ) -> String / {fs.lock[l], fs.unlock[l], fs.write_file[l], key_value.fail, entropy.next, abort.raise} = {
-  let asks = max(tries, 1);
-  let taken = iterate(1, asks + 1, |n: Int|
+  let attempts = max(tries, 1);
+  let taken = iterate(1, attempts + 1, |n: Int|
     if fs.lock[l](lock_path(dir)) { Stop(true) }
-    else if n >= asks { Stop(false) }
+    else if n >= attempts { Stop(false) }
     else { Continue(n + 1) });
   let token = token_hex(16);
   if !taken { fail(Locked) }
@@ -958,10 +958,10 @@ pub fn stats(s: Store) -> Stats =
     sequence: s.sequence,
   }
 
-fn batch_weight(limits: Limits, ops: List<Op>) -> Int / {key_value.fail} =
-  ops.fold(0, |bytes: Int, op: Op| {
-    let key = match op { Put(k, _) -> k, Delete(k) -> k };
-    let value = match op { Put(_, v) -> v.len(), Delete(_) -> 0 };
+fn batch_weight(limits: Limits, operations: List<Op>) -> Int / {key_value.fail} =
+  operations.fold(0, |bytes: Int, operation: Op| {
+    let key = match operation { Put(k, _) -> k, Delete(k) -> k };
+    let value = match operation { Put(_, v) -> v.len(), Delete(_) -> 0 };
     if key.len() < 1 || key.len() > limits.key { fail(Unfit(Key)) }
     else if value > limits.value { fail(Unfit(Value)) }
     else { bytes + key.len() + value }
@@ -998,7 +998,7 @@ fn rotate_segment<[l]>(
     }
   }
 
-/// Commits `ops` as one batch. Once it returns, all of them are in the store, in order, so a key
+/// Commits `operations` as one batch. Once it returns, all of them are in the store, in order, so a key
 /// the batch names twice has the value of its last op. If it raises before the frame is appended,
 /// none of them are. The batch takes the next sequence number, which becomes the version of each
 /// key it puts. An empty batch commits nothing. `Durable` syncs the log before returning; `Fast`
@@ -1012,13 +1012,13 @@ fn rotate_segment<[l]>(
 /// `Stale` otherwise. Open the store again to read what the log contains.
 pub fn batch<[l]>(
   s: Store,
-  ops: List<Op>,
+  operations: List<Op>,
   durability: Durability,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
-  if ops.len() == 0 { s }
-  else if batch_weight(s.limits, ops) > s.limits.batch { fail(Unfit(Batch)) } else {
+  if operations.len() == 0 { s }
+  else if batch_weight(s.limits, operations) > s.limits.batch { fail(Unfit(Batch)) } else {
     let at = if segment_full(s) { header_size() } else { s.end };
-    let body = body_of(s.sequence + 1, ops.map(op_bytes));
+    let body = body_of(s.sequence + 1, operations.map(op_bytes));
     let bytes = frame(at, if segment_full(s) { header_size() } else { s.synced_bodies }, body);
     let end = at + bytes.len();
     renew_lock[l](
@@ -1052,16 +1052,16 @@ pub fn batch<[l]>(
           end: end,
           synced_bodies: if durability == Durable { end } else { r.synced_bodies },
           total: r.total + state.weight,
-          live: r.live + live_weight(state.index, ops) - live_weight(r.index, ops),
+          live: r.live + live_weight(state.index, operations) - live_weight(r.index, operations),
           weight: r.weight + state.weight,
         })
       },
     }
   }
 
-fn live_weight(index: Map<Bytes, Slot>, ops: List<Op>) -> Int =
-  ops.fold(Map::new(), |seen: Map<Bytes, Unit>, op: Op|
-    seen.insert(match op { Put(k, _) -> k, Delete(k) -> k }, ())).fold(
+fn live_weight(index: Map<Bytes, Slot>, operations: List<Op>) -> Int =
+  operations.fold(Map::new(), |seen: Map<Bytes, Unit>, operation: Op|
+    seen.insert(match operation { Put(k, _) -> k, Delete(k) -> k }, ())).fold(
     0,
     |bytes: Int, key: Bytes, _: Unit|
       match index.get(key) { Some(slot) -> bytes + record_size(key, slot.len), None -> bytes },
@@ -1170,10 +1170,10 @@ fn rewrite_as_base<[l]>(
   let here = log_position(s);
   let wrote: Result<CompactionState, (String, fs::FileError)> = try[files.fail] {
     io::replacing[l](path, Durable, None, |sink: Sink<| {fs.write_chunk[l]}>| {
-      let said = |bytes: Bytes|
+      let write_bytes = |bytes: Bytes|
         if (sink.push)(bytes) { () }
         else { fail(Failed(path, fs::operation_failed("write_chunk"))) };
-      said(header_bytes(number, true, s.sequence, s.shape));
+      write_bytes(header_bytes(number, true, s.sequence, s.shape));
       let copied = s.index.fold(
         {
           waiting: [],
@@ -1210,7 +1210,7 @@ fn rewrite_as_base<[l]>(
       );
       let done = flush_frame[l](copied, number, path, sink);
       let last = frame(done.at, header_size(), body_of(0, []));
-      said(last);
+      write_bytes(last);
       renew_lock[l](s.dir, s.token, here, log_position_of(number + 1, header_size()));
       { ..done, at: done.at + last.len() }
     })
@@ -1347,7 +1347,7 @@ fn opened<a>(
     with_rand(rand(seed), || {
       let ran: Result<a, Error> = try[key_value.fail] {
         with_scope[store](open[d]("db", limits, policy, shape, 1), |s: Store|
-          close[d](s)) { held -> go(held.get()) }
+          close[d](s)) { store_scope -> go(store_scope.get()) }
       };
       ran
     }).value)
@@ -1374,14 +1374,15 @@ type Shown = { pairs: List<Pair>, sequence: Int }
 fn shown<[l]>(s: Store) -> Shown / {fs.read_at[l], key_value.fail, abort.raise} =
   { pairs: listed(scan[l](snapshot(s), None, None)), sequence: stats(s).sequence }
 
-fn stepped(m: Shown, ops: List<Op>) -> Shown =
-  if ops.len() == 0 { m } else {
+fn stepped(m: Shown, operations: List<Op>) -> Shown =
+  if operations.len() == 0 { m } else {
     let version = m.sequence + 1;
-    let before = m.pairs.fold(Map::new(), |held: Map<Bytes, Pair>, p: Pair| held.insert(p.key, p));
-    let after = ops.fold(before, |held: Map<Bytes, Pair>, op: Op|
-      match op {
-        Put(key, value) -> held.insert(key, { key: key, value: value, version: version }),
-        Delete(key) -> held.remove(key),
+    let before = m.pairs.fold(Map::new(), |pairs_by_key: Map<Bytes, Pair>, p: Pair|
+      pairs_by_key.insert(p.key, p));
+    let after = operations.fold(before, |pairs_by_key: Map<Bytes, Pair>, operation: Op|
+      match operation {
+        Put(key, value) -> pairs_by_key.insert(key, { key: key, value: value, version: version }),
+        Delete(key) -> pairs_by_key.remove(key),
       });
     { pairs: after.values(), sequence: version }
   }
@@ -1428,14 +1429,14 @@ test "a reopened store has what was committed, each key under its version, and n
     let s1 = batch[d](s0, [Put(b"a", b"1"), Put(b"b", b"2")], Fast);
     shown[d](delete[d](put[d](s1, b"c", b"3", Durable), b"a", Fast))
   });
-  let held = {
+  let expected = {
     pairs: [{ key: b"b", value: b"2", version: 1 }, { key: b"c", value: b"3", version: 2 }],
     sequence: 3,
   };
-  assert_eq(first.value, Ok(held));
+  assert_eq(first.value, Ok(expected));
   let second = session(first.tree, 2, small(), |s: Store|
     (shown[d](s), version(put[d](s, b"d", b"4", Fast), b"d")));
-  assert_eq(second.value, Ok((held, Some(4))))
+  assert_eq(second.value, Ok((expected, Some(4))))
 }
 
 fn expected_frame(at: Int, mark: Int, body: Bytes) -> Bytes / {abort.raise} = {
@@ -1491,7 +1492,7 @@ test "a store's files follow the format its module documents" {
     expected_frame(64, 64, kept_body),
     expected_frame(119, 64, u64_le(0).concat(u32_le(0))),
   ]);
-  let said = Bytes::concat_all([
+  let hint = Bytes::concat_all([
     b"PLYKVHNT",
     u32_le(1),
     u32_le(0),
@@ -1514,14 +1515,14 @@ test "a store's files follow the format its module documents" {
   );
   assert_eq(mem_read(over.tree, "db/00000001.log"), Some(log));
   assert_eq(mem_read(over.tree, "db/00000002.log"), Some(base));
-  assert_eq(mem_read(over.tree, "db/00000002.hint"), Some(said.concat(said.blake3().slice(0, 8))));
+  assert_eq(mem_read(over.tree, "db/00000002.hint"), Some(hint.concat(hint.blake3().slice(0, 8))));
   assert_eq(mem_read(over.tree, "db/00000003.log"), Some(header(0, 3, 1)))
 }
 
 test "a key, a value or a batch past a store's limits is rejected, and nothing is written for it" {
-  let tried = |ops: List<Op>|
+  let tried = |operations: List<Op>|
     session(mem_empty(), 1, small(), |s: Store| {
-      batch[d](s, ops, Fast);
+      batch[d](s, operations, Fast);
       fs.file_size[d]("db/00000001.log")
     }).value;
   assert_eq(tried([Put(b"", b"v")]), Err(Unfit(Key)));
@@ -1678,17 +1679,17 @@ test "opening a store reads the hint file (a summary of a completed log segment)
     fs::listed_names(mem_list(state.tree, "db")),
     Some(["00000001.hint", "00000001.log", "00000002.hint", "00000002.log", "00000003.log"]),
   );
-  let held = |tree: MemFs| session(tree, 2, small(), |s: Store| (shown[d](s), stats(s)));
-  let whole = held(state.tree);
+  let reopened = |tree: MemFs| session(tree, 2, small(), |s: Store| (shown[d](s), stats(s)));
+  let whole = reopened(state.tree);
   assert_eq(whole.value, match state.value {
     Ok(all) -> Ok((all, { entries: 6, total: 234, live: 234, segments: 3, sequence: 6 })),
     Err(rejection) -> Err(rejection),
   });
-  assert_eq(held(flip_byte(state.tree, "db/00000001.log", 70)).value, whole.value);
-  let unhinted = held(mem_remove(state.tree, hint).fs);
+  assert_eq(reopened(flip_byte(state.tree, "db/00000001.log", 70)).value, whole.value);
+  let unhinted = reopened(mem_remove(state.tree, hint).fs);
   assert_eq(unhinted.value, whole.value);
   assert_eq(mem_read(unhinted.tree, hint), mem_read(state.tree, hint));
-  let misled = held(flip_byte(state.tree, hint, 60));
+  let misled = reopened(flip_byte(state.tree, hint, 60));
   assert_eq(misled.value, whole.value);
   assert_eq(mem_read(misled.tree, hint), mem_read(state.tree, hint));
   let rotten = flip_byte(state.tree, "db/00000001.log", 115);
@@ -1697,7 +1698,7 @@ test "opening a store reads the hint file (a summary of a completed log segment)
     (lost, get[d](s, b"k2"))
   });
   assert_eq(read.value, Ok((Err(Corrupt("00000001.log", 111)), Some(b"2".repeat(20)))));
-  assert_eq(held(mem_remove(rotten, hint).fs).value, Err(Corrupt("00000001.log", 64)))
+  assert_eq(reopened(mem_remove(rotten, hint).fs).value, Err(Corrupt("00000001.log", 64)))
 }
 
 test "a compaction merges every value and its version into one set of files, and the files it replaced remain until `discard` is called" {
@@ -1717,12 +1718,12 @@ test "a compaction merges every value and its version into one set of files, and
       next: version(put[d](cleared, b"new", b"n", Durable), b"new"),
     }
   });
-  let held = { pairs: [{ key: b"even", value: b"4".repeat(20), version: 5 }], sequence: 7 };
+  let expected = { pairs: [{ key: b"even", value: b"4".repeat(20), version: 5 }], sequence: 7 };
   assert_eq(
     over.value,
     Ok({
-      before: (held, { entries: 1, total: 263, live: 41, segments: 4, sequence: 7 }),
-      packed: (held, { entries: 1, total: 41, live: 41, segments: 2, sequence: 7 }),
+      before: (expected, { entries: 1, total: 263, live: 41, segments: 4, sequence: 7 }),
+      packed: (expected, { entries: 1, total: 41, live: 41, segments: 2, sequence: 7 }),
       kept: Some([
         "00000001.hint",
         "00000001.log",
@@ -1744,7 +1745,7 @@ test "a compaction merges every value and its version into one set of files, and
   assert_eq(
     again.value,
     Ok((
-      stepped(held, [Put(b"new", b"n")]),
+      stepped(expected, [Put(b"new", b"n")]),
       { entries: 2, total: 62, live: 62, segments: 2, sequence: 8 },
     )),
   )
@@ -1788,8 +1789,8 @@ test "a log that ends partway through a batch opens with the complete batches be
   let state = session(mem_empty(), 1, large_limits(), |s0: Store|
     batches.fold(
       { store: s0, ends: [] },
-      |at: { store: Store, ends: List<Int> }, ops: List<Op>| {
-        let next = batch[d](at.store, ops, Fast);
+      |at: { store: Store, ends: List<Int> }, operations: List<Op>| {
+        let next = batch[d](at.store, operations, Fast);
         { store: next, ends: at.ends.push(fs.file_size[d](log).expect("the log")) }
       },
     ).ends);
@@ -1797,16 +1798,16 @@ test "a log that ends partway through a batch opens with the complete batches be
   assert_eq(ends, [115, 177, 228]);
   range(64, 229).fold((), |_: Unit, keep: Int| {
     let whole = ends.filter(|end: Int| end <= keep).len();
-    let held = batches.take(whole).fold({ pairs: [], sequence: 0 }, stepped);
+    let expected = batches.take(whole).fold({ pairs: [], sequence: 0 }, stepped);
     let again = session(shortened(state.tree, log, keep), 2, large_limits(), |s: Store| {
       let found = (shown[d](s), fs.file_size[d](log));
       put[d](s, b"z", b"after", Durable);
       found
     });
     let truncate = match ends.at(whole - 1) { Some(end) -> end, None -> 64 };
-    assert_eq(again.value, Ok((held, Some(truncate))));
+    assert_eq(again.value, Ok((expected, Some(truncate))));
     let after = session(again.tree, 3, large_limits(), |s: Store| shown[d](s));
-    assert_eq(after.value, Ok(stepped(held, [Put(b"z", b"after")])))
+    assert_eq(after.value, Ok(stepped(expected, [Put(b"z", b"after")])))
   })
 }
 
@@ -1818,16 +1819,16 @@ test "corruption in log data already synced to disk is reported as an error, and
       put[d](put[d](s1, b"b", b"second", second), b"c", b"third", Fast);
       ()
     }).tree;
-  let held = |tree: MemFs|
+  let listed_keys = |tree: MemFs|
     session(tree, 2, large_limits(), |s: Store| listed(keys(snapshot(s), None, None))).value;
   let early = state(Durable, Fast);
-  assert_eq(held(flip_byte(early, log, 100)), Err(Corrupt("00000001.log", 64)));
-  assert_eq(held(flip_byte(early, log, 150)), Ok([b"a"]));
-  assert_eq(held(flip_byte(early, log, 200)), Ok([b"a", b"b"]));
+  assert_eq(listed_keys(flip_byte(early, log, 100)), Err(Corrupt("00000001.log", 64)));
+  assert_eq(listed_keys(flip_byte(early, log, 150)), Ok([b"a"]));
+  assert_eq(listed_keys(flip_byte(early, log, 200)), Ok([b"a", b"b"]));
   let late = state(Fast, Durable);
-  assert_eq(held(flip_byte(late, log, 100)), Err(Corrupt("00000001.log", 64)));
-  assert_eq(held(flip_byte(late, log, 150)), Err(Corrupt("00000001.log", 115)));
-  assert_eq(held(flip_byte(late, log, 200)), Ok([b"a", b"b"]));
+  assert_eq(listed_keys(flip_byte(late, log, 100)), Err(Corrupt("00000001.log", 64)));
+  assert_eq(listed_keys(flip_byte(late, log, 150)), Err(Corrupt("00000001.log", 115)));
+  assert_eq(listed_keys(flip_byte(late, log, 200)), Ok([b"a", b"b"]));
   let rejected = session(flip_byte(late, log, 100), 2, large_limits(), |s: Store| ());
   assert_eq(mem_read(rejected.tree, log), mem_read(flip_byte(late, log, 100), log));
   assert_eq(fs::listed_names(mem_list(rejected.tree, "db")), Some(["00000001.log"]))
@@ -1961,10 +1962,10 @@ test "a batch written after another writer has taken over the directory fails as
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"1", Fast);
-    let held = fs.read_file[d]("db/lock");
+    let lock_file = fs.read_file[d]("db/lock");
     fs.remove[d]("db/lock");
     close[d](put[d](open[d]("db", large_limits(), Manual, raw(), 1), b"theirs", b"2", Fast));
-    fs.write_file[d]("db/lock", match held { Some(bytes) -> bytes, None -> b"" });
+    fs.write_file[d]("db/lock", match lock_file { Some(bytes) -> bytes, None -> b"" });
     let ours: Result<Store, Error> = try[key_value.fail] { put[d](s1, b"ours", b"3", Fast) };
     (error_of(ours), fs.file_size[d](log))
   });
@@ -2203,12 +2204,12 @@ fn with_store<a | e>(
   handle {
     body()
   } with {
-    var held = s,
-    newest.store() -> held,
+    var current_store = s,
+    newest.store() -> current_store,
     newest.replace(next) -> {
-      held = next;
+      current_store = next;
     },
-    return value -> { value: value, store: held },
+    return value -> { value: value, store: current_store },
   }
 
 test "two tasks that each add to one count with compare-and-set lose no addition, however their reads and commits interleave" {
@@ -2335,9 +2336,9 @@ fn completed_actions(
     with_rand(rand(1), || {
       let ran: Result<Int, Error> = try[key_value.fail] {
         with_scope[store](open[d]("db", limits, Manual, raw(), 1), |s: Store|
-          close[d](s)) { held ->
+          close[d](s)) { store_scope ->
           iterate(
-            { store: held.get(), done: 0 },
+            { store: store_scope.get(), done: 0 },
             acts.len() + 1,
             |at: { store: Store, done: Int }|
               match acts.at(at.done) {
@@ -2382,11 +2383,12 @@ fn revives(
 fn crashes(
   whole: Int,
   run: (Int) -> MemResult<Int> / {abort.raise},
-  holds: (MemFs, Int, Bool) -> Bool / {abort.raise},
+  is_consistent: (MemFs, Int, Bool) -> Bool / {abort.raise},
 ) -> { points: Int, broken: Option<Int> } / {abort.raise} =
   iterate(0, 100000, |writes: Int| {
     let ran = run(writes);
-    if !holds(ran.tree, ran.value, false) || !holds(mem_crashed(ran.tree), ran.value, true) {
+    if !is_consistent(ran.tree, ran.value, false)
+        || !is_consistent(mem_crashed(ran.tree), ran.value, true) {
       Stop({ points: writes + 1, broken: Some(writes) })
     } else if ran.value == whole && !mem_exists(ran.tree, "db/lock") {
       Stop({ points: writes + 1, broken: None })
@@ -2459,20 +2461,22 @@ test "a compaction that crashes at any of its writes, including renewing its loc
         put[d](s, Bytes::of_string(Int::to_string(100 + i)), b"v", if i == 69 { Durable }
         else { Fast })),
     ));
-  let held = match state.value { Ok(found) -> found, Err(_) -> panic("the store rejected") };
-  assert_eq(held.pairs.len(), 70);
+  let expected = match state.value { Ok(found) -> found, Err(_) -> panic("the store rejected") };
+  assert_eq(expected.pairs.len(), 70);
   let died = crashes(
     1,
     |writes: Int|
       on_mem_failing[d](state.tree, writes, ||
         with_rand(rand(4), || {
           let ran: Result<Store, Error> = try[key_value.fail] {
-            with_scope[store](open[d]("db", limits, Manual, raw(), 1), |s: Store|
-              close[d](s)) { held -> compact[d](held.get()) }
+            with_scope[store](
+              open[d]("db", limits, Manual, raw(), 1),
+              |s: Store| close[d](s),
+            ) { store_scope -> compact[d](store_scope.get()) }
           };
           match ran { Ok(_) -> 1, Err(_) -> 0 }
         }).value),
-    |tree: MemFs, _: Int, _: Bool| revives(tree, limits, [held], 0, 0),
+    |tree: MemFs, _: Int, _: Bool| revives(tree, limits, [expected], 0, 0),
   );
   assert_eq(died.broken, None);
   assert(died.points > 20)
@@ -2506,7 +2510,7 @@ fn after(steps: List<Step>) -> Shown / {abort.raise} = {
 
 fn append_step(steps: List<Step>, step: Step) -> List<Step> = steps.push(step)
 
-fn as_a_map(held: Shown, step: Step) -> Shown = stepped(held, step_ops(step))
+fn as_a_map(state: Shown, step: Step) -> Shown = stepped(state, step_ops(step))
 
 test "a store changes its contents as a map does, with a version being its batch's number and a compaction changing nothing" {
   gen::check2(gen::list(steps()), steps(), |x: List<Step>, y: Step|

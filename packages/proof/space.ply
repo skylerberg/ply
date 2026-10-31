@@ -465,9 +465,9 @@ fn walk(env: Env, st: State, c: Code) -> Result<SpaceSummary, String> / {abort.r
       Ok(cond) -> {
         let slots = |k: Int| slot_at(st, k).relation;
         let branch = |truth: Bool, c: Code| {
-          let holds = assumed(slots, i.cond, truth);
-          if possible(holds, env.missing_index) {
-            Some(walk({ ..env, found: env.found.concat(holds) }, cond.state, c))
+          let assumptions = assumed(slots, i.cond, truth);
+          if possible(assumptions, env.missing_index) {
+            Some(walk({ ..env, found: env.found.concat(assumptions) }, cond.state, c))
           } else { None }
         };
         match ((branch(true, i.then_branch), branch(false, i.else_branch))) {
@@ -582,7 +582,7 @@ fn walk_all(
   env: Env,
   st: State,
   cs: List<Code>,
-  keeps: (Int) -> Option<Sharing>,
+  argument_sharing: (Int) -> Option<Sharing>,
 ) -> Result<{ walked: SpaceSummary, all: List<SpaceSummary> }, String> / {abort.raise} =
   range(0, cs.len()).fold(
     Ok({ walked: empty_summary(st), all: [] }),
@@ -594,7 +594,7 @@ fn walk_all(
           Some(c) -> match walk({ ..env, tail: false }, sofar.walked.state, c) {
             Err(reason) -> Err(reason),
             Ok(w) -> {
-              let after = match keeps(i) {
+              let after = match argument_sharing(i) {
                 Some(h) -> mark_shared(w.state, w.read, h),
                 None -> w.state,
               };
@@ -608,21 +608,21 @@ fn walk_all(
 fn binary(
   env: Env,
   st: State,
-  op: Bytes,
-  lhs: Code,
-  rhs: Code,
+  operator: Bytes,
+  left: Code,
+  right: Code,
 ) -> Result<SpaceSummary, String> / {abort.raise} =
-  match walk({ ..env, tail: false }, st, lhs) {
+  match walk({ ..env, tail: false }, st, left) {
     Err(reason) -> Err(reason),
     Ok(l) -> {
-      let short = op == b"and" || op == b"or";
-      match walk({ ..env, tail: env.tail && short }, l.state, rhs) {
+      let short = operator == b"and" || operator == b"or";
+      match walk({ ..env, tail: env.tail && short }, l.state, right) {
         Err(reason) -> Err(reason),
-        Ok(r) -> if op == b"concat" { appended(l, r) } else {
+        Ok(r) -> if operator == b"concat" { appended(l, r) } else {
           Ok({
             ..as_value(then(l, r), Unshared, true),
-            size: arithmetic(op, l.size, r.size),
-            relation: operation_relation(env.found, op, l.relation, rhs, r.relation, lhs),
+            size: arithmetic(operator, l.size, r.size),
+            relation: operation_relation(env.found, operator, l.relation, right, r.relation, left),
           })
         },
       }
@@ -1041,7 +1041,7 @@ fn threaded_calls(
   k: Int,
 ) -> Result<{ first: { space: Polynomial, holders: Sharing, number: Bool }, rest: { space: Polynomial, holders: Sharing, number: Bool } }, String> / {abort.raise} = {
   let seed = match all.at(k) { Some(w) -> w, None -> empty_summary(st) };
-  let handing = |accumulator: Slot|
+  let parameter_slots = |accumulator: Slot|
     range(0, it.params.len()).map(|j: Int|
       match it.params.get(j) { Accumulator(_) -> accumulator, _ -> slots.get(j) });
   match callback(
@@ -1049,7 +1049,7 @@ fn threaded_calls(
       st,
       args,
       it.callback,
-      handing({ ..slot_of(seed), relation: Other, holders: sharing_of(seed) }),
+      parameter_slots({ ..slot_of(seed), relation: Other, holders: sharing_of(seed) }),
     ) {
     Err(reason) -> Err(reason),
     Ok(first) -> match callback_fixpoint(
@@ -1057,7 +1057,7 @@ fn threaded_calls(
         st,
         args,
         it.callback,
-        handing,
+        parameter_slots,
         first.holders,
         seed.is_number && first.number,
         3,
@@ -1298,12 +1298,12 @@ fn callback_call(
     Some(a) -> a != ValueResult,
     None -> returns_number(env.context, name),
   };
-  let holds = it.result == Mapped || it.result == Filtered || it.result == Folded;
-  let keeps = |i: Int|
+  let shares_parts = it.result == Mapped || it.result == Filtered || it.result == Folded;
+  let argument_sharing = |i: Int|
     if numeric || it.result == Updated(i) { None }
-    else if holds && it.iterated_parameters.at(0) == Some(i) { Some(OnlyPartsShared) }
+    else if shares_parts && it.iterated_parameters.at(0) == Some(i) { Some(OnlyPartsShared) }
     else { Some(Shared) };
-  match walk_all(env, st, args, keeps) {
+  match walk_all(env, st, args, argument_sharing) {
     Err(reason) -> Err(reason),
     Ok(a) -> {
       let now = a.walked.state;
@@ -1491,7 +1491,7 @@ fn callback_fixpoint(
   st: State,
   args: List<Code>,
   position: Int,
-  handing: (Slot) -> List<Slot> / {abort.raise},
+  parameter_slots: (Slot) -> List<Slot> / {abort.raise},
   holders: Sharing,
   number: Bool,
   tries: Int,
@@ -1501,7 +1501,7 @@ fn callback_fixpoint(
       st,
       args,
       position,
-      handing({ ..unknown_slot(), holders: holders, is_number: number }),
+      parameter_slots({ ..unknown_slot(), holders: holders, is_number: number }),
     ) {
     Err(reason) -> Err(reason),
     Ok(cb) -> if more_shared(holders, cb.holders) == holders || tries <= 0 {
@@ -1512,7 +1512,7 @@ fn callback_fixpoint(
         st,
         args,
         position,
-        handing,
+        parameter_slots,
         more_shared(holders, cb.holders),
         number,
         tries - 1,
@@ -1568,8 +1568,8 @@ fn callback(
     },
   }
 
-fn shown(src: Bytes, definition: String) -> Result<Bool, String> / {abort.raise} =
-  within_clause(context_owning([{ name: b"m", src: src }], |_m: Bytes| true), "m." ++ definition)
+fn shown(source: Bytes, definition: String) -> Result<Bool, String> / {abort.raise} =
+  within_clause(context_owning([{ name: b"m", src: source }], |_m: Bytes| true), "m." ++ definition)
 
 fn within_clause(context: Context, name: String) -> Result<Bool, String> / {abort.raise} =
   match context.claims.definitions.get(name) {

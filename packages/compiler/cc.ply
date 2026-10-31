@@ -497,7 +497,7 @@ fn compilers_handler<a | e>(
     go()
   } with {
     compilers.find[*label]() -> match found(compilers_found(label)) {
-      Some(said) -> match parts(said) {
+      Some(found_compiler) -> match parts(found_compiler) {
         [path, identity, support] ->
           Some({
             path: String::of_bytes_lossy(path),
@@ -509,9 +509,12 @@ fn compilers_handler<a | e>(
       None -> None,
     },
     compilers.start[*label](args) -> {
-      let said = compilers_started(label, encode_parts(args.map(|a: String| Bytes::of_string(a))));
-      if said.at(0) == 1 { Ok(decode_int(said.slice(1, said.len()))) }
-      else { Err(String::of_bytes_lossy(said.slice(1, said.len()))) }
+      let started = compilers_started(
+        label,
+        encode_parts(args.map(|a: String| Bytes::of_string(a))),
+      );
+      if started.at(0) == 1 { Ok(decode_int(started.slice(1, started.len()))) }
+      else { Err(String::of_bytes_lossy(started.slice(1, started.len()))) }
     },
     compilers.wait[*label](job) -> found(job_wait(job)),
   }
@@ -586,7 +589,7 @@ fn memory_handler<a | e>(go: () -> a / {memory.read | e}) -> a / {native.read, a
     go()
   } with {
     memory.heap() -> match parts(memory_heap()) {
-      [live, held] -> { live: decode_int(live), reserved: decode_int(held) },
+      [live, reserved] -> { live: decode_int(live), reserved: decode_int(reserved) },
       _ -> panic("the runtime returned malformed memory usage data"),
     },
     memory.census() ->
@@ -645,7 +648,7 @@ test "`split` of C text with no part marker returns the whole text as the header
 }
 
 test "`split` aborts with a message naming the label when two parts have the same label" {
-  let said = handle {
+  let message = handle {
     let _ = split(
       Bytes::concat_all([part_mark("ab"), b"\nint a;\n", part_mark("ab"), b"\nint b;\n"]),
     );
@@ -653,7 +656,7 @@ test "`split` aborts with a message naming the label when two parts have the sam
   } with {
     abort.raise(m) -> m,
   };
-  assert(said.contains("`ab`"), Some(said))
+  assert(message.contains("`ab`"), Some(message))
 }
 
 test "a part's digest is the BLAKE3 hash of the header followed by the part's C, so changing the header changes every digest" {
@@ -704,7 +707,7 @@ test "both profiles optimise native programs the same" {
 
 fn run_all_with(
   runs: List<List<String>>,
-  said: (String) -> Option<Bytes>,
+  compiler_output: (String) -> Option<Bytes>,
 ) -> { result: Result<Unit, String>, started: Int } / {abort.raise} =
   handle {
     run_all[cc](runs)
@@ -714,7 +717,8 @@ fn run_all_with(
       started = started + 1;
       Ok(started - 1)
     },
-    compilers.wait[cc](job) -> said(match runs.get(job).last() { Some(f) -> f, None -> "" }),
+    compilers.wait[cc](job) ->
+      compiler_output(match runs.get(job).last() { Some(f) -> f, None -> "" }),
     toolchain.jobs() -> 1,
     toolchain.cache() -> panic("a run reads no cache"),
     toolchain.reuse_dir() -> panic("a run reads no cache"),
@@ -727,9 +731,9 @@ fn run_all_with(
 
 test "a compile runs every compiler invocation, then fails once with the compiler's output for each invocation that failed" {
   let runs = [["-c", "a.c"], ["-c", "b.c"], ["-c", "c.c"]];
-  let said = |file: String|
+  let compiler_output = |file: String|
     if file == "b.c" { None } else { Some(Bytes::of_string(file ++ ":1: error: no")) };
-  let r = run_all_with(runs, said);
+  let r = run_all_with(runs, compiler_output);
   assert_eq(r.started, 3);
   match r.result {
     Ok(_) -> assert(false, Some("a compile two parts rejected succeeded")),
@@ -757,7 +761,7 @@ test "a compile runs every compiler invocation, then fails once with the compile
 fn probe_with(
   cache_sources: Bool,
   start: Result<Int, String>,
-  said: Option<Bytes>,
+  compiler_output: Option<Bytes>,
 ) -> { fits: Bool, runs: List<List<String>> } / {abort.raise} =
   handle {
     targets_x86_64_linux[cc]()
@@ -767,7 +771,7 @@ fn probe_with(
       runs = runs.push(args);
       start
     },
-    compilers.wait[cc](job) -> said,
+    compilers.wait[cc](job) -> compiler_output,
     toolchain.cache() -> "/cache",
     toolchain.jobs() -> 1,
     toolchain.exists(path) -> false,
@@ -798,13 +802,13 @@ test "a compiler is usable for x86-64 Linux only if it preprocesses the target-d
 fn in_test_cache(path: String) -> String / {abort.raise} = path.slice("/cache/".len(), path.len())
 
 fn fake_build<a>(
-  held: Map<String, Bytes>,
+  initial_files: Map<String, Bytes>,
   build: () -> a / {compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise},
 ) -> { made: a, written: List<String>, runs: List<List<String>>, files: Map<String, Bytes> } / {abort.raise} =
   handle {
     build()
   } with {
-    var files: Map<String, Bytes> = held,
+    var files: Map<String, Bytes> = initial_files,
     var written: List<String> = [],
     var runs: List<List<String>> = [],
     compilers.find[cc]() -> Some({ path: "cc", identity: b"cc 1", support_flags: [] }),
@@ -849,7 +853,7 @@ test "a build compiles each part whose object is not cached, including a part wh
   let fresh = [written_part(head, "a", b"int a;\n"), written_part(head, "a", b"int b;\n")];
   let built = written_part(head, "c", b"int c;\n");
   let taken = { ..written_part(head, "d", b"int d;\n"), text: None };
-  let held = Map::new().insert(source_path(taken.digest), head.concat(b"int d;\n")).insert(
+  let cached_files = Map::new().insert(source_path(taken.digest), head.concat(b"int d;\n")).insert(
     object_path(t, [], { label: built.label, digest: built.digest }),
     b"compiled",
   );
@@ -858,7 +862,7 @@ test "a build compiles each part whose object is not cached, including a part wh
       Err(reason) -> Err(reason),
       Ok(sources) -> objects[cc](t, sources, [], "work"),
     };
-  let first = fake_build(held, build);
+  let first = fake_build(cached_files, build);
   let input = |w: WrittenPart| Some("/cache/" ++ source_path(w.digest));
   assert_eq(first.written, fresh.push(built).map(|w: WrittenPart| source_path(w.digest)));
   assert_eq(first.runs.map(|run: List<String>| run.last()), fresh.push(taken).map(input));

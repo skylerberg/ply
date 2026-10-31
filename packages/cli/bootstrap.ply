@@ -183,8 +183,8 @@ fn shipped_key(files: List<ShippedFile>) -> Bytes =
           length_prefixed(Bytes::of_string(f.path)).concat(blake3(f.bytes)),
         )).fold(
         [b"ply shipped modules 1\0"],
-        |accumulator: List<Bytes>, name: String, held: Bytes|
-          accumulator.push(length_prefixed(Bytes::of_string(name))).push(held),
+        |accumulator: List<Bytes>, name: String, file_digest: Bytes|
+          accumulator.push(length_prefixed(Bytes::of_string(name))).push(file_digest),
       ),
     ),
   )
@@ -213,8 +213,8 @@ fn read_chunks<a>(
   match fs.file_size[abs](path) {
     None -> None,
     Some(size) ->
-      range(0, (size + step - 1) / step).fold(Some([]), |held: Option<List<a>>, i: Int|
-        match held {
+      range(0, (size + step - 1) / step).fold(Some([]), |chunks: Option<List<a>>, i: Int|
+        match chunks {
           None -> None,
           Some(built_ply) -> match fs.read_at[abs](path, i * step, step) {
             Some(bytes) -> Some(built_ply.push(each(bytes))),
@@ -267,8 +267,10 @@ fn builder_cache_key(
           } else { b"" }),
         )).fold(
         [b"ply builder 2\0", length_prefixed(Bytes::of_string(reads_at))],
-        |accumulator: List<Bytes>, name: String, held: Bytes|
-          accumulator.push(length_prefixed(Bytes::of_string(name))).push(length_prefixed(held)),
+        |accumulator: List<Bytes>, name: String, content_digest: Bytes|
+          accumulator.push(length_prefixed(Bytes::of_string(name))).push(
+            length_prefixed(content_digest),
+          ),
       ),
     ),
   );
@@ -364,7 +366,7 @@ fn build_builder(
   phases: Bool,
 ) -> Result<Builder, List<Diagnostic>> / {Bootstraps, process.err[proc], shipped.definitions, toolchain.bodies_dir, shipped.read_pack, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.report_view_used, Derives, abort.raise} = {
   let reads_at = builder_reads_path(linking, identity_of(shipped.definitions(), builder_roots()));
-  let kept = match read_if_present(reads_at) {
+  let cached_builder = match read_if_present(reads_at) {
     None -> None,
     Some(names) -> {
       let at = builder_cache_key(
@@ -380,7 +382,7 @@ fn build_builder(
       }
     },
   };
-  match kept {
+  match cached_builder {
     Some(k) -> {
       let copy = toolchain.cache() ++ "/" ++ work ++ "/builder";
       if fs.create_dir[abs](strip_root(parent(copy)))
@@ -536,18 +538,18 @@ fn shipped_results(
     match append_pack(returning, build_pack(files, front, [])) {
       Err(diagnostics) -> Err(diagnostics),
       Ok(_) -> {
-        let asked = toolchain.run(cache_relative(returning), ["std", "--answering"]);
-        let kept = if asked.code != 0 { None } else {
+        let check_run = toolchain.run(cache_relative(returning), ["std", "--answering"]);
+        let cache_key = if check_run.code != 0 { None } else {
           Some(
             shipped_results_cache_key(
               keys.shipped,
               keys.linking,
-              Bytes::of_string(String::of_bytes_lossy(asked.out).trim()),
+              Bytes::of_string(String::of_bytes_lossy(check_run.out).trim()),
               identity_of(shipped.definitions(), shipped_results_roots()),
             ),
           )
         };
-        let had = match kept {
+        let had = match cache_key {
           None -> None,
           Some(at) -> match read_if_present(at) {
             Some(bytes) -> decode_shipped_results(bytes),
@@ -558,7 +560,7 @@ fn shipped_results(
           Some(a) -> Ok({ returned: a, taken: true }),
           None -> match build_shipped_results(returning, work) {
             Err(diagnostics) -> Err(diagnostics),
-            Ok(files) -> match kept {
+            Ok(files) -> match cache_key {
               None -> Ok({ returned: files, taken: false }),
               Some(at) -> if toolchain.write_file(at, encode_shipped_results(files)) {
                 Ok({ returned: files, taken: false })
@@ -595,11 +597,12 @@ fn install(
   out: String,
   pack: Bytes,
 ) -> Result<Unit, List<Diagnostic>> / {fs.write[abs], entropy.next, abort.raise} = {
-  let tmp = out ++ "." ++ entropy.next().to_string() ++ ".tmp";
-  if fs.create_dir[abs](strip_root(parent(out))) && fs.copy[abs](strip_root(exe), strip_root(tmp))
-      && fs.append[abs](strip_root(tmp), pack) != None
-      && fs.rename[abs](strip_root(tmp), strip_root(out)) { Ok(()) } else {
-    let _ = fs.remove[abs](strip_root(tmp));
+  let temporary_path = out ++ "." ++ entropy.next().to_string() ++ ".tmp";
+  if fs.create_dir[abs](strip_root(parent(out)))
+      && fs.copy[abs](strip_root(exe), strip_root(temporary_path))
+      && fs.append[abs](strip_root(temporary_path), pack) != None
+      && fs.rename[abs](strip_root(temporary_path), strip_root(out)) { Ok(()) } else {
+    let _ = fs.remove[abs](strip_root(temporary_path));
     failed("the new `ply` could not be written to `" ++ out ++ "`")
   }
 }
@@ -743,17 +746,17 @@ pub fn run(
 }
 
 test "the hash that identifies how a `ply` bootstraps changes only when the bootstrap command's definition or the runtime changes" {
-  let said = |definitions: Bytes, runtime: Bytes|
+  let hash_lines = |definitions: Bytes, runtime: Bytes|
     handle {
       inputs_hash_output().lines
     } with {
       shipped.definitions() -> definitions,
       shipped.runtime() -> Bytes::concat_all([b"ply runtime 1\nidentity ", runtime, b"\n"]),
     };
-  let first = said(b"bootstrap.run 01\nexplain.run 02\n", b"r");
-  assert_eq(said(b"bootstrap.run 01\nexplain.run 03\n", b"r"), first);
-  assert(said(b"bootstrap.run 04\nexplain.run 02\n", b"r") != first, None);
-  assert(said(b"bootstrap.run 01\nexplain.run 02\n", b"s") != first, None)
+  let first = hash_lines(b"bootstrap.run 01\nexplain.run 02\n", b"r");
+  assert_eq(hash_lines(b"bootstrap.run 01\nexplain.run 03\n", b"r"), first);
+  assert(hash_lines(b"bootstrap.run 04\nexplain.run 02\n", b"r") != first, None);
+  assert(hash_lines(b"bootstrap.run 01\nexplain.run 02\n", b"s") != first, None)
 }
 
 fn sample_parts() -> ToolchainParts =
@@ -852,31 +855,31 @@ fn edited(files: List<ShippedFile>, name: String) -> List<ShippedFile> =
   files.map(|f: ShippedFile| if f.name == name { { ..f, bytes: f.bytes.concat(b"!") } } else { f })
 
 test "`builder_reads_path` returns a path ending in `.reads` that is the same for equal arguments and differs when either argument differs" {
-  let kept = builder_reads_path(b"linking", b"building");
-  assert(kept.ends_with(".reads"));
-  assert_eq(builder_reads_path(b"linking", b"building"), kept);
-  assert(builder_reads_path(b"moved", b"building") != kept);
-  assert(builder_reads_path(b"linking", b"moved") != kept)
+  let reads_path = builder_reads_path(b"linking", b"building");
+  assert(reads_path.ends_with(".reads"));
+  assert_eq(builder_reads_path(b"linking", b"building"), reads_path);
+  assert(builder_reads_path(b"moved", b"building") != reads_path);
+  assert(builder_reads_path(b"linking", b"moved") != reads_path)
 }
 
 test "`builder_cache_key` changes with the contents of the shipped files the builder read and with the name of every shipped file, not with other files' contents" {
   let files = three_files();
   let reads = ["std.a.ply", "std/a/data.txt"];
-  let kept = builder_cache_key("r.reads", files, reads);
-  assert(kept.ends_with(".builder"));
-  assert_eq(builder_cache_key("r.reads", edited(files, "std.b.ply"), reads), kept);
-  assert(builder_cache_key("r.reads", edited(files, "std.a.ply"), reads) != kept);
-  assert(builder_cache_key("r.reads", edited(files, "std/a/data.txt"), reads) != kept);
+  let cache_key = builder_cache_key("r.reads", files, reads);
+  assert(cache_key.ends_with(".builder"));
+  assert_eq(builder_cache_key("r.reads", edited(files, "std.b.ply"), reads), cache_key);
+  assert(builder_cache_key("r.reads", edited(files, "std.a.ply"), reads) != cache_key);
+  assert(builder_cache_key("r.reads", edited(files, "std/a/data.txt"), reads) != cache_key);
   assert(
     builder_cache_key(
         "r.reads",
         files.push({ name: "std.c.ply", path: "std/c.ply", bytes: b"" }),
         reads,
       )
-      != kept,
+      != cache_key,
   );
-  assert(builder_cache_key("r.reads", files, reads.push("std.b.ply")) != kept);
-  assert(builder_cache_key("moved.reads", files, reads) != kept)
+  assert(builder_cache_key("r.reads", files, reads.push("std.b.ply")) != cache_key);
+  assert(builder_cache_key("moved.reads", files, reads) != cache_key)
 }
 
 test "`builder_reads` returns the source files of the loaded modules and the embedded data files, and no other files" {
@@ -886,13 +889,16 @@ test "`builder_reads` returns the source files of the loaded modules and the emb
 }
 
 test "`shipped_results_cache_key` returns a key ending in `.answers`, equal for equal arguments and different when the shipped, linking, returning or gathering argument differs" {
-  let kept = shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering");
-  assert(kept.ends_with(".answers"));
-  assert_eq(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering"), kept);
-  assert(shipped_results_cache_key(b"moved", b"linking", b"returning", b"gathering") != kept);
-  assert(shipped_results_cache_key(b"shipped", b"moved", b"returning", b"gathering") != kept);
-  assert(shipped_results_cache_key(b"shipped", b"linking", b"moved", b"gathering") != kept);
-  assert(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"moved") != kept)
+  let cache_key = shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering");
+  assert(cache_key.ends_with(".answers"));
+  assert_eq(
+    shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering"),
+    cache_key,
+  );
+  assert(shipped_results_cache_key(b"moved", b"linking", b"returning", b"gathering") != cache_key);
+  assert(shipped_results_cache_key(b"shipped", b"moved", b"returning", b"gathering") != cache_key);
+  assert(shipped_results_cache_key(b"shipped", b"linking", b"moved", b"gathering") != cache_key);
+  assert(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"moved") != cache_key)
 }
 
 test "`decode_shipped_results` returns the stored results that `encode_shipped_results` produced, and `None` for truncated, extended or too-short bytes" {
@@ -900,9 +906,9 @@ test "`decode_shipped_results` returns the stored results that `encode_shipped_r
     { path: "answers/store", bytes: b"frames" },
     { path: "answers/index", bytes: b"" },
   ];
-  let kept = encode_shipped_results(shipped_results);
-  assert_eq(decode_shipped_results(kept), Some(shipped_results));
-  assert_eq(decode_shipped_results(kept.slice(0, kept.len() - 1)), None);
-  assert_eq(decode_shipped_results(kept.concat(b"x")), None);
+  let encoded_results = encode_shipped_results(shipped_results);
+  assert_eq(decode_shipped_results(encoded_results), Some(shipped_results));
+  assert_eq(decode_shipped_results(encoded_results.slice(0, encoded_results.len() - 1)), None);
+  assert_eq(decode_shipped_results(encoded_results.concat(b"x")), None);
   assert_eq(decode_shipped_results(b"short"), None)
 }

@@ -217,16 +217,23 @@ pub fn option_type(ty: Type) -> Type = applied_type(b"Option", ty)
 pub fn map_type(k: Type, v: Type) -> Type = NamedType({ name: b"Map", args: [k, v] })
 pub fn iter_type(s: Type, r: Type) -> Type = NamedType({ name: b"Iter", args: [s, r] })
 pub fn secret_type(ty: Type) -> Type = applied_type(b"Secret", ty)
-pub fn fn_type(params: List<Type>, ret: Type, effects: Effects) -> Type =
-  FunctionType({ params: params, kept: [], once: false, ret: ret, effects: effects })
+pub fn fn_type(params: List<Type>, return_type: Type, effects: Effects) -> Type =
+  FunctionType({ params: params, kept: [], once: false, ret: return_type, effects: effects })
 
 pub fn owning_fn_type(
   params: List<Type>,
-  kept: List<Int>,
+  keep_parameters: List<Int>,
   once: Bool,
-  ret: Type,
+  return_type: Type,
   effects: Effects,
-) -> Type = FunctionType({ params: params, kept: kept, once: once, ret: ret, effects: effects })
+) -> Type =
+  FunctionType({
+    params: params,
+    kept: keep_parameters,
+    once: once,
+    ret: return_type,
+    effects: effects,
+  })
 pub fn monomorphic(ty: Type) -> Scheme =
   { type_variables: [], effect_variables: [], keep_variables: [], label_variables: [], ty: ty }
 
@@ -331,13 +338,13 @@ pub fn is_rigid_effects(substitution: Substitution, v: Int) -> Bool =
   substitution.rigid_effects.contains(v)
 
 pub fn shallow_resolve(substitution: Substitution, ty: Type) -> Type / {abort.raise} =
-  iterate(ty, substitution.ty.len() + 2, |cur: Type|
-    match cur {
+  iterate(ty, substitution.ty.len() + 2, |current: Type|
+    match current {
       VariableType(v) -> match substitution.ty.get(v) {
         Some(next) -> Continue(next),
-        None -> Stop(cur),
+        None -> Stop(current),
       },
-      _ -> Stop(cur),
+      _ -> Stop(current),
     })
 
 pub fn resolve_type(substitution: Substitution, t: Type) -> Type / {abort.raise} =
@@ -1019,7 +1026,7 @@ pub fn env_locals(env: TypeEnv) -> List<InScope> / {abort.raise} = {
     scope.names.fold(accumulator, |found: List<InScope>, name: Bytes, binder: Int|
       if range(i + 1, n).any(|j: Int| env.scopes.get(j).names.contains(name)) { found } else {
         match scope.locals.get(binder) {
-          Some(sc) -> found.push({ binder: binder, name: name, sc: sc }),
+          Some(scheme) -> found.push({ binder: binder, name: name, sc: scheme }),
           None -> found,
         }
       })
@@ -1048,13 +1055,16 @@ pub fn env_free_variables(
   let walked = env.scopes.fold(
     { scopes: [], free: globals.free },
     |accumulator: { scopes: List<Scope>, free: FreeVariables }, scope: Scope| {
-      let kept = still_open(
+      let open_locals = still_open(
         substitution,
         scope.ungeneralized,
         |binder: Int| scope.locals.get(binder),
         accumulator.free,
       );
-      { scopes: accumulator.scopes.push({ ..scope, ungeneralized: kept.open }), free: kept.free }
+      {
+        scopes: accumulator.scopes.push({ ..scope, ungeneralized: open_locals.open }),
+        free: open_locals.free,
+      }
     },
   );
   { e: { ..env, open: globals.open, scopes: walked.scopes }, free: walked.free }
@@ -1590,15 +1600,15 @@ fn renumbered(node: InternedType, to: Map<Int, Int>) -> InternedType / {abort.ra
 type Numbering = { numbered: Map<Int, Int>, out: List<InternedType> }
 
 fn numbered_from(
-  held: List<InternedType>,
+  interned_types: List<InternedType>,
   s: Numbering,
   place: Int,
   budget: Int,
 ) -> Numbering / {abort.raise} =
   if budget <= 0 || s.numbered.contains(place) { s } else {
-    let node = held.get(place);
+    let node = interned_types.get(place);
     let below = interned_parts_of(node).fold(s, |accumulator: Numbering, p: Int|
-      numbered_from(held, accumulator, p, budget - 1));
+      numbered_from(interned_types, accumulator, p, budget - 1));
     {
       numbered: below.numbered.insert(place, below.out.len()),
       out: below.out.push(renumbered(node, below.numbered)),
@@ -1621,8 +1631,8 @@ pub fn interned_subset(
   }
 }
 
-pub fn types_of(held: List<InternedType>) -> List<Type> / {abort.raise} =
-  held.fold([], |built: List<Type>, node: InternedType| {
+pub fn types_of(interned_types: List<InternedType>) -> List<Type> / {abort.raise} =
+  interned_types.fold([], |built: List<Type>, node: InternedType| {
     let part = |i: Int| built.get(i);
     let fields = |fs: List<InternedField>|
       fs.map(|f: InternedField| { name: f.name, ty: part(f.ty) });
@@ -1781,7 +1791,8 @@ fn free_label(printer: Printer) -> Bytes / {abort.raise} =
   })
 
 fn label_in_use(names: Map<Int, Bytes>, name: Bytes) -> Bool =
-  names.fold(false, |accumulator: Bool, v: Int, held: Bytes| accumulator || held == name)
+  names.fold(false, |accumulator: Bool, v: Int, existing_name: Bytes|
+    accumulator || existing_name == name)
 
 fn reserve_resource(printer: Printer, resource: Resource) -> Printer =
   match resource {
@@ -1892,7 +1903,7 @@ pub fn print_effect(
       text: Bytes::concat_all([
         entry.effect,
         b".",
-        match entry.op { Some(op) -> op, None -> mode_text(entry.mode) },
+        match entry.op { Some(operation) -> operation, None -> mode_text(entry.mode) },
         r.text,
       ]),
     }
@@ -1925,11 +1936,11 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
       { printer: o.printer, text: o.name }
     },
     NamedType(c) -> if c.name == b"Scoped" && c.args.len() == 2 {
-      let elem = printed(printer, c.args.get(1));
-      let label = label_text(elem.printer, c.args.get(0));
+      let element = printed(printer, c.args.get(1));
+      let label = label_text(element.printer, c.args.get(0));
       {
         printer: label.printer,
-        text: Bytes::concat_all([b"Scoped<", elem.text, b", [", label.text, b"]>"]),
+        text: Bytes::concat_all([b"Scoped<", element.text, b", [", label.text, b"]>"]),
       }
     } else if c.args.len() > 0 && is_label_or_effects(ty) {
       let o = label_text(printer, c.args.get(0));
@@ -2070,14 +2081,14 @@ pub fn print_effect_list_text(
 
 pub fn effect_list_text(effects: List<Effect>, sep: Bytes) -> Bytes / {abort.raise} = {
   let out = print_effect_list_text(printer_new(), effects, sep);
-  let vars = effects.fold([], |accumulator: List<Int>, entry: Effect|
+  let label_variables = effects.fold([], |accumulator: List<Int>, entry: Effect|
     match entry.resource {
       ResourceVariable(v) -> if accumulator.contains(v) { accumulator }
       else { accumulator.push(v) },
       _ -> accumulator,
     });
-  if vars.len() == 0 { out.text } else {
-    let head = vars.fold(
+  if label_variables.len() == 0 { out.text } else {
+    let head = label_variables.fold(
       { printer: out.printer, texts: [] },
       |accumulator: { printer: Printer, texts: List<Bytes> }, v: Int| {
         let o = label_name(accumulator.printer, v);
@@ -2243,7 +2254,7 @@ test "unification assigns a type variable once and rejects a type that would con
 
 test "unifying a variable with a list nested 200 levels deep succeeds, even through a chain of 200 variable bindings, and a mismatch deep inside is still reported" {
   let nested = |inner: Type| range(0, 200).fold(inner, |t: Type, _i: Int| list_type(t));
-  let vars = range(0, 201).fold(
+  let type_variables = range(0, 201).fold(
     { fresh: fresh_new(), types: [] },
     |accumulator: { fresh: Fresh, types: List<Type> }, _i: Int| {
       let v = fresh_type(accumulator.fresh);
@@ -2251,14 +2262,24 @@ test "unifying a variable with a list nested 200 levels deep succeeds, even thro
     },
   );
   let chained = range(0, 200).fold(
-    unify_succeeded(substitution_new(), vars.fresh),
+    unify_succeeded(substitution_new(), type_variables.fresh),
     |u: UnifyResult, i: Int|
-      unify(u.substitution, u.fresh, vars.types.get(i), list_type(vars.types.get(i + 1))),
+      unify(
+        u.substitution,
+        u.fresh,
+        type_variables.types.get(i),
+        list_type(type_variables.types.get(i + 1)),
+      ),
   );
-  let u = unify(chained.substitution, chained.fresh, vars.types.get(0), nested(int_type()));
+  let u = unify(
+    chained.substitution,
+    chained.fresh,
+    type_variables.types.get(0),
+    nested(int_type()),
+  );
   assert(u.error == None);
-  assert(resolve_type(u.substitution, vars.types.get(0)) == nested(int_type()));
-  let bad = unify(u.substitution, u.fresh, nested(bool_type()), vars.types.get(0));
+  assert(resolve_type(u.substitution, type_variables.types.get(0)) == nested(int_type()));
+  let bad = unify(u.substitution, u.fresh, nested(bool_type()), type_variables.types.get(0));
   assert(match bad.error {
     Some(Mismatch(m)) -> m.expected == bool_type() && m.found == int_type(),
     _ -> false,
@@ -2363,14 +2384,14 @@ test "effects can be written as text with each label parameter named by its posi
 }
 
 test "the printer names type variables in order of first appearance, and names effect variables separately" {
-  let sc = {
+  let scheme = {
     type_variables: [7, 3],
     effect_variables: [2],
     keep_variables: [],
     label_variables: [],
     ty: fn_type([VariableType(3), VariableType(7)], list_type(VariableType(3)), open_effects(2)),
   };
-  assert_eq(scheme_text(sc), b"<b, a | e>(a, b) -> List<a> / e");
+  assert_eq(scheme_text(scheme), b"<b, a | e>(a, b) -> List<a> / e");
   assert_eq(
     type_text(
       RecordType(
@@ -2482,17 +2503,22 @@ test "a label variable is printed as `m` instead of `l` when a named resource is
     op: Some(b"send"),
   };
   assert_eq(effect_list_text([named, same_op], b","), b"<[m]>net.send[l],net.send[m]");
-  let sc = {
+  let scheme = {
     type_variables: [],
     effect_variables: [],
     keep_variables: [],
     label_variables: [4],
     ty: fn_type([], unit_type(), closed_effects([named, var_])),
   };
-  assert_eq(scheme_text(sc), b"<[m]>() -> Unit / {net.send[l], net.recv[m]}");
-  let held = { effect: b"net", resource: NamedResource(b"m"), mode: WriteMode, op: Some(b"close") };
+  assert_eq(scheme_text(scheme), b"<[m]>() -> Unit / {net.send[l], net.recv[m]}");
+  let named_close = {
+    effect: b"net",
+    resource: NamedResource(b"m"),
+    mode: WriteMode,
+    op: Some(b"close"),
+  };
   assert_eq(
-    effect_list_text([named, held, var_], b","),
+    effect_list_text([named, named_close, var_], b","),
     b"<[n]>net.send[l],net.close[m],net.recv[n]",
   );
   let last = {
@@ -2502,7 +2528,7 @@ test "a label variable is printed as `m` instead of `l` when a named resource is
     op: Some(b"connect"),
   };
   assert_eq(
-    effect_list_text([named, held, last, var_], b","),
+    effect_list_text([named, named_close, last, var_], b","),
     b"<[l1]>net.send[l],net.close[m],net.connect[n],net.recv[l1]",
   )
 }
@@ -2525,14 +2551,14 @@ test "unifying effects binds a free label variable to the label that a concrete 
 
 test "a scheme prints its label parameters bracketed, among the type parameters" {
   let entry = { effect: b"net", resource: ResourceVariable(5), mode: WriteMode, op: Some(b"send") };
-  let sc = {
+  let scheme = {
     type_variables: [1],
     effect_variables: [2],
     keep_variables: [],
     label_variables: [5],
     ty: fn_type([VariableType(1)], unit_type(), { listed: [entry], variable: Some(2) }),
   };
-  assert_eq(scheme_text(sc), b"<a, [l] | e>(a) -> Unit / {net.send[l] | e}");
+  assert_eq(scheme_text(scheme), b"<a, [l] | e>(a) -> Unit / {net.send[l] | e}");
   let other = {
     type_variables: [1],
     effect_variables: [2],
@@ -2545,21 +2571,21 @@ test "a scheme prints its label parameters bracketed, among the type parameters"
       variable: Some(2),
     }),
   };
-  assert_eq(scheme_text(other), scheme_text(sc))
+  assert_eq(scheme_text(other), scheme_text(scheme))
 }
 
 test "instantiating a scheme gives its label parameters fresh variables and returns those variables" {
   let entry = { effect: b"net", resource: ResourceVariable(5), mode: WriteMode, op: Some(b"send") };
-  let sc = {
+  let scheme = {
     type_variables: [],
     effect_variables: [],
     keep_variables: [],
     label_variables: [5],
     ty: fn_type([], unit_type(), closed_effects([entry])),
   };
-  let inst = instantiate_with(sc, fresh_new());
-  assert_eq(inst.labels.len(), 1);
-  let bound = match inst.labels.get(0) { VariableType(v) -> v, _ -> 0 - 1 };
+  let instance = instantiate_with(scheme, fresh_new());
+  assert_eq(instance.labels.len(), 1);
+  let bound = match instance.labels.get(0) { VariableType(v) -> v, _ -> 0 - 1 };
   assert(bound >= 0);
   let s = {
     ty: Map::new().insert(bound, label_type(b"conn")),
@@ -2567,32 +2593,37 @@ test "instantiating a scheme gives its label parameters fresh variables and retu
     rigid_type: Map::new(),
     rigid_effects: Map::new(),
   };
-  assert_eq(type_text(resolve_type(s, inst.ty)), b"() -> Unit / {net.send[conn]}")
+  assert_eq(type_text(resolve_type(s, instance.ty)), b"() -> Unit / {net.send[conn]}")
 }
 
 test "a declared type's label and effect arguments print correctly, unify with other arguments and are substituted into its field types" {
   let send = |r: Resource| { effect: b"net", resource: r, mode: WriteMode, op: Some(b"send") };
-  let held = |label: Type, effects: Effects|
+  let sink_type = |label: Type, effects: Effects|
     NamedType({ name: b"m.Sink", args: applied_args([int_type()], [label], [effects]) });
-  let open = held(VariableType(1), open_effects(2));
-  let conn = held(label_type(b"conn"), single_effect(send(NamedResource(b"conn"))));
+  let open = sink_type(VariableType(1), open_effects(2));
+  let connection_type = sink_type(label_type(b"conn"), single_effect(send(NamedResource(b"conn"))));
   assert_eq(type_text(open), b"m.Sink<Int, [l] | e>");
-  assert_eq(type_text(conn), b"m.Sink<Int, [conn] | {net.send[conn]}>");
+  assert_eq(type_text(connection_type), b"m.Sink<Int, [conn] | {net.send[conn]}>");
   assert_eq(
     type_text(NamedType({ name: b"m.Box", args: applied_args([], [], [no_effects()]) })),
     b"m.Box<| {}>",
   );
   let fresh = { next_type: 3, next_effect_variable: 3 };
-  let u = unify(substitution_new(), fresh, open, conn);
+  let u = unify(substitution_new(), fresh, open, connection_type);
   assert(u.error == None);
-  assert_eq(type_text(resolve_type(u.substitution, open)), type_text(conn));
-  let narrower = unify(substitution_new(), fresh, conn, held(label_type(b"conn"), no_effects()));
+  assert_eq(type_text(resolve_type(u.substitution, open)), type_text(connection_type));
+  let narrower = unify(
+    substitution_new(),
+    fresh,
+    connection_type,
+    sink_type(label_type(b"conn"), no_effects()),
+  );
   assert(match narrower.error { Some(EffectsMismatch(_)) -> true, _ -> false });
   let elsewhere = unify(
     substitution_new(),
     fresh,
-    conn,
-    held(label_type(b"peer"), open_effects(2)),
+    connection_type,
+    sink_type(label_type(b"peer"), open_effects(2)),
   );
   assert(match elsewhere.error {
     Some(Mismatch(m)) -> type_text(m.expected) == b"[conn]" && type_text(m.found) == b"[peer]",
@@ -2619,17 +2650,17 @@ test "a declared type's label and effect arguments print correctly, unify with o
 
 test "a `new` record's label and effect arguments print, unify and are substituted into its fields the same way as a sum type's" {
   let send = |r: Resource| { effect: b"net", resource: r, mode: WriteMode, op: Some(b"send") };
-  let held = |label: Type, effects: Effects|
+  let feed_type = |label: Type, effects: Effects|
     NominalType({
       name: b"m.Feed",
       args: applied_args([int_type()], [label], [effects]),
       fields: [{ name: b"send", ty: fn_type([int_type()], unit_type(), effects) }],
     });
-  let open = held(VariableType(1), { listed: [send(ResourceVariable(1))], variable: Some(2) });
-  let conn = held(label_type(b"conn"), single_effect(send(NamedResource(b"conn"))));
+  let open = feed_type(VariableType(1), { listed: [send(ResourceVariable(1))], variable: Some(2) });
+  let connection_type = feed_type(label_type(b"conn"), single_effect(send(NamedResource(b"conn"))));
   assert_eq(type_text(open), b"m.Feed<Int, [l] | {net.send[l] | e}>");
   let used = apply_arguments(
-    held(VariableType(1), open_effects(2)),
+    feed_type(VariableType(1), open_effects(2)),
     [1],
     [2],
     applied_args([], [label_type(b"conn")], [single_effect(send(NamedResource(b"conn")))]),
@@ -2639,14 +2670,19 @@ test "a `new` record's label and effect arguments print, unify and are substitut
     b"(Int) -> Unit / {net.send[conn]}",
   ]);
   let fresh = { next_type: 3, next_effect_variable: 3 };
-  assert(unify(substitution_new(), fresh, used, conn).error == None);
-  let narrower = unify(substitution_new(), fresh, conn, held(label_type(b"conn"), no_effects()));
+  assert(unify(substitution_new(), fresh, used, connection_type).error == None);
+  let narrower = unify(
+    substitution_new(),
+    fresh,
+    connection_type,
+    feed_type(label_type(b"conn"), no_effects()),
+  );
   assert(match narrower.error { Some(EffectsMismatch(_)) -> true, _ -> false });
   let elsewhere = unify(
     substitution_new(),
     fresh,
-    conn,
-    held(label_type(b"peer"), open_effects(2)),
+    connection_type,
+    feed_type(label_type(b"peer"), open_effects(2)),
   );
   assert(match elsewhere.error { Some(Mismatch(_)) -> true, _ -> false })
 }
@@ -2687,18 +2723,18 @@ test "a type table returns each type inserted into it, and inserting the same ty
     VariableType(2),
     span,
   ];
-  let held = types.fold(
+  let inserted = types.fold(
     { table: Map::new(), keys: [] },
     |accumulator: { table: TypeTable, keys: List<Bytes> }, ty: Type| {
       let h = insert_type(accumulator.table, ty);
       { table: h.table, keys: accumulator.keys.push(h.key) }
     },
   );
-  assert_eq(held.keys.map(|k: Bytes| type_at(held.table, k, Map::new()).ty), types);
-  let again = insert_type(held.table, point);
+  assert_eq(inserted.keys.map(|k: Bytes| type_at(inserted.table, k, Map::new()).ty), types);
+  let again = insert_type(inserted.table, point);
   assert_eq(again.key, insert_type(Map::new(), point).key);
-  assert_eq(again.table, held.table);
-  assert_eq(held.table.len(), 6)
+  assert_eq(again.table, inserted.table);
+  assert_eq(inserted.table.len(), 6)
 }
 
 test "`interned_subset` of a table built from several lists of types, restricted to one list, equals a table built from only that list" {

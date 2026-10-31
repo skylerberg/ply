@@ -125,7 +125,7 @@ fn op_row(module: Int, op_info: OpInfo, width_sums: WidthSums) -> OpRow / {abort
     kept: op_info.kept,
     params: op_info.params.map(canonical_type),
     ret: canonical_type(op_info.ret),
-    scheme: match op_info.scheme { Some(sc) -> Some(canonical_scheme(sc)), None -> None },
+    scheme: match op_info.scheme { Some(scheme) -> Some(canonical_scheme(scheme)), None -> None },
     at: span_at(module, op_info.at.span),
     carries: widths_of_all(width_sums, [], op_info.params).map(grounded),
   }
@@ -168,11 +168,11 @@ fn waiting_operations(
         |accumulator: List<Bytes>, e: TypedExpression<Bytes>|
           match e.node {
             TypedHandle(h) ->
-              h.clauses.fold(accumulator, |ops: List<Bytes>, c: TypedClause<Bytes>|
+              h.clauses.fold(accumulator, |operations: List<Bytes>, c: TypedClause<Bytes>|
                 if c.effect == served
                     && c.effects.listed.any(|a: Effect| a.effect == b"std.internal.native.wait") {
-                  ops.push(c.op)
-                } else { ops }),
+                  operations.push(c.op)
+                } else { operations }),
             _ -> accumulator,
           },
       ),
@@ -300,7 +300,7 @@ fn hash_rows(outlines: List<Outline>, hashes: HashOutput) -> List<HashTableRow> 
 }
 
 fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.raise} = {
-  let (params, ret, effects) = match definition_info.scheme.ty {
+  let (params, return_type, effects) = match definition_info.scheme.ty {
     FunctionType(f) -> (f.params, f.ret, f.effects.listed),
     other -> ([], other, []),
   };
@@ -316,7 +316,7 @@ fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.rai
     b"(",
     Bytes::join(printed.texts, b", "),
     b") -> ",
-    print_type(printed.p, ret).text,
+    print_type(printed.p, return_type).text,
     b" / ",
     effect_list_text(canonical_effects(effects), b", "),
     b" ",
@@ -550,18 +550,24 @@ fn width_number(name: Bytes) -> Option<Int> =
 type WidthSums = { sums: Map<Bytes, Bool> }
 
 fn width_sums_of(constructors: List<ConstructorInfo>) -> WidthSums = {
-  let held = holding_widths(constructors, []);
+  let fixed_width_types = holding_widths(constructors, []);
   {
     sums: Map::of_entries(
       constructors.map(|constructor_info: ConstructorInfo|
-        { key: constructor_info.type_name, value: held.contains(constructor_info.type_name) }),
+        {
+          key: constructor_info.type_name,
+          value: fixed_width_types.contains(constructor_info.type_name),
+        }),
     ),
   }
 }
 
-fn holding_widths(constructors: List<ConstructorInfo>, held: List<Bytes>) -> List<Bytes> =
+fn holding_widths(
+  constructors: List<ConstructorInfo>,
+  fixed_width_types: List<Bytes>,
+) -> List<Bytes> =
   range(0, constructors.len() + 1).fold(
-    { held: held, done: false },
+    { held: fixed_width_types, done: false },
     |st: { held: List<Bytes>, done: Bool }, i: Int|
       if st.done { st } else {
         let grown = constructors.fold(
@@ -576,27 +582,29 @@ fn holding_widths(constructors: List<ConstructorInfo>, held: List<Bytes>) -> Lis
       },
   ).held
 
-fn has_fixed_width(t: Type, held: List<Bytes>) -> Bool =
+fn has_fixed_width(t: Type, fixed_width_types: List<Bytes>) -> Bool =
   match t {
     VariableType(_) -> false,
     NamedType(c) ->
-      width_number(c.name) != None || held.contains(c.name)
-        || c.args.fold(false, |b: Bool, a: Type| b || has_fixed_width(a, held)),
+      width_number(c.name) != None || fixed_width_types.contains(c.name)
+        || c.args.fold(false, |b: Bool, a: Type| b || has_fixed_width(a, fixed_width_types)),
     FunctionType(_) -> false,
-    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || has_fixed_width(field.ty, held)),
+    RecordType(fs) ->
+      fs.fold(false, |b: Bool, field: Field| b || has_fixed_width(field.ty, fixed_width_types)),
     NominalType(n) ->
-      n.fields.fold(false, |b: Bool, field: Field| b || has_fixed_width(field.ty, held)),
+      n.fields.fold(false, |b: Bool, field: Field|
+        b || has_fixed_width(field.ty, fixed_width_types)),
   }
 
 fn has_no_widths(widths_of: Widths) -> Bool = match widths_of { NoWidths -> true, _ -> false }
 
-fn widths_of(width_sums: WidthSums, vars: List<Int>, ty: Type) -> Widths / {abort.raise} =
+fn widths_of(width_sums: WidthSums, type_variables: List<Int>, ty: Type) -> Widths / {abort.raise} =
   match ty {
-    VariableType(v) -> VariableWidths(var_number(vars, v)),
+    VariableType(v) -> VariableWidths(var_number(type_variables, v)),
     NamedType(c) -> match width_number(c.name) {
       Some(n) -> FixedWidth(n),
       None -> {
-        let args = widths_of_all(width_sums, vars, c.args);
+        let args = widths_of_all(width_sums, type_variables, c.args);
         let plain = args.fold(true, |b: Bool, a: Widths| b && has_no_widths(a));
         if list_item(ty) != None || array_element(ty) != None || columns_row(ty) != None {
           if plain { NoWidths } else { ListWidths(args.get(0)) }
@@ -604,38 +612,39 @@ fn widths_of(width_sums: WidthSums, vars: List<Int>, ty: Type) -> Widths / {abor
           if plain { NoWidths } else { MapWidths(args.get(0), args.get(1)) }
         } else {
           match width_sums.sums.get(c.name) {
-            Some(holds) -> if holds || !plain { SumWidths(args) } else { NoWidths },
+            Some(fixed_width) -> if fixed_width || !plain { SumWidths(args) } else { NoWidths },
             None -> NoWidths,
           }
         }
       },
     },
     FunctionType(f) -> {
-      let params = widths_of_all(width_sums, vars, f.params);
-      let ret = widths_of(width_sums, vars, f.ret);
-      if has_no_widths(ret) && params.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) {
-        NoWidths
-      } else { FunctionWidths(params, ret) }
+      let params = widths_of_all(width_sums, type_variables, f.params);
+      let return_widths = widths_of(width_sums, type_variables, f.ret);
+      if has_no_widths(return_widths)
+          && params.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) { NoWidths }
+      else { FunctionWidths(params, return_widths) }
     },
-    RecordType(fs) -> record_widths(width_sums, vars, fs),
-    NominalType(n) -> record_widths(width_sums, vars, n.fields),
+    RecordType(fs) -> record_widths(width_sums, type_variables, fs),
+    NominalType(n) -> record_widths(width_sums, type_variables, n.fields),
   }
 
 fn record_widths(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   fs: List<Field>,
 ) -> Widths / {abort.raise} = {
-  let fields = fs.map(|f: Field| { name: f.name, widths: widths_of(width_sums, vars, f.ty) });
+  let fields = fs.map(|f: Field|
+    { name: f.name, widths: widths_of(width_sums, type_variables, f.ty) });
   if fields.fold(true, |b: Bool, f: FieldWidths| b && has_no_widths(f.widths)) { NoWidths }
   else { RecordWidths(fields) }
 }
 
 fn widths_of_all(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   types: List<Type>,
-) -> List<Widths> / {abort.raise} = types.map(|ty: Type| widths_of(width_sums, vars, ty))
+) -> List<Widths> / {abort.raise} = types.map(|ty: Type| widths_of(width_sums, type_variables, ty))
 
 fn grounded(c: Widths) -> Widths =
   match c {
@@ -664,9 +673,9 @@ fn grounded(c: Widths) -> Widths =
     other -> other,
   }
 
-fn var_number(vars: List<Int>, v: Int) -> Int / {abort.raise} =
-  range(0, vars.len()).fold(vars.len() + v, |accumulator: Int, i: Int|
-    if accumulator >= vars.len() && vars.get(i) == v { i } else { accumulator })
+fn var_number(type_variables: List<Int>, v: Int) -> Int / {abort.raise} =
+  range(0, type_variables.len()).fold(type_variables.len() + v, |accumulator: Int, i: Int|
+    if accumulator >= type_variables.len() && type_variables.get(i) == v { i } else { accumulator })
 
 fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
   match ty {
@@ -676,7 +685,7 @@ fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
 
 fn emitter_root(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   witnesses: List<Int>,
   root: RootKey,
   params: List<Type>,
@@ -691,21 +700,21 @@ fn emitter_root(
     arity: taken.len() + labels,
     pure: pure,
     at: place,
-    params: widths_of_all(width_sums, vars, taken),
-    result: widths_of(width_sums, vars, result),
+    params: widths_of_all(width_sums, type_variables, taken),
+    result: widths_of(width_sums, type_variables, result),
     witnesses: witnesses,
   }
 }
 
 fn proposition_root(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   witnesses: List<Int>,
   root: RootKey,
   params: List<Type>,
   place: ModuleSpan,
 ) -> EmitterRoot / {abort.raise} =
-  emitter_root(width_sums, vars, witnesses, root, params, bool_type(), 0, false, place)
+  emitter_root(width_sums, type_variables, witnesses, root, params, bool_type(), 0, false, place)
 
 fn witness_variables(definition: DefinitionInfo) -> List<Int> =
   witness_params(definition.constraints)
@@ -735,12 +744,12 @@ fn emitter_roots(
                 None -> a,
                 Some(definition) -> {
                   let sig = emit_signature(definition.scheme.ty);
-                  let vars = definition.scheme.type_variables;
+                  let function_variables = definition.scheme.type_variables;
                   let witnesses = witness_variables(definition);
                   let place = span_at(definition.at.module, definition.at.span);
                   let fn_row = emitter_root(
                     width_sums,
-                    vars,
+                    function_variables,
                     witnesses,
                     Named(name),
                     sig.params,
@@ -757,7 +766,7 @@ fn emitter_roots(
                           let root = clause_key(name, kind, b.requires);
                           let row = proposition_root(
                             width_sums,
-                            vars,
+                            function_variables,
                             witnesses,
                             root,
                             sig.params,
@@ -769,7 +778,7 @@ fn emitter_roots(
                           let root = clause_key(name, kind, b.ensures);
                           let row = proposition_root(
                             width_sums,
-                            vars,
+                            function_variables,
                             witnesses,
                             root,
                             sig.params.push(sig.ret),
@@ -821,7 +830,7 @@ fn emitter_roots(
                   Some(x) -> x.binders.map(|b: LawBinder| b.ty),
                   None -> [],
                 };
-                let vars = variables_in(binders);
+                let law_variables = variables_in(binders);
                 let place = match law {
                   Some(x) -> span_at(x.at.module, x.at.span),
                   None -> no_module_span(),
@@ -831,7 +840,7 @@ fn emitter_roots(
                   |part: LawPart| {
                     proposition_root(
                       width_sums,
-                      vars,
+                      law_variables,
                       [],
                       law_key(o.name, l.name, part),
                       binders,

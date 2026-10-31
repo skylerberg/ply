@@ -387,9 +387,9 @@ pub fn analyse_with(
       accumulator.push({ ..parse_at(accumulator.len(), m.src), src: m.src.src }),
   );
   let all = if closed.any(|p: ParsedSource| p.name == prelude_module()) { closed } else {
-    let src = prelude_source::text();
+    let source = prelude_source::text();
     closed.push(
-      untested({ ..parse_at(closed.len(), { name: prelude_module(), src: src }), src: src }),
+      untested({ ..parse_at(closed.len(), { name: prelude_module(), src: source }), src: source }),
     )
   };
   let texts = all.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, p: ParsedSource|
@@ -419,12 +419,12 @@ fn unimported_in(
   r: Resolution,
   read: Map<Bytes, List<Bytes>>,
 ) -> List<List<Bytes>> / {abort.raise} = {
-  let held = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
+  let module_names = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
     accumulator.insert(m.name, true));
   range(0, modules.len()).map(|i: Int|
     unimported_of(
       match read.get(modules.get(i).name) { Some(xs) -> xs, None -> [] },
-      |m: Bytes| held.contains(m),
+      |m: Bytes| module_names.contains(m),
       r.imports.get(i).map(|t: Int| modules.get(t).name),
     ))
 }
@@ -606,13 +606,13 @@ pub fn checked_closure(
       checked: checked,
       index: h.index,
       hashes: {
-        let kept = cached_member_sites(h.modules, checked);
+        let cached_sites = cached_member_sites(h.modules, checked);
         checked_hashes(
           h.hashes,
-          checked.facts.members.concat(kept.sites),
-          kept.unread,
+          checked.facts.members.concat(cached_sites.sites),
+          cached_sites.unread,
           checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TestInfo|
-            if kept.unread.contains(test_owner(t.module, t.name)) {
+            if cached_sites.unread.contains(test_owner(t.module, t.name)) {
               accumulator.insert(t.key, true)
             } else { accumulator }),
         )
@@ -635,8 +635,10 @@ fn cached_member_sites(
   modules: List<ParsedModule>,
   checked: CheckOutput,
 ) -> { sites: List<MemberSite>, unread: Map<Bytes, Bool> } / {abort.raise} = {
-  let kept = checked.cached.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, k: CachedFacts|
-    accumulator.insert(k.name, k.facts));
+  let cached_facts = checked.cached.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bytes>, k: CachedFacts| accumulator.insert(k.name, k.facts),
+  );
   let read = range(0, modules.len()).fold(
     { sites: [], placed: Map::new() },
     |accumulator: { sites: List<MemberSite>, placed: Map<Bytes, Bool> }, i: Int| {
@@ -651,7 +653,7 @@ fn cached_member_sites(
           };
           match at {
             None -> a,
-            Some(x) -> match kept.get(x.owner) {
+            Some(x) -> match cached_facts.get(x.owner) {
               None -> a,
               Some(recorded) -> match decode_facts(recorded, i, x.owner) {
                 None -> a,
@@ -691,7 +693,7 @@ fn analyse_closure(
       None -> checked_closure(h, rows, CheckEvery),
       Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
         Err(diagnostics) -> Rejected(diagnostics),
-        Ok(kept) -> checked_closure(kept, rows, CheckEvery),
+        Ok(pruned) -> checked_closure(pruned, rows, CheckEvery),
       },
     },
   }
@@ -714,11 +716,11 @@ fn prune_prelude(
     h.index.laws.map(|l: LawNode| ItemKeyed(l.key)),
   );
   let reach = reached_functions(h.hashes, roots);
-  let kept = |p: ParsedSource, item: Item|
+  let is_reachable = |p: ParsedSource, item: Item|
     match item { FunctionItem(d) -> reach.contains(qualify(p.name, d.name.name)), _ -> true };
   if !parsed.any(|p: ParsedSource|
-      p.name == prelude_module() && p.module.module.items.any(|item: Item| !kept(p, item))) { None }
-  else {
+      p.name == prelude_module()
+        && p.module.module.items.any(|item: Item| !is_reachable(p, item))) { None } else {
     Some(
       parsed.map(|p: ParsedSource|
         if p.name != prelude_module() { p } else {
@@ -728,7 +730,7 @@ fn prune_prelude(
               ..p.module,
               module: {
                 ..p.module.module,
-                items: p.module.module.items.filter(|item: Item| kept(p, item)),
+                items: p.module.module.items.filter(|item: Item| is_reachable(p, item)),
               },
             },
           }
@@ -791,18 +793,21 @@ fn names_reached(hashes: List<HashTableRow>, entry: Bytes) -> Map<Bytes, Bool> /
 }
 
 fn definitions_reached(hashes: List<HashTableRow>, entry: Bytes) -> Bytes / {abort.raise} = {
-  let reached = names_reached(hashes, entry);
-  let held = hashes.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, frame: HashTableRow|
-    match frame {
-      DefinitionHashRow(row) -> match row.definition {
-        Some(h) -> if reached.contains(row.name) { accumulator.insert(row.name, h) }
-        else { accumulator },
-        None -> accumulator,
+  let reachable = names_reached(hashes, entry);
+  let reachable_hashes = hashes.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bytes>, frame: HashTableRow|
+      match frame {
+        DefinitionHashRow(row) -> match row.definition {
+          Some(h) -> if reachable.contains(row.name) { accumulator.insert(row.name, h) }
+          else { accumulator },
+          None -> accumulator,
+        },
+        _ -> accumulator,
       },
-      _ -> accumulator,
-    });
+  );
   Bytes::concat_all(
-    held.fold([], |lines: List<Bytes>, name: Bytes, h: Bytes|
+    reachable_hashes.fold([], |lines: List<Bytes>, name: Bytes, h: Bytes|
       lines.push(Bytes::concat_all([name, b" ", h, b"\n"]))),
   )
 }
@@ -922,7 +927,7 @@ fn resolved_at(
           ty: |t: Type, u: Unit| { ty: t, state: u },
           effects: |r: Effects| r,
           entry: |a: Effect| a,
-          span: |sp: Span| moved_by(sp, base),
+          span: |span: Span| moved_by(span, base),
         }).out,
       ),
   }
@@ -1058,8 +1063,8 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
       {
         ..c,
         node: CodeBlock({
-          statements: b.statements.map(|stmt: CodeStatement|
-            match stmt {
+          statements: b.statements.map(|statement: CodeStatement|
+            match statement {
               CodeLet(l) -> CodeLet({ name: l.name, slot: l.slot, value: g(l.value) }),
               CodeLetDestructure(l) ->
                 CodeLetDestructure({ span: l.span, pattern: l.pattern, value: g(l.value) }),
@@ -1069,7 +1074,7 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
         }),
       },
     CodeList(l) -> { ..c, node: CodeList({ items: gs(l.items) }) },
-    CodeRecord(rc) -> { ..c, node: CodeRecord({ fields: given_fields(rc.fields, given) }) },
+    CodeRecord(record) -> { ..c, node: CodeRecord({ fields: given_fields(record.fields, given) }) },
     CodeMatch(x) ->
       {
         ..c,
@@ -1166,15 +1171,17 @@ fn instantiated(
               Some(Map::new()),
               |accumulator: Option<Map<Int, Code>>, k: Int|
                 match ((accumulator, a.args.at(k))) {
-                  (Some(held), Some(arg)) -> {
+                  (Some(substitutions), Some(arg)) -> {
                     let x = lower_fn([], [], arg);
-                    if x.failed.len() > 0 { None } else { Some(held.insert(binders + k, x.code)) }
+                    if x.failed.len() > 0 { None }
+                    else { Some(substitutions.insert(binders + k, x.code)) }
                   },
                   _ -> None,
                 },
             );
             match given {
-              Some(held) -> if l.failed.len() > 0 { None } else { Some(given_in(l.code, held)) },
+              Some(substitutions) -> if l.failed.len() > 0 { None }
+              else { Some(given_in(l.code, substitutions)) },
               None -> None,
             }
           },
@@ -1369,7 +1376,7 @@ pub fn untested(p: ParsedSource) -> ParsedSource =
   }
 
 fn size_over(home: Bytes, declared: Bytes) -> Bytes / {abort.raise} = {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"import ",
     home,
     b"\npub fn size(s: ",
@@ -1380,7 +1387,7 @@ fn size_over(home: Bytes, declared: Bytes) -> Bytes / {abort.raise} = {
     home,
     b"::log.put(1); 1 }\n",
   ]);
-  match analyse(parse_all([{ name: b"m", src: src }, { name: home, src: declared }])) {
+  match analyse(parse_all([{ name: b"m", src: source }, { name: home, src: declared }])) {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
         d.name == b"m.size") {
@@ -1432,8 +1439,8 @@ test "an interface distinguishes a type from an effect that has the same name" {
 }
 
 test "an interface differs when a function parameter or type variable is marked `keep` and when it is not" {
-  let recorded = |src: Bytes|
-    match analyse(parse_all([{ name: b"m", src: src }])) {
+  let recorded = |source: Bytes|
+    match analyse(parse_all([{ name: b"m", src: source }])) {
       Rejected(_) -> panic("the test program fails to check"),
       Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
           d.name == b"m.f") {
@@ -1454,8 +1461,8 @@ test "an interface differs when a function parameter or type variable is marked 
 }
 
 test "the types used in a function body are recorded as keys into one shared table of types, and read back from that table" {
-  let src = b"fn first<a>(xs: List<a>, d: a) -> a = match xs { [x, ..] -> x, _ -> d }\nfn go(ys: List<Int>) -> Int = first(ys, 0)\n";
-  match analyse(parse_all([{ name: b"m", src: src }])) {
+  let source = b"fn first<a>(xs: List<a>, d: a) -> a = match xs { [x, ..] -> x, _ -> d }\nfn go(ys: List<Int>) -> Int = first(ys, 0)\n";
+  match analyse(parse_all([{ name: b"m", src: source }])) {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(w) -> {
       let rows = rows_of(w);
@@ -1522,8 +1529,8 @@ test "each test is identified by its module and label, and tests are listed in t
 }
 
 test "a published listing limited to chosen definitions and tests still has every test as a root, and its keys are the full listing's keys for the chosen roots" {
-  let src = b"fn base(x: Int) -> Int = x + 1\nfn used(x: Int) -> Int requires x > 0 = base(x)\nfn other(x: Int) -> Int = x * 2\ntest \"uses\" { assert_eq(used(1), 2) }\ntest \"others\" { assert_eq(other(1), 2) }\nlaw \"l\" forall (x: Int) { other(x) == x * 2 }";
-  match analyse(parse_all([{ name: b"m", src: src }])) {
+  let source = b"fn base(x: Int) -> Int = x + 1\nfn used(x: Int) -> Int requires x > 0 = base(x)\nfn other(x: Int) -> Int = x * 2\ntest \"uses\" { assert_eq(used(1), 2) }\ntest \"others\" { assert_eq(other(1), 2) }\nlaw \"l\" forall (x: Int) { other(x) == x * 2 }";
+  match analyse(parse_all([{ name: b"m", src: source }])) {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(w) -> {
       let whole = dump_of(Analysed(w));
@@ -1552,13 +1559,13 @@ test "a published listing limited to chosen definitions and tests still has ever
 
 test "a test's key depends on the effect operations its code uses, and not on the order an effect set lists them in" {
   let key = |set: Bytes| {
-    let src = Bytes::concat_all([
+    let source = Bytes::concat_all([
       b"effect store {\n  read all[r]() -> List<Int>\n  write save[r](rows: List<Int>) -> Unit\n}\n",
       set,
       b"\nfn listed() -> Int / {Web} = store.all[orders]().len()\n",
       b"test \"listed\" { handle { assert_eq(listed(), 0) } with { store.all[orders]() -> [] } }\n",
     ]);
-    match analyse(parse_all([{ name: b"m", src: src }])) {
+    match analyse(parse_all([{ name: b"m", src: source }])) {
       Rejected(_) -> panic("the test program fails to check"),
       Analysed(w) ->
         dump_of(Analysed(w)).keys.filter(|k: KeyRow| k.root == test_owner(b"m", b"listed")).map(
@@ -1587,14 +1594,14 @@ test "a published builtin lists its type signature and its parameter names" {
 }
 
 test "prelude function bodies can call extern functions and functions on a type, by method syntax or by qualified name" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"extern fn List::at<a>(xs: List<a>, i: Int) -> Option<a>\n",
     b"extern fn List::len<a>(xs: List<a>) -> Int\n",
     b"fn walked<a>(xs: List<a>, i: Int) -> Int = match xs.at(i) { Some(_) -> walked(xs, i + 1), None -> i }\n",
     b"pub fn List::count<a>(xs: List<a>) -> Int = walked(xs, 0) + xs.len() + List::len(xs)\n",
     b"pub fn List::twice<a>(xs: List<a>) -> Int = xs.count() + List::count(xs)\n",
   ]);
-  match analyse(parse_all([{ name: prelude_module(), src: src }])) {
+  match analyse(parse_all([{ name: prelude_module(), src: source }])) {
     Rejected(ds) ->
       panic(String::of_bytes_lossy(Bytes::join(ds.map(|d: Diagnostic| d.message), b"; "))),
     Analysed(w) ->
@@ -1607,7 +1614,7 @@ test "prelude function bodies can call extern functions and functions on a type,
 }
 
 test "a function that `std.prelude` defines in Ply is checked against the type signature that its callers see" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n",
     b"pub fn k(xs: List<Int>) -> Option<Int> / {abort.raise} = xs.set(0, 1).push(2).at(0)\n",
     b"pub fn l(a: Array<Int>, c: Columns<{ x: Int }>) -> Int = a.to_list().len() + c.to_list().len()\n",
@@ -1619,7 +1626,7 @@ test "a function that `std.prelude` defines in Ply is checked against the type s
     b"pub fn d(a: Decimal, b: Decimal, f: Float, s: String) -> Int / {abort.raise} = a.div(b, 2, HalfEven).round(1, Down).to_string().len() + some(Decimal::of_string(s)) + some(Decimal::of_float(f)) + some(Int::of_decimal(a, Up)) + some(Int::of_float(f.round(Floor), Ceiling)) + (if Float::of_decimal(a) > 0.0 { 1 } else { 0 })\n",
     b"pub fn n(m: Map<Int, Int>) -> Int = m.remove(1).insert(2, 3).update(2, |v: Int| v + 1).fold(0, |s: Int, k: Int, v: Int| s + k + v) + m.keys().len() + m.values().len() + m.entries().len() + Map::of_entries(m.entries()).merge(m).len() + e(m.first()) + e(m.last()) + e(m.floor(1)) + e(m.ceiling(1)) + e(m.below(1)) + e(m.above(1)) + p(m.pop_first()) + p(m.pop_last()) + m.range(None, true, None, true, 3).len() + (if m.contains(1) { 1 } else { 0 }) + m.split(1).below.len() + match m.get(1) { Some(v) -> v, None -> 0 }\n",
   ]);
-  match analyse(parse_all([{ name: b"m", src: src }])) {
+  match analyse(parse_all([{ name: b"m", src: source }])) {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(w) -> {
       let checked = w.checked.definitions.fold(
@@ -1641,8 +1648,8 @@ test "a function that `std.prelude` defines in Ply is checked against the type s
 }
 
 test "printing a definition's source text writes the parameter name on a method-call argument, as in `c.scaled(plus: 3)`" {
-  let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)\n";
-  match analyse(parse_all([{ name: b"m", src: src }])) {
+  let source = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)\n";
+  match analyse(parse_all([{ name: b"m", src: source }])) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
     Analysed(w) -> {
       let more = match print_bodies(

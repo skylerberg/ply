@@ -327,7 +327,7 @@ fn named(
     let part = printer.layout.parts.get(slot.part);
     printer.source_names.contains(qualify(part.module, part.names.get(slot.class)))
   };
-  let told = match printer.layout.by_hash.get(target.hash) {
+  let has_source_name = match printer.layout.by_hash.get(target.hash) {
     Some(slots) -> slots.filter(meant).len() > 0,
     None -> false,
   };
@@ -335,7 +335,7 @@ fn named(
     Some({ part: printer.part, class: target.member_index })
   } else {
     pick(printer.layout, printer.graph, naming.imports, target.hash, printer.module, |slot: Slot|
-      !told || meant(slot))
+      !has_source_name || meant(slot))
   };
   match found {
     None ->
@@ -402,9 +402,10 @@ fn names_body(
   match layout.by_hash.get(hash) {
     None -> false,
     Some(found) ->
-      found.fold(false, |held: Bool, s: Slot| {
+      found.fold(false, |already_named: Bool, s: Slot| {
         let p = layout.parts.get(s.part);
-        held || (p.module == module && p.names.get(s.class) == name && nameable(layout, s, own))
+        already_named
+          || (p.module == module && p.names.get(s.class) == name && nameable(layout, s, own))
       }),
   }
 
@@ -574,7 +575,7 @@ fn type_of(
         }),
       }
     },
-    Function(parameters, returned, effects, kept, once) -> {
+    Function(parameters, returned, effects, retained_parameters, once) -> {
       let spelled_parameters = types_of(printer, naming, depth, parameters);
       let spelled_returned = type_of(printer, spelled_parameters.naming, depth, returned);
       let spelled_effects = optional_effects_of(printer, spelled_returned.naming, depth, effects);
@@ -583,7 +584,7 @@ fn type_of(
         node: FunctionTypeExpression({
           span: dummy_span(),
           params: spelled_parameters.node,
-          kept: kept,
+          kept: retained_parameters,
           once: once,
           ret: spelled_returned.node,
           effects: spelled_effects.node,
@@ -1215,7 +1216,7 @@ fn expression_of(
       }
     },
     Block(entries, tail) -> {
-      let said = |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, statement: StoredStatement| {
+      let append_statement = |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, statement: StoredStatement| {
         let spelled = statement_of(printer, accumulator.naming, accumulator.depth, statement);
         { naming: spelled.naming, depth: spelled.depth, node: accumulator.node.push(spelled.node) }
       };
@@ -1223,8 +1224,8 @@ fn expression_of(
         { naming: naming, depth: depth, node: [] },
         |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, entry: stored::Entry<Reference, Int, Int, Unit>|
           match entry {
-            One(statement) -> said(accumulator, statement),
-            Commuting(_, members) -> members.fold(accumulator, said),
+            One(statement) -> append_statement(accumulator, statement),
+            Commuting(_, members) -> members.fold(accumulator, append_statement),
           },
       );
       let spelled_variable = optional_expression_of(
@@ -1285,14 +1286,14 @@ fn handle_of(
     },
   );
   let body = expression_of(printer, variables.naming, depth, handled.body);
-  let held = level + handled.variables.len();
+  let level_after_variables = level + handled.variables.len();
   let clauses = named_in_turn(
     body.naming,
     handled.clauses,
     |so_far: NameState, clause: stored::HandlerClause<Reference, Int, Int, Unit>| {
       let effect_name = effect_named(printer, so_far, clause.effect);
       let labelled_by = labelled(depth, clause.label);
-      let bound = held + clause.parameters;
+      let bound = level_after_variables + clause.parameters;
       let clause_body = expression_of(
         printer,
         effect_name.naming,
@@ -1310,7 +1311,7 @@ fn handle_of(
           resume: if clause.resumes { Some(ident(local_name(bound))) } else { None },
           body: clause_body.node,
           span: span,
-          params: range(held, bound).map(|i: Int| ident(local_name(i))),
+          params: range(level_after_variables, bound).map(|i: Int| ident(local_name(i))),
         },
       }
     },
@@ -1318,10 +1319,19 @@ fn handle_of(
   let returned = match handled.returned {
     None -> { naming: clauses.naming, node: None },
     Some(given) -> {
-      let spelled = expression_of(printer, clauses.naming, { ..depth, values: held + 1 }, given);
+      let spelled = expression_of(
+        printer,
+        clauses.naming,
+        { ..depth, values: level_after_variables + 1 },
+        given,
+      );
       {
         naming: spelled.naming,
-        node: Some({ binder: ident(local_name(held)), body: spelled.node, span: span }),
+        node: Some({
+          binder: ident(local_name(level_after_variables)),
+          body: spelled.node,
+          span: span,
+        }),
       }
     },
   };
@@ -1877,16 +1887,16 @@ fn add_component(
       Some(cs) ->
         {
           ..checked,
-          parts: cs.fold(checked.parts, |ps: List<Part>, cp: Copied|
+          parts: cs.fold(checked.parts, |ps: List<Part>, copied: Copied|
             ps.push({
               members: component.members,
               picks: component.picks,
               hashes: component.hashes,
-              names: cp.names,
-              public: cp.public,
-              module: cp.module,
-              binder: default_binder(cp.module),
-              printed: !shipped.contains(cp.module),
+              names: copied.names,
+              public: copied.public,
+              module: copied.module,
+              binder: default_binder(copied.module),
+              printed: !shipped.contains(copied.module),
             })),
         },
     },
@@ -2115,8 +2125,8 @@ pub fn print_bodies(
           |accumulator: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
             accumulator.insert(
               source_names_key(n.name, n.hash),
-              n.names.fold(Map::new(), |held: Map<Bytes, Bool>, name: Bytes|
-                held.insert(name, true)),
+              n.names.fold(Map::new(), |names_so_far: Map<Bytes, Bool>, name: Bytes|
+                names_so_far.insert(name, true)),
             ),
         ),
       );

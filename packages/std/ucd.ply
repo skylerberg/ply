@@ -53,10 +53,10 @@ fn line_error(line: Bytes, reason: String) -> String = f"`{String::of_bytes_loss
 
 fn code_point(digits: Bytes, line: Bytes) -> Int / {abort.raise} =
   match digits.int_of_ascii_radix(16) {
-    Some(cp) -> if cp < 0 {
+    Some(point) -> if point < 0 {
       panic(line_error(line, "is not a code point or a range of code points"))
-    } else if cp > 0x10FFFF { panic(line_error(line, "is past U+10FFFF")) }
-    else { cp },
+    } else if point > 0x10FFFF { panic(line_error(line, "is past U+10FFFF")) }
+    else { point },
     None -> panic(line_error(line, "is not a code point or a range of code points")),
   }
 
@@ -102,8 +102,8 @@ type Span = { count: Int, value: Int }
 
 type CoverState = { spans: List<Span>, next: Int }
 
-fn covering(held: List<ValueRun>, missing: Int) -> List<Span> / {abort.raise} = {
-  let covered = held.fold({ spans: [], next: 0 }, |accumulator: CoverState, run: ValueRun|
+fn covering(runs: List<ValueRun>, missing: Int) -> List<Span> / {abort.raise} = {
+  let covered = runs.fold({ spans: [], next: 0 }, |accumulator: CoverState, run: ValueRun|
     if run.first < accumulator.next || run.last < run.first || run.last > 0x10FFFF {
       panic(
         "a table's ranges must be in ascending order, must not overlap and must end at or before U+10FFFF",
@@ -191,12 +191,13 @@ pub fn table_of(valued: List<ValueRun>, missing: Int) -> Table / {abort.raise} =
         }
       },
     );
-    let held = Bytes::concat_all(cut.blocks);
+    let block_bytes = Bytes::concat_all(cut.blocks);
     let values = Array::of_list(known.values);
     {
       index: Array::of_list(cut.index),
       blocks: Array::of_list(
-        range(0, held.len() / 2).map(|i: Int| values.get(held.at(2 * i) << 8 | held.at(2 * i + 1))),
+        range(0, block_bytes.len() / 2).map(|i: Int|
+          values.get(block_bytes.at(2 * i) << 8 | block_bytes.at(2 * i + 1))),
       ),
       missing: missing,
     }
@@ -208,8 +209,9 @@ pub fn table_of(valued: List<ValueRun>, missing: Int) -> Table / {abort.raise} =
 pub fn code_points(field: Bytes) -> List<Int> / {abort.raise} =
   field.split(b" ").filter(|part: Bytes| part.len() > 0).map(|part: Bytes|
     match part.int_of_ascii_radix(16) {
-      Some(cp) -> if cp < 0 || cp > 0x10FFFF { panic(line_error(field, "lists no code points")) }
-      else { cp },
+      Some(point) -> if point < 0 || point > 0x10FFFF {
+        panic(line_error(field, "lists no code points"))
+      } else { point },
       None -> panic(line_error(field, "lists no code points")),
     })
 
@@ -229,7 +231,8 @@ pub fn parse_offset(text: Bytes) -> Int / {abort.raise} =
 
 /// Returns the code point at a signed distance from `cp`. The distance is stored in the low twenty
 /// bits of `held`.
-pub fn apply_distance(cp: Int, held: Int) -> Int = cp + (held & 0xFFFFF ^ 0x80000) - 0x80000
+pub fn apply_distance(code_point: Int, distance: Int) -> Int =
+  code_point + (distance & 0xFFFFF ^ 0x80000) - 0x80000
 
 /// Sequences of code points stored end to end, for a table whose values are sequences. The table
 /// stores the place `intern` returns, and `sequence` reads the sequence back from it.
@@ -258,7 +261,8 @@ pub fn intern(
         let place = so_far.points.len() << 5 | sequence.len();
         {
           gathering: {
-            points: sequence.fold(so_far.points, |all: List<Int>, cp: Int| all.push(cp)),
+            points: sequence.fold(so_far.points, |all: List<Int>, code_point: Int|
+              all.push(code_point)),
             places: so_far.places.insert(sequence, place),
           },
           place: place,
@@ -270,19 +274,19 @@ pub fn intern(
 /// The sequence at `place` among the stored `code_points`. Empty for a place of zero.
 pub fn sequence(code_points: Array<Int>, place: Int) -> List<Int> =
   range(place >> 5, (place >> 5) + (place & 31)).fold([], |found: List<Int>, i: Int|
-    match code_points.at(i) { Some(cp) -> found.push(cp), None -> found })
+    match code_points.at(i) { Some(code_point) -> found.push(code_point), None -> found })
 
 /// Returns the value `held` stores for the code point `cp`, or the table's missing value when `cp`
 /// is not a code point. Always does two array reads, whatever `cp` is.
-pub fn lookup(held: Table, cp: Int) -> Int
+pub fn lookup(table: Table, code_point: Int) -> Int
   cost 1
 =
-  match held.index.at(cp >> 8) {
-    Some(block) -> match held.blocks.at(block << 8 | cp & 255) {
+  match table.index.at(code_point >> 8) {
+    Some(block) -> match table.blocks.at(block << 8 | code_point & 255) {
       Some(value) -> value,
-      None -> held.missing,
+      None -> table.missing,
     },
-    None -> held.missing,
+    None -> table.missing,
   }
 
 fn text_of(lines: List<String>) -> Bytes =
@@ -323,24 +327,24 @@ test "`runs` rejects the line {c.line} after the valid line 0041..005A, with the
   ) { assert_eq(try[abort.raise] { runs(text_of(["0041..005A;Lu", c.line])) }, Err(c.reason)) }
 
 test "a table of another version, or with no version, is rejected" {
-  let told = Err("a table opens with `# Unicode 17.0.0`");
-  assert_eq(try[abort.raise] { runs(b"# Unicode 16.0.0\n0041;Lu\n") }, told);
-  assert_eq(try[abort.raise] { runs(b"0041;Lu\n") }, told);
-  assert_eq(try[abort.raise] { runs(b"") }, told)
+  let expected_error = Err("a table opens with `# Unicode 17.0.0`");
+  assert_eq(try[abort.raise] { runs(b"# Unicode 16.0.0\n0041;Lu\n") }, expected_error);
+  assert_eq(try[abort.raise] { runs(b"0041;Lu\n") }, expected_error);
+  assert_eq(try[abort.raise] { runs(b"") }, expected_error)
 }
 
 fn first_byte(fields: List<Bytes>) -> Int / {abort.raise} =
   match fields { [field, ..] -> field.at(0), [] -> panic("no field") }
 
 test "`lookup` returns the value of the range containing a code point, and the default value elsewhere" {
-  let held = table(letters(), -1, first_byte);
+  let letters_table = table(letters(), -1, first_byte);
   assert_eq(
     [0, 0x40, 0x41, 0x5A, 0x5B, 0x60, 0x61, 0x62, 0xFFFF, 0x10FFFD, 0x10FFFE, 0x10FFFF].map(
-      |cp: Int| lookup(held, cp),
+      |code_point: Int| lookup(letters_table, code_point),
     ),
     [-1, -1, 76, 76, -1, -1, 76, -1, -1, -1, 67, 67],
   );
-  assert_eq([-1, -256, 0x110000, 9223372036854775807].map(|n: Int| lookup(held, n)), [
+  assert_eq([-1, -256, 0x110000, 9223372036854775807].map(|n: Int| lookup(letters_table, n)), [
     -1,
     -1,
     -1,
@@ -361,32 +365,32 @@ fn number(fields: List<Bytes>) -> Int / {abort.raise} =
   }
 
 test "`lookup` returns the right value for every code point in a table with more distinct values than fit in a byte" {
-  let held = table(distinct_blocks_table(1200), -7, number);
-  let wrong = range(0, 1200 * 257 + 600).filter(|cp: Int|
-    lookup(held, cp) != (if cp >= 1200 * 257 || cp % 257 == 256 { -7 } else { cp / 257 }));
+  let block_table = table(distinct_blocks_table(1200), -7, number);
+  let wrong = range(0, 1200 * 257 + 600).filter(|code_point: Int|
+    lookup(block_table, code_point)
+      != (if code_point >= 1200 * 257 || code_point % 257 == 256 { -7 } else { code_point / 257 }));
   assert_eq(wrong, [])
 }
 
 test "`table_of` builds a lookup table from value ranges, and rejects ranges that overlap or run backward" {
-  let held = table_of(
+  let range_table = table_of(
     [{ first: 0x41, last: 0x5A, value: 7 }, { first: 0x61, last: 0x61, value: 9 }],
     0,
   );
-  assert_eq([0x40, 0x41, 0x5A, 0x5B, 0x61, 0x62].map(|cp: Int| lookup(held, cp)), [
-    0,
-    7,
-    7,
-    0,
-    9,
-    0,
-  ]);
-  let told = Err(
+  assert_eq(
+    [0x40, 0x41, 0x5A, 0x5B, 0x61, 0x62].map(|code_point: Int| lookup(range_table, code_point)),
+    [0, 7, 7, 0, 9, 0],
+  );
+  let expected_error = Err(
     "a table's ranges must be in ascending order, must not overlap and must end at or before U+10FFFF",
   );
   let made = |runs: List<ValueRun>| try[abort.raise] { lookup(table_of(runs, 0), 0) };
-  assert_eq(made([{ first: 5, last: 9, value: 1 }, { first: 9, last: 12, value: 2 }]), told);
-  assert_eq(made([{ first: 5, last: 4, value: 1 }]), told);
-  assert_eq(made([{ first: 0x10FFFF, last: 0x110000, value: 1 }]), told)
+  assert_eq(
+    made([{ first: 5, last: 9, value: 1 }, { first: 9, last: 12, value: 2 }]),
+    expected_error,
+  );
+  assert_eq(made([{ first: 5, last: 4, value: 1 }]), expected_error);
+  assert_eq(made([{ first: 0x10FFFF, last: 0x110000, value: 1 }]), expected_error)
 }
 
 test "`code_points` parses a field of hex code points, and rejects a field containing anything else" {
@@ -400,12 +404,12 @@ test "`intern` stores a code point sequence and returns its position, and adding
   let one = intern(empty_pool(), [0x73, 0x73]);
   let two = intern(one.gathering, [0x66, 0x66, 0x69]);
   let again = intern(two.gathering, [0x73, 0x73]);
-  let held = Array::of_list(again.gathering.points);
-  assert_eq(held.len(), 5);
+  let stored_points = Array::of_list(again.gathering.points);
+  assert_eq(stored_points.len(), 5);
   assert_eq(again.place, one.place);
-  assert_eq(sequence(held, one.place), [0x73, 0x73]);
-  assert_eq(sequence(held, two.place), [0x66, 0x66, 0x69]);
-  assert_eq(sequence(held, 0), []);
+  assert_eq(sequence(stored_points, one.place), [0x73, 0x73]);
+  assert_eq(sequence(stored_points, two.place), [0x66, 0x66, 0x69]);
+  assert_eq(sequence(stored_points, 0), []);
   assert_eq(intern(again.gathering, []).place, 0);
   assert_eq(
     [b"", b"0", b"32", b"-32"].map(|text: Bytes| apply_distance(100, parse_offset(text))),

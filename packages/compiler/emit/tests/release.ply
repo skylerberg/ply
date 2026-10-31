@@ -155,7 +155,7 @@ test "`holds_unkeepable_value` is true for a type that contains a function, even
   match corpus_constructors() {
     Err(reason) -> assert_eq(reason, b""),
     Ok(constructors) -> {
-      let held = |ty: Type|
+      let contains_unkeepable = |ty: Type|
         holds_unkeepable_value(
           constructors,
           WordBlock({ parts: [{ at: 0, ty: ty, representation: AsWord }], words: 1 }),
@@ -164,10 +164,10 @@ test "`holds_unkeepable_value` is true for a type that contains a function, even
         { name: b"job", ty: named_type(b"m.Job") },
         { name: b"name", ty: string_type() },
       ]);
-      assert_eq(held(named_type(b"m.Tree")), false);
-      assert_eq(held(named_type(b"m.Expr")), false);
-      assert_eq(held(named_type(b"m.Job")), true);
-      assert_eq(held(plan), true)
+      assert_eq(contains_unkeepable(named_type(b"m.Tree")), false);
+      assert_eq(contains_unkeepable(named_type(b"m.Expr")), false);
+      assert_eq(contains_unkeepable(named_type(b"m.Job")), true);
+      assert_eq(contains_unkeepable(plan), true)
     },
   }
 }
@@ -229,15 +229,15 @@ test "a closure that captures a channel gets a `Keep` function equal to 0 that c
 }
 
 fn ownership_faults(k: RootKey, f: Fn) -> List<Bytes> / {abort.raise} = {
-  let handed = with_conventions(f, Map::new());
-  if handed.convention != f.convention {
+  let recomputed = with_conventions(f, Map::new());
+  if recomputed.convention != f.convention {
     [
       root_text(root_name(k)).concat(
         b" has a calling convention that differs from the one recomputed from its body",
       ),
     ]
   } else {
-    match ownership_fault(built_form(handed)) {
+    match ownership_fault(built_form(recomputed)) {
       Some(reason) -> [root_text(root_name(k)).concat(b": ").concat(reason)],
       None -> [],
     }
@@ -252,9 +252,9 @@ test "every function generated for a type takes each argument as owned or borrow
     { name: b"tree", ty: named_type(b"m.Tree") },
   ]);
   let types = [named_type(b"m.Tree"), expression, pair, named_type(b"m.Job"), string_type()];
-  let over = |ops: List<TypeOp>, key: (TypeOp, Type) -> RootKey|
-    ops.fold([], |accumulator: List<RootKey>, op: TypeOp|
-      accumulator.concat(types.map(|t: Type| key(op, t))));
+  let over = |operations: List<TypeOp>, key: (TypeOp, Type) -> RootKey|
+    operations.fold([], |accumulator: List<RootKey>, operation: TypeOp|
+      accumulator.concat(types.map(|t: Type| key(operation, t))));
   match corpus_constructors() {
     Err(reason) -> assert_eq(reason, b""),
     Ok(constructors) -> {
@@ -271,11 +271,14 @@ test "every function generated for a type takes each argument as owned or borrow
         ],
         root_of,
       ).concat(
-        [Drop, Share, Keep].fold([], |accumulator: List<RootKey>, op: TypeOp|
-          accumulator.concat([case_root(op, expression, 1), case_root(op, expression, 2)])),
+        [Drop, Share, Keep].fold([], |accumulator: List<RootKey>, operation: TypeOp|
+          accumulator.concat([
+            case_root(operation, expression, 1),
+            case_root(operation, expression, 2),
+          ])),
       );
-      let entries = over([OnWordForm(Lower), OnWordForm(Lift)], |op: TypeOp, t: Type|
-        generated_key(op, t, b"m"));
+      let entries = over([OnWordForm(Lower), OnWordForm(Lift)], |operation: TypeOp, t: Type|
+        generated_key(operation, t, b"m"));
       assert_eq(
         plain.fold([], |accumulator: List<Bytes>, k: RootKey|
           accumulator.concat(ownership_faults(k, generated(constructors, k)))).concat(
@@ -289,16 +292,16 @@ test "every function generated for a type takes each argument as owned or borrow
 }
 
 test "a sum stored in several reference-counted words is released by one call to its type's release function, which passes the check and decrements each word" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"type Duo = | Both(String, List<Int>) | Neither\n",
     b"fn g(n: Int) -> Int / {abort.raise} = if n > 3 { panic(\"big\") } else { n }\n",
     b"fn kept(d: Duo, n: Int) -> Duo / {abort.raise} = { let m = g(n); if m > 0 { d } else { d } }\n",
     b"fn pick(d: Duo, b: Bool) -> Duo = if b { d } else { Neither }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
-      let held = |op: TypeOp| root_of(keys::Unboxed(op), named_type(b"m.Duo"));
+      let unboxed_key = |operation: TypeOp| root_of(keys::Unboxed(operation), named_type(b"m.Duo"));
       let call = |k: RootKey| symbol_of(root_text(root_name(k))).concat(b"(ctx, ");
       let calls_in = |name: Bytes, k: RootKey|
         match printed_by_ir(p, name) {
@@ -306,21 +309,24 @@ test "a sum stored in several reference-counted words is released by one call to
           Err(reason) -> panic(String::of_bytes_lossy(reason)),
         };
       assert_eq(
-        [calls_in(b"pick", held(keys::Release)), calls_in(b"kept", held(keys::Release))],
+        [
+          calls_in(b"pick", unboxed_key(keys::Release)),
+          calls_in(b"kept", unboxed_key(keys::Release)),
+        ],
         [1, 1],
       );
-      [keys::Release, Dup].fold((), |_: Unit, op: TypeOp| {
-        let f = generated(p.setting.constructors, held(op));
+      [keys::Release, Dup].fold((), |_: Unit, operation: TypeOp| {
+        let f = generated(p.setting.constructors, unboxed_key(operation));
         let built = built_form(f);
         let c = pieces_text(printed_fn(built, p.setting.constructors).pieces);
         let body = match c.index_of(b"_entry(PlyCtx *ctx, const Word *args) {") {
           Some(at) -> c.slice(0, at),
           None -> c,
         };
-        let each = if op == Dup { b"ply_dup(" } else { b"ply_rel" };
+        let each = if operation == Dup { b"ply_dup(" } else { b"ply_rel" };
         assert(
           ownership_fault(built) == None && body.split(each).len() - 1 == 2
-            && !body.contains(call(held(op))),
+            && !body.contains(call(unboxed_key(operation))),
           Some(String::of_bytes_lossy(c)),
         )
       })
@@ -329,8 +335,8 @@ test "a sum stored in several reference-counted words is released by one call to
 }
 
 test "the release function for a sum stored in one word also handles a case with no allocation, so every path passes the ownership check" {
-  let src = b"type Found = | Hit(Bytes) | Miss | Bad(String)\ntype L = | Nil | Cons(Int, L)\nfn uses(f: Found, l: L) -> Int = 0\n";
-  match program_of(src) {
+  let source = b"type Found = | Hit(Bytes) | Miss | Bad(String)\ntype L = | Nil | Cons(Int, L)\nfn uses(f: Found, l: L) -> Int = 0\n";
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
       assert_eq(

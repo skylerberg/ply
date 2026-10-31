@@ -136,12 +136,12 @@ pub fn prover_input_of(
   let values = if stating.len() == 0 { Map::new() } else { values_named(analysis.modules) };
   let built = definitions.fold(clauses, |accumulator: CollectedObligations, d: DefinitionInfo|
     builds_of(accumulator, d, written, stating, values, analysis.hashes, closing));
-  let owed = laws.fold(built, |accumulator: CollectedObligations, l: LawInfo|
+  let collected = laws.fold(built, |accumulator: CollectedObligations, l: LawInfo|
     law_of(accumulator, l, analysis.hashes.laws, wheres, closing));
   let imports = imports_of(analysis.modules);
   let trusted = analysis.checked.laws.filter(|l: LawInfo|
     !owned(l.module) && !l.has_guard && analysis.hashes.law_texts.contains(l.key));
-  let standing = |o: Obligation|
+  let imported_law_hashes = |o: Obligation|
     match o.kind {
       Cost(_) -> [],
       Space(_) -> [],
@@ -163,7 +163,8 @@ pub fn prover_input_of(
       declarations: declarations,
       signatures: analysis.checked.definitions.map(signature_of),
       builtins: builtin_signatures(),
-      obligations: owed.obligations.map(|o: Obligation| with_imported_laws(o, standing(o))),
+      obligations: collected.obligations.map(|o: Obligation|
+        with_imported_laws(o, imported_law_hashes(o))),
       measures: measures_in(analysis, owned),
       keys: keys_of(analysis.checked.instances),
       numerics: numerics_of(analysis.checked.numeric_types),
@@ -178,7 +179,7 @@ pub fn prover_input_of(
       analysis.hashes,
     ),
     laws: sentences_of(laws, analysis.hashes),
-    warnings: owed.warnings,
+    warnings: collected.warnings,
   }
 }
 
@@ -249,15 +250,16 @@ fn makes_opaque_value(
 ) -> Bool = {
   let any = |ts: List<Type>|
     ts.fold(false, |hit: Bool, x: Type| hit || makes_opaque_value(x, d, module, seen, room));
-  let kept = |name: Bytes|
+  let is_opaque_name = |name: Bytes|
     d.closed.fold(false, |hit: Bool, c: { ty: Bytes, home: Bytes }|
       hit || (c.ty == name && c.home != module));
   match t {
     VariableType(_) -> false,
     FunctionType(f) -> any(f.params) || makes_opaque_value(f.ret, d, module, seen, room),
     RecordType(fs) -> any(fs.map(|f: Field| f.ty)),
-    NominalType(n) -> any(type_args(n.args)) || kept(n.name) || any(n.fields.map(|f: Field| f.ty)),
-    NamedType(c) -> if any(type_args(c.args)) || kept(c.name) { true }
+    NominalType(n) ->
+      any(type_args(n.args)) || is_opaque_name(n.name) || any(n.fields.map(|f: Field| f.ty)),
+    NamedType(c) -> if any(type_args(c.args)) || is_opaque_name(c.name) { true }
     else if room <= 0 || seen.contains(c.name) { false } else {
       d.constructors.fold(false, |hit: Bool, k: ConstructorInfo|
         hit
@@ -343,47 +345,52 @@ fn met(t: Type, seen: List<Int>) -> List<Int> =
       type_args(n.args).fold(seen, |accumulator: List<Int>, a: Type| met(a, accumulator)),
   }
 
-fn number_of(vars: List<Int>, v: Int) -> Int / {abort.raise} =
-  range(0, vars.len()).fold(vars.len(), |found: Int, i: Int|
-    if found < vars.len() { found } else if vars.get(i) == v { i } else { found })
+fn number_of(variables: List<Int>, v: Int) -> Int / {abort.raise} =
+  range(0, variables.len()).fold(variables.len(), |found: Int, i: Int|
+    if found < variables.len() { found } else if variables.get(i) == v { i } else { found })
 
-fn type_of(t: Type, vars: List<Int>) -> Sort / {abort.raise} =
+fn type_of(t: Type, variables: List<Int>) -> Sort / {abort.raise} =
   match t {
-    VariableType(v) -> SortVariable(number_of(vars, v)),
+    VariableType(v) -> SortVariable(number_of(variables, v)),
     NamedType(c) ->
-      NamedSort(String::of_bytes_lossy(c.name), type_args(c.args).map(|a: Type| type_of(a, vars))),
+      NamedSort(
+        String::of_bytes_lossy(c.name),
+        type_args(c.args).map(|a: Type| type_of(a, variables)),
+      ),
     FunctionType(f) ->
       FunctionSort(
-        f.params.map(|p: Type| type_of(p, vars)),
-        type_of(f.ret, vars),
+        f.params.map(|p: Type| type_of(p, variables)),
+        type_of(f.ret, variables),
         is_pure(f.effects),
       ),
-    RecordType(fs) -> record_of(fs, vars),
-    NominalType(n) -> record_of(n.fields, vars),
+    RecordType(fs) -> record_of(fs, variables),
+    NominalType(n) -> record_of(n.fields, variables),
   }
 
-fn record_of(fs: List<Field>, vars: List<Int>) -> Sort / {abort.raise} =
-  RecordSort(fs.map(|f: Field| { name: String::of_bytes_lossy(f.name), ty: type_of(f.ty, vars) }))
+fn record_of(fs: List<Field>, variables: List<Int>) -> Sort / {abort.raise} =
+  RecordSort(
+    fs.map(|f: Field| { name: String::of_bytes_lossy(f.name), ty: type_of(f.ty, variables) }),
+  )
 
-fn numbered(vars: List<Int>) -> Printer / {abort.raise} =
-  range(0, vars.len()).fold(printer_new(), |p: Printer, i: Int|
-    printer_naming(p, vars.get(i), type_letter(i)))
+fn numbered(variables: List<Int>) -> Printer / {abort.raise} =
+  range(0, variables.len()).fold(printer_new(), |p: Printer, i: Int|
+    printer_naming(p, variables.get(i), type_letter(i)))
 
 type Named = { name: Bytes, ty: Type }
 
 type PrintedBinders = { binders: List<Binder>, variables: List<String> }
 
 fn binders_of(named: List<Named>, d: OpaqueTypes, module: Bytes) -> PrintedBinders / {abort.raise} = {
-  let vars = named.fold([], |accumulator: List<Int>, b: Named| met(b.ty, accumulator));
+  let type_variables = named.fold([], |accumulator: List<Int>, b: Named| met(b.ty, accumulator));
   let printed = named.fold(
-    { p: numbered(vars), out: [] },
+    { p: numbered(type_variables), out: [] },
     |accumulator: { p: Printer, out: List<Binder> }, b: Named| {
       let o = print_type(accumulator.p, b.ty);
       {
         p: o.printer,
         out: accumulator.out.push({
           name: String::of_bytes_lossy(b.name),
-          ty: type_of(b.ty, vars),
+          ty: type_of(b.ty, type_variables),
           text: String::of_bytes_lossy(o.text),
           constructible: d.closed.len() == 0
             || !makes_opaque_value(b.ty, d, module, [], d.constructors.len()),
@@ -393,7 +400,7 @@ fn binders_of(named: List<Named>, d: OpaqueTypes, module: Bytes) -> PrintedBinde
   );
   {
     binders: printed.out,
-    variables: range(0, vars.len()).map(|i: Int| String::of_bytes_lossy(type_letter(i))),
+    variables: range(0, type_variables.len()).map(|i: Int| String::of_bytes_lossy(type_letter(i))),
   }
 }
 
@@ -691,7 +698,8 @@ fn law_of(
         closing,
         l.module,
       );
-      let vars = l.binders.fold([], |accumulator: List<Int>, b: LawBinder| met(b.ty, accumulator));
+      let type_variables = l.binders.fold([], |accumulator: List<Int>, b: LawBinder|
+        met(b.ty, accumulator));
       let effects = effects_text(l.effects);
       {
         ..accumulator,
@@ -717,7 +725,7 @@ fn law_of(
             match wheres.get(l.key) { Some(s) -> s.bounds, None -> [] },
             closing,
           ),
-          identities: l.identities.map(|v: Int| number_of(vars, v)),
+          identities: l.identities.map(|v: Int| number_of(type_variables, v)),
         }),
       }
     },
@@ -761,8 +769,9 @@ fn trusted_law_from(l: LawInfo, closing: OpaqueTypes) -> TrustedLaw / {abort.rai
       l.module,
     ).binders,
     identities: {
-      let vars = l.binders.fold([], |accumulator: List<Int>, b: LawBinder| met(b.ty, accumulator));
-      l.identities.map(|v: Int| number_of(vars, v))
+      let type_variables = l.binders.fold([], |accumulator: List<Int>, b: LawBinder|
+        met(b.ty, accumulator));
+      l.identities.map(|v: Int| number_of(type_variables, v))
     },
     module: l.at.module,
   }
@@ -784,11 +793,11 @@ pub fn empty_prover_input() -> ProverInput =
 
 fn operations_of(effects: List<EffectInfo>) -> List<Operation> / {abort.raise} =
   effects.fold([], |accumulator: List<Operation>, e: EffectInfo|
-    e.operations.fold(accumulator, |out: List<Operation>, op: OpInfo|
+    e.operations.fold(accumulator, |out: List<Operation>, operation: OpInfo|
       out.push({
         effect: String::of_bytes_lossy(e.name),
-        op: String::of_bytes_lossy(op.name),
-        results: type_of(op.ret, met(op.ret, [])),
+        op: String::of_bytes_lossy(operation.name),
+        results: type_of(operation.ret, met(operation.ret, [])),
       })))
 
 pub fn imports_of(modules: List<ParsedModule>) -> List<List<Int>> / {abort.raise} = {
@@ -978,16 +987,16 @@ fn measures_of(modules: List<ParsedModule>) -> Map<Bytes, Expression> =
         _ -> a,
       }))
 
-pub fn whole_of(src: Bytes) -> Analysis / {abort.raise} =
-  match analyse(parse_all([{ name: b"m", src: src }])) {
+pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
+  match analyse(parse_all([{ name: b"m", src: source }])) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
     Analysed(w) -> w,
   }
 
 pub fn every(m: Bytes) -> Bool = true
 
-fn prover_input(src: Bytes) -> ProverInputResult / {abort.raise} =
-  prover_input_of(whole_of(src), every)
+fn prover_input(source: Bytes) -> ProverInputResult / {abort.raise} =
+  prover_input_of(whole_of(source), every)
 
 fn declaration_named(ds: List<Declaration>, name: String) -> Declaration / {abort.raise} =
   match ds.fold(None, |found: Option<Declaration>, d: Declaration|
@@ -1227,8 +1236,8 @@ test "a `law`'s guard is its `where` condition, located at its position in the s
 }
 
 test "a `decreases` measure belongs to its definition, is not an obligation, and uses the parameters as written" {
-  let src = b"fn climb(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }\nfn plain(n: Int) -> Int = n\n";
-  let w = prover_input(src).world;
+  let source = b"fn climb(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }\nfn plain(n: Int) -> Int = n\n";
+  let w = prover_input(source).world;
   assert_eq(w.measures.map(|m: Measure| m.owner), ["m.climb"]);
   assert_eq(w.measures.map(|m: Measure| m.binders.map(|b: Binder| b.name)), [["a", "b"]]);
   assert_eq(owned_by(w.obligations, "m.climb"), [])
@@ -1247,7 +1256,7 @@ test "outside the module that defines an opaque type, the prover never builds va
       src: b"import std.vault (Token, Stamp, Coin)\ntype Held = | Held(Token, Int)\nfn kept(t: Token) -> Int ensures result != 7 = 1\nfn stamps(ss: List<Stamp>) -> Int ensures result != 7 = ss.len()\nfn wrapped(h: Held) -> Int ensures result != 7 = 1\nfn flipped(c: Coin, n: Int) -> Int ensures result != 7 = n\n",
     },
   ];
-  let built = match analyse_pulling_std_with(user, shipped, no_rows(), reached: false).out {
+  let built = match analyse_pulling_std_with(user, shipped, no_rows(), cut_unused: false).out {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
     Analysed(w) -> prover_input_of(w, every),
   };
@@ -1280,10 +1289,10 @@ test "outside the module that defines an opaque type, the prover never builds va
   ])
 }
 
-fn app_law_key(src: Bytes) -> String / {abort.raise} =
+fn app_law_key(source: Bytes) -> String / {abort.raise} =
   match analyse(
       parse_all([
-        { name: b"base", src: b"pub fn f(x: Int) -> Int = x\n".concat(src) },
+        { name: b"base", src: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
         { name: b"app", src: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n" },
       ]),
     ) {

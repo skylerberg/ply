@@ -109,11 +109,11 @@ pub fn reachable_keys<| e>(
           let seen = x.seen.insert(key, true);
           match memo_store.record(key) {
             None -> Continue({ ..x, seen: seen, work: rest }),
-            Some(rec) ->
+            Some(record) ->
               Continue({
                 seen: seen,
-                work: dependency_keys(queries, rec.reads, rest),
-                keys: if wanted.contains(rec.query) { x.keys.push(key) } else { x.keys },
+                work: dependency_keys(queries, record.reads, rest),
+                keys: if wanted.contains(record.query) { x.keys.push(key) } else { x.keys },
               }),
           }
         },
@@ -201,12 +201,12 @@ pub fn queries_id<| e>(queries: Map<Bytes, Query<| e>>) -> Bytes =
 
 pub fn previous_key(key: Bytes) -> Bytes = blake3(b"earlier\x00".concat(key))
 
-pub fn current_records(held: MemoryStore) -> Map<Bytes, Record> = {
-  let earlier = held.records.fold(
+pub fn current_records(store: MemoryStore) -> Map<Bytes, Record> = {
+  let earlier = store.records.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bool>, k: Bytes, _: Record| accumulator.insert(previous_key(k), true),
   );
-  held.records.fold(Map::new(), |accumulator: Map<Bytes, Record>, k: Bytes, r: Record|
+  store.records.fold(Map::new(), |accumulator: Map<Bytes, Record>, k: Bytes, r: Record|
     if earlier.contains(k) { accumulator } else { accumulator.insert(k, r) })
 }
 
@@ -642,12 +642,12 @@ fn would_reuse<| e>(
       None -> {
         let current_records = match memo_store.record(key) {
           None -> { run: run, ok: false },
-          Some(rec) -> {
-            let s = if rec.summary.len() == 0 { { run: run, ok: false } }
-            else { would_reuse_reads(queries, run, q.name, rec.summary, left - 1) };
+          Some(record) -> {
+            let s = if record.summary.len() == 0 { { run: run, ok: false } }
+            else { would_reuse_reads(queries, run, q.name, record.summary, left - 1) };
             let d = if s.ok { s }
-            else { would_reuse_reads(queries, s.run, q.name, rec.reads, left - 1) };
-            { run: d.run, ok: d.ok && (q.persistent || memo_store.output(rec.output) != None) }
+            else { would_reuse_reads(queries, s.run, q.name, record.reads, left - 1) };
+            { run: d.run, ok: d.ok && (q.persistent || memo_store.output(record.output) != None) }
           },
         };
         let j = if current_records.ok { current_records } else {
@@ -670,14 +670,14 @@ fn would_reuse<| e>(
 fn would_reuse_record<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
-  judged: Bytes,
+  checked_query: Bytes,
   record: Option<Record>,
   left: Int,
 ) -> { run: Run, ok: Bool } / {memo_store.read, memo_store.write, abort.raise | e} =
   match record {
     None -> { run: run, ok: false },
     Some(e) -> {
-      let t = would_reuse_reads(queries, run, judged, e.reads, left);
+      let t = would_reuse_reads(queries, run, checked_query, e.reads, left);
       { run: t.run, ok: t.ok && memo_store.output(e.output) != None }
     },
   }
@@ -685,7 +685,7 @@ fn would_reuse_record<| e>(
 fn would_reuse_reads<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
-  judged: Bytes,
+  checked_query: Bytes,
   reads: List<Dependency>,
   left: Int,
 ) -> { run: Run, ok: Bool } / {memo_store.read, memo_store.write, abort.raise | e} =
@@ -697,24 +697,30 @@ fn would_reuse_reads<| e>(
         QueryDependency(name, input, digest) -> match queries.get(name) {
           None -> { run: accumulator.run, ok: false },
           Some(q) -> {
-            let asked = key_of(q, input);
-            let offered = match accumulator.run.provided.get(asked) {
+            let dependency_key = key_of(q, input);
+            let offered = match accumulator.run.provided.get(dependency_key) {
               Some(o) -> if provided_valid(accumulator.run, o) { Some(digest_of(Some(o.output))) }
               else { None },
               None -> None,
             };
-            match accumulator.run.resolved.get(asked) {
+            match accumulator.run.resolved.get(dependency_key) {
               Some(h) -> { run: accumulator.run, ok: h == digest },
-              None -> if accumulator.run.open.contains(asked) {
-                { run: accumulator.run, ok: memo_store.output_digest(asked) == Some(digest) }
+              None -> if accumulator.run.open.contains(dependency_key) {
+                {
+                  run: accumulator.run,
+                  ok: memo_store.output_digest(dependency_key) == Some(digest),
+                }
               } else {
                 match offered {
                   Some(d) -> { run: accumulator.run, ok: d == digest },
-                  None -> if name == judged {
-                    let w = would_reuse(queries, accumulator.run, q, asked, left);
-                    { run: w.run, ok: w.ok && memo_store.output_digest(asked) == Some(digest) }
+                  None -> if name == checked_query {
+                    let w = would_reuse(queries, accumulator.run, q, dependency_key, left);
+                    {
+                      run: w.run,
+                      ok: w.ok && memo_store.output_digest(dependency_key) == Some(digest),
+                    }
                   } else {
-                    let a = verify_key(queries, accumulator.run, q, asked, input, left);
+                    let a = verify_key(queries, accumulator.run, q, dependency_key, input, left);
                     { run: a.run_index, ok: a.head == digest }
                   },
                 }
@@ -761,24 +767,24 @@ fn execute<| e>(
         found: found,
       }
     };
-    let asking = |s: Execution, name: Bytes, asked: Bytes, whole: Bool| {
+    let request_query = |s: Execution, name: Bytes, query_input: Bytes, whole: Bool| {
       let aq = query_of(queries, name);
-      let akey = key_of(aq, asked);
-      let a = if whole { fetch_output(queries, s.run, aq, akey, asked, left - 1) } else {
-        let h = verify_key(queries, s.run, aq, akey, asked, left - 1);
+      let akey = key_of(aq, query_input);
+      let a = if whole { fetch_output(queries, s.run, aq, akey, query_input, left - 1) } else {
+        let h = verify_key(queries, s.run, aq, akey, query_input, left - 1);
         { run: h.run_index, output: b"", head: h.head }
       };
       {
-        st: { ..s, run: a.run, reads: s.reads.push(QueryDependency(name, asked, a.head)) },
+        st: { ..s, run: a.run, reads: s.reads.push(QueryDependency(name, query_input, a.head)) },
         asked: a,
       }
     };
-    let provide_taken = |s: Execution, by: Bytes, name: Bytes, asked: Bytes, output: Bytes|
+    let provide_taken = |s: Execution, by: Bytes, name: Bytes, query_input: Bytes, output: Bytes|
       {
         ..s,
         run: {
           ..s.run,
-          provided: s.run.provided.insert(key_of(query_of(queries, name), asked), {
+          provided: s.run.provided.insert(key_of(query_of(queries, name), query_input), {
             output: output,
             by: by,
             from: key,
@@ -795,27 +801,27 @@ fn execute<| e>(
         st = w.st;
         w.found
       },
-      memo.fetch(name, asked) -> {
-        let a = asking(st, name, asked, true);
+      memo.fetch(name, query_input) -> {
+        let a = request_query(st, name, query_input, true);
         st = a.st;
         a.asked.output
       },
-      memo.output_digest(name, asked) -> {
-        let a = asking(st, name, asked, false);
+      memo.output_digest(name, query_input) -> {
+        let a = request_query(st, name, query_input, false);
         st = a.st;
         a.asked.head
       },
       memo.stored_output(digest) -> memo_store.output(digest),
-      memo.is_cached(name, asked) -> {
+      memo.is_cached(name, query_input) -> {
         let jq = query_of(queries, name);
-        let k = key_of(jq, asked);
+        let k = key_of(jq, query_input);
         let was = st.run;
-        let judged = handle {
+        let reuse_check = handle {
           Some(would_reuse(queries, { ..was, checking_reuse: true }, jq, k, left - 1))
         } with {
           abort.raise(_) -> None,
         };
-        match judged {
+        match reuse_check {
           None -> match was.provided.get(k) { Some(o) -> provided_valid(was, o), None -> false },
           Some(w) -> {
             st = { ..st, run: { ..w.run, checking_reuse: was.checking_reuse } };
@@ -827,11 +833,11 @@ fn execute<| e>(
           },
         }
       },
-      memo.provide(name, asked, output) -> {
-        st = provide_taken(st, q.name, name, asked, output);
+      memo.provide(name, query_input, output) -> {
+        st = provide_taken(st, q.name, name, query_input, output);
       },
-      memo.provide_as(by, name, asked, output) -> {
-        st = provide_taken(st, query_of(queries, by).name, name, asked, output);
+      memo.provide_as(by, name, query_input, output) -> {
+        st = provide_taken(st, query_of(queries, by).name, name, query_input, output);
       },
       memo.provided() -> match st.run.provided.get(key) {
         None -> None,
@@ -850,9 +856,9 @@ fn execute<| e>(
     let d = digest_of(Some(ran.output));
     let summary = if !q.summarized { [] }
     else { match summary_of(queries, s.reads) { Some(made) -> made, None -> [] } };
-    let rec = { query: q.hash, input: input, reads: s.reads, output: d, summary: summary };
-    if q.persistent { keep_previous(key, rec) };
-    memo_store.put(key, rec, ran.output, q.persistent);
+    let record = { query: q.hash, input: input, reads: s.reads, output: d, summary: summary };
+    if q.persistent { keep_previous(key, record) };
+    memo_store.put(key, record, ran.output, q.persistent);
     { run_index: s.run, head: d }
   }
 
@@ -883,15 +889,15 @@ pub fn record_output<| e>(
   memo_store.running(queries_id(queries), hashes_of(queries));
   let defined = queries.fold(looked, |accumulator: List<Dependency>, name: Bytes, q: Query<| e>|
     accumulator.push(ExternalDependency(query_kind(), name, digest_of(Some(q.hash)))));
-  let rec = {
+  let record = {
     query: hash,
     input: b"",
     reads: reads,
     output: digest_of(Some(output)),
     summary: defined,
   };
-  keep_previous(key, rec);
-  memo_store.put(key, rec, output, true)
+  keep_previous(key, record);
+  memo_store.put(key, record, output, true)
 }
 
 pub type ExternalRead = { kind: Bytes, at: Bytes, value: Option<Bytes>, digest: Bytes }
@@ -916,20 +922,20 @@ pub fn with_memory_store<a | e>(
 ) -> { store: MemoryStore, value: a } / {abort.raise | e} = {
   let packed_at = |r: MemoryRunState, inl: Map<Bytes, Bytes>, key: Bytes|
     match r.packed.get(key) {
-      Some(rec) -> { running: r, inlined: inl, rec: rec },
+      Some(record) -> { running: r, inlined: inl, rec: record },
       None -> {
         let found = packs::record(r.pack, read, key);
         let got: { inlined: Map<Bytes, Bytes>, rec: Option<Record> } = match found.bytes {
           None -> { inlined: inl, rec: None },
           Some(b) -> match record_from(b) {
             None -> { inlined: inl, rec: None },
-            Some(rec) ->
+            Some(record) ->
               {
                 inlined: match inline_output_of(b) {
-                  Some(o) -> inl.insert(rec.output, o),
+                  Some(o) -> inl.insert(record.output, o),
                   None -> inl,
                 },
-                rec: Some(rec),
+                rec: Some(record),
               },
           },
         };
@@ -949,7 +955,7 @@ pub fn with_memory_store<a | e>(
       }
     } else {
       match h.records.get(key) {
-        Some(rec) -> { running: r, inlined: inl, rec: Some(rec) },
+        Some(record) -> { running: r, inlined: inl, rec: Some(record) },
         None -> packed_at(r, inl, key),
       }
     };
@@ -1003,21 +1009,22 @@ pub fn with_memory_store<a | e>(
         },
       },
     },
-    memo_store.put(key, rec, output, lasting) -> {
+    memo_store.put(key, record, output, lasting) -> {
       let persisted = lasting || inline_output(output) != None;
       if !persisted {
-        transient = transient.insert(rec.output, output);
+        transient = transient.insert(record.output, output);
       };
       store = {
-        records: store.records.insert(key, rec),
-        outputs: if persisted { store.outputs.insert(rec.output, output) } else { store.outputs },
+        records: store.records.insert(key, record),
+        outputs: if persisted { store.outputs.insert(record.output, output) }
+        else { store.outputs },
       };
     },
-    memo_store.store_record(key, rec) -> {
+    memo_store.store_record(key, record) -> {
       store = {
-        records: store.records.insert(key, rec),
-        outputs: match inlined.get(rec.output) {
-          Some(o) -> store.outputs.insert(rec.output, o),
+        records: store.records.insert(key, record),
+        outputs: match inlined.get(record.output) {
+          Some(o) -> store.outputs.insert(record.output, o),
           None -> store.outputs,
         },
       };
@@ -1371,7 +1378,7 @@ fn loudest_by_digest(input: Bytes) -> Bytes / {memo.read} =
 test "fetching a result by its digest records the same dependencies as calling the query directly, and returns the same result" {
   let by = |body: (Bytes) -> Bytes / {memo.read}|
     test_queries(b"h1").insert(b"loudest", query(b"loudest", b"d1", body));
-  let asked = run_query(
+  let direct_run = run_query(
     by(exclaim_longer),
     test_world([{ at: b"a", text: b"four" }]),
     b"loudest",
@@ -1384,7 +1391,7 @@ test "fetching a result by its digest records the same dependencies as calling t
     b"a",
   );
   assert_eq(headed.output, b"long 4!");
-  assert_eq(headed.world.store.records, asked.world.store.records);
+  assert_eq(headed.world.store.records, direct_run.world.store.records);
   let moved = run_query(
     by(loudest_by_digest),
     edited(headed.world, b"a", b"forty"),
@@ -1688,9 +1695,16 @@ fn commanded_over(
         Some(o) -> { took: true, output: o, executed: 0 },
         None -> {
           let a = query_output(q, run, name, b"a");
-          let said = b"said ".concat(a.output);
-          record_output(q, key, b"c1", driver_dependencies(a.run), memo_store.looked(), said);
-          { took: false, output: said, executed: executed_count(a.run) }
+          let result_text = b"said ".concat(a.output);
+          record_output(
+            q,
+            key,
+            b"c1",
+            driver_dependencies(a.run),
+            memo_store.looked(),
+            result_text,
+          );
+          { took: false, output: result_text, executed: executed_count(a.run) }
         },
       }
     },
@@ -1735,8 +1749,8 @@ test "a command result that depends on a pack result is not reused when the stor
   let q = test_queries(b"h1");
   let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let forty = run_query(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
-  let commanded = |held: MemoryStore, w: TestEnvironment|
-    commanded_over(q, { ..w, store: held }, Some(pack_over(q, w)), b"length", b"k");
+  let commanded = |memory_store: MemoryStore, w: TestEnvironment|
+    commanded_over(q, { ..w, store: memory_store }, Some(pack_over(q, w)), b"length", b"k");
   let first = commanded(empty_memory_store(), four.world);
   assert_eq(first.output, b"said 4");
   assert(commanded(first.world.store, four.world).took);
@@ -1795,8 +1809,8 @@ test "a query marked not persistent stores its records but not its large results
     ..query(b"length", b"h1", length_of),
     persistent: false,
   });
-  let held = run_query(short, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  assert(held.world.store.outputs.contains(digest_of(Some(b"4"))))
+  let short_run = run_query(short, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  assert(short_run.world.store.outputs.contains(digest_of(Some(b"4"))))
 }
 
 fn provide_taken(input: Bytes) -> Bytes / {memo.read} = {
@@ -1840,9 +1854,9 @@ test "a record is found valid using a result provided earlier in the run, withou
   let q = offer_queries(b"o1").insert(b"judging", query(b"judging", b"j1", check_taken_cached));
   let first = run_query(q, test_world([]), b"both", b"a");
   let moved = q.insert(b"offering", query(b"offering", b"o2", provide_taken));
-  let judged = run_query(moved, first.world, b"judging", b"a");
-  assert_eq(judged.output, b"kept");
-  assert_eq(judged.executed, 2)
+  let validity_run = run_query(moved, first.world, b"judging", b"a");
+  assert_eq(validity_run.output, b"kept");
+  assert_eq(validity_run.executed, 2)
 }
 
 test "a query asking for its own result is rejected" {

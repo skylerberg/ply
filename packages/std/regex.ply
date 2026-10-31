@@ -1371,8 +1371,8 @@ fn dispatch(b: FragmentBuilder, arms: List<Arm>) -> BuilderEntry / {abort.raise}
   }
 }
 
-fn add_instruction(b: FragmentBuilder, inst: Inst) -> BuilderEntry =
-  { building: { ..b, insts: b.insts.push(inst) }, entry: b.insts.len() }
+fn add_instruction(b: FragmentBuilder, instruction: Inst) -> BuilderEntry =
+  { building: { ..b, insts: b.insts.push(instruction) }, entry: b.insts.len() }
 
 fn switch(arms: List<Arm>) -> Inst / {abort.raise} = {
   let places = arms.map(|a: Arm| a.place).unique();
@@ -1408,8 +1408,8 @@ type Emitter = {
 
 type EmitResult = { emitter: Emitter, entry: Int }
 
-fn emit_instruction(e: Emitter, inst: Inst) -> EmitResult =
-  { emitter: { ..e, insts: e.insts.push(inst) }, entry: e.insts.len() }
+fn emit_instruction(e: Emitter, instruction: Inst) -> EmitResult =
+  { emitter: { ..e, insts: e.insts.push(instruction) }, entry: e.insts.len() }
 
 fn fork(first: Int, other: Int, greedy: Bool) -> Inst =
   if greedy { Split(first, other) } else { Split(other, first) }
@@ -1495,15 +1495,15 @@ fn emit_class(e: Emitter, set: List<Interval>, next: Int) -> EmitResult / {abort
   let known = e.classes.get(set);
   let t = match known { Some(t) -> t, None -> class_fragment(set, e.bytes, e.reversed) };
   let base = e.insts.len();
-  let insts = t.insts.fold(e.insts, |accumulator: List<Inst>, i: Inst|
+  let instructions = t.insts.fold(e.insts, |accumulator: List<Inst>, i: Inst|
     accumulator.push(relocate(i, base, next)));
   {
     emitter: match known {
-      Some(_) -> { ..e, insts: insts },
+      Some(_) -> { ..e, insts: instructions },
       None ->
         {
           ..e,
-          insts: insts,
+          insts: instructions,
           classes: e.classes.insert(set, t),
           boundaries: t.cuts.fold(e.boundaries, |cuts: Map<Int, Unit>, c: Int| cuts.insert(c, ())),
         },
@@ -1613,11 +1613,16 @@ fn byte_classes(cuts: Map<Int, Unit>) -> { classes: Bytes, count: Int } / {abort
 
 type Prefilter = { first: Bytes, prefix: Bytes, exact: Bool, required: Bytes }
 
-fn prefilter(insts: Array<Inst>, start: Int, tree: Node, bytes: Bool) -> Prefilter / {abort.raise} = {
-  let n = insts.len();
-  let led = prefix_from(insts, start, [], n + 1);
+fn prefilter(
+  instructions: Array<Inst>,
+  start: Int,
+  tree: Node,
+  bytes: Bool,
+) -> Prefilter / {abort.raise} = {
+  let n = instructions.len();
+  let led = prefix_from(instructions, start, [], n + 1);
   let firsts = first_from(
-    insts,
+    instructions,
     Array::new(n, false),
     Array::new(2 * n + 2, 0).set(0, start),
     1,
@@ -1668,53 +1673,76 @@ fn code_point_bytes(c: Int, bytes: Bool) -> Bytes / {abort.raise} =
 fn longer(a: Bytes, b: Bytes) -> Bytes = if b.len() > a.len() { b } else { a }
 
 fn prefix_from(
-  insts: Array<Inst>,
+  instructions: Array<Inst>,
   pc: Int,
   bytes: List<Bytes>,
   left: Int,
 ) -> { bytes: List<Bytes>, whole: Bool } / {abort.raise} =
   if left <= 0 { { bytes: bytes, whole: false } } else {
-    match insts.get(pc) {
-      Save(_, to) -> prefix_from(insts, to, bytes, left - 1),
+    match instructions.get(pc) {
+      Save(_, to) -> prefix_from(instructions, to, bytes, left - 1),
       Range(lo, hi, to) if lo == hi ->
-        prefix_from(insts, to, bytes.push(byte_of_int(lo)), left - 1),
+        prefix_from(instructions, to, bytes.push(byte_of_int(lo)), left - 1),
       Match -> { bytes: bytes, whole: true },
       _ -> { bytes: bytes, whole: false },
     }
   }
 
 fn first_from(
-  insts: Array<Inst>,
+  instructions: Array<Inst>,
   seen: Array<Bool>,
   stack: Array<Int>,
-  sp: Int,
+  stack_size: Int,
   parts: List<Bytes>,
   left: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
-  if sp <= 0 { Some(parts) } else if left <= 0 {
+  if stack_size <= 0 { Some(parts) } else if left <= 0 {
     panic(
       "the search visited the same step of the compiled pattern twice, but it must visit each step at most once",
     )
   } else {
-    let pc = stack.get(sp - 1);
-    if seen.get(pc) { first_from(insts, seen, stack, sp - 1, parts, left - 1) } else {
+    let pc = stack.get(stack_size - 1);
+    if seen.get(pc) { first_from(instructions, seen, stack, stack_size - 1, parts, left - 1) }
+    else {
       let marked = seen.set(pc, true);
-      match insts.get(pc) {
+      match instructions.get(pc) {
         Split(x, y) ->
-          first_from(insts, marked, stack.set(sp - 1, y).set(sp, x), sp + 1, parts, left - 1),
-        Save(_, to) -> first_from(insts, marked, stack.set(sp - 1, to), sp, parts, left - 1),
+          first_from(
+            instructions,
+            marked,
+            stack.set(stack_size - 1, y).set(stack_size, x),
+            stack_size + 1,
+            parts,
+            left - 1,
+          ),
+        Save(_, to) ->
+          first_from(
+            instructions,
+            marked,
+            stack.set(stack_size - 1, to),
+            stack_size,
+            parts,
+            left - 1,
+          ),
         Range(lo, hi, _) ->
           first_from(
-            insts,
+            instructions,
             marked,
             stack,
-            sp - 1,
+            stack_size - 1,
             parts.push(every_byte().slice(lo, hi + 1)),
             left - 1,
           ),
         Switch(table, _) ->
-          first_from(insts, marked, stack, sp - 1, switch_bytes(table, 0, parts, 257), left - 1),
-        Fail -> first_from(insts, marked, stack, sp - 1, parts, left - 1),
+          first_from(
+            instructions,
+            marked,
+            stack,
+            stack_size - 1,
+            switch_bytes(table, 0, parts, 257),
+            left - 1,
+          ),
+        Fail -> first_from(instructions, marked, stack, stack_size - 1, parts, left - 1),
         Match | Check(_, _) -> None,
       }
     }
@@ -1835,13 +1863,13 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.fail,
       [48, 58, 65, 91, 95, 96, 97, 123].fold(lined, |cuts: Map<Int, Unit>, c: Int|
         cuts.insert(c, ()))
     } else { lined };
-    let told = byte_classes(cuts);
-    let insts = Array::of_list(sought.emitter.insts);
+    let class_table = byte_classes(cuts);
+    let instructions = Array::of_list(sought.emitter.insts);
     let finder = {
-      insts: insts,
+      insts: instructions,
       entry: sought.entry,
-      classes: told.classes,
-      stride: told.count + 1,
+      classes: class_table.classes,
+      stride: class_table.count + 1,
       first_wins: true,
       lines: looks & 3 != 0,
       words: looks & 48 != 0,
@@ -1854,10 +1882,10 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.fail,
       names: p.groups,
       numbers: range(0, p.groups.len()).fold(Map::new(), |m: Map<String, Int>, i: Int|
         match p.groups.at(i) { Some(Some(name)) -> m.insert(name, i), _ -> m }),
-      insts: insts,
+      insts: instructions,
       start: ahead.entry,
       search: sought.entry,
-      prefilter: prefilter(insts, ahead.entry, p.node, bytes),
+      prefilter: prefilter(instructions, ahead.entry, p.node, bytes),
       finder: finder,
       longest_finder: { ..finder, entry: ahead.entry, first_wins: false },
       reverse: {
@@ -1880,18 +1908,18 @@ fn unicode_word_from(hay: Bytes, at: Int) -> Bool / {abort.raise} =
   if at >= hay.len() { false } else {
     let b = hay.at(at);
     let next = |i: Int| if at + i < hay.len() { hay.at(at + i) & 0x3F } else { 0 };
-    let cp = if b < 0x80 { b }
+    let code_point = if b < 0x80 { b }
     else if b < 0xE0 { (b & 0x1F) << 6 | next(1) }
     else if b < 0xF0 { (b & 0x0F) << 12 | next(1) << 6 | next(2) }
     else { (b & 0x07) << 18 | next(1) << 12 | next(2) << 6 | next(3) };
-    if cp < 0x80 { is_word(cp) } else {
-      match Char::of_int(cp) {
+    if code_point < 0x80 { is_word(code_point) } else {
+      match Char::of_int(code_point) {
         None -> false,
         Some(c) ->
           c.is_alphabetic() || c.is_mark() || c.is_digit()
             || c.general_category() == char::ConnectorPunctuation
-            || cp == 0x200C
-            || cp == 0x200D,
+            || code_point == 0x200C
+            || code_point == 0x200D,
       }
     }
   }
@@ -1941,11 +1969,11 @@ fn run(r: Run, entry: Int, from: Int) -> Array<Int> / {abort.raise} = {
 fn threads_step(
   r: Run,
   fuel: Int,
-  pos: Int,
+  position: Int,
   seen: Array<Int>,
   stack_pcs: Array<Int>,
   stack_captures: Array<Array<Int>>,
-  sp: Int,
+  stack_size: Int,
   current_pcs: Array<Int>,
   current_captures: Array<Array<Int>>,
   current_count: Int,
@@ -1956,11 +1984,11 @@ fn threads_step(
   best: Array<Int>,
 ) -> Array<Int> / {abort.raise} =
   if fuel <= 0 { panic("a run takes a bounded number of steps") } else if t >= current_count {
-    if pos >= r.stop || next_count == 0 { best } else {
+    if position >= r.stop || next_count == 0 { best } else {
       threads_step(
         r,
         fuel - 1,
-        pos + 1,
+        position + 1,
         seen,
         stack_pcs,
         stack_captures,
@@ -1981,11 +2009,11 @@ fn threads_step(
       threads_step(
         r,
         fuel - 1,
-        pos,
+        position,
         seen,
         stack_pcs,
         stack_captures,
-        sp,
+        stack_size,
         current_pcs,
         current_captures,
         current_count,
@@ -1998,12 +2026,12 @@ fn threads_step(
     } else {
       match r.insts.get(current_pcs.get(t)) {
         Range(lo, hi, to) -> {
-          let b = if pos < r.stop { r.hay.at(pos) } else { -1 };
+          let b = if position < r.stop { r.hay.at(position) } else { -1 };
           if b >= lo && b <= hi {
             threads_add(
               r,
               fuel - 1,
-              pos,
+              position,
               seen,
               stack_pcs.set(0, to),
               stack_captures.set(0, cap),
@@ -2021,11 +2049,11 @@ fn threads_step(
             threads_step(
               r,
               fuel - 1,
-              pos,
+              position,
               seen,
               stack_pcs,
               stack_captures,
-              sp,
+              stack_size,
               current_pcs,
               current_captures,
               current_count,
@@ -2038,12 +2066,12 @@ fn threads_step(
           }
         },
         Switch(table, arms) -> {
-          let arm = if pos < r.stop { table.at(r.hay.at(pos)) } else { 0 };
+          let arm = if position < r.stop { table.at(r.hay.at(position)) } else { 0 };
           if arm > 0 {
             threads_add(
               r,
               fuel - 1,
-              pos,
+              position,
               seen,
               stack_pcs.set(0, arms.get(arm - 1)),
               stack_captures.set(0, cap),
@@ -2061,11 +2089,11 @@ fn threads_step(
             threads_step(
               r,
               fuel - 1,
-              pos,
+              position,
               seen,
               stack_pcs,
               stack_captures,
-              sp,
+              stack_size,
               current_pcs,
               current_captures,
               current_count,
@@ -2081,11 +2109,11 @@ fn threads_step(
           threads_step(
             r,
             fuel - 1,
-            pos,
+            position,
             seen,
             stack_pcs,
             stack_captures,
-            sp,
+            stack_size,
             current_pcs,
             current_captures,
             current_count,
@@ -2099,11 +2127,11 @@ fn threads_step(
           threads_step(
             r,
             fuel - 1,
-            pos,
+            position,
             seen,
             stack_pcs,
             stack_captures,
-            sp,
+            stack_size,
             current_pcs,
             current_captures,
             current_count,
@@ -2118,11 +2146,11 @@ fn threads_step(
           threads_step(
             r,
             fuel - 1,
-            pos,
+            position,
             seen,
             stack_pcs,
             stack_captures,
-            sp,
+            stack_size,
             current_pcs,
             current_captures,
             current_count,
@@ -2139,11 +2167,11 @@ fn threads_step(
 fn threads_add(
   r: Run,
   fuel: Int,
-  pos: Int,
+  position: Int,
   seen: Array<Int>,
   stack_pcs: Array<Int>,
   stack_captures: Array<Array<Int>>,
-  sp: Int,
+  stack_size: Int,
   current_pcs: Array<Int>,
   current_captures: Array<Array<Int>>,
   current_count: Int,
@@ -2153,11 +2181,11 @@ fn threads_add(
   next_count: Int,
   best: Array<Int>,
 ) -> Array<Int> / {abort.raise} =
-  if fuel <= 0 { panic("a run takes a bounded number of steps") } else if sp <= 0 {
+  if fuel <= 0 { panic("a run takes a bounded number of steps") } else if stack_size <= 0 {
     threads_step(
       r,
       fuel - 1,
-      pos,
+      position,
       seen,
       stack_pcs,
       stack_captures,
@@ -2172,16 +2200,16 @@ fn threads_add(
       best,
     )
   } else {
-    let pc = stack_pcs.get(sp - 1);
-    if seen.get(pc) == pos + 1 {
+    let pc = stack_pcs.get(stack_size - 1);
+    if seen.get(pc) == position + 1 {
       threads_add(
         r,
         fuel - 1,
-        pos,
+        position,
         seen,
         stack_pcs,
         stack_captures,
-        sp - 1,
+        stack_size - 1,
         current_pcs,
         current_captures,
         current_count,
@@ -2192,18 +2220,18 @@ fn threads_add(
         best,
       )
     } else {
-      let cap = stack_captures.get(sp - 1);
-      let marked = seen.set(pc, pos + 1);
+      let cap = stack_captures.get(stack_size - 1);
+      let marked = seen.set(pc, position + 1);
       match r.insts.get(pc) {
         Split(x, y) ->
           threads_add(
             r,
             fuel - 1,
-            pos,
+            position,
             marked,
-            stack_pcs.set(sp - 1, y).set(sp, x),
-            stack_captures.set(sp, cap),
-            sp + 1,
+            stack_pcs.set(stack_size - 1, y).set(stack_size, x),
+            stack_captures.set(stack_size, cap),
+            stack_size + 1,
             current_pcs,
             current_captures,
             current_count,
@@ -2217,12 +2245,12 @@ fn threads_add(
           threads_add(
             r,
             fuel - 1,
-            pos,
+            position,
             marked,
-            stack_pcs.set(sp - 1, to),
-            if slot < r.slots { stack_captures.set(sp - 1, cap.set(slot, pos + 1)) }
+            stack_pcs.set(stack_size - 1, to),
+            if slot < r.slots { stack_captures.set(stack_size - 1, cap.set(slot, position + 1)) }
             else { stack_captures },
-            sp,
+            stack_size,
             current_pcs,
             current_captures,
             current_count,
@@ -2232,15 +2260,15 @@ fn threads_add(
             next_count,
             best,
           ),
-        Check(looks, to) -> if looks & ~looks_at(r.hay, pos + 1, r.wide) == 0 {
+        Check(looks, to) -> if looks & ~looks_at(r.hay, position + 1, r.wide) == 0 {
           threads_add(
             r,
             fuel - 1,
-            pos,
+            position,
             marked,
-            stack_pcs.set(sp - 1, to),
+            stack_pcs.set(stack_size - 1, to),
             stack_captures,
-            sp,
+            stack_size,
             current_pcs,
             current_captures,
             current_count,
@@ -2254,11 +2282,11 @@ fn threads_add(
           threads_add(
             r,
             fuel - 1,
-            pos,
+            position,
             marked,
             stack_pcs,
             stack_captures,
-            sp - 1,
+            stack_size - 1,
             current_pcs,
             current_captures,
             current_count,
@@ -2273,11 +2301,11 @@ fn threads_add(
           threads_add(
             r,
             fuel - 1,
-            pos,
+            position,
             marked,
             stack_pcs,
             stack_captures,
-            sp - 1,
+            stack_size - 1,
             current_pcs,
             current_captures,
             current_count,
@@ -2291,11 +2319,11 @@ fn threads_add(
           threads_add(
             r,
             fuel - 1,
-            pos,
+            position,
             marked,
             stack_pcs,
             stack_captures,
-            sp - 1,
+            stack_size - 1,
             current_pcs,
             current_captures,
             current_count,
@@ -2340,95 +2368,117 @@ type Closure = {
 }
 
 fn epsilon_closure(
-  insts: Array<Inst>,
+  instructions: Array<Inst>,
   have: Int,
   cut: Bool,
   stamp: Int,
   seen: Array<Int>,
   stack: Array<Int>,
-  sp: Int,
+  stack_size: Int,
   out: List<Int>,
   needs: Int,
   fuel: Int,
 ) -> Closure / {abort.raise} =
-  if sp <= 0 { { seen: seen, stack: stack, out: out, asked_looks: needs, sealed: false } }
+  if stack_size <= 0 { { seen: seen, stack: stack, out: out, asked_looks: needs, sealed: false } }
   else if fuel <= 0 {
     panic(
       "the search visited the same step of the compiled pattern twice while computing one matcher state, but it must visit each step at most once",
     )
   } else {
-    let pc = stack.get(sp - 1);
+    let pc = stack.get(stack_size - 1);
     if seen.get(pc) == stamp {
-      epsilon_closure(insts, have, cut, stamp, seen, stack, sp - 1, out, needs, fuel - 1)
+      epsilon_closure(
+        instructions,
+        have,
+        cut,
+        stamp,
+        seen,
+        stack,
+        stack_size - 1,
+        out,
+        needs,
+        fuel - 1,
+      )
     } else {
       let marked = seen.set(pc, stamp);
-      match insts.get(pc) {
+      match instructions.get(pc) {
         Split(x, y) ->
           epsilon_closure(
-            insts,
+            instructions,
             have,
             cut,
             stamp,
             marked,
-            stack.set(sp - 1, y).set(sp, x),
-            sp + 1,
+            stack.set(stack_size - 1, y).set(stack_size, x),
+            stack_size + 1,
             out,
             needs,
             fuel - 1,
           ),
         Save(_, to) ->
           epsilon_closure(
-            insts,
+            instructions,
             have,
             cut,
             stamp,
             marked,
-            stack.set(sp - 1, to),
-            sp,
+            stack.set(stack_size - 1, to),
+            stack_size,
             out,
             needs,
             fuel - 1,
           ),
         Check(looks, to) -> if looks & ~have == 0 {
           epsilon_closure(
-            insts,
+            instructions,
             have,
             cut,
             stamp,
             marked,
-            stack.set(sp - 1, to),
-            sp,
+            stack.set(stack_size - 1, to),
+            stack_size,
             out.push(pc),
             needs | looks,
             fuel - 1,
           )
         } else {
           epsilon_closure(
-            insts,
+            instructions,
             have,
             cut,
             stamp,
             marked,
             stack,
-            sp - 1,
+            stack_size - 1,
             out.push(pc),
             needs | looks,
             fuel - 1,
           )
         },
         Fail ->
-          epsilon_closure(insts, have, cut, stamp, marked, stack, sp - 1, out, needs, fuel - 1),
-        Match -> if cut {
-          { seen: marked, stack: stack, out: out.push(pc), asked_looks: needs, sealed: true }
-        } else {
           epsilon_closure(
-            insts,
+            instructions,
             have,
             cut,
             stamp,
             marked,
             stack,
-            sp - 1,
+            stack_size - 1,
+            out,
+            needs,
+            fuel - 1,
+          ),
+        Match -> if cut {
+          { seen: marked, stack: stack, out: out.push(pc), asked_looks: needs, sealed: true }
+        } else {
+          epsilon_closure(
+            instructions,
+            have,
+            cut,
+            stamp,
+            marked,
+            stack,
+            stack_size - 1,
             out.push(pc),
             needs,
             fuel - 1,
@@ -2436,13 +2486,13 @@ fn epsilon_closure(
         },
         _ ->
           epsilon_closure(
-            insts,
+            instructions,
             have,
             cut,
             stamp,
             marked,
             stack,
-            sp - 1,
+            stack_size - 1,
             out.push(pc),
             needs,
             fuel - 1,
@@ -3101,18 +3151,29 @@ fn by_states(
       re.prefilter,
       hay.len() - from + 3,
     );
-    let kept = { ..explored, stamp: end.stamp, ahead: end.states };
+    let updated_cache = { ..explored, stamp: end.stamp, ahead: end.states };
     if end.at == -2 {
-      by_threads(re, hay, from, end.table, end.seen, end.stack, { ..kept, overflowed: true }, want)
+      by_threads(
+        re,
+        hay,
+        from,
+        end.table,
+        end.seen,
+        end.stack,
+        { ..updated_cache, overflowed: true },
+        want,
+      )
     } else if end.at < 0 {
       {
         table: end.table,
         seen: end.seen,
         stack: end.stack,
-        explored: kept,
+        explored: updated_cache,
         slots: Array::of_list([]),
       }
-    } else { find_start(re, hay, from, end.at, end.table, end.seen, end.stack, kept, want) }
+    } else {
+      find_start(re, hay, from, end.at, end.table, end.seen, end.stack, updated_cache, want)
+    }
   }
 }
 
@@ -3154,7 +3215,7 @@ fn find_start(
       -1,
       end - from + 3,
     );
-    let kept = { ..explored, stamp: start.stamp, back: start.states };
+    let updated_cache = { ..explored, stamp: start.stamp, back: start.states };
     if start.at == -2 {
       by_threads(
         re,
@@ -3163,15 +3224,25 @@ fn find_start(
         start.table,
         start.seen,
         start.stack,
-        { ..kept, overflowed: true },
+        { ..updated_cache, overflowed: true },
         want,
       )
     } else if start.at < 0 {
       panic("searching backwards from the end of a match must find its start")
     } else if re.options.longest {
-      find_longest_end(re, hay, start.at, start.table, start.seen, start.stack, kept, want)
+      find_longest_end(re, hay, start.at, start.table, start.seen, start.stack, updated_cache, want)
     } else {
-      capture_known_match(re, hay, start.at, end, start.table, start.seen, start.stack, kept, want)
+      capture_known_match(
+        re,
+        hay,
+        start.at,
+        end,
+        start.table,
+        start.seen,
+        start.stack,
+        updated_cache,
+        want,
+      )
     }
   }
 }
@@ -3224,11 +3295,32 @@ fn find_longest_end(
       re.prefilter,
       hay.len() - start + 3,
     );
-    let kept = { ..explored, stamp: end.stamp, stretch: end.states };
+    let updated_cache = { ..explored, stamp: end.stamp, stretch: end.states };
     if end.at == -2 {
-      by_threads(re, hay, start, end.table, end.seen, end.stack, { ..kept, overflowed: true }, want)
+      by_threads(
+        re,
+        hay,
+        start,
+        end.table,
+        end.seen,
+        end.stack,
+        { ..updated_cache, overflowed: true },
+        want,
+      )
     } else if end.at < 0 { panic("searching forwards from the start of a match must find its end") }
-    else { capture_known_match(re, hay, start, end.at, end.table, end.seen, end.stack, kept, want) }
+    else {
+      capture_known_match(
+        re,
+        hay,
+        start,
+        end.at,
+        end.table,
+        end.seen,
+        end.stack,
+        updated_cache,
+        want,
+      )
+    }
   }
 }
 
@@ -3506,14 +3598,14 @@ pub fn read_template(re: Regex, text: String) -> Template / {regex.fail, abort.r
   parse_template(inner(re), text)
 
 fn parse_template(re: Compiled, text: String) -> Template / {regex.fail, abort.raise} = {
-  let src = Array::of_list(text.code_points());
-  { parts: template_parts(re, text, src, 0, 0, [], src.len() + 1) }
+  let code_points = Array::of_list(text.code_points());
+  { parts: template_parts(re, text, code_points, 0, 0, [], code_points.len() + 1) }
 }
 
 fn template_parts(
   re: Compiled,
   text: String,
-  src: Array<Int>,
+  code_points: Array<Int>,
   from: Int,
   at: Int,
   parts: List<Part>,
@@ -3522,28 +3614,37 @@ fn template_parts(
   if left <= 0 {
     panic("the parser cannot finish: it found more parts than there are characters left to read")
   } else {
-    match src.at(at) {
+    match code_points.at(at) {
       None -> verbatim(text, from, at, parts),
-      Some(c) -> if c != b'$' { template_parts(re, text, src, from, at + 1, parts, left - 1) }
-      else {
+      Some(c) -> if c != b'$' {
+        template_parts(re, text, code_points, from, at + 1, parts, left - 1)
+      } else {
         let before = verbatim(text, from, at, parts);
-        let next = match src.at(at + 1) { Some(n) -> n, None -> -1 };
+        let next = match code_points.at(at + 1) { Some(n) -> n, None -> -1 };
         if next == b'$' {
-          template_parts(re, text, src, at + 2, at + 2, before.push(Verbatim("$")), left - 1)
+          template_parts(
+            re,
+            text,
+            code_points,
+            at + 2,
+            at + 2,
+            before.push(Verbatim("$")),
+            left - 1,
+          )
         } else {
           let braced = meta(next) == Brace;
           let open = if braced { at + 2 } else { at + 1 };
-          let end = name_end(src, open);
-          if braced && src.at(end) != Some(b'}') { fail(at, UnclosedName) }
+          let end = name_end(code_points, open);
+          if braced && code_points.at(end) != Some(b'}') { fail(at, UnclosedName) }
           else if end == open { fail(at, if braced { NoSuchGroup } else { LoneDollar }) } else {
             let after = if braced { end + 1 } else { end };
             template_parts(
               re,
               text,
-              src,
+              code_points,
               after,
               after,
-              before.push(Group(group_index(re, name_text(src, open, end), at))),
+              before.push(Group(group_index(re, name_text(code_points, open, end), at))),
               left - 1,
             )
           }

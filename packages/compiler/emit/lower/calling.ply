@@ -130,11 +130,11 @@ fn param_effects_of(setting: ModuleContext, r: Root) -> List<Option<Effects>> =
       None -> None,
     } {
     Some(d) -> match d.definition.scheme {
-      Some(sc) -> match sc.ty {
+      Some(scheme) -> match scheme.ty {
         FunctionType(f) ->
           range(0, r.params.len()).map(|p: Int|
             match f.params.at(p - d.definition.witnesses) {
-              Some(FunctionType(g)) -> Some(in_scheme(sc, g.effects)),
+              Some(FunctionType(g)) -> Some(in_scheme(scheme, g.effects)),
               _ -> None,
             }),
         _ -> [],
@@ -189,9 +189,9 @@ fn call_signature_at(
 ) -> Option<Signature> / {abort.raise} =
   match d.scheme {
     None -> None,
-    Some(sc) -> match sc.ty {
+    Some(scheme) -> match scheme.ty {
       FunctionType(f) -> {
-        let carried = specialised_variables(s, sc, args, d.arity);
+        let carried = specialised_variables(s, scheme, args, d.arity);
         let at = range(0, args.len()).map(|j: Int|
           match args.at(j) {
             Some(t) -> if carried.contains(j) { t } else { unknown_type() },
@@ -237,11 +237,11 @@ fn specialised_among(
   known_lambda_read: List<Int>,
   fuel: Int,
 ) -> List<Int> = {
-  let at = |vars: List<Int>|
+  let at = |variable_indices: List<Int>|
     range(0, args.len()).map(|k: Int|
-      if vars.contains(k) { match args.at(k) { Some(t) -> t, None -> unknown_type() } }
+      if variable_indices.contains(k) { match args.at(k) { Some(t) -> t, None -> unknown_type() } }
       else { unknown_type() });
-  let kept = known_lambda_read.filter(|j: Int|
+  let retained_indices = known_lambda_read.filter(|j: Int|
     call_signature.any(|p: Type|
       type_variables(p).contains(j)
         && {
@@ -253,8 +253,8 @@ fn specialised_among(
               None -> false,
             })
         }));
-  if fuel <= 0 || kept.len() == known_lambda_read.len() { kept }
-  else { specialised_among(s, call_signature, args, kept, fuel - 1) }
+  if fuel <= 0 || retained_indices.len() == known_lambda_read.len() { retained_indices }
+  else { specialised_among(s, call_signature, args, retained_indices, fuel - 1) }
 }
 
 fn signature_convention(s: ModuleContext, c: Signature) -> Convention =
@@ -414,7 +414,7 @@ fn walk_arity(by: WalkKind) -> Int = match by { Folding -> 2, EntryFolding -> 3,
 
 fn walk_types(d: NamedDefinition, function: Code) -> Option<{ over: List<Type>, held: Type }> =
   match d.definition.scheme {
-    Some(sc) -> match substituted_fully(sc.ty, reference_args(function)) {
+    Some(scheme) -> match substituted_fully(scheme.ty, reference_args(function)) {
       FunctionType(f) -> match f.params.at(0) {
         Some(t) -> match ((list_item(t), map_parts(t))) {
           (Some(item), _) -> Some({ over: [item], held: f.ret }),
@@ -791,8 +791,8 @@ fn enter_known_lambda(
         unreachable(
           b"the lambda that the caller passed as a borrowed argument to the function being compiled was not found",
         ),
-      Some(lender) -> {
-        let lambdas_stack_allocated = match lender {
+      Some(defining_frame) -> {
+        let lambdas_stack_allocated = match defining_frame {
           None -> context,
           Some(bl) ->
             with_inlinable_lambdas({
@@ -815,7 +815,7 @@ fn enter_known_lambda(
           slot_variable(st, k.slot),
           k,
           lowered,
-          lender,
+          defining_frame,
           at,
         )
       },
@@ -1127,18 +1127,18 @@ fn inlined_in_frame(
   f: Option<Var>,
   k: KnownLambdaCall,
   lowered: List<Option<Arg>>,
-  lender: Option<BoundLambda>,
+  defining_frame: Option<BoundLambda>,
   at: Span,
 ) -> Opened / {abort.raise} =
   match f {
     None -> unreachable(b"a lambda called in place has no variable holding its closure"),
     Some(closure) -> {
       let typed = k.lambda.ty;
-      let sited = match lender {
+      let sited = match defining_frame {
         Some(bl) -> emitted(st, SiteScope(Some({ root: bl.owner, base: bl.base }))),
         None -> st,
       };
-      let held = capture_representations(context, k.lambda.body, k.lambda.captures);
+      let representations = capture_representations(context, k.lambda.body, k.lambda.captures);
       let caps = range(0, k.lambda.captures.len()).fold(
         { st: sited, env: Map::new() },
         |accumulator: { st: Lowering, env: Map<Int, Arg> }, i: Int|
@@ -1148,8 +1148,8 @@ fn inlined_in_frame(
               let read = bound_as(
                 accumulator.st,
                 captured_type(context, st, k.lambda, i),
-                match held.at(i) { Some(r) -> r, None -> AsWord },
-                Get({ of: closure, path: CapturePath(capture_offset(held, i)) }),
+                match representations.at(i) { Some(r) -> r, None -> AsWord },
+                Get({ of: closure, path: CapturePath(capture_offset(representations, i)) }),
                 at,
               );
               { st: read.st, env: accumulator.env.insert(c.destination, read.arg) }
@@ -1161,7 +1161,7 @@ fn inlined_in_frame(
         result_type: typed.ret,
         frame_span: k.lambda.at,
         captured: k.lambda.captures.map(|c: Capture| c.destination),
-        words: match lender {
+        words: match defining_frame {
           Some(_) -> parameter_function_words(context, closure),
           None -> context.words,
         },
@@ -1260,8 +1260,8 @@ pub fn exit_inlined(
     },
   }
 
-fn end_site_scope(insts: Block, from: Int, back: Lowering) -> Lowering =
-  if insts.drop(from).any(|i: Inst| match i { SiteScope(Some(_)) -> true, _ -> false }) {
+fn end_site_scope(instructions: Block, from: Int, back: Lowering) -> Lowering =
+  if instructions.drop(from).any(|i: Inst| match i { SiteScope(Some(_)) -> true, _ -> false }) {
     emitted(back, SiteScope(None))
   } else { back }
 
@@ -1299,7 +1299,7 @@ fn exit_walk(
     Primitive({ op: b"add", on: AsInt, args: [VarOperand(v.at), IntOperand(1)] }),
     at,
   );
-  let went = |s: Lowering, held: Arg| emitted(s, Next([after.arg, held]));
+  let went = |s: Lowering, next_value: Arg| emitted(s, Next([after.arg, next_value]));
   let item = match w.kind {
     Mapping -> {
       let o = list_push(context, after.st, VarOperand(v.accumulator), body.arg, w.accumulator, at);
@@ -1420,8 +1420,8 @@ fn exit_map_walk(
         at,
       );
       let result = fresh(root.st, w.accumulator, representation_of(context.setting, w.accumulator));
-      let reads = |op: ContainerOp|
-        Op({ op: OfContainers(op), args: [m], uses: typed_ir::reads(1) });
+      let reads = |operation: ContainerOp|
+        Op({ op: OfContainers(operation), args: [m], uses: typed_ir::reads(1) });
       let opened_root = emitted(
         some_bound(enter_block(result.st), root.arg, e.root, at),
         Let({ var: e.height, value: reads(NodeIntrinsic(OfMap(MapHeight))), at: at, unwind: [] }),
@@ -1719,8 +1719,8 @@ pub fn called_builtin(
 
 fn step_typed(l: Lambda) -> Option<{ state: Type, result: Type }> = iter_of(l.ty.params, l.ty.ret)
 
-fn iter_of(params: List<Type>, ret: Type) -> Option<{ state: Type, result: Type }> =
-  match ((iter_parts(ret), params)) {
+fn iter_of(params: List<Type>, return_type: Type) -> Option<{ state: Type, result: Type }> =
+  match ((iter_parts(return_type), params)) {
     (Some(it), [a]) -> Some({ state: a, result: it.result }),
     _ -> None,
   }
@@ -1921,12 +1921,12 @@ fn iter_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
 fn read_out(
   context: Context,
   x: Var,
-  ctor: Bytes,
+  constructor: Bytes,
   into: Var,
   e: PassEnd,
 ) -> { block: Block, arg: Arg, next: Int } =
   if into.representation == AsUnit { { block: [], arg: ZeroOperand(AsUnit), next: e.next } } else {
-    let i = match case_index(x.representation, ctor) { Some(k) -> k, None -> 0 };
+    let i = match case_index(x.representation, constructor) { Some(k) -> k, None -> 0 };
     let read = match x.representation {
       AsSum(s) ->
         {
@@ -1938,7 +1938,7 @@ fn read_out(
         },
       _ ->
         {
-          path: CasePath({ case: if ctor == stop_constructor() { 1 } else { 0 }, at: 0 }),
+          path: CasePath({ case: if constructor == stop_constructor() { 1 } else { 0 }, at: 0 }),
           representation: AsWord,
         },
     };
@@ -2051,8 +2051,9 @@ pub fn closure(
   let laid = shape_captures(s);
   let returned = if falls_through(inner.st.insts) { represented_as(inner, s.result, at) }
   else { inner };
-  let insts = if falls_through(returned.st.insts) { returned.st.insts.push(Return(returned.arg)) }
-  else { returned.st.insts };
+  let instructions = if falls_through(returned.st.insts) {
+    returned.st.insts.push(Return(returned.arg))
+  } else { returned.st.insts };
   let body = {
     key: context.key,
     kind: kind,
@@ -2060,8 +2061,8 @@ pub fn closure(
     convention: shape_convention(s),
     result_type: if frame.resumes != None { word_type() } else { s.ret },
     body: match context.inlined_from {
-      Some(l) -> [SiteScope(Some({ root: l.owner, base: context.base }))].concat(insts),
-      None -> insts,
+      Some(l) -> [SiteScope(Some({ root: l.owner, base: context.base }))].concat(instructions),
+      None -> instructions,
     },
     lambdas: [],
     base: context.base,
@@ -2355,8 +2356,8 @@ type ClosureLayout = {
 fn captures_in_order<a>(
   note_captures: List<a>,
   labels: List<a>,
-  holding: EvidenceValues<a>,
-) -> List<a> = note_captures.concat(labels).concat(listed_evidence_values(holding))
+  evidence_values: EvidenceValues<a>,
+) -> List<a> = note_captures.concat(labels).concat(listed_evidence_values(evidence_values))
 
 fn shape_captures(s: ClosureLayout) -> List<Var> =
   captures_in_order(s.captured, s.labels, s.held_evidence)
@@ -2397,7 +2398,7 @@ fn continuation_type(t: Type, resumes: Option<Effects>) -> Type =
 fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> ClosureLayout = {
   let f = frame.ty;
   let continued = |j: Int| frame.resumes != None && j == frame.params - 1;
-  let held = capture_representations(context, frame.body, frame.captures);
+  let capture_representations = capture_representations(context, frame.body, frame.captures);
   let note_captures = numbered(
     0,
     range(0, frame.captures.len()).map(|i: Int|
@@ -2406,7 +2407,7 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
           Some(c) -> match env.get(c.src) { Some(a) -> type_of(a), None -> unknown_type() },
           None -> unknown_type(),
         },
-        representation: match held.at(i) { Some(r) -> r, None -> AsWord },
+        representation: match capture_representations.at(i) { Some(r) -> r, None -> AsWord },
       }),
   );
   let labels = numbered(
@@ -2422,13 +2423,13 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
     Some(_) -> [uncounted],
     None -> [],
   });
-  let kept = numbered(
+  let retained_evidence = numbered(
     instance.next,
     frame.captured_evidence.kept.map(|_: Arg|
       { ty: instance_block_type(), representation: AsWord }),
   );
   let own = numbered(
-    kept.next,
+    retained_evidence.next,
     f.params.fold([], |accumulator: List<{ ty: Type, representation: Representation }>, t: Type|
       accumulator.push(if continued(accumulator.len()) {
         { ty: resumption(continuation_type(t, frame.resumes)), representation: AsWord }
@@ -2444,7 +2445,11 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
   {
     captured: note_captures.vars,
     labels: labels.vars,
-    held_evidence: { words: words_held.vars, instance: instance.vars.at(0), kept: kept.vars },
+    held_evidence: {
+      words: words_held.vars,
+      instance: instance.vars.at(0),
+      kept: retained_evidence.vars,
+    },
     parameters: own.vars,
     evidence_parameters: words.vars,
     result: if frame.resumes != None { AsWord } else { representation_of(context.setting, f.ret) },
@@ -2508,8 +2513,8 @@ fn capture_representations(
       None -> AsWord,
     })
 
-fn capture_offset(held: List<Representation>, i: Int) -> Int =
-  held.take(i).fold(0, |n: Int, r: Representation| n + value_words(r))
+fn capture_offset(representations: List<Representation>, i: Int) -> Int =
+  representations.take(i).fold(0, |n: Int, r: Representation| n + value_words(r))
 
 fn captured_type(context: Context, st: Lowering, l: Lambda, i: Int) -> Type = {
   let own = capture_type(st, l.at, i);
@@ -2542,8 +2547,8 @@ fn slot_read(c: Code, slot: Int) -> Option<Code> = {
       first(
         b.statements.fold(
           match b.tail { Some(t) -> [t], None -> [] },
-          |accumulator: List<Code>, stmt: CodeStatement|
-            accumulator.push(match stmt {
+          |accumulator: List<Code>, statement: CodeStatement|
+            accumulator.push(match statement {
               CodeLet(l) -> l.value,
               CodeLetDestructure(l) -> l.value,
               CodeDo(d) -> d.code,
@@ -2574,10 +2579,13 @@ fn slot_read(c: Code, slot: Int) -> Option<Code> = {
             Some(r) -> match into(r.captures) { Some(d) -> slot_read(r.body, d), None -> None },
             None -> None,
           },
-          |accumulator: Option<Code>, cl: CodeClause|
+          |accumulator: Option<Code>, clause: CodeClause|
             match accumulator {
               Some(_) -> accumulator,
-              None -> match into(cl.captures) { Some(d) -> slot_read(cl.body, d), None -> None },
+              None -> match into(clause.captures) {
+                Some(d) -> slot_read(clause.body, d),
+                None -> None,
+              },
             },
         ),
     },
@@ -2587,7 +2595,7 @@ fn slot_read(c: Code, slot: Int) -> Option<Code> = {
 
 fn generic(d: Definition) -> Bool =
   match d.scheme {
-    Some(sc) -> sc.type_variables.len() > 0 || sc.effect_variables.len() > 0,
+    Some(scheme) -> scheme.type_variables.len() > 0 || scheme.effect_variables.len() > 0,
     None -> false,
   }
 
@@ -2600,17 +2608,17 @@ fn constant_read(
 ) -> LoweredValue / {abort.raise} =
   match return_type_at(d.definition, reference_args(function)) {
     None -> unreachable(b"a constant of no function type: ".concat(d.full)),
-    Some(ret) ->
+    Some(return_type) ->
       represented_as(
         bound_as(
           st,
-          ret,
+          return_type,
           AsWord,
           Op({
             op: OfCalling(
               ConstantRead({
                 callee: Root(d.definition.root),
-                kept: ret,
+                kept: return_type,
                 constant: d.definition.constant,
               }),
             ),
@@ -2619,7 +2627,7 @@ fn constant_read(
           }),
           at,
         ),
-        representation_of(context.setting, ret),
+        representation_of(context.setting, return_type),
         at,
       ),
   }
@@ -2822,7 +2830,7 @@ pub fn simulate_called(
   let name = scheduler_module().concat(b"::simulated");
   let returned = match definition_named(context, name) {
     Some(d) -> match d.definition.scheme {
-      Some(sc) -> match sc.ty {
+      Some(scheme) -> match scheme.ty {
         FunctionType(f) -> match f.params.last() {
           Some(FunctionType(b)) -> b.effects.listed.map(|a: Effect| a.effect),
           _ -> [],
@@ -2879,7 +2887,7 @@ fn called_as(
     (None, _) -> unreachable(b"a call of a definition that has no type: ".concat(d.full)),
     (_, None) ->
       unreachable(b"a call of a definition whose type is not a function type: ".concat(d.full)),
-    (Some(c), Some(ret)) -> {
+    (Some(c), Some(return_type)) -> {
       let conv = with_evidence_parameters(
         signature_convention(context.setting, c),
         given.labels.len(),
@@ -2900,20 +2908,23 @@ fn called_as(
       represented_as(
         bound_as(
           h.st,
-          ret,
+          return_type,
           conv.result,
           Call({
             callee: n.callee,
             args: h.args,
             convention: conv,
             suspends: match d.definition.scheme {
-              Some(sc) -> match sc.ty { FunctionType(f) -> may_suspend(f.effects), _ -> true },
+              Some(scheme) -> match scheme.ty {
+                FunctionType(f) -> may_suspend(f.effects),
+                _ -> true,
+              },
               None -> true,
             },
           }),
           at,
         ),
-        representation_of(context.setting, ret),
+        representation_of(context.setting, return_type),
         at,
       )
     },
@@ -2922,11 +2933,11 @@ fn called_as(
 
 fn return_type_at(d: Definition, given: List<Type>) -> Option<Type> =
   match d.scheme {
-    Some(sc) -> match sc.ty {
-      FunctionType(f) -> if sc.type_variables.len() == 0 { Some(f.ret) }
-      else if given.len() == sc.type_variables.len() { Some(substituted_fully(f.ret, given)) }
+    Some(scheme) -> match scheme.ty {
+      FunctionType(f) -> if scheme.type_variables.len() == 0 { Some(f.ret) }
+      else if given.len() == scheme.type_variables.len() { Some(substituted_fully(f.ret, given)) }
       else { None },
-      other -> if sc.type_variables.len() == 0 { Some(other) } else { None },
+      other -> if scheme.type_variables.len() == 0 { Some(other) } else { None },
     },
     None -> None,
   }
@@ -2991,7 +3002,7 @@ fn reference_to(
             callee: Named(d.full),
             args: given,
             specialised_variables: match d.definition.scheme {
-              Some(sc) -> specialised_variables(s, sc, given, d.definition.arity),
+              Some(scheme) -> specialised_variables(s, scheme, given, d.definition.arity),
               None -> [],
             },
             functions: functions,
@@ -3179,7 +3190,7 @@ fn passed_as_given(context: Context, given: EvidenceArguments) -> Bool / {abort.
 
 fn labelled_param(d: Definition, j: Int) -> Bool =
   match d.scheme {
-    Some(sc) -> match sc.ty {
+    Some(scheme) -> match scheme.ty {
       FunctionType(f) -> match f.params.at(j) {
         Some(FunctionType(p)) ->
           p.effects.listed.any(|a: Effect|
@@ -3245,7 +3256,7 @@ fn named_arity(
     NDefinition(v) -> {
       match definition_full(module, definitions, imports, v.full) {
         Some(d) -> match d.definition.scheme {
-          Some(sc) -> match sc.ty {
+          Some(scheme) -> match scheme.ty {
             FunctionType(f) -> if d.definition.witnesses == 0
                 && f.params.len() == d.definition.arity { Some(d.definition.arity) }
             else { None },
@@ -3333,14 +3344,14 @@ pub fn named_in(
         NDefinition(v) -> definition_full(module, definitions, imports, v.full) != None,
         _ -> false,
       };
-      let handed = if !callee { [] } else {
+      let named_arguments = if !callee { [] } else {
         a.args.fold([], |accumulator: List<Lambda>, x: Code|
           match named_arity(module, definitions, imports, x) {
             Some(n) -> accumulator.push(named_lambda(x, n)),
             None -> accumulator,
           })
       };
-      handed.concat(within(a.args.push(a.function)))
+      named_arguments.concat(within(a.args.push(a.function)))
     },
     CodeLambda(l) -> go(l.body),
     CodeUnary(u) -> go(u.operand),
@@ -3351,8 +3362,8 @@ pub fn named_in(
       within(
         b.statements.fold(
           match b.tail { Some(t) -> [t], None -> [] },
-          |accumulator: List<Code>, stmt: CodeStatement|
-            accumulator.push(match stmt {
+          |accumulator: List<Code>, statement: CodeStatement|
+            accumulator.push(match statement {
               CodeLet(l) -> l.value,
               CodeLetDestructure(l) -> l.value,
               CodeDo(d) -> d.code,
@@ -3377,7 +3388,7 @@ pub fn named_in(
       within(
         h.clauses.fold(
           match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
-          |accumulator: List<Code>, cl: CodeClause| accumulator.push(cl.body),
+          |accumulator: List<Code>, clause: CodeClause| accumulator.push(clause.body),
         ),
       ),
     _ -> [],
@@ -3398,8 +3409,8 @@ pub fn lambdas_of(c: Code) -> List<Lambda> = {
       within(
         b.statements.fold(
           match b.tail { Some(t) -> [t], None -> [] },
-          |accumulator: List<Code>, stmt: CodeStatement|
-            accumulator.push(match stmt {
+          |accumulator: List<Code>, statement: CodeStatement|
+            accumulator.push(match statement {
               CodeLet(l) -> l.value,
               CodeLetDestructure(l) -> l.value,
               CodeDo(d) -> d.code,
@@ -3424,7 +3435,7 @@ pub fn lambdas_of(c: Code) -> List<Lambda> = {
       within(
         h.clauses.fold(
           match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
-          |accumulator: List<Code>, cl: CodeClause| accumulator.push(cl.body),
+          |accumulator: List<Code>, clause: CodeClause| accumulator.push(clause.body),
         ),
       ),
     _ -> [],
@@ -3446,7 +3457,7 @@ pub fn has_handle_matching(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool
   match c.node {
     CodeHandle(h) ->
       counted(h.clauses) || has_handle_matching(h.body, counted)
-        || within(h.clauses.map(|cl: CodeClause| cl.body))
+        || within(h.clauses.map(|clause: CodeClause| clause.body))
         || (match h.ret { Some(r) -> has_handle_matching(r.body, counted), None -> false }),
     CodeUnary(u) -> has_handle_matching(u.operand, counted),
     CodeBinary(b) -> within([b.lhs, b.rhs]),
@@ -3455,9 +3466,9 @@ pub fn has_handle_matching(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool
     CodeIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
     CodeBlock(b) ->
       (match b.tail { Some(t) -> has_handle_matching(t, counted), None -> false })
-        || b.statements.fold(false, |accumulator: Bool, stmt: CodeStatement|
+        || b.statements.fold(false, |accumulator: Bool, statement: CodeStatement|
           accumulator
-            || (match stmt {
+            || (match statement {
               CodeLet(l) -> has_handle_matching(l.value, counted),
               CodeLetDestructure(l) -> has_handle_matching(l.value, counted),
               CodeDo(d) -> has_handle_matching(d.code, counted),
@@ -3475,7 +3486,7 @@ pub fn has_handle_matching(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool
     CodeLambda(l) -> has_handle_matching(l.body, counted),
     CodeSimulate(x) -> has_handle_matching(x.body, counted),
     CodeKnownLambda(k) -> has_handle_matching(k.lambda.body, counted),
-    CodeParallel(pr) -> within(pr.branches),
+    CodeParallel(parallel) -> within(parallel.branches),
     _ -> false,
   }
 }
@@ -3521,8 +3532,8 @@ fn known_values(
     CodeBlock(b) -> {
       let walked = b.statements.fold(
         { bound: bound, statements: [] },
-        |accumulator: { bound: List<KnownSlot>, statements: List<CodeStatement> }, stmt: CodeStatement|
-          match stmt {
+        |accumulator: { bound: List<KnownSlot>, statements: List<CodeStatement> }, statement: CodeStatement|
+          match statement {
             CodeLet(l) -> {
               let value = known_values(l.value, accumulator.bound, owner, own, again);
               let rest = accumulator.bound.filter(|k: KnownSlot| k.slot != l.slot);
@@ -3583,7 +3594,7 @@ fn known_values(
       CodeLambda({ ..l, body: known_values(l.body, inside(l.captures), owner, own, again) }),
     CodeSimulate(x) ->
       CodeSimulate({ ..x, body: known_values(x.body, inside(x.captures), owner, own, again) }),
-    CodeParallel(pr) -> CodeParallel({ ..pr, branches: pr.branches.map(go) }),
+    CodeParallel(parallel) -> CodeParallel({ ..parallel, branches: parallel.branches.map(go) }),
     CodeFieldRead(f) -> CodeFieldRead({ ..f, base: go(f.base) }),
     CodeUpdate(u) ->
       CodeUpdate({

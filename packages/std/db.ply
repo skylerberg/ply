@@ -297,14 +297,14 @@ fn send_chunks<[t] | e>(
   chunk: Int,
   budget: Int,
   left: Int,
-  held: List<List<Param>>,
+  buffered_rows: List<List<Param>>,
 ) -> Result<Unit, DbError> / {db.copy_rows[t], seq.spent | e} =
   match s() {
-    Done -> if held.len() == 0 { Ok(()) } else { db.copy_rows[t](id, held) },
+    Done -> if buffered_rows.len() == 0 { Ok(()) } else { db.copy_rows[t](id, buffered_rows) },
     Skip(rest) -> if left <= 0 { seq.spent(budget) }
-    else { send_chunks[t](id, rest, chunk, budget, left - 1, held) },
+    else { send_chunks[t](id, rest, chunk, budget, left - 1, buffered_rows) },
     Yield(row, rest) -> if left <= 0 { seq.spent(budget) } else {
-      let more = held.push(row);
+      let more = buffered_rows.push(row);
       if more.len() < chunk { send_chunks[t](id, rest, chunk, budget, left - 1, more) } else {
         match db.copy_rows[t](id, more) {
           Err(e) -> Err(e),
@@ -349,9 +349,14 @@ pub fn copy_from<a, [t] | e>(
     },
   }
 
-fn page_rows<[t]>(id: Int, page: Int, held: List<Row>, fuel: Int) -> Seq<Row | {db.copy_take[t]}> =
+fn page_rows<[t]>(
+  id: Int,
+  page: Int,
+  buffered_rows: List<Row>,
+  fuel: Int,
+) -> Seq<Row | {db.copy_take[t]}> =
   ||
-    match held {
+    match buffered_rows {
       [row, ..rest] -> Yield(row, page_rows[t](id, page, rest, fuel)),
       [] -> if fuel <= 0 { Done } else {
         match db.copy_take[t](id, page) {
@@ -411,13 +416,13 @@ fn run_rounds<b, [t]>(
   round: keep Round<b>,
 ) -> List<b> / {db.query[t], db.batch[t], abort.raise, diverges} = {
   let { steps, waiting } = round;
-  let asking = range(0, steps.len()).filter(|i: Int|
+  let query_indices = range(0, steps.len()).filter(|i: Int|
     match steps.at(i) { Some(Asked(_)) -> true, _ -> false });
-  if asking.len() == 0 {
+  if query_indices.len() == 0 {
     steps.fold([], |accumulator: List<b>, s: Step<b>|
       match s { Finished(v) -> accumulator.push(v), _ -> accumulator })
   } else {
-    let results = run_round_queries[t](steps, asking);
+    let results = run_round_queries[t](steps, query_indices);
     run_rounds[t](
       resumed(steps, 0, results, reversed(waiting, NoContinuations), {
         steps: [],
@@ -459,29 +464,32 @@ fn resumed<b>(
 
 fn run_round_queries<b, [t]>(
   steps: List<Step<b>>,
-  asking: List<Int>,
+  query_indices: List<Int>,
 ) -> Map<Int, QueryResult> / {db.query[t], db.batch[t]} = {
-  let groups = asking.fold([], |accumulator: List<{ s: Statement, at: List<Int> }>, i: Int|
-    match steps.at(i) {
-      Some(Asked(a)) -> match range(0, accumulator.len()).fold(
-          None,
-          |found: Option<Int>, g: Int|
-            match found {
-              Some(_) -> found,
-              None -> match accumulator.at(g) {
-                Some(x) -> if x.s == a.s { Some(g) } else { None },
-                None -> None,
+  let groups = query_indices.fold(
+    [],
+    |accumulator: List<{ s: Statement, at: List<Int> }>, i: Int|
+      match steps.at(i) {
+        Some(Asked(a)) -> match range(0, accumulator.len()).fold(
+            None,
+            |found: Option<Int>, g: Int|
+              match found {
+                Some(_) -> found,
+                None -> match accumulator.at(g) {
+                  Some(x) -> if x.s == a.s { Some(g) } else { None },
+                  None -> None,
+                },
               },
-            },
-        ) {
-        Some(g) -> match accumulator.at(g) {
-          Some(x) -> accumulator.set(g, { ..x, at: x.at.push(i) }),
-          None -> accumulator,
+          ) {
+          Some(g) -> match accumulator.at(g) {
+            Some(x) -> accumulator.set(g, { ..x, at: x.at.push(i) }),
+            None -> accumulator,
+          },
+          None -> accumulator.push({ s: a.s, at: [i] }),
         },
-        None -> accumulator.push({ s: a.s, at: [i] }),
+        _ -> accumulator,
       },
-      _ -> accumulator,
-    });
+  );
   let params = |i: Int| match steps.at(i) { Some(Asked(a)) -> a.ps, _ -> [] };
   groups.fold(
     Map::new(),
@@ -1036,9 +1044,9 @@ fn in_set(set: Bytes, c: Int) -> Bool / {abort.raise} =
   if c < 0 { false } else { match set.index_of_byte(c) { Some(_) -> true, None -> false } }
 
 fn lex_all(sql: String) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let src = Bytes::of_string(sql);
-  if !src.is_utf8() { Err(unsupported("statement text that is not valid UTF-8")) }
-  else { lex(src, 0, [], 2 * src.len() + 2) }
+  let source = Bytes::of_string(sql);
+  if !source.is_utf8() { Err(unsupported("statement text that is not valid UTF-8")) }
+  else { lex(source, 0, [], 2 * source.len() + 2) }
 }
 
 reuse fn lex(
@@ -1078,15 +1086,16 @@ reuse fn lex(
     else { lex_symbol(src, j, accumulator, left - 1) }
   }
 
-fn line_comment_end(src: Bytes, i: Int) -> Int =
-  if i >= src.len() || src.peek(i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
+fn line_comment_end(source: Bytes, i: Int) -> Int =
+  if i >= source.len() || source.peek(i) == 10 { i + 1 } else { line_comment_end(source, i + 1) }
 
-fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> =
+fn block_comment_end(source: Bytes, i: Int, depth: Int) -> Option<Int> =
   if depth == 0 { Some(i) }
-  else if i >= src.len() { None }
-  else if src.peek(i) == 47 && src.peek(i + 1) == 42 { block_comment_end(src, i + 2, depth + 1) }
-  else if src.peek(i) == 42 && src.peek(i + 1) == 47 { block_comment_end(src, i + 2, depth - 1) }
-  else { block_comment_end(src, i + 1, depth) }
+  else if i >= source.len() { None } else if source.peek(i) == 47 && source.peek(i + 1) == 42 {
+    block_comment_end(source, i + 2, depth + 1)
+  } else if source.peek(i) == 42 && source.peek(i + 1) == 47 {
+    block_comment_end(source, i + 2, depth - 1)
+  } else { block_comment_end(source, i + 1, depth) }
 
 reuse fn lex_number(
   src: Bytes,
@@ -1523,8 +1532,8 @@ fn parse_query(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise
 fn parse_select(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise} = {
   let p = parse_proj(ts)?;
   let after = expect_word(p.rest, "from")?;
-  let src = parse_name(after)?;
-  parse_select_tail(src.value, p.value, src.rest)
+  let table = parse_name(after)?;
+  parse_select_tail(table.value, p.value, table.rest)
 }
 
 fn parse_select_tail(
@@ -1607,23 +1616,23 @@ fn parse_order_keys(
   } else {
     let c = parse_colref(ts)?;
     let dir = token_word(c.rest);
-    let desc = dir == "desc";
+    let descending = dir == "desc";
     let after_dir = if dir == "asc" || dir == "desc" { rest_of(c.rest) } else { c.rest };
     {
-      let n = parse_nulls(after_dir, desc)?;
-      let keys = accumulator.push({ column: c.value, desc: desc, nulls_first: n.value });
+      let n = parse_nulls(after_dir, descending)?;
+      let keys = accumulator.push({ column: c.value, desc: descending, nulls_first: n.value });
       if token_symbol(n.rest) == "," { parse_order_keys(rest_of(n.rest), keys, left - 1) }
       else { Ok(parsed(keys, n.rest)) }
     }
   }
 
-fn parse_nulls(ts: List<Token>, desc: Bool) -> Result<Parsed<Bool>, DbError> =
+fn parse_nulls(ts: List<Token>, descending: Bool) -> Result<Parsed<Bool>, DbError> =
   if token_word(ts) == "nulls" {
     let w = token_word(rest_of(ts));
     if w == "first" { Ok(parsed(true, rest_of(rest_of(ts)))) }
     else if w == "last" { Ok(parsed(false, rest_of(rest_of(ts)))) }
     else { Err(expected("`first` or `last` after `nulls`", rest_of(ts))) }
-  } else { Ok(parsed(desc, ts)) }
+  } else { Ok(parsed(descending, ts)) }
 
 type Slice = { limit: Option<Expression>, offset: Option<Expression> }
 
@@ -1644,8 +1653,8 @@ fn parse_one_bound(
 
 fn parse_insert(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise} = {
   let a = expect_word(ts, "into")?;
-  let src = parse_name(a)?;
-  let cols = parse_insert_columns(src.rest)?;
+  let table = parse_name(a)?;
+  let cols = parse_insert_columns(table.rest)?;
   match expect_word(cols.rest, "values") {
     Err(_) -> Err(unsupported("an `insert` whose source is not a `values` list")),
     Ok(b) -> {
@@ -1654,7 +1663,7 @@ fn parse_insert(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.rais
       Ok(
         parsed(
           Insert({
-            source: src.value,
+            source: table.value,
             columns: cols.value,
             tuples: tuples.value,
             returning: r.value,
@@ -1710,15 +1719,15 @@ fn parse_returning(ts: List<Token>) -> Result<Parsed<Option<Projection>>, DbErro
   } else { Ok(parsed(None, ts)) }
 
 fn parse_update(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise} = {
-  let src = parse_name(ts)?;
-  let a = expect_word(src.rest, "set")?;
+  let table = parse_name(ts)?;
+  let a = expect_word(table.rest, "set")?;
   let sets = parse_assignments(a, [], a.len() + 1)?;
   if token_word(sets.rest) == "from" { Err(unsupported("`update ... from`")) } else {
     let w = parse_where(sets.rest)?;
     let r = parse_returning(w.rest)?;
     Ok(
       parsed(
-        Update({ source: src.value, sets: sets.value, filter: w.value, returning: r.value }),
+        Update({ source: table.value, sets: sets.value, filter: w.value, returning: r.value }),
         r.rest,
       ),
     )
@@ -1741,11 +1750,11 @@ fn parse_assignments(
 
 fn parse_delete(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise} = {
   let a = expect_word(ts, "from")?;
-  let src = parse_name(a)?;
-  if token_word(src.rest) == "using" { Err(unsupported("`delete ... using`")) } else {
-    let w = parse_where(src.rest)?;
+  let table = parse_name(a)?;
+  if token_word(table.rest) == "using" { Err(unsupported("`delete ... using`")) } else {
+    let w = parse_where(table.rest)?;
     let r = parse_returning(w.rest)?;
-    Ok(parsed(Delete({ source: src.value, filter: w.value, returning: r.value }), r.rest))
+    Ok(parsed(Delete({ source: table.value, filter: w.value, returning: r.value }), r.rest))
   }
 }
 
@@ -1836,7 +1845,7 @@ fn eval_pred(row: Row, ps: List<Param>, e: Expression) -> Result<SqlBool, DbErro
       let tb = eval_pred(row, ps, b)?;
       Ok(sql_or(ta, tb))
     },
-    Compare(op, a, b) -> eval_compare(row, ps, op, a, b),
+    Compare(comparison, a, b) -> eval_compare(row, ps, comparison, a, b),
     IsNull(x, want) -> {
       let v = eval_value(row, ps, x)?;
       Ok(sql_bool_of(if want { is_null(v) } else { !is_null(v) }))
@@ -1867,7 +1876,7 @@ fn eval_pred_of_value(
 fn eval_compare(
   row: Row,
   ps: List<Param>,
-  op: Comparison,
+  comparison: Comparison,
   a: Expression,
   b: Expression,
 ) -> Result<SqlBool, DbError> / {abort.raise} = {
@@ -1878,7 +1887,7 @@ fn eval_compare(
     None -> Ok(SqlUnknown),
     Some(c) ->
       Ok(
-        sql_bool_of(match op {
+        sql_bool_of(match comparison {
           EqualTo -> c == 0,
           NotEqualTo -> c != 0,
           LessThan -> c < 0,
@@ -2480,9 +2489,9 @@ fn plan_expression(definition: Table, e: Expression) -> Result<Expression, DbErr
       let pb = plan_expression(definition, b)?;
       Ok(Or(pa, pb))
     },
-    Compare(op, a, b) -> {
+    Compare(comparison, a, b) -> {
       let p = plan_operands(definition, a, b)?;
-      Ok(Compare(op, p.left, p.right))
+      Ok(Compare(comparison, p.left, p.right))
     },
     IsNull(x, want) -> {
       let a = plan_expression(definition, x)?;
@@ -3774,8 +3783,8 @@ test "rolling back to a savepoint clears the failed state and the inner writes" 
   let d0 = test_seed();
   let b = begin_step(d0, ReadCommitted, ReadWrite);
   let i = test_run(b.db, "insert into part (sku, price) values ('z', 1)", []);
-  let sp = begin_step(i.db, ReadCommitted, ReadWrite);
-  let bad = test_run(sp.db, "insert into part (sku, price) values ('z', 2)", []);
+  let savepoint = begin_step(i.db, ReadCommitted, ReadWrite);
+  let bad = test_run(savepoint.db, "insert into part (sku, price) values ('z', 2)", []);
   assert_eq(test_code(bad.out), "23505");
   let back = abort_step(bad.db);
   assert_eq(test_count(test_out(back.db, "select count(*) from part", [])), 4);
@@ -3787,8 +3796,8 @@ test "releasing a savepoint in an aborted transaction fails as an aborted transa
   let d0 = test_seed();
   let b = begin_step(d0, ReadCommitted, ReadWrite);
   let i = test_run(b.db, "insert into part (sku, price) values ('z', 1)", []);
-  let sp = begin_step(i.db, ReadCommitted, ReadWrite);
-  let bad = test_run(sp.db, "insert into part (sku, price) values ('z', 2)", []);
+  let savepoint = begin_step(i.db, ReadCommitted, ReadWrite);
+  let bad = test_run(savepoint.db, "insert into part (sku, price) values ('z', 2)", []);
   let rel = commit_step(bad.db);
   assert_eq(test_code(rel.out), "25P02");
   let c = commit_step(rel.db);
@@ -3953,8 +3962,8 @@ test "the fake database fails a notification with the same error codes as a real
 }
 
 test "after the connection is cut, a listener drops its queued notifications and ignores those sent meanwhile, and its next wait returns `Reconnected`" {
-  let held = test_notified(test_listening(), "before");
-  let cut = disconnect_step(held);
+  let notified = test_notified(test_listening(), "before");
+  let cut = disconnect_step(notified);
   let lost = test_notified(cut, "during");
   let back = next_notification_step(lost);
   assert_eq(back.notification, Reconnected);
@@ -4017,14 +4026,14 @@ type SmallCount = | Never | Once | Twice
 fn times(t: SmallCount) -> Int = match t { Never -> 0, Once -> 1, Twice -> 2 }
 
 fn test_waits(waits: Int) -> List<Notice> / {db.next_notification, task.yield} =
-  range(0, waits).fold([], |heard: List<Notice>, i: Int| {
+  range(0, waits).fold([], |notices: List<Notice>, i: Int| {
     let n = db.next_notification(100);
     task.yield();
-    heard.push(n)
+    notices.push(n)
   })
 
-fn announced(heard: List<Notice>, sent: Int) -> Bool / {abort.raise} = {
-  let walked = heard.fold(
+fn announced(notices: List<Notice>, sent: Int) -> Bool / {abort.raise} = {
+  let walked = notices.fold(
     { next: 0, warned: false, ok: true },
     |at: { next: Int, warned: Bool, ok: Bool }, n: Notice|
       match n {
@@ -4052,7 +4061,7 @@ test "a listener on the fake database receives every committed notification in o
   ) {
   simulate {
     let n = times(c.extra_notices) + 1;
-    let heard = on_fake(|| {
+    let notices = on_fake(|| {
       db.listen[jobs]();
       let notifier = task.spawn(||
         range(0, n).fold((), |u: Unit, i: Int| {
@@ -4069,9 +4078,9 @@ test "a listener on the fake database receives every committed notification in o
       task.join(cutter);
       early.concat(test_waits(n + 2))
     });
-    let deliver = heard.filter(|h: Notice| match h { Notified(_) -> true, _ -> false });
-    assert(announced(heard, n));
-    assert(c.disconnects != Never || (deliver.len() == n && !heard.contains(Reconnected)))
+    let deliver = notices.filter(|h: Notice| match h { Notified(_) -> true, _ -> false });
+    assert(announced(notices, n));
+    assert(c.disconnects != Never || (deliver.len() == n && !notices.contains(Reconnected)))
   }
 }
 
@@ -4474,8 +4483,8 @@ fn client_error(e: pg::ClientError) -> DbError =
   }
 
 fn server_error(s: pg::ServerError) -> DbError = {
-  let said = if s.detail == "" { s.message } else { s.message ++ ": " ++ s.detail };
-  db_error(s.code, s.constraint, said)
+  let message = if s.detail == "" { s.message } else { s.message ++ ": " ++ s.detail };
+  db_error(s.code, s.constraint, message)
 }
 
 fn connection_lost() -> DbError =
@@ -4904,10 +4913,14 @@ fn release_copy_connection(p: Pool, n: Int, within: Bool, session: Option<pg::Se
 fn copy_of(p: Pool, id: Int) -> Option<Copy> = p.copied_fields.find(|c: Copy| c.id == id)
 
 fn with_copy(p: Pool, c: Copy) -> Pool =
-  { ..p, copied_fields: p.copied_fields.map(|held: Copy| if held.id == c.id { c } else { held }) }
+  {
+    ..p,
+    copied_fields: p.copied_fields.map(|existing: Copy|
+      if existing.id == c.id { c } else { existing }),
+  }
 
 fn without_copy(p: Pool, id: Int) -> Pool =
-  { ..p, copied_fields: p.copied_fields.filter(|held: Copy| held.id != id) }
+  { ..p, copied_fields: p.copied_fields.filter(|existing: Copy| existing.id != id) }
 
 fn unknown_copy(id: Int) -> DbError =
   db_error("55000", "", "no copy is open under the number " ++ id.to_string())
@@ -5592,8 +5605,8 @@ fn renumber_placeholders(
   String::of_bytes(walked.out.concat(b.slice(walked.at, b.len())))
 }
 
-fn split_asks(rows: List<Row>, asks: Int) -> List<QueryResult> = {
-  let held = rows.fold(Map::new(), |accumulator: Map<Int, List<Row>>, row: Row|
+fn split_asks(rows: List<Row>, query_count: Int) -> List<QueryResult> = {
+  let rows_by_query = rows.fold(Map::new(), |accumulator: Map<Int, List<Row>>, row: Row|
     match row.get("ply.ask") {
       Some(IntDatum(i)) ->
         accumulator.insert(
@@ -5605,7 +5618,8 @@ fn split_asks(rows: List<Row>, asks: Int) -> List<QueryResult> = {
         ),
       _ -> accumulator,
     });
-  range(0, asks).map(|i: Int| Rows(match held.get(i) { Some(xs) -> xs, None -> [] }))
+  range(0, query_count).map(|i: Int|
+    Rows(match rows_by_query.get(i) { Some(xs) -> xs, None -> [] }))
 }
 
 fn close_pool(p: Pool, config: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
@@ -6282,20 +6296,20 @@ fn test_statement(
   sql: String,
   extended: Bool,
 ) -> FeedResult / {abort.raise} = {
-  let heard = { ..w, said: w.said.push(sql) };
+  let recorded = { ..w, said: w.said.push(sql) };
   let picked = test_pick(rejections, sql);
   match picked.found {
     Some(r) -> if r.fatal {
       {
-        wire: { ..heard, outbox: heard.outbox.concat(test_error("FATAL", r)), open: false },
+        wire: { ..recorded, outbox: recorded.outbox.concat(test_error("FATAL", r)), open: false },
         rejections: picked.rest,
       }
     } else {
       let status = test_after_error(sql, w.status);
       {
         wire: {
-          ..heard,
-          outbox: Bytes::concat_all([heard.outbox, test_error("ERROR", r), test_ready(status)]),
+          ..recorded,
+          outbox: Bytes::concat_all([recorded.outbox, test_error("ERROR", r), test_ready(status)]),
           status: status,
         },
         rejections: picked.rest,
@@ -6305,8 +6319,8 @@ fn test_statement(
       let a = test_result(sql, w.status, extended);
       {
         wire: {
-          ..heard,
-          outbox: Bytes::concat_all([heard.outbox, a.bytes, test_ready(a.status)]),
+          ..recorded,
+          outbox: Bytes::concat_all([recorded.outbox, a.bytes, test_ready(a.status)]),
           status: a.status,
         },
         rejections: picked.rest,
@@ -6415,9 +6429,9 @@ fn over_script<a | e>(
     },
     net.recv[link](c, max, timeout_ms) -> {
       if test_talking(fake, c) { task.yield() };
-      let heard = test_read(fake, c);
-      fake = heard.fake;
-      Some(heard.bytes)
+      let received = test_read(fake, c);
+      fake = received.fake;
+      Some(received.bytes)
     },
     net.close[link](c) -> {
       fake = test_closed(fake, c);
@@ -6445,11 +6459,11 @@ fn test_runs(wires: List<FakeConnection>) -> List<List<String>> =
     accumulator.concat(test_cut(w.said, [], [])))
 
 fn test_cut(
-  said: List<String>,
+  statements: List<String>,
   run: List<String>,
   accumulator: List<List<String>>,
 ) -> List<List<String>> =
-  match said {
+  match statements {
     [] -> if run.len() == 0 { accumulator } else { accumulator.push(run) },
     [s, ..rest] -> if s == "commit" || s == "rollback" {
       test_cut(rest, [], accumulator.push(run.push(s)))

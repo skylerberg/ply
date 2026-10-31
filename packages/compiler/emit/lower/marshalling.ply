@@ -126,7 +126,7 @@ fn instance_var(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let place = |a: Arg| match a { IntOperand(n) -> Some(i.vars + 2 * n), _ -> None };
-  let op = |o: HandleOp, operands: List<Arg>, takes: List<Bool>|
+  let handling_operation = |o: HandleOp, operands: List<Arg>, takes: List<Bool>|
     Op({
       op: OfHandling(o),
       args: [i.word].concat(operands),
@@ -144,7 +144,7 @@ fn instance_var(
       match ((place(p), callee.ty)) {
         (Some(word_at), FunctionType(t)) ->
           represented_as(
-            bound_as(st, t.ret, AsWord, op(VarRead(word_at), [], []), at),
+            bound_as(st, t.ret, AsWord, handling_operation(VarRead(word_at), [], []), at),
             representation_of(context.setting, t.ret),
             at,
           ),
@@ -159,10 +159,16 @@ fn instance_var(
         if name == b"?handler_init" {
           let d = type_descriptor(context, word.st, type_of(x), at);
           unit_after(
-            run_for_effect(d.st, op(VarInit(word_at), [word.arg, d.arg], [true, false]), at),
+            run_for_effect(
+              d.st,
+              handling_operation(VarInit(word_at), [word.arg, d.arg], [true, false]),
+              at,
+            ),
           )
         } else if name == b"?handler_set" {
-          unit_after(run_for_effect(word.st, op(VarWrite(word_at), [word.arg], [true]), at))
+          unit_after(
+            run_for_effect(word.st, handling_operation(VarWrite(word_at), [word.arg], [true]), at),
+          )
         } else {
           unreachable(
             b"a handler variable builtin that takes a value must be an initialization or an assignment",
@@ -187,11 +193,16 @@ fn serialize_part(
   ty: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let held = marks_of(ty).ty;
-  if !fully_known(held) { unreachable(b"a value is converted at a type that is not fully known") }
-  else {
-    let conv = typed_convention(context.setting.constructors, [held], unit_type());
-    let h = represented_as({ st: st, arg: x }, representation_of(context.setting, held), at);
+  let unmarked_type = marks_of(ty).ty;
+  if !fully_known(unmarked_type) {
+    unreachable(b"a value is converted at a type that is not fully known")
+  } else {
+    let conv = typed_convention(context.setting.constructors, [unmarked_type], unit_type());
+    let h = represented_as(
+      { st: st, arg: x },
+      representation_of(context.setting, unmarked_type),
+      at,
+    );
     bound_as(
       h.st,
       unit_type(),
@@ -213,13 +224,14 @@ fn deserialize_part(
   ty: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let held = marks_of(ty).ty;
-  if !fully_known(held) { unreachable(b"`?lift` is called at a type that is not fully known") }
-  else {
-    let conv = typed_convention(context.setting.constructors, [], held);
+  let unmarked_type = marks_of(ty).ty;
+  if !fully_known(unmarked_type) {
+    unreachable(b"`?lift` is called at a type that is not fully known")
+  } else {
+    let conv = typed_convention(context.setting.constructors, [], unmarked_type);
     bound_as(
       st,
-      held,
+      unmarked_type,
       conv.result,
       Call({
         callee: Root(marked_key(Lift, ty, context.setting.module)),
@@ -912,8 +924,9 @@ pub fn kept_descriptor(
   } else {
     let module = context.setting.module;
     let ty = type_static(context.setting.constructors, module, st, t, function_marks(t), false);
-    let entry = |op: TypeOp, built: Bool|
-      if built { EntryWord(keys::generated_key(OnWordForm(op), t, module)) } else { RawWord(0) };
+    let entry = |type_operation: TypeOp, built: Bool|
+      if built { EntryWord(keys::generated_key(OnWordForm(type_operation), t, module)) }
+      else { RawWord(0) };
     let k = static_added(
       ty.st,
       StaticStruct({
@@ -932,7 +945,7 @@ pub fn operation_descriptor(
   context: Context,
   st: Lowering,
   eff: Bytes,
-  op: EffectOperation,
+  operation: EffectOperation,
   params: List<Type>,
   result: Type,
 ) -> { st: Lowering, name: Option<Bytes> } / {abort.raise} =
@@ -944,16 +957,17 @@ pub fn operation_descriptor(
     }
   } else {
     let module = context.setting.module;
-    let declared = |i: Int| match op.params.at(i) { Some(d) -> d, None -> unknown_type() };
-    let whole = |i: Int| match declared(i) { VariableType(v) -> op.own.contains(v), _ -> false };
+    let declared = |i: Int| match operation.params.at(i) { Some(d) -> d, None -> unknown_type() };
+    let whole = |i: Int|
+      match declared(i) { VariableType(v) -> operation.own.contains(v), _ -> false };
     let walked = range(0, params.len()).map(|i: Int|
-      mark_type_params(declared(i), params.get(i), op.own));
-    let ret = mark_type_params(op.ret, result, op.own);
-    let vars = own_types(op, params, result);
-    if vars.any(|t: Option<Type>| t == None) { { st: st, name: None } } else {
+      mark_type_params(declared(i), params.get(i), operation.own));
+    let return_marks = mark_type_params(operation.ret, result, operation.own);
+    let own_variable_types = own_types(operation, params, result);
+    if own_variable_types.any(|t: Option<Type>| t == None) { { st: st, name: None } } else {
       let typed = |s: Lowering, t: Type, marks: List<Int>, shown: Bool|
         type_static(context.setting.constructors, module, s, t, marks, shown);
-      let returned = typed(st, result, marks_of(ret.marked).marks, false);
+      let returned = typed(st, result, marks_of(return_marks.marked).marks, false);
       let taken = range(0, params.len()).fold(
         { st: returned.st, names: [] },
         |accumulator: { st: Lowering, names: List<Bytes> }, i: Int| {
@@ -961,12 +975,12 @@ pub fn operation_descriptor(
             accumulator.st,
             params.get(i),
             if whole(i) { [] } else { marks_of(walked.get(i).marked).marks },
-            serializes_parameters(eff, op),
+            serializes_parameters(eff, operation),
           );
           { st: d.st, names: accumulator.names.push(d.name) }
         },
       );
-      let stood = vars.fold(
+      let stood = own_variable_types.fold(
         { st: taken.st, names: [] },
         |accumulator: { st: Lowering, names: List<Bytes> }, t: Option<Type>|
           match t {
@@ -993,7 +1007,7 @@ pub fn operation_descriptor(
           of: b"PlyOp",
           fields: [
             FieldWord(eff),
-            FieldWord(op.name),
+            FieldWord(operation.name),
             AddressWord({ name: returned.name, tag: 0 }),
             RawWord(
               range(0, params.len()).fold(0, |m: Int, i: Int|
@@ -1010,23 +1024,23 @@ pub fn operation_descriptor(
     }
   }
 
-fn serializes_parameters(eff: Bytes, op: EffectOperation) -> Bool =
-  is_raise(op.mode) || (eff == b"abort" && op.name == b"raise")
+fn serializes_parameters(eff: Bytes, operation: EffectOperation) -> Bool =
+  is_raise(operation.mode) || (eff == b"abort" && operation.name == b"raise")
 
 pub fn own_types(
-  op: EffectOperation,
+  operation: EffectOperation,
   params: List<Type>,
   result: Type,
 ) -> List<Option<Type>> / {abort.raise} = {
-  let declared = |i: Int| match op.params.at(i) { Some(d) -> d, None -> unknown_type() };
+  let declared = |i: Int| match operation.params.at(i) { Some(d) -> d, None -> unknown_type() };
   let bound = range(0, params.len()).fold(
     [],
     |accumulator: List<{ var: Int, ty: Type }>, i: Int|
-      accumulator.concat(mark_type_params(declared(i), params.get(i), op.own).bound),
+      accumulator.concat(mark_type_params(declared(i), params.get(i), operation.own).bound),
   ).concat(
-    mark_type_params(op.ret, result, op.own).bound,
+    mark_type_params(operation.ret, result, operation.own).bound,
   );
-  op.own.map(|v: Int|
+  operation.own.map(|v: Int|
     bound.fold(None, |found: Option<Type>, b: { var: Int, ty: Type }|
       if found == None && b.var == v { Some(b.ty) } else { found }))
 }
@@ -1077,7 +1091,7 @@ pub fn pending_abort_raise(
         );
         match d.name {
           None -> { st: d.st, pending: None },
-          Some(op) -> {
+          Some(descriptor_name) -> {
             let s = type_static(
               context.setting.constructors,
               context.setting.module,
@@ -1086,7 +1100,10 @@ pub fn pending_abort_raise(
               function_marks(string_type()),
               false,
             );
-            { st: s.st, pending: Some({ word: word, index: k, op: op, string: s.name }) }
+            {
+              st: s.st,
+              pending: Some({ word: word, index: k, op: descriptor_name, string: s.name }),
+            }
           },
         }
       },
@@ -1103,7 +1120,8 @@ fn type_static(
 ) -> { st: Lowering, name: Bytes } / {abort.raise} = {
   let spelled = encode_type(t);
   let text = static_added(st, StaticWords([BytesWord(spelled)]));
-  let marked = |op: TypeOp| keys::with_marks(keys::generated_key(op, t, module), marks);
+  let marked = |operation: TypeOp|
+    keys::with_marks(keys::generated_key(operation, t, module), marks);
   let heads = word_form_functions(constructors, t);
   static_added(
     text.st,
@@ -1135,10 +1153,10 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
     Generated(w, _) -> {
       let rep = representation_with(constructors, w.ty);
       let word = { id: 0, ty: w.ty, representation: AsWord };
-      let held = { id: 1, ty: w.ty, representation: rep };
-      let call = |op: TypeOp, args: List<Arg>, result: Type|
+      let represented = { id: 1, ty: w.ty, representation: rep };
+      let call = |operation: TypeOp, args: List<Arg>, result: Type|
         Call({
-          callee: Root(keys::as_op(k, op)),
+          callee: Root(keys::as_op(k, operation)),
           args: args,
           convention: typed_convention(constructors, args.map(|_: Arg| w.ty), result),
           suspends: false,
@@ -1159,7 +1177,7 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
             (if opened { [] } else {
               [
                 Let({
-                  var: held,
+                  var: represented,
                   value: Convert({ arg: VarOperand(word), to: rep }),
                   at: dummy_span(),
                   unwind: [],
@@ -1168,7 +1186,11 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
             }).concat([
               Let({
                 var: done,
-                value: call(Lower, [VarOperand(if opened { word } else { held })], unit_type()),
+                value: call(
+                  Lower,
+                  [VarOperand(if opened { word } else { represented })],
+                  unit_type(),
+                ),
                 at: dummy_span(),
                 unwind: [],
               }),
@@ -1183,22 +1205,22 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
             w.ty,
             AsWord,
             [],
-            [Let({ var: held, value: call(Lift, [], w.ty), at: dummy_span(), unwind: [] })].concat(
-              if opened { [Return(VarOperand(held))] } else {
-                [
-                  Let({
-                    var: out,
-                    value: Convert({ arg: VarOperand(held), to: AsWord }),
-                    at: dummy_span(),
-                    unwind: [],
-                  }),
-                  Return(VarOperand(out)),
-                ]
-              },
-            ),
+            [
+              Let({ var: represented, value: call(Lift, [], w.ty), at: dummy_span(), unwind: [] }),
+            ].concat(if opened { [Return(VarOperand(represented))] } else {
+              [
+                Let({
+                  var: out,
+                  value: Convert({ arg: VarOperand(represented), to: AsWord }),
+                  at: dummy_span(),
+                  unwind: [],
+                }),
+                Return(VarOperand(out)),
+              ]
+            }),
           )
         },
-        OnWordForm(op) -> if op != keys::Equal && op != keys::Order {
+        OnWordForm(operation) -> if operation != keys::Equal && operation != keys::Order {
           unreachable(
             b"an entry function for a type represented as an integer must convert values or compare them",
           )
@@ -1206,14 +1228,14 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
           let other = { id: 1, ty: w.ty, representation: AsWord };
           let left = { id: 2, ty: w.ty, representation: rep };
           let right = { id: 3, ty: w.ty, representation: rep };
-          let returned_type = if op == keys::Equal { bool_type() } else { ordering_type() };
+          let returned_type = if operation == keys::Equal { bool_type() } else { ordering_type() };
           let returned = {
             id: 4,
             ty: returned_type,
             representation: representation_with(constructors, returned_type),
           };
           let signed = { id: 5, ty: int_type(), representation: AsInt };
-          let word_type = if op == keys::Equal { returned_type } else { int_type() };
+          let word_type = if operation == keys::Equal { returned_type } else { int_type() };
           let out = { id: 6, ty: word_type, representation: AsWord };
           let let_of = |v: Var, value: Rvalue|
             Let({ var: v, value: value, at: dummy_span(), unwind: [] });
@@ -1225,7 +1247,7 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
           };
           let compared = if opened { [VarOperand(word), VarOperand(other)] }
           else { [VarOperand(left), VarOperand(right)] };
-          let finished = if op == keys::Equal {
+          let finished = if operation == keys::Equal {
             [let_of(out, Convert({ arg: VarOperand(returned), to: AsWord }))]
           } else {
             [
@@ -1245,7 +1267,7 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {a
             word_type,
             AsWord,
             [word, other],
-            held_pair.push(let_of(returned, call(op, compared, returned_type))).concat(
+            held_pair.push(let_of(returned, call(operation, compared, returned_type))).concat(
               finished,
             ).push(
               Return(VarOperand(out)),

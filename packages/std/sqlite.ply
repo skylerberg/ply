@@ -85,7 +85,7 @@ import std.gen
 
 extern fn sqlite_run(
   image: Bytes,
-  sql: String,
+  connection: String,
   params: Bytes,
   reads_only: Bool,
   strict: Bool,
@@ -168,7 +168,7 @@ pub nondet effect sqlite {
 /// operation can still fail.
 pub effect sql {
   /// A database did not do what was requested.
-  raise fail(reason: Error)
+  raise fail(connection: Error)
 }
 
 /// The constraint a write broke: a unique index or a primary key, a foreign key, `NOT NULL`, a
@@ -366,7 +366,7 @@ pub fn opening<[d]>(
   options: Options,
 ) -> Connection<[d]> / {sqlite.open[d], sql.fail} =
   match sqlite.open[d](path, mode, options) {
-    Ok(conn) -> Connection(conn),
+    Ok(connection) -> Connection(connection),
     Err(f) -> sql.fail(rejection_of(f)),
   }
 
@@ -374,8 +374,8 @@ pub fn opening<[d]>(
 /// releases it with this, written `|c| sqlite::close(c)`.
 pub fn close<[d]>(c: Connection<[d]>) -> Unit / {sqlite.close[d]} =
   match c {
-    Connection(conn) -> {
-      sqlite.close[d](conn);
+    Connection(connection) -> {
+      sqlite.close[d](connection);
       ()
     },
   }
@@ -384,14 +384,14 @@ fn connection_number<[d]>(c: Connection<[d]>) -> Int = match c { Connection(conn
 
 /// The rows a read-only statement returns. Raises `Rejected` for a statement that could write.
 pub fn query<[d], [r]>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
 ) -> List<Row> / {scoped.read[r], sqlite.query[d], sql.fail, abort.raise} =
   match q {
     Bound(sql, params) -> {
       let reply = raise_on_failure(
-        sqlite.query[d](connection_number(conn.get()), sql, params, limits),
+        sqlite.query[d](connection_number(connection.get()), sql, params, limits),
       );
       rows_of(reply.columns, reply.rows)
     },
@@ -403,14 +403,14 @@ pub type ExecuteResult = { rows: Int, last_row_id: Int }
 
 /// Runs a statement that writes, including a schema statement.
 pub fn execute<[d], [r]>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
 ) -> ExecuteResult / {scoped.read[r], sqlite.execute[d], sql.fail} =
   match q {
     Bound(sql, params) -> {
       let reply = raise_on_failure(
-        sqlite.execute[d](connection_number(conn.get()), sql, params, limits),
+        sqlite.execute[d](connection_number(connection.get()), sql, params, limits),
       );
       { rows: reply.changed, last_row_id: reply.last_row_id }
     },
@@ -418,14 +418,14 @@ pub fn execute<[d], [r]>(
 
 /// Runs a statement that writes and returns rows, as one with `returning` does.
 pub fn returning<[d], [r]>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
 ) -> List<Row> / {scoped.read[r], sqlite.execute[d], sql.fail, abort.raise} =
   match q {
     Bound(sql, params) -> {
       let reply = raise_on_failure(
-        sqlite.execute[d](connection_number(conn.get()), sql, params, limits),
+        sqlite.execute[d](connection_number(connection.get()), sql, params, limits),
       );
       rows_of(reply.columns, reply.rows)
     },
@@ -436,13 +436,13 @@ pub fn returning<[d], [r]>(
 /// as `Failed` instead of being raised: its `code` is the `Failure`'s `kind` and its `constraint`
 /// is the `Failure`'s `name`.
 pub fn run<[d], [r]>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
 ) -> QueryResult / {scoped.read[r], sqlite.execute[d], abort.raise} =
   match q {
     Bound(sql, params) -> {
-      let reply = sqlite.execute[d](connection_number(conn.get()), sql, params, limits);
+      let reply = sqlite.execute[d](connection_number(connection.get()), sql, params, limits);
       match reply.failure {
         Some(f) -> Failed({ code: f.kind, constraint: f.name, detail: f.detail }),
         None -> if reply.columns.len() == 0 { Count(reply.changed) } else {
@@ -467,37 +467,37 @@ pub fn run<[d], [r]>(
 /// connection holds the lock past the wait. On a connection opened to read, it takes no lock and
 /// is a `snapshot`.
 pub fn transaction<a, [d], [r] | e>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   body: () -> a / e,
 ) -> a / {scoped.read[r], sqlite.control[d], sql.fail | e} =
-  in_transaction[d](connection_number(conn.get()), Begin, body)
+  in_transaction[d](connection_number(connection.get()), Begin, body)
 
 /// Runs `body` inside a transaction that only reads: every query in it sees the database as it was
 /// at the first query. A write in it raises `Busy` if another connection has written since.
 pub fn snapshot<a, [d], [r] | e>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   body: () -> a / e,
 ) -> a / {scoped.read[r], sqlite.control[d], sql.fail | e} =
-  in_transaction[d](connection_number(conn.get()), BeginRead, body)
+  in_transaction[d](connection_number(connection.get()), BeginRead, body)
 
 fn in_transaction<a, [d] | e>(
-  conn: Int,
+  connection: Int,
   opens: TransactionStep,
   body: () -> a / e,
 ) -> a / {sqlite.control[d], sql.fail | e} = {
-  raise_on_failure(sqlite.control[d](conn, opens));
+  raise_on_failure(sqlite.control[d](connection, opens));
   handle {
     bracket(
       || (),
       |_u: Unit|
         if !body_finished.ended() {
-          sqlite.control[d](conn, Rollback);
+          sqlite.control[d](connection, Rollback);
           ()
         },
       |_u: Unit| {
         let value = body();
         body_finished.end();
-        raise_on_failure(sqlite.control[d](conn, Commit));
+        raise_on_failure(sqlite.control[d](connection, Commit));
         value
       },
     )
@@ -521,7 +521,7 @@ effect body_finished {
 /// cannot run other statements during the fold, so `f` must not use it. `f` can read from another
 /// connection, or collect rows to write after the fold ends.
 pub fn fold_rows<a, [d], [r] | e>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
   page: Int,
@@ -530,7 +530,7 @@ pub fn fold_rows<a, [d], [r] | e>(
 ) -> a / {scoped.read[r], sqlite.cursor[d], sqlite.fetch[d], sqlite.finish[d], sql.fail, abort.raise | e} =
   match q {
     Bound(sql, params) -> {
-      let id = connection_number(conn.get());
+      let id = connection_number(connection.get());
       if page < 1 { panic("the page size must be at least 1 row") } else {
         bracket(
           || raise_on_failure(sqlite.cursor[d](id, sql, params, limits)).columns,
@@ -554,10 +554,10 @@ pub fn fold_rows<a, [d], [r] | e>(
 /// connections write meanwhile. Raises `Malformed` inside a transaction, because the engine cannot
 /// copy then.
 pub fn backup<[d], [r]>(
-  conn: Scoped<Connection<[d]>, [r]>,
+  connection: Scoped<Connection<[d]>, [r]>,
   path: String,
 ) -> Unit / {scoped.read[r], sqlite.backup[d], sql.fail} = {
-  raise_on_failure(sqlite.backup[d](connection_number(conn.get()), path));
+  raise_on_failure(sqlite.backup[d](connection_number(connection.get()), path));
   ()
 }
 
@@ -620,44 +620,51 @@ fn host_handler<a | e>(
       match opened { Ok(_) -> record_opened_files(label, path, mode), Err(_) -> () };
       opened
     },
-    sqlite.close[*label](conn) -> job_wait(sqlite_close(label, conn)) == b"\x01",
-    sqlite.query[*label](conn, sql, params, limits) ->
+    sqlite.close[*label](connection) -> job_wait(sqlite_close(label, connection)) == b"\x01",
+    sqlite.query[*label](connection, sql, params, limits) ->
       decode_reply(
-        job_wait(sqlite_query(label, conn, sql, encode_scalars(params), encode_limits(limits))),
+        job_wait(
+          sqlite_query(label, connection, sql, encode_scalars(params), encode_limits(limits)),
+        ),
       ),
-    sqlite.execute[*label](conn, sql, params, limits) ->
+    sqlite.execute[*label](connection, sql, params, limits) ->
       decode_reply(
-        job_wait(sqlite_execute(label, conn, sql, encode_scalars(params), encode_limits(limits))),
+        job_wait(
+          sqlite_execute(label, connection, sql, encode_scalars(params), encode_limits(limits)),
+        ),
       ),
-    sqlite.control[*label](conn, step) ->
-      decode_reply(job_wait(sqlite_control(label, conn, step_number(step)))),
-    sqlite.backup[*label](conn, path) -> {
-      let reply = decode_reply(job_wait(sqlite_backup(label, conn, path)));
+    sqlite.control[*label](connection, step) ->
+      decode_reply(job_wait(sqlite_control(label, connection, step_number(step)))),
+    sqlite.backup[*label](connection, path) -> {
+      let reply = decode_reply(job_wait(sqlite_backup(label, connection, path)));
       match reply.failure { None -> observed(label, path, 4), Some(_) -> () };
       reply
     },
-    sqlite.cursor[*label](conn, sql, params, limits) ->
+    sqlite.cursor[*label](connection, sql, params, limits) ->
       decode_reply(
-        job_wait(sqlite_cursor(label, conn, sql, encode_scalars(params), encode_limits(limits))),
+        job_wait(
+          sqlite_cursor(label, connection, sql, encode_scalars(params), encode_limits(limits)),
+        ),
       ),
-    sqlite.fetch[*label](conn, rows) -> decode_reply(job_wait(sqlite_fetch(label, conn, rows))),
-    sqlite.finish[*label](conn) -> job_wait(sqlite_finish(label, conn)) == b"\x01",
+    sqlite.fetch[*label](connection, rows) ->
+      decode_reply(job_wait(sqlite_fetch(label, connection, rows))),
+    sqlite.finish[*label](connection) -> job_wait(sqlite_finish(label, connection)) == b"\x01",
   }
 
 extern fn sqlite_open(
   label: String,
-  path: String,
+  connection: String,
   mode: Int,
   strict: Bool,
   busy_ms: Int,
   statements: Int,
 ) -> Int / {native.read}
 
-extern fn sqlite_close(label: String, conn: Int) -> Int / {native.read}
+extern fn sqlite_close(label: String, connection: Int) -> Int / {native.read}
 
 extern fn sqlite_query(
   label: String,
-  conn: Int,
+  connection: Int,
   sql: String,
   params: Bytes,
   limits: Bytes,
@@ -665,7 +672,7 @@ extern fn sqlite_query(
 
 extern fn sqlite_execute(
   label: String,
-  conn: Int,
+  connection: Int,
   sql: String,
   params: Bytes,
   limits: Bytes,
@@ -673,19 +680,19 @@ extern fn sqlite_execute(
 
 extern fn sqlite_cursor(
   label: String,
-  conn: Int,
+  connection: Int,
   sql: String,
   params: Bytes,
   limits: Bytes,
 ) -> Int / {native.read}
 
-extern fn sqlite_control(label: String, conn: Int, step: Int) -> Int / {native.read}
+extern fn sqlite_control(label: String, connection: Int, step: Int) -> Int / {native.read}
 
-extern fn sqlite_backup(label: String, conn: Int, path: String) -> Int / {native.read}
+extern fn sqlite_backup(label: String, connection: Int, path: String) -> Int / {native.read}
 
-extern fn sqlite_fetch(label: String, conn: Int, rows: Int) -> Int / {native.read}
+extern fn sqlite_fetch(label: String, connection: Int, rows: Int) -> Int / {native.read}
 
-extern fn sqlite_finish(label: String, conn: Int) -> Int / {native.read}
+extern fn sqlite_finish(label: String, connection: Int) -> Int / {native.read}
 
 fn mode_number(mode: Mode) -> Int = match mode { ReadOnly -> 0, ReadWrite -> 1, Create -> 2 }
 
@@ -819,46 +826,46 @@ pub fn on_memory<a, [d] | e>(
       t = opened.fake;
       opened.conn
     },
-    sqlite.close[d](conn) -> {
+    sqlite.close[d](connection) -> {
       let now = t;
-      t = fake_close(now, conn);
-      now.open.contains(conn)
+      t = fake_close(now, connection);
+      now.open.contains(connection)
     },
-    sqlite.query[d](conn, sql, params, limits) -> {
-      let bare_statement = fake_run(t, conn, sql, params, limits, true);
+    sqlite.query[d](connection, sql, params, limits) -> {
+      let bare_statement = fake_run(t, connection, sql, params, limits, true);
       t = bare_statement.fake;
       bare_statement.reply
     },
-    sqlite.execute[d](conn, sql, params, limits) -> {
-      let bare_statement = fake_run(t, conn, sql, params, limits, false);
+    sqlite.execute[d](connection, sql, params, limits) -> {
+      let bare_statement = fake_run(t, connection, sql, params, limits, false);
       t = bare_statement.fake;
       bare_statement.reply
     },
-    sqlite.control[d](conn, step) -> {
-      let bare_statement = fake_control(t, conn, step);
+    sqlite.control[d](connection, step) -> {
+      let bare_statement = fake_control(t, connection, step);
       t = bare_statement.fake;
       bare_statement.reply
     },
-    sqlite.backup[d](conn, path) -> {
-      let bare_statement = fake_backup(t, conn, path);
+    sqlite.backup[d](connection, path) -> {
+      let bare_statement = fake_backup(t, connection, path);
       t = bare_statement.fake;
       bare_statement.reply
     },
-    sqlite.cursor[d](conn, sql, params, limits) -> {
-      let bare_statement = fake_cursor(t, conn, sql, params, limits);
+    sqlite.cursor[d](connection, sql, params, limits) -> {
+      let bare_statement = fake_cursor(t, connection, sql, params, limits);
       t = bare_statement.fake;
       bare_statement.reply
     },
-    sqlite.fetch[d](conn, rows) -> {
-      let bare_statement = fake_fetch(t, conn, rows);
+    sqlite.fetch[d](connection, rows) -> {
+      let bare_statement = fake_fetch(t, connection, rows);
       t = bare_statement.fake;
       bare_statement.reply
     },
-    sqlite.finish[d](conn) -> {
+    sqlite.finish[d](connection) -> {
       let now = t;
-      match now.open.get(conn) {
+      match now.open.get(connection) {
         Some(o) -> {
-          t = { ..now, open: now.open.insert(conn, { ..o, cursor: None }) };
+          t = { ..now, open: now.open.insert(connection, { ..o, cursor: None }) };
           o.cursor != None
         },
         None -> false,
@@ -899,8 +906,8 @@ fn committed_database(t: Fake, path: String) -> Bytes = t.files.get(path).unwrap
 fn image_of(t: Fake, o: FakeConnection) -> Bytes =
   if o.saved.len() > 0 { o.working } else { committed_database(t, o.path) }
 
-fn written_by_another(t: Fake, path: String, conn: Int) -> Bool =
-  match t.writer.get(path) { Some(holder) -> holder != conn, None -> false }
+fn written_by_another(t: Fake, path: String, connection: Int) -> Bool =
+  match t.writer.get(path) { Some(holder) -> holder != connection, None -> false }
 
 fn fake_open(
   t: Fake,
@@ -930,14 +937,15 @@ fn fake_open(
   }
 }
 
-fn fake_close(t: Fake, conn: Int) -> Fake =
-  match t.open.get(conn) {
+fn fake_close(t: Fake, connection: Int) -> Fake =
+  match t.open.get(connection) {
     None -> t,
-    Some(o) -> { ..unlocked(t, o, conn), open: t.open.remove(conn) },
+    Some(o) -> { ..unlocked(t, o, connection), open: t.open.remove(connection) },
   }
 
-fn unlocked(t: Fake, o: FakeConnection, conn: Int) -> Fake =
-  if t.writer.get(o.path) == Some(conn) { { ..t, writer: t.writer.remove(o.path) } } else { t }
+fn unlocked(t: Fake, o: FakeConnection, connection: Int) -> Fake =
+  if t.writer.get(o.path) == Some(connection) { { ..t, writer: t.writer.remove(o.path) } }
+  else { t }
 
 type StatementResult = { database_after: Bytes, reply: Reply }
 
@@ -961,13 +969,13 @@ fn run_on_image(
 
 fn fake_run(
   t: Fake,
-  conn: Int,
+  connection: Int,
   sql: String,
   params: List<Scalar>,
   limits: Limits,
   querying: Bool,
 ) -> FakeStep / {abort.raise} =
-  match t.open.get(conn) {
+  match t.open.get(connection) {
     None -> { fake: t, reply: no_connection_reply() },
     Some(o) -> if o.cursor != None { { fake: t, reply: cursor_open_reply() } } else {
       let ran = run_on_image(
@@ -989,14 +997,21 @@ fn fake_run(
             ),
           }
         } else { { fake: t, reply: ran.reply } },
-        None -> if ran.reply.wrote { fake_apply_write(t, conn, o, ran.database_after, ran.reply) }
-        else { { fake: t, reply: ran.reply } },
+        None -> if ran.reply.wrote {
+          fake_apply_write(t, connection, o, ran.database_after, ran.reply)
+        } else { { fake: t, reply: ran.reply } },
       }
     },
   }
 
-fn fake_apply_write(t: Fake, conn: Int, o: FakeConnection, image: Bytes, reply: Reply) -> FakeStep =
-  if written_by_another(t, o.path, conn) { { fake: t, reply: busy_reply() } }
+fn fake_apply_write(
+  t: Fake,
+  connection: Int,
+  o: FakeConnection,
+  image: Bytes,
+  reply: Reply,
+) -> FakeStep =
+  if written_by_another(t, o.path, connection) { { fake: t, reply: busy_reply() } }
   else if o.saved.len() == 0 {
     { fake: { ..t, files: t.files.insert(o.path, image) }, reply: reply }
   } else if !o.writes && committed_database(t, o.path) != o.base {
@@ -1005,27 +1020,27 @@ fn fake_apply_write(t: Fake, conn: Int, o: FakeConnection, image: Bytes, reply: 
     {
       fake: {
         ..t,
-        open: t.open.insert(conn, { ..o, working: image, writes: true }),
-        writer: t.writer.insert(o.path, conn),
+        open: t.open.insert(connection, { ..o, working: image, writes: true }),
+        writer: t.writer.insert(o.path, connection),
       },
       reply: reply,
     }
   }
 
-fn fake_control(t: Fake, conn: Int, step: TransactionStep) -> FakeStep =
-  match t.open.get(conn) {
+fn fake_control(t: Fake, connection: Int, step: TransactionStep) -> FakeStep =
+  match t.open.get(connection) {
     None -> { fake: t, reply: no_connection_reply() },
     Some(o) -> if o.cursor != None { { fake: t, reply: cursor_open_reply() } } else {
       match step {
-        Begin -> fake_begin(t, conn, o, true),
-        BeginRead -> fake_begin(t, conn, o, false),
-        Commit -> fake_end(t, conn, o, true),
-        Rollback -> fake_end(t, conn, o, false),
+        Begin -> fake_begin(t, connection, o, true),
+        BeginRead -> fake_begin(t, connection, o, false),
+        Commit -> fake_end(t, connection, o, true),
+        Rollback -> fake_end(t, connection, o, false),
       }
     },
   }
 
-fn fake_begin(t: Fake, conn: Int, o: FakeConnection, takes_write_lock: Bool) -> FakeStep = {
+fn fake_begin(t: Fake, connection: Int, o: FakeConnection, takes_write_lock: Bool) -> FakeStep = {
   let writes = takes_write_lock && o.mode != ReadOnly;
   if o.saved.len() >= 32 {
     {
@@ -1034,51 +1049,51 @@ fn fake_begin(t: Fake, conn: Int, o: FakeConnection, takes_write_lock: Bool) -> 
     }
   } else if o.saved.len() > 0 {
     {
-      fake: { ..t, open: t.open.insert(conn, { ..o, saved: o.saved.push(o.working) }) },
+      fake: { ..t, open: t.open.insert(connection, { ..o, saved: o.saved.push(o.working) }) },
       reply: empty_reply(),
     }
-  } else if writes && written_by_another(t, o.path, conn) { { fake: t, reply: busy_reply() } }
+  } else if writes && written_by_another(t, o.path, connection) { { fake: t, reply: busy_reply() } }
   else {
     let image = committed_database(t, o.path);
     {
       fake: {
         ..t,
-        open: t.open.insert(conn, {
+        open: t.open.insert(connection, {
           ..o,
           saved: [image],
           working: image,
           base: image,
           writes: writes,
         }),
-        writer: if writes { t.writer.insert(o.path, conn) } else { t.writer },
+        writer: if writes { t.writer.insert(o.path, connection) } else { t.writer },
       },
       reply: empty_reply(),
     }
   }
 }
 
-fn fake_end(t: Fake, conn: Int, o: FakeConnection, stored_datum: Bool) -> FakeStep = {
+fn fake_end(t: Fake, connection: Int, o: FakeConnection, stored_datum: Bool) -> FakeStep = {
   let depth = o.saved.len();
   if depth == 0 { { fake: t, reply: failure_reply("refused", "", "no transaction is open") } }
   else if depth > 1 {
     let outer = o.saved.slice(0, depth - 1);
     let working = if stored_datum { o.working } else { o.saved.at(depth - 1).unwrap_or(o.working) };
     {
-      fake: { ..t, open: t.open.insert(conn, { ..o, saved: outer, working: working }) },
+      fake: { ..t, open: t.open.insert(connection, { ..o, saved: outer, working: working }) },
       reply: empty_reply(),
     }
   } else {
     let files = if stored_datum && o.writes { t.files.insert(o.path, o.working) } else { t.files };
     let ended = { ..o, saved: [], working: b"", base: b"", writes: false };
     {
-      fake: { ..unlocked(t, o, conn), files: files, open: t.open.insert(conn, ended) },
+      fake: { ..unlocked(t, o, connection), files: files, open: t.open.insert(connection, ended) },
       reply: empty_reply(),
     }
   }
 }
 
-fn fake_backup(t: Fake, conn: Int, path: String) -> FakeStep / {abort.raise} =
-  match t.open.get(conn) {
+fn fake_backup(t: Fake, connection: Int, path: String) -> FakeStep / {abort.raise} =
+  match t.open.get(connection) {
     None -> { fake: t, reply: no_connection_reply() },
     Some(o) -> {
       let to = confined(path);
@@ -1107,12 +1122,12 @@ fn fake_backup(t: Fake, conn: Int, path: String) -> FakeStep / {abort.raise} =
 
 fn fake_cursor(
   t: Fake,
-  conn: Int,
+  connection: Int,
   sql: String,
   params: List<Scalar>,
   limits: Limits,
 ) -> FakeStep / {abort.raise} =
-  match t.open.get(conn) {
+  match t.open.get(connection) {
     None -> { fake: t, reply: no_connection_reply() },
     Some(o) -> if o.cursor != None { { fake: t, reply: cursor_open_reply() } } else {
       let ran = run_on_image(image_of(t, o), sql, params, true, o.strict, {
@@ -1124,7 +1139,7 @@ fn fake_cursor(
         None -> {
           let folding = Some({ rows: ran.reply.rows, at: 0, bytes: limits.bytes });
           {
-            fake: { ..t, open: t.open.insert(conn, { ..o, cursor: folding }) },
+            fake: { ..t, open: t.open.insert(connection, { ..o, cursor: folding }) },
             reply: { ..empty_reply(), columns: ran.reply.columns },
           }
         },
@@ -1132,8 +1147,8 @@ fn fake_cursor(
     },
   }
 
-fn fake_fetch(t: Fake, conn: Int, rows: Int) -> FakeStep =
-  match t.open.get(conn) {
+fn fake_fetch(t: Fake, connection: Int, rows: Int) -> FakeStep =
+  match t.open.get(connection) {
     None -> { fake: t, reply: no_connection_reply() },
     Some(o) -> match o.cursor {
       None -> { fake: t, reply: failure_reply("closed", "", "no fold is open on this connection") },
@@ -1157,7 +1172,7 @@ fn fake_fetch(t: Fake, conn: Int, rows: Int) -> FakeStep =
         } else {
           let folding = Some({ ..f, at: f.at + page.len() });
           {
-            fake: { ..t, open: t.open.insert(conn, { ..o, cursor: folding }) },
+            fake: { ..t, open: t.open.insert(connection, { ..o, cursor: folding }) },
             reply: { ..empty_reply(), rows: page },
           }
         }
@@ -1173,12 +1188,14 @@ fn strict_options() -> Options = { strict: true, busy_ms: 0, statements: 16 }
 fn stored_datum(p: Param) -> Datum / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_scope[kept_value](opening[scratch]("v.db", Create, strict_options()), |c|
-        close(c)) { conn -> {
-        execute(conn, bound(stmt("create table v (x any) strict"), []), generous_limits());
-        execute(conn, bound(stmt("insert into v (x) values (?1)"), [p]), generous_limits());
+      with_scope[kept_value](
+        opening[scratch]("v.db", Create, strict_options()),
+        |c| close(c),
+      ) { connection -> {
+        execute(connection, bound(stmt("create table v (x any) strict"), []), generous_limits());
+        execute(connection, bound(stmt("insert into v (x) values (?1)"), [p]), generous_limits());
         column_value(
-          query(conn, bound(stmt("select x from v"), []), generous_limits()).at(0).unwrap_or(
+          query(connection, bound(stmt("select x from v"), []), generous_limits()).at(0).unwrap_or(
             Map::new(),
           ),
           "x",
@@ -1200,22 +1217,28 @@ test "a float written is the float read, and a NaN is stored as null" {
 fn after_a_failed_transaction(ns: List<Int>) -> List<Int> / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_scope[rolled_back](opening[scratch]("t.db", Create, strict_options()), |c|
-        close(c)) { conn -> {
-        execute(conn, bound(stmt("create table t (n integer) strict"), []), generous_limits());
-        execute(conn, bound(stmt("insert into t (n) values (7)"), []), generous_limits());
+      with_scope[rolled_back](
+        opening[scratch]("t.db", Create, strict_options()),
+        |c| close(c),
+      ) { connection -> {
+        execute(
+          connection,
+          bound(stmt("create table t (n integer) strict"), []),
+          generous_limits(),
+        );
+        execute(connection, bound(stmt("insert into t (n) values (7)"), []), generous_limits());
         let gave_up: Result<Unit, Error> = try {
-          transaction(conn, || {
+          transaction(connection, || {
             ns.map(|n: Int|
               execute(
-                conn,
+                connection,
                 bound(stmt("insert into t (n) values (?1)"), [IntParameter(n)]),
                 generous_limits(),
               ));
             sql.fail(Closed("the transaction function failed on purpose"))
           })
         };
-        query(conn, bound(stmt("select n from t order by rowid"), []), generous_limits()).map(
+        query(connection, bound(stmt("select n from t order by rowid"), []), generous_limits()).map(
           |row: Row| int(row, "n"),
         )
       } })
@@ -1231,11 +1254,17 @@ test "a transaction whose body raises changes nothing" {
 fn rows_returned(column_value: Int, limit: Int) -> Int / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_scope[limited](opening[scratch]("t.db", Create, strict_options()), |c|
-        close(c)) { conn -> {
-        execute(conn, bound(stmt("create table t (n integer) strict"), []), generous_limits());
+      with_scope[limited](
+        opening[scratch]("t.db", Create, strict_options()),
+        |c| close(c),
+      ) { connection -> {
         execute(
-          conn,
+          connection,
+          bound(stmt("create table t (n integer) strict"), []),
+          generous_limits(),
+        );
+        execute(
+          connection,
           bound(
             stmt(
               "with recursive c(i) as (select 1 union all select i + 1 from c where i < ?1) insert into t select i from c where ?1 > 0",
@@ -1244,7 +1273,11 @@ fn rows_returned(column_value: Int, limit: Int) -> Int / {abort.raise} = {
           ),
           generous_limits(),
         );
-        query(conn, bound(stmt("select n from t"), []), { ..generous_limits(), rows: limit }).len()
+        query(connection, bound(stmt("select n from t"), []), {
+          ..generous_limits(),
+          rows: limit,
+        }).len(
+        )
       } })
   };
   match read { Ok(n) -> n, Err(_) -> -1 }
@@ -1309,14 +1342,14 @@ fn rejection<a | e>(go: () -> a / {sql.fail | e}) -> Option<Error> / e =
 test "a database written and closed is read back when it is opened again" {
   let wrote = over_fake(memory(), ||
     with_scope[first](opening[app]("data/app.db", Create, strict_options()), |c|
-      close(c)) { conn -> {
+      close(c)) { connection -> {
       execute(
-        conn,
+        connection,
         bare_statement("create table person (id integer primary key, name text not null) strict"),
         generous_limits(),
       );
       execute(
-        conn,
+        connection,
         bound(stmt("insert into person (name) values (?1)"), [TextParameter("Ada")]),
         generous_limits(),
       )
@@ -1324,9 +1357,11 @@ test "a database written and closed is read back when it is opened again" {
   let left = match wrote { Ok(over) -> over, Err(_) -> panic("the database was not written") };
   assert_eq(left.value, { rows: 1, last_row_id: 1 });
   let names = in_fake(left.memory, ||
-    with_scope[second](opening[app]("data/app.db", ReadOnly, strict_options()), |c|
-      close(c)) { conn ->
-      query(conn, bare_statement("select id, name from person"), generous_limits()).map(
+    with_scope[second](
+      opening[app]("data/app.db", ReadOnly, strict_options()),
+      |c| close(c),
+    ) { connection ->
+      query(connection, bare_statement("select id, name from person"), generous_limits()).map(
         |row: Row| text(row, "name"),
       )
     });
@@ -1350,27 +1385,30 @@ fn in_empty_fake<a>(
 test "a database that does not exist opens only in Create mode" {
   assert_eq(
     in_empty_fake(||
-      with_scope[missing](opening[app]("no.db", ReadWrite, strict_options()), |c|
-        close(c)) { conn -> 1 }),
+      with_scope[missing](
+        opening[app]("no.db", ReadWrite, strict_options()),
+        |c| close(c),
+      ) { connection -> 1 }),
     Err(Unopened("unable to open database file")),
   );
   assert_eq(
     in_empty_fake(||
-      with_scope[made](opening[app]("no.db", Create, strict_options()), |c| close(c)) { conn -> 1 }),
+      with_scope[made](opening[app]("no.db", Create, strict_options()), |c|
+        close(c)) { connection -> 1 }),
     Ok(1),
   )
 }
 
 test "each value kind is read with its matching reader, and a null column reads as `None` through `optional`" {
   let read = in_empty_fake(||
-    with_scope[typed](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[typed](opening[app]("t.db", Create, strict_options()), |c| close(c)) { connection -> {
       execute(
-        conn,
+        connection,
         bare_statement("create table v (i integer, r real, t text, b blob, n text) strict"),
         generous_limits(),
       );
       execute(
-        conn,
+        connection,
         bound(stmt("insert into v values (?1, ?2, ?3, ?4, ?5)"), [
           IntParameter(-9223372036854775807 - 1),
           FloatParameter(1.5),
@@ -1380,7 +1418,11 @@ test "each value kind is read with its matching reader, and a null column reads 
         ]),
         generous_limits(),
       );
-      let rows = query(conn, bare_statement("select i, r, t, b, n from v"), generous_limits());
+      let rows = query(
+        connection,
+        bare_statement("select i, r, t, b, n from v"),
+        generous_limits(),
+      );
       let row = rows.at(0).unwrap_or(Map::new());
       {
         i: int(row, "i"),
@@ -1410,10 +1452,10 @@ test "each value kind is read with its matching reader, and a null column reads 
 
 test "a boolean is bound as 1 or 0, and a parameter type SQLite cannot store is rejected" {
   let read = in_empty_fake(||
-    with_scope[bools](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
+    with_scope[bools](opening[app]("t.db", Create, strict_options()), |c| close(c)) { connection ->
       numbers(
         query(
-          conn,
+          connection,
           bound(stmt("select ?1 as a union all select ?2"), [
             BoolParameter(true),
             BoolParameter(false),
@@ -1430,28 +1472,28 @@ test "a boolean is bound as 1 or 0, and a parameter type SQLite cannot store is 
 
 test "a transaction commits when its body returns and rolls back when it raises" {
   let read = in_empty_fake(||
-    with_scope[txn](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
-      transaction(conn, ||
-        execute(conn, bare_statement("insert into t values (1)"), generous_limits()));
+    with_scope[txn](opening[app]("t.db", Create, strict_options()), |c| close(c)) { connection -> {
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits());
+      transaction(connection, ||
+        execute(connection, bare_statement("insert into t values (1)"), generous_limits()));
       let failed = rejection(||
-        transaction(conn, || {
-          execute(conn, bare_statement("insert into t values (2)"), generous_limits());
-          execute(conn, bare_statement("insert into t values ('two')"), generous_limits())
+        transaction(connection, || {
+          execute(connection, bare_statement("insert into t values (2)"), generous_limits());
+          execute(connection, bare_statement("insert into t values ('two')"), generous_limits())
         }));
-      let inner = transaction(conn, || {
-        execute(conn, bare_statement("insert into t values (3)"), generous_limits());
+      let inner = transaction(connection, || {
+        execute(connection, bare_statement("insert into t values (3)"), generous_limits());
         let gave_up = rejection(||
-          transaction(conn, || {
-            execute(conn, bare_statement("insert into t values (4)"), generous_limits());
+          transaction(connection, || {
+            execute(connection, bare_statement("insert into t values (4)"), generous_limits());
             sql.fail(Closed("no"))
           }));
-        execute(conn, bare_statement("insert into t values (5)"), generous_limits());
+        execute(connection, bare_statement("insert into t values (5)"), generous_limits());
         gave_up
       });
       {
         held: numbers(
-          query(conn, bare_statement("select n from t order by n"), generous_limits()),
+          query(connection, bare_statement("select n from t order by n"), generous_limits()),
           "n",
         ),
         failed: failed,
@@ -1536,59 +1578,67 @@ fn violation_cases() -> List<ViolationCase> =
 test "executing `{c.sql}` fails with the constraint violation the case expects" for c: ViolationCase in violation_cases(
   ) {
   let read = in_empty_fake(||
-    with_scope[constrained](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
+    with_scope[constrained](opening[app]("t.db", Create, strict_options()), |x|
+      close(x)) { connection -> {
       execute(
-        conn,
+        connection,
         bare_statement("create table p (id integer primary key, code text not null unique) strict"),
         generous_limits(),
       );
       execute(
-        conn,
+        connection,
         bare_statement(
           "create table c (id integer primary key, p integer not null references p (id), n integer, constraint positive check (n > 0)) strict",
         ),
         generous_limits(),
       );
-      execute(conn, bare_statement("insert into p values (1, 'a')"), generous_limits());
-      execute(conn, bare_statement("insert into c (p, n) values (1, 1)"), generous_limits());
-      rejection(|| execute(conn, bare_statement(c.sql), generous_limits()))
+      execute(connection, bare_statement("insert into p values (1, 'a')"), generous_limits());
+      execute(connection, bare_statement("insert into c (p, n) values (1, 1)"), generous_limits());
+      rejection(|| execute(connection, bare_statement(c.sql), generous_limits()))
     } });
   assert_eq(read, Ok(Some(c.reason)))
 }
 
 test "a query that exceeds a limit is rejected, and the error names that limit" {
   let read = in_empty_fake(||
-    with_scope[bounded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
-      execute(conn, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
+    with_scope[bounded](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { connection -> {
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits());
+      execute(connection, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
       [
         rejection(||
-          query(conn, bare_statement("select n from t"), { ..generous_limits(), rows: 2 })),
+          query(connection, bare_statement("select n from t"), { ..generous_limits(), rows: 2 })),
         rejection(||
-          query(conn, bare_statement("select 'abcdef' as a"), { ..generous_limits(), bytes: 5 })),
+          query(connection, bare_statement("select 'abcdef' as a"), {
+            ..generous_limits(),
+            bytes: 5,
+          })),
         rejection(||
-          query(conn, bare_statement("select 1 as a"), { ..generous_limits(), sql_bytes: 5 })),
+          query(connection, bare_statement("select 1 as a"), {
+            ..generous_limits(),
+            sql_bytes: 5,
+          })),
         rejection(||
           query(
-            conn,
+            connection,
             bound(stmt("select ?1 as a, ?2 as b"), [IntParameter(1), IntParameter(2)]),
             { ..generous_limits(), params: 1 },
           )),
         rejection(||
           query(
-            conn,
+            connection,
             bare_statement(
               "with recursive c(i) as (select 1 union all select i + 1 from c where i < 1000000) select count(*) as n from c",
             ),
             { ..generous_limits(), steps: 10 },
           )),
         rejection(||
-          returning(conn, bare_statement("delete from t returning n"), {
+          returning(connection, bare_statement("delete from t returning n"), {
             ..generous_limits(),
             rows: 1,
           })),
         rejection(||
-          query(conn, bare_statement("select n from t"), { ..generous_limits(), rows: 3 })),
+          query(connection, bare_statement("select n from t"), { ..generous_limits(), rows: 3 })),
       ]
     } });
   assert_eq(
@@ -1607,23 +1657,28 @@ test "a query that exceeds a limit is rejected, and the error names that limit" 
 
 test "a write whose returned rows exceed the row limit is rolled back and changes nothing" {
   let read = in_empty_fake(||
-    with_scope[undone](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
-      execute(conn, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
+    with_scope[undone](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { connection -> {
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits());
+      execute(connection, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
       let over = rejection(||
-        returning(conn, bare_statement("delete from t returning n"), {
+        returning(connection, bare_statement("delete from t returning n"), {
           ..generous_limits(),
           rows: 1,
         }));
       let gone = numbers(
-        returning(conn, bare_statement("delete from t where n = 2 returning n"), generous_limits()),
+        returning(
+          connection,
+          bare_statement("delete from t where n = 2 returning n"),
+          generous_limits(),
+        ),
         "n",
       );
       {
         over: over,
         gone: gone,
         left: numbers(
-          query(conn, bare_statement("select n from t order by n"), generous_limits()),
+          query(connection, bare_statement("select n from t order by n"), generous_limits()),
           "n",
         ),
       }
@@ -1633,10 +1688,11 @@ test "a write whose returned rows exceed the row limit is rolled back and change
 
 test "fold_rows reads every row a page at a time and nothing else runs meanwhile" {
   let read = in_empty_fake(||
-    with_scope[folding](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+    with_scope[folding](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { connection -> {
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits());
       execute(
-        conn,
+        connection,
         bare_statement(
           "with recursive c(i) as (select 1 union all select i + 1 from c where i < 10) insert into t select i from c",
         ),
@@ -1645,26 +1701,27 @@ test "fold_rows reads every row a page at a time and nothing else runs meanwhile
       let all = bare_statement("select n from t order by n");
       let counted = |accumulator: Int, _: Row| accumulator + 1;
       {
-        sum: fold_rows(conn, all, generous_limits(), 3, 0, |accumulator: Int, row: Row|
+        sum: fold_rows(connection, all, generous_limits(), 3, 0, |accumulator: Int, row: Row|
           accumulator + int(row, "n")),
-        whole: fold_rows(conn, all, generous_limits(), 10, 0, counted),
+        whole: fold_rows(connection, all, generous_limits(), 10, 0, counted),
         none: fold_rows(
-          conn,
+          connection,
           bare_statement("select n from t where n > 99"),
           generous_limits(),
           4,
           0,
           counted,
         ),
-        over: rejection(|| fold_rows(conn, all, { ..generous_limits(), rows: 7 }, 3, 0, counted)),
+        over: rejection(||
+          fold_rows(connection, all, { ..generous_limits(), rows: 7 }, 3, 0, counted)),
         meanwhile: is_rejected(
-          fold_rows(conn, all, generous_limits(), 20, None, |_: Option<Error>, _: Row|
-            rejection(|| query(conn, bare_statement("select 1 as a"), generous_limits()))),
+          fold_rows(connection, all, generous_limits(), 20, None, |_: Option<Error>, _: Row|
+            rejection(|| query(connection, bare_statement("select 1 as a"), generous_limits()))),
         ),
         writes: is_rejected(
           rejection(||
             fold_rows(
-              conn,
+              connection,
               bare_statement("delete from t returning n"),
               generous_limits(),
               3,
@@ -1672,7 +1729,7 @@ test "fold_rows reads every row a page at a time and nothing else runs meanwhile
               counted,
             )),
         ),
-        after: query(conn, all, generous_limits()).len(),
+        after: query(connection, all, generous_limits()).len(),
       }
     } });
   assert_eq(
@@ -1694,14 +1751,15 @@ fn is_rejected(reason: Option<Error>) -> Bool =
 
 test "a backup is a separate database, and never overwrites a file" {
   let made = over_fake(memory(), ||
-    with_scope[source](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
-      execute(conn, bare_statement("insert into t values (1)"), generous_limits());
-      backup(conn, "copies/t.db");
-      execute(conn, bare_statement("insert into t values (2)"), generous_limits());
+    with_scope[source](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { connection -> {
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits());
+      execute(connection, bare_statement("insert into t values (1)"), generous_limits());
+      backup(connection, "copies/t.db");
+      execute(connection, bare_statement("insert into t values (2)"), generous_limits());
       {
-        reprinted: is_rejected(rejection(|| backup(conn, "copies/t.db"))),
-        inside: rejection(|| transaction(conn, || backup(conn, "copies/u.db"))),
+        reprinted: is_rejected(rejection(|| backup(connection, "copies/t.db"))),
+        inside: rejection(|| transaction(connection, || backup(connection, "copies/u.db"))),
       }
     } });
   let left = match made { Ok(over) -> over, Err(_) -> panic("the backup was not made") };
@@ -1710,9 +1768,11 @@ test "a backup is a separate database, and never overwrites a file" {
     inside: Some(Malformed("cannot VACUUM from within a transaction")),
   });
   let copy = in_fake(left.memory, ||
-    with_scope[copied](opening[app]("copies/t.db", ReadOnly, strict_options()), |c|
-      close(c)) { conn ->
-      numbers(query(conn, bare_statement("select n from t"), generous_limits()), "n")
+    with_scope[copied](
+      opening[app]("copies/t.db", ReadOnly, strict_options()),
+      |c| close(c),
+    ) { connection ->
+      numbers(query(connection, bare_statement("select n from t"), generous_limits()), "n")
     });
   assert_eq(copy, Ok([1]));
   assert(database_bytes(left.memory, "copies/u.db") == None);
@@ -1721,23 +1781,30 @@ test "a backup is a separate database, and never overwrites a file" {
 
 test "a connection opened to read writes nothing, and a query never writes" {
   let read = in_empty_fake(|| {
-    with_scope[seeded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits())
+    with_scope[seeded](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { connection ->
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits())
     };
-    with_scope[reading](opening[app]("t.db", ReadOnly, strict_options()), |c| close(c)) { conn ->
+    with_scope[reading](opening[app]("t.db", ReadOnly, strict_options()), |c|
+      close(c)) { connection ->
       [
-        rejection(|| execute(conn, bare_statement("insert into t values (1)"), generous_limits())),
         rejection(||
-          query(conn, bare_statement("insert into t values (1) returning n"), generous_limits())),
+          execute(connection, bare_statement("insert into t values (1)"), generous_limits())),
         rejection(||
-          transaction(conn, ||
-            execute(conn, bare_statement("insert into t values (1)"), generous_limits()))),
+          query(
+            connection,
+            bare_statement("insert into t values (1) returning n"),
+            generous_limits(),
+          )),
         rejection(||
-          transaction(conn, ||
-            query(conn, bare_statement("select n from t"), generous_limits()).len())),
+          transaction(connection, ||
+            execute(connection, bare_statement("insert into t values (1)"), generous_limits()))),
         rejection(||
-          snapshot(conn, ||
-            query(conn, bare_statement("select n from t"), generous_limits()).len())),
+          transaction(connection, ||
+            query(connection, bare_statement("select n from t"), generous_limits()).len())),
+        rejection(||
+          snapshot(connection, ||
+            query(connection, bare_statement("select n from t"), generous_limits()).len())),
       ]
     }
   });
@@ -1753,8 +1820,9 @@ test "a strict connection rejects a table that is not strict, and another connec
       with_scope[strictness](
         opening[app]("t.db", Create, { ..strict_options(), strict: strict }),
         |c| close(c),
-      ) { conn ->
-        rejection(|| execute(conn, bare_statement("create table loose (a)"), generous_limits()))
+      ) { connection ->
+        rejection(||
+          execute(connection, bare_statement("create table loose (a)"), generous_limits()))
       });
   assert(match made(true) { Ok(Some(Rejected(_))) -> true, _ -> false });
   assert_eq(made(false), Ok(None))
@@ -1774,50 +1842,52 @@ fn engine_rejects() -> List<String> =
 test "the engine rejects `{c}` when it runs, though the SQL parser accepts it" for c: String in engine_rejects(
   ) {
   let read = in_empty_fake(||
-    with_scope[authorized](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
-      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+    with_scope[authorized](opening[app]("t.db", Create, strict_options()), |x|
+      close(x)) { connection -> {
+      execute(connection, bare_statement("create table t (n integer) strict"), generous_limits());
       let params = if c.contains("?1") { [TextParameter("now")] } else { [] };
-      rejection(|| execute(conn, bound(stmt(c), params), generous_limits()))
+      rejection(|| execute(connection, bound(stmt(c), params), generous_limits()))
     } });
   assert(match read { Ok(Some(Rejected(_))) -> true, _ -> false })
 }
 
 test "a view and a trigger are bound by the same rules as a statement" {
   let read = in_empty_fake(||
-    with_scope[smuggled](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[smuggled](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { connection -> {
       execute(
-        conn,
+        connection,
         bare_statement("create table t (n integer, at text) strict"),
         generous_limits(),
       );
       execute(
-        conn,
+        connection,
         bare_statement("create view stamped as select datetime(at) as at from t"),
         generous_limits(),
       );
       execute(
-        conn,
+        connection,
         bare_statement(
           "create trigger stamp after insert on t begin update t set at = datetime(new.at, '+1 day'); end",
         ),
         generous_limits(),
       );
       execute(
-        conn,
+        connection,
         bare_statement("insert into t values (1, '2024-01-31 12:00:00')"),
         generous_limits(),
       );
       let stored_datum = query(
-        conn,
+        connection,
         bare_statement("select at from stamped"),
         generous_limits(),
       ).map(|row: Row| text(row, "at"));
       let now = rejection(||
-        execute(conn, bare_statement("insert into t values (2, 'now')"), generous_limits()));
+        execute(connection, bare_statement("insert into t values (2, 'now')"), generous_limits()));
       {
         kept: stored_datum,
         now: now,
-        held: query(conn, bare_statement("select n from t"), generous_limits()).len(),
+        held: query(connection, bare_statement("select n from t"), generous_limits()).len(),
       }
     } });
   assert(match read {
@@ -1847,8 +1917,10 @@ test "a SQL template's interpolated values become `?1`, `?2` parameters, and a r
 test "a path that leaves its root is rejected with E0452's message" {
   let escaped = try[abort.raise] {
     in_empty_fake(||
-      with_scope[escaping](opening[app]("../t.db", Create, strict_options()), |c|
-        close(c)) { conn -> 0 })
+      with_scope[escaping](
+        opening[app]("../t.db", Create, strict_options()),
+        |c| close(c),
+      ) { connection -> 0 })
   };
   assert_eq(escaped, Err("`../t.db` leaves the root it was given"))
 }
@@ -1858,9 +1930,9 @@ test "using a connection after it was closed, or one that was never opened, fail
     let stored_datum = with_scope[leaving](
       opening[app]("t.db", Create, strict_options()),
       |c| close(c),
-    ) { conn -> conn.get() };
-    with_scope[again](stored_datum, |_: Connection<[app]>| ()) { conn ->
-      rejection(|| query(conn, bare_statement("select 1 as a"), generous_limits()))
+    ) { connection -> connection.get() };
+    with_scope[again](stored_datum, |_: Connection<[app]>| ()) { connection ->
+      rejection(|| query(connection, bare_statement("select 1 as a"), generous_limits()))
     }
   });
   assert(match read { Ok(Some(Closed(_))) -> true, _ -> false })

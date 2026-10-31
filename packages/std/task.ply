@@ -236,12 +236,12 @@ pub fn until<a | e>(
       } else { [] };
       { worker: worker, timers: timers }
     },
-    |held: { worker: Task<a>, timers: List<Task<Unit>> }| {
-      cancel_and_await(held.timers);
-      cancel_and_await([held.worker])
+    |running: { worker: Task<a>, timers: List<Task<Unit>> }| {
+      cancel_and_await(running.timers);
+      cancel_and_await([running.worker])
     },
-    |held: { worker: Task<a>, timers: List<Task<Unit>> }|
-      match task.await(held.worker) { Some(result) -> Done(result), None -> TimedOut },
+    |running: { worker: Task<a>, timers: List<Task<Unit>> }|
+      match task.await(running.worker) { Some(result) -> Done(result), None -> TimedOut },
   )
 }
 
@@ -311,8 +311,8 @@ pub fn try_with_permit<a | e>(sem: Permits, body: () -> a / e) -> Option<a> / {t
   match sem {
     Semaphore(tokens) -> with_scope[permit](
       task.select([(tokens, None)], false),
-      |held: Option<(Int, Option<Unit>)>|
-        match held {
+      |selection: Option<(Int, Option<Unit>)>|
+        match selection {
           Some(_) -> {
             task.send(tokens, ());
             ()
@@ -495,8 +495,8 @@ pub opaque type Budget = new { hundredths: Int, percent: Int, reserve: Int }
 /// retries available. The budget never accumulates more than `reserve` retries, or one retry if
 /// `reserve` is zero. A negative `percent` or `reserve` is treated as zero.
 pub fn budget(percent: Int, reserve: Int) -> Budget = {
-  let kept = max(0, reserve);
-  { hundredths: kept * 100, percent: max(0, percent), reserve: kept }
+  let clamped_reserve = max(0, reserve);
+  { hundredths: clamped_reserve * 100, percent: max(0, percent), reserve: clamped_reserve }
 }
 
 /// The budget after a call pays into it.
@@ -591,10 +591,10 @@ pub fn guarded<a, x | e>(
   store: (Breaker) -> Unit / e,
   body: () -> Result<a, x> / e,
 ) -> Result<a, BreakerError<x>> / {clock.read | e} = {
-  let asked = clock.now();
+  let requested_at = clock.now();
   bracket(
     || {
-      let result = admit(load(), asked);
+      let result = admit(load(), requested_at);
       store(result.breaker);
       result
     },
@@ -642,9 +642,9 @@ pub fn take(b: Bucket, now: Instant) -> Option<Bucket> = {
 
 /// Returns how many tokens the bucket contains at `now`.
 pub fn tokens(b: Bucket, now: Instant) -> Int / {abort.raise} = {
-  let owed = nanos_at(b.full_at) - nanos_at(now);
-  if owed <= 0 { b.capacity }
-  else { max(0, b.capacity - (owed + as_nanos(b.every) - 1) / as_nanos(b.every)) }
+  let nanos_until_full = nanos_at(b.full_at) - nanos_at(now);
+  if nanos_until_full <= 0 { b.capacity }
+  else { max(0, b.capacity - (nanos_until_full + as_nanos(b.every) - 1) / as_nanos(b.every)) }
 }
 
 /// Runs `body` once the bucket that the caller stores has a token for it. The token is reserved
@@ -1187,15 +1187,15 @@ law "a semaphore of one permit admits waiters in the order they requested, in ev
             }),
         )
       } with {
-        var asked: List<Int> = [],
+        var requested_order: List<Int> = [],
         var entered: List<Int> = [],
         queue.requested(i) -> {
-          asked = asked.push(i);
+          requested_order = requested_order.push(i);
         },
         queue.entered(i) -> {
           entered = entered.push(i);
         },
-        return _done -> asked == entered,
+        return _done -> requested_order == entered,
       }
     }
   }
@@ -1373,12 +1373,12 @@ test "`retry_budgeted` retries only while the budget has retries left, and every
         }).value)
     }
   } with {
-    var kept = budget(50, 1),
-    budgets.load() -> kept,
+    var stored_budget = budget(50, 1),
+    budgets.load() -> stored_budget,
     budgets.store(next) -> {
-      kept = next;
+      stored_budget = next;
     },
-    return calls -> (calls, kept),
+    return calls -> (calls, stored_budget),
   };
   assert_eq(ended._0, [over_budget_failure(2), over_budget_failure(1), over_budget_failure(2)]);
   assert_eq(retries_left(ended._1), 0)
@@ -1400,9 +1400,9 @@ test "a budget never allows more retries than its reserve plus its percentage of
     gen::any_int(),
     gen::any_int(),
     gen::list(gen::bool()),
-    |share: Int, held: Int, script: List<Bool>| {
+    |share: Int, reserve_input: Int, script: List<Bool>| {
       let percent = rem_euclid(share, 101);
-      let reserve = rem_euclid(held, 4);
+      let reserve = rem_euclid(reserve_input, 4);
       let ran = script.fold(
         { budget: budget(percent, reserve), calls: 0, retries: 0 },
         |so_far: { budget: Budget, calls: Int, retries: Int }, call: Bool|
@@ -1461,16 +1461,16 @@ test "a retry wait never exceeds the cap or falls below the jitter's minimum, fo
 }
 
 test "an open breaker rejects every call until its cooldown ends, then lets one probe at a time" {
-  gen::check2(gen::any_int(), gen::any_int(), |cools: Int, asks: Int| {
+  gen::check2(gen::any_int(), gen::any_int(), |cools: Int, arrival_input: Int| {
     let cooldown = rem_euclid(cools, 6);
-    let asked = rem_euclid(asks, 9);
+    let arrival = rem_euclid(arrival_input, 9);
     let open = record(breaker(1, Duration(cooldown), 2), false, Instant(0));
-    let first = admit(open, Instant(asked));
-    let second = admit(first.breaker, Instant(asked));
-    if asked < cooldown { !first.admitted && !first.probe && first.breaker == open } else {
+    let first = admit(open, Instant(arrival));
+    let second = admit(first.breaker, Instant(arrival));
+    if arrival < cooldown { !first.admitted && !first.probe && first.breaker == open } else {
       first.admitted && first.probe && circuit(first.breaker) == HalfOpen(0, true)
         && !second.admitted
-        && admit(abandon_probe(first.breaker), Instant(asked)).admitted
+        && admit(abandon_probe(first.breaker), Instant(arrival)).admitted
     }
   })
 }
@@ -1502,10 +1502,10 @@ fn with_breaker<a | e>(
   handle {
     body()
   } with {
-    var kept = b,
-    shared_breaker.load() -> kept,
+    var current = b,
+    shared_breaker.load() -> current,
     shared_breaker.store(next) -> {
-      kept = next;
+      current = next;
     },
   }
 
@@ -1535,8 +1535,8 @@ test "a bucket left alone fills again, to its capacity and no further" {
     gen::any_int(),
     gen::any_int(),
     gen::any_int(),
-    |holds: Int, period: Int, takes: Int, rests: Int| {
-      let capacity = 1 + rem_euclid(holds, 3);
+    |capacity_input: Int, period: Int, takes: Int, rests: Int| {
+      let capacity = 1 + rem_euclid(capacity_input, 3);
       let every = 1 + rem_euclid(period, 3);
       let taken = rem_euclid(takes, capacity + 1);
       let idle = rem_euclid(rests, 13);
@@ -1561,10 +1561,10 @@ fn bucketed<a | e>(
   handle {
     body()
   } with {
-    var kept = b,
-    shared_bucket.load() -> kept,
+    var current = b,
+    shared_bucket.load() -> current,
     shared_bucket.store(next) -> {
-      kept = next;
+      current = next;
     },
   }
 

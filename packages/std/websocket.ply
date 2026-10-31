@@ -109,29 +109,39 @@ pub fn is_control(o: Opcode) -> Bool = o == Close || o == Ping || o == Pong
 
 /// The frame at the front of `buf`, read under `limits`; a compressed frame is rejected unless
 /// `compression` was negotiated.
-pub fn decode_frame(buf: Bytes, limits: Limits, compression: Bool) -> DecodeResult / {abort.raise} =
-  if buf.len() < 2 { NeedMore } else {
-    let b0 = buf.at(0);
-    let b1 = buf.at(1);
+pub fn decode_frame(
+  frame_bytes: Bytes,
+  limits: Limits,
+  compression: Bool,
+) -> DecodeResult / {abort.raise} =
+  if frame_bytes.len() < 2 { NeedMore } else {
+    let b0 = frame_bytes.at(0);
+    let b1 = frame_bytes.at(1);
     match opcode_of(b0 & 15) {
       None -> Invalid(protocol_error("a reserved opcode")),
-      Some(op) -> if b0 & 0x30 != 0 { Invalid(protocol_error("a reserved bit is set")) }
-      else if b0 & 0x40 != 0 && (!compression || is_control(op)) {
+      Some(opcode) -> if b0 & 0x30 != 0 { Invalid(protocol_error("a reserved bit is set")) }
+      else if b0 & 0x40 != 0 && (!compression || is_control(opcode)) {
         Invalid(protocol_error("a frame is marked compressed with nothing agreed to compress it"))
-      } else if is_control(op) && (b0 & 0x80 == 0 || b1 & 0x7f > 125) {
+      } else if is_control(opcode) && (b0 & 0x80 == 0 || b1 & 0x7f > 125) {
         Invalid(protocol_error("a control frame is fragmented or longer than 125 bytes"))
-      } else { sized(buf, b0, b1, op, limits) },
+      } else { sized(frame_bytes, b0, b1, opcode, limits) },
     }
   }
 
-fn sized(buf: Bytes, b0: Int, b1: Int, op: Opcode, limits: Limits) -> DecodeResult / {abort.raise} = {
+fn sized(
+  frame_bytes: Bytes,
+  b0: Int,
+  b1: Int,
+  opcode: Opcode,
+  limits: Limits,
+) -> DecodeResult / {abort.raise} = {
   let short = b1 & 0x7f;
-  let length = if short == 126 { buf.u16_be_at(2) }
-  else if short == 127 { buf.u64_be_at(2) }
+  let length = if short == 126 { frame_bytes.u16_be_at(2) }
+  else if short == 127 { frame_bytes.u64_be_at(2) }
   else { Some(short) };
   let header = if short == 126 { 4 } else if short == 127 { 10 } else { 2 };
   let masked = b1 & 0x80 != 0;
-  let top = short == 127 && buf.len() > 2 && buf.at(2) & 0x80 != 0;
+  let top = short == 127 && frame_bytes.len() > 2 && frame_bytes.at(2) & 0x80 != 0;
   match length {
     None -> if top { Invalid(protocol_error("a length with its top bit set")) } else { NeedMore },
     Some(n) -> if n < 0 || top { Invalid(protocol_error("a length with its top bit set")) }
@@ -139,11 +149,17 @@ fn sized(buf: Bytes, b0: Int, b1: Int, op: Opcode, limits: Limits) -> DecodeResu
       Invalid(protocol_error("a length not written in its shortest form"))
     } else if n > limits.max_frame { Invalid(too_big("a frame is longer than the limit")) } else {
       let start = header + (if masked { 4 } else { 0 });
-      if buf.len() < start + n { NeedMore } else {
-        let raw = buf.slice(start, start + n);
-        let payload = if masked { unmasked(raw, buf.slice(header, header + 4)) } else { raw };
+      if frame_bytes.len() < start + n { NeedMore } else {
+        let raw = frame_bytes.slice(start, start + n);
+        let payload = if masked { unmasked(raw, frame_bytes.slice(header, header + 4)) }
+        else { raw };
         Got({
-          frame: { fin: b0 & 0x80 != 0, compressed: b0 & 0x40 != 0, opcode: op, payload: payload },
+          frame: {
+            fin: b0 & 0x80 != 0,
+            compressed: b0 & 0x40 != 0,
+            opcode: opcode,
+            payload: payload,
+          },
           masked: masked,
           used: start + n,
         })
@@ -399,9 +415,9 @@ fn inflated(
 /// together with the state updated with this end's compression state.
 pub fn message_frame(s: State, m: Message) -> { state: State, frame: Frame } / {abort.raise} = {
   let plain = match m { TextMessage(t) -> Bytes::of_string(t), BinaryMessage(b) -> b };
-  let op = match m { TextMessage(_) -> Text, BinaryMessage(_) -> Binary };
+  let opcode = match m { TextMessage(_) -> Text, BinaryMessage(_) -> Binary };
   match s.compression {
-    None -> { state: s, frame: { fin: true, compressed: false, opcode: op, payload: plain } },
+    None -> { state: s, frame: { fin: true, compressed: false, opcode: opcode, payload: plain } },
     Some(c) -> {
       let start = match s.deflater { Some(w) -> w, None -> gzip::writer(gzip::Deflate) };
       let took = gzip::write(start, plain, gzip::Deflate);
@@ -412,7 +428,7 @@ pub fn message_frame(s: State, m: Message) -> { state: State, frame: Frame } / {
         frame: {
           fin: true,
           compressed: true,
-          opcode: op,
+          opcode: opcode,
           payload: all.slice(0, all.len() - flush_tail().len()),
         },
       }
@@ -895,8 +911,8 @@ fn finish_handshake<[l]>(
     }
   }
 
-fn frame(fin: Bool, op: Opcode, payload: Bytes) -> Frame =
-  { fin: fin, compressed: false, opcode: op, payload: payload }
+fn frame(fin: Bool, opcode: Opcode, payload: Bytes) -> Frame =
+  { fin: fin, compressed: false, opcode: opcode, payload: payload }
 
 fn text(t: String) -> Frame = frame(true, Text, Bytes::of_string(t))
 
@@ -1441,8 +1457,8 @@ test "in the Autobahn conformance case {c.case}, an echo server accepts the offe
     Reject(_) -> panic("the offer is taken"),
   };
   let messages = c.sizes.map(of_size);
-  let said = client_says(compressed(Client, c.contexts, messages).push(closing(1000)));
-  let echo = echoed("Sec-WebSocket-Extensions: " ++ c.offer ++ "\r\n", said, options);
+  let client_bytes = client_says(compressed(Client, c.contexts, messages).push(closing(1000)));
+  let echo = echoed("Sec-WebSocket-Extensions: " ++ c.offer ++ "\r\n", client_bytes, options);
   assert_eq(echo, server_says(compressed(Server, c.contexts, messages).push(closing(1000))));
   let frames = compressed(Server, c.contexts, messages);
   assert_eq(decompressed(Client, c.contexts, frames), messages.map(|m: Message| Received(m)))
@@ -1466,10 +1482,10 @@ test "Autobahn 13.5.1: an offer with a server window under 32 KiB is declined, a
 test "a compressor that keeps its history between messages sends a repeated message as a short back-reference" {
   let both = { server: true, client: true };
   let again = TextMessage("Hello, compressed world, hello again, compressed world");
-  let kept = compressed(Server, both, [again, again]);
+  let with_history = compressed(Server, both, [again, again]);
   let fresh = compressed(Server, { server: false, client: true }, [again, again]);
   let size = |f: Frame| f.payload.len();
-  assert(size(kept.at_or(1, close_frame(1000, ""))) < 8);
+  assert(size(with_history.at_or(1, close_frame(1000, ""))) < 8);
   assert_eq(
     size(fresh.at_or(1, close_frame(1000, ""))),
     size(fresh.at_or(0, close_frame(1000, ""))),

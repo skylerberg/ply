@@ -226,8 +226,8 @@ pub type ModuleScope = {
 pub fn root_outputs(
   s: Scope,
   roots: List<RootKey>,
-  handed: Map<RootName, OwnershipSignature>,
-) -> List<RootOutput> / {abort.raise} = results_of(lowered_in(s, roots, handed))
+  ownership_signatures: Map<RootName, OwnershipSignature>,
+) -> List<RootOutput> / {abort.raise} = results_of(lowered_in(s, roots, ownership_signatures))
 
 pub fn scope_of(
   given: List<Source>,
@@ -374,9 +374,9 @@ fn host_handlers(
   definitions_of: (Bytes) -> List<Definition>,
 ) -> Map<Bytes, HostHandler> / {abort.raise} =
   modules.fold(Map::new(), |accumulator: Map<Bytes, HostHandler>, m: ParsedModule|
-    m.module.items.fold(accumulator, |held: Map<Bytes, HostHandler>, item: Item|
+    m.module.items.fold(accumulator, |handlers: Map<Bytes, HostHandler>, item: Item|
       match item {
-        InstanceItem(d) -> if d.kind != HostInstance { held } else {
+        InstanceItem(d) -> if d.kind != HostInstance { handlers } else {
           let served = qualify(m.name, d.target.name);
           match definitions_of(m.name).find(|definition: Definition|
               definition.name == d.function.name) {
@@ -391,13 +391,13 @@ fn host_handlers(
                 ]),
               ),
             Some(definition) ->
-              held.insert(served, {
+              handlers.insert(served, {
                 call: qualify(m.name, d.function.name),
                 import: { name: served, module: m.name, definitions: [definition], whole: true },
               }),
           }
         },
-        _ -> held,
+        _ -> handlers,
       }))
 
 fn with_prelude_handlers(
@@ -441,7 +441,7 @@ fn handlers_for(
 pub fn lowered_in(
   s: Scope,
   roots: List<RootKey>,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership_signatures: Map<RootName, OwnershipSignature>,
 ) -> LoweredProgram / {abort.raise} = {
   let wanted = wanted_names(roots);
   let touched = roots.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: RootKey|
@@ -451,14 +451,17 @@ pub fn lowered_in(
   let borrowed_by = specialised.fold(
     Map::new(),
     |accumulator: Map<RootName, Option<BoundLambda>>, _: Bytes, sps: List<RootKey>|
-      sps.fold(accumulator, |held: Map<RootName, Option<BoundLambda>>, sp: RootKey|
-        inlined_lambdas(sp).fold(
-          held,
-          |h: Map<RootName, Option<BoundLambda>>, f: InlinedLambda| {
-            let name = root_name(f.owner);
-            if h.contains(name) { h } else { h.insert(name, owner_lambdas(s, f.owner)) }
-          },
-        )),
+      sps.fold(
+        accumulator,
+        |borrowed_lambdas: Map<RootName, Option<BoundLambda>>, specialisation: RootKey|
+          inlined_lambdas(specialisation).fold(
+            borrowed_lambdas,
+            |h: Map<RootName, Option<BoundLambda>>, f: InlinedLambda| {
+              let name = root_name(f.owner);
+              if h.contains(name) { h } else { h.insert(name, owner_lambdas(s, f.owner)) }
+            },
+          ),
+      ),
   );
   let forming = {
     scope: s,
@@ -475,7 +478,7 @@ pub fn lowered_in(
     stated: s.declared_operations,
     constructors: s.constructors,
     borrowed: s.borrowed,
-    ownership_signatures: handed,
+    ownership_signatures: ownership_signatures,
   }
 }
 
@@ -811,7 +814,7 @@ fn written_formed(
     let module = s.module;
     let here = s.definitions;
     let module_tree = { items: x.items };
-    let reached = || {
+    let check_calls_loaded = || {
       let unreached = emitted_code().calls.filter(|n: Bytes|
         match definition_in(module, here, s.imports, n) { Some(_) -> false, None -> true });
       if unreached.len() > 0 {
@@ -847,19 +850,19 @@ fn written_formed(
         },
       ]
     } else if is_marshal_op(w.op) {
-      if is_walked_container(r.ty) { reached() };
+      if is_walked_container(r.ty) { check_calls_loaded() };
       [written_root(r.key, marshal_root(module, s.constructors, r.key))]
     } else if contained {
-      reached();
+      check_calls_loaded();
       [written_root(r.key, container_code(module, s.constructors, r.op, r.ty))]
     } else if w.op == keys::ReleaseResource {
       [written_root(r.key, release_resource_code(module, s.constructors, here, r.key, r.ty))]
     } else if w.op == ContainerWalk(b"let_go_items") {
       [written_root(r.key, release_items_code(module, s.constructors, r.key, r.ty))]
     } else if w.op == keys::Equal || w.op == Order {
-      let held = kind_of(w.ty);
+      let representation = kind_of(w.ty);
       let param = |n: Bytes|
-        { name: n, kind: held.kind, ty: held.ty, of: Some(w.ty), lambda: None };
+        { name: n, kind: representation.kind, ty: representation.ty, of: Some(w.ty), lambda: None };
       let formed = |code: Code| [root_from_code(s, 0, w.key, [param(b"a"), param(b"b")], code)];
       match built_in_cases(s.constructors, w.ty) {
         None -> if is_sum(s.constructors, w.ty) { [] }
@@ -874,13 +877,21 @@ fn written_formed(
       } else {
         reflection_code(module, s.constructors, here, module_tree.items, r.op == b"shown", r.ty)
       };
-      let held = kind_of(r.ty);
+      let representation = kind_of(r.ty);
       [
         root_from_code(
           s,
           0,
           r.key,
-          [{ name: b"a", kind: held.kind, ty: held.ty, of: Some(r.ty), lambda: None }],
+          [
+            {
+              name: b"a",
+              kind: representation.kind,
+              ty: representation.ty,
+              of: Some(r.ty),
+              lambda: None,
+            },
+          ],
           code,
         ),
       ]
@@ -905,8 +916,8 @@ fn built_in_cases(constructors: Constructors, ty: Type) -> Option<List<SumConstr
     _ -> None,
   }
 
-fn is_plain_written(op: TypeOp) -> Bool =
-  match op {
+fn is_plain_written(operation: TypeOp) -> Bool =
+  match operation {
     keys::Drop -> true,
     keys::Dup -> true,
     keys::Release -> true,
@@ -1005,10 +1016,11 @@ fn add_item_forms(
       let p = { full: full, base: d.span.start, recorded: recorded_of(full) };
       let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
         accumulator.out,
-        |a: List<Fn>, sp: RootKey|
-          match if inlined_lambdas(sp).len() > 0 { None } else { looped(a, sp) } {
+        |a: List<Fn>, specialisation: RootKey|
+          match if inlined_lambdas(specialisation).len() > 0 { None }
+            else { looped(a, specialisation) } {
             Some(out) -> out,
-            None -> a.push(specialised_lowered(s, d, sp, lambda_at, p.recorded)),
+            None -> a.push(specialised_lowered(s, d, specialisation, lambda_at, p.recorded)),
           },
       );
       let out = if !wants_root(wanted, Named(p.full)) { specialisations } else {
@@ -1096,9 +1108,9 @@ fn add_item_forms(
     },
     LawItem(d) -> {
       let part = |which: LawPart| law_key(module, d.name, which);
-      let asked = |which: LawPart|
+      let is_wanted = |which: LawPart|
         wants_root(wanted, part(which)) || wants_root(wanted, EntryPoint(part(which)));
-      if !asked(LawGuard) && !asked(LawBody) { accumulator } else {
+      if !is_wanted(LawGuard) && !is_wanted(LawBody) { accumulator } else {
         let recorded = recorded_of(law_owner(module, d.name));
         let rooted = |out: List<Fn>, which: LawPart, body: BodyPart| {
           let b = resolved_at(recorded, body, d.span.start, []);
@@ -1118,7 +1130,7 @@ fn add_item_forms(
     },
     TypeItem(t) -> {
       let named = qualify(module, t.name.name);
-      let asked = written_roots.fold(
+      let type_forms = written_roots.fold(
         [],
         |accumulator2: List<{ key: RootKey, op: TypeOp, args: List<Type> }>, w: { key: RootKey, op: TypeOp, ty: Type }|
           match w.ty {
@@ -1136,7 +1148,7 @@ fn add_item_forms(
       match s.constructors.sums.get(named) {
         None -> accumulator,
         Some(declared) ->
-          asked.fold(
+          type_forms.fold(
             accumulator,
             |a2: RootForms, d: { key: RootKey, op: TypeOp, args: List<Type> }| {
               let cs = if d.args.len() == 0 { declared } else {
@@ -1153,21 +1165,36 @@ fn add_item_forms(
                 },
               });
               let param = |n: Bytes, ty: Type| {
-                let held = kind_of(ty);
-                { name: n, kind: held.kind, ty: held.ty, of: Some(ty), lambda: None }
+                let representation = kind_of(ty);
+                {
+                  name: n,
+                  kind: representation.kind,
+                  ty: representation.ty,
+                  of: Some(ty),
+                  lambda: None,
+                }
               };
               let formed = |ps: List<EmitParam>, code: Code|
                 root_from_code(s, t.span.start, d.key, ps, code);
               let made = match d.op {
-                NumericFunction(op) -> {
-                  let ps = if op == b"of_int" { [param(b"a", int_type())] }
-                  else if op == b"neg" { [param(b"a", compared)] }
+                NumericFunction(function_name) -> {
+                  let ps = if function_name == b"of_int" { [param(b"a", int_type())] }
+                  else if function_name == b"neg" { [param(b"a", compared)] }
                   else { [param(b"a", compared), param(b"b", compared)] };
                   formed(
                     ps,
-                    match numeric_instance(module, here, module_tree.items, compared, op) {
+                    match numeric_instance(
+                        module,
+                        here,
+                        module_tree.items,
+                        compared,
+                        function_name,
+                      ) {
                       Some(f) -> instance_code(f, ps.map(param_type)),
-                      None -> panic(String::of_bytes_lossy(b"no function stated for ".concat(op))),
+                      None ->
+                        panic(
+                          String::of_bytes_lossy(b"no function stated for ".concat(function_name)),
+                        ),
                     },
                   )
                 },
@@ -1192,27 +1219,28 @@ fn add_item_forms(
   }
 }
 
-pub fn enterable(c: MarshalledSums, sc: Scheme) -> Bool =
-  sc.label_variables.len() == 0
-    && (match judged_type(sc) {
+pub fn enterable(c: MarshalledSums, scheme: Scheme) -> Bool =
+  scheme.label_variables.len() == 0
+    && (match judged_type(scheme) {
       FunctionType(f) ->
         f.params.all(|t: Type| is_marshallable(c, t, true)) && is_marshallable(c, f.ret, false),
       _ -> false,
     })
 
-pub fn judgeable(c: MarshalledSums, sc: Scheme) -> Bool =
-  sc.label_variables.len() == 0
-    && (match judged_type(sc) {
+pub fn judgeable(c: MarshalledSums, scheme: Scheme) -> Bool =
+  scheme.label_variables.len() == 0
+    && (match judged_type(scheme) {
       FunctionType(f) -> f.params.push(f.ret).all(|t: Type| liftable(c, t)),
       _ -> false,
     })
 
 pub fn liftable(c: MarshalledSums, t: Type) -> Bool = is_marshallable(c, t, true)
 
-fn judged_type(sc: Scheme) -> Type = substituted(sc.ty, int_arguments(sc.type_variables))
+fn judged_type(scheme: Scheme) -> Type =
+  substituted(scheme.ty, int_arguments(scheme.type_variables))
 
-fn int_arguments(vars: List<Int>) -> List<Type> =
-  range(0, vars.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
+fn int_arguments(type_variables: List<Int>) -> List<Type> =
+  range(0, type_variables.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
 
 fn with_entry(
   s: ModuleContext,
@@ -1225,17 +1253,17 @@ fn with_entry(
   let key = EntryPoint(root);
   if !wants_root(wanted, key) { out } else {
     match scheme {
-      Some(sc) -> match sc.ty {
+      Some(scheme) -> match scheme.ty {
         FunctionType(f) -> {
-          let ints = int_arguments(sc.type_variables);
+          let ints = int_arguments(scheme.type_variables);
           let called = match root {
             Named(_) ->
               {
                 callee: root,
-                at: sc.type_variables.map(|_: Int| int_type()),
-                rows: sc.effect_variables.map(|_: Int| no_effects()),
+                at: scheme.type_variables.map(|_: Int| int_type()),
+                rows: scheme.effect_variables.map(|_: Int| no_effects()),
               },
-            _ -> { callee: judged_callee(root, sc.type_variables.len()), at: [], rows: [] },
+            _ -> { callee: judged_callee(root, scheme.type_variables.len()), at: [], rows: [] },
           };
           let hosted = handlers_for(hosts, f.effects.listed.map(|a: Effect| a.effect));
           let e = runtime_entry_code(
@@ -1278,18 +1306,18 @@ fn with_entry(
 fn added_by(h: HostHandler) -> List<Effect> =
   h.import.definitions.fold([], |accumulator: List<Effect>, d: Definition|
     match d.scheme {
-      Some(sc) -> match sc.ty {
+      Some(scheme) -> match scheme.ty {
         FunctionType(f) -> accumulator.concat(f.effects.listed),
         _ -> accumulator,
       },
       None -> accumulator,
     })
 
-fn judged_callee(root: RootKey, vars: Int) -> RootKey =
-  if vars == 0 { root } else {
+fn judged_callee(root: RootKey, type_variable_count: Int) -> RootKey =
+  if type_variable_count == 0 { root } else {
     match root {
       Clause(c) -> match c.definition {
-        Named(d) -> Clause({ ..c, definition: claims_key(d, vars) }),
+        Named(d) -> Clause({ ..c, definition: claims_key(d, type_variable_count) }),
         _ -> root,
       },
       _ -> root,
@@ -1301,7 +1329,7 @@ fn with_claim_entry(
   wanted: Map<RootName, Bool>,
   root: RootKey,
   params: List<EmitParam>,
-  vars: List<Int>,
+  type_variables: List<Int>,
   out: List<Fn>,
 ) -> List<Fn> / {abort.raise} =
   with_entry(
@@ -1311,7 +1339,7 @@ fn with_claim_entry(
     root,
     Some({
       ..monomorphic(fn_type(params.map(param_type), bool_type(), no_effects())),
-      type_variables: vars,
+      type_variables: type_variables,
     }),
     out,
   )
@@ -1327,8 +1355,11 @@ fn clause_roots(
   schemes: Map<Bytes, Scheme>,
 ) -> RootForms / {abort.raise} = {
   let full = qualify(s.module, definition.name.name);
-  let vars = match schemes.get(full) { Some(sc) -> sc.type_variables, None -> [] };
-  let ints = int_arguments(vars);
+  let type_variables = match schemes.get(full) {
+    Some(scheme) -> scheme.type_variables,
+    None -> [],
+  };
+  let ints = int_arguments(type_variables);
   let base = definition.span.start;
   let clause = |kind: ClauseKind, k: Int| Clause({ definition: Named(full), kind: kind, n: k });
   let rooted = |out: List<Fn>, key: RootKey, at: Int| {
@@ -1336,12 +1367,12 @@ fn clause_roots(
     let ps = root_params(b, []);
     let own = if !wants_root(wanted, key) { out }
     else { out.push(root_from_code(s, base, key, ps, body_code(b, [], recorded))) };
-    let callee = judged_callee(key, vars.len());
+    let callee = judged_callee(key, type_variables.len());
     let specialised = if callee == key || !wants_root(wanted, callee) { own } else {
-      let sp = root_body(recorded, ClauseBody(at), base, [], ints);
-      own.push(root_from_code(s, base, callee, sp.params, sp.code))
+      let specialisation = root_body(recorded, ClauseBody(at), base, [], ints);
+      own.push(root_from_code(s, base, callee, specialisation.params, specialisation.code))
     };
-    with_claim_entry(s, wanted, key, ps, vars, specialised)
+    with_claim_entry(s, wanted, key, ps, type_variables, specialised)
   };
   let walked = definition.spec.fold(
     { out: accumulator.out, requires: 0, ensures: 0, at: 0 },

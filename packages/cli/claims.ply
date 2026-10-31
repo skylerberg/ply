@@ -210,8 +210,8 @@ pub fn static_prover_of(
   {
     result: |wanted: List<Int>, runs: List<Int>, static_prover: Bool, budget: Int| {
       let obligation = |i: Int| world.obligations.at(i);
-      let asked = somes(List::map(if static_prover { wanted } else { runs }, obligation));
-      if asked.len() == 0 {
+      let obligations = somes(List::map(if static_prover { wanted } else { runs }, obligation));
+      if obligations.len() == 0 {
         {
           resolved: runs.map(|_i: Int| not_attempted()),
           static_prover_results: if static_prover { Some(wanted.map(|_i: Int| None)) }
@@ -219,7 +219,7 @@ pub fn static_prover_of(
         }
       } else {
         let p: Prover = prover_of(
-          claims_for(analysis, modules_of(analysis, asked), owned),
+          claims_for(analysis, modules_of(analysis, obligations), owned),
           world,
           budget,
         );
@@ -266,10 +266,11 @@ pub fn static_prover_of(
 
 pub fn no_static_prover(static_prover: Option<StaticProverResult>) -> StaticProver =
   {
-    result: |wanted: List<Int>, runs: List<Int>, asked: Bool, budget: Int|
+    result: |wanted: List<Int>, runs: List<Int>, include_results: Bool, budget: Int|
       {
         resolved: runs.map(|_i: Int| not_attempted()),
-        static_prover_results: if asked { Some(wanted.map(|_i: Int| static_prover)) } else { None },
+        static_prover_results: if include_results { Some(wanted.map(|_i: Int| static_prover)) }
+        else { None },
       },
   }
 
@@ -427,7 +428,7 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, verdicts: Verdicts) -> Li
             outcome: o,
             reason: match verdicts.reasons.at(i) { Some(r) -> r, None -> Fresh },
             static_prover: match verdicts.static_prover_results {
-              Some(reached) -> match reached.at(i) { Some(r) -> r, None -> None },
+              Some(prover_results) -> match prover_results.at(i) { Some(r) -> r, None -> None },
               None -> None,
             },
           }),
@@ -482,16 +483,17 @@ pub fn decide_claims<| e>(
   static_prover: Bool,
   discharge: (List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> Result<Verdicts, Rejection> / {abort.raise, proof_store.cached, proof_store.record, decisions.known | e} = {
-  let asked = wanted.map(|i: Int| claim_at(collection.claims, i));
-  let keys = asked.map(|claim: Claim|
+  let selected_claims = wanted.map(|i: Int| claim_at(collection.claims, i));
+  let keys = selected_claims.map(|claim: Claim|
     {
       bare: claim_key(Bytes::of_hex(claim.key)).hex_of(),
       ran: run_key(Bytes::of_hex(claim.run_key)).hex_of(),
     });
-  let held = keys.map(|k: { bare: String, ran: String }| proof_store.cached([k.bare, k.ran]));
+  let cached_texts = keys.map(|k: { bare: String, ran: String }|
+    proof_store.cached([k.bare, k.ran]));
   let results = range(0, keys.len()).map(|i: Int| {
     let k = keys_at(keys, i);
-    let h = match held.at(i) { Some(texts) -> texts, None -> [] };
+    let h = match cached_texts.at(i) { Some(texts) -> texts, None -> [] };
     verdict_of(k.bare, k.ran, evidence_kind(cached_at(h, 0)), evidence_kind(cached_at(h, 1)))
   });
   let selection = select(results, use_cache);
@@ -499,33 +501,34 @@ pub fn decide_claims<| e>(
   let static_results = (statics.result)(wanted, runs, static_prover, collection.plan.prove_budget);
   let row_at = |at: Int, outcome: Outcome|
     {
-      claim: claim_at(asked, at),
+      claim: claim_at(selected_claims, at),
       outcome: outcome,
       reason: match selection.reasons.at(at) { Some(r) -> r, None -> Fresh },
       static_prover: match static_results.static_prover_results {
-        Some(reached) -> match reached.at(at) { Some(r) -> r, None -> None },
+        Some(prover_results) -> match prover_results.at(at) { Some(r) -> r, None -> None },
         None -> None,
       },
     };
-  let kept = range(0, selection.from.len()).fold(
+  let cached_outcomes = range(0, selection.from.len()).fold(
     Map::new(),
     |accumulator: Map<Int, Outcome>, at: Int|
       match selection.from.at(at) {
         Some(Some(key)) -> {
-          let h = match held.at(at) { Some(texts) -> texts, None -> [] };
+          let h = match cached_texts.at(at) { Some(texts) -> texts, None -> [] };
           let text = if key == keys_at(keys, at).bare { cached_at(h, 0) } else { cached_at(h, 1) };
           accumulator.insert(at, match text {
             Some(t) -> match evidence_of(t) {
               Ok(c) -> Proved(c),
-              Err(_) -> missing_outcome(claim_at(asked, at)),
+              Err(_) -> missing_outcome(claim_at(selected_claims, at)),
             },
-            None -> missing_outcome(claim_at(asked, at)),
+            None -> missing_outcome(claim_at(selected_claims, at)),
           })
         },
         _ -> accumulator,
       },
   );
-  kept.fold((), |_: Unit, at: Int, outcome: Outcome| decisions.known(row_at(at, outcome)));
+  cached_outcomes.fold((), |_: Unit, at: Int, outcome: Outcome|
+    decisions.known(row_at(at, outcome)));
   let place_of = range(0, runs.len()).fold(Map::new(), |accumulator: Map<Int, Int>, k: Int|
     accumulator.insert(runs.at_or(k, -1), selection.to_discharge.at_or(k, -1)));
   let ran = handle {
@@ -537,10 +540,15 @@ pub fn decide_claims<| e>(
   match ran {
     Err(reason) -> Err(reason),
     Ok(d) -> {
-      let all = merge_outcomes(asked, kept, selection.to_discharge, d.outcomes);
+      let all = merge_outcomes(
+        selected_claims,
+        cached_outcomes,
+        selection.to_discharge,
+        d.outcomes,
+      );
       range(d.outcomes.len(), selection.to_discharge.len()).fold((), |_: Unit, k: Int| {
         let at = selection.to_discharge.at_or(k, -1);
-        decisions.known(row_at(at, all.at_or(at, missing_outcome(claim_at(asked, at)))))
+        decisions.known(row_at(at, all.at_or(at, missing_outcome(claim_at(selected_claims, at)))))
       });
       let recorded = cache_writes(
         keys,
@@ -592,19 +600,19 @@ fn evidence_kind(text: Option<Bytes>) -> Option<String> / {abort.raise} =
   }
 
 fn merge_outcomes(
-  asked: List<Claim>,
-  kept: Map<Int, Outcome>,
+  claims: List<Claim>,
+  cached_outcomes: Map<Int, Outcome>,
   to_discharge: List<Int>,
   discharged: List<Outcome>,
 ) -> List<Outcome> = {
   let place = range(0, to_discharge.len()).fold(Map::new(), |accumulator: Map<Int, Int>, k: Int|
     accumulator.insert(to_discharge.at_or(k, -1), k));
-  range(0, asked.len()).map(|at: Int|
-    match kept.get(at) {
+  range(0, claims.len()).map(|at: Int|
+    match cached_outcomes.get(at) {
       Some(o) -> o,
       None -> match discharged.at(place.get_or(at, -1)) {
         Some(o) -> o,
-        None -> missing_outcome(claim_at(asked, at)),
+        None -> missing_outcome(claim_at(claims, at)),
       },
     })
 }
@@ -658,17 +666,20 @@ pub fn discharge_runs(
   resolved: List<StaticResult>,
 ) -> DischargeResult / {entering::machine.enter, time.elapsed_ms, discharging.decided, abort.raise} = {
   let started = time.elapsed_ms();
-  let asked = range(0, runs.len()).fold([], |accumulator: List<ClaimToDischarge>, k: Int|
-    match ((runs.at(k), resolved.at(k))) {
-      (Some(i), Some(s)) -> match collection.world.obligations.at(i) {
-        Some(o) -> accumulator.push({ claim: i, obligation: o, resolved: s }),
-        None -> accumulator,
+  let claims_to_discharge = range(0, runs.len()).fold(
+    [],
+    |accumulator: List<ClaimToDischarge>, k: Int|
+      match ((runs.at(k), resolved.at(k))) {
+        (Some(i), Some(s)) -> match collection.world.obligations.at(i) {
+          Some(o) -> accumulator.push({ claim: i, obligation: o, resolved: s }),
+          None -> accumulator,
+        },
+        _ -> accumulator,
       },
-      _ -> accumulator,
-    });
+  );
   let ran = handle {
     discharged(
-      asked,
+      claims_to_discharge,
       collection.world,
       collection.plan.sim,
       |q: RuntimeRequest|
@@ -1030,8 +1041,8 @@ pub fn run_interleaving(
     },
   }
 
-fn cached_at(held: List<Option<Bytes>>, i: Int) -> Option<Bytes> =
-  match held.at(i) { Some(x) -> x, None -> None }
+fn cached_at(texts: List<Option<Bytes>>, i: Int) -> Option<Bytes> =
+  match texts.at(i) { Some(x) -> x, None -> None }
 
 pub fn claim_at(claims: List<Claim>, i: Int) -> Claim =
   match claims.at(i) {
@@ -1169,7 +1180,11 @@ fn kind_members(claim: Claim) -> List<Member> =
     },
   }
 
-pub fn obligation_json(row: Row, places: List<SourceText>, reached: Bool) -> Json / {abort.raise} =
+pub fn obligation_json(
+  row: Row,
+  places: List<SourceText>,
+  include_static_prover: Bool,
+) -> Json / {abort.raise} =
   object(
     [
       { key: "key", value: Str(row.claim.key) },
@@ -1183,8 +1198,9 @@ pub fn obligation_json(row: Row, places: List<SourceText>, reached: Bool) -> Jso
         value: match location_text(places, row.claim.at) { Some(at) -> Str(at), None -> Null },
       },
       { key: "outcome", value: Str(outcome_word(row.outcome)) },
-    ].concat(if reached { [{ key: "static_prover", value: static_prover_json(row.static_prover) }] }
-    else { [] }).concat(
+    ].concat(if include_static_prover {
+      [{ key: "static_prover", value: static_prover_json(row.static_prover) }]
+    } else { [] }).concat(
       kind_members(row.claim),
     ).concat(
       outcome_members(row.outcome),
@@ -1569,13 +1585,13 @@ fn a_collection_of(claims: List<Claim>) -> Collection =
   }
 
 test "a proved claim produces no diagnostics" {
-  let held: Row = {
+  let proved_row: Row = {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved([], 1),
     reason: FromProof,
     static_prover: None,
   };
-  assert_eq(diagnostics_of([held]).len(), 0)
+  assert_eq(diagnostics_of([proved_row]).len(), 0)
 }
 
 test "the coverage lines start with the definition and obligation counts, then list the definitions no proved claim covers" {

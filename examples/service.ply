@@ -709,18 +709,18 @@ fn streamed(o: Order) -> Reply / {db.query[items], abort.raise} =
 
 pub fn dispatch(
   e: Endpoint,
-  req: http::Request,
+  request: http::Request,
   params: Map<String, String>,
 ) -> Reply / {Serving, abort.raise} = {
   let span = trace.enter[http](
     "dispatch",
     Map::of_entries([
-      text_field("method", http::method_name(req.method)),
-      text_field("path", req.path),
+      text_field("method", http::method_name(request.method)),
+      text_field("path", request.path),
       text_field("endpoint", endpoint_name(e)),
     ]),
   );
-  let reply = guarded(e, req, params);
+  let reply = guarded(e, request, params);
   trace.exit[http](span, outcome_of(reply));
   reply
 }
@@ -734,28 +734,28 @@ fn outcome_of(r: Reply) -> trace::Outcome =
 
 fn guarded(
   e: Endpoint,
-  req: http::Request,
+  request: http::Request,
   params: Map<String, String>,
 ) -> Reply / {Serving, abort.raise} =
   match e {
-    PlaceOrder -> if authorized(config.secret[credentials](api_key()), presented(req)) {
-      dispatched(e, req, params)
+    PlaceOrder -> if authorized(config.secret[credentials](api_key()), presented(request)) {
+      dispatched(e, request, params)
     } else {
       trace.event[http](
         trace::Warn,
         "api key rejected",
         Map::of_entries([
-          text_field("path", req.path),
-          { key: "presented", value: trace::BoolField(presented(req) != "") },
+          text_field("path", request.path),
+          { key: "presented", value: trace::BoolField(presented(request) != "") },
         ]),
       );
       Buffered(problem(401, "unauthorized", "POST /orders needs a matching `x-api-key` header"))
     },
-    _ -> dispatched(e, req, params),
+    _ -> dispatched(e, request, params),
   }
 
-fn presented(req: http::Request) -> String =
-  match req.headers.get("x-api-key") { Some([value, ..]) -> value, _ -> "" }
+fn presented(request: http::Request) -> String =
+  match request.headers.get("x-api-key") { Some([value, ..]) -> value, _ -> "" }
 
 fn authorized(configured: Option<Secret<String>>, offered: String) -> Bool =
   match configured { None -> false, Some(key) -> !key.is_empty() && key.verify(offered) }
@@ -777,7 +777,7 @@ fn endpoint_name(e: Endpoint) -> String =
 
 fn dispatched(
   e: Endpoint,
-  req: http::Request,
+  request: http::Request,
   params: Map<String, String>,
 ) -> Reply / {Service, signal.stopping, abort.raise} =
   match e {
@@ -788,18 +788,18 @@ fn dispatched(
     Featured -> Buffered(featured()),
     GetItem -> Buffered(get_item(params)),
     ListOrders -> Buffered(list_orders()),
-    PlaceOrder -> Buffered(place_order(http::whole_bytes(req.body))),
+    PlaceOrder -> Buffered(place_order(http::whole_bytes(request.body))),
     GetOrder -> Buffered(get_order(params)),
     CancelOrder -> Buffered(cancel_order(params)),
     Receipt -> receipt(params),
   }
 
-pub fn result(req: http::Request) -> Reply / {Serving, abort.raise} =
-  if req.target == "*" { Buffered(server_options()) } else {
-    match route_of(routed_method(req.method), req.path) {
-      router::NotFound -> Buffered(problem(404, "no such route", req.path)),
+pub fn result(request: http::Request) -> Reply / {Serving, abort.raise} =
+  if request.target == "*" { Buffered(server_options()) } else {
+    match route_of(routed_method(request.method), request.path) {
+      router::NotFound -> Buffered(problem(404, "no such route", request.path)),
       router::MethodNotAllowed(ms) -> Buffered(method_not_allowed(ms)),
-      router::Found(m) -> dispatch(m.endpoint, req, m.params),
+      router::Found(m) -> dispatch(m.endpoint, request, m.params),
     }
   }
 
@@ -835,8 +835,8 @@ fn method_not_allowed(ms: List<http::Method>) -> http::Response<| {}> / {abort.r
     ),
   }
 
-pub fn app(req: http::Request) -> http::Response<| {}> / {Serving, abort.raise} =
-  collapse(result(req))
+pub fn app(request: http::Request) -> http::Response<| {}> / {Serving, abort.raise} =
+  collapse(result(request))
 
 pub fn collapse(r: Reply) -> http::Response<| {}> =
   match r {
@@ -911,12 +911,12 @@ fn turn<| e>(
 fn handle_head<| e>(
   c: Int,
   l: http::Limits,
-  buf: Bytes,
+  buffer: Bytes,
   complete: Bool,
   left: Int,
   stopping: () -> Bool / e,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} =
-  match http::parse_head(buf, l) {
+  match http::parse_head(buffer, l) {
     http::Incomplete -> if complete {
       write_out(
         c,
@@ -938,26 +938,26 @@ fn handle_head<| e>(
     },
     http::HeadRejected(reason) ->
       write_out(c, l, http::Get, http::Http11, false, http::error_response(reason)),
-    http::Parsed(h) -> continued(c, l, h, buf, left, stopping),
+    http::Parsed(h) -> continued(c, l, h, buffer, left, stopping),
   }
 
 fn continued<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
-  buf: Bytes,
+  buffer: Bytes,
   left: Int,
   stopping: () -> Bool / e,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} = {
-  let told = if h.expects_continue {
+  let continue_sent = if h.expects_continue {
     send_all[conn](c, http::continue_response(), l.write_timeout_ms)
   } else { true };
-  if !told { () } else {
+  if !continue_sent { () } else {
     with_body(
       c,
       l,
       h,
-      http::read_body[conn](c, h.framing, buf.slice(h.consumed, buf.len()), l),
+      http::read_body[conn](c, h.framing, buffer.slice(h.consumed, buffer.len()), l),
       left,
       stopping,
     )
@@ -2012,11 +2012,11 @@ fn pooled_run(
   count: Int,
   path: String,
 ) -> net::RunResult<http::PoolStats> / {sim.read, abort.raise} = {
-  let asked = Bytes::of_string(
+  let request = Bytes::of_string(
     "GET " ++ path ++ " HTTP/1.1\r\nHost: service.example\r\nConnection: close\r\n\r\n",
   );
   let callers = range(0, count).fold(net::mem_empty(), |m: net::MemNet, i: Int|
-    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Sends(asked)]));
+    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Sends(request)]));
   fake(Some(Secret::of_string(fake_key())), ||
     net::on_mem(callers, ||
       simulate {
@@ -2159,9 +2159,10 @@ fn served(raw: Bytes) -> Exchange / {abort.raise} = exchange([raw], seed_shelf()
 fn status_of(raw: Bytes) -> Int / {abort.raise} =
   match raw.index_of(b" ") {
     None -> 0,
-    Some(sp) -> match router::int_of_text(
+    Some(space_position) -> match router::int_of_text(
         String::of_bytes_lossy(
-          raw.slice(sp + 1, if sp + 4 > raw.len() { raw.len() } else { sp + 4 }),
+          raw.slice(space_position + 1, if space_position + 4 > raw.len() { raw.len() }
+          else { space_position + 4 }),
         ),
       ) {
       Some(n) -> n,
@@ -2276,7 +2277,7 @@ fn over_socket(
     } with {
       var queue = inbox,
       var sent = [],
-      var said = [],
+      var printed_lines = [],
       net.listen[listener](port) -> 1,
       net.listen_tls[listener](port, credential) -> {
         assert_eq(credential, "service");
@@ -2296,9 +2297,9 @@ fn over_socket(
       },
       net.close[conn](c) -> (),
       process.out[proc](line) -> {
-        said = said.push(line);
+        printed_lines = printed_lines.push(line);
       },
-      return u -> { sent: sent, said: said },
+      return u -> { sent: sent, said: printed_lines },
     });
   {
     wrote: Bytes::concat_all(ran.out.sent),

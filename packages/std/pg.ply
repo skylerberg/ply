@@ -316,27 +316,27 @@ pub fn terminate() -> Bytes / {abort.raise} = frontend(Terminate, b"")
 /// invalid. `rest` is the bytes after the frame, or the whole buffer when `frame` is `None`.
 pub type Partial = { frame: Option<Message>, rest: Bytes }
 
-/// The first whole frame in `buf`, and the bytes after it.
-pub fn first_frame(buf: Bytes) -> Partial = {
-  let n = buf.len();
-  if n < 5 { { frame: None, rest: buf } } else {
-    match buf.u32_be_at(1) {
-      None -> { frame: None, rest: buf },
-      Some(len) -> if len < 4 || 1 + len > n { { frame: None, rest: buf } } else {
+/// The first whole frame in `buffer`, and the bytes after it.
+pub fn first_frame(buffer: Bytes) -> Partial = {
+  let n = buffer.len();
+  if n < 5 { { frame: None, rest: buffer } } else {
+    match buffer.u32_be_at(1) {
+      None -> { frame: None, rest: buffer },
+      Some(len) -> if len < 4 || 1 + len > n { { frame: None, rest: buffer } } else {
         {
-          frame: Some({ kind: backend_of(buf.at(0)), body: buf.slice(5, 1 + len) }),
-          rest: buf.slice(1 + len, n),
+          frame: Some({ kind: backend_of(buffer.at(0)), body: buffer.slice(5, 1 + len) }),
+          rest: buffer.slice(1 + len, n),
         }
       },
     }
   }
 }
 
-/// Every whole frame in `buf`, and the bytes that are not yet one.
-pub fn read(buf: Bytes) -> Frames / {abort.raise} = read_all(buf, [], buf.len())
+/// Every whole frame in `buffer`, and the bytes that are not yet one.
+pub fn read(buffer: Bytes) -> Frames / {abort.raise} = read_all(buffer, [], buffer.len())
 
-fn read_all(buf: Bytes, accumulator: List<Message>, left: Int) -> Frames / {abort.raise} = {
-  let p = first_frame(buf);
+fn read_all(buffer: Bytes, accumulator: List<Message>, left: Int) -> Frames / {abort.raise} = {
+  let p = first_frame(buffer);
   match p.frame {
     None -> { done: accumulator, rest: p.rest },
     Some(m) -> if left <= 0 {
@@ -623,10 +623,10 @@ type ReceivedMessage = { message: Message, rest: Bytes }
 
 fn read_message<[l]>(
   c: Int,
-  buf: Bytes,
+  buffer: Bytes,
   timeout_ms: Int,
 ) -> Result<ReceivedMessage, ClientError> / {net.recv[l], abort.raise} =
-  match arriving[l](c, buf, timeout_ms) {
+  match arriving[l](c, buffer, timeout_ms) {
     Ok(Arrived(got)) -> Ok(got),
     Ok(Incomplete(_)) -> Err(TimedOut),
     Err(e) -> Err(e),
@@ -636,29 +636,30 @@ type Arrival = | Arrived(ReceivedMessage) | Incomplete(Bytes)
 
 fn arriving<[l]>(
   c: Int,
-  buf: Bytes,
+  buffer: Bytes,
   timeout_ms: Int,
 ) -> Result<Arrival, ClientError> / {net.recv[l], abort.raise} =
-  awaiting[l](c, buf, timeout_ms, 4294967297)
+  awaiting[l](c, buffer, timeout_ms, 4294967297)
 
 fn awaiting<[l]>(
   c: Int,
-  buf: Bytes,
+  buffer: Bytes,
   timeout_ms: Int,
   rounds_left: Int,
 ) -> Result<Arrival, ClientError> / {net.recv[l], abort.raise} = {
-  let p = first_frame(buf);
+  let p = first_frame(buffer);
   match p.frame {
     Some(m) -> Ok(Arrived({ message: m, rest: p.rest })),
-    None -> if buf.len() >= 5 && (match buf.u32_be_at(1) { Some(n) -> n < 4, None -> false }) {
+    None -> if buffer.len() >= 5
+        && (match buffer.u32_be_at(1) { Some(n) -> n < 4, None -> false }) {
       Err(Unexpected("a message declares a length below 4, the size of the length field itself"))
     } else if rounds_left <= 0 {
       panic("a message is still incomplete after more reads than its declared length can need")
     } else {
       match net.recv[l](c, read_size(), timeout_ms) {
-        None -> Ok(Incomplete(buf)),
+        None -> Ok(Incomplete(buffer)),
         Some(bytes) -> if bytes.len() == 0 { Err(Closed) }
-        else { awaiting[l](c, buf.concat(bytes), timeout_ms, rounds_left - 1) },
+        else { awaiting[l](c, buffer.concat(bytes), timeout_ms, rounds_left - 1) },
       }
     },
   }
@@ -695,9 +696,9 @@ pub fn connect<[l]>(
 ) -> Result<Session, ClientError> / {net.connect[l], net.start_tls[l], net.peer_certificate[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], abort.raise, diverges} =
   match net.connect[l](host, port, timeouts.connect_ms) {
     None -> Err(Unreachable),
-    Some(conn) -> {
+    Some(connection) -> {
       let opening: Session = {
-        conn: conn,
+        conn: connection,
         buffer: b"",
         user: user,
         database: database,
@@ -705,10 +706,10 @@ pub fn connect<[l]>(
         status: Idle,
         notices: [],
       };
-      let started = match secured[l](conn, tls, timeouts) {
+      let started = match secured[l](connection, tls, timeouts) {
         Err(e) -> Err(e),
         Ok(channel) -> if !send_all[l](
-            conn,
+            connection,
             startup(user, database, parameters),
             timeouts.write_ms,
           ) { Err(NotSent) }
@@ -717,7 +718,7 @@ pub fn connect<[l]>(
       match started {
         Ok(s) -> Ok(s),
         Err(e) -> {
-          net.close[l](conn);
+          net.close[l](connection);
           Err(e)
         },
       }
@@ -731,19 +732,20 @@ pub fn alpn() -> String = "postgresql"
 type Channel = | Plaintext | Secured(Option<Bytes>)
 
 fn secured<[l]>(
-  conn: Int,
+  connection: Int,
   tls: Tls,
   timeouts: Timeouts,
 ) -> Result<Channel, ClientError> / {net.send[l], net.recv[l], net.start_tls[l], net.peer_certificate[l], abort.raise} =
   match tls {
     NoTls -> Ok(Plaintext),
-    Direct(name) -> upgraded[l](conn, name, timeouts),
-    Requested(name) -> if !send_all[l](conn, ssl_request(), timeouts.write_ms) { Err(NotSent) }
-    else {
-      match net.recv[l](conn, 1, timeouts.read_ms) {
+    Direct(name) -> upgraded[l](connection, name, timeouts),
+    Requested(name) -> if !send_all[l](connection, ssl_request(), timeouts.write_ms) {
+      Err(NotSent)
+    } else {
+      match net.recv[l](connection, 1, timeouts.read_ms) {
         None -> Err(TimedOut),
         Some(result) -> if result.len() == 0 { Err(Closed) }
-        else if result.at(0) == 83 { upgraded[l](conn, name, timeouts) }
+        else if result.at(0) == 83 { upgraded[l](connection, name, timeouts) }
         else if result.at(0) == 78 { Err(Declined) } else {
           Err(Unexpected("the server responded to the SSL request with neither `S` nor `N`"))
         },
@@ -752,12 +754,12 @@ fn secured<[l]>(
   }
 
 fn upgraded<[l]>(
-  conn: Int,
+  connection: Int,
   name: String,
   timeouts: Timeouts,
 ) -> Result<Channel, ClientError> / {net.start_tls[l], net.peer_certificate[l]} =
-  match net.start_tls[l](conn, name, [alpn()], b"", timeouts.connect_ms) {
-    Ok(_) -> Ok(Secured(net.peer_certificate[l](conn))),
+  match net.start_tls[l](connection, name, [alpn()], b"", timeouts.connect_ms) {
+    Ok(_) -> Ok(Secured(net.peer_certificate[l](connection))),
     Err(reason) -> Err(Unsecured(reason)),
   }
 
@@ -1253,7 +1255,7 @@ pub fn await_notification<[l]>(
     [oldest, ..later] -> Ok({ session: { ..s, notices: later }, notification: Some(oldest) }),
     [] -> match arriving[l](s.conn, s.buffer, timeout_ms) {
       Err(e) -> Err(e),
-      Ok(Incomplete(held)) -> Ok({ session: { ..s, buffer: held }, notification: None }),
+      Ok(Incomplete(buffer)) -> Ok({ session: { ..s, buffer: buffer }, notification: None }),
       Ok(Arrived(got)) -> {
         let rest = { ..s, buffer: got.rest };
         let m = got.message;
@@ -1521,15 +1523,15 @@ test "a start-up message is a length, the version, then the parameters" {
 
 test "`startup` appends each run-time setting to the start-up message as a name and a value, in order" {
   let plain = startup("me", "db", []);
-  let told = startup("me", "db", [
+  let with_settings = startup("me", "db", [
     { name: "statement_timeout", value: "250" },
     { name: "application_name", value: "service" },
   ]);
   let settings = b"statement_timeout\x00250\x00application_name\x00service\x00";
-  assert_eq(told.u32_be_at(0), Some(29 + settings.len()));
-  assert_eq(told.slice_at(28, settings.len()), Some(settings));
-  assert_eq(told.slice(4, 28), plain.slice(4, 28));
-  assert_eq(told.at(told.len() - 1), 0)
+  assert_eq(with_settings.u32_be_at(0), Some(29 + settings.len()));
+  assert_eq(with_settings.slice_at(28, settings.len()), Some(settings));
+  assert_eq(with_settings.slice(4, 28), plain.slice(4, 28));
+  assert_eq(with_settings.at(with_settings.len() - 1), 0)
 }
 
 test "`ssl_request` returns the 8-byte message that carries the protocol's reserved code 80877103" {
@@ -1807,8 +1809,16 @@ test "over TLS, SCRAM binds to the server's certificate when the server offers S
 fn message_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
   byte_of_int(kind).concat(length_prefixed(body))
 
-fn sample_session(conn: Int) -> Session =
-  { conn: conn, buffer: b"", user: "ply", database: "ply", settings: [], status: Idle, notices: [] }
+fn sample_session(connection: Int) -> Session =
+  {
+    conn: connection,
+    buffer: b"",
+    user: "ply",
+    database: "ply",
+    settings: [],
+    status: Idle,
+    notices: [],
+  }
 
 fn scripted_queries(
   chunks: List<Bytes>,
@@ -1977,11 +1987,11 @@ fn scripted_authentication(
 
 test "a clear-text password is sent only as one secret message of `p`, length, password and a zero byte, and never appears in the plain sent bytes" {
   let begun = startup("ply", "ply", []);
-  let asked = message_frame(82, u32_be(3));
+  let authentication_request = message_frame(82, u32_be(3));
   let c = scripted_authentication(
     [
       net::Expects(begun),
-      Sends(asked),
+      Sends(authentication_request),
       net::ExpectsSecret(Bytes::concat_all([b"p", u32_be(11), b"pencil\x00"])),
       Sends(welcome()),
     ],
@@ -1990,7 +2000,7 @@ test "a clear-text password is sent only as one secret message of `p`, length, p
   assert_eq(c.outcome, "connected");
   assert_eq(c.sent, begun);
   assert_eq(c.sealed, 1);
-  let none = scripted_authentication([net::Expects(begun), Sends(asked)], None);
+  let none = scripted_authentication([net::Expects(begun), Sends(authentication_request)], None);
   assert_eq(
     none.outcome,
     client_error_text(ConnectionRejected(no_password("ply", "a clear-text password"))),
@@ -2052,7 +2062,7 @@ test "a notification that arrives while a statement is running is stored for the
     notification_frame(9, "jobs", "early"),
     message_frame(90, b"I"),
   ]);
-  let heard = net::on_mem(
+  let received_notification = net::on_mem(
     net::mem_serving(net::mem_empty(), server, [
       [net::Expects(query("listen jobs")), Sends(returned), net::Silent],
     ]),
@@ -2067,7 +2077,7 @@ test "a notification that arrives while a statement is running is stored for the
       }
     },
   ).value;
-  assert_eq(heard, Some({ sender: 9, channel: "jobs", payload: "early" }))
+  assert_eq(received_notification, Some({ sender: 9, channel: "jobs", payload: "early" }))
 }
 
 test "a row's values are written in COPY's text format, every escape where one is needed" {

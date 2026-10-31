@@ -261,14 +261,14 @@ fn last_seen(seen: Map<Bytes, Int>, query: Bytes, at: Int) -> Map<Bytes, Int> =
   }
 
 fn tables_of(
-  told: Map<Bytes, KeyRow>,
+  key_rows: Map<Bytes, KeyRow>,
   seen: Map<Bytes, Int>,
   results: Map<Bytes, Bytes>,
 ) -> List<Table> / {abort.raise} = {
   let nth = seen.fold(Map::new(), |accumulator: Map<Bytes, Int>, query: Bytes, _: Int|
     accumulator.insert(query, accumulator.len()));
   [
-    segments::table(records_table(), told, |_: Bytes, t: KeyRow|
+    segments::table(records_table(), key_rows, |_: Bytes, t: KeyRow|
       Some(row_rest({ ..t.row, query: match nth.get(t.query) { Some(i) -> i, None -> 65535 } }))),
     segments::table(outputs_table(), results, |_: Bytes, at: Bytes| Some(at)),
     segments::table(queries_table(), seen, |_: Bytes, at: Int| Some(u64_le(at))),
@@ -286,7 +286,7 @@ fn commit<[r]>(
   o: OpenStore,
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
   if wrote_nothing(o) { () } else {
-    let told = o.written_rows.fold(
+    let key_rows = o.written_rows.fold(
       Map::new(),
       |accumulator: Map<Bytes, KeyRow>, key: Bytes, x: OwnRow| {
         let lies = match x.frame { Some(f) -> f, None -> { offset: 0, size: 0 } };
@@ -307,7 +307,7 @@ fn commit<[r]>(
         seen.insert(query, o.now)),
       |seen: Map<Bytes, Int>, _: Bytes, x: OwnRow| last_seen(seen, x.query, x.seen),
     );
-    match segments::finish[r](dir, schema(), token, o.out, tables_of(told, seen, o.results)) {
+    match segments::finish[r](dir, schema(), token, o.out, tables_of(key_rows, seen, o.results)) {
       None -> (),
       Some(seg) -> match segments::commit[r](dir, schema(), seg, without: o.unreadable_segments) {
         Committed(m) -> {
@@ -437,13 +437,13 @@ fn merged_keys(all: List<MergeInput>) -> Map<Bytes, MergedKey> / {abort.raise} =
     ))
 
 fn retained_queries(
-  keeping: RetentionPolicy,
+  retention: RetentionPolicy,
   whole: Bool,
   all: List<MergeInput>,
   carried: Map<Bytes, MergedKey>,
   seen: Map<Bytes, Int>,
 ) -> Map<Bytes, Bool> / {abort.raise} =
-  match keeping {
+  match retention {
     KeepOnly(queries) -> queries,
     KeepRecent(own) -> if !whole { own } else {
       let lengths = all.fold(Map::new(), |accumulator: Map<Bytes, Int>, x: MergeInput|
@@ -456,19 +456,22 @@ fn retained_queries(
               segments::read_u32(x.results, i * output_row_width() + 40),
             ),
         ));
-      let held = carried.fold(Map::new(), |accumulator: Map<Bytes, Int>, _: Bytes, c: MergedKey|
-        match c.from {
-          None -> accumulator,
-          Some(f) ->
-            accumulator.insert(
-              c.query,
-              f.size + (match lengths.get(c.row.result) { Some(n) -> n, None -> 0 })
-                + (match accumulator.get(c.query) { Some(n) -> n, None -> 0 }),
-            ),
-        });
-      let mine = held.fold(0, |n: Int, query: Bytes, bytes: Int|
+      let query_bytes = carried.fold(
+        Map::new(),
+        |accumulator: Map<Bytes, Int>, _: Bytes, c: MergedKey|
+          match c.from {
+            None -> accumulator,
+            Some(f) ->
+              accumulator.insert(
+                c.query,
+                f.size + (match lengths.get(c.row.result) { Some(n) -> n, None -> 0 })
+                  + (match accumulator.get(c.query) { Some(n) -> n, None -> 0 }),
+              ),
+          },
+      );
+      let mine = query_bytes.fold(0, |n: Int, query: Bytes, bytes: Int|
         if own.contains(query) { n + bytes } else { n });
-      let others = held.fold(
+      let others = query_bytes.fold(
         [],
         |accumulator: List<ForeignQuery>, query: Bytes, bytes: Int|
           if own.contains(query) { accumulator } else {
@@ -494,7 +497,7 @@ fn merge_segments<[r]>(
   m: Manifest,
   from: Int,
   token: Bytes,
-  keeping: RetentionPolicy,
+  retention: RetentionPolicy,
 ) -> Option<Compaction> / {fs.read[r], fs.write[r], abort.raise} = {
   let whole = from == 0;
   let merging = m.segments.drop(from);
@@ -511,7 +514,7 @@ fn merge_segments<[r]>(
           },
         ));
       let carried = merged_keys(all);
-      let live = retained_queries(keeping, whole, all, carried, seen);
+      let live = retained_queries(retention, whole, all, carried, seen);
       let with_memo_store = carried.fold(
         { keys: Map::new(), dropped: 0 },
         |accumulator: { keys: Map<Bytes, MergedKey>, dropped: Int }, key: Bytes, c: MergedKey|
@@ -607,7 +610,7 @@ fn merge_segments<[r]>(
         |accumulator: Map<Bytes, Int>, _: Bytes, c: MergedKey|
           accumulator.insert(c.query, match seen.get(c.query) { Some(at) -> at, None -> 0 }),
       );
-      let told = with_memo_store.keys.fold(
+      let key_rows = with_memo_store.keys.fold(
         Map::new(),
         |accumulator: Map<Bytes, KeyRow>, key: Bytes, c: MergedKey| {
           let lies = match c.from {
@@ -628,7 +631,7 @@ fn merge_segments<[r]>(
           })
         },
       );
-      let tables = tables_of(told, seen_kept, copied.results);
+      let tables = tables_of(key_rows, seen_kept, copied.results);
       match segments::finish[r](dir, schema(), token, copied.out, tables) {
         None -> None,
         Some(seg) -> match segments::replace_merged[r](dir, schema(), m, from, seg) {
@@ -688,7 +691,7 @@ pub fn with_memo_store<a, [r] | e>(
     let found = packs::output(o.pack, read, digest);
     { open: { ..o, pack: found.reading }, result: found.bytes }
   };
-  let held = |o: OpenStore, key: Bytes|
+  let row_result = |o: OpenStore, key: Bytes|
     match o.written_rows.get(key) {
       Some(x) -> { open: o, held: Some(x.result) },
       None -> {
@@ -709,7 +712,7 @@ pub fn with_memo_store<a, [r] | e>(
     }
   };
   let own = |o0: OpenStore, key: Bytes| {
-    let h0 = held(o0, key);
+    let h0 = row_result(o0, key);
     match h0.held {
       None -> { open: h0.open, bytes: None },
       Some(result) -> {
@@ -749,16 +752,16 @@ pub fn with_memo_store<a, [r] | e>(
         None -> { open: o, result: None },
       },
     };
-  let keeping = |o0: OpenStore, key: Bytes, rec: Record, inline: Option<Bytes>, longer: Option<Bytes>|
-    match packs::output_key(rec.output) {
+  let append_record = |o0: OpenStore, key: Bytes, record: Record, inline: Option<Bytes>, longer: Option<Bytes>|
+    match packs::output_key(record.output) {
       None -> o0,
       Some(name) -> {
         if key.len() != key_width() { panic("a memo key must be thirty-two bytes") };
-        let bytes = record_bytes(rec, inline);
+        let bytes = record_bytes(record, inline);
         let f = segments::append_payload(o0.out, bytes);
         let o1 = { ..o0, out: f.writing };
         let o2 = match inline {
-          Some(a) -> { ..o1, inlined: o1.inlined.insert(rec.output, a) },
+          Some(a) -> { ..o1, inlined: o1.inlined.insert(record.output, a) },
           None -> o1,
         };
         let o3 = match longer {
@@ -788,7 +791,7 @@ pub fn with_memo_store<a, [r] | e>(
           out: segments::flush_when_full[r](dir, schema(), token, o3.out),
           written_rows: o3.written_rows.insert(key, {
             result: name,
-            query: rec.query.blake3(),
+            query: record.query.blake3(),
             seen: o3.now,
             frame: Some({ offset: f.at, size: bytes.len() }),
           }),
@@ -805,7 +808,7 @@ pub fn with_memo_store<a, [r] | e>(
       match p.bytes {
         Some(b) -> output_digest_of(b),
         None -> {
-          let h = held(st, key);
+          let h = row_result(st, key);
           st = h.open;
           match h.held {
             Some(result) -> {
@@ -833,7 +836,7 @@ pub fn with_memo_store<a, [r] | e>(
           match mine.bytes {
             Some(b) -> record_from(b),
             None -> {
-              let h = held(st, key);
+              let h = row_result(st, key);
               st = h.open;
               match h.held {
                 Some(_) -> None,
@@ -896,17 +899,17 @@ pub fn with_memo_store<a, [r] | e>(
         },
       }
     },
-    memo_store.put(key, rec, output, lasting) -> {
+    memo_store.put(key, record, output, lasting) -> {
       st = match inline_output(output) {
-        Some(a) -> keeping(st, key, rec, Some(a), None),
-        None -> if lasting { keeping(st, key, rec, None, Some(output)) } else {
-          let o = keeping(st, key, rec, None, None);
-          { ..o, transient: o.transient.insert(rec.output, output) }
+        Some(a) -> append_record(st, key, record, Some(a), None),
+        None -> if lasting { append_record(st, key, record, None, Some(output)) } else {
+          let o = append_record(st, key, record, None, None);
+          { ..o, transient: o.transient.insert(record.output, output) }
         },
       };
     },
-    memo_store.store_record(key, rec) -> {
-      st = keeping(st, key, rec, st.inlined.get(rec.output), None);
+    memo_store.store_record(key, record) -> {
+      st = append_record(st, key, record, st.inlined.get(record.output), None);
     },
     memo_store.external(kind, place) -> {
       let l = looked(st, kind, place);
@@ -926,7 +929,7 @@ pub fn with_memo_store<a, [r] | e>(
       p.bytes != None
     },
     memo_store.pack_record(key) -> {
-      let h = held(st, key);
+      let h = row_result(st, key);
       st = h.open;
       match h.held {
         None -> None,
@@ -1019,11 +1022,11 @@ pub fn write_pack<[r]>(
       };
       match named {
         None -> { ..accumulator, open: k.open },
-        Some(rec) -> {
-          let longer = if inline_output_of(rec.bytes) != None {
+        Some(record) -> {
+          let longer = if inline_output_of(record.bytes) != None {
             Some({ ..accumulator, open: k.open })
           } else {
-            match packs::output_key(rec.digest) {
+            match packs::output_key(record.digest) {
               None -> None,
               Some(name) -> if accumulator.results.contains(name) {
                 Some({ ..accumulator, open: k.open })
@@ -1051,12 +1054,12 @@ pub fn write_pack<[r]>(
           match longer {
             None -> { ..accumulator, open: k.open },
             Some(had) -> {
-              let f = packs::append_frame(had.writing, rec.bytes, compress);
+              let f = packs::append_frame(had.writing, record.bytes, compress);
               {
                 ..had,
                 writing: f.writing,
                 records: had.records.insert(key, f.at),
-                returned: had.returned.insert(key, rec.digest),
+                returned: had.returned.insert(key, record.digest),
               }
             },
           }
@@ -1541,9 +1544,9 @@ test "a pack contains the records of the queries it was built for and the result
   assert_eq(made.records, 2);
   let below = |files: Bytes, text: Bytes| quoted_below(fs::mem_of([]), made.written, files, text);
   let quoted_long = Bytes::concat_all([b"\"", long, b"\""]);
-  let stands = below(b"files", long);
-  assert_eq(stands.value, { output: quoted_long, ran: 0 });
-  assert_eq(segments_in(stands.tree), []);
+  let packed_run = below(b"files", long);
+  assert_eq(packed_run.value, { output: quoted_long, ran: 0 });
+  assert_eq(segments_in(packed_run.tree), []);
   let checked = below(b"other files", long);
   assert_eq(checked.value, { output: quoted_long, ran: 0 });
   assert_eq(segments_in(checked.tree), []);
@@ -1562,11 +1565,11 @@ test "a result computed in a run whose pack was built from other files is recomp
 test "a record a run writes survives the segment merge that its write triggers, but a later run's merge can delete it" {
   let queries = test_queries(b"");
   let key = b"command".blake3();
-  let said = b"done ".repeat(40000);
+  let large_output = b"done ".repeat(40000);
   let look = |_: Bytes, at: Bytes| Some(b"long ".repeat(1200).concat(at));
   let session = |tree: fs::MemFs, work: () -> Option<Bytes> / {memo_store.read, memo_store.write, abort.raise}|
     fs::on_mem[abs](tree, || with_memo_store[abs]("s", packs::no_pack, b"", look, work));
-  let held = |tree: fs::MemFs|
+  let has_record = |tree: fs::MemFs|
     match fs::on_mem[abs](tree, || record_at[abs]("s", key)).value {
       Some(_) -> true,
       None -> false,
@@ -1575,17 +1578,17 @@ test "a record a run writes survives the segment merge that its write triggers, 
     with_memo_store[abs]("s", packs::no_pack, b"", look, ||
       memo::driver_dependencies(query_output(queries, start_run(queries), b"quoted", b"a").run)));
   let recorded = session(loaded.tree, || {
-    memo::record_output(queries, key, b"c1", loaded.value, [], said);
+    memo::record_output(queries, key, b"c1", loaded.value, [], large_output);
     None
   });
-  assert(held(recorded.tree), Some("the run's own record outlives the merge its write made"));
-  assert_eq(session(recorded.tree, || memo::cached_output(queries, key)).value, Some(said));
+  assert(has_record(recorded.tree), Some("the run's own record outlives the merge its write made"));
+  assert_eq(session(recorded.tree, || memo::cached_output(queries, key)).value, Some(large_output));
   let later = session(recorded.tree, || {
     range(0, 10).fold(start_run(queries), |run: memo::Run, i: Int|
       query_output(queries, run, b"quoted", Bytes::of_string(i.to_string())).run);
     None
   });
-  assert(!held(later.tree), Some("another run's merge drops a record of a query not its own"))
+  assert(!has_record(later.tree), Some("another run's merge drops a record of a query not its own"))
 }
 
 test "reusing a command's result makes the same few file system calls, however many results are cached" {

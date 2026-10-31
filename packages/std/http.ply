@@ -301,23 +301,23 @@ pub type Line =
   | LineTooLong
   | LineIllegal({ at: Int, reason: String })
 
-fn read_line(buf: Bytes, from: Int, budget: Int) -> Line / {abort.raise} = {
-  let n = buf.len();
+fn read_line(buffer: Bytes, from: Int, budget: Int) -> Line / {abort.raise} = {
+  let n = buffer.len();
   if from > n { LineIncomplete } else {
-    let stop = buf.scan_until(from, line_stops(), budget + 1);
+    let stop = buffer.scan_until(from, line_stops(), budget + 1);
     if stop > from + budget { LineTooLong }
     else if stop >= n { LineIncomplete }
-    else { line_at(buf, from, stop, n) }
+    else { line_at(buffer, from, stop, n) }
   }
 }
 
-fn line_at(buf: Bytes, from: Int, stop: Int, n: Int) -> Line / {abort.raise} = {
-  let c = buf.at(stop);
+fn line_at(buffer: Bytes, from: Int, stop: Int, n: Int) -> Line / {abort.raise} = {
+  let c = buffer.at(stop);
   if c == b'\n' {
     LineIllegal({ at: stop, reason: "a line ended with a bare LF; HTTP/1.1 lines end with CRLF" })
   } else if c != b'\r' {
     LineIllegal({ at: stop, reason: "a control character is not allowed in a header line" })
-  } else if stop + 1 >= n { LineIncomplete } else if buf.at(stop + 1) != b'\n' {
+  } else if stop + 1 >= n { LineIncomplete } else if buffer.at(stop + 1) != b'\n' {
     LineIllegal({ at: stop, reason: "a bare CR is not allowed in a header line" })
   } else { LineAt({ start: from, stop: stop, next: stop + 2 }) }
 }
@@ -325,8 +325,8 @@ fn line_at(buf: Bytes, from: Int, stop: Int, n: Int) -> Line / {abort.raise} = {
 /// The request head at the start of `buf`, rejected rather than guessed at when it is ambiguous:
 /// a bare LF, a duplicate `Content-Length`, both a length and chunked framing, an unknown transfer
 /// coding.
-pub fn parse_head(buf: Bytes, limits: Limits) -> HeadResult / {abort.raise} =
-  match read_line(buf, 0, limits.max_request_line) {
+pub fn parse_head(buffer: Bytes, limits: Limits) -> HeadResult / {abort.raise} =
+  match read_line(buffer, 0, limits.max_request_line) {
     LineIncomplete -> Incomplete,
     LineTooLong ->
       reject(
@@ -334,17 +334,17 @@ pub fn parse_head(buf: Bytes, limits: Limits) -> HeadResult / {abort.raise} =
         "the request line is longer than " ++ limits.max_request_line.to_string() ++ " bytes",
       ),
     LineIllegal(e) -> reject(400, e.reason),
-    LineAt(l) -> after_request_line(buf, limits, l),
+    LineAt(l) -> after_request_line(buffer, limits, l),
   }
 
 fn after_request_line(
-  buf: Bytes,
+  buffer: Bytes,
   limits: Limits,
   l: { start: Int, stop: Int, next: Int },
 ) -> HeadResult / {abort.raise} =
-  match request_line(buf.slice(l.start, l.stop)) {
+  match request_line(buffer.slice(l.start, l.stop)) {
     Err(r) -> HeadRejected(r),
-    Ok(start) -> match fields(buf, l.next, l.next, limits) {
+    Ok(start) -> match fields(buffer, l.next, l.next, limits) {
       FieldsIncomplete -> Incomplete,
       FieldsRejected(r) -> HeadRejected(r),
       FieldsDone(done) -> match host_of(start, done.headers) {
@@ -390,24 +390,30 @@ type RequestLine = {
 
 fn request_line(line: Bytes) -> Result<RequestLine, Error> / {abort.raise} = {
   let n = line.len();
-  let sp1 = line.scan_until(0, b" ", n);
+  let first_space = line.scan_until(0, b" ", n);
   if line.scan_until(0, b"\t", n) < n {
     Err({
       status: 400,
       reason: "a request line may contain no whitespace except the two spaces between its parts",
     })
-  } else if sp1 >= n {
+  } else if first_space >= n {
     Err({ status: 400, reason: "a request line is `METHOD SP TARGET SP VERSION`" })
   } else {
-    let sp2 = line.scan_until(sp1 + 1, b" ", n - sp1 - 1);
-    if sp2 >= n {
+    let second_space = line.scan_until(first_space + 1, b" ", n - first_space - 1);
+    if second_space >= n {
       Err({
         status: 400,
         reason: "a request line is `METHOD TARGET VERSION`, each separated by one space",
       })
-    } else if line.scan_until(sp2 + 1, b" ", n - sp2 - 1) < n {
+    } else if line.scan_until(second_space + 1, b" ", n - second_space - 1) < n {
       Err({ status: 400, reason: "a request line may contain no more than two spaces" })
-    } else { request_parts(line.slice(0, sp1), line.slice(sp1 + 1, sp2), line.slice(sp2 + 1, n)) }
+    } else {
+      request_parts(
+        line.slice(0, first_space),
+        line.slice(first_space + 1, second_space),
+        line.slice(second_space + 1, n),
+      )
+    }
   }
 }
 
@@ -570,11 +576,16 @@ type FieldsBlock = { headers: Headers, count: Int, next: Int }
 
 type FieldsResult = | FieldsDone(FieldsBlock) | FieldsIncomplete | FieldsRejected(Error)
 
-fn fields(buf: Bytes, block_start: Int, from: Int, limits: Limits) -> FieldsResult / {abort.raise} =
-  field_lines(buf, block_start, from, limits, empty_headers(), 0)
+fn fields(
+  buffer: Bytes,
+  block_start: Int,
+  from: Int,
+  limits: Limits,
+) -> FieldsResult / {abort.raise} =
+  field_lines(buffer, block_start, from, limits, empty_headers(), 0)
 
 fn field_lines(
-  buf: Bytes,
+  buffer: Bytes,
   block_start: Int,
   from: Int,
   limits: Limits,
@@ -584,11 +595,11 @@ fn field_lines(
   let used = from - block_start;
   let left = limits.max_header_bytes - used;
   if left <= 0 { FieldsRejected(too_much_header(limits)) } else {
-    match read_line(buf, from, left) {
+    match read_line(buffer, from, left) {
       LineIncomplete -> FieldsIncomplete,
       LineTooLong -> FieldsRejected(too_much_header(limits)),
       LineIllegal(e) -> FieldsRejected({ status: 400, reason: e.reason }),
-      LineAt(l) -> field_line(buf, block_start, limits, accumulator, count, l),
+      LineAt(l) -> field_line(buffer, block_start, limits, accumulator, count, l),
     }
   }
 }
@@ -600,7 +611,7 @@ fn too_much_header(limits: Limits) -> Error =
   }
 
 fn field_line(
-  buf: Bytes,
+  buffer: Bytes,
   block_start: Int,
   limits: Limits,
   accumulator: Headers,
@@ -614,11 +625,11 @@ fn field_line(
       reason: "more than " ++ limits.max_header_count.to_string() ++ " header fields",
     })
   } else {
-    match parse_field(buf.slice(l.start, l.stop)) {
+    match parse_field(buffer.slice(l.start, l.stop)) {
       Err(r) -> FieldsRejected(r),
       Ok(f) ->
         field_lines(
-          buf,
+          buffer,
           block_start,
           l.next,
           limits,
@@ -895,17 +906,17 @@ fn host_of(start: RequestLine, headers: Headers) -> Result<String, Error> = {
 }
 
 fn framing_of(headers: Headers, limits: Limits) -> Result<Framing, Error> / {abort.raise} = {
-  let cl = header_lines(headers, "content-length");
+  let content_lengths = header_lines(headers, "content-length");
   let te = header_lines(headers, "transfer-encoding");
-  if cl.len() > 0 && te.len() > 0 {
+  if content_lengths.len() > 0 && te.len() > 0 {
     Err({
       status: 400,
       reason: "a request carries `Content-Length` or `Transfer-Encoding`, never both",
     })
   } else if te.len() > 0 { chunked_of(list_field(headers, "transfer-encoding")) }
-  else if cl.len() > 1 {
+  else if content_lengths.len() > 1 {
     Err({ status: 400, reason: "a request carries at most one `Content-Length` field line" })
-  } else { match cl { [only] -> length_of(only, limits), _ -> Ok(NoBody) } }
+  } else { match content_lengths { [only] -> length_of(only, limits), _ -> Ok(NoBody) } }
 }
 
 fn chunked_of(codings: List<String>) -> Result<Framing, Error> =
@@ -925,7 +936,7 @@ fn chunked_of(codings: List<String>) -> Result<Framing, Error> =
 fn count_string(xs: List<String>, want: String) -> Int =
   xs.fold(0, |accumulator: Int, x: String| if x == want { accumulator + 1 } else { accumulator })
 
-fn last_string(xs: List<String>) -> String = xs.fold("", |prev: String, x: String| x)
+fn last_string(xs: List<String>) -> String = xs.fold("", |previous: String, x: String| x)
 
 fn length_of(raw: String, limits: Limits) -> Result<Framing, Error> / {abort.raise} = {
   let b = Bytes::of_string(raw);
@@ -987,27 +998,27 @@ pub fn body_start(framing: Framing, limits: Limits) -> BodyState =
   }
 
 /// Decoding is pure; only refilling the buffer performs `net`.
-pub fn body_step(state: BodyState, buf: Bytes) -> BodyStep / {abort.raise} =
+pub fn body_step(state: BodyState, buffer: Bytes) -> BodyStep / {abort.raise} =
   match state.framing {
     NoBody -> Complete({ consumed: 0, out: b"", trailers: empty_headers() }),
-    Length(_) -> length_step(state, buf),
-    Chunked -> chunk_step(state, buf, 0, [], chunk_budget()),
-    UntilClose -> until_close_step(state, buf),
+    Length(_) -> length_step(state, buffer),
+    Chunked -> chunk_step(state, buffer, 0, [], chunk_budget()),
+    UntilClose -> until_close_step(state, buffer),
   }
 
-fn until_close_step(state: BodyState, buf: Bytes) -> BodyStep = {
-  let n = buf.len();
+fn until_close_step(state: BodyState, buffer: Bytes) -> BodyStep = {
+  let n = buffer.len();
   if state.received + n > state.limits.max_body {
     Rejected({
       status: 413,
       reason: "the body is longer than " ++ state.limits.max_body.to_string() ++ " bytes",
     })
-  } else { Await({ state: { ..state, received: state.received + n }, consumed: n, out: buf }) }
+  } else { Await({ state: { ..state, received: state.received + n }, consumed: n, out: buffer }) }
 }
 
-fn length_step(state: BodyState, buf: Bytes) -> BodyStep / {abort.raise} = {
-  let take = min_int(state.remaining, buf.len());
-  let out = buf.slice(0, take);
+fn length_step(state: BodyState, buffer: Bytes) -> BodyStep / {abort.raise} = {
+  let take = min_int(state.remaining, buffer.len());
+  let out = buffer.slice(0, take);
   if take >= state.remaining { Complete({ consumed: take, out: out, trailers: empty_headers() }) }
   else {
     Await({
@@ -1026,17 +1037,17 @@ fn length_step(state: BodyState, buf: Bytes) -> BodyStep / {abort.raise} = {
 
 fn chunk_step(
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   at: Int,
   out: List<Bytes>,
   fuel: Int,
 ) -> BodyStep / {abort.raise} =
   if fuel <= 0 { Await({ state: state, consumed: at, out: Bytes::concat_all(out) }) } else {
     match state.phase {
-      AtSize -> read_chunk_size(state, buf, at, out, fuel),
-      InData -> chunk_data(state, buf, at, out, fuel),
-      AfterData -> chunk_crlf(state, buf, at, out, fuel),
-      InTrailers -> chunk_trailers(state, buf, at, out),
+      AtSize -> read_chunk_size(state, buffer, at, out, fuel),
+      InData -> chunk_data(state, buffer, at, out, fuel),
+      AfterData -> chunk_crlf(state, buffer, at, out, fuel),
+      InTrailers -> chunk_trailers(state, buffer, at, out),
       Finished ->
         Complete({ consumed: at, out: Bytes::concat_all(out), trailers: empty_headers() }),
     }
@@ -1056,12 +1067,12 @@ fn with_phase(state: BodyState, phase: ChunkPhase, remaining: Int, inbound_body:
 
 fn read_chunk_size(
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   at: Int,
   out: List<Bytes>,
   fuel: Int,
 ) -> BodyStep / {abort.raise} =
-  match read_line(buf, at, state.limits.max_chunk_line) {
+  match read_line(buffer, at, state.limits.max_chunk_line) {
     LineIncomplete -> need_more_bytes(state, at, out),
     LineTooLong ->
       Rejected({
@@ -1070,12 +1081,12 @@ fn read_chunk_size(
           ++ " bytes",
       }),
     LineIllegal(e) -> Rejected({ status: 400, reason: e.reason }),
-    LineAt(l) -> sized(state, buf, out, fuel, buf.slice(l.start, l.stop), l.next),
+    LineAt(l) -> sized(state, buffer, out, fuel, buffer.slice(l.start, l.stop), l.next),
   }
 
 fn sized(
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   out: List<Bytes>,
   fuel: Int,
   line: Bytes,
@@ -1091,7 +1102,7 @@ fn sized(
       reason: "a chunk size is 1 to 16 hexadecimal digits, optionally followed by `;`",
     })
   } else if !fits_in_int(digits, 0, digits.len()) { Rejected(too_large_chunk(state.limits)) }
-  else { chunk_sized(state, buf, out, fuel, hex_to_int(digits, 0, 0), next) }
+  else { chunk_sized(state, buffer, out, fuel, hex_to_int(digits, 0, 0), next) }
 }
 
 fn fits_in_int(b: Bytes, i: Int, n: Int) -> Bool / {abort.raise} =
@@ -1107,7 +1118,7 @@ fn too_large_chunk(limits: Limits) -> Error =
 
 fn chunk_sized(
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   out: List<Bytes>,
   fuel: Int,
   size: Int,
@@ -1120,8 +1131,10 @@ fn chunk_sized(
       reason: "the body is longer than " ++ state.limits.max_body.to_string() ++ " bytes",
     })
   } else if size == 0 {
-    chunk_step(with_phase(state, InTrailers, 0, state.received), buf, next, out, fuel - 1)
-  } else { chunk_step(with_phase(state, InData, size, state.received), buf, next, out, fuel - 1) }
+    chunk_step(with_phase(state, InTrailers, 0, state.received), buffer, next, out, fuel - 1)
+  } else {
+    chunk_step(with_phase(state, InData, size, state.received), buffer, next, out, fuel - 1)
+  }
 
 fn hex_to_int(b: Bytes, i: Int, accumulator: Int) -> Int / {abort.raise} =
   if i >= b.len() { accumulator }
@@ -1151,24 +1164,24 @@ reuse fn chunk_data(
 
 fn chunk_crlf(
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   at: Int,
   out: List<Bytes>,
   fuel: Int,
 ) -> BodyStep / {abort.raise} =
-  if buf.len() < at + 2 { need_more_bytes(state, at, out) }
-  else if buf.at(at) != b'\r' || buf.at(at + 1) != b'\n' {
+  if buffer.len() < at + 2 { need_more_bytes(state, at, out) }
+  else if buffer.at(at) != b'\r' || buffer.at(at + 1) != b'\n' {
     Rejected({ status: 400, reason: "a chunk's data must be followed by CRLF" })
-  } else { chunk_step(with_phase(state, AtSize, 0, state.received), buf, at + 2, out, fuel - 1) }
+  } else { chunk_step(with_phase(state, AtSize, 0, state.received), buffer, at + 2, out, fuel - 1) }
 
 fn chunk_trailers(
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   at: Int,
   out: List<Bytes>,
 ) -> BodyStep / {abort.raise} = {
   let trailer_limits = { ..state.limits, max_header_bytes: state.limits.max_trailer_bytes };
-  match fields(buf, at, at, trailer_limits) {
+  match fields(buffer, at, at, trailer_limits) {
     FieldsIncomplete -> need_more_bytes(state, at, out),
     FieldsRejected(r) -> Rejected(r),
     FieldsDone(done) ->
@@ -1178,8 +1191,8 @@ fn chunk_trailers(
 
 /// A body made of `chunks` as they are pulled, its length not known before.
 pub fn chunked<| e>(chunks: Seq<Bytes | e>) -> Body<| e> = {
-  let held: Stream<| e> = { length: None, chunks: chunks, close: || () };
-  Streamed(held)
+  let stream: Stream<| e> = { length: None, chunks: chunks, close: || () };
+  Streamed(stream)
 }
 
 /// Returns the bytes of a body whose length is known. Panics on a streamed body; use `collect_body`
@@ -1200,8 +1213,8 @@ pub fn collect_body<| e>(b: Body<| e>, limit: Int) -> Option<Bytes> / {abort.rai
   match b {
     Whole(bytes) -> if bytes.len() > limit { None } else { Some(bytes) },
     Streamed(s) ->
-      bracket(|| s, |held: Stream<| e>| (held.close)(), |held: Stream<| e>|
-        collect_chunks(held.chunks, limit)),
+      bracket(|| s, |stream: Stream<| e>| (stream.close)(), |stream: Stream<| e>|
+        collect_chunks(stream.chunks, limit)),
   }
 
 fn collect_chunks<| e>(chunks: Seq<Bytes | e>, limit: Int) -> Option<Bytes> / {abort.raise | e} =
@@ -1647,13 +1660,13 @@ pub type BodyResult =
 pub fn read_body<[l]>(
   c: Int,
   framing: Framing,
-  buf: Bytes,
+  buffer: Bytes,
   limits: Limits,
 ) -> BodyResult / {net.recv[l], abort.raise} =
   body_loop[l](
     c,
     body_start(framing, limits),
-    buf,
+    buffer,
     [],
     slice_ms(limits.body_timeout_ms),
     read_budget(limits.body_timeout_ms),
@@ -1724,11 +1737,11 @@ pub type ResponseHeadResult =
 
 /// `method` decides the framing: a response to `HEAD` carries no body whatever its fields state.
 pub fn parse_response_head(
-  buf: Bytes,
+  buffer: Bytes,
   method: Method,
   limits: Limits,
 ) -> ResponseHeadResult / {abort.raise} =
-  match read_line(buf, 0, limits.max_request_line) {
+  match read_line(buffer, 0, limits.max_request_line) {
     LineIncomplete -> ResponseIncomplete,
     LineTooLong ->
       ResponseRejected({
@@ -1737,18 +1750,18 @@ pub fn parse_response_head(
           ++ " bytes",
       }),
     LineIllegal(e) -> ResponseRejected({ status: 502, reason: e.reason }),
-    LineAt(l) -> after_status_line(buf, method, limits, l),
+    LineAt(l) -> after_status_line(buffer, method, limits, l),
   }
 
 fn after_status_line(
-  buf: Bytes,
+  buffer: Bytes,
   method: Method,
   limits: Limits,
   l: { start: Int, stop: Int, next: Int },
 ) -> ResponseHeadResult / {abort.raise} =
-  match status_line(buf.slice(l.start, l.stop)) {
+  match status_line(buffer.slice(l.start, l.stop)) {
     Err(r) -> ResponseRejected(r),
-    Ok(start) -> match fields(buf, l.next, l.next, limits) {
+    Ok(start) -> match fields(buffer, l.next, l.next, limits) {
       FieldsIncomplete -> ResponseIncomplete,
       FieldsRejected(r) -> ResponseRejected(as_bad_gateway(r)),
       FieldsDone(done) -> match response_framing(method, start.status, done.headers, limits) {
@@ -1773,16 +1786,16 @@ type StatusLine = { version: Version, status: Int, reason: String }
 
 fn status_line(line: Bytes) -> Result<StatusLine, Error> / {abort.raise} = {
   let n = line.len();
-  let sp = line.scan_until(0, b" ", n);
-  if sp >= n {
+  let version_end = line.scan_until(0, b" ", n);
+  if version_end >= n {
     Err({
       status: 502,
       reason: "the response status line has no space after the version; it must be `VERSION SP STATUS SP REASON`",
     })
   } else {
-    let version = response_version(line.slice(0, sp))?;
-    let code = line.slice(sp + 1, min_int(sp + 4, n));
-    let after = sp + 4;
+    let version = response_version(line.slice(0, version_end))?;
+    let code = line.slice(version_end + 1, min_int(version_end + 4, n));
+    let after = version_end + 4;
     let status = if code.len() == 3 && all_digits(code) { code.int_of_ascii() } else { None };
     match status {
       None -> Err({ status: 502, reason: "the response status is not three digits" }),
@@ -2120,18 +2133,18 @@ fn fetch_with_redirects<[l]>(
 ) -> Result<FetchResult, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
   match exchange_at_url[l](method, at, with_cookies(headers, jar, at, now), body, options) {
     Err(e) -> Err(e),
-    Ok(res) -> {
-      let kept = cookie::store(jar, at, header_lines(res.headers, "set-cookie"), now);
+    Ok(response) -> {
+      let updated_jar = cookie::store(jar, at, header_lines(response.headers, "set-cookie"), now);
       let redirects = max(options.max_redirects, 0) - left;
-      match redirect_of(res) {
-        None -> Ok({ response: res, url: at, jar: kept, redirects: redirects }),
+      match redirect_of(response) {
+        None -> Ok({ response: response, url: at, jar: updated_jar, redirects: redirects }),
         Some(location) -> if left <= 0 { Err(TooManyRedirects(redirects)) } else {
           match url::url_join(at, location) {
             Err(_) -> Err(BadLocation(location)),
             Ok(next) -> if url_scheme(at) == "https" && url_scheme(next) != "https" {
               Err(Downgraded(url::url_redacted(next)))
             } else {
-              let m = redirected_method(res.status, method);
+              let m = redirected_method(response.status, method);
               fetch_with_redirects[l](
                 m,
                 next,
@@ -2141,7 +2154,7 @@ fn fetch_with_redirects<[l]>(
                   url::url_origin(at) == url::url_origin(next),
                 ),
                 if m == method { body } else { b"" },
-                kept,
+                updated_jar,
                 options,
                 now,
                 left - 1,
@@ -2153,9 +2166,10 @@ fn fetch_with_redirects<[l]>(
     },
   }
 
-fn redirect_of<| e>(res: Response<| e>) -> Option<String> =
-  if res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307
-      || res.status == 308 { header(res.headers, "location") }
+fn redirect_of<| e>(response: Response<| e>) -> Option<String> =
+  if response.status == 301 || response.status == 302 || response.status == 303
+      || response.status == 307
+      || response.status == 308 { header(response.headers, "location") }
   else { None }
 
 fn redirected_method(status: Int, m: Method) -> Method =
@@ -2164,9 +2178,10 @@ fn redirected_method(status: Int, m: Method) -> Method =
   else { m }
 
 fn followed_headers(headers: Headers, method_changed: Bool, same_origin: Bool) -> Headers = {
-  let kept = if same_origin { headers }
+  let forwarded_headers = if same_origin { headers }
   else { headers.remove("authorization").remove("proxy-authorization").remove("cookie") };
-  if method_changed { kept.remove("content-type").remove("content-encoding") } else { kept }
+  if method_changed { forwarded_headers.remove("content-type").remove("content-encoding") }
+  else { forwarded_headers }
 }
 
 fn with_cookies(headers: Headers, jar: Jar, at: Url, now: Instant) -> Headers / {abort.raise} =
@@ -2316,10 +2331,10 @@ fn exchange_tunnelled<[l]>(
   request: Request,
   limits: Limits,
 ) -> Result<Response<| {}>, FetchError> / {net.send[l], net.recv[l], net.start_tls[l], clock.read, abort.raise} = {
-  let asked = Bytes::of_string(
+  let connect_request = Bytes::of_string(
     "CONNECT " ++ authority ++ " HTTP/1.1\r\nHost: " ++ authority ++ "\r\n\r\n",
   );
-  if !send_all[l](c, asked, limits.write_timeout_ms) { Err(NoOutcome(NotSent)) } else {
+  if !send_all[l](c, connect_request, limits.write_timeout_ms) { Err(NoOutcome(NotSent)) } else {
     match read_head[l](c, b"", limits, false) {
       HeadTimedOut -> Err(NoOutcome(TimedOut)),
       HeadIdle -> Err(NoOutcome(TimedOut)),
@@ -2550,8 +2565,12 @@ fn served_body(framing: Framing) -> Body<| {Reading}> =
   match framing {
     NoBody -> Whole(b""),
     Length(n) -> {
-      let held: Stream<| {Reading}> = { length: Some(n), chunks: incoming_chunks(), close: || () };
-      Streamed(held)
+      let stream: Stream<| {Reading}> = {
+        length: Some(n),
+        chunks: incoming_chunks(),
+        close: || (),
+      };
+      Streamed(stream)
     },
     _ -> chunked(incoming_chunks()),
   }
@@ -2600,11 +2619,11 @@ fn serve_request<[l] | e>(
   handle {
     let returned: Result<Bool, Error> = try[incoming.fail] {
       handle {
-        let res = app(request);
-        let held = inbound_body.get();
-        inbound_body.set({ ..held, started: true });
-        let kept = keep && held.continued && (held.ended || !closing());
-        respond[l](c, limits, request.method, request.version, kept, res)
+        let response = app(request);
+        let body_state = inbound_body.get();
+        inbound_body.set({ ..body_state, started: true });
+        let reusable = keep && body_state.continued && (body_state.ended || !closing());
+        respond[l](c, limits, request.method, request.version, reusable, response)
       } with {
         incoming.pull() -> {
           let p = pull_body_piece[l](c, limits, inbound_body.get());
@@ -2620,7 +2639,7 @@ fn serve_request<[l] | e>(
         if !s.started { send_error_response[l](c, limits, r.status, r.reason ++ "\n") } else { () };
         { keep: false, rest: b"" }
       },
-      Ok(kept) -> if !kept || !s.continued { { keep: false, rest: b"" } }
+      Ok(reusable) -> if !reusable || !s.continued { { keep: false, rest: b"" } }
       else if s.ended { { keep: true, rest: s.buf } }
       else { read_past[l](c, limits, s) },
     }
@@ -2714,11 +2733,11 @@ pub fn respond<[l] | e>(
     Whole(_) ->
       send_all[l](c, encode(method, version, keep_alive, r), limits.write_timeout_ms) && keep_alive,
     Streamed(s) ->
-      bracket(|| s, |held: Stream<| e>| (held.close)(), |held: Stream<| e>| {
+      bracket(|| s, |stream: Stream<| e>| (stream.close)(), |stream: Stream<| e>| {
         let keep = keep_alive && !ends_at_close(version, r);
         if !send_all[l](c, encode_head(method, version, keep, r), limits.write_timeout_ms) { false }
         else if method == Head || bodiless(r.status) { keep }
-        else { send_stream[l](c, limits, version, held) && keep }
+        else { send_stream[l](c, limits, version, stream) && keep }
       }),
   }
 
@@ -2942,18 +2961,18 @@ fn h2_result_requests<| e>(
       match ev {
         http2::Requested(q) -> {
           let request = stream_request(q.request, origin);
-          let res = match read_whole(request.trailers, || app(request)) {
+          let response = match read_whole(request.trailers, || app(request)) {
             Ok(result) -> result,
             Err(reason) -> error_response(reason),
           };
-          match res.body {
+          match response.body {
             Whole(bytes) ->
               {
                 ..t,
                 connection: http2::respond(
                   t.connection,
                   q.stream,
-                  { status: res.status, headers: res.headers, body: bytes },
+                  { status: response.status, headers: response.headers, body: bytes },
                   at_millis(now),
                 ),
               },
@@ -2961,8 +2980,8 @@ fn h2_result_requests<| e>(
               let handle_head = http2::respond_head(
                 t.connection,
                 q.stream,
-                res.status,
-                res.headers,
+                response.status,
+                response.headers,
                 s.length,
                 at_millis(now),
               );
@@ -3187,9 +3206,9 @@ fn exchange_h2<[l]>(
     ) {
     None -> Err(NotSent),
     Some(sent) -> {
-      let asked = http2::take_output(sent.connection);
-      if !send_all[l](c, asked.bytes, limits.write_timeout_ms) { Err(NotSent) } else {
-        await_h2_response[l](c, asked.connection, sent.stream, limits, now, h2_max_steps(limits))
+      let output = http2::take_output(sent.connection);
+      if !send_all[l](c, output.bytes, limits.write_timeout_ms) { Err(NotSent) } else {
+        await_h2_response[l](c, output.connection, sent.stream, limits, now, h2_max_steps(limits))
       }
     },
   }
@@ -3197,13 +3216,13 @@ fn exchange_h2<[l]>(
 
 fn await_h2_response<[l]>(
   c: Int,
-  conn: http2::Connection,
+  connection: http2::Connection,
   stream: Int,
   limits: Limits,
   at: Int,
   fuel: Int,
 ) -> Result<Response<| {}>, ClientError> / {net.send[l], net.recv[l], clock.read, abort.raise} = {
-  let out = http2::take_output(conn);
+  let out = http2::take_output(connection);
   if out.bytes.len() > 0 && !send_all[l](c, out.bytes, limits.write_timeout_ms) { Err(Closed) }
   else if fuel <= 0 { Err(TimedOut) } else {
     let now = max(clock_ms(), at);
@@ -3257,11 +3276,11 @@ fn h2_outcome(
 
 fn h2_finished<[l]>(
   c: Int,
-  conn: http2::Connection,
+  connection: http2::Connection,
   limits: Limits,
   done: Result<Response<| {}>, ClientError>,
 ) -> Result<Response<| {}>, ClientError> / {net.send[l], clock.read, abort.raise} = {
-  let goodbye = http2::take_output(http2::drain(conn, at_millis(clock_ms())));
+  let goodbye = http2::take_output(http2::drain(connection, at_millis(clock_ms())));
   if goodbye.bytes.len() > 0 {
     send_all[l](c, goodbye.bytes, limits.write_timeout_ms);
     ()
@@ -3321,10 +3340,10 @@ pub fn serve_pooled_with<[l], [k] | e>(
   count: Int,
   limits: Limits,
   shedding: Shedding,
-  conn: keep (Int, Chan<Unit>) -> Unit / e,
+  handler: keep (Int, Chan<Unit>) -> Unit / e,
 ) -> PoolStats / {abort.raise, net.accept[l], net.send[k], net.close[k], task.write, clock.read | e} =
   pool[l](listener, count, limits, shedding, |c: Int, turn: Turn<Chan<Unit>>|
-    match turn { Shed -> send_busy[k](c, limits, shedding), Serve(stop) -> conn(c, stop) })
+    match turn { Shed -> send_busy[k](c, limits, shedding), Serve(stop) -> handler(c, stop) })
 
 /// Like `serve_pooled`, for a listener opened by `net.listen`. Each connection is first secured
 /// with the `--tls` credential `credential`, before any request is read, offering `h2` and then
@@ -3827,15 +3846,15 @@ test "Content-Encoding is passed through untouched" {
 
 type Decoded = { bytes: Bytes, trailers: Headers, consumed: Int }
 
-fn decode_body(framing: Framing, buf: Bytes) -> Result<Decoded, Error> / {abort.raise} =
-  decode_from(body_start(framing, default_limits()), buf, 0, [], 64)
+fn decode_body(framing: Framing, bytes: Bytes) -> Result<Decoded, Error> / {abort.raise} =
+  decode_from(body_start(framing, default_limits()), bytes, 0, [], 64)
 
 fn decode_body_with(
   framing: Framing,
-  buf: Bytes,
+  bytes: Bytes,
   limits: Limits,
 ) -> Result<Decoded, Error> / {abort.raise} =
-  decode_from(body_start(framing, limits), buf, 0, [], 64)
+  decode_from(body_start(framing, limits), bytes, 0, [], 64)
 
 reuse fn decode_from(
   state: BodyState,
@@ -3858,11 +3877,11 @@ reuse fn decode_from(
     }
   }
 
-fn body_status(framing: Framing, buf: Bytes, limits: Limits) -> Int / {abort.raise} =
-  match decode_body_with(framing, buf, limits) { Err(r) -> r.status, Ok(_) -> 0 }
+fn body_status(framing: Framing, bytes: Bytes, limits: Limits) -> Int / {abort.raise} =
+  match decode_body_with(framing, bytes, limits) { Err(r) -> r.status, Ok(_) -> 0 }
 
-fn decoded(framing: Framing, buf: Bytes) -> Decoded / {abort.raise} =
-  match decode_body(framing, buf) { Ok(d) -> d, Err(r) -> panic("expected a body: " ++ r.reason) }
+fn decoded(framing: Framing, bytes: Bytes) -> Decoded / {abort.raise} =
+  match decode_body(framing, bytes) { Ok(d) -> d, Err(r) -> panic("expected a body: " ++ r.reason) }
 
 test "a length-framed body stops at its length and leaves the rest" {
   let d = decoded(Length(5), b"helloGET / HTTP/1.1\r\n");
@@ -4064,12 +4083,12 @@ fn reference_length(raw: Bytes) -> Int / {abort.raise} = {
   let head_end = match raw.index_of(b"\r\n\r\n") { Some(at) -> at + 4, None -> -1 };
   if head_end < 0 { -1 } else {
     let lines = String::of_bytes_lossy(raw.slice(0, head_end)).split("\r\n");
-    let cl = values_of(lines, "content-length:");
+    let content_lengths = values_of(lines, "content-length:");
     let te = values_of(lines, "transfer-encoding:");
-    if te.len() > 0 && cl.len() > 0 { -1 }
+    if te.len() > 0 && content_lengths.len() > 0 { -1 }
     else if te.len() > 0 { if last_string(te) == "chunked" { -2 } else { -1 } }
-    else if cl.len() > 1 { -1 }
-    else { match cl { [only] -> parse_content_length(only), _ -> 0 } }
+    else if content_lengths.len() > 1 { -1 }
+    else { match content_lengths { [only] -> parse_content_length(only), _ -> 0 } }
   }
 }
 
@@ -4522,8 +4541,8 @@ fn limits_streaming(n: Int) -> Limits = {
   { ..base, max_stream_chunks: n }
 }
 
-fn chunk_status(buf: Bytes) -> Int / {abort.raise} =
-  match body_step(body_start(Chunked, default_limits()), buf) {
+fn chunk_status(bytes: Bytes) -> Int / {abort.raise} =
+  match body_step(body_start(Chunked, default_limits()), bytes) {
     Rejected(r) -> r.status,
     Await(_) -> -1,
     Complete(_) -> 0,
@@ -4824,10 +4843,10 @@ test "a request is sent, its response read, and the connection closed" {
 
 fn fetched(
   script: List<Step>,
-  reached: Bool,
+  reachable: Bool,
 ) -> Result<Plain, ClientError> / {ip.fail, abort.raise} =
   read_plain(
-    net::on_mem(if reached { serving("h", script) } else { net::mem_empty() }, ||
+    net::on_mem(if reachable { serving("h", script) } else { net::mem_empty() }, ||
       request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())).value,
   )
 
@@ -4837,7 +4856,8 @@ fn read_plain(
   r: Result<Response<| {}>, ClientError>,
 ) -> Result<Plain, ClientError> / {abort.raise} =
   match r {
-    Ok(res) -> Ok({ status: res.status, headers: res.headers, body: whole_bytes(res.body) }),
+    Ok(response) ->
+      Ok({ status: response.status, headers: response.headers, body: whole_bytes(response.body) }),
     Err(reason) -> Err(reason),
   }
 
@@ -5302,7 +5322,8 @@ fn redirect(status: Int, location: String) -> Response<| {}> =
 fn example_shop_site(scripts: List<List<Step>>) -> Site =
   { name: "shop.example", at: "192.0.2.10", port: 80, scripts: scripts }
 
-fn sent_text(n: MemNet, conn: Int) -> String = String::of_bytes_lossy(net::mem_sent(n, conn))
+fn sent_text(n: MemNet, connection: Int) -> String =
+  String::of_bytes_lossy(net::mem_sent(n, connection))
 
 type Fetch = { method: Method, url: Url, headers: Headers, body: Bytes, options: FetchOptions }
 
@@ -5382,7 +5403,7 @@ test "a 307 is fetched again with the original method and body" {
 }
 
 test "credentials go no further than the origin they were written for" {
-  let asked = {
+  let credentialed_fetch = {
     ..default_fetch(Get, url"http://shop.example/", b""),
     headers: set_header(
       set_header(empty_headers(), "authorization", "Bearer t"),
@@ -5403,7 +5424,7 @@ test "credentials go no further than the origin they were written for" {
         scripts: [[sends_response(text_response(200, "there"))]],
       },
     ]),
-    asked,
+    credentialed_fetch,
   );
   assert_eq(status_of(ran.value), 200);
   assert(sent_text(ran.net, 2).contains("authorization: Bearer t\r\n"));
@@ -5684,7 +5705,7 @@ fn h2_requests(paths: List<String>) -> Bytes / {abort.raise} = {
     http2::encode_frame(http2::SettingsFrame({ ack: false, settings: [] })),
     http2::encode_frame(http2::SettingsFrame({ ack: true, settings: [] })),
   ]);
-  let asked = range(0, paths.len()).fold(
+  let request_frames = range(0, paths.len()).fold(
     { encoder: http2::encoder(4096), frames: [opening] },
     |w: RequestFrames, i: Int| {
       let e = http2::encode(w.encoder, [
@@ -5710,7 +5731,7 @@ fn h2_requests(paths: List<String>) -> Bytes / {abort.raise} = {
       }
     },
   );
-  Bytes::concat_all(asked.frames)
+  Bytes::concat_all(request_frames.frames)
 }
 
 type FrameScan = { at: Int, shown: List<String> }
@@ -5815,12 +5836,12 @@ test "a streamed response over HTTP/2 is sent as DATA frames as it is pulled" {
 
 test "a streamed response over HTTP/2 that states its length and sends fewer bytes is reset" {
   let short = |request: Request| {
-    let held: Stream<| {Reading, task.select}> = {
+    let stream: Stream<| {Reading, task.select}> = {
       length: Some(10),
       chunks: seq::of_list([b"four"]),
       close: || (),
     };
-    { status: 200, headers: empty_headers(), body: Streamed(held) }
+    { status: 200, headers: empty_headers(), body: Streamed(stream) }
   };
   let frames = h2_frames(pooled_one([Sends(h2_requests(["/a"])), Silent], short));
   assert_eq(frames.drop(3).take(3), ["HEADERS 1", "DATA 1 four", "RST_STREAM 1"])
@@ -5892,12 +5913,12 @@ test "a client that sent `Expect: 100-continue` gets no 100 Continue when the ha
 
 test "a stream that names its length is sent under Content-Length, and one that falls short ends the connection" {
   let sized = |n: Int| {
-    let held: Stream<| {}> = {
+    let stream: Stream<| {}> = {
       length: Some(n),
       chunks: seq::of_list([b"abc", b"de"]),
       close: || (),
     };
-    { status: 200, headers: empty_headers(), body: Streamed(held) }
+    { status: 200, headers: empty_headers(), body: Streamed(stream) }
   };
   let whole = written([], |c: Int| respond[conn](c, default_limits(), Get, Http11, true, sized(5)));
   assert(whole.reusable);

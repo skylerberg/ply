@@ -410,14 +410,19 @@ fn scan(state: TryState, expression: Expression) -> ScanResult / {abort.raise} =
       }
     },
     MatchExpression(m) -> {
-      let sc = scan(state, m.scrutinee);
-      let rebuilt = MatchExpression({ span: m.span, scrutinee: sc.expression, arms: m.arms });
-      match sc.scan {
-        ScanFound(_) -> { state: sc.state, scan: sc.scan, expression: rebuilt },
-        ScanImpure -> { state: sc.state, scan: ScanImpure, expression: rebuilt },
+      let scrutinee_scan = scan(state, m.scrutinee);
+      let rebuilt = MatchExpression({
+        span: m.span,
+        scrutinee: scrutinee_scan.expression,
+        arms: m.arms,
+      });
+      match scrutinee_scan.scan {
+        ScanFound(_) ->
+          { state: scrutinee_scan.state, scan: scrutinee_scan.scan, expression: rebuilt },
+        ScanImpure -> { state: scrutinee_scan.state, scan: ScanImpure, expression: rebuilt },
         ScanPure ->
           {
-            state: sc.state,
+            state: scrutinee_scan.state,
             scan: purity(
               m.arms.fold(true, |accumulator: Bool, arm: MatchArm|
                 accumulator && is_pure(arm.body)
@@ -492,11 +497,15 @@ fn scan_head(state: TryState, expression: Expression) -> ScanResult / {abort.rai
       }
     },
     MatchExpression(m) -> {
-      let sc = scan(state, m.scrutinee);
+      let scrutinee_scan = scan(state, m.scrutinee);
       {
-        state: sc.state,
-        scan: sc.scan,
-        expression: MatchExpression({ span: m.span, scrutinee: sc.expression, arms: m.arms }),
+        state: scrutinee_scan.state,
+        scan: scrutinee_scan.scan,
+        expression: MatchExpression({
+          span: m.span,
+          scrutinee: scrutinee_scan.expression,
+          arms: m.arms,
+        }),
       }
     },
     _ -> scan(state, expression),
@@ -632,23 +641,23 @@ fn split_at(
   match taken.enclosing_match {
     None -> { state: taken.state, statements: statements.set(i, taken.stmt), split: None },
     Some(t) -> {
-      let kept = statements.set(i, taken.stmt);
-      let rest = kept.drop(if t.consumes { i + 1 } else { i });
+      let updated_statements = statements.set(i, taken.stmt);
+      let rest = updated_statements.drop(if t.consumes { i + 1 } else { i });
       let body0 = BlockExpression({ span: made_at(t.at), tail: tail, statements: rest });
       let body = if remaining <= 0 { panic(extra_lift_message()) }
       else { return_block(taken.state, body0, remaining - 1) };
       let w = try_match(body.state, t.operand, t.at, t.pattern, body.expression);
-      { state: w.state, statements: kept, split: Some(w.expression) }
+      { state: w.state, statements: updated_statements, split: Some(w.expression) }
     },
   }
 }
 
 fn lift_from_statement(
   state: TryState,
-  stmt: Statement,
+  statement: Statement,
   remaining: Int,
 ) -> StatementLift / {abort.raise} =
-  match stmt {
+  match statement {
     LetElseStatement(l) -> match l.value {
       PropagateExpression(t) -> {
         let fresh = fresh_binder(state, t.span);
@@ -767,7 +776,7 @@ fn lift_from_statement(
                 consumes: false,
               }),
             },
-          _ -> { state: o.state, stmt: stmt, enclosing_match: None },
+          _ -> { state: o.state, stmt: statement, enclosing_match: None },
         }
       },
     },
@@ -811,7 +820,7 @@ fn lift_from_statement(
                 consumes: false,
               }),
             },
-          _ -> { state: o.state, stmt: stmt, enclosing_match: None },
+          _ -> { state: o.state, stmt: statement, enclosing_match: None },
         }
       },
     },
@@ -840,7 +849,7 @@ fn lift_from_statement(
                 consumes: false,
               }),
             },
-          _ -> { state: o.state, stmt: stmt, enclosing_match: None },
+          _ -> { state: o.state, stmt: statement, enclosing_match: None },
         }
       },
     },
@@ -944,9 +953,9 @@ fn exits_in(
       }
     },
     MatchExpression(m) -> {
-      let sc = exits_in(state, exit, outermost, m.scrutinee);
+      let scrutinee = exits_in(state, exit, outermost, m.scrutinee);
       let arms = m.arms.fold(
-        { state: sc.state, arms: [] },
+        { state: scrutinee.state, arms: [] },
         |accumulator: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
             None -> { state: accumulator.state, expression: None },
@@ -964,14 +973,14 @@ fn exits_in(
       );
       {
         state: arms.state,
-        expression: MatchExpression({ ..m, scrutinee: sc.expression, arms: arms.arms }),
+        expression: MatchExpression({ ..m, scrutinee: scrutinee.expression, arms: arms.arms }),
       }
     },
     BlockExpression(b) -> {
       let statements = b.statements.fold(
         { state: state, statements: [] },
-        |accumulator: { state: TryState, statements: List<Statement> }, stmt: Statement|
-          match stmt {
+        |accumulator: { state: TryState, statements: List<Statement> }, statement: Statement|
+          match statement {
             LetStatement(l) -> {
               let o = exits_in(accumulator.state, exit, outermost, l.value);
               {
@@ -1007,7 +1016,7 @@ fn exits_in(
             },
           },
       );
-      let tl = match b.tail {
+      let tail_output = match b.tail {
         None -> { state: statements.state, expression: None },
         Some(t) -> {
           let o = exits_in(statements.state, exit, outermost, t);
@@ -1015,10 +1024,10 @@ fn exits_in(
         },
       };
       {
-        state: tl.state,
+        state: tail_output.state,
         expression: BlockExpression({
           ..b,
-          tail: tl.expression,
+          tail: tail_output.expression,
           statements: statements.statements,
         }),
       }
@@ -1113,9 +1122,9 @@ fn handle_exits(
       );
       let r: { state: TryState, ret: Option<ReturnClause> } = match h.ret {
         None -> { state: cs.state, ret: None },
-        Some(rc) -> {
-          let o = exits_through(cs.state, exit, rc.body);
-          { state: o.state, ret: Some({ ..rc, body: o.expression }) }
+        Some(return_clause) -> {
+          let o = exits_through(cs.state, exit, return_clause.body);
+          { state: o.state, ret: Some({ ..return_clause, body: o.expression }) }
         },
       };
       {
@@ -1389,9 +1398,9 @@ fn sweep_inner(
       }
     },
     MatchExpression(m) -> {
-      let sc = rewrite_tries_within(state, m.scrutinee, scope, barrier, remaining);
+      let scrutinee = rewrite_tries_within(state, m.scrutinee, scope, barrier, remaining);
       let arms = m.arms.fold(
-        { state: sc.state, arms: [] },
+        { state: scrutinee.state, arms: [] },
         |accumulator: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
             None -> { state: accumulator.state, expression: None },
@@ -1414,14 +1423,18 @@ fn sweep_inner(
       );
       {
         state: arms.state,
-        expression: MatchExpression({ span: m.span, scrutinee: sc.expression, arms: arms.arms }),
+        expression: MatchExpression({
+          span: m.span,
+          scrutinee: scrutinee.expression,
+          arms: arms.arms,
+        }),
       }
     },
     BlockExpression(b) -> {
       let statements = b.statements.fold(
         { state: state, statements: [] },
-        |accumulator: { state: TryState, statements: List<Statement> }, stmt: Statement|
-          match stmt {
+        |accumulator: { state: TryState, statements: List<Statement> }, statement: Statement|
+          match statement {
             LetStatement(l) -> {
               let o = rewrite_tries_within(accumulator.state, l.value, scope, barrier, remaining);
               {
@@ -1459,7 +1472,7 @@ fn sweep_inner(
             },
           },
       );
-      let tl = match b.tail {
+      let tail_output = match b.tail {
         None -> { state: statements.state, expression: None },
         Some(t) -> {
           let o = rewrite_tries_within(statements.state, t, scope, barrier, remaining);
@@ -1467,10 +1480,10 @@ fn sweep_inner(
         },
       };
       {
-        state: tl.state,
+        state: tail_output.state,
         expression: BlockExpression({
           span: b.span,
-          tail: tl.expression,
+          tail: tail_output.expression,
           statements: statements.statements,
         }),
       }
@@ -1554,15 +1567,22 @@ fn sweep_inner(
       );
       let r = match h.ret {
         None -> { state: cs.state, ret: None },
-        Some(rc) -> {
+        Some(return_clause) -> {
           let o = rewrite_tries_within(
             cs.state,
-            rc.body,
+            return_clause.body,
             scope,
             barrier_for_parts(state, barrier, b"a `handle` return clause"),
             remaining,
           );
-          { state: o.state, ret: Some({ binder: rc.binder, body: o.expression, span: rc.span }) }
+          {
+            state: o.state,
+            ret: Some({
+              binder: return_clause.binder,
+              body: o.expression,
+              span: return_clause.span,
+            }),
+          }
         },
       };
       {

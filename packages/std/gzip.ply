@@ -148,8 +148,8 @@ fn fixed_lengths() -> List<Int> =
 type BitWriter = { pieces: List<Bytes>, buf: Int, bits: Int }
 
 fn write_bits(w: BitWriter, packed: Int) -> BitWriter = {
-  let { pieces, buf, bits } = w;
-  let wide = buf | packed >>> 6 << bits;
+  let { pieces, buf: buffer, bits } = w;
+  let wide = buffer | packed >>> 6 << bits;
   let count = bits + (packed & 63);
   if count < 32 { { pieces: pieces, buf: wide, bits: count } }
   else { { pieces: pieces.push(u32_le(wide)), buf: wide >>> 32, bits: count - 32 } }
@@ -292,7 +292,7 @@ fn write_block(
   w: BitWriter,
   c: Coder,
 ) -> BlockState / {abort.raise} = {
-  let held = w.buf;
+  let buffer = w.buf;
   let bits = w.bits;
   let mark = w.pieces.len();
   let flag = if last { 1 } else { 0 };
@@ -313,7 +313,7 @@ fn write_block(
   } else {
     let size = to - from;
     let opened = write_bits(
-      { pieces: ended.pieces.take(mark), buf: held, bits: bits },
+      { pieces: ended.pieces.take(mark), buf: buffer, bits: bits },
       flag << 6 | 3 + pad,
     );
     let sized = Bytes::concat_all([
@@ -412,10 +412,10 @@ type EncodeStep = { out: Bytes, next: Encoder }
 fn encode_chunk(e: Encoder, chunk: Bytes, format: Format) -> EncodeStep / {abort.raise} = {
   let sum = match format { Deflate -> e.sum, _ -> checksum::update(e.sum, chunk) };
   let total = e.total + chunk.len();
-  let buf = e.buf.concat(chunk);
-  let whole = (buf.len() - e.from) / 65535 * 65535;
-  if whole == 0 { { out: b"", next: { ..e, buf: buf, sum: sum, total: total } } } else {
-    let done = write_blocks(buf, e.from, e.from + whole, e.shift, false, e.state, e.coder);
+  let buffer = e.buf.concat(chunk);
+  let whole = (buffer.len() - e.from) / 65535 * 65535;
+  if whole == 0 { { out: b"", next: { ..e, buf: buffer, sum: sum, total: total } } } else {
+    let done = write_blocks(buffer, e.from, e.from + whole, e.shift, false, e.state, e.coder);
     let w = done.w;
     let at = e.from + whole;
     let cut = if at > 65536 { at - 32768 } else { 0 };
@@ -423,7 +423,7 @@ fn encode_chunk(e: Encoder, chunk: Bytes, format: Format) -> EncodeStep / {abort
       out: Bytes::concat_all(w.pieces),
       next: {
         ..e,
-        buf: if cut == 0 { buf } else { buf.slice(cut, buf.len()) },
+        buf: if cut == 0 { buffer } else { buffer.slice(cut, buffer.len()) },
         from: at - cut,
         shift: e.shift + cut,
         state: { w: { pieces: [], buf: w.buf, bits: w.bits }, table: done.table },
@@ -452,7 +452,7 @@ fn encode_chunks<| e>(
 ) -> Seq<Bytes | {abort.raise | e}> =
   ||
     if fuel <= 0 { Done } else {
-      let w = match state { Some(held) -> held, None -> encoder(format) };
+      let w = match state { Some(current) -> current, None -> encoder(format) };
       match plain() {
         Done -> Yield(finish_encoder(w, format), seq::empty()),
         Skip(rest) -> Skip(encode_chunks(rest, format, Some(w), fuel - 1)),
@@ -590,8 +590,8 @@ fn usable(lengths: List<Int>) -> Bool / {abort.raise} = {
 fn padded(data: Bytes) -> Bytes =
   data.concat(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 
-fn peek(src: Bytes, bit: Int) -> Int / {abort.raise} =
-  Int::of_u32(src.u32_le(bit >>> 3)) >>> (bit & 7)
+fn peek(source: Bytes, bit: Int) -> Int / {abort.raise} =
+  Int::of_u32(source.u32_le(bit >>> 3)) >>> (bit & 7)
 
 const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_of_int))
 
@@ -600,7 +600,7 @@ type ExtraBitBases = { lengths: Array<Int>, distances: Array<Int> }
 type Match = { next: Int, length: Int, dist: Int }
 
 fn match_read(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   bit: Int,
   symbol: Int,
@@ -610,7 +610,7 @@ fn match_read(
 ) -> Match / {gzip.fail, abort.raise} = {
   let span = code_bases.lengths.get(symbol - 257);
   let at = bit + (span & 15);
-  let window = peek(src, at);
+  let window = peek(source, at);
   let fast = dist.fast.get(window & (1 << dist.bits) - 1);
   let entry = if fast != 0 { fast } else { long_entry(dist, window, dist.bits + 1) };
   if entry == 0 && at + 15 <= end { fail(base + (at >>> 3), InvalidCode) }
@@ -619,8 +619,8 @@ fn match_read(
     let after = at + (entry & 15);
     {
       next: after + (far & 15),
-      length: (span >>> 4) + (peek(src, bit) & (1 << (span & 15)) - 1),
-      dist: (far >>> 4) + (peek(src, after) & (1 << (far & 15)) - 1),
+      length: (span >>> 4) + (peek(source, bit) & (1 << (span & 15)) - 1),
+      dist: (far >>> 4) + (peek(source, after) & (1 << (far & 15)) - 1),
     }
   }
 }
@@ -628,7 +628,7 @@ fn match_read(
 type BlockProgress = { out: Bytes, bit: Int, state: Int }
 
 fn decode_symbols(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   bit: Int,
   out: Bytes,
@@ -639,7 +639,7 @@ fn decode_symbols(
   stop: Int,
   left: Int,
 ) -> BlockProgress / {gzip.fail, abort.raise} = {
-  let window = Int::of_u32(src.u32_le(bit >>> 3)) >>> (bit & 7);
+  let window = Int::of_u32(source.u32_le(bit >>> 3)) >>> (bit & 7);
   let fast = literal.fast.get(window & (1 << literal.bits) - 1);
   let entry = if fast != 0 { fast } else { long_entry(literal, window, literal.bits + 1) };
   let next = bit + (entry & 15);
@@ -651,7 +651,7 @@ fn decode_symbols(
   else if symbol < 256 {
     if bounds.get(0) + n >= bounds.get(1) { fail(bounds.get(3) + (bit >>> 3), OverLimit) } else {
       decode_symbols(
-        src,
+        source,
         end,
         next,
         out ++ single_bytes().get(symbol),
@@ -664,13 +664,13 @@ fn decode_symbols(
       )
     }
   } else if symbol == 256 { { out: out, bit: next, state: 0 } } else {
-    let m = match_read(src, end, next, symbol, dist, code_bases, bounds.get(3));
+    let m = match_read(source, end, next, symbol, dist, code_bases, bounds.get(3));
     let total = bounds.get(0) + n;
     if m.next > end { { out: out, bit: bit, state: 1 } }
     else if m.dist > total - bounds.get(2) { fail(bounds.get(3) + (bit >>> 3), DistanceTooFar) }
     else if total + m.length > bounds.get(1) { fail(bounds.get(3) + (bit >>> 3), OverLimit) } else {
       decode_symbols(
-        src,
+        source,
         end,
         m.next,
         if m.dist >= m.length { out ++ out.slice(n - m.dist, n - m.dist + m.length) }
@@ -695,7 +695,7 @@ fn repeated(out: List<Int>, value: Int, n: Int) -> List<Int> =
   if n <= 0 { out } else { repeated(out.push(value), value, n - 1) }
 
 fn lengths_read(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   bit: Int,
   codes: Table,
@@ -706,7 +706,7 @@ fn lengths_read(
 ) -> Lengths / {gzip.fail, abort.raise} =
   if out.len() == want { { bit: bit, lengths: out } }
   else if out.len() > want || left <= 0 { fail(base + (bit >>> 3), InvalidCodeLengths) } else {
-    let entry = codes.fast.get(peek(src, bit) & 127);
+    let entry = codes.fast.get(peek(source, bit) & 127);
     let symbol = entry >>> 4;
     let after = bit + (entry & 15);
     let counted = if symbol < 16 { 0 }
@@ -715,14 +715,14 @@ fn lengths_read(
     else { 7 };
     if after + counted > end { fail(base + (end >>> 3), Truncated) }
     else if entry == 0 { fail(base + (bit >>> 3), InvalidCodeLengths) } else if symbol < 16 {
-      lengths_read(src, end, after, codes, want, out.push(symbol), left - 1, base)
+      lengths_read(source, end, after, codes, want, out.push(symbol), left - 1, base)
     } else {
-      let run = (if symbol == 18 { 11 } else { 3 }) + (peek(src, after) & (1 << counted) - 1);
+      let run = (if symbol == 18 { 11 } else { 3 }) + (peek(source, after) & (1 << counted) - 1);
       match if symbol == 16 { out.at(out.len() - 1) } else { Some(0) } {
         None -> fail(base + (bit >>> 3), InvalidCodeLengths),
         Some(value) ->
           lengths_read(
-            src,
+            source,
             end,
             after + counted,
             codes,
@@ -737,8 +737,8 @@ fn lengths_read(
 
 type Codes = { bit: Int, literal: Table, dist: Table }
 
-fn dynamic_read(src: Bytes, end: Int, bit: Int, base: Int) -> Codes / {gzip.fail, abort.raise} = {
-  let head = peek(src, bit);
+fn dynamic_read(source: Bytes, end: Int, bit: Int, base: Int) -> Codes / {gzip.fail, abort.raise} = {
+  let head = peek(source, bit);
   let literals = (head & 31) + 257;
   let distances = (head >>> 5 & 31) + 1;
   let listed = (head >>> 10 & 15) + 4;
@@ -746,10 +746,10 @@ fn dynamic_read(src: Bytes, end: Int, bit: Int, base: Int) -> Codes / {gzip.fail
   if at + 3 * listed > end { fail(base + (end >>> 3), Truncated) }
   else if literals > 286 || distances > 30 { fail(base + (bit >>> 3), InvalidCodeLengths) } else {
     let order = range(0, listed).fold(zeros(19), |into: List<Int>, i: Int|
-      into.set(code_length_order().at_or(i, 0), peek(src, at + 3 * i) & 7));
+      into.set(code_length_order().at_or(i, 0), peek(source, at + 3 * i) & 7));
     if unassigned(length_counts(order)) != 0 { fail(base + (at >>> 3), InvalidCodeLengths) } else {
       let read = lengths_read(
-        src,
+        source,
         end,
         at + 3 * listed,
         table_of(order, 7),
@@ -818,36 +818,43 @@ fn decoder(format: Format, limit: Int, input: Bytes) -> Decoder / {abort.raise} 
   }
 }
 
-fn skip_zero_terminated(src: Bytes, n: Int, at: Int, base: Int) -> Int / {gzip.fail, abort.raise} = {
+fn skip_zero_terminated(
+  source: Bytes,
+  n: Int,
+  at: Int,
+  base: Int,
+) -> Int / {gzip.fail, abort.raise} = {
   let most = min(n, at + header_field_limit() + 1);
-  match src.slice(at, most).index_of_byte(0) {
+  match source.slice(at, most).index_of_byte(0) {
     Some(i) -> at + i + 1,
     None -> if most == n { fail(base + n, Truncated) } else { fail(base + at, InvalidHeader) },
   }
 }
 
 fn header_read(
-  src: Bytes,
+  source: Bytes,
   n: Int,
   at: Int,
   first: Bool,
   base: Int,
 ) -> Int / {gzip.fail, abort.raise} = {
   let have = min(n - at, 3);
-  let opens = src.slice(at, at + have) == b"\x1f\x8b\x08".slice(0, have);
+  let opens = source.slice(at, at + have) == b"\x1f\x8b\x08".slice(0, have);
   if !opens { fail(base + at, if first { WrongFormat } else { TrailingBytes }) } else {
-    let flags = src.at(at + 3);
+    let flags = source.at(at + 3);
     if flags & 0xE0 != 0 { fail(base + at + 3, InvalidHeader) } else {
       let fixed = at + 10;
       let extra = if flags & 4 == 0 { fixed }
-      else { fixed + 2 + (src.at(fixed) | src.at(fixed + 1) << 8) };
+      else { fixed + 2 + (source.at(fixed) | source.at(fixed + 1) << 8) };
       if extra > n { fail(base + n, Truncated) } else {
-        let named = if flags & 8 == 0 { extra } else { skip_zero_terminated(src, n, extra, base) };
-        let noted = if flags & 16 == 0 { named } else { skip_zero_terminated(src, n, named, base) };
+        let named = if flags & 8 == 0 { extra }
+        else { skip_zero_terminated(source, n, extra, base) };
+        let noted = if flags & 16 == 0 { named }
+        else { skip_zero_terminated(source, n, named, base) };
         if flags & 2 == 0 { noted }
         else if noted + 2 > n { fail(base + n, Truncated) }
-        else if src.at(noted) | src.at(noted + 1) << 8
-            != Int::of_u32(crc32(src.slice(at, noted))) & 0xFFFF {
+        else if source.at(noted) | source.at(noted + 1) << 8
+            != Int::of_u32(crc32(source.slice(at, noted))) & 0xFFFF {
           fail(base + noted, HeaderChecksumMismatch)
         } else { noted + 2 }
       }
@@ -856,7 +863,7 @@ fn header_read(
 }
 
 fn framing_read(
-  src: Bytes,
+  source: Bytes,
   n: Int,
   core: DecoderState,
   written: Int,
@@ -866,8 +873,8 @@ fn framing_read(
   match core.format {
     Deflate -> { ..core, phase: 1 },
     Zlib -> {
-      let method = src.at(at);
-      let flags = src.at(at + 1);
+      let method = source.at(at);
+      let flags = source.at(at + 1);
       if at < n && method & 15 != 8 { fail(base + at, WrongFormat) }
       else if at + 2 > n { fail(base + n, Truncated) }
       else if method >>> 4 > 7 || (method * 256 + flags) % 31 != 0 { fail(base + at, WrongFormat) }
@@ -875,7 +882,7 @@ fn framing_read(
       else { { ..core, bit: 8 * (at + 2), phase: 1 } }
     },
     Gzip -> if at >= n { fail(base + n, Truncated) } else {
-      let after = header_read(src, n, at, core.members == 0, base);
+      let after = header_read(source, n, at, core.members == 0, base);
       {
         ..core,
         bit: 8 * after,
@@ -889,21 +896,21 @@ fn framing_read(
 }
 
 fn block_read(
-  src: Bytes,
+  source: Bytes,
   n: Int,
   core: DecoderState,
   written: Int,
 ) -> DecoderState / {gzip.fail, abort.raise} = {
   let bit = core.bit;
   let base = core.base;
-  let head = peek(src, bit) & 7;
+  let head = peek(source, bit) & 7;
   let kind = head >>> 1;
   let last = head & 1 == 1;
   if bit + 3 > 8 * n { fail(base + n, Truncated) } else if kind == 0 {
     let at = bit + 10 >>> 3;
-    let size = src.at(at) | src.at(at + 1) << 8;
+    let size = source.at(at) | source.at(at + 1) << 8;
     if at + 4 > n { fail(base + n, Truncated) }
-    else if size ^ (src.at(at + 2) | src.at(at + 3) << 8) != 0xFFFF {
+    else if size ^ (source.at(at + 2) | source.at(at + 3) << 8) != 0xFFFF {
       fail(base + at, StoredLengthMismatch)
     } else if written + size > core.limit { fail(base + at, OverLimit) }
     else { { ..core, bit: 8 * (at + 4), phase: 3, last: last, left: size } }
@@ -917,7 +924,7 @@ fn block_read(
       dist: fixed_distances(),
     }
   } else if kind == 2 {
-    let codes = dynamic_read(src, 8 * n, bit + 3, base);
+    let codes = dynamic_read(source, 8 * n, bit + 3, base);
     { ..core, bit: codes.bit, phase: 2, last: last, literal: codes.literal, dist: codes.dist }
   } else { fail(base + (bit >>> 3), ReservedBlockType) }
 }

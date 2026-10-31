@@ -317,23 +317,23 @@ fn setting_pair(s: Setting) -> { id: Int, value: Int } =
 /// start.
 pub type ReadResult = { frame: Frame, next: Int }
 
-/// The length of the frame whose header starts at `at`, or `None` where `buf` ends before its
+/// The length of the frame whose header starts at `at`, or `None` where `bytes` ends before its
 /// header does.
-pub fn frame_length(buf: Bytes, at: Int) -> Option<Int> =
-  if at < 0 || buf.len() - at < 9 { None }
-  else { Some(buf.at(at) << 16 | buf.at(at + 1) << 8 | buf.at(at + 2)) }
+pub fn frame_length(bytes: Bytes, at: Int) -> Option<Int> =
+  if at < 0 || bytes.len() - at < 9 { None }
+  else { Some(bytes.at(at) << 16 | bytes.at(at + 1) << 8 | bytes.at(at + 2)) }
 
-/// Returns the frame at index `at` of `buf`, or `None` when `buf` ends before the frame does.
+/// Returns the frame at index `at` of `bytes`, or `None` when `bytes` ends before the frame does.
 /// Rejects a frame longer than `max_size` as soon as its header arrives, without waiting for its
 /// payload. A violation that affects only one stream is raised only if the frame has no other
 /// fault. The caller can then reset that stream and continue reading at the next frame, because the
 /// length in the frame header still locates it.
 pub fn read_frame(
-  buf: Bytes,
+  bytes: Bytes,
   at: Int,
   max_size: Int,
 ) -> Option<ReadResult> / {http2.violated, abort.raise} =
-  match frame_length(buf, at) {
+  match frame_length(bytes, at) {
     None -> None,
     Some(length) -> if length > max_size {
       violation(
@@ -342,13 +342,13 @@ pub fn read_frame(
         "a frame of " ++ length.to_string() ++ " octets, past the " ++ max_size.to_string()
           ++ " allowed",
       )
-    } else if buf.len() - at - 9 < length { None } else {
+    } else if bytes.len() - at - 9 < length { None } else {
       Some({
         frame: frame_of(
-          buf.at(at + 3),
-          buf.at(at + 4),
-          word(buf, at + 5) & 0x7FFF_FFFF,
-          buf.slice(at + 9, at + 9 + length),
+          bytes.at(at + 3),
+          bytes.at(at + 4),
+          word(bytes, at + 5) & 0x7FFF_FFFF,
+          bytes.slice(at + 9, at + 9 + length),
         ),
         next: at + 9 + length,
       })
@@ -1358,12 +1358,12 @@ fn write_literal(e: Encoder, f: Field) -> EncodeResult / {abort.raise} = {
     { encoder: e, block: Bytes::concat_all([integer(index, 4, 0), name, value]) }
   } else {
     let ev = insert_entry(e.table, f);
-    let kept = forget_evicted(e, ev);
+    let pruned_encoder = forget_evicted(e, ev);
     {
       encoder: {
-        ..kept,
-        fields: kept.fields.insert(f, ev.table.newest),
-        names: kept.names.insert(f.name, ev.table.newest),
+        ..pruned_encoder,
+        fields: pruned_encoder.fields.insert(f, ev.table.newest),
+        names: pruned_encoder.names.insert(f.name, ev.table.newest),
       },
       block: Bytes::concat_all([integer(index, 6, 0x40), name, value]),
     }
@@ -1790,8 +1790,9 @@ fn recv_target(k: ConnectionState) -> Int =
   if k.acked { k.limits.initial_window } else { max(default_window(), k.limits.initial_window) }
 
 fn remember_closed(closed: Map<Int, Bool>, s: Int, by_us: Bool, most: Int) -> Map<Int, Bool> = {
-  let kept = closed.insert(s, by_us);
-  if kept.len() <= most { kept } else { match kept.pop_first() { Some(p) -> p.rest, None -> kept } }
+  let updated_closed = closed.insert(s, by_us);
+  if updated_closed.len() <= most { updated_closed }
+  else { match updated_closed.pop_first() { Some(p) -> p.rest, None -> updated_closed } }
 }
 
 fn drop_stream(k: ConnectionState, st: Stream, by_us: Bool, t: Int) -> ConnectionState = {
@@ -1869,10 +1870,10 @@ pub fn receive(c: Connection, data: Bytes, now: Instant) -> ReceiveResult / {abo
     report({ ..k, held: k.held.push(data), pending_size: size })
   } else {
     let t = ms(now);
-    let buf = Bytes::concat_all(k.held.push(data));
+    let bytes = Bytes::concat_all(k.held.push(data));
     report(
       send_pending_data(
-        if k.started { framed_input(k, buf, t) } else { read_preface(k, buf, t) },
+        if k.started { framed_input(k, bytes, t) } else { read_preface(k, bytes, t) },
         t,
       ),
     )
@@ -1890,20 +1891,20 @@ fn report(k: ConnectionState) -> ReceiveResult =
       }),
   }
 
-fn read_preface(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
-  let n = min(buf.len(), preface().len());
-  if buf.slice(0, n) != preface().slice(0, n) {
+fn read_preface(k: ConnectionState, bytes: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
+  let n = min(bytes.len(), preface().len());
+  if bytes.slice(0, n) != preface().slice(0, n) {
     close_with_error(k, ProtocolError, "the connection does not open with the HTTP/2 preface")
-  } else if n < preface().len() { { ..k, held: [buf], pending_size: buf.len() } }
-  else { framed_input({ ..k, started: true }, buf.slice(n, buf.len()), t) }
+  } else if n < preface().len() { { ..k, held: [bytes], pending_size: bytes.len() } }
+  else { framed_input({ ..k, started: true }, bytes.slice(n, bytes.len()), t) }
 }
 
 type Scan = { k: ConnectionState, at: Int }
 
-fn framed_input(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
-  let done = iterate({ k: k, at: 0 }, buf.len() / 9 + 2, |r: Scan|
+fn framed_input(k: ConnectionState, bytes: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
+  let done = iterate({ k: k, at: 0 }, bytes.len() / 9 + 2, |r: Scan|
     if r.k.over { Stop(r) } else {
-      match frame_length(buf, r.at) {
+      match frame_length(bytes, r.at) {
         None -> Stop(r),
         Some(length) -> if length > r.k.limits.max_frame_size {
           Stop({
@@ -1916,12 +1917,12 @@ fn framed_input(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {ab
                 ++ " allowed",
             ),
           })
-        } else if buf.len() - r.at - 9 < length { Stop(r) }
-        else { Continue({ k: one_frame(r.k, buf, r.at, t), at: r.at + 9 + length }) },
+        } else if bytes.len() - r.at - 9 < length { Stop(r) }
+        else { Continue({ k: one_frame(r.k, bytes, r.at, t), at: r.at + 9 + length }) },
       }
     });
   if done.k.over { done.k } else {
-    let rest = buf.slice(done.at, buf.len());
+    let rest = bytes.slice(done.at, bytes.len());
     {
       ..done.k,
       held: [rest],
@@ -1931,27 +1932,27 @@ fn framed_input(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {ab
   }
 }
 
-fn one_frame(k: ConnectionState, buf: Bytes, at: Int, t: Int) -> ConnectionState / {abort.raise} = {
-  let kind = buf.at(at + 3);
-  let stream = word(buf, at + 5) & 0x7FFF_FFFF;
+fn one_frame(k: ConnectionState, bytes: Bytes, at: Int, t: Int) -> ConnectionState / {abort.raise} = {
+  let kind = bytes.at(at + 3);
+  let stream = word(bytes, at + 5) & 0x7FFF_FFFF;
   match k.block {
     Some(b) -> if kind != 9 || stream != b.stream {
       close_with_error(k, ProtocolError, "a field block interrupted before its END_HEADERS")
-    } else { handle_frame(k, buf, at, t) },
-    None -> if !k.greeted && (kind != 4 || buf.at(at + 4) & 0x1 != 0) {
+    } else { handle_frame(k, bytes, at, t) },
+    None -> if !k.greeted && (kind != 4 || bytes.at(at + 4) & 0x1 != 0) {
       close_with_error(k, ProtocolError, "a connection whose first frame is not SETTINGS")
-    } else { handle_frame(k, buf, at, t) },
+    } else { handle_frame(k, bytes, at, t) },
   }
 }
 
 fn handle_frame(
   k: ConnectionState,
-  buf: Bytes,
+  bytes: Bytes,
   at: Int,
   t: Int,
 ) -> ConnectionState / {abort.raise} =
   match try {
-      match read_frame(buf, at, k.limits.max_frame_size) {
+      match read_frame(bytes, at, k.limits.max_frame_size) {
         None -> k,
         Some(r) -> on_frame(k, r.frame, t),
       }
@@ -2484,10 +2485,10 @@ fn on_goaway(
     |accumulator: ConnectionState, st: Stream|
       event(drop_stream(accumulator, st, false, t), Reset({ stream: st.id, code: RefusedStream })),
   );
-  let told = event(refused_ones, GoingAway({ last_stream: bound, code: code, debug: debug }));
-  if code == NoError { told } else {
+  let going_away = event(refused_ones, GoingAway({ last_stream: bound, code: code, debug: debug }));
+  if code == NoError { going_away } else {
     event(
-      { ..told, over: true, held: [], pending_size: 0, block: None },
+      { ..going_away, over: true, held: [], pending_size: 0, block: None },
       Closed({ code: code, reason: "the peer's GOAWAY: " ++ String::of_bytes_lossy(debug) }),
     )
   }
@@ -2965,8 +2966,8 @@ pub fn give(
   let k = state_of(c);
   match k.streams.get(stream) {
     Some(st) -> if !st.more || k.over { c } else {
-      let held = if st.sent == 0 { st.out } else { st.out.slice(st.sent, st.out.len()) };
-      let fed = { ..st, out: held.concat(piece), sent: 0, more: !last };
+      let unsent = if st.sent == 0 { st.out } else { st.out.slice(st.sent, st.out.len()) };
+      let fed = { ..st, out: unsent.concat(piece), sent: 0, more: !last };
       Connection(
         send_pending_data(store_stream({ ..k, buffered: k.buffered + piece.len() }, fed), ms(now)),
       )
@@ -4740,12 +4741,12 @@ fn carried(
       Stop({ ..x, client: c.connection, server: s.connection, to_server: up, to_client: down })
     } else {
       let n = piece(cuts, x.step, up.len());
-      let heard = receive(s.connection, up.slice(0, n), at(x.step + 1));
+      let server_result = receive(s.connection, up.slice(0, n), at(x.step + 1));
       let m = piece(cuts, x.step + 1, down.len());
       let back = receive(c.connection, down.slice(0, m), at(x.step + 1));
       Continue({
         client: back.connection,
-        server: returned_all(heard.connection, heard.events, app, x.step + 1),
+        server: returned_all(server_result.connection, server_result.events, app, x.step + 1),
         to_server: up.slice(n, up.len()),
         to_client: down.slice(m, down.len()),
         events: x.events.concat(back.events),
@@ -4828,7 +4829,7 @@ test "a client learns which of its streams a GOAWAY left unprocessed, and opens 
     asking("GET", "/b", b""),
   ]);
   let c = take_output(opened_two.client);
-  let told = receive(
+  let received = receive(
     c.connection,
     wire([
       SettingsFrame({ ack: false, settings: [] }),
@@ -4836,8 +4837,8 @@ test "a client learns which of its streams a GOAWAY left unprocessed, and opens 
     ]),
     at(1),
   );
-  assert_eq(results(told.events), [(3, 0 - 1, "REFUSED_STREAM")]);
-  assert_eq(request(told.connection, asking("GET", "/c", b""), at(2)) == None, true)
+  assert_eq(results(received.events), [(3, 0 - 1, "REFUSED_STREAM")]);
+  assert_eq(request(received.connection, asking("GET", "/c", b""), at(2)) == None, true)
 }
 
 fn response_of_size(r: Request) -> Response / {abort.raise} =
@@ -4945,8 +4946,8 @@ fn multiplexed(
   if fuel <= 0 || results(e.events).len() >= 2 { e } else {
     let c = take_output(e.client);
     let s = take_output(e.server);
-    let heard = receive(s.connection, c.bytes, at(1));
-    spawned(heard.events, inbox);
+    let server_result = receive(s.connection, c.bytes, at(1));
+    spawned(server_result.events, inbox);
     let back = receive(c.connection, s.bytes, at(1));
     let quiet = c.bytes.len() == 0 && s.bytes.len() == 0;
     let ready = match task.select([(inbox, None)], quiet) {
@@ -4954,8 +4955,8 @@ fn multiplexed(
       _ -> None,
     };
     let server_now = match ready {
-      Some((stream, r)) -> respond(heard.connection, stream, r, at(1)),
-      None -> heard.connection,
+      Some((stream, r)) -> respond(server_result.connection, stream, r, at(1)),
+      None -> server_result.connection,
     };
     multiplexed(
       { ..e, client: back.connection, server: server_now, events: e.events.concat(back.events) },

@@ -68,7 +68,8 @@ type Walk = {
 
 fn walk_of(resolved: Resolution, index: Int) -> Walk =
   {
-    find: |namespace: Namespace, qname: QName| find(resolved, index, namespace, qname),
+    find: |namespace: Namespace, qualified_name: QName|
+      find(resolved, index, namespace, qualified_name),
     module_named: |name: Bytes|
       match find_module_binding(resolved.scopes.get(index).modules, name) {
         Some(m) -> Some(m.target),
@@ -151,14 +152,14 @@ fn binder(w: Walk, name: Identifier, shorthand: Bool, again: Bool) -> Walk / {ab
 
 fn bare(name: Identifier) -> QName = { module: None, name: name, span: name.span }
 
-fn definition(w: Walk, namespace: Namespace, qname: QName) -> Refers / {abort.raise} =
-  match (w.find)(namespace, qname) {
+fn definition(w: Walk, namespace: Namespace, qualified_name: QName) -> Refers / {abort.raise} =
+  match (w.find)(namespace, qualified_name) {
     Some(b) -> Definition({ qualified: b.qualified, namespace: namespace }),
     None -> Unbound,
   }
 
-fn qualifier(w: Walk, qname: QName) -> Walk / {abort.raise} =
-  match qname.module {
+fn qualifier(w: Walk, qualified_name: QName) -> Walk / {abort.raise} =
+  match qualified_name.module {
     None -> w,
     Some(q) -> match (w.module_named)(q.name) {
       Some(m) -> record_reference(w, q, ModuleQualifier(m), false),
@@ -169,15 +170,15 @@ fn qualifier(w: Walk, qname: QName) -> Walk / {abort.raise} =
     },
   }
 
-fn value_named(w: Walk, qname: QName, shorthand: Bool) -> Walk / {abort.raise} = {
-  let refers = match qname.module {
-    None -> match find_local(w, qname.name.name) {
+fn value_named(w: Walk, qualified_name: QName, shorthand: Bool) -> Walk / {abort.raise} = {
+  let refers = match qualified_name.module {
+    None -> match find_local(w, qualified_name.name.name) {
       Some(r) -> r,
-      None -> definition(w, ValueSpace, qname),
+      None -> definition(w, ValueSpace, qualified_name),
     },
-    Some(_) -> definition(w, ValueSpace, qname),
+    Some(_) -> definition(w, ValueSpace, qualified_name),
   };
-  record_reference(qualifier(w, qname), qname.name, refers, shorthand)
+  record_reference(qualifier(w, qualified_name), qualified_name.name, refers, shorthand)
 }
 
 fn made_field(name: Identifier, at: Span) -> Bool =
@@ -203,17 +204,22 @@ fn walk_fields(w: Walk, fields: List<RecordLiteralField>, of: FieldOf) -> Walk /
         ),
     })
 
-fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
-  record_reference(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
+fn named_in(w: Walk, namespace: Namespace, qualified_name: QName) -> Walk / {abort.raise} =
+  record_reference(
+    qualifier(w, qualified_name),
+    qualified_name.name,
+    definition(w, namespace, qualified_name),
+    false,
+  )
 
 fn effect_of(w: Walk, eff: QName) -> Bytes / {abort.raise} =
   match (w.find)(EffectSpace, eff) { Some(b) -> b.qualified, None -> eff.name.name }
 
-fn operation(w: Walk, eff: QName, op: Identifier) -> Walk / {abort.raise} =
+fn operation(w: Walk, eff: QName, operation_name: Identifier) -> Walk / {abort.raise} =
   record_reference(
     named_in(w, EffectSpace, eff),
-    op,
-    Operation({ effect: effect_of(w, eff), name: op.name }),
+    operation_name,
+    Operation({ effect: effect_of(w, eff), name: operation_name.name }),
     false,
   )
 
@@ -253,7 +259,7 @@ fn walk_effect_list(
   sets.fold(
     effects.fold(w, |accumulator: Walk, a: EffectExpression|
       match a.op {
-        Some(op) -> operation(accumulator, a.effect_name, op),
+        Some(operation_name) -> operation(accumulator, a.effect_name, operation_name),
         None -> named_in(accumulator, EffectSpace, a.effect_name),
       }),
     |accumulator: Walk, set: QName| named_in(accumulator, SetSpace, set),
@@ -365,12 +371,19 @@ fn walk_statement(w: Walk, s: Statement) -> Walk / {abort.raise} =
       ),
   }
 
-fn in_scope(w: Walk, vars: List<HandlerVar>) -> Walk / {abort.raise} =
-  vars.fold(pushed(w), |accumulator: Walk, v: HandlerVar|
+fn in_scope(w: Walk, handler_variables: List<HandlerVar>) -> Walk / {abort.raise} =
+  handler_variables.fold(pushed(w), |accumulator: Walk, v: HandlerVar|
     scoped(accumulator, v.name.name, Local(v.name.span.site)))
 
-fn walk_clause(w: Walk, vars: List<HandlerVar>, c: HandleClause) -> Walk / {abort.raise} = {
-  let with_params = c.params.fold(in_scope(operation(w, c.effect_name, c.op), vars), bound);
+fn walk_clause(
+  w: Walk,
+  handler_variables: List<HandlerVar>,
+  c: HandleClause,
+) -> Walk / {abort.raise} = {
+  let with_params = c.params.fold(
+    in_scope(operation(w, c.effect_name, c.op), handler_variables),
+    bound,
+  );
   let with_label = match c.label_binder { Some(l) -> bound(with_params, l), None -> with_params };
   let with_resume = match c.resume { Some(k) -> bound(with_label, k), None -> with_label };
   popped(walk_expression(with_resume, c.body))
@@ -525,15 +538,18 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
       let qualified = effect_of(w, bare(eff.name));
       eff.operations.fold(
         named_in(w, EffectSpace, bare(eff.name)),
-        |accumulator: Walk, op: OpDefinition| {
+        |accumulator: Walk, operation_definition: OpDefinition| {
           let declared = record_reference(
             accumulator,
-            op.name,
-            Operation({ effect: qualified, name: op.name.name }),
+            operation_definition.name,
+            Operation({ effect: qualified, name: operation_definition.name.name }),
             false,
           );
-          let typed = walk_type(op.params.fold(declared, walk_type), op.ret);
-          popped(op.param_names.fold(pushed(typed), bound))
+          let typed = walk_type(
+            operation_definition.params.fold(declared, walk_type),
+            operation_definition.ret,
+          );
+          popped(operation_definition.param_names.fold(pushed(typed), bound))
         },
       )
     },

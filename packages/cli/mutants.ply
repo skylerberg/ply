@@ -149,15 +149,15 @@ fn is_digit_or_underscore(c: Int) -> Bool = (c >= 48 && c <= 57) || c == 95
 
 fn is_word(c: Int) -> Bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
 
-fn plain_decimal(src: Bytes, t: Token) -> Bool / {abort.raise} = {
+fn plain_decimal(source: Bytes, t: Token) -> Bool / {abort.raise} = {
   let digits = range(t.start, t.end).fold(true, |ok: Bool, i: Int|
-    ok && is_digit_or_underscore(src.at(i)));
-  let after = if t.end < src.len() { src.at(t.end) } else { 0 };
+    ok && is_digit_or_underscore(source.at(i)));
+  let after = if t.end < source.len() { source.at(t.end) } else { 0 };
   digits && !is_word(after) && after != 46
 }
 
-pub fn mutation_sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> / {abort.raise} = {
-  let tokens = lex(src).tokens;
+pub fn mutation_sites(source: Bytes) -> List<{ start: Int, end: Int, to: String }> / {abort.raise} = {
+  let tokens = lex(source).tokens;
   range(0, tokens.len()).fold(
     [],
     |accumulator: List<{ start: Int, end: Int, to: String }>, i: Int|
@@ -173,7 +173,7 @@ pub fn mutation_sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> 
             Keyword(k) -> if k == b"true" { site("false") }
             else if k == b"false" { site("true") }
             else { accumulator },
-            IntLiteral(n) -> if !plain_decimal(src, t) { accumulator } else {
+            IntLiteral(n) -> if !plain_decimal(source, t) { accumulator } else {
               match checked_add(n, 1) { Some(m) -> site(m.to_string()), None -> accumulator }
             },
             _ -> accumulator,
@@ -191,12 +191,12 @@ pub fn mutations(
     None -> [],
     Some(place) -> {
       let start = definition_info.at.span.start;
-      let src = place.text.slice(start, definition_info.at.span.end);
-      mutation_sites(src).map(|s: { start: Int, end: Int, to: String }|
+      let definition_source = place.text.slice(start, definition_info.at.span.end);
+      mutation_sites(definition_source).map(|s: { start: Int, end: Int, to: String }|
         {
           definition: String::of_bytes_lossy(definition_info.name),
           at: { module: definition_info.at.module, start: start + s.start, end: start + s.end },
-          original: String::of_bytes_lossy(src.slice(s.start, s.end)),
+          original: String::of_bytes_lossy(definition_source.slice(s.start, s.end)),
           replacement: s.to,
         })
     },
@@ -224,13 +224,16 @@ pub fn mutation_queue(
           unreached: accumulator.unreached.push(String::of_bytes_lossy(definition_info.name)),
         }
       } else {
-        let held = match accumulator.by_cost.get(tests.len()) { Some(xs) -> xs, None -> [] };
+        let existing_mutations = match accumulator.by_cost.get(tests.len()) {
+          Some(xs) -> xs,
+          None -> [],
+        };
         {
           ..accumulator,
           by_cost: accumulator.by_cost.insert(
             tests.len(),
             mutations(places, definition_info).fold(
-              held,
+              existing_mutations,
               |into: List<{ tests: List<Int>, mutation: Mutation }>, m: Mutation|
                 into.push({ tests: tests, mutation: m }),
             ),
@@ -279,8 +282,8 @@ fn spliced_packages(
     |accumulator: { at: Int, out: List<SuppliedPackage> }, supplied: SuppliedPackage| {
       let modules = range(0, supplied.modules.len()).map(|j: Int|
         match ((supplied.modules.at(j), places.at(accumulator.at + j))) {
-          (Some(src), Some(place)) -> { name: src.name, src: place.text },
-          (Some(src), None) -> src,
+          (Some(supplied_module), Some(place)) -> { name: supplied_module.name, src: place.text },
+          (Some(supplied_module), None) -> supplied_module,
           _ -> { name: b"", src: b"" },
         });
       {
@@ -361,7 +364,7 @@ pub fn mutants(
   places: List<SourceText>,
   analysis: CheckedProgram,
   q: Queue,
-  judged: List<MutantVerdict>,
+  verdicts: List<MutantVerdict>,
   budget_spent: Bool,
 ) -> MutationReport / {abort.raise} = {
   let keys = analysis.checked.tests.fold(
@@ -369,7 +372,7 @@ pub fn mutants(
     |accumulator: Map<Int, String>, test_info: TestInfo|
       accumulator.insert(test_info.index, String::of_bytes_lossy(test_info.key)),
   );
-  let rows = judged.fold(
+  let rows = verdicts.fold(
     [],
     |accumulator: List<{ judged: MutantVerdict, mutation: Mutation, tests: List<String> }>, j: MutantVerdict|
       match q.mutants.at(j.id) {
@@ -383,13 +386,13 @@ pub fn mutants(
           }),
       },
   );
-  let said = |verdict: String|
+  let with_verdict = |verdict: String|
     rows.filter(|r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
       r.judged.verdict == verdict);
-  let killed = said("killed").len();
-  let survived = said("survived").len();
-  let skipped = said("skipped").len();
-  let unresolved = said("unresolved").len();
+  let killed = with_verdict("killed").len();
+  let survived = with_verdict("survived").len();
+  let skipped = with_verdict("skipped").len();
+  let unresolved = with_verdict("unresolved").len();
   let entry = |r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
     mutation_json(
       places,
@@ -404,7 +407,7 @@ pub fn mutants(
     skipped: skipped + unresolved,
     budget_spent: budget_spent,
     unreached: q.unreached,
-    survivors: said("survived").map(
+    survivors: with_verdict("survived").map(
       |r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
         {
           definition: r.mutation.definition,
@@ -423,7 +426,7 @@ pub fn mutants(
       { key: "unresolved", value: int(unresolved) },
       { key: "budget_spent", value: Bool(budget_spent) },
       { key: "unreached", value: Array(q.unreached.map(|n: String| Str(n))) },
-      { key: "survivors", value: Array(said("survived").map(entry)) },
+      { key: "survivors", value: Array(with_verdict("survived").map(entry)) },
       {
         key: "skips",
         value: Array(
@@ -473,9 +476,9 @@ pub fn coverage(analysis: CheckedProgram) -> Coverage / {abort.raise} = {
   }
 }
 
-fn changes(src: String) -> List<String> / {abort.raise} =
-  mutation_sites(Bytes::of_string(src)).map(|s: { start: Int, end: Int, to: String }|
-    String::of_bytes_lossy(Bytes::of_string(src).slice(s.start, s.end)) ++ "->" ++ s.to)
+fn changes(source: String) -> List<String> / {abort.raise} =
+  mutation_sites(Bytes::of_string(source)).map(|s: { start: Int, end: Int, to: String }|
+    String::of_bytes_lossy(Bytes::of_string(source).slice(s.start, s.end)) ++ "->" ++ s.to)
 
 test "`changes` lists a mutation for each operator and literal, and none for an arrow, a concatenation or the contents of a string" {
   assert_eq(changes("fn f(a: Int) -> Int = a + 1 - 2"), ["+->-", "1->2", "-->+", "2->3"]);

@@ -82,7 +82,7 @@ pub fn with_released(
       Map::new(),
       |m: Map<Bytes, Effects>, ty: Bytes, by: Bytes|
         match scheme_of(by) {
-          Some(sc) -> match sc.ty {
+          Some(scheme) -> match scheme.ty {
             FunctionType(f) -> m.insert(ty, { listed: f.effects.listed, variable: None }),
             _ -> m,
           },
@@ -299,9 +299,12 @@ fn unstorable_sums(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, Unstora
       }
     });
   let users_of = |n: Bytes| match users.get(n) { Some(xs) -> xs, None -> [] };
-  let asks = sums.fold(1 + sums.len(), |b: Int, name: Bytes, cs: List<SumConstructor>|
-    b + (2 + (match cs.at(0) { Some(c) -> c.params.len(), None -> 0 })) * users_of(name).len());
-  range(0, asks).fold(
+  let iteration_limit = sums.fold(
+    1 + sums.len(),
+    |b: Int, name: Bytes, cs: List<SumConstructor>|
+      b + (2 + (match cs.at(0) { Some(c) -> c.params.len(), None -> 0 })) * users_of(name).len(),
+  );
+  range(0, iteration_limit).fold(
     { known: start, todo: sums.keys() },
     |w: { known: Map<Bytes, Unstorable>, todo: List<Bytes> }, _: Int|
       match w.todo {
@@ -338,29 +341,30 @@ pub fn type_names(ty: Type) -> List<Bytes> =
 
 fn recursive_groups(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, RecursiveGroup> = {
   let inline = params_in_place(sums);
-  let holds = |cs: List<SumConstructor>|
+  let inner_sums = |cs: List<SumConstructor>|
     cs.fold([], |accumulator: List<Bytes>, c: SumConstructor|
       c.fields.fold(accumulator, |a: List<Bytes>, f: Type|
         inline_sums(sums, inline, f).fold(a, |b: List<Bytes>, n: Bytes|
           if b.contains(n) { b } else { b.push(n) })));
-  let held = sums.fold(
+  let inner_sums_by_name = sums.fold(
     Map::new(),
-    |m: Map<Bytes, List<Bytes>>, name: Bytes, cs: List<SumConstructor>| m.insert(name, holds(cs)),
+    |m: Map<Bytes, List<Bytes>>, name: Bytes, cs: List<SumConstructor>|
+      m.insert(name, inner_sums(cs)),
   );
-  let cyclic = on_cycles(held);
+  let cyclic = on_cycles(inner_sums_by_name);
   let within = cyclic.fold(Map::new(), |m: Map<Bytes, List<Bytes>>, n: Bytes|
-    m.insert(n, match held.get(n) {
+    m.insert(n, match inner_sums_by_name.get(n) {
       Some(hs) -> hs.filter(|h: Bytes| cyclic.contains(h)),
       None -> [],
     }));
   let steps = within.fold(0, |n: Int, _: Bytes, hs: List<Bytes>| n + hs.len());
   let reach = cyclic.fold(Map::new(), |m: Map<Bytes, Map<Bytes, Bool>>, n: Bytes|
     m.insert(n, reached(within, n, 2 * steps + 1)));
-  let reaches = |from: Bytes, to: Bytes|
+  let is_reachable = |from: Bytes, to: Bytes|
     match reach.get(from) { Some(r) -> r.contains(to), None -> false };
   cyclic.fold(Map::new(), |m: Map<Bytes, RecursiveGroup>, n: Bytes|
-    if !reaches(n, n) { m } else {
-      let group = cyclic.filter(|y: Bytes| reaches(n, y) && reaches(y, n));
+    if !is_reachable(n, n) { m } else {
+      let group = cyclic.filter(|y: Bytes| is_reachable(n, y) && is_reachable(y, n));
       m.insert(n, {
         group: group,
         indirect: match sums.get(n) {
@@ -384,9 +388,9 @@ fn params_in_place(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, List<In
   );
   let rounds = generic.fold(1, |n: Int, g: { name: Bytes, classes: List<SumConstructor> }|
     n + (match g.classes.at(0) { Some(c) -> c.params.len(), None -> 0 }));
-  range(0, rounds).fold(Map::new(), |held: Map<Bytes, List<Int>>, _: Int|
+  range(0, rounds).fold(Map::new(), |in_place_parameters: Map<Bytes, List<Int>>, _: Int|
     generic.fold(
-      held,
+      in_place_parameters,
       |accumulator: Map<Bytes, List<Int>>, g: { name: Bytes, classes: List<SumConstructor> }|
         accumulator.insert(
           g.name,
@@ -399,16 +403,16 @@ fn params_in_place(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, List<In
     ))
 }
 
-fn variables_in_place(held: Map<Bytes, List<Int>>, ty: Type) -> List<Int> =
+fn variables_in_place(in_place_parameters: Map<Bytes, List<Int>>, ty: Type) -> List<Int> =
   match ty {
     VariableType(v) -> [v],
     RecordType(fs) ->
       fs.fold([], |accumulator: List<Int>, f: Field|
-        accumulator.concat(variables_in_place(held, f.ty))),
+        accumulator.concat(variables_in_place(in_place_parameters, f.ty))),
     NominalType(x) ->
       x.fields.fold([], |accumulator: List<Int>, f: Field|
-        accumulator.concat(variables_in_place(held, f.ty))),
-    NamedType(c) -> match held.get(c.name) {
+        accumulator.concat(variables_in_place(in_place_parameters, f.ty))),
+    NamedType(c) -> match in_place_parameters.get(c.name) {
       Some(ps) ->
         c.args.fold(
           { at: 0, vars: [] },
@@ -416,7 +420,7 @@ fn variables_in_place(held: Map<Bytes, List<Int>>, ty: Type) -> List<Int> =
             {
               at: accumulator.at + 1,
               vars: if ps.contains(accumulator.at) {
-                accumulator.vars.concat(variables_in_place(held, a))
+                accumulator.vars.concat(variables_in_place(in_place_parameters, a))
               } else { accumulator.vars },
             },
         ).vars,
@@ -454,13 +458,16 @@ fn inline_sums(
     },
   }
 
-fn on_cycles(held: Map<Bytes, List<Bytes>>) -> List<Bytes> = {
-  let names = held.fold([], |accumulator: List<Bytes>, n: Bytes, _: List<Bytes>|
+fn on_cycles(inner_sums: Map<Bytes, List<Bytes>>) -> List<Bytes> = {
+  let names = inner_sums.fold([], |accumulator: List<Bytes>, n: Bytes, _: List<Bytes>|
     accumulator.push(n));
-  let holders = held.fold(Map::new(), |m: Map<Bytes, List<Bytes>>, n: Bytes, hs: List<Bytes>|
-    hs.fold(m, |k: Map<Bytes, List<Bytes>>, h: Bytes|
-      k.insert(h, match k.get(h) { Some(ns) -> ns.push(n), None -> [n] })));
-  let open = held.fold(Map::new(), |m: Map<Bytes, Int>, n: Bytes, hs: List<Bytes>|
+  let holders = inner_sums.fold(
+    Map::new(),
+    |m: Map<Bytes, List<Bytes>>, n: Bytes, hs: List<Bytes>|
+      hs.fold(m, |k: Map<Bytes, List<Bytes>>, h: Bytes|
+        k.insert(h, match k.get(h) { Some(ns) -> ns.push(n), None -> [n] })),
+  );
+  let open = inner_sums.fold(Map::new(), |m: Map<Bytes, Int>, n: Bytes, hs: List<Bytes>|
     m.insert(n, hs.len()));
   let ended = range(0, names.len()).fold(
     { open: open, ended: names.filter(|n: Bytes| open.get(n) == Some(0)), at: 0 },
@@ -486,8 +493,8 @@ fn on_cycles(held: Map<Bytes, List<Bytes>>) -> List<Bytes> = {
   names.filter(|n: Bytes| match ended.open.get(n) { Some(k) -> k > 0, None -> false })
 }
 
-fn reached(held: Map<Bytes, List<Bytes>>, from: Bytes, bound: Int) -> Map<Bytes, Bool> = {
-  let next = |n: Bytes| match held.get(n) { Some(hs) -> hs, None -> [] };
+fn reached(inner_sums: Map<Bytes, List<Bytes>>, from: Bytes, bound: Int) -> Map<Bytes, Bool> = {
+  let next = |n: Bytes| match inner_sums.get(n) { Some(hs) -> hs, None -> [] };
   range(0, bound).fold(
     { seen: Map::new(), todo: next(from), at: 0 },
     |s: { seen: Map<Bytes, Bool>, todo: List<Bytes>, at: Int }, _: Int|
@@ -860,8 +867,8 @@ fn sum_within(
   open: Bool,
   depth: Int,
 ) -> Option<SumLayout> = {
-  let rec = constructors.recursive.get(c.name);
-  let group = match rec {
+  let recursive_group = constructors.recursive.get(c.name);
+  let group = match recursive_group {
     Some(r) ->
       r.group.fold(cut, |accumulator: List<Bytes>, g: Bytes|
         if accumulator.contains(g) { accumulator } else { accumulator.push(g) }),
@@ -871,7 +878,10 @@ fn sum_within(
     match accumulator {
       None -> None,
       Some(done) -> {
-        let boxed = match rec { Some(r) -> r.indirect.at(done.len()) == Some(true), None -> false };
+        let boxed = match recursive_group {
+          Some(r) -> r.indirect.at(done.len()) == Some(true),
+          None -> false,
+        };
         let args = if boxed && !open { Some(PlainWords([])) } else {
           all_known(
             constructor_fields_at(k, c.args).map(|t: Type|
@@ -907,8 +917,8 @@ fn variables_within(
       NamedType(c) -> match constructors.sums.get(c.name) {
         None -> [],
         Some(cs) -> {
-          let rec = constructors.recursive.get(c.name);
-          let inside = match rec {
+          let recursive_group = constructors.recursive.get(c.name);
+          let inside = match recursive_group {
             Some(r) ->
               r.group.fold(cut, |accumulator: List<Bytes>, g: Bytes|
                 if accumulator.contains(g) { accumulator } else { accumulator.push(g) }),
@@ -917,7 +927,7 @@ fn variables_within(
           cs.fold(
             { at: 0, vars: [] },
             |accumulator: { at: Int, vars: List<Int> }, k: SumConstructor| {
-              let boxed = match rec {
+              let boxed = match recursive_group {
                 Some(r) -> r.indirect.at(accumulator.at) == Some(true),
                 None -> false,
               };
@@ -980,9 +990,9 @@ fn key_within(constructors: Constructors, ty: Type, depth: Int) -> Bytes / {abor
       NominalType(x) -> fields_key(x.fields),
       NamedType(c) -> match constructors.sums.get(c.name) {
         Some(cs) -> {
-          let rec = constructors.recursive.get(c.name);
+          let recursive_group = constructors.recursive.get(c.name);
           let cases = cs.fold([], |accumulator: List<Bytes>, k: SumConstructor| {
-            let boxed = match rec {
+            let boxed = match recursive_group {
               Some(r) -> r.indirect.at(accumulator.len()) == Some(true),
               None -> false,
             };
@@ -1009,7 +1019,7 @@ fn key_within(constructors: Constructors, ty: Type, depth: Int) -> Bytes / {abor
 pub fn word_form(constructors: Constructors, ty: Type) -> WordForm / {abort.raise} = {
   let l = layout_of(constructors, ty);
   let n = words(l);
-  let held = match l {
+  let layout_form = match l {
     SumCases(s) -> if layout::raw_sum(s) { Bits } else if n <= 1 { Itself } else { Box(n) },
     _ -> if n <= 1 { Itself } else { Box(n) },
   };
@@ -1017,15 +1027,15 @@ pub fn word_form(constructors: Constructors, ty: Type) -> WordForm / {abort.rais
   match ty {
     RecordType(_) -> record,
     NominalType(_) -> record,
-    NamedType(c) -> if constructors.sums.contains(c.name) { held }
+    NamedType(c) -> if constructors.sums.contains(c.name) { layout_form }
     else if is_int(ty) || is_bool(ty) || is_float(ty) { Bits }
     else if is_decimal(ty) { RuntimeBox } else {
       match width_named(c.name) {
         Some(w) -> if in_register(w) { Bits } else { RuntimeBox },
-        None -> held,
+        None -> layout_form,
       }
     },
-    _ -> held,
+    _ -> layout_form,
   }
 }
 
@@ -1137,15 +1147,15 @@ pub fn definition_entry(
 ) -> Definition = {
   let full = qualify(module, d.name.name);
   let sig = sig_of(schemes, full);
-  let ret = match sig { Some(s) -> Some(kind_of(s.ret)), None -> None };
+  let return_shape = match sig { Some(s) -> Some(kind_of(s.ret)), None -> None };
   let witnesses = d.constraints.fold([], |accumulator: List<Bytes>, c: Constraint|
     if !is_predicate(c.deriver) || accumulator.contains(c.param.name) { accumulator }
     else { accumulator.push(c.param.name) }).len(
   );
   {
     name: d.name.name,
-    ret: match ret { Some(r) -> Some(r.kind), None -> None },
-    return_type: match ret { Some(r) -> r.ty, None -> OpenShape([]) },
+    ret: match return_shape { Some(r) -> Some(r.kind), None -> None },
+    return_type: match return_shape { Some(r) -> r.ty, None -> OpenShape([]) },
     pure: pure.contains(full),
     constant: d.constant != None,
     arity: witnesses + d.params.len() + d.generics.labels.len(),
@@ -1177,13 +1187,13 @@ test "a specialisation's root name includes its type arguments and the borrowed 
   );
   let u32 = [width_type({ bits: 32, signed: false })];
   let borrowed = |nth: Int| [{ param: 1, owner: Named(b"app.main"), nth: nth }];
-  let handed = root_name(specialisation_key(b"m.f", u32, borrowed(0)));
+  let borrowed_root = root_name(specialisation_key(b"m.f", u32, borrowed(0)));
   assert(
-    root_text(handed).index_of(b"app.main") != None
-      && handed != root_name(specialisation_key(b"m.f", u32, [])),
+    root_text(borrowed_root).index_of(b"app.main") != None
+      && borrowed_root != root_name(specialisation_key(b"m.f", u32, [])),
     None,
   );
-  assert(handed != root_name(specialisation_key(b"m.f", u32, borrowed(3))), None)
+  assert(borrowed_root != root_name(specialisation_key(b"m.f", u32, borrowed(3))), None)
 }
 
 fn case_of(name: Bytes, index: Int, fields: List<Type>, params: List<Int>) -> SumConstructor =
@@ -1403,9 +1413,10 @@ test "two sums laid alike share a layout key, and Option<Color> and Option<Strin
   let pointer = key(string_type());
   assert_eq([list_type(int_type()), applied(b"m.Wrap", [int_type()])].map(key), [pointer, pointer]);
   assert_eq(key(RecordType([{ name: b"s", ty: string_type() }])), b"{s:_}");
-  let rec = |b: Type| key(RecordType([{ name: b"a", ty: int_type() }, { name: b"b", ty: b }]));
-  assert_eq(rec(string_type()), rec(list_type(int_type())));
-  assert(rec(string_type()) != rec(int_type()), None);
+  let record_key = |b: Type|
+    key(RecordType([{ name: b"a", ty: int_type() }, { name: b"b", ty: b }]));
+  assert_eq(record_key(string_type()), record_key(list_type(int_type())));
+  assert(record_key(string_type()) != record_key(int_type()), None);
   let scalars = [b"Unit", b"Bool", b"Float"].map(|n: Bytes| key(named_type(n))).push(pointer);
   assert_eq(
     range(0, scalars.len()).filter(|i: Int| scalars.drop(i + 1).contains(scalars.get(i))),

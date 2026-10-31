@@ -202,8 +202,8 @@ fn rebind(state: CostState, slot: Int, owner: Owner) -> CostState =
     chain: state.chain.map(|b: Bind| if b.slot == slot { { slot: slot, owner: owner } } else { b }),
   }
 
-fn add_site(state: CostState, span: Span, op: Bytes, owner: Owner) -> CostState =
-  { ..state, sites: state.sites.push({ span: span, builtin_name: op, owner: owner }) }
+fn add_site(state: CostState, span: Span, operation: Bytes, owner: Owner) -> CostState =
+  { ..state, sites: state.sites.push({ span: span, builtin_name: operation, owner: owner }) }
 
 fn add_demand(state: CostState, d: PassedArgument) -> CostState =
   { ..state, demands: state.demands.push(d) }
@@ -242,8 +242,8 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
           l.at,
         ),
       ),
-    CodeParallel(pr) ->
-      fresh(pr.branches.fold(state, |s: CostState, b: Code| walk(env, b, s).state)),
+    CodeParallel(parallel) ->
+      fresh(parallel.branches.fold(state, |s: CostState, b: Code| walk(env, b, s).state)),
     CodeApply(a) -> app(env, c.span, a.function, a.args, state),
     CodeKnownLambda(k) -> var_owner(env, k.name, k.slot, read_moved(env.moves, c.span), state),
     CodeIf(i) -> {
@@ -252,25 +252,28 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
       { state: e.state, owner: join(t.owner, e.owner) }
     },
     CodeMatch(m) -> {
-      let sc = walk(env, m.scrutinee, state);
-      let arms = m.arms.fold({ state: sc.state, owner: None }, |accumulator: Arms, a: CodeArm| {
-        let bound = pattern_slots(a.pattern).fold(accumulator.state, |s: CostState, slot: Int|
-          bind(s, slot, sc.owner));
-        let guarded = match a.guard { Some(g) -> walk(env, g, bound).state, None -> bound };
-        let w = walk(env, a.body, guarded);
-        {
-          state: w.state,
-          owner: Some(match accumulator.owner {
-            None -> w.owner,
-            Some(prev) -> join(prev, w.owner),
-          }),
-        }
-      });
+      let scrutinee = walk(env, m.scrutinee, state);
+      let arms = m.arms.fold(
+        { state: scrutinee.state, owner: None },
+        |accumulator: Arms, a: CodeArm| {
+          let bound = pattern_slots(a.pattern).fold(accumulator.state, |s: CostState, slot: Int|
+            bind(s, slot, scrutinee.owner));
+          let guarded = match a.guard { Some(g) -> walk(env, g, bound).state, None -> bound };
+          let w = walk(env, a.body, guarded);
+          {
+            state: w.state,
+            owner: Some(match accumulator.owner {
+              None -> w.owner,
+              Some(previous_owner) -> join(previous_owner, w.owner),
+            }),
+          }
+        },
+      );
       { state: arms.state, owner: match arms.owner { Some(o) -> o, None -> FreshOwner } }
     },
     CodeBlock(b) -> {
-      let s = b.statements.fold(state, |accumulator: CostState, stmt: CodeStatement|
-        match stmt {
+      let s = b.statements.fold(state, |accumulator: CostState, statement: CodeStatement|
+        match statement {
           CodeLet(l) -> {
             let w = walk(env, l.value, accumulator);
             bind(w.state, l.slot, w.owner)
@@ -336,19 +339,19 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
         ),
       },
     CodeHandle(h) -> {
-      let caught = h.clauses.fold(state, |accumulator: CostState, cl: CodeClause|
-        mark_captured_shared(env, accumulator, cl.captures, cl.body, cl.at));
+      let caught = h.clauses.fold(state, |accumulator: CostState, clause: CodeClause|
+        mark_captured_shared(env, accumulator, clause.captures, clause.body, clause.at));
       let armed = match h.ret {
         Some(r) -> mark_captured_shared(env, caught, r.captures, r.body, r.at),
         None -> caught,
       };
       let ran = walk(env, h.body, armed).state;
-      let clauses = h.clauses.fold(ran, |accumulator: CostState, cl: CodeClause|
+      let clauses = h.clauses.fold(ran, |accumulator: CostState, clause: CodeClause|
         walk_nested_body(
           env,
-          cl.params + (if cl.resume { 1 } else { 0 }),
+          clause.params + (if clause.resume { 1 } else { 0 }),
           [],
-          cl.body,
+          clause.body,
           accumulator,
         ));
       {
@@ -477,8 +480,8 @@ fn children(c: Code) -> List<Code> =
     CodeKnownLambda(_) -> [],
     CodeIf(i) -> [i.cond, i.then_branch, i.else_branch],
     CodeBlock(b) -> {
-      let statements = b.statements.map(|stmt: CodeStatement|
-        match stmt {
+      let statements = b.statements.map(|statement: CodeStatement|
+        match statement {
           CodeLet(l) -> l.value,
           CodeLetDestructure(l) -> l.value,
           CodeDo(d) -> d.code,
@@ -493,7 +496,7 @@ fn children(c: Code) -> List<Code> =
       m.arms.fold([m.scrutinee], |accumulator: List<Code>, a: CodeArm|
         List::push(match a.guard { Some(g) -> accumulator.push(g), None -> accumulator }, a.body)),
     CodePerform(p) -> p.args,
-    CodeParallel(pr) -> pr.branches,
+    CodeParallel(parallel) -> parallel.branches,
     _ -> [],
   }
 
@@ -585,7 +588,7 @@ fn app(
     { state: w.state, owners: accumulator.owners.push(w.owner) }
   });
   let sited = match update_of(builtin, n) {
-    Some(op) -> add_site(walked.state, span, op, owner_at(walked.owners, 0)),
+    Some(operation) -> add_site(walked.state, span, operation, owner_at(walked.owners, 0)),
     None -> walked.state,
   };
   let demanded = match callee {
@@ -615,7 +618,8 @@ fn update_of(builtin: Option<Bytes>, n: Int) -> Option<Bytes> =
     None -> None,
   }
 
-fn container_name(op: Bytes) -> Bytes = if op == b"Array::set" { b"array" } else { b"list" }
+fn container_name(operation: Bytes) -> Bytes =
+  if operation == b"Array::set" { b"array" } else { b"list" }
 
 fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: List<Owner>) -> Owner =
   match builtin {
@@ -1318,7 +1322,7 @@ fn definition_of_fn(
     own: own,
     declared_return: match definition.returns {
       None -> None,
-      Some(ReturnsFresh(sp)) -> Some({ ret: FreshReturn, span: sp }),
+      Some(ReturnsFresh(return_span)) -> Some({ ret: FreshReturn, span: return_span }),
       Some(ReturnsParam(x)) ->
         Some({
           ret: ReturnOfParam(
@@ -1331,10 +1335,10 @@ fn definition_of_fn(
   }
 }
 
-fn violates(said: ReturnOwnership, got: ReturnOwnership) -> Bool =
+fn violates(declared: ReturnOwnership, got: ReturnOwnership) -> Bool =
   match got {
     FreshReturn -> false,
-    ReturnOfParam(k) -> match said { ReturnOfParam(j) -> j != k, _ -> true },
+    ReturnOfParam(k) -> match declared { ReturnOfParam(j) -> j != k, _ -> true },
     _ -> true,
   }
 
@@ -1433,7 +1437,10 @@ fn whole_program_of(p: CostInput) -> Option<WholeProgram> / {abort.raise} = {
   let tables = embed_tables(a.embeds);
   let parsed = range(0, a.modules.len()).map(|i: Int| {
     let name = a.modules.get(i).name;
-    let source = { name: name, src: match p.sources.at(i) { Some(src) -> src, None -> b"" } };
+    let source = {
+      name: name,
+      src: match p.sources.at(i) { Some(source_text) -> source_text, None -> b"" },
+    };
     let x = parse_from(
       i,
       source,
@@ -1569,7 +1576,7 @@ fn cached_body(prog: Program, i: Int, module_name: Bytes, k: CachedBody) -> Opti
   match definition {
     None -> None,
     Some(d) -> {
-      let stands = k.lookups.fold(true, |accumulator: Bool, l: CachedLookup|
+      let lookups_unchanged = k.lookups.fold(true, |accumulator: Bool, l: CachedLookup|
         accumulator
           && (match l.bound {
             None -> true,
@@ -1589,7 +1596,7 @@ fn cached_body(prog: Program, i: Int, module_name: Bytes, k: CachedBody) -> Opti
         lowered: false,
         reuse: k.reuse,
         looked: k.lookups,
-        cached_walks: if !stands { [] } else {
+        cached_walks: if !lookups_unchanged { [] } else {
           k.walks.fold([], |accumulator: List<WalkResult>, w: CachedWalk|
             match found_of(prog.index, w) { Some(f) -> accumulator.push(f), None -> accumulator })
         },
@@ -1632,7 +1639,7 @@ fn failed_run(prog: Program) -> Run =
     failed: true,
   }
 
-fn initial_run(p: CostInput, kept: List<Option<Bytes>>) -> Run / {abort.raise} = {
+fn initial_run(p: CostInput, stored_modules: List<Option<Bytes>>) -> Run / {abort.raise} = {
   let a = p.analysis;
   let definitions = definitions_of(a, p.facts);
   let base = {
@@ -1646,7 +1653,7 @@ fn initial_run(p: CostInput, kept: List<Option<Bytes>>) -> Run / {abort.raise} =
   };
   let container_name = range(0, a.modules.len()).map(|i: Int|
     if !own_module(a, i) { None } else {
-      match kept.at(i) {
+      match stored_modules.at(i) {
         Some(Some(bytes)) -> cached_bodies(base, i, a.modules.get(i).name, bytes),
         _ -> None,
       }
@@ -1782,7 +1789,7 @@ pub type Costing = {
   lowered: Int,
 }
 
-pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
+pub fn costs(p: CostInput, stored_modules: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
   let n = p.analysis.modules.len();
   let rejected = {
     report: { ok: false, rounds: 0, definitions: [], return_mismatches: [] },
@@ -1790,7 +1797,7 @@ pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.r
     walked_modules: 0,
     lowered: 0,
   };
-  let start = initial_run(p, kept);
+  let start = initial_run(p, stored_modules);
   let tables = start_tables(start.prog.definitions);
   let first = evaluate(p, start, |_: Int| true, tables);
   if first.failed { rejected } else {
@@ -1885,7 +1892,7 @@ pub fn cost_keys(p: CostInput, identity: Bytes) -> List<Bytes> / {abort.raise} =
             head,
             m.name,
             b"\x00",
-            blake3(match p.sources.at(i) { Some(src) -> src, None -> b"" }),
+            blake3(match p.sources.at(i) { Some(source) -> source, None -> b"" }),
             b"\x00",
             match embeds.get(m.name) { Some(e) -> e, None -> b"" },
             b"\x00",
@@ -1992,8 +1999,8 @@ fn reported(
 ) -> Report / {abort.raise} = costs(checked_cost_input(names, sources, module_packages)).report
 
 test "a cost report gives each update's source location, whether it copies or reuses, the reason, and an edit that would avoid the copy" {
-  let src = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match m.get(0) { Some(xs) -> xs.push(n), None -> [] }\n";
-  let r = reported([b"m"], [src]);
+  let source = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match m.get(0) { Some(xs) -> xs.push(n), None -> [] }\n";
+  let r = reported([b"m"], [source]);
   assert(r.ok);
   assert_eq(r.definitions.len(), 1);
   let d = r.definitions.get(0);
@@ -2001,7 +2008,7 @@ test "a cost report gives each update's source location, whether it copies or re
   assert_eq(d.reuse_keyword, Some(span_between(0, 5)));
   assert_eq(d.sites.len(), 1);
   let s = d.sites.get(0);
-  assert_eq(src.slice(s.start, s.end), b"xs.push(n)");
+  assert_eq(source.slice(s.start, s.end), b"xs.push(n)");
   assert_eq(s.op, b"List::push");
   assert_eq(s.verdict, b"copies");
   assert_eq(s.reason, b"`Map::get` returns a clone the map still contains");
@@ -2010,8 +2017,8 @@ test "a cost report gives each update's source location, whether it copies or re
 }
 
 test "updating a map entry read with `first` or `floor` copies it, but an entry removed with `pop_first` or `split` is reused" {
-  let src = b"fn peek(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.first() { Some(e) -> e.value.push(n), None -> [] }\nfn near(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.floor(n) { Some(e) -> e.value.push(n), None -> [] }\nfn take(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.pop_first() { Some(p) -> p.value.push(n), None -> [] }\nfn cut(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.split(n).at { Some(xs) -> xs.push(n), None -> [] }\ntest \"fresh\" { assert_eq(take(Map::new().insert(1, [1]), 2), [1, 2]); assert_eq(cut(Map::new().insert(1, [1]), 1), [1, 1]) }\n";
-  let r = reported([b"m"], [src]);
+  let source = b"fn peek(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.first() { Some(e) -> e.value.push(n), None -> [] }\nfn near(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.floor(n) { Some(e) -> e.value.push(n), None -> [] }\nfn take(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.pop_first() { Some(p) -> p.value.push(n), None -> [] }\nfn cut(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.split(n).at { Some(xs) -> xs.push(n), None -> [] }\ntest \"fresh\" { assert_eq(take(Map::new().insert(1, [1]), 2), [1, 2]); assert_eq(cut(Map::new().insert(1, [1]), 1), [1, 1]) }\n";
+  let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let peeked = site_of(b"peek");
@@ -2033,8 +2040,8 @@ test "updating a map entry read with `first` or `floor` copies it, but an entry 
 }
 
 test "an array or list element replaced in place is an update, and one read out first is a copy" {
-  let src = b"fn fill(xs: Array<Int>, i: Int) -> Array<Int> / {abort.raise} = if i <= 0 { xs } else { fill(xs.set(i - 1, i), i - 1) }\nfn twice(xs: Array<Int>) -> Array<Int> / {abort.raise} = { let n = xs.get(0) + xs.len(); xs.set(0, n) }\nfn again(xs: Array<Int>) -> Int / {abort.raise} = xs.set(0, 1).len() + xs.len()\nfn sized(xs: Array<Int>) -> Array<Int> / {abort.raise} = xs.set(0, xs.len())\nfn first(ys: List<Array<Int>>) -> Array<Int> / {abort.raise} = match ys.at(0) { Some(a) -> a.set(0, 1), None -> Array::new(1, 0) }\nfn bump(zs: List<Int>) -> List<Int> / {abort.raise} = zs.set(0, 1)\ntest \"fresh\" { assert_eq(fill(Array::new(3, 0), 3).len(), 3); assert_eq(bump([0]), [1]) }\n";
-  let r = reported([b"m"], [src]);
+  let source = b"fn fill(xs: Array<Int>, i: Int) -> Array<Int> / {abort.raise} = if i <= 0 { xs } else { fill(xs.set(i - 1, i), i - 1) }\nfn twice(xs: Array<Int>) -> Array<Int> / {abort.raise} = { let n = xs.get(0) + xs.len(); xs.set(0, n) }\nfn again(xs: Array<Int>) -> Int / {abort.raise} = xs.set(0, 1).len() + xs.len()\nfn sized(xs: Array<Int>) -> Array<Int> / {abort.raise} = xs.set(0, xs.len())\nfn first(ys: List<Array<Int>>) -> Array<Int> / {abort.raise} = match ys.at(0) { Some(a) -> a.set(0, 1), None -> Array::new(1, 0) }\nfn bump(zs: List<Int>) -> List<Int> / {abort.raise} = zs.set(0, 1)\ntest \"fresh\" { assert_eq(fill(Array::new(3, 0), 3).len(), 3); assert_eq(bump([0]), [1]) }\n";
+  let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let filled = site_of(b"fill");
@@ -2063,8 +2070,8 @@ test "an array or list element replaced in place is an update, and one read out 
 }
 
 test "updating a value read from a scope reports a copy, and updating one the scope's callback returns or ends up using reports an unknown cost" {
-  let src = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_scope[r](xs, |l: List<Int>| ()) { h -> h.get().push(n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = List::push(with_scope[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_scope[r](xs, |l: List<Int>| { let grown = l.push(n); () }) { h -> n }\n";
-  let r = reported([b"m"], [src]);
+  let source = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_scope[r](xs, |l: List<Int>| ()) { h -> h.get().push(n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = List::push(with_scope[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_scope[r](xs, |l: List<Int>| { let grown = l.push(n); () }) { h -> n }\n";
+  let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let read = site_of(b"read");
@@ -2083,28 +2090,28 @@ fn verdicts(r: Report) -> List<Bytes> =
       a.push(Bytes::concat_all([d.name, b" ", s.verdict]))))
 
 test "a `returns` clause is checked against the function body, and a mismatch reports the declared and actual return origin" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"fn mk(n: Int) -> List<Int> returns fresh = range(0, n)\n",
     b"fn pick(xs: List<Int>, ys: List<Int>) -> List<Int> returns ys = xs\n",
     b"fn same(xs: List<Int>) -> List<Int> returns xs = xs\n",
     b"fn folded(xs: List<Int>) -> List<Int> returns fresh = xs.fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
   ]);
-  let r = reported([b"m"], [src]);
+  let r = reported([b"m"], [source]);
   assert(r.ok);
   assert_eq(r.return_mismatches.map(|u: ReturnMismatch| (u.name, u.declared, u.actual)), [
     (b"m.pick", b"its parameter `ys`", b"its parameter `xs`"),
     (b"m.folded", b"fresh", b"`List::fold` returns whatever its callback returned"),
   ]);
-  assert_eq(src.slice(r.return_mismatches.get(0).start, r.return_mismatches.get(0).end), b"ys")
+  assert_eq(source.slice(r.return_mismatches.get(0).start, r.return_mismatches.get(0).end), b"ys")
 }
 
 test "an update inside a callback passed to a builtin reports a copy or reuse by what the builtin passes in" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"fn grown(xs: List<Int>) -> List<Int> = xs.fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
     b"fn each(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|ys: List<Int>| ys.push(1))\n",
     b"fn values(m: Map<Int, Int>) -> List<Int> returns fresh = m.fold([], |acc: List<Int>, k: Int, v: Int| acc.push(v))\n",
   ]);
-  let r = reported([b"m"], [src]);
+  let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   assert_eq(site_of(b"grown").verdict, b"reuses");
@@ -2189,7 +2196,8 @@ fn std_cost_input(user: List<Source>, shipped: List<Source>) -> CostInput / {abo
     Analysed(w) ->
       cost_input_of(
         w,
-        w.modules.map(|m: ParsedModule| match texts.get(m.name) { Some(src) -> src, None -> b"" }),
+        w.modules.map(|m: ParsedModule|
+          match texts.get(m.name) { Some(source) -> source, None -> b"" }),
       ),
   }
 }
@@ -2246,7 +2254,7 @@ test "a stored analysis of a module is discarded when a name its body looks up n
   let p = three_module_program(made_fresh());
   let first = costed_over(Map::new(), p);
   let key = cost_keys(p, b"checker").get(1);
-  let kept = match first.store.get(key) {
+  let stored_module = match first.store.get(key) {
     Some(bytes) -> match bin::decode(bytes, cached_module_bin()) {
       Ok(m) -> m,
       Err(_) -> panic("a kept entry decodes"),
@@ -2254,7 +2262,7 @@ test "a stored analysis of a module is discarded when a name its body looks up n
     None -> panic("the module's entry is kept"),
   };
   let renamed = {
-    bodies: kept.bodies.map(|k: CachedBody|
+    bodies: stored_module.bodies.map(|k: CachedBody|
       {
         ..k,
         lookups: k.lookups.map(|l: CachedLookup|

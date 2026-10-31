@@ -267,7 +267,7 @@ fn choose_task<v>(
         let taken = record_step(s, step, choices);
         if dropped { Continue(finish_cancel(stopped_running(taken, id, Stopped), id)) } else {
           match task.state {
-            Ready(res) -> Stop({ ..taken, current: Some(id), turn: Run(id, res) }),
+            Ready(resumption) -> Stop({ ..taken, current: Some(id), turn: Run(id, resumption) }),
             _ ->
               Stop(
                 fail_turn(
@@ -356,7 +356,7 @@ fn production_turn<v>(r: Scheduler<v>, host: HostState) -> Scheduler<v> / {abort
     None -> match s.ready {
       [id, ..rest] -> match s.tasks.get(id) {
         Some(t) -> match t.state {
-          Ready(res) -> { ..s, ready: rest, current: Some(id), turn: Run(id, res) },
+          Ready(resumption) -> { ..s, ready: rest, current: Some(id), turn: Run(id, resumption) },
           _ -> fail_turn(s, internal_error(s, task_name(id) ++ " was chosen but is not enabled")),
         },
         None ->
@@ -545,23 +545,29 @@ fn reply<v>(s: Scheduler<v>, task: Int, incoming: Reply<v>) -> Scheduler<v> =
 fn raise_in_task<v>(s: Scheduler<v>, task: Int, f: Failure) -> Scheduler<v> =
   { ..running_readied(s, task, Raise(f)), current: None }
 
-fn running_readied<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
-  match s.policy { Seeded -> set_state(s, id, Ready(res)), Production -> ready_queued(s, id, res) }
+fn running_readied<v>(s: Scheduler<v>, id: Int, resumption: Resumption<v>) -> Scheduler<v> =
+  match s.policy {
+    Seeded -> set_state(s, id, Ready(resumption)),
+    Production -> ready_queued(s, id, resumption),
+  }
 
-fn make_ready<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
-  match s.policy { Seeded -> ready_in_order(s, id, res), Production -> ready_queued(s, id, res) }
+fn make_ready<v>(s: Scheduler<v>, id: Int, resumption: Resumption<v>) -> Scheduler<v> =
+  match s.policy {
+    Seeded -> ready_in_order(s, id, resumption),
+    Production -> ready_queued(s, id, resumption),
+  }
 
-fn ready_in_order<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
+fn ready_in_order<v>(s: Scheduler<v>, id: Int, resumption: Resumption<v>) -> Scheduler<v> =
   {
     ..s,
-    tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: Ready(res) }),
+    tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: Ready(resumption) }),
     ready: ascending_with(s.ready, id),
   }
 
-fn ready_queued<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
+fn ready_queued<v>(s: Scheduler<v>, id: Int, resumption: Resumption<v>) -> Scheduler<v> =
   {
     ..s,
-    tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: Ready(res) }),
+    tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: Ready(resumption) }),
     ready: s.ready.push(id),
   }
 
@@ -683,11 +689,11 @@ fn apply_join<v>(
   awaiting: Bool,
 ) -> Scheduler<v> / {abort.raise} =
   if t.scheduler != s.id { fail_scheduler(s, foreign_task(site, t.id)) } else {
-    let settled = match s.tasks.get(t.id) {
+    let outcome = match s.tasks.get(t.id) {
       Some(target) -> match target.state { Done -> Returned, Stopped -> Cancelled, _ -> Live },
       None -> t.ended,
     };
-    match settled {
+    match outcome {
       Returned ->
         reply(absorbed(s, task, t.id), task, if awaiting { Awaited(true) } else { Joined }),
       Cancelled -> {
@@ -717,7 +723,7 @@ fn apply_cancel<v>(
 ) -> Scheduler<v> / {abort.raise} =
   if t.scheduler != s.id { fail_scheduler(s, foreign_task(site, t.id)) }
   else if t.id == task || t.id == 0 { fail_scheduler(s, invalid_cancel(site, t.id, task)) } else {
-    let standing = match s.tasks.get(t.id) {
+    let target_status = match s.tasks.get(t.id) {
       None -> None,
       Some(target) ->
         Some({
@@ -731,7 +737,7 @@ fn apply_cancel<v>(
           suspends: !target.cancelled,
         }),
     };
-    match standing {
+    match target_status {
       None -> match t.ended {
         Live -> fail_scheduler(s, unknown_task(site, t.id)),
         _ -> reply(record_access(s, trail::end_access(t.id), site), task, Flag(false)),
@@ -862,7 +868,8 @@ fn finish_cancel<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> / {abort.raise} = 
           };
           match waited {
             None -> accumulator,
-            Some(Some(res)) -> absorbed(make_ready(accumulator, joiner, res), joiner, id),
+            Some(Some(resumption)) ->
+              absorbed(make_ready(accumulator, joiner, resumption), joiner, id),
             Some(None) ->
               fail_scheduler(
                 accumulator,
@@ -1373,9 +1380,12 @@ fn apply_select<v>(
   wait: Bool,
   site: Site,
 ) -> Scheduler<v> / {abort.raise} = {
-  let refused = arms.fold(None, |bad: Option<Failure>, a: { chan: ChanRef, send: Option<v> }|
-    match bad { Some(_) -> bad, None -> channel_error(s, a.chan, site) });
-  match refused {
+  let channel_failure = arms.fold(
+    None,
+    |bad: Option<Failure>, a: { chan: ChanRef, send: Option<v> }|
+      match bad { Some(_) -> bad, None -> channel_error(s, a.chan, site) },
+  );
+  match channel_failure {
     Some(f) -> fail_scheduler(s, f),
     None -> {
       let wait_description = arms.map(|a: { chan: ChanRef, send: Option<v> }|
@@ -1788,7 +1798,7 @@ extern fn task_resumed_kept(
   id: Int,
   code: Int,
   n: Int,
-  kept: Kept,
+  payload: Kept,
 ) -> Int / {native.write}
 
 extern fn task_resumed_raising(s: Stacks, id: Int, failure: Bytes) -> Int / {native.write}
@@ -1806,7 +1816,7 @@ extern fn task_yielded_kept(
   code: Int,
   a: Int,
   b: Int,
-  kept: Kept,
+  payload: Kept,
 ) -> Int / {native.write}
 
 extern fn heard_number(s: Stacks) -> Int / {native.read}
@@ -1855,16 +1865,16 @@ pub fn crossing_spawn<a | e>(body: keep () -> a / e) -> Task<a> / {task.spawn | 
 pub fn crossing_join<a>(t: Task<a>) -> a / {task.join, abort.raise} = open(task.join(task_as(t)))
 
 pub fn crossing_cancel<a>(t: Task<a>) -> Bool / {task.cancel} = {
-  let kept: Task<Kept> = task_as(t);
-  task.cancel(kept)
+  let erased_task: Task<Kept> = task_as(t);
+  task.cancel(erased_task)
 }
 
 pub fn crossing_await<a>(t: Task<a>) -> Option<a> / {task.await} =
   match task.await(task_as(t)) { Some(k) -> Some(open(k)), None -> None }
 
 pub fn crossing_channel<a>(capacity: Int) -> Chan<a> / {task.channel, abort.raise} = {
-  let kept: Chan<Kept> = task.channel(capacity);
-  chan_as(kept)
+  let erased_channel: Chan<Kept> = task.channel(capacity);
+  chan_as(erased_channel)
 }
 
 pub fn crossing_send<a>(c: Chan<a>, x: a) -> Bool / {task.send} = task.send(chan_as(c), keep(x))
@@ -1873,8 +1883,8 @@ pub fn crossing_recv<a>(c: Chan<a>) -> Option<a> / {task.recv} =
   match task.recv(chan_as(c)) { Some(k) -> Some(open(k)), None -> None }
 
 pub fn crossing_close<a>(c: Chan<a>) -> Unit / {task.close} = {
-  let kept: Chan<Kept> = chan_as(c);
-  task.close(kept)
+  let erased_channel: Chan<Kept> = chan_as(c);
+  task.close(erased_channel)
 }
 
 pub fn crossing_select<a>(
@@ -2034,8 +2044,12 @@ fn request_select(
   match went { Some(w) -> Some((w.at, w.got)), None -> None }
 }
 
-fn resume_task(s: Stacks, id: Int, res: Resumption<Kept>) -> Int / {abort.raise, native.write} =
-  match res {
+fn resume_task(
+  s: Stacks,
+  id: Int,
+  resumption: Resumption<Kept>,
+) -> Int / {abort.raise, native.write} =
+  match resumption {
     Start -> task_resumed(s, id, resume_start(), 0),
     Unwind -> task_resumed(s, id, resume_unwind(), 0),
     Raise(f) -> task_resumed_raising(s, id, failure_bytes(f)),
@@ -2144,8 +2158,8 @@ fn run_simulation(
     |region: Scheduler<Kept>| {
       let chosen = next_turn(region, { now: 0, stopping: false });
       match chosen.turn {
-        Run(task, res) -> {
-          let code = resume_task(s, task, res);
+        Run(task, resumption) -> {
+          let code = resume_task(s, task, resumption);
           let child = chosen.next_id;
           let context = {
             site: { root: asked_site(s, 0), start: asked_site(s, 1), end: asked_site(s, 2) },
@@ -2295,8 +2309,8 @@ fn serve_turn(
   r: Scheduler<Kept>,
 ) -> Scheduler<Kept> / {abort.raise, native.read, native.write, diverges} =
   match r.turn {
-    Run(task, res) -> {
-      let code = resume_task(s, task, res);
+    Run(task, resumption) -> {
+      let code = resume_task(s, task, resumption);
       let child = r.next_id;
       let context = {
         site: { root: asked_site(s, 0), start: asked_site(s, 1), end: asked_site(s, 2) },

@@ -1126,7 +1126,8 @@ fn first_fault(faults: List<Option<Fault>>) -> Option<Fault> =
   faults.fold(None, |found: Option<Fault>, next: Option<Fault>|
     if found == None { next } else { found })
 
-fn fault_if(fault: Fault, holds: Bool) -> Option<Fault> = if holds { Some(fault) } else { None }
+fn fault_if(fault: Fault, condition: Bool) -> Option<Fault> =
+  if condition { Some(fault) } else { None }
 
 fn validity_fault(c: Certificate, seconds: Int) -> Option<Fault> =
   if seconds < date::unix_seconds(c.info.not_before) { Some(NotYetValid) }
@@ -1265,8 +1266,8 @@ type PathSearch = {
 
 fn failed(c: Certificate, reason: Fault) -> Failure = { certificate: c, reason: reason }
 
-fn record_failure(h: PathSearch, c: Certificate, reason: Fault, reached: Int) -> PathSearch =
-  if reached > h.furthest_depth { { ..h, failure: failed(c, reason), furthest_depth: reached } }
+fn record_failure(h: PathSearch, c: Certificate, reason: Fault, depth: Int) -> PathSearch =
+  if depth > h.furthest_depth { { ..h, failure: failed(c, reason), furthest_depth: depth } }
   else { h }
 
 fn issuer_fault(case: VerifyInput, path: List<Certificate>, issuer: Certificate) -> Option<Fault> = {
@@ -1412,24 +1413,24 @@ fn try_issuer(
   trusted: Bool,
   h: PathSearch,
 ) -> Attempt / {abort.raise} = {
-  let reached = path.len();
+  let depth = path.len();
   if h.checks >= case.policy.signatures {
     Finished(record_failure(h, current, Spent, h.furthest_depth + 1))
   } else {
     match issuer_fault(case, path, issuer) {
-      Some(reason) -> Finished(record_failure(h, issuer, reason, reached)),
+      Some(reason) -> Finished(record_failure(h, issuer, reason, depth)),
       None -> match verifier(issuer.info.key, current.info.algorithm, case.policy) {
-        Err(reason) -> Finished(record_failure(h, current, reason, reached)),
+        Err(reason) -> Finished(record_failure(h, current, reason, depth)),
         Ok(key) -> {
           let checked = { ..h, checks: h.checks + 1 };
           if !crypto::verify(key, current.tbs, current.signature) {
-            Finished(record_failure(checked, current, Unissued, reached))
+            Finished(record_failure(checked, current, Unissued, depth))
           } else if !trusted { Extended(checked) } else {
             let whole = path.push(issuer);
             match path_fault(case, whole) {
               None -> Finished({ ..checked, path: Some(whole) }),
               Some(failure) ->
-                Finished(record_failure(checked, failure.certificate, failure.reason, reached + 1)),
+                Finished(record_failure(checked, failure.certificate, failure.reason, depth + 1)),
             }
           }
         },
@@ -1809,12 +1810,12 @@ pub fn self_signed(
 /// draft's extensions as an extension request.
 pub fn request(draft: Draft, key: crypto::SigningKey) -> Bytes / {x509.fail, abort.raise} =
   catch_unwritable(|| {
-    let asked = draft_extensions(draft);
-    let attributes = if asked.len() == 0 { [] } else {
+    let requested_extensions = draft_extensions(draft);
+    let attributes = if requested_extensions.len() == 0 { [] } else {
       [
         asn1::sequence([
           asn1::oid(oid::Oid([1, 2, 840, 113549, 1, 9, 14])),
-          asn1::set_of([asn1::sequence(asked)]),
+          asn1::set_of([asn1::sequence(requested_extensions)]),
         ]),
       ]
     };
@@ -1843,9 +1844,12 @@ fn request_at(r: Reader, data: Bytes, limits: Limits) -> ReadResult<Request> / {
               let values = asn1::read_raw(id.rest);
               { value: [], rest: values.rest }
             } else {
-              let asked = asn1::read_set_of(id.rest, |v: Reader|
+              let extension_lists = asn1::read_set_of(id.rest, |v: Reader|
                 asn1::read_sequence_of(v, |e: Reader| extension_at(e, limits, Strict)));
-              { value: asked.value.flat_map(|list: List<Extension>| list), rest: asked.rest }
+              {
+                value: extension_lists.value.flat_map(|list: List<Extension>| list),
+                rest: extension_lists.rest,
+              }
             }
           })));
       if version.value != 0 { x509.fail(BadVersion(version.value + 1)) } else {
@@ -2494,7 +2498,7 @@ test "a certificate breaking RFC 5280 is rejected, and so is a request its key d
     )
   };
   assert_eq(long.err(), Some(BadSerial));
-  let asked = fixture(||
+  let request_bytes = fixture(||
     request(
       {
         ..leaf_draft("www.example.com"),
@@ -2502,8 +2506,8 @@ test "a certificate breaking RFC 5280 is rejected, and so is a request its key d
       },
       key_of(3),
     ));
-  let read_back = fixture(|| read_request(asked, limits()));
-  assert_eq(request_der(read_back), asked);
+  let read_back = fixture(|| read_request(request_bytes, limits()));
+  assert_eq(request_der(read_back), request_bytes);
   assert_eq(request_key(read_back), info(p.leaf).key);
   assert_eq(
     request_subject(read_back).rdns.map(|rdn: List<Attribute>| rdn.map(|a: Attribute| a.value)),
@@ -2514,8 +2518,11 @@ test "a certificate breaking RFC 5280 is rejected, and so is a request its key d
     ExtendedKeyUsage([server_auth()]),
     SubjectAltName([Dns("www.example.com")]),
   ]);
-  let n = asked.len();
-  let forged = Bytes::concat_all([asked.slice(0, n - 1), byte_of_int(asked.at(n - 1) ^ 1)]);
+  let n = request_bytes.len();
+  let forged = Bytes::concat_all([
+    request_bytes.slice(0, n - 1),
+    byte_of_int(request_bytes.at(n - 1) ^ 1),
+  ]);
   assert_eq(Result::err(try { read_request(forged, limits()) }), Some(Unproven))
 }
 
@@ -2606,11 +2613,11 @@ test "a built certificate and a built request read back as what was built" {
       };
       let key = key_of(seed & 0xFF);
       let built = fixture(|| self_signed(d, b"\x05", day(1), day(2), key));
-      let asked = fixture(|| read_request(request(d, key), limits()));
+      let parsed_request = fixture(|| read_request(request(d, key), limits()));
       parse(der(built), limits(), Strict) == Ok(built) && alt_names(built) == d.alt_names
         && is_ca(built) == ca
-        && request_subject(asked) == info(built).subject
-        && request_key(asked) == info(built).key
+        && request_subject(parsed_request) == info(built).subject
+        && request_key(parsed_request) == info(built).key
     },
   )
 }

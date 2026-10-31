@@ -76,7 +76,8 @@ fn local(id: Int, ty: Type, rep: Representation) -> Var = { id: id, ty: ty, repr
 
 fn word(id: Int) -> Var = local(id, string_type(), AsWord)
 
-fn closure_var(id: Int, ret: Type) -> Var = local(id, fn_type([], ret, no_effects()), AsWord)
+fn closure_var(id: Int, return_type: Type) -> Var =
+  local(id, fn_type([], return_type, no_effects()), AsWord)
 
 fn sample_span() -> Span = span_between(3, 9)
 
@@ -154,8 +155,8 @@ fn unpacks(body: List<Inst>, v: Var, rep: Representation) -> Bool =
   body.any(|i: Inst|
     match i { Let(l) -> l.value == Convert({ arg: VarOperand(v), to: rep }), _ -> false })
 
-fn without_descriptor(op: HandleOp) -> HandleOp =
-  match op { Perform(x) -> Perform({ ..x, descriptor: b"" }), other -> other }
+fn without_descriptor(operation: HandleOp) -> HandleOp =
+  match operation { Perform(x) -> Perform({ ..x, descriptor: b"" }), other -> other }
 
 fn perform_corpus() -> Bytes =
   Bytes::concat_all([
@@ -426,12 +427,12 @@ test "a clause handling `abort.raise` passes the runtime the descriptor of the m
 }
 
 test "a clause that calls `resume` in tail position stores its result as a single word without unpacking the continuation's result" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect ask {\n  read get(n: Int) -> Int\n}\n",
     b"type R = { a: String, n: Int, m: Int }\n",
     b"fn run(n: Int) -> R = handle { { a: \"x\", n: ask.get(n), m: 0 } } with { ask.get(q) resume k -> if q > 0 { k(q) } else { { a: \"y\", n: 0, m: 0 } } }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let f = lowered_root(p, b"run");
@@ -594,7 +595,8 @@ test "a clause that calls `resume` outside tail position runs the `handle` body 
         None -> assert(false),
         Some(g) -> {
           assert_eq(
-            g.h.clauses.map(|cl: CodeClause| clause_frame(cl, no_captured_evidence()).params),
+            g.h.clauses.map(|clause: CodeClause|
+              clause_frame(clause, no_captured_evidence()).params),
             [3],
           );
           assert_eq(body_frame(g.context, g.h, planned(g), [], int_type()).captures.len(), 0)
@@ -644,11 +646,11 @@ test "a clause that calls `resume` outside tail position runs the `handle` body 
 }
 
 test "a `handle` body run as a separate function captures the initial value of each handler variable, stored at the variable's type" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect tally {\n  write add(n: Int) -> Unit\n  read total() -> Int\n}\n",
     b"fn resumed() -> Int = handle { tally.add(1); tally.total() } with { var n = 0, var m = n + 1, tally.add(k) resume r -> { n = n + k; let first = r(()); n = n + m; first + m }, tally.total() -> n }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let f = lowered_root(p, b"resumed");
@@ -661,9 +663,13 @@ test "a `handle` body run as a separate function captures the initial value of e
           }),
         [[evidence], [evidence], [int_type(), int_type(), evidence, evidence]],
       );
-      let ops = f.lambdas.fold([], |accumulator: List<Bytes>, l: typed_ir::Lambda|
+      let operation_names = f.lambdas.fold([], |accumulator: List<Bytes>, l: typed_ir::Lambda|
         match l { Closure(c) -> accumulator.concat(variable_operations(c.body.body)) });
-      assert_eq([b"init", b"read", b"write"].map(|o: Bytes| ops.contains(o)), [true, true, true])
+      assert_eq([b"init", b"read", b"write"].map(|o: Bytes| operation_names.contains(o)), [
+        true,
+        true,
+        true,
+      ])
     },
   }
 }
@@ -701,8 +707,8 @@ test "a type parameter of an operation is marked wherever it occurs inside a typ
   match program_of(marshalling_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
-      let marked = |op: keys::TypeOp, t: Type, marks: List<Int>|
-        keys::with_marks(keys::generated_key(op, t, b"m"), marks);
+      let marked = |operation: keys::TypeOp, t: Type, marks: List<Int>|
+        keys::with_marks(keys::generated_key(operation, t, b"m"), marks);
       let names = |k: RootKey|
         named_calls(written_at(p.setting.constructors, k).code).map(
           |c: { name: Bytes, recorded: Option<SiteType> }|
@@ -864,23 +870,26 @@ fn static_comparison_entries(statics: List<StaticDefinition>) -> List<List<Optio
     })
 
 fn comparison_entries(t: Type) -> List<Option<RootKey>> =
-  [keys::Equal, keys::Order].map(|op: keys::TypeOp|
-    Some(keys::generated_key(OnWordForm(op), t, b"m")))
+  [keys::Equal, keys::Order].map(|operation: keys::TypeOp|
+    Some(keys::generated_key(OnWordForm(operation), t, b"m")))
 
 test "a value passed to a clause of a generic operation is boxed as `Kept`, the clause stores and returns it, and the perform unboxes the result at its own type" {
   match program_of(generic_operation_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let f = lowered_root(p, b"swapped");
-      let kept = NamedType({ name: b"std.internal.schedule.Kept", args: [] });
+      let boxed_type = NamedType({ name: b"std.internal.schedule.Kept", args: [] });
       let called = natives_in(f.body);
       assert(called.contains(b"builtin_elaborated_keep_p"), None);
       assert(called.contains(b"builtin_elaborated_open_p"), None);
       assert_eq(static_comparison_entries(f.statics), [comparison_entries(int_type())]);
       match f.lambdas.at(0) {
         Some(Closure(c)) -> {
-          assert(c.body.params.any(|v: Var| v.ty == kept && v.representation == AsWord), None);
-          assert_eq(c.body.result_type, kept)
+          assert(
+            c.body.params.any(|v: Var| v.ty == boxed_type && v.representation == AsWord),
+            None,
+          );
+          assert_eq(c.body.result_type, boxed_type)
         },
         _ -> assert(false),
       }
@@ -975,8 +984,8 @@ test "a value nested in the arguments of a generic operation is boxed one part a
         let f = lowered_root(p, name);
         f.body.fold([], rooted_call)
       };
-      let at = |op: keys::TypeOp, t: Type, marks: List<Int>|
-        keys::with_marks(keys::generated_key(op, t, b"m"), marks);
+      let at = |operation: keys::TypeOp, t: Type, marks: List<Int>|
+        keys::with_marks(keys::generated_key(operation, t, b"m"), marks);
       assert_eq(calls(b"first"), [
         at(keys::Keeping, list_type(int), [1]),
         at(keys::Opening, option_type(int), [1]),
@@ -1075,11 +1084,11 @@ fn fn_of(name: Bytes, params: List<Var>, body: List<Inst>) -> Fn =
     statics: [],
   }
 
-fn op_let(v: Var, op: HandleOp, args: List<Arg>) -> Inst =
+fn op_let(v: Var, operation: HandleOp, args: List<Arg>) -> Inst =
   Let({
     var: v,
     value: Op({
-      op: OfHandling(op),
+      op: OfHandling(operation),
       args: args,
       uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, suspends: true },
     }),
@@ -1297,13 +1306,15 @@ test "every function in the handling test program lowers to IR and prints C with
 }
 
 test "the task operations the scheduler loads are the prelude's `task` operations, and those that pass values between tasks are the generic ones" {
-  let ops = match prelude_effects().find(|e: EffectInfo| e.name == b"task") {
+  let task_effect_operations = match prelude_effects().find(|e: EffectInfo| e.name == b"task") {
     Some(e) -> e.operations,
     None -> [],
   };
-  assert_eq(ops.map(|o: OpInfo| o.name).sort(), task_operations().sort());
+  assert_eq(task_effect_operations.map(|o: OpInfo| o.name).sort(), task_operations().sort());
   assert_eq(
-    ops.filter(|o: OpInfo| marshalling_variables(o).len() > 0).map(|o: OpInfo| o.name),
+    task_effect_operations.filter(|o: OpInfo| marshalling_variables(o).len() > 0).map(
+      |o: OpInfo| o.name,
+    ),
     marshalling_operations(),
   )
 }
@@ -1362,8 +1373,8 @@ test "a scheduler perform at a type its body leaves unresolved fails the build, 
     name: scheduler_module(),
     src: b"pub fn crossing_channel<a>(capacity: Int) -> Chan<a> / {task.channel, abort.raise} = {\n  let _ = task.channel(capacity);\n  abort.raise(\"none\")\n}\n",
   };
-  let src = b"fn made() -> Chan<Int> / {task.channel, abort.raise} = task.channel(1)\n";
-  match built_c(src, [scheduler], Named(b"std.internal.schedule.crossing_channel")) {
+  let source = b"fn made() -> Chan<Int> / {task.channel, abort.raise} = task.channel(1)\n";
+  match built_c(source, [scheduler], Named(b"std.internal.schedule.crossing_channel")) {
     Ok(_) -> assert(false, Some("a perform at a type its body leaves open was written")),
     Err(reason) ->
       assert(
@@ -1382,9 +1393,9 @@ test "a generated marshalling function reports the source locations passed by it
       b"pub fn crossing_probe(n: Int) -> Int / {abort.raise} = if n + 1 > 2 { abort.raise(\"wide\") } else { n }\n",
     ]),
   };
-  let src = b"fn made() -> Chan<Int> / {task.channel, abort.raise} = task.channel(1)\n";
+  let source = b"fn made() -> Chan<Int> / {task.channel, abort.raise} = task.channel(1)\n";
   {
-    let f = shipped_lowered(src, [scheduler], scheduler_module(), b"crossing_probe");
+    let f = shipped_lowered(source, [scheduler], scheduler_module(), b"crossing_probe");
     let text = pieces_text(printed_fn(f, no_constructors()).pieces);
     let shown = Some(String::of_bytes_lossy(text));
     assert(
@@ -1403,7 +1414,7 @@ test "a generated marshalling function reports the source locations passed by it
 }
 
 test "handler variables of many types, including maps and bytes, lower and print without errors, as does a `parallel` block over lists" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect keep {\n  read head(key: Bytes) -> Option<Bytes>\n  write put(key: Bytes, v: Bytes) -> Unit\n}\n",
     b"effect prover {\n  read judged[c](lane: List<Int>) -> List<Int>\n}\n",
     b"fn lanes(xs: List<Int>, ys: List<Int>) -> List<Int> / {prover.judged[claims]} = { let h = parallel { prover.judged[claims](xs), prover.judged[claims](ys) }; h._1.fold(h._0, |out: List<Int>, x: Int| out.push(x)) }\n",
@@ -1411,7 +1422,7 @@ test "handler variables of many types, including maps and bytes, lower and print
     b"fn kept(keys: List<Bytes>) -> List<Option<Bytes>> = handle { keep.put(b\"a\", b\"1\"); keys.map(|k: Bytes| keep.head(k)) } with { var store: Map<Bytes, Bytes> = Map::new(), var running: Pulling = { stamp: b\"\", looked: Map::new(), trusted: false, packed: Map::new(), n: 0 }, var files: List<String> = [], var begun = false, var last: Option<Bytes> = None, keep.head(key) -> { running = { ..running, n: running.n + 1, looked: running.looked.insert(key, running.n) }; last = Some(key); begun = true; store.get(key) }, keep.put(key, v) -> { store = store.insert(key, v); files = files.push(\"put\"); }, return r -> if begun && files.len() > 0 && last != None { r } else { [] } }\n",
     b"fn halves(xs: List<List<Int>>) -> List<List<Int>> = { let h = parallel { xs.map(|x: List<Int>| x.push(1)), xs.map(|x: List<Int>| x.push(2)) }; h._1.fold(h._0, |out: List<List<Int>>, x: List<Int>| out.push(x)) }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> assert_eq(build_failures(p, [b"kept", b"halves", b"lanes"]), []),
   }
@@ -1581,12 +1592,12 @@ test "a handle body run as a separate function gets a heap-allocated block that 
 }
 
 test "a `handle` catches a raise of an operation that one of its clauses handles when the runtime reports the failure as still pending" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect oops {\n  raise boom(n: Int)\n}\n",
     b"fn bang(n: Int) -> Int / {oops.boom} = if n > 0 { oops.boom(n) } else { n }\n",
     b"fn caught(n: Int) -> Int = handle { bang(n) } with { oops.boom(k) -> k + 1 }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> match printed_by_ir(p, b"caught") {
       Err(reason) -> assert_eq(reason, b""),
@@ -1603,12 +1614,12 @@ test "a `handle` catches a raise of an operation that one of its clauses handles
 }
 
 test "a `?` inside a `handle` lowers as a raise that the enclosing `handle` catches" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect ask {\n  read get() -> Int\n}\n",
     b"fn parsed(b: Int) -> Result<Int, Int> = if b < 48 { Err(b) } else { Ok(b - 48) }\n",
     b"fn asked(b: Int) -> Result<Int, Int> = { let n = handle { parsed(b)? + ask.get() } with { ask.get() -> 1 }; Ok(n) }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> match printed_by_ir(p, b"asked") {
       Err(reason) -> assert_eq(reason, b""),
@@ -1672,12 +1683,12 @@ test "each `handle` creates a state object in which its body runs, whether or no
 }
 
 test "a `try` block selects each clause by its operation and stores the result at the result type, leaving the body's normal value to the return clause" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect bad {\n  raise fail(at: Int)\n}\n",
     b"fn failing(at: Int) -> Int / {bad.fail} = if at > 0 { bad.fail(at) } else { at }\n",
     b"fn tried(n: Int) -> Result<Int, Int> = try { failing(n) }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       {
@@ -1763,12 +1774,12 @@ fn indexed_names(text: Bytes) -> List<Bytes> / {abort.raise} =
   })
 
 test "a `handle` reads and writes each handler variable and its result in its state object, not in a closure it creates" {
-  let src = Bytes::concat_all([
+  let source = Bytes::concat_all([
     b"effect picking {\n  write pick(chosen: Int) -> Unit\n}\n",
     b"fn form(n: Int) -> Int / {picking.pick, abort.raise} = { picking.pick(n); n }\n",
     b"fn finished(n: Int) -> { bytes: Int, chosen: List<Int> } / {abort.raise} = handle { form(n) } with { var chosen: List<Int> = [], picking.pick(one) -> { chosen = chosen.push(one); }, return bytes -> { bytes: bytes, chosen: chosen } }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> match printed_by_ir(p, b"finished") {
       Err(reason) -> assert_eq(reason, b""),
@@ -1851,16 +1862,16 @@ test "what an operation returns and what its clause receives are stored as their
         Ok(f) -> match f.lambdas.at(0) {
           Some(Closure(c)) -> match c.body.params.at(c.captures) {
             None -> assert(false),
-            Some(handed) -> {
-              assert_eq(match handed.ty { RecordType(fs) -> fs.len(), _ -> 0 }, 2);
+            Some(clause_parameter) -> {
+              assert_eq(match clause_parameter.ty { RecordType(fs) -> fs.len(), _ -> 0 }, 2);
               assert_eq(
-                match handed.representation {
+                match clause_parameter.representation {
                   AsFlattened(ls) -> Some(ls.map(|l: Leaf| l.representation)),
                   _ -> None,
                 },
                 Some([AsInt, AsInt]),
               );
-              assert_eq(reads_of(c.body.body, handed), [LeafPath(0), LeafPath(1)])
+              assert_eq(reads_of(c.body.body, clause_parameter), [LeafPath(0), LeafPath(1)])
             },
           },
           None -> assert(false),
@@ -1953,13 +1964,13 @@ fn part_of(v: Rvalue) -> List<Bytes> / {abort.raise} =
   }
 
 fn params_of(context: Context) -> { vars: List<Var>, st: Lowering } / {abort.raise} = {
-  let vars = range(0, context.types.len()).map(|i: Int|
+  let variables = range(0, context.types.len()).map(|i: Int|
     {
       id: i,
       ty: context.types.get(i),
       representation: representation_of(context.setting, context.types.get(i)),
     });
-  { vars: vars, st: initial_lowering(vars) }
+  { vars: variables, st: initial_lowering(variables) }
 }
 
 fn calls_in(
@@ -2413,9 +2424,9 @@ test "a generated marshalling function calls only marshalling builtins, function
         option_type(string_type()),
         columns_type(record),
       ];
-      let asked = types.fold([], |accumulator: List<RootKey>, t: Type|
+      let root_keys = types.fold([], |accumulator: List<RootKey>, t: Type|
         accumulator.concat(
-          [Lower, Lift].map(|op: keys::TypeOp| keys::generated_key(op, t, b"m")),
+          [Lower, Lift].map(|operation: keys::TypeOp| keys::generated_key(operation, t, b"m")),
         )).concat(
         [list_type(int_type()), array, map].fold([], |accumulator: List<RootKey>, t: Type|
           accumulator.concat(container_definitions(b"m", t).map(|d: Definition| d.root))),
@@ -2425,11 +2436,11 @@ test "a generated marshalling function calls only marshalling builtins, function
           { ty: map_type(string_type(), int_type()), at: 2 },
         ].fold([], |accumulator: List<RootKey>, m: { ty: Type, at: Int }|
           accumulator.concat(
-            [Keeping, Opening].map(|op: keys::TypeOp|
-              keys::with_marks(keys::generated_key(op, m.ty, b"m"), [m.at])),
+            [Keeping, Opening].map(|operation: keys::TypeOp|
+              keys::with_marks(keys::generated_key(operation, m.ty, b"m"), [m.at])),
           )),
       );
-      let roots = asked.fold(
+      let roots = root_keys.fold(
         [],
         |accumulator: List<{ key: RootKey, root: GeneratedRoot }>, k: RootKey| {
           let r = written_at(p.setting.constructors, k);
@@ -2531,7 +2542,7 @@ test "a type can be sent to the runtime when its marshalling functions exist, an
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let constructors = p.setting.constructors;
-      let held = marshalled_sums(constructors.sums, |_: Bytes| true);
+      let all_sums = marshalled_sums(constructors.sums, |_: Bytes| true);
       let shape = NamedType({ name: b"m.Shape", args: [] });
       let hook = NamedType({ name: b"m.Hook", args: [] });
       let callback = fn_type([int_type()], int_type(), no_effects());
@@ -2552,9 +2563,9 @@ test "a type can be sent to the runtime when its marshalling functions exist, an
         VariableType(0),
         list_node_type(int_type()),
       ];
-      let message = |back: Bool| types.map(|t: Type| is_marshallable(held, t, back));
-      let written = |op: keys::TypeOp|
-        types.map(|t: Type| written_whole(constructors, keys::generated_key(op, t, b"m")));
+      let message = |back: Bool| types.map(|t: Type| is_marshallable(all_sums, t, back));
+      let written = |operation: keys::TypeOp|
+        types.map(|t: Type| written_whole(constructors, keys::generated_key(operation, t, b"m")));
       assert_eq(message(false), written(Lower));
       assert_eq(message(true), written(Lift));
       assert_eq(message(false), [
@@ -2631,7 +2642,7 @@ test "a type's runtime descriptor is emitted once, and lists the type's name bef
         let twice = type_descriptor(r.context, once.st, shape, sample_span());
         assert_eq(twice.st.statics, once.st.statics);
         assert_eq(once.st.statics.len(), 2);
-        let key = |op: keys::TypeOp, t: Type| keys::generated_key(op, t, b"m");
+        let key = |operation: keys::TypeOp, t: Type| keys::generated_key(operation, t, b"m");
         let laid = |d: LoweredValue|
           match d.st.statics.at(1) { Some(s) -> s, None -> panic("a descriptor laid no static") };
         let lowering = |s: StaticDefinition|
@@ -2689,10 +2700,13 @@ test "functions that convert a type to and from the runtime's one-word form buil
         list_type(int_type()),
       ];
       let entries = types.fold([], |accumulator: List<Fn>, t: Type|
-        [OnWordForm(Lower), OnWordForm(Lift)].fold(accumulator, |a: List<Fn>, op: keys::TypeOp| {
-          let f = serialization_function(constructors, keys::generated_key(op, t, b"m"));
-          a.push(f)
-        }));
+        [OnWordForm(Lower), OnWordForm(Lift)].fold(
+          accumulator,
+          |a: List<Fn>, operation: keys::TypeOp| {
+            let f = serialization_function(constructors, keys::generated_key(operation, t, b"m"));
+            a.push(f)
+          },
+        ));
       let rejected = entries.fold([], |accumulator: List<Bytes>, f: Fn|
         match build_failure(p, f) {
           Some(reason) ->

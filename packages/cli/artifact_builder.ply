@@ -82,8 +82,8 @@ pub fn with_artifacts<a | e>(
   handle {
     body()
   } with {
-    artifacts.made(front, hashes, entry, startup, reaches) ->
-      build_artifact(front, hashes, entry, startup, reaches),
+    artifacts.made(front, hashes, entry, startup, include_closures) ->
+      build_artifact(front, hashes, entry, startup, include_closures),
     artifacts.previous(path, bytes) -> previous(path, bytes),
     artifacts.unit(front, names) -> library_unit(front, names),
   }
@@ -187,8 +187,8 @@ fn bodies_of(d: Dump, pairs: List<NamedHash>) -> Map<Bytes, Bytes> / {abort.rais
     })
 }
 
-fn pairs_of(held: List<ClosureEntry>) -> List<NamedHash> =
-  held.fold(Map::new(), |accumulator: Map<Bytes, NamedHash>, x: ClosureEntry|
+fn pairs_of(closure_entries: List<ClosureEntry>) -> List<NamedHash> =
+  closure_entries.fold(Map::new(), |accumulator: Map<Bytes, NamedHash>, x: ClosureEntry|
     accumulator.insert(Bytes::concat_all([x.name, b"\x00", x.hash]), {
       name: x.name,
       hash: x.hash,
@@ -254,14 +254,14 @@ fn path_of(module: Bytes) -> String / {abort.raise} =
 
 fn printed_files(
   d: Dump,
-  held: List<ClosureEntry>,
+  closure_entries: List<ClosureEntry>,
   bodies: Map<Bytes, Bytes>,
 ) -> Result<List<SourceFile>, Diagnostic> / {shipped.names, abort.raise} = {
   let shipped_names = shipped.names().fold(
     Map::new(),
     |accumulator: Map<Bytes, Bool>, n: String| accumulator.insert(Bytes::of_string(n), true),
   );
-  let shipped_modules = held.fold(
+  let shipped_modules = closure_entries.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bool>, x: ClosureEntry| {
       let m = module_of(x.name);
@@ -272,7 +272,7 @@ fn printed_files(
   let exports = visibility_of(d);
   match print_bodies(
       bodies.values(),
-      held.fold(
+      closure_entries.fold(
         Map::new(),
         |accumulator: Map<Bytes, { name: Bytes, hash: Bytes, public: Bool }>, x: ClosureEntry|
           accumulator.insert(Bytes::concat_all([x.name, b"\x00", x.hash]), {
@@ -284,12 +284,15 @@ fn printed_files(
       ),
       [],
       shipped_modules,
-      held.map(|x: ClosureEntry|
+      closure_entries.map(|x: ClosureEntry|
         {
           name: x.name,
           hash: x.hash,
           names: x.refs.fold([], |accumulator: List<Bytes>, i: Int|
-            match held.at(i) { Some(to) -> accumulator.push(to.name), None -> accumulator }),
+            match closure_entries.at(i) {
+              Some(to) -> accumulator.push(to.name),
+              None -> accumulator,
+            }),
         }),
     ) {
     Unprintable(r) ->
@@ -354,27 +357,30 @@ fn names_of_pairs(pairs: List<NamedHash>) -> List<Bytes> =
     accumulator.insert(pair.name, true)).keys(
   )
 
-fn closures_of(held: List<ClosureEntry>) -> List<Dependencies> / {abort.raise} = {
-  let edges = held.map(|x: ClosureEntry| x.refs);
-  let name_at = |i: Int| match held.at(i) { Some(x) -> x.name, None -> b"" };
-  range(0, held.len()).fold(Map::new(), |accumulator: Map<Bytes, Dependencies>, i: Int|
-    match held.at(i) {
-      None -> accumulator,
-      Some(x) ->
-        accumulator.insert(
-          Bytes::concat_all([x.name, b"\x00", if x.declaration { b"0" } else { b"1" }]),
-          {
-            name: String::of_bytes(x.name),
-            dependencies: walk(edges, [i]).fold(
-              Map::new(),
-              |seen: Map<Bytes, Bool>, j: Int| seen.insert(name_at(j), true),
-            ).keys(
-            ).map(
-              String::of_bytes,
-            ),
-          },
-        ),
-    }).values(
+fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abort.raise} = {
+  let edges = closure_entries.map(|x: ClosureEntry| x.refs);
+  let name_at = |i: Int| match closure_entries.at(i) { Some(x) -> x.name, None -> b"" };
+  range(0, closure_entries.len()).fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Dependencies>, i: Int|
+      match closure_entries.at(i) {
+        None -> accumulator,
+        Some(x) ->
+          accumulator.insert(
+            Bytes::concat_all([x.name, b"\x00", if x.declaration { b"0" } else { b"1" }]),
+            {
+              name: String::of_bytes(x.name),
+              dependencies: walk(edges, [i]).fold(
+                Map::new(),
+                |seen: Map<Bytes, Bool>, j: Int| seen.insert(name_at(j), true),
+              ).keys(
+              ).map(
+                String::of_bytes,
+              ),
+            },
+          ),
+      },
+  ).values(
   )
 }
 
@@ -429,7 +435,7 @@ pub fn build_artifact(
   hashes: HashOutput,
   entry: String,
   startup: List<String>,
-  reaches: Bool,
+  include_closures: Bool,
 ) -> Result<BuiltArtifact, Rejection> / {emit.unit, toolchain.read, shipped.names, shipped.module, shipped.report_view_used, shipped.definitions, shipped.runtime, abort.raise} = {
   let definitions = by_name(hashes.definitions);
   let roots = startup.push(entry).map(Bytes::of_string);
@@ -496,12 +502,12 @@ pub fn build_artifact(
                         Some(h) -> h,
                         None -> b"",
                       };
-                      let held = named_sections(pairs).push(closure_section(files));
+                      let sections = named_sections(pairs).push(closure_section(files));
                       let runnable = bin::encode(
                         {
                           entry: entry,
                           made_from: source_digest(|name: Bytes|
-                            match held.find(|s: Section| s.name == name) {
+                            match sections.find(|s: Section| s.name == name) {
                               Some(s) -> s.payload,
                               None -> b"",
                             }),
@@ -516,7 +522,7 @@ pub fn build_artifact(
                         head: header_of(entry_hash),
                         sections: flatten([
                           [bodies_section(bodies)],
-                          held,
+                          sections,
                           [
                             { name: b"runnable", count: 1, payload: runnable },
                             { name: b"unit", count: 1, payload: gzip::gzip(unit) },
@@ -525,7 +531,7 @@ pub fn build_artifact(
                         definitions: bodies.keys().len(),
                         names: pairs.map(|pair: NamedHash|
                           { name: String::of_bytes(pair.name), hash: pair.hash.hex_of() }),
-                        closures: if reaches { closures_of(closure) } else { [] },
+                        closures: if include_closures { closures_of(closure) } else { [] },
                       })
                     },
                   }
@@ -871,7 +877,7 @@ fn read_runnable(
   path: String,
   bytes: Bytes,
   entry: String,
-  held: Bytes,
+  source_digest: Bytes,
 ) -> Result<Runnable, Diagnostic> / {abort.raise} =
   match bin::decode(bytes, runnable_section_bin()) {
     Err(reason) ->
@@ -891,7 +897,7 @@ fn read_runnable(
           [],
         ),
       )
-    } else if c.made_from != held {
+    } else if c.made_from != source_digest {
       Err(
         invalid_artifact(
           path,
@@ -928,12 +934,12 @@ fn closure_entry(name: Bytes, declaration: Bool, hash: Bytes, refs: List<Int>) -
   { name: name, declaration: declaration, hash: hash, refs: refs }
 
 test "`pairs_of` returns a name and hash pair for both a function and a declaration of one name, sorted by name and then by hash" {
-  let held = [
+  let closure_entries = [
     closure_entry(b"m.f", false, b"\x05", [1, 2]),
     closure_entry(b"m.T", false, b"\x09", []),
     closure_entry(b"m.T", true, b"\x02", []),
   ];
-  assert_eq(pairs_of(held), [
+  assert_eq(pairs_of(closure_entries), [
     { name: b"m.T", hash: b"\x02" },
     { name: b"m.T", hash: b"\x09" },
     { name: b"m.f", hash: b"\x05" },
@@ -941,13 +947,13 @@ test "`pairs_of` returns a name and hash pair for both a function and a declarat
 }
 
 test "`closures_of` lists the definitions each stored definition depends on, treating an effect declaration and a function of the same name as separate" {
-  let held = [
+  let closure_entries = [
     closure_entry(b"m.main", false, b"\x01", [1]),
     closure_entry(b"m.gz", true, b"\x02", []),
     closure_entry(b"m.gz", false, b"\x03", [3]),
     closure_entry(b"m.written", false, b"\x04", []),
   ];
-  assert_eq(closures_of(held), [
+  assert_eq(closures_of(closure_entries), [
     { name: "m.gz", dependencies: ["m.gz"] },
     { name: "m.gz", dependencies: ["m.gz", "m.written"] },
     { name: "m.main", dependencies: ["m.gz", "m.main"] },

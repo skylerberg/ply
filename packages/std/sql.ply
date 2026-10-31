@@ -2171,7 +2171,7 @@ fn check_against_schema(
     ) {
     Err(f) -> [f],
     Ok(statement) -> {
-      let judged = type_check_statement(
+      let checked = type_check_statement(
         {
           findings: [],
           placed: [],
@@ -2184,14 +2184,14 @@ fn check_against_schema(
       );
       let shaped = match site.row {
         None -> [],
-        Some(fields) -> if judged.j.findings.len() > 0 { [] }
-        else { check_row_fields(fields, judged.returned) },
+        Some(fields) -> if checked.j.findings.len() > 0 { [] }
+        else { check_row_fields(fields, checked.returned) },
       };
       let bound = match site.parameter_constructors {
         None -> [],
-        Some(given) -> check_parameter_types(site.dialect, given, judged.j.placed),
+        Some(given) -> check_parameter_types(site.dialect, given, checked.j.placed),
       };
-      judged.j.findings.concat(shaped).concat(bound)
+      checked.j.findings.concat(shaped).concat(bound)
     },
   }
 }
@@ -2649,42 +2649,52 @@ fn parse_not(
     let inner = parse_not(sql_step(parser), left - 1)?;
     Ok(parse_output(inner.parser, NotExpression(inner.value)))
   } else {
-    let lhs = parse_sum(parser, left - 1)?;
-    parse_predicate(lhs, left - 1)
+    let left_operand = parse_sum(parser, left - 1)?;
+    parse_predicate(left_operand, left - 1)
   }
 
 fn parse_predicate(
-  lhs: ParseOutput<QueryExpression>,
+  left_operand: ParseOutput<QueryExpression>,
   left: Int,
 ) -> Result<ParseOutput<QueryExpression>, Finding> / {abort.raise} =
-  if left <= 0 { too_deep(lhs.parser) } else {
-    match parse_comparison(lhs.parser) {
+  if left <= 0 { too_deep(left_operand.parser) } else {
+    match parse_comparison(left_operand.parser) {
       Some(c) -> {
-        let rhs = parse_sum(c.parser, left - 1)?;
-        Ok(parse_output(rhs.parser, BinaryExpression({ op: c.op, lhs: lhs.value, rhs: rhs.value })))
+        let right_operand = parse_sum(c.parser, left - 1)?;
+        Ok(
+          parse_output(
+            right_operand.parser,
+            BinaryExpression({ op: c.op, lhs: left_operand.value, rhs: right_operand.value }),
+          ),
+        )
       },
-      None -> if sql_at_word(lhs.parser, "is") {
-        let p = sql_eat_word(sql_step(lhs.parser), "not").parser;
-        if sql_at_word(p, "null") { Ok(parse_output(sql_step(p), IsNullExpression(lhs.value))) }
-        else if sql_at_word(p, "true") || sql_at_word(p, "false") {
+      None -> if sql_at_word(left_operand.parser, "is") {
+        let p = sql_eat_word(sql_step(left_operand.parser), "not").parser;
+        if sql_at_word(p, "null") {
+          Ok(parse_output(sql_step(p), IsNullExpression(left_operand.value)))
+        } else if sql_at_word(p, "true") || sql_at_word(p, "false") {
           Ok(
             parse_output(
               sql_step(p),
-              BinaryExpression({ op: "=", lhs: lhs.value, rhs: LiteralExpression(BoolType) }),
+              BinaryExpression({
+                op: "=",
+                lhs: left_operand.value,
+                rhs: LiteralExpression(BoolType),
+              }),
             ),
           )
         } else { unsupported_here(p) }
       } else {
-        let negated = sql_eat_word(lhs.parser, "not");
+        let negated = sql_eat_word(left_operand.parser, "not");
         let p = negated.parser;
-        if sql_at_word(p, "in") { parse_in(lhs.value, sql_step(p), left - 1) }
+        if sql_at_word(p, "in") { parse_in(left_operand.value, sql_step(p), left - 1) }
         else if sql_at_word(p, "between") {
           let low = parse_sum(sql_step(p), left - 1)?;
           let high = parse_sum(expect_word(low.parser, "and")?, left - 1)?;
           Ok(
             parse_output(
               high.parser,
-              BetweenExpression({ value: lhs.value, low: low.value, high: high.value }),
+              BetweenExpression({ value: left_operand.value, low: low.value, high: high.value }),
             ),
           )
         } else if sql_at_word(p, "like") || sql_at_word(p, "ilike") {
@@ -2692,11 +2702,11 @@ fn parse_predicate(
           Ok(
             parse_output(
               pattern.parser,
-              BinaryExpression({ op: "like", lhs: lhs.value, rhs: pattern.value }),
+              BinaryExpression({ op: "like", lhs: left_operand.value, rhs: pattern.value }),
             ),
           )
         } else if negated.ate { unsupported_here(p) }
-        else { Ok(lhs) }
+        else { Ok(left_operand) }
       },
     }
   }
@@ -3378,9 +3388,9 @@ fn lookup_bare_column(scope: List<List<TableBinding>>, column: String, missing: 
   match scope {
     [] -> Missing(missing),
     [level, ..outer] -> {
-      let holding = level.filter(|b: TableBinding|
+      let matching_bindings = level.filter(|b: TableBinding|
         match b.table { Some(t) -> column_type_in(t, false, column) != None, None -> false });
-      match holding {
+      match matching_bindings {
         [first, second, ..] ->
           Missing(
             "names the column `" ++ column ++ "`, which `" ++ binding_table_name(first) ++ "` and `"
@@ -3520,50 +3530,82 @@ fn check_expression(
     }
   }
 
-fn is_comparison(op: String) -> Bool = ["=", "<>", "<", "<=", ">", ">="].contains(op)
+fn is_comparison(operator: String) -> Bool = ["=", "<>", "<", "<=", ">", ">="].contains(operator)
 
 fn check_operator(
   j: CheckState,
   scope: List<List<TableBinding>>,
-  op: String,
-  lhs: QueryExpression,
-  rhs: QueryExpression,
+  operator: String,
+  left_operand: QueryExpression,
+  right_operand: QueryExpression,
   want: ValueType,
   what: String,
   left: Int,
 ) -> TypeResult / {abort.raise} =
-  if op == "and" || op == "or" {
-    let l = check_expression(j, scope, lhs, BoolType, "a condition", left - 1);
-    let r = check_expression(l.j, scope, rhs, BoolType, "a condition", left - 1);
+  if operator == "and" || operator == "or" {
+    let l = check_expression(j, scope, left_operand, BoolType, "a condition", left - 1);
+    let r = check_expression(l.j, scope, right_operand, BoolType, "a condition", left - 1);
     type_result(r.j, BoolType, l.t.nullable || r.t.nullable)
-  } else if op == "||" || op == "like" {
-    let l = check_expression(j, scope, lhs, TextType, operand_description(rhs), left - 1);
-    let r = check_expression(l.j, scope, rhs, TextType, operand_description(lhs), left - 1);
-    type_result(r.j, if op == "like" { BoolType } else { TextType }, l.t.nullable || r.t.nullable)
-  } else if is_comparison(op) {
-    let pair = check_operands(j, scope, lhs, rhs, UnknownType, "", left - 1);
+  } else if operator == "||" || operator == "like" {
+    let l = check_expression(
+      j,
+      scope,
+      left_operand,
+      TextType,
+      operand_description(right_operand),
+      left - 1,
+    );
+    let r = check_expression(
+      l.j,
+      scope,
+      right_operand,
+      TextType,
+      operand_description(left_operand),
+      left - 1,
+    );
+    type_result(
+      r.j,
+      if operator == "like" { BoolType } else { TextType },
+      l.t.nullable || r.t.nullable,
+    )
+  } else if is_comparison(operator) {
+    let pair = check_operands(j, scope, left_operand, right_operand, UnknownType, "", left - 1);
     type_result(pair.j, BoolType, pair.l.nullable || pair.r.nullable)
   } else {
-    let pair = check_operands(j, scope, lhs, rhs, want, what, left - 1);
+    let pair = check_operands(j, scope, left_operand, right_operand, want, what, left - 1);
     type_result(pair.j, arithmetic_type(pair.l.ty, pair.r.ty), pair.l.nullable || pair.r.nullable)
   }
 
 fn check_operands(
   j: CheckState,
   scope: List<List<TableBinding>>,
-  lhs: QueryExpression,
-  rhs: QueryExpression,
+  left_operand: QueryExpression,
+  right_operand: QueryExpression,
   want: ValueType,
   what: String,
   left: Int,
 ) -> { j: CheckState, l: ExpressionType, r: ExpressionType } / {abort.raise} =
-  if is_placeholder(lhs) && !is_placeholder(rhs) {
-    let r = check_expression(j, scope, rhs, want, what, left);
-    let l = check_expression(r.j, scope, lhs, r.t.ty, operand_description(rhs), left);
+  if is_placeholder(left_operand) && !is_placeholder(right_operand) {
+    let r = check_expression(j, scope, right_operand, want, what, left);
+    let l = check_expression(
+      r.j,
+      scope,
+      left_operand,
+      r.t.ty,
+      operand_description(right_operand),
+      left,
+    );
     { j: l.j, l: l.t, r: r.t }
   } else {
-    let l = check_expression(j, scope, lhs, want, what, left);
-    let r = check_expression(l.j, scope, rhs, l.t.ty, operand_description(lhs), left);
+    let l = check_expression(j, scope, left_operand, want, what, left);
+    let r = check_expression(
+      l.j,
+      scope,
+      right_operand,
+      l.t.ty,
+      operand_description(left_operand),
+      left,
+    );
     { j: r.j, l: l.t, r: r.t }
   }
 
@@ -4198,7 +4240,7 @@ fn check_parameter_types(
 ) -> List<Finding> =
   placed.fold([], |accumulator: List<Finding>, p: PlaceholderType|
     match given.at(p.n - 1) {
-      Some(Some(ctor)) -> if parameter_fits(ctor, p.ty) { accumulator } else {
+      Some(Some(constructor)) -> if parameter_fits(constructor, p.ty) { accumulator } else {
         accumulator.push({
           kind: ValueMismatch,
           at: p.at,
@@ -4206,26 +4248,26 @@ fn check_parameter_types(
             ++ ", which is "
             ++ value_type_text(p.ty)
             ++ ", and the call passes a `"
-            ++ ctor
+            ++ constructor
             ++ "`",
         })
       },
       _ -> accumulator,
     })
 
-fn parameter_fits(ctor: String, ty: ValueType) -> Bool =
-  ctor == "PNull"
+fn parameter_fits(constructor: String, ty: ValueType) -> Bool =
+  constructor == "PNull"
     || (match ty {
       UnknownType -> true,
       NullType -> true,
-      TextType -> ctor == "PText",
-      IntType -> ctor == "PInt",
-      BoolType -> ctor == "PBool",
-      BytesType -> ctor == "PBytes",
-      FloatType -> ctor == "PFloat" || ctor == "PInt" || ctor == "PNumeric",
-      NumericType -> ctor == "PNumeric" || ctor == "PInt" || ctor == "PFloat",
-      JsonType -> ctor == "PJson",
-      ArrayType(_) -> ctor == "PArray",
+      TextType -> constructor == "PText",
+      IntType -> constructor == "PInt",
+      BoolType -> constructor == "PBool",
+      BytesType -> constructor == "PBytes",
+      FloatType -> constructor == "PFloat" || constructor == "PInt" || constructor == "PNumeric",
+      NumericType -> constructor == "PNumeric" || constructor == "PInt" || constructor == "PFloat",
+      JsonType -> constructor == "PJson",
+      ArrayType(_) -> constructor == "PArray",
     })
 
 /// Why a row could not be read as a value: the column, what the field expected, and what the row

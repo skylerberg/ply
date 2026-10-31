@@ -242,7 +242,7 @@ fn is_number_token(kind: TokenKind) -> Bool =
     FixedLiteral(ty, v) -> true,
     WideLiteral(ty, high, low) -> true,
     FloatLiteral(f) -> true,
-    DecimalLiteral(m, sc) -> true,
+    DecimalLiteral(m, scale) -> true,
     _ -> false,
   }
 
@@ -294,7 +294,8 @@ fn pattern_atom(
     FixedLiteral(ty, v) -> literal_pattern(input, parser, LiteralFixed(ty, v)),
     WideLiteral(ty, high, low) -> literal_pattern(input, parser, LiteralWide(ty, high, low)),
     FloatLiteral(f) -> literal_pattern(input, parser, LiteralFloat(source_text(input, st))),
-    DecimalLiteral(m, sc) -> literal_pattern(input, parser, LiteralDecimal(source_text(input, st))),
+    DecimalLiteral(m, scale) ->
+      literal_pattern(input, parser, LiteralDecimal(source_text(input, st))),
     StringLiteral(s) -> literal_pattern(input, parser, LiteralString(s)),
     BytesLiteral(b) -> literal_pattern(input, parser, LiteralBytes(b)),
     CharLiteral(v) -> literal_pattern(input, parser, LiteralChar(v)),
@@ -350,7 +351,7 @@ fn negative_literal(
         parser: a.parser,
         node: PatternLiteral({ span: s, literal: LiteralFloat(source_text(input, s)) }),
       }),
-    DecimalLiteral(mm, sc) ->
+    DecimalLiteral(mm, scale) ->
       Ok({
         parser: a.parser,
         node: PatternLiteral({ span: s, literal: LiteralDecimal(source_text(input, s)) }),
@@ -365,24 +366,33 @@ fn pattern_paren(
 ) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   if at_token(input, o.parser, token_rparen()) {
-    let cl = advance(input, o.parser);
+    let closing_paren = advance(input, o.parser);
     Ok({
-      parser: cl.parser,
-      node: PatternLiteral({ span: span_to(o.node, cl.node), literal: LiteralUnit }),
+      parser: closing_paren.parser,
+      node: PatternLiteral({ span: span_to(o.node, closing_paren.node), literal: LiteralUnit }),
     })
   } else {
     let inner = pattern(input, o.parser)?;
     if at_token(input, inner.parser, token_comma()) {
       let rest = comma_list(input, advance(input, inner.parser).parser, token_rparen(), pattern)?;
-      let cl = expect_close(input, rest.parser, token_rparen(), o.node, b"`)` to close the tuple")?;
+      let closing_paren = expect_close(
+        input,
+        rest.parser,
+        token_rparen(),
+        o.node,
+        b"`)` to close the tuple",
+      )?;
       let items = prepend(inner.node, rest.node);
       if items.len() == 1 {
-        Ok({ parser: cl.parser, node: set_pattern_span(inner.node, span_to(o.node, cl.node)) })
+        Ok({
+          parser: closing_paren.parser,
+          node: set_pattern_span(inner.node, span_to(o.node, closing_paren.node)),
+        })
       } else {
         Ok({
-          parser: cl.parser,
+          parser: closing_paren.parser,
           node: PatternRecord({
-            span: span_to(o.node, cl.node),
+            span: span_to(o.node, closing_paren.node),
             rest: false,
             fields: range(0, items.len()).map(|i: Int| -> { name: Identifier, pattern: Pattern } {
               match items.at(i) {
@@ -412,7 +422,7 @@ fn pattern_named(
   } else if at_token(input, q.parser, token_lparen()) {
     let o = advance(input, q.parser);
     let args = comma_list(input, o.parser, token_rparen(), pattern)?;
-    let cl = expect_close(
+    let closing_paren = expect_close(
       input,
       args.parser,
       token_rparen(),
@@ -420,8 +430,12 @@ fn pattern_named(
       b"`)` to close the constructor arguments",
     )?;
     Ok({
-      parser: cl.parser,
-      node: PatternConstructor({ span: span_to(span, cl.node), name: q.node, args: args.node }),
+      parser: closing_paren.parser,
+      node: PatternConstructor({
+        span: span_to(span, closing_paren.node),
+        name: q.node,
+        args: args.node,
+      }),
     })
   } else {
     Ok({
@@ -441,7 +455,7 @@ fn list_pattern(
 ) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: b } = list_items(input, o.parser, o.node)?;
-  let { parser, node: cl } = expect_close(
+  let { parser, node: closing_bracket } = expect_close(
     input,
     parser,
     token_rbracket(),
@@ -450,7 +464,7 @@ fn list_pattern(
   )?;
   Ok({
     parser: parser,
-    node: PatternList({ span: span_to(o.node, cl), rest: b.rest, items: b.items }),
+    node: PatternList({ span: span_to(o.node, closing_bracket), rest: b.rest, items: b.items }),
   })
 }
 
@@ -515,7 +529,7 @@ fn record_pattern(
 ) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: b } = record_fields(input, o.parser, o.node)?;
-  let { parser, node: cl } = expect_close(
+  let { parser, node: closing_brace } = expect_close(
     input,
     parser,
     token_rbrace(),
@@ -527,7 +541,7 @@ fn record_pattern(
       parser,
       b.fields.map(|f: { name: Identifier, pattern: Pattern }| f.name),
     ),
-    node: PatternRecord({ span: span_to(o.node, cl), rest: b.rest, fields: b.fields }),
+    node: PatternRecord({ span: span_to(o.node, closing_brace), rest: b.rest, fields: b.fields }),
   })
 }
 
@@ -627,8 +641,8 @@ pub fn dump_pattern(pattern: Pattern) -> Bytes / {abort.raise} =
 fn dump_pattern_field(f: { name: Identifier, pattern: Pattern }) -> Bytes / {abort.raise} =
   dump_identifier(f.name).concat(dump_pattern(f.pattern))
 
-pub fn dump_pattern_of(src: Bytes) -> String / {abort.raise} = {
-  let s = start(src);
+pub fn dump_pattern_of(source: Bytes) -> String / {abort.raise} = {
+  let s = start(source);
   let r = parsed_or(pattern(s.input, s.parser), no_pattern());
   String::of_bytes(dump_pattern(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
@@ -767,8 +781,8 @@ fn join_shapes(patterns: List<Pattern>) -> Bytes =
     if accumulator.len() == 0 { shape(pattern) }
     else { Bytes::concat_all([accumulator, b", ", shape(pattern)]) })
 
-fn expanded(src: Bytes) -> List<Bytes> / {abort.raise} = {
-  let s = start(src);
+fn expanded(source: Bytes) -> List<Bytes> / {abort.raise} = {
+  let s = start(source);
   alternatives_of(parsed_or(pattern(s.input, s.parser), no_pattern()).node).map(shape)
 }
 

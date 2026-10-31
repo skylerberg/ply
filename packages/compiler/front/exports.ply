@@ -387,10 +387,13 @@ pub fn imports_read(
     else {
       match d.kind {
         SelectedNames(ns) -> {
-          let kept = ns.filter(|n: Identifier|
+          let mentioned_names = ns.filter(|n: Identifier|
             named.contains(mention_key({ module: target, name: n.name })));
-          if kept.len() == 0 { accumulator } else {
-            accumulator.push({ declaration: { ..d, kind: SelectedNames(kept) }, target: target })
+          if mentioned_names.len() == 0 { accumulator } else {
+            accumulator.push({
+              declaration: { ..d, kind: SelectedNames(mentioned_names) },
+              target: target,
+            })
           }
         },
         _ -> if modules.contains(target) { accumulator.push({ declaration: d, target: target }) }
@@ -591,7 +594,7 @@ pub fn exports_of(
   let owners = named_in(raw, parsed);
   let functions = fn_owners(raw, parsed);
   let targets = import_targets(analysis, i);
-  let sc = scopes(parsed, raw, targets);
+  let mention_scopes = scopes(parsed, raw, targets);
   let fn_owner = |name: Bytes|
     match functions.get(simple_of(module, name)) { Some(o) -> o, None -> b"" };
   let contracts = analysis.hashes.contracts.fold(
@@ -641,9 +644,12 @@ pub fn exports_of(
             fs.filter(|f: Item| derives.contains(span_key(item_span(f)))).map(interface_item),
           ),
         );
-        let expansion = if fs.len() == 0 { [] } else { mentioned(sc.expanded, alone(text, fs)) };
+        let expansion = if fs.len() == 0 { [] }
+        else { mentioned(mention_scopes.expanded, alone(text, fs)) };
         let mentions = distinct(
-          mentioned(sc.written, stated).concat(expansion).concat(hidden_import_mentions(printed)),
+          mentioned(mention_scopes.written, stated).concat(expansion).concat(
+            hidden_import_mentions(printed),
+          ),
         ).filter(|m: Mention| !(m.module == module && m.name == o));
         let runtimes = deriver_modules_of(raw, its);
         accumulator.insert(o, {
@@ -709,20 +715,20 @@ pub fn imported_mentions_in(
   tokens: List<Token>,
   targets: List<Bytes>,
 ) -> List<Mention> / {abort.raise} = {
-  let sc = scopes(parsed, raw, targets);
+  let mention_scopes = scopes(parsed, raw, targets);
   let expansion = generated_by_owner(raw, parsed, fn_owners(raw, parsed)).fold(
     [],
     |accumulator: List<Mention>, _: Bytes, fs: List<Item>|
-      accumulator.concat(mentioned(sc.expanded, alone(text, fs))),
+      accumulator.concat(mentioned(mention_scopes.expanded, alone(text, fs))),
   );
-  let selected = sc.written.selected.fold(
+  let selected = mention_scopes.written.selected.fold(
     [],
     |accumulator: List<Mention>, n: Bytes, ms: List<Bytes>|
       accumulator.concat(ms.map(|m: Bytes| { module: m, name: n })),
   );
   let runtimes = deriver_modules_of(raw, raw.items).map(|m: Bytes| { module: m, name: b"" });
   distinct(
-    mentioned_in(sc.written, tokens).concat(expansion).concat(selected).concat(
+    mentioned_in(mention_scopes.written, tokens).concat(expansion).concat(selected).concat(
       runtimes.concat(hidden_of(raw)),
     ),
   ).filter(|m: Mention| m.module != parsed.name)
@@ -786,13 +792,13 @@ pub fn needed_entries<x | e>(
               if have.contains(h.owner) { accumulator } else { accumulator.push({ head: h, x: e }) }
             },
           );
-          let asked = s.asked.insert(mention_key(m), true);
+          let visited_mentions = s.asked.insert(mention_key(m), true);
           if fresh.len() == 0 {
             Continue({
               out: if s.out.contains(m.module) || m.name.starts_with(b"::")
                   || entries(m.module, b"").len() == 0 { s.out }
               else { s.out.insert(m.module, have) },
-              asked: asked,
+              asked: visited_mentions,
               work: rest,
             })
           } else {
@@ -802,7 +808,7 @@ pub fn needed_entries<x | e>(
                 fresh.fold(have, |h: Map<Bytes, x>, f: { head: InterfaceHeader, x: x }|
                   h.insert(f.head.owner, f.x)),
               ),
-              asked: asked,
+              asked: visited_mentions,
               work: fresh.fold(rest, |w: List<Mention>, f: { head: InterfaceHeader, x: x }|
                 w.concat(f.head.mentions.concat(publishing(m.module, f.head.owner)))),
             })
@@ -921,17 +927,17 @@ fn staged_with_interfaces(
   placing: (Bytes) -> ModuleOrigin / {abort.raise},
   reading: CheckInputs,
 ) -> { staged: StagedLoad, at: Int } / {abort.raise} = {
-  let standing = dependencies.fold(
+  let dependency_sources = dependencies.fold(
     [],
     |accumulator: List<{ placed: ModuleOrigin, source: Source }>, m: Bytes, es: Map<Bytes, OwnerInterface>|
       accumulator.push({ placed: placing(m), source: interface_source(m, es) }),
   );
-  let rooted = standing.fold(
+  let rooted = dependency_sources.fold(
     [],
     |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
       match x.placed { InRoot -> accumulator.push(x.source), _ -> accumulator },
   );
-  let standing_in = standing.fold(
+  let standing_in = dependency_sources.fold(
     [],
     |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
       match x.placed { ShippedModule -> accumulator.push(x.source), _ -> accumulator },
@@ -941,7 +947,7 @@ fn staged_with_interfaces(
     standing_in
   } else { standing_in.push(interface_source(prelude_module(), Map::new())) };
   let supplied = range(0, reading.packages.supplied.len()).map(|i: Int| {
-    let held = standing.fold(
+    let package_sources = dependency_sources.fold(
       [],
       |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
         match x.placed {
@@ -953,9 +959,9 @@ fn staged_with_interfaces(
     {
       ..reading.packages.supplied.get(i),
       modules: match placed {
-        InPackage(k, rel) -> if k == i + 1 { held.push({ name: rel, src: source.src }) }
-        else { held },
-        _ -> held,
+        InPackage(k, rel) -> if k == i + 1 { package_sources.push({ name: rel, src: source.src }) }
+        else { package_sources },
+        _ -> package_sources,
       },
     }
   });
@@ -977,7 +983,7 @@ fn staged_with_interfaces(
     { nodes: fixed, tests: [], laws: [] },
     reading.embeds,
     tested: reading.tested,
-    reached: false,
+    cut_unused: false,
     data: reading.data,
     unread: {
       let staged = shipped.concat(reading.all_sources).fold(
@@ -998,7 +1004,7 @@ fn staged_with_interfaces(
             ds.concat(e.derived)),
         }),
     ),
-    judged: reading.judged,
+    package_verdicts: reading.judged,
     checked: Some(source.name),
   );
   {
@@ -1318,12 +1324,14 @@ pub fn group_source_from(
     None -> Map::new(),
   };
   let dependencies = needed.remove(module);
-  let held = siblings.fold([], |accumulator: List<OwnerInterface>, _: Bytes, e: OwnerInterface|
-    accumulator.push(e));
+  let sibling_interfaces = siblings.fold(
+    [],
+    |accumulator: List<OwnerInterface>, _: Bytes, e: OwnerInterface| accumulator.push(e),
+  );
   let written = print_standalone(
     b"",
     merged_imports(
-      held.push({
+      sibling_interfaces.push({
         transitive_digest: b"",
         owner: b"",
         text: own,
@@ -1350,13 +1358,13 @@ pub fn group_source_from(
         written,
         own,
         b"\n\n",
-        Bytes::join(held.map(|e: OwnerInterface| e.text), b"\n"),
+        Bytes::join(sibling_interfaces.map(|e: OwnerInterface| e.text), b"\n"),
       ]),
     },
     offset: written.len(),
     items: item_layout(members),
     derived: members.fold(
-      held.fold([], |accumulator: List<Derivation>, e: OwnerInterface|
+      sibling_interfaces.fold([], |accumulator: List<Derivation>, e: OwnerInterface|
         accumulator.concat(e.derived)),
       |accumulator: List<Derivation>, o: OwnerText| accumulator.concat(o.derived),
     ),
@@ -1657,8 +1665,8 @@ fn per_owner(
 }
 
 test "a test checked alone gets the same name as in its module, even when an earlier test has the same label" {
-  let src = b"test \"holds {n}\" for n: Int in [1] { assert(n > 0) }\n\n// the second\ntest \"holds {n}\" for n: Int in [2] { assert(n > 0) }\n";
-  let sources = [{ name: b"m", src: src }];
+  let source = b"test \"holds {n}\" for n: Int in [1] { assert(n > 0) }\n\n// the second\ntest \"holds {n}\" for n: Int in [2] { assert(n > 0) }\n";
+  let sources = [{ name: b"m", src: source }];
   let shipped = [
     {
       name: b"std.cases",
@@ -1962,13 +1970,13 @@ test "a call on a locally bound name depends only on the called function's name,
 }
 
 test "a definition's tokens, with or without its signature, equal the tokens from lexing its source texts joined, and give the same mentions" {
-  let src = b"import std.list\npub type Shape =\n  | Dot\n  | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> abs(n),\n  }\npub transparent fn twice(n: Int) -> Int = n + n\nfn named(s: Shape) -> String = \"shape of {size(s)}\"\nfn listed(xs: List<Int>) -> Int = {\n  let ys = List::rotate(xs, 1);\n  ys.len() + twice(1)\n}\nfn small() -> Set<Int> = #[1, 2]\ntest \"the size of a line of {n}\" for n: Int in [1, 2] {\n  assert_eq(size(Line(n)), n)\n}\n";
-  let parsed = parse_at(0, { name: b"m", src: src }).module;
-  let raw = parse(src).node;
-  let tokens = lex(src).tokens;
+  let source = b"import std.list\npub type Shape =\n  | Dot\n  | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> abs(n),\n  }\npub transparent fn twice(n: Int) -> Int = n + n\nfn named(s: Shape) -> String = \"shape of {size(s)}\"\nfn listed(xs: List<Int>) -> Int = {\n  let ys = List::rotate(xs, 1);\n  ys.len() + twice(1)\n}\nfn small() -> Set<Int> = #[1, 2]\ntest \"the size of a line of {n}\" for n: Int in [1, 2] {\n  assert_eq(size(Line(n)), n)\n}\n";
+  let parsed = parse_at(0, { name: b"m", src: source }).module;
+  let raw = parse(source).node;
+  let tokens = lex(source).tokens;
   let scope = module_scope(parsed, raw, raw.imports.map(import_path));
   let kinds = |ts: List<Token>| ts.map(|t: Token| t.kind);
-  let reads = owner_texts(parsed, raw, src);
+  let reads = owner_texts(parsed, raw, source);
   assert_eq(reads.len(), 7);
   for_all(reads, |o: OwnerText|
     for_all(
@@ -1981,7 +1989,7 @@ test "a definition's tokens, with or without its signature, equal the tokens fro
         let alone = lex(joined).tokens;
         assert_eq(kinds(r.lexed), kinds(alone));
         assert_eq(
-          owner_mentions(b"m", scope, r.read, src, r.lexed),
+          owner_mentions(b"m", scope, r.read, source, r.lexed),
           owner_mentions(b"m", scope, r.read, joined, alone),
         )
       },
