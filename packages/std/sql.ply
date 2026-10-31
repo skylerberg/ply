@@ -4483,7 +4483,7 @@ pub fn array_field<a>(r: FieldCodec<a>) -> FieldCodec<List<a>> =
     write: |xs: List<a>| ArrayParameter(xs.map(r.write)),
   }
 
-test "a statement's words fold and a quoted identifier keeps its case" {
+test "the tokenizer lowercases keywords and unquoted names, and a quoted identifier keeps its original case" {
   assert_eq(
     sql_tokenize_summary(Postgres, "SELECT t.Sku FROM parts AS t"),
     Ok([
@@ -4527,7 +4527,7 @@ test "a semicolon is its own token, and one inside a literal is text" {
   assert_eq(sql_tokenize_summary(Postgres, "select 'it''s'"), Ok(["word:select", "text:'it''s'"]))
 }
 
-test "a placeholder is not a dollar quote, and a string may be escaped" {
+test "`$1` is a placeholder token, not the start of a `$tag$` quoted string, and `e'..'`, `b'..'` and `x'..'` literals are text tokens" {
   assert_eq(
     sql_tokenize_summary(Postgres, "select $1, $23"),
     Ok(["word:select", "placeholder:$1", "punct:,", "placeholder:$23"]),
@@ -4592,7 +4592,7 @@ test "a quote that is never closed is rejected, not guessed at" {
 
 fn is_error<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, Ok(_) -> false }
 
-test "SQLite's lexer is its own: no nested comment, no dollar quote, three quotes for a name" {
+test "SQLite tokenizing differs from Postgres: block comments do not nest, `$tag$` strings are not recognized, and backticks, brackets and double quotes quote names" {
   assert_eq(
     sql_tokenize_summary(Sqlite, "select /* a /* b */ random() -- c\n"),
     Ok(["word:select", "word:random", "punct:(", "punct:)"]),
@@ -4657,7 +4657,7 @@ fn sqlite_kind_cases() -> List<KindCase> =
     { sql: "insert into time (at) values (?1)", kind: Insert },
   ]
 
-test "the parser reports what {c.sql} does" for c: KindCase in sqlite_kind_cases() {
+test "`scan_statement` returns the expected statement kind for the SQLite statement {c.sql}" for c: KindCase in sqlite_kind_cases() {
   assert_eq(scan_statement(Sqlite, c.sql).map(|s: SqlScan| s.kind), Ok(c.kind))
 }
 
@@ -4688,11 +4688,11 @@ fn sqlite_rejection_cases() -> List<ErrorCase> =
     { sql: "select 1 where a = $1", at: 19 },
   ]
 
-test "the parser rejects {c.sql} at the right byte" for c: ErrorCase in sqlite_rejection_cases() {
+test "`scan_statement` rejects the SQLite statement {c.sql} and reports the byte offset where it fails" for c: ErrorCase in sqlite_rejection_cases() {
   assert_eq(scan_statement(Sqlite, c.sql).map_err(|e: DbError| rejection_byte(e)), Err(Some(c.at)))
 }
 
-test "an error's byte is the one after its last marker, whatever the statement quotes" {
+test "`rejection_byte` returns the number after the last `at byte` in an error message, even when the quoted statement also contains `at byte`, and returns `None` when the message has none" {
   assert_eq(
     rejection_byte(db_error("0A000", "", "`' at byte 9'` at byte 31. the statement ends here")),
     Some(31),
@@ -4742,7 +4742,7 @@ test "a join names both tables" {
   assert_eq(scan_names("select * from a join b using (x)"), ["a", "b"])
 }
 
-test "a set operation names every arm" {
+test "a set operation (`union`, `intersect`, `except`) reports the tables of every select in it" {
   assert_eq(scan_names("select sku from items union all select sku from orders"), [
     "items",
     "orders",
@@ -4755,7 +4755,7 @@ test "a set operation names every arm" {
   assert_eq(scan_names("(select a from x) union (select a from y)"), ["x", "y"])
 }
 
-test "a subquery is followed rather than ignored" {
+test "the tables used inside subqueries are included in the tables a statement reads" {
   assert_eq(scan_names("select sku from items where sku in (select sku from orders)"), [
     "items",
     "orders",
@@ -4832,18 +4832,18 @@ test "a schema-qualified name is its last segment" {
   assert_eq(scan_names("insert into public.items values ($1)"), ["items"])
 }
 
-test "case folding follows postgres rather than the parser" {
+test "unquoted table names are lowercased as Postgres does, and quoted names keep their case" {
   assert_eq(scan_names("SELECT * FROM Items"), ["items"]);
   assert_eq(scan_names("select * from \"Items\""), ["Items"]);
   assert_eq(scan_names("select * from \"has space\""), ["has space"])
 }
 
-test "a second statement is rejected and named" {
+test "a second statement after a semicolon is rejected, and the error gives its position" {
   assert(scan_rejects_at("select 1 from items; drop table items", 19));
   assert(scan_rejects("insert into items values (1); delete from items"))
 }
 
-test "a semicolon inside a literal is text" {
+test "a semicolon inside a string literal or quoted name does not end the statement" {
   assert_eq(scan_names("select * from items where sku = '; drop table items; --'"), ["items"]);
   assert_eq(scan_names("select * from items where sku = $tag$; drop table items$tag$"), ["items"]);
   assert_eq(scan_names("select * from items where sku = $$;$$"), ["items"]);
@@ -4852,7 +4852,7 @@ test "a semicolon inside a literal is text" {
   assert_eq(scan_names("select * from \"weird;name\""), ["weird;name"])
 }
 
-test "a comment is not statement text" {
+test "comments are ignored when scanning a statement, and an unclosed comment is rejected" {
   assert_eq(scan_names("select 1 from items -- ; drop table items"), ["items"]);
   assert_eq(scan_names("select 1 /* ; drop table items */ from items"), ["items"]);
   assert_eq(scan_names("select 1 /* outer /* inner ; */ still comment */ from items"), ["items"]);
@@ -4865,7 +4865,7 @@ test "an unterminated literal is rejected rather than guessed at" {
   assert(scan_rejects_at("select * from items where sku = $tag$open", 32))
 }
 
-test "every statement shape outside the allowed set is rejected" {
+test "statements other than select, insert, update, delete, values and with are rejected, as is empty text" {
   assert(scan_rejects("create table t (a int)"));
   assert(scan_rejects("alter table t add column b int"));
   assert(scan_rejects("drop table t"));
@@ -4888,7 +4888,7 @@ test "every statement shape outside the allowed set is rejected" {
   assert(scan_rejects("   "))
 }
 
-test "a construct the parser cannot account for is rejected by name" {
+test "constructs whose table reads or writes the scanner cannot report, such as row locks and upserts, are rejected" {
   // A set-returning function's relations live in a function body.
   assert(scan_rejects("select * from generate_series(1, 10)"));
   // A row lock is a write the parser has no way to report through a read.
@@ -4900,7 +4900,7 @@ test "a construct the parser cannot account for is rejected by name" {
   assert(scan_rejects("select * from (items join orders on true)"))
 }
 
-test "an alias in the select list is a name and not a clause" {
+test "a column alias in the select list is not read as a table name" {
   assert_eq(scan_names("select id as ident from items"), ["items"]);
   assert_eq(scan_names("select count(*) as n from items"), ["items"]);
   assert_eq(scan_names("select id ident from items"), ["items"]);
@@ -4959,7 +4959,7 @@ fn nested_selects(n: Int) -> String = nested_from("select * from items", n)
 fn nested_from(sql: String, n: Int) -> String =
   if n <= 0 { sql } else { nested_from("select * from (" ++ sql ++ ") t", n - 1) }
 
-test "malformed input gets a result and never a panic" {
+test "malformed SQL makes `scan_statement` return normally and never panic" {
   // A panic would fail this test, so calling the parser is the assertion: whatever it returns is
   // fine, as long as a program that built the text is not killed by the driver's own check.
   let _ = scan_statement(Postgres, "select");
@@ -4993,7 +4993,7 @@ test "malformed input gets a result and never a panic" {
   assert(scan_rejects("with a as ("))
 }
 
-test "the payloads that change a statement's shape are rejected" {
+test "a statement with an injected second statement is rejected, and an injected `union select` lists its second table" {
   assert(scan_rejects("select * from items where sku = '' ; drop table items --'"));
   // Accepted here: the injected table is in the scan, so the effects check rejects it.
   assert_eq(scan_names("select * from items where sku = '' union select * from pg_shadow --'"), [
@@ -5004,12 +5004,12 @@ test "the payloads that change a statement's shape are rejected" {
   assert_eq(scan_names("select * from items where sku = '' or 1=1"), ["items"])
 }
 
-test "a placeholder is a token and never a value" {
+test "a `$1` placeholder is scanned as a parameter and is never replaced by text" {
   assert_eq(scan_names("select * from items where sku = $1 and n > $22"), ["items"]);
   assert_eq(scan_names("insert into items values ($1, $2, $3) returning sku"), ["items"])
 }
 
-test "the statement kind is reported so a read label over a write can be rejected" {
+test "the scan reports whether a statement writes, so a read-only call that runs a write statement can be rejected" {
   assert(!kind_writes(scan_ok("select * from items").kind));
   assert(!kind_writes(scan_ok("values (1), (2)").kind));
   assert(kind_writes(scan_ok("insert into items values ($1)").kind));
@@ -5079,7 +5079,7 @@ fn test_row_findings(row: List<Field>, sql: String) -> List<FindingKind> / {abor
     |f: Finding| f.kind,
   )
 
-test "a table or a column the schema does not declare is found where the statement names it" {
+test "the check reports an error at the position of a table or column the schema does not declare" {
   let reads = test_site(Reads, "items");
   assert_eq(
     test_findings(reads, "select sku, name, price from items where on_hand > $1 order by sku"),
@@ -5108,7 +5108,7 @@ test "a table or a column the schema does not declare is found where the stateme
   )
 }
 
-test "a column in two tables is named with its table, and a left join's columns may be null" {
+test "a column in two tables must be qualified with its table name, and left-joined columns must be optional" {
   assert_eq(
     check_statement(
       Some(test_schema()),
@@ -5130,7 +5130,7 @@ test "a column in two tables is named with its table, and a left join's columns 
   )
 }
 
-test "the label is one of the statement's tables, and the call performs what the statement does" {
+test "the check fails when the call's table is not in the statement or its operation differs from the statement's" {
   assert_eq(test_findings(test_site(Reads, "orders"), "select sku from items"), [
     { kind: LabelMismatch, at: 0 },
   ]);
@@ -5153,7 +5153,7 @@ test "the label is one of the statement's tables, and the call performs what the
   )
 }
 
-test "a `*` is found, and what the check does not follow is named where it stops" {
+test "the check reports `*` selections and unsupported constructs at their position in the statement" {
   let reads = test_site(Reads, "items");
   assert_eq(test_findings(reads, "select * from items"), [{ kind: SelectStar, at: 7 }]);
   assert_eq(test_findings(reads, "select i.* from items i"), [{ kind: SelectStar, at: 7 }]);
@@ -5219,7 +5219,7 @@ test "a call passes as many parameters as the statement has placeholders" {
   )
 }
 
-test "a row type's fields are checked against a statement's columns, by name, type and null" {
+test "the check fails when a row type's fields differ from the statement's columns in name, type or nullability" {
   let priced = "select sku, price from items";
   assert_eq(
     test_row_findings([field("sku", text_field()), field("price", numeric_field())], priced),
@@ -5254,7 +5254,7 @@ test "a row type's fields are checked against a statement's columns, by name, ty
   )
 }
 
-test "without a schema, the check compares a statement with its call alone" {
+test "without a schema, the check compares a statement only with the call's table and operation" {
   assert_eq(check_statement(None, test_site(Reads, "items"), "select nmae from items"), []);
   assert_eq(
     check_statement(None, test_site(Reads, "items"), "delete from items").map(|f: Finding| f.kind),
@@ -5262,7 +5262,7 @@ test "without a schema, the check compares a statement with its call alone" {
   )
 }
 
-test "for text the parser rejects, the check reports only that" {
+test "for SQL the parser rejects, the check reports a single unreadable-statement error" {
   assert_eq(test_findings(test_site(Reads, "items"), "select sku from items; drop table items"), [
     { kind: Unreadable, at: 21 },
   ])
@@ -5288,7 +5288,7 @@ test "a SQLite statement is checked in its own dialect, its columns named as SQL
   )
 }
 
-test "a statement the check cannot follow gets a result and never a panic" {
+test "the check returns findings and never panics on unsupported or malformed statements" {
   let reads = test_site(Reads, "items");
   let _ = check_statement(Some(test_schema()), reads, "select sku from items where (");
   let _ = check_statement(
@@ -5338,7 +5338,7 @@ fn test_part_row() -> RowCodec<TestPart> =
       [to_parameter(text_field(), p.sku), to_parameter(optional_field(text_field()), p.note)],
   }
 
-test "a row reads into its fields, and a column of another type reports which" {
+test "a row decodes into its fields, and a column of the wrong type returns an error naming the column" {
   let row = Map::new().insert("sku", TextDatum("a")).insert("note", NullDatum);
   assert_eq(decode_rows(Rows([row]), test_part_row()), Ok([{ sku: "a", note: None }]));
   assert_eq(

@@ -2061,7 +2061,7 @@ test "a reply past a limit is rejected, whether or not its line has ended" {
   )
 }
 
-test "a reply is written as a server writes it" {
+test "`render_reply` writes a reply in SMTP wire format, and `reply` rejects invalid text" {
   assert_eq(render_reply(reply_of(250, ["OK"])), b"250 OK\r\n");
   assert_eq(render_reply(reply_of(250, [""])), b"250\r\n");
   assert_eq(
@@ -2092,7 +2092,7 @@ fn reads_or_rejects(given: Bytes, limits: Limits) -> Bool =
     Err(_) -> false,
   }
 
-test "any bytes are a reply within the limits or are rejected, and a reply read writes as bytes that read back as it" {
+test "parsing any bytes as an SMTP reply either succeeds within the line and reply size limits or is rejected, including for truncated input" {
   gen::check2(gen::bytes(), gen::any_int(), |data: Bytes, cut: Int| {
     let tight: Limits = { line: 24, reply: 60, scram_iterations: 1, transcript: 0 };
     let lined = Bytes::concat_all([b"250-", data, b"\r\n250 ", data, b"\r\n"]);
@@ -2142,7 +2142,7 @@ test "the enhanced status {show(s.text)} is a class, a subject and a detail, or 
 fn option_parts(s: Option<Status>) -> Option<List<Int>> =
   match s { Some(held) -> Some(status_parts(held)), None -> None }
 
-test "a reply's status is the one its text starts with, if that is of the code's class" {
+test "`enhanced_status` returns the status code at the start of a reply's text, only if its first digit matches the first digit of the reply code" {
   assert_eq(show(enhanced_status(reply_of(550, ["5.1.1 No such user"]))), "Some(5.1.1)");
   assert_eq(show(enhanced_status(reply_of(250, ["2.1.5 Ok", "2.1.5 more"]))), "Some(2.1.5)");
   assert_eq(
@@ -2244,7 +2244,7 @@ fn stuffings() -> List<StuffingCase> =
     { body: b"\r\n.", expect: b"\r\n.." },
   ]
 
-test "a line that starts with a dot is sent with one more: {s.body}" for s: StuffingCase in stuffings(
+test "`dot_stuff` adds a dot to each line of the body that starts with a dot, and `unstuff` removes it: {s.body}" for s: StuffingCase in stuffings(
   ) {
   assert_eq(dot_stuff(s.body), s.expect);
   assert_eq(unstuff(s.expect), s.body)
@@ -2264,11 +2264,11 @@ fn lined() -> Gen<Lines> =
 
 fn unlined(l: Lines) -> Bytes = match l { Lines(body) -> body }
 
-test "a stuffed body is unstuffed to what it was" {
+test "`unstuff` reverses `dot_stuff` for any bytes, giving back the original body" {
   gen::check(gen::bytes(), |x: Bytes| inverse(dot_stuff, unstuff, x))
 }
 
-test "no line of a stuffed body is a lone dot" {
+test "`dot_stuff` output never has a line that is only a dot, which would end the message body early" {
   gen::check2(lined(), gen::bytes(), |l: Lines, raw: Bytes| {
     [unlined(l), raw].all(|body: Bytes| !b"\r\n".concat(dot_stuff(body)).contains(b"\r\n.\r\n"))
   })
@@ -2316,7 +2316,7 @@ fn flawed() -> List<MessageErrorCase> =
     { what: "one line left open", data: b"a", expect: Some(Unterminated) },
   ]
 
-test "a message that is not CRLF lines is rejected where it breaks, never repaired: {f.what}" for f: MessageErrorCase in flawed(
+test "`message_error` returns the byte offset where a message stops being CRLF-terminated lines, and does not repair it: {f.what}" for f: MessageErrorCase in flawed(
   ) { assert_eq(message_error(f.data), f.expect) }
 
 test "a parameter's text is carried as printable ASCII" {
@@ -3117,7 +3117,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
     },
   ]
 
-test "a message is sent as recorded, and what became of it is reported for each recipient: {r.what}" for r: RecordingCase in sendings(
+test "replaying a recorded successful SMTP exchange sends the recorded bytes and reports each recipient's result: {r.what}" for r: RecordingCase in sendings(
   ) {
   let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
   assert_eq(got.exchange, r.exchange);
@@ -3456,7 +3456,7 @@ fn failings() -> List<RecordingCase> / {email.fail, abort.raise} =
     },
   ]
 
-test "an exchange that goes wrong fails where it does, and for the reason it does: {r.what}" for r: RecordingCase in failings(
+test "replaying a recorded failing SMTP exchange sends the recorded bytes and ends with the expected error: {r.what}" for r: RecordingCase in failings(
   ) {
   let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
   assert_eq(got.exchange, r.exchange);
@@ -3475,7 +3475,7 @@ fn split_server_reads(beats: List<ServerEvent>, size: Int) -> List<ServerEvent> 
 
 // An unsolicited reply is told apart only by arriving before its command, so that recording is
 // left out.
-test "however the server's bytes are cut into reads, the client sends the same and ends the same" {
+test "the client sends the same bytes and ends in the same state however the server's bytes are split across reads" {
   let cases = sendings().concat(failings()).filter(|r: RecordingCase| r.ended != Err(Unsolicited));
   let differing = cases.flat_map(|r: RecordingCase| {
     let whole = replayed(configured(r.client), r.secure, r.acts, r.exchange);
@@ -3622,7 +3622,7 @@ fn provings() -> List<AuthCase> / {abort.raise} =
     },
   ]
 
-test "a credential goes to the server as a secret and nowhere else: not into an error, a shown turn, the lines a session keeps, or the plain bytes it writes, under {p.what}" for p: AuthCase in provings(
+test "a credential is sent to the server in a `Secret`, and does not appear in errors, displayed values, the session's recorded lines or plain bytes, under {p.what}" for p: AuthCase in provings(
   ) {
   let got = replayed(configured(p.client), p.secure, [], p.exchange);
   let wire = String::of_bytes_lossy(got.wire);
@@ -3638,7 +3638,7 @@ test "a credential goes to the server as a secret and nowhere else: not into an 
   )
 }
 
-test "a turn that carries a credential shows stars where it carries it" {
+test "displaying a session that uses a credential shows `****` in place of the credential" {
   let got = replayed(
     with_credential(client(), tim_password()),
     true,
@@ -3658,7 +3658,7 @@ test "a turn that carries a credential shows stars where it carries it" {
 
 fn ehlo_reply(lines: List<String>) -> Bytes = render_reply({ code: Code(250), lines: lines })
 
-test "what a server offered before TLS is forgotten: after it the client knows only the reply to the second EHLO" {
+test "after STARTTLS the client discards the capabilities listed before TLS and uses only those in the next EHLO reply" {
   gen::check2(replies(), replies(), |before: Reply, after: Reply| {
     match try[smtp.fail] { config("client.example", default_limits()) } {
       Err(_) -> false,
@@ -3824,7 +3824,7 @@ fn driven_as(chunks: List<Bytes>, envelope: Envelope, secure: Bool, shape: Int) 
 fn server_greeting() -> List<Bytes> =
   [b"220 mx.example ESMTP\r\n", b"250-mx.example\r\n250-PIPELINING\r\n250 SMTPUTF8\r\n"]
 
-test "whatever a server sends, the client replies or raises an error: it fails no other way, stores no more than its limit, and writes whole lines" {
+test "for any bytes a server sends, the client either succeeds or fails with an SMTP error, and never panics or loops" {
   gen::check3(
     scripts(),
     email::envelopes(),
@@ -3938,7 +3938,7 @@ fn submission() -> String =
   \\C: QUIT
   \\S: 221 2.0.0 Bye
 
-test "a session over TLS from its first byte is verified as its host, writes what the engine returns, waits each phase's time, and is closed once" {
+test "a session that starts with TLS checks the server's host name, sends the same bytes as the engine replay, uses the configured timeouts, and closes the connection once" {
   let c = with_credential(client(), tim_password());
   let envelope = email::envelope_of(ReturnTo(test_sender()), test_recipients(["Jones", "Green"]));
   let ran = on_mx(serving(465, [implicit(submission())]), || {
@@ -3957,7 +3957,7 @@ test "a session over TLS from its first byte is verified as its host, writes wha
   assert_eq(ran.net.closed, [1])
 }
 
-test "a session's credential reaches the server whole in its line, and no plain byte contains it" {
+test "a session sends the full password in its `AUTH` line, and the transcript shows `AUTH PLAIN ****` without the encoded password" {
   let script = [
     net::Upgrades,
     net::Sends(b"220 mx.example ESMTP\r\n"),
@@ -3992,7 +3992,7 @@ test "a session's credential reaches the server whole in its line, and no plain 
   assert_eq(net::mem_remaining_script(ran.net, 1), [])
 }
 
-test "STARTTLS over a connection: only EHLO and STARTTLS are sent in the clear, and the credential after the upgrade" {
+test "with STARTTLS, only EHLO and STARTTLS are sent unencrypted, and the credential is sent only after the connection is upgraded to TLS" {
   let r = sendings().get(1);
   let jones = email::envelope_of(ReturnTo(test_sender()), test_recipients(["Jones", "Green"]));
   let brown = email::envelope_of(ReturnTo(test_sender()), test_recipients(["Brown"]));
@@ -4053,7 +4053,7 @@ fn run_acts<[l]>(
       },
   ).outcomes
 
-test "every recording with no credential in it, played by a server that checks each line the client sends, ends over a connection as it does in the engine" {
+test "each recorded exchange without a credential, played to a server that checks every client line, ends with the same result and sends the same bytes as the engine replay" {
   let cases = sendings().concat(failings()).filter(|r: RecordingCase| !r.exchange.contains("****"));
   let differing = cases.filter(|r: RecordingCase| {
     let port = if r.secure { 465 } else { 587 };
@@ -4107,7 +4107,7 @@ test "plaintext waiting at the upgrade is rejected before TLS, whether the clien
   )
 }
 
-test "a connection that starts in the clear is rejected when its server is not verified, and used as it is when no TLS is requested" {
+test "a STARTTLS connection fails and closes when the server cannot be verified, and with TLS set to plain the client never starts TLS" {
   let offer = [
     net::Sends(b"220 mx.example ESMTP\r\n"),
     net::Sends(b"250-mx.example\r\n250 STARTTLS\r\n"),
@@ -4137,7 +4137,7 @@ test "a connection that starts in the clear is rejected when its server is not v
   assert_eq(plain.net.closed, [1])
 }
 
-test "a server that cannot be reached, is not the one named, or hangs up at once" {
+test "opening a session fails when the server is unreachable, fails verification as the named host, or hangs up immediately" {
   let open_one = || secured(open_tls[mail]("mx.example", 465, client()).engine);
   let gone = on_mx(serving(25, []), open_one);
   assert_eq(gone.value, Err(Unreachable));
@@ -4196,7 +4196,7 @@ test "a wait is one deadline, and each read gets what is left of it, however the
   assert_eq(long.net.closed, [])
 }
 
-test "a session is bound by the deadline around it, which limits its every wait" {
+test "a session applies the surrounding timeout to every wait, so each wait is limited to the time remaining" {
   let ran = net::on_mem(serving(465, [[net::Upgrades, net::Silent]]), ||
     simulate {
       task::unbounded(||
@@ -4280,7 +4280,7 @@ fn hello_draft() -> Draft / {time.now_ms, entropy.next, email.fail, abort.raise}
     [email::mailbox_entry(email::mailbox(email::address("eve", "example.org")))],
   )
 
-test "a draft is sent to everyone it goes to, its blind copies among them, as the bytes std.email writes without them" {
+test "sending a draft delivers it to every recipient including blind copies, and sends the bytes `email::build` writes, which have no `Bcc` header" {
   let d = match handle {
       try[email.fail] { hello_draft() }
     } with {
@@ -4318,7 +4318,7 @@ test "a draft is sent to everyone it goes to, its blind copies among them, as th
   assert(!String::of_bytes_lossy(written).contains("eve@example.org"))
 }
 
-test "a message read is sent on as the bytes it was read from, to everyone it names, without its blind copies' lines" {
+test "`relay` sends a message that was read as its original bytes to every recipient it names, leaving out its Bcc header lines" {
   let data = b"From: John Doe <jdoe@machine.example>\r\nTo: Mary Smith <mary@example.net>\r\nBcc: eve@example.org\r\nSubject: Saying Hello\r\nX-Odd:   kept \t as it was\r\n\r\n.Hello.\r\n";
   let m = email::read_tolerant(data, email::default_limits()).message;
   let greeted = [
@@ -4343,7 +4343,7 @@ test "a message read is sent on as the bytes it was read from, to everyone it na
   assert_eq(net::mem_sent(rejected.net, 1), b"EHLO client.example\r\n")
 }
 
-test "a session keeps the newest lines of its exchange, and no credential among them" {
+test "a session's transcript contains only the newest lines up to its limit, and never a credential" {
   let envelope = email::envelope_of(ReturnTo(test_sender()), test_recipients(["Jones", "Green"]));
   let kept = |most: Int| {
     let limits: Limits = { ..default_limits(), transcript: most };

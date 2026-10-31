@@ -27,7 +27,7 @@ test/nondet "a host operation inside a simulation is rejected" {
 
 // A host handler replies from the machine through natives, which fail inside a simulation as a host
 // operation does.
-test/nondet "a fact of the machine asked inside a simulation is rejected" {
+test/nondet "a machine operation such as `os.cpus` inside a `simulate` block fails with E0425" {
   write_program(
     "import std.os (os)\n\ntest/nondet \"asks inside a region\" {\n  simulate {\n    assert(os.cpus() >= 1)\n  }\n}\n",
   );
@@ -37,7 +37,7 @@ test/nondet "a fact of the machine asked inside a simulation is rejected" {
 
 // What a simulation schedules itself never reaches the boundary, so the binding's scheduler is
 // shadowed.
-test/nondet "a scheduler handles the task operations it schedules" {
+test/nondet "`simulate` handles the `task.spawn` and `task.join` calls made inside it" {
   write_program(
     "test/nondet \"spawns inside a region\" {\n  let n = simulate {\n    let t = task.spawn(|| 20 + 1);\n    task.join(t)\n  };\n  assert_eq(n, 21)\n}\n",
   );
@@ -46,7 +46,7 @@ test/nondet "a scheduler handles the task operations it schedules" {
 }
 
 // A clause around the operation handles it, so the run reaches no handler and needs no root.
-test/nondet "a handler in scope shadows the host" {
+test/nondet "a `handle` block's handler runs instead of the real host operation it handles" {
   write_program(
     "import std.fs (fs)\n\ntest/nondet \"the double answers\" {\n  let read = handle { fs.read_file[cwd](\"absent\") } with {\n    fs.read_file[cwd](p) -> Some(b\"double\"),\n  };\n  assert_eq(read, Some(b\"double\"))\n}\n",
   );
@@ -69,7 +69,7 @@ test/nondet "a response the host gives later is waited for outside a scheduler" 
 
 // A test performing `task` runs under the run's scheduler, where a task waiting on the host waits
 // and the others run; each join returns its own task's result.
-test/nondet "tasks waiting on the host park in a production scheduler and each join returns its own" {
+test/nondet "with the production scheduler, four tasks each waiting on an `sh` process get their own value from `task.join`" {
   write_program(
     waits_on_a_child(
       "  let ts = range(0, 4).map(|i: Int| task.spawn(|| child() + i));\n  assert_eq(ts.map(|t: Task<Int>| task.join(t)), [7, 8, 9, 10])",
@@ -88,7 +88,7 @@ fn race_program(opened: String) -> String =
 
 // A simulation in a task of the run's scheduler runs as one outside it does: the entry's seed takes
 // the same schedule.
-test/nondet "a simulate inside a task of the run's scheduler runs and takes its schedule from the seed" {
+test/nondet "a `simulate` block inside a task spawned by `ply run` runs, and gives the same result as outside a task for the same `--seed`" {
   let returned = |opened: String| {
     write_program(race_program(opened));
     let r = spawned(["run", "--json", "--seed", "5"]);
@@ -108,7 +108,7 @@ fn hosted_test_arguments() -> List<String> =
 // Tasks retire as they finish unheld, and a retired id is never reused, so no join lands on
 // another task's result; a kept handle serves every join; and a handle inside a finished task's
 // result keeps its task joinable.
-test/nondet "every join in a production scheduler returns its own task" {
+test/nondet "with the production scheduler, `task.join` returns the result of the task it is given, including under heavy spawning and nesting" {
   write_program(
     "fn churn(n: Int) -> Int / {task.write, abort.raise} =\n  range(0, n).fold(0, |sum: Int, i: Int| {\n    task.spawn(|| i);\n    let t = task.spawn(|| i * 2);\n    task.yield();\n    sum + task.join(t)\n  })\n\nfn kept(n: Int) -> Int / {task.write, abort.raise} = {\n  let held = range(0, n).fold([], |tasks: List<Task<Int>>, i: Int| tasks.push(task.spawn(|| i)));\n  task.yield();\n  held.fold(0, |sum: Int, t: Task<Int>| sum + task.join(t) + task.join(t))\n}\n\nfn relayed() -> Int / {task.write, abort.raise} = {\n  let outer = task.spawn(|| task.spawn(|| 21));\n  task.yield();\n  task.yield();\n  let inner = task.join(outer);\n  task.yield();\n  task.join(inner) * 2\n}\n\ntest/nondet \"churn\" { assert_eq(churn(300), 89700) }\ntest/nondet \"kept\" { assert_eq(kept(40), 1560) }\ntest/nondet \"relayed\" { assert_eq(relayed(), 42) }\n",
   );
@@ -119,7 +119,7 @@ test/nondet "every join in a production scheduler returns its own task" {
 // The scheduler runs a spawned task first, so the task yields to the spawner, which reads the clock
 // once its `handle` has ended and joins; the task then reads the clock later, and is still served
 // from the clause around its spawn.
-test/nondet "a production task is handled by the handle around its spawn after that handle ended" {
+test/nondet "with the production scheduler, a task spawned inside a `handle` block still uses its handler after the block has ended" {
   write_program(String::of_bytes_lossy(embed("../programs/host_boundary/ended_handle.ply")));
   let ran = spawned(hosted_test_arguments());
   assert(ran.code == 0, Some(all_output(ran)))
@@ -127,7 +127,7 @@ test/nondet "a production task is handled by the handle around its spawn after t
 
 // Each task opens its scope, then waits on a child the host reports later and parks; each still
 // reads its own scoped value once it wakes, whichever scope closed first.
-test/nondet "tasks parked on the host keep their scoped values when the other's scope closes first" {
+test/nondet "two tasks each waiting on an `sh` process still read their own `with_scope` value after the other task's scope has ended" {
   write_program(
     "import std.process (process, exit_code)\n\nfn child(code: Int) -> Int / {process.spawn[sh]} =\n  match exit_code(process.spawn[sh]([\"-c\", \"exit \" ++ code.to_string()], \"\", [])) { Some(c) -> c, None -> 0 }\n\ntest/nondet \"each task reads its hold after the other's region closed\" {\n  let first = task.spawn(|| with_scope[a](10, |x: Int| ()) { c -> {\n    let got = child(5);\n    c.get() + got\n  } });\n  let second = task.spawn(|| with_scope[b](20, |x: Int| ()) { c -> {\n    let got = child(5);\n    c.get() + got\n  } });\n  assert_eq(task.join(first) + task.join(second), 40)\n}\n",
   );
@@ -137,7 +137,7 @@ test/nondet "tasks parked on the host keep their scoped values when the other's 
 
 // A simulation ends before the operation beside it, which the run does once, outside any schedule.
 // A test that simulates is re-run by the search, so this is a run's.
-test/nondet "a host operation beside a simulation is performed once" {
+test/nondet "a file append made outside a `simulate` block in the same program runs once and writes one line" {
   write_program(
     "import std.fs (fs)\n\nfn main() -> Int / {fs.write[cwd], sim.read, abort.raise} = {\n  let inside = simulate {\n    let a = task.spawn(|| 1);\n    let b = task.spawn(|| 2);\n    task.join(a) + task.join(b)\n  };\n  match fs.append[cwd](\"sent\", Bytes::of_string(inside.to_string() ++ \"\\n\")) { Some(at) -> at, None -> 1 }\n}\n",
   );

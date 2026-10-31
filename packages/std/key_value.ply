@@ -1468,7 +1468,7 @@ fn stepped(m: Shown, ops: List<Op>) -> Shown =
     { pairs: after.values(), sequence: version }
   }
 
-test "a put is read back under its batch's number, a delete removes it, and an older store value reads what it had" {
+test "a read at a batch's version returns that batch's puts, a delete removes the key, and a read at an older version returns the values from that version" {
   let over = session(mem_empty(), 1, small(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"one", Fast);
     let s2 = batch[d](s1, [Put(b"b", b"two"), Put(b"a", b"uno"), Delete(b"c")], Durable);
@@ -1640,7 +1640,7 @@ fn counting<a, [l] | e>(
 fn keys_of<| e>(found: Seq<Pair | e>) -> List<Bytes> / {abort.raise | e} =
   listed(found).map(|p: Pair| p.key)
 
-test "a scan returns a range of keys in byte order, a prefix its keys, and reads no more than is pulled" {
+test "`scan` returns keys in byte order within a range, `prefixed` returns the keys with a given prefix, and a scan reads only as many entries as the caller consumes" {
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s = [b"b/2", b"a", b"b/1", b"c", b"b", b"b/\xff"].fold(s0, |s: Store, key: Bytes|
       put[d](s, key, b"at ".concat(key), Fast));
@@ -1754,7 +1754,7 @@ fn flip_byte(tree: MemFs, path: String, at: Int) -> MemFs / {abort.raise} = {
 fn shortened(tree: MemFs, path: String, keep: Int) -> MemFs / {abort.raise} =
   mem_write(tree, path, mem_read(tree, path).expect("the file to shorten does not exist").slice(0, keep)).fs
 
-test "a full segment has a hint that opening reads instead, and a hint for another segment is ignored and written again" {
+test "opening a store reads the hint file (a summary of a completed log segment) instead of that segment, and ignores and rewrites a hint that is missing or belongs to another segment" {
   let state = six_key_store();
   let hint = "db/00000001.hint";
   assert_eq(
@@ -1783,7 +1783,7 @@ test "a full segment has a hint that opening reads instead, and a hint for anoth
   assert_eq(held(mem_remove(rotten, hint).fs).value, Err(Corrupt("00000001.log", 64)))
 }
 
-test "a compaction keeps every value under its version in one base, and what it replaced stays until it is discarded" {
+test "a compaction merges every value and its version into one set of files, and the files it replaced remain until `discard` is called" {
   let over = session(mem_empty(), 1, small(), |s0: Store| {
     let filled = range(0, 6).fold(s0, |s: Store, i: Int|
       put[d](s, if i % 2 == 0 { b"even" } else { b"odd" }, byte_of_int(48 + i).repeat(20), Fast));
@@ -1833,7 +1833,7 @@ test "a compaction keeps every value under its version in one base, and what it 
   )
 }
 
-test "a store set to compact does so in the commit that leaves enough of its log dead, and not again until as much is" {
+test "a store set to compact when 50 bytes are obsolete compacts in the commit that reaches that amount, and does not compact again until another 50 bytes are obsolete" {
   let over = opened(mem_empty(), 1, large_limits(), WhenDead(50, 40), raw(), |s0: Store| {
     let s1 = put[d](s0, b"k", b"1".repeat(20), Fast);
     let s2 = put[d](s1, b"k", b"2".repeat(20), Fast);
@@ -1861,7 +1861,7 @@ test "a store set to compact does so in the commit that leaves enough of its log
   )
 }
 
-test "a log that ends inside a frame opens to the batches before it, is cut to them, and takes the next commit" {
+test "a log that ends partway through a batch opens with the complete batches before it, is truncated to them, and accepts the next commit" {
   let batches = [
     [Put(b"a", b"first")],
     [Put(b"b", b"second"), Delete(b"a")],
@@ -1893,7 +1893,7 @@ test "a log that ends inside a frame opens to the batches before it, is cut to t
   })
 }
 
-test "damage that a sync had covered is reported where it is, and what no sync covered is cut with all that follows it" {
+test "corruption in log data already synced to disk is reported as an error, and unsynced data from the first corruption onward is cut off" {
   let log = "db/00000001.log";
   let state = |first: Durability, second: Durability|
     session(mem_empty(), 1, large_limits(), |s0: Store| {
@@ -1956,7 +1956,7 @@ test "a directory that is not a complete store is rejected with what is wrong wi
   )
 }
 
-test "one store has a directory at a time, and a value of a store that is closed, or behind another, commits nothing" {
+test "a second store cannot open a directory that is already open, and a commit through a closed store or a store handle older than a later commit fails and writes nothing" {
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let second: Result<Store, Error> = try[key_value.fail] {
@@ -2006,7 +2006,7 @@ test "one store has a directory at a time, and a value of a store that is closed
   assert_eq(beside_another.value, Ok((Some(LockLost), [b"a"])))
 }
 
-test "a commit the file system failed, or one that finds its next segment started, leaves a store that commits nothing until reopened" {
+test "a commit that the file system fails, or that finds a newer log file already started, makes the store fail every commit until it is reopened" {
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"1", Fast);
@@ -2040,7 +2040,7 @@ test "a commit the file system failed, or one that finds its next segment starte
   assert_eq(planted.value, Ok((Some(Stale), Some(Stale), Some(b"another writer's"))))
 }
 
-test "a frame written past another writer's fails as stale, and is not a batch to the store opened after" {
+test "a batch written after another writer has taken over the directory fails as stale, and is not read as a batch when the store is reopened" {
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"1", Fast);
@@ -2191,7 +2191,7 @@ fn lock_takeover_outcome(read_ms: Int) -> MemResult<LockTakeoverOutcome> / {abor
         }
       })).value)
 
-test "a lock renewed as a compaction copies is never old enough to take, and a store that sat idle past the age has lost it and writes nothing" {
+test "a store that renews its lock during a compaction keeps the lock, but a store idle for longer than the lock's expiry time loses the lock and writes nothing" {
   let is_base = lock_takeover_outcome(400);
   assert_eq(is_base.value, {
     compaction_error: None,
@@ -2310,7 +2310,7 @@ fn with_store<a | e>(
     return value -> { value: value, store: held },
   }
 
-test "two tasks that add to one count by compare-and-set lose no addition, wherever their reads and commits fall" {
+test "two tasks that each add to one count with compare-and-set lose no addition, however their reads and commits interleave" {
   let over = on_mem[d](mem_empty(), ||
     with_rand(rand(1), || {
       let ran: Result<{ ended: List<Option<Error>>, held: Shown }, Error> = try[key_value.fail] {
@@ -2354,7 +2354,7 @@ test "two tasks that add to one count by compare-and-set lose no addition, where
   )
 }
 
-test "a reader sees all of a batch or none of it, wherever its reads fall among a writer's commits" {
+test "a reader sees all of a batch or none of it, however its reads interleave with a writer's commits" {
   let over = on_mem[d](mem_empty(), ||
     with_rand(rand(1), || {
       let ran: Result<{ wrote: Option<Error>, read: Result<Bool, Error> }, Error> = try[key_value.fail] {
@@ -2535,7 +2535,7 @@ fn check_crash_recovery(
   )
 }
 
-law "a store that dies at any write of three steps opens to a prefix of them, with every step that returned and, after a loss of power, every durable one"
+law "a store that crashes during any of three writes reopens to the state after some prefix of those writes, including every write that returned and, after a power loss, every durable write"
   forall (first: Act, second: Act, third: Act) {
     check_crash_recovery([first, second, third], small()).broken == None
   }
@@ -2561,7 +2561,7 @@ fn steps() -> gen::Gen<Step> =
 /// A generator of `Name` for tests.
 fn names() -> gen::Gen<Name> = gen::elements([Ka, Kb, Kc])
 
-test "a longer history that dies at a random write opens to a prefix with everything it must keep" {
+test "after a crash at a random write in a long sequence of writes, reopening gives the state after some prefix of the writes, and that prefix includes every write that had returned (and every synced write after a power loss)" {
   gen::check2(gen::list(acts()), gen::any_int(), |drawn: List<Act>, at: Int| {
     let acts = drawn.take(16);
     let all = contents_after_each(acts);
@@ -2573,7 +2573,7 @@ test "a longer history that dies at a random write opens to a prefix with everyt
   })
 }
 
-test "a compaction that dies at any of its writes, a renewal of its lock among them, leaves every value to the store opened after it" {
+test "a compaction that crashes at any of its writes, including renewing its lock, loses no values in the store reopened afterward" {
   let limits: Limits = { key: 8, value: 64, batch: 96, file: 1024 };
   let state = session(mem_empty(), 1, limits, |s0: Store|
     shown[d](

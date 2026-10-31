@@ -2043,7 +2043,7 @@ fn gathered(
 ) -> Bytes / {brotli.fail, seq.spent, abort.raise} =
   Bytes::concat_all(seq::to_list(chunks, 1000000))
 
-test "{s.name} survives each level, whole and a chunk at a time" for s: Sample in samples() {
+test "{s.name} decompresses to the original bytes after `compress` at each level, and after streaming in chunks" for s: Sample in samples() {
   let fast = compress(s.bytes, Fast);
   assert(decompress(fast, large_limits()) == s.bytes);
   assert(decompress(compress(s.bytes, Stored), large_limits()) == s.bytes);
@@ -2057,7 +2057,7 @@ test "{s.name} survives each level, whole and a chunk at a time" for s: Sample i
   assert(fast.len() <= s.bytes.len() + 16)
 }
 
-test "a stream starts with its window and ends with an empty meta-block, and text compresses to a hundredth" {
+test "`compress` and `compress_stream` write the exact bytes for empty, one-byte and incompressible input" {
   assert_eq(compress(b"", Fast), b"\x06");
   assert_eq(compress(b"", Stored), b"\x06");
   assert_eq(compress(b"a", Stored), Bytes::of_hex("0000106103"));
@@ -2119,7 +2119,7 @@ fn streams() -> List<Fixture> =
     { name: "nothing, from a pipe, which gives the largest window", packed: "3f", plain: b"" },
   ]
 
-test "decompress reads {f.name}, whole and a few bytes at a time" for f: Fixture in streams() {
+test "`decompress` and `decompress_stream` return the original bytes of {f.name}, given whole or in pieces of 1 or 7 bytes" for f: Fixture in streams() {
   let packed = Bytes::of_hex(f.packed);
   assert_eq(decompress(packed, large_limits()), f.plain);
   assert_eq(gathered(decompress_stream(seq::slices(packed, 1), large_limits())), f.plain);
@@ -2127,7 +2127,7 @@ test "decompress reads {f.name}, whole and a few bytes at a time" for f: Fixture
   assert_eq(decompress_first(packed.concat(b"more"), large_limits()).used, packed.len())
 }
 
-test "cut short anywhere, {f.name} fails as truncated, at the cut" for f: Fixture in streams() {
+test "`try_decompress` of {f.name} cut to any shorter length fails as truncated, at the cut length" for f: Fixture in streams() {
   let whole = Bytes::of_hex(f.packed);
   assert_eq(
     range(0, whole.len()).filter(|n: Int|
@@ -2208,7 +2208,7 @@ fn stream_header(length: Int) -> BitWriter / {abort.raise} = {
   )
 }
 
-test "a match from before the first byte is a word of the dictionary, as a transform writes it" {
+test "a copy distance beyond the output so far outputs a word from the built-in dictionary, and a too-short word fails" {
   let named = |extra: Int|
     pad_to_byte(write_bits(write_bits(write_bits(stream_header(8), 2, 2), 3, 2), extra, 13)).out;
   assert_eq(decompress(named(4), large_limits()), b"time in ");
@@ -2219,7 +2219,7 @@ test "a match from before the first byte is a word of the dictionary, as a trans
   assert_error(try_decompress(short, large_limits()), short.len() - 1, Length)
 }
 
-test "a word is found by its length and number, and written between two strings, cut, or in upper case" {
+test "dictionary words are found by length and index, and `transformed` adds a prefix and suffix, drops letters or uppercases them" {
   let word = |length: Int, number: Int| {
     let from = word_starts().get(length) + number * length;
     words().slice(from, from + length)
@@ -2249,7 +2249,7 @@ test "a word is found by its length and number, and written between two strings,
   assert_eq(transformed(b"abc", 42), b"")
 }
 
-test "the dictionary is the bytes of RFC 7932's Appendix A, by their length and CRC-32 as it gives them" {
+test "the dictionary has the length, CRC-32 and SHA-256 that RFC 7932 Appendix A gives for its bytes" {
   assert_eq(words().len(), 122784);
   assert_eq(Int::of_u32(crc32(words())), 0x5136CB04);
   assert_eq(
@@ -2273,7 +2273,7 @@ test "the context lookup is the table of RFC 7932's section 7.1" {
   assert_eq(text(0xA9, 0xC3), 1)
 }
 
-test "the errors only a command can raise are reported at its position" {
+test "a copy command with an invalid distance, length or dictionary word fails with an error at the command's bit position" {
   let ring = 4 | 11 << 25;
   let lim = Array::of_list([0, 1008, 100]);
   let fill_at_intervals = |length: Int, dist: Int, left: Int| -> Result<Bytes, Error> {
@@ -2328,7 +2328,7 @@ fn largest_history(
     largest_history(take_output(moved).next, wide, fuel - 1)
   }
 
-test "a stream is read in a history its window bounds, however long it is and whatever its commands" {
+test "decoding retains at most the window size of earlier output, however long the stream is and whatever its commands" {
   let plain = sample_sentence().repeat(4000);
   // A stream with a 1 KiB window, in uncompressed meta-blocks of 1000 bytes.
   let blocks = range(0, 340).fold(
@@ -2367,7 +2367,7 @@ test "a stream written at the fast level reads back" {
 fn chunked(pieces: List<Bytes>, limits: Limits) -> Result<Bytes, Error> / {seq.spent, abort.raise} =
   try[brotli.fail] { gathered(decompress_stream(seq::of_list(pieces), limits)) }
 
-test "a stream reads the same however its bytes are cut, and so does what is written of them" {
+test "bytes compressed by `compress` or `compress_stream` decompress to the original however the input is split into pieces" {
   gen::check2(gen::bytes(), gen::list(gen::any_int()), |x: Bytes, cuts: List<Int>| {
     let sizes = cuts.map(|c: Int| c & 7);
     let plain = Bytes::concat_all([x, thrice(), x]);
@@ -2385,7 +2385,7 @@ fn stays_within_limits(packed: Bytes) -> Bool = {
   match got { Ok(Ok(plain)) -> plain.len() <= 4096, Ok(Err(_)) -> true, Err(_) -> false }
 }
 
-test "whatever bytes a reader is given, as a stream, as a meta-block's header or as its commands, it returns within its limits or rejects them" {
+test "`decompress` of arbitrary bytes, alone or after a valid header, returns a result within the size limits or an error" {
   gen::check(gen::bytes(), |x: Bytes| {
     stays_within_limits(x) && stays_within_limits(b"\xE2\x7F\x00".concat(x))
       && stays_within_limits(pad_to_byte(stream_header(2000)).out.concat(x))

@@ -2874,7 +2874,7 @@ test "metrics follow OTLP's JSON mapping" {
   )
 }
 
-test "a request reads back from its protobuf, and the two encodings read as one model" {
+test "`decode_traces` and `decode_metrics` return the original sample from its protobuf encoding, and JSON metrics decode to the same value as protobuf metrics" {
   let wire = encode_traces(Protobuf, sample_traces());
   assert_eq(decode_traces(Protobuf, wire, default_limits()), Ok(sample_traces()));
   let metrics = encode_metrics(Protobuf, sample_metrics());
@@ -3092,19 +3092,19 @@ fn number_points() -> gen::Gen<NumberPoint> =
 /// Generates a `Temporality` for a test.
 fn temporalities() -> gen::Gen<Temporality> = gen::elements([Delta, Cumulative])
 
-test "traces read back from their JSON" {
+test "`decode_traces` returns the original traces from their JSON encoding, for any traces" {
   gen::check(traces_drawn(), |t: Traces| {
     decode_traces(Json, encode_traces(Json, t), default_limits()) == Ok(t)
   })
 }
 
-test "metrics read back from their JSON" {
+test "`decode_metrics` returns the original metrics from their JSON encoding, for any metrics" {
   gen::check(metrics_drawn(), |m: Metrics| {
     decode_metrics(Json, encode_metrics(Json, m), default_limits()) == Ok(m)
   })
 }
 
-test "a receipt reads back from either encoding" {
+test "`decode_response` returns the original export response from either protobuf or JSON encoding" {
   gen::check2(gen::any_int(), gen::text(), |rejected: Int, message: String| {
     let receipt: ExportResponse = { rejected: rejected, message: message };
     decode_response(
@@ -3261,7 +3261,7 @@ fn rejected_traces() -> List<RejectedCase> / {abort.raise} =
     },
   ]
 
-test "traces are rejected: {c.name}" for c: RejectedCase in rejected_traces() {
+test "`decode_traces` rejects the invalid request {c.name} with the expected reason and field" for c: RejectedCase in rejected_traces() {
   match decode_traces(c.encoding, c.body, default_limits()) {
     Ok(_) -> panic("accepted"),
     Err(refusal) -> {
@@ -3330,7 +3330,7 @@ fn rejected_metrics() -> List<RejectedCase> / {abort.raise} =
     },
   ]
 
-test "metrics are rejected: {c.name}" for c: RejectedCase in rejected_metrics() {
+test "`decode_metrics` rejects the invalid request {c.name} with the expected reason and field" for c: RejectedCase in rejected_metrics() {
   match decode_metrics(c.encoding, c.body, default_limits()) {
     Ok(_) -> panic("accepted"),
     Err(refusal) -> {
@@ -3387,7 +3387,7 @@ test "a request past its limits is rejected" {
   }
 }
 
-test "an empty receipt is the empty message, and a partial one reports what was rejected" {
+test "an export response with nothing rejected encodes as empty, and one with rejected items encodes the count and message" {
   let none: ExportResponse = { rejected: 0, message: "" };
   assert_eq(encode_response(Protobuf, TraceSignal, none), b"");
   assert_eq(encode_response(Json, TraceSignal, none), b"{}");
@@ -3797,7 +3797,7 @@ fn shipments() -> List<Shipment> =
     { name: "gzipped JSON", encoding: Json, gzip: true },
   ]
 
-test "a collector decodes what was traced, sent as {c.name}" for c: Shipment in shipments() {
+test "a collector receives and decodes the exported traces and metrics when they are sent as {c.name}" for c: Shipment in shipments() {
   let base: Config = test_config();
   let config: Config = { ..base, encoding: c.encoding, gzip: c.gzip };
   let ran = with_rand(rand(41), ||
@@ -3848,7 +3848,7 @@ test "a request the collector cannot accept yet is sent again after Retry-After 
   }
 }
 
-test "a failed request waits for an event after its backoff, and the events before it queue" {
+test "after a request fails, spans only queue until one ends after the retry delay, and that span's end resends the failed request" {
   let base: Config = test_config();
   let config: Config = { ..base, batch: 1 };
   let ran = with_rand(rand(8), ||
@@ -3932,7 +3932,7 @@ test "a request is abandoned when the collector rejects it or it fails every att
   assert_eq(tired.seen.traces, [])
 }
 
-test "spans are sent when enough wait or the oldest has waited long enough, and metrics on their interval" {
+test "spans are sent when the batch size is reached or the oldest span exceeds the maximum age, and metrics at their interval" {
   let base: Config = test_config();
   let config: Config = { ..base, batch: 3, max_age_ms: 5000, metrics_every_ms: 60000 };
   let ran = with_rand(rand(11), ||
@@ -3984,7 +3984,7 @@ fn remote(sampled: Bool) -> http::Request / {abort.raise} = {
   }
 }
 
-test "a trace that is not recorded is not sent, and a span takes the decision of its caller" {
+test "with the sampler set to always off, no spans are exported, except spans inside a request whose incoming trace is marked as sampled" {
   let base: Config = test_config();
   let config: Config = { ..base, sampler: telemetry::AlwaysOff };
   let ran = with_rand(rand(12), ||
@@ -4058,7 +4058,7 @@ test "a ratio sampler records the traces whose ids it selects, and no others" {
   assert(kept)
 }
 
-test "a partial accept is believed, and a metric tracks no more series than its bound" {
+test "a partially accepted export counts as exported, and a metric tracks at most `max_series` series" {
   let base: Config = test_config();
   let config: Config = { ..base, max_series: 2 };
   let ran = with_rand(rand(14), ||
@@ -4085,7 +4085,7 @@ test "a partial accept is believed, and a metric tracks no more series than its 
   }
 }
 
-test "closing a span closes the spans left open under it, and an exit of a span not open is counted" {
+test "closing a span ends its still-open child spans as abandoned, and exiting a span that is not open increments `unmatched_exits`" {
   let config: Config = test_config();
   let ran = with_rand(rand(15), ||
     simulate {
@@ -4133,7 +4133,7 @@ test "a flush waits no longer than it is given, and what it could not send stays
   assert_eq(ran.seen.arrivals, [0, 60000])
 }
 
-test "a retry's wait doubles to its bound, lies in its upper half, and is never under Retry-After" {
+test "`retry_wait` doubles with each attempt up to a maximum, picks a random wait in the upper half of that range, and is never below Retry-After" {
   let config: Config = test_config();
   assert_eq(retry_wait(config, 1, None, 0), 50);
   assert_eq(retry_wait(config, 1, None, 999), 99);

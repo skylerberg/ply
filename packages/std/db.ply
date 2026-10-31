@@ -520,7 +520,7 @@ fn reserve(stock: Bool) -> Unit / {db.execute[items], db.rollback} =
     ()
   } else { db.rollback("no stock") }
 
-test "a rollback discards the continuation the body had left" {
+test "a rollback aborts the transaction and skips the rest of the body, and `transaction` returns the reason as an error" {
   let journal = handle {
     let out = transaction(ReadCommitted, ReadWrite, || {
       db.execute[items](stmt("insert one"), []);
@@ -553,7 +553,7 @@ test "a rollback discards the continuation the body had left" {
   assert_eq(journal, ["begin", "insert one", "abort"])
 }
 
-test "a body that returns commits, and its value comes out" {
+test "a transaction body that returns normally commits, and `transaction` returns the body's value" {
   let journal = handle {
     let out = transaction(Serializable, ReadWrite, || {
       db.execute[items](stmt("insert one"), []);
@@ -653,7 +653,7 @@ test "a commit that fails is an Err carrying the SQLSTATE" {
   assert_eq(journal, ["begin", "insert one", "commit"])
 }
 
-test "a rollback two calls deep discards its callers" {
+test "a rollback in a function called two levels below the transaction body aborts the whole transaction" {
   let journal = handle {
     let out = transaction(ReadCommitted, ReadWrite, || charge(false));
     assert_eq(out, Err({ reason: "no stock", error: None }))
@@ -812,7 +812,7 @@ test "sandbox runs the body, returns its value and aborts" {
 }
 
 // `sandbox` installs no `handle`, so the enclosing transaction handles a rollback inside it.
-test "a sandbox nested in a transaction keeps the transaction's rollback" {
+test "a rollback inside a `sandbox` within a `transaction` aborts the sandbox's database work, then the transaction, and `transaction` returns the rollback reason as an error" {
   let journal = handle {
     let out = transaction(ReadCommitted, ReadWrite, ||
       sandbox(|| {
@@ -3609,7 +3609,7 @@ test "create_schema renders one statement per table and one per sequence" {
   )
 }
 
-test "a where, an order by, a limit and an offset" {
+test "a select filters rows with `where`, sorts them with `order by`, and trims them with `limit` and `offset`" {
   let d = test_seed();
   assert_eq(test_skus(test_out(d, "select sku from part order by sku", [])), ["a", "b", "c"]);
   assert_eq(test_skus(test_out(d, "select sku from part order by sku desc", [])), ["c", "b", "a"]);
@@ -3638,7 +3638,7 @@ test "a where, an order by, a limit and an offset" {
   assert_eq(test_count(test_out(d, "select count(*) from part", [])), 3)
 }
 
-test "a comparison with null is unknown, and a where keeps only what is true" {
+test "a comparison with null is unknown, and a `where` selects only rows for which the condition is true" {
   let d = test_seed();
   assert_eq(test_skus(test_out(d, "select sku from part where n = 1 order by sku", [])), ["a"]);
   assert_eq(test_skus(test_out(d, "select sku from part where n <> 1 order by sku", [])), ["c"]);
@@ -3652,7 +3652,7 @@ test "a comparison with null is unknown, and a where keeps only what is true" {
   )
 }
 
-test "nulls order last under asc and first under desc, and the words override it" {
+test "nulls sort last under ascending order and first under descending, and `nulls first` overrides that default" {
   let d = test_seed();
   assert_eq(test_skus(test_out(d, "select sku, n from part order by n, sku", [])), ["a", "c", "b"]);
   assert_eq(test_skus(test_out(d, "select sku, n from part order by n desc, sku", [])), [
@@ -3771,7 +3771,7 @@ test "a committed scope is visible and an aborted one is not" {
   assert_eq(test_count(test_out(a2.db, "select count(*) from part", [])), 4)
 }
 
-test "a statement that failed inside a scope makes every later one 25P02" {
+test "after a statement fails inside a transaction, every later statement fails with error 25P02, meaning the transaction is aborted" {
   let d0 = test_seed();
   let b = begin_step(d0, ReadCommitted, ReadWrite);
   let bad = test_run(b.db, "insert into part (sku, price) values ('a', 1)", []);
@@ -3796,7 +3796,7 @@ test "rolling back to a savepoint clears the failed state and the inner writes" 
   assert_eq(test_count(test_out(c.db, "select count(*) from part", [])), 4)
 }
 
-test "releasing a savepoint in an aborted transaction is 25P02 and commits nothing" {
+test "releasing a savepoint in an aborted transaction fails as an aborted transaction, and the later commit also fails and writes nothing" {
   let d0 = test_seed();
   let b = begin_step(d0, ReadCommitted, ReadWrite);
   let i = test_run(b.db, "insert into part (sku, price) values ('z', 1)", []);
@@ -3810,7 +3810,7 @@ test "releasing a savepoint in an aborted transaction is 25P02 and commits nothi
   assert_eq(test_count(test_out(c.db, "select count(*) from part", [])), 3)
 }
 
-test "a sequence is not rolled back" {
+test "an id from a serial column is not reused after the transaction that took it rolls back" {
   let d0 = test_seed();
   let b = begin_step(d0, ReadCommitted, ReadWrite);
   let i = test_run(b.db, "insert into bin (sku, qty) values ('a', 1) returning id", []);
@@ -3820,7 +3820,7 @@ test "a sequence is not rolled back" {
   assert_eq(j.out, Rows([Map::new().insert("id", IntDatum(2))]))
 }
 
-test "a write in a read-only scope is 25006 and a nested begin at another level is 25001" {
+test "a write in a read-only transaction fails, and beginning a nested transaction at a different isolation level fails" {
   let d0 = test_seed();
   let ro = begin_step(d0, ReadCommitted, ReadOnly);
   assert_eq(
@@ -3850,7 +3850,7 @@ fn test_deepen(db: MemDb, left: Int) -> Outcome = {
   if left <= 1 { r } else { test_deepen(r.db, left - 1) }
 }
 
-test "what the fake does not model, it rejects by name" {
+test "the fake database rejects each SQL feature it does not support with the not-supported error code" {
   let d = test_seed();
   let rejected = [
     "select p.sku from part p join bin b on p.sku = b.sku",
@@ -3898,7 +3898,7 @@ test "a comment and a result-column alias are ordinary SQL, not rejected" {
   assert_eq(test_code(test_out(d, "select sku from part /* never closed", [])), "0A000")
 }
 
-test "an unknown relation and an unknown column are named" {
+test "a query on a missing table or a missing column fails with the undefined-table or undefined-column error code" {
   let d = test_seed();
   assert_eq(test_code(test_out(d, "select sku from nosuch order by sku", [])), "42P01");
   assert_eq(test_code(test_out(d, "select nosuch from part", [])), "42703");
@@ -3954,7 +3954,7 @@ test "the fake delivers a notification when its transaction commits, and never w
   assert_eq(next_notification_step(now).notification, test_heard("jobs", "c"))
 }
 
-test "a savepoint rolled back takes back what it notified, and leaves what the transaction did" {
+test "rolling back a savepoint drops notifications sent inside it, but notifications sent earlier in the transaction are still delivered on commit" {
   let outer = test_notified(test_begun(test_listening()), "kept");
   let inner = abort_step(test_notified(test_begun(outer), "undone")).db;
   let first = next_notification_step(commit_step(inner).db);
@@ -3962,14 +3962,14 @@ test "a savepoint rolled back takes back what it notified, and leaves what the t
   assert_eq(next_notification_step(first.db).notification, Quiet)
 }
 
-test "a notification the fake rejects is rejected as the server rejects it" {
+test "the fake database fails a notification with the same error codes as a real server, for an oversized payload and for an aborted transaction" {
   let long = String::of_bytes(Bytes::concat_all(range(0, 8000).map(|i: Int| b"x")));
   assert_eq(test_code(notify_step(test_listening(), "jobs", long).out), "22023");
   let failed = test_run(test_begun(test_listening()), "select * from missing", []).db;
   assert_eq(test_code(notify_step(failed, "jobs", "x").out), "25P02")
 }
 
-test "a cut listener loses what it had and what is sent until its next wait, which reports it" {
+test "after the connection is cut, a listener drops its queued notifications and ignores those sent meanwhile, and its next wait returns `Reconnected`" {
   let held = test_notified(test_listening(), "before");
   let cut = disconnect_step(held);
   let lost = test_notified(cut, "during");
@@ -4075,7 +4075,7 @@ fn strains() -> List<Strain> =
     [Never, Once, Twice].fold(acc, |inner: List<Strain>, cut: SmallCount|
       inner.push({ extra_notices: sent, disconnects: cut })))
 
-test "a listener over the fake receives what is committed while it listens, in order, and learns of every loss, in every interleaving of {times(c.extra_notices) + 1} notices and {times(c.disconnects)} cuts" for c: Strain in strains(
+test "a listener on the fake database receives every committed notification in order and learns of every disconnect, whatever the task scheduling, with {times(c.extra_notices) + 1} notifications and {times(c.disconnects)} disconnects" for c: Strain in strains(
   ) {
   simulate {
     let n = times(c.extra_notices) + 1;
@@ -6142,7 +6142,7 @@ pub fn with_password(s: Server, password: Option<Secret<Bytes>>) -> Result<Serve
 
 // --- Tests ------------------------------------------------------------------
 
-test "a connection string reads into the parts a driver needs" {
+test "`server_of` parses a connection URL into user, password, host, port, database and application name" {
   match server_of(
       "postgres://ply:hunter2@127.0.0.1:5433/app?sslmode=disable&application_name=ply",
     ) {
@@ -6158,7 +6158,7 @@ test "a connection string reads into the parts a driver needs" {
   }
 }
 
-test "a connection string's timeouts and name are what every connection starts with" {
+test "`startup_parameters` returns the timeouts and application name from a connection URL as the settings sent when a connection starts" {
   match server_of(
       "postgres://ply@db/app?statement_timeout=250&application_name=the%20service&idle_in_transaction_session_timeout=0",
     ) {
@@ -6182,7 +6182,7 @@ test "a connection string's timeouts and name are what every connection starts w
   }
 }
 
-test "a timeout is whole milliseconds, given once, and no more than postgres takes" {
+test "a timeout in a connection URL must be a whole number of milliseconds within the server's maximum and appear only once" {
   assert_err("postgres://ply@db/app?statement_timeout=5s", "whole number of milliseconds");
   assert_err("postgres://ply@db/app?statement_timeout=-1", "whole number of milliseconds");
   assert_err("postgres://ply@db/app?idle_in_transaction_session_timeout=", "whole number");
@@ -6202,7 +6202,7 @@ test "a connection string may leave out the port, the password and the parameter
   }
 }
 
-test "a password may contain the field separators, escaped, and is read as a secret" {
+test "a URL password may contain percent-escaped characters such as `@` and `:`, and `server_of` stores it as a `Secret`" {
   match server_of("postgres://ply:a%40b%3Ac@db:5433/app") {
     Err(reason) -> panic(reason),
     Ok(s) -> {
@@ -6223,7 +6223,7 @@ test "a password may contain the field separators, escaped, and is read as a sec
   assert_err("postgres://ply:a%4@db/app", "two hex digits")
 }
 
-test "a password is taken from settings once, and rejected alongside a connection string's" {
+test "`with_password` adds a password given in settings to a URL without one, and fails when the URL has its own password" {
   let given = Some(Secret::of_bytes(b"b"));
   match server_of("postgres://ply@db/app") {
     Err(reason) -> panic(reason),
@@ -6238,7 +6238,7 @@ test "a password is taken from settings once, and rejected alongside a connectio
   }
 }
 
-test "what a connection string cannot mean is rejected rather than guessed" {
+test "`server_of` returns an error for a connection string it cannot interpret, instead of guessing" {
   assert_err("host=db user=ply", "keyword");
   assert_err("mysql://ply@db/app", "not a database");
   assert_err("postgres://db/app", "user@");
@@ -6254,7 +6254,7 @@ test "what a connection string cannot mean is rejected rather than guessed" {
 fn ssl_of_url(url: String) -> Ssl / {abort.raise} =
   match server_of(url) { Ok(s) -> s.ssl, Err(reason) -> panic(reason) }
 
-test "every sslmode that secures verifies the server, and one open to a TLS downgrade is rejected" {
+test "`ssl_of_url` accepts only sslmode values that verify the server, and rejects modes that allow plaintext or a TLS downgrade" {
   assert_eq(ssl_of_url("postgres://ply@db/app"), Disabled);
   assert_eq(ssl_of_url("postgres://ply@db/app?sslmode=disable"), Disabled);
   assert_eq(ssl_of_url("postgres://ply@db/app?sslmode=require"), Negotiated);
@@ -6653,7 +6653,7 @@ fn retry_serializable(
     },
   }
 
-test "an error from the server is its SQLSTATE, the constraint it names and its message" {
+test "a server error is reported with its SQLSTATE code, constraint name and message, and the connection stays usable" {
   simulate {
     let r = over_script(
       1,
@@ -6681,7 +6681,7 @@ test "an error from the server is its SQLSTATE, the constraint it names and its 
   }
 }
 
-test "a pool finishes every connection it holds once its body returns" {
+test "a pool closes every connection it opened when the function running inside it returns" {
   simulate {
     let r = over_script(2, [], || {
       let first = db.execute[part](test_insert("a"), []);
@@ -6716,7 +6716,7 @@ test "a serialization failure at commit is retryable, and the retry begins a tra
   }
 }
 
-test "two tasks' transactions each hold a connection of their own, whichever order they run in" {
+test "transactions in two concurrent tasks each use their own connection, in either order of execution" {
   simulate {
     let r = over_script(2, [], || {
       let a = task.spawn(||
@@ -6741,7 +6741,7 @@ test "two tasks' transactions each hold a connection of their own, whichever ord
   }
 }
 
-test "an operation belongs to the one transaction not waiting on the server, and to none when all are" {
+test "`route` picks the one open transaction that is not waiting on the server for an operation, and returns `NoTransaction` when all are waiting" {
   let s = {
     n: 0,
     session: None,
@@ -6775,7 +6775,7 @@ test "a pool gives a connection to one statement at a time, and reports when it 
   }
 }
 
-test "a notification goes on its transaction's connection, its channel and payload as parameters" {
+test "`db.notify` runs on the connection of the current transaction, with the channel and payload sent as parameters" {
   simulate {
     let r = over_script(1, [], || {
       let inside = transaction(ReadCommitted, ReadWrite, || db.notify[jobs]("in"));
@@ -6824,7 +6824,7 @@ test "an inner abort closes its savepoint, and the transaction around it still c
   }
 }
 
-test "a commit the server turns into a rollback is 25P02, and gives the connection back" {
+test "when the server turns a commit into a rollback it fails as an aborted transaction, and the connection returns to the pool" {
   simulate {
     let r = over_script(
       1,
@@ -6882,7 +6882,7 @@ test "a nested begin the transaction cannot accept is rejected before anything i
   }
 }
 
-test "a connection lost inside a transaction fails the rest of it, and nothing of it runs elsewhere" {
+test "after a connection is lost inside a transaction, its remaining statements fail and are not run on another connection" {
   simulate {
     let r = over_script(
       1,
@@ -6945,7 +6945,7 @@ fn ten_of(id: Int) -> Int / {db.query[items]} =
     _ -> 0 - 1,
   }
 
-test "a lookup mapped over its ids queries the store once, and returns what each alone would" {
+test "`map_batched` runs one query for all ids and returns the same values as mapping the lookup over each id separately" {
   let ids = [3, 1, 4, 1, 5];
   let alone = times_ten_store(|| ids.map(ten_of));
   let together = times_ten_store(|| map_batched[items](ids, ten_of));
@@ -6954,7 +6954,7 @@ test "a lookup mapped over its ids queries the store once, and returns what each
   assert_eq({ queries: together.queries, batches: together.batches }, { queries: 0, batches: 1 })
 }
 
-test "a lookup that queries twice takes two rounds, and a lone query is a db.query" {
+test "a lookup with two queries runs two batched queries, and a single id runs one plain `db.query`" {
   let twice = |id: Int| ten_of(id) + ten_of(id + 100);
   let r = times_ten_store(|| map_batched[items]([1, 2, 3], twice));
   assert_eq(r.value, [1020, 1040, 1060]);
@@ -6967,7 +6967,7 @@ test "a lookup that queries twice takes two rounds, and a lone query is a db.que
   })
 }
 
-test "a batch is the statement once per query, its placeholders renumbered and its rows marked" {
+test "`combine_batch` builds one SQL statement that repeats the statement once per query, renumbers each copy's placeholders and adds columns that mark each row's query and position" {
   let c = combine_batch(stmt("select v from items where id = $1 and kind = $2;"), [
     [IntParameter(1), TextParameter("a")],
     [IntParameter(2), TextParameter("b")],
@@ -7001,7 +7001,7 @@ test "a batch is the statement once per query, its placeholders renumbered and i
   )
 }
 
-test "a batch's rows split by the query they belong to, in order, without the batch's columns" {
+test "`split_asks` groups the rows of a combined batch result by the query that produced them, in order, and drops the `ply.ask` and `ply.row` columns" {
   let marked = |ask: Int, place: Int, v: Int|
     Map::new().insert("ply.ask", IntDatum(ask)).insert("ply.row", IntDatum(place)).insert(
       "v",

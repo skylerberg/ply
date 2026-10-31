@@ -3323,7 +3323,7 @@ fn sendable() -> Gen<Sendable> =
     |f: Frame| Sendable(f),
   )
 
-test "every frame reads back from its bytes" {
+test "encoding any frame to bytes and reading the bytes back gives the same frame" {
   gen::check(sendable(), |x: Sendable|
     round_trip(
       |s: Sendable| match s { Sendable(f) -> encode_frame(f) },
@@ -3663,7 +3663,7 @@ fn stories() -> List<Scenario> =
     },
   ]
 
-test "RFC 7541's example {s.name} decodes block by block to its fields and its table" for s: Scenario in stories(
+test "decoding each header block of RFC 7541's example {s.name} in turn returns its header fields and leaves the dynamic table at the listed size" for s: Scenario in stories(
   ) {
   s.examples.fold(decoder(s.capacity, 2), |d: Decoder, e: Example| {
     let got = decoded(d, Bytes::of_hex(e.wire));
@@ -3677,14 +3677,14 @@ test "RFC 7541's example {s.name} decodes block by block to its fields and its t
   ()
 }
 
-test "integers are written as RFC 7541 C.1 has them" {
+test "integers are encoded and decoded as the examples in RFC 7541 section C.1 show" {
   assert_eq(integer(10, 5, 0).hex_of(), "0a");
   assert_eq(integer(1337, 5, 0).hex_of(), "1f9a0a");
   assert_eq(integer(42, 8, 0).hex_of(), "2a");
   assert_eq(integer_at(Bytes::of_hex("1f9a0a"), 0, 5), { value: 1337, next: 3 })
 }
 
-test "strings are Huffman-coded as RFC 7541 C.4 has them" {
+test "strings are Huffman-coded as the examples in RFC 7541 section C.4 show" {
   assert_eq(huffman_encode(b"www.example.com").hex_of(), "f1e3c2e5f23a6ba0ab90f4ff");
   assert_eq(huffman_encode(b"no-cache").hex_of(), "a8eb10649cbf");
   assert_eq(huffman_length(b"custom-key"), 8);
@@ -3693,7 +3693,7 @@ test "strings are Huffman-coded as RFC 7541 C.4 has them" {
   assert_eq(huffman().codes.get(47), 0x18)
 }
 
-test "a Huffman-coded string decodes to itself" {
+test "encoding a string with Huffman coding and decoding it gives back the original string" {
   gen::check(gen::bytes(), |x: Bytes|
     round_trip(
       huffman_encode,
@@ -3718,7 +3718,7 @@ test "a Huffman string that contains EOS, or is padded wrong, is rejected" {
   )
 }
 
-test "a block that names what no table contains, or runs past its end, is rejected" {
+test "decoding a header block fails on index 0, an index past the static and dynamic tables, or a truncated or oversized string or integer" {
   assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("80")), "index 0");
   assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("be")), "index 62 is larger than the static and dynamic tables together");
   assert_eq(
@@ -3739,7 +3739,7 @@ test "a block that names what no table contains, or runs past its end, is reject
   )
 }
 
-test "table size updates come first, at most as many as allowed, and within the ceiling" {
+test "decoding fails when a dynamic table size update follows a field, repeats too often, or exceeds the table's maximum size" {
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("8220")),
     "a table size update after a field",
@@ -3984,7 +3984,7 @@ test "a GET is a request the application responds to with HEADERS and then DATA"
   assert_eq(open_streams(s.connection), 0)
 }
 
-test "the server's first output is its SETTINGS and the window it adds to the connection's" {
+test "the server's first output is a SETTINGS frame and a WINDOW_UPDATE that enlarges the connection's flow-control window" {
   let start = take_output(server(default_limits(), at(0)));
   assert_eq(frames_in(start.bytes).map(shown), ["SETTINGS", "WINDOW_UPDATE 0 983041"])
 }
@@ -4306,7 +4306,7 @@ fn exchanges() -> List<Exchange> / {abort.raise} =
 fn drop_method(fields: List<(String, String)>) -> List<(String, String)> =
   fields.filter(|f: (String, String)| match f { (n, _) -> n != ":method" })
 
-test "after h2spec: {e.name}" for e: Exchange in exchanges() {
+test "for the h2spec case {e.name}, the server sends the frames that h2spec expects in reply" for e: Exchange in exchanges() {
   let s = served(default_limits(), [opening([])].concat(e.input), echo);
   assert_eq(s.frames.drop(1), e.output)
 }
@@ -4355,13 +4355,13 @@ fn malformed_requests() -> List<Bad> =
     },
   ]
 
-test "a request with {b.name} is reset as malformed" for b: Bad in malformed_requests() {
+test "a request with {b.name} is reset with PROTOCOL_ERROR as malformed and never reaches the application" for b: Bad in malformed_requests() {
   let s = served(default_limits(), [opening([]), encode_frame(headers(1, b.fields, true))], echo);
   assert_eq(s.frames, ["SETTINGS ACK", "RST_STREAM 1 PROTOCOL_ERROR"]);
   assert_eq(s.events, [])
 }
 
-test "cookies sent as several fields are one field to the application" {
+test "cookie fields sent separately are joined with `; ` into one cookie field for the application" {
   let s = served(
     default_limits(),
     [
@@ -4425,7 +4425,7 @@ test "a response to HEAD, and a 204, carry no body" {
   assert_eq(none.frames, ["SETTINGS ACK", "HEADERS 1 END_STREAM"])
 }
 
-test "a stream past max_concurrent_streams is refused, and a later one is accepted" {
+test "a stream beyond `max_concurrent_streams` is reset with REFUSED_STREAM, and a later stream is accepted" {
   let l = { ..default_limits(), max_concurrent_streams: 1 };
   let s = served(
     l,
@@ -4462,7 +4462,7 @@ test "rapid reset: streams opened and reset past max_resets close the connection
   assert(finished(s.connection), None)
 }
 
-test "streams reset within the window count, and the count restarts after it" {
+test "the connection closes when stream resets exceed `max_resets` within `window_ms`, and resets in a later window count from zero" {
   let l = { ..default_limits(), max_resets: 2, window_ms: 100 };
   let start = take_output(server(l, at(0)));
   let one = receive(
@@ -4581,7 +4581,7 @@ fn table_amplification_input() -> List<Bytes> / {abort.raise} = {
   ]
 }
 
-test "HPACK bomb: fields past max_header_list_size get a 431 response, however short their block" {
+test "a small compressed header block that expands past `max_header_list_size` gets a 431 response" {
   let s = served(default_limits(), [opening([])].concat(table_amplification_input()), echo);
   let reason = "the fields are larger than 65536 octets\n";
   assert_eq(s.frames, [
@@ -4594,7 +4594,7 @@ test "HPACK bomb: fields past max_header_list_size get a 431 response, however s
   assert_eq(s.events.len(), 1)
 }
 
-test "HPACK bomb: table size updates past max_table_size_updates, or past the table, close the connection" {
+test "HPACK bomb: more table size updates than `max_table_size_updates`, or an update above the maximum table size, close the connection" {
   let updates = HeadersFrame({
     stream: 1,
     block: Bytes::of_hex("202020").concat(block_of(get_fields("/"))),
@@ -4669,7 +4669,7 @@ test "slow reader: a stream whose window stays closed past stall_ms is reset, an
   assert_eq(buffered_octets(late.connection), 0)
 }
 
-test "slow reader: a stream opened while max_buffered octets wait is refused" {
+test "slow reader: a stream opened while `max_buffered` bytes are waiting to be sent is reset with REFUSED_STREAM" {
   let l = { ..default_limits(), max_buffered: 10 };
   let s = served(
     l,
@@ -4728,7 +4728,7 @@ test "an idle connection closes after idle_timeout_ms" {
   assert(finished(idle.connection), None)
 }
 
-test "after max_requests streams the server names the last it accepts and ignores the rest" {
+test "after `max_requests` streams the server sends GOAWAY naming the last stream it will process, and ignores later streams" {
   let l = { ..default_limits(), max_requests: 2 };
   let s = served(
     l,
@@ -4864,7 +4864,7 @@ fn results(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
       _ -> acc,
     })
 
-test "a client's requests reach a server, and the responses come back on their streams" {
+test "a client's requests arrive at a server, and each response comes back on its request's stream" {
   let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
   let e = carried(
     send_requests(connected_pair(default_limits()), [
@@ -4885,7 +4885,7 @@ test "a client's requests reach a server, and the responses come back on their s
   assert_eq(open_streams(e.server), 0)
 }
 
-test "a request's trailers reach the server's application" {
+test "a request's trailers are passed to the server's application" {
   let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
   let e = carried(
     send_requests(connected_pair(default_limits()), [posted]),
@@ -4897,7 +4897,7 @@ test "a request's trailers reach the server's application" {
   assert_eq(results(e.events), [(1, 200, "3")])
 }
 
-test "a client rejects a response whose head is malformed, and a server's PUSH_PROMISE" {
+test "a client rejects a response whose status and headers are malformed, and closes the connection when the server sends PUSH_PROMISE" {
   let start = take_output(client(default_limits(), at(0)));
   let sent = match request(start.connection, asking("GET", "/", b""), at(0)) {
     Some(s) -> s.connection,

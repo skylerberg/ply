@@ -2744,7 +2744,7 @@ test "the body runs first, and the region completes once every task has ended" {
   assert_eq(then(t, 0, Finished).turn, Complete)
 }
 
-test "a join waits for the task it names, which returns its result through its handle" {
+test "a join waits until the task it names finishes, and resumes at once if that task's handle already has a result" {
   let apply_spawn = then(next(lowest()), 0, Spawn);
   assert_eq(apply_spawn.turn, Run(0, Resume(Spawned(1))));
   let wait_description = then(apply_spawn, 0, Join(live(1)));
@@ -2821,7 +2821,7 @@ test "a cancel releases what the task waits on, and the task only unwinds" {
   assert_eq(then(unwound, 0, Join(live(1))).turn, Run(0, Raise(joined_cancelled(nowhere(), 1))))
 }
 
-test "a task cancelled inside a release keeps its wait, and the cancel waits for it to leave" {
+test "cancelling a task while it runs cleanup code does not interrupt its wait, and the cancel takes effect after the cleanup ends" {
   let releasing = { acquiring: 0, releasing: 1, stopping: false };
   let stopped = then(receiver_waiting(), 0, Cancel(live(1), releasing));
   assert_eq(stopped.turn, Run(0, Resume(Flag(true))));
@@ -2830,7 +2830,7 @@ test "a task cancelled inside a release keeps its wait, and the cancel waits for
   assert_eq(then(stopped, 0, Send(chan(0), 3)).turn, Run(0, Resume(Flag(true))))
 }
 
-test "a raise that leaves a task cancels the region's other tasks, and lands once they have ended" {
+test "a task ending with an error cancels the other tasks in its group, and the error is raised again after they have ended" {
   let raising = then(receiver_waiting(), 0, Sleep(10));
   assert_eq(raising.turn, Run(0, Resume(Nothing)));
   let apply_spawn = then(raising, 0, Spawn);
@@ -2843,7 +2843,7 @@ test "a raise that leaves a task cancels the region's other tasks, and lands onc
   assert_eq(first.raising, Some(0))
 }
 
-test "a sibling in a bracket's acquire keeps its reply, and the raise waits for it to unwind" {
+test "a task inside a bracket's acquire step still receives the result of its spawn, and the raise waits until that task unwinds" {
   // The body spawns task 1, and the seed runs task 1 before the body receives its reply.
   let apply_spawn = then(next(seeded_by([0, 1], 1000)), 0, Spawn);
   assert_eq(apply_spawn.turn, Run(1, Start));
@@ -2855,7 +2855,7 @@ test "a sibling in a bracket's acquire keeps its reply, and the raise waits for 
   assert_eq(then(final_trail, 0, Unwound).turn, Reraise(1))
 }
 
-test "each step records what the scheduler orders it against" {
+test "each step records the shared state it accessed, which decides which steps the scheduler may reorder" {
   let stopped = then(receiver_waiting(), 0, Cancel(live(1), unshielded()));
   let steps = steps_taken(stopped);
   let touched = |i: Int| match steps.at(i) { Some(s) -> s.accesses, None -> [] };
@@ -2869,7 +2869,7 @@ test "each step records what the scheduler orders it against" {
   assert_eq(touched(5), [])
 }
 
-test "a step is placed where it first accessed what another task could, else where it gave up control" {
+test "a step records the source location of its first access to shared state, or of its yield if it made no such access" {
   let context = |n: Int| { root: 1, start: n, end: n + 1 };
   let touched = record_accesses(next(lowest()), [
     { access: trail::ScopedValue(1, Write), at: context(2) },
@@ -2907,7 +2907,7 @@ test "a deadlock names each blocked task where it waits" {
 }
 
 // The bytes `ply_compiled::tasks::failure_of` is tested on.
-test "a failure is written as the runtime reads it" {
+test "a failure is encoded to the byte format the runtime decodes" {
   let f = {
     code: "E0414",
     message: "m",
@@ -2945,26 +2945,26 @@ test "a production region runs ready tasks first in, first out" {
   assert_eq(then(apply_spawn, 1, Yield).turn, Run(0, Resume(Spawned(1))))
 }
 
-test "a production task waits on its ticket while the region idles, and runs once it is completed" {
+test "with the runtime scheduler, a task waiting on a completion ticket stays idle, and resumes once the ticket is completed" {
   let wait_description = then(produced(), 0, Ticket(42));
   assert_eq(wait_description.turn, Idle(None));
   assert_eq(next(wake_ticket_waiters(wait_description, [7, 42])).turn, Run(0, Resume(Nothing)))
 }
 
-test "a production sleeper runs once the run's clock reaches its deadline" {
+test "with the runtime scheduler, a sleeping task stays idle until the clock reaches its wake time, then resumes" {
   let asleep = at_time(produced(), 0, Sleep(100), 0);
   assert_eq(asleep.turn, Idle(Some(100)));
   assert_eq(next_turn(asleep, { now: 50, stopping: false }).turn, Idle(Some(100)));
   assert_eq(next_turn(asleep, { now: 100, stopping: false }).turn, Run(0, Resume(Nothing)))
 }
 
-test "a production scheduler deadlocks only with nothing waiting on the host" {
+test "the runtime scheduler fails with a deadlock error when all tasks are blocked, but goes idle if the run is stopping" {
   let stuck = handle_request(then(produced(), 0, Channel(0)), 0, Recv(chan(0)), here());
   assert_eq(code_of(next_turn(stuck, { now: 0, stopping: false })), "E0414");
   assert_eq(next_turn(stuck, { now: 0, stopping: true }).turn, Idle(None))
 }
 
-test "a production scheduler keeps no task that has ended, and a join reads the handle" {
+test "the runtime scheduler removes tasks that have ended, and joining a removed task uses the result stored in its handle" {
   let ended = then(then(produced(), 0, Spawn), 1, Finished);
   assert_eq(ended.turn, Run(0, Resume(Spawned(1))));
   assert_eq(task_count(ended), 1);
@@ -2972,7 +2972,7 @@ test "a production scheduler keeps no task that has ended, and a join reads the 
   assert_eq(code_of(then(ended, 0, Join(live(1)))), "E0413")
 }
 
-test "a production task cancelled before it starts has its handle marked before it is freed" {
+test "with the runtime scheduler, cancelling a task before it starts marks its handle cancelled, then removes the task" {
   let both = then(then(then(produced(), 0, Spawn), 1, Yield), 0, Spawn);
   assert_eq(both.turn, Run(1, Resume(Nothing)));
   let stopped = then(both, 1, Cancel(live(2), unshielded()));
@@ -2994,7 +2994,7 @@ fn serving_at(parks: Int) -> Scheduler<Kept> =
 fn failure_code(r: Scheduler<Kept>) -> String =
   match r.ending { Some(SchedulerFailed(f)) -> f.code, _ -> "" }
 
-test "waits on the run that wake nothing fail the scheduler past the bound, and a wait a deadline or stop ended does not count" {
+test "the scheduler fails once the count of wakeups with no task to run reaches the limit, and wakeups from a deadline, a stop or a completed ticket reset it" {
   assert_eq(failure_code(after_park(serving_at(max_spurious_wakeups()), None, [], false)), "E0505");
   assert_eq(failure_code(after_park(serving_at(max_spurious_wakeups() - 1), None, [], false)), "");
   assert_eq(

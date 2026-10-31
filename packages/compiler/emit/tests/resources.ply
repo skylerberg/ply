@@ -58,14 +58,14 @@ fn unwound_in(b: Block) -> List<List<RootKey>> =
   flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
     match i { CleanupScope(Some(xs)) -> acc.push(xs.map(|x: Unwinding| x.callee)), _ -> acc })
 
-test "a resource is let go where its block ends, by its type's `LetGo` root" {
+test "a resource is released where its block ends, by the release function of its type" {
   let p = program(b"fn f() -> Int = { let c = open(1); let n = send(c, 1); n }\n");
   assert_eq(calls_in(body_of(p, b"f")), [Named(b"m.open"), Named(b"m.send"), conn_release_key()]);
   let q = program(b"fn g() -> Unit = { let c = open(1); close(c) }\n");
   assert_eq(calls_in(body_of(q, b"g")), [Named(b"m.open"), Named(b"m.close")])
 }
 
-test "a failure unwinding past a resource lets it go first, through the runtime" {
+test "a failure that unwinds past a resource releases it first, through the runtime" {
   let p = program(
     b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {abort.raise} = { let c = open(1); let n = send(c, might()); n }\n",
   );
@@ -75,7 +75,7 @@ test "a failure unwinding past a resource lets it go first, through the runtime"
   assert(text.index_of(b"rt_unwind_hold_p(ctx, ") != None, Some(String::of_bytes_lossy(text)))
 }
 
-test "a tail call past what its block lets go stays a loop" {
+test "a tail call stays a loop even when its block must release a resource" {
   let p = program(
     b"fn count(xs: List<Int>) -> Int = { let c = open(1); match xs { [] -> 0, [_, ..rest] -> count(rest) } }\n",
   );
@@ -84,7 +84,7 @@ test "a tail call past what its block lets go stays a loop" {
   assert_eq(calls_in(b).filter(|k: RootKey| k == conn_release_key()).len(), 1)
 }
 
-test "a block that ends in a statement lets go after it, and each alternative of a pattern its own" {
+test "a block ending in a statement releases its resource after the statement, and each alternative of an or-pattern releases its own resource" {
   let p = program(b"fn f() -> Unit = { let c = open(1); send(c, 1); }\n");
   assert_eq(calls_in(body_of(p, b"f")), [Named(b"m.open"), Named(b"m.send"), conn_release_key()]);
   let q = program(
@@ -93,14 +93,14 @@ test "a block that ends in a statement lets go after it, and each alternative of
   assert_eq(calls_in(body_of(q, b"g")).filter(|k: RootKey| k == conn_release_key()).len(), 2)
 }
 
-test "a release that fails lets go of what is still owned, through the runtime" {
+test "when a release fails, the resources still owned are released through the runtime" {
   let p = program(b"fn f() -> Unit = { let a = open(1); let b = open(2); () }\n");
   assert_eq(unwound_in(body_of(p, b"f")), [[conn_release_key()], [conn_release_key()]]);
   let q = program(b"fn f() -> Unit = { let a = open(1); () }\n");
   assert_eq(unwound_in(body_of(q, b"f")), [])
 }
 
-test "a `let` whose pattern misses lets go of what its block owns before it fails" {
+test "a `let` whose pattern does not match releases the resources of its block before it fails" {
   let p = program(
     b"fn maybe() -> Option<Int> = None\nfn f() -> Int / {abort.raise} = { let c = open(1); let Some(n) = maybe(); send(c, n) }\n",
   );
@@ -112,7 +112,7 @@ test "a `let` whose pattern misses lets go of what its block owns before it fail
   assert_eq(calls_in(b).filter(|k: RootKey| k == conn_release_key()).len(), 1)
 }
 
-test "a miss lets go of each value whole, passed borrowed to its release, past what a `handle` around holds" {
+test "a failed pattern releases each whole value by passing it to its release function as borrowed, as an enclosing `handle`'s cleanup does" {
   let p = program(
     b"type Pair = | Pair(Conn, Option<Int>)\ntype Held = | Held(Conn, Int)\nfn mk() -> Pair = Pair(open(1), None)\nfn f() -> Held / {abort.raise} = { let Pair(c, Some(n)) = mk(); Held(c, n) }\n",
   );
@@ -138,14 +138,14 @@ test "a miss lets go of each value whole, passed borrowed to its release, past w
   assert(flat(body_of(q, b"f")).any(|i: Inst| match i { Fail(_) -> true, _ -> false }), None)
 }
 
-test "a name an or-pattern's arm binds again leaves each alternative's resource its own release" {
+test "when one arm of an or-pattern rebinds a name, each alternative's resource still gets its own release call" {
   let p = program(
     b"type Either = | L(Conn) | R(Conn)\nfn g(e: keep Either) -> Int = match e { L(c) | R(c) -> { let n = match Some(1) { Some(c) -> c, None -> 0 }; send(c, n) } }\n",
   );
   assert_eq(calls_in(body_of(p, b"g")).filter(|k: RootKey| k == conn_release_key()).len(), 2)
 }
 
-test "a `let ... else` whose pattern misses lets go of the value it missed" {
+test "a `let ... else` whose pattern does not match releases the value it failed to match" {
   let p = program(
     b"type Either = | L(Conn) | R(Conn)\nfn mk() -> Either = R(open(1))\nfn g() -> Int = { let L(c) = mk() else { 0 }; send(c, 1) }\n",
   );
@@ -157,14 +157,14 @@ test "a `let ... else` whose pattern misses lets go of the value it missed" {
   assert(calls_in(body_of(p, b"g")).any(|k: RootKey| k == either), None)
 }
 
-test "an update whose written field fails lets go of the record it updates" {
+test "an update whose new field value fails releases the record being updated" {
   let p = program(
     b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {abort.raise} = { let h = { conn: open(1), n: 1 }; let r = { ..h, n: might() }; send(r.conn, r.n) }\n",
   );
   assert_eq(unwound_in(body_of(p, b"f")).len(), 2)
 }
 
-test "a raise that a `handle` in an argument handles lets go of nothing the call holds" {
+test "a raise handled by a `handle` inside an argument releases nothing owned by the enclosing call" {
   let p = program(
     b"fn kept(c: keep Conn, n: Int) -> Int = { close(c); n }\nfn f() -> Int = kept(open(1), handle { abort.raise(\"no\"); 1 } with { abort.raise(m) -> 2 })\n",
   );
@@ -173,7 +173,7 @@ test "a raise that a `handle` in an argument handles lets go of nothing the call
   assert_eq(inside, [])
 }
 
-test "a clause of a `handle` in an argument lowers past what the call holds" {
+test "a call to `kept` still lowers when one argument is a `handle` clause and the other arguments are resources" {
   let p = program(
     b"fn kept(c: keep Conn, d: keep Conn) -> Int = { close(c); close(d); 1 }\nfn f() -> Int = kept(open(1), handle { abort.raise(\"no\"); open(2) } with { abort.raise(m) -> open(3) })\n",
   );
@@ -197,7 +197,7 @@ fn argument_counts(b: Block, k: RootKey) -> List<Int> =
     }
   })
 
-test "a release that performs is handed the word the body holds for it, where its block ends and where a failure unwinds" {
+test "a resource's release function that performs effects is passed the resource's words, both at the end of its block and when a failure unwinds" {
   let p = program(
     logging_release_corpus().concat(
       b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {log.write, abort.raise} = { let c = Noted(1); let n = might(); n }\n",
