@@ -2364,7 +2364,8 @@ Expr Expression
 
 It renames each definition, local variable, effect operation, record field and module with the old
 name, where it is declared and wherever it is used. A record field is renamed in every record type
-that has it.
+that has it. Renaming a type also renames the functions its `derive` lines generate, such as
+`box_bin` for `Box`, wherever they are used.
 
 A line can be narrower:
 
@@ -2390,7 +2391,8 @@ exactly a renamed name, or that contains a word `--words` renames, is reported a
 
 `ply rename` changes nothing, and exits 2, if the program does not check first, or if the rename
 would change what any name refers to: two definitions with one name, a local hidden by another,
-or a call on a value that could call a different function. Because of these checks, the renamed
+a call on a value that could call a different function, or a definition a `derive` writes that
+names something the renames remove. Because of these checks, the renamed
 program has the same types, so `ply rename` does not check it again. It renames only the files
 under its paths, and stops if another file of the package uses a renamed name. `--check` reports
 what would change without writing.

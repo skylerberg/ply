@@ -18,12 +18,13 @@ import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label, D
 import compiler.check.member (MemberTarget, CallsFunction)
 import compiler.check.resolve.bindings (Reference, Refers, Local, Definition, Operation,
                                         ModuleQualifier, Unbound)
-import compiler.syntax.items (parse, Module)
+import compiler.syntax.items (parse, Module, DeriveOrigin)
 import compiler.syntax.parsing (is_synthetic_site)
 import compiler.syntax.node_ids (numbered_module)
 import rename.lines (renamed, shown)
 import rename.strings (line_at)
-import rename.programs (Entry, Loaded, Read, DefinitionKey, entries_of, indices_of, key_of, name_in)
+import rename.programs (Entry, Loaded, Read, DefinitionKey, entries_of, indices_of, key_of, name_in,
+                        derived_names, derived_unbound)
 import rename.edits (Renaming, move_of, moved_name, qualified_after)
 
 fn modules_after(
@@ -99,6 +100,35 @@ fn entry_failures(
   wrong.map(|x: Reference| moved_failure(r, x))
 }
 
+pub type Checked = { failures: List<Failure>, derived: Map<DefinitionKey, Bytes> }
+
+fn derived_renames(
+  rn: Renaming,
+  r: Read,
+  after: List<DeriveOrigin>,
+) -> Map<DefinitionKey, Bytes> / {abort.raise} =
+  if after.len() != r.derived.len() { Map::new() } else {
+    range(0, after.len()).fold(Map::new(), |acc: Map<DefinitionKey, Bytes>, k: Int| {
+      let old = derived_names(r.derived.get(k));
+      let new = derived_names(after.get(k));
+      if old.len() != new.len() { acc } else {
+        range(0, old.len()).fold(acc, |into: Map<DefinitionKey, Bytes>, i: Int|
+          if old.get(i) == new.get(i) { into }
+          else { into.insert({ file: absolute(rn.pwd, r.file.at), name: old.get(i) }, new.get(i)) })
+      }
+    })
+  }
+
+fn unbound_failures(r: Read, after: ResolvedProgram, j: Int) -> List<Failure> / {abort.raise} =
+  derived_unbound(after.resolution, j, after.modules.get(j).module).keys().filter(
+    |name: Bytes| !r.derived_unbound.contains(name),
+  ).map(|name: Bytes|
+    {
+      path: displayed(r.file.at),
+      reason: "a definition a `derive` writes would refer to " ++ shown(name)
+        ++ ", which nothing declares after the renames",
+    })
+
 fn compared(
   rn: Renaming,
   l: Loaded,
@@ -106,9 +136,11 @@ fn compared(
   texts: Map<String, Bytes>,
 ) -> List<Failure> / {abort.raise} = {
   let modules = modules_after(rn, l, after);
-  l.reads.concat(l.unrenamed).fold([], |acc: List<Failure>, r: Read|
+  l.reads.concat(l.unrenamed).fold([], |failures: List<Failure>, r: Read|
     match modules.get(r.name) {
+      None -> failures,
       Some(j) -> {
+        let acc = failures.concat(unbound_failures(r, after, j));
         let text = texts.get(absolute(rn.pwd, r.file.at)).unwrap_or(r.file.text);
         let now = entries_of(
           after.resolution,
@@ -123,7 +155,6 @@ fn compared(
             found.concat(entry_failures(rn, l, modules, r, k == 0, r.entries.get(k), now.get(k))))
         }
       },
-      None -> acc,
     })
 }
 
@@ -308,15 +339,28 @@ pub fn verified(
   texts: Map<String, Bytes>,
   renamed: Renamed,
   parses: ParsedSources,
-) -> { failures: List<Failure>, parses: ParsedSources } / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+) -> { checked: Checked, parses: ParsedSources } / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let files = renamed_library(l.path, library);
   let checked = ||
     over_renamed(renamed, || {
       let after = renamed_resolution([l.path], renamed_shipping(l, library, files), parses);
       {
-        failures: match after.resolved {
-          Err(u) -> unresolved_failures(rn, l, u),
-          Ok(program) -> compared(rn, l, program, texts),
+        checked: {
+          failures: match after.resolved {
+            Err(u) -> unresolved_failures(rn, l, u),
+            Ok(program) -> compared(rn, l, program, texts),
+          },
+          derived: l.reads.fold(Map::new(), |acc: Map<DefinitionKey, Bytes>, r: Read|
+            match after.parses.get(
+                moved_name(r.name, rn.modules.get(absolute(rn.pwd, r.file.at))),
+              ) {
+              Some(p) ->
+                derived_renames(rn, r, p.module.derived).fold(
+                  acc,
+                  |m: Map<DefinitionKey, Bytes>, key: DefinitionKey, new: Bytes| m.insert(key, new),
+                ),
+              None -> acc,
+            }),
         },
         parses: after.parses,
       }
