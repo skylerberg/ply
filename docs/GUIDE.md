@@ -2377,9 +2377,10 @@ A line can be narrower:
 | `packages/compiler/emit/old/ new` | a directory of modules |
 
 `--words` renames words inside names instead: `ty type` changes `ty_vars` to `type_vars` and `TyCon`
-to `TypeCon`. A name inside backticks in a comment is renamed too. Text in strings is never changed;
-a string that is exactly a renamed name, or that contains a word `--words` renames, is reported as
-a warning.
+to `TypeCon`. A name inside backticks in a comment is renamed too. A string whose whole text is the
+qualified name of a renamed definition or of a definition in a moved module, such as
+`"app.store.total"`, is renamed with it. Other text in strings is never changed; a string that is
+exactly a renamed name, or that contains a word `--words` renames, is reported as a warning.
 
 `ply rename` changes nothing, and exits 2, if the program does not check first, or if the rename
 would change what any name refers to: two definitions with one name, a local hidden by another,
