@@ -12,10 +12,10 @@ import compiler.check.infer.walked (WalkedExpression, WalkedLiteral, WalkedRead,
                                     WalkedPerform, WalkedLambda, WalkedSimulate, WalkedParallel,
                                     WalkedHandle, WalkedDefault, WalkedArm, WalkedStatement,
                                     WalkedLet, WalkedLetElse, WalkedDo, WalkedAssign, WalkedField,
-                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVar,
+                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVariable,
                                     walked_expression_nodes_folded)
 import compiler.check.resolve.tables (Diagnostic, error_at, error_at_and)
-import compiler.check.infer.checker (simulated_ops)
+import compiler.check.infer.checker (simulated_operations)
 import compiler.check.infer.names (simple_name_of)
 import std.list
 import std.option
@@ -29,9 +29,9 @@ pub type Facts = {
   opened: (Type) -> Bool / {abort.raise},
 }
 
-pub type ArgumentModes = { kept: List<Int>, all: Bool }
+pub type ArgumentModes = { taken_indices: List<Int>, all: Bool }
 
-fn keeps_argument(t: ArgumentModes, i: Int) -> Bool = t.all || t.kept.contains(i)
+fn takes_argument(t: ArgumentModes, i: Int) -> Bool = t.all || t.taken_indices.contains(i)
 
 pub type Param = { name: Bytes, span: Span, ty: Type, keep: Bool }
 
@@ -614,25 +614,25 @@ fn walk(
     },
     WalkedRead(_) -> state,
     WalkedBinary(b) -> {
-      let sides = [b.lhs, b.rhs].fold(
+      let sides = [b.left_operand, b.right_operand].fold(
         { st: state, left: state },
         |accumulator: { st: OwnershipState, left: OwnershipState }, x: WalkedExpression|
           { st: walk(f, s, accumulator.st, x, Read), left: accumulator.st },
       );
-      let both = if b.op == b"and" || b.op == b"or" {
+      let both = if b.operation == b"and" || b.operation == b"or" {
         check_guard_consumed(
           f,
           sides.left,
           sides.st,
-          b.rhs.span,
+          b.right_operand.span,
           b"the right of `&&` or `||`, which may not run",
         )
       } else { sides.st };
-      if never_raises(b.op) { both } else { release_on_failure(s, both, e.span) }
+      if never_raises(b.operation) { both } else { release_on_failure(s, both, e.span) }
     },
     WalkedUnary(u) -> {
       let operand = walk(f, s, state, u.operand, Read);
-      if u.op == b"neg" { release_on_failure(s, operand, e.span) } else { operand }
+      if u.operation == b"neg" { release_on_failure(s, operand, e.span) } else { operand }
     },
     WalkedLambda(l) ->
       check_new_value(
@@ -766,12 +766,12 @@ fn walk(
       check_new_value(f, { ..state_with_values, in_flight: state.in_flight }, e, usage)
     },
     WalkedPerform(p) -> {
-      let consumed_parameters = f.operation_consumed_parameters(p.effect, p.op);
+      let consumed_parameters = f.operation_consumed_parameters(p.effect, p.operation);
       let how = Bytes::concat_all([
         b"handed to `",
         simple_name_of(p.effect),
         b".",
-        p.op,
+        p.operation,
         b"`, which consumes the value",
       ]);
       let args = p.args.fold(
@@ -796,7 +796,7 @@ fn walk(
           f,
           {
             ..isolated_scope(s, t.body.span),
-            handles: s.handles.push({ operations: simulated_ops(), body: s.body }),
+            handles: s.handles.push({ operations: simulated_operations(), body: s.body }),
           },
           { ..state, in_flight: [] },
           t.body,
@@ -970,7 +970,7 @@ fn walk_call(
       walk_arguments(f, s, walk(f, s, state, function, Read), value_call_modes(f, function), args),
   }
 
-fn all_taken() -> ArgumentModes = { kept: [], all: true }
+fn all_taken() -> ArgumentModes = { taken_indices: [], all: true }
 
 type CallModes = { taking: ArgumentModes, params: List<Type> }
 
@@ -986,8 +986,9 @@ fn named(f: Facts, function: WalkedExpression, key: Bytes) -> CallModes / {abort
 
 fn value_call_modes(f: Facts, function: WalkedExpression) -> CallModes / {abort.raise} =
   match type_of(f, function) {
-    FunctionType(t) -> { taking: { kept: t.kept, all: false }, params: t.params },
-    _ -> { taking: { kept: [], all: false }, params: [] },
+    FunctionType(t) ->
+      { taking: { taken_indices: t.keep_parameters, all: false }, params: t.params },
+    _ -> { taking: { taken_indices: [], all: false }, params: [] },
   }
 
 fn walk_arguments(
@@ -1006,7 +1007,7 @@ fn walk_arguments(
           s,
           accumulator.st,
           x,
-          keeps_argument(c.taking, accumulator.at),
+          takes_argument(c.taking, accumulator.at),
           c.params.at(accumulator.at),
         ),
         at: accumulator.at + 1,
@@ -1025,7 +1026,7 @@ fn walk_argument(
   match arg.node {
     WalkedLambda(l) ->
       walk_lambda(f, s, state, arg, l, enclosing_function_at(arg.span, usage), match ty {
-        Some(FunctionType(t)) -> t.kept,
+        Some(FunctionType(t)) -> t.keep_parameters,
         _ -> [],
       }).st,
     _ -> put_in_flight(f, s, state, walk(f, s, state, arg, usage), arg, usage),
@@ -1095,7 +1096,7 @@ fn walk_lambda(
   s: Scope,
   state: OwnershipState,
   e: WalkedExpression,
-  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: WalkedExpression, effects: Effects },
+  l: { params: List<TypedParam<Type>>, owned_parameters: List<Int>, body: WalkedExpression, effects: Effects },
   fun: EnclosingFunction,
   given: List<Int>,
 ) -> { st: OwnershipState, captured: Captures } / {abort.raise} = {
@@ -1113,7 +1114,14 @@ fn walk_lambda(
   let params = range(0, l.params.len()).fold(inner, |accumulator: ScopedState, i: Int| {
     let p = l.params.get(i);
     let t = f.resolved(p.ty);
-    bind(accumulator, p.name, p.span, t, f.resource(t), l.kept.contains(i) || given.contains(i))
+    bind(
+      accumulator,
+      p.name,
+      p.span,
+      t,
+      f.resource(t),
+      l.owned_parameters.contains(i) || given.contains(i),
+    )
   });
   let body = release_scope(
     f,
@@ -1188,7 +1196,7 @@ fn bind_lambda(
   name: Bytes,
   at: Span,
   e: WalkedExpression,
-  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: WalkedExpression, effects: Effects },
+  l: { params: List<TypedParam<Type>>, owned_parameters: List<Int>, body: WalkedExpression, effects: Effects },
 ) -> ScopedState / {abort.raise} = {
   let local: EnclosingFunction = { span: e.span, escapes: false, local: true };
   let first = walk_lambda(f, b.s, b.st, e, l, local, []);
@@ -1606,13 +1614,14 @@ fn walk_handle(
   s: Scope,
   state: OwnershipState,
   e: WalkedExpression,
-  h: { body: WalkedExpression, effects: Effects, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> },
+  h: { body: WalkedExpression, effects: Effects, clauses: List<WalkedClause>, return_clause: Option<WalkedReturn>, variables: List<WalkedHandlerVariable> },
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
-  let operation_names = h.clauses.map(|c: WalkedClause| Bytes::concat_all([c.effect, b".", c.op]));
-  let handler_scope = h.vars.fold(
+  let operation_names = h.clauses.map(|c: WalkedClause|
+    Bytes::concat_all([c.effect, b".", c.operation]));
+  let handler_scope = h.variables.fold(
     { s: s, st: state },
-    |accumulator: ScopedState, v: WalkedHandlerVar| {
+    |accumulator: ScopedState, v: WalkedHandlerVariable| {
       let is_resource = has_resource_type(f, v.init);
       let walked = walk(f, accumulator.s, accumulator.st, v.init, if is_resource {
         Moved(b"stored in a handler's variable")
@@ -1630,13 +1639,13 @@ fn walk_handle(
       { ..s, handles: s.handles.push({ operations: operation_names, body: s.body }) },
       handler_scope.st,
       h.body,
-      match h.ret { Some(_) -> Moved(b"returned to the `return` clause"), None -> usage },
+      match h.return_clause { Some(_) -> Moved(b"returned to the `return` clause"), None -> usage },
     ),
     e.span,
     release_context(s),
   );
   let clauses = h.clauses.fold(inside, |accumulator: OwnershipState, c: WalkedClause| {
-    let consumed_parameters = f.operation_consumed_parameters(c.effect, c.op);
+    let consumed_parameters = f.operation_consumed_parameters(c.effect, c.operation);
     let given = range(0, c.params.len()).fold(
       {
         s: { ..isolated_scope(handler_scope.s, c.span), block: [] },
@@ -1668,7 +1677,7 @@ fn walk_handle(
     );
     { ..ended, in_flight: accumulator.in_flight }
   });
-  match h.ret {
+  match h.return_clause {
     None -> clauses,
     Some(r) -> {
       let inner: ScopedState = {
@@ -1838,7 +1847,7 @@ fn owning_function_passed(f: Facts, b: Binding, span: Span) -> Diagnostic =
     ],
   )
 
-fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diagnostic =
+fn handler_variable_resource(f: Facts, v: WalkedHandlerVariable) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,

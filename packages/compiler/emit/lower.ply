@@ -1,5 +1,5 @@
 import std.list (zip)
-import compiler.emit.code (Code, read_name, CodeLiteral, CodeVar, NDefinition, NConstructor,
+import compiler.emit.code (Code, read_name, CodeLiteral, CodeVariable, NDefinition, NConstructor,
                            NBuiltin, CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda, CodeSimulate,
                            CodeParallel, CodeHandle, CodeFieldRead, CodeUpdate, CodeKnownLambda,
@@ -10,9 +10,9 @@ import compiler.syntax.patterns (LiteralUnit)
 import compiler.syntax.expressions (detached_closure_span, scheduler_module)
 import compiler.emit.representations (Definition, resume_result_type, no_constructors)
 import compiler.emit.typing (unknown_type)
-import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Fn, Metered, falls_through,
+import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Function, Metered, falls_through,
                                operand_representation, CleanupScope, Unwinding, Fail, LetMismatch,
-                               operand_var)
+                               operand_variable)
 import compiler.emit.lower.module_context (ModuleContext, Root)
 import compiler.emit.keys (Named, root_name, root_text, module_of)
 import compiler.check.types (Type, no_effects)
@@ -46,17 +46,17 @@ import compiler.emit.evidence (evidence_type)
 import compiler.emit.output (EffectsGeneric)
 import compiler.emit.statics (folded)
 
-pub fn root_lowered(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
+pub fn root_lowered(setting: ModuleContext, r: Root) -> Function / {abort.raise} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn(context_of(setting, r, body), body)
 }
 
-pub fn root_observed(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
+pub fn root_observed(setting: ModuleContext, r: Root) -> Function / {abort.raise} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn({ ..context_of(setting, r, body), emits_notes: true }, body)
 }
 
-pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Fn / {abort.raise} =
+pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {abort.raise} =
   lowered_group(
     roots.map(|r: Root| {
       let body = known_body(root_text(root_name(r.key)), r.params, r.code);
@@ -79,8 +79,9 @@ pub fn tail_calls(
       } else { accumulator },
       _ -> accumulator,
     },
-    CodeBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_calls(here, b.rhs, accumulator) }
-    else { accumulator },
+    CodeBinary(b) -> if b.operation == b"and" || b.operation == b"or" {
+      tail_calls(here, b.right_operand, accumulator)
+    } else { accumulator },
     CodeIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, accumulator)),
     CodeBlock(b) -> match b.tail {
       Some(t) -> tail_calls(here, t, accumulator),
@@ -115,7 +116,11 @@ fn spawn_argument_lowered(
         body: l.body,
         ty: l.ty,
         words: [],
-        captured_evidence: { words: captured_evidence.words, instance: None, kept: context.kept },
+        captured_evidence: {
+          words: captured_evidence.words,
+          instance: None,
+          retained_values: context.retained_arguments,
+        },
       };
       let o = lambda_body_start(context, captured_evidence.st, frame, l.at);
       closure(
@@ -151,7 +156,7 @@ fn let_with_mismatch(
     { st: value.st, us: [] },
     |accumulator: { st: Lowering, us: List<Unwinding> }, x: Code|
       match x.node {
-        CodeVar(v) -> match accumulator.st.env.get(v.slot) {
+        CodeVariable(v) -> match accumulator.st.env.get(v.slot) {
           Some(arg) -> {
             let u = unwound(context, accumulator.st, arg, at);
             { st: u.st, us: accumulator.us.push(u.unwound) }
@@ -161,7 +166,7 @@ fn let_with_mismatch(
         _ -> accumulator,
       },
   );
-  let id = |u: Unwinding| match operand_var(u.arg) { Some(v) -> v.id, None -> -1 };
+  let id = |u: Unwinding| match operand_variable(u.arg) { Some(v) -> v.id, None -> -1 };
   let mine = own.us.map(id);
   let letting = value.st.unwinding.fold(own.us, |us: List<Unwinding>, u: Unwinding|
     if mine.contains(id(u)) { us } else { us.push(u) });
@@ -189,9 +194,9 @@ fn within_cleanup_scope(
           },
       );
       let mine = lowered_arguments.unwound.map(|u: Unwinding|
-        match operand_var(u.arg) { Some(v) -> v.id, None -> -1 });
+        match operand_variable(u.arg) { Some(v) -> v.id, None -> -1 });
       let around = lowered_arguments.st.unwinding.filter(|u: Unwinding|
-        !mine.contains(match operand_var(u.arg) { Some(v) -> v.id, None -> -1 }));
+        !mine.contains(match operand_variable(u.arg) { Some(v) -> v.id, None -> -1 }));
       let out = lowered(
         context,
         {
@@ -202,12 +207,13 @@ fn within_cleanup_scope(
         false,
       );
       let closed = { ..out, st: { ..out.st, unwinding: lowered_arguments.st.unwinding } };
-      if falls_through(closed.st.insts) { { ..closed, st: emitted(closed.st, CleanupScope(None)) } }
-      else { closed }
+      if falls_through(closed.st.instructions) {
+        { ..closed, st: emitted(closed.st, CleanupScope(None)) }
+      } else { closed }
     },
   }
 
-pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
+pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
   let conv = convention(context);
   let known_representations = parameter_representations(context);
   let declared = context.params.len();
@@ -231,16 +237,18 @@ pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
   let start = if h.unfilled { with_need(begun.st, { var: 0 - 1, reads: EffectsGeneric }) }
   else { begun.st };
   let out = lowered(begun.context, start, body, true);
-  let returned = if falls_through(out.st.insts) { represented_as(out, conv.result, body.span) }
-  else { out };
+  let returned = if falls_through(out.st.instructions) {
+    represented_as(out, conv.result, body.span)
+  } else { out };
   folded(context.setting.constructors, {
     key: context.key,
     kind: Metered,
     params: params,
     convention: conv,
     result_type: context.result_type,
-    body: if falls_through(returned.st.insts) { returned.st.insts.push(Return(returned.arg)) }
-    else { returned.st.insts },
+    body: if falls_through(returned.st.instructions) {
+      returned.st.instructions.push(Return(returned.arg))
+    } else { returned.st.instructions },
     lambdas: returned.st.lambdas,
     base: context.base,
     members: [],
@@ -249,7 +257,7 @@ pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
   })
 }
 
-pub fn lowered_group(members: List<GroupMember>) -> Fn / {abort.raise} = {
+pub fn lowered_group(members: List<GroupMember>) -> Function / {abort.raise} = {
   let starts = group_body_starts(members);
   let bodies = range(0, members.len()).fold(
     { after: None, out: [] },
@@ -286,7 +294,7 @@ fn slot_read(
   views: Bool,
 ) -> Option<{ st: Lowering, read: SlotRead }> / {abort.raise} =
   match x.node {
-    CodeVar(v) -> match state.env.get(v.slot) {
+    CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> {
         let o = if views && operand_representation(a) == AsListView { { st: state, arg: a } }
         else { slot_taken(context, state, v.name, v.slot, a, x.ty, x.span) };
@@ -318,7 +326,7 @@ fn callee_lowered(
   function: Code,
 ) -> LoweredValue / {abort.raise} =
   match function.node {
-    CodeVar(v) -> match state.env.get(v.slot) {
+    CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> if resume_result_type(type_of(a)) != None {
         { st: note_slot_read(context, state, read_note(), v.slot, function.span), arg: a }
       } else { lowered(context, state, function, false) },
@@ -329,7 +337,7 @@ fn callee_lowered(
 
 fn list_view_slot(state: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
   match c.node {
-    CodeVar(v) -> match state.env.get(v.slot) {
+    CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> if operand_representation(a) == AsListView { Some({ slot: v.slot, arg: a }) }
       else { None },
       None -> None,
@@ -343,7 +351,7 @@ fn reads_noted(context: Context, state: Lowering, read: List<SlotRead>) -> Lower
 fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredValue / {abort.raise} =
   match c.node {
     CodeLiteral(l) -> literal(context, state, l, c.span),
-    CodeVar(v) -> match state.env.get(v.slot) {
+    CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) ->
         slot_taken(
           context,
@@ -360,22 +368,26 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
     NConstructor(_) -> global_value(context, state, c),
     NBuiltin(_) -> global_value(context, state, c),
     CodeKnownLambda(k) -> known_lambda_read(context, state, k, c.span),
-    CodeUnary(u) -> unary(context, lowered(context, state, u.operand, false), u.op, c.span),
-    CodeBinary(b) -> if b.op == b"and" || b.op == b"or" {
-      let l = represented_as(lowered(context, state, b.lhs, false), AsBool, b.lhs.span);
+    CodeUnary(u) -> unary(context, lowered(context, state, u.operand, false), u.operation, c.span),
+    CodeBinary(b) -> if b.operation == b"and" || b.operation == b"or" {
+      let l = represented_as(
+        lowered(context, state, b.left_operand, false),
+        AsBool,
+        b.left_operand.span,
+      );
       short_circuit(
         context,
         l,
-        lowered(context, enter_block(l.st), b.rhs, tail),
-        b.op == b"and",
+        lowered(context, enter_block(l.st), b.right_operand, tail),
+        b.operation == b"and",
         c.span,
       )
     } else {
-      match compared_side(context, b.op, b.lhs, b.rhs) {
+      match compared_side(context, b.operation, b.left_operand, b.right_operand) {
         Some(true) -> {
-          let args = match b.lhs.node {
+          let args = match b.left_operand.node {
             CodeApply(ca) -> {
-              let wanted = compared_args(context, b.lhs);
+              let wanted = compared_args(context, b.left_operand);
               ca.args.fold(
                 { st: state, args: [], at: 0 },
                 |accumulator: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
@@ -389,13 +401,20 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
             },
             _ -> { st: state, args: [], at: 0 },
           };
-          compared(context, lowered(context, args.st, b.rhs, false), b.lhs, args.args, b.op, c.span)
+          compared(
+            context,
+            lowered(context, args.st, b.right_operand, false),
+            b.left_operand,
+            args.args,
+            b.operation,
+            c.span,
+          )
         },
         Some(false) -> {
-          let v = lowered(context, state, b.lhs, false);
-          let args = match b.rhs.node {
+          let v = lowered(context, state, b.left_operand, false);
+          let args = match b.right_operand.node {
             CodeApply(ca) -> {
-              let wanted = compared_args(context, b.rhs);
+              let wanted = compared_args(context, b.right_operand);
               ca.args.fold(
                 { st: v.st, args: [], at: 0 },
                 |accumulator: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
@@ -409,21 +428,28 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
             },
             _ -> { st: v.st, args: [], at: 0 },
           };
-          compared(context, { st: args.st, arg: v.arg }, b.rhs, args.args, b.op, c.span)
+          compared(
+            context,
+            { st: args.st, arg: v.arg },
+            b.right_operand,
+            args.args,
+            b.operation,
+            c.span,
+          )
         },
         None -> match constant(context, c) {
           Some(a) -> { st: state, arg: a },
           None -> {
-            let left_operands = match slot_read(context, state, b.lhs, false) {
+            let left_operands = match slot_read(context, state, b.left_operand, false) {
               Some(r) -> { state: r.st, args: [r.read.arg], read: [r.read] },
               None -> {
-                let o = lowered(context, state, b.lhs, false);
+                let o = lowered(context, state, b.left_operand, false);
                 { state: o.st, args: [o.arg], read: [] }
               },
             };
-            let operands = match operand(context, b.op, b.rhs) {
+            let operands = match operand(context, b.operation, b.right_operand) {
               Some(a) -> { ..left_operands, args: left_operands.args.push(a) },
-              None -> match slot_read(context, left_operands.state, b.rhs, false) {
+              None -> match slot_read(context, left_operands.state, b.right_operand, false) {
                 Some(r) ->
                   {
                     state: r.st,
@@ -431,7 +457,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
                     read: left_operands.read.push(r.read),
                   },
                 None -> {
-                  let o = lowered(context, left_operands.state, b.rhs, false);
+                  let o = lowered(context, left_operands.state, b.right_operand, false);
                   { ..left_operands, state: o.st, args: left_operands.args.push(o.arg) }
                 },
               },
@@ -441,7 +467,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
               context,
               { st: s, arg: operands.args.get(0) },
               { st: s, arg: operands.args.get(1) },
-              b.op,
+              b.operation,
               c.span,
             )
           },
@@ -740,7 +766,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         },
         None -> { st: state, arg: None },
       };
-      let spawns = p.effect == b"task" && p.op == b"spawn";
+      let spawns = p.effect == b"task" && p.operation == b"spawn";
       let args = p.args.fold(
         { st: lb.st, args: [] },
         |accumulator: { st: Lowering, args: List<Arg> }, x: Code| {
@@ -749,7 +775,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
           { st: o.st, args: accumulator.args.push(o.arg) }
         },
       );
-      let operation = { effect: p.effect, op: p.op, resource: p.resource };
+      let operation = { effect: p.effect, operation: p.operation, resource: p.resource };
       match scheduler_perform_call(context, operation, p.args, args.args, c.ty, c.span) {
         Some(x) -> if module_of(context.key) == scheduler_module() {
           unreachable(
@@ -785,7 +811,13 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         captures: x.captures,
         resumes: None,
         body: x.body,
-        ty: { params: [], kept: [], once: false, ret: x.body.ty, effects: no_effects() },
+        ty: {
+          params: [],
+          keep_parameters: [],
+          once: false,
+          return_type: x.body.ty,
+          effects: no_effects(),
+        },
         words: words_of(context, x.effects),
         captured_evidence: no_captured_evidence(),
       };
@@ -831,7 +863,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
           { st: k.st, out: accumulator.out.push(k.arg) }
         },
       );
-      let return_clause = match h.ret {
+      let return_clause = match h.return_clause {
         Some(r) -> {
           let evidence = clause_captured_evidence(context, clauses.st, plan, r.effects, r.at);
           let frame = return_frame(r, evidence.held);

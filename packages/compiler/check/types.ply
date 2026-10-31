@@ -9,7 +9,7 @@ import std.option
 
 pub type Resource = | NamedResource(Bytes) | SingletonResource | ResourceVariable(Int) | AnyResource
 
-pub type Effect = { effect: Bytes, resource: Resource, mode: Mode, op: Option<Bytes> }
+pub type Effect = { effect: Bytes, resource: Resource, mode: Mode, operation: Option<Bytes> }
 
 derive bin for Resource
 
@@ -46,7 +46,7 @@ pub fn resource_covers(a: Resource, b: Resource) -> Bool =
 fn mode_rank(mode: Mode) -> Int =
   match mode { ReadMode -> 0, WriteMode -> 1, InvalidMode -> 2, RaiseMode -> 3 }
 
-fn op_lt(a: Option<Bytes>, b: Option<Bytes>) -> Bool =
+fn operation_less(a: Option<Bytes>, b: Option<Bytes>) -> Bool =
   match a {
     None -> match b { Some(_) -> true, None -> false },
     Some(x) -> match b { Some(y) -> compare(x, y) == Less, None -> false },
@@ -58,12 +58,15 @@ pub fn effect_lt(a: Effect, b: Effect) -> Bool =
     && (resource_lt(a.resource, b.resource)
     || (a.resource == b.resource
     && (mode_rank(a.mode) < mode_rank(b.mode)
-    || (mode_rank(a.mode) == mode_rank(b.mode) && op_lt(a.op, b.op))))))
+    || (mode_rank(a.mode) == mode_rank(b.mode) && operation_less(a.operation, b.operation))))))
 
 pub fn effect_covers(a: Effect, b: Effect) -> Bool =
   a.effect == b.effect && resource_covers(a.resource, b.resource)
     && (a == b
-    || (match a.op { None -> mode_rank(a.mode) == mode_rank(b.mode), Some(_) -> a.op == b.op }))
+    || (match a.operation {
+      None -> mode_rank(a.mode) == mode_rank(b.mode),
+      Some(_) -> a.operation == b.operation,
+    }))
 
 pub fn effects_cover(effects: List<Effect>, x: Effect) -> Bool =
   effects.fold(false, |accumulator: Bool, y: Effect| accumulator || effect_covers(y, x))
@@ -71,7 +74,7 @@ pub fn effects_cover(effects: List<Effect>, x: Effect) -> Bool =
 fn is_permissive(entry: Effect) -> Bool =
   match entry.resource {
     AnyResource -> true,
-    _ -> match entry.op { None -> true, Some(_) -> false },
+    _ -> match entry.operation { None -> true, Some(_) -> false },
   }
 
 pub fn effect_allowed(found: List<Effect>, entry: Effect) -> Bool =
@@ -143,7 +146,7 @@ pub fn without_raises(effects: List<Effect>) -> List<Effect> =
   effects.filter(|entry: Effect| !is_raise(entry.mode))
 
 pub fn diverges_effect() -> Effect =
-  { effect: b"diverges", resource: SingletonResource, mode: ReadMode, op: None }
+  { effect: b"diverges", resource: SingletonResource, mode: ReadMode, operation: None }
 
 pub fn is_diverges(entry: Effect) -> Bool = entry.effect == b"diverges"
 
@@ -179,9 +182,9 @@ pub type Type =
 
 pub type FunctionSignature = {
   params: List<Type>,
-  kept: List<Int>,
+  keep_parameters: List<Int>,
   once: Bool,
-  ret: Type,
+  return_type: Type,
   effects: Effects,
 }
 
@@ -217,10 +220,16 @@ pub fn option_type(ty: Type) -> Type = applied_type(b"Option", ty)
 pub fn map_type(k: Type, v: Type) -> Type = NamedType({ name: b"Map", args: [k, v] })
 pub fn iter_type(s: Type, r: Type) -> Type = NamedType({ name: b"Iter", args: [s, r] })
 pub fn secret_type(ty: Type) -> Type = applied_type(b"Secret", ty)
-pub fn fn_type(params: List<Type>, return_type: Type, effects: Effects) -> Type =
-  FunctionType({ params: params, kept: [], once: false, ret: return_type, effects: effects })
+pub fn function_type(params: List<Type>, return_type: Type, effects: Effects) -> Type =
+  FunctionType({
+    params: params,
+    keep_parameters: [],
+    once: false,
+    return_type: return_type,
+    effects: effects,
+  })
 
-pub fn owning_fn_type(
+pub fn owning_function_type(
   params: List<Type>,
   keep_parameters: List<Int>,
   once: Bool,
@@ -229,9 +238,9 @@ pub fn owning_fn_type(
 ) -> Type =
   FunctionType({
     params: params,
-    kept: keep_parameters,
+    keep_parameters: keep_parameters,
     once: once,
-    ret: return_type,
+    return_type: return_type,
     effects: effects,
   })
 pub fn monomorphic(ty: Type) -> Scheme =
@@ -289,13 +298,13 @@ pub type Fresh = { next_type: Int, next_effect_variable: Int }
 
 pub fn fresh_new() -> Fresh = { next_type: 0, next_effect_variable: 0 }
 
-pub fn fresh_type_var(fresh: Fresh) -> { fresh: Fresh, var: Int } =
+pub fn fresh_type_variable(fresh: Fresh) -> { fresh: Fresh, var: Int } =
   {
     fresh: { next_type: fresh.next_type + 1, next_effect_variable: fresh.next_effect_variable },
     var: fresh.next_type,
   }
 pub fn fresh_type(fresh: Fresh) -> { fresh: Fresh, ty: Type } = {
-  let o = fresh_type_var(fresh);
+  let o = fresh_type_variable(fresh);
   { fresh: o.fresh, ty: VariableType(o.var) }
 }
 pub fn fresh_effect_variable(fresh: Fresh) -> { fresh: Fresh, var: Int } =
@@ -359,7 +368,7 @@ fn has_bound_variable(substitution: Substitution, t: Type) -> Bool =
       c.args.fold(false, |found: Bool, a: Type| found || has_bound_variable(substitution, a)),
     FunctionType(f) ->
       f.params.fold(false, |found: Bool, p: Type| found || has_bound_variable(substitution, p))
-        || has_bound_variable(substitution, f.ret)
+        || has_bound_variable(substitution, f.return_type)
         || effects_may_change(substitution, f.effects),
     RecordType(fs) ->
       fs.fold(false, |found: Bool, f: Field| found || has_bound_variable(substitution, f.ty)),
@@ -389,9 +398,9 @@ fn rebuild_resolved(substitution: Substitution, t: Type, budget: Int) -> Type / 
         params: f.params.map(|p: Type|
           if has_bound_variable(substitution, p) { rebuild_resolved(substitution, p, budget) }
           else { p }),
-        ret: if has_bound_variable(substitution, f.ret) {
-          rebuild_resolved(substitution, f.ret, budget)
-        } else { f.ret },
+        return_type: if has_bound_variable(substitution, f.return_type) {
+          rebuild_resolved(substitution, f.return_type, budget)
+        } else { f.return_type },
         effects: if effects_may_change(substitution, f.effects) {
           resolve_effects(substitution, f.effects)
         } else { f.effects },
@@ -485,14 +494,14 @@ pub fn label_of(ty: Type) -> Option<Bytes> / {abort.raise} =
 
 fn label_arg(label: Type) -> Type = applied_type(b"#label", label)
 
-fn effects_arg(effects: Effects) -> Type = fn_type([], named_type(b"#effects"), effects)
+fn effects_arg(effects: Effects) -> Type = function_type([], named_type(b"#effects"), effects)
 
 pub fn arg_label(ty: Type) -> Option<Type> =
   match ty { NamedType(c) -> if c.name == b"#label" { c.args.at(0) } else { None }, _ -> None }
 
 pub fn arg_effects(ty: Type) -> Option<Effects> =
   match ty {
-    FunctionType(f) -> match f.ret {
+    FunctionType(f) -> match f.return_type {
       NamedType(c) -> if c.name == b"#effects" { Some(f.effects) } else { None },
       _ -> None,
     },
@@ -510,7 +519,7 @@ pub fn applied_args(
 pub fn is_label_or_effects(ty: Type) -> Bool =
   match ty {
     NamedType(c) -> c.name == b"#label",
-    FunctionType(f) -> match f.ret { NamedType(c) -> c.name == b"#effects", _ -> false },
+    FunctionType(f) -> match f.return_type { NamedType(c) -> c.name == b"#effects", _ -> false },
     _ -> false,
   }
 
@@ -523,7 +532,7 @@ pub fn resolve_effect(substitution: Substitution, entry: Effect) -> Effect / {ab
         effect: entry.effect,
         resource: resource_of(shallow_resolve(substitution, VariableType(v)), v),
         mode: entry.mode,
-        op: entry.op,
+        operation: entry.operation,
       },
     _ -> entry,
   }
@@ -541,7 +550,7 @@ pub fn occurs_type(v: Int, t: Type) -> Bool =
       c.args.fold(false, |accumulator: Bool, a: Type| accumulator || occurs_type(v, a)),
     FunctionType(f) ->
       f.params.fold(false, |accumulator: Bool, p: Type| accumulator || occurs_type(v, p))
-        || occurs_type(v, f.ret),
+        || occurs_type(v, f.return_type),
     RecordType(fs) ->
       fs.fold(false, |accumulator: Bool, f: Field| accumulator || occurs_type(v, f.ty)),
     NominalType(n) ->
@@ -624,7 +633,7 @@ fn variables_of(seen: List<Int>, ty: Type) -> List<Int> =
   match ty {
     VariableType(v) -> if seen.contains(v) { seen } else { seen.push(v) },
     NamedType(c) -> c.args.fold(seen, variables_of),
-    FunctionType(f) -> variables_of(f.params.fold(seen, variables_of), f.ret),
+    FunctionType(f) -> variables_of(f.params.fold(seen, variables_of), f.return_type),
     RecordType(fs) ->
       fs.fold(seen, |accumulator: List<Int>, f: Field| variables_of(accumulator, f.ty)),
     NominalType(n) -> n.args.fold(seen, variables_of),
@@ -661,7 +670,7 @@ fn free_variables_within(
     FunctionType(fn_) -> {
       let ps = fn_.params.fold(accumulator, |a: FreeVariables, x: Type|
         free_variables_within(substitution, x, a, budget));
-      let r = free_variables_within(substitution, fn_.ret, ps, budget);
+      let r = free_variables_within(substitution, fn_.return_type, ps, budget);
       let effects = resolve_effects(substitution, fn_.effects);
       let ls = effects.listed.fold(r, |a: FreeVariables, x: Effect|
         match x.resource {
@@ -740,7 +749,8 @@ fn type_size(t: Type) -> Int =
   match t {
     VariableType(_) -> 1,
     NamedType(c) -> c.args.fold(1, |n: Int, a: Type| n + type_size(a)),
-    FunctionType(f) -> f.params.fold(1 + type_size(f.ret), |n: Int, p: Type| n + type_size(p)),
+    FunctionType(f) ->
+      f.params.fold(1 + type_size(f.return_type), |n: Int, p: Type| n + type_size(p)),
     RecordType(fs) -> fs.fold(1, |n: Int, f: Field| n + type_size(f.ty)),
     NominalType(x) -> x.args.fold(1, |n: Int, a: Type| n + type_size(a)),
   }
@@ -790,7 +800,15 @@ fn unify_structural(
         match ps.error {
           Some(_) -> ps,
           None -> {
-            let r = unify_at(ps.substitution, ps.fresh, f1.ret, f2.ret, exact, budget, tries);
+            let r = unify_at(
+              ps.substitution,
+              ps.fresh,
+              f1.return_type,
+              f2.return_type,
+              exact,
+              budget,
+              tries,
+            );
             match r.error {
               Some(_) -> r,
               None -> unify_effects_at(r.substitution, r.fresh, f1.effects, f2.effects, exact),
@@ -889,7 +907,8 @@ fn matching_label(
       Some(_) -> accumulator,
       None -> {
         let b = resolve_effect(substitution, y);
-        if b.effect == x.effect && mode_rank(b.mode) == mode_rank(x.mode) && b.op == x.op {
+        if b.effect == x.effect && mode_rank(b.mode) == mode_rank(x.mode)
+            && b.operation == x.operation {
           match b.resource {
             NamedResource(n) -> Some(label_type(n)),
             ResourceVariable(w) -> if w == v { None } else { Some(VariableType(w)) },
@@ -973,7 +992,7 @@ pub type Scope = { locals: Map<Int, Scheme>, names: Map<Bytes, Int>, ungeneraliz
 
 pub type TypeEnv = { globals: Map<Bytes, Scheme>, open: List<Bytes>, scopes: List<Scope> }
 
-pub type InScope = { binder: Int, name: Bytes, sc: Scheme }
+pub type InScope = { binder: Int, name: Bytes, scheme: Scheme }
 
 fn scope_new() -> Scope = { locals: Map::new(), names: Map::new(), ungeneralized: [] }
 
@@ -1026,7 +1045,7 @@ pub fn env_locals(env: TypeEnv) -> List<InScope> / {abort.raise} = {
     scope.names.fold(accumulator, |found: List<InScope>, name: Bytes, binder: Int|
       if range(i + 1, n).any(|j: Int| env.scopes.get(j).names.contains(name)) { found } else {
         match scope.locals.get(binder) {
-          Some(scheme) -> found.push({ binder: binder, name: name, sc: scheme }),
+          Some(scheme) -> found.push({ binder: binder, name: name, scheme: scheme }),
           None -> found,
         }
       })
@@ -1102,7 +1121,7 @@ fn rename(t: Type, types: Map<Int, Type>, effect_variables: Map<Int, Int>) -> Ty
       FunctionType({
         ..f,
         params: f.params.map(|p: Type| rename(p, types, effect_variables)),
-        ret: rename(f.ret, types, effect_variables),
+        return_type: rename(f.return_type, types, effect_variables),
         effects: {
           listed: f.effects.listed.fold([], |accumulator: List<Effect>, a: Effect|
             effects_insert(accumulator, rename_effect(a, types))),
@@ -1128,7 +1147,12 @@ fn rename_effect(entry: Effect, types: Map<Int, Type>) -> Effect / {abort.raise}
   match entry.resource {
     ResourceVariable(v) -> match types.get(v) {
       Some(t) ->
-        { effect: entry.effect, resource: resource_of(t, v), mode: entry.mode, op: entry.op },
+        {
+          effect: entry.effect,
+          resource: resource_of(t, v),
+          mode: entry.mode,
+          operation: entry.operation,
+        },
       None -> entry,
     },
     _ -> entry,
@@ -1153,7 +1177,7 @@ fn substituted(
       FunctionType({
         ..f,
         params: f.params.map(|p: Type| substituted(p, types, effect_substitution)),
-        ret: substituted(f.ret, types, effect_substitution),
+        return_type: substituted(f.return_type, types, effect_substitution),
         effects: match filled {
           Some(found) -> { listed: effects_union(effects, found.listed), variable: found.variable },
           None -> { listed: effects, variable: f.effects.variable },
@@ -1287,7 +1311,7 @@ pub fn generalize(
 pub type TypeNode =
   | NodeVariable(Int)
   | NodeNamed({ name: Bytes, args: List<Bytes> })
-  | NodeFunction({ params: List<Bytes>, kept: List<Int>, once: Bool, ret: Bytes })
+  | NodeFunction({ params: List<Bytes>, keep_parameters: List<Int>, once: Bool, return_type: Bytes })
   | NodeRecord(List<NodeField>)
   | NodeNominal({ name: Bytes, args: List<Bytes>, fields: List<NodeField> })
 
@@ -1328,10 +1352,15 @@ pub fn insert_type(table: TypeTable, ty: Type) -> { table: TypeTable, key: Bytes
     },
     FunctionType(f) -> {
       let p = insert_parts(table, f.params);
-      let r = insert_type(p.table, f.ret);
+      let r = insert_type(p.table, f.return_type);
       {
         table: r.table,
-        node: NodeFunction({ params: p.keys, kept: f.kept, once: f.once, ret: r.key }),
+        node: NodeFunction({
+          params: p.keys,
+          keep_parameters: f.keep_parameters,
+          once: f.once,
+          return_type: r.key,
+        }),
       }
     },
     RecordType(fs) -> {
@@ -1355,22 +1384,22 @@ fn node_parts(node: TypeNode) -> List<Bytes> =
   match node {
     NodeVariable(_) -> [],
     NodeNamed(c) -> c.args,
-    NodeFunction(f) -> f.params.push(f.ret),
+    NodeFunction(f) -> f.params.push(f.return_type),
     NodeRecord(fs) -> fs.map(|f: NodeField| f.ty),
     NodeNominal(x) -> x.args.concat(x.fields.map(|f: NodeField| f.ty)),
   }
 
 pub fn subtable(table: TypeTable, keys: List<Bytes>) -> TypeTable =
   keys.fold(Map::new(), |accumulator: TypeTable, k: Bytes|
-    reached_nodes(table, k, accumulator, table.len()))
+    reachable_nodes(table, k, accumulator, table.len()))
 
-fn reached_nodes(table: TypeTable, key: Bytes, accumulator: TypeTable, budget: Int) -> TypeTable =
+fn reachable_nodes(table: TypeTable, key: Bytes, accumulator: TypeTable, budget: Int) -> TypeTable =
   if budget <= 0 || accumulator.contains(key) { accumulator } else {
     match table.get(key) {
       None -> accumulator,
       Some(node) ->
         node_parts(node).fold(accumulator.insert(key, node), |a: TypeTable, k: Bytes|
-          reached_nodes(table, k, a, budget - 1)),
+          reachable_nodes(table, k, a, budget - 1)),
     }
   }
 
@@ -1444,8 +1473,11 @@ fn type_of_node(
     },
     NodeFunction(f) -> {
       let p = types_within(table, f.params, read, budget);
-      let r = type_within(table, f.ret, p.read, budget);
-      { ty: owning_fn_type(p.types, f.kept, f.once, r.ty, no_effects()), read: r.read }
+      let r = type_within(table, f.return_type, p.read, budget);
+      {
+        ty: owning_function_type(p.types, f.keep_parameters, f.once, r.ty, no_effects()),
+        read: r.read,
+      }
     },
     NodeRecord(fs) -> {
       let r = fields_within(table, fs, read, budget);
@@ -1461,7 +1493,7 @@ fn type_of_node(
 pub type InternedType =
   | InternedVariable(Int)
   | InternedNamed({ name: Bytes, args: List<Int> })
-  | InternedFunction({ params: List<Int>, kept: List<Int>, once: Bool, ret: Int, effects: Effects })
+  | InternedFunction({ params: List<Int>, keep_parameters: List<Int>, once: Bool, return_type: Int, effects: Effects })
   | InternedRecord(List<InternedField>)
   | InternedNominal({ name: Bytes, args: List<Int>, fields: List<InternedField> })
 
@@ -1509,14 +1541,14 @@ fn intern_type(h: TypeInterner, ty: Type) -> { h: TypeInterner, at: Int } / {abo
     },
     FunctionType(f) -> {
       let p = intern_parts(h, f.params);
-      let r = intern_type(p.h, f.ret);
+      let r = intern_type(p.h, f.return_type);
       intern_node(
         r.h,
         InternedFunction({
           params: p.at,
-          kept: f.kept,
+          keep_parameters: f.keep_parameters,
           once: f.once,
-          ret: r.at,
+          return_type: r.at,
           effects: f.effects,
         }),
       )
@@ -1572,7 +1604,7 @@ fn interned_parts_of(node: InternedType) -> List<Int> =
   match node {
     InternedVariable(_) -> [],
     InternedNamed(c) -> c.args,
-    InternedFunction(f) -> f.params.push(f.ret),
+    InternedFunction(f) -> f.params.push(f.return_type),
     InternedRecord(fs) -> fs.map(|f: InternedField| f.ty),
     InternedNominal(x) ->
       x.fields.fold(x.args, |accumulator: List<Int>, f: InternedField| accumulator.push(f.ty)),
@@ -1590,7 +1622,8 @@ fn renumbered(node: InternedType, to: Map<Int, Int>) -> InternedType / {abort.ra
   match node {
     InternedVariable(v) -> InternedVariable(v),
     InternedNamed(c) -> InternedNamed({ name: c.name, args: c.args.map(part) }),
-    InternedFunction(f) -> InternedFunction({ ..f, params: f.params.map(part), ret: part(f.ret) }),
+    InternedFunction(f) ->
+      InternedFunction({ ..f, params: f.params.map(part), return_type: part(f.return_type) }),
     InternedRecord(fs) -> InternedRecord(fields(fs)),
     InternedNominal(x) ->
       InternedNominal({ name: x.name, args: x.args.map(part), fields: fields(x.fields) }),
@@ -1640,7 +1673,13 @@ pub fn types_of(interned_types: List<InternedType>) -> List<Type> / {abort.raise
       InternedVariable(v) -> VariableType(v),
       InternedNamed(c) -> NamedType({ name: c.name, args: c.args.map(part) }),
       InternedFunction(f) ->
-        owning_fn_type(f.params.map(part), f.kept, f.once, part(f.ret), f.effects),
+        owning_function_type(
+          f.params.map(part),
+          f.keep_parameters,
+          f.once,
+          part(f.return_type),
+          f.effects,
+        ),
       InternedRecord(fs) -> RecordType(fields(fs)),
       InternedNominal(x) ->
         NominalType({ name: x.name, args: x.args.map(part), fields: fields(x.fields) }),
@@ -1669,7 +1708,7 @@ fn name_in(n: VariableRenaming, ty: Type) -> VariableRenaming =
     VariableType(v) -> name_type(n, v),
     NamedType(c) -> c.args.fold(n, name_in),
     FunctionType(f) -> {
-      let m = name_effects(name_in(f.params.fold(n, name_in), f.ret), f.effects.listed);
+      let m = name_effects(name_in(f.params.fold(n, name_in), f.return_type), f.effects.listed);
       match f.effects.variable { Some(v) -> name_effect_variable(m, v), None -> m }
     },
     RecordType(fs) -> fs.fold(n, |m: VariableRenaming, field: Field| name_in(m, field.ty)),
@@ -1818,7 +1857,7 @@ fn reserve_type(printer: Printer, t: Type) -> Printer / {abort.raise} =
       reserve_effects(
         reserve_type(
           f.params.fold(printer, |accumulator: Printer, x: Type| reserve_type(accumulator, x)),
-          f.ret,
+          f.return_type,
         ),
         f.effects.listed,
       ),
@@ -1858,7 +1897,7 @@ fn type_with_written_labels(ty: Type, closed: (Bytes) -> Bool) -> Type / {abort.
       FunctionType({
         ..f,
         params: f.params.map(|p: Type| type_with_written_labels(p, closed)),
-        ret: type_with_written_labels(f.ret, closed),
+        return_type: type_with_written_labels(f.return_type, closed),
         effects: effects_with_written_labels(f.effects, closed),
       }),
     RecordType(fs) ->
@@ -1903,7 +1942,7 @@ pub fn print_effect(
       text: Bytes::concat_all([
         entry.effect,
         b".",
-        match entry.op { Some(operation) -> operation, None -> mode_text(entry.mode) },
+        match entry.operation { Some(operation) -> operation, None -> mode_text(entry.mode) },
         r.text,
       ]),
     }
@@ -1950,9 +1989,10 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
       Some(effects) -> print_effects(printer, effects),
       None -> {
         let ps = print_types(printer, f.params);
-        let r = printed(ps.printer, f.ret);
+        let r = printed(ps.printer, f.return_type);
         let params = range(0, ps.texts.len()).map(|i: Int|
-          if f.kept.contains(i) { b"keep ".concat(ps.texts.get(i)) } else { ps.texts.get(i) });
+          if f.keep_parameters.contains(i) { b"keep ".concat(ps.texts.get(i)) }
+          else { ps.texts.get(i) });
         let head = Bytes::concat_all([
           if f.once { b"once (" } else { b"(" },
           Bytes::join(params, b", "),
@@ -2124,10 +2164,12 @@ fn read_effect(text: Bytes) -> Option<Effect> / {abort.raise} =
           let eff = s.name.slice(0, d);
           let access = s.name.slice(d + 1, s.name.len());
           if access == b"read" {
-            Some({ effect: eff, resource: s.resource, mode: ReadMode, op: None })
+            Some({ effect: eff, resource: s.resource, mode: ReadMode, operation: None })
           } else if access == b"write" {
-            Some({ effect: eff, resource: s.resource, mode: WriteMode, op: None })
-          } else { Some({ effect: eff, resource: s.resource, mode: WriteMode, op: Some(access) }) }
+            Some({ effect: eff, resource: s.resource, mode: WriteMode, operation: None })
+          } else {
+            Some({ effect: eff, resource: s.resource, mode: WriteMode, operation: Some(access) })
+          }
         }
       },
     }
@@ -2287,7 +2329,7 @@ test "unifying a variable with a list nested 200 levels deep succeeds, even thro
 }
 
 test "effects unify one effect at a time, and a closed effect list rejects an effect it does not contain" {
-  let db = { effect: b"db", resource: NamedResource(b"users"), mode: ReadMode, op: None };
+  let db = { effect: b"db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
   let f0 = fresh_new();
   let e = fresh_effects(f0);
   let u = unify_effects(substitution_new(), e.fresh, e.effects, single_effect(db));
@@ -2297,20 +2339,20 @@ test "effects unify one effect at a time, and a closed effect list rejects an ef
 }
 
 test "`net.send[conn]` is ordered after `net.write[conn]` in an effect list, and `net.write` covers `net.send`, so the list can omit `net.send`" {
-  let wr = { effect: b"net", resource: NamedResource(b"conn"), mode: WriteMode, op: None };
+  let wr = { effect: b"net", resource: NamedResource(b"conn"), mode: WriteMode, operation: None };
   let send = {
     effect: b"net",
     resource: NamedResource(b"conn"),
     mode: WriteMode,
-    op: Some(b"send"),
+    operation: Some(b"send"),
   };
   let recv = {
     effect: b"net",
     resource: NamedResource(b"conn"),
     mode: WriteMode,
-    op: Some(b"recv"),
+    operation: Some(b"recv"),
   };
-  let rd = { effect: b"net", resource: NamedResource(b"conn"), mode: ReadMode, op: None };
+  let rd = { effect: b"net", resource: NamedResource(b"conn"), mode: ReadMode, operation: None };
   assert(effect_lt(wr, send));
   assert(!effect_lt(send, wr));
   assert(effect_lt(recv, send));
@@ -2335,13 +2377,13 @@ test "`net.send[conn]` is ordered after `net.write[conn]` in an effect list, and
 }
 
 test "effects read back as the effects they were printed from" {
-  let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, op: None };
-  let wr = { effect: b"m.net", resource: SingletonResource, mode: WriteMode, op: None };
+  let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
+  let wr = { effect: b"m.net", resource: SingletonResource, mode: WriteMode, operation: None };
   let send = {
     effect: b"m.net",
     resource: NamedResource(b"conn"),
     mode: WriteMode,
-    op: Some(b"send"),
+    operation: Some(b"send"),
   };
   assert_eq(read_effects(b""), Some([]));
   assert_eq(read_effects(effect_list_text([rd], b",")), Some([rd]));
@@ -2350,7 +2392,14 @@ test "effects read back as the effects they were printed from" {
   assert_eq(
     read_effects(
       effect_list_text(
-        [{ effect: b"m.net", resource: ResourceVariable(4), mode: WriteMode, op: Some(b"send") }],
+        [
+          {
+            effect: b"m.net",
+            resource: ResourceVariable(4),
+            mode: WriteMode,
+            operation: Some(b"send"),
+          },
+        ],
         b",",
       ),
     ),
@@ -2363,8 +2412,9 @@ test "effects read back as the effects they were printed from" {
 }
 
 test "effects can be written as text with each label parameter named by its position, and read back with each position replaced by a given label variable" {
-  let send = |r: Resource| { effect: b"m.net", resource: r, mode: WriteMode, op: Some(b"send") };
-  let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, op: None };
+  let send = |r: Resource|
+    { effect: b"m.net", resource: r, mode: WriteMode, operation: Some(b"send") };
+  let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
   let recorded = positional_effects_text(
     [send(ResourceVariable(7)), rd, send(ResourceVariable(4))],
     [4, 7],
@@ -2389,7 +2439,11 @@ test "the printer names type variables in order of first appearance, and names e
     effect_variables: [2],
     keep_variables: [],
     label_variables: [],
-    ty: fn_type([VariableType(3), VariableType(7)], list_type(VariableType(3)), open_effects(2)),
+    ty: function_type(
+      [VariableType(3), VariableType(7)],
+      list_type(VariableType(3)),
+      open_effects(2),
+    ),
   };
   assert_eq(scheme_text(scheme), b"<b, a | e>(a, b) -> List<a> / e");
   assert_eq(
@@ -2404,13 +2458,13 @@ test "the printer names type variables in order of first appearance, and names e
 
 test "two schemes that differ only in how their variables are numbered have the same canonical form" {
   let send = |v: Int|
-    { effect: b"net", resource: ResourceVariable(v), mode: WriteMode, op: Some(b"send") };
+    { effect: b"net", resource: ResourceVariable(v), mode: WriteMode, operation: Some(b"send") };
   let one = {
     type_variables: [7, 3],
     effect_variables: [12],
     keep_variables: [],
     label_variables: [5],
-    ty: fn_type([VariableType(3), list_type(VariableType(7))], VariableType(3), {
+    ty: function_type([VariableType(3), list_type(VariableType(7))], VariableType(3), {
       listed: [send(5)],
       variable: Some(12),
     }),
@@ -2420,7 +2474,7 @@ test "two schemes that differ only in how their variables are numbered have the 
     effect_variables: [2],
     keep_variables: [],
     label_variables: [9],
-    ty: fn_type([VariableType(21), list_type(VariableType(40))], VariableType(21), {
+    ty: function_type([VariableType(21), list_type(VariableType(40))], VariableType(21), {
       listed: [send(9)],
       variable: Some(2),
     }),
@@ -2432,15 +2486,15 @@ test "two schemes that differ only in how their variables are numbered have the 
     effect_variables: [0],
     keep_variables: [],
     label_variables: [2],
-    ty: fn_type([VariableType(1), list_type(VariableType(0))], VariableType(1), {
+    ty: function_type([VariableType(1), list_type(VariableType(0))], VariableType(1), {
       listed: [send(2)],
       variable: Some(0),
     }),
   });
   assert_eq(scheme_text(canonical_scheme(one)), scheme_text(one));
   assert_eq(canonical_type(list_type(VariableType(8))), list_type(VariableType(0)));
-  let recv = { ..send(30), op: Some(b"recv") };
-  assert_eq(canonical_effects([send(12), recv]), [send(0), { ..send(1), op: Some(b"recv") }])
+  let recv = { ..send(30), operation: Some(b"recv") };
+  assert_eq(canonical_effects([send(12), recv]), [send(0), { ..send(1), operation: Some(b"recv") }])
 }
 
 test "in an effect list a label variable is ordered after a named label and before the unlabeled effect, and resolves to the label bound to it" {
@@ -2448,10 +2502,20 @@ test "in an effect list a label variable is ordered after a named label and befo
     effect: b"net",
     resource: NamedResource(b"conn"),
     mode: WriteMode,
-    op: Some(b"send"),
+    operation: Some(b"send"),
   };
-  let var_ = { effect: b"net", resource: ResourceVariable(4), mode: WriteMode, op: Some(b"send") };
-  let single = { effect: b"net", resource: SingletonResource, mode: WriteMode, op: Some(b"send") };
+  let var_ = {
+    effect: b"net",
+    resource: ResourceVariable(4),
+    mode: WriteMode,
+    operation: Some(b"send"),
+  };
+  let single = {
+    effect: b"net",
+    resource: SingletonResource,
+    mode: WriteMode,
+    operation: Some(b"send"),
+  };
   assert(effect_lt(named, var_));
   assert(effect_lt(var_, single));
   assert_eq(
@@ -2473,14 +2537,19 @@ test "the text of a function's effects starts with a bracketed list of the label
     effect: b"net",
     resource: NamedResource(b"conn"),
     mode: WriteMode,
-    op: Some(b"send"),
+    operation: Some(b"send"),
   };
-  let first = { effect: b"net", resource: ResourceVariable(4), mode: WriteMode, op: Some(b"recv") };
+  let first = {
+    effect: b"net",
+    resource: ResourceVariable(4),
+    mode: WriteMode,
+    operation: Some(b"recv"),
+  };
   let second = {
     effect: b"net",
     resource: ResourceVariable(9),
     mode: WriteMode,
-    op: Some(b"send"),
+    operation: Some(b"send"),
   };
   assert_eq(effect_list_text([named], b","), b"net.send[conn]");
   assert_eq(effect_list_text([], b","), b"");
@@ -2492,15 +2561,25 @@ test "the text of a function's effects starts with a bracketed list of the label
 }
 
 test "a label variable is printed as `m` instead of `l` when a named resource is already called `l`" {
-  let named = { effect: b"net", resource: NamedResource(b"l"), mode: WriteMode, op: Some(b"send") };
-  let var_ = { effect: b"net", resource: ResourceVariable(4), mode: WriteMode, op: Some(b"recv") };
+  let named = {
+    effect: b"net",
+    resource: NamedResource(b"l"),
+    mode: WriteMode,
+    operation: Some(b"send"),
+  };
+  let var_ = {
+    effect: b"net",
+    resource: ResourceVariable(4),
+    mode: WriteMode,
+    operation: Some(b"recv"),
+  };
   assert_eq(effect_list_text([named, var_], b","), b"<[m]>net.send[l],net.recv[m]");
   assert_eq(effects_text(closed_effects([named, var_])), b"{net.send[l], net.recv[m]}");
   let same_op = {
     effect: b"net",
     resource: ResourceVariable(4),
     mode: WriteMode,
-    op: Some(b"send"),
+    operation: Some(b"send"),
   };
   assert_eq(effect_list_text([named, same_op], b","), b"<[m]>net.send[l],net.send[m]");
   let scheme = {
@@ -2508,14 +2587,14 @@ test "a label variable is printed as `m` instead of `l` when a named resource is
     effect_variables: [],
     keep_variables: [],
     label_variables: [4],
-    ty: fn_type([], unit_type(), closed_effects([named, var_])),
+    ty: function_type([], unit_type(), closed_effects([named, var_])),
   };
   assert_eq(scheme_text(scheme), b"<[m]>() -> Unit / {net.send[l], net.recv[m]}");
   let named_close = {
     effect: b"net",
     resource: NamedResource(b"m"),
     mode: WriteMode,
-    op: Some(b"close"),
+    operation: Some(b"close"),
   };
   assert_eq(
     effect_list_text([named, named_close, var_], b","),
@@ -2525,7 +2604,7 @@ test "a label variable is printed as `m` instead of `l` when a named resource is
     effect: b"net",
     resource: NamedResource(b"n"),
     mode: WriteMode,
-    op: Some(b"connect"),
+    operation: Some(b"connect"),
   };
   assert_eq(
     effect_list_text([named, named_close, last, var_], b","),
@@ -2535,12 +2614,17 @@ test "a label variable is printed as `m` instead of `l` when a named resource is
 
 test "unifying effects binds a free label variable to the label that a concrete effect has for the same operation, and fails if the variable is rigid" {
   let f0 = fresh_new();
-  let v = fresh_type_var(f0);
+  let v = fresh_type_variable(f0);
   let generic = closed_effects([
-    { effect: b"net", resource: ResourceVariable(v.var), mode: WriteMode, op: Some(b"send") },
+    {
+      effect: b"net",
+      resource: ResourceVariable(v.var),
+      mode: WriteMode,
+      operation: Some(b"send"),
+    },
   ]);
   let concrete = closed_effects([
-    { effect: b"net", resource: NamedResource(b"conn"), mode: WriteMode, op: Some(b"send") },
+    { effect: b"net", resource: NamedResource(b"conn"), mode: WriteMode, operation: Some(b"send") },
   ]);
   let u = unify_effects(substitution_new(), v.fresh, generic, concrete);
   assert(match u.error { None -> true, Some(_) -> false });
@@ -2550,13 +2634,18 @@ test "unifying effects binds a free label variable to the label that a concrete 
 }
 
 test "a scheme prints its label parameters bracketed, among the type parameters" {
-  let entry = { effect: b"net", resource: ResourceVariable(5), mode: WriteMode, op: Some(b"send") };
+  let entry = {
+    effect: b"net",
+    resource: ResourceVariable(5),
+    mode: WriteMode,
+    operation: Some(b"send"),
+  };
   let scheme = {
     type_variables: [1],
     effect_variables: [2],
     keep_variables: [],
     label_variables: [5],
-    ty: fn_type([VariableType(1)], unit_type(), { listed: [entry], variable: Some(2) }),
+    ty: function_type([VariableType(1)], unit_type(), { listed: [entry], variable: Some(2) }),
   };
   assert_eq(scheme_text(scheme), b"<a, [l] | e>(a) -> Unit / {net.send[l] | e}");
   let other = {
@@ -2564,9 +2653,14 @@ test "a scheme prints its label parameters bracketed, among the type parameters"
     effect_variables: [2],
     keep_variables: [],
     label_variables: [9],
-    ty: fn_type([VariableType(1)], unit_type(), {
+    ty: function_type([VariableType(1)], unit_type(), {
       listed: [
-        { effect: b"net", resource: ResourceVariable(9), mode: WriteMode, op: Some(b"send") },
+        {
+          effect: b"net",
+          resource: ResourceVariable(9),
+          mode: WriteMode,
+          operation: Some(b"send"),
+        },
       ],
       variable: Some(2),
     }),
@@ -2575,13 +2669,18 @@ test "a scheme prints its label parameters bracketed, among the type parameters"
 }
 
 test "instantiating a scheme gives its label parameters fresh variables and returns those variables" {
-  let entry = { effect: b"net", resource: ResourceVariable(5), mode: WriteMode, op: Some(b"send") };
+  let entry = {
+    effect: b"net",
+    resource: ResourceVariable(5),
+    mode: WriteMode,
+    operation: Some(b"send"),
+  };
   let scheme = {
     type_variables: [],
     effect_variables: [],
     keep_variables: [],
     label_variables: [5],
-    ty: fn_type([], unit_type(), closed_effects([entry])),
+    ty: function_type([], unit_type(), closed_effects([entry])),
   };
   let instance = instantiate_with(scheme, fresh_new());
   assert_eq(instance.labels.len(), 1);
@@ -2597,7 +2696,8 @@ test "instantiating a scheme gives its label parameters fresh variables and retu
 }
 
 test "a declared type's label and effect arguments print correctly, unify with other arguments and are substituted into its field types" {
-  let send = |r: Resource| { effect: b"net", resource: r, mode: WriteMode, op: Some(b"send") };
+  let send = |r: Resource|
+    { effect: b"net", resource: r, mode: WriteMode, operation: Some(b"send") };
   let sink_type = |label: Type, effects: Effects|
     NamedType({ name: b"m.Sink", args: applied_args([int_type()], [label], [effects]) });
   let open = sink_type(VariableType(1), open_effects(2));
@@ -2629,7 +2729,7 @@ test "a declared type's label and effect arguments print correctly, unify with o
     Some(Mismatch(m)) -> type_text(m.expected) == b"[conn]" && type_text(m.found) == b"[peer]",
     _ -> false,
   });
-  let field = fn_type([VariableType(0)], open, {
+  let field = function_type([VariableType(0)], open, {
     listed: [send(ResourceVariable(1))],
     variable: Some(2),
   });
@@ -2649,12 +2749,13 @@ test "a declared type's label and effect arguments print correctly, unify with o
 }
 
 test "a `new` record's label and effect arguments print, unify and are substituted into its fields the same way as a sum type's" {
-  let send = |r: Resource| { effect: b"net", resource: r, mode: WriteMode, op: Some(b"send") };
+  let send = |r: Resource|
+    { effect: b"net", resource: r, mode: WriteMode, operation: Some(b"send") };
   let feed_type = |label: Type, effects: Effects|
     NominalType({
       name: b"m.Feed",
       args: applied_args([int_type()], [label], [effects]),
-      fields: [{ name: b"send", ty: fn_type([int_type()], unit_type(), effects) }],
+      fields: [{ name: b"send", ty: function_type([int_type()], unit_type(), effects) }],
     });
   let open = feed_type(VariableType(1), { listed: [send(ResourceVariable(1))], variable: Some(2) });
   let connection_type = feed_type(label_type(b"conn"), single_effect(send(NamedResource(b"conn"))));
@@ -2692,7 +2793,7 @@ test "generalization does not generalize type variables that still appear in the
   let a = fresh_type(f0);
   let b = fresh_type(a.fresh);
   let env = env_bind_global(env_new(), b"outer", monomorphic(a.ty));
-  let g = generalize(substitution_new(), env, fn_type([a.ty], b.ty, no_effects()));
+  let g = generalize(substitution_new(), env, function_type([a.ty], b.ty, no_effects()));
   assert_eq(g.scheme.type_variables.len(), 1)
 }
 
@@ -2700,7 +2801,7 @@ test "`intern_types` stores types in a table, reading them back gives the origin
   let span = RecordType([{ name: b"end", ty: int_type() }, { name: b"start", ty: int_type() }]);
   let point = NominalType({ name: b"m.Point", args: [], fields: [{ name: b"x", ty: int_type() }] });
   let types = [
-    fn_type([span, list_type(span)], span, no_effects()),
+    function_type([span, list_type(span)], span, no_effects()),
     RecordType([{ name: b"at", ty: span }, { name: b"name", ty: bytes_type() }]),
     VariableType(3),
     span,
@@ -2718,7 +2819,7 @@ test "a type table returns each type inserted into it, and inserting the same ty
   let span = RecordType([{ name: b"end", ty: int_type() }, { name: b"start", ty: int_type() }]);
   let point = NominalType({ name: b"m.Point", args: [], fields: [{ name: b"at", ty: span }] });
   let types = [
-    fn_type([span, point], list_type(point), no_effects()),
+    function_type([span, point], list_type(point), no_effects()),
     point,
     VariableType(2),
     span,
@@ -2741,7 +2842,7 @@ test "`interned_subset` of a table built from several lists of types, restricted
   let span = RecordType([{ name: b"end", ty: int_type() }, { name: b"start", ty: int_type() }]);
   let point = NominalType({ name: b"m.Point", args: [], fields: [{ name: b"x", ty: span }] });
   let first = [list_type(point), bytes_type()];
-  let second = [fn_type([span, point], int_type(), no_effects()), point, list_type(point)];
+  let second = [function_type([span, point], int_type(), no_effects()), point, list_type(point)];
   let a = intern_more_types(empty_interner(), first);
   let b = intern_more_types(a.h, second);
   assert_eq(interned_subset(b.h, b.at), intern_types(second));

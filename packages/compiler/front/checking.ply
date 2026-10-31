@@ -23,7 +23,7 @@ import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_
 import compiler.front.diagnostics (parse_all, diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               request_of_key)
-import compiler.front.pkg (PackageSources, read_packages, judged_packages_bin, without_locations)
+import compiler.front.pkg (PackageSources, read_packages, validated_packages_bin, without_locations)
 import compiler.check.resolve.tables (Source, Diagnostic, Label, backticked, error_at)
 import compiler.syntax.parsing (Span, ParseDiagnostic, dummy_span)
 import compiler.store.hash.forms (CachedNode, CachedHashes, ModuleHashes, no_cached_hashes,
@@ -99,7 +99,7 @@ pub fn load_inputs_of(
     },
   );
   {
-    layout: bin::encode(without_locations(j), judged_packages_bin()),
+    layout: bin::encode(without_locations(j), validated_packages_bin()),
     places: placed.fold(
       Map::new(),
       |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, placing: PackageLocation, text: Bytes }|
@@ -748,7 +748,11 @@ pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {a
 
 fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
   load_inputs_of(
-    { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
+    {
+      root: b"",
+      manifest: None,
+      files: sources.map(|s: Source| { module: s.name, text: s.source_text }),
+    },
     [],
   )
 
@@ -764,7 +768,7 @@ fn lookup_input_shipping(
 ) -> Option<Bytes> / {abort.raise} = {
   let all = with_prelude_source(shipped);
   let source_text = |name: Bytes|
-    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.src), None -> None };
+    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
   lookup_input(
     w,
     source_text,
@@ -938,7 +942,7 @@ fn embedding_queried(
   source_text: Bytes,
   files: Map<Bytes, Bytes>,
 ) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
-  let w = inputs_alone([{ name: b"m", src: source_text }]);
+  let w = inputs_alone([{ name: b"m", source_text: source_text }]);
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
     match files.get(want.path) {
@@ -1022,7 +1026,11 @@ pub fn check_with_pack(
   derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> CheckedSources / {abort.raise} = {
   let w = load_inputs_of(
-    { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
+    {
+      root: b"",
+      manifest: None,
+      files: sources.map(|s: Source| { module: s.name, text: s.source_text }),
+    },
     [],
   );
   handle {
@@ -1077,9 +1085,9 @@ effect fetching {
 
 pub fn layered(lib: Bytes) -> List<Source> =
   [
-    { name: b"lib", src: lib },
-    { name: b"app", src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n" },
-    { name: b"aside", src: b"pub fn alone() -> Int = 7\n" },
+    { name: b"lib", source_text: lib },
+    { name: b"app", source_text: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n" },
+    { name: b"aside", source_text: b"pub fn alone() -> Int = 7\n" },
   ]
 
 test "a definition group that calls a group with a type error is skipped, and the module reports the same errors as a whole-module check" {
@@ -1087,7 +1095,7 @@ test "a definition group that calls a group with a type error is skipped, and th
     [
       {
         name: b"lib",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub fn base(n: Int) -> Int = ",
           body,
           b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
@@ -1152,8 +1160,8 @@ fn shipped_store_results(
 
 test "computing the shipped modules' results names each one that fails" {
   let rejected = shipped_store_results([
-    { name: b"std.a", src: b"pub fn a() -> Int = 1\n" },
-    { name: b"std.b", src: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
+    { name: b"std.a", source_text: b"pub fn a() -> Int = 1\n" },
+    { name: b"std.b", source_text: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
   ]).value;
   assert_eq(rejected.map(|x: CheckedModule| x.module), [b"std.b"]);
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), [
@@ -1163,16 +1171,19 @@ test "computing the shipped modules' results names each one that fails" {
 
 test "a compiler module imports another below the compiler's root by its full name" {
   let shipped = [
-    { name: b"compiler.syntax.base", src: b"pub fn one() -> Int = 1\n" },
+    { name: b"compiler.syntax.base", source_text: b"pub fn one() -> Int = 1\n" },
     {
       name: b"compiler.check.user",
-      src: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
+      source_text: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
     },
   ];
   let rejected = shipped_store_results(shipped).value;
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), []);
   let user = [
-    { name: b"main", src: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n" },
+    {
+      name: b"main",
+      source_text: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n",
+    },
   ];
   let f = check_sources(empty_memory_store(), user, shipped);
   assert_eq(
@@ -1204,7 +1215,7 @@ test "loading from a prebuilt store of shipped results fetches a module's defini
   let shipped = [
     {
       name: b"std.many",
-      src: Bytes::concat_all(
+      source_text: Bytes::concat_all(
         range(0, owners).map(|i: Int|
           Bytes::of_string(f"pub fn f{i.to_string()}() -> Int = {i.to_string()} + 1\n\n")),
       ),
@@ -1214,7 +1225,9 @@ test "loading from a prebuilt store of shipped results fetches a module's defini
   let read = memo::current_records(store).fold(b"", |found: Bytes, _: Bytes, r: Record|
     if r.query == owners_query() { r.output } else { found });
   let read_bytes = match store.outputs.get(read) { Some(o) -> o, None -> b"" };
-  let user = [{ name: b"main", src: b"import std.many (f0)\npub fn main() -> Int = f0()\n" }];
+  let user = [
+    { name: b"main", source_text: b"import std.many (f0)\npub fn main() -> Int = f0()\n" },
+  ];
   let load = check_with_pack(empty_memory_store(), pack_of(store), user, shipped);
   let fetches = load.fetched.filter(|b: Bytes| b == read_bytes).len();
   assert(fetches > 0, Some("the read is short enough to be kept inside its record"));
@@ -1225,24 +1238,28 @@ test "loading from a prebuilt store of shipped results type-checks no definition
   let shipped = [
     {
       name: b"std.pair",
-      src: b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\npub fn both(n: Int) -> Bool = even(n) || odd(n)\n",
+      source_text: b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\npub fn both(n: Int) -> Bool = even(n) || odd(n)\n",
     },
   ];
-  let user = [{ name: b"main", src: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" }];
+  let user = [
+    { name: b"main", source_text: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" },
+  ];
   let load = check_with_pack(empty_memory_store(), pack_of(shipped_store(shipped)), user, shipped);
   assert_eq(executed_for(load.run, typed_query()), []);
   assert_eq(load.results, check_sources(empty_memory_store(), user, shipped).results)
 }
 
 test "a shipped module's imports are checked as an importing module sees them, ignoring imports used only by its tests" {
-  let user = [{ name: b"main", src: b"import std.a (two)\npub fn main() -> Int = two()\n" }];
+  let user = [
+    { name: b"main", source_text: b"import std.a (two)\npub fn main() -> Int = two()\n" },
+  ];
   let shipped = [
     {
       name: b"std.a",
-      src: b"import std.b (one)\nimport std.c (spare)\n\npub fn two() -> Int = one() + one()\ntest \"spared\" { assert_eq(spare(), 3) }\n",
+      source_text: b"import std.b (one)\nimport std.c (spare)\n\npub fn two() -> Int = one() + one()\ntest \"spared\" { assert_eq(spare(), 3) }\n",
     },
-    { name: b"std.b", src: b"pub fn one() -> Int = 1\n" },
-    { name: b"std.c", src: b"pub fn spare() -> Int = 3\n" },
+    { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n" },
+    { name: b"std.c", source_text: b"pub fn spare() -> Int = 3\n" },
   ];
   let f = check_sources(empty_memory_store(), user, shipped);
   assert_eq(
@@ -1256,7 +1273,7 @@ test "a module reports the errors of a definition with an error, and none from t
   let sources = [
     {
       name: b"app",
-      src: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
+      source_text: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
     },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
@@ -1268,7 +1285,7 @@ test "a module reports the errors of a definition with an error, and none from t
 }
 
 test "an import of a module that does not exist fails the importing module even when nothing uses the import" {
-  let sources = [{ name: b"app", src: b"import nonesuch\npub fn f() -> Int = 1\n" }];
+  let sources = [{ name: b"app", source_text: b"import nonesuch\npub fn f() -> Int = 1\n" }];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
@@ -1279,9 +1296,9 @@ test "an import of a module that does not exist fails the importing module even 
 
 test "two imports that give the same module name fail their module even when neither is used" {
   let sources = [
-    { name: b"net", src: b"pub fn x() -> Int = 1\n" },
-    { name: b"lib.net", src: b"pub fn y() -> Int = 2\n" },
-    { name: b"app", src: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
+    { name: b"net", source_text: b"pub fn x() -> Int = 1\n" },
+    { name: b"lib.net", source_text: b"pub fn y() -> Int = 2\n" },
+    { name: b"app", source_text: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
@@ -1293,10 +1310,10 @@ test "two imports that give the same module name fail their module even when nei
 
 test "a name two imports select fails their module, though its module exports it" {
   let sources = [
-    { name: b"base", src: b"pub type T = | A | B\npub fn f() -> T = A\n" },
+    { name: b"base", source_text: b"pub type T = | A | B\npub fn f() -> T = A\n" },
     {
       name: b"app",
-      src: b"import base (T)\nimport base (T, f)\npub fn g() -> Bool = f() == f()\n",
+      source_text: b"import base (T)\nimport base (T, f)\npub fn g() -> Bool = f() == f()\n",
     },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
@@ -1309,8 +1326,8 @@ test "a name two imports select fails their module, though its module exports it
 
 test "a name a module selects that its module does not declare fails the module" {
   let sources = [
-    { name: b"lib", src: b"pub fn used() -> Int = 1\n" },
-    { name: b"app", src: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
+    { name: b"lib", source_text: b"pub fn used() -> Int = 1\n" },
+    { name: b"app", source_text: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(

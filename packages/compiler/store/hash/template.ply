@@ -18,15 +18,15 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, Param, MatchArm, HandleClause,
-                                    ReturnClause, HandlerVar, RecordLiteralField,
+                                    ReturnClause, HandlerStateVariable, RecordLiteralField,
                                     TaggedLiteralExpression, Hole, tagged_parser, tagged_filler,
                                     NamedArg, prelude_module)
 import compiler.syntax.items (FnDefinition, TypeDefinition, AliasBody, SumBody, VariantDefinition,
-                              EffectDefinition, OpDefinition, TestDefinition, LawDefinition, Binder,
-                              Constraint, RequiresClause, EnsuresClause, CostClause, SpaceClause,
-                              SpecClause, schema_of, ReturnsFresh, ReturnsParam, NominalBody,
-                              ExternBody, InstanceDefinition, HostInstance, numeric_ops, numeric_by,
-                              member_of, member_name)
+                              EffectDefinition, OperationDefinition, TestDefinition, LawDefinition,
+                              Binder, Constraint, RequiresClause, EnsuresClause, CostClause,
+                              SpaceClause, SpecClause, schema_of, ReturnsFresh, ReturnsParam,
+                              NominalBody, ExternBody, InstanceDefinition, HostInstance,
+                              numeric_operations, numeric_by, member_of, member_name)
 import compiler.check.resolve.bindings (item_locals, body_binders)
 import compiler.syntax.items (FunctionItem, TestItem, LawItem, result_name)
 import compiler.check.member (CallsFunction)
@@ -446,9 +446,9 @@ pub fn type_template(encoder: Encoder, written: TypeExpression) -> TemplateType 
     FunctionTypeExpression(function) ->
       Function(
         types(encoder, function.params),
-        type_template(encoder, function.ret),
+        type_template(encoder, function.return_type),
         optional_effects(encoder, function.effects),
-        function.kept,
+        function.keep_indices,
         function.once,
       ),
     RecordTypeExpression(record) ->
@@ -512,7 +512,7 @@ fn encoded_effect(
 ) -> Effect<Int, EffectSlot> / {abort.raise} = {
   let performed = effect_of(encoder, written.effect_name);
   let label = optional_label(encoder, effect_label(written));
-  match written.op {
+  match written.operation {
     None -> Moded(performed, written.mode, label, written.bounded),
     Some(operation) -> OfOperation(performed, operation.name, label, written.bounded),
   }
@@ -781,16 +781,16 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
     NameExpression(variable) ->
       { encoder: read(encoder, variable.name), form: Variable(value_of(encoder, variable.name)) },
     BinaryExpression(binary) -> {
-      let left = expression(encoder, binary.lhs);
-      let right = expression(left.encoder, binary.rhs);
-      let called = if emitted_code().operators.contains(binary.op) {
+      let left = expression(encoder, binary.left_operand);
+      let right = expression(left.encoder, binary.right_operand);
+      let called = if emitted_code().operators.contains(binary.operation) {
         emitted_call_nodes(encoder, emitted_code().calls)
       } else { [] };
-      { encoder: right.encoder, form: Binary(binary.op, left.form, right.form, called) }
+      { encoder: right.encoder, form: Binary(binary.operation, left.form, right.form, called) }
     },
     UnaryExpression(unary) -> {
       let operand = expression(encoder, unary.operand);
-      { encoder: operand.encoder, form: Unary(unary.op, operand.form) }
+      { encoder: operand.encoder, form: Unary(unary.operation, operand.form) }
     },
     LambdaExpression(lambda) -> {
       let annotations = lambda.params.map(|parameter: Param| optional_type(encoder, parameter.ty));
@@ -877,7 +877,7 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
           encoder: arguments.encoder,
           form: Perform(
             effect_of(encoder, perform.effect_name),
-            perform.op.name,
+            perform.operation.name,
             optional_label(encoder, perform.resource),
             arguments.form,
           ),
@@ -888,16 +888,16 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
           { ..encoder, reads: encoder.reads.push(i) },
           Variable({ named: Local(encoder.values.get(i).position), written: [] }),
           perform.span,
-          perform.op,
+          perform.operation,
           match perform.resource { Some(resource) -> [resource], None -> [] },
           perform.args,
           [],
         ),
     },
     HandleExpression(handler) -> {
-      let variables = handler.vars.fold(
+      let variables = handler.handler_variables.fold(
         { encoder: encoder, form: [] },
-        |accumulator: Built<List<stored::HandlerVariable<Int, EffectSlot, BinderPosition, Note>>>, variable: HandlerVar| {
+        |accumulator: Built<List<stored::HandlerVariable<Int, EffectSlot, BinderPosition, Note>>>, variable: HandlerStateVariable| {
           let first = expression(accumulator.encoder, variable.init);
           {
             encoder: bind(first.encoder, variable.name),
@@ -911,10 +911,10 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
       let body = expression(close_scope(variables.encoder, encoder), handler.body);
       let clause_encoder = bind_all(
         close_scope(body.encoder, encoder),
-        handler.vars.map(|variable: HandlerVar| variable.name),
+        handler.handler_variables.map(|variable: HandlerStateVariable| variable.name),
       );
       let clauses = handled_clauses(clause_encoder, handler.clauses);
-      let returned = match handler.ret {
+      let returned = match handler.return_clause {
         None -> { encoder: clauses.encoder, form: None },
         Some(clause) -> {
           let built = expression(bind(clauses.encoder, clause.binder), clause.body);
@@ -980,7 +980,10 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
           match tried.raise {
             None -> None,
             Some(raised) ->
-              Some({ effect: effect_of(encoder, raised.effect_name), operation: raised.op.name }),
+              Some({
+                effect: effect_of(encoder, raised.effect_name),
+                operation: raised.operation.name,
+              }),
           },
           body.form,
         ),
@@ -1005,7 +1008,7 @@ fn handled_clauses(
         encoder: close_scope(body.encoder, accumulator.encoder),
         form: accumulator.form.push({
           effect: effect_of(accumulator.encoder, clause.effect_name),
-          operation: clause.op.name,
+          operation: clause.operation.name,
           label: optional_label(accumulator.encoder, clause_label(clause)),
           parameters: clause.params.len(),
           resumes: clause.resume != None,
@@ -1186,7 +1189,7 @@ fn generics_of(
     types: types.len(),
     effects: rows.len(),
     labels: labels.len(),
-    kept: levels_of(types, retained_types),
+    retained_types: levels_of(types, retained_types),
   }
 
 fn levels_of(names: List<Identifier>, marked: List<Identifier>) -> List<Int> = {
@@ -1248,7 +1251,7 @@ fn function_form(
       {
         encoder: default_value.encoder,
         form: accumulator.form.push({
-          kept: parameter.keep,
+          retained: parameter.keep,
           spaced: parameter.space != None,
           annotation: optional_type(generic, parameter.ty),
           default: default_value.form,
@@ -1263,9 +1266,14 @@ fn function_form(
   let measure = optional_expression(bound, definition.decreases);
   let body = expression(measure.encoder, definition.body);
   {
-    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
+    generics: generics_of(
+      generics.types,
+      generics.effects,
+      generics.labels,
+      generics.retained_types,
+    ),
     parameters: parameters.form,
-    returned: optional_type(generic, definition.ret),
+    returned: optional_type(generic, definition.return_type),
     effects: optional_effects(generic, definition.effects),
     constraints: constraints(generic, definition.constraints),
     identities: identities(generic, definition),
@@ -1285,7 +1293,12 @@ fn type_form(
   let unqualified = |name: Identifier| { module: None, name: name, span: name.span };
   let items = inner.index.items.get(inner.module);
   {
-    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
+    generics: generics_of(
+      generics.types,
+      generics.effects,
+      generics.labels,
+      generics.retained_types,
+    ),
     has_effect_generics: generics.effects.len() > 0 || generics.labels.len() > 0,
     constraints: constraints(inner, definition.constraints),
     body: match definition.body {
@@ -1311,7 +1324,7 @@ fn type_form(
     numerics: match items.numerics.get(definition.name.name) {
       None -> [],
       Some(arithmetic) ->
-        numeric_ops().fold(
+        numeric_operations().fold(
           [],
           |accumulator: List<Numeric<Int, BinderPosition>>, operation: Bytes|
             match numeric_by(arithmetic, operation) {
@@ -1335,7 +1348,8 @@ fn effect_form(
     name: definition.name.name,
     nondet: definition.is_nondet,
     operations: by_name(
-      definition.operations.map(|operation: OpDefinition| operation_form(encoder, operation)),
+      definition.operations.map(|operation: OperationDefinition|
+        operation_form(encoder, operation)),
       |operation: Operation<Int, EffectSlot>| operation.name,
     ),
     host_function: match encoder.index.items.get(encoder.module).instances.get(
@@ -1358,7 +1372,7 @@ fn effect_form(
 
 fn operation_form(
   encoder: Encoder,
-  operation: OpDefinition,
+  operation: OperationDefinition,
 ) -> Operation<Int, EffectSlot> / {abort.raise} = {
   let inner = {
     ..encoder,
@@ -1375,8 +1389,8 @@ fn operation_form(
     resource: operation.resource_param,
     types: operation.type_params.len(),
     parameters: types(inner, operation.params).map(carried),
-    kept: operation.kept,
-    returned: carried(type_template(inner, operation.ret)),
+    retained_parameters: operation.keep_indices,
+    returned: carried(type_template(inner, operation.return_type)),
   }
 }
 
@@ -1483,7 +1497,12 @@ fn spec_form(
   };
   {
     kind: clause.kind,
-    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
+    generics: generics_of(
+      generics.types,
+      generics.effects,
+      generics.labels,
+      generics.retained_types,
+    ),
     parameters: owner.params.len(),
     names: scoped.form,
     body: expression(scoped.encoder, clause.expression).form,
@@ -1505,7 +1524,7 @@ pub fn is_pure(written: Expression) -> Bool =
     LiteralExpression(_) -> true,
     TaggedLiteralExpression(tagged) -> tagged.holes.len() == 0,
     NameExpression(_) -> true,
-    BinaryExpression(binary) -> is_pure(binary.lhs) && is_pure(binary.rhs),
+    BinaryExpression(binary) -> is_pure(binary.left_operand) && is_pure(binary.right_operand),
     UnaryExpression(unary) -> is_pure(unary.operand),
     LambdaExpression(lambda) -> is_pure(lambda.body),
     IfExpression(conditional) ->

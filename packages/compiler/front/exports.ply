@@ -9,11 +9,11 @@ import compiler.front (PulledAnalysis, StagedLoad, EmbedRecord, analyse_pulling_
                        load_with_shipped, checked_staged)
 import compiler.front.rows (KnownDefinitionRow, Rows, ModuleDerivations, known_definition_row_bin,
                             is_declared_in)
-import compiler.front.pkg (PackageSources, SuppliedPackage, JudgedPackages)
+import compiler.front.pkg (PackageSources, SuppliedPackage, ValidatedPackages)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, DeriveItem, EffectSetItem, ExternItem, is_shipped,
                               InstanceItem, NumericItem, SumBody, ImportDeclaration, WholeModule,
-                              ModuleAlias, SelectedNames, VariantDefinition, OpDefinition,
+                              ModuleAlias, SelectedNames, VariantDefinition, OperationDefinition,
                               DeriveOrigin, Derivation, parse, parse_started, header, header_of,
                               is_explicit_import, item_span, import_declaration_bin, owner_of,
                               item_owner, test_of_owner, member_of, member_name, is_builtin,
@@ -100,7 +100,7 @@ derive bin for ItemAt
 
 fn undocumented_variant(v: VariantDefinition) -> VariantDefinition = { ..v, doc: None }
 
-fn undocumented_op(o: OpDefinition) -> OpDefinition = { ..o, doc: None }
+fn undocumented_operation(o: OperationDefinition) -> OperationDefinition = { ..o, doc: None }
 
 fn interface_item(item: Item) -> Item =
   match item {
@@ -118,7 +118,8 @@ fn interface_item(item: Item) -> Item =
         field_docs: [],
         body: match d.body { SumBody(vs) -> SumBody(vs.map(undocumented_variant)), other -> other },
       }),
-    EffectItem(d) -> EffectItem({ ..d, doc: None, operations: d.operations.map(undocumented_op) }),
+    EffectItem(d) ->
+      EffectItem({ ..d, doc: None, operations: d.operations.map(undocumented_operation) }),
     SchemaItem(d) -> SchemaItem({ ..d, doc: None }),
     EffectSetItem(d) -> EffectSetItem({ ..d, doc: None }),
     ExternItem(d) -> ExternItem({ ..d, doc: None }),
@@ -426,7 +427,7 @@ fn listed_under(m: Map<Bytes, List<Bytes>>, k: Bytes, v: Bytes) -> Map<Bytes, Li
   if had.contains(v) { m } else { m.insert(k, had.push(v)) }
 }
 
-fn fn_owners(raw: Module, parsed: ParsedModule) -> Map<Bytes, Bytes> = {
+fn function_owners(raw: Module, parsed: ParsedModule) -> Map<Bytes, Bytes> = {
   let stated = raw.items.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, item: Item|
     match owner_of(item) {
       Some(o) -> accumulator.insert(span_key(item_span(item)), o),
@@ -469,12 +470,14 @@ fn owners_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> = {
         }
       },
     });
-  fn_owners(raw, parsed).fold(own, |accumulator: Map<Bytes, List<Bytes>>, f: Bytes, o: Bytes|
-    listed_under(accumulator, f, o))
+  function_owners(raw, parsed).fold(
+    own,
+    |accumulator: Map<Bytes, List<Bytes>>, f: Bytes, o: Bytes| listed_under(accumulator, f, o),
+  )
 }
 
 fn named_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> / {abort.raise} =
-  fn_owners(raw, parsed).fold(
+  function_owners(raw, parsed).fold(
     owners_in(raw, parsed),
     |accumulator: Map<Bytes, List<Bytes>>, f: Bytes, o: Bytes|
       match member_of(f) {
@@ -592,7 +595,7 @@ pub fn exports_of(
   let module = parsed.name;
   let raw = match read { Some(r) -> r, None -> parse(text).node };
   let owners = named_in(raw, parsed);
-  let functions = fn_owners(raw, parsed);
+  let functions = function_owners(raw, parsed);
   let targets = import_targets(analysis, i);
   let mention_scopes = scopes(parsed, raw, targets);
   let fn_owner = |name: Bytes|
@@ -672,7 +675,7 @@ pub fn hashes_of(index: Index, hashes: HashOutput, i: Int, text: Bytes) -> Hashe
   hashes_by_owner(
     parsed.name,
     cached_nodes(index, hashes, Map::new().insert(parsed.name, true)),
-    fn_owners(parse(text).node, parsed),
+    function_owners(parse(text).node, parsed),
   )
 }
 
@@ -706,7 +709,7 @@ pub fn hash_owners(
   raw: Module,
   parsed: ParsedModule,
 ) -> { functions: Map<Bytes, Bytes>, owners: Map<Bytes, List<Bytes>> } =
-  { functions: fn_owners(raw, parsed), owners: owners_in(raw, parsed) }
+  { functions: function_owners(raw, parsed), owners: owners_in(raw, parsed) }
 
 pub fn imported_mentions_in(
   parsed: ParsedModule,
@@ -716,7 +719,7 @@ pub fn imported_mentions_in(
   targets: List<Bytes>,
 ) -> List<Mention> / {abort.raise} = {
   let mention_scopes = scopes(parsed, raw, targets);
-  let expansion = generated_by_owner(raw, parsed, fn_owners(raw, parsed)).fold(
+  let expansion = generated_by_owner(raw, parsed, function_owners(raw, parsed)).fold(
     [],
     |accumulator: List<Mention>, _: Bytes, fs: List<Item>|
       accumulator.concat(mentioned(mention_scopes.expanded, alone(text, fs))),
@@ -898,7 +901,7 @@ pub fn interface_source(
     accumulator.push(e));
   {
     name: module,
-    src: print_standalone(b"", merged_imports(es), []).concat(
+    source_text: print_standalone(b"", merged_imports(es), []).concat(
       Bytes::join(es.map(|e: OwnerInterface| e.text), b"\n"),
     ),
   }
@@ -911,7 +914,7 @@ derive bin for ModuleOrigin
 pub type CheckInputs = {
   packages: PackageSources,
   tested: Bool,
-  judged: Option<JudgedPackages>,
+  checked_packages: Option<ValidatedPackages>,
   unread: List<Bytes>,
   all_sources: List<Source>,
   data: List<EmbedFile>,
@@ -951,16 +954,18 @@ fn staged_with_interfaces(
       [],
       |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
         match x.placed {
-          InPackage(k, rel) -> if k == i + 1 { accumulator.push({ name: rel, src: x.source.src }) }
-          else { accumulator },
+          InPackage(k, rel) -> if k == i + 1 {
+            accumulator.push({ name: rel, source_text: x.source.source_text })
+          } else { accumulator },
           _ -> accumulator,
         },
     );
     {
       ..reading.packages.supplied.get(i),
       modules: match placed {
-        InPackage(k, rel) -> if k == i + 1 { package_sources.push({ name: rel, src: source.src }) }
-        else { package_sources },
+        InPackage(k, rel) -> if k == i + 1 {
+          package_sources.push({ name: rel, source_text: source.source_text })
+        } else { package_sources },
         _ -> package_sources,
       },
     }
@@ -1004,7 +1009,7 @@ fn staged_with_interfaces(
             ds.concat(e.derived)),
         }),
     ),
-    package_verdicts: reading.judged,
+    package_verdicts: reading.checked_packages,
     checked: Some(source.name),
   );
   {
@@ -1070,7 +1075,7 @@ pub fn owner_texts(
   raw: Module,
   text: Bytes,
 ) -> List<OwnerText> / {abort.raise} = {
-  let generated = generated_by_owner(raw, parsed, fn_owners(raw, parsed));
+  let generated = generated_by_owner(raw, parsed, function_owners(raw, parsed));
   let declared = owners_in(raw, parsed).fold(
     Map::new(),
     |accumulator: Map<Bytes, List<Bytes>>, n: Bytes, os: List<Bytes>|
@@ -1354,7 +1359,7 @@ pub fn group_source_from(
   {
     source: {
       name: module,
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         written,
         own,
         b"\n\n",
@@ -1429,7 +1434,7 @@ pub fn checked_owner(
   reading: CheckInputs,
   walks: Option<(Int) -> BodyChecking / {abort.raise}> = None,
 ) -> { pulled: PulledAnalysis, at: Int } / {abort.raise} = {
-  let raw = parse(o.source.src);
+  let raw = parse(o.source.source_text);
   let parsed = parse_from(
     0,
     o.source,
@@ -1493,10 +1498,10 @@ fn per_module(
   sources: List<Source>,
 ) -> List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: CachedHashes, rehashed: CachedHashes }> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.src));
+    accumulator.insert(s.name, s.source_text));
   let read = with_prelude_source(sources).fold(
     Map::new(),
-    |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.src),
+    |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.source_text),
   );
   let text_at = |i: Int| match read.get(whole.modules.get(i).name) { Some(t) -> t, None -> b"" };
   let exports = range(0, whole.modules.len()).fold(
@@ -1518,7 +1523,7 @@ fn per_module(
     data: [],
     embeds: [],
     given: [],
-    judged: None,
+    checked_packages: None,
     unread: [],
   };
   let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
@@ -1533,11 +1538,11 @@ fn per_module(
           import_targets(whole, i),
           |_: Bytes| visible_modules(whole, i),
         );
-        let source = { name: name, src: text_at(i) };
+        let source = { name: name, source_text: text_at(i) };
         let parsed = parse_from(
           0,
           source,
-          parse(source.src),
+          parse(source.source_text),
           derivations: whole.modules.get(i).derived.map(derivation_of),
         );
         let apart = match checked_against(source, InRoot, dependencies, placing, {
@@ -1588,10 +1593,10 @@ fn checked_alone(
   shipped: List<Source> = [],
 ) -> Analysis / {abort.raise} = {
   let texts = sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.src));
+    accumulator.insert(s.name, s.source_text));
   let read = with_prelude_source(sources.concat(shipped)).fold(
     Map::new(),
-    |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.src),
+    |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.source_text),
   );
   let text_at = |k: Int| match read.get(whole.modules.get(k).name) { Some(t) -> t, None -> b"" };
   let exports = range(0, whole.modules.len()).fold(
@@ -1606,7 +1611,7 @@ fn checked_alone(
     data: [],
     embeds: [],
     given: [],
-    judged: None,
+    checked_packages: None,
     unread: [],
   };
   let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
@@ -1632,7 +1637,7 @@ fn per_owner(
   shipped: List<Source> = [],
 ) -> List<{ owner: Bytes, whole: Agreed, apart: Agreed }> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.src));
+    accumulator.insert(s.name, s.source_text));
   range(0, whole.modules.len()).fold(
     [],
     |accumulator: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, i: Int| {
@@ -1642,7 +1647,7 @@ fn per_owner(
         None -> accumulator,
         Some(text) -> {
           let raw = parse(text).node;
-          let functions = fn_owners(raw, parsed);
+          let functions = function_owners(raw, parsed);
           let owned_by = |o: Bytes, n: Bytes| functions.get(simple_of(name, n)) == Some(o);
           let owners = raw.items.fold(Map::new(), |m: Map<Bytes, Bytes>, item: Item|
             match item { FunctionItem(d) -> m.insert(d.name.name, d.name.name), _ -> m }).values(
@@ -1666,13 +1671,13 @@ fn per_owner(
 
 test "a test checked alone gets the same name as in its module, even when an earlier test has the same label" {
   let source = b"test \"holds {n}\" for n: Int in [1] { assert(n > 0) }\n\n// the second\ntest \"holds {n}\" for n: Int in [2] { assert(n > 0) }\n";
-  let sources = [{ name: b"m", src: source }];
+  let sources = [{ name: b"m", source_text: source }];
   let shipped = [
     {
       name: b"std.cases",
-      src: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
+      source_text: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
     },
-    { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"\n" },
+    { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"\n" },
   ];
   let whole = outcome(analyse_pulling_std_with(sources, shipped, no_rows()));
   let m = range(0, whole.modules.len()).fold(0, |k: Int, j: Int|
@@ -1688,7 +1693,10 @@ test "a test checked alone gets the same name as in its module, even when an ear
 }
 
 test "each function checked alone against the interfaces of what it uses returns the same result as checking its whole module" {
-  let sources = [{ name: b"core", src: core_source() }, { name: b"shop", src: shop_source() }];
+  let sources = [
+    { name: b"core", source_text: core_source() },
+    { name: b"shop", source_text: shop_source() },
+  ];
   let found = per_owner(outcome(analyse_pulling_std_with(sources, [], no_rows())), sources);
   assert_eq(found.map(|f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner), [
     b"core.helper",
@@ -1752,9 +1760,9 @@ fn sorter_source() -> Bytes =
 
 test "an interface lists a `derive` as the signatures of the functions it generates, without bodies, and checks against it give the same result as checking the whole program" {
   let sources = [
-    { name: b"likeness", src: likeness_source() },
-    { name: b"kinds", src: kinds_source() },
-    { name: b"sorter", src: sorter_source() },
+    { name: b"likeness", source_text: likeness_source() },
+    { name: b"kinds", source_text: kinds_source() },
+    { name: b"sorter", source_text: sorter_source() },
   ];
   let whole = outcome(analyse_pulling_std_with(sources, [], no_rows(), derived: kinds_derived()));
   let kinds = range(0, whole.modules.len()).fold(0, |k: Int, i: Int|
@@ -1803,8 +1811,11 @@ fn rows_derived() -> List<ModuleDerivations> =
   ]
 
 test "a type's interface includes its `derive sql` line, so a definition checked alone matches the whole program" {
-  let sources = [{ name: b"rows", src: rows_source() }, { name: b"report", src: report_source() }];
-  let shipped = [{ name: b"std.sql", src: likeness_source() }];
+  let sources = [
+    { name: b"rows", source_text: rows_source() },
+    { name: b"report", source_text: report_source() },
+  ];
+  let shipped = [{ name: b"std.sql", source_text: likeness_source() }];
   let whole = outcome(
     analyse_pulling_std_with(sources, shipped, no_rows(), derived: rows_derived()),
   );
@@ -1826,7 +1837,10 @@ test "a type's interface includes its `derive sql` line, so a definition checked
 }
 
 test "each module checked and hashed against the interfaces of its imports gives the same results as the whole program" {
-  let sources = [{ name: b"core", src: core_source() }, { name: b"shop", src: shop_source() }];
+  let sources = [
+    { name: b"core", source_text: core_source() },
+    { name: b"shop", source_text: shop_source() },
+  ];
   let found = per_module(outcome(analyse_pulling_std_with(sources, [], no_rows())), sources);
   assert_eq(
     found.map(
@@ -1845,14 +1859,17 @@ test "each module checked and hashed against the interfaces of its imports gives
 }
 
 test "an interface's header can be read from its encoded bytes alone, and the bytes include its dependency digest" {
-  let sources = [{ name: b"core", src: core_source() }, { name: b"shop", src: shop_source() }];
+  let sources = [
+    { name: b"core", source_text: core_source() },
+    { name: b"shop", source_text: shop_source() },
+  ];
   let whole = outcome(analyse_pulling_std_with(sources, [], no_rows()));
   let entries = range(0, whole.modules.len()).fold(
     [],
     |accumulator: List<OwnerInterface>, i: Int|
       sources.fold(accumulator, |a: List<OwnerInterface>, s: Source|
         if whole.modules.get(i).name != s.name { a } else {
-          exports_of(whole, i, s.src).entries.fold(
+          exports_of(whole, i, s.source_text).entries.fold(
             a,
             |b: List<OwnerInterface>, _: Bytes, e: OwnerInterface| b.push(e),
           )
@@ -1872,7 +1889,7 @@ test "an interface's header can be read from its encoded bytes alone, and the by
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
   xs.fold((), |_: Unit, x: a| f(x))
 
-fn said_in(text: Bytes) -> List<Bytes> / {abort.raise} =
+fn mentions_in(text: Bytes) -> List<Bytes> / {abort.raise} =
   distinct(
     mentioned(
       {
@@ -1890,12 +1907,12 @@ fn said_in(text: Bytes) -> List<Bytes> / {abort.raise} =
 
 test "a method call records only the method name, a call to a type's function records the type too, and an effect operation call records nothing" {
   assert_eq(
-    said_in(
+    mentions_in(
       b"fn f(xs: Stack) -> Int / {abort.raise} = { abort.raise(1); xs.push(2).depth() + lib::made().area() }",
     ),
     [b" area", b" depth", b" push", b"deep.lib made", b"here ::push", b"here Stack"],
   );
-  assert_eq(said_in(b"fn g() -> Int = Shape::unit().area() + Stack::depth(Stack::new())"), [
+  assert_eq(mentions_in(b"fn g() -> Int = Shape::unit().area() + Stack::depth(Stack::new())"), [
     b" area",
     b" depth",
     b" new",
@@ -1905,7 +1922,7 @@ test "a method call records only the method name, a call to a type's function re
     b"shapes Shape",
     b"shapes Shape::unit",
   ]);
-  assert_eq(said_in(b"fn h(b: Bytes) -> Bytes = Bytes::push(Bytes::trimmed(b), 0)"), [
+  assert_eq(mentions_in(b"fn h(b: Bytes) -> Bytes = Bytes::push(Bytes::trimmed(b), 0)"), [
     b" push",
     b" trimmed",
     b"here ::push",
@@ -1914,42 +1931,45 @@ test "a method call records only the method name, a call to a type's function re
 
 test "`==`, `digest` and `assert_eq` depend on the functions generated for containers, but `<` and `observe` do not" {
   let written = emitted_code().calls.map(|n: Bytes| Bytes::concat_all([prelude_module(), b" ", n]));
-  assert_eq(said_in(b"fn f(a: Int, b: Int) -> Bool = a == b"), written);
-  assert_eq(said_in(b"fn f(a: Int, b: Int) -> Bool = a != b"), written);
-  assert_eq(said_in(b"fn f(a: Int) -> Bytes = digest(a)"), written);
-  assert_eq(said_in(b"fn f(a: Int, b: Int) -> Bool = a < b"), []);
-  assert_eq(said_in(b"fn f(a: Int) -> Unit / {abort.raise} = assert_eq(a, 1)"), written);
-  assert_eq(said_in(b"fn f(a: Int) -> Int = observe(a)"), []);
-  assert_eq(said_in(b"const fn f() -> Int = 1"), [])
+  assert_eq(mentions_in(b"fn f(a: Int, b: Int) -> Bool = a == b"), written);
+  assert_eq(mentions_in(b"fn f(a: Int, b: Int) -> Bool = a != b"), written);
+  assert_eq(mentions_in(b"fn f(a: Int) -> Bytes = digest(a)"), written);
+  assert_eq(mentions_in(b"fn f(a: Int, b: Int) -> Bool = a < b"), []);
+  assert_eq(mentions_in(b"fn f(a: Int) -> Unit / {abort.raise} = assert_eq(a, 1)"), written);
+  assert_eq(mentions_in(b"fn f(a: Int) -> Int = observe(a)"), []);
+  assert_eq(mentions_in(b"const fn f() -> Int = 1"), [])
 }
 
 test "a map literal depends on the same functions as a call to `Map::of_entries`" {
   assert_eq(
-    said_in(b"fn f() -> Map<Int, Int> = #{1: 2}"),
-    said_in(b"fn f() -> Map<Int, Int> = Map::of_entries([{ key: 1, value: 2 }])"),
+    mentions_in(b"fn f() -> Map<Int, Int> = #{1: 2}"),
+    mentions_in(b"fn f() -> Map<Int, Int> = Map::of_entries([{ key: 1, value: 2 }])"),
   );
   let marshalling = emitted_code().calls.concat(emitted_code().insert_calls).map(|n: Bytes|
     Bytes::concat_all([prelude_module(), b" ", n]));
-  assert_eq(said_in(b"fn f() -> Map<Int, Int> = #{}"), [b" of_entries"].concat(marshalling));
-  assert(said_in(b"fn f() -> String = f\"{#{1: 2}}\"").contains(b" of_entries"), None)
+  assert_eq(mentions_in(b"fn f() -> Map<Int, Int> = #{}"), [b" of_entries"].concat(marshalling));
+  assert(mentions_in(b"fn f() -> String = f\"{#{1: 2}}\"").contains(b" of_entries"), None)
 }
 
 test "a container type name depends on the container conversion functions, except inside the prelude" {
   let marshalling = emitted_code().calls.concat(emitted_code().insert_calls).map(|n: Bytes|
     Bytes::concat_all([prelude_module(), b" ", n]));
-  assert_eq(said_in(b"fn f(xs: List<Int>) -> Int = 0"), marshalling);
-  assert_eq(said_in(b"fn f(n: Int) -> Int = n"), []);
+  assert_eq(mentions_in(b"fn f(xs: List<Int>) -> Int = 0"), marshalling);
+  assert_eq(mentions_in(b"fn f(n: Int) -> Int = n"), []);
   assert_eq(written_mentions(prelude_module(), lex(b"List<Int>").tokens, 0), [])
 }
 
 test "an effect operation's type parameters depend on the container conversion functions, since they may be instantiated with a container" {
   let marshalling = emitted_code().calls.concat(emitted_code().insert_calls).map(|n: Bytes|
     Bytes::concat_all([prelude_module(), b" ", n]));
-  assert_eq(said_in(b"effect box {\n  write put<a>(x: a) -> Unit\n}\n"), marshalling);
-  assert_eq(said_in(b"effect box {\n  read take[k]<a>() -> a\n}\n"), marshalling);
-  assert_eq(said_in(b"effect box {\n  write swap<a, b>(x: a, y: b) -> (b, a)\n}\n"), marshalling);
-  assert_eq(said_in(b"effect box {\n  write put(x: Int) -> Unit\n}\n"), []);
-  assert_eq(said_in(b"fn f(read: Int, x: Int) -> Bool = read < x"), [])
+  assert_eq(mentions_in(b"effect box {\n  write put<a>(x: a) -> Unit\n}\n"), marshalling);
+  assert_eq(mentions_in(b"effect box {\n  read take[k]<a>() -> a\n}\n"), marshalling);
+  assert_eq(
+    mentions_in(b"effect box {\n  write swap<a, b>(x: a, y: b) -> (b, a)\n}\n"),
+    marshalling,
+  );
+  assert_eq(mentions_in(b"effect box {\n  write put(x: Int) -> Unit\n}\n"), []);
+  assert_eq(mentions_in(b"fn f(read: Int, x: Int) -> Bool = read < x"), [])
 }
 
 test "a call on a locally bound name depends only on the called function's name, however the name is bound" {
@@ -1963,15 +1983,15 @@ test "a call on a locally bound name depends only on the called function's name,
       b"fn f(l: List<T>) -> Int = match l { [x, ..rest] -> x.go[r](), [] -> 0 }",
     ],
     |text: Bytes|
-      assert_eq(said_in(text).filter(|m: Bytes| !m.starts_with(prelude_module())), [b" go"]),
+      assert_eq(mentions_in(text).filter(|m: Bytes| !m.starts_with(prelude_module())), [b" go"]),
   );
-  assert_eq(said_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [b"deep.lib x"]);
-  assert_eq(said_in(b"fn f() -> Int = (limits.go)() + size(limits.most)"), [b" go"])
+  assert_eq(mentions_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [b"deep.lib x"]);
+  assert_eq(mentions_in(b"fn f() -> Int = (limits.go)() + size(limits.most)"), [b" go"])
 }
 
 test "a definition's tokens, with or without its signature, equal the tokens from lexing its source texts joined, and give the same mentions" {
   let source = b"import std.list\npub type Shape =\n  | Dot\n  | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> abs(n),\n  }\npub transparent fn twice(n: Int) -> Int = n + n\nfn named(s: Shape) -> String = \"shape of {size(s)}\"\nfn listed(xs: List<Int>) -> Int = {\n  let ys = List::rotate(xs, 1);\n  ys.len() + twice(1)\n}\nfn small() -> Set<Int> = #[1, 2]\ntest \"the size of a line of {n}\" for n: Int in [1, 2] {\n  assert_eq(size(Line(n)), n)\n}\n";
-  let parsed = parse_at(0, { name: b"m", src: source }).module;
+  let parsed = parse_at(0, { name: b"m", source_text: source }).module;
   let raw = parse(source).node;
   let tokens = lex(source).tokens;
   let scope = module_scope(parsed, raw, raw.imports.map(import_path));

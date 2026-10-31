@@ -30,8 +30,8 @@ import compiler.store.hash.forms (FirstPass, build_index, listed_refs, member_ha
                                   hash_forms, cached_nodes, cached_hashes_of, is_declaration,
                                   definition_key, hash_layout, assemble, walked, DeclarationNamed,
                                   FunctionNamed, ItemKeyed, ReachableNames, reach, closure_of,
-                                  reached_functions, reached_by_tests, references_in,
-                                  find_referrers, keys_reaching, ClosureEntry, build_closure,
+                                  reachable_functions, reachable_by_tests, references_in,
+                                  find_referrers, keys_referring_to, ClosureEntry, build_closure,
                                   by_name, of_key, module_record, module_record_bin, record_digest,
                                   recorded_graph, recorded_reachable_hashes, recorded_hashes,
                                   ReachableHashes)
@@ -494,7 +494,10 @@ fn return_refs(
 fn lambda_rets(e: Expression, out: List<TypeExpression>) -> List<TypeExpression> =
   expression_nodes_folded(e, out, |accumulator: List<TypeExpression>, x: Expression|
     match x {
-      LambdaExpression(l) -> match l.ret { Some(t) -> accumulator.push(t), None -> accumulator },
+      LambdaExpression(l) -> match l.return_clause {
+        Some(t) -> accumulator.push(t),
+        None -> accumulator,
+      },
       _ -> accumulator,
     })
 
@@ -601,7 +604,7 @@ type Parsed = {
 pub fn hash_dump(sources: List<Source>) -> String / {abort.raise} = {
   let parsed = range(0, sources.len()).map(|i: Int| {
     let s = sources.get(i);
-    let r = parse(s.src);
+    let r = parse(s.source_text);
     let x = expand(r.node, r.parser.diagnostics);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diagnostics: d.diagnostics }
@@ -637,11 +640,11 @@ fn itemized() -> List<Source> =
   [
     {
       name: b"base",
-      src: b"pub fn one() -> Int = 1\nfn unused_here() -> Int = 9\ntest \"one is one\" { assert(one() == 1) }\nlaw \"one is fixed\" forall x: Int { one() + x == x + 1 }\n",
+      source_text: b"pub fn one() -> Int = 1\nfn unused_here() -> Int = 9\ntest \"one is one\" { assert(one() == 1) }\nlaw \"one is fixed\" forall x: Int { one() + x == x + 1 }\n",
     },
     {
       name: b"app",
-      src: b"import base\npub fn two() -> Int = base::one() + 1\ntest \"two\" { assert(two() == 2) }\nlaw \"two is two\" forall x: Int { two() + x == x + 2 }\n",
+      source_text: b"import base\npub fn two() -> Int = base::one() + 1\ntest \"two\" { assert(two() == 2) }\nlaw \"two is two\" forall x: Int { two() + x == x + 2 }\n",
     },
   ]
 
@@ -690,7 +693,7 @@ test "hashing a program from a complete cache of nodes, tests and laws gives the
   let sources = itemized().concat([
     {
       name: b"loops",
-      src: b"import base\npub effect tick { write beat() -> Unit }\npub fn even(n: Int) -> Bool / { tick.write } = if n == 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n == 0 { false } else { even(n - 1) }\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\ntest \"halves\" { assert_eq(half(base::one() + 3), 2) }\n",
+      source_text: b"import base\npub effect tick { write beat() -> Unit }\npub fn even(n: Int) -> Bool / { tick.write } = if n == 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n == 0 { false } else { even(n - 1) }\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\ntest \"halves\" { assert_eq(half(base::one() + 3), 2) }\n",
     },
   ]);
   let index = index_sources(sources);
@@ -705,7 +708,8 @@ test "hashing a program from a complete cache of nodes, tests and laws gives the
 test "a type is used when a function declared on it is called, and reported unused when none of its functions is called" {
   let source = b"type Tally = | Tally\nfn Tally::made() -> Int = 1\nfn Tally::idle() -> Int = 2\ntype Lone = | Lone\nfn Lone::made() -> Int = 3\npub fn f() -> Int = Tally::made()\n";
   assert_eq(
-    unused_diagnostics(index_sources([{ name: b"m", src: source }])).map(|d: Diagnostic| d.message),
+    unused_diagnostics(index_sources([{ name: b"m", source_text: source }])).map(|d: Diagnostic|
+      d.message),
     [
       b"fn `m.Tally::idle` is never used",
       b"type `m.Lone` is never used",
@@ -717,7 +721,7 @@ test "a type is used when a function declared on it is called, and reported unus
 test "an extern type is not reported unused when an extern function declared on it is called" {
   let source = b"extern type Spelt\nextern fn Spelt::of(b: Bytes) -> String\npub fn f(b: Bytes) -> String = Spelt::of(b)\n";
   assert_eq(
-    unused_diagnostics(index_sources([{ name: b"std.spelling", src: source }])).map(
+    unused_diagnostics(index_sources([{ name: b"std.spelling", source_text: source }])).map(
       |d: Diagnostic| d.message,
     ),
     [],
@@ -726,13 +730,13 @@ test "an extern type is not reported unused when an extern function declared on 
 
 test "renaming a definition does not move its hash, and a change to a callee does" {
   let a = hash_dump([
-    { name: b"m", src: b"fn helper(x: Int) -> Int = x + 1\nfn f() -> Int = helper(1)" },
+    { name: b"m", source_text: b"fn helper(x: Int) -> Int = x + 1\nfn f() -> Int = helper(1)" },
   ]);
   let b = hash_dump([
-    { name: b"m", src: b"fn aide(x: Int) -> Int = x + 1\nfn f() -> Int = aide(1)" },
+    { name: b"m", source_text: b"fn aide(x: Int) -> Int = x + 1\nfn f() -> Int = aide(1)" },
   ]);
   let c = hash_dump([
-    { name: b"m", src: b"fn helper(x: Int) -> Int = x + 2\nfn f() -> Int = helper(1)" },
+    { name: b"m", source_text: b"fn helper(x: Int) -> Int = x + 2\nfn f() -> Int = helper(1)" },
   ]);
   assert_eq(dumped_hash(a, b"m.helper"), dumped_hash(b, b"m.aide"));
   assert_eq(dumped_hash(a, b"m.f"), dumped_hash(b, b"m.f"));
@@ -750,10 +754,15 @@ test "a type's where clause is in its hash, and its spelling is not" {
   };
   let source_with = |w: Bytes|
     Bytes::concat_all([b"pub type Game<a>", w, b" = { same: (a, a) -> Bool }\n"]);
-  let with_where = hash_dump([{ name: b"m", src: source_with(b" where derivable(eq, a)") }]);
-  let without = hash_dump([{ name: b"m", src: source_with(b"") }]);
+  let with_where = hash_dump([
+    { name: b"m", source_text: source_with(b" where derivable(eq, a)") },
+  ]);
+  let without = hash_dump([{ name: b"m", source_text: source_with(b"") }]);
   let renamed = hash_dump([
-    { name: b"m", src: b"pub type Game<b> where derivable(eq, b) = { same: (b, b) -> Bool }\n" },
+    {
+      name: b"m",
+      source_text: b"pub type Game<b> where derivable(eq, b) = { same: (b, b) -> Bool }\n",
+    },
   ]);
   assert(
     declaration(with_where, b"m.Game") != declaration(without, b"m.Game"),
@@ -769,24 +778,27 @@ test "replacing doc comments with plain comments of the same length does not cha
     b"/// Reads `t`.\nfn f(t: T) -> Int / {log.write} = match t { A -> 0, B(n) -> { log.line(\"x\"); n } }\n",
   ]);
   let plain = documented.replace(b"///", b"// ").replace(b"//!", b"// ");
-  assert_eq(hash_dump([{ name: b"m", src: documented }]), hash_dump([{ name: b"m", src: plain }]))
+  assert_eq(
+    hash_dump([{ name: b"m", source_text: documented }]),
+    hash_dump([{ name: b"m", source_text: plain }]),
+  )
 }
 
 test "an interpolated string hashes the same as the concatenation it stands for" {
-  let shown = { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" };
-  let a = hash_dump([shown, { name: b"m", src: b"fn f(x: Int) -> String = f\"a {x} b\"" }]);
+  let shown = { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"" };
+  let a = hash_dump([shown, { name: b"m", source_text: b"fn f(x: Int) -> String = f\"a {x} b\"" }]);
   let b = hash_dump([
     shown,
     {
       name: b"m",
-      src: b"import std.show\nfn f(x: Int) -> String = \"a \" ++ show::display(x) ++ \" b\"",
+      source_text: b"import std.show\nfn f(x: Int) -> String = \"a \" ++ show::display(x) ++ \" b\"",
     },
   ]);
   assert_eq(dumped_hash(a, b"m.f"), dumped_hash(b, b"m.f"))
 }
 
 test "a byte literal like `b'{'` hashes the same as the integer `123`, and `+%` and `*|` hash the same as `wrap_add` and `saturating_mul` calls" {
-  let one = |source: Bytes| dumped_hash(hash_dump([{ name: b"m", src: source }]), b"m.f");
+  let one = |source: Bytes| dumped_hash(hash_dump([{ name: b"m", source_text: source }]), b"m.f");
   assert_eq(
     one(b"fn f(c: Int) -> Bool = c == b'{' || c == b'\\n'"),
     one(b"fn f(c: Int) -> Bool = c == 123 || c == 10"),
@@ -809,14 +821,14 @@ test "a tagged literal hashes with its parser and its text, apart from the call 
   let tag = |accepted: Bytes|
     {
       name: b"hex",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn literal(t: String) -> Result<Int, { message: String, offset: Int }> = Ok(",
         accepted,
         b")",
       ]),
     };
   let caller_module = |body: Bytes|
-    { name: b"m", src: b"import hex\nfn f() -> Int = ".concat(body) };
+    { name: b"m", source_text: b"import hex\nfn f() -> Int = ".concat(body) };
   let of = |parser: Bytes, body: Bytes|
     dumped_hash(hash_dump([tag(parser), caller_module(body)]), b"m.f");
   let literal = of(b"1", b"hex\"ab\"");
@@ -826,7 +838,7 @@ test "a tagged literal hashes with its parser and its text, apart from the call 
   assert(of(b"1", b"match hex::literal(\"ab\") { Ok(n) -> n, Err(_) -> 0 }") != literal);
   let renamed = hash_dump([
     tag(b"1"),
-    { name: b"m", src: b"import hex as h\nfn f() -> Int = h\"ab\"" },
+    { name: b"m", source_text: b"import hex as h\nfn f() -> Int = h\"ab\"" },
   ]);
   assert_eq(dumped_hash(renamed, b"m.f"), literal)
 }
@@ -835,14 +847,14 @@ test "a tagged string with `{...}` placeholders hashes differently when the tag'
   let tag = |compiled: Bytes|
     {
       name: b"sh",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(",
         compiled,
         b")\npub fn fill(c: Int, holes: List<Int>) -> Int = c",
       ]),
     };
   let caller_module = |body: Bytes|
-    { name: b"m", src: b"import sh\nfn f(n: Int) -> Int = ".concat(body) };
+    { name: b"m", source_text: b"import sh\nfn f(n: Int) -> Int = ".concat(body) };
   let of = |compiled: Bytes, body: Bytes|
     dumped_hash(hash_dump([tag(compiled), caller_module(body)]), b"m.f");
   let literal = of(b"1", b"sh\"a {n} b\"");
@@ -860,15 +872,18 @@ test "a tagged string with `{...}` placeholders hashes differently when the tag'
 test "a record update of another module's record has the same hash each time, and a different hash when that module's record type changes" {
   let app = b"import shapes\npub fn bumped() -> shapes::P = { let p = shapes::mk(); {..p, a: 3} }";
   let narrow = [
-    { name: b"shapes", src: b"pub type P = { a: Int, b: Int }\npub fn mk() -> P = { a: 1, b: 2 }" },
-    { name: b"app", src: app },
+    {
+      name: b"shapes",
+      source_text: b"pub type P = { a: Int, b: Int }\npub fn mk() -> P = { a: 1, b: 2 }",
+    },
+    { name: b"app", source_text: app },
   ];
   let wide = [
     {
       name: b"shapes",
-      src: b"pub type P = { a: Int, b: Int, c: Int }\npub fn mk() -> P = { a: 1, b: 2, c: 3 }",
+      source_text: b"pub type P = { a: Int, b: Int, c: Int }\npub fn mk() -> P = { a: 1, b: 2, c: 3 }",
     },
-    { name: b"app", src: app },
+    { name: b"app", source_text: app },
   ];
   assert_eq(
     dumped_hash(hash_dump(narrow), b"app.bumped"),
@@ -884,7 +899,7 @@ test "two functions that call each other are hashed together as one group, and e
     hash_dump([
       {
         name: b"m",
-        src: b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }",
+        source_text: b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }",
       },
     ]),
   );
@@ -895,7 +910,7 @@ test "two functions that call each other are hashed together as one group, and e
 pub fn index_sources(sources: List<Source>) -> Index / {abort.raise} =
   match resolve_modules(
       range(0, sources.len()).map(|i: Int| {
-        let r = parse(sources.get(i).src);
+        let r = parse(sources.get(i).source_text);
         let d: Expansion = expand_derives(
           i,
           sources.get(i).name,
@@ -919,7 +934,7 @@ test "a function's closure is every function it references directly or indirectl
     index_sources([
       {
         name: b"m",
-        src: b"pub fn leaf() -> Int = 1\npub fn mid() -> Int = leaf()\npub fn top() -> Int = mid()\npub fn other() -> Int = 2\ntest \"it\" { assert_eq(top(), 1) }",
+        source_text: b"pub fn leaf() -> Int = 1\npub fn mid() -> Int = leaf()\npub fn top() -> Int = mid()\npub fn other() -> Int = 2\ntest \"it\" { assert_eq(top(), 1) }",
       },
     ]),
   );
@@ -927,92 +942,93 @@ test "a function's closure is every function it references directly or indirectl
   assert_eq(closure_of(h, [b"m.it"]).keys(), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
   assert_eq(closure_of(h, [b"m.mid", b"m.other"]).keys(), [b"m.leaf", b"m.mid", b"m.other"]);
   assert_eq(closure_of(h, [b"m.nothing"]), Map::new());
-  assert_eq(keys_reaching(h, one_set([b"m.leaf"])).keys(), [
+  assert_eq(keys_referring_to(h, one_set([b"m.leaf"])).keys(), [
     b"m.it",
     b"m.leaf",
     b"m.mid",
     b"m.top",
   ]);
-  assert_eq(keys_reaching(h, one_set([b"m.other"])).keys(), [b"m.other"])
+  assert_eq(keys_referring_to(h, one_set([b"m.other"])).keys(), [b"m.other"])
 }
 
 test "the functions a definition depends on include those named in its `requires` and `ensures` clauses and everything they call" {
   let index = index_sources([
     {
       name: b"m",
-      src: b"pub fn f(n: Int) -> Int\n  requires n > floor()\n  ensures result == model(n)\n= n\nfn model(n: Int) -> Int = n + under()\nfn under() -> Int = 0\nfn floor() -> Int = 0\npub fn other() -> Int = 2",
+      source_text: b"pub fn f(n: Int) -> Int\n  requires n > floor()\n  ensures result == model(n)\n= n\nfn model(n: Int) -> Int = n + under()\nfn under() -> Int = 0\nfn floor() -> Int = 0\npub fn other() -> Int = 2",
     },
   ]);
   let h = hash_index(index);
   assert_eq(closure_of(h, [b"m.f"]).keys(), [b"m.f"]);
-  assert_eq(reached_functions(h, [FunctionNamed(b"m.f")]).keys(), [
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.f")]).keys(), [
     b"m.f",
     b"m.floor",
     b"m.model",
     b"m.under",
   ]);
-  assert_eq(reached_functions(h, [FunctionNamed(b"m.other")]).keys(), [b"m.other"])
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.other")]).keys(), [b"m.other"])
 }
 
 test "a parameterized test depends on the functions its case table and case label call, but not on functions only its body calls" {
   let index = index_sources([
     {
       name: b"m",
-      src: b"fn table() -> List<Int> = build(2)\nfn build(n: Int) -> List<Int> = [n]\nfn name_of(n: Int) -> Int = n\nfn heavy(n: Int) -> Int = deeper(n)\nfn deeper(n: Int) -> Int = n\ntest \"case {name_of(n)}\" for n: Int in table() {\n  assert_eq(heavy(n), n)\n}\n",
+      source_text: b"fn table() -> List<Int> = build(2)\nfn build(n: Int) -> List<Int> = [n]\nfn name_of(n: Int) -> Int = n\nfn heavy(n: Int) -> Int = deeper(n)\nfn deeper(n: Int) -> Int = n\ntest \"case {name_of(n)}\" for n: Int in table() {\n  assert_eq(heavy(n), n)\n}\n",
     },
     {
       name: b"std.cases",
-      src: b"pub fn listed(xs: Int, f: Int) -> Int = 0\npub fn chosen(xs: Int, at: Int) -> Int = 0\n",
+      source_text: b"pub fn listed(xs: Int, f: Int) -> Int = 0\npub fn chosen(xs: Int, at: Int) -> Int = 0\n",
     },
-    { name: b"std.show", src: b"pub fn display(x: Int) -> Int = x\n" },
+    { name: b"std.show", source_text: b"pub fn display(x: Int) -> Int = x\n" },
   ]);
   let h = hash_index(index);
-  let listed = reached_by_tests(h, [b"m.case {name_of(n)}"]).keys();
+  let listed = reachable_by_tests(h, [b"m.case {name_of(n)}"]).keys();
   assert(listed.contains(b"m.table") && listed.contains(b"m.build"), Some("the table is listed"));
   assert(!listed.contains(b"m.heavy") && !listed.contains(b"m.deeper"), Some("no case runs"));
-  let run = reached_functions(h, [ItemKeyed(b"m.case {name_of(n)}")]).keys();
+  let run = reachable_functions(h, [ItemKeyed(b"m.case {name_of(n)}")]).keys();
   assert(run.contains(b"m.heavy") && run.contains(b"m.table"), None)
 }
 
 test "a module with a test that uses `simulate` depends on the scheduler's functions when the scheduler module is loaded, though no code names them" {
   let scheduler = {
     name: b"std.internal.schedule",
-    src: b"pub fn simulated(n: Int) -> Int = nested(n)\nfn nested(n: Int) -> Int = n\n",
+    source_text: b"pub fn simulated(n: Int) -> Int = nested(n)\nfn nested(n: Int) -> Int = n\n",
   };
   let program = {
     name: b"m",
-    src: b"fn three() -> Int = 3\ntest \"x\" {\n  let r = simulate { three() };\n  assert_eq(r, 3)\n}\n",
+    source_text: b"fn three() -> Int = 3\ntest \"x\" {\n  let r = simulate { three() };\n  assert_eq(r, 3)\n}\n",
   };
   let scheduled = [b"std.internal.schedule.nested", b"std.internal.schedule.simulated"];
   let scheduled_present = |functions: Map<Bytes, Bool>|
     scheduled.filter(|n: Bytes| functions.contains(n));
   let h = hash_index(index_sources([program, scheduler]));
-  assert_eq(scheduled_present(reached_functions(h, [ItemKeyed(b"m.x")])), scheduled);
-  assert_eq(scheduled_present(reached_by_tests(h, [b"m.x"])), scheduled);
-  assert(reached_functions(h, [ItemKeyed(b"m.x")]).contains(b"m.three"), None);
-  assert_eq(reached_functions(hash_index(index_sources([program])), [ItemKeyed(b"m.x")]).keys(), [
-    b"m.three",
-  ])
+  assert_eq(scheduled_present(reachable_functions(h, [ItemKeyed(b"m.x")])), scheduled);
+  assert_eq(scheduled_present(reachable_by_tests(h, [b"m.x"])), scheduled);
+  assert(reachable_functions(h, [ItemKeyed(b"m.x")]).contains(b"m.three"), None);
+  assert_eq(
+    reachable_functions(hash_index(index_sources([program])), [ItemKeyed(b"m.x")]).keys(),
+    [b"m.three"],
+  )
 }
 
 test "a function reference depends only on the function itself, not on a type or effect with the same name" {
   let index = index_sources([
     {
       name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub type Box = | Box(Int)\neffect Box { read held() -> Box }\npub fn boxed() -> Box / {Box.read} = Box.held()\npub fn caller() -> Int = log()",
+      source_text: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub type Box = | Box(Int)\neffect Box { read held() -> Box }\npub fn boxed() -> Box / {Box.read} = Box.held()\npub fn caller() -> Int = log()",
     },
   ]);
   let h = hash_index(index);
-  assert_eq(reached_functions(h, [FunctionNamed(b"m.user")]).keys(), [b"m.user"]);
-  assert_eq(reached_functions(h, [FunctionNamed(b"m.boxed")]).keys(), [b"m.boxed"]);
-  assert_eq(reached_functions(h, [FunctionNamed(b"m.caller")]).keys(), [
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.user")]).keys(), [b"m.user"]);
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.boxed")]).keys(), [b"m.boxed"]);
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.caller")]).keys(), [
     b"m.caller",
     b"m.helper",
     b"m.log",
   ]);
-  assert_eq(reached_functions(h, [FunctionNamed(b"m.log")]).keys(), [b"m.helper", b"m.log"]);
-  assert_eq(reached_functions(h, [DeclarationNamed(b"m.log")]).keys(), []);
-  assert_eq(reached_functions(h, [DeclarationNamed(b"m.Box")]).keys(), [])
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.log")]).keys(), [b"m.helper", b"m.log"]);
+  assert_eq(reachable_functions(h, [DeclarationNamed(b"m.log")]).keys(), []);
+  assert_eq(reachable_functions(h, [DeclarationNamed(b"m.Box")]).keys(), [])
 }
 
 fn hash_parameterized_test(
@@ -1023,14 +1039,14 @@ fn hash_parameterized_test(
 ) -> HashOutput / {abort.raise} =
   hash_index(
     index_sources([
-      { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
+      { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"" },
       {
         name: b"std.cases",
-        src: b"pub type Table<a> = List<a>\npub fn listed<a>(t: List<a>, l: (a) -> String) -> List<String> = t.map(l)\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a = panic(\"\")",
+        source_text: b"pub type Table<a> = List<a>\npub fn listed<a>(t: List<a>, l: (a) -> String) -> List<String> = t.map(l)\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a = panic(\"\")",
       },
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub fn few() -> List<Int> = [1]\npub fn more() -> List<Int> = [1, 2]\npub fn held(n: Int) -> Bool = n > 0\ntest \"",
           label,
           b"\" for n: ",
@@ -1081,7 +1097,7 @@ fn three_of_a_name() -> HashOutput / {abort.raise} =
     index_sources([
       {
         name: b"m",
-        src: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub fn caller() -> Int = log()\ntest \"log\" { assert_eq(caller(), 1) }",
+        source_text: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub fn caller() -> Int = log()\ntest \"log\" { assert_eq(caller(), 1) }",
       },
     ]),
   )
@@ -1146,7 +1162,11 @@ test "a reference given only by name follows every definition with that name: fu
   let h = three_of_a_name();
   assert_eq(closure_of(h, [b"m.user"]).keys(), [b"m.log", b"m.user"]);
   assert_eq(closure_of(h, [b"m.log"]).keys(), [b"m.caller", b"m.helper", b"m.log"]);
-  assert_eq(keys_reaching(h, one_set([b"m.helper"])).keys(), [b"m.caller", b"m.helper", b"m.log"])
+  assert_eq(keys_referring_to(h, one_set([b"m.helper"])).keys(), [
+    b"m.caller",
+    b"m.helper",
+    b"m.log",
+  ])
 }
 
 fn all_public(
@@ -1171,9 +1191,9 @@ fn printed_modules(
 test "adding a `decreases` clause to a function changes the function's hash" {
   let source = b"fn f(n: Int) -> Int decreases n = if n <= 0 { 0 } else { f(n - 1) }";
   let plain = hash_dump([
-    { name: b"m", src: b"fn f(n: Int) -> Int = if n <= 0 { 0 } else { f(n - 1) }" },
+    { name: b"m", source_text: b"fn f(n: Int) -> Int = if n <= 0 { 0 } else { f(n - 1) }" },
   ]);
-  let measured = hash_dump([{ name: b"m", src: source }]);
+  let measured = hash_dump([{ name: b"m", source_text: source }]);
   assert(dumped_hash(plain, b"m.f") != dumped_hash(measured, b"m.f"))
 }
 
@@ -1198,7 +1218,7 @@ test "a type's invariant is part of the type's hash, so naming a different invar
       hash_dump([
         {
           name: b"m",
-          src: Bytes::concat_all([
+          source_text: Bytes::concat_all([
             balance,
             b"fn valid(b: B) -> Bool = ",
             valid,
@@ -1208,7 +1228,7 @@ test "a type's invariant is part of the type's hash, so naming a different invar
       ]),
       b"m.B",
     );
-  let plain = declaration_in_dump(hash_dump([{ name: b"m", src: balance }]), b"m.B");
+  let plain = declaration_in_dump(hash_dump([{ name: b"m", source_text: balance }]), b"m.B");
   assert(stated(b"true") != stated(b"false"));
   assert(stated(b"true") != plain)
 }
@@ -1219,7 +1239,7 @@ test "changing a law's `where identity(a)` condition changes the law's hash, the
       hash_dump([
         {
           name: b"m",
-          src: Bytes::concat_all([b"law \"l\" forall (x: a, y: b) ", w, b"{ x == x }\n"]),
+          source_text: Bytes::concat_all([b"law \"l\" forall (x: a, y: b) ", w, b"{ x == x }\n"]),
         },
       ]),
       b"m.l",
@@ -1231,7 +1251,7 @@ test "changing a law's `where identity(a)` condition changes the law's hash, the
     hash_dump([
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub law schema s<a>(f: (a) -> a) forall (x: a) ",
           w,
           b"{ f(x) == x }\npub fn same(n: Int) -> Int = n\nlaw \"l\" = s(same)\n",
@@ -1249,10 +1269,10 @@ test "marking a function `const` changes its hash and the hash of the function t
   let plain = hash_dump([
     {
       name: b"m",
-      src: b"pub fn table() -> List<Int> = [1, 2]\npub fn first() -> Option<Int> = table().at(0)",
+      source_text: b"pub fn table() -> List<Int> = [1, 2]\npub fn first() -> Option<Int> = table().at(0)",
     },
   ]);
-  let marked = hash_dump([{ name: b"m", src: source }]);
+  let marked = hash_dump([{ name: b"m", source_text: source }]);
   assert(dumped_hash(plain, b"m.table") != dumped_hash(marked, b"m.table"));
   assert(dumped_hash(plain, b"m.first") != dumped_hash(marked, b"m.first"))
 }
@@ -1263,7 +1283,7 @@ fn trees() -> Bytes =
 test "an or-pattern binds each variable once, and which variable each alternative binds is part of the hash" {
   let over = |arm: Bytes|
     Bytes::concat_all([trees(), b"pub fn f(t: Tree) -> Int = match t { ", arm, b", _ -> 0 }"]);
-  let one = |arm: Bytes| dumped_hash(hash_dump([{ name: b"m", src: over(arm) }]), b"m.f");
+  let one = |arm: Bytes| dumped_hash(hash_dump([{ name: b"m", source_text: over(arm) }]), b"m.f");
   assert_eq(one(b"Node(_, x) | Other(x, _) -> x"), one(b"Node(_, n) | Other(n, _) -> n"));
   let straight = one(b"Node(Node(_, x), y) | Other(x, Node(_, y)) -> x - y");
   assert(straight != one(b"Node(Node(_, y), x) | Other(x, Node(_, y)) -> x - y"));
@@ -1274,7 +1294,7 @@ test "an or-pattern binds each variable once, and which variable each alternativ
       hash_dump([
         {
           name: b"m",
-          src: Bytes::concat_all([
+          source_text: Bytes::concat_all([
             b"pub fn f(a: Result<Int, Int>, b: (Int, Int)) -> Int = { ",
             first,
             b" ",
@@ -1304,7 +1324,8 @@ test "renaming a `let` variable does not change a hash when other `let`s do not 
       second,
       b" / 2; hw - hh }",
     ]);
-  let one = |source: Bytes| dumped_hash(hash_dump([{ name: b"m", src: source }]), b"m.spread");
+  let one = |source: Bytes|
+    dumped_hash(hash_dump([{ name: b"m", source_text: source }]), b"m.spread");
   assert_eq(one(spread(b"w", b"h")), one(spread(b"h", b"w")))
 }
 
@@ -1314,7 +1335,11 @@ test "whether an effect row is `bounded` is part of a function's hash" {
       hash_dump([
         {
           name: b"m",
-          src: Bytes::concat_all([b"pub fn f<| e>(g: () -> Int / e) -> Int / ", row, b" = g()"]),
+          source_text: Bytes::concat_all([
+            b"pub fn f<| e>(g: () -> Int / e) -> Int / ",
+            row,
+            b" = g()",
+          ]),
         },
       ]),
       b"m.f",
@@ -1327,15 +1352,15 @@ test "printing stored bodies and hashing the printed text gives the stored hashe
     index_sources([
       {
         name: b"left.util",
-        src: b"pub type Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }",
+        source_text: b"pub type Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }",
       },
       {
         name: b"right.util",
-        src: b"pub fn big() -> Float = 0.1 + 1e300\npub fn tiny() -> Decimal = 0.050m\npub fn raw() -> Bytes = b\"\\x00\\\"q\"",
+        source_text: b"pub fn big() -> Float = 0.1 + 1e300\npub fn tiny() -> Decimal = 0.050m\npub fn raw() -> Bytes = b\"\\x00\\\"q\"",
       },
       {
         name: b"app",
-        src: b"import left.util as l\nfn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\nfn all() -> Int = l::size(l::Line(0xFFFFFFFFFFFFFFFF)) + (match 255u8 { _ -> 1 })",
+        source_text: b"import left.util as l\nfn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\nfn all() -> Int = l::size(l::Line(0xFFFFFFFFFFFFFFFF)) + (match 255u8 { _ -> 1 })",
       },
     ]),
   );
@@ -1347,7 +1372,9 @@ test "printing stored bodies and hashing the printed text gives the stored hashe
   ]);
   assert(ms.get(0).text.contains(b"import left.util as left_util\n"));
   let again = hash_index(
-    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(
+      ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, source_text: m.text }),
+    ),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   let shipped = printed_modules(out, [b"left.util"]);
@@ -1359,11 +1386,11 @@ test "a function body that uses `==`, `digest` or `List::digest` is recorded as 
     index_sources([
       {
         name: prelude_module(),
-        src: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = xs\n",
+        source_text: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = xs\n",
       },
       {
         name: b"app",
-        src: b"pub fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\npub fn hashed(a: List<Int>) -> Bytes = digest(a)\npub fn named(a: List<Int>) -> Bytes = List::digest(a)\npub fn both(a: Int) -> Bool = a != 0 && digest(a) == b\"\"\npub fn plain(a: Int) -> Int = a\n",
+        source_text: b"pub fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\npub fn hashed(a: List<Int>) -> Bytes = digest(a)\npub fn named(a: List<Int>) -> Bytes = List::digest(a)\npub fn both(a: Int) -> Bool = a != 0 && digest(a) == b\"\"\npub fn plain(a: Int) -> Int = a\n",
       },
     ]),
   );
@@ -1381,8 +1408,8 @@ test "a function body that uses `==`, `digest` or `List::digest` is recorded as 
 test "printing a body that calls a method on a value imports each module whose function that method may resolve to" {
   let hashed = hash_index(
     index_sources([
-      { name: b"low", src: b"pub type A = | A\npub fn A::go(a: A) -> Int = 1" },
-      { name: b"app", src: b"import low\npub fn gone(xs: List<Int>) -> Int = xs.go()" },
+      { name: b"low", source_text: b"pub type A = | A\npub fn A::go(a: A) -> Int = 1" },
+      { name: b"app", source_text: b"import low\npub fn gone(xs: List<Int>) -> Int = xs.go()" },
     ]),
   );
   let out = {
@@ -1393,14 +1420,16 @@ test "printing a body that calls a method on a value imports each module whose f
   let ms = printed_modules(out, []);
   assert(ms.get(0).text.contains(b"import low\n"));
   let again = hash_index(
-    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(
+      ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, source_text: m.text }),
+    ),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
 test "printing a method call keeps it as written, with named arguments naming the parameter they fill" {
   let source = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)";
-  let index = index_sources([{ name: b"m", src: source }]);
+  let index = index_sources([{ name: b"m", source_text: source }]);
   let body_of = |name: Bytes|
     index.nodes.fold(dummy_span(), |accumulator: Span, n: Node|
       match n.body {
@@ -1452,9 +1481,10 @@ test "the scope given to `with_scope` is part of its hash" {
       None -> panic("the index names stored"),
     }
   };
-  let out = hash_index(index_sources([{ name: b"app", src: source(b"file") }]));
+  let out = hash_index(index_sources([{ name: b"app", source_text: source(b"file") }]));
   assert(
-    hash_of(hash_index(index_sources([{ name: b"app", src: source(b"other") }]))) != hash_of(out),
+    hash_of(hash_index(index_sources([{ name: b"app", source_text: source(b"other") }])))
+      != hash_of(out),
   )
 }
 
@@ -1471,8 +1501,10 @@ test "a `try` that names the effect it catches hashes differently from a `try` t
       None -> panic("the index names f"),
     }
   };
-  let out = hash_index(index_sources([{ name: b"m", src: source(b"try[p.bad] { g(n) }") }]));
-  let unnamed = hash_index(index_sources([{ name: b"m", src: source(b"try { g(n) }") }]));
+  let out = hash_index(
+    index_sources([{ name: b"m", source_text: source(b"try[p.bad] { g(n) }") }]),
+  );
+  let unnamed = hash_index(index_sources([{ name: b"m", source_text: source(b"try { g(n) }") }]));
   assert(hash_of(unnamed) != hash_of(out))
 }
 
@@ -1480,15 +1512,17 @@ test "a tagged literal is printed with the import name of the module that define
   let parser = b"(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)";
   let out = hash_index(
     index_sources([
-      { name: b"aaa", src: b"pub fn of_text".concat(parser) },
-      { name: b"hex", src: b"pub fn literal".concat(parser) },
-      { name: b"app", src: b"import hex as h\npub fn two() -> Int = h\"a\\\"b\" + h\"\"" },
+      { name: b"aaa", source_text: b"pub fn of_text".concat(parser) },
+      { name: b"hex", source_text: b"pub fn literal".concat(parser) },
+      { name: b"app", source_text: b"import hex as h\npub fn two() -> Int = h\"a\\\"b\" + h\"\"" },
     ]),
   );
   let ms = printed_modules(out, []);
   assert(ms.get(1).text.contains(b"hex\"a\\\"b\" + hex\"\""));
   let again = hash_index(
-    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(
+      ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, source_text: m.text }),
+    ),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
@@ -1501,11 +1535,11 @@ test "a tagged literal with holes is printed with the import name of the module 
     index_sources([
       {
         name: b"aaa",
-        src: Bytes::concat_all([b"pub fn compile", compiler, b"\npub fn stuffed", filler]),
+        source_text: Bytes::concat_all([b"pub fn compile", compiler, b"\npub fn stuffed", filler]),
       },
       {
         name: b"sh",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub fn compile",
           compiler,
           b"\npub fn fill",
@@ -1516,7 +1550,7 @@ test "a tagged literal with holes is printed with the import name of the module 
       },
       {
         name: b"app",
-        src: b"import sh as s\npub fn two() -> Int = s\"a{{b}} {1 + 2}\\\"{s\"{{\"}\" + s\"}}\"",
+        source_text: b"import sh as s\npub fn two() -> Int = s\"a{{b}} {1 + 2}\\\"{s\"{{\"}\" + s\"}}\"",
       },
     ]),
   );
@@ -1526,7 +1560,9 @@ test "a tagged literal with holes is printed with the import name of the module 
       found || m.text.contains(b"sh\"a")),
   );
   let again = hash_index(
-    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(
+      ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, source_text: m.text }),
+    ),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
@@ -1534,9 +1570,12 @@ test "a tagged literal with holes is printed with the import name of the module 
 test "a reference is printed with a name that the module defining the referenced function exports" {
   let out = hash_index(
     index_sources([
-      { name: b"hidden", src: b"fn span() -> Int = 4\npub fn stride() -> Int = span() + 1" },
-      { name: b"shelf", src: b"pub fn width() -> Int = 4" },
-      { name: b"app", src: b"import shelf\npub fn wide() -> Int = shelf::width()" },
+      {
+        name: b"hidden",
+        source_text: b"fn span() -> Int = 4\npub fn stride() -> Int = span() + 1",
+      },
+      { name: b"shelf", source_text: b"pub fn width() -> Int = 4" },
+      { name: b"app", source_text: b"import shelf\npub fn wide() -> Int = shelf::width()" },
     ]),
   );
   let named = by_name(named_hashes(out));
@@ -1558,7 +1597,9 @@ test "a reference is printed with a name that the module defining the referenced
 
 test "a record type's fields and an effect's operations hash the same in any order" {
   let hash_of = |source: Bytes, name: Bytes|
-    match by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: source }])))).get(
+    match by_name(
+        named_hashes(hash_index(index_sources([{ name: b"m", source_text: source }]))),
+      ).get(
         name,
       ) {
       Some(hash) -> hash,
@@ -1591,9 +1632,10 @@ test "an effect written as an operation, such as `net.send`, hashes differently 
       None -> panic("the index names f"),
     }
   };
-  let out = hash_index(index_sources([{ name: b"m", src: source(b"send") }]));
+  let out = hash_index(index_sources([{ name: b"m", source_text: source(b"send") }]));
   assert(
-    hash_of(out) != hash_of(hash_index(index_sources([{ name: b"m", src: source(b"write") }]))),
+    hash_of(out)
+      != hash_of(hash_index(index_sources([{ name: b"m", source_text: source(b"write") }]))),
   )
 }
 
@@ -1633,7 +1675,7 @@ test "renaming a function's generic label parameter does not change its hash, bu
       b"](x)",
     ]);
   let hash_of = |source: Bytes, name: Bytes| {
-    let out = hash_index(index_sources([{ name: b"m", src: source }]));
+    let out = hash_index(index_sources([{ name: b"m", source_text: source }]));
     match by_name(named_hashes(out)).get(name) {
       Some(h) -> h,
       None -> panic("the index names the definition"),
@@ -1657,8 +1699,8 @@ test "renaming an operation's type parameter does not change a hash" {
       v,
       b" }",
     ]);
-  let out = hash_index(index_sources([{ name: b"m", src: boxed(b"a") }]));
-  let renamed = hash_index(index_sources([{ name: b"m", src: boxed(b"b") }]));
+  let out = hash_index(index_sources([{ name: b"m", source_text: boxed(b"a") }]));
+  let renamed = hash_index(index_sources([{ name: b"m", source_text: boxed(b"b") }]));
   assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)))
 }
 
@@ -1684,7 +1726,7 @@ test "renaming a type's label and effect parameters does not change a hash, but 
       given,
       b"]}>) -> Int = 1",
     ]);
-  let hashed = |source: Bytes| hash_index(index_sources([{ name: b"m", src: source }]));
+  let hashed = |source: Bytes| hash_index(index_sources([{ name: b"m", source_text: source }]));
   let out = hashed(module_source(b"e", b"l", b"conn"));
   let named = by_name(named_hashes(out));
   assert_eq(by_name(named_hashes(hashed(module_source(b"f", b"k", b"conn")))), named);
@@ -1697,8 +1739,8 @@ test "renaming a type's label and effect parameters does not change a hash, but 
 test "two effects with the same operations but different names have different hashes" {
   let out = hash_index(
     index_sources([
-      { name: b"a", src: b"pub effect one { read at() -> Int }" },
-      { name: b"b", src: b"pub effect two { read at() -> Int }" },
+      { name: b"a", source_text: b"pub effect one { read at() -> Int }" },
+      { name: b"b", source_text: b"pub effect two { read at() -> Int }" },
     ]),
   );
   let named = by_name(named_hashes(out));
@@ -1709,8 +1751,8 @@ test "two effects with the same operations but different names have different ha
 test "one effect declaration under two names is rejected, since a body cannot say which one it performs" {
   let out = hash_index(
     index_sources([
-      { name: b"a", src: b"pub effect one { read at() -> Int }" },
-      { name: b"b", src: b"pub effect one { read at() -> Int }" },
+      { name: b"a", source_text: b"pub effect one { read at() -> Int }" },
+      { name: b"b", source_text: b"pub effect one { read at() -> Int }" },
     ]),
   );
   let named = by_name(named_hashes(out));
@@ -1733,8 +1775,8 @@ test "one effect declaration under two names is rejected, since a body cannot sa
 test "two sum types that differ only in name have different hashes, and one sum type declared in two modules has one hash" {
   let apart = hash_index(
     index_sources([
-      { name: b"a", src: b"pub type One = | Wrap(Int)" },
-      { name: b"b", src: b"pub type Two = | Wrap(Int)" },
+      { name: b"a", source_text: b"pub type One = | Wrap(Int)" },
+      { name: b"b", source_text: b"pub type Two = | Wrap(Int)" },
     ]),
   );
   let named = by_name(named_hashes(apart));
@@ -1744,8 +1786,8 @@ test "two sum types that differ only in name have different hashes, and one sum 
     named_hashes(
       hash_index(
         index_sources([
-          { name: b"a", src: b"pub type One = | Wrap(Int)" },
-          { name: b"b", src: b"pub type One = | Wrap(Int)" },
+          { name: b"a", source_text: b"pub type One = | Wrap(Int)" },
+          { name: b"b", source_text: b"pub type One = | Wrap(Int)" },
         ]),
       ),
     ),
@@ -1758,15 +1800,15 @@ test "a type declared identically in two modules is printed under the name the r
     index_sources([
       {
         name: b"a",
-        src: b"pub type Limits = new { most: Int }\npub fn fa(l: Limits) -> Int = l.most + 1",
+        source_text: b"pub type Limits = new { most: Int }\npub fn fa(l: Limits) -> Int = l.most + 1",
       },
       {
         name: b"b",
-        src: b"pub type Limits = new { most: Int }\npub fn fb(l: Limits) -> Int = l.most * 2",
+        source_text: b"pub type Limits = new { most: Int }\npub fn fb(l: Limits) -> Int = l.most * 2",
       },
       {
         name: b"app",
-        src: b"import a\nimport b\npub fn roomy() -> b::Limits = { most: 1 }\npub fn main() -> Int = b::fb(roomy()) + a::fa({ most: 2 })",
+        source_text: b"import a\nimport b\npub fn roomy() -> b::Limits = { most: 1 }\npub fn main() -> Int = b::fb(roomy()) + a::fa({ most: 2 })",
       },
     ]),
   );
@@ -1793,7 +1835,7 @@ test "a type declared identically in two modules is printed under the name the r
 
 test "a `new` record type hashes by its name and fields, and differs from a plain alias of the same fields" {
   let m = |source: Bytes|
-    by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: source }]))));
+    by_name(named_hashes(hash_index(index_sources([{ name: b"m", source_text: source }]))));
   let date = m(b"pub type Date = new { day: Int }\npub fn mk() -> Date = { day: 1 }");
   let other = m(b"pub type Span = new { day: Int }\npub fn mk() -> Span = { day: 1 }");
   let alias = m(b"pub type Date = { day: Int }\npub fn mk() -> Date = { day: 1 }");
@@ -1806,8 +1848,8 @@ test "a `new` record type hashes by its name and fields, and differs from a plai
     named_hashes(
       hash_index(
         index_sources([
-          { name: b"a", src: b"pub type Date = new { day: Int }" },
-          { name: b"b", src: b"pub type Date = new { day: Int }" },
+          { name: b"a", source_text: b"pub type Date = new { day: Int }" },
+          { name: b"b", source_text: b"pub type Date = new { day: Int }" },
         ]),
       ),
     ),
@@ -1817,7 +1859,7 @@ test "a `new` record type hashes by its name and fields, and differs from a plai
 
 test "a type's hash records whether it is opaque, and the hashes of definitions that depend on the type change with it" {
   let m = |source: Bytes|
-    by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: source }]))));
+    by_name(named_hashes(hash_index(index_sources([{ name: b"m", source_text: source }]))));
   let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
   let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
   assert(open.get(b"m.Date") != closed.get(b"m.Date"));
@@ -1832,7 +1874,7 @@ test "a type's hash records whether it is opaque, and the hashes of definitions 
 
 test "a type alias is transparent, so its name is not part of its hash" {
   let m = |source: Bytes|
-    by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: source }]))));
+    by_name(named_hashes(hash_index(index_sources([{ name: b"m", source_text: source }]))));
   let metres = m(b"pub type Metres = Int\npub fn go(x: Metres) -> Metres = x");
   let feet = m(b"pub type Feet = Int\npub fn go(x: Feet) -> Feet = x");
   assert_eq(metres.get(b"m.Metres"), feet.get(b"m.Feet"));
@@ -1847,7 +1889,7 @@ test "a definition's hash changes with the name of the effect it performs" {
     index_sources([
       {
         name: b"m",
-        src: b"pub effect log { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()",
+        source_text: b"pub effect log { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()",
       },
     ]),
   );
@@ -1855,7 +1897,7 @@ test "a definition's hash changes with the name of the effect it performs" {
     index_sources([
       {
         name: b"m",
-        src: b"pub effect trace { write put() -> Unit }\npub fn say() -> Unit / {trace.write} = trace.put()",
+        source_text: b"pub effect trace { write put() -> Unit }\npub fn say() -> Unit / {trace.write} = trace.put()",
       },
     ]),
   );
@@ -1866,7 +1908,7 @@ test "hashing a module's definitions in separate groups gives the same hashes as
   let index = index_sources([
     {
       name: b"m",
-      src: b"pub type T = | Leaf | Node(List<T>)\npub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn count(t: T) -> Int = match t { Leaf -> 1, Node(ts) -> ts.fold(0, |n: Int, k: T| n + count(k)) }\ntest \"it\" { assert(even(2)) }\n",
+      source_text: b"pub type T = | Leaf | Node(List<T>)\npub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn count(t: T) -> Int = match t { Leaf -> 1, Node(ts) -> ts.fold(0, |n: Int, k: T| n + count(k)) }\ntest \"it\" { assert(even(2)) }\n",
     },
   ]);
   let whole = module_forms(index, [0], 0);
@@ -1909,14 +1951,17 @@ test "a definition's hash follows each function a method call on a value may res
           index_sources([
             {
               name: b"low",
-              src: b"pub type A = | A\npub fn made() -> A = A\npub fn A::go(a: A) -> Int = ".concat(
+              source_text: b"pub type A = | A\npub fn made() -> A = A\npub fn A::go(a: A) -> Int = ".concat(
                 low,
               ),
             },
-            { name: b"side", src: b"pub type B = | B\npub fn B::go(b: B) -> Int = ".concat(side) },
+            {
+              name: b"side",
+              source_text: b"pub type B = | B\npub fn B::go(b: B) -> Int = ".concat(side),
+            },
             {
               name: b"m",
-              src: b"import low\npub fn f() -> Int = low::made().go()\npub fn g() -> Int = low::A::go(low::made())",
+              source_text: b"import low\npub fn f() -> Int = low::made().go()\npub fn g() -> Int = low::A::go(low::made())",
             },
           ]),
         ),
@@ -1932,19 +1977,19 @@ test "a definition's hash follows each function a method call on a value may res
 test "a body that compares, digests or shows a value references the functions that implement those operations for containers" {
   let prelude = {
     name: prelude_module(),
-    src: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = if full(1) { xs } else { xs }\nfn full(n: Int) -> Bool = n == 32\n",
+    source_text: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = if full(1) { xs } else { xs }\nfn full(n: Int) -> Bool = n == 32\n",
   };
   let hashes = hash_index(
     index_sources([
       prelude,
-      { name: b"std.value", src: b"pub extern fn shown<a>(x: a) -> Bool\n" },
+      { name: b"std.value", source_text: b"pub extern fn shown<a>(x: a) -> Bool\n" },
       {
         name: b"m",
-        src: b"import std.value (shown)\npub fn same(a: Int, b: Int) -> Bool = a != b\npub fn hashed(a: Int) -> Bytes = digest(a)\npub fn told(a: Int) -> Bool = shown(a)\npub fn less(a: Int, b: Int) -> Bool = a < b\n",
+        source_text: b"import std.value (shown)\npub fn same(a: Int, b: Int) -> Bool = a != b\npub fn hashed(a: Int) -> Bytes = digest(a)\npub fn told(a: Int) -> Bool = shown(a)\npub fn less(a: Int, b: Int) -> Bool = a < b\n",
       },
       {
         name: b"n",
-        src: b"fn digest(a: Int) -> Bytes = b\"\"\npub fn own(a: Int) -> Bytes = digest(a)\n",
+        source_text: b"fn digest(a: Int) -> Bytes = b\"\"\npub fn own(a: Int) -> Bytes = digest(a)\n",
       },
     ]),
   );
@@ -1960,7 +2005,7 @@ test "a body that compares, digests or shows a value references the functions th
   assert_eq(references_in(hashes, FunctionNamed(b"n.own")), [
     { name: b"n.digest", declaration: false },
   ]);
-  assert_eq(reached_functions(hashes, [FunctionNamed(b"m.same")]).keys(), [
+  assert_eq(reachable_functions(hashes, [FunctionNamed(b"m.same")]).keys(), [
     b"m.same",
     b"std.prelude.List::at",
     b"std.prelude.List::push",
@@ -2053,8 +2098,8 @@ test "a call that omits an argument whose default is a function in the same modu
   let left = b"fn triple(x: Int) -> Int = x * 3\nfn inner(x: Int, f: (Int) -> Int = triple) -> Int = f(x)\nfn caller() -> Int = inner(1)";
   let written = left.replace(b"inner(1)", b"inner(1, triple)");
   assert_eq(
-    dumped_hash(hash_dump([{ name: b"m", src: left }]), b"m.caller"),
-    dumped_hash(hash_dump([{ name: b"m", src: written }]), b"m.caller"),
+    dumped_hash(hash_dump([{ name: b"m", source_text: left }]), b"m.caller"),
+    dumped_hash(hash_dump([{ name: b"m", source_text: written }]), b"m.caller"),
   )
 }
 
@@ -2062,14 +2107,15 @@ test "a parameter marked `keep` hashes differently from the same parameter witho
   let borrowed = b"fn hold(f: (Int) -> Int) -> Int = f(1)";
   let keep_marked = b"fn hold(f: keep (Int) -> Int) -> Int = f(1)";
   assert(
-    dumped_hash(hash_dump([{ name: b"m", src: borrowed }]), b"m.hold")
-      != dumped_hash(hash_dump([{ name: b"m", src: keep_marked }]), b"m.hold"),
+    dumped_hash(hash_dump([{ name: b"m", source_text: borrowed }]), b"m.hold")
+      != dumped_hash(hash_dump([{ name: b"m", source_text: keep_marked }]), b"m.hold"),
     None,
   )
 }
 
 test "a parameter with a `space` annotation hashes differently from one without, whatever the space is called" {
-  let hash = |source: Bytes| dumped_hash(hash_dump([{ name: b"m", src: source }]), b"m.each");
+  let hash = |source: Bytes|
+    dumped_hash(hash_dump([{ name: b"m", source_text: source }]), b"m.each");
   let plain = hash(b"fn each(f: (Int) -> Int) -> Int = f(1)");
   let named = hash(b"fn each(f: (Int) -> Int space s) -> Int = f(1)");
   assert(plain != named, None);
@@ -2082,7 +2128,7 @@ test "a type's hash covers the arithmetic operations the type declares" {
       index_sources([
         {
           name: b"m",
-          src: Bytes::concat_all([
+          source_text: Bytes::concat_all([
             b"pub type N = | N(Int)\n",
             stated,
             b"fn add(a: N, b: N) -> N = match a { N(x) -> match b { N(y) -> N(",
@@ -2113,7 +2159,7 @@ test "a type's hash changes with its `key` and `show` declarations, and so do th
           index_sources([
             {
               name: b"m",
-              src: Bytes::concat_all([
+              source_text: Bytes::concat_all([
                 b"pub type Box = | Box(Int, Int)\n",
                 stated,
                 b"fn area(b: Box) -> Int = match b { Box(w, h) -> ",
@@ -2145,18 +2191,18 @@ test "a type's hash changes with its `key` and `show` declarations, and so do th
 
 test "reading each module's saved hash record finds the same functions, with the same hashes, that each test depends on" {
   let index = index_sources([
-    { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
+    { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"" },
     {
       name: b"std.cases",
-      src: b"pub type Table<a> = List<a>\npub fn listed<a>(t: List<a>, l: (a) -> String) -> List<String> = t.map(l)\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a = panic(\"\")",
+      source_text: b"pub type Table<a> = List<a>\npub fn listed<a>(t: List<a>, l: (a) -> String) -> List<String> = t.map(l)\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a = panic(\"\")",
     },
     {
       name: b"low",
-      src: b"pub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn unused() -> Int = 7\n",
+      source_text: b"pub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn unused() -> Int = 7\n",
     },
     {
       name: b"app",
-      src: b"import low\ntype Amount = | Cents(Int)\nfn Amount(n: Int) -> Int = n\nfn table() -> List<Int> = [Amount(2)]\nfn held(n: Int) -> Bool = low::even(n)\nfn cents(a: Amount) -> Int = match a { Cents(c) -> c }\ntest \"plain\" { assert_eq(cents(Cents(2)), 2) }\ntest \"case {n}\" for n: Int in table() { assert(held(n)) }\n",
+      source_text: b"import low\ntype Amount = | Cents(Int)\nfn Amount(n: Int) -> Int = n\nfn table() -> List<Int> = [Amount(2)]\nfn held(n: Int) -> Bool = low::even(n)\nfn cents(a: Amount) -> Int = match a { Cents(c) -> c }\ntest \"plain\" { assert_eq(cents(Cents(2)), 2) }\ntest \"case {n}\" for n: Int in table() { assert(held(n)) }\n",
     },
   ]);
   let h = hash_index(index);

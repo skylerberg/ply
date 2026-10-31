@@ -1,5 +1,5 @@
 import compiler.check.infer.names (simple_name_of)
-import compiler.emit.code (Code, CodeVar, NDefinition, NConstructor, NBuiltin, CodeKnownLambda,
+import compiler.emit.code (Code, CodeVariable, NDefinition, NConstructor, NBuiltin, CodeKnownLambda,
                            CodeLambda, CodeApply, CodeUnary, CodeBinary, CodeFieldRead, CodeIf,
                            CodeBlock, CodeList, CodeRecord, CodeUpdate, CodeMatch, CodePerform,
                            CodeSimulate, CodeParallel, CodeHandle, Lambda, Capture, CodeStatement,
@@ -21,24 +21,25 @@ import compiler.emit.representations (Definition, Imported, EmitParam, BoundLamb
                                       layout_key, known_layout)
 import compiler.emit.layout (Pointer, classes, OfMap, MapRoot, MapHeight, NodeCount, NodeKey,
                              NodeValue)
-import compiler.emit.typed_ir.containers (ContainerOp, NodeIntrinsic, Length)
+import compiler.emit.typed_ir.containers (ContainerOperation, NodeIntrinsic, Length)
 import compiler.emit.output (Layout, Exact)
 import compiler.emit.release (released_variables)
-import compiler.check.known (list_item, map_parts, map_node_type, iter_parts, some_constructor,
+import compiler.check.known (list_item, map_parts, map_node_type, iterator_parts, some_constructor,
                              continue_constructor, stop_constructor)
 import compiler.emit.keys (RootKey, InlinedLambda, Named, Specialisation, Test, KeyType, KeyLayout,
                            Callee, Root, Generic, Evidence, root_name, root_text, definition_of,
                            key_types, key_effects, unspecialised, specialisation_key)
 import compiler.emit.typed_ir
 import compiler.emit.typed_ir (reps_of, owned_params, Representation, AsInt, AsBool, AsWord,
-                               AsListView, AsSum, AsUnit, AsImmediate, Var, Arg, VarOperand,
-                               IntOperand, ZeroOperand, no_closure_evidence, OwnedParam, Convention,
-                               Rvalue, Primitive, Allocate, Get, Aggregate, Convert, Native, Op,
-                               OfCalling, ClosureAllocation, CapturePath, CasePath, TagTest,
-                               IntTest, Call, Apply, Inst, Let, Do, Declaration, Assign, If, Case,
-                               Match, Loop, Next, Done, Restart, Jump, Return, Fail, NoMatchingArm,
-                               SiteScope, Block, Fn, FnKind, Metered, Plain, Member, Closure,
-                               no_links, falls_through, operand_representation, is_refcounted,
+                               AsListView, AsSum, AsUnit, AsImmediate, Variable, Arg,
+                               VariableOperand, IntOperand, ZeroOperand, no_closure_evidence,
+                               OwnedParam, Convention, Rvalue, Primitive, Allocate, Get, Aggregate,
+                               Convert, Native, OperationCall, OfCalling, ClosureAllocation,
+                               CapturePath, CasePath, TagTest, IntTest, Call, Apply, Instruction,
+                               Let, Do, Declaration, Assign, If, Case, Match, Loop, Next, Done,
+                               Restart, Jump, Return, Fail, NoMatchingArm, SiteScope, Block,
+                               Function, FunctionKind, Metered, Plain, Member, Closure, no_links,
+                               falls_through, operand_representation, is_refcounted,
                                StackAllocation, OfHandling, OfContainers)
 import compiler.emit.typed_ir.calling (ConstantRead)
 import compiler.emit.typed_ir.handling (Entering, CurrentSite)
@@ -56,7 +57,7 @@ import compiler.emit.lower.base (Context, Lowering, LoweredValue, Target, ToCons
                                  type_of, represented_as, note_slot_read, read_note, capture_note,
                                  note_frame_entry, retyped, with_need, no_captured_evidence,
                                  EvidenceValues, listed_evidence_values, evidence_values_of,
-                                 substitute_evidence_vars, exit_block)
+                                 substitute_evidence_variables, exit_block)
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read,
                                        empty_list_with_capacity, intrinsic_call)
@@ -117,7 +118,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
     label_values: [],
     evidence_arguments: [],
     instance: None,
-    kept: [],
+    retained_arguments: [],
     performs: r.performs,
   });
   { ..context, tails: Restarts(tail_parameter_representations(context)) }
@@ -202,7 +203,7 @@ fn call_signature_at(
           params: ints(d.witnesses).concat(f.params.map(|t: Type| substituted(t, at))).concat(
             ints(d.arity - d.witnesses - f.params.len()),
           ),
-          result: substituted(f.ret, at),
+          result: substituted(f.return_type, at),
         })
       },
       _ -> None,
@@ -221,7 +222,7 @@ fn specialised_variables(
         match args.at(j) { Some(t) -> !has_variables(t), None -> false });
       specialised_among(
         s,
-        if arity > 0 { f.params.push(f.ret) } else { f.params },
+        if arity > 0 { f.params.push(f.return_type) } else { f.params },
         args,
         known_lambda_read,
         known_lambda_read.len(),
@@ -283,9 +284,11 @@ fn recurses_on_rest(context: Context, c: Code, i: Int) -> Bool / {abort.raise} =
     CodeIf(x) ->
       recurses_on_rest(context, x.then_branch, i) || recurses_on_rest(context, x.else_branch, i),
     CodeBlock(b) -> match b.tail { Some(t) -> recurses_on_rest(context, t, i), None -> false },
-    CodeBinary(b) -> (b.op == b"and" || b.op == b"or") && recurses_on_rest(context, b.rhs, i),
+    CodeBinary(b) ->
+      (b.operation == b"and" || b.operation == b"or")
+        && recurses_on_rest(context, b.right_operand, i),
     CodeMatch(m) -> {
-      let on_param = match m.scrutinee.node { CodeVar(v) -> v.slot == i, _ -> false };
+      let on_param = match m.scrutinee.node { CodeVariable(v) -> v.slot == i, _ -> false };
       m.arms.fold(false, |found: Bool, a: CodeArm|
         found || recurses_on_rest(context, a.body, i)
           || (on_param
@@ -305,7 +308,7 @@ fn self_call_passes_slot(context: Context, c: Code, i: Int, r: Int) -> Bool / {a
     CodeApply(a) ->
       a.args.len() == context.params.len()
         && (match a.args.at(i) {
-          Some(x) -> match x.node { CodeVar(v) -> v.slot == r, _ -> false },
+          Some(x) -> match x.node { CodeVariable(v) -> v.slot == r, _ -> false },
           None -> false,
         })
         && (match target(context, a.function, a.args) {
@@ -320,7 +323,8 @@ fn self_call_passes_slot(context: Context, c: Code, i: Int, r: Int) -> Bool / {a
       None -> false,
     },
     CodeBinary(b) ->
-      (b.op == b"and" || b.op == b"or") && self_call_passes_slot(context, b.rhs, i, r),
+      (b.operation == b"and" || b.operation == b"or")
+        && self_call_passes_slot(context, b.right_operand, i, r),
     CodeMatch(m) ->
       m.arms.fold(false, |found: Bool, a: CodeArm|
         found || self_call_passes_slot(context, a.body, i, r)),
@@ -336,7 +340,7 @@ pub fn target(
     CodeKnownLambda(k) -> if !k.in_place || frame_of(context, k.owner, k.nth) == None {
       Some(ToValue)
     } else { Some(ToInlinedBody(KnownLambda)) },
-    CodeVar(_) -> Some(ToValue),
+    CodeVariable(_) -> Some(ToValue),
     NConstructor(c) -> Some(ToConstructor(c.name)),
     NDefinition(f) -> match defined(context, f.full) {
       Some(d) -> match walk_of(context, d, function, args) {
@@ -417,8 +421,8 @@ fn walk_types(d: NamedDefinition, function: Code) -> Option<{ over: List<Type>, 
     Some(scheme) -> match substituted_fully(scheme.ty, reference_args(function)) {
       FunctionType(f) -> match f.params.at(0) {
         Some(t) -> match ((list_item(t), map_parts(t))) {
-          (Some(item), _) -> Some({ over: [item], held: f.ret }),
-          (_, Some(m)) -> Some({ over: [m.key, m.value], held: f.ret }),
+          (Some(item), _) -> Some({ over: [item], held: f.return_type }),
+          (_, Some(m)) -> Some({ over: [m.key, m.value], held: f.return_type }),
           _ -> None,
         },
         _ -> None,
@@ -506,7 +510,7 @@ pub fn global_value(
         context,
         st,
         match target(o.context, function, []) {
-          Some(ToConstructor(c)) -> constructed(o.context, o.st, c, params, f.ret, at),
+          Some(ToConstructor(c)) -> constructed(o.context, o.st, c, params, f.return_type, at),
           Some(ToDefinition(full_name)) ->
             called(o.context, o.st, full_name, function, [], params, false, at),
           Some(ToBuiltin(b)) -> called_builtin(o.context, o.st, b, params, function, at),
@@ -539,9 +543,9 @@ pub fn continuation_closure(
         let frame = {
           params: n,
           size: n + 1,
-          captures: [{ src: slot, destination: n }],
+          captures: [{ source: slot, destination: n }],
           resumes: None,
-          body: { node: CodeVar({ name: b"resume", slot: n }), span: at, ty: t },
+          body: { node: CodeVariable({ name: b"resume", slot: n }), span: at, ty: t },
           ty: f,
           words: effects_evidence(f.effects, context.effect_evidence, context.labels),
           captured_evidence: no_captured_evidence(),
@@ -646,7 +650,7 @@ pub fn known_applied(
 ) -> LoweredValue / {abort.raise} = {
   let wanted = match ((frame_of(context, k.owner, k.nth), f)) {
     (Some(None), _) -> effects_evidence(k.lambda.effects, context.effect_evidence, context.labels),
-    (Some(Some(_)), VarOperand(v)) -> param_wanted(context, v),
+    (Some(Some(_)), VariableOperand(v)) -> param_wanted(context, v),
     _ -> effects_evidence(effects, context.effect_evidence, context.labels),
   };
   applied_wanting(context, st, f, args, wanted, tail, at)
@@ -666,7 +670,7 @@ fn applied_wanting(
       unreachable(b"a function value called with another arity")
     } else {
       let reps = t.params.map(|p: Type| representation_of(context.setting, p));
-      let result = representation_of(context.setting, t.ret);
+      let result = representation_of(context.setting, t.return_type);
       let e = wanted_evidence_arguments(
         context,
         note_parameter_called(context, note_function_layout(st, FunctionType(t)), f),
@@ -677,7 +681,7 @@ fn applied_wanting(
       let h = all_represented_as(e.st, args.concat(e.args), all, at);
       bound_as(
         h.st,
-        t.ret,
+        t.return_type,
         result,
         Apply({
           f: f,
@@ -689,7 +693,7 @@ fn applied_wanting(
             returned: typed_ir::OwnedResult,
           },
           suspends: true,
-          closure: match f { VarOperand(v) -> st.closures.get(v.id), _ -> None },
+          closure: match f { VariableOperand(v) -> st.closures.get(v.id), _ -> None },
         }),
         at,
       )
@@ -702,8 +706,8 @@ fn applied_wanting(
           let e = function_value_evidence(context, h.st, k.effects, at);
           run_for_effect(
             e.st,
-            Op({
-              op: OfHandling(Entering),
+            OperationCall({
+              operation: OfHandling(Entering),
               args: e.args,
               uses: { takes: [false, false], owned: false, fails: false, suspends: false },
             }),
@@ -742,8 +746,8 @@ fn applied_wanting(
 fn note_function_layout(st: Lowering, t: Type) -> Lowering =
   type_variables(t).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Layout }))
 
-fn note_capture_releases(st: Lowering, captures: List<Var>) -> Lowering =
-  captures.fold(st, |s: Lowering, v: Var|
+fn note_capture_releases(st: Lowering, captures: List<Variable>) -> Lowering =
+  captures.fold(st, |s: Lowering, v: Variable|
     released_variables(v.ty).fold(s, |q: Lowering, x: Int| with_need(q, { var: x, reads: Exact })))
 
 pub type InPlaceArgs = { args: List<Option<Arg>>, range: Option<{ lo: Arg, hi: Arg }> }
@@ -753,7 +757,7 @@ pub type Entered = { context: Context, st: Lowering, looped: LoopKind }
 pub type LoopKind =
   | NotLooped
   | StepLoop(StepVariables)
-  | WalkLoop({ walk: Walk, vars: WalkVariables, entry: Option<MapWalkVariables> })
+  | WalkLoop({ walk: Walk, variables: WalkVariables, entry: Option<MapWalkVariables> })
 
 pub fn enter_inlined(
   context: Context,
@@ -842,12 +846,12 @@ fn enter_walk(
           enter_block(made.st),
           Let({
             var: v.item,
-            value: Primitive({ op: b"add", on: AsInt, args: [r.lo, VarOperand(v.at)] }),
+            value: Primitive({ operation: b"add", on: AsInt, args: [r.lo, VariableOperand(v.at)] }),
             at: at,
             unwind: [],
           }),
         ),
-        args: [VarOperand(v.item)],
+        args: [VariableOperand(v.item)],
         entry: None,
       }
     },
@@ -862,8 +866,8 @@ fn enter_walk(
         },
         _ ->
           {
-            st: item_read_into(enter_block(made.st), xs, VarOperand(v.at), v.item, at),
-            args: [VarOperand(v.item)],
+            st: item_read_into(enter_block(made.st), xs, VariableOperand(v.at), v.item, at),
+            args: [VariableOperand(v.item)],
             entry: None,
           },
       }
@@ -871,8 +875,8 @@ fn enter_walk(
     _ -> unreachable(b"a loop over a value that is not a list"),
   };
   let params = match w.kind {
-    Folding -> [VarOperand(v.accumulator)].concat(read.args),
-    EntryFolding -> [VarOperand(v.accumulator)].concat(read.args),
+    Folding -> [VariableOperand(v.accumulator)].concat(read.args),
+    EntryFolding -> [VariableOperand(v.accumulator)].concat(read.args),
     _ -> read.args,
   };
   let o = match f.node {
@@ -882,17 +886,17 @@ fn enter_walk(
     CodeLambda(l) -> enter_inlined_lambda(context, read.st, l, params, at),
     _ -> enter_inlined_lambda(context, read.st, named_lambda(f, params.len()), params, at),
   };
-  { context: o.context, st: o.st, looped: WalkLoop({ walk: w, vars: v, entry: read.entry }) }
+  { context: o.context, st: o.st, looped: WalkLoop({ walk: w, variables: v, entry: read.entry }) }
 }
 
 pub type MapWalkVariables = {
-  node: Var,
-  i: Var,
-  leaf: Var,
-  place: Var,
-  root: Var,
-  height: Var,
-  len: Var,
+  node: Variable,
+  i: Variable,
+  leaf: Variable,
+  place: Variable,
+  root: Variable,
+  height: Variable,
+  len: Variable,
 }
 
 fn map_traversal_variables(
@@ -932,12 +936,19 @@ fn entry_read(
   w: Walk,
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } / {abort.raise} = {
-  let count = intrinsic_call(context, st, OfMap(NodeCount), [VarOperand(e.node)], int_type(), at);
+  let count = intrinsic_call(
+    context,
+    st,
+    OfMap(NodeCount),
+    [VariableOperand(e.node)],
+    int_type(),
+    at,
+  );
   let inside = bound_as(
     count.st,
     bool_type(),
     AsBool,
-    Primitive({ op: b"lt", on: AsInt, args: [VarOperand(e.i), count.arg] }),
+    Primitive({ operation: b"lt", on: AsInt, args: [VariableOperand(e.i), count.arg] }),
     at,
   );
   let joining = emitted(emitted(inside.st, Declaration(e.leaf)), Declaration(e.place));
@@ -946,7 +957,7 @@ fn entry_read(
     enter_block(joining),
     b"node_max",
     w.over,
-    [VarOperand(e.node), IntOperand(0)],
+    [VariableOperand(e.node), IntOperand(0)],
     at,
   );
   let above = prelude_called(
@@ -954,25 +965,25 @@ fn entry_read(
     greatest.st,
     b"leaf_above",
     w.over,
-    [VarOperand(e.root), VarOperand(e.height), greatest.arg],
+    [VariableOperand(e.root), VariableOperand(e.height), greatest.arg],
     at,
   );
   let found = some_payload_read(context, enter_block(above.st), above.arg, map_node(w), at);
   let next = emitted(
     exit_block(above.st, found.st),
     Case({
-      on: match above.arg { VarOperand(x) -> x, _ -> e.leaf },
+      on: match above.arg { VariableOperand(x) -> x, _ -> e.leaf },
       test: TagTest(cases_of(above.arg)),
       arms: [
         {
           when: some_case(above.arg),
-          body: found.st.insts.concat([
+          body: found.st.instructions.concat([
             Assign({ var: e.leaf, arg: found.arg }),
             Assign({ var: e.place, arg: IntOperand(0) }),
           ]),
         },
       ],
-      rest: [Done(VarOperand(v.accumulator))],
+      rest: [Done(VariableOperand(v.accumulator))],
     }),
   );
   let read = emitted(
@@ -980,17 +991,17 @@ fn entry_read(
     If({
       cond: inside.arg,
       then: [
-        Assign({ var: e.leaf, arg: VarOperand(e.node) }),
-        Assign({ var: e.place, arg: VarOperand(e.i) }),
+        Assign({ var: e.leaf, arg: VariableOperand(e.node) }),
+        Assign({ var: e.place, arg: VariableOperand(e.i) }),
       ],
-      otherwise: next.insts,
+      otherwise: next.instructions,
     }),
   );
   let key = intrinsic_call(
     context,
     read,
     OfMap(NodeKey),
-    [VarOperand(e.leaf), VarOperand(e.place)],
+    [VariableOperand(e.leaf), VariableOperand(e.place)],
     w.over.get(0),
     at,
   );
@@ -998,7 +1009,7 @@ fn entry_read(
     context,
     key.st,
     OfMap(NodeValue),
-    [VarOperand(e.leaf), VarOperand(e.place)],
+    [VariableOperand(e.leaf), VariableOperand(e.place)],
     w.over.get(1),
     at,
   );
@@ -1031,12 +1042,12 @@ fn some_payload_read(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let v = fresh(st, ty, representation_of(context.setting, ty));
-  { st: some_bound(v.st, o, v.var, at), arg: VarOperand(v.var) }
+  { st: some_bound(v.st, o, v.var, at), arg: VariableOperand(v.var) }
 }
 
-fn some_bound(st: Lowering, o: Arg, into: Var, at: Span) -> Lowering / {abort.raise} =
+fn some_bound(st: Lowering, o: Arg, into: Variable, at: Span) -> Lowering / {abort.raise} =
   match ((o, operand_representation(o))) {
-    (VarOperand(x), AsSum(s)) -> match case_argument_offset(s.layout, some_case(o), 0) {
+    (VariableOperand(x), AsSum(s)) -> match case_argument_offset(s.layout, some_case(o), 0) {
       Some(word) ->
         emitted(
           st,
@@ -1068,7 +1079,7 @@ fn enter_inlined_lambda(
   let t = l.ty;
   let inner = {
     ..context,
-    result_type: t.ret,
+    result_type: t.return_type,
     frame_span: l.at,
     captured: l.captures.map(|c: Capture| c.destination),
   };
@@ -1089,7 +1100,7 @@ fn enter_inlined_lambda(
   match l.captures.fold(Some(taken.env), |accumulator: Option<Map<Int, Arg>>, cap: Capture|
       match accumulator {
         None -> None,
-        Some(m) -> match st.env.get(cap.src) {
+        Some(m) -> match st.env.get(cap.source) {
           Some(a) -> Some(m.insert(cap.destination, a)),
           None -> None,
         },
@@ -1118,13 +1129,13 @@ fn frame_of(context: Context, owner: Bytes, nth: Int) -> Option<Option<BoundLamb
     }
   }
 
-fn slot_variable(st: Lowering, slot: Int) -> Option<Var> =
-  match st.env.get(slot) { Some(VarOperand(v)) -> Some(v), _ -> None }
+fn slot_variable(st: Lowering, slot: Int) -> Option<Variable> =
+  match st.env.get(slot) { Some(VariableOperand(v)) -> Some(v), _ -> None }
 
 fn inlined_in_frame(
   context: Context,
   st: Lowering,
-  f: Option<Var>,
+  f: Option<Variable>,
   k: KnownLambdaCall,
   lowered: List<Option<Arg>>,
   defining_frame: Option<BoundLambda>,
@@ -1158,7 +1169,7 @@ fn inlined_in_frame(
       );
       let inner = {
         ..context,
-        result_type: typed.ret,
+        result_type: typed.return_type,
         frame_span: k.lambda.at,
         captured: k.lambda.captures.map(|c: Capture| c.destination),
         words: match defining_frame {
@@ -1184,7 +1195,7 @@ fn inlined_in_frame(
     },
   }
 
-fn parameter_function_words(context: Context, closure: Var) -> List<EvidenceWord> = {
+fn parameter_function_words(context: Context, closure: Variable) -> List<EvidenceWord> = {
   let wanted = param_wanted(context, closure);
   let words = evidence_for(context, wanted);
   range(0, wanted.len()).fold([], |accumulator: List<EvidenceWord>, i: Int|
@@ -1195,7 +1206,7 @@ fn parameter_function_words(context: Context, closure: Var) -> List<EvidenceWord
     })
 }
 
-fn param_wanted(context: Context, closure: Var) -> List<EffectsEvidence> =
+fn param_wanted(context: Context, closure: Variable) -> List<EffectsEvidence> =
   match context.parameter_positions.get(closure.id) {
     Some(p) -> match context.param_effects.at(p) {
       Some(Some(r)) -> effects_evidence(r, context.effect_evidence, context.labels),
@@ -1215,7 +1226,7 @@ pub fn exit_inlined(
   match enter_inlined.looped {
     NotLooped ->
       {
-        st: end_site_scope(enter_inlined.st.insts, before.insts.len(), {
+        st: end_site_scope(enter_inlined.st.instructions, before.instructions.len(), {
           ..body.st,
           env: before.env,
         }),
@@ -1223,8 +1234,8 @@ pub fn exit_inlined(
       },
     WalkLoop(w) -> match w.entry {
       Some(e) ->
-        exit_map_walk(context, before, enter_inlined, body, lowered, w.walk, w.vars, e, at),
-      None -> exit_walk(context, before, enter_inlined, body, lowered, w.walk, w.vars, at),
+        exit_map_walk(context, before, enter_inlined, body, lowered, w.walk, w.variables, e, at),
+      None -> exit_walk(context, before, enter_inlined, body, lowered, w.walk, w.variables, at),
     },
     StepLoop(v) -> match ((lowered.args.at(0), lowered.args.at(1))) {
       (Some(Some(seed)), Some(Some(budget))) -> {
@@ -1235,12 +1246,15 @@ pub fn exit_inlined(
           next: body.st.next,
           at: at,
         };
-        let pass = match fused(body.st.insts, body.arg, ended) {
+        let pass = match fused(body.st.instructions, body.arg, ended) {
           Some(f) -> f,
-          None -> iter_tested(context, body.st.insts, body.arg, ended),
+          None -> iterator_step_tested(context, body.st.instructions, body.arg, ended),
         };
         let seeded = represented_as(
-          { st: { ..body.st, insts: before.insts, env: before.env, next: pass.next }, arg: seed },
+          {
+            st: { ..body.st, instructions: before.instructions, env: before.env, next: pass.next },
+            arg: seed,
+          },
           v.state.representation,
           at,
         );
@@ -1253,7 +1267,7 @@ pub fn exit_inlined(
               result: v.result,
             }),
           ),
-          arg: VarOperand(v.result),
+          arg: VariableOperand(v.result),
         }
       },
       _ -> unreachable(b"a step with no seed or no budget"),
@@ -1261,11 +1275,11 @@ pub fn exit_inlined(
   }
 
 fn end_site_scope(instructions: Block, from: Int, back: Lowering) -> Lowering =
-  if instructions.drop(from).any(|i: Inst| match i { SiteScope(Some(_)) -> true, _ -> false }) {
-    emitted(back, SiteScope(None))
-  } else { back }
+  if instructions.drop(from).any(|i: Instruction|
+      match i { SiteScope(Some(_)) -> true, _ -> false }) { emitted(back, SiteScope(None)) }
+  else { back }
 
-pub type WalkVariables = { at: Var, accumulator: Var, result: Var, item: Var }
+pub type WalkVariables = { at: Variable, accumulator: Variable, result: Variable, item: Variable }
 
 fn walk_variables(
   context: Context,
@@ -1290,19 +1304,26 @@ fn exit_walk(
   v: WalkVariables,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let outside = |s: Lowering| { ..s, insts: before.insts, env: before.env };
-  let back = end_site_scope(enter_inlined.st.insts, 0, { ..body.st, env: before.env });
+  let outside = |s: Lowering| { ..s, instructions: before.instructions, env: before.env };
+  let back = end_site_scope(enter_inlined.st.instructions, 0, { ..body.st, env: before.env });
   let after = bound_as(
     back,
     int_type(),
     AsInt,
-    Primitive({ op: b"add", on: AsInt, args: [VarOperand(v.at), IntOperand(1)] }),
+    Primitive({ operation: b"add", on: AsInt, args: [VariableOperand(v.at), IntOperand(1)] }),
     at,
   );
   let went = |s: Lowering, next_value: Arg| emitted(s, Next([after.arg, next_value]));
   let item = match w.kind {
     Mapping -> {
-      let o = list_push(context, after.st, VarOperand(v.accumulator), body.arg, w.accumulator, at);
+      let o = list_push(
+        context,
+        after.st,
+        VariableOperand(v.accumulator),
+        body.arg,
+        w.accumulator,
+        at,
+      );
       went(o.st, o.arg)
     },
     Filtering -> {
@@ -1310,8 +1331,8 @@ fn exit_walk(
       let o = list_push(
         context,
         enter_block(k.st),
-        VarOperand(v.accumulator),
-        VarOperand(v.item),
+        VariableOperand(v.accumulator),
+        VariableOperand(v.item),
         w.accumulator,
         at,
       );
@@ -1319,8 +1340,8 @@ fn exit_walk(
         exit_block(k.st, o.st),
         If({
           cond: k.arg,
-          then: went(o.st, o.arg).insts,
-          otherwise: [Next([after.arg, VarOperand(v.accumulator)])],
+          then: went(o.st, o.arg).instructions,
+          otherwise: [Next([after.arg, VariableOperand(v.accumulator)])],
         }),
       )
     },
@@ -1341,14 +1362,14 @@ fn exit_walk(
     let pass = [
       Let({
         var: ended.var,
-        value: Primitive({ op: b"ge", on: AsInt, args: [VarOperand(v.at), n] }),
+        value: Primitive({ operation: b"ge", on: AsInt, args: [VariableOperand(v.at), n] }),
         at: at,
         unwind: [],
       }),
       If({
-        cond: VarOperand(ended.var),
-        then: [Done(VarOperand(v.accumulator))],
-        otherwise: item.insts,
+        cond: VariableOperand(ended.var),
+        then: [Done(VariableOperand(v.accumulator))],
+        otherwise: item.instructions,
       }),
     ];
     {
@@ -1360,7 +1381,7 @@ fn exit_walk(
           result: v.result,
         }),
       ),
-      arg: VarOperand(v.result),
+      arg: VariableOperand(v.result),
     }
   };
   match ((w.ranged, lowered.args.at(0), lowered.range)) {
@@ -1370,7 +1391,7 @@ fn exit_walk(
           s,
           int_type(),
           AsInt,
-          Primitive({ op: b"sub", on: AsInt, args: [hi, lo] }),
+          Primitive({ operation: b"sub", on: AsInt, args: [hi, lo] }),
           at,
         );
         looped(n.st, n.arg)
@@ -1394,20 +1415,20 @@ fn exit_map_walk(
   e: MapWalkVariables,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let outside = |s: Lowering| { ..s, insts: before.insts, env: before.env };
-  let back = end_site_scope(enter_inlined.st.insts, 0, { ..body.st, env: before.env });
-  let plus_one = |s: Lowering, x: Var|
+  let outside = |s: Lowering| { ..s, instructions: before.instructions, env: before.env };
+  let back = end_site_scope(enter_inlined.st.instructions, 0, { ..body.st, env: before.env });
+  let plus_one = |s: Lowering, x: Variable|
     bound_as(
       s,
       int_type(),
       AsInt,
-      Primitive({ op: b"add", on: AsInt, args: [VarOperand(x), IntOperand(1)] }),
+      Primitive({ operation: b"add", on: AsInt, args: [VariableOperand(x), IntOperand(1)] }),
       at,
     );
   let done_next = plus_one(back, v.at);
   let place_next = plus_one(done_next.st, e.place);
   let h = represented_as({ st: place_next.st, arg: body.arg }, v.accumulator.representation, at);
-  let item = emitted(h.st, Next([done_next.arg, VarOperand(e.leaf), place_next.arg, h.arg]));
+  let item = emitted(h.st, Next([done_next.arg, VariableOperand(e.leaf), place_next.arg, h.arg]));
   match ((lowered.args.at(0), lowered.args.at(1))) {
     (Some(Some(m)), Some(Some(init))) -> {
       let seed = represented_as({ st: outside(item), arg: init }, v.accumulator.representation, at);
@@ -1420,8 +1441,8 @@ fn exit_map_walk(
         at,
       );
       let result = fresh(root.st, w.accumulator, representation_of(context.setting, w.accumulator));
-      let reads = |operation: ContainerOp|
-        Op({ op: OfContainers(operation), args: [m], uses: typed_ir::reads(1) });
+      let reads = |operation: ContainerOperation|
+        OperationCall({ operation: OfContainers(operation), args: [m], uses: typed_ir::reads(1) });
       let opened_root = emitted(
         some_bound(enter_block(result.st), root.arg, e.root, at),
         Let({ var: e.height, value: reads(NodeIntrinsic(OfMap(MapHeight))), at: at, unwind: [] }),
@@ -1431,7 +1452,7 @@ fn exit_map_walk(
         opened_root,
         b"first_leaf",
         w.over,
-        [VarOperand(e.root), VarOperand(e.height)],
+        [VariableOperand(e.root), VariableOperand(e.height)],
         at,
       );
       let measured = emitted(
@@ -1442,14 +1463,18 @@ fn exit_map_walk(
       let pass = [
         Let({
           var: ended.var,
-          value: Primitive({ op: b"ge", on: AsInt, args: [VarOperand(v.at), VarOperand(e.len)] }),
+          value: Primitive({
+            operation: b"ge",
+            on: AsInt,
+            args: [VariableOperand(v.at), VariableOperand(e.len)],
+          }),
           at: at,
           unwind: [],
         }),
         If({
-          cond: VarOperand(ended.var),
-          then: [Done(VarOperand(v.accumulator))],
-          otherwise: item.insts,
+          cond: VariableOperand(ended.var),
+          then: [Done(VariableOperand(v.accumulator))],
+          otherwise: item.instructions,
         }),
       ];
       let looped = emitted(
@@ -1465,20 +1490,20 @@ fn exit_map_walk(
           result: v.result,
         }),
       );
-      let some = emitted(looped, Assign({ var: result.var, arg: VarOperand(v.result) }));
+      let some = emitted(looped, Assign({ var: result.var, arg: VariableOperand(v.result) }));
       match root.arg {
-        VarOperand(r) ->
+        VariableOperand(r) ->
           {
             st: emitted(
               exit_block(emitted(result.st, Declaration(result.var)), some),
               Case({
                 on: r,
                 test: TagTest(cases_of(root.arg)),
-                arms: [{ when: some_case(root.arg), body: some.insts }],
+                arms: [{ when: some_case(root.arg), body: some.instructions }],
                 rest: [Assign({ var: result.var, arg: seed.arg })],
               }),
             ),
-            arg: VarOperand(result.var),
+            arg: VariableOperand(result.var),
           },
         _ -> unreachable(b"the `Map` being folded is not stored in a variable"),
       }
@@ -1543,11 +1568,11 @@ fn enter_step(
             at,
           );
           match l.captures.fold(
-              Some(Map::new().insert(0, VarOperand(v.state))),
+              Some(Map::new().insert(0, VariableOperand(v.state))),
               |accumulator: Option<Map<Int, Arg>>, cap: Capture|
                 match accumulator {
                   None -> None,
-                  Some(m) -> match st.env.get(cap.src) {
+                  Some(m) -> match st.env.get(cap.source) {
                     Some(a) -> Some(m.insert(cap.destination, a)),
                     None -> None,
                   },
@@ -1582,15 +1607,19 @@ fn enter_step(
 
 fn budget_checked(
   st: Lowering,
-  exit_inlined: Var,
+  exit_inlined: Variable,
   budget: Arg,
   at: Span,
-) -> { st: Lowering, spent: Var } = {
+) -> { st: Lowering, spent: Variable } = {
   let c = bound_as(
     st,
     bool_type(),
     AsBool,
-    Primitive({ op: b"le", on: AsInt, args: [VarOperand(exit_inlined), IntOperand(0)] }),
+    Primitive({
+      operation: b"le",
+      on: AsInt,
+      args: [VariableOperand(exit_inlined), IntOperand(0)],
+    }),
     at,
   );
   let k = fresh(c.st, bool_type(), AsBool);
@@ -1601,14 +1630,14 @@ fn budget_checked(
       then: [
         Let({
           var: k.var,
-          value: Primitive({ op: b"ge", on: AsInt, args: [budget, IntOperand(1)] }),
+          value: Primitive({ operation: b"ge", on: AsInt, args: [budget, IntOperand(1)] }),
           at: at,
           unwind: [],
         }),
         Do({
           value: Native({
             name: b"rt_iterate_bad_p",
-            args: [VarOperand(k.var), budget],
+            args: [VariableOperand(k.var), budget],
             uses: budget_failure_uses(),
           }),
           at: at,
@@ -1625,9 +1654,9 @@ fn budget_checked(
       Let({
         var: budget_failure_uses.var,
         value: Primitive({
-          op: b"sub",
+          operation: b"sub",
           on: AsInt,
-          args: [VarOperand(exit_inlined), IntOperand(1)],
+          args: [VariableOperand(exit_inlined), IntOperand(1)],
         }),
         at: at,
         unwind: [],
@@ -1646,7 +1675,7 @@ pub fn iterate_builtin(
 ) -> LoweredValue / {abort.raise} =
   match args {
     [seed, budget, step] -> match match type_of(step) {
-        FunctionType(f) -> iter_of(f.params, f.ret),
+        FunctionType(f) -> iterator_types(f.params, f.return_type),
         _ -> None,
       } {
       None ->
@@ -1654,9 +1683,9 @@ pub fn iterate_builtin(
       Some(t) -> {
         let v = step_variables(context, st, t.state, t.result);
         let begun = budget_checked(enter_block(v.st), v.left, budget, at);
-        let r = applied(context, begun.st, step, [VarOperand(v.state)], effects, false, at);
+        let r = applied(context, begun.st, step, [VariableOperand(v.state)], effects, false, at);
         let exit_inlined = begun.spent;
-        let pass = iter_tested(context, r.st.insts, r.arg, {
+        let pass = iterator_step_tested(context, r.st.instructions, r.arg, {
           state: v.state,
           left: exit_inlined,
           result: v.result,
@@ -1664,7 +1693,7 @@ pub fn iterate_builtin(
           at: at,
         });
         let seeded = represented_as(
-          { st: { ..r.st, insts: st.insts, next: pass.next }, arg: seed },
+          { st: { ..r.st, instructions: st.instructions, next: pass.next }, arg: seed },
           v.state.representation,
           at,
         );
@@ -1677,7 +1706,7 @@ pub fn iterate_builtin(
               result: v.result,
             }),
           ),
-          arg: VarOperand(v.result),
+          arg: VariableOperand(v.result),
         }
       },
     },
@@ -1700,7 +1729,7 @@ pub fn called_builtin(
         performed(
           context,
           st,
-          { effect: b"abort", op: b"raise", resource: b"" },
+          { effect: b"abort", operation: b"raise", resource: b"" },
           None,
           None,
           args,
@@ -1717,61 +1746,63 @@ pub fn called_builtin(
   } else { builtin(context, st, name, args, function, at) }
 }
 
-fn step_typed(l: Lambda) -> Option<{ state: Type, result: Type }> = iter_of(l.ty.params, l.ty.ret)
+fn step_typed(l: Lambda) -> Option<{ state: Type, result: Type }> =
+  iterator_types(l.ty.params, l.ty.return_type)
 
-fn iter_of(params: List<Type>, return_type: Type) -> Option<{ state: Type, result: Type }> =
-  match ((iter_parts(return_type), params)) {
+fn iterator_types(params: List<Type>, return_type: Type) -> Option<{ state: Type, result: Type }> =
+  match ((iterator_parts(return_type), params)) {
     (Some(it), [a]) -> Some({ state: a, result: it.result }),
     _ -> None,
   }
 
 fn function_parts(t: Type, arity: Int) -> Option<{ ty: Type, params: List<Type>, ret: Type }> =
   match t {
-    FunctionType(f) -> if f.params.len() == arity { Some({ ty: t, params: f.params, ret: f.ret }) }
-    else { None },
+    FunctionType(f) -> if f.params.len() == arity {
+      Some({ ty: t, params: f.params, ret: f.return_type })
+    } else { None },
     _ -> None,
   }
 
-pub type StepVariables = { state: Var, left: Var, left_after: Var, result: Var }
+pub type StepVariables = { state: Variable, left: Variable, left_after: Variable, result: Variable }
 
 fn step_variables(
   context: Context,
   st: Lowering,
   state: Type,
   result: Type,
-) -> { st: Lowering, state: Var, left: Var, result: Var } = {
+) -> { st: Lowering, state: Variable, left: Variable, result: Variable } = {
   let s = fresh(st, state, representation_of(context.setting, state));
   let n = fresh(s.st, int_type(), AsInt);
   let a = fresh(n.st, result, representation_of(context.setting, result));
   { st: a.st, state: s.var, left: n.var, result: a.var }
 }
 
-type PassEnd = { state: Var, left: Var, result: Var, next: Int, at: Span }
+type PassEnd = { state: Variable, left: Variable, result: Variable, next: Int, at: Span }
 
 type Pass = { block: Block, next: Int }
 
 fn fused(b: Block, v: Arg, e: PassEnd) -> Option<Pass> =
   match v {
-    VarOperand(x) -> match b.at(b.len() - 1) {
+    VariableOperand(x) -> match b.at(b.len() - 1) {
       Some(Let(l)) -> if l.var != x { None }
       else { ending(b.take(b.len() - 1), l.var, l.value, e) },
       _ -> if b.contains(Declaration(x)) {
-        tail_fused(b.filter(|i: Inst| i != Declaration(x)), x, e)
+        tail_fused(b.filter(|i: Instruction| i != Declaration(x)), x, e)
       } else { None },
     },
     _ -> None,
   }
 
-fn tail_fused(b: Block, j: Var, e: PassEnd) -> Option<Pass> = {
+fn tail_fused(b: Block, j: Variable, e: PassEnd) -> Option<Pass> = {
   let n = b.len();
   let before = b.take(n - 1);
   match b.at(n - 1) {
     Some(Assign(a)) -> if a.var != j { None } else {
       match a.arg {
-        VarOperand(x) -> match b.at(n - 2) {
+        VariableOperand(x) -> match b.at(n - 2) {
           Some(Let(l)) -> if l.var != x { None } else { ending(b.take(n - 2), l.var, l.value, e) },
           Some(i) -> if !before.contains(Declaration(x)) { None }
-          else { last_fused(b.take(n - 2).filter(|y: Inst| y != Declaration(x)), i, x, e) },
+          else { last_fused(b.take(n - 2).filter(|y: Instruction| y != Declaration(x)), i, x, e) },
           None -> None,
         },
         _ -> None,
@@ -1782,7 +1813,7 @@ fn tail_fused(b: Block, j: Var, e: PassEnd) -> Option<Pass> = {
   }
 }
 
-fn last_fused(before: Block, last: Inst, j: Var, e: PassEnd) -> Option<Pass> =
+fn last_fused(before: Block, last: Instruction, j: Variable, e: PassEnd) -> Option<Pass> =
   match last {
     If(x) -> match tail_fused(x.then, j, e) {
       None -> None,
@@ -1844,7 +1875,7 @@ fn last_fused(before: Block, last: Inst, j: Var, e: PassEnd) -> Option<Pass> =
     },
   }
 
-fn ending(b: Block, made: Var, value: Rvalue, e: PassEnd) -> Option<Pass> =
+fn ending(b: Block, made: Variable, value: Rvalue, e: PassEnd) -> Option<Pass> =
   match value {
     Aggregate(g) -> match ((made.representation, g.parts)) {
       (AsSum(s), [IntOperand(i), a]) -> {
@@ -1852,7 +1883,7 @@ fn ending(b: Block, made: Var, value: Rvalue, e: PassEnd) -> Option<Pass> =
         if s.cases.at(i) == Some(continue_constructor()) {
           let h = packed_into(u.arg, e.state, e);
           Some({
-            block: u.block.concat(h.block).push(Next([h.arg, VarOperand(e.left)])),
+            block: u.block.concat(h.block).push(Next([h.arg, VariableOperand(e.left)])),
             next: h.next,
           })
         } else if s.cases.at(i) == Some(stop_constructor()) {
@@ -1867,7 +1898,7 @@ fn ending(b: Block, made: Var, value: Rvalue, e: PassEnd) -> Option<Pass> =
 
 fn without_construction(b: Block, a: Arg) -> { block: Block, arg: Arg } =
   match a {
-    VarOperand(w) -> match b.at(b.len() - 1) {
+    VariableOperand(w) -> match b.at(b.len() - 1) {
       Some(Let(l)) -> if l.var != w { { block: b, arg: a } } else {
         match l.value {
           Convert(k) -> { block: b.take(b.len() - 1), arg: k.arg },
@@ -1879,21 +1910,21 @@ fn without_construction(b: Block, a: Arg) -> { block: Block, arg: Arg } =
     _ -> { block: b, arg: a },
   }
 
-fn packed_into(a: Arg, into: Var, e: PassEnd) -> { block: Block, arg: Arg, next: Int } =
+fn packed_into(a: Arg, into: Variable, e: PassEnd) -> { block: Block, arg: Arg, next: Int } =
   if operand_representation(a) == into.representation { { block: [], arg: a, next: e.next } } else {
     let v = { id: e.next, ty: into.ty, representation: into.representation };
     {
       block: [
         Let({ var: v, value: Convert({ arg: a, to: into.representation }), at: e.at, unwind: [] }),
       ],
-      arg: VarOperand(v),
+      arg: VariableOperand(v),
       next: e.next + 1,
     }
   }
 
-fn iter_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
+fn iterator_step_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
   match v {
-    VarOperand(x) -> {
+    VariableOperand(x) -> {
       let go = read_out(context, x, continue_constructor(), e.state, e);
       let stop = read_out(context, x, stop_constructor(), e.result, { ..e, next: go.next });
       {
@@ -1902,7 +1933,7 @@ fn iter_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
             on: x,
             test: TagTest([continue_constructor(), stop_constructor()]),
             arms: [
-              { when: 0, body: go.block.push(Next([go.arg, VarOperand(e.left)])) },
+              { when: 0, body: go.block.push(Next([go.arg, VariableOperand(e.left)])) },
               { when: 1, body: stop.block.push(Done(stop.arg)) },
             ],
             rest: [Fail({ reason: NoMatchingArm, at: e.at, resource: [], unwind: [] })],
@@ -1920,9 +1951,9 @@ fn iter_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
 
 fn read_out(
   context: Context,
-  x: Var,
+  x: Variable,
   constructor: Bytes,
-  into: Var,
+  into: Variable,
   e: PassEnd,
 ) -> { block: Block, arg: Arg, next: Int } =
   if into.representation == AsUnit { { block: [], arg: ZeroOperand(AsUnit), next: e.next } } else {
@@ -1943,7 +1974,7 @@ fn read_out(
         },
     };
     let r = { id: e.next, ty: into.ty, representation: read.representation };
-    let h = packed_into(VarOperand(r), into, { ..e, next: e.next + 1 });
+    let h = packed_into(VariableOperand(r), into, { ..e, next: e.next + 1 });
     {
       block: [Let({ var: r, value: Get({ of: x, path: read.path }), at: e.at, unwind: [] })].concat(
         h.block,
@@ -1974,12 +2005,12 @@ pub fn lambda_body_start(
   ).st;
   let caps = zip(frame.captures, s.captured).fold(
     enter_function(reserved, shape_params(s), Map::new()),
-    |accumulator: Lowering, p: { first: Capture, second: Var }|
+    |accumulator: Lowering, p: { first: Capture, second: Variable }|
       {
         ..accumulator,
-        env: accumulator.env.insert(p.first.destination, VarOperand(p.second)),
-        closures: match st.env.get(p.first.src) {
-          Some(VarOperand(outer)) -> match st.closures.get(outer.id) {
+        env: accumulator.env.insert(p.first.destination, VariableOperand(p.second)),
+        closures: match st.env.get(p.first.source) {
+          Some(VariableOperand(outer)) -> match st.closures.get(outer.id) {
             Some(n) -> accumulator.closures.insert(p.second.id, n),
             None -> accumulator.closures,
           },
@@ -1990,10 +2021,10 @@ pub fn lambda_body_start(
   let given = {
     ..caps,
     env: range(0, s.parameters.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
-      match s.parameters.at(j) { Some(p) -> m.insert(j, VarOperand(p)), None -> m }),
+      match s.parameters.at(j) { Some(p) -> m.insert(j, VariableOperand(p)), None -> m }),
   };
   let read = read_evidence_words(given, s.evidence_parameters, frame.words, at);
-  let inside = substitute_evidence_vars(frame.captured_evidence, s.held_evidence);
+  let inside = substitute_evidence_variables(frame.captured_evidence, s.held_evidence);
   {
     context: {
       ..context,
@@ -2001,7 +2032,7 @@ pub fn lambda_body_start(
       params: [],
       types: [],
       result: s.result,
-      result_type: s.ret,
+      result_type: s.return_type,
       parameter_positions: Map::new(),
       frame_span: at,
       captured: frame.captures.map(|c: Capture| c.destination),
@@ -2009,17 +2040,18 @@ pub fn lambda_body_start(
       label_values: label_values_at(
         context,
         frame_labels(context, frame),
-        s.labels.map(VarOperand),
+        s.labels.map(VariableOperand),
       ),
       instance: inside.instance,
-      kept: inside.kept,
+      retained_arguments: inside.retained_values,
     },
     st: read.st,
   }
 }
 
 fn note_captures(context: Context, st: Lowering, captures: List<Capture>, at: Span) -> Lowering =
-  captures.fold(st, |s: Lowering, c: Capture| note_slot_read(context, s, capture_note(), c.src, at))
+  captures.fold(st, |s: Lowering, c: Capture|
+    note_slot_read(context, s, capture_note(), c.source, at))
 
 pub fn note_step_captures(
   context: Context,
@@ -2043,23 +2075,23 @@ pub fn closure(
   outer: Lowering,
   inner: LoweredValue,
   frame: Frame,
-  kind: FnKind,
+  kind: FunctionKind,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let s = closure_layout(context, outer.env, frame, at);
   let nth = outer.lambdas.len();
   let laid = shape_captures(s);
-  let returned = if falls_through(inner.st.insts) { represented_as(inner, s.result, at) }
+  let returned = if falls_through(inner.st.instructions) { represented_as(inner, s.result, at) }
   else { inner };
-  let instructions = if falls_through(returned.st.insts) {
-    returned.st.insts.push(Return(returned.arg))
-  } else { returned.st.insts };
+  let instructions = if falls_through(returned.st.instructions) {
+    returned.st.instructions.push(Return(returned.arg))
+  } else { returned.st.instructions };
   let body = {
     key: context.key,
     kind: kind,
     params: shape_params(s),
     convention: shape_convention(s),
-    result_type: if frame.resumes != None { word_type() } else { s.ret },
+    result_type: if frame.resumes != None { word_type() } else { s.return_type },
     body: match context.inlined_from {
       Some(l) -> [SiteScope(Some({ root: l.owner, base: context.base }))].concat(instructions),
       None -> instructions,
@@ -2072,11 +2104,12 @@ pub fn closure(
   };
   let unraised = exit_function(outer, returned.st);
   let exit_inlined = frame_labels(context, frame);
-  let raising = match substitute_evidence_vars(frame.captured_evidence, s.held_evidence).words.find(
-      |w: EvidenceWord| w.evidence.effect == b"abort" && !w.inherited,
-    ) {
+  let raising = match substitute_evidence_variables(
+      frame.captured_evidence,
+      s.held_evidence,
+    ).words.find(|w: EvidenceWord| w.evidence.effect == b"abort" && !w.inherited) {
     Some(w) -> match w.word {
-      VarOperand(v) -> pending_abort_raise(context, unraised, v),
+      VariableOperand(v) -> pending_abort_raise(context, unraised, v),
       _ -> { st: unraised, pending: None },
     },
     None -> { st: unraised, pending: None },
@@ -2099,7 +2132,7 @@ pub fn closure(
           resource_captures: frame.words.fold([], |accumulator: List<Int>, o: EffectsEvidence|
             match o.evidence.resource {
               ResourceVariable(p) -> match zip(exit_inlined, s.labels).find(
-                  |l: { first: Int, second: Var }| l.first == p,
+                  |l: { first: Int, second: Variable }| l.first == p,
                 ) {
                 Some(l) -> match range(0, laid.len()).find(|k: Int|
                     match laid.at(k) { Some(v) -> v.id == l.second.id, None -> false }) {
@@ -2116,8 +2149,8 @@ pub fn closure(
   };
   let caps = zip(frame.captures, s.captured).fold(
     { st: note_captures(context, placed, frame.captures, at), args: [] },
-    |accumulator: { st: Lowering, args: List<Arg> }, p: { first: Capture, second: Var }|
-      match accumulator.st.env.get(p.first.src) {
+    |accumulator: { st: Lowering, args: List<Arg> }, p: { first: Capture, second: Variable }|
+      match accumulator.st.env.get(p.first.source) {
         Some(a) -> {
           let h = represented_as({ st: accumulator.st, arg: a }, p.second.representation, at);
           { st: h.st, args: accumulator.args.push(h.arg) }
@@ -2141,7 +2174,8 @@ pub fn closure(
     at,
   );
   match made.arg {
-    VarOperand(v) -> { ..made, st: { ..made.st, closures: made.st.closures.insert(v.id, nth) } },
+    VariableOperand(v) ->
+      { ..made, st: { ..made.st, closures: made.st.closures.insert(v.id, nth) } },
     _ -> made,
   }
 }
@@ -2149,7 +2183,7 @@ pub fn closure(
 pub fn group_body_starts(members: List<GroupMember>) -> List<Opened> / {abort.raise} = {
   let keys = members.map(|m: GroupMember| m.context.key);
   let params = member_params(members);
-  let after = params.fold(1, |n: Int, ps: List<Var>| n + ps.len());
+  let after = params.fold(1, |n: Int, ps: List<Variable>| n + ps.len());
   range(0, members.len()).fold([], |accumulator: List<Opened>, i: Int|
     match members.at(i) {
       None -> accumulator,
@@ -2169,7 +2203,7 @@ pub fn group_body_starts(members: List<GroupMember>) -> List<Opened> / {abort.ra
             ..initial_lowering([]),
             next: after,
             env: range(0, own.len()).fold(Map::new(), |e: Map<Int, Arg>, j: Int|
-              match own.at(j) { Some(v) -> e.insert(j, VarOperand(v)), None -> e }),
+              match own.at(j) { Some(v) -> e.insert(j, VariableOperand(v)), None -> e }),
           },
           own,
           m.context.params.len(),
@@ -2183,7 +2217,7 @@ pub fn group_body_starts(members: List<GroupMember>) -> List<Opened> / {abort.ra
 pub fn tail_group_root(
   members: List<GroupMember>,
   bodies: List<LoweredValue>,
-) -> Fn / {abort.raise} =
+) -> Function / {abort.raise} =
   match members.at(0) {
     None -> unreachable(b"a group of tail-calling functions has no members"),
     Some(first) -> {
@@ -2200,8 +2234,8 @@ pub fn tail_group_root(
             None -> accumulator,
             Some(b) -> match members.at(i) {
               None -> accumulator,
-              Some(m) -> if !falls_through(b.st.insts) {
-                { ..accumulator, arms: accumulator.arms.push({ when: i, body: b.st.insts }) }
+              Some(m) -> if !falls_through(b.st.instructions) {
+                { ..accumulator, arms: accumulator.arms.push({ when: i, body: b.st.instructions }) }
               } else {
                 let h = represented_as(
                   { st: { ..b.st, next: accumulator.next }, arg: b.arg },
@@ -2210,7 +2244,10 @@ pub fn tail_group_root(
                 );
                 {
                   next: h.st.next,
-                  arms: accumulator.arms.push({ when: i, body: h.st.insts.push(Return(h.arg)) }),
+                  arms: accumulator.arms.push({
+                    when: i,
+                    body: h.st.instructions.push(Return(h.arg)),
+                  }),
                 }
               },
             },
@@ -2268,10 +2305,10 @@ pub fn tail_group_root(
     },
   }
 
-fn member_params(members: List<GroupMember>) -> List<List<Var>> / {abort.raise} =
+fn member_params(members: List<GroupMember>) -> List<List<Variable>> / {abort.raise} =
   members.fold(
     { next: 1, out: [] },
-    |accumulator: { next: Int, out: List<List<Var>> }, m: GroupMember| {
+    |accumulator: { next: Int, out: List<List<Variable>> }, m: GroupMember| {
       let reps = reps_of(convention(m.context));
       let declared = m.context.params.len();
       let handed_types = evidence_parameter_types(
@@ -2343,14 +2380,14 @@ pub type NamedDefinition = { full: Bytes, definition: Definition }
 type Reference = { st: Lowering, callee: Callee, args: List<Type>, given: List<Type> }
 
 type ClosureLayout = {
-  captured: List<Var>,
-  labels: List<Var>,
-  held_evidence: EvidenceValues<Var>,
-  parameters: List<Var>,
-  evidence_parameters: List<Var>,
+  captured: List<Variable>,
+  labels: List<Variable>,
+  held_evidence: EvidenceValues<Variable>,
+  parameters: List<Variable>,
+  evidence_parameters: List<Variable>,
   result: Representation,
   ty: Type,
-  ret: Type,
+  return_type: Type,
 }
 
 fn captures_in_order<a>(
@@ -2359,16 +2396,16 @@ fn captures_in_order<a>(
   evidence_values: EvidenceValues<a>,
 ) -> List<a> = note_captures.concat(labels).concat(listed_evidence_values(evidence_values))
 
-fn shape_captures(s: ClosureLayout) -> List<Var> =
+fn shape_captures(s: ClosureLayout) -> List<Variable> =
   captures_in_order(s.captured, s.labels, s.held_evidence)
 
-fn shape_params(s: ClosureLayout) -> List<Var> =
+fn shape_params(s: ClosureLayout) -> List<Variable> =
   shape_captures(s).concat(s.parameters).concat(s.evidence_parameters)
 
 fn shape_convention(s: ClosureLayout) -> Convention = {
   let params = shape_params(s);
   {
-    params: owned_params(params.map(|v: Var| v.representation)),
+    params: owned_params(params.map(|v: Variable| v.representation)),
     result: s.result,
     destination_passing: false,
     returned: typed_ir::OwnedResult,
@@ -2378,11 +2415,11 @@ fn shape_convention(s: ClosureLayout) -> Convention = {
 fn numbered(
   first: Int,
   specs: List<{ ty: Type, representation: Representation }>,
-) -> { vars: List<Var>, next: Int } =
+) -> { vars: List<Variable>, next: Int } =
   {
     vars: specs.fold(
       [],
-      |accumulator: List<Var>, s: { ty: Type, representation: Representation }|
+      |accumulator: List<Variable>, s: { ty: Type, representation: Representation }|
         accumulator.push({
           id: first + accumulator.len(),
           ty: s.ty,
@@ -2404,7 +2441,7 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
     range(0, frame.captures.len()).map(|i: Int|
       {
         ty: match frame.captures.at(i) {
-          Some(c) -> match env.get(c.src) { Some(a) -> type_of(a), None -> unknown_type() },
+          Some(c) -> match env.get(c.source) { Some(a) -> type_of(a), None -> unknown_type() },
           None -> unknown_type(),
         },
         representation: match capture_representations.at(i) { Some(r) -> r, None -> AsWord },
@@ -2425,7 +2462,7 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
   });
   let retained_evidence = numbered(
     instance.next,
-    frame.captured_evidence.kept.map(|_: Arg|
+    frame.captured_evidence.retained_values.map(|_: Arg|
       { ty: instance_block_type(), representation: AsWord }),
   );
   let own = numbered(
@@ -2448,13 +2485,14 @@ fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) 
     held_evidence: {
       words: words_held.vars,
       instance: instance.vars.at(0),
-      kept: retained_evidence.vars,
+      retained_values: retained_evidence.vars,
     },
     parameters: own.vars,
     evidence_parameters: words.vars,
-    result: if frame.resumes != None { AsWord } else { representation_of(context.setting, f.ret) },
+    result: if frame.resumes != None { AsWord }
+    else { representation_of(context.setting, f.return_type) },
     ty: FunctionType(f),
-    ret: f.ret,
+    return_type: f.return_type,
   }
 }
 
@@ -2470,7 +2508,7 @@ fn frame_labels(context: Context, frame: Frame) -> List<Int> =
     ),
   )
 
-fn empty_function(context: Context) -> Fn =
+fn empty_function(context: Context) -> Function =
   {
     key: context.key,
     kind: Metered,
@@ -2534,13 +2572,13 @@ fn slot_read(c: Code, slot: Int) -> Option<Code> = {
     captures.fold(None, |accumulator: Option<Int>, k: Capture|
       match accumulator {
         Some(_) -> accumulator,
-        None -> if k.src == slot { Some(k.destination) } else { None },
+        None -> if k.source == slot { Some(k.destination) } else { None },
       });
   match c.node {
-    CodeVar(v) -> if v.slot == slot { Some(c) } else { None },
+    CodeVariable(v) -> if v.slot == slot { Some(c) } else { None },
     CodeKnownLambda(k) -> if k.slot == slot { Some(c) } else { None },
     CodeUnary(u) -> slot_read(u.operand, slot),
-    CodeBinary(b) -> first([b.lhs, b.rhs]),
+    CodeBinary(b) -> first([b.left_operand, b.right_operand]),
     CodeApply(a) -> first(a.args.push(a.function)),
     CodeIf(i) -> first([i.cond, i.then_branch, i.else_branch]),
     CodeBlock(b) ->
@@ -2575,7 +2613,7 @@ fn slot_read(c: Code, slot: Int) -> Option<Code> = {
       Some(x) -> Some(x),
       None ->
         h.clauses.fold(
-          match h.ret {
+          match h.return_clause {
             Some(r) -> match into(r.captures) { Some(d) -> slot_read(r.body, d), None -> None },
             None -> None,
           },
@@ -2614,11 +2652,11 @@ fn constant_read(
           st,
           return_type,
           AsWord,
-          Op({
-            op: OfCalling(
+          OperationCall({
+            operation: OfCalling(
               ConstantRead({
                 callee: Root(d.definition.root),
-                kept: return_type,
+                value_type: return_type,
                 constant: d.definition.constant,
               }),
             ),
@@ -2641,7 +2679,7 @@ fn borrows_outlive_jump(context: Context, d: NamedDefinition, args: List<Arg>) -
       Some(a) ->
         !is_refcounted(operand_representation(a))
           || (match a {
-            VarOperand(v) -> v.id < context.params.len() && own.contains(v.id),
+            VariableOperand(v) -> v.id < context.params.len() && own.contains(v.id),
             _ -> false,
           }),
       None -> false,
@@ -2682,7 +2720,7 @@ fn tail_jump_with_evidence(
       && is_self_reference(
         context,
         reference_args(function),
-        fn_args(context, d.definition, codes),
+        function_arguments(context, d.definition, codes),
         given.effect_evidence,
       )
       && (passed_as_given(context, given) || given.words.len() <= max_evidence_params()) {
@@ -2766,7 +2804,7 @@ fn convention_call(
       st,
       d,
       function,
-      fn_args(context, d.definition, codes),
+      function_arguments(context, d.definition, codes),
       given.effect_evidence,
     ),
     codes,
@@ -2811,7 +2849,7 @@ fn defined_called(
       st,
       d,
       types,
-      fn_args(context, d.definition, codes),
+      function_arguments(context, d.definition, codes),
       given.effect_evidence,
     ),
     codes,
@@ -2848,8 +2886,8 @@ pub fn simulate_called(
         accumulator.st,
         int_type(),
         AsInt,
-        Op({
-          op: OfHandling(CurrentSite(part)),
+        OperationCall({
+          operation: OfHandling(CurrentSite(part)),
           args: [],
           uses: { takes: [], owned: false, fails: false, suspends: false },
         }),
@@ -2862,7 +2900,7 @@ pub fn simulate_called(
     context,
     sites.st,
     name,
-    [match type_of(body) { FunctionType(f) -> f.ret, _ -> unknown_type() }],
+    [match type_of(body) { FunctionType(f) -> f.return_type, _ -> unknown_type() }],
     [{ ..effects, listed: effects.listed.filter(|a: Effect| !returned.contains(a.effect)) }],
     [],
     sites.args.push(body),
@@ -2934,9 +2972,10 @@ fn called_as(
 fn return_type_at(d: Definition, given: List<Type>) -> Option<Type> =
   match d.scheme {
     Some(scheme) -> match scheme.ty {
-      FunctionType(f) -> if scheme.type_variables.len() == 0 { Some(f.ret) }
-      else if given.len() == scheme.type_variables.len() { Some(substituted_fully(f.ret, given)) }
-      else { None },
+      FunctionType(f) -> if scheme.type_variables.len() == 0 { Some(f.return_type) }
+      else if given.len() == scheme.type_variables.len() {
+        Some(substituted_fully(f.return_type, given))
+      } else { None },
       other -> if scheme.type_variables.len() == 0 { Some(other) } else { None },
     },
     None -> None,
@@ -3051,10 +3090,14 @@ fn lambdas_stack_allocated(
     match codes.at(i) {
       Some(c) -> match c.node {
         CodeLambda(_) -> match args.at(i) {
-          Some(VarOperand(v)) ->
+          Some(VariableOperand(v)) ->
             {
               ..accumulator,
-              insts: stack_allocated_in_block(accumulator.insts, v, accumulator.insts.len() - 1),
+              instructions: stack_allocated_in_block(
+                accumulator.instructions,
+                v,
+                accumulator.instructions.len() - 1,
+              ),
             },
           _ -> accumulator,
         },
@@ -3065,12 +3108,18 @@ fn lambdas_stack_allocated(
 
 pub fn stack_allocated(l: LoweredValue) -> LoweredValue =
   match l.arg {
-    VarOperand(v) ->
-      { ..l, st: { ..l.st, insts: stack_allocated_in_block(l.st.insts, v, l.st.insts.len() - 1) } },
+    VariableOperand(v) ->
+      {
+        ..l,
+        st: {
+          ..l.st,
+          instructions: stack_allocated_in_block(l.st.instructions, v, l.st.instructions.len() - 1),
+        },
+      },
     _ -> l,
   }
 
-fn stack_allocated_in_block(b: Block, v: Var, i: Int) -> Block =
+fn stack_allocated_in_block(b: Block, v: Variable, i: Int) -> Block =
   if i < 0 { b } else {
     match b.at(i) {
       Some(Let(x)) -> if x.var != v { stack_allocated_in_block(b, v, i - 1) } else {
@@ -3098,9 +3147,9 @@ fn note_forwarded_functions(
     range(0, codes.len()).fold(st, |accumulator: Lowering, i: Int|
       match codes.at(i) {
         Some(c) -> match c.node {
-          CodeVar(_) -> {
+          CodeVariable(_) -> {
             match args.at(i) {
-              Some(VarOperand(p)) -> match context.parameter_positions.get(p.id) {
+              Some(VariableOperand(p)) -> match context.parameter_positions.get(p.id) {
                 Some(j) -> if may_hold_function(context, j) {
                   {
                     ..accumulator,
@@ -3127,7 +3176,7 @@ fn note_forwarded_functions(
 
 fn note_parameter_called(context: Context, st: Lowering, f: Arg) -> Lowering =
   match f {
-    VarOperand(p) -> match context.parameter_positions.get(p.id) {
+    VariableOperand(p) -> match context.parameter_positions.get(p.id) {
       Some(j) -> if context.tails == PlainCalls || st.links.called.contains(j) { st }
       else { { ..st, links: { ..st.links, called: st.links.called.push(j) } } },
       None -> st,
@@ -3141,7 +3190,7 @@ fn may_hold_function(context: Context, j: Int) -> Bool =
     None -> true,
   }
 
-fn fn_args(
+fn function_arguments(
   context: Context,
   callee: Definition,
   codes: List<Code>,
@@ -3273,7 +3322,14 @@ fn named_arity(
 fn named_lambda(c: Code, n: Int) -> Lambda = {
   let f = match c.ty {
     FunctionType(t) -> t,
-    _ -> { params: [], kept: [], once: false, ret: unknown_type(), effects: no_effects() },
+    _ ->
+      {
+        params: [],
+        keep_parameters: [],
+        once: false,
+        return_type: unknown_type(),
+        effects: no_effects(),
+      },
   };
   {
     params: n,
@@ -3287,14 +3343,14 @@ fn named_lambda(c: Code, n: Int) -> Lambda = {
         function: c,
         args: range(0, n).map(|i: Int|
           {
-            node: CodeVar({ name: b"p".concat(ascii_of_int(i)), slot: i }),
+            node: CodeVariable({ name: b"p".concat(ascii_of_int(i)), slot: i }),
             span: c.span,
             ty: match f.params.at(i) { Some(t) -> t, None -> unknown_type() },
           }),
         effects: no_effects(),
       }),
       span: c.span,
-      ty: f.ret,
+      ty: f.return_type,
     },
   }
 }
@@ -3303,7 +3359,7 @@ fn called_frame(k: KnownLambdaCall) -> Lambda =
   {
     ..k.lambda,
     size: k.lambda.params + 1,
-    captures: [{ src: k.slot, destination: k.lambda.params }],
+    captures: [{ source: k.slot, destination: k.lambda.params }],
   }
 
 pub fn known_run(
@@ -3355,7 +3411,7 @@ pub fn named_in(
     },
     CodeLambda(l) -> go(l.body),
     CodeUnary(u) -> go(u.operand),
-    CodeBinary(b) -> within([b.lhs, b.rhs]),
+    CodeBinary(b) -> within([b.left_operand, b.right_operand]),
     CodeFieldRead(f) -> go(f.base),
     CodeIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
     CodeBlock(b) ->
@@ -3387,7 +3443,7 @@ pub fn named_in(
     CodeHandle(h) ->
       within(
         h.clauses.fold(
-          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          match h.return_clause { Some(r) -> [h.body, r.body], None -> [h.body] },
           |accumulator: List<Code>, clause: CodeClause| accumulator.push(clause.body),
         ),
       ),
@@ -3401,7 +3457,7 @@ pub fn lambdas_of(c: Code) -> List<Lambda> = {
   match c.node {
     CodeLambda(l) -> [l].concat(lambdas_of(l.body)),
     CodeUnary(u) -> lambdas_of(u.operand),
-    CodeBinary(b) -> within([b.lhs, b.rhs]),
+    CodeBinary(b) -> within([b.left_operand, b.right_operand]),
     CodeFieldRead(f) -> lambdas_of(f.base),
     CodeApply(a) -> within(a.args.push(a.function)),
     CodeIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
@@ -3434,7 +3490,7 @@ pub fn lambdas_of(c: Code) -> List<Lambda> = {
     CodeHandle(h) ->
       within(
         h.clauses.fold(
-          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          match h.return_clause { Some(r) -> [h.body, r.body], None -> [h.body] },
           |accumulator: List<Code>, clause: CodeClause| accumulator.push(clause.body),
         ),
       ),
@@ -3458,9 +3514,12 @@ pub fn has_handle_matching(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool
     CodeHandle(h) ->
       counted(h.clauses) || has_handle_matching(h.body, counted)
         || within(h.clauses.map(|clause: CodeClause| clause.body))
-        || (match h.ret { Some(r) -> has_handle_matching(r.body, counted), None -> false }),
+        || (match h.return_clause {
+          Some(r) -> has_handle_matching(r.body, counted),
+          None -> false,
+        }),
     CodeUnary(u) -> has_handle_matching(u.operand, counted),
-    CodeBinary(b) -> within([b.lhs, b.rhs]),
+    CodeBinary(b) -> within([b.left_operand, b.right_operand]),
     CodeFieldRead(f) -> has_handle_matching(f.base, counted),
     CodeApply(a) -> within(a.args.push(a.function)),
     CodeIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
@@ -3506,13 +3565,13 @@ fn known_values(
       if k.slot == slot { Some(k) } else { found });
   let inside = |caps: List<Capture>|
     caps.fold([], |accumulator: List<KnownSlot>, cap: Capture|
-      match known_lambda_read(cap.src) {
+      match known_lambda_read(cap.source) {
         Some(k) -> accumulator.push({ ..k, slot: cap.destination }),
         None -> accumulator,
       });
   let maybe = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
   let node = match c.node {
-    CodeVar(v) -> match known_lambda_read(v.slot) {
+    CodeVariable(v) -> match known_lambda_read(v.slot) {
       Some(k) ->
         CodeKnownLambda({
           name: v.name,
@@ -3526,7 +3585,8 @@ fn known_values(
     },
     CodeApply(a) -> CodeApply({ ..a, function: go(a.function), args: a.args.map(go) }),
     CodeUnary(u) -> CodeUnary({ ..u, operand: go(u.operand) }),
-    CodeBinary(b) -> CodeBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    CodeBinary(b) ->
+      CodeBinary({ ..b, left_operand: go(b.left_operand), right_operand: go(b.right_operand) }),
     CodeIf(i) ->
       CodeIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
     CodeBlock(b) -> {

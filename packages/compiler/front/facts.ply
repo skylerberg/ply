@@ -13,7 +13,7 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, HoleExpression, TryBlockExpression, Param,
                                     LetStatement, LetElseStatement, ExpressionStatement,
-                                    AssignmentStatement, HandlerVar, RecordLiteralField,
+                                    AssignmentStatement, HandlerStateVariable, RecordLiteralField,
                                     expression_span, TaggedLiteralExpression, TaggedLiteral, Hole,
                                     TaggedPart, tagged_parts, tagged_part_bin, prelude_module,
                                     prelude_hosts)
@@ -23,9 +23,10 @@ import compiler.check.types (unit_type, TypeTable, InternedType, interned_type_b
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Resolution, qualify,
                                       import_module_name)
 import compiler.check.resolve.scopes (post_order)
-import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFn, DenotesConstructor,
-                                  DenotesNothing, qualified_effect_name, qualified_type_name)
-import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reached_functions, Subject,
+import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFunction,
+                                  DenotesConstructor, DenotesNothing, qualified_effect_name,
+                                  qualified_type_name)
+import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reachable_functions, Subject,
                                   FunctionNamed, DeclarationNamed, ItemKeyed, hashes_from_cache)
 import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
@@ -33,7 +34,7 @@ import compiler.check.typed (TypedBody)
 import compiler.check.infer (CheckOutput, types_joined, measured_definitions, EmitFacts,
                              emit_facts_bin, remap_fact_modules, facts_filtered)
 import compiler.check.infer.checker (Location, DefinitionInfo, TestInfo, LawInfo, EffectInfo,
-                                     OpInfo, ConstructorInfo, CachedFacts, CheckedBody,
+                                     OperationInfo, ConstructorInfo, CachedFacts, CheckedBody,
                                      WitnessOrder, MemberSite, InstanceInfo, NumericInfo,
                                      definition_info_bin, test_info_bin, law_info_bin,
                                      effect_info_bin, constructor_info_bin, instance_info_bin,
@@ -233,10 +234,10 @@ fn lits(accumulator: List<Bytes>, expression: Expression) -> List<Bytes> / {abor
     TaggedLiteralExpression(v) -> backwards(accumulator, v.holes.map(|h: Hole| h.value)),
     HoleExpression(_) -> accumulator,
     InvalidExpression(_) -> accumulator,
-    BinaryExpression(v) -> lits(lits(accumulator, v.rhs), v.lhs),
+    BinaryExpression(v) -> lits(lits(accumulator, v.right_operand), v.left_operand),
     UnaryExpression(v) ->
       lits(
-        if v.op == b"neg" { neg_literal(accumulator, v.operand) } else { accumulator },
+        if v.operation == b"neg" { neg_literal(accumulator, v.operand) } else { accumulator },
         v.operand,
       ),
     LambdaExpression(v) -> lits(accumulator, v.body),
@@ -274,7 +275,11 @@ fn lits(accumulator: List<Bytes>, expression: Expression) -> List<Bytes> / {abor
     PropagateExpression(v) -> lits(accumulator, v.operand),
     ListExpression(v) -> backwards(accumulator, v.items),
     PerformExpression(v) -> backwards(accumulator, v.args),
-    HandleExpression(v) -> backwards(lits(accumulator, v.body), v.vars.map(|x: HandlerVar| x.init)),
+    HandleExpression(v) ->
+      backwards(
+        lits(accumulator, v.body),
+        v.handler_variables.map(|x: HandlerStateVariable| x.init),
+      ),
     WithScopeExpression(v) -> lits(lits(lits(accumulator, v.body), v.release), v.acquire),
     SimulateExpression(v) -> lits(accumulator, v.body),
     ParallelExpression(v) -> backwards(accumulator, v.branches),
@@ -365,7 +370,7 @@ fn farthest_end() -> Int = 1000000000000
 fn int_of(e: Expression) -> Option<Int> =
   match e {
     LiteralExpression(v) -> match v.literal { LiteralInt(k) -> Some(k), _ -> None },
-    UnaryExpression(v) -> if v.op != b"neg" { None } else {
+    UnaryExpression(v) -> if v.operation != b"neg" { None } else {
       match v.operand {
         LiteralExpression(x) -> match x.literal { LiteralInt(k) -> Some(0 - k), _ -> None },
         _ -> None,
@@ -399,16 +404,17 @@ fn flipped_comparison(comparison: Bytes) -> Bytes =
 
 fn add_limits(accumulator: List<Limit>, guard: Expression) -> List<Limit> =
   match guard {
-    BinaryExpression(v) -> if v.op == b"and" { add_limits(add_limits(accumulator, v.lhs), v.rhs) }
-    else {
-      match bare_name(v.lhs) {
-        Some(name) -> match int_of(v.rhs) {
-          Some(k) -> end_of(accumulator, name, v.op, k),
+    BinaryExpression(v) -> if v.operation == b"and" {
+      add_limits(add_limits(accumulator, v.left_operand), v.right_operand)
+    } else {
+      match bare_name(v.left_operand) {
+        Some(name) -> match int_of(v.right_operand) {
+          Some(k) -> end_of(accumulator, name, v.operation, k),
           None -> accumulator,
         },
-        None -> match bare_name(v.rhs) {
-          Some(name) -> match int_of(v.lhs) {
-            Some(k) -> end_of(accumulator, name, flipped_comparison(v.op), k),
+        None -> match bare_name(v.right_operand) {
+          Some(name) -> match int_of(v.left_operand) {
+            Some(k) -> end_of(accumulator, name, flipped_comparison(v.operation), k),
             None -> accumulator,
           },
           None -> accumulator,
@@ -564,7 +570,8 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
       {
         ..x,
         at: at(x.at),
-        operations: x.operations.map(|operation: OpInfo| { ..operation, at: at(operation.at) }),
+        operations: x.operations.map(|operation: OperationInfo|
+          { ..operation, at: at(operation.at) }),
       }),
     constructors: t.constructors.map(|c: ConstructorInfo| { ..c, at: at(c.at) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: at(x.at) }),
@@ -644,7 +651,7 @@ pub fn named_imports(parsed: ParsedModule, targets: List<Bytes>) -> List<Bytes> 
 
 fn first_index(xs: List<Int>) -> Int = match xs { [x, ..] -> x, [] -> 0 }
 
-fn reached_shipped_functions(
+fn reachable_shipped_functions(
   shapes: List<ModuleShape>,
   hashes: HashOutput,
   shipped: Map<Bytes, Bool>,
@@ -674,7 +681,7 @@ fn reached_shipped_functions(
         if hashes.refs.declared.contains(n) { a } else { a.push(FunctionNamed(n)) })
     }
   });
-  reached_functions(hashes, roots)
+  reachable_functions(hashes, roots)
 }
 
 fn survives_cut(o: Outline, reachable: Map<Bytes, Bool>, item: OutlineItem) -> Bool =
@@ -754,7 +761,7 @@ fn in_check_order<a>(
     |accumulator: List<a>, t: ModuleTables| accumulator.concat(pick(t).filter(|x: a| !first(x))),
   )
 
-fn fn_spans_of(o: Outline) -> List<Span> =
+fn function_spans_of(o: Outline) -> List<Span> =
   o.items.fold([], |accumulator: List<Span>, item: OutlineItem|
     match item { OutlinedFunction(x) -> accumulator.push(x.span), _ -> accumulator })
 
@@ -762,7 +769,7 @@ fn within_any(spans: List<Span>, span: Span) -> Bool =
   spans.fold(false, |b: Bool, at: Span| b || (span.start >= at.start && span.end <= at.end))
 
 fn untested_shape(s: ModuleShape) -> ModuleShape = {
-  let spans = fn_spans_of(s.outline);
+  let spans = function_spans_of(s.outline);
   {
     ..s,
     outline: {
@@ -860,11 +867,11 @@ pub type Frame = {
 
 pub type CheckedProgram = { frame: Frame, checked: CheckOutput }
 
-pub type TableReads = { reads: List<TablesRead>, reached: Map<Bytes, Bool> }
+pub type TableReads = { reads: List<TablesRead>, reachable: Map<Bytes, Bool> }
 
 pub type TablesRead = { outline: Outline, untested: Bool, trimmed: Bool }
 
-pub fn no_reads() -> TableReads = { reads: [], reached: Map::new() }
+pub fn no_reads() -> TableReads = { reads: [], reachable: Map::new() }
 
 pub fn functions_of(frame: Frame) -> Int =
   frame.outlines.fold(0, |n: Int, o: Outline|
@@ -900,7 +907,7 @@ pub fn framed_program(
     && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
   let whole = hashes_from_cache(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
   let reach = if cutting {
-    reached_shipped_functions(
+    reachable_shipped_functions(
       read,
       whole,
       shipped.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes, _: Bytes| m.insert(n, true)),
@@ -937,7 +944,7 @@ pub fn framed_program(
     reads: {
       reads: shapes.map(|s: ModuleShape|
         { outline: s.outline, untested: untested(s), trimmed: cut(s) }),
-      reached: reach,
+      reachable: reach,
     },
     views: if cutting { views_read(read, whole, reach, shipped) } else { [] },
   }
@@ -954,7 +961,7 @@ pub fn checked_program_over(
       let r = reads.reads.get(k);
       let plain = if r.untested { untested_tables(tables.get(k), r.outline) }
       else { tables.get(k) };
-      let t = if r.trimmed { cut_tables(plain, r.outline, reads.reached) } else { plain };
+      let t = if r.trimmed { cut_tables(plain, r.outline, reads.reachable) } else { plain };
       {
         out: accumulator.out.push(moved_tables(t, 0, k, accumulator.tests, accumulator.laws)),
         tests: accumulator.tests + t.tests.len(),
@@ -1149,7 +1156,7 @@ fn merged_tables(
   }
 }
 
-fn keeps_body(definition: FnDefinition) -> Bool =
+fn exposes_body(definition: FnDefinition) -> Bool =
   definition.generics.labels.len() > 0
     || (match definition.transparent { Some(_) -> true, None -> false })
 
@@ -1160,7 +1167,7 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
   );
   parsed.module.items.fold([], |accumulator: List<Cut>, item: Item|
     match item {
-      FunctionItem(d) -> if generated.contains(span_key(d.span)) || keeps_body(d) { accumulator }
+      FunctionItem(d) -> if generated.contains(span_key(d.span)) || exposes_body(d) { accumulator }
       else {
         let b = expression_span(d.body);
         if b.end - b.start < 2 { accumulator } else {
@@ -1257,7 +1264,7 @@ derive bin for TypedConst
 pub fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} =
   w.modules.get(i).module.items.fold([], |accumulator: List<TypedConst>, item: Item|
     match item {
-      FunctionItem(d) -> match ((d.constant, d.ret)) {
+      FunctionItem(d) -> match ((d.constant, d.return_type)) {
         (Some(_), Some(NamedTypeExpression(c))) -> match qualified_type_name(w.index, i, c.name) {
           Some(type_name) ->
             accumulator.push({
@@ -1418,7 +1425,7 @@ fn statement_site(
         Some({
           module: module,
           span: p.span,
-          callee: Bytes::concat_all([named, b".", p.op.name]),
+          callee: Bytes::concat_all([named, b".", p.operation.name]),
           label: label.name,
           args: args(p.args),
         }),
@@ -1426,7 +1433,7 @@ fn statement_site(
     },
     CallExpression(a) -> match ((a.function, a.labels.at(0))) {
       (NameExpression(v), Some(label)) -> match denotation(reading.index, module, v.name) {
-        DenotesFn(callee) ->
+        DenotesFunction(callee) ->
           Some({
             module: module,
             span: a.span,
@@ -1449,8 +1456,11 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
       LiteralString(s) -> TextArgument(s),
       _ -> OtherArgument,
     },
-    BinaryExpression(b) -> if b.op != b"++" { OtherArgument } else {
-      match ((argument(reading, module, b.lhs), argument(reading, module, b.rhs))) {
+    BinaryExpression(b) -> if b.operation != b"++" { OtherArgument } else {
+      match ((
+          argument(reading, module, b.left_operand),
+          argument(reading, module, b.right_operand),
+        )) {
         (TextArgument(x), TextArgument(y)) -> TextArgument(x.concat(y)),
         _ -> OtherArgument,
       }
@@ -1462,7 +1472,7 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
     CallExpression(a) -> if a.labels.len() > 0 || a.named.len() > 0 { OtherArgument } else {
       match a.function {
         NameExpression(v) -> match denotation(reading.index, module, v.name) {
-          DenotesFn(callee) -> match reading.rows.get(callee) {
+          DenotesFunction(callee) -> match reading.rows.get(callee) {
             Some(fields) -> if a.args.len() == 0 { RowArgument(fields) } else { OtherArgument },
             None ->
               CallArgument({

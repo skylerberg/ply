@@ -1596,7 +1596,7 @@ type ConnectionState = {
   started: Bool,
   greeted: Bool,
   over: Bool,
-  held: List<Bytes>,
+  pending_chunks: List<Bytes>,
   pending_size: Int,
   needed: Int,
   out: List<Bytes>,
@@ -1677,7 +1677,7 @@ fn new_connection(role: Role, limits: Limits, now: Instant) -> Connection / {abo
     started: role == Client,
     greeted: false,
     over: false,
-    held: [],
+    pending_chunks: [],
     pending_size: 0,
     needed: 0,
     out: List::concat(if role == Client { [preface(), greeting] } else { [greeting] }, window),
@@ -1848,7 +1848,14 @@ fn close_with_error(
       GoAwayFrame({ last_stream: k.highest, code: code, debug: Bytes::of_string(reason) }),
     );
     event(
-      { ..sent, over: true, held: [], pending_size: 0, block: None, goaway_sent: k.highest },
+      {
+        ..sent,
+        over: true,
+        pending_chunks: [],
+        pending_size: 0,
+        block: None,
+        goaway_sent: k.highest,
+      },
       Closed({ code: code, reason: reason }),
     )
   }
@@ -1867,10 +1874,10 @@ pub fn receive(c: Connection, data: Bytes, now: Instant) -> ReceiveResult / {abo
   let k = state_of(c);
   let size = k.pending_size + data.len();
   if k.over { report(k) } else if k.started && size < k.needed {
-    report({ ..k, held: k.held.push(data), pending_size: size })
+    report({ ..k, pending_chunks: k.pending_chunks.push(data), pending_size: size })
   } else {
     let t = ms(now);
-    let bytes = Bytes::concat_all(k.held.push(data));
+    let bytes = Bytes::concat_all(k.pending_chunks.push(data));
     report(
       send_pending_data(
         if k.started { framed_input(k, bytes, t) } else { read_preface(k, bytes, t) },
@@ -1895,7 +1902,7 @@ fn read_preface(k: ConnectionState, bytes: Bytes, t: Int) -> ConnectionState / {
   let n = min(bytes.len(), preface().len());
   if bytes.slice(0, n) != preface().slice(0, n) {
     close_with_error(k, ProtocolError, "the connection does not open with the HTTP/2 preface")
-  } else if n < preface().len() { { ..k, held: [bytes], pending_size: bytes.len() } }
+  } else if n < preface().len() { { ..k, pending_chunks: [bytes], pending_size: bytes.len() } }
   else { framed_input({ ..k, started: true }, bytes.slice(n, bytes.len()), t) }
 }
 
@@ -1925,7 +1932,7 @@ fn framed_input(k: ConnectionState, bytes: Bytes, t: Int) -> ConnectionState / {
     let rest = bytes.slice(done.at, bytes.len());
     {
       ..done.k,
-      held: [rest],
+      pending_chunks: [rest],
       pending_size: rest.len(),
       needed: match frame_length(rest, 0) { Some(length) -> 9 + length, None -> 9 },
     }
@@ -2488,7 +2495,7 @@ fn on_goaway(
   let going_away = event(refused_ones, GoingAway({ last_stream: bound, code: code, debug: debug }));
   if code == NoError { going_away } else {
     event(
-      { ..going_away, over: true, held: [], pending_size: 0, block: None },
+      { ..going_away, over: true, pending_chunks: [], pending_size: 0, block: None },
       Closed({ code: code, reason: "the peer's GOAWAY: " ++ String::of_bytes_lossy(debug) }),
     )
   }
@@ -3176,7 +3183,7 @@ pub fn peer_closed(c: Connection) -> ReceiveResult = {
   if k.over { report(k) } else {
     report(
       event(
-        { ..k, over: true, held: [], pending_size: 0 },
+        { ..k, over: true, pending_chunks: [], pending_size: 0 },
         Closed({ code: Cancel, reason: "the peer closed the connection" }),
       ),
     )
@@ -3830,7 +3837,7 @@ fn data(s: Int, b: Bytes, end: Bool) -> Bytes / {abort.raise} =
 fn echo(r: Request) -> Response =
   plain_text(200, r.method ++ " " ++ r.target ++ " " ++ String::of_bytes_lossy(r.body))
 
-fn asking(method: String, target: String, body: Bytes) -> Request =
+fn client_request(method: String, target: String, body: Bytes) -> Request =
   {
     method: method,
     scheme: "https",
@@ -4766,12 +4773,15 @@ fn results(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
     })
 
 test "a client's requests arrive at a server, and each response comes back on its request's stream" {
-  let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
+  let posted = {
+    ..client_request("POST", "/b", b"xyz"),
+    trailers: Map::new().insert("x-sum", ["3"]),
+  };
   let e = carried(
     send_requests(connected_pair(default_limits()), [
-      asking("GET", "/a", b""),
+      client_request("GET", "/a", b""),
       posted,
-      asking("HEAD", "/c", b""),
+      client_request("HEAD", "/c", b""),
     ]),
     echo,
     [],
@@ -4787,7 +4797,10 @@ test "a client's requests arrive at a server, and each response comes back on it
 }
 
 test "a request's trailers are passed to the server's application" {
-  let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
+  let posted = {
+    ..client_request("POST", "/b", b"xyz"),
+    trailers: Map::new().insert("x-sum", ["3"]),
+  };
   let e = carried(
     send_requests(connected_pair(default_limits()), [posted]),
     |r: Request|
@@ -4800,7 +4813,7 @@ test "a request's trailers are passed to the server's application" {
 
 test "a client rejects a response whose status and headers are malformed, and closes the connection when the server sends PUSH_PROMISE" {
   let start = take_output(client(default_limits(), at(0)));
-  let sent = match request(start.connection, asking("GET", "/", b""), at(0)) {
+  let sent = match request(start.connection, client_request("GET", "/", b""), at(0)) {
     Some(s) -> s.connection,
     None -> panic("a stream"),
   };
@@ -4825,8 +4838,8 @@ test "a client rejects a response whose status and headers are malformed, and cl
 
 test "a client learns which of its streams a GOAWAY left unprocessed, and opens no more" {
   let opened_two = send_requests(connected_pair(default_limits()), [
-    asking("GET", "/a", b""),
-    asking("GET", "/b", b""),
+    client_request("GET", "/a", b""),
+    client_request("GET", "/b", b""),
   ]);
   let c = take_output(opened_two.client);
   let received = receive(
@@ -4838,7 +4851,7 @@ test "a client learns which of its streams a GOAWAY left unprocessed, and opens 
     at(1),
   );
   assert_eq(results(received.events), [(3, 0 - 1, "REFUSED_STREAM")]);
-  assert_eq(request(received.connection, asking("GET", "/c", b""), at(2)) == None, true)
+  assert_eq(request(received.connection, client_request("GET", "/c", b""), at(2)) == None, true)
 }
 
 fn response_of_size(r: Request) -> Response / {abort.raise} =
@@ -4970,7 +4983,10 @@ test "two responses larger than their windows finish under every interleaving of
     let inbox = task.channel(4);
     let l = { ..default_limits(), initial_window: 40 };
     let e = multiplexed(
-      send_requests(connected_pair(l), [asking("GET", "/50", b""), asking("GET", "/45", b"")]),
+      send_requests(connected_pair(l), [
+        client_request("GET", "/50", b""),
+        client_request("GET", "/45", b""),
+      ]),
       inbox,
       40,
     );

@@ -11,8 +11,9 @@ import compiler.check.known (array_name, bool_name, bytes_name, char_name, colum
                              some_constructor, string_name, unit_name, ordering_type)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
                              Field, Scheme, Effects, Effect, int_type, bytes_type, bool_type,
-                             unit_type, string_type, float_type, list_type, option_type, fn_type,
-                             monomorphic, no_effects, open_effects, arg_effects, fields_sorted)
+                             unit_type, string_type, float_type, list_type, option_type,
+                             function_type, monomorphic, no_effects, open_effects, arg_effects,
+                             fields_sorted)
 import compiler.emit.typing (unknown_type)
 import std.list
 import std.list (zip)
@@ -20,11 +21,11 @@ import compiler.syntax.patterns (LiteralChar)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (BoolKind, BoxedKind, IntKind, width_named)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Generated, TypeOp, Reflect, Show, Digest, ContainerWalk, Lower,
-                           Lift, Keeping, Opening, root_name, root_text, op_name)
+import compiler.emit.keys (RootKey, Generated, TypeOperation, Reflect, Show, Digest, ContainerWalk,
+                           Lower, Lift, Wrapping, Opening, root_name, root_text, operation_name)
 import compiler.emit.representations (Constructors, SumConstructor, OpenShape, Definition,
-                                      EmitParam, at_args, kind_of, runtime_object, holds_resource,
-                                      constructor_fields_at, release_effects)
+                                      EmitParam, at_args, kind_of, runtime_object,
+                                      contains_resource, constructor_fields_at, release_effects)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.marks (marked_type, marked_key, without_marks, dynamic_form, has_marks)
 import compiler.store.hash.template (emitted_code)
@@ -38,7 +39,7 @@ import compiler.emit.writing (unspanned_code, prelude_call, placed, int_code, bo
 fn is_key_value(t: Type) -> Bool =
   match t { RecordType(fs) -> fs.map(|f: Field| f.name) == [b"key", b"value"], _ -> false }
 
-fn walk_ops() -> List<Bytes> =
+fn walk_operations() -> List<Bytes> =
   [b"equal", b"equal_from", b"ordered", b"ordered_from"].concat(gathering_walks())
 
 fn gathering_walks() -> List<Bytes> =
@@ -54,52 +55,57 @@ fn gathering_walks() -> List<Bytes> =
 fn marshal_loops() -> List<Bytes> =
   [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"]
 
-pub fn container_op_generated(operation: Bytes) -> Bool =
-  walk_ops().contains(operation) || marshal_loops().contains(operation)
+pub fn container_operation_generated(operation: Bytes) -> Bool =
+  walk_operations().contains(operation) || marshal_loops().contains(operation)
     || dynamic_loops().contains(operation)
     || strings_root(operation)
 
 pub fn container_reads_argument(operation: Bytes, k: Int) -> Bool =
   if gathering_walks().contains(operation) { k != 1 }
   else if dynamic_loops().contains(operation) { k != 1 } else {
-    walk_ops().contains(operation) || operation == b"lower_items" || operation == b"lower_entries"
+    walk_operations().contains(operation) || operation == b"lower_items"
+      || operation == b"lower_entries"
       || operation == b"let_go_items"
   }
 
 pub fn container_definitions(module: Bytes, t: Type) -> List<Definition> / {abort.raise} =
-  [Reflect, Show, Digest].concat(walk_ops().map(ContainerWalk)).map(|written_op: TypeOp| {
-    let operation = op_name(written_op);
-    let root = keys::generated_key(written_op, t, module);
-    let typed = container_signature(operation, t);
-    {
-      name: name_in_module(module, root_text(root_name(root))),
-      ret: Some(if typed.ret == bool_type() { BoolKind } else { BoxedKind }),
-      return_type: OpenShape([]),
-      pure: true,
-      constant: false,
-      arity: typed.params.len(),
-      scheme: Some(monomorphic(fn_type(typed.params, typed.ret, no_effects()))),
-      witnesses: 0,
-      borrowed: [],
-      root: root,
-    }
-  })
+  [Reflect, Show, Digest].concat(walk_operations().map(ContainerWalk)).map(
+    |written_op: TypeOperation| {
+      let operation = operation_name(written_op);
+      let root = keys::generated_key(written_op, t, module);
+      let typed = container_signature(operation, t);
+      {
+        name: name_in_module(module, root_text(root_name(root))),
+        return_kind: Some(if typed.result_type == bool_type() { BoolKind } else { BoxedKind }),
+        return_type: OpenShape([]),
+        pure: true,
+        constant: false,
+        arity: typed.params.len(),
+        scheme: Some(monomorphic(function_type(typed.params, typed.result_type, no_effects()))),
+        witnesses: 0,
+        borrowed: [],
+        root: root,
+      }
+    },
+  )
 
-fn container_signature(operation: Bytes, t: Type) -> { params: List<Type>, ret: Type } = {
+fn container_signature(operation: Bytes, t: Type) -> { params: List<Type>, result_type: Type } = {
   let value = value_type();
   let entries = list_type(RecordType([{ name: b"key", ty: value }, { name: b"value", ty: value }]));
-  let gathered = |l: Type| { params: [t, l, int_type()], ret: l };
-  if operation == b"equal" { { params: [t, t], ret: bool_type() } }
-  else if operation == b"ordered" { { params: [t, t], ret: ordering_type() } }
-  else if operation == b"equal_from" { { params: [t, t, int_type()], ret: bool_type() } }
-  else if operation == b"ordered_from" { { params: [t, t, int_type()], ret: ordering_type() } }
-  else if operation == b"reflect_from" || operation == b"shown_from" { gathered(list_type(value)) }
-  else if operation == b"digest_from" || operation == b"digest_entries_from" {
+  let gathered = |l: Type| { params: [t, l, int_type()], result_type: l };
+  if operation == b"equal" { { params: [t, t], result_type: bool_type() } }
+  else if operation == b"ordered" { { params: [t, t], result_type: ordering_type() } }
+  else if operation == b"equal_from" { { params: [t, t, int_type()], result_type: bool_type() } }
+  else if operation == b"ordered_from" {
+    { params: [t, t, int_type()], result_type: ordering_type() }
+  } else if operation == b"reflect_from" || operation == b"shown_from" {
+    gathered(list_type(value))
+  } else if operation == b"digest_from" || operation == b"digest_entries_from" {
     gathered(list_type(bytes_type()))
   } else if operation == b"reflect_entries_from" || operation == b"shown_entries_from" {
     gathered(entries)
-  } else if operation == b"digest" { { params: [t], ret: bytes_type() } }
-  else { { params: [t], ret: value } }
+  } else if operation == b"digest" { { params: [t], result_type: bytes_type() } }
+  else { { params: [t], result_type: value } }
 }
 
 pub type GeneratedRoot = {
@@ -185,7 +191,7 @@ fn container_walk_code(
   let next = binary_of(b"add", i, int_code(1));
   let looped = |name: Bytes, operands: List<Code>| {
     let key = keys::generated_key(ContainerWalk(name), walked, module);
-    call_of(module, key, operands, container_signature(name, walked).ret)
+    call_of(module, key, operands, container_signature(name, walked).result_type)
   };
   let length = |c: Code, over: List<Type>|
     builtin_call(
@@ -502,11 +508,11 @@ fn container_walk_code(
 pub fn name_in_module(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
-pub type InstanceFn = {
+pub type InstanceFunction = {
   full: Bytes,
   args: List<Type>,
   fn_type: Type,
-  ret: Type,
+  return_type: Type,
   effect_arguments: List<Effects>,
 }
 
@@ -515,7 +521,7 @@ pub fn key_instance(
   here: List<Definition>,
   items: List<Item>,
   ty: Type,
-) -> Option<InstanceFn> =
+) -> Option<InstanceFunction> =
   instance_for(module, here, ty, |c: Bytes|
     items.fold(None, |accumulator: Option<Bytes>, item: Item|
       match item {
@@ -531,7 +537,7 @@ pub fn numeric_instance(
   items: List<Item>,
   ty: Type,
   operation: Bytes,
-) -> Option<InstanceFn> =
+) -> Option<InstanceFunction> =
   instance_for(module, here, ty, |c: Bytes|
     items.fold(None, |accumulator: Option<Bytes>, item: Item|
       match item {
@@ -546,7 +552,7 @@ fn instance_for(
   here: List<Definition>,
   ty: Type,
   named: (Bytes) -> Option<Bytes>,
-) -> Option<InstanceFn> =
+) -> Option<InstanceFunction> =
   match ty {
     NamedType(c) -> match named(c.name) {
       None -> None,
@@ -554,7 +560,7 @@ fn instance_for(
           if h.name == f { h.scheme } else { s }) {
         Some(scheme) -> match scheme.ty {
           FunctionType(fn_type) -> {
-            let at_type = fn_type.params.push(fn_type.ret).fold(
+            let at_type = fn_type.params.push(fn_type.return_type).fold(
               None,
               |accumulator: Option<List<Type>>, t: Type|
                 match accumulator {
@@ -583,7 +589,7 @@ fn instance_for(
               full: qualify(module, f),
               args: args,
               fn_type: at_args(scheme.ty, scheme.type_variables, args),
-              ret: at_args(fn_type.ret, scheme.type_variables, args),
+              return_type: at_args(fn_type.return_type, scheme.type_variables, args),
               effect_arguments: effect_arguments,
             })
           },
@@ -595,17 +601,17 @@ fn instance_for(
     _ -> None,
   }
 
-fn stated_call(s: InstanceFn, args: List<Code>) -> Code =
+fn stated_call(s: InstanceFunction, args: List<Code>) -> Code =
   applied(
     unspanned_code(
       NDefinition({ full: s.full, args: s.args, effect_arguments: s.effect_arguments, labels: [] }),
       s.fn_type,
     ),
     args,
-    s.ret,
+    s.return_type,
   )
 
-pub fn instance_code(s: InstanceFn, params: List<Type>) -> Code =
+pub fn instance_code(s: InstanceFunction, params: List<Type>) -> Code =
   stated_call(
     s,
     range(0, params.len()).map(|i: Int|
@@ -615,7 +621,7 @@ pub fn instance_code(s: InstanceFn, params: List<Type>) -> Code =
       })),
   )
 
-pub fn key_comparison_code(k: InstanceFn, eq: Bool, ty: Type) -> Code = {
+pub fn key_comparison_code(k: InstanceFunction, eq: Bool, ty: Type) -> Code = {
   let ordered = compare_call(
     stated_call(k, [slot_code(b"a", 0, ty)]),
     stated_call(k, [slot_code(b"b", 1, ty)]),
@@ -973,7 +979,7 @@ pub fn release_resource_code(
     Some(fs) ->
       {
         code: sequence(
-          fs.filter(|f: Field| holds_resource(constructors, f.ty)).map(|f: Field|
+          fs.filter(|f: Field| contains_resource(constructors, f.ty)).map(|f: Field|
             let_go(field_code(a, f.name, f.ty))),
         ),
         here: [],
@@ -1018,7 +1024,7 @@ pub fn release_resource_code(
                         constructor_fields_at(sum_constructor, c.args),
                       );
                       let resource_payloads = xs.filter(|x: Bound|
-                        holds_resource(constructors, x.ty));
+                        contains_resource(constructors, x.ty));
                       {
                         arms: accumulator.arms.push({
                           pattern: CodeConstructorPattern({
@@ -1026,7 +1032,7 @@ pub fn release_resource_code(
                             name: sum_constructor.name,
                             case: sum_constructor.index,
                             args: xs.map(|x: Bound|
-                              if holds_resource(constructors, x.ty) { bound_pattern(x) }
+                              if contains_resource(constructors, x.ty) { bound_pattern(x) }
                               else { CodeWildcardPattern }),
                           }),
                           guard: None,
@@ -1090,11 +1096,11 @@ pub fn release_items_code(
 
 fn let_go(x: Code) -> Code = builtin_call(b"?let_go", [], [x], unit_type())
 
-pub fn is_marshal_op(operation: TypeOp) -> Bool =
+pub fn is_marshal_operation(operation: TypeOperation) -> Bool =
   match operation {
     Lower -> true,
     Lift -> true,
-    Keeping -> true,
+    Wrapping -> true,
     Opening -> true,
     ContainerWalk(c) -> marshal_loops().contains(c) || dynamic_loops().contains(c),
     _ -> false,
@@ -1108,7 +1114,7 @@ pub fn marshal_root(
   match key {
     Generated(w, _) -> {
       let marked = marked_type(w.ty, w.marks);
-      match w.op {
+      match w.operation {
         Lower ->
           generated_root(
             module,
@@ -1118,7 +1124,7 @@ pub fn marshal_root(
             lowering_code(module, constructors, marked),
           ),
         Lift -> generated_root(module, key, [], w.ty, lifting_code(module, constructors, marked)),
-        Keeping ->
+        Wrapping ->
           generated_root(
             module,
             key,
@@ -1279,7 +1285,7 @@ fn dynamic_code(
     },
     RecordType(fs) -> dynamic_record(a, fs, into, keeping),
     NominalType(x) -> dynamic_record(a, x.fields, into, keeping),
-    FunctionType(f) -> dynamic_function(f.params, f.ret, from, into, keeping),
+    FunctionType(f) -> dynamic_function(f.params, f.return_type, from, into, keeping),
     VariableType(_) -> internal_error(b"cannot convert a value whose type is a type variable"),
   }
 }
@@ -1321,14 +1327,21 @@ fn dynamic_function(
   let called = applied(slot_code(b"f", n, from), args, dynamic_side(return_type, !keeping));
   let ty = match into {
     FunctionType(g) -> g,
-    _ -> { params: params, kept: [], once: false, ret: return_type, effects: no_effects() },
+    _ ->
+      {
+        params: params,
+        keep_parameters: [],
+        once: false,
+        return_type: return_type,
+        effects: no_effects(),
+      },
   };
   {
     code: unspanned_code(
       CodeLambda({
         params: n,
         size: n + 1,
-        captures: [{ src: 0, destination: n }],
+        captures: [{ source: 0, destination: n }],
         body: wrap_handles(called, return_type, keeping),
         at: placed(0),
         ty: ty,
@@ -1483,7 +1496,7 @@ pub fn runtime_entry_code(
         effect_arguments: rows,
         labels: [],
       }),
-      fn_type(params, result, { listed: effects.listed, variable: None }),
+      function_type(params, result, { listed: effects.listed, variable: None }),
     ),
     reads,
     result,
@@ -1493,7 +1506,13 @@ pub fn runtime_entry_code(
     { code: direct, listed: effects.listed, n: 0 },
     |inner: { code: Code, listed: List<Effect>, n: Int }, host: { call: Bytes, effect: Bytes, adds: List<Effect> }| {
       let performs = { listed: inner.listed, variable: None };
-      let lambda_type = { params: [], kept: [], once: false, ret: result, effects: no_effects() };
+      let lambda_type = {
+        params: [],
+        keep_parameters: [],
+        once: false,
+        return_type: result,
+        effects: no_effects(),
+      };
       let left = inner.listed.filter(|a: Effect| a.effect != host.effect);
       let leaves = { listed: left, variable: None };
       {
@@ -1505,14 +1524,14 @@ pub fn runtime_entry_code(
               effect_arguments: [leaves],
               labels: [],
             }),
-            fn_type([FunctionType({ ..lambda_type, effects: performs })], result, leaves),
+            function_type([FunctionType({ ..lambda_type, effects: performs })], result, leaves),
           ),
           [
             unspanned_code(
               CodeLambda({
                 params: 0,
                 size: params.len(),
-                captures: range(0, params.len()).map(|i: Int| { src: i, destination: i }),
+                captures: range(0, params.len()).map(|i: Int| { source: i, destination: i }),
                 body: inner.code,
                 at: placed(inner.n),
                 ty: lambda_type,
@@ -1545,12 +1564,12 @@ pub fn called_definition(
 ) -> Definition / {abort.raise} =
   {
     name: name_in_module(module, root_text(root_name(root))),
-    ret: Some(kind_of(result).kind),
+    return_kind: Some(kind_of(result).kind),
     return_type: OpenShape([]),
     pure: pure,
     constant: false,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, result, effects))),
+    scheme: Some(monomorphic(function_type(params, result, effects))),
     witnesses: 0,
     borrowed: [],
     root: root,
@@ -2103,14 +2122,14 @@ fn is_marshallable_part(
       else if (k.name == list_name() || k.name == array_name()) && k.args.len() == 1 {
         c.marshals_containers && parts
       } else if k.name == columns_name() && k.args.len() == 1 {
-        c.marshals_containers && parts && k.args.all(|a: Type| holds_records(a, open))
+        c.marshals_containers && parts && k.args.all(|a: Type| has_record_fields(a, open))
       } else if k.name == map_name() && k.args.len() == 2 {
         c.marshals_containers && (!back || c.lifts) && parts
       } else { c.sums.contains(k.name) && !bad.contains(k.name) && parts }
     },
   }
 
-fn holds_records(t: Type, open: Bool) -> Bool =
+fn has_record_fields(t: Type, open: Bool) -> Bool =
   match t {
     RecordType(fs) -> fs.len() > 0,
     NominalType(x) -> x.fields.len() > 0,
@@ -2139,7 +2158,7 @@ fn generated_root(
 
 fn param_name(key: RootKey, i: Int) -> Bytes =
   match key {
-    Generated(w, _) -> match w.op {
+    Generated(w, _) -> match w.operation {
       ContainerWalk(c) -> if dynamic_loops().contains(c) {
         match i { 0 -> b"a", 1 -> b"out", _ -> b"i" }
       } else if i == 1 { if c.starts_with(b"lift") { b"n" } else { b"i" } }
@@ -2161,12 +2180,12 @@ fn definition_of(
 ) -> Definition / {abort.raise} =
   {
     name: name_in_module(module, root_text(root_name(key))),
-    ret: Some(kind_of(result).kind),
+    return_kind: Some(kind_of(result).kind),
     return_type: OpenShape([]),
     pure: effects.listed.len() == 0,
     constant: false,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, result, effects))),
+    scheme: Some(monomorphic(function_type(params, result, effects))),
     witnesses: 0,
     borrowed: [],
     root: key,
@@ -2189,7 +2208,7 @@ fn call_of(
         effect_arguments: [],
         labels: [],
       }),
-      fn_type(args.map(|a: Code| a.ty), return_type, no_effects()),
+      function_type(args.map(|a: Code| a.ty), return_type, no_effects()),
     ),
     args,
     return_type,

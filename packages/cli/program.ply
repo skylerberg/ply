@@ -13,7 +13,7 @@ import compiler.front.facts (Analysis, ShippedModuleSummary, CheckedProgram, Fra
 import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, locked_packages,
                        resolved_with_shipped)
 import compiler.check.resolve.defaults (ResolvedProgram)
-import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FnOutline,
+import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FunctionOutline,
                             KnownDefinitionRow, KnownTestRow, ModuleDerivations)
 import compiler.front.published (dump_of, no_rows)
 import compiler.front.pkg (PackageSources, LockedPackage, SuppliedPackage, closure)
@@ -69,7 +69,7 @@ pub type Program = {
   shipped_views: List<ShippedModuleSummary>,
   tallies: List<QueryStats>,
   missing_results: Int,
-  asked: List<Dependency>,
+  requested_dependencies: List<Dependency>,
   looked_up: List<Dependency>,
 }
 
@@ -131,7 +131,7 @@ fn failed_program(
     shipped_views: [],
     tallies: [],
     missing_results: 0,
-    asked: [],
+    requested_dependencies: [],
     looked_up: [],
   }
 
@@ -150,12 +150,12 @@ pub fn no_program() -> Program =
     packages: { root: b"", manifest: None, supplied: [] },
     embeds: [],
     inputs: Map::new(),
-    shipping: { sources: [], unread: [], data: [], asked: [], dependencies: [] },
+    shipping: { sources: [], unread: [], data: [], required_modules: [], dependencies: [] },
     prune_unreached: true,
     shipped_views: [],
     tallies: [],
     missing_results: 0,
-    asked: [],
+    requested_dependencies: [],
     looked_up: [],
   }
 
@@ -175,7 +175,7 @@ fn supplied(project: Project) -> List<SuppliedPackage> =
       root: Bytes::of_string(package.root),
       manifest: package.manifest,
       modules: package.files.map(|file: File|
-        { name: Bytes::of_string(file.module), src: file.text }),
+        { name: Bytes::of_string(file.module), source_text: file.text }),
     })
 
 fn read_paths(project: Project) -> List<paths::RootedPath> =
@@ -235,7 +235,7 @@ pub fn front_end(
     unread: shipping.unread,
     cut_unused: prune_unreached,
     data: shipping.data,
-    required: shipping.asked,
+    required: shipping.required_modules,
     pulls: shipping.dependencies,
     fixed: fixed,
     derived: derived,
@@ -249,7 +249,7 @@ pub fn reanalysed(
   moved: List<Bytes>,
 ) -> PulledAnalysis / {abort.raise} = {
   let rows = published_rows(program);
-  let stale = forms::keys_reaching(
+  let stale = forms::keys_referring_to(
     frame.hashes,
     moved.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes| accumulator.insert(n, true)),
   );
@@ -283,7 +283,7 @@ fn analysed(
   let texts = shipping.sources.fold(
     Map::new(),
     |accumulator: Map<String, Bytes>, source: Source|
-      accumulator.insert(String::of_bytes_lossy(source.name), source.src),
+      accumulator.insert(String::of_bytes_lossy(source.name), source.source_text),
   );
   let packages: PackageSources = packages_of(project);
   let warnings = root_warnings(results, project.sources.len());
@@ -296,7 +296,7 @@ fn analysed(
     pulled,
     all_shipped_names(shipping),
     shipping.sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, source: Source|
-      accumulator.insert(source.name, source.src)),
+      accumulator.insert(source.name, source.source_text)),
     true,
     prune_unreached,
     warnings,
@@ -326,20 +326,20 @@ fn analysed(
     shipped_views: loaded.views,
     tallies: [],
     missing_results: 0,
-    asked: [],
+    requested_dependencies: [],
     looked_up: [],
   };
   let owned = project.sources.fold(Map::new(), |accumulator: Map<Bytes, Bool>, source: Source|
     accumulator.insert(source.name, true));
   let mine = |m: Bytes| owned.contains(m);
   let own = loaded.frame.outlines.take(project.files.len());
-  let any_function = |pick: (FnOutline) -> Bool|
+  let any_function = |pick: (FunctionOutline) -> Bool|
     own.fold(false, |b: Bool, o: Outline|
       b
         || o.items.fold(false, |m: Bool, item: OutlineItem|
           m || (match item { OutlinedFunction(f) -> pick(f), _ -> false })));
-  let measured = any_function(|f: FnOutline| f.measured);
-  if !measured && !any_function(|f: FnOutline| f.reuse || f.returns) { program } else {
+  let measured = any_function(|f: FunctionOutline| f.measured);
+  if !measured && !any_function(|f: FunctionOutline| f.reuse || f.returns) { program } else {
     let rejected = |ds: List<Diagnostic>| { ..program, diagnostics: ds, frame: None };
     match whole_of(program) {
       Err(ds) -> rejected(ds),
@@ -418,7 +418,8 @@ fn parsed_into<| e>(
 ) -> ParsedSources / {abort.raise | e} =
   sources.fold(parses, |accumulator: ParsedSources, s: Source|
     match accumulator.get(s.name) {
-      Some(p) -> if p.src == s.src { accumulator } else { accumulator.insert(s.name, parsing(s)) },
+      Some(p) -> if p.text == s.source_text { accumulator }
+      else { accumulator.insert(s.name, parsing(s)) },
       None -> accumulator.insert(s.name, parsing(s)),
     })
 
@@ -436,7 +437,7 @@ fn resolved_from(
     embeds.map(|embed: Embed| embed.embedded),
     shipping.unread,
     shipping.data,
-    shipping.asked,
+    shipping.required_modules,
     shipping.dependencies,
     parses.values(),
   )
@@ -465,7 +466,7 @@ pub fn resolution_of(
           parse_from(
             0,
             s,
-            parse(s.src),
+            parse(s.source_text),
             derivations: match derived.find(|m: ModuleDerivations| m.module == s.name) {
               Some(m) -> m.derivations,
               None -> [],
@@ -502,7 +503,7 @@ pub fn renamed_resolution(
     let names = own.fold(Map::new(), |accumulator: Map<Bytes, Bool>, s: Source|
       accumulator.insert(s.name, true));
     let texts = project.sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-      accumulator.insert(s.name, s.src));
+      accumulator.insert(s.name, s.source_text));
     let shipped = {
       ..shipping,
       sources: shipping.sources.filter(|s: Source| !names.contains(s.name)),
@@ -514,7 +515,7 @@ pub fn renamed_resolution(
       parse_from(
         0,
         s,
-        parse(s.src),
+        parse(s.source_text),
         library: Some(|ask: DeriverRequest| derivation_result(ask, texts)),
       ));
     {
@@ -554,7 +555,7 @@ fn assembled(
     ..assembled_from(project, shipping, paths, q, true),
     tallies: q.tallies,
     missing_results: q.missing_results,
-    asked: q.asked,
+    requested_dependencies: q.requested_dependencies,
     looked_up: q.looked_up,
   }
 
@@ -590,7 +591,7 @@ fn assembled_from(
       let texts = shipping.sources.fold(
         Map::new(),
         |accumulator: Map<String, Bytes>, source: Source|
-          accumulator.insert(String::of_bytes_lossy(source.name), source.src),
+          accumulator.insert(String::of_bytes_lossy(source.name), source.source_text),
       );
       let pulled = results.drop(own.modules.len()).map(|a: CheckedModule|
         shipped_place(texts, String::of_bytes_lossy(a.module)));
@@ -731,7 +732,7 @@ pub fn cache_command(
           project,
           key,
           made,
-          program.asked,
+          program.requested_dependencies,
           program.looked_up,
           output,
         )
@@ -741,7 +742,7 @@ pub fn cache_command(
           project,
           key,
           made,
-          program.asked,
+          program.requested_dependencies,
           program.looked_up,
           output,
         )
@@ -943,7 +944,7 @@ pub fn sources_of(program: Program, frame: Frame) -> List<Source> / {abort.raise
   range(0, frame.outlines.len()).map(|i: Int|
     {
       name: frame.outlines.get(i).name,
-      src: match program.source_texts.at(i) { Some(place) -> place.text, None -> b"" },
+      source_text: match program.source_texts.at(i) { Some(place) -> place.text, None -> b"" },
     })
 
 pub fn in_root_package(frame: Frame) -> (Bytes) -> Bool = {
@@ -1148,12 +1149,12 @@ test "a proof covers the root package's claims and never a shipped module's" {
       [
         {
           name: b"m",
-          src: b"import std.y\nimport compiler.x\nfn own() -> Int = y::one() + x::one()\n",
+          source_text: b"import std.y\nimport compiler.x\nfn own() -> Int = y::one() + x::one()\n",
         },
       ],
       [
-        { name: b"std.y", src: b"pub fn one() -> Int = 1\n" },
-        { name: b"compiler.x", src: b"pub fn one() -> Int = 1\n" },
+        { name: b"std.y", source_text: b"pub fn one() -> Int = 1\n" },
+        { name: b"compiler.x", source_text: b"pub fn one() -> Int = 1\n" },
       ],
       no_rows(),
       cut_unused: false,
@@ -1176,10 +1177,10 @@ fn a_definition(name: Bytes, simple: Bytes) -> DefinitionInfo =
       keep_variables: [],
       label_variables: [],
       ty: FunctionType({
-        kept: [],
+        keep_parameters: [],
         once: false,
         params: [],
-        ret: NamedType({ name: b"Int", args: [] }),
+        return_type: NamedType({ name: b"Int", args: [] }),
         effects: { listed: [], variable: None },
       }),
     },

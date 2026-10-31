@@ -6,10 +6,10 @@ import compiler.syntax.node_ids (numbered)
 import compiler.emit.code (CodeListPattern, CodeBindingPattern)
 import compiler.emit.keys (Named)
 import compiler.emit.typed_ir (Representation, AsInt, AsFixed, AsWord, AsFloat, AsSum, AsListView,
-                               Var, VarOperand, BoolOperand, Primitive, Get, CasePath, LeafPath,
-                               Inst, Let, Assign, If, Case, Match, Miss, Fail, NoMatchingArm,
-                               LetMismatch, Block, Test, TagTest, IntTest, RangeTest, LengthTest,
-                               Op, OfContainers)
+                               Variable, VariableOperand, BoolOperand, Primitive, Get, CasePath,
+                               LeafPath, Instruction, Let, Assign, If, Case, Match, Miss, Fail,
+                               NoMatchingArm, LetMismatch, Block, Test, TagTest, IntTest, RangeTest,
+                               LengthTest, OperationCall, OfContainers)
 import compiler.emit.typed_ir.containers (ItemAt)
 import compiler.emit.lower.base (initial_lowering)
 import compiler.emit.lower.calling (context_of)
@@ -19,7 +19,7 @@ import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
 import compiler.emit.pieces (pieces_text)
 
-fn param_of(source: Bytes, name: Bytes, i: Int) -> Var / {abort.raise} =
+fn param_of(source: Bytes, name: Bytes, i: Int) -> Variable / {abort.raise} =
   match program_of(source) {
     Err(reason) -> panic(String::of_bytes_lossy(reason)),
     Ok(p) -> {
@@ -47,7 +47,7 @@ fn span_in(source: Bytes, name: Bytes, pick: (Expression) -> Span) -> Span / {ab
     })
 
 fn arms_of(body: Block) -> List<Block> =
-  body.fold([], |accumulator: List<Block>, i: Inst|
+  body.fold([], |accumulator: List<Block>, i: Instruction|
     match i { Match(m) -> if accumulator == [] { m.arms } else { accumulator }, _ -> accumulator })
 
 fn opening_case(arm: Block) -> Option<{ test: Test, when: Int, body: Block }> =
@@ -59,7 +59,7 @@ fn opening_case(arm: Block) -> Option<{ test: Test, when: Int, body: Block }> =
     _ -> None,
   }
 
-fn case_read(i: Inst) -> Option<{ of: Var, case: Int }> =
+fn case_read(i: Instruction) -> Option<{ of: Variable, case: Int }> =
   match i {
     Let(l) -> match l.value {
       Get(g) -> match g.path {
@@ -73,10 +73,10 @@ fn case_read(i: Inst) -> Option<{ of: Var, case: Int }> =
 
 fn first_case(
   b: Block,
-) -> Option<{ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }> =
+) -> Option<{ on: Variable, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }> =
   b.fold(
     None,
-    |accumulator: Option<{ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }>, i: Inst|
+    |accumulator: Option<{ on: Variable, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }>, i: Instruction|
       match accumulator {
         Some(_) -> accumulator,
         None -> match i { Case(c) -> Some(c), _ -> None },
@@ -108,7 +108,7 @@ test "integer literals and ranges are each tested in their own `Case`, and an ar
           match a.at(0) { Some(Case(c)) -> c.rest == [Miss], _ -> true }),
       );
       assert(
-        body.any(|i: Inst|
+        body.any(|i: Instruction|
           match i {
             Match(m) ->
               m.rest == [Fail({ reason: NoMatchingArm, at: matched, resource: [], unwind: [] })],
@@ -183,7 +183,7 @@ test "a guard is tested inside its arm's pattern test, and a guard that is false
         },
         None -> None,
       };
-      assert_eq(guard, Some({ cond: VarOperand(even), otherwise: [Miss] }))
+      assert_eq(guard, Some({ cond: VariableOperand(even), otherwise: [Miss] }))
     },
   };
   match body_of(b"fn either(n: Int) -> Int = match n { 1 | 2 -> 1, _ -> 0 }\n", b"either") {
@@ -220,14 +220,15 @@ test "a constructor pattern tests the constructor's index within its sum, and re
         opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
           match o {
             Some(x) ->
-              x.body.map(case_read).filter(|r: Option<{ of: Var, case: Int }>| r != None).len(),
+              x.body.map(case_read).filter(|r: Option<{ of: Variable, case: Int }>| r != None).len(
+              ),
             None -> 0 - 1,
           }),
         [0, 2, 0],
       );
       let reads = match opened.at(1) { Some(Some(x)) -> x.body.take(2).map(case_read), _ -> [] };
       assert_eq(
-        reads.map(|r: Option<{ of: Var, case: Int }>|
+        reads.map(|r: Option<{ of: Variable, case: Int }>|
           match r {
             Some(x) -> Some({ of: x.of.id, sum: is_sum(x.of.representation), case: x.case }),
             None -> None,
@@ -276,7 +277,7 @@ test "matching an `Option` tests its tag to tell `None` from `Some`, and reads `
       assert_eq(
         match opened.at(0) {
           Some(Some(y)) ->
-            y.body.map(case_read).filter(|r: Option<{ of: Var, case: Int }>| r != None),
+            y.body.map(case_read).filter(|r: Option<{ of: Variable, case: Int }>| r != None),
           _ -> [],
         },
         [Some({ of: o, case: 1 })],
@@ -371,12 +372,12 @@ test "a list pattern tests the list's length, then reads each item it tests or b
         ],
       );
       assert_eq(
-        (match opened.at(1) { Some(Some(x)) -> x.body.take(1), _ -> [] }).map(|i: Inst|
+        (match opened.at(1) { Some(Some(x)) -> x.body.take(1), _ -> [] }).map(|i: Instruction|
           match i {
             Let(l) -> match l.value {
-              Op(o) -> if o.op != OfContainers(ItemAt) { None } else {
+              OperationCall(o) -> if o.operation != OfContainers(ItemAt) { None } else {
                 Some({
-                  of_list: o.args.at(0) == Some(VarOperand(xs)),
+                  of_list: o.args.at(0) == Some(VariableOperand(xs)),
                   owned: o.uses.owned,
                   held: l.var.representation,
                 })
@@ -396,12 +397,12 @@ test "a record or tuple pattern tests nothing and reads the fields it binds" {
     Err(reason) -> assert_eq(reason, b""),
     Ok(body) -> {
       assert_eq(
-        body.filter(|i: Inst|
+        body.filter(|i: Instruction|
           match i { Case(_) -> true, If(_) -> true, Match(_) -> true, _ -> false }),
         [],
       );
       assert_eq(
-        body.take(2).map(|i: Inst| match case_read(i) { Some(r) -> r.of.id, None -> 0 - 1 }),
+        body.take(2).map(|i: Instruction| match case_read(i) { Some(r) -> r.of.id, None -> 0 - 1 }),
         [0, 0],
       )
     },
@@ -412,9 +413,10 @@ test "a record or tuple pattern tests nothing and reads the fields it binds" {
     ) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(body) ->
-      assert_eq(arms_of(body).map(|a: Block| a.take(2).map(|i: Inst| case_read(i) != None)), [
-        [true, true],
-      ]),
+      assert_eq(
+        arms_of(body).map(|a: Block| a.take(2).map(|i: Instruction| case_read(i) != None)),
+        [[true, true]],
+      ),
   }
 }
 
@@ -434,7 +436,7 @@ test "a refutable `let` tests its pattern and fails when the pattern does not ma
     Ok(body) -> {
       assert_eq(
         first_case(body).map(
-          |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+          |c: { on: Variable, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
             {
               on: c.on,
               test: c.test,
@@ -457,12 +459,12 @@ test "a refutable `let` tests its pattern and fails when the pattern does not ma
 test "comparing a value with a constructor of its sum produces a `Bool` computed from the constructor's tag test" {
   let o = param_of(b"fn unset(o: Option<Int>) -> Bool = o == None\n", b"unset", 0);
   let set_to = |b: Block|
-    b.fold([], |accumulator: List<Bool>, i: Inst|
+    b.fold([], |accumulator: List<Bool>, i: Instruction|
       match i {
         Assign(a) -> match a.arg { BoolOperand(x) -> accumulator.push(x), _ -> accumulator },
         _ -> accumulator,
       });
-  let joined = |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+  let joined = |c: { on: Variable, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
     {
       test: c.test,
       when: c.arms.map(|a: { when: Int, body: Block }| a.when),
@@ -474,7 +476,8 @@ test "comparing a value with a constructor of its sum produces a `Bool` computed
     Ok(body) -> {
       assert_eq(
         first_case(body).map(
-          |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }| c.on,
+          |c: { on: Variable, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+            c.on,
         ),
         Some(o),
       );
@@ -545,10 +548,10 @@ test "comparing a value with a constructor of its sum produces a `Bool` computed
         match first_case(body) {
           Some(c) -> match c.arms.at(0) {
             Some(a) ->
-              a.body.map(|i: Inst|
+              a.body.map(|i: Instruction|
                 match i {
                   Let(l) -> match l.value {
-                    Primitive(p) -> Some(p.op),
+                    Primitive(p) -> Some(p.operation),
                     Get(_) -> Some(b"get"),
                     _ -> None,
                   },
@@ -570,14 +573,18 @@ test "a constructor's computed argument is lowered before the comparison and com
     b"fn not_negative_zero(x: Option<Float>) -> Bool = x != Some(-0.0)\n",
   ]);
   let operations = |body: Block|
-    body.fold([], |accumulator: List<Bytes>, i: Inst|
+    body.fold([], |accumulator: List<Bytes>, i: Instruction|
       match i {
         Case(c) -> match c.arms.at(0) {
           Some(a) ->
             accumulator.concat(
-              a.body.map(|x: Inst|
+              a.body.map(|x: Instruction|
                 match x {
-                  Let(l) -> match l.value { Primitive(p) -> p.op, Get(_) -> b"get", _ -> b"other" },
+                  Let(l) -> match l.value {
+                    Primitive(p) -> p.operation,
+                    Get(_) -> b"get",
+                    _ -> b"other",
+                  },
                   If(_) -> b"if",
                   _ -> b"other",
                 }),
@@ -600,7 +607,7 @@ test "a constructor's computed argument is lowered before the comparison and com
 }
 
 fn tags_tested(b: Block) -> List<List<Bytes>> =
-  b.fold([], |accumulator: List<List<Bytes>>, i: Inst|
+  b.fold([], |accumulator: List<List<Bytes>>, i: Instruction|
     match i {
       Case(c) -> {
         let here = match c.test { TagTest(names) -> accumulator.push(names), _ -> accumulator };
@@ -654,7 +661,7 @@ test "a list pattern over a view reads its items from the view's list at its off
         let st = arm_start(
           context_of(p.setting, root, code),
           initial_lowering([s]),
-          VarOperand(s),
+          VariableOperand(s),
           {
             pattern: CodeListPattern({
               items: [binder(b"x", 1, int_type())],
@@ -665,13 +672,13 @@ test "a list pattern over a view reads its items from the view's list at its off
           },
         );
         assert_eq(
-          first_case(st.insts).map(
-            |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+          first_case(st.instructions).map(
+            |c: { on: Variable, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
               { on: c.on, test: c.test },
           ),
           Some({ on: s, test: LengthTest({ at_least: 1 }) }),
         );
-        let leaves = st.insts.fold([], |accumulator: List<Var>, i: Inst|
+        let leaves = st.instructions.fold([], |accumulator: List<Variable>, i: Instruction|
           match i {
             Let(l) -> match l.value {
               Get(g) -> if g.of == s && (g.path == LeafPath(0) || g.path == LeafPath(1)) {
@@ -682,17 +689,18 @@ test "a list pattern over a view reads its items from the view's list at its off
             _ -> accumulator,
           });
         assert(
-          st.insts.any(|i: Inst|
+          st.instructions.any(|i: Instruction|
             match i {
               Let(l) -> match l.value {
-                Op(o) -> o.op == OfContainers(ItemAt) && o.args == leaves.map(VarOperand),
+                OperationCall(o) ->
+                  o.operation == OfContainers(ItemAt) && o.args == leaves.map(VariableOperand),
                 _ -> false,
               },
               _ -> false,
             }),
         );
         assert_eq(
-          match st.env.get(2) { Some(VarOperand(v)) -> Some(v.representation), _ -> None },
+          match st.env.get(2) { Some(VariableOperand(v)) -> Some(v.representation), _ -> None },
           Some(AsListView),
         )
       },
@@ -709,9 +717,9 @@ test "a literal of any other type is tested by its type's equality" {
           Some([Let(l), If(x)]) -> match l.value {
             Primitive(p) ->
               Some({
-                op: p.op,
+                op: p.operation,
                 on: p.on,
-                tested: x.cond == VarOperand(l.var),
+                tested: x.cond == VariableOperand(l.var),
                 otherwise: x.otherwise,
               }),
             _ -> None,
@@ -726,16 +734,16 @@ test "a literal of any other type is tested by its type's equality" {
     Ok(p) -> {
       let f = lowered_root(p, b"word");
       assert(match arms_of(f.body).at(0) {
-        Some(a) -> a.any(|i: Inst| match i { If(_) -> true, _ -> false }),
+        Some(a) -> a.any(|i: Instruction| match i { If(_) -> true, _ -> false }),
         None -> false,
       })
     },
   }
 }
 
-type CorpusRoot = { name: Bytes, src: Bytes }
+type CorpusRoot = { name: Bytes, source_text: Bytes }
 
-fn lowers(name: Bytes, source: Bytes) -> CorpusRoot = { name: name, src: source }
+fn lowers(name: Bytes, source: Bytes) -> CorpusRoot = { name: name, source_text: source }
 
 fn corpus_types() -> Bytes =
   Bytes::concat_all([
@@ -1246,7 +1254,9 @@ fn corpus_roots() -> List<CorpusRoot> =
   ]
 
 fn corpus() -> Bytes =
-  corpus_types().concat(Bytes::concat_all(corpus_roots().map(|r: CorpusRoot| r.src.concat(b"\n"))))
+  corpus_types().concat(
+    Bytes::concat_all(corpus_roots().map(|r: CorpusRoot| r.source_text.concat(b"\n"))),
+  )
 
 test "every function in the matching test program lowers, passes the ownership check and prints C without failure" {
   match program_of(corpus()) {

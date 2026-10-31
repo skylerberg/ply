@@ -8,17 +8,18 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     TaggedLiteralExpression, InvalidExpression, HoleExpression,
                                     TryBlockExpression, Param, Statement, LetStatement,
                                     LetElseStatement, ExpressionStatement, AssignmentStatement,
-                                    MatchArm, HandleClause, ReturnClause, HandlerVar, NamedArg,
-                                    RecordLiteralField, Hole, expression_span, written_operator)
+                                    MatchArm, HandleClause, ReturnClause, HandlerStateVariable,
+                                    NamedArg, RecordLiteralField, Hole, expression_span,
+                                    written_operator)
 import compiler.syntax.fmt
 import compiler.syntax.items
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, DeriveItem, EffectSetItem, ExternItem, InstanceItem,
                               NumericItem, ImportDeclaration, WholeModule, ModuleAlias,
                               SelectedNames, Binder, SpecClause, RequiresClause, EnsuresClause,
-                              CostClause, SpaceClause, VariantDefinition, OpDefinition, AliasBody,
-                              SumBody, NominalBody, ExternBody, item_span, item_doc, is_pub,
-                              is_explicit_import)
+                              CostClause, SpaceClause, VariantDefinition, OperationDefinition,
+                              AliasBody, SumBody, NominalBody, ExternBody, item_span, item_doc,
+                              is_pub, is_explicit_import)
 import compiler.syntax.lexer
 import compiler.syntax.parsing
 import compiler.syntax.parsing (ParseDiagnostic, Parser, Input)
@@ -110,7 +111,7 @@ type NodeSyntax =
   | ImportAliasSyntax(parsing::Identifier)
   | ItemSyntax(Item)
   | VariantSyntax(VariantDefinition)
-  | OperationSyntax(OpDefinition)
+  | OperationSyntax(OperationDefinition)
   | ParameterSyntax(Param)
   | ClauseSyntax(SpecClause)
   | DecreasesSyntax(Expression)
@@ -120,7 +121,7 @@ type NodeSyntax =
   | ArmSyntax(MatchArm)
   | HandlerSyntax(HandleClause)
   | ReturnHandlerSyntax(ReturnClause)
-  | HandlerVariableSyntax(HandlerVar)
+  | HandlerVariableSyntax(HandlerStateVariable)
   | FieldSyntax({ name: parsing::Identifier, value: Expression })
   | PatternFieldSyntax({ name: parsing::Identifier, pattern: Pattern })
   | TypeFieldSyntax({ name: parsing::Identifier, ty: TypeExpression })
@@ -295,7 +296,7 @@ fn item_parts(item: Item) -> List<NodeSyntax> =
     FunctionItem(d) ->
       all_of([
         as_params(d.params),
-        optional(d.ret, |t: TypeExpression| TypeSyntax(t)),
+        optional(d.return_type, |t: TypeExpression| TypeSyntax(t)),
         optional(d.effects, |r: EffectsExpression| EffectsSyntax(r)),
         as_clauses(d.spec),
         optional(d.decreases, |e: Expression| DecreasesSyntax(e)),
@@ -307,7 +308,7 @@ fn item_parts(item: Item) -> List<NodeSyntax> =
       NominalBody(t) -> [TypeSyntax(t)],
       ExternBody -> [],
     },
-    EffectItem(d) -> d.operations.map(|o: OpDefinition| OperationSyntax(o)),
+    EffectItem(d) -> d.operations.map(|o: OperationDefinition| OperationSyntax(o)),
     TestItem(d) ->
       all_of([
         match d.cases {
@@ -349,7 +350,7 @@ fn item_parts(item: Item) -> List<NodeSyntax> =
     ExternItem(d) ->
       all_of([
         as_params(d.params),
-        [TypeSyntax(d.ret)],
+        [TypeSyntax(d.return_type)],
         optional(d.effects, |r: EffectsExpression| EffectsSyntax(r)),
         as_clauses(d.spec),
       ]),
@@ -393,12 +394,12 @@ fn expression_parts(source: Bytes, e: Expression) -> List<NodeSyntax> / {abort.r
     fmt::AsParsed -> match e {
       LiteralExpression(_) -> [],
       NameExpression(_) -> [],
-      BinaryExpression(v) -> [ExpressionSyntax(v.lhs), ExpressionSyntax(v.rhs)],
+      BinaryExpression(v) -> [ExpressionSyntax(v.left_operand), ExpressionSyntax(v.right_operand)],
       UnaryExpression(v) -> [ExpressionSyntax(v.operand)],
       LambdaExpression(v) ->
         all_of([
           as_params(v.params),
-          optional(v.ret, |t: TypeExpression| TypeSyntax(t)),
+          optional(v.return_clause, |t: TypeExpression| TypeSyntax(t)),
           [ExpressionSyntax(v.body)],
         ]),
       CallExpression(v) -> if is_operator(e) || is_display(e) { as_values(v.args) } else {
@@ -436,9 +437,9 @@ fn expression_parts(source: Bytes, e: Expression) -> List<NodeSyntax> / {abort.r
           source,
           all_of([
             [ExpressionSyntax(v.body)],
-            v.vars.map(|x: HandlerVar| HandlerVariableSyntax(x)),
+            v.handler_variables.map(|x: HandlerStateVariable| HandlerVariableSyntax(x)),
             v.clauses.map(|c: HandleClause| HandlerSyntax(c)),
-            optional(v.ret, |r: ReturnClause| ReturnHandlerSyntax(r)),
+            optional(v.return_clause, |r: ReturnClause| ReturnHandlerSyntax(r)),
           ]),
         ),
       WithScopeExpression(v) ->
@@ -485,7 +486,7 @@ fn type_parts(t: TypeExpression) -> List<NodeSyntax> / {abort.raise} =
     FunctionTypeExpression(x) ->
       all_of([
         as_types(x.params),
-        [TypeSyntax(x.ret)],
+        [TypeSyntax(x.return_type)],
         optional(x.effects, |r: EffectsExpression| EffectsSyntax(r)),
       ]),
     RecordTypeExpression(x) -> if fmt::is_type_tuple(x.fields) {
@@ -514,7 +515,7 @@ fn parts_of(source: Bytes, at: NodeSyntax) -> List<NodeSyntax> / {abort.raise} =
     ItemSyntax(item) -> item_parts(item),
     VariantSyntax(v) -> as_types(v.fields),
     OperationSyntax(o) -> if is_raise(o.mode) { as_types(o.params) }
-    else { as_types(o.params).push(TypeSyntax(o.ret)) },
+    else { as_types(o.params).push(TypeSyntax(o.return_type)) },
     ParameterSyntax(p) ->
       all_of([
         optional(p.ty, |t: TypeExpression| TypeSyntax(t)),
@@ -703,11 +704,11 @@ fn name_of(at: NodeSyntax) -> Option<parsing::Identifier> =
     ExpressionSyntax(e) -> match e {
       NameExpression(v) -> Some(v.name.name),
       FieldExpression(v) -> Some(v.field),
-      PerformExpression(v) -> Some(v.op),
+      PerformExpression(v) -> Some(v.operation),
       TaggedLiteralExpression(t) -> Some(t.tag),
       _ -> None,
     },
-    HandlerSyntax(c) -> Some(c.op),
+    HandlerSyntax(c) -> Some(c.operation),
     HandlerVariableSyntax(v) -> Some(v.name),
     StatementSyntax(statement) -> match statement {
       AssignmentStatement(v) -> Some(v.name),
@@ -780,9 +781,9 @@ fn resolve_method_call(origin: Origin, at: NodeSyntax) -> NodeSyntax =
           CallExpression({
             span: p.span,
             function: FieldExpression({
-              span: parsing::span_to(p.effect_name.span, p.op.span),
+              span: parsing::span_to(p.effect_name.span, p.operation.span),
               base: on,
-              field: p.op,
+              field: p.operation,
             }),
             named: [],
             args: p.args,
@@ -807,8 +808,8 @@ pub fn qualifier(node: Node) -> Option<Identifier> =
 pub fn operator(node: Node) -> Option<String> =
   match node {
     Node(_, ExpressionSyntax(e)) -> match e {
-      BinaryExpression(v) -> Some(String::of_bytes_lossy(fmt::op_text(v.op))),
-      UnaryExpression(v) -> Some(String::of_bytes_lossy(fmt::unary_text(v.op))),
+      BinaryExpression(v) -> Some(String::of_bytes_lossy(fmt::operation_text(v.operation))),
+      UnaryExpression(v) -> Some(String::of_bytes_lossy(fmt::unary_text(v.operation))),
       CallExpression(v) -> match written_operator(v.function, v.args) {
         Some(o) -> Some(String::of_bytes_lossy(o.text)),
         None -> None,

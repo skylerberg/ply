@@ -1552,7 +1552,7 @@ pub fn negotiated<| e, s>(
 pub type HeadReadResult =
   /// What arrived up to the end of the head; `complete` is false when the head ran past the size bound,
   /// which `parse_head` then rejects with 431 or 414.
-  | HeadBytes({ buf: Bytes, complete: Bool })
+  | HeadBytes({ head: Bytes, complete: Bool })
   /// The head began arriving and did not finish inside `header_timeout_ms`: 408.
   | HeadTimedOut
   /// Nothing arrived between messages on a kept-alive connection: close without writing.
@@ -1614,8 +1614,8 @@ fn read_head_loop<[l]>(
   reads: Int,
   r: HeadBuffer,
 ) -> HeadReadResult / {net.recv[l], abort.raise} =
-  if r.found { HeadBytes({ buf: Bytes::concat_all(r.pieces), complete: true }) }
-  else if r.total >= cap { HeadBytes({ buf: Bytes::concat_all(r.pieces), complete: false }) }
+  if r.found { HeadBytes({ head: Bytes::concat_all(r.pieces), complete: true }) }
+  else if r.total >= cap { HeadBytes({ head: Bytes::concat_all(r.pieces), complete: false }) }
   else if reads <= 0 { HeadTimedOut } else {
     match net.recv[l](c, min_int(read_size(), cap - r.total), slice) {
       None -> read_head_loop[l](c, limits, cap, slice, reads - 1, r),
@@ -2000,7 +2000,7 @@ fn exchange_over<[l]>(
       HeadTimedOut -> Err(TimedOut),
       HeadIdle -> Err(TimedOut),
       HeadClosed(_) -> Err(Closed),
-      HeadBytes(got) -> match parse_response_head(got.buf, request.method, limits) {
+      HeadBytes(got) -> match parse_response_head(got.head, request.method, limits) {
         ResponseRejected(r) -> Err(Malformed(r)),
         ResponseIncomplete ->
           Err(
@@ -2012,7 +2012,7 @@ fn exchange_over<[l]>(
             }),
           ),
         ResponseParsed(head) ->
-          read_response[l](c, head, got.buf.slice(head.consumed, got.buf.len()), limits),
+          read_response[l](c, head, got.head.slice(head.consumed, got.head.len()), limits),
       },
     }
   }
@@ -2339,7 +2339,7 @@ fn exchange_tunnelled<[l]>(
       HeadTimedOut -> Err(NoOutcome(TimedOut)),
       HeadIdle -> Err(NoOutcome(TimedOut)),
       HeadClosed(_) -> Err(NoOutcome(Closed)),
-      HeadBytes(got) -> match parse_response_head(got.buf, Other("CONNECT"), limits) {
+      HeadBytes(got) -> match parse_response_head(got.head, Other("CONNECT"), limits) {
         ResponseRejected(r) -> Err(NoOutcome(Malformed(r))),
         ResponseIncomplete ->
           Err(
@@ -2350,7 +2350,13 @@ fn exchange_tunnelled<[l]>(
         ResponseParsed(head) -> if head.status < 200 || head.status > 299 {
           Err(ProxyRejected(head.status))
         } else {
-          exchange_secured[l](c, host, got.buf.slice(head.consumed, got.buf.len()), request, limits)
+          exchange_secured[l](
+            c,
+            host,
+            got.head.slice(head.consumed, got.head.len()),
+            request,
+            limits,
+          )
         },
       },
     }
@@ -2401,8 +2407,8 @@ pub fn serve_draining<[l] | e>(
     let origin = client_identity_of[l](h);
     let first = read_head[l](h, b"", limits, false);
     match first {
-      HeadBytes(got) if got.buf.starts_with(preface_head()) ->
-        start_h2[l](h, got.buf, limits, app, || stopped_by(stop), origin),
+      HeadBytes(got) if got.head.starts_with(preface_head()) ->
+        start_h2[l](h, got.head, limits, app, || stopped_by(stop), origin),
       _ ->
         handle_head[l](
           h,
@@ -2533,10 +2539,10 @@ fn after_head<[l] | e>(
   stoppable: Bool,
   stopping: () -> Bool / e,
   origin: ClientIdentity,
-  read: { buf: Bytes, complete: Bool },
+  read: { head: Bytes, complete: Bool },
   left: Int,
 ) -> Unit / {abort.raise, net.peer_certificate[l], net.recv[l], net.send[l] | e} =
-  match parse_head(read.buf, limits) {
+  match parse_head(read.head, limits) {
     Incomplete -> if read.complete {
       send_error_response[l](c, limits, 400, "the request head never ended\n")
     } else {
@@ -2544,7 +2550,7 @@ fn after_head<[l] | e>(
     },
     HeadRejected(r) -> send_error_response[l](c, limits, r.status, r.reason ++ "\n"),
     Parsed(head) -> {
-      let rest = read.buf.slice(head.consumed, read.buf.len());
+      let rest = read.head.slice(head.consumed, read.head.len());
       let keep = head.keep_alive && left > 0 && !(stoppable && rest.len() == 0 && stopping());
       let from = with_client_certificate[l](c, origin);
       let request = {
@@ -2585,7 +2591,7 @@ fn incoming_chunks() -> Seq<Bytes | {Reading}> = {
 
 type Inbound = {
   state: BodyState,
-  buf: Bytes,
+  buffer: Bytes,
   continued: Bool,
   reads: Int,
   slice: Int,
@@ -2608,7 +2614,7 @@ fn serve_request<[l] | e>(
 ) -> ExchangeResult / {abort.raise, net.recv[l], net.send[l] | e} = {
   let start: Inbound = {
     state: body_start(head.framing, limits),
-    buf: rest,
+    buffer: rest,
     continued: !head.expects_continue,
     reads: read_budget(limits.body_timeout_ms),
     slice: slice_ms(limits.body_timeout_ms),
@@ -2640,7 +2646,7 @@ fn serve_request<[l] | e>(
         { keep: false, rest: b"" }
       },
       Ok(reusable) -> if !reusable || !s.continued { { keep: false, rest: b"" } }
-      else if s.ended { { keep: true, rest: s.buf } }
+      else if s.ended { { keep: true, rest: s.buffer } }
       else { read_past[l](c, limits, s) },
     }
   } with {
@@ -2666,7 +2672,7 @@ fn read_past<[l]>(
     iterate(s, limits.max_body + s.reads + 2, |at: Inbound|
       if at.ended { Stop(at) } else { Continue(pull_body_piece[l](c, limits, at).inbound) })
   };
-  match read { Ok(done) -> { keep: true, rest: done.buf }, Err(_) -> { keep: false, rest: b"" } }
+  match read { Ok(done) -> { keep: true, rest: done.buffer }, Err(_) -> { keep: false, rest: b"" } }
 }
 
 fn pull_body_piece<[l]>(
@@ -2678,22 +2684,22 @@ fn pull_body_piece<[l]>(
     if !s.continued && !send_all[l](c, continue_response(), limits.write_timeout_ms) {
       incoming.fail({ status: 400, reason: "the client went away\n" })
     } else { () };
-    iterate({ ..s, continued: true }, s.reads + s.buf.len() + 2, |at: Inbound|
-      match body_step(at.state, at.buf) {
+    iterate({ ..s, continued: true }, s.reads + s.buffer.len() + 2, |at: Inbound|
+      match body_step(at.state, at.buffer) {
         Rejected(r) -> incoming.fail(r),
         Complete(done) ->
           Stop({
             inbound: {
               ..at,
-              buf: at.buf.slice(done.consumed, at.buf.len()),
+              buffer: at.buffer.slice(done.consumed, at.buffer.len()),
               ended: true,
               trailers: done.trailers,
             },
             piece: done.out,
           }),
         Await(step) -> {
-          let rest = at.buf.slice(step.consumed, at.buf.len());
-          let moved = { ..at, state: step.state, buf: rest };
+          let rest = at.buffer.slice(step.consumed, at.buffer.len());
+          let moved = { ..at, state: step.state, buffer: rest };
           if step.out.len() > 0 { Stop({ inbound: moved, piece: step.out }) }
           else if at.reads <= 0 {
             incoming.fail({ status: 408, reason: "the request body did not arrive" })
@@ -2704,7 +2710,7 @@ fn pull_body_piece<[l]>(
               None -> Continue({ ..moved, reads: at.reads - 1 }),
               Some(chunk) -> if chunk.len() == 0 {
                 incoming.fail({ status: 400, reason: "the client closed before its body ended" })
-              } else { Continue({ ..moved, buf: rest.concat(chunk), reads: at.reads - 1 }) },
+              } else { Continue({ ..moved, buffer: rest.concat(chunk), reads: at.reads - 1 }) },
             }
           }
         },
@@ -3312,7 +3318,7 @@ pub fn default_shedding() -> Shedding =
 /// was full or because they had waited too long.
 pub type PoolStats = { served: Int, shed_full: Int, shed_timed_out: Int }
 
-type QueuedConnection = { conn: Int, at: Instant }
+type QueuedConnection = { connection: Int, at: Instant }
 
 type WorkerStats = { served: Int, shed_timed_out: Int }
 
@@ -3332,8 +3338,8 @@ pub fn serve_pooled<[l], [k] | e>(
   serve_pooled_with[l, k](listener, count, limits, shedding, |c: Int, stop: Chan<Unit>|
     serve_draining[k](c, limits, stop, app))
 
-/// `serve_pooled` with each connection served by `conn`, for a program with its own connection
-/// loop. `conn` is given the connection and the channel the pool closes when it stops accepting,
+/// `serve_pooled` with each connection served by `connection`, for a program with its own connection
+/// loop. `connection` is given the connection and the channel the pool closes when it stops accepting,
 /// and must close the connection itself.
 pub fn serve_pooled_with<[l], [k] | e>(
   listener: Int,
@@ -3417,7 +3423,7 @@ fn accept_loop<[l] | e>(
   if left <= 0 { shed } else {
     let c = net.accept[l](listener);
     if c == 0 { shed } else {
-      match try_send(line, { conn: c, at: clock.now() }) {
+      match try_send(line, { connection: c, at: clock.now() }) {
         Accepted -> accept_loop[l](listener, line, handled, left - 1, shed),
         _ -> {
           handled(c, Shed);
@@ -3439,7 +3445,7 @@ fn worker<| e>(
     match task.recv(line) {
       None -> done,
       Some(q) -> if as_millis(between(q.at, clock.now())) > shedding.max_wait_ms {
-        handled(q.conn, Shed);
+        handled(q.connection, Shed);
         worker(
           line,
           stop,
@@ -3449,7 +3455,7 @@ fn worker<| e>(
           left - 1,
         )
       } else {
-        handled(q.conn, Serve(stop));
+        handled(q.connection, Serve(stop));
         worker(
           line,
           stop,
@@ -4260,7 +4266,7 @@ fn echo_app<| e>(request: Request) -> Response<| e> / {Reading} =
 
 fn ignore_body_app<| e>(request: Request) -> Response<| e> = text_response(200, request.path)
 
-fn limits_keeping(n: Int) -> Limits = {
+fn limits_with_max_keep_alive(n: Int) -> Limits = {
   let base: Limits = default_limits();
   { ..base, max_keep_alive: n }
 }
@@ -4270,7 +4276,7 @@ fn result_of(status: Int, body: String, keep: Bool) -> Bytes / {abort.raise} =
 
 fn caller() -> SocketAddress / {ip.fail, abort.raise} = ip::read_socket("203.0.113.9:4431")
 
-fn served_conn() -> Int = 2
+fn served_connection() -> Int = 2
 
 fn served(
   script: List<Step>,
@@ -4281,7 +4287,7 @@ fn served(
     let listener = net.listen[listener](0);
     serve_connection[conn](net.accept[listener](listener), limits, app)
   });
-  { out: net::mem_sent(ran.net, served_conn()), net: ran.net }
+  { out: net::mem_sent(ran.net, served_connection()), net: ran.net }
 }
 
 test "a 1.1 connection is reused and its requests are handled in order" {
@@ -4291,7 +4297,7 @@ test "a 1.1 connection is reused and its requests are handled in order" {
     echo_app,
   );
   assert_eq(ran.out, result_of(200, "GET /a|", true).concat(result_of(200, "GET /b|", true)));
-  assert_eq(ran.net.closed, [served_conn()])
+  assert_eq(ran.net.closed, [served_connection()])
 }
 
 test "`serve_connection` serves a connection and closes it whatever connection type the caller passes as its type argument" {
@@ -4300,8 +4306,8 @@ test "`serve_connection` serves a connection and closes it whatever connection t
     let listener = net.listen[listener](0);
     serve_connection[upstream](net.accept[listener](listener), default_limits(), echo_app)
   });
-  assert_eq(net::mem_sent(ran.net, served_conn()), result_of(200, "GET /a|", true));
-  assert_eq(ran.net.closed, [served_conn()])
+  assert_eq(net::mem_sent(ran.net, served_connection()), result_of(200, "GET /a|", true));
+  assert_eq(ran.net.closed, [served_connection()])
 }
 
 test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connection" {
@@ -4312,14 +4318,14 @@ test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connecti
     echo_app,
   );
   assert_eq(closing.out, result_of(200, "GET /a|", false));
-  assert_eq(net::mem_remaining_script(closing.net, served_conn()), [second]);
+  assert_eq(net::mem_remaining_script(closing.net, served_connection()), [second]);
   let bounded = served(
     [Sends(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), second],
-    limits_keeping(1),
+    limits_with_max_keep_alive(1),
     echo_app,
   );
   assert_eq(bounded.out, result_of(200, "GET /a|", false));
-  assert_eq(net::mem_remaining_script(bounded.net, served_conn()), [second])
+  assert_eq(net::mem_remaining_script(bounded.net, served_connection()), [second])
 }
 
 test "a body the handler ignores is drained before the next request is framed" {
@@ -4395,11 +4401,11 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
     echo_app,
   );
   assert_eq(idle.out, result_of(200, "GET /a|", true));
-  assert_eq(idle.net.closed, [served_conn()])
+  assert_eq(idle.net.closed, [served_connection()])
 }
 
 fn granted(net: MemNet, skip: Int) -> Int =
-  net::mem_deadlines(net, served_conn()).drop(skip).fold(0, |total: Int, ms: Int| total + ms)
+  net::mem_deadlines(net, served_connection()).drop(skip).fold(0, |total: Int, ms: Int| total + ms)
 
 test "the whole head is bounded by header_timeout_ms and not by each read" {
   let slow = served([Repeats(b"a")], default_limits(), echo_app);
@@ -4450,7 +4456,7 @@ test "a framing error gets one response and the connection is not reused" {
       text_response(400, "a request carries `Content-Length` or `Transfer-Encoding`, never both\n"),
     ),
   );
-  assert_eq(net::mem_remaining_script(ran.net, served_conn()), [second])
+  assert_eq(net::mem_remaining_script(ran.net, served_connection()), [second])
 }
 
 test "a 100-continue is written before the body is read" {
@@ -4480,7 +4486,7 @@ fn written(
     let listener = net.listen[listener](0);
     write(net.accept[listener](listener))
   });
-  { out: net::mem_sent(ran.net, served_conn()), reusable: ran.value }
+  { out: net::mem_sent(ran.net, served_connection()), reusable: ran.value }
 }
 
 fn streamed(
@@ -5129,8 +5135,8 @@ fn certified(der: Bytes) -> List<String> / {ip.fail, abort.raise} = {
     serve[listener, conn](l, 2, default_limits(), app)
   });
   [
-    String::of_bytes_lossy(net::mem_sent(ran.net, served_conn())),
-    String::of_bytes_lossy(net::mem_sent(ran.net, served_conn() + 1)),
+    String::of_bytes_lossy(net::mem_sent(ran.net, served_connection())),
+    String::of_bytes_lossy(net::mem_sent(ran.net, served_connection() + 1)),
   ]
 }
 
@@ -5157,7 +5163,7 @@ fn exchanged_with(request: Bytes, app: Handler<| {}>) -> Bytes / {ip.fail, abort
     let listener = net.listen[listener](0);
     serve_connection[conn](net.accept[listener](listener), default_limits(), app)
   });
-  net::mem_sent(ran.net, served_conn())
+  net::mem_sent(ran.net, served_connection())
 }
 
 fn upload() -> Bytes =
@@ -5654,15 +5660,15 @@ fn drained(script: List<Step>) -> MemNet / {ip.fail, sim.read, abort.raise} =
 
 test "after a stop, a connection serves the requests already read, closes after the last response, and reads no more requests" {
   let one = drained([Sends(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Silent]);
-  assert_eq(net::mem_sent(one, served_conn()), result_of(200, "GET /a|", false));
-  assert_eq(net::mem_deadlines(one, served_conn()).len(), 1);
-  assert_eq(one.closed, [served_conn()]);
+  assert_eq(net::mem_sent(one, served_connection()), result_of(200, "GET /a|", false));
+  assert_eq(net::mem_deadlines(one, served_connection()).len(), 1);
+  assert_eq(one.closed, [served_connection()]);
   let two = drained([
     Sends(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
     Silent,
   ]);
   assert_eq(
-    net::mem_sent(two, served_conn()),
+    net::mem_sent(two, served_connection()),
     result_of(200, "GET /a|", true).concat(result_of(200, "GET /b|", false)),
   )
 }
@@ -5684,9 +5690,9 @@ test "when a stop arrives while a handler responds without reading the request b
         serve_draining[conn](net.accept[listener](listener), default_limits(), stop, early)
       },
   ).net;
-  assert_eq(net::mem_sent(n, served_conn()), result_of(200, "/a", false));
-  assert_eq(net::mem_deadlines(n, served_conn()).len(), 1);
-  assert_eq(n.closed, [served_conn()])
+  assert_eq(net::mem_sent(n, served_connection()), result_of(200, "/a", false));
+  assert_eq(net::mem_deadlines(n, served_connection()).len(), 1);
+  assert_eq(n.closed, [served_connection()])
 }
 
 test "a shed connection is told when to retry" {
@@ -5763,7 +5769,7 @@ fn h2_greeting() -> List<String> = ["SETTINGS", "WINDOW_UPDATE", "SETTINGS ACK"]
 test "a connection with the HTTP/2 preface is served HTTP/2, and drained with GOAWAY at the stop" {
   let n = drained([Sends(h2_requests(["/a?x=1"])), Silent]);
   assert_eq(
-    h2_frames(net::mem_sent(n, served_conn())),
+    h2_frames(net::mem_sent(n, served_connection())),
     h2_greeting().concat([
       "HEADERS 1",
       "DATA 1 GET /a| END_STREAM",
@@ -5772,7 +5778,7 @@ test "a connection with the HTTP/2 preface is served HTTP/2, and drained with GO
       "GOAWAY 1 NO_ERROR",
     ]),
   );
-  assert_eq(n.closed, [served_conn()])
+  assert_eq(n.closed, [served_connection()])
 }
 
 fn pooled_one(
@@ -5791,7 +5797,7 @@ fn pooled_one(
           app,
         )
       }).net,
-    served_conn(),
+    served_connection(),
   )
 
 test "a pool serves each HTTP/2 stream as soon as it arrives, as an `Http2` request with the client's address in `peer`" {
@@ -5894,7 +5900,7 @@ test "a request body longer than `max_body` is rejected with 413 at the chunk th
     ran.out,
     encode(Post, Http11, false, text_response(413, "the body is longer than 8 bytes\n")),
   );
-  assert_eq(net::mem_remaining_script(ran.net, served_conn()), [rest])
+  assert_eq(net::mem_remaining_script(ran.net, served_connection()), [rest])
 }
 
 test "a client that sent `Expect: 100-continue` gets no 100 Continue when the handler responds without reading the body" {
@@ -5908,7 +5914,7 @@ test "a client that sent `Expect: 100-continue` gets no 100 Continue when the ha
     ignore_body_app,
   );
   assert_eq(ran.out, result_of(200, "/a", false));
-  assert_eq(net::mem_remaining_script(ran.net, served_conn()), [body])
+  assert_eq(net::mem_remaining_script(ran.net, served_connection()), [body])
 }
 
 test "a stream that names its length is sent under Content-Length, and one that falls short ends the connection" {
@@ -5960,7 +5966,7 @@ test "an HTTP/2 request whose body never arrives gets 408 at its deadline, closi
       serve_draining[conn](net.accept[listener](listener), quick_idle(), stop, echo_app)
     });
   assert_eq(
-    h2_frames(net::mem_sent(ran.net, served_conn())),
+    h2_frames(net::mem_sent(ran.net, served_connection())),
     h2_greeting().concat([
       "HEADERS 1",
       "DATA 1 the request did not arrive whole within 35000 ms\n END_STREAM",
@@ -5968,7 +5974,7 @@ test "an HTTP/2 request whose body never arrives gets 408 at its deadline, closi
       "GOAWAY 1 NO_ERROR",
     ]),
   );
-  assert_eq(ran.net.closed, [served_conn()])
+  assert_eq(ran.net.closed, [served_connection()])
 }
 
 test "`http2_limits` derives an HTTP/2 connection's body, request count and timeout limits from the HTTP/1.1 limits" {
@@ -6110,12 +6116,12 @@ test "a TLS pool secures each connection offering `h2`, and serves a connection 
       )
     });
   assert_eq(ran.value, { served: 1, shed_full: 0, shed_timed_out: 0 });
-  assert_eq(net::mem_secured(ran.net, served_conn()), Some("api"));
-  let frames = h2_frames(net::mem_sent(ran.net, served_conn()));
+  assert_eq(net::mem_secured(ran.net, served_connection()), Some("api"));
+  let frames = h2_frames(net::mem_sent(ran.net, served_connection()));
   assert_eq(frames.take(1), ["SETTINGS"]);
   assert(frames.contains("DATA 1 h2 /a END_STREAM"));
   assert_eq(frames.last(), Some("GOAWAY 1 NO_ERROR"));
-  assert_eq(ran.net.closed, [served_conn()])
+  assert_eq(ran.net.closed, [served_connection()])
 }
 
 test "a connection shed over TLS is secured offering only http/1.1, then told when to retry" {
@@ -6134,9 +6140,9 @@ test "a connection shed over TLS is secured offering only http/1.1, then told wh
       )
     },
   );
-  let sends_response = String::of_bytes_lossy(net::mem_sent(ran.net, served_conn()));
+  let sends_response = String::of_bytes_lossy(net::mem_sent(ran.net, served_connection()));
   assert(sends_response.starts_with("HTTP/1.1 503 "));
   assert(sends_response.contains("retry-after: 1\r\n"));
-  assert_eq(net::mem_secured(ran.net, served_conn()), Some("api"));
-  assert_eq(ran.net.closed, [served_conn()])
+  assert_eq(net::mem_secured(ran.net, served_connection()), Some("api"));
+  assert_eq(ran.net.closed, [served_connection()])
 }

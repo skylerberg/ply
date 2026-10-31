@@ -6,7 +6,7 @@ import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front (analyse_pulling_std_with)
 import compiler.front.rows (module_imports)
 import compiler.check.infer.checker (Builtin, ConstructorInfo, DefinitionInfo, LawBinder, LawInfo,
-                                     SpecInfo, InstanceInfo, NumericInfo, EffectInfo, OpInfo,
+                                     SpecInfo, InstanceInfo, NumericInfo, EffectInfo, OperationInfo,
                                      builtins)
 import compiler.syntax.items (Item, FunctionItem, TypeItem, LawItem, CostClause, EnsuresClause,
                               RequiresClause, SpaceClause, SpecClause, SpecKind, KeyInstance,
@@ -86,7 +86,7 @@ pub type ProverInput = {
   operations: List<Operation>,
 }
 
-pub type Operation = { effect: String, op: String, results: Sort }
+pub type Operation = { effect: String, operation: String, results: Sort }
 
 pub type TrustedLaw = {
   key: String,
@@ -255,7 +255,7 @@ fn makes_opaque_value(
       hit || (c.ty == name && c.home != module));
   match t {
     VariableType(_) -> false,
-    FunctionType(f) -> any(f.params) || makes_opaque_value(f.ret, d, module, seen, room),
+    FunctionType(f) -> any(f.params) || makes_opaque_value(f.return_type, d, module, seen, room),
     RecordType(fs) -> any(fs.map(|f: Field| f.ty)),
     NominalType(n) ->
       any(type_args(n.args)) || is_opaque_name(n.name) || any(n.fields.map(|f: Field| f.ty)),
@@ -338,7 +338,10 @@ fn met(t: Type, seen: List<Int>) -> List<Int> =
     NamedType(c) ->
       type_args(c.args).fold(seen, |accumulator: List<Int>, a: Type| met(a, accumulator)),
     FunctionType(f) ->
-      met(f.ret, f.params.fold(seen, |accumulator: List<Int>, p: Type| met(p, accumulator))),
+      met(
+        f.return_type,
+        f.params.fold(seen, |accumulator: List<Int>, p: Type| met(p, accumulator)),
+      ),
     RecordType(fs) ->
       in_print_order(fs).fold(seen, |accumulator: List<Int>, f: Field| met(f.ty, accumulator)),
     NominalType(n) ->
@@ -360,7 +363,7 @@ fn type_of(t: Type, variables: List<Int>) -> Sort / {abort.raise} =
     FunctionType(f) ->
       FunctionSort(
         f.params.map(|p: Type| type_of(p, variables)),
-        type_of(f.ret, variables),
+        type_of(f.return_type, variables),
         is_pure(f.effects),
       ),
     RecordType(fs) -> record_of(fs, variables),
@@ -419,13 +422,13 @@ fn effect_parameters_of(t: Type) -> List<Int> =
   match t {
     FunctionType(f) -> match f.effects.variable {
       Some(v) -> if without_raises(f.effects.listed).len() > 0
-          || mentions_effect_variable(f.ret, v) { [] } else {
+          || mentions_effect_variable(f.return_type, v) { [] } else {
         let direct = range(0, f.params.len()).filter(|i: Int|
           match f.params.at(i) {
             Some(FunctionType(g)) ->
               g.effects.variable == Some(v)
                 && !g.params.any(|p: Type| mentions_effect_variable(p, v))
-                && !mentions_effect_variable(g.ret, v),
+                && !mentions_effect_variable(g.return_type, v),
             _ -> false,
           });
         let elsewhere = range(0, f.params.len()).any(|i: Int|
@@ -444,7 +447,7 @@ fn mentions_effect_variable(t: Type, v: Int) -> Bool =
     NamedType(c) -> type_args(c.args).any(|a: Type| mentions_effect_variable(a, v)),
     FunctionType(f) ->
       f.effects.variable == Some(v) || f.params.any(|p: Type| mentions_effect_variable(p, v))
-        || mentions_effect_variable(f.ret, v),
+        || mentions_effect_variable(f.return_type, v),
     RecordType(fs) -> fs.any(|x: Field| mentions_effect_variable(x.ty, v)),
     NominalType(n) ->
       n.fields.any(|x: Field| mentions_effect_variable(x.ty, v))
@@ -452,7 +455,7 @@ fn mentions_effect_variable(t: Type, v: Int) -> Bool =
   }
 
 fn params_of(k: ConstructorInfo) -> List<Int> = {
-  let result = match k.scheme.ty { FunctionType(f) -> f.ret, other -> other };
+  let result = match k.scheme.ty { FunctionType(f) -> f.return_type, other -> other };
   match result {
     NamedType(c) -> type_args(c.args).map(|a: Type| match a { VariableType(v) -> v, _ -> 0 - 1 }),
     _ -> [],
@@ -600,13 +603,17 @@ fn clauses_of(
   let claimed = d.spec.filter(|s: SpecInfo| s.kind != RequiresClause);
   if claimed.len() == 0 { accumulator } else {
     let shape = match d.scheme.ty {
-      FunctionType(f) -> { params: f.params, ret: f.ret },
-      other -> { params: [], ret: other },
+      FunctionType(f) -> { params: f.params, result_type: f.return_type },
+      other -> { params: [], result_type: other },
     };
     let names = match written.get(d.name) { Some(ns) -> ns, None -> [] };
     let params = range(0, min(names.len(), shape.params.len())).map(|i: Int|
       { name: names.get(i), ty: shape.params.get(i) });
-    let printed = binders_of(params.push({ name: b"result", ty: shape.ret }), closing, d.module);
+    let printed = binders_of(
+      params.push({ name: b"result", ty: shape.result_type }),
+      closing,
+      d.module,
+    );
     let binders = range(0, params.len()).map(|i: Int| printed.binders.get(i));
     let result = printed.binders.at(params.len());
     let stated = match clauses.get(d.name) { Some(c) -> c, None -> { requires: [], ensures: [] } };
@@ -793,11 +800,11 @@ pub fn empty_prover_input() -> ProverInput =
 
 fn operations_of(effects: List<EffectInfo>) -> List<Operation> / {abort.raise} =
   effects.fold([], |accumulator: List<Operation>, e: EffectInfo|
-    e.operations.fold(accumulator, |out: List<Operation>, operation: OpInfo|
+    e.operations.fold(accumulator, |out: List<Operation>, operation: OperationInfo|
       out.push({
         effect: String::of_bytes_lossy(e.name),
-        op: String::of_bytes_lossy(operation.name),
-        results: type_of(operation.ret, met(operation.ret, [])),
+        operation: String::of_bytes_lossy(operation.name),
+        results: type_of(operation.return_type, met(operation.return_type, [])),
       })))
 
 pub fn imports_of(modules: List<ParsedModule>) -> List<List<Int>> / {abort.raise} = {
@@ -806,10 +813,10 @@ pub fn imports_of(modules: List<ParsedModule>) -> List<List<Int>> / {abort.raise
   let direct = modules.map(|m: ParsedModule|
     module_imports(m).fold([], |accumulator: List<Int>, name: Bytes|
       match index.get(name) { Some(j) -> accumulator.push(j), None -> accumulator }));
-  range(0, modules.len()).map(|i: Int| reached_from(direct, i))
+  range(0, modules.len()).map(|i: Int| reachable_from(direct, i))
 }
 
-fn reached_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
+fn reachable_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
   let start = match direct.at(from) { Some(xs) -> xs, None -> [] };
   let seen = iterate(
     { seen: start.fold(Map::new(), |m: Map<Int, Bool>, x: Int| m.insert(x, true)), stack: start },
@@ -883,13 +890,17 @@ fn builds_of(
   });
   if owed_for.len() == 0 { accumulator } else {
     let shape = match d.scheme.ty {
-      FunctionType(f) -> { params: f.params, ret: f.ret },
-      other -> { params: [], ret: other },
+      FunctionType(f) -> { params: f.params, result_type: f.return_type },
+      other -> { params: [], result_type: other },
     };
     let names = match written.get(d.name) { Some(ns) -> ns, None -> [] };
     let params = range(0, min(names.len(), shape.params.len())).map(|i: Int|
       { name: names.get(i), ty: shape.params.get(i) });
-    let printed = binders_of(params.push({ name: b"result", ty: shape.ret }), closing, d.module);
+    let printed = binders_of(
+      params.push({ name: b"result", ty: shape.result_type }),
+      closing,
+      d.module,
+    );
     let check = h.checks.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
       if x.name == d.name { x.hash } else { found });
     owed_for.fold(accumulator, |a: CollectedObligations, i: { type_name: Bytes, by: Bytes }| {
@@ -988,7 +999,7 @@ fn measures_of(modules: List<ParsedModule>) -> Map<Bytes, Expression> =
       }))
 
 pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
-  match analyse(parse_all([{ name: b"m", src: source }])) {
+  match analyse(parse_all([{ name: b"m", source_text: source }])) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
     Analysed(w) -> w,
   }
@@ -1247,13 +1258,13 @@ test "outside the module that defines an opaque type, the prover never builds va
   let shipped = [
     {
       name: b"std.vault",
-      src: b"pub opaque type Token = | Token(Int)\npub opaque type Stamp = new { at: Int }\npub opaque type Coin = | Heads | Tails\npub fn worth(t: Token) -> Int ensures result != 7 = match t { Token(n) -> n }\npub fn turned(c: Coin) -> Int ensures result != 7 = 1\n",
+      source_text: b"pub opaque type Token = | Token(Int)\npub opaque type Stamp = new { at: Int }\npub opaque type Coin = | Heads | Tails\npub fn worth(t: Token) -> Int ensures result != 7 = match t { Token(n) -> n }\npub fn turned(c: Coin) -> Int ensures result != 7 = 1\n",
     },
   ];
   let user = [
     {
       name: b"m",
-      src: b"import std.vault (Token, Stamp, Coin)\ntype Held = | Held(Token, Int)\nfn kept(t: Token) -> Int ensures result != 7 = 1\nfn stamps(ss: List<Stamp>) -> Int ensures result != 7 = ss.len()\nfn wrapped(h: Held) -> Int ensures result != 7 = 1\nfn flipped(c: Coin, n: Int) -> Int ensures result != 7 = n\n",
+      source_text: b"import std.vault (Token, Stamp, Coin)\ntype Held = | Held(Token, Int)\nfn kept(t: Token) -> Int ensures result != 7 = 1\nfn stamps(ss: List<Stamp>) -> Int ensures result != 7 = ss.len()\nfn wrapped(h: Held) -> Int ensures result != 7 = 1\nfn flipped(c: Coin, n: Int) -> Int ensures result != 7 = n\n",
     },
   ];
   let built = match analyse_pulling_std_with(user, shipped, no_rows(), cut_unused: false).out {
@@ -1292,8 +1303,11 @@ test "outside the module that defines an opaque type, the prover never builds va
 fn app_law_key(source: Bytes) -> String / {abort.raise} =
   match analyse(
       parse_all([
-        { name: b"base", src: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
-        { name: b"app", src: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n" },
+        { name: b"base", source_text: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
+        {
+          name: b"app",
+          source_text: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n",
+        },
       ]),
     ) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),

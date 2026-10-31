@@ -107,7 +107,7 @@ fn code_of(o: Opcode) -> Int =
 
 pub fn is_control(o: Opcode) -> Bool = o == Close || o == Ping || o == Pong
 
-/// The frame at the front of `buf`, read under `limits`; a compressed frame is rejected unless
+/// The frame at the front of `head`, read under `limits`; a compressed frame is rejected unless
 /// `compression` was negotiated.
 pub fn decode_frame(
   frame_bytes: Bytes,
@@ -373,10 +373,10 @@ fn handle_close(s: State, payload: Bytes) -> Step / {abort.raise} =
 
 fn flush_tail() -> Bytes = b"\x00\x00\xff\xff"
 
-fn keeps_context(s: State, c: ContextTakeover) -> Bool =
+fn retains_context(s: State, c: ContextTakeover) -> Bool =
   match s.role { Server -> c.server, Client -> c.client }
 
-fn peer_keeps_context(s: State, c: ContextTakeover) -> Bool =
+fn peer_retains_context(s: State, c: ContextTakeover) -> Bool =
   match s.role { Server -> c.client, Client -> c.server }
 
 fn inflated(
@@ -400,7 +400,7 @@ fn inflated(
       Ok({
         bytes: got.bytes,
         inflater: match s.compression {
-          Some(c) -> if peer_keeps_context(s, c) && !gzip::ended(got.after) { Some(got.after) }
+          Some(c) -> if peer_retains_context(s, c) && !gzip::ended(got.after) { Some(got.after) }
           else { None },
           None -> None,
         },
@@ -424,7 +424,7 @@ pub fn message_frame(s: State, m: Message) -> { state: State, frame: Frame } / {
       let flushed = gzip::flush(took.next, gzip::Deflate);
       let all = took.out.concat(flushed.out);
       {
-        state: { ..s, deflater: if keeps_context(s, c) { Some(flushed.next) } else { None } },
+        state: { ..s, deflater: if retains_context(s, c) { Some(flushed.next) } else { None } },
         frame: {
           fin: true,
           compressed: true,
@@ -633,7 +633,7 @@ pub fn check_response(
 }
 
 /// One end of an open connection: its handle, its state, and the bytes read past the last frame.
-pub type Session = { conn: Int, state: State, buffer: Bytes, negotiated: Agreement }
+pub type Session = { connection: Int, state: State, buffer: Bytes, negotiated: Agreement }
 
 /// The outcome of `receive`: a message, or the reason there is none.
 pub type Got =
@@ -690,7 +690,7 @@ fn receive_step<[l]>(
           got: Some(Failure(f)),
         }
       },
-      NeedMore -> match net.recv[l](s.conn, http::read_size(), timeout_ms) {
+      NeedMore -> match net.recv[l](s.connection, http::read_size(), timeout_ms) {
         None -> { session: s, got: Some(TimedOut) },
         Some(chunk) -> if chunk.len() == 0 { { session: s, got: Some(Gone) } }
         else { { session: { ..s, buffer: s.buffer.concat(chunk) }, got: None } },
@@ -724,7 +724,7 @@ fn send_frames<[l]>(
   frames.fold(true, |ok: Bool, f: Frame|
     ok
       && send_all[l](
-        s.conn,
+        s.connection,
         encode_frame(f, match s.state.role { Client -> Some(token_bytes(4)), Server -> None }),
         timeout_ms,
       ))
@@ -766,7 +766,7 @@ pub fn serve_connection<[l] | e>(
 ) -> Unit / {net.recv[l], net.send[l], net.close[l], entropy.next, abort.raise | e} =
   bracket(|| c, |h: Int| net.close[l](h), |h: Int|
     match http::read_head[l](h, b"", limits, false) {
-      http::HeadBytes(got) -> match http::parse_head(got.buf, limits) {
+      http::HeadBytes(got) -> match http::parse_head(got.head, limits) {
         http::Parsed(head) -> match upgrade(head.request, options) {
           Reject(r) -> {
             send_all[l](
@@ -779,9 +779,9 @@ pub fn serve_connection<[l] | e>(
           Accept(u) -> if send_all[l](h, u.head, limits.write_timeout_ms) {
             serve_messages[l](
               {
-                conn: h,
+                connection: h,
                 state: initial_state(Server, options.limits, u.negotiated.compression),
-                buffer: got.buf.slice(head.consumed, got.buf.len()),
+                buffer: got.head.slice(head.consumed, got.head.len()),
                 negotiated: u.negotiated,
               },
               options,
@@ -894,13 +894,13 @@ fn finish_handshake<[l]>(
     Err(Declined("the request was not sent"))
   } else {
     match http::read_head[l](c, b"", limits, false) {
-      http::HeadBytes(got) -> match http::parse_response_head(got.buf, http::Get, limits) {
+      http::HeadBytes(got) -> match http::parse_response_head(got.head, http::Get, limits) {
         http::ResponseParsed(head) -> match check_response(head, key, options) {
           Ok(agreed) ->
             Ok({
-              conn: c,
+              connection: c,
               state: initial_state(Client, options.limits, agreed.compression),
-              buffer: got.buf.slice(head.consumed, got.buf.len()),
+              buffer: got.head.slice(head.consumed, got.head.len()),
               negotiated: agreed,
             }),
           Err(reason) -> Err(Declined(reason)),

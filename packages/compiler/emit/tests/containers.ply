@@ -1,4 +1,4 @@
-import compiler.emit.print.unit_header (writable_fn)
+import compiler.emit.print.unit_header (writable_function)
 import compiler.emit.representations (layout_of)
 import std.bytes (ascii_of_int)
 import compiler.prelude_source
@@ -18,10 +18,11 @@ import compiler.emit.pieces (pieces_text)
 import compiler.emit.release (root_of)
 import compiler.emit.code (CodeFieldRead)
 import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFloat, AsWord, AsSum, AsFlattened,
-                               Leaf, Var, Arg, VarOperand, IntOperand, ZeroOperand, Rvalue,
-                               Allocate, Allocation, ListAllocation, Call, Native, Op, OfContainers,
-                               OfHandling, Operation, Convert, OperationSignature, Inst, Let, Fn,
-                               Lambda, Closure, operand_representation)
+                               Leaf, Variable, Arg, VariableOperand, IntOperand, ZeroOperand,
+                               Rvalue, Allocate, Allocation, ListAllocation, Call, Native,
+                               OperationCall, OfContainers, OfHandling, Operation, Convert,
+                               OperationSignature, Instruction, Let, Function, Lambda, Closure,
+                               operand_representation)
 import compiler.emit.typed_ir.handling (UnspecialisedBuiltin)
 import compiler.emit.typed_ir.containers (NodeIntrinsic, Length, ArrayLength, InBounds, ArrayNew,
                                           ArraySet, ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet,
@@ -35,7 +36,7 @@ import compiler.emit.lower.containers (reads_column, column_read, list_literal, 
                                        rest_read)
 import compiler.emit.lower.module_context (Root, module_context_in)
 import compiler.emit.keys (RootKey, Named, Generated, Copy)
-import compiler.emit.print (printed_fn)
+import compiler.emit.print (printed_function)
 import compiler.emit.emit_harness (entry_handler_words, Program, program_of, lowered_root, checked,
                                    printed_text, build_failures)
 import compiler.emit.print.count_functions (increments_count)
@@ -43,11 +44,11 @@ import compiler.emit.print.count_functions (increments_count)
 fn program(source: Bytes) -> Program / {abort.raise} =
   match program_of(source) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
 
-type Binding = { var: Var, value: Rvalue }
+type Binding = { var: Variable, value: Rvalue }
 
 fn bound_in(p: Program, name: Bytes) -> List<Binding> / {abort.raise} = {
   let f = lowered_root(p, name);
-  f.body.fold([], |accumulator: List<Binding>, i: Inst|
+  f.body.fold([], |accumulator: List<Binding>, i: Instruction|
     match i { Let(l) -> accumulator.push({ var: l.var, value: l.value }), _ -> accumulator })
 }
 
@@ -76,15 +77,20 @@ fn natives_in(
       },
   )
 
-fn ops_in(
+fn operations_in(
   bs: List<Binding>,
 ) -> List<{ op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }> =
   bs.fold(
     [],
     |accumulator: List<{ op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }>, b: Binding|
       match b.value {
-        Op(o) ->
-          accumulator.push({ op: o.op, args: o.args, uses: o.uses, result: b.var.representation }),
+        OperationCall(o) ->
+          accumulator.push({
+            op: o.operation,
+            args: o.args,
+            uses: o.uses,
+            result: b.var.representation,
+          }),
         _ -> accumulator,
       },
   )
@@ -94,7 +100,7 @@ fn packs_in(bs: List<Binding>) -> List<Representation> =
     match b.value { Convert(k) -> accumulator.push(k.to), _ -> accumulator })
 
 fn param(id: Int, ty: Bytes) -> Arg =
-  VarOperand({ id: id, ty: NamedType({ name: ty, args: [] }), representation: AsWord })
+  VariableOperand({ id: id, ty: NamedType({ name: ty, args: [] }), representation: AsWord })
 
 test "a list literal is built from its items, each stored in the representation of its type" {
   let p = program(
@@ -124,7 +130,7 @@ test "a list literal is built from its items, each stored in the representation 
 test "a list pattern reads an item directly from the list and binds the rest as a new list" {
   let p = program(b"fn f(xs: List<String>) -> Int = 0\n");
   let strings = list_type(string_type());
-  let opened = |name: Bytes, ty: Type, act: (Context, Var) -> LoweredValue|
+  let opened = |name: Bytes, ty: Type, act: (Context, Variable) -> LoweredValue|
     match p.roots.find(|r: Root| r.key == Named(qualify(b"m", name))) {
       None -> panic("no such root"),
       Some(r) -> {
@@ -134,22 +140,22 @@ test "a list pattern reads an item directly from the list and binds the rest as 
       },
     };
   let bound = |l: LoweredValue|
-    l.st.insts.fold([], |accumulator: List<Binding>, i: Inst|
+    l.st.instructions.fold([], |accumulator: List<Binding>, i: Instruction|
       match i { Let(x) -> accumulator.push({ var: x.var, value: x.value }), _ -> accumulator });
-  let item = opened(b"f", strings, |context: Context, xs: Var|
-    item_read(context, initial_lowering([xs]), VarOperand(xs), IntOperand(40), string_type()));
-  assert_eq(ops_in(bound(item)), [
+  let item = opened(b"f", strings, |context: Context, xs: Variable|
+    item_read(context, initial_lowering([xs]), VariableOperand(xs), IntOperand(40), string_type()));
+  assert_eq(operations_in(bound(item)), [
     {
       op: OfContainers(ItemAt),
-      args: [VarOperand({ id: 0, ty: strings, representation: AsWord }), IntOperand(40)],
+      args: [VariableOperand({ id: 0, ty: strings, representation: AsWord }), IntOperand(40)],
       uses: { takes: [false, false], owned: false, fails: false, suspends: false },
       result: AsWord,
     },
   ]);
-  let rest = opened(b"f", strings, |context: Context, xs: Var|
-    rest_read(initial_lowering([xs]), strings, VarOperand(xs), IntOperand(2)));
+  let rest = opened(b"f", strings, |context: Context, xs: Variable|
+    rest_read(initial_lowering([xs]), strings, VariableOperand(xs), IntOperand(2)));
   assert_eq(
-    ops_in(bound(rest)).map(
+    operations_in(bound(rest)).map(
       |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
         { op: o.op, uses: o.uses },
     ),
@@ -187,7 +193,7 @@ test "`len` on a list, byte string or array reads the length directly, cannot fa
   let read = |name: Bytes| {
     let bs = bound_in(p, name);
     assert_eq(natives_in(bs), []);
-    ops_in(bs).map(
+    operations_in(bs).map(
       |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
         { op: o.op, takes: o.uses.takes, fails: o.uses.fails, result: o.result },
     )
@@ -208,7 +214,7 @@ test "an array's `at` checks the index and reads the element directly, building 
   let p = program(b"fn element(a: Array<String>, i: Int) -> Option<String> = a.at(i)\n");
   assert_eq(natives_in(bound_in(p, b"element")), []);
   assert_eq(
-    ops_in(bound_in(p, b"element")).map(
+    operations_in(bound_in(p, b"element")).map(
       |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
         { op: o.op, result: o.result },
     ),
@@ -233,7 +239,7 @@ test "an array is created, written and read directly using the representation of
     ]),
   );
   let operations_of = |name: Bytes|
-    ops_in(bound_in(p, name)).map(
+    operations_in(bound_in(p, name)).map(
       |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
         { op: o.op, result: o.result, takes: o.uses.takes },
     );
@@ -341,7 +347,7 @@ test "`Columns` creation, writes, reads, length and `at` are lowered to one arra
     ]),
   );
   let operations_of = |name: Bytes|
-    ops_in(bound_in(p, name)).map(
+    operations_in(bound_in(p, name)).map(
       |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
         o.op,
     );
@@ -367,7 +373,7 @@ test "an array whose elements have a type variable's type is created using the e
     let f = lowered_root(p, b"made");
     assert_eq(f.links.needs.map(|n: Need| n.reads), [Layout]);
     assert_eq(
-      ops_in(bound_in(p, b"made")).map(
+      operations_in(bound_in(p, b"made")).map(
         |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
           o.op,
       ),
@@ -413,17 +419,18 @@ test "reading a field of a `Columns` element reads that field's array directly, 
               let l = column_read(
                 context,
                 initial_lowering([ps, i]),
-                [VarOperand(ps), VarOperand(i)],
+                [VariableOperand(ps), VariableOperand(i)],
                 b.base,
                 b.name,
                 code.span,
               );
-              l.st.insts.fold(
+              l.st.instructions.fold(
                 [],
-                |accumulator: List<{ op: Operation, result: Representation }>, x: Inst|
+                |accumulator: List<{ op: Operation, result: Representation }>, x: Instruction|
                   match x {
                     Let(v) -> match v.value {
-                      Op(o) -> accumulator.push({ op: o.op, result: v.var.representation }),
+                      OperationCall(o) ->
+                        accumulator.push({ op: o.operation, result: v.var.representation }),
                       _ -> accumulator,
                     },
                     _ -> accumulator,
@@ -458,7 +465,7 @@ test "`Bytes::position` lowers to an inline loop that calls the predicate and bu
   let p = program(b"fn found(b: Bytes) -> Option<Int> = b.position(0, |c: Int| c == 32)\n");
   [p, { ..p, setting: { ..p.setting, release_build: true } }].fold((), |_: Unit, q: Program| {
     assert_eq(
-      ops_in(bound_in(q, b"found")).map(
+      operations_in(bound_in(q, b"found")).map(
         |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
           { op: o.op, uses: o.uses, result: o.result },
       ),
@@ -494,7 +501,7 @@ test "`Bytes::position` passes its predicate the predicate's function and the ha
       b"  b.position(0, |c: Int| {\n    asks.one();\n    c == 32\n  })\n",
     ]),
   );
-  let positions = ops_in(bound_in(p, b"found")).filter(
+  let positions = operations_in(bound_in(p, b"found")).filter(
     |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
       o.op == OfContainers(Position),
   );
@@ -544,10 +551,11 @@ test "`Bytes::position` used as a value becomes a lambda whose loop calls the pr
       f.lambdas.fold([], |accumulator: List<OperationSignature>, l: Lambda|
         match l {
           Closure(c) ->
-            c.body.body.fold(accumulator, |us: List<OperationSignature>, i: Inst|
+            c.body.body.fold(accumulator, |us: List<OperationSignature>, i: Instruction|
               match i {
                 Let(x) -> match x.value {
-                  Op(o) -> if o.op == OfContainers(Position) { us.push(o.uses) } else { us },
+                  OperationCall(o) -> if o.operation == OfContainers(Position) { us.push(o.uses) }
+                  else { us },
                   _ -> us,
                 },
                 _ -> us,
@@ -565,11 +573,11 @@ test "`Bytes::position` used as a value becomes a lambda whose loop calls the pr
 fn cleanups(p: Program, name: Bytes) -> List<OperationSignature> / {abort.raise} =
   match checked(p, name) {
     Ok(f) ->
-      f.lambdas.fold([f.body], |accumulator: List<List<Inst>>, l: Lambda|
+      f.lambdas.fold([f.body], |accumulator: List<List<Instruction>>, l: Lambda|
         match l { Closure(c) -> accumulator.push(c.body.body) }).fold(
         [],
-        |accumulator: List<OperationSignature>, b: List<Inst>|
-          b.fold(accumulator, |us: List<OperationSignature>, i: Inst|
+        |accumulator: List<OperationSignature>, b: List<Instruction>|
+          b.fold(accumulator, |us: List<OperationSignature>, i: Instruction|
             match i {
               Let(x) -> match x.value {
                 Native(n) -> if n.name == b"rt_with_cleanup_p" { us.push(n.uses) } else { us },
@@ -662,7 +670,7 @@ test "functions using handler variables or `with_scope` type-check, and `with_sc
       match l {
         Closure(c) ->
           accumulator.concat(
-            c.body.body.fold([], |bs: List<Binding>, i: Inst|
+            c.body.body.fold([], |bs: List<Binding>, i: Instruction|
               match i { Let(x) -> bs.push({ var: x.var, value: x.value }), _ -> bs }),
           ),
       }).filter(|b: Binding|
@@ -721,7 +729,7 @@ test "an operator on a numeric type variable lowers to a generic builtin that is
   let binary = OfHandling(UnspecialisedBuiltin(b"?numeric_binary"));
   assert_eq(
     names.map(|n: Bytes|
-      ops_in(bound_in(p, n)).map(
+      operations_in(bound_in(p, n)).map(
         |o: { op: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
           o.op,
       )),
@@ -731,13 +739,13 @@ test "an operator on a numeric type variable lowers to a generic builtin that is
 }
 
 fn program_of_modules(
-  sources: List<{ name: Bytes, src: Bytes }>,
+  sources: List<{ name: Bytes, source_text: Bytes }>,
   natives: List<Bytes>,
 ) -> Program / {abort.raise} =
   match analyse(parse_all(sources)) {
     Analysed(a) -> match module_context_in(a, b"m") {
       Ok(s) ->
-        { src: b"", analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
+        { source: b"", analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
       Err(reason) -> panic(String::of_bytes_lossy(reason)),
     },
     _ -> panic("the program does not check"),
@@ -751,10 +759,10 @@ test "a name that no import provides refers to the builtin, but an imported func
     );
   let whole = program_of_modules(
     [
-      { name: b"min", src: b"pub fn size(xs: List<Int>) -> Int = xs.len()\n" },
+      { name: b"min", source_text: b"pub fn size(xs: List<Int>) -> Int = xs.len()\n" },
       {
         name: b"m",
-        src: b"import min\nfn least(x: Int) -> Int = min(x, 1)\nfn n(xs: List<Int>) -> Int = min::size(xs)\n",
+        source_text: b"import min\nfn least(x: Int) -> Int = min(x, 1)\nfn n(xs: List<Int>) -> Int = min::size(xs)\n",
       },
     ],
     [b"min", b"List::len"],
@@ -768,7 +776,7 @@ test "a name that no import provides refers to the builtin, but an imported func
     {
       let f = lowered_root(whole, b"n");
       natives_in(
-          f.body.fold([], |accumulator: List<Binding>, i: Inst|
+          f.body.fold([], |accumulator: List<Binding>, i: Instruction|
             match i {
               Let(l) -> accumulator.push({ var: l.var, value: l.value }),
               _ -> accumulator,
@@ -780,8 +788,8 @@ test "a name that no import provides refers to the builtin, but an imported func
   );
   let taken = program_of_modules(
     [
-      { name: b"a", src: b"pub fn min(x: Int, y: Int) -> Int = x\n" },
-      { name: b"m", src: b"import a (min)\nfn least(x: Int) -> Int = min(x, 1)\n" },
+      { name: b"a", source_text: b"pub fn min(x: Int, y: Int) -> Int = x\n" },
+      { name: b"m", source_text: b"import a (min)\nfn least(x: Int) -> Int = min(x, 1)\n" },
     ],
     [b"min"],
   );
@@ -799,11 +807,11 @@ fn program_with_native(
   user: Bytes,
   natives: List<Bytes>,
 ) -> Program / {abort.raise} = {
-  let shipped = [{ name: b"std.native", src: native }];
-  match analyse_pulling_std_with([{ name: b"m", src: user }], shipped, no_rows()).out {
+  let shipped = [{ name: b"std.native", source_text: native }];
+  match analyse_pulling_std_with([{ name: b"m", source_text: user }], shipped, no_rows()).out {
     Analysed(a) -> match module_context_in(a, b"m") {
       Ok(s) ->
-        { src: user, analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
+        { source: user, analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
       Err(reason) -> panic(String::of_bytes_lossy(reason)),
     },
     _ -> panic("the program does not check"),
@@ -963,120 +971,135 @@ test "every function in the container test programs lowers, type-checks after it
   assert_eq(build_failures(program(corpus()), corpus_names()), [])
 }
 
-fn intrinsic_calls() -> List<{ name: Bytes, src: Bytes }> =
+fn intrinsic_calls() -> List<{ name: Bytes, source_text: Bytes }> =
   [
-    { name: b"start", src: b"(xs: List<Int>) -> Int = ListNode::start(xs)" },
-    { name: b"tail_len", src: b"(xs: List<Int>) -> Int = ListNode::tail_len(xs)" },
-    { name: b"root", src: b"(xs: List<Int>) -> Option<ListNode<Int>> = ListNode::root(xs)" },
-    { name: b"tail_at", src: b"(xs: List<String>) -> String = ListNode::tail_at(xs, 1)" },
+    { name: b"start", source_text: b"(xs: List<Int>) -> Int = ListNode::start(xs)" },
+    { name: b"tail_len", source_text: b"(xs: List<Int>) -> Int = ListNode::tail_len(xs)" },
+    {
+      name: b"root",
+      source_text: b"(xs: List<Int>) -> Option<ListNode<Int>> = ListNode::root(xs)",
+    },
+    { name: b"tail_at", source_text: b"(xs: List<String>) -> String = ListNode::tail_at(xs, 1)" },
     {
       name: b"tail_at_maybe",
-      src: b"(xs: List<Option<Int>>) -> Option<Int> = ListNode::tail_at(xs, 1)",
+      source_text: b"(xs: List<Option<Int>>) -> Option<Int> = ListNode::tail_at(xs, 1)",
     },
-    { name: b"len", src: b"(n: ListNode<Int>) -> Int = ListNode::len(n)" },
-    { name: b"leaf_at", src: b"(n: ListNode<Int>) -> Int = ListNode::leaf_at(n, 3)" },
-    { name: b"leaf_at_any", src: b"<a>(n: ListNode<a>) -> a = ListNode::leaf_at(n, 3)" },
-    { name: b"leaf_at_on", src: b"(n: ListNode<String>) -> String = n.leaf_at(3)" },
-    { name: b"kid_at", src: b"(n: ListNode<Int>) -> ListNode<Int> = ListNode::kid_at(n, 1)" },
+    { name: b"len", source_text: b"(n: ListNode<Int>) -> Int = ListNode::len(n)" },
+    { name: b"leaf_at", source_text: b"(n: ListNode<Int>) -> Int = ListNode::leaf_at(n, 3)" },
+    { name: b"leaf_at_any", source_text: b"<a>(n: ListNode<a>) -> a = ListNode::leaf_at(n, 3)" },
+    { name: b"leaf_at_on", source_text: b"(n: ListNode<String>) -> String = n.leaf_at(3)" },
+    {
+      name: b"kid_at",
+      source_text: b"(n: ListNode<Int>) -> ListNode<Int> = ListNode::kid_at(n, 1)",
+    },
     {
       name: b"tail_push",
-      src: b"(xs: List<String>, x: String) -> List<String> = ListNode::tail_push(xs, x)",
+      source_text: b"(xs: List<String>, x: String) -> List<String> = ListNode::tail_push(xs, x)",
     },
-    { name: b"tail_set", src: b"(xs: List<Int>) -> List<Int> = ListNode::tail_set(xs, 2, 7)" },
+    {
+      name: b"tail_set",
+      source_text: b"(xs: List<Int>) -> List<Int> = ListNode::tail_set(xs, 2, 7)",
+    },
     {
       name: b"leaf_set",
-      src: b"(n: ListNode<String>, x: String) -> ListNode<String> = ListNode::leaf_set(n, 2, x)",
+      source_text: b"(n: ListNode<String>, x: String) -> ListNode<String> = ListNode::leaf_set(n, 2, x)",
     },
     {
       name: b"leaf_set_any",
-      src: b"<a>(n: ListNode<a>, x: a) -> ListNode<a> = ListNode::leaf_set(n, 2, x)",
+      source_text: b"<a>(n: ListNode<a>, x: a) -> ListNode<a> = ListNode::leaf_set(n, 2, x)",
     },
     {
       name: b"root_swap",
-      src: b"(xs: List<Int>, r: ListNode<Int>) -> Option<ListNode<Int>> = ListNode::root_swap(xs, Some(r)).old",
+      source_text: b"(xs: List<Int>, r: ListNode<Int>) -> Option<ListNode<Int>> = ListNode::root_swap(xs, Some(r)).old",
     },
     {
       name: b"kid_swap",
-      src: b"(n: ListNode<Int>) -> ListNode<Int> = ListNode::kid_swap(n, 0, None).node",
+      source_text: b"(n: ListNode<Int>) -> ListNode<Int> = ListNode::kid_swap(n, 0, None).node",
     },
-    { name: b"tail_start", src: b"(xs: List<Int>) -> List<Int> = ListNode::tail_start(xs, 7)" },
-    { name: b"spill", src: b"(xs: List<Int>) -> ListNode<Int> = ListNode::spill(xs).leaf" },
-    { name: b"branch", src: b"() -> ListNode<Int> = ListNode::branch()" },
+    {
+      name: b"tail_start",
+      source_text: b"(xs: List<Int>) -> List<Int> = ListNode::tail_start(xs, 7)",
+    },
+    { name: b"spill", source_text: b"(xs: List<Int>) -> ListNode<Int> = ListNode::spill(xs).leaf" },
+    { name: b"branch", source_text: b"() -> ListNode<Int> = ListNode::branch()" },
     {
       name: b"map_root",
-      src: b"(m: Map<Int, String>) -> Option<MapNode<Int, String>> = MapNode::root(m)",
+      source_text: b"(m: Map<Int, String>) -> Option<MapNode<Int, String>> = MapNode::root(m)",
     },
-    { name: b"height", src: b"(m: Map<Int, String>) -> Int = MapNode::height(m)" },
-    { name: b"count", src: b"(n: MapNode<Int, String>) -> Int = MapNode::count(n)" },
-    { name: b"key", src: b"(n: MapNode<Int, String>) -> Int = MapNode::key(n, 1)" },
-    { name: b"value", src: b"(n: MapNode<Int, String>) -> String = MapNode::value(n, 1)" },
+    { name: b"height", source_text: b"(m: Map<Int, String>) -> Int = MapNode::height(m)" },
+    { name: b"count", source_text: b"(n: MapNode<Int, String>) -> Int = MapNode::count(n)" },
+    { name: b"key", source_text: b"(n: MapNode<Int, String>) -> Int = MapNode::key(n, 1)" },
+    { name: b"value", source_text: b"(n: MapNode<Int, String>) -> String = MapNode::value(n, 1)" },
     {
       name: b"kid",
-      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid(n, 1)",
+      source_text: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid(n, 1)",
     },
-    { name: b"kid_max", src: b"(n: MapNode<Int, String>) -> Int = MapNode::kid_max(n, 1)" },
-    { name: b"kid_size", src: b"(n: MapNode<Int, String>) -> Int = MapNode::kid_size(n, 1)" },
-    { name: b"leaf", src: b"() -> MapNode<Int, String> = MapNode::leaf()" },
-    { name: b"map_branch", src: b"() -> MapNode<Int, String> = MapNode::branch()" },
+    { name: b"kid_max", source_text: b"(n: MapNode<Int, String>) -> Int = MapNode::kid_max(n, 1)" },
+    {
+      name: b"kid_size",
+      source_text: b"(n: MapNode<Int, String>) -> Int = MapNode::kid_size(n, 1)",
+    },
+    { name: b"leaf", source_text: b"() -> MapNode<Int, String> = MapNode::leaf()" },
+    { name: b"map_branch", source_text: b"() -> MapNode<Int, String> = MapNode::branch()" },
     {
       name: b"pair_put",
-      src: b"(n: MapNode<Int, String>, v: String) -> MapNode<Int, String> = MapNode::pair_put(n, 1, 5, v)",
+      source_text: b"(n: MapNode<Int, String>, v: String) -> MapNode<Int, String> = MapNode::pair_put(n, 1, 5, v)",
     },
     {
       name: b"pair_set",
-      src: b"(n: MapNode<Int, String>, v: String) -> MapNode<Int, String> = MapNode::pair_set(n, 1, 5, v)",
+      source_text: b"(n: MapNode<Int, String>, v: String) -> MapNode<Int, String> = MapNode::pair_set(n, 1, 5, v)",
     },
     {
       name: b"pair_take",
-      src: b"(n: MapNode<Int, String>) -> String = MapNode::pair_take(n, 1).value",
+      source_text: b"(n: MapNode<Int, String>) -> String = MapNode::pair_take(n, 1).value",
     },
     {
       name: b"key_take",
-      src: b"(n: MapNode<{ a: Int, b: Int }, Int>) -> { a: Int, b: Int } = MapNode::pair_take(n, 1).key",
+      source_text: b"(n: MapNode<{ a: Int, b: Int }, Int>) -> { a: Int, b: Int } = MapNode::pair_take(n, 1).key",
     },
     {
       name: b"open_key_take",
-      src: b"<v>(n: MapNode<{ a: Int, b: Int }, v>) -> { a: Int, b: Int } = MapNode::pair_take(n, 1).key",
+      source_text: b"<v>(n: MapNode<{ a: Int, b: Int }, v>) -> { a: Int, b: Int } = MapNode::pair_take(n, 1).key",
     },
     {
       name: b"nested_take",
-      src: b"(n: MapNode<{ a: { x: Int, y: String }, b: Int }, Int>) -> { a: { x: Int, y: String }, b: Int } = MapNode::pair_take(n, 1).key",
+      source_text: b"(n: MapNode<{ a: { x: Int, y: String }, b: Int }, Int>) -> { a: { x: Int, y: String }, b: Int } = MapNode::pair_take(n, 1).key",
     },
     {
       name: b"leaf_cut",
-      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::leaf_cut(n, 16).right",
+      source_text: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::leaf_cut(n, 16).right",
     },
     {
       name: b"branch_cut",
-      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::branch_cut(n, 16).left",
+      source_text: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::branch_cut(n, 16).left",
     },
     {
       name: b"kid_out",
-      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_out(n, 1).kid",
+      source_text: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_out(n, 1).kid",
     },
     {
       name: b"kid_back",
-      src: b"(n: MapNode<Int, String>, k: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_back(n, 1, k, 9, 4)",
+      source_text: b"(n: MapNode<Int, String>, k: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_back(n, 1, k, 9, 4)",
     },
     {
       name: b"kid_put",
-      src: b"(n: MapNode<Int, String>, k: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_put(n, 1, k, 9, 4)",
+      source_text: b"(n: MapNode<Int, String>, k: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_put(n, 1, k, 9, 4)",
     },
     {
       name: b"kid_drop",
-      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_drop(n, 1)",
+      source_text: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_drop(n, 1)",
     },
     {
       name: b"map_swap",
-      src: b"(m: Map<Int, String>, r: MapNode<Int, String>) -> Map<Int, String> = MapNode::map_swap(m, Some(r), 1, 40).map",
+      source_text: b"(m: Map<Int, String>, r: MapNode<Int, String>) -> Map<Int, String> = MapNode::map_swap(m, Some(r), 1, 40).map",
     },
-    { name: b"spelt", src: b"(b: Bytes) -> String = Utf8::spelt(b)" },
+    { name: b"spelt", source_text: b"(b: Bytes) -> String = Utf8::spelt(b)" },
   ]
 
 test "each prelude extern that has an intrinsic lowers to operations on the runtime's objects, using the layouts' field positions" {
   let calls = intrinsic_calls();
-  let probes = calls.fold(b"\n", |accumulator: Bytes, c: { name: Bytes, src: Bytes }|
-    Bytes::concat_all([accumulator, b"fn probe_", c.name, c.src, b"\n"]));
+  let probes = calls.fold(b"\n", |accumulator: Bytes, c: { name: Bytes, source_text: Bytes }|
+    Bytes::concat_all([accumulator, b"fn probe_", c.name, c.source_text, b"\n"]));
   assert_eq(
     intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
       probes.index_of(i.name.slice(b"std.prelude.".len(), i.name.len()).concat(b"(")) == None).map(
@@ -1084,7 +1107,9 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
     ),
     [],
   );
-  match analyse(parse_all([{ name: b"std.prelude", src: prelude_source::text().concat(probes) }])) {
+  match analyse(
+      parse_all([{ name: b"std.prelude", source_text: prelude_source::text().concat(probes) }]),
+    ) {
     Analysed(a) -> match module_context_in(a, b"std.prelude") {
       Ok(s) -> {
         let lowered = |name: Bytes| {
@@ -1094,11 +1119,11 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
             Some(r) -> lowered_fn(context_of(s.setting, r, r.code), r.code),
           }
         };
-        let written = |f: Fn|
-          f.body.fold([], |accumulator: List<Rvalue>, i: Inst|
+        let written = |f: Function|
+          f.body.fold([], |accumulator: List<Rvalue>, i: Instruction|
             match i {
               Let(l) -> match l.value {
-                Op(_) -> accumulator.push(l.value),
+                OperationCall(_) -> accumulator.push(l.value),
                 Native(_) -> accumulator.push(l.value),
                 Call(_) -> accumulator.push(l.value),
                 _ -> accumulator,
@@ -1108,9 +1133,9 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
         assert_eq(
           calls.fold(
             [],
-            |accumulator: List<{ name: Bytes, reason: Bytes }>, c: { name: Bytes, src: Bytes }|
+            |accumulator: List<{ name: Bytes, reason: Bytes }>, c: { name: Bytes, source_text: Bytes }|
               match written(lowered(c.name)) {
-                [Op(o)] -> match o.op {
+                [OperationCall(o)] -> match o.operation {
                   OfContainers(NodeIntrinsic(_)) -> accumulator,
                   _ -> accumulator.push({ name: c.name, reason: b"another operation" }),
                 },
@@ -1120,7 +1145,7 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
           [],
         );
         let code = |name: Bytes|
-          pieces_text(printed_fn(lowered(name), s.setting.constructors).pieces);
+          pieces_text(printed_function(lowered(name), s.setting.constructors).pieces);
         let laid = container_layouts();
         let has = |name: Bytes, text: Bytes| code(name).index_of(text) != None;
         let field = |name: Bytes| b"))->".concat(name);
@@ -1145,15 +1170,18 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
           ],
           [true, true, true, true, true, true, true, true, true, true, true, true, true],
         );
-        assert_eq([has(b"pair_set", writable_fn()), has(b"kid_put", writable_fn())], [true, false]);
-        let resolved = calls.filter(|c: { name: Bytes, src: Bytes }| {
+        assert_eq([has(b"pair_set", writable_function()), has(b"kid_put", writable_function())], [
+          true,
+          false,
+        ]);
+        let resolved = calls.filter(|c: { name: Bytes, source_text: Bytes }| {
           let f = lowered(c.name);
           f.links.needs == []
         });
         let copies = |name: Bytes| {
           let f = lowered(name);
-          printed_fn(f, s.setting.constructors).calls.filter(|k: RootKey|
-            match k { Generated(w, _) -> w.op == Copy, _ -> false })
+          printed_function(f, s.setting.constructors).calls.filter(|k: RootKey|
+            match k { Generated(w, _) -> w.operation == Copy, _ -> false })
         };
         assert_eq(
           [b"leaf_set", b"kid_put", b"map_swap", b"branch_cut", b"tail_start", b"leaf_at"].map(
@@ -1177,10 +1205,10 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
         );
         let fields = |name: Bytes| {
           let f = lowered(name);
-          f.body.fold([], |accumulator: List<Representation>, i: Inst|
+          f.body.fold([], |accumulator: List<Representation>, i: Instruction|
             match i {
               Let(l) -> match l.value {
-                Op(_) -> accumulator.push(l.var.representation),
+                OperationCall(_) -> accumulator.push(l.var.representation),
                 _ -> accumulator,
               },
               _ -> accumulator,
@@ -1228,8 +1256,8 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
           ]),
         ]);
         assert_eq(
-          resolved.filter(|c: { name: Bytes, src: Bytes }| has(c.name, b"builtin_")).map(
-            |c: { name: Bytes, src: Bytes }| c.name,
+          resolved.filter(|c: { name: Bytes, source_text: Bytes }| has(c.name, b"builtin_")).map(
+            |c: { name: Bytes, source_text: Bytes }| c.name,
           ),
           [],
         );
@@ -1238,7 +1266,10 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
         none_missed(
           [b"root", b"map_root"].fold([], |accumulator: List<Bytes>, name: Bytes| {
             let text = pieces_text(
-              printed_fn(insert_reference_counts(lowered(name)), s.setting.constructors).pieces,
+              printed_function(
+                insert_reference_counts(lowered(name)),
+                s.setting.constructors,
+              ).pieces,
             );
             if increments_count(text) { accumulator }
             else { accumulator.push(Bytes::concat_all([name, b":\n", text])) }

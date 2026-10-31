@@ -5,9 +5,10 @@ import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, Name
                                     EffectExpression, ReadMode, mode_text)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               EffectSetItem, Cases, SumBody, AliasBody, VariantDefinition,
-                              SpecClause, Binder, EffectSetDefinition, OpDefinition, LawDefinition,
-                              SchemaInstance, SchemaDefinition, SchemaIdentity, schema_named,
-                              schema_guard_name, law_type_variables, NominalBody, ExternBody)
+                              SpecClause, Binder, EffectSetDefinition, OperationDefinition,
+                              LawDefinition, SchemaInstance, SchemaDefinition, SchemaIdentity,
+                              schema_named, schema_guard_name, law_type_variables, NominalBody,
+                              ExternBody)
 import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
                                     UnaryExpression, LambdaExpression, CallExpression, IfExpression,
                                     MatchExpression, BlockExpression, RecordExpression,
@@ -17,7 +18,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, Param, NamedArg, MatchArm, HandleClause,
-                                    HandlerVar, RecordLiteralField, TaggedLiteralExpression, Hole)
+                                    HandlerStateVariable, RecordLiteralField,
+                                    TaggedLiteralExpression, Hole)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
                                  PatternRange, PatternConstructor, PatternRecord, PatternList,
                                  PatternOr, PatternInvalid)
@@ -139,7 +141,7 @@ fn diverges_expression(qualified_name: QName) -> EffectExpression =
   {
     effect_name: qualified_name,
     mode: ReadMode,
-    op: None,
+    operation: None,
     resource: None,
     resource_wildcard: false,
     bounded: false,
@@ -382,7 +384,7 @@ fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise} = {
     b" ",
     mode_text(a.mode),
     b" ",
-    match a.op { Some(o) -> o.name, None -> b"" },
+    match a.operation { Some(o) -> o.name, None -> b"" },
     b" ",
     if a.resource_wildcard { b"*" } else { match a.resource { Some(x) -> x.name, None -> b"" } },
   ])
@@ -473,7 +475,10 @@ fn effect_with_span(entry: EffectExpression, span: Span) -> EffectExpression =
       span: span,
     },
     mode: entry.mode,
-    op: match entry.op { Some(o) -> Some({ name: o.name, span: span }), None -> None },
+    operation: match entry.operation {
+      Some(o) -> Some({ name: o.name, span: span }),
+      None -> None,
+    },
     resource: match entry.resource { Some(x) -> Some({ name: x.name, span: span }), None -> None },
     resource_wildcard: entry.resource_wildcard,
     bounded: entry.bounded,
@@ -522,7 +527,7 @@ type EffectsExpander = {
   resolved: Resolution,
   table: SetTable,
   module: Int,
-  reached: List<ModuleBinding>,
+  bindings: List<ModuleBinding>,
   diagnostics: List<Diagnostic>,
   rows: Int,
 }
@@ -538,7 +543,10 @@ fn without_node_ids(a: EffectExpression) -> EffectExpression =
       name: { ..a.effect_name.name, span: { ..a.effect_name.name.span, site: 0 } },
       span: { ..a.effect_name.span, site: 0 },
     },
-    op: match a.op { Some(o) -> Some({ ..o, span: { ..o.span, site: 0 } }), None -> None },
+    operation: match a.operation {
+      Some(o) -> Some({ ..o, span: { ..o.span, site: 0 } }),
+      None -> None,
+    },
   }
 
 type ExpandedEffects = { expander: EffectsExpander, r: EffectsExpression }
@@ -584,7 +592,7 @@ fn expand_effects(
                   {
                     expander: {
                       ..a.expander,
-                      reached: add_binding_once(a.expander.reached, u.bind),
+                      bindings: add_binding_once(a.expander.bindings, u.bind),
                     },
                     listed: a.listed.push(without_node_ids(u.entry)),
                   }
@@ -615,7 +623,7 @@ fn expand_module_sets(
     resolved: resolved,
     table: table,
     module: m,
-    reached: [],
+    bindings: [],
     diagnostics: [],
     rows: 0,
   };
@@ -630,8 +638,8 @@ fn expand_module_sets(
             {
               expander: {
                 ..accumulator.expander,
-                reached: us.fold(
-                  accumulator.expander.reached,
+                bindings: us.fold(
+                  accumulator.expander.bindings,
                   |bindings: List<ModuleBinding>, u: LocalizedEffect|
                     add_binding_once(bindings, u.bind),
                 ),
@@ -696,11 +704,11 @@ fn expand_effects_in_type(
     },
     FunctionTypeExpression(ft) -> {
       let ps = expand_effects_in_types(expander, ft.params);
-      let r = expand_effects_in_type(ps.expander, ft.ret);
+      let r = expand_effects_in_type(ps.expander, ft.return_type);
       let e = expand_optional_effects(r.expander, ft.effects);
       {
         expander: e.expander,
-        t: FunctionTypeExpression({ ..ft, params: ps.ts, ret: r.t, effects: e.r }),
+        t: FunctionTypeExpression({ ..ft, params: ps.ts, return_type: r.t, effects: e.r }),
       }
     },
     RecordTypeExpression(r) -> {
@@ -794,20 +802,36 @@ fn expand_effects_in_expression(
 ) -> { expander: EffectsExpander, e: Expression } / {abort.raise} =
   match expression {
     BinaryExpression(b) -> {
-      let l = expand_effects_in_expression(expander, b.lhs);
-      let r = expand_effects_in_expression(l.expander, b.rhs);
-      { expander: r.expander, e: BinaryExpression({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+      let l = expand_effects_in_expression(expander, b.left_operand);
+      let r = expand_effects_in_expression(l.expander, b.right_operand);
+      {
+        expander: r.expander,
+        e: BinaryExpression({
+          span: b.span,
+          operation: b.operation,
+          left_operand: l.e,
+          right_operand: r.e,
+        }),
+      }
     },
     UnaryExpression(u) -> {
       let o = expand_effects_in_expression(expander, u.operand);
-      { expander: o.expander, e: UnaryExpression({ span: u.span, op: u.op, operand: o.e }) }
+      {
+        expander: o.expander,
+        e: UnaryExpression({ span: u.span, operation: u.operation, operand: o.e }),
+      }
     },
     LambdaExpression(l) -> {
       let ps = expand_effects_in_parameters(expander, l.params);
       let b = expand_effects_in_expression(ps.expander, l.body);
       {
         expander: b.expander,
-        e: LambdaExpression({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }),
+        e: LambdaExpression({
+          span: l.span,
+          body: b.e,
+          params: ps.ps,
+          return_clause: l.return_clause,
+        }),
       }
     },
     CallExpression(a) -> {
@@ -945,16 +969,16 @@ fn expand_effects_in_expression(
         e: PerformExpression({
           span: p.span,
           effect_name: p.effect_name,
-          op: p.op,
+          operation: p.operation,
           resource: p.resource,
           args: o.xs,
         }),
       }
     },
     HandleExpression(h) -> {
-      let vs = h.vars.fold(
+      let vs = h.handler_variables.fold(
         { expander: expander, vs: [] },
-        |accumulator: { expander: EffectsExpander, vs: List<HandlerVar> }, v: HandlerVar| {
+        |accumulator: { expander: EffectsExpander, vs: List<HandlerStateVariable> }, v: HandlerStateVariable| {
           let t = expand_effects_in_optional_type(accumulator.expander, v.ty);
           let i = expand_effects_in_expression(t.expander, v.init);
           { expander: i.expander, vs: accumulator.vs.push({ ..v, ty: t.t, init: i.e }) }
@@ -969,7 +993,7 @@ fn expand_effects_in_expression(
             expander: o.expander,
             classes: accumulator.classes.push({
               effect_name: c.effect_name,
-              op: c.op,
+              operation: c.operation,
               resource: c.resource,
               wildcard_label: c.wildcard_label,
               label_binder: c.label_binder,
@@ -981,7 +1005,7 @@ fn expand_effects_in_expression(
           }
         },
       );
-      let r = match h.ret {
+      let r = match h.return_clause {
         None -> { expander: cs.expander, r: None },
         Some(return_clause) -> {
           let o = expand_effects_in_expression(cs.expander, return_clause.body);
@@ -996,9 +1020,9 @@ fn expand_effects_in_expression(
         e: HandleExpression({
           span: h.span,
           body: b.e,
-          ret: r.r,
+          return_clause: r.r,
           clauses: cs.classes,
-          vars: vs.vs,
+          handler_variables: vs.vs,
         }),
       }
     },
@@ -1043,7 +1067,7 @@ fn expand_effects_in_item(
   match item {
     FunctionItem(d) -> {
       let ps = expand_effects_in_parameters(expander, d.params);
-      let r = expand_effects_in_optional_type(ps.expander, d.ret);
+      let r = expand_effects_in_optional_type(ps.expander, d.return_type);
       let ef = expand_optional_effects(r.expander, d.effects);
       let spec = d.spec.fold(
         { expander: ef.expander, xs: [] },
@@ -1070,7 +1094,7 @@ fn expand_effects_in_item(
           name: d.name,
           generics: d.generics,
           params: ps.ps,
-          ret: r.t,
+          return_type: r.t,
           effects: ef.r,
           constraints: d.constraints,
           spec: spec.xs,
@@ -1109,12 +1133,16 @@ fn expand_effects_in_item(
     EffectItem(d) -> {
       let operations = d.operations.fold(
         { expander: expander, operations: [] },
-        |accumulator: { expander: EffectsExpander, operations: List<OpDefinition> }, operation: OpDefinition| {
+        |accumulator: { expander: EffectsExpander, operations: List<OperationDefinition> }, operation: OperationDefinition| {
           let ps = expand_effects_in_types(accumulator.expander, operation.params);
-          let r = expand_effects_in_type(ps.expander, operation.ret);
+          let r = expand_effects_in_type(ps.expander, operation.return_type);
           {
             expander: r.expander,
-            operations: accumulator.operations.push({ ..operation, params: ps.ts, ret: r.t }),
+            operations: accumulator.operations.push({
+              ..operation,
+              params: ps.ts,
+              return_type: r.t,
+            }),
           }
         },
       );
@@ -1373,7 +1401,7 @@ pub fn expand_sets(r: Resolution, modules: List<ParsedModule>) -> SetExpansion /
     |accumulator: SetExpansion, m: Int| {
       let o = expand_module_sets(r, t, m, modules.get(m));
       {
-        resolution: o.expander.reached.fold(
+        resolution: o.expander.bindings.fold(
           accumulator.resolution,
           |rr: Resolution, binding: ModuleBinding|
             add_module_binding(rr, m, binding.binder, binding.target),

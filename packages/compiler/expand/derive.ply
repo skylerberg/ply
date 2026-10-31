@@ -15,8 +15,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
-                                    AssignmentStatement, HandlerVar, Param, NamedArg, MatchArm,
-                                    HandleClause, ReturnClause, RecordLiteralField,
+                                    AssignmentStatement, HandlerStateVariable, Param, NamedArg,
+                                    MatchArm, HandleClause, ReturnClause, RecordLiteralField,
                                     TaggedLiteralExpression, Hole, expression_span)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, DeriveItem, FnDefinition,
                               TypeDefinition, AliasBody, SumBody, VariantDefinition,
@@ -45,7 +45,7 @@ fn qualified_name_at(qualified_name: QName, span: Span) -> QName =
 fn optional_identifier_at(o: Option<Identifier>, span: Span) -> Option<Identifier> =
   match o { Some(i) -> Some(identifier_at(i, span)), None -> None }
 
-fn retarget_fn(definition: FnDefinition, span: Span) -> FnDefinition =
+fn retarget_function(definition: FnDefinition, span: Span) -> FnDefinition =
   {
     visibility: definition.visibility,
     name: { name: definition.name.name, span: span },
@@ -56,10 +56,14 @@ fn retarget_fn(definition: FnDefinition, span: Span) -> FnDefinition =
         identifier_at(identifier, span)),
       labels: definition.generics.labels.map(|identifier: Identifier|
         identifier_at(identifier, span)),
-      kept: definition.generics.kept.map(|identifier: Identifier| identifier_at(identifier, span)),
+      retained_types: definition.generics.retained_types.map(|identifier: Identifier|
+        identifier_at(identifier, span)),
     },
     params: definition.params.map(|param: Param| retarget_param(param, span)),
-    ret: match definition.ret { Some(t) -> Some(retarget_type(t, span)), None -> None },
+    return_type: match definition.return_type {
+      Some(t) -> Some(retarget_type(t, span)),
+      None -> None,
+    },
     effects: match definition.effects { Some(r) -> Some(retarget_effects(r, span)), None -> None },
     constraints: definition.constraints.map(|c: Constraint|
       { deriver: c.deriver, deriver_span: span, param: identifier_at(c.param, span), span: span }),
@@ -105,7 +109,7 @@ fn retarget_type(t: TypeExpression, span: Span) -> TypeExpression =
         ..f,
         span: span,
         params: f.params.map(|p: TypeExpression| retarget_type(p, span)),
-        ret: retarget_type(f.ret, span),
+        return_type: retarget_type(f.return_type, span),
         effects: match f.effects { Some(r) -> Some(retarget_effects(r, span)), None -> None },
       }),
     RecordTypeExpression(r) ->
@@ -124,7 +128,7 @@ fn retarget_effects(effects: EffectsExpression, span: Span) -> EffectsExpression
       {
         effect_name: qualified_name_at(entry.effect_name, span),
         mode: entry.mode,
-        op: optional_identifier_at(entry.op, span),
+        operation: optional_identifier_at(entry.operation, span),
         resource: optional_identifier_at(entry.resource, span),
         resource_wildcard: entry.resource_wildcard,
         bounded: entry.bounded,
@@ -150,18 +154,22 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
     BinaryExpression(b) ->
       BinaryExpression({
         span: span,
-        op: b.op,
-        lhs: retarget_expression(b.lhs, span),
-        rhs: retarget_expression(b.rhs, span),
+        operation: b.operation,
+        left_operand: retarget_expression(b.left_operand, span),
+        right_operand: retarget_expression(b.right_operand, span),
       }),
     UnaryExpression(u) ->
-      UnaryExpression({ span: span, op: u.op, operand: retarget_expression(u.operand, span) }),
+      UnaryExpression({
+        span: span,
+        operation: u.operation,
+        operand: retarget_expression(u.operand, span),
+      }),
     LambdaExpression(l) ->
       LambdaExpression({
         span: span,
         body: retarget_expression(l.body, span),
         params: l.params.map(|p: Param| retarget_param(p, span)),
-        ret: l.ret,
+        return_clause: l.return_clause,
       }),
     CallExpression(a) ->
       CallExpression({
@@ -249,7 +257,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
       PerformExpression({
         span: span,
         effect_name: qualified_name_at(p.effect_name, span),
-        op: identifier_at(p.op, span),
+        operation: identifier_at(p.operation, span),
         resource: optional_identifier_at(p.resource, span),
         args: p.args.map(|x: Expression| retarget_expression(x, span)),
       }),
@@ -257,7 +265,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
       HandleExpression({
         span: span,
         body: retarget_expression(h.body, span),
-        ret: match h.ret {
+        return_clause: match h.return_clause {
           Some(return_clause) ->
             Some({
               binder: identifier_at(return_clause.binder, span),
@@ -269,7 +277,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
         clauses: h.clauses.map(|c: HandleClause|
           {
             effect_name: qualified_name_at(c.effect_name, span),
-            op: identifier_at(c.op, span),
+            operation: identifier_at(c.operation, span),
             resource: optional_identifier_at(c.resource, span),
             wildcard_label: c.wildcard_label,
             label_binder: optional_identifier_at(c.label_binder, span),
@@ -278,7 +286,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
             span: span,
             params: c.params.map(|p: Identifier| identifier_at(p, span)),
           }),
-        vars: h.vars.map(|v: HandlerVar|
+        handler_variables: h.handler_variables.map(|v: HandlerStateVariable|
           {
             name: identifier_at(v.name, span),
             ty: match v.ty { Some(t) -> Some(retarget_type(t, span)), None -> None },
@@ -512,7 +520,7 @@ fn add_generated_source(
   let x = expand(r.node, r.parser.diagnostics);
   let functions = x.module.items.fold([], |accumulator: List<FnDefinition>, item: Item|
     match item {
-      FunctionItem(d) -> accumulator.push(retarget_fn(d, definition.span)),
+      FunctionItem(d) -> accumulator.push(retarget_function(d, definition.span)),
       _ -> accumulator,
     });
   if x.diagnostics.len() > 0 || functions.len() != x.module.items.len()

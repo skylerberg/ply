@@ -540,7 +540,7 @@ pub type MemListener = {
 /// secrets sent with `send_secret`, in the form `send_secret` frames them. `unheard` is the
 /// received bytes that no `Expects` step has matched yet. `deadlines` is the deadline given to each
 /// read, in order.
-pub type MemConn = {
+pub type MemoryConnection = {
   label: Option<String>,
   local: Option<SocketAddress>,
   peer: Option<SocketAddress>,
@@ -570,7 +570,7 @@ pub type MemNet = {
   next: Int,
   port: Int,
   listeners: Map<Int, MemListener>,
-  conns: Map<Int, MemConn>,
+  conns: Map<Int, MemoryConnection>,
   endpoints: Map<String, Endpoint>,
   callers: List<Caller>,
   names: dns::Table,
@@ -764,7 +764,7 @@ fn claimed(
     },
   }
 
-fn conn_of(n: MemNet, label: String, id: Int) -> MemConn / {abort.raise} =
+fn connection_of(n: MemNet, label: String, id: Int) -> MemoryConnection / {abort.raise} =
   match n.conns.get(id) {
     Some(c) -> if n.closed.contains(id) { no_socket(id) }
     else { { ..c, label: claimed(id, c.label, label) } },
@@ -784,9 +784,10 @@ fn listener_of(n: MemNet, label: String, id: Int) -> MemListener / {abort.raise}
     } else { no_socket(id) },
   }
 
-fn with_conn(n: MemNet, id: Int, c: MemConn) -> MemNet = { ..n, conns: n.conns.insert(id, c) }
+fn with_connection(n: MemNet, id: Int, c: MemoryConnection) -> MemNet =
+  { ..n, conns: n.conns.insert(id, c) }
 
-fn advance_script(c: MemConn) -> MemConn / {abort.raise} =
+fn advance_script(c: MemoryConnection) -> MemoryConnection / {abort.raise} =
   match c.script {
     [Sends(bytes), ..rest] -> if bytes.len() == 0 { advance_script({ ..c, script: rest }) }
     else { c },
@@ -815,11 +816,11 @@ fn advance_script(c: MemConn) -> MemConn / {abort.raise} =
     _ -> c,
   }
 
-fn new_conn(
+fn connection_with_script(
   local: Option<SocketAddress>,
   peer: Option<SocketAddress>,
   script: List<Step>,
-) -> MemConn =
+) -> MemoryConnection =
   {
     label: None,
     local: local,
@@ -961,13 +962,13 @@ fn opened(
     Some(at) -> Some(ip::socket_at(ip::loopback_like(ip::socket_ip(at)), n.port)),
     None -> None,
   };
-  let fresh = new_conn(local, to, []);
+  let fresh = connection_with_script(local, to, []);
   let mine = { ..fresh, label: Some(label), options: options.fold(fresh.options, with_option) };
   let after = { ..n, port: if local == None { n.port } else { n.port + 1 } };
   match bound_at(n, key) {
     Some(listener) -> {
       let l = match n.listeners.get(listener) { Some(l) -> l, None -> no_socket(listener) };
-      let accepted = new_conn(l.at, local, []);
+      let accepted = connection_with_script(l.at, local, []);
       let theirs = {
         ..accepted,
         joined: Some(n.next),
@@ -1085,7 +1086,7 @@ pub fn mem_connect_tls(
     Some(id) -> match connect_first_address.net.conns.get(id) {
       Some(c) ->
         {
-          net: with_conn(connect_first_address.net, id, {
+          net: with_connection(connect_first_address.net, id, {
             ..c,
             tls_name: Some(host),
             negotiated: Some("http/1.1"),
@@ -1109,7 +1110,7 @@ pub fn mem_accept(n: MemNet, label: String, listener: Int) -> StepResult<Int> / 
     [] -> match n.callers {
       [] -> { net: n, result: 0 },
       [caller, ..rest] -> {
-        let fresh = new_conn(l.at, caller.from, caller.script);
+        let fresh = connection_with_script(l.at, caller.from, caller.script);
         let c = {
           ..fresh,
           tls_name: l.tls,
@@ -1138,23 +1139,30 @@ pub fn mem_recv(
 ) -> StepResult<Option<Bytes>> / {abort.raise} = {
   deadline("recv", timeout_ms);
   let wanted = checked_read_size(max);
-  let advanced = advance_script(conn_of(n, label, connection));
+  let advanced = advance_script(connection_of(n, label, connection));
   let c = { ..advanced, deadlines: advanced.deadlines.push(timeout_ms) };
   let most = if n.chunk_limit > 0 { min(wanted, n.chunk_limit) } else { wanted };
   match c.script {
     [] ->
-      { net: with_conn(n, connection, c), result: if c.may_send_more { None } else { Some(b"") } },
+      {
+        net: with_connection(n, connection, c),
+        result: if c.may_send_more { None } else { Some(b"") },
+      },
     [Sends(bytes), ..rest] -> if bytes.len() > most {
       let left = bytes.slice(most, bytes.len());
       {
-        net: with_conn(n, connection, { ..c, script: [Sends(left)].concat(rest) }),
+        net: with_connection(n, connection, { ..c, script: [Sends(left)].concat(rest) }),
         result: Some(bytes.slice(0, most)),
       }
-    } else { { net: with_conn(n, connection, { ..c, script: rest }), result: Some(bytes) } },
+    } else { { net: with_connection(n, connection, { ..c, script: rest }), result: Some(bytes) } },
     [Repeats(bytes), ..] ->
-      { net: with_conn(n, connection, c), result: Some(bytes.slice(0, min(most, bytes.len()))) },
-    [Stalls, ..rest] -> { net: with_conn(n, connection, { ..c, script: rest }), result: None },
-    _ -> { net: with_conn(n, connection, c), result: None },
+      {
+        net: with_connection(n, connection, c),
+        result: Some(bytes.slice(0, min(most, bytes.len()))),
+      },
+    [Stalls, ..rest] ->
+      { net: with_connection(n, connection, { ..c, script: rest }), result: None },
+    _ -> { net: with_connection(n, connection, c), result: None },
   }
 }
 
@@ -1169,10 +1177,11 @@ pub fn mem_send(
 ) -> StepResult<Option<Int>> / {abort.raise} = {
   deadline("send", timeout_ms);
   check_nonempty_write("send", payload.len() == 0);
-  let c = advance_script(conn_of(n, label, connection));
-  if c.ended || c.gone { { net: with_conn(n, connection, c), result: Some(0) } } else {
+  let c = advance_script(connection_of(n, label, connection));
+  if c.ended || c.gone { { net: with_connection(n, connection, c), result: Some(0) } } else {
     match c.script {
-      [Blocks, ..rest] -> { net: with_conn(n, connection, { ..c, script: rest }), result: None },
+      [Blocks, ..rest] ->
+        { net: with_connection(n, connection, { ..c, script: rest }), result: None },
       _ -> {
         let size = if n.chunk_limit > 0 { min(payload.len(), n.chunk_limit) }
         else { payload.len() };
@@ -1182,7 +1191,7 @@ pub fn mem_send(
           sent: c.sent.concat(part),
           unheard: c.unheard.concat(part),
         });
-        { net: passed_on(with_conn(n, connection, mine), c.joined, part), result: Some(size) }
+        { net: passed_on(with_connection(n, connection, mine), c.joined, part), result: Some(size) }
       },
     }
   }
@@ -1225,8 +1234,8 @@ pub fn mem_send_secret(
   deadline("send_secret", timeout_ms);
   let framed = sent_secret(before, secret, encoding, after);
   check_nonempty_write("send_secret", framed.is_empty());
-  let c = advance_script(conn_of(n, label, connection));
-  if c.ended || c.gone { { net: with_conn(n, connection, c), result: false } }
+  let c = advance_script(connection_of(n, label, connection));
+  if c.ended || c.gone { { net: with_connection(n, connection, c), result: false } }
   else if c.joined != None {
     panic(
       "the in-memory network cannot send a credential to the program's own end of socket "
@@ -1236,7 +1245,8 @@ pub fn mem_send_secret(
   } else {
     let with_secret = { ..c, sent_secrets: c.sent_secrets.push(framed) };
     match c.script {
-      [Blocks, ..rest] -> { net: with_conn(n, connection, { ..c, script: rest }), result: false },
+      [Blocks, ..rest] ->
+        { net: with_connection(n, connection, { ..c, script: rest }), result: false },
       [Expects(expected), ..] ->
         panic(
           "the scripted peer expected to receive \"" ++ String::of_bytes_lossy(expected)
@@ -1244,7 +1254,7 @@ pub fn mem_send_secret(
         ),
       [ExpectsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
         {
-          net: with_conn(n, connection, advance_script({ ..with_secret, script: rest })),
+          net: with_connection(n, connection, advance_script({ ..with_secret, script: rest })),
           result: true,
         }
       } else {
@@ -1252,7 +1262,7 @@ pub fn mem_send_secret(
           "the scripted peer expected one credential but the program sent a different credential",
         )
       },
-      _ -> { net: with_conn(n, connection, with_secret), result: true },
+      _ -> { net: with_connection(n, connection, with_secret), result: true },
     }
   }
 }
@@ -1261,7 +1271,7 @@ fn passed_on(n: MemNet, other: Option<Int>, bytes: Bytes) -> MemNet =
   match other {
     None -> n,
     Some(id) -> match n.conns.get(id) {
-      Some(c) -> with_conn(n, id, { ..c, script: c.script.push(Sends(bytes)) }),
+      Some(c) -> with_connection(n, id, { ..c, script: c.script.push(Sends(bytes)) }),
       None -> n,
     },
   }
@@ -1271,7 +1281,7 @@ fn signal_far_end(n: MemNet, other: Option<Int>, closed: Bool) -> MemNet =
     None -> n,
     Some(id) -> match n.conns.get(id) {
       Some(c) ->
-        with_conn(n, id, {
+        with_connection(n, id, {
           ..c,
           may_send_more: false,
           gone: c.gone || closed,
@@ -1286,10 +1296,10 @@ pub fn mem_close_write(
   label: String,
   connection: Int,
 ) -> StepResult<Unit> / {abort.raise} = {
-  let c = conn_of(n, label, connection);
+  let c = connection_of(n, label, connection);
   {
     net: signal_far_end(
-      with_conn(n, connection, advance_script({ ..c, ended: true })),
+      with_connection(n, connection, advance_script({ ..c, ended: true })),
       c.joined,
       false,
     ),
@@ -1302,8 +1312,13 @@ pub fn mem_close_write(
 pub fn mem_close(n: MemNet, label: String, socket: Int) -> StepResult<Unit> / {abort.raise} =
   match n.conns.get(socket) {
     Some(_) -> {
-      let c = conn_of(n, label, socket);
-      let closed_network = with_conn(n, socket, { ..c, gone: true, ended: true, joined: None });
+      let c = connection_of(n, label, socket);
+      let closed_network = with_connection(n, socket, {
+        ..c,
+        gone: true,
+        ended: true,
+        joined: None,
+      });
       {
         net: { ..signal_far_end(closed_network, c.joined, true), closed: n.closed.push(socket) },
         result: (),
@@ -1329,10 +1344,10 @@ fn upgraded(
   timeout_ms: Int,
 ) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} = {
   deadline(operation, timeout_ms);
-  let c = advance_script(conn_of(n, label, connection));
+  let c = advance_script(connection_of(n, label, connection));
   let secured = |rest: List<Step>| {
     {
-      net: with_conn(n, connection, {
+      net: with_connection(n, connection, {
         ..c,
         script: rest,
         tls_name: Some(who),
@@ -1344,7 +1359,7 @@ fn upgraded(
   let over = |reason: Error| {
     {
       net: signal_far_end(
-        with_conn(n, connection, {
+        with_connection(n, connection, {
           ..c,
           script: [],
           may_send_more: false,
@@ -1411,8 +1426,11 @@ pub fn mem_handshake(
   label: String,
   connection: Int,
 ) -> StepResult<Option<Int>> / {abort.raise} = {
-  let c = conn_of(n, label, connection);
-  { net: with_conn(n, connection, c), result: if c.tls_name == None { None } else { Some(0) } }
+  let c = connection_of(n, label, connection);
+  {
+    net: with_connection(n, connection, c),
+    result: if c.tls_name == None { None } else { Some(0) },
+  }
 }
 
 fn setting(option: SocketOption) -> Int =
@@ -1453,11 +1471,12 @@ pub fn mem_set_option(
   let option = option_checked(requested_option);
   match n.conns.get(socket) {
     Some(_) -> {
-      let c = conn_of(n, label, socket);
-      let set = with_conn(n, socket, { ..c, options: with_option(c.options, option) });
+      let c = connection_of(n, label, socket);
+      let set = with_connection(n, socket, { ..c, options: with_option(c.options, option) });
       let presenting = match ((c.accepted, c.joined)) {
         (false, Some(peer)) -> match set.conns.get(peer) {
-          Some(p) -> with_conn(set, peer, { ..p, client_certificate: presented_by(n, [option]) }),
+          Some(p) ->
+            with_connection(set, peer, { ..p, client_certificate: presented_by(n, [option]) }),
           None -> set,
         },
         _ -> set,
@@ -1480,7 +1499,7 @@ pub fn mem_set_option(
 /// What `net.options` returns over the network: each option set, as it was last set.
 pub fn mem_options(n: MemNet, label: String, socket: Int) -> List<SocketOption> / {abort.raise} =
   match n.conns.get(socket) {
-    Some(_) -> conn_of(n, label, socket).options,
+    Some(_) -> connection_of(n, label, socket).options,
     None -> listener_of(n, label, socket).options,
   }
 
@@ -1490,7 +1509,7 @@ pub fn mem_local_address(
   socket: Int,
 ) -> Option<SocketAddress> / {abort.raise} =
   match n.conns.get(socket) {
-    Some(_) -> conn_of(n, label, socket).local,
+    Some(_) -> connection_of(n, label, socket).local,
     None -> listener_of(n, label, socket).at,
   }
 
@@ -1503,7 +1522,7 @@ pub fn mem_peer_address(
   connection: Int,
 ) -> Option<SocketAddress> / {abort.raise} =
   match n.conns.get(connection) {
-    Some(_) -> conn_of(n, label, connection).peer,
+    Some(_) -> connection_of(n, label, connection).peer,
     None -> {
       let _l = listener_of(n, label, connection);
       None
@@ -1521,7 +1540,7 @@ pub fn mem_peer_certificate(
 ) -> Option<Bytes> / {abort.raise} =
   match n.conns.get(connection) {
     Some(_) -> {
-      let c = conn_of(n, label, connection);
+      let c = connection_of(n, label, connection);
       match c.tls_name {
         Some(name) -> if c.accepted { c.client_certificate } else { n.leaves.get(name) },
         None -> None,
@@ -1537,7 +1556,7 @@ pub fn mem_peer_certificate(
 /// upgraded, or `http/1.1` for a connection opened by `connect_tls`.
 pub fn mem_protocol(n: MemNet, label: String, connection: Int) -> Option<String> / {abort.raise} =
   match n.conns.get(connection) {
-    Some(_) -> conn_of(n, label, connection).negotiated,
+    Some(_) -> connection_of(n, label, connection).negotiated,
     None -> {
       let _l = listener_of(n, label, connection);
       None
@@ -1550,7 +1569,7 @@ pub fn mem_peer_credentials(
   connection: Int,
 ) -> Option<PeerCredentials> / {abort.raise} =
   match n.conns.get(connection) {
-    Some(_) -> conn_of(n, label, connection).credentials,
+    Some(_) -> connection_of(n, label, connection).credentials,
     None -> {
       let _l = listener_of(n, label, connection);
       None

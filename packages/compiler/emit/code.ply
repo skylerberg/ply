@@ -4,7 +4,7 @@ import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, Litera
                                  LiteralDecimal, LiteralChar, LiteralUnit, LiteralInvalid)
 import compiler.syntax.expressions (simulate_closure_span)
 import compiler.check.types (Type, VariableType, FunctionType, FunctionSignature, Effects, Effect,
-                             no_effects, unit_type, int_type, string_type, fn_type)
+                             no_effects, unit_type, int_type, string_type, function_type)
 import compiler.check.typed (TypedExpression, pattern_binders, TypedLiteral, TypedRead, TypedUnary,
                              TypedBinary, TypedCall, TypedIf, TypedMatch, TypedBlock, TypedList,
                              TypedRecord, TypedUpdate, TypedFieldRead, TypedPerform, TypedLambda,
@@ -14,7 +14,7 @@ import compiler.check.typed (TypedExpression, pattern_binders, TypedLiteral, Typ
                              TypedBinder, TypedLiteralPattern, TypedRange, TypedCase,
                              TypedRecordPattern, TypedListPattern, TypedOr, TypedFieldPattern,
                              TypedStatement, TypedLet, TypedLetElse, TypedDo, TypedAssign,
-                             TypedClause, TypedReturn, TypedHandlerVar,
+                             TypedClause, TypedReturn, TypedHandlerVariable,
                              typed_expression_nodes_folded, NumericWitness, ConcreteWitness,
                              ParamWitness, StatedWitness, witness_param_name, TypedRelease,
                              NodeHolder, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
@@ -31,19 +31,19 @@ derive children for Code
 
 pub type Node =
   | CodeLiteral(SourceLiteral)
-  | CodeVar({ name: Bytes, slot: Int })
+  | CodeVariable({ name: Bytes, slot: Int })
   | NDefinition({ full: Bytes, args: List<Type>, effect_arguments: List<Effects>, labels: List<FilledLabel> })
   | NConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<Type> })
   | NBuiltin({ name: Bytes, args: List<Type>, effect_arguments: List<Effects> })
-  | CodeUnary({ op: Bytes, operand: Code })
-  | CodeBinary({ op: Bytes, lhs: Code, rhs: Code })
+  | CodeUnary({ operation: Bytes, operand: Code })
+  | CodeBinary({ operation: Bytes, left_operand: Code, right_operand: Code })
   | CodeApply({ function: Code, args: List<Code>, effects: Effects })
   | CodeIf({ cond: Code, then_branch: Code, else_branch: Code })
   | CodeBlock({ statements: List<CodeStatement>, tail: Option<Code> })
   | CodeList({ items: List<Code> })
   | CodeRecord({ fields: List<CodeField> })
   | CodeMatch({ scrutinee: Code, arms: List<CodeArm> })
-  | CodePerform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Code>, entry: Effect, args: List<Code> })
+  | CodePerform({ effect: Bytes, operation: Bytes, resource: Bytes, label: Option<Code>, entry: Effect, args: List<Code> })
   | CodeLabel(Bytes)
   | CodeLambda(Lambda)
   | CodeSimulate({ size: Int, captures: List<Capture>, body: Code, at: Span, effects: Effects })
@@ -87,18 +87,18 @@ pub type CodePatternField = { name: Bytes, pattern: CodePattern }
 
 pub type CodeArm = { pattern: CodePattern, guard: Option<Code>, body: Code }
 
-pub type Capture = { src: Int, destination: Int }
+pub type Capture = { source: Int, destination: Int }
 
 pub type CodeHandler = {
   body: Code,
   clauses: List<CodeClause>,
-  ret: Option<CodeReturn>,
+  return_clause: Option<CodeReturn>,
   effects: Effects,
 }
 
 pub type CodeClause = {
   effect: Bytes,
-  op: Bytes,
+  operation: Bytes,
   resource: Bytes,
   label: Option<Code>,
   params: Int,
@@ -138,7 +138,7 @@ pub fn read_name(c: Code) -> Option<Bytes> =
 fn resource_tag(name: Bytes, label: Option<Code>) -> Bytes =
   match label {
     None -> name,
-    Some(c) -> match c.node { CodeVar(v) -> b"$".concat(ascii_of_int(v.slot)), _ -> name },
+    Some(c) -> match c.node { CodeVariable(v) -> b"$".concat(ascii_of_int(v.slot)), _ -> name },
   }
 
 pub fn dump_literal(literal: SourceLiteral) -> Bytes / {abort.raise} =
@@ -182,7 +182,7 @@ fn dump_captures(captures: List<Capture>) -> Bytes =
     captures.fold(b"", |accumulator: Bytes, capture: Capture|
       Bytes::concat_all([
         accumulator,
-        ascii_of_int(capture.src),
+        ascii_of_int(capture.source),
         b">",
         ascii_of_int(capture.destination),
         b" ",
@@ -228,12 +228,21 @@ pub fn dump(code: Code) -> Bytes / {abort.raise} = dump_node(code.node)
 fn dump_node(n: Node) -> Bytes / {abort.raise} =
   match n {
     CodeLiteral(l) -> Bytes::concat_all([b"lit(", dump_literal(l), b")"]),
-    CodeVar(v) -> Bytes::concat_all([b"var(", v.name, b",", ascii_of_int(v.slot), b")"]),
+    CodeVariable(v) -> Bytes::concat_all([b"var(", v.name, b",", ascii_of_int(v.slot), b")"]),
     NDefinition(d) -> Bytes::concat_all([b"def(", d.full, b")"]),
     NConstructor(c) -> Bytes::concat_all([b"ctor(", c.name, b")"]),
     NBuiltin(b) -> Bytes::concat_all([b"builtin(", b.name, b")"]),
-    CodeUnary(u) -> Bytes::concat_all([b"un(", u.op, b",", dump(u.operand), b")"]),
-    CodeBinary(b) -> Bytes::concat_all([b"bin(", b.op, b",", dump(b.lhs), b",", dump(b.rhs), b")"]),
+    CodeUnary(u) -> Bytes::concat_all([b"un(", u.operation, b",", dump(u.operand), b")"]),
+    CodeBinary(b) ->
+      Bytes::concat_all([
+        b"bin(",
+        b.operation,
+        b",",
+        dump(b.left_operand),
+        b",",
+        dump(b.right_operand),
+        b")",
+      ]),
     CodeApply(a) ->
       Bytes::concat_all([
         b"app(",
@@ -312,7 +321,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
         b"perform(",
         p.effect,
         b",",
-        p.op,
+        p.operation,
         b",",
         resource_tag(p.resource, p.label),
         p.args.fold(b"", |accumulator: Bytes, a: Code|
@@ -346,7 +355,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
             b",cl(",
             c.effect,
             b",",
-            c.op,
+            c.operation,
             b",",
             resource_tag(c.resource, c.label),
             b",",
@@ -361,7 +370,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
             dump(c.body),
             b")",
           ])),
-        match h.ret {
+        match h.return_clause {
           Some(r) ->
             Bytes::concat_all([
               b",ret(",
@@ -513,12 +522,15 @@ fn resolve(stack: Stack, name: Bytes) -> SlotLookup =
 
 fn read_local(stack: Stack, name: Bytes, ty: Type, span: Span) -> Lowered =
   match handler_variable(stack, name) {
-    Some(h) -> { code: var_read(h, span), stack: stack },
+    Some(h) -> { code: handler_variable_read(h, span), stack: stack },
     None -> {
       let r = resolve(stack, name);
       match r.slot {
         Some(s) ->
-          { code: { node: CodeVar({ name: name, slot: s }), span: span, ty: ty }, stack: r.stack },
+          {
+            code: { node: CodeVariable({ name: name, slot: s }), span: span, ty: ty },
+            stack: r.stack,
+          },
         None ->
           {
             code: { node: CodeLiteral(LiteralUnit), span: span, ty: ty },
@@ -620,7 +632,7 @@ fn capture(frame: Frame, name: Bytes, source: Int) -> Frame =
   {
     names: frame.names.push(name),
     scope: frame.scope,
-    captures: frame.captures.push({ src: source, destination: frame.names.len() }),
+    captures: frame.captures.push({ source: source, destination: frame.names.len() }),
     capture_names: frame.capture_names.push(name),
   }
 
@@ -695,30 +707,38 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
           let w = read_local(o.stack, witness_param_name(p), int_type(), e.span);
           {
             code: {
-              ..internal_builtin_call(b"?numeric_unary", [int_code(if u.op == b"bitnot" { 1 } else { 0 }), w.code, o.code], e.ty),
+              ..internal_builtin_call(b"?numeric_unary", [int_code(if u.operation == b"bitnot" { 1 } else { 0 }), w.code, o.code], e.ty),
               span: e.span,
             },
             stack: w.stack,
           }
         },
-        None -> { code: at(e, CodeUnary({ op: u.op, operand: o.code })), stack: o.stack },
+        None ->
+          { code: at(e, CodeUnary({ operation: u.operation, operand: o.code })), stack: o.stack },
       }
     },
     TypedBinary(b) -> {
-      let l = lower_in(b.lhs, stack);
-      let r = lower_in(b.rhs, l.stack);
-      match open_witness(b.witness, b.lhs.ty) {
+      let l = lower_in(b.left_operand, stack);
+      let r = lower_in(b.right_operand, l.stack);
+      match open_witness(b.witness, b.left_operand.ty) {
         Some(p) -> {
           let w = read_local(r.stack, witness_param_name(p), int_type(), e.span);
           {
             code: {
-              ..internal_builtin_call(b"?numeric_binary", [int_code(numeric_operator_code(b.op)), w.code, l.code, r.code], e.ty),
+              ..internal_builtin_call(b"?numeric_binary", [int_code(numeric_operator_code(b.operation)), w.code, l.code, r.code], e.ty),
               span: e.span,
             },
             stack: w.stack,
           }
         },
-        None -> { code: at(e, CodeBinary({ op: b.op, lhs: l.code, rhs: r.code })), stack: r.stack },
+        None ->
+          {
+            code: at(
+              e,
+              CodeBinary({ operation: b.operation, left_operand: l.code, right_operand: r.code }),
+            ),
+            stack: r.stack,
+          },
       }
     },
     TypedIf(i) -> {
@@ -787,7 +807,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
           e,
           CodePerform({
             effect: p.effect,
-            op: p.op,
+            operation: p.operation,
             resource: name,
             label: match lb { Some(o) -> Some(o.code), None -> None },
             entry: p.entry,
@@ -833,7 +853,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
       }),
     TypedHandle(h) ->
       snapshotted(e, stack, |st: Stack|
-        handled(e, h.body, h.clauses, h.ret, h.vars, h.effects, st)),
+        handled(e, h.body, h.clauses, h.return_clause, h.variables, h.effects, st)),
     TypedBlock(b) ->
       lower_from(b.statements, 0, { statements: [], stack: stack }, depth_of(stack), b.tail, e.ty),
   }
@@ -914,7 +934,7 @@ fn as_update(
           match accumulator {
             Some(_) -> accumulator,
             None -> if copy_base(f, stack) != None { None }
-            else { projected_var(f.value, stack, []) },
+            else { projected_variable(f.value, stack, []) },
           }),
     };
     match base {
@@ -934,7 +954,7 @@ fn as_update(
                 e,
                 CodeUpdate({
                   base: {
-                    node: CodeVar({ name: read.name, slot: sl }),
+                    node: CodeVariable({ name: read.name, slot: sl }),
                     span: read.at,
                     ty: read.ty,
                   },
@@ -1028,25 +1048,29 @@ fn copy_base(field: TypedField<Type>, stack: Stack) -> Option<Bytes> =
     _ -> None,
   }
 
-fn projected_var(e: TypedExpression<Type>, stack: Stack, inner: List<Bytes>) -> Option<Projected> = {
+fn projected_variable(
+  e: TypedExpression<Type>,
+  stack: Stack,
+  inner: List<Bytes>,
+) -> Option<Projected> = {
   let first = |expressions: List<TypedExpression<Type>>|
     expressions.fold(None, |accumulator: Option<Projected>, x: TypedExpression<Type>|
-      match accumulator { Some(_) -> accumulator, None -> projected_var(x, stack, inner) });
+      match accumulator { Some(_) -> accumulator, None -> projected_variable(x, stack, inner) });
   match e.node {
     TypedFieldRead(x) -> match x.base.node {
       TypedRead(ReadLocal(n)) -> if !inner.contains(n) && binding_depth(stack, n) != None {
         Some({ name: n, at: x.base.span, ty: x.base.ty })
       } else { None },
-      _ -> projected_var(x.base, stack, inner),
+      _ -> projected_variable(x.base, stack, inner),
     },
-    TypedUnary(x) -> projected_var(x.operand, stack, inner),
-    TypedBinary(x) -> first([x.lhs, x.rhs]),
-    TypedCall(x) -> match projected_var(x.callee, stack, inner) {
+    TypedUnary(x) -> projected_variable(x.operand, stack, inner),
+    TypedBinary(x) -> first([x.left_operand, x.right_operand]),
+    TypedCall(x) -> match projected_variable(x.callee, stack, inner) {
       Some(n) -> Some(n),
       None -> first(x.args),
     },
     TypedIf(x) -> first([x.cond, x.then_branch, x.else_branch]),
-    TypedMatch(x) -> projected_var(x.scrutinee, stack, inner),
+    TypedMatch(x) -> projected_variable(x.scrutinee, stack, inner),
     TypedBlock(x) -> {
       let walked = x.statements.fold(
         { found: None, inner: inner },
@@ -1056,26 +1080,29 @@ fn projected_var(e: TypedExpression<Type>, stack: Stack, inner: List<Bytes>) -> 
             None -> match statement {
               TypedLet(l) ->
                 {
-                  found: projected_var(l.value, stack, accumulator.inner),
+                  found: projected_variable(l.value, stack, accumulator.inner),
                   inner: accumulator.inner.concat(
                     pattern_binders(l.pattern).map(|b: TypedParam<Type>| b.name),
                   ),
                 },
               TypedLetElse(l) ->
                 {
-                  found: match projected_var(l.value, stack, accumulator.inner) {
+                  found: match projected_variable(l.value, stack, accumulator.inner) {
                     Some(n) -> Some(n),
-                    None -> projected_var(l.fallback, stack, accumulator.inner),
+                    None -> projected_variable(l.fallback, stack, accumulator.inner),
                   },
                   inner: accumulator.inner.concat(
                     pattern_binders(l.pattern).map(|b: TypedParam<Type>| b.name),
                   ),
                 },
               TypedDo(v) ->
-                { found: projected_var(v, stack, accumulator.inner), inner: accumulator.inner },
+                {
+                  found: projected_variable(v, stack, accumulator.inner),
+                  inner: accumulator.inner,
+                },
               TypedAssign(v) ->
                 {
-                  found: projected_var(v.value, stack, accumulator.inner),
+                  found: projected_variable(v.value, stack, accumulator.inner),
                   inner: accumulator.inner,
                 },
             },
@@ -1083,17 +1110,20 @@ fn projected_var(e: TypedExpression<Type>, stack: Stack, inner: List<Bytes>) -> 
       );
       match walked.found {
         Some(n) -> Some(n),
-        None -> match x.tail { Some(t) -> projected_var(t, stack, walked.inner), None -> None },
+        None -> match x.tail {
+          Some(t) -> projected_variable(t, stack, walked.inner),
+          None -> None,
+        },
       }
     },
     TypedRecord(fs) -> first(fs.map(|f: TypedField<Type>| f.value)),
-    TypedUpdate(x) -> match projected_var(x.base, stack, inner) {
+    TypedUpdate(x) -> match projected_variable(x.base, stack, inner) {
       Some(n) -> Some(n),
       None -> first(x.sets.map(|f: TypedField<Type>| f.value)),
     },
     TypedList(xs) -> first(xs),
     TypedPerform(x) -> first(x.args),
-    TypedHandle(x) -> projected_var(x.body, stack, inner),
+    TypedHandle(x) -> projected_variable(x.body, stack, inner),
     TypedLiteral(_) -> None,
     TypedRead(_) -> None,
     TypedLambda(_) -> None,
@@ -1137,9 +1167,9 @@ fn lower_lambda(
 fn closure_type(params: List<TypedParam<Type>>, return_type: Type) -> FunctionSignature =
   {
     params: params.map(|p: TypedParam<Type>| p.ty),
-    kept: [],
+    keep_parameters: [],
     once: false,
-    ret: return_type,
+    return_type: return_type,
     effects: no_effects(),
   }
 
@@ -1170,14 +1200,14 @@ fn handled(
   body: TypedExpression<Type>,
   clauses: List<TypedClause<Type>>,
   return_clause: Option<TypedReturn<Type>>,
-  handler_variables: List<TypedHandlerVar<Type>>,
+  handler_variables: List<TypedHandlerVariable<Type>>,
   effects: Effects,
   stack: Stack,
 ) -> Lowered / {abort.raise} = {
   let depth = depth_of(stack);
   let made = handler_variables.fold(
     { statements: [], reads: [], stack: stack },
-    |accumulator: { statements: List<CodeStatement>, reads: List<Code>, stack: Stack }, v: TypedHandlerVar<Type>| {
+    |accumulator: { statements: List<CodeStatement>, reads: List<Code>, stack: Stack }, v: TypedHandlerVariable<Type>| {
       let o = lower_in(v.init, accumulator.stack);
       let slot = top_frame(o.stack).names.len();
       {
@@ -1185,7 +1215,7 @@ fn handled(
           CodeLet({ name: v.name, slot: slot, value: o.code }),
         ),
         reads: accumulator.reads.push({
-          node: CodeVar({ name: v.name, slot: slot }),
+          node: CodeVariable({ name: v.name, slot: slot }),
           span: v.span,
           ty: v.ty,
         }),
@@ -1217,7 +1247,7 @@ fn handled(
       ..st,
       handler_variables: handler_variables.fold(
         outer_held,
-        |accumulator: List<HandlerVariable>, v: TypedHandlerVar<Type>|
+        |accumulator: List<HandlerVariable>, v: TypedHandlerVariable<Type>|
           accumulator.push({
             name: v.name,
             at: accumulator.len() - outer_held.len(),
@@ -1252,7 +1282,7 @@ fn handled(
       {
         clauses: accumulator.clauses.push({
           effect: c.effect,
-          op: c.op,
+          operation: c.operation,
           resource: resource_name,
           label: match lb { Some(o) -> Some(o.code), None -> None },
           params: c.params.len(),
@@ -1301,7 +1331,12 @@ fn handled(
   };
   let installed_handle = at(
     e,
-    CodeHandle({ body: started, clauses: cls.clauses, ret: returned.ret, effects: effects }),
+    CodeHandle({
+      body: started,
+      clauses: cls.clauses,
+      return_clause: returned.ret,
+      effects: effects,
+    }),
   );
   {
     code: if made.statements.len() == 0 { installed_handle }
@@ -1322,7 +1357,7 @@ fn handler_variable(stack: Stack, name: Bytes) -> Option<HandlerVariable> =
     else { Some(h) },
   }
 
-fn var_read(h: HandlerVariable, span: Span) -> Code =
+fn handler_variable_read(h: HandlerVariable, span: Span) -> Code =
   { ..internal_builtin_call(b"?handler_var", [int_code(h.at)], h.ty), span: span }
 
 fn snapshotted(
@@ -1354,7 +1389,7 @@ fn snapshotted(
               CodeLet({
                 name: h.name,
                 slot: top_frame(accumulator.stack).names.len(),
-                value: var_read(h, e.span),
+                value: handler_variable_read(h, e.span),
               }),
             ),
             stack: bind_in_stack(accumulator.stack, h.name),
@@ -1408,7 +1443,7 @@ fn internal_builtin_call(name: Bytes, args: List<Code>, ty: Type) -> Code =
       function: {
         node: NBuiltin({ name: name, args: [], effect_arguments: [] }),
         span: dummy_span(),
-        ty: fn_type(args.map(|a: Code| a.ty), ty, no_effects()),
+        ty: function_type(args.map(|a: Code| a.ty), ty, no_effects()),
       },
       args: args,
       effects: no_effects(),
@@ -1748,7 +1783,11 @@ fn value_after_calls(name: Bytes, slot: Int, value: Code, calls: List<Code>) -> 
       statements: [CodeLet({ name: name, slot: slot, value: value })].concat(
         calls.map(|c: Code| CodeDo({ code: c })),
       ),
-      tail: Some({ node: CodeVar({ name: name, slot: slot }), span: dummy_span(), ty: value.ty }),
+      tail: Some({
+        node: CodeVariable({ name: name, slot: slot }),
+        span: dummy_span(),
+        ty: value.ty,
+      }),
     }),
     span: dummy_span(),
     ty: value.ty,
@@ -1792,7 +1831,7 @@ fn release_slot_reads(s: Stack, rs: List<TypedRelease>) -> LoweredSequence =
           {
             ..accumulator,
             codes: accumulator.codes.push({
-              node: CodeVar({ name: b.name, slot: b.slot }),
+              node: CodeVariable({ name: b.name, slot: b.slot }),
               span: dummy_span(),
               ty: b.ty,
             }),
@@ -1810,20 +1849,20 @@ fn release_slot_reads(s: Stack, rs: List<TypedRelease>) -> LoweredSequence =
 fn through_caps(reads: List<Int>, caps: List<Capture>) -> List<Int> =
   reads.fold([], |accumulator: List<Int>, s: Int|
     match caps.fold(None, |found: Option<Int>, capture: Capture|
-        if capture.destination == s { Some(capture.src) } else { found }) {
+        if capture.destination == s { Some(capture.source) } else { found }) {
       Some(source) -> accumulator.push(source),
       None -> accumulator,
     })
 
 pub fn slots_read(code: Code) -> List<Int> =
   match code.node {
-    CodeVar(v) -> [v.slot],
+    CodeVariable(v) -> [v.slot],
     CodeLiteral(_) -> [],
     NDefinition(_) -> [],
     NConstructor(_) -> [],
     NBuiltin(_) -> [],
     CodeUnary(u) -> slots_read(u.operand),
-    CodeBinary(b) -> slots_read(b.lhs).concat(slots_read(b.rhs)),
+    CodeBinary(b) -> slots_read(b.left_operand).concat(slots_read(b.right_operand)),
     CodeFieldRead(f) -> slots_read(f.base),
     CodeApply(a) -> slots_read(a.function).concat(all_read(a.args)),
     CodeKnownLambda(k) -> [k.slot],
@@ -1853,14 +1892,14 @@ pub fn slots_read(code: Code) -> List<Int> =
     CodePerform(p) ->
       List::concat(match p.label { Some(x) -> slots_read(x), None -> [] }, all_read(p.args)),
     CodeLambda(l) -> through_caps(slots_read(l.body), l.captures),
-    CodeSimulate(x) -> x.captures.map(|c2: Capture| c2.src).concat(slots_read(x.body)),
+    CodeSimulate(x) -> x.captures.map(|c2: Capture| c2.source).concat(slots_read(x.body)),
     CodeParallel(parallel) -> all_read(parallel.branches),
     CodeHandle(h) ->
       slots_read(h.body).concat(
         h.clauses.fold([], |accumulator: List<Int>, clause: CodeClause|
           accumulator.concat(match clause.label { Some(x) -> slots_read(x), None -> [] }).concat(
             through_caps(slots_read(clause.body), clause.captures),
-          )).concat(match h.ret {
+          )).concat(match h.return_clause {
           Some(r) -> through_caps(slots_read(r.body), r.captures),
           None -> [],
         }),
@@ -1876,7 +1915,7 @@ fn field_slots_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
 
 pub type LoweredBody = { code: Code, size: Int, failed: List<Bytes> }
 
-pub fn lower_fn(
+pub fn lower_function(
   params: List<TypedParam<Type>>,
   labels: List<Bytes>,
   body: TypedExpression<Type>,

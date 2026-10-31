@@ -709,7 +709,7 @@ pub type Event =
 /// message that requests anything is not sent to a server that does not offer the extension.
 pub type Dsn = new {
   /// How much of the message a report returns; the server's choice if `None`.
-  ret: Option<Return>,
+  return_content: Option<Return>,
   /// An identifier of the sender's own, returned in each report: printable ASCII, 100
   /// characters at most.
   envelope_id: Option<String>,
@@ -722,7 +722,7 @@ pub type Dsn = new {
 }
 
 /// Nothing requested: reports are made as the servers choose.
-pub fn no_dsn() -> Dsn = { ret: None, envelope_id: None, notify: None, original: false }
+pub fn no_dsn() -> Dsn = { return_content: None, envelope_id: None, notify: None, original: false }
 
 fn requests_reports(d: Dsn) -> Bool = d != no_dsn()
 
@@ -761,7 +761,11 @@ fn event_word(e: Event) -> String =
   match e { Delivered -> "SUCCESS", Failed -> "FAILURE", Delayed -> "DELAY" }
 
 fn mail_dsn_parameters(dsn_request: Dsn) -> String / {abort.raise} =
-  (match dsn_request.ret { Some(Full) -> " RET=FULL", Some(Headers) -> " RET=HDRS", None -> "" })
+  (match dsn_request.return_content {
+      Some(Full) -> " RET=FULL",
+      Some(Headers) -> " RET=HDRS",
+      None -> "",
+    })
     ++ (match dsn_request.envelope_id { Some(id) -> " ENVID=" ++ xtext(id), None -> "" })
 
 fn rcpt_dsn_parameters(dsn_request: Dsn, a: Address) -> String / {abort.raise} =
@@ -1033,12 +1037,12 @@ pub type Next =
 
 /// One step of an engine: its new state, what to write to the server first, what to do after
 /// that, the lines of the exchange this step read and wrote, and how many whole replies it read.
-pub type Turn = { engine: Engine, out: Wire, next: Next, said: List<Line>, returned: Int }
+pub type Turn = { engine: Engine, out: Wire, next: Next, reply_lines: List<Line>, returned: Int }
 
 fn state(e: Engine) -> State = match e { Engine(s) -> s }
 
 fn turn(s: State, out: Wire, next: Next, reply_of: List<Line>, replies_read: Int) -> Turn =
-  { engine: Engine(s), out: out, next: next, said: reply_of, returned: replies_read }
+  { engine: Engine(s), out: out, next: next, reply_lines: reply_of, returned: replies_read }
 
 /// An engine for a newly made connection, waiting for the server's greeting.
 pub fn start(c: Config, link: Link) -> Turn =
@@ -1476,7 +1480,7 @@ pub fn mail(
   e: Engine,
   envelope: Envelope,
   data: Bytes,
-  dsn_request: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+  dsn_request: Dsn = { return_content: None, envelope_id: None, notify: None, original: false },
 ) -> Turn / {smtp.fail, abort.raise} = {
   let s = state(e);
   let shape = shape_of(envelope, data);
@@ -1591,7 +1595,7 @@ pub opaque type Session = new {
   handle: Int,
   engine: Engine,
   /// The newest lines of the exchange, `Limits.transcript` of them at most.
-  kept: List<Line>,
+  recent_lines: List<Line>,
 }
 
 /// The result of sending a message: the session to use for the next message, and the outcome of
@@ -1599,7 +1603,7 @@ pub opaque type Session = new {
 /// recipient only if every outcome is `Accepted`.
 pub type SendResult = { session: Session, deliveries: List<Delivery> }
 
-type DriveResult = { engine: Engine, said: List<Line> }
+type DriveResult = { engine: Engine, lines: List<Line> }
 
 fn deadline_after(ms: Int) -> Instant / {clock.read, task::deadline.at} = {
   let own = after(clock.now(), millis(ms));
@@ -1648,14 +1652,14 @@ fn drive<[l] | e>(
   left: Int,
 ) -> DriveResult / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.fail, abort.raise | e} = {
   let waits = config_of(t.engine).timeouts;
-  let all_said = reply_of.concat(t.said);
+  let all_said = reply_of.concat(t.reply_lines);
   let wrote = wire_size(t.out) > 0;
   if wrote && !sent_by[l](h, t.out, deadline_after(waits.block_ms)) {
     smtp.fail(NotSent(match t.next { Await(p) -> p, _ -> Quit }))
   } else {
     match t.next {
-      Ready -> { engine: t.engine, said: all_said },
-      Over -> { engine: t.engine, said: all_said },
+      Ready -> { engine: t.engine, lines: all_said },
+      Over -> { engine: t.engine, lines: all_said },
       Secure -> if left <= 0 { smtp.fail(TimedOut(Handshake)) } else {
         match secure(h, unread(t.engine)) {
           Some(reason) -> smtp.fail(reason),
@@ -1696,7 +1700,7 @@ fn established<[l] | e>(
   secure: (Int, Bytes) -> Option<Error> / e,
 ) -> Session / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.fail, abort.raise | e} =
   match try[smtp.fail] { drive[l](h, start(c, link), [], None, secure, 16 * max_reads()) } {
-    Ok(d) -> { handle: h, engine: d.engine, kept: trim_transcript(c.limits, [], d.said) },
+    Ok(d) -> { handle: h, engine: d.engine, recent_lines: trim_transcript(c.limits, [], d.lines) },
     Err(reason) -> {
       net.close[l](h);
       smtp.fail(reason)
@@ -1777,7 +1781,7 @@ pub fn submit<[l]>(
   s: Session,
   envelope: Envelope,
   data: Bytes,
-  dsn_request: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+  dsn_request: Dsn = { return_content: None, envelope_id: None, notify: None, original: false },
 ) -> SendResult / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.fail, abort.raise} = {
   let d = drive[l](
     s.handle,
@@ -1791,7 +1795,7 @@ pub fn submit<[l]>(
     session: {
       handle: s.handle,
       engine: d.engine,
-      kept: trim_transcript(config_of(d.engine).limits, s.kept, d.said),
+      recent_lines: trim_transcript(config_of(d.engine).limits, s.recent_lines, d.lines),
     },
     deliveries: deliveries(d.engine),
   }
@@ -1804,7 +1808,7 @@ pub fn submit<[l]>(
 pub fn send<[l]>(
   s: Session,
   d: Draft,
-  dsn_request: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+  dsn_request: Dsn = { return_content: None, envelope_id: None, notify: None, original: false },
 ) -> SendResult / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, entropy.next bounded, smtp.fail, abort.raise} =
   match try[email.unwritable] { email::write_fresh(d, email::repertoire_for(d)) } {
     Ok(data) -> submit[l](s, email::envelope(d), data, dsn_request),
@@ -1818,7 +1822,7 @@ pub fn send<[l]>(
 pub fn relay<[l]>(
   s: Session,
   m: Message,
-  dsn_request: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+  dsn_request: Dsn = { return_content: None, envelope_id: None, notify: None, original: false },
 ) -> SendResult / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.fail, abort.raise} =
   match try[email.fail] { email::message_envelope(m) } {
     Ok(envelope) ->
@@ -1890,7 +1894,7 @@ pub fn server_offered(s: Session) -> Option<Capabilities> = offered(s.engine)
 
 /// The newest lines of a session's exchange, `Limits.transcript` of them at most, oldest
 /// first. No credential is among them.
-pub fn transcript(s: Session) -> List<Line> = s.kept
+pub fn transcript(s: Session) -> List<Line> = s.recent_lines
 
 /// Lines of an exchange as text, one per line: `C:` before what the client sent, `S:` before what
 /// the server sent, and `*:` before anything else.
@@ -2290,9 +2294,9 @@ fn marked(mark: String, sent: Bytes) -> List<String> =
   }
 
 fn written(t: Turn) -> List<String> =
-  List::concat(if t.said.contains(Upgraded) { ["*: TLS"] } else { [] }, match t.out {
+  List::concat(if t.reply_lines.contains(Upgraded) { ["*: TLS"] } else { [] }, match t.out {
     Veiled(_, _, _) ->
-      t.said.filter(|l: Line| match l { Client(_) -> true, _ -> false }).map(|l: Line|
+      t.reply_lines.filter(|l: Line| match l { Client(_) -> true, _ -> false }).map(|l: Line|
         transcript_text([l])),
     Open(sent) -> marked("C:", sent),
   })
@@ -2387,7 +2391,7 @@ fn onward(
         } {
         Ok(next_turn) -> Onward(Ok(next_turn), beats, rest, { ..here, delivering: true }),
         Err(reason) -> if !usable(reason) { Halt(Err(reason)) } else {
-          Onward(Ok({ ..t, out: Open(b""), said: [] }), beats, rest, {
+          Onward(Ok({ ..t, out: Open(b""), reply_lines: [] }), beats, rest, {
             ..here,
             outcomes: here.outcomes.push("rejected: " ++ show(reason)),
           })
@@ -2917,7 +2921,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
         Deliver(
           email::envelope_of(ReturnTo(test_sender()), test_recipients(["Jones"])),
           test_message(),
-          { ret: None, envelope_id: None, notify: Some([]), original: false },
+          { return_content: None, envelope_id: None, notify: Some([]), original: false },
         ),
         Deliver(email::envelope_of(ReturnTo(test_sender()), []), test_message(), no_dsn()),
         Deliver(
@@ -2954,7 +2958,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
           ]),
           test_message(),
           {
-            ret: Some(Headers),
+            return_content: Some(Headers),
             envelope_id: Some("QQ314159"),
             notify: Some([Failed, Delivered]),
             original: true,
@@ -2963,12 +2967,12 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
         Deliver(
           email::envelope_of(NullPath, [email::address("Alice", "Example.ORG")]),
           test_message(),
-          { ret: Some(Full), envelope_id: None, notify: Some([]), original: false },
+          { return_content: Some(Full), envelope_id: None, notify: Some([]), original: false },
         ),
         Deliver(
           email::envelope_of(NullPath, [email::address("Alice", "Example.ORG")]),
           test_message(),
-          { ret: None, envelope_id: Some("caf\u{e9}"), notify: None, original: false },
+          { return_content: None, envelope_id: Some("caf\u{e9}"), notify: None, original: false },
         ),
       ],
       exchange:
@@ -4259,7 +4263,7 @@ test "no address and no parameter writes a line of its own: a message's commands
           ]);
           match try[smtp.fail] {
               mail(opened.engine, envelope, test_message(), {
-                ret: Some(Headers),
+                return_content: Some(Headers),
                 envelope_id: Some(id),
                 notify: Some([Failed, Delayed]),
                 original: original,

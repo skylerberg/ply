@@ -2,9 +2,9 @@ import compiler.syntax.parsing (Span)
 import compiler.check.types (Type, Effects, Effect, Resource, NamedResource, SingletonResource,
                              ResourceVariable, AnyResource, Scheme, int_type, no_effects)
 import compiler.check.infer.checker (simulated_effect_names)
-import compiler.emit.code (Code, CodeLabel, CodeVar, NDefinition, NBuiltin, CodePerform, CodeLambda,
-                           CodeSimulate, CodeHandle, CodeClause, is_label_binder, code_children,
-                           labels_among)
+import compiler.emit.code (Code, CodeLabel, CodeVariable, NDefinition, NBuiltin, CodePerform,
+                           CodeLambda, CodeSimulate, CodeHandle, CodeClause, is_label_binder,
+                           code_children, labels_among)
 import compiler.emit.keys (RootKey, EntryPoint, Evidence, key_effects, unspecialised)
 import compiler.emit.evidence (EffectsEvidence, KeyedEvidence, effects_evidence, declared_effects,
                                offset_labels, passed_label_count, renumber_labels, key_effects_of,
@@ -12,10 +12,10 @@ import compiler.emit.evidence (EffectsEvidence, KeyedEvidence, effects_evidence,
                                max_evidence_params, evidence_param_count, evidence_array_type,
                                evidence_array_of, effects_descriptor_type)
 import compiler.emit.representations (Definition)
-import compiler.emit.typed_ir (Representation, AsInt, AsImmediate, Var, Arg, VarOperand, IntOperand,
-                               ZeroOperand, Op, OfHandling, Static, Convention, BorrowedParam,
-                               reads)
-import compiler.emit.typed_ir.handling (HandleOp, WordArray, WordAt, SchedulerEvidence,
+import compiler.emit.typed_ir (Representation, AsInt, AsImmediate, Variable, Arg, VariableOperand,
+                               IntOperand, ZeroOperand, OperationCall, OfHandling, Static,
+                               Convention, BorrowedParam, reads)
+import compiler.emit.typed_ir.handling (HandleOperation, WordArray, WordAt, SchedulerEvidence,
                                         UnhandledEvidence)
 import compiler.emit.typed_ir.statics (StaticLayout, StaticWord, StaticWords, RawWord, FieldWord)
 import compiler.emit.lower.module_context (ModuleContext)
@@ -67,7 +67,7 @@ pub fn evidence_parameter_types(h: EvidenceParameters) -> List<Type> =
 pub fn enter_root_body(
   context: Context,
   st: Lowering,
-  params: List<Var>,
+  params: List<Variable>,
   declared: Int,
   h: EvidenceParameters,
 ) -> { context: Context, st: Lowering } = {
@@ -83,8 +83,8 @@ pub fn enter_root_body(
       words: read.words,
       label_values: labels_among(params.take(declared), h.labels).concat(
         params.drop(declared).take(h.hidden),
-      ).map(|v: Var| Some(VarOperand(v))),
-      evidence_arguments: params.drop(declared).map(VarOperand),
+      ).map(|v: Variable| Some(VariableOperand(v))),
+      evidence_arguments: params.drop(declared).map(VariableOperand),
     },
     st: read.st,
   }
@@ -103,17 +103,21 @@ pub fn entry_body_start(
         { st: o.st, made: [], words: [] },
         |accumulator: { st: Lowering, made: List<EntryObject>, words: List<EvidenceWord> }, e: Bytes| {
           let operation = entry_object(e);
-          let w = match accumulator.made.find(|m: EntryObject| m.op == operation) {
+          let w = match accumulator.made.find(|m: EntryObject| m.operation == operation) {
             Some(m) -> { st: accumulator.st, made: accumulator.made, arg: m.arg },
             None -> {
               let b = bound_as(
                 accumulator.st,
                 evidence_type(),
                 AsImmediate,
-                Op({ op: OfHandling(operation), args: [], uses: reads(0) }),
+                OperationCall({ operation: OfHandling(operation), args: [], uses: reads(0) }),
                 o.context.body.span,
               );
-              { st: b.st, made: accumulator.made.push({ op: operation, arg: b.arg }), arg: b.arg }
+              {
+                st: b.st,
+                made: accumulator.made.push({ operation: operation, arg: b.arg }),
+                arg: b.arg,
+              }
             },
           };
           {
@@ -136,20 +140,21 @@ pub fn entry_body_start(
     _ -> o,
   }
 
-type EntryObject = { op: HandleOp, arg: Arg }
+type EntryObject = { operation: HandleOperation, arg: Arg }
 
-fn entry_object(name: Bytes) -> HandleOp =
+fn entry_object(name: Bytes) -> HandleOperation =
   if name == b"sim" || simulated_effect_names().contains(name) { SchedulerEvidence }
   else { UnhandledEvidence }
 
 pub fn read_evidence_words(
   st: Lowering,
-  carried: List<Var>,
+  carried: List<Variable>,
   own: List<EffectsEvidence>,
   at: Span,
 ) -> { st: Lowering, words: List<EvidenceWord> } = {
-  let read = if own.len() <= max_evidence_params() { { st: st, words: carried.map(VarOperand) } }
-  else {
+  let read = if own.len() <= max_evidence_params() {
+    { st: st, words: carried.map(VariableOperand) }
+  } else {
     match carried.at(0) {
       None -> { st: st, words: [] },
       Some(array) ->
@@ -160,7 +165,11 @@ pub fn read_evidence_words(
               accumulator.st,
               evidence_type(),
               AsImmediate,
-              Op({ op: OfHandling(WordAt(i)), args: [VarOperand(array)], uses: reads(1) }),
+              OperationCall({
+                operation: OfHandling(WordAt(i)),
+                args: [VariableOperand(array)],
+                uses: reads(1),
+              }),
               at,
             );
             { st: w.st, words: accumulator.words.push(w.arg) }
@@ -214,7 +223,7 @@ fn effects_of(c: Code) -> { effect_arguments: List<Effects>, listed: List<Effect
     CodeHandle(h) ->
       {
         effect_arguments: h.clauses.fold(
-          match h.ret { Some(r) -> [h.effects, r.effects], None -> [h.effects] },
+          match h.return_clause { Some(r) -> [h.effects, r.effects], None -> [h.effects] },
           |accumulator: List<Effects>, clause: CodeClause| accumulator.push(clause.effects),
         ),
         listed: [],
@@ -245,7 +254,7 @@ pub fn labels_read(context: Context, c: Code, accumulator: List<Int>) -> List<In
       out.concat(places(effects_evidence(r, context.effect_evidence, context.labels))),
   );
   let named = match c.node {
-    CodeVar(v) ->
+    CodeVariable(v) ->
       range(0, context.label_names.len()).filter(|i: Int|
         match context.label_names.at(i) {
           Some(n) -> Bytes::concat_all([b"[", n, b"]"]) == v.name,
@@ -410,7 +419,11 @@ pub fn passed_evidence_arguments(
       words.st,
       evidence_array_type(),
       AsImmediate,
-      Op({ op: OfHandling(WordArray), args: words.args, uses: reads(words.args.len()) }),
+      OperationCall({
+        operation: OfHandling(WordArray),
+        args: words.args,
+        uses: reads(words.args.len()),
+      }),
       at,
     );
     { st: laid.st, args: h.labels.push(laid.arg) }
@@ -450,7 +463,7 @@ pub fn fill_missing_evidence(
       st,
       evidence_type(),
       AsImmediate,
-      Op({ op: OfHandling(SchedulerEvidence), args: [], uses: reads(0) }),
+      OperationCall({ operation: OfHandling(SchedulerEvidence), args: [], uses: reads(0) }),
       at,
     );
     { st: b.st, args: words.map(|w: Arg| if w == ZeroOperand(AsImmediate) { b.arg } else { w }) }
@@ -475,7 +488,7 @@ fn resolve_label_resource(
 pub fn label_resource(context: Context, c: Code) -> Resource / {abort.raise} =
   match c.node {
     CodeLabel(n) -> NamedResource(n),
-    CodeVar(v) -> if !is_label_binder(v.name) { unknown_resource() } else {
+    CodeVariable(v) -> if !is_label_binder(v.name) { unknown_resource() } else {
       let name = v.name.slice(1, v.name.len() - 1);
       match range(0, context.label_names.len()).find(|i: Int|
           context.label_names.at(i) == Some(name)) {
@@ -522,7 +535,7 @@ pub fn wanted_evidence_arguments(
       descriptor.st,
       evidence_array_type(),
       AsImmediate,
-      Op({ op: OfHandling(WordArray), args: all, uses: reads(all.len()) }),
+      OperationCall({ operation: OfHandling(WordArray), args: all, uses: reads(all.len()) }),
       at,
     );
     { st: laid.st, args: [descriptor.arg, laid.arg] }

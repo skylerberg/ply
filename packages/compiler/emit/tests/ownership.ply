@@ -1,12 +1,13 @@
-import compiler.emit.typed_ir (Inst, Block, Let, Do, Allocate, Inc, Reset, Free, If, Case, Match,
-                               Loop, Handle, Fn, Rvalue, Get, Take, Op, OfStrings, OfContainers,
-                               PayloadPath, InlineRecordPath, AsInt, AsAddress, RecordAllocation,
+import compiler.emit.typed_ir (Instruction, Block, Let, Do, Allocate, Increment, Reset, Free, If,
+                               Case, Match, Loop, Handle, Function, Rvalue, Get, Take,
+                               OperationCall, OfStrings, OfContainers, PayloadPath,
+                               InlineRecordPath, AsInt, AsAddress, RecordAllocation,
                                FieldInitializer, BuiltInPlace, Update)
 import compiler.emit.typed_ir.containers (CopyOut, Retain)
 import compiler.emit.emit_harness (program_of, lowered_root, checked, printed_by_ir)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
-import compiler.emit.print.count_functions (release_fn, call_start)
+import compiler.emit.print.count_functions (release_function, call_start)
 
 test "a lowered function with no reference counting is unchanged by `insert_reference_counts` and passes the ownership check" {
   let source = Bytes::concat_all([
@@ -71,16 +72,20 @@ fn corpus_names() -> List<Bytes> =
     b"kept_in",
   ]
 
-fn insts(b: Block) -> List<Inst> =
-  b.fold([], |accumulator: List<Inst>, i: Inst|
+fn instructions(b: Block) -> List<Instruction> =
+  b.fold([], |accumulator: List<Instruction>, i: Instruction|
     accumulator.push(i).concat(match i {
-      If(x) -> insts(x.then).concat(insts(x.otherwise)),
+      If(x) -> instructions(x.then).concat(instructions(x.otherwise)),
       Case(c) ->
-        c.arms.fold(insts(c.rest), |a: List<Inst>, arm: { when: Int, body: Block }|
-          a.concat(insts(arm.body))),
-      Match(m) -> m.arms.fold(insts(m.rest), |a: List<Inst>, arm: Block| a.concat(insts(arm))),
-      Loop(l) -> insts(l.body),
-      Handle(h) -> insts(h.body),
+        c.arms.fold(
+          instructions(c.rest),
+          |a: List<Instruction>, arm: { when: Int, body: Block }| a.concat(instructions(arm.body)),
+        ),
+      Match(m) ->
+        m.arms.fold(instructions(m.rest), |a: List<Instruction>, arm: Block|
+          a.concat(instructions(arm))),
+      Loop(l) -> instructions(l.body),
+      Handle(h) -> instructions(h.body),
       _ -> [],
     }))
 
@@ -98,7 +103,10 @@ test "every function in the ownership test program lowers and passes the ownersh
       );
       let incs = |n: Bytes|
         match checked(p, n) {
-          Ok(f) -> insts(f.body).filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
+          Ok(f) ->
+            instructions(f.body).filter(|i: Instruction|
+              match i { Increment(_) -> true, _ -> false }).len(
+            ),
           Err(_) -> 0 - 1,
         };
       assert_eq([b"rename", b"bump", b"label", b"first", b"pick", b"size", b"mirror"].map(incs), [
@@ -111,7 +119,10 @@ test "every function in the ownership test program lowers and passes the ownersh
         0,
       ]);
       let resets = match checked(p, b"mirror") {
-        Ok(f) -> insts(f.body).filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+        Ok(f) ->
+          instructions(f.body).filter(|i: Instruction|
+            match i { Reset(_) -> true, _ -> false }).len(
+          ),
         Err(_) -> 0 - 1,
       };
       assert_eq(resets, 1)
@@ -150,7 +161,7 @@ test "a failure releases the list it owns before exiting, and all such failures 
     Ok(p) -> match printed_by_ir(p, b"grown") {
       Err(reason) -> assert_eq(reason, b""),
       Ok(t) -> {
-        assert_eq(t.split(call_start(release_fn(), [b"ctx", b"p0"])).len() - 1, 1);
+        assert_eq(t.split(call_start(release_function(), [b"ctx", b"p0"])).len() - 1, 1);
         let targets = t.split(b"goto ").drop(1).map(|s: Bytes|
           match s.index_of(b";") { Some(at) -> s.slice(0, at), None -> s });
         assert(targets.len() >= 3 && targets.all(|x: Bytes| Some(x) == targets.at(0)))
@@ -209,17 +220,20 @@ test "a record literal containing record literals allocates one block, with each
     Ok(p) -> match checked(p, b"nested") {
       Err(reason) -> assert_eq(reason, b""),
       Ok(f) -> {
-        let makes = insts(f.body).fold([], |accumulator: List<List<FieldInitializer>>, i: Inst|
-          match i {
-            Let(l) -> match l.value {
-              Allocate(m) -> match m.made {
-                RecordAllocation(shape) -> accumulator.push(shape),
+        let makes = instructions(f.body).fold(
+          [],
+          |accumulator: List<List<FieldInitializer>>, i: Instruction|
+            match i {
+              Let(l) -> match l.value {
+                Allocate(m) -> match m.made {
+                  RecordAllocation(shape) -> accumulator.push(shape),
+                  _ -> accumulator,
+                },
                 _ -> accumulator,
               },
               _ -> accumulator,
             },
-            _ -> accumulator,
-          });
+        );
         assert_eq(makes.len(), 1);
         assert_eq(
           makes.get(0).filter(|s: FieldInitializer|
@@ -241,9 +255,9 @@ test "updating an inline record inside an update of its containing record is a s
           match checked(p, n) {
             Ok(f) ->
               Ok(
-                insts(f.body).fold(
+                instructions(f.body).fold(
                   { updates: 0, places: 0 },
-                  |accumulator: { updates: Int, places: Int }, i: Inst|
+                  |accumulator: { updates: Int, places: Int }, i: Instruction|
                     match i {
                       Let(l) -> match l.value {
                         Update(_) -> { ..accumulator, updates: accumulator.updates + 1 },
@@ -265,19 +279,23 @@ test "updating an inline record inside an update of its containing record is a s
 }
 
 fn place_reads(b: Block) -> { kept: Int, taken: Int } =
-  insts(b).fold({ kept: 0, taken: 0 }, |accumulator: { kept: Int, taken: Int }, i: Inst|
-    match i {
-      Let(l) -> match l.value {
-        Op(o) -> if o.op == OfContainers(Retain) { { ..accumulator, kept: accumulator.kept + 1 } }
-        else { accumulator },
-        Take(t) -> match t.path {
-          InlineRecordPath(_) -> { ..accumulator, taken: accumulator.taken + 1 },
+  instructions(b).fold(
+    { kept: 0, taken: 0 },
+    |accumulator: { kept: Int, taken: Int }, i: Instruction|
+      match i {
+        Let(l) -> match l.value {
+          OperationCall(o) -> if o.operation == OfContainers(Retain) {
+            { ..accumulator, kept: accumulator.kept + 1 }
+          } else { accumulator },
+          Take(t) -> match t.path {
+            InlineRecordPath(_) -> { ..accumulator, taken: accumulator.taken + 1 },
+            _ -> accumulator,
+          },
           _ -> accumulator,
         },
         _ -> accumulator,
       },
-      _ -> accumulator,
-    })
+  )
 
 test "reading an inline record out of an allocation with no other users moves it out, and takes a reference count only where the record is used again" {
   match program_of(inline_record_corpus()) {
@@ -328,11 +346,11 @@ fn buffer_corpus() -> Bytes =
   ])
 
 fn reuse_of(b: Block) -> { incs: Int, resets: Int, reused: Int } = {
-  let all = insts(b);
+  let all = instructions(b);
   {
-    incs: all.filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
-    resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
-    reused: all.filter(|i: Inst|
+    incs: all.filter(|i: Instruction| match i { Increment(_) -> true, _ -> false }).len(),
+    resets: all.filter(|i: Instruction| match i { Reset(_) -> true, _ -> false }).len(),
+    reused: all.filter(|i: Instruction|
       match i {
         Let(l) -> match l.value { Allocate(m) -> m.reuse != None, _ -> false },
         _ -> false,
@@ -376,16 +394,16 @@ test "a tree node that a function destructures and rebuilds with the same shape 
       let counts = |n: Bytes|
         match checked(p, n) {
           Ok(f) -> {
-            let all = insts(f.body);
+            let all = instructions(f.body);
             Ok({
-              resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
-              reused: all.filter(|i: Inst|
+              resets: all.filter(|i: Instruction| match i { Reset(_) -> true, _ -> false }).len(),
+              reused: all.filter(|i: Instruction|
                 match i {
                   Let(l) -> match l.value { Allocate(m) -> m.reuse != None, _ -> false },
                   _ -> false,
                 }).len(
               ),
-              freed: all.filter(|i: Inst| match i { Free(_) -> true, _ -> false }).len(),
+              freed: all.filter(|i: Instruction| match i { Free(_) -> true, _ -> false }).len(),
             })
           },
           Err(reason) -> Err(reason),
@@ -405,8 +423,8 @@ fn bytes_corpus() -> Bytes =
     b"fn digested(b: Bytes) -> Bytes = b.blake3()\n",
   ])
 
-fn broken_in(b: Block, broken: (Inst) -> Option<Inst>) -> Block =
-  b.map(|i: Inst|
+fn broken_in(b: Block, broken: (Instruction) -> Option<Instruction>) -> Block =
+  b.map(|i: Instruction|
     match broken(i) {
       Some(x) -> x,
       None -> match i {
@@ -430,22 +448,22 @@ fn broken_in(b: Block, broken: (Inst) -> Option<Inst>) -> Block =
       },
     })
 
-fn rule_violation(i: Inst) -> Option<Inst> =
+fn rule_violation(i: Instruction) -> Option<Instruction> =
   match i {
     Let(l) -> match l.value {
-      Op(o) -> match o.op {
+      OperationCall(o) -> match o.operation {
         OfStrings(_) ->
           Some(
             Let({
               ..l,
-              value: Op({
+              value: OperationCall({
                 ..o,
                 uses: { ..o.uses, takes: o.uses.takes.map(|t: Bool| !t), owned: !o.uses.owned },
               }),
             }),
           ),
         OfContainers(CopyOut) ->
-          Some(Let({ ..l, value: Op({ ..o, uses: { ..o.uses, owned: false } }) })),
+          Some(Let({ ..l, value: OperationCall({ ..o, uses: { ..o.uses, owned: false } }) })),
         _ -> None,
       },
       Get(g) -> if g.path == PayloadPath {
@@ -454,9 +472,11 @@ fn rule_violation(i: Inst) -> Option<Inst> =
       _ -> None,
     },
     Do(d) -> match d.value {
-      Op(o) -> match o.op {
+      OperationCall(o) -> match o.operation {
         OfStrings(_) ->
-          Some(Do({ ..d, value: Op({ ..o, uses: { ..o.uses, owned: !o.uses.owned } }) })),
+          Some(
+            Do({ ..d, value: OperationCall({ ..o, uses: { ..o.uses, owned: !o.uses.owned } }) }),
+          ),
         _ -> None,
       },
       _ -> None,
@@ -469,17 +489,17 @@ test "bytes read through an address, operated on and returned by a marshalling c
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let names = [b"first", b"starts", b"holds", b"cut", b"digested"];
-      let counted = names.fold([], |accumulator: List<{ name: Bytes, f: Fn }>, n: Bytes|
+      let counted = names.fold([], |accumulator: List<{ name: Bytes, f: Function }>, n: Bytes|
         match checked(p, n) {
           Ok(f) -> accumulator.push({ name: n, f: f }),
           Err(reason) -> panic(String::of_bytes_lossy(n.concat(b": ").concat(reason))),
         });
       assert_eq(counted.len(), names.len());
       assert_eq(
-        counted.filter(|c: { name: Bytes, f: Fn }| {
+        counted.filter(|c: { name: Bytes, f: Function }| {
           let broken = broken_in(c.f.body, rule_violation);
           broken == c.f.body || ownership_fault({ ..c.f, body: broken }) == None
-        }).map(|c: { name: Bytes, f: Fn }| c.name),
+        }).map(|c: { name: Bytes, f: Function }| c.name),
         [],
       )
     },

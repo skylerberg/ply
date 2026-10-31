@@ -4,7 +4,8 @@ import compiler.syntax.parsing (Identifier, Span, prelude_binder)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, RaiseMode, InvalidMode, mode_text)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
                              Field, Scheme, Effects, Effect, int_type, bool_type, float_type,
-                             decimal_type, bytes_type, fn_type, no_effects, unit_type, list_type)
+                             decimal_type, bytes_type, function_type, no_effects, unit_type,
+                             list_type)
 import compiler.check.known (ordering_name, less_constructor, equal_constructor)
 import compiler.emit.typing (SiteType, SiteAnnotations, annotations_of, no_annotations, site_type,
                              unknown_type, body_at)
@@ -19,13 +20,13 @@ import compiler.check.typed
 import compiler.check.typed (TypedBody, TypedParam, BodyPart, WholeBody, TestRun, part_key,
                              body_retyped)
 import compiler.check.infer (BodyFacts, item_owner, facts_by_owner)
-import compiler.check.infer.checker (MemberSite, Builtin, builtins, EffectInfo, OpInfo)
+import compiler.check.infer.checker (MemberSite, Builtin, builtins, EffectInfo, OperationInfo)
 import compiler.check.infer.definitions (MachineCall, machine_calls, parsed_natives)
 import compiler.front.facts (Analysis)
 import compiler.front.emitter_input (InferredFacts, inferred_facts_bin, constructors_read)
-import compiler.front.rows (Rows, KnownDefinitionRow, ConstructorRow, EffectRow, OpRow)
+import compiler.front.rows (Rows, KnownDefinitionRow, ConstructorRow, EffectRow, OperationRow)
 import compiler.front.published (facts_read, rows_of, inferred_facts)
-import compiler.emit.code (Code, lower_fn, with_labels)
+import compiler.emit.code (Code, lower_function, with_labels)
 import compiler.emit.representations (Definition, Imported, Constructors, SumConstructor, OpenShape,
                                       EffectName, EffectOperation, EmitParam, constructors_of,
                                       constructor_sums, sig_of, definition_entry, type_variables,
@@ -225,7 +226,7 @@ pub fn body_code(
   labels: List<Bytes>,
   recorded: SiteAnnotations,
 ) -> Code / {abort.raise} = {
-  let l = lower_fn(b.params, labels, b.body);
+  let l = lower_function(b.params, labels, b.body);
   match l.failed.at(0) { Some(reason) -> unlowered(reason), None -> l.code }
 }
 
@@ -289,7 +290,7 @@ fn root_of(
     WholeBody,
     definition.span.start,
     definition.generics.labels.map(|i: Identifier| i.name),
-    match sig_of(schemes, full) { Some(s) -> s.ret, None -> unknown_type() },
+    match sig_of(schemes, full) { Some(s) -> s.result_type, None -> unknown_type() },
   )
 }
 
@@ -359,7 +360,7 @@ fn known_constructor(s: ModuleContext, name: Bytes) -> Option<Bytes> =
 pub fn declared_schemes() -> Map<Bytes, Scheme> / {abort.raise} =
   builtins().fold(Map::new(), |m: Map<Bytes, Scheme>, b: Builtin| m.insert(b.name, b.scheme))
 
-pub type CallTypes = { params: List<Type>, ret: Type }
+pub type CallTypes = { params: List<Type>, result_type: Type }
 
 pub fn builtin_call_types(
   s: ModuleContext,
@@ -369,7 +370,7 @@ pub fn builtin_call_types(
   match recorded {
     None -> declared_call_types(s, name, []),
     Some(t) -> match t.ty {
-      FunctionType(f) -> Some({ params: f.params, ret: f.ret }),
+      FunctionType(f) -> Some({ params: f.params, result_type: f.return_type }),
       _ -> declared_call_types(s, name, t.args),
     },
   }
@@ -391,7 +392,7 @@ pub fn declared_call_types(s: ModuleContext, name: Bytes, args: List<Type>) -> O
         FunctionType(f) ->
           Some({
             params: f.params.map(|p: Type| instantiated(p, by)),
-            ret: instantiated(f.ret, by),
+            result_type: instantiated(f.return_type, by),
           }),
         _ -> None,
       }
@@ -406,7 +407,7 @@ fn instantiated(ty: Type, by: Map<Int, Type>) -> Type =
       FunctionType({
         ..f,
         params: f.params.map(|p: Type| instantiated(p, by)),
-        ret: instantiated(f.ret, by),
+        return_type: instantiated(f.return_type, by),
       }),
     RecordType(fs) -> RecordType(fs.map(|f: Field| { ..f, ty: instantiated(f.ty, by) })),
     NominalType(x) ->
@@ -486,13 +487,13 @@ pub fn declared_effects(resolved: Resolution, operations: Operations) -> List<Ef
 
 pub type Operations = Map<Bytes, List<EffectOperation>>
 
-pub fn op_mode_of(o: OpInfo) -> EffectOperation =
+pub fn effect_operation_of(o: OperationInfo) -> EffectOperation =
   {
     name: o.name,
     mode: o.mode,
     params: o.params,
-    ret: o.ret,
-    own: own_type_parameters(o.scheme, o.params, o.ret),
+    return_type: o.return_type,
+    own: own_type_parameters(o.scheme, o.params, o.return_type),
   }
 
 fn own_type_parameters(scheme: Option<Scheme>, params: List<Type>, result: Type) -> List<Int> =
@@ -506,13 +507,13 @@ fn own_type_parameters(scheme: Option<Scheme>, params: List<Type>, result: Type)
 
 pub fn checked_operations(effects: List<EffectInfo>) -> Operations =
   effects.fold(Map::new(), |accumulator: Operations, e: EffectInfo|
-    accumulator.insert(e.name, e.operations.map(op_mode_of)))
+    accumulator.insert(e.name, e.operations.map(effect_operation_of)))
 
 pub fn published_operations(effects: List<EffectRow>) -> Operations =
   effects.fold(Map::new(), |accumulator: Operations, e: EffectRow|
     accumulator.insert(
       e.name,
-      e.operations.map(|o: OpRow|
+      e.operations.map(|o: OperationRow|
         {
           name: o.name,
           mode: match [ReadMode, WriteMode, RaiseMode].find(|m: Mode| mode_text(m) == o.mode) {
@@ -520,8 +521,8 @@ pub fn published_operations(effects: List<EffectRow>) -> Operations =
             None -> InvalidMode,
           },
           params: o.params,
-          ret: o.ret,
-          own: own_type_parameters(o.scheme, o.params, o.ret),
+          return_type: o.return_type,
+          own: own_type_parameters(o.scheme, o.params, o.return_type),
         }),
     ))
 
@@ -636,7 +637,7 @@ fn constructor_module_context(imports: List<Imported>, names: List<Bytes>) -> Mo
 test "a builtin is typed by what the checker recorded where it called it, else by its declared scheme at the recorded type arguments" {
   let s = { ..constructor_module_context([], []), declared: declared_schemes() };
   let ints = list_type(int_type());
-  let len = Some({ params: [ints], ret: int_type() });
+  let len = Some({ params: [ints], result_type: int_type() });
   assert_eq(declared_call_types(s, b"List::len", [int_type()]), len);
   assert_eq(declared_call_types(s, b"List::len", []), None);
   assert_eq(declared_call_types(s, b"m.nothing", []), None);
@@ -644,10 +645,10 @@ test "a builtin is typed by what the checker recorded where it called it, else b
     builtin_call_types(s, Some(site_type(unknown_type(), [int_type()])), b"List::len"),
     len,
   );
-  let checked = fn_type([bytes_type()], int_type(), no_effects());
+  let checked = function_type([bytes_type()], int_type(), no_effects());
   assert_eq(
     builtin_call_types(s, Some(site_type(checked, [int_type()])), b"List::len"),
-    Some({ params: [bytes_type()], ret: int_type() }),
+    Some({ params: [bytes_type()], result_type: int_type() }),
   )
 }
 

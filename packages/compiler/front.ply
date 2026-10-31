@@ -19,7 +19,7 @@ import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label, F
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
 import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.store.hash.graph (TestNode, LawNode, Node, NodeFn)
-import compiler.store.hash.forms (build_index, CachedHashes, by_name, reached_functions, Subject,
+import compiler.store.hash.forms (build_index, CachedHashes, by_name, reachable_functions, Subject,
                                   FunctionNamed, DeclarationNamed, ItemKeyed, cached_hashes_of)
 import compiler.store.hash.template (emitted_code)
 import compiler.store.hash (hash_index, body_key)
@@ -32,8 +32,8 @@ import compiler.check.typed (TypedBody)
 import compiler.check.termination (Termination, Terminates, unknown_summary)
 import compiler.front.diagnostics (ParsedSource, parse_header_at, parse_all, parse_at, parse_from,
                                    diagnostic_in_module, with_prelude_source)
-import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, JudgedPackages, Closure,
-                           closure, closure_of_judged, pins_of)
+import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, ValidatedPackages,
+                           Closure, closure, closure_of_validated, pins_of)
 import compiler.prelude_source
 import std.bin
 import std.hash (blake3)
@@ -49,7 +49,7 @@ import compiler.syntax.lexer (is_identifier_continue)
 import compiler.front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterConstructor,
                             FunctionWidths, ListWidths, MapWidths, NoWidths, RecordWidths,
                             SumWidths, VariableWidths, FixedWidth, KnownDefinitionRow, KnownTestRow,
-                            Rows, ModuleRow, DefinitionRow, TypeRow, TestRow, LawRow, OpRow,
+                            Rows, ModuleRow, DefinitionRow, TypeRow, TestRow, LawRow, OperationRow,
                             EffectRow, ConstructorRow, HashRow, ItemHashRow, DefinitionHashRow,
                             LawHashRow, TestHashRow, HashTableRow, BodyRow, Dump)
 import compiler.front.facts (outlines_of, guard_bounds, Bounded, encode_tables, decode_tables,
@@ -200,7 +200,7 @@ pub type ShippedInputs = {
   sources: List<Source>,
   unread: List<Bytes>,
   data: List<ShippedData>,
-  asked: List<Bytes>,
+  required_modules: List<Bytes>,
   dependencies: List<ModuleDependencies>,
 }
 
@@ -213,7 +213,9 @@ derive bin for Dependencies
 pub fn dependencies_of(source: Source) -> Dependencies / {abort.raise} =
   {
     imports: parse_header_at(0, source).module.module.imports,
-    wants: if may_call_embed(source.src) { requests_by_item(parse(source.src).node) } else { [] },
+    wants: if may_call_embed(source.source_text) {
+      requests_by_item(parse(source.source_text).node)
+    } else { [] },
   }
 
 fn home_imports(homes: List<Bytes>) -> List<ImportDeclaration> =
@@ -235,7 +237,7 @@ pub fn shipped_inputs_of_pulled<| e>(
   let reading = |accumulator: List<Source>, n: Bytes|
     if accumulator.fold(false, |b: Bool, s: Source| b || s.name == n) { accumulator } else {
       match read(n) {
-        Some(source_text) -> accumulator.push({ name: n, src: source_text }),
+        Some(source_text) -> accumulator.push({ name: n, source_text: source_text }),
         None -> accumulator,
       }
     };
@@ -259,7 +261,7 @@ pub fn shipped_inputs_of_pulled<| e>(
         if a.fold(false, |b: Bool, d: ShippedData| b || d.name == name) { a } else {
           match read_data(name) { Some(bytes) -> a.push({ name: name, bytes: bytes }), None -> a }
         })),
-    asked: required,
+    required_modules: required,
     dependencies: [],
   }
 }
@@ -307,7 +309,7 @@ pub fn shipped_inputs_of<| e>(
     sources: needed.found,
     unread: listed.filter(|name: Bytes| !lookup_or_empty.contains(name)),
     data: needed.data,
-    asked: required,
+    required_modules: required,
     dependencies: own.concat(needed.pulls),
   }
 }
@@ -328,7 +330,7 @@ fn with_home_imports<| e>(
   read: (Bytes) -> Option<Bytes> / e,
 ) -> { pulls: Dependencies, declared: Option<List<HomeNames>> } / {abort.raise | e} =
   if !sees_homes(source.name) { { pulls: pulls, declared: declared } } else {
-    let input = start(source.src).input;
+    let input = start(source.source_text).input;
     let called = called_names(input);
     let d = if called.len() == 0 { declared }
     else { Some(match declared { Some(d) -> d, None -> homes_declaring(read) }) };
@@ -368,7 +370,7 @@ fn read_needed<| e>(
         match read(name) {
           None -> { ..accumulator, tried: tried },
           Some(text) -> {
-            let source = { name: name, src: text };
+            let source = { name: name, source_text: text };
             let added = with_home_imports(source, pulled(source), accumulator.declared, read);
             let pulls = added.pulls;
             read_embedded_files(
@@ -414,7 +416,7 @@ fn read_embedded_files<| e>(
             Some(text) ->
               {
                 ..accumulator,
-                found: accumulator.found.push({ name: name, src: text }),
+                found: accumulator.found.push({ name: name, source_text: text }),
                 tried: tried,
               },
           }
@@ -477,8 +479,8 @@ pub fn shipped_data_name(module: Bytes, path: Bytes) -> Option<Bytes> =
   }
 
 fn data_wants(module: Source) -> List<{ want: EmbedRequest, name: Bytes }> / {abort.raise} =
-  if !may_call_embed(module.src) { [] } else {
-    embed_requests(parse(module.src).node).fold(
+  if !may_call_embed(module.source_text) { [] } else {
+    embed_requests(parse(module.source_text).node).fold(
       [],
       |accumulator: List<{ want: EmbedRequest, name: Bytes }>, want: EmbedRequest|
         if want.dir { accumulator } else {
@@ -499,11 +501,11 @@ pub type ShippedWants = { texts: List<Bytes>, data: List<Bytes> }
 derive bin for ShippedWants
 
 pub fn shipped_wants(module: Source) -> ShippedWants / {abort.raise} =
-  if !may_call_embed(module.src) { { texts: [], data: [] } }
-  else { shipped_wants_in(module.name, parse(module.src).node) }
+  if !may_call_embed(module.source_text) { { texts: [], data: [] } }
+  else { shipped_wants_in(module.name, parse(module.source_text).node) }
 
 pub fn shipped_wants_of(module: Source, node: Module) -> ShippedWants / {abort.raise} =
-  if !may_call_embed(module.src) { { texts: [], data: [] } }
+  if !may_call_embed(module.source_text) { { texts: [], data: [] } }
   else { shipped_wants_in(module.name, node) }
 
 fn shipped_wants_in(name: Bytes, node: Module) -> ShippedWants / {abort.raise} =
@@ -550,7 +552,7 @@ type PullState = {
   unimported: Map<Bytes, List<Bytes>>,
 }
 
-fn asked_with(required: List<Bytes>, unimported: Map<Bytes, List<Bytes>>) -> List<Bytes> =
+fn required_with(required: List<Bytes>, unimported: Map<Bytes, List<Bytes>>) -> List<Bytes> =
   unimported.fold(required, |accumulator: List<Bytes>, _: Bytes, read: List<Bytes>|
     accumulator.concat(read))
 
@@ -607,7 +609,7 @@ fn pull_rounds(
     } else {
       let read = missing_imports(
         r.wanted.fold([], |accumulator: List<Source>, name: Bytes, text: Bytes|
-          accumulator.push({ name: name, src: text })),
+          accumulator.push({ name: name, source_text: text })),
         declared,
       );
       let round = r.wanted.fold(x, |accumulator: PullState, name: Bytes, text: Bytes| {
@@ -617,7 +619,7 @@ fn pull_rounds(
           dependencies,
           data,
           at,
-          parsed_at(given, derived, at, { name: name, src: text }),
+          parsed_at(given, derived, at, { name: name, source_text: text }),
         );
         {
           ..accumulator,
@@ -649,7 +651,7 @@ fn pull_rounds(
           ),
         },
         rounds_left - 1,
-        asked_with(required, read),
+        required_with(required, read),
         declared,
         given,
         derived,
@@ -664,13 +666,13 @@ fn parsed_at(
   index: Int,
   source: Source,
 ) -> ParsedSource / {abort.raise} =
-  match given.find(|g: ParsedSource| g.name == source.name && g.src == source.src) {
+  match given.find(|g: ParsedSource| g.name == source.name && g.text == source.source_text) {
     Some(g) -> { ..g, diagnostics: g.diagnostics.map(|d: Diagnostic| moved_to(d, index)) },
     None ->
       parse_from(
         index,
         source,
-        parse(source.src),
+        parse(source.source_text),
         derivations: match derived.find(|m: ModuleDerivations| m.module == source.name) {
           Some(m) -> m.derivations,
           None -> [],
@@ -773,13 +775,13 @@ fn shipped_embedded(
   index: Int,
   parsed: ParsedSource,
 ) -> { parsed: ParsedSource, embeds: List<ModuleEmbed> } / {abort.raise} = {
-  let source = { name: parsed.name, src: parsed.src };
-  let text = match whole.get(source.name) { Some(t) -> t, None -> source.src };
-  let read = if text == source.src { parsed }
+  let source = { name: parsed.name, source_text: parsed.text };
+  let text = match whole.get(source.name) { Some(t) -> t, None -> source.source_text };
+  let read = if text == source.source_text { parsed }
   else { with_hidden_imports(parsed, dependencies.get(source.name)) };
-  let p = { ..read, src: text };
+  let p = { ..read, text: text };
   if !may_call_embed(text) { { parsed: p, embeds: [] } } else {
-    let wants = if text == source.src { embed_requests(p.module.module) } else {
+    let wants = if text == source.source_text { embed_requests(p.module.module) } else {
       match dependencies.get(source.name) {
         Some(t) -> requests_in(t.wants),
         None -> embed_requests(parse(text).node),
@@ -811,7 +813,7 @@ pub fn parse_shipped(
   data: List<ShippedData>,
 ) -> List<ParsedSource> / {abort.raise} = {
   let whole = shipped.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.src));
+    accumulator.insert(s.name, s.source_text));
   let lookup_or_empty = data_by_name(embed_files_of(data));
   range(0, modules.len()).map(|i: Int|
     shipped_embedded(whole, Map::new(), lookup_or_empty, i, parse_at(i, modules.get(i))).parsed)
@@ -872,10 +874,10 @@ fn pulled_load(
   pulls: List<ModuleDependencies>,
   given: List<ParsedSource>,
   derived: List<ModuleDerivations>,
-  package_verdicts: Option<JudgedPackages>,
+  package_verdicts: Option<ValidatedPackages>,
 ) -> PulledLoad / {abort.raise} = {
   let package_closure = match package_verdicts {
-    Some(j) -> closure_of_judged(j, packages.supplied),
+    Some(j) -> closure_of_validated(j, packages.supplied),
     None -> closure(packages, user.map(|s: Source| s.name)),
   };
   let dependencies = pulls.fold(
@@ -886,7 +888,7 @@ fn pulled_load(
   let lookup_or_empty = if unread.contains(prelude_module()) { shipped }
   else { with_prelude_source(shipped) };
   let texts = lookup_or_empty.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.src));
+    accumulator.insert(s.name, s.source_text));
   let sources = user.concat(package_closure.modules.map(|m: { pkg: Int, src: Source }| m.src));
   let declared = homes_declaring(|h: Bytes| texts.get(h));
   let unimported = missing_imports(sources, declared);
@@ -909,12 +911,12 @@ fn pulled_load(
       else { accumulator.insert(m.name, m.pulls.wants) }),
     |accumulator: Map<Bytes, List<ItemEmbeds>>, i: Int| {
       let s = sources.get(i);
-      if !tested || accumulator.contains(s.name) || !may_call_embed(s.src) { accumulator }
+      if !tested || accumulator.contains(s.name) || !may_call_embed(s.source_text) { accumulator }
       else { accumulator.insert(s.name, requests_by_item(parsed.get(i).module.module)) }
     },
   );
-  let mentions = user.map(|s: Source| may_call_embed(s.src)).concat(
-    package_closure.modules.map(|m: { pkg: Int, src: Source }| may_call_embed(m.src.src)),
+  let mentions = user.map(|s: Source| may_call_embed(s.source_text)).concat(
+    package_closure.modules.map(|m: { pkg: Int, src: Source }| may_call_embed(m.src.source_text)),
   );
   let declaration_sources = embedded_all(parsed, embed_slots(packages, user), mentions, embeds);
   let assembled = declaration_sources.parsed;
@@ -939,7 +941,7 @@ fn pulled_load(
       unimported: unimported,
     },
     texts.len(),
-    asked_with(required, unimported),
+    required_with(required, unimported),
     declared,
     given,
     derived,
@@ -968,7 +970,7 @@ pub fn load_with_shipped(
   pulls: List<ModuleDependencies> = [],
   given: List<ParsedSource> = [],
   derived: List<ModuleDerivations> = [],
-  package_verdicts: Option<JudgedPackages> = None,
+  package_verdicts: Option<ValidatedPackages> = None,
   checked: Option<Bytes> = None,
 ) -> StagedLoad / {abort.raise} = {
   let load = pulled_load(
@@ -1009,7 +1011,7 @@ pub fn load_with_shipped(
     match hashed(x.parsed) {
       Err(diagnostics) -> { pulled: x.pulled, hashed: Err(diagnostics), shipped_views: [] },
       Ok(h) -> {
-        let reach = reached_shipped_functions(h);
+        let reach = used_shipped_functions(h);
         {
           pulled: x.pulled,
           hashed: match cut_to_reach(x.parsed, h, reach) {
@@ -1049,7 +1051,7 @@ pub fn resolved_with_shipped(
     [],
     None,
   );
-  let modules = load.pulled.parsed.map(|p: ParsedSource| { name: p.name, src: p.src });
+  let modules = load.pulled.parsed.map(|p: ParsedSource| { name: p.name, source_text: p.text });
   if load.pulled.diagnostics.len() > 0 {
     Err({ diagnostics: load.pulled.diagnostics, modules: modules })
   } else {
@@ -1072,7 +1074,7 @@ fn shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} =
     },
   )
 
-fn reached_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} = {
+fn used_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} = {
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
   let imported = range(0, first).fold([], |accumulator: List<Subject>, i: Int|
@@ -1099,7 +1101,7 @@ fn reached_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.rais
         },
       })
   });
-  reached_functions(
+  reachable_functions(
     h.hashes,
     h.index.nodes.fold(
       h.hashes.definitions.fold(
@@ -1250,7 +1252,9 @@ fn shipped_views_of(
 pub fn shipped_viewer(modules: List<Bytes>) -> Source =
   {
     name: b"viewer",
-    src: Bytes::concat_all(modules.map(|m: Bytes| Bytes::concat_all([b"import ", m, b"\n"]))),
+    source_text: Bytes::concat_all(
+      modules.map(|m: Bytes| Bytes::concat_all([b"import ", m, b"\n"])),
+    ),
   }
 
 pub fn shipped_views(
@@ -1378,7 +1382,7 @@ pub fn locked_packages(
     let read = range(0, sources.len()).fold([], |accumulator: List<ModuleEmbed>, i: Int| {
       let source = sources.get(i);
       match slots.at(i) {
-        Some(slot) -> if !may_call_embed(source.src) { accumulator } else {
+        Some(slot) -> if !may_call_embed(source.source_text) { accumulator } else {
           match tables.get(slot) {
             Some(table) ->
               table.fold(accumulator, |a: List<ModuleEmbed>, key: Bytes, read: EmbedResult|
@@ -1468,15 +1472,15 @@ fn changed_embed_error(embed: ModuleEmbed) -> Diagnostic / {abort.raise} =
 
 pub fn embeds_wanted(root: Bytes, sources: List<Source>) -> List<EmbedRecord> / {abort.raise} =
   sources.fold([], |accumulator: List<EmbedRecord>, source: Source|
-    if !may_call_embed(source.src) { accumulator }
-    else { accumulator.concat(module_embeds_wanted(root, source, parse(source.src).node)) })
+    if !may_call_embed(source.source_text) { accumulator }
+    else { accumulator.concat(module_embeds_wanted(root, source, parse(source.source_text).node)) })
 
 pub fn module_embeds_wanted(
   root: Bytes,
   source: Source,
   raw: Module,
 ) -> List<EmbedRecord> / {abort.raise} =
-  if !may_call_embed(source.src) { [] } else {
+  if !may_call_embed(source.source_text) { [] } else {
     embed_requests(raw).map(|want: EmbedRequest|
       { root: root, module: source.name, want: want, read: Err(b"not read yet") })
   }
@@ -1544,7 +1548,7 @@ fn program() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\ntype Shape = | Dot | Line(Int)\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"says\" { say(b\"x\") }",
+      source_text: b"effect log { write emit(Bytes) -> Unit }\ntype Shape = | Dot | Line(Int)\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"says\" { say(b\"x\") }",
     },
   ]
 
@@ -1552,11 +1556,11 @@ pub fn faceted() -> List<Source> =
   [
     {
       name: b"base",
-      src: b"pub effect tick { write beat() -> Unit }\npub type Shape = | Dot | Line(Int)\nfn shown(s: Shape) -> String = match s { Dot -> \"dot\", Line(n) -> \"line\" }\nshow for Shape by shown\npub opaque type Coin = new { cents: Int }\npub fn coin(n: Int) -> Coin = { cents: n }\npub fn cents(c: Coin) -> Int = c.cents\npub fn even(n: Int) -> Bool / { tick.write } = if n <= 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n <= 0 { false } else { even(n - 1) }\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\npub const fn seven() -> Int = 7\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)\npub fn magnitude<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\nlaw \"halving shrinks\" forall (n: Int) where n >= 0 { half(n) <= n }\ntest \"two\" { assert_eq(half(4), 2) }\n",
+      source_text: b"pub effect tick { write beat() -> Unit }\npub type Shape = | Dot | Line(Int)\nfn shown(s: Shape) -> String = match s { Dot -> \"dot\", Line(n) -> \"line\" }\nshow for Shape by shown\npub opaque type Coin = new { cents: Int }\npub fn coin(n: Int) -> Coin = { cents: n }\npub fn cents(c: Coin) -> Int = c.cents\npub fn even(n: Int) -> Bool / { tick.write } = if n <= 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n <= 0 { false } else { even(n - 1) }\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\npub const fn seven() -> Int = 7\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)\npub fn magnitude<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\nlaw \"halving shrinks\" forall (n: Int) where n >= 0 { half(n) <= n }\ntest \"two\" { assert_eq(half(4), 2) }\n",
     },
     {
       name: b"app",
-      src: b"import base\npub fn worth(n: Int) -> Int = base::cents(base::coin(base::half(n))) + base::seven()\npub fn tagged() -> Int = base\"one\" + base\"two\" + base::magnitude(0 - 2)\ntest \"worth\" { assert_eq(worth(4), 9) }\ntest \"tags\" { assert_eq(base\"three\", 1) }\ntest \"lines\" { assert(base::Line(1) == base::Line(1)) }\nlaw \"worth is above seven\" forall (n: Int) where n >= 0 { worth(n) >= 7 }\n",
+      source_text: b"import base\npub fn worth(n: Int) -> Int = base::cents(base::coin(base::half(n))) + base::seven()\npub fn tagged() -> Int = base\"one\" + base\"two\" + base::magnitude(0 - 2)\ntest \"worth\" { assert_eq(worth(4), 9) }\ntest \"tags\" { assert_eq(base\"three\", 1) }\ntest \"lines\" { assert(base::Line(1) == base::Line(1)) }\nlaw \"worth is above seven\" forall (n: Int) where n >= 0 { worth(n) >= 7 }\n",
     },
   ]
 
@@ -1618,13 +1622,13 @@ test "building a program's tables from its modules' check results gives the same
   let user = [
     {
       name: b"main",
-      src: b"import std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1)\npub fn named(t: Tag) -> String = \"{t}\"\n",
+      source_text: b"import std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1)\npub fn named(t: Tag) -> String = \"{t}\"\n",
     },
   ];
   let shipped = [
     {
       name: b"std.shapes",
-      src: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\ntype Bag = | Bag(List<Point>)\n",
+      source_text: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\ntype Bag = | Bag(List<Point>)\n",
     },
   ];
   let read = |cut_unused: Bool|
@@ -1648,7 +1652,7 @@ test "building a program's tables from its modules' check results gives the same
   let returned = assembled_program(
     facts,
     fixing,
-    Map::new().insert(b"std.shapes", shipped.get(0).src).insert(
+    Map::new().insert(b"std.shapes", shipped.get(0).source_text).insert(
       prelude_module(),
       prelude_source::text(),
     ),
@@ -1675,7 +1679,7 @@ test "building a program's tables from its modules' check results gives the same
   assert_eq(returned.views, load_with_shipped(user, shipped).shipped_views)
 }
 
-pub fn reached_prelude_functions() -> List<Bytes> =
+pub fn used_prelude_functions() -> List<Bytes> =
   [
     b"shift_from",
     b"trie_shift",
@@ -1692,13 +1696,13 @@ test "a call that leads back to a recursive type through a function in the type'
   let user = [
     {
       name: b"m",
-      src: b"pub type Expr<r> = | Leaf(r) | Maybe(Option<Expr<r>>)\npub fn mapped<r, s>(e: Expr<r>, f: (r) -> s) -> Expr<s> = match e { Leaf(x) -> Leaf(f(x)), Maybe(o) -> Maybe(o.map(|y: Expr<r>| mapped(y, f))) }\n",
+      source_text: b"pub type Expr<r> = | Leaf(r) | Maybe(Option<Expr<r>>)\npub fn mapped<r, s>(e: Expr<r>, f: (r) -> s) -> Expr<s> = match e { Leaf(x) -> Leaf(f(x)), Maybe(o) -> Maybe(o.map(|y: Expr<r>| mapped(y, f))) }\n",
     },
   ];
   let shipped = [
     {
       name: b"std.option",
-      src: b"pub fn Option::map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e bounded = match o { None -> None, Some(x) -> Some(f(x)) }\n",
+      source_text: b"pub fn Option::map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e bounded = match o { None -> None, Some(x) -> Some(f(x)) }\n",
     },
   ];
   match analyse_pulling_std(user, shipped).out {
@@ -1712,12 +1716,12 @@ test "a call written after a `?` has the same source position in the checked mod
   let program = b"fn parsed(s: String) -> Result<Int, String> = Ok(1)\nfn f(s: String) -> Result<Int, String> = { let n = parsed(s)?; Ok(n + s.len()) }\n";
   let sites = |m: Module|
     expressions_matching(m, |e: Expression|
-      match e { PerformExpression(p) -> p.op.name == b"len", _ -> false }).map(
+      match e { PerformExpression(p) -> p.operation.name == b"len", _ -> false }).map(
       expression_span,
     ).map(|at: Span| at.site);
   let declaration_sources = sites(numbered_module(parse(program).node));
   assert_eq(declaration_sources.len(), 1);
-  match analyse_pulling_std([{ name: b"m", src: program }], []).out {
+  match analyse_pulling_std([{ name: b"m", source_text: program }], []).out {
     Rejected(ds) ->
       panic(String::of_bytes_lossy(Bytes::concat_all(ds.map(|d: Diagnostic| d.message)))),
     Analysed(w) -> assert_eq(sites(w.modules.get(0).module), declaration_sources),
@@ -1726,7 +1730,7 @@ test "a call written after a `?` has the same source position in the checked mod
 
 test "the emitter assigns a key to every emitter root, meaning every function, test, law and contract check, and no two roots have the same key" {
   let program = b"fn pos(x: Int) -> Bool = x > 0\nfn f(x: Int) -> Int requires pos(x) ensures x >= 0 = x\ntest \"t\" { assert_eq(f(1), 1) }\nlaw \"l\" forall (x: Int) { f(x) == x }";
-  match analyse(parse_all([{ name: b"m", src: program }])) {
+  match analyse(parse_all([{ name: b"m", source_text: program }])) {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(w) -> {
       let keys = root_keys(outlines_of(w), w.checked, w.hashes);
@@ -1740,7 +1744,7 @@ test "the emitter assigns a key to every emitter root, meaning every function, t
           test_owner(b"m", b"t"),
           law_root(b"l", LawBody),
         ].concat(
-          reached_prelude_functions(),
+          used_prelude_functions(),
         ),
       );
       let distinct = Map::of_entries(keys.map(|k: KeyRow| { key: k.key, value: () })).keys();
@@ -1751,11 +1755,11 @@ test "the emitter assigns a key to every emitter root, meaning every function, t
 
 test "an emitter root is marked pure only when it is a function definition with no effects and no preconditions or postconditions" {
   let program = b"effect log { write emit(Bytes) -> Unit }\nfn origin() -> Int = 0\nfn hello() -> Unit / { log.write } = log.emit(b\"hi\")\nfn same<a>(x: a, y: a) -> Bool where derivable(eq, a) = x == y\nfn positive(n: Int) -> Int requires n > 0 = n\ntest \"t\" { assert_eq(origin(), 0) }\nlaw \"l\" forall (n: Int) { same(n, n) }";
-  let d = dump_of(analyse(parse_all([{ name: b"m", src: program }])));
+  let d = dump_of(analyse(parse_all([{ name: b"m", source_text: program }])));
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot|
-      !reached_prelude_functions().contains(root.root)).map(|root: EmitterRoot|
-      { root: root.root, pure: root.pure }),
+    d.emitter_roots.filter(|root: EmitterRoot| !used_prelude_functions().contains(root.root)).map(
+      |root: EmitterRoot| { root: root.root, pure: root.pure },
+    ),
     [
       { root: b"m.origin", pure: true },
       { root: b"m.hello", pure: false },
@@ -1767,16 +1771,16 @@ test "an emitter root is marked pure only when it is a function definition with 
     ],
   );
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot| reached_prelude_functions().contains(root.root)).map(
+    d.emitter_roots.filter(|root: EmitterRoot| used_prelude_functions().contains(root.root)).map(
       |root: EmitterRoot| root.root,
     ),
-    reached_prelude_functions(),
+    used_prelude_functions(),
   )
 }
 
 test "a program that declares an effect operation with its own type parameters includes the list and map functions that copy values, because a `perform` may call it with a list or map" {
   let roots = |program: Bytes|
-    dump_of(analyse(parse_all([{ name: b"m", src: program }]))).emitter_roots.map(
+    dump_of(analyse(parse_all([{ name: b"m", source_text: program }]))).emitter_roots.map(
       |r: EmitterRoot| r.root,
     );
   let marshalling = [b"List::at", b"List::push", b"Map::entries", b"Map::insert"].map(|n: Bytes|
@@ -1796,11 +1800,11 @@ fn law_root(label: Bytes, part: LawPart) -> Bytes / {abort.raise} =
 
 test "an emitter root records a fixed integer width exactly for the parameters and result whose type is a fixed-width integer" {
   let program = b"fn low_bit(b: U8) -> Int requires Int::of_u8(b) < 200 ensures result < 2 = Int::of_u8(b & 1u8)\nfn narrow(n: Int) -> U8 / {abort.raise} requires n >= 0 ensures Int::of_u8(result) == n = U8::of_int(n)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\ntest \"t\" { assert_eq(inc(1), 2) }\nlaw \"low\" forall (b: U8) where Int::of_u8(b) > 0 { low_bit(b) < 2 }\nlaw \"grows\" forall (x: Int) where x > 0 { inc(x) > x }";
-  let d = dump_of(analyse(parse_all([{ name: b"m", src: program }])));
+  let d = dump_of(analyse(parse_all([{ name: b"m", source_text: program }])));
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot|
-      !reached_prelude_functions().contains(root.root)).map(|root: EmitterRoot|
-      { root: root.root, params: root.params, result: root.result }),
+    d.emitter_roots.filter(|root: EmitterRoot| !used_prelude_functions().contains(root.root)).map(
+      |root: EmitterRoot| { root: root.root, params: root.params, result: root.result },
+    ),
     [
       { root: b"m.low_bit", params: [FixedWidth(0)], result: NoWidths },
       { root: b"m.narrow", params: [NoWidths], result: FixedWidth(0) },
@@ -1822,7 +1826,7 @@ test "an emitter root records a fixed integer width exactly for the parameters a
 
 test "a fixed integer width is tracked through lists, maps, records, sum types, functions and variables" {
   let program = b"effect probe { write put(xs: List<U8>, n: Int) -> Unit }\ntype Byte = | Byte(U8)\ntype Tree = | Leaf | Node(Tree, I16, Tree)\ntype Pair<a, b> = | Pair(b, a)\ntype Color = | Red | Green\nfn wrap(xs: List<U8>) -> List<Byte> = xs.map(|x: U8| Byte(x))\nfn pick<a>(xs: List<a>, r: { v: I16, n: Int }) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\nfn swap(m: Map<String, I8>) -> Pair<Int, U64> / {abort.raise} = Pair(U64::of_int(1), 0)\nfn plain(c: Color, o: Option<Int>) -> Tree = Leaf\nfn apply<a>(f: (Int) -> a, x: Int) -> a = f(x)\nfn sent(xs: List<U8>) -> Unit / { probe.write } = probe.put(xs, 1)";
-  let d = dump_of(analyse(parse_all([{ name: b"m", src: program }])));
+  let d = dump_of(analyse(parse_all([{ name: b"m", source_text: program }])));
   let carried = |root: EmitterRoot| { root: root.root, params: root.params, result: root.result };
   assert_eq(
     d.emitter_roots.filter(|root: EmitterRoot| module_of_name(root.root) == b"m").map(carried),
@@ -1861,7 +1865,7 @@ test "a fixed integer width is tracked through lists, maps, records, sum types, 
     }),
     None,
   );
-  assert_eq(effect_named(d, b"m.probe").operations.map(|o: OpRow| o.carries), [
+  assert_eq(effect_named(d, b"m.probe").operations.map(|o: OperationRow| o.carries), [
     [ListWidths(FixedWidth(0)), NoWidths],
   ]);
   let own = d.emitter_constructors.filter(|k: EmitterConstructor| k.name.slice(0, 2) == b"m.");
@@ -1920,7 +1924,7 @@ test "a native program's header contains its entry function and the hash of each
     b"base.half",
     b"base.seven",
   ].concat(
-    reached_prelude_functions(),
+    used_prelude_functions(),
   ).sort(
   );
   assert_eq(
@@ -1982,13 +1986,14 @@ fn dead_code_sources() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"pub fn api() -> Int = shared()\nfn shared() -> Int = 1\nfn dead() -> Int = deader()\nfn deader() -> Int = 2\nfn tested() -> Int = 3\nfn lawful(x: Int) -> Int = x\nfn positive(x: Int) -> Bool = x > 0\npub fn checked(x: Int) -> Int requires positive(x) = x\ntype Pair = { a: Int }\npub fn make() -> Int = { let f = |x: Int| -> Pair { { a: x } }; f(1).a }\nfn _kept() -> Int = 4\nfn main() -> Int = 5\ntype Unused = | Nothing\ntest \"calls it\" { assert_eq(tested(), 3) }\nlaw \"it is the identity\" forall (x: Int) { lawful(x) == x }",
+      source_text: b"pub fn api() -> Int = shared()\nfn shared() -> Int = 1\nfn dead() -> Int = deader()\nfn deader() -> Int = 2\nfn tested() -> Int = 3\nfn lawful(x: Int) -> Int = x\nfn positive(x: Int) -> Bool = x > 0\npub fn checked(x: Int) -> Int requires positive(x) = x\ntype Pair = { a: Int }\npub fn make() -> Int = { let f = |x: Int| -> Pair { { a: x } }; f(1).a }\nfn _kept() -> Int = 4\nfn main() -> Int = 5\ntype Unused = | Nothing\ntest \"calls it\" { assert_eq(tested(), 3) }\nlaw \"it is the identity\" forall (x: Int) { lawful(x) == x }",
     },
   ]
 
 fn test_effects(program: Bytes, name: Bytes) -> Bytes / {abort.raise} =
-  match dump_of(analyse(parse_all([{ name: b"m", src: program }]))).tests.filter(|t: TestRow|
-      t.name == name) {
+  match dump_of(analyse(parse_all([{ name: b"m", source_text: program }]))).tests.filter(
+      |t: TestRow| t.name == name,
+    ) {
     [t, ..] -> effect_list_text(t.effects, b","),
     [] -> panic("the analysis result lists no test with that name"),
   }
@@ -2012,7 +2017,7 @@ test "only a definition that no emitter root uses gets an unused-definition warn
   assert(messages.contains(b"fn `m.deader` is never used"));
   assert(messages.contains(b"type `m.Unused` is never used"));
   assert_eq(messages.len(), 3);
-  let program = dead_code_sources().get(0).src;
+  let program = dead_code_sources().get(0).source_text;
   let named = d.diagnostics.map(|diagnostic: Diagnostic|
     match diagnostic.labels.filter(|l: Label| l.primary) {
       [l, ..] -> program.slice(l.start, l.end),
@@ -2049,7 +2054,9 @@ test "a test's table entry is stored at the test's index and records its key" {
       module: b"m",
       index: 0,
       nondet: false,
-      effects: [{ effect: b"m.log", resource: SingletonResource, mode: WriteMode, op: None }],
+      effects: [
+        { effect: b"m.log", resource: SingletonResource, mode: WriteMode, operation: None },
+      ],
       at: { module: 0, start: 127, end: 152 },
       name_at: { module: 0, start: 132, end: 138 },
     },
@@ -2073,9 +2080,9 @@ test "an effect's table entry records each operation with its mode, its types an
       name: b"emit",
       mode: b"write",
       resource_param: false,
-      kept: [],
+      retained_parameters: [],
       params: [bytes_type()],
-      ret: unit_type(),
+      return_type: unit_type(),
       scheme: None,
       at: { module: 0, start: 13, end: 38 },
       carries: [NoWidths],
@@ -2089,11 +2096,11 @@ test "a prelude effect has no module and an empty source span, and its operation
   assert_eq(sim.module, b"");
   assert(sim.public);
   assert_eq(sim.at, { module: no_module(), start: 0, end: 0 });
-  assert_eq(sim.operations.map(|o: OpRow| o.name), [b"seed"]);
+  assert_eq(sim.operations.map(|o: OperationRow| o.name), [b"seed"]);
   let seed = sim.operations.get(0);
   assert_eq(seed.mode, b"read");
   assert_eq(seed.params, []);
-  assert_eq(seed.ret, int_type());
+  assert_eq(seed.return_type, int_type());
   assert_eq(match seed.scheme { Some(scheme) -> scheme_text(scheme), None -> b"" }, b"() -> Int");
   assert_eq(seed.at, { module: no_module(), start: 0, end: 0 })
 }
@@ -2116,10 +2123,10 @@ test "a constructor's table entry records its field types and its type scheme" {
         keep_variables: [],
         label_variables: [],
         ty: FunctionType({
-          kept: [],
+          keep_parameters: [],
           once: false,
           params: [int_type()],
-          ret: named_type(b"m.Shape"),
+          return_type: named_type(b"m.Shape"),
           effects: { listed: [], variable: None },
         }),
       },
@@ -2171,7 +2178,7 @@ fn specified() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\neffect set Io = {log.write}\nfn say(b: Bytes) -> Unit / {Io} = log.emit(b)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\nlaw \"inc grows\" forall (x: Int) where x > 0 { inc(x) > x }",
+      source_text: b"effect log { write emit(Bytes) -> Unit }\neffect set Io = {log.write}\nfn say(b: Bytes) -> Unit / {Io} = log.emit(b)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\nlaw \"inc grows\" forall (x: Int) where x > 0 { inc(x) > x }",
     },
   ]
 
@@ -2204,7 +2211,7 @@ fn rows_written_as(row: Bytes) -> List<Source> =
   [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub effect log { write emit(Bytes) -> Unit }\neffect set Io = {log.write}\n",
         b"pub fn say(b: Bytes) -> Unit / {",
         row,
@@ -2249,7 +2256,7 @@ fn declaration_sources() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"pub type Pair<a, b> = { fst: a, snd: b }\npub effect log { write emit(Bytes) -> Unit }\npub reuse fn keep(xs: List<Int>) -> List<Int> = xs.push(1)\nlaw \"bounds\" forall (n: Int) where n > -3 && n < 7 { n == n }",
+      source_text: b"pub type Pair<a, b> = { fst: a, snd: b }\npub effect log { write emit(Bytes) -> Unit }\npub reuse fn keep(xs: List<Int>) -> List<Int> = xs.push(1)\nlaw \"bounds\" forall (n: Int) where n > -3 && n < 7 { n == n }",
     },
   ]
 
@@ -2287,7 +2294,11 @@ fn bounds_written(guard: Bytes) -> List<Bounded> / {abort.raise} = {
   let modules = parse_all([
     {
       name: b"m",
-      src: Bytes::concat_all([b"law \"l\" forall (n: Int, m: Int) where ", guard, b" { true }\n"]),
+      source_text: Bytes::concat_all([
+        b"law \"l\" forall (n: Int, m: Int) where ",
+        guard,
+        b" { true }\n",
+      ]),
     },
   ]).map(|p: ParsedSource| p.module);
   modules.get(0).module.items.fold([], |accumulator: List<Bounded>, item: Item|
@@ -2329,7 +2340,9 @@ test "a law's entry in the law table records its variables with their source spa
       {
         name: b"Io",
         includes: [],
-        listed: [{ effect: b"m.log", resource: SingletonResource, mode: WriteMode, op: None }],
+        listed: [
+          { effect: b"m.log", resource: SingletonResource, mode: WriteMode, operation: None },
+        ],
       },
     ],
     [],
@@ -2351,10 +2364,10 @@ test "a law's entry in the law table records its variables with their source spa
 
 fn law_sources() -> List<Source> =
   [
-    { name: b"base", src: b"pub fn one() -> Int = 1\npub type Coin = | Heads | Tails" },
+    { name: b"base", source_text: b"pub fn one() -> Int = 1\npub type Coin = | Heads | Tails" },
     {
       name: b"app",
-      src: b"import base\nfn two(x: Int) -> Option<Int> requires x > 0 = Some(base::one() + [x].len())\nlaw \"it grows\" forall (x: Int) where x > 0 { two(x) != None }",
+      source_text: b"import base\nfn two(x: Int) -> Option<Int> requires x > 0 = Some(base::one() + [x].len())\nlaw \"it grows\" forall (x: Int) where x > 0 { two(x) != None }",
     },
   ]
 
@@ -2402,11 +2415,11 @@ test "a law that instantiates a schema produces the schema's guard and body with
   let out = claims([
     {
       name: b"lib",
-      src: b"pub fn limit() -> Int = 100\npub law schema fixed(f: (Int) -> Int, low: Int) forall (x: Int) where x > low && x < limit() { f(x) == x }",
+      source_text: b"pub fn limit() -> Int = 100\npub law schema fixed(f: (Int) -> Int, low: Int) forall (x: Int) where x > low && x < limit() { f(x) == x }",
     },
     {
       name: b"app",
-      src: b"import lib\nfn id(n: Int) -> Int = n\nlaw \"made\" = lib::fixed(id, 0)\nlaw \"written\" forall (x: Int) where x > 0 && x < lib::limit() { id(x) == x }\nlaw \"through a lambda\" = lib::fixed(|n: Int| id(n), 0)",
+      source_text: b"import lib\nfn id(n: Int) -> Int = n\nlaw \"made\" = lib::fixed(id, 0)\nlaw \"written\" forall (x: Int) where x > 0 && x < lib::limit() { id(x) == x }\nlaw \"through a lambda\" = lib::fixed(|n: Int| id(n), 0)",
     },
   ]);
   let body_of = |key: Bytes|
@@ -2431,7 +2444,10 @@ test "a law that instantiates a schema produces the schema's guard and body with
 
 test "lowering a record update to a proof claim gives the equivalent record literal" {
   let out = claims([
-    { name: b"m", src: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P = {..p, b: 3}" },
+    {
+      name: b"m",
+      source_text: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P = {..p, b: 3}",
+    },
   ]);
   assert_eq(out.len(), 1);
   match out.get(0) {
@@ -2444,11 +2460,11 @@ test "lowering proof claims from an already analysed program gives the same clai
   let sources = [
     {
       name: b"base",
-      src: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P ensures result.b == 3 = {..p, b: 3}\npub fn same(p: P) -> P = p\npub effect tally { write add[r](n: Int) -> Unit }\npub fn add_twice<[r]>(n: Int) -> Unit / {tally.add[r]} = { tally.add[r](n); tally.add[r](n) }\npub fn keyed<a>(k: a) -> Map<a, Int> where derivable(ord, a) = Map::new().insert(k, 1)\npub fn size(xs: List<Int>) -> Int cost xs.len() space xs.len() = xs.len()\n",
+      source_text: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P ensures result.b == 3 = {..p, b: 3}\npub fn same(p: P) -> P = p\npub effect tally { write add[r](n: Int) -> Unit }\npub fn add_twice<[r]>(n: Int) -> Unit / {tally.add[r]} = { tally.add[r](n); tally.add[r](n) }\npub fn keyed<a>(k: a) -> Map<a, Int> where derivable(ord, a) = Map::new().insert(k, 1)\npub fn size(xs: List<Int>) -> Int cost xs.len() space xs.len() = xs.len()\n",
     },
     {
       name: b"app",
-      src: b"import base\nfn moved(p: base::P) -> Int requires {..p, a: 1}.a == 1 = base::same(p).a\nfn counted() -> Map<Int, Int> / {base::tally.add[c]} = { base::add_twice[c](2); {..base::bump({ a: 0, b: 0 }), a: 1}.a; base::keyed(4) }\nlaw \"bumped\" forall (p: base::P) { base::bump(p) == {..p, b: 3} }\ntest \"updated\" { assert_eq({..base::same({ a: 1, b: 2 }), a: 5}.a, 5) }\n",
+      source_text: b"import base\nfn moved(p: base::P) -> Int requires {..p, a: 1}.a == 1 = base::same(p).a\nfn counted() -> Map<Int, Int> / {base::tally.add[c]} = { base::add_twice[c](2); {..base::bump({ a: 0, b: 0 }), a: 1}.a; base::keyed(4) }\nlaw \"bumped\" forall (p: base::P) { base::bump(p) == {..p, b: 3} }\ntest \"updated\" { assert_eq({..base::same({ a: 1, b: 2 }), a: 5}.a, 5) }\n",
     },
   ];
   let w = analysis_of(sources);
@@ -2457,19 +2473,19 @@ test "lowering proof claims from an already analysed program gives the same clai
 
 fn shipped_modules() -> List<Source> =
   [
-    { name: b"std.a", src: b"import std.c\npub fn a() -> Int = 1" },
-    { name: b"std.b", src: b"pub fn b() -> Int = 2" },
-    { name: b"std.c", src: b"pub fn c() -> Int = 3" },
-    { name: b"std.d", src: b"pub fn d() -> Int = 4" },
+    { name: b"std.a", source_text: b"import std.c\npub fn a() -> Int = 1" },
+    { name: b"std.b", source_text: b"pub fn b() -> Int = 2" },
+    { name: b"std.c", source_text: b"pub fn c() -> Int = 3" },
+    { name: b"std.d", source_text: b"pub fn d() -> Int = 4" },
   ]
 
 fn unused_function_sources() -> List<Source> =
   [
     {
       name: b"std.r",
-      src: b"import std.s (helper, other)\npub fn used() -> Int = helper()\npub fn unused() -> Int = other()\npub fn imported() -> Int = 3\ntest \"r holds\" { assert(used() == 1) }\n",
+      source_text: b"import std.s (helper, other)\npub fn used() -> Int = helper()\npub fn unused() -> Int = other()\npub fn imported() -> Int = 3\ntest \"r holds\" { assert(used() == 1) }\n",
     },
-    { name: b"std.s", src: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\n" },
+    { name: b"std.s", source_text: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\n" },
   ]
 
 fn pulled_hashes(p: PulledAnalysis) -> List<{ name: Bytes, hash: Bytes }> =
@@ -2479,7 +2495,7 @@ fn definition_names(p: PulledAnalysis) -> List<Bytes> =
   pulled_hashes(p).map(|d: { name: Bytes, hash: Bytes }| d.name).sort()
 
 pub fn not_written(names: List<Bytes>) -> List<Bytes> =
-  names.filter(|n: Bytes| !reached_prelude_functions().contains(n))
+  names.filter(|n: Bytes| !used_prelude_functions().contains(n))
 
 fn prelude_functions() -> List<Bytes> / {abort.raise} =
   parse(prelude_source::text()).node.items.fold([], |accumulator: List<Bytes>, item: Item|
@@ -2490,7 +2506,9 @@ fn prelude_functions() -> List<Bytes> / {abort.raise} =
   )
 
 test "analysis loads from a standard library module only the functions the program uses and the names it imports" {
-  let user = [{ name: b"m", src: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" }];
+  let user = [
+    { name: b"m", source_text: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" },
+  ];
   let of_prelude = |names: List<Bytes>|
     names.filter(|n: Bytes| module_of_name(n) == prelude_module());
   let not_of_prelude = |names: List<Bytes>|
@@ -2524,15 +2542,15 @@ test "analysis loads a standard library function together with the definitions i
   let specified = [
     {
       name: b"std.q",
-      src: b"import std.s (helper)\nimport std.s as s\npub fn used(n: Int) -> Int\n  requires n > s::other()\n  ensures result == model(n) + helper()\n= n\nfn model(n: Int) -> Int = n - further()\nfn further() -> Int = 1\npub fn unused() -> Int = 2\n",
+      source_text: b"import std.s (helper)\nimport std.s as s\npub fn used(n: Int) -> Int\n  requires n > s::other()\n  ensures result == model(n) + helper()\n= n\nfn model(n: Int) -> Int = n - further()\nfn further() -> Int = 1\npub fn unused() -> Int = 2\n",
     },
     {
       name: b"std.s",
-      src: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\npub fn idle() -> Int = 5\n",
+      source_text: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\npub fn idle() -> Int = 5\n",
     },
   ];
   let cut = analyse_pulling_std_with(
-    [{ name: b"m", src: b"import std.q\npub fn f() -> Int = q::used(9)\n" }],
+    [{ name: b"m", source_text: b"import std.q\npub fn f() -> Int = q::used(9)\n" }],
     specified,
     no_rows(),
   );
@@ -2553,7 +2571,7 @@ test "analysis loads a standard library function together with the definitions i
       b"std.s.helper",
       b"std.s.other",
     ].concat(
-      reached_prelude_functions(),
+      used_prelude_functions(),
     ).sort(
     ),
   )
@@ -2563,12 +2581,12 @@ test "analysis loads a standard library type together with the functions its mod
   let stating = [
     {
       name: b"std.n",
-      src: b"import std.s (helper)\npub type N = | N(Int)\nkey for N by held\nshow for N by written\nnumeric for N by { add: plus, sub: plus, mul: plus, neg: same, of_int: of }\nfn held(n: N) -> Int = match n { N(x) -> x + helper() }\nfn written(n: N) -> String = \"n\"\nfn plus(a: N, b: N) -> N = a\nfn same(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\npub fn unused() -> Int = 2\n",
+      source_text: b"import std.s (helper)\npub type N = | N(Int)\nkey for N by held\nshow for N by written\nnumeric for N by { add: plus, sub: plus, mul: plus, neg: same, of_int: of }\nfn held(n: N) -> Int = match n { N(x) -> x + helper() }\nfn written(n: N) -> String = \"n\"\nfn plus(a: N, b: N) -> N = a\nfn same(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\npub fn unused() -> Int = 2\n",
     },
-    { name: b"std.s", src: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\n" },
+    { name: b"std.s", source_text: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\n" },
   ];
   let idle = analyse_pulling_std_with(
-    [{ name: b"m", src: b"import std.n\npub fn f() -> Int = 1\n" }],
+    [{ name: b"m", source_text: b"import std.n\npub fn f() -> Int = 1\n" }],
     stating,
     no_rows(),
   );
@@ -2589,36 +2607,33 @@ test "analysis loads a standard library type together with the functions its mod
     b"std.s.helper",
   ]);
   let used = analyse_pulling_std_with(
-    [{ name: b"m", src: b"import std.n (N)\npub fn f(a: N, b: N) -> Bool = a + b == a\n" }],
+    [{ name: b"m", source_text: b"import std.n (N)\npub fn f(a: N, b: N) -> Bool = a + b == a\n" }],
     stating,
     no_rows(),
   );
-  assert_eq(
-    definition_names(used),
-    definition_names(idle).concat(reached_prelude_functions()).sort(),
-  )
+  assert_eq(definition_names(used), definition_names(idle).concat(used_prelude_functions()).sort())
 }
 
 fn same_name_sources() -> List<Source> =
   [
     {
       name: b"std.z",
-      src: b"pub effect pack {\n  raise rejected(at: Int)\n}\npub effect Pack {\n  raise spilled(at: Int)\n}\npub type Pack = | Pack(Int) | Loose\npub fn pack(n: Int) -> Pack = Pack(squeezed(n))\nfn squeezed(n: Int) -> Int = n + deeper()\nfn deeper() -> Int = 1\npub fn try_unpack(p: Pack) -> Int / {pack.rejected, Pack.spilled} =\n  match p { Pack(n) -> if n < 0 { pack.rejected(n) } else { n }, Loose -> Pack.spilled(0) }\npub fn idle() -> Int = 3\n",
+      source_text: b"pub effect pack {\n  raise rejected(at: Int)\n}\npub effect Pack {\n  raise spilled(at: Int)\n}\npub type Pack = | Pack(Int) | Loose\npub fn pack(n: Int) -> Pack = Pack(squeezed(n))\nfn squeezed(n: Int) -> Int = n + deeper()\nfn deeper() -> Int = 1\npub fn try_unpack(p: Pack) -> Int / {pack.rejected, Pack.spilled} =\n  match p { Pack(n) -> if n < 0 { pack.rejected(n) } else { n }, Loose -> Pack.spilled(0) }\npub fn idle() -> Int = 3\n",
     },
     {
       name: b"std.y",
-      src: b"import std.z (pack, Pack, Loose)\npub fn guarded(n: Int) -> Int / {pack.rejected} = if n < 0 { pack.rejected(n) } else { n }\npub fn loose() -> Pack = Loose\n",
+      source_text: b"import std.z (pack, Pack, Loose)\npub fn guarded(n: Int) -> Int / {pack.rejected} = if n < 0 { pack.rejected(n) } else { n }\npub fn loose() -> Pack = Loose\n",
     },
     {
       name: b"std.w",
-      src: b"pub effect table {\n  raise missing(at: Int)\n}\npub fn table() -> Bytes = embed(\"w/table.txt\")\npub fn rows() -> Int = table().len()\npub fn try_row(n: Int) -> Int / {table.missing} = if n < 0 { table.missing(n) } else { n }\n",
+      source_text: b"pub effect table {\n  raise missing(at: Int)\n}\npub fn table() -> Bytes = embed(\"w/table.txt\")\npub fn rows() -> Int = table().len()\npub fn try_row(n: Int) -> Int / {table.missing} = if n < 0 { table.missing(n) } else { n }\n",
     },
   ]
 
 fn namesake_data(bytes: Bytes) -> List<ShippedData> = [{ name: b"std/w/table.txt", bytes: bytes }]
 
 fn loaded_twice(imports: Bytes) -> List<List<Bytes>> / {abort.raise} = {
-  let user = [{ name: b"m", src: imports.concat(b"\npub fn f() -> Int = 1\n") }];
+  let user = [{ name: b"m", source_text: imports.concat(b"\npub fn f() -> Int = 1\n") }];
   let diagnostic_texts = |diagnostics: List<Diagnostic>|
     diagnostics.map(|d: Diagnostic| Bytes::concat_all([d.code, b": ", d.message]));
   let data = namesake_data(b"one\n");
@@ -2662,7 +2677,7 @@ test "importing a standard library function loads only that function, not an eff
 test "changing a data file a bundled function embeds changes that function's hash, but not the hash of modules that never call it" {
   let over = |imports: Bytes, bytes: Bytes|
     analyse_pulling_std_with(
-      [{ name: b"m", src: imports.concat(b"\npub fn f() -> Int = 1\n") }],
+      [{ name: b"m", source_text: imports.concat(b"\npub fn f() -> Int = 1\n") }],
       same_name_sources(),
       no_rows(),
       data: namesake_data(bytes),
@@ -2682,13 +2697,18 @@ test "changing a data file a bundled function embeds changes that function's has
 }
 
 test "importing a bundled compiler module includes only the functions the program uses, directly or indirectly" {
-  let user = [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()\n" }];
+  let user = [
+    { name: b"m", source_text: b"import compiler.a (first)\npub fn f() -> Int = first()\n" },
+  ];
   let shipped = [
     {
       name: b"compiler.a",
-      src: b"import compiler.b (second, third)\npub fn first() -> Int = second()\npub fn unused() -> Int = third()\n",
+      source_text: b"import compiler.b (second, third)\npub fn first() -> Int = second()\npub fn unused() -> Int = third()\n",
     },
-    { name: b"compiler.b", src: b"pub fn second() -> Int = 1\npub fn third() -> Int = 2\n" },
+    {
+      name: b"compiler.b",
+      source_text: b"pub fn second() -> Int = 1\npub fn third() -> Int = 2\n",
+    },
   ];
   let cut = analyse_pulling_std_with(user, shipped, no_rows());
   assert_eq(definition_names(cut), [b"compiler.a.first", b"compiler.b.second", b"m.f"])
@@ -2707,12 +2727,17 @@ fn view_names(v: ShippedModuleSummary) -> List<Bytes> =
   v.definitions.map(|d: { name: Bytes, hash: Bytes }| d.name).sort()
 
 test "analysis returns a hash of each bundled module's text and of its declarations, for only the functions the program uses" {
-  let user = [{ name: b"m", src: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" }];
+  let user = [
+    { name: b"m", source_text: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" },
+  ];
   let viewed = analyse_pulling_std_with(user, unused_function_sources(), no_rows()).shipped_views;
   assert_eq(viewed.map(|v: ShippedModuleSummary| v.module), [prelude_module(), b"std.r", b"std.s"]);
   assert_eq(view_names(view_named(viewed, b"std.r")), [b"std.r.imported", b"std.r.used"]);
   assert_eq(view_names(view_named(viewed, b"std.s")), [b"std.s.helper"]);
-  assert_eq(view_named(viewed, b"std.s").text, hex(blake3(unused_function_sources().get(1).src)));
+  assert_eq(
+    view_named(viewed, b"std.s").text,
+    hex(blake3(unused_function_sources().get(1).source_text)),
+  );
   let hexed = |b: Bytes|
     b.len() == 64
       && range(0, 64).fold(true, |ok: Bool, i: Int| {
@@ -2749,11 +2774,15 @@ test "every analysis includes `std.prelude`, with only the prelude's Ply-written
   let viewed = |source_text: Bytes|
     view_names(
       view_named(
-        analyse_pulling_std_with([{ name: b"m", src: source_text }], [], no_rows()).shipped_views,
+        analyse_pulling_std_with(
+          [{ name: b"m", source_text: source_text }],
+          [],
+          no_rows(),
+        ).shipped_views,
         prelude_module(),
       ),
     );
-  let declaration_sources = reached_prelude_functions().sort();
+  let declaration_sources = used_prelude_functions().sort();
   let contains_prelude_name = |names: List<Bytes>, name: Bytes|
     names.contains(qualify(prelude_module(), name));
   assert_eq(viewed(b"pub fn g() -> Int = 1\n"), []);
@@ -2795,28 +2824,32 @@ test "every analysis includes `std.prelude`, with only the prelude's Ply-written
 }
 
 test "adding an unused function to a bundled module changes its text hash but not its declarations hash; adding a type changes both" {
-  let user = [{ name: b"m", src: b"import std.r (used)\npub fn f() -> Int = used()\n" }];
+  let user = [{ name: b"m", source_text: b"import std.r (used)\npub fn f() -> Int = used()\n" }];
   let with_s = |text: Bytes|
     view_named(
       analyse_pulling_std_with(
         user,
-        [unused_function_sources().get(0), { name: b"std.s", src: text }],
+        [unused_function_sources().get(0), { name: b"std.s", source_text: text }],
         no_rows(),
       ).shipped_views,
       b"std.s",
     );
-  let before = with_s(unused_function_sources().get(1).src);
-  let added = with_s(unused_function_sources().get(1).src.concat(b"pub fn later() -> Int = 5\n"));
+  let before = with_s(unused_function_sources().get(1).source_text);
+  let added = with_s(
+    unused_function_sources().get(1).source_text.concat(b"pub fn later() -> Int = 5\n"),
+  );
   assert(added.text != before.text, None);
   assert_eq(added.form, before.form);
   assert_eq(added.definitions, before.definitions);
-  let typed = with_s(unused_function_sources().get(1).src.concat(b"pub type T = { x: Int }\n"));
+  let typed = with_s(
+    unused_function_sources().get(1).source_text.concat(b"pub type T = { x: Int }\n"),
+  );
   assert(typed.form != before.form, None)
 }
 
 test "analysis loads the bundled modules a program imports in rounds, one round per import depth, each sorted by name" {
   let a = pulled_dump(
-    [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }],
+    [{ name: b"m", source_text: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }],
     shipped_modules(),
   );
   assert_eq(a.pulled, [b"std.a", b"std.b", b"std.prelude", b"std.c"]);
@@ -2826,7 +2859,7 @@ test "analysis loads the bundled modules a program imports in rounds, one round 
 
 test "importing a module that is not bundled reports an error at the import and lists the bundled modules" {
   let a = pulled_dump(
-    [{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }],
+    [{ name: b"m", source_text: b"import std.e\npub fn f() -> Int = 1" }],
     shipped_modules(),
   );
   assert_eq(a.pulled, []);
@@ -2849,7 +2882,7 @@ test "importing a module that is not bundled reports an error at the import and 
 
 fn shipped_text(name: Bytes) -> Option<Bytes> =
   shipped_modules().fold(None, |accumulator: Option<Bytes>, s: Source|
-    if s.name == name { Some(s.src) } else { accumulator })
+    if s.name == name { Some(s.source_text) } else { accumulator })
 
 effect read_requests {
   write module(name: Bytes) -> Unit
@@ -2894,14 +2927,14 @@ fn pulled_by(
 }
 
 test "analysis reads only the bundled modules the program imports and the modules those import" {
-  let p = pulled_by([{ name: b"m", src: b"import std.a\npub fn f() -> Int = 1" }]);
+  let p = pulled_by([{ name: b"m", source_text: b"import std.a\npub fn f() -> Int = 1" }]);
   assert_eq(p.asked, [b"std.a", b"std.c"]);
   assert_eq(p.shipping.sources.map(|s: Source| s.name), [b"std.a", b"std.c"]);
   assert_eq(p.shipping.unread, [b"std.b", b"std.d"])
 }
 
 test "analysis asked to include a bundled module reads it and its imports, even when no module imports it" {
-  let user = [{ name: b"m", src: b"import std.b\npub fn f() -> Int = 1" }];
+  let user = [{ name: b"m", source_text: b"import std.b\npub fn f() -> Int = 1" }];
   let p = pulled_by(user, [b"std.d", b"std.a", b"std.b", b"std.nowhere"]);
   assert_eq(p.asked, [b"std.a", b"std.b", b"std.d", b"std.c"]);
   assert_eq(p.shipping.unread, []);
@@ -2914,7 +2947,7 @@ test "analysis asked to include a bundled module reads it and its imports, even 
       cut_unused: false,
       required: required,
     );
-  assert_eq(pull_rounds(p.shipping.asked).pulled, [
+  assert_eq(pull_rounds(p.shipping.required_modules).pulled, [
     b"std.a",
     b"std.b",
     b"std.d",
@@ -2925,7 +2958,7 @@ test "analysis asked to include a bundled module reads it and its imports, even 
 }
 
 test "a bundled module's tests are included when analysis is asked to include that module, not when it is only imported" {
-  let user = [{ name: b"m", src: b"pub fn f() -> Int = 1\n" }];
+  let user = [{ name: b"m", source_text: b"pub fn f() -> Int = 1\n" }];
   let tests_of = |p: PulledAnalysis|
     match p.out {
       Analysed(w) ->
@@ -2955,7 +2988,7 @@ fn diverging_sources() -> List<Source> =
   [
     {
       name: b"std.spin",
-      src: b"pub fn turn(n: Int) -> Int = spin(n)\nfn spin(n: Int) -> Int = if n <= 0 { 0 } else { spin(n + 1) - 1 }\ntest \"spins\" { assert(spin(0) == 0) }\n",
+      source_text: b"pub fn turn(n: Int) -> Int = spin(n)\nfn spin(n: Int) -> Int = if n <= 0 { 0 } else { spin(n + 1) - 1 }\ntest \"spins\" { assert(spin(0) == 0) }\n",
     },
   ]
 
@@ -2967,7 +3000,7 @@ test "a bundled function that may recurse forever is rejected with the same erro
         diagnostics.map(|d: Diagnostic| { code: d.code, message: d.message }),
     };
   let spun = [{ code: b"E0302", message: b"`spin` may not return, and its effects do not say so" }];
-  let importer = |body: Bytes| [{ name: b"m", src: b"import std.spin\n".concat(body) }];
+  let importer = |body: Bytes| [{ name: b"m", source_text: b"import std.spin\n".concat(body) }];
   assert_eq(
     rejections(analyse_pulling_std_with(diverging_sources(), diverging_sources(), no_rows())),
     spun,
@@ -3008,7 +3041,7 @@ test "a bundled function that may recurse forever is rejected with the same erro
 
 test "analysis fails with an internal compiler error when a module it must use was never read" {
   let lazy = analyse_pulling_std_with(
-    [{ name: b"m", src: b"pub fn f() -> Int = 1\n" }],
+    [{ name: b"m", source_text: b"pub fn f() -> Int = 1\n" }],
     [],
     no_rows(),
     unread: [b"std.a"],
@@ -3027,19 +3060,19 @@ test "analysis reads the compiler modules a compiler module imports from its pac
   let texts = [
     {
       name: b"compiler.fmt",
-      src: b"import compiler.lexer\npub fn f() -> Bytes = embed(\"words/table.ply\")\n",
+      source_text: b"import compiler.lexer\npub fn f() -> Bytes = embed(\"words/table.ply\")\n",
     },
-    { name: b"compiler.lexer", src: b"pub fn l() -> Int = 1\n" },
-    { name: b"compiler.words.table", src: b"" },
-    { name: b"compiler.unit", src: b"pub fn u() -> Int = 2\n" },
+    { name: b"compiler.lexer", source_text: b"pub fn l() -> Int = 1\n" },
+    { name: b"compiler.words.table", source_text: b"" },
+    { name: b"compiler.unit", source_text: b"pub fn u() -> Int = 2\n" },
   ];
   let s = shipped_inputs_of(
-    [{ name: b"app", src: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
+    [{ name: b"app", source_text: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
     { root: b"", manifest: None, supplied: [] },
     texts.map(|t: Source| t.name),
     |name: Bytes|
       texts.fold(None, |accumulator: Option<Bytes>, t: Source|
-        if t.name == name { Some(t.src) } else { accumulator }),
+        if t.name == name { Some(t.source_text) } else { accumulator }),
     |name: Bytes| None,
     dependencies_of,
   );
@@ -3056,17 +3089,17 @@ test "analysis reads the library module text and the library data file that a co
   let texts = [
     {
       name: b"compiler.fmt",
-      src: b"pub fn f() -> Bytes = embed(\"../std/words.ply\")\npub fn g() -> Bytes = embed(\"../std/oid/names.txt\")\n",
+      source_text: b"pub fn f() -> Bytes = embed(\"../std/words.ply\")\npub fn g() -> Bytes = embed(\"../std/oid/names.txt\")\n",
     },
-    { name: b"std.words", src: b"" },
+    { name: b"std.words", source_text: b"" },
   ];
   let s = shipped_inputs_of(
-    [{ name: b"app", src: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
+    [{ name: b"app", source_text: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
     { root: b"", manifest: None, supplied: [] },
     texts.map(|t: Source| t.name),
     |name: Bytes|
       texts.fold(None, |accumulator: Option<Bytes>, t: Source|
-        if t.name == name { Some(t.src) } else { accumulator }),
+        if t.name == name { Some(t.source_text) } else { accumulator }),
     |name: Bytes| if name == b"std/oid/names.txt" { Some(b"2.5.4.3 cn\n") } else { None },
     dependencies_of,
   );
@@ -3081,9 +3114,9 @@ fn data_pulled_by(
   let texts = [
     {
       name: b"std.words",
-      src: b"pub fn list() -> Bytes = embed(\"words/list.txt\")\npub fn again() -> Bytes = embed(\"./words/list.txt\")\n",
+      source_text: b"pub fn list() -> Bytes = embed(\"words/list.txt\")\npub fn again() -> Bytes = embed(\"./words/list.txt\")\n",
     },
-    { name: b"std.idle", src: b"pub fn rest() -> Bytes = embed(\"idle/rest.txt\")\n" },
+    { name: b"std.idle", source_text: b"pub fn rest() -> Bytes = embed(\"idle/rest.txt\")\n" },
   ];
   let ran = recording_reads(||
     shipped_inputs_of(
@@ -3093,7 +3126,7 @@ fn data_pulled_by(
       |name: Bytes| {
         read_requests.module(name);
         texts.fold(None, |accumulator: Option<Bytes>, t: Source|
-          if t.name == name { Some(t.src) } else { accumulator })
+          if t.name == name { Some(t.source_text) } else { accumulator })
       },
       |name: Bytes| {
         read_requests.data(name);
@@ -3106,7 +3139,7 @@ fn data_pulled_by(
 }
 
 test "analysis asked to include a bundled module reads the data file it embeds, even when no module imports it" {
-  let p = data_pulled_by([{ name: b"m", src: b"pub fn f() -> Int = 1" }], [b"std.words"]);
+  let p = data_pulled_by([{ name: b"m", source_text: b"pub fn f() -> Int = 1" }], [b"std.words"]);
   assert_eq(p.modules, [b"std.words"]);
   assert_eq(p.data, [b"std/words/list.txt"]);
   assert_eq(p.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\ntwo\n" }]);
@@ -3114,18 +3147,18 @@ test "analysis asked to include a bundled module reads the data file it embeds, 
 }
 
 test "analysis reads each data file embedded by the bundled modules it loads exactly once, and no other data files" {
-  let p = data_pulled_by([{ name: b"m", src: b"import std.words\npub fn f() -> Int = 1" }]);
+  let p = data_pulled_by([{ name: b"m", source_text: b"import std.words\npub fn f() -> Int = 1" }]);
   assert_eq(p.modules, [b"std.words"]);
   assert_eq(p.data, [b"std/words/list.txt"]);
   assert_eq(p.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\ntwo\n" }]);
   assert_eq(p.shipping.unread, [b"std.idle"]);
-  let none = data_pulled_by([{ name: b"m", src: b"pub fn f() -> Int = 1" }]);
+  let none = data_pulled_by([{ name: b"m", source_text: b"pub fn f() -> Int = 1" }]);
   assert_eq(none.data, []);
   assert_eq(none.shipping.data, [])
 }
 
 test "analysis given only the bundled modules it needs returns the same result as analysis given every bundled module" {
-  let user = [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }];
+  let user = [{ name: b"m", source_text: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }];
   let p = pulled_by(user);
   let whole = analyse_pulling_std(user, shipped_modules());
   let lazy = analyse_pulling_std_with(
@@ -3139,7 +3172,7 @@ test "analysis given only the bundled modules it needs returns the same result a
 }
 
 test "importing a module that is not bundled lists every bundled module in the error, including unread ones" {
-  let user = [{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }];
+  let user = [{ name: b"m", source_text: b"import std.e\npub fn f() -> Int = 1" }];
   let p = pulled_by(user);
   assert_eq(p.shipping.sources, []);
   let lazy = analyse_pulling_std_with(user, [], no_rows(), unread: p.shipping.unread);
@@ -3149,13 +3182,16 @@ test "importing a module that is not bundled lists every bundled module in the e
 
 fn compiler_shipped() -> List<Source> =
   [
-    { name: b"compiler.a", src: b"import compiler.b (second)\npub fn first() -> Int = second()" },
-    { name: b"compiler.b", src: b"pub fn second() -> Int = 1" },
+    {
+      name: b"compiler.a",
+      source_text: b"import compiler.b (second)\npub fn first() -> Int = second()",
+    },
+    { name: b"compiler.b", source_text: b"pub fn second() -> Int = 1" },
   ]
 
 test "a bundled compiler module is loaded from the compiler package when a program imports it" {
   let a = pulled_dump(
-    [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
+    [{ name: b"m", source_text: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
     compiler_shipped(),
   );
   assert_eq(a.pulled, [b"compiler.a", prelude_module(), b"compiler.b"]);
@@ -3168,17 +3204,17 @@ test "a bundled compiler module is loaded from the compiler package when a progr
 
 fn library_over_compiler() -> List<Source> =
   [
-    { name: b"std.base", src: b"pub fn one() -> Int = 1" },
+    { name: b"std.base", source_text: b"pub fn one() -> Int = 1" },
     {
       name: b"std.reader",
-      src: b"import compiler.a (first)\nimport std.base (one)\npub fn read() -> Int = first() + one()",
+      source_text: b"import compiler.a (first)\nimport std.base (one)\npub fn read() -> Int = first() + one()",
     },
     {
       name: b"compiler.a",
-      src: b"import compiler.b (second)\nimport std.base (one)\npub fn first() -> Int = second() + one()\npub fn unreached() -> Int = 0",
+      source_text: b"import compiler.b (second)\nimport std.base (one)\npub fn first() -> Int = second() + one()\npub fn unreached() -> Int = 0",
     },
-    { name: b"compiler.b", src: b"import std.deep (two)\npub fn second() -> Int = two()" },
-    { name: b"std.deep", src: b"pub fn two() -> Int = 2\npub fn idle() -> Int = 0" },
+    { name: b"compiler.b", source_text: b"import std.deep (two)\npub fn second() -> Int = two()" },
+    { name: b"std.deep", source_text: b"pub fn two() -> Int = 2\npub fn idle() -> Int = 0" },
   ]
 
 test "a library module loaded without the full compiler sources also loads the compiler modules it imports, transitively, with their used functions" {
@@ -3206,8 +3242,8 @@ fn messages(d: Dump) -> List<Bytes> = d.diagnostics.map(|diagnostic: Diagnostic|
 
 test "a bundled module that imports a module which is not bundled is reported as a compiler error" {
   let a = pulled_dump(
-    [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
-    [{ name: b"compiler.a", src: b"import std.e (e)\npub fn first() -> Int = e()" }],
+    [{ name: b"m", source_text: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
+    [{ name: b"compiler.a", source_text: b"import std.e (e)\npub fn first() -> Int = e()" }],
   );
   assert(
     messages(a.dump).contains(
@@ -3217,8 +3253,8 @@ test "a bundled module that imports a module which is not bundled is reported as
 }
 
 test "a bundled module that imports a non-bundled module gets an error whose label points at that import in the bundled module" {
-  let a = pulled_dump([{ name: b"m", src: b"import std.x\npub fn f() -> Int = 1" }], [
-    { name: b"std.x", src: b"import m\npub fn x() -> Int = 1" },
+  let a = pulled_dump([{ name: b"m", source_text: b"import std.x\npub fn f() -> Int = 1" }], [
+    { name: b"std.x", source_text: b"import m\npub fn x() -> Int = 1" },
   ]);
   assert_eq(a.pulled, [prelude_module(), b"std.x"]);
   let import_diagnostics = a.dump.diagnostics.filter(|diagnostic: Diagnostic|
@@ -3241,9 +3277,12 @@ fn returned() -> List<Source> =
   [
     {
       name: b"base",
-      src: b"pub effect log { write emit(Bytes) -> Unit }\npub type Shape = | Dot | Line(Int)\npub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\npub fn same(x: Int) -> Int = x",
+      source_text: b"pub effect log { write emit(Bytes) -> Unit }\npub type Shape = | Dot | Line(Int)\npub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\npub fn same(x: Int) -> Int = x",
     },
-    { name: b"app", src: b"import base\nimport std.b\npub fn two() -> Int = base::same(2)" },
+    {
+      name: b"app",
+      source_text: b"import base\nimport std.b\npub fn two() -> Int = base::same(2)",
+    },
   ]
 
 fn definition_named(d: Dump, name: Bytes) -> DefinitionRow / {abort.raise} =
@@ -3262,7 +3301,7 @@ test "the analysis output contains each type's constructors and each function's 
     effect: b"base.log",
     resource: SingletonResource,
     mode: WriteMode,
-    op: None,
+    operation: None,
   };
   let say = definition_named(a.dump, b"base.say");
   assert_eq(say.effects, [write]);
@@ -3275,7 +3314,7 @@ test "the analysis output contains each type's constructors and each function's 
 }
 
 test "a rejected program returns only diagnostics located at the error, and no definitions, types or modules" {
-  let bad = [{ name: b"m", src: b"fn f() -> Int = \"x\"" }];
+  let bad = [{ name: b"m", source_text: b"fn f() -> Int = \"x\"" }];
   let a = pulled_dump(bad, []);
   assert_eq(a.pulled, [prelude_module()]);
   assert_eq(a.dump.diagnostics, [
@@ -3303,7 +3342,7 @@ test "function bodies read back from the stored analysis equal the bodies from c
   let a = analysis_of([
     {
       name: b"m",
-      src: b"pub type P = { x: Int, y: Int }\n\npub fn moved(p: P) -> P\n  ensures result.x == p.x + 1\n= { ..p, x: p.x + 1 }\n",
+      source_text: b"pub type P = { x: Int, y: Int }\n\npub fn moved(p: P) -> P\n  ensures result.x == p.x + 1\n= { ..p, x: p.x + 1 }\n",
     },
   ]);
   match facts_read(rows_of(a), inferred_facts(a), None, a.modules) {
@@ -3327,11 +3366,11 @@ test "database statement sites are the calls to a database effect operation or t
   let w = analysis_of([
     {
       name: b"store",
-      src: b"pub type Param = | PInt(Int) | PNull\npub type Stmt = { sql: String }\npub fn stmt(sql: String) -> Stmt = { sql: sql }\npub effect db { read query[t](s: Stmt, ps: List<Param>) -> Int }\npub fn run<[t]>(s: Stmt) -> Int / {db.query[t]} = db.query[t](s, [])\n",
+      source_text: b"pub type Param = | PInt(Int) | PNull\npub type Stmt = { sql: String }\npub fn stmt(sql: String) -> Stmt = { sql: sql }\npub effect db { read query[t](s: Stmt, ps: List<Param>) -> Int }\npub fn run<[t]>(s: Stmt) -> Int / {db.query[t]} = db.query[t](s, [])\n",
     },
     {
       name: b"app",
-      src: b"import store\nimport store (db)\nfn q() -> store::Stmt = store::stmt(\"select \" ++ \"sku from items\")\npub fn f(n: Int, p: store::Param) -> Int / {db.query[items]} = db.query[items](q(), [store::PInt(n), store::PNull, p])\npub fn g() -> Int / {db.query[items]} = store::run[items](store::stmt(\"select 1\"))\n",
+      source_text: b"import store\nimport store (db)\nfn q() -> store::Stmt = store::stmt(\"select \" ++ \"sku from items\")\npub fn f(n: Int, p: store::Param) -> Int / {db.query[items]} = db.query[items](q(), [store::PInt(n), store::PNull, p])\npub fn g() -> Int / {db.query[items]} = store::run[items](store::stmt(\"select 1\"))\n",
     },
   ]);
   let hash_of = |name: Bytes|
@@ -3372,11 +3411,11 @@ test "database effect calls inside the module that declares the effect are not s
   let w = analysis_of([
     {
       name: b"std.db",
-      src: b"pub type Stmt = { sql: String }\npub fn stmt(sql: String) -> Stmt = { sql: sql }\npub effect db { read query[t](s: Stmt) -> Int }\npub fn own() -> Int / {db.query[items]} = db.query[items](stmt(\"insert one\"))\n",
+      source_text: b"pub type Stmt = { sql: String }\npub fn stmt(sql: String) -> Stmt = { sql: sql }\npub effect db { read query[t](s: Stmt) -> Int }\npub fn own() -> Int / {db.query[items]} = db.query[items](stmt(\"insert one\"))\n",
     },
     {
       name: b"std.user",
-      src: b"import std.db as base\nimport std.db (db)\npub fn f() -> Int / {db.query[items]} = db.query[items](base::stmt(\"select 1\"))\n",
+      source_text: b"import std.db as base\nimport std.db (db)\npub fn f() -> Int / {db.query[items]} = db.query[items](base::stmt(\"select 1\"))\n",
     },
   ]);
   assert_eq(statements_of(w, 0), []);
@@ -3393,11 +3432,11 @@ fn effect_sources() -> List<Source> =
   [
     {
       name: b"base",
-      src: b"pub effect log { write emit(Bytes) -> Unit }\npub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)",
+      source_text: b"pub effect log { write emit(Bytes) -> Unit }\npub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)",
     },
     {
       name: b"app",
-      src: b"import base\nfn twice(b: Bytes) -> Unit / {base::log.write} = base::say(b)\ntest \"says\" { twice(b\"x\") }",
+      source_text: b"import base\nfn twice(b: Bytes) -> Unit / {base::log.write} = base::say(b)\ntest \"says\" { twice(b\"x\") }",
     },
   ]
 
@@ -3423,10 +3462,10 @@ fn scheme_named(p: Published, name: Bytes) -> Scheme / {abort.raise} =
 
 test "a generic function gets the same published definition whatever type variable numbers the checker used while checking earlier modules" {
   let pick = b"pub fn pick<p, q>(x: p, y: q, f: (p) -> q) -> List<q> = [f(x), y]";
-  let alone = [{ name: b"m", src: pick }];
+  let alone = [{ name: b"m", source_text: pick }];
   let behind = [
-    { name: b"a", src: b"pub fn first<c, d, e>(x: c, y: d, z: e) -> c = x" },
-    { name: b"m", src: pick },
+    { name: b"a", source_text: b"pub fn first<c, d, e>(x: c, y: d, z: e) -> c = x" },
+    { name: b"m", source_text: pick },
   ];
   let raw = |sources: List<Source>|
     analysis_of(sources).checked.definitions.fold(
@@ -3459,11 +3498,11 @@ fn generic() -> List<Source> =
   [
     {
       name: b"base",
-      src: b"pub effect log { write emit(Bytes) -> Unit }\npub fn around<a | e>(f: () -> a / e) -> a / {log.write | e} = {\n  log.emit(b\"in\");\n  f()\n}\npub fn bare<a | e>(f: () -> a / e) -> a / e = f()",
+      source_text: b"pub effect log { write emit(Bytes) -> Unit }\npub fn around<a | e>(f: () -> a / e) -> a / {log.write | e} = {\n  log.emit(b\"in\");\n  f()\n}\npub fn bare<a | e>(f: () -> a / e) -> a / e = f()",
     },
     {
       name: b"app",
-      src: b"import base\nfn twice(b: Bytes) -> Unit / {base::log.write} = base::around(|| base::bare(|| base::log.emit(b)))\ntest \"says\" { twice(b\"x\") }",
+      source_text: b"import base\nfn twice(b: Bytes) -> Unit / {base::log.write} = base::around(|| base::bare(|| base::log.emit(b)))\ntest \"says\" { twice(b\"x\") }",
     },
   ]
 
@@ -3496,7 +3535,7 @@ test "the effects of a test and of a `law` property do not include `abort.raise`
     parse_all([
       {
         name: b"m",
-        src: b"pub effect log { write put(Bytes) -> Unit }\nfn half(n: Int, d: Int) -> Int / {abort.raise} = n / d\ntest \"halves\" { log.put(b\"x\"); assert_eq(half(4, 2), 2) }\nlaw \"whole\" forall (n: Int) { half(n, 1) == n }",
+        source_text: b"pub effect log { write put(Bytes) -> Unit }\nfn half(n: Int, d: Int) -> Int / {abort.raise} = n / d\ntest \"halves\" { log.put(b\"x\"); assert_eq(half(4, 2), 2) }\nlaw \"whole\" forall (n: Int) { half(n, 1) == n }",
       },
     ]),
   );
@@ -3511,7 +3550,7 @@ fn moded() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"pub effect store { read peek[t]() -> Int  write put[t](n: Int) -> Unit }\ntest \"reads\" { handle { assert_eq(store.peek[a](), 1) } with { store.peek[a]() -> 1 } }\ntest \"touches\" { let n = store.peek[b](); store.put[b](n) }",
+      source_text: b"pub effect store { read peek[t]() -> Int  write put[t](n: Int) -> Unit }\ntest \"reads\" { handle { assert_eq(store.peek[a](), 1) } with { store.peek[a]() -> 1 } }\ntest \"touches\" { let n = store.peek[b](); store.put[b](n) }",
     },
   ]
 
@@ -3544,7 +3583,7 @@ fn two_effects() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"pub effect log { write put() -> Unit }\npub effect other { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()\npub fn quiet(x: Int) -> Int = x",
+      source_text: b"pub effect log { write put() -> Unit }\npub effect other { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()\npub fn quiet(x: Int) -> Int = x",
     },
   ]
 
@@ -3609,7 +3648,7 @@ fn labelled() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\npub fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\npub fn both<[a], [c]>(b: Bytes) -> Unit / {net.send[a], net.send[c]} = { relay[c](b); relay[a](b) }\npub fn go(b: Bytes) -> Unit / {net.send[conn]} = both[conn, conn](b)\n",
+      source_text: b"effect net { write send[r](Bytes) -> Unit }\npub fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\npub fn both<[a], [c]>(b: Bytes) -> Unit / {net.send[a], net.send[c]} = { relay[c](b); relay[a](b) }\npub fn go(b: Bytes) -> Unit / {net.send[conn]} = both[conn, conn](b)\n",
     },
   ]
 
@@ -3624,7 +3663,7 @@ fn mutually_recursive_sources(above: Bytes, between: Bytes) -> List<Source> =
   [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         above,
         b"fn spin(n: Int) -> Int / {diverges} = hop(n + 1)\n",
         between,
@@ -3656,7 +3695,7 @@ fn reading(above: Bytes) -> List<Source> =
   [
     {
       name: b"m",
-      src: above.concat(
+      source_text: above.concat(
         b"pub fn at(b: Bytes, i: Int) -> Int / {abort.raise} = if i < b.len() { b.at(i) } else { 0 }\npub fn walk(b: Bytes, i: Int) -> Int / {abort.raise} = if i < 0 || i >= b.len() { 0 } else { b.at(i) + walk(b, i + 1) }\n",
       ),
     },
@@ -3697,7 +3736,7 @@ fn declared() -> List<Source> =
   [
     {
       name: b"m",
-      src: b"pub type Shape = | Circle(Int) | Empty\npub nondet effect wall { read now() -> Int\n write set[r](Int) -> Unit }\npub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\ntest \"two is even\" { assert(even(2)) }",
+      source_text: b"pub type Shape = | Circle(Int) | Empty\npub nondet effect wall { read now() -> Int\n write set[r](Int) -> Unit }\npub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\ntest \"two is even\" { assert(even(2)) }",
     },
   ]
 
@@ -3732,20 +3771,20 @@ fn hash_of(sources: List<Source>, name: Bytes) -> Bytes / {abort.raise} =
 test "a map or set literal has the same hash as the equivalent constructor call" {
   let set = {
     name: b"std.set",
-    src: b"pub type Set<a> = | Set(Map<a, Unit>)\npub fn Set::of_list<a>(xs: List<a>) -> Set<a> = Set(Map::new())\n",
+    source_text: b"pub type Set<a> = | Set(Map<a, Unit>)\npub fn Set::of_list<a>(xs: List<a>) -> Set<a> = Set(Map::new())\n",
   };
   let literal = [
     set,
     {
       name: b"m",
-      src: b"import std.set (Set)\npub fn two() -> Map<Int, Int> = #{1: 2, 3: 4}\npub fn s() -> Set<Int> = #[5]",
+      source_text: b"import std.set (Set)\npub fn two() -> Map<Int, Int> = #{1: 2, 3: 4}\npub fn s() -> Set<Int> = #[5]",
     },
   ];
   let call = [
     set,
     {
       name: b"m",
-      src: b"import std.set (Set)\npub fn two() -> Map<Int, Int> = Map::of_entries([{key: 1, value: 2}, {key: 3, value: 4}])\npub fn s() -> Set<Int> = Set::of_list([5])",
+      source_text: b"import std.set (Set)\npub fn two() -> Map<Int, Int> = Map::of_entries([{key: 1, value: 2}, {key: 3, value: 4}])\npub fn s() -> Set<Int> = Set::of_list([5])",
     },
   ];
   assert(hash_of(literal, b"m.two") != b"");
@@ -3755,8 +3794,14 @@ test "a map or set literal has the same hash as the equivalent constructor call"
 
 test "naming a function that is not exported changes the hash of every definition that names it" {
   let caller = b"import a\npub fn two() -> Int = a::one()";
-  let exported = [{ name: b"a", src: b"pub fn one() -> Int = 1" }, { name: b"b", src: caller }];
-  let shut = [{ name: b"a", src: b"fn one() -> Int = 1" }, { name: b"b", src: caller }];
+  let exported = [
+    { name: b"a", source_text: b"pub fn one() -> Int = 1" },
+    { name: b"b", source_text: caller },
+  ];
+  let shut = [
+    { name: b"a", source_text: b"fn one() -> Int = 1" },
+    { name: b"b", source_text: caller },
+  ];
   assert(hash_of(exported, b"b.two") != b"");
   assert(hash_of(shut, b"b.two") != hash_of(exported, b"b.two"));
   assert_eq(hash_of(shut, b"a.one"), hash_of(exported, b"a.one"))
@@ -3805,15 +3850,17 @@ fn with_lib(user: List<Source>) -> PackageSources =
           b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"lib\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
         ),
         modules: [
-          { name: b"answer", src: b"pub fn answer() -> Int = 42" },
-          { name: b"extra", src: b"fn hidden() -> Int = 1" },
+          { name: b"answer", source_text: b"pub fn answer() -> Int = 42" },
+          { name: b"extra", source_text: b"fn hidden() -> Int = 1" },
         ],
       },
     ],
   }
 
 test "a declared dependency's modules resolve under its prefix" {
-  let user = [{ name: b"m", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let user = [
+    { name: b"m", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()" },
+  ];
   match analyse_with(parse_all(user), no_rows(), with_lib(user)) {
     Rejected(ds) -> assert_eq(ds.map(|diagnostic: Diagnostic| diagnostic.code), []),
     Analysed(_) -> assert(true),
@@ -3821,7 +3868,9 @@ test "a declared dependency's modules resolve under its prefix" {
 }
 
 test "importing a module from an undeclared dependency is rejected, naming the package and the importing module" {
-  let user = [{ name: b"m", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let user = [
+    { name: b"m", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()" },
+  ];
   let packages = with_lib(user);
   let undeclared = analyse_with(parse_all(user), no_rows(), {
     root: b"app",
@@ -3837,15 +3886,17 @@ test "importing a module from an undeclared dependency is rejected, naming the p
 }
 
 test "a dependency's imports resolve under the dependency's prefix, not at the top level of the program" {
-  let user = [{ name: b"m", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let user = [
+    { name: b"m", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()" },
+  ];
   let packages = with_lib(user);
   let supplied = [
     {
       root: b"lib",
       manifest: packages.supplied.get(0).manifest,
       modules: [
-        { name: b"answer", src: b"import extra\npub fn answer() -> Int = extra::hidden()" },
-        { name: b"extra", src: b"fn hidden() -> Int = 1" },
+        { name: b"answer", source_text: b"import extra\npub fn answer() -> Int = extra::hidden()" },
+        { name: b"extra", source_text: b"fn hidden() -> Int = 1" },
       ],
     },
   ];
@@ -3861,7 +3912,7 @@ test "a dependency's imports resolve under the dependency's prefix, not at the t
 }
 
 test "a declared dependency with no manifest is reported as an error at its declaration" {
-  let user = [{ name: b"m", src: b"fn main() -> Int = 1" }];
+  let user = [{ name: b"m", source_text: b"fn main() -> Int = 1" }];
   let packages = with_lib(user);
   let package_closure = closure(
     { ..packages, supplied: [{ root: b"lib", manifest: None, modules: [] }] },
@@ -3871,7 +3922,7 @@ test "a declared dependency with no manifest is reported as an error at its decl
 }
 
 test "a cycle of packages is rejected, naming the cycle" {
-  let user = [{ name: b"m", src: b"fn main() -> Int = 1" }];
+  let user = [{ name: b"m", source_text: b"fn main() -> Int = 1" }];
   let manifest_dependency = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"n\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"other\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../other\")}], entry: None}";
   let package_closure = closure(
     {
@@ -3912,7 +3963,7 @@ fn embedding_in(
 fn embedding(source_text: Bytes, reads: List<Read>) -> AnalysisOutcome / {abort.raise} =
   embedding_in(
     { root: b"r", manifest: None, supplied: [] },
-    [{ name: b"m", src: source_text }],
+    [{ name: b"m", source_text: source_text }],
     reads,
   )
 
@@ -3961,7 +4012,7 @@ test "only a module that may call `embed` is parsed for what it embeds" {
 }
 
 test "loading returns the files each declaration embeds, reusing stored embed requests instead of parsing when they exist" {
-  let a: Source = { name: b"a", src: b"pub fn text() -> Bytes = embed(\"x.txt\")\n" };
+  let a: Source = { name: b"a", source_text: b"pub fn text() -> Bytes = embed(\"x.txt\")\n" };
   let read = [
     {
       root: b"",
@@ -4049,7 +4100,9 @@ test "a module that defines its own `embed` function calls that function instead
 }
 
 test "`locked_packages` computed from the dependencies equals the locked package hashes from analysis, including embedded files" {
-  let user = [{ name: b"main", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let user = [
+    { name: b"main", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()" },
+  ];
   let packages = with_lib(user);
   let lib = packages.supplied.get(0);
   let embedding = {
@@ -4057,7 +4110,9 @@ test "`locked_packages` computed from the dependencies equals the locked package
     supplied: [
       {
         ..lib,
-        modules: [{ name: b"answer", src: b"pub fn answer() -> Int = embed(\"n.txt\").len()" }],
+        modules: [
+          { name: b"answer", source_text: b"pub fn answer() -> Int = embed(\"n.txt\").len()" },
+        ],
       },
     ],
   };
@@ -4077,7 +4132,9 @@ test "`locked_packages` computed from the dependencies equals the locked package
 }
 
 test "a dependency's locked hash depends on the files its modules embed as well as on their text" {
-  let user = [{ name: b"main", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let user = [
+    { name: b"main", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()" },
+  ];
   let packages = with_lib(user);
   let embedding_lib = |read: Option<Bytes>| {
     let lib = packages.supplied.get(0);
@@ -4087,7 +4144,7 @@ test "a dependency's locked hash depends on the files its modules embed as well 
     };
     let changed = {
       ..packages,
-      supplied: [{ ..lib, modules: [{ name: b"answer", src: source_text }] }],
+      supplied: [{ ..lib, modules: [{ name: b"answer", source_text: source_text }] }],
     };
     let reads = match read {
       Some(b) ->
@@ -4126,9 +4183,12 @@ test "`shipped_name` maps a file path next to a bundled module to that package's
 }
 
 test "a bundled module can embed another bundled module's text, and changing that text changes the hash" {
-  let user = [{ name: b"m", src: b"import std.deep.a\npub fn f() -> Bytes = a::text()" }];
-  let embedding = { name: b"std.deep.a", src: b"pub fn text() -> Bytes = embed(\"../note.ply\")" };
-  let over = |note: Bytes| pulled_dump(user, [embedding, { name: b"std.note", src: note }]);
+  let user = [{ name: b"m", source_text: b"import std.deep.a\npub fn f() -> Bytes = a::text()" }];
+  let embedding = {
+    name: b"std.deep.a",
+    source_text: b"pub fn text() -> Bytes = embed(\"../note.ply\")",
+  };
+  let over = |note: Bytes| pulled_dump(user, [embedding, { name: b"std.note", source_text: note }]);
   let one = over(b"one");
   assert_eq(one.dump.diagnostics, []);
   assert_eq(one.pulled, [b"std.deep.a", prelude_module()]);
@@ -4140,15 +4200,16 @@ test "a bundled module can embed another bundled module's text, and changing tha
 
 test "`shipped_embedded` returns the files embedded by a bundled module's full text, even when only a stub of the module is parsed" {
   let whole = [
-    { name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"note.ply\")" },
-    { name: b"std.note", src: b"one" },
-  ].fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.src));
+    { name: b"std.a", source_text: b"pub fn text() -> Bytes = embed(\"note.ply\")" },
+    { name: b"std.note", source_text: b"one" },
+  ].fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
+    accumulator.insert(s.name, s.source_text));
   let stub = shipped_embedded(
     whole,
     Map::new(),
     Map::new(),
     0,
-    parse_at(0, { name: b"std.a", src: b"pub fn text() -> Bytes = b\"\"" }),
+    parse_at(0, { name: b"std.a", source_text: b"pub fn text() -> Bytes = b\"\"" }),
   );
   assert_eq(stub.embeds, [
     { module: b"std.a", key: b"file:note.ply", read: Ok([embed_file(b"", b"one")]) },
@@ -4156,9 +4217,9 @@ test "`shipped_embedded` returns the files embedded by a bundled module's full t
 }
 
 test "comparing, ordering or hashing a type that contains a bundled module's `extern type` is rejected" {
-  let native = { name: b"std.native", src: b"pub extern type Node<a>\n" };
+  let native = { name: b"std.native", source_text: b"pub extern type Node<a>\n" };
   let codes = |source_text: Bytes|
-    pulled_dump([{ name: b"m", src: source_text }], [native]).dump.diagnostics.filter(
+    pulled_dump([{ name: b"m", source_text: source_text }], [native]).dump.diagnostics.filter(
       |d: Diagnostic| d.severity == b"error",
     ).map(|d: Diagnostic| d.code);
   let lookup_or_empty = |inner: Bytes, body: Bytes|
@@ -4179,9 +4240,10 @@ test "comparing, ordering or hashing a type that contains a bundled module's `ex
 }
 
 test "a bundled module that embeds a file missing from the bundled modules is rejected" {
-  let a = pulled_dump([{ name: b"m", src: b"import std.a\npub fn f() -> Bytes = a::text()" }], [
-    { name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"gone.ply\")" },
-  ]);
+  let a = pulled_dump(
+    [{ name: b"m", source_text: b"import std.a\npub fn f() -> Bytes = a::text()" }],
+    [{ name: b"std.a", source_text: b"pub fn text() -> Bytes = embed(\"gone.ply\")" }],
+  );
   assert_eq(a.dump.diagnostics.map(|d: Diagnostic| d.code), [b"E0146"])
 }
 
@@ -4202,7 +4264,7 @@ test "a data file beside a shipped module is named by its place below the packag
 fn words_module(path: Bytes) -> Source =
   {
     name: b"std.words",
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"pub fn list() -> Bytes = embed(\"",
       path,
       b"\")\npub fn count() -> Int = list().len()\npub fn idle() -> Int = 7\n",
@@ -4213,7 +4275,7 @@ fn words_data(bytes: Bytes) -> List<ShippedData> = [{ name: b"std/words/list.txt
 
 fn over_words(user: Bytes, data: List<ShippedData>) -> PulledAnalysis / {abort.raise} =
   analyse_pulling_std_with(
-    [{ name: b"m", src: user }],
+    [{ name: b"m", source_text: user }],
     [words_module(b"words/list.txt")],
     no_rows(),
     data: data,
@@ -4250,7 +4312,7 @@ test "changing a data file leaves the hashes unchanged for a program that uses n
 
 test "embedding a data file missing from the shipped modules, or a path outside them, is rejected with an error in the embedding module" {
   let source_text = b"import std.words\npub fn n() -> Int = words::count()\n";
-  let user = [{ name: b"m", src: source_text }];
+  let user = [{ name: b"m", source_text: source_text }];
   let placed_at = |p: PulledAnalysis|
     match p.out {
       Analysed(_) -> [],
@@ -4267,7 +4329,7 @@ test "embedding a data file missing from the shipped modules, or a path outside 
   assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [2] }]);
   let directory = analyse_pulling_std_with(
     user,
-    [{ name: b"std.words", src: b"pub fn count() -> Int = embed_dir(\"words\").len()\n" }],
+    [{ name: b"std.words", source_text: b"pub fn count() -> Int = embed_dir(\"words\").len()\n" }],
     no_rows(),
     data: words_data(b"one\n"),
   );
@@ -4275,13 +4337,13 @@ test "embedding a data file missing from the shipped modules, or a path outside 
 }
 
 test "`shipped_embedded` returns a shipped module's data file even when the module is given only as a stub without its full source" {
-  let whole = Map::new().insert(b"std.words", words_module(b"words/list.txt").src);
+  let whole = Map::new().insert(b"std.words", words_module(b"words/list.txt").source_text);
   let stub = shipped_embedded(
     whole,
     Map::new(),
     data_by_name(embed_files_of(words_data(b"one\n"))),
     0,
-    parse_at(0, { name: b"std.words", src: b"pub fn list() -> Bytes = b\"\"" }),
+    parse_at(0, { name: b"std.words", source_text: b"pub fn list() -> Bytes = b\"\"" }),
   );
   assert_eq(stub.embeds, [
     { module: b"std.words", key: b"file:words/list.txt", read: Ok([embed_file(b"", b"one\n")]) },
@@ -4292,14 +4354,14 @@ test "`shipped_embedded` takes a stub module's embeds from its saved dependency 
   let whole = Map::new().insert(b"std.words", b"embed( names nothing a parse would find");
   let dependencies = Map::new().insert(b"std.words", {
     imports: [],
-    wants: requests_by_item(parse(words_module(b"words/list.txt").src).node),
+    wants: requests_by_item(parse(words_module(b"words/list.txt").source_text).node),
   });
   let stub = shipped_embedded(
     whole,
     dependencies,
     data_by_name(embed_files_of(words_data(b"one\n"))),
     0,
-    parse_at(0, { name: b"std.words", src: b"pub fn list() -> Bytes = b\"\"" }),
+    parse_at(0, { name: b"std.words", source_text: b"pub fn list() -> Bytes = b\"\"" }),
   );
   assert_eq(stub.embeds.map(|e: ModuleEmbed| e.key), [b"file:words/list.txt"])
 }
@@ -4307,7 +4369,10 @@ test "`shipped_embedded` takes a stub module's embeds from its saved dependency 
 test "parsing shipped modules together with their data files finds the same embeds as loading a program that imports them" {
   let module = words_module(b"words/list.txt");
   assert_eq(shipped_data_wanted(module), [b"std/words/list.txt"]);
-  assert_eq(shipped_data_wanted({ name: b"std.plain", src: b"pub fn one() -> Int = 1\n" }), []);
+  assert_eq(
+    shipped_data_wanted({ name: b"std.plain", source_text: b"pub fn one() -> Int = 1\n" }),
+    [],
+  );
   let pulled = over_words(
     b"import std.words\npub fn n() -> Int = words::count()\n",
     words_data(b"one\n"),

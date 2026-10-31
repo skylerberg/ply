@@ -101,7 +101,7 @@ fn modules_in<[r]>(
           else { accumulator },
           Dir -> if is_skipped(l.name) || depth_left <= 0 { accumulator } else {
             let inner = fs.list_dir[r](joined(dir, path));
-            if own && holds_package(inner) { accumulator }
+            if own && contains_package(inner) { accumulator }
             else { modules_in[r](dir, path, inner, accumulator, depth_left - 1, own) }
           },
           Symlink -> accumulator,
@@ -111,7 +111,7 @@ fn modules_in<[r]>(
       }),
   }
 
-fn holds_package(listing: Option<List<Listed>>) -> Bool =
+fn contains_package(listing: Option<List<Listed>>) -> Bool =
   match listing {
     Some(files_below) -> files_below.any(|l: Listed| l.name == "ply.pkg"),
     None -> false,
@@ -145,7 +145,7 @@ fn package_at<[r]>(
 }
 
 fn sources_of(files: List<SourceFile>) -> List<Source> =
-  files.map(|f: SourceFile| { name: Bytes::of_string(f.name), src: f.text })
+  files.map(|f: SourceFile| { name: Bytes::of_string(f.name), source_text: f.text })
 
 fn supplied_of(package: Package) -> SuppliedPackage =
   {
@@ -603,7 +603,7 @@ pub fn report_viewed(
 
 fn texts_of(shipped_sources: List<Source>) -> Map<Bytes, Bytes> =
   shipped_sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, source: Source|
-    accumulator.insert(source.name, source.src))
+    accumulator.insert(source.name, source.source_text))
 
 pub type InMemoryAnalysis = { out: AnalysisOutcome, files: List<SourceFile> }
 
@@ -705,7 +705,7 @@ pub fn load<[r]>(
 
 pub effect set Derives = {shipped.names, shipped.module, shipped.digests, shipped.report_view_used, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
 
-type ReachedModule = { name: Bytes, text: Bytes }
+type DeriverModule = { name: Bytes, text: Bytes }
 
 pub fn derivation_result(
   ask: DeriverRequest,
@@ -730,7 +730,7 @@ pub fn derivation_result(
   }
 }
 
-fn deriver_key(module: Bytes, modules: List<ReachedModule>) -> Bytes / {Derives, abort.raise} =
+fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives, abort.raise} =
   blake3(
     Bytes::concat_all([
       blake3(shipped.definitions()),
@@ -739,19 +739,19 @@ fn deriver_key(module: Bytes, modules: List<ReachedModule>) -> Bytes / {Derives,
       module,
       b"\x00",
       Bytes::concat_all(
-        modules.map(|r: ReachedModule| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
+        modules.map(|r: DeriverModule| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
       ),
     ]),
   )
 
-fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<ReachedModule> / {abort.raise} =
+fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<DeriverModule> / {abort.raise} =
   iterate(
     { seen: [], frontier: [module] },
     own.len() + 1,
-    |walk: { seen: List<ReachedModule>, frontier: List<Bytes> }| {
-      let fresh = walk.frontier.fold([], |accumulator: List<ReachedModule>, name: Bytes|
+    |walk: { seen: List<DeriverModule>, frontier: List<Bytes> }| {
+      let fresh = walk.frontier.fold([], |accumulator: List<DeriverModule>, name: Bytes|
         match if is_shipped(name) { None } else { own.get(name) } {
-          Some(text) -> if walk.seen.concat(accumulator).any(|module: ReachedModule|
+          Some(text) -> if walk.seen.concat(accumulator).any(|module: DeriverModule|
               module.name == name) { accumulator }
           else { accumulator.push({ name: name, text: text }) },
           None -> accumulator,
@@ -759,7 +759,7 @@ fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<ReachedModule>
       if fresh.len() == 0 { Stop(walk) } else {
         Continue({
           seen: walk.seen.concat(fresh),
-          frontier: fresh.fold([], |accumulator: List<Bytes>, module: ReachedModule| {
+          frontier: fresh.fold([], |accumulator: List<Bytes>, module: DeriverModule| {
             let imports = match header(module.text) {
               Some(head) -> head.imports,
               None -> parse(module.text).node.imports,
@@ -788,7 +788,7 @@ fn diagnostic_line(d: Diagnostic) -> Bytes = Bytes::concat_all([d.code, b": ", d
 fn run_derivation(
   ask: DeriverRequest,
   deriver: Bytes,
-  modules: List<ReachedModule>,
+  modules: List<DeriverModule>,
 ) -> DerivationRun / {Derives, abort.raise} = {
   let name = derivation_name(modules);
   match deriver_library(ask.module, deriver, name, modules) {
@@ -806,9 +806,9 @@ fn run_derivation(
   }
 }
 
-fn derivation_name(modules: List<ReachedModule>) -> Bytes / {abort.raise} =
+fn derivation_name(modules: List<DeriverModule>) -> Bytes / {abort.raise} =
   iterate(b"derivation", modules.len() + 1, |n: Bytes|
-    if modules.any(|r: ReachedModule| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) })
+    if modules.any(|r: DeriverModule| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) })
 
 fn derived_root(name: Bytes) -> Bytes = name.concat(b".derived")
 
@@ -816,7 +816,7 @@ fn deriver_library(
   module: Bytes,
   deriver: Bytes,
   name: Bytes,
-  modules: List<ReachedModule>,
+  modules: List<DeriverModule>,
 ) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
   let library_record = "derivers/" ++ String::of_bytes(hex(deriver));
   match toolchain.read_file(library_record) {
@@ -833,9 +833,9 @@ fn compile_deriver(
   module: Bytes,
   library_record: String,
   name: Bytes,
-  modules: List<ReachedModule>,
+  modules: List<DeriverModule>,
 ) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
-  let files = modules.map(|r: ReachedModule|
+  let files = modules.map(|r: DeriverModule|
     {
       path: String::of_bytes(r.name) ++ ".ply",
       name: String::of_bytes(r.name),
@@ -1004,7 +1004,7 @@ test "a derivation request naming a declaration that is not a value returns noth
 
 test "`deriver_modules` returns the project's own modules that a deriver module imports, directly or through other modules, and no standard library modules" {
   let reach = |own: Map<Bytes, Bytes>, module: Bytes|
-    deriver_modules(module, own).map(|module: ReachedModule| module.name);
+    deriver_modules(module, own).map(|module: DeriverModule| module.name);
   assert_eq(reach(Map::new(), b"std.derive.map"), []);
   let own = Map::new().insert(
     b"app.deriver",

@@ -3,12 +3,12 @@ import std.internal.native (native, observed, found, parts, decode_int)
 import compiler.check.types (int_type, Type, VariableType, FunctionType, NamedType, Scheme,
                              type_text, decode_type, digits, string_type)
 import compiler.emit.output (Output, RootOutput, Tables, DefinitionSymbol, Prototype,
-                             ExpectedPrototype, CallAt, SharedFn, GenericAt, callee_name,
+                             ExpectedPrototype, CallAt, SharedFunction, GenericAt, callee_name,
                              word_prototype, no_generics, output_bin, tables_bin, root_output_bin,
                              no_tables, GenericCall, Generics, Need, ForwardedParameter, NeedKind,
                              Scalar, Layout, Exact, EffectsGeneric, needs_specialisation,
                              PublishedSignature, Keyed, KeyedTag, KeyedField, KeyedEntry,
-                             shared_fn_bin)
+                             shared_function_bin)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticFile, StaticWords, StaticWord,
                                        FieldWord, AddressWord, named_by_content, words_of,
                                        static_definition_bin)
@@ -69,7 +69,7 @@ import std.time (time)
 import compiler.syntax.parsing (no_module)
 import compiler.syntax.items (RequiresClause, EnsuresClause, spec_kind_text)
 import compiler.syntax.expressions (prelude_module)
-import compiler.emit.print.count_functions (identity_fn)
+import compiler.emit.print.count_functions (identity_function)
 
 pub effect shipped {
   read names() -> List<String>
@@ -187,7 +187,7 @@ fn call_params(c: MachineCall) -> List<Machine> =
     match v {
       MachineInt(_) -> accumulator.push(abi::I64),
       MachineFloat -> accumulator.push(abi::F64),
-      MachineText(_) -> accumulator.push(abi::Addr).push(abi::I64),
+      MachineText(_) -> accumulator.push(abi::Address).push(abi::I64),
       MachineSecret(_) -> accumulator.push(abi::Secret),
       MachineObject(_) -> accumulator.push(abi::Handle),
       MachineTypeVariable(_) -> accumulator.push(abi::Opaque).push(abi::Type),
@@ -286,7 +286,7 @@ fn agrees(assumed: PublishedSignature, now: Option<PublishedSignature>) -> Bool 
     None -> !assumed.borrowed.any(|l: Bool| l) && assumed.borrowed_from == None,
   }
 
-fn handing_text(h: PublishedSignature) -> Bytes / {abort.raise} =
+fn ownership_text(h: PublishedSignature) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"[",
     Bytes::join(h.borrowed.map(|l: Bool| if l { b"borrowed" } else { b"given" }), b", "),
@@ -324,10 +324,10 @@ fn signature_mismatch_error(wrong: List<SignatureMismatch>) -> Diagnostic / {abo
         b"` calls `",
         root_text(m.assumed.definition),
         b"` written ",
-        handing_text(m.assumed),
+        ownership_text(m.assumed),
         b", but the called function is declared ",
         match m.published {
-          Some(h) -> handing_text(h),
+          Some(h) -> ownership_text(h),
           None -> b"without argument information, so every argument is passed in the default way",
         },
       ])),
@@ -483,7 +483,7 @@ pub type Emission = {
   produced: UnitOutput,
   roots: List<RootKey>,
   cached: Int,
-  asked: Int,
+  emitter_requests: Int,
   unserved: List<RuntimeMismatch>,
   unbound: List<Unbound>,
   signature_mismatches: List<SignatureMismatch>,
@@ -986,7 +986,7 @@ fn fields_part(
   }
 }
 
-type BucketBody = { text: Bytes, statics: List<Bytes>, shared: List<SharedFn> }
+type BucketBody = { text: Bytes, statics: List<Bytes>, shared: List<SharedFunction> }
 
 type BodyHoles = { body: UnitBody, keys: List<Bytes> }
 
@@ -1050,7 +1050,7 @@ fn constants_defined(
       ),
   )
 
-fn reaches_of(name: RootName, tables: Tables) -> List<RootName> =
+fn reachable_names(name: RootName, tables: Tables) -> List<RootName> =
   sorted_unique_names(
     tables.calls.map(root_name).concat(if tables.members.len() == 0 { [name] }
     else { tables.members.map(root_name) }),
@@ -1113,9 +1113,12 @@ fn shared_functions_c(group: List<BucketBody>) -> Bytes =
   group.fold(
     { seen: Map::new(), out: [] },
     |accumulator: { seen: Map<Bytes, Bool>, out: List<Bytes> }, p: BucketBody|
-      p.shared.fold(accumulator, |a: { seen: Map<Bytes, Bool>, out: List<Bytes> }, f: SharedFn|
-        if a.seen.contains(f.symbol) { a }
-        else { { seen: a.seen.insert(f.symbol, true), out: a.out.push(f.text) } }),
+      p.shared.fold(
+        accumulator,
+        |a: { seen: Map<Bytes, Bool>, out: List<Bytes> }, f: SharedFunction|
+          if a.seen.contains(f.symbol) { a }
+          else { { seen: a.seen.insert(f.symbol, true), out: a.out.push(f.text) } },
+      ),
   ).out.fold(b"", |accumulator: Bytes, t: Bytes| accumulator.concat(t))
 
 fn placing(
@@ -1191,7 +1194,7 @@ fn part_written<| e>(
 ) -> { part: WrittenPart, records: List<Record> } / {abort.raise | e} = {
   let prototypes = sorted_unique_names(
     p.group.fold([], |accumulator: List<RootName>, m: BodyHoles|
-      accumulator.concat(reaches_of(m.body.name, m.body.tables))),
+      accumulator.concat(reachable_names(m.body.name, m.body.tables))),
   ).map(|name: RootName|
     match taken.get(name) { Some(t) -> prototype(t.symbol, t.prototype), None -> b"" });
   let called = p.group.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: BodyHoles|
@@ -1587,7 +1590,7 @@ fn modules_read(
   ).read
 }
 
-fn modules_asked(p: Program, ks: List<RootKey>) -> Map<Bytes, Bool> / {abort.raise} = {
+fn required_modules(p: Program, ks: List<RootKey>) -> Map<Bytes, Bool> / {abort.raise} = {
   let starts = ks.fold(
     modules_lowered(ks).insert(prelude_module(), true),
     |accumulator: Map<Bytes, Bool>, k: RootKey|
@@ -1807,7 +1810,7 @@ type CachedResult = {
 
 derive bin for CachedResult
 
-type Body = { text: Bytes, shared: List<SharedFn> }
+type Body = { text: Bytes, shared: List<SharedFunction> }
 
 derive bin for Body
 
@@ -2040,20 +2043,20 @@ fn emit_scoped(
   ownership: Map<RootName, OwnershipSignature>,
   done: KnownResults,
 ) -> EmitterReply<EmitterScope> / {abort.raise} = {
-  let needed = modules_asked(p, roots);
+  let needed = required_modules(p, roots);
   let covers = needed.fold(true, |all: Bool, m: Bytes, _: Bool| all && scope.covered.contains(m));
   let scoped = match scope.scope {
     Some(s) -> if covers { { scope: s, covered: scope.covered } } else {
       let pending = offered.filter(|k: RootKey|
         !done.before.contains(root_name(k)) && !done.now.contains(root_name(k)));
-      let covered = modules_asked(p, roots.concat(pending)).fold(
+      let covered = required_modules(p, roots.concat(pending)).fold(
         scope.covered,
         |accumulator: Map<Bytes, Bool>, m: Bytes, _: Bool| accumulator.insert(m, true),
       );
       { scope: scope_of_modules(dump, p, constructors, offered, covered), covered: covered }
     },
     None -> {
-      let covered = modules_asked(p, roots.concat(scope.expected_roots));
+      let covered = required_modules(p, roots.concat(scope.expected_roots));
       { scope: scope_of_modules(dump, p, constructors, offered, covered), covered: covered }
     },
   };
@@ -2298,7 +2301,7 @@ type EmissionProgress<s> = {
   published: Map<RootName, PublishedSignature>,
   ownership: Map<RootName, OwnershipSignature>,
   cached: Int,
-  asked: Int,
+  emitter_requests: Int,
   added: List<RootKey>,
   known: Map<Bytes, Bool>,
   needs: Map<RootName, List<Need>>,
@@ -2315,7 +2318,7 @@ pub type LevelTally = {
   place: Int,
   roots: Int,
   cached: Int,
-  asked: Int,
+  emitter_requests: Int,
   steps: Int,
   began: Int,
   ended: Int,
@@ -2350,7 +2353,7 @@ fn walk_levels<s | e>(
       published: Map::new(),
       ownership: Map::new(),
       cached: 0,
-      asked: 0,
+      emitter_requests: 0,
       added: [],
       known: cached.known,
       needs: Map::new(),
@@ -2400,7 +2403,7 @@ fn report_level<s | e>(
         place: l,
         roots: r.walk.keys.len() - w.keys.len(),
         cached: r.walk.cached - w.cached,
-        asked: r.walk.asked - w.asked,
+        emitter_requests: r.walk.emitter_requests - w.emitter_requests,
         steps: r.steps,
         began: began,
         ended: t.now(),
@@ -2501,7 +2504,7 @@ fn dependents_with(
 type AskProgress<s> = {
   emitted: Map<RootName, Output>,
   cached: Map<RootName, Output>,
-  asked: Int,
+  emitter_requests: Int,
   pending: List<RootKey>,
   emitter: s,
   found: Map<RootName, RootKey>,
@@ -2535,7 +2538,7 @@ fn with_results<s | e>(
     {
       emitted: Map::new(),
       cached: cached,
-      asked: 0,
+      emitter_requests: 0,
       pending: missed,
       emitter: w.emitter,
       found: Map::new(),
@@ -2561,7 +2564,7 @@ fn with_results<s | e>(
             m.insert(n, a)),
           cached: moved.fold(t.cached, |m: Map<RootName, Output>, k: RootKey|
             m.remove(root_name(k))),
-          asked: t.asked + requests.len() + found.len() - t.found.len(),
+          emitter_requests: t.emitter_requests + requests.len() + found.len() - t.found.len(),
           pending: [],
           emitter: got.state,
           found: found,
@@ -2628,7 +2631,7 @@ fn with_results<s | e>(
     ownership: merged_ownership(w.ownership, all),
     dependents: dependents_with(w.dependents, all),
     cached: w.cached + all.len() - body_names.len(),
-    asked: w.asked + resolved.asked,
+    emitter_requests: w.emitter_requests + resolved.emitter_requests,
     unstored_records: w.unstored_records.concat(r.records),
     known: r.known,
     unread: w.unread.concat(now),
@@ -2808,7 +2811,7 @@ pub fn emitted<| e>(
         produced: produced,
         roots: roots,
         cached: all.cached,
-        asked: all.asked,
+        emitter_requests: all.emitter_requests,
         unserved: runtime_mismatches(runtime),
         unbound: unbound(runtime.natives, called_externs(natives_called(produced.made), natives)),
         signature_mismatches: signature_mismatches(
@@ -2822,7 +2825,7 @@ pub fn emitted<| e>(
   }
 
 pub fn built(
-  modules: List<{ name: Bytes, src: Bytes }>,
+  modules: List<{ name: Bytes, source_text: Bytes }>,
 ) -> Result<Emission, Bytes> / {abort.raise} = {
   let dump = dump_of(analyse(parse_all(modules)));
   emitted(
@@ -2837,7 +2840,7 @@ pub fn built(
 }
 
 pub fn roots_built(
-  modules: List<{ name: Bytes, src: Bytes }>,
+  modules: List<{ name: Bytes, source_text: Bytes }>,
 ) -> Result<List<RootKey>, Bytes> / {abort.raise} =
   match built(modules) { Ok(e) -> Ok(e.roots), Err(reason) -> Err(reason) }
 
@@ -3582,7 +3585,7 @@ test "a call to mutually recursive generic functions at a type compiles to their
     b"fn go() -> Float = ping(1.5, 3)\n",
     b"fn back() -> String = pong(\"s\", 3)\n",
   ]);
-  let dump = dump_of(analyse(parse_all([{ name: b"m", src: source }])));
+  let dump = dump_of(analyse(parse_all([{ name: b"m", source_text: source }])));
   match emitted(
       a_runtime(b"r"),
       dump,
@@ -3716,7 +3719,7 @@ test "a unit compiles specialisations whose code is alike as one body, and each 
     b"fn one() -> Int = apply(|x: Int| x, 1)\n",
     b"fn two() -> Int = apply(|x: Int| x, 2)\n",
   ]);
-  match built([{ name: b"m", src: source }]) {
+  match built([{ name: b"m", source_text: source }]) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(e) -> {
       let specialisations = e.roots.filter(|k: RootKey|
@@ -4396,9 +4399,9 @@ fn three_modules_dump() -> Dump / {abort.raise} = {
   dump_of(
     analyse(
       parse_all([
-        { name: b"a", src: texts.get(0) },
-        { name: b"b", src: texts.get(1) },
-        { name: b"c", src: texts.get(2) },
+        { name: b"a", source_text: texts.get(0) },
+        { name: b"b", source_text: texts.get(1) },
+        { name: b"c", source_text: texts.get(2) },
       ]),
     ),
   )
@@ -4414,13 +4417,13 @@ test "a unit depends only on the modules that contain its roots and the modules 
   let p = over(b"b.g");
   assert_eq(p.digests.keys(), [b"b", b"c"]);
   let whole = program_of(dump, three_modules(), [Named(b"a.f")]);
-  assert_eq(modules_asked(whole, [Named(b"b.g")]).keys(), p.read.keys());
+  assert_eq(required_modules(whole, [Named(b"b.g")]).keys(), p.read.keys());
   let scope = scope_of_modules(
     dump,
     whole,
     [],
     [Named(b"b.g")],
-    modules_asked(whole, [Named(b"b.g")]),
+    required_modules(whole, [Named(b"b.g")]),
   );
   assert_eq(
     emit::root_outputs(scope, [Named(b"b.g")], Map::new()).map(|r: RootOutput| root_text(r.name)),
@@ -4430,21 +4433,21 @@ test "a unit depends only on the modules that contain its roots and the modules 
 
 test "a specialisation's scope includes the module declaring its type argument, even when the generic function's module does not import it" {
   let user = [
-    { name: b"s", src: b"pub type E = | A | B\n" },
+    { name: b"s", source_text: b"pub type E = | A | B\n" },
     {
       name: b"g",
-      src: b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
+      source_text: b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
     },
     {
       name: b"m",
-      src: b"import g\nimport s (E)\nfn pick(xs: List<E>) -> Option<E> = g::first(xs)\n",
+      source_text: b"import g\nimport s (E)\nfn pick(xs: List<E>) -> Option<E> = g::first(xs)\n",
     },
   ];
   let dump = dump_of(analyse(parse_all(user)));
   let p = program_of(dump, sources_in_order(dump, user), requested_roots(dump).keys);
   let at = specialisation_key(b"g.first", [NamedType({ name: b"s.E", args: [] })], []);
   assert_eq(modules_lowered([at]).keys(), [b"g"]);
-  let scoped_modules = modules_asked(p, [at]);
+  let scoped_modules = required_modules(p, [at]);
   assert(
     scoped_modules.contains(b"s") && scoped_modules.contains(b"g")
       && !scoped_modules.contains(b"m"),
@@ -4532,7 +4535,12 @@ fn program_declaring(cases: Bytes) -> Program / {abort.raise} = {
     b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
   ];
   let dump = dump_of(
-    analyse(parse_all([{ name: b"s", src: texts.get(0) }, { name: b"g", src: texts.get(1) }])),
+    analyse(
+      parse_all([
+        { name: b"s", source_text: texts.get(0) },
+        { name: b"g", source_text: texts.get(1) },
+      ]),
+    ),
   );
   program_of(dump, texts, requested_roots(dump).keys)
 }
@@ -4594,7 +4602,7 @@ test "a call that assumes a borrowing signature different from the callee's decl
   ]);
   let wrong = signature_mismatches(results, results.keys());
   assert_eq(wrong.map(|m: SignatureMismatch| m.caller), [definition_root(b"m.caller")]);
-  let dump = dump_of(analyse(parse_all([{ name: b"m", src: b"fn one() -> Int = 1\n" }])));
+  let dump = dump_of(analyse(parse_all([{ name: b"m", source_text: b"fn one() -> Int = 1\n" }])));
   let e = {
     produced: {
       parts: [],
@@ -4604,7 +4612,7 @@ test "a call that assumes a borrowing signature different from the callee's decl
     },
     roots: [],
     cached: 0,
-    asked: 0,
+    emitter_requests: 0,
     unserved: [],
     unbound: [],
     signature_mismatches: wrong,
@@ -4657,7 +4665,7 @@ test "compiling roots in several batches returns the same outputs as `emit::root
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules(), requested_roots(dump).keys);
   let missed = requested_roots(dump).keys;
-  let scope = scope_of_modules(dump, p, [], missed, modules_asked(p, missed));
+  let scope = scope_of_modules(dump, p, [], missed, required_modules(p, missed));
   let together = results_by_name(emit::root_outputs(scope, missed, Map::new()));
   assert(
     together.fold(false, |found: Bool, _: RootName, a: Output|
@@ -4683,7 +4691,7 @@ test "compiling roots in several batches returns the same outputs as `emit::root
     together.fold(true, |ok: Bool, n: RootName, a: Output| ok && walk.results.get(n) == Some(a)),
     None,
   );
-  assert_eq(walk.asked, walk.keys.len());
+  assert_eq(walk.emitter_requests, walk.keys.len());
   let places = module_levels(p);
   assert(
     p.imports.fold(true, |ok: Bool, m: Bytes, xs: List<Bytes>|
@@ -4700,14 +4708,14 @@ test "a build with an empty cache asks the emitter for each root exactly once, a
   let phases = {
     now: || 0,
     outcome: |t: LevelTally|
-      if t.asked == t.roots - t.cached { () } else {
+      if t.emitter_requests == t.roots - t.cached { () } else {
         panic(
           String::of_bytes_lossy(
             Bytes::concat_all([
               b"place ",
               ascii_of_int(t.place),
               b" asked ",
-              ascii_of_int(t.asked),
+              ascii_of_int(t.emitter_requests),
               b" of ",
               ascii_of_int(t.roots),
             ]),
@@ -4718,7 +4726,8 @@ test "a build with an empty cache asks the emitter for each root exactly once, a
   let texts = three_modules();
   let sources = sources_in_order(
     dump,
-    range(0, texts.len()).map(|i: Int| { name: [b"a", b"b", b"c"].get(i), src: texts.get(i) }),
+    range(0, texts.len()).map(|i: Int|
+      { name: [b"a", b"b", b"c"].get(i), source_text: texts.get(i) }),
   );
   match emitted(
       a_runtime(b"r"),
@@ -4738,8 +4747,8 @@ test "a build with an empty cache asks the emitter for each root exactly once, a
 fn unit_builder(
   source: Bytes,
 ) -> { unit: (List<RootKey>) -> Emission / {abort.raise} } / {abort.raise} = {
-  let user = [{ name: b"m", src: source }];
-  let shipped = [{ name: b"std.prelude", src: prelude_source::text() }];
+  let user = [{ name: b"m", source_text: source }];
+  let shipped = [{ name: b"std.prelude", source_text: prelude_source::text() }];
   let modules = user.concat(shipped);
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
   let runtime = { ..a_runtime(b"r"), natives: program_natives([]).map(declared_signature) };
@@ -4771,7 +4780,7 @@ test "no drop function is generated for lists of scalars, whose memory the runti
     b"fn held(w: U128) -> Int = [{ a: w, b: \"x\" }].len()\n",
     b"fn performed(n: Int) -> Float / {e.op} = e.op(n)\n",
   ]);
-  let dump = dump_of(analyse(parse_all([{ name: b"m", src: source }])));
+  let dump = dump_of(analyse(parse_all([{ name: b"m", source_text: source }])));
   let every = [b"m.ints", b"m.floats", b"m.decimals", b"m.wides", b"m.held", b"m.performed"];
   let produced = match emitted(
       a_runtime(b"r"),
@@ -4792,7 +4801,7 @@ test "no drop function is generated for lists of scalars, whose memory the runti
       !taken.contains(drop_at(t))),
     [],
   );
-  assert(unit_text(produced.parts).index_of(identity_fn()) != None, None);
+  assert(unit_text(produced.parts).index_of(identity_function()) != None, None);
   assert_eq(
     taken.filter(|n: Bytes|
       [b"Int", b"Float", b"Decimal", b"U128"].any(|t: Bytes|
@@ -4850,11 +4859,11 @@ test "an `extern fn` is reported unbound when no native matches it, two natives 
   let marshalling = |name: Bytes| { module: b"", name: name, words: 3, raises: false, call: None };
   let declared_fun = {
     name: b"?out_fun",
-    params: [abi::Opaque, abi::Addr, abi::I64],
+    params: [abi::Opaque, abi::Address, abi::I64],
     result: None,
     raises: false,
   };
-  let swapped = { ..declared_fun, params: [abi::Addr, abi::I64, abi::Opaque] };
+  let swapped = { ..declared_fun, params: [abi::Address, abi::I64, abi::Opaque] };
   assert_eq(unbound([declared_fun], [marshalling(b"?out_fun")]), []);
   assert_eq(unbound([swapped], [marshalling(b"?out_fun")]).map(unbound_line), [
     b"the compiler's `?out_fun` takes [Handed, Addr, I64], returns nothing and cannot raise, and the runtime's native takes [Addr, I64, Handed], returns nothing and cannot raise",
@@ -4863,8 +4872,8 @@ test "an `extern fn` is reported unbound when no native matches it, two natives 
 }
 
 fn unit_against_runtime(
-  user: List<{ name: Bytes, src: Bytes }>,
-  shipped: List<{ name: Bytes, src: Bytes }>,
+  user: List<{ name: Bytes, source_text: Bytes }>,
+  shipped: List<{ name: Bytes, source_text: Bytes }>,
   natives: List<Native>,
 ) -> Result<Bytes, List<Diagnostic>> / {abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
@@ -4884,11 +4893,11 @@ fn unit_against_runtime(
   match parts { Ok(ps) -> Ok(unit_text(ps)), Err(diagnostics) -> Err(diagnostics) }
 }
 
-fn sources_in_order(dump: Dump, modules: List<{ name: Bytes, src: Bytes }>) -> List<Bytes> = {
+fn sources_in_order(dump: Dump, modules: List<{ name: Bytes, source_text: Bytes }>) -> List<Bytes> = {
   let texts = modules.fold(
     Map::new().insert(prelude_module(), prelude_source::text()),
-    |accumulator: Map<Bytes, Bytes>, s: { name: Bytes, src: Bytes }|
-      accumulator.insert(s.name, s.src),
+    |accumulator: Map<Bytes, Bytes>, s: { name: Bytes, source_text: Bytes }|
+      accumulator.insert(s.name, s.source_text),
   );
   let indexed = dump.modules.fold(Map::new(), |accumulator: Map<Int, Bytes>, m: ModuleRow|
     accumulator.insert(m.index, match texts.get(m.name) { Some(t) -> t, None -> b"" }));
@@ -4903,17 +4912,17 @@ fn rejection_codes<a>(r: Result<a, List<Diagnostic>>) -> List<Bytes> =
         accumulator.push(d.code).concat(d.notes_text)),
   }
 
-fn first_said(emission: Result<Emission, Bytes>, dump: Dump) -> List<Bytes> / {abort.raise} =
+fn first_diagnostic(emission: Result<Emission, Bytes>, dump: Dump) -> List<Bytes> / {abort.raise} =
   match unit_parts(dump, emission) {
     Ok(_) -> [],
     Err(diagnostics) -> match diagnostics.at(0) { Some(d) -> [d.code, d.message], None -> [] },
   }
 
 test "a root the emitter returns no output for makes its unit fail with an internal error naming the root" {
-  let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
+  let user = [{ name: b"m", source_text: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(declared_signature) };
-  let diagnostic = first_said(
+  let diagnostic = first_diagnostic(
     emitted(
       runtime,
       dump,
@@ -4936,7 +4945,7 @@ test "each root a program requests has a key built from its kind, and the key's 
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"fn f(x: Int) -> Int requires x > 0 ensures result > 0 = x\n",
         b"fn none<a>() -> List<a> ensures result.len() == 0 = []\n",
         b"test \"t\" for n: Int in [1] { assert(n > 0) }\n",
@@ -4947,7 +4956,7 @@ test "each root a program requests has a key built from its kind, and the key's 
   ];
   let cases = {
     name: b"std.cases",
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"pub type Table<a> = List<a>\n",
       b"pub type Listed = { label: String, identity: Bytes }\n",
       b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} = table.map(|c: a| { label: label(c), identity: b\"\" })\n",
@@ -4982,7 +4991,7 @@ test "a constant that can fail with `abort.raise` still has a function-table ent
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn limit() -> Int / {abort.raise} = if 2 > 3 { abort.raise(\"never\") } else { 7 }\n",
         b"pub fn twice() -> Int / {abort.raise} = limit() + limit()\n",
       ]),
@@ -5018,7 +5027,7 @@ test "a test that performs the `sim` effect compiles, with the generated entry f
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"fn timed(n: Int) -> Int / {sim.read} = n + sim.seed() * 0\n",
         b"test \"timed\" { assert_eq(timed(1), 1) }\n",
       ]),
@@ -5043,7 +5052,7 @@ test "generated code that compares or hashes a value, or runs a test on it, comp
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub type Step<a | e> = () -> Option<a> / e\n",
         b"pub type Seq<a | e> = | Seq(Step<a | e>)\n",
         b"pub fn empty<a | e>() -> Seq<a | e> = {\n  let step: Step<a | e> = || None;\n  Seq(step)\n}\n",
@@ -5092,7 +5101,9 @@ test "generated code that compares or hashes a value, or runs a test on it, comp
 }
 
 test "a generic function's `ensures` clause is compiled once for each type the function is checked with" {
-  let user = [{ name: b"m", src: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" }];
+  let user = [
+    { name: b"m", source_text: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" },
+  ];
   let dump = dump_of(analyse(parse_all(user)));
   let clause = |definition: RootKey| Clause({ definition: definition, kind: Ensures, n: 0 });
   match emitted(
@@ -5118,11 +5129,13 @@ test "a generic function's `ensures` clause is compiled once for each type the f
 }
 
 test "a second build with a populated cache asks the code generator to build nothing, and still includes a generic function's `ensures` clause" {
-  let user = [{ name: b"m", src: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" }];
+  let user = [
+    { name: b"m", source_text: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" },
+  ];
   with_body_store(|| {
-    assert(unit_in_store(user).asked > 0, None);
+    assert(unit_in_store(user).emitter_requests > 0, None);
     let warm = unit_in_store(user);
-    assert_eq(warm.asked, 0);
+    assert_eq(warm.emitter_requests, 0);
     assert(
       warm.produced.taken.contains(
         root_name(Clause({ definition: claims_key(b"m.none", 1), kind: Ensures, n: 0 })),
@@ -5136,7 +5149,7 @@ test "a function named by a type's `key for` gets an entry function the runtime 
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub type Box = | Box(Int)\n",
         b"pub fn size(b: Box) -> Int = match b { Box(n) -> n }\n",
         b"key for Box by size\n",
@@ -5170,7 +5183,7 @@ test "only a generic definition whose calls resolve without extra type informati
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
         b"pub fn made<a>(make: () -> a) -> a = make()\n",
         b"pub fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
@@ -5219,12 +5232,12 @@ test "a function's entry function runs it under the runtime's own handler for ea
   let user = [
     {
       name: b"m",
-      src: b"import std.fact (fact)\npub fn asked() -> Int / {fact.get} = fact.get()\npub fn plain() -> Int = 1\npub fn shifted(n: Int, s: String) -> Int / {fact.get} = fact.get() + n + s.len()\n",
+      source_text: b"import std.fact (fact)\npub fn asked() -> Int / {fact.get} = fact.get()\npub fn plain() -> Int = 1\npub fn shifted(n: Int, s: String) -> Int / {fact.get} = fact.get() + n + s.len()\n",
     },
   ];
   let fact = {
     name: b"std.fact",
-    src: b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / e = handle { go() } with { fact.get() -> 7 }\n",
+    source_text: b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / e = handle { go() } with { fact.get() -> 7 }\n",
   };
   let dump = dump_of(analyse_pulling_std_with(user, [fact], no_rows()).out);
   assert_eq(
@@ -5263,7 +5276,7 @@ test "a function that performs `task` runs under the scheduler and the runtime's
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn yielded() -> Int / {task.write} = {\n  task.yield();\n  1\n}\npub fn plain() -> Int = 1\n",
         b"pub fn timed() -> Int / {task.write, clock.read} = {\n  task.yield();\n  match clock.now() { Instant(n) -> n }\n}\n",
       ]),
@@ -5283,7 +5296,7 @@ test "a function that performs `task` runs under the scheduler and the runtime's
   ];
   let scheduler = {
     name: b"std.internal.schedule",
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"pub fn scheduled<a | e>(body: keep () -> a / {task.write | e}) -> a / {abort.raise | e} =\n",
       b"  handle { body() } with {\n",
       Bytes::concat_all(
@@ -5329,7 +5342,7 @@ test "a function's entry function passes it the runtime's handler for each effec
   let user = [
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"import std.time (time)\n",
         b"effect ask {\n  read get() -> Int\n}\n",
         b"pub fn main() -> Int / {ask.read, time.read, clock.read, abort.raise} = {\n",
@@ -5339,7 +5352,10 @@ test "a function's entry function passes it the runtime's handler for each effec
       ]),
     },
   ];
-  let time = { name: b"std.time", src: b"pub nondet effect time {\n  read now() -> Int\n}\n" };
+  let time = {
+    name: b"std.time",
+    source_text: b"pub nondet effect time {\n  read now() -> Int\n}\n",
+  };
   let dump = dump_of(analyse_pulling_std_with(user, [time], no_rows()).out);
   match emitted(
       a_runtime(b"r"),
@@ -5364,11 +5380,14 @@ test "a function's entry function passes it the runtime's handler for each effec
 
 test "a simulation passes the scheduler a handler for each effect it needs, including effects the simulation's own effect list does not name" {
   let user = [
-    { name: b"m", src: b"pub fn main() -> Int / {abort.raise, sim.read} = simulate { 1 }\n" },
+    {
+      name: b"m",
+      source_text: b"pub fn main() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
+    },
   ];
   let scheduler = {
     name: b"std.internal.schedule",
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"import std.internal.native (native)\n",
       b"extern fn seed_path() -> Bytes / {native.read}\n",
       b"pub fn simulated<a | e>(root: Int, start: Int, end: Int, body: keep () -> a / {task.write, clock.read, clock.write, random.write, sim.read | e}) -> a / {abort.raise, native.read | e} = {\n",
@@ -5377,7 +5396,7 @@ test "a simulation passes the scheduler a handler for each effect it needs, incl
       b"}\n",
     ]),
   };
-  let native = { name: b"std.internal.native", src: b"pub nondet effect native {}\n" };
+  let native = { name: b"std.internal.native", source_text: b"pub nondet effect native {}\n" };
   let dump = dump_of(analyse_pulling_std_with(user, [scheduler, native], no_rows()).out);
   assert_eq(
     dump.diagnostics.filter(|d: Diagnostic| d.severity == b"error").map(|d: Diagnostic| d.message),
@@ -5401,12 +5420,12 @@ test "a host handler waits for the result of each operation whose clause perform
   let user = [
     {
       name: b"m",
-      src: b"import std.fact (fact)\npub fn asked() -> Int / {fact.slow, fact.fast, fact.behind} = fact.slow() + fact.fast() + fact.behind()\n",
+      source_text: b"import std.fact (fact)\npub fn asked() -> Int / {fact.slow, fact.fast, fact.behind} = fact.slow() + fact.fast() + fact.behind()\n",
     },
   ];
   let fact = {
     name: b"std.fact",
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"import std.internal.native (native, wait, job_wait)\n",
       b"pub effect fact {\n  read slow() -> Int\n  read fast() -> Int\n  read behind() -> Int\n}\n",
       b"host for fact by served\n",
@@ -5417,7 +5436,7 @@ test "a host handler waits for the result of each operation whose clause perform
   };
   let native = {
     name: b"std.internal.native",
-    src: b"pub nondet effect native {}\npub nondet effect wait {}\npub extern fn job_wait(ticket: Int) -> Bytes / {native.read, wait.read}\n",
+    source_text: b"pub nondet effect native {}\npub nondet effect wait {}\npub extern fn job_wait(ticket: Int) -> Bytes / {native.read, wait.read}\n",
   };
   let dump = dump_of(analyse_pulling_std_with(user, [fact, native], no_rows()).out);
   assert_eq(
@@ -5434,12 +5453,12 @@ test "a test's entry function runs it under the runtime's handler for each effec
   let user = [
     {
       name: b"m",
-      src: b"import std.fact (fact)\ntest \"asks\" {\n  fact.put[cell](1);\n  assert(fact.get() == 7)\n}\n",
+      source_text: b"import std.fact (fact)\ntest \"asks\" {\n  fact.put[cell](1);\n  assert(fact.get() == 7)\n}\n",
     },
   ];
   let fact = {
     name: b"std.fact",
-    src: b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
+    source_text: b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
   };
   let dump = dump_of(analyse_pulling_std_with(user, [fact], no_rows()).out);
   match emitted(
@@ -5466,7 +5485,7 @@ test "an `ensures` clause about a function that a definition returns gets no ent
   let user = [
     {
       name: b"m",
-      src: b"pub fn adder(n: Int) -> (Int) -> Int ensures result(1) == n + 1 = |x: Int| x + n\n",
+      source_text: b"pub fn adder(n: Int) -> (Int) -> Int ensures result(1) == n + 1 = |x: Int| x + n\n",
     },
   ];
   let dump = dump_of(analyse(parse_all(user)));
@@ -5476,7 +5495,7 @@ test "an `ensures` clause about a function that a definition returns gets no ent
 }
 
 test "a build fails with an internal error when asked to compile a definition that the analysis output has no typed record for" {
-  let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
+  let user = [{ name: b"m", source_text: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let whole = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   let dump = {
     ..whole,
@@ -5496,7 +5515,7 @@ test "a build fails with an internal error when asked to compile a definition th
       |_: List<Record>| (),
     );
   [offers.keys, []].fold((), |_: Unit, offered: List<RootKey>| {
-    let diagnostic = first_said(made(offered), dump);
+    let diagnostic = first_diagnostic(made(offered), dump);
     assert_eq(diagnostic.at(0), Some(b"E0505"));
     assert(
       diagnostic.any(|n: Bytes| n.index_of(b"offered `m.one` with no typed effects") != None),
@@ -5506,14 +5525,14 @@ test "a build fails with an internal error when asked to compile a definition th
 }
 
 test "a build reports how many definitions it requested at each dependency level, in level order, as that level finishes" {
-  let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
+  let user = [{ name: b"m", source_text: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   with_body_store(|| {
     let record_level = |r: LevelTally|
       body_store.put([
         {
           key: ascii_of_int(r.place),
-          bytes: Bytes::concat_all(range(0, r.asked).map(|_: Int| b"x")),
+          bytes: Bytes::concat_all(range(0, r.emitter_requests).map(|_: Int| b"x")),
         },
         {
           key: b"told",
@@ -5546,7 +5565,7 @@ test "a build reports how many definitions it requested at each dependency level
         assert_eq(
           order.fold(0, |n: Int, l: Int|
             n + (match body_store.get(ascii_of_int(l)) { Some(v) -> v.len(), None -> 0 })),
-          e.asked,
+          e.emitter_requests,
         )
       },
     }
@@ -5557,7 +5576,7 @@ test "a unit is rejected where the runtime does not implement a native it calls 
   let program = [
     {
       name: b"m",
-      src: b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\nfn plus<a>(x: a, y: a) -> a where numeric(a) = x + y\n",
+      source_text: b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\nfn plus<a>(x: a, y: a) -> a where numeric(a) = x + y\n",
     },
   ];
   let implemented = declared_natives().map(declared_signature);
@@ -5609,7 +5628,7 @@ test "a unit whose bodies define their own `extern fn` declarations does not req
     0,
   );
   let calls = b"\npub fn pushed(xs: List<Int>) -> List<Int> = ListNode::tail_push(xs, 1)\npub fn emptied(m: Map<Int, Int>) -> Map<Int, Int> = MapNode::map_swap(m, None, 0, 0).map\n";
-  let program = [{ name: b"std.prelude", src: prelude_source::text().concat(calls) }];
+  let program = [{ name: b"std.prelude", source_text: prelude_source::text().concat(calls) }];
   match unit_against_runtime(program, [], implemented) {
     Ok(c) -> {
       let helper_calls = intrinsics().map(|i: { name: Bytes, op: Intrinsic }|
@@ -5621,7 +5640,7 @@ test "a unit whose bodies define their own `extern fn` declarations does not req
 }
 
 test "a unit is rejected when the runtime's helper functions or data layout differ from what the compiler declares" {
-  let user = [{ name: b"m", src: b"fn one() -> Int = 1\n" }];
+  let user = [{ name: b"m", source_text: b"fn one() -> Int = 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   let every = requested_roots(dump).keys;
   let over = |runtime: Runtime|
@@ -5737,7 +5756,7 @@ test "the runtime functions listed for a compiled definition are exactly the `bu
   let scanned = |k: UnitBody|
     k.tables.shared.fold(
       pointers_named(k.text, b"builtin_", Map::new()),
-      |m: Map<Bytes, Bool>, f: SharedFn| pointers_named(f.text, b"builtin_", m),
+      |m: Map<Bytes, Bool>, f: SharedFunction| pointers_named(f.text, b"builtin_", m),
     ).keys(
     );
   assert_eq(
@@ -5815,7 +5834,7 @@ test "specialisations of a recursive function that differ only in their names co
     b"fn one() -> Int = sum(|x: Int| x, 3)\n",
     b"fn two() -> Int = sum(|x: Int| x, 4)\n",
   ]);
-  match built([{ name: b"m", src: source }]) {
+  match built([{ name: b"m", source_text: source }]) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(e) -> {
       let specialisations = e.roots.filter(|k: RootKey|
@@ -5856,13 +5875,13 @@ test "a unit is rejected when the runtime implements a shipped module's `extern 
   let native = [
     {
       name: b"std.native",
-      src: b"pub extern fn counted(x: Int) -> Int\npub extern fn named(id: Int) -> String\n",
+      source_text: b"pub extern fn counted(x: Int) -> Int\npub extern fn named(id: Int) -> String\n",
     },
   ];
   let program = [
     {
       name: b"m",
-      src: b"import std.native (counted, named)\nfn f() -> Int = counted(1)\nfn g() -> String = named(7)\n",
+      source_text: b"import std.native (counted, named)\nfn f() -> Int = counted(1)\nfn g() -> String = named(7)\n",
     },
   ];
   let count_line = |params: List<Machine>|
@@ -5907,18 +5926,18 @@ test "a build declares a standard library `extern fn` with the runtime's low-lev
   let native = [
     {
       name: b"std.native",
-      src: b"pub extern fn named(id: Int, sep: String) -> String\npub extern fn told(on: Bool, x: Float, c: Char, w: U8) -> Char\npub extern fn noted(b: Bytes) -> Unit\n",
+      source_text: b"pub extern fn named(id: Int, sep: String) -> String\npub extern fn told(on: Bool, x: Float, c: Char, w: U8) -> Char\npub extern fn noted(b: Bytes) -> Unit\n",
     },
   ];
   let program = [
     {
       name: b"m",
-      src: b"import std.native (named, told, noted)\nfn g() -> String = named(7, \"-\")\nfn h() -> Char = told(true, 1.5, 'a', 3u8)\nfn k() -> Unit = noted(b\"x\")\n",
+      source_text: b"import std.native (named, told, noted)\nfn g() -> String = named(7, \"-\")\nfn h() -> Char = told(true, 1.5, 'a', 3u8)\nfn k() -> Unit = noted(b\"x\")\n",
     },
   ];
   let named = {
     name: b"named",
-    params: [abi::I64, abi::Addr, abi::I64],
+    params: [abi::I64, abi::Address, abi::I64],
     result: Some(abi::Taken),
     raises: false,
   };
@@ -5928,7 +5947,7 @@ test "a build declares a standard library `extern fn` with the runtime's low-lev
     result: Some(abi::I64),
     raises: false,
   };
-  let noted = { name: b"noted", params: [abi::Addr, abi::I64], result: None, raises: false };
+  let noted = { name: b"noted", params: [abi::Address, abi::I64], result: None, raises: false };
   match unit_against_runtime(
       program,
       native,
@@ -5966,11 +5985,13 @@ test "a build declares a standard library `extern fn` with the runtime's low-lev
 }
 
 test "a method of a type that a module calls without importing is compiled from the module that defines it, and that module is passed to the code generator" {
-  let user = [{ name: b"m", src: b"fn first(xs: List<Int>) -> Int / {abort.raise} = xs.get(0)\n" }];
+  let user = [
+    { name: b"m", source_text: b"fn first(xs: List<Int>) -> Int / {abort.raise} = xs.get(0)\n" },
+  ];
   let shipped = [
     {
       name: b"std.list",
-      src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+      source_text: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
     },
   ];
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
@@ -5981,7 +6002,7 @@ test "a method of a type that a module calls without importing is compiled from 
     match ((places.get(b"m"), places.get(b"std.list"))) { (Some(a), Some(b)) -> a > b, _ -> false },
     None,
   );
-  let modules = modules_asked(p, [root]);
+  let modules = required_modules(p, [root]);
   assert(modules.contains(b"std.list"), None);
   assert_eq(
     emit::root_outputs(scope_of_modules(dump, p, [], [root], modules), [root], Map::new()).map(
@@ -5995,16 +6016,16 @@ test "a module's analysis record lists the standard library modules it uses with
   let user = [
     {
       name: b"m",
-      src: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
+      source_text: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
     },
-    { name: b"n", src: b"import m\npub fn one() -> Int = 1\n" },
+    { name: b"n", source_text: b"import m\npub fn one() -> Int = 1\n" },
   ];
   let shipped = [
     {
       name: b"std.list",
-      src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+      source_text: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
     },
-    { name: b"std.internal.schedule", src: b"pub fn idle() -> Int = 0\n" },
+    { name: b"std.internal.schedule", source_text: b"pub fn idle() -> Int = 0\n" },
   ];
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
   let unimported = |module: Bytes|
@@ -6019,7 +6040,7 @@ test "a `law` whose body uses a type variable that the checker treats as unknown
   let user = [
     {
       name: b"m",
-      src: b"fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n",
+      source_text: b"fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n",
     },
   ];
   let dump = dump_of(analyse(parse_all(user)));
@@ -6027,7 +6048,7 @@ test "a `law` whose body uses a type variable that the checker treats as unknown
   let p = program_of(dump, sources_in_order(dump, user), [root]);
   assert_eq(
     emit::root_outputs(
-      scope_of_modules(dump, p, [], [root], modules_asked(p, [root])),
+      scope_of_modules(dump, p, [], [root], required_modules(p, [root])),
       [root],
       Map::new(),
     ).map(|r: RootOutput| root_text(r.name)),
@@ -6042,7 +6063,7 @@ test "a build asks the code generator for a definition that a cached compiled fu
     let unit = |source: Bytes|
       match emitted(
           runtime,
-          dump_of(analyse(parse_all([{ name: b"m", src: source }]))),
+          dump_of(analyse(parse_all([{ name: b"m", source_text: source }]))),
           [source],
           Map::new(),
           [b"m.each", b"m.total", b"m.scaled"].map(Named),
@@ -6105,7 +6126,7 @@ fn with_body_store<a | e>(
   }
 
 fn unit_in_file_store<[r]>(
-  user: List<{ name: Bytes, src: Bytes }>,
+  user: List<{ name: Bytes, source_text: Bytes }>,
   report_level: keep (LevelTally) -> Unit / {abort.raise},
 ) -> Emission / {fs.read[r], fs.write[r], abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
@@ -6127,7 +6148,7 @@ fn unit_in_file_store<[r]>(
 
 fn unit_on_tree(
   tree: fs::MemFs,
-  user: List<{ name: Bytes, src: Bytes }>,
+  user: List<{ name: Bytes, source_text: Bytes }>,
 ) -> fs::MemResult<Emission> / {abort.raise} =
   fs::on_mem[abs](tree, || unit_in_file_store[abs](user, ignore_tally))
 
@@ -6146,19 +6167,19 @@ fn store_bytes(tree: fs::MemFs) -> Int / {abort.raise} =
 
 fn ignore_tally(_: LevelTally) -> Unit = ()
 
-fn sample_program() -> List<{ name: Bytes, src: Bytes }> =
+fn sample_program() -> List<{ name: Bytes, source_text: Bytes }> =
   [
     {
       name: b"m",
-      src: b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\nfn pair<a>(x: a) -> List<a> = [x, x]\nfn twice(n: Int) -> Int = pair(n).len() + pair(\"s\").len()\n",
+      source_text: b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\nfn pair<a>(x: a) -> List<a> = [x, x]\nfn twice(n: Int) -> Int = pair(n).len() + pair(\"s\").len()\n",
     },
   ]
 
 test "a run over a store an earlier run filled reads every result back and writes nothing" {
   let first = unit_on_tree(fs::mem_of([]), sample_program());
-  assert(first.value.asked > 0, None);
+  assert(first.value.emitter_requests > 0, None);
   let second = unit_on_tree(first.tree, sample_program());
-  assert_eq(second.value.asked, 0);
+  assert_eq(second.value.emitter_requests, 0);
   assert_eq(second.value.produced.taken, first.value.produced.taken);
   assert_eq(store_files(second.tree), store_files(first.tree))
 }
@@ -6175,17 +6196,17 @@ test "a run that dies caches the results of every call the emitter finished" {
     });
   assert(died.value, None);
   let next = unit_on_tree(died.tree, sample_program());
-  assert(next.value.cached > 0 && next.value.asked < whole.value.asked, None);
+  assert(next.value.cached > 0 && next.value.emitter_requests < whole.value.emitter_requests, None);
   assert_eq(next.value.produced.taken, whole.value.produced.taken)
 }
 
 test "a build writes to the cache only the results it computed itself, however many results the cache already has" {
   let first = unit_on_tree(fs::mem_of([]), sample_program());
   let grown = |more: Bytes| {
-    let user = sample_program().map(|m: { name: Bytes, src: Bytes }|
-      { ..m, src: m.src.concat(more) });
+    let user = sample_program().map(|m: { name: Bytes, source_text: Bytes }|
+      { ..m, source_text: m.source_text.concat(more) });
     let next = unit_on_tree(first.tree, user);
-    { asked: next.value.asked, wrote: store_bytes(next.tree) - store_bytes(first.tree) }
+    { asked: next.value.emitter_requests, wrote: store_bytes(next.tree) - store_bytes(first.tree) }
   };
   let one = grown(b"fn aside() -> Int = 7\n");
   let two = grown(b"fn aside() -> Int = 7\nfn beside() -> Int = 8\n");
@@ -6203,7 +6224,7 @@ test "a build skips a cache file that cannot be read and asks the code generator
       if f.name.starts_with("seg-") { fs::mem_write(t, "s/" ++ f.name, b"").fs } else { t },
   );
   let again = unit_on_tree(cut, sample_program());
-  assert_eq(again.value.asked, first.value.asked);
+  assert_eq(again.value.emitter_requests, first.value.emitter_requests);
   assert_eq(again.value.produced.taken, first.value.produced.taken)
 }
 
@@ -6378,7 +6399,7 @@ test "reading a definition that has no parameters computes its value once and ca
   let read_with = |keep: Bytes|
     text.index_of(Bytes::concat_all([b", (Word)(intptr_t)", keep, b")"])) != None;
   assert(text.index_of(b"rt_memo_p(ctx, ") != None, None);
-  assert(read_with(identity_fn()), None);
+  assert(read_with(identity_function()), None);
   assert(read_with(symbol_of(printed(root_of(keys::Keep, string_type())))), None);
 }
 
@@ -6396,7 +6417,7 @@ test "a call to a `const fn` is evaluated once and adds nothing to the step coun
 }
 
 fn unit_in_store(
-  user: List<{ name: Bytes, src: Bytes }>,
+  user: List<{ name: Bytes, source_text: Bytes }>,
 ) -> Emission / {body_store.get, body_store.put, abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   match emitted(
@@ -6423,11 +6444,11 @@ fn unit_in_store(
   }
 }
 
-fn nested_records(d: Int) -> List<{ name: Bytes, src: Bytes }> =
+fn nested_records(d: Int) -> List<{ name: Bytes, source_text: Bytes }> =
   [
     {
       name: b"m",
-      src: Bytes::concat_all(
+      source_text: Bytes::concat_all(
         range(1, d + 1).fold(
           [b"type T0 = { s: String }\n"],
           |accumulator: List<Bytes>, k: Int| {
@@ -6463,10 +6484,10 @@ test "a build's number of dependency levels does not grow with how deeply record
   )
 }
 
-type CountingEmitter = { scoped: EmitterScope, built: Int, asked: List<RootName> }
+type CountingEmitter = { scoped: EmitterScope, built: Int, requested_roots: List<RootName> }
 
 fn walk_in_store(
-  user: List<{ name: Bytes, src: Bytes }>,
+  user: List<{ name: Bytes, source_text: Bytes }>,
 ) -> { walk: EmissionProgress<CountingEmitter>, program: Program, dump: Dump } / {body_store.get, body_store.put, abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   let offered = requested_roots(dump).keys;
@@ -6481,7 +6502,7 @@ fn walk_in_store(
     |k: Bytes| body_store.get(k),
     |rs: List<Record>| body_store.put(rs),
     None,
-    |ahead: List<RootKey>| { scoped: initial_emitter_scope(ahead), built: 0, asked: [] },
+    |ahead: List<RootKey>| { scoped: initial_emitter_scope(ahead), built: 0, requested_roots: [] },
     |emitter: CountingEmitter, roots: List<RootKey>, signatures: Map<RootName, OwnershipSignature>, done: KnownResults| {
       let a = emit_scoped(dump, p, constructors, offered, emitter.scoped, roots, signatures, done);
       let grew = match emitter.scoped.scope {
@@ -6492,7 +6513,9 @@ fn walk_in_store(
         state: {
           scoped: a.state,
           built: if grew { emitter.built + 1 } else { emitter.built },
-          asked: emitter.asked.concat(roots.map(root_name)).concat(a.found.map(root_name)),
+          requested_roots: emitter.requested_roots.concat(roots.map(root_name)).concat(
+            a.found.map(root_name),
+          ),
         },
         results: a.results,
         found: a.found,
@@ -6508,20 +6531,23 @@ test "a build with an empty cache asks the code generator for each definition on
     let cold = walked_cold.walk;
     assert_eq(cold.emitter.built, 1);
     assert_eq(cold.emitter.scoped.covered.keys(), walked_cold.program.read.keys());
-    assert(cold.emitter.asked.len() > 0, None);
-    assert_eq(sorted_unique_names(cold.emitter.asked).len(), cold.emitter.asked.len());
-    assert_eq(cold.asked, cold.emitter.asked.len());
+    assert(cold.emitter.requested_roots.len() > 0, None);
+    assert_eq(
+      sorted_unique_names(cold.emitter.requested_roots).len(),
+      cold.emitter.requested_roots.len(),
+    );
+    assert_eq(cold.emitter_requests, cold.emitter.requested_roots.len());
     let warm = walk_in_store(sample_program()).walk;
-    assert_eq((warm.emitter.built, warm.emitter.asked), (0, []));
+    assert_eq((warm.emitter.built, warm.emitter.requested_roots), (0, []));
     assert_eq(warm.results.keys(), cold.results.keys())
   })
 }
 
-fn parted_program(applied: Bytes, added: Bytes) -> List<{ name: Bytes, src: Bytes }> =
+fn parted_program(applied: Bytes, added: Bytes) -> List<{ name: Bytes, source_text: Bytes }> =
   [
     {
       name: b"g",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn apply<a>(f: (a) -> a, x: a) -> a = ",
         applied,
         b"\n",
@@ -6531,7 +6557,7 @@ fn parted_program(applied: Bytes, added: Bytes) -> List<{ name: Bytes, src: Byte
     },
     {
       name: b"k",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"import g\n",
         b"pub type Box = { v: Int, w: List<Int> }\n",
         b"pub fn both<a>(x: a) -> Bool = g::same(x, x)\n",
@@ -6540,8 +6566,11 @@ fn parted_program(applied: Bytes, added: Bytes) -> List<{ name: Bytes, src: Byte
         b"pub fn top(xs: List<Box>) -> Int = match g::first(xs) { Some(b) -> b.v + b.w.len(), None -> 0 }\n",
       ]),
     },
-    { name: b"d", src: Bytes::concat_all([b"pub fn bump(x: Int) -> Int = x + ", added, b"\n"]) },
-    { name: b"e", src: b"import d\npub fn h(x: Int) -> Int = d::bump(x) - 1\n" },
+    {
+      name: b"d",
+      source_text: Bytes::concat_all([b"pub fn bump(x: Int) -> Int = x + ", added, b"\n"]),
+    },
+    { name: b"e", source_text: b"import d\npub fn h(x: Int) -> Int = d::bump(x) - 1\n" },
   ]
 
 test "a rebuild with a cache reads only the modules needed by the definitions that changed, and none of the unrelated modules" {
@@ -6552,7 +6581,10 @@ test "a rebuild with a cache reads only the modules needed by the definitions th
     let read = program_of(warm.dump, warm.program.sources, missed).read.keys();
     assert(!read.contains(b"g") && !read.contains(b"k"), None);
     let emitter = warm.walk.emitter;
-    assert_eq(sorted_unique_names(emitter.asked), sorted_unique_names(missed.map(root_name)));
+    assert_eq(
+      sorted_unique_names(emitter.requested_roots),
+      sorted_unique_names(missed.map(root_name)),
+    );
     assert_eq(emitter.scoped.covered.keys(), read);
     assert_eq(emitter.built, 1)
   })
@@ -6564,7 +6596,7 @@ test "when a cached function calls a definition that must be rebuilt, the build 
     let edited = parted_program(b"f(f(x))", b"1");
     let warm = walk_in_store(edited);
     let scoped = warm.walk.emitter.scoped;
-    assert(!modules_asked(warm.program, scoped.expected_roots).contains(b"k"), None);
+    assert(!required_modules(warm.program, scoped.expected_roots).contains(b"k"), None);
     assert(scoped.covered.contains(b"k"), None);
     assert_eq(warm.walk.emitter.built, 2);
     let cold = with_body_store(|| walk_in_store(edited)).walk;
@@ -6580,7 +6612,7 @@ test "a rebuild from a cache writes the same C as a build with an empty cache, b
   let edited = parted_program(b"f(f(x))", b"2");
   let warm = unit_on_tree(first.tree, edited).value;
   let cold = unit_on_tree(fs::mem_of([]), edited).value;
-  assert(warm.cached > 0 && warm.asked < cold.asked, None);
+  assert(warm.cached > 0 && warm.emitter_requests < cold.emitter_requests, None);
   assert_eq(
     sorted_unique_names(warm.roots.map(root_name)),
     sorted_unique_names(cold.roots.map(root_name)),
@@ -6589,7 +6621,7 @@ test "a rebuild from a cache writes the same C as a build with an empty cache, b
 }
 
 fn emit_unit<[r]>(
-  user: List<{ name: Bytes, src: Bytes }>,
+  user: List<{ name: Bytes, source_text: Bytes }>,
   bodies: Bool,
 ) -> Emission / {fs.read[r], fs.write[r], abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);

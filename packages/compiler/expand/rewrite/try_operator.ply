@@ -12,10 +12,10 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, TryBlockExpression, Statement, LetStatement,
                                     LetElseStatement, ExpressionStatement, AssignmentStatement,
-                                    HandlerVar, NamedArg, MatchArm, HandleClause, ReturnClause,
-                                    RecordLiteralField, expression_span, TaggedLiteralExpression,
-                                    Hole, with_hole_values, exit_effect, is_exit_effect,
-                                    exit_operation_name)
+                                    HandlerStateVariable, NamedArg, MatchArm, HandleClause,
+                                    ReturnClause, RecordLiteralField, expression_span,
+                                    TaggedLiteralExpression, Hole, with_hole_values, exit_effect,
+                                    is_exit_effect, exit_operation_name)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternConstructor,
                                  LiteralUnit)
 import std.bytes (ascii_of_int)
@@ -134,10 +134,11 @@ fn fresh_binder(state: TryState, span: Span) -> { state: TryState, binder: Ident
     binder: { name: b"?".concat(Bytes::of_string(state.fresh.to_string())), span: made_at(span) },
   }
 
-pub fn var_of(name: Identifier) -> Expression =
+pub fn name_expression_of(name: Identifier) -> Expression =
   NameExpression({ span: name.span, name: bare(name) })
 
-pub fn var_pattern(name: Identifier) -> Pattern = PatternVariable({ span: name.span, name: name })
+pub fn variable_pattern(name: Identifier) -> Pattern =
+  PatternVariable({ span: name.span, name: name })
 
 pub fn constructor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
   PatternConstructor({
@@ -154,7 +155,7 @@ fn exit_raise(exit: Bytes, span: Span, value: Expression) -> Expression = {
   PerformExpression({
     span: at,
     effect_name: bare({ name: exit, span: at }),
-    op: { name: exit_operation_name(), span: at },
+    operation: { name: exit_operation_name(), span: at },
     resource: None,
     args: [value],
   })
@@ -174,14 +175,18 @@ fn try_match(
   match mode {
     TryResult -> {
       let fresh = fresh_binder(state, span);
-      let fail_pattern = constructor_pattern(err_constructor(), [var_pattern(fresh.binder)], span);
+      let fail_pattern = constructor_pattern(
+        err_constructor(),
+        [variable_pattern(fresh.binder)],
+        span,
+      );
       let fail_body = match state.exit {
-        Some(exit) -> exit_raise(exit, span, var_of(fresh.binder)),
+        Some(exit) -> exit_raise(exit, span, name_expression_of(fresh.binder)),
         None ->
           CallExpression({
             span: made_at(span),
-            function: var_of({ name: err_constructor(), span: failure_span(span) }),
-            args: [var_of(fresh.binder)],
+            function: name_expression_of({ name: err_constructor(), span: failure_span(span) }),
+            args: [name_expression_of(fresh.binder)],
             named: [],
             labels: [],
           }),
@@ -212,7 +217,7 @@ fn try_match(
             span,
             LiteralExpression({ span: failure_span(span), literal: LiteralUnit }),
           ),
-        None -> var_of({ name: none_constructor(), span: failure_span(span) }),
+        None -> name_expression_of({ name: none_constructor(), span: failure_span(span) }),
       };
       {
         state: state,
@@ -270,34 +275,39 @@ fn scan(state: TryState, expression: Expression) -> ScanResult / {abort.raise} =
           {
             state: fresh.state,
             scan: ScanFound({ operand: inner.expression, binder: fresh.binder, at: t.span }),
-            expression: var_of(fresh.binder),
+            expression: name_expression_of(fresh.binder),
           }
         },
       }
     },
     BinaryExpression(b) -> {
-      let short = b.op == b"and" || b.op == b"or";
-      let l = scan(state, b.lhs);
+      let short = b.operation == b"and" || b.operation == b"or";
+      let l = scan(state, b.left_operand);
       match l.scan {
         ScanFound(_) ->
           {
             state: l.state,
             scan: l.scan,
-            expression: BinaryExpression({ span: b.span, op: b.op, lhs: l.expression, rhs: b.rhs }),
+            expression: BinaryExpression({
+              span: b.span,
+              operation: b.operation,
+              left_operand: l.expression,
+              right_operand: b.right_operand,
+            }),
           },
         ScanImpure -> { state: l.state, scan: ScanImpure, expression: expression },
         ScanPure -> if short {
-          { state: l.state, scan: purity(is_pure(b.rhs)), expression: expression }
+          { state: l.state, scan: purity(is_pure(b.right_operand)), expression: expression }
         } else {
-          let r = scan(l.state, b.rhs);
+          let r = scan(l.state, b.right_operand);
           {
             state: r.state,
             scan: r.scan,
             expression: BinaryExpression({
               span: b.span,
-              op: b.op,
-              lhs: l.expression,
-              rhs: r.expression,
+              operation: b.operation,
+              left_operand: l.expression,
+              right_operand: r.expression,
             }),
           }
         },
@@ -308,7 +318,11 @@ fn scan(state: TryState, expression: Expression) -> ScanResult / {abort.raise} =
       {
         state: o.state,
         scan: o.scan,
-        expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
+        expression: UnaryExpression({
+          span: u.span,
+          operation: u.operation,
+          operand: o.expression,
+        }),
       }
     },
     CallExpression(a) -> {
@@ -340,7 +354,7 @@ fn scan(state: TryState, expression: Expression) -> ScanResult / {abort.raise} =
       let rebuilt = PerformExpression({
         span: p.span,
         effect_name: p.effect_name,
-        op: p.op,
+        operation: p.operation,
         resource: p.resource,
         args: o.expressions,
       });
@@ -451,7 +465,7 @@ fn lift_from_head(
   let found = scan_head(state, expression);
   match found.scan {
     ScanFound(l) -> {
-      let w = try_match(found.state, l.operand, l.at, var_pattern(l.binder), found.expression);
+      let w = try_match(found.state, l.operand, l.at, variable_pattern(l.binder), found.expression);
       match w.expression {
         MatchExpression(m) -> {
           let success = m.arms.get(1);
@@ -625,7 +639,7 @@ fn return_block(
 
 type StatementLift = {
   state: TryState,
-  stmt: Statement,
+  statement: Statement,
   enclosing_match: Option<{ operand: Expression, at: Span, pattern: Pattern, consumes: Bool }>,
 }
 
@@ -639,9 +653,9 @@ fn split_at(
 ) -> { state: TryState, statements: List<Statement>, split: Option<Expression> } / {abort.raise} = {
   let taken = lift_from_statement(state, st, remaining);
   match taken.enclosing_match {
-    None -> { state: taken.state, statements: statements.set(i, taken.stmt), split: None },
+    None -> { state: taken.state, statements: statements.set(i, taken.statement), split: None },
     Some(t) -> {
-      let updated_statements = statements.set(i, taken.stmt);
+      let updated_statements = statements.set(i, taken.statement);
       let rest = updated_statements.drop(if t.consumes { i + 1 } else { i });
       let body0 = BlockExpression({ span: made_at(t.at), tail: tail, statements: rest });
       let body = if remaining <= 0 { panic(extra_lift_message()) }
@@ -661,11 +675,11 @@ fn lift_from_statement(
     LetElseStatement(l) -> match l.value {
       PropagateExpression(t) -> {
         let fresh = fresh_binder(state, t.span);
-        let o = lift_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+        let o = lift_try(fresh.state, t.operand, t.span, variable_pattern(fresh.binder));
         if o.enclosing_match.consumes {
           {
             state: o.state,
-            stmt: LetElseStatement({ ..l, value: var_of(fresh.binder) }),
+            statement: LetElseStatement({ ..l, value: name_expression_of(fresh.binder) }),
             enclosing_match: Some({
               operand: o.enclosing_match.operand,
               at: o.enclosing_match.at,
@@ -676,7 +690,7 @@ fn lift_from_statement(
         } else {
           {
             state: o.state,
-            stmt: LetElseStatement({
+            statement: LetElseStatement({
               ..l,
               value: PropagateExpression({ span: t.span, operand: o.remaining_operand }),
             }),
@@ -690,11 +704,11 @@ fn lift_from_statement(
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: LetElseStatement({ ..l, value: o.expression }),
+              statement: LetElseStatement({ ..l, value: o.expression }),
               enclosing_match: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pattern: var_pattern(lift.binder),
+                pattern: variable_pattern(lift.binder),
                 consumes: false,
               }),
             },
@@ -702,7 +716,7 @@ fn lift_from_statement(
             let f = return_position(o.state, l.fallback, remaining);
             {
               state: f.state,
-              stmt: LetElseStatement({ ..l, fallback: f.expression }),
+              statement: LetElseStatement({ ..l, fallback: f.expression }),
               enclosing_match: None,
             }
           },
@@ -713,15 +727,15 @@ fn lift_from_statement(
       PropagateExpression(t) -> match l.ty {
         Some(_) -> {
           let fresh = fresh_binder(state, t.span);
-          let o = lift_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+          let o = lift_try(fresh.state, t.operand, t.span, variable_pattern(fresh.binder));
           if o.enclosing_match.consumes {
             {
               state: o.state,
-              stmt: LetStatement({
+              statement: LetStatement({
                 span: l.span,
                 pattern: l.pattern,
                 ty: l.ty,
-                value: var_of(fresh.binder),
+                value: name_expression_of(fresh.binder),
               }),
               enclosing_match: Some({
                 operand: o.enclosing_match.operand,
@@ -733,7 +747,7 @@ fn lift_from_statement(
           } else {
             {
               state: o.state,
-              stmt: LetStatement({
+              statement: LetStatement({
                 span: l.span,
                 pattern: l.pattern,
                 ty: l.ty,
@@ -747,7 +761,7 @@ fn lift_from_statement(
           let o = lift_try(state, t.operand, t.span, l.pattern);
           {
             state: o.state,
-            stmt: LetStatement({
+            statement: LetStatement({
               span: l.span,
               pattern: l.pattern,
               ty: None,
@@ -763,7 +777,7 @@ fn lift_from_statement(
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: LetStatement({
+              statement: LetStatement({
                 span: l.span,
                 pattern: l.pattern,
                 ty: l.ty,
@@ -772,22 +786,22 @@ fn lift_from_statement(
               enclosing_match: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pattern: var_pattern(lift.binder),
+                pattern: variable_pattern(lift.binder),
                 consumes: false,
               }),
             },
-          _ -> { state: o.state, stmt: statement, enclosing_match: None },
+          _ -> { state: o.state, statement: statement, enclosing_match: None },
         }
       },
     },
     AssignmentStatement(a) -> match a.value {
       PropagateExpression(t) -> {
         let fresh = fresh_binder(state, t.span);
-        let o = lift_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+        let o = lift_try(fresh.state, t.operand, t.span, variable_pattern(fresh.binder));
         if o.enclosing_match.consumes {
           {
             state: o.state,
-            stmt: AssignmentStatement({ ..a, value: var_of(fresh.binder) }),
+            statement: AssignmentStatement({ ..a, value: name_expression_of(fresh.binder) }),
             enclosing_match: Some({
               operand: o.enclosing_match.operand,
               at: o.enclosing_match.at,
@@ -798,7 +812,7 @@ fn lift_from_statement(
         } else {
           {
             state: o.state,
-            stmt: AssignmentStatement({
+            statement: AssignmentStatement({
               ..a,
               value: PropagateExpression({ span: t.span, operand: o.remaining_operand }),
             }),
@@ -812,15 +826,15 @@ fn lift_from_statement(
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: AssignmentStatement({ ..a, value: o.expression }),
+              statement: AssignmentStatement({ ..a, value: o.expression }),
               enclosing_match: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pattern: var_pattern(lift.binder),
+                pattern: variable_pattern(lift.binder),
                 consumes: false,
               }),
             },
-          _ -> { state: o.state, stmt: statement, enclosing_match: None },
+          _ -> { state: o.state, statement: statement, enclosing_match: None },
         }
       },
     },
@@ -829,7 +843,7 @@ fn lift_from_statement(
         let o = lift_try(state, t.operand, t.span, PatternWildcard({ span: expression_span(v) }));
         {
           state: o.state,
-          stmt: ExpressionStatement(
+          statement: ExpressionStatement(
             PropagateExpression({ span: t.span, operand: o.remaining_operand }),
           ),
           enclosing_match: Some(o.enclosing_match),
@@ -841,15 +855,15 @@ fn lift_from_statement(
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: ExpressionStatement(o.expression),
+              statement: ExpressionStatement(o.expression),
               enclosing_match: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pattern: var_pattern(lift.binder),
+                pattern: variable_pattern(lift.binder),
                 consumes: false,
               }),
             },
-          _ -> { state: o.state, stmt: statement, enclosing_match: None },
+          _ -> { state: o.state, statement: statement, enclosing_match: None },
         }
       },
     },
@@ -876,7 +890,7 @@ fn lift_try(
         enclosing_match: {
           operand: lift.operand,
           at: lift.at,
-          pattern: var_pattern(lift.binder),
+          pattern: variable_pattern(lift.binder),
           consumes: false,
         },
       },
@@ -907,11 +921,15 @@ fn exits_in(
     HandleExpression(_) -> handle_exits(state, exit, outermost, expression),
     TryBlockExpression(_) -> handle_exits(state, exit, outermost, expression),
     BinaryExpression(b) -> {
-      let l = exits_in(state, exit, outermost, b.lhs);
-      let r = exits_in(l.state, exit, outermost, b.rhs);
+      let l = exits_in(state, exit, outermost, b.left_operand);
+      let r = exits_in(l.state, exit, outermost, b.right_operand);
       {
         state: r.state,
-        expression: BinaryExpression({ ..b, lhs: l.expression, rhs: r.expression }),
+        expression: BinaryExpression({
+          ..b,
+          left_operand: l.expression,
+          right_operand: r.expression,
+        }),
       }
     },
     UnaryExpression(u) -> {
@@ -1120,7 +1138,7 @@ fn handle_exits(
           { state: o.state, clauses: accumulator.clauses.push({ ..c, body: o.expression }) }
         },
       );
-      let r: { state: TryState, ret: Option<ReturnClause> } = match h.ret {
+      let r: { state: TryState, ret: Option<ReturnClause> } = match h.return_clause {
         None -> { state: cs.state, ret: None },
         Some(return_clause) -> {
           let o = exits_through(cs.state, exit, return_clause.body);
@@ -1129,7 +1147,12 @@ fn handle_exits(
       };
       {
         state: r.state,
-        expression: HandleExpression({ ..h, body: b.expression, clauses: cs.clauses, ret: r.ret }),
+        expression: HandleExpression({
+          ..h,
+          body: b.expression,
+          clauses: cs.clauses,
+          return_clause: r.ret,
+        }),
       }
     },
     TryBlockExpression(t) -> {
@@ -1147,13 +1170,16 @@ fn handle_exits(
 fn catch_exit(state: TryState, exit: Bytes, h: Expression) -> TryOutput / {abort.raise} = {
   let span = made_at(expression_span(h));
   let fresh = fresh_binder(state, span);
-  let named = |n: Bytes| var_of({ name: n, span: span });
+  let named = |n: Bytes| name_expression_of({ name: n, span: span });
   let called = |n: Bytes, x: Expression|
     CallExpression({ span: span, function: named(n), args: [x], named: [], labels: [] });
   let returned = match state.mode {
     Some(TryOption) -> { ok: called(some_constructor(), h), failed: named(none_constructor()) },
     _ ->
-      { ok: called(ok_constructor(), h), failed: called(err_constructor(), var_of(fresh.binder)) },
+      {
+        ok: called(ok_constructor(), h),
+        failed: called(err_constructor(), name_expression_of(fresh.binder)),
+      },
   };
   {
     state: fresh.state,
@@ -1162,11 +1188,11 @@ fn catch_exit(state: TryState, exit: Bytes, h: Expression) -> TryOutput / {abort
       operand: HandleExpression({
         span: span,
         body: returned.ok,
-        ret: None,
+        return_clause: None,
         clauses: [
           {
             effect_name: bare({ name: exit, span: span }),
-            op: { name: exit_operation_name(), span: span },
+            operation: { name: exit_operation_name(), span: span },
             resource: None,
             wildcard_label: false,
             label_binder: None,
@@ -1176,7 +1202,7 @@ fn catch_exit(state: TryState, exit: Bytes, h: Expression) -> TryOutput / {abort
             params: [fresh.binder],
           },
         ],
-        vars: [],
+        handler_variables: [],
       }),
     }),
   }
@@ -1200,7 +1226,7 @@ fn rewrite_tries(
   rewrite_tries_within(state, expression, scope, barrier, count_in(expression, is_typed_lambda))
 
 fn is_typed_lambda(e: Expression) -> Bool =
-  match e { LambdaExpression(l) -> l.ret != None, _ -> false }
+  match e { LambdaExpression(l) -> l.return_clause != None, _ -> false }
 
 fn rewrite_tries_within(
   state: TryState,
@@ -1289,15 +1315,15 @@ fn sweep_inner(
       { state: o.state, expression: PropagateExpression({ span: t.span, operand: o.expression }) }
     },
     BinaryExpression(b) -> {
-      let l = rewrite_tries_within(state, b.lhs, scope, barrier, remaining);
-      let r = rewrite_tries_within(l.state, b.rhs, scope, barrier, remaining);
+      let l = rewrite_tries_within(state, b.left_operand, scope, barrier, remaining);
+      let r = rewrite_tries_within(l.state, b.right_operand, scope, barrier, remaining);
       {
         state: r.state,
         expression: BinaryExpression({
           span: b.span,
-          op: b.op,
-          lhs: l.expression,
-          rhs: r.expression,
+          operation: b.operation,
+          left_operand: l.expression,
+          right_operand: r.expression,
         }),
       }
     },
@@ -1305,10 +1331,14 @@ fn sweep_inner(
       let o = rewrite_tries_within(state, u.operand, scope, barrier, remaining);
       {
         state: o.state,
-        expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
+        expression: UnaryExpression({
+          span: u.span,
+          operation: u.operation,
+          operand: o.expression,
+        }),
       }
     },
-    LambdaExpression(l) -> match l.ret {
+    LambdaExpression(l) -> match l.return_clause {
       None -> {
         let o = rewrite_tries_within(
           state,
@@ -1323,7 +1353,7 @@ fn sweep_inner(
             span: l.span,
             body: o.expression,
             params: l.params,
-            ret: None,
+            return_clause: None,
           }),
         }
       },
@@ -1336,7 +1366,7 @@ fn sweep_inner(
               span: l.span,
               body: o.expression,
               params: l.params,
-              ret: Some(ty),
+              return_clause: Some(ty),
             }),
           }
         },
@@ -1353,7 +1383,7 @@ fn sweep_inner(
               span: l.span,
               body: s.expression,
               params: l.params,
-              ret: Some(ty),
+              return_clause: Some(ty),
             }),
           }
         },
@@ -1518,16 +1548,16 @@ fn sweep_inner(
         expression: PerformExpression({
           span: p.span,
           effect_name: p.effect_name,
-          op: p.op,
+          operation: p.operation,
           resource: p.resource,
           args: o.expressions,
         }),
       }
     },
     HandleExpression(h) -> {
-      let vs = h.vars.fold(
+      let vs = h.handler_variables.fold(
         { state: state, vars: [] },
-        |accumulator: { state: TryState, vars: List<HandlerVar> }, v: HandlerVar| {
+        |accumulator: { state: TryState, vars: List<HandlerStateVariable> }, v: HandlerStateVariable| {
           let o = rewrite_tries_within(accumulator.state, v.init, scope, barrier, remaining);
           { state: o.state, vars: accumulator.vars.push({ ..v, init: o.expression }) }
         },
@@ -1553,7 +1583,7 @@ fn sweep_inner(
             state: o.state,
             clauses: accumulator.clauses.push({
               effect_name: c.effect_name,
-              op: c.op,
+              operation: c.operation,
               resource: c.resource,
               wildcard_label: c.wildcard_label,
               label_binder: c.label_binder,
@@ -1565,7 +1595,7 @@ fn sweep_inner(
           }
         },
       );
-      let r = match h.ret {
+      let r = match h.return_clause {
         None -> { state: cs.state, ret: None },
         Some(return_clause) -> {
           let o = rewrite_tries_within(
@@ -1590,9 +1620,9 @@ fn sweep_inner(
         expression: HandleExpression({
           span: h.span,
           body: b.expression,
-          ret: r.ret,
+          return_clause: r.ret,
           clauses: cs.clauses,
-          vars: vs.vars,
+          handler_variables: vs.vars,
         }),
       }
     },
@@ -1745,7 +1775,7 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
           { state: o.state, expression: Some(o.expression) }
         },
       };
-      let body = match mode_for(state, d.ret) {
+      let body = match mode_for(state, d.return_type) {
         Err(reason) -> rewrite_tries(measured.state, d.body, Some(reason), None),
         Ok(m) -> {
           let ex = lift_exits({ ..measured.state, mode: Some(m) }, d.body);
@@ -1761,7 +1791,7 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
           name: d.name,
           generics: d.generics,
           params: d.params,
-          ret: d.ret,
+          return_type: d.return_type,
           effects: d.effects,
           constraints: d.constraints,
           spec: spec.clauses,

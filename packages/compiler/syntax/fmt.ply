@@ -6,12 +6,12 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               SchemaItem, DeriveItem, EffectSetItem, ExternItem, ImportDeclaration,
                               WholeModule, ModuleAlias, SelectedNames, FnDefinition,
                               ExternDefinition, TypeDefinition, AliasBody, SumBody,
-                              VariantDefinition, EffectDefinition, OpDefinition, TestDefinition,
-                              LawDefinition, SchemaDefinition, Binder, Constraint, SpecClause,
-                              ReturnsFresh, ReturnsParam, Visibility, Public, Private, item_span,
-                              item_doc, parse, dump_module, is_explicit_import, constraint_written,
-                              is_pub, spec_kind_text, NominalBody, ExternBody, InstanceItem,
-                              instance_text, NumericItem, NumericOp)
+                              VariantDefinition, EffectDefinition, OperationDefinition,
+                              TestDefinition, LawDefinition, SchemaDefinition, Binder, Constraint,
+                              SpecClause, ReturnsFresh, ReturnsParam, Visibility, Public, Private,
+                              item_span, item_doc, parse, dump_module, is_explicit_import,
+                              constraint_written, is_pub, spec_kind_text, NominalBody, ExternBody,
+                              InstanceItem, instance_text, NumericItem, NumericOperation)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
                                     UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
@@ -27,7 +27,7 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     RaiseName, RecordLiteralField, NamedArg, Param, Statement,
                                     LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, MatchArm, HandleClause, ReturnClause,
-                                    HandlerVar, expression_span, is_block_like,
+                                    HandlerStateVariable, expression_span, is_block_like,
                                     TaggedLiteralExpression, TaggedLiteral, Hole, written_operator,
                                     call_operator, set_binder, map_literal_call,
                                     expression_nodes_mapped)
@@ -68,8 +68,14 @@ pub fn fmt_source(source: Bytes) -> Result<Bytes, Bytes> / {abort.raise} = {
 fn as_operator(e: Expression) -> Expression =
   match e {
     CallExpression(a) -> match ((written_operator(a.function, a.args), a.args)) {
-      (Some(o), [left, right]) -> if a.labels.len() > 0 || a.named.len() > 0 { e }
-      else { BinaryExpression({ span: a.span, op: o.name, lhs: left, rhs: right }) },
+      (Some(o), [left, right]) -> if a.labels.len() > 0 || a.named.len() > 0 { e } else {
+        BinaryExpression({
+          span: a.span,
+          operation: o.name,
+          left_operand: left,
+          right_operand: right,
+        })
+      },
       _ -> e,
     },
     _ -> e,
@@ -227,7 +233,7 @@ fn has_blank_line_between(input: PrintInput, a: Int, b: Int) -> Bool / {abort.ra
 fn take_comment(printer: Printer, c: Comment) -> Printer =
   { ..printer, next_comment: printer.next_comment + 1, previous_end: c.end }
 
-fn keeps_blank_line(input: PrintInput, printer: Printer, at: Int) -> Bool / {abort.raise} =
+fn preserves_blank_line(input: PrintInput, printer: Printer, at: Int) -> Bool / {abort.raise} =
   has_blank_line_between(input, printer.previous_end, at)
     && !(match input.comments.at(printer.next_comment - 1) {
       Some(c) -> c.end == printer.previous_end && doc_mark(input.source, c) == Some(ItemDoc),
@@ -243,7 +249,7 @@ fn flush_comments(
 ) -> Printer / {abort.raise} =
   match input.comments.at(printer.next_comment) {
     Some(c) -> if c.start < before {
-      let s = newline(printer, indent, blanks && keeps_blank_line(input, printer, c.start));
+      let s = newline(printer, indent, blanks && preserves_blank_line(input, printer, c.start));
       flush_comments(
         input,
         take_comment(emit(s, comment_text(input, c)), c),
@@ -263,7 +269,7 @@ fn newline_after_comments(
   blanks: Bool,
 ) -> Printer / {abort.raise} = {
   let s = flush_comments(input, printer, start, indent, blanks);
-  newline(s, indent, blanks && keeps_blank_line(input, s, start))
+  newline(s, indent, blanks && preserves_blank_line(input, s, start))
 }
 
 fn leading_comments(
@@ -371,7 +377,7 @@ fn effect_text(entry: EffectExpression) -> Bytes =
   Bytes::concat_all([
     qualified_name_text(entry.effect_name),
     b".",
-    match entry.op { Some(o) -> o.name, None -> mode_text(entry.mode) },
+    match entry.operation { Some(o) -> o.name, None -> mode_text(entry.mode) },
     effect_label_text(entry),
     if entry.bounded { b" bounded" } else { b"" },
   ])
@@ -442,13 +448,13 @@ fn type_text(input: PrintInput, t: TypeExpression) -> Bytes / {abort.raise} =
         if x.once { b"once (" } else { b"(" },
         Bytes::join(
           range(0, x.params.len()).map(|i: Int|
-            (if x.kept.contains(i) { b"keep " } else { b"" }).concat(
+            (if x.keep_indices.contains(i) { b"keep " } else { b"" }).concat(
               type_text(input, x.params.get(i)),
             )),
           b", ",
         ),
         b") -> ",
-        type_text(input, x.ret),
+        type_text(input, x.return_type),
         effects_suffix(input, x.effects),
       ]),
     RecordTypeExpression(x) -> if is_type_tuple(x.fields) {
@@ -700,7 +706,7 @@ fn binding_power(operation: Bytes) -> Int =
   else if operation == b"add" || operation == b"sub" { 9 }
   else { match call_operator(operation) { Some(o) -> o.binding_power, None -> 10 } }
 
-pub fn op_text(operation: Bytes) -> Bytes = {
+pub fn operation_text(operation: Bytes) -> Bytes = {
   let table = [
     { n: b"or", t: b"||" },
     { n: b"and", t: b"&&" },
@@ -749,9 +755,9 @@ fn is_open_ended(expression: Expression) -> Bool =
 fn parens_operand(expression: Expression, parent: Bytes, is_right_operand: Bool) -> Bool =
   match expression {
     BinaryExpression(v) ->
-      binding_power(v.op) < binding_power(parent)
-        || (binding_power(v.op) == binding_power(parent) && is_right_operand)
-        || (v.op == b"and" && parent == b"or"),
+      binding_power(v.operation) < binding_power(parent)
+        || (binding_power(v.operation) == binding_power(parent) && is_right_operand)
+        || (v.operation == b"and" && parent == b"or"),
     _ -> is_open_ended(expression),
   }
 
@@ -794,7 +800,7 @@ fn starts_with_brace(expression: Expression) -> Bool =
     BlockExpression(_) -> true,
     SimulateExpression(_) -> true,
     ParallelExpression(_) -> true,
-    BinaryExpression(v) -> starts_with_brace(v.lhs),
+    BinaryExpression(v) -> starts_with_brace(v.left_operand),
     CallExpression(v) -> starts_with_brace(v.function),
     FieldExpression(v) -> starts_with_brace(v.base),
     PropagateExpression(v) -> starts_with_brace(v.operand),
@@ -803,7 +809,9 @@ fn starts_with_brace(expression: Expression) -> Bool =
 
 fn contains_brace(expression: Expression) -> Bool / {abort.raise} =
   match expression {
-    BinaryExpression(v) -> contains_brace(v.lhs) || opens_brace(v.rhs) || contains_brace(v.rhs),
+    BinaryExpression(v) ->
+      contains_brace(v.left_operand) || opens_brace(v.right_operand)
+        || contains_brace(v.right_operand),
     UnaryExpression(v) -> opens_brace(v.operand) || contains_brace(v.operand),
     CallExpression(v) -> contains_brace(v.function),
     FieldExpression(v) -> contains_brace(v.base),
@@ -818,7 +826,7 @@ fn opens_brace(expression: Expression) -> Bool / {abort.raise} =
     BlockExpression(_) -> true,
     SimulateExpression(_) -> true,
     ParallelExpression(_) -> true,
-    BinaryExpression(v) -> opens_brace(v.lhs),
+    BinaryExpression(v) -> opens_brace(v.left_operand),
     CallExpression(v) -> opens_brace(v.function),
     FieldExpression(v) -> opens_brace(v.base),
     PropagateExpression(v) -> opens_brace(v.operand),
@@ -885,7 +893,13 @@ fn try_head(raise: Option<RaiseName>) -> Bytes =
   match raise {
     None -> b"try ",
     Some(r) ->
-      Bytes::concat_all([b"try[", qualified_name_text(r.effect_name), b".", r.op.name, b"] "]),
+      Bytes::concat_all([
+        b"try[",
+        qualified_name_text(r.effect_name),
+        b".",
+        r.operation.name,
+        b"] ",
+      ]),
   }
 
 fn clause_head(clause: HandleClause) -> Bytes =
@@ -895,12 +909,12 @@ fn clause_head(clause: HandleClause) -> Bytes =
         Bytes::concat_all([
           qualified_name_text(clause.effect_name),
           b".",
-          clause.op.name,
+          clause.operation.name,
           b"[*",
           match clause.label_binder { Some(t) -> t.name, None -> b"" },
           b"]",
         ]),
-      false -> perform_head(clause.effect_name, clause.op, clause.resource),
+      false -> perform_head(clause.effect_name, clause.operation, clause.resource),
     },
     b"(",
     Bytes::join(clause.params.map(|parameter: Identifier| parameter.name), b", "),
@@ -1022,8 +1036,8 @@ fn one_interpolation(input: PrintInput, grouped: Span) -> Bool / {abort.raise} =
 
 fn pieces(input: PrintInput, expression: Expression) -> Option<Bytes> / {abort.raise} =
   match expression {
-    BinaryExpression(v) -> if v.op == b"concat" {
-      concat_options([pieces(input, v.lhs), pieces(input, v.rhs)])
+    BinaryExpression(v) -> if v.operation == b"concat" {
+      concat_options([pieces(input, v.left_operand), pieces(input, v.right_operand)])
     } else { piece(input, expression) },
     _ -> piece(input, expression),
   }
@@ -1049,8 +1063,13 @@ fn pieces_layout(
   indent: Int,
 ) -> Printer / {abort.raise} =
   match expression {
-    BinaryExpression(v) -> if v.op == b"concat" {
-      pieces_layout(input, pieces_layout(input, printer, v.lhs, indent), v.rhs, indent)
+    BinaryExpression(v) -> if v.operation == b"concat" {
+      pieces_layout(
+        input,
+        pieces_layout(input, printer, v.left_operand, indent),
+        v.right_operand,
+        indent,
+      )
     } else { piece_layout(input, printer, expression, indent) },
     _ -> piece_layout(input, printer, expression, indent),
   }
@@ -1096,18 +1115,24 @@ fn flat_node(input: PrintInput, e: Expression) -> Option<Bytes> / {abort.raise} 
     NameExpression(v) -> Some(qualified_name_text(v.name)),
     BinaryExpression(v) ->
       concat_options([
-        wrap(flat_expression(input, v.lhs), parens_operand(v.lhs, v.op, false)),
-        Some(Bytes::concat_all([b" ", op_text(v.op), b" "])),
-        wrap(flat_expression(input, v.rhs), parens_operand(v.rhs, v.op, true)),
+        wrap(
+          flat_expression(input, v.left_operand),
+          parens_operand(v.left_operand, v.operation, false),
+        ),
+        Some(Bytes::concat_all([b" ", operation_text(v.operation), b" "])),
+        wrap(
+          flat_expression(input, v.right_operand),
+          parens_operand(v.right_operand, v.operation, true),
+        ),
       ]),
     UnaryExpression(v) ->
       concat_options([
-        Some(unary_text(v.op)),
+        Some(unary_text(v.operation)),
         wrap(flat_expression(input, v.operand), parens_unary(v.operand)),
       ]),
     LambdaExpression(v) ->
       concat_options([
-        Some(lambda_head(input, v.params, v.ret)),
+        Some(lambda_head(input, v.params, v.return_clause)),
         Some(b" "),
         flat_expression(input, v.body),
       ]),
@@ -1197,17 +1222,17 @@ fn flat_node(input: PrintInput, e: Expression) -> Option<Bytes> / {abort.raise} 
     },
     PerformExpression(v) ->
       concat_options([
-        Some(perform_head(v.effect_name, v.op, v.resource)),
+        Some(perform_head(v.effect_name, v.operation, v.resource)),
         Some(b"("),
         join_options(v.args.map(|x: Expression| flat_expression(input, x)), b", "),
         Some(b")"),
       ]),
-    HandleExpression(v) -> if v.vars.len() > 0 { None } else {
+    HandleExpression(v) -> if v.handler_variables.len() > 0 { None } else {
       concat_options([
         Some(b"handle "),
         flat_expression(input, v.body),
         Some(b" with "),
-        flat_clauses(input, v.clauses, v.ret),
+        flat_clauses(input, v.clauses, v.return_clause),
       ])
     },
     WithScopeExpression(v) ->
@@ -1311,7 +1336,7 @@ fn chain(
     continuation_indent,
     0,
   );
-  let s2 = emit(newline(s1, continuation_indent, false), op_text(operation).concat(b" "));
+  let s2 = emit(newline(s1, continuation_indent, false), operation_text(operation).concat(b" "));
   chain_operand(
     input,
     s2,
@@ -1380,17 +1405,26 @@ fn broken_node(
     },
     HoleExpression(v) -> emit(printer, v.text),
     NameExpression(v) -> emit(printer, qualified_name_text(v.name)),
-    BinaryExpression(v) -> chain(input, printer, v.lhs, v.op, v.rhs, continuation_indent, after),
+    BinaryExpression(v) ->
+      chain(
+        input,
+        printer,
+        v.left_operand,
+        v.operation,
+        v.right_operand,
+        continuation_indent,
+        after,
+      ),
     UnaryExpression(v) ->
       operand(
         input,
-        emit(printer, unary_text(v.op)),
+        emit(printer, unary_text(v.operation)),
         v.operand,
         parens_unary(v.operand),
         indent,
         after,
       ),
-    LambdaExpression(v) -> lambda(input, printer, v.params, v.ret, v.body, indent, after),
+    LambdaExpression(v) -> lambda(input, printer, v.params, v.return_clause, v.body, indent, after),
     CallExpression(v) -> match collection_literal_of(input, expression) {
       Some(m) -> collection_literal(input, printer, m, indent),
       None -> {
@@ -1439,7 +1473,7 @@ fn broken_node(
     PerformExpression(v) ->
       call(
         input,
-        emit(printer, perform_head(v.effect_name, v.op, v.resource)),
+        emit(printer, perform_head(v.effect_name, v.operation, v.resource)),
         v.args,
         [],
         v.span,
@@ -1503,7 +1537,7 @@ fn block_of(
       trailing_comment(input, emit(printer, b"{"), v.span.start + 1),
       v.span.start + 1,
     );
-    let s2 = v.statements.fold(s1, |s: Printer, x: Statement| stmt(input, s, x, indent + 2));
+    let s2 = v.statements.fold(s1, |s: Printer, x: Statement| statement(input, s, x, indent + 2));
     let s3 = match v.tail {
       Some(t) -> {
         let tsp = expression_span(t);
@@ -1522,7 +1556,12 @@ fn block_of(
   }
 }
 
-fn stmt(input: PrintInput, printer: Printer, x: Statement, indent: Int) -> Printer / {abort.raise} =
+fn statement(
+  input: PrintInput,
+  printer: Printer,
+  x: Statement,
+  indent: Int,
+) -> Printer / {abort.raise} =
   match x {
     LetStatement(v) -> {
       let s1 = newline_after_comments(input, printer, v.span.start, indent, true);
@@ -1584,7 +1623,7 @@ fn huggable(expression: Expression) -> Bool =
 
 fn head_width(input: PrintInput, expression: Expression) -> Int / {abort.raise} =
   match expression {
-    LambdaExpression(v) -> lambda_head(input, v.params, v.ret).len() + 2,
+    LambdaExpression(v) -> lambda_head(input, v.params, v.return_clause).len() + 2,
     MatchExpression(v) -> 8 + flat_len(input, v.scrutinee),
     IfExpression(v) -> 5 + flat_len(input, v.cond),
     HandleExpression(_) -> 8,
@@ -1758,8 +1797,8 @@ pub fn holes_of(e: Expression) -> List<Expression> = append_interpolations(e, []
 
 fn append_interpolations(e: Expression, found: List<Expression>) -> List<Expression> =
   match e {
-    BinaryExpression(v) -> if v.op == b"concat" {
-      append_interpolations(v.rhs, append_interpolations(v.lhs, found))
+    BinaryExpression(v) -> if v.operation == b"concat" {
+      append_interpolations(v.right_operand, append_interpolations(v.left_operand, found))
     } else { found },
     CallExpression(v) -> match v.args { [x] -> found.push(x), _ -> found },
     _ -> found,
@@ -1999,25 +2038,25 @@ fn arm_body(
 fn handle_expression(
   input: PrintInput,
   printer: Printer,
-  h: { span: Span, body: Expression, ret: Option<ReturnClause>, clauses: List<HandleClause>, vars: List<HandlerVar> },
+  h: { span: Span, body: Expression, return_clause: Option<ReturnClause>, clauses: List<HandleClause>, handler_variables: List<HandlerStateVariable> },
   indent: Int,
 ) -> Printer / {abort.raise} = {
   let clauses = h.clauses;
-  let return_clause = h.ret;
+  let return_clause = h.return_clause;
   let s1 = emit(printer, b"handle ");
   let s2 = match h.body {
     BlockExpression(v) -> block_of(input, s1, v, indent),
     _ -> expression(input, s1, h.body, indent + 2, 7),
   };
   let s3v = emit(s2, b" with {");
-  let s3 = range(0, h.vars.len()).fold(s3v, |s: Printer, i: Int| {
-    let v = h.vars.get(i);
+  let s3 = range(0, h.handler_variables.len()).fold(s3v, |s: Printer, i: Int| {
+    let v = h.handler_variables.get(i);
     let ty = match v.ty { Some(t) -> b": ".concat(type_text(input, t)), None -> b"" };
     let o = emit(
       newline_after_comments(input, s, v.span.start, indent + 2, false),
       Bytes::concat_all([b"var ", v.name.name, ty, b" = "]),
     );
-    let last = i == h.vars.len() - 1 && clauses.len() == 0
+    let last = i == h.handler_variables.len() - 1 && clauses.len() == 0
       && (match return_clause { Some(_) -> false, None -> true });
     let bd = separated(input, expression(input, o, v.init, indent + 2, 1), v.init, last);
     trailing_comment(input, set_previous(bd, v.span.end), v.span.end)
@@ -2171,7 +2210,8 @@ fn item(input: PrintInput, printer: Printer, it: Item) -> Printer / {abort.raise
           d.target.name,
           b" by { ",
           Bytes::join(
-            d.operations.map(|x: NumericOp| Bytes::concat_all([x.op.name, b": ", x.by.name])),
+            d.operations.map(|x: NumericOperation|
+              Bytes::concat_all([x.operation.name, b": ", x.by.name])),
             b", ",
           ),
           b" }",
@@ -2238,7 +2278,7 @@ fn fn_definition(
     definition.name.name,
     generics_text(definition.generics),
   ]);
-  let return_type = match definition.ret {
+  let return_type = match definition.return_type {
     Some(t) -> b" -> ".concat(type_text(input, t)),
     None -> b"",
   };
@@ -2313,7 +2353,7 @@ fn extern_definition(
   ]);
   let tail = Bytes::concat_all([
     b" -> ",
-    type_text(input, definition.ret),
+    type_text(input, definition.return_type),
     effects_suffix(input, definition.effects),
   ]);
   let params_end = match definition.params.at(definition.params.len() - 1) {
@@ -2498,16 +2538,21 @@ fn past_keep(input: PrintInput, i: Int, has_keep: Bool) -> Int / {abort.raise} =
     if j >= 4 && input.source.slice(j - 4, j) == b"keep" { j - 4 } else { i }
   }
 
-fn op_declaration_text(input: PrintInput, operation: OpDefinition) -> Bytes / {abort.raise} = {
+fn operation_declaration_text(
+  input: PrintInput,
+  operation: OperationDefinition,
+) -> Bytes / {abort.raise} = {
   let resource = if !operation.resource_param { b"" }
   else if in_source(input, operation.name.span) {
     Bytes::concat_all([b"[", identifier_after_bracket(input, operation.name.span.end), b"]"])
   } else { b"[r]" };
   let ps = range(0, operation.params.len()).map(|i: Int| {
     let t = operation.params.get(i);
-    let ty = (if operation.kept.contains(i) { b"keep " } else { b"" }).concat(type_text(input, t));
+    let ty = (if operation.keep_indices.contains(i) { b"keep " } else { b"" }).concat(
+      type_text(input, t),
+    );
     let named = if in_source(input, type_span(t)) {
-      name_before(input, past_keep(input, type_span(t).start, operation.kept.contains(i)))
+      name_before(input, past_keep(input, type_span(t).start, operation.keep_indices.contains(i)))
     } else { None };
     match named { Some(n) -> Bytes::concat_all([n, b": ", ty]), None -> ty }
   });
@@ -2520,7 +2565,8 @@ fn op_declaration_text(input: PrintInput, operation: OpDefinition) -> Bytes / {a
     b"(",
     Bytes::join(ps, b", "),
     b")",
-    if is_raise(operation.mode) { b"" } else { b" -> ".concat(type_text(input, operation.ret)) },
+    if is_raise(operation.mode) { b"" }
+    else { b" -> ".concat(type_text(input, operation.return_type)) },
   ])
 }
 
@@ -2535,10 +2581,10 @@ fn effect_definition(
     Bytes::concat_all([visibility_text(d.visibility), nd, b"effect ", d.name.name, b" {"]),
   );
   if d.operations.len() == 0 && !comment_before(input, s1, d.span.end) { emit(s1, b"}") } else {
-    let s2 = d.operations.fold(s1, |s: Printer, operation: OpDefinition| {
+    let s2 = d.operations.fold(s1, |s: Printer, operation: OperationDefinition| {
       let e = emit(
         newline_after_comments(input, s, operation.span.start, 2, false),
-        op_declaration_text(input, operation),
+        operation_declaration_text(input, operation),
       );
       trailing_comment(
         input,
@@ -2763,7 +2809,7 @@ fn item_name(item: Item) -> Option<Bytes> =
     _ -> None,
   }
 
-fn item_desc(item: Item) -> Bytes =
+fn item_description(item: Item) -> Bytes =
   match item_name(item) {
     Some(n) -> Bytes::concat_all([b"`", item_kind(item), b"` `", n, b"`"]),
     None -> Bytes::concat_all([b"a `", item_kind(item), b"`"]),
@@ -2901,9 +2947,9 @@ pub fn replace_item(
           Err(
             Bytes::concat_all([
               b"the replacement defines ",
-              item_desc(fresh),
+              item_description(fresh),
               b"; expected ",
-              item_desc(old.item),
+              item_description(old.item),
             ]),
           )
         } else {

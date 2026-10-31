@@ -5,17 +5,18 @@ import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, Name
                                     EffectExpression, WriteMode, type_span, mode_text, is_raise,
                                     identifier_names)
 import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, FnDefinition,
-                              TypeDefinition, AliasBody, SumBody, VariantDefinition, OpDefinition,
-                              Constraint, Deriver, OrdDeriver, NumericDeriver, IntegerDeriver,
-                              is_predicate, NominalBody, ExternBody, constraint_written)
+                              TypeDefinition, AliasBody, SumBody, VariantDefinition,
+                              OperationDefinition, Constraint, Deriver, OrderingDeriver,
+                              NumericDeriver, IntegerDeriver, is_predicate, NominalBody, ExternBody,
+                              constraint_written)
 import compiler.syntax.expressions (Param)
 import compiler.check.types (NamedResource, SingletonResource, ResourceVariable, AnyResource,
                              Effect, Effects, Type, VariableType, NamedType, FunctionType,
                              RecordType, Field, Scheme, effects_cover, effects_insert, no_effects,
-                             open_effects, unit_type, fn_type, fields_sorted, field_get,
+                             open_effects, unit_type, function_type, fields_sorted, field_get,
                              ints_insert, mark_rigid_type, mark_rigid_effects, free_variables,
                              env_bind_global, env_lookup, env_locals, InScope, label_type,
-                             applied_args, apply_arguments, NominalType, owning_fn_type)
+                             applied_args, apply_arguments, NominalType, owning_function_type)
 import compiler.check.known (scoped_name, scoped_type, task_name, builtin_channel_name, map_parts)
 import compiler.check.resolve.tables (ParsedModule, Binding, TypeSpace, EffectSpace, qualify,
                                       default_binder, backticked)
@@ -25,18 +26,18 @@ import std.option
 import std.string
 import compiler.check.borrowing (parameter_mode)
 import compiler.check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord,
-                                     DeclaredSum, TypeDeclaration, RecordDeclaration, OpInfo,
+                                     DeclaredSum, TypeDeclaration, RecordDeclaration, OperationInfo,
                                      EffectInfo, Signature, Assumption, OpenScope, ScopedValueKind,
                                      ScopedLabel, Tasks, RigidParam, MapKeySite, Checker,
                                      DefinitionConstraint, ConstraintSite, insert_constraint,
-                                     dedup_constraints, WithType, WithVar, WithEffects, WithName,
-                                     WithTypes, WithEffect, scoped_effect, is_scoped_effect,
-                                     location_of, module_name, scope_of, report_error_at,
-                                     report_error_at_and, supplied, new_type, new_type_var,
-                                     new_effects, new_effect_variable, resolve, is_prelude_effect,
-                                     seed_effect, builtin_type_arity, add_constructor,
-                                     constructor_of, add_effect, effect_of, channel_ops, mode_eq,
-                                     ConstructorInfo)
+                                     dedup_constraints, WithType, WithVariable, WithEffects,
+                                     WithName, WithTypes, WithEffect, scoped_effect,
+                                     is_scoped_effect, location_of, module_name, scope_of,
+                                     report_error_at, report_error_at_and, supplied, new_type,
+                                     new_type_variable, new_effects, new_effect_variable, resolve,
+                                     is_prelude_effect, seed_effect, builtin_type_arity,
+                                     add_constructor, constructor_of, add_effect, effect_of,
+                                     channel_operations, mode_eq, ConstructorInfo)
 import compiler.check.infer.names (global, unresolved_in_derived, exporter, simple_name_of)
 
 fn type_param(checker: Checker, identifier: Identifier) -> { checker: Checker, ty: Type } =
@@ -100,12 +101,15 @@ fn convert_type_within(
     },
     FunctionTypeExpression(f) -> {
       let ps: WithTypes = convert_types_within(checker, f.params, room);
-      let r: WithType = convert_type_within(ps.checker, f.ret, room);
+      let r: WithType = convert_type_within(ps.checker, f.return_type, room);
       let eff = match f.effects {
         Some(effects) -> convert_effects(r.checker, effects),
         None -> { checker: r.checker, effects: no_effects() },
       };
-      { checker: eff.checker, ty: owning_fn_type(ps.types, f.kept, f.once, r.ty, eff.effects) }
+      {
+        checker: eff.checker,
+        ty: owning_function_type(ps.types, f.keep_indices, f.once, r.ty, eff.effects),
+      }
     },
     NamedTypeExpression(c) ->
       convert_constructor(checker, c.name, c.args, c.labels, c.effect_arguments, c.span, room),
@@ -144,26 +148,30 @@ fn bind_declaration_params(
 ) -> { checker: Checker, labels: List<Int>, effect_params: List<Int> } = {
   let closed: Checker = { ..checker, label_params: Map::new(), effect_params: Map::new() };
   let labels = declaration.labels.fold(
-    { checker: closed, vars: [] },
-    |accumulator: { checker: Checker, vars: List<Int> }, name: Bytes| {
-      let o: WithVar = new_type_var(accumulator.checker);
+    { checker: closed, identity_variables: [] },
+    |accumulator: { checker: Checker, identity_variables: List<Int> }, name: Bytes| {
+      let o: WithVariable = new_type_variable(accumulator.checker);
       {
         checker: { ..o.checker, label_params: o.checker.label_params.insert(name, o.var) },
-        vars: accumulator.vars.push(o.var),
+        identity_variables: accumulator.identity_variables.push(o.var),
       }
     },
   );
   let effects = declaration.effect_params.fold(
-    { checker: labels.checker, vars: [] },
-    |accumulator: { checker: Checker, vars: List<Int> }, name: Bytes| {
-      let o: WithVar = new_effect_variable(accumulator.checker);
+    { checker: labels.checker, identity_variables: [] },
+    |accumulator: { checker: Checker, identity_variables: List<Int> }, name: Bytes| {
+      let o: WithVariable = new_effect_variable(accumulator.checker);
       {
         checker: { ..o.checker, effect_params: o.checker.effect_params.insert(name, o.var) },
-        vars: accumulator.vars.push(o.var),
+        identity_variables: accumulator.identity_variables.push(o.var),
       }
     },
   );
-  { checker: effects.checker, labels: labels.vars, effect_params: effects.vars }
+  {
+    checker: effects.checker,
+    labels: labels.identity_variables,
+    effect_params: effects.identity_variables,
+  }
 }
 
 fn convert_types(
@@ -396,7 +404,7 @@ fn convert_constructor(
                     && declaration.effect_params.len() == 0;
                   match if memo { g.checker.aliases.get(qualified) } else { None } {
                     Some(m) -> {
-                      let assumed = assumed_for(g.checker, OrdDeriver);
+                      let assumed = assumed_for(g.checker, OrderingDeriver);
                       let keys = m.keys.map(|s: MapKeySite|
                         { ..s, scope: g.checker.scope, assumed: assumed });
                       {
@@ -499,7 +507,7 @@ fn declared_record(
       let bound_parameters: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = declaration.params.fold(
         { checker: checker, vars: [], params: Map::new() },
         |accumulator: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
-          let o: WithVar = new_type_var(accumulator.checker);
+          let o: WithVariable = new_type_variable(accumulator.checker);
           {
             checker: o.checker,
             vars: accumulator.vars.push(o.var),
@@ -751,9 +759,9 @@ pub fn convert_effect(
           }
         };
         let info = effect_of(e.checker, eff);
-        let label_less: { checker: Checker, rejected: Bool } = match a.op {
+        let label_less: { checker: Checker, rejected: Bool } = match a.operation {
           Some(operation) -> match info {
-            Some(i) -> match op_named(i, operation.name) {
+            Some(i) -> match operation_named(i, operation.name) {
               Some(o) -> if a.resource_wildcard && !o.resource_param {
                 { checker: reject_any_label(e.checker, a.span, eff, o.name, o.at), rejected: true }
               } else { { checker: e.checker, rejected: false } },
@@ -765,11 +773,11 @@ pub fn convert_effect(
         };
         let named_context: Checker = label_less.checker;
         let entry: Option<Effect> = if label_less.rejected { None } else {
-          match a.op {
+          match a.operation {
             Some(operation) -> match info {
-              Some(i) -> match op_named(i, operation.name) {
+              Some(i) -> match operation_named(i, operation.name) {
                 Some(o) ->
-                  Some({ effect: eff, resource: resource, mode: o.mode, op: Some(o.name) }),
+                  Some({ effect: eff, resource: resource, mode: o.mode, operation: Some(o.name) }),
                 None -> None,
               },
               None -> None,
@@ -779,12 +787,13 @@ pub fn convert_effect(
                 || (match info {
                   Some(i) ->
                     i.operations.len() == 0
-                      || i.operations.fold(false, |accumulator: Bool, o: OpInfo|
+                      || i.operations.fold(false, |accumulator: Bool, o: OperationInfo|
                         accumulator || mode_eq(o.mode, a.mode)),
                   None -> true,
                 });
-              if declares_mode { Some({ effect: eff, resource: resource, mode: a.mode, op: None }) }
-              else { None }
+              if declares_mode {
+                Some({ effect: eff, resource: resource, mode: a.mode, operation: None })
+              } else { None }
             },
           }
         };
@@ -792,8 +801,8 @@ pub fn convert_effect(
           Some(_) -> { checker: named_context, entry: entry },
           None -> {
             let known = match info {
-              Some(i) -> match a.op {
-                Some(_) -> effect_modes(i).concat(effect_moded_ops(i)),
+              Some(i) -> match a.operation {
+                Some(_) -> effect_modes(i).concat(effect_non_raise_operation_names(i)),
                 None -> effect_modes(i),
               },
               None -> [],
@@ -801,7 +810,7 @@ pub fn convert_effect(
             let help = if known.len() == 0 { [] } else {
               [Bytes::concat_all([b"`", eff, b"` can perform: ", Bytes::join(known, b", ")])]
             };
-            let (message, label) = match a.op {
+            let (message, label) = match a.operation {
               Some(operation) ->
                 (
                   Bytes::concat_all([
@@ -841,7 +850,7 @@ pub fn convert_effect(
   }
 
 fn effect_modes(info: EffectInfo) -> List<Bytes> =
-  info.operations.fold([], |accumulator: List<Bytes>, op_info: OpInfo| {
+  info.operations.fold([], |accumulator: List<Bytes>, op_info: OperationInfo| {
     let k = Bytes::concat_all([
       info.simple_name,
       b".",
@@ -850,17 +859,18 @@ fn effect_modes(info: EffectInfo) -> List<Bytes> =
     if accumulator.contains(k) { accumulator } else { accumulator.push(k) }
   })
 
-fn effect_moded_ops(info: EffectInfo) -> List<Bytes> =
-  effect_ops({
+fn effect_non_raise_operation_names(info: EffectInfo) -> List<Bytes> =
+  effect_operation_names({
     ..info,
-    operations: info.operations.filter(|op_info: OpInfo| !is_raise(op_info.mode)),
+    operations: info.operations.filter(|op_info: OperationInfo| !is_raise(op_info.mode)),
   })
 
-fn effect_ops(info: EffectInfo) -> List<Bytes> =
-  info.operations.map(|op_info: OpInfo| Bytes::concat_all([info.simple_name, b".", op_info.name]))
+fn effect_operation_names(info: EffectInfo) -> List<Bytes> =
+  info.operations.map(|op_info: OperationInfo|
+    Bytes::concat_all([info.simple_name, b".", op_info.name]))
 
-pub fn op_named(info: EffectInfo, name: Bytes) -> Option<OpInfo> =
-  info.operations.fold(None, |accumulator: Option<OpInfo>, op_info: OpInfo|
+pub fn operation_named(info: EffectInfo, name: Bytes) -> Option<OperationInfo> =
+  info.operations.fold(None, |accumulator: Option<OperationInfo>, op_info: OperationInfo|
     match accumulator {
       Some(_) -> accumulator,
       None -> if op_info.name == name { Some(op_info) } else { None },
@@ -1073,7 +1083,7 @@ fn scope_brand(ty: Type) -> Option<Bytes> =
     else { first_reason(c.args, scope_brand) },
     FunctionType(f) -> match first_reason(f.params, scope_brand) {
       Some(b) -> Some(b),
-      None -> scope_brand(f.ret),
+      None -> scope_brand(f.return_type),
     },
     RecordType(fs) -> first_reason(fs, |f: Field| scope_brand(f.ty)),
     NominalType(n) -> first_reason(n.fields, |f: Field| scope_brand(f.ty)),
@@ -1124,7 +1134,7 @@ fn first_scoped_effect(ty: Type) -> Option<Bytes> =
     else if effects_include_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
       match first_reason(f.params, first_scoped_effect) {
         Some(b) -> Some(b),
-        None -> first_scoped_effect(f.ret),
+        None -> first_scoped_effect(f.return_type),
       }
     },
   }
@@ -1205,12 +1215,12 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
             None -> {
               let collected = definition.operations.fold(
                 { checker: c, operations: [] },
-                |accumulator: { checker: Checker, operations: List<OpInfo> }, operation: OpDefinition|
-                  if accumulator.operations.fold(false, |b: Bool, op_info: OpInfo|
+                |accumulator: { checker: Checker, operations: List<OperationInfo> }, operation: OperationDefinition|
+                  if accumulator.operations.fold(false, |b: Bool, op_info: OperationInfo|
                       b || op_info.name == operation.name.name) {
                     let first_span = accumulator.operations.fold(
                       dummy_span(),
-                      |span: Span, op_info: OpInfo|
+                      |span: Span, op_info: OperationInfo|
                         if op_info.name == operation.name.name { op_info.at.span } else { span },
                     );
                     {
@@ -1232,12 +1242,12 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                       assumed: bound.type_params.fold(
                         bound.assumed,
                         |xs: List<Assumption>, k: Bytes, t: Type|
-                          match t { VariableType(v) -> assume(xs, OrdDeriver, v), _ -> xs },
+                          match t { VariableType(v) -> assume(xs, OrderingDeriver, v), _ -> xs },
                       ),
                     };
                     let ps: WithTypes = convert_types(c1, operation.params);
                     let r: WithType = if is_raise(operation.mode) { new_type(ps.checker) }
-                    else { convert_type(ps.checker, operation.ret) };
+                    else { convert_type(ps.checker, operation.return_type) };
                     let c2: Checker = {
                       ..r.checker,
                       type_params: Map::new(),
@@ -1259,12 +1269,12 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                       reject_scoped_type(
                         c3,
                         r.ty,
-                        type_span(operation.ret),
+                        type_span(operation.return_type),
                         operation.name.name,
                         b"result",
                       ),
                       r.ty,
-                      type_span(operation.ret),
+                      type_span(operation.return_type),
                       operation.name.name,
                       b"result",
                       operation_scoped_notes(),
@@ -1276,8 +1286,8 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                         mode: operation.mode,
                         resource_param: operation.resource_param,
                         params: ps.types,
-                        kept: operation.kept,
-                        ret: r.ty,
+                        keep_indices: operation.keep_indices,
+                        return_type: r.ty,
                         at: location_of(c4, operation.span),
                         scheme: None,
                       }),
@@ -1314,7 +1324,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
               let type_variables: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = declaration.params.fold(
                 { checker: c, vars: [], params: Map::new() },
                 |accumulator: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
-                  let o: WithVar = new_type_var(accumulator.checker);
+                  let o: WithVariable = new_type_variable(accumulator.checker);
                   {
                     checker: o.checker,
                     vars: accumulator.vars.push(o.var),
@@ -1361,7 +1371,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                         ),
                     );
                     let ty = if fs.types.len() == 0 { result }
-                    else { fn_type(fs.types, result, no_effects()) };
+                    else { function_type(fs.types, result, no_effects()) };
                     let scheme = {
                       type_variables: type_variables.vars,
                       effect_variables: own.effect_params,
@@ -1443,9 +1453,9 @@ type SumCase = { fields: List<Type>, params: List<Int> }
 type ParamStep = { from: Bytes, to: Bytes, grown: Bool }
 
 fn grows_itself(sums: Map<Bytes, List<SumCase>>, name: Bytes) -> Bool = {
-  let steps = sums_reached(sums, name).fold([], |accumulator: List<ParamStep>, s: Bytes|
+  let steps = reachable_sums(sums, name).fold([], |accumulator: List<ParamStep>, s: Bytes|
     accumulator.concat(param_steps(sums, s)));
-  let from = |p: Bytes| positions_reached(steps, p).push(p);
+  let from = |p: Bytes| reachable_positions(steps, p).push(p);
   let own = steps.fold([], |accumulator: List<Bytes>, s: ParamStep|
     if s.from.starts_with(name.concat(b"#")) && !accumulator.contains(s.from) {
       accumulator.push(s.from)
@@ -1454,7 +1464,7 @@ fn grows_itself(sums: Map<Bytes, List<SumCase>>, name: Bytes) -> Bool = {
     s.grown && own.any(|p: Bytes| from(s.to).contains(p) && from(p).contains(s.from)))
 }
 
-fn sums_reached(sums: Map<Bytes, List<SumCase>>, name: Bytes) -> List<Bytes> =
+fn reachable_sums(sums: Map<Bytes, List<SumCase>>, name: Bytes) -> List<Bytes> =
   range(0, sums.len()).fold(
     { seen: [name], at: 0 },
     |s: { seen: List<Bytes>, at: Int }, _: Int|
@@ -1541,7 +1551,7 @@ fn variables_of(t: Type) -> List<Int> =
       x.args.fold([], |accumulator: List<Int>, a: Type| accumulator.concat(variables_of(a))),
   }
 
-fn positions_reached(steps: List<ParamStep>, from: Bytes) -> List<Bytes> = {
+fn reachable_positions(steps: List<ParamStep>, from: Bytes) -> List<Bytes> = {
   let next = |n: Bytes| steps.filter(|s: ParamStep| s.from == n).map(|s: ParamStep| s.to);
   range(0, steps.len()).fold(next(from), |seen: List<Bytes>, _: Int|
     seen.fold(seen, |accumulator: List<Bytes>, n: Bytes|
@@ -1627,9 +1637,9 @@ pub fn assume(xs: List<Assumption>, deriver: Deriver, v: Int) -> List<Assumption
   match hit {
     Some(i) -> {
       let x = xs.get(i);
-      xs.set(i, { deriver: x.deriver, vars: ints_insert(x.vars, v) })
+      xs.set(i, { deriver: x.deriver, variables: ints_insert(x.variables, v) })
     },
-    None -> xs.push({ deriver: deriver, vars: [v] }),
+    None -> xs.push({ deriver: deriver, variables: [v] }),
   }
 }
 
@@ -1657,7 +1667,7 @@ fn check_where(checker: Checker, definition: FnDefinition) -> Checker / {abort.r
 
 fn bind_type_params(checker: Checker, names: List<Identifier>) -> Checker =
   names.fold(checker, |c: Checker, type_parameter: Identifier| {
-    let o: WithVar = new_type_var(c);
+    let o: WithVariable = new_type_variable(c);
     {
       ..o.checker,
       substitution: mark_rigid_type(o.checker.substitution, o.var),
@@ -1688,7 +1698,7 @@ pub fn member_scheme(
           None -> vs,
         },
     ),
-    keep_variables: definition.generics.kept.fold(
+    keep_variables: definition.generics.retained_types.fold(
       [],
       |vs: List<Int>, retained_parameter: Identifier|
         match sig.type_params.get(retained_parameter.name) {
@@ -1720,7 +1730,7 @@ pub fn written_signature(
   let with_effects: Checker = definition.generics.effects.fold(
     types,
     |c: Checker, p: Identifier| {
-      let o: WithVar = new_effect_variable(c);
+      let o: WithVariable = new_effect_variable(c);
       {
         ..o.checker,
         substitution: mark_rigid_effects(o.checker.substitution, o.var),
@@ -1731,7 +1741,7 @@ pub fn written_signature(
   let labels: Checker = definition.generics.labels.fold(
     with_effects,
     |c: Checker, p: Identifier| {
-      let o: WithVar = new_type_var(c);
+      let o: WithVariable = new_type_variable(c);
       {
         ..o.checker,
         substitution: mark_rigid_type(o.checker.substitution, o.var),
@@ -1761,7 +1771,7 @@ pub fn written_signature(
         },
       },
   );
-  let return_type: WithType = match definition.ret {
+  let return_type: WithType = match definition.return_type {
     Some(t) -> {
       let o: WithType = convert_type(params.checker, t);
       { checker: check_scoped_placement(o.checker, t, o.ty, false), ty: o.ty }
@@ -1786,7 +1796,7 @@ pub fn written_signature(
       type_params: c.type_params,
       effect_params: c.effect_params,
       label_params: c.label_params,
-      fn_type: owning_fn_type(
+      fn_type: owning_function_type(
         params.types,
         range(0, definition.params.len()).filter(|i: Int| definition.params.get(i).keep),
         false,
@@ -1794,7 +1804,7 @@ pub fn written_signature(
         effects.effects,
       ),
       params: params.types,
-      ret: return_type.ty,
+      return_type: return_type.ty,
       declared: declared.r,
       published_effects: effects.effects,
       promised_bounded: declared.bounded,
@@ -1804,17 +1814,17 @@ pub fn written_signature(
   }
 }
 
-fn keeps_scoped(ty: Type, passed: Bool) -> Bool =
+fn contains_scoped(ty: Type, passed: Bool) -> Bool =
   match ty {
     VariableType(_) -> false,
     NamedType(c) ->
       (c.name == scoped_name() && !passed)
-        || c.args.fold(false, |b: Bool, a: Type| b || keeps_scoped(a, false)),
+        || c.args.fold(false, |b: Bool, a: Type| b || contains_scoped(a, false)),
     FunctionType(f) ->
-      f.params.fold(false, |b: Bool, p: Type| b || keeps_scoped(p, true))
-        || keeps_scoped(f.ret, false),
-    RecordType(fs) -> fs.fold(false, |b: Bool, f: Field| b || keeps_scoped(f.ty, false)),
-    NominalType(n) -> n.args.fold(false, |b: Bool, a: Type| b || keeps_scoped(a, false)),
+      f.params.fold(false, |b: Bool, p: Type| b || contains_scoped(p, true))
+        || contains_scoped(f.return_type, false),
+    RecordType(fs) -> fs.fold(false, |b: Bool, f: Field| b || contains_scoped(f.ty, false)),
+    NominalType(n) -> n.args.fold(false, |b: Bool, a: Type| b || contains_scoped(a, false)),
   }
 
 pub fn check_scoped_placement(
@@ -1823,7 +1833,7 @@ pub fn check_scoped_placement(
   ty: Type,
   passed: Bool,
 ) -> Checker / {abort.raise} =
-  if !keeps_scoped(resolve(checker, ty), passed) { checker } else {
+  if !contains_scoped(resolve(checker, ty), passed) { checker } else {
     report_error_at(
       checker,
       b"E0446",
@@ -1856,7 +1866,7 @@ pub fn rigid_params(checker: Checker) -> List<RigidParam> =
 pub fn assumed_for(checker: Checker, deriver: Deriver) -> List<Int> / {abort.raise} =
   checker.assumed.fold([], |accumulator: List<Int>, a: Assumption|
     if a.deriver == deriver || (deriver == NumericDeriver && a.deriver == IntegerDeriver) {
-      a.vars.fold(accumulator, |b: List<Int>, v: Int| ints_insert(b, v))
+      a.variables.fold(accumulator, |b: List<Int>, v: Int| ints_insert(b, v))
     } else { accumulator })
 
 pub type OrderedPart = { key: Type, container: Option<Type> }
@@ -1988,7 +1998,7 @@ pub fn note_map_key_sites(
   found: List<OrderedKey>,
 ) -> Checker / {abort.raise} =
   if found.len() == 0 { checker } else {
-    let assumed = assumed_for(checker, OrdDeriver);
+    let assumed = assumed_for(checker, OrderingDeriver);
     let params = rigid_params(checker);
     {
       ..checker,
@@ -2041,8 +2051,8 @@ pub fn note_witness_params(checker: Checker, cs: List<Constraint>) -> Checker =
 pub fn is_scheduler_handle(name: Bytes) -> Bool =
   name == task_name() || name == builtin_channel_name()
 
-pub fn task_op(operation: Bytes) -> Effect =
-  { effect: b"task", resource: SingletonResource, mode: WriteMode, op: Some(operation) }
+pub fn task_operation(operation: Bytes) -> Effect =
+  { effect: b"task", resource: SingletonResource, mode: WriteMode, operation: Some(operation) }
 
 pub fn effects_include_brand(effects: Effects, brand: ScopedValueKind) -> Bool =
   match brand {
@@ -2050,8 +2060,8 @@ pub fn effects_include_brand(effects: Effects, brand: ScopedValueKind) -> Bool =
       effects.listed.fold(false, |b: Bool, entry: Effect|
         b || (entry.effect == scoped_effect() && entry.resource == NamedResource(r))),
     Tasks ->
-      [b"join", b"await", b"cancel"].concat(channel_ops()).fold(
+      [b"join", b"await", b"cancel"].concat(channel_operations()).fold(
         effects_cover(effects.listed, seed_effect()),
-        |b: Bool, operation: Bytes| b || effects_cover(effects.listed, task_op(operation)),
+        |b: Bool, operation: Bytes| b || effects_cover(effects.listed, task_operation(operation)),
       ),
   }

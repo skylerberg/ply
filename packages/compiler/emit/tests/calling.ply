@@ -14,13 +14,14 @@ import compiler.emit.representations (BoundLambda, EmitParam, has_variables)
 import compiler.emit.lower.module_context (root_body, param_type)
 import compiler.check.typed (WholeBody)
 import compiler.emit.typed_ir (ZeroOperand, Representation, AsInt, AsBool, AsWord, AsImmediate,
-                               AsFlattened, AsSum, AsListView, CaseAllocation, Var, Arg, VarOperand,
-                               IntOperand, Rvalue, Call, Apply, Allocate, Get, Convert, Aggregate,
-                               Primitive, Native, Op, OfCalling, OfContainers, ClosureAllocation,
-                               CapturePath, TagTest, Inst, Let, Do, If, Case, Match, Loop, Next,
-                               Done, Restart, Jump, Return, SiteScope, Block, Fn, Member, Closure,
-                               AsFixed, IntTest, RangeTest, Convention, Lambda, BorrowedParam,
-                               OwnedParam, Plain, Handle, operand_representation, StackAllocation)
+                               AsFlattened, AsSum, AsListView, CaseAllocation, Variable, Arg,
+                               VariableOperand, IntOperand, Rvalue, Call, Apply, Allocate, Get,
+                               Convert, Aggregate, Primitive, Native, OperationCall, OfCalling,
+                               OfContainers, ClosureAllocation, CapturePath, TagTest, Instruction,
+                               Let, Do, If, Case, Match, Loop, Next, Done, Restart, Jump, Return,
+                               SiteScope, Block, Function, Member, Closure, AsFixed, IntTest,
+                               RangeTest, Convention, Lambda, BorrowedParam, OwnedParam, Plain,
+                               Handle, operand_representation, StackAllocation)
 import compiler.emit.typed_ir.calling (ConstantRead)
 import compiler.emit.typed_ir.containers (Rest, ItemAt)
 import compiler.emit.lower (lowered_fn, lowered_group)
@@ -36,7 +37,7 @@ import compiler.emit.emit_harness (Program, program_of, scheduled_program_of, pr
 import compiler.emit.lower.representation (passing, ByReference, c_values_of, value_words)
 import compiler.emit.layout (max_flat_words)
 import compiler.emit.print.value_printing (signature_types)
-import compiler.emit.print.count_functions (free_fn, call_text)
+import compiler.emit.print.count_functions (free_function, call_text)
 
 fn corpus() -> Bytes =
   Bytes::concat_all([
@@ -220,10 +221,10 @@ fn tail_groups() -> List<List<Bytes>> =
     [b"wide_even", b"wide_odd"],
   ]
 
-fn lowered_as_built(p: Program, name: Bytes) -> Fn / {abort.raise} =
+fn lowered_as_built(p: Program, name: Bytes) -> Function / {abort.raise} =
   lowered_by_key(p, Named(qualify(b"m", name)))
 
-fn lowered_by_key(p: Program, key: RootKey) -> Fn / {abort.raise} =
+fn lowered_by_key(p: Program, key: RootKey) -> Function / {abort.raise} =
   match range(0, p.roots.len()).find(|i: Int| p.roots.get(i).key == key) {
     None ->
       panic(String::of_bytes_lossy(b"no such definition: ".concat(root_text(root_name(key))))),
@@ -237,39 +238,39 @@ fn lowered_by_key(p: Program, key: RootKey) -> Fn / {abort.raise} =
 fn corpus_program() -> Program / {abort.raise} =
   match program_of(corpus()) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
 
-fn lowered(name: Bytes) -> Fn / {abort.raise} = lowered_as_built(corpus_program(), name)
+fn lowered(name: Bytes) -> Function / {abort.raise} = lowered_as_built(corpus_program(), name)
 
-fn vals_in(b: Block) -> List<Rvalue> =
-  b.fold([], |accumulator: List<Rvalue>, i: Inst|
+fn values_in(b: Block) -> List<Rvalue> =
+  b.fold([], |accumulator: List<Rvalue>, i: Instruction|
     match i {
       Let(l) -> accumulator.push(l.value),
       Do(d) -> accumulator.push(d.value),
-      If(x) -> accumulator.concat(vals_in(x.then)).concat(vals_in(x.otherwise)),
+      If(x) -> accumulator.concat(values_in(x.then)).concat(values_in(x.otherwise)),
       Case(c) ->
         c.arms.fold(accumulator, |a: List<Rvalue>, arm: { when: Int, body: Block }|
-          a.concat(vals_in(arm.body))).concat(
-          vals_in(c.rest),
+          a.concat(values_in(arm.body))).concat(
+          values_in(c.rest),
         ),
       Match(m) ->
-        m.arms.fold(accumulator, |a: List<Rvalue>, arm: Block| a.concat(vals_in(arm))).concat(
-          vals_in(m.rest),
+        m.arms.fold(accumulator, |a: List<Rvalue>, arm: Block| a.concat(values_in(arm))).concat(
+          values_in(m.rest),
         ),
-      Loop(l) -> accumulator.concat(vals_in(l.body)),
+      Loop(l) -> accumulator.concat(values_in(l.body)),
       _ -> accumulator,
     })
 
-fn bound_in(b: Block) -> List<Var> =
-  b.fold([], |accumulator: List<Var>, i: Inst|
+fn bound_in(b: Block) -> List<Variable> =
+  b.fold([], |accumulator: List<Variable>, i: Instruction|
     match i {
       Let(l) -> accumulator.push(l.var),
       If(x) -> accumulator.concat(bound_in(x.then)).concat(bound_in(x.otherwise)),
       Case(c) ->
-        c.arms.fold(accumulator, |a: List<Var>, arm: { when: Int, body: Block }|
+        c.arms.fold(accumulator, |a: List<Variable>, arm: { when: Int, body: Block }|
           a.concat(bound_in(arm.body))).concat(
           bound_in(c.rest),
         ),
       Match(m) ->
-        m.arms.fold(accumulator, |a: List<Var>, arm: Block| a.concat(bound_in(arm))).concat(
+        m.arms.fold(accumulator, |a: List<Variable>, arm: Block| a.concat(bound_in(arm))).concat(
           bound_in(m.rest),
         ),
       Loop(l) -> accumulator.concat(bound_in(l.body)),
@@ -277,7 +278,7 @@ fn bound_in(b: Block) -> List<Var> =
     })
 
 fn restarts(b: Block) -> Bool =
-  b.fold(false, |found: Bool, i: Inst|
+  b.fold(false, |found: Bool, i: Instruction|
     found
       || (match i {
         Restart(_) -> true,
@@ -285,14 +286,14 @@ fn restarts(b: Block) -> Bool =
         _ -> false,
       }))
 
-fn closure_of(f: Fn, nth: Int) -> Option<{ body: Fn, captures: Int }> =
+fn closure_of(f: Function, nth: Int) -> Option<{ body: Function, captures: Int }> =
   match f.lambdas.at(nth) {
     Some(Closure(c)) -> Some({ body: c.body, captures: c.captures }),
     None -> None,
   }
 
-fn lets_in(b: Block) -> List<{ var: Var, value: Rvalue }> =
-  b.fold([], |accumulator: List<{ var: Var, value: Rvalue }>, i: Inst|
+fn lets_in(b: Block) -> List<{ var: Variable, value: Rvalue }> =
+  b.fold([], |accumulator: List<{ var: Variable, value: Rvalue }>, i: Instruction|
     match i {
       Let(l) -> accumulator.push({ var: l.var, value: l.value }),
       Handle(h) -> accumulator.concat(lets_in(h.body)),
@@ -310,21 +311,21 @@ test "a handle around a spawnable task allocates its instance on the heap, and t
       let f = lowered_as_built(p, b"sayer");
       let lets = f.lambdas.fold(
         lets_in(f.body),
-        |accumulator: List<{ var: Var, value: Rvalue }>, l: Lambda|
+        |accumulator: List<{ var: Variable, value: Rvalue }>, l: Lambda|
           match l { Closure(c) -> accumulator.concat(lets_in(c.body.body)) },
       );
-      let blocks = lets.filter(|x: { var: Var, value: Rvalue }|
+      let blocks = lets.filter(|x: { var: Variable, value: Rvalue }|
         match x.value {
-          Op(o) -> match o.op { OfHandling(HeapInstance(_)) -> true, _ -> false },
+          OperationCall(o) -> match o.operation { OfHandling(HeapInstance(_)) -> true, _ -> false },
           _ -> false,
         });
       assert_eq(blocks.len(), 1);
       assert(
-        lets.any(|x: { var: Var, value: Rvalue }|
+        lets.any(|x: { var: Variable, value: Rvalue }|
           match x.value {
             Allocate(m) ->
               m.args.any(|a: Arg|
-                blocks.any(|b: { var: Var, value: Rvalue }| a == VarOperand(b.var))),
+                blocks.any(|b: { var: Variable, value: Rvalue }| a == VariableOperand(b.var))),
             _ -> false,
           }),
         None,
@@ -337,7 +338,7 @@ test "a call of a definition passes each argument in the representation the call
   {
     let f = lowered(b"twice");
     assert_eq(
-      vals_in(f.body).fold(
+      values_in(f.body).fold(
         [],
         |accumulator: List<{ representations: List<Representation>, result: Representation }>, v: Rvalue|
           match v {
@@ -356,7 +357,7 @@ test "a call of a definition passes each argument in the representation the call
   {
     let f = lowered(b"handed");
     assert_eq(
-      vals_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
+      values_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
         match v {
           Call(c) -> accumulator.push(reps_of(c.convention).push(c.convention.result)),
           _ -> accumulator,
@@ -370,7 +371,7 @@ test "a small record is passed to a call and returned from it as separate fields
   {
     let f = lowered(b"summed");
     assert_eq(
-      vals_in(f.body).fold(
+      values_in(f.body).fold(
         [],
         |accumulator: List<{ representations: List<Representation>, result: Representation }>, v: Rvalue|
           match v {
@@ -420,7 +421,7 @@ test "a lambda and a function value also receive a small record as separate fiel
   {
     let f = lowered(b"applied_pair");
     assert_eq(
-      vals_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
+      values_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
         match v {
           Apply(a) -> accumulator.push(reps_of(a.convention).push(a.convention.result)),
           _ -> accumulator,
@@ -443,7 +444,7 @@ test "a call of a generic definition lowers to a generic call recorded with the 
       },
     ]);
     assert_eq(
-      vals_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
+      values_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
         match v {
           Call(c) -> if c.callee == Generic(0) {
             accumulator.push(reps_of(c.convention).push(c.convention.result))
@@ -479,7 +480,7 @@ test "a self call in tail position restarts the body, and a call from a lambda t
       Some(c) -> {
         assert(!restarts(c.body.body), None);
         assert_eq(
-          vals_in(c.body.body).filter(|v: Rvalue|
+          values_in(c.body.body).filter(|v: Rvalue|
             match v { Call(x) -> x.callee == Root(Named(b"m.count")), _ -> false }).len(
           ),
           1,
@@ -494,7 +495,7 @@ test "a lambda becomes a closure over its own function, which receives its captu
     let f = lowered(b"adder");
     assert_eq(f.lambdas.len(), 1);
     assert_eq(
-      vals_in(f.body).fold(
+      values_in(f.body).fold(
         [],
         |accumulator: List<{ captures: Int, params: Int, args: Int }>, v: Rvalue|
           match v {
@@ -516,7 +517,8 @@ test "a lambda becomes a closure over its own function, which receives its captu
         assert_eq(reps_of(c.body.convention), [AsInt, AsInt]);
         assert_eq(c.body.convention.result, AsInt);
         assert_eq(
-          vals_in(c.body.body).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }).len(),
+          values_in(c.body.body).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }).len(
+          ),
           0,
         )
       },
@@ -560,7 +562,7 @@ test "a closure is its own heap block that starts with its function descriptor, 
       },
     };
     assert(text.index_of(b"ply_rel_int") == None, Some(String::of_bytes_lossy(text)));
-    has(call_text(free_fn(), [b"ctx", b"self", b"24"]));
+    has(call_text(free_function(), [b"ctx", b"self", b"24"]));
     assert(text.index_of(b"PlyFnBlock ") == None, Some(String::of_bytes_lossy(text)))
   }
 }
@@ -569,7 +571,7 @@ test "a record captured by a closure is stored in the closure's block as separat
   {
     let f = lowered(b"captor");
     assert_eq(
-      vals_in(f.body).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }).len(),
+      values_in(f.body).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }).len(),
       0,
     );
     let text = printed_text(corpus_program(), f);
@@ -595,7 +597,7 @@ test "a lambda written inside another lambda becomes a closure of the enclosing 
       None -> assert(false, Some("nested makes no closure")),
       Some(outer) ->
         assert_eq(
-          vals_in(outer.body.body).fold(
+          values_in(outer.body.body).fold(
             [],
             |accumulator: List<{ nth: Int, captures: Int }>, v: Rvalue|
               match v {
@@ -613,8 +615,8 @@ test "a lambda written inside another lambda becomes a closure of the enclosing 
 }
 
 test "a definition or constructor used as a value becomes a closure around a wrapper lambda, and a pure definition with no parameters is evaluated once" {
-  let made = |f: Fn|
-    vals_in(f.body).fold([], |accumulator: List<{ captures: Int, params: Int }>, v: Rvalue|
+  let made = |f: Function|
+    values_in(f.body).fold([], |accumulator: List<{ captures: Int, params: Int }>, v: Rvalue|
       match v {
         Allocate(m) -> match m.made {
           ClosureAllocation(c) -> accumulator.push({ captures: c.captures, params: c.params }),
@@ -631,7 +633,7 @@ test "a definition or constructor used as a value becomes a closure around a wra
         assert_eq(reps_of(c.body.convention), [AsInt, AsInt]);
         assert_eq(c.body.kind, Plain);
         assert_eq(
-          vals_in(c.body.body).filter(|v: Rvalue|
+          values_in(c.body.body).filter(|v: Rvalue|
             match v { Call(k) -> k.callee == Root(Named(b"m.add")), _ -> false }).len(
           ),
           1,
@@ -646,7 +648,7 @@ test "a definition or constructor used as a value becomes a closure around a wra
       None -> assert(false, Some("some_of makes no closure")),
       Some(c) ->
         assert_eq(
-          vals_in(c.body.body).filter(|v: Rvalue|
+          values_in(c.body.body).filter(|v: Rvalue|
             match v { Call(_) -> true, Apply(_) -> true, _ -> false }).len(
           ),
           0,
@@ -655,14 +657,18 @@ test "a definition or constructor used as a value becomes a closure around a wra
   };
   {
     let f = lowered(b"read_kept");
-    let vs = vals_in(f.body);
+    let vs = values_in(f.body);
     assert_eq(
       vs.filter(|v: Rvalue|
         match v {
-          Op(o) ->
-            o.op
+          OperationCall(o) ->
+            o.operation
               == OfCalling(
-                ConstantRead({ callee: Root(Named(b"m.kept")), kept: int_type(), constant: false }),
+                ConstantRead({
+                  callee: Root(Named(b"m.kept")),
+                  value_type: int_type(),
+                  constant: false,
+                }),
               ),
           _ -> false,
         }).len(
@@ -677,7 +683,7 @@ test "a definition or constructor used as a value becomes a closure around a wra
 test "a no-parameter function that calls a nondeterministic native which reads state is called at every use, but one that calls a pure native is called once" {
   let scheduler = {
     name: scheduler_module(),
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"import std.internal.native (native)\n",
       b"extern fn seed_path() -> Bytes / {native.read}\n",
       b"extern fn site_placed(root: Int, start: Int, end: Int) -> Bytes\n",
@@ -690,14 +696,14 @@ test "a no-parameter function that calls a nondeterministic native which reads s
       b"}\n",
     ]),
   };
-  let native = { name: b"std.internal.native", src: b"pub nondet effect native {}\n" };
+  let native = { name: b"std.internal.native", source_text: b"pub nondet effect native {}\n" };
   let region = b"fn main() -> Int / {abort.raise, sim.read} = simulate { 1 }\n";
   {
     let f = shipped_lowered(region, [scheduler, native], scheduler_module(), b"ran");
     let read = |callee: Bytes|
-      vals_in(f.body).filter(|v: Rvalue|
+      values_in(f.body).filter(|v: Rvalue|
         match v {
-          Op(o) -> match o.op {
+          OperationCall(o) -> match o.operation {
             OfCalling(ConstantRead(c)) ->
               c.callee == Root(Named(qualify(scheduler_module(), callee))),
             _ -> false,
@@ -712,7 +718,8 @@ test "a no-parameter function that calls a nondeterministic native which reads s
 test "closures inside a scope-bound value, and the builtin results for that value, are typed as that value, so no variable has an unresolved type" {
   {
     let f = lowered(b"held");
-    let open = |b: Fn| b.params.concat(bound_in(b.body)).filter(|v: Var| has_variables(v.ty));
+    let open = |b: Function|
+      b.params.concat(bound_in(b.body)).filter(|v: Variable| has_variables(v.ty));
     assert_eq(open(f), []);
     assert_eq(
       f.lambdas.map(|l: Lambda| match l { Closure(c) -> open(c.body) }),
@@ -733,7 +740,7 @@ test "closures inside a scope-bound value, and the builtin results for that valu
 test "a lambda passed to a parameter its callee borrows is allocated in the caller's stack frame, and the call is specialised for that lambda" {
   {
     let f = lowered(b"lends");
-    let vs = vals_in(f.body);
+    let vs = values_in(f.body);
     assert_eq(
       vs.fold([], |accumulator: List<Bool>, v: Rvalue|
         match v {
@@ -766,7 +773,7 @@ test "calling a function value passes the effect descriptor and effect evidence 
   {
     let f = lowered(b"applied");
     assert_eq(
-      vals_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
+      values_in(f.body).fold([], |accumulator: List<List<Representation>>, v: Rvalue|
         match v {
           Apply(a) -> accumulator.push(reps_of(a.convention).push(a.convention.result)),
           _ -> accumulator,
@@ -780,7 +787,7 @@ test "calling a function value passes the effect descriptor and effect evidence 
 test "a lambda bound by `let` and called directly is inlined with no indirect call, and reads its captured values from its closure" {
   {
     let f = lowered(b"local");
-    let vs = vals_in(f.body);
+    let vs = values_in(f.body);
     assert_eq(vs.filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len(), 0);
     assert_eq(
       vs.filter(|v: Rvalue| match v { Get(g) -> g.path == CapturePath(0), _ -> false }).len(),
@@ -790,15 +797,16 @@ test "a lambda bound by `let` and called directly is inlined with no indirect ca
 }
 
 test "a step function whose every arm directly builds `Continue` or `Stop` loops or exits without allocating an object" {
-  let made = |f: Fn|
-    vals_in(f.body).filter(|v: Rvalue|
+  let made = |f: Function|
+    values_in(f.body).filter(|v: Rvalue|
       match v {
         Allocate(m) -> match m.made { CaseAllocation(_) -> true, _ -> false },
         Aggregate(_) -> true,
         _ -> false,
       }).len(
     );
-  let looped = |f: Fn| f.body.filter(|i: Inst| match i { Loop(_) -> true, _ -> false }).len();
+  let looped = |f: Function|
+    f.body.filter(|i: Instruction| match i { Loop(_) -> true, _ -> false }).len();
   {
     let f = lowered(b"steps");
     assert_eq(looped(f), 1);
@@ -812,9 +820,9 @@ test "a step function whose every arm directly builds `Continue` or `Stop` loops
 
 test "`iterate` on a step that is a function value loops in the body, calling the step through its function descriptor on each pass" {
   let applying = |b: Block|
-    b.filter(|i: Inst|
+    b.filter(|i: Instruction|
       match i {
-        Loop(l) -> vals_in(l.body).any(|v: Rvalue| match v { Apply(_) -> true, _ -> false }),
+        Loop(l) -> values_in(l.body).any(|v: Rvalue| match v { Apply(_) -> true, _ -> false }),
         _ -> false,
       }).len(
     );
@@ -845,7 +853,7 @@ test "a step's loop fails by the runtime once its budget is spent" {
 test "a step that `iterate` runs becomes a loop over its state and budget, where each pass continues or exits according to the `Iter` it returns" {
   {
     let f = lowered(b"stepped");
-    match f.body.fold(None, |accumulator: Option<Inst>, i: Inst|
+    match f.body.fold(None, |accumulator: Option<Instruction>, i: Instruction|
         match i { Loop(_) -> Some(i), _ -> accumulator }) {
       Some(Loop(l)) -> {
         assert_eq(l.state.map(|c: LoopVariable| c.var.representation), [AsInt, AsInt]);
@@ -884,7 +892,7 @@ fn walk_corpus() -> Bytes =
   ])
 
 fn loops_in(b: Block) -> List<Int> =
-  b.fold([], |accumulator: List<Int>, i: Inst|
+  b.fold([], |accumulator: List<Int>, i: Instruction|
     match i {
       Loop(l) -> accumulator.push(l.state.len()).concat(loops_in(l.body)),
       If(x) -> accumulator.concat(loops_in(x.then)).concat(loops_in(x.otherwise)),
@@ -914,12 +922,12 @@ test "a fold, map or filter over a lambda is one loop in its caller, the lambda'
         b"counted",
       ];
       let functions = corpus_names.map(|n: Bytes| lowered_as_built(p, n));
-      assert_eq(functions.map(|f: Fn| loops_in(f.body)), [[2], [2], [2], [2], [2], [4], [2]]);
-      let applied = |f: Fn|
-        vals_in(f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len();
+      assert_eq(functions.map(|f: Function| loops_in(f.body)), [[2], [2], [2], [2], [2], [4], [2]]);
+      let applied = |f: Function|
+        values_in(f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len();
       assert_eq(functions.map(applied), [0, 0, 0, 0, 0, 0, 0]);
       let prelude = |n: Bytes| Named(b"std.prelude.".concat(n));
-      assert_eq(functions.map(|f: Fn| f.links.generics.map(|g: GenericCall| g.callee)), [
+      assert_eq(functions.map(|f: Function| f.links.generics.map(|g: GenericCall| g.callee)), [
         [],
         [prelude(b"List::push")],
         [prelude(b"List::push")],
@@ -928,9 +936,9 @@ test "a fold, map or filter over a lambda is one loop in its caller, the lambda'
         [prelude(b"node_max"), prelude(b"leaf_above"), prelude(b"first_leaf")],
         [prelude(b"List::push")],
       ]);
-      let reads_items = |f: Fn|
-        vals_in(f.body).any(|v: Rvalue|
-          match v { Op(o) -> o.op == OfContainers(ItemAt), _ -> false });
+      let reads_items = |f: Function|
+        values_in(f.body).any(|v: Rvalue|
+          match v { OperationCall(o) -> o.operation == OfContainers(ItemAt), _ -> false });
       assert_eq(functions.map(reads_items), [true, true, true, true, true, false, false])
     },
   }
@@ -949,7 +957,7 @@ fn lowered_specialisation(
   args: List<Type>,
   functions: List<InlinedLambda>,
   lambda_arguments: List<Option<BoundLambda>>,
-) -> Result<Fn, Bytes> / {abort.raise} =
+) -> Result<Function, Bytes> / {abort.raise} =
   specialised_at(
     p,
     name,
@@ -962,7 +970,7 @@ fn specialised_at(
   name: Bytes,
   key: RootKey,
   lambda_arguments: List<Option<BoundLambda>>,
-) -> Result<Fn, Bytes> / {abort.raise} =
+) -> Result<Function, Bytes> / {abort.raise} =
   match match root_index(p, name) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such root"),
     Some(r) -> {
@@ -994,10 +1002,10 @@ fn lambda_specialisation(
   lambda_root: Bytes,
   generic: Bytes,
   param: Int,
-) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
+) -> Result<{ f: Function, base: Int }, Bytes> / {abort.raise} =
   match match root_index(p, lambda_root) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no function contains the lambda"),
-    Some(l) -> match borrowed_lambda_key(p.src, lambda_root, generic, param) {
+    Some(l) -> match borrowed_lambda_key(p.source, lambda_root, generic, param) {
       Err(reason) -> Err(reason),
       Ok(key) -> {
         let written = lambdas_of(known_body(root_text(root_name(l.key)), l.params, l.code));
@@ -1036,7 +1044,7 @@ fn borrowed_lambda_key(
   generic: Bytes,
   param: Int,
 ) -> Result<RootKey, Bytes> / {abort.raise} =
-  match roots_built([{ name: b"m", src: source }]) {
+  match roots_built([{ name: b"m", source_text: source }]) {
     Err(reason) -> Err(reason),
     Ok(keys) -> {
       let of = keys.filter(|k: RootKey| definition_of(k) == Some(qualify(b"m", generic)));
@@ -1067,16 +1075,16 @@ test "a lambda inlined into a specialisation of another function uses the passin
       Err(reason) -> assert_eq(reason, b""),
       Ok(run) -> {
         assert_eq(
-          run.f.body.fold([], |accumulator: List<Inst>, i: Inst|
+          run.f.body.fold([], |accumulator: List<Instruction>, i: Instruction|
             match i { SiteScope(_) -> accumulator.push(i), _ -> accumulator }),
           [SiteScope(Some({ root: Named(b"m.lends_word"), base: run.base })), SiteScope(None)],
         );
         assert_eq(
-          vals_in(run.f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len(),
+          values_in(run.f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len(),
           0,
         );
         assert_eq(
-          vals_in(run.f.body).filter(|v: Rvalue|
+          values_in(run.f.body).filter(|v: Rvalue|
             match v { Get(g) -> g.path == CapturePath(0), _ -> false }).len(
           ),
           1,
@@ -1092,19 +1100,28 @@ test "a closure made inside a lambda passed without ownership performs effects w
     Ok(p) -> match lambda_specialisation(p, b"lends_noting", b"apply_in", 0) {
       Err(reason) -> assert_eq(reason, b""),
       Ok(run) -> {
-        let bridged = |f: Fn|
-          vals_in(f.body).filter(|v: Rvalue|
-            match v { Op(o) -> o.op == OfHandling(SchedulerEvidence), _ -> false });
-        let performs = |f: Fn|
-          vals_in(f.body).filter(|v: Rvalue|
+        let bridged = |f: Function|
+          values_in(f.body).filter(|v: Rvalue|
             match v {
-              Op(o) -> match o.op { OfHandling(Perform(_)) -> true, _ -> false },
+              OperationCall(o) -> o.operation == OfHandling(SchedulerEvidence),
               _ -> false,
             });
-        let closures = range(0, run.f.lambdas.len()).fold([], |accumulator: List<Fn>, k: Int|
-          match closure_of(run.f, k) { Some(c) -> accumulator.push(c.body), None -> accumulator });
-        assert_eq(closures.map(|f: Fn| performs(f).len()), [1]);
-        assert_eq(closures.map(|f: Fn| bridged(f).len()).concat([bridged(run.f).len()]), [0, 0])
+        let performs = |f: Function|
+          values_in(f.body).filter(|v: Rvalue|
+            match v {
+              OperationCall(o) -> match o.operation { OfHandling(Perform(_)) -> true, _ -> false },
+              _ -> false,
+            });
+        let closures = range(0, run.f.lambdas.len()).fold(
+          [],
+          |accumulator: List<Function>, k: Int|
+            match closure_of(run.f, k) { Some(c) -> accumulator.push(c.body), None -> accumulator },
+        );
+        assert_eq(closures.map(|f: Function| performs(f).len()), [1]);
+        assert_eq(closures.map(|f: Function| bridged(f).len()).concat([bridged(run.f).len()]), [
+          0,
+          0,
+        ])
       },
     },
   }
@@ -1116,9 +1133,9 @@ test "a lambda passed without ownership to a function generic over a type and ef
     Ok(p) -> match lambda_specialisation(p, b"lends_logged", b"apply_in", 0) {
       Err(reason) -> assert_eq(reason, b""),
       Ok(run) -> {
-        let words = vals_in(run.f.body).fold([], |accumulator: List<List<Arg>>, v: Rvalue|
+        let words = values_in(run.f.body).fold([], |accumulator: List<List<Arg>>, v: Rvalue|
           match v {
-            Op(o) -> match o.op {
+            OperationCall(o) -> match o.operation {
               OfHandling(Perform(_)) -> accumulator.push(o.args),
               _ -> accumulator,
             },
@@ -1137,9 +1154,9 @@ test "a lambda passed without ownership to a parameter with a fixed effect list 
     Ok(p) -> match lambda_specialisation(p, b"lends_closed", b"noting", 0) {
       Err(reason) -> assert_eq(reason, b""),
       Ok(run) -> {
-        let operations = vals_in(run.f.body).fold([], |accumulator: List<Bytes>, v: Rvalue|
+        let operations = values_in(run.f.body).fold([], |accumulator: List<Bytes>, v: Rvalue|
           match v {
-            Op(o) -> match o.op {
+            OperationCall(o) -> match o.operation {
               OfHandling(Perform(_)) -> accumulator.push(b"perform"),
               OfHandling(SchedulerEvidence) -> accumulator.push(b"bridge"),
               _ -> accumulator,
@@ -1165,7 +1182,7 @@ test "lambdas written inside a lambda passed without ownership belong to the fun
           [Some(lambda_arguments), Some(lambda_arguments)],
         );
         assert_eq(
-          vals_in(run.f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len(),
+          values_in(run.f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false }).len(),
           0,
         );
         assert_eq(run.f.links.generics.map(|g: GenericCall| g.functions), [
@@ -1183,12 +1200,13 @@ fn fold_operators(
   match lambda_specialisation(p, lambda_root, b"fold_from", 3) {
     Err(reason) -> Err(reason),
     Ok(run) -> {
-      let values = vals_in(run.f.body);
+      let values = values_in(run.f.body);
       Ok({
         c: values.fold([], |accumulator: List<Bytes>, v: Rvalue|
           match v {
-            Primitive(x) -> if x.on == AsInt && x.op != b"ge" { accumulator.push(x.op) }
-            else { accumulator },
+            Primitive(x) -> if x.on == AsInt && x.operation != b"ge" {
+              accumulator.push(x.operation)
+            } else { accumulator },
             _ -> accumulator,
           }),
         runtime: values.filter(|v: Rvalue|
@@ -1248,7 +1266,7 @@ test "a closure written in a function calls a borrowed lambda parameter of that 
           range(0, run.f.lambdas.len()).map(|k: Int|
             match closure_of(run.f, k) {
               Some(c) ->
-                vals_in(c.body.body).filter(|v: Rvalue|
+                values_in(c.body.body).filter(|v: Rvalue|
                   match v { Apply(_) -> true, _ -> false }).len(
                 ),
               None -> 0,
@@ -1262,7 +1280,7 @@ test "a closure written in a function calls a borrowed lambda parameter of that 
 type TestedValue = { representation: Representation, branch: Bool }
 
 fn tested_in(b: Block) -> List<TestedValue> =
-  b.fold([], |accumulator: List<TestedValue>, i: Inst|
+  b.fold([], |accumulator: List<TestedValue>, i: Instruction|
     match i {
       If(x) ->
         accumulator.push({ representation: operand_representation(x.cond), branch: true }).concat(
@@ -1344,10 +1362,10 @@ test "a specialisation reads a parameter passed as a word at its full type, so a
   assert_eq([built([]), built([{ param: 1, owner: Named(b"m.positive"), nth: 0 }])], [None, None])
 }
 
-fn cases_module() -> { name: Bytes, src: Bytes } =
+fn cases_module() -> { name: Bytes, source_text: Bytes } =
   {
     name: b"std.cases",
-    src: Bytes::concat_all([
+    source_text: Bytes::concat_all([
       b"pub type Table<a> = List<a>\n",
       b"pub type Listed = { label: String, identity: Bytes }\n",
       b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} =\n",
@@ -1359,7 +1377,7 @@ fn cases_module() -> { name: Bytes, src: Bytes } =
 
 fn builds(
   source: Bytes,
-  shipped: List<{ name: Bytes, src: Bytes }>,
+  shipped: List<{ name: Bytes, source_text: Bytes }>,
   root: RootKey,
 ) -> Result<Bool, Bytes> / {abort.raise} =
   match built_c(source, shipped, root) { Err(reason) -> Err(reason), Ok(_) -> Ok(true) }
@@ -1404,7 +1422,7 @@ test "the variables a `law` binds become parameters of its generated functions, 
   }
 }
 
-fn lowered_tail_group(corpus_names: List<Bytes>) -> Result<Fn, Bytes> / {abort.raise} =
+fn lowered_tail_group(corpus_names: List<Bytes>) -> Result<Function, Bytes> / {abort.raise} =
   match program_of(corpus()) {
     Err(reason) -> Err(reason),
     Ok(p) -> {
@@ -1424,18 +1442,22 @@ fn lowered_tail_group(corpus_names: List<Bytes>) -> Result<Fn, Bytes> / {abort.r
     },
   }
 
-fn insts_in(b: Block) -> List<Inst> =
-  b.fold([], |accumulator: List<Inst>, i: Inst|
+fn instructions_in(b: Block) -> List<Instruction> =
+  b.fold([], |accumulator: List<Instruction>, i: Instruction|
     match i {
-      If(x) -> accumulator.push(i).concat(insts_in(x.then)).concat(insts_in(x.otherwise)),
+      If(x) ->
+        accumulator.push(i).concat(instructions_in(x.then)).concat(instructions_in(x.otherwise)),
       Case(c) ->
         c.arms.fold(
-          accumulator.push(i).concat(insts_in(c.rest)),
-          |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts_in(arm.body)),
+          accumulator.push(i).concat(instructions_in(c.rest)),
+          |a: List<Instruction>, arm: { when: Int, body: Block }|
+            a.concat(instructions_in(arm.body)),
         ),
       Match(m) ->
-        m.arms.fold(accumulator.push(i).concat(insts_in(m.rest)), |a: List<Inst>, arm: Block|
-          a.concat(insts_in(arm))),
+        m.arms.fold(
+          accumulator.push(i).concat(instructions_in(m.rest)),
+          |a: List<Instruction>, arm: Block| a.concat(instructions_in(arm)),
+        ),
       _ -> accumulator.push(i),
     })
 
@@ -1453,9 +1475,9 @@ test "a function that calls itself with its effect-label arguments in a differen
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let f = lowered_as_built(p, b"hop");
-      let words = f.params.drop(f.params.len() - 2).map(VarOperand);
+      let words = f.params.drop(f.params.len() - 2).map(VariableOperand);
       assert_eq(
-        insts_in(f.body).fold([], |accumulator: List<List<Arg>>, i: Inst|
+        instructions_in(f.body).fold([], |accumulator: List<List<Arg>>, i: Instruction|
           match i {
             Restart(args) -> accumulator.push(args.drop(args.len() - 2)),
             _ -> accumulator,
@@ -1478,9 +1500,9 @@ test "a self call that passes along the evidence words it received as one array 
     Ok(p) -> {
       let f = lowered_as_built(p, b"spin");
       assert_eq(
-        insts_in(f.body).fold([], |accumulator: List<List<Arg>>, i: Inst|
+        instructions_in(f.body).fold([], |accumulator: List<List<Arg>>, i: Instruction|
           match i { Restart(args) -> accumulator.push(args.drop(1)), _ -> accumulator }),
-        [f.params.drop(1).map(VarOperand)],
+        [f.params.drop(1).map(VariableOperand)],
       )
     },
   }
@@ -1501,17 +1523,19 @@ test "a tail group lowers to one function that runs each member by case, and a t
     Err(reason) -> assert_eq(reason, b""),
     Ok(f) -> {
       assert_eq(f.members.map(|m: Member| m.key), [Named(b"m.even"), Named(b"m.odd")]);
-      assert_eq(f.members.map(|m: Member| m.params.map(|v: Var| v.representation)), [
+      assert_eq(f.members.map(|m: Member| m.params.map(|v: Variable| v.representation)), [
         [AsInt],
         [AsInt],
       ]);
       assert_eq(
-        insts_in(f.body).fold([], |accumulator: List<Int>, i: Inst|
+        instructions_in(f.body).fold([], |accumulator: List<Int>, i: Instruction|
           match i { Jump(e) -> accumulator.push(e.member), _ -> accumulator }),
         [1, 0],
       );
       assert_eq(
-        insts_in(f.body).filter(|i: Inst| match i { Restart(_) -> true, _ -> false }).len(),
+        instructions_in(f.body).filter(|i: Instruction|
+          match i { Restart(_) -> true, _ -> false }).len(
+        ),
         0,
       )
     },
@@ -1530,7 +1554,7 @@ test "mutually tail-calling functions take and return a record and a sum as sepa
         [[true, false, true], [true, false, true]],
       );
       assert_eq(
-        insts_in(f.body).fold([], |accumulator: List<Int>, i: Inst|
+        instructions_in(f.body).fold([], |accumulator: List<Int>, i: Instruction|
           match i { Jump(e) -> accumulator.push(e.member), _ -> accumulator }),
         [1, 0],
       );
@@ -1579,11 +1603,13 @@ test "a specialisation, looked up by its type arguments and lambda arguments, re
       Err(reason) -> assert_eq(reason, b""),
       Ok(f) -> {
         assert_eq(
-          insts_in(f.body).filter(|i: Inst| match i { Restart(_) -> true, _ -> false }).len(),
+          instructions_in(f.body).filter(|i: Instruction|
+            match i { Restart(_) -> true, _ -> false }).len(
+          ),
           1,
         );
         assert_eq(
-          vals_in(f.body).filter(|v: Rvalue| match v { Call(_) -> true, _ -> false }).len(),
+          values_in(f.body).filter(|v: Rvalue| match v { Call(_) -> true, _ -> false }).len(),
           0,
         )
       },
@@ -1592,9 +1618,9 @@ test "a specialisation, looked up by its type arguments and lambda arguments, re
 }
 
 fn rests_made(b: Block) -> Int =
-  vals_in(b).filter(|v: Rvalue|
+  values_in(b).filter(|v: Rvalue|
     match v {
-      Op(o) -> o.op == OfContainers(Rest),
+      OperationCall(o) -> o.operation == OfContainers(Rest),
       Convert(k) -> operand_representation(k.arg) == AsListView,
       _ -> false,
     }).len(
@@ -1607,9 +1633,10 @@ test "a list that a function walks by restarting on its rest is a view of the li
       let walked = |name: Bytes| {
         let f = lowered_as_built(p, name);
         Ok({
-          held: f.params.map(|v: Var| v.representation).take(1),
+          held: f.params.map(|v: Variable| v.representation).take(1),
           taken: reps_of(f.convention).take(1),
-          restarts: insts_in(f.body).any(|i: Inst| match i { Restart(_) -> true, _ -> false }),
+          restarts: instructions_in(f.body).any(|i: Instruction|
+            match i { Restart(_) -> true, _ -> false }),
           rests: rests_made(f.body),
         })
       };
@@ -1633,7 +1660,7 @@ test "a list that a function walks by restarting on its rest is a view of the li
       {
         let f = lowered_as_built(p, b"again");
         assert(
-          vals_in(f.body).any(|v: Rvalue|
+          values_in(f.body).any(|v: Rvalue|
             match v { Aggregate(g) -> g.parts.at(1) == Some(IntOperand(0)), _ -> false }),
         )
       }
@@ -1642,7 +1669,7 @@ test "a list that a function walks by restarting on its rest is a view of the li
 }
 
 fn first_loop_body(b: Block) -> Option<Block> =
-  b.fold(None, |accumulator: Option<Block>, i: Inst|
+  b.fold(None, |accumulator: Option<Block>, i: Instruction|
     match accumulator {
       Some(_) -> accumulator,
       None -> match i { Loop(l) -> Some(l.body), _ -> None },
@@ -1659,7 +1686,7 @@ test "a loop step that does more work after raising an effect runs the remaining
           _ -> false,
         });
         assert_eq(
-          vals_in(pass).filter(|v: Rvalue|
+          values_in(pass).filter(|v: Rvalue|
             match v {
               Aggregate(_) -> true,
               Allocate(m) -> match m.made { CaseAllocation(_) -> true, _ -> false },
@@ -1684,7 +1711,7 @@ test "a restart and a loop over a record set its parameter or state value by val
   {
     let f = lowered(b"paired_step");
     assert_eq(
-      f.body.fold([], |accumulator: List<Bool>, i: Inst|
+      f.body.fold([], |accumulator: List<Bool>, i: Instruction|
         match i {
           Loop(l) ->
             accumulator.concat(l.state.map(|c: LoopVariable| several_values(c.var.representation))),
@@ -1697,19 +1724,19 @@ test "a restart and a loop over a record set its parameter or state value by val
 }
 
 test "a continuation is a machine word the runtime calls with word arguments, and a handler clause that resumes it returns the word that call returns" {
-  let applied = |f: Fn|
-    vals_in(f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false });
-  let clause_of = |f: Fn|
-    range(0, f.lambdas.len()).fold(None, |accumulator: Option<Fn>, k: Int|
+  let applied = |f: Function|
+    values_in(f.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false });
+  let clause_of = |f: Function|
+    range(0, f.lambdas.len()).fold(None, |accumulator: Option<Function>, k: Int|
       match closure_of(f, k) {
         Some(c) -> if applied(c.body).len() > 0 { Some(c.body) } else { accumulator },
         None -> accumulator,
       });
-  let conventions = |c: Fn|
+  let conventions = |c: Function|
     applied(c).map(|v: Rvalue|
       match v { Apply(a) -> reps_of(a.convention).push(a.convention.result), _ -> [] });
-  let resumed = |c: Fn|
-    c.body.fold([], |accumulator: List<Var>, i: Inst|
+  let resumed = |c: Function|
+    c.body.fold([], |accumulator: List<Variable>, i: Instruction|
       match i {
         Let(l) -> match l.value { Apply(_) -> accumulator.push(l.var), _ -> accumulator },
         _ -> accumulator,
@@ -1721,11 +1748,13 @@ test "a continuation is a machine word the runtime calls with word arguments, an
       Some(c) -> {
         assert_eq(c.convention.result, AsWord);
         assert_eq(conventions(c), [[AsWord, AsWord]]);
-        assert_eq(resumed(c).map(|v: Var| c.body.contains(Return(VarOperand(v)))), [true]);
+        assert_eq(resumed(c).map(|v: Variable| c.body.contains(Return(VariableOperand(v)))), [
+          true,
+        ]);
         assert_eq(
-          vals_in(c.body).filter(|v: Rvalue|
+          values_in(c.body).filter(|v: Rvalue|
             match v {
-              Convert(k) -> resumed(c).any(|r: Var| k.arg == VarOperand(r)),
+              Convert(k) -> resumed(c).any(|r: Variable| k.arg == VariableOperand(r)),
               _ -> false,
             }).len(
           ),
@@ -1811,7 +1840,7 @@ fn name_length(s: Bytes) -> Int =
   }).n
 
 test "every function in the calling test corpus prints C that assigns only variables it declares" {
-  let left_of = |f: Fn| {
+  let left_of = |f: Function| {
     let built = built_form(f);
     if needs_specialisation(built.links.needs) { [] }
     else { undeclared(printed_text(corpus_program(), built)) }
@@ -1882,9 +1911,9 @@ test "every function and tail group in the calling test corpus lowers, passes th
   }
 }
 
-fn root_calls(f: Fn) -> List<{ callee: RootKey, convention: Convention }> =
+fn root_calls(f: Function) -> List<{ callee: RootKey, convention: Convention }> =
   f.lambdas.fold(
-    vals_in(f.body).fold(
+    values_in(f.body).fold(
       [],
       |accumulator: List<{ callee: RootKey, convention: Convention }>, v: Rvalue|
         match v {
@@ -1977,7 +2006,7 @@ test "a closure and a function value take a sum wider than a call's registers by
   {
     let f = lowered(b"wide_applied");
     assert_eq(
-      vals_in(f.body).fold([], |accumulator: List<Bool>, v: Rvalue|
+      values_in(f.body).fold([], |accumulator: List<Bool>, v: Rvalue|
         match v {
           Apply(a) -> accumulator.concat(reps_of(a.convention).map(is_wide_sum)),
           _ -> accumulator,
@@ -2038,7 +2067,7 @@ test "a function used as a value is passed down a chain of generic calls along w
     b"  fresh(pack_frame, look)\n",
     b"}\n",
   ]);
-  match roots_built([{ name: b"m", src: source }]) {
+  match roots_built([{ name: b"m", source_text: source }]) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(keys) -> {
       let rows_of = |name: Bytes|
@@ -2082,7 +2111,7 @@ test "a function from another module used as a value becomes a closure that rece
     b"fn through<|e>(read: (Int) -> Int / {abort.raise | e}) -> Int / {abort.raise | e} = read(1)\n",
     b"fn top() -> Int / {shipped.answer, abort.raise} = through(pack_frame)\n",
   ]);
-  let f = shipped_lowered(source, [{ name: b"std.probe", src: u }], b"m", b"top");
+  let f = shipped_lowered(source, [{ name: b"std.probe", source_text: u }], b"m", b"top");
   assert_eq(f.lambdas.map(|l: Lambda| match l { Closure(c) -> c.words.count }), [1])
 }
 
@@ -2102,7 +2131,7 @@ test "a handler's variables and clauses receive the effect handlers that the enc
     b"fn pack_frame(n: Int) -> Int / {shipped.answer} = shipped.answer(n)\n",
     b"fn top() -> Int / {shipped.answer, abort.raise} = held(pack_frame, || keep.head(1))\n",
   ]);
-  match roots_built([{ name: b"m", src: source }]) {
+  match roots_built([{ name: b"m", source_text: source }]) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(keys) -> match ((
         program_of(source),
@@ -2112,8 +2141,8 @@ test "a handler's variables and clauses receive the effect handlers that the enc
         Err(reason) -> assert_eq(reason, b""),
         Ok(f) -> {
           let bodies = [f].concat(f.lambdas.map(|l: Lambda| match l { Closure(c) -> c.body }));
-          let zeroed = bodies.fold([], |accumulator: List<List<Arg>>, g: Fn|
-            vals_in(g.body).fold(accumulator, |a: List<List<Arg>>, v: Rvalue|
+          let zeroed = bodies.fold([], |accumulator: List<List<Arg>>, g: Function|
+            values_in(g.body).fold(accumulator, |a: List<List<Arg>>, v: Rvalue|
               match v {
                 Call(c) -> if c.args.contains(ZeroOperand(AsImmediate)) { a.push(c.args) }
                 else { a },
@@ -2137,7 +2166,7 @@ test "a call to `List::fold` inside a lambda of a function generic over effects 
     b"fn got(n: Int) -> Int / {probe.get} = probe.get(n)\n",
     b"fn top() -> Int / {abort.raise} = handle { bracket_fold(0, |acc: Int, x: Int| acc + got(x)) } with { probe.get(n) -> n }\n",
   ]);
-  match roots_built([{ name: b"m", src: source }]) {
+  match roots_built([{ name: b"m", source_text: source }]) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(keys) ->
       assert_eq(
@@ -2157,11 +2186,11 @@ test "a function passed through a module that does not import its effect still r
   let modules = [
     {
       name: b"packs",
-      src: b"pub fn opened<|e>(read: (Int) -> Int / {abort.raise | e}) -> Int / {abort.raise | e} = read(0)\n",
+      source_text: b"pub fn opened<|e>(read: (Int) -> Int / {abort.raise | e}) -> Int / {abort.raise | e} = read(0)\n",
     },
     {
       name: b"memo",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"import packs (opened)\n",
         b"pub effect shipped {\n  read answer(n: Int) -> Int\n}\n",
         b"pub fn fresh<|e>(read: (Int) -> Int / {abort.raise | e}) -> Int / {abort.raise | e} = opened(read)\n",
@@ -2170,7 +2199,7 @@ test "a function passed through a module that does not import its effect still r
     },
     {
       name: b"m",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"import memo (shipped, fresh, pack_frame)\n",
         b"fn top() -> Int / {abort.raise} = handle { fresh(pack_frame) } with { shipped.answer(n) -> n }\n",
       ]),

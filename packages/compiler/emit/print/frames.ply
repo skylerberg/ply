@@ -7,17 +7,17 @@ import compiler.emit.keys (Root, Named, Unboxed, Release, root_name, root_text)
 import compiler.emit.roots (symbol_of)
 import compiler.emit.representations (constructors_of)
 import compiler.emit.release (root_of)
-import compiler.emit.typed_ir (Representation, AsInt, AsWord, AsFlattened, AsReuseToken, Var,
-                               Rvalue, Call, Primitive, Native, Block, Do, Inc, Dec, Free,
-                               IntOperand, VarOperand, OwnedResult, is_refcounted, may_suspend,
-                               handle_suspends)
+import compiler.emit.typed_ir (Representation, AsInt, AsWord, AsFlattened, AsReuseToken, Variable,
+                               Rvalue, Call, Primitive, Native, Block, Do, Increment, Decrement,
+                               Free, IntOperand, VariableOperand, OwnedResult, is_refcounted,
+                               may_suspend, handle_suspends)
 import compiler.emit.typed_ir.handling (HandleSite, Clause, empty_instance)
 import compiler.emit.print.text (Printing, InstructionContext, empty_printing, function_body, line,
                                  named, name_of, part_names)
 import compiler.emit.print.ownership (count_printed)
 import compiler.emit.print.value_printing (c_type)
 import compiler.emit.lower.representation (c_values_of, representation_with)
-import compiler.emit.print.count_functions (free_fn, call_text, call_start)
+import compiler.emit.print.count_functions (free_function, call_text, call_start)
 
 pub type FrameLink = { printing: Printing, leave: Bytes, record: Option<Bytes> }
 
@@ -28,7 +28,7 @@ fn frames_head() -> Bytes = b"PLY_FRAMES(ctx)"
 pub fn site_linked(
   p: InstructionContext,
   printing: Printing,
-  unwind: List<Var>,
+  unwind: List<Variable>,
   value: Rvalue,
 ) -> FrameLink / {abort.raise} =
   if !may_suspend(value) { { printing: printing, leave: p.exit_statement, record: None } } else {
@@ -47,7 +47,7 @@ pub fn handle_linked(
   label: Int,
   body: Block,
   site: HandleSite,
-  unwind: List<Var>,
+  unwind: List<Variable>,
 ) -> FrameLink / {abort.raise} =
   if !handle_suspends(body, site) { { printing: printing, leave: p.exit_statement, record: None } }
   else {
@@ -105,15 +105,15 @@ pub fn each_functions_printed(symbol: Bytes, printing: Printing) -> List<Piece> 
       None -> accumulator,
     })
 
-type Slots = { tokens: List<Var>, refcounted: List<Var>, words: List<Bytes> }
+type Slots = { tokens: List<Variable>, refcounted: List<Variable>, words: List<Bytes> }
 
-fn slots_of(printing: Printing, unwind: List<Var>) -> Slots = {
-  let counted_variables = unwind.filter(|v: Var|
+fn slots_of(printing: Printing, unwind: List<Variable>) -> Slots = {
+  let counted_variables = unwind.filter(|v: Variable|
     is_refcounted(v.representation) && !token(v.representation));
   {
-    tokens: unwind.filter(|v: Var| token(v.representation)),
+    tokens: unwind.filter(|v: Variable| token(v.representation)),
     refcounted: counted_variables,
-    words: counted_variables.fold([], |accumulator: List<Bytes>, v: Var|
+    words: counted_variables.fold([], |accumulator: List<Bytes>, v: Variable|
       accumulator.concat(
         counted_values(name_of(printing, v), v.representation).map(|c: CValue| c.name),
       )),
@@ -147,7 +147,7 @@ fn linked(
     let inner = { ..p, depth: p.depth + 1 };
     let freed = s.tokens.fold(
       line(printing, p.depth, Bytes::concat_all([b"if (", frames_head(), b") {"])),
-      |q: Printing, t: Var| {
+      |q: Printing, t: Variable| {
         let words = match t.representation { AsReuseToken(n) -> n, _ -> 0 };
         line(
           count_printed(inner, q, Free({ of: t, bytes: IntOperand(header_bytes() + 8 * words) })),
@@ -206,11 +206,11 @@ fn each_name(symbol: Bytes, i: Int) -> Bytes =
 fn each_named(
   p: InstructionContext,
   printing: Printing,
-  counted_variables: List<Var>,
+  counted_variables: List<Variable>,
 ) -> { printing: Printing, name: Bytes } / {abort.raise} = {
   let laid = range(0, counted_variables.len()).fold(
     { at: 0, names: Map::new(), loads: [], vars: [] },
-    |accumulator: { at: Int, names: Map<Int, Bytes>, loads: List<Bytes>, vars: List<Var> }, i: Int| {
+    |accumulator: { at: Int, names: Map<Int, Bytes>, loads: List<Bytes>, vars: List<Variable> }, i: Int| {
       let v = { ..counted_variables.get(i), id: i };
       let x = b"x".concat(ascii_of_int(i));
       let values = counted_values(x, v.representation);
@@ -234,8 +234,10 @@ fn each_named(
       }
     },
   );
-  let down = laid.vars.fold({ ..printing, out: [], names: laid.names }, |q: Printing, v: Var|
-    count_printed({ ..p, depth: 0 }, q, Dec(v)));
+  let down = laid.vars.fold(
+    { ..printing, out: [], names: laid.names },
+    |q: Printing, v: Variable| count_printed({ ..p, depth: 0 }, q, Decrement(v)),
+  );
   let body = merged(
     [Text(Bytes::concat_all([b"  (void)d; ", Bytes::join(laid.loads, b" "), b"\n"]))].concat(
       down.out,
@@ -262,7 +264,8 @@ fn each_named(
   }
 }
 
-fn local(id: Int, ty: Type, rep: Representation) -> Var = { id: id, ty: ty, representation: rep }
+fn local(id: Int, ty: Type, rep: Representation) -> Variable =
+  { id: id, ty: ty, representation: rep }
 
 fn string_int_type() -> Type / {abort.raise} =
   RecordType(fields_sorted([{ name: b"a", ty: string_type() }, { name: b"b", ty: int_type() }]))
@@ -294,7 +297,7 @@ fn call_of(stops: Bool) -> Rvalue =
     suspends: stops,
   })
 
-fn frame_setup() -> { printing: Printing, s: Var, flat: Var, n: Var, token: Var } / {abort.raise} = {
+fn frame_setup() -> { printing: Printing, s: Variable, flat: Variable, n: Variable, token: Variable } / {abort.raise} = {
   let s = local(0, string_type(), AsWord);
   let flat = {
     id: 1,
@@ -368,10 +371,11 @@ test "a frame record's cleanup function releases every value stored in the recor
     constructors: h.printing.constructors,
   };
   let down = pieces_text(
-    slots.fold(named, |q: Printing, v: Var| count_printed(place(), q, Dec(v))).out,
+    slots.fold(named, |q: Printing, v: Variable| count_printed(place(), q, Decrement(v))).out,
   );
   let up = pieces_text(
-    slots.fold(named, |q: Printing, v: Var| count_printed(place(), q, Inc({ var: v, n: 1 }))).out,
+    slots.fold(named, |q: Printing, v: Variable|
+      count_printed(place(), q, Increment({ var: v, n: 1 }))).out,
   );
   assert(has(each, b"= s[0];") && has(each, b"= s[1];"), Some(String::of_bytes_lossy(each)));
   assert(has(each, down) && !has(each, up), Some(String::of_bytes_lossy(each)))
@@ -431,7 +435,11 @@ test "a frame record's cleanup function releases a value through its type's rele
 
 test "a call that cannot pause, a value that cannot fail, and a call with no counted value live after it each link no frame record" {
   let h = frame_setup();
-  let summed = Primitive({ op: b"add", on: AsInt, args: [VarOperand(h.n), IntOperand(1)] });
+  let summed = Primitive({
+    operation: b"add",
+    on: AsInt,
+    args: [VariableOperand(h.n), IntOperand(1)],
+  });
   [
     site_linked(place(), h.printing, [h.s, h.flat], call_of(false)),
     site_linked(place(), h.printing, [h.s], summed),
@@ -448,7 +456,7 @@ test "a call that cannot pause, a value that cannot fail, and a call with no cou
 
 test "a reuse token live across a pausing call is freed, if it was not reused, before the frame record is linked, and is never stored in the record" {
   let h = frame_setup();
-  let freed = call_start(free_fn(), [b"ctx", b"t3"]);
+  let freed = call_start(free_function(), [b"ctx", b"t3"]);
   let l = site_linked(place(), h.printing, [h.s, h.token], call_of(true));
   let r = match l.record { Some(r) -> r, None -> b"" };
   let text = pieces_text(l.printing.out);
@@ -488,9 +496,9 @@ test "call sites with identical live values share one cleanup function, and the 
 
 test "an effect handler whose body can pause links its own frame record of the counted values live across that body" {
   let h = frame_setup();
-  let ask_clause = { effect: b"m.ask", op: b"get", mode: 0, string: None, handler: 0 };
+  let ask_clause = { effect: b"m.ask", operation: b"get", mode: 0, string: None, handler: 0 };
   let site = |clauses: List<Clause>|
-    { clauses: clauses, ret: None, detached: None, instance: empty_instance(0) };
+    { clauses: clauses, return_clause: None, detached: None, instance: empty_instance(0) };
   let l = handle_linked(place(), h.printing, 2, [], site([ask_clause]), [h.s, h.n]);
   let r = match l.record { Some(r) -> r, None -> b"" };
   let text = pieces_text(l.printing.out);

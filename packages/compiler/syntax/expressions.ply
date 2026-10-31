@@ -7,8 +7,8 @@ import compiler.syntax.parsing (tuple_field_name, Span, Identifier, QName, Input
                                 current_span, at_token, at_eof, at_identifier_text, advance, eat,
                                 expect, expect_close, expect_identifier, expect_binder,
                                 expect_field_name, report_duplicate_fields, keyword_pun_error,
-                                with_no_brace, too_deep, start, qname, starts_upper, comma_list,
-                                token_lparen, token_rparen, token_lbrace, token_rbrace,
+                                with_no_brace, too_deep, start, qualified_name, starts_upper,
+                                comma_list, token_lparen, token_rparen, token_lbrace, token_rbrace,
                                 token_lbracket, token_rbracket, token_comma, token_semi,
                                 token_colon, token_coloncolon, token_dot, token_dotdot, token_arrow,
                                 token_eq, token_pipe, token_pipepipe, token_question, token_star,
@@ -43,9 +43,9 @@ import compiler.syntax.patterns (Pattern, PatternVariable, SourceLiteral, Litera
 pub type Expression =
   | LiteralExpression({ span: Span, literal: SourceLiteral })
   | NameExpression({ span: Span, name: QName })
-  | BinaryExpression({ span: Span, op: Bytes, lhs: Expression, rhs: Expression })
-  | UnaryExpression({ span: Span, op: Bytes, operand: Expression })
-  | LambdaExpression({ span: Span, params: List<Param>, ret: Option<TypeExpression>, body: Expression })
+  | BinaryExpression({ span: Span, operation: Bytes, left_operand: Expression, right_operand: Expression })
+  | UnaryExpression({ span: Span, operation: Bytes, operand: Expression })
+  | LambdaExpression({ span: Span, params: List<Param>, return_clause: Option<TypeExpression>, body: Expression })
   | CallExpression({ span: Span, function: Expression, labels: List<Identifier>, args: List<Expression>, named: List<NamedArg> })
   | IfExpression({ span: Span, cond: Expression, then_branch: Expression, else_branch: Expression })
   | MatchExpression({ span: Span, scrutinee: Expression, arms: List<MatchArm> })
@@ -55,8 +55,8 @@ pub type Expression =
   | PropagateExpression({ span: Span, operand: Expression })
   | FieldExpression({ span: Span, base: Expression, field: Identifier })
   | ListExpression({ span: Span, items: List<Expression> })
-  | PerformExpression({ span: Span, effect_name: QName, op: Identifier, resource: Option<Identifier>, args: List<Expression> })
-  | HandleExpression({ span: Span, vars: List<HandlerVar>, body: Expression, clauses: List<HandleClause>, ret: Option<ReturnClause> })
+  | PerformExpression({ span: Span, effect_name: QName, operation: Identifier, resource: Option<Identifier>, args: List<Expression> })
+  | HandleExpression({ span: Span, handler_variables: List<HandlerStateVariable>, body: Expression, clauses: List<HandleClause>, return_clause: Option<ReturnClause> })
   | WithScopeExpression({ span: Span, resource: Identifier, acquire: Expression, release: Expression, binder: Identifier, body: Expression })
   | SimulateExpression({ span: Span, body: Expression })
   | ParallelExpression({ span: Span, branches: List<Expression> })
@@ -67,7 +67,7 @@ pub type Expression =
 
 derive children for Expression
 
-pub type RaiseName = { effect_name: QName, op: Identifier }
+pub type RaiseName = { effect_name: QName, operation: Identifier }
 
 pub type TaggedLiteral = {
   span: Span,
@@ -105,7 +105,7 @@ pub type MatchArm = { pattern: Pattern, guard: Option<Expression>, body: Express
 
 pub type HandleClause = {
   effect_name: QName,
-  op: Identifier,
+  operation: Identifier,
   resource: Option<Identifier>,
   wildcard_label: Bool,
   label_binder: Option<Identifier>,
@@ -117,7 +117,12 @@ pub type HandleClause = {
 
 pub type ReturnClause = { binder: Identifier, body: Expression, span: Span }
 
-pub type HandlerVar = { name: Identifier, ty: Option<TypeExpression>, init: Expression, span: Span }
+pub type HandlerStateVariable = {
+  name: Identifier,
+  ty: Option<TypeExpression>,
+  init: Expression,
+  span: Span,
+}
 
 pub fn no_expression() -> Expression = InvalidExpression({ span: dummy_span() })
 
@@ -176,15 +181,15 @@ pub fn try_spans(at: Span) -> TrySpans =
     arguments_record: synthetic_span(at, role_try_arguments_record()),
   }
 
-fn tag_fn(t: TaggedLiteral, name: Bytes, role: Int) -> QName = {
+fn tag_function(t: TaggedLiteral, name: Bytes, role: Int) -> QName = {
   let at = { ..t.tag.span, site: synthetic_span(t.span, role).site };
   { module: Some(t.tag), name: { name: name, span: at }, span: at }
 }
 
 pub fn tagged_parser(t: TaggedLiteral) -> QName =
-  tag_fn(t, if t.holes.len() == 0 { b"literal" } else { b"compile" }, role_tag_parser())
+  tag_function(t, if t.holes.len() == 0 { b"literal" } else { b"compile" }, role_tag_parser())
 
-pub fn tagged_filler(t: TaggedLiteral) -> QName = tag_fn(t, b"fill", role_tag_filler())
+pub fn tagged_filler(t: TaggedLiteral) -> QName = tag_function(t, b"fill", role_tag_filler())
 
 pub type TaggedPart = { text: Bytes, quoted: Span }
 
@@ -228,10 +233,22 @@ fn set_span(expression: Expression, span: Span) -> Expression =
   match expression {
     LiteralExpression(v) -> LiteralExpression({ span: span, literal: v.literal }),
     NameExpression(v) -> NameExpression({ span: span, name: v.name }),
-    BinaryExpression(v) -> BinaryExpression({ span: span, op: v.op, lhs: v.lhs, rhs: v.rhs }),
-    UnaryExpression(v) -> UnaryExpression({ span: span, op: v.op, operand: v.operand }),
+    BinaryExpression(v) ->
+      BinaryExpression({
+        span: span,
+        operation: v.operation,
+        left_operand: v.left_operand,
+        right_operand: v.right_operand,
+      }),
+    UnaryExpression(v) ->
+      UnaryExpression({ span: span, operation: v.operation, operand: v.operand }),
     LambdaExpression(v) ->
-      LambdaExpression({ span: span, body: v.body, params: v.params, ret: v.ret }),
+      LambdaExpression({
+        span: span,
+        body: v.body,
+        params: v.params,
+        return_clause: v.return_clause,
+      }),
     CallExpression(v) ->
       CallExpression({
         span: span,
@@ -259,7 +276,7 @@ fn set_span(expression: Expression, span: Span) -> Expression =
       PerformExpression({
         span: span,
         effect_name: v.effect_name,
-        op: v.op,
+        operation: v.operation,
         resource: v.resource,
         args: v.args,
       }),
@@ -286,29 +303,29 @@ pub fn is_block_like(expression: Expression) -> Bool =
     _ -> false,
   }
 
-type BinaryOperator = { op: Bytes, binding_power: Int, width: Int }
+type BinaryOperator = { operator: Bytes, binding_power: Int, width: Int }
 
 fn binary_operator(kind: TokenKind) -> Option<BinaryOperator> =
   match kind {
-    Punctuation(s) -> if s == b"pipepipe" { Some({ op: b"or", binding_power: 1, width: 1 }) }
-    else if s == b"ampamp" { Some({ op: b"and", binding_power: 2, width: 1 }) }
-    else if s == b"eqeq" { Some({ op: b"eq", binding_power: 3, width: 1 }) }
-    else if s == b"bangeq" { Some({ op: b"ne", binding_power: 3, width: 1 }) }
-    else if s == b"lt" { Some({ op: b"lt", binding_power: 3, width: 1 }) }
-    else if s == b"le" { Some({ op: b"le", binding_power: 3, width: 1 }) }
-    else if s == b"gt" { Some({ op: b"gt", binding_power: 3, width: 1 }) }
-    else if s == b"ge" { Some({ op: b"ge", binding_power: 3, width: 1 }) }
-    else if s == b"pipe" { Some({ op: b"bitor", binding_power: 4, width: 1 }) }
-    else if s == b"caret" { Some({ op: b"bitxor", binding_power: 5, width: 1 }) }
-    else if s == b"amp" { Some({ op: b"bitand", binding_power: 6, width: 1 }) }
-    else if s == b"plusplus" { Some({ op: b"concat", binding_power: 8, width: 1 }) }
-    else if s == b"plus" { Some({ op: b"add", binding_power: 9, width: 1 }) }
-    else if s == b"minus" { Some({ op: b"sub", binding_power: 9, width: 1 }) }
-    else if s == b"star" { Some({ op: b"mul", binding_power: 10, width: 1 }) }
-    else if s == b"slash" { Some({ op: b"div", binding_power: 10, width: 1 }) }
-    else if s == b"percent" { Some({ op: b"rem", binding_power: 10, width: 1 }) } else {
+    Punctuation(s) -> if s == b"pipepipe" { Some({ operator: b"or", binding_power: 1, width: 1 }) }
+    else if s == b"ampamp" { Some({ operator: b"and", binding_power: 2, width: 1 }) }
+    else if s == b"eqeq" { Some({ operator: b"eq", binding_power: 3, width: 1 }) }
+    else if s == b"bangeq" { Some({ operator: b"ne", binding_power: 3, width: 1 }) }
+    else if s == b"lt" { Some({ operator: b"lt", binding_power: 3, width: 1 }) }
+    else if s == b"le" { Some({ operator: b"le", binding_power: 3, width: 1 }) }
+    else if s == b"gt" { Some({ operator: b"gt", binding_power: 3, width: 1 }) }
+    else if s == b"ge" { Some({ operator: b"ge", binding_power: 3, width: 1 }) }
+    else if s == b"pipe" { Some({ operator: b"bitor", binding_power: 4, width: 1 }) }
+    else if s == b"caret" { Some({ operator: b"bitxor", binding_power: 5, width: 1 }) }
+    else if s == b"amp" { Some({ operator: b"bitand", binding_power: 6, width: 1 }) }
+    else if s == b"plusplus" { Some({ operator: b"concat", binding_power: 8, width: 1 }) }
+    else if s == b"plus" { Some({ operator: b"add", binding_power: 9, width: 1 }) }
+    else if s == b"minus" { Some({ operator: b"sub", binding_power: 9, width: 1 }) }
+    else if s == b"star" { Some({ operator: b"mul", binding_power: 10, width: 1 }) }
+    else if s == b"slash" { Some({ operator: b"div", binding_power: 10, width: 1 }) }
+    else if s == b"percent" { Some({ operator: b"rem", binding_power: 10, width: 1 }) } else {
       call_operators().fold(None, |accumulator: Option<BinaryOperator>, o: CallOperator|
-        if o.token == s { Some({ op: o.name, binding_power: o.binding_power, width: 1 }) }
+        if o.token == s { Some({ operator: o.name, binding_power: o.binding_power, width: 1 }) }
         else { accumulator })
     },
     _ -> None,
@@ -340,16 +357,22 @@ pub fn written_operator(function: Expression, args: List<Expression>) -> Option<
 
 fn binary_node(o: BinaryOperator, at: Span, left: Expression, right: Expression) -> Expression = {
   let span = span_to(expression_span(left), expression_span(right));
-  match call_operator(o.op) {
+  match call_operator(o.operator) {
     Some(_) ->
       CallExpression({
         span: span,
-        function: NameExpression({ span: at, name: bare({ name: o.op, span: at }) }),
+        function: NameExpression({ span: at, name: bare({ name: o.operator, span: at }) }),
         named: [],
         args: [left, right],
         labels: [],
       }),
-    None -> BinaryExpression({ span: span, op: o.op, lhs: left, rhs: right }),
+    None ->
+      BinaryExpression({
+        span: span,
+        operation: o.operator,
+        left_operand: left,
+        right_operand: right,
+      }),
   }
 }
 
@@ -364,11 +387,11 @@ fn adjacent_same_tokens(input: Input, parser: Parser, n: Int) -> Bool =
 fn peek_binary_operator(input: Input, parser: Parser) -> Option<BinaryOperator> =
   if parser.no_pipe && at_token(input, parser, token_pipe()) { None }
   else if at_token(input, parser, token_gt()) && adjacent_same_tokens(input, parser, 2) {
-    Some({ op: b"ushr", binding_power: 7, width: 3 })
+    Some({ operator: b"ushr", binding_power: 7, width: 3 })
   } else if at_token(input, parser, token_gt()) && adjacent_same_tokens(input, parser, 1) {
-    Some({ op: b"shr", binding_power: 7, width: 2 })
+    Some({ operator: b"shr", binding_power: 7, width: 2 })
   } else if at_token(input, parser, token_lt()) && adjacent_same_tokens(input, parser, 1) {
-    Some({ op: b"shl", binding_power: 7, width: 2 })
+    Some({ operator: b"shl", binding_power: 7, width: 2 })
   } else { binary_operator(token_kind(input, parser)) }
 
 pub fn expression(
@@ -397,7 +420,7 @@ fn binary_expression(
   powers: Int,
 ) -> Result<ParseOutput<Expression>, Parser> / {abort.raise} = {
   let left = unary_expression(input, parser)?;
-  iterate(left, input.token_count - left.parser.pos + 1, |s: ParseOutput<Expression>|
+  iterate(left, input.token_count - left.parser.position + 1, |s: ParseOutput<Expression>|
     match peek_binary_operator(input, s.parser) {
       None -> Stop(Ok(s)),
       Some(o) -> if o.binding_power < min_binding_power { Stop(Ok(s)) }
@@ -440,7 +463,7 @@ fn unary_body(
       parser: parser,
       node: UnaryExpression({
         span: span_to(st.node, expression_span(operand)),
-        op: operator,
+        operation: operator,
         operand: operand,
       }),
     })
@@ -452,7 +475,7 @@ fn postfix_expression(
   parser: Parser,
 ) -> Result<ParseOutput<Expression>, Parser> / {abort.raise} = {
   let first = primary_expression(input, parser)?;
-  iterate(first, input.token_count - first.parser.pos + 1, |s: ParseOutput<Expression>|
+  iterate(first, input.token_count - first.parser.position + 1, |s: ParseOutput<Expression>|
     if at_token(input, s.parser, token_lparen()) {
       match call_args(input, s.parser) {
         Err(q) -> Stop(Err(q)),
@@ -574,7 +597,7 @@ fn postfix_dot(
         PerformExpression({
           span: span,
           effect_name: eff,
-          op: operation,
+          operation: operation,
           resource: resource,
           args: a.args,
         })
@@ -607,7 +630,7 @@ fn at_label_arguments(input: Input, s: ParseOutput<Expression>) -> Bool / {abort
   }
 
 fn label_args_ahead(input: Input, parser: Parser) -> Bool / {abort.raise} =
-  iterate(1, input.token_count - parser.pos + 1, |i: Int|
+  iterate(1, input.token_count - parser.position + 1, |i: Int|
     match token_kind_at(input, parser, i) {
       Identifier(n) -> if token_kind_at(input, parser, i + 1) == token_comma() { Continue(i + 2) }
       else {
@@ -866,7 +889,7 @@ fn primary_identifier(
     match tagged_text(input, parser) {
       Some(head) -> tagged_literal(input, parser, name, head),
       None -> {
-        let { parser, node: q } = qname(input, parser, b"an expression")?;
+        let { parser, node: q } = qualified_name(input, parser, b"an expression")?;
         Ok({ parser: parser, node: NameExpression({ span: q.span, name: q }) })
       },
     }
@@ -1097,30 +1120,34 @@ fn holes_on(
   input: Input,
   parser: Parser,
 ) -> Result<ParseOutput<List<Hole>>, Parser> / {abort.raise} =
-  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: PartialList<Hole>| {
-    let opened = advance(input, s.parser);
-    match expression(input, opened.parser) {
-      Err(q) -> Stop(Err(q)),
-      Ok(r) -> {
-        let hole_span = current_span(input, r.parser);
-        match token_kind(input, r.parser) {
-          InterpolatedMiddle(t) ->
-            Continue({
-              parser: r.parser,
-              out: s.out.push({ value: r.node, text: t, quoted: hole_span }),
-            }),
-          InterpolatedTail(t) ->
-            Stop(
-              Ok({
-                parser: advance(input, r.parser).parser,
-                node: s.out.push({ value: r.node, text: t, quoted: hole_span }),
+  iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.position + 1,
+    |s: PartialList<Hole>| {
+      let opened = advance(input, s.parser);
+      match expression(input, opened.parser) {
+        Err(q) -> Stop(Err(q)),
+        Ok(r) -> {
+          let hole_span = current_span(input, r.parser);
+          match token_kind(input, r.parser) {
+            InterpolatedMiddle(t) ->
+              Continue({
+                parser: r.parser,
+                out: s.out.push({ value: r.node, text: t, quoted: hole_span }),
               }),
-            ),
-          _ -> Stop(Err(error_here(input, r.parser, b"`}` to close the interpolated value"))),
-        }
-      },
-    }
-  })
+            InterpolatedTail(t) ->
+              Stop(
+                Ok({
+                  parser: advance(input, r.parser).parser,
+                  node: s.out.push({ value: r.node, text: t, quoted: hole_span }),
+                }),
+              ),
+            _ -> Stop(Err(error_here(input, r.parser, b"`}` to close the interpolated value"))),
+          }
+        },
+      }
+    },
+  )
 
 fn display_call(expression: Expression) -> Expression = {
   let span = expression_span(expression);
@@ -1340,7 +1367,7 @@ pub fn listing(
                 span: synthetic_span_at(binder.span, for_span, role_case_label_param()),
               },
             ],
-            ret: None,
+            return_clause: None,
           }),
         ],
       ),
@@ -1413,9 +1440,9 @@ fn concatenated(span: Span, parts: List<Expression>) -> Expression = {
       let x = at_expression(nonempty_parts, i);
       BinaryExpression({
         span: span_to(expression_span(accumulator), expression_span(x)),
-        op: b"concat",
-        lhs: accumulator,
-        rhs: x,
+        operation: b"concat",
+        left_operand: accumulator,
+        right_operand: x,
       })
     },
   );
@@ -1534,10 +1561,10 @@ fn record_update_base(
       ),
     )
   } else {
-    let { parser, node: name } = qname(input, dots.parser, b"the record being updated")?;
+    let { parser, node: name } = qualified_name(input, dots.parser, b"the record being updated")?;
     let path = iterate(
       { parser: parser, node: NameExpression({ span: name.span, name: name }) },
-      input.token_count - parser.pos + 1,
+      input.token_count - parser.position + 1,
       |s: ParseOutput<Expression>|
         if !at_token(input, s.parser, token_dot()) { Stop(Ok(s)) } else {
           let d = advance(input, s.parser);
@@ -1555,9 +1582,9 @@ fn record_update_base(
           }
         },
     )?;
-    let op_of: Option<{ effect_name: QName, op: Identifier }> = match path.node {
+    let op_of: Option<{ effect_name: QName, operation: Identifier }> = match path.node {
       FieldExpression(f) -> match f.base {
-        NameExpression(v) -> Some({ effect_name: v.name, op: f.field }),
+        NameExpression(v) -> Some({ effect_name: v.name, operation: f.field }),
         _ -> None,
       },
       _ -> None,
@@ -1574,7 +1601,7 @@ fn record_update_base(
             PerformExpression({
               span: span,
               effect_name: p.effect_name,
-              op: p.op,
+              operation: p.operation,
               resource: resource,
               args: a.args,
             })
@@ -1663,7 +1690,7 @@ fn block_inner(
   let { parser, node: o } = expect(input, parser, token_lbrace(), b"`{` to start a block")?;
   let body = iterate(
     { parser: parser, tail: None, statements: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: BlockAccumulator|
       if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
         Stop(Err(unclosed(input, s.parser, o, b"`}` to close the block")))
@@ -1834,7 +1861,7 @@ fn else_block(
   } else if input.room <= 0 { Err(too_deep(input, parser)) }
   else { block_expression({ ..input, room: input.room - 1 }, parser) }
 
-pub fn fn_param(
+pub fn function_parameter(
   input: Input,
   parser: Parser,
 ) -> Result<ParseOutput<Param>, Parser> / {abort.raise} = param_inner(input, parser, true)
@@ -2023,7 +2050,7 @@ fn lambda_expression(
           span: span_to(st, expression_span(body)),
           body: body,
           params: params,
-          ret: Some(return_type),
+          return_clause: Some(return_type),
         }),
       })
     }
@@ -2035,7 +2062,7 @@ fn lambda_expression(
         span: span_to(st, expression_span(body)),
         body: body,
         params: params,
-        ret: None,
+        return_clause: None,
       }),
     })
   }
@@ -2077,7 +2104,7 @@ fn if_expression(
 ) -> Result<ParseOutput<Expression>, Parser> / {abort.raise} = {
   let chain = iterate(
     { parser: parser, out: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: PartialList<IfArm>| {
       let st = advance(input, s.parser);
       match scrutinee(input, st.parser) {
@@ -2138,7 +2165,7 @@ fn match_arms(input: Input, parser: Parser) -> Result<MatchArms, Parser> / {abor
   let { parser, node: o } = expect(input, parser, token_lbrace(), b"`{` to start the match arms")?;
   let body = iterate(
     { parser: parser, out: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: PartialList<MatchArm>|
       if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
         Stop(Err(unclosed(input, s.parser, o, b"`}` to close the match arms")))
@@ -2221,9 +2248,9 @@ fn handle_expression(
 
 type HandlerClauses = {
   parser: Parser,
-  ret: Option<ReturnClause>,
+  return_clause: Option<ReturnClause>,
   clauses: List<HandleClause>,
-  vars: List<HandlerVar>,
+  handler_variables: List<HandlerStateVariable>,
 }
 
 fn handle_rest(
@@ -2245,8 +2272,8 @@ fn handle_rest(
     b"`{` to start the handler clauses",
   )?;
   let accumulator = iterate(
-    { parser: parser, ret: None, clauses: [], vars: [] },
-    input.token_count - parser.pos + 1,
+    { parser: parser, return_clause: None, clauses: [], handler_variables: [] },
+    input.token_count - parser.position + 1,
     |s: HandlerClauses|
       if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
         Stop(Err(unclosed(input, s.parser, o, b"`}` to close the handler")))
@@ -2264,9 +2291,9 @@ fn handle_rest(
     node: HandleExpression({
       span: span_to(span, closing_brace),
       body: body,
-      ret: accumulator.ret,
+      return_clause: accumulator.return_clause,
       clauses: accumulator.clauses,
-      vars: accumulator.vars,
+      handler_variables: accumulator.handler_variables,
     }),
   })
 }
@@ -2279,8 +2306,8 @@ fn handle_step(
     match return_clause(input, s.parser) {
       Err(q) -> Stop(Err(q)),
       Ok(parsed_return) -> {
-        let next = match s.ret {
-          None -> { ..s, parser: parsed_return.parser, ret: Some(parsed_return.node) },
+        let next = match s.return_clause {
+          None -> { ..s, parser: parsed_return.parser, return_clause: Some(parsed_return.node) },
           Some(first_return) ->
             {
               ..s,
@@ -2303,10 +2330,11 @@ fn handle_step(
       },
     }
   } else if at_identifier_text(input, s.parser, b"var") && is_identifier_at(input, s.parser, 1) {
-    match handler_var(input, s.parser) {
+    match handler_variable(input, s.parser) {
       Err(q) -> Stop(Err(q)),
       Ok(v) -> {
-        let first = s.clauses.len() == 0 && (match s.ret { None -> true, Some(_) -> false });
+        let first = s.clauses.len() == 0
+          && (match s.return_clause { None -> true, Some(_) -> false });
         let placed = if first { v.parser } else {
           push_diagnostic(
             v.parser,
@@ -2320,7 +2348,7 @@ fn handle_step(
           )
         };
         let comma = eat(input, placed, token_comma());
-        Continue({ ..s, parser: comma.parser, vars: s.vars.push(v.node) })
+        Continue({ ..s, parser: comma.parser, handler_variables: s.handler_variables.push(v.node) })
       },
     }
   } else {
@@ -2333,10 +2361,10 @@ fn handle_step(
     }
   }
 
-fn handler_var(
+fn handler_variable(
   input: Input,
   parser: Parser,
-) -> Result<ParseOutput<HandlerVar>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<HandlerStateVariable>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = expect_identifier(
     input,
@@ -2373,7 +2401,7 @@ fn handle_clause(
   input: Input,
   parser: Parser,
 ) -> Result<ParseOutput<HandleClause>, Parser> / {abort.raise} = {
-  let { parser, node: eff } = qname(input, parser, b"an effect name, or `return`")?;
+  let { parser, node: eff } = qualified_name(input, parser, b"an effect name, or `return`")?;
   let { parser, .. } = expect(input, parser, token_dot(), b"`.` and the operation name")?;
   let { parser, node: operation } = expect_identifier(input, parser, b"an operation name")?;
   let { parser, node: resource_clause } = clause_resource(input, parser)?;
@@ -2398,7 +2426,7 @@ fn handle_clause(
     parser: parser,
     node: {
       effect_name: eff,
-      op: operation,
+      operation: operation,
       resource: resource_clause.name,
       wildcard_label: resource_clause.every,
       label_binder: resource_clause.binder,
@@ -2555,11 +2583,11 @@ fn try_raise(
 ) -> Result<ParseOutput<Option<RaiseName>>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lbracket()) { Ok({ parser: parser, node: None }) } else {
     let o = advance(input, parser);
-    let { parser, node: eff } = qname(input, o.parser, b"an effect name")?;
+    let { parser, node: eff } = qualified_name(input, o.parser, b"an effect name")?;
     let { parser, .. } = expect(input, parser, token_dot(), b"`.` and the operation name")?;
     let { parser, node: operation } = expect_identifier(input, parser, b"an operation name")?;
     let { parser, .. } = expect_close(input, parser, token_rbracket(), o.node, b"`]`")?;
-    Ok({ parser: parser, node: Some({ effect_name: eff, op: operation }) })
+    Ok({ parser: parser, node: Some({ effect_name: eff, operation: operation }) })
   }
 
 fn parallel_expression(
@@ -2597,17 +2625,21 @@ pub fn dump_expression(expression: Expression) -> Bytes / {abort.raise} =
     BinaryExpression(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"ebin"),
-        dump_word(v.op),
-        dump_expression(v.lhs),
-        dump_expression(v.rhs),
+        dump_word(v.operation),
+        dump_expression(v.left_operand),
+        dump_expression(v.right_operand),
       ]),
     UnaryExpression(v) ->
-      Bytes::concat_all([dump_node(v.span, b"eun"), dump_word(v.op), dump_expression(v.operand)]),
+      Bytes::concat_all([
+        dump_node(v.span, b"eun"),
+        dump_word(v.operation),
+        dump_expression(v.operand),
+      ]),
     LambdaExpression(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"elam"),
         dump_list(v.params, dump_param),
-        dump_opt(v.ret, dump_type),
+        dump_opt(v.return_clause, dump_type),
         dump_expression(v.body),
       ]),
     CallExpression(v) ->
@@ -2656,7 +2688,7 @@ pub fn dump_expression(expression: Expression) -> Bytes / {abort.raise} =
       Bytes::concat_all([
         dump_node(v.span, b"eprf"),
         dump_qualified_name(v.effect_name),
-        dump_identifier(v.op),
+        dump_identifier(v.operation),
         dump_opt(v.resource, dump_identifier),
         dump_list(v.args, dump_expression),
       ]),
@@ -2665,9 +2697,9 @@ pub fn dump_expression(expression: Expression) -> Bytes / {abort.raise} =
         dump_node(v.span, b"ehnd"),
         dump_expression(v.body),
         dump_list(v.clauses, dump_clause),
-        dump_opt(v.ret, dump_return),
-        if v.vars.len() == 0 { b"" }
-        else { dump_word(b"vars").concat(dump_list(v.vars, dump_var)) },
+        dump_opt(v.return_clause, dump_return),
+        if v.handler_variables.len() == 0 { b"" }
+        else { dump_word(b"vars").concat(dump_list(v.handler_variables, dump_handler_variable)) },
       ]),
     WithScopeExpression(v) ->
       Bytes::concat_all([
@@ -2695,7 +2727,7 @@ pub fn dump_expression(expression: Expression) -> Bytes / {abort.raise} =
       Bytes::concat_all([
         dump_node(v.span, b"etrb"),
         dump_opt(v.raise, |r: RaiseName|
-          dump_qualified_name(r.effect_name).concat(dump_identifier(r.op))),
+          dump_qualified_name(r.effect_name).concat(dump_identifier(r.operation))),
         dump_expression(v.body),
       ]),
   }
@@ -2765,7 +2797,7 @@ pub fn dump_clause(clause: HandleClause) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(clause.span, b"hcl"),
     dump_qualified_name(clause.effect_name),
-    dump_identifier(clause.op),
+    dump_identifier(clause.operation),
     dump_opt(clause.resource, dump_identifier),
     dump_opt(clause.label_binder, dump_identifier),
     dump_list(clause.params, dump_identifier),
@@ -2773,7 +2805,7 @@ pub fn dump_clause(clause: HandleClause) -> Bytes / {abort.raise} =
     dump_expression(clause.body),
   ])
 
-pub fn dump_var(v: HandlerVar) -> Bytes / {abort.raise} =
+pub fn dump_handler_variable(v: HandlerStateVariable) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(v.span, b"hvar"),
     dump_identifier(v.name),
@@ -2805,9 +2837,9 @@ pub fn dump_param_of(source: Bytes) -> String / {abort.raise} = {
   String::of_bytes(dump_param(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
 
-pub fn dump_fn_param_of(source: Bytes) -> String / {abort.raise} = {
+pub fn dump_function_parameter_of(source: Bytes) -> String / {abort.raise} = {
   let s = start(source);
-  let r = parsed_or(fn_param(s.input, s.parser), no_param());
+  let r = parsed_or(function_parameter(s.input, s.parser), no_param());
   String::of_bytes(dump_param(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
 
@@ -2815,7 +2847,7 @@ pub fn node_count(expression: Expression) -> Int =
   match expression {
     LiteralExpression(v) -> 1,
     NameExpression(v) -> 1,
-    BinaryExpression(v) -> 1 + node_count(v.lhs) + node_count(v.rhs),
+    BinaryExpression(v) -> 1 + node_count(v.left_operand) + node_count(v.right_operand),
     UnaryExpression(v) -> 1 + node_count(v.operand),
     LambdaExpression(v) -> 1 + count_params(v.params) + node_count(v.body),
     CallExpression(v) ->
@@ -2843,8 +2875,9 @@ pub fn node_count(expression: Expression) -> Int =
       1 + node_count(v.body)
         + v.clauses.fold(0, |n: Int, clause: HandleClause|
           n + 1 + clause.params.len() + node_count(clause.body))
-        + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) })
-        + v.vars.fold(0, |n: Int, hv: HandlerVar| n + 1 + node_count(hv.init)),
+        + (match v.return_clause { None -> 0, Some(r) -> 1 + node_count(r.body) })
+        + v.handler_variables.fold(0, |n: Int, hv: HandlerStateVariable|
+          n + 1 + node_count(hv.init)),
     WithScopeExpression(v) ->
       1 + node_count(v.acquire) + node_count(v.release) + node_count(v.body),
     SimulateExpression(v) -> 1 + node_count(v.body),
@@ -3030,11 +3063,14 @@ test "a parameter's type and its default are both optional" {
 
 test "a fn parameter may carry a default and a lambda parameter may not" {
   assert_eq(
-    dump_fn_param_of(b"x: Int = 1"),
+    dump_function_parameter_of(b"x: Int = 1"),
     "0:10:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;"
       ++ "?1;9:10:elit;%int;@31;#0;",
   );
-  assert_eq(dump_fn_param_of(b"x = 1"), "0:5:prm;0:1:ident;@78;?0;?1;4:5:elit;%int;@31;#0;");
+  assert_eq(
+    dump_function_parameter_of(b"x = 1"),
+    "0:5:prm;0:1:ident;@78;?0;?1;4:5:elit;%int;@31;#0;",
+  );
   assert_eq(
     dump_param_of(b"x: Int = 1"),
     "0:6:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;"
@@ -3043,31 +3079,31 @@ test "a fn parameter may carry a default and a lambda parameter may not" {
 }
 
 test "a parameter of function type may have a `cost` clause naming a variable, and other parameters cannot" {
-  let named = dump_fn_param_of(b"g: (Int) -> Int cost k");
+  let named = dump_function_parameter_of(b"g: (Int) -> Int cost k");
   assert(named.contains("%cost;"), Some(named));
   assert(named.ends_with(";@6b;?0;#0;"), Some(named));
-  assert(dump_fn_param_of(b"n: Int cost k").contains("!E0001"));
+  assert(dump_function_parameter_of(b"n: Int cost k").contains("!E0001"));
   assert(!dump_param_of(b"g: (Int) -> Int cost k").contains("%cost;"))
 }
 
 test "a parameter of function type may have a `space` clause after its `cost` clause, and other parameters cannot" {
-  let named = dump_fn_param_of(b"g: (Int) -> Int space s");
+  let named = dump_function_parameter_of(b"g: (Int) -> Int space s");
   assert(named.contains("%space;") && !named.contains("%cost;"), Some(named));
   assert(named.ends_with(";@73;?0;#0;"), Some(named));
-  let both = dump_fn_param_of(b"g: (Int) -> Int cost k space s");
+  let both = dump_function_parameter_of(b"g: (Int) -> Int cost k space s");
   assert(both.contains("%cost;") && both.ends_with(";@73;?0;#0;"), Some(both));
-  assert(dump_fn_param_of(b"n: Int space s").contains("!E0001"));
-  assert(!dump_fn_param_of(b"g: (Int) -> Int space s cost k").contains("%cost;"));
+  assert(dump_function_parameter_of(b"n: Int space s").contains("!E0001"));
+  assert(!dump_function_parameter_of(b"g: (Int) -> Int space s cost k").contains("%cost;"));
   assert(!dump_param_of(b"g: (Int) -> Int space s").contains("%space;"))
 }
 
 test "`keep` before a parameter's type is parsed as a flag on the parameter, but `keep` alone is a type variable name" {
-  let keep_dump = dump_fn_param_of(b"g: keep (Int) -> Int");
+  let keep_dump = dump_function_parameter_of(b"g: keep (Int) -> Int");
   assert(keep_dump.contains("%keep;"), Some(keep_dump));
-  assert(!dump_fn_param_of(b"g: (Int) -> Int").contains("%keep;"));
-  let resource = dump_fn_param_of(b"c: keep Conn");
+  assert(!dump_function_parameter_of(b"g: (Int) -> Int").contains("%keep;"));
+  let resource = dump_function_parameter_of(b"c: keep Conn");
   assert(resource.contains("%keep;") && !resource.contains("!E0001"), Some(resource));
-  let named = dump_fn_param_of(b"n: keep");
+  let named = dump_function_parameter_of(b"n: keep");
   assert(
     named.contains(":tvar;") && !named.contains("%keep;") && !named.contains("!E0001"),
     Some(named),
@@ -3078,7 +3114,7 @@ test "`keep` before a parameter's type is parsed as a flag on the parameter, but
 test "a parameter may be named `_`, with or without a type" {
   assert_eq(dump_param_of(b"_"), "0:1:prm;0:1:ident;@5f;?0;?0;#0;");
   assert_eq(
-    dump_fn_param_of(b"_: Int"),
+    dump_function_parameter_of(b"_: Int"),
     "0:6:prm;0:1:ident;@5f;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;?0;#0;",
   )
 }

@@ -17,10 +17,10 @@ import compiler.store.hash (digest)
 import compiler.check.infer (CheckOutput, BodyFacts, decode_facts, facts_by_owner, encode_facts,
                              no_body_facts, body_facts_bin, is_pure_definition, types_named)
 import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInfo, LawInfo,
-                                     LawBinder, EffectInfo, OpInfo, ConstructorInfo, CheckCache,
-                                     empty_cache, CachedDefinition, CachedTest, CachedFacts,
-                                     WitnessOrder, listing_type, witness_order_bin, witness_params,
-                                     InstanceInfo, NumericInfo)
+                                     LawBinder, EffectInfo, OperationInfo, ConstructorInfo,
+                                     CheckCache, empty_cache, CachedDefinition, CachedTest,
+                                     CachedFacts, WitnessOrder, listing_type, witness_order_bin,
+                                     witness_params, InstanceInfo, NumericInfo)
 import compiler.check.typed (TypedBody, TypedExpression, TypedHandle, TypedClause,
                              typed_expression_nodes)
 import compiler.emit.keys (RootKey, Named, TestCases, Clause, Requires, Ensures, LawPart, LawGuard,
@@ -40,7 +40,7 @@ import compiler.front.rows (span_at, location_span, WrittenFunction, written_fun
                             EmitterConstructor, FunctionWidths, ListWidths, MapWidths, NoWidths,
                             RecordWidths, SumWidths, VariableWidths, FixedWidth, Widths,
                             FieldWidths, EffectHash, KnownDefinitionRow, KnownTestRow, Rows,
-                            ModuleSpan, DefinitionRow, TestRow, LawRow, OpRow, EffectRow,
+                            ModuleSpan, DefinitionRow, TestRow, LawRow, OperationRow, EffectRow,
                             ConstructorRow, HashRow, DefinitionHashRow, LawHashRow, TestHashRow,
                             HashTableRow, OrdinalRow, Dump, normalized_diagnostic)
 import compiler.front.facts (outlines_of, effect_visibility, effect_hosts, effect_public_of,
@@ -117,14 +117,18 @@ fn law_row(law_info: LawInfo, lits: List<Bytes>) -> LawRow / {abort.raise} =
     literals: lits,
   }
 
-fn op_row(module: Int, op_info: OpInfo, width_sums: WidthSums) -> OpRow / {abort.raise} =
+fn operation_row(
+  module: Int,
+  op_info: OperationInfo,
+  width_sums: WidthSums,
+) -> OperationRow / {abort.raise} =
   {
     name: op_info.name,
     mode: mode_text(op_info.mode),
     resource_param: op_info.resource_param,
-    kept: op_info.kept,
+    retained_parameters: op_info.keep_indices,
     params: op_info.params.map(canonical_type),
-    ret: canonical_type(op_info.ret),
+    return_type: canonical_type(op_info.return_type),
     scheme: match op_info.scheme { Some(scheme) -> Some(canonical_scheme(scheme)), None -> None },
     at: span_at(module, op_info.at.span),
     carries: widths_of_all(width_sums, [], op_info.params).map(grounded),
@@ -144,8 +148,8 @@ fn effect_row(
     simple_name: effect_info.simple_name,
     public: public,
     nondet: effect_info.nondet,
-    operations: effect_info.operations.map(|op_info: OpInfo|
-      op_row(effect_info.at.module, op_info, width_sums)),
+    operations: effect_info.operations.map(|op_info: OperationInfo|
+      operation_row(effect_info.at.module, op_info, width_sums)),
     at: location_span(effect_info.at),
     host: host,
     waits: match host {
@@ -171,7 +175,7 @@ fn waiting_operations(
               h.clauses.fold(accumulator, |operations: List<Bytes>, c: TypedClause<Bytes>|
                 if c.effect == served
                     && c.effects.listed.any(|a: Effect| a.effect == b"std.internal.native.wait") {
-                  operations.push(c.op)
+                  operations.push(c.operation)
                 } else { operations }),
             _ -> accumulator,
           },
@@ -301,7 +305,7 @@ fn hash_rows(outlines: List<Outline>, hashes: HashOutput) -> List<HashTableRow> 
 
 fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.raise} = {
   let (params, return_type, effects) = match definition_info.scheme.ty {
-    FunctionType(f) -> (f.params, f.ret, f.effects.listed),
+    FunctionType(f) -> (f.params, f.return_type, f.effects.listed),
     other -> ([], other, []),
   };
   let printed = params.fold(
@@ -550,7 +554,7 @@ fn width_number(name: Bytes) -> Option<Int> =
 type WidthSums = { sums: Map<Bytes, Bool> }
 
 fn width_sums_of(constructors: List<ConstructorInfo>) -> WidthSums = {
-  let fixed_width_types = holding_widths(constructors, []);
+  let fixed_width_types = types_with_fixed_width(constructors, []);
   {
     sums: Map::of_entries(
       constructors.map(|constructor_info: ConstructorInfo|
@@ -562,7 +566,7 @@ fn width_sums_of(constructors: List<ConstructorInfo>) -> WidthSums = {
   }
 }
 
-fn holding_widths(
+fn types_with_fixed_width(
   constructors: List<ConstructorInfo>,
   fixed_width_types: List<Bytes>,
 ) -> List<Bytes> =
@@ -600,7 +604,7 @@ fn has_no_widths(widths_of: Widths) -> Bool = match widths_of { NoWidths -> true
 
 fn widths_of(width_sums: WidthSums, type_variables: List<Int>, ty: Type) -> Widths / {abort.raise} =
   match ty {
-    VariableType(v) -> VariableWidths(var_number(type_variables, v)),
+    VariableType(v) -> VariableWidths(variable_number(type_variables, v)),
     NamedType(c) -> match width_number(c.name) {
       Some(n) -> FixedWidth(n),
       None -> {
@@ -620,7 +624,7 @@ fn widths_of(width_sums: WidthSums, type_variables: List<Int>, ty: Type) -> Widt
     },
     FunctionType(f) -> {
       let params = widths_of_all(width_sums, type_variables, f.params);
-      let return_widths = widths_of(width_sums, type_variables, f.ret);
+      let return_widths = widths_of(width_sums, type_variables, f.return_type);
       if has_no_widths(return_widths)
           && params.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) { NoWidths }
       else { FunctionWidths(params, return_widths) }
@@ -673,14 +677,14 @@ fn grounded(c: Widths) -> Widths =
     other -> other,
   }
 
-fn var_number(type_variables: List<Int>, v: Int) -> Int / {abort.raise} =
+fn variable_number(type_variables: List<Int>, v: Int) -> Int / {abort.raise} =
   range(0, type_variables.len()).fold(type_variables.len() + v, |accumulator: Int, i: Int|
     if accumulator >= type_variables.len() && type_variables.get(i) == v { i } else { accumulator })
 
-fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
+fn emit_signature(ty: Type) -> { params: List<Type>, result_type: Type } =
   match ty {
-    FunctionType(f) -> { params: f.params, ret: f.ret },
-    other -> { params: [], ret: other },
+    FunctionType(f) -> { params: f.params, result_type: f.return_type },
+    other -> { params: [], result_type: other },
   }
 
 fn emitter_root(
@@ -753,7 +757,7 @@ fn emitter_roots(
                     witnesses,
                     Named(name),
                     sig.params,
-                    sig.ret,
+                    sig.result_type,
                     definition.scheme.label_variables.len(),
                     is_pure_definition(definition),
                     place,
@@ -781,7 +785,7 @@ fn emitter_roots(
                             function_variables,
                             witnesses,
                             root,
-                            sig.params.push(sig.ret),
+                            sig.params.push(sig.result_type),
                             place,
                           );
                           { rows: b.rows.push(row), requires: b.requires, ensures: b.ensures + 1 }

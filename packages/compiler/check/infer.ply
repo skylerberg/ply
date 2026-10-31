@@ -1,9 +1,9 @@
 import compiler.syntax.parsing (Span, span_between, node_id_base, dummy_span, moved_by)
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
-import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, ExternItem, OrdDeriver,
-                              NumericDeriver, deriver_text, DeriveOrigin, InvariantInstance, parse,
-                              is_predicate)
+import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, ExternItem,
+                              OrderingDeriver, NumericDeriver, deriver_text, DeriveOrigin,
+                              InvariantInstance, parse, is_predicate)
 import compiler.syntax.expressions (Expression, prelude_module, try_spans, expression_span,
                                     sees_homes)
 import compiler.expand.rewrite.shared (expressions_matching)
@@ -13,9 +13,10 @@ import compiler.check.types (Effect, Effects, ResourceVariable, SingletonResourc
                              canonical_beside, RecordType, record_fields, Field, effects_sorted,
                              resolve_effect, no_effects, open_effects, single_effect,
                              without_raises, int_type, bool_type, bytes_type, list_type, iter_type,
-                             fn_type, shallow_resolve, written_label, label_of, effect_list_text,
-                             scheme_text, type_text, NominalType, TypeTable, insert_type, subtable,
-                             tables_joined, type_table_bin, variables_in, unit_type, type_at)
+                             function_type, shallow_resolve, written_label, label_of,
+                             effect_list_text, scheme_text, type_text, NominalType, TypeTable,
+                             insert_type, subtable, tables_joined, type_table_bin, variables_in,
+                             unit_type, type_at)
 import compiler.check.termination (Terminates, TerminatesByDecreases, Diverges, Site)
 import compiler.check.resolve.tables (ParsedModule, Source, Resolution, Diagnostic, Label, Edit,
                                       Fix, with_fix, insertion, qualify, error_at)
@@ -43,22 +44,22 @@ import compiler.check.typed (TypedExpression, TypedBody, ReadLocal, ReadDefiniti
                              ReleaseUnwinding, ReleaseMissing, ReleaseFailing)
 import compiler.check.infer.walked (WalkedTree, WalkedReading, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, resolved)
-import compiler.check.infer.checker (OpInfo, EffectInfo, ConstructorInfo, DefinitionConstraint,
-                                     InstanceInfo, NumericInfo, SpecInfo, DefinitionInfo,
-                                     RaisingCall, RaisingFunctionValue, UnguardedBuiltin,
-                                     RequirementNotShown, ZeroDivisor, Raise, TestInfo, LawBinder,
-                                     LawInfo, MemberSite, WitnessOrder, LabelApplication,
-                                     CachedDefinition, CachedTest, CachedFacts, CheckCache,
-                                     empty_cache, Checker, CheckedBody, report, report_error_at,
-                                     resolve, resolve_effects_in, abort_effect, definition_of,
-                                     Builtin, builtin_of_extern, builtins, builtin_named,
-                                     member_site_bin, witness_order_bin, ReleaseSite)
+import compiler.check.infer.checker (OperationInfo, EffectInfo, ConstructorInfo,
+                                     DefinitionConstraint, InstanceInfo, NumericInfo, SpecInfo,
+                                     DefinitionInfo, RaisingCall, RaisingFunctionValue,
+                                     UnguardedBuiltin, RequirementNotShown, ZeroDivisor, Raise,
+                                     TestInfo, LawBinder, LawInfo, MemberSite, WitnessOrder,
+                                     LabelApplication, CachedDefinition, CachedTest, CachedFacts,
+                                     CheckCache, empty_cache, Checker, CheckedBody, report,
+                                     report_error_at, resolve, resolve_effects_in, abort_effect,
+                                     definition_of, Builtin, builtin_of_extern, builtins,
+                                     builtin_named, member_site_bin, witness_order_bin, ReleaseSite)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (collect_nominals, collect_types, collect_effects,
                                           collect_constructors, check_value_namespace,
                                           reject_irregular)
-import compiler.check.infer.expression (check_bit_ops, check_concats, check_columns, check_updates,
-                                        kept_type)
+import compiler.check.infer.expression (check_bit_operations, check_concats, check_columns,
+                                        check_updates, retained_type)
 import compiler.check.infer.definitions (ModuleSignatures, bind_signatures, externs_of, externs_in,
                                          check_bodies, check_numerics, check_tests, check_laws,
                                          check_schemas, check_specs, unlowered_of)
@@ -532,15 +533,15 @@ fn numbered(ty: Type, numbering: Map<Int, Int>, retained_variables: List<Int>) -
     match ty {
       VariableType(v) -> match numbering.get(v) {
         Some(i) -> VariableType(i),
-        None -> if retained_variables.contains(v) { kept_type() } else { unit_type() },
+        None -> if retained_variables.contains(v) { retained_type() } else { unit_type() },
       },
       NamedType(c) -> NamedType({ ..c, args: c.args.map(again) }),
       FunctionType(f) ->
         FunctionType({
-          kept: [],
+          keep_parameters: [],
           once: false,
           params: f.params.map(again),
-          ret: again(f.ret),
+          return_type: again(f.return_type),
           effects: no_effects(),
         }),
       RecordType(fs) -> RecordType(fs.map(|f: Field| { ..f, ty: again(f.ty) })),
@@ -560,7 +561,7 @@ fn needs_renumbering(ty: Type) -> Bool =
     FunctionType(f) ->
       f.effects.listed.len() > 0 || f.effects.variable != None
         || f.params.fold(false, |found: Bool, p: Type| found || needs_renumbering(p))
-        || needs_renumbering(f.ret),
+        || needs_renumbering(f.return_type),
     RecordType(fs) -> fs.fold(false, |found: Bool, f: Field| found || needs_renumbering(f.ty)),
     NominalType(x) ->
       x.args.fold(false, |found: Bool, a: Type| found || needs_renumbering(a))
@@ -653,12 +654,12 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
         ],
       )
     } else {
-      let names = a.vars.fold([], |accumulator: List<Bytes>, v: Int|
+      let names = a.variables.fold([], |accumulator: List<Bytes>, v: Int|
         match label_named(in_module, a, v) {
           Some(n) -> accumulator.push(written_label(n)),
           None -> accumulator,
         });
-      if names.len() < a.vars.len() {
+      if names.len() < a.variables.len() {
         let unfilled = error_at(
           b"E0306",
           a.module,
@@ -751,7 +752,7 @@ pub fn check_program_with(
       modules.get(i),
     ));
   let resolved: Checker = check_columns(
-    check_bit_ops(check_numerics(check_concats(check_updates(check_instances(tested))))),
+    check_bit_operations(check_numerics(check_concats(check_updates(check_instances(tested))))),
   );
   let constrained: Checker = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(resolved))),
@@ -786,7 +787,7 @@ fn dump_definition(definition_info: DefinitionInfo) -> Bytes / {abort.raise} =
     b";",
   ])
 
-fn dump_op(op_info: OpInfo) -> Bytes / {abort.raise} =
+fn dump_operation(op_info: OperationInfo) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     op_info.name,
     b":",
@@ -796,7 +797,7 @@ fn dump_op(op_info: OpInfo) -> Bytes / {abort.raise} =
     b":",
     Bytes::join(op_info.params.map(type_text), b"+"),
     b":",
-    type_text(op_info.ret),
+    type_text(op_info.return_type),
   ])
 
 fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
@@ -840,7 +841,7 @@ fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
             b";",
             dump_flag(effect_info.nondet),
             b";",
-            Bytes::join(effect_info.operations.map(dump_op), b","),
+            Bytes::join(effect_info.operations.map(dump_operation), b","),
             b";",
           ]),
       ),
@@ -886,7 +887,7 @@ type ExpandedSource = {
 fn parsed_all(sources: List<Source>) -> List<ExpandedSource> / {abort.raise} =
   range(0, sources.len()).map(|i: Int| {
     let s = sources.get(i);
-    let r = parse(s.src);
+    let r = parse(s.source_text);
     let x = expand(r.node, r.parser.diagnostics);
     let d: Expansion = expand_derives(i, s.name, x.module);
     {
@@ -979,7 +980,7 @@ test "`check_dump` writes each function, test, law, effect and type constructor 
     check_dump([
       {
         name: b"m",
-        src: b"effect log { write emit(Bytes) -> Unit }\ntype Box = | Box(Int)\nfn say<a>(x: a, b: Bytes) -> a / { log.write } where derivable(eq, a) = { log.emit(b); x }\ntest \"says\" { let _ = say(1, b\"x\"); () }\nlaw \"same\" forall (n: Int) where n > 0 { n == n }",
+        source_text: b"effect log { write emit(Bytes) -> Unit }\ntype Box = | Box(Int)\nfn say<a>(x: a, b: Bytes) -> a / { log.write } where derivable(eq, a) = { log.emit(b); x }\ntest \"says\" { let _ = say(1, b\"x\"); () }\nlaw \"same\" forall (n: Int) where n > 0 { n == n }",
       },
     ]),
     "K;1;F;m.say;<a>(a, Bytes) -> a / {m.log.write};m.log.write;m.log.emit;eq0;T;m.says;0;m.log.write;L;m.same;n:Int;1;;E;m.log;0;emit:write:0:Bytes:Unit;C;m.Box;m.Box;0;1;(Int) -> m.Box;",
@@ -987,7 +988,7 @@ test "`check_dump` writes each function, test, law, effect and type constructor 
 }
 
 fn checked_m(source: Bytes) -> CheckResult / {abort.raise} =
-  match resolved_all([{ name: b"m", src: source }]) {
+  match resolved_all([{ name: b"m", source_text: source }]) {
     Err(rejected) -> panic("`m` does not resolve: " ++ String::of_bytes_lossy(rejected)),
     Ok(x) -> check_program(x.resolution, x.modules),
   }
@@ -1062,7 +1063,12 @@ fn source_expression_at(checker: Checker, at: Span) -> Expression / {abort.raise
 fn shown(t: Type) -> Bytes / {abort.raise} =
   match t {
     FunctionType(f) ->
-      Bytes::concat_all([b"(", Bytes::join(f.params.map(shown), b", "), b") -> ", shown(f.ret)]),
+      Bytes::concat_all([
+        b"(",
+        Bytes::join(f.params.map(shown), b", "),
+        b") -> ",
+        shown(f.return_type),
+      ]),
     other -> type_text(other),
   }
 
@@ -1095,7 +1101,7 @@ fn effect_placed_text(entry: Effect) -> Bytes / {abort.raise} = {
   Bytes::concat_all([
     entry.effect,
     b".",
-    match entry.op { Some(operation) -> operation, None -> mode_text(entry.mode) },
+    match entry.operation { Some(operation) -> operation, None -> mode_text(entry.mode) },
     resource,
   ])
 }
@@ -1133,7 +1139,7 @@ fn effects_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abo
         own.concat(
           h.clauses.filter(|c: TypedClause<Type>| picked(c.span)).map(|c: TypedClause<Type>|
             placed_effects_text(c.effects)),
-        ).concat(match h.ret {
+        ).concat(match h.return_clause {
           Some(r) -> if picked(r.span) { [placed_effects_text(r.effects)] } else { [] },
           None -> [],
         }),
@@ -1469,7 +1475,7 @@ test "`[*]` on an operation that takes no resource is rejected" {
   let dump = check_dump([
     {
       name: b"m",
-      src: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit = handle { log.note(\"x\") } with { log.note[*](line) -> () }",
+      source_text: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit = handle { log.note(\"x\") } with { log.note[*](line) -> () }",
     },
   ]);
   assert(dump.contains("E0304"))
@@ -1479,7 +1485,7 @@ test "`[*]` in a function's effects on an operation that takes no resource is re
   let dump = check_dump([
     {
       name: b"m",
-      src: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit / {log.note[*]} = log.note(\"x\")",
+      source_text: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit / {log.note[*]} = log.note(\"x\")",
     },
   ]);
   assert(dump.contains("E0304"))
@@ -1489,26 +1495,26 @@ test "a call is rejected when it cannot fill a generic resource label, gives the
   let unfilled = check_dump([
     {
       name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go(b: Bytes) -> Unit / {net.send[conn]} = relay(b)",
+      source_text: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go(b: Bytes) -> Unit / {net.send[conn]} = relay(b)",
     },
   ]);
   assert(unfilled.contains("E0306"));
   let counted = check_dump([
     {
       name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn, other](b)",
+      source_text: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn, other](b)",
     },
   ]);
   assert(counted.contains("E0306"));
   let valued = check_dump([
     {
       name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go() -> (Bytes) -> Unit / {net.send[conn]} = relay",
+      source_text: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go() -> (Bytes) -> Unit / {net.send[conn]} = relay",
     },
   ]);
   assert(valued.contains("E0306"));
   let plain = check_dump([
-    { name: b"m", src: b"fn id(x: Int) -> Int = x\nfn go(n: Int) -> Int = id[conn](n)" },
+    { name: b"m", source_text: b"fn id(x: Int) -> Int = x\nfn go(n: Int) -> Int = id[conn](n)" },
   ]);
   assert(plain.contains("E0306"))
 }
@@ -3913,7 +3919,7 @@ test "checking a program from its own exported interfaces gives the same result 
   let modules = [
     {
       name: b"m",
-      src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\nfn show<a>(x: a) -> Int where derivable(eq, a) = 1\ntest \"says\" { say(b\"x\") }",
+      source_text: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\nfn show<a>(x: a) -> Int where derivable(eq, a) = 1\ntest \"says\" { say(b\"x\") }",
     },
   ];
   let dumps = check_dumps(modules);
@@ -3950,12 +3956,12 @@ fn rejections(source: Bytes) -> List<List<Bytes>> / {abort.raise} =
 
 fn label_rejections(source: Bytes) -> List<Bytes> / {abort.raise} =
   match resolved_all([
-      { name: b"m", src: source },
+      { name: b"m", source_text: source },
       {
         name: b"std.cases",
-        src: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
+        source_text: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
       },
-      { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"\n" },
+      { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"\n" },
     ]) {
     Err(dump) -> [dump],
     Ok(x) ->
@@ -4206,7 +4212,7 @@ test "a call instantiating a constrained parameter with a function is rejected a
 fn errors_across(sources: List<Source>) -> List<Diagnostic> / {abort.raise} = {
   let parsed = range(0, sources.len()).map(|i: Int| {
     let s = sources.get(i);
-    let r = parse(s.src);
+    let r = parse(s.source_text);
     let x = expand(r.node, r.parser.diagnostics);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diagnostics: d.diagnostics }
@@ -4232,8 +4238,11 @@ fn codes_across(sources: List<Source>) -> List<Bytes> / {abort.raise} =
 test "an error in one module is not also reported for code at the same source position in another module" {
   assert_eq(
     codes_across([
-      { name: b"a", src: b"fn sender(f: () -> Unit / {net.send[x]}) -> Unit = f()\n" },
-      { name: b"b", src: b"fn digit(b: Int) -> Int / {abort.raise} = abort.raise(\"x\")\n" },
+      { name: b"a", source_text: b"fn sender(f: () -> Unit / {net.send[x]}) -> Unit = f()\n" },
+      {
+        name: b"b",
+        source_text: b"fn digit(b: Int) -> Int / {abort.raise} = abort.raise(\"x\")\n",
+      },
     ]),
     [b"E0103"],
   )
@@ -4252,11 +4261,11 @@ test "a suggested fix lists only effects the module can name in its source, so n
   let ds = errors_across([
     {
       name: b"base",
-      src: b"pub effect net { write send[c](p: Bytes) -> Unit }\npub fn push() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n",
+      source_text: b"pub effect net { write send[c](p: Bytes) -> Unit }\npub fn push() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n",
     },
     {
       name: b"app",
-      src: b"import base (push)\nfn run() -> Unit / {clock.read} = push()\nfn quiet() -> Unit = push()",
+      source_text: b"import base (push)\nfn run() -> Unit / {clock.read} = push()\nfn quiet() -> Unit = push()",
     },
   ]);
   assert_eq(ds.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0302", b"E0302"]);
@@ -4266,14 +4275,16 @@ test "a suggested fix lists only effects the module can name in its source, so n
 test "a record update takes its shape from the base's inferred type, not from where it was written" {
   let p = b"type P = { a: Int, b: Int }\nfn mk() -> P = { a: 1, b: 2 }\n";
   assert_eq(
-    codes_across([{ name: b"m", src: p.concat(b"fn f() -> P = { let q = mk(); {..q, b: 3} }") }]),
+    codes_across([
+      { name: b"m", source_text: p.concat(b"fn f() -> P = { let q = mk(); {..q, b: 3} }") },
+    ]),
     [],
   );
   assert_eq(
     codes_across([
       {
         name: b"m",
-        src: p.concat(
+        source_text: p.concat(
           b"fn g(ps: List<P>) -> P = match ps.at(0) { Some(q) -> {..q, b: 3}, None -> mk() }",
         ),
       },
@@ -4284,7 +4295,7 @@ test "a record update takes its shape from the base's inferred type, not from wh
     codes_across([
       {
         name: b"m",
-        src: p.concat(b"fn h(xs: List<Int>) -> P = xs.fold(mk(), |acc, x| {..acc, a: x})"),
+        source_text: p.concat(b"fn h(xs: List<Int>) -> P = xs.fold(mk(), |acc, x| {..acc, a: x})"),
       },
     ]),
     [],
@@ -4296,11 +4307,11 @@ test "a record update may name a record type another module declares" {
     codes_across([
       {
         name: b"shapes",
-        src: b"pub type P = { a: Int, b: Int }\npub fn mk() -> P = { a: 1, b: 2 }",
+        source_text: b"pub type P = { a: Int, b: Int }\npub fn mk() -> P = { a: 1, b: 2 }",
       },
       {
         name: b"m",
-        src: b"import shapes\nfn f() -> shapes::P = { let q = shapes::mk(); {..q, b: 3} }",
+        source_text: b"import shapes\nfn f() -> shapes::P = { let q = shapes::mk(); {..q, b: 3} }",
       },
     ]),
     [],
@@ -4311,46 +4322,52 @@ test "a record update is rejected when the base is not a record, when the base's
   let p = b"type P = { a: Int, b: Int }\n";
   assert_eq(
     codes_across([
-      { name: b"m", src: p.concat(b"fn f(n: Int) -> Int = { let q = {..n, a: 1}; 0 }") },
+      { name: b"m", source_text: p.concat(b"fn f(n: Int) -> Int = { let q = {..n, a: 1}; 0 }") },
     ]),
     [b"E0116"],
   );
   assert_eq(
     codes_across([
-      { name: b"m", src: p.concat(b"fn f() -> Int = { let g = |s| {..s, a: 1}; 0 }") },
+      { name: b"m", source_text: p.concat(b"fn f() -> Int = { let g = |s| {..s, a: 1}; 0 }") },
     ]),
     [b"E0116"],
   );
-  assert_eq(codes_across([{ name: b"m", src: p.concat(b"fn f(q: P) -> P = {..q, c: 1}") }]), [
-    b"E0117",
-  ])
+  assert_eq(
+    codes_across([{ name: b"m", source_text: p.concat(b"fn f(q: P) -> P = {..q, c: 1}") }]),
+    [b"E0117"],
+  )
 }
 
 test "`++` joins two Strings or two Bytes, and rejects one of each" {
   assert_eq(
-    codes_across([{ name: b"m", src: b"fn f(a: String, b: String) -> String = a ++ b" }]),
+    codes_across([{ name: b"m", source_text: b"fn f(a: String, b: String) -> String = a ++ b" }]),
     [],
   );
-  assert_eq(codes_across([{ name: b"m", src: b"fn f(a: Bytes, b: Bytes) -> Bytes = a ++ b" }]), []);
+  assert_eq(
+    codes_across([{ name: b"m", source_text: b"fn f(a: Bytes, b: Bytes) -> Bytes = a ++ b" }]),
+    [],
+  );
   assert_eq(
     codes_across([
       {
         name: b"m",
-        src: b"fn f(xs: List<Bytes>) -> Bytes = xs.fold(b\"\", |acc: Bytes, x: Bytes| acc ++ x)",
+        source_text: b"fn f(xs: List<Bytes>) -> Bytes = xs.fold(b\"\", |acc: Bytes, x: Bytes| acc ++ x)",
       },
     ]),
     [],
   );
   assert_eq(
-    codes_across([{ name: b"m", src: b"fn f(a: String, b: Bytes) -> String = a ++ b" }]),
+    codes_across([{ name: b"m", source_text: b"fn f(a: String, b: Bytes) -> String = a ++ b" }]),
     [b"E0201"],
   );
-  assert_eq(codes_across([{ name: b"m", src: b"fn f(a: Int, b: Int) -> Int = a ++ b" }]), [
-    b"E0201",
-  ]);
-  assert_eq(codes_across([{ name: b"m", src: b"fn f() -> Int = { let g = |a, b| a ++ b; 0 }" }]), [
-    b"E0210",
-  ])
+  assert_eq(
+    codes_across([{ name: b"m", source_text: b"fn f(a: Int, b: Int) -> Int = a ++ b" }]),
+    [b"E0201"],
+  );
+  assert_eq(
+    codes_across([{ name: b"m", source_text: b"fn f() -> Int = { let g = |a, b| a ++ b; 0 }" }]),
+    [b"E0210"],
+  )
 }
 
 fn not_covered(source: Bytes) -> List<Bytes> / {abort.raise} = {
@@ -4975,7 +4992,7 @@ test "a builtin is what the prelude declares: its scheme, its parameters' names 
     effect_variables: [],
     keep_variables: [],
     label_variables: [],
-    ty: fn_type(
+    ty: function_type(
       [bytes_type(), int_type(), int_type()],
       bytes_type(),
       single_effect(abort_effect()),
@@ -4990,19 +5007,26 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
     effect_variables: [0],
     keep_variables: [],
     label_variables: [],
-    ty: fn_type(
-      [list_type(VariableType(0)), fn_type([VariableType(0)], VariableType(1), open_effects(0))],
+    ty: function_type(
+      [
+        list_type(VariableType(0)),
+        function_type([VariableType(0)], VariableType(1), open_effects(0)),
+      ],
       list_type(VariableType(1)),
       open_effects(0),
     ),
   });
   assert_eq(
     declared_as(b"iterate").scheme.ty,
-    fn_type(
+    function_type(
       [
         VariableType(0),
         int_type(),
-        fn_type([VariableType(0)], iter_type(VariableType(0), VariableType(1)), open_effects(0)),
+        function_type(
+          [VariableType(0)],
+          iter_type(VariableType(0), VariableType(1)),
+          open_effects(0),
+        ),
       ],
       VariableType(1),
       { listed: [abort_effect()], variable: Some(0) },
@@ -5011,7 +5035,7 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
 }
 
 test "a declaration's `where` clause records which constraint each call must satisfy, identified by the parameter's position" {
-  assert_eq(declared_as(b"compare").constraints, [{ deriver: OrdDeriver, param: 0 }]);
+  assert_eq(declared_as(b"compare").constraints, [{ deriver: OrderingDeriver, param: 0 }]);
   assert_eq(declared_as(b"numeric_of_int").constraints, [{ deriver: NumericDeriver, param: 0 }]);
   assert_eq(declared_as(b"List::push").constraints, [])
 }
@@ -5022,22 +5046,23 @@ test "every builtin can be used in a module that has no imports" {
 
 test "an `extern fn` outside a shipped module is rejected" {
   assert_eq(check_codes(b"extern fn secret(x: Int) -> Int\nfn f() -> Int = 1\n"), [b"E0151"]);
-  assert_eq(codes_of([{ name: b"tools.native", src: b"pub extern fn secret(x: Int) -> Int\n" }]), [
-    b"E0151",
-  ])
+  assert_eq(
+    codes_of([{ name: b"tools.native", source_text: b"pub extern fn secret(x: Int) -> Int\n" }]),
+    [b"E0151"],
+  )
 }
 
 test "a public extern of a shipped module is callable by its qualified or imported name, and a private extern only inside that module" {
   let native = {
     name: b"std.native",
-    src: b"pub type Pair<a> = | Pair(a, a)\npub extern fn doubled(x: Int) -> Int\nextern fn hidden(x: Int) -> Int\npub fn twice(x: Int) -> Int = hidden(x) + hidden(x)\npub extern fn first<a>(p: Pair<a>) -> a\n",
+    source_text: b"pub type Pair<a> = | Pair(a, a)\npub extern fn doubled(x: Int) -> Int\nextern fn hidden(x: Int) -> Int\npub fn twice(x: Int) -> Int = hidden(x) + hidden(x)\npub extern fn first<a>(p: Pair<a>) -> a\n",
   };
   assert_eq(
     codes_of([
       native,
       {
         name: b"m",
-        src: b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3) + n::twice(4)\n",
+        source_text: b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3) + n::twice(4)\n",
       },
     ]),
     [],
@@ -5045,18 +5070,18 @@ test "a public extern of a shipped module is callable by its qualified or import
   assert_eq(
     codes_of([
       native,
-      { name: b"m", src: b"import std.native (hidden)\nfn f() -> Int = hidden(1)\n" },
+      { name: b"m", source_text: b"import std.native (hidden)\nfn f() -> Int = hidden(1)\n" },
     ]),
     [b"E0107"],
   );
   assert_eq(
     codes_of([
       native,
-      { name: b"m", src: b"import std.native (doubled)\nfn f() -> Int = doubled(true)\n" },
+      { name: b"m", source_text: b"import std.native (doubled)\nfn f() -> Int = doubled(true)\n" },
     ]),
     [b"E0201"],
   );
-  let pairs = |source: Bytes| codes_of([native, { name: b"m", src: source }]);
+  let pairs = |source: Bytes| codes_of([native, { name: b"m", source_text: source }]);
   assert_eq(
     pairs(b"import std.native (Pair, first)\nfn f(p: Pair<String>) -> String = first(p)\n"),
     [],
@@ -5069,18 +5094,19 @@ test "a public extern of a shipped module is callable by its qualified or import
 test "a shipped module's extern declared with a type alias takes and returns the type that the alias stands for" {
   let native = {
     name: b"std.native",
-    src: b"pub type Pid = Int\npub type Pair = { pid: Pid, n: Int }\npub extern fn pid() -> Pid\npub extern fn first(p: Pair) -> Int\npub fn f() -> Int = pid()\npub fn g() -> Pid = first({ pid: pid(), n: 2 })\n",
+    source_text: b"pub type Pid = Int\npub type Pair = { pid: Pid, n: Int }\npub extern fn pid() -> Pid\npub extern fn first(p: Pair) -> Int\npub fn f() -> Int = pid()\npub fn g() -> Pid = first({ pid: pid(), n: 2 })\n",
   };
-  assert_eq(codes_of([native, { name: b"m", src: b"fn h() -> Int = 1\n" }]), [])
+  assert_eq(codes_of([native, { name: b"m", source_text: b"fn h() -> Int = 1\n" }]), [])
 }
 
 test "a shipped module's extern can use an effect operation from an effect it imports, and its callers must declare that effect" {
-  let with_ask_effect = { name: b"std.asking", src: b"pub nondet effect asked {}\n" };
+  let with_ask_effect = { name: b"std.asking", source_text: b"pub nondet effect asked {}\n" };
   let native = {
     name: b"std.native",
-    src: b"import std.asking (asked)\npub extern fn size() -> Int / {asked.read}\n",
+    source_text: b"import std.asking (asked)\npub extern fn size() -> Int / {asked.read}\n",
   };
-  let codes = |source: Bytes| codes_of([with_ask_effect, native, { name: b"m", src: source }]);
+  let codes = |source: Bytes|
+    codes_of([with_ask_effect, native, { name: b"m", source_text: source }]);
   assert_eq(
     codes(
       b"import std.asking (asked)\nimport std.native (size)\nfn f() -> Int / {asked.read} = size()\n",
@@ -5092,28 +5118,28 @@ test "a shipped module's extern can use an effect operation from an effect it im
     codes_of([
       {
         name: b"std.native",
-        src: b"pub nondet effect waits {}\npub extern fn wait() -> Int / {waits.read}\n",
+        source_text: b"pub nondet effect waits {}\npub extern fn wait() -> Int / {waits.read}\n",
       },
       {
         name: b"m",
-        src: b"import std.native (waits, wait)\nfn f() -> Int / {waits.read} = wait()\n",
+        source_text: b"import std.native (waits, wait)\nfn f() -> Int / {waits.read} = wait()\n",
       },
     ]),
     [],
   );
   let mode_effect_module = {
     name: b"std.asking",
-    src: b"pub nondet effect told {\n  read get() -> Int\n}\n",
+    source_text: b"pub nondet effect told {\n  read get() -> Int\n}\n",
   };
   let mode_native_module = {
     name: b"std.native",
-    src: b"import std.asking (told)\npub extern fn size() -> Int / {told.read}\n",
+    source_text: b"import std.asking (told)\npub extern fn size() -> Int / {told.read}\n",
   };
   match try[abort.raise] {
       codes_of([
         mode_effect_module,
         mode_native_module,
-        { name: b"m", src: b"fn f() -> Int = 1\n" },
+        { name: b"m", source_text: b"fn f() -> Int = 1\n" },
       ])
     } {
     Ok(codes) -> assert(false, Some("checked, with " ++ codes.len().to_string() ++ " codes")),
@@ -5125,9 +5151,9 @@ test "an `extern type` belongs to a shipped module, takes type parameters, and h
   assert_eq(check_codes(b"extern type Node<a>\nfn f() -> Int = 1\n"), [b"E0151"]);
   let native = {
     name: b"std.native",
-    src: b"pub extern type Node<a>\nextern type Hidden\npub extern fn node_of<a>(x: a) -> Node<a>\npub extern fn value_of<a>(n: Node<a>) -> a\n",
+    source_text: b"pub extern type Node<a>\nextern type Hidden\npub extern fn node_of<a>(x: a) -> Node<a>\npub extern fn value_of<a>(n: Node<a>) -> a\n",
   };
-  let codes = |source: Bytes| codes_of([native, { name: b"m", src: source }]);
+  let codes = |source: Bytes| codes_of([native, { name: b"m", source_text: source }]);
   assert_eq(
     codes(
       b"import std.native (Node, node_of, value_of)\nfn f() -> Int = value_of(node_of(1))\nfn g(n: Node<String>) -> String = value_of(n)\n",
@@ -5155,9 +5181,9 @@ test "an `extern type` belongs to a shipped module, takes type parameters, and h
     codes_of([
       {
         name: b"std.native",
-        src: b"extern type Node\nextern fn rank(n: Node) -> Int\nkey for Node by rank\n",
+        source_text: b"extern type Node\nextern fn rank(n: Node) -> Int\nkey for Node by rank\n",
       },
-      { name: b"m", src: b"fn f() -> Int = 1\n" },
+      { name: b"m", source_text: b"fn f() -> Int = 1\n" },
     ]),
     [b"E0217"],
   );
@@ -5165,9 +5191,12 @@ test "an `extern type` belongs to a shipped module, takes type parameters, and h
     codes_of([
       {
         name: b"std.native",
-        src: Bytes::concat_all([b"extern type Node\nextern fn rank(n: Node) -> Int\n", item]),
+        source_text: Bytes::concat_all([
+          b"extern type Node\nextern fn rank(n: Node) -> Int\n",
+          item,
+        ]),
       },
-      { name: b"m", src: b"fn f() -> Int = 1\n" },
+      { name: b"m", source_text: b"fn f() -> Int = 1\n" },
     ]);
   assert_eq(
     measured_definitions(
@@ -5232,8 +5261,8 @@ test "the prelude declares only the extern functions that the code generator has
   assert_eq(externs_in(prelude_module(), text), [
     { module: prelude_module(), name: b"ListNode::leaf_of", words: 2, raises: false, call: None },
   ]);
-  let prelude = { name: prelude_module(), src: text };
-  let user = |source: Bytes| codes_of([prelude, { name: b"m", src: source }]);
+  let prelude = { name: prelude_module(), source_text: text };
+  let user = |source: Bytes| codes_of([prelude, { name: b"m", source_text: source }]);
   assert_eq(user(b"fn f(xs: List<Int>) -> Int = ListNode::start(xs)\n"), [b"E0101"]);
   assert_eq(user(b"fn f(n: ListNode<Int>) -> Int = 1\n"), [b"E0102"]);
   assert_eq(user(b"import std.prelude (ListNode)\nfn f(n: ListNode<Int>) -> Int = 1\n"), [
@@ -5995,12 +6024,15 @@ fn host_handler_sources(rest: Bytes) -> List<Source> =
   [
     {
       name: b"std.fact",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n  raise lost(why: String)\n}\n",
         rest,
       ]),
     },
-    { name: b"m", src: b"import std.fact (fact)\nfn main() -> Int / {fact.get} = fact.get()\n" },
+    {
+      name: b"m",
+      source_text: b"import std.fact (fact)\nfn main() -> Int / {fact.get} = fact.get()\n",
+    },
   ]
 
 fn host_handler_source(go: Bytes, result: Bytes, body: Bytes) -> Bytes =
@@ -6032,7 +6064,7 @@ test "a `host for` handler must handle every read and write of its effect, and o
     codes_of([
       {
         name: b"tools.fact",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub effect fact {\n  read get() -> Int\n}\n",
           b"host for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / e = handle { go() } with { fact.get() -> 7 }\n",
         ]),
@@ -6081,11 +6113,11 @@ test "a `host for` handler must handle every read and write of its effect, and o
   );
   let other = {
     name: b"std.clock",
-    src: b"pub effect tick {\n  read now() -> Int\n}\nhost for tick by ticked\nfn ticked<a | e>(go: () -> a / {tick.now | e}) -> a / e = handle { go() } with { tick.now() -> 0 }\n",
+    source_text: b"pub effect tick {\n  read now() -> Int\n}\nhost for tick by ticked\nfn ticked<a | e>(go: () -> a / {tick.now | e}) -> a / e = handle { go() } with { tick.now() -> 0 }\n",
   };
   let ticking = {
     name: b"std.fact",
-    src: b"import std.clock (tick)\npub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / {tick.now | e} = handle { go() } with { fact.get() -> tick.now() }\n",
+    source_text: b"import std.clock (tick)\npub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / {tick.now | e} = handle { go() } with { fact.get() -> tick.now() }\n",
   };
   assert_eq(codes_of([other, ticking]), [b"E0164"])
 }
@@ -6442,11 +6474,14 @@ test "a key type that cannot be ordered, passed where a signature names a `Map`,
 }
 
 test "an `extern` function in a standard library module that names a `Map` requires the key to be orderable" {
-  assert_eq(declared_as(b"Map::new").constraints, [{ deriver: OrdDeriver, param: 0 }]);
-  assert_eq(declared_as(b"Map::len").constraints, [{ deriver: OrdDeriver, param: 0 }]);
-  let native = { name: b"std.native", src: b"pub extern fn size<k>(m: Map<k, Int>) -> Int\n" };
+  assert_eq(declared_as(b"Map::new").constraints, [{ deriver: OrderingDeriver, param: 0 }]);
+  assert_eq(declared_as(b"Map::len").constraints, [{ deriver: OrderingDeriver, param: 0 }]);
+  let native = {
+    name: b"std.native",
+    source_text: b"pub extern fn size<k>(m: Map<k, Int>) -> Int\n",
+  };
   let calls = |source: Bytes|
-    codes_of([native, { name: b"m", src: b"import std.native (size)\n".concat(source) }]);
+    codes_of([native, { name: b"m", source_text: b"import std.native (size)\n".concat(source) }]);
   assert_eq(calls(b"fn twice<j>(m: Map<j, Int>) -> Int = size(m) + size(m)\n"), []);
   assert_eq(calls(b"fn floats(x: Float) -> Int = size(Map::new().insert(x, 1))\n"), [b"E0206"])
 }
@@ -6535,10 +6570,13 @@ test "a type with a `key` function is compared, used as a `Map` key and hashed b
 test "a `forall` ranges over an opaque type another module declares" {
   let vault = {
     name: b"vault",
-    src: b"pub opaque type Coin = | Heads | Tails\npub opaque type Purse<a> = | Purse(List<a>)\n",
+    source_text: b"pub opaque type Coin = | Heads | Tails\npub opaque type Purse<a> = | Purse(List<a>)\n",
   };
   let over = |law: Bytes|
-    codes_across([vault, { name: b"app", src: b"import vault (Coin, Purse)\n".concat(law) }]);
+    codes_across([
+      vault,
+      { name: b"app", source_text: b"import vault (Coin, Purse)\n".concat(law) },
+    ]);
   assert_eq(over(b"law \"l\" forall (c: Coin, cs: List<Coin>) { c == c }"), []);
   assert_eq(over(b"law \"l\" forall (p: Purse<Coin>) { p == p }"), []);
   assert_eq(over(b"law \"l\" forall (c: Coin) { c == Heads }"), [b"E0107"])
@@ -6560,9 +6598,9 @@ test "a scoped opaque value can be used only through its own module's functions,
     codes_across([
       {
         name: b"vault",
-        src: b"pub opaque type Token = | Token(Int)\npub fn mint(n: Int) -> Token = Token(n)\npub fn spend(t: Token) -> Unit = ()\npub fn worth(t: Token) -> Int = match t { Token(n) -> n }\n",
+        source_text: b"pub opaque type Token = | Token(Int)\npub fn mint(n: Int) -> Token = Token(n)\npub fn spend(t: Token) -> Unit = ()\npub fn worth(t: Token) -> Int = match t { Token(n) -> n }\n",
       },
-      { name: b"app", src: b"import vault (Token, mint, spend, worth)\n".concat(app) },
+      { name: b"app", source_text: b"import vault (Token, mint, spend, worth)\n".concat(app) },
     ]);
   assert_eq(
     over(b"fn spent(n: Int) -> Int = with_scope[t](mint(n), spend) { h -> worth(h.get()) }"),
@@ -6722,20 +6760,24 @@ test "a binding and an effect of one name are rejected once, where the effect ha
 }
 
 test "a name from `std.console` needs no import, and a function of the same name that the module declares or imports takes precedence" {
-  let console = { name: b"std.console", src: b"pub fn print(text: String) -> Int = text.len()\n" };
-  assert_eq(codes_of([console, { name: b"m", src: b"fn f() -> Int = print(\"x\")\n" }]), []);
+  let console = {
+    name: b"std.console",
+    source_text: b"pub fn print(text: String) -> Int = text.len()\n",
+  };
+  assert_eq(codes_of([console, { name: b"m", source_text: b"fn f() -> Int = print(\"x\")\n" }]), [
+  ]);
   assert_eq(
     codes_of([
       console,
-      { name: b"m", src: b"fn print(n: Int) -> Int = n\nfn f() -> Int = print(1)\n" },
+      { name: b"m", source_text: b"fn print(n: Int) -> Int = n\nfn f() -> Int = print(1)\n" },
     ]),
     [],
   );
   assert_eq(
     codes_of([
       console,
-      { name: b"other", src: b"pub fn print(b: Bool) -> Bool = b\n" },
-      { name: b"m", src: b"import other (print)\nfn f() -> Bool = print(true)\n" },
+      { name: b"other", source_text: b"pub fn print(b: Bool) -> Bool = b\n" },
+      { name: b"m", source_text: b"import other (print)\nfn f() -> Bool = print(true)\n" },
     ]),
     [],
   )
@@ -6744,14 +6786,14 @@ test "a name from `std.console` needs no import, and a function of the same name
 test "a function of a type another module declares is named through that module" {
   let shapes = {
     name: b"shapes",
-    src: b"pub type Shape = | Sq(Int)\npub fn Shape::make(n: Int) -> Shape = Sq(n)\npub fn Shape::area(s: Shape) -> Int = match s { Sq(n) -> n * n }\n",
+    source_text: b"pub type Shape = | Sq(Int)\npub fn Shape::make(n: Int) -> Shape = Sq(n)\npub fn Shape::area(s: Shape) -> Int = match s { Sq(n) -> n * n }\n",
   };
   assert_eq(
     codes_of([
       shapes,
       {
         name: b"m",
-        src: b"import shapes\nfn f(n: Int) -> Int = shapes::Shape::make(n).area() + shapes::Shape::make(n).shapes::Shape::area()\n",
+        source_text: b"import shapes\nfn f(n: Int) -> Int = shapes::Shape::make(n).area() + shapes::Shape::make(n).shapes::Shape::area()\n",
       },
     ]),
     [],
@@ -6759,7 +6801,7 @@ test "a function of a type another module declares is named through that module"
   assert_eq(
     codes_of([
       shapes,
-      { name: b"m", src: b"import shapes\nfn f(n: Int) -> Int = shapes::Shape::nope(n)\n" },
+      { name: b"m", source_text: b"import shapes\nfn f(n: Int) -> Int = shapes::Shape::nope(n)\n" },
     ]),
     [b"E0101"],
   );
@@ -6874,7 +6916,7 @@ test "`b.slice(0, 1)` is accepted inside an `if b.len() >= 1` check and rejected
 fn codes_of(sources: List<Source>) -> List<Bytes> / {abort.raise} =
   match resolve_modules(
       sources.map(|source: Source|
-        { name: source.name, module: parse(source.src).node, derived: [] }),
+        { name: source.name, module: parse(source.source_text).node, derived: [] }),
     ) {
     ResolveFailed(ds) -> ds.map(|diagnostic: Diagnostic| diagnostic.code),
     ResolveSucceeded(y) ->
@@ -6886,23 +6928,25 @@ fn codes_of(sources: List<Source>) -> List<Bytes> / {abort.raise} =
 test "extra functions for a built-in type such as `List` come from the `std` module that defines it, and every module can call them except modules that module imports" {
   let home = {
     name: b"std.list",
-    src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
+    source_text: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
   };
   let calls = b"fn f(xs: List<Int>) -> Option<Int> = xs.second()\nfn g(xs: List<Int>) -> Option<Int> = List::second(xs)\n";
-  assert_eq(codes_of([home, { name: b"m", src: b"import std.list\n".concat(calls) }]), []);
+  assert_eq(codes_of([home, { name: b"m", source_text: b"import std.list\n".concat(calls) }]), []);
   assert_eq(
     codes_of([
       home,
-      { name: b"mid", src: b"import std.list\npub fn one() -> Int = 1\n" },
-      { name: b"m", src: b"import mid\n".concat(calls) },
+      { name: b"mid", source_text: b"import std.list\npub fn one() -> Int = 1\n" },
+      { name: b"m", source_text: b"import mid\n".concat(calls) },
     ]),
     [],
   );
-  assert_eq(codes_of([home, { name: b"m", src: calls }]), []);
-  assert_eq(codes_of([home, { name: b"std.other", src: calls }]), []);
-  assert_eq(codes_of([home, { name: b"std.gen", src: calls }]), [b"E0101", b"E0101"]);
+  assert_eq(codes_of([home, { name: b"m", source_text: calls }]), []);
+  assert_eq(codes_of([home, { name: b"std.other", source_text: calls }]), []);
+  assert_eq(codes_of([home, { name: b"std.gen", source_text: calls }]), [b"E0101", b"E0101"]);
   assert_eq(
-    codes_of([{ name: b"std.list", src: b"pub fn List::len<a>(xs: List<a>) -> Int = 0\n" }]),
+    codes_of([
+      { name: b"std.list", source_text: b"pub fn List::len<a>(xs: List<a>) -> Int = 0\n" },
+    ]),
     [b"E0105"],
   )
 }
@@ -6910,7 +6954,7 @@ test "extra functions for a built-in type such as `List` come from the `std` mod
 test "every way of writing a call of a type's function resolves to that function, for declared and built-in types alike" {
   let home = {
     name: b"std.list",
-    src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
+    source_text: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
   };
   let kinds = [
     { ty: b"Box", f: b"Box::size", result: b"Int" },
@@ -6930,7 +6974,7 @@ test "every way of writing a call of a type's function resolves to that function
       home,
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"import std.list\ntype Box = | Box(Int)\nfn Box::size(b: Box) -> Int = match b { Box(n) -> n }\n",
           b"fn pass<a>(v: a) -> a = v\n",
           body,
@@ -7054,14 +7098,18 @@ test "the error for a stored borrowed parameter names the function that borrows 
 test "a call checks `keep` against the callee's signature, whether the callee is in another module or is a type's function" {
   let lib = {
     name: b"lib",
-    src: b"pub fn hold(h: keep (Int) -> Int) -> Int = 0\npub fn lend(h: (Int) -> Int) -> Int = h(0)\n",
+    source_text: b"pub fn hold(h: keep (Int) -> Int) -> Int = 0\npub fn lend(h: (Int) -> Int) -> Int = h(0)\n",
   };
   let calling = |call: Bytes|
     codes_of([
       lib,
       {
         name: b"m",
-        src: Bytes::concat_all([b"import lib\nfn f(g: (Int) -> Int) -> Int = ", call, b"\n"]),
+        source_text: Bytes::concat_all([
+          b"import lib\nfn f(g: (Int) -> Int) -> Int = ",
+          call,
+          b"\n",
+        ]),
       },
     ]);
   assert_eq(calling(b"lib::lend(g)"), []);
@@ -7129,7 +7177,7 @@ test "`List::f(xs, g)` and `xs.f(g)` use the declaration from the `std` module t
   let home = |param: Bytes|
     {
       name: b"std.list",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn List::ordered<a>(xs: List<a>, before: ",
         param,
         b") -> List<a> = xs\n",
@@ -7137,7 +7185,7 @@ test "`List::f(xs, g)` and `xs.f(g)` use the declaration from the `std` module t
     };
   let calls = {
     name: b"m",
-    src: b"import std.list\nfn f(xs: List<Int>, g: (Int, Int) -> Bool) -> List<Int> = List::ordered(xs, g)\nfn h(xs: List<Int>, g: (Int, Int) -> Bool) -> List<Int> = xs.ordered(g)\n",
+    source_text: b"import std.list\nfn f(xs: List<Int>, g: (Int, Int) -> Bool) -> List<Int> = List::ordered(xs, g)\nfn h(xs: List<Int>, g: (Int, Int) -> Bool) -> List<Int> = xs.ordered(g)\n",
   };
   assert_eq(codes_of([home(b"(a, a) -> Bool"), calls]), []);
   assert_eq(codes_of([home(b"keep (a, a) -> Bool"), calls]), [b"E0475", b"E0475"])
@@ -7157,12 +7205,12 @@ test "a borrowed parameter is rejected when a lambda, `else`, scope, handler var
   assert_eq(check_codes(b"fn f(g: (Int) -> Unit) -> Int = with_scope[r](1, g) { h -> 2 }"), []);
   let marks = {
     name: b"marks",
-    src: b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<(Int) -> Int>) -> Int = c\n",
+    source_text: b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<(Int) -> Int>) -> Int = c\n",
   };
   assert_eq(
     codes_of([
       marks,
-      { name: b"m", src: b"import marks\nfn f(g: (Int) -> Int) -> Int = marks\"a{g}b\"\n" },
+      { name: b"m", source_text: b"import marks\nfn f(g: (Int) -> Int) -> Int = marks\"a{g}b\"\n" },
     ]),
     [b"E0475"],
   )

@@ -11,8 +11,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
-                                    AssignmentStatement, HandlerVar, Param, NamedArg, MatchArm,
-                                    HandleClause, RecordLiteralField, expression_span,
+                                    AssignmentStatement, HandlerStateVariable, Param, NamedArg,
+                                    MatchArm, HandleClause, RecordLiteralField, expression_span,
                                     TaggedLiteralExpression, TaggedLiteral, Hole, tagged_parser,
                                     tagged_filler)
 import compiler.syntax.items (FnDefinition)
@@ -47,7 +47,7 @@ pub type Place = { parameter_index: Int, path: List<Bytes> }
 pub type Base =
   | PlaceBase(Place)
   | LengthBase({ name: Bytes, of: Place })
-  | QuotientBase({ of: Base, by: Int, op: Bytes })
+  | QuotientBase({ of: Base, by: Int, operator: Bytes })
   | RemainderBase({ by: Base })
 
 pub type Linear = { base: Option<Base>, k: Int }
@@ -990,44 +990,45 @@ fn term_of_expression(context: MemberContext, scope: Scope, e: Expression) -> Te
       },
     },
     FieldExpression(f) -> project(term_of_expression(context, scope, f.base), f.field.name),
-    BinaryExpression(b) -> if b.op == b"add" {
+    BinaryExpression(b) -> if b.operation == b"add" {
       offset(
         context,
-        term_of_expression(context, scope, b.lhs),
-        term_of_expression(context, scope, b.rhs),
+        term_of_expression(context, scope, b.left_operand),
+        term_of_expression(context, scope, b.right_operand),
       )
-    } else if b.op == b"sub" {
-      match term_of_expression(context, scope, b.rhs) {
+    } else if b.operation == b"sub" {
+      match term_of_expression(context, scope, b.right_operand) {
         Exactly(r) -> match r.base {
           None -> match checked_neg(r.k) {
-            Some(k) -> shifted(context, term_of_expression(context, scope, b.lhs), k),
+            Some(k) -> shifted(context, term_of_expression(context, scope, b.left_operand), k),
             None -> UnknownTerm,
           },
           Some(_) -> UnknownTerm,
         },
         _ -> UnknownTerm,
       }
-    } else if b.op == b"div" {
+    } else if b.operation == b"div" {
       quotient(
         context,
-        term_of_expression(context, scope, b.lhs),
-        term_of_expression(context, scope, b.rhs),
-        b.op,
+        term_of_expression(context, scope, b.left_operand),
+        term_of_expression(context, scope, b.right_operand),
+        b.operation,
       )
-    } else if b.op == b"shr" || b.op == b"ushr" {
-      match term_of_expression(context, scope, b.rhs) {
+    } else if b.operation == b"shr" || b.operation == b"ushr" {
+      match term_of_expression(context, scope, b.right_operand) {
         Exactly(r) -> if r.base == None && r.k >= 1 && r.k <= 62 {
           quotient(
             context,
-            term_of_expression(context, scope, b.lhs),
+            term_of_expression(context, scope, b.left_operand),
             Exactly({ base: None, k: pow(2, r.k) }),
-            b.op,
+            b.operation,
           )
         } else { UnknownTerm },
         _ -> UnknownTerm,
       }
-    } else if b.op == b"rem" { remainder(context, term_of_expression(context, scope, b.rhs)) }
-    else { UnknownTerm },
+    } else if b.operation == b"rem" {
+      remainder(context, term_of_expression(context, scope, b.right_operand))
+    } else { UnknownTerm },
     RecordExpression(r) ->
       RecordTerm({ base: None, fields: field_terms(context, scope, r.fields) }),
     ListExpression(l) ->
@@ -1110,7 +1111,7 @@ fn quotient(context: MemberContext, a: Term, b: Term, operator: Bytes) -> Term /
       Some(x) -> if l.k != 0 || !integer(context, l) { UnknownTerm } else {
         match b {
           Exactly(r) -> if r.base == None && r.k >= 2 {
-            Exactly({ base: Some(QuotientBase({ of: x, by: r.k, op: operator })), k: 0 })
+            Exactly({ base: Some(QuotientBase({ of: x, by: r.k, operator: operator })), k: 0 })
           } else { UnknownTerm },
           _ -> UnknownTerm,
         }
@@ -1544,20 +1545,26 @@ fn assume(
   truth: Bool,
 ) -> Scope / {abort.raise} =
   match e {
-    UnaryExpression(u) -> if u.op == b"not" { assume(context, scope, u.operand, !truth) }
+    UnaryExpression(u) -> if u.operation == b"not" { assume(context, scope, u.operand, !truth) }
     else { scope },
-    BinaryExpression(b) -> if b.op == b"and" {
-      if truth { assume(context, assume(context, scope, b.lhs, true), b.rhs, true) } else { scope }
-    } else if b.op == b"or" {
-      if truth { scope }
-      else { assume(context, assume(context, scope, b.lhs, false), b.rhs, false) }
+    BinaryExpression(b) -> if b.operation == b"and" {
+      if truth {
+        assume(context, assume(context, scope, b.left_operand, true), b.right_operand, true)
+      } else { scope }
+    } else if b.operation == b"or" {
+      if truth { scope } else {
+        assume(context, assume(context, scope, b.left_operand, false), b.right_operand, false)
+      }
     } else {
-      match linear_of_expression(context, scope, b.lhs) {
+      match linear_of_expression(context, scope, b.left_operand) {
         None -> scope,
-        Some(l) -> match linear_of_expression(context, scope, b.rhs) {
+        Some(l) -> match linear_of_expression(context, scope, b.right_operand) {
           None -> scope,
           Some(r) ->
-            { ..scope, facts: append_facts(scope.facts, comparison_facts(b.op, l, r, truth)) },
+            {
+              ..scope,
+              facts: append_facts(scope.facts, comparison_facts(b.operation, l, r, truth)),
+            },
         },
       }
     },
@@ -1779,17 +1786,30 @@ fn walk(
           [],
         ),
     },
-    BinaryExpression(b) -> if b.op == b"and" {
-      walk(context, assume(context, s, b.lhs, true), walk(context, s, accumulator, b.lhs), b.rhs)
-    } else if b.op == b"or" {
-      walk(context, assume(context, s, b.lhs, false), walk(context, s, accumulator, b.lhs), b.rhs)
+    BinaryExpression(b) -> if b.operation == b"and" {
+      walk(
+        context,
+        assume(context, s, b.left_operand, true),
+        walk(context, s, accumulator, b.left_operand),
+        b.right_operand,
+      )
+    } else if b.operation == b"or" {
+      walk(
+        context,
+        assume(context, s, b.left_operand, false),
+        walk(context, s, accumulator, b.left_operand),
+        b.right_operand,
+      )
     } else {
       walk_implicit_calls(
         context,
         s,
-        walk(context, s, walk(context, s, accumulator, b.lhs), b.rhs),
+        walk(context, s, walk(context, s, accumulator, b.left_operand), b.right_operand),
         expression_span(e),
-        [term_of_expression(context, s, b.lhs), term_of_expression(context, s, b.rhs)],
+        [
+          term_of_expression(context, s, b.left_operand),
+          term_of_expression(context, s, b.right_operand),
+        ],
       )
     },
     UnaryExpression(u) ->
@@ -1869,18 +1889,18 @@ fn walk(
     PerformExpression(p) ->
       p.args.fold(accumulator, |a: Findings, x: Expression| walk(context, s, a, x)),
     HandleExpression(h) -> {
-      let inits = h.vars.fold(
+      let inits = h.handler_variables.fold(
         { seen: accumulator, scope: s },
-        |a: { seen: Findings, scope: Scope }, v: HandlerVar|
+        |a: { seen: Findings, scope: Scope }, v: HandlerStateVariable|
           {
             seen: walk(context, a.scope, a.seen, v.init),
             scope: bound(a.scope, v.name, UnknownTerm),
           },
       );
       let body = walk(context, s, inits.seen, h.body);
-      let handler_scope = h.vars.fold(s, |scope: Scope, v: HandlerVar|
+      let handler_scope = h.handler_variables.fold(s, |scope: Scope, v: HandlerStateVariable|
         bound(scope, v.name, UnknownTerm));
-      let returned = match h.ret {
+      let returned = match h.return_clause {
         Some(r) -> walk(context, bound(handler_scope, r.binder, UnknownTerm), body, r.body),
         None -> body,
       };

@@ -10,8 +10,9 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, Param, NamedArg, MatchArm, HandleClause,
-                                    ReturnClause, HandlerVar, RecordLiteralField, expression_span,
-                                    TaggedLiteralExpression, Hole, home_modules, sees_homes)
+                                    ReturnClause, HandlerStateVariable, RecordLiteralField,
+                                    expression_span, TaggedLiteralExpression, Hole, home_modules,
+                                    sees_homes)
 import compiler.syntax.calls (slotted, ordered_arguments, Slot, FromDefault, UnmatchedReason,
                               NoSuchParameter, FilledByPosition)
 import std.list
@@ -137,7 +138,15 @@ fn qualify_expression(
     },
     LambdaExpression(l) -> {
       let o: QualifyResult = qualify_expression(resolved, qualifier, l.body);
-      { q: o.q, e: LambdaExpression({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
+      {
+        q: o.q,
+        e: LambdaExpression({
+          span: l.span,
+          body: o.e,
+          params: l.params,
+          return_clause: l.return_clause,
+        }),
+      }
     },
     CallExpression(a) -> if a.named.len() > 0
         || !(match a.function { NameExpression(v) -> starts_upper(v.name.name.name), _ -> false }) {
@@ -229,13 +238,21 @@ fn qualify_expression(
       { q: tail.q, e: BlockExpression({ span: b.span, tail: tail.e, statements: statements.xs }) }
     },
     BinaryExpression(b) -> {
-      let l = qualify_expression(resolved, qualifier, b.lhs);
-      let rr = qualify_expression(resolved, l.q, b.rhs);
-      { q: rr.q, e: BinaryExpression({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
+      let l = qualify_expression(resolved, qualifier, b.left_operand);
+      let rr = qualify_expression(resolved, l.q, b.right_operand);
+      {
+        q: rr.q,
+        e: BinaryExpression({
+          span: b.span,
+          operation: b.operation,
+          left_operand: l.e,
+          right_operand: rr.e,
+        }),
+      }
     },
     UnaryExpression(u) -> {
       let o: QualifyResult = qualify_expression(resolved, qualifier, u.operand);
-      { q: o.q, e: UnaryExpression({ span: u.span, op: u.op, operand: o.e }) }
+      { q: o.q, e: UnaryExpression({ span: u.span, operation: u.operation, operand: o.e }) }
     },
     IfExpression(i) -> {
       let c = qualify_expression(resolved, qualifier, i.cond);
@@ -449,15 +466,15 @@ fn fill_children(
     HoleExpression(_) -> { filler: filler, expression: expression },
     InvalidExpression(_) -> { filler: filler, expression: expression },
     BinaryExpression(b) -> {
-      let l = fill_expression(f, filler, b.lhs);
-      let rr = fill_expression(f, l.filler, b.rhs);
+      let l = fill_expression(f, filler, b.left_operand);
+      let rr = fill_expression(f, l.filler, b.right_operand);
       {
         filler: rr.filler,
         expression: BinaryExpression({
           span: b.span,
-          op: b.op,
-          lhs: l.expression,
-          rhs: rr.expression,
+          operation: b.operation,
+          left_operand: l.expression,
+          right_operand: rr.expression,
         }),
       }
     },
@@ -465,7 +482,11 @@ fn fill_children(
       let o: FillResult = fill_expression(f, filler, u.operand);
       {
         filler: o.filler,
-        expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
+        expression: UnaryExpression({
+          span: u.span,
+          operation: u.operation,
+          operand: o.expression,
+        }),
       }
     },
     LambdaExpression(l) -> {
@@ -476,7 +497,7 @@ fn fill_children(
           span: l.span,
           body: o.expression,
           params: l.params,
-          ret: l.ret,
+          return_clause: l.return_clause,
         }),
       }
     },
@@ -634,16 +655,16 @@ fn fill_children(
         expression: PerformExpression({
           span: p.span,
           effect_name: p.effect_name,
-          op: p.op,
+          operation: p.operation,
           resource: p.resource,
           args: o.xs,
         }),
       }
     },
     HandleExpression(h) -> {
-      let variables: { filler: Filler, xs: List<HandlerVar> } = h.vars.fold(
+      let variables: { filler: Filler, xs: List<HandlerStateVariable> } = h.handler_variables.fold(
         { filler: filler, xs: [] },
-        |accumulator: { filler: Filler, xs: List<HandlerVar> }, v: HandlerVar| {
+        |accumulator: { filler: Filler, xs: List<HandlerStateVariable> }, v: HandlerStateVariable| {
           let o: FillResult = fill_expression(f, accumulator.filler, v.init);
           { filler: o.filler, xs: accumulator.xs.push({ ..v, init: o.expression }) }
         },
@@ -657,7 +678,7 @@ fn fill_children(
             filler: o.filler,
             xs: accumulator.xs.push({
               effect_name: c.effect_name,
-              op: c.op,
+              operation: c.operation,
               resource: c.resource,
               wildcard_label: c.wildcard_label,
               label_binder: c.label_binder,
@@ -669,7 +690,7 @@ fn fill_children(
           }
         },
       );
-      let return_clause: { filler: Filler, expression: Option<ReturnClause> } = match h.ret {
+      let return_clause: { filler: Filler, expression: Option<ReturnClause> } = match h.return_clause {
         None -> { filler: clauses.filler, expression: None },
         Some(clause) -> {
           let o: FillResult = fill_expression(f, clauses.filler, clause.body);
@@ -684,9 +705,9 @@ fn fill_children(
         expression: HandleExpression({
           span: h.span,
           body: body.expression,
-          ret: return_clause.expression,
+          return_clause: return_clause.expression,
           clauses: clauses.xs,
-          vars: variables.xs,
+          handler_variables: variables.xs,
         }),
       }
     },
@@ -805,7 +826,7 @@ fn as_perform(
         expression: PerformExpression({
           span: call.span,
           effect_name: v.name,
-          op: operation,
+          operation: operation,
           resource: call.labels.at(0),
           args: call.args,
         }),
@@ -979,7 +1000,7 @@ fn fill_item(
           name: d.name,
           generics: d.generics,
           params: d.params,
-          ret: d.ret,
+          return_type: d.return_type,
           effects: d.effects,
           constraints: d.constraints,
           spec: spec.xs,
