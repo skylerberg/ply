@@ -54,6 +54,7 @@ pub type OwnerInterface = {
   imports: List<ImportDeclaration>,
   rows: List<KnownDefinitionRow>,
   fixed: List<CachedNode>,
+  derived: List<Derivation>,
 }
 
 pub type InterfaceHeader = { reach: Bytes, owner: Bytes, mentions: List<Mention> }
@@ -324,6 +325,17 @@ fn imports_implicit_names(d: ImportDeclaration) -> Bool =
 
 fn derive_held_as_generated(raw: Module, item: Item) -> Bool / {abort.raise} =
   match item { DeriveItem(d) -> deriver_module(raw, d.deriver) != Some(b"std.sql"), _ -> false }
+
+/// The derivations recorded for the `derive` lines among `items`.
+fn derivations_of(parsed: ParsedModule, items: List<Item>) -> List<Derivation> =
+  items.fold([], |acc: List<Derivation>, item: Item|
+    match item {
+      DeriveItem(d) -> match parsed.derived.find(|x: DeriveOrigin| x.span == d.span) {
+        Some(x) -> acc.push(derivation_of(x)),
+        None -> acc,
+      },
+      _ -> acc,
+    })
 
 fn deriver_modules_of(raw: Module, items: List<Item>) -> List<Bytes> / {abort.raise} =
   items.fold([], |acc: List<Bytes>, item: Item|
@@ -614,6 +626,10 @@ pub fn exports_of(
         mentions: mentions,
         rows: match rows.get(o) { Some(xs) -> xs, None -> [] },
         fixed: match fixed.get(o) { Some(xs) -> xs, None -> [] },
+        derived: derivations_of(
+          parsed,
+          its.filter(|item: Item| !derive_held_as_generated(raw, item)),
+        ),
       })
     }),
   }
@@ -933,6 +949,15 @@ fn staged_against(
     required: shipped.map(|s: Source| s.name).concat(if own { [] } else { [source.name] }),
     apart: placed == InRoot && is_shipped(source.name),
     given: reading.given,
+    derived: dependencies.fold(
+      [],
+      |acc: List<ModuleDerivations>, m: Bytes, es: Map<Bytes, OwnerInterface>|
+        acc.push({
+          module: m,
+          derivations: es.fold([], |ds: List<Derivation>, _: Bytes, e: OwnerInterface|
+            ds.concat(e.derived)),
+        }),
+    ),
     judged: reading.judged,
     checked: Some(source.name),
   );
@@ -1016,14 +1041,7 @@ pub fn owner_texts(
       starts: its.map(|item: Item| written_start(text, item)),
       generated: match generated.get(o) { Some(fs) -> alone(text, fs), None -> b"" },
       runtimes: deriver_modules_of(raw, its),
-      derived: its.fold([], |acc: List<Derivation>, item: Item|
-        match item {
-          DeriveItem(d) -> match parsed.derived.find(|x: DeriveOrigin| x.span == d.span) {
-            Some(x) -> acc.push(derivation_of(x)),
-            None -> acc,
-          },
-          _ -> acc,
-        }),
+      derived: derivations_of(parsed, its),
       names: match declared.get(o) { Some(ns) -> ns, None -> [] },
     }
   })
@@ -1267,6 +1285,7 @@ pub fn group_source_from(
         mentions: [],
         rows: [],
         fixed: [],
+        derived: [],
       }),
     ),
     [],
@@ -1289,7 +1308,10 @@ pub fn group_source_from(
     },
     offset: written.len(),
     items: item_layout(members),
-    derived: members.fold([], |acc: List<Derivation>, o: OwnerText| acc.concat(o.derived)),
+    derived: members.fold(
+      held.fold([], |acc: List<Derivation>, e: OwnerInterface| acc.concat(e.derived)),
+      |acc: List<Derivation>, o: OwnerText| acc.concat(o.derived),
+    ),
     dependencies: dependencies,
     rows: all.fold([], |acc: List<KnownDefinitionRow>, es: Map<Bytes, OwnerInterface>|
       es.fold(acc, |a: List<KnownDefinitionRow>, _: Bytes, e: OwnerInterface| a.concat(e.rows))),
@@ -1548,6 +1570,7 @@ fn checked_apart(
 fn per_owner(
   whole: Analysis,
   sources: List<Source>,
+  shipped: List<Source> = [],
 ) -> List<{ owner: Bytes, whole: Agreed, apart: Agreed }> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
@@ -1566,7 +1589,7 @@ fn per_owner(
             match item { FunctionItem(d) -> m.insert(d.name.name, d.name.name), _ -> m }).values(
           );
           owners.fold(acc, |a: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, o: Bytes| {
-            let apart = checked_apart(whole, sources, i, o);
+            let apart = checked_apart(whole, sources, i, o, shipped: shipped);
             a.push({
               owner: Bytes::concat_all([name, b".", o]),
               whole: agreed_owner(whole, name, |n: Bytes| owned_by(o, n)),
@@ -1697,6 +1720,45 @@ test "an entry holds a derive as the functions it generates, bodies left out, an
     b"sorter.alike",
     b"sorter.order",
     b"sorter.paired",
+  ]);
+  for_all(apart, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| assert_eq(f.apart, f.whole))
+}
+
+fn rows_source() -> Bytes =
+  b"import std.sql\npub type Line = { sku: String, count: Int }\nderive sql for Line\npub fn columns() -> Int = line_width()\n"
+
+fn report_source() -> Bytes =
+  b"import rows\nfn width() -> Int = rows::line_width() + rows::columns()\n"
+
+fn rows_derived() -> List<ModuleDerivations> =
+  [
+    {
+      module: b"rows",
+      derivations: [
+        { deriver: b"sql", target: b"Line", written: [b"pub fn line_width() -> Int = 2"] },
+      ],
+    },
+  ]
+
+test "a type's interface keeps its `derive sql` line with its derivation, so a definition checked alone agrees with the whole program" {
+  let sources = [{ name: b"rows", src: rows_source() }, { name: b"report", src: report_source() }];
+  let shipped = [{ name: b"std.sql", src: likeness_source() }];
+  let whole = outcome(
+    analyse_pulling_std_with(sources, shipped, no_rows(), derived: rows_derived()),
+  );
+  let rows = range(0, whole.modules.len()).fold(0, |k: Int, i: Int|
+    if whole.modules.get(i).name == b"rows" { i } else { k });
+  match exports_of(whole, rows, rows_source()).entries.get(b"Line") {
+    Some(e) -> {
+      assert(e.text.index_of(b"derive sql for Line") != None, Some(String::of_bytes_lossy(e.text)));
+      assert_eq(e.derived, rows_derived().get(0).derivations)
+    },
+    None -> panic("`rows` exports no interface for `Line`"),
+  };
+  let apart = per_owner(whole, sources, shipped: shipped);
+  assert_eq(apart.map(|f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner).sort(), [
+    b"report.width",
+    b"rows.columns",
   ]);
   for_all(apart, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| assert_eq(f.apart, f.whole))
 }
