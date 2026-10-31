@@ -1,7 +1,3 @@
-//! The run's socket table over real sockets on loopback, as `std.net`'s and `std.udp`'s natives
-//! drive it: each operation that waits is a job, run here, and every result is flat as the real
-//! handlers read it.
-
 use ply_core::{Span, codes};
 use ply_host::jobs::Job;
 use ply_host::native::{int_of, parts_of};
@@ -25,7 +21,6 @@ fn loopback() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
-/// A result that may be an error: what follows byte 1, or the error written after byte 0.
 fn outcome(result: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
     match result.split_first() {
         Some((1, rest)) => Ok(rest.to_vec()),
@@ -34,7 +29,6 @@ fn outcome(result: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
     }
 }
 
-/// What a native found: what follows byte 1, or none for the byte 0.
 fn found(result: Vec<u8>) -> Option<Vec<u8>> {
     match result.split_first() {
         Some((1, rest)) => Some(rest.to_vec()),
@@ -51,7 +45,6 @@ fn ran(job: Job) -> Vec<u8> {
     job().expect("the job ran")
 }
 
-/// A run's sockets, and how a test reaches them.
 struct Net {
     host: TcpHost,
 }
@@ -63,7 +56,6 @@ impl Net {
         }
     }
 
-    /// A listener at `ip` on a port of the kernel's choosing, and where it is.
     fn listening(&self, ip: IpAddr) -> (i64, Endpoint) {
         let listener = int(
             &outcome(self.host.listen_on("listener", &at(ip, 0), &[])).expect("loopback binds")
@@ -82,7 +74,6 @@ impl Net {
         found(flat.expect("a socket")).map(|e| Endpoint::read(&e).expect("an address"))
     }
 
-    /// A connection to the program's own listener at `here`: the client's end and the server's.
     fn joined(&self, listener: i64, here: &Endpoint) -> (i64, i64) {
         let connecting = self
             .host
@@ -456,7 +447,6 @@ mod unix {
     }
 }
 
-/// A certificate for `localhost` on disk, as `--tls` and `--trust` name one.
 struct Material {
     _dir: tempfile::TempDir,
     certificate: std::path::PathBuf,
@@ -478,7 +468,6 @@ fn material() -> Material {
 }
 
 impl Material {
-    /// Sockets that serve this certificate as `mail`, and trust it when `trusting`.
     fn net(&self, trusting: bool) -> Net {
         let spec = CredentialSpec {
             name: "mail".to_string(),
@@ -506,7 +495,6 @@ fn upgrade(alpn: &[&str], unread: usize, timeout: Duration) -> Upgrade {
     }
 }
 
-/// What an upgrade finished with: the protocol agreed, or the error's bytes.
 type Finished = Result<Option<String>, Vec<u8>>;
 
 fn finished(result: Vec<u8>) -> Finished {
@@ -514,7 +502,6 @@ fn finished(result: Vec<u8>) -> Finished {
         .map(|agreed| found(agreed).map(|p| String::from_utf8(p).expect("a protocol is text")))
 }
 
-/// Both halves of an upgrade, each waiting on the other, finished together.
 fn upgraded(
     net: &Net,
     client: i64,
@@ -689,7 +676,6 @@ fn plaintext_ahead_of_a_handshake_is_rejected_and_ends_the_connection() {
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
 
-    // A go-ahead with a second line behind it, which the client reads only the first of.
     let (client, server) = net.joined(listener, &here);
     assert_eq!(
         net.send("conn", server, b"220 go ahead\r\n250 injected\r\n"),
@@ -718,7 +704,6 @@ fn plaintext_ahead_of_a_handshake_is_rejected_and_ends_the_connection() {
     net.close("client", client);
     net.close("conn", server);
 
-    // Plaintext the caller still holds, at either end.
     let (client, server) = net.joined(listener, &here);
     let started = net
         .host
@@ -903,7 +888,6 @@ fn a_tls_listener_serves_a_client_that_connects_over_tls() {
     net.close("listener", listener);
 }
 
-/// A datagram socket at loopback, on a port of the kernel's choosing, and where it is.
 fn datagram_socket(net: &Net, label: &str) -> (i64, Endpoint) {
     let bound = ply_host::udp::bind(&net.host, label, &at(loopback(), 0), &[]);
     let socket = int(&outcome(bound).expect("loopback binds"));
@@ -911,7 +895,6 @@ fn datagram_socket(net: &Net, label: &str) -> (i64, Endpoint) {
     (socket, here)
 }
 
-/// A datagram received, or its error's bytes: who sent it, its bytes, and whether it was cut.
 fn received(
     net: &Net,
     label: &str,
@@ -1098,7 +1081,6 @@ fn localhost_resolves_to_loopback_each_address_once_and_a_name_that_cannot_exist
     once.sort();
     once.dedup();
     assert_eq!(once.len(), found.len(), "{found:?}");
-    // Which failure is the machine's resolver's to say.
     assert_eq!(ply_host::dns::lookup("no-such-host.invalid")[0], 0);
     let reversed = ply_host::dns::reverse(loopback());
     assert!(matches!(reversed.first(), Some(0 | 1)));

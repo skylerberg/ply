@@ -1,10 +1,7 @@
-//! A binding made from what a run is granted alone.
-
 use ply_core::host::Grants;
 use ply_privileged::hosts::Hosts;
 use ply_privileged::policy;
 
-/// Every family a host can grant, as the launcher grants `ply` its own program.
 fn every_family() -> Grants {
     policy::names()
         .into_iter()

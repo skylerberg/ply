@@ -1,7 +1,3 @@
-//! What this binary ships, and the binding a run is granted, over a pack written out by hand.
-
-/// The pack this binary reads: a few shipped modules written out by hand, one below another and one
-/// with a data file beside it.
 #[ctor::ctor(unsafe)]
 fn installed() {
     let file =

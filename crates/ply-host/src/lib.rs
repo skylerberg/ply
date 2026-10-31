@@ -1,6 +1,3 @@
-//! The trusted computing base: the OS calls behind the natives of the host handlers, and the run's
-//! clocks and pools a production scheduler waits on.
-
 pub mod certgen;
 pub mod config;
 pub mod dns;

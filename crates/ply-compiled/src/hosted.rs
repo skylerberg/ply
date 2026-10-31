@@ -1,16 +1,3 @@
-//! The natives the host handlers of the standard library's host effects call (`host for`): each asks
-//! the machine the program runs on and returns machine data, integers, bytes or a secret, which the
-//! effect's module reads into its own types. Each that asks the host fails where a run may not
-//! reach it, inside a simulation or in a test the search re-runs, as a host operation does.
-//!
-//! A native that would block the program's thread returns a ticket, which `job_wait` reads the
-//! job's bytes by. In a production scheduler the job runs on the process's pools as the scheduler's
-//! other tasks run. Outside one, where no other task could run, a job that reads files or computes
-//! runs on the program's thread; one that waits on what is outside the process still runs on a
-//! pool, so a shutdown's drain can give up waiting on it.
-//!
-//! A native returning structured data writes it in the flat forms of `ply_host::native`.
-
 mod dns;
 mod env;
 mod fs;
@@ -40,7 +27,6 @@ use ply_host::registry::Facilities;
 use std::path::Path;
 use zeroize::Zeroizing;
 
-/// Every native here, under the name its module declares it by.
 pub fn natives() -> Vec<MachineNative> {
     let mut natives = vec![
         machine_native("job_wait", rt_job_wait as unsafe extern "C" fn(_, _) -> _),
@@ -124,10 +110,6 @@ pub fn natives() -> Vec<MachineNative> {
 }
 
 impl Ctx {
-    /// Whether the native `native` may ask the host now. Where it may, the run has asked it as a
-    /// host operation is asked: a `Nondeterministic` response means its pass holds only for the
-    /// binding it ran under. Where it may not, the run fails as a host operation's would, and the
-    /// native returns nothing it reads.
     fn reaches_host(&mut self, native: &'static str, determinism: Determinism) -> bool {
         let operation = format!("the native `{native}`");
         let span = self.site();
@@ -143,9 +125,6 @@ impl Ctx {
         true
     }
 
-    /// The ticket of `job`, the job this context's run's, which `native` asked for as `what`, a
-    /// diagnostic names it by: run as the module says, on `work`'s pool or here. 0, with the run
-    /// failed, where no thread could be had for it.
     fn submitted(
         &mut self,
         native: &'static str,
@@ -156,8 +135,6 @@ impl Ctx {
         self.refusing(native, what, work, move || job().map_err(Failure::Said))
     }
 
-    /// The ticket of `job` as [`Ctx::submitted`] hands one, where the job may fail with a
-    /// diagnostic of its own.
     fn refusing(
         &mut self,
         native: &'static str,
@@ -184,8 +161,6 @@ impl Ctx {
         }
     }
 
-    /// The ticket of `work`'s hash, which `native` asked for as `what`; 0, with the run failed
-    /// where the hash asked for is past its bounds.
     fn hashed(
         &mut self,
         native: &'static str,
@@ -203,8 +178,6 @@ impl Ctx {
     }
 }
 
-/// What `result` returns, where the native `native` may ask the host for a response of
-/// `determinism`; `rejected` where it may not.
 fn asked<R>(
     ctx: *mut Ctx,
     native: &'static str,
@@ -220,8 +193,6 @@ fn asked<R>(
     }
 }
 
-/// What `result` returns where the run is granted `family` and the native `native` may ask the host
-/// for a response of `determinism`; `rejected`, with the run failed, where it lacks the family.
 fn granted<R>(
     ctx: *mut Ctx,
     family: &'static str,
@@ -246,8 +217,6 @@ fn granted<R>(
     asked(ctx, native, determinism, rejected, result)
 }
 
-/// What `read` takes of the facilities the run's host grants; `None`, with the run failed, for a
-/// runtime no host made.
 fn from_host<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
     let runtime = c.host_runtime();
     match ply_host::registry::facilities_of(&*runtime) {
@@ -262,8 +231,6 @@ fn from_host<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
     }
 }
 
-/// What a native was handed, read; `None`, with the run failed, where it is not what the real
-/// handler hands on, which checks what it hands.
 fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T> {
     if read.is_none() {
         c.fail(Diagnostic::error(
@@ -274,7 +241,6 @@ fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T
     read
 }
 
-/// `result`'s bytes as taken bytes; none, with the run failed, where it is a diagnostic.
 fn given(c: &mut Ctx, result: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
     match result {
         Ok(bytes) => c.given(bytes),
@@ -285,8 +251,6 @@ fn given(c: &mut Ctx, result: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
     }
 }
 
-/// The ticket of `job` on the waiting pool, which `native` asked for as `what`; 0, with the run
-/// failed, where it is a diagnostic.
 fn waited(
     c: &mut Ctx,
     native: &'static str,
@@ -302,12 +266,10 @@ fn waited(
     }
 }
 
-/// The text a native borrowed at `p`; `None`, with the run failed, where it is not UTF-8.
 fn text_at(c: &mut Ctx, p: Addr, n: I64) -> Option<String> {
     c.text(unsafe { borrowed(p, n) }).map(str::to_string)
 }
 
-/// The texts borrowed as parts at `p`; `None`, with the run failed, where they are not.
 fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
     let read = parts_of(unsafe { borrowed(p, n) }).and_then(|texts| {
         texts
@@ -324,16 +286,12 @@ fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
     read
 }
 
-/// The run failed where `done` is a diagnostic.
 fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
     if let Err(d) = done {
         c.fail(d);
     }
 }
 
-/// The bytes the job of `ticket` returned, as taken bytes: in a production scheduler the running
-/// task waits for them as the scheduler's other tasks run, and outside one the thread waits. A job
-/// that failed fails the run, naming what asked for it.
 pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     match crate::tasks::waited(c, crate::tasks::ASK_TICKET, ticket.0) {
@@ -356,13 +314,6 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     }
 }
 
-/// What a host handler read or wrote, entered into the record of the run asking where it is
-/// observed. Under the root the label at `label_at` names, at the path at `path_at` below it,
-/// `kind` 0 is a file's bytes read, 1 a directory's names, 2 what is there, 3 every path below,
-/// and 4 a write; a label no root is bound to holds nothing to record. Of what the binary ships,
-/// the label empty, 5 is the shipped module the path names read (every module's name for the empty
-/// path), 6 the program the launcher entered, and 7 and 8 a load's view at the path of the shipped
-/// modules it reached, which it pulled itself for 7. It asks nothing of the host itself.
 pub unsafe extern "C" fn rt_observed(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -402,7 +353,6 @@ pub unsafe extern "C" fn rt_observed(
     }) else {
         return;
     };
-    // The path as the program named it: where a link in it leads is read again when the record is.
     let target = root.join(path);
     match how {
         Some(how) => recorder.read(how, &target),
@@ -410,8 +360,6 @@ pub unsafe extern "C" fn rt_observed(
     }
 }
 
-/// A new self-signed certificate for `localhost`, told: its certificate, its key, its DER and its
-/// fingerprint as parts.
 pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "certgen_issue", Nondeterministic, TakenBytes(0), |c| {
         let said = match ply_host::certgen::issue(&[]) {
@@ -431,9 +379,6 @@ pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-/// The run's value of `key`: a plain one, or, where `secret`, the one only `config.secret` reads.
-/// `None` where the run was granted no such key. The read is entered into the record of the run
-/// asking, where it is observed: a plain value as what it returned, a secret as one read.
 fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
     let runtime = c.host_runtime();
     let value = ply_host::registry::facilities_of(&*runtime).and_then(|facilities| {
@@ -455,7 +400,6 @@ fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
     value
 }
 
-/// The run's plain value of the key at `p`, found.
 pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     asked(ctx, "config_get", Nondeterministic, TakenBytes(0), |c| {
         let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
@@ -466,7 +410,6 @@ pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenB
     })
 }
 
-/// 1 where the run holds a secret value of the key at `p`, else 0.
 pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     asked(ctx, "config_secret_held", Nondeterministic, I64(0), |c| {
         let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
@@ -476,7 +419,6 @@ pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -
     })
 }
 
-/// The run's secret value of the key at `p`, empty where it holds none.
 pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> SecretHandle {
     asked(
         ctx,
@@ -493,7 +435,6 @@ pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> Sec
     )
 }
 
-/// The ticket of Argon2 version 1.3 over what `kdf.argon2` is handed.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_kdf_argon2(
     ctx: *mut Ctx,
@@ -533,7 +474,6 @@ pub unsafe extern "C" fn rt_kdf_argon2(
     })
 }
 
-/// The ticket of scrypt over what `kdf.scrypt` is handed.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_kdf_scrypt(
     ctx: *mut Ctx,
@@ -561,7 +501,6 @@ pub unsafe extern "C" fn rt_kdf_scrypt(
     })
 }
 
-/// The ticket of bcrypt over what `kdf.bcrypt` is handed.
 pub unsafe extern "C" fn rt_kdf_bcrypt(
     ctx: *mut Ctx,
     password: SecretHandle,
@@ -582,7 +521,6 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
     })
 }
 
-/// The ticket of PBKDF2 over what `kdf.pbkdf2` is handed.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_kdf_pbkdf2(
     ctx: *mut Ctx,
@@ -612,77 +550,66 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
     })
 }
 
-/// The name the toolchain gives the system this binary was built for.
 pub unsafe extern "C" fn rt_os_system(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "os_system", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::OS.as_bytes().to_vec())
     })
 }
 
-/// The name the toolchain gives the architecture this binary was built for.
 pub unsafe extern "C" fn rt_os_machine(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "os_machine", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::ARCH.as_bytes().to_vec())
     })
 }
 
-/// The system's name and release, as `uname -sr` prints them, told.
 pub unsafe extern "C" fn rt_os_uname(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "os_uname", Nondeterministic, TakenBytes(0), |c| {
         c.given(told(ply_host::os::name()))
     })
 }
 
-/// The name the kernel holds for the machine, told.
 pub unsafe extern "C" fn rt_os_hostname(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "os_hostname", Nondeterministic, TakenBytes(0), |c| {
         c.given(told(ply_host::os::hostname()))
     })
 }
 
-/// The processors the process may run on at once.
 pub unsafe extern "C" fn rt_os_cpus(ctx: *mut Ctx) -> I64 {
     asked(ctx, "os_cpus", Nondeterministic, I64(0), |_| {
         I64(ply_host::os::cpus())
     })
 }
 
-/// The id of the user the process runs as.
 pub unsafe extern "C" fn rt_os_uid(ctx: *mut Ctx) -> I64 {
     asked(ctx, "os_uid", Nondeterministic, I64(0), |_| {
         I64(ply_host::os::uid())
     })
 }
 
-/// The name the system's records give the user of id `id`, found.
 pub unsafe extern "C" fn rt_os_user_name(ctx: *mut Ctx, id: I64) -> TakenBytes {
     asked(ctx, "os_user_name", Nondeterministic, TakenBytes(0), |c| {
         c.given(found(ply_host::os::user_name(id.0)))
     })
 }
 
-/// The process's id.
 pub unsafe extern "C" fn rt_os_pid(ctx: *mut Ctx) -> I64 {
     asked(ctx, "os_pid", Nondeterministic, I64(0), |_| {
         I64(i64::from(std::process::id()))
     })
 }
 
-/// The executable the process runs, its links followed, found.
 pub unsafe extern "C" fn rt_os_executable(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "os_executable", Nondeterministic, TakenBytes(0), |c| {
         c.given(found(ply_host::os::executable()))
     })
 }
 
-/// 1 where the machine's words are big-endian, else 0.
 pub unsafe extern "C" fn rt_os_big_endian(ctx: *mut Ctx) -> I64 {
     asked(ctx, "os_big_endian", Nondeterministic, I64(0), |_| {
         I64(i64::from(cfg!(target_endian = "big")))
     })
 }
 
-/// The width of an address on the machine, in bits.
 pub unsafe extern "C" fn rt_os_pointer_bits(ctx: *mut Ctx) -> I64 {
     asked(ctx, "os_pointer_bits", Nondeterministic, I64(0), |_| {
         I64(i64::from(usize::BITS))

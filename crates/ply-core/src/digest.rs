@@ -1,10 +1,5 @@
-//! The encoding a value's content digest hashes, of a scalar and of a string: values `==` calls
-//! equal are one run of bytes in it.
-
 use crate::{Decimal, IntTy};
 
-/// `b3:` and a digest's first twelve hex characters: every digest Ply prints for a person to
-/// compare is written this way.
 pub fn short(digest: &[u8; 32]) -> String {
     let mut out = String::from("b3:");
     for byte in &digest[..6] {
@@ -13,7 +8,6 @@ pub fn short(digest: &[u8; 32]) -> String {
     out
 }
 
-/// A scalar as compiled code holds it, which the encoding writes alone: a width by its type and bits.
 pub enum Scalar {
     Unit,
     Bool(bool),
@@ -23,7 +17,6 @@ pub enum Scalar {
     Decimal(Decimal),
 }
 
-/// `s`'s encoding.
 pub fn scalar(s: Scalar) -> Vec<u8> {
     let mut out = Vec::new();
     match s {
@@ -32,7 +25,6 @@ pub fn scalar(s: Scalar) -> Vec<u8> {
         Scalar::Int(n) => int(&mut out, n),
         Scalar::Width(ty, bits) => {
             let bits = ty.normalize(bits);
-            // Below 64 bits a width is the `Int` it reads as, which is how compiled code holds it.
             if ty.bits() < 64 {
                 int(&mut out, bits as i64);
             } else {
@@ -57,7 +49,6 @@ pub fn scalar(s: Scalar) -> Vec<u8> {
     out
 }
 
-/// A string's encoding where `text`, else a byte string's.
 pub fn text(text: bool, b: &[u8]) -> Vec<u8> {
     let mut out = vec![if text { 7 } else { 8 }];
     out.extend_from_slice(&(b.len() as u64).to_le_bytes());

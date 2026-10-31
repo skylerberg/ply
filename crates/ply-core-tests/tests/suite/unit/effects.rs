@@ -17,7 +17,6 @@ fn an_operation_atom_prints_its_operation_in_place_of_the_mode() {
     );
 }
 
-/// A label variable prints under the next letter, and past the last under the round.
 #[test]
 fn a_label_variable_is_named_by_its_place() {
     assert_eq!(label_var_name(0), "l");

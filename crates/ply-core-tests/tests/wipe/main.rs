@@ -1,7 +1,3 @@
-//! A binary of its own: it installs a `#[global_allocator]` that, while a test watches, keeps every
-//! block allocated and looks at each one as it is freed, so the test can say whether a credential's
-//! bytes are anywhere on the heap and whether a block that held them was given back unwiped.
-
 use ply_core::Span;
 use ply_core::crypto::{self, Framing};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -44,7 +40,6 @@ fn home(ptr: usize) -> usize {
     ((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 46) & (SLOTS - 1)
 }
 
-/// Whether `size` bytes at `ptr` hold the marker. Called under the lock, allocating nothing.
 unsafe fn holds(ptr: *const u8, size: usize) -> bool {
     let len = MARKER_LEN.load(Ordering::Relaxed);
     if len == 0 || size < len {
@@ -105,7 +100,6 @@ unsafe impl GlobalAlloc for Watching {
     }
 }
 
-/// From here on every block allocated is kept, and `marker` is what is looked for.
 fn watch(marker: &[u8]) {
     assert!(marker.len() <= MARK);
     lock();
@@ -122,7 +116,6 @@ fn watch(marker: &[u8]) {
     unlock();
 }
 
-/// How many blocks kept since `watch` hold the marker now, and how many held it when freed.
 fn seen() -> (usize, usize) {
     lock();
     let mut live = 0;
@@ -147,8 +140,6 @@ fn stop() {
 
 type Wiped = Zeroizing<Vec<u8>>;
 
-/// A path a secret takes: what it is called, the bytes looked for, and what it makes of the plain
-/// bytes it is handed, every one of them made before the watch starts.
 struct Path {
     name: &'static str,
     marker: Vec<u8>,
@@ -285,7 +276,6 @@ fn paths() -> Vec<Path> {
     ]
 }
 
-/// The contents of each `INTEGER` a DER `SEQUENCE` of them holds.
 fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     fn length(der: &[u8], at: &mut usize) -> usize {
         let first = der[*at];
@@ -318,7 +308,6 @@ fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// `n` and `e` as bytes, then each private number of a PKCS #1 document as its base64url text.
 fn jwk_texts(document: &[u8]) -> Vec<Vec<u8>> {
     let numbers = integers(document);
     let mut out = vec![numbers[1].clone(), numbers[2].clone()];
@@ -332,7 +321,6 @@ fn jwk_texts(document: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// One test at a time: the watch is the process's.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]

@@ -54,7 +54,6 @@ fn a_block_past_a_pages_sizes_is_held_at_its_size_until_it_is_given_back() {
     assert_eq!(b.held(), 0);
 }
 
-/// Blocks of one size, all given back, leave their pages to whatever size is asked for next.
 #[test]
 fn pages_one_size_emptied_serve_another() {
     let mut b = Blocks::default();
@@ -88,7 +87,6 @@ fn segments_left_with_no_block_go_back() {
     assert!(b.holds(again.addr()));
 }
 
-/// A heap that takes a segment an ended heap held walks only its own blocks there.
 #[test]
 fn a_segment_an_ended_heap_held_holds_none_of_its_blocks() {
     let mut first = Blocks::default();
@@ -110,7 +108,6 @@ fn a_segment_an_ended_heap_held_holds_none_of_its_blocks() {
     }
 }
 
-/// A block handed back off its heap's thread is the heap's to hand out once it looks for one.
 #[test]
 fn a_block_another_thread_hands_back_is_handed_out_again() {
     let mut b = Blocks::default();
@@ -125,7 +122,6 @@ fn a_block_another_thread_hands_back_is_handed_out_again() {
     drop(rest);
 }
 
-/// A heap that takes only blocks past a page's sizes still takes up the ones handed back to it.
 #[test]
 fn a_large_block_another_thread_hands_back_is_given_up_before_the_next() {
     let mut b = Blocks::default();
@@ -139,9 +135,6 @@ fn a_large_block_another_thread_hands_back_is_given_up_before_the_next() {
     assert_eq!(b.held(), MIB);
 }
 
-/// A block another thread is handing back keeps the heap it read as its owner until it is pushed:
-/// an adopter of that heap goes on only once the block is on the list it drains, so neither the
-/// heap the push lands in nor the block is lost.
 #[test]
 fn an_adopter_waits_for_a_block_being_handed_back_to_the_heap_it_adopts() {
     struct Moved(Blocks);
@@ -197,7 +190,6 @@ fn an_adopted_heaps_blocks_are_the_adopters() {
     assert!(next.iter().all(|block| parent.holds(block.addr())));
 }
 
-/// Branches that each emptied all but one page cost their adopter those pages and no more.
 #[test]
 fn an_adopter_keeps_no_more_emptied_pages_than_of_its_own() {
     let mut parent = Blocks::default();

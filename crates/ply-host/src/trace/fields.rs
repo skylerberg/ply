@@ -1,14 +1,8 @@
-//! A record's fields as `std.trace`'s host handler writes them for its natives: parts, a name and
-//! then its field, each field its kind's byte, 0 an integer and 3 a float in eight bytes, the most
-//! significant first, 1 a flag's byte, 2 text, 4 a decimal's text, 5 bytes and 6 JSON's text as
-//! `std.json` writes it, then what it holds.
-
 use super::sink::Field;
 use crate::native::{int_of, parts_of};
 use ply_core::Decimal;
 use std::str::FromStr;
 
-/// The fields `flat` writes, in the order it writes them; `None` for bytes that write none.
 pub fn fields_read(flat: &[u8]) -> Option<Vec<(String, Field)>> {
     let parts = parts_of(flat)?;
     if parts.len() % 2 != 0 {

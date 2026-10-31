@@ -1,32 +1,17 @@
-//! The launcher: enter the program this executable was linked with, with the command line and the
-//! shipped modules beside it.
-//!
-//! This is the whole of what stands between the operating system and the program `ply` is: the
-//! big-stack thread, the definition the pack says the program enters, the `cwd` and `shipped`
-//! roots, the process binding, and the exit code.
-
 use ply_compiled::entry::{self, Ended, Grants, Opened};
 use ply_core::{Diagnostic, codes};
 use std::path::{Path, PathBuf};
 
-/// Where the pack carries what a launcher reads of the linked program: the definition it enters
-/// and each `fn` that one reaches with its hash.
 pub const FRONT: &str = "program/front";
 
-/// The line a front of this launcher's own format opens with, which the program's builder writes.
 const FRONT_FORMAT: &[u8] = b"ply entry 1\n";
 
-/// What a launched program is: the definition it enters and the stage its shipped modules are laid
-/// out under.
 pub struct Program {
     pub entry: String,
-    /// Each `fn` the entry reaches and its hash, a `name hash` line each in name order.
     pub definitions: String,
-    /// The stage's identity: the shipped modules land under it, beside the C cache.
     pub stage: String,
 }
 
-/// The program this executable was linked with, as its pack names it.
 pub fn linked_program() -> Result<Program, Diagnostic> {
     let pack = ply_pack::installed();
     let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
@@ -60,11 +45,8 @@ fn unlinked(reason: String) -> Diagnostic {
     )
 }
 
-/// The marker that says a shipped modules directory is whole; landed last, so a reader never sees
-/// half of one. Not a `.ply` file, so the program's own listing passes over it.
 const SHIPPED_MARKER: &str = "SHIPPED.ok";
 
-/// The pack appended to this binary, installed for everything after it to read.
 pub fn install_own_pack() -> Result<(), String> {
     let binary =
         std::env::current_exe().map_err(|e| format!("this binary cannot be found: {e}"))?;
@@ -80,14 +62,6 @@ pub fn install_own_pack() -> Result<(), String> {
     }
 }
 
-/// What the `ply` program is granted: every family; its roots, `cwd` at `root`, `shipped` at the
-/// shipped modules and `abs` at the filesystem's root (the program is the tool, so a path that
-/// leaves the working directory is addressed under `abs`); its command line; the `git` on `PATH`
-/// for its `process.spawn[git]`, which fetches a git dependency, and is unbound where none can be
-/// started (the program reads that with `process.bound[git]`); and the PEM files `PLY_TRUST` names,
-/// separated as `PATH` separates directories, which its own `net.connect_tls` accepts beside the
-/// built-in roots, as `--trust` gives a program a command runs (one that does not load is `E0430`
-/// before the program runs).
 pub fn grants(root: &Path, shipped: &Path, argv: &[String]) -> Grants {
     let path = |p: &Path| p.display().to_string();
     let mut grants = Grants::default()
@@ -119,7 +93,6 @@ pub fn grants(root: &Path, shipped: &Path, argv: &[String]) -> Grants {
     grants.with("argv", &argv)
 }
 
-/// Not `.ply` files, so the program's own listing passes over them.
 const STAMPS: &str = "stamps";
 
 const DEFINITIONS: &str = "definitions";
@@ -128,9 +101,6 @@ const DIGESTS: &str = "digests";
 
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
-/// The runtime's side of what cached results are a function of beyond their own keys, as `name hex`
-/// lines: a query's result is the evaluator's, and a pass or claim's evidence the whole runtime's.
-/// The program adds its own side to each, from the definitions it is told it has.
 pub fn stamps() -> String {
     let stamp = |parts: &[&str]| {
         let mut h = blake3::Hasher::new();
@@ -147,9 +117,6 @@ pub fn stamps() -> String {
     )
 }
 
-/// The directory a stage keeps its shipped modules in, named for all it holds: the stamps, the
-/// definitions, and every shipped file by `files`, their digest. The program a stage is named for
-/// reaches only some of them, so a `ply` rebuilt over an edit to another lays out its own.
 pub fn shipped_dir_name(stamps: &str, definitions: &str, files: &ply_pack::Digest) -> String {
     let mut laid = blake3::Hasher::new();
     laid.update(stamps.as_bytes());
@@ -160,10 +127,6 @@ pub fn shipped_dir_name(stamps: &str, definitions: &str, files: &ply_pack::Diges
     format!("shipped-{}", &laid.finalize().to_hex()[..16])
 }
 
-/// The shipped modules as files, `<dotted name>.ply` each, the data files they embed below them by
-/// name, and the stamps, the definitions and every shipped file's digest beside them. Each file
-/// lands by a rename and the marker last, so a run that finds the marker finds it whole, and reads
-/// no file of the pack for it.
 pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
     let dir = ply_compiled::c::stage::stage_dir(stage).join(shipped_dir_name(
@@ -212,9 +175,6 @@ fn lay_out(dir: &Path, stamps: &str, definitions: &str) -> std::io::Result<()> {
     write_atomically(&dir.join(SHIPPED_MARKER), b"ok")
 }
 
-/// Writes what this `ply` read where the `ply` that started it asked, begun now so that a report
-/// that never finishes is told from one never asked for. It is written when the entry ends, or
-/// wherever the process ends first.
 fn reporting() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
     let file = PathBuf::from(std::env::var_os(ply_host::observe::TRACE_VAR)?);
     std::fs::write(&file, b"").ok()?;
@@ -232,8 +192,6 @@ fn reporting() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
     Some(write)
 }
 
-/// How a launched program ended: the exit code it asked for, or what stopped it, as it is printed;
-/// and what its host runtime warned of as it ended.
 pub struct Launched {
     pub code: Result<i32, String>,
     pub warnings: Vec<Diagnostic>,
@@ -248,7 +206,6 @@ impl Launched {
     }
 }
 
-/// Enter the program on the command's own big-stack thread, granted every family.
 pub fn run(
     program: Program,
     root: &Path,
@@ -268,7 +225,6 @@ pub fn run(
     ply_privileged::shipped::entered(&program.entry, definitions);
     let grants = grants(root, &shipped, &argv);
     let entry = program.entry;
-    // The entry runs on a thread of its own, with the stack a front end's recursion wants.
     let work = std::thread::Builder::new()
         .name("ply".to_string())
         .stack_size(ply_compiled::rt::PROGRAM_STACK)
@@ -278,8 +234,6 @@ pub fn run(
                 Some(asked) => {
                     let (launched, counted, sites) =
                         crate::count::window_sampled(launch, asked.every());
-                    // The entry's result stands: the run happened, and a count that could not
-                    // be written is reported rather than replacing what the program did.
                     if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
                     {
                         eprintln!(
@@ -312,7 +266,6 @@ pub fn run(
     }
 }
 
-/// The linked program's `entry` entered with nothing, under the binding `grants` make.
 fn entered(entry: &str, grants: &Grants) -> Launched {
     let opened = match Opened::linked() {
         Ok(opened) => opened,
@@ -343,7 +296,6 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
         Some(&hosts),
         None,
     );
-    // Ends the children still running and flushes the sink.
     let _ = hosts.torn_down();
     let code = match (hosts.requested_exit(), outcome.ended) {
         (Some(code), _) => Ok(code),
@@ -368,8 +320,6 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
     }
 }
 
-/// `d` as it is printed, with the definition its primary label's site lies in: the launcher holds
-/// no source to place it in.
 fn placed(d: &Diagnostic, opened: &Opened) -> String {
     let site = d.primary_span().and_then(|span| opened.root_named(span));
     match site {

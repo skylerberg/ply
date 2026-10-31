@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 thread_local! {
-    /// The run a test's jobs are submitted for and waited on.
     static RUN: Rc<dyn HostRuntime> = ply_host::Host::new().runtime();
 }
 
@@ -67,7 +66,6 @@ fn bytes_are_written_as_they_are_and_a_line_keeps_its_place_among_them() {
     );
 }
 
-/// Only a host that writes the process's own streams ends the process over them.
 #[test]
 fn a_host_whose_streams_are_captured_leaves_an_unhandled_raise_to_the_run() {
     let host = host(&[]);
@@ -88,8 +86,6 @@ fn exit_records_the_first_code_and_unwinds() {
     );
 }
 
-/// A test is no process of its own: what it would write, read or exit with is withheld, naming
-/// where it is served.
 #[test]
 fn a_host_that_only_starts_programs_withholds_the_runs_own_process() {
     let host = ProcessHost::spawning(Executables::new());
@@ -119,11 +115,8 @@ fn a_host_that_only_starts_programs_withholds_the_runs_own_process() {
     assert_eq!(host.requested_exit(), None);
 }
 
-// --- Spawning ---------------------------------------------------------------
-
 const SH: &str = "/bin/sh";
 
-/// Enough for a shell to find nothing it needs outside its own builtins.
 const PATH: (&str, &str) = ("PATH", "/usr/bin:/bin");
 
 fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
@@ -134,7 +127,6 @@ fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
     Arc::new(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables))
 }
 
-/// What a job returned, run on this thread.
 fn ran(job: FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
@@ -142,7 +134,6 @@ fn ran(job: FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     })
 }
 
-/// A child's ending as [`Finished::flat`] wrote it.
 fn finished(flat: &[u8]) -> Finished {
     let [kind, n, out, err] = parts_of(flat)
         .expect("parts")
@@ -199,7 +190,6 @@ fn a_signal_is_an_ending_of_its_own_rather_than_a_code() {
     assert_eq!(done.ended, Ended::Signalled(9));
 }
 
-/// A spawn is one of the run's children, so a stop or a teardown that ends them ends it too.
 #[test]
 fn ending_the_children_ends_a_spawn_still_running() {
     let host = spawning("sh", SH);
@@ -215,10 +205,8 @@ fn ending_the_children_ends_a_spawn_still_running() {
     );
 }
 
-/// The run's own environment is the classic hidden input, so a spawn inherits none of it.
 #[test]
 fn a_spawn_sees_only_the_environment_it_was_given() {
-    // nextest runs one test per process, so this environment is this test's alone.
     unsafe { std::env::set_var("PLY_SPAWN_WITNESS", "leaked") };
     let host = spawning("sh", SH);
     let done = spawn(
@@ -252,7 +240,6 @@ fn a_spawn_runs_in_the_directory_it_was_given() {
     assert_eq!(done.out, b"here");
 }
 
-/// The label is the capability: without one bound, nothing about the call decides what runs.
 #[test]
 fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
     let host = spawning("sh", SH);
@@ -274,7 +261,6 @@ fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
     );
 }
 
-/// The table the run was given is the whole result, and asking again reads the same one.
 #[test]
 fn bound_returns_whether_the_run_bound_a_program_to_the_label() {
     let shell = spawning("sh", SH);
@@ -343,8 +329,6 @@ fn an_exec_argument_is_a_label_and_a_path() {
     }
 }
 
-// --- Children ---------------------------------------------------------------
-
 fn wired(input: bool, out: Output, err: Output) -> Io {
     Io { input, out, err }
 }
@@ -353,7 +337,6 @@ fn file(path: &str) -> Output {
     Output::File(path.to_string())
 }
 
-/// What `start` returned under `label`: the handle, or why the child could not start.
 fn launched(
     host: &Arc<ProcessHost>,
     label: &str,
@@ -372,7 +355,6 @@ fn launched(
     )
 }
 
-/// `sh -c script` under `[sh]`, running.
 fn start(host: &Arc<ProcessHost>, script: &str, dir: &str, io: Io) -> i64 {
     launched(host, "sh", script, dir, io)
         .expect("a start returns")
@@ -422,7 +404,6 @@ fn heard(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> Heard {
     }
 }
 
-/// Whether any process has this pid, as `kill -0` asks.
 fn alive(pid: &str) -> bool {
     std::process::Command::new(SH)
         .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
@@ -431,7 +412,6 @@ fn alive(pid: &str) -> bool {
         .success()
 }
 
-/// A child that says its own pid, then sleeps as that pid for longer than any test runs.
 fn sleeper(host: &Arc<ProcessHost>) -> (i64, String) {
     let child = start(
         host,
@@ -500,7 +480,6 @@ fn a_signal_to_a_child_that_has_ended_returns_false() {
         "",
         wired(false, Output::Discard, Output::Discard),
     );
-    // A signal that lands before the child is gone still reaches it; the result turns once it is.
     let until = Instant::now() + Duration::from_secs(10);
     while signal(&host, child, Signal::Hangup).expect("an unspent handle") {
         assert!(Instant::now() < until, "the child never ended");
@@ -673,7 +652,6 @@ fn kept_output_past_the_bound_is_drained_and_rejected_at_the_wait() {
         "",
         wired(false, Output::Keep, Output::Discard),
     );
-    // The child finishes rather than blocking on a full pipe, and the rejection comes at the wait.
     let rejected = wait(&host, child, 60_000).expect_err("more than a kept stream holds");
     assert_eq!(rejected.code, codes::PROCESS_OUTPUT_TOO_LARGE);
     assert!(
@@ -855,9 +833,6 @@ fn the_runs_teardown_ends_the_children_it_leaves() {
     assert!(!alive(&pid), "the child {pid} outlived the run's teardown");
 }
 
-/// A park over jobs of two pools, a child's wait and a socket's accept, waits for whichever
-/// finishes, rather than returning with nothing done and leaving the scheduler to count it as a
-/// fruitless park.
 #[test]
 fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
     let host = spawning("sh", SH);

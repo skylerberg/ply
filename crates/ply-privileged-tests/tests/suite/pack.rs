@@ -1,6 +1,3 @@
-//! The pack this binary reads, written out by hand.
-
-/// The files this binary's pack holds, by their paths in it.
 pub const SHIPPED: &[(&str, &[u8])] = &[
     ("std/json.ply", b"pub type Json = | Null\n"),
     ("std/hash.ply", b"pub fn sha256(b: Bytes) -> Bytes = b\n"),
@@ -20,7 +17,6 @@ pub const SHIPPED: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// `files` laid out as a pack: their bytes, the table ascending by path, the trailer.
 pub fn pack(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut sorted = files.to_vec();
     sorted.sort_by_key(|(path, _)| *path);

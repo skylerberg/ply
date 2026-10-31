@@ -1,11 +1,9 @@
-/// One shape, written the two ways.
 struct Pair {
     name: &'static str,
     canonical: &'static str,
     pessimal: &'static str,
 }
 
-/// The members differ only in parameter order: the growing argument moves and nothing else does.
 const CALL_ARG_CANONICAL: &str = r#"
 fn go(i: Int, acc: List<Int>) -> List<Int> =
   if i >= 200 { acc } else { go(i + 1, push(acc, i)) }
@@ -44,7 +42,6 @@ test "the growing field is first in its literal" {
 }
 "#;
 
-/// Field last, record first: the position rule compounds at every enclosing node.
 const COMPOUNDING_PESSIMAL: &str = r#"
 fn go(s: {k: Int, out: List<Int>}, i: Int) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go({k: s.k + 1, out: push(s.out, i)}, i + 1) }
@@ -55,7 +52,6 @@ test "the growing field is last and its record is first in the call" {
 }
 "#;
 
-/// The members differ only in how `xs` arrives: a statement binder here, a parameter there.
 const PARAM_VS_LET_CANONICAL: &str = r#"
 fn probe(n: Int) -> Int = {
   let xs = range(0, n);
@@ -181,7 +177,6 @@ fn the_pairs_are_the_five_shapes_they_say_they_are() {
         .map(|(p, d)| (p.name, d.0.as_str(), d.1.as_str()))
         .collect();
 
-    // The second and third rows share a canonical digest on purpose: only the outer node moved.
     let expected: [(&str, &str, &str); EXPECTED_PAIRS] = [
         ("call argument", "b3:2a168234d2a1", "b3:dc587bf7bfb2"),
         ("record field", "b3:031f75989bca", "b3:a52314fd4b69"),

@@ -1,7 +1,3 @@
-//! Compiled code, the only evaluator: a program's emitted C built and loaded as a unit, and the
-//! runtime that C calls into.
-
-// Raw-pointer helpers share the contract in `heap.rs`.
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

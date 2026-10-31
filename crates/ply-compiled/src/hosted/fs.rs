@@ -1,8 +1,3 @@
-//! `std.fs`'s natives: each operation on a path under the root its label names, or on a file a
-//! run holds open there, a job of the run's on the filing pool, and confined to its root there.
-//! Each returns what `ply_host::fs` writes of it. A read is no function of its arguments: asking
-//! twice may return otherwise.
-
 use super::{Nondeterministic, asked, from_host, handed, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
@@ -14,8 +9,6 @@ use ply_host::fs::{Chunk, Op, Opening, Second};
 use ply_host::jobs::Work;
 use std::sync::Arc;
 
-/// The ticket of `op` on the path at `pp` under the root the label at `lp` names, handed what
-/// `second` reads beside the path; 0, with the run failed, where it reads nothing.
 fn ticket_of(
     ctx: *mut Ctx,
     native: &'static str,
@@ -44,7 +37,6 @@ fn ticket_of(
     })
 }
 
-/// The ticket of `chunk` asked of the file `file` names under the root the label at `lp` names.
 fn on_file(ctx: *mut Ctx, native: &'static str, lp: Addr, ln: I64, file: I64, chunk: Chunk) -> I64 {
     asked(ctx, native, Nondeterministic, I64(0), |c| {
         let Some(label) = text_at(c, lp, ln) else {
@@ -68,7 +60,6 @@ fn on_file(ctx: *mut Ctx, native: &'static str, lp: Addr, ln: I64, file: I64, ch
     })
 }
 
-/// The natives that take a label and a path alone, each the operation beside its name.
 macro_rules! on_paths {
     ($($native:ident = $name:literal => $op:ident),+ $(,)?) => {
         $(
@@ -185,7 +176,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     natives
 }
 
-/// The ticket of `fs.rename` from the path at `pp` to the one at `tp`.
 pub unsafe extern "C" fn rt_fs_rename(
     ctx: *mut Ctx,
     lp: Addr,
@@ -200,7 +190,6 @@ pub unsafe extern "C" fn rt_fs_rename(
     })
 }
 
-/// The ticket of `fs.copy` of the file at `pp` to the path at `tp`.
 pub unsafe extern "C" fn rt_fs_copy(
     ctx: *mut Ctx,
     lp: Addr,
@@ -215,7 +204,6 @@ pub unsafe extern "C" fn rt_fs_copy(
     })
 }
 
-/// The ticket of `fs.link`: the path at `pp` made another name for the file at `tp`.
 pub unsafe extern "C" fn rt_fs_link(
     ctx: *mut Ctx,
     lp: Addr,
@@ -230,7 +218,6 @@ pub unsafe extern "C" fn rt_fs_link(
     })
 }
 
-/// The ticket of `fs.symlink`: the path at `pp` made a link to the target at `tp`.
 pub unsafe extern "C" fn rt_fs_symlink(
     ctx: *mut Ctx,
     lp: Addr,
@@ -245,7 +232,6 @@ pub unsafe extern "C" fn rt_fs_symlink(
     })
 }
 
-/// The ticket of `fs.temp_dir` under the directory at `pp`, its name starting with the text at `xp`.
 pub unsafe extern "C" fn rt_fs_temp_dir(
     ctx: *mut Ctx,
     lp: Addr,
@@ -260,7 +246,6 @@ pub unsafe extern "C" fn rt_fs_temp_dir(
     })
 }
 
-/// The ticket of `fs.write_file` of the bytes at `bp`.
 pub unsafe extern "C" fn rt_fs_write_file(
     ctx: *mut Ctx,
     lp: Addr,
@@ -280,7 +265,6 @@ pub unsafe extern "C" fn rt_fs_write_file(
     )
 }
 
-/// The ticket of `fs.append` of the bytes at `bp`.
 pub unsafe extern "C" fn rt_fs_append(
     ctx: *mut Ctx,
     lp: Addr,
@@ -295,7 +279,6 @@ pub unsafe extern "C" fn rt_fs_append(
     })
 }
 
-/// The ticket of `fs.read_at`: what is there of `len` bytes from `offset`, neither negative.
 pub unsafe extern "C" fn rt_fs_read_at(
     ctx: *mut Ctx,
     lp: Addr,
@@ -313,7 +296,6 @@ pub unsafe extern "C" fn rt_fs_read_at(
     })
 }
 
-/// The ticket of `fs.set_mode` to the nine permission bits `bits`.
 pub unsafe extern "C" fn rt_fs_set_mode(
     ctx: *mut Ctx,
     lp: Addr,
@@ -328,7 +310,6 @@ pub unsafe extern "C" fn rt_fs_set_mode(
     })
 }
 
-/// The ticket of `fs.set_modified` to `ms` milliseconds since the epoch, never before it.
 pub unsafe extern "C" fn rt_fs_set_modified(
     ctx: *mut Ctx,
     lp: Addr,
@@ -347,7 +328,6 @@ pub unsafe extern "C" fn rt_fs_set_modified(
     )
 }
 
-/// The ticket of `fs.scan`, below the directory's own entries where `deep` is 1.
 pub unsafe extern "C" fn rt_fs_scan(
     ctx: *mut Ctx,
     lp: Addr,
@@ -361,7 +341,6 @@ pub unsafe extern "C" fn rt_fs_scan(
     })
 }
 
-/// The ticket of `fs.open` as the opening `how` numbers.
 pub unsafe extern "C" fn rt_fs_open(
     ctx: *mut Ctx,
     lp: Addr,
@@ -375,7 +354,6 @@ pub unsafe extern "C" fn rt_fs_open(
     })
 }
 
-/// The ticket of at most `max` bytes of the file `file`, `max` never negative.
 pub unsafe extern "C" fn rt_fs_read_chunk(
     ctx: *mut Ctx,
     lp: Addr,
@@ -387,7 +365,6 @@ pub unsafe extern "C" fn rt_fs_read_chunk(
     on_file(ctx, "fs_read_chunk", lp, ln, file, Chunk::Read(max))
 }
 
-/// The ticket of the bytes at `bp` written to the file `file`.
 pub unsafe extern "C" fn rt_fs_write_chunk(
     ctx: *mut Ctx,
     lp: Addr,
@@ -400,13 +377,10 @@ pub unsafe extern "C" fn rt_fs_write_chunk(
     on_file(ctx, "fs_write_chunk", lp, ln, file, Chunk::Write(body))
 }
 
-/// The ticket of the file `file` let go.
 pub unsafe extern "C" fn rt_fs_close(ctx: *mut Ctx, lp: Addr, ln: I64, file: I64) -> I64 {
     on_file(ctx, "fs_close", lp, ln, file, Chunk::Close)
 }
 
-/// The ticket of `fs.write_secret`: the bytes at `bp`, the secret `secret` in the encoding named
-/// at `ep`, and the bytes at `ap`, framed here and wiped once written.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_fs_write_secret(
     ctx: *mut Ctx,
@@ -440,8 +414,6 @@ pub unsafe extern "C" fn rt_fs_write_secret(
     )
 }
 
-/// The ticket of `fs.read_secret`: the secret between the bytes at `bp` and those at `ap`, in the
-/// encoding named at `ep`, kept by the run under the number returned, found.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_fs_read_secret(
     ctx: *mut Ctx,
@@ -479,7 +451,6 @@ pub unsafe extern "C" fn rt_fs_read_secret(
     )
 }
 
-/// The secret the run keeps under `number`, which it no longer keeps.
 pub unsafe extern "C" fn rt_fs_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
     asked(
         ctx,

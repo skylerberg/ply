@@ -1,7 +1,3 @@
-//! Values marshalled between emitted code and runtime a part at a time, as emitted code calls the
-//! natives: written as the codec writes them, read back part by part, and marshalling begun inside
-//! others leaving the outer as they found it.
-
 use crate::bare::{context, helper};
 use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
@@ -22,7 +18,6 @@ type A2 = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 type N3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word);
 type A3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word) -> Word;
 
-/// The native the compiler declares as `name`, at `F`, as a unit binds it.
 fn native<F: Copy>(name: &str) -> F {
     helper(&builtin_helper_name(name))
 }
@@ -31,8 +26,6 @@ fn text(ctx: *mut Ctx, native_name: &str, s: &[u8]) {
     unsafe { native::<N2>(native_name)(ctx, s.as_ptr() as Word, s.len() as Word) }
 }
 
-/// What `write` writes between opening the lowering of a value a diagnostic shows and closing it,
-/// copied out as emitted code copies the taken bytes.
 fn lowered(ctx: &mut Ctx, write: impl FnOnce(*mut Ctx)) -> Vec<u8> {
     let ctx: *mut Ctx = ctx;
     unsafe {
@@ -45,12 +38,10 @@ fn lowered(ctx: &mut Ctx, write: impl FnOnce(*mut Ctx)) -> Vec<u8> {
     }
 }
 
-/// Begins a lifting of `bytes`, as the runtime begins one of an entry's arguments.
 fn lift_open(ctx: *mut Ctx, bytes: &[u8]) {
     unsafe { &mut *ctx }.lift_from(bytes.to_vec());
 }
 
-/// `write` over a fresh writer: the bytes the codec writes of a value written a part at a time.
 fn written(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
     let mut w = Writer::new();
     write(&mut w);
@@ -69,7 +60,6 @@ fn decimal_words(d: Decimal) -> (Word, Word) {
     )
 }
 
-/// Every kind of part, written by the natives, is the bytes the codec writes of the same value.
 #[test]
 fn the_natives_write_what_the_codec_writes() {
     let mut ctx = context();
@@ -80,7 +70,6 @@ fn the_natives_write_what_the_codec_writes() {
         text(ctx, "?out_name", b"a_decimal");
         native::<N2>("?out_decimal")(ctx, lo, hi);
         text(ctx, "?out_name", b"b_narrow");
-        // A narrow width however its holder extends it: here zero-extended.
         native::<N3>("?out_fixed")(ctx, width(IntTy::I8), 0xff, 0);
         text(ctx, "?out_name", b"c_wide");
         native::<N3>("?out_fixed")(ctx, width(IntTy::U128), -1, 7);
@@ -127,13 +116,10 @@ fn the_natives_write_what_the_codec_writes() {
     assert_eq!(bytes, expected);
 }
 
-/// A block of one word past its header, counted `rc`, its address the word that stands for it.
 fn block(rc: u32) -> Box<[u64; 2]> {
     Box::new([u64::from(rc), 0])
 }
 
-/// Asked of a value written before, the lowering of a value a diagnostic shows writes it again as
-/// `AGAIN`, numbered as each string, bytes, list, array or map opened.
 #[test]
 fn a_value_written_twice_is_written_again() {
     let mut ctx = context();
@@ -165,7 +151,6 @@ fn a_value_written_twice_is_written_again() {
         }
         w.str(s);
     });
-    // The outer list is 0, the inner list 1 and its string 2.
     let shared = written(|w| {
         w.count(tag::LIST, 3);
         w.count(tag::LIST, 1);
@@ -182,8 +167,6 @@ fn a_value_written_twice_is_written_again() {
     );
 }
 
-/// A static stands for every value of its contents, a string's and a byte string's alike, so a
-/// lowering that shares writes it whole each time, never as `AGAIN`.
 #[test]
 fn a_static_is_written_whole_each_time_a_lowering_shares() {
     let mut ctx = context();
@@ -206,7 +189,6 @@ fn a_static_is_written_whole_each_time_a_lowering_shares() {
     assert_eq!(bytes, whole);
 }
 
-/// Bytes the codec wrote, read a part at a time as a value's type reads them.
 #[test]
 fn the_natives_read_what_the_codec_writes() {
     let mut ctx = context();
@@ -258,8 +240,6 @@ fn the_natives_read_what_the_codec_writes() {
     unfailed(&mut ctx);
 }
 
-/// What a descriptor lifts or lowers by where the runtime never asks it to fails the entry, saying
-/// which.
 #[test]
 fn a_descriptors_rejection_fails_the_entry() {
     for (rejection, said) in [
@@ -277,7 +257,6 @@ fn a_descriptors_rejection_fails_the_entry() {
     }
 }
 
-/// Asserts the context did not fail, saying why where it did.
 pub fn unfailed(ctx: &mut Ctx) {
     let failed = ctx.failed;
     let reason = ctx.take_failure();
@@ -296,7 +275,6 @@ fn lift_and(bytes: &[u8], read: impl FnOnce(*mut Ctx)) -> String {
     ctx.take_failure().expect("a diagnostic").message
 }
 
-/// Bytes that do not hold what a type reads are Ply's defect, and fail the context.
 #[test]
 fn bytes_that_do_not_read_as_the_type_fail_the_context() {
     let int = written(|w| w.int(3));
@@ -321,8 +299,6 @@ fn bytes_that_do_not_read_as_the_type_fail_the_context() {
     assert!(said.contains("not an encoded value"), "{said}");
 }
 
-/// The read that returns a width's or a `Decimal`'s low word keeps the word above it for one ask:
-/// a narrow width's as the width's sign extends it, a 128-bit width's its own.
 #[test]
 fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
     let mut ctx = context();
@@ -359,7 +335,6 @@ fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
     assert!(said.contains("no wide value was read"), "{said}");
 }
 
-/// A 128-bit width read as its two words is made a box of them.
 #[test]
 fn a_128_bit_widths_two_words_box_as_its_two_words() {
     let boxed: A3 = helper("rt_box_wide");
@@ -379,8 +354,6 @@ fn a_128_bit_widths_two_words_box_as_its_two_words() {
     assert!(said.contains("no 128-bit width"), "{said}");
 }
 
-/// Marshalling begun inside another works on a frame of its own, and the outer one goes on where it
-/// was.
 #[test]
 fn marshalling_inside_marshalling_leaves_the_outer_as_it_was() {
     let mut ctx = context();
@@ -391,7 +364,6 @@ fn marshalling_inside_marshalling_leaves_the_outer_as_it_was() {
         native::<N1>("?out_int")(c, 1);
         let mut inner = context();
         written_inside = lowered(&mut inner, |i| native::<N1>("?out_int")(i, 0));
-        // On the same context: a lowering, then a lifting, each inside the outer lowering.
         native::<N0>("?shown_open")(c);
         native::<N1>("?out_int")(c, 2);
         let n = native::<A0>("?lower_close")(c);
@@ -423,8 +395,6 @@ fn a_value_written_with_no_lowering_open_fails_the_context() {
     assert!(said.contains("no lowering open"), "{said}");
 }
 
-/// What a carried value is: a pair whose second is carried again, each lowered through its own
-/// type, the inner in a lowering of its own inside the outer's.
 static INNER: PlyType = PlyType {
     identity: 2,
     spelled: b"m.Inner".as_ptr(),
@@ -453,7 +423,6 @@ unsafe extern "C" fn nothing(_ctx: *mut Ctx) -> Word {
     0
 }
 
-/// The inner value's word is the number it holds.
 unsafe extern "C" fn lower_inner(ctx: *mut Ctx, w: Word) -> Word {
     unsafe {
         native::<N3>("?out_ctor")(ctx, b"m.Inner".as_ptr() as Word, 7, 1);
@@ -462,7 +431,6 @@ unsafe extern "C" fn lower_inner(ctx: *mut Ctx, w: Word) -> Word {
     0
 }
 
-/// A pair's word is its first number; its second is the inner value one more.
 unsafe extern "C" fn lower_pair(ctx: *mut Ctx, w: Word) -> Word {
     unsafe {
         native::<N2>("?out_count")(ctx, tag::RECORD as Word, 2);
@@ -474,9 +442,6 @@ unsafe extern "C" fn lower_pair(ctx: *mut Ctx, w: Word) -> Word {
     0
 }
 
-/// A diagnostic shows a value's bytes alone: a credential and a scoped value each a handle at
-/// the position saying what it is, the credential's payload nowhere, and a carried value written in
-/// place through its type and what it carries through theirs.
 #[test]
 fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
     let mut ctx = context();
@@ -510,8 +475,6 @@ fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
     assert!(!bytes.windows(7).any(|b| b == b"hunter2"));
 }
 
-/// An `assert_eq` that failed raises `E0501` showing the expected value and then the actual, each the
-/// bytes it was handed, and a clause for the raise is told each by its kind.
 #[test]
 fn a_failed_assertion_raises_showing_the_expected_value_then_the_actual() {
     type N4 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
@@ -551,7 +514,6 @@ fn a_function_the_program_wrote_crosses_by_its_name() {
     assert_eq!(named, by_name);
 }
 
-/// The taken bytes are copied out whole or not at all.
 #[test]
 fn taken_bytes_are_copied_out_at_their_count_alone() {
     let mut ctx = context();

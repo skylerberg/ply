@@ -1,7 +1,3 @@
-//! What an operation emitted code writes in place leaves in the context when it hands the runtime
-//! its operands' rejection: raised where the operation raises, which `abort.raise` handles, and
-//! failing the run where it fails.
-
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
@@ -12,7 +8,6 @@ use ply_core::{Diagnostic, codes};
 type Rejected = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
 type RejectedText = unsafe extern "C" fn(*mut Ctx, Word, *const u8, Word, *const u8, Word);
 
-/// The diagnostic `refuse` leaves in a fresh context.
 fn left(refuse: impl FnOnce(&mut Ctx)) -> Diagnostic {
     let mut ctx = context_of(&[], Vec::new());
     ctx.begin();
@@ -23,12 +18,10 @@ fn left(refuse: impl FnOnce(&mut Ctx)) -> Diagnostic {
     d
 }
 
-/// What `?refused` makes of `what` and the numbers `a`, `b` and `c`.
 fn rejected(what: Word, a: Word, b: Word, c: Word) -> Diagnostic {
     left(|ctx| unsafe { helper::<Rejected>(&builtin_helper_name("?refused"))(ctx, what, a, b, c) })
 }
 
-/// What `?refused_text` makes of `what` and the texts `p` and `q`, `p` none where it is `None`.
 fn rejected_text(what: Word, p: Option<&[u8]>, q: &[u8]) -> Diagnostic {
     let (at, n) = p.map_or((std::ptr::null(), -1), |p| (p.as_ptr(), p.len() as Word));
     left(|ctx| unsafe {
@@ -86,7 +79,6 @@ fn an_operation_no_number_names_fails_the_entry_as_plys_fault() {
     }
 }
 
-/// A `String` read and dropped: what the runtime lifts its message through.
 unsafe extern "C" fn read_text(ctx: *mut Ctx) -> Word {
     let text: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_str"));
     let taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word) =
@@ -113,8 +105,6 @@ static STRING_T: PlyType = PlyType {
 
 type Pending = unsafe extern "C" fn(*mut Ctx, *const PlyType, Word) -> Word;
 
-/// How the context failed once `refuse` ran, a raise it left pending taken as code holding a clause
-/// for `abort.raise` takes it.
 fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
@@ -141,7 +131,6 @@ fn a_rejection_is_a_raise_where_its_builtin_raises_and_fails_the_run_where_it_fa
             helper::<Rejected>(&builtin_helper_name("?refused"))(c, what, a, b, 0)
         })
     };
-    // A raise is left pending for the code around the builtin, which a clause for it takes.
     assert_eq!(numbers(4, 9, 2), FAILED_PENDING, "`Array::get` raises");
     assert_eq!(numbers(8, 9, 2), FAILED_PENDING, "`Bytes::at` raises");
     assert_eq!(numbers(17, 0, 20_000_000), 1, "`range` fails the run");

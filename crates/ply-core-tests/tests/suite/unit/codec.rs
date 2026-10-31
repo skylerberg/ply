@@ -12,7 +12,6 @@ fn written(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
     w.finish()
 }
 
-/// `body` past the format, as no writer would write it.
 fn with(body: &[u8]) -> Vec<u8> {
     [&FORMAT[..], body].concat()
 }

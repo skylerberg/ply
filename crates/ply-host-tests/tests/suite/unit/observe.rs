@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A run given no configuration.
 static UNCONFIGURED: BTreeMap<String, String> = BTreeMap::new();
 
 fn module(name: &str) -> Option<String> {
@@ -65,7 +64,6 @@ fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
     recorder.wrote(&dir.path().join("out"));
     recorder.read(Read::File, &dir.path().join("out/b.ply"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    // What it wrote is its own: reading it back is no input.
     assert_eq!(lines(&trace), ["dir\tcwd\tsrc\t", "file\tcwd\tsrc/a.ply\t"]);
     assert!(stands(&trace, &world(&roots, "b")));
     std::fs::write(dir.path().join("src/b.ply"), b"new").unwrap();
@@ -102,7 +100,6 @@ fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
     std::fs::write(pkg.join("left over"), b"by another test").unwrap();
     let roots = rooted(dir.path());
     let recorder = Recorder::default();
-    // Listed, emptied of what was left there, and written into.
     recorder.read(Read::Dir, &pkg);
     recorder.read(Read::Tree, &pkg);
     std::fs::remove_file(pkg.join("left over")).unwrap();
@@ -118,11 +115,9 @@ fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
             "tree\tcwd\tpkg\t.cache/entry\u{1f}left over"
         ]
     );
-    // Another run leaves something else there, which this one would have removed.
     std::fs::write(pkg.join("left over"), b"by yet another").unwrap();
     std::fs::write(pkg.join(".cache/entry"), b"moved").unwrap();
     assert!(stands(&trace, &world(&roots, "b")));
-    // A module added beside the ones it read is not its own.
     std::fs::write(pkg.join("b.ply"), b"b").unwrap();
     assert!(moved(&trace, &world(&roots, "b")));
 }
@@ -167,7 +162,6 @@ fn a_configuration_read_stands_while_its_key_returns_what_it_did() {
         lines(&trace),
         ["config\tSERVICE_ABSENT", "config\tSERVICE_REGION"]
     );
-    // A key the run never read moves nothing.
     let other_unread = values(&[("SERVICE_REGION", "eu"), ("UNREAD", "two")]);
     assert!(stands(&trace, &configured(&[], "b", &other_unread)));
     let us = values(&[("SERVICE_REGION", "us")]);
@@ -228,7 +222,6 @@ fn shipped_modules_and_the_program_are_recorded_at_the_binary_s_digests() {
     );
 }
 
-/// The only test that lays the shipped modules out: where they lie is the process's to set once.
 #[test]
 fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_link() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,7 +234,6 @@ fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_li
     recorder.read(Read::File, &real.join("shipped/std.list.ply"));
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert_eq!(trace, "shipped\tstd.list\tlist digest\n");
-    // A data file a module embeds lies below them under its name, and no view stands for it.
     recorder.read(Read::File, &real.join("shipped/std/words/list.txt"));
     recorder.reached(VIEW, true);
     let embedding = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
@@ -249,7 +241,6 @@ fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_li
         embedding,
         "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd/words/list.txt\twords digest\n"
     );
-    // What lies beside them is the program's.
     recorder.read(Read::File, &real.join("shipped/stamps"));
     let stamped = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert!(
@@ -267,10 +258,8 @@ fn a_view_stands_for_one_whole_read_of_the_modules_it_names() {
     recorder.shipped("std.list");
     recorder.shipped("std.list");
     recorder.reached(VIEW, true);
-    // Never read of the binary: a caller handed the load its own text.
     recorder.reached("shipform\tstd.handed\tt\tf\n", true);
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    // The second read had no view of its own, so it holds the whole module.
     assert_eq!(
         trace,
         "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd.list\tlist digest\n"
@@ -325,8 +314,6 @@ fn a_ply_it_started_reports_its_views() {
     );
 }
 
-/// The record is the run's: what a host handler of it reads goes there, a run made on the test's
-/// behalf shares it, and a run with none of its own records nothing.
 #[test]
 fn a_run_records_into_the_record_it_was_handed_and_one_handed_none_records_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -377,11 +364,9 @@ fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_i
         ),
     )
     .unwrap();
-    // A program that is not `ply` never begins its report.
     let _other = recorder.child_trace();
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
     assert_eq!(lines(&trace), ["file\tcwd\ta.ply\t", "shipped\tstd.list"]);
-    // The child's binary responded, not ours.
     assert!(trace.contains("shipped\tstd.list\tits own digest\n"));
     let unfinished = recorder.child_trace();
     std::fs::write(&unfinished, "read\tfile\t/x\n").unwrap();
@@ -429,7 +414,6 @@ fn a_front_end_s_store_is_neither_read_nor_listed() {
     recorder.read(Read::File, &pkg.join(".ply-cache/index"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
     assert_eq!(lines(&trace), ["dir\tcwd\tpkg\t", "tree\tcwd\tpkg\t"]);
-    // Another test's store appearing beside the sources moves nothing.
     std::fs::create_dir(pkg.join(".ply-cache")).unwrap();
     std::fs::write(pkg.join(".ply-cache/index"), b"filed").unwrap();
     assert!(stands(&trace, &world(&roots, "b")));

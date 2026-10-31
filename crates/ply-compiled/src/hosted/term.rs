@@ -1,10 +1,3 @@
-//! `std.term`'s natives: whether the process's streams are a terminal, the terminal's size and
-//! input mode, and what is typed at it, read from the buffer `process.line` reads.
-//!
-//! A line read for a `Secret` is marshalled alone: the job that reads it keeps it with the run
-//! that asked, under a number, and returns the number found, and `term_secret_taken` makes the
-//! secret of what the run keeps.
-
 use super::{Nondeterministic, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
@@ -42,7 +35,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// The modes as the host handler numbers them: `Cooked` 0, `Silent` 1 and `Raw` 2.
 fn mode_of(n: i64) -> Option<Mode> {
     match n {
         0 => Some(Mode::Cooked),
@@ -60,7 +52,6 @@ fn mode_number(mode: Mode) -> i64 {
     }
 }
 
-/// 1 where the stream numbered `stream` (standard input 0, output 1, error 2) is a terminal.
 pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 {
     asked(
         ctx,
@@ -82,7 +73,6 @@ pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 
     )
 }
 
-/// The terminal's columns and rows, each in eight bytes, found.
 pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
     asked(
         ctx,
@@ -97,8 +87,6 @@ pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
     )
 }
 
-/// The terminal standard input is put in the mode numbered `mode`, returning the mode it was in,
-/// or -1, nothing changed, where standard input is no terminal.
 pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
     asked(
         ctx,
@@ -121,8 +109,6 @@ pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
     )
 }
 
-/// The ticket of what has been typed, at most `max` bytes, found; none where nothing came within
-/// `timeout_ms`, which waits as long as it takes where it is negative.
 pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64) -> I64 {
     asked(
         ctx,
@@ -145,9 +131,6 @@ pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64)
     )
 }
 
-/// The ticket of one line of standard input kept for a `Secret` by the run that asked: the number
-/// it is kept under, found, or none at the end of input. A line read after its run ended is wiped
-/// as it is dropped.
 pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
     asked(
         ctx,
@@ -171,7 +154,6 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
     )
 }
 
-/// The line the run keeps under `number`, as a secret that only a `Secret`'s own readers read.
 pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
     asked(
         ctx,

@@ -1,7 +1,3 @@
-//! The families this binary serves itself, as the runtime's natives bind them: a binding from what
-//! a run is granted alone, what families register and the facts a run's disclosures print, and the
-//! world a trace of the run's reads is read against.
-
 use crate::hosts::Hosts;
 use ply_compiled::entry::{Bound, Grants};
 use ply_compiled::flat::Writer;
@@ -13,7 +9,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Installs the binder and what the binary ships, once, before a program enters another.
 pub fn install() {
     ply_compiled::entry::install(Box::new(Binder));
     crate::shipped::install();
@@ -30,12 +25,6 @@ impl ply_compiled::entry::Binder for Binder {
         }))
     }
 
-    /// `hosting := list(failure) refusals, option(transport), list(named) roots, sink,
-    /// list(string) signals`; `transport := string library, string version, string provider,
-    /// list(string) versions, list(string) alpn, string roots, string roots_version, int trusted,
-    /// list(credential)`; `credential := string name, string fingerprint, int certificates`;
-    /// `named := string name, string path`; `sink := string sink, string destination,
-    /// option(string) level`.
     fn hosting(&self, grants: &Grants, w: &mut Writer) {
         let mut rejections = Vec::new();
         let credentials = credentials_of(grants)
@@ -129,7 +118,6 @@ fn roots_of(grants: &Grants) -> Result<ply_host::fs::Roots, Diagnostic> {
     ply_host::fs::Roots::load(&specs, ply_core::Span::DUMMY)
 }
 
-/// A binding and the world its runs' traces are read against.
 struct Borrowed {
     hosts: Hosts,
     world: Worldly,
@@ -157,8 +145,6 @@ impl Bound for Borrowed {
     }
 }
 
-/// What a trace is read against: the roots a run is granted, what the run binds apart from the
-/// program, and the plain value of each configuration key it is given.
 #[derive(Clone)]
 struct Worldly {
     roots: Vec<(String, PathBuf)>,
@@ -202,8 +188,6 @@ impl Worldly {
     }
 }
 
-/// What a run binds apart from the program, which a pass's key covers: the roots, programs and
-/// families it is granted, by name.
 fn binding_digest(grants: &Grants) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in ["fs", "exec", "allow"] {

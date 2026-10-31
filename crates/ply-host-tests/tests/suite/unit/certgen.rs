@@ -1,5 +1,3 @@
-//! Certificates a run generates for itself.
-
 use ply_host::certgen;
 
 #[test]
@@ -16,7 +14,6 @@ fn an_issued_certificate_is_a_localhost_certificate_a_client_can_trust() {
         issued.key.starts_with("-----BEGIN PRIVATE KEY-----"),
         "the key is PEM"
     );
-    // The DER is the certificate's, and the fingerprint names it.
     assert!(!issued.der.is_empty());
     assert_eq!(
         issued.fingerprint,
@@ -28,7 +25,6 @@ fn an_issued_certificate_is_a_localhost_certificate_a_client_can_trust() {
         issued.fingerprint
     );
 
-    // A client trusting exactly this one loads it as a credential.
     let dir = tempfile::tempdir().unwrap();
     let certificate = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
@@ -59,8 +55,6 @@ fn two_issuances_are_not_the_same_certificate() {
     );
 }
 
-/// A certificate names the names it was asked for, or `localhost` when it was asked for none,
-/// and a server holding it completes a handshake a client trusting that one name accepts.
 #[test]
 fn a_named_certificate_is_a_certificate_for_that_name() {
     let issued = certgen::issue(&["localhost".to_string(), "127.0.0.1".to_string()])
@@ -80,7 +74,6 @@ fn a_named_certificate_is_a_certificate_for_that_name() {
         &[],
     )
     .expect("the issued material loads as a credential");
-    // Resolving the server config reads the leaf, so a malformed pair would fail here.
     let server = loaded
         .resolve("issued", ply_core::Span::DUMMY)
         .expect("resolves");

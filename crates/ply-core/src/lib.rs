@@ -1,5 +1,4 @@
-//! The runtime's vocabulary: PLV1, spans, diagnostics and their codes, effects, and
-//! the host boundary.
+#![allow(clippy::missing_safety_doc)]
 
 pub mod builtins;
 pub mod codec;

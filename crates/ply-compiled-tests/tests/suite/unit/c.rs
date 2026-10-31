@@ -7,7 +7,6 @@ use ply_compiled::c::{builtin_helper_name, helpers};
 use ply_compiled::heap::{imm, imm_value};
 use std::sync::atomic::Ordering::Relaxed;
 
-/// A declaration with no address is a null call at run time: a crash rather than a decline.
 #[test]
 fn every_declared_helper_has_an_address() {
     for h in helpers() {
@@ -15,8 +14,6 @@ fn every_declared_helper_has_an_address() {
     }
 }
 
-/// What the runtime reports of a native is read off the type of the function it binds: the words
-/// past the context, whether it returns, and whether what it returns may be a raise.
 #[test]
 fn a_natives_signature_is_its_functions_type() {
     use ply_compiled::emitted::{Handed, PlyType};
@@ -54,9 +51,6 @@ fn a_natives_signature_is_its_functions_type() {
     );
 }
 
-/// A native over machine data is bound as a builtin's helper is, under the name the compiler or a
-/// shipped module's `extern fn` gives it, which no other native has, at the
-/// words and kinds its function takes.
 #[test]
 fn every_native_over_machine_data_has_a_helper_of_its_own() {
     use ply_compiled::c::machine_natives;
@@ -94,9 +88,6 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
     assert_eq!(out_str.signature.result, None);
 }
 
-/// What the runtime says of itself to a compiler is read off its own functions and structs: each
-/// helper of its own and each native with what its function's type takes and returns, and where it
-/// lays out what emitted code reads in place.
 #[test]
 fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     use ply_compiled::rt::Ctx;
@@ -140,7 +131,6 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     );
 }
 
-/// A unit binds the helpers it records by name, in its own order, each to this runtime's own.
 #[test]
 fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     let mut exports = units::exports_of(&[]);
@@ -157,8 +147,6 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A table reads as a unit writes one: its helpers, constants, modules, pools and entered roots,
-/// in that order.
 #[test]
 fn a_units_table_reads_as_a_unit_writes_it() {
     let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nfields 1\nop\nentered m.main\n";
@@ -170,8 +158,6 @@ fn a_units_table_reads_as_a_unit_writes_it() {
     assert_eq!(read.encode(), said);
 }
 
-/// The last release's units list what their emitter rejected after their modules: that table reads
-/// as the same table without the list, since the release's builder runs on this runtime.
 #[test]
 fn a_table_listing_rejections_reads_as_one_without_them() {
     let listed = "helpers 0\nconstants 0\nmodules 3\nrefused 1\nm.f\nwhy\nfields 1\nop\n\
@@ -181,8 +167,6 @@ fn a_table_listing_rejections_reads_as_one_without_them() {
     assert_eq!(read.encode(), bare);
 }
 
-/// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
-/// another shape, rejects the unit by name rather than binding it to nothing.
 #[test]
 fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_rejected_by_name() {
     let mut retired = units::exports_of(&[]);
@@ -238,11 +222,8 @@ fn a_unit_compiles_loads_binds_and_returns() {
     assert_eq!(imm_value(result), 42);
 }
 
-/// The prologue a body opens with: room asked for on the stack it runs on where its frame lies below
-/// the floor.
 const PROLOGUE: &str = "  { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
-/// `ladder(n)` is `n` calls deep, none of them a tail call, each frame a kilobyte and more.
 fn deep_calls() -> [units::Def; 1] {
     let ladder = units::symbol("m.ladder");
     [def(
@@ -259,11 +240,8 @@ fn deep_calls() -> [units::Def; 1] {
     )]
 }
 
-/// Twenty megabytes of frames and more: past a stack's first two chunks.
 const DEEP: i64 = 20_000;
 
-/// An entry begun where a Rust recursion grew onto a stacker segment, or anywhere else the runtime
-/// does not know.
 struct Unknown {
     ctx: *mut ply_compiled::rt::Ctx,
     entry: ply_compiled::rt::Entry,
@@ -284,8 +262,6 @@ extern "C" fn enter_from_an_unknown_stack(arg: usize) {
     std::process::abort();
 }
 
-/// `m.ladder(DEEP)` begun on a stack unknown to the runtime: what it returned, the chunks it grew
-/// by, and how it failed.
 fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
@@ -312,9 +288,6 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     Some((imm_value(result), grown, failed, raised))
 }
 
-/// A recursion past a stack's first chunk makes the stack writable further down and returns on
-/// it, so a program nests as deeply as its stack's reservation holds. An entry begun where the
-/// runtime knows no stack is given one of its own.
 #[test]
 fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
     let Some((result, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
@@ -328,8 +301,6 @@ fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
     );
 }
 
-/// A thread's own stack is reserved whole and cannot be made larger: a recursion past its floor
-/// fails, and never runs into its guard.
 #[test]
 fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
     let ran = std::thread::Builder::new()
@@ -362,10 +333,8 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
     assert!(raised.contains("what the native stack holds"), "{raised}");
 }
 
-/// A loop's restart probes the floor as a prologue does, reading it anew each pass.
 const RESTART: &str = "  ply_loop: { char probe; if ((uintptr_t)&probe < (uintptr_t)*(volatile int64_t *)&ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
-/// A loop that makes no call ends at its restart once its clock runs out.
 #[test]
 fn a_loop_past_its_clock_ends_at_its_next_restart() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -390,8 +359,6 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
     assert!(said.contains("timed out after 20 ms"), "{said}");
 }
 
-/// The watchdog writes to a context only while its entry runs, since the context may be reused or
-/// freed after.
 #[test]
 fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
     let native = units::opened(
@@ -410,7 +377,6 @@ fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
     assert_eq!(ctx.stack_floor.load(Relaxed), 7);
 }
 
-/// A unit says each constant with its row of the code table.
 #[test]
 fn a_unit_says_its_constants_slots() {
     let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nfields 0\n";
@@ -423,8 +389,6 @@ fn a_unit_says_its_constants_slots() {
     );
 }
 
-/// A unit entered encoded names each root it is entered at on a line of its own after its tables,
-/// among lines a runtime that does not know them reads as nothing.
 #[test]
 fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
     let tables = "helpers 0\nconstants 0\nmodules 0\nfields 0\n";

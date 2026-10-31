@@ -1,5 +1,3 @@
-//! `std.random`'s natives: the operating system's entropy, each draw independent of every other.
-
 use super::{Nondeterministic, asked};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
@@ -20,7 +18,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// Sixty-three bits of the operating system's entropy; 0, with the run failed, where it gave none.
 pub unsafe extern "C" fn rt_entropy_next(ctx: *mut Ctx) -> I64 {
     asked(
         ctx,
@@ -37,8 +34,6 @@ pub unsafe extern "C" fn rt_entropy_next(ctx: *mut Ctx) -> I64 {
     )
 }
 
-/// `n` bytes of the operating system's entropy drawn into a secret, `n` in the range the real
-/// handler checks.
 pub unsafe extern "C" fn rt_entropy_secret(ctx: *mut Ctx, n: I64) -> SecretHandle {
     asked(
         ctx,

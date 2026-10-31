@@ -30,7 +30,6 @@ fn hchacha20_is_the_drafts() {
 #[test]
 fn an_hmac_is_rfc_4231s_and_each_scheme_makes_a_public_key_and_a_signature() {
     let key = [7; 32];
-    // RFC 4231, case 2.
     assert_eq!(
         crypto::hmac("SHA-256", b"Jefe", b"what do ya want for nothing?"),
         Some(hex(
@@ -149,9 +148,7 @@ fn a_key_that_is_none_of_its_scheme_returns_nothing() {
             .unwrap()
             .map(|s| s.to_vec())
     };
-    // A point of small order sends every key to zero.
     assert_eq!(agreed("x25519", &[0; 32]), None);
-    // The point at infinity's place, and a point off the curve.
     assert_eq!(agreed("p256", &[0]), None);
     let mut off = vec![4u8];
     off.extend([1u8; 64]);
@@ -161,7 +158,6 @@ fn a_key_that_is_none_of_its_scheme_returns_nothing() {
 
 #[test]
 fn a_private_key_is_read_from_its_document_as_the_scheme_it_names() {
-    // RFC 8410, section 10.3.
     let seed = hex("d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842");
     let mut document = hex("302e020100300506032b657004220420");
     document.extend(&seed);
@@ -200,7 +196,6 @@ fn what_is_sealed_opens_and_a_turned_bit_does_not() {
 
 #[test]
 fn bytes_encode_as_rfc_4648_writes_and_decode_back() {
-    // RFC 4648, section 10.
     let words = ["", "f", "fo", "foo", "foob", "fooba", "foobar"];
     let base64 = [
         "", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy",
@@ -329,7 +324,6 @@ fn every_curve_signs_as_its_verifier_reads_and_a_high_s_secp256k1_signature_is_i
         assert_eq!(verified(&raw, b"m"), Ok(true), "{curve}");
         assert_eq!(verified(&raw, b"n"), Ok(false), "{curve}");
     }
-    // secp256k1's order; `s` and `n - s` are one signature.
     let order = hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
     let scalar = [3u8; 32];
     let public = crypto::public("k256", &scalar).unwrap().unwrap();
@@ -353,7 +347,6 @@ fn every_curve_signs_as_its_verifier_reads_and_a_high_s_secp256k1_signature_is_i
     }
 }
 
-/// The contents of each `INTEGER` a DER `SEQUENCE` of them holds.
 fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     fn length(der: &[u8], at: &mut usize) -> usize {
         let first = der[*at];

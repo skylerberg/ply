@@ -1,8 +1,5 @@
-//! The diagnostic for a `perform` no handler handles.
-
 use crate::{Diagnostic, Span, Symbol, codes};
 
-/// Deliberately not `E0424`: inference should have prevented this perform, so it is a bug-catcher.
 #[cold]
 #[inline(never)]
 pub fn err_unhandled(

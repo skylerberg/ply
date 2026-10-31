@@ -1,7 +1,3 @@
-//! `std.trace`'s natives: records written to the run's sink, and the spans the run keeps open, each
-//! the running task's of this machine. A record's fields cross flat as `ply_host::trace` reads them,
-//! and only where the sink wants the record.
-
 use super::{Nondeterministic, asked, done, from_host, handed};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64};
@@ -34,7 +30,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// The levels as the host handler numbers them: `Debug` 0, `Info` 1, `Warn` 2 and `Error` 3.
 fn level_of(n: I64) -> Option<Level> {
     match n.0 {
         0 => Some(Level::Debug),
@@ -45,14 +40,11 @@ fn level_of(n: I64) -> Option<Level> {
     }
 }
 
-/// The run's trace, and who performs on this machine: the running task of a production scheduler,
-/// or the machine itself outside one.
 fn traced(c: &mut Ctx) -> Option<(Arc<Trace>, Owner)> {
     let trace = from_host(c, |facilities| Arc::clone(facilities.tracing()))?;
     Some((trace, (c.id, crate::tasks::production_task(c))))
 }
 
-/// The fields at `at`, as the host handler writes them.
 fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Field)>> {
     handed(
         c,
@@ -62,7 +54,6 @@ fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Fi
     )
 }
 
-/// 1 where the run's sink writes a record at the level numbered `level`.
 pub unsafe extern "C" fn rt_trace_wants(ctx: *mut Ctx, level: I64) -> I64 {
     asked(
         ctx,
@@ -79,9 +70,6 @@ pub unsafe extern "C" fn rt_trace_wants(ctx: *mut Ctx, level: I64) -> I64 {
     )
 }
 
-/// One record of the kind numbered `kind` (`event` 0, `count` 1, `gauge` 2, `time` 3) on the
-/// channel at `channel_at`: a count's delta or a time's microseconds in `amount`, and a gauge's
-/// value as the decimal text at `value_at`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_trace_record(
     ctx: *mut Ctx,
@@ -139,7 +127,6 @@ pub unsafe extern "C" fn rt_trace_record(
     });
 }
 
-/// Opens a span on the channel at `channel_at`, returning its id.
 pub unsafe extern "C" fn rt_trace_enter(
     ctx: *mut Ctx,
     channel_at: Addr,
@@ -172,9 +159,6 @@ pub unsafe extern "C" fn rt_trace_enter(
     )
 }
 
-/// Closes span `id` on the channel at `channel_at` with the outcome numbered `outcome` (`Ok` 0,
-/// `Failed` 1 with the reason at `reason_at`, `Abandoned` 2), and every span opened inside it.
-/// One that is not open fails the run.
 pub unsafe extern "C" fn rt_trace_exit(
     ctx: *mut Ctx,
     channel_at: Addr,

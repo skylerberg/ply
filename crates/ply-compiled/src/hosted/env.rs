@@ -1,6 +1,3 @@
-//! `std.env`'s natives: the variables and the working directory of the process, which every run
-//! may read.
-
 use super::{Nondeterministic, asked, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
@@ -24,7 +21,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// The value of the variable whose name is at `p`, found where it is set and UTF-8.
 pub unsafe extern "C" fn rt_env_variable(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     asked(ctx, "env_variable", Nondeterministic, TakenBytes(0), |c| {
         let Some(name) = text_at(c, p, n) else {
@@ -34,7 +30,6 @@ pub unsafe extern "C" fn rt_env_variable(ctx: *mut Ctx, p: Addr, n: I64) -> Take
     })
 }
 
-/// Every variable whose name and value are UTF-8, each its name and value as parts, as parts.
 pub unsafe extern "C" fn rt_env_variables(ctx: *mut Ctx) -> TakenBytes {
     asked(ctx, "env_variables", Nondeterministic, TakenBytes(0), |c| {
         let variables: Vec<Vec<u8>> = std::env::vars_os()
@@ -46,7 +41,6 @@ pub unsafe extern "C" fn rt_env_variables(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-/// The directory the process runs in; `.` where the system does not say.
 pub unsafe extern "C" fn rt_env_working_directory(ctx: *mut Ctx) -> TakenBytes {
     asked(
         ctx,

@@ -1,6 +1,3 @@
-//! A scoped value as emitted code meets it: made of a word it takes, read and taken through
-//! natives that never read or count what it holds.
-
 use crate::bare::{context, helper};
 use ply_compiled::rt::Ctx;
 
@@ -16,7 +13,6 @@ fn a_scoped_value_passes_borrowed_and_hands_back_the_word_it_was_made_of_and_rej
     let mut ctx = context();
     ctx.begin();
     let c: *mut Ctx = &mut ctx;
-    // Raw words the runtime would take for objects, if it read them: it never does.
     for word in [4096i64, 8, 0, -8] {
         let h = unsafe { made(c, word) };
         assert_eq!(unsafe { read(c, h) }, word);

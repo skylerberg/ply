@@ -1,9 +1,3 @@
-//! `std.process`'s natives: the run's own process, which a run that is not one withholds, and the
-//! programs `--exec` binds, each by its label. What waits, on another program, on a person or on a
-//! pipe a child drains at its own pace, is a job on the waiting pool. Where the run asking is
-//! observed, a child's `File` outputs are entered into its record as writes, and a `ply` the child
-//! is reports what it read there.
-
 use super::{Determinism, Nondeterministic, asked, from_host, text_at, texts_at};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
@@ -80,9 +74,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// What `result` returns of the run's process host, where the native may ask the host for a
-/// response of `determinism`; `rejected`, with the run failed, where the run was granted no
-/// process host, or `result` fails. `op` and `reach` name what a rejection names.
 fn hosted<R: Copy>(
     ctx: *mut Ctx,
     native: &'static str,
@@ -107,7 +98,6 @@ fn hosted<R: Copy>(
     })
 }
 
-/// The stream `number` numbers: standard output 0 and standard error 1.
 fn stream_of(number: I64) -> Stream {
     if number.0 == 0 {
         Stream::Out
@@ -116,8 +106,6 @@ fn stream_of(number: I64) -> Stream {
     }
 }
 
-/// The environment borrowed as parts at `p`, each variable's name and value, and, where the run
-/// asking is observed, where a `ply` the child is reports what it read.
 fn environment_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<(String, String)>> {
     let texts = texts_at(c, p, n)?;
     if texts.len() % 2 != 0 {
@@ -140,7 +128,6 @@ fn environment_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<(String, String)>>
     Some(env)
 }
 
-/// The arguments the run was given, as parts.
 pub unsafe extern "C" fn rt_process_args(ctx: *mut Ctx) -> TakenBytes {
     let none = TakenBytes(0);
     hosted(
@@ -158,7 +145,6 @@ pub unsafe extern "C" fn rt_process_args(ctx: *mut Ctx) -> TakenBytes {
     )
 }
 
-/// 1 where the run bound a program to the label at `p`, else 0.
 pub unsafe extern "C" fn rt_process_bound(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     hosted(
         ctx,
@@ -171,7 +157,6 @@ pub unsafe extern "C" fn rt_process_bound(ctx: *mut Ctx, p: Addr, n: I64) -> I64
     )
 }
 
-/// The text at `p` and a line ending written to the stream `stream` numbers.
 pub unsafe extern "C" fn rt_process_line(ctx: *mut Ctx, stream: I64, p: Addr, n: I64) {
     let op = match stream_of(stream) {
         Stream::Out => "out",
@@ -191,7 +176,6 @@ pub unsafe extern "C" fn rt_process_line(ctx: *mut Ctx, stream: I64, p: Addr, n:
     )
 }
 
-/// 1 where the bytes at `p` reached the stream `stream` numbers, 0 once its reader has gone.
 pub unsafe extern "C" fn rt_process_write(ctx: *mut Ctx, stream: I64, p: Addr, n: I64) -> I64 {
     let op = match stream_of(stream) {
         Stream::Out => "out_bytes",
@@ -215,7 +199,6 @@ pub unsafe extern "C" fn rt_process_write(ctx: *mut Ctx, stream: I64, p: Addr, n
     )
 }
 
-/// 1 where what standard output's buffer held reached it, 0 once its reader has gone.
 pub unsafe extern "C" fn rt_process_flush(ctx: *mut Ctx) -> I64 {
     hosted(
         ctx,
@@ -228,7 +211,6 @@ pub unsafe extern "C" fn rt_process_flush(ctx: *mut Ctx) -> I64 {
     )
 }
 
-/// The ticket of one line of standard input without its ending, found.
 pub unsafe extern "C" fn rt_process_read_line(ctx: *mut Ctx) -> I64 {
     hosted(
         ctx,
@@ -244,7 +226,6 @@ pub unsafe extern "C" fn rt_process_read_line(ctx: *mut Ctx) -> I64 {
     )
 }
 
-/// The ticket of what comes next on standard input, at most `max` bytes.
 pub unsafe extern "C" fn rt_process_read(ctx: *mut Ctx, max: I64) -> I64 {
     hosted(
         ctx,
@@ -265,7 +246,6 @@ pub unsafe extern "C" fn rt_process_read(ctx: *mut Ctx, max: I64) -> I64 {
     )
 }
 
-/// The run ended with `code`, which it exits with once its host has torn down.
 pub unsafe extern "C" fn rt_process_exit(ctx: *mut Ctx, code: I64) {
     hosted(
         ctx,
@@ -288,8 +268,6 @@ pub unsafe extern "C" fn rt_process_exit(ctx: *mut Ctx, code: I64) {
     )
 }
 
-/// The ticket of the program the label at `lp` names run to its end with the arguments at `ap`,
-/// in the directory at `dp` under the environment at `ep`: how it ended and both its streams.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_process_spawn(
     ctx: *mut Ctx,
@@ -324,9 +302,6 @@ pub unsafe extern "C" fn rt_process_spawn(
     )
 }
 
-/// How a child is wired, borrowed as parts: three bytes, 1 where it reads input and each output
-/// stream's number (`Keep` 0, `Discard` 1, `Inherit` 2, `Lines` 3 and `File` 4), then the path
-/// of each stream that is a file.
 fn wiring_of(wiring: &[u8]) -> Option<Io> {
     let parts = parts_of(wiring)?;
     let [kinds, out_file, err_file] = parts.as_slice() else {
@@ -343,9 +318,6 @@ fn wiring_of(wiring: &[u8]) -> Option<Io> {
     })
 }
 
-/// A child of the program the label at `lp` names, started beside the program as
-/// [`rt_process_spawn`] reads its arguments, and wired as the parts at `wp` say: byte 1 and its
-/// handle, or byte 0 and why it could not start.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_process_start(
     ctx: *mut Ctx,
@@ -398,8 +370,6 @@ pub unsafe extern "C" fn rt_process_start(
     )
 }
 
-/// The ticket of how the child `child` the label at `lp` started ended, found once it has: none
-/// while it runs past `timeout_ms`.
 pub unsafe extern "C" fn rt_process_wait(
     ctx: *mut Ctx,
     lp: Addr,
@@ -424,7 +394,6 @@ pub unsafe extern "C" fn rt_process_wait(
     )
 }
 
-/// 1 where the signal `signal` numbers reached the child, 0 where it had already ended.
 pub unsafe extern "C" fn rt_process_signal(
     ctx: *mut Ctx,
     lp: Addr,
@@ -456,7 +425,6 @@ pub unsafe extern "C" fn rt_process_signal(
     )
 }
 
-/// The ticket of the bytes at `p` written to the child's input: byte 1 where every byte was.
 pub unsafe extern "C" fn rt_process_input(
     ctx: *mut Ctx,
     lp: Addr,
@@ -483,7 +451,6 @@ pub unsafe extern "C" fn rt_process_input(
     )
 }
 
-/// The child's input closed.
 pub unsafe extern "C" fn rt_process_end_input(ctx: *mut Ctx, lp: Addr, ln: I64, child: I64) {
     hosted(
         ctx,
@@ -499,8 +466,6 @@ pub unsafe extern "C" fn rt_process_end_input(ctx: *mut Ctx, lp: Addr, ln: I64, 
     )
 }
 
-/// The ticket of the next line any of the child's `Lines` streams wrote: byte 0 and the line,
-/// byte 1 for nothing before `timeout_ms`, or byte 2 for the end of every one.
 pub unsafe extern "C" fn rt_process_output_line(
     ctx: *mut Ctx,
     lp: Addr,

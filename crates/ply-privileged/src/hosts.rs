@@ -1,6 +1,3 @@
-//! The binding a run is granted, from its grants alone, and the operations of the families this
-//! runtime serves itself.
-
 use ply_compiled::entry::Grants;
 use ply_core::host::HostBinding;
 use ply_core::{Diagnostic, Span};
@@ -8,20 +5,13 @@ use ply_host::config::{Entry, Snapshot};
 use ply_host::tls;
 use std::sync::Arc;
 
-/// What a run has bound: the facilities its handlers act on, the binding, and what stops it where
-/// it listens for a signal.
 pub struct Hosts {
-    /// The source of every [`HostRuntime`].
     host: Arc<ply_host::Host>,
     binding: Arc<HostBinding>,
     stop: Option<Arc<ply_host::signal::Shutdown>>,
 }
 
 impl Hosts {
-    /// The binding of every family this runtime serves itself, from what a run is granted alone: no
-    /// program's effects are read. Its roots, its programs and its command line narrow what they
-    /// serve. A run given `drain LEAD_MS DRAIN_MS` drains on `INT` or `TERM`; one given `end` ends
-    /// its children and exits at once.
     pub fn granted(grants: &Grants) -> Result<Hosts, Vec<Diagnostic>> {
         let pairs = |name: &'static str| {
             grants.named(name).filter_map(|fields| match fields {
@@ -104,11 +94,6 @@ impl Hosts {
         })
     }
 
-    /// The binding torn down, its children ended and its sink flushed: what it reports, each a
-    /// flat body by name. `teardown := int spans_left_open`; `handshakes := int completed,
-    /// int refused, list(string reason, int count)`; `stopping := option(string) signal,
-    /// int listeners, int connections, int elapsed_ms`; `trace := int events, int spans,
-    /// int abandoned, bool flushed`.
     pub fn torn_down(&self) -> Vec<(String, Vec<u8>)> {
         use ply_compiled::flat::Writer;
         let mut reports = Vec::new();
@@ -152,7 +137,6 @@ impl Hosts {
         reports
     }
 
-    /// A reactor for each machine, which a worker thread can call for itself.
     pub fn runtime_factory(&self) -> ply_core::RuntimeFactory {
         let host = Arc::clone(&self.host);
         Arc::new(move || host.runtime())
@@ -162,13 +146,11 @@ impl Hosts {
         Arc::clone(&self.binding)
     }
 
-    /// The code `process.exit` asked for, once the run is over.
     pub fn requested_exit(&self) -> Option<i32> {
         self.host.process()?.requested_exit()
     }
 }
 
-/// A binding no one observes: the launcher's own program's.
 impl ply_compiled::entry::Bound for Hosts {
     fn binding(&self) -> Arc<HostBinding> {
         Hosts::binding(self)
@@ -191,8 +173,6 @@ impl ply_compiled::entry::Bound for Hosts {
     }
 }
 
-/// The configuration a run is granted: each `config KEY VALUE secret|plain` entry, pinned where a
-/// `schema` entry names the function that requires it.
 fn configured(grants: &Grants) -> Arc<Snapshot> {
     let values = grants
         .named("config")

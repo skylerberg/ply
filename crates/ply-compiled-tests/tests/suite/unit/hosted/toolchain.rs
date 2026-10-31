@@ -2,8 +2,6 @@ use ply_compiled::hosted::toolchain::{ended, support_flags};
 use std::path::Path;
 use std::process::Command;
 
-/// A program a signal stops says nothing of it, so its runner does; one that exits says what its
-/// code does.
 #[test]
 fn a_program_stopped_by_a_signal_is_said_to_be() {
     let shell = Path::new("/bin/sh");
@@ -24,8 +22,6 @@ fn a_program_stopped_by_a_signal_is_said_to_be() {
     assert_eq!(ended(shell, exited), (3, None));
 }
 
-/// tcc finds `libtcc1.a` relative to `-B`; without it the compile succeeds and the object fails to
-/// load with an empty `dlerror`.
 #[test]
 fn a_tcc_that_is_not_installed_is_told_where_its_support_library_is() {
     let dir = tempfile::tempdir().expect("a scratch directory");

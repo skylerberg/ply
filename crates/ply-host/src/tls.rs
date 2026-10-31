@@ -1,5 +1,3 @@
-//! TLS credentials and sessions, terminated through rustls.
-
 use ply_core::{Diagnostic, Span, codes};
 use rustls::client::{ClientConnection, ResolvesClientCert};
 use rustls::crypto::CryptoProvider;
@@ -25,20 +23,15 @@ use std::time::{Duration, Instant, SystemTime};
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
 
-/// The root certificates `net.connect_tls` verifies a server against, beside any `--trust`.
 pub const ROOTS: &str = "webpki-roots";
 pub const ROOTS_VERSION: &str = "1.0.9";
 
-/// `ring`, not rustls's default `aws-lc-rs`, which needs a C toolchain and cmake on some platforms.
 pub const PROVIDER: &str = "ring";
 
-/// Exactly `http/1.1`: browsers offer `h2` first, and negotiating it then speaking 1.1 breaks them.
 pub const ALPN: [&str; 1] = ["http/1.1"];
 
-/// What `with_safe_default_protocol_versions` resolves to under `tls12`, in rustls's order.
 pub const VERSIONS: [&str; 2] = ["TLS 1.3", "TLS 1.2"];
 
-/// One `--tls NAME=CERT,KEY` argument, parsed but not yet loaded.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CredentialSpec {
     pub name: String,
@@ -72,16 +65,13 @@ fn malformed(text: &str, reason: &str) -> String {
     format!("`{text}` is not a TLS credential: {reason}; write `--tls NAME=CERT.pem,KEY.pem`")
 }
 
-/// A loaded credential; nothing outside this module can take the key back out.
 pub struct Credential {
     config: Arc<ServerConfig>,
-    /// SHA-256 of the first certificate's leaf, as `ply hosts` prints it.
     fingerprint: String,
     certificates: usize,
     chooser: Arc<Chooser>,
 }
 
-/// One certificate a credential responds with, and when its two files last changed.
 #[derive(Debug)]
 struct Loaded {
     spec: CredentialSpec,
@@ -89,21 +79,15 @@ struct Loaded {
     stamp: Option<(SystemTime, SystemTime)>,
 }
 
-/// The certificates one credential name holds: a handshake gets the first whose names cover the
-/// name its client asks for (SNI), or the first of all, and a certificate whose files change is
-/// read again, a look at most a second, so a renewed one is served without a restart. One that
-/// no longer loads leaves the one before it in place.
 #[derive(Debug)]
 pub struct Chooser {
     loaded: Mutex<Vec<Loaded>>,
     looked: Mutex<Instant>,
 }
 
-/// How often a chooser looks at its files.
 const RELOAD_LOOK: Duration = Duration::from_secs(1);
 
 impl Chooser {
-    /// Reads changed files again, at most once a `RELOAD_LOOK` unless `now`.
     fn refresh(&self, now: bool) {
         {
             let mut looked = lock(&self.looked);
@@ -124,12 +108,10 @@ impl Chooser {
         }
     }
 
-    /// Reads every file again now, whatever the clock says: what a test of reloading asks for.
     pub fn reload_now(&self) {
         self.refresh(true);
     }
 
-    /// The leaf each certificate responds with now, in the order given.
     pub fn leaves(&self) -> Vec<Vec<u8>> {
         lock(&self.loaded)
             .iter()
@@ -138,7 +120,6 @@ impl Chooser {
     }
 }
 
-/// A client presents the first certificate a credential holds, as a server asks for one.
 impl ResolvesClientCert for Chooser {
     fn resolve(
         &self,
@@ -168,7 +149,6 @@ impl ResolvesServerCert for Chooser {
     }
 }
 
-/// Whether `key`'s leaf names `name` among its subject alternative names.
 fn covers(key: &CertifiedKey, name: &ServerName<'_>) -> bool {
     key.end_entity_cert()
         .ok()
@@ -176,13 +156,11 @@ fn covers(key: &CertifiedKey, name: &ServerName<'_>) -> bool {
         .is_some_and(|leaf| leaf.verify_is_valid_for_subject_name(name).is_ok())
 }
 
-/// When a credential's two files last changed, where both can be looked at.
 fn stamp(spec: &CredentialSpec) -> Option<(SystemTime, SystemTime)> {
     let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
     Some((modified(&spec.certificate)?, modified(&spec.key)?))
 }
 
-/// A certificate chain and its key, read and checked to go together.
 struct Certified {
     key: Arc<CertifiedKey>,
     fingerprint: String,
@@ -197,7 +175,6 @@ fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
     let certificates = chain.len();
     let key =
         CertifiedKey::from_der(chain, key, &provider()).map_err(|e| err_mismatch(spec, &e))?;
-    // rustls rejects a key that does not match the leaf certificate's public key.
     key.keys_match().map_err(|e| err_mismatch(spec, &e))?;
     Ok(Certified {
         key: Arc::new(key),
@@ -215,12 +192,10 @@ impl Credential {
         self.certificates
     }
 
-    /// The certificates the name holds, as handshakes choose among them.
     pub fn chooser(&self) -> &Arc<Chooser> {
         &self.chooser
     }
 
-    /// The configuration a listener under this name responds with.
     pub fn config(&self) -> &Arc<ServerConfig> {
         &self.config
     }
@@ -229,11 +204,8 @@ impl Credential {
 #[derive(Default)]
 pub struct Credentials {
     entries: BTreeMap<String, Credential>,
-    /// What `net.connect_tls` verifies a server against.
     client: Option<Arc<ClientConfig>>,
-    /// The same, presenting each credential to a server that asks a client for a certificate.
     presenting: BTreeMap<String, Arc<ClientConfig>>,
-    /// The credentials whose listeners reject a client that presents no certificate.
     required: Vec<String>,
     trusted: usize,
 }
@@ -243,11 +215,6 @@ impl Credentials {
         Credentials::default()
     }
 
-    /// `trusted` names PEM files whose certificates `net.connect_tls` accepts beside the roots,
-    /// and which a listener verifies a client's certificate against: where there are any, every
-    /// listener asks a client for one, and serves a client that presents none unless `required`
-    /// names its credential (`--mtls`). A name given several times holds several certificates,
-    /// chosen among by the name a client asks for.
     pub fn load(
         specs: &[CredentialSpec],
         trusted: &[PathBuf],
@@ -325,14 +292,10 @@ impl Credentials {
         })
     }
 
-    /// Whether the listener of the credential `name` rejects a client that presents no certificate.
     pub fn requires_client(&self, name: &str) -> bool {
         self.required.iter().any(|r| r == name)
     }
 
-    /// The configuration `net.start_tls` verifies a server with, presenting the credential `name`
-    /// where the server asks for a client certificate; `E0429` naming the configured credentials
-    /// where the run holds none of that name.
     pub fn presenting(&self, name: &str, span: Span) -> Result<Arc<ClientConfig>, Diagnostic> {
         match self.presenting.get(name) {
             Some(config) => Ok(Arc::clone(config)),
@@ -340,12 +303,10 @@ impl Credentials {
         }
     }
 
-    /// How many trusted certificates join the roots.
     pub fn trusted(&self) -> usize {
         self.trusted
     }
 
-    /// The configuration `net.connect_tls` verifies a server with; built once per run.
     pub fn client(&self) -> Arc<ClientConfig> {
         match &self.client {
             Some(config) => Arc::clone(config),
@@ -366,7 +327,6 @@ impl Credentials {
         self.entries.iter().map(|(name, c)| (name.as_str(), c))
     }
 
-    /// The configuration a listener is built with, or `E0429` naming the configured credentials.
     pub fn resolve(&self, name: &str, span: Span) -> Result<Arc<ServerConfig>, Diagnostic> {
         match self.entries.get(name) {
             Some(credential) => Ok(Arc::clone(&credential.config)),
@@ -376,15 +336,11 @@ impl Credentials {
 }
 
 impl fmt::Debug for Credentials {
-    /// By name only, so no key material is printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.names()).finish()
     }
 }
 
-/// What every listener of a run shares: the client verifiers the trusted certificates make, one
-/// that serves a client presenting no certificate and one that rejects it, and one ticket key,
-/// which rotates, so a session one listener began resumes at another.
 struct Shared {
     verifier: Option<Arc<dyn ClientCertVerifier>>,
     requiring: Option<Arc<dyn ClientCertVerifier>>,
@@ -433,8 +389,6 @@ impl Shared {
     }
 }
 
-/// What verifies a client's certificate against `anchors`, none where there are none: one that
-/// serves a client presenting no certificate, or where `required` one that rejects it.
 fn client_verifier(
     anchors: &[CertificateDer<'static>],
     required: bool,
@@ -459,16 +413,12 @@ fn client_verifier(
     Ok(Some(built))
 }
 
-/// Sessions a listener keeps for resumption by id, besides those its tickets carry.
 const SESSIONS: usize = 1024;
 
-/// The provider, installed explicitly on each builder.
 pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// A client's configuration: the roots and `trusted` to verify a server against, and where
-/// `presenting` names a credential, its certificate for a server that asks for one.
 fn client_config(
     trusted: Vec<CertificateDer<'static>>,
     presenting: Option<Arc<Chooser>>,
@@ -496,7 +446,6 @@ fn client_config(
     Ok(Arc::new(config))
 }
 
-/// The certificates a PEM file holds, or why it holds none a caller can use.
 fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("it could not be read: {e}"))?;
     let chain: Result<Vec<CertificateDer<'static>>, io::Error> =
@@ -520,7 +469,6 @@ fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Diagnostic> {
     })
 }
 
-/// SHA-256 of the leaf's DER, through the provider's own hash rather than a second implementation.
 pub fn fingerprint(leaf: &CertificateDer<'_>) -> String {
     let Some(sha256) = provider()
         .cipher_suites
@@ -529,7 +477,6 @@ pub fn fingerprint(leaf: &CertificateDer<'_>) -> String {
         .map(|suite| suite.common.hash_provider)
         .find(|hash| hash.algorithm() == HashAlgorithm::SHA256)
     else {
-        // Unreachable with `ring`; not a panic, since no run should end over a listed fingerprint.
         return "sha256:unavailable".to_string();
     };
     let mut out = String::from("sha256:");
@@ -539,7 +486,6 @@ pub fn fingerprint(leaf: &CertificateDer<'_>) -> String {
     out
 }
 
-/// `Read + Write` by value over a shared stream, so `close` can shut it down under a parked read.
 struct Socket(Arc<TcpStream>);
 
 impl Read for Socket {
@@ -558,14 +504,12 @@ impl Write for Socket {
     }
 }
 
-/// The two ends a session can be; rustls types them apart.
 enum Stream {
     Server(StreamOwned<ServerConnection, Socket>),
     Client(StreamOwned<ClientConnection, Socket>),
 }
 
 impl Stream {
-    /// One round of the handshake, driven from outside the read/write path.
     fn complete_io(&mut self) -> io::Result<(usize, usize)> {
         match self {
             Stream::Server(s) => s.conn.complete_io(&mut s.sock),
@@ -580,8 +524,6 @@ impl Stream {
         }
     }
 
-    /// The far end's end-entity certificate as it presented it: a server's always, a client's where
-    /// it was asked for one and gave it.
     fn peer_leaf(&self) -> Option<Vec<u8>> {
         let chain = match self {
             Stream::Server(s) => s.conn.peer_certificates(),
@@ -597,7 +539,6 @@ impl Stream {
         }
     }
 
-    /// The application protocol the handshake agreed on.
     fn protocol(&self) -> Option<String> {
         let agreed = match self {
             Stream::Server(s) => s.conn.alpn_protocol(),
@@ -607,31 +548,24 @@ impl Stream {
     }
 }
 
-/// Why a handshake asked to complete within a deadline did not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unfinished {
     Expired,
-    /// One of the `REASON_` strings.
     Rejected(&'static str),
 }
 
-/// The configuration `config` with `alpn` as the protocols it offers, none when `alpn` is empty.
 pub fn client_offering(config: &ClientConfig, alpn: &[String]) -> Arc<ClientConfig> {
     let mut config = config.clone();
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     Arc::new(config)
 }
 
-/// The configuration `config` with `alpn` as the protocols it accepts; empty accepts a client
-/// whatever it offers and agrees on none.
 pub fn server_accepting(config: &ServerConfig, alpn: &[String]) -> Arc<ServerConfig> {
     let mut config = config.clone();
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     Arc::new(config)
 }
 
-/// Whether bytes are waiting to be read on a connection that is about to start a handshake as the
-/// client, where the server never speaks first: plaintext sent behind a go-ahead.
 pub fn plaintext_waiting(socket: &TcpStream) -> bool {
     if socket.set_nonblocking(true).is_err() {
         return false;
@@ -671,11 +605,7 @@ pub struct Session {
     socket: Arc<TcpStream>,
     session: Mutex<Option<Stream>>,
     handshakes: Arc<Handshakes>,
-    /// What the handshake took, once one has completed: microseconds, measured by whichever
-    /// operation got there first — `net.handshake`, or the read or write that needed the connection.
     took: Mutex<Option<u64>>,
-    /// The far end's certificate and the protocol the two agreed, kept once the handshake
-    /// completes, so reading them never waits on a read that holds the session.
     peer: Mutex<Option<Vec<u8>>>,
     agreed: Mutex<Option<String>>,
 }
@@ -692,7 +622,6 @@ impl Session {
         Session::started(started, socket, handshakes)
     }
 
-    /// The client end, verifying `name`; it handshakes on the first read or write, like a server.
     pub fn connect(
         config: Arc<ClientConfig>,
         name: ServerName<'static>,
@@ -723,8 +652,6 @@ impl Session {
         }
     }
 
-    /// A session that never starts: the connection is ended, counted under `reason`, and reads as
-    /// a peer done sending.
     pub fn rejected(
         socket: Arc<TcpStream>,
         handshakes: Arc<Handshakes>,
@@ -742,13 +669,10 @@ impl Session {
         }
     }
 
-    /// The application protocol the handshake agreed, once it has completed.
     pub fn protocol(&self) -> Option<String> {
         lock(&self.agreed).clone()
     }
 
-    /// What a completed handshake leaves to be read without the session: its length, the peer's
-    /// certificate and the protocol.
     fn finished(&self, stream: &Stream, took: u64) {
         lock(&self.took).get_or_insert(took);
         *lock(&self.peer) = stream.peer_leaf();
@@ -756,14 +680,10 @@ impl Session {
         self.handshakes.completed();
     }
 
-    /// The far end's end-entity certificate (DER) once the handshake has completed: the server's
-    /// on a client's session, and on a server's the client's where it presented one this run
-    /// verified. What RFC 5929's `tls-server-end-point` hashes.
     pub fn peer_certificate(&self) -> Option<Vec<u8>> {
         lock(&self.peer).clone()
     }
 
-    /// This end's address, which the session shares with the socket it runs over.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -772,14 +692,10 @@ impl Session {
         self.socket.peer_addr()
     }
 
-    /// The socket the session runs over, for the options that are the socket's.
     pub fn socket(&self) -> &TcpStream {
         &self.socket
     }
 
-    /// The handshake, completed within `timeout` in all, returning the application protocol it
-    /// agreed on. A handshake that does not complete ends the connection, a deadline included:
-    /// an upgrade that timed out has left bytes of a handshake on the wire.
     pub fn finish_within(&self, timeout: Duration) -> Result<Option<String>, Unfinished> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
@@ -819,14 +735,11 @@ impl Session {
         }
     }
 
-    /// Ends a session that will not be handshaken, counted under `reason`.
     pub fn refuse(&self, reason: &'static str) {
         let mut guard = lock(&self.session);
         self.finish(&mut guard, Some(reason));
     }
 
-    /// Ends this end's sending: `close_notify`, then the socket's write half. Reads go on until the
-    /// peer ends its own.
     pub fn close_write(&self) {
         let mut guard = lock(&self.session);
         if let Some(stream) = guard.as_mut() {
@@ -836,12 +749,6 @@ impl Session {
         let _ = self.socket.shutdown(Shutdown::Write);
     }
 
-    /// The handshake, completed now rather than when a request needs it, returning what it took in
-    /// microseconds.
-    ///
-    /// `None` when this connection has none to complete: a session whose configuration failed to
-    /// start, or one whose handshake failed, which closes the connection the way the read/write path
-    /// would. A session that already handshook returns what that earlier handshake took.
     pub fn handshake(&self) -> Option<u64> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
@@ -851,7 +758,6 @@ impl Session {
         }
         loop {
             match stream.complete_io() {
-                // Neither read nor wrote, and still handshaking: the peer is gone.
                 Ok((0, 0)) if stream.is_handshaking() => {
                     self.finish(&mut guard, Some(REASON_GONE));
                     return None;
@@ -871,17 +777,14 @@ impl Session {
         }
     }
 
-    /// The transport deadline every later operation on this session runs under.
     pub fn deadline(&self, timeout: Duration) {
         let _ = self.socket.set_read_timeout(Some(timeout));
         let _ = self.socket.set_write_timeout(Some(timeout));
     }
 
-    /// Up to `max` decrypted bytes: `None` on deadline, empty once the peer or session is gone.
     pub fn read(&self, max: usize) -> Option<Vec<u8>> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
-        // An ending, never a deadline: `None` would have the caller wait on a dead connection.
         let Some(stream) = guard.as_mut() else {
             return Some(Vec::new());
         };
@@ -906,7 +809,6 @@ impl Session {
         }
     }
 
-    /// The whole payload, or `0` for a connection that is finished.
     pub fn write(&self, payload: &[u8]) -> usize {
         let began = Instant::now();
         let mut guard = lock(&self.session);
@@ -938,8 +840,6 @@ impl Session {
         let _ = self.socket.shutdown(Shutdown::Both);
     }
 
-    /// A handshake that has just finished; `began` is when the operation that drove it started, so
-    /// the number is the handshake's own and not the wait before it.
     fn completed(&self, began: Instant, was_handshaking: bool, stream: &Stream) {
         if was_handshaking && !stream.is_handshaking() {
             self.finished(stream, began.elapsed().as_micros() as u64);
@@ -973,7 +873,6 @@ pub const REASON_NAME: &str =
     "the name is neither a DNS name nor an IP address, so no certificate can be verified as it";
 pub const REASON_OTHER: &str = "the TLS session failed";
 
-/// A deadline that expired, which is not an ending.
 fn expired(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -981,7 +880,6 @@ fn expired(error: &io::Error) -> bool {
     )
 }
 
-/// Why a handshake was rejected, as one of a fixed set of strings.
 pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
     if !handshaking {
         return REASON_TRANSPORT;
@@ -1043,7 +941,6 @@ impl Handshakes {
         *lock(&self.counts).rejected.entry(reason).or_default() += 1;
     }
 
-    /// Reasons sort by descending count, then text, so one failure always prints one order.
     pub fn snapshot(&self) -> HandshakeCounts {
         let counts = lock(&self.counts);
         let mut reasons: Vec<(&'static str, u64)> =
@@ -1070,7 +967,6 @@ impl HandshakeCounts {
     }
 }
 
-/// The guarded state has no invariant a panicking caller can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1106,7 +1002,6 @@ pub fn unknown_credential<'a>(
     diagnostic.note("the credential is named rather than passed as bytes, so that no private key enters a definition's hash or the content-addressed store")
 }
 
-/// Unreachable with `ring`, which supports both versions [`VERSIONS`] names.
 #[cold]
 fn err_configured(name: &str, error: &TlsError) -> Diagnostic {
     Diagnostic::error(

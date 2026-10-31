@@ -1,8 +1,3 @@
-//! What this runtime says of itself to a compiler that emits code for it, in the form
-//! `compiler.emit.abi.runtime_of` reads: what a unit emitted against it is a function of, each
-//! native and helper it binds with what its function's type takes and returns, where it lays out
-//! what emitted code reads in place, each as a named integer, and the diagnostic codes it raises.
-
 use super::prelude::{machine_natives, own_helpers};
 use crate::blocks::{self, Filling, Page, Segment};
 use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
@@ -13,17 +8,14 @@ use crate::rt::Ctx;
 use std::fmt::Write;
 use std::mem::{offset_of, size_of};
 
-/// Each native compiled code calls, under the name the compiler declares it by.
 pub fn natives() -> impl Iterator<Item = (&'static str, Signature)> {
     machine_natives().iter().map(|n| (n.name, n.signature))
 }
 
-/// The size of the field `field` borrows out of an `S`.
 fn field_bytes<S, F>(_field: fn(&S) -> &F) -> usize {
     size_of::<F>()
 }
 
-/// Each named field of `$s` as `$name.field.at` and `$name.field.bytes`, then `$name.bytes`.
 macro_rules! laid {
     ($out:ident, $s:ty as $name:literal: $($f:ident),* $(,)?) => {
         $(
@@ -37,9 +29,6 @@ macro_rules! laid {
     };
 }
 
-/// Where this runtime lays out what emitted code reads and writes in place, and the constants both
-/// read, each under the name `compiler.emit.abi.facts` gives it. Of the context, only the fields
-/// emitted code reads: a field it reads anew is named here.
 fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
     laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
@@ -91,9 +80,6 @@ fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
     out.push('\n');
 }
 
-/// This runtime, described: a line naming the form, then its identity, each native, each helper
-/// of its own, each fact and each diagnostic code it raises, a line each, its words apart by one
-/// space.
 pub fn described() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {

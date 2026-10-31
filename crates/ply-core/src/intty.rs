@@ -1,9 +1,5 @@
-//! Fixed-width integers, with the arithmetic the value model checks them with.
-
 use std::fmt;
 
-/// A fixed-width integer type; `Int` is not one. Arithmetic is checked unless `wrap_*` is used.
-/// The 128-bit widths come last, so each narrower width keeps its number in every format.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum IntTy {
     U8,
@@ -68,7 +64,6 @@ impl IntTy {
         )
     }
 
-    /// The largest value.
     pub fn max(self) -> u128 {
         if self.signed() {
             (1u128 << (self.bits() - 1)) - 1
@@ -77,22 +72,18 @@ impl IntTy {
         }
     }
 
-    /// The smallest value.
     pub fn min(self) -> i128 {
         if self.signed() {
-            // `i128::MIN` for `I128`, where the shift below would overflow.
             i128::MIN >> (128 - self.bits())
         } else {
             0
         }
     }
 
-    /// Whether `v` is one of this type's values.
     pub fn holds(self, v: i128) -> bool {
         v >= self.min() && (v < 0 || v as u128 <= self.max())
     }
 
-    /// Truncated to this width, then zero- or sign-extended; every `Fixed` is in this form.
     pub fn normalize(self, bits: u128) -> u128 {
         let w = self.bits();
         if w == 128 {
@@ -113,7 +104,6 @@ impl fmt::Display for IntTy {
     }
 }
 
-/// A fixed-width integer; its bits are always normalized, so derived `Eq` and `Hash` are by value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Fixed {
     pub ty: IntTy,
@@ -128,12 +118,10 @@ impl Fixed {
         }
     }
 
-    /// Truncated to the width and sign-extended past it.
     pub fn bits(self) -> u128 {
         self.bits
     }
 
-    /// The value, wherever an `i128` holds it: every width's but a `U128` past `i128::MAX`.
     pub fn to_i128(self) -> Option<i128> {
         if self.ty.signed() {
             Some(self.bits as i128)
@@ -142,7 +130,6 @@ impl Fixed {
         }
     }
 
-    /// The bits with nothing above this type's width.
     pub fn raw(self) -> u128 {
         if self.ty.bits() == 128 {
             self.bits

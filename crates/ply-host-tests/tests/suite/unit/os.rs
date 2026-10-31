@@ -1,6 +1,5 @@
 use ply_host::os::*;
 
-/// What a command of the system's own writes, without its ending.
 fn said(program: &str, args: &[&str]) -> String {
     let done = std::process::Command::new(program)
         .args(args)

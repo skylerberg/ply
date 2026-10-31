@@ -1,8 +1,5 @@
-//! The pack a native program carries after its code, read back as `ply bootstrap` lays it out.
-
 use std::io::Write;
 
-/// `files` laid out as a pack after `code`: their bytes, the table ascending by path, the trailer.
 fn binary(code: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut sorted = files.to_vec();
     sorted.sort_by_key(|(path, _)| *path);
@@ -119,7 +116,6 @@ fn a_cached_result_is_the_frame_a_range_of_the_cached_results_file_holds() {
         Some(b"another".to_vec())
     );
     assert_eq!(pack.result("index", 0, 0), Some(b"index".to_vec()));
-    // Not where a frame starts, past the file, or no file at all.
     assert_eq!(pack.result("store", 1, one.len()), None);
     assert_eq!(pack.result("store", one.len(), two.len() + 1), None);
     assert_eq!(pack.result("records", 0, 0), None);
@@ -169,7 +165,6 @@ fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
         ("compiler/infer.ply", b"q"),
         ("program/front", b"f"),
     ]));
-    // The program, and a file whose path only starts as a root's does, are no part of it.
     assert!(!moved(&[
         ("std/option.ply", b"a"),
         ("stdlib.txt", b"d"),
@@ -178,8 +173,6 @@ fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
     ]));
 }
 
-// A stage is named for the program, which reaches only some shipped modules: an edit to another,
-// or to a test in one, must still move the directory a rebuilt `ply` reads them from.
 #[test]
 fn a_stages_shipped_directory_moves_with_any_shipped_file() {
     let name = ply_launcher::shipped_dir_name;
@@ -208,7 +201,6 @@ fn a_torn_pack_is_rejected_rather_than_read() {
         "a trailer naming more than the binary holds"
     );
 
-    // The table claims a file runs past where the table begins.
     let mut overrun = whole.clone();
     let table_len = u64::from_le_bytes(overrun[trailer + 8..trailer + 16].try_into().unwrap());
     let table = trailer - table_len as usize;

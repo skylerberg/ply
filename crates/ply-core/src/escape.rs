@@ -1,9 +1,5 @@
-//! Escape enforcement at the boundaries the brand cannot see.
-
 use crate::{Diagnostic, Span, codes};
 
-/// What may not cross a boundary: a continuation, which no type records as one, and a task or a
-/// channel, which only the scheduler that made it can hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
     Continuation,
@@ -12,7 +8,6 @@ pub enum Handle {
 }
 
 impl Handle {
-    /// A continuation has no type of its own to name: its type is a function's.
     fn noun(self) -> &'static str {
         match self {
             Handle::Continuation => "a continuation",
@@ -34,7 +29,6 @@ impl Handle {
         }
     }
 
-    /// Why no type rejected it before the boundary did.
     fn unseen(self) -> &'static str {
         match self {
             Handle::Continuation => {
@@ -48,7 +42,6 @@ impl Handle {
         }
     }
 
-    /// What the program does instead, at an entry's result.
     fn instead(self) -> &'static str {
         match self {
             Handle::Continuation => {
@@ -66,7 +59,6 @@ impl Handle {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Escapee {
     pub handle: Handle,
-    /// Outermost first, e.g. `["item 2", "`Just`'s argument 1"]`.
     pub route: Vec<String>,
 }
 
@@ -114,7 +106,6 @@ impl Boundary<'_> {
     }
 }
 
-/// `escapee` rejected at `boundary`.
 #[cold]
 #[inline(never)]
 pub fn rejected(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {

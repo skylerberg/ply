@@ -1,6 +1,5 @@
 use ply_core::host::*;
 
-/// A run's binding keeps what the run is granted, which the natives of the host handlers read.
 #[test]
 fn a_granted_binding_keeps_what_its_run_is_granted() {
     let binding = HostBinding::granted(Grants::default().with("allow", &["toolchain"]));

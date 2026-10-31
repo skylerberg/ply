@@ -1,12 +1,6 @@
-//! The launcher's own `--count-allocations` flag.
-
-/// The counting allocator is a whole-binary decision, so this test binary installs it too, which
-/// is what makes the window tests meaningful here.
 #[global_allocator]
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
-/// The launcher's own flag, taken out of the line wherever it is written; the program parses
-/// what is left and never sees it.
 #[test]
 fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
     for line in [
@@ -56,9 +50,6 @@ fn a_line_without_the_flag_keeps_its_words() {
     assert_eq!(argv, vec!["run".to_string(), "p.ply".to_string()]);
 }
 
-/// One test, because a window is process-global: two tests taking windows at once would clobber
-/// each other's sites, which is fine for a launcher run (one entry, one window) and not for a
-/// suite that runs its tests in parallel.
 #[test]
 fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
     let (result, counted, sites) = ply_launcher::count::window(
@@ -75,11 +66,6 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
         sites.is_empty(),
         "no sites were asked for, so none were recorded"
     );
-    // The same work, attributed. Every allocation the window counted is attributed to a site, and
-    // the walk's own allocations are neither: they are the instrument's, not the program's. That
-    // makes the rows a *complete* breakdown of the total — an allocation counted but not
-    // attributed is exactly the bug worth catching (the walker's `Vec` growth used to be counted
-    // in the total and left out of every row).
     let (_, counted, sites) = ply_launcher::count::window(
         || {
             let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
@@ -99,9 +85,6 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
         bytes, counted.bytes,
         "the rows' bytes are the window's bytes"
     );
-    // And the same work again at the run's default sample: every allocation is still counted, one
-    // in `SAMPLED` is walked, and the rows come back scaled up so they read in the totals' units.
-    // Their sum is near the total rather than equal to it, which is the trade the report states.
     let (result, counted, sites) = ply_launcher::count::window_sampled(
         || {
             let mut v: Vec<Vec<u64>> = Vec::new();
@@ -135,9 +118,6 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
     );
 }
 
-/// The flags that ask for sites: plain ones sample — the walk is the whole cost of a site census —
-/// and `-exact` walks every allocation. The stronger request wins wherever it stands, and asking
-/// for sites at all still means sites.
 #[test]
 fn the_sites_flags_choose_between_every_allocation_and_a_sample() {
     for (line, exact) in [
@@ -176,9 +156,6 @@ fn the_sites_flags_choose_between_every_allocation_and_a_sample() {
     }
 }
 
-/// A sample of every `n`th allocation would alias with a program that allocates exactly `n` times
-/// around an iteration — the same site every time, which is the one thing a site census must not
-/// do. The sample is spread instead.
 #[test]
 fn the_sample_does_not_fall_on_one_period_of_the_window() {
     let every = ply_launcher::count::SAMPLED;

@@ -1,10 +1,3 @@
-//! The flat format the runtime and `std.machine` exchange machine data in: `std.bin`'s encoding of
-//! a sequence of primitives, which the module reads into its own types and the runtime writes and
-//! reads by position, naming nothing. A count or a tag is a LEB128 varint, an integer its zigzag as
-//! one, a `Bool` one byte, a `Float` its bits as eight bytes little-endian, bytes and text a count
-//! and the bytes, a list a count and its items, an option a tag (0 none, 1 some) and its value.
-
-/// Bytes being written.
 #[derive(Default)]
 pub struct Writer {
     bytes: Vec<u8>,
@@ -32,7 +25,6 @@ impl Writer {
         self.varint(((n << 1) ^ (n >> 63)) as u64)
     }
 
-    /// A count or a figure as an `Int`, which none here has past `i64::MAX`.
     pub fn count(&mut self, n: u64) -> &mut Writer {
         self.int(i64::try_from(n).unwrap_or(i64::MAX))
     }
@@ -56,13 +48,11 @@ impl Writer {
         self.bytes(s.as_bytes())
     }
 
-    /// What another writer of this format wrote, as part of what this one writes.
     pub fn written(&mut self, b: &[u8]) -> &mut Writer {
         self.bytes.extend_from_slice(b);
         self
     }
 
-    /// An option: none, or `write` of its value.
     pub fn option<T>(&mut self, v: Option<T>, write: impl FnOnce(&mut Writer, T)) -> &mut Writer {
         match v {
             None => {
@@ -76,7 +66,6 @@ impl Writer {
         self
     }
 
-    /// A list: its count, and `write` of each item.
     pub fn list<T>(
         &mut self,
         items: impl ExactSizeIterator<Item = T>,
@@ -90,7 +79,6 @@ impl Writer {
     }
 }
 
-/// Bytes being read, each read rejecting what no writer of the format writes.
 pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -101,7 +89,6 @@ impl<'a> Reader<'a> {
         Reader { bytes, at: 0 }
     }
 
-    /// Rejects bytes left over.
     pub fn end(&self) -> Result<(), String> {
         if self.at == self.bytes.len() {
             Ok(())
@@ -131,13 +118,11 @@ impl<'a> Reader<'a> {
         Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
     }
 
-    /// An `Int` that is a count or a figure: never below 0.
     pub fn count(&mut self) -> Result<u64, String> {
         let at = self.at;
         u64::try_from(self.int()?).map_err(|_| format!("a negative count at {at}"))
     }
 
-    /// A tag below `count`.
     pub fn tag(&mut self, count: u64) -> Result<u64, String> {
         let at = self.at;
         let t = self.varint()?;
@@ -158,7 +143,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// The length of what follows, which the bytes left hold.
     fn length(&mut self) -> Result<usize, String> {
         let at = self.at;
         let n = self.varint()?;

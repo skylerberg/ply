@@ -1,5 +1,3 @@
-//! `ply-compiled`'s unit tests; the module tree mirrors `crates/ply-compiled/src`.
-
 mod blocks;
 mod c;
 mod detached;

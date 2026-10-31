@@ -35,7 +35,6 @@ fn allocations_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, ALLOCS.with(Cell::get))
 }
 
-/// A clock nobody may read without it being visible.
 #[derive(Default)]
 struct CountedClock(AtomicU64);
 
@@ -49,8 +48,6 @@ struct Bench {
     trace: Arc<Trace>,
     clock: Arc<CountedClock>,
     owner: Owner,
-    /// Three fields, which is what an endpoint's event actually carries, read once outside the
-    /// measurement as the native reads them.
     fields: Vec<(String, Field)>,
 }
 
@@ -114,8 +111,6 @@ impl Bench {
 
 const EVENTS: usize = 1_000;
 
-/// Warm first: a first call through `dyn` may fault in a page; the steady state is what is
-/// measured.
 fn steady(times: usize, mut each: impl FnMut()) -> usize {
     for _ in 0..16 {
         each();
@@ -164,7 +159,6 @@ fn a_debug_event_under_a_warn_filter_costs_what_a_discarded_one_costs() {
     assert_eq!(b.clock_reads(), 0, "a filtered event is not stamped");
 }
 
-/// It costs the stack entry its `exit` is checked against, which is not the sink's.
 #[test]
 fn a_discarded_span_costs_less_than_a_collected_one_and_reads_no_clock() {
     const SPANS: usize = 200;
@@ -186,7 +180,6 @@ fn a_discarded_span_costs_less_than_a_collected_one_and_reads_no_clock() {
     assert_eq!(discarded.trace.open_spans(), 0, "every span was closed");
 }
 
-/// The collected cost, for the discarded ones to be read against.
 #[test]
 fn a_collected_event_pays_for_the_record_it_asked_for() {
     let sink = Arc::new(ply_host::trace::sink::Recording::new(Level::Debug));

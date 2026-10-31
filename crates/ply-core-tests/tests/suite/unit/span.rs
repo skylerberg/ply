@@ -7,7 +7,6 @@ fn line_col_is_one_based_and_char_counted() {
     let f = sm.get(id).unwrap();
     assert_eq!(f.line_col(0), (1, 1));
     assert_eq!(f.line_col(4), (2, 1));
-    // `é` is two bytes; the column after it is still counted in chars.
     assert_eq!(f.line_col(7), (2, 3));
 }
 
@@ -24,8 +23,6 @@ fn a_span_is_bounded_by_its_texts_length_alone() {
     assert_eq!(sm.snippet(halved), "\u{fffd}");
 }
 
-/// What `ply` prints for a failure no program is there to render: the heading, a line per note and
-/// per fix, and no label, since nothing holds the source a label points into.
 #[test]
 fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
     let d = Diagnostic::error(
@@ -56,8 +53,6 @@ fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
     );
 }
 
-/// Placed for a reader that will not hold the sources: each label that lands in one keeps its place
-/// as a note, and a label outside them is dropped rather than misplaced.
 #[test]
 fn a_placed_diagnostic_keeps_each_label_it_can_place_as_a_note() {
     let mut sources = SourceMap::new();

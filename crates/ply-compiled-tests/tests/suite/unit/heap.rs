@@ -7,18 +7,14 @@ use ply_compiled::heap::{
 use ply_compiled::rt::Ctx;
 use std::sync::Arc;
 
-/// A block of `payload` bytes past its header, from `h`: its word, which a `Block` is.
 fn block(h: &mut Heap, payload: usize) -> Word {
     unsafe { std::mem::transmute::<Block, Word>(Block::alloc(h, (HEADER + payload) as Word)) }
 }
 
-/// Gives back the block `w` of `payload` bytes past its header to `h`, the heap the entry runs on.
 fn freed(h: &mut Heap, w: Word, payload: usize) {
     unsafe { std::mem::transmute::<Word, Block>(w).free(h, (HEADER + payload) as Word) }
 }
 
-/// What a native object holds in these tests: text, whose count of holders says how many native
-/// objects holding it are not yet dropped.
 pub(super) struct Holding(pub(super) Arc<str>);
 
 impl Native for Holding {
@@ -29,7 +25,6 @@ fn holding(text: &str) -> Box<dyn Native> {
     Box::new(Holding(Arc::from(text)))
 }
 
-/// The text the native object `w` holds.
 fn held_by(w: Word) -> Arc<str> {
     let held = unsafe { native_of::<Holding>(w) }.expect("a native object holding text");
     Arc::clone(&held.0)
@@ -47,7 +42,6 @@ fn an_ended_entry_gives_back_what_it_held() {
     assert_eq!(h.live(), 1, "an ended heap allocates afresh");
 }
 
-/// A block is its size rounded up by an eighth at most, and a page ends short of one more.
 #[test]
 fn a_heap_holds_little_more_than_its_blocks_take() {
     let mut h = Heap::new();
@@ -61,7 +55,6 @@ fn a_heap_holds_little_more_than_its_blocks_take() {
     assert_eq!(big.held(), (1 << 20) + HEADER);
 }
 
-/// What blocks of one size held serves blocks of another once every block beside them is given back.
 #[test]
 fn memory_one_size_gave_up_serves_another() {
     let mut h = Heap::new();
@@ -112,7 +105,6 @@ fn a_dead_native_objects_block_is_the_next_native_objects() {
     assert_eq!(ctx.heap.natives(), 1);
 }
 
-/// The end drops what the table lists, so a block listed twice would drop what it holds twice.
 #[test]
 fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
     let mut ctx = context();
@@ -145,14 +137,12 @@ fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
         assert!(Arc::ptr_eq(&held_by(words[i]), &held));
     }
 
-    // Out of listing order, so removals move entries into the holes they leave.
     for w in [reused[1], words[6], reused[3], words[1], reused[0]] {
         release_object(&raw mut ctx, w);
     }
     assert_eq!(ctx.heap.natives(), 3);
     assert_eq!(Arc::strong_count(&held), 3);
 
-    // Let go under another context, the block cannot go back to its heap, so it stays listed, dead.
     let mut other = context();
     release_object(&raw mut other, words[5]);
     assert_eq!(ctx.heap.natives(), 3);
@@ -166,7 +156,6 @@ fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
     );
 }
 
-/// Derived, because a filter naming no test runs nothing and exits 0, which reads as a pass.
 fn own_test_name(leaf: &str) -> String {
     match module_path!().split_once("::") {
         Some((_binary, module)) => format!("{module}::{leaf}"),
@@ -174,7 +163,6 @@ fn own_test_name(leaf: &str) -> String {
     }
 }
 
-/// `PLY_HEAP_POISON` is read once per process, so the poisoned heap runs in a process of its own.
 #[test]
 fn under_poisoning_a_stale_word_that_reaches_a_reused_native_object_block_is_caught() {
     let name = own_test_name("a_stale_word_meets_a_reused_native_object_block_poisoned");
@@ -220,7 +208,6 @@ fn a_stale_word_meets_a_reused_native_object_block_poisoned() {
     held_by(stale);
 }
 
-/// A block another heap gave out goes back to it, not to the heap of the entry running.
 #[test]
 fn a_block_dying_under_another_heap_goes_back_to_its_own() {
     let mut outer = Heap::new();
@@ -240,8 +227,6 @@ fn a_block_dying_under_another_heap_goes_back_to_its_own() {
     outer.end();
 }
 
-/// A branch's blocks are the parent's once it adopts the branch's heap, and the parent keeps
-/// bumping where it was; the branch's native objects join the parent's table after its own.
 #[test]
 fn an_adopted_heap_keeps_its_blocks_and_its_native_objects() {
     let mut ctx = context();

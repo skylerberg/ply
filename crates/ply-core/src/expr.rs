@@ -1,6 +1,3 @@
-//! The binary operators compiled code hands the runtime, and how a `Float` is written.
-
-/// The shortest text that reads back as this `f64`, always distinguishable from an integer.
 pub fn render_float(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -8,7 +5,6 @@ pub fn render_float(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
-    // `{}` is always positional, so `1e300` would print every digit.
     let positional = format!("{f}");
     let exponential = format!("{f:e}");
     let text = if exponential.len() < positional.len() {
@@ -39,7 +35,6 @@ pub enum BinOp {
     And,
     Or,
     Concat,
-    /// `Int` only. `Shl` discards what it shifts out; a shift count outside `0..=63` raises.
     BitAnd,
     BitOr,
     BitXor,
@@ -49,7 +44,6 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// The operator as it is written, for a diagnostic that quotes it.
     pub fn text(self) -> &'static str {
         match self {
             BinOp::Add => "+",

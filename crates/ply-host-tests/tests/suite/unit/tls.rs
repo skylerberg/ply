@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
-/// A certificate and key on disk, and the DER a client trusts them by.
 struct Material {
     dir: tempfile::TempDir,
     certificate: PathBuf,
@@ -22,7 +21,6 @@ struct Material {
     der: rustls::pki_types::CertificateDer<'static>,
 }
 
-/// Generated, not checked in: a committed certificate is either expired or ships its private key.
 fn material() -> Material {
     let dir = tempfile::tempdir().expect("a temp dir");
     let issued = ply_host::certgen::issue(&[]).expect("a certificate is issued");
@@ -81,7 +79,6 @@ fn a_generated_certificate_loads_and_is_reported_by_name_and_fingerprint() {
         "an operator compares this against `openssl x509 -fingerprint -sha256`: {}",
         credential.fingerprint()
     );
-    // 32 bytes of hex, and the same value twice: the listing is diffed in CI.
     assert_eq!(credential.fingerprint().len(), "sha256:".len() + 64);
     let again = material.credentials("api");
     assert_eq!(
@@ -106,7 +103,6 @@ fn a_key_that_does_not_match_the_leaf_is_rejected_before_anything_runs() {
         "{}",
         diagnostic.message
     );
-    // Both files, because either one could be the one that is wrong.
     assert!(
         diagnostic.message.contains("cert.pem"),
         "{}",
@@ -152,7 +148,6 @@ fn a_malformed_pem_a_certificate_free_file_and_a_key_free_file_are_each_rejected
         rejected.message
     );
 
-    // Valid PEM, wrong contents: the key file offered where a chain was wanted.
     let empty = one(load(CredentialSpec {
         name: "api".to_string(),
         certificate: material.key.clone(),
@@ -196,7 +191,6 @@ fn every_credential_that_fails_is_reported_rather_than_the_first() {
     );
 }
 
-/// A certificate for `names` written beside the others in `dir`, under `stem`.
 fn issued_into(
     dir: &std::path::Path,
     stem: &str,
@@ -222,7 +216,6 @@ fn der_of(issued: &ply_host::certgen::Issued) -> rustls::pki_types::CertificateD
     rustls::pki_types::CertificateDer::from(issued.der.clone())
 }
 
-/// A client that trusts `trusted`, and presents `own` where it is given one.
 fn client_trusting(
     trusted: &[&ply_host::certgen::Issued],
     own: Option<&ply_host::certgen::Issued>,
@@ -249,15 +242,12 @@ fn client_trusting(
     Arc::new(config)
 }
 
-/// A handshake between the two over buffers, and what each end ended with: the server's
-/// connection and the client's.
 fn shaken(
     server: &Arc<ServerConfig>,
     client: &Arc<ClientConfig>,
     name: &str,
 ) -> (rustls::Connection, rustls::Connection) {
     let (mut s, mut c) = ends(server, client, name);
-    // Enough rounds for the handshake and the tickets a TLS 1.3 server sends after it.
     for _ in 0..8 {
         pump(&mut c, &mut s);
         pump(&mut s, &mut c);
@@ -269,7 +259,6 @@ fn shaken(
     (s, c)
 }
 
-/// The error a handshake between the two ends with, whichever end rejected.
 fn rejection(server: &Arc<ServerConfig>, client: &Arc<ClientConfig>, name: &str) -> TlsError {
     let (mut s, mut c) = ends(server, client, name);
     for _ in 0..8 {
@@ -280,7 +269,6 @@ fn rejection(server: &Arc<ServerConfig>, client: &Arc<ClientConfig>, name: &str)
     panic!("the handshake completed")
 }
 
-/// A server's connection and a client's, before either has written.
 fn ends(
     server: &Arc<ServerConfig>,
     client: &Arc<ClientConfig>,
@@ -299,7 +287,6 @@ fn pump(from: &mut rustls::Connection, to: &mut rustls::Connection) {
     passed(from, to).expect("the peer's records are good");
 }
 
-/// What `from` has to write, read by `to`, or the error `to` rejected it with.
 fn passed(from: &mut rustls::Connection, to: &mut rustls::Connection) -> Result<(), TlsError> {
     let mut wire = Vec::new();
     while from.wants_write() {
@@ -367,7 +354,6 @@ fn a_certificate_whose_files_change_is_served_anew_without_a_restart() {
             .and_then(|chain| chain.first().cloned()),
         Some(der_of(&after))
     );
-    // A file that no longer loads leaves the certificate before it in place.
     std::fs::write(&spec.key, "not a key").expect("the key is spoiled");
     std::fs::File::options()
         .write(true)
@@ -532,7 +518,6 @@ fn a_secured_session_keeps_the_certificate_its_peer_presented() {
     );
     assert_eq!(session.protocol(), None);
     assert!(session.handshake().is_some());
-    // The client presented none, and this run trusts none to ask for.
     assert_eq!(session.peer_certificate(), None);
     assert_eq!(session.protocol(), Some("http/1.1".to_string()));
     let mut request = Vec::new();
@@ -566,7 +551,6 @@ fn the_argument_shape_is_a_usage_error_with_the_form_in_it() {
     }
 }
 
-/// The fix is a `--tls` argument, so the diagnostic says what the run was given.
 #[test]
 fn an_unconfigured_credential_lists_the_ones_there_are() {
     let material = material();
@@ -608,7 +592,6 @@ fn an_unconfigured_credential_lists_the_ones_there_are() {
     );
 }
 
-/// A `Debug` that could print key material is a key that gets printed.
 #[test]
 fn nothing_about_a_credential_renders_its_key() {
     let material = material();
@@ -620,7 +603,6 @@ fn nothing_about_a_credential_renders_its_key() {
     }
 }
 
-/// Trusts exactly the generated certificate, so a round trip proves verification was on.
 fn client(der: &rustls::pki_types::CertificateDer<'static>, alpn: &[&str]) -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.add(der.clone()).expect("the generated certificate");
@@ -657,7 +639,6 @@ impl Peer {
         self.listener.local_addr().expect("a bound port").port()
     }
 
-    /// No I/O: `accept` never handshakes, so a client sending garbage cannot take the loop down.
     fn accept(&self) -> Session {
         let (stream, _) = self.listener.accept().expect("a connection");
         Session::new(
@@ -724,7 +705,6 @@ fn a_request_over_tls_reads_and_writes_the_same_bytes_the_plaintext_path_would()
     assert!(counts.reasons.is_empty());
 
     session.close();
-    // End of stream is not a one-shot result, and a closed session never wakes.
     assert_eq!(session.read(64), Some(Vec::new()));
     assert_eq!(session.write(RESPONSE), 0);
 }
@@ -748,7 +728,6 @@ fn a_client_offering_only_h2_is_rejected_and_one_offering_http_1_1_is_served() {
     assert_eq!(counts.completed, 0);
     assert_eq!(counts.reasons, [(REASON_ALPN, 1)]);
 
-    // The listener survives: the half of the claim one rejected connection cannot show.
     let client = speak(
         peer.port(),
         material.der.clone(),
@@ -779,7 +758,6 @@ fn a_peer_that_does_not_speak_tls_closes_that_connection_and_nothing_else() {
     let plaintext = std::thread::spawn(move || {
         let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let _ = socket.write_all(REQUEST);
-        // Held open so the server's response is a rejection rather than an EOF.
         std::thread::sleep(std::time::Duration::from_millis(50));
     });
 
@@ -816,7 +794,6 @@ fn a_client_that_disconnects_mid_handshake_is_counted_as_the_peer_going_away() {
     assert_eq!(counts.reasons, [(REASON_GONE, 1)]);
 }
 
-/// Nothing reached the program and rustls keeps its partial record, so the next read resumes.
 #[test]
 fn a_read_deadline_returns_none_and_leaves_the_session_open() {
     let material = material();
@@ -829,7 +806,6 @@ fn a_read_deadline_returns_none_and_leaves_the_session_open() {
         let connection = ClientConnection::new(config, name).expect("a client connection");
         let socket = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let mut stream = StreamOwned::new(connection, socket);
-        // Handshake, stay silent past the server's read deadline, then send the request.
         stream.flush().expect("the handshake completes");
         std::thread::sleep(std::time::Duration::from_millis(300));
         stream.write_all(REQUEST).expect("the request is written");
@@ -858,7 +834,6 @@ fn a_read_deadline_returns_none_and_leaves_the_session_open() {
     assert_eq!(peer.handshakes.snapshot().rejected, 0);
 }
 
-/// A security property: they key a run-long map, and rustls's error text embeds peer-chosen values.
 #[test]
 fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
     let cases = [
@@ -896,16 +871,13 @@ fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
         assert_eq!(reason(true, &wrapped), expected, "{error:?}");
     }
 
-    // Without the versions, "unsupported" is a sentence a reader cannot act on.
     assert!(REASON_VERSION.contains("TLS 1.3") && REASON_VERSION.contains("TLS 1.2"));
     assert!(REASON_ALPN.contains("http/1.1"));
 
-    // Past the handshake it is a transport failure; counting it rejected would inflate the summary.
     let after = io::Error::new(io::ErrorKind::InvalidData, TlsError::DecryptError);
     assert_eq!(reason(false, &after), REASON_TRANSPORT);
 }
 
-/// The summary reports this count, so its order must not depend on which failure came first.
 #[test]
 fn the_reasons_are_reported_most_frequent_first_and_then_alphabetically() {
     let handshakes = Handshakes::default();
@@ -943,12 +915,10 @@ fn the_listing_names_the_version_that_is_actually_linked() {
         VERSION, resolved,
         "`ply hosts` would print {VERSION} for a build linking {resolved}"
     );
-    // `cargo search` surfaces a `-dev` pre-release, which the trusted computing base must not use.
     assert!(!resolved.contains("dev"), "{resolved} is a pre-release");
     assert!(resolved.starts_with("0.23."), "{resolved}");
 }
 
-/// The provider goes on the builder, never the process-wide default another library may install.
 #[test]
 fn the_provider_is_the_one_this_module_names() {
     assert_eq!(PROVIDER, "ring");
@@ -957,7 +927,6 @@ fn the_provider_is_the_one_this_module_names() {
         "a process-wide default provider was installed, and `ply hosts` names one that was not consulted"
     );
     let material = material();
-    // `Credentials::load` would have failed had it needed the process default.
     assert!(!material.credentials("api").is_empty());
 }
 
@@ -965,7 +934,6 @@ fn the_provider_is_the_one_this_module_names() {
 fn two_operations_on_one_session_serialise_rather_than_interleave() {
     let material = material();
     let peer = peer(&material);
-    // The client reads every byte, so no write races a departed peer and the count is exact.
     let client = speak(
         peer.port(),
         material.der.clone(),

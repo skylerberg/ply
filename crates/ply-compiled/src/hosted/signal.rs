@@ -1,6 +1,3 @@
-//! `std.signal`'s natives: the stop the run listens for, where it listens for one, and the
-//! signals the process is asked about.
-
 use super::{Nondeterministic, asked, from_host, handed};
 use crate::c::{MachineNative, machine_native};
 use crate::native::I64;
@@ -24,7 +21,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// 1 where the run has been asked to stop; a run that listens for no stop never has.
 pub unsafe extern "C" fn rt_signal_stopping(ctx: *mut Ctx) -> I64 {
     asked(
         ctx,
@@ -40,7 +36,6 @@ pub unsafe extern "C" fn rt_signal_stopping(ctx: *mut Ctx) -> I64 {
     )
 }
 
-/// The milliseconds the drain has left, and -1 while nothing has asked the run to stop.
 pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
     asked(
         ctx,
@@ -56,9 +51,6 @@ pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
     )
 }
 
-/// 1 where the signal numbered `which` (`SIGHUP` 0, `SIGUSR1` 1, `SIGUSR2` 2, `SIGWINCH` 3) has
-/// arrived since it was last asked about. An ask takes the arrival it returns. A run that listens
-/// for no stop hears no signal, and its ask installs nothing.
 pub unsafe extern "C" fn rt_signal_arrived(ctx: *mut Ctx, which: I64) -> I64 {
     asked(
         ctx,

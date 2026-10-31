@@ -1,7 +1,3 @@
-//! Frame records walked as the runtime walks them: records laid by hand where a stopped
-//! computation's frames would be, between its stack pointer and its stack's top, and a runtime
-//! frame's record holding a value of every kind it may hold.
-
 use super::heap::Holding;
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
@@ -16,20 +12,15 @@ use std::sync::Arc;
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 
-/// A box: a block of one word, a marker the box is told apart by.
 const BOX: Word = (HEADER + 8) as Word;
 
-/// A closure: a block of its descriptor, a marker, and a box it captures.
 const CLOSURE: Word = (HEADER + 8 * 3) as Word;
 
 thread_local! {
-    /// The markers of the blocks released, in the order they went.
     static FREED: RefCell<Vec<Word>> = const { RefCell::new(Vec::new()) };
-    /// Each record's one slot and the `d` its `each` was called with.
     static WALKED: RefCell<Vec<(Word, i64)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The markers of the blocks released since the last call, least first.
 pub(super) fn freed() -> Vec<Word> {
     let mut freed = FREED.with(|f| std::mem::take(&mut *f.borrow_mut()));
     freed.sort_unstable();
@@ -40,7 +31,6 @@ fn walked() -> Vec<(Word, i64)> {
     WALKED.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
-/// The count at a block's offset 0.
 pub(super) fn count(w: Word) -> u32 {
     unsafe { *(w as *const u32) }
 }
@@ -59,7 +49,6 @@ pub(super) fn dup(w: Word) {
     unsafe { *(w as *mut u32) += 1 };
 }
 
-/// One holder fewer of a box, as a box's drop root counts one: the last frees it.
 pub(super) fn release_box(ctx: *mut Ctx, w: Word) {
     unsafe {
         if count(w) > 1 {
@@ -89,7 +78,6 @@ unsafe extern "C" fn nothing(_ctx: *mut Ctx) -> Word {
     0
 }
 
-/// `type#m.Box`, which counts a box as emitted code does.
 static COUNTED: PlyType = PlyType {
     identity: 1,
     spelled: b"m.Box".as_ptr(),
@@ -104,7 +92,6 @@ unsafe extern "C" fn uncalled(_ctx: *mut Ctx, _block: Word, _args: *const Word) 
     unreachable!("nothing here calls a closure")
 }
 
-/// A closure's release entry: its captured box, then its block.
 unsafe extern "C" fn closure_released(ctx: *mut Ctx, h: Handed) -> Word {
     let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
     unsafe {
@@ -124,7 +111,6 @@ static CLOSES_OVER_A_BOX: PlyFnDesc = PlyFnDesc {
     keep: unread,
 };
 
-/// A closure told apart by `marker`, holding `capture`.
 fn closure(ctx: *mut Ctx, marker: Word, capture: Word) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, CLOSURE) };
     unsafe {
@@ -135,8 +121,6 @@ fn closure(ctx: *mut Ctx, marker: Word, capture: Word) -> Word {
     w
 }
 
-/// A closure over a box, a carried box and a native object holding `text`, as a runtime frame holds
-/// them, and their words, for the test to count.
 pub(super) fn every_kind(
     ctx: *mut Ctx,
     markers: [Word; 3],
@@ -161,15 +145,12 @@ unsafe extern "C" fn logged(_ctx: *mut Ctx, slots: *mut Word, d: i64) {
     WALKED.with(|w| w.borrow_mut().push((slot, d)));
 }
 
-/// A record and its one slot, as a compiled frame lays them out.
 #[repr(C)]
 struct Record {
     h: PlyFrame,
     slot: Word,
 }
 
-/// Lays three records on `stack` as three frames between `sp` and the top would hold them, slots
-/// 1 to 3 from the outermost in, and returns the innermost.
 fn laid(stack: &Stack, sp: usize) -> *mut PlyFrame {
     let top = stack.top();
     let mut below = base();
@@ -198,7 +179,6 @@ fn the_chain_head_follows_the_eight_fields_every_unit_reads_and_a_record_is_two_
     assert_eq!(offset_of!(PlyFrame, each), 8);
 }
 
-/// A body abandoned at a stop lets go of what its live records hold, innermost first.
 #[test]
 fn a_live_chain_released_lets_go_of_every_record_once() {
     let mut ctx = context();
@@ -217,8 +197,6 @@ fn a_chain_with_no_record_walks_nothing() {
     assert!(walked().is_empty());
 }
 
-/// A runtime frame's record lets go of a closure through its descriptor, a carried value through
-/// its type and a handle as a handle, and gives each back to the frame when its call returns.
 #[test]
 fn a_runtime_frames_record_lets_go_of_each_slot_as_its_kind_is_counted() {
     let mut owned = context();
@@ -226,7 +204,6 @@ fn a_runtime_frames_record_lets_go_of_each_slot_as_its_kind_is_counted() {
     let ctx = &raw mut owned;
     let text: Arc<str> = Arc::from("held");
     let (held, words) = every_kind(ctx, [5, 2, 3], &text);
-    // Each held once more, so the record's letting go leaves the frame's own.
     words.iter().copied().for_each(dup);
     let (seen, back) = unsafe {
         held_across(ctx, held, || {
@@ -250,8 +227,6 @@ fn a_runtime_frames_record_lets_go_of_each_slot_as_its_kind_is_counted() {
     assert_eq!(unsafe { (*ctx).heap.live() }, 0);
 }
 
-/// A frame abandoned under its call never returns to let go of what it held: the walk does, as each
-/// is released.
 #[test]
 fn a_runtime_frame_abandoned_under_its_call_lets_go_of_each_slot_once() {
     let mut owned = context();

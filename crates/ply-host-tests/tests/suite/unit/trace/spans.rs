@@ -88,7 +88,6 @@ fn two_tasks_of_one_machine_keep_separate_stacks() {
     );
     assert_eq!(spans.innermost(second), (b, 0));
 
-    // Interleaved: the second task closes first, and neither closes the other's.
     let closed = spans
         .exit(second, b, &channel("http"), Outcome::Ok)
         .unwrap_or_else(|_| panic!("task 2's span is open"));
@@ -116,7 +115,6 @@ fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
         diagnostic.notes.iter().any(|n| n.contains("task @1")),
         "the rejection must name the task that holds it: {diagnostic:?}"
     );
-    // And the span is still open, because rejecting is not closing.
     assert_eq!(spans.depth(first), 1);
 }
 
@@ -139,7 +137,6 @@ fn the_three_ways_an_exit_names_a_span_that_is_not_open_are_told_apart() {
     };
     assert!(matches!(never, Unbalanced::NeverOpened));
 
-    // A forged `Span` whose id collides with an open one on another channel.
     let again = enter(&mut spans, owner, "http", "request");
     let Err(elsewhere) = spans.exit(owner, again, &channel("orders"), Outcome::Ok) else {
         panic!("the channel disagrees");
@@ -170,7 +167,6 @@ fn teardown_closes_this_machines_spans_and_leaves_every_other_machines_alone() {
     assert!(warning.message.contains('2'), "{}", warning.message);
 }
 
-/// Innermost first, so the warning names the span the computation was actually inside.
 #[test]
 fn teardown_reports_the_innermost_span_first() {
     let mut spans = Spans::new();
@@ -221,7 +217,6 @@ fn a_retired_task_closes_its_own_spans_innermost_first_and_nothing_else() {
     );
 }
 
-/// A stack a task emptied would otherwise stay keyed by it until its entry point ends.
 #[test]
 fn retiring_a_task_that_closed_every_span_drops_its_stack() {
     let mut spans = Spans::new();
@@ -238,8 +233,6 @@ fn retiring_a_task_that_closed_every_span_drops_its_stack() {
     assert!(spans.retired(mine).is_none(), "nothing was left open");
 }
 
-/// A server retires tasks for as long as it runs, so what they abandoned is a count and a few
-/// names however many there were.
 #[test]
 fn ten_thousand_retired_tasks_each_abandoning_a_span_keep_the_summary_bounded() {
     let mut spans = Spans::new();
@@ -269,7 +262,6 @@ fn ten_thousand_retired_tasks_each_abandoning_a_span_keep_the_summary_bounded() 
     assert!(message.contains("9997 more"), "{message}");
 }
 
-/// The span the entry point itself was inside is named first; its retired tasks' follow.
 #[test]
 fn an_entry_points_own_spans_are_named_before_its_retired_tasks_and_no_other_machines() {
     let mut spans = Spans::new();
@@ -292,7 +284,6 @@ fn an_entry_points_own_spans_are_named_before_its_retired_tasks_and_no_other_mac
     );
 }
 
-/// Ids correlate a log's records, so a reused one merges two requests.
 #[test]
 fn ids_ascend_from_one_and_are_never_reused() {
     let mut spans = Spans::new();

@@ -1,5 +1,3 @@
-//! Which spans each performer has open, and what closes one.
-
 use super::Outcome;
 use ply_core::host::MachineId;
 use ply_core::{Diagnostic, Resource, Span, TaskId, codes};
@@ -10,9 +8,7 @@ pub type Owner = (MachineId, Option<TaskId>);
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OpenSpan {
     pub id: i64,
-    /// The channel the `enter` named; the closing record is written on it.
     pub channel: Resource,
-    /// The `Arc<str>` the argument already held, so keeping it allocates nothing.
     pub name: std::sync::Arc<str>,
     pub parent: i64,
     pub started: Option<i64>,
@@ -23,24 +19,19 @@ pub struct Closing {
     pub outcome: Outcome,
 }
 
-/// Why an `exit` names a span that is not open on the performing task's stack.
 #[derive(Debug)]
 pub enum Unbalanced {
     NeverOpened,
     AlreadyClosed,
     OtherOwner(Owner),
-    /// Open here under a different channel, which only a forged `Span` record can produce.
     OtherChannel(Resource),
 }
 
-/// How many abandoned spans a warning names.
 pub const NAMED: usize = 3;
 
-/// How many spans were closed `Abandoned`, and the first few by name, however many there were.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Abandoned {
     pub count: u64,
-    /// At most [`NAMED`] spans' names and channels, in the order they were abandoned.
     pub first: Vec<(std::sync::Arc<str>, Resource)>,
 }
 
@@ -57,7 +48,6 @@ impl Abandoned {
         }
     }
 
-    /// `self`, then `later`: the count of both, and as many names as there is room for.
     fn then(mut self, later: Abandoned) -> Abandoned {
         self.count += later.count;
         let room = NAMED.saturating_sub(self.first.len());
@@ -68,13 +58,10 @@ impl Abandoned {
 
 pub struct Spans {
     open: BTreeMap<Owner, Vec<OpenSpan>>,
-    /// The next id each entry point mints; dropped by [`Spans::end_entry_point`].
     next: BTreeMap<MachineId, i64>,
-    /// Per machine, what its retired tasks left open, for the warning its entry point ends with.
     retired: BTreeMap<MachineId, Abandoned>,
     opened: u64,
     abandoned: u64,
-    /// What every ended entry point's warning counted.
     left_open: u64,
 }
 
@@ -100,13 +87,10 @@ impl Spans {
         self.opened
     }
 
-    /// Every span closed `Abandoned`, those an outer `exit` closed through included.
     pub fn abandoned(&self) -> u64 {
         self.abandoned
     }
 
-    /// The spans the ended entry points' warnings counted: those left open when their task or
-    /// entry point ended.
     pub fn left_open(&self) -> u64 {
         self.left_open
     }
@@ -119,7 +103,6 @@ impl Spans {
         self.open.values().map(Vec::len).sum()
     }
 
-    /// The span `owner`'s events belong to and its parent; `(0, 0)` outside any.
     pub fn innermost(&self, owner: Owner) -> (i64, i64) {
         self.open
             .get(&owner)
@@ -134,7 +117,6 @@ impl Spans {
         name: std::sync::Arc<str>,
         started: Option<i64>,
     ) -> OpenSpan {
-        // From 1, so `0` in a record's `span` or `parent` unambiguously means no span.
         let next = self.next.entry(owner.0).or_insert(1);
         let id = *next;
         *next += 1;
@@ -152,7 +134,6 @@ impl Spans {
         open
     }
 
-    /// `trace.exit[c]`: closes `id` and every span opened above it, innermost first.
     pub fn exit(
         &mut self,
         owner: Owner,
@@ -172,7 +153,6 @@ impl Spans {
             .get_mut(&owner)
             .expect("the position came from it");
         let popped: Vec<OpenSpan> = stack.drain(at..).collect();
-        // `popped[0]` is the span the program named; the rest never ran their own `exit`.
         let closings: Vec<Closing> = popped
             .into_iter()
             .enumerate()
@@ -190,7 +170,6 @@ impl Spans {
         Ok(closings)
     }
 
-    /// Closes this machine's open spans, innermost first per task, with its retired tasks' after.
     pub fn end_entry_point(&mut self, machine: MachineId) -> (Vec<Closing>, Abandoned) {
         self.next.remove(&machine);
         let mine: Vec<Owner> = self
@@ -213,7 +192,6 @@ impl Spans {
         (closings, abandoned)
     }
 
-    /// Removes a retired task's spans, innermost first, noting them for its entry point's warning.
     pub fn end_task(&mut self, machine: MachineId, task: TaskId) -> Vec<Closing> {
         let closings = self.end_owner((machine, Some(task)));
         if !closings.is_empty() {
@@ -225,12 +203,10 @@ impl Spans {
         closings
     }
 
-    /// What this machine's retired tasks have abandoned since its entry point began.
     pub fn retired(&self, machine: MachineId) -> Option<&Abandoned> {
         self.retired.get(&machine)
     }
 
-    /// Removes every span `owner` still has open, innermost first, and the owner with them.
     fn end_owner(&mut self, owner: Owner) -> Vec<Closing> {
         let Some(stack) = self.open.remove(&owner) else {
             return Vec::new();
@@ -246,7 +222,6 @@ impl Spans {
             .collect()
     }
 
-    /// The owners a stack is kept for, open spans or not.
     pub fn owners(&self) -> usize {
         self.open.len()
     }
@@ -332,7 +307,6 @@ pub fn label(resource: &Resource) -> &str {
     match resource {
         Resource::Named(name) => name.as_str(),
         Resource::Var(_) | Resource::Singleton => "",
-        // Every label, which names no one channel.
         Resource::Every => "*",
     }
 }

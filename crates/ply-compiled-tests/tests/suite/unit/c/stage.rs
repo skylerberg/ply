@@ -50,7 +50,6 @@ fn what_a_run_caches_is_stored_under_the_users_caches() {
     );
 }
 
-/// The specification of `XDG_CACHE_HOME` has a relative path ignored.
 #[test]
 fn a_relative_cache_home_is_not_one() {
     assert_eq!(

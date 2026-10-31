@@ -1,8 +1,3 @@
-//! `std.sqlite`'s natives: the run's databases, each under the root its label names, every
-//! operation a ticket of a job on the process's waiting pool, and the fake's statement over an
-//! image, which reaches no host. What they are handed and return is flat as `ply_host::sqlite`
-//! reads and writes it.
-
 use super::{Nondeterministic, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
@@ -62,9 +57,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// One statement over the database the image at `image_at` holds, as the fake runs it: parts of
-/// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
-/// what it is handed, so it asks the host nothing.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_run(
     ctx: *mut Ctx,
@@ -100,14 +92,11 @@ pub unsafe extern "C" fn rt_sqlite_run(
     c.given(parts(&[&found(left), &reply_written(&reply)]))
 }
 
-/// The SQL functions a statement may call, in order, as parts.
 pub unsafe extern "C" fn rt_sqlite_functions(ctx: *mut Ctx) -> TakenBytes {
     let names: Vec<&[u8]> = FUNCTIONS.iter().map(|name| name.as_bytes()).collect();
     unsafe { &mut *ctx }.given(parts(&names))
 }
 
-/// The run's databases and the root the label at `label` names; `None`, with the run failed,
-/// where no root is bound to it.
 fn rooted(c: &mut Ctx, label: &[u8], what: &'static str) -> Option<(Arc<SqliteHost>, PathBuf)> {
     let label = c.text(label)?;
     let span = c.site();
@@ -124,7 +113,6 @@ fn rooted(c: &mut Ctx, label: &[u8], what: &'static str) -> Option<(Arc<SqliteHo
     }
 }
 
-/// A statement's text, values and limits, as the host handler hands them.
 fn statement(
     c: &mut Ctx,
     native: &str,
@@ -138,8 +126,6 @@ fn statement(
     Some((sql, params, limits))
 }
 
-/// The ticket of the database at the path at `path_at` opened under the root the label names:
-/// the connection's number, or why it did not open.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_open(
     ctx: *mut Ctx,
@@ -187,7 +173,6 @@ pub unsafe extern "C" fn rt_sqlite_open(
     )
 }
 
-/// The ticket of a connection closed: byte 1, or byte 0 for a number that names none.
 pub unsafe extern "C" fn rt_sqlite_close(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -210,8 +195,6 @@ pub unsafe extern "C" fn rt_sqlite_close(
     )
 }
 
-/// The ticket of a statement run on a connection: its reply. `reads_only` rejects one that could
-/// write, and `cursor` opens it to be fetched a page at a time.
 #[allow(clippy::too_many_arguments)]
 fn ran(
     ctx: *mut Ctx,
@@ -247,7 +230,6 @@ fn ran(
     })
 }
 
-/// The ticket of a statement that only reads: its reply.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_query(
     ctx: *mut Ctx,
@@ -275,7 +257,6 @@ pub unsafe extern "C" fn rt_sqlite_query(
     )
 }
 
-/// The ticket of a statement that may write: its reply.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_execute(
     ctx: *mut Ctx,
@@ -303,7 +284,6 @@ pub unsafe extern "C" fn rt_sqlite_execute(
     )
 }
 
-/// The ticket of a statement that only reads, opened to be fetched a page at a time: its reply.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_cursor(
     ctx: *mut Ctx,
@@ -331,7 +311,6 @@ pub unsafe extern "C" fn rt_sqlite_cursor(
     )
 }
 
-/// The ticket of a step of a connection's transaction: its reply.
 pub unsafe extern "C" fn rt_sqlite_control(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -370,8 +349,6 @@ pub unsafe extern "C" fn rt_sqlite_control(
     )
 }
 
-/// The ticket of a compacted copy of a connection's database written to the path at `path_at`:
-/// its reply.
 pub unsafe extern "C" fn rt_sqlite_backup(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -400,7 +377,6 @@ pub unsafe extern "C" fn rt_sqlite_backup(
     )
 }
 
-/// The ticket of the next `rows` rows of a connection's open statement: its reply.
 pub unsafe extern "C" fn rt_sqlite_fetch(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -429,7 +405,6 @@ pub unsafe extern "C" fn rt_sqlite_fetch(
     )
 }
 
-/// The ticket of a connection's open statement ended: byte 1, or byte 0 where none is open.
 pub unsafe extern "C" fn rt_sqlite_finish(
     ctx: *mut Ctx,
     label_at: Addr,

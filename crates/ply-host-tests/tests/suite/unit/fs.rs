@@ -38,7 +38,6 @@ fn an_absolute_path_and_a_parent_component_are_rejected() {
     }
 }
 
-/// The half a lexical check cannot do.
 #[test]
 fn a_symlink_out_of_the_root_is_rejected() {
     let dir = root();
@@ -52,7 +51,6 @@ fn a_symlink_out_of_the_root_is_rejected() {
     assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
-/// A not-yet-existing target still traverses its parent's link, so the nearest ancestor is checked.
 #[test]
 fn a_write_through_a_symlinked_directory_is_rejected() {
     let dir = root();
@@ -65,7 +63,6 @@ fn a_write_through_a_symlinked_directory_is_rejected() {
     assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
-/// A link to where nothing is resolves to nothing, so it is held by where it leads.
 #[test]
 fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_rejected() {
     let dir = root();
@@ -108,7 +105,6 @@ fn an_unbound_label_names_the_flag_that_would_bind_it() {
     );
 }
 
-/// What `disk.rs` serialises a read-merge-write with, as an operation a Ply store can perform.
 #[test]
 fn a_lock_is_taken_once_and_released_only_by_its_holder() {
     let dir = root();
@@ -118,8 +114,6 @@ fn a_lock_is_taken_once_and_released_only_by_its_holder() {
 
     assert!(take_lock(&lock, &held));
     assert!(lock.exists(), "the lock is the file's existence");
-    // A second taker waits out the holder and returns `false` rather than raising. Waiting the
-    // two seconds `fs.lock` waits proves nothing this does not, so the wait is the caller's here.
     let brief = Duration::from_millis(20);
     let waited = Instant::now();
     assert!(!take_lock_within(&lock, &held, brief));
@@ -131,13 +125,11 @@ fn a_lock_is_taken_once_and_released_only_by_its_holder() {
 
     assert!(drop_lock(&lock, &held));
     assert!(!lock.exists());
-    // Releasing one nothing holds changes nothing, and the next taker gets it at once.
     assert!(!drop_lock(&lock, &held));
     assert!(take_lock(&lock, &held));
     assert!(drop_lock(&lock, &held));
 }
 
-/// A lock file another run left behind is one this run cannot remove; only age breaks it.
 #[test]
 fn a_lock_this_run_did_not_take_is_not_its_to_release() {
     let dir = root();
@@ -150,7 +142,6 @@ fn a_lock_this_run_did_not_take_is_not_its_to_release() {
     assert!(lock.exists(), "another holder's lock was removed");
 }
 
-/// The holder died without releasing, which a `--jobs` run has to be able to recover from.
 #[test]
 fn a_lock_older_than_the_stale_age_is_broken_and_taken() {
     let dir = root();
@@ -183,15 +174,12 @@ fn a_lock_with_no_directory_to_sit_in_is_rejected_without_waiting() {
     );
 }
 
-// --- Asking the host ----------------------------------------------------------
-
 fn rooted(at: &Path) -> FsHost {
     let mut roots = Roots::new();
     roots.bind("cache", at, span()).expect("the root binds");
     FsHost::new(roots)
 }
 
-/// What a job returned, run on this thread.
 fn ran(job: ply_host::jobs::FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
@@ -199,7 +187,6 @@ fn ran(job: ply_host::jobs::FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     })
 }
 
-/// The operation as the host handler asks it, under `label`.
 fn asked(
     fs: &FsHost,
     op: Op,
@@ -210,7 +197,6 @@ fn asked(
     ran(fs.asked(op, label, path.to_string(), second, span())?)
 }
 
-/// The operation under `cache`.
 fn perform(fs: &FsHost, op: Op, path: &str, second: Second) -> Result<Vec<u8>, Diagnostic> {
     asked(fs, op, "cache", path, second)
 }
@@ -273,7 +259,6 @@ fn read_at(fs: &FsHost, path: &str, offset: i64, len: i64) -> Option<Vec<u8>> {
     found_bytes(on(fs, Op::ReadAt, path, Second::Range { offset, len }))
 }
 
-/// What a flush of an append-only cache does, and what its cost is: the frame, not the file.
 #[test]
 fn an_append_creates_the_log_and_returns_where_each_frame_landed() {
     let dir = root();
@@ -286,7 +271,6 @@ fn an_append_creates_the_log_and_returns_where_each_frame_landed() {
 
     let whole = dir.path().canonicalize().unwrap().join("frontend.dat");
     assert_eq!(std::fs::read(&whole).unwrap(), b"headerframetail");
-    // The offset an append returned is the one the frame is read back at.
     assert_eq!(read_at(&fs, "frontend.dat", 6, 5), Some(b"frame".to_vec()));
     assert_eq!(read_at(&fs, "frontend.dat", 11, 4), Some(b"tail".to_vec()));
 }
@@ -296,7 +280,6 @@ fn an_append_with_no_directory_to_hold_it_returns_none() {
     let dir = root();
     let fs = rooted(dir.path());
     assert_eq!(append(&fs, "absent/frontend.dat", b"frame"), None);
-    // A directory is not a log either.
     std::fs::create_dir(dir.path().canonicalize().unwrap().join("sub")).unwrap();
     assert_eq!(append(&fs, "sub", b"frame"), None);
 }
@@ -313,7 +296,6 @@ fn a_ranged_read_returns_what_is_there_and_is_short_past_the_end() {
 
     assert_eq!(read_at(&fs, "a.dat", 0, 10), Some(b"0123456789".to_vec()));
     assert_eq!(read_at(&fs, "a.dat", 3, 4), Some(b"3456".to_vec()));
-    // Short rather than rejected: a file can end before a range a reader recorded earlier does.
     assert_eq!(read_at(&fs, "a.dat", 8, 100), Some(b"89".to_vec()));
     assert_eq!(read_at(&fs, "a.dat", 10, 5), Some(Vec::new()));
     assert_eq!(read_at(&fs, "a.dat", 99, 5), Some(Vec::new()));
@@ -349,7 +331,6 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
         "the rejection should name what reads a large file: {:?}",
         rejected.notes
     );
-    // The bound is reachable, so the largest allowed call is not itself rejected.
     assert_eq!(read_at(&fs, "a.dat", 0, MAX_READ_BYTES as i64), None);
 }
 
@@ -360,13 +341,11 @@ fn a_sync_flushes_a_file_or_a_directory_and_returns_false_for_neither() {
     assert_eq!(append(&fs, "frontend.dat", b"frame"), Some(0));
 
     let sync = |path: &str| did(on(&fs, Op::Sync, path, Second::None));
-    // The data file, then the directory whose rename must survive with it.
     assert!(sync("frontend.dat"));
     assert!(sync(""));
     assert!(!sync("absent.dat"));
 }
 
-/// Every operation names its root by its label, and a label no root is bound to reaches no file.
 #[test]
 fn every_operation_rejects_a_label_no_root_is_bound_to() {
     let dir = root();
@@ -387,8 +366,6 @@ fn every_operation_rejects_a_label_no_root_is_bound_to() {
     }
 }
 
-// --- Copies, trees, temporary directories, modes, links, walks and stamps ---
-
 fn file_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -408,7 +385,6 @@ fn a_copy_carries_the_bytes_and_permission_bits_and_never_a_directory() {
     assert!(copy("a.txt", "b.txt"));
     assert_eq!(std::fs::read(real.join("b.txt")).unwrap(), b"x");
     assert_eq!(file_mode(&real.join("b.txt")), 0o600);
-    // Over a file that is there, as a write is.
     std::fs::write(real.join("c.txt"), b"old").unwrap();
     assert!(copy("a.txt", "c.txt"));
     assert_eq!(std::fs::read(real.join("c.txt")).unwrap(), b"x");
@@ -538,7 +514,6 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_rejected() {
         !made("l", "a.txt"),
         "a path that is there is not made a link"
     );
-    // A target is read from the directory the link is made in, wherever a link above it leads.
     std::fs::create_dir_all(real.join("d/e/f")).unwrap();
     std::os::unix::fs::symlink("..", real.join("d/back")).unwrap();
     std::os::unix::fs::symlink("e/f", real.join("d/deep")).unwrap();
@@ -559,7 +534,6 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_rejected() {
     }
 }
 
-/// The entries a walk returned, each its path and kind.
 fn entries(said: Vec<u8>) -> Option<Vec<(String, Kind)>> {
     found(&said).map(|flat| {
         parts_of(flat)
@@ -672,8 +646,6 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
     }
 }
 
-// --- Open files ---
-
 fn opened(fs: &FsHost, label: &str, path: &str, how: Opening) -> Result<i64, Vec<u8>> {
     let said = asked(fs, Op::Open, label, path, Second::Opening(how))
         .unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message));
@@ -710,7 +682,6 @@ fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
 
     let first = opened(&fs, "cache", "log", Opening::Read).expect("the file opens");
     assert_eq!(chunk(&fs, "cache", first, 4), Some(b"abcd".to_vec()));
-    // Another root's label reaches nothing this root opened: not to read it, not to close it.
     assert_eq!(chunk(&fs, "other", first, 4), None);
     assert!(!closed(&fs, "other", first));
     assert_eq!(chunk(&fs, "cache", first, 4), Some(b"ef".to_vec()));
@@ -719,7 +690,6 @@ fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
     assert!(closed(&fs, "cache", first));
     assert!(!closed(&fs, "cache", first));
     assert_eq!(chunk(&fs, "cache", first, 4), None);
-    // A descriptor names one open, so the next open returns another.
     let second = opened(&fs, "cache", "log", Opening::Read).expect("the file opens again");
     assert_ne!(second, first);
 }
@@ -763,11 +733,8 @@ fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
         .map(|_| ())
         .expect_err("more than one read returns");
     assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
-    // The rejection did not move the descriptor.
     assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
 }
-
-// --- Exclusive creates, looks, scans, names and room ---
 
 #[test]
 fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is() {
@@ -796,7 +763,6 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
             "{there}"
         );
     }
-    // The link was rejected as itself: nothing was made where it points.
     assert!(!real.join("d/nowhere").exists());
     assert_eq!(
         opened(&fs, "cache", "no/new", Opening::Create),
@@ -817,7 +783,6 @@ fn write_secret(fs: &FsHost, path: &str, encoding: &str) -> Result<Vec<u8>, Diag
     perform(fs, Op::WriteSecret, path, sealed(encoding, b"\x01\x23\xab"))
 }
 
-/// The secret a file holds between `before` and `after`, kept by a run and taken back from it.
 fn read_secret(
     fs: &FsHost,
     path: &str,
@@ -901,7 +866,6 @@ fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
     );
 }
 
-/// A secret read after its run ended is kept by no one, and returns as one not there.
 #[test]
 fn a_secret_read_for_a_run_that_has_ended_is_stored_by_no_one() {
     let dir = root();
@@ -940,7 +904,6 @@ fn a_secret_write_rejects_an_unknown_encoding_and_a_path_out_of_the_root() {
     assert!(std::fs::read_dir(&real).unwrap().next().is_none());
 }
 
-/// What one look read, as [`Stat::flat`] writes it.
 fn looked(flat: &[u8]) -> Stat {
     let [k, size, modified, mode, links, device, id] = parts_of(flat)
         .expect("parts")
@@ -1001,7 +964,6 @@ fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
     assert_eq!((folder.kind, folder.size, folder.links), (Kind::Dir, 0, 1));
     assert_eq!(folder.mode, file_mode(&real.join("d")));
 
-    // The link is read, not followed: it is no file, and it is not the file it points at.
     let link = stat(&fs, "d/l").expect("a link is there");
     assert_eq!(
         (link.kind, link.size, link.mode, link.links),
@@ -1095,7 +1057,6 @@ fn a_file_takes_a_second_name_and_nothing_else_does() {
     assert_eq!((first.links, second.links), (2, 2));
     assert_eq!((first.device, first.id), (second.device, second.id));
 
-    // A copy onto the file itself, by either name, would empty it before reading it.
     for (from, to) in [("twin.txt", "d/a.txt"), ("d/a.txt", "d/a.txt")] {
         assert!(did(on(&fs, Op::Copy, from, other(to))), "{from} -> {to}");
         assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
@@ -1138,27 +1099,17 @@ fn the_room_of_a_file_system_is_returned_for_a_path_that_names_something() {
     let [total, free, available, inodes, inodes_free] = room("").expect("the root is there");
     assert!(total > 0 && free <= total && available <= free);
     assert!(inodes_free <= inodes);
-    // One file system holds the root and the file in it.
     assert_eq!(room("a.txt").map(|r| r[0]), Some(total));
     assert_eq!(room("absent"), None);
 }
 
-// --- Links that lead out of the root ---
-
-/// Where a link that leads out of the root stands in the path an operation is given.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Way {
-    /// The last name is a link to a path outside the root where nothing is.
     Dangling,
-    /// The last name is a link to a file outside the root.
     ToFile,
-    /// A name below a link to a path outside the root where nothing is.
     BelowDangling,
-    /// A file outside the root, named through a link to its directory.
     Through,
-    /// A name that is not there, through a link to a directory outside the root.
     ThroughToNew,
-    /// `..` after a link to a directory inside the root.
     Climbing,
 }
 
@@ -1183,14 +1134,11 @@ impl Way {
         }
     }
 
-    /// Whether the path names the link, which an operation that follows no link acts on as itself.
     fn names_the_link(self) -> bool {
         matches!(self, Way::Dangling | Way::ToFile)
     }
 }
 
-/// A root holding a file, a directory and the links each `Way` names, and the directory outside it
-/// that they lead to.
 fn linked_out() -> (tempfile::TempDir, tempfile::TempDir) {
     let (inside, outside) = (root(), root());
     let (here, there) = (inside.path(), outside.path().canonicalize().unwrap());
@@ -1208,8 +1156,6 @@ fn linked_out() -> (tempfile::TempDir, tempfile::TempDir) {
     (inside, outside)
 }
 
-/// Everything at and under `dir`: each path with its mode, how many names it has, when it was
-/// modified and a file's bytes.
 fn held(dir: &Path) -> Vec<String> {
     use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
@@ -1237,10 +1183,6 @@ fn held(dir: &Path) -> Vec<String> {
     out
 }
 
-/// Every way `op` is given `path`: the path it is asked of, what it is handed beside it, and
-/// whether it then acts on a link that is the path's last name rather than on what the link leads
-/// to. No arm is a wildcard, so an operation added to the family does not compile until it says
-/// how it takes a path.
 fn given(op: Op, path: &str) -> Vec<(String, Second, bool)> {
     let p = || path.to_string();
     let plain = || "plain.txt".to_string();
@@ -1300,7 +1242,6 @@ fn given(op: Op, path: &str) -> Vec<(String, Second, bool)> {
             (p(), Second::Path(plain()), true),
             ("named".to_string(), Second::Path(p()), true),
         ],
-        // An open file is named by the descriptor `open` returned, and takes no path.
         Op::ReadChunk | Op::WriteChunk | Op::Close => Vec::new(),
     }
 }
@@ -1383,7 +1324,6 @@ fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
     }
 }
 
-/// A chain of `links` links under `at`, the first named `first`, the last leading to `to`.
 fn chain(at: &Path, first: &str, links: usize, to: &str) {
     for i in 0..links {
         let name = if i == 0 {
@@ -1410,8 +1350,6 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
     let read = |path: &str| found_bytes(on(&fs, Op::ReadFile, path, Second::None));
     let write = |path: &str| did(on(&fs, Op::WriteFile, path, body(b"w")));
 
-    // A link to what is not there yet is written through, and one that names the root's own
-    // absolute path stays inside it.
     std::os::unix::fs::symlink("d/new.txt", real.join("fresh")).unwrap();
     assert!(write("fresh"));
     assert_eq!(std::fs::read(real.join("d/new.txt")).unwrap(), b"w");
@@ -1444,14 +1382,11 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
         Kind::Symlink
     );
 
-    // A link's target that steps back out of a name that is not there names nothing, as the
-    // system resolves it.
     std::os::unix::fs::symlink("absent/../d/a.txt", real.join("back")).unwrap();
     assert_eq!(read("back"), None);
     assert!(!write("back"));
 }
 
-/// What a read appends is found after the leading byte, and a read that fails finds nothing.
 #[test]
 fn a_read_is_found_in_place_or_not_at_all() {
     let read = found_read(3, |out| {

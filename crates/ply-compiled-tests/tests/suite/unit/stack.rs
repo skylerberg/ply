@@ -22,7 +22,6 @@ fn taken() -> Stack {
     Stack::take().expect("the system maps a stack")
 }
 
-/// Switches back to the test's stack, storing this stack's pointer where the test reads it.
 fn yield_to_main() {
     let (task, main) = with(|p| (&mut p.task as *mut usize, p.main));
     unsafe { switch(&mut *task, main) };
@@ -33,7 +32,6 @@ fn run_task() {
     unsafe { switch(&mut *main, task) };
 }
 
-/// Aligned only if the frame was entered as the ABI requires, so a trampoline off by a word is caught.
 #[inline(never)]
 fn aligned_local() -> usize {
     #[repr(align(16))]
@@ -62,23 +60,16 @@ extern "C" fn count_to(n: usize) {
     unreachable!("a finished task was resumed");
 }
 
-/// Past two chunks of a kilobyte a frame, so a descent has to extend its stack twice.
 const PAD: usize = 1024;
 const LEVELS: usize = (20 << 20) / PAD;
 
-/// A descent of [`LEVELS`] frames on `stack`, with what it saw on the way down.
 struct Descent {
     stack: *const Stack,
-    /// Each frame's pad, from the top down.
     frames: Vec<usize>,
-    /// Whether an extension the floor asked for was rejected.
     rejected: bool,
-    /// What it counts to at the bottom.
     counts: usize,
 }
 
-/// Recurses a frame of a kilobyte or so per level, making room below the floor as a compiled
-/// prologue makes it, and counts at the bottom.
 fn descend(d: &mut Descent, levels: usize) {
     let pad = std::hint::black_box([0u8; PAD]);
     let at = &pad as *const [u8; PAD] as usize;
@@ -137,8 +128,6 @@ fn a_task_runs_on_its_own_stack_and_yields_back_in_order() {
     PONG.with(|p| *p.borrow_mut() = None);
 }
 
-/// A recursion past a stack's first chunk stays on that stack: every frame below the one above it,
-/// all in one reservation, and all of them live where the recursion stopped.
 #[test]
 fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
     let stack = taken();
@@ -177,8 +166,6 @@ fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
     PONG.with(|p| *p.borrow_mut() = None);
 }
 
-/// A stack grows a chunk at a time until its reservation is spent, and its floor never passes the
-/// room the runtime's own frames keep above the guard.
 #[test]
 fn a_stack_extends_until_its_reservation_is_spent_and_its_floor_keeps_the_margin() {
     let stack = taken();
@@ -194,7 +181,6 @@ fn a_stack_extends_until_its_reservation_is_spent_and_its_floor_keeps_the_margin
     assert!(!stack.extend(), "a spent reservation extended again");
 }
 
-/// A stack given back as it was taken is the next one taken; one that grew is not kept.
 #[test]
 fn a_stack_given_back_unextended_is_taken_again_and_one_that_grew_is_not() {
     let first = taken();
@@ -212,7 +198,6 @@ fn a_stack_given_back_unextended_is_taken_again_and_one_that_grew_is_not() {
     );
 }
 
-/// Ten thousand suspended bodies or tasks hold ten thousand stacks at once.
 #[test]
 fn ten_thousand_stacks_are_held_at_once_and_given_back_on_one_thread() {
     let stacks: Vec<Stack> = (0..10_000).map(|_| taken()).collect();
@@ -223,7 +208,6 @@ fn ten_thousand_stacks_are_held_at_once_and_given_back_on_one_thread() {
     assert_eq!(tops.len(), stacks.len());
 }
 
-/// What a task that grows and then stops sees of the context it runs under.
 struct Grows {
     ctx: *mut ply_compiled::rt::Ctx,
     task: *const Stack,
@@ -248,8 +232,6 @@ extern "C" fn grow_then_stop(arg: usize) {
     std::process::abort();
 }
 
-/// A task that grew and stopped resumes under its grown stack's floor, whatever floor the stack
-/// that resumed it left behind.
 #[test]
 fn a_task_that_grew_resumes_under_its_own_floor() {
     let dir = tempfile::tempdir().expect("a scratch directory");

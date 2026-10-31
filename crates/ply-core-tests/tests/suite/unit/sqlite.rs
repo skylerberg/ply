@@ -87,7 +87,6 @@ fn the_engine_is_built_with_the_options_the_tree_asks_for() {
         first(&done(&mut engine, "SELECT sqlite_version()")),
         text("3.53.2")
     );
-    // `PRINTF_PRECISION_LIMIT`, which the engine does not list.
     assert_eq!(
         first(&done(&mut engine, "SELECT length(printf('%.200000d', 1))")),
         Scalar::Int(100_000)
@@ -498,7 +497,6 @@ fn each_limit_rejects_what_passes_it() {
         Some(("steps", String::new()))
     );
     assert_eq!(first(&done(&mut engine, "SELECT 7")), Scalar::Int(7));
-    // A write rejected for what it returned leaves nothing behind.
     assert_eq!(
         limited(
             &mut engine,
@@ -615,7 +613,6 @@ fn a_statement_is_read_a_page_at_a_time() {
     );
 }
 
-/// One statement over `image` as the fake runs it, every table `STRICT`.
 fn over(image: &[u8], sql: &str, params: &[Scalar], reads_only: bool) -> (Reply, Option<Vec<u8>>) {
     ply_core::sqlite::run_over(image, sql, params, roomy(), reads_only, true)
 }

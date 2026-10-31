@@ -1,10 +1,5 @@
-//! The boxes of `Decimal`s and 128-bit widths, and the failures compiled arithmetic and matching
-//! raise.
-
 use super::*;
 
-/// The box of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
-/// and above it `hi`.
 pub unsafe extern "C" fn rt_box_wide(ctx: *mut Ctx, lo: I64, hi: I64, t: I64) -> Word {
     let ctx = unsafe { &mut *ctx };
     let wide = usize::try_from(t.0)
@@ -17,7 +12,6 @@ pub unsafe extern "C" fn rt_box_wide(ctx: *mut Ctx, lo: I64, hi: I64, t: I64) ->
     two_words(ctx, lo.0, hi.0)
 }
 
-/// A block of two scalar words, `lo` and then `hi`, which compiled code releases by its size.
 fn two_words(ctx: &mut Ctx, lo: i64, hi: i64) -> Word {
     let o = ctx.heap.raw_alloc(16);
     unsafe {
@@ -27,33 +21,28 @@ fn two_words(ctx: &mut Ctx, lo: i64, hi: i64) -> Word {
     o as Word
 }
 
-/// The box of the `Decimal` whose two words are `lo` and `hi`.
 pub unsafe extern "C" fn rt_box_decimal(ctx: *mut Ctx, lo: i64, hi: i64) -> i64 {
     two_words(unsafe { &mut *ctx }, lo, hi)
 }
 
-/// A `match` whose arms did not cover the value.
 pub unsafe extern "C" fn rt_no_match(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("no arm of this `match` matched");
     ctx.fail(d);
 }
 
-/// A refutable `let` whose pattern did not match the value bound to it.
 pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("`let` pattern did not match the bound value");
     raise_error(ctx, d);
 }
 
-/// An `Int` divided by zero, raised: `what` 0 a division's, any other a remainder's.
 pub unsafe extern "C" fn rt_by_zero(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = if what == 0 { "division" } else { "remainder" };
     raise_error(ctx, error(format!("{name} by zero")));
 }
 
-/// `Int::of_u64` of `value`'s bits, past what an `Int` holds, raised.
 pub unsafe extern "C" fn rt_not_an_int(ctx: *mut Ctx, value: i64) {
     let ctx = unsafe { &mut *ctx };
     let d = error(format!("`Int::of_u64` was given {}", value as u64))
@@ -61,8 +50,6 @@ pub unsafe extern "C" fn rt_not_an_int(ctx: *mut Ctx, value: i64) {
     raise_error(ctx, d);
 }
 
-/// `Int::of_i128`, where `signed` is not 0, or else `Int::of_u128`, of the 128-bit width whose
-/// words are `lo` and `hi`, past what an `Int` holds, raised.
 pub unsafe extern "C" fn rt_not_an_int_wide(ctx: *mut Ctx, lo: i64, hi: i64, signed: i64) {
     let ctx = unsafe { &mut *ctx };
     let bits = (u128::from(hi as u64) << 64) | u128::from(lo as u64);
@@ -77,8 +64,6 @@ pub unsafe extern "C" fn rt_not_an_int_wide(ctx: *mut Ctx, lo: i64, hi: i64, sig
     raise_error(ctx, d);
 }
 
-/// A `Decimal` operator's result past what a `Decimal` holds exactly; `what` is `emit/c.ply`'s
-/// `overflow_code`.
 pub unsafe extern "C" fn rt_decimal_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
@@ -92,7 +77,6 @@ pub unsafe extern "C" fn rt_decimal_overflow(ctx: *mut Ctx, what: i64) {
     ctx.fail(d);
 }
 
-/// `what` is `emit/c.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
@@ -107,7 +91,6 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     ctx.fail(d);
 }
 
-/// An `Int` outside the target width; `which` indexes [`ply_core::INT_TYPES`].
 pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64) {
     let ctx = unsafe { &mut *ctx };
     let t = ply_core::INT_TYPES[which as usize];

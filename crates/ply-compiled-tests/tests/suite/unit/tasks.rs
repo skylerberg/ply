@@ -30,7 +30,6 @@ fn asking(code: i64, n: i64) -> Message {
     }
 }
 
-/// Asks its loop twice, the second time one more than it heard, then keeps what it heard last.
 unsafe fn asks_twice(_ctx: *mut Ctx, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
     let first = unsafe { tasks::to_loop(scheduler, asking(1, 10)) };
@@ -103,8 +102,6 @@ unsafe fn breaks(ctx: *mut Ctx, _: usize) {
     unsafe { (*ctx).failed = 1 };
 }
 
-/// A body that did not return leaves the context clear for the loop, and how it ended is put back
-/// where the loop asks.
 #[test]
 fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     let mut ctx = context();
@@ -134,7 +131,6 @@ fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     drop(scheduler);
 }
 
-/// Asks its loop once, then ends.
 unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
     unsafe { tasks::to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
 }
@@ -191,7 +187,6 @@ fn a_task_the_scheduler_never_ran_lets_go_of_its_body() {
     assert_eq!(RELEASED.with(Cell::get), before + 2);
 }
 
-/// Stands in an `acquire`, asks its loop, and leaves it, keeping whether a cancel landed there.
 unsafe fn acquires(_ctx: *mut Ctx, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
     let id = unsafe { (*scheduler).shield(Shield::Acquire) }.expect("a task runs");
@@ -227,7 +222,6 @@ fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
 #[test]
 fn a_schedulers_failure_reads_as_the_scheduler_writes_it() {
     let ctx = context();
-    // What `std.internal.schedule`'s `failure_bytes` writes, pinned there.
     let bytes = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
     let d = failure_of(&ctx, bytes).expect("it reads");
     assert_eq!(d.code, codes::DEADLOCK);
@@ -241,7 +235,6 @@ fn a_schedulers_failure_reads_as_the_scheduler_writes_it() {
     assert!(failure_of(&ctx, &bytes[..5]).is_err());
 }
 
-/// The bytes a native left taken, `n` of them, copied out as emitted code copies them.
 fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
     let mut out = vec![0u8; usize::try_from(n).expect("a count")];
     unsafe { rt_taken(ctx, Addr(out.as_mut_ptr()), I64(n)) };
@@ -305,8 +298,6 @@ fn a_ticket_another_run_handed_out_is_rejected() {
     assert!(ctx.take_failure().is_some());
 }
 
-// --- The scheduler's objects ---------------------------------------------------------------
-
 unsafe extern "C" fn untouched(_ctx: *mut Ctx, _w: Word) -> Word {
     0
 }
@@ -330,7 +321,6 @@ const fn scalar(identity: u64, spelled: &'static [u8]) -> PlyType {
 static INTS: PlyType = scalar(7, b"Int");
 static TEXTS: PlyType = scalar(8, b"String");
 
-/// The word a native's result is, each of one word.
 fn word_of<T>(x: T) -> Word {
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<Word>());
     let w = unsafe { std::mem::transmute_copy(&x) };
@@ -350,7 +340,6 @@ fn let_go(ctx: &mut Ctx, w: Word) {
     heap::release_object(ctx, w);
 }
 
-/// What `std.internal.trail`'s `touches_of` reads, pinned there too.
 #[test]
 fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
     let mut ctx = context();
@@ -405,7 +394,6 @@ thread_local! {
     static ENTERED: RefCell<Vec<Word>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A closure block no count is kept of, as emitted code lays out one that captures nothing.
 #[repr(C, align(8))]
 struct Immortal {
     rc: u32,
@@ -427,7 +415,6 @@ const fn function(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> 
     }
 }
 
-/// Keeps the descriptor and the first word it was entered with, and returns 5 kept.
 unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let c = unsafe { &mut *ctx };
     let first = if c.entering_words == 0 {
@@ -441,7 +428,6 @@ unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -
     word_of(unsafe { tasks::rt_keep(ctx, handed(5), &INTS) })
 }
 
-/// Asks its loop code 3 with 4 and 5, and returns nothing once it hears back.
 unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let s = STACKS.with(Cell::get);
     unsafe { tasks::rt_task_yielded(ctx, handle(s), I64(3), I64(4), I64(5)) };
@@ -463,8 +449,6 @@ fn block(f: &'static Immortal) -> Block {
     <Block as Returned>::of(f as *const Immortal as Word)
 }
 
-/// Stacks for a scheduler, a task handle in it, and `f` made a body of task 1 returning into it,
-/// the effects descriptor `descriptor` and its words `words`.
 fn started(
     ctx: &mut Ctx,
     f: &'static Immortal,
@@ -478,7 +462,6 @@ fn started(
     let b = word_of(unsafe {
         tasks::rt_task_body(c, handle(t), block(f), descriptor.as_ptr(), words.as_ptr())
     });
-    // The body copied the words it was handed.
     words.iter_mut().for_each(|w| *w = 0);
     unsafe { tasks::rt_task_started(c, handle(s), I64(1), handle(b)) };
     let_go(ctx, b);
