@@ -10,8 +10,9 @@ pub(super) static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 pub struct Ctx {
     pub failed: i64,
     // The runtime's own, in a word between the fields emitted code reads.
-    /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
-    pub(super) last_entry: usize,
+    /// The running entry's number, which no other entry in the process shares: a continuation
+    /// carries it, since its index names a body of that entry alone.
+    pub(crate) entry: u64,
     /// The lowest address a compiled frame may begin at. The watchdog raises it past every frame
     /// once the entry's clock runs out ([`watched`]).
     pub stack_floor: std::sync::atomic::AtomicUsize,
@@ -81,9 +82,6 @@ pub struct Ctx {
     /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
-    /// The running entry's number, which no other entry in the process shares: a continuation
-    /// carries it, since its index names a body of that entry alone.
-    pub(crate) entry: u64,
     /// The host boundary: what a `perform` nothing on the stack handles reaches.
     pub(crate) binding: Arc<ply_core::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_core::HostRuntime>>,
@@ -220,7 +218,6 @@ impl Ctx {
             deadline: None,
             time_budget_ms: 0,
             heap,
-            last_entry: 0,
             tables,
             diagnostic: None,
             stacks: vec![Vec::new()],
@@ -385,7 +382,7 @@ impl Ctx {
         self.marshallings.clear();
         self.taken.clear();
         // Every path out of an entry calls `end`; this catches one that did not.
-        if self.heap.allocated() != 0 {
+        if self.heap.held() != 0 {
             self.end();
         }
         self.detached.clear();
@@ -462,25 +459,6 @@ impl Ctx {
             "an entry ended with a release still running or waiting"
         );
         self.give_thread_back();
-        self.last_entry = self.heap.allocated();
-        if std::env::var("PLY_C_PHASES").is_ok() {
-            eprintln!(
-                "entry: {} objects allocated, {} recycled, {}MB held, {} stacks grown",
-                self.heap.allocated(),
-                self.heap.recycled(),
-                self.held() / 1_000_000,
-                self.grown
-            );
-            let live = self.census();
-            if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
-                for (size, n, bytes) in live.into_iter().take(24) {
-                    eprintln!(
-                        "  live at end: blocks of {size} bytes past the header: {n}, {}MB",
-                        bytes / 1_000_000
-                    );
-                }
-            }
-        }
         self.heap.end();
         if std::mem::take(&mut self.pooled) {
             crate::parallel::workers_ended(self.id.0);

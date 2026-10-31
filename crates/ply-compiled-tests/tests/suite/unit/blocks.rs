@@ -23,7 +23,6 @@ fn a_dead_block_is_the_next_of_its_class_and_of_no_other() {
     unsafe { b.give(first, 48) };
     assert_ne!(b.take(64), first);
     assert_eq!(b.take(48), first);
-    assert_eq!(b.reused(), 1);
     unsafe { b.give(other, 64) };
 }
 

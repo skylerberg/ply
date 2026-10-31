@@ -208,13 +208,6 @@ pub fn exiting() {
     }
 }
 
-/// What this `ply` wrote outside any handler, when a `ply` that started it is observing it.
-pub fn process_wrote(path: &Path) {
-    if let Some(recorder) = PROCESS.get() {
-        recorder.wrote(path);
-    }
-}
-
 impl Recorder {
     fn observed(&self) -> MutexGuard<'_, Observed> {
         self.observed.lock().unwrap_or_else(|e| e.into_inner())
