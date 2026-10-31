@@ -59,6 +59,10 @@ pub unsafe extern "C" fn rt_detached_stop(
 pub type OpEntry =
     unsafe extern "C" fn(*mut Ctx, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
 
+pub const EVIDENCE_ONE_SLOT: i64 = 1;
+
+pub const EVIDENCE_SHARED: i64 = 2;
+
 #[repr(C)]
 pub struct RuntimeObject {
     pub flags: i64,
@@ -73,7 +77,7 @@ pub struct Slot {
 }
 
 pub static NO_HANDLER_OBJECT: RuntimeObject = RuntimeObject {
-    flags: 1,
+    flags: EVIDENCE_ONE_SLOT | EVIDENCE_SHARED,
     slot: Slot {
         entry: bridged,
         env: 0,
@@ -81,7 +85,7 @@ pub static NO_HANDLER_OBJECT: RuntimeObject = RuntimeObject {
 };
 
 pub static UNHANDLED_OPERATION: RuntimeObject = RuntimeObject {
-    flags: 1,
+    flags: EVIDENCE_ONE_SLOT | EVIDENCE_SHARED,
     slot: Slot {
         entry: unserved,
         env: 0,

@@ -62,6 +62,8 @@ fn facts() -> Vec<(&'static str, usize)> {
             "failed.target",
             crate::rt::FAILED_UNWOUND_TO_HANDLER as usize,
         ),
+        ("evidence.one_slot", crate::rt::EVIDENCE_ONE_SLOT as usize),
+        ("evidence.shared", crate::rt::EVIDENCE_SHARED as usize),
         ("failed.pending", crate::rt::FAILED_PENDING_RAISE as usize),
         ("unwinding.words", crate::rt::UNWINDING_WORDS),
         ("instance.head", crate::detached::INSTANCE_HEADER_WORDS),

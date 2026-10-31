@@ -7,6 +7,14 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 
+pub(crate) fn thread_branch() -> u64 {
+    PARALLEL_ENTRY_ID.with(Cell::get)
+}
+
+pub(crate) fn inherit_branch(machine: u64) {
+    PARALLEL_ENTRY_ID.with(|of| of.set(machine));
+}
+
 fn call(ctx: *mut Ctx, f: Word) -> Word {
     unsafe { Block::of(f).call(ctx, &[]) }
 }
@@ -82,7 +90,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     c.entering_desc = 0;
     c.entering_words = 0;
     let nested = PARALLEL_ENTRY_ID.with(|of| of.get() != 0 && of.get() != c.id.0);
-    let without_drain = !nested && allowed && every_capture_is_bridge(c, words);
+    let at_once = !nested && allowed && shared_only(words);
     match pool() {
         Some(pool) if n >= 2 && without_drain && share(ctx, branches) => unsafe {
             in_parallel(ctx, pool, branches, words)
@@ -91,12 +99,16 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     }
 }
 
-fn every_capture_is_bridge(c: &Ctx, (desc, words): (Word, Word)) -> bool {
+fn shared_only((desc, words): (Word, Word)) -> bool {
     if desc == 0 {
         return true;
     }
     let n = unsafe { *(desc as *const Word) };
-    (0..n).all(|i| unsafe { *(words as *const Word).add(i as usize) } == c.bridge)
+    (0..n).all(|i| {
+        let object = unsafe { *(words as *const Word).add(i as usize) } as *const Word;
+        let flags = unsafe { *object };
+        flags & crate::rt::EVIDENCE_SHARED != 0
+    })
 }
 
 unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {

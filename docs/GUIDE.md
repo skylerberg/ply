@@ -1056,9 +1056,11 @@ exactly as deterministic as its branches.
 
 - If several branches fail, the `parallel` block fails with the failure of the leftmost failing
   branch.
-- If a `handle` around the `parallel` block, or a `simulate` block, would handle the operations of
-  any branch, the branches run one after another instead of at the same time. The block returns the
-  same result either way.
+- Branches may perform operations that a `handle` around the block handles, and still run at the
+  same time, when that `handle` has no `var` and each clause it reaches returns without `resume`,
+  captures nothing and performs only through handlers of the same kind. Host handlers are written
+  this way. Under any other `handle`, or under a `simulate` block, the branches run one after
+  another, and the block returns the same result.
 - A branch may not spawn a task or open a `simulate` block (`E0309`), and may not use `?`.
 
 `std.parallel` splits a list into parts and processes each part in its own nested `parallel` block.
@@ -2500,6 +2502,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply hash [path]` | each definition's hash; `--dependencies` adds what each refers to |
 | `ply definitions [path]` | every definition: location, hash, signature, effects and references; `--filter` |
 | `ply callers DEF [path]` | what refers to the definition named `DEF`, and every definition, test and law (a property that `ply test` checks) that depends on it |
+| `ply unused [path]` | `--workspace`, `--json`: definitions nothing uses, and those only tests and laws use; in a package with `main`, `pub` does not count as a use, and a leading `_` opts a name out. Under `--workspace`, every package `ply.work` names is judged together, except the standard library |
 | `ply resolve [path]` | writes `ply.lock`, downloading registry dependencies |
 | `ply vendor [path]` | copies dependencies into `vendor/` |
 | `ply why NAME [path]` | why a package is a dependency |
