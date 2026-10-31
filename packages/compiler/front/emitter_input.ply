@@ -21,8 +21,9 @@ import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInf
                                      empty_cache, CachedDefinition, CachedTest, CachedFacts,
                                      WitnessOrder, listing_type, witness_order_bin, witness_params,
                                      InstanceInfo, NumericInfo)
-import compiler.check.typed (TypedBody, TypedExpression, TypedHandle, TypedClause,
-                             typed_expression_nodes)
+import compiler.check.typed (TypedBody, TypedExpression, TypedHandle, TypedClause, TypedLiteral,
+                             WholeBody, typed_expression_nodes)
+import compiler.syntax.patterns (SourceLiteral, LiteralEmbedded)
 import compiler.emit.keys (RootKey, Named, TestCases, Clause, Requires, Ensures, LawPart, LawGuard,
                            LawBody, root_name, root_text, part_name, test_key, test_owner, law_key,
                            law_owner)
@@ -293,7 +294,10 @@ fn hash_rows(outlines: List<Outline>, hashes: HashOutput) -> List<HashTableRow> 
   ).frames
 }
 
-fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.raise} = {
+fn emitted_signature_text(
+  definition_info: DefinitionInfo,
+  own: Map<Bytes, Bytes>,
+) -> Bytes / {abort.raise} = {
   let (params, ret, effects) = match definition_info.scheme.ty {
     FunctionType(f) -> (f.params, f.ret, f.effects.listed),
     other -> ([], other, []),
@@ -305,7 +309,7 @@ fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.rai
       { p: out.printer, texts: acc.texts.push(out.text) }
     },
   );
-  let pure = if is_pure_definition(definition_info) { b"true" } else { b"false" };
+  let is_pure = is_pure_definition(definition_info);
   Bytes::concat_all([
     b"(",
     Bytes::join(printed.texts, b", "),
@@ -314,7 +318,10 @@ fn emitted_signature_text(definition_info: DefinitionInfo) -> Bytes / {abort.rai
     b" / ",
     effect_list_text(canonical_effects(effects), b", "),
     b" ",
-    pure,
+    if is_pure { b"true" } else { b"false" },
+    if is_pure && params.len() == 0 {
+      match own.get(definition_info.name) { Some(h) -> hex(h), None -> b"" }
+    } else { b"" },
   ])
 }
 
@@ -427,7 +434,7 @@ pub fn root_keys(
   let published = Map::of_entries(
     checked.definitions.filter(|d: DefinitionInfo|
       match read { Some(r) -> r.contains(d.name), None -> true }).map(|d: DefinitionInfo|
-      { key: d.name, value: emitted_signature_text(d) }),
+      { key: d.name, value: emitted_signature_text(d, own) }),
   );
   let guarded = checked.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: LawInfo|
     acc.insert(l.key, l.has_guard));
@@ -1088,7 +1095,37 @@ pub fn definition_known_row(
     raises: definition_info.raises,
     facts: encoded_facts(read, definition_info.name),
     scheme: canonical_scheme(definition_info.scheme),
+    literal: constant_literal(read, definition_info),
   }
+
+fn constant_literal(
+  read: AllBodyFacts,
+  definition_info: DefinitionInfo,
+) -> Option<SourceLiteral> / {abort.raise} =
+  match definition_info.scheme.ty {
+    FunctionType(f) -> if f.params.len() > 0 || definition_info.spec.len() > 0
+        || !is_pure_definition(definition_info) { None }
+    else { body_literal(read, definition_info.name) },
+    _ -> None,
+  }
+
+fn body_literal(read: AllBodyFacts, owner: Bytes) -> Option<SourceLiteral> / {abort.raise} = {
+  let facts = match read.cached.get(owner) {
+    Some(recorded) -> decode_facts(recorded, 0, b""),
+    None -> read.computed.get(owner),
+  };
+  match facts {
+    None -> None,
+    Some(f) -> match f.bodies.find(|b: TypedBody<Bytes>| b.part == WholeBody) {
+      None -> None,
+      Some(b) -> match b.body.node {
+        TypedLiteral(LiteralEmbedded(_, _)) -> None,
+        TypedLiteral(l) -> Some(l),
+        _ -> None,
+      },
+    },
+  }
+}
 
 fn test_known_row(
   declarations: Map<Bytes, Bytes>,

@@ -72,6 +72,7 @@ import compiler.syntax.items (RequiresClause, EnsuresClause, spec_kind_text)
 import compiler.syntax.expressions (prelude_module)
 import compiler.emit.print.count_functions (identity_fn)
 import std.list (positions)
+import compiler.emit.print.constants (constant_read_fn, const_fn_read_fn)
 
 pub effect shipped {
   read names() -> List<String>
@@ -6230,22 +6231,56 @@ test "a read of a definition of no parameters keeps its value for good through i
   let text = unit_text(unit.produced.parts);
   let read_with = |keep: Bytes|
     text.index_of(Bytes::concat_all([b", (Word)(intptr_t)", keep, b")"])) != None;
-  assert(text.index_of(b"rt_memo_p(ctx, ") != None, None);
+  assert(text.index_of(read_of(constant_read_fn())) != None, None);
   assert(read_with(identity_fn()), None);
   assert(read_with(symbol_of(printed(root_of(keys::Keep, string_type())))), None);
 }
 
-test "a read of a `const fn` is charged nothing, and a read of a plain definition what it cost" {
+fn read_of(helper: Bytes) -> Bytes = helper.concat(b"(ctx, ply_part")
+
+test "a `const fn` is read through the check that no raise left it, and a plain definition is not" {
   let reads = |table: Bytes| {
     let k = unit_builder(Bytes::concat_all([table, b"fn read() -> Int = table().len()\n"]));
     let text = unit_text(k.unit([b"m.table", b"m.read"].map(Named)).produced.parts);
-    let count = |helper: Bytes| text.split(helper).len() - 1;
-    [count(b"rt_const_p(ctx, "), count(b"rt_memo_p(ctx, ")]
+    let count = |helper: Bytes| text.split(read_of(helper)).len() - 1;
+    [count(const_fn_read_fn()), count(constant_read_fn())]
   };
   let constant = reads(b"const fn table() -> List<Int> = [1, 2]\n");
   let plain = reads(b"fn table() -> List<Int> = [1, 2]\n");
   assert_eq(constant, [1, plain.get(1) - 1]);
   assert_eq(plain.get(0), 0)
+}
+
+test "a read of a definition whose body is a literal of its type is the literal" {
+  let text = |source: Bytes|
+    unit_text(unit_builder(source).unit([Named(b"m.read")]).produced.parts);
+  let reads = |source: Bytes, helper: Bytes| text(source).index_of(read_of(helper)) != None;
+  let int = text(b"fn kept() -> Int = 300\nfn read(n: Int) -> Int = n + kept()\n");
+  assert(int.index_of(b"INT64_C(300)") != None, None);
+  assert(int.index_of(read_of(constant_read_fn())) == None, None);
+  assert(int.index_of(b"ply_m_kept_") == None, None);
+  assert(
+    !reads(
+      b"fn kept() -> Bytes = b\"abc\"\nfn read(n: Int) -> Int = n + kept().len()\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    !reads(b"fn kept() -> U8 = 200u8\nfn read(_: Int) -> U8 = kept()\n", constant_read_fn()),
+    None,
+  );
+  assert(
+    !reads(
+      b"const fn kept() -> String = \"abc\"\nfn read(n: Int) -> Int = n + kept().len()\n",
+      const_fn_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    reads(b"fn kept() -> Int = 1 + 2\nfn read(n: Int) -> Int = n + kept()\n", constant_read_fn()),
+    None,
+  )
 }
 
 fn unit_in_store(
