@@ -18,6 +18,8 @@ const PREC = {
 const RESERVED = ['fn', 'if', 'pub', 'let', 'type', 'test', 'else', 'with', 'true', 'false', 'match',
   'import', 'effect', 'nondet', 'handle'];
 
+const CONTEXTUAL = ['parallel', 'simulate', 'try', 'with_scope'];
+
 const FIELD_NAME = $ => choice($.identifier, ...RESERVED);
 
 module.exports = grammar({
@@ -38,6 +40,10 @@ module.exports = grammar({
   conflicts: $ => [
     [$.sum_variant, $._type],
     [$.function_type, $.tuple_type],
+    [$._expression, $.parallel_expression],
+    [$._expression, $.simulate_expression],
+    [$._expression, $.try_block],
+    [$._expression, $.with_scope_expression],
   ],
 
 
@@ -368,6 +374,7 @@ module.exports = grammar({
     _expression: $ => choice(
       $._literal,
       $.identifier,
+      alias(choice(...CONTEXTUAL), $.identifier),
       $.qualified_name,
       $.field_expression,
       $.call_expression,

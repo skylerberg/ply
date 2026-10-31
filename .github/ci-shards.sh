@@ -774,12 +774,12 @@ cmd_comments() {
   local found
   found=$(
     cd "$root"
-    git grep -n -E '^\s*(//|/\*)' -- '*.ply' '*.rs' '*.pkg' ply.work ':!packages/std' ':!tests/fixtures/lang' \
+    git grep -n -E '^[[:space:]]*(//|/\*)' -- '*.ply' '*.rs' '*.pkg' ply.work ':!packages/std' ':!tests/fixtures/lang' \
       ':!tests/programs/fmt' ':!tests/programs/doc' || true
-    git grep -n -E '^\s*(//([^/!]|$)|/\*)' -- packages/std || true
-    git grep -n -E '^\s*//' -- packages/std/internal || true
-    git grep -n -E '^\s*//' -- tests/fixtures/lang | grep -vE ':\s*// (raises|refused|effects) .* ::' || true
-    git grep -n -E '^\s*#([^!]|$)' -- '*.sh' 'scripts/*' '.github/*.yml' '.github/*.yaml' '*.toml' \
+    git grep -n -E '^[[:space:]]*(//([^/!]|$)|/\*)' -- packages/std || true
+    git grep -n -E '^[[:space:]]*//' -- packages/std/internal || true
+    git grep -n -E '^[[:space:]]*//' -- tests/fixtures/lang | grep -vE ':[[:space:]]*// (raises|refused|effects) .* ::' || true
+    git grep -n -E '^[[:space:]]*#([^!]|$)' -- '*.sh' 'scripts/*' '.github/*.yml' '.github/*.yaml' '*.toml' \
       ':!tests' ':!examples/same-tests.sh' | grep -v '# shellcheck ' || true
     git ls-files -z 'packages/std/*.ply' ':!packages/std/internal' ':!packages/std/prelude.ply' |
       xargs -0 awk '
@@ -806,7 +806,7 @@ cmd_names() {
   found=$(
     cd "$root"
     git grep -n -w -E "$retired" -- '*.ply' ':!tests/fixtures' ':!tests/programs' |
-      grep -v -E '^[^:]+:[0-9]+:\s*(\\\\|///|//!|(test(/[a-z]+)?|law) ")' |
+      grep -v -E '^[^:]+:[0-9]+:[[:space:]]*(\\\\|///|//!|(test(/[a-z]+)?|law) ")' |
       sed -E 's/"([^"\\]|\\.)*"//g' | grep -w -E "$retired" || true
   )
   if [[ -n $found ]]; then
