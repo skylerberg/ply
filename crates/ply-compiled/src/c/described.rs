@@ -86,7 +86,8 @@ fn facts() -> Vec<(&'static str, usize)> {
 
 fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
     let result = s.result.map_or("-", Machine::name);
-    let _ = write!(out, "{kind} {name} {} {result}", u8::from(s.raises));
+    // The 0 is the column a release's compiler reads for a native that raises, which none does.
+    let _ = write!(out, "{kind} {name} 0 {result}");
     for p in s.params {
         let _ = write!(out, " {}", p.name());
     }

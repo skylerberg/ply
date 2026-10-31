@@ -2,7 +2,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Raises, Signature};
+use crate::native::{Addr, F64, I64, Native, Signature};
 use crate::rt::Ctx;
 
 /// A runtime helper the emitted C may call: what it takes past the context and returns, as its
@@ -113,8 +113,6 @@ machine! {
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
-    "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
-    "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
 }
 
 /// The natives over machine data: marshalling's and the rest of this table's, then strings' and
@@ -159,17 +157,6 @@ macro_rules! helpers {
 }
 
 helpers! {
-    rt_box_decimal(lo, hi) -> Word;
-    rt_no_match();
-    rt_let_no_match();
-    rt_overflow(what);
-    rt_decimal_overflow(what);
-    rt_by_zero(what);
-    rt_not_an_int(value);
-    rt_not_an_int_wide(lo, hi, signed);
-    rt_not_that_width(which, value);
-    rt_iterate_bad(what, n);
-    rt_shift_count(n, which);
     rt_stack_more() -> Word;
     rt_inc_shared(w);
     rt_note_update(in_place, copied);
@@ -215,7 +202,6 @@ helpers! {
     ) -> Handed;
     rt_unwind_hold(held) -> Word;
     rt_unwind_resume(held);
-    rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_branches(slots: *const Handed, n: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
     rt_const(index: I64, keep: KeepRoot) -> Handed;
