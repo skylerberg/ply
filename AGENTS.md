@@ -45,8 +45,9 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 
 ## Comments
 
-- Default to none. Clear names and small functions should explain the code; a comment that
-  restates it is noise. Write one only for a reason the code cannot show, an invariant the types
+- The compiler and the CLI hold none, and CI fails on one there.
+- Elsewhere, default to none. Clear names and small functions should explain the code; a comment
+  that restates it is noise. Write one only for a reason the code cannot show, an invariant the types
   do not enforce, or a trap, and keep it to one line. Delete stale or redundant comments you pass.
 - No history ("used to", "since #123"), no references to PRs or documents, no figures.
 - Doc comments (`///` above a declaration, `//!` at the head of a module) are for callers. Open
