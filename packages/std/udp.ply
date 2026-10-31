@@ -1,4 +1,5 @@
-//! Datagrams: UDP sockets, as an effect whose label names what a socket is for.
+//! Datagrams: UDP sockets, as an effect whose label names what a socket is for. A label is a name
+//! the caller chooses, so that one program can use several sets of sockets and tell them apart.
 //!
 //! A socket is bound. It then sends datagrams to addresses and receives datagrams from any sender.
 //! `recv_from` takes the most bytes it will accept. A longer datagram is cut to that size and
@@ -9,18 +10,19 @@
 //! and a socket's options are `std.net`'s `SocketOption`: `Broadcast`, `JoinGroup` and
 //! `LeaveGroup`, along with the buffer sizes.
 //!
-//! A run may bind a loopback address, or no address with port `0` for a client socket that sends
-//! requests and receives replies. Any other bind is `PermissionDenied`, as a listener beyond
-//! loopback is.
+//! A program running for real may bind a loopback address, or no address with port `0` for a client
+//! socket that sends requests and receives replies. Binding any other address fails with
+//! `PermissionDenied`. That includes acting as a listener on an address other than loopback.
 //!
 //! A datagram may be lost, arrive twice or arrive out of order, and a protocol over UDP is correct
 //! only if it stays correct when that happens. The fake is `MemUdp`, with a `mem_` function for
-//! every operation, and `on_mem` runs code written against any labels over one. A far end is a
-//! function from a datagram to the datagrams it replies with, or another of the program's own
-//! sockets. Each datagram the fake carries meets a `Fate`. First come the fates a test listed
+//! every operation. `on_mem` runs code that uses UDP sockets under any labels against one `MemUdp`.
+//! A far end is a function from a datagram to the datagrams it replies with, or another of the
+//! program's own sockets. Each datagram the fake carries gets a `Fate`, its outcome on the network:
+//! `Delivered`, `Dropped`, `Duplicated` or reordered. The fates a test lists come first
 //! (`mem_with_fates`). After those, each fate is drawn from a seed at the given chances
-//! (`mem_lossy`). Under `simulate` the seed is `sim.seed()`, so a run over many seeds is a run
-//! over many networks. Nothing waits in the fake: a receive with nothing to return times out.
+//! (`mem_lossy`). Under `simulate` the seed is `sim.seed()`, so a run over many seeds is a run over
+//! many networks. Nothing waits in the fake: a receive with nothing to return times out.
 
 import std.internal.native (native, wait, job_wait, found, parts, encode_parts, decode_int)
 import std.ip
@@ -34,7 +36,8 @@ import std.random (Rand, rand, rand_below)
 /// One received datagram: its sender, the part of it that fit, and whether it was longer.
 pub type Datagram = { from: SocketAddress, payload: Bytes, truncated: Bool }
 
-/// Datagram sockets, under the label the caller gives them.
+/// Datagram sockets. The label `[l]` on each operation names what the sockets are for, so a program
+/// can use separate sets of sockets under different labels.
 pub nondet effect udp {
   /// Binds a socket at `at`, with `options` set before it binds. Port `0` requests any free port,
   /// which `local_address` then reports. `at` must be a loopback address, or the unspecified
@@ -45,18 +48,17 @@ pub nondet effect udp {
   /// Sends `payload` to `to` as one datagram and returns its length. A successful send does not
   /// mean the datagram arrived.
   write send_to[s](socket: Int, to: SocketAddress, payload: Bytes, timeout_ms: Int) -> Result<Int, Error>
-  /// `send_to` the far end that `connect` fixed. A socket with no far end is a runtime error.
+  /// Sends `payload` as one datagram to the far end that `connect` fixed, and returns its length,
+  /// as `send_to` does. A socket with no far end is a runtime error.
   write send[s](socket: Int, payload: Bytes, timeout_ms: Int) -> Result<Int, Error>
   /// Receives the next datagram, up to `max` bytes of it. On a connected socket, `Rejected` means
   /// the far end reported that no one was listening for an earlier send.
   write recv_from[s](socket: Int, max: Int, timeout_ms: Int) -> Result<Datagram, Error>
-  /// Sets one option of a socket.
   write set_option[s](socket: Int, option: SocketOption) -> Result<Unit, Error>
-  /// Closes a socket.
   write close[s](socket: Int) -> Unit
-  /// The address the socket is bound to.
+  /// Returns the address the socket is bound to, or `None` when the socket does not exist or is not
+  /// bound.
   read local_address[s](socket: Int) -> Option<SocketAddress>
-  /// The socket's current options.
   read options[s](socket: Int) -> List<SocketOption>
 }
 
@@ -66,8 +68,6 @@ pub fn bound<[l]>(
   options: List<SocketOption>,
 ) -> Int / {udp.bind[l], socket.fail} =
   match udp.bind[l](at, options) { Ok(s) -> s, Err(reason) -> socket.fail(reason) }
-
-// --- The fake ---------------------------------------------------------------
 
 /// What becomes of one datagram on its way.
 pub type Fate =
@@ -155,14 +155,10 @@ fn check_timeout(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
     )
   } else { () }
 
-/// Returns `max`, or fails if a receive requests no bytes. A datagram longer than the requested
-/// size is cut to it and marked `truncated`, so requesting none would lose every datagram.
 fn checked_max(max: Int) -> Int / {abort.raise} =
   if max <= 0 { panic("`udp.recv_from` was asked for " ++ max.to_string() ++ " bytes") }
   else { max }
 
-/// Whether a run may bind at `at`: a loopback address, or no address and no port for a client
-/// socket. A run may not open a socket that anything on a network could reach at a known port.
 fn bindable(at: SocketAddress) -> Bool = {
   let address = ip::socket_ip(at);
   ip::is_loopback(address) || (ip::is_unspecified(address) && ip::socket_port(at) == 0)
@@ -183,7 +179,6 @@ fn socket_of(u: MemUdp, label: String, id: Int) -> MemSocket / {abort.raise} =
 fn with_socket(u: MemUdp, id: Int, s: MemSocket) -> MemUdp =
   { ..u, sockets: u.sockets.insert(id, s) }
 
-/// Performs `udp.bind` on the fake network.
 pub fn mem_bind(
   u: MemUdp,
   label: String,
@@ -219,7 +214,6 @@ pub fn mem_bind(
   }
 }
 
-/// Performs `udp.connect` on the fake network.
 pub fn mem_connect(
   u: MemUdp,
   label: String,
@@ -230,8 +224,6 @@ pub fn mem_connect(
   { udp: with_socket(u, socket, { ..s, peer: Some(to) }), result: Ok(()) }
 }
 
-/// The fate of the next datagram, and the network after choosing it: the next listed fate, or
-/// else one drawn at the network's chances.
 fn next_fate(u: MemUdp) -> { udp: MemUdp, fate: Fate } / {abort.raise} =
   match u.queued_fates {
     [fate, ..rest] ->
@@ -252,19 +244,15 @@ fn next_fate(u: MemUdp) -> { udp: MemUdp, fate: Fate } / {abort.raise} =
     },
   }
 
-/// Whether the socket `s` receives a datagram sent to `to`. It does when the datagram is sent to
-/// its port at its address (any address when it is bound to none), or to a group it joined.
 fn receives(s: MemSocket, to: SocketAddress) -> Bool =
   ip::socket_port(s.at) == ip::socket_port(to)
     && (ip::socket_ip(s.at) == ip::socket_ip(to) || ip::is_unspecified(ip::socket_ip(s.at))
     || s.groups.filter(|group: Ip| group == ip::socket_ip(to)).len() > 0)
 
-/// The handles of the sockets that receive a datagram sent to `to`, in ascending order.
 fn receivers(u: MemUdp, to: SocketAddress) -> List<Int> =
   u.sockets.fold([], |found: List<Int>, id: Int, s: MemSocket|
     if receives(s, to) { found.push(id) } else { found })
 
-/// Queues `datagram` for the socket `to` to receive, as its fate decides.
 fn deliver(u: MemUdp, to: Int, datagram: Datagram, fate: Fate) -> MemUdp =
   match u.sockets.get(to) {
     None -> u,
@@ -279,8 +267,6 @@ fn deliver(u: MemUdp, to: Int, datagram: Datagram, fate: Fate) -> MemUdp =
     },
   }
 
-/// Carries one datagram from `from` to every socket that receives at `to`, each copy meeting its
-/// own fate.
 fn transmit(
   u: MemUdp,
   from: SocketAddress,
@@ -292,8 +278,6 @@ fn transmit(
     deliver(dealt.udp, id, { from: from, payload: payload, truncated: false }, dealt.fate)
   })
 
-/// The address a datagram from the socket `s` to `to` appears to come from: where `s` is bound,
-/// or loopback when it is bound to no address.
 fn source(s: MemSocket, to: SocketAddress) -> SocketAddress / {abort.raise} =
   if ip::is_unspecified(ip::socket_ip(s.at)) {
     ip::socket_at(ip::loopback_like(ip::socket_ip(to)), ip::socket_port(s.at))
@@ -307,9 +291,11 @@ fn is_broadcast(address: Ip) -> Bool =
   match address { V4(four) -> ip::v4_to_int(four) == 4294967295, V6(_) -> false }
 
 /// Performs `udp.send_to` on the fake network. The datagram goes to each of the program's own
-/// sockets that receives at `to`, or to the far end the network was given there, whose replies
-/// come back the same way. Each trip meets a fate. When no one is at `to`, nothing arrives, and on
-/// a connected socket the next receive returns `Rejected`.
+/// sockets that receives at `to`. If there are none, it goes to the responder registered for `to`
+/// in `returning`, and the responder's replies are sent back to the socket. Every datagram,
+/// including each reply, gets its own `Fate`, its outcome on the network (delivered, dropped or
+/// duplicated). When nothing is at `to`, nothing arrives, and on a connected socket the next
+/// receive returns `Rejected`.
 pub fn mem_send_to(
   u: MemUdp,
   label: String,
@@ -484,13 +470,8 @@ pub fn on_mem<a | e>(
     return value -> { value: value, udp: t },
   }
 
-// --- The host handler -------------------------------------------------------
-
 host for udp by host_handler
 
-/// Runs `go` with every datagram socket opened on the machine. Each socket goes in the run's
-/// single socket table under the label the clause binds, and every operation that waits does so in
-/// the calling task.
 fn host_handler<a | e>(
   go: () -> a / {udp.read[*], udp.write[*] | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
@@ -531,13 +512,10 @@ fn host_handler<a | e>(
     udp.options[*label](socket) -> net::decode_options(udp_options(label, socket)),
   }
 
-/// Binds a datagram socket at the encoded address, with the encoded options set before it binds.
 extern fn udp_bind(label: String, at: Bytes, options: Bytes) -> Bytes / {native.read}
 
-/// Fixes a datagram socket's far end at the encoded address.
 extern fn udp_connect(label: String, socket: Int, to: Bytes) -> Bytes / {native.read}
 
-/// Sends `payload` as one datagram to the encoded address, and returns a ticket.
 extern fn udp_send_to(
   label: String,
   socket: Int,
@@ -546,7 +524,6 @@ extern fn udp_send_to(
   timeout_ms: Int,
 ) -> Int / {native.read}
 
-/// Sends `payload` as one datagram to the far end `connect` fixed, and returns a ticket.
 extern fn udp_send(
   label: String,
   socket: Int,
@@ -554,7 +531,6 @@ extern fn udp_send(
   timeout_ms: Int,
 ) -> Int / {native.read}
 
-/// Receives the next datagram, up to `max` bytes of it, and returns a ticket.
 extern fn udp_recv_from(
   label: String,
   socket: Int,
@@ -562,28 +538,20 @@ extern fn udp_recv_from(
   timeout_ms: Int,
 ) -> Int / {native.read}
 
-/// Sets the encoded option on a datagram socket.
 extern fn udp_set_option(label: String, socket: Int, option: Bytes) -> Bytes / {native.read}
 
-/// Closes a datagram socket.
 extern fn udp_close(label: String, socket: Int) -> Unit / {native.read}
 
-/// The address a datagram socket is bound to, in the form `found` decodes.
 extern fn udp_local_address(label: String, socket: Int) -> Bytes / {native.read}
 
-/// Each option a datagram socket has, encoded as parts.
 extern fn udp_options(label: String, socket: Int) -> Bytes / {native.read}
 
-/// Decodes a datagram as the host's natives write one: parts for the sender's address, the
-/// payload, and byte 1 when it was cut short.
 fn datagram_read(flat: Bytes) -> Datagram / {abort.raise} =
   match parts(flat) {
     [from, payload, truncated] ->
       { from: net::decode_address(from), payload: payload, truncated: truncated == b"\x01" },
     _ -> panic("the runtime returned a received packet that is not made of a sender address, a payload and a truncation flag"),
   }
-
-// --- Tests ------------------------------------------------------------------
 
 fn bind_socket<[l]>(text: String) -> Int / {udp.bind[l], ip.fail, abort.raise} =
   match udp.bind[l](ip::read_socket(text), []) {
@@ -738,7 +706,6 @@ test "the test network delivers, drops, duplicates or reorders each datagram as 
   assert_eq(ran.udp.applied_fates, [Delivered, Dropped, Duplicated, Overtaking, Delivered])
 }
 
-/// A far end that replies to a request with its first byte, then the rest of its bytes reversed.
 fn reverse_tail(question: Bytes) -> List<Bytes> =
   if question.len() == 0 { [] } else {
     [
@@ -747,8 +714,6 @@ fn reverse_tail(question: Bytes) -> List<Bytes> =
     ]
   }
 
-/// The reply to `question` from `server`, sent up to `attempts` times. A reply must start with the
-/// question's first byte, so a late or duplicated reply to an earlier question is skipped.
 fn asked<[l]>(
   socket: Int,
   server: SocketAddress,
@@ -764,7 +729,6 @@ fn asked<[l]>(
       }
     })
 
-/// The first waiting datagram that replies to `question`, reading at most `most` datagrams.
 fn result_to<[l]>(
   socket: Int,
   question: Bytes,

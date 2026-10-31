@@ -1,32 +1,33 @@
-//! Lazy sequences: elements made one at a time, as a consumer requests them.
+//! Lazy sequences: elements produced one at a time, as a consumer asks for them.
 //!
-//! A `Seq<a | e>` is a function that returns its next `Step`: an element and the rest, the rest
-//! alone, or the end. Nothing runs until a consumer pulls. An adapter (`map`, `filter`, `take` and
-//! the others) wraps that function without calling it. So a pipeline keeps one element at a time
-//! and no list per stage, and each stage adds a closure and a step to every pull through it. The
-//! effects `e` are what a pull performs: a sequence whose steps read a file or a socket shows it in
-//! its type, and the effect is handled where the sequence is consumed. A sequence is a value, so
-//! pulling it again from its start runs its steps again and performs their effects again.
+//! A `Seq<a | e>` is a function that returns its next `Step`: an element and the rest of the
+//! sequence, a skip and the rest, or the end. Nothing runs until a consumer pulls. An adapter
+//! (`map`, `filter`, `take` and others) wraps a sequence in a new function without calling it. A
+//! pipeline therefore holds one element at a time, not a list per stage, and each stage adds a
+//! closure and a step to every pull. The effects `e` are what a pull performs: a sequence whose
+//! steps read a file or a socket shows that in its type, and the effect is handled where the
+//! sequence is consumed. A sequence is a value, so pulling it again from the start runs its steps
+//! and performs their effects again.
 //!
-//! A sequence may have no end, as `repeat`, `cycle`, `iterate` and an `unfold` that never returns
-//! `None` have none, and no type distinguishes such a sequence from one that ends. A sequence with
-//! an end may still skip any number of times before its next element, as a `filter` over an endless
-//! sequence does. So `take` bounds the elements a consumer sees, not the pulls it makes. Two rules
-//! keep a consumer from running forever without output. First, a pull does a bounded amount of
-//! work, which is what `Skip` is for: an adapter that drops an element returns the rest instead of
-//! looking for the next element. Second, every consumer takes a budget, as the prelude's `iterate`
-//! does: the most elements and skips it may pull. A consumer that would pull more raises
-//! `seq.spent`, so it never returns a result for part of a sequence as if for the whole; `try`
-//! turns that raise into an `Err`. The pull that returns `Done` is not counted, so
-//! `to_list(of_list(xs), xs.len())` is `xs`.
+//! A sequence may be endless, as `repeat`, `cycle`, `iterate` and an `unfold` that never returns
+//! `None` are, and no type tells an endless sequence from a finite one. A finite sequence may also
+//! skip many times before its next element, as a `filter` over an endless sequence does. So `take`
+//! limits the elements a consumer sees, not the pulls it makes. Two rules stop a consumer from
+//! running forever without output. First, each pull does a bounded amount of work, which is what
+//! `Skip` is for: an adapter that drops an element returns `Skip` instead of searching for the next
+//! element. Second, every consumer takes a budget, as the prelude's `iterate` does: the most
+//! elements and skips it may pull. A consumer that would pull more raises `seq.spent`, so it never
+//! returns part of a sequence as if it were the whole; `try` turns that raise into an `Err`. The
+//! final pull that returns `Done` does not count toward the budget, so `to_list(of_list(xs),
+//! xs.len())` is `xs`.
 //!
-//! `combinations`, `permutations` and `cartesian` return the selections from a list one at a time,
-//! since there are too many to fit in a list long before the list they are taken from is long.
+//! `combinations`, `permutations` and `cartesian` return their selections one at a time, because
+//! the number of selections grows too fast to build them all as a list.
 //!
 //! `range` and `iterate` are also prelude names, and `map`, `filter` and `fold` are also list
 //! functions, so qualify them: `seq::map(s, f)`. An adapter's pulls nest as deep as the pipeline,
-//! so a sequence built by appending in a loop is as deep as the loop was long. `flat_map` over the
-//! parts stays flat.
+//! so a sequence built by appending in a loop is as deep as the loop ran. `flat_map` over the
+//! sequences to append stays flat.
 
 import std.laws (agrees)
 import std.list
@@ -51,13 +52,8 @@ pub effect seq {
   raise spent(budget: Int)
 }
 
-/// The pulls an adapter counts down, which is the measure that proves its definition terminates. No
-/// run reaches it, and it is the largest count a closure can store in a word.
 fn max_pulls() -> Int = 4611686018427387903
 
-// --- Builders ---------------------------------------------------------------
-
-/// The empty sequence.
 pub fn empty<a | e>() -> Seq<a | e> = || Done
 
 /// The sequence of `x` alone.
@@ -69,9 +65,9 @@ pub fn of_list<a | e>(xs: List<a>) -> Seq<a | e> = from_index(xs, 0)
 fn from_index<a | e>(xs: List<a>, i: Int) -> Seq<a | e> =
   || match xs.at(i) { Some(x) -> Yield(x, from_index(xs, i + 1)), None -> Done }
 
-/// The integers from `lo` toward `hi`, `step` apart, without reaching `hi`. They go upward for a
-/// positive `step` and downward for a negative one. A `step` of zero gives the empty sequence, and
-/// a range that would pass the last `Int` ends there.
+/// Returns the integers from `lo` toward `hi`, each `step` after the previous one, stopping before
+/// `hi`. It counts up for a positive `step` and down for a negative one. A `step` of zero gives the
+/// empty sequence, and the sequence ends before it would overflow `Int`.
 pub fn range<| e>(lo: Int, hi: Int, step: Int = 1) -> Seq<Int | e> =
   stepped(lo, hi, step, max_pulls())
 
@@ -82,7 +78,7 @@ fn stepped<| e>(at: Int, hi: Int, step: Int, fuel: Int) -> Seq<Int | e> =
       Yield(at, if next > at == (step > 0) { stepped(next, hi, step, fuel - 1) } else { empty() })
     }
 
-/// `x`, without end.
+/// Returns a sequence that repeats `x` without end.
 pub fn repeat<a | e>(x: a) -> Seq<a | e> = repeated(x, max_pulls())
 
 fn repeated<a | e>(x: a, fuel: Int) -> Seq<a | e> =
@@ -151,7 +147,6 @@ fn lines_from<| e>(data: Bytes, at: Int, fuel: Int) -> Seq<String | e> =
       }
     }
 
-/// Where the line starting at `at` ends: `at` is inside the text or just past it.
 fn line_end(data: Bytes, at: Int) -> Option<Int> =
   handle { data.index_of_from(b"\n", at) } with { abort.raise(_) -> None }
 
@@ -176,8 +171,6 @@ fn sliced<| e>(data: Bytes, size: Int, at: Int, fuel: Int) -> Seq<Bytes | e> =
         sliced(data, size, end, fuel - 1),
       )
     }
-
-// --- Selections --------------------------------------------------------------
 
 /// Every way to choose `k` of the elements of `xs`, each as a list in the order of `xs`. The
 /// choices come in order of the positions chosen: the first is the first `k` elements, and the last
@@ -211,8 +204,6 @@ pub fn cartesian<a | e>(xss: List<List<a>>) -> Seq<List<a> | e> =
     list::filter_map(list::zip(xss, digits), |taken: { first: List<a>, second: Int }|
       taken.first.at(taken.second)))
 
-/// What `pick` returns for each row of digits in turn. The digit at each place counts from zero up
-/// to that place's radix, and the last place counts fastest. A radix below one leaves no rows.
 fn odometer<a | e>(radices: List<Int>, pick: keep (List<Int>) -> a) -> Seq<a | e> =
   rows_from(
     if radices.all(|radix: Int| radix > 0) { Some(counted(0, 0, radices.len(), [])) } else { None },
@@ -220,8 +211,6 @@ fn odometer<a | e>(radices: List<Int>, pick: keep (List<Int>) -> a) -> Seq<a | e
     pick,
   )
 
-/// What `pick` returns for the row `first` and for each row `next` returns after it, until `next`
-/// returns `None`.
 fn rows_from<a | e>(
   first: Option<List<Int>>,
   next: keep (List<Int>) -> Option<List<Int>>,
@@ -232,8 +221,6 @@ fn rows_from<a | e>(
   unfold(first, step)
 }
 
-/// The row after `digits`, or `None` after the last row. The last place still below its radix goes
-/// up by one, and the places after it restart at zero.
 fn next_digits(digits: List<Int>, radices: List<Int>) -> Option<List<Int>> =
   match list::enumerate(list::zip(digits, radices)).find_last(
       |place: { index: Int, value: { first: Int, second: Int } }|
@@ -251,9 +238,6 @@ fn next_digits(digits: List<Int>, radices: List<Int>) -> Option<List<Int>> =
       ),
   }
 
-/// The choice of positions out of `n` that follows `positions`, or `None` after the last choice.
-/// The last position with room ahead of it moves up by one, and the positions after it follow
-/// directly behind it.
 fn next_choice(positions: List<Int>, n: Int) -> Option<List<Int>> =
   match list::enumerate(positions).find_last(|held: { index: Int, value: Int }|
       held.value < n - positions.len() + held.index) {
@@ -262,7 +246,6 @@ fn next_choice(positions: List<Int>, n: Int) -> Option<List<Int>> =
       Some(counted(moved.value + 1, 1, positions.len() - moved.index, positions.take(moved.index))),
   }
 
-/// The elements the digits pick in turn, each digit indexing the elements still `left`.
 fn arranged<a>(digits: List<Int>, left: List<a>, out: List<a>) -> List<a> =
   match digits {
     [] -> out,
@@ -272,13 +255,10 @@ fn arranged<a>(digits: List<Int>, left: List<a>, out: List<a>) -> List<a> =
     },
   }
 
-/// `out` followed by `count` numbers, starting at `from` and `step` apart.
 fn counted(from: Int, step: Int, count: Int, out: List<Int>) -> List<Int> =
   if count <= 0 { out } else { counted(from + step, step, count - 1, out.push(from)) }
 
-// --- Adapters ---------------------------------------------------------------
-
-/// `f` of each element, called when the element is pulled.
+/// Returns a sequence that applies `f` to each element of `s` when that element is pulled.
 pub fn map<a, b | e>(s: Seq<a | e>, f: keep (a) -> b / e) -> Seq<b | e> = mapped(s, f, max_pulls())
 
 fn mapped<a, b | e>(s: Seq<a | e>, f: keep (a) -> b / e, fuel: Int) -> Seq<b | e> =
@@ -362,7 +342,8 @@ fn taken<a | e>(s: Seq<a | e>, n: Int, fuel: Int) -> Seq<a | e> =
       }
     }
 
-/// Everything but the first `n` elements, each of which becomes a skip.
+/// Returns `s` without its first `n` elements. While it drops them, the sequence yields `Skip` for
+/// each dropped element instead of `Yield`.
 pub fn drop<a | e>(s: Seq<a | e>, n: Int) -> Seq<a | e> =
   if n <= 0 { s } else { dropped(s, n, max_pulls()) }
 
@@ -376,8 +357,8 @@ fn dropped<a | e>(s: Seq<a | e>, n: Int, fuel: Int) -> Seq<a | e> =
       }
     }
 
-/// The longest prefix for whose every element `ok` returns true. `ok` is not called past the first
-/// element for which it returns false, and `s` is pulled no further.
+/// Returns the longest prefix of `s` in which `ok` returns true for every element. `ok` is not
+/// called on elements after the first one it rejects, and `s` is not pulled any further.
 pub fn take_while<a | e>(s: Seq<a | e>, ok: keep (a) -> Bool / e) -> Seq<a | e> =
   taken_while(s, ok, max_pulls())
 
@@ -452,7 +433,6 @@ pub fn zip<a, b | e>(a: Seq<a | e>, b: Seq<b | e>) -> Seq<{ first: a, second: b 
 pub fn zip_with<a, b, c | e>(a: Seq<a | e>, b: Seq<b | e>, f: keep (a, b) -> c / e) -> Seq<c | e> =
   zipped(a, None, b, f, max_pulls())
 
-/// `held` is an element pulled from the left while the right returned a skip.
 fn zipped<a, b, c | e>(
   left: Seq<a | e>,
   held: Option<a>,
@@ -525,8 +505,8 @@ fn appended<a | e>(a: Seq<a | e>, b: Seq<a | e>, fuel: Int) -> Seq<a | e> =
       }
     }
 
-/// An element of `a`, then one of `b`, and so on in turn; once either has ended, the rest of the
-/// other.
+/// Returns the elements of `a` and `b` alternately, starting with `a`. When one sequence ends, the
+/// rest of the other sequence follows.
 pub fn interleave<a | e>(a: Seq<a | e>, b: Seq<a | e>) -> Seq<a | e> =
   interleaved(a, b, max_pulls())
 
@@ -575,13 +555,11 @@ fn inspected<a | e>(s: Seq<a | e>, f: keep (a) -> Unit / e, fuel: Int) -> Seq<a 
       }
     }
 
-/// The state of one side of a merge: a sequence not yet pulled for its next element, that element
-/// with the rest, or the end.
 type Side<a | e> = | Unread(Seq<a | e>) | Read(a, Seq<a | e>) | Exhausted
 
-/// The elements of both sequences in one order, given that each is already in that order. `before`
-/// returns whether its first argument comes first; of two elements it does not order, `a`'s comes
-/// first.
+/// Returns the elements of both sequences in sorted order, given that each is already sorted by
+/// `before`. `before(x, y)` returns true when `x` comes before `y`. When neither of two elements
+/// comes before the other, the element from `a` comes first.
 pub fn merge_sorted<a | e>(
   a: Seq<a | e>,
   b: Seq<a | e>,
@@ -615,8 +593,6 @@ fn merged<a | e>(
 
 fn side_of<a | e>(step: Step<a | e>) -> Side<a | e> =
   match step { Done -> Exhausted, Skip(rest) -> Unread(rest), Yield(x, rest) -> Read(x, rest) }
-
-// --- Consumers --------------------------------------------------------------
 
 /// Folds `f` over the elements in order, starting from `init`. Each call gets the result of the
 /// previous one.
@@ -688,11 +664,9 @@ fn pulled<a | e>(
     Yield(x, rest) -> if left <= 0 { seq.spent(budget) } else { Some({ value: x, rest: rest }) },
   }
 
-/// The elements as a list.
 pub fn to_list<a | e>(s: Seq<a | e>, budget: Int) -> List<a> / {seq.spent | e} =
   fold(s, budget, [], |acc: List<a>, x: a| acc.push(x))
 
-/// How many elements the sequence has.
 pub fn length<a | e>(s: Seq<a | e>, budget: Int) -> Int / {seq.spent | e} =
   fold(s, budget, 0, |n: Int, _: a| n + 1)
 
@@ -732,13 +706,8 @@ pub fn all<a | e>(s: Seq<a | e>, budget: Int, ok: (a) -> Bool / e) -> Bool / {se
 pub fn for_each<a | e>(s: Seq<a | e>, budget: Int, f: (a) -> Unit / e) -> Unit / {seq.spent | e} =
   fold(s, budget, (), |_: Unit, x: a| f(x))
 
-// --- Tests ------------------------------------------------------------------
-
-/// A pure sequence's elements, under a budget no test here comes near.
 fn listed<a>(s: Seq<a | {}>) -> List<a> / {seq.spent} = to_list(s, 1000000)
 
-/// The integers from zero up to `n`, as the prelude's `range` returns them. This module's own
-/// `range` hides the prelude's name.
 fn upto(n: Int) -> List<Int> =
   list::enumerate(List::replicate((), n)).map(|p: { index: Int, value: Unit }| p.index)
 
@@ -1011,12 +980,9 @@ effect feed {
   write next() -> Option<Int>
 }
 
-/// The values `feed.next` returns, each requested when it is pulled.
 fn feed_values() -> Seq<Int | {feed.next}> =
   unfold((), |_: Unit| match feed.next() { Some(x) -> Some({ value: x, next: () }), None -> None })
 
-/// What `body` returns when `feed.next` returns the integers from zero up to `n`, and how many
-/// times `feed.next` was called.
 fn count_pulls<a>(
   n: Int,
   body: () -> a / {feed.next, seq.spent},
@@ -1126,7 +1092,6 @@ test "a consumer runs as a loop however long the sequence is" {
   )
 }
 
-/// Every choice of `k` elements of `xs`, built by deciding whether the first element is among them.
 fn chosen(xs: List<Int>, k: Int) -> List<List<Int>> =
   if k == 0 { [[]] } else {
     match xs {
@@ -1138,7 +1103,6 @@ fn chosen(xs: List<Int>, k: Int) -> List<List<Int>> =
     }
   }
 
-/// Every arrangement of `k` elements of `xs`, built by deciding which element comes first.
 fn rows(xs: List<Int>, k: Int) -> List<List<Int>> =
   if k <= 0 { if k == 0 { [[]] } else { [] } } else {
     list::enumerate(xs).flat_map(|head: { index: Int, value: Int }|
@@ -1146,20 +1110,15 @@ fn rows(xs: List<Int>, k: Int) -> List<List<Int>> =
         list::prepend(head.value, others)))
   }
 
-/// The elements of `xs` with a skip before each one, as an adapter's source may produce them.
 fn with_skips(xs: List<Int>) -> Seq<Int | {}> = flat_map(of_list(xs), |x: Int| once(x))
 
-/// A list and a small number, which a test draws together.
 type Cut = { xs: List<Int>, n: Int }
 
-/// Two lists, which a test draws together.
 type Two = { xs: List<Int>, ys: List<Int> }
 
-/// A `Cut` as a test draws one.
 fn cuts() -> gen::Gen<Cut> =
   gen::map2(gen::list(gen::any_int()), gen::any_int(), |xs: List<Int>, n: Int| { xs: xs, n: n })
 
-/// A `Two` as a test draws one.
 fn twos() -> gen::Gen<Two> =
   gen::map2(gen::list(gen::any_int()), gen::list(gen::any_int()), |xs: List<Int>, ys: List<Int>|
     { xs: xs, ys: ys })

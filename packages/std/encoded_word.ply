@@ -1,27 +1,32 @@
-//! Text outside ASCII in a header field: RFC 2047's encoded words, and RFC 2231's and RFC 8187's
-//! extended parameter values.
+//! Reads and writes text outside ASCII in a header field: RFC 2047's encoded words, and the
+//! extended parameter values of RFC 2231 and RFC 8187.
 //!
-//! An encoded word is `=?charset?coding?text?=`: a charset's name, `Q` or `B`, and bytes written in
-//! that coding. `Q` is quoted-printable restricted to what every header position allows, with `_`
-//! for a space, and `B` is base64. `encode` leaves printable ASCII that contains no `=?` unchanged.
-//! It writes any other text as UTF-8 words of at most 75 characters with a space between them,
-//! never splitting a character. `encode_words` returns the words themselves, whatever the text
-//! contains. `read` returns the text of a field's value: each encoded word is decoded wherever it
-//! appears, blanks between two encoded words are dropped, and everything else is kept as written.
-//! Anything shaped like an encoded word must be a valid one. So each of these raises an `Error`,
-//! which `decode` returns as an `Err`: a charset or a coding this module does not know, encoded
-//! text that is invalid in its coding, and bytes that are not text in the charset. A word longer
-//! than 75 characters is still read. `pieces` returns the parts `read` is made of, each word with
-//! its text or the reason it has none, for a reader that keeps an unreadable word as written.
+//! An encoded word is `=?charset?coding?text?=`: a charset's name, the coding `Q` or `B`, and the
+//! text's bytes written in that coding. `Q` is quoted-printable restricted to the characters
+//! allowed in every header position, with `_` for a space. `B` is base64.
+//!
+//! `encode` returns printable ASCII that contains no `=?` unchanged. It writes any other text as
+//! UTF-8 encoded words of at most 75 characters, separated by spaces, and never splits a character
+//! between words. `encode_words` always writes encoded words, even for text that `encode` would
+//! leave unchanged.
+//!
+//! `read` returns the text of a field's value. It decodes each encoded word wherever it appears,
+//! drops the blanks between two encoded words, and leaves everything else as written. Text shaped
+//! like an encoded word must be a valid one. `read` raises an `Error`, and `decode` returns it as
+//! an `Err`, for a charset or coding this module does not know, for encoded text that is invalid in
+//! its coding, and for bytes that are not valid text in the charset. A word longer than 75
+//! characters is still read. `pieces` returns the parts that `read` is made of, each word with its
+//! text or the reason it has none, for a caller that wants to keep an unreadable word as written.
 //!
 //! An extended value is `charset'language'text`, with the text's bytes percent-encoded. It is the
 //! value of a parameter whose name ends in `*`, as in `filename*=UTF-8''na%C3%AFve.txt`. The
 //! language is read and dropped. RFC 2231 also splits a value into sections, `name*0*`, `name*1`,
-//! and only the first names the charset. `read_sections` reads them as one value and
+//! and only the first section names the charset. `read_sections` reads sections as one value and
 //! `encode_sections` writes one. `std.mime` decides which parameters are sections of one value.
 //!
 //! The charsets read and written are UTF-8, US-ASCII, ISO-8859-1, ISO-8859-2, ISO-8859-15,
-//! windows-1250, windows-1251, windows-1252 and KOI8-R. Any other is rejected by name.
+//! windows-1250, windows-1251, windows-1252 and KOI8-R. Any other charset is an error of kind
+//! `UnknownCharset`, which carries the charset's name.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes
@@ -33,15 +38,14 @@ import std.string
 import std.url (url_encode)
 import std.gen
 
-/// A character set this module reads and writes.
 pub type Charset =
   | Utf8
   | UsAscii
-  /// ISO-8859-1.
   | Latin1
-  /// ISO-8859-2, central Europe's.
+  /// ISO-8859-2, the charset for Central European languages.
   | Latin2
-  /// ISO-8859-15: ISO-8859-1 with the euro sign and the letters French and Finnish lacked.
+  /// ISO-8859-15: ISO-8859-1 with the euro sign and with the French and Finnish letters that
+  /// ISO-8859-1 lacks.
   | Latin9
   | Windows1250
   | Windows1251
@@ -52,7 +56,6 @@ pub type Charset =
 pub type Coding =
   /// Printable ASCII as itself, `_` for a space, and `=` with two hex digits for any other byte.
   | Q
-  /// Base64.
   | B
 
 /// Why a text cannot be read.
@@ -81,8 +84,6 @@ pub effect encoded_word {
 fn fail<a>(at: Int, reason: ErrorKind) -> a / {encoded_word.fail} =
   encoded_word.fail({ at: at, reason: reason })
 
-// --- Charsets ---------------------------------------------------------------
-
 /// The charset a name means, in any case: `utf-8` and `utf8`; `us-ascii` and `ascii`;
 /// `iso-8859-1`, `iso8859-1`, `iso_8859-1`, `latin1` and `l1`, and the same five forms of
 /// ISO-8859-2 and ISO-8859-15 (`latin2`, `l2`, `latin9`, `l9`); `windows-1250`, `windows-1251` and
@@ -101,7 +102,7 @@ pub fn charset_named(name: String) -> Option<Charset> =
     _ -> None,
   }
 
-/// The name a charset is registered under.
+/// Returns the name of `c` in the IANA charset registry, as written in an encoded word.
 pub fn charset_name(c: Charset) -> String =
   match c {
     Utf8 -> "UTF-8",
@@ -115,13 +116,13 @@ pub fn charset_name(c: Charset) -> String =
     Koi8R -> "KOI8-R",
   }
 
-/// Every charset this module reads and writes.
 pub fn charsets() -> List<Charset> =
   [Utf8, UsAscii, Latin1, Latin2, Latin9, Windows1250, Windows1251, Windows1252, Koi8R]
 
-/// The text `data` encodes in a charset; `None` when it is not text: bytes that are not UTF-8, a
-/// byte past 127 in US-ASCII, or a byte a single-byte charset maps to no character. Every byte is
-/// a character of ISO-8859-1, ISO-8859-2, ISO-8859-15 and KOI8-R.
+/// Returns the text that the bytes `data` spell in the charset `c`, or `None` when `data` is not
+/// valid in it. That happens for bytes that are not UTF-8, for a byte above 127 in US-ASCII, and
+/// for a byte that a single-byte charset maps to no character. Every byte is valid in ISO-8859-1,
+/// ISO-8859-2, ISO-8859-15 and KOI8-R.
 pub fn text_of(c: Charset, data: Bytes) -> Option<String> / {abort.raise} =
   match c {
     Utf8 -> if data.is_utf8() { Some(String::of_bytes(data)) } else { None },
@@ -132,7 +133,8 @@ pub fn text_of(c: Charset, data: Bytes) -> Option<String> / {abort.raise} =
     },
   }
 
-/// `text` in a charset; `None` when it contains a character the charset lacks.
+/// Returns the bytes that spell `text` in the charset `c`, or `None` when `text` contains a
+/// character the charset lacks.
 pub fn bytes_of(c: Charset, text: String) -> Option<Bytes> / {abort.raise} =
   match c {
     Utf8 -> Some(Bytes::of_string(text)),
@@ -156,15 +158,12 @@ type Point = { byte: Int, point: Int }
 fn enumerate_points(points: List<Int>) -> List<Point> =
   range(0, points.len()).map(|b: Int| { byte: b, point: points.at_or(b, -1) })
 
-/// The character of each byte of a single-byte charset, by its scalar value: `-1` for a byte the
-/// charset maps to no character. A byte outside the charset's table is ISO-8859-1's.
 fn points_of(c: Charset) -> List<Int> / {abort.raise} = {
   let first = table_start(c);
   let held = table(c).code_points().map(|p: Int| if p == 0xFFFD { -1 } else { p });
   range(0, first).concat(held).concat(range(first + held.len(), 256))
 }
 
-/// The byte a single-byte charset's table starts at.
 fn table_start(c: Charset) -> Int =
   match c {
     Latin2 | Latin9 -> 0xA0,
@@ -172,9 +171,6 @@ fn table_start(c: Charset) -> Int =
     _ -> 256,
   }
 
-/// The characters of a single-byte charset's bytes from `table_start` on, where it differs from
-/// ISO-8859-1: `U+FFFD` for a byte it maps to no character. Each is what the Unicode Consortium's
-/// mapping of the charset gives for the byte.
 fn table(c: Charset) -> String =
   match c {
     Latin2 ->
@@ -204,11 +200,9 @@ fn table(c: Charset) -> String =
 
 fn is_ascii(data: Bytes) -> Bool = data.position(0, |c: Int| c > 127) == None
 
-// --- Encoded words ----------------------------------------------------------
-
-/// `text` as a header field carries it: unchanged if it is printable ASCII containing no `=?`, and
-/// otherwise UTF-8 encoded words in `coding`, each at most 75 characters and containing only whole
-/// characters, with a space between them.
+/// Returns `text` in the form it takes in a header field: unchanged if it is printable ASCII
+/// containing no `=?`, and otherwise UTF-8 encoded words in `coding`, each at most 75 characters
+/// and containing only whole characters, with a space between them.
 pub fn encode(text: String, coding: Coding) -> String / {abort.raise} =
   if is_plain(text) { text } else { String::join(encode_words(text, coding), " ") }
 
@@ -245,8 +239,6 @@ pub fn read(text: String) -> String / {encoded_word.fail, abort.raise} = {
   String::join(read.out.push(read.gap), "")
 }
 
-/// The text read so far, the blanks after an encoded word (dropped if another encoded word follows
-/// them), and whether an encoded word was the last thing read.
 type JoinState = { out: List<String>, gap: String, joined: Bool }
 
 /// Whether `text` is nothing but spaces, tabs and line breaks: what may separate two encoded words
@@ -263,7 +255,6 @@ pub fn decode(text: String) -> Result<String, Error> / {abort.raise} = try { rea
 fn printable() -> Bytes =
   b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
-/// The characters `Q` writes unchanged: those every header position allows.
 fn q_unescaped_bytes() -> Bytes =
   b"!*+-/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -272,11 +263,8 @@ fn is_plain(text: String) -> Bool / {abort.raise} = {
   !text.contains("=?") && b.skip(0, printable()) == b.len()
 }
 
-/// The most of a word's 75 characters its text may take, in what `width` counts: `=?UTF-8?Q?` and
-/// `?=` take twelve, and base64 writes three bytes as four characters.
 fn max_text_width(coding: Coding) -> Int = match coding { Q -> 63, B -> 45 }
 
-/// How much of a word's 75 characters a character's bytes use.
 fn width(bytes: Bytes, coding: Coding) -> Int / {abort.raise} =
   match coding {
     B -> bytes.len(),
@@ -290,7 +278,6 @@ fn q_encode_byte(c: Int) -> Bytes / {abort.raise} =
 
 type ChunkState = { done: List<Bytes>, pending: List<Bytes>, room: Int }
 
-/// The UTF-8 of `text` split between characters into chunks that each fit one word.
 fn chunks(text: String, coding: Coding) -> List<Bytes> / {abort.raise} = {
   let cut = text.chars().fold(
     { done: [], pending: [], room: max_text_width(coding) },
@@ -322,7 +309,6 @@ fn encode_chunk(chunk: Bytes, coding: Coding) -> String / {abort.raise} =
 
 type Scan = { at: Int, out: List<Piece> }
 
-/// The parts of the text from `s.at` on. `left` bounds the recursion: each step consumes a `=?`.
 fn words(b: Bytes, s: Scan, left: Int) -> List<Piece> / {abort.raise} =
   if left <= 0 { s.out } else {
     match b.index_of_from(b"=?", s.at) {
@@ -347,10 +333,8 @@ fn words(b: Bytes, s: Scan, left: Int) -> List<Piece> / {abort.raise} =
 fn with_literal(out: List<Piece>, b: Bytes, from: Int, to: Int) -> List<Piece> / {abort.raise} =
   if to <= from { out } else { out.push(Literal(String::of_bytes(b.slice(from, to)))) }
 
-/// The offsets of the parts of an encoded word.
 type WordPositions = { charset_at: Int, coding_at: Int, text_at: Int, text_end: Int, end: Int }
 
-/// The encoded word whose `=?` is at `open`, if what follows has the shape of one.
 fn word_at(b: Bytes, open: Int) -> Option<WordPositions> / {abort.raise} = {
   let stops = b"? \t\r\n";
   let charset_end = b.skip_until(open + 2, stops);
@@ -371,7 +355,6 @@ fn word_at(b: Bytes, open: Int) -> Option<WordPositions> / {abort.raise} = {
 
 fn decode_word(b: Bytes, w: WordPositions) -> Result<String, Error> / {abort.raise} = {
   let named = String::of_bytes(b.slice(w.charset_at, w.coding_at - 1));
-  // RFC 2231 lets a language follow the charset after a `*`.
   let name = match named.split("*") { [first, ..] -> first, [] -> named };
   let coding = String::of_bytes(b.slice(w.coding_at, w.text_at - 1));
   let coded = b.slice(w.text_at, w.text_end);
@@ -388,16 +371,12 @@ fn decode_word(b: Bytes, w: WordPositions) -> Result<String, Error> / {abort.rai
   }
 }
 
-/// The bytes a word's text encodes in the coding, named in lower case: `None` for a coding that is
-/// neither `q` nor `b`, and `Some(None)` for text that is invalid in the coding.
 fn word_bytes(coding: String, coded: Bytes) -> Option<Option<Bytes>> / {abort.raise} =
   match coding {
     "q" -> Some(unescape(coded.replace(b"_", b" "), b'=', printable()).ok()),
     "b" -> Some(base64_decode(String::of_bytes(coded))),
     _ -> None,
   }
-
-// --- Extended values --------------------------------------------------------
 
 /// `text` as an extended parameter value: `UTF-8''` and its bytes percent-encoded.
 pub fn encode_extended(text: String) -> String / {abort.raise} = "UTF-8''" ++ url_encode(text)
@@ -416,12 +395,13 @@ pub fn decode_extended(value: String) -> Result<String, Error> / {abort.raise} =
 /// with the charset and the language.
 pub type Section = { text: String, extended: Bool }
 
-/// The value of the sections together, in the order given, raising `encoded_word.fail` where
-/// `decode_sections` returns `Err`. When none is extended, the value is their texts as written.
-/// Otherwise the first names the charset, each extended section is that charset's bytes
-/// percent-encoded, and any other section is text the charset must be able to encode. A character's
-/// bytes may span two sections. An error's offset counts through the sections' texts one after
-/// another.
+/// Returns the value that the sections form together, in the order given. Raises
+/// `encoded_word.fail` where `decode_sections` returns `Err`. When no section is extended, the
+/// value is the sections' texts joined as written. Otherwise the first section must be extended and
+/// name the charset. Each extended section holds percent-encoded bytes of that charset. Every other
+/// section is plain text that the charset must be able to encode. One character's bytes may be
+/// split across two sections. An error's offset counts characters through the sections' texts, one
+/// after another.
 pub fn read_sections(sections: List<Section>) -> String / {encoded_word.fail, abort.raise} =
   match sections {
     [] -> "",
@@ -431,7 +411,6 @@ pub fn read_sections(sections: List<Section>) -> String / {encoded_word.fail, ab
     else { read_extended_value(first.text, rest) },
   }
 
-/// The value of an extended first section and the sections after it.
 fn read_extended_value(
   head: String,
   rest: List<Section>,
@@ -459,7 +438,6 @@ fn read_extended_value(
   }
 }
 
-/// The bytes one section represents, where its text starts at `at`.
 fn section_bytes(
   charset: Charset,
   s: Section,
@@ -476,10 +454,10 @@ fn section_bytes(
 pub fn decode_sections(sections: List<Section>) -> Result<String, Error> / {abort.raise} =
   try { read_sections(sections) }
 
-/// `text` as the extended sections of one value: its UTF-8 percent-encoded and split between
-/// characters, with the first section starting with `UTF-8''`. Each section is at most `room`
-/// characters, unless a single character's escapes are longer. A text that fits is one section,
-/// equal to `encode_extended`'s value.
+/// Splits `text` into extended sections, each a piece of its percent-encoded UTF-8. The first
+/// section begins with `UTF-8''`. A character's escapes are never split between sections. Each
+/// section is at most `room` characters of encoded output, unless one character's escapes alone are
+/// longer. A text that fits is a single section equal to the value of `encode_extended`.
 pub fn encode_sections(text: String, room: Int) -> List<String> / {abort.raise} = {
   let cut = text.chars().fold(
     { done: [], held: "UTF-8''" },
@@ -492,11 +470,8 @@ pub fn encode_sections(text: String, room: Int) -> List<String> / {abort.raise} 
   cut.done.push(cut.held)
 }
 
-/// RFC 8187's `attr-char`: what an extended value writes without a `%`.
 fn attribute_chars() -> Bytes =
   b"!#$&+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-// --- Tests ------------------------------------------------------------------
 
 test "`encode` returns only ASCII, and every space-separated encoded word is at most 75 characters long" {
   gen::check(gen::text(), |text: String| {
@@ -517,9 +492,6 @@ test "encoded words are read back whatever the text contains" {
 
 type Vector = { field: String, decoded_text: String }
 
-/// Field values and their text. The first seven are fields of RFC 2047 §8's messages and the next
-/// seven rows of its table of what a reader displays. The one in a charset this module does not
-/// read is among `error_cases`.
 fn vectors() -> List<Vector> =
   [
     {
@@ -597,7 +569,6 @@ test "`decode` returns the expected decoded text for the encoded-word field {sho
 
 type ErrorCase = { field: String, at: Int, reason: ErrorKind }
 
-/// Field values that cannot be read. The first is RFC 2047 §8's in the charset of Hebrew.
 fn error_cases() -> List<ErrorCase> =
   [
     { field: "=?iso-8859-8?b?7eXs+SDv4SDp7Oj08A==?=", at: 2, reason: UnknownCharset("iso-8859-8") },
@@ -659,8 +630,6 @@ test "a long text is cut between characters into words of at most 75" {
 
 type ExtendedCase = { value: String, text: String }
 
-/// Extended values and their text: RFC 8187 §3.2.3's two, RFC 6266 §5's, and what the grammar
-/// leaves to a reader.
 fn extended() -> List<ExtendedCase> =
   [
     { value: "iso-8859-1'en'%A3%20rates", text: "\u{a3} rates" },
@@ -745,7 +714,6 @@ test "`charset_named` finds a charset by name in any letter case, and the listed
 
 type TableCase = { charset: Charset, data: Bytes, text: String }
 
-/// Bytes and their text in a single-byte charset, each where the charset differs from ISO-8859-1.
 fn table_cases() -> List<TableCase> =
   [
     { charset: Latin1, data: b"\x80\xa4\xff", text: "\u{80}\u{a4}\u{ff}" },
@@ -811,7 +779,6 @@ test "encoded words are written for any text, plain or not, and none for an empt
 
 type SectionCase = { sections: List<Section>, text: String }
 
-/// Values in sections, the first two RFC 2231 §3's and §4.1's.
 fn section_cases() -> List<SectionCase> =
   [
     {

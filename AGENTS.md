@@ -50,19 +50,14 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 
 ## Comments
 
-- Don't write comments in the compiler, the CLI or the Rust code. CI fails if any of them contains
-  a comment.
-- Avoid comments in other code too. Clear names and small functions should explain the code, and a
-  comment that repeats the code is noise. Write a comment only to explain a reason the code can't
-  show, an invariant the types don't enforce, or a trap, and keep it to one line. When you see a
-  stale or redundant comment, delete it.
-- Comments don't describe history ("used to", "since #123"), refer to PRs or documents, or quote
-  measurements.
-- Doc comments (`///` above a declaration, `//!` at the top of a module) are written for the people
-  who call the code. Start with a one-sentence summary. Then say what the signature can't: what the
-  result means, when the function raises, units, and edge cases. Don't repeat the types. Don't
-  include examples: the tests that use a definition serve as its examples, and `ply callers` lists
-  those tests.
+- Don't write comments. Clear names and small functions should explain the code. CI fails on every
+  comment except a doc comment on a public definition of the standard library, and the few comments
+  that a test reads as its input.
+- A standard library doc comment (`///` above a public declaration, `//!` at the top of a module) is
+  written for the people who call the code. Start with a one-sentence summary. Then say what the
+  signature can't: what the result means, when the function raises, units, and edge cases. Don't
+  repeat the types. Don't include examples: the tests that use a definition serve as its examples,
+  and `ply callers` lists those tests. Don't describe history, refer to PRs or quote measurements.
 
 ## Naming
 

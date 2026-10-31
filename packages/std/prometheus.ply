@@ -1,26 +1,36 @@
-//! Prometheus: metrics stored in a registry, and the page a scrape reads them from.
+//! Stores Prometheus metrics in a registry and serves them to scrapers.
 //!
-//! A `Registry` is a value. `add`, `set` and `observe` return the registry with a counter
-//! increased, a gauge set or a histogram's bucket counted. `snapshot` returns its contents: its
-//! families in the order of their names, and each family's series in the order of their labels,
-//! so two scrapes of one state produce the same bytes. A metric's name and a label's name are a
-//! `Name` and a `Label`, which only contain text the exposition formats allow. `sanitized_name`
-//! and `sanitized_label` make one from any text. A metric keeps at most the registry's
-//! `max_series` label sets, and a new one past that is dropped and counted: an unbounded label is
-//! how a registry outgrows its server.
+//! A `Registry` is a value. `add` returns a registry with a counter increased, `set` one with a
+//! gauge set, and `observe` one with a histogram bucket counted.
 //!
-//! `render_text` writes a snapshot in the text format, version 0.0.4, and `render_openmetrics` in
-//! OpenMetrics 1.0, which also carries a unit, an exemplar for a counter or a bucket, and
-//! `# EOF`. `parse` reads either back: `parse(render_openmetrics(s))` is `s`, and
-//! `parse(render_text(s))` is `as_text_format(s)`, the snapshot without what the older format
-//! cannot express. A counter's family is named without `_total` and its sample with it, and a
-//! histogram's buckets are cumulative under `le`, ending in `+Inf`. A summary, an info and a state
-//! set are not modelled, and `parse` rejects each with its own reason.
+//! `snapshot` returns the registry's contents. Families are sorted by name and each family's series
+//! are sorted by labels, so two scrapes of the same state produce the same bytes.
 //!
-//! `recording` is a `trace` handler: it handles `trace.count`, `trace.gauge` and `trace.time` on
-//! any channel by recording them in a registry, with the channel as the label `channel`, the
-//! fields as labels, and a timing in seconds. `scrape` responds to a `GET /metrics` from that
-//! registry in the format the request's `Accept` prefers.
+//! A metric name is a `Name` and a label name is a `Label`. Each can hold only text the exposition
+//! formats allow. `sanitized_name` and `sanitized_label` build one from any text.
+//!
+//! A metric accepts at most the registry's `max_series` distinct label sets. A new label set past
+//! that limit is dropped and counted. This stops a label with unlimited values from using all of
+//! the server's memory.
+//!
+//! `render_text` writes a snapshot in the text format, version 0.0.4. `render_openmetrics` writes
+//! OpenMetrics 1.0, which adds units, exemplars on counters and buckets, and a final `# EOF` line.
+//! `parse` reads either format.
+//!
+//! Parsing `render_openmetrics(s)` returns `s`. Parsing `render_text(s)` returns
+//! `as_text_format(s)`, which is `s` without the units and exemplars that the text format cannot
+//! express.
+//!
+//! A counter family is named without `_total`, and its samples are named with it. A histogram's
+//! buckets are cumulative, labeled by `le`, and end with `+Inf`. Summaries, info metrics and state
+//! sets are not supported, and `parse` rejects each with its own message.
+//!
+//! `recording` is a `trace` handler. It records `trace.count`, `trace.gauge` and `trace.time` on
+//! any channel into a registry. The channel becomes the label `channel`, the fields become labels,
+//! and timings are in seconds.
+//!
+//! `scrape` responds to `GET /metrics` from a registry, in the format the request's `Accept` header
+//! prefers.
 
 import std.bytes (is_digit)
 import std.float
@@ -34,8 +44,6 @@ import std.string
 import std.telemetry
 import std.trace
 import std.trace (Fields, trace)
-
-// --- Names --------------------------------------------------------------------
 
 /// A metric's name: a letter, `_` or `:`, and then letters, digits, `_` and `:`.
 pub opaque type Name = | Name(String)
@@ -104,13 +112,10 @@ fn sanitized(text: String, allowed: Bytes) -> String =
     Err(_) -> "_",
   }
 
-/// A metric name's text.
 pub fn name_text(n: Name) -> String = match n { Name(text) -> text }
 
-/// A label name's text.
 pub fn label_text(l: Label) -> String = match l { Label(text) -> text }
 
-/// One label and its value.
 pub type Pair = new { label: Label, value: String }
 
 /// A series' labels: in the order of their names, each name once.
@@ -124,18 +129,15 @@ pub fn labels(given: List<Pair>) -> Labels =
     ).map(|e: { key: Label, value: String }| -> Pair { { label: e.key, value: e.value } }),
   )
 
-/// No labels.
 pub fn no_labels() -> Labels = Labels([])
 
 /// The pairs of a label set, in the order of their names.
 pub fn pairs(ls: Labels) -> List<Pair> = match ls { Labels(held) -> held }
 
-/// A label and its value.
 pub fn pair(l: Label, value: String) -> Pair = { label: l, value: value }
 
-// --- A snapshot -----------------------------------------------------------------
-
-/// What kind of metric a family is.
+/// The type of a metric family: a counter that only increases, a gauge that can go up and down, a
+/// histogram of bucketed observations, or `Untyped` when the type is unknown.
 pub type Kind = | Counter | Gauge | Histogram | Untyped
 
 /// An observation a sample refers to: its labels, by convention a trace id and a span id, and
@@ -146,7 +148,8 @@ pub type Exemplar = new { labels: Labels, value: Float }
 /// bucket before it. The last bucket's `le` is infinity.
 pub type Bucket = new { le: Float, count: Int, exemplar: Option<Exemplar> }
 
-/// The value of one series.
+/// The data of one series, which depends on the family's kind: a counter's total, a gauge's current
+/// value, or a histogram's buckets and sum.
 pub type Value =
   | CounterValue(Float, Option<Exemplar>)
   | GaugeValue(Float)
@@ -185,10 +188,6 @@ pub fn as_text_format(s: Snapshot) -> Snapshot =
     }),
   }
 
-// --- The registry ---------------------------------------------------------------
-
-/// The current state of one series: a counter's total, a gauge's level, or a histogram's count in
-/// each of its own buckets, with the exemplar last seen there, and its sum.
 type Slot =
   | CounterSlot(Float, Option<Exemplar>)
   | GaugeSlot(Float)
@@ -203,7 +202,7 @@ type FamilyState = {
   series: Map<Labels, Slot>,
 }
 
-/// Metrics as a value: families by name, each with its series by labels.
+/// Stores metrics: each metric family by name, and each family's series by label set.
 pub opaque type Registry = new {
   families: Map<String, FamilyState>,
   max_series: Int,
@@ -218,11 +217,11 @@ pub fn registry(max_series: Int) -> Registry =
 /// How many updates had a label set that their metric had no room for.
 pub fn dropped(r: Registry) -> Int = r.dropped
 
-/// How many updates were rejected as invalid: one to a metric of another kind, a counter moved
-/// backwards or by a NaN, or a unit that its metric's name does not end with.
+/// Returns how many updates were rejected as invalid. An update is invalid when it targets a metric
+/// of a different kind, moves a counter backwards or by a NaN, or declares a unit that the metric's
+/// name does not end with.
 pub fn rejected(r: Registry) -> Int = r.rejected
 
-/// A counter's family is named without the `_total` its samples carry.
 fn family_name(n: Name, kind: Kind) -> String = {
   let text = name_text(n);
   match kind {
@@ -235,9 +234,9 @@ fn family_name(n: Name, kind: Kind) -> String = {
 
 fn rejecting(r: Registry) -> Registry = { ..r, rejected: r.rejected + 1 }
 
-/// Declares the metric `n` to be of `kind`, with this help and unit. A unit must be what the name
-/// ends with after a `_`, as OpenMetrics requires. A unit that is not, or a kind other than the
-/// one the metric already has, is rejected and counted.
+/// Declares the metric `n` to be of `kind`, with the given help and unit. A non-empty unit must
+/// follow a `_` at the end of the name, as OpenMetrics requires. Rejects and counts the call if the
+/// unit does not match the name, or if the metric already exists with a different kind.
 pub fn describe(r: Registry, n: Name, kind: Kind, help: String, unit: String) -> Registry = {
   let key = family_name(n, kind);
   if unit != "" && !key.ends_with("_" ++ unit) { rejecting(r) } else {
@@ -260,9 +259,9 @@ pub fn describe(r: Registry, n: Name, kind: Kind, help: String, unit: String) ->
   }
 }
 
-/// Sets the upper bounds the histogram `n` counts under, which must ascend. It is rejected once
-/// the histogram has a series, since counts under different bounds cannot be told apart, and for
-/// bounds that do not ascend or that contain a NaN or an infinity.
+/// Sets the upper bounds of the buckets of the histogram `n`. Rejects and counts the call if the
+/// histogram already has a series, because counts recorded with different bounds cannot be
+/// compared, or if the bounds do not strictly ascend or contain a NaN or an infinity.
 pub fn with_bounds(r: Registry, n: Name, bounds: List<Float>) -> Registry = {
   let described = match r.families.get(name_text(n)) {
     Some(_) -> r,
@@ -283,10 +282,6 @@ pub fn with_bounds(r: Registry, n: Name, bounds: List<Float>) -> Registry = {
   }
 }
 
-/// Updates the series of `n` under `ls` with `step`, which is passed the series' previous state.
-/// The metric is created, of `kind`, if the registry has none with that name. An update to a
-/// metric of another kind is rejected, and a label set past `max_series` is dropped, and each is
-/// counted.
 fn update_series(
   r: Registry,
   n: Name,
@@ -315,8 +310,6 @@ fn update_series(
   }
 }
 
-/// The exemplar if OpenMetrics can carry it, which is when its labels' names and values total at
-/// most 128 characters, and otherwise `None`.
 fn exemplar_within_limit(e: Option<Exemplar>) -> Option<Exemplar> =
   match e {
     Some(held) -> if pairs(held.labels).fold(0, |n: Int, p: Pair|
@@ -331,7 +324,8 @@ fn exemplar_within_limit(e: Option<Exemplar>) -> Option<Exemplar> =
 pub fn add(r: Registry, n: Name, ls: Labels, delta: Float) -> Registry =
   add_with(r, n, ls, delta, None)
 
-/// `add`, with an exemplar that replaces the one the series had; `None` keeps it.
+/// Adds `delta` to a counter like `add`, and replaces the series' exemplar with `exemplar`. With
+/// `None`, the series keeps its current exemplar.
 pub fn add_with(
   r: Registry,
   n: Name,
@@ -427,18 +421,11 @@ fn slot_value(held: FamilyState, slot: Slot) -> Value =
       ),
   }
 
-// --- Writing --------------------------------------------------------------------
-
-/// The `Content-Type` of the text format.
 pub fn text_content_type() -> String = "text/plain; version=0.0.4; charset=utf-8"
 
-/// The `Content-Type` of OpenMetrics.
 pub fn openmetrics_content_type() -> String =
   "application/openmetrics-text; version=1.0.0; charset=utf-8"
 
-/// Writes a number as Prometheus's own writers do, so a `le` reads the same from every process:
-/// its shortest digits, formatted as Go's `%g` formats them, `+Inf`, `-Inf` and `NaN` by name, and
-/// in OpenMetrics a whole number with `.0`.
 fn number(f: Float, openmetrics: Bool) -> String =
   if f.is_nan() { "NaN" }
   else if f == Float::infinity() { "+Inf" }
@@ -449,8 +436,6 @@ fn number(f: Float, openmetrics: Bool) -> String =
     }
   }
 
-/// Reformats `written`, a number's shortest digits with or without an exponent, as Go's `%g`
-/// does.
 fn format_like_go(written: String, openmetrics: Bool) -> String / {abort.raise} = {
   let negative = written.starts_with("-");
   let body = if negative { written.slice(1, written.len()) } else { written };
@@ -474,7 +459,6 @@ fn format_like_go(written: String, openmetrics: Bool) -> String / {abort.raise} 
   (if negative { "-" } else { "" }) ++ text
 }
 
-/// Where the digits of `every` end, leaving off trailing zeros.
 fn last_digit(every: Bytes, from: Int) -> Int / {abort.raise} =
   range(from, every.len()).fold(from, |end: Int, i: Int|
     if every.at(i) == b'0' { end } else { i + 1 })
@@ -495,12 +479,9 @@ fn replaced(text: String, from: String, to: String) -> String =
 fn string_split_whole(text: String, sep: String) -> List<String> =
   match try[abort.raise] { text.split(sep) } { Ok(parts) -> parts, Err(_) -> [text] }
 
-/// A label's value as written between its quotes, with backslashes, quotes and line feeds
-/// escaped.
 fn escaped_value(text: String) -> String =
   replaced(replaced(replaced(text, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n")
 
-/// A help text with backslashes and line feeds escaped, and in OpenMetrics quotes too.
 fn escaped_help(text: String, openmetrics: Bool) -> String = {
   let base = replaced(replaced(text, "\\", "\\\\"), "\n", "\\n");
   if openmetrics { replaced(base, "\"", "\\\"") } else { base }
@@ -557,7 +538,6 @@ fn series_lines(base: String, held: Series, openmetrics: Bool) -> List<String> =
 
 fn family_lines(f: Family, openmetrics: Bool) -> List<String> = {
   let base = name_text(f.name);
-  // The text format names a counter's family as its samples are named.
   let titled = match f.kind {
     Counter -> if openmetrics { base } else { base ++ "_total" },
     _ -> base,
@@ -578,13 +558,11 @@ fn rendered(s: Snapshot, openmetrics: Bool) -> Bytes = {
   Bytes::of_string(every.fold("", |text: String, line: String| text ++ line ++ "\n"))
 }
 
-/// `s` in the text format, version 0.0.4.
+/// Renders the snapshot `s` in the Prometheus text format, version 0.0.4.
 pub fn render_text(s: Snapshot) -> Bytes = rendered(s, false)
 
-/// `s` in OpenMetrics 1.0, ending in `# EOF`.
+/// Renders the snapshot `s` in OpenMetrics 1.0, ending with a `# EOF` line.
 pub fn render_openmetrics(s: Snapshot) -> Bytes = rendered(s, true)
-
-// --- Reading --------------------------------------------------------------------
 
 /// The limits `parse` enforces on a page.
 pub type Limits = new {
@@ -610,11 +588,13 @@ pub type ErrorKind =
   | BadEscape
   /// A value that is not a number, or a count that is not a whole one.
   | BadValue
-  /// A `TYPE` this module does not model, which it carries: `summary`, `info`, `stateset`.
+  /// A `TYPE` this module does not model, such as `summary`, `info` or `stateset`. The variant
+  /// contains the type's name.
   | Unsupported(String)
   /// A `HELP`, `TYPE` or `UNIT` line without its parts.
   | BadComment
-  /// A sample of a kind its family is not: a bucket with no `le`.
+  /// A sample that does not fit the kind of its family, such as a histogram bucket sample with no
+  /// `le` label.
   | Misplaced
   /// A line after `# EOF`.
   | AfterEnd
@@ -637,7 +617,6 @@ pub fn default_limits() -> Limits = { length: 16777216, samples: 1000000 }
 pub fn parse(page: Bytes, limits: Limits) -> Result<Snapshot, Error> / {abort.raise} =
   try { read(page, limits) }
 
-/// A family as it is read: its series in the order they first appear.
 type Draft = {
   name: String,
   help: String,
@@ -730,7 +709,6 @@ fn comment_read(
   if name(named) == None { fail(BadComment, at) } else if word == b"TYPE" {
     let kind = kind_of(comment_text, at);
     let key = family_name(Name(named), kind);
-    // A `HELP` that came first made a family under the name it was written with.
     let early = if key == named { None } else { r.drafts.get(named) };
     let update_series = match early {
       Some(_) ->
@@ -751,7 +729,6 @@ fn comment_read(
       None -> known,
     }
   } else {
-    // A `HELP` may come before its `TYPE`, under the name the samples of a counter carry.
     let key = match r.drafts.get(named) {
       Some(_) -> named,
       None -> if r.drafts.contains(family_name(Name(named), Counter)) {
@@ -782,7 +759,6 @@ fn kind_of(comment_text: String, at: Int) -> Kind / {prometheus.fail} =
     other -> fail(Unsupported(other), at),
   }
 
-/// Unescapes `\\`, `\"` and `\n` in a text.
 fn unescaped(raw: Bytes, at: Int) -> String / {prometheus.fail, abort.raise} = {
   let n = raw.len();
   let pieces = iterate({ i: 0, out: [] }, n + 1, |s: { i: Int, out: List<Bytes> }|
@@ -805,7 +781,6 @@ fn unescaped(raw: Bytes, at: Int) -> String / {prometheus.fail, abort.raise} = {
 
 type LabelsRead = { pairs: List<Pair>, le: Option<Float>, next: Int }
 
-/// Reads labels from the `{` at `from` through their `}`, and separates `le` from the rest.
 fn labels_read(line: Bytes, from: Int, at: Int) -> LabelsRead / {prometheus.fail, abort.raise} = {
   let n = line.len();
   let start: LabelsRead = { pairs: [], le: None, next: from + 1 };
@@ -833,8 +808,6 @@ fn labels_read(line: Bytes, from: Int, at: Int) -> LabelsRead / {prometheus.fail
   })
 }
 
-/// The index of the quote that ends a value opened at `from`: the first quote not escaped by a
-/// backslash.
 fn closing_quote(line: Bytes, from: Int, at: Int) -> Int / {prometheus.fail, abort.raise} = {
   let n = line.len();
   iterate(from, n + 1, |i: Int|
@@ -863,7 +836,6 @@ fn whole_of(raw: Bytes, at: Int) -> Int / {prometheus.fail, abort.raise} = {
 
 type Token = { text: Bytes, next: Int }
 
-/// The run of non-space bytes that starts at the first non-space byte at or after `from`.
 fn token(line: Bytes, from: Int) -> Token / {abort.raise} = {
   let start = line.skip(from, b" ");
   let stop = line.scan_until(start, b" ", max(line.len() - start, 0));
@@ -899,8 +871,6 @@ fn sample_of(line: Bytes, at: Int) -> SampleRead / {prometheus.fail, abort.raise
   }
 }
 
-/// Reads the exemplar after a sample's value, `# {labels} value`, with or without a timestamp
-/// before it.
 fn exemplar_of(
   line: Bytes,
   from: Int,
@@ -979,8 +949,6 @@ fn sample_read(r: ParseState, line: Bytes, at: Int) -> ParseState / {prometheus.
   }
 }
 
-/// A histogram's `_count` and any `_created` sample carry nothing a snapshot stores, so they are
-/// skipped. Any other sample is a gauge's or an untyped family's level.
 fn passed_or_level(
   r: ParseState,
   s: SampleRead,
@@ -1010,9 +978,6 @@ fn read_gauge(
   }
 }
 
-// --- The handler ----------------------------------------------------------------
-
-/// A field as a label's value.
 fn field_text(f: trace::Field) -> String =
   match f {
     trace::IntField(n) -> n.to_string(),
@@ -1030,10 +995,9 @@ fn field_text(f: trace::Field) -> String =
     },
   }
 
-/// The label a metric's channel is written under.
+/// Returns the name of the label that records which channel a metric was recorded on.
 pub fn channel_label() -> Label = Label("channel")
 
-/// A metric's labels: its channel, and its fields except the two that identify a span.
 fn labels_of(channel: String, fields: Fields) -> Labels =
   labels(
     fields.entries().fold(
@@ -1044,8 +1008,6 @@ fn labels_of(channel: String, fields: Fields) -> Labels =
     ),
   )
 
-/// The exemplar a metric's fields carry, when `std.telemetry`'s `stamped` wrote a span's ids into
-/// them.
 fn exemplar_in(fields: Fields, value: Float) -> Option<Exemplar> =
   match ((fields.get(telemetry::trace_id_field()), fields.get(telemetry::span_id_field()))) {
     (Some(trace::StringField(trace_hex)), Some(trace::StringField(span_hex))) ->
@@ -1100,10 +1062,9 @@ pub fn record_time(
 }
 
 /// Runs `body` and records every `trace.count`, `trace.gauge` and `trace.time` it performs, on any
-/// channel, in a registry that starts as `start`, with `record_count`, `record_gauge` and
-/// `record_time`. Other `trace` operations pass to whatever handles them outside, so a span
-/// exporter goes around this handler. `prometheus.registry` returns the current registry, which
-/// is what `scrape` serves.
+/// channel, into a registry that starts as `start`. Other `trace` operations are not handled here
+/// and continue to the next enclosing handler, such as a span exporter. The `prometheus.registry`
+/// operation returns the current registry, which `scrape` serves.
 pub fn recording<a | e>(
   start: Registry,
   body: () -> a / {trace.count[*], trace.gauge[*], trace.time[*], prometheus.registry | e},
@@ -1123,8 +1084,6 @@ pub fn recording<a | e>(
     },
     prometheus.registry() -> held,
   }
-
-// --- The page -------------------------------------------------------------------
 
 /// Whether an `Accept` field prefers OpenMetrics to the text format: whichever of
 /// `application/openmetrics-text` and `text/plain` has the higher `q`, or the text format when
@@ -1166,17 +1125,15 @@ pub fn page<| e>(request: Request, s: Snapshot) -> Response<| e> = {
   }
 }
 
-/// The response to a scrape. For a `GET` or a `HEAD` of `/metrics`, it is the registry of the
-/// `recording` around the caller, as `page` writes it. Any other request returns `None`, and the
-/// program handles it itself.
+/// Returns the response to a scrape request. For a `GET` or `HEAD` of `/metrics`, the response
+/// contains the current registry of the enclosing `recording`, written by `page`. For any other
+/// request it returns `None`, so the caller must handle the request itself.
 pub fn scrape<| e>(request: Request) -> Option<Response<| e>> / {prometheus.registry} =
   match ((request.method, request.path)) {
     (http::Get, "/metrics") -> Some(page(request, snapshot(prometheus.registry()))),
     (http::Head, "/metrics") -> Some(page(request, snapshot(prometheus.registry()))),
     _ -> None,
   }
-
-// --- Tests ------------------------------------------------------------------
 
 type Step = { kind: Int, metric: Int, label_set_index: Int, value: Int, marked: Bool }
 
@@ -1214,8 +1171,6 @@ fn sample_exemplar(value: Float) -> Exemplar =
     value: value,
   }
 
-/// A registry with a family of each kind declared, one with a help text no format writes
-/// unchanged.
 fn described() -> Registry =
   describe(
     describe(
@@ -1364,7 +1319,6 @@ test "two registries given the same updates in different orders render the same 
   );
   assert_eq(render_text(snapshot(one)), render_text(snapshot(other)));
   assert_eq(render_openmetrics(snapshot(one)), render_openmetrics(snapshot(other)));
-  // Labels are written in the order of their names, whatever order they were given in.
   assert(
     String::of_bytes(render_text(snapshot(one))).contains(
       "orders_total{sku=\"x\",zone=\"eu\"} 1\n",
@@ -1435,7 +1389,6 @@ test "an update that does not fit its metric is rejected and counted" {
   );
   assert_eq(rejected(after), 6);
   assert_eq(snapshot(after), snapshot(r));
-  // A gauge named like a counter's samples is its own family, and so is a histogram's.
   assert_eq(snapshot(set(r, named("orders_total"), no_labels(), 1.0)).families.len(), 2)
 }
 
@@ -1649,7 +1602,6 @@ fn accepts() -> List<Accepting> =
 test "an Accept of `{c.accept}` gets OpenMetrics, or the text format" for c: Accepting in accepts(
   ) { assert_eq(prefers_openmetrics(c.accept), c.open) }
 
-/// A number as a program writes it, and as each format does.
 type Written = { value: String, text: String, openmetrics: String }
 
 fn written_numbers() -> List<Written> =

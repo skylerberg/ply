@@ -1,9 +1,3 @@
-//! The engine: tables of payloads keyed by 32 bytes, stored as a manifest and a handful of segments
-//! (`compiler.store.segments`). A flush writes what a run put and dropped as one segment, which the
-//! manifest names under the store's lock and syncs, so a reader sees a flush whole or not at all,
-//! two runs flushing one store keep each other's entries, and what a flush wrote outlives a loss of
-//! power. It knows a table by its number and a key as 32 bytes, never what a payload means.
-
 import std.fs (fs, listed_names, mem_empty)
 import std.bytes (u32_le, u64_le)
 import std.list
@@ -12,22 +6,16 @@ import compiler.store.segments
 import compiler.store.segments (Manifest, Segment, SegmentWriter, Committed, LockHeld)
 import fake (run_in_memory)
 
-// --- Layout -----------------------------------------------------------------
-
-/// Moves whenever the bytes on disk change meaning; a store in another format reads as empty.
 pub fn format_version() -> Int = 2
 
 pub fn key_width() -> Int = 32
 
-/// A table's number, then a key.
 fn slot_width() -> Int = 1 + key_width()
 
-/// A slot, whether its entry was dropped, where the entry's frame lies and how long its payload is.
 fn row_width() -> Int = slot_width() + 13
 
 fn rows_table() -> Int = 1
 
-/// The files of a layout no `ply` reads, which the next flush removes.
 fn retired_files() -> List<String> =
   ["store.dat", "store.idx", "store.lock", "store.dat.tmp", "store.idx.tmp"]
 
@@ -45,11 +33,6 @@ fn size_of(row: Bytes) -> Int = segments::read_u32(row, slot_width() + 9)
 fn row_at(rows: Bytes, i: Int) -> Bytes / {abort.raise} =
   rows.slice(i * row_width(), (i + 1) * row_width())
 
-// --- The store --------------------------------------------------------------
-
-/// What one run holds: the manifest it read, each segment's rows, oldest first, the segments whose
-/// rows did not read, and what it put and dropped since, which a read sees first. `schema` names
-/// the stored types and this format, and the manifest by them.
 pub type Store = {
   dir: String,
   schema: Bytes,
@@ -61,15 +44,12 @@ pub type Store = {
   warnings: List<Warning>,
 }
 
-/// What a warning reports: the store could not be read or written, held something that did not
-/// verify, or was written in another format or for other stored types.
 pub type WarningKind = | Unreadable | Corrupt | OtherVersion
 
 pub type Warning = { kind: WarningKind, message: String }
 
 pub type Lookup = | Hit(Bytes) | Miss | Bad(String)
 
-/// One warning per distinct reason, however often a run meets it.
 pub fn warn(store: Store, trouble: WarningKind, message: String) -> Store =
   { ..store, warnings: add_warning(store.warnings, { kind: trouble, message: message }) }
 
@@ -80,8 +60,6 @@ pub fn messages(ws: List<Warning>) -> List<String> = ws.map(|w: Warning| w.messa
 
 type SegmentRows = { rows: List<Bytes>, unreadable_segments: List<Bytes> }
 
-/// Each segment's rows of `m`, taken from `cached_rows` where a run read them already: a segment whose
-/// rows do not read holds nothing a run can find, and is named among the lost.
 fn read_rows<[r]>(
   dir: String,
   m: Manifest,
@@ -105,7 +83,6 @@ fn warn_lost_segments(store: Store) -> Store =
     warn(store, Corrupt, "a part of the store does not read; its entries are treated as absent")
   }
 
-/// `schema` names every stored type's encoding; a store written under another is read as empty.
 pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise} = {
   let shapes = Bytes::blake3(u32_le(format_version()) ++ schema);
   let m = segments::manifest[r](dir, shapes);
@@ -131,11 +108,8 @@ pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise
   } else { store }
 }
 
-// --- Reading ----------------------------------------------------------------
-
 type SegmentRow = { token: Bytes, row: Bytes }
 
-/// The newest row of `sl` and the segment that holds it.
 fn find_row(store: Store, sl: Bytes) -> Option<SegmentRow> / {abort.raise} =
   range(0, store.rows.len()).fold(None, |acc: Option<SegmentRow>, back: Int|
     match acc {
@@ -158,7 +132,6 @@ pub fn get<[r]>(store: Store, table: Int, key: Bytes) -> Lookup / {fs.read[r], a
       None -> if !unwritten && store.deleted.contains(sl) { Miss } else {
         match find_row(store, sl) {
           None -> Miss,
-          // An entry that holds nothing is all in its row, which its table's checksum vouched for.
           Some(p) -> if is_deleted(p.row) { Miss }
           else if size_of(p.row) == 0 { Hit(b"") } else {
             match segments::payload[r](store.dir, p.token, offset_of(p.row), size_of(p.row)) {
@@ -171,7 +144,6 @@ pub fn get<[r]>(store: Store, table: Int, key: Bytes) -> Lookup / {fs.read[r], a
     }
   }
 
-/// Whether `table` holds `key`, read from the index alone: no payload is read or checked.
 pub fn contains_key(store: Store, table: Int, key: Bytes) -> Bool / {abort.raise} =
   if key.len() != key_width() { false } else {
     let sl = slot(table, key);
@@ -180,8 +152,6 @@ pub fn contains_key(store: Store, table: Int, key: Bytes) -> Bool / {abort.raise
     else { match find_row(store, sl) { Some(p) -> !is_deleted(p.row), None -> false } }
   }
 
-/// The rows of `table` among `rows`, in order: a table's rows lie together, since a row leads with
-/// its table.
 fn table_rows(rows: Bytes, table: Int) -> List<Bytes> / {abort.raise} =
   iterate(
     {
@@ -195,7 +165,6 @@ fn table_rows(rows: Bytes, table: Int) -> List<Bytes> / {abort.raise} =
       } else { Stop(x.out) },
   )
 
-/// Every key the table holds, ascending, what this run put and dropped included.
 pub fn keys(store: Store, table: Int) -> List<Bytes> / {abort.raise} = {
   let contains_key = store.rows.fold(Map::new(), |acc: Map<Bytes, Bool>, rows: Bytes|
     table_rows(rows, table).fold(acc, |m: Map<Bytes, Bool>, row: Bytes| {
@@ -208,8 +177,6 @@ pub fn keys(store: Store, table: Int) -> List<Bytes> / {abort.raise} = {
   )
 }
 
-/// The newest row of each slot among the segments from the one at `from` on, and the segment that
-/// holds it.
 fn newest_rows(store: Store, from: Int) -> Map<Bytes, SegmentRow> / {abort.raise} =
   range(from, store.rows.len()).fold(Map::new(), |acc: Map<Bytes, SegmentRow>, i: Int| {
     let token = store.manifest.segments.get(i).token;
@@ -224,8 +191,6 @@ pub type Stats = { entries: List<{ table: Int, count: Int }>, data_bytes: Int, l
 
 type Live = { counts: Map<Int, Int>, frames: Int, rows: Int }
 
-/// What the segments hold, and what one segment of the live entries alone would take, so
-/// `data_bytes - live_bytes` is what compaction reclaims.
 pub fn stats(store: Store) -> Stats / {abort.raise} = {
   let live = newest_rows(store, 0).fold(
     { counts: Map::new(), frames: 0, rows: 0 },
@@ -251,14 +216,11 @@ pub fn stats(store: Store) -> Stats / {abort.raise} = {
   }
 }
 
-// --- Writing ----------------------------------------------------------------
-
 fn checked_slot(table: Int, key: Bytes) -> Bytes / {abort.raise} =
   if table < 0 || table > 255 { panic("a store table is numbered 0 to 255") }
   else if key.len() != key_width() { panic("a store key is 32 bytes") }
   else { slot(table, key) }
 
-/// Stored by the next `flush`; until then this store's reads see it.
 pub fn put(store: Store, table: Int, key: Bytes, payload: Bytes) -> Store / {abort.raise} = {
   let sl = checked_slot(table, key);
   { ..store, puts: store.puts.insert(sl, payload), deleted: store.deleted.remove(sl) }
@@ -274,7 +236,6 @@ pub fn pending_count(store: Store) -> Int = store.puts.len() + store.deleted.len
 fn warn_not_flushed(store: Store, reason: String) -> Store =
   warn(store, Unreadable, reason ++ "; this run's entries were not kept")
 
-/// `store` as the manifest `m` names it, with nothing waiting to be written.
 fn with_manifest<[r]>(store: Store, m: Manifest) -> Store / {fs.read[r], abort.raise} = {
   let cached_rows = range(0, store.rows.len()).fold(Map::new(), |acc: Map<Bytes, Bytes>, i: Int| {
     let token = store.manifest.segments.get(i).token;
@@ -323,9 +284,6 @@ fn remove_segment<[r]>(store: Store, token: Bytes) -> Unit / {fs.write[r], abort
   ()
 }
 
-/// What a run put and dropped written as one segment, which the store's manifest then names: read
-/// again under the lock, so two runs flushing one store keep each other's entries, and the later
-/// wins a key both wrote.
 pub fn flush<[r]>(store: Store) -> Store / {fs.read[r], fs.write[r], abort.raise} =
   if pending_count(store) == 0 { store } else {
     match segments::start_run[r](store.dir) {
@@ -374,10 +332,6 @@ fn write_segment<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.writ
 
 fn mostly_dead(st: Stats) -> Bool = (st.data_bytes - st.live_bytes) * 2 > st.data_bytes
 
-/// `store` after a flush: what no manifest names removed, then its newest segments written again
-/// as one where they are due, and all of them where most of what they hold is replaced or dropped.
-/// The segments that rewrite replaces stay until the next flush, since the store is read without a
-/// run's directory: a run that opened it before this flush still reads what it was shown.
 fn clean_up<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.write[r], abort.raise} = {
   segments::sweep[r](store.dir, store.schema, run, []);
   retired_files().fold((), |_: Unit, name: String| {
@@ -389,9 +343,6 @@ fn clean_up<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.write[r],
   else { store }
 }
 
-/// The segments of `store` from the one at `from` on written again as one: of each slot its newest
-/// row and that row's payload. A dropped slot keeps its row while an older segment may still hold
-/// the entry.
 fn rewrite_segments<[r]>(
   store: Store,
   from: Int,
@@ -436,10 +387,6 @@ fn rewrite_segments<[r]>(
   }
 }
 
-// --- Compaction -------------------------------------------------------------
-
-/// The live entries written again as one segment, so what replaced or dropped entries left is gone
-/// at once: a run that opened the store before reads its entries as absent from then on.
 pub fn compact<[r]>(s0: Store) -> Store / {fs.read[r], fs.write[r], abort.raise} = {
   let s = flush[r](s0);
   let st = stats(s);
@@ -457,7 +404,6 @@ pub fn compact<[r]>(s0: Store) -> Store / {fs.read[r], fs.write[r], abort.raise}
   }
 }
 
-/// Everything a store holds in `dir` removed, whatever format wrote it: whether all of it went.
 pub fn clear_dir<[r]>(dir: String) -> Bool / {fs.read[r], fs.write[r]} =
   match listed_names(fs.list_dir[r](dir)) {
     None -> true,
@@ -469,7 +415,6 @@ pub fn clear_dir<[r]>(dir: String) -> Bool / {fs.read[r], fs.write[r]} =
         } else { ok }),
   }
 
-/// How many bytes the store's files in `dir` take, those no manifest names any more among them.
 pub fn disk_usage<[r]>(dir: String) -> Int / {fs.read[r]} =
   List::fold(
     match listed_names(fs.list_dir[r](dir)) { Some(names) -> names, None -> [] },
@@ -482,8 +427,6 @@ pub fn disk_usage<[r]>(dir: String) -> Int / {fs.read[r]} =
 
 pub fn name_key(name: String) -> Bytes = Bytes::of_string(name).blake3()
 
-// --- Tests ------------------------------------------------------------------
-
 fn schema_a() -> Bytes = b"schema a"
 
 fn lookup_payload(f: Lookup) -> Bytes =
@@ -495,7 +438,6 @@ fn all_messages(xs: List<List<Warning>>) -> List<String> =
 
 fn is_miss(f: Lookup) -> Bool = match f { Miss -> true, _ -> false }
 
-/// The segments that hold the store in `cache`, by name.
 fn segment_files() -> List<String> / {fs.read[mem]} =
   List::filter(
     match listed_names(fs.list_dir[mem]("cache")) { Some(names) -> names, None -> [] },
@@ -561,7 +503,6 @@ test "two runs flushing one store keep each other's entries, and the later wins 
     );
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
-    // The later flush reads the manifest again, so it holds what the earlier one wrote.
     assert_eq(lookup_payload(get[mem](b1, 1, name_key("mine"))), b"a");
     let c = open[mem]("cache", schema_a());
     assert_eq(lookup_payload(get[mem](c, 1, name_key("mine"))), b"a");
@@ -638,7 +579,6 @@ test "opening a store written under another schema gives an empty store and a wa
 
 test "a store with a segment file missing warns, still reads the other segments, and a later flush removes the missing segment from the manifest" {
   let run = run_in_memory(mem_empty(), || {
-    // Long enough that the short segment after it is not written again with it as one.
     let long = Bytes::concat_all(range(0, 64).map(|i: Int| b"0123456789abcdef"));
     let s1 = flush[mem](
       put(put(open[mem]("cache", schema_a()), 1, name_key("a"), long), 1, name_key("b"), long),
@@ -713,7 +653,6 @@ test "a flush after most stored data was replaced or deleted rewrites the live e
     let s2 = flush[mem](put(s1, 1, name_key("a"), b"small"));
     assert_eq(stats(s2).data_bytes, stats(s2).live_bytes);
     assert_eq(s2.manifest.segments.len(), 1);
-    // A run that opened the store before the flush still reads what it was shown, until the next.
     assert_eq(lookup_payload(get[mem](s1, 1, name_key("a"))), big);
     let s3 = open[mem]("cache", schema_a());
     assert_eq(pending_count(flush[mem](put(s3, 1, name_key("b"), b"next"))), 0);

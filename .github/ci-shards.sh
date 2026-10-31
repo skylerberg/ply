@@ -766,6 +766,38 @@ members_outside_crates() {
     grep -v '^crates/' || true
 }
 
+cmd_comments() {
+  local found
+  found=$(
+    cd "$root"
+    git grep -n -E '^\s*(//|/\*)' -- '*.ply' '*.rs' '*.pkg' ply.work ':!packages/std' ':!tests/fixtures/lang' \
+      ':!tests/programs/fmt' ':!tests/programs/doc' || true
+    git grep -n -E '^\s*(//([^/!]|$)|/\*)' -- packages/std || true
+    git grep -n -E '^\s*//' -- packages/std/internal || true
+    git grep -n -E '^\s*//' -- tests/fixtures/lang | grep -vE ':\s*// (raises|refused|effects) .* ::' || true
+    git grep -n -E '^\s*#([^!]|$)' -- '*.sh' 'scripts/*' '.github/*.yml' '.github/*.yaml' '*.toml' \
+      ':!tests' ':!examples/same-tests.sh' | grep -v '# shellcheck ' || true
+    git ls-files 'packages/std/*.ply' ':!packages/std/internal' ':!packages/std/prelude.ply' |
+      while read -r file; do
+        awk -v file="$file" '
+          /^\/\/\// { doc = FNR; next }
+          /^[ \t]+\/\/\// { if (!public) print file ":" FNR ": a doc comment inside a private declaration"; next }
+          /^[^] \t\/})]/ {
+            public = ($0 ~ /^pub /)
+            if (doc && !public) print file ":" doc ": a doc comment on a private definition"
+            doc = 0
+          }
+        ' "$file"
+      done
+  )
+  if [[ -n $found ]]; then
+    echo "$found" >&2
+    echo "FAIL: comments are allowed only on the public definitions of the standard library: use a clear name or a test instead" >&2
+    return 1
+  fi
+  echo "comments: only the public definitions of the standard library have them"
+}
+
 cmd_verify() {
   local failures=0 member package entry id dir
   local workflow="$root/.github/workflows/ci.yml"
@@ -965,6 +997,7 @@ cmd_verify() {
   cmd_prune_check || failures=$((failures + 1))
   cmd_actions || failures=$((failures + 1))
   cmd_toolchain_embeds || failures=$((failures + 1))
+  cmd_comments || failures=$((failures + 1))
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
