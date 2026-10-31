@@ -19,11 +19,20 @@ import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.check.resolve.tables (ParsedModule, Diagnostic, Declarations, Resolution, Scope,
                                       module_of_name)
 import compiler.check.resolve.bindings (written, Written, ModuleQualifier)
-import compiler.check.infer (item_owner)
-import compiler.check.infer.checker (MemberSite)
+import compiler.check.infer (item_owner, decode_facts)
+import compiler.check.infer.checker (MemberSite, CachedFacts)
 import compiler.check.member (MemberTarget)
+import compiler.check.types (TypeTable, NodeRecord, NodeNominal, NodeField)
+import compiler.check.typed (TypedBody, TypedExpression, TypedPattern, TypedFieldPattern, TypedArm,
+                             TypedStatement, TypedFieldRead, TypedRecord, TypedUpdate, TypedCall,
+                             TypedMatch, TypedBlock, TypedLet, TypedLetElse, TypedRecordPattern,
+                             TypedCase, TypedListPattern, TypedOr, typed_expression_nodes)
 import compiler.syntax.items (parse, Module, ImportDeclaration, Item, EffectItem, ExternItem,
-                              TypeItem, SumBody, VariantDefinition, OpDefinition)
+                              TypeItem, SumBody, AliasBody, NominalBody, VariantDefinition,
+                              OpDefinition)
+import compiler.syntax.type_syntax (TypeExpression, RecordTypeExpression)
+import compiler.syntax.parsing (Identifier)
+import compiler.check.resolve.tables (qualify)
 import compiler.syntax.node_ids (numbered_module)
 
 pub type Library = { root: RootedPath, name: String }
@@ -64,6 +73,12 @@ pub fn libraries_of(
 
 pub type Entry = { owner: Bytes, names: Written }
 
+pub type Record = | PlainRecord(List<Bytes>) | NewRecordType(Bytes)
+
+pub fn plain_record(fields: List<Bytes>) -> Record = PlainRecord(fields.sort())
+
+pub type DeclaredRecord = { name: Bytes, record: Record, fields: List<Bytes> }
+
 pub type Read = {
   file: sources::File,
   index: Int,
@@ -74,6 +89,8 @@ pub type Read = {
   externs: Map<Bytes, Bool>,
   effects: List<{ name: Bytes, operations: List<Bytes> }>,
   sums: List<{ name: Bytes, variants: List<Bytes> }>,
+  records: List<DeclaredRecord>,
+  typed_records: Map<Bytes, Map<Int, Record>>,
 }
 
 pub type Loaded = {
@@ -133,6 +150,111 @@ fn calls_by_module(
     },
   )
 
+fn record_in(types: TypeTable, key: Bytes) -> Option<Record> =
+  match types.get(key) {
+    Some(NodeRecord(fields)) -> Some(plain_record(fields.map(|f: NodeField| f.name))),
+    Some(NodeNominal(n)) -> Some(NewRecordType(n.name)),
+    _ -> None,
+  }
+
+fn with_record(
+  sites: Map<Int, Record>,
+  types: TypeTable,
+  site: Int,
+  key: Bytes,
+) -> Map<Int, Record> / {abort.raise} =
+  match record_in(types, key) { Some(r) -> sites.insert(site, r), None -> sites }
+
+fn pattern_records(
+  sites: Map<Int, Record>,
+  types: TypeTable,
+  pattern: TypedPattern<Bytes>,
+) -> Map<Int, Record> / {abort.raise} = {
+  let each = |into: Map<Int, Record>, p: TypedPattern<Bytes>| pattern_records(into, types, p);
+  match pattern {
+    TypedRecordPattern(r) ->
+      r.fields.fold(
+        with_record(sites, types, r.span.site, r.ty),
+        |into: Map<Int, Record>, f: TypedFieldPattern<Bytes>| each(into, f.pattern),
+      ),
+    TypedCase(c) -> c.args.fold(sites, each),
+    TypedListPattern(l) -> {
+      let items = l.items.fold(sites, each);
+      match l.rest { Some(rest) -> each(items, rest), None -> items }
+    },
+    TypedOr(alternatives) -> alternatives.fold(sites, each),
+    _ -> sites,
+  }
+}
+
+fn body_records(
+  sites: Map<Int, Record>,
+  types: TypeTable,
+  body: TypedBody<Bytes>,
+) -> Map<Int, Record> / {abort.raise} =
+  typed_expression_nodes(body.body).fold(
+    sites,
+    |acc: Map<Int, Record>, e: TypedExpression<Bytes>|
+      match e.node {
+        TypedFieldRead(f) -> with_record(acc, types, e.span.site, f.base.ty),
+        TypedRecord(_) -> with_record(acc, types, e.span.site, e.ty),
+        TypedUpdate(_) -> with_record(acc, types, e.span.site, e.ty),
+        TypedCall(c) -> match c.callee.node {
+          TypedFieldRead(f) -> with_record(acc, types, e.span.site, f.base.ty),
+          _ -> acc,
+        },
+        TypedMatch(m) ->
+          m.arms.fold(acc, |into: Map<Int, Record>, arm: TypedArm<Bytes>|
+            pattern_records(into, types, arm.pattern)),
+        TypedBlock(b) ->
+          b.statements.fold(acc, |into: Map<Int, Record>, statement: TypedStatement<Bytes>|
+            match statement {
+              TypedLet(l) -> pattern_records(into, types, l.pattern),
+              TypedLetElse(l) -> pattern_records(into, types, l.pattern),
+              _ -> into,
+            }),
+        _ -> acc,
+      },
+  )
+
+fn records_by_owner(view: CheckedProgram) -> Map<Bytes, Map<Int, Record>> / {abort.raise} = {
+  let types = view.checked.facts.types;
+  let with_body = |acc: Map<Bytes, Map<Int, Record>>, owner: Bytes, body: TypedBody<Bytes>|
+    acc.insert(owner, body_records(acc.get(owner).unwrap_or(Map::new()), types, body));
+  view.checked.cached.fold(
+    view.checked.facts.bodies.fold(
+      Map::new(),
+      |acc: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>| with_body(acc, b.owner, b),
+    ),
+    |acc: Map<Bytes, Map<Int, Record>>, k: CachedFacts|
+      match decode_facts(k.facts, 0, k.name) {
+        Some(f) ->
+          f.bodies.fold(acc, |into: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
+            with_body(into, k.name, b)),
+        None -> acc,
+      },
+  )
+}
+
+fn declared_records(module: Bytes, tree: Module) -> List<DeclaredRecord> / {abort.raise} =
+  tree.items.fold([], |acc: List<DeclaredRecord>, item: Item|
+    match item {
+      TypeItem(t) -> match t.body {
+        AliasBody(RecordTypeExpression(r)) -> {
+          let fields = r.fields.map(|f: { name: Identifier, ty: TypeExpression }| f.name.name);
+          acc.push({ name: t.name.name, record: plain_record(fields), fields: fields })
+        },
+        NominalBody(RecordTypeExpression(r)) ->
+          acc.push({
+            name: t.name.name,
+            record: NewRecordType(qualify(module, t.name.name)),
+            fields: r.fields.map(|f: { name: Identifier, ty: TypeExpression }| f.name.name),
+          }),
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
 pub fn entries_of(
   r: Resolution,
   index: Int,
@@ -150,6 +272,7 @@ pub fn entries_of(
 fn read_of(
   resolved: ResolvedProgram,
   calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
+  owner_records: Map<Bytes, Map<Int, Record>>,
   file: sources::File,
 ) -> Option<Read> / {abort.raise} = {
   let name = Bytes::of_string(file.module);
@@ -158,11 +281,12 @@ fn read_of(
     Some(index) -> {
       let tree = numbered_module(parse(file.text).node);
       let targets = resolved.r.imports.get(index);
+      let entries = entries_of(resolved.r, index, name, tree);
       Some({
         file: file,
         index: index,
         name: name,
-        entries: entries_of(resolved.r, index, name, tree),
+        entries: entries,
         calls: calls.get(name).unwrap_or(Map::new()),
         imports: range(0, tree.imports.len()).fold(
           [],
@@ -201,6 +325,12 @@ fn read_of(
               _ -> acc,
             },
         ),
+        records: declared_records(name, tree),
+        typed_records: entries.fold(Map::new(), |acc: Map<Bytes, Map<Int, Record>>, e: Entry|
+          match owner_records.get(e.owner) {
+            Some(sites) -> acc.insert(e.owner, sites),
+            None -> acc,
+          }),
       })
     },
   }
@@ -237,6 +367,7 @@ pub fn loads_of(
           (_, None) -> rejected(program.diagnostics),
           (Ok(resolved), Some(view)) -> {
             let calls = calls_by_module(view);
+            let owner_records = records_by_owner(view);
             let read_before = acc.loads.fold(Map::new(), |m: Map<String, Bool>, l: Loaded|
               l.reads.fold(m, |into: Map<String, Bool>, r: Read|
                 into.insert(absolute(pwd, r.file.at), true)));
@@ -257,13 +388,19 @@ pub fn loads_of(
                     && !read_before.contains(absolute(pwd, f.at))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, calls, f) { Some(r) -> reads.push(r), None -> reads },
+                    match read_of(resolved, calls, owner_records, f) {
+                      Some(r) -> reads.push(r),
+                      None -> reads,
+                    },
                 ),
                 unrenamed: program.files.filter(|f: sources::File|
                   !roots.any(|r: RootedPath| under(f.at, r))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, calls, f) { Some(r) -> reads.push(r), None -> reads },
+                    match read_of(resolved, calls, owner_records, f) {
+                      Some(r) -> reads.push(r),
+                      None -> reads,
+                    },
                 ),
               }),
               failures: acc.failures,
