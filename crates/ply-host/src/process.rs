@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 const EFFECT: &str = "std.process.process";
 
 /// What serves the effect, for a rejection to name.
-const SERVED_BY: &str = "std.process::served";
+const SERVED_BY: &str = "std.process::host_process";
 
 /// The effect whose raise says a standard stream's reader went away, and that raise.
 pub const PIPE_EFFECT: &str = "std.process.pipe";
