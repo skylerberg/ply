@@ -320,20 +320,21 @@ fn parameter_ownership(f: Fn, member: Option<Int>) -> List<ParamOwnership> =
   }
 
 fn pass_arguments(w: CheckState, args: List<Arg>, handed: List<ParamOwnership>) -> CheckState =
-  range(0, args.len()).fold(w, |acc: CheckState, i: Int|
+  range(0, args.len()).fold(w, |accumulator: CheckState, i: Int|
     match args.at(i) {
-      None -> acc,
-      Some(a) -> if handed.at(i) != Some(BorrowedParam) { pass_argument(acc, a) } else {
+      None -> accumulator,
+      Some(a) -> if handed.at(i) != Some(BorrowedParam) { pass_argument(accumulator, a) } else {
         match operand_var(a) {
           Some(v) -> if !is_refcounted(v.representation)
-              || borrowed_from_parameters(acc.path_state, v) { read_of(acc, v) } else {
+              || borrowed_from_parameters(accumulator.path_state, v) { read_of(accumulator, v) }
+          else {
             faulted(
-              acc,
+              accumulator,
               b"a borrowed value is passed to a tail call that may outlive the borrow: v",
               v,
             )
           },
-          None -> acc,
+          None -> accumulator,
         }
       },
     })
@@ -362,33 +363,40 @@ fn arguments_have_representations(args: List<Arg>, reps: List<Representation>) -
       })
 
 fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState =
-  b.fold(w, |acc: CheckState, i: Inst|
-    if acc.fault != None || !acc.live { acc } else {
+  b.fold(w, |accumulator: CheckState, i: Inst|
+    if accumulator.fault != None || !accumulator.live { accumulator } else {
       match i {
-        Let(l) -> check_let(context, acc, l.var, l.value, l.unwind),
+        Let(l) -> check_let(context, accumulator, l.var, l.value, l.unwind),
         Do(d) -> match token_in(read_args(d.value)) {
-          Some(t) -> faulted(acc, b"a reuse token (reserved memory) is used as a value: v", t),
-          None -> if partly_taken_argument(acc.path_state, read_args(d.value)) != None {
-            { ..acc, fault: Some(b"a block is used after one of its fields was moved out of it") }
-          } else if escaping(acc.path_state, d.value) != None {
+          Some(t) ->
+            faulted(accumulator, b"a reuse token (reserved memory) is used as a value: v", t),
+          None -> if partly_taken_argument(accumulator.path_state, read_args(d.value)) != None {
             {
-              ..acc,
+              ..accumulator,
+              fault: Some(b"a block is used after one of its fields was moved out of it"),
+            }
+          } else if escaping(accumulator.path_state, d.value) != None {
+            {
+              ..accumulator,
               fault: Some(b"a closure on this frame's stack escapes the call that borrows it"),
             }
           } else if results_count(d.value) {
-            { ..acc, fault: Some(b"a value has a reference count that nothing releases") }
+            { ..accumulator, fault: Some(b"a value has a reference count that nothing releases") }
           } else {
-            match or_else(bytes_fault(acc.path_state, None, d.value), uses_fault(None, d.value)) {
-              Some(f) -> faulted(acc, f.reason, f.v),
-              None -> failing(context, used(acc, operands(d.value)), d.value, d.unwind),
+            match or_else(
+                bytes_fault(accumulator.path_state, None, d.value),
+                uses_fault(None, d.value),
+              ) {
+              Some(f) -> faulted(accumulator, f.reason, f.v),
+              None -> failing(context, used(accumulator, operands(d.value)), d.value, d.unwind),
             }
           },
         },
-        Declaration(v) -> { ..acc, path_state: declared(acc.path_state, v.id) },
-        Assign(s) -> match acc.path_state.joins.get(s.var.id) {
+        Declaration(v) -> { ..accumulator, path_state: declared(accumulator.path_state, v.id) },
+        Assign(s) -> match accumulator.path_state.joins.get(s.var.id) {
           Some(false) -> if !same_rep(s.arg, s.var.representation) {
             faulted(
-              acc,
+              accumulator,
               b"a variable assigned in several branches receives a value with a different representation than the variable: v",
               s.var,
             )
@@ -403,9 +411,10 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
                 },
               };
             match operand_var(s.arg) {
-              Some(v) -> if acc.path_state.uncounted.contains(s.var.id) { set(read_of(acc, v)) }
-              else if acc.path_state.uncounted.contains(v.id) {
-                let x = set(read_of(acc, v));
+              Some(v) -> if accumulator.path_state.uncounted.contains(s.var.id) {
+                set(read_of(accumulator, v))
+              } else if accumulator.path_state.uncounted.contains(v.id) {
+                let x = set(read_of(accumulator, v));
                 {
                   ..x,
                   path_state: {
@@ -413,8 +422,8 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
                     pending: x.path_state.pending.insert(s.var.id, true),
                   },
                 }
-              } else if borrowed_here(acc.path_state, v) {
-                let read = read_of(acc, v);
+              } else if borrowed_here(accumulator.path_state, v) {
+                let read = read_of(accumulator, v);
                 let x = set(read);
                 {
                   ..x,
@@ -426,17 +435,17 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
                     ),
                   },
                 }
-              } else { join_owns_count(set(pass_argument(acc, s.arg)), s.var) },
-              None -> if acc.path_state.uncounted.contains(s.var.id) { set(acc) }
-              else { join_owns_count(set(acc), s.var) },
+              } else { join_owns_count(set(pass_argument(accumulator, s.arg)), s.var) },
+              None -> if accumulator.path_state.uncounted.contains(s.var.id) { set(accumulator) }
+              else { join_owns_count(set(accumulator), s.var) },
             }
           },
-          Some(true) -> faulted(acc, b"a join set twice on one path: v", s.var),
-          None -> faulted(acc, b"a join set before it is declared: v", s.var),
+          Some(true) -> faulted(accumulator, b"a join set twice on one path: v", s.var),
+          None -> faulted(accumulator, b"a join set before it is declared: v", s.var),
         },
         If(x) -> {
-          let read = read_arg(acc, x.cond);
-          match last_tested(acc.path_state, x.cond) {
+          let read = read_arg(accumulator, x.cond);
+          match last_tested(accumulator.path_state, x.cond) {
             Some(n) ->
               joined(
                 read,
@@ -466,21 +475,25 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           }
         },
         Case(c) -> if !names_each(c.test, c.arms.map(|a: { when: Int, body: Block }| a.when)) {
-          faulted(acc, b"a case arm for a constructor that the case test does not name: v", c.on)
+          faulted(
+            accumulator,
+            b"a case arm for a constructor that the case test does not name: v",
+            c.on,
+          )
         } else if !test_fits_representation(c.test, c.on.representation) {
           faulted(
-            acc,
+            accumulator,
             b"a case that tests a value as a number, but the value is not stored as a number: v",
             c.on,
           )
         } else if !sum_tested(c.test, c.on.representation) {
           faulted(
-            acc,
+            accumulator,
             b"a case on a sum type that tests constructors the sum type does not have: v",
             c.on,
           )
         } else {
-          let read = read_of(acc, c.on);
+          let read = read_of(accumulator, c.on);
           c.arms.fold(
             check_block(f, context, read, c.rest),
             |j: CheckState, a: { when: Int, body: Block }|
@@ -501,7 +514,7 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
         },
         Match(m) -> {
           let tried = m.arms.fold(
-            { from: Some(acc.path_state), out: { ..acc, live: false } },
+            { from: Some(accumulator.path_state), out: { ..accumulator, live: false } },
             |s: { from: Option<PathState>, out: CheckState }, a: Block|
               if s.out.fault != None { s } else {
                 match s.from {
@@ -509,12 +522,15 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
                   Some(h) -> {
                     let w = check_block(
                       f,
-                      { ..context, arm: Some(acc.path_state) },
-                      { ..acc, path_state: arm_entry_state(acc, h), missed: None },
+                      { ..context, arm: Some(accumulator.path_state) },
+                      { ..accumulator, path_state: arm_entry_state(accumulator, h), missed: None },
                       a,
                     );
                     if w.fault != None { { from: None, out: w } } else {
-                      { from: w.missed, out: joined(acc, s.out, { ..w, missed: acc.missed }) }
+                      {
+                        from: w.missed,
+                        out: joined(accumulator, s.out, { ..w, missed: accumulator.missed }),
+                      }
                     }
                   },
                 }
@@ -525,19 +541,25 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
               None -> tried.out,
               Some(h) ->
                 joined(
-                  acc,
+                  accumulator,
                   tried.out,
-                  check_block(f, context, { ..acc, path_state: arm_entry_state(acc, h) }, m.rest),
+                  check_block(
+                    f,
+                    context,
+                    { ..accumulator, path_state: arm_entry_state(accumulator, h) },
+                    m.rest,
+                  ),
                 ),
             }
           }
         },
         Miss -> match context.arm {
-          None -> { ..acc, fault: Some(b"a failed match in an arm appears outside any match") },
+          None ->
+            { ..accumulator, fault: Some(b"a failed match in an arm appears outside any match") },
           Some(entry) -> {
             let handed = {
-              ..scoped(acc.path_state, entry),
-              taken: acc.path_state.taken.fold(
+              ..scoped(accumulator.path_state, entry),
+              taken: accumulator.path_state.taken.fold(
                 Map::new(),
                 |m: Map<Int, List<Path>>, id: Int, ps: List<Path>|
                   if entry.owned_counts.contains(id) || entry.borrowed_from.contains(id) {
@@ -545,29 +567,32 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
                   } else { m },
               ),
             };
-            match acc.missed {
-              None -> { ..acc, missed: Some(handed), live: false },
+            match accumulator.missed {
+              None -> { ..accumulator, missed: Some(handed), live: false },
               Some(m) -> if m.owned_counts == handed.owned_counts && m.unset == handed.unset {
                 {
-                  ..acc,
+                  ..accumulator,
                   missed: Some({ ..m, taken: merge_taken(m.taken, handed.taken) }),
                   live: false,
                 }
               } else {
-                { ..acc, fault: Some(b"the arms of a match end with different reference counts") }
+                {
+                  ..accumulator,
+                  fault: Some(b"the arms of a match end with different reference counts"),
+                }
               },
             }
           },
         },
         Loop(l) -> if !l.state.all(|c: LoopVariable| same_rep(c.init, c.var.representation)) {
           {
-            ..acc,
+            ..accumulator,
             fault: Some(
               b"a loop's state is initialized with values whose representation differs from the state's representation",
             ),
           }
         } else {
-          let fed = carried_inits(l.state).fold(acc, pass_argument);
+          let fed = carried_inits(l.state).fold(accumulator, pass_argument);
           let start = carried_variables(l.state).fold(fed.path_state, |h: PathState, s: Var|
             if is_refcounted(s.representation) {
               { ..h, owned_counts: h.owned_counts.insert(s.id, 1) }
@@ -603,79 +628,79 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
           }
         },
         Next(args) -> match context.looped {
-          None -> { ..acc, fault: Some(b"a loop's next pass outside a loop") },
+          None -> { ..accumulator, fault: Some(b"a loop's next pass outside a loop") },
           Some(lp) -> if args.len() != lp.state.len()
               || !arguments_match_variables(args, lp.state) {
             {
-              ..acc,
+              ..accumulator,
               fault: Some(
                 b"a loop's next pass passes values stored differently from the loop's state",
               ),
             }
           } else {
             ended(
-              args.fold(acc, pass_argument),
+              args.fold(accumulator, pass_argument),
               lp.entry_counts,
               b"a reference count differs between where the loop starts its next pass and where the loop expects it: v",
             )
           },
         },
         Done(a) -> match context.looped {
-          None -> { ..acc, fault: Some(b"a loop's result outside a loop") },
+          None -> { ..accumulator, fault: Some(b"a loop's result outside a loop") },
           Some(lp) -> if !same_rep(a, lp.result.representation) {
             {
-              ..acc,
+              ..accumulator,
               fault: Some(b"a loop's result stored differently from the loop's result variable"),
             }
           } else {
             {
-              ..ended(pass_argument(acc, a), lp.entry_counts, b"a reference count differs between where the loop is exited and where the loop expects it: v"),
+              ..ended(pass_argument(accumulator, a), lp.entry_counts, b"a reference count differs between where the loop is exited and where the loop expects it: v"),
               done: true,
             }
           },
         },
-        Return(a) -> if context.handled { fault_leaving_handle(acc) }
+        Return(a) -> if context.handled { fault_leaving_handle(accumulator) }
         else if !same_rep(a, context.result) {
           {
-            ..acc,
+            ..accumulator,
             fault: Some(b"a result stored differently from the way the function returns it"),
           }
         } else {
           ended(
             match context.returned {
-              OwnedResult -> pass_argument(acc, a),
-              BorrowedResult(from) -> check_borrowed_result(acc, a, from),
+              OwnedResult -> pass_argument(accumulator, a),
+              BorrowedResult(from) -> check_borrowed_result(accumulator, a, from),
             },
             Map::new(),
             b"a reference count not released before the body returns: v",
           )
         },
-        Restart(args) -> if context.handled { fault_leaving_handle(acc) }
+        Restart(args) -> if context.handled { fault_leaving_handle(accumulator) }
         else if !arguments_match_parameters(f, context.member, args) {
           {
-            ..acc,
+            ..accumulator,
             fault: Some(
               b"a restart whose arguments are stored differently from the parameters it restarts",
             ),
           }
         } else {
           ended(
-            pass_arguments(acc, args, parameter_ownership(f, context.member)),
+            pass_arguments(accumulator, args, parameter_ownership(f, context.member)),
             Map::new(),
             b"a reference count not released before the body restarts: v",
           )
         },
-        Jump(e) -> if context.handled { fault_leaving_handle(acc) }
+        Jump(e) -> if context.handled { fault_leaving_handle(accumulator) }
         else if !arguments_match_parameters(f, Some(e.member), e.args) {
           {
-            ..acc,
+            ..accumulator,
             fault: Some(
               b"a call into a function of a mutually recursive group with arguments stored differently from its parameters",
             ),
           }
         } else {
           ended(
-            pass_arguments(acc, e.args, parameter_ownership(f, Some(e.member))),
+            pass_arguments(accumulator, e.args, parameter_ownership(f, Some(e.member))),
             Map::new(),
             b"a reference count not released before the body calls into a function of its mutually recursive group: v",
           )
@@ -683,29 +708,29 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
         Fail(x) ->
           ended(
             x.unwind.fold(
-              x.resource.fold(acc, |w: CheckState, u: Unwinding|
+              x.resource.fold(accumulator, |w: CheckState, u: Unwinding|
                 match operand_var(u.arg) { Some(v) -> read_of(w, v), None -> w }),
               consumed,
             ),
             context.failure_counts,
             b"a reference count differs between where the body fails and where the enclosing handle expects it: v",
           ),
-        Handle(_) -> check_handle(f, context, acc, i),
+        Handle(_) -> check_handle(f, context, accumulator, i),
         Inc(n) -> if !is_refcounted(n.var.representation)
-            || acc.path_state.uncounted.contains(n.var.id) {
+            || accumulator.path_state.uncounted.contains(n.var.id) {
           faulted(
-            acc,
+            accumulator,
             b"a reference count is incremented for a value that has no reference count: v",
             n.var,
           )
         } else if is_token(n.var) {
           faulted(
-            acc,
+            accumulator,
             b"a reference count is incremented on a reuse token, which is a block of memory set aside for reuse: v",
             n.var,
           )
         } else {
-          let read = read_of(acc, n.var);
+          let read = read_of(accumulator, n.var);
           if read.fault != None { read } else {
             resolved(read.path_state, n.var).fold(read, |x: CheckState, t: Var|
               {
@@ -720,27 +745,28 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
               })
           }
         },
-        Dec(v) -> if !is_refcounted(v.representation) || acc.path_state.uncounted.contains(v.id) {
+        Dec(v) -> if !is_refcounted(v.representation)
+            || accumulator.path_state.uncounted.contains(v.id) {
           faulted(
-            acc,
+            accumulator,
             b"a reference count is decremented for a value that has no reference count: v",
             v,
           )
         } else if is_token(v) {
           faulted(
-            acc,
+            accumulator,
             b"a reference count is decremented on a reuse token, which is a block of memory set aside for reuse: v",
             v,
           )
-        } else { consumed(acc, v) },
+        } else { consumed(accumulator, v) },
         Reset(r) -> if !is_token(r.token) {
           faulted(
-            acc,
+            accumulator,
             b"a block of memory is set aside for reuse in a variable that is not a reuse token: v",
             r.token,
           )
         } else {
-          let c = consumed(acc, r.of);
+          let c = consumed(accumulator, r.of);
           {
             ..c,
             path_state: {
@@ -751,21 +777,21 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
         },
         Free(r) -> if !is_token(r.of) {
           faulted(
-            acc,
+            accumulator,
             b"a block of memory is freed through a variable that is not a reuse token: v",
             r.of,
           )
-        } else { consumed(acc, r.of) },
+        } else { consumed(accumulator, r.of) },
         Destructure(o) -> if !is_flat(o.of.representation) {
-          block_opened(context, acc, o.of, o.words)
+          block_opened(context, accumulator, o.of, o.words)
         } else if o.words.map(|w: Var| w.representation) != parts_of(o.of.representation) {
           faulted(
-            acc,
+            accumulator,
             b"a value split into fields stored differently from the fields of its type: v",
             o.of,
           )
         } else {
-          let c = consumed(acc, o.of);
+          let c = consumed(accumulator, o.of);
           let read_arg = o.words.fold(c, |x: CheckState, v: Var|
             if is_refcounted(v.representation) {
               {
@@ -784,37 +810,37 @@ fn check_block(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState
             },
           }
         },
-        SiteScope(_) -> acc,
+        SiteScope(_) -> accumulator,
         CleanupScope(Some(xs)) ->
-          xs.fold(acc, |w: CheckState, x: Unwinding|
+          xs.fold(accumulator, |w: CheckState, x: Unwinding|
             match operand_var(x.arg) { Some(v) -> read_of(w, v), None -> w }),
-        CleanupScope(None) -> acc,
+        CleanupScope(None) -> accumulator,
       }
     })
 
 fn check_let(
   context: Enclosing,
-  acc: CheckState,
+  accumulator: CheckState,
   y: Var,
   value: Rvalue,
   unwind: List<Var>,
 ) -> CheckState =
   match or_else(
       field_fault(
-        acc.path_state,
+        accumulator.path_state,
         match context.looped { Some(lp) -> lp.entry_counts, None -> Map::new() },
         y,
         value,
       ),
-      or_else(bytes_fault(acc.path_state, Some(y), value), uses_fault(Some(y), value)),
+      or_else(bytes_fault(accumulator.path_state, Some(y), value), uses_fault(Some(y), value)),
     ) {
-    Some(f) -> faulted(acc, f.reason, f.v),
-    None -> note_take(check_bound_value(context, acc, y, value, unwind), y, value),
+    Some(f) -> faulted(accumulator, f.reason, f.v),
+    None -> note_take(check_bound_value(context, accumulator, y, value, unwind), y, value),
   }
 
 fn check_bound_value(
   context: Enclosing,
-  acc: CheckState,
+  accumulator: CheckState,
   y: Var,
   value: Rvalue,
   unwind: List<Var>,
@@ -822,22 +848,22 @@ fn check_bound_value(
   match token_in(read_args(value)) {
     Some(t) ->
       faulted(
-        acc,
+        accumulator,
         b"a reuse token, which is a block of memory set aside for reuse, is read as if it were a value: v",
         t,
       ),
-    None -> match word_read(acc, y, value) {
+    None -> match word_read(accumulator, y, value) {
       Some(w) -> w,
-      None -> match escaping(acc.path_state, value) {
+      None -> match escaping(accumulator.path_state, value) {
         Some(c) ->
           faulted(
-            acc,
+            accumulator,
             b"a closure stored on this function's stack is passed somewhere that can use it after the function returns: v",
             c,
           ),
         None -> match stack_captures(value) {
           Some(caps) -> {
-            let read = failing(context, used(acc, operands(value)), value, unwind);
+            let read = failing(context, used(accumulator, operands(value)), value, unwind);
             let read_arg = caps.fold([], |vs: List<Var>, a: Arg|
               match operand_var(a) {
                 Some(v) -> if is_refcounted(v.representation) { vs.push(v) } else { vs },
@@ -852,13 +878,13 @@ fn check_bound_value(
             }
           },
           None -> match representation_fault(y, value) {
-            Some(reason) -> faulted(acc, reason, y),
-            None -> if acc.path_state.uncounted.contains(y.id) {
-              failing(context, used(acc, operands(value)), value, unwind)
+            Some(reason) -> faulted(accumulator, reason, y),
+            None -> if accumulator.path_state.uncounted.contains(y.id) {
+              failing(context, used(accumulator, operands(value)), value, unwind)
             } else {
               match count_shared_with(y, value) {
-                Some(x) -> if borrowed_here(acc.path_state, x) {
-                  let read = failing(context, read_of(acc, x), value, unwind);
+                Some(x) -> if borrowed_here(accumulator.path_state, x) {
+                  let read = failing(context, read_of(accumulator, x), value, unwind);
                   if read.fault != None { read } else {
                     {
                       ..read,
@@ -873,14 +899,14 @@ fn check_bound_value(
                   }
                 } else {
                   result(
-                    failing(context, used(acc, operands(value)), value, unwind),
+                    failing(context, used(accumulator, operands(value)), value, unwind),
                     y,
                     result_ownership(value),
                   )
                 },
                 None ->
                   result(
-                    failing(context, used(acc, operands(value)), value, unwind),
+                    failing(context, used(accumulator, operands(value)), value, unwind),
                     y,
                     result_ownership(value),
                   ),
@@ -892,31 +918,31 @@ fn check_bound_value(
     },
   }
 
-fn check_handle(f: Fn, context: Enclosing, acc: CheckState, i: Inst) -> CheckState =
+fn check_handle(f: Fn, context: Enclosing, accumulator: CheckState, i: Inst) -> CheckState =
   match i {
     Handle(x) -> match token_in(x.args) {
       Some(t) ->
         faulted(
-          acc,
+          accumulator,
           b"a reuse token, which is a block of memory set aside for reuse, is read as if it were a value: v",
           t,
         ),
-      None -> if partly_taken_argument(acc.path_state, x.args) != None {
-        { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
+      None -> if partly_taken_argument(accumulator.path_state, x.args) != None {
+        { ..accumulator, fault: Some(b"a block used whole after a field was taken out of it") }
       } else if (x.site.detached != None || x.site.instance.heap != None)
           && x.args.any(|a: Arg|
             match operand_var(a) {
-              Some(v) -> acc.path_state.stacks.contains(v.id),
+              Some(v) -> accumulator.path_state.stacks.contains(v.id),
               None -> false,
             }) {
         {
-          ..acc,
+          ..accumulator,
           fault: Some(
             b"a closure stored on this function's stack is passed to a handle that can run after the function returns",
           ),
         }
       } else {
-        let h = used(acc, by_signature(x.args, x.uses));
+        let h = used(accumulator, by_signature(x.args, x.uses));
         let across = h.path_state;
         let after = {
           ..h,
@@ -970,7 +996,7 @@ fn check_handle(f: Fn, context: Enclosing, acc: CheckState, i: Inst) -> CheckSta
         }
       },
     },
-    _ -> acc,
+    _ -> accumulator,
   }
 
 fn field_fault(
@@ -1282,11 +1308,16 @@ fn case_position_exists(of: Var, p: { case: Int, at: Int }) -> Bool =
     _ -> false,
   }
 
-fn block_opened(context: Enclosing, acc: CheckState, of: Var, parts: List<Var>) -> CheckState =
+fn block_opened(
+  context: Enclosing,
+  accumulator: CheckState,
+  of: Var,
+  parts: List<Var>,
+) -> CheckState =
   if !opens_as(context, of, parts) {
-    faulted(acc, b"a value split into fields that other code may still use: v", of)
+    faulted(accumulator, b"a value split into fields that other code may still use: v", of)
   } else {
-    parts.fold(consumed(acc, of), |x: CheckState, v: Var|
+    parts.fold(consumed(accumulator, of), |x: CheckState, v: Var|
       if is_refcounted(v.representation) {
         {
           ..x,
@@ -1453,8 +1484,8 @@ fn declared(h: PathState, id: Int) -> PathState =
   { ..h, joins: h.joins.insert(id, false), unset: h.unset.insert(id, true) }
 
 fn used(w: CheckState, ops: List<{ arg: Arg, takes: Bool }>) -> CheckState =
-  ops.fold(w, |acc: CheckState, o: { arg: Arg, takes: Bool }|
-    if o.takes { consume_arg(acc, o.arg) } else { read_arg(acc, o.arg) })
+  ops.fold(w, |accumulator: CheckState, o: { arg: Arg, takes: Bool }|
+    if o.takes { consume_arg(accumulator, o.arg) } else { read_arg(accumulator, o.arg) })
 
 fn consume_arg(w: CheckState, a: Arg) -> CheckState =
   match a { VarOperand(v) -> consumed(w, v), _ -> w }
@@ -1622,7 +1653,7 @@ fn is_flat(r: Representation) -> Bool = match r { AsFlattened(_) -> true, _ -> f
 
 fn resolved(h: PathState, v: Var) -> List<Var> =
   match h.stacks.get(v.id) {
-    Some(caps) -> caps.fold([], |acc: List<Var>, c: Var| acc.concat(word_of(h, c))),
+    Some(caps) -> caps.fold([], |accumulator: List<Var>, c: Var| accumulator.concat(word_of(h, c))),
     None -> word_of(h, v),
   }
 
@@ -1672,9 +1703,9 @@ pub fn uncounted_variables(f: Fn) -> Map<Int, Bool> = {
   let sets = joins_set(Map::new(), f.body);
   range(0, binders(f.body) + 1).fold(
     { found: Map::new(), done: false },
-    |acc: { found: Map<Int, Bool>, done: Bool }, _: Int|
-      if acc.done { acc } else {
-        let lets = uncounted_lets(acc.found, f.body);
+    |accumulator: { found: Map<Int, Bool>, done: Bool }, _: Int|
+      if accumulator.done { accumulator } else {
+        let lets = uncounted_lets(accumulator.found, f.body);
         let next = sets.fold(lets, |m: Map<Int, Bool>, j: Int, args: List<Arg>|
           if args.all(|a: Arg|
               match a {
@@ -1682,7 +1713,7 @@ pub fn uncounted_variables(f: Fn) -> Map<Int, Bool> = {
                 _ -> true,
               }) { m.insert(j, true) }
           else { m });
-        { found: next, done: next.len() == acc.found.len() }
+        { found: next, done: next.len() == accumulator.found.len() }
       },
   ).found
 }
@@ -1705,24 +1736,26 @@ fn uncounted_lets(found: Map<Int, Bool>, b: Block) -> Map<Int, Bool> =
     })
 
 fn joins_set(m: Map<Int, List<Arg>>, b: Block) -> Map<Int, List<Arg>> =
-  b.fold(m, |acc: Map<Int, List<Arg>>, i: Inst|
+  b.fold(m, |accumulator: Map<Int, List<Arg>>, i: Inst|
     match i {
-      Declaration(v) -> if acc.contains(v.id) { acc } else { acc.insert(v.id, []) },
-      Assign(x) -> match acc.get(x.var.id) {
-        Some(xs) -> acc.insert(x.var.id, xs.push(x.arg)),
-        None -> acc,
+      Declaration(v) -> if accumulator.contains(v.id) { accumulator }
+      else { accumulator.insert(v.id, []) },
+      Assign(x) -> match accumulator.get(x.var.id) {
+        Some(xs) -> accumulator.insert(x.var.id, xs.push(x.arg)),
+        None -> accumulator,
       },
-      If(x) -> joins_set(joins_set(acc, x.then), x.otherwise),
+      If(x) -> joins_set(joins_set(accumulator, x.then), x.otherwise),
       Case(c) ->
         c.arms.fold(
-          joins_set(acc, c.rest),
+          joins_set(accumulator, c.rest),
           |n: Map<Int, List<Arg>>, a: { when: Int, body: Block }| joins_set(n, a.body),
         ),
       Match(x) ->
-        x.arms.fold(joins_set(acc, x.rest), |n: Map<Int, List<Arg>>, a: Block| joins_set(n, a)),
-      Loop(l) -> joins_set(acc, l.body),
-      Handle(h) -> joins_set(acc, h.body),
-      _ -> acc,
+        x.arms.fold(joins_set(accumulator, x.rest), |n: Map<Int, List<Arg>>, a: Block|
+          joins_set(n, a)),
+      Loop(l) -> joins_set(accumulator, l.body),
+      Handle(h) -> joins_set(accumulator, h.body),
+      _ -> accumulator,
     })
 
 fn binders(b: Block) -> Int =
@@ -1862,7 +1895,8 @@ fn result(w: CheckState, v: Var, a: Provenance) -> CheckState =
   }
 
 fn ints_joined(a: List<Int>, b: List<Int>) -> List<Int> =
-  b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
+  b.fold(a, |accumulator: List<Int>, x: Int|
+    if accumulator.contains(x) { accumulator } else { accumulator.push(x) })
 
 fn join_owns_count(w: CheckState, j: Var) -> CheckState =
   if is_refcounted(j.representation) {

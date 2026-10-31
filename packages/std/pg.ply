@@ -335,15 +335,15 @@ pub fn first_frame(buf: Bytes) -> Partial = {
 /// Every whole frame in `buf`, and the bytes that are not yet one.
 pub fn read(buf: Bytes) -> Frames / {abort.raise} = read_all(buf, [], buf.len())
 
-fn read_all(buf: Bytes, acc: List<Message>, left: Int) -> Frames / {abort.raise} = {
+fn read_all(buf: Bytes, accumulator: List<Message>, left: Int) -> Frames / {abort.raise} = {
   let p = first_frame(buf);
   match p.frame {
-    None -> { done: acc, rest: p.rest },
+    None -> { done: accumulator, rest: p.rest },
     Some(m) -> if left <= 0 {
       panic(
         "the PostgreSQL message reader found another complete message after it had already consumed every byte of the buffer, which is a bug in the reader",
       )
-    } else { read_all(p.rest, acc.push(m), left - 1) },
+    } else { read_all(p.rest, accumulator.push(m), left - 1) },
   }
 }
 
@@ -442,9 +442,9 @@ fn columns(
   body: Bytes,
   at: Int,
   left: Int,
-  acc: List<Column>,
+  accumulator: List<Column>,
 ) -> Option<List<Column>> / {abort.raise} =
-  if left <= 0 { Some(acc) } else {
+  if left <= 0 { Some(accumulator) } else {
     match read_cstring(body, at) {
       None -> None,
       Some(name) -> match body.u32_be_at(name.next + 6) {
@@ -456,7 +456,7 @@ fn columns(
               body,
               name.next + 18,
               left - 1,
-              acc.push({ name: name.text, ty: ty, format: format }),
+              accumulator.push({ name: name.text, ty: ty, format: format }),
             ),
         },
       },
@@ -475,15 +475,15 @@ fn values(
   body: Bytes,
   at: Int,
   left: Int,
-  acc: List<Option<Bytes>>,
+  accumulator: List<Option<Bytes>>,
 ) -> Option<List<Option<Bytes>>> =
-  if left <= 0 { Some(acc) } else {
+  if left <= 0 { Some(accumulator) } else {
     match body.i32_be_at(at) {
       None -> None,
-      Some(len) -> if len < 0 { values(body, at + 4, left - 1, acc.push(None)) } else {
+      Some(len) -> if len < 0 { values(body, at + 4, left - 1, accumulator.push(None)) } else {
         match body.slice_at(at + 4, len) {
           None -> None,
-          Some(raw) -> values(body, at + 4 + len, left - 1, acc.push(Some(raw))),
+          Some(raw) -> values(body, at + 4 + len, left - 1, accumulator.push(Some(raw))),
         }
       },
     }
@@ -497,11 +497,11 @@ pub fn command_tag(message: Message) -> Option<String> / {abort.raise} =
 pub fn parameter_types(message: Message) -> Option<List<Int>> =
   match message.body.u16_be_at(0) { None -> None, Some(count) -> oids(message.body, 2, count, []) }
 
-fn oids(body: Bytes, at: Int, left: Int, acc: List<Int>) -> Option<List<Int>> =
-  if left <= 0 { Some(acc) } else {
+fn oids(body: Bytes, at: Int, left: Int, accumulator: List<Int>) -> Option<List<Int>> =
+  if left <= 0 { Some(accumulator) } else {
     match body.u32_be_at(at) {
       None -> None,
-      Some(oid) -> oids(body, at + 4, left - 1, acc.push(oid)),
+      Some(oid) -> oids(body, at + 4, left - 1, accumulator.push(oid)),
     }
   }
 
@@ -514,21 +514,28 @@ pub type Field = { code: Int, text: String }
 pub fn diagnostic_fields(message: Message) -> List<Field> / {abort.raise} =
   fields_of(message.body, 0, [], message.body.len())
 
-fn fields_of(b: Bytes, at: Int, acc: List<Field>, left: Int) -> List<Field> / {abort.raise} =
-  if at >= b.len() { acc }
-  else if b.at(at) == 0 { acc } else {
+fn fields_of(
+  b: Bytes,
+  at: Int,
+  accumulator: List<Field>,
+  left: Int,
+) -> List<Field> / {abort.raise} =
+  if at >= b.len() { accumulator }
+  else if b.at(at) == 0 { accumulator } else {
     let code = b.at(at);
     match read_cstring(b, at + 1) {
-      None -> acc,
+      None -> accumulator,
       Some(field) -> if left <= 0 { panic("an error or notice message has more fields than bytes") }
-      else { fields_of(b, field.next, acc.push({ code: code, text: field.text }), left - 1) },
+      else {
+        fields_of(b, field.next, accumulator.push({ code: code, text: field.text }), left - 1)
+      },
     }
   }
 
 /// The diagnostic field with this type byte, such as the SQLSTATE under `C`.
 pub fn field_of(message: Message, code: Int) -> Option<String> / {abort.raise} =
-  diagnostic_fields(message).fold(None, |acc: Option<String>, f: Field|
-    if f.code == code { Some(f.text) } else { acc })
+  diagnostic_fields(message).fold(None, |accumulator: Option<String>, f: Field|
+    if f.code == code { Some(f.text) } else { accumulator })
 
 /// How long a client waits, in milliseconds: to connect, for a read, for a write.
 pub type Timeouts = { connect_ms: Int, read_ms: Int, write_ms: Int }
@@ -609,8 +616,8 @@ pub fn client_error_text(e: ClientError) -> String =
 
 /// The value the server set `name` to at start-up.
 pub fn setting(s: Session, name: String) -> Option<String> =
-  s.settings.fold(None, |acc: Option<String>, set: Parameter|
-    if set.name == name { Some(set.value) } else { acc })
+  s.settings.fold(None, |accumulator: Option<String>, set: Parameter|
+    if set.name == name { Some(set.value) } else { accumulator })
 
 type ReceivedMessage = { message: Message, rest: Bytes }
 
@@ -759,7 +766,7 @@ fn greet<[l]>(
   password: Option<Secret<Bytes>>,
   nonce: String,
   timeouts: Timeouts,
-  acc: Greeting,
+  accumulator: Greeting,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
     Err(e) -> Err(e),
@@ -769,7 +776,7 @@ fn greet<[l]>(
       match m.kind {
         Authentication -> match auth_code(m) {
           None -> Err(Unexpected("an authentication message with no code")),
-          Some(0) -> greet[l](rest, password, nonce, timeouts, acc),
+          Some(0) -> greet[l](rest, password, nonce, timeouts, accumulator),
           Some(3) -> match password {
             None -> Err(ConnectionRejected(no_password(s.user, "a clear-text password"))),
             Some(secret) -> if !net.send_secret[l](
@@ -780,11 +787,11 @@ fn greet<[l]>(
                 b"\x00",
                 timeouts.write_ms,
               ) { Err(NotSent) }
-            else { greet[l](rest, password, nonce, timeouts, acc) },
+            else { greet[l](rest, password, nonce, timeouts, accumulator) },
           },
-          Some(10) -> scram_begin[l](rest, password, nonce, timeouts, acc, m),
-          Some(11) -> scram_continue[l](rest, password, nonce, timeouts, acc, m),
-          Some(12) -> match acc.sasl.expected {
+          Some(10) -> scram_begin[l](rest, password, nonce, timeouts, accumulator, m),
+          Some(11) -> scram_continue[l](rest, password, nonce, timeouts, accumulator, m),
+          Some(12) -> match accumulator.sasl.expected {
             None ->
               Err(
                 Unexpected(
@@ -795,7 +802,7 @@ fn greet<[l]>(
               None -> Err(Unexpected("the final SASL authentication message is not text")),
               Some(text) -> if !scram_verify(text, expected) {
                 Err(Unexpected("the server's proof did not verify"))
-              } else { greet[l](rest, password, nonce, timeouts, acc) },
+              } else { greet[l](rest, password, nonce, timeouts, accumulator) },
             },
           },
           Some(other) ->
@@ -808,13 +815,16 @@ fn greet<[l]>(
         },
         ParameterStatus -> match parameter_status(m) {
           Some(set) ->
-            greet[l](rest, password, nonce, timeouts, { ..acc, settings: acc.settings.push(set) }),
-          None -> greet[l](rest, password, nonce, timeouts, acc),
+            greet[l](rest, password, nonce, timeouts, {
+              ..accumulator,
+              settings: accumulator.settings.push(set),
+            }),
+          None -> greet[l](rest, password, nonce, timeouts, accumulator),
         },
-        BackendKeyData -> greet[l](rest, password, nonce, timeouts, acc),
-        NoticeResponse -> greet[l](rest, password, nonce, timeouts, acc),
+        BackendKeyData -> greet[l](rest, password, nonce, timeouts, accumulator),
+        NoticeResponse -> greet[l](rest, password, nonce, timeouts, accumulator),
         ErrorResponse -> Err(ConnectionRejected(server_error_of(m))),
-        ReadyForQuery -> Ok({ ..rest, settings: acc.settings, status: status_after(m) }),
+        ReadyForQuery -> Ok({ ..rest, settings: accumulator.settings, status: status_after(m) }),
         _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " before the server was ready")),
       }
     },
@@ -847,13 +857,18 @@ fn auth_text(message: Message) -> Option<String> / {abort.raise} =
 fn mechanisms(message: Message) -> List<String> / {abort.raise} =
   match auth_body(message) { None -> [], Some(bytes) -> names_from(bytes, 0, [], bytes.len()) }
 
-fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> / {abort.raise} =
-  if at >= b.len() { acc } else {
+fn names_from(
+  b: Bytes,
+  at: Int,
+  accumulator: List<String>,
+  left: Int,
+) -> List<String> / {abort.raise} =
+  if at >= b.len() { accumulator } else {
     match read_cstring(b, at) {
-      None -> acc,
-      Some(name) -> if name.text.len() == 0 { acc }
+      None -> accumulator,
+      Some(name) -> if name.text.len() == 0 { accumulator }
       else if left <= 0 { panic("the list of SASL mechanisms has more names than bytes") }
-      else { names_from(b, name.next, acc.push(name.text), left - 1) },
+      else { names_from(b, name.next, accumulator.push(name.text), left - 1) },
     }
   }
 
@@ -898,12 +913,12 @@ fn scram_begin<[l]>(
   password: Option<Secret<Bytes>>,
   nonce: String,
   timeouts: Timeouts,
-  acc: Greeting,
+  accumulator: Greeting,
   message: Message,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
     None -> Err(ConnectionRejected(no_password(s.user, "a password"))),
-    Some(_) -> match choose_binding(acc.channel, mechanisms(message)) {
+    Some(_) -> match choose_binding(accumulator.channel, mechanisms(message)) {
       Err(e) -> Err(e),
       Ok(binding) -> {
         let first_bare = scram_first_bare(s.user, nonce);
@@ -919,7 +934,7 @@ fn scram_begin<[l]>(
             timeouts.write_ms,
           ) { Err(NotSent) } else {
           greet[l](s, password, nonce, timeouts, {
-            ..acc,
+            ..accumulator,
             sasl: { first_bare: first_bare, binding: binding, expected: None },
           })
         }
@@ -935,7 +950,7 @@ fn der_at(b: Bytes, at: Int) -> Option<Element> =
     let n = if first_frame < 128 { 0 } else { first_frame - 128 };
     if n > 4 || at + 2 + n > b.len() || first_frame == 128 { None } else {
       let length = if n == 0 { first_frame }
-      else { range(0, n).fold(0, |acc: Int, i: Int| acc * 256 + b.at(at + 2 + i)) };
+      else { range(0, n).fold(0, |accumulator: Int, i: Int| accumulator * 256 + b.at(at + 2 + i)) };
       let start = at + 2 + n;
       if start + length > b.len() { None }
       else { Some({ tag: b.at(at), start: start, end: start + length }) }
@@ -1036,7 +1051,7 @@ fn scram_continue<[l]>(
   password: Option<Secret<Bytes>>,
   nonce: String,
   timeouts: Timeouts,
-  acc: Greeting,
+  accumulator: Greeting,
   message: Message,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
@@ -1049,9 +1064,9 @@ fn scram_continue<[l]>(
             Unexpected("the server's SASL challenge message could not be parsed: " ++ server_first),
           ),
         Some(challenge) -> match scram_final(
-            acc.sasl.binding,
+            accumulator.sasl.binding,
             secret,
-            acc.sasl.first_bare,
+            accumulator.sasl.first_bare,
             server_first,
             challenge,
           ) {
@@ -1069,8 +1084,8 @@ fn scram_continue<[l]>(
                 timeouts.write_ms,
               ) { Err(NotSent) } else {
               greet[l](s, password, nonce, timeouts, {
-                ..acc,
-                sasl: { ..acc.sasl, expected: Some(proof.expected) },
+                ..accumulator,
+                sasl: { ..accumulator.sasl, expected: Some(proof.expected) },
               })
             }
           },
@@ -1143,10 +1158,10 @@ fn empty_result() -> PartialResult = { columns: [], rows: [], tag: "", rejected:
 fn gather<[l]>(
   s: Session,
   timeouts: Timeouts,
-  acc: PartialResult,
+  accumulator: PartialResult,
 ) -> Result<Reply, ClientError> / {net.recv[l], abort.raise, diverges} =
   match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
-    Err(e) -> match acc.rejected {
+    Err(e) -> match accumulator.rejected {
       Some(server) -> Err(ConnectionRejected(server)),
       None -> Err(e),
     },
@@ -1156,34 +1171,39 @@ fn gather<[l]>(
       match m.kind {
         RowDescription ->
           gather[l](rest, timeouts, {
-            ..acc,
-            columns: match row_description(m) { Some(c) -> c, None -> acc.columns },
+            ..accumulator,
+            columns: match row_description(m) { Some(c) -> c, None -> accumulator.columns },
           }),
         DataRow ->
           gather[l](rest, timeouts, {
-            ..acc,
-            rows: acc.rows.concat([match data_row(m) { Some(r) -> r, None -> [] }]),
+            ..accumulator,
+            rows: accumulator.rows.concat([match data_row(m) { Some(r) -> r, None -> [] }]),
           }),
         CommandComplete ->
           gather[l](rest, timeouts, {
-            ..acc,
-            tag: match command_tag(m) { Some(t) -> t, None -> acc.tag },
+            ..accumulator,
+            tag: match command_tag(m) { Some(t) -> t, None -> accumulator.tag },
           }),
-        ErrorResponse -> gather[l](rest, timeouts, { ..acc, rejected: Some(server_error_of(m)) }),
-        NoticeResponse -> gather[l](rest, timeouts, acc),
-        NotificationResponse -> gather[l](queue_notification(rest, m), timeouts, acc),
+        ErrorResponse ->
+          gather[l](rest, timeouts, { ..accumulator, rejected: Some(server_error_of(m)) }),
+        NoticeResponse -> gather[l](rest, timeouts, accumulator),
+        NotificationResponse -> gather[l](queue_notification(rest, m), timeouts, accumulator),
         ReadyForQuery -> {
           let ready = { ..rest, status: status_after(m) };
-          match acc.rejected {
+          match accumulator.rejected {
             Some(server) -> Err(Rejected(ready, server)),
             None ->
               Ok({
                 session: ready,
-                result: { columns: acc.columns, rows: acc.rows, tag: acc.tag },
+                result: {
+                  columns: accumulator.columns,
+                  rows: accumulator.rows,
+                  tag: accumulator.tag,
+                },
               }),
           }
         },
-        _ -> gather[l](rest, timeouts, acc),
+        _ -> gather[l](rest, timeouts, accumulator),
       }
     },
   }
@@ -1302,28 +1322,35 @@ fn copy_split(
   line: Bytes,
   start: Int,
   at: Int,
-  acc: List<Bytes>,
+  accumulator: List<Bytes>,
   left: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
   if left <= 0 { panic("splitting a copy line ran more steps than the line has bytes") }
-  else if at >= line.len() { Some(acc.push(line.slice(start, at))) } else {
+  else if at >= line.len() { Some(accumulator.push(line.slice(start, at))) } else {
     let c = line.at(at);
     if c == 92 {
-      if at + 1 >= line.len() { None } else { copy_split(line, start, at + 2, acc, left - 1) }
-    } else if c == 9 { copy_split(line, at + 1, at + 1, acc.push(line.slice(start, at)), left - 1) }
-    else { copy_split(line, start, at + 1, acc, left - 1) }
+      if at + 1 >= line.len() { None }
+      else { copy_split(line, start, at + 2, accumulator, left - 1) }
+    } else if c == 9 {
+      copy_split(line, at + 1, at + 1, accumulator.push(line.slice(start, at)), left - 1)
+    } else { copy_split(line, start, at + 1, accumulator, left - 1) }
   }
 
 fn copy_unescaped(field: Bytes) -> Option<Bytes> / {abort.raise} =
   unescaping(field, 0, b"", field.len() + 1)
 
-fn unescaping(field: Bytes, at: Int, acc: Bytes, left: Int) -> Option<Bytes> / {abort.raise} =
+fn unescaping(
+  field: Bytes,
+  at: Int,
+  accumulator: Bytes,
+  left: Int,
+) -> Option<Bytes> / {abort.raise} =
   if left <= 0 { panic("decoding a copy field ran more steps than the field has bytes") }
-  else if at >= field.len() { Some(acc) } else if field.at(at) != 92 {
-    unescaping(field, at + 1, acc.concat(field.slice(at, at + 1)), left - 1)
+  else if at >= field.len() { Some(accumulator) } else if field.at(at) != 92 {
+    unescaping(field, at + 1, accumulator.concat(field.slice(at, at + 1)), left - 1)
   } else if at + 1 >= field.len() { None } else {
     let e = escape_at(field, at + 1);
-    unescaping(field, e.next, acc.concat(e.byte), left - 1)
+    unescaping(field, e.next, accumulator.concat(e.byte), left - 1)
   }
 
 type Escape = { byte: Bytes, next: Int }
@@ -1346,11 +1373,12 @@ fn escape_at(field: Bytes, at: Int) -> Escape / {abort.raise} = {
 fn digits(field: Bytes, at: Int, radix: Int, most: Int) -> Escape / {abort.raise} = {
   let taken = range(0, most).fold(
     { value: 0, next: at, open: true },
-    |acc: { value: Int, next: Int, open: Bool }, i: Int|
-      if !acc.open || acc.next >= field.len() { { ..acc, open: false } } else {
-        let d = bytes::digit_value(field.at(acc.next));
-        if d < 0 || d >= radix { { ..acc, open: false } }
-        else { { value: acc.value * radix + d, next: acc.next + 1, open: true } }
+    |accumulator: { value: Int, next: Int, open: Bool }, i: Int|
+      if !accumulator.open || accumulator.next >= field.len() { { ..accumulator, open: false } }
+      else {
+        let d = bytes::digit_value(field.at(accumulator.next));
+        if d < 0 || d >= radix { { ..accumulator, open: false } }
+        else { { value: accumulator.value * radix + d, next: accumulator.next + 1, open: true } }
       },
   );
   { byte: byte_of_int(taken.value & 255), next: taken.next }
@@ -1654,7 +1682,7 @@ fn sample_certificate(algorithm: Bytes, params: Bytes) -> Bytes / {abort.raise} 
     else { Bytes::concat_all([byte_of_int(130), byte_of_int(n / 256), byte_of_int(n % 256)]) };
   let element = |tag: Int, content: Bytes|
     Bytes::concat_all([byte_of_int(tag), length(content.len()), content]);
-  let subject = range(0, 300).fold(b"", |acc: Bytes, i: Int| acc.concat(b"s"));
+  let subject = range(0, 300).fold(b"", |accumulator: Bytes, i: Int| accumulator.concat(b"s"));
   element(
     48,
     Bytes::concat_all([
@@ -1793,14 +1821,14 @@ fn scripted_queries(
   net::on_mem(scripted, ||
     sqls.fold(
       { session: sample_session(net::dial_address[conn](server, [], 1000)), results: [] },
-      |acc: { session: Session, results: List<Result<Reply, ClientError>> }, sql: String| {
-        let result = simple_query[conn](acc.session, sql, default_timeouts());
+      |accumulator: { session: Session, results: List<Result<Reply, ClientError>> }, sql: String| {
+        let result = simple_query[conn](accumulator.session, sql, default_timeouts());
         let next = match result {
           Ok(r) -> r.session,
           Err(Rejected(s, _)) -> s,
-          Err(_) -> acc.session,
+          Err(_) -> accumulator.session,
         };
-        { session: next, results: acc.results.push(result) }
+        { session: next, results: accumulator.results.push(result) }
       },
     ).results).value
 }
@@ -1983,9 +2011,10 @@ fn scripted_waits(
     let s = sample_session(net::dial_address[conn](server, [], 1000));
     range(0, waits).fold(
       { session: s, output_lines: [] },
-      |acc: { session: Session, output_lines: List<Option<Notification>> }, i: Int|
-        match await_notification[conn](acc.session, 50) {
-          Ok(w) -> { session: w.session, output_lines: acc.output_lines.push(w.notification) },
+      |accumulator: { session: Session, output_lines: List<Option<Notification>> }, i: Int|
+        match await_notification[conn](accumulator.session, 50) {
+          Ok(w) ->
+            { session: w.session, output_lines: accumulator.output_lines.push(w.notification) },
           Err(e) -> panic(client_error_text(e)),
         },
     ).output_lines
@@ -2167,13 +2196,13 @@ test "a copy out returns one chunk of data per call, then returns no data once t
         Ok(c) ->
           range(0, 3).fold(
             { session: c.session, said: [] },
-            |acc: { session: Session, said: List<String> }, i: Int|
-              match copy_out_take[conn](acc.session, default_timeouts()) {
-                Err(e) -> { ..acc, said: acc.said.push(client_error_text(e)) },
+            |accumulator: { session: Session, said: List<String> }, i: Int|
+              match copy_out_take[conn](accumulator.session, default_timeouts()) {
+                Err(e) -> { ..accumulator, said: accumulator.said.push(client_error_text(e)) },
                 Ok(p) ->
                   {
                     session: p.session,
-                    said: acc.said.push(match p.data {
+                    said: accumulator.said.push(match p.data {
                       Some(d) -> String::of_bytes(d),
                       None -> "end",
                     }),

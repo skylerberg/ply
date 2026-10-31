@@ -31,32 +31,42 @@ fn body_of(p: Program, name: Bytes) -> Block / {abort.raise} =
   }
 
 fn flat(b: Block) -> List<Inst> =
-  b.fold([], |acc: List<Inst>, i: Inst|
+  b.fold([], |accumulator: List<Inst>, i: Inst|
     match i {
-      If(x) -> acc.push(i).concat(flat(x.then)).concat(flat(x.otherwise)),
+      If(x) -> accumulator.push(i).concat(flat(x.then)).concat(flat(x.otherwise)),
       Case(c) ->
-        c.arms.fold(acc.push(i), |a: List<Inst>, arm: { when: Int, body: Block }|
+        c.arms.fold(accumulator.push(i), |a: List<Inst>, arm: { when: Int, body: Block }|
           a.concat(flat(arm.body))).concat(
           flat(c.rest),
         ),
       Match(m) ->
-        m.arms.fold(acc.push(i), |a: List<Inst>, arm: Block| a.concat(flat(arm))).concat(
+        m.arms.fold(accumulator.push(i), |a: List<Inst>, arm: Block| a.concat(flat(arm))).concat(
           flat(m.rest),
         ),
-      Handle(h) -> acc.push(i).concat(flat(h.body)),
-      _ -> acc.push(i),
+      Handle(h) -> accumulator.push(i).concat(flat(h.body)),
+      _ -> accumulator.push(i),
     })
 
 fn calls_in(b: Block) -> List<RootKey> =
-  flat(b).fold([], |acc: List<RootKey>, i: Inst|
-    match i { Let(l) -> push_callee(acc, l.value), Do(d) -> push_callee(acc, d.value), _ -> acc })
+  flat(b).fold([], |accumulator: List<RootKey>, i: Inst|
+    match i {
+      Let(l) -> push_callee(accumulator, l.value),
+      Do(d) -> push_callee(accumulator, d.value),
+      _ -> accumulator,
+    })
 
-fn push_callee(acc: List<RootKey>, v: Rvalue) -> List<RootKey> =
-  match v { Call(c) -> match c.callee { Root(k) -> acc.push(k), _ -> acc }, _ -> acc }
+fn push_callee(accumulator: List<RootKey>, v: Rvalue) -> List<RootKey> =
+  match v {
+    Call(c) -> match c.callee { Root(k) -> accumulator.push(k), _ -> accumulator },
+    _ -> accumulator,
+  }
 
 fn unwound_in(b: Block) -> List<List<RootKey>> =
-  flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
-    match i { CleanupScope(Some(xs)) -> acc.push(xs.map(|x: Unwinding| x.callee)), _ -> acc })
+  flat(b).fold([], |accumulator: List<List<RootKey>>, i: Inst|
+    match i {
+      CleanupScope(Some(xs)) -> accumulator.push(xs.map(|x: Unwinding| x.callee)),
+      _ -> accumulator,
+    })
 
 test "a resource is released where its block ends, by the release function of its type" {
   let p = program(b"fn f() -> Int = { let c = open(1); let n = send(c, 1); n }\n");
@@ -106,8 +116,11 @@ test "a `let` whose pattern does not match releases the resources of its block b
   );
   let b = body_of(p, b"f");
   assert(unwound_in(b).all(|xs: List<RootKey>| xs == [conn_release_key()]), None);
-  let missed = flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
-    match i { Fail(x) -> acc.push(x.resource.map(|u: Unwinding| u.callee)), _ -> acc });
+  let missed = flat(b).fold([], |accumulator: List<List<RootKey>>, i: Inst|
+    match i {
+      Fail(x) -> accumulator.push(x.resource.map(|u: Unwinding| u.callee)),
+      _ -> accumulator,
+    });
   assert_eq(missed, [[conn_release_key()]]);
   assert_eq(calls_in(b).filter(|k: RootKey| k == conn_release_key()).len(), 1)
 }
@@ -125,12 +138,17 @@ test "a failed pattern releases each whole value by passing it to its release fu
   let r = program(
     b"fn might() -> Int / {abort.raise} = 1\nfn maybe() -> Option<Int> = None\nfn g() -> Int / {abort.raise} = { let c = open(1); let n = send(c, might()); let Some(m) = maybe(); n + m }\n",
   );
-  let handings = flat(body_of(r, b"g")).fold([], |acc: List<List<ParamOwnership>>, i: Inst|
-    match i {
-      CleanupScope(Some(xs)) -> acc.concat(xs.map(|u: Unwinding| param_ownerships(u.convention))),
-      Fail(x) -> acc.concat(x.resource.map(|u: Unwinding| param_ownerships(u.convention))),
-      _ -> acc,
-    });
+  let handings = flat(body_of(r, b"g")).fold(
+    [],
+    |accumulator: List<List<ParamOwnership>>, i: Inst|
+      match i {
+        CleanupScope(Some(xs)) ->
+          accumulator.concat(xs.map(|u: Unwinding| param_ownerships(u.convention))),
+        Fail(x) ->
+          accumulator.concat(x.resource.map(|u: Unwinding| param_ownerships(u.convention))),
+        _ -> accumulator,
+      },
+  );
   assert(handings.len() >= 2 && handings.all(|h: List<ParamOwnership>| h == handings.get(0)), None);
   let q = program(
     b"fn f(o: Option<Int>) -> Int / {abort.raise} = { let c = open(1); handle { let Some(x) = o; close(c); x } with { abort.raise(m) -> 0 } }\n",
@@ -168,8 +186,8 @@ test "a raise handled by a `handle` inside an argument releases nothing owned by
   let p = program(
     b"fn kept(c: keep Conn, n: Int) -> Int = { close(c); n }\nfn f() -> Int = kept(open(1), handle { abort.raise(\"no\"); 1 } with { abort.raise(m) -> 2 })\n",
   );
-  let inside = flat(body_of(p, b"f")).fold([], |acc: List<List<RootKey>>, i: Inst|
-    match i { Handle(h) -> acc.concat(unwound_in(h.body)), _ -> acc });
+  let inside = flat(body_of(p, b"f")).fold([], |accumulator: List<List<RootKey>>, i: Inst|
+    match i { Handle(h) -> accumulator.concat(unwound_in(h.body)), _ -> accumulator });
   assert_eq(inside, [])
 }
 
@@ -189,11 +207,12 @@ fn logging_release_corpus() -> Bytes =
   ])
 
 fn argument_counts(b: Block, k: RootKey) -> List<Int> =
-  flat(b).fold([], |acc: List<Int>, i: Inst| {
+  flat(b).fold([], |accumulator: List<Int>, i: Inst| {
     let v = match i { Let(l) -> Some(l.value), Do(d) -> Some(d.value), _ -> None };
     match v {
-      Some(Call(c)) -> if c.callee == Root(k) { acc.push(c.args.len()) } else { acc },
-      _ -> acc,
+      Some(Call(c)) -> if c.callee == Root(k) { accumulator.push(c.args.len()) }
+      else { accumulator },
+      _ -> accumulator,
     }
   })
 
@@ -211,10 +230,10 @@ test "a resource's release function that performs effects is passed the resource
     ),
     [2],
   );
-  let words = flat(b).fold([], |acc: List<Int>, i: Inst|
+  let words = flat(b).fold([], |accumulator: List<Int>, i: Inst|
     match i {
-      CleanupScope(Some(xs)) -> acc.concat(xs.map(|u: Unwinding| u.words.len())),
-      _ -> acc,
+      CleanupScope(Some(xs)) -> accumulator.concat(xs.map(|u: Unwinding| u.words.len())),
+      _ -> accumulator,
     });
   assert(words.len() > 0 && words.all(|n: Int| n == 1), None);
   let q = program(b"fn g() -> Int / {abort.raise} = { let c = open(1); let n = send(c, 1); n }\n");

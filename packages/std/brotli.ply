@@ -1370,12 +1370,12 @@ pub fn read(r: Reader, chunk: Bytes) -> ReadResult / {brotli.fail, abort.raise} 
 /// Returns whether the reader has read the last meta-block of the stream.
 pub fn ended(r: Reader) -> Bool = match r { Reader(d) -> d.core.phase == 5 }
 
-type BitWriter = { out: Bytes, acc: Int, n: Int }
+type BitWriter = { out: Bytes, accumulator: Int, n: Int }
 
 fn write_bits(w: BitWriter, value: Int, count: Int) -> BitWriter / {abort.raise} = {
-  let acc = w.acc | value << w.n;
+  let accumulator = w.accumulator | value << w.n;
   let n = w.n + count;
-  { out: flush_bits(w.out, acc, n), acc: acc >>> (n & 0x78), n: n & 7 }
+  { out: flush_bits(w.out, accumulator, n), accumulator: accumulator >>> (n & 0x78), n: n & 7 }
 }
 
 fn pad_to_byte(w: BitWriter) -> BitWriter / {abort.raise} = write_bits(w, 0, 0 - w.n & 7)
@@ -1476,7 +1476,7 @@ fn literals_written(
   end: Int,
   codes: Array<Int>,
   out: Bytes,
-  acc: Int,
+  accumulator: Int,
   n: Int,
 ) -> BitWriter / {abort.raise} =
   if i + 3 <= end {
@@ -1485,7 +1485,7 @@ fn literals_written(
     let c = codes.get(buf.at(i + 2));
     let two = n + (a & 15);
     let three = two + (b & 15);
-    let all = acc | a >>> 4 << n | b >>> 4 << two | c >>> 4 << three;
+    let all = accumulator | a >>> 4 << n | b >>> 4 << two | c >>> 4 << three;
     let held = three + (c & 15);
     literals_written(
       buf,
@@ -1498,7 +1498,7 @@ fn literals_written(
     )
   } else if i < end {
     let a = codes.get(buf.at(i));
-    let all = acc | a >>> 4 << n;
+    let all = accumulator | a >>> 4 << n;
     let held = n + (a & 15);
     literals_written(
       buf,
@@ -1509,7 +1509,7 @@ fn literals_written(
       all >>> (held & 0x78),
       held & 7,
     )
-  } else { { out: out, acc: acc, n: n } }
+  } else { { out: out, accumulator: accumulator, n: n } }
 
 type Coding = { literals: Array<Int>, commands: Array<Int>, distances: Array<Int> }
 
@@ -1537,7 +1537,7 @@ fn commands_written(
     let cc = copy_codes().get(
       b"\x00\x08\x00\x08\x00\x08\x10\x00\x10\x08\x10".at(cell) + (symbol & 7),
     );
-    let head = w.acc | code >>> 4 << w.n | insert - (ic >>> 5) << w.n + (code & 15);
+    let head = w.accumulator | code >>> 4 << w.n | insert - (ic >>> 5) << w.n + (code & 15);
     let held = w.n + (code & 15) + (ic & 31);
     let lengths = head >>> (held & 0x78) | copy - (cc >>> 5) << (held & 7);
     let held2 = (held & 7) + (cc & 31);
@@ -1564,12 +1564,12 @@ fn commands_written(
     } else {
       let dcode = k.distances.get(far);
       let width = if far < 16 { 0 } else { bit_length(dist + 3) - 2 };
-      let tail = wrote.acc | dcode >>> 4 << wrote.n
+      let tail = wrote.accumulator | dcode >>> 4 << wrote.n
         | (dist + 3 & (1 << width) - 1) << wrote.n + (dcode & 15);
       let held3 = wrote.n + (dcode & 15) + width;
       commands_written(seqs, i + 1, buf, at + insert + copy, dist, k, {
         out: flush_bits(wrote.out, tail, held3),
-        acc: tail >>> (held3 & 0x78),
+        accumulator: tail >>> (held3 & 0x78),
         n: held3 & 7,
       })
     }
@@ -1585,7 +1585,7 @@ pub type Level =
   /// codes, uses a single block type with no context modelling, and never uses a dictionary word.
   | Fast
 
-type Packer = { table: Array<Int>, last: Int, acc: Int, n: Int }
+type Packer = { table: Array<Int>, last: Int, accumulator: Int, n: Int }
 
 type Packed = { bytes: Bytes, packer: Packer }
 
@@ -1605,11 +1605,11 @@ fn block_written(
   p: Packer,
 ) -> Packed / {abort.raise} = {
   let last = p.last;
-  let start: BitWriter = { out: b"", acc: p.acc, n: p.n };
+  let start: BitWriter = { out: b"", accumulator: p.accumulator, n: p.n };
   let raw = pad_to_byte(block_head(start, to - from, true));
   let stored = raw.out.concat(buf.slice(from, to));
   match level {
-    Stored -> { bytes: stored, packer: { table: p.table, last: last, acc: 0, n: 0 } },
+    Stored -> { bytes: stored, packer: { table: p.table, last: last, accumulator: 0, n: 0 } },
     Fast -> {
       let seen = find_matches(buf, from, from, to, p.table, [], last, shift, to - from + 1);
       let anchor = seen.anchor;
@@ -1652,11 +1652,11 @@ fn block_written(
         spelled,
       );
       if wrote.out.len() >= stored.len() {
-        { bytes: stored, packer: { table: table, last: last, acc: 0, n: 0 } }
+        { bytes: stored, packer: { table: table, last: last, accumulator: 0, n: 0 } }
       } else {
         {
           bytes: wrote.out,
-          packer: { table: table, last: counts.last, acc: wrote.acc, n: wrote.n },
+          packer: { table: table, last: counts.last, accumulator: wrote.accumulator, n: wrote.n },
         }
       }
     },
@@ -1682,14 +1682,15 @@ fn blocks_written(
   }
 
 fn end_of_stream(p: Packer) -> Bytes / {abort.raise} =
-  pad_to_byte(write_bits({ out: b"", acc: p.acc, n: p.n }, 3, 2)).out
+  pad_to_byte(write_bits({ out: b"", accumulator: p.accumulator, n: p.n }, 3, 2)).out
 
 /// Compresses `data` as one stream. Its window is 64 KiB if the data is no longer than that, and
 /// 4 MiB otherwise.
 pub fn compress(data: Bytes, level: Level) -> Bytes / {abort.raise} = {
   let n = data.len();
-  let start: Packer = if n <= 65520 { { table: Array::new(131072, 0), last: 4, acc: 0, n: 1 } }
-  else { { table: Array::new(131072, 0), last: 4, acc: 11, n: 4 } };
+  let start: Packer = if n <= 65520 {
+    { table: Array::new(131072, 0), last: 4, accumulator: 0, n: 1 }
+  } else { { table: Array::new(131072, 0), last: 4, accumulator: 11, n: 4 } };
   let written = blocks_written(data, 0, n, 0, level, start, []);
   Bytes::concat_all(written.out.push(end_of_stream(written.packer)))
 }
@@ -1718,7 +1719,12 @@ fn compress_chunk(w: Encoder, chunk: Bytes, level: Level) -> EncoderOutput / {ab
 }
 
 fn new_encoder() -> Encoder =
-  { buf: b"", from: 0, shift: 0, packer: { table: Array::new(131072, 0), last: 4, acc: 11, n: 4 } }
+  {
+    buf: b"",
+    from: 0,
+    shift: 0,
+    packer: { table: Array::new(131072, 0), last: 4, accumulator: 11, n: 4 },
+  }
 
 fn finish_encoder(w: Encoder, level: Level) -> Bytes / {abort.raise} = {
   let rest = blocks_written(w.buf, w.from, w.buf.len(), w.shift, level, w.packer, []);
@@ -1982,7 +1988,7 @@ fn write_four_symbols(w: BitWriter, symbols: List<Int>, width: Int) -> BitWriter
 
 fn stream_header(length: Int) -> BitWriter / {abort.raise} = {
   let head = write_bits(
-    write_bits(write_bits({ out: b"", acc: 0, n: 1 }, 1, 2), 0, 2),
+    write_bits(write_bits({ out: b"", accumulator: 0, n: 1 }, 1, 2), 0, 2),
     length - 1,
     16,
   );
@@ -2119,7 +2125,7 @@ fn largest_history(
 test "decoding retains at most the window size of earlier output, however long the stream is and whatever its commands" {
   let plain = sample_sentence().repeat(4000);
   let blocks = range(0, 340).fold(
-    { out: [], packer: { table: Array::new(1, 0), last: 4, acc: 0x21, n: 7 } },
+    { out: [], packer: { table: Array::new(1, 0), last: 4, accumulator: 0x21, n: 7 } },
     |s: { out: List<Bytes>, packer: Packer }, i: Int| {
       let one = block_written(plain, 1000 * i, 1000 * i + 1000, 0, Stored, s.packer);
       { out: s.out.push(one.bytes), packer: one.packer }
