@@ -3,18 +3,19 @@ import std.json (Bool)
 import paths (RootedPath, absolute, child, displayed, kind)
 import walk (Failure)
 import compiler.check.resolve.tables (Declarations, Declaration, Namespace, ValueSpace, TypeSpace,
-                                      EffectSpace, SetSpace, Binding, space, namespaces,
+                                      EffectSpace, SetSpace, Binding, declarations_in, namespaces,
                                       bindings_in, qualify, module_of_name)
 import compiler.check.resolve.bindings (written, Reference, Member, Local, Definition, Operation,
-                                        Module, Unbound, FieldName, CalledName, ArgumentName)
+                                        ModuleQualifier, Unbound, FieldName, CalledName,
+                                        ArgumentName)
 import compiler.check.member (CallsFunction)
 import compiler.syntax.lexer (lex, Token, Comment, Identifier)
 import compiler.syntax.items (Module, ImportDeclaration, ModuleAlias, member_of, member_name)
-import compiler.syntax.parsing (is_made)
+import compiler.syntax.parsing (is_synthetic_site)
 import rename.lines (Moved, OperationLine, Renames, field_name, joined, renamed, shown)
 import rename.strings (line_at)
-import rename.programs (Entry, Library, Loaded, Read, DefinitionKey, in_root, key_of, module_path,
-                        name_in, package_of)
+import rename.programs (Entry, Library, Loaded, Read, DefinitionKey, root_relative, key_of,
+                        module_path, name_in, package_of)
 
 type Applying = { at: Int, parts: List<Bytes> }
 
@@ -37,7 +38,7 @@ type Spaces = {
 fn no_spaces() -> Spaces =
   { values: Map::new(), types: Map::new(), effects: Map::new(), sets: Map::new() }
 
-fn in_space(s: Spaces, namespace: Namespace) -> Map<DefinitionKey, Bytes> =
+fn names_in_namespace(s: Spaces, namespace: Namespace) -> Map<DefinitionKey, Bytes> =
   match namespace {
     ValueSpace -> s.values,
     TypeSpace -> s.types,
@@ -80,7 +81,7 @@ fn declared_name(
   match member_of(name) {
     Some(m) ->
       member_name(
-        if space(declarations, TypeSpace).any(|d: Declaration| d.name == m.of) {
+        if declarations_in(declarations, TypeSpace).any(|d: Declaration| d.name == m.of) {
           simple_name(renames, file, m.of)
         } else { m.of },
         simple_name(renames, file, m.member),
@@ -88,13 +89,13 @@ fn declared_name(
     None -> simple_name(renames, file, name),
   }
 
-pub fn own_part(name: Bytes) -> Bytes / {abort.raise} =
+pub fn unqualified_name(name: Bytes) -> Bytes / {abort.raise} =
   match member_of(name) { Some(m) -> m.member, None -> name }
 
 fn extern_rejection(path: String, name: Bytes) -> Failure / {abort.raise} =
   {
     path: path,
-    reason: shown(own_part(name))
+    reason: shown(unqualified_name(name))
       ++ " is declared with `extern`, so code outside Ply uses that name",
   }
 
@@ -102,7 +103,7 @@ fn with_definitions(rn: Renaming, r: Read, declarations: Declarations) -> Renami
   let path = displayed(r.file.at);
   let file = absolute(rn.pwd, r.file.at);
   namespaces().fold(rn, |acc: Renaming, namespace: Namespace|
-    space(declarations, namespace).fold(acc, |into: Renaming, d: Declaration| {
+    declarations_in(declarations, namespace).fold(acc, |into: Renaming, d: Declaration| {
       let new = declared_name(rn.renames, path, declarations, d.name);
       let seen = if namespace == ValueSpace {
         into.declared.insert({ file: file, name: d.name }, path)
@@ -122,7 +123,7 @@ fn with_definitions(rn: Renaming, r: Read, declarations: Declarations) -> Renami
 fn with_operations(rn: Renaming, r: Read, declarations: Declarations) -> Renaming / {abort.raise} = {
   let path = displayed(r.file.at);
   r.effects.fold(rn, |acc: Renaming, e: { name: Bytes, operations: List<Bytes> }|
-    match space(declarations, EffectSpace).find(|d: Declaration| d.name == e.name) {
+    match declarations_in(declarations, EffectSpace).find(|d: Declaration| d.name == e.name) {
       None -> acc,
       Some(declared) -> {
         let effect_key = { file: absolute(rn.pwd, r.file.at), name: declared.name };
@@ -151,7 +152,7 @@ fn with_move(rn: Renaming, r: Read, package: RootedPath) -> Renaming / {abort.ra
   let parts = module_path(at, package).split("/");
   let base = if package.path == "" { "" } else { package.path ++ "/" };
   let lined = rn.renames.modules.fold(parts, |acc: List<String>, m: Moved| {
-    let path = in_root(m.path, at);
+    let path = root_relative(m.path, at);
     let index = if !path.ends_with("/") { if path == at.path { parts.len() - 1 } else { -1 } }
     else if at.path.starts_with(path) && path.starts_with(base) {
       path.slice(base.len(), path.len() - 1).split("/").len() - 1
@@ -208,7 +209,7 @@ pub fn qualified_renames(rn: Renaming, reads: List<Read>) -> Map<Bytes, Bytes> /
       None -> acc,
     });
   namespaces().fold(moved, |acc: Map<Bytes, Bytes>, namespace: Namespace|
-    in_space(rn.definitions, namespace).fold(
+    names_in_namespace(rn.definitions, namespace).fold(
       acc,
       |into: Map<Bytes, Bytes>, key: DefinitionKey, new: Bytes|
         match modules.get(key.file) {
@@ -263,7 +264,7 @@ pub fn qualified_after(
       qualify(
         moved_name(module, move_of(rn, l, i)),
         key_of(l, qualified).and_then(|k: DefinitionKey|
-          in_space(rn.definitions, namespace).get(k)).unwrap_or(
+          names_in_namespace(rn.definitions, namespace).get(k)).unwrap_or(
           name_in(module, qualified),
         ),
       ),
@@ -295,8 +296,8 @@ fn definition_new(
   written: Bytes,
 ) -> Bytes / {abort.raise} =
   match key_of(l, qualified).and_then(|k: DefinitionKey|
-      in_space(rn.definitions, namespace).get(k)) {
-    Some(n) -> if member_of(written) != None { n } else { own_part(n) },
+      names_in_namespace(rn.definitions, namespace).get(k)) {
+    Some(n) -> if member_of(written) != None { n } else { unqualified_name(n) },
     None -> written,
   }
 
@@ -317,10 +318,10 @@ pub fn shared_names(rn: Renaming, loads: List<Loaded>) -> List<SharedName> / {ab
           ),
         });
       namespaces().fold(found, |f: List<SharedName>, namespace: Namespace|
-        space(l.declarations.get(r.index), namespace).fold(
+        declarations_in(l.declarations.get(r.index), namespace).fold(
           f,
           |into: List<SharedName>, d: Declaration| {
-            let new = in_space(rn.definitions, namespace).get({
+            let new = names_in_namespace(rn.definitions, namespace).get({
               file: file,
               name: d.name,
             }).unwrap_or(
@@ -330,7 +331,8 @@ pub fn shared_names(rn: Renaming, loads: List<Loaded>) -> List<SharedName> / {ab
             if new == d.name { into } else {
               match after.find(|a: { namespace: Namespace, names: Map<Bytes, Bool> }|
                   a.namespace != namespace && a.names.contains(new)
-                    && !space(declarations, a.namespace).any(|o: Declaration| o.name == d.name)) {
+                    && !declarations_in(declarations, a.namespace).any(|o: Declaration|
+                      o.name == d.name)) {
                 Some(a) ->
                   into.push({
                     path: displayed(r.file.at),
@@ -347,14 +349,14 @@ pub fn shared_names(rn: Renaming, loads: List<Loaded>) -> List<SharedName> / {ab
     }))
 
 fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abort.raise} =
-  match x.refers {
+  match x.target {
     Local(_) -> simple_name(rn.renames, displayed(r.file.at), x.name),
     Definition(d) -> definition_new(rn, l, d.namespace, d.qualified, x.name),
     Operation(o) -> match key_of(l, o.effect).and_then(|k: DefinitionKey| rn.operations.get(k)) {
       Some(ops) -> ops.get(o.name).unwrap_or(x.name),
       None -> x.name,
     },
-    Module(m) -> qualifier_new(rn, l, r, x.name, m),
+    ModuleQualifier(m) -> qualifier_new(rn, l, r, x.name, m),
     Unbound -> x.name,
   }
 
@@ -367,8 +369,8 @@ fn member_new(rn: Renaming, l: Loaded, r: Read, owner: Bytes, m: Member) -> Byte
           rn.definitions.values.get(k)) {
         None -> m.name,
         Some(n) -> match member_of(m.name) {
-          Some(w) -> member_name(w.of, own_part(n)),
-          None -> own_part(n),
+          Some(w) -> member_name(w.of, unqualified_name(n)),
+          None -> unqualified_name(n),
         },
       },
       _ -> field_name(rn.renames, m.name),
@@ -444,9 +446,9 @@ pub fn uses_renamed(rn: Renaming, l: Loaded, r: Read) -> Bool / {abort.raise} =
   import_edits(rn, l, r).len() > 0
     || r.entries.any(|e: Entry|
       e.names.references.any(|x: Reference|
-          match x.refers {
+          match x.target {
             Local(_) -> false,
-            _ -> !is_made(x.site) && reference_new(rn, l, r, x) != x.name,
+            _ -> !is_synthetic_site(x.site) && reference_new(rn, l, r, x) != x.name,
           })
         || e.names.members.any(|m: Member| member_new(rn, l, r, e.owner, m) != m.name))
 
@@ -461,7 +463,7 @@ pub fn edited_of(rn: Renaming, l: Loaded, r: Read) -> Edited / {abort.raise} = {
       let shorthands = e.names.references.fold(Map::new(), |m: Map<Int, Bool>, x: Reference|
         if x.shorthand { m.insert(x.start, true) } else { m });
       let referred = e.names.references.fold(acc, |done: Edited, x: Reference|
-        if is_made(x.site) { done } else {
+        if is_synthetic_site(x.site) { done } else {
           let new = reference_new(rn, l, r, x);
           let field = fields.get(x.start).unwrap_or(x.name);
           if x.shorthand && field != new {
@@ -520,10 +522,13 @@ pub fn split_names(rn: Renaming, loads: List<Loaded>) -> List<SplitName> / {abor
   loads.fold([], |acc: List<SplitName>, l: Loaded|
     l.reads.fold(acc, |found: List<SplitName>, r: Read| {
       let file = absolute(rn.pwd, r.file.at);
-      space(l.declarations.get(r.index), TypeSpace).fold(
+      declarations_in(l.declarations.get(r.index), TypeSpace).fold(
         found,
         |into: List<SplitName>, t: Declaration| {
-          let new = in_space(rn.definitions, TypeSpace).get({ file: file, name: t.name }).unwrap_or(
+          let new = names_in_namespace(rn.definitions, TypeSpace).get({
+            file: file,
+            name: t.name,
+          }).unwrap_or(
             t.name,
           );
           if new == t.name { into } else {

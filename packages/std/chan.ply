@@ -124,13 +124,13 @@ pub fn try_send<a>(c: Chan<a>, x: a) -> SendResult / {task.select} =
 // --- Choosing among channels ------------------------------------------------
 
 /// One thing a select may do: `receive` from a channel, or `sending` a value to one.
-pub type Arm<a> = (Chan<a>, Option<a>)
+pub type SelectCase<a> = (Chan<a>, Option<a>)
 
 /// The arm that receives from `c`.
-pub fn receive<a>(c: Chan<a>) -> Arm<a> = (c, None)
+pub fn receive<a>(c: Chan<a>) -> SelectCase<a> = (c, None)
 
 /// The arm that sends `x` to `c`.
-pub fn sending<a>(c: Chan<a>, x: a) -> Arm<a> = (c, Some(x))
+pub fn sending<a>(c: Chan<a>, x: a) -> SelectCase<a> = (c, Some(x))
 
 /// What a select did, with the index of the arm that proceeded.
 pub type SelectResult<a> =
@@ -143,15 +143,15 @@ pub type SelectResult<a> =
 
 /// Performs the first of `arms`, in their order, that can proceed, waiting until one can if none
 /// can now. With no arms, it waits forever.
-pub fn select<a>(arms: List<Arm<a>>) -> SelectResult<a> / {task.select, abort.raise} =
+pub fn select<a>(arms: List<SelectCase<a>>) -> SelectResult<a> / {task.select, abort.raise} =
   select_from(0, arms)
 
 /// `select`, looking first at the arm at index `first`, then at those after it, and then at those
-/// before. Given `next_turn` of its last result, it gives every arm a turn: an arm that stays
+/// before. Given `next_select_start` of its last result, it gives every arm a turn: an arm that stays
 /// ready proceeds within as many selects as there are arms.
 pub fn select_from<a>(
   first: Int,
-  arms: List<Arm<a>>,
+  arms: List<SelectCase<a>>,
 ) -> SelectResult<a> / {task.select, abort.raise} =
   match select_rotated(first, arms, [], true) {
     Some(went) -> went,
@@ -159,18 +159,19 @@ pub fn select_from<a>(
   }
 
 /// `select`, returning `None` at once if no arm can proceed.
-pub fn try_select<a>(arms: List<Arm<a>>) -> Option<SelectResult<a>> / {task.select, abort.raise} =
-  select_rotated(0, arms, [], false)
+pub fn try_select<a>(
+  arms: List<SelectCase<a>>,
+) -> Option<SelectResult<a>> / {task.select, abort.raise} = select_rotated(0, arms, [], false)
 
 /// `select_from`, returning `None` at once if no arm can proceed.
 pub fn try_select_from<a>(
   first: Int,
-  arms: List<Arm<a>>,
+  arms: List<SelectCase<a>>,
 ) -> Option<SelectResult<a>> / {task.select, abort.raise} = select_rotated(first, arms, [], false)
 
 /// The index `select_from` should look at first after the result `went`: the arm after the one
 /// that proceeded.
-pub fn next_turn<a>(went: SelectResult<a>) -> Int =
+pub fn next_select_start<a>(went: SelectResult<a>) -> Int =
   match went { Received(at, _) -> at + 1, Sent(at) -> at + 1, Closed(at) -> at + 1 }
 
 /// `select_from`, giving up at `at`. Returns `TimedOut` if no arm could proceed by then, though an
@@ -179,7 +180,7 @@ pub fn next_turn<a>(went: SelectResult<a>) -> Int =
 pub fn select_until<a>(
   at: Instant,
   first: Int,
-  arms: List<Arm<a>>,
+  arms: List<SelectCase<a>>,
 ) -> task::Timed<SelectResult<a>> / {task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
   match task::deadline.at() {
     // The enclosing deadline comes first and stops this task, so no timer is needed.
@@ -209,8 +210,8 @@ pub fn select_until<a>(
 /// the arm's index in `arms`, and the arms of `last` get indexes past the end of `arms`.
 fn select_rotated<a>(
   first: Int,
-  arms: List<Arm<a>>,
-  last: List<Arm<a>>,
+  arms: List<SelectCase<a>>,
+  last: List<SelectCase<a>>,
   wait: Bool,
 ) -> Option<SelectResult<a>> / {task.select, abort.raise} = {
   let n = arms.len();
@@ -471,23 +472,25 @@ test "a closed channel rejects a send, returns what was queued in order, and the
 }
 
 /// A level a test's tasks raise and lower.
-effect level {
+effect concurrency {
   write up() -> Unit
   write down() -> Unit
 }
 
 /// Runs `body` and returns its value with the highest level it reached.
-fn peak<a | e>(body: () -> a / {level.up, level.down | e}) -> { value: a, most: Int } / e =
+fn peak_concurrency<a | e>(
+  body: () -> a / {concurrency.up, concurrency.down | e},
+) -> { value: a, most: Int } / e =
   handle {
     body()
   } with {
     var now = 0,
     var most = 0,
-    level.up() -> {
+    concurrency.up() -> {
       now = now + 1;
       most = max(most, now);
     },
-    level.down() -> {
+    concurrency.down() -> {
       now = now - 1;
     },
     return value -> { value: value, most: most },
@@ -524,18 +527,18 @@ law "a channel never holds more values than its capacity, in every interleaving"
     simulate {
       let ch = task.channel(count(room));
       let n = count(values);
-      peak(||
+      peak_concurrency(||
           task::scoped(
             [
               ||
                 range(0, n).fold((), |_u: Unit, i: Int| {
                   task.send(ch, i);
-                  level.up()
+                  concurrency.up()
                 }),
             ],
             |_sender: List<Task<Unit>>|
               range(0, n).fold((), |_u: Unit, _i: Int| {
-                level.down();
+                concurrency.down();
                 task.recv(ch);
                 ()
               }),
@@ -624,7 +627,10 @@ law "an arm that stays ready goes within as many fair selects as there are arms"
           let chose = select_from(so_far.turn, ready.map(|c: Chan<Int>| receive(c)));
           match chose {
             Received(at, from) ->
-              { turn: next_turn(chose), seen: if at == from { so_far.seen.push(at) } else { [] } },
+              {
+                turn: next_select_start(chose),
+                seen: if at == from { so_far.seen.push(at) } else { [] },
+              },
             _ -> { turn: so_far.turn, seen: [] },
           }
         },
@@ -760,15 +766,15 @@ test "fan_out runs its function on no more of {count(c.values)} values at once t
   ).filter(|l: Load| l.values != Two || l.workers != Two) {
   simulate {
     let n = count(c.values);
-    let got = peak(||
+    let got = peak_concurrency(||
       fan_out(
         filled(range(0, n)),
         count(c.workers),
         n,
         |x: Int| {
-          level.up();
+          concurrency.up();
           task.yield();
-          level.down();
+          concurrency.down();
           x * 2
         },
         |out: Chan<Int>| drain(out, 10),

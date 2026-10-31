@@ -270,12 +270,12 @@ fn label_chars() -> Bytes = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
 fn printable() -> Bytes =
   b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
-/// RFC 5322's `dtext`: what a domain literal contains between its brackets.
-fn dtext() -> Bytes =
+/// RFC 5322's `domain_literal_chars`: what a domain literal contains between its brackets.
+fn domain_literal_chars() -> Bytes =
   b"!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
-/// RFC 5322's `ftext`: what a field's name is made of.
-fn ftext() -> Bytes =
+/// RFC 5322's `field_name_chars`: what a field's name is made of.
+fn field_name_chars() -> Bytes =
   b"!\"#$%&'()*+,-./0123456789;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 /// What a message identifier contains between its angle brackets.
@@ -287,19 +287,19 @@ fn controls() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
 
 /// Every byte past 127.
-const fn high() -> Bytes = Bytes::concat_all(range(128, 256).map(byte_of_int))
+const fn non_ascii() -> Bytes = Bytes::concat_all(range(128, 256).map(byte_of_int))
 
-const fn atext_wide() -> Bytes = atext().concat(high())
+const fn atext_wide() -> Bytes = atext().concat(non_ascii())
 
-const fn label_wide() -> Bytes = label_chars().concat(high())
+const fn label_wide() -> Bytes = label_chars().concat(non_ascii())
 
-const fn printable_wide() -> Bytes = printable().concat(high())
+const fn printable_wide() -> Bytes = printable().concat(non_ascii())
 
 /// What ends a run of plain text in a quoted string, where every byte past 127 is text.
 const fn quoted_stops() -> Bytes = b"\"\\".concat(controls())
 
 /// What ends a run of plain text in a quoted string that contains only ASCII.
-const fn quoted_stops_ascii() -> Bytes = quoted_stops().concat(high())
+const fn quoted_stops_ascii() -> Bytes = quoted_stops().concat(non_ascii())
 
 // --- Reading: the pieces of an address ---------------------------------------
 
@@ -331,7 +331,7 @@ fn is_text(context: Context, c: Int) -> Bool =
 
 /// Where the blanks and comments from `at` end. Comments nest, and a backslash in one takes the
 /// character after it.
-fn cfws(context: Context, at: Int) -> Int / {email.fail} =
+fn skip_blanks(context: Context, at: Int) -> Int / {email.fail} =
   blank(context, at, 0, context.b.len() - at + 1)
 
 /// `depth` counts the comments open at `at`. `left` bounds the recursion: each step consumes a
@@ -340,7 +340,7 @@ fn blank(context: Context, at: Int, depth: Int, left: Int) -> Int / {email.fail}
   let c = context.b.peek(at);
   if left <= 0 { at } else if depth > 0 {
     let opened = if c == b'(' { 1 } else if c == b')' { -1 } else { 0 };
-    blank(context, at + commented(context, at), depth + opened, left - 1)
+    blank(context, at + comment_character_bytes(context, at), depth + opened, left - 1)
   } else if bytes::is_blank(c) { blank(context, at + 1, 0, left - 1) }
   else if c == b'(' { blank(context, at + 1, 1, left - 1) }
   else { at }
@@ -348,7 +348,7 @@ fn blank(context: Context, at: Int, depth: Int, left: Int) -> Int / {email.fail}
 
 /// How many bytes the comment character at `at` takes: two for a backslash and the character it
 /// escapes. Raises when the comment ends unclosed, and for a character no comment may contain.
-fn commented(context: Context, at: Int) -> Int / {email.fail} = {
+fn comment_character_bytes(context: Context, at: Int) -> Int / {email.fail} = {
   let c = context.b.peek(at);
   if c < 0 { fail(at, UnclosedComment) }
   else if c != b'\\' { if is_text(context, c) { 1 } else { fail(at, byte_problem(context, at)) } }
@@ -394,26 +394,31 @@ type Tok = | Atom(String) | Quoted(String) | Dot
 type TokenSpan = { token: Tok, at: Int, end: Int, spaced: Bool }
 
 /// The words an address starts with, and the offset after them and the blanks that follow.
-type Run = { tokens: List<TokenSpan>, at: Int }
+type TokenRun = { tokens: List<TokenSpan>, at: Int }
 
 /// The atoms, quoted strings and dots from `at`, which are a display name or a local part
 /// depending on what follows them.
-fn run(context: Context, at: Int) -> Run / {email.fail, abort.raise} =
-  run_from(context, { tokens: [], at: at }, context.b.len() - at + 1)
+fn run(context: Context, at: Int) -> TokenRun / {email.fail, abort.raise} =
+  token_run_from(context, { tokens: [], at: at }, context.b.len() - at + 1)
 
 /// `left` bounds the recursion: each step consumes a token.
-fn run_from(context: Context, r: Run, left: Int) -> Run / {email.fail, abort.raise} = {
-  let start = cfws(context, r.at);
+fn token_run_from(
+  context: Context,
+  r: TokenRun,
+  left: Int,
+) -> TokenRun / {email.fail, abort.raise} = {
+  let start = skip_blanks(context, r.at);
   let c = context.b.peek(start);
   let spaced = start > r.at;
   if left <= 0 { { tokens: r.tokens, at: start } } else if c == b'"' {
     let q = quoted(context, start);
-    run_from(context, with_token(r, Quoted(q.text), start, q.at, spaced), left - 1)
-  } else if c == b'.' { run_from(context, with_token(r, Dot, start, start + 1, spaced), left - 1) }
-  else {
+    token_run_from(context, with_token(r, Quoted(q.text), start, q.at, spaced), left - 1)
+  } else if c == b'.' {
+    token_run_from(context, with_token(r, Dot, start, start + 1, spaced), left - 1)
+  } else {
     let end = context.b.skip(start, atoms(context));
     if end == start { { tokens: r.tokens, at: start } } else {
-      run_from(
+      token_run_from(
         context,
         with_token(r, Atom(String::of_bytes(context.b.slice(start, end))), start, end, spaced),
         left - 1,
@@ -422,7 +427,7 @@ fn run_from(context: Context, r: Run, left: Int) -> Run / {email.fail, abort.rai
   }
 }
 
-fn with_token(r: Run, token: Tok, at: Int, end: Int, spaced: Bool) -> Run =
+fn with_token(r: TokenRun, token: Tok, at: Int, end: Int, spaced: Bool) -> TokenRun =
   { tokens: r.tokens.push({ token: token, at: at, end: end, spaced: spaced }), at: end }
 
 fn is_dot(t: TokenSpan) -> Bool = match t.token { Dot -> true, _ -> false }
@@ -519,12 +524,12 @@ type Labels = { at: Int, held: List<String> }
 fn labels(context: Context, s: Labels, left: Int) -> Labels / {email.fail, abort.raise} = {
   let end = context.b.skip(s.at, atoms(context));
   if end == s.at { fail(s.at, byte_problem_or(context, s.at, BadDomain)) } else {
-    let held = s.held.push(String::of_bytes(context.b.slice(s.at, end)));
-    let dot = cfws(context, end);
-    if left <= 0 || context.b.peek(dot) != b'.' { { at: end, held: held } } else {
-      let next = cfws(context, dot + 1);
+    let message_data = s.held.push(String::of_bytes(context.b.slice(s.at, end)));
+    let dot = skip_blanks(context, end);
+    if left <= 0 || context.b.peek(dot) != b'.' { { at: end, held: message_data } } else {
+      let next = skip_blanks(context, dot + 1);
       if (dot > end || next > dot + 1) && !context.obsolete { fail(end, ObsoleteSyntax) }
-      else { labels(context, { at: next, held: held }, left - 1) }
+      else { labels(context, { at: next, held: message_data }, left - 1) }
     }
   }
 }
@@ -542,7 +547,7 @@ fn is_label(label: String) -> Bool / {abort.raise} = {
 /// one address, and no reader should have to decide whether it is two.
 fn bracketed(context: Context, at: Int) -> Text / {email.fail, abort.raise} = {
   let from = context.b.skip(at + 1, b" \t");
-  let end = context.b.skip(from, dtext());
+  let end = context.b.skip(from, domain_literal_chars());
   let close = context.b.skip(end, b" \t");
   if context.b.peek(close) != b']' { fail(close, byte_problem_or(context, close, BadDomain)) }
   else if end == from { fail(at, BadDomain) }
@@ -552,15 +557,19 @@ fn bracketed(context: Context, at: Int) -> Text / {email.fail, abort.raise} = {
 
 /// The domain after the `@` at `at - 1`, with the blanks and comments around it skipped.
 fn domain_at(context: Context, at: Int) -> Domain / {email.fail, abort.raise} = {
-  let d = domain_from(context, cfws(context, at));
-  { text: d.text, key: d.key, at: cfws(context, d.at) }
+  let d = domain_from(context, skip_blanks(context, at));
+  { text: d.text, key: d.key, at: skip_blanks(context, d.at) }
 }
 
 type AddressSpec = { address: Address, at: Int }
 
 /// The address whose local part is the words `r`, which started at `from`, and whose `@` is at
 /// `r.at`.
-fn address_spec(context: Context, r: Run, from: Int) -> AddressSpec / {email.fail, abort.raise} = {
+fn address_spec(
+  context: Context,
+  r: TokenRun,
+  from: Int,
+) -> AddressSpec / {email.fail, abort.raise} = {
   let local = local_of(context, r.tokens, from);
   let d = domain_at(context, r.at + 1);
   { address: Address(local, d.text, d.key), at: d.at }
@@ -569,7 +578,7 @@ fn address_spec(context: Context, r: Run, from: Int) -> AddressSpec / {email.fai
 /// The address in the angle brackets that open at `at`, and the offset after its `>` and the
 /// blanks that follow. A route, `@a,@b:`, is read and dropped under `Obsolete`.
 fn angle(context: Context, at: Int) -> AddressSpec / {email.fail, abort.raise} = {
-  let start = cfws(context, at + 1);
+  let start = skip_blanks(context, at + 1);
   let c = context.b.peek(start);
   let routed = c == b'@' || c == b',';
   let from = if !routed { start }
@@ -585,7 +594,7 @@ fn angle(context: Context, at: Int) -> AddressSpec / {email.fail, abort.raise} =
     let s = address_spec(context, r, from);
     if context.b.peek(s.at) != b'>' {
       fail(s.at, if context.b.peek(s.at) < 0 { UnclosedAngle } else { byte_problem(context, s.at) })
-    } else { { address: s.address, at: cfws(context, s.at + 1) } }
+    } else { { address: s.address, at: skip_blanks(context, s.at + 1) } }
   }
 }
 
@@ -596,14 +605,15 @@ fn route(
   context: Context,
   at: Int,
   any: Bool,
-  held: Bool,
+  message_data: Bool,
   left: Int,
 ) -> Int / {email.fail, abort.raise} = {
-  let start = cfws(context, at);
+  let start = skip_blanks(context, at);
   let c = context.b.peek(start);
   if c == b':' && any { start + 1 }
   else if left <= 0 { fail(start, Unexpected) }
-  else if c == b',' { route(context, start + 1, any, false, left - 1) } else if c == b'@' && !held {
+  else if c == b',' { route(context, start + 1, any, false, left - 1) }
+  else if c == b'@' && !message_data {
     route(context, domain_at(context, start + 1).at, true, true, left - 1)
   } else { fail(start, if c < 0 { UnclosedAngle } else { byte_problem(context, start) }) }
 }
@@ -636,13 +646,14 @@ fn add_phrase_word(
     else { { out: s.out.push(if t.spaced { " ." } else { "." }), dot: true, word: false } },
     Atom(written) -> {
       let w = decode_atom(context, written, t.at);
-      { out: s.out.push(gap(s, t, w.whole) ++ w.text), dot: false, word: w.whole }
+      { out: s.out.push(separator_before(s, t, w.whole) ++ w.text), dot: false, word: w.whole }
     },
-    Quoted(held) ->
+    Quoted(message_data) ->
       {
         out: s.out.push(
-          gap(s, t, false)
-            ++ (if context.obsolete { decode_encoded_words(held).text } else { held }),
+          separator_before(s, t, false)
+            ++ (if context.obsolete { decode_encoded_words(message_data).text }
+            else { message_data }),
         ),
         dot: false,
         word: false,
@@ -650,7 +661,7 @@ fn add_phrase_word(
   }
 
 /// The separator between the words collected and the next one.
-fn gap(s: PhraseState, t: TokenSpan, word: Bool) -> String =
+fn separator_before(s: PhraseState, t: TokenSpan, word: Bool) -> String =
   if s.out.len() == 0 || (s.dot && !t.spaced) || (s.word && word) { "" } else { " " }
 
 /// A text with its encoded words decoded: whether one could not be, and whether the text was
@@ -711,7 +722,7 @@ fn decode_atom(
 
 /// Whether the words `r` end with an encoded word that touches the character at `r.at`, with no
 /// blank between them.
-fn touches(r: Run) -> Bool =
+fn touches(r: TokenRun) -> Bool =
   match r.tokens.last() {
     Some(end) -> match end.token {
       Atom(written) -> end.end == r.at && written.starts_with("=?") && written.ends_with("?="),
@@ -723,7 +734,11 @@ fn touches(r: Run) -> Bool =
 type ParsedMailbox = { mailbox: Mailbox, at: Int }
 
 /// The mailbox whose opening words are `r`, which started at `from`.
-fn mailbox_from(context: Context, r: Run, from: Int) -> ParsedMailbox / {email.fail, abort.raise} = {
+fn mailbox_from(
+  context: Context,
+  r: TokenRun,
+  from: Int,
+) -> ParsedMailbox / {email.fail, abort.raise} = {
   let c = context.b.peek(r.at);
   if c == b'<' {
     let name = if !context.obsolete && touches(r) { fail(r.at, BadEncodedWord) }
@@ -751,7 +766,7 @@ type Place = | Ended | Empty | Filled
 
 /// What is at `r.at`, where `r` is the words read from an element's place. `any` records that an
 /// element was read before, and `grouped` that a `;` ends the list.
-fn place(context: Context, r: Run, any: Bool, grouped: Bool) -> Place / {email.fail} = {
+fn place(context: Context, r: TokenRun, any: Bool, grouped: Bool) -> Place / {email.fail} = {
   let c = context.b.peek(r.at);
   if r.tokens.len() > 0 { Filled } else if c < 0 || (grouped && c == b';') {
     if any && !context.obsolete { fail(r.at, ObsoleteSyntax) } else { Ended }
@@ -821,7 +836,7 @@ fn members_from(
 }
 
 /// The mailbox or the group whose opening words are `r`, which started at `from`.
-fn element(context: Context, r: Run, from: Int) -> Element / {email.fail, abort.raise} =
+fn element(context: Context, r: TokenRun, from: Int) -> Element / {email.fail, abort.raise} =
   if context.b.peek(r.at) != b':' {
     let m = mailbox_from(context, r, from);
     { entry: Single(m.mailbox), at: m.at }
@@ -831,7 +846,7 @@ fn element(context: Context, r: Run, from: Int) -> Element / {email.fail, abort.
       Some(name) -> {
         let inner = members_from(context, r.at + 1, [], context.b.len() - r.at + 2);
         if context.b.peek(inner.at) != b';' { fail(inner.at, UnclosedGroup) }
-        else { { entry: Group(name, inner.members), at: cfws(context, inner.at + 1) } }
+        else { { entry: Group(name, inner.members), at: skip_blanks(context, inner.at + 1) } }
       },
     }
   }
@@ -1074,7 +1089,8 @@ pub fn group_name(e: Entry) -> Option<String> =
   match e { Single(_) -> None, Group(name, _) -> Some(name) }
 
 /// The mailboxes in an entry: itself, or a group's members.
-pub fn members(e: Entry) -> List<Mailbox> = match e { Single(m) -> [m], Group(_, held) -> held }
+pub fn members(e: Entry) -> List<Mailbox> =
+  match e { Single(m) -> [m], Group(_, message_data) -> message_data }
 
 /// Every mailbox of an address list in the order written, groups flattened.
 pub fn mailboxes_of(es: List<Entry>) -> List<Mailbox> = es.flat_map(members)
@@ -1105,8 +1121,8 @@ pub fn parse_address_list(
 fn entry_text(e: Entry) -> String =
   match e {
     Single(m) -> mailbox_text(m),
-    Group(name, held) ->
-      phrase_text(name) ++ ":" ++ String::join(held.map(mailbox_text), ", ") ++ ";",
+    Group(name, message_data) ->
+      phrase_text(name) ++ ":" ++ String::join(message_data.map(mailbox_text), ", ") ++ ";",
   }
 
 /// An address list as `show` writes its entries, with `, ` between them: what
@@ -1124,7 +1140,8 @@ fn arbitrary_text(chars: String, least: Int, most: Int) -> Gen<String> =
 /// One to three of what `g` draws, with `sep` between them.
 fn several(g: Gen<String>, sep: String) -> Gen<String> =
   gen::and_then(gen::int_between(1, 3), |n: Int|
-    gen::map(gen::list_of_length(g, n), |held: List<String>| String::join(held, sep)))
+    gen::map(gen::list_of_length(g, n), |message_data: List<String>|
+      String::join(message_data, sep)))
 
 fn arbitrary_local_part() -> Gen<String> =
   gen::one_of([
@@ -1190,7 +1207,7 @@ pub fn entries() -> Gen<Entry> =
     gen::map2(
       arbitrary_display_name(),
       gen::list_of(mailboxes(), 3),
-      |name: String, held: List<Mailbox>| Group(name, held),
+      |name: String, message_data: List<Mailbox>| Group(name, message_data),
     ),
   ])
 
@@ -1263,7 +1280,7 @@ fn ids_from(
   acc: List<MessageId>,
   left: Int,
 ) -> List<MessageId> / {email.fail, abort.raise} = {
-  let start = cfws(context, at);
+  let start = skip_blanks(context, at);
   let c = context.b.peek(start);
   if c < 0 || left <= 0 { acc } else if c == b'<' {
     let close = context.b.skip_until(start + 1, b">");
@@ -1274,7 +1291,7 @@ fn ids_from(
     } else if !context.obsolete {
       fail(start, byte_problem_or(context, start + 1 + inner.skip(0, id_chars()), BadMessageId))
     } else {
-      let i = spaced_id(context, start);
+      let i = obsolete_message_id(context, start);
       ids_from(context, i.at, acc.push(identifier(i.text, start)), left - 1)
     }
   } else if !context.obsolete { fail(start, byte_problem_or(context, start, BadMessageId)) }
@@ -1287,16 +1304,16 @@ fn ids_from(
 
 /// The identifier whose `<` is at `at`, written with blanks or comments inside its brackets as RFC
 /// 5322 §4 allows: a local part, `@` and a domain, read as an address's are.
-fn spaced_id(context: Context, at: Int) -> Text / {email.fail, abort.raise} = {
+fn obsolete_message_id(context: Context, at: Int) -> Text / {email.fail, abort.raise} = {
   let r = run(context, at + 1);
   if context.b.peek(r.at) != b'@' { fail(at, byte_problem_or(context, r.at, BadMessageId)) } else {
     let left = String::join(r.tokens.map(token_text), "");
-    let start = cfws(context, r.at + 1);
+    let start = skip_blanks(context, r.at + 1);
     let right = if context.b.peek(start) == b'[' { bracketed(context, start) } else {
       let read = labels(context, { at: start, held: [] }, context.b.len() - start + 1);
       { text: String::join(read.held, "."), at: read.at }
     };
-    let close = cfws(context, right.at);
+    let close = skip_blanks(context, right.at);
     if context.b.peek(close) != b'>' { fail(close, UnclosedAngle) }
     else { { text: left ++ "@" ++ right.text, at: close + 1 } }
   }
@@ -1342,12 +1359,12 @@ pub fn field(
   value: String,
   repertoire: Repertoire = Ascii,
 ) -> Field / {email.fail, abort.raise} = {
-  let held = String::of_chars(trimmed(header_text(value).chars()));
-  let cut = stretches(held);
-  let eight = Bytes::of_string(held).skip_until(0, high());
-  if eight < Bytes::of_string(held).len() && repertoire == Ascii { fail(eight, NonAscii) }
+  let message_data = String::of_chars(trimmed(header_text(value).chars()));
+  let cut = split_before_spaces(message_data);
+  let eight = Bytes::of_string(message_data).skip_until(0, non_ascii());
+  if eight < Bytes::of_string(message_data).len() && repertoire == Ascii { fail(eight, NonAscii) }
   else if cut.any(|s: String| Bytes::of_string(s).len() > 998) { fail(0, TooLong) }
-  else { { name: field_name(name), raw: folded(name, cut), value: held } }
+  else { { name: field_name(name), raw: folded(name, cut), value: message_data } }
 }
 
 /// The field `name` whose value is `text` as an unstructured field carries it: unchanged if it is
@@ -1366,7 +1383,7 @@ pub fn text_field(
 /// enough to leave room on a line.
 fn field_name(name: String) -> String / {email.fail, abort.raise} = {
   let n = Bytes::of_string(name);
-  let stop = n.skip(0, ftext());
+  let stop = n.skip(0, field_name_chars());
   if n.len() == 0 || n.len() > 76 || stop < n.len() { fail(min(stop, 76), BadName) } else { name }
 }
 
@@ -1378,7 +1395,7 @@ fn trimmed(chars: List<Char>) -> List<Char> = {
 
 /// `text` split before each run of spaces, each piece starting with its spaces and the first with
 /// the space that follows a field's colon: where a field's line may be folded.
-fn stretches(text: String) -> List<String> =
+fn split_before_spaces(text: String) -> List<String> =
   text.split(" ").fold(
     { out: [], pad: " " },
     |s: { out: List<String>, pad: String }, part: String|
@@ -1406,7 +1423,7 @@ fn folded(name: String, cut: List<String>) -> Bytes = {
 /// The pieces that carry `text` as an unstructured value: its words if it is plain, and encoded
 /// words otherwise.
 fn text_stretches(text: String, utf8: Bool) -> List<String> / {abort.raise} = {
-  let cut = stretches(text);
+  let cut = split_before_spaces(text);
   if is_plain(text, utf8) && cut.all(|s: String| Bytes::of_string(s).len() <= 998) { cut }
   else { encode_words(text, coding_for(text)).map(|w: String| " " ++ w) }
 }
@@ -1429,11 +1446,12 @@ fn q_plain() -> Bytes = b" !*+-/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
 
 /// The coding that writes `text` in fewer characters: `Q` when few of its bytes need an escape.
 fn coding_for(text: String) -> encoded_word::Coding / {abort.raise} =
-  if mostly(Bytes::of_string(text), q_plain()) { encoded_word::Q } else { encoded_word::B }
+  if few_bytes_outside(Bytes::of_string(text), q_plain()) { encoded_word::Q }
+  else { encoded_word::B }
 
 /// Whether fewer than one in six of the first 4096 bytes of `data` are outside `plain`, which is
 /// when escaping them takes less space than base64 does.
-fn mostly(data: Bytes, plain: Bytes) -> Bool / {abort.raise} = {
+fn few_bytes_outside(data: Bytes, plain: Bytes) -> Bool / {abort.raise} = {
   let head = data.slice(0, min(data.len(), 4096));
   count_outside(head, plain, 0, 0, head.len() + 1) * 6 < head.len()
 }
@@ -1452,8 +1470,8 @@ fn count_outside(b: Bytes, plain: Bytes, at: Int, count: Int, left: Int) -> Int 
 fn value_of(raw: Bytes) -> String / {abort.raise} = {
   let n = raw.len();
   let colon = match raw.index_of_byte(b':') { Some(i) -> i + 1, None -> n };
-  let held = raw.slice(colon, n).replace(b"\r", b"").replace(b"\n", b"");
-  String::of_chars(trimmed(String::of_bytes_lossy(held).chars()))
+  let message_data = raw.slice(colon, n).replace(b"\r", b"").replace(b"\n", b"");
+  String::of_chars(trimmed(String::of_bytes_lossy(message_data).chars()))
 }
 
 // --- Messages -----------------------------------------------------------------
@@ -1487,35 +1505,35 @@ type MessageData = { fields: List<Field>, gap: Bytes, body: Bytes, utf8: Bool }
 /// messages of their own.
 pub opaque type Message = | Message(MessageData, List<Message>)
 
-fn held(m: Message) -> MessageData = match m { Message(h, _) -> h }
+fn message_data(m: Message) -> MessageData = match m { Message(h, _) -> h }
 
 /// The bytes a message was read from, exactly.
 pub fn render(m: Message) -> Bytes = {
-  let h = held(m);
+  let h = message_data(m);
   Bytes::concat_all(h.fields.map(|f: Field| f.raw).push(h.gap).push(h.body))
 }
 
 /// A message's header fields, in the order written.
-pub fn fields(m: Message) -> List<Field> = held(m).fields
+pub fn fields(m: Message) -> List<Field> = message_data(m).fields
 
 /// A message's body as it was transferred, its transfer encoding not undone: everything after
 /// the blank line that ends the header block.
-pub fn body(m: Message) -> Bytes = held(m).body
+pub fn body(m: Message) -> Bytes = message_data(m).body
 
 /// The parts of a multipart message, each a message of its own; none for any other. A part of
 /// `message/rfc822` is a part like any other: its body is a message for a reader to read in turn.
 pub fn parts(m: Message) -> List<Message> = match m { Message(_, children) -> children }
 
-fn fields_named(held: List<Field>, lower: String) -> List<Field> =
-  held.filter(|f: Field| f.name.ascii_lower() == lower)
+fn fields_named(message_data: List<Field>, lower: String) -> List<Field> =
+  message_data.filter(|f: Field| f.name.ascii_lower() == lower)
 
 /// The unfolded value of a message's first field named `name`, in any case.
 pub fn header(m: Message, name: String) -> Option<String> =
-  fields_named(held(m).fields, name.ascii_lower()).first().map(|f: Field| f.value)
+  fields_named(message_data(m).fields, name.ascii_lower()).first().map(|f: Field| f.value)
 
 /// The unfolded value of each of a message's fields named `name`, in the order written.
 pub fn headers(m: Message, name: String) -> List<String> =
-  fields_named(held(m).fields, name.ascii_lower()).map(|f: Field| f.value)
+  fields_named(message_data(m).fields, name.ascii_lower()).map(|f: Field| f.value)
 
 /// A message read by `read_tolerant`, and everything `read` would have rejected it for, in order
 /// of position.
@@ -1559,7 +1577,9 @@ pub fn read_tolerant(
   if data.len() > most { fail(most, TooLarge) } else {
     let settings = { limits: limits, utf8: repertoire == Utf8 };
     let read = entity(data, 0, settings, limits.max_depth, limits.max_parts);
-    let all_found = read.defects.concat(top_checks(held(read.message).fields, settings.utf8));
+    let all_found = read.defects.concat(
+      top_checks(message_data(read.message).fields, settings.utf8),
+    );
     { message: read.message, defects: all_found.sort_by(|a: Error, b: Error| a.at < b.at) }
   }
 }
@@ -1627,7 +1647,7 @@ fn named_line(
 ) -> Option<HeaderScan> / {email.fail, abort.raise} = {
   let n = b.len();
   let feed = b.skip_until(h.at, b"\n");
-  let name_end = b.skip(h.at, ftext());
+  let name_end = b.skip(h.at, field_name_chars());
   let colon = b.skip(name_end, b" \t");
   if name_end == h.at || b.peek(colon) != b':' { None } else {
     let done = close_field(b, origin, settings, h, h.at);
@@ -1691,7 +1711,7 @@ fn close_field(
       at: h.at,
       start: -1,
       fields: h.fields.push({
-        name: String::of_bytes(raw.slice(0, raw.skip(0, ftext()))),
+        name: String::of_bytes(raw.slice(0, raw.skip(0, field_name_chars()))),
         raw: raw,
         value: value_of(raw),
       }),
@@ -1706,7 +1726,7 @@ fn field_controls() -> Bytes =
 
 fn field_defects(raw: Bytes, at: Int, utf8: Bool) -> List<Error> / {abort.raise} = {
   let n = raw.len();
-  let eight = raw.skip_until(0, high());
+  let eight = raw.skip_until(0, non_ascii());
   let control = raw.skip_until(0, field_controls());
   List::concat(
     if eight < n && !(utf8 && raw.is_utf8()) { [{ at: at + eight, reason: EightBitHeader }] }
@@ -1717,7 +1737,7 @@ fn field_defects(raw: Bytes, at: Int, utf8: Bool) -> List<Error> / {abort.raise}
 
 /// A line reader's state, and the first bare line feed, bare carriage return and line past 998
 /// octets it found, each below zero until it finds one.
-type LineScan = { at: Int, start: Int, feed: Int, ret: Int, long: Int }
+type LineScan = { at: Int, start: Int, bare_line_feed: Int, ret: Int, long: Int }
 
 /// What keeps `data` from being lines as a message has them, each ending with CRLF and containing
 /// at most 998 octets: the first line feed with no carriage return before it, the first carriage
@@ -1727,9 +1747,10 @@ pub fn line_flaws(data: Bytes) -> List<Error> / {abort.raise} = line_defects(dat
 
 /// What is wrong with the lines of `b`, which starts at `origin`: the first of each kind.
 fn line_defects(b: Bytes, origin: Int) -> List<Error> / {abort.raise} = {
-  let seen = lines_from(b, { at: 0, start: 0, feed: -1, ret: -1, long: -1 }, b.len() + 2);
+  let seen = lines_from(b, { at: 0, start: 0, bare_line_feed: -1, ret: -1, long: -1 }, b.len() + 2);
   List::concat(
-    if seen.feed < 0 { [] } else { [{ at: origin + seen.feed, reason: BareLineFeed }] },
+    if seen.bare_line_feed < 0 { [] }
+    else { [{ at: origin + seen.bare_line_feed, reason: BareLineFeed }] },
     if seen.ret < 0 { [] } else { [{ at: origin + seen.ret, reason: BareCarriageReturn }] },
   ).concat(if seen.long < 0 { [] } else { [{ at: origin + seen.long, reason: LongLine }] })
 }
@@ -1754,7 +1775,7 @@ fn lines_from(b: Bytes, s: LineScan, left: Int) -> LineScan / {abort.raise} = {
         ..s,
         at: stop + 1,
         start: stop + 1,
-        feed: if s.feed < 0 { stop } else { s.feed },
+        bare_line_feed: if s.bare_line_feed < 0 { stop } else { s.bare_line_feed },
         long: long,
       },
       left - 1,
@@ -1826,7 +1847,7 @@ type Branching = { children: List<Message>, parts: Int, defects: List<Error> }
 /// What is wrong with the lines of a multipart body that belong to no part: all of them, when the
 /// body is kept as one part.
 fn around(payload: Bytes, at: Int, found: PartSpans) -> List<Error> / {abort.raise} =
-  if found.ok { between(payload, at, found.spans) } else { line_defects(payload, at) }
+  if found.ok { flaws_outside_parts(payload, at, found.spans) } else { line_defects(payload, at) }
 
 /// Where a multipart body's parts are, or that it is kept as one part, and why.
 type PartSpans = { spans: List<Span>, defects: List<Error>, ok: Bool }
@@ -1893,7 +1914,7 @@ fn closed_spans(
 
 /// What is wrong with the lines of a multipart body that belong to no part: its preamble, its
 /// delimiters and its epilogue.
-fn between(payload: Bytes, at: Int, spans: List<Span>) -> List<Error> / {abort.raise} = {
+fn flaws_outside_parts(payload: Bytes, at: Int, spans: List<Span>) -> List<Error> / {abort.raise} = {
   let cut = spans.fold({ from: 0, out: [] }, |g: { from: Int, out: List<Error> }, s: Span|
     {
       from: s.to,
@@ -1903,9 +1924,9 @@ fn between(payload: Bytes, at: Int, spans: List<Span>) -> List<Error> / {abort.r
 }
 
 /// What is wrong with the body of an entity that is not multipart.
-fn leaf_defects(held: List<Field>, payload: Bytes, at: Int) -> List<Error> / {abort.raise} = {
-  let encoding = encoding_of(held);
-  let eight = payload.skip_until(0, high());
+fn leaf_defects(message_data: List<Field>, payload: Bytes, at: Int) -> List<Error> / {abort.raise} = {
+  let encoding = encoding_of(message_data);
+  let eight = payload.skip_until(0, non_ascii());
   List::concat(if encoding == Binary { [] } else { line_defects(payload, at) }, match encoding {
     SevenBit -> if eight < payload.len() { [{ at: at + eight, reason: Undeclared8Bit }] }
     else { [] },
@@ -1920,13 +1941,16 @@ fn leaf_defects(held: List<Field>, payload: Bytes, at: Int) -> List<Error> / {ab
 /// A field, and the offset in the message where it starts.
 type PositionedField = { at: Int, field: Field }
 
-fn field_positions(held: List<Field>, origin: Int) -> List<PositionedField> =
-  held.fold({ at: origin, out: [] }, |p: { at: Int, out: List<PositionedField> }, f: Field|
-    { at: p.at + f.raw.len(), out: p.out.push({ at: p.at, field: f }) }).out
+fn field_positions(message_data: List<Field>, origin: Int) -> List<PositionedField> =
+  message_data.fold(
+    { at: origin, out: [] },
+    |p: { at: Int, out: List<PositionedField> }, f: Field|
+      { at: p.at + f.raw.len(), out: p.out.push({ at: p.at, field: f }) },
+  ).out
 
 /// Each repeat of a field named in `names`, which a header block may have only once.
-fn repeats(held: List<PositionedField>, names: List<String>) -> List<Error> =
-  held.fold(
+fn repeats(message_data: List<PositionedField>, names: List<String>) -> List<Error> =
+  message_data.fold(
     { seen: Map::new(), out: [] },
     |r: { seen: Map<String, Unit>, out: List<Error> }, p: PositionedField| {
       let lower = p.field.name.ascii_lower();
@@ -1938,11 +1962,11 @@ fn repeats(held: List<PositionedField>, names: List<String>) -> List<Error> =
 
 /// What is wrong with the MIME fields of one entity.
 fn mime_checks(
-  held: List<Field>,
+  message_data: List<Field>,
   origin: Int,
   multipart_entity: Bool,
 ) -> List<Error> / {abort.raise} = {
-  let all_placed = field_positions(held, origin);
+  let all_placed = field_positions(message_data, origin);
   repeats(all_placed, [
     "content-type",
     "content-transfer-encoding",
@@ -1975,9 +1999,9 @@ fn mime_check(f: Field, multipart_entity: Bool) -> List<ErrorKind> / {abort.rais
 /// What is wrong with the fields of a message's own header block: one it must have and lacks, one
 /// it may have once and has again, and each value this module reads that does not parse in RFC
 /// 5322's current syntax.
-fn top_checks(held: List<Field>, utf8: Bool) -> List<Error> / {abort.raise} = {
-  let all_placed = field_positions(held, 0);
-  let lowered = held.map(|f: Field| f.name.ascii_lower());
+fn top_checks(message_data: List<Field>, utf8: Bool) -> List<Error> / {abort.raise} = {
+  let all_placed = field_positions(message_data, 0);
+  let lowered = message_data.map(|f: Field| f.name.ascii_lower());
   ["date", "from"].filter(|name: String| !lowered.contains(name)).map(|name: String|
     { at: 0, reason: Missing(name) }).concat(
     repeats(all_placed, [
@@ -2048,7 +2072,7 @@ fn obsolete_date(value: String) -> Bool / {abort.raise} = {
     None -> true,
     Some(i) ->
       words.len() != i + 2 || !is_year(words.at_or(i - 1, "")) || !is_zone(words.at_or(i + 1, ""))
-        || Result::ok(try { cfws(context, after) }) != Some(context.b.len()),
+        || Result::ok(try { skip_blanks(context, after) }) != Some(context.b.len()),
   }
 }
 
@@ -2074,10 +2098,10 @@ fn is_zone(word: String) -> Bool / {abort.raise} = {
 
 // --- What a message's fields contain --------------------------------------------
 
-fn repertoire_of(m: Message) -> Repertoire = if held(m).utf8 { Utf8 } else { Ascii }
+fn repertoire_of(m: Message) -> Repertoire = if message_data(m).utf8 { Utf8 } else { Ascii }
 
 fn listed_in(m: Message, lower: String) -> List<Entry> / {abort.raise} =
-  match fields_named(held(m).fields, lower).first() {
+  match fields_named(message_data(m).fields, lower).first() {
     None -> [],
     Some(f) -> match parse_address_list(f.value, repertoire_of(m), Obsolete) {
       Ok(found) -> found,
@@ -2184,8 +2208,8 @@ fn stripped(
 /// A media type read from a `Content-Type` field, and whether the field parsed.
 type Media = { media: MediaType, ok: Bool }
 
-fn media_of(held: List<Field>) -> Media / {abort.raise} =
-  match fields_named(held, "content-type").first() {
+fn media_of(message_data: List<Field>) -> Media / {abort.raise} =
+  match fields_named(message_data, "content-type").first() {
     None ->
       { media: MediaType("text", "plain", [{ name: "charset", value: "us-ascii" }]), ok: true },
     Some(f) -> match mime::parse(uncommented(f.value)) {
@@ -2201,7 +2225,8 @@ fn media_of(held: List<Field>) -> Media / {abort.raise} =
 /// A message's media type: its `Content-Type` field's, with comments skipped and each parameter RFC
 /// 2231 writes in sections or with a charset joined into one value. `text/plain; charset=us-ascii`
 /// when the message has no such field or its value is not a media type, as RFC 2045 §5.2 specifies.
-pub fn content_type(m: Message) -> MediaType / {abort.raise} = media_of(held(m).fields).media
+pub fn content_type(m: Message) -> MediaType / {abort.raise} =
+  media_of(message_data(m).fields).media
 
 /// How a body is written for transfer.
 pub type Encoding =
@@ -2213,8 +2238,8 @@ pub type Encoding =
   /// Any other encoding, by its name in lower case. `content` undoes none.
   | Other(String)
 
-fn encoding_of(held: List<Field>) -> Encoding / {abort.raise} =
-  match fields_named(held, "content-transfer-encoding").first() {
+fn encoding_of(message_data: List<Field>) -> Encoding / {abort.raise} =
+  match fields_named(message_data, "content-transfer-encoding").first() {
     None -> SevenBit,
     Some(f) -> match String::of_chars(trimmed(uncommented(f.value).chars())).ascii_lower() {
       "7bit" -> SevenBit,
@@ -2228,7 +2253,8 @@ fn encoding_of(held: List<Field>) -> Encoding / {abort.raise} =
 
 /// A message's transfer encoding: its `Content-Transfer-Encoding` field's, and `SevenBit` when
 /// it has none.
-pub fn transfer_encoding(m: Message) -> Encoding / {abort.raise} = encoding_of(held(m).fields)
+pub fn transfer_encoding(m: Message) -> Encoding / {abort.raise} =
+  encoding_of(message_data(m).fields)
 
 /// A `Content-Disposition` field's value: `inline`, `attachment` or whatever other word it starts
 /// with, in lower case, and the file name it gives, which is data a sender chose and never a path.
@@ -2237,8 +2263,8 @@ pub type Disposition = new { kind: String, filename: Option<String> }
 /// A disposition read, and whether its whole field parsed.
 type ParsedDisposition = { found: Option<Disposition>, ok: Bool }
 
-fn read_disposition(held: List<Field>) -> ParsedDisposition / {abort.raise} =
-  match fields_named(held, "content-disposition").first() {
+fn read_disposition(message_data: List<Field>) -> ParsedDisposition / {abort.raise} =
+  match fields_named(message_data, "content-disposition").first() {
     None -> { found: None, ok: true },
     Some(f) -> {
       let value = uncommented(f.value);
@@ -2268,7 +2294,7 @@ fn parameters(value: String, at: Int) -> Option<List<Param>> / {abort.raise} =
 /// A message's `Content-Disposition`; `None` when it has none or its value does not start with a
 /// word.
 pub fn disposition(m: Message) -> Option<Disposition> / {abort.raise} =
-  read_disposition(held(m).fields).found
+  read_disposition(message_data(m).fields).found
 
 /// The identifier of a message's `Content-ID` field, which a `cid:` link in an HTML body names
 /// a part by.
@@ -2280,7 +2306,7 @@ fn base64_chars() -> Bytes = b"+/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk
 
 /// The bytes a base64 body encodes, if it is nothing but canonical base64 and line breaks.
 fn clean_base64(payload: Bytes) -> Option<Bytes> / {abort.raise} =
-  if payload.skip_until(0, high()) < payload.len() { None }
+  if payload.skip_until(0, non_ascii()) < payload.len() { None }
   else { base64_decode(String::of_bytes(payload.replace(b"\r\n", b"").replace(b"\n", b""))) }
 
 /// The bytes a base64 body encodes, read as RFC 2045 §6.8 tells a reader to: every byte outside
@@ -2310,7 +2336,7 @@ fn unquoted(payload: Bytes) -> Option<Bytes> / {abort.raise} =
 /// to, skipping bytes outside its alphabet. `None` for any other encoding, and for a body that is
 /// not in the named encoding. A multipart message's content is its body unchanged.
 pub fn content(m: Message) -> Option<Bytes> / {abort.raise} = {
-  let h = held(m);
+  let h = message_data(m);
   match encoding_of(h.fields) {
     SevenBit | EightBit | Binary -> Some(h.body),
     QuotedPrintable -> unquoted(h.body),
@@ -2368,8 +2394,8 @@ fn strip_carriage_returns(line: String) -> String =
   if !line.ends_with("\r") { line }
   else { String::of_chars(line.chars().reverse().drop_while(|c: Char| c == '\r').reverse()) }
 
-fn is_attached(held: List<Field>) -> Bool / {abort.raise} =
-  match read_disposition(held).found { Some(d) -> d.kind == "attachment", None -> false }
+fn is_attached(message_data: List<Field>) -> Bool / {abort.raise} =
+  match read_disposition(message_data).found { Some(d) -> d.kind == "attachment", None -> false }
 
 /// Where a message's `text/<subtype>` body part is, as the index of a part at each depth.
 fn body_path(m: Message, subtype: String) -> Option<List<Int>> / {abort.raise} =
@@ -2560,7 +2586,7 @@ pub fn with_thread(d: Draft, in_reply_to: List<MessageId>, references: List<Mess
   { ..d, in_reply_to: in_reply_to, references: references }
 
 /// The names of the fields a draft writes itself.
-fn managed() -> List<String> =
+fn draft_fields() -> List<String> =
   [
     "date",
     "from",
@@ -2578,7 +2604,7 @@ fn managed() -> List<String> =
 
 fn is_managed(name: String) -> Bool = {
   let lower = name.ascii_lower();
-  managed().contains(lower) || lower.starts_with("content-")
+  draft_fields().contains(lower) || lower.starts_with("content-")
 }
 
 /// `d` with one more field after its existing ones, rebuilt from the field's name and value as
@@ -2600,7 +2626,7 @@ pub fn attach(d: Draft, a: Attachment) -> Draft = { ..d, attachments: d.attachme
 
 /// `d` with one more part its HTML body shows: an image a `cid:` link names by the part's
 /// `content_id`. The HTML body and these are written as `multipart/related`.
-pub fn inline(d: Draft, a: Attachment) -> Draft = { ..d, inline: d.inline.push(a) }
+pub fn attach_inline(d: Draft, a: Attachment) -> Draft = { ..d, inline: d.inline.push(a) }
 
 /// A file to attach: its name, its bytes, and the media type its name's extension names in
 /// `std.mime`'s table, `application/octet-stream` when it names none.
@@ -2727,23 +2753,24 @@ pub fn write_fresh(
 
 /// A field's lines as a draft stores them, if the repertoire allows them.
 fn field_bytes(f: Field, utf8: Bool) -> Bytes / {email.unwritable, abort.raise} =
-  if !utf8 && f.raw.skip_until(0, high()) < f.raw.len() { email.unwritable(NeedsUtf8) }
+  if !utf8 && f.raw.skip_until(0, non_ascii()) < f.raw.len() { email.unwritable(NeedsUtf8) }
   else { f.raw }
 
-fn id_field(name: String, held: List<MessageId>) -> Bytes =
-  if held.len() == 0 { b"" } else { folded(name, held.map(|i: MessageId| " " ++ id_text(i))) }
+fn id_field(name: String, message_data: List<MessageId>) -> Bytes =
+  if message_data.len() == 0 { b"" }
+  else { folded(name, message_data.map(|i: MessageId| " " ++ id_text(i))) }
 
 /// The field `name` of these addresses; nothing for none.
 fn address_field(
   name: String,
-  held: List<Entry>,
+  message_data: List<Entry>,
   utf8: Bool,
 ) -> Bytes / {email.unwritable, abort.raise} =
-  if held.len() == 0 { b"" } else {
-    let end = held.len() - 1;
+  if message_data.len() == 0 { b"" } else {
+    let end = message_data.len() - 1;
     folded(
       name,
-      enumerate(held).flat_map(|e: { index: Int, value: Entry }|
+      enumerate(message_data).flat_map(|e: { index: Int, value: Entry }|
         append_to_last(entry_stretches(e.value, utf8), if e.index < end { "," } else { "" })),
     )
   }
@@ -2754,25 +2781,25 @@ fn append_to_last(cut: List<String>, mark: String) -> List<String> / {abort.rais
 
 fn entry_stretches(e: Entry, utf8: Bool) -> List<String> / {email.unwritable, abort.raise} =
   match e {
-    Single(m) -> mailbox_stretches(m, utf8),
-    Group(name, held) -> {
-      let end = held.len() - 1;
-      let written = name_stretches(name, utf8);
+    Single(m) -> mailbox_pieces(m, utf8),
+    Group(name, message_data) -> {
+      let end = message_data.len() - 1;
+      let written = name_pieces(name, utf8);
       let encode_body = match written.last() { Some(w) -> w.ends_with("?="), None -> false };
       append_to_last(
         append_to_last(written, if encode_body { " :" } else { ":" }).concat(
-          enumerate(held).flat_map(|m: { index: Int, value: Mailbox }|
-            append_to_last(mailbox_stretches(m.value, utf8), if m.index < end { "," } else { "" })),
+          enumerate(message_data).flat_map(|m: { index: Int, value: Mailbox }|
+            append_to_last(mailbox_pieces(m.value, utf8), if m.index < end { "," } else { "" })),
         ),
         ";",
       )
     },
   }
 
-fn mailbox_stretches(m: Mailbox, utf8: Bool) -> List<String> / {email.unwritable, abort.raise} =
+fn mailbox_pieces(m: Mailbox, utf8: Bool) -> List<String> / {email.unwritable, abort.raise} =
   match m {
     Mailbox(None, a) -> [" " ++ wire_address(a, utf8)],
-    Mailbox(Some(name), a) -> name_stretches(name, utf8).push(" <" ++ wire_address(a, utf8) ++ ">"),
+    Mailbox(Some(name), a) -> name_pieces(name, utf8).push(" <" ++ wire_address(a, utf8) ++ ">"),
   }
 
 /// An address as a field carries it: as written under `Utf8`, and in ASCII otherwise, with a
@@ -2783,12 +2810,12 @@ fn wire_address(a: Address, utf8: Bool) -> String / {email.unwritable} =
 
 /// The pieces that carry a display name: its words if it is atoms with one space between them, a
 /// quoted string if it is printable, and encoded words otherwise.
-fn name_stretches(name: String, utf8: Bool) -> List<String> / {abort.raise} = {
+fn name_pieces(name: String, utf8: Bool) -> List<String> / {abort.raise} = {
   let b = Bytes::of_string(name);
   let printed = !name.contains("=?")
     && b.skip(0, Bytes::concat(if utf8 { printable_wide() } else { printable() }, b"\t")) == b.len()
     && !has_c1(name);
-  let cut = stretches(if printed && is_words(name) { name } else { quote(name) });
+  let cut = split_before_spaces(if printed && is_words(name) { name } else { quote(name) });
   if printed && cut.all(|s: String| Bytes::of_string(s).len() <= 900) { cut }
   else { encode_words(name, coding_for(name)).map(|w: String| " " ++ w) }
 }
@@ -2863,26 +2890,26 @@ fn html_part(
 /// A multipart entity of these parts.
 fn multipart_entity(
   subtype: String,
-  held: List<RawPart>,
+  message_data: List<RawPart>,
   boundary: String,
 ) -> RawPart / {email.unwritable, abort.raise} =
-  match try { multipart::frame(held, boundary) } {
+  match try { multipart::frame(message_data, boundary) } {
     Err(reason) -> email.unwritable(Framing(reason)),
     Ok(data) ->
       {
         head: folded(
           "Content-Type",
-          param_stretches("multipart/" ++ subtype, [{ name: "boundary", value: boundary }]),
+          param_lines("multipart/" ++ subtype, [{ name: "boundary", value: boundary }]),
         ),
         data: data,
       },
   }
 
-fn param_stretches(lead: String, held: List<Param>) -> List<String> = {
-  let end = held.len() - 1;
+fn param_lines(lead: String, message_data: List<Param>) -> List<String> = {
+  let end = message_data.len() - 1;
   prepend(
-    " " ++ lead ++ (if held.len() > 0 { ";" } else { "" }),
-    enumerate(held).map(|p: { index: Int, value: Param }|
+    " " ++ lead ++ (if message_data.len() > 0 { ";" } else { "" }),
+    enumerate(message_data).map(|p: { index: Int, value: Param }|
       " " ++ mime::param_text(p.value) ++ (if p.index < end { ";" } else { "" })),
   )
 }
@@ -2903,7 +2930,7 @@ fn encode_body(wire: Bytes, text: Option<String>, whole: Bool) -> EncodedBody / 
   let end_block = !whole || size == 0 || wire.slice(max(size - 2, 0), size) == b"\r\n";
   if end_block && wire.skip(0, seven_bit()) == size && line_defects(wire, 0).len() == 0 {
     { encoding: "7bit", data: wire }
-  } else if mostly(wire, qp_plain()) {
+  } else if few_bytes_outside(wire, qp_plain()) {
     let quoted = match text {
       Some(lines) -> quoted_printable::encode_text(lines),
       None -> quoted_printable::encode(wire),
@@ -2935,7 +2962,7 @@ fn qp_plain() -> Bytes =
 
 fn text_part(text: String, subtype: String, whole: Bool) -> RawPart / {abort.raise} = {
   let wire = Bytes::of_string(text).replace(b"\n", b"\r\n");
-  let ascii = wire.skip_until(0, high()) >= wire.len();
+  let ascii = wire.skip_until(0, non_ascii()) >= wire.len();
   let body = encode_body(wire, Some(text), whole);
   {
     head: Bytes::of_string(
@@ -2951,26 +2978,27 @@ fn text_part(text: String, subtype: String, whole: Bool) -> RawPart / {abort.rai
 /// The part for an attachment, under the disposition `kind`.
 fn file_part(a: Attachment, index: Int, kind: String) -> RawPart / {email.unwritable, abort.raise} = {
   let top = mime::top_level(a.content_type);
-  let held = mime::params(a.content_type);
+  let message_data = mime::params(a.content_type);
   let fit = is_token(top) && is_token(mime::subtype(a.content_type)) && top != "multipart"
     && top != "message"
-    && held.all(|p: Param| is_token(p.name) && !p.name.contains("*") && p.name.len() <= 40);
+    && message_data.all(|p: Param| is_token(p.name) && !p.name.contains("*") && p.name.len() <= 40);
   if !fit { email.unwritable(BadAttachment(index)) } else {
     let body = encode_body(a.data, None, false);
     {
       head: Bytes::concat_all([
         folded(
           "Content-Type",
-          param_stretches(
+          param_lines(
             mime::essence(a.content_type),
-            held.flat_map(|p: Param| mime::sectioned(p.name.ascii_lower(), p.value, 60)),
+            message_data.flat_map(|p: Param|
+              mime::split_into_sections(p.name.ascii_lower(), p.value, 60)),
           ),
         ),
         Bytes::of_string("Content-Transfer-Encoding: " ++ body.encoding ++ "\r\n"),
         folded(
           "Content-Disposition",
-          param_stretches(kind, match a.filename {
-            Some(name) -> mime::sectioned("filename", name, 60),
+          param_lines(kind, match a.filename {
+            Some(name) -> mime::split_into_sections("filename", name, 60),
             None -> [],
           }),
         ),
@@ -3011,7 +3039,7 @@ fn html_body_of(m: Message) -> Option<MainBody> / {abort.raise} =
 fn main_body_of(m: Message) -> Option<MainBody> / {abort.raise} =
   match leaf_text(m, "plain") {
     Some(read) -> {
-      let h = held(m);
+      let h = message_data(m);
       let bare = h.body.len() == 0 && fields_named(h.fields, "content-type").len() == 0;
       Some({ text: if bare { None } else { Some(read) }, html: None, inline: [] })
     },
@@ -3035,7 +3063,7 @@ fn shape_of(m: Message) -> Option<Shape> / {abort.raise} =
     match parts(m) {
       [] -> None,
       [lead, ..rest] -> if !rest.all(is_leaf) { None }
-      else if is_leaf(lead) && is_attached(held(lead).fields) {
+      else if is_leaf(lead) && is_attached(message_data(lead).fields) {
         Some({
           core: { text: None, html: None, inline: [] },
           attachments: parts(m).map(attachment_of),
@@ -3052,7 +3080,7 @@ fn shape_of(m: Message) -> Option<Shape> / {abort.raise} =
 /// no draft can contain, or has a body that is not one of a draft's: text, HTML, the two as
 /// alternatives, the HTML with inline parts, and any of these with attachments.
 pub fn draft_of(m: Message) -> Option<Draft> / {abort.raise} = {
-  let h = held(m);
+  let h = message_data(m);
   let others = h.fields.filter(|f: Field| !is_managed(f.name)).map(|f: Field|
     Result::ok(try { field(f.name, f.value, Utf8) }));
   let topic = match subject(m) {
@@ -3086,7 +3114,7 @@ fn draft_of_fields(
     [] -> None,
     authors -> match date(m) {
       None -> None,
-      Some(when) -> match id(m) {
+      Some(example_date) -> match id(m) {
         None -> None,
         Some(known) -> match topic {
           None -> None,
@@ -3099,7 +3127,7 @@ fn draft_of_fields(
               cc: cc(m),
               bcc: bcc(m),
               subject: reader_summary,
-              date: to_the_second(when),
+              date: to_the_second(example_date),
               id: known,
               in_reply_to: in_reply_to(m),
               references: references(m),
@@ -3188,7 +3216,7 @@ pub fn repertoire_for(d: Draft) -> Repertoire / {abort.raise} = {
     d.to.concat(d.cc).concat(d.bcc),
   );
   if mailboxes_of(named_in).all(|m: Mailbox| is_ascii(address_of(m)))
-      && d.fields.all(|f: Field| f.raw.skip_until(0, high()) >= f.raw.len()) { Ascii }
+      && d.fields.all(|f: Field| f.raw.skip_until(0, non_ascii()) >= f.raw.len()) { Ascii }
   else { Utf8 }
 }
 
@@ -3214,7 +3242,7 @@ pub fn without(m: Message, dropped: String) -> Message =
 /// offset of a field's value, whatever prevents that field from being read, since a half-read field
 /// would send mail to fewer people than it names.
 pub fn message_envelope(m: Message) -> Envelope / {email.fail, abort.raise} = {
-  let held_fields = held(m).fields;
+  let held_fields = message_data(m).fields;
   let resent = held_fields.any(|f: Field| f.name.ascii_lower().starts_with("resent-"));
   let stem = if resent { "resent-" } else { "" };
   let repertoire = repertoire_of(m);
@@ -3383,12 +3411,12 @@ fn arbitrary_attachment() -> Gen<Attachment> =
       ]),
       |content_type: MediaType, data: Bytes| { content_type: content_type, data: data },
     ),
-    |named_as: { filename: Option<String>, content_id: Option<MessageId> }, held: { content_type: MediaType, data: Bytes }|
+    |named_as: { filename: Option<String>, content_id: Option<MessageId> }, message_data: { content_type: MediaType, data: Bytes }|
       {
         filename: named_as.filename,
-        content_type: held.content_type,
+        content_type: message_data.content_type,
         content_id: named_as.content_id,
-        data: held.data,
+        data: message_data.data,
       },
   )
 
@@ -3401,11 +3429,11 @@ fn arbitrary_shape() -> Gen<Shape> =
         |text: Option<String>, html: Option<String>| { text: text, html: html },
       ),
       gen::list_of(arbitrary_attachment(), 2),
-      |reader_summary: { text: Option<String>, html: Option<String> }, inline: List<Attachment>|
+      |reader_summary: { text: Option<String>, html: Option<String> }, attach_inline: List<Attachment>|
         {
           text: reader_summary.text,
           html: reader_summary.html,
-          inline: if reader_summary.html == None { [] } else { inline },
+          inline: if reader_summary.html == None { [] } else { attach_inline },
         },
     ),
     gen::list_of(arbitrary_attachment(), 2),
@@ -3426,7 +3454,7 @@ fn arbitrary_parties() -> Gen<Parties> =
       { author: lead.author, sender: lead.sender, lists: lists },
   )
 
-type Stamp = {
+type MessageHeaders = {
   subject: Option<String>,
   date: OffsetDateTime,
   id: MessageId,
@@ -3434,7 +3462,7 @@ type Stamp = {
   fields: List<Field>,
 }
 
-fn arbitrary_stamp() -> Gen<Stamp> =
+fn arbitrary_stamp() -> Gen<MessageHeaders> =
   gen::map2(
     gen::map2(
       gen::option_of(arbitrary_subject()),
@@ -3465,10 +3493,10 @@ fn arbitrary_stamp() -> Gen<Stamp> =
 /// thread and other fields, a text and an HTML body, inline parts and attachments.
 pub fn drafts() -> Gen<Draft> =
   gen::map2(
-    gen::map2(arbitrary_parties(), arbitrary_stamp(), |who: Parties, stamp: Stamp|
+    gen::map2(arbitrary_parties(), arbitrary_stamp(), |who: Parties, stamp: MessageHeaders|
       { who: who, stamp: stamp }),
     arbitrary_shape(),
-    |head: { who: Parties, stamp: Stamp }, shape: Shape|
+    |head: { who: Parties, stamp: MessageHeaders }, shape: Shape|
       {
         from: [head.who.author],
         sender: head.who.sender,
@@ -3866,15 +3894,15 @@ test "a domain literal is kept as written between its brackets" {
   assert_eq(Result::map(try { address("a", "[192.0.2.1 ]") }, domain), Ok("[192.0.2.1]"))
 }
 
-fn joe() -> Mailbox / {email.fail, abort.raise} = named_mailbox("Joe Q. Public", jdoe())
+fn joe_q_public() -> Mailbox / {email.fail, abort.raise} = named_mailbox("Joe Q. Public", jdoe())
 
 test "a mailbox is an address with a name that contains no line break" {
-  assert_eq(try { show(joe()) }, Ok("\"Joe Q. Public\" <jdoe@example.org>"));
+  assert_eq(try { show(joe_q_public()) }, Ok("\"Joe Q. Public\" <jdoe@example.org>"));
   assert_eq(try { show(named_mailbox("Joe Public", jdoe())) }, Ok("Joe Public <jdoe@example.org>"));
   assert_eq(try { show(mailbox(jdoe())) }, Ok("jdoe@example.org"));
   assert_eq(try { named_mailbox("", jdoe()) }, try { mailbox(jdoe()) });
-  assert_eq(try { display_name(joe()) }, Ok(Some("Joe Q. Public")));
-  assert_eq(try { address_of(joe()) }, try { jdoe() });
+  assert_eq(try { display_name(joe_q_public()) }, Ok(Some("Joe Q. Public")));
+  assert_eq(try { address_of(joe_q_public()) }, try { jdoe() });
   assert_eq(
     try { named_mailbox("Joe\r\nBcc: eve@example.org", jdoe()) },
     Err({ at: 3, reason: LineBreak }),
@@ -4118,7 +4146,7 @@ fn simple_addressing() -> String =
   \\This is a message just to say hello.
   \\So, "Hello".
 
-fn sent_by_a_secretary() -> String =
+fn sender_example() -> String =
   \\From: John Doe <jdoe@machine.example>
   \\Sender: Michael Jones <mjones@machine.example>
   \\To: Mary Smith <mary@example.net>
@@ -4184,7 +4212,7 @@ fn resent() -> String =
   \\This is a message just to say hello.
   \\So, "Hello".
 
-fn traced() -> String =
+fn received_example() -> String =
   \\Received: from x.y.test
   \\   by example.net
   \\   via TCP
@@ -4279,7 +4307,7 @@ fn examples() -> List<Example> =
     },
     {
       what: "A.1.1, the same sent by a secretary",
-      text: sent_by_a_secretary(),
+      text: sender_example(),
       defects: [],
       says: [
         "from John Doe <jdoe@machine.example>",
@@ -4363,7 +4391,7 @@ fn examples() -> List<Example> =
     },
     {
       what: "A.4, a message with trace fields",
-      text: traced(),
+      text: received_example(),
       defects: [],
       says: [
         "from John Doe <jdoe@node.example>",
@@ -4458,7 +4486,7 @@ test "reads {c.what}" for c: Example in examples() {
 }
 
 test "a field is kept as it was written alongside its unfolded value" {
-  let m = read(crlf_text(traced()), default_limits());
+  let m = read(crlf_text(received_example()), default_limits());
   assert_eq(headers(m, "received"), [
     "from x.y.test   by example.net   via TCP   with ESMTP   id ABC12345   for <mary@example.net>;  21 Nov 1997 10:05:43 -0600",
     "from node.example by x.y.test; 21 Nov 1997 10:01:22 -0600",
@@ -5369,7 +5397,7 @@ test "RFC 8058's fields are read, and written from the same links" {
   )
 }
 
-fn when() -> OffsetDateTime / {abort.raise} =
+fn example_date() -> OffsetDateTime / {abort.raise} =
   match date::parse_rfc3339("1997-11-21T09:55:06-06:00") {
     Some(at) -> at,
     None -> panic("no date"),
@@ -5381,7 +5409,7 @@ fn plain_draft() -> Draft / {email.fail, abort.raise} =
     named_mailbox("John Doe", address("jdoe", "machine.example")),
     [named_mailbox("Mary Smith", address("mary", "example.net"))],
     "Saying Hello",
-    when(),
+    example_date(),
     message_id("1234", "local.machine.example"),
   )
 
@@ -5426,7 +5454,7 @@ test "a text and an HTML body are alternatives, inline parts are related, and at
     data: b"\x89PNG\r\n\x1a\n",
   };
   let d = attach(
-    inline(
+    attach_inline(
       with_html(with_text(plain_draft(), "caf\u{e9}\n"), "<img src=\"cid:logo@machine.example\">"),
       logo,
     ),
@@ -5536,7 +5564,7 @@ test "no value given to a draft adds a field to it" {
   let eve = "x\r\nBcc: eve@example.org";
   assert_eq(try { with_subject(plain_draft(), eve) }, Err({ at: 1, reason: LineBreak }));
   assert_eq(
-    try { draft(mailbox(jdoe()), [], eve, when(), message_id("a", "example.org")) },
+    try { draft(mailbox(jdoe()), [], eve, example_date(), message_id("a", "example.org")) },
     Err({ at: 1, reason: LineBreak }),
   );
   assert_eq(try { named_mailbox(eve, jdoe()) }, Err({ at: 1, reason: LineBreak }));
@@ -5795,7 +5823,7 @@ fn write_error_cases() -> List<WriteErrorCase> / {email.fail, abort.raise} = {
     },
     {
       what: "inline parts and no HTML body",
-      draft: inline(d, file),
+      draft: attach_inline(d, file),
       boundary: "x",
       reason: NoHtml,
     },
@@ -5807,7 +5835,7 @@ fn write_error_cases() -> List<WriteErrorCase> / {email.fail, abort.raise} = {
     },
     {
       what: "an attachment that is a message",
-      draft: attach(inline(with_html(d, "x"), file), {
+      draft: attach(attach_inline(with_html(d, "x"), file), {
         ..file,
         content_type: MediaType("message", "rfc822", []),
       }),
@@ -5864,7 +5892,7 @@ test "under UTF-8 a draft is written unchanged, and read back" {
         ),
         [mailbox(address("\u{7528}\u{6237}", "\u{4f8b}\u{3048}.jp", Utf8))],
         "Gr\u{fc}\u{df}e",
-        when(),
+        example_date(),
         message_id("1", "example.org"),
       ),
       "Gr\u{fc}\u{df}e\n",
@@ -5993,7 +6021,7 @@ test "no subject and no name writes a line break of its own, a line past 998 oct
           named_mailbox(name, jdoe()),
           [named_mailbox(name, jdoe())],
           topic,
-          when(),
+          example_date(),
           message_id("a", "example.org"),
         )
       } {
@@ -6033,10 +6061,11 @@ test "any bytes are read tolerantly, and rendered as they were" {
 }
 
 /// RFC 6376 §3.4.5's message.
-fn signed_message() -> Bytes = b"A: X\r\nB : Y\t\r\n\tZ  \r\n\r\n C \r\nD \t E\r\n\r\n\r\n"
+fn canonicalization_message() -> Bytes =
+  b"A: X\r\nB : Y\t\r\n\tZ  \r\n\r\n C \r\nD \t E\r\n\r\n\r\n"
 
 test "RFC 6376's examples are canonical in each form" {
-  let m = read_tolerant(signed_message(), default_limits()).message;
+  let m = read_tolerant(canonicalization_message(), default_limits()).message;
   let head = |form: Canonical|
     Bytes::concat_all(fields(m).map(|f: Field| canonical_field(f, form)));
   assert_eq(head(Relaxed), b"a:X\r\nb:Y Z\r\n");

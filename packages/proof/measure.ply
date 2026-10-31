@@ -47,7 +47,8 @@ pub fn descent_of(context: Context, definition: String) -> Result<Code, String> 
               Some(x) -> match x.measure { Some(c) -> mentions(o, c), None -> false },
               None -> false,
             }));
-        if circular { Err("a measure calls into its own group") } else { descends(o, body) }
+        if circular { Err("a measure calls into its own group") }
+        else { all_calls_decrease(o, body) }
       },
       (None, _) -> Err("its body was not lowered"),
       (_, None) -> Err("it states no measure"),
@@ -88,7 +89,7 @@ fn measure_call(definition: String, args: List<Code>, span: Span) -> Code =
   )
 
 /// At a call of `callee`, a member stating a measure: `0 <= m(x̄) && m'(ȳ) < m(x̄)`.
-fn descent(o: MeasureGroup, callee: String, args: List<Code>, span: Span) -> Code = {
+fn decrease_claim(o: MeasureGroup, callee: String, args: List<Code>, span: Span) -> Code = {
   let mine = measure_call(
     o.current,
     range(0, o.params).map(|k: Int|
@@ -116,14 +117,14 @@ fn all_descend(o: MeasureGroup, cs: List<Code>, span: Span) -> Result<Code, Stri
   cs.fold(Ok(true_literal(span)), |acc: Result<Code, String>, c: Code|
     match acc {
       Err(_) -> acc,
-      Ok(sofar) -> match descends(o, c) {
+      Ok(sofar) -> match all_calls_decrease(o, c) {
         Ok(more) -> Ok(both(sofar, more)),
         Err(reason) -> Err(reason),
       },
     })
 
 /// Whether every call into the group that `c` makes, in the order it makes them, descends.
-fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
+fn all_calls_decrease(o: MeasureGroup, c: Code) -> Result<Code, String> =
   if !mentions(o, c) { Ok(true_literal(c.span)) } else {
     match c.node {
       CodeVar(v) -> Err("`" ++ String::of_bytes_lossy(v.name) ++ "` is handed on as a value"),
@@ -134,19 +135,19 @@ fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
           NDefinition(f) -> {
             let name = String::of_bytes_lossy(f.full);
             if o.group.contains(name) {
-              Ok(if o.stating.contains(name) { both(args, descent(o, name, a.args, c.span)) }
+              Ok(if o.stating.contains(name) { both(args, decrease_claim(o, name, a.args, c.span)) }
               else { args })
             } else { Ok(args) }
           },
           NConstructor(_) -> Ok(args),
           NBuiltin(_) -> Ok(args),
-          _ -> Ok(both(args, descends(o, a.function)?)),
+          _ -> Ok(both(args, all_calls_decrease(o, a.function)?)),
         }
       },
       CodeIf(i) -> {
-        let cond = descends(o, i.cond)?;
-        let then_branch = descends(o, i.then_branch)?;
-        let else_branch = descends(o, i.else_branch)?;
+        let cond = all_calls_decrease(o, i.cond)?;
+        let then_branch = all_calls_decrease(o, i.then_branch)?;
+        let else_branch = all_calls_decrease(o, i.else_branch)?;
         Ok(
           both(
             cond,
@@ -159,7 +160,7 @@ fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
         )
       },
       CodeMatch(m) -> {
-        let scrutinee = descends(o, m.scrutinee)?;
+        let scrutinee = all_calls_decrease(o, m.scrutinee)?;
         if m.arms.fold(false, |found: Bool, arm: CodeArm|
             found || (match arm.guard { Some(g) -> mentions(o, g), None -> false })) {
           Err("a call into the group in a guard")
@@ -167,7 +168,7 @@ fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
           let arms = m.arms.fold(Ok([]), |acc: Result<List<CodeArm>, String>, arm: CodeArm|
             match acc {
               Err(_) -> acc,
-              Ok(xs) -> match descends(o, arm.body) {
+              Ok(xs) -> match all_calls_decrease(o, arm.body) {
                 Ok(b) -> Ok(xs.push({ ..arm, body: b })),
                 Err(reason) -> Err(reason),
               },
@@ -181,14 +182,17 @@ fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
         }
       },
       CodeBlock(b) -> {
-        let tail = (match b.tail { Some(t) -> descends(o, t), None -> Ok(true_literal(c.span)) })?;
+        let tail = (match b.tail {
+          Some(t) -> all_calls_decrease(o, t),
+          None -> Ok(true_literal(c.span)),
+        })?;
         range(0, b.statements.len()).fold(Ok(tail), |acc: Result<Code, String>, k: Int|
           match acc {
             Err(_) -> acc,
             Ok(rest) -> match b.statements.at(b.statements.len() - 1 - k) {
               None -> acc,
               Some(st) -> match st {
-                CodeDo(d) -> match descends(o, d.code) {
+                CodeDo(d) -> match all_calls_decrease(o, d.code) {
                   Ok(x) -> Ok(both(x, rest)),
                   Err(reason) -> Err(reason),
                 },
@@ -199,8 +203,8 @@ fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
           })
       },
       CodeBinary(b) -> {
-        let lhs = descends(o, b.lhs)?;
-        let rhs = descends(o, b.rhs)?;
+        let lhs = all_calls_decrease(o, b.lhs)?;
+        let rhs = all_calls_decrease(o, b.rhs)?;
         // The right of `&&` and `||` is evaluated only where the left lets it be.
         if b.op == b"and" {
           Ok(
@@ -226,10 +230,10 @@ fn descends(o: MeasureGroup, c: Code) -> Result<Code, String> =
           )
         } else { Ok(both(lhs, rhs)) }
       },
-      CodeUnary(u) -> descends(o, u.operand),
+      CodeUnary(u) -> all_calls_decrease(o, u.operand),
       CodeList(l) -> all_descend(o, l.items, c.span),
       CodeRecord(r) -> all_descend(o, r.fields.map(|f: CodeField| f.value), c.span),
-      CodeFieldRead(f) -> descends(o, f.base),
+      CodeFieldRead(f) -> all_calls_decrease(o, f.base),
       CodeUpdate(u) -> all_descend(o, u.sets.map(|f: CodeField| f.value).push(u.base), c.span),
       CodePerform(p) -> all_descend(o, p.args, c.span),
       _ -> Err("a call into the group inside a lambda or a simulation"),
@@ -244,7 +248,7 @@ fn binding_descends(
   rest: Code,
   span: Span,
 ) -> Result<Code, String> =
-  match descends(o, value) {
+  match all_calls_decrease(o, value) {
     Err(reason) -> Err(reason),
     Ok(v) ->
       Ok(

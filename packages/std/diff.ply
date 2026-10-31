@@ -233,7 +233,7 @@ fn with_keep<a>(edits: List<Edit<a>>, kept: List<a>) -> List<Edit<a>> =
 /// A list with hunks applied, and the index where each hunk was applied.
 pub type ApplyResult<a> = new { result: List<a>, at: List<Int> }
 
-type ApplyState<a> = { hunk: Int, from: Int, drift: Int, out: List<a>, at: List<Int> }
+type ApplyState<a> = { hunk: Int, from: Int, offset: Int, out: List<a>, at: List<Int> }
 
 /// `to` with each hunk's deletions removed and its insertions added, each hunk exactly at its
 /// stated start. Raises `diff.fail` for the first hunk whose kept and deleted elements differ from
@@ -259,10 +259,10 @@ pub fn apply_near<a>(hunks: List<Hunk<a>>, to: List<a>, reach: Int) -> ApplyResu
   where derivable(eq, a)
 = {
   let far = if reach > 0 { reach } else { 0 };
-  let { hunk: _, from, drift: _, out, at } = hunks.fold(
-    { hunk: 0, from: 0, drift: 0, out: [], at: [] },
+  let { hunk: _, from, offset: _, out, at } = hunks.fold(
+    { hunk: 0, from: 0, offset: 0, out: [], at: [] },
     |s: ApplyState<a>, h: Hunk<a>| {
-      let { hunk, from, drift, out, at } = s;
+      let { hunk, from, offset: drift, out, at } = s;
       let want = before(h.edits);
       match find_position(want, to, checked_add(h.old_at, drift), from, far) {
         Err(reason) -> diff.fail({ hunk: hunk, reason: reason }),
@@ -270,7 +270,7 @@ pub fn apply_near<a>(hunks: List<Hunk<a>>, to: List<a>, reach: Int) -> ApplyResu
           {
             hunk: hunk + 1,
             from: p + want.len(),
-            drift: match checked_sub(p, h.old_at) { Some(moved) -> moved, None -> 0 },
+            offset: match checked_sub(p, h.old_at) { Some(moved) -> moved, None -> 0 },
             out: out.concat(slice(to, from, p - from)).concat(after(h.edits)),
             at: at.push(p),
           },
@@ -321,17 +321,17 @@ fn nearest_match<a>(
 ) -> Int
   where derivable(eq, a)
 =
-  if up <= last && apart(up, guess) <= reach
-      && (down < floor || apart(up, guess) <= apart(guess, down)) {
+  if up <= last && absolute_difference(up, guess) <= reach
+      && (down < floor || absolute_difference(up, guess) <= absolute_difference(guess, down)) {
     if first_mismatch(want, to, up, 0) < 0 { up }
     else { nearest_match(want, to, guess, reach, floor, last, up + 1, down) }
-  } else if down >= floor && apart(guess, down) <= reach {
+  } else if down >= floor && absolute_difference(guess, down) <= reach {
     if first_mismatch(want, to, down, 0) < 0 { down }
     else { nearest_match(want, to, guess, reach, floor, last, up, down - 1) }
   } else { 0 - 1 }
 
 /// How far apart two indexes are, capped at the largest `Int`.
-fn apart(x: Int, y: Int) -> Int =
+fn absolute_difference(x: Int, y: Int) -> Int =
   match checked_sub(x, y) {
     Some(d) -> if d >= 0 { d } else { match checked_neg(d) { Some(n) -> n, None -> max_int() } },
     None -> max_int(),
@@ -571,9 +571,9 @@ pub fn unified(d: FileDiff) -> String =
           out.push("@@ -").push(ranges).push(" @@\n"),
           |body: List<String>, e: Edit<String>|
             match e {
-              Keep(ls) -> signed(body, " ", ls),
-              Delete(ls) -> signed(body, "-", ls),
-              Insert(ls) -> signed(body, "+", ls),
+              Keep(ls) -> append_prefixed(body, " ", ls),
+              Delete(ls) -> append_prefixed(body, "-", ls),
+              Insert(ls) -> append_prefixed(body, "+", ls),
             },
         )
       }),
@@ -587,7 +587,7 @@ fn range_text(at: Int, n: Int) -> String =
   else if n == 1 { Int::to_string(at + 1) }
   else { Int::to_string(at + 1) ++ "," ++ n.to_string() }
 
-fn signed(out: List<String>, sign: String, ls: List<String>) -> List<String> =
+fn append_prefixed(out: List<String>, sign: String, ls: List<String>) -> List<String> =
   ls.fold(out, |acc: List<String>, l: String|
     if l.ends_with("\n") { acc.push(sign).push(l) }
     else { acc.push(sign).push(l).push("\n\\ No newline at end of file\n") })
@@ -1072,7 +1072,7 @@ type Span = | Same(Int) | Deleted(Int) | Inserted(Int)
 type Box = { a0: Int, a1: Int, b0: Int, b1: Int }
 
 /// What is left to search, in order: stretches, and between them kept runs already found.
-type Pending = | Done | Stretch(Box, Pending) | Matched(Int, Pending)
+type Pending = | Done | Unmatched(Box, Pending) | Matched(Int, Pending)
 
 /// One direction of a stretch's search. Its frontier is the cells of `v` around `base`, and the
 /// other direction's is the cells around `other`. `origin_a`, `origin_b` and `step` map its
@@ -1094,7 +1094,7 @@ type Side = {
 type Cut = { v: Array<Int>, x: Int, y: Int }
 
 /// What a frontier cell contains for a diagonal that no path of the round is on.
-fn unreached() -> Int = 0 - 4611686018427387904
+fn unvisited_marker() -> Int = 0 - 4611686018427387904
 
 /// The last round a frontier has cells for, which no terminating search reaches.
 fn last_round() -> Int = 8388607
@@ -1126,7 +1126,7 @@ fn search_spans<a>(a: List<a>, b: List<a>, limit: Int) -> List<Span> / {abort.ra
     Array::new(2 * width, 0),
     Array::of_list(a),
     Array::of_list(b),
-    Stretch({ a0: 0, a1: n, b0: 0, b1: m }, Done),
+    Unmatched({ a0: 0, a1: n, b0: 0, b1: m }, Done),
     [],
     cap,
     width,
@@ -1168,7 +1168,7 @@ reuse fn solve<a>(
   match todo {
     Done -> out,
     Matched(n, rest) -> solve(v, xs, ys, rest, out.push(Same(n)), cap, width, fuel),
-    Stretch(box, rest) -> if fuel <= 0 { drain(todo, out) } else {
+    Unmatched(box, rest) -> if fuel <= 0 { drain(todo, out) } else {
       let n = box.a1 - box.a0;
       let m = box.b1 - box.b0;
       let short = if n < m { n } else { m };
@@ -1200,7 +1200,7 @@ reuse fn solve<a>(
             cut.v,
             xs,
             ys,
-            Stretch(lo, Stretch(hi, Matched(tail, rest))),
+            Unmatched(lo, Unmatched(hi, Matched(tail, rest))),
             led,
             cap,
             width,
@@ -1216,7 +1216,7 @@ reuse fn drain(todo: Pending, out: List<Span>) -> List<Span> =
   match todo {
     Done -> out,
     Matched(n, rest) -> drain(rest, out.push(Same(n))),
-    Stretch(box, rest) -> drain(rest, push_replacement(out, box.a1 - box.a0, box.b1 - box.b0)),
+    Unmatched(box, rest) -> drain(rest, push_replacement(out, box.a1 - box.a0, box.b1 - box.b0)),
   }
 
 /// The spans, then a stretch of `removed_entry` elements replaced by `new` others.
@@ -1314,8 +1314,8 @@ reuse fn search<a>(
 /// The frontier ready for round `d`: the cells just outside the round's diagonals contain no path,
 /// except the one the first round starts from.
 reuse fn prepare_round(v: Array<Int>, base: Int, d: Int) -> Array<Int> / {abort.raise} =
-  if d == 0 { v.set(base - 1, unreached()).set(base + 1, 0) }
-  else { v.set(base - d - 1, unreached()).set(base + d + 1, unreached()) }
+  if d == 0 { v.set(base - 1, unvisited_marker()).set(base + 1, 0) }
+  else { v.set(base - d - 1, unvisited_marker()).set(base + d + 1, unvisited_marker()) }
 
 /// Round `d` of one direction from diagonal `k` up: each diagonal's furthest point is one step
 /// right of its lower neighbour's or one down from its upper neighbour's, whichever is further and
@@ -1334,10 +1334,10 @@ reuse fn sweep<a>(
   if k > d { { v: v, x: 0 - 1, y: 0 } } else {
     let below = v.get(s.base + k - 1);
     let above = v.get(s.base + k + 1);
-    let right = if below < s.n { below + 1 } else { unreached() };
-    let down = if above - k <= s.m { above } else { unreached() };
+    let right = if below < s.n { below + 1 } else { unvisited_marker() };
+    let down = if above - k <= s.m { above } else { unvisited_marker() };
     let from = if right > down { right } else { down };
-    if from < 0 { sweep(v.set(s.base + k, unreached()), xs, ys, s, d, k + 2) } else {
+    if from < 0 { sweep(v.set(s.base + k, unvisited_marker()), xs, ys, s, d, k + 2) } else {
       let y = from - k;
       let remaining = if s.n - from < s.m - y { s.n - from } else { s.m - y };
       let x = from
@@ -1434,7 +1434,7 @@ test "long lists of few values get a shortest script, and one that reads back wi
   let wrong = range(0, 24).fold(0, |wrong: Int, t: Int| {
     let a = noise(t * 7 + 1, 150 + t);
     let b = noise(t * 11 + 5, 170 - t);
-    let least = a.len() + b.len() - 2 * common(a, b);
+    let least = a.len() + b.len() - 2 * longest_common_length(a, b);
     let cut = diff(a, b, t % 6);
     if distance(diff(a, b)) == least && before(cut) == a && after(cut) == b
         && distance(cut) >= least { wrong }
@@ -1471,7 +1471,7 @@ test "a short list against a long one gets a shortest script, whichever is first
   let wrong = range(0, 40).fold(0, |wrong: Int, t: Int| {
     let short = noise(t * 5 + 3, t % 7);
     let long = noise(t * 13 + 2, 30 + t);
-    let least = short.len() + long.len() - 2 * common(short, long);
+    let least = short.len() + long.len() - 2 * longest_common_length(short, long);
     if distance(diff(short, long)) == least && distance(diff(long, short)) == least
         && after(diff(long, short, 1 + t % 9)) == short
         && after(diff(short, long, 1 + t % 9)) == long { wrong }
@@ -1868,9 +1868,9 @@ test "a text is patched by its lines, and a line whose newline differs does not 
 }
 
 test "a merge of texts writes a conflict between git's markers" {
-  let apart = merge_lines("a\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n", "a\nb\nc\nd\nE\n");
-  assert_eq(resolved(apart), Some(["a\n", "B\n", "c\n", "d\n", "E\n"]));
-  assert_eq(merge_text(apart, "ours", "theirs"), "a\nB\nc\nd\nE\n");
+  let absolute_difference = merge_lines("a\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n", "a\nb\nc\nd\nE\n");
+  assert_eq(resolved(absolute_difference), Some(["a\n", "B\n", "c\n", "d\n", "E\n"]));
+  assert_eq(merge_text(absolute_difference, "ours", "theirs"), "a\nB\nc\nd\nE\n");
   let clash = merge_lines("a\nb\nc\n", "a\nB\nc\n", "a\nb2\nc\n");
   assert_eq(
     merge_text(clash, "ours", "theirs"),
@@ -1925,7 +1925,7 @@ test "values that differ where no step reaches are replaced whole" {
 // --- Laws -------------------------------------------------------------------
 
 /// A list over three values, so that two of them share elements.
-fn few(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x % 3)
+fn mod_three(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x % 3)
 
 /// A `Pages` as a test generates one.
 fn pages_drawn() -> gen::Gen<Pages> =
@@ -1944,14 +1944,14 @@ test "the hunks of a diff, applied to its first list, return its second" {
     gen::list(gen::any_int()),
     gen::any_int(),
     |a: List<Int>, b: List<Int>, context: Int| {
-      try_apply(hunks(diff(few(a), few(b)), context), few(a)) == Ok(few(b))
+      try_apply(hunks(diff(mod_three(a), mod_three(b)), context), mod_three(a)) == Ok(mod_three(b))
     },
   )
 }
 
 /// The length of the longest sequence both lists contain in order, by the textbook table a row at a
 /// time.
-fn common<a>(a: List<a>, b: List<a>) -> Int
+fn longest_common_length<a>(a: List<a>, b: List<a>) -> Int
   where derivable(eq, a)
 = {
   let last = a.fold(b.map(|_: a| 0), |above: List<Int>, x: a|
@@ -1977,17 +1977,18 @@ fn flags(t: Flags) -> List<Bool> = [t._0, t._1, t._2, t._3, t._4, t._5]
 law "a script over up to three marks is as short as any"
   forall (p: Marks, q: Marks) {
     distance(diff(marks(p), marks(q)))
-      == marks(p).len() + marks(q).len() - 2 * common(marks(p), marks(q))
+      == marks(p).len() + marks(q).len() - 2 * longest_common_length(marks(p), marks(q))
   }
 
 law "a script over six flags is as short as any"
   forall (p: Flags, q: Flags) {
-    distance(diff(flags(p), flags(q))) == 12 - 2 * common(flags(p), flags(q))
+    distance(diff(flags(p), flags(q))) == 12 - 2 * longest_common_length(flags(p), flags(q))
   }
 
 test "a script is as short as any" {
   gen::check2(gen::list(gen::any_int()), gen::list(gen::any_int()), |a: List<Int>, b: List<Int>| {
-    distance(diff(few(a), few(b))) == a.len() + b.len() - 2 * common(few(a), few(b))
+    distance(diff(mod_three(a), mod_three(b)))
+      == a.len() + b.len() - 2 * longest_common_length(mod_three(a), mod_three(b))
   })
 }
 
@@ -2008,7 +2009,8 @@ test "a merge is resolved alike whichever side is ours" {
     gen::list(gen::any_int()),
     gen::list(gen::any_int()),
     |o: List<Int>, a: List<Int>, b: List<Int>| {
-      resolved(merge(few(o), few(a), few(b))) == resolved(merge(few(o), few(b), few(a)))
+      resolved(merge(mod_three(o), mod_three(a), mod_three(b)))
+        == resolved(merge(mod_three(o), mod_three(b), mod_three(a)))
     },
   )
 }

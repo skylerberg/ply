@@ -8,9 +8,9 @@ import compiler.emit.lower.representation (case_index)
 import compiler.emit.layout (ValueLayout, PlainWords, SumCases, SumLayout, CaseLayout, CaseTest,
                              CaseArgs, Always, WordIs, WordOutside, LowBits, Pointer, PointerSum,
                              CharImmediate, RawRange, pointer_floor, nullary_step, tag_bits,
-                             sum_layout, record_layout, raw, head_field, list_head)
+                             sum_layout, record_layout, any_integer, head_field, list_head)
 import compiler.emit.print.text (Printing, InstructionContext, line, text, pad, pieces, name_of,
-                                 arg_text, site, part_names, unsupported)
+                                 arg_text, source_position, part_names, unsupported)
 
 pub fn case_opened(p: InstructionContext, printing: Printing, on: Var, t: Test) -> Printing =
   text(printing, pad(p.depth))
@@ -225,7 +225,7 @@ pub fn switch_value(s: SumLayout, ws: List<Bytes>) -> Bytes =
               b") == ",
               mask,
               b" ? ",
-              int_literal(boxed_tag_base()),
+              int_literal(first_boxed_tag()),
               b" + (int64_t)ply_words((",
               w,
               b") & ~(Word)",
@@ -250,7 +250,7 @@ pub fn case_label(s: SumLayout, i: Int) -> Bytes =
       WordIs(t) -> Bytes::concat_all([b"case ", int_literal(t.value), b":"]),
       LowBits(t) -> match t.block_tag {
         None -> Bytes::concat_all([b"case ", int_literal(pointer_floor() + t.bits), b":"]),
-        Some(tag) -> Bytes::concat_all([b"case ", int_literal(boxed_tag_base() + tag), b":"]),
+        Some(tag) -> Bytes::concat_all([b"case ", int_literal(first_boxed_tag() + tag), b":"]),
       },
       _ -> b"default:",
     },
@@ -271,7 +271,7 @@ fn tested_word(t: CaseTest) -> Int =
 
 fn tag_mask() -> Int = (1 << tag_bits()) - 1
 
-fn boxed_tag_base() -> Int = pointer_floor() + tag_mask() + 1
+fn first_boxed_tag() -> Int = pointer_floor() + tag_mask() + 1
 
 fn typed_int(printing: Printing, r: Representation, n: Int) -> Bytes =
   match r {
@@ -295,12 +295,12 @@ pub fn match_rest(p: InstructionContext, printing: Printing, label: Int, arms: I
 pub fn match_closed(p: InstructionContext, printing: Printing, label: Int) -> Printing =
   line(printing, p.depth, Bytes::concat_all([end_label(label), b": ;"]))
 
-pub fn missed(p: InstructionContext, printing: Printing, label: Int, i: Int) -> Printing =
+pub fn next_arm_jump(p: InstructionContext, printing: Printing, label: Int, i: Int) -> Printing =
   line(printing, p.depth, Bytes::concat_all([b"goto ", arm_label(label, i + 1), b";"]))
 
 pub fn failed(p: InstructionContext, printing: Printing, reason: MatchFailure) -> Printing =
   line(
-    site(p, printing),
+    source_position(p, printing),
     p.depth,
     Bytes::concat_all([
       match reason {
@@ -318,30 +318,33 @@ fn end_label(label: Int) -> Bytes = Bytes::concat_all([b"ply_m", ascii_of_int(la
 
 fn case_of(args: List<ValueLayout>) -> CaseArgs = { args: record_layout(args), indirect: false }
 
-fn maybe_of(l: ValueLayout) -> SumLayout = sum_layout([case_of([]), case_of([l])])
+fn option_layout(l: ValueLayout) -> SumLayout = sum_layout([case_of([]), case_of([l])])
 
 test "a sum's case is told by its word's value, a niche word's class, or a pointer's low bits" {
   let x = [b"x"];
   let pointer = PlainWords([Pointer]);
   let reads = |told: Bytes, parts: List<Bytes>| parts.all(|p: Bytes| told.index_of(p) != None);
-  assert(case_test(maybe_of(pointer), x, 0).index_of(b"== INT64_C(0)") != None, None);
-  let some = case_test(maybe_of(pointer), x, 1);
+  assert(case_test(option_layout(pointer), x, 0).index_of(b"== INT64_C(0)") != None, None);
+  let some = case_test(option_layout(pointer), x, 1);
   assert(reads(some, [b"INT64_C(4096)"]) && some.index_of(b"==") == None, None);
   assert(
-    reads(case_test(maybe_of(SumCases(maybe_of(pointer))), x, 1), [
+    reads(case_test(option_layout(SumCases(option_layout(pointer))), x, 1), [
       b"INT64_C(4096)",
       b"INT64_C(8)",
     ]),
     None,
   );
   assert(
-    reads(case_test(maybe_of(PlainWords([RawRange({ lo: 0, hi: 1 })])), x, 1), [
+    reads(case_test(option_layout(PlainWords([RawRange({ lo: 0, hi: 1 })])), x, 1), [
       b"INT64_C(0)",
       b"INT64_C(1)",
     ]),
     None,
   );
-  assert(reads(case_test(maybe_of(PlainWords([CharImmediate(0)])), x, 1), [b"& 7) == 2"]), None);
+  assert(
+    reads(case_test(option_layout(PlainWords([CharImmediate(0)])), x, 1), [b"& 7) == 2"]),
+    None,
+  );
   let tags = sum_layout(
     range(0, 9).map(|_: Int| { args: record_layout([pointer]), indirect: true }),
   );
@@ -350,7 +353,7 @@ test "a sum's case is told by its word's value, a niche word's class, or a point
     reads(case_test(tags, x, 8), [b"& 7) == INT64_C(7)", b"ply_words(", b"== INT64_C(8)"]),
     None,
   );
-  let tagged = case_test(maybe_of(PlainWords([raw()])), [b"t_0", b"t_1", b"t_2"], 1);
+  let tagged = case_test(option_layout(PlainWords([any_integer()])), [b"t_0", b"t_1", b"t_2"], 1);
   assert(reads(tagged, [b"t_0", b"INT64_C(1)"]) && tagged.index_of(b"t_1") == None, None);
   assert_eq(case_test(sum_layout([case_of([pointer])]), x, 0), b"1")
 }
@@ -362,11 +365,14 @@ test "a switch over a sum's case switches on its tested word, each case labelled
   let ordering = sum_layout([case_of([]), case_of([]), case_of([])]);
   assert_eq(switch_value(ordering, x), b"(int64_t)(x)");
   assert_eq(labels(ordering), [b"case INT64_C(0):", b"case INT64_C(1):", b"case INT64_C(2):"]);
-  assert_eq(switch_value(maybe_of(PlainWords([raw()])), [b"t_0", b"t_1"]), b"(int64_t)(t_0)");
-  assert_eq(switch_value(maybe_of(pointer), x), b"(int64_t)(x)");
-  assert_eq(labels(maybe_of(pointer)), [b"case INT64_C(0):", b"default:"]);
-  assert_eq(empty_arms(maybe_of(pointer), [1]), b"case INT64_C(0): break; ");
-  assert_eq(empty_arms(maybe_of(pointer), [0]), b"");
+  assert_eq(
+    switch_value(option_layout(PlainWords([any_integer()])), [b"t_0", b"t_1"]),
+    b"(int64_t)(t_0)",
+  );
+  assert_eq(switch_value(option_layout(pointer), x), b"(int64_t)(x)");
+  assert_eq(labels(option_layout(pointer)), [b"case INT64_C(0):", b"default:"]);
+  assert_eq(empty_arms(option_layout(pointer), [1]), b"case INT64_C(0): break; ");
+  assert_eq(empty_arms(option_layout(pointer), [0]), b"");
   let tags = sum_layout(
     [case_of([])].concat(
       range(0, 9).map(|_: Int| { args: record_layout([pointer]), indirect: true }),
@@ -384,7 +390,7 @@ test "a switch over a sum's case switches on its tested word, each case labelled
     b"case INT64_C(4097):",
   ]);
   assert_eq(labels(tags).drop(8), [b"case INT64_C(4112):", b"case INT64_C(4113):"]);
-  [ordering, maybe_of(pointer), tags].fold((), |_: Unit, s: SumLayout|
+  [ordering, option_layout(pointer), tags].fold((), |_: Unit, s: SumLayout|
     assert_eq(
       labels(s).len(),
       labels(s).fold([], |seen: List<Bytes>, l: Bytes|

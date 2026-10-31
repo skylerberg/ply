@@ -298,14 +298,14 @@ pub fn mode_of_bits(bits: Int) -> Mode = {
 
 // --- The host handler -------------------------------------------------------
 
-host for fs by served
+host for fs by host_handler
 
 /// Runs `go` against the files under the roots the run binds. Each operation waits in the
 /// requesting task, and what it read or wrote is entered into an observed run's record. A stamp, a
 /// sync, a lock, a file system's space, and reads and writes through an open file record nothing:
 /// a stamp is about when, not what, the space belongs to the machine, and an open file is recorded
 /// when it opens.
-fn served<a | e>(
+fn host_handler<a | e>(
   go: () -> a / {fs.read[*], fs.write[*] | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
   handle {
@@ -625,7 +625,7 @@ extern fn fs_secret_taken(number: Int) -> Secret<Bytes> / {native.read}
 /// closed, and `short` is the most bytes one `read_chunk` returns, or zero for as many as
 /// requested. `ids` records which file, directory or link each path refers to, `next_id` is the
 /// next id, and `shared` counts the names of each file that has more than one. `space` is what
-/// `space` returns. `synced` stores each file's body as last synced, and `durable` the files a
+/// `space` returns. `synced_bodies` stores each file's body as last synced, and `durable` the files a
 /// synced directory listed, which is what `mem_crashed` keeps.
 pub type MemFs = {
   files: Map<String, Body>,
@@ -641,15 +641,15 @@ pub type MemFs = {
   next_id: Int,
   shared: Map<Int, Int>,
   space: Space,
-  synced: Map<Int, Body>,
-  durable: Map<String, Int>,
+  synced_bodies: Map<Int, Body>,
+  synced_names: Map<String, Int>,
 }
 
 /// What a file of the fake contains: its bytes, or what `fs.write_secret` wrote, stored as it was
 /// given. No Ply code can open a secret, so the fake cannot return a sealed file's bytes where the
 /// host would. `mem_read`, `read_at` and `read_chunk` treat it as unreadable, `fs.read_secret`
 /// reads it back only with the same surrounding bytes and encoding it was written with, and
-/// `mem_sealed` returns its contents.
+/// `mem_framed_secret` returns its contents.
 pub type Body = | Plain(Bytes) | Sealed(FramedSecret)
 
 /// A secret as `fs.write_secret` writes one: `before`, then `secret` in `encoding`, then `after`.
@@ -744,8 +744,8 @@ pub fn mem_empty() -> MemFs =
       inodes: 0x10_0000,
       inodes_free: 0x8_0000,
     },
-    synced: Map::new(),
-    durable: Map::new(),
+    synced_bodies: Map::new(),
+    synced_names: Map::new(),
   }
 
 /// The tree in a file system with this much space, which is what `space` returns for it.
@@ -770,7 +770,7 @@ pub fn mem_read(tree: MemFs, path: String) -> Option<Bytes> / {abort.raise} = {
 }
 
 /// The contents of a file `fs.write_secret` wrote; `None` for any other path.
-pub fn mem_sealed(tree: MemFs, path: String) -> Option<FramedSecret> / {abort.raise} = {
+pub fn mem_framed_secret(tree: MemFs, path: String) -> Option<FramedSecret> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   match tree.files.get(key) { Some(Sealed(f)) -> Some(f), _ -> None }
 }
@@ -953,7 +953,7 @@ pub fn mem_sync(tree: MemFs, path: String) -> WriteResult / {abort.raise} =
 fn sync_file(tree: MemFs, key: String) -> MemFs =
   match tree.ids.get(key) {
     Some(id) -> match tree.files.get(key) {
-      Some(body) -> { ..tree, synced: tree.synced.insert(id, body) },
+      Some(body) -> { ..tree, synced_bodies: tree.synced_bodies.insert(id, body) },
       None -> tree,
     },
     None -> tree,
@@ -962,11 +962,11 @@ fn sync_file(tree: MemFs, key: String) -> MemFs =
 /// The tree with `dir`'s current files, and none that have left it, as the ones a power loss keeps
 /// there.
 fn sync_dir(tree: MemFs, dir: String) -> MemFs = {
-  let left = tree.durable.keys().fold(tree.durable, |m: Map<String, Int>, key: String|
+  let left = tree.synced_names.keys().fold(tree.synced_names, |m: Map<String, Int>, key: String|
     if parent_of(key) == dir && !tree.files.contains(key) { m.remove(key) } else { m });
   {
     ..tree,
-    durable: tree.files.fold(left, |m: Map<String, Int>, key: String, _body: Body|
+    synced_names: tree.files.fold(left, |m: Map<String, Int>, key: String, _body: Body|
       if parent_of(key) != dir { m }
       else { match tree.ids.get(key) { Some(id) -> m.insert(key, id), None -> m } }),
   }
@@ -976,15 +976,15 @@ fn sync_dir(tree: MemFs, dir: String) -> MemFs = {
 /// having been on disk all along.
 pub fn mem_sync_all(tree: MemFs) -> MemFs =
   tree.files.fold(
-    { ..tree, synced: Map::new(), durable: Map::new() },
+    { ..tree, synced_bodies: Map::new(), synced_names: Map::new() },
     |t: MemFs, key: String, body: Body| {
       let named = with_id(t, key);
       match named.ids.get(key) {
         Some(id) ->
           {
             ..named,
-            synced: named.synced.insert(id, body),
-            durable: named.durable.insert(key, id),
+            synced_bodies: named.synced_bodies.insert(id, body),
+            synced_names: named.synced_names.insert(key, id),
           },
         None -> named,
       }
@@ -997,7 +997,7 @@ pub fn mem_sync_all(tree: MemFs) -> MemFs =
 /// directory listed is gone. Directories and links are kept as they are, and no descriptor or lock
 /// survives the loss. The returned tree is fully synced.
 pub fn mem_crashed(tree: MemFs) -> MemFs = {
-  let kept = tree.durable.fold(Map::new(), |m: Map<String, Int>, key: String, id: Int|
+  let kept = tree.synced_names.fold(Map::new(), |m: Map<String, Int>, key: String, id: Int|
     if kind_at(tree, parent_of(key)) != Dir || tree.dirs.contains(key) || tree.links.contains(key) {
       m
     } else { m.insert(key, id) });
@@ -1008,7 +1008,7 @@ pub fn mem_crashed(tree: MemFs) -> MemFs = {
   mem_sync_all({
     ..tree,
     files: kept.fold(Map::new(), |m: Map<String, Body>, key: String, id: Int|
-      m.insert(key, match tree.synced.get(id) { Some(body) -> body, None -> Plain(b"") })),
+      m.insert(key, match tree.synced_bodies.get(id) { Some(body) -> body, None -> Plain(b"") })),
     ids: tree.ids.fold(kept, |m: Map<String, Int>, key: String, id: Int|
       if tree.files.contains(key) || m.contains(key) { m } else { m.insert(key, id) }),
     shared: counted.fold(Map::new(), |n: Map<Int, Int>, id: Int, names: Int|
@@ -1131,11 +1131,11 @@ fn moved(f: MemFs, src: String, destination: String) -> MemFs / {abort.raise} = 
   let under_destination = |k: String| destination ++ k.slice(src.len(), k.len());
   let keyed = all_keys(cleared).fold(cleared, |t: MemFs, k: String|
     if k == src || k.starts_with(src ++ "/") { rekeyed(t, k, under_destination(k)) } else { t });
-  let durable = if kind_at(f, src) != Dir { keyed.durable } else {
-    keyed.durable.keys().fold(keyed.durable, |m: Map<String, Int>, k: String|
+  let durable = if kind_at(f, src) != Dir { keyed.synced_names } else {
+    keyed.synced_names.keys().fold(keyed.synced_names, |m: Map<String, Int>, k: String|
       if k.starts_with(src ++ "/") { moved_key(m, k, under_destination(k)) } else { m })
   };
-  { ..keyed, durable: durable, clock: keyed.clock + 1 }
+  { ..keyed, synced_names: durable, clock: keyed.clock + 1 }
 }
 
 /// The lock is the file's existence, so a second taker finds it there and gets `false`.
@@ -1268,10 +1268,10 @@ fn stat_at(tree: MemFs, key: String) -> Option<Stat> = {
 pub fn mem_scan(tree: MemFs, path: String, deep: Bool) -> Option<List<ScanEntry>> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   if kind_at(tree, key) != Dir { None }
-  else { Some(scanned(tree, key, normalize(path), deep, [], tree.dirs.len())) }
+  else { Some(scan_tree(tree, key, normalize(path), deep, [], tree.dirs.len())) }
 }
 
-fn scanned(
+fn scan_tree(
   tree: MemFs,
   key: String,
   named: String,
@@ -1289,7 +1289,7 @@ fn scanned(
           let listed = out.push({ path: shown, stat: found });
           if !deep || found.kind != Dir { listed }
           else if room <= 0 { panic("a directory below itself") }
-          else { scanned(tree, child, shown, deep, listed, room - 1) }
+          else { scan_tree(tree, child, shown, deep, listed, room - 1) }
         },
       }
     })
@@ -1387,7 +1387,7 @@ fn descriptor(tree: MemFs, key: String, how: OpenMode) -> OpenResult =
 pub fn mem_read_chunk(tree: MemFs, file: Int, max: Int) -> ReadChunkResult / {abort.raise} =
   if max < 0 { panic("a chunk's length cannot be negative") } else {
     match tree.opened.get(file) {
-      Some(o) -> if o.how != ToRead || holds_sealed(tree, o.key) { { fs: tree, bytes: None } }
+      Some(o) -> if o.how != ToRead || holds_secret(tree, o.key) { { fs: tree, bytes: None } }
       else {
         let body = match tree.files.get(o.key) { Some(Plain(b)) -> b, _ -> b"" };
         let size = body.len();
@@ -1436,7 +1436,7 @@ pub fn mem_write_chunk(tree: MemFs, file: Int, body: Bytes) -> WriteResult / {ab
     None -> { fs: tree, ok: false },
   }
 
-fn holds_sealed(tree: MemFs, key: String) -> Bool =
+fn holds_secret(tree: MemFs, key: String) -> Bool =
   match tree.files.get(key) { Some(Sealed(_)) -> true, _ -> false }
 
 /// What `fs.close` does to the tree.
@@ -1450,7 +1450,7 @@ pub fn mem_close(tree: MemFs, file: Int) -> WriteResult =
 pub fn mem_short_reads(tree: MemFs, n: Int) -> MemFs = { ..tree, short: n }
 
 /// What `go` returned over the fake, and the tree it left.
-pub type Over<a> = { value: a, tree: MemFs }
+pub type MemResult<a> = { value: a, tree: MemFs }
 
 /// Runs `go` over `tree` as the label its effects name, with every operation handled by the fake.
 /// This is what a test passes to code that may perform any operation of a root. `canonical`
@@ -1458,7 +1458,7 @@ pub type Over<a> = { value: a, tree: MemFs }
 pub fn on_mem<a, [l] | e>(
   tree: MemFs,
   go: () -> a / {fs.read[l], fs.write[l] | e},
-) -> Over<a> / {abort.raise | e bounded} = {
+) -> MemResult<a> / {abort.raise | e bounded} = {
   let ran = run_on_mem[l](tree, -1, go);
   { value: ran.value, tree: ran.tree }
 }
@@ -1483,7 +1483,7 @@ pub fn on_mem_failing<a, [l] | e>(
   tree: MemFs,
   writes: Int,
   go: () -> a / {fs.read[l], fs.write[l] | e},
-) -> Over<a> / {abort.raise | e bounded} = {
+) -> MemResult<a> / {abort.raise | e bounded} = {
   let ran = run_on_mem[l](tree, max(writes, 0), go);
   { value: ran.value, tree: ran.tree }
 }
@@ -1905,7 +1905,7 @@ pub fn copy_tree<a, [l] | e>(
     if c.done.stopped { c } else {
       let p = placed[l, l](found, how, c, entry);
       if p.skipped { p.copy } else {
-        told(
+        apply_step(
           if p.bytes { finish_file_copy[l](p.copy, p.to, entry.stat, fs.copy[l](p.from, p.to)) }
           else { p.copy },
           p.to,
@@ -1933,7 +1933,7 @@ pub fn copy_tree_across<a, [s], [d] | e>(
     if c.done.stopped { c } else {
       let p = placed[s, d](found, how, c, entry);
       if p.skipped { p.copy } else {
-        told(
+        apply_step(
           if p.bytes {
             finish_file_copy[d](
               p.copy,
@@ -2126,7 +2126,7 @@ fn finish_file_copy<a, [d]>(
   else { { ..c, firsts: c.firsts.insert(found.id, { device: found.device, path: destination }) } }
 
 /// The copy after its fold is called with the entry at `destination`.
-fn told<a | e>(
+fn apply_step<a | e>(
   c: CopyState<a>,
   destination: String,
   found: Stat,
@@ -2205,11 +2205,11 @@ pub fn watch<[l]>(path: String, deep: Bool, limit: Int) -> Watch / {fs.scan[l]} 
 
 /// Looks once, without waiting: what changed since the watch's last look.
 pub fn poll<[l]>(w: Watch) -> PollResult / {fs.scan[l], abort.raise} =
-  looked(w, fs.scan[l](w.path, w.deep))
+  apply_scan(w, fs.scan[l](w.path, w.deep))
 
 /// What a look that saw `now` reports to a watch. A directory that cannot be read, or can be read
 /// again, is a `Rescan`, never an empty directory.
-pub fn looked(w: Watch, now: Option<List<ScanEntry>>) -> PollResult / {abort.raise} = {
+pub fn apply_scan(w: Watch, now: Option<List<ScanEntry>>) -> PollResult / {abort.raise} = {
   let next = { ..w, seen: now };
   match now {
     None -> { watch: next, changes: if w.seen == None { [] } else { [Rescan] } },
@@ -2237,12 +2237,12 @@ pub fn await_changes<[l]>(
     max(looks, 0) + 1,
     |s: { left: Int, settling: Bool, last: Option<List<ScanEntry>> }|
       if s.left <= 0 {
-        Stop(if s.settling { looked(w, s.last) } else { { watch: w, changes: [] } })
+        Stop(if s.settling { apply_scan(w, s.last) } else { { watch: w, changes: [] } })
       } else {
         time.sleep_ms(max(as_millis(every), 1));
         let now = fs.scan[l](w.path, w.deep);
         if now != s.last { Continue({ left: s.left - 1, settling: true, last: now }) }
-        else if s.settling && now != w.seen { Stop(looked(w, now)) }
+        else if s.settling && now != w.seen { Stop(apply_scan(w, now)) }
         else { Continue({ left: s.left - 1, settling: false, last: now }) }
       },
   )
@@ -2762,16 +2762,16 @@ test "a secret written to the fake stays sealed and readable only by its owner, 
     mem_size(ran.tree, path) == Some(size) && mem_mode(ran.tree, path) == Some(owner_only());
   assert(held("keys/new", 13) && held("keys/old", 4));
   assert(
-    mem_sealed(ran.tree, "keys/new")
+    mem_framed_secret(ran.tree, "keys/new")
       == Some({ before: b"key ", secret: key, encoding: "hex", after: b"\n" }),
   );
-  assert(mem_sealed(tree, "keys/old") == None);
+  assert(mem_framed_secret(tree, "keys/old") == None);
   // Bytes after a sealed file's end stay sealed with it, and a plain write unseals it.
   let grown = mem_append(ran.tree, "keys/new", b"!").fs;
   assert(mem_read_secret(grown, "keys/new", b"key ", "hex", b"\n!") == Some(key));
   assert_eq(mem_size(grown, "keys/new"), Some(14));
   let plain = mem_write(grown, "keys/new", b"open").fs;
-  assert(mem_sealed(plain, "keys/new") == None);
+  assert(mem_framed_secret(plain, "keys/new") == None);
   assert_eq(mem_read(plain, "keys/new"), Some(b"open"))
 }
 
@@ -3104,7 +3104,7 @@ test "a handled temp_dir, copy, walk and remove_tree behave as the fake's" {
   }
 }
 
-fn rearranged() -> Option<String> / {fs.read[disk], fs.write[disk]} = {
+fn link_to_copy() -> Option<String> / {fs.read[disk], fs.write[disk]} = {
   let dir = fs.temp_dir[disk]("", "t-")?;
   if fs.copy[disk]("a.txt", dir ++ "/b.txt") && fs.symlink[disk](dir ++ "/l", "b.txt") {
     fs.read_link[disk](dir ++ "/l")
@@ -3112,7 +3112,7 @@ fn rearranged() -> Option<String> / {fs.read[disk], fs.write[disk]} = {
 }
 
 test "a body that may perform any operation of its root runs entirely over the fake" {
-  let over = on_mem(mem_of([{ path: "a.txt", body: b"x" }]), || rearranged());
+  let over = on_mem(mem_of([{ path: "a.txt", body: b"x" }]), || link_to_copy());
   assert_eq(over.value, Some("b.txt"));
   assert_eq(mem_read(over.tree, "t-2/b.txt"), Some(b"x"))
 }
@@ -3402,7 +3402,7 @@ fn replaced(
   writes: Int,
   body: Bytes,
   durability: Durability,
-) -> Over<Result<Unit, (String, FileError)>> / {abort.raise} =
+) -> MemResult<Result<Unit, (String, FileError)>> / {abort.raise} =
   on_mem_failing[d](tree, writes, ||
     counted(|| {
       let wrote: Result<Unit, (String, FileError)> = try[files.fail] {
@@ -3452,7 +3452,7 @@ test "an atomic write replaces a link and another name of a file, and writes thr
 }
 
 /// An atomic write of `path` over a disk that accepts nothing written through a descriptor.
-fn unwritable<[l]>(
+fn atomic_write_fails<[l]>(
   path: String,
 ) -> Unit / {fs.open[l], fs.space[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.fail, entropy.next, abort.raise} =
   handle { write_atomic[l](path, b"new", Durable) } with { fs.write_chunk[l](file, body) -> false }
@@ -3477,7 +3477,9 @@ test "an atomic write that cannot be made reports where it stopped and why, and 
   let full = |room: Int|
     on_mem[d](mem_with_space(base, { ..roomy, available: room }), ||
       counted(|| {
-        let wrote: Result<Unit, (String, FileError)> = try[files.fail] { unwritable[d]("d/cfg") };
+        let wrote: Result<Unit, (String, FileError)> = try[files.fail] {
+          atomic_write_fails[d]("d/cfg")
+        };
         match wrote { Ok(_) -> None, Err((_, reason)) -> Some(reason) }
       }));
   assert_eq(full(2).value, Some(NoSpace));
@@ -3552,7 +3554,7 @@ fn copy_tried(
   from: String,
   to: String,
   how: CopyOptions,
-) -> Over<Result<CopyResult<Int>, (String, FileError)>> / {abort.raise} =
+) -> MemResult<Result<CopyResult<Int>, (String, FileError)>> / {abort.raise} =
   on_mem[d](tree, || {
     let copied: Result<CopyResult<Int>, (String, FileError)> = try[files.fail] {
       copy_tree[d](from, to, how, 0, counting)
@@ -3617,8 +3619,15 @@ test "a copy checks its bounds before it copies anything, stops where its fold s
     Err(("absent", NotFound)),
   );
   let stopped = on_mem[d](sample_tree(), ||
-    copy_tree[d]("src", "out", within(100, 1000), [], |seen: List<String>, told: Progress|
-      if seen.len() < 1 { Continue(seen.push(told.path)) } else { Stop(seen.push(told.path)) }));
+    copy_tree[d](
+      "src",
+      "out",
+      within(100, 1000),
+      [],
+      |seen: List<String>, apply_step: Progress|
+        if seen.len() < 1 { Continue(seen.push(apply_step.path)) }
+        else { Stop(seen.push(apply_step.path)) },
+    ));
   assert_eq(stopped.value.value, ["out", "out/a.txt"]);
   assert_eq(stopped.value.stopped, true);
   assert_eq(listed_names(mem_list(stopped.tree, "out")), Some(["a.txt"]));

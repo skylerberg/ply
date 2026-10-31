@@ -226,8 +226,8 @@ pub fn int_of_integer(content: Bytes) -> Option<Int> =
 /// The content of the `INTEGER` `n`, whatever its size.
 pub fn integer_of_big_int(n: BigInt) -> Bytes / {abort.raise} =
   if bigint::is_negative(n) {
-    signed(bigint::to_bytes(bigint::sub(bigint::neg(n), bigint::one()))).xor_byte(0xFF)
-  } else { signed(bigint::to_bytes(n)) }
+    integer_content(bigint::to_bytes(bigint::sub(bigint::neg(n), bigint::one()))).xor_byte(0xFF)
+  } else { integer_content(bigint::to_bytes(n)) }
 
 /// The number an `INTEGER`'s content encodes, or zero for no octets.
 pub fn big_int_of_integer(content: Bytes) -> BigInt / {abort.raise} =
@@ -253,7 +253,7 @@ fn first_significant(content: Bytes, i: Int) -> Int / {abort.raise} =
 
 /// A magnitude with a zero octet prepended when its first octet would read as a sign, or when it
 /// has no octets.
-fn signed(magnitude: Bytes) -> Bytes =
+fn integer_content(magnitude: Bytes) -> Bytes =
   if magnitude.len() == 0 || magnitude.at(0) >= 0x80 { b"\x00".concat(magnitude) }
   else { magnitude }
 
@@ -350,7 +350,7 @@ pub fn big_int(n: BigInt) -> Bytes / {abort.raise} = element(0x02, integer_of_bi
 /// The `INTEGER` whose magnitude is `magnitude`, most significant octet first. It is never
 /// negative, whatever its first bit is. Use it for a modulus or half of a signature.
 pub fn unsigned(magnitude: Bytes) -> Bytes / {abort.raise} =
-  element(0x02, signed(magnitude.strip_leading_zeros()))
+  element(0x02, integer_content(magnitude.strip_leading_zeros()))
 
 /// The `ENUMERATED` `n`.
 pub fn enumerated(n: Int) -> Bytes / {abort.raise} = element(0x0A, integer_of_int(n))
@@ -475,16 +475,16 @@ type Header = { tag: Tag, constructed: Bool, from: Int, to: Int }
 
 /// A base-128 number in a tag or an arc: its value and where it ends, or that the input ended
 /// inside it, that it has a leading `80`, or that it is wider than 63 bits.
-type Septets = | Number(Int, Int) | Cut | Padded | Wide
+type Septets = | Number(Int, Int) | Ended | Padded | Overflow
 
 fn septets_at(data: Bytes, at: Int, end: Int) -> Septets / {abort.raise} =
-  if at >= end { Cut }
+  if at >= end { Ended }
   else if data.at(at) == 0x80 { Padded }
   else { septets_from(data, at, end, 0, 9) }
 
 fn septets_from(data: Bytes, at: Int, end: Int, value: Int, left: Int) -> Septets / {abort.raise} =
-  if at >= end { Cut }
-  else if left <= 0 { Wide } else {
+  if at >= end { Ended }
+  else if left <= 0 { Overflow } else {
     let octet = data.at(at);
     let more = value << 7 | octet & 0x7F;
     if octet < 0x80 { Number(more, at + 1) }
@@ -499,9 +499,9 @@ fn header_at(data: Bytes, at: Int, end: Int) -> Header / {asn1.fail, abort.raise
       match septets_at(data, at + 1, end) {
         Number(number, next) -> if number < 31 { fail(at, OverlongTag) }
         else { { number: number, next: next } },
-        Cut -> fail(end, Truncated),
+        Ended -> fail(end, Truncated),
         Padded -> fail(at, OverlongTag),
-        Wide -> fail(at, TooWide),
+        Overflow -> fail(at, TooWide),
       }
     };
     if first < 0x40 && id.number == 0 { fail(at, EndOfContents) } else {
@@ -599,9 +599,9 @@ fn arcs_of(
   if i >= content.len() || left <= 0 { acc } else {
     match septets_at(content, i, content.len()) {
       Number(arc, next) -> arcs_of(content, next, at, acc.push(arc), left - 1),
-      Cut -> fail(at + i, BadOid),
+      Ended -> fail(at + i, BadOid),
       Padded -> fail(at + i, OverlongArc),
-      Wide -> fail(at + i, TooWide),
+      Overflow -> fail(at + i, TooWide),
     }
   }
 
@@ -1164,7 +1164,7 @@ fn all_times_valid(v: Value) -> Bool =
     _ -> true,
   }
 
-fn writable(v: Value) -> Bool / {abort.raise} =
+fn can_encode(v: Value) -> Bool / {abort.raise} =
   all_times_valid(v) && (match encode(v) { Ok(_) -> true, Err(_) -> false })
 
 /// Whether `data` is rejected, or read as a value that writes back as exactly `data`.
@@ -1245,12 +1245,12 @@ fn classes() -> gen::Gen<Class> = gen::elements([Universal, Application, Context
 
 test "a value that writes reads back as itself" {
   gen::check(values(), |v: Value|
-    if writable(v) { decode(write(v), height(v)) == Ok(v) } else { true })
+    if can_encode(v) { decode(write(v), height(v)) == Ok(v) } else { true })
 }
 
 test "a written value with one octet changed is rejected or is another value's encoding" {
   gen::check3(values(), gen::any_int(), gen::any_int(), |v: Value, at: Int, octet: Int|
-    if writable(v) { rewritten(altered(write(v), at, octet)) } else { true })
+    if can_encode(v) { rewritten(altered(write(v), at, octet)) } else { true })
 }
 
 law "a Bool reads back from the BOOLEAN written for it" =
@@ -2051,7 +2051,7 @@ test "bits are counted from the first octet's top, and named bits end at the las
 
 type Entry = { id: Oid, critical: Bool, value: Bytes }
 
-type Card = {
+type Certificate = {
   version: Int,
   serial: Bytes,
   algorithm: Bytes,
@@ -2070,7 +2070,7 @@ fn entry(r: Reader) -> ReadResult<Entry> / {asn1.fail, abort.raise} =
     { value: { id: id.value, critical: critical.value, value: value.value }, rest: value.rest }
   })
 
-fn card(r: Reader) -> ReadResult<Card> / {asn1.fail, abort.raise} =
+fn card(r: Reader) -> ReadResult<Certificate> / {asn1.fail, abort.raise} =
   within(read_sequence(r), |fields: Reader| {
     let version = read_default(fields, context(0), 0, |x: Reader|
       read_explicit(x, context(0), read_int));

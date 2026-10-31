@@ -30,10 +30,11 @@ import compiler.store.hash.forms (FirstPass, build_index, listed_refs, member_ha
                                   hash_forms, cached_nodes, cached_hashes_of, is_declaration,
                                   definition_key, hash_layout, assemble, walked, DeclarationNamed,
                                   FunctionNamed, ItemKeyed, ReachableNames, reach, closure_of,
-                                  reached_functions, listing_reach, references_in, find_referrers,
-                                  keys_reaching, ClosureEntry, build_closure, by_name, of_key,
-                                  module_record, module_record_bin, record_digest, recorded_graph,
-                                  recorded_reach, recorded_hashes, ReachableHashes)
+                                  reached_functions, reached_by_tests, references_in,
+                                  find_referrers, keys_reaching, ClosureEntry, build_closure,
+                                  by_name, of_key, module_record, module_record_bin, record_digest,
+                                  recorded_graph, recorded_reachable_hashes, recorded_hashes,
+                                  ReachableHashes)
 import compiler.store.hash.printer (envelope, picks_of, Printed, Unprintable, print_bodies)
 
 pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} =
@@ -293,7 +294,10 @@ pub fn public_contracts(
   })
 }
 
-pub fn unused(index: Index, fixed: List<CachedNode> = []) -> List<Diagnostic> / {abort.raise} =
+pub fn unused_diagnostics(
+  index: Index,
+  fixed: List<CachedNode> = [],
+) -> List<Diagnostic> / {abort.raise} =
   unused_over(
     index,
     node_edges_of(index, first_pass(index)),
@@ -329,7 +333,7 @@ fn unused_over(
   let seen = walked(edges, roots).seen;
   range(0, n).fold([], |acc: List<Diagnostic>, v: Int|
     if seen.get(v) || held.contains(v) { acc }
-    else { acc.push(never_used(index, index.nodes.get(v))) })
+    else { acc.push(unused_diagnostic(index, index.nodes.get(v))) })
 }
 
 pub type UseNode = {
@@ -363,7 +367,7 @@ fn use_nodes(
         span: node_span(node),
         root: is_root(index, node),
         leads: edges.get(v).map(|w: Int| keys.get(w)),
-        unused: Some(never_used(index, node)),
+        unused: Some(unused_diagnostic(index, node)),
       })
     }).concat(
     item_uses(index, index.tests, tests, index.laws, laws),
@@ -502,7 +506,7 @@ fn is_root(index: Index, node: Node) -> Bool / {abort.raise} =
       NodeEffect(d) -> is_pub(d.visibility),
     })
 
-fn never_used(index: Index, node: Node) -> Diagnostic / {abort.raise} = {
+fn unused_diagnostic(index: Index, node: Node) -> Diagnostic / {abort.raise} = {
   let named: { kind: Bytes, span: Span } = match node.body {
     NodeFn(d) ->
       {
@@ -686,17 +690,21 @@ test "a program read with every node, test and law fixed as a fresh run fixed it
 
 test "a type named only as the owner of a function something calls is used, and one of an uncalled function is not" {
   let src = b"type Tally = | Tally\nfn Tally::made() -> Int = 1\nfn Tally::idle() -> Int = 2\ntype Lone = | Lone\nfn Lone::made() -> Int = 3\npub fn f() -> Int = Tally::made()\n";
-  assert_eq(unused(index_sources([{ name: b"m", src: src }])).map(|d: Diagnostic| d.message), [
-    b"fn `m.Tally::idle` is never used",
-    b"type `m.Lone` is never used",
-    b"fn `m.Lone::made` is never used",
-  ])
+  assert_eq(
+    unused_diagnostics(index_sources([{ name: b"m", src: src }])).map(|d: Diagnostic| d.message),
+    [
+      b"fn `m.Tally::idle` is never used",
+      b"type `m.Lone` is never used",
+      b"fn `m.Lone::made` is never used",
+    ],
+  )
 }
 
 test "a type named only as the owner of an extern function something calls is used" {
   let src = b"extern type Spelt\nextern fn Spelt::of(b: Bytes) -> String\npub fn f(b: Bytes) -> String = Spelt::of(b)\n";
   assert_eq(
-    unused(index_sources([{ name: b"std.spelling", src: src }])).map(|d: Diagnostic| d.message),
+    unused_diagnostics(index_sources([{ name: b"std.spelling", src: src }])).map(|d: Diagnostic|
+      d.message),
     [],
   )
 }
@@ -943,7 +951,7 @@ test "a listing reaches what its table and label do, and nothing only a case run
     { name: b"std.show", src: b"pub fn display(x: Int) -> Int = x\n" },
   ]);
   let h = hash_index(index);
-  let listed = listing_reach(h, [b"m.case {name_of(n)}"]).keys();
+  let listed = reached_by_tests(h, [b"m.case {name_of(n)}"]).keys();
   assert(listed.contains(b"m.table") && listed.contains(b"m.build"), Some("the table is listed"));
   assert(!listed.contains(b"m.heavy") && !listed.contains(b"m.deeper"), Some("no case runs"));
   let run = reached_functions(h, [ItemKeyed(b"m.case {name_of(n)}")]).keys();
@@ -963,7 +971,7 @@ test "a unit offering a test holds the scheduler's functions wherever the load h
   let held = |reached: Map<Bytes, Bool>| scheduled.filter(|n: Bytes| reached.contains(n));
   let h = hash_index(index_sources([program, scheduler]));
   assert_eq(held(reached_functions(h, [ItemKeyed(b"m.x")])), scheduled);
-  assert_eq(held(listing_reach(h, [b"m.x"])), scheduled);
+  assert_eq(held(reached_by_tests(h, [b"m.x"])), scheduled);
   assert(reached_functions(h, [ItemKeyed(b"m.x")]).contains(b"m.three"), None);
   assert_eq(reached_functions(hash_index(index_sources([program])), [ItemKeyed(b"m.x")]).keys(), [
     b"m.three",
@@ -990,7 +998,12 @@ test "a function is reached through itself, never through a type or an effect of
   assert_eq(reached_functions(h, [DeclarationNamed(b"m.Box")]).keys(), [])
 }
 
-fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput / {abort.raise} =
+fn hash_parameterized_test(
+  label: Bytes,
+  ty: Bytes,
+  table: Bytes,
+  body: Bytes,
+) -> HashOutput / {abort.raise} =
   hash_index(
     index_sources([
       { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
@@ -1016,12 +1029,24 @@ fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput 
   )
 
 test "a test over cases hashes as what one case runs: its table and its label move nothing, its body and its case's type do" {
-  let base = over_cases(b"n {n}", b"Int", b"few()", b"assert(held(n))");
+  let base = hash_parameterized_test(b"n {n}", b"Int", b"few()", b"assert(held(n))");
   let hashed = |h: HashOutput| h.tests.values().get(0);
-  assert_eq(hashed(over_cases(b"n {n}", b"Int", b"more()", b"assert(held(n))")), hashed(base));
-  assert_eq(hashed(over_cases(b"another", b"Int", b"few()", b"assert(held(n))")), hashed(base));
-  assert(hashed(over_cases(b"n {n}", b"Int", b"few()", b"assert(!held(n))")) != hashed(base));
-  assert(hashed(over_cases(b"n {n}", b"Bool", b"few()", b"assert(held(n))")) != hashed(base));
+  assert_eq(
+    hashed(hash_parameterized_test(b"n {n}", b"Int", b"more()", b"assert(held(n))")),
+    hashed(base),
+  );
+  assert_eq(
+    hashed(hash_parameterized_test(b"another", b"Int", b"few()", b"assert(held(n))")),
+    hashed(base),
+  );
+  assert(
+    hashed(hash_parameterized_test(b"n {n}", b"Int", b"few()", b"assert(!held(n))"))
+      != hashed(base),
+  );
+  assert(
+    hashed(hash_parameterized_test(b"n {n}", b"Bool", b"few()", b"assert(held(n))"))
+      != hashed(base),
+  );
   let reached = closure_of(base, [b"m.n {n}"]);
   assert(reached.contains(b"m.few") && reached.contains(b"m.held"));
   assert(reached.contains(b"std.cases.listed") && reached.contains(b"std.cases.chosen"));
@@ -1112,7 +1137,7 @@ fn all_public(
 ) -> List<{ name: Bytes, hash: Bytes, public: Bool }> =
   xs.map(|x: { name: Bytes, hash: Bytes }| { name: x.name, hash: x.hash, public: true })
 
-fn printed_of(
+fn printed_modules(
   out: HashOutput,
   shipped: List<Bytes>,
 ) -> List<{ module: Bytes, text: Bytes }> / {abort.raise} =
@@ -1137,7 +1162,7 @@ test "a stated measure moves a definition's hash" {
 
 fn dumped_law(dump: String, key: Bytes) -> Bytes / {abort.raise} = dumped_as(dump, b"L;", key)
 
-fn dumped_declaration(dump: String, name: Bytes) -> Bytes / {abort.raise} =
+fn declaration_in_dump(dump: String, name: Bytes) -> Bytes / {abort.raise} =
   dumped_as(dump, b"Y;", name)
 
 fn dumped_as(dump: String, kind: Bytes, name: Bytes) -> Bytes / {abort.raise} = {
@@ -1152,7 +1177,7 @@ fn dumped_as(dump: String, kind: Bytes, name: Bytes) -> Bytes / {abort.raise} = 
 test "a type's invariant is part of what the type is: the function it names moves the type's hash" {
   let balance = b"pub opaque type B = | B(Int)\npub fn open() -> B = B(0)\n";
   let stated = |valid: Bytes|
-    dumped_declaration(
+    declaration_in_dump(
       hash_dump([
         {
           name: b"m",
@@ -1166,7 +1191,7 @@ test "a type's invariant is part of what the type is: the function it names move
       ]),
       b"m.B",
     );
-  let plain = dumped_declaration(hash_dump([{ name: b"m", src: balance }]), b"m.B");
+  let plain = declaration_in_dump(hash_dump([{ name: b"m", src: balance }]), b"m.B");
   assert(stated(b"true") != stated(b"false"));
   assert(stated(b"true") != plain)
 }
@@ -1297,7 +1322,7 @@ test "printed bodies hash back to what they were stored under, under their own n
       },
     ]),
   );
-  let ms = printed_of(out, []);
+  let ms = printed_modules(out, []);
   assert_eq(ms.map(|m: { module: Bytes, text: Bytes }| m.module), [
     b"app",
     b"left.util",
@@ -1308,7 +1333,7 @@ test "printed bodies hash back to what they were stored under, under their own n
     index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
-  let shipped = printed_of(out, [b"left.util"]);
+  let shipped = printed_modules(out, [b"left.util"]);
   assert_eq(shipped.map(|m: { module: Bytes, text: Bytes }| m.module), [b"app", b"right.util"])
 }
 
@@ -1348,7 +1373,7 @@ test "a body that calls on a value prints back importing each module whose funct
     bodies: hashed.bodies.map(|b: { name: Bytes, body: Bytes }|
       { ..b, body: checked_body(b.body, Map::new()) }),
   };
-  let ms = printed_of(out, []);
+  let ms = printed_modules(out, []);
   assert(ms.get(0).text.contains(b"import low\n"));
   let again = hash_index(
     index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
@@ -1441,7 +1466,7 @@ test "a tagged literal prints back under a binder whose module names its parser 
       { name: b"app", src: b"import hex as h\npub fn two() -> Int = h\"a\\\"b\" + h\"\"" },
     ]),
   );
-  let ms = printed_of(out, []);
+  let ms = printed_modules(out, []);
   assert(ms.get(1).text.contains(b"hex\"a\\\"b\" + hex\"\""));
   let again = hash_index(
     index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
@@ -1476,7 +1501,7 @@ test "a tagged literal with holes prints under a binder that names `compile` and
       },
     ]),
   );
-  let ms = printed_of(out, []);
+  let ms = printed_modules(out, []);
   assert(
     ms.fold(false, |found: Bool, m: { module: Bytes, text: Bytes }|
       found || m.text.contains(b"sh\"a")),
@@ -2123,23 +2148,23 @@ test "a walk of a program's module records reaches what each test reached, by na
     };
   let plain = b"app.plain";
   let ranged = b"app.case {n}";
-  assert_eq(recorded_reach(g, plain, false), Some(hashed(reach(h, [ItemKeyed(plain)]))));
+  assert_eq(recorded_reachable_hashes(g, plain, false), Some(hashed(reach(h, [ItemKeyed(plain)]))));
   let runs = {
     ..h,
     refs: { ..h.refs, items: h.refs.items.insert(ranged, of_key(h.refs.cases, ranged)) },
   };
-  let case = recorded_reach(g, ranged, true);
+  let case = recorded_reachable_hashes(g, ranged, true);
   assert_eq(case, Some(hashed(reach(runs, [ItemKeyed(ranged)]))));
   match case {
     Some(c) -> assert(c.functions.contains(b"low.odd") && !c.functions.contains(b"app.table")),
     None -> panic("the case's test is recorded"),
   };
-  assert_eq(recorded_reach(g, b"app.gone", false), None);
+  assert_eq(recorded_reachable_hashes(g, b"app.gone", false), None);
   let alone = |r: Option<ReachableHashes>|
     match r { Some(x) -> x.functions.values().concat(x.declarations.values()), None -> [] };
   assert_eq(
     recorded_hashes(g, [{ key: plain, case: false }, { key: ranged, case: true }]).sort(),
-    alone(recorded_reach(g, plain, false)).concat(alone(case)).fold(
+    alone(recorded_reachable_hashes(g, plain, false)).concat(alone(case)).fold(
       Map::new(),
       |m: Map<Bytes, Bool>, h: Bytes| m.insert(h, true),
     ).keys(

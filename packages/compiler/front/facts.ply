@@ -31,7 +31,7 @@ import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
 import compiler.check.typed (TypedBody)
 import compiler.check.infer (CheckOutput, types_joined, measured_definitions, EmitFacts,
-                             emit_facts_bin, facts_moved, facts_kept)
+                             emit_facts_bin, remap_fact_modules, facts_filtered)
 import compiler.check.infer.checker (Location, DefinitionInfo, TestInfo, LawInfo, EffectInfo,
                                      OpInfo, ConstructorInfo, CachedFacts, CheckedBody,
                                      WitnessOrder, MemberSite, InstanceInfo, NumericInfo,
@@ -53,8 +53,8 @@ import compiler.expand.declarations (declaration_of)
 import std.derive.codec
 import compiler.expand.embed (ModuleEmbed, ItemEmbeds, item_embeds_bin, requests_by_item,
                               module_embed_bin)
-import compiler.syntax.items (is_std, is_compiler, is_shipped, is_written)
-import compiler.syntax.node_ids (numbered_made)
+import compiler.syntax.items (is_std, is_compiler, is_shipped, is_explicit_import)
+import compiler.syntax.node_ids (numbered_missing)
 import std.bytes (ascii_of_int)
 import compiler.front.rows (span_at, OutlinedEffect, OutlinedFunction, OutlinedLaw, OutlinedTest,
                             OutlinedType, OutlineItem, Outline, outline_bin, EffectSetRow,
@@ -118,7 +118,7 @@ fn outline_of(
         _ -> acc,
       }),
     declared: module_items(parsed),
-    imports: imported_names(parsed.module.imports.filter(is_written)),
+    imports: imported_names(parsed.module.imports.filter(is_explicit_import)),
     schemas: schemas_declared(parsed),
     sets: sets,
     cuts: cuts,
@@ -131,7 +131,7 @@ fn outline_of(
 
 pub fn read_outline(parsed: ParsedModule) -> Outline / {abort.raise} =
   outline_of(
-    { ..parsed, module: { ..parsed.module, items: parsed.module.items.map(numbered_made) } },
+    { ..parsed, module: { ..parsed.module, items: parsed.module.items.map(numbered_missing) } },
     [],
     cuts_of(parsed),
     [parsed],
@@ -350,7 +350,7 @@ pub fn guard_bounds(
 
 pub type Bounded = { name: Bytes, low: Int, high: Int }
 
-type End = { name: Bytes, lower: Bool, at: Int }
+type Limit = { name: Bytes, lower: Bool, at: Int }
 
 fn farthest_end() -> Int = 1000000000000
 
@@ -372,7 +372,7 @@ fn bare_name(e: Expression) -> Option<Bytes> =
     _ -> None,
   }
 
-fn end_of(acc: List<End>, name: Bytes, op: Bytes, k: Int) -> List<End> =
+fn end_of(acc: List<Limit>, name: Bytes, op: Bytes, k: Int) -> List<Limit> =
   if k > farthest_end() || k < 0 - farthest_end() { acc }
   else if op == b"gt" { acc.push({ name: name, lower: true, at: k + 1 }) }
   else if op == b"ge" { acc.push({ name: name, lower: true, at: k }) }
@@ -388,9 +388,9 @@ fn flipped_comparison(op: Bytes) -> Bytes =
   else if op == b"le" { b"ge" }
   else { op }
 
-fn ends_in(acc: List<End>, guard: Expression) -> List<End> =
+fn add_limits(acc: List<Limit>, guard: Expression) -> List<Limit> =
   match guard {
-    BinaryExpression(v) -> if v.op == b"and" { ends_in(ends_in(acc, v.lhs), v.rhs) } else {
+    BinaryExpression(v) -> if v.op == b"and" { add_limits(add_limits(acc, v.lhs), v.rhs) } else {
       match bare_name(v.lhs) {
         Some(name) -> match int_of(v.rhs) { Some(k) -> end_of(acc, name, v.op, k), None -> acc },
         None -> match bare_name(v.rhs) {
@@ -406,17 +406,17 @@ fn ends_in(acc: List<End>, guard: Expression) -> List<End> =
   }
 
 pub fn bounds_of(guards: List<Expression>) -> List<Bounded> = {
-  let ends = guards.fold([], ends_in);
-  ends.fold([], |acc: List<Bounded>, e: End|
+  let ends = guards.fold([], add_limits);
+  ends.fold([], |acc: List<Bounded>, e: Limit|
     if acc.fold(false, |seen: Bool, b: Bounded| seen || b.name == e.name) { acc } else {
-      let own = ends.filter(|x: End| x.name == e.name);
-      let lows = own.filter(|x: End| x.lower);
-      let highs = own.filter(|x: End| !x.lower);
+      let own = ends.filter(|x: Limit| x.name == e.name);
+      let lows = own.filter(|x: Limit| x.lower);
+      let highs = own.filter(|x: Limit| !x.lower);
       if lows.len() == 0 || highs.len() == 0 { acc } else {
         acc.push({
           name: e.name,
-          low: lows.fold(0 - farthest_end() - 1, |m: Int, x: End| max(m, x.at)),
-          high: highs.fold(farthest_end() + 1, |m: Int, x: End| min(m, x.at)),
+          low: lows.fold(0 - farthest_end() - 1, |m: Int, x: Limit| max(m, x.at)),
+          high: highs.fold(farthest_end() + 1, |m: Int, x: Limit| min(m, x.at)),
         })
       }
     })
@@ -551,7 +551,7 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
     constructors: t.constructors.map(|c: ConstructorInfo| { ..c, at: at(c.at) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: at(x.at) }),
     numeric: t.numeric.map(|x: NumericInfo| { ..x, at: at(x.at) }),
-    facts: facts_moved(t.facts, |module: Int| moved_module(module, from, to)),
+    facts: remap_fact_modules(t.facts, |module: Int| moved_module(module, from, to)),
   }
 }
 
@@ -599,7 +599,7 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
         instances: c.instances.filter(|x: InstanceInfo| mine(x.at.module)),
         numeric: c.numeric_types.filter(|x: NumericInfo| mine(x.at.module)),
         facts: {
-          ..facts_kept(c.facts, |module: Int, owner: Bytes| mine(module)),
+          ..facts_filtered(c.facts, |module: Int, owner: Bytes| mine(module)),
           pure: c.facts.pure.filter(|n: Bytes| is_declared_in(name, n)),
           orders: c.facts.orders.filter(|x: WitnessOrder| mine(x.module)),
         },
@@ -707,7 +707,7 @@ fn cut_tables(
     tests: [],
     laws: [],
     facts: {
-      ..facts_kept(t.facts, |module: Int, owner: Bytes| reached.contains(owner)),
+      ..facts_filtered(t.facts, |module: Int, owner: Bytes| reached.contains(owner)),
       pure: t.facts.pure.filter(|n: Bytes| reached.contains(n)),
       orders: t.facts.orders.filter(|x: WitnessOrder| reached.contains(qualify(o.name, x.name))),
     },
@@ -763,7 +763,7 @@ fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} 
     ..t,
     tests: [],
     laws: [],
-    facts: facts_kept(t.facts, |module: Int, owner: Bytes| of_definitions(owner)),
+    facts: facts_filtered(t.facts, |module: Int, owner: Bytes| of_definitions(owner)),
     cached: t.cached.filter(|k: CachedFacts| of_definitions(k.name)),
   }
 }
@@ -773,12 +773,12 @@ fn views_read(
   hashes: HashOutput,
   read: Map<Bytes, Bool>,
   texts: Map<Bytes, Bytes>,
-) -> List<ShippedView> / {abort.raise} = {
+) -> List<ShippedModuleSummary> / {abort.raise} = {
   let definitions = by_name(hashes.definitions);
   let declarations = by_name(hashes.declarations);
   let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
     match table.get(name) { Some(hash) -> hash, None -> b"" };
-  shapes.fold([], |acc: List<ShippedView>, s: ModuleShape| {
+  shapes.fold([], |acc: List<ShippedModuleSummary>, s: ModuleShape| {
     let o = s.outline;
     match texts.get(o.name) {
       None -> acc,
@@ -874,7 +874,7 @@ pub fn framed_program(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-) -> { frame: Frame, reads: TableReads, views: List<ShippedView> } / {abort.raise} = {
+) -> { frame: Frame, reads: TableReads, views: List<ShippedModuleSummary> } / {abort.raise} = {
   let untested = |s: ModuleShape| !tested && !shipped.contains(s.outline.name);
   let read = shapes.map(|s: ModuleShape| if untested(s) { untested_shape(s) } else { s });
   let cutting = reached
@@ -954,7 +954,7 @@ pub fn assembled_program(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-) -> { view: CheckedProgram, views: List<ShippedView> } / {abort.raise} = {
+) -> { view: CheckedProgram, views: List<ShippedModuleSummary> } / {abort.raise} = {
   let f = framed_program(
     facts.map(|x: ModuleFacts| x.shape),
     fixing,
@@ -992,7 +992,7 @@ pub fn pulled_next(
 pub type AssembledLoad = {
   frame: Frame,
   reads: TableReads,
-  views: List<ShippedView>,
+  views: List<ShippedModuleSummary>,
   pulled: List<Bytes>,
 }
 
@@ -1287,7 +1287,7 @@ fn derived_rows(modules: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {ab
         _ -> rows,
       }))
 
-fn row_read_of(read: codec::RowRead) -> RowRead =
+fn row_read_of(read: codec::ColumnRead) -> RowRead =
   match read {
     codec::Scalar(reader) -> ScalarRead(Bytes::of_string(reader)),
     codec::Optional(inner) -> OptionalRead(row_read_of(inner)),
@@ -1478,7 +1478,11 @@ pub fn package_tables(
   }
 }
 
-pub fn pulled_at(packages: List<PackageDependencies>, module_packages: List<Int>, i: Int) -> Bool =
+pub fn is_shipped_module(
+  packages: List<PackageDependencies>,
+  module_packages: List<Int>,
+  i: Int,
+) -> Bool =
   match module_packages.at(i) {
     Some(k) -> match packages.at(k) { Some(p) -> is_shipped(p.prefix), None -> true },
     None -> false,
@@ -1515,7 +1519,7 @@ pub fn home_of(modules: List<ParsedModule>, of: SchemaInstance) -> Option<Int> =
         }),
   }
 
-pub type ShippedView = {
+pub type ShippedModuleSummary = {
   module: Bytes,
   text: Bytes,
   form: Bytes,

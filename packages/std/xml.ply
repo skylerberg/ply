@@ -7,7 +7,7 @@
 //! module reads no document that contains one. With no declaration there is no external entity to
 //! fetch, no parameter entity and no entity to expand. So the only references are `&lt;`, `&gt;`,
 //! `&amp;`, `&apos;`, `&quot;` and the numeric ones, each of which must name a character a document
-//! may contain. Every reader takes `Limits`, and none nests deeper than `deepest()` whatever they
+//! may contain. Every reader takes `Limits`, and none nests deeper than `maximum_depth()` whatever they
 //! say.
 //!
 //! `start` and `next` are the reader: a `Cursor` over the bytes, and a step from it to the next
@@ -52,7 +52,7 @@ pub fn xmlns_namespace() -> String = "http://www.w3.org/2000/xmlns/"
 /// The most elements any reader here has open at once, and the deepest tree `write` writes. The
 /// tree functions nest a few calls per level, so documents are bounded at a depth where they still
 /// return.
-pub fn deepest() -> Int = 1000
+pub fn maximum_depth() -> Int = 1000
 
 // --- The tree -----------------------------------------------------------------------
 
@@ -214,7 +214,7 @@ pub type ErrorKind =
   /// For `write`: an empty text node, or two adjacent ones, which no document reads back as they
   /// are.
   | SplitText
-  /// Elements nested past `Limits.max_depth` or `deepest()`.
+  /// Elements nested past `Limits.max_depth` or `maximum_depth()`.
   | TooDeep
   /// More attributes on an element than `Limits.max_attributes`.
   | TooManyAttributes
@@ -331,14 +331,14 @@ fn utf8_prefix(data: Bytes, i: Int, left: Int) -> Int / {abort.raise} =
     if width == 0 { i } else { utf8_prefix(data, i + width, left - 1) }
   }
 
-fn controls() -> Bytes =
+fn control_characters() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
 
 /// The offset of the first character in UTF-8 `data` that no document may contain, and its code
 /// point; the length of `data` when there is none.
 fn first_illegal_char(data: Bytes) -> { at: Int, point: Int } / {abort.raise} = {
   let n = data.len();
-  let control = data.skip_until(0, controls());
+  let control = data.skip_until(0, control_characters());
   let fffe = data.index_of(b"\xef\xbf\xbe").unwrap_or(n);
   let ffff = data.index_of(b"\xef\xbf\xbf").unwrap_or(n);
   let at = min(control, min(fffe, ffff));
@@ -409,7 +409,7 @@ fn joined(pieces: List<Bytes>) -> Bytes =
 /// What a reader may spend on one document. A limit that is not positive allows nothing of its
 /// kind.
 pub type Limits = new {
-  /// Elements open at once; never more than `deepest()`.
+  /// Elements open at once; never more than `maximum_depth()`.
   max_depth: Int,
   /// Attributes on one element, its namespace declarations among them.
   max_attributes: Int,
@@ -521,7 +521,7 @@ fn initial_cursor(data: Bytes, origin: Int, wide: Bool, limits: Limits) -> Curso
   {
     data: data,
     at: origin,
-    limits: { ..limits, max_depth: min(limits.max_depth, deepest()) },
+    limits: { ..limits, max_depth: min(limits.max_depth, maximum_depth()) },
     stage: Prolog,
     open: Outermost,
     depth: 0,
@@ -641,7 +641,7 @@ fn markup(c: Cursor, i: Int) -> Step / {xml.fail, abort.raise} =
       })
     },
     b'!' -> if c.data.starts_at(i, b"<!--") {
-      let read = comment(c, i);
+      let read = read_comment(c, i);
       make_step(c, i, CommentOrInstruction(Comment(read.text)), { ..c, at: read.next })
     } else if c.data.starts_at(i, b"<!DOCTYPE") { fail(c, i, Doctype) }
     else if c.data.starts_at(i, b"<![CDATA[") { fail(c, i, OutsideRoot) }
@@ -665,7 +665,7 @@ fn text_run(c: Cursor, i: Int, pieces: List<Bytes>, left: Int) -> Run / {xml.fai
         let name_out = reference(c, stop);
         text_run(c, name_out.next, held.push(name_out.bytes), left - 1)
       },
-      b']' -> brackets(c, stop, held, left),
+      b']' -> square_brackets(c, stop, held, left),
       b'\r' -> {
         let next = if c.data.peek(stop + 1) == b'\n' { stop + 2 } else { stop + 1 };
         text_run(c, next, held.push(b"\n"), left - 1)
@@ -677,7 +677,12 @@ fn text_run(c: Cursor, i: Int, pieces: List<Bytes>, left: Int) -> Run / {xml.fai
   }
 }
 
-fn brackets(c: Cursor, i: Int, held: List<Bytes>, left: Int) -> Run / {xml.fail, abort.raise} = {
+fn square_brackets(
+  c: Cursor,
+  i: Int,
+  held: List<Bytes>,
+  left: Int,
+) -> Run / {xml.fail, abort.raise} = {
   let end = c.data.skip(i, b"]");
   if end - i >= 2 && c.data.peek(end) == b'>' { fail(c, end - 2, CDataEnd) }
   else if left <= 0 { panic("more pieces of text than bytes") }
@@ -979,7 +984,7 @@ fn close_element(c: Cursor, from: Int, at: Int) -> Step / {xml.fail, abort.raise
 
 // --- The reader: comments, instructions and the declaration -------------------------
 
-fn comment(c: Cursor, i: Int) -> { text: String, next: Int } / {xml.fail, abort.raise} =
+fn read_comment(c: Cursor, i: Int) -> { text: String, next: Int } / {xml.fail, abort.raise} =
   match c.data.index_of_from(b"--", i + 4) {
     None -> fail(c, i, Truncated),
     Some(end) -> if c.data.peek(end + 2) != b'>' {
@@ -1107,7 +1112,7 @@ fn declared_standalone(
 
 type Frame = { start: Start, children: List<Node> }
 
-type Frames = | Ground | Upon(Frame, Frames)
+type OpenElements = | Ground | Open(Frame, OpenElements)
 
 /// Every event of the document in `data`, in order.
 pub fn events(data: Bytes, limits: Limits) -> List<Event> / {xml.fail, abort.raise} =
@@ -1125,10 +1130,10 @@ pub fn subtree(
   start: Start,
   c: Cursor,
 ) -> { element: Element, rest: Cursor } / {xml.fail, abort.raise} =
-  build_subtree(Upon({ start: start, children: [] }, Ground), c, c.data.len() - c.at + 2)
+  build_subtree(Open({ start: start, children: [] }, Ground), c, c.data.len() - c.at + 2)
 
 fn build_subtree(
-  frames: Frames,
+  frames: OpenElements,
   c: Cursor,
   left: Int,
 ) -> { element: Element, rest: Cursor } / {xml.fail, abort.raise} =
@@ -1137,12 +1142,12 @@ fn build_subtree(
     Some(step) -> if left <= 0 { panic("more events than bytes") } else {
       match step.event {
         StartElement(s) ->
-          build_subtree(Upon({ start: s, children: [] }, frames), step.rest, left - 1),
+          build_subtree(Open({ start: s, children: [] }, frames), step.rest, left - 1),
         EndElement(_) -> match frames {
           Ground -> fail(c, c.at, OutsideRoot),
-          Upon(top, below) -> match below {
+          Open(top, below) -> match below {
             Ground -> { element: frame_element(top), rest: step.rest },
-            Upon(_, _) ->
+            Open(_, _) ->
               build_subtree(add_child(below, Element(frame_element(top))), step.rest, left - 1),
           },
         },
@@ -1162,10 +1167,10 @@ fn frame_element(f: Frame) -> Element =
     declared: Spelling(f.start.declared),
   }
 
-fn add_child(frames: Frames, node: Node) -> Frames =
+fn add_child(frames: OpenElements, node: Node) -> OpenElements =
   match frames {
     Ground -> Ground,
-    Upon(top, below) -> Upon({ start: top.start, children: top.children.push(node) }, below),
+    Open(top, below) -> Open({ start: top.start, children: top.children.push(node) }, below),
   }
 
 /// The cursor past the end of the element whose start was the last event read. What it passes is
@@ -1246,11 +1251,11 @@ pub type Layout =
 
 type Formatting = { indent: Int, level: Int, flat: Bool }
 
-type Scope = Map<String, String>
+type NamespaceScope = Map<String, String>
 
 /// What one start tag binds: `taken` is each prefix it declares or relies on, and `order` the
 /// declarations it writes.
-type TagBindings = { taken: Scope, order: List<Binding> }
+type TagBindings = { taken: NamespaceScope, order: List<Binding> }
 
 type NameResult = { text: Bytes, claims: TagBindings }
 
@@ -1280,10 +1285,10 @@ pub fn write(d: Document, layout: Layout) -> Bytes / {xml.unwritable, abort.rais
     None -> [],
   };
   let before = d.before.fold(head, |out: List<Bytes>, m: Miscellaneous|
-    out.push(miscellaneous_out(m)).push(line));
-  let root = element_out(d.root, Map::new(), look, deepest(), before);
+    out.push(write_miscellaneous(m)).push(line));
+  let root = element_out(d.root, Map::new(), look, maximum_depth(), before);
   let after = d.after.fold(root, |out: List<Bytes>, m: Miscellaneous|
-    out.push(line).push(miscellaneous_out(m)));
+    out.push(line).push(write_miscellaneous(m)));
   Bytes::concat_all(after.push(line))
 }
 
@@ -1305,7 +1310,7 @@ fn declaration_out(d: Declaration) -> Bytes / {xml.unwritable, abort.raise} =
     ])
   }
 
-fn miscellaneous_out(m: Miscellaneous) -> Bytes / {xml.unwritable, abort.raise} =
+fn write_miscellaneous(m: Miscellaneous) -> Bytes / {xml.unwritable, abort.raise} =
   match m {
     Comment(text) -> {
       let raw = checked_bytes(text);
@@ -1365,11 +1370,11 @@ fn value_out(text: String) -> Bytes / {xml.unwritable, abort.raise} =
 /// Whether `text` is a name with no colon.
 fn is_name(text: String) -> Bool / {abort.raise} = is_ncname(Bytes::of_string(text))
 
-fn margin(look: Formatting) -> Bytes = b"\n".concat(b" ".repeat(look.indent * look.level))
+fn newline_indent(look: Formatting) -> Bytes = b"\n".concat(b" ".repeat(look.indent * look.level))
 
 fn element_out(
   e: Element,
-  outer: Scope,
+  outer: NamespaceScope,
   look: Formatting,
   room: Int,
   out: List<Bytes>,
@@ -1383,48 +1388,48 @@ fn element_out(
         { out: tag.out.push(b">"), has_text: false },
         |f: ChildrenState, child: Node| child_out(child, tag.scope, inner, room - 1, f),
       );
-      let closing = if flat { filled.out } else { filled.out.push(margin(look)) };
+      let closing = if flat { filled.out } else { filled.out.push(newline_indent(look)) };
       closing.push(b"</").push(tag.name).push(b">")
     }
   }
 
 fn child_out(
   child: Node,
-  scope: Scope,
+  scope: NamespaceScope,
   look: Formatting,
   room: Int,
   f: ChildrenState,
 ) -> ChildrenState / {xml.unwritable, abort.raise} = {
-  let lead = if look.flat { f.out } else { f.out.push(margin(look)) };
+  let lead = if look.flat { f.out } else { f.out.push(newline_indent(look)) };
   match child {
     Element(e) -> { out: element_out(e, scope, look, room, lead), has_text: false },
     Text(t) -> if f.has_text || t == "" { xml.unwritable(SplitText) }
     else { { out: lead.push(text_out(t)), has_text: true } },
-    Miscellaneous(m) -> { out: lead.push(miscellaneous_out(m)), has_text: false },
+    Miscellaneous(m) -> { out: lead.push(write_miscellaneous(m)), has_text: false },
   }
 }
 
-type TagResult = { out: List<Bytes>, name: Bytes, scope: Scope }
+type TagResult = { out: List<Bytes>, name: Bytes, scope: NamespaceScope }
 
 /// The start tag of `e` up to where `>` or `/>` closes it, and the namespaces in scope inside it.
 fn tag_out(
   e: Element,
-  outer: Scope,
+  outer: NamespaceScope,
   out: List<Bytes>,
 ) -> TagResult / {xml.unwritable, abort.raise} = {
   let declared = spelling_value(e.declared).fold({ taken: Map::new(), order: [] }, add_declaration);
   let own = name_out(e.name, declared, outer, false);
-  let written = e.attributes.fold(
+  let write_compact = e.attributes.fold(
     { claims: own.claims, pieces: [], seen: Map::new() },
     |a: AttributeState, x: Attribute| attribute_out(a, x, outer),
   );
   let opened_tag = out.push(b"<").push(own.text);
-  let bound = written.claims.order.fold(opened_tag, |o: List<Bytes>, b: Binding|
+  let bound = write_compact.claims.order.fold(opened_tag, |o: List<Bytes>, b: Binding|
     o.push(xmlns_attribute_name(b.prefix)).push(value_out(b.namespace)).push(b"\""));
   {
-    out: written.pieces.fold(bound, |o: List<Bytes>, p: Bytes| o.push(p)),
+    out: write_compact.pieces.fold(bound, |o: List<Bytes>, p: Bytes| o.push(p)),
     name: own.text,
-    scope: outer.merge(written.claims.taken),
+    scope: outer.merge(write_compact.claims.taken),
   }
 }
 
@@ -1446,7 +1451,7 @@ fn bind_prefix(c: TagBindings, prefix: String, namespace: String) -> TagBindings
 fn attribute_out(
   a: AttributeState,
   x: Attribute,
-  outer: Scope,
+  outer: NamespaceScope,
 ) -> AttributeState / {xml.unwritable, abort.raise} = {
   let own = name_out(x.name, a.claims, outer, true);
   let key = (x.name.namespace, x.name.local);
@@ -1463,7 +1468,7 @@ fn attribute_out(
 fn name_out(
   n: Name,
   claims: TagBindings,
-  outer: Scope,
+  outer: NamespaceScope,
   attribute: Bool,
 ) -> NameResult / {xml.unwritable, abort.raise} =
   if !is_name(n.local) || (attribute && n.namespace == "" && n.local == "xmlns") {
@@ -1486,7 +1491,7 @@ fn name_out(
 
 /// `claims` with no default namespace in effect, for an element in no namespace: a default the
 /// element declared is dropped, and one in scope around it is undeclared.
-fn without_default_namespace(claims: TagBindings, outer: Scope) -> TagBindings = {
+fn without_default_namespace(claims: TagBindings, outer: NamespaceScope) -> TagBindings = {
   let own = claims.taken.get("");
   let inherited = outer.get("").unwrap_or("");
   let without: TagBindings = {
@@ -1500,7 +1505,7 @@ fn without_default_namespace(claims: TagBindings, outer: Scope) -> TagBindings =
 
 type PrefixChoice = { prefix: String, claims: TagBindings }
 
-fn bound_in(claims: TagBindings, outer: Scope, prefix: String) -> Option<String> =
+fn bound_in(claims: TagBindings, outer: NamespaceScope, prefix: String) -> Option<String> =
   match claims.taken.get(prefix) { Some(uri) -> Some(uri), None -> outer.get(prefix) }
 
 /// The prefix a name in `namespace` is written with, `""` for none, and the tag's bindings with
@@ -1509,7 +1514,7 @@ fn prefix_for(
   namespace: String,
   hint: String,
   claims: TagBindings,
-  outer: Scope,
+  outer: NamespaceScope,
   attribute: Bool,
 ) -> PrefixChoice / {xml.unwritable, abort.raise} = {
   let usable = !(attribute && hint == "");
@@ -1535,7 +1540,7 @@ fn prefix_for(
   }
 }
 
-fn generated_prefix(scope: Scope, k: Int, left: Int) -> String / {abort.raise} = {
+fn generated_prefix(scope: NamespaceScope, k: Int, left: Int) -> String / {abort.raise} = {
   let prefix = "ns" ++ k.to_string();
   if !scope.contains(prefix) { prefix }
   else if left <= 0 { panic("more prefixes in scope than the scope holds") }
@@ -1574,12 +1579,12 @@ fn within(e: Element, name: Name, found: List<Element>) -> List<Element> =
     })
 
 /// All the text inside `e`, at any depth, in document order, with nothing between the pieces.
-pub fn text(e: Element) -> String = String::of_bytes_lossy(Bytes::concat_all(spoken(e, [])))
+pub fn text(e: Element) -> String = String::of_bytes_lossy(Bytes::concat_all(append_text(e, [])))
 
-fn spoken(e: Element, said: List<Bytes>) -> List<Bytes> =
+fn append_text(e: Element, said: List<Bytes>) -> List<Bytes> =
   e.children.fold(said, |acc: List<Bytes>, n: Node|
     match n {
-      Element(child) -> spoken(child, acc),
+      Element(child) -> append_text(child, acc),
       Text(t) -> acc.push(Bytes::of_string(t)),
       Miscellaneous(_) -> acc,
     })
@@ -1691,23 +1696,23 @@ type Mold = new {
 
 type Valued = { name: Name, texts: List<String> }
 
-type Cast = | Shaped(Mold) | Texts(List<String>) | Apart(Miscellaneous)
+type Cast = | Child(Mold) | Texts(List<String>) | Annotation(Miscellaneous)
 
-fn molded(e: Element) -> Mold =
+fn element_to_mold(e: Element) -> Mold =
   {
     name: e.name,
     attributes: e.attributes.map(|a: Attribute| { name: a.name, texts: a.value.split("\u{fdd0}") }),
     children: e.children.map(|n: Node|
       match n {
-        Element(child) -> Shaped(molded(child)),
+        Element(child) -> Child(element_to_mold(child)),
         Text(t) -> Texts(t.split("\u{fdd0}")),
-        Miscellaneous(m) -> Apart(m),
+        Miscellaneous(m) -> Annotation(m),
       }),
     declared: spelling_value(e.declared),
   }
 
 /// Why a literal's markup is rejected, and at which character of which text.
-pub type Misplaced = { message: String, offset: Int, part: Int }
+pub type LiteralError = { message: String, offset: Int, part: Int }
 
 /// `text` as the contents of a hole: one text node, or nothing for the empty string.
 pub fn chars(text: String) -> List<Node> = if text == "" { [] } else { [Text(text)] }
@@ -1744,7 +1749,7 @@ fn joined_parts(parts: List<String>, quoted: List<Bool>) -> Joined =
 /// or the first character, hole or end that makes them invalid. A hole may be in an element's
 /// content, inside a quoted attribute value, or a whole value, `name={hole}`. An error just past a
 /// text belongs to the hole after it, or to the literal's end after the last text.
-pub fn compile(parts: List<String>) -> Result<Template, Misplaced> / {abort.raise} =
+pub fn compile(parts: List<String>) -> Result<Template, LiteralError> / {abort.raise} =
   match parts.find_index(|p: String| p.contains("\u{fdd0}")) {
     Some(k) ->
       Err({
@@ -1759,7 +1764,7 @@ fn templated(
   parts: List<String>,
   quoted: List<Bool>,
   left: Int,
-) -> Result<Template, Misplaced> / {abort.raise} = {
+) -> Result<Template, LiteralError> / {abort.raise} = {
   let j = joined_parts(parts, quoted);
   let text = Bytes::concat_all(j.pieces);
   match try { placed(text, parts) } {
@@ -1770,17 +1775,21 @@ fn templated(
       } else {
         Err(at_hole(parts, k, "a hole stands in an element's content or in an attribute's value"))
       },
-      None -> Err(located(parts, j.starts, rejection)),
+      None -> Err(literal_error(parts, j.starts, rejection)),
     },
   }
 }
 
-fn at_hole(parts: List<String>, k: Int, message: String) -> Misplaced =
+fn at_hole(parts: List<String>, k: Int, message: String) -> LiteralError =
   { message: message, offset: parts.at_or(k, "").len(), part: k }
 
 /// Where an error at a byte of the joined texts falls: in the last text that starts at or before
 /// it, at that character, or just past the text when the error is in the hole after it.
-fn located(parts: List<String>, starts: List<Int>, rejection: Error) -> Misplaced / {abort.raise} = {
+fn literal_error(
+  parts: List<String>,
+  starts: List<Int>,
+  rejection: Error,
+) -> LiteralError / {abort.raise} = {
   let part = max(starts.filter(|from: Int| from <= rejection.at).len() - 1, 0);
   let text = Bytes::of_string(parts.at_or(part, ""));
   let within = min(max(rejection.at - starts.at_or(part, 0), 0), text.len());
@@ -1792,9 +1801,9 @@ fn located(parts: List<String>, starts: List<Int>, rejection: Error) -> Misplace
 fn placed(
   text: Bytes,
   parts: List<String>,
-) -> Result<Template, Misplaced> / {xml.fail, abort.raise} = {
+) -> Result<Template, LiteralError> / {xml.fail, abort.raise} = {
   let d = read(text, default_limits());
-  let walk = strayed(start(text, default_limits()), 0, text.len() + 2);
+  let walk = scan_holes(start(text, default_limits()), 0, text.len() + 2);
   match walk.stray {
     Some(message) -> Err(at_hole(parts, walk.seen, message)),
     None -> if walk.seen != parts.len() - 1 {
@@ -1809,7 +1818,7 @@ fn placed(
         offset: 0,
         part: 0,
       })
-    } else { Ok({ root: molded(d.root) }) },
+    } else { Ok({ root: element_to_mold(d.root) }) },
   }
 }
 
@@ -1817,18 +1826,18 @@ type Walk = { stray: Option<String>, seen: Int }
 
 /// The first hole in a comment, an instruction or a namespace declaration, by how many holes come
 /// before it, or how many holes the document contains.
-fn strayed(c: Cursor, seen: Int, left: Int) -> Walk / {xml.fail, abort.raise} =
+fn scan_holes(c: Cursor, seen: Int, left: Int) -> Walk / {xml.fail, abort.raise} =
   match next(c) {
     None -> { stray: None, seen: seen },
     Some(step) -> if left <= 0 { panic("more events than bytes") } else {
       match step.event {
-        Characters(text) -> strayed(step.rest, seen + marks_in(text), left - 1),
+        Characters(text) -> scan_holes(step.rest, seen + marks_in(text), left - 1),
         CommentOrInstruction(Comment(text)) -> if marks_in(text) > 0 {
           { stray: Some("a comment holds no hole"), seen: seen }
-        } else { strayed(step.rest, seen, left - 1) },
+        } else { scan_holes(step.rest, seen, left - 1) },
         CommentOrInstruction(Instruction(_, data)) -> if marks_in(data) > 0 {
           { stray: Some("a processing instruction holds no hole"), seen: seen }
-        } else { strayed(step.rest, seen, left - 1) },
+        } else { scan_holes(step.rest, seen, left - 1) },
         StartElement(_) -> {
           let tag = raws_at(c, step.at).fold(
             { stray: None, seen: seen },
@@ -1839,9 +1848,9 @@ fn strayed(c: Cursor, seen: Int, left: Int) -> Walk / {xml.fail, abort.raise} =
               } else { { ..w, seen: w.seen + marks_in(raw.value) } }
             },
           );
-          if tag.stray != None { tag } else { strayed(step.rest, tag.seen, left - 1) }
+          if tag.stray != None { tag } else { scan_holes(step.rest, tag.seen, left - 1) }
         },
-        _ -> strayed(step.rest, seen, left - 1),
+        _ -> scan_holes(step.rest, seen, left - 1),
       }
     },
   }
@@ -1856,26 +1865,29 @@ pub fn fill(t: Template, holes: List<List<Node>>) -> Element = filled(t.root, ho
 
 type Filled = { element: Element, next: Int }
 
-type Weaving = { attributes: List<Attribute>, next: Int }
+type FilledAttributes = { attributes: List<Attribute>, next: Int }
 
-type Grafted = { joining: JoinState, next: Int }
+type FilledChildren = { joining: JoinState, next: Int }
 
 fn filled(m: Mold, holes: List<List<Node>>, from: Int) -> Filled = {
-  let woven_values = m.attributes.fold({ attributes: [], next: from }, |w: Weaving, a: Valued|
-    {
-      attributes: w.attributes.push({ name: a.name, value: woven(a.texts, holes, w.next) }),
-      next: w.next + a.texts.len() - 1,
-    });
+  let woven_values = m.attributes.fold(
+    { attributes: [], next: from },
+    |w: FilledAttributes, a: Valued|
+      {
+        attributes: w.attributes.push({ name: a.name, value: woven(a.texts, holes, w.next) }),
+        next: w.next + a.texts.len() - 1,
+      },
+  );
   let grafted = m.children.fold(
     { joining: { nodes: [], text: [] }, next: woven_values.next },
-    |g: Grafted, c: Cast|
+    |g: FilledChildren, c: Cast|
       match c {
         Texts(texts) -> grafts(texts, holes, g),
-        Shaped(child) -> {
+        Child(child) -> {
           let inner = filled(child, holes, g.next);
           { joining: join_text(g.joining, Element(inner.element)), next: inner.next }
         },
-        Apart(miscellaneous) ->
+        Annotation(miscellaneous) ->
           { ..g, joining: join_text(g.joining, Miscellaneous(miscellaneous)) },
       },
   );
@@ -1905,13 +1917,13 @@ fn woven(texts: List<String>, holes: List<List<Node>>, from: Int) -> String =
 fn said(out: List<Bytes>, n: Node) -> List<Bytes> =
   match n {
     Text(t) -> out.push(Bytes::of_string(t)),
-    Element(e) -> spoken(e, out),
+    Element(e) -> append_text(e, out),
     Miscellaneous(_) -> out,
   }
 
 /// An element's content: the texts between its holes, and each hole's nodes between them.
-fn grafts(texts: List<String>, holes: List<List<Node>>, g: Grafted) -> Grafted =
-  range(0, texts.len()).fold(g, |acc: Grafted, k: Int| {
+fn grafts(texts: List<String>, holes: List<List<Node>>, g: FilledChildren) -> FilledChildren =
+  range(0, texts.len()).fold(g, |acc: FilledChildren, k: Int| {
     let with_text = join_text(acc.joining, Text(texts.at_or(k, "")));
     if k == texts.len() - 1 { { ..acc, joining: with_text } }
     else { { joining: holes.at_or(acc.next, []).fold(with_text, join_text), next: acc.next + 1 } }
@@ -1983,25 +1995,25 @@ fn attribute_sets() -> List<List<Attribute>> =
     ],
   ]
 
-fn reread(numbers: List<Int>) -> Result<Document, Error> / {xml.unwritable, abort.raise} =
+fn write_then_parse(numbers: List<Int>) -> Result<Document, Error> / {xml.unwritable, abort.raise} =
   parse(write(document(planted(numbers)), Compact), default_limits())
 
 /// `text` as `write` writes the document it contains; `text` itself when it contains none.
-fn respelled(text: Bytes) -> Bytes / {abort.raise} =
+fn reserialize(text: Bytes) -> Bytes / {abort.raise} =
   match parse(text, default_limits()) {
     Err(_) -> text,
-    Ok(d) -> match encode(d, Compact) { Ok(written) -> written, Err(_) -> text },
+    Ok(d) -> match encode(d, Compact) { Ok(write_compact) -> write_compact, Err(_) -> text },
   }
 
 test "a tree the writer writes reads back as itself" {
   gen::check(gen::list(gen::any_int()), |x: List<Int>|
-    agrees(reread, |numbers: List<Int>| Ok(document(planted(numbers))), x))
+    agrees(write_then_parse, |numbers: List<Int>| Ok(document(planted(numbers))), x))
 }
 
 test "a tree written with any layout rewrites to a text that rewrites to itself" {
   gen::check2(gen::list(gen::any_int()), gen::any_int(), |numbers: List<Int>, indent: Int| {
-    let once = respelled(write(document(planted(numbers)), Indented(indent & 7)));
-    respelled(once) == once
+    let once = reserialize(write(document(planted(numbers)), Indented(indent & 7)));
+    reserialize(once) == once
   })
 }
 
@@ -2026,7 +2038,7 @@ fn rewritten(text: String) -> String / {abort.raise} =
     Ok(d) -> match encode(d, Compact) { Ok(b) -> String::of_bytes(b), Err(_) -> "unwritable" },
   }
 
-fn written(e: Element) -> Result<String, ErrorKind> / {abort.raise} =
+fn write_compact(e: Element) -> Result<String, ErrorKind> / {abort.raise} =
   match encode(document(e), Compact) {
     Ok(b) -> Ok(String::of_bytes(b)),
     Err(reason) -> Err(reason),
@@ -2478,8 +2490,8 @@ test "a document at its limits is read, and a limit that is not positive allows 
   assert_eq(failure_of(b"<a x=''/>", { ..tight(), max_attributes: 0 }), Some(TooManyAttributes));
   let nested = |levels: Int| Bytes::concat_all([b"<a>".repeat(levels), b"</a>".repeat(levels)]);
   let roomy: Limits = { ..default_limits(), max_depth: 1000000 };
-  assert_eq(failure_of(nested(deepest()), roomy), None);
-  assert_eq(failure_of(nested(deepest() + 1), roomy), Some(TooDeep))
+  assert_eq(failure_of(nested(maximum_depth()), roomy), None);
+  assert_eq(failure_of(nested(maximum_depth() + 1), roomy), Some(TooDeep))
 }
 
 test "a document is its events in order, with text between markup as one" {
@@ -2691,17 +2703,17 @@ test "a tree is written as it was read, and escaped where needed" {
 }
 
 test "a namespace is declared where a name first needs it" {
-  assert_eq(written(element(qualified("u", "a"), [], [])), Ok("<a xmlns=\"u\"/>"));
+  assert_eq(write_compact(element(qualified("u", "a"), [], [])), Ok("<a xmlns=\"u\"/>"));
   assert_eq(
-    written(element(prefixed("u", "p", "a"), [attribute(qualified("u", "x"), "1")], [])),
+    write_compact(element(prefixed("u", "p", "a"), [attribute(qualified("u", "x"), "1")], [])),
     Ok("<p:a xmlns:p=\"u\" p:x=\"1\"/>"),
   );
   assert_eq(
-    written(element(qualified("u", "a"), [attribute(qualified("u", "x"), "1")], [])),
+    write_compact(element(qualified("u", "a"), [attribute(qualified("u", "x"), "1")], [])),
     Ok("<a xmlns=\"u\" xmlns:ns1=\"u\" ns1:x=\"1\"/>"),
   );
   assert_eq(
-    written(
+    write_compact(
       element(qualified("u", "a"), [], [
         Element(plain("b", [Element(element(qualified("u", "c"), [], []))])),
       ]),
@@ -2709,7 +2721,7 @@ test "a namespace is declared where a name first needs it" {
     Ok("<a xmlns=\"u\"><b xmlns=\"\"><c xmlns=\"u\"/></b></a>"),
   );
   assert_eq(
-    written(
+    write_compact(
       element(
         prefixed("u", "p", "a"),
         [attribute(prefixed("v", "p", "x"), "1"), attribute(prefixed("w", "p", "y"), "2")],
@@ -2724,7 +2736,7 @@ test "a namespace is declared where a name first needs it" {
     ),
   );
   assert_eq(
-    written(element(name("a"), [attribute(qualified(xml_namespace(), "lang"), "en")], [])),
+    write_compact(element(name("a"), [attribute(qualified(xml_namespace(), "lang"), "en")], [])),
     Ok("<a xml:lang=\"en\"/>"),
   );
   let defaulted: Element = {
@@ -2733,7 +2745,7 @@ test "a namespace is declared where a name first needs it" {
     children: [],
     declared: Spelling([{ prefix: "", namespace: "u" }, { prefix: "p", namespace: "v" }]),
   };
-  assert_eq(written(defaulted), Ok("<a xmlns:p=\"v\"/>"))
+  assert_eq(write_compact(defaulted), Ok("<a xmlns:p=\"v\"/>"))
 }
 
 type Unwritable = { name: String, tree: Element, reason: ErrorKind }
@@ -2862,13 +2874,13 @@ fn unwritables() -> List<Unwritable> =
   ]
 
 test "a tree no document can represent is rejected: {c.name}" for c: Unwritable in unwritables() {
-  assert_eq(written(c.tree), Err(c.reason))
+  assert_eq(write_compact(c.tree), Err(c.reason))
 }
 
 test "a tree deeper than `deepest()` is rejected, and a declaration is written as given" {
-  let nested = range(0, deepest()).fold(plain("a", []), |inner: Element, _: Int|
+  let nested = range(0, maximum_depth()).fold(plain("a", []), |inner: Element, _: Int|
     plain("a", [Element(inner)]));
-  assert_eq(written(nested), Err(TooDeep));
+  assert_eq(write_compact(nested), Err(TooDeep));
   let declared = |version: String|
     encode(
       {
@@ -2962,7 +2974,10 @@ test "the raising reader raises the error the other returns, and a task may perf
 fn filled_with(parts: List<String>, holes: List<List<Node>>) -> String / {abort.raise} =
   match compile(parts) {
     Err(rejected) -> rejected.message,
-    Ok(t) -> match written(fill(t, holes)) { Ok(text) -> text, Err(reason) -> explain(reason) },
+    Ok(t) -> match write_compact(fill(t, holes)) {
+      Ok(text) -> text,
+      Err(reason) -> explain(reason),
+    },
   }
 
 fn misplaced(parts: List<String>) -> Option<{ offset: Int, part: Int }> / {abort.raise} =

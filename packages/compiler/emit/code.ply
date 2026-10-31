@@ -1,4 +1,4 @@
-import compiler.syntax.parsing (Span, dummy_span, synthetic_span, role_branch)
+import compiler.syntax.parsing (Span, dummy_span, synthetic_span, role_parallel_branch)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
                                  LiteralString, LiteralBytes, LiteralEmbedded, LiteralFloat,
                                  LiteralDecimal, LiteralChar, LiteralUnit, LiteralInvalid)
@@ -16,9 +16,9 @@ import compiler.check.typed (TypedExpression, pattern_binders, TypedLiteral, Typ
                              TypedStatement, TypedLet, TypedLetElse, TypedDo, TypedAssign,
                              TypedClause, TypedReturn, TypedHandlerVar,
                              typed_expression_nodes_folded, NumericWitness, ConcreteWitness,
-                             ParamWitness, StatedWitness, witness_param, TypedRelease, HeldByNode,
-                             ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseMissing,
-                             ReleaseFailing, binding_key, holder_key)
+                             ParamWitness, StatedWitness, witness_param_name, TypedRelease,
+                             NodeHolder, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
+                             ReleaseMissing, ReleaseFailing, binding_key, holder_key)
 import compiler.expand.rewrite (witness_code, declared_witness_name, numeric_operator_code)
 import std.derive.children
 import std.list
@@ -50,10 +50,10 @@ pub type Node =
   | CodeParallel({ branches: List<Code> })
   | CodeHandle(CodeHandler)
   | CodeFieldRead({ base: Code, field: Bytes })
-  | CodeUpdate({ base: Code, copies: List<Bytes>, sets: List<CodeField> })
-  | CodeKnownLambda(KnownRead)
+  | CodeUpdate({ base: Code, copied_fields: List<Bytes>, sets: List<CodeField> })
+  | CodeKnownLambda(KnownLambdaCall)
 
-pub type KnownRead = {
+pub type KnownLambdaCall = {
   name: Bytes,
   slot: Int,
   lambda: Lambda,
@@ -389,7 +389,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
       Bytes::concat_all([
         b"upd(",
         dump(u.base),
-        u.copies.fold(b"", |acc: Bytes, n: Bytes| Bytes::concat_all([acc, b",c:", n])),
+        u.copied_fields.fold(b"", |acc: Bytes, n: Bytes| Bytes::concat_all([acc, b",c:", n])),
         u.sets.fold(b"", |acc: Bytes, f: CodeField|
           Bytes::concat_all([acc, b",s:", f.name, b"=", dump(f.value)])),
         b")",
@@ -423,11 +423,11 @@ type Stack = {
   released: Map<Int, Bool>,
   binders: Map<Int, Binder>,
   rekey: Map<Bytes, Int>,
-  held: List<HeldVar>,
+  held: List<HandlerVariable>,
   failed: List<Bytes>,
 }
 
-type HeldVar = { name: Bytes, at: Int, ty: Type, depth: Int }
+type HandlerVariable = { name: Bytes, at: Int, ty: Type, depth: Int }
 
 type Binder = { name: Bytes, depth: Int, slot: Int, ty: Type }
 
@@ -435,7 +435,7 @@ fn released_in(body: TypedExpression<Type>) -> Map<Int, Bool> =
   typed_expression_nodes_folded(body, Map::new(), |acc: Map<Int, Bool>, e: TypedExpression<Type>|
     e.releases.fold(acc, |m: Map<Int, Bool>, r: TypedRelease|
       match r.place {
-        ReleaseFailing(_) -> if r.held == HeldByNode(e.span.site) { m }
+        ReleaseFailing(_) -> if r.held == NodeHolder(e.span.site) { m }
         else { m.insert(holder_key(r.held), true) },
         _ -> m.insert(holder_key(r.held), true),
       }))
@@ -502,7 +502,7 @@ fn resolve(stack: Stack, name: Bytes) -> SlotLookup =
   }
 
 fn read_local(stack: Stack, name: Bytes, ty: Type, span: Span) -> Lowered =
-  match held_var(stack, name) {
+  match handler_variable(stack, name) {
     Some(h) -> { code: var_read(h, span), stack: stack },
     None -> {
       let r = resolve(stack, name);
@@ -573,7 +573,7 @@ fn binder_noted(stack: Stack, name: Bytes, site: Int, depth: Int, slot: Int, ty:
     }
   }
 
-fn unscope(frame: Frame, to: Int) -> Frame =
+fn truncate_scope(frame: Frame, to: Int) -> Frame =
   {
     names: frame.names,
     scope: take(frame.scope, to),
@@ -582,7 +582,7 @@ fn unscope(frame: Frame, to: Int) -> Frame =
   }
 
 fn unscope_stack(stack: Stack, to: Int) -> Stack =
-  with_top_frame(stack, unscope(top_frame(stack), to))
+  with_top_frame(stack, truncate_scope(top_frame(stack), to))
 
 fn depth_of(stack: Stack) -> Int = top_frame(stack).scope.len()
 
@@ -667,10 +667,10 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
       let o = lower_in(u.operand, stack);
       match open_witness(u.witness, u.operand.ty) {
         Some(p) -> {
-          let w = read_local(o.stack, witness_param(p), int_type(), e.span);
+          let w = read_local(o.stack, witness_param_name(p), int_type(), e.span);
           {
             code: {
-              ..hidden_call(b"?numeric_unary", [int_code(if u.op == b"bitnot" { 1 } else { 0 }), w.code, o.code], e.ty),
+              ..internal_builtin_call(b"?numeric_unary", [int_code(if u.op == b"bitnot" { 1 } else { 0 }), w.code, o.code], e.ty),
               span: e.span,
             },
             stack: w.stack,
@@ -684,10 +684,10 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
       let r = lower_in(b.rhs, l.stack);
       match open_witness(b.witness, b.lhs.ty) {
         Some(p) -> {
-          let w = read_local(r.stack, witness_param(p), int_type(), e.span);
+          let w = read_local(r.stack, witness_param_name(p), int_type(), e.span);
           {
             code: {
-              ..hidden_call(b"?numeric_binary", [int_code(numeric_operator_code(b.op)), w.code, l.code, r.code], e.ty),
+              ..internal_builtin_call(b"?numeric_binary", [int_code(numeric_operator_code(b.op)), w.code, l.code, r.code], e.ty),
               span: e.span,
             },
             stack: w.stack,
@@ -723,7 +723,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
         { code: at(e, CodeRecord({ fields: r.fields })), stack: r.stack }
       },
     },
-    TypedUpdate(u) -> updated(e, u.base, u.sets, u.copies, stack),
+    TypedUpdate(u) -> updated(e, u.base, u.sets, u.copied_fields, stack),
     TypedCall(c) -> {
       let fu = lower_in(c.callee, stack);
       let ws = match c.callee.node {
@@ -800,7 +800,7 @@ fn lower_node(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise}
             t.body,
             t.effects,
             sq.stack,
-            synthetic_span(t.body.span, role_branch()),
+            synthetic_span(t.body.span, role_parallel_branch()),
           );
           { codes: sq.codes.push(o.code), stack: o.stack }
         });
@@ -823,7 +823,10 @@ fn updated(
   let made = |read: (Stack) -> Lowered / {abort.raise}, st: Stack| {
     let r = lower_fields(sets, st);
     let b = read(r.stack);
-    { code: at(e, CodeUpdate({ base: b.code, copies: copies, sets: r.fields })), stack: b.stack }
+    {
+      code: at(e, CodeUpdate({ base: b.code, copied_fields: copies, sets: r.fields })),
+      stack: b.stack,
+    }
   };
   let local = match base.node {
     TypedRead(ReadLocal(n)) -> binding_depth(stack, n) != None,
@@ -910,7 +913,7 @@ fn as_update(
                     span: read.at,
                     ty: read.ty,
                   },
-                  copies: fields.filter(copied).map(|f: TypedField<Type>| f.name),
+                  copied_fields: fields.filter(copied).map(|f: TypedField<Type>| f.name),
                   sets: o.fields,
                 }),
               ),
@@ -955,7 +958,7 @@ fn as_path_update(
             e,
             CodeUpdate({
               base: o.code,
-              copies: fields.filter(copied).map(|f: TypedField<Type>| f.name),
+              copied_fields: fields.filter(copied).map(|f: TypedField<Type>| f.name),
               sets: r.fields,
             }),
           ),
@@ -1078,7 +1081,10 @@ fn lower_lambda(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let inner = params.fold(empty_frame(), |g: Frame, p: TypedParam<Type>| bind(g, p.name));
-  let b = lower_in(body, params_noted(push_frame(stack, inner), params, stack.frames.len(), 0));
+  let b = lower_in(
+    body,
+    record_param_binders(push_frame(stack, inner), params, stack.frames.len(), 0),
+  );
   let f = top_frame(b.stack);
   let value = closure_type(params, body.ty);
   {
@@ -1108,7 +1114,12 @@ fn closure_type(params: List<TypedParam<Type>>, ret: Type) -> FunctionSignature 
     effects: no_effects(),
   }
 
-fn params_noted(stack: Stack, params: List<TypedParam<Type>>, depth: Int, from: Int) -> Stack =
+fn record_param_binders(
+  stack: Stack,
+  params: List<TypedParam<Type>>,
+  depth: Int,
+  from: Int,
+) -> Stack =
   params.fold(
     { stack: stack, slot: from },
     |acc: { stack: Stack, slot: Int }, p: TypedParam<Type>|
@@ -1147,7 +1158,9 @@ fn handled(
   let b = lower_in(body, unscope_stack(made.stack, depth));
   let installed = made.reads.fold([], |acc: List<CodeStatement>, r: Code|
     acc.push(
-      CodeDo({ code: hidden_call(b"?handler_init", [int_code(acc.len()), r], unit_type()) }),
+      CodeDo({
+        code: internal_builtin_call(b"?handler_init", [int_code(acc.len()), r], unit_type()),
+      }),
     ));
   let started = if installed.len() == 0 { b.code } else {
     {
@@ -1160,7 +1173,7 @@ fn handled(
   let holding = |st: Stack|
     {
       ..st,
-      held: vars.fold(outer_held, |acc: List<HeldVar>, v: TypedHandlerVar<Type>|
+      held: vars.fold(outer_held, |acc: List<HandlerVariable>, v: TypedHandlerVar<Type>|
         acc.push({
           name: v.name,
           at: acc.len() - outer_held.len(),
@@ -1178,14 +1191,14 @@ fn handled(
       let lb = label_code(acc.stack, res);
       let outer = match lb { Some(o) -> o.stack, None -> acc.stack };
       let inner = outer.frames.len();
-      let pushed = params_noted(
+      let pushed = record_param_binders(
         push_frame(outer, names.fold(empty_frame(), |g: Frame, n: Bytes| bind(g, n))),
         c.params,
         inner,
         0,
       );
       let entered = match c.resume {
-        Some(k) -> params_noted(pushed, [k], inner, names.len() - 1),
+        Some(k) -> record_param_binders(pushed, [k], inner, names.len() - 1),
         None -> pushed,
       };
       let cb = lower_in(c.body, holding(entered));
@@ -1220,7 +1233,7 @@ fn handled(
   let returned = match ret {
     None -> { ret: None, stack: cls.stack },
     Some(r) -> {
-      let entered = params_noted(
+      let entered = record_param_binders(
         push_frame(cls.stack, bind(empty_frame(), r.binder.name)),
         [r.binder],
         cls.stack.frames.len(),
@@ -1252,8 +1265,8 @@ fn handled(
   }
 }
 
-fn held_var(stack: Stack, name: Bytes) -> Option<HeldVar> =
-  match stack.held.fold(None, |acc: Option<HeldVar>, h: HeldVar|
+fn handler_variable(stack: Stack, name: Bytes) -> Option<HandlerVariable> =
+  match stack.held.fold(None, |acc: Option<HandlerVariable>, h: HandlerVariable|
       if h.name == name { Some(h) } else { acc }) {
     None -> None,
     Some(h) -> if range(h.depth, stack.frames.len()).any(|i: Int|
@@ -1261,8 +1274,8 @@ fn held_var(stack: Stack, name: Bytes) -> Option<HeldVar> =
     else { Some(h) },
   }
 
-fn var_read(h: HeldVar, span: Span) -> Code =
-  { ..hidden_call(b"?handler_var", [int_code(h.at)], h.ty), span: span }
+fn var_read(h: HandlerVariable, span: Span) -> Code =
+  { ..internal_builtin_call(b"?handler_var", [int_code(h.at)], h.ty), span: span }
 
 fn snapshotted(
   e: TypedExpression<Type>,
@@ -1273,10 +1286,10 @@ fn snapshotted(
     let used = typed_expression_nodes_folded(
       e,
       [],
-      |acc: List<HeldVar>, x: TypedExpression<Type>|
+      |acc: List<HandlerVariable>, x: TypedExpression<Type>|
         match x.node {
-          TypedRead(ReadLocal(n)) -> match held_var(stack, n) {
-            Some(h) -> if acc.any(|y: HeldVar| y.name == n) { acc } else { acc.push(h) },
+          TypedRead(ReadLocal(n)) -> match handler_variable(stack, n) {
+            Some(h) -> if acc.any(|y: HandlerVariable| y.name == n) { acc } else { acc.push(h) },
             None -> acc,
           },
           _ -> acc,
@@ -1286,7 +1299,7 @@ fn snapshotted(
       let depth = depth_of(stack);
       let bound = used.fold(
         { statements: [], stack: stack },
-        |acc: BlockAccumulator, h: HeldVar|
+        |acc: BlockAccumulator, h: HandlerVariable|
           {
             statements: acc.statements.push(
               CodeLet({
@@ -1317,14 +1330,14 @@ fn witness_args(stack: Stack, witnesses: List<NumericWitness>, at: Span) -> Lowe
     match w {
       ConcreteWitness(n) -> { ..acc, codes: acc.codes.push(int_code(witness_code(n))) },
       ParamWitness(p) -> {
-        let o = read_local(acc.stack, witness_param(p), int_type(), at);
+        let o = read_local(acc.stack, witness_param_name(p), int_type(), at);
         { codes: acc.codes.push(o.code), stack: o.stack }
       },
       StatedWitness(ctor) ->
         {
           ..acc,
           codes: acc.codes.push(
-            hidden_call(
+            internal_builtin_call(
               declared_witness_name(),
               [{ node: CodeLiteral(LiteralString(ctor)), span: dummy_span(), ty: string_type() }],
               int_type(),
@@ -1333,7 +1346,7 @@ fn witness_args(stack: Stack, witnesses: List<NumericWitness>, at: Span) -> Lowe
         },
     })
 
-fn hidden_call(name: Bytes, args: List<Code>, ty: Type) -> Code =
+fn internal_builtin_call(name: Bytes, args: List<Code>, ty: Type) -> Code =
   {
     node: CodeApply({
       function: {
@@ -1418,9 +1431,9 @@ fn lower_from(
   let next = |a: BlockAccumulator| lower_from(statements, from + 1, a, depth, tail, ty);
   let rest = |st: Stack|
     lower_from(statements, from + 1, { statements: [], stack: st }, depth_of(st), tail, ty);
-  let branched = |o: Lowered| finished(acc, depth, { code: Some(o.code), stack: o.stack }, ty);
+  let branched = |o: Lowered| finish_block(acc, depth, { code: Some(o.code), stack: o.stack }, ty);
   match statements.at(from) {
-    None -> finished(acc, depth, lower_guard(tail, acc.stack), ty),
+    None -> finish_block(acc, depth, lower_guard(tail, acc.stack), ty),
     Some(TypedLetElse(l)) ->
       branched(
         matched(l.span, ty, lower_in(l.value, acc.stack), |start: ArmAccumulator|
@@ -1451,8 +1464,9 @@ fn lower_from(
             CodeLetDestructure({
               span: l.span,
               pattern: s.pattern,
-              value: if unwound.codes.len() == 0 { o.code }
-              else { hidden_call(b"?let_missing", unwound.codes.push(o.code), o.code.ty) },
+              value: if unwound.codes.len() == 0 { o.code } else {
+                internal_builtin_call(b"?let_missing", unwound.codes.push(o.code), o.code.ty)
+              },
             }),
           ),
           stack: s.stack,
@@ -1470,13 +1484,13 @@ fn lower_from(
     },
     Some(TypedAssign(a)) -> {
       let o = lower_in(a.value, acc.stack);
-      match held_var(o.stack, a.name) {
+      match handler_variable(o.stack, a.name) {
         Some(h) ->
           next({
             statements: acc.statements.push(
               CodeDo({
                 code: {
-                  ..hidden_call(b"?handler_set", [int_code(h.at), o.code], unit_type()),
+                  ..internal_builtin_call(b"?handler_set", [int_code(h.at), o.code], unit_type()),
                   span: a.span,
                 },
               }),
@@ -1500,7 +1514,7 @@ fn lower_from(
   }
 }
 
-fn finished(acc: BlockAccumulator, depth: Int, t: LoweredGuard, ty: Type) -> Lowered =
+fn finish_block(acc: BlockAccumulator, depth: Int, t: LoweredGuard, ty: Type) -> Lowered =
   {
     code: {
       node: CodeBlock({ statements: acc.statements, tail: t.code }),
@@ -1557,7 +1571,7 @@ fn slotted(p: CodePattern, stack: Stack) -> LoweredPattern =
       }
     },
     CodeConstructorPattern(c) -> {
-      let r = all_slotted(c.args, stack);
+      let r = assign_pattern_slots(c.args, stack);
       { pattern: CodeConstructorPattern({ ..c, args: r.pats }), stack: r.stack }
     },
     CodeRecordPattern(r) -> {
@@ -1571,7 +1585,7 @@ fn slotted(p: CodePattern, stack: Stack) -> LoweredPattern =
       { pattern: CodeRecordPattern({ fields: walked.fields, rest: r.rest }), stack: walked.stack }
     },
     CodeListPattern(l) -> {
-      let r = all_slotted(l.items, stack);
+      let r = assign_pattern_slots(l.items, stack);
       match l.rest {
         None -> { pattern: CodeListPattern({ items: r.pats, rest: None }), stack: r.stack },
         Some(rp) -> {
@@ -1587,7 +1601,7 @@ fn slotted(p: CodePattern, stack: Stack) -> LoweredPattern =
 
 type PatternSeq = { pats: List<CodePattern>, stack: Stack }
 
-fn all_slotted(patterns: List<CodePattern>, stack: Stack) -> PatternSeq =
+fn assign_pattern_slots(patterns: List<CodePattern>, stack: Stack) -> PatternSeq =
   patterns.fold({ pats: [], stack: stack }, |acc: PatternSeq, p: CodePattern| {
     let o = slotted(p, acc.stack);
     { pats: acc.pats.push(o.pattern), stack: o.stack }
@@ -1624,7 +1638,10 @@ fn released_around(e: TypedExpression<Type>, o: Lowered) -> Lowered = {
   let before = here.filter(|x: TypedRelease| x.place == ReleaseBefore);
   let unwound = release_slot_reads(o.stack, unwinding);
   let guarded = if unwinding.len() == 0 { { code: o.code, stack: unwound.stack } } else {
-    { code: hidden_call(b"?unwinds", unwound.codes.push(o.code), o.code.ty), stack: unwound.stack }
+    {
+      code: internal_builtin_call(b"?unwinds", unwound.codes.push(o.code), o.code.ty),
+      stack: unwound.stack,
+    }
   };
   let ty = guarded.code.ty;
   let ended = if after.len() == 0 { guarded } else {
@@ -1643,7 +1660,7 @@ fn released_around(e: TypedExpression<Type>, o: Lowered) -> Lowered = {
     };
     let lets = release_calls(bound, after, here);
     {
-      code: held_then(b"?released", slot, guarded.code, lets.codes),
+      code: value_after_calls(b"?released", slot, guarded.code, lets.codes),
       stack: unscope_stack(lets.stack, depth),
     }
   };
@@ -1653,7 +1670,7 @@ fn released_around(e: TypedExpression<Type>, o: Lowered) -> Lowered = {
   if !s.released.contains(span.site) { { code: made, stack: s } } else {
     let slot = top_frame(s).names.len();
     {
-      code: held_then(b"?held", slot, made, []),
+      code: value_after_calls(b"?held", slot, made, []),
       stack: binder_noted(
         unscope_stack(bind_in_stack(s, b"?held"), depth_of(s)),
         b"?held",
@@ -1666,7 +1683,7 @@ fn released_around(e: TypedExpression<Type>, o: Lowered) -> Lowered = {
   }
 }
 
-fn held_then(name: Bytes, slot: Int, value: Code, calls: List<Code>) -> Code =
+fn value_after_calls(name: Bytes, slot: Int, value: Code, calls: List<Code>) -> Code =
   {
     node: CodeBlock({
       statements: [CodeLet({ name: name, slot: slot, value: value })].concat(
@@ -1697,10 +1714,10 @@ fn release_calls(s: Stack, rs: List<TypedRelease>, here: List<TypedRelease>) -> 
           own.stack,
           here.filter(|y: TypedRelease| y.place == ReleaseFailing(r.held)),
         );
-        let call = hidden_call(b"?let_go", [x], unit_type());
+        let call = internal_builtin_call(b"?let_go", [x], unit_type());
         {
           codes: acc.codes.push(if failing.codes.len() == 0 { call }
-          else { hidden_call(b"?unwinds", failing.codes.push(call), unit_type()) }),
+          else { internal_builtin_call(b"?unwinds", failing.codes.push(call), unit_type()) }),
           stack: failing.stack,
         }
       },
@@ -1761,7 +1778,7 @@ pub fn slots_read(code: Code) -> List<Int> =
           CodeDo(d) -> slots_read(d.code),
         })).concat(match b.tail { Some(t) -> slots_read(t), None -> [] }),
     CodeList(l) -> all_read(l.items),
-    CodeRecord(r) -> fields_read(r.fields, []),
+    CodeRecord(r) -> field_slots_read(r.fields, []),
     CodeMatch(m) ->
       slots_read(m.scrutinee).concat(
         m.arms.fold([], |acc: List<Int>, a: CodeArm|
@@ -1772,7 +1789,7 @@ pub fn slots_read(code: Code) -> List<Int> =
             ),
           )),
       ),
-    CodeUpdate(u) -> fields_read(u.sets, slots_read(u.base)),
+    CodeUpdate(u) -> field_slots_read(u.sets, slots_read(u.base)),
     CodeLabel(_) -> [],
     CodePerform(p) ->
       List::concat(match p.label { Some(x) -> slots_read(x), None -> [] }, all_read(p.args)),
@@ -1794,7 +1811,7 @@ pub fn slots_read(code: Code) -> List<Int> =
 pub fn all_read(codes: List<Code>) -> List<Int> =
   codes.fold([], |acc: List<Int>, code: Code| acc.concat(slots_read(code)))
 
-fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
+fn field_slots_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
   fs.fold(before, |acc: List<Int>, field: CodeField| acc.concat(slots_read(field.value)))
 
 pub type LoweredBody = { code: Code, size: Int, failed: List<Bytes> }
@@ -1808,7 +1825,7 @@ pub fn lower_fn(
     empty_frame(),
     |frame: Frame, name: Bytes| bind(frame, name),
   );
-  let stack = params_noted(
+  let stack = record_param_binders(
     {
       frames: [start],
       labels: labels,

@@ -1,5 +1,5 @@
 import compiler.syntax.parsing (Span, span_between)
-import compiler.syntax.expressions (marshalling_perform, scheduler_module)
+import compiler.syntax.expressions (is_marshalling_function, scheduler_module)
 import compiler.check.types (Type, NamedType, int_type, string_type, bool_type)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (int_literal)
@@ -9,11 +9,11 @@ import compiler.emit.keys (RootKey, Named, Root, Generated, has_entry, definitio
 import compiler.emit.evidence (declared_arity)
 import compiler.emit.representations (Constructors, no_constructors, known_layout)
 import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
-import compiler.emit.pieces (Piece, Text, Hole, Symbol, ConstructorTag, FailureSiteRoot, InGroup,
+import compiler.emit.pieces (Piece, Text, Hole, Symbol, ConstructorTag, FailureOwner, InGroup,
                              LambdaOwner, FromCaller, merged, pieces_text, own_symbol)
 import compiler.emit.release (drop_of)
 import compiler.emit.typed_ir.handling (empty_instance)
-import compiler.emit.typed_ir (carried_variables, reps_of, all_given, param_rep,
+import compiler.emit.typed_ir (carried_variables, reps_of, owned_params, param_rep,
                                no_closure_evidence, Representation, AsInt, AsBool, AsWord,
                                AsFlattened, AsSum, AsUnit, AsListView, Var, Arg, VarOperand,
                                IntOperand, BoolOperand, ZeroOperand, Rvalue, Primitive, Literal,
@@ -25,21 +25,22 @@ import compiler.emit.typed_ir (carried_variables, reps_of, all_given, param_rep,
                                Restart, Jump, Fail, Handle, SiteScope, SiteOrigin, Inc, Dec, Reset,
                                Free, Destructure, Block, Fn, Member, Metered, Plain, OwnedParam,
                                OwnedResult, Lambda, Closure, OperationSignature, NoMatchingArm,
-                               IfUnique, WalkLoop, Unspecialised, no_links, falls_through, var_text,
+                               IfUnique, WalkLoop, OperandsOnly, no_links, falls_through, var_text,
                                base_allocation, InlineRecordPath, CleanupScope, Unwinding,
-                               operand_var, any_held, calls_in)
+                               operand_var, any_inst, calls_in)
 import compiler.emit.print.text (BodyContext, InstructionContext, Printing, PrintOutput,
                                  empty_printing, function_body, line, text, pieces, pad, named,
-                                 name_of, arg_text, assigned, label, check, failing_return, site,
-                                 slot, part_names, part_name, unsupported, native_noted)
-import compiler.emit.print.ownership (block_opened, block_closed, count_printed, walked_value,
+                                 name_of, arg_text, assigned, label, check, failing_return,
+                                 source_position, slot, part_names, part_name, unsupported,
+                                 native_noted)
+import compiler.emit.print.ownership (block_opened, block_closed, count_printed, walk_value,
                                       last_of, updated, failure_exit_through)
 import compiler.emit.print.value_printing (c_type, as_word, word_as, word_to_parts, value_printing,
-                                           get_printed, gathered, static_word, join_declared,
-                                           set_parts, returned, signature_types,
+                                           get_printed, build_value, static_word, join_declared,
+                                           set_parts, write_return_value, signature_types,
                                            signature_parameters, signature_names, params_opened,
-                                           write_inline, layout_dups_at)
-import compiler.emit.print.packing (packed)
+                                           write_inline, layout_retain_at)
+import compiler.emit.print.packing (representation_converted)
 import compiler.emit.print.destinations (destinations_of)
 import compiler.emit.print.probe (probe, head_probe, probed_fn)
 import compiler.emit.print.primitives (literal, primitive)
@@ -47,12 +48,12 @@ import compiler.emit.print.containers (list_printed, container_op)
 import compiler.emit.print.strings (string_op)
 import compiler.emit.print.matching (case_opened, case_arm, case_arm_closed, case_rest, case_closed,
                                      match_opened, match_arm, match_arm_closed, match_rest,
-                                     match_closed, missed, failed)
+                                     match_closed, next_arm_jump, failed)
 import compiler.emit.print.calling (call, applied, closure_made, restarted, entered_member,
-                                    loop_opened, loop_closed, next, done, calling_op, lambda_names,
-                                    lambda_text, group_wrapper, capture_printed, member_returned,
-                                    runtime_entry, entry_signature_of, group_buffers, member_opened,
-                                    typed_declared)
+                                    loop_opened, loop_closed, next, loop_done, calling_op,
+                                    lambda_names, lambda_text, group_wrapper, capture_printed,
+                                    member_returned, runtime_entry, entry_signature_of,
+                                    group_buffers, member_opened, typed_declared)
 import compiler.emit.lower.representation (passing, ByReference)
 import compiler.emit.print.effects (handle_opened, handle_closed, landing_jump, effect_op)
 import compiler.emit.print.frames (site_linked, handle_linked, unlinked, record_declared,
@@ -101,7 +102,7 @@ fn root_printed(
   constructors: Constructors,
 ) -> { printing: Printing, out: List<Piece> } / {abort.raise} = {
   let sited = match definition_of(f.key) {
-    Some(d) -> if marshalling_perform(d) { Some(FromCaller) } else { None },
+    Some(d) -> if is_marshalling_function(d) { Some(FromCaller) } else { None },
     None -> None,
   };
   let scheduling = match definition_of(f.key) { Some(d) -> enters_scheduler(d), None -> false };
@@ -115,7 +116,7 @@ fn root_printed(
     { printing: body, out: [] }
   } else { runtime_entry(body, name, entry_signature_of(f)) };
   let opening = match f.kind {
-    Metered -> if head_probed(f) { head_probe(f.convention.result) } else { b"" },
+    Metered -> if needs_stack_check(f) { head_probe(f.convention.result) } else { b"" },
     Plain -> if !is_drop_root(f.key) { b"" }
     else { Bytes::concat_all([b"  if (ply_drop_deep(ctx, p0, ", name, b")) return 0;\n"]) },
   };
@@ -143,7 +144,7 @@ fn root_printed(
 }
 
 fn enters_scheduler(d: Bytes) -> Bool =
-  marshalling_perform(d) || d == scheduler_module().concat(b".simulated")
+  is_marshalling_function(d) || d == scheduler_module().concat(b".simulated")
     || d == scheduler_module().concat(b".scheduled")
     || d == scheduler_module().concat(b".clocked")
 
@@ -341,7 +342,7 @@ fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing
 fn body_printed(
   symbol: Bytes,
   f: Fn,
-  sited: Option<FailureSiteRoot>,
+  sited: Option<FailureOwner>,
   given: Printing,
 ) -> Printing / {abort.raise} = {
   let kept = if sited == Some(FromCaller) {
@@ -368,7 +369,7 @@ fn body_printed(
     pr,
     |q: Printing, l: Bytes| line(q, 0, l),
   );
-  let viewed = views_opened(f, opened);
+  let viewed = declare_list_views(f, opened);
   let probed = match f.kind { Metered -> probe(f.convention.result), _ -> b";" };
   let looped = if restarts(f.body) {
     text(viewed, Bytes::concat_all([b"  ply_loop: ", probed, b"\n"]))
@@ -399,7 +400,7 @@ fn body_printed(
   if record.len() == 0 { done } else { { ..done, out: [Text(record)].concat(done.out) } }
 }
 
-fn views_opened(f: Fn, pr: Printing) -> Printing =
+fn declare_list_views(f: Fn, pr: Printing) -> Printing =
   range(0, f.params.len()).fold(pr, |q: Printing, i: Int|
     match f.params.at(i) {
       Some(v) -> if v.representation != AsListView || param_rep(f.convention, i) != Some(AsWord) {
@@ -423,9 +424,9 @@ fn views_opened(f: Fn, pr: Printing) -> Printing =
       None -> q,
     })
 
-fn restarts(b: Block) -> Bool = any_held(b, |i: Inst| match i { Restart(_) -> true, _ -> false })
+fn restarts(b: Block) -> Bool = any_inst(b, |i: Inst| match i { Restart(_) -> true, _ -> false })
 
-fn head_probed(f: Fn) -> Bool =
+fn needs_stack_check(f: Fn) -> Bool =
   !restarts(f.body) && (match f.key { Generated(_, _) -> true, _ -> calls_in(f.body) })
 
 fn failure_target(u: BodyContext) -> Bytes =
@@ -564,11 +565,11 @@ fn printed(home: BodyContext, pr: Printing, b: Block, depth: Int) -> Printing / 
               )
             },
             Miss -> match u.arm {
-              Some(a) -> missed(p, acc, a.label, a.at),
+              Some(a) -> next_arm_jump(p, acc, a.label, a.at),
               None -> unsupported(b"a miss outside a match", b"Miss"),
             },
             Fail(x) -> {
-              let out = failure_exit_through(acc, x.letting, x.unwind, failure_target(u));
+              let out = failure_exit_through(acc, x.resource, x.unwind, failure_target(u));
               failed({ ..p, at: x.at, leave: out.leave }, out.printing, x.reason)
             },
             Loop(lp) -> {
@@ -607,13 +608,13 @@ fn printed(home: BodyContext, pr: Printing, b: Block, depth: Int) -> Printing / 
                 ),
             },
             Done(a) -> match u.looping {
-              Some(lp) -> done(p, acc, lp.label, lp.result, a),
+              Some(lp) -> loop_done(p, acc, lp.label, lp.result, a),
               None -> unsupported(b"a loop's result outside a loop", b"Done"),
             },
             Return(a) -> match u.group {
               Some(_) -> member_returned(p, acc, a),
               None -> {
-                let r = returned(acc, depth, a);
+                let r = write_return_value(acc, depth, a);
                 let leaving = if u.epilogue == b"" { b"" }
                 else { Bytes::concat_all([b"  ", u.epilogue, b"\n"]) };
                 let moved = moved_to_destination(r.printing, a);
@@ -695,8 +696,8 @@ fn value_printed(
     },
     Take(t) -> taken(p, pr, into, t),
     Tag(name) -> tagged(p, pr, into, name),
-    Convert(k) -> packed(p, pr, into, k),
-    Aggregate(g) -> gathered(p, pr, into, g.parts),
+    Convert(k) -> representation_converted(p, pr, into, k),
+    Aggregate(g) -> build_value(p, pr, into, g.parts),
     Update(u) -> updated(p, pr, into, u),
     Call(c) -> call(p, pr, into, c),
     Apply(c) -> applied(p, pr, into, c),
@@ -708,8 +709,8 @@ fn value_printed(
       OfStrings(x) -> string_op(p, pr, into, x, o.args),
     },
     IfUnique(v) -> last_of(p, pr, into, v),
-    WalkLoop(w) -> walked_value(p, pr, into, w.of, w.op),
-    Unspecialised(_) ->
+    WalkLoop(w) -> walk_value(p, pr, into, w.of, w.op),
+    OperandsOnly(_) ->
       unsupported(b"what only a specialisation computes", b"a body its callers resolve"),
   }
 
@@ -760,7 +761,11 @@ fn taken_from_inline_record(
       let n = named(pr, v);
       let place = Bytes::concat_all([b"&", slot(block, at + 1)]);
       let bytes = int_literal(8 * m);
-      let counted = layout_dups_at(n.printing, l, Bytes::concat_all([b"ply_words(", n.name, b")"]));
+      let counted = layout_retain_at(
+        n.printing,
+        l,
+        Bytes::concat_all([b"ply_words(", n.name, b")"]),
+      );
       line(
         counted.printing,
         p.depth,
@@ -880,7 +885,7 @@ fn native(
     b")",
   ]);
   let noted = match builtin_pointed(n.name) { Some(h) -> native_noted(pr, h), None -> pr };
-  let sited = if n.uses.fails { site(p, noted) } else { noted };
+  let sited = if n.uses.fails { source_position(p, noted) } else { noted };
   let written = match into {
     Some(v) -> assigned(sited, p.depth, v, c_type(v.representation), call),
     None -> line(sited, p.depth, call.concat(b";")),
@@ -1022,7 +1027,7 @@ fn returning(result: Var, body: Block) -> Bytes / {abort.raise} =
     ).pieces,
   )
 
-fn nested_handles(fails: Bool) -> Bytes / {abort.raise} = {
+fn nested_handle_text(fails: Bool) -> Bytes / {abort.raise} = {
   let outer = word_var(0);
   let inner = word_var(1);
   let t = word_var(2);
@@ -1045,8 +1050,8 @@ fn nested_handles(fails: Bool) -> Bytes / {abort.raise} = {
 }
 
 test "a failure inside a handle's body goes to its landing, and the landing leaves by the handle's leave" {
-  let failing = nested_handles(true);
-  let quiet = nested_handles(false);
+  let failing = nested_handle_text(true);
+  let quiet = nested_handle_text(false);
   assert_eq(occurrences(failing, landing_jump(1)), occurrences(quiet, landing_jump(1)) + 1);
   assert_eq(occurrences(failing, b"return "), occurrences(quiet, b"return "));
   let after = match failing.index_of(b"ply_h1:") {
@@ -1066,7 +1071,7 @@ test "a fail inside a handle's body goes to its landing, never out of the functi
   ]);
   let failing = returning(result, [
     handle_over(result, [
-      Fail({ reason: NoMatchingArm, at: span_between(0, 0), letting: [], unwind: [] }),
+      Fail({ reason: NoMatchingArm, at: span_between(0, 0), resource: [], unwind: [] }),
     ]),
   ]);
   assert_eq(occurrences(failing, landing_jump(0)), occurrences(set, landing_jump(0)) + 1);
@@ -1249,7 +1254,7 @@ fn int_root(params: List<Var>, body: Block) -> Fn =
     kind: Metered,
     params: params,
     convention: {
-      params: all_given(params.map(|v: Var| v.representation)),
+      params: owned_params(params.map(|v: Var| v.representation)),
       result: AsInt,
       destination_passing: false,
       returned: OwnedResult,
@@ -1351,7 +1356,7 @@ fn called(args: List<Arg>) -> Rvalue =
     callee: Root(Named(b"m.g")),
     args: args,
     convention: {
-      params: all_given(args.map(|_: Arg| AsWord)),
+      params: owned_params(args.map(|_: Arg| AsWord)),
       result: AsWord,
       destination_passing: false,
       returned: OwnedResult,
@@ -1359,7 +1364,7 @@ fn called(args: List<Arg>) -> Rvalue =
     suspends: false,
   })
 
-fn holding(v: Var, value: Rvalue, unwind: List<Var>) -> Inst =
+fn let_unwinding(v: Var, value: Rvalue, unwind: List<Var>) -> Inst =
   Let({ var: v, value: value, at: span_between(0, 0), unwind: unwind })
 
 fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
@@ -1368,7 +1373,7 @@ fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
       {
         ..int_root(params, body),
         convention: {
-          params: all_given(params.map(|v: Var| v.representation)),
+          params: owned_params(params.map(|v: Var| v.representation)),
           result: AsWord,
           destination_passing: false,
           returned: OwnedResult,
@@ -1393,9 +1398,9 @@ test "each failure releases what it holds through tails that failures holding al
   let b = word_var(2);
   let c = word_var(3);
   let text = word_root([s], [
-    holding(a, called([]), [s]),
-    holding(b, called([]), [s, a]),
-    holding(c, called([VarOperand(a)]), [s, b]),
+    let_unwinding(a, called([]), [s]),
+    let_unwinding(b, called([]), [s, a]),
+    let_unwinding(c, called([VarOperand(a)]), [s, b]),
     Return(VarOperand(c)),
   ]);
   let said = Some(String::of_bytes_lossy(text));
@@ -1421,8 +1426,8 @@ test "a tail stands in the block its value was declared in, and goes on to the t
     If({
       cond: VarOperand(flag),
       then: [
-        holding(a, called([]), [s]),
-        holding(b, called([]), [s, a]),
+        let_unwinding(a, called([]), [s]),
+        let_unwinding(b, called([]), [s, a]),
         Assign({ var: j, arg: VarOperand(b) }),
       ],
       otherwise: [Assign({ var: j, arg: VarOperand(s) })],
@@ -1444,8 +1449,8 @@ test "a failure inside a handle's body releases what the body holds and goes to 
   let text = word_root([s], [
     Handle({
       body: [
-        holding(a, called([]), []),
-        holding(b, called([]), [a]),
+        let_unwinding(a, called([]), []),
+        let_unwinding(b, called([]), [a]),
         Assign({ var: result, arg: VarOperand(b) }),
       ],
       args: [],
@@ -1472,14 +1477,22 @@ test "a value whose C tests for no failure adds no tail" {
   let half = { ..n, id: 2 };
   let a = word_var(3);
   let quiet = word_root([s, n], [
-    holding(half, Primitive({ op: b"div", on: AsInt, args: [VarOperand(n), IntOperand(2)] }), [s]),
+    let_unwinding(
+      half,
+      Primitive({ op: b"div", on: AsInt, args: [VarOperand(n), IntOperand(2)] }),
+      [s],
+    ),
     Return(VarOperand(s)),
   ]);
   assert_eq(quiet.index_of(b"goto ply_u"), None);
   assert_eq(quiet.index_of(b"ply_u0:"), None);
   let then_called = word_root([s, n], [
-    holding(half, Primitive({ op: b"div", on: AsInt, args: [VarOperand(n), IntOperand(2)] }), [s]),
-    holding(a, called([]), [s]),
+    let_unwinding(
+      half,
+      Primitive({ op: b"div", on: AsInt, args: [VarOperand(n), IntOperand(2)] }),
+      [s],
+    ),
+    let_unwinding(a, called([]), [s]),
     Return(VarOperand(a)),
   ]);
   assert(then_called.index_of(b"if (ctx->failed) goto ply_u0;") != None);

@@ -17,9 +17,9 @@ import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFixed, AsFloat, 
                                Convert, Native, Inst, Let, Do, Declaration, Assign, If, Case, Match,
                                Miss, Loop, Next, Done, Return, Restart, Jump, Fail, Handle,
                                SiteScope, Inc, Dec, Reset, Free, Destructure, Block, Lambda, Links,
-                               AsWord, AsUnit, AsListView, Aggregate, Primitive, Unspecialised,
+                               AsWord, AsUnit, AsListView, Aggregate, Primitive, OperandsOnly,
                                operand_representation, falls_through, is_refcounted, operands,
-                               parts_of, no_links, CleanupScope, Unwinding, Carried)
+                               parts_of, no_links, CleanupScope, Unwinding, LoopVariable)
 import compiler.emit.lower.module_context (ModuleContext)
 import compiler.emit.lower.representation (representation_of)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticLayout, StaticWords, AddressWord,
@@ -40,7 +40,7 @@ pub type Context = {
   parameter_positions: Map<Int, Int>,
   inlined_from: Option<{ owner: RootKey, written: List<code::Lambda> }>,
   owners: Map<Bytes, RootKey>,
-  observing: Bool,
+  emits_notes: Bool,
   frame: Span,
   captured: List<Int>,
   allows_lambda_inlining: Bool,
@@ -66,19 +66,22 @@ pub type CapturedEvidence = {
 
 pub fn no_captured_evidence() -> CapturedEvidence = { words: [], instance: None, kept: [] }
 
-pub type Holding<a> = { words: List<a>, instance: Option<a>, kept: List<a> }
+pub type EvidenceValues<a> = { words: List<a>, instance: Option<a>, kept: List<a> }
 
-pub fn holding_laid<a>(h: Holding<a>) -> List<a> =
+pub fn listed_evidence_values<a>(h: EvidenceValues<a>) -> List<a> =
   h.words.concat(match h.instance { Some(i) -> [i], None -> [] }).concat(h.kept)
 
-pub fn held_values(h: CapturedEvidence) -> Holding<Arg> =
+pub fn evidence_values_of(h: CapturedEvidence) -> EvidenceValues<Arg> =
   {
     words: h.words.map(|w: EvidenceWord| w.word),
     instance: match h.instance { Some(i) -> Some(i.word), None -> None },
     kept: h.kept,
   }
 
-pub fn held_inside(h: CapturedEvidence, vars: Holding<Var>) -> CapturedEvidence =
+pub fn substitute_evidence_vars(
+  h: CapturedEvidence,
+  vars: EvidenceValues<Var>,
+) -> CapturedEvidence =
   {
     words: zip(h.words, vars.words).map(|p: { first: EvidenceWord, second: Var }|
       { ..p.first, word: VarOperand(p.second) }),
@@ -91,7 +94,7 @@ pub fn held_inside(h: CapturedEvidence, vars: Holding<Var>) -> CapturedEvidence 
 
 pub type EvidenceWord = { evidence: Evidence, word: Arg, through: Bool, handled: Bool }
 
-pub type TailCalls = | Restarts(List<Representation>) | Enters(List<RootKey>) | Calls
+pub type TailCalls = | Restarts(List<Representation>) | Enters(List<RootKey>) | PlainCalls
 
 pub type Lowering = {
   next: Int,
@@ -178,7 +181,7 @@ pub fn deferred_to_specialisation(
   rep: Representation,
   ops: List<{ arg: Arg, takes: Bool }>,
   at: Span,
-) -> LoweredValue = bound_as(st, ty, rep, Unspecialised(ops), at)
+) -> LoweredValue = bound_as(st, ty, rep, OperandsOnly(ops), at)
 
 pub fn run_for_effect(st: Lowering, value: Rvalue, at: Span) -> Lowering =
   emitted(st, Do({ value: value, at: at, unwind: [] }))
@@ -198,11 +201,11 @@ pub fn note_slot_read(
   slot: Int,
   at: Span,
 ) -> Lowering =
-  if !context.observing { st }
+  if !context.emits_notes { st }
   else { with_note(st, note, [IntOperand(slot), IntOperand(context.frame.site)], at) }
 
 pub fn note_frame_entry(context: Context, st: Lowering, at: Span) -> Lowering =
-  if !context.observing { st }
+  if !context.emits_notes { st }
   else { with_note(st, enter_note(), [IntOperand(context.frame.site)], at) }
 
 fn with_note(st: Lowering, note: Bytes, args: List<Arg>, at: Span) -> Lowering =
@@ -248,7 +251,7 @@ pub fn static_added(
 pub fn with_lambda(st: Lowering, l: Lambda) -> { st: Lowering, nth: Int } =
   { st: { ..st, lambdas: st.lambdas.push(l) }, nth: st.lambdas.len() }
 
-pub fn noted(st: Lowering, need: Need) -> Lowering =
+pub fn with_need(st: Lowering, need: Need) -> Lowering =
   if st.links.needs.contains(need) { st }
   else { { ..st, links: { ..st.links, needs: st.links.needs.push(need) } } }
 
@@ -384,7 +387,7 @@ fn references_variable(i: Inst, id: Int, binding: Bool) -> Bool = {
     Match(m) -> within(m.rest) || m.arms.any(within),
     Loop(l) ->
       l.result.id == id
-        || l.state.any(|c: Carried| c.var.id == id || argument_references(c.init, id))
+        || l.state.any(|c: LoopVariable| c.var.id == id || argument_references(c.init, id))
         || within(l.body),
     Next(args) -> args.any(|a: Arg| argument_references(a, id)),
     Done(a) -> argument_references(a, id),
@@ -426,7 +429,7 @@ pub fn packed_from(st: Lowering, v: Var, to: Representation) -> Option<Var> = {
     })
 }
 
-pub fn unread_packs_dropped(b: Block) -> Block =
+pub fn drop_unread_conversions(b: Block) -> Block =
   unread_dropped_in(b, |id: Int| b.any(|i: Inst| references_variable(i, id, false)))
 
 fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
@@ -678,7 +681,7 @@ test "a word just opened to its type and handed straight back as a word is the w
   let back = represented_as(enter_block, AsWord, dummy_span());
   assert_eq(back.arg, VarOperand(w));
   assert_eq(back.st.insts, enter_block.st.insts);
-  assert_eq(unread_packs_dropped(back.st.insts), []);
+  assert_eq(drop_unread_conversions(back.st.insts), []);
   let named = {
     ..enter_block,
     st: { ..enter_block.st, env: enter_block.st.env.insert(1, enter_block.arg) },

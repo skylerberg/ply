@@ -196,7 +196,7 @@ fn plain(what: LineKind) -> Shape = { what: what, key: 0, key_end: 0, from: 0, t
 
 fn blanks() -> Bytes = b" \t\r"
 
-fn is_mark(o: Options, c: Int) -> Bool = (c == 35 && o.hash) || (c == 59 && o.semicolon)
+fn is_comment_marker(o: Options, c: Int) -> Bool = (c == 35 && o.hash) || (c == 59 && o.semicolon)
 
 fn delimiters(o: Options) -> Bytes = if o.colon { b"=:" } else { b"=" }
 
@@ -204,7 +204,7 @@ fn shape(row: Bytes, number: Int, o: Options) -> Shape / {ini.fail, abort.raise}
   let lead = row.skip(0, blanks());
   let c = row.peek(lead);
   if c < 0 { plain(Blank) }
-  else if is_mark(o, c) { plain(Comment) }
+  else if is_comment_marker(o, c) { plain(Comment) }
   else if c == 91 { plain(Header(header_name(row, lead, number, o))) }
   else { entry_shape(row, lead, number, o) }
 }
@@ -215,7 +215,7 @@ fn header_name(row: Bytes, lead: Int, number: Int, o: Options) -> String / {ini.
   let from = min(row.skip(lead + 1, blanks()), close);
   let to = trimmed_end(row, from, close);
   let after = row.skip(close + 1, blanks());
-  if close >= n || to == from || (after < n && !is_mark(o, row.at(after))) {
+  if close >= n || to == from || (after < n && !is_comment_marker(o, row.at(after))) {
     fail(number, BadHeader)
   } else { String::of_bytes(row.slice(from, to)) }
 }
@@ -276,7 +276,7 @@ fn valued_entry_shape(
   if o.quotes && row.peek(start) == 34 {
     let q = read_quoted(row, start + 1, number);
     let after = row.skip(q.end, blanks());
-    if after < n && !is_mark(o, row.at(after)) { fail(number, BadQuote) } else {
+    if after < n && !is_comment_marker(o, row.at(after)) { fail(number, BadQuote) } else {
       {
         what: Entry({ key: key, value: Some(String::of_bytes(q.value)) }),
         key: lead,
@@ -346,10 +346,10 @@ fn located_entries(doc: Document) -> List<LocatedEntry> =
       _ -> { at: w.at + 1, section: w.section, found: w.found },
     }).found
 
-fn folded(o: Options, name: String) -> String =
+fn case_folded(o: Options, name: String) -> String =
   if o.any_case { unicode::lowercase(name) } else { name }
 
-fn same(o: Options, a: String, b: String) -> Bool = folded(o, a) == folded(o, b)
+fn same(o: Options, a: String, b: String) -> Bool = case_folded(o, a) == case_folded(o, b)
 
 fn section_entries(doc: Document, section: String) -> List<LocatedEntry> =
   located_entries(doc).filter(|p: LocatedEntry| same(doc.options, p.section, section))
@@ -390,14 +390,14 @@ type Distinct = { seen: Map<String, Unit>, kept: List<String> }
 /// `names` without those that match an earlier one, each as first written.
 fn distinct(o: Options, names: List<String>) -> List<String> =
   names.fold({ seen: Map::new(), kept: [] }, |d: Distinct, name: String|
-    if d.seen.contains(folded(o, name)) { d }
-    else { { seen: d.seen.insert(folded(o, name), ()), kept: d.kept.push(name) } }).kept
+    if d.seen.contains(case_folded(o, name)) { d }
+    else { { seen: d.seen.insert(case_folded(o, name), ()), kept: d.kept.push(name) } }).kept
 
 /// `doc`, or an error at the first line that repeats a key its section already has.
 fn check_unique_keys(doc: Document) -> Document / {ini.fail} = {
   let o = doc.options;
   let _ = located_entries(doc).fold(Map::new(), |seen: Map<List<String>, Unit>, p: LocatedEntry| {
-    let name = [folded(o, p.section), folded(o, p.entry.key)];
+    let name = [case_folded(o, p.section), case_folded(o, p.entry.key)];
     if seen.contains(name) { fail(p.at + 1, Repeated) } else { seen.insert(name, ()) }
   });
   doc
@@ -437,7 +437,7 @@ pub fn add(
   key: String,
   value: String,
 ) -> Document / {ini.fail, abort.raise} = {
-  let spot = spot_for(doc, section);
+  let spot = placement_for(doc, section);
   if !doc.options.repeats && key_entries(doc, section, key).len() > 0 {
     fail(spot.at + 1, Repeated)
   } else {
@@ -471,9 +471,9 @@ pub fn remove(doc: Document, section: String, key: String) -> Document = {
 
 /// Where a new entry goes: the index its line takes, what is written before its key and between
 /// its key and its value, and whether its section's header is written above it.
-type Spot = { at: Int, lead: String, separator: String, opens: Bool }
+type Placement = { at: Int, lead: String, separator: String, opens: Bool }
 
-fn spot_for(doc: Document, section: String) -> Spot / {ini.fail, abort.raise} =
+fn placement_for(doc: Document, section: String) -> Placement / {ini.fail, abort.raise} =
   match section_entries(doc, section).last() {
     Some(p) -> styled_after(doc, p.at),
     None -> match header_indexes(doc, section).last() {
@@ -484,7 +484,7 @@ fn spot_for(doc: Document, section: String) -> Spot / {ini.fail, abort.raise} =
   }
 
 /// The spot after the entry on line `at`, in that entry's style.
-fn styled_after(doc: Document, at: Int) -> Spot / {ini.fail, abort.raise} = {
+fn styled_after(doc: Document, at: Int) -> Placement / {ini.fail, abort.raise} = {
   let row = Bytes::of_string(doc.lines.get(at).text);
   let s = shape(row, at + 1, doc.options);
   {
@@ -556,7 +556,7 @@ fn entry_line(
   let tried = if !o.quotes { [bare] }
   else if w.quoted_first { [head ++ in_quotes(value) ++ tail, bare] }
   else { [bare, head ++ in_quotes(value) ++ tail] };
-  match tried.filter(|text: String| reads_as(o, text, what)) {
+  match tried.filter(|text: String| parses_as(o, text, what)) {
     [text, ..] -> { what: what, text: text },
     [] -> fail(w.line, Unwritable),
   }
@@ -569,12 +569,12 @@ fn header_line(
   number: Int,
 ) -> Line / {ini.fail, abort.raise} = {
   let text = "[" ++ name ++ "]" ++ tail;
-  if reads_as(o, text, Header(name)) { { what: Header(name), text: text } }
+  if parses_as(o, text, Header(name)) { { what: Header(name), text: text } }
   else { fail(number, Unwritable) }
 }
 
 /// Whether `text` is one line that parses as `what`.
-fn reads_as(o: Options, text: String, what: LineKind) -> Bool / {abort.raise} = {
+fn parses_as(o: Options, text: String, what: LineKind) -> Bool / {abort.raise} = {
   let read = try { shape(Bytes::of_string(text), 0, o) };
   !text.contains("\n") && (match read { Ok(s) -> s.what == what, Err(_) -> false })
 }
@@ -614,10 +614,10 @@ fn rewrite_value(
 // --- Properties -------------------------------------------------------------
 
 /// A limit no text here reaches.
-fn cap() -> Int = 1_000_000
+fn size_limit() -> Int = 1_000_000
 
 /// Every choice `defaults` turns off, turned on.
-fn loose() -> Options =
+fn all_enabled() -> Options =
   {
     hash: true,
     semicolon: true,
@@ -633,7 +633,10 @@ fn quoting() -> Options = { ..defaults(), quotes: true }
 
 test "a text that parses is written back byte for byte" {
   gen::check(gen::text(), |text: String| {
-    match decode(text, loose(), cap()) { Ok(doc) -> render(doc) == text, Err(_) -> true }
+    match decode(text, all_enabled(), size_limit()) {
+      Ok(doc) -> render(doc) == text,
+      Err(_) -> true,
+    }
   })
 }
 
@@ -641,7 +644,7 @@ test "a value that is set is the value parsed back from the text" {
   gen::check(gen::text(), |x: String|
     round_trip(
       |value: String| render(set(empty(quoting()), "section", "key", value)),
-      |text: String| get(read(text, quoting(), cap()), "section", "key"),
+      |text: String| get(read(text, quoting(), size_limit()), "section", "key"),
       x,
     ))
 }
@@ -767,7 +770,7 @@ fn readings() -> List<Reading> =
     },
     {
       name: "a comment character inside quotes",
-      options: { ..loose(), colon: false },
+      options: { ..all_enabled(), colon: false },
       text: "key = \"a # b\" # noted",
       what: entry("key", "a # b"),
     },
@@ -797,7 +800,7 @@ fn readings() -> List<Reading> =
     },
     {
       name: "a key with no value before a comment",
-      options: { ..loose(), colon: false },
+      options: { ..all_enabled(), colon: false },
       text: "flag # key = value",
       what: Entry({ key: "flag", value: None }),
     },
@@ -918,7 +921,7 @@ fn rejected() -> List<Rejected> =
   ]
 
 test "{c.name} is rejected" for c: Rejected in rejected() {
-  assert_eq(decode(c.text, c.options, cap()), Err({ line: c.line, reason: c.reason }));
+  assert_eq(decode(c.text, c.options, size_limit()), Err({ line: c.line, reason: c.reason }));
   assert(explain(c.reason).len() > 0)
 }
 
@@ -934,11 +937,11 @@ test "a text over the limit is rejected without parsing, and one at the limit pa
 }
 
 test "a text is its lines joined by line feeds, so every text is written back" {
-  let back = |text: String| render(read(text, defaults(), cap()));
-  assert_eq(read("", defaults(), cap()).lines.len(), 1);
-  assert_eq(read("", defaults(), cap()), empty(defaults()));
-  assert_eq(read("a = 1\n", defaults(), cap()).lines.len(), 2);
-  assert_eq(read("a = 1", defaults(), cap()).lines.len(), 1);
+  let back = |text: String| render(read(text, defaults(), size_limit()));
+  assert_eq(read("", defaults(), size_limit()).lines.len(), 1);
+  assert_eq(read("", defaults(), size_limit()), empty(defaults()));
+  assert_eq(read("a = 1\n", defaults(), size_limit()).lines.len(), 2);
+  assert_eq(read("a = 1", defaults(), size_limit()).lines.len(), 1);
   assert_eq(back(""), "");
   assert_eq(back("\n\n"), "\n\n");
   assert_eq(back("  a  =  1  \r\n\t; c\r\n[ s ]\r\nb=2"), "  a  =  1  \r\n\t; c\r\n[ s ]\r\nb=2")
@@ -964,7 +967,7 @@ fn nested() -> String =
   \\X = 5
 
 test "a key is looked up in its section, and its last value is returned" {
-  let doc = read(nested(), { ..defaults(), bare_keys: true }, cap());
+  let doc = read(nested(), { ..defaults(), bare_keys: true }, size_limit());
   assert_eq(get(doc, "a", "x"), Some("2"));
   assert_eq(get_all(doc, "a", "x"), ["1", "2"]);
   assert_eq(get(doc, "b", "x"), Some("3"));
@@ -976,7 +979,7 @@ test "a key is looked up in its section, and its last value is returned" {
 }
 
 test "a key with no value returns the empty text, and its entry tells it apart from an empty one" {
-  let doc = read(nested(), { ..defaults(), bare_keys: true }, cap());
+  let doc = read(nested(), { ..defaults(), bare_keys: true }, size_limit());
   assert_eq(get(doc, "a", "flag"), Some(""));
   assert_eq(get(doc, "A", "y"), Some(""));
   assert_eq(entries(doc, "a"), [
@@ -988,30 +991,30 @@ test "a key with no value returns the empty text, and its entry tells it apart f
 }
 
 test "sections and keys are listed once each, in the order they first appear" {
-  let doc = read(nested(), { ..defaults(), bare_keys: true }, cap());
+  let doc = read(nested(), { ..defaults(), bare_keys: true }, size_limit());
   assert_eq(sections(doc), ["a", "b", "A"]);
   assert_eq(keys(doc, "a"), ["x", "flag"]);
   assert_eq(keys(doc, ""), ["top"]);
   assert_eq(keys(doc, "c"), []);
-  assert_eq(sections(read("# nothing\n", defaults(), cap())), [])
+  assert_eq(sections(read("# nothing\n", defaults(), size_limit())), [])
 }
 
 test "a section opened again is one section, and case is ignored only when the dialect says so" {
-  let folded = read(nested(), { ..defaults(), bare_keys: true, any_case: true }, cap());
-  assert_eq(sections(folded), ["a", "b"]);
-  assert_eq(keys(folded, "A"), ["x", "flag", "y"]);
-  assert_eq(get_all(folded, "a", "X"), ["1", "2", "5"]);
-  assert_eq(get(folded, "A", "x"), Some("5"));
-  let again = read("[a]\nx = 1\n[b]\n[a]\nx = 2\n", defaults(), cap());
+  let case_folded = read(nested(), { ..defaults(), bare_keys: true, any_case: true }, size_limit());
+  assert_eq(sections(case_folded), ["a", "b"]);
+  assert_eq(keys(case_folded, "A"), ["x", "flag", "y"]);
+  assert_eq(get_all(case_folded, "a", "X"), ["1", "2", "5"]);
+  assert_eq(get(case_folded, "A", "x"), Some("5"));
+  let again = read("[a]\nx = 1\n[b]\n[a]\nx = 2\n", defaults(), size_limit());
   assert_eq(sections(again), ["a", "b"]);
   assert_eq(get_all(again, "a", "x"), ["1", "2"]);
-  let accented = read("[Größe]\nÄnderung = 1\n", { ..defaults(), any_case: true }, cap());
+  let accented = read("[Größe]\nÄnderung = 1\n", { ..defaults(), any_case: true }, size_limit());
   assert_eq(get(accented, "GRÖßE", "änderung"), Some("1"))
 }
 
 // --- Tests: editing ---------------------------------------------------------
 
-fn site() -> String =
+fn example_ini() -> String =
   \\# site.ini
   \\name = demo
   \\
@@ -1023,46 +1026,54 @@ fn site() -> String =
   \\root=C:\data
   \\
 
-fn noted() -> Options = { ..defaults(), trailing_comments: true }
+fn trailing_comment_options() -> Options = { ..defaults(), trailing_comments: true }
 
 test "set rewrites one value and keeps its line's blanks and comment" {
-  let doc = read(site(), noted(), cap());
+  let doc = read(example_ini(), trailing_comment_options(), size_limit());
   assert_eq(
     render(set(doc, "server", "host", "example.org")),
-    site().replace("example.com", "example.org"),
+    example_ini().replace("example.com", "example.org"),
   );
-  assert_eq(render(set(doc, "paths", "root", "D:\\srv")), site().replace("C:\\data", "D:\\srv"));
-  assert_eq(render(set(doc, "", "name", "")), site().replace("name = demo", "name = "));
+  assert_eq(
+    render(set(doc, "paths", "root", "D:\\srv")),
+    example_ini().replace("C:\\data", "D:\\srv"),
+  );
+  assert_eq(render(set(doc, "", "name", "")), example_ini().replace("name = demo", "name = "));
   assert_eq(get(set(doc, "server", "host", "example.org"), "server", "host"), Some("example.org"));
-  assert_eq(render(set(doc, "server", "port", "8080")), site())
+  assert_eq(render(set(doc, "server", "port", "8080")), example_ini())
 }
 
 test "a key written more than once has its last value set" {
-  let doc = read("[a]\nx = 1\nx = 2\n[a]\nx = 3 \ny = 4\n", defaults(), cap());
+  let doc = read("[a]\nx = 1\nx = 2\n[a]\nx = 3 \ny = 4\n", defaults(), size_limit());
   assert_eq(render(set(doc, "a", "x", "9")), "[a]\nx = 1\nx = 2\n[a]\nx = 9 \ny = 4\n")
 }
 
 test "a new entry follows its section's last one, in the same style" {
-  let doc = read(site(), noted(), cap());
+  let doc = read(example_ini(), trailing_comment_options(), size_limit());
   assert_eq(
     render(set(doc, "server", "tls", "on")),
-    site().replace("  port = 8080\n", "  port = 8080\n  tls = on\n"),
+    example_ini().replace("  port = 8080\n", "  port = 8080\n  tls = on\n"),
   );
   assert_eq(
     render(set(doc, "paths", "cache", "/tmp")),
-    site().replace("root=C:\\data\n", "root=C:\\data\ncache=/tmp\n"),
+    example_ini().replace("root=C:\\data\n", "root=C:\\data\ncache=/tmp\n"),
   );
   assert_eq(
     render(set(doc, "", "owner", "ada")),
-    site().replace("name = demo\n", "name = demo\nowner = ada\n"),
+    example_ini().replace("name = demo\n", "name = demo\nowner = ada\n"),
   );
   assert_eq(
     render(add(doc, "server", "host", "example.net")),
-    site().replace("  port = 8080\n", "  port = 8080\n  host = example.net\n"),
+    example_ini().replace("  port = 8080\n", "  port = 8080\n  host = example.net\n"),
   );
   assert_eq(
     render(
-      add(read("[a]\nx=1\n[b]\n[a]\ny : 2\n", { ..defaults(), colon: true }, cap()), "a", "z", "3"),
+      add(
+        read("[a]\nx=1\n[b]\n[a]\ny : 2\n", { ..defaults(), colon: true }, size_limit()),
+        "a",
+        "z",
+        "3",
+      ),
     ),
     "[a]\nx=1\n[b]\n[a]\ny : 2\nz : 3\n",
   )
@@ -1070,7 +1081,7 @@ test "a new entry follows its section's last one, in the same style" {
 
 test "a section with no entry takes one under its header, and a new section opens at the end" {
   let at = |text: String, section: String|
-    render(add(read(text, defaults(), cap()), section, "k", "v"));
+    render(add(read(text, defaults(), size_limit()), section, "k", "v"));
   assert_eq(at("[a]\n[b]\nx=1\n", "a"), "[a]\nk = v\n[b]\nx=1\n");
   assert_eq(at("[a]\nx=1\n", "b"), "[a]\nx=1\n[b]\nk = v\n");
   assert_eq(at("[a]\nx=1", "b"), "[a]\nx=1\n[b]\nk = v");
@@ -1082,7 +1093,7 @@ test "a section with no entry takes one under its header, and a new section open
 }
 
 test "a line written into a text of carriage returns ends in one" {
-  let doc = read("[a]\r\nx = 1\r\n", defaults(), cap());
+  let doc = read("[a]\r\nx = 1\r\n", defaults(), size_limit());
   assert_eq(render(set(doc, "a", "x", "2")), "[a]\r\nx = 2\r\n");
   assert_eq(render(set(doc, "a", "y", "2")), "[a]\r\nx = 1\r\ny = 2\r\n");
   assert_eq(render(set(doc, "b", "y", "2")), "[a]\r\nx = 1\r\n[b]\r\ny = 2\r\n");
@@ -1090,7 +1101,11 @@ test "a line written into a text of carriage returns ends in one" {
 }
 
 test "a value is written in quotes when it was in quotes or needs them" {
-  let doc = read("a = \"one\" ; noted\nb = two\nc = \"x\"#y\n", { ..loose(), colon: false }, cap());
+  let doc = read(
+    "a = \"one\" ; noted\nb = two\nc = \"x\"#y\n",
+    { ..all_enabled(), colon: false },
+    size_limit(),
+  );
   let text = |d: Document| render(d);
   assert_eq(text(set(doc, "", "a", "1")), "a = \"1\" ; noted\nb = two\nc = \"x\"#y\n");
   assert_eq(text(set(doc, "", "c", "z")), "a = \"one\" ; noted\nb = two\nc = \"z\"#y\n");
@@ -1103,7 +1118,11 @@ test "a value is written in quotes when it was in quotes or needs them" {
 }
 
 test "a key with no value gains a delimiter, and an empty value keeps its comment apart" {
-  let doc = read("flag ; noted\nempty = ; noted\nbare\n", { ..loose(), colon: false }, cap());
+  let doc = read(
+    "flag ; noted\nempty = ; noted\nbare\n",
+    { ..all_enabled(), colon: false },
+    size_limit(),
+  );
   assert_eq(render(set(doc, "", "flag", "on")), "flag = on ; noted\nempty = ; noted\nbare\n");
   assert_eq(render(set(doc, "", "bare", "on")), "flag ; noted\nempty = ; noted\nbare = on\n");
   assert_eq(render(set(doc, "", "empty", "full")), "flag ; noted\nempty =full ; noted\nbare\n");
@@ -1111,7 +1130,7 @@ test "a key with no value gains a delimiter, and an empty value keeps its commen
 }
 
 test "remove deletes every entry of a key and leaves the other lines" {
-  let doc = read("[a]\nx = 1\n# kept\nx = 2\ny = 3\n[b]\nx = 4\n", defaults(), cap());
+  let doc = read("[a]\nx = 1\n# kept\nx = 2\ny = 3\n[b]\nx = 4\n", defaults(), size_limit());
   assert_eq(render(remove(doc, "a", "x")), "[a]\n# kept\ny = 3\n[b]\nx = 4\n");
   assert_eq(remove(doc, "a", "z"), doc);
   assert_eq(remove(doc, "c", "x"), doc)
@@ -1144,7 +1163,7 @@ fn unwritten() -> List<Unwritten> =
     },
     {
       name: "a value that would open a comment",
-      options: noted(),
+      options: trailing_comment_options(),
       section: "a",
       key: "k",
       value: "v # w",
@@ -1195,23 +1214,23 @@ fn unwritten() -> List<Unwritten> =
   ]
 
 test "{c.name} is not written" for c: Unwritten in unwritten() {
-  let doc = read("[a]\nx = 1\n", c.options, cap());
+  let doc = read("[a]\nx = 1\n", c.options, size_limit());
   assert_eq(try { set(doc, c.section, c.key, c.value) }, Err({ line: 3, reason: Unwritable }))
 }
 
 test "a value that cannot be written bare is rejected at its line, or quoted if the dialect can" {
-  let doc = read("[a]\nx = 1\ny = 2\n", defaults(), cap());
+  let doc = read("[a]\nx = 1\ny = 2\n", defaults(), size_limit());
   assert_eq(try { set(doc, "a", "x", " v") }, Err({ line: 2, reason: Unwritable }));
   assert_eq(render(set(doc, "a", "x", "v # w")), "[a]\nx = v # w\ny = 2\n");
-  let read_quoted = read("[a]\nx = 1\ny = 2\n", quoting(), cap());
+  let read_quoted = read("[a]\nx = 1\ny = 2\n", quoting(), size_limit());
   assert_eq(render(set(read_quoted, "a", "x", " v")), "[a]\nx = \" v\"\ny = 2\n")
 }
 
 test "a key is added again only when the dialect's keys may repeat" {
-  let once = read("[a]\nx = 1\n", { ..defaults(), repeats: false }, cap());
+  let once = read("[a]\nx = 1\n", { ..defaults(), repeats: false }, size_limit());
   assert_eq(try { add(once, "a", "x", "2") }, Err({ line: 3, reason: Repeated }));
   assert_eq(render(set(once, "a", "x", "2")), "[a]\nx = 2\n");
   assert_eq(render(add(once, "a", "y", "2")), "[a]\nx = 1\ny = 2\n");
-  let many = read("[a]\nx = 1\n", defaults(), cap());
+  let many = read("[a]\nx = 1\n", defaults(), size_limit());
   assert_eq(get_all(add(many, "a", "x", "2"), "a", "x"), ["1", "2"])
 }

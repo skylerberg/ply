@@ -8,7 +8,7 @@ import compiler.emit.code (Code, read_name, CodeLiteral, CodeVar, NDefinition, N
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (LiteralUnit)
 import compiler.syntax.expressions (detached_closure_span, scheduler_module)
-import compiler.emit.representations (Definition, resumed, no_constructors)
+import compiler.emit.representations (Definition, resume_result_type, no_constructors)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Fn, Metered, falls_through,
                                operand_representation, CleanupScope, Unwinding, Fail, LetMismatch,
@@ -20,7 +20,7 @@ import compiler.emit.lower.base (Context, Lowering, LoweredValue, ToConstructor,
                                  ToDefinition, ToValue, ToInlinedBody, LoweredArm, GroupMember,
                                  initial_lowering, unreachable, enter_block, exit_block, joined,
                                  short_circuit, represented_as, note_slot_read, read_note,
-                                 typed_slot_read, list_of_view, type_of, noted,
+                                 typed_slot_read, list_of_view, type_of, with_need,
                                  no_captured_evidence, emitted)
 import compiler.emit.lower.data (constructed, record_literal, field, record_update)
 import compiler.emit.lower.scalars (literal, constant, operand, unary, binary, unwound)
@@ -36,9 +36,10 @@ import compiler.emit.lower.calling (convention, parameter_representations, targe
                                     stack_allocated, known_run, known_applied)
 import compiler.emit.lower.handling (performed, label, clause_frame, return_frame, body_frame,
                                      handle_assembled, parallel_block, enter_handle, handle_plan,
-                                     clause_captured_evidence, instance_objects, detached_landing,
-                                     detaches, scheduler_perform_call, HandlePlan)
-import compiler.emit.lower.evidence (evidence_parameters, root_body_start, entry_body_start,
+                                     clause_captured_evidence, instance_objects,
+                                     lower_detached_handle, detaches, scheduler_perform_call,
+                                     HandlePlan)
+import compiler.emit.lower.evidence (evidence_parameters, enter_root_body, entry_body_start,
                                      words_of, evidence_parameter_types, performed_by,
                                      captured_evidence_for)
 import compiler.emit.evidence (evidence_type)
@@ -52,7 +53,7 @@ pub fn root_lowered(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
 
 pub fn root_observed(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
-  lowered_fn({ ..context_of(setting, r, body), observing: true }, body)
+  lowered_fn({ ..context_of(setting, r, body), emits_notes: true }, body)
 }
 
 pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Fn / {abort.raise} =
@@ -90,7 +91,11 @@ pub fn tail_calls(
 fn stack_closure(plan: HandlePlan, k: LoweredValue) -> LoweredValue =
   match plan.instance.block { None -> stack_allocated(k), Some(_) -> k }
 
-fn spawned(context: Context, state: Lowering, x: Code) -> LoweredValue / {abort.raise} =
+fn spawn_argument_lowered(
+  context: Context,
+  state: Lowering,
+  x: Code,
+) -> LoweredValue / {abort.raise} =
   match x.node {
     CodeLambda(l) -> {
       let held = captured_evidence_for(context, state, words_of(context, l.effects), l.at);
@@ -143,7 +148,7 @@ fn let_with_mismatch(
   let letting = value.st.unwinding.fold(own.us, |us: List<Unwinding>, u: Unwinding|
     if mine.contains(id(u)) { us } else { us.push(u) });
   let_else(context, { ..value, st: own.st }, pattern, [
-    Fail({ reason: LetMismatch, at: at, letting: letting, unwind: [] }),
+    Fail({ reason: LetMismatch, at: at, resource: letting, unwind: [] }),
   ])
 }
 
@@ -199,10 +204,10 @@ pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
       representation: match held.at(i) { Some(r) -> r, None -> conv.params.get(i).representation },
     });
   let begun = entry_body_start(
-    root_body_start(context, initial_lowering(params), params, declared, h),
+    enter_root_body(context, initial_lowering(params), params, declared, h),
     context.performs,
   );
-  let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: EffectsGeneric }) }
+  let start = if h.unfilled { with_need(begun.st, { var: 0 - 1, reads: EffectsGeneric }) }
   else { begun.st };
   let out = lowered(begun.context, start, body, true);
   let returned = if falls_through(out.st.insts) { represented_as(out, conv.result, body.span) }
@@ -281,9 +286,9 @@ fn slot_taken(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let l = list_of_view({ st: state, arg: a }, at);
-  if is_label_binder(name) { l }
-  else if resumed(type_of(a)) != None { continuation_closure(context, l.st, slot, a, at) }
-  else { typed_slot_read(context, l, name, slot, ty, at) }
+  if is_label_binder(name) { l } else if resume_result_type(type_of(a)) != None {
+    continuation_closure(context, l.st, slot, a, at)
+  } else { typed_slot_read(context, l, name, slot, ty, at) }
 }
 
 fn callee_lowered(
@@ -293,7 +298,7 @@ fn callee_lowered(
 ) -> LoweredValue / {abort.raise} =
   match function.node {
     CodeVar(v) -> match state.env.get(v.slot) {
-      Some(a) -> if resumed(type_of(a)) != None {
+      Some(a) -> if resume_result_type(type_of(a)) != None {
         { st: note_slot_read(context, state, read_note(), v.slot, function.span), arg: a }
       } else { lowered(context, state, function, false) },
       None -> lowered(context, state, function, false),
@@ -625,7 +630,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
             context,
             reads_noted(context, ops.st, ops.read),
             b,
-            u.copies,
+            u.copied_fields,
             zip(u.sets, set).map(|x: { first: CodeField, second: Arg }|
               { name: x.first.name, arg: x.second }),
             c.ty,
@@ -671,7 +676,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       let args = p.args.fold(
         { st: lb.st, args: [] },
         |acc: { st: Lowering, args: List<Arg> }, x: Code| {
-          let o = if spawns { spawned(context, acc.st, x) }
+          let o = if spawns { spawn_argument_lowered(context, acc.st, x) }
           else { lowered(context, acc.st, x, false) };
           { st: o.st, args: acc.args.push(o.arg) }
         },
@@ -773,7 +778,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         closure(
           context,
           objects.st,
-          detached_landing(o.context, o.st, inner, h, plan, result, at),
+          lower_detached_handle(o.context, o.st, inner, h, plan, result, at),
           frame,
           Metered,
           at,

@@ -25,7 +25,8 @@ import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, LawBinde
                                      spec_info_bin, BodyChecking, ReuseBodies, OwnCall)
 import compiler.emit.keys (test_owner, law_owner)
 import compiler.check.infer.definitions (checked_functions, check_order)
-import compiler.check.infer (EmitFacts, types_named, types_joined, emit_facts_bin, facts_moved)
+import compiler.check.infer (EmitFacts, types_named, types_joined, emit_facts_bin,
+                             remap_fact_modules)
 import compiler.check.typed (TypedBody, part_key)
 import compiler.check.resolve.tables (Diagnostic, Label, Edit, Fix, Source, diagnostic_bin)
 import compiler.syntax.parsing (Span, span_between, start)
@@ -92,7 +93,7 @@ fn moved_tables(t: ModuleTables, m: Relocation) -> ModuleTables =
     constructors: t.constructors.map(|c: ConstructorInfo| { ..c, at: moved_location(c.at, m) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: moved_location(x.at, m) }),
     numeric: t.numeric.map(|x: NumericInfo| { ..x, at: moved_location(x.at, m) }),
-    facts: facts_moved(t.facts, |i: Int| moved_index(i, m)),
+    facts: remap_fact_modules(t.facts, |i: Int| moved_index(i, m)),
   }
 
 fn moved_diagnostic(d: Diagnostic, m: Relocation) -> Diagnostic =
@@ -130,7 +131,7 @@ fn group_offset(spots: List<ItemRange>, p: Int) -> Int =
 
 fn owner_result(
   said: ModuleCheck,
-  share: Share,
+  share: OwnerPart,
   spots: List<ItemRange>,
 ) -> OwnerResult / {abort.raise} = {
   let slot = said.slot;
@@ -155,7 +156,7 @@ fn owner_result(
     xs.fold(0 - 1, |acc: Int, k: Int| if acc < 0 || k < acc { k } else { acc });
   let first_test = lowest(share.tests.map(|x: TestInfo| x.index));
   let first_law = lowest(share.laws.map(|l: LawInfo| l.index));
-  numbered(
+  offset_indexes(
     {
       tables: moved_tables(kept, back),
       rows: {
@@ -169,7 +170,7 @@ fn owner_result(
       statements: share.statements.map(|x: StatementSite| { ..x, span: moved_at(x.span, back) }),
       consts: share.consts,
       sets: share.sets,
-      laws: share.outlined,
+      laws: share.law_outlines,
       uses: share.uses.map(|r: UseNode|
         {
           ..r,
@@ -186,7 +187,7 @@ fn owner_result(
   )
 }
 
-type Share = {
+type OwnerPart = {
   definitions: List<DefinitionInfo>,
   tests: List<TestInfo>,
   laws: List<LawInfo>,
@@ -202,7 +203,7 @@ type Share = {
   statements: List<StatementSite>,
   consts: List<TypedConst>,
   sets: List<EffectSetRow>,
-  outlined: List<LawOutline>,
+  law_outlines: List<LawOutline>,
   uses: List<UseNode>,
 }
 
@@ -622,7 +623,7 @@ pub fn finalized_result(
                     },
                   }),
                 facts: {
-                  ..facts_moved(w.typed.facts, |i: Int| moved_index(i, to)),
+                  ..remap_fact_modules(w.typed.facts, |i: Int| moved_index(i, to)),
                   pure: m.result.tables.facts.pure,
                 },
                 cached: w.typed.cached,
@@ -775,7 +776,7 @@ pub fn group_results(
       statements: share_in(statements, o),
       consts: share_in(consts, o),
       sets: share_in(sets, o),
-      outlined: share_in(outlined, o),
+      law_outlines: share_in(outlined, o),
       uses: share_in(uses, o),
     };
   let chosen = {
@@ -830,7 +831,7 @@ pub fn group_results(
 fn share_in<a>(m: Map<Bytes, List<a>>, o: Bytes) -> List<a> =
   match m.get(o) { Some(xs) -> xs, None -> [] }
 
-pub fn numbered(a: OwnerResult, tests: Int, laws: Int) -> OwnerResult =
+pub fn offset_indexes(a: OwnerResult, tests: Int, laws: Int) -> OwnerResult =
   {
     ..a,
     tables: {
@@ -898,7 +899,7 @@ pub fn assembled(
   let numbered_all = placed.fold(
     { tests: 0, laws: 0, out: [] },
     |acc: { tests: Int, laws: Int, out: List<OwnerResult> }, x: { first: Int, member: MemberResult, result: OwnerResult }| {
-      let a = numbered(x.result, acc.tests, acc.laws);
+      let a = offset_indexes(x.result, acc.tests, acc.laws);
       {
         tests: acc.tests + a.tables.tests.len(),
         laws: acc.laws + a.tables.laws.len(),
@@ -1041,7 +1042,7 @@ pub fn assembled(
   }
 }
 
-type Whole = {
+type ModuleOwnerResults = {
   module: Bytes,
   whole: ModuleFacts,
   rows: List<KnownDefinitionRow>,
@@ -1049,7 +1050,10 @@ type Whole = {
   owners: List<OwnerResult>,
 }
 
-fn owned_apart(whole: Analysis, sources: List<Source>) -> List<Whole> / {abort.raise} = {
+fn owners_checked_alone(
+  whole: Analysis,
+  sources: List<Source>,
+) -> List<ModuleOwnerResults> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
   let text_at = |i: Int| match texts.get(whole.modules.get(i).name) { Some(t) -> t, None -> b"" };
@@ -1069,7 +1073,7 @@ fn owned_apart(whole: Analysis, sources: List<Source>) -> List<Whole> / {abort.r
     unread: [],
   };
   let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
-  range(0, whole.modules.len()).fold([], |acc: List<Whole>, i: Int| {
+  range(0, whole.modules.len()).fold([], |acc: List<ModuleOwnerResults>, i: Int| {
     let parsed = whole.modules.get(i);
     if !texts.contains(parsed.name) { acc } else {
       let raw = parse(text_at(i)).node;
@@ -1151,7 +1155,7 @@ fn normalized_tables(t: ModuleTables) -> ModuleTables / {abort.raise} =
 
 fn joined_tables(owners: List<OwnerResult>) -> ModuleTables =
   owners.fold(no_module_tables(), |acc: ModuleTables, a: OwnerResult| {
-    let t = numbered(a, acc.tests.len(), acc.laws.len()).tables;
+    let t = offset_indexes(a, acc.tests.len(), acc.laws.len()).tables;
     {
       definitions: acc.definitions.concat(t.definitions),
       tests: acc.tests.concat(t.tests),
@@ -1176,7 +1180,7 @@ fn agrees(sources: List<Source>) -> Unit / {abort.raise} = {
     Analysed(w) -> w,
     Rejected(_) -> panic("the fixture checks"),
   };
-  owned_apart(whole, sources).fold((), |u: Unit, m: Whole| {
+  owners_checked_alone(whole, sources).fold((), |u: Unit, m: ModuleOwnerResults| {
     let apart = normalized_tables(joined_tables(m.owners));
     let checked = normalized_tables(m.whole.tables);
     assert_eq(
@@ -1227,7 +1231,7 @@ test "each owner checked alone and placed where it stands returns what its modul
   agrees(faceted())
 }
 
-fn assembled_apart(
+fn assembled_alone(
   whole: Analysis,
   sources: List<Source>,
 ) -> List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefinitionRow>, warned: List<Bytes>, apart: AssembledModule }> / {abort.raise} = {
@@ -1356,7 +1360,7 @@ fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
     Analysed(w) -> w,
     Rejected(_) -> panic("the fixture checks"),
   };
-  assembled_apart(whole, sources).fold(
+  assembled_alone(whole, sources).fold(
     (),
     |u: Unit, m: { module: Bytes, whole: ModuleFacts, rows: List<KnownDefinitionRow>, warned: List<Bytes>, apart: AssembledModule }| {
       let a = m.apart.facts;

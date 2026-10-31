@@ -1,4 +1,4 @@
-import args (kept)
+import args (matches_filters)
 import units (emit)
 import std.fs
 import std.fs (fs, mem_empty)
@@ -13,7 +13,7 @@ import compiler.store.hash.encoding (hex)
 import compiler.front.checking.world (QueryEffects)
 import compiler.front.checking.groups (queries)
 import compiler.front.emitter_input (Analysed, checked_program_of)
-import compiler.load (analyse_in_memory, fresh_check_results, deriving_nothing, read_packages)
+import compiler.load (analyse_in_memory, fresh_check_results, forbid_derivers, read_packages)
 import results
 import store.tables
 import store.fake (run_in_memory)
@@ -28,7 +28,8 @@ import tester
 import tester (result_cache, ExecutionResult, InterleavingFailure, BindingReport, LastPass, Options,
                TestRun, TestUnit, Usage, joined_trace, sum_usage, no_usage)
 import std.machine as entering
-import changes (Compared, ChangeDiff, compared, delta_of, change_diffs, texts_of, texts_then)
+import changes (Compared, ChangeDiff, compared, delta_of, change_diffs, texts_of,
+                stored_baseline_texts)
 import changes
 import views
 import testing.conclude (Conclusion, Hashes, StaleIndex, UnobservedSearch, is_written)
@@ -36,7 +37,7 @@ import testing.conclude
 import testing.delta (Delta)
 import testing.diagnose (changes_of)
 import testing.select
-import testing.select (StoredResult, Moved, Row, Search, Stands, keyed_per_root, digest_of,
+import testing.select (StoredResult, Moved, Row, Search, Passing, keyed_per_root, digest_of,
                        pass_keys_by_test, key_of, pending_roots, seed_keys)
 import std.bytes
 import sim.plan
@@ -58,7 +59,7 @@ pub fn test_hash_at(analysis: CheckedProgram, i: Int) -> Option<Bytes> =
 pub fn hash_at(analysis: CheckedProgram, i: Int) -> Option<String> / {abort.raise} =
   match test_hash_at(analysis, i) { Some(h) -> Some(h.hex_of()), None -> None }
 
-pub fn seeded_of(effects: List<types::Effect>) -> Bool =
+pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
   effects.fold(false, |found: Bool, a: types::Effect| found || a.effect == b"sim")
 
 pub fn entry_of(index: Int, key: Bytes) -> Entry =
@@ -279,7 +280,7 @@ pub fn conclude_tests(
         acc.push({
           index: i,
           key: t.key,
-          seeded: seeded_of(t.effects),
+          seeded: uses_simulation(t.effects),
           hash: test_hash_at(analysis, i),
           of: match entry { Some(e) -> e.of, None -> t.key },
           case: match entry { Some(e) -> e.case != None, None -> false },
@@ -331,7 +332,7 @@ fn cost_of(c: Option<search::Cost>) -> Option<Cost> =
       }),
   }
 
-fn tenths_of(e: Exploration) -> Option<Int> =
+fn reduction_tenths_of(e: Exploration) -> Option<Int> =
   match e.naive {
     None -> None,
     Some(naive) -> if e.explored > 0 { Some((naive.explored * 20 + e.explored) / (2 * e.explored)) }
@@ -345,7 +346,7 @@ fn explored_of(e: Exploration) -> SearchSummary / {abort.raise} =
     exhausted: e.exhausted,
     blind: cost_of(e.blind),
     naive: cost_of(e.naive),
-    reduction_tenths: tenths_of(e),
+    reduction_tenths: reduction_tenths_of(e),
     steps: e.steps,
     virtual_time_ns: e.virtual_time,
     failing_seed: match e.failure { Some(seed) -> Some(plan::seed_text(seed)), None -> None },
@@ -578,7 +579,7 @@ pub fn mutated(
   options: Options,
   search_options: SearchOptions,
   targeted: Option<List<DefinitionInfo>>,
-) -> RunReport / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.report_reached} =
+) -> RunReport / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.report_view_used} =
   match targeted {
     None -> report,
     Some(definitions) -> if !green_run(report) { report } else {
@@ -609,7 +610,7 @@ fn mutant_verdict(
   id: Int,
   every: List<List<Int>>,
   search_options: SearchOptions,
-) -> MutantVerdict / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.report_reached} =
+) -> MutantVerdict / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.report_view_used} =
   match queue.mutants.at(id) {
     None ->
       { id: id, verdict: "unresolved", reason: "no mutant " ++ id.to_string() ++ " was queued" },
@@ -701,7 +702,7 @@ pub fn cases_of(
       )),
     returning: range(0, rows.len()).map(|i: Int|
       match ((keys.at_or(i, None), held.at_or(i, None))) {
-        (Some(key), Some(Stands)) -> [key],
+        (Some(key), Some(Passing)) -> [key],
         (Some(_), None) -> match ((rooted.at_or(i, None), owed.at_or(i, None))) {
           (Some(ks), Some([])) -> ks,
           _ -> [],
@@ -723,12 +724,12 @@ pub fn pass_status(
 ) -> Option<StoredResult> / {entering::machine.changed_read, abort.raise} =
   match held {
     None -> None,
-    Some(trace) -> if trace == b"" { Some(Stands) } else {
+    Some(trace) -> if trace == b"" { Some(Passing) } else {
       let split = views::split(trace);
       match tester::stale_read(options, supplied, split.rest) {
         Some(what) -> Some(Moved(what)),
         None -> match views::stale_view(now, split.shipped_views) {
-          None -> Some(Stands),
+          None -> Some(Passing),
           Some(what) -> Some(Moved(what)),
         },
       }
@@ -757,7 +758,7 @@ pub fn diagnosed_all(
         (Some(f), Some(Some(record))) -> Some(compared(tree, f.key, f.test_hash, record)),
         _ -> None,
       });
-    let then = texts_then(
+    let then = stored_baseline_texts(
       sides.fold([], |acc: List<Compared>, x: Option<Compared>|
         match x { Some(c) -> acc.push(c), None -> acc }),
     );
@@ -841,10 +842,16 @@ test "a bounded count renders as a lower bound, and a reduction needs the naive 
     failure: None,
     race: None,
   };
-  assert_eq(tenths_of(e), None);
-  assert_eq(tenths_of({ ..e, naive: Some({ explored: 120, bounded: false }) }), Some(100));
-  assert_eq(tenths_of({ ..e, naive: Some({ explored: 40, bounded: false }) }), Some(33));
-  assert_eq(tenths_of({ ..e, explored: 0, naive: Some({ explored: 40, bounded: false }) }), None);
+  assert_eq(reduction_tenths_of(e), None);
+  assert_eq(
+    reduction_tenths_of({ ..e, naive: Some({ explored: 120, bounded: false }) }),
+    Some(100),
+  );
+  assert_eq(reduction_tenths_of({ ..e, naive: Some({ explored: 40, bounded: false }) }), Some(33));
+  assert_eq(
+    reduction_tenths_of({ ..e, explored: 0, naive: Some({ explored: 40, bounded: false }) }),
+    None,
+  );
   assert_eq(
     explored_of({ ..e, failure: Some({ root: 7u64, path: [1, 0] }) }).failing_seed,
     Some("7:1.0"),
@@ -873,7 +880,7 @@ fn loaded_from(
               m.insert(Bytes::of_string(f.path.slice(2, f.path.len() - 4)), f.body),
           );
           {
-            modules: deriving_nothing(|| fresh_check_results[t](p)).modules,
+            modules: forbid_derivers(|| fresh_check_results[t](p)).modules,
             whole: whole,
             sources: whole.frame.outlines.map(|o: Outline|
               { name: o.name, src: texts.get(o.name).unwrap_or(b"") }),
@@ -888,7 +895,7 @@ fn loaded_from(
     fs.read_file[t](path) -> fs::mem_read(tree, path),
     shipped.names() -> ["std.prelude"],
     shipped.module(name) -> if name == "std.prelude" { Some(prelude_source::text()) } else { None },
-    shipped.report_reached(view, pulled) -> (),
+    shipped.report_view_used(view, pulled) -> (),
     shipped.read_pack(path, offset, len) -> None,
     shipped.definitions() -> listed,
     shipped.stamps() -> "",
@@ -938,7 +945,7 @@ fn store_passing(
     ran,
   );
   handle {
-    store_history(view, program.sources, program.modules, c.filing)
+    store_history(view, program.sources, program.modules, c.store_update)
   } with {
     var store = tables::open_cache[mem]("cache", { runtime: "runtime", code: "code" }),
     result_cache.unstored(hashes) -> results::unstored_in(store, hashes),
@@ -946,7 +953,7 @@ fn store_passing(
       store = results::store_pass(store, texts, modules);
     },
     return u -> {
-      let _flushed = tables::flush_cache[mem](results::put_filing[mem, mem](store, c.filing));
+      let _flushed = tables::flush_cache[mem](results::put_filing[mem, mem](store, c.store_update));
       u
     },
   }

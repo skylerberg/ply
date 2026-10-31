@@ -239,7 +239,7 @@ fn reader_at(
     None ->
       {
         dash: b"--".concat(b),
-        limits: floored(limits),
+        limits: non_negative_limits(limits),
         lines: lines,
         at: 0,
         parts: parts,
@@ -252,7 +252,7 @@ fn reader_at(
 
 /// `l` with each limit below zero set to zero, so an error for passing one is at a byte of the
 /// body.
-fn floored(l: Limits) -> Limits =
+fn non_negative_limits(l: Limits) -> Limits =
   {
     max_parts: max(l.max_parts, 0),
     max_header_bytes: max(l.max_header_bytes, 0),
@@ -310,7 +310,7 @@ fn opening(r: Reader, seen: Bytes, searched: Int) -> Step / {multipart.fail, abo
     } else {
       match tail(r, seen, at + width) {
         Short -> More({ ..r, phase: Opening(max(0, at - 1)) }),
-        Opens(next) -> head({ ..r, at: next, phase: Head }, seen),
+        NextPart(next) -> head({ ..r, at: next, phase: Head }, seen),
         Closes(next) -> End({ ..r, at: next, phase: Closed }),
       }
     },
@@ -319,12 +319,12 @@ fn opening(r: Reader, seen: Bytes, searched: Int) -> Step / {multipart.fail, abo
 
 /// What follows a delimiter: the line break that opens a part, the `--` that closes the body,
 /// each with where the next line starts, or too few bytes to tell.
-type Tail = | Opens(Int) | Closes(Int) | Short
+type Tail = | NextPart(Int) | Closes(Int) | Short
 
 fn tail(r: Reader, seen: Bytes, after: Int) -> Tail / {multipart.fail, abort.raise} =
   if seen.peek(after) != b'-' {
     match line_break(r, seen, seen.skip(after, blanks())) {
-      Some(next) -> Opens(next),
+      Some(next) -> NextPart(next),
       None -> Short,
     }
   } else if after + 1 >= seen.len() { Short }
@@ -473,7 +473,7 @@ fn data(
         let found = { headers: headers, head: r.at, from: from, to: to };
         match tail(r, seen, i + needle.len()) {
           Short -> More({ ..r, phase: Data(headers, from, i) }),
-          Opens(next) -> Next(found, { ..r, at: next, parts: r.parts + 1, phase: Head }),
+          NextPart(next) -> Next(found, { ..r, at: next, parts: r.parts + 1, phase: Head }),
           Closes(next) -> Next(found, { ..r, at: next, parts: r.parts + 1, phase: Closed }),
         }
       }
@@ -524,14 +524,14 @@ fn find_parts_from(
   if left <= 0 { fail(r, body.len(), Truncated) } else {
     match step(r, body) {
       Next(found, next) -> find_parts_from(next, body, acc.push(found), left - 1),
-      End(closed) -> { parts: acc, reader: finished(closed, body) },
+      End(closed) -> { parts: acc, reader: finish_reader(closed, body) },
       More(_) -> fail(r, body.len(), Truncated),
     }
   }
 
 /// The reader past the closing delimiter, once the epilogue is known to be short and to contain
 /// no delimiter.
-fn finished(r: Reader, body: Bytes) -> Reader / {multipart.fail, abort.raise} =
+fn finish_reader(r: Reader, body: Bytes) -> Reader / {multipart.fail, abort.raise} =
   if body.len() - r.at > r.limits.max_preamble {
     fail(r, r.at + r.limits.max_preamble, EpilogueTooLarge)
   } else {
@@ -756,16 +756,16 @@ fn with_parameter(b: Bytes, p: Parameters, name: String, at: Int) -> Parameters 
 
 /// A quoted name with a browser's escapes decoded.
 fn unescaped(text: String) -> String =
-  name_escapes().fold(text, |acc: String, e: { written: String, meant: String }|
-    acc.replace(e.written, e.meant))
+  name_escapes().fold(text, |acc: String, e: { written: String, source_names: String }|
+    acc.replace(e.written, e.source_names))
 
-fn name_escapes() -> List<{ written: String, meant: String }> =
+fn name_escapes() -> List<{ written: String, source_names: String }> =
   [
-    { written: "%22", meant: "\"" },
-    { written: "%0D", meant: "\r" },
-    { written: "%0d", meant: "\r" },
-    { written: "%0A", meant: "\n" },
-    { written: "%0a", meant: "\n" },
+    { written: "%22", source_names: "\"" },
+    { written: "%0D", source_names: "\r" },
+    { written: "%0d", source_names: "\r" },
+    { written: "%0A", source_names: "\n" },
+    { written: "%0a", source_names: "\n" },
   ]
 
 /// The name under which a client's file can be stored in one directory, on any system: its last
@@ -989,12 +989,12 @@ pub fn form_data(
   )
 
 fn field_part(index: Int, f: Field) -> Part / {multipart.unwritable} =
-  { headers: [disposing(index, f.name, None)], data: Bytes::of_string(f.value) }
+  { headers: [form_data_disposition(index, f.name, None)], data: Bytes::of_string(f.value) }
 
 fn file_part(index: Int, f: File) -> Part / {multipart.unwritable} =
   {
     headers: [
-      disposing(index, f.name, Some(f.filename)),
+      form_data_disposition(index, f.name, Some(f.filename)),
       { name: "content-type", value: mime::render(f.content_type) },
     ],
     data: f.data,
@@ -1007,7 +1007,7 @@ pub fn build_form(
   boundary: String,
 ) -> Result<Bytes, WriteError> / {abort.raise} = try { form_data(fields, files, boundary) }
 
-fn disposing(
+fn form_data_disposition(
   index: Int,
   name: String,
   filename: Option<String>,
@@ -1094,7 +1094,7 @@ fn charset_printed() -> String =
   \\AaB03x--
 
 /// RFC 7578 §4.6's body with the delimiters its text means.
-fn charset_meant() -> String =
+fn default_charset_body() -> String =
   \\--AaB03x
   \\content-disposition: form-data; name="_charset_"
   \\
@@ -1107,7 +1107,7 @@ fn charset_meant() -> String =
 
 /// A form as Chrome sends one, written by hand from what it sends: two text fields, a file whose
 /// name contains a letter outside ASCII and quotes, and a file input left empty.
-fn chrome() -> String =
+fn chrome_form_body() -> String =
   \\------WebKitFormBoundary7MA4YWxkTrZu0gW
   \\Content-Disposition: form-data; name="title"
   \\
@@ -1170,7 +1170,7 @@ fn curl() -> String =
 fn typed_plain(charset: String) -> Header =
   { name: "content-type", value: "text/plain; charset=" ++ charset }
 
-fn disposed_as(value: String) -> Header = { name: "content-disposition", value: value }
+fn disposition_header(value: String) -> Header = { name: "content-disposition", value: value }
 
 type Readable = { what: String, body: Bytes, boundary: String, lines: Lines, parts: List<Part> }
 
@@ -1200,7 +1200,7 @@ fn readable() -> List<Readable> =
       parts: [
         {
           headers: [
-            disposed_as("form-data; name=\"field1\""),
+            disposition_header("form-data; name=\"field1\""),
             { name: "content-type", value: "text/plain;charset=UTF-8" },
             { name: "content-transfer-encoding", value: "quoted-printable" },
           ],
@@ -1213,17 +1213,19 @@ fn readable() -> List<Readable> =
       body: wire(charset_printed()),
       boundary: "AaB03x",
       lines: Strict,
-      parts: [{ headers: [disposed_as("form-data; name=\"_charset_\"")], data: b"iso-8859-1" }],
+      parts: [
+        { headers: [disposition_header("form-data; name=\"_charset_\"")], data: b"iso-8859-1" },
+      ],
     },
     {
       what: "RFC 7578's default charset as meant",
-      body: wire(charset_meant()),
+      body: wire(default_charset_body()),
       boundary: "AaB03x",
       lines: Strict,
       parts: [
-        { headers: [disposed_as("form-data; name=\"_charset_\"")], data: b"iso-8859-1" },
+        { headers: [disposition_header("form-data; name=\"_charset_\"")], data: b"iso-8859-1" },
         {
-          headers: [disposed_as("form-data; name=\"field1\"")],
+          headers: [disposition_header("form-data; name=\"field1\"")],
           data: b"...text encoded in iso-8859-1 ...",
         },
       ],
@@ -1234,10 +1236,10 @@ fn readable() -> List<Readable> =
       boundary: "------------------------d74496d66958873e",
       lines: Strict,
       parts: [
-        { headers: [disposed_as("form-data; name=\"name\"")], data: b"value" },
+        { headers: [disposition_header("form-data; name=\"name\"")], data: b"value" },
         {
           headers: [
-            disposed_as("form-data; name=\"file\"; filename=\"hello.txt\""),
+            disposition_header("form-data; name=\"file\"; filename=\"hello.txt\""),
             { name: "content-type", value: "text/plain" },
           ],
           data: b"Hello, World!\r\n",
@@ -1789,7 +1791,7 @@ fn dispositions() -> List<Disposed> =
   ]
 
 test "a disposition of {show(c.value)}" for c: Disposed in dispositions() {
-  assert_eq(disposition({ headers: [disposed_as(c.value)], data: b"" }), c.read)
+  assert_eq(disposition({ headers: [disposition_header(c.value)], data: b"" }), c.read)
 }
 
 type Named = { name: String, safe: Option<String> }
@@ -1856,7 +1858,7 @@ fn text_plain() -> MediaType = MediaType("text", "plain", [])
 
 test "a browser's form is its fields and its files" {
   assert_eq(
-    parse_form(wire(chrome()), "----WebKitFormBoundary7MA4YWxkTrZu0gW", default_limits()),
+    parse_form(wire(chrome_form_body()), "----WebKitFormBoundary7MA4YWxkTrZu0gW", default_limits()),
     Ok({
       fields: [
         { name: "title", value: "Quarterly report" },
@@ -1909,7 +1911,10 @@ test "RFC 7578's fields are read in the charset and the transfer encoding they n
     parse_form(wire(euro()).concat(b"--"), "AaB03x", default_limits()),
     Ok({ fields: [{ name: "field1", value: "Joe owes \u{20ac}100." }], files: [] }),
   );
-  let latin = wire(charset_meant()).replace(b"...text encoded in iso-8859-1 ...", b"caf\xe9");
+  let latin = wire(default_charset_body()).replace(
+    b"...text encoded in iso-8859-1 ...",
+    b"caf\xe9",
+  );
   assert_eq(
     parse_form(latin, "AaB03x", default_limits()),
     Ok({

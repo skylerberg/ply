@@ -16,15 +16,15 @@ import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, ma
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, Scheme, Effect, int_type,
                              bool_type, bytes_type, unit_type, fn_type, monomorphic, no_effects,
                              read_effects)
-import compiler.emit.lower.module_context (ModuleContext, declared_schemes, walked_read,
+import compiler.emit.lower.module_context (ModuleContext, declared_schemes, decode_inferred_facts,
                                            definitions_in, resolved_imports, declared_effects,
-                                           filings_of, param_type, scheduler_imported,
+                                           recorded_annotations, param_type, scheduler_imported,
                                            published_operations, root_body, resolved_at,
                                            root_params, body_code)
 import compiler.check.typed
 import compiler.check.typed (BodyPart, WholeBody, ClauseBody, TestRun, CaseListing)
 import compiler.emit.lower.calling (known_body, lambdas_of, named_in, definition_in)
-import compiler.emit.lower.scalars (is_walked_container, is_walked_columns)
+import compiler.emit.lower.scalars (is_walked_container, is_columns_type)
 import compiler.emit.typing (SiteAnnotations)
 import compiler.front.rows (Rows, KnownDefinitionRow, KnownTestRow, ModuleDerivations, EffectRow)
 import compiler.front.published (facts_read)
@@ -53,13 +53,13 @@ import compiler.emit.representations (Constructors, SumConstructor, BytesShape, 
                                       kind_of, boxed, at_args, substituted)
 import compiler.emit.generated (GeneratedRoot, MarshalledSums, container_code,
                                 container_op_generated, marshal_root, is_marshal_op,
-                                runtime_entry_code, marshals, equality_code, compared_code,
-                                ordering_code, ordered_code, key_instance, keyed_code,
+                                runtime_entry_code, is_marshallable, equality_code, compared_code,
+                                ordering_code, ordered_code, key_instance, key_comparison_code,
                                 numeric_instance, instance_code, digest_code, reflection_code,
-                                called_definition, let_go_code, let_go_items_code)
+                                called_definition, release_resource_code, release_items_code)
 import compiler.emit.root_emission (root_from_code, emitted_of, naming)
 import compiler.emit.release (generated)
-import compiler.emit.lower.marshalling (word_form_entry)
+import compiler.emit.lower.marshalling (serialization_function)
 import compiler.emit.specialisations (specialisations_wanted, specialised_lowered, tail_loop_of,
                                       tail_loop_lowered)
 
@@ -215,7 +215,7 @@ pub type ModuleScope = {
   effects: List<EffectName>,
 }
 
-pub fn returned(
+pub fn root_outputs(
   s: Scope,
   roots: List<RootKey>,
   handed: Map<RootName, OwnershipSignature>,
@@ -274,7 +274,7 @@ pub fn scope_of(
     Map::new(),
     |acc: Map<Bytes, Scheme>, row: KnownDefinitionRow| acc.insert(row.name, row.scheme),
   );
-  let w = match walked_read(walked) {
+  let w = match decode_inferred_facts(walked) {
     Some(w) -> w,
     None -> unread(b"its result carries nothing its check read"),
   };
@@ -523,7 +523,7 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
   let modules = s.modules;
   let schemes = s.schemes;
   let module_at = |i: Int| module_scope(s, i);
-  let recorded_of = |o: Bytes| filings_of(s.owned, o);
+  let recorded_of = |o: Bytes| recorded_annotations(s.owned, o);
   let of = match owner {
     Specialisation(a, _) ->
       { base: a.definition, args: key_types(owner), allows_lambda_inlining: a.borrowed.len() == 0 },
@@ -592,12 +592,12 @@ fn owners_to_read(rows: Rows, roots: List<RootKey>) -> Map<Bytes, Bool> =
       if row.facts.len() == 0 { acc } else { acc.insert(row.name, true) }),
     |acc: Map<Bytes, Bool>, k: RootKey|
       inlined_lambdas(k).fold(
-        acc.insert(site_owner_text(k), true).insert(site_owner_text(facts_root(k)), true),
+        acc.insert(site_owner_text(k), true).insert(site_owner_text(parent_root(k)), true),
         |r: Map<Bytes, Bool>, f: InlinedLambda| r.insert(site_owner_text(f.owner), true),
       ),
   )
 
-fn facts_root(k: RootKey) -> RootKey =
+fn parent_root(k: RootKey) -> RootKey =
   match k { Clause(c) -> c.definition, TestCases(t) -> t, _ -> k }
 
 fn definition_root(k: RootKey) -> Option<Bytes> =
@@ -783,12 +783,12 @@ fn written_formed(
     let reflective = match w.op { Reflect -> true, Show -> true, Digest -> true, _ -> false };
     let contained = match w.op {
       ContainerWalk(c) -> container_op_generated(c),
-      _ -> reflective && (is_walked_container(r.ty) || is_walked_columns(r.ty)),
+      _ -> reflective && (is_walked_container(r.ty) || is_columns_type(r.ty)),
     };
     if is_plain_written(w.op) {
       [
         match w.op {
-          keys::OnWordForm(_) -> word_form_entry(s.constructors, w.key),
+          keys::OnWordForm(_) -> serialization_function(s.constructors, w.key),
           _ -> generated(s.constructors, w.key),
         },
       ]
@@ -799,9 +799,9 @@ fn written_formed(
       reached();
       [written_root(r.key, container_code(module, s.constructors, r.op, r.ty))]
     } else if w.op == keys::ReleaseResource {
-      [written_root(r.key, let_go_code(module, s.constructors, here, r.key, r.ty))]
+      [written_root(r.key, release_resource_code(module, s.constructors, here, r.key, r.ty))]
     } else if w.op == ContainerWalk(b"let_go_items") {
-      [written_root(r.key, let_go_items_code(module, s.constructors, r.key, r.ty))]
+      [written_root(r.key, release_items_code(module, s.constructors, r.key, r.ty))]
     } else if w.op == keys::Equal || w.op == Order {
       let held = kind_of(w.ty);
       let param = |n: Bytes|
@@ -898,9 +898,9 @@ fn items_formed(x: ItemFormInputs, lo: Int, hi: Int, depth_left: Int) -> List<Fn
   }
 
 fn item_formed(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {abort.raise} =
-  naming(item_owner(x.s.module, item), || item_walked(x, acc, item))
+  naming(item_owner(x.s.module, item), || add_item_forms(x, acc, item))
 
-fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {abort.raise} = {
+fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {abort.raise} = {
   let s = x.s;
   let f = x.f;
   let module = s.module;
@@ -914,7 +914,7 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
   let here = s.here;
   let module_tree = x.module_tree;
   let written_roots = x.written_roots;
-  let recorded_of = |owner: Bytes| filings_of(f.scope.owned, owner);
+  let recorded_of = |owner: Bytes| recorded_annotations(f.scope.owned, owner);
   let lambda_at = |owner: RootKey, nth: Int| lambda_in(f.scope, f.borrowed_by, owner, nth);
   let read_of = |full: Bytes|
     match if reading.contains(full) { definitions.get(full) } else { None } {
@@ -1105,7 +1105,7 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
                 formed(
                   [param(b"a", compared), param(b"b", compared)],
                   match key_instance(module, here, module_tree.items, compared) {
-                    Some(k) -> keyed_code(k, eq, compared),
+                    Some(k) -> key_comparison_code(k, eq, compared),
                     None -> if eq { equality_code(compared, cs) }
                     else { ordering_code(compared, cs) },
                   },
@@ -1123,7 +1123,8 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
 pub fn enterable(c: MarshalledSums, sc: Scheme) -> Bool =
   sc.label_variables.len() == 0
     && (match judged_type(sc) {
-      FunctionType(f) -> f.params.all(|t: Type| marshals(c, t, true)) && marshals(c, f.ret, false),
+      FunctionType(f) ->
+        f.params.all(|t: Type| is_marshallable(c, t, true)) && is_marshallable(c, f.ret, false),
       _ -> false,
     })
 
@@ -1134,11 +1135,11 @@ pub fn judgeable(c: MarshalledSums, sc: Scheme) -> Bool =
       _ -> false,
     })
 
-pub fn liftable(c: MarshalledSums, t: Type) -> Bool = marshals(c, t, true)
+pub fn liftable(c: MarshalledSums, t: Type) -> Bool = is_marshallable(c, t, true)
 
-fn judged_type(sc: Scheme) -> Type = substituted(sc.ty, judged_args(sc.type_variables))
+fn judged_type(sc: Scheme) -> Type = substituted(sc.ty, int_arguments(sc.type_variables))
 
-fn judged_args(vars: List<Int>) -> List<Type> =
+fn int_arguments(vars: List<Int>) -> List<Type> =
   range(0, vars.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
 
 fn with_entry(
@@ -1154,7 +1155,7 @@ fn with_entry(
     match scheme {
       Some(sc) -> match sc.ty {
         FunctionType(f) -> {
-          let ints = judged_args(sc.type_variables);
+          let ints = int_arguments(sc.type_variables);
           let called = match root {
             Named(_) ->
               {
@@ -1252,7 +1253,7 @@ fn clause_roots(
 ) -> RootForms / {abort.raise} = {
   let full = qualify(s.module, definition.name.name);
   let vars = match schemes.get(full) { Some(sc) -> sc.type_variables, None -> [] };
-  let ints = judged_args(vars);
+  let ints = int_arguments(vars);
   let base = definition.span.start;
   let clause = |kind: ClauseKind, k: Int| Clause({ definition: Named(full), kind: kind, n: k });
   let rooted = |out: List<Fn>, key: RootKey, at: Int| {

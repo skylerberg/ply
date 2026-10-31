@@ -42,8 +42,9 @@ import compiler.expand.embed (ModuleEmbed, EmbedResult, EmbedFile, EmbedBytes, E
                               EmbedRequest, ItemEmbeds, embed_request_bin, embed_result_bin,
                               item_embeds_bin, embed_key, inline_embeds, embed_requests,
                               requests_by_item, requests_in, request_of_key, embed_file)
-import compiler.syntax.items (parse, import_declaration_bin, scheduler_read, homes_declaring,
-                              homes_for, called_names, is_std, is_shipped, HomeNames)
+import compiler.syntax.items (parse, import_declaration_bin, scheduler_modules_needed,
+                              homes_declaring, homes_for, called_names, is_std, is_shipped,
+                              HomeNames)
 import compiler.syntax.lexer (is_identifier_continue)
 import compiler.front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterConstructor,
                             FunctionWidths, ListWidths, MapWidths, NoWidths, RecordWidths,
@@ -55,7 +56,7 @@ import compiler.front.facts (outlines_of, guard_bounds, Bounded, encode_tables, 
                              module_facts, functions_of, tests_of, assembled_program, cuts_of,
                              Analysis, CallArgument, ConstructorArgument, ListArgument,
                              OtherArgument, TextArgument, StatementSite, sites_in, statements_of,
-                             toolchain_tree, tree_named, ShippedView, ToolchainTree)
+                             toolchain_tree, tree_named, ShippedModuleSummary, ToolchainTree)
 import compiler.front.emitter_input (root_keys, checked_program_of, view_dump, Analysed,
                                      AnalysisOutcome, Rejected)
 import compiler.front.published (no_rows, encode_rows, decode_rows, rows_of, inferred_facts,
@@ -63,7 +64,7 @@ import compiler.front.published (no_rows, encode_rows, decode_rows, rows_of, inf
                                  analyse_with, HashedProgram, hashed_closure, resolved_closure,
                                  checked_closure, runtime_dump, entry_header, dump_of, Claim,
                                  ClaimDefinition, ClaimLaw, ClaimSum, ClaimClause, claims,
-                                 claims_in, rechecked, untested, unimported_read)
+                                 claims_in, rechecked, untested, missing_imports)
 
 fn import_at(imports: List<ImportDeclaration>, name: Bytes) -> Span / {abort.raise} = {
   let found = imports.fold(None, |acc: Option<Span>, declaration: ImportDeclaration|
@@ -112,7 +113,7 @@ fn foreign_import(m: Int, span: Span, importer: Bytes, name: Bytes) -> Diagnosti
     ],
   )
 
-type Round = { wanted: Map<Bytes, Bytes>, diagnostics: List<Diagnostic> }
+type ImportedModules = { wanted: Map<Bytes, Bytes>, diagnostics: List<Diagnostic> }
 
 type Wanted = { names: Map<Bytes, Bool>, diagnostics: List<Diagnostic> }
 
@@ -167,19 +168,19 @@ fn pull_round(
   listed: List<Bytes>,
   parsed: List<ParsedSource>,
   required: List<Bytes>,
-) -> Round / {abort.raise} = {
+) -> ImportedModules / {abort.raise} = {
   let w = wanted(users, listed, parsed.map(importer), required);
   w.names.fold(
     { wanted: Map::new(), diagnostics: w.diagnostics },
-    |r: Round, name: Bytes, _: Bool|
+    |r: ImportedModules, name: Bytes, _: Bool|
       match shipped.get(name) {
         Some(src) -> { ..r, wanted: r.wanted.insert(name, src) },
-        None -> { ..r, diagnostics: r.diagnostics.push(unread_shipped(name)) },
+        None -> { ..r, diagnostics: r.diagnostics.push(missing_shipped_source(name)) },
       },
   )
 }
 
-fn unread_shipped(name: Bytes) -> Diagnostic =
+fn missing_shipped_source(name: Bytes) -> Diagnostic =
   error_at(
     b"E0505",
     0,
@@ -327,7 +328,7 @@ fn with_home_imports<| e>(
       pulls: {
         ..pulls,
         imports: pulls.imports.concat(
-          home_imports(homes.concat(scheduler_read(source.name, input))),
+          home_imports(homes.concat(scheduler_modules_needed(source.name, input))),
         ),
       },
       declared: d,
@@ -575,7 +576,7 @@ fn pull_rounds(
     if r.diagnostics.len() > 0 { { ..x, diagnostics: r.diagnostics } }
     else if r.wanted.len() == 0 { x }
     else if rounds_left <= 0 { panic("a shipped module pulled twice") } else {
-      let read = unimported_read(
+      let read = missing_imports(
         r.wanted.fold([], |acc: List<Source>, name: Bytes, src: Bytes|
           acc.push({ name: name, src: src })),
         declared,
@@ -775,7 +776,7 @@ pub fn parse_shipped(
 pub type PulledAnalysis = {
   pulled: List<Bytes>,
   out: AnalysisOutcome,
-  shipped_views: List<ShippedView>,
+  shipped_views: List<ShippedModuleSummary>,
 }
 
 pub fn analyse_pulling_std(
@@ -786,17 +787,17 @@ pub fn analyse_pulling_std(
 pub type StagedLoad = {
   pulled: List<Bytes>,
   hashed: Result<HashedProgram, List<Diagnostic>>,
-  shipped_views: List<ShippedView>,
+  shipped_views: List<ShippedModuleSummary>,
 }
 
-pub fn viewed_text(viewed: List<ShippedView>) -> Bytes = {
+pub fn viewed_text(viewed: List<ShippedModuleSummary>) -> Bytes = {
   let line = |parts: List<Bytes>|
     parts.fold(b"", |acc: Bytes, part: Bytes|
       if acc.len() == 0 { part } else { Bytes::concat_all([acc, b"\t", part]) }).concat(
       b"\n",
     );
   Bytes::concat_all(
-    viewed.fold([], |acc: List<Bytes>, v: ShippedView|
+    viewed.fold([], |acc: List<Bytes>, v: ShippedModuleSummary|
       v.definitions.fold(
         acc.push(line([b"shipform", v.module, v.text, v.form])),
         |a: List<Bytes>, d: { name: Bytes, hash: Bytes }|
@@ -842,7 +843,7 @@ fn pulled_load(
     acc.insert(s.name, s.src));
   let sources = user.concat(package_closure.modules.map(|m: { pkg: Int, src: Source }| m.src));
   let declared = homes_declaring(|h: Bytes| texts.get(h));
-  let unimported = unimported_read(sources, declared);
+  let unimported = missing_imports(sources, declared);
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
     |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
@@ -868,8 +869,8 @@ fn pulled_load(
   let mentions = user.map(|s: Source| may_call_embed(s.src)).concat(
     package_closure.modules.map(|m: { pkg: Int, src: Source }| may_call_embed(m.src.src)),
   );
-  let written = embedded_all(parsed, embed_slots(packages, user), mentions, embeds);
-  let assembled = written.parsed;
+  let declaration_sources = embedded_all(parsed, embed_slots(packages, user), mentions, embeds);
+  let assembled = declaration_sources.parsed;
   let named = shipped.map(|s: Source| s.name).concat(unread);
   let listed = named.concat(lookup_or_empty.drop(shipped.len()).map(|s: Source| s.name));
   let rooted = user.map(|u: Source| u.name);
@@ -896,10 +897,16 @@ fn pulled_load(
     given,
     derived,
   );
-  { pulled: x, package_closure: package_closure, tree: tree, embeds_at: written.at, items: items }
+  {
+    pulled: x,
+    package_closure: package_closure,
+    tree: tree,
+    embeds_at: declaration_sources.at,
+    items: items,
+  }
 }
 
-pub fn staged_pulling_std_with(
+pub fn load_with_shipped(
   user: List<Source>,
   shipped: List<Source>,
   packages: PackageSources = { root: b"", manifest: None, supplied: [] },
@@ -969,7 +976,7 @@ pub fn staged_pulling_std_with(
   }
 }
 
-pub fn resolved_pulling_std_with(
+pub fn resolved_with_shipped(
   user: List<Source>,
   shipped: List<Source>,
   packages: PackageSources,
@@ -1124,7 +1131,10 @@ fn cut_to_reach(
   }
 }
 
-fn shipped_views_of(h: HashedProgram, read: (Bytes) -> Bool) -> List<ShippedView> / {abort.raise} = {
+fn shipped_views_of(
+  h: HashedProgram,
+  read: (Bytes) -> Bool,
+) -> List<ShippedModuleSummary> / {abort.raise} = {
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
   let definitions = h.hashes.definitions.fold(
@@ -1182,8 +1192,8 @@ pub fn shipped_views(
   shipped: List<Source>,
   unread: List<Bytes> = [],
   data: List<ShippedData> = [],
-) -> Result<List<ShippedView>, List<Diagnostic>> / {abort.raise} =
-  match staged_pulling_std_with(
+) -> Result<List<ShippedModuleSummary>, List<Diagnostic>> / {abort.raise} =
+  match load_with_shipped(
       [shipped_viewer(modules)],
       shipped,
       tested: false,
@@ -1224,7 +1234,7 @@ pub fn analyse_pulling_std_with(
   derived: List<ModuleDerivations> = [],
 ) -> PulledAnalysis / {abort.raise} =
   checked_staged(
-    staged_pulling_std_with(
+    load_with_shipped(
       user,
       shipped,
       packages,
@@ -1251,9 +1261,9 @@ fn is_module_level_item(item: Item) -> Bool =
   }
 
 pub fn module_form_digest(module: Module, text: Bytes) -> Bytes / {abort.raise} = {
-  let written = module.imports.filter(|d: ImportDeclaration|
+  let declaration_sources = module.imports.filter(|d: ImportDeclaration|
     match d.kind { ModuleAlias(a) -> !is_hidden_binder(a.name), _ -> true });
-  let imports = written.map(|d: ImportDeclaration|
+  let imports = declaration_sources.map(|d: ImportDeclaration|
     Bytes::concat_all([
       b"import ",
       Bytes::join(d.path.map(|part: Identifier| part.name), b"."),
@@ -1283,7 +1293,7 @@ pub fn module_form_digest(module: Module, text: Bytes) -> Bytes / {abort.raise} 
   )
 }
 
-pub fn pins_of_load(
+pub fn locked_packages(
   user: List<Source>,
   packages: PackageSources,
   embeds: List<EmbedRecord>,
@@ -1594,10 +1604,10 @@ test "a program's tables made from its modules' facts, each shipped module's cut
   assert_eq(returned.view.frame.hashes, cut.hashes);
   assert_eq(returned.view, checked_program_of(cut));
   assert_eq(dump, whole_dump);
-  assert_eq(returned.views, staged_pulling_std_with(user, shipped).shipped_views)
+  assert_eq(returned.views, load_with_shipped(user, shipped).shipped_views)
 }
 
-pub fn written_reach() -> List<Bytes> =
+pub fn reached_prelude_functions() -> List<Bytes> =
   [
     b"shift_from",
     b"trie_shift",
@@ -1637,12 +1647,12 @@ test "a call written after a `?` holds the site its module as written gives it" 
       match e { PerformExpression(p) -> p.op.name == b"len", _ -> false }).map(
       expression_span,
     ).map(|at: Span| at.site);
-  let written = sites(numbered_module(parse(src).node));
-  assert_eq(written.len(), 1);
+  let declaration_sources = sites(numbered_module(parse(src).node));
+  assert_eq(declaration_sources.len(), 1);
   match analyse_pulling_std([{ name: b"m", src: src }], []).out {
     Rejected(ds) ->
       panic(String::of_bytes_lossy(Bytes::concat_all(ds.map(|d: Diagnostic| d.message)))),
-    Analysed(w) -> assert_eq(sites(w.modules.get(0).module), written),
+    Analysed(w) -> assert_eq(sites(w.modules.get(0).module), declaration_sources),
   }
 }
 
@@ -1662,7 +1672,7 @@ test "the emitter's root keys cover every root and no two share one" {
           test_owner(b"m", b"t"),
           law_root(b"l", LawBody),
         ].concat(
-          written_reach(),
+          reached_prelude_functions(),
         ),
       );
       let distinct = Map::of_entries(keys.map(|k: KeyRow| { key: k.key, value: () })).keys();
@@ -1675,9 +1685,9 @@ test "a root is pure only as a definition with no effects and no constraint" {
   let src = b"effect log { write emit(Bytes) -> Unit }\nfn origin() -> Int = 0\nfn hello() -> Unit / { log.write } = log.emit(b\"hi\")\nfn same<a>(x: a, y: a) -> Bool where derivable(eq, a) = x == y\nfn positive(n: Int) -> Int requires n > 0 = n\ntest \"t\" { assert_eq(origin(), 0) }\nlaw \"l\" forall (n: Int) { same(n, n) }";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot| !written_reach().contains(root.root)).map(
-      |root: EmitterRoot| { root: root.root, pure: root.pure },
-    ),
+    d.emitter_roots.filter(|root: EmitterRoot|
+      !reached_prelude_functions().contains(root.root)).map(|root: EmitterRoot|
+      { root: root.root, pure: root.pure }),
     [
       { root: b"m.origin", pure: true },
       { root: b"m.hello", pure: false },
@@ -1689,10 +1699,10 @@ test "a root is pure only as a definition with no effects and no constraint" {
     ],
   );
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot| written_reach().contains(root.root)).map(
+    d.emitter_roots.filter(|root: EmitterRoot| reached_prelude_functions().contains(root.root)).map(
       |root: EmitterRoot| root.root,
     ),
-    written_reach(),
+    reached_prelude_functions(),
   )
 }
 
@@ -1719,9 +1729,9 @@ test "a root carries a width exactly where a value it is entered with or returns
   let src = b"fn low_bit(b: U8) -> Int requires Int::of_u8(b) < 200 ensures result < 2 = Int::of_u8(b & 1u8)\nfn narrow(n: Int) -> U8 / {abort.raise} requires n >= 0 ensures Int::of_u8(result) == n = U8::of_int(n)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\ntest \"t\" { assert_eq(inc(1), 2) }\nlaw \"low\" forall (b: U8) where Int::of_u8(b) > 0 { low_bit(b) < 2 }\nlaw \"grows\" forall (x: Int) where x > 0 { inc(x) > x }";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot| !written_reach().contains(root.root)).map(
-      |root: EmitterRoot| { root: root.root, params: root.params, result: root.result },
-    ),
+    d.emitter_roots.filter(|root: EmitterRoot|
+      !reached_prelude_functions().contains(root.root)).map(|root: EmitterRoot|
+      { root: root.root, params: root.params, result: root.result }),
     [
       { root: b"m.low_bit", params: [FixedWidth(0)], result: NoWidths },
       { root: b"m.narrow", params: [NoWidths], result: FixedWidth(0) },
@@ -1753,7 +1763,7 @@ test "a carry follows a width into lists, maps, records, sum types, functions an
         root: b"m.pick",
         params: [
           ListWidths(VariableWidths(0)),
-          RecordWidths([{ name: b"n", carry: NoWidths }, { name: b"v", carry: FixedWidth(5) }]),
+          RecordWidths([{ name: b"n", widths: NoWidths }, { name: b"v", widths: FixedWidth(5) }]),
         ],
         result: SumWidths([VariableWidths(0)]),
       },
@@ -1835,7 +1845,7 @@ test "a native program carries its entry and the hash of each fn its entry reach
         _ -> found,
       });
   let reached = [b"app.worth", b"base.cents", b"base.coin", b"base.half", b"base.seven"].concat(
-    written_reach(),
+    reached_prelude_functions(),
   ).sort(
   );
   assert_eq(
@@ -1893,7 +1903,7 @@ test "a program's result holds its warnings, its order, its packages and its mod
   }
 }
 
-fn reachable() -> List<Source> =
+fn dead_code_sources() -> List<Source> =
   [
     {
       name: b"m",
@@ -1921,13 +1931,13 @@ test "a general clause inside a scope carries that scope's effects out of it" {
 }
 
 test "only a definition no root reaches is warned, each once at its name" {
-  let d = dump_of(analyse(parse_all(reachable())));
+  let d = dump_of(analyse(parse_all(dead_code_sources())));
   let said = d.diagnostics.map(|diagnostic: Diagnostic| diagnostic.message);
   assert(said.contains(b"fn `m.dead` is never used"));
   assert(said.contains(b"fn `m.deader` is never used"));
   assert(said.contains(b"type `m.Unused` is never used"));
   assert_eq(said.len(), 3);
-  let src = reachable().get(0).src;
+  let src = dead_code_sources().get(0).src;
   let named = d.diagnostics.map(|diagnostic: Diagnostic|
     match diagnostic.labels.filter(|l: Label| l.primary) {
       [l, ..] -> src.slice(l.start, l.end),
@@ -2154,7 +2164,7 @@ test "an effect set and its expansion are one program: the same hashes, bodies a
   assert_eq(e.definitions.map(|row: DefinitionRow| row.effect_aliases), [[], []])
 }
 
-fn written() -> List<Source> =
+fn declaration_sources() -> List<Source> =
   [
     {
       name: b"m",
@@ -2163,13 +2173,13 @@ fn written() -> List<Source> =
   ]
 
 test "a definition's row holds its visibility, its reuse marker and its parameters as written" {
-  let keep = definition_named(dump_of(analyse(parse_all(written()))), b"m.keep");
+  let keep = definition_named(dump_of(analyse(parse_all(declaration_sources()))), b"m.keep");
   assert(keep.public && keep.reuse);
   assert_eq(keep.params, [{ name: b"xs", at: { module: 0, start: 104, end: 117 } }])
 }
 
 test "a type's row holds its arity and its visibility" {
-  let rows = dump_of(analyse(parse_all(written()))).types.map(|t: TypeRow|
+  let rows = dump_of(analyse(parse_all(declaration_sources()))).types.map(|t: TypeRow|
     { name: t.name, module: t.module, public: t.public, arity: t.arity });
   assert_eq(
     rows.filter(|t: { name: Bytes, module: Bytes, public: Bool, arity: Int }| t.module == b"m"),
@@ -2187,7 +2197,7 @@ test "a type's row holds its arity and its visibility" {
 }
 
 test "a guard's literals are in the search's order, a negation folded" {
-  assert_eq(dump_of(analyse(parse_all(written()))).laws.map(|l: LawRow| l.literals), [
+  assert_eq(dump_of(analyse(parse_all(declaration_sources()))).laws.map(|l: LawRow| l.literals), [
     [b"int 7", b"int -3", b"int 3"],
   ])
 }
@@ -2258,7 +2268,7 @@ test "a law's row holds its binders with their spans and types, and its hashes c
   assert_eq(inc.spec_texts.len(), 2)
 }
 
-fn claimed() -> List<Source> =
+fn law_sources() -> List<Source> =
   [
     { name: b"base", src: b"pub fn one() -> Int = 1\npub type Coin = | Heads | Tails" },
     {
@@ -2270,7 +2280,7 @@ fn claimed() -> List<Source> =
 fn code_text(c: Option<Code>) -> Bytes / {abort.raise} = match c { Some(x) -> dump(x), None -> b"" }
 
 test "a claim is lowered with each global named program-wide, and a builtin and a prelude constructor as written" {
-  let out = claims(claimed());
+  let out = claims(law_sources());
   assert_eq(out.len(), 4);
   match out.get(0) {
     ClaimDefinition(d) -> {
@@ -2372,7 +2382,7 @@ fn shipped_modules() -> List<Source> =
     { name: b"std.d", src: b"pub fn d() -> Int = 4" },
   ]
 
-fn reached_fixture() -> List<Source> =
+fn unused_function_sources() -> List<Source> =
   [
     {
       name: b"std.r",
@@ -2388,7 +2398,7 @@ fn definition_names(p: PulledAnalysis) -> List<Bytes> =
   pulled_hashes(p).map(|d: { name: Bytes, hash: Bytes }| d.name).sort()
 
 pub fn not_written(names: List<Bytes>) -> List<Bytes> =
-  names.filter(|n: Bytes| !written_reach().contains(n))
+  names.filter(|n: Bytes| !reached_prelude_functions().contains(n))
 
 fn prelude_functions() -> List<Bytes> / {abort.raise} =
   parse(prelude_source::text()).node.items.fold([], |acc: List<Bytes>, item: Item|
@@ -2404,9 +2414,9 @@ test "a program reads of a shipped module the functions it reaches and the names
     names.filter(|n: Bytes| module_of_name(n) == prelude_module());
   let not_of_prelude = |names: List<Bytes>|
     names.filter(|n: Bytes| module_of_name(n) != prelude_module());
-  let cut = analyse_pulling_std_with(user, reached_fixture(), no_rows());
+  let cut = analyse_pulling_std_with(user, unused_function_sources(), no_rows());
   assert_eq(definition_names(cut), [b"m.f", b"std.r.imported", b"std.r.used", b"std.s.helper"]);
-  let whole = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
+  let whole = analyse_pulling_std_with(user, unused_function_sources(), no_rows(), reached: false);
   assert(definition_names(whole).contains(b"std.prelude.mapped_from"), None);
   assert_eq(not_of_prelude(definition_names(whole)), [
     b"m.f",
@@ -2457,7 +2467,7 @@ test "a shipped function is read with what its specifications name" {
       b"std.s.helper",
       b"std.s.other",
     ].concat(
-      written_reach(),
+      reached_prelude_functions(),
     ).sort(
     ),
   )
@@ -2497,10 +2507,13 @@ test "a shipped type is read with what its module states of it, though the progr
     stating,
     no_rows(),
   );
-  assert_eq(definition_names(used), definition_names(idle).concat(written_reach()).sort())
+  assert_eq(
+    definition_names(used),
+    definition_names(idle).concat(reached_prelude_functions()).sort(),
+  )
 }
 
-fn namesakes() -> List<Source> =
+fn same_name_sources() -> List<Source> =
   [
     {
       name: b"std.z",
@@ -2523,12 +2536,12 @@ fn loaded_twice(imports: Bytes) -> List<List<Bytes>> / {abort.raise} = {
   let said = |diagnostics: List<Diagnostic>|
     diagnostics.map(|d: Diagnostic| Bytes::concat_all([d.code, b": ", d.message]));
   let data = namesake_data(b"one\n");
-  let cold = analyse_pulling_std_with(user, namesakes(), no_rows(), data: data);
+  let cold = analyse_pulling_std_with(user, same_name_sources(), no_rows(), data: data);
   match cold.out {
     Rejected(diagnostics) -> [said(diagnostics)],
     Analysed(w) -> {
       let rows = rows_of(w);
-      let warm = analyse_pulling_std_with(user, namesakes(), rows, data: data);
+      let warm = analyse_pulling_std_with(user, same_name_sources(), rows, data: data);
       [
         definition_names(cold),
         match warm.out {
@@ -2564,7 +2577,7 @@ test "a data file a shipped function embeds moves what reaches the function, and
   let over = |imports: Bytes, bytes: Bytes|
     analyse_pulling_std_with(
       [{ name: b"m", src: imports.concat(b"\npub fn f() -> Int = 1\n") }],
-      namesakes(),
+      same_name_sources(),
       no_rows(),
       data: namesake_data(bytes),
     );
@@ -2595,40 +2608,48 @@ test "a shipped compiler module's import of another keeps only what the program 
   assert_eq(definition_names(cut), [b"compiler.a.first", b"compiler.b.second", b"m.f"])
 }
 
-fn view_named(views: List<ShippedView>, module: Bytes) -> ShippedView / {abort.raise} =
-  match views.filter(|v: ShippedView| v.module == module) {
+fn view_named(
+  views: List<ShippedModuleSummary>,
+  module: Bytes,
+) -> ShippedModuleSummary / {abort.raise} =
+  match views.filter(|v: ShippedModuleSummary| v.module == module) {
     [v, ..] -> v,
     [] -> panic("no view of the module"),
   }
 
-fn view_names(v: ShippedView) -> List<Bytes> =
+fn view_names(v: ShippedModuleSummary) -> List<Bytes> =
   v.definitions.map(|d: { name: Bytes, hash: Bytes }| d.name).sort()
 
 test "a load's view of a shipped module is its form and the functions the program reached" {
   let user = [{ name: b"m", src: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" }];
-  let viewed = analyse_pulling_std_with(user, reached_fixture(), no_rows()).shipped_views;
-  assert_eq(viewed.map(|v: ShippedView| v.module), [prelude_module(), b"std.r", b"std.s"]);
+  let viewed = analyse_pulling_std_with(user, unused_function_sources(), no_rows()).shipped_views;
+  assert_eq(viewed.map(|v: ShippedModuleSummary| v.module), [prelude_module(), b"std.r", b"std.s"]);
   assert_eq(view_names(view_named(viewed, b"std.r")), [b"std.r.imported", b"std.r.used"]);
   assert_eq(view_names(view_named(viewed, b"std.s")), [b"std.s.helper"]);
-  assert_eq(view_named(viewed, b"std.s").text, hex(blake3(reached_fixture().get(1).src)));
+  assert_eq(view_named(viewed, b"std.s").text, hex(blake3(unused_function_sources().get(1).src)));
   let hexed = |b: Bytes|
     b.len() == 64
       && range(0, 64).fold(true, |ok: Bool, i: Int| {
         let c = b.at(i);
         ok && ((c >= 48 && c <= 57) || (c >= 97 && c <= 102))
       });
-  viewed.fold((), |u: Unit, v: ShippedView| {
+  viewed.fold((), |u: Unit, v: ShippedModuleSummary| {
     assert(hexed(v.text) && hexed(v.form), None);
     v.definitions.fold((), |w: Unit, d: { name: Bytes, hash: Bytes }| assert(hexed(d.hash), None))
   });
   assert_eq(
-    analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false).shipped_views,
+    analyse_pulling_std_with(
+      user,
+      unused_function_sources(),
+      no_rows(),
+      reached: false,
+    ).shipped_views,
     [],
   );
-  match shipped_views([b"std.r"], reached_fixture()) {
+  match shipped_views([b"std.r"], unused_function_sources()) {
     Err(_) -> panic("the shipped modules hash"),
     Ok(now) ->
-      viewed.fold((), |u: Unit, v: ShippedView| {
+      viewed.fold((), |u: Unit, v: ShippedModuleSummary| {
         let whole = view_named(now, v.module);
         assert_eq(whole.form, v.form);
         assert_eq(whole.text, v.text);
@@ -2646,12 +2667,13 @@ test "every load reads `std.prelude`, keeping the functions it writes in Ply tha
         prelude_module(),
       ),
     );
-  let written = written_reach().sort();
+  let declaration_sources = reached_prelude_functions().sort();
   let holds = |names: List<Bytes>, name: Bytes| names.contains(qualify(prelude_module(), name));
   assert_eq(viewed(b"pub fn g() -> Int = 1\n"), []);
   let marshalling = viewed(b"pub fn c(xs: List<Int>) -> Int = 0\n");
   assert(
-    written.all(|n: Bytes| marshalling.contains(n)) && holds(marshalling, b"Map::insert"),
+    declaration_sources.all(|n: Bytes| marshalling.contains(n))
+      && holds(marshalling, b"Map::insert"),
     None,
   );
   assert_eq(viewed(b"pub fn d(m: Map<Int, Int>) -> Int = 0\n"), marshalling);
@@ -2660,7 +2682,7 @@ test "every load reads `std.prelude`, keeping the functions it writes in Ply tha
   let set = viewed(b"pub fn h(xs: List<Int>) -> List<Int> / {abort.raise} = xs.set(0, 1)\n");
   assert(holds(set, b"List::set") && !holds(set, b"List::map"), None);
   let got = viewed(b"pub fn k(m: Map<Int, Int>) -> Option<Int> = m.get(1)\n");
-  assert(holds(got, b"Map::get") && written.all(|n: Bytes| got.contains(n)), None);
+  assert(holds(got, b"Map::get") && declaration_sources.all(|n: Bytes| got.contains(n)), None);
   assert_eq(viewed(b"pub fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\n"), marshalling);
   assert_eq(
     viewed(b"pub fn alike(a: Map<Int, Bytes>, b: Map<Int, Bytes>) -> Bool = a == b\n"),
@@ -2668,7 +2690,7 @@ test "every load reads `std.prelude`, keeping the functions it writes in Ply tha
   );
   assert_eq(viewed(b"pub fn hashed(a: List<Int>) -> Bytes = digest(a)\n"), marshalling);
   assert_eq(viewed(b"pub fn less(a: Int, b: Int) -> Bool = a < b\n"), []);
-  assert_eq(viewed(b"pub fn equal(a: Int, b: Int) -> Bool = a == b\n"), written);
+  assert_eq(viewed(b"pub fn equal(a: Int, b: Int) -> Bool = a == b\n"), declaration_sources);
   assert_eq(
     emitted_code().calls.concat(emitted_code().lifts).filter(|n: Bytes|
       !builtins().any(|b: Builtin| b.body && b.name == n)),
@@ -2682,17 +2704,17 @@ test "a function nothing reaches leaves a view's form alone and a type moves it"
     view_named(
       analyse_pulling_std_with(
         user,
-        [reached_fixture().get(0), { name: b"std.s", src: text }],
+        [unused_function_sources().get(0), { name: b"std.s", src: text }],
         no_rows(),
       ).shipped_views,
       b"std.s",
     );
-  let before = with_s(reached_fixture().get(1).src);
-  let added = with_s(reached_fixture().get(1).src.concat(b"pub fn later() -> Int = 5\n"));
+  let before = with_s(unused_function_sources().get(1).src);
+  let added = with_s(unused_function_sources().get(1).src.concat(b"pub fn later() -> Int = 5\n"));
   assert(added.text != before.text, None);
   assert_eq(added.form, before.form);
   assert_eq(added.definitions, before.definitions);
-  let typed = with_s(reached_fixture().get(1).src.concat(b"pub type T = { x: Int }\n"));
+  let typed = with_s(unused_function_sources().get(1).src.concat(b"pub type T = { x: Int }\n"));
   assert(typed.form != before.form, None)
 }
 
@@ -2816,19 +2838,19 @@ test "an asked module's tests are in a load that reads it whole, and in none tha
     };
   let required = analyse_pulling_std_with(
     user,
-    reached_fixture(),
+    unused_function_sources(),
     no_rows(),
     reached: false,
     required: [b"std.r"],
   );
   assert_eq(required.pulled, [prelude_module(), b"std.r", b"std.s"]);
   assert_eq(tests_of(required), [b"std.r.r holds"]);
-  let plain = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
+  let plain = analyse_pulling_std_with(user, unused_function_sources(), no_rows(), reached: false);
   assert_eq(plain.pulled, [prelude_module()]);
   assert_eq(tests_of(plain), [])
 }
 
-fn spinning() -> List<Source> =
+fn diverging_sources() -> List<Source> =
   [
     {
       name: b"std.spin",
@@ -2845,12 +2867,15 @@ test "a shipped recursion not seen to end is rejected alike by every load that r
     };
   let spun = [{ code: b"E0302", message: b"`spin` may not return, and its effects do not say so" }];
   let importer = |body: Bytes| [{ name: b"m", src: b"import std.spin\n".concat(body) }];
-  assert_eq(rejections(analyse_pulling_std_with(spinning(), spinning(), no_rows())), spun);
+  assert_eq(
+    rejections(analyse_pulling_std_with(diverging_sources(), diverging_sources(), no_rows())),
+    spun,
+  );
   assert_eq(
     rejections(
       analyse_pulling_std_with(
         importer(b"pub fn f() -> Int = 1\n"),
-        spinning(),
+        diverging_sources(),
         no_rows(),
         reached: false,
         required: [b"std.spin"],
@@ -2862,7 +2887,7 @@ test "a shipped recursion not seen to end is rejected alike by every load that r
     rejections(
       analyse_pulling_std_with(
         importer(b"pub fn f() -> Int = spin::turn(1)\n"),
-        spinning(),
+        diverging_sources(),
         no_rows(),
       ),
     ),
@@ -2870,7 +2895,11 @@ test "a shipped recursion not seen to end is rejected alike by every load that r
   );
   assert_eq(
     rejections(
-      analyse_pulling_std_with(importer(b"pub fn f() -> Int = 1\n"), spinning(), no_rows()),
+      analyse_pulling_std_with(
+        importer(b"pub fn f() -> Int = 1\n"),
+        diverging_sources(),
+        no_rows(),
+      ),
     ),
     [],
   )
@@ -3049,7 +3078,7 @@ fn library_over_compiler() -> List<Source> =
 test "library modules read apart pull the compiler's modules they import, and what those import, each for what is reached" {
   let all = library_over_compiler();
   let own = all.filter(|s: Source| s.name == b"std.base" || s.name == b"std.reader");
-  let pulled = checked_staged(staged_pulling_std_with(own, all, apart: true), no_rows());
+  let pulled = checked_staged(load_with_shipped(own, all, apart: true), no_rows());
   assert_eq(pulled.pulled, [b"compiler.a", prelude_module(), b"compiler.b", b"std.deep"]);
   let d = dump_of(pulled.out);
   assert_eq(d.diagnostics, []);
@@ -3246,7 +3275,7 @@ test "a statement module's own calls are no statements a check holds to a databa
 fn seeded_of(outcome: AnalysisOutcome) -> List<Bytes> / {abort.raise} =
   match outcome { Rejected(_) -> panic("the program checks"), Analysed(w) -> w.checked.seeded }
 
-fn effectful() -> List<Source> =
+fn effect_sources() -> List<Source> =
   [
     {
       name: b"base",
@@ -3303,13 +3332,13 @@ test "two programs alike but for what the checker met first publish one definiti
 }
 
 test "a definition whose hash has not changed is published from its rows, not from its body" {
-  let rows = rows_of(analysis_of(effectful()));
+  let rows = rows_of(analysis_of(effect_sources()));
   assert(rows.definitions.len() > 0);
   assert(rows.tests.len() > 0);
-  let seeded = analyse_with(parse_all(effectful()), rows);
+  let seeded = analyse_with(parse_all(effect_sources()), rows);
   assert_eq(seeded_of(seeded), [b"base.say", b"app.twice"]);
-  assert_eq(published(seeded), published(analyse(parse_all(effectful()))));
-  assert_eq(seeded_of(analyse(parse_all(effectful()))), [])
+  assert_eq(published(seeded), published(analyse(parse_all(effect_sources()))));
+  assert_eq(seeded_of(analyse(parse_all(effect_sources()))), [])
 }
 
 fn generic() -> List<Source> =
@@ -3332,12 +3361,12 @@ test "a definition generic over effects is published from its rows, ending in th
 }
 
 test "rows recorded under a hash this program no longer has are walked instead" {
-  let rows = rows_of(analysis_of(effectful()));
+  let rows = rows_of(analysis_of(effect_sources()));
   let stale = rows.definitions.map(|row: KnownDefinitionRow|
     { ..row, hash: b"moved", effects: b"nowhere.read", performed: b"nowhere.read" });
-  let walked = analyse_with(parse_all(effectful()), { ..rows, definitions: stale, tests: [] });
+  let walked = analyse_with(parse_all(effect_sources()), { ..rows, definitions: stale, tests: [] });
   assert_eq(seeded_of(walked), []);
-  assert_eq(published(walked), published(analyse(parse_all(effectful()))))
+  assert_eq(published(walked), published(analyse(parse_all(effect_sources()))))
 }
 
 fn test_effects_of(outcome: AnalysisOutcome, key: Bytes) -> Bytes / {abort.raise} =
@@ -3405,7 +3434,7 @@ fn two_effects() -> List<Source> =
     },
   ]
 
-fn wrong_rows(sources: List<Source>) -> List<KnownDefinitionRow> / {abort.raise} =
+fn wrong_effect_rows(sources: List<Source>) -> List<KnownDefinitionRow> / {abort.raise} =
   match analyse(parse_all(sources)) {
     Rejected(_) -> panic("the program checks"),
     Analysed(w) -> {
@@ -3437,7 +3466,10 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefinitionRow> / {abort.raise}
 
 test "a row that will not unify walks the body rather than reporting" {
   let sources = two_effects();
-  let seeded = analyse_with(parse_all(sources), { ..no_rows(), definitions: wrong_rows(sources) });
+  let seeded = analyse_with(parse_all(sources), {
+    ..no_rows(),
+    definitions: wrong_effect_rows(sources),
+  });
   assert_eq(effects_text_of(seeded, b"m.quiet"), b"");
   assert_eq(effects_text_of(seeded, b"m.say"), b"m.log.write");
   assert_eq(
@@ -3448,10 +3480,10 @@ test "a row that will not unify walks the body rather than reporting" {
 }
 
 test "an analysis seeded with its own rows returns exactly what a fresh one does" {
-  let rows = rows_of(analysis_of(effectful()));
-  let seeded = analyse_with(parse_all(effectful()), rows);
+  let rows = rows_of(analysis_of(effect_sources()));
+  let seeded = analyse_with(parse_all(effect_sources()), rows);
   assert_eq(seeded_of(seeded).len(), rows.definitions.len());
-  assert_eq(published(seeded), published(analyse(parse_all(effectful()))));
+  assert_eq(published(seeded), published(analyse(parse_all(effect_sources()))));
   assert_eq(test_effects_of(seeded, b"app.says"), b"base.log.write")
 }
 
@@ -3470,7 +3502,7 @@ test "a definition generic over labels is seeded from its rows, each label as it
   assert_eq(published(seeded), published(analyse(parse_all(labelled()))))
 }
 
-fn looping(above: Bytes, between: Bytes) -> List<Source> =
+fn mutually_recursive_sources(above: Bytes, between: Bytes) -> List<Source> =
   [
     {
       name: b"m",
@@ -3492,8 +3524,11 @@ fn endings(outcome: AnalysisOutcome) -> List<{ name: Bytes, ending: Termination 
   }
 
 test "a seeded ending is where its call is now, however its definitions moved" {
-  let rows = rows_of(analysis_of(looping(b"", b"")));
-  let moved = looping(b"pub fn aside() -> Int = 3\n", b"pub fn apart() -> Int = 4\n");
+  let rows = rows_of(analysis_of(mutually_recursive_sources(b"", b"")));
+  let moved = mutually_recursive_sources(
+    b"pub fn aside() -> Int = 3\n",
+    b"pub fn apart() -> Int = 4\n",
+  );
   let seeded = analyse_with(parse_all(moved), { ..rows, tests: [] });
   assert_eq(seeded_of(seeded), [b"m.spin", b"m.hop", b"m.wait"]);
   assert_eq(endings(seeded), endings(analyse(parse_all(moved))))
@@ -3811,7 +3846,7 @@ test "a load hands on what each item asks to embed, from what the text was kept 
     },
   ];
   let items = |pulls: List<ModuleDependencies>|
-    match staged_pulling_std_with([a], [], embeds: read, pulls: pulls).hashed {
+    match load_with_shipped([a], [], embeds: read, pulls: pulls).hashed {
       Ok(h) -> h.embed_items.get(b"a"),
       Err(_) -> panic("the module loads"),
     };
@@ -3910,7 +3945,7 @@ test "the pins read off the closure are the pins an analysis returns, embeds inc
     analyse_pulling_std_with(user, [], no_rows(), embedding, reads).out,
   ).pins;
   assert_eq(analysed.len(), 1);
-  assert_eq(pins_of_load(user, embedding, reads), Ok(analysed))
+  assert_eq(locked_packages(user, embedding, reads), Ok(analysed))
 }
 
 test "a dependency is pinned by what its modules embed as well as by their text" {

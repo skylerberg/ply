@@ -19,7 +19,7 @@
 //! which read the caller's value and write one back. Over a handler's variable, these are
 //! operations its clauses handle. Each reads and writes with nothing in between that another task
 //! could run in, so tasks sharing one value see each step whole. `single_flight`'s runs are stored
-//! in a channel its callers share, which `flights` creates in the scheduler they run in. Jitter is
+//! in a channel its callers share, which `runs_in_progress` creates in the scheduler they run in. Jitter is
 //! drawn from `std.random`'s `entropy`, so a run that handles it from a seed waits what the seed
 //! decides.
 //!
@@ -73,12 +73,12 @@ fn fold_as_completed<a, s | e>(
         ()
       });
     scoped(racers, |_kids: List<Task<Unit>>|
-      iterate({ state: init, heard: 0 }, n + 1, |so_far: { state: s, heard: Int }|
-        if so_far.heard == n { Stop(so_far.state) } else {
+      iterate({ state: init, output_lines: 0 }, n + 1, |so_far: { state: s, output_lines: Int }|
+        if so_far.output_lines == n { Stop(so_far.state) } else {
           match task.recv(ended) {
             None -> Stop(so_far.state),
             Some(result) -> match step(so_far.state, result._0, result._1) {
-              Continue(next) -> Continue({ state: next, heard: so_far.heard + 1 }),
+              Continue(next) -> Continue({ state: next, output_lines: so_far.output_lines + 1 }),
               Stop(last) -> Stop(last),
             },
           }
@@ -386,7 +386,7 @@ pub fn wait_choices<x>(policy: Retry<x>, failures: Int, previous: Duration) -> I
     NoJitter -> 1,
     FullJitter -> ceiling + 1,
     EqualJitter -> ceiling / 2 + 1,
-    DecorrelatedJitter -> decorrelated_top(policy, previous) - as_nanos(policy.base) + 1,
+    DecorrelatedJitter -> decorrelated_upper_bound(policy, previous) - as_nanos(policy.base) + 1,
   }
 }
 
@@ -402,7 +402,7 @@ pub fn wait_of<x>(policy: Retry<x>, failures: Int, previous: Duration, draw: Int
 }
 
 /// Three times the previous wait or `base`, whichever is larger, and at most `max_wait`.
-fn decorrelated_top<x>(policy: Retry<x>, previous: Duration) -> Int = {
+fn decorrelated_upper_bound<x>(policy: Retry<x>, previous: Duration) -> Int = {
   let before = max(as_nanos(policy.base), as_nanos(previous));
   if before > max_wait() / 3 { max_wait() } else { before * 3 }
 }
@@ -430,11 +430,11 @@ pub fn retry_budgeted<a, x | e>(
   store: (Budget) -> Unit / e,
   body: (Int) -> Result<a, x> / e,
 ) -> Result<a, RetryFailure<x>> / {clock.read, clock.write, random::entropy.below, deadline.at, abort.raise | e} = {
-  store(pay_in(load()));
+  store(credit_call(load()));
   run_retries(
     policy,
     ||
-      match draw_retry(load()) {
+      match spend_retry(load()) {
         Some(rest) -> {
           store(rest);
           true
@@ -504,11 +504,11 @@ pub fn budget(percent: Int, reserve: Int) -> Budget = {
 }
 
 /// The budget after a call pays into it.
-pub fn pay_in(b: Budget) -> Budget =
+pub fn credit_call(b: Budget) -> Budget =
   { ..b, hundredths: min(max(1, b.reserve) * 100, b.hundredths + b.percent) }
 
 /// The budget after a retry draws on it, or `None` if it has no whole retry to give.
-pub fn draw_retry(b: Budget) -> Option<Budget> =
+pub fn spend_retry(b: Budget) -> Option<Budget> =
   if b.hundredths < 100 { None } else { Some({ ..b, hundredths: b.hundredths - 100 }) }
 
 /// How many whole retries the budget could pay for now.
@@ -670,7 +670,7 @@ pub fn throttled<a | e>(
 // --- One run for many callers -----------------------------------------------
 
 /// The runs in progress, by key: a channel that contains their table while no caller changes it.
-pub type Flights<k, a> = { table: Chan<FlightTable<k, a>> }
+pub type RunsInProgress<k, a> = { table: Chan<FlightTable<k, a>> }
 
 /// Each run in progress by its key, with its id and the channel on which each waiting caller
 /// receives the result. `next` is the id the next run takes.
@@ -682,7 +682,7 @@ type FlightTable<k, a> = { next: Int, runs: Map<k, { id: Int, waiting: List<Chan
 type FlightRole<channel> = | Run(Int) | Wait(channel)
 
 /// Flights with no run in progress, for the tasks of the scheduler it is created in.
-pub fn flights<k, a>() -> Flights<k, a> / {task.write}
+pub fn runs_in_progress<k, a>() -> RunsInProgress<k, a> / {task.write}
   where derivable(ord, k)
 = {
   let table = task.channel(1);
@@ -690,12 +690,12 @@ pub fn flights<k, a>() -> Flights<k, a> / {task.write}
   { table: table }
 }
 
-/// Runs `body` once for all callers that request `key` from `flights` while it runs: the first
+/// Runs `body` once for all callers that request `key` from `runs_in_progress` while it runs: the first
 /// caller runs it and the others wait for its result. A caller that comes after it has returned
 /// runs it again. If the caller running it is cancelled, one of the waiting callers runs it
 /// instead.
 pub fn single_flight<k, a | e>(
-  flights: Flights<k, a>,
+  runs_in_progress: RunsInProgress<k, a>,
   key: k,
   body: () -> a / e,
 ) -> a / {task.write, diverges | e}
@@ -705,19 +705,22 @@ pub fn single_flight<k, a | e>(
   // Joining is the acquire and finishing the run is the release, which a cancel waits for, so the
   // table is always put back and a run given to this caller is always released.
   bracket(
-    || join_flight(flights, key),
+    || join_flight(runs_in_progress, key),
     |j: Option<FlightRole<Chan<a>>>|
-      match j { Some(Run(id)) -> finish_flight(flights, key, id, None), _ -> () },
+      match j { Some(Run(id)) -> finish_flight(runs_in_progress, key, id, None), _ -> () },
     |j: Option<FlightRole<Chan<a>>>|
       match j {
         Some(Run(id)) -> {
           let result = body();
-          bracket(|| finish_flight(flights, key, id, Some(result)), |_u: Unit| (), |_u: Unit|
-            result)
+          bracket(
+            || finish_flight(runs_in_progress, key, id, Some(result)),
+            |_u: Unit| (),
+            |_u: Unit| result,
+          )
         },
         Some(Wait(returned)) -> match task.recv(returned) {
           Some(result) -> result,
-          None -> single_flight(flights, key, body),
+          None -> single_flight(runs_in_progress, key, body),
         },
         None -> body(),
       },
@@ -725,22 +728,25 @@ pub fn single_flight<k, a | e>(
 
 /// The run in progress for `key` to wait on, or one this caller starts, or `None` if the table is
 /// gone.
-fn join_flight<k, a>(flights: Flights<k, a>, key: k) -> Option<FlightRole<Chan<a>>> / {task.write}
+fn join_flight<k, a>(
+  runs_in_progress: RunsInProgress<k, a>,
+  key: k,
+) -> Option<FlightRole<Chan<a>>> / {task.write}
   where derivable(ord, k)
 =
-  match task.recv(flights.table) {
+  match task.recv(runs_in_progress.table) {
     None -> None,
     Some(t) -> match t.runs.get(key) {
       Some(run) -> {
         let mine = task.channel(1);
-        task.send(flights.table, {
+        task.send(runs_in_progress.table, {
           ..t,
           runs: t.runs.insert(key, { ..run, waiting: run.waiting.push(mine) }),
         });
         Some(Wait(mine))
       },
       None -> {
-        task.send(flights.table, {
+        task.send(runs_in_progress.table, {
           next: t.next + 1,
           runs: t.runs.insert(key, { id: t.next, waiting: [] }),
         });
@@ -752,18 +758,18 @@ fn join_flight<k, a>(flights: Flights<k, a>, key: k) -> Option<FlightRole<Chan<a
 /// Ends the run `id` for `key`, if it is still the one in progress. Each caller waiting on it is
 /// sent `result`, or has its channel closed if there is none.
 fn finish_flight<k, a>(
-  flights: Flights<k, a>,
+  runs_in_progress: RunsInProgress<k, a>,
   key: k,
   id: Int,
   result: Option<a>,
 ) -> Unit / {task.write}
   where derivable(ord, k)
 =
-  match task.recv(flights.table) {
+  match task.recv(runs_in_progress.table) {
     None -> (),
     Some(t) -> match t.runs.get(key) {
-      Some(run) -> if run.id != id { put_back(flights, t) } else {
-        put_back(flights, { ..t, runs: t.runs.remove(key) });
+      Some(run) -> if run.id != id { put_back(runs_in_progress, t) } else {
+        put_back(runs_in_progress, { ..t, runs: t.runs.remove(key) });
         run.waiting.fold((), |_u: Unit, waiter: Chan<a>|
           match result {
             Some(x) -> {
@@ -773,14 +779,17 @@ fn finish_flight<k, a>(
             None -> task.close(waiter),
           })
       },
-      None -> put_back(flights, t),
+      None -> put_back(runs_in_progress, t),
     },
   }
 
-fn put_back<k, a>(flights: Flights<k, a>, t: FlightTable<k, a>) -> Unit / {task.write}
+fn put_back<k, a>(
+  runs_in_progress: RunsInProgress<k, a>,
+  t: FlightTable<k, a>,
+) -> Unit / {task.write}
   where derivable(ord, k)
 = {
-  task.send(flights.table, t);
+  task.send(runs_in_progress.table, t);
   ()
 }
 
@@ -920,16 +929,16 @@ test "a timeout runs on the virtual clock: {c.name}" for c: Bounded in bounded()
 }
 
 /// A count small enough that a law runs every interleaving at each one.
-type Few = | Zero | One | Two | Three
+type SmallCount = | Zero | One | Two | Three
 
-fn count(n: Few) -> Int = match n { Zero -> 0, One -> 1, Two -> 2, Three -> 3 }
+fn few_to_int(n: SmallCount) -> Int = match n { Zero -> 0, One -> 1, Two -> 2, Three -> 3 }
 
 law "work ends before its timeout or is stopped at it, in every interleaving"
-  forall (allowed: Few, taken: Few) {
+  forall (allowed: SmallCount, taken: SmallCount) {
     simulate {
       unbounded(|| {
-        let budget = count(allowed);
-        let work = count(taken);
+        let budget = few_to_int(allowed);
+        let work = few_to_int(taken);
         let ended = timeout(Duration(budget), || nap(work));
         let at = clock.now();
         if work < budget { ended == Done(work) && at == Instant(work) }
@@ -1059,10 +1068,10 @@ test "each loser of a race has released what it held when the race returns" {
 }
 
 law "a race returns the body that ends first and takes no longer, in every interleaving"
-  forall (a: Few, b: Few, c: Few) where a != b && a != c && b != c {
+  forall (a: SmallCount, b: SmallCount, c: SmallCount) where a != b && a != c && b != c {
     simulate {
-      let first = min(count(a), min(count(b), count(c)));
-      race([|| nap(count(a)), || nap(count(b)), || nap(count(c))]) == Some(first)
+      let first = min(few_to_int(a), min(few_to_int(b), few_to_int(c)));
+      race([|| nap(few_to_int(a)), || nap(few_to_int(b)), || nap(few_to_int(c))]) == Some(first)
         && clock.now() == Instant(first)
     }
   }
@@ -1138,17 +1147,19 @@ test "first_ok of bodies that all fail returns every failure in the bodies' orde
 }
 
 law "map_concurrent returns results in the order given and never runs more than its limit at once"
-  forall (items: Few, at_once: Few) where at_once != Zero && (items != Three || at_once != Three) {
+  forall (items: SmallCount, at_once: SmallCount)
+  where at_once != Zero && (items != Three || at_once != Three) {
     simulate {
-      let n = count(items);
+      let n = few_to_int(items);
       let got = peak(||
-        map_concurrent(range(0, n), count(at_once), |x: Int| {
+        map_concurrent(range(0, n), few_to_int(at_once), |x: Int| {
           level.up();
           task.yield();
           level.down();
           x * 2
         }));
-      got.value == range(0, n).map(|x: Int| x * 2) && got.most <= count(at_once) && got.inside == 0
+      got.value == range(0, n).map(|x: Int| x * 2) && got.most <= few_to_int(at_once)
+        && got.inside == 0
     }
   }
 
@@ -1163,13 +1174,13 @@ test "map_concurrent of nothing is nothing, and a limit below one raises" {
 }
 
 law "a semaphore never admits more holders than it has permits, in every interleaving"
-  forall (permits: Few, tasks: Few)
+  forall (permits: SmallCount, tasks: SmallCount)
   where permits != Zero && permits != Three && (permits == One || tasks != Three) {
     simulate {
-      let sem = semaphore(count(permits));
+      let sem = semaphore(few_to_int(permits));
       let got = peak(||
         all(
-          range(0, count(tasks)).map(|_i: Int|
+          range(0, few_to_int(tasks)).map(|_i: Int|
             ||
               with_permit(sem, || {
                 level.up();
@@ -1177,7 +1188,8 @@ law "a semaphore never admits more holders than it has permits, in every interle
                 level.down()
               })),
         ));
-      got.most <= count(permits) && got.inside == 0 && (count(tasks) == 0 || got.most >= 1)
+      got.most <= few_to_int(permits) && got.inside == 0
+        && (few_to_int(tasks) == 0 || got.most >= 1)
     }
   }
 
@@ -1188,12 +1200,12 @@ effect queue {
 }
 
 law "a semaphore of one permit admits waiters in the order they requested, in every interleaving"
-  forall (tasks: Few) {
+  forall (tasks: SmallCount) {
     simulate {
       let sem = semaphore(1);
       handle {
         all(
-          range(0, count(tasks)).map(|i: Int|
+          range(0, few_to_int(tasks)).map(|i: Int|
             || {
               queue.requested(i);
               with_permit(sem, || {
@@ -1313,9 +1325,9 @@ test "a retry without jitter waits its base doubled up to its cap, until its att
   assert_eq(ended, (Err({ last: "no 5", attempts: 5, reason: Spent }), Instant(110)))
 }
 
-type Spread = { name: String, jitter: Jitter }
+type JitterCase = { name: String, jitter: Jitter }
 
-fn spreads() -> List<Spread> =
+fn jitter_cases() -> List<JitterCase> =
   [
     { name: "none", jitter: NoJitter },
     { name: "full", jitter: FullJitter },
@@ -1323,7 +1335,7 @@ fn spreads() -> List<Spread> =
     { name: "decorrelated", jitter: DecorrelatedJitter },
   ]
 
-test "a retry waits what its jitter computes from the draws the simulation's seed decides: {c.name}" for c: Spread in spreads(
+test "a retry waits what its jitter computes from the draws the simulation's seed decides: {c.name}" for c: JitterCase in jitter_cases(
   ) {
   simulate {
     unbounded(|| {
@@ -1399,7 +1411,7 @@ test "a retry under a budget is made only while the budget pays, and each call p
     },
     return calls -> (calls, kept),
   };
-  assert_eq(ended._0, [over_budget(2), over_budget(1), over_budget(2)]);
+  assert_eq(ended._0, [over_budget_failure(2), over_budget_failure(1), over_budget_failure(2)]);
   assert_eq(retries_left(ended._1), 0)
 }
 
@@ -1409,7 +1421,7 @@ effect budgets {
   write store(b: Budget) -> Unit
 }
 
-fn over_budget(attempts: Int) -> Result<Int, RetryFailure<String>> =
+fn over_budget_failure(attempts: Int) -> Result<Int, RetryFailure<String>> =
   Err({ last: "no " ++ attempts.to_string(), attempts: attempts, reason: OverBudget })
 
 /// Generates any `Jitter`.
@@ -1427,8 +1439,9 @@ test "a budget never pays for more retries than its reserve and its share of the
       let ran = script.fold(
         { budget: budget(percent, reserve), calls: 0, retries: 0 },
         |so_far: { budget: Budget, calls: Int, retries: Int }, call: Bool|
-          if call { { ..so_far, budget: pay_in(so_far.budget), calls: so_far.calls + 1 } } else {
-            match draw_retry(so_far.budget) {
+          if call { { ..so_far, budget: credit_call(so_far.budget), calls: so_far.calls + 1 } }
+          else {
+            match spend_retry(so_far.budget) {
               Some(rest) -> { ..so_far, budget: rest, retries: so_far.retries + 1 },
               None -> so_far,
             }
@@ -1498,34 +1511,37 @@ test "an open breaker rejects every call until its cooldown ends, then lets one 
 }
 
 test "a call behind an open breaker is rejected, probes after the cooldown, and closes it" {
-  breaking(breaker(2, Duration(10), 1), ||
+  with_breaker(breaker(2, Duration(10), 1), ||
     simulate {
       let call = |ok: Bool|
-        guarded(|| breakers.load(), |b: Breaker| breakers.store(b), ||
+        guarded(|| shared_breaker.load(), |b: Breaker| shared_breaker.store(b), ||
           if ok { Ok(1) } else { Err("down") });
       assert_eq(call(false), Err(Failed("down")));
       assert_eq(call(false), Err(Failed("down")));
       assert_eq(call(true), Err(Rejected));
       clock.sleep(Duration(10));
       assert_eq(call(true), Ok(1));
-      assert_eq(circuit(breakers.load()), Closed(0))
+      assert_eq(circuit(shared_breaker.load()), Closed(0))
     })
 }
 
 /// The breaker a test's calls share.
-effect breakers {
+effect shared_breaker {
   read load() -> Breaker
   write store(b: Breaker) -> Unit
 }
 
-/// Runs `body` with its calls sharing the breaker `b` through `breakers`.
-fn breaking<a | e>(b: Breaker, body: () -> a / {breakers.load, breakers.store | e}) -> a / e =
+/// Runs `body` with its calls sharing the breaker `b` through `shared_breaker`.
+fn with_breaker<a | e>(
+  b: Breaker,
+  body: () -> a / {shared_breaker.load, shared_breaker.store | e},
+) -> a / e =
   handle {
     body()
   } with {
     var kept = b,
-    breakers.load() -> kept,
-    breakers.store(next) -> {
+    shared_breaker.load() -> kept,
+    shared_breaker.store(next) -> {
       kept = next;
     },
   }
@@ -1536,16 +1552,16 @@ fn slow_ok(takes: Int) -> Result<Int, String> / {clock.write} = {
 }
 
 test "a probe that is cancelled is released, so the next call may probe" {
-  breaking(record(breaker(1, Duration(0), 1), false, Instant(0)), ||
+  with_breaker(record(breaker(1, Duration(0), 1), false, Instant(0)), ||
     simulate {
       let call = |takes: Int|
-        guarded(|| breakers.load(), |b: Breaker| breakers.store(b), || slow_ok(takes));
+        guarded(|| shared_breaker.load(), |b: Breaker| shared_breaker.store(b), || slow_ok(takes));
       let probe = task.spawn(|| call(50));
       clock.sleep(Duration(1));
       assert_eq(call(1), Err(Rejected));
       assert(task.cancel(probe));
       assert_eq(task.await(probe), None);
-      assert_eq(circuit(breakers.load()), HalfOpen(0, false));
+      assert_eq(circuit(shared_breaker.load()), HalfOpen(0, false));
       assert_eq(call(1), Ok(1))
     })
 }
@@ -1571,19 +1587,22 @@ test "a bucket left alone fills again, to its capacity and no further" {
 }
 
 /// The bucket a test's calls share.
-effect buckets {
+effect shared_bucket {
   read load() -> Bucket
   write store(b: Bucket) -> Unit
 }
 
-/// Runs `body` with its calls sharing the bucket `b` through `buckets`.
-fn bucketed<a | e>(b: Bucket, body: () -> a / {buckets.load, buckets.store | e}) -> a / e =
+/// Runs `body` with its calls sharing the bucket `b` through `shared_bucket`.
+fn bucketed<a | e>(
+  b: Bucket,
+  body: () -> a / {shared_bucket.load, shared_bucket.store | e},
+) -> a / e =
   handle {
     body()
   } with {
     var kept = b,
-    buckets.load() -> kept,
-    buckets.store(next) -> {
+    shared_bucket.load() -> kept,
+    shared_bucket.store(next) -> {
       kept = next;
     },
   }
@@ -1592,7 +1611,7 @@ test "calls through a bucket go at once while it holds tokens, and then one each
   let times = bucketed(bucket(2, Duration(10), Instant(0)), ||
     simulate {
       range(0, 5).map(|_i: Int|
-        throttled(|| buckets.load(), |b: Bucket| buckets.store(b), || clock.now()))
+        throttled(|| shared_bucket.load(), |b: Bucket| shared_bucket.store(b), || clock.now()))
     });
   assert_eq(times, [Instant(0), Instant(0), Instant(10), Instant(20), Instant(30)])
 }
@@ -1602,7 +1621,8 @@ test "tasks through one bucket are spaced as one caller's calls are, in every in
     simulate {
       all(
         range(0, 3).map(|_i: Int|
-          || throttled(|| buckets.load(), |b: Bucket| buckets.store(b), || clock.now())),
+          ||
+            throttled(|| shared_bucket.load(), |b: Bucket| shared_bucket.store(b), || clock.now())),
       )
     });
   assert_eq(times.sort(), [Instant(0), Instant(10), Instant(20)])
@@ -1629,7 +1649,7 @@ test "callers of one key while it runs share one run and its result, in every in
   let ran = counted_runs(||
     simulate {
       {
-        let f: Flights<String, Int> = flights();
+        let f: RunsInProgress<String, Int> = runs_in_progress();
         let ask = |key: String|
           ||
             single_flight(f, key, || {
@@ -1655,7 +1675,7 @@ test "callers that request different keys each run their own, and a later caller
   let ran = counted_runs(||
     simulate {
       {
-        let f: Flights<String, Int> = flights();
+        let f: RunsInProgress<String, Int> = runs_in_progress();
         let ask = |key: String|
           ||
             single_flight(f, key, || {
@@ -1681,7 +1701,7 @@ test "where the caller running a flight is cancelled, a caller waiting on it run
   let ran = counted_runs(||
     simulate {
       {
-        let f: Flights<String, Int> = flights();
+        let f: RunsInProgress<String, Int> = runs_in_progress();
         let ask = ||
           single_flight(f, "a", || {
             ran.run();
@@ -1720,10 +1740,11 @@ test "a ticker whose second tick runs long catches up, starts over or skips, per
 
 test "a ticker ends when its tick returns Stop, and never ticks past its limit" {
   simulate {
-    let cancel_and_await = every(Duration(10), Burst, 9, 0, |count: Int, _due: Instant|
-      if count == 2 { Stop(count + 1) } else { Continue(count + 1) });
+    let cancel_and_await = every(Duration(10), Burst, 9, 0, |few_to_int: Int, _due: Instant|
+      if few_to_int == 2 { Stop(few_to_int + 1) } else { Continue(few_to_int + 1) });
     assert_eq((cancel_and_await, clock.now()), (3, Instant(30)));
-    let limited = every(Duration(10), Burst, 2, 0, |count: Int, _due: Instant| Continue(count + 1));
+    let limited = every(Duration(10), Burst, 2, 0, |few_to_int: Int, _due: Instant|
+      Continue(few_to_int + 1));
     assert_eq((limited, clock.now()), (2, Instant(50)))
   }
 }

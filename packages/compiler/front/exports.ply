@@ -6,7 +6,7 @@ import compiler.front.published (no_rows, rows_of)
 import compiler.front.facts (Analysis)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front (PulledAnalysis, StagedLoad, EmbedRecord, analyse_pulling_std_with,
-                       staged_pulling_std_with, checked_staged)
+                       load_with_shipped, checked_staged)
 import compiler.front.rows (KnownDefinitionRow, Rows, ModuleDerivations, known_definition_row_bin,
                             is_declared_in)
 import compiler.front.pkg (PackageSources, SuppliedPackage, JudgedPackages)
@@ -15,16 +15,17 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               InstanceItem, NumericItem, SumBody, ImportDeclaration, WholeModule,
                               ModuleAlias, SelectedNames, VariantDefinition, OpDefinition,
                               DeriveOrigin, Derivation, parse, parse_started, header, header_of,
-                              is_written, item_span, import_declaration_bin, owner_of, item_owner,
-                              test_of_owner, member_of, member_name, is_builtin, derivation_bin)
+                              is_explicit_import, item_span, import_declaration_bin, owner_of,
+                              item_owner, test_of_owner, member_of, member_name, is_builtin,
+                              derivation_bin)
 import compiler.syntax.fmt (print_standalone)
 import compiler.syntax.expressions (BlockExpression, expression_span, implicitly_imported_by,
                                     prelude_module, map_literal_call)
 import compiler.store.hash.forms (CachedNode, CachedHashes, NodeRef, HashOutput, cached_nodes,
                                   cached_hashes_of, selection_forms, module_selection, hash_forms,
                                   cached_node_bin)
-import compiler.store.hash.template (called_at, emitted_code, emitted_calls_for, crossed_by,
-                                     marshalling_calls)
+import compiler.store.hash.template (called_at, emitted_code, emitted_calls_for,
+                                     marshalling_calls_for, marshalling_calls)
 import compiler.store.hash.graph (Index)
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label)
 import compiler.front.diagnostics (ParsedSource, parse_at, parse_from, with_prelude_source)
@@ -40,11 +41,11 @@ import compiler.check.types (canonical_scheme, Scheme)
 
 pub type Mention = { module: Bytes, name: Bytes }
 
-pub fn of_any(name: Bytes) -> Bytes = b"::".concat(name)
+pub fn any_module_name(name: Bytes) -> Bytes = b"::".concat(name)
 
 pub fn called_of(modules: List<Bytes>, names: List<Bytes>) -> List<Mention> =
   modules.fold([], |acc: List<Mention>, m: Bytes|
-    names.fold(acc, |a: List<Mention>, n: Bytes| a.push({ module: m, name: of_any(n) })))
+    names.fold(acc, |a: List<Mention>, n: Bytes| a.push({ module: m, name: any_module_name(n) })))
 
 pub type OwnerInterface = {
   reach: Bytes,
@@ -220,8 +221,8 @@ fn called_on_value(tokens: List<Token>, bound: Map<Bytes, Bool>, i: Int) -> Bool
 }
 
 fn on_value(scope: Scope, name: Bytes) -> List<Mention> =
-  [{ module: b"", name: name }].concat(if scope.owners.contains(of_any(name)) {
-    [{ module: scope.module, name: of_any(name) }]
+  [{ module: b"", name: name }].concat(if scope.owners.contains(any_module_name(name)) {
+    [{ module: scope.module, name: any_module_name(name) }]
   } else { [] })
 
 fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
@@ -233,7 +234,7 @@ fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
   else { declared }
 }
 
-fn through(scope: Scope, binder: Bytes, name: Bytes) -> List<Mention> =
+fn binder_mentions(scope: Scope, binder: Bytes, name: Bytes) -> List<Mention> =
   match scope.binders.get(binder) {
     Some(m) -> [{ module: m, name: name }],
     None -> of_type(scope, binder, name),
@@ -248,11 +249,11 @@ fn mentioned_in(scope: Scope, tokens: List<Token>) -> List<Mention> / {abort.rai
     let acc = was.concat(written_mentions(scope.module, tokens, i));
     match identifier_at(tokens, i) {
       None -> if punct_at(tokens, i, b"hashbrace") {
-        acc.concat(through(scope, map_literal_call().binder, map_literal_call().name))
+        acc.concat(binder_mentions(scope, map_literal_call().binder, map_literal_call().name))
       } else { acc },
       Some(n) -> if punct_at(tokens, i - 1, b"coloncolon") {
         match identifier_at(tokens, i - 2) {
-          Some(b) -> acc.concat(through(scope, b, n)),
+          Some(b) -> acc.concat(binder_mentions(scope, b, n)),
           None -> acc,
         }
       } else if punct_at(tokens, i - 1, b"dot") {
@@ -281,7 +282,7 @@ fn written_mentions(module: Bytes, tokens: List<Token>, i: Int) -> List<Mention>
       Punctuation(p) -> if emitted_code().tokens.contains(p) { emitted_code().calls }
       else if opens_own_types(tokens, i) { marshalling_calls(module) }
       else { [] },
-      Identifier(n) -> emitted_calls_for(n).concat(crossed_by(module, n)),
+      Identifier(n) -> emitted_calls_for(n).concat(marshalling_calls_for(module, n)),
       _ -> [],
     },
     None -> [],
@@ -306,7 +307,7 @@ fn opens_own_types(tokens: List<Token>, i: Int) -> Bool = {
 fn hidden_import_mentions(text: Bytes) -> List<Mention> / {abort.raise} =
   hidden_of(match header(text) { Some(m) -> m, None -> parse(text).node })
 
-fn hidden_lexed(
+fn implicit_mentions(
   source: Bytes,
   tokens: List<Token>,
   text: () -> Bytes / {abort.raise},
@@ -317,13 +318,13 @@ fn hidden_lexed(
 
 fn hidden_of(raw: Module) -> List<Mention> =
   raw.imports.fold([], |acc: List<Mention>, d: ImportDeclaration|
-    if is_written(d) || imports_implicit_names(d) { acc }
+    if is_explicit_import(d) || imports_implicit_names(d) { acc }
     else { acc.push({ module: import_path(d), name: b"" }) })
 
 fn imports_implicit_names(d: ImportDeclaration) -> Bool =
   match d.kind { ModuleAlias(a) -> implicitly_imported_by(a.name) != [], _ -> false }
 
-fn derive_held_as_generated(raw: Module, item: Item) -> Bool / {abort.raise} =
+fn is_generated_derive(raw: Module, item: Item) -> Bool / {abort.raise} =
   match item { DeriveItem(d) -> deriver_module(raw, d.deriver) != Some(b"std.sql"), _ -> false }
 
 /// The derivations recorded for the `derive` lines among `items`.
@@ -340,7 +341,7 @@ fn derivations_of(parsed: ParsedModule, items: List<Item>) -> List<Derivation> =
 fn deriver_modules_of(raw: Module, items: List<Item>) -> List<Bytes> / {abort.raise} =
   items.fold([], |acc: List<Bytes>, item: Item|
     match item {
-      DeriveItem(d) -> if derive_held_as_generated(raw, item) { acc } else {
+      DeriveItem(d) -> if is_generated_derive(raw, item) { acc } else {
         match deriver_module(raw, d.deriver) {
           Some(m) -> if acc.contains(m) { acc } else { acc.push(m) },
           None -> acc,
@@ -374,7 +375,7 @@ pub fn imports_read(
   range(0, min(imports.len(), targets.len())).fold([], |acc: List<Imported>, i: Int| {
     let d = imports.get(i);
     let target = targets.get(i);
-    if !is_written(d) { acc }
+    if !is_explicit_import(d) { acc }
     else if runtimes.contains(target) { acc.push({ declaration: d, target: target }) } else {
       match d.kind {
         SelectedNames(ns) -> {
@@ -455,7 +456,10 @@ fn named_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> / {abo
   fn_owners(raw, parsed).fold(
     owners_in(raw, parsed),
     |acc: Map<Bytes, List<Bytes>>, f: Bytes, o: Bytes|
-      match member_of(f) { Some(m) -> listed_under(acc, of_any(m.member), o), None -> acc },
+      match member_of(f) {
+        Some(m) -> listed_under(acc, any_module_name(m.member), o),
+        None -> acc,
+      },
   )
 
 fn generated_by_owner(
@@ -601,11 +605,11 @@ pub fn exports_of(
     entries: items.fold(Map::new(), |acc: Map<Bytes, OwnerInterface>, o: Bytes, its: List<Item>| {
       let stated = alone(
         text,
-        its.filter(|item: Item| !derive_held_as_generated(raw, item)).map(interface_item),
+        its.filter(|item: Item| !is_generated_derive(raw, item)).map(interface_item),
       );
       let fs = match generated.get(o) { Some(fs) -> fs, None -> [] };
       let derives = its.fold(Map::new(), |spans: Map<Bytes, Bool>, item: Item|
-        if derive_held_as_generated(raw, item) { spans.insert(span_key(item_span(item)), true) }
+        if is_generated_derive(raw, item) { spans.insert(span_key(item_span(item)), true) }
         else { spans });
       let printed = stated.concat(
         alone(
@@ -622,14 +626,11 @@ pub fn exports_of(
         reach: b"",
         owner: o,
         text: printed,
-        imports: imports_for(raw.imports, targets, mentions, runtimes).map(unplaced),
+        imports: imports_for(raw.imports, targets, mentions, runtimes).map(without_spans),
         mentions: mentions,
         rows: match rows.get(o) { Some(xs) -> xs, None -> [] },
         fixed: match fixed.get(o) { Some(xs) -> xs, None -> [] },
-        derived: derivations_of(
-          parsed,
-          its.filter(|item: Item| !derive_held_as_generated(raw, item)),
-        ),
+        derived: derivations_of(parsed, its.filter(|item: Item| !is_generated_derive(raw, item))),
       })
     }),
   }
@@ -717,9 +718,9 @@ pub fn needed_by<| e>(
   imported: List<Bytes>,
   returning: (Bytes) -> List<Bytes> / {abort.raise | e},
 ) -> Map<Bytes, Map<Bytes, OwnerInterface>> / {abort.raise | e} =
-  needed_through(entries, interface_header_of, wanted, imported, |_: Bytes, _: Bytes| [], returning)
+  needed_entries(entries, interface_header_of, wanted, imported, |_: Bytes, _: Bytes| [], returning)
 
-pub fn needed_through<x | e>(
+pub fn needed_entries<x | e>(
   entries: (Bytes, Bytes) -> List<x> / {abort.raise | e},
   head: (x) -> InterfaceHeader,
   wanted: List<Mention>,
@@ -800,7 +801,7 @@ pub fn owner_interfaces_in(
 
 fn nowhere(i: Identifier) -> Identifier = { ..i, span: dummy_span() }
 
-fn unplaced(d: ImportDeclaration) -> ImportDeclaration =
+fn without_spans(d: ImportDeclaration) -> ImportDeclaration =
   {
     path: d.path.map(nowhere),
     kind: match d.kind {
@@ -848,7 +849,10 @@ fn merged_imports(entries: List<OwnerInterface>) -> List<ImportDeclaration> / {a
     match merged.held.get(k) { Some(d) -> d, None -> panic("an import merged is kept") })
 }
 
-pub fn synthetic(module: Bytes, entries: Map<Bytes, OwnerInterface>) -> Source / {abort.raise} = {
+pub fn interface_source(
+  module: Bytes,
+  entries: Map<Bytes, OwnerInterface>,
+) -> Source / {abort.raise} = {
   let es = entries.fold([], |acc: List<OwnerInterface>, _: Bytes, e: OwnerInterface| acc.push(e));
   {
     name: module,
@@ -873,7 +877,7 @@ pub type CheckInputs = {
   given: List<ParsedSource>,
 }
 
-fn staged_against(
+fn staged_with_interfaces(
   source: Source,
   placed: ModuleOrigin,
   dependencies: Map<Bytes, Map<Bytes, OwnerInterface>>,
@@ -884,7 +888,7 @@ fn staged_against(
   let standing = dependencies.fold(
     [],
     |acc: List<{ placed: ModuleOrigin, source: Source }>, m: Bytes, es: Map<Bytes, OwnerInterface>|
-      acc.push({ placed: placing(m), source: synthetic(m, es) }),
+      acc.push({ placed: placing(m), source: interface_source(m, es) }),
   );
   let rooted = standing.fold(
     [],
@@ -899,7 +903,7 @@ fn staged_against(
   let shipped = if source.name == prelude_module()
       || standing_in.concat(reading.whole).any(|s: Source| s.name == prelude_module()) {
     standing_in
-  } else { standing_in.push(synthetic(prelude_module(), Map::new())) };
+  } else { standing_in.push(interface_source(prelude_module(), Map::new())) };
   let supplied = range(0, reading.packages.supplied.len()).map(|i: Int| {
     let held = standing.fold(
       [],
@@ -930,7 +934,7 @@ fn staged_against(
     ShippedModule ->
       rooted.len() + supplied.fold(0, |n: Int, p: SuppliedPackage| n + p.modules.len()),
   };
-  let staged = staged_pulling_std_with(
+  let staged = load_with_shipped(
     match placed { InRoot -> rooted.push(source), _ -> rooted },
     shipped.concat(reading.whole).concat(if own { [] } else { [source] }),
     { ..reading.packages, supplied: supplied },
@@ -987,7 +991,7 @@ pub fn checked_against(
     |acc: List<CachedNode>, _: Bytes, es: Map<Bytes, OwnerInterface>|
       es.fold(acc, |a: List<CachedNode>, _: Bytes, e: OwnerInterface| a.concat(e.fixed)),
   );
-  let s = staged_against(source, placed, dependencies, fixed, placing, reading);
+  let s = staged_with_interfaces(source, placed, dependencies, fixed, placing, reading);
   {
     pulled: checked_staged(s.staged, { definitions: rows, tests: [], types: Map::new() }),
     at: s.at,
@@ -1048,7 +1052,7 @@ pub fn owner_texts(
 }
 
 pub fn signature_text(raw: Module, o: OwnerText) -> OwnerText / {abort.raise} = {
-  let cuts = signature_cuts(raw, o);
+  let cuts = signature_ends(raw, o);
   {
     ..o,
     texts: range(0, o.texts.len()).map(|k: Int| {
@@ -1061,7 +1065,7 @@ pub fn signature_text(raw: Module, o: OwnerText) -> OwnerText / {abort.raise} = 
   }
 }
 
-fn signature_cuts(raw: Module, o: OwnerText) -> List<Option<Int>> =
+fn signature_ends(raw: Module, o: OwnerText) -> List<Option<Int>> =
   owner_items(raw, o.owner).map(|item: Item|
     match item {
       FunctionItem(d) -> if d.transparent != None { None }
@@ -1076,7 +1080,7 @@ pub fn signature_tokens(
   raw: Module,
   tokens: List<Token>,
   o: OwnerText,
-) -> List<Token> / {abort.raise} = read_tokens(tokens, o, signature_cuts(raw, o))
+) -> List<Token> / {abort.raise} = read_tokens(tokens, o, signature_ends(raw, o))
 
 fn read_tokens(
   tokens: List<Token>,
@@ -1134,7 +1138,7 @@ pub fn owner_mentions(
   tokens: List<Token>,
 ) -> List<Mention> / {abort.raise} = {
   let expansion = if o.generated.len() == 0 { [] } else { mentioned(scope.expanded, o.generated) };
-  let hidden = hidden_lexed(source, tokens, || Bytes::join(o.texts, b"\n\n"));
+  let hidden = implicit_mentions(source, tokens, || Bytes::join(o.texts, b"\n\n"));
   distinct(mentioned_in(scope.written, tokens).concat(expansion).concat(hidden)).filter(
     |m: Mention| !(m.module == module && m.name == o.owner),
   )
@@ -1246,7 +1250,7 @@ pub fn group_needs<x | e>(
       SelectedNames(ns) -> acc.concat(ns.map(|n: Identifier| { module: x.target, name: n.name })),
       _ -> acc,
     });
-  needed_through(
+  needed_entries(
     entries,
     head,
     mentions.filter(|m: Mention| !(m.module == module && names.contains(m.name))).concat(selected),
@@ -1320,7 +1324,7 @@ pub fn group_source_from(
   }
 }
 
-pub fn unplaced_imports(raw: Module) -> List<ImportDeclaration> = raw.imports.map(unplaced)
+pub fn unplaced_imports(raw: Module) -> List<ImportDeclaration> = raw.imports.map(without_spans)
 
 pub fn owner_source<| e>(
   parsed: ParsedModule,
@@ -1379,7 +1383,7 @@ pub fn checked_owner(
     { ..raw, node: named_as_owned(raw.node, o) },
     derivations: o.derived,
   );
-  let s = staged_against(o.source, placed, o.dependencies, o.fixed, placing, {
+  let s = staged_with_interfaces(o.source, placed, o.dependencies, o.fixed, placing, {
     ..reading,
     given: reading.given.push(parsed),
   });
@@ -1413,7 +1417,7 @@ type Agreed = {
   warnings: List<Bytes>,
 }
 
-fn agreed(w: Analysis, module: Bytes) -> Agreed / {abort.raise} = {
+fn module_check_result(w: Analysis, module: Bytes) -> Agreed / {abort.raise} = {
   let mine = |name: Bytes| is_declared_in(module, name);
   let at_module = range(0, w.modules.len()).fold(0, |acc: Int, i: Int|
     if w.modules.get(i).name == module { i } else { acc });
@@ -1485,15 +1489,15 @@ fn per_module(
             ..reading,
             given: [parsed],
           }).pulled.out {
-          Rejected(ds) -> rejected_apart(name, "checks", ds),
+          Rejected(ds) -> rejected_alone(name, "checks", ds),
           Analysed(w) -> w,
         };
         let at_apart = range(0, apart.modules.len()).fold(0, |k: Int, j: Int|
           if apart.modules.get(j).name == name { j } else { k });
         acc.push({
           module: name,
-          whole: agreed(whole, name),
-          apart: agreed(apart, name),
+          whole: module_check_result(whole, name),
+          apart: module_check_result(apart, name),
           hashed: fixed_of(|m: Bytes| m == name),
           rehashed: hash_forms(
             selection_forms(apart.index, apart.module_packages, {
@@ -1513,7 +1517,7 @@ fn agreed_owner(
   module: Bytes,
   owned: (Bytes) -> Bool / {abort.raise},
 ) -> Agreed / {abort.raise} = {
-  let a = agreed(w, module);
+  let a = module_check_result(w, module);
   {
     schemes: a.schemes.filter(|s: { name: Bytes, scheme: Scheme }| owned(s.name)),
     rows: a.rows.filter(|r: KnownDefinitionRow| owned(r.name)),
@@ -1521,7 +1525,7 @@ fn agreed_owner(
   }
 }
 
-fn checked_apart(
+fn checked_alone(
   whole: Analysis,
   sources: List<Source>,
   i: Int,
@@ -1562,7 +1566,7 @@ fn checked_apart(
     |_: Bytes| visible_modules(whole, i),
   );
   match checked_owner(source, InRoot, placing, reading).pulled.out {
-    Rejected(ds) -> rejected_apart(Bytes::concat_all([parsed.name, b".", o]), "checks", ds),
+    Rejected(ds) -> rejected_alone(Bytes::concat_all([parsed.name, b".", o]), "checks", ds),
     Analysed(w) -> w,
   }
 }
@@ -1589,7 +1593,7 @@ fn per_owner(
             match item { FunctionItem(d) -> m.insert(d.name.name, d.name.name), _ -> m }).values(
           );
           owners.fold(acc, |a: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, o: Bytes| {
-            let apart = checked_apart(whole, sources, i, o, shipped: shipped);
+            let apart = checked_alone(whole, sources, i, o, shipped: shipped);
             a.push({
               owner: Bytes::concat_all([name, b".", o]),
               whole: agreed_owner(whole, name, |n: Bytes| owned_by(o, n)),
@@ -1620,7 +1624,7 @@ test "a test checked alone keeps the name its module gives it beside an earlier 
   assert_eq(keys(whole), [b"m.holds {n}", b"m.holds {n} (2)"]);
   assert_eq(
     [b"test holds {n}", b"test holds {n} (2)"].map(|o: Bytes|
-      keys(checked_apart(whole, sources, m, o, shipped: shipped))),
+      keys(checked_alone(whole, sources, m, o, shipped: shipped))),
     [[b"m.holds {n}"], [b"m.holds {n} (2)"]],
   )
 }
@@ -1642,7 +1646,7 @@ test "each function checked alone against the entries it reads returns what its 
   })
 }
 
-fn rejected_apart<a>(name: Bytes, what: String, ds: List<Diagnostic>) -> a / {abort.raise} =
+fn rejected_alone<a>(name: Bytes, what: String, ds: List<Diagnostic>) -> a / {abort.raise} =
   panic(
     "module `" ++ String::of_bytes_lossy(name) ++ "` " ++ what ++ " apart: "
       ++ String::of_bytes_lossy(

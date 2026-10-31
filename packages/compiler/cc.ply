@@ -41,16 +41,16 @@ pub type Compiler = { path: String, identity: Bytes, support_flags: List<String>
 
 pub type Toolchain = { identity: Bytes, support_flags: List<String>, level: String, checked: Bool }
 
-fn mark_opener() -> Bytes = b"/* --- "
+fn marker_start() -> Bytes = b"/* --- "
 
 fn part_opener() -> Bytes = b"/* --- part "
 
-fn mark_closer() -> Bytes = b" --- */"
+fn marker_end() -> Bytes = b" --- */"
 
 pub fn part_mark(label: String) -> Bytes =
-  Bytes::concat_all([part_opener(), Bytes::of_string(label), mark_closer()])
+  Bytes::concat_all([part_opener(), Bytes::of_string(label), marker_end()])
 
-pub fn tail_mark() -> Bytes = b"/* --- the runtime, bound at load --- */"
+pub fn runtime_part_mark() -> Bytes = b"/* --- the runtime, bound at load --- */"
 
 fn line_start(text: Bytes, mark: Bytes, from: Int) -> Option<Int> / {abort.raise} =
   if from == 0 && text.starts_with(mark) { Some(0) } else {
@@ -58,10 +58,10 @@ fn line_start(text: Bytes, mark: Bytes, from: Int) -> Option<Int> / {abort.raise
   }
 
 fn label_of(line: Bytes) -> Option<String> / {abort.raise} =
-  if line == tail_mark() { Some("runtime") }
-  else if line.len() >= part_opener().len() + mark_closer().len() && line.starts_with(part_opener())
-      && line.ends_with(mark_closer()) {
-    Some(String::of_bytes(line.slice(part_opener().len(), line.len() - mark_closer().len())))
+  if line == runtime_part_mark() { Some("runtime") }
+  else if line.len() >= part_opener().len() + marker_end().len() && line.starts_with(part_opener())
+      && line.ends_with(marker_end()) {
+    Some(String::of_bytes(line.slice(part_opener().len(), line.len() - marker_end().len())))
   } else { None }
 
 fn marks(text: Bytes) -> List<{ at: Int, label: String }> / {abort.raise} =
@@ -69,7 +69,7 @@ fn marks(text: Bytes) -> List<{ at: Int, label: String }> / {abort.raise} =
     { from: 0, found: [] },
     text.len() + 1,
     |s: { from: Int, found: List<{ at: Int, label: String }> }|
-      match line_start(text, mark_opener(), s.from) {
+      match line_start(text, marker_start(), s.from) {
         None -> Stop(s.found),
         Some(at) -> {
           let end = match text.index_of_from(b"\n", at) { Some(e) -> e, None -> text.len() };
@@ -310,7 +310,7 @@ pub fn sources_cached(sources: List<Source>) -> Bool / {toolchain.read} =
 fn object_path(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
   "obj/" ++ cache_key(t, flags, [Bytes::of_string(s.digest)]) ++ ".o"
 
-pub type Objects = { paths: List<String>, compiled: Int }
+pub type Objects = { paths: List<String>, compiled_count: Int }
 
 pub fn objects<[c]>(
   t: Toolchain,
@@ -338,7 +338,7 @@ pub fn objects<[c]>(
           let placed = missing.fold(true, |ok: Bool, i: Int|
             ok && toolchain.rename(object(i), targets.get(i)));
           if placed {
-            Ok({ paths: targets.map(|o: String| cache ++ "/" ++ o), compiled: missing.len() })
+            Ok({ paths: targets.map(|o: String| cache ++ "/" ++ o), compiled_count: missing.len() })
           } else { Err("an object could not be kept in the toolchain's cache") }
         },
       }
@@ -603,7 +603,7 @@ extern fn memory_heap() -> Bytes / {native.read}
 extern fn memory_census() -> Bytes / {native.read}
 
 fn runtime_text() -> Bytes =
-  tail_mark().concat(b"\nint r;\n/* --- what the loader reads --- */\nint s;\n")
+  runtime_part_mark().concat(b"\nint r;\n/* --- what the loader reads --- */\nint s;\n")
 
 fn unit_text() -> Bytes =
   Bytes::concat_all([
@@ -793,7 +793,7 @@ test "a compiler compiles for x86-64 Linux where it preprocesses the probe, and 
 
 fn in_test_cache(path: String) -> String / {abort.raise} = path.slice("/cache/".len(), path.len())
 
-fn built_over<a>(
+fn fake_build<a>(
   held: Map<String, Bytes>,
   build: () -> a / {compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise},
 ) -> { made: a, written: List<String>, runs: List<List<String>>, files: Map<String, Bytes> } / {abort.raise} =
@@ -854,17 +854,17 @@ test "a build compiles each source whose object is not cached from the C stored 
       Err(reason) -> Err(reason),
       Ok(sources) -> objects[cc](t, sources, [], "work"),
     };
-  let first = built_over(held, build);
+  let first = fake_build(held, build);
   let input = |w: WrittenPart| Some("/cache/" ++ source_path(w.digest));
   assert_eq(first.written, fresh.push(built).map(|w: WrittenPart| source_path(w.digest)));
   assert_eq(first.runs.map(|run: List<String>| run.last()), fresh.push(taken).map(input));
-  let again = built_over(first.files, build);
+  let again = fake_build(first.files, build);
   let paths = |r: Result<Objects, String>| r.map(|o: Objects| o.paths);
   assert_eq(paths(again.made), paths(first.made));
   assert_eq(again.runs, []);
   assert_eq(again.written, []);
   let lost = { label: taken.label, digest: taken.digest };
-  assert(built_over(Map::new(), || objects[cc](t, [lost], [], "work")).made.is_err(), None)
+  assert(fake_build(Map::new(), || objects[cc](t, [lost], [], "work")).made.is_err(), None)
 }
 
 test "a unit compiled again from its sources starts no compiler and writes nothing" {
@@ -873,9 +873,9 @@ test "a unit compiled again from its sources starts no compiler and writes nothi
       Err(reason) -> Err(reason),
       Ok(sources) -> library[cc](development(), sources),
     };
-  let first = built_over(Map::new(), compiled);
+  let first = fake_build(Map::new(), compiled);
   assert(first.made.is_ok(), None);
-  let again = built_over(first.files, compiled);
+  let again = fake_build(first.files, compiled);
   assert_eq(again.made, first.made);
   assert_eq(again.runs, []);
   assert_eq(again.written, [])
@@ -885,18 +885,18 @@ test "caching a unit's parts writes each new one's C, reuses each one already ca
   let fresh = { label: "a", digest: "aa", size: 2, text: Some(b"a\n") };
   let beside = { label: "c", digest: "cc", size: 2, text: Some(b"c\n") };
   let taken = { label: "b", digest: "bb", size: 9, text: None };
-  let r = built_over(Map::new().insert("src/bb.c", b"h\nb\n"), ||
+  let r = fake_build(Map::new().insert("src/bb.c", b"h\nb\n"), ||
     cache_sources(b"h\n", [fresh, beside, taken]));
   assert_eq(r.made.map(|sources: List<Source>| sources.map(source_label)), Ok(["b", "a", "c"]));
   assert_eq(r.written, ["src/aa.c", "src/cc.c"]);
-  assert(built_over(Map::new(), || cache_sources(b"h\n", [fresh, taken])).made.is_err(), None)
+  assert(fake_build(Map::new(), || cache_sources(b"h\n", [fresh, taken])).made.is_err(), None)
 }
 
 test "a unit's C read back from its kept sources holds its parts, and keeps as those sources again, writing nothing" {
   let cut = split(unit_text());
-  let first = built_over(Map::new(), || cache_sources(cut.head, cut.parts));
+  let first = fake_build(Map::new(), || cache_sources(cut.head, cut.parts));
   let sources = first.made.expect("the parts are kept");
-  let again = built_over(first.files, ||
+  let again = fake_build(first.files, ||
     match read_back(cut.head, sources) {
       Err(reason) -> Err(reason),
       Ok(back) -> cache_text(back).map(|s: List<Source>| { back: back, sources: s }),
@@ -911,7 +911,7 @@ test "a unit's C read back from its kept sources holds its parts, and keeps as t
       assert_eq(back.parts.sort_by_key(part_label), cut.parts.sort_by_key(part_label))
     },
   };
-  assert(built_over(Map::new(), || read_back(cut.head, sources)).made.is_err(), None)
+  assert(fake_build(Map::new(), || read_back(cut.head, sources)).made.is_err(), None)
 }
 
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =

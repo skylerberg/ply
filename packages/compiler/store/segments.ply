@@ -4,7 +4,7 @@ import std.hash (checksum)
 import std.bytes (u32_le, u64_le)
 import std.list
 
-fn format() -> Int = 3
+fn format_version() -> Int = 3
 
 fn segment_magic() -> Bytes = b"PLYSEGM1"
 
@@ -59,7 +59,7 @@ fn segment_bytes(s: Segment) -> Bytes =
 fn manifest_bytes(m: Manifest) -> Bytes / {abort.raise} = {
   let body = Bytes::concat_all([
     manifest_magic(),
-    u32_le(format()),
+    u32_le(format_version()),
     u64_le(m.generation),
     u32_le(m.segments.len()),
     Bytes::concat_all(m.segments.map(segment_bytes)),
@@ -113,7 +113,7 @@ fn segments_from(
 
 fn manifest_from(b: Bytes) -> Option<Manifest> / {abort.raise} = {
   let n = b.len();
-  if n < 32 || b.slice(0, 8) != manifest_magic() || read_u32(b, 8) != format() { None }
+  if n < 32 || b.slice(0, 8) != manifest_magic() || read_u32(b, 8) != format_version() { None }
   else if checksum(b.slice(0, n - 8)) != b.slice(n - 8, n) { None } else {
     Some({ generation: read_u64(b, 12), segments: segments_from(b, 24, read_u32(b, 20), []) })
   }
@@ -285,13 +285,13 @@ pub type SegmentWriter = {
   waiting: List<Bytes>,
   unwritten: Map<Int, Bytes>,
   buffered: Int,
-  dead: Bool,
+  failed: Bool,
 }
 
 pub fn new_writer() -> SegmentWriter =
-  { end: header_len(), waiting: [], unwritten: Map::new(), buffered: 0, dead: false }
+  { end: header_len(), waiting: [], unwritten: Map::new(), buffered: 0, failed: false }
 
-pub fn failed_writer() -> SegmentWriter = { ..new_writer(), dead: true }
+pub fn failed_writer() -> SegmentWriter = { ..new_writer(), failed: true }
 
 pub fn append_payload(
   w: SegmentWriter,
@@ -324,7 +324,7 @@ pub fn append_frames(w: SegmentWriter, frames: Bytes) -> { writing: SegmentWrite
 pub fn pending_payload(w: SegmentWriter, at: Int) -> Option<Bytes> = w.unwritten.get(at)
 
 fn header(schema: Bytes, token: Bytes) -> Bytes =
-  Bytes::concat_all([segment_magic(), u32_le(format()), token, schema])
+  Bytes::concat_all([segment_magic(), u32_le(format_version()), token, schema])
 
 fn flush<[r]>(
   dir: String,
@@ -333,15 +333,15 @@ fn flush<[r]>(
   w: SegmentWriter,
   more: Bytes,
 ) -> SegmentWriter / {fs.write[r], abort.raise} =
-  if w.dead { w } else {
+  if w.failed { w } else {
     let path = segment_path(dir, token);
     let body = Bytes::concat_all(w.waiting).concat(more);
     let done = if w.end - w.buffered == header_len() {
       fs.write_file[r](path, header(schema, token).concat(body))
     } else { body.len() == 0 || fs.append[r](path, body) != None };
     if done {
-      { end: w.end + more.len(), waiting: [], unwritten: Map::new(), buffered: 0, dead: false }
-    } else { { ..w, dead: true } }
+      { end: w.end + more.len(), waiting: [], unwritten: Map::new(), buffered: 0, failed: false }
+    } else { { ..w, failed: true } }
   }
 
 pub fn flush_when_full<[r]>(
@@ -399,7 +399,7 @@ pub fn finish<[r]>(
       },
   );
   let done = flush[r](dir, schema, token, w, Bytes::concat_all(built.bytes));
-  if done.dead { None } else { Some({ token: token, at: 0, size: done.end, parts: built.parts }) }
+  if done.failed { None } else { Some({ token: token, at: 0, size: done.end, parts: built.parts }) }
 }
 
 pub type CommitResult = | Committed(Manifest) | LockHeld | StoreChanged | WriteFailed
@@ -473,14 +473,15 @@ pub fn merge_start(m: Manifest) -> Int / {abort.raise} = {
   }
 }
 
-fn is_own_segment<[r]>(
+fn has_segment_header<[r]>(
   dir: String,
   name: String,
   schema: Bytes,
 ) -> Bool / {fs.read[r], abort.raise} =
   match fs.read_at[r](dir ++ "/" ++ name, 0, header_len()) {
     Some(b) ->
-      b.len() == header_len() && b.slice(0, 8) == segment_magic() && read_u32(b, 8) == format()
+      b.len() == header_len() && b.slice(0, 8) == segment_magic()
+        && read_u32(b, 8) == format_version()
         && b.slice(20, 52) == schema,
     None -> false,
   }
@@ -523,7 +524,7 @@ pub fn sweep<[r]>(
     names.fold((), |_: Unit, name: String|
       if name.starts_with(own ++ ".") { removed(name) }
       else if name.starts_with("seg-") && !committed_manifest.contains(name)
-          && (!has_other_manifests || is_own_segment[r](dir, name, schema)) { removed(name) })
+          && (!has_other_manifests || has_segment_header[r](dir, name, schema)) { removed(name) })
   }
 }
 
@@ -666,13 +667,13 @@ test "a merge lands only where no run committed while it worked, and replaces wh
     let late = replace_merged[abs]("s", test_shapes(), m1, 0, both);
     let flush = committed_manifest(replace_merged[abs]("s", test_shapes(), m2, 0, both));
     {
-      late: late,
+      shed_timed_out: late,
       landed: flush,
       a: lookup[abs]("s", b"a".blake3()),
       b: lookup[abs]("s", b"b".blake3()),
     }
   });
-  assert_eq(run.value.late, StoreChanged);
+  assert_eq(run.value.shed_timed_out, StoreChanged);
   assert_eq(run.value.landed.generation, 3);
   assert_eq(run.value.landed.segments.map(|s: Segment| s.token), [b"token--c"]);
   assert_eq(run.value.a, Some(b"one"));

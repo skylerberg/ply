@@ -6,7 +6,7 @@ import compiler.emit.layout
 import compiler.emit.layout (WordClass, header_bytes, Pointer, Always, WordIs, WordOutside, Nullary,
                              Inline, Boxed, PlainWords)
 import compiler.emit.lower.representation (leaf_type)
-import compiler.emit.lower.base (unread_packs_dropped)
+import compiler.emit.lower.base (drop_unread_conversions)
 import compiler.emit.release (boxed_case_of)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (dummy_span)
@@ -14,30 +14,31 @@ import compiler.emit.keys (Named, Root)
 import compiler.emit.typed_ir.containers (Retain)
 import compiler.emit.typed_ir.handling (empty_instance)
 import compiler.emit.representations (RecordShape, kind_of)
-import compiler.emit.typed_ir (param_borrowed, handed_of, borrowed_where, no_closure_evidence,
-                               Representation, AsWord, AsInt, AsBool, AsFloat, AsFlattened,
-                               AsReuseToken, AsSum, CaseAllocation, Var, Arg, VarOperand,
-                               IntOperand, BoolOperand, FloatOperand, ZeroOperand, Rvalue,
-                               Primitive, Allocate, Get, Take, Convert, Call, Apply, Native,
+import compiler.emit.typed_ir (param_borrowed, param_ownerships, borrowed_where,
+                               no_closure_evidence, Representation, AsWord, AsInt, AsBool, AsFloat,
+                               AsFlattened, AsReuseToken, AsSum, CaseAllocation, Var, Arg,
+                               VarOperand, IntOperand, BoolOperand, FloatOperand, ZeroOperand,
+                               Rvalue, Primitive, Allocate, Get, Take, Convert, Call, Apply, Native,
                                Aggregate, Update, FieldWrite, Path, FieldPath, ArgumentPath,
                                LeafPath, CasePath, Allocation, ListAllocation, ClosureAllocation,
                                LengthTest, Inst, Let, Do, Declaration, Assign, If, Case, Match,
                                Miss, Loop, Next, Done, Return, Restart, Jump, Fail, NoMatchingArm,
                                Handle, SiteScope, Inc, Dec, Reset, Free, Destructure, Block, Fn,
                                Member, Convention, Metered, Lambda, Closure, ParamOwnership,
-                               OwnedParam, BorrowedParam, Carried, carried_variables, carried_inits,
-                               OwnedResult, BorrowedResult, ResultOwnership, Test, TagTest, Owns,
-                               BorrowSources, Immortal, Static, Op, OfStrings, AsAddress,
-                               PayloadPath, no_links, is_refcounted, operands, fails, by_signature,
-                               operand_var, operand_representation, parts_of, is_terminator,
-                               string_signature, StackAllocation, OfContainers, WalkLoop,
-                               Unspecialised, IfUnique, InlineRecordPath, is_record_word,
-                               read_records, RecordAllocation, FieldInitializer, FromArgument,
-                               BuiltInPlace, CleanupScope, Unwinding)
+                               OwnedParam, BorrowedParam, LoopVariable, carried_variables,
+                               carried_inits, OwnedResult, BorrowedResult, ResultOwnership, Test,
+                               TagTest, Owns, BorrowSources, Immortal, Static, Op, OfStrings,
+                               AsAddress, PayloadPath, no_links, is_refcounted, operands, fails,
+                               by_signature, operand_var, operand_representation, parts_of,
+                               is_terminator, string_signature, StackAllocation, OfContainers,
+                               WalkLoop, OperandsOnly, IfUnique, InlineRecordPath, is_record_word,
+                               takes_except_records, RecordAllocation, FieldInitializer,
+                               FromArgument, BuiltInPlace, CleanupScope, Unwinding)
 import compiler.emit.typed_ir.strings (ByteRead)
-import compiler.emit.verify (ownership_fault, stack_captures, payload_of, takeable,
+import compiler.emit.verify (ownership_fault, stack_captures, payload_of, can_take,
                              is_inline_record, reuses_cells, allocation_words, count_shared_with,
-                             may_leave, result_ownership, is_counted_word, immortals, points_into)
+                             may_leave, result_ownership, is_counted_word, uncounted_variables,
+                             points_into)
 
 type Ownership = | OwnsCount | BorrowsFrom(List<Int>)
 
@@ -69,7 +70,12 @@ type Exits = {
 
 type ReuseCandidate = { at: Int, route: List<{ at: Int, arm: Int }>, made: Allocation }
 
-type BackwardState = { rev: List<Inst>, live: Live, next: Int, takers: List<ReuseCandidate> }
+type BackwardState = {
+  rev: List<Inst>,
+  live: Live,
+  next: Int,
+  reuse_candidates: List<ReuseCandidate>,
+}
 
 type Plan = {
   incs: List<Inst>,
@@ -82,15 +88,15 @@ type Plan = {
 type Operand = { arg: Arg, takes: Bool }
 
 pub fn insert_reference_counts(given: Fn) -> Fn = {
-  let f = insert_takes(built_in_place({ ..given, body: unread_packs_dropped(given.body) }));
+  let f = take_fields(built_in_place({ ..given, body: drop_unread_conversions(given.body) }));
   let facts = facts_of(f);
   let top = {
     looped: None,
     miss: Map::new(),
     landing: Map::new(),
     known: Map::new(),
-    restart: handed_of(f.convention),
-    enters: f.members.map(|m: Member| handed_of(m.convention)),
+    restart: param_ownerships(f.convention),
+    enters: f.members.map(|m: Member| param_ownerships(m.convention)),
     returned: f.convention.returned,
   };
   let counted = if f.members.len() == 0 {
@@ -106,7 +112,11 @@ pub fn insert_reference_counts(given: Fn) -> Fn = {
               facts,
               match member {
                 Some(m) ->
-                  { ..top, restart: handed_of(m.convention), returned: m.convention.returned },
+                  {
+                    ..top,
+                    restart: param_ownerships(m.convention),
+                    returned: m.convention.returned,
+                  },
                 None -> { ..top, restart: [] },
               },
               match member { Some(m) -> m.params, None -> [] },
@@ -152,7 +162,8 @@ fn renamed(i: Inst, renames: Map<Int, Var>) -> Inst =
       Let(l) -> Let({ ..l, value: value_renamed(l.value, arg, var) }),
       Do(d) -> Do({ ..d, value: value_renamed(d.value, arg, var) }),
       Assign(x) -> Assign({ ..x, arg: arg(x.arg) }),
-      Loop(l) -> Loop({ ..l, state: l.state.map(|c: Carried| { var: c.var, init: arg(c.init) }) }),
+      Loop(l) ->
+        Loop({ ..l, state: l.state.map(|c: LoopVariable| { var: c.var, init: arg(c.init) }) }),
       Next(args) -> Next(args.map(arg)),
       Done(a) -> Done(arg(a)),
       Return(a) -> Return(arg(a)),
@@ -179,8 +190,8 @@ fn value_renamed(v: Rvalue, arg: (Arg) -> Arg, var: (Var) -> Var) -> Rvalue =
     Op(o) -> Op({ ..o, args: o.args.map(arg) }),
     IfUnique(x) -> IfUnique(var(x)),
     WalkLoop(w) -> WalkLoop({ ..w, of: var(w.of) }),
-    Unspecialised(ops) ->
-      Unspecialised(ops.map(|o: { arg: Arg, takes: Bool }| { ..o, arg: arg(o.arg) })),
+    OperandsOnly(ops) ->
+      OperandsOnly(ops.map(|o: { arg: Arg, takes: Bool }| { ..o, arg: arg(o.arg) })),
     _ -> v,
   }
 
@@ -192,7 +203,7 @@ fn counted_block(
   across: Live,
   next: Int,
 ) -> { block: Block, next: Int } = {
-  let back = walked_back(facts, top, b, across, next);
+  let back = walk_backward(facts, top, b, across, next);
   let held = params.fold(across, |m: Live, p: Var|
     resolved(facts, p).fold(m, |n: Live, w: Var|
       if owns(facts, w) { n.insert(w.id, w) } else { n }));
@@ -201,7 +212,7 @@ fn counted_block(
       Some(ws) -> acc.push(Destructure({ of: p, words: ws })),
       None -> acc,
     });
-  let e = entered(facts, top, back, held);
+  let e = release_unused(facts, top, back, held);
   { block: opens.concat(e.block), next: e.next }
 }
 
@@ -249,7 +260,7 @@ fn uses_in(b: Block, m: Map<Int, Int>) -> Map<Int, Int> = {
       Jump(e) -> named(acc, e.args),
       Handle(h) -> uses_in(h.body, named(acc, h.args)),
       CleanupScope(Some(xs)) -> named(acc, xs.map(|x: Unwinding| x.arg)),
-      Fail(x) -> named(acc, x.letting.map(|u: Unwinding| u.arg)),
+      Fail(x) -> named(acc, x.resource.map(|u: Unwinding| u.arg)),
       _ -> acc,
     })
 }
@@ -286,7 +297,7 @@ fn built_into(b: Block, uses: Map<Int, Int>) -> Block = {
             _ -> { ..s, out: s.out.push(i) },
           },
           Update(u) -> {
-            let folded = updates_folded(s, u.of, u.sets);
+            let folded = merge_nested_updates(s, u.of, u.sets);
             let made = Let({ ..l, value: Update({ of: u.of, sets: folded.sets }) });
             let base = match s.spots.get(u.of.id) { Some(q) -> Some(q), None -> None };
             {
@@ -308,7 +319,7 @@ fn built_into(b: Block, uses: Map<Int, Int>) -> Block = {
           },
           Allocate(m) -> match m.made {
             RecordAllocation(shape) -> {
-              let spliced = spliced_in(shape, m.args, 0, s.pending);
+              let spliced = splice_pending(shape, m.args, 0, s.pending);
               let made = Let({
                 ..l,
                 value: Allocate({ ..m, made: RecordAllocation(spliced.shape), args: spliced.args }),
@@ -332,7 +343,7 @@ fn built_into(b: Block, uses: Map<Int, Int>) -> Block = {
   walked.out.filter(|i: Inst| match i { Let(l) -> !walked.gone.contains(l.var.id), _ -> true })
 }
 
-fn updates_folded(
+fn merge_nested_updates(
   s: BuildState,
   of: Var,
   sets: List<FieldWrite>,
@@ -357,7 +368,7 @@ fn updates_folded(
   )
 }
 
-fn spliced_in(
+fn splice_pending(
   shape: List<FieldInitializer>,
   args: List<Arg>,
   at: Int,
@@ -417,7 +428,7 @@ fn nested_built(i: Inst, uses: Map<Int, Int>) -> Inst =
     _ -> i,
   }
 
-fn insert_takes(f: Fn) -> Fn = {
+fn take_fields(f: Fn) -> Fn = {
   let start = f.members.fold(
     given_bound(f.params, f.convention, Map::new()),
     |m: Map<Int, Int>, x: Member| given_bound(x.params, x.convention, m),
@@ -435,10 +446,10 @@ fn insert_takes(f: Fn) -> Fn = {
     f.body,
     0 - 1,
   );
-  let taking = s.gets.fold(
+  let with_reuse_candidate = s.gets.fold(
     Map::new(),
     |m: Map<Int, Var>, g: { var: Var, of: Var, path: Path, pass: Int }|
-      if s.bound.get(g.of.id) == Some(g.pass) && takeable(g.of.representation, g.path)
+      if s.bound.get(g.of.id) == Some(g.pass) && can_take(g.of.representation, g.path)
           && payload_of(Get({ of: g.of, path: g.path }), g.var) == None
           && is_counted_word(g.var.representation)
           && !is_inline_record(g.of, g.path, g.var)
@@ -449,9 +460,9 @@ fn insert_takes(f: Fn) -> Fn = {
         m.insert(g.var.id, g.of)
       } else { m },
   );
-  if taking.len() == 0 { f } else {
+  if with_reuse_candidate.len() == 0 { f } else {
     let facts = facts_of(f);
-    let held = taking.fold(Map::new(), |m: Map<Int, Bool>, id: Int, of: Var|
+    let held = with_reuse_candidate.fold(Map::new(), |m: Map<Int, Bool>, id: Int, of: Var|
       if owns(facts, of) { m.insert(id, true) } else { m });
     if held.len() == 0 { f } else { { ..f, body: with_takes(f.body, held) } }
   }
@@ -497,7 +508,7 @@ fn given_bound(params: List<Var>, conv: Convention, m: Map<Int, Int>) -> Map<Int
       None -> acc,
     })
 
-fn read_once_more(r: Map<Int, Map<Path, Int>>, of: Int, path: Path) -> Map<Int, Map<Path, Int>> = {
+fn count_read(r: Map<Int, Map<Path, Int>>, of: Int, path: Path) -> Map<Int, Map<Path, Int>> = {
   let ps = match r.get(of) { Some(x) -> x, None -> Map::new() };
   r.insert(of, ps.insert(path, match ps.get(path) { Some(n) -> n + 1, None -> 1 }))
 }
@@ -534,7 +545,7 @@ fn scan_field_reads(s: FieldReadScan, b: Block, pass: Int) -> FieldReadScan =
             {
               ..acc,
               gets: acc.gets.push({ var: l.var, of: g.of, path: g.path, pass: pass }),
-              reads: read_once_more(acc.reads, g.of.id, g.path),
+              reads: count_read(acc.reads, g.of.id, g.path),
               passed: acc.passed.insert(
                 g.of.id,
                 (match acc.passed.get(g.of.id) { Some(rs) -> rs, None -> [] }).push({
@@ -544,7 +555,7 @@ fn scan_field_reads(s: FieldReadScan, b: Block, pass: Int) -> FieldReadScan =
               ),
             },
           Update(u) -> {
-            let sets = used_in(acc, read_records(u.sets.map(|x: FieldWrite| x.arg)));
+            let sets = used_in(acc, takes_except_records(u.sets.map(|x: FieldWrite| x.arg)));
             updated_past({ ..sets, handed: sets.handed.insert(u.of.id, true) }, u)
           },
           _ -> used_in(acc, operands(l.value)),
@@ -586,7 +597,7 @@ fn scan_field_reads(s: FieldReadScan, b: Block, pass: Int) -> FieldReadScan =
         ),
       Loop(l) -> {
         let looped = carried_variables(l.state).fold(
-          handed_in(acc, l.state.map(|c: Carried| c.init)),
+          handed_in(acc, l.state.map(|c: LoopVariable| c.init)),
           |a: FieldReadScan, v: Var| { ..a, bound: a.bound.insert(v.id, l.result.id) },
         );
         let after = scan_field_reads(looped, l.body, l.result.id);
@@ -600,7 +611,7 @@ fn scan_field_reads(s: FieldReadScan, b: Block, pass: Int) -> FieldReadScan =
       Handle(h) ->
         scan_field_reads(used_in(acc, by_signature(h.args, h.uses)), h.body, h.result.id),
       CleanupScope(Some(xs)) -> used_in(acc, xs.map(|u: Unwinding| { arg: u.arg, takes: false })),
-      Fail(x) -> used_in(acc, x.letting.map(|u: Unwinding| { arg: u.arg, takes: false })),
+      Fail(x) -> used_in(acc, x.resource.map(|u: Unwinding| { arg: u.arg, takes: false })),
       _ -> acc,
     })
 
@@ -619,31 +630,35 @@ fn used_in(s: FieldReadScan, ops: List<Operand>) -> FieldReadScan =
 fn handed_in(s: FieldReadScan, args: List<Arg>) -> FieldReadScan =
   used_in(s, args.map(|a: Arg| { arg: a, takes: true }))
 
-fn with_takes(b: Block, taking: Map<Int, Bool>) -> Block =
+fn with_takes(b: Block, with_reuse_candidate: Map<Int, Bool>) -> Block =
   b.map(|i: Inst|
     match i {
       Let(l) -> match l.value {
-        Get(g) -> if taking.contains(l.var.id) {
+        Get(g) -> if with_reuse_candidate.contains(l.var.id) {
           Let({ ..l, value: Take({ of: g.of, path: g.path }) })
         } else { i },
         _ -> i,
       },
       If(x) ->
-        If({ ..x, then: with_takes(x.then, taking), otherwise: with_takes(x.otherwise, taking) }),
+        If({
+          ..x,
+          then: with_takes(x.then, with_reuse_candidate),
+          otherwise: with_takes(x.otherwise, with_reuse_candidate),
+        }),
       Case(c) ->
         Case({
           ..c,
           arms: c.arms.map(|a: { when: Int, body: Block }|
-            { when: a.when, body: with_takes(a.body, taking) }),
-          rest: with_takes(c.rest, taking),
+            { when: a.when, body: with_takes(a.body, with_reuse_candidate) }),
+          rest: with_takes(c.rest, with_reuse_candidate),
         }),
       Match(m) ->
         Match({
-          arms: m.arms.map(|a: Block| with_takes(a, taking)),
-          rest: with_takes(m.rest, taking),
+          arms: m.arms.map(|a: Block| with_takes(a, with_reuse_candidate)),
+          rest: with_takes(m.rest, with_reuse_candidate),
         }),
-      Loop(l) -> Loop({ ..l, body: with_takes(l.body, taking) }),
-      Handle(h) -> Handle({ ..h, body: with_takes(h.body, taking) }),
+      Loop(l) -> Loop({ ..l, body: with_takes(l.body, with_reuse_candidate) }),
+      Handle(h) -> Handle({ ..h, body: with_takes(h.body, with_reuse_candidate) }),
       _ -> i,
     })
 
@@ -659,7 +674,7 @@ fn facts_of(f: Fn) -> Facts = {
     alias: Map::new(),
     stacks: Map::new(),
     promoted: Map::new(),
-    immortal: immortals(f),
+    immortal: uncounted_variables(f),
   };
   let first = collect_definitions(params_defined(f, empty), f.body);
   let got = first.gets.fold(
@@ -727,8 +742,8 @@ fn facts_of(f: Fn) -> Facts = {
     );
     { ..collect_definitions(start, f.body), next: words.next }
   };
-  let joined = joins_held(read, f.body);
-  let scan_promotions = promoted(joined, f.body);
+  let joined = join_assigned_ownership(read, f.body);
+  let scan_promotions = find_made_owned(joined, f.body);
   {
     ..joined,
     held: scan_promotions.fold(joined.held, |h: Map<Int, Ownership>, id: Int, _: Bool|
@@ -737,11 +752,11 @@ fn facts_of(f: Fn) -> Facts = {
   }
 }
 
-fn joins_held(facts: Facts, b: Block) -> Facts = {
+fn join_assigned_ownership(facts: Facts, b: Block) -> Facts = {
   let sets = assigned(Map::new(), b);
   let bound = opened_levels(facts, levels(Map::new(), b, 0));
   sets.fold({ fx: facts, done: Map::new() }, |s: JoinState, j: Int, _: List<Arg>|
-    join_held(s, sets, bound, j, sets.len())).fx
+    join_ownership(s, sets, bound, j, sets.len())).fx
 }
 
 type JoinState = { fx: Facts, done: Map<Int, Bool> }
@@ -781,7 +796,7 @@ fn opened_levels(facts: Facts, bound: Map<Int, Int>) -> Map<Int, Int> =
     ws.fold(m, |n: Map<Int, Int>, w: Var| n.insert(w.id, level))
   })
 
-fn join_held(
+fn join_ownership(
   s: JoinState,
   sets: Map<Int, List<Arg>>,
   bound: Map<Int, Int>,
@@ -794,7 +809,7 @@ fn join_held(
       Some(args) -> {
         let first = args.fold(s, |acc: JoinState, a: Arg|
           match operand_var(a) {
-            Some(v) -> if sets.contains(v.id) { join_held(acc, sets, bound, v.id, depth - 1) }
+            Some(v) -> if sets.contains(v.id) { join_ownership(acc, sets, bound, v.id, depth - 1) }
             else { acc },
             None -> acc,
           });
@@ -806,7 +821,7 @@ fn join_held(
               Some(v) -> if !is_refcounted(v.representation) || first.fx.immortal.contains(v.id) {
                 bs
               } else {
-                match held_through(first.fx, v) {
+                match ownership_through_alias(first.fx, v) {
                   Some(BorrowsFrom(ys)) -> {
                     let from = flattened(first.fx, ys);
                     if from.any(|x: Int| level(x) > level(j)) { None }
@@ -852,11 +867,11 @@ fn assigned(m: Map<Int, List<Arg>>, b: Block) -> Map<Int, List<Arg>> =
       _ -> acc,
     })
 
-fn promoted(facts: Facts, b: Block) -> Map<Int, Bool> =
+fn find_made_owned(facts: Facts, b: Block) -> Map<Int, Bool> =
   scan_promotions(
     facts,
     scan_last_uses(facts, { at: 0, last: Map::new(), taken: Map::new() }, b),
-    { at: 0, gone: Map::new(), dying: Map::new(), up: Map::new() },
+    { at: 0, gone: Map::new(), last_used: Map::new(), up: Map::new() },
     b,
   ).up
 
@@ -916,20 +931,25 @@ fn used_at(facts: Facts, s: LastUses, k: Int, ops: List<Operand>) -> LastUses =
       None -> acc,
     })
 
-type PromotionScan = { at: Int, gone: Map<Int, Bool>, dying: Map<Int, Bool>, up: Map<Int, Bool> }
+type MadeOwnedScan = {
+  at: Int,
+  gone: Map<Int, Bool>,
+  last_used: Map<Int, Bool>,
+  up: Map<Int, Bool>,
+}
 
-fn scan_promotions(facts: Facts, s: LastUses, r: PromotionScan, b: Block) -> PromotionScan =
-  b.fold(r, |acc: PromotionScan, i: Inst| {
+fn scan_promotions(facts: Facts, s: LastUses, r: MadeOwnedScan, b: Block) -> MadeOwnedScan =
+  b.fold(r, |acc: MadeOwnedScan, i: Inst| {
     let k = acc.at;
     let here = { ..acc, at: k + 1 };
     match i {
       Let(l) -> {
         let past = passed_at(facts, s, here, k, uses_of(facts, l.value));
         match l.value {
-          Allocate(m) -> if takes_cells(l.var, m.made, m.reuse) {
+          Allocate(m) -> if is_reuse_candidate(l.var, m.made, m.reuse) {
             {
               ..past,
-              gone: past.dying.fold(past.gone, |g: Map<Int, Bool>, id: Int, _: Bool|
+              gone: past.last_used.fold(past.gone, |g: Map<Int, Bool>, id: Int, _: Bool|
                 match facts.vars.get(id) {
                   Some(v) -> if v.ty == l.var.ty && owns(facts, v) { g.insert(id, true) }
                   else { g },
@@ -970,19 +990,19 @@ fn scan_promotions(facts: Facts, s: LastUses, r: PromotionScan, b: Block) -> Pro
     }
   })
 
-fn branches(facts: Facts, s: LastUses, r: PromotionScan, blocks: List<Block>) -> PromotionScan =
-  blocks.fold(r, |acc: PromotionScan, b: Block| {
-    let w = scan_promotions(facts, s, { ..acc, gone: r.gone, dying: r.dying }, b);
-    { ..w, gone: Map::merge(acc.gone, w.gone), dying: Map::merge(acc.dying, w.dying) }
+fn branches(facts: Facts, s: LastUses, r: MadeOwnedScan, blocks: List<Block>) -> MadeOwnedScan =
+  blocks.fold(r, |acc: MadeOwnedScan, b: Block| {
+    let w = scan_promotions(facts, s, { ..acc, gone: r.gone, last_used: r.last_used }, b);
+    { ..w, gone: Map::merge(acc.gone, w.gone), last_used: Map::merge(acc.last_used, w.last_used) }
   })
 
 fn passed_at(
   facts: Facts,
   s: LastUses,
-  r: PromotionScan,
+  r: MadeOwnedScan,
   k: Int,
   ops: List<Operand>,
-) -> PromotionScan = {
+) -> MadeOwnedScan = {
   let used = expanded(facts, ops);
   {
     ..r,
@@ -1005,7 +1025,7 @@ fn passed_at(
         } else { g },
         None -> g,
       }),
-    dying: used.fold(r.dying, |d: Map<Int, Bool>, o: Operand|
+    last_used: used.fold(r.last_used, |d: Map<Int, Bool>, o: Operand|
       match operand_var(o.arg) {
         Some(v) -> if s.last.get(v.id) == Some(k) { d.insert(v.id, true) } else { d },
         None -> d,
@@ -1091,7 +1111,7 @@ fn defined(facts: Facts, v: Var, h: Ownership) -> Facts =
     next: if v.id >= facts.next { v.id + 1 } else { facts.next },
   }
 
-fn holding_none(facts: Facts, v: Var) -> Facts =
+fn define_unowned(facts: Facts, v: Var) -> Facts =
   { ..defined(facts, v, OwnsCount), held: facts.held }
 
 fn collect_definitions(facts: Facts, b: Block) -> Facts =
@@ -1110,9 +1130,9 @@ fn collect_definitions(facts: Facts, b: Block) -> Facts =
                 }),
             ),
           },
-        None -> if acc.immortal.contains(l.var.id) { holding_none(acc, l.var) } else {
+        None -> if acc.immortal.contains(l.var.id) { define_unowned(acc, l.var) } else {
           let a = match count_shared_with(l.var, l.value) {
-            Some(x) -> match held_through(acc, x) {
+            Some(x) -> match ownership_through_alias(acc, x) {
               Some(BorrowsFrom(_)) -> BorrowSources([x]),
               _ -> result_ownership(l.value),
             },
@@ -1141,7 +1161,7 @@ fn collect_definitions(facts: Facts, b: Block) -> Facts =
           }
         },
       },
-      Declaration(v) -> if acc.immortal.contains(v.id) { holding_none(acc, v) }
+      Declaration(v) -> if acc.immortal.contains(v.id) { define_unowned(acc, v) }
       else { defined(acc, v, OwnsCount) },
       If(x) -> collect_definitions(collect_definitions(acc, x.then), x.otherwise),
       Case(c) ->
@@ -1177,7 +1197,7 @@ fn base_of(facts: Facts, v: Var) -> List<Int> = {
   }
 }
 
-fn held_through(facts: Facts, v: Var) -> Option<Ownership> =
+fn ownership_through_alias(facts: Facts, v: Var) -> Option<Ownership> =
   match facts.alias.get(v.id) { Some(t) -> facts.held.get(t.id), None -> facts.held.get(v.id) }
 
 fn aliased(direct: Map<Int, Var>, v: Var, depth: Int) -> Var =
@@ -1250,218 +1270,241 @@ fn alive(facts: Facts, live: Live, v: Var) -> Live =
 fn arg_live(facts: Facts, live: Live, a: Arg) -> Live =
   match operand_var(a) { Some(v) -> alive(facts, live, v), None -> live }
 
-fn walked_back(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> BackwardState =
-  b.fold_right({ rev: [], live: out, next: next, takers: [] }, |i: Inst, acc: BackwardState|
-    match i {
-      Let(l) -> {
-        let words = match facts.opened.get(l.var.id) { Some(ws) -> ws, None -> [] };
-        let after = words.fold(acc.live.remove(l.var.id), |m: Live, w: Var| m.remove(w.id));
-        let again = count_shared_with(l.var, l.value);
-        let held_again = again != None;
-        let p = planned(
-          facts,
-          match again {
-            Some(x) -> if owns(facts, l.var) { uses_of(facts, l.value) }
-            else { [{ arg: VarOperand(x), takes: false }] },
-            None -> uses_of(facts, l.value),
-          },
-          after,
-        );
-        let unwind = if may_leave(l.value) { unwind_of(facts, ex, after, p.after) } else { [] };
-        let made = Let({ ..l, unwind: unwind });
-        let promoting = facts.promoted.contains(l.var.id) && !held_again;
-        let keeping = promoting && is_record_word(l.var);
-        let read = { ..l.var, id: acc.next };
-        match facts.opened.get(l.var.id) {
-          Some(ws) ->
-            with_counts(
-              ex,
-              acc,
-              p,
-              made,
-              [Destructure({ of: l.var, words: ws })],
-              ws.filter(|w: Var| owns(facts, w) && !acc.live.contains(w.id)),
-            ),
-          None -> if keeping {
-            with_counts(
-              ex,
-              { ..acc, next: acc.next + 1 },
-              p,
-              Let({ ..l, var: read, unwind: unwind }),
-              [Let({ var: l.var, value: retain(read), at: l.at, unwind: [] })],
-              if !acc.live.contains(l.var.id) { [l.var] } else { [] },
-            )
-          } else {
-            with_counts(
-              ex,
-              acc,
-              p,
-              made,
-              if promoting { [Inc({ var: l.var, n: 1 })] } else { [] },
-              if owns(facts, l.var) && !acc.live.contains(l.var.id) { [l.var] } else { [] },
-            )
-          },
-        }
-      },
-      Do(d) -> {
-        let p = planned(facts, uses_of(facts, d.value), acc.live);
-        let unwind = if may_leave(d.value) { unwind_of(facts, ex, acc.live, p.after) } else { [] };
-        with_counts(ex, acc, p, Do({ ..d, unwind: unwind }), [], [])
-      },
-      Declaration(v) -> { ..acc, rev: acc.rev.push(i), live: acc.live.remove(v.id) },
-      Assign(s) -> {
-        let dead = if owns(facts, s.var) && !acc.live.contains(s.var.id) { [s.var] } else { [] };
-        with_counts(
-          ex,
-          acc,
-          planned(
+fn walk_backward(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> BackwardState =
+  b.fold_right(
+    { rev: [], live: out, next: next, reuse_candidates: [] },
+    |i: Inst, acc: BackwardState|
+      match i {
+        Let(l) -> {
+          let words = match facts.opened.get(l.var.id) { Some(ws) -> ws, None -> [] };
+          let after = words.fold(acc.live.remove(l.var.id), |m: Live, w: Var| m.remove(w.id));
+          let again = count_shared_with(l.var, l.value);
+          let held_again = again != None;
+          let p = planned(
             facts,
-            [{ arg: s.arg, takes: owns(facts, s.var) || !is_refcounted(s.var.representation) }],
-            acc.live.remove(s.var.id),
-          ),
-          i,
-          [],
-          dead,
-        )
-      },
-      If(x) -> {
-        let t = walked_back(facts, ex, x.then, acc.live, acc.next);
-        let e = walked_back(facts, ex, x.otherwise, acc.live, t.next);
-        let live = arg_live(facts, Map::merge(t.live, e.live), x.cond);
-        let tb = entered(facts, ex, { ..t, next: e.next }, live);
-        let eb = entered(facts, ex, { ..e, next: tb.next }, live);
-        let at = acc.rev.len();
-        branched(
-          acc,
-          If({ cond: x.cond, then: tb.block, otherwise: eb.block }),
-          live,
-          eb.next,
-          stepped(tb.takers, at, 0).concat(stepped(eb.takers, at, 1)),
-        )
-      },
-      Case(c) -> {
-        let rest = walked_back(facts, ex, c.rest, acc.live, acc.next);
-        let arms = c.arms.fold(
-          { walks: [], next: rest.next },
-          |s: Arms, a: { when: Int, body: Block }| {
-            let k = { ..ex, known: known_at(ex.known, c.on, c.test, a.when) };
-            let w = walked_back(facts, k, a.body, acc.live, s.next);
-            { walks: s.walks.push({ when: a.when, back: w, exits: k }), next: w.next }
-          },
-        );
-        let live = arms.walks.fold(alive(facts, rest.live, c.on), |l: Live, w: ArmWalk|
-          Map::merge(l, w.back.live));
-        let r = entered(facts, ex, { ..rest, next: arms.next }, live);
-        let at = acc.rev.len();
-        let opened = arms.walks.fold(
-          { arms: [], next: r.next, takers: stepped(r.takers, at, c.arms.len()) },
-          |s: { arms: List<{ when: Int, body: Block }>, next: Int, takers: List<ReuseCandidate> }, w: ArmWalk| {
-            let e = entered(facts, w.exits, { ..w.back, next: s.next }, live);
+            match again {
+              Some(x) -> if owns(facts, l.var) { uses_of(facts, l.value) }
+              else { [{ arg: VarOperand(x), takes: false }] },
+              None -> uses_of(facts, l.value),
+            },
+            after,
+          );
+          let unwind = if may_leave(l.value) { variables_to_unwind(facts, ex, after, p.after) }
+          else { [] };
+          let made = Let({ ..l, unwind: unwind });
+          let promoting = facts.promoted.contains(l.var.id) && !held_again;
+          let keeping = promoting && is_record_word(l.var);
+          let read = { ..l.var, id: acc.next };
+          match facts.opened.get(l.var.id) {
+            Some(ws) ->
+              with_counts(
+                ex,
+                acc,
+                p,
+                made,
+                [Destructure({ of: l.var, words: ws })],
+                ws.filter(|w: Var| owns(facts, w) && !acc.live.contains(w.id)),
+              ),
+            None -> if keeping {
+              with_counts(
+                ex,
+                { ..acc, next: acc.next + 1 },
+                p,
+                Let({ ..l, var: read, unwind: unwind }),
+                [Let({ var: l.var, value: retain(read), at: l.at, unwind: [] })],
+                if !acc.live.contains(l.var.id) { [l.var] } else { [] },
+              )
+            } else {
+              with_counts(
+                ex,
+                acc,
+                p,
+                made,
+                if promoting { [Inc({ var: l.var, n: 1 })] } else { [] },
+                if owns(facts, l.var) && !acc.live.contains(l.var.id) { [l.var] } else { [] },
+              )
+            },
+          }
+        },
+        Do(d) -> {
+          let p = planned(facts, uses_of(facts, d.value), acc.live);
+          let unwind = if may_leave(d.value) { variables_to_unwind(facts, ex, acc.live, p.after) }
+          else { [] };
+          with_counts(ex, acc, p, Do({ ..d, unwind: unwind }), [], [])
+        },
+        Declaration(v) -> { ..acc, rev: acc.rev.push(i), live: acc.live.remove(v.id) },
+        Assign(s) -> {
+          let dead = if owns(facts, s.var) && !acc.live.contains(s.var.id) { [s.var] } else { [] };
+          with_counts(
+            ex,
+            acc,
+            planned(
+              facts,
+              [{ arg: s.arg, takes: owns(facts, s.var) || !is_refcounted(s.var.representation) }],
+              acc.live.remove(s.var.id),
+            ),
+            i,
+            [],
+            dead,
+          )
+        },
+        If(x) -> {
+          let t = walk_backward(facts, ex, x.then, acc.live, acc.next);
+          let e = walk_backward(facts, ex, x.otherwise, acc.live, t.next);
+          let live = arg_live(facts, Map::merge(t.live, e.live), x.cond);
+          let tb = release_unused(facts, ex, { ..t, next: e.next }, live);
+          let eb = release_unused(facts, ex, { ..e, next: tb.next }, live);
+          let at = acc.rev.len();
+          push_branch(
+            acc,
+            If({ cond: x.cond, then: tb.block, otherwise: eb.block }),
+            live,
+            eb.next,
+            stepped(tb.reuse_candidates, at, 0).concat(stepped(eb.reuse_candidates, at, 1)),
+          )
+        },
+        Case(c) -> {
+          let rest = walk_backward(facts, ex, c.rest, acc.live, acc.next);
+          let arms = c.arms.fold(
+            { walks: [], next: rest.next },
+            |s: Arms, a: { when: Int, body: Block }| {
+              let k = { ..ex, known: known_at(ex.known, c.on, c.test, a.when) };
+              let w = walk_backward(facts, k, a.body, acc.live, s.next);
+              { walks: s.walks.push({ when: a.when, back: w, exits: k }), next: w.next }
+            },
+          );
+          let live = arms.walks.fold(alive(facts, rest.live, c.on), |l: Live, w: ArmWalk|
+            Map::merge(l, w.back.live));
+          let r = release_unused(facts, ex, { ..rest, next: arms.next }, live);
+          let at = acc.rev.len();
+          let opened = arms.walks.fold(
             {
-              arms: s.arms.push({ when: w.when, body: e.block }),
-              next: e.next,
-              takers: s.takers.concat(stepped(e.takers, at, s.arms.len())),
-            }
-          },
-        );
-        branched(
-          acc,
-          Case({ ..c, arms: opened.arms, rest: r.block }),
-          live,
-          opened.next,
-          opened.takers,
-        )
+              arms: [],
+              next: r.next,
+              reuse_candidates: stepped(r.reuse_candidates, at, c.arms.len()),
+            },
+            |s: { arms: List<{ when: Int, body: Block }>, next: Int, reuse_candidates: List<ReuseCandidate> }, w: ArmWalk| {
+              let e = release_unused(facts, w.exits, { ..w.back, next: s.next }, live);
+              {
+                arms: s.arms.push({ when: w.when, body: e.block }),
+                next: e.next,
+                reuse_candidates: s.reuse_candidates.concat(
+                  stepped(e.reuse_candidates, at, s.arms.len()),
+                ),
+              }
+            },
+          );
+          push_branch(
+            acc,
+            Case({ ..c, arms: opened.arms, rest: r.block }),
+            live,
+            opened.next,
+            opened.reuse_candidates,
+          )
+        },
+        Match(m) -> {
+          let rest = walk_backward(facts, ex, m.rest, acc.live, acc.next);
+          let arms = m.arms.fold_right(
+            { blocks: [], entry: rest.live, next: rest.next },
+            |a: Block, s: { blocks: List<Block>, entry: Live, next: Int }| {
+              let w = walk_backward(facts, { ..ex, miss: s.entry }, a, acc.live, s.next);
+              { blocks: s.blocks.push(w.rev.reverse()), entry: w.live, next: w.next }
+            },
+          );
+          push_branch(
+            acc,
+            Match({ arms: arms.blocks.reverse(), rest: rest.rev.reverse() }),
+            arms.entry,
+            arms.next,
+            [],
+          )
+        },
+        Loop(l) -> {
+          let vars = carried_variables(l.state);
+          let words = vars.fold([], |ws: List<Var>, s: Var|
+            match facts.opened.get(s.id) { Some(x) -> ws.concat(x), None -> ws });
+          let inner = outer_reads(facts, l.body, vars.concat(words));
+          let carry_token = Map::merge(acc.live.remove(l.result.id), inner);
+          let k = { ..ex, looped: Some(carry_token), miss: Map::new() };
+          let e = counted_block(facts, k, vars, l.body, carry_token, acc.next);
+          let p = planned(facts, all_taken(carried_inits(l.state)), carry_token);
+          let gone = inner.values().filter(|v: Var| owns(facts, v) && !acc.live.contains(v.id));
+          with_counts(
+            ex,
+            { ..acc, next: e.next },
+            { ..p, after: p.after.concat(gone) },
+            Loop({ ..l, body: e.block }),
+            [],
+            dead_result(facts, acc.live, l.result),
+          )
+        },
+        Handle(h) -> {
+          let ops = by_signature(h.args, h.uses);
+          let borrowed = ops.filter(|o: Operand| !o.takes).fold(
+            Map::new(),
+            |l: Live, o: Operand| arg_live(facts, l, o.arg),
+          );
+          let inner = Map::merge(outer_reads(facts, h.body, [h.result]), borrowed);
+          let across = Map::merge(acc.live.remove(h.result.id), inner);
+          let k = { ..ex, looped: None, miss: Map::new(), landing: across };
+          let ends = if h.site.ret == None { across.insert(h.result.id, h.result) } else { across };
+          let body = walk_backward(facts, k, h.body, ends, acc.next);
+          let e = release_unused(facts, k, body, across);
+          let p = planned(facts, ops, across);
+          let gone = inner.values().filter(|v: Var| owns(facts, v) && !acc.live.contains(v.id));
+          let unwind = across.values().filter(|v: Var|
+            owns(facts, v) && !ex.landing.contains(v.id));
+          with_counts(
+            ex,
+            { ..acc, next: e.next },
+            { ..p, after: p.after.concat(gone) },
+            Handle({ ..h, body: e.block, unwind: unwind }),
+            [],
+            dead_result(facts, acc.live, h.result),
+          )
+        },
+        Next(args) -> ended_back(facts, ex, acc, i, all_taken(args), looped_live(ex)),
+        Done(a) -> ended_back(facts, ex, acc, i, all_taken([a]), looped_live(ex)),
+        Return(a) ->
+          ended_back(
+            facts,
+            ex,
+            acc,
+            i,
+            match ex.returned {
+              OwnedResult -> all_taken([a]),
+              BorrowedResult(_) -> [{ arg: a, takes: false }],
+            },
+            Map::new(),
+          ),
+        Restart(args) ->
+          ended_back(facts, ex, acc, i, operands_by_ownership(args, ex.restart), Map::new()),
+        Jump(e) ->
+          ended_back(
+            facts,
+            ex,
+            acc,
+            i,
+            operands_by_ownership(e.args, match ex.enters.at(e.member) {
+              Some(h) -> h,
+              None -> [],
+            }),
+            Map::new(),
+          ),
+        Fail(x) -> {
+          let live = x.resource.fold(ex.landing, |l: Live, u: Unwinding| arg_live(facts, l, u.arg));
+          let unwind = live.values().filter(|v: Var| owns(facts, v) && !ex.landing.contains(v.id));
+          {
+            ..acc,
+            rev: acc.rev.push(Fail({ ..x, unwind: unwind })),
+            live: live,
+            reuse_candidates: [],
+          }
+        },
+        Miss -> { ..acc, rev: acc.rev.push(i), live: ex.miss, reuse_candidates: [] },
+        _ -> { ..acc, rev: acc.rev.push(i) },
       },
-      Match(m) -> {
-        let rest = walked_back(facts, ex, m.rest, acc.live, acc.next);
-        let arms = m.arms.fold_right(
-          { blocks: [], entry: rest.live, next: rest.next },
-          |a: Block, s: { blocks: List<Block>, entry: Live, next: Int }| {
-            let w = walked_back(facts, { ..ex, miss: s.entry }, a, acc.live, s.next);
-            { blocks: s.blocks.push(w.rev.reverse()), entry: w.live, next: w.next }
-          },
-        );
-        branched(
-          acc,
-          Match({ arms: arms.blocks.reverse(), rest: rest.rev.reverse() }),
-          arms.entry,
-          arms.next,
-          [],
-        )
-      },
-      Loop(l) -> {
-        let vars = carried_variables(l.state);
-        let words = vars.fold([], |ws: List<Var>, s: Var|
-          match facts.opened.get(s.id) { Some(x) -> ws.concat(x), None -> ws });
-        let inner = outer_reads(facts, l.body, vars.concat(words));
-        let carry_token = Map::merge(acc.live.remove(l.result.id), inner);
-        let k = { ..ex, looped: Some(carry_token), miss: Map::new() };
-        let e = counted_block(facts, k, vars, l.body, carry_token, acc.next);
-        let p = planned(facts, all_taken(carried_inits(l.state)), carry_token);
-        let gone = inner.values().filter(|v: Var| owns(facts, v) && !acc.live.contains(v.id));
-        with_counts(
-          ex,
-          { ..acc, next: e.next },
-          { ..p, after: p.after.concat(gone) },
-          Loop({ ..l, body: e.block }),
-          [],
-          dead_result(facts, acc.live, l.result),
-        )
-      },
-      Handle(h) -> {
-        let ops = by_signature(h.args, h.uses);
-        let borrowed = ops.filter(|o: Operand| !o.takes).fold(Map::new(), |l: Live, o: Operand|
-          arg_live(facts, l, o.arg));
-        let inner = Map::merge(outer_reads(facts, h.body, [h.result]), borrowed);
-        let across = Map::merge(acc.live.remove(h.result.id), inner);
-        let k = { ..ex, looped: None, miss: Map::new(), landing: across };
-        let ends = if h.site.ret == None { across.insert(h.result.id, h.result) } else { across };
-        let body = walked_back(facts, k, h.body, ends, acc.next);
-        let e = entered(facts, k, body, across);
-        let p = planned(facts, ops, across);
-        let gone = inner.values().filter(|v: Var| owns(facts, v) && !acc.live.contains(v.id));
-        let unwind = across.values().filter(|v: Var| owns(facts, v) && !ex.landing.contains(v.id));
-        with_counts(
-          ex,
-          { ..acc, next: e.next },
-          { ..p, after: p.after.concat(gone) },
-          Handle({ ..h, body: e.block, unwind: unwind }),
-          [],
-          dead_result(facts, acc.live, h.result),
-        )
-      },
-      Next(args) -> ended_back(facts, ex, acc, i, all_taken(args), looped_live(ex)),
-      Done(a) -> ended_back(facts, ex, acc, i, all_taken([a]), looped_live(ex)),
-      Return(a) ->
-        ended_back(
-          facts,
-          ex,
-          acc,
-          i,
-          match ex.returned {
-            OwnedResult -> all_taken([a]),
-            BorrowedResult(_) -> [{ arg: a, takes: false }],
-          },
-          Map::new(),
-        ),
-      Restart(args) -> ended_back(facts, ex, acc, i, handed_as(args, ex.restart), Map::new()),
-      Jump(e) ->
-        ended_back(
-          facts,
-          ex,
-          acc,
-          i,
-          handed_as(e.args, match ex.enters.at(e.member) { Some(h) -> h, None -> [] }),
-          Map::new(),
-        ),
-      Fail(x) -> {
-        let live = x.letting.fold(ex.landing, |l: Live, u: Unwinding| arg_live(facts, l, u.arg));
-        let unwind = live.values().filter(|v: Var| owns(facts, v) && !ex.landing.contains(v.id));
-        { ..acc, rev: acc.rev.push(Fail({ ..x, unwind: unwind })), live: live, takers: [] }
-      },
-      Miss -> { ..acc, rev: acc.rev.push(i), live: ex.miss, takers: [] },
-      _ -> { ..acc, rev: acc.rev.push(i) },
-    })
+  )
 
 type ArmWalk = { when: Int, back: BackwardState, exits: Exits }
 
@@ -1507,7 +1550,7 @@ fn mentioned(facts: Facts, m: Mentions, b: Block) -> Mentions =
           mentioned(facts, a, arm)),
       Loop(l) -> {
         let state = carried_variables(l.state).fold(
-          args_in(acc, l.state.map(|c: Carried| c.init)),
+          args_in(acc, l.state.map(|c: LoopVariable| c.init)),
           |a: Mentions, s: Var|
             match facts.opened.get(s.id) {
               Some(ws) -> ws.fold(bound_in(a, s), bound_in),
@@ -1527,7 +1570,7 @@ fn mentioned(facts: Facts, m: Mentions, b: Block) -> Mentions =
       Reset(r) -> bound_in(args_in(acc, [VarOperand(r.of)]), r.token),
       Free(r) -> args_in(acc, [VarOperand(r.of)]),
       Destructure(o) -> o.words.fold(args_in(acc, [VarOperand(o.of)]), bound_in),
-      Fail(x) -> args_in(acc, x.letting.map(|u: Unwinding| u.arg)),
+      Fail(x) -> args_in(acc, x.resource.map(|u: Unwinding| u.arg)),
       Miss -> acc,
       SiteScope(_) -> acc,
       CleanupScope(_) -> acc,
@@ -1573,10 +1616,14 @@ fn planned(facts: Facts, uses: List<Operand>, after: Live) -> Plan = {
     let held = { ..p, live: p.live.insert(x.id, x) };
     if !owns(facts, x) {
       if taken > 0 && is_record_word(x) { { ..held, keeps: held.keeps.push({ of: x, n: taken }) } }
-      else { counts_for(held, x, taken) }
+      else { with_increment(held, x, taken) }
     } else if live || t.read.contains(x.id) {
-      counts_for({ ..held, after: if live { held.after } else { held.after.push(x) } }, x, taken)
-    } else if taken > 0 { counts_for(held, x, taken - 1) }
+      with_increment(
+        { ..held, after: if live { held.after } else { held.after.push(x) } },
+        x,
+        taken,
+      )
+    } else if taken > 0 { with_increment(held, x, taken - 1) }
     else { { ..held, before: held.before.push(x) } }
   })
 }
@@ -1594,10 +1641,10 @@ fn listed(t: OperandUses, v: Var) -> OperandUses =
   if t.listed.contains(v.id) { t }
   else { { ..t, order: t.order.push(v), listed: t.listed.insert(v.id, true) } }
 
-fn counts_for(p: Plan, v: Var, n: Int) -> Plan =
+fn with_increment(p: Plan, v: Var, n: Int) -> Plan =
   if n > 0 { { ..p, incs: p.incs.push(Inc({ var: v, n: n })) } } else { p }
 
-fn unwind_of(facts: Facts, ex: Exits, after: Live, dying: List<Var>) -> List<Var> =
+fn variables_to_unwind(facts: Facts, ex: Exits, after: Live, dying: List<Var>) -> List<Var> =
   after.values().concat(dying).filter(|v: Var| owns(facts, v) && !ex.landing.contains(v.id))
 
 fn with_counts(
@@ -1631,7 +1678,8 @@ fn with_counts(
   let put = {
     ..tail,
     rev: followed.push(inst),
-    takers: if nests(inst) { [] } else { taking(tail.takers, inst, followed.len()) },
+    reuse_candidates: if has_nested_block(inst) { [] }
+    else { with_reuse_candidate(tail.reuse_candidates, inst, followed.len()) },
   };
   let freed = p.before.reverse().fold(put, |b: BackwardState, v: Var| release_var(ex, b, v));
   {
@@ -1641,7 +1689,7 @@ fn with_counts(
   }
 }
 
-fn nests(i: Inst) -> Bool =
+fn has_nested_block(i: Inst) -> Bool =
   match i {
     If(_) -> true,
     Case(_) -> true,
@@ -1659,18 +1707,18 @@ fn ended_back(
   ops: List<Operand>,
   after: Live,
 ) -> BackwardState =
-  with_counts(ex, { ..acc, takers: [] }, planned(facts, ops, after), inst, [], [])
+  with_counts(ex, { ..acc, reuse_candidates: [] }, planned(facts, ops, after), inst, [], [])
 
 fn all_taken(args: List<Arg>) -> List<Operand> = args.map(|a: Arg| { arg: a, takes: true })
 
-fn handed_as(args: List<Arg>, handed: List<ParamOwnership>) -> List<Operand> =
+fn operands_by_ownership(args: List<Arg>, handed: List<ParamOwnership>) -> List<Operand> =
   range(0, args.len()).fold([], |acc: List<Operand>, i: Int|
     match args.at(i) {
       Some(a) -> acc.push({ arg: a, takes: handed.at(i) != Some(BorrowedParam) }),
       None -> acc,
     })
 
-fn branched(
+fn push_branch(
   acc: BackwardState,
   inst: Inst,
   live: Live,
@@ -1681,15 +1729,18 @@ fn branched(
     rev: acc.rev.push(inst),
     live: live,
     next: next,
-    takers: if carries([inst]) { takers.concat(acc.takers) } else { takers },
+    reuse_candidates: if is_straight_line([inst]) { takers.concat(acc.reuse_candidates) }
+    else { takers },
   }
 
-fn carries(b: Block) -> Bool =
+fn is_straight_line(b: Block) -> Bool =
   b.all(|i: Inst|
     match i {
-      If(x) -> carries(x.then) && carries(x.otherwise),
-      Case(c) -> carries(c.rest) && c.arms.all(|a: { when: Int, body: Block }| carries(a.body)),
-      Match(m) -> carries(m.rest) && m.arms.all(carries),
+      If(x) -> is_straight_line(x.then) && is_straight_line(x.otherwise),
+      Case(c) ->
+        is_straight_line(c.rest)
+          && c.arms.all(|a: { when: Int, body: Block }| is_straight_line(a.body)),
+      Match(m) -> is_straight_line(m.rest) && m.arms.all(is_straight_line),
       Loop(_) -> false,
       Handle(_) -> false,
       _ -> true,
@@ -1698,21 +1749,21 @@ fn carries(b: Block) -> Bool =
 fn stepped(takers: List<ReuseCandidate>, at: Int, arm: Int) -> List<ReuseCandidate> =
   takers.map(|t: ReuseCandidate| { ..t, route: [{ at: at, arm: arm }].concat(t.route) })
 
-fn entered(
+fn release_unused(
   facts: Facts,
   ex: Exits,
   w: BackwardState,
   held: Live,
-) -> { block: Block, next: Int, takers: List<ReuseCandidate> } = {
+) -> { block: Block, next: Int, reuse_candidates: List<ReuseCandidate> } = {
   let gone = held.values().filter(|v: Var| owns(facts, v) && !w.live.contains(v.id));
   let b = gone.reverse().fold(w, |acc: BackwardState, v: Var| release_var(ex, acc, v));
-  { block: b.rev.reverse(), next: b.next, takers: b.takers }
+  { block: b.rev.reverse(), next: b.next, reuse_candidates: b.reuse_candidates }
 }
 
-fn taking(takers: List<ReuseCandidate>, inst: Inst, at: Int) -> List<ReuseCandidate> =
+fn with_reuse_candidate(takers: List<ReuseCandidate>, inst: Inst, at: Int) -> List<ReuseCandidate> =
   match inst {
     Let(l) -> match l.value {
-      Allocate(m) -> if takes_cells(l.var, m.made, m.reuse) {
+      Allocate(m) -> if is_reuse_candidate(l.var, m.made, m.reuse) {
         takers.push({ at: at, route: [], made: m.made })
       } else { takers },
       _ -> takers,
@@ -1720,7 +1771,7 @@ fn taking(takers: List<ReuseCandidate>, inst: Inst, at: Int) -> List<ReuseCandid
     _ -> takers,
   }
 
-fn takes_cells(v: Var, made: Allocation, reuse: Option<Var>) -> Bool =
+fn is_reuse_candidate(v: Var, made: Allocation, reuse: Option<Var>) -> Bool =
   reuse == None && v.representation == AsWord && reuses_cells(made) && allocation_words(made) > 0
 
 pub fn may_reuse(f: Fn) -> Bool = reuses_within(f.body)
@@ -1729,7 +1780,10 @@ fn reuses_within(b: Block) -> Bool =
   b.fold(false, |any: Bool, i: Inst|
     any
       || (match i {
-        Let(l) -> match l.value { Allocate(m) -> takes_cells(l.var, m.made, m.reuse), _ -> false },
+        Let(l) -> match l.value {
+          Allocate(m) -> is_reuse_candidate(l.var, m.made, m.reuse),
+          _ -> false,
+        },
         If(x) -> reuses_within(x.then) || reuses_within(x.otherwise),
         Case(c) ->
           c.arms.fold(reuses_within(c.rest), |a: Bool, arm: { when: Int, body: Block }|
@@ -1741,13 +1795,14 @@ fn reuses_within(b: Block) -> Bool =
         _ -> false,
       }))
 
-fn first_at(t: ReuseCandidate) -> Int = match t.route.at(0) { Some(s) -> s.at, None -> t.at }
+fn position_in_block(t: ReuseCandidate) -> Int =
+  match t.route.at(0) { Some(s) -> s.at, None -> t.at }
 
 fn nearest(takers: List<ReuseCandidate>) -> Option<Int> =
   takers.fold(None, |best: Option<Int>, t: ReuseCandidate|
     match best {
-      Some(b) -> if first_at(t) > b { Some(first_at(t)) } else { best },
-      None -> Some(first_at(t)),
+      Some(b) -> if position_in_block(t) > b { Some(position_in_block(t)) } else { best },
+      None -> Some(position_in_block(t)),
     })
 
 fn release_var(ex: Exits, b: BackwardState, v: Var) -> BackwardState = {
@@ -1755,11 +1810,11 @@ fn release_var(ex: Exits, b: BackwardState, v: Var) -> BackwardState = {
   match boxed_known(ex, v) {
     None -> released,
     Some(r) -> {
-      let fitting = b.takers.filter(|t: ReuseCandidate| fits(r, t));
+      let fitting = b.reuse_candidates.filter(|t: ReuseCandidate| fits(r, t));
       match nearest(fitting) {
         None -> released,
         Some(at) -> {
-          let chosen = fitting.filter(|t: ReuseCandidate| first_at(t) == at);
+          let chosen = fitting.filter(|t: ReuseCandidate| position_in_block(t) == at);
           let made = match chosen.at(0) { Some(t) -> t.made, None -> ListAllocation(0) };
           let box = { id: b.next, ty: v.ty, representation: r };
           let token = token_of(b.next + 1, box, made);
@@ -1771,7 +1826,7 @@ fn release_var(ex: Exits, b: BackwardState, v: Var) -> BackwardState = {
               Destructure({ of: v, words: [box] }),
             ),
             next: b.next + 2,
-            takers: b.takers.filter(|x: ReuseCandidate| !chosen.contains(x)),
+            reuse_candidates: b.reuse_candidates.filter(|x: ReuseCandidate| !chosen.contains(x)),
           }
         },
       }
@@ -1793,7 +1848,7 @@ fn boxed_known(ex: Exits, v: Var) -> Option<Representation> =
     _ -> None,
   }
 
-fn box_words(r: Representation) -> Int =
+fn boxed_payload_words(r: Representation) -> Int =
   match r {
     AsSum(s) -> match s.layout.cases.at(0) {
       Some(c) -> match c.payload { Boxed(x) -> x.skip + layout::words(x.layout), _ -> 0 },
@@ -1807,26 +1862,26 @@ fn token_of(id: Int, of: Var, made: Allocation) -> Var =
 
 fn fits(r: Representation, t: ReuseCandidate) -> Bool =
   (match t.made { CaseAllocation(_) -> true, _ -> false })
-    && allocation_words(t.made) == box_words(r)
+    && allocation_words(t.made) == boxed_payload_words(r)
 
 fn taken_in(block: Block, takers: List<ReuseCandidate>, token: Var) -> Block =
   match nearest(takers) {
     None -> block,
     Some(at) -> {
-      let here = takers.filter(|t: ReuseCandidate| first_at(t) == at);
+      let here = takers.filter(|t: ReuseCandidate| position_in_block(t) == at);
       let last = block.len() - 1;
       block.fold({ k: 0, out: [] }, |s: { k: Int, out: List<Inst> }, i: Inst|
         {
           k: s.k + 1,
           out: s.out.push(if last - s.k == at { taking_at(i, here, token) }
-          else if last - s.k > at { held_across(i, token) }
+          else if last - s.k > at { free_on_unwind(i, token) }
           else { i }),
         }).out
     },
   }
 
 fn taking_at(i: Inst, takers: List<ReuseCandidate>, token: Var) -> Inst =
-  if takers.any(|t: ReuseCandidate| t.route.len() == 0) { taken_by(i, token) } else {
+  if takers.any(|t: ReuseCandidate| t.route.len() == 0) { with_reuse_token(i, token) } else {
     match i {
       If(x) ->
         If({
@@ -1865,7 +1920,7 @@ fn freed(token: Var) -> Inst =
     ),
   })
 
-fn taken_by(i: Inst, token: Var) -> Inst =
+fn with_reuse_token(i: Inst, token: Var) -> Inst =
   match i {
     Let(l) -> match l.value {
       Allocate(m) -> Let({ ..l, value: Allocate({ ..m, reuse: Some(token) }) }),
@@ -1874,7 +1929,7 @@ fn taken_by(i: Inst, token: Var) -> Inst =
     _ -> i,
   }
 
-fn held_across(i: Inst, token: Var) -> Inst = carry_token(i, token, false)
+fn free_on_unwind(i: Inst, token: Var) -> Inst = carry_token(i, token, false)
 
 fn carry_token(i: Inst, token: Var, matched: Bool) -> Inst =
   match i {
@@ -1908,7 +1963,7 @@ fn carry_token_in(b: Block, token: Var, matched: Bool) -> Block =
 
 fn leaves_with(i: Inst, matched: Bool) -> Bool = match i { Miss -> !matched, _ -> is_terminator(i) }
 
-fn maybe_word() -> Representation =
+fn pointer_option_representation() -> Representation =
   AsSum({
     layout: {
       classes: [Pointer],
@@ -2188,7 +2243,11 @@ test "a record held in place is never taken out of its block, however its reader
 
 test "a field of a sum's payload, the sum read out of a record, keeps the record held until it is read" {
   let t = of_type(0, b"m.T");
-  let o = { id: 1, ty: option_type(named_type(b"m.C")), representation: maybe_word() };
+  let o = {
+    id: 1,
+    ty: option_type(named_type(b"m.C")),
+    representation: pointer_option_representation(),
+  };
   let c = of_type(2, b"m.C");
   let b = word(3);
   let r = word(4);
@@ -2497,7 +2556,7 @@ test "a word read out of a sum whose case lays it as its one counted word holds 
       },
       cases: [b"m.T"],
     });
-  let t = { ..of_type(0, b"m.T"), representation: laid([Pointer, layout::raw()]) };
+  let t = { ..of_type(0, b"m.T"), representation: laid([Pointer, layout::any_integer()]) };
   let out = word(1);
   let n = int(2);
   let reads = [
@@ -2740,13 +2799,20 @@ test "a result handed back borrowed takes no count, and a join of borrowed value
     body: [Declaration(j), branch, Inc({ var: j, n: 1 }), Return(VarOperand(j))],
     rejected: None,
   });
-  let o = { id: 5, ty: option_type(string_type()), representation: maybe_word() };
+  let o = {
+    id: 5,
+    ty: option_type(string_type()),
+    representation: pointer_option_representation(),
+  };
   let some = |value: Rvalue, returned: ResultOwnership| {
-    let f = root_of([p], [0], maybe_word(), [bind(o, value, []), Return(VarOperand(o))]);
+    let f = root_of([p], [0], pointer_option_representation(), [
+      bind(o, value, []),
+      Return(VarOperand(o)),
+    ]);
     { ..f, convention: { ..f.convention, returned: returned } }
   };
   [
-    Convert({ arg: VarOperand(p), to: maybe_word() }),
+    Convert({ arg: VarOperand(p), to: pointer_option_representation() }),
     Aggregate({ parts: [IntOperand(1), VarOperand(p)] }),
   ].fold((), |_: Unit, value: Rvalue| {
     assert_eq(counted_body(some(value, BorrowedResult([{ param: 0, whole: true }]))), {
@@ -2771,7 +2837,7 @@ test "a result handed back borrowed takes no count, and a join of borrowed value
       Assign({ var: either, arg: VarOperand(none) }),
     ],
   });
-  let found = root_of([c, p], [0, 1], maybe_word(), [
+  let found = root_of([c, p], [0, 1], pointer_option_representation(), [
     Declaration(either),
     maybe,
     Return(VarOperand(either)),
@@ -2788,17 +2854,17 @@ test "a result handed back borrowed takes no count, and a join of borrowed value
 test "a sum's payload that is its one count, held again as another sum's word, is borrowed as the sum is" {
   let text = string_type();
   let opt = |inner: Type| option_type(inner);
-  let m = { id: 0, ty: opt(text), representation: maybe_word() };
+  let m = { id: 0, ty: opt(text), representation: pointer_option_representation() };
   let s = word(1);
-  let y = { id: 2, ty: opt(text), representation: maybe_word() };
+  let y = { id: 2, ty: opt(text), representation: pointer_option_representation() };
   let some_of = |of: Var| bind(s, Get({ of: of, path: CasePath({ case: 1, at: 0 }) }), []);
   let returning = |p: Var, body: Block, returned: ResultOwnership| {
-    let f = root_of([p], [0], maybe_word(), body);
+    let f = root_of([p], [0], pointer_option_representation(), body);
     { ..f, convention: { ..f.convention, returned: returned } }
   };
   let whole = BorrowedResult([{ param: 0, whole: true }]);
   [
-    Convert({ arg: VarOperand(s), to: maybe_word() }),
+    Convert({ arg: VarOperand(s), to: pointer_option_representation() }),
     Aggregate({ parts: [IntOperand(1), VarOperand(s)] }),
   ].fold((), |_: Unit, value: Rvalue| {
     let body = [some_of(m), bind(y, value, []), Return(VarOperand(y))];
@@ -2810,7 +2876,7 @@ test "a sum's payload that is its one count, held again as another sum's word, i
   });
   let again = bind(y, Aggregate({ parts: [IntOperand(1), VarOperand(s)] }), []);
   let v = NamedType({ name: b"m.V", args: [] });
-  let n = { id: 0, ty: opt(v), representation: maybe_word() };
+  let n = { id: 0, ty: opt(v), representation: pointer_option_representation() };
   let inner = {
     id: 3,
     ty: v,
@@ -2992,7 +3058,7 @@ test "an arm lets go before it misses of what only it reads" {
           [If({ cond: BoolOperand(true), then: then, otherwise: miss })],
           [Return(VarOperand(q))],
         ],
-        rest: [Fail({ reason: NoMatchingArm, at: dummy_span(), letting: [], unwind: [] })],
+        rest: [Fail({ reason: NoMatchingArm, at: dummy_span(), resource: [], unwind: [] })],
       }),
     ];
   let f = root_of([p, q], [], AsWord, matched([Return(VarOperand(p))], [Miss]));
@@ -3023,7 +3089,7 @@ test "an arm lets go before a miss however deep of what it read with a count of 
     [
       Match({
         arms: [first, [Return(VarOperand(xs))]],
-        rest: [Fail({ reason: NoMatchingArm, at: dummy_span(), letting: [], unwind: [] })],
+        rest: [Fail({ reason: NoMatchingArm, at: dummy_span(), resource: [], unwind: [] })],
       }),
     ];
   let f = root_of(
@@ -3250,7 +3316,7 @@ test "a handle holds across its body what the body reads, which its landing rele
   let inside = [
     If({
       cond: VarOperand(c),
-      then: [Fail({ reason: NoMatchingArm, at: dummy_span(), letting: [], unwind: [] })],
+      then: [Fail({ reason: NoMatchingArm, at: dummy_span(), resource: [], unwind: [] })],
       otherwise: [],
     }),
     bind(r, call_of([VarOperand(p)], [0]), []),
@@ -3554,9 +3620,9 @@ test "a field read once in each arm of a branch is taken in each, and in neither
     });
   let f = |before: List<Inst>|
     root_of([o, c, p], [], AsWord, before.push(branch(Get({ of: o, path: at }))));
-  assert_eq(insert_takes(f([])).body, [branch(Take({ of: o, path: at }))]);
+  assert_eq(take_fields(f([])).body, [branch(Take({ of: o, path: at }))]);
   let first = bind(word(6), Get({ of: o, path: at }), []);
-  assert_eq(insert_takes(f([first])).body, [first, branch(Get({ of: o, path: at }))])
+  assert_eq(take_fields(f([first])).body, [first, branch(Get({ of: o, path: at }))])
 }
 
 test "a field is taken out of a join only where the join holds a count, never out of one set from borrowed reads" {

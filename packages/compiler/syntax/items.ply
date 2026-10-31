@@ -116,7 +116,7 @@ pub type SpecClause = { kind: SpecKind, expression: Expression, span: Span }
 
 pub fn result_name() -> Bytes = b"result"
 
-pub type Returns = | ReturnsFresh(Span) | ReturnsParam(Identifier)
+pub type ReturnsClause = | ReturnsFresh(Span) | ReturnsParam(Identifier)
 
 pub type FnDefinition = {
   visibility: Visibility,
@@ -127,7 +127,7 @@ pub type FnDefinition = {
   effects: Option<EffectsExpression>,
   constraints: List<Constraint>,
   spec: List<SpecClause>,
-  returns: Option<Returns>,
+  returns: Option<ReturnsClause>,
   reuse: Option<Span>,
   transparent: Option<Span>,
   constant: Option<Span>,
@@ -827,7 +827,7 @@ fn opt_returns(
   input: Input,
   parser: Parser,
   params: List<Param>,
-) -> Result<ParseOutput<Option<Returns>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Option<ReturnsClause>>, Parser> / {abort.raise} =
   if !at_returns(input, parser) { Ok({ parser: parser, node: None }) } else {
     let a = advance(input, parser);
     let { parser, node: name } = expect_identifier(
@@ -2499,7 +2499,7 @@ pub fn read_without_import<| e>(
   if !sees_homes(name) { [] } else {
     let called = called_names(input);
     (if called.len() == 0 { [] } else { homes_for(called, declared()) }).concat(
-      scheduler_read(name, input),
+      scheduler_modules_needed(name, input),
     )
   }
 
@@ -2509,7 +2509,7 @@ pub fn unimported_of<| e>(
   imported: List<Bytes>,
 ) -> List<Bytes> / e = read.filter(|m: Bytes| held(m) && !imported.contains(m))
 
-pub fn scheduler_read(name: Bytes, input: Input) -> List<Bytes> =
+pub fn scheduler_modules_needed(name: Bytes, input: Input) -> List<Bytes> =
   if scheduler_dependencies().contains(name) { [] } else {
     let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
     let named = |i: Int, ops: List<Bytes>|
@@ -2671,7 +2671,7 @@ fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDeclaration 
     span: span,
   }
 
-pub fn is_written(declaration: ImportDeclaration) -> Bool =
+pub fn is_explicit_import(declaration: ImportDeclaration) -> Bool =
   match declaration.kind {
     ModuleAlias(a) -> !is_hidden_binder(a.name) && a.name != prelude_binder(),
     _ -> true,
@@ -2793,7 +2793,7 @@ type NameUse = { piece: Int, name: Bytes }
 
 type ItemKind = | TestOrLaw | PrivateItem(List<Bytes>) | ImportItem(List<Bytes>) | ExportedItem
 
-pub fn unread_by_importers(src: Bytes) -> List<Span> / {abort.raise} = {
+pub fn unneeded_spans(src: Bytes) -> List<Span> / {abort.raise} = {
   let s = start(src);
   let input = s.input;
   let scan = scan_items(input, s.parser, bindable_names(input, tokens_in_imports(input)));
@@ -2821,7 +2821,7 @@ pub fn unread_by_importers(src: Bytes) -> List<Span> / {abort.raise} = {
       ExportedItem -> false,
     };
     if cut {
-      acc.push(span_between(before_piece(input, firsts.get(j)), token_at(input, lasts.get(j)).end))
+      acc.push(span_between(piece_start(input, firsts.get(j)), token_at(input, lasts.get(j)).end))
     } else { acc }
   })
 }
@@ -2958,7 +2958,7 @@ type ReachState = { kept: Array<Bool>, frontier: List<Int> }
 fn token_at(input: Input, i: Int) -> Token =
   match input.tokens.at(i) { Some(t) -> t, None -> { start: 0, end: 0, kind: EndOfInput } }
 
-fn before_piece(input: Input, first: Int) -> Int =
+fn piece_start(input: Input, first: Int) -> Int =
   if first > 0 { token_at(input, first - 1).end } else {
     input.comments.fold(0, |at: Int, c: Comment|
       if c.end <= token_at(input, 0).start && doc_mark(input.source, c) == Some(ModuleDoc) { c.end }
@@ -3163,7 +3163,7 @@ pub fn dump_reuse(span: Span) -> Bytes = dump_node(span, b"reu")
 
 pub fn dump_transparent(span: Span) -> Bytes = dump_node(span, b"trn")
 
-pub fn dump_returns(r: Returns) -> Bytes / {abort.raise} =
+pub fn dump_returns(r: ReturnsClause) -> Bytes / {abort.raise} =
   match r {
     ReturnsFresh(s) -> dump_node(s, b"rfr"),
     ReturnsParam(x) -> dump_word(b"rpm").concat(dump_identifier(x)),
@@ -3691,7 +3691,7 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
     _ -> panic("one test"),
   };
   assert_eq(r.node.imports.len(), 2);
-  assert_eq(r.node.imports.filter(is_written).len(), 0);
+  assert_eq(r.node.imports.filter(is_explicit_import).len(), 0);
   assert_eq(parse(b"test \"n\" { assert(true) }\n").node.imports.len(), 0);
   assert_eq(parse(b"fn f(n: Int) -> Int = sh\"a {n}\"\n").node.imports.len(), 0);
   assert_eq(parse(b"fn f(n: Int) -> Int = sh\"a {f\"{n}\"}\"\n").node.imports.len(), 1)
@@ -4270,7 +4270,7 @@ test "a module reads the scheduler where it writes `simulate` or performs `task`
 
 test "an importer reads no test or law, nor a private item or an import only they reach" {
   let src = b"//! A module.\n\nimport std.laws (agrees)\nimport std.bytes\n\n/// More.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + bytes::one()\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = thrice(x)\n\nfn thrice(x: Int) -> Int = x * 3\n\ntype Pair = { a: Int, b: Int }\n\n// --- Tests\n\ntest \"more\" {\n  assert_eq(more(twice(1)), 4)\n}\n\ntest/nondet \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n\nlaw \"pairs\" = agrees(|p: Pair| p.a, |p: Pair| p.a)\n";
-  assert_eq(unread_by_importers(src).map(|s: Span| src.slice(s.start, s.end)), [
+  assert_eq(unneeded_spans(src).map(|s: Span| src.slice(s.start, s.end)), [
     b"\n\nimport std.laws (agrees)",
     b"\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = thrice(x)",
     b"\n\nfn thrice(x: Int) -> Int = x * 3",
@@ -4280,17 +4280,17 @@ test "an importer reads no test or law, nor a private item or an import only the
     b"\n\nlaw \"pairs\" = agrees(|p: Pair| p.a, |p: Pair| p.a)",
   ]);
   let performs = b"import std.list\nimport std.process (process)\n\npub fn stop(text: String) -> Int / {abort.raise, process.out[proc]} = { process.out[proc](text); abort.raise(1) }\n";
-  assert_eq(unread_by_importers(performs).len(), 1);
+  assert_eq(unneeded_spans(performs).len(), 1);
   let through = b"import std.list\nimport std.laws (agrees)\n\npub fn second(xs: List<Int>) -> Option<Int> = xs.second()\n";
-  assert_eq(unread_by_importers(through), []);
+  assert_eq(unneeded_spans(through), []);
   let named = b"import std.list\n\npub fn second(xs: List<Int>) -> Option<Int> = List::second(xs)\n";
-  assert_eq(unread_by_importers(named), []);
+  assert_eq(unneeded_spans(named), []);
   let tested = b"import std.list\n\npub fn one() -> Int = 1\n\ntest \"second\" { assert_eq([1, 2].second(), Some(2)) }\n";
-  assert_eq(unread_by_importers(tested).len(), 2);
+  assert_eq(unneeded_spans(tested).len(), 2);
   let held = b"import std.bin\n\ntype Kept = { a: Int }\n\nderive bin for Kept\n\nfn helper() -> Int = 1\n\npub fn shown() -> Int = helper()\n";
-  assert_eq(unread_by_importers(held), []);
+  assert_eq(unneeded_spans(held), []);
   let stated = b"pub opaque type Balance = | Balance(Int)\n\nfn valid(b: Balance) -> Bool = true\n\ntest \"valid\" { assert(valid(Balance(1))) }\n\ninvariant for Balance by valid\n";
-  assert_eq(unread_by_importers(stated).map(|s: Span| stated.slice(s.start, s.end)), [
+  assert_eq(unneeded_spans(stated).map(|s: Span| stated.slice(s.start, s.end)), [
     b"\n\ntest \"valid\" { assert(valid(Balance(1))) }",
   ])
 }

@@ -234,7 +234,7 @@ pub fn encode_frame(f: Frame) -> Bytes / {abort.raise} =
         5,
         flag(p.end_headers, 0x4) | flag(p.padding != None, 0x8),
         p.stream,
-        padded(u32_be(identifier(p.promised)).concat(p.block), p.padding),
+        padded(u32_be(checked_window_increment(p.promised)).concat(p.block), p.padding),
       ),
     PingFrame(p) -> if p.data.len() != 8 { panic("a PING carries eight octets") }
     else { framed(6, flag(p.ack, 0x1), 0, p.data) },
@@ -244,17 +244,17 @@ pub fn encode_frame(f: Frame) -> Bytes / {abort.raise} =
         0,
         0,
         Bytes::concat_all([
-          u32_be(identifier(g.last_stream)),
+          u32_be(checked_window_increment(g.last_stream)),
           u32_be(code_number(g.code)),
           g.debug,
         ]),
       ),
-    WindowUpdateFrame(w) -> framed(8, 0, w.stream, u32_be(identifier(w.increment))),
+    WindowUpdateFrame(w) -> framed(8, 0, w.stream, u32_be(checked_window_increment(w.increment))),
     ContinuationFrame(c) -> framed(9, flag(c.end_headers, 0x4), c.stream, c.block),
     UnknownFrame(u) -> framed(u.kind, u.flags, u.stream, u.payload),
   }
 
-fn identifier(n: Int) -> Int / {abort.raise} =
+fn checked_window_increment(n: Int) -> Int / {abort.raise} =
   if n < 0 || n > largest_window() { panic(n.to_string() ++ " is past 31 bits") } else { n }
 
 fn framed(kind: Int, flags: Int, stream: Int, payload: Bytes) -> Bytes / {abort.raise} = {
@@ -268,7 +268,7 @@ fn framed(kind: Int, flags: Int, stream: Int, payload: Bytes) -> Bytes / {abort.
       byte_of_int(n & 0xFF),
       byte_of_int(kind),
       byte_of_int(flags),
-      u32_be(identifier(stream)),
+      u32_be(checked_window_increment(stream)),
       payload,
     ])
   }
@@ -285,7 +285,7 @@ fn priority_bytes(p: Option<Priority>) -> Bytes / {abort.raise} =
   match p {
     None -> b"",
     Some(q) -> if q.weight < 1 || q.weight > 256 { panic("a weight is 1 to 256") } else {
-      u32_be(identifier(q.depends_on) | flag(q.exclusive, 0x8000_0000)).concat(
+      u32_be(checked_window_increment(q.depends_on) | flag(q.exclusive, 0x8000_0000)).concat(
         byte_of_int(q.weight - 1),
       )
     },
@@ -359,9 +359,9 @@ fn frame_of(
 ) -> Frame / {http2.violated, abort.raise} =
   if kind == 0 { data_of(flags, stream, payload) }
   else if kind == 1 { headers_of(flags, stream, payload) }
-  else if kind == 2 { priority_of(stream, payload) }
+  else if kind == 2 { read_priority_frame(stream, payload) }
   else if kind == 3 { reset_of(stream, payload) }
-  else if kind == 4 { settings_of(flags, stream, payload) }
+  else if kind == 4 { read_settings_frame(flags, stream, payload) }
   else if kind == 5 { push_promise_of(flags, stream, payload) }
   else if kind == 6 { ping_of(flags, stream, payload) }
   else if kind == 7 { goaway_of(stream, payload) }
@@ -419,7 +419,7 @@ fn headers_of(flags: Int, stream: Int, payload: Bytes) -> Frame / {http2.violate
   }
 }
 
-fn priority_of(stream: Int, payload: Bytes) -> Frame / {http2.violated, abort.raise} = {
+fn read_priority_frame(stream: Int, payload: Bytes) -> Frame / {http2.violated, abort.raise} = {
   on_stream(stream, "PRIORITY");
   if payload.len() != 5 {
     violation(FrameSizeError, stream, "a PRIORITY frame of other than five octets")
@@ -438,7 +438,11 @@ fn reset_of(stream: Int, payload: Bytes) -> Frame / {http2.violated} = {
   } else { ResetFrame({ stream: stream, code: code_of(word(payload, 0)) }) }
 }
 
-fn settings_of(flags: Int, stream: Int, payload: Bytes) -> Frame / {http2.violated, abort.raise} = {
+fn read_settings_frame(
+  flags: Int,
+  stream: Int,
+  payload: Bytes,
+) -> Frame / {http2.violated, abort.raise} = {
   on_connection(stream, "SETTINGS");
   if is_set(flags, 0x1) {
     if payload.len() != 0 {
@@ -1615,7 +1619,7 @@ type ConnectionState = {
   /// the next frame needs. The pieces are joined only once the frame can be read, so a frame that
   /// arrives an octet at a time is not copied again for each octet.
   held: List<Bytes>,
-  held_size: Int,
+  pending_size: Int,
   needed: Int,
   out: List<Bytes>,
   decoder: Decoder,
@@ -1704,7 +1708,7 @@ fn new_connection(role: Role, limits: Limits, now: Instant) -> Connection / {abo
     greeted: false,
     over: false,
     held: [],
-    held_size: 0,
+    pending_size: 0,
     needed: 0,
     out: List::concat(if role == Client { [preface(), greeting] } else { [greeting] }, window),
     decoder: decoder(
@@ -1880,7 +1884,7 @@ fn close_with_error(
       GoAwayFrame({ last_stream: k.highest, code: code, debug: Bytes::of_string(reason) }),
     );
     event(
-      { ..sent, over: true, held: [], held_size: 0, block: None, goaway_sent: k.highest },
+      { ..sent, over: true, held: [], pending_size: 0, block: None, goaway_sent: k.highest },
       Closed({ code: code, reason: reason }),
     )
   }
@@ -1898,13 +1902,18 @@ fn goaway(k: ConnectionState, last: Int) -> ConnectionState / {abort.raise} = {
 /// closed connection reads nothing more.
 pub fn receive(c: Connection, data: Bytes, now: Instant) -> ReceiveResult / {abort.raise} = {
   let k = state_of(c);
-  let size = k.held_size + data.len();
-  if k.over { report(k) }
-  else if k.started && size < k.needed { report({ ..k, held: k.held.push(data), held_size: size }) }
-  else {
+  let size = k.pending_size + data.len();
+  if k.over { report(k) } else if k.started && size < k.needed {
+    report({ ..k, held: k.held.push(data), pending_size: size })
+  } else {
     let t = ms(now);
     let buf = Bytes::concat_all(k.held.push(data));
-    report(pump(if k.started { framed_input(k, buf, t) } else { read_preface(k, buf, t) }, t))
+    report(
+      send_pending_data(
+        if k.started { framed_input(k, buf, t) } else { read_preface(k, buf, t) },
+        t,
+      ),
+    )
   }
 }
 
@@ -1926,7 +1935,7 @@ fn read_preface(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {ab
   let n = min(buf.len(), preface().len());
   if buf.slice(0, n) != preface().slice(0, n) {
     close_with_error(k, ProtocolError, "the connection does not open with the HTTP/2 preface")
-  } else if n < preface().len() { { ..k, held: [buf], held_size: buf.len() } }
+  } else if n < preface().len() { { ..k, held: [buf], pending_size: buf.len() } }
   else { framed_input({ ..k, started: true }, buf.slice(n, buf.len()), t) }
 }
 
@@ -1958,7 +1967,7 @@ fn framed_input(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {ab
     {
       ..done.k,
       held: [rest],
-      held_size: rest.len(),
+      pending_size: rest.len(),
       needed: match frame_length(rest, 0) { Some(length) -> 9 + length, None -> 9 },
     }
   }
@@ -2530,7 +2539,7 @@ fn on_goaway(
   let told = event(refused_ones, GoingAway({ last_stream: bound, code: code, debug: debug }));
   if code == NoError { told } else {
     event(
-      { ..told, over: true, held: [], held_size: 0, block: None },
+      { ..told, over: true, held: [], pending_size: 0, block: None },
       Closed({ code: code, reason: "the peer's GOAWAY: " ++ String::of_bytes_lossy(debug) }),
     )
   }
@@ -2562,7 +2571,7 @@ fn on_window_update(
 /// §8.1.1), or well formed and not served, with the status that reports why.
 type Head = | WellFormed(Request, Option<Int>) | Malformed(String) | Rejected(Int, String)
 
-type Gathering = {
+type CollectedHeaders = {
   pseudo: Map<Bytes, Bytes>,
   regular: Bool,
   headers: Headers,
@@ -2599,11 +2608,11 @@ fn connection_specific(name: String) -> Bool =
     || name == "transfer-encoding"
     || name == "upgrade"
 
-fn gathered(
+fn collect_headers(
   fields: List<Field>,
   allowed: List<Bytes>,
   trailing: Bool,
-) -> Gathering / {abort.raise} =
+) -> CollectedHeaders / {abort.raise} =
   fields.fold(
     {
       pseudo: Map::new(),
@@ -2613,18 +2622,18 @@ fn gathered(
       length: None,
       wrong: None,
     },
-    |g: Gathering, f: Field|
+    |g: CollectedHeaders, f: Field|
       if g.wrong != None { g } else { field_gathered(g, f, allowed, trailing) },
   )
 
-fn wrong(g: Gathering, reason: String) -> Gathering = { ..g, wrong: Some(reason) }
+fn wrong(g: CollectedHeaders, reason: String) -> CollectedHeaders = { ..g, wrong: Some(reason) }
 
 fn field_gathered(
-  g: Gathering,
+  g: CollectedHeaders,
   f: Field,
   allowed: List<Bytes>,
   trailing: Bool,
-) -> Gathering / {abort.raise} =
+) -> CollectedHeaders / {abort.raise} =
   match field_flaw(f) {
     Some(reason) -> wrong(g, reason),
     None -> if f.name.at(0) == b':' {
@@ -2640,7 +2649,11 @@ fn field_gathered(
     },
   }
 
-fn regular_gathered(g: Gathering, name: String, value: String) -> Gathering / {abort.raise} =
+fn regular_gathered(
+  g: CollectedHeaders,
+  name: String,
+  value: String,
+) -> CollectedHeaders / {abort.raise} =
   if connection_specific(name) { wrong(g, "the connection-specific field `" ++ name ++ "`") }
   else if name == "te" && value != "trailers" { wrong(g, "`te` other than `trailers`") }
   else if name == "cookie" { { ..g, cookies: g.cookies.push(value) } }
@@ -2657,12 +2670,12 @@ fn field_added(h: Headers, name: String, value: String) -> Headers =
   h.insert(name, List::push(match h.get(name) { Some(earlier) -> earlier, None -> [] }, value))
 
 /// The fields with the cookie's pieces joined into one, as an HTTP/1.1 message has it (§8.2.3).
-fn with_cookies(g: Gathering) -> Headers =
+fn with_cookies(g: CollectedHeaders) -> Headers =
   if g.cookies == [] { g.headers }
   else { g.headers.insert("cookie", [String::join(g.cookies, "; ")]) }
 
 fn request_of(fields: List<Field>) -> Head / {abort.raise} = {
-  let g = gathered(fields, [b":method", b":scheme", b":authority", b":path"], false);
+  let g = collect_headers(fields, [b":method", b":scheme", b":authority", b":path"], false);
   match g.wrong {
     Some(reason) -> Malformed(reason),
     None -> match g.pseudo.get(b":method") {
@@ -2676,7 +2689,7 @@ fn request_of(fields: List<Field>) -> Head / {abort.raise} = {
           < m.len() { Malformed("a `:method` that is not a token") } else {
         match ((g.pseudo.get(b":scheme"), g.pseudo.get(b":path"))) {
           (Some(scheme), Some(p)) ->
-            targeted(g, String::of_bytes(m), String::of_bytes(scheme), String::of_bytes(p)),
+            request_head(g, String::of_bytes(m), String::of_bytes(scheme), String::of_bytes(p)),
           _ -> Malformed("no `:scheme` or no `:path`"),
         }
       },
@@ -2684,7 +2697,12 @@ fn request_of(fields: List<Field>) -> Head / {abort.raise} = {
   }
 }
 
-fn targeted(g: Gathering, method: String, scheme: String, path: String) -> Head / {abort.raise} = {
+fn request_head(
+  g: CollectedHeaders,
+  method: String,
+  scheme: String,
+  path: String,
+) -> Head / {abort.raise} = {
   let hosts = match g.headers.get("host") { Some(named) -> named, None -> [] };
   let authority = match g.pseudo.get(b":authority") {
     Some(a) -> String::of_bytes(a),
@@ -2715,7 +2733,7 @@ fn targeted(g: Gathering, method: String, scheme: String, path: String) -> Head 
 type ResponseHead = { status: Int, headers: Headers, expected: Option<Int> }
 
 fn response_of(fields: List<Field>) -> Result<ResponseHead, String> / {abort.raise} = {
-  let g = gathered(fields, [b":status"], false);
+  let g = collect_headers(fields, [b":status"], false);
   match g.wrong {
     Some(reason) -> Err(reason),
     None -> match g.pseudo.get(b":status") {
@@ -2731,7 +2749,7 @@ fn response_of(fields: List<Field>) -> Result<ResponseHead, String> / {abort.rai
 }
 
 fn trailers_of(fields: List<Field>) -> Result<Headers, String> / {abort.raise} = {
-  let g = gathered(fields, [], true);
+  let g = collect_headers(fields, [], true);
   match g.wrong { Some(reason) -> Err(reason), None -> Ok(with_cookies(g)) }
 }
 
@@ -2860,7 +2878,7 @@ type PumpRound = { k: ConnectionState, moved: Bool }
 
 /// Sends `DATA` for every stream with data to send, one frame for each in turn, starting after the
 /// stream the last round ended at, until no window allows more.
-fn pump(k: ConnectionState, t: Int) -> ConnectionState / {abort.raise} =
+fn send_pending_data(k: ConnectionState, t: Int) -> ConnectionState / {abort.raise} =
   if k.over { k } else {
     let done = iterate(k, k.buffered + k.streams.len() + 2, |p: ConnectionState| {
       let r = one_round(p, t);
@@ -2942,7 +2960,7 @@ pub fn respond(
     Client -> panic("a client handles no request"),
     Server -> match k.streams.get(stream) {
       Some(st) -> if st.returned || k.over { c }
-      else { Connection(pump(send_response(k, st, r, ms(now)), ms(now))) },
+      else { Connection(send_pending_data(send_response(k, st, r, ms(now)), ms(now))) },
       None -> c,
     },
   }
@@ -2986,7 +3004,7 @@ pub fn respond_head(
           reset_after: st.phase == Open,
         };
         Connection(
-          pump(
+          send_pending_data(
             if has_no_body { sending_finished(headed, queued, t) }
             else { store_stream(headed, queued) },
             t,
@@ -3013,7 +3031,9 @@ pub fn give(
     Some(st) -> if !st.more || k.over { c } else {
       let held = if st.sent == 0 { st.out } else { st.out.slice(st.sent, st.out.len()) };
       let fed = { ..st, out: held.concat(piece), sent: 0, more: !last };
-      Connection(pump(store_stream({ ..k, buffered: k.buffered + piece.len() }, fed), ms(now)))
+      Connection(
+        send_pending_data(store_stream({ ..k, buffered: k.buffered + piece.len() }, fed), ms(now)),
+      )
     },
     None -> c,
   }
@@ -3069,7 +3089,7 @@ pub fn request(
     };
     let queued = if ends { store_stream(headed, { ..st, phase: LocalClosed }) }
     else { store_stream({ ..headed, buffered: headed.buffered + request.body.len() }, st) };
-    Some({ connection: Connection(pump(queued, t)), stream: s })
+    Some({ connection: Connection(send_pending_data(queued, t)), stream: s })
   }
 }
 
@@ -3108,7 +3128,7 @@ pub fn tick(c: Connection, now: Instant) -> ReceiveResult / {abort.raise} = {
     let idled = if drained.streams.len() == 0 && drained.goaway_sent < 0 && drained.draining < 0
         && t - drained.quiet_since >= l.idle_timeout_ms { goaway(drained, drained.highest) }
     else { drained };
-    report(pump(idled, t))
+    report(send_pending_data(idled, t))
   }
 }
 
@@ -3216,7 +3236,7 @@ pub fn peer_closed(c: Connection) -> ReceiveResult = {
   if k.over { report(k) } else {
     report(
       event(
-        { ..k, over: true, held: [], held_size: 0 },
+        { ..k, over: true, held: [], pending_size: 0 },
         Closed({ code: Cancel, reason: "the peer closed the connection" }),
       ),
     )
@@ -3232,7 +3252,7 @@ fn read_back(b: Bytes) -> Option<Frame> / {abort.raise} =
   }
 
 /// The violation reading `b` raises, as its code and stream; `None` when it reads without error.
-fn refusal_of(b: Bytes) -> Option<(ErrorCode, Int)> / {abort.raise} =
+fn frame_error(b: Bytes) -> Option<(ErrorCode, Int)> / {abort.raise} =
   match try { read_frame(b, 0, default_frame_size()) } {
     Ok(_) -> None,
     Err(v) -> Some((v.code, v.stream)),
@@ -3357,11 +3377,11 @@ test "a frame is not read until all of it has arrived" {
   assert_eq(read_back(whole), Some(PingFrame({ ack: false, data: b"12345678" })))
 }
 
-type Refused = { hex: String, code: ErrorCode, stream: Int }
+type RejectedFrame = { hex: String, code: ErrorCode, stream: Int }
 
 /// Frames RFC 9113 §6 says a receiver must reject, the code it rejects each with, and the stream
 /// the error is limited to.
-fn refused_frames() -> List<Refused> =
+fn rejected_frame_cases() -> List<RejectedFrame> =
   [
     // Past SETTINGS_MAX_FRAME_SIZE, rejected from its header alone.
     { hex: "004001000000000001", code: FrameSizeError, stream: 0 },
@@ -3395,16 +3415,15 @@ fn refused_frames() -> List<Refused> =
     { hex: "000000090400000000", code: ProtocolError, stream: 0 },
   ]
 
-test "frame {r.hex} is rejected as RFC 9113 requires" for r: Refused in refused_frames() {
-  assert_eq(refusal_of(Bytes::of_hex(r.hex)), Some((r.code, r.stream)))
-}
+test "frame {r.hex} is rejected as RFC 9113 requires" for r: RejectedFrame in rejected_frame_cases(
+  ) { assert_eq(frame_error(Bytes::of_hex(r.hex)), Some((r.code, r.stream))) }
 
 // --- Tests: HPACK -------------------------------------------------------------------
 
 fn decoded(d: Decoder, block: Bytes) -> DecodeResult / {abort.raise} =
   match try { decode(d, block) } { Ok(got) -> got, Err(v) -> panic(v.reason) }
 
-fn refused_block(d: Decoder, block: Bytes) -> String / {abort.raise} =
+fn decode_result_text(d: Decoder, block: Bytes) -> String / {abort.raise} =
   match try { decode(d, block) } { Ok(_) -> "decoded", Err(v) -> v.reason }
 
 fn text_field(f: Field) -> String / {abort.raise} =
@@ -3417,11 +3436,11 @@ type Example = {
   table: Int,
 }
 
-type Story = { name: String, capacity: Int, examples: List<Example> }
+type Scenario = { name: String, capacity: Int, examples: List<Example> }
 
 /// RFC 7541 Appendix C, each section's blocks in order: the requests decoded with a table of 4096
 /// octets and the responses with one of 256, as the RFC has them.
-fn stories() -> List<Story> =
+fn stories() -> List<Scenario> =
   [
     {
       name: "C.2.1",
@@ -3638,7 +3657,7 @@ fn stories() -> List<Story> =
     },
   ]
 
-test "RFC 7541's example {s.name} decodes block by block to its fields and its table" for s: Story in stories(
+test "RFC 7541's example {s.name} decodes block by block to its fields and its table" for s: Scenario in stories(
   ) {
   s.examples.fold(decoder(s.capacity, 2), |d: Decoder, e: Example| {
     let got = decoded(d, Bytes::of_hex(e.wire));
@@ -3680,55 +3699,58 @@ test "a Huffman-coded string decodes to itself" {
 test "a Huffman string that contains EOS, or is padded wrong, is rejected" {
   // EOS whole, then a padding of eight ones, then a padding of zeros.
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("0084ffffffff" ++ "8178")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("0084ffffffff" ++ "8178")),
     "a Huffman string that holds EOS",
   );
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("0081ff")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("0081ff")),
     "a Huffman string padded with more than seven bits",
   );
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("008100")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("008100")),
     "a Huffman string padded with other than the first bits of EOS",
   )
 }
 
 test "a block that names what no table contains, or runs past its end, is rejected" {
-  assert_eq(refused_block(decoder(4096, 2), Bytes::of_hex("80")), "index 0");
-  assert_eq(refused_block(decoder(4096, 2), Bytes::of_hex("be")), "index 62 past the tables");
+  assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("80")), "index 0");
+  assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("be")), "index 62 past the tables");
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("400a6375")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("400a6375")),
     "a string that runs past the end of its block",
   );
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("ff")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("ff")),
     "an integer that runs past the end of its block",
   );
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("ff8080808080")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("ff8080808080")),
     "an integer of more than five continuation octets",
   );
-  assert_eq(refused_block(decoder(4096, 2), Bytes::of_hex("ffffffffff0f")), "an integer past 2^32")
+  assert_eq(
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("ffffffffff0f")),
+    "an integer past 2^32",
+  )
 }
 
 test "table size updates come first, at most as many as allowed, and within the ceiling" {
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("8220")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("8220")),
     "a table size update after a field",
   );
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("202020")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("202020")),
     "more than 2 table size updates in a block",
   );
   assert_eq(
-    refused_block(decoder(4096, 2), Bytes::of_hex("3fe21f")),
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("3fe21f")),
     "a table size update to 4097 past the 4096 allowed",
   );
   assert_eq(decoded(decoder(4096, 2), Bytes::of_hex("203fe11f82")).decoder.table.capacity, 4096);
   // After the ceiling drops below the table's size, the next block must start with an update.
   let lowered = with_ceiling(decoded(decoder(4096, 2), Bytes::of_hex("82")).decoder, 100);
   assert_eq(
-    refused_block(lowered, Bytes::of_hex("82")),
+    decode_result_text(lowered, Bytes::of_hex("82")),
     "a block that does not open with the table size update it owes",
   );
   assert_eq(decoded(lowered, Bytes::of_hex("3f4582")).decoder.table.capacity, 100)
@@ -3920,10 +3942,10 @@ fn served(
 ) -> Served / {abort.raise} = {
   let start = take_output(server(limits, at(0)));
   chunks.fold({ connection: start.connection, frames: [], events: [] }, |s: Served, chunk: Bytes|
-    after(s, receive(s.connection, chunk, at(1)), app, 1))
+    serve_result(s, receive(s.connection, chunk, at(1)), app, 1))
 }
 
-fn after(
+fn serve_result(
   s: Served,
   r: ReceiveResult,
   app: (Request) -> Response / {abort.raise},
@@ -3937,8 +3959,8 @@ fn after(
   }
 }
 
-fn ticked(s: Served, t: Int) -> Served / {abort.raise} =
-  after(s, tick(s.connection, at(t)), echo, t)
+fn serve_tick(s: Served, t: Int) -> Served / {abort.raise} =
+  serve_result(s, tick(s.connection, at(t)), echo, t)
 
 test "a GET is a request the application responds to with HEADERS and then DATA" {
   let s = served(default_limits(), [opening([]).concat(get(1, "/a?b=1"))], echo);
@@ -4520,7 +4542,7 @@ test "CONTINUATION flood: a field block past max_header_block closes the connect
 /// A first request that leaves a 4 KiB field in the server's table, and a second whose block of
 /// a few dozen octets names it twenty times: its `:authority` is inserted first, so the field is
 /// index 63.
-fn bomb() -> List<Bytes> / {abort.raise} = {
+fn table_amplification_input() -> List<Bytes> / {abort.raise} = {
   let planted = block_of(get_fields("/")).concat(
     Bytes::concat_all([
       integer(0, 6, 0x40),
@@ -4554,7 +4576,7 @@ fn bomb() -> List<Bytes> / {abort.raise} = {
 }
 
 test "HPACK bomb: fields past max_header_list_size get a 431 response, however short their block" {
-  let s = served(default_limits(), [opening([])].concat(bomb()), echo);
+  let s = served(default_limits(), [opening([])].concat(table_amplification_input()), echo);
   let reason = "the fields are larger than 65536 octets\n";
   assert_eq(s.frames, [
     "SETTINGS ACK",
@@ -4634,9 +4656,9 @@ test "slow reader: a stream whose window stays closed past stall_ms is reset, an
   assert_eq(s.frames, ["SETTINGS ACK", "HEADERS 1"]);
   assert_eq(buffered_octets(s.connection), 6);
   assert_eq(deadline(s.connection), Some(at(1001)));
-  let early = ticked(s, 900);
+  let early = serve_tick(s, 900);
   assert_eq(early.frames, s.frames);
-  let late = ticked(early, 1001);
+  let late = serve_tick(early, 1001);
   assert_eq(late.frames, ["SETTINGS ACK", "HEADERS 1", "RST_STREAM 1 CANCEL"]);
   assert_eq(buffered_octets(late.connection), 0)
 }
@@ -4674,7 +4696,7 @@ test "a request not complete within request_timeout_ms gets a 408 response" {
   let l = { ..default_limits(), request_timeout_ms: 1000 };
   let s = served(l, [opening([]), encode_frame(headers(1, get_fields("/"), false))], echo);
   assert_eq(deadline(s.connection), Some(at(1001)));
-  let late = ticked(s, 1001);
+  let late = serve_tick(s, 1001);
   let reason = "the request did not arrive whole within 1000 ms\n";
   assert_eq(late.frames, [
     "SETTINGS ACK",
@@ -4688,14 +4710,14 @@ test "SETTINGS the client never acknowledges close the connection with SETTINGS_
   let l = { ..default_limits(), settings_timeout_ms: 500 };
   let s = served(l, [preface().concat(wire([SettingsFrame({ ack: false, settings: [] })]))], echo);
   assert_eq(deadline(s.connection), Some(at(500)));
-  assert_eq(ticked(s, 500).frames, ["SETTINGS ACK", "GOAWAY 0 SETTINGS_TIMEOUT"])
+  assert_eq(serve_tick(s, 500).frames, ["SETTINGS ACK", "GOAWAY 0 SETTINGS_TIMEOUT"])
 }
 
 test "an idle connection closes after idle_timeout_ms" {
   let l = { ..default_limits(), idle_timeout_ms: 2000 };
   let s = served(l, [opening([]), get(1, "/")], echo);
   assert_eq(deadline(s.connection), Some(at(2001)));
-  let idle = ticked(s, 2001);
+  let idle = serve_tick(s, 2001);
   assert_eq(idle.frames.drop(3), ["GOAWAY 1 NO_ERROR"]);
   assert(finished(idle.connection), None)
 }
@@ -4723,7 +4745,7 @@ test "a drain accepts the streams sent before its PING returns, and only those" 
   let begun = take_output(drain(s.connection, at(2)));
   assert_eq(frames_in(begun.bytes).map(shown), ["GOAWAY 2147483647 NO_ERROR", "PING"]);
   assert(!finished(begun.connection), None);
-  let late = after(
+  let late = serve_result(
     { ..s, connection: begun.connection, frames: [] },
     receive(
       begun.connection,
@@ -4734,7 +4756,7 @@ test "a drain accepts the streams sent before its PING returns, and only those" 
     3,
   );
   assert_eq(late.frames, ["GOAWAY 3 NO_ERROR", "HEADERS 3", "DATA 3 6 END_STREAM"]);
-  let ignored = after(late, receive(late.connection, get(5, "/"), at(4)), echo, 4);
+  let ignored = serve_result(late, receive(late.connection, get(5, "/"), at(4)), echo, 4);
   assert_eq(ignored.frames, late.frames);
   assert(finished(ignored.connection), None)
 }
@@ -4747,10 +4769,15 @@ test "a drain whose PING never returns names the last stream after drain_ms" {
   );
   let begun = take_output(drain(s.connection, at(2)));
   assert_eq(deadline(begun.connection), Some(at(1002)));
-  let named = ticked({ ..s, connection: begun.connection, frames: [] }, 1002);
+  let named = serve_tick({ ..s, connection: begun.connection, frames: [] }, 1002);
   assert_eq(named.frames, ["GOAWAY 1 NO_ERROR"]);
   assert(!finished(named.connection), None);
-  let done = after(named, receive(named.connection, data(1, b"", true), at(1003)), echo, 1003);
+  let done = serve_result(
+    named,
+    receive(named.connection, data(1, b"", true), at(1003)),
+    echo,
+    1003,
+  );
   assert_eq(done.frames, ["GOAWAY 1 NO_ERROR", "HEADERS 1", "DATA 1 6 END_STREAM"]);
   assert(finished(done.connection), None)
 }
@@ -4758,25 +4785,32 @@ test "a drain whose PING never returns names the last stream after drain_ms" {
 // --- Tests: a client and a server ------------------------------------------------------
 
 /// A client and a server joined by the bytes each has sent and the other not yet read.
-type Ends = {
+type ConnectedPair = {
   client: Connection,
   server: Connection,
   up: Bytes,
-  down: Bytes,
+  to_client: Bytes,
   events: List<Event>,
   step: Int,
 }
 
-fn joined(l: Limits) -> Ends / {abort.raise} =
-  { client: client(l, at(0)), server: server(l, at(0)), up: b"", down: b"", events: [], step: 0 }
+fn connected_pair(l: Limits) -> ConnectedPair / {abort.raise} =
+  {
+    client: client(l, at(0)),
+    server: server(l, at(0)),
+    up: b"",
+    to_client: b"",
+    events: [],
+    step: 0,
+  }
 
 /// How many of the `n` waiting octets the delivery at step `i` carries: the next value from `cuts`,
 /// as 1 to 200, or all of them when `cuts` has no value.
 fn piece(cuts: List<Int>, i: Int, n: Int) -> Int / {abort.raise} =
   if cuts == [] { n } else { min(n, 1 + (cuts.at_or(i % cuts.len(), 0) % 200 + 200) % 200) }
 
-fn asked(e: Ends, reqs: List<Request>) -> Ends / {abort.raise} =
-  reqs.fold(e, |x: Ends, r: Request|
+fn send_requests(e: ConnectedPair, reqs: List<Request>) -> ConnectedPair / {abort.raise} =
+  reqs.fold(e, |x: ConnectedPair, r: Request|
     match request(x.client, r, at(x.step)) {
       Some(sent) -> { ..x, client: sent.connection },
       None -> x,
@@ -4786,18 +4820,18 @@ fn asked(e: Ends, reqs: List<Request>) -> Ends / {abort.raise} =
 /// part of what is waiting each way, as `cuts` decides, and `app` responds to each request as it
 /// arrives.
 fn carried(
-  e: Ends,
+  e: ConnectedPair,
   app: (Request) -> Response / {abort.raise},
   cuts: List<Int>,
   budget: Int,
-) -> Ends / {abort.raise} =
-  iterate(e, budget + 1, |x: Ends| {
+) -> ConnectedPair / {abort.raise} =
+  iterate(e, budget + 1, |x: ConnectedPair| {
     let c = take_output(x.client);
     let s = take_output(x.server);
     let up = x.up.concat(c.bytes);
-    let down = x.down.concat(s.bytes);
+    let down = x.to_client.concat(s.bytes);
     if (up.len() == 0 && down.len() == 0) || x.step >= budget {
-      Stop({ ..x, client: c.connection, server: s.connection, up: up, down: down })
+      Stop({ ..x, client: c.connection, server: s.connection, up: up, to_client: down })
     } else {
       let n = piece(cuts, x.step, up.len());
       let heard = receive(s.connection, up.slice(0, n), at(x.step + 1));
@@ -4807,7 +4841,7 @@ fn carried(
         client: back.connection,
         server: returned_all(heard.connection, heard.events, app, x.step + 1),
         up: up.slice(n, up.len()),
-        down: down.slice(m, down.len()),
+        to_client: down.slice(m, down.len()),
         events: x.events.concat(back.events),
         step: x.step + 1,
       })
@@ -4827,7 +4861,11 @@ fn results(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
 test "a client's requests reach a server, and the responses come back on their streams" {
   let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
   let e = carried(
-    asked(joined(default_limits()), [asking("GET", "/a", b""), posted, asking("HEAD", "/c", b"")]),
+    send_requests(connected_pair(default_limits()), [
+      asking("GET", "/a", b""),
+      posted,
+      asking("HEAD", "/c", b""),
+    ]),
     echo,
     [],
     50,
@@ -4844,7 +4882,7 @@ test "a client's requests reach a server, and the responses come back on their s
 test "a request's trailers reach the server's application" {
   let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
   let e = carried(
-    asked(joined(default_limits()), [posted]),
+    send_requests(connected_pair(default_limits()), [posted]),
     |r: Request|
       plain_text(200, match first_value(r.trailers, "x-sum") { Some(v) -> v, None -> "none" }),
     [],
@@ -4879,7 +4917,7 @@ test "a client rejects a response whose head is malformed, and a server's PUSH_P
 }
 
 test "a client learns which of its streams a GOAWAY left unprocessed, and opens no more" {
-  let opened_two = asked(joined(default_limits()), [
+  let opened_two = send_requests(connected_pair(default_limits()), [
     asking("GET", "/a", b""),
     asking("GET", "/b", b""),
   ]);
@@ -4897,7 +4935,7 @@ test "a client learns which of its streams a GOAWAY left unprocessed, and opens 
 }
 
 /// A response with as many octets as the target names, such as `/50`.
-fn sized(r: Request) -> Response / {abort.raise} =
+fn response_of_size(r: Request) -> Response / {abort.raise} =
   {
     status: 200,
     headers: Map::new(),
@@ -4946,7 +4984,7 @@ test "a server sends no more DATA than its client's windows allow, however they 
       );
       let start = take_output(server(default_limits(), at(0)));
       let first = receive(start.connection, opening([InitialWindowSize(w)]).concat(gets), at(1));
-      let out = take_output(returned_all(first.connection, first.events, sized, 1));
+      let out = take_output(returned_all(first.connection, first.events, response_of_size, 1));
       let opened_ledger = tallied(
         { connection: out.connection, sent: Map::new(), granted: Map::new(), held: true },
         out.bytes,
@@ -4983,7 +5021,7 @@ fn spawned(
   match events {
     [] -> (),
     [Requested(q), ..rest] -> {
-      task.spawn(|| task.send(inbox, (q.stream, sized(q.request))));
+      task.spawn(|| task.send(inbox, (q.stream, response_of_size(q.request))));
       spawned(rest, inbox)
     },
     [_, ..rest] -> spawned(rest, inbox),
@@ -4994,10 +5032,10 @@ fn spawned(
 /// without waiting, and waits for one only when no bytes are left to carry. The schedule decides
 /// where among the steps each response lands.
 fn multiplexed(
-  e: Ends,
+  e: ConnectedPair,
   inbox: Chan<(Int, Response)>,
   fuel: Int,
-) -> Ends / {task.spawn, task.send, task.select, task.recv, abort.raise} =
+) -> ConnectedPair / {task.spawn, task.send, task.select, task.recv, abort.raise} =
   if fuel <= 0 || results(e.events).len() >= 2 { e } else {
     let c = take_output(e.client);
     let s = take_output(e.server);
@@ -5025,7 +5063,7 @@ test "two responses larger than their windows finish under every interleaving of
     let inbox = task.channel(4);
     let l = { ..default_limits(), initial_window: 40 };
     let e = multiplexed(
-      asked(joined(l), [asking("GET", "/50", b""), asking("GET", "/45", b"")]),
+      send_requests(connected_pair(l), [asking("GET", "/50", b""), asking("GET", "/45", b"")]),
       inbox,
       40,
     );

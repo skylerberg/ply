@@ -33,7 +33,7 @@ import compiler.emit.lower.representation (representation_of, typed_convention,
                                            width_representation)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, unreachable, fresh, bound,
                                  bound_as, enter_block, pair_words, exit_block, type_of,
-                                 represented_as, noted, set_join, joined, short_circuit,
+                                 represented_as, with_need, set_join, joined, short_circuit,
                                  deferred_to_specialisation, has_unknown_part)
 import compiler.emit.lower.data (constructed_as, field)
 import compiler.emit.lower.marshalling (left_to_callers, blake3_of, scalar_encoding, concatenated)
@@ -113,7 +113,7 @@ pub fn unary(
             at,
           ),
         SumOperands(t) -> if op == b"neg" && numeric_sum(context.setting.constructors, t) {
-          stated(context, o.st, op, [o.arg], [t], t, at)
+          numeric_function_call(context, o.st, op, [o.arg], [t], t, at)
         } else { fail_missing_operator(o.st, op) },
         _ -> fail_missing_operator(o.st, op),
       }
@@ -195,7 +195,7 @@ fn binary_by_class(
         }
       } else { compared_by_order(context, l, r, op, ty, at) },
       SumOperands(t) -> if !eq && numeric_sum(context.setting.constructors, t) && arithmetic(op) {
-        stated(context, r.st, op, [l.arg, r.arg], [t, t], t, at)
+        numeric_function_call(context, r.st, op, [l.arg, r.arg], [t, t], t, at)
       } else if eq {
         equal_by(
           context,
@@ -207,7 +207,7 @@ fn binary_by_class(
           at,
         )
       } else { compared_by_order(context, l, r, op, ty, at) },
-      WalkedOperands(t) -> if eq {
+      ContainerOperands(t) -> if eq {
         equal_by(
           context,
           r.st,
@@ -399,8 +399,9 @@ pub fn scalar_builtin_call(
         ordered(context, st, name, a, b, at)
       } else if name == b"min" || name == b"max" {
         min_or_max(context, st, name == b"max", a, b, at)
-      } else if name == b"reflect" || name == b"shown" { reflected(context, st, name, a, at) }
-      else if name == b"?encoded" || name == b"digest" {
+      } else if name == b"reflect" || name == b"shown" {
+        reflect_to_value(context, st, name, a, at)
+      } else if name == b"?encoded" || name == b"digest" {
         encoded(context, st, name == b"digest", a, at)
       } else if name == b"?same" {
         let x = represented_as({ st: st, arg: a }, AsWord, at);
@@ -430,12 +431,12 @@ pub fn scalar_builtin_call(
         bound(context, x.st, int_type(), Primitive({ op: b"bits", on: AsFloat, args: [x.arg] }), at)
       } else if float_function(name) != None { float_called(st, name, args, at) }
       else if float_exact(name) != None { float_computed(context, st, name, a, at) }
-      else if decimal_conversion(name) { decimal_converted(context, st, name, a, at) }
-      else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
+      else if is_decimal_conversion(name) { decimal_converted(context, st, name, a, at) }
+      else if wrapping(name) || is_saturating_operation(name) || name.starts_with(b"checked_") {
         width_arithmetic(context, st, name, args, at)
       } else if name == b"to_int" { to_int_call(context, st, args, at) }
       else if name == b"?numeric_binary" || name == b"?numeric_unary" {
-        witnessed_operator(context, st, name, args, at)
+        indexed_numeric_operator(context, st, name, args, at)
       } else if name == b"?stated_witness" { witness_value(context, st, a, at) } else {
         match of_int_width(name) {
           Some(w) -> {
@@ -466,7 +467,7 @@ pub fn scalar_builtin_call(
     },
   }
 
-pub fn decimal_conversion(name: Bytes) -> Bool =
+pub fn is_decimal_conversion(name: Bytes) -> Bool =
   name == b"Decimal::of_int" || name == b"Decimal::scale"
 
 fn decimal_converted(
@@ -562,7 +563,7 @@ type OperatorClass =
   | TextOperands
   | NullaryOperands(Type)
   | SumOperands(Type)
-  | WalkedOperands(Type)
+  | ContainerOperands(Type)
   | RecordOperands(List<Field>)
   | WordOperands(Type)
 
@@ -574,7 +575,7 @@ pub fn comparison_built(constructors: Constructors, t: Type, order: Bool) -> Boo
         FunctionType(_) -> if order { Stop(false) } else { Continue({ ..s, todo: rest }) },
         _ -> match class_of(constructors, x) {
           RecordOperands(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
-          WalkedOperands(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
+          ContainerOperands(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
           SumOperands(w) -> match w {
             NamedType(c) -> if s.seen.contains(c.name) || keyed_sum(constructors, c.name) {
               Continue({ ..s, todo: rest })
@@ -607,8 +608,8 @@ fn class_of(constructors: Constructors, ty: Type) -> OperatorClass =
     NominalType(x) -> if x.fields.len() > 0 && !has_variables(ty) { RecordOperands(x.fields) }
     else { WordOperands(ty) },
     NamedType(c) -> if c.args.len() > 0 {
-      if is_walked_container(ty) || is_walked_columns(ty) || is_result(ty)
-          || (is_option(ty) && !has_variables(ty)) { WalkedOperands(ty) }
+      if is_walked_container(ty) || is_columns_type(ty) || is_result(ty)
+          || (is_option(ty) && !has_variables(ty)) { ContainerOperands(ty) }
       else if generic_sum(constructors, ty) { SumOperands(ty) }
       else { WordOperands(ty) }
     } else if is_int(ty) { IntOperands }
@@ -666,7 +667,7 @@ fn equal_by(
   if op == b"ne" { negation(context, e, at) } else { e }
 }
 
-pub fn stated(
+pub fn numeric_function_call(
   context: Context,
   st: Lowering,
   op: Bytes,
@@ -816,7 +817,7 @@ fn open_at(
     at,
   )
 
-fn kept_sign(st: Lowering, a: Arg, b: Arg, at: Span) -> LoweredValue = {
+fn kept_order(st: Lowering, a: Arg, b: Arg, at: Span) -> LoweredValue = {
   let l = represented_as({ st: st, arg: a }, AsWord, at);
   let r = represented_as({ st: l.st, arg: b }, AsWord, at);
   bound_as(
@@ -886,7 +887,7 @@ fn root_order(
   match class_of(context.setting.constructors, ty) {
     NullaryOperands(t) -> at_root(Order, t),
     SumOperands(t) -> at_root(Order, t),
-    WalkedOperands(t) -> at_root(ContainerWalk(b"ordered"), t),
+    ContainerOperands(t) -> at_root(ContainerWalk(b"ordered"), t),
     WordOperands(t) -> if is_option(t) && !has_variables(t) {
       at_root(ContainerWalk(b"ordered"), t)
     } else { None },
@@ -936,7 +937,7 @@ fn order_sign(
         },
         _ -> if representation_of(context.setting, ty) == AsUnit {
           { st: r.st, arg: IntOperand(0) }
-        } else if ty == kept_type() { kept_sign(r.st, l.arg, r.arg, at) }
+        } else if ty == kept_type() { kept_order(r.st, l.arg, r.arg, at) }
         else { unreachable(b"an order of a type none is derived for: ".concat(encode_type(ty))) },
       },
     }
@@ -970,7 +971,7 @@ fn total_key(context: Context, f: LoweredValue, at: Span) -> LoweredValue = {
   )
 }
 
-fn reflected(
+fn reflect_to_value(
   context: Context,
   st: Lowering,
   name: Bytes,
@@ -1002,7 +1003,7 @@ fn reflected(
       else if c.name == secret_name() { unary_primitive(b"std.value.VSecret") }
       else if has_unknown_part(ty) { open_at(context, st, ty, [a], value_type, at) }
       else if written_sum(context.setting.constructors, c) || is_walked_container(ty)
-          || is_walked_columns(ty) { type_operation_call(context, st, op, ty, a, at) }
+          || is_columns_type(ty) { type_operation_call(context, st, op, ty, a, at) }
       else if c.args.len() > 0 { none() }
       else if is_int(ty) { value(b"std.value.VInt") }
       else if is_bool(ty) { value(b"std.value.VBool") }
@@ -1076,7 +1077,7 @@ fn encoded(
   let rooted_by = match ty {
     NamedType(c) ->
       written_sum(context.setting.constructors, c) || is_walked_container(ty)
-        || is_walked_columns(ty),
+        || is_columns_type(ty),
     RecordType(_) -> true,
     NominalType(_) -> true,
     _ -> false,
@@ -1108,7 +1109,12 @@ fn type_operation_call(
     at,
   )
 
-pub fn let_go(context: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} = {
+pub fn release_value(
+  context: Context,
+  st: Lowering,
+  a: Arg,
+  at: Span,
+) -> LoweredValue / {abort.raise} = {
   let ty = type_of(a);
   if has_variables(ty) {
     deferred_to_specialisation(
@@ -1119,13 +1125,13 @@ pub fn let_go(context: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue 
       at,
     )
   } else {
-    let h = let_go_evidence(context, ty);
+    let h = release_function_evidence(context, ty);
     let w = passed_evidence_arguments(st, h, at);
     let words = { count: h.words.len(), args: w.args };
     root_call_with_words(
       context,
       w.st,
-      let_go_root(context, ty),
+      release_function_root(context, ty),
       [a],
       [ty],
       unit_type(),
@@ -1143,14 +1149,14 @@ pub fn unwound(
   at: Span,
 ) -> { st: Lowering, unwound: Unwinding } / {abort.raise} = {
   let ty = type_of(a);
-  let h = let_go_evidence(context, ty);
+  let h = release_function_evidence(context, ty);
   let w = passed_evidence_arguments(note_exact_types(st, ty), h, at);
   {
     st: w.st,
     unwound: {
       arg: a,
       words: w.args,
-      callee: let_go_root(context, ty),
+      callee: release_function_root(context, ty),
       convention: with_evidence_parameters(
         typed_convention(context.setting.constructors, [ty], unit_type()),
         0,
@@ -1160,10 +1166,10 @@ pub fn unwound(
   }
 }
 
-fn let_go_root(context: Context, ty: Type) -> RootKey =
+fn release_function_root(context: Context, ty: Type) -> RootKey =
   keys::generated_key(ReleaseResource, ty, context.setting.module)
 
-fn let_go_evidence(context: Context, ty: Type) -> EvidenceArguments / {abort.raise} =
+fn release_function_evidence(context: Context, ty: Type) -> EvidenceArguments / {abort.raise} =
   scheme_evidence_arguments(
     context,
     Some(
@@ -1188,7 +1194,7 @@ fn width_arithmetic(
   match class_of(context.setting.constructors, ty) {
     WidthOperands(w) -> if w.bits > 64 {
       if checked {
-        checked_in_place(
+        checked_operation(
           context,
           st,
           name,
@@ -1209,10 +1215,10 @@ fn width_arithmetic(
           at,
         )
       }
-    } else if wrapping(name) || (saturating(name) && w.bits == 64) {
+    } else if wrapping(name) || (is_saturating_operation(name) && w.bits == 64) {
       binary_primitive(context, { st: st, arg: a }, { st: st, arg: b }, name, AsFixed(w), ty, at)
     } else if w.bits == 64 {
-      checked_in_place(
+      checked_operation(
         context,
         st,
         name,
@@ -1225,7 +1231,7 @@ fn width_arithmetic(
     } else if checked { checked_width(context, st, name, a, b, w, result, at) } else {
       binary_primitive(context, { st: st, arg: a }, { st: st, arg: b }, name, AsFixed(w), ty, at)
     },
-    IntOperands -> if wrapping(name) || saturating(name) {
+    IntOperands -> if wrapping(name) || is_saturating_operation(name) {
       let x = represented_as({ st: st, arg: a }, AsInt, at);
       let y = if has_count_operand(name) { { st: x.st, arg: b } }
       else { represented_as({ st: x.st, arg: b }, AsInt, at) };
@@ -1238,7 +1244,7 @@ fn width_arithmetic(
       )
     } else {
       let word = AsFixed({ bits: 64, signed: true });
-      checked_in_place(context, st, name, a, b, { ty: ty, held: AsInt, on: word }, result, at)
+      checked_operation(context, st, name, a, b, { ty: ty, held: AsInt, on: word }, result, at)
     },
     _ -> unreachable(b"an integer's builtin at a type that is no integer: ".concat(name)),
   }
@@ -1304,7 +1310,7 @@ fn to_int_call(
     _ -> unreachable(b"`to_int` called other than with a witness and a value"),
   }
 
-fn witnessed_operator(
+fn indexed_numeric_operator(
   context: Context,
   st: Lowering,
   name: Bytes,
@@ -1312,7 +1318,7 @@ fn witnessed_operator(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let scalar = |t: Type|
-    match t { VariableType(v) -> noted(st, { var: v, reads: Scalar }), _ -> st };
+    match t { VariableType(v) -> with_need(st, { var: v, reads: Scalar }), _ -> st };
   match args {
     [IntOperand(k), _, x, y] -> match numeric_operators().at(k) {
       None -> unreachable(b"an operator over a witness numbered as none is"),
@@ -1406,7 +1412,7 @@ fn checked_width(
   some_if(context, fits, narrowed, option, at)
 }
 
-fn checked_in_place(
+fn checked_operation(
   context: Context,
   st: Lowering,
   name: Bytes,
@@ -1481,8 +1487,8 @@ fn fail_missing_operator(st: Lowering, op: Bytes) -> LoweredValue / {abort.raise
 
 fn note_exact_types(st: Lowering, ty: Type) -> Lowering =
   match ty {
-    VariableType(v) -> if v < 0 { st } else { noted(st, { var: v, reads: Exact }) },
-    _ -> type_variables(ty).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
+    VariableType(v) -> if v < 0 { st } else { with_need(st, { var: v, reads: Exact }) },
+    _ -> type_variables(ty).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Exact })),
   }
 
 fn has_count_operand(op: Bytes) -> Bool = shift(op) || op == b"rotl" || op == b"rotr"
@@ -1491,14 +1497,14 @@ fn wrapping(name: Bytes) -> Bool =
   name == b"wrap_add" || name == b"wrap_sub" || name == b"wrap_mul" || name == b"rotr"
     || name == b"rotl"
 
-fn saturating(name: Bytes) -> Bool =
+fn is_saturating_operation(name: Bytes) -> Bool =
   name == b"saturating_add" || name == b"saturating_sub" || name == b"saturating_mul"
 
 fn arity(name: Bytes) -> Int =
   if name == b"compare" || name == b"compare_values" || name == b"?same" || name == b"min"
       || name == b"max"
       || wrapping(name)
-      || saturating(name)
+      || is_saturating_operation(name)
       || (name.starts_with(b"checked_") && name != b"checked_neg") { 2 }
   else if name == b"to_int" { 2 }
   else if name == b"?numeric_binary" { 4 }
@@ -1603,6 +1609,6 @@ fn is_option(t: Type) -> Bool = option_item(t) != None
 pub fn is_walked_container(t: Type) -> Bool =
   !has_variables(t) && (list_item(t) != None || array_element(t) != None || map_parts(t) != None)
 
-pub fn is_walked_columns(t: Type) -> Bool = !has_variables(t) && columns_row(t) != None
+pub fn is_columns_type(t: Type) -> Bool = !has_variables(t) && columns_row(t) != None
 
 fn is_result(t: Type) -> Bool = !has_variables(t) && result_parts(t) != None

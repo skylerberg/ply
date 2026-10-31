@@ -241,7 +241,7 @@ fn match_length(data: Bytes, seen: Int, i: Int, n: Int) -> Int / {abort.raise} =
   if seen < 0 || i - seen > 32768 || data.at(seen) != data.at(i)
       || data.at(seen + 1) != data.at(i + 1)
       || data.at(seen + 2) != data.at(i + 2) { 0 }
-  else { data.agreeing(seen, i, min(258, n - i), 3) }
+  else { data.match_length(seen, i, min(258, n - i), 3) }
 
 /// Each position from `from` to `to` into the table, so a later match can find the bytes a match
 /// covered.
@@ -667,7 +667,7 @@ fn peek(src: Bytes, bit: Int) -> Int / {abort.raise} =
 const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_of_int))
 
 /// What the extra bits of a length code and of a distance code span, built once per stream.
-type Bases = { lengths: Array<Int>, distances: Array<Int> }
+type ExtraBitBases = { lengths: Array<Int>, distances: Array<Int> }
 
 type Match = { next: Int, length: Int, dist: Int }
 
@@ -679,7 +679,7 @@ fn match_read(
   bit: Int,
   symbol: Int,
   dist: Table,
-  code_bases: Bases,
+  code_bases: ExtraBitBases,
   base: Int,
 ) -> Match / {gzip.fail, abort.raise} = {
   let span = code_bases.lengths.get(symbol - 257);
@@ -719,7 +719,7 @@ fn decode_symbols(
   bounds: Array<Int>,
   literal: Table,
   dist: Table,
-  code_bases: Bases,
+  code_bases: ExtraBitBases,
   stop: Int,
   left: Int,
 ) -> BlockProgress / {gzip.fail, abort.raise} = {
@@ -772,7 +772,8 @@ fn decode_symbols(
 }
 
 /// The order a dynamic block lists the lengths of its code-length code in.
-fn length_order() -> List<Int> = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+fn code_length_order() -> List<Int> =
+  [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
 
 type Lengths = { bit: Int, lengths: List<Int> }
 
@@ -837,7 +838,7 @@ fn dynamic_read(src: Bytes, end: Int, bit: Int, base: Int) -> Codes / {gzip.fail
   if at + 3 * listed > end { fail(base + (end >>> 3), Truncated) }
   else if literals > 286 || distances > 30 { fail(base + (bit >>> 3), InvalidCodeLengths) } else {
     let order = range(0, listed).fold(zeros(19), |into: List<Int>, i: Int|
-      into.set(length_order().at_or(i, 0), peek(src, at + 3 * i) & 7));
+      into.set(code_length_order().at_or(i, 0), peek(src, at + 3 * i) & 7));
     if unassigned(length_counts(order)) != 0 { fail(base + (at >>> 3), InvalidCodeLengths) } else {
       let read = lengths_read(
         src,
@@ -883,7 +884,7 @@ type DecoderState = {
   left: Int,
   literal: Table,
   dist: Table,
-  spans: Bases,
+  spans: ExtraBitBases,
   opened: Int,
   members: Int,
   sum: checksum::State,
@@ -1107,7 +1108,7 @@ fn decode_block(d: Decoder, goal: Int) -> Decoder / {gzip.fail, abort.raise} = {
 }
 
 /// A stored block's bytes, as many as the input contains.
-fn stored_bytes(d: Decoder) -> Decoder = {
+fn copy_stored_bytes(d: Decoder) -> Decoder = {
   let core = d.core;
   let from = core.bit >>> 3;
   let count = min(core.left, d.input.len() - 16 - from);
@@ -1128,7 +1129,7 @@ fn stored_bytes(d: Decoder) -> Decoder = {
 /// One step of a reader. A reader that needs more input than it has reports it in `need`.
 fn step(d: Decoder, goal: Int) -> Decoder / {gzip.fail, abort.raise} =
   if d.core.phase == 2 { decode_block(d, goal) }
-  else if d.core.phase == 3 { stored_bytes(d) } else {
+  else if d.core.phase == 3 { copy_stored_bytes(d) } else {
     let read: Result<DecoderState, Error> = try { read_header_or_trailer(d) };
     match read {
       Ok(core) -> { ..d, core: core },
@@ -1154,12 +1155,12 @@ fn check_ended(d: Decoder) -> Decoder / {gzip.fail} = {
 }
 
 /// The bytes written and not yet returned.
-fn pending(d: Decoder) -> Bytes / {abort.raise} =
+fn unreturned_bytes(d: Decoder) -> Bytes / {abort.raise} =
   if d.core.sent == 0 { d.history } else { d.history.slice(d.core.sent, d.history.len()) }
 
 /// The bytes a stream in the framing `format` contains, at most `limit` of them.
 fn decompress(data: Bytes, format: Format, limit: Int) -> Bytes / {gzip.fail, abort.raise} =
-  pending(
+  unreturned_bytes(
     check_ended(pump(decoder(format, limit, data), 0x3FFF_FFFF_FFFF_FFFF, 8 * data.len() + 64)),
   )
 
@@ -1311,11 +1312,11 @@ pub fn allowing(r: Reader, more: Int) -> Reader =
 
 // --- Tests ------------------------------------------------------------------
 
-fn checked() -> Bytes =
+fn sample_sentence() -> Bytes =
   b"Ply checks every effect a program performs, and a test that reads no host is cached. "
 
 fn prose() -> Bytes =
-  checked().repeat(3).concat(
+  sample_sentence().repeat(3).concat(
     b"The rows name the resources; the hashes name the definitions; nothing else decides a re-run. ",
   ).repeat(
     2,
@@ -1409,7 +1410,7 @@ fn gzip_files() -> List<Fixture> =
     {
       name: "an extra field, a name, a comment and a header CRC",
       packed: "1f8b081e00f1536502030600417002006f6b70726f73652e747874006120636f6d6d656e740058d20dccd10980300c05c055de00e22cae10d2572b6a539220747bfb7b1f773c13daa877801f7d82b5521382e176babc18f46afec606e965793212d924e19412e886668bae80caaaca8e1ffd137faf55000000",
-      plain: checked(),
+      plain: sample_sentence(),
     },
   ]
 
@@ -1487,7 +1488,7 @@ fn two_members() -> Bytes / {abort.raise} =
   )
 
 test "a file of two members reads as one stream, under one limit" {
-  let both = fox().concat(checked());
+  let both = fox().concat(sample_sentence());
   assert_eq(gunzip(two_members(), both.len()), both);
   assert(over(try_gunzip(two_members(), both.len() - 1)));
   assert(over(try_gunzip(two_members(), fox().len())))
@@ -1632,7 +1633,7 @@ test "a header's fields are skipped, bounded, and its CRC checked" {
   let every = Bytes::of_hex(
     "1f8b081e00f1536502030600417002006f6b70726f73652e747874006120636f6d6d656e740058d20dccd10980300c05c055de00e22cae10d2572b6a539220747bfb7b1f773c13daa877801f7d82b5521382e176babc18f46afec606e965793212d924e19412e886668bae80caaaca8e1ffd137faf55000000",
   );
-  assert_eq(try_gunzip(every, 85), Ok(checked()));
+  assert_eq(try_gunzip(every, 85), Ok(sample_sentence()));
   // The CRC follows the comment's zero, at byte 38, and covers every byte before it.
   rejected(try_gunzip(every.with_byte(38, 0), 85), 38, HeaderChecksumMismatch);
   rejected(try_gunzip(every.with_byte(20, 0x50), 85), 38, HeaderChecksumMismatch)
@@ -1663,7 +1664,7 @@ test "unzlib reports why a stream is not zlib, and where" {
 }
 
 /// The lengths short of `whole` at which `read` returns anything but a truncation error.
-fn cut_wrongly(
+fn missed_truncations(
   whole: Bytes,
   read: (Bytes) -> Result<Bytes, Error> / {abort.raise},
 ) -> List<Int> / {abort.raise} =
@@ -1674,14 +1675,14 @@ fn cut_wrongly(
     })
 
 test "cut short anywhere, {f.name} is rejected as truncated" for f: Fixture in gzip_files() {
-  assert_eq(cut_wrongly(Bytes::of_hex(f.packed), |b: Bytes| try_gunzip(b, 1000)), [])
+  assert_eq(missed_truncations(Bytes::of_hex(f.packed), |b: Bytes| try_gunzip(b, 1000)), [])
 }
 
 test "cut short anywhere, a zlib stream of {f.name} is rejected as truncated" for f: Fixture in zlib_streams(
-  ) { assert_eq(cut_wrongly(Bytes::of_hex(f.packed), |b: Bytes| try_unzlib(b, 1000)), []) }
+  ) { assert_eq(missed_truncations(Bytes::of_hex(f.packed), |b: Bytes| try_unzlib(b, 1000)), []) }
 
 test "cut short anywhere, a raw stream of {f.name} is rejected as truncated" for f: Fixture in deflate_streams(
-  ) { assert_eq(cut_wrongly(Bytes::of_hex(f.packed), |b: Bytes| try_inflate(b, 70000)), []) }
+  ) { assert_eq(missed_truncations(Bytes::of_hex(f.packed), |b: Bytes| try_inflate(b, 70000)), []) }
 
 /// `data` with bit `bit` flipped.
 fn flipped(data: Bytes, bit: Int) -> Bytes / {abort.raise} =
@@ -1720,7 +1721,7 @@ test "a stream far over the limit is rejected the same way however far over it i
 }
 
 /// `n` bytes of one sentence over and over.
-fn text(n: Int) -> Bytes / {abort.raise} = checked().repeat(n / 85 + 1).slice(0, n)
+fn sample_bytes(n: Int) -> Bytes / {abort.raise} = sample_sentence().repeat(n / 85 + 1).slice(0, n)
 
 fn formats() -> List<Format> = [Deflate, Zlib, Gzip]
 
@@ -1750,7 +1751,10 @@ test "an empty stream is its framing and one empty block, a chunk at a time as w
   assert_eq(gathered(encoded(seq::once(b""), Zlib)), zlib(b""));
   assert_eq(gathered(encoded(seq::empty(), Deflate)), Bytes::of_hex("0300"));
   assert_eq(gathered(decoded(seq::once(gzip(b"")), Gzip, 0)), b"");
-  assert_eq(gathered(decoded(seq::slices(two_members(), 3), Gzip, 1000)), fox().concat(checked()))
+  assert_eq(
+    gathered(decoded(seq::slices(two_members(), 3), Gzip, 1000)),
+    fox().concat(sample_sentence()),
+  )
 }
 
 /// What the reader of `format` returns for `data` read whole, or why it failed.
@@ -1773,7 +1777,7 @@ test "writing a chunk at a time matches writing whole, and reading a chunk at a 
     |x: Bytes, cuts: List<Int>, which: Int| {
       let format = formats().at_or((which & 0x7FFF_FFFF) % 3, Gzip);
       let sizes = cuts.map(|c: Int| c & 7);
-      let plain = Bytes::concat_all([x, checked(), x]);
+      let plain = Bytes::concat_all([x, sample_sentence(), x]);
       let packed = packed_as(format, plain);
       gathered(encoded(seq::of_list(plain.pieces(sizes)), format)) == packed
         && read_chunked(format, packed.pieces(sizes), plain.len()) == Ok(plain)
@@ -1857,14 +1861,14 @@ test "a stream is read in a history of a few times a match's reach, however long
   assert(read.most < 140000, Some(read.most.to_string()));
   // Long enough that the reader checksums bytes it has already dropped, and that the writer drops
   // bytes too.
-  let long = text(400000);
+  let long = sample_bytes(400000);
   assert(gathered(decoded(seq::slices(gzip(long), 3000), Gzip, 400000)) == long);
   assert(gathered(decoded(seq::slices(zlib(long), 3000), Zlib, 400000)) == long);
   assert(gathered(encoded(seq::slices(long, 50000), Gzip)) == gzip(long))
 }
 
 /// `pieces` written one `write` at a time, then finished: all the bytes, the last ones included.
-fn written_in(pieces: List<Bytes>, format: Format) -> Bytes / {abort.raise} = {
+fn write_in_pieces(pieces: List<Bytes>, format: Format) -> Bytes / {abort.raise} = {
   let ran = pieces.fold(
     { out: [], w: writer(format) },
     |s: { out: List<Bytes>, w: Writer }, p: Bytes| {
@@ -1896,9 +1900,9 @@ test "a stream written a piece at a time is the stream written whole, and reads 
     Zlib,
     Gzip,
   ] {
-  let long = text(200000);
+  let long = sample_bytes(200000);
   let pieces = seq::to_list(seq::slices(long, 7000), 100);
-  let packed = written_in(pieces, f);
+  let packed = write_in_pieces(pieces, f);
   assert_eq(packed, packed_as(f, long));
   let back = read_in(seq::to_list(seq::slices(packed, 999), 1000), f, 200000);
   assert_eq(back, { out: long, ended: true });
@@ -1909,7 +1913,7 @@ test "a stream written a piece at a time is the stream written whole, and reads 
 }
 
 test "a flush ends on a byte boundary with an empty stored block, and a reader gets all before it" {
-  let first = text(100000);
+  let first = sample_bytes(100000);
   let second = first.slice(500, 3000);
   let one = flush(write(writer(Deflate), first, Deflate).next, Deflate);
   let wrote = write(writer(Deflate), first, Deflate).out.concat(one.out);

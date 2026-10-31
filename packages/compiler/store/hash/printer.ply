@@ -45,7 +45,7 @@ import compiler.store.hash.stored (Reference, Hashed, Member, Itself, ByName, Fr
                                    EffectReference, Declared, EffectUnbound, TypeParameter,
                                    TypeDefined, TypeUnbound, Type, Applied, AppliedOver, Function,
                                    Fields, UnitType, EffectParameter, EffectVariableName, Effects,
-                                   Moded, OfOperation, Wild, Bind, Again, LiteralPattern,
+                                   Moded, OfOperation, Wild, Bind, Rebound, LiteralPattern,
                                    RangePattern, ConstructorPattern, RecordPattern, ListPattern,
                                    OrPattern, InFull, Among, Constant, Unwritten, Variable, Binary,
                                    Unary, Lambda, Call, OnValue, If, Match, Record, RecordUpdate,
@@ -149,7 +149,7 @@ type Part = {
 type Layout = {
   parts: List<Part>,
   by_hash: Map<Bytes, List<Slot>>,
-  meant: Map<Bytes, Map<Bytes, Bool>>,
+  source_names: Map<Bytes, Map<Bytes, Bool>>,
 }
 
 type BodyPrinter = {
@@ -157,17 +157,17 @@ type BodyPrinter = {
   part: Int,
   own: Bytes,
   graph: Map<Bytes, List<Bytes>>,
-  meant: Map<Bytes, Bool>,
+  source_names: Map<Bytes, Bool>,
 }
 
-fn meant_key(name: Bytes, hash: Bytes) -> Bytes = hash.concat(name)
+fn source_names_key(name: Bytes, hash: Bytes) -> Bytes = hash.concat(name)
 
 type NameState = {
   imports: Map<Bytes, Bytes>,
   missing: Map<Bytes, Bool>,
   slots: Map<Bytes, Int>,
   picks: List<Choice>,
-  picked: Int,
+  call_index: Int,
 }
 
 type Depth = { values: Int, types: Int, effects: Int, labels: Int }
@@ -322,7 +322,7 @@ fn named(
 ) -> NamedNode<QName> / {abort.raise} = {
   let meant = |slot: Slot| {
     let part = printer.layout.parts.get(slot.part);
-    printer.meant.contains(qualify(part.module, part.names.get(slot.class)))
+    printer.source_names.contains(qualify(part.module, part.names.get(slot.class)))
   };
   let told = match printer.layout.by_hash.get(target.hash) {
     Some(slots) -> slots.filter(meant).len() > 0,
@@ -364,7 +364,11 @@ fn reference_named(
   named(printer, target.naming, target.node, constructor)
 }
 
-fn seen(printer: BodyPrinter, naming: NameState, target: Target) -> NameState / {abort.raise} =
+fn with_import(
+  printer: BodyPrinter,
+  naming: NameState,
+  target: Target,
+) -> NameState / {abort.raise} =
   if target.class >= 0 { naming } else {
     match pick(
         printer.layout,
@@ -682,7 +686,7 @@ fn effects_of(
   }
 }
 
-fn width_name(at: Int) -> Bytes / {abort.raise} =
+fn integer_width_name(at: Int) -> Bytes / {abort.raise} =
   match widths().at(at) {
     Some(width) -> width.name,
     None -> panic("a literal of no width the lexer has"),
@@ -691,8 +695,8 @@ fn width_name(at: Int) -> Bytes / {abort.raise} =
 fn literal_of(literal: Literal) -> SourceLiteral / {abort.raise} =
   match literal {
     IntLiteral(value) -> LiteralInt(value),
-    FixedLiteral(width, bits) -> LiteralFixed(width_name(width), bits),
-    WideLiteral(width, high, low) -> LiteralWide(width_name(width), high, low),
+    FixedLiteral(width, bits) -> LiteralFixed(integer_width_name(width), bits),
+    WideLiteral(width, high, low) -> LiteralWide(integer_width_name(width), high, low),
     BoolLiteral(value) -> LiteralBool(value),
     StringLiteral(text) -> LiteralString(text),
     BytesLiteral(content) -> LiteralBytes(content),
@@ -732,7 +736,7 @@ fn pattern_of(
         depth: { ..depth, values: depth.values + 1 },
         node: PatternVariable({ span: span, name: ident(local_name(depth.values)) }),
       },
-    Again(level) -> if level >= depth.values {
+    Rebound(level) -> if level >= depth.values {
       panic("an alternative names a binder that is not in scope")
     } else {
       {
@@ -861,11 +865,11 @@ fn on_value_of(
   let base = expression_of(printer, naming, depth, call.base);
   let arguments = expressions_of(printer, base.naming, depth, call.arguments);
   let given = fields_of(printer, arguments.naming, depth, call.named);
-  let choice: Choice = match given.naming.picks.at(given.naming.picked) {
+  let choice: Choice = match given.naming.picks.at(given.naming.call_index) {
     Some(found) -> found,
     None -> { named: [] },
   };
-  let after = { ..given.naming, picked: given.naming.picked + 1 };
+  let after = { ..given.naming, call_index: given.naming.call_index + 1 };
   let named_arguments = range(0, given.node.len()).map(|i: Int|
     {
       name: if choice.named.len() == given.node.len() { ident(local_name(choice.named.get(i))) }
@@ -909,7 +913,7 @@ fn on_value_of(
       {
         naming: references.fold(after, |n: NameState, reference: Reference| {
           let target = target_of(printer, n, reference);
-          seen(printer, target.naming, target.node)
+          with_import(printer, target.naming, target.node)
         }),
         node: on_value(call.name),
       },
@@ -1634,7 +1638,7 @@ type Component = {
 
 type Copied = { module: Bytes, names: List<Bytes>, public: List<Bool> }
 
-type Parting = {
+type PartitionState = {
   seen: Map<Bytes, Bool>,
   declared: Map<Bytes, Bytes>,
   parts: List<Part>,
@@ -1723,7 +1727,7 @@ fn named_of(
       },
   )
 
-fn copies(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort.raise} =
+fn split_by_module(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort.raise} =
   if classes.len() == 1 {
     Some(
       classes.get(0).map(|n: Holder| { module: n.module, names: [n.simple], public: [n.public] }),
@@ -1759,64 +1763,70 @@ fn copies(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort.raise} =
       })
   }
 
-fn part_in(
-  acc: Parting,
+fn add_component(
+  acc: PartitionState,
   component: Component,
   named: Map<Bytes, Map<Bytes, Holder>>,
   shipped: List<Bytes>,
-) -> Parting / {abort.raise} = {
+) -> PartitionState / {abort.raise} = {
   let classes = component.hashes.map(|h: Bytes|
     match named.get(h) { Some(m) -> m.values(), None -> [] });
-  let checked: Parting = range(0, component.hashes.len()).fold(acc, |a: Parting, i: Int|
-    match a.bad {
-      Some(_) -> a,
-      None -> {
-        let all = classes.get(i);
-        let h = component.hashes.get(i);
-        if all.len() == 0 {
-          {
-            ..a,
-            bad: some_error(Bytes::concat_all([b"the body `", short_hex(h), b"` has no name"]), []),
-          }
-        } else {
-          let kind = kind_of(
-            component.members.get(i),
-            qualify(all.get(0).module, all.get(0).simple),
-          );
-          if kind == 2 && all.len() > 1 {
+  let checked: PartitionState = range(0, component.hashes.len()).fold(
+    acc,
+    |a: PartitionState, i: Int|
+      match a.bad {
+        Some(_) -> a,
+        None -> {
+          let all = classes.get(i);
+          let h = component.hashes.get(i);
+          if all.len() == 0 {
             {
               ..a,
               bad: some_error(
-                listed(all).concat(
-                  b" are one effect declaration, so a body cannot say which it performs",
-                ),
-                [b"make the declarations differ, or keep one of them"],
+                Bytes::concat_all([b"the body `", short_hex(h), b"` has no name"]),
+                [],
               ),
             }
           } else {
-            all.fold(a, |b: Parting, n: Holder| {
-              let q = qualify(n.module, n.simple);
-              let key = byte_of_int(kind).concat(q);
-              match b.declared.get(key) {
-                Some(other) -> if other == h || is_some(b.bad) { b } else {
-                  {
-                    ..b,
-                    bad: some_error(
-                      Bytes::concat_all([b"`", q, b"` names two different definitions"]),
-                      [],
-                    ),
-                  }
-                },
-                None -> { ..b, declared: b.declared.insert(key, h) },
+            let kind = kind_of(
+              component.members.get(i),
+              qualify(all.get(0).module, all.get(0).simple),
+            );
+            if kind == 2 && all.len() > 1 {
+              {
+                ..a,
+                bad: some_error(
+                  listed(all).concat(
+                    b" are one effect declaration, so a body cannot say which it performs",
+                  ),
+                  [b"make the declarations differ, or keep one of them"],
+                ),
               }
-            })
+            } else {
+              all.fold(a, |b: PartitionState, n: Holder| {
+                let q = qualify(n.module, n.simple);
+                let key = byte_of_int(kind).concat(q);
+                match b.declared.get(key) {
+                  Some(other) -> if other == h || is_some(b.bad) { b } else {
+                    {
+                      ..b,
+                      bad: some_error(
+                        Bytes::concat_all([b"`", q, b"` names two different definitions"]),
+                        [],
+                      ),
+                    }
+                  },
+                  None -> { ..b, declared: b.declared.insert(key, h) },
+                }
+              })
+            }
           }
-        }
+        },
       },
-    });
+  );
   match checked.bad {
     Some(_) -> checked,
-    None -> match copies(classes) {
+    None -> match split_by_module(classes) {
       None ->
         {
           ..checked,
@@ -1904,7 +1914,7 @@ fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout /
           }),
         ))
     }),
-    meant: meant,
+    source_names: meant,
   }
 }
 
@@ -1912,7 +1922,8 @@ fn fresh_naming(
   imports: Map<Bytes, Bytes>,
   missing: Map<Bytes, Bool>,
   picks: List<Choice>,
-) -> NameState = { imports: imports, missing: missing, slots: Map::new(), picks: picks, picked: 0 }
+) -> NameState =
+  { imports: imports, missing: missing, slots: Map::new(), picks: picks, call_index: 0 }
 
 fn print_parts(
   layout: Layout,
@@ -1922,14 +1933,22 @@ fn print_parts(
     |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
       let p = layout.parts.get(u);
       if !p.printed { acc } else {
-        let x = { layout: layout, part: u, own: p.module, graph: acc.graph, meant: Map::new() };
+        let x = {
+          layout: layout,
+          part: u,
+          own: p.module,
+          graph: acc.graph,
+          source_names: Map::new(),
+        };
         let walked = range(0, p.members.len()).fold(
           { imports: Map::new(), missing: acc.missing, texts: [] },
           |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, c: Int| {
             let name = p.names.get(c);
             let printer = {
               ..x,
-              meant: match layout.meant.get(meant_key(qualify(p.module, name), p.hashes.get(c))) {
+              source_names: match layout.source_names.get(
+                  source_names_key(qualify(p.module, name), p.hashes.get(c)),
+                ) {
                 Some(names) -> names,
                 None -> Map::new(),
               },
@@ -1970,7 +1989,7 @@ fn print_tests(
   tests: List<Bytes>,
   missing: Map<Bytes, Bool>,
 ) -> { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> } / {abort.raise} = {
-  let x = { layout: layout, part: 0 - 1, own: b"", graph: g, meant: Map::new() };
+  let x = { layout: layout, part: 0 - 1, own: b"", graph: g, source_names: Map::new() };
   range(0, tests.len()).fold(
     { imports: Map::new(), missing: missing, texts: [] },
     |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, i: Int| {
@@ -2027,14 +2046,14 @@ pub fn print_bodies(
     comps.fold(Map::new(), |acc: Map<Bytes, Bool>, component: Component|
       acc.insert(component.key, true)),
   );
-  let parted: Parting = match n.bad {
+  let parted: PartitionState = match n.bad {
     Some(_) -> { seen: Map::new(), declared: Map::new(), parts: [], bad: n.bad },
     None ->
       comps.fold(
         { seen: Map::new(), declared: Map::new(), parts: [], bad: None },
-        |acc: Parting, component: Component|
+        |acc: PartitionState, component: Component|
           if is_some(acc.bad) || acc.seen.contains(component.id) { acc } else {
-            part_in(
+            add_component(
               { ..acc, seen: acc.seen.insert(component.id, true) },
               component,
               n.named,
@@ -2052,7 +2071,7 @@ pub fn print_bodies(
           Map::new(),
           |acc: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
             acc.insert(
-              meant_key(n.name, n.hash),
+              source_names_key(n.name, n.hash),
               n.names.fold(Map::new(), |held: Map<Bytes, Bool>, name: Bytes|
                 held.insert(name, true)),
             ),

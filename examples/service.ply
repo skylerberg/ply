@@ -72,7 +72,7 @@ pub type Placement = { customer: String, lines: List<Line> }
 /// One shape for every error, so a client parses one document whatever went wrong.
 pub type Problem = { error: String, detail: String }
 
-pub type Health = { service: String, routes: Int }
+pub type Health = { service: String, route_count: Int }
 
 /// The response to a readiness probe, and it is deliberately not `Health`.
 pub type Readiness = { service: String, store: String, stopping: Bool }
@@ -265,7 +265,7 @@ fn items_all() -> sql::Statement =
 
 /// The readiness probe, and the cheapest statement in the file: one aggregate over one table, no
 /// rows on the wire, no parameters to bind.
-fn store_reachable() -> sql::Statement = sql::stmt("select count(*) from items")
+fn count_items_statement() -> sql::Statement = sql::stmt("select count(*) from items")
 
 fn items_in_stock() -> sql::Statement =
   sql::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
@@ -305,7 +305,7 @@ fn listed<a>(
 ) -> Result<List<a>, http::Response<| {}>> / {abort.raise} =
   match read {
     Ok(xs) -> Ok(xs),
-    Err(sql::Refused(e)) -> Err(unavailable(e)),
+    Err(sql::Rejected(e)) -> Err(unavailable(e)),
     Err(sql::UnexpectedCount(_)) ->
       Err(problem(500, "unreadable result", "a query returned a count")),
     Err(sql::InvalidRow(e)) ->
@@ -385,7 +385,7 @@ pub fn draw_down(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(she
 pub fn put_back(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(shelf, lines, -1)
 
 /// There is no `next_id` here any more, and its absence is the point.
-pub fn order_by(orders: List<Order>, id: Int) -> Option<Order> =
+pub fn find_order(orders: List<Order>, id: Int) -> Option<Order> =
   orders.fold(None, |found: Option<Order>, o: Order| if o.id == id { Some(o) } else { found })
 
 pub fn cancelled(o: Order) -> Order =
@@ -479,12 +479,12 @@ fn join(xs: List<String>) -> String =
 // --- Liveness and readiness, which are two different questions --------------------
 
 pub fn health() -> http::Response<| {}> / {abort.raise} =
-  json_body(200, { service: "parts", routes: table().len() }, health_json())
+  json_body(200, { service: "parts", route_count: table().len() }, health_json())
 
 /// 503 while draining, 503 while the store is unreachable, 200 otherwise.
 pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abort.raise} =
   if signal.stopping() { unready("draining", true) } else {
-    match db.query[items](store_reachable(), []) {
+    match db.query[items](count_items_statement(), []) {
       sql::Rows(_) ->
         json_body(200, { service: "parts", store: "reachable", stopping: false }, readiness_json()),
       // The SQLSTATE is the detail rather than the error, exactly as `unavailable` does it: a
@@ -1067,12 +1067,12 @@ fn turn<| e>(
           false,
           http::text_response(408, "the request head did not arrive\n"),
         ),
-      http::HeadBytes(read) -> heard(c, l, read.buf, read.complete, left - 1, stopping),
+      http::HeadBytes(read) -> handle_head(c, l, read.buf, read.complete, left - 1, stopping),
     }
   }
 
 /// From here on `left` is how many requests the connection may serve after this one.
-fn heard<| e>(
+fn handle_head<| e>(
   c: Int,
   l: http::Limits,
   buf: Bytes,
@@ -1156,10 +1156,10 @@ fn with_body<| e>(
     http::BodyClosed -> (),
     http::BodyRejected(reason) ->
       write_out(c, l, h.request.method, h.request.version, false, http::error_response(reason)),
-    http::BodyComplete(got) -> returned(c, l, h, got, left, stopping),
+    http::BodyComplete(got) -> handle_request(c, l, h, got, left, stopping),
   }
 
-fn returned<| e>(
+fn handle_request<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
@@ -1171,7 +1171,7 @@ fn returned<| e>(
   // A stop seen once the response is ready makes it the connection's last, unless a request is
   // already read behind it.
   let keep = h.keep_alive && left > 0 && !(got.rest.len() == 0 && stopping());
-  let wrote = match streamable(h.request.method, reply) {
+  let wrote = match buffer_head_reply(h.request.method, reply) {
     Buffered(r) ->
       send_all[conn](
         c,
@@ -1196,7 +1196,7 @@ fn returned<| e>(
 /// A `HEAD` response carries no body, so there is nothing to stream: the cursor is drained here and
 /// `http::encode` writes the `Content-Length` a `GET` would have produced and no bytes after the
 /// head.
-fn streamable(m: http::Method, r: Reply) -> Reply =
+fn buffer_head_reply(m: http::Method, r: Reply) -> Reply =
   match m { http::Head -> Buffered(collapse(r)), _ -> r }
 
 /// A cursor's chunks as a stream, each made as it is pulled.
@@ -1356,7 +1356,7 @@ pub fn fake<a | e>(
   body: () -> a / {Serving | e},
 ) -> a / {abort.raise | e} =
   handle {
-    over_values(stocked(seed_shelf(), seed_orders()), body).out
+    run_in_memory(stocked(seed_shelf(), seed_orders()), body).out
   } with {
     // Handled from the argument, and only for the key this service declares.
     config.secret[credentials](key) -> if key == api_key() { api } else { None },
@@ -1365,7 +1365,7 @@ pub fn fake<a | e>(
 
 /// What `body` returns over the database `d` and an empty sink, beside what it leaves of both:
 /// every `db` and `trace` operation `Serving` names is handled here, and the rest by the caller.
-fn over_values<a | e>(
+fn run_in_memory<a | e>(
   d: db::MemDb,
   body: () -> a / {Serving | e},
 ) -> { out: a, db: db::MemDb, sink: trace::Sink } / {abort.raise, config.secret[credentials], signal.stopping | e} =
@@ -1534,7 +1534,7 @@ fn read_out<a>(d: db::MemDb, s: sql::Statement, c: sql::RowCodec<a>) -> List<a> 
   match sql::decode_rows(db::step(d, s, []).out, c) {
     Ok(xs) -> xs,
     Err(sql::InvalidRow(e)) -> panic("a row would not decode: " ++ e.column),
-    Err(sql::Refused(e)) -> panic("a read of the fake failed: " ++ e.code ++ " " ++ e.detail),
+    Err(sql::Rejected(e)) -> panic("a read of the fake failed: " ++ e.code ++ " " ++ e.detail),
     Err(sql::UnexpectedCount(_)) -> panic("a query returned a count"),
   }
 
@@ -1655,7 +1655,7 @@ test "a Rest segment captures every remaining segment, joined" {
 
 // --- Tests: every route, hermetically -----------------------------------------------
 
-pub type Ran<a> = {
+pub type ServiceRun<a> = {
   out: a,
   shelf: List<Item>,
   book: List<Order>,
@@ -1669,9 +1669,9 @@ fn against<a | e>(
   d: db::MemDb,
   values: config::Values,
   body: () -> a / {Serving | e},
-) -> Ran<a> / {abort.raise, signal.stopping | e} = {
+) -> ServiceRun<a> / {abort.raise, signal.stopping | e} = {
   let ran = handle {
-    over_values(d, body)
+    run_in_memory(d, body)
   } with {
     config.secret[credentials](key) -> config::get_secret(values, key),
     // And **not** `signal`, which the caller handles.
@@ -1688,7 +1688,10 @@ fn against<a | e>(
 
 /// The service as `examples/service.sql` seeds it, with a key configured and nobody asking it to
 /// stop.
-fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.raise | e} =
+fn run_configured<a | e>(
+  d: db::MemDb,
+  body: () -> a / {Serving | e},
+) -> ServiceRun<a> / {abort.raise | e} =
   handle {
     against(d, config::one_secret(api_key(), fake_key()), body)
   } with {
@@ -1702,11 +1705,12 @@ fn served_by(
   m: http::Method,
   path: String,
   body: Bytes,
-) -> Ran<http::Response<| {}>> / {abort.raise} = under(stock(), || app(request(m, path, body)))
+) -> ServiceRun<http::Response<| {}>> / {abort.raise} =
+  run_configured(stock(), || app(request(m, path, body)))
 
 /// A placement, with the key.
-fn posted(body: String) -> Ran<http::Response<| {}>> / {abort.raise} =
-  under(stock(), || app(authorized_request(http::Post, "/orders", Bytes::of_string(body))))
+fn posted(body: String) -> ServiceRun<http::Response<| {}>> / {abort.raise} =
+  run_configured(stock(), || app(authorized_request(http::Post, "/orders", Bytes::of_string(body))))
 
 fn request(m: http::Method, path: String, body: Bytes) -> http::Request =
   {
@@ -1753,7 +1757,7 @@ test "GET /health is pure and counts the table it is served from" {
   assert_eq(r.out.status, 200);
   assert_eq(
     json::decode_bytes(http::whole_bytes(r.out.body), health_json()),
-    Ok({ service: "parts", routes: 11 }),
+    Ok({ service: "parts", route_count: 11 }),
   );
   // Pure means pure: the store this request was handed is the store it left.
   assert_eq(r.shelf, seed_shelf());
@@ -1801,7 +1805,7 @@ test "GET /items reads the shelf and responds with it in sku order" {
 // group and run side by side.
 test "GET /items/featured is the shelf minus what is out of stock" {
   let flange = { sku: "flange", name: "flange", price: 1.00m, on_hand: 0 };
-  let r = under(stocked(seed_shelf().push(flange), []), ||
+  let r = run_configured(stocked(seed_shelf().push(flange), []), ||
     app(request(http::Get, "/items/featured", b"")));
   assert_eq(r.out.status, 200);
   assert_eq(
@@ -1904,7 +1908,7 @@ test "an order the shelf cannot cover writes nothing and says which sku" {
 
 // The one thing a rollback does not undo, pinned so that nobody has to discover it.
 test "a rolled-back placement consumes the order number it was given" {
-  let r = under(stock(), || {
+  let r = run_configured(stock(), || {
     assert_eq(
       app(
         authorized_request(
@@ -1974,7 +1978,7 @@ test "an empty order and a line with no quantity are rejected without a transact
 }
 
 test "DELETE /orders/{id} puts the lines back and cancels once" {
-  let r = under(stock(), || {
+  let r = run_configured(stock(), || {
     assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 200);
     assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 409);
     assert_eq(app(request(http::Delete, "/orders/99", b"")).status, 404)
@@ -2007,7 +2011,7 @@ test "GET /health is 200 with no store, no clock and no stop flag in reach" {
   assert_eq(r.status, 200);
   assert_eq(
     json::decode_bytes(http::whole_bytes(r.body), health_json()),
-    Ok({ service: "parts", routes: 11 }),
+    Ok({ service: "parts", route_count: 11 }),
   )
 }
 
@@ -2077,7 +2081,7 @@ test "POST /orders takes the configured key and rejects every other request" {
   let accepted = posted(body);
   assert_eq(accepted.out.status, 201);
 
-  let guessed = under(stock(), ||
+  let guessed = run_configured(stock(), ||
     app({
       method: http::Post,
       target: "/orders",
@@ -2098,7 +2102,8 @@ test "POST /orders takes the configured key and rejects every other request" {
   assert_eq(recorded_names(guessed.records), ["dispatch", "api key rejected", "dispatch"]);
   assert_eq(outcomes_of(guessed.records), [trace::Failed("401")]);
 
-  let bare = under(stock(), || app(request(http::Post, "/orders", Bytes::of_string(body))));
+  let bare = run_configured(stock(), ||
+    app(request(http::Post, "/orders", Bytes::of_string(body))));
   assert_eq(bare.out.status, 401);
   assert_eq(bare.book, seed_orders())
 }
@@ -2278,7 +2283,7 @@ fn mentions(text: String, needle: Bytes) -> Bool = Bytes::of_string(text).index_
 // the drain's exit criterion, and it is a claim about what is *absent*: not one line of
 // `serve`, `serve_connection` or the framing changed to make a signal drain this service.
 test "a signal drains the accept loop with no source change" {
-  let r = under(stock(), ||
+  let r = run_configured(stock(), ||
     handle {
       // Asked for eight connections and given one, because a stop arrived.
       listen_and_serve(8137, 8)
@@ -2305,7 +2310,7 @@ test "a signal drains the accept loop with no source change" {
       },
       // The signal, arriving.
       net.close[conn](c) -> {
-        stop = signal::draining(30000);
+        stop = signal::stopping_within(30000);
       },
       // The clause that reads the flag, beside the one that sets it.
       signal.stopping() -> signal::stopping_step(stop),
@@ -2346,7 +2351,7 @@ test "a pooled service sheds what its queue cannot hold, and responds to every c
   let ran = pooled_run(2, "/health");
   let p = ran.value;
   // Whether the one worker was free as each arrived is the schedule's to say, in every one of them.
-  assert_eq(p.served + p.shed_full + p.shed_late, 2);
+  assert_eq(p.served + p.shed_full + p.shed_timed_out, 2);
   assert(p.served >= 1);
   let wrote = range(2, 4).map(|c: Int| net::mem_sent(ran.net, c));
   assert_eq(wrote.filter(|w: Bytes| status_of(w) == 200).len(), p.served);
@@ -2446,14 +2451,14 @@ test "GET /orders/{id}/receipt streams, and a missing order does not" {
 
 // --- The whole service, over a simulated socket ---------------------------------------
 
-type Exchange = { wrote: Bytes, sent: Int, closes: Int, shelf: List<Item>, book: List<Order> }
+type Exchange = { wrote: Bytes, sent: Int, close_count: Int, shelf: List<Item>, book: List<Order> }
 
 fn first_of(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -> b"" }
 
 fn rest_of(queued: List<Bytes>) -> List<Bytes> = match queued { [_, ..rest] -> rest, _ -> [] }
 
 fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchange / {abort.raise} = {
-  let ran = under(stocked(shelf, book), ||
+  let ran = run_configured(stocked(shelf, book), ||
     handle {
       serve_connection(7, limits())
     } with {
@@ -2472,7 +2477,7 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
       net.close[conn](c) -> {
         closes = closes + 1;
       },
-      return u -> { sent: sent, closes: closes },
+      return u -> { sent: sent, close_count: closes },
     });
   {
     wrote: Bytes::concat_all(ran.out.sent),
@@ -2480,7 +2485,7 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
     // `send_all` writes a buffered response in one, and `http::respond` writes a stream's head
     // and then chunks that begin with a hex size.
     sent: ran.out.sent.filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
-    closes: ran.out.closes,
+    close_count: ran.out.close_count,
     shelf: ran.shelf,
     book: ran.book,
   }
@@ -2511,7 +2516,7 @@ fn get_line(path: String) -> Bytes =
 test "a request over the simulated socket gets a response and the connection is closed" {
   let e = served(get_line("/health"));
   assert_eq(status_of(e.wrote), 200);
-  assert_eq(e.closes, 1);
+  assert_eq(e.close_count, 1);
   assert_eq(e.sent, 1)
 }
 
@@ -2520,7 +2525,7 @@ test "a request over the simulated socket gets a response and the connection is 
 test "two pipelined requests get responses in order on one connection" {
   let e = served(get_line("/health").concat(get_line("/items")));
   assert_eq(e.sent, 2);
-  assert_eq(e.closes, 1);
+  assert_eq(e.close_count, 1);
   assert(e.wrote.index_of(b"\"service\":\"parts\"") != None);
   assert(e.wrote.index_of(b"\"sku\":\"gasket\"") != None)
 }
@@ -2610,7 +2615,7 @@ test "OPTIONS * responds with the methods the table declares anywhere" {
 test "a peer that opens a connection and says nothing is closed without a response" {
   let e = exchange([], seed_shelf(), seed_orders());
   assert_eq(e.wrote, b"");
-  assert_eq(e.closes, 1)
+  assert_eq(e.close_count, 1)
 }
 
 // --- The service as its settings describe it ----------------------------------------------
@@ -2621,7 +2626,7 @@ fn over_socket(
   inbox: List<Bytes>,
   s: Settings,
 ) -> { wrote: Bytes, sent: Int, said: List<String> } / {sim.read, abort.raise} = {
-  let ran = under(stock(), ||
+  let ran = run_configured(stock(), ||
     handle {
       // A task per connection needs a scheduler; the sequential loop spawns nothing under it.
       simulate { assert_eq(listening(s), 1) }
@@ -2767,7 +2772,7 @@ test "run_memory serves the service with no database bound and no host at all" {
 fn rejected(raw: Bytes) -> Int / {abort.raise} = {
   let e = served(raw);
   assert_eq(e.sent, 1);
-  assert_eq(e.closes, 1);
+  assert_eq(e.close_count, 1);
   assert_eq(e.shelf, seed_shelf());
   assert_eq(e.book, seed_orders());
   status_of(e.wrote)
@@ -2778,7 +2783,7 @@ test "Content-Length and Transfer-Encoding together are rejected and nothing is 
     b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
   );
   assert_eq(status_of(e.wrote), 400);
-  assert_eq(e.closes, 1);
+  assert_eq(e.close_count, 1);
   assert_eq(e.sent, 1);
   assert_eq(e.book, seed_orders())
 }
@@ -2873,7 +2878,7 @@ test "trailers arrive in their own field and are never merged into the headers" 
   // The body was framed by the chunks and not by the trailer, so the service saw `{}` and rejected
   // it as a `Placement` rather than as a framing error.
   assert_eq(status_of(e.wrote), 400);
-  assert_eq(e.closes, 1)
+  assert_eq(e.close_count, 1)
 }
 
 test "a request line longer than this service will hold is 414" {
@@ -2997,7 +3002,7 @@ pub type Pick = | Bolt | Gasket | Widget
 
 pub type Amount = | One | Couple | Handful | Crate
 
-pub type Want = { pick: Pick, amount: Amount }
+pub type LineChoice = { pick: Pick, amount: Amount }
 
 fn sku_of(p: Pick) -> String = match p { Bolt -> "bolt", Gasket -> "gasket", Widget -> "widget" }
 
@@ -3005,10 +3010,10 @@ fn sku_of(p: Pick) -> String = match p { Bolt -> "bolt", Gasket -> "gasket", Wid
 /// lands on both sides of the rejection rather than on one.
 fn qty_of(a: Amount) -> Int = match a { One -> 1, Couple -> 2, Handful -> 5, Crate -> 40 }
 
-pub fn lines_of(ws: List<Want>) -> List<Line> =
-  ws.map(|w: Want| { sku: sku_of(w.pick), qty: qty_of(w.amount) })
+pub fn lines_of(ws: List<LineChoice>) -> List<Line> =
+  ws.map(|w: LineChoice| { sku: sku_of(w.pick), qty: qty_of(w.amount) })
 
-fn wants() -> Gen<List<Want>> =
+fn wants() -> Gen<List<LineChoice>> =
   gen::and_then(gen::int_between(1, 4), |n: Int|
     gen::list_of_length(
       gen::map2(
@@ -3019,12 +3024,12 @@ fn wants() -> Gen<List<Want>> =
       n,
     ))
 
-fn covered(ws: List<Want>) -> Bool = short_skus(seed_shelf(), lines_of(ws)).len() == 0
+fn covered(ws: List<LineChoice>) -> Bool = short_skus(seed_shelf(), lines_of(ws)).len() == 0
 
 /// Through the whole route — the key check, the decode and the span — so the tests cover what a
 /// client actually reaches rather than starting after it.
-pub fn placed_over(ws: List<Want>) -> Ran<http::Response<| {}>> / {abort.raise} =
-  under(stocked(seed_shelf(), []), ||
+pub fn run_place_order(ws: List<LineChoice>) -> ServiceRun<http::Response<| {}>> / {abort.raise} =
+  run_configured(stocked(seed_shelf(), []), ||
     app(
       authorized_request(
         http::Post,
@@ -3034,33 +3039,33 @@ pub fn placed_over(ws: List<Want>) -> Ran<http::Response<| {}>> / {abort.raise} 
     ))
 
 /// The claim a rollback is for.
-pub fn rejected_without_trace(ws: List<Want>) -> Bool / {abort.raise} = {
-  let r = placed_over(ws);
+pub fn rejected_without_trace(ws: List<LineChoice>) -> Bool / {abort.raise} = {
+  let r = run_place_order(ws);
   r.out.status == 409 && r.shelf == seed_shelf() && r.book == []
     && trace::named(r.records, "placed") == []
     && trace::counter_total(r.records, "orders placed") == 0
 }
 
 test "a placement the shelf cannot cover leaves no row behind" {
-  gen::check(wants(), |ws: List<Want>| covered(ws) || rejected_without_trace(ws))
+  gen::check(wants(), |ws: List<LineChoice>| covered(ws) || rejected_without_trace(ws))
 }
 
 /// And the other half, without which the first is satisfied by a service that rejects everything:
 /// what a placement that succeeds does to the shelf is exactly `draw_down`, the pure function the
 /// tests above check on its own.
-pub fn committed_as_specified(ws: List<Want>) -> Bool / {abort.raise} = {
-  let r = placed_over(ws);
+pub fn committed_as_specified(ws: List<LineChoice>) -> Bool / {abort.raise} = {
+  let r = run_place_order(ws);
   r.out.status == 201 && r.shelf == draw_down(seed_shelf(), lines_of(ws)) && r.book.len() == 1
 }
 
 test "a placement the shelf can cover moves the shelf by exactly the drawdown" {
-  gen::check(wants(), |ws: List<Want>| !covered(ws) || committed_as_specified(ws))
+  gen::check(wants(), |ws: List<LineChoice>| !covered(ws) || committed_as_specified(ws))
 }
 
 /// The statement and the predicate it replaced, over every id.
 pub fn one_order_agrees(id: Int) -> Bool / {abort.raise} = {
-  let r = under(stock(), || app(request(http::Get, "/orders/" ++ id.to_string(), b"")));
-  match order_by(seed_orders(), id) {
+  let r = run_configured(stock(), || app(request(http::Get, "/orders/" ++ id.to_string(), b"")));
+  match find_order(seed_orders(), id) {
     Some(o) ->
       r.out.status == 200
         && json::decode_bytes(http::whole_bytes(r.out.body), order_json()) == Ok(o),

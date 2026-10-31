@@ -1,7 +1,7 @@
 import compiler.emit.costs (Report, Costed, Site, Unkept, CostInput, Costing, costs, cost_keys,
                             cost_input_of, report_bin)
 import compiler.expand.embed (ModuleEmbed, EmbedFile, embed_file)
-import compiler.front.facts (Analysis, Frame, pulled_at)
+import compiler.front.facts (Analysis, Frame, is_shipped_module)
 import compiler.front.rows (Outline, OutlineItem, OutlinedFunction)
 import compiler.front (analyse_pulling_std_with, module_form_digest)
 import compiler.front.published (no_rows)
@@ -39,7 +39,7 @@ pub fn costs_of(
   analysis: Analysis,
 ) -> Costing / {cost_checker.report, abort.raise} = {
   let sources = range(0, analysis.modules.len()).map(|i: Int|
-    match program.places.at(i) { Some(place) -> place.text, None -> b"" });
+    match program.places.at(i) { Some(example_sources) -> example_sources.text, None -> b"" });
   let c = cost_checker.report(cost_input_of(analysis, sources));
   {
     ..c,
@@ -50,7 +50,7 @@ pub fn costs_of(
   }
 }
 
-pub fn broken_promises(
+pub fn reuse_violations(
   program: Program,
   frame: Frame,
 ) -> List<Diagnostic> / {cost_checker.report, abort.raise} =
@@ -60,7 +60,7 @@ pub fn broken_promises(
       Ok(w) -> {
         let r = costs_of(program, w).report;
         if !r.ok { [unresolved()] } else {
-          r.unkept.fold(promises(r), |acc: List<Diagnostic>, u: Unkept|
+          r.unkept.fold(report_reuse_violations(r), |acc: List<Diagnostic>, u: Unkept|
             acc.push(broken_returns_clause(u)))
         }
       },
@@ -152,7 +152,7 @@ fn keyed_sources(a: Analysis, sources: List<Bytes>) -> List<Bytes> / {abort.rais
   range(0, a.modules.len()).map(|i: Int| {
     let m = a.modules.get(i);
     let src = match sources.at(i) { Some(x) -> x, None -> b"" };
-    if !pulled_at(a.packages, a.module_packages, i) { src } else {
+    if !is_shipped_module(a.packages, a.module_packages, i) { src } else {
       Bytes::concat_all(
         [b"shipped\x00", module_form_digest(m.module, src), b"\x00"].concat(
           match held.get(m.name) { Some(xs) -> xs, None -> [] },
@@ -245,9 +245,10 @@ fn basename(path: String) -> String = {
 fn location_text(places: List<SourceText>, module: Int, offset: Int) -> String / {abort.raise} =
   match places.at(module) {
     None -> "<unknown>",
-    Some(place) -> {
-      let spot = position_of(place.text, offset);
-      basename(place.path) ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.column.to_string()
+    Some(example_sources) -> {
+      let spot = position_of(example_sources.text, offset);
+      basename(example_sources.path) ++ ":" ++ spot.line.to_string() ++ ":"
+        ++ spot.column.to_string()
     },
   }
 
@@ -291,10 +292,10 @@ fn site_lines(
     "    " ++ at ++ " ".repeat(pad) ++ "  " ++ colored_verdict(style, site.verdict) ++ "  "
       ++ String::of_bytes_lossy(site.reason),
   );
-  if site.fix.len() == 0 { said } else {
+  if site.suggestion.len() == 0 { said } else {
     said.push(
       "    " ++ " ".repeat(location_width()) ++ "  " ++ " ".repeat(7) ++ "  "
-        ++ dim(style, "fix: " ++ String::of_bytes_lossy(site.fix)),
+        ++ dim(style, "fix: " ++ String::of_bytes_lossy(site.suggestion)),
     )
   }
 }
@@ -354,13 +355,13 @@ pub fn unresolved() -> Diagnostic =
     [b"this is Ply's fault: the compiler's own `costs.ply` is what failed here"],
   )
 
-fn unkept(d: Costed, promise: Span, site: Site) -> Diagnostic = {
+fn reuse_violation(d: Costed, promise: Span, site: Site) -> Diagnostic = {
   let held = if site.op == b"Array::set" { b"array" } else { b"list" };
   let what = if site.verdict == b"copies" { b"copies its ".concat(held) }
   else { b"cannot be shown to reuse its ".concat(held) };
-  let note = if site.fix.len() == 0 {
+  let note = if site.suggestion.len() == 0 {
     b"no edit inside this body removes the copy; the promise cannot be kept as written, so either restructure the update or drop `reuse`"
-  } else { b"fix: ".concat(site.fix) };
+  } else { b"fix: ".concat(site.suggestion) };
   error_at_and(
     b"E0127",
     d.module,
@@ -383,14 +384,14 @@ fn unkept(d: Costed, promise: Span, site: Site) -> Diagnostic = {
   )
 }
 
-pub fn promises(report: Report) -> List<Diagnostic> =
+pub fn report_reuse_violations(report: Report) -> List<Diagnostic> =
   report.definitions.fold([], |acc: List<Diagnostic>, d: Costed|
     match d.reuse {
       None -> acc,
       Some(promise) ->
         d.sites.fold(acc, |diagnostics: List<Diagnostic>, site: Site|
           if site.verdict == b"reuses" || site.param >= 0 { diagnostics }
-          else { diagnostics.push(unkept(d, promise, site)) }),
+          else { diagnostics.push(reuse_violation(d, promise, site)) }),
     })
 
 test "a cost report's key moves with the checker, a module's text, the packages and an embed" {
@@ -426,7 +427,7 @@ test "a cost report stands over a shipped module that gained what the program do
   assert(keyed(b"pub fn f() -> Int = 2\n") != base, Some("what the program reaches moved"))
 }
 
-fn place() -> List<SourceText> =
+fn example_sources() -> List<SourceText> =
   [{ path: "src/m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }]
 
 fn site(verdict: Bytes, reason: Bytes, fix: Bytes, param: Int) -> Site =
@@ -436,7 +437,7 @@ fn site(verdict: Bytes, reason: Bytes, fix: Bytes, param: Int) -> Site =
     op: b"List::push",
     verdict: verdict,
     reason: reason,
-    fix: fix,
+    suggestion: fix,
     param: param,
   }
 
@@ -471,10 +472,10 @@ test "a definition's tally names only the verdicts it has, in one order" {
 }
 
 test "a program that updates nothing is told so on one line" {
-  assert_eq(report_lines(plain(), place(), { ok: true, rounds: 1, definitions: [], unkept: [] }), [
-    "",
-    "   no updates: nothing to cost",
-  ])
+  assert_eq(
+    report_lines(plain(), example_sources(), { ok: true, rounds: 1, definitions: [], unkept: [] }),
+    ["", "   no updates: nothing to cost"],
+  )
 }
 
 test "a site is placed by its file's base name and the verdict column does not move" {
@@ -484,7 +485,7 @@ test "a site is placed by its file's base name and the verdict column does not m
     definitions: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)],
     unkept: [],
   };
-  assert_eq(report_lines(plain(), place(), r), [
+  assert_eq(report_lines(plain(), example_sources(), r), [
     "",
     "",
     "  m.grow  1 COPIES",
@@ -503,14 +504,14 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     definitions: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)],
     unkept: [],
   };
-  assert_eq(promises(kept), []);
+  assert_eq(report_reuse_violations(kept), []);
   let caller: Report = {
     ok: true,
     rounds: 1,
     definitions: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)],
     unkept: [],
   };
-  assert_eq(promises(caller), []);
+  assert_eq(report_reuse_violations(caller), []);
   let broken: Report = {
     ok: true,
     rounds: 1,
@@ -519,7 +520,7 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     ],
     unkept: [],
   };
-  let raised = promises(broken);
+  let raised = report_reuse_violations(broken);
   assert_eq(raised.len(), 1);
   let d = match raised.at(0) { Some(x) -> x, None -> panic("one diagnostic") };
   assert_eq(d.code, b"E0127");
@@ -535,7 +536,7 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     definitions: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)],
     unkept: [],
   };
-  assert_eq(promises(hopeless).map(|x: Diagnostic| x.message), [
+  assert_eq(report_reuse_violations(hopeless).map(|x: Diagnostic| x.message), [
     b"`grow` is a `reuse fn`, and this `List::push` cannot be shown to reuse its list: a call",
   ]);
   let array: Report = {
@@ -546,7 +547,7 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     ],
     unkept: [],
   };
-  assert_eq(promises(array).map(|x: Diagnostic| x.message), [
+  assert_eq(report_reuse_violations(array).map(|x: Diagnostic| x.message), [
     b"`grow` is a `reuse fn`, and this `Array::set` copies its array: read again",
   ])
 }
@@ -558,7 +559,7 @@ test "a definition with no promise is costed and never rejected" {
     definitions: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)],
     unkept: [],
   };
-  assert_eq(promises(r), [])
+  assert_eq(report_reuse_violations(r), [])
 }
 
 test "a `returns` clause its body does not keep is rejected where it is written" {

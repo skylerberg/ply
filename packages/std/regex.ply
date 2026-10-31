@@ -195,7 +195,7 @@ fn fail<a>(at: Int, reason: ErrorKind) -> a / {regex.fail} = regex.fail({ at: at
 type Interval = { lo: Int, hi: Int }
 
 /// A condition on a position that a pattern checks without consuming a character.
-type Look =
+type Assertion =
   | LineStart
   | LineEnd
   | TextStart
@@ -214,7 +214,7 @@ type Node =
   | Literal(Int)
   /// One code point of these, which are in order and neither touch nor overlap.
   | Class(List<Interval>)
-  | Looking(Look)
+  | Looking(Assertion)
   /// Two or more in a row, none of them a `Concat` or `Empty`.
   | Concat(List<Node>)
   /// Two or more, the leftmost preferred, none of them an `Alternate`.
@@ -327,13 +327,13 @@ fn folded_ascii(items: List<Interval>) -> List<Interval> =
 /// code point, and the distance to another member of each one's orbit, as `ucd::apply_distance`
 /// reads it. A run whose code points have several other members appears once for each. The runs are
 /// in ascending order.
-const fn orbits() -> Array<Int> =
+const fn case_fold_runs() -> Array<Int> =
   Array::of_list(
     ucd::runs(embed("ucd/fold.txt")).fold([], |required_literal: List<Int>, run: ucd::Run|
       Bytes::split(match run.fields.at(0) { Some(far) -> far, None -> b"" }, b",").fold(
         required_literal,
         |so_far: List<Int>, far: Bytes|
-          so_far.push(run.first).push(run.last).push(ucd::distance(far)),
+          so_far.push(run.first).push(run.last).push(ucd::parse_offset(far)),
       )),
   )
 
@@ -341,7 +341,7 @@ const fn orbits() -> Array<Int> =
 /// ignores case as Unicode's simple case folding pairs characters, so `k` also matches `K` and the
 /// Kelvin sign.
 fn folded_unicode(items: List<Interval>) -> List<Interval> / {abort.raise} = {
-  let runs = orbits();
+  let runs = case_fold_runs();
   let count = runs.len() / 3;
   items.fold(items, |acc: List<Interval>, i: Interval| {
     let from = iterate({ low: 0, high: count }, 32, |s: { low: Int, high: Int }|
@@ -696,17 +696,17 @@ fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.fail, abor
 /// Reads a count just after a `{`: `n}`, `n,}` or `n,m}`, with `-1` for no upper end, and 1001 for
 /// any count past 1000. `None` if the text is not a count, which leaves the `{` as a plain
 /// character.
-fn repeat_count(s: Source, at: Int) -> Option<{ least: Int, most: Int, at: Int }> = {
+fn repeat_count(s: Source, at: Int) -> Option<{ minimum_sizes: Int, most: Int, at: Int }> = {
   let first = number(s, at);
   if first.at == at { None } else {
     match code_point_at(s, first.at) {
-      b'}' -> Some({ least: first.value, most: first.value, at: first.at + 1 }),
+      b'}' -> Some({ minimum_sizes: first.value, most: first.value, at: first.at + 1 }),
       b',' -> if code_point_at(s, first.at + 1) == b'}' {
-        Some({ least: first.value, most: -1, at: first.at + 2 })
+        Some({ minimum_sizes: first.value, most: -1, at: first.at + 2 })
       } else {
         let second = number(s, first.at + 1);
         if second.at == first.at + 1 || code_point_at(s, second.at) != b'}' { None }
-        else { Some({ least: first.value, most: second.value, at: second.at + 1 }) }
+        else { Some({ minimum_sizes: first.value, most: second.value, at: second.at + 1 }) }
       },
       _ -> None,
     }
@@ -733,9 +733,9 @@ fn repetition(s: Source, p: Parse) -> Parse / {regex.fail} =
     QuestionMark -> repeat_node(s, p, 0, 1, p.at + 1),
     Brace -> match repeat_count(s, p.at + 1) {
       None -> p,
-      Some(c) -> if c.least > 1000 || c.most > 1000 || (c.most >= 0 && c.least > c.most) {
-        fail(p.at, BadRepeat)
-      } else { repeat_node(s, p, c.least, c.most, c.at) },
+      Some(c) -> if c.minimum_sizes > 1000 || c.most > 1000
+          || (c.most >= 0 && c.minimum_sizes > c.most) { fail(p.at, BadRepeat) }
+      else { repeat_node(s, p, c.minimum_sizes, c.most, c.at) },
     },
     _ -> p,
   }
@@ -873,7 +873,7 @@ fn octal(s: Source, at: Int, value: Int, left: Int) -> { code: Int, at: Int } = 
 /// `\xNN`, or `\x{N...}` of any number of digits that name a code point.
 fn hexadecimal(s: Source, at: Int) -> { code: Int, at: Int } / {regex.fail} =
   if code_point_at(s, at + 2) == b'{' {
-    let read = hex_run(s, at + 3, 0);
+    let read = read_hex_digits(s, at + 3, 0);
     if read.at == at + 3 || code_point_at(s, read.at) != b'}' || read.code > 0x10FFFF {
       fail(at, BadEscape)
     } else { { code: read.code, at: read.at + 1 } }
@@ -884,10 +884,10 @@ fn hexadecimal(s: Source, at: Int) -> { code: Int, at: Int } / {regex.fail} =
   }
 
 /// The hex digits from `at`, with their value capped just past the last code point.
-fn hex_run(s: Source, at: Int, value: Int) -> { code: Int, at: Int } = {
+fn read_hex_digits(s: Source, at: Int, value: Int) -> { code: Int, at: Int } = {
   let digit = hex_value(code_point_at(s, at));
   if at >= s.text.len() || digit < 0 { { code: value, at: at } }
-  else { hex_run(s, at + 1, if value > 0x10FFFF { value } else { value * 16 + digit }) }
+  else { read_hex_digits(s, at + 1, if value > 0x10FFFF { value } else { value * 16 + digit }) }
 }
 
 // --- Groups ---------------------------------------------------------------------
@@ -1035,7 +1035,7 @@ fn class(
 ) -> Parse / {regex.fail, abort.raise} = {
   let negated = code_point_at(s, at + 1) == b'^';
   let from = if negated { at + 2 } else { at + 1 };
-  let read = members(s, at, from, flags, [], true, s.text.len() - at + 1);
+  let read = read_class_members(s, at, from, flags, [], true, s.text.len() - at + 1);
   let set = canonical(read.items);
   leaf(
     s,
@@ -1046,7 +1046,7 @@ fn class(
   )
 }
 
-fn members(
+fn read_class_members(
   s: Source,
   open: Int,
   at: Int,
@@ -1060,7 +1060,7 @@ fn members(
     if c == -1 { fail(open, UnclosedClass) }
     else if c == b']' && !first { { items: items, at: at + 1 } } else {
       let one = member(s, at, flags);
-      members(
+      read_class_members(
         s,
         open,
         one.at,
@@ -1512,7 +1512,7 @@ fn fork(first: Int, other: Int, greedy: Bool) -> Inst =
 
 /// The looks an instruction checks, as a set of bits. A program read backwards swaps a start for
 /// an end.
-fn look_bits(look: Look, reversed: Bool) -> Int =
+fn look_bits(look: Assertion, reversed: Bool) -> Int =
   match look {
     LineStart -> if reversed { 2 } else { 1 },
     LineEnd -> if reversed { 1 } else { 2 },
@@ -1552,8 +1552,8 @@ fn emit(e: Emitter, node: Node, next: Int, depth: Int) -> EmitResult / {abort.ra
           else { emit_instruction(acc.e, Split(entry, acc.entry)) })
       },
       Capture(index, _, sub) -> if e.reversed { emit(e, sub, next, depth - 1) } else {
-        let close = emit_instruction(e, Save(2 * index + 1, next));
-        let body = emit(close.e, sub, close.entry, depth - 1);
+        let epsilon_closure = emit_instruction(e, Save(2 * index + 1, next));
+        let body = emit(epsilon_closure.e, sub, epsilon_closure.entry, depth - 1);
         emit_instruction(body.e, Save(2 * index, body.entry))
       },
       Repeat(sub, least, most, greedy) -> if most >= 0 {
@@ -1897,7 +1897,7 @@ type Compiled = {
   /// The search for where the leftmost match ends, the one for the longest end from a known
   /// start, and the one that reads a match backwards from its end to its start.
   finder: Automaton,
-  stretcher: Automaton,
+  longest_finder: Automaton,
   reverse: Automaton,
   /// Whether a look checks for a word of any script. A search by states steps a byte at a time and
   /// cannot check that, so such a pattern is always searched by following every state at once.
@@ -1963,7 +1963,7 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.fail,
       search: sought.entry,
       opening: prefilter(insts, ahead.entry, p.node, bytes),
       finder: finder,
-      stretcher: { ..finder, entry: ahead.entry, first_wins: false },
+      longest_finder: { ..finder, entry: ahead.entry, first_wins: false },
       reverse: {
         ..finder,
         insts: Array::of_list(behind.e.insts),
@@ -2463,13 +2463,19 @@ type States = {
 /// `spent` whether a search ran out of room, after which the call follows every state at once.
 type SearchCache = { stamp: Int, ahead: States, back: States, stretch: States, spent: Bool }
 
-fn states(room: Int, base: Int) -> States =
+fn empty_states(room: Int, base: Int) -> States =
   { ids: Map::new(), keys: [[], []], starts: [-1, -1, -1, -1], room: room + 2, base: base }
 
 /// What no search has explored: each automaton's states are made with the table, by the first
 /// search that goes one state at a time.
 fn empty_search_cache() -> SearchCache =
-  { stamp: 1, ahead: states(0, 0), back: states(0, 0), stretch: states(0, 0), spent: false }
+  {
+    stamp: 1,
+    ahead: empty_states(0, 0),
+    back: empty_states(0, 0),
+    stretch: empty_states(0, 0),
+    spent: false,
+  }
 
 /// What following places without taking a byte reached: the places that take one, ask a look or
 /// match, in order; every look asked; and whether a match ended the walk.
@@ -2479,7 +2485,7 @@ type Closure = { seen: Array<Int>, stack: Array<Int>, out: List<Int>, needs: Int
 /// looks `have`: a place not yet reached under this `stamp` joins `out`. A look stays in `out`
 /// whether or not it matches here, since the next byte may change the result. Where `cut`,
 /// a `Match` ends the walk, as nothing reached after it can be preferred.
-fn close(
+fn epsilon_closure(
   insts: Array<Inst>,
   have: Int,
   cut: Bool,
@@ -2495,12 +2501,12 @@ fn close(
   else if fuel <= 0 { panic("a program is walked once a state") } else {
     let pc = stack.get(sp - 1);
     if seen.get(pc) == stamp {
-      close(insts, have, cut, stamp, seen, stack, sp - 1, out, needs, fuel - 1)
+      epsilon_closure(insts, have, cut, stamp, seen, stack, sp - 1, out, needs, fuel - 1)
     } else {
       let marked = seen.set(pc, stamp);
       match insts.get(pc) {
         Split(x, y) ->
-          close(
+          epsilon_closure(
             insts,
             have,
             cut,
@@ -2513,9 +2519,20 @@ fn close(
             fuel - 1,
           ),
         Save(_, to) ->
-          close(insts, have, cut, stamp, marked, stack.set(sp - 1, to), sp, out, needs, fuel - 1),
+          epsilon_closure(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            stack.set(sp - 1, to),
+            sp,
+            out,
+            needs,
+            fuel - 1,
+          ),
         Check(looks, to) -> if looks & ~have == 0 {
-          close(
+          epsilon_closure(
             insts,
             have,
             cut,
@@ -2528,7 +2545,7 @@ fn close(
             fuel - 1,
           )
         } else {
-          close(
+          epsilon_closure(
             insts,
             have,
             cut,
@@ -2541,13 +2558,37 @@ fn close(
             fuel - 1,
           )
         },
-        Fail -> close(insts, have, cut, stamp, marked, stack, sp - 1, out, needs, fuel - 1),
+        Fail ->
+          epsilon_closure(insts, have, cut, stamp, marked, stack, sp - 1, out, needs, fuel - 1),
         Match -> if cut {
           { seen: marked, stack: stack, out: out.push(pc), needs: needs, sealed: true }
         } else {
-          close(insts, have, cut, stamp, marked, stack, sp - 1, out.push(pc), needs, fuel - 1)
+          epsilon_closure(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            stack,
+            sp - 1,
+            out.push(pc),
+            needs,
+            fuel - 1,
+          )
         },
-        _ -> close(insts, have, cut, stamp, marked, stack, sp - 1, out.push(pc), needs, fuel - 1),
+        _ ->
+          epsilon_closure(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            stack,
+            sp - 1,
+            out.push(pc),
+            needs,
+            fuel - 1,
+          ),
       }
     }
   }
@@ -2567,7 +2608,7 @@ fn reclose(
   match key.at(i) {
     None -> { seen: seen, stack: stack, out: out, needs: needs, sealed: false },
     Some(pc) -> {
-      let c = close(
+      let c = epsilon_closure(
         a.insts,
         have,
         false,
@@ -2624,7 +2665,7 @@ fn advance(
       } else if to < 0 {
         advance(a, places, i + 1, b, after, stamp, seen, stack, out, needs, matched)
       } else {
-        let c = close(
+        let c = epsilon_closure(
           a.insts,
           after,
           a.first_wins,
@@ -2756,7 +2797,7 @@ fn start_state(
   let known = s.starts.at_or(kind, -1);
   if known >= 0 { { seen: seen, stack: stack, states: s, to: known } } else {
     let have = match kind { 0 -> 5, 1 -> 1, _ -> 0 };
-    let walked = close(
+    let walked = epsilon_closure(
       a.insts,
       have,
       a.first_wins,
@@ -3109,9 +3150,9 @@ fn search(
       Array::new(2 * most + 2, 0),
       {
         stamp: 1,
-        ahead: states(rows - 2, 0),
-        back: states(rows - 2, rows * re.finder.stride),
-        stretch: states(rows - 2, 2 * rows * re.finder.stride),
+        ahead: empty_states(rows - 2, 0),
+        back: empty_states(rows - 2, rows * re.finder.stride),
+        stretch: empty_states(rows - 2, 2 * rows * re.finder.stride),
         spent: false,
       },
       want,
@@ -3311,7 +3352,7 @@ fn find_longest_end(
   want: Int,
 ) -> Hit / {abort.raise} = {
   let first = start_state(
-    re.stretcher,
+    re.longest_finder,
     seen,
     stack,
     explored.stretch,
@@ -3333,7 +3374,7 @@ fn find_longest_end(
     )
   } else {
     let end = search_forward(
-      re.stretcher,
+      re.longest_finder,
       table,
       first.seen,
       first.stack,
@@ -3374,7 +3415,7 @@ fn has_match_by_states(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
       a,
       Array::new(a.insts.len(), 0),
       Array::new(2 * a.insts.len() + 2, 0),
-      states(room, 0),
+      empty_states(room, 0),
       1,
       hay,
       0,

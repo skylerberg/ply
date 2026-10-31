@@ -22,15 +22,15 @@ import rules (RuleLog, Cited, Contract, record_rule, record_unfold)
 import compiler.front.published (ClaimClause)
 import compiler.syntax.items (EnsuresClause, RequiresClause)
 import sort (bool_sort, bytes_sort, float_sort, int_sort, string_sort, decimal_sort, is_named_sort,
-             list_element, list_sort, record_of, call_result_sort, matched, match_strict, foreign,
-             foreign_base, vars)
+             list_element, list_sort, record_of, call_result_sort, matched, match_strict,
+             shift_variables, external_variable_base, vars)
 import term (Terms, InternedTerm, IntTerm, BoolTerm, StringTerm, DecimalTerm, FloatTerm, FixedTerm,
              UnitTerm, SymbolTerm, OpaqueTerm, LinearSumTerm, ApplicationTerm, ConstructorTerm,
              NilTerm, ConsTerm, RecordTerm, IfTerm, MatchTerm, ClosureTerm, CmpOp, Lt, Le, Gt, Ge,
              Arm, ArmTest, Always, TestConstructor, TestLiteral, TestList, Undecidable, true_id,
              false_id, new_terms, size, node, sort_of, force_int, intern, int_literal, boolean,
              string, decimal, float_literal, fixed, unit, nil, cons, symbol, opaque, add, sub, neg,
-             mul, field, not, and, or, cmp, eq, equal_at, app, float_nan, float_rank,
+             mul, field, not, and, or, cmp, eq, intern_equality, app, float_nan, float_rank,
              decimal_normalized, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
              op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge,
              op_float)
@@ -46,7 +46,7 @@ pub fn max_terms() -> Int = 20000
 /// How deep calls may be read inside one another from a root: a recursion over values in view, a
 /// closure applied, a list call read over its spine. An unfolding inside another counts against the
 /// unfold depth too.
-pub fn unroll_budget() -> Int = 64
+pub fn call_depth_limit() -> Int = 64
 
 /// How many definitions one reading of a claim unfolds in all. An unrolling over a value in view counts
 /// no depth, and a reading that repeats one makes no new terms, so neither bound counts its work.
@@ -171,7 +171,7 @@ pub type Blocker =
   | BoundUnshown(String)
   /// Every part of the claim was read, and the search found a case it could not close: the claim may
   /// be false there, or need a lemma or a guard.
-  | Unclosed
+  | UnprovedCase
   /// A value of the type named, which states an invariant, built where the proof did not read it: in a
   /// constructor handed on as a function, or in code the lowering passed over.
   | UnreadConstruction(String)
@@ -199,7 +199,7 @@ pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
     DestructuringLet -> { kind: "destructuring_let", detail: None },
     Induction(reason) -> { kind: "induction", detail: Some(reason) },
     BoundUnshown(reason) -> { kind: "unbounded", detail: Some(reason) },
-    Unclosed -> { kind: "unclosed", detail: None },
+    UnprovedCase -> { kind: "unclosed", detail: None },
     UnreadConstruction(t) -> { kind: "unseen_build", detail: Some(t) },
     ResultAssumed -> { kind: "answer_assumed", detail: None },
   }
@@ -413,7 +413,7 @@ pub fn lower_root(
     { ..lowering, window: binders.map(|t: Int| Some(t)) },
     context,
     c,
-    unroll_budget(),
+    call_depth_limit(),
   );
   { lowering: { ..r.lowering, window: outer }, id: r.id }
 }
@@ -431,7 +431,7 @@ fn lower_optional(
   }
 
 /// What an effectful expression returns, of `sort` where that is known, which is not read.
-fn region(lowering: Lowering, sort: Option<Sort>) -> LoweredTerm / {abort.raise} = {
+fn effectful_result(lowering: Lowering, sort: Option<Sort>) -> LoweredTerm / {abort.raise} = {
   let lw = add_blocker(require_unreachable(lowering), Effectful);
   lift({ ..lw, impure: true }, symbol(lw.terms, sort))
 }
@@ -571,7 +571,7 @@ fn function_pure(lowering: Lowering, context: Context, t: Int) -> Bool / {abort.
 /// a builtin that returns there or a constructor, or in a law a binder whose type says it performs
 /// nothing and never raises. Elsewhere a function's type cannot say so, since an overflow inside it
 /// ends the run whatever its effects are.
-fn function_total(
+fn function_always_returns(
   lowering: Lowering,
   context: Context,
   t: Int,
@@ -678,7 +678,7 @@ pub fn lower(
         ),
       ),
     // The fields a record update copies read the base; the ones it sets follow them.
-    CodeUpdate(u) -> record(lowering, context, u.copies, u.sets, Some(u.base), unfolds),
+    CodeUpdate(u) -> record(lowering, context, u.copied_fields, u.sets, Some(u.base), unfolds),
     CodeFieldRead(f) -> {
       let base = lower(lowering, context, f.base, unfolds);
       lift(base.lowering, field(base.lowering.terms, base.id, String::of_bytes_lossy(f.field)))
@@ -706,9 +706,9 @@ pub fn lower(
         });
       lift(items.lowering, built)
     },
-    CodePerform(p) -> region(lowering, operation_sort(context, p.effect, p.op)),
-    CodeSimulate(_) -> region(lowering, None),
-    CodeHandle(_) -> region(lowering, None),
+    CodePerform(p) -> effectful_result(lowering, operation_sort(context, p.effect, p.op)),
+    CodeSimulate(_) -> effectful_result(lowering, None),
+    CodeHandle(_) -> effectful_result(lowering, None),
     // A label argument is the field-table entry of a resource: opaque, like a perform.
     CodeLabel(_) -> opaque_symbol(lowering, Effectful),
   }
@@ -900,11 +900,14 @@ fn global(lowering: Lowering, context: Context, name: String) -> LoweredTerm / {
         intern(
           lowering.terms,
           ConstructorTerm({ name: name, args: [] }),
-          Some(foreign(constructor_sort(c))),
+          Some(shift_variables(constructor_sort(c))),
         ),
       )
     } else {
-      lift(lowering, intern(lowering.terms, OpaqueTerm(name), Some(foreign(constructor_sort(c)))))
+      lift(
+        lowering,
+        intern(lowering.terms, OpaqueTerm(name), Some(shift_variables(constructor_sort(c)))),
+      )
     },
     None -> match signature(context, name) {
       Some(s) -> lift(lowering, intern(lowering.terms, OpaqueTerm(name), Some(s.ty))),
@@ -1133,7 +1136,7 @@ fn equal_within(
       lift(lowering, eq(lowering.terms, x, y))
     } else {
       match sort {
-        None -> by_shape(lowering, context, x, y, unfolds, depth_left),
+        None -> equal_by_shape(lowering, context, x, y, unfolds, depth_left),
         Some(s) -> if is_identity(context, s, lowering.identities) {
           lift(lowering, eq(lowering.terms, x, y))
         } else if depth_left <= 0 { related(lowering, context, Some(s), x, y) }
@@ -1146,7 +1149,7 @@ fn equal_within(
           let nx = decimal_normalized(lowering.terms, x);
           let ny = decimal_normalized(nx.terms, y);
           lift(lowering, eq(ny.terms, nx.id, ny.id))
-        } else { pointwise(lowering, context, Some(s), x, y, unfolds, depth_left - 1) },
+        } else { equal_by_parts(lowering, context, Some(s), x, y, unfolds, depth_left - 1) },
       }
     },
   }
@@ -1172,7 +1175,7 @@ fn nullary(terms: Terms, t: Int) -> Bool / {abort.raise} =
 
 /// `==` of operands no sort is known of, by what their shapes say: a literal of a sort whose `==` is
 /// identity, or constructors, cells and records taken apart.
-fn by_shape(
+fn equal_by_shape(
   lowering: Lowering,
   context: Context,
   x: Int,
@@ -1190,12 +1193,12 @@ fn by_shape(
     };
   if plain(x) || plain(y) { lift(lowering, eq(lowering.terms, x, y)) }
   else if depth_left <= 0 { related(lowering, context, None, x, y) }
-  else { pointwise(lowering, context, None, x, y, unfolds, depth_left - 1) }
+  else { equal_by_parts(lowering, context, None, x, y, unfolds, depth_left - 1) }
 }
 
 /// `==` of two values of a sort holding a part whose `==` is not identity: by constructor, cell or
 /// field where both shapes are in view, a record's fields always; otherwise the relation alone.
-fn pointwise(
+fn equal_by_parts(
   lowering: Lowering,
   context: Context,
   sort: Option<Sort>,
@@ -1271,7 +1274,7 @@ fn related(
   let sorts = [sort_of(lowering.terms, x), sort_of(lowering.terms, y)];
   // A sort that leaves nothing unsettled is both operands' type.
   let resolved = sorts.filter(|s: Option<Sort>|
-    match s { Some(t) -> !vars(t, []).any(|v: Int| v >= foreign_base()), None -> false });
+    match s { Some(t) -> !vars(t, []).any(|v: Int| v >= external_variable_base()), None -> false });
   let keyed = match resolved.at(0) {
     Some(s) -> may_call_key(context, s),
     None -> sorts.any(|s: Option<Sort>| may_call_key(context, s)),
@@ -1282,14 +1285,15 @@ fn related(
     Some(t) -> is_reflexive(context, t, lowering.identities),
     None -> false,
   };
-  lift(lw, equal_at(lw.terms, x, y, reflexive))
+  lift(lw, intern_equality(lw.terms, x, y, reflexive))
 }
 
 /// Of two sorts one value may have, the one that knows more: a sort whose type arguments are known
 /// over one whose are not.
 fn more_specific_sort(a: Option<Sort>, b: Option<Sort>) -> Option<Sort> =
   match a {
-    Some(s) -> if vars(s, []).any(|v: Int| v >= foreign_base()) && b != None { b } else { a },
+    Some(s) -> if vars(s, []).any(|v: Int| v >= external_variable_base()) && b != None { b }
+    else { a },
     None -> b,
   }
 
@@ -1581,7 +1585,7 @@ fn call_head(
                     is_pure(context, name)
                       || effect_parameters_pure(told.lowering, context, name, args),
                     note_unfold_rejection(told.lowering, context, name),
-                    told.fitted,
+                    told.matched,
                   ),
               }
             }
@@ -1593,8 +1597,18 @@ fn call_head(
   };
   match opened {
     Resolved(r) -> r,
-    LeaveCall(pure, lw2, fitted) -> {
-      let returned = call_not_unfolded(lw2, context, who, head, args, sort, pure, fitted, unfolds);
+    LeaveCall(pure, lw2, match_pattern) -> {
+      let returned = call_not_unfolded(
+        lw2,
+        context,
+        who,
+        head,
+        args,
+        sort,
+        pure,
+        match_pattern,
+        unfolds,
+      );
       // What a call returns holds its type's invariant unless the claim made a value of a type that
       // states one, which the call may have been handed.
       if returned.lowering.tainted.len() > 0 { returned } else {
@@ -1617,10 +1631,10 @@ fn call_not_unfolded(
   args: List<Int>,
   sort: Option<Sort>,
   pure: Bool,
-  fitted: Bool,
+  match_pattern: Bool,
   unfolds: Int,
 ) -> LoweredTerm / {abort.raise} = {
-  let total = fitted || callee_is_total(lw2, context, who, head.id, args);
+  let total = match_pattern || callee_is_total(lw2, context, who, head.id, args);
   // A definition whose contract is in hand returns wherever its `requires` hold.
   match match who {
       Named(name) -> if total || !pure { None }
@@ -1631,7 +1645,7 @@ fn call_not_unfolded(
     None -> {
       let lw3 = if !total { require_unreachable(lw2) } else { lw2 };
       match match who {
-          Unresolved(name) -> match folded_builtin(lw3, name, args) {
+          Unresolved(name) -> match evaluate_builtin(lw3, name, args) {
             Some(r) -> Some(r),
             None -> list_builtin(lw3, name, head.id, args),
           },
@@ -1730,7 +1744,7 @@ fn law_covers_call(
   declared: List<Sort>,
   terms: List<Int>,
 ) -> Bool =
-  !declared.any(|t: Sort| holds_function(context, t))
+  !declared.any(|t: Sort| contains_function(context, t))
     && !keyed_at_variable(lowering, context, declared, terms)
 
 /// Whether a variable of `declared`, fixed by the sorts of `terms`, may be a type whose `==` calls
@@ -1757,7 +1771,7 @@ fn keyed_at_variable(
     })
 
 /// Whether a value of `ty` is or holds a function, through any declaration.
-fn holds_function(context: Context, ty: Sort) -> Bool = function_within(context, ty, [], 64)
+fn contains_function(context: Context, ty: Sort) -> Bool = function_within(context, ty, [], 64)
 
 fn function_within(context: Context, ty: Sort, seen: List<String>, depth_left: Int) -> Bool =
   depth_left <= 0
@@ -1781,9 +1795,9 @@ fn function_within(context: Context, ty: Sort, seen: List<String>, depth_left: I
 /// Whether a value of `ty` can hold one of the types `names`, at any depth and through any
 /// declaration. A type variable holds none: what stands on it was shown at every type.
 fn mentions_any(context: Context, ty: Sort, names: List<String>) -> Bool =
-  names.len() > 0 && holds_any(context, ty, names, [], 64)
+  names.len() > 0 && contains_any_name(context, ty, names, [], 64)
 
-fn holds_any(
+fn contains_any_name(
   context: Context,
   ty: Sort,
   names: List<String>,
@@ -1794,20 +1808,22 @@ fn holds_any(
     || (match ty {
       SortVariable(_) -> false,
       NamedSort(n, args) ->
-        names.contains(n) || args.any(|a: Sort| holds_any(context, a, names, seen, depth_left - 1))
+        names.contains(n)
+          || args.any(|a: Sort| contains_any_name(context, a, names, seen, depth_left - 1))
           || (!seen.contains(n)
           && (match context.declarations.get(n) {
             Some(declaration) ->
               declaration.variants.any(|v: Variant|
-                v.fields.any(|f: Sort| holds_any(context, f, names, seen.push(n), depth_left - 1))),
+                v.fields.any(|f: Sort|
+                  contains_any_name(context, f, names, seen.push(n), depth_left - 1))),
             None -> false,
           })),
       FunctionSort(params, ret, _) ->
-        params.any(|p: Sort| holds_any(context, p, names, seen, depth_left - 1))
-          || holds_any(context, ret, names, seen, depth_left - 1),
+        params.any(|p: Sort| contains_any_name(context, p, names, seen, depth_left - 1))
+          || contains_any_name(context, ret, names, seen, depth_left - 1),
       RecordSort(fields) ->
         fields.any(|f: { name: String, ty: Sort }|
-          holds_any(context, f.ty, names, seen, depth_left - 1)),
+          contains_any_name(context, f.ty, names, seen, depth_left - 1)),
     })
 
 /// A call of `name` read by its contract, where one is in hand: a proved `ensures` shows the body
@@ -1922,7 +1938,7 @@ fn contract_applies(lowering: Lowering, context: Context, name: String) -> Bool 
       None -> false,
     }))
 
-type LemmaUse = { lowering: Lowering, apart: Bool, fitted: Bool }
+type LemmaUse = { lowering: Lowering, apart: Bool, matched: Bool }
 
 /// Each lemma whose trigger the call `name(args)` fits puts its claim at what the trigger bound into
 /// the proof, lowered on one unfolding less, as a definition's body is.
@@ -1934,7 +1950,7 @@ fn lemma_instances(
   unfolds: Int,
 ) -> LemmaUse / {abort.raise} =
   lowering.lemmas.fold(
-    { lowering: lowering, apart: false, fitted: false },
+    { lowering: lowering, apart: false, matched: false },
     |acc: LemmaUse, lemma: Lemma|
       if unfolds <= 0 || lemma.function != name || lemma.args.len() != args.len()
           || lemma.typed.any(|t: Sort| mentions_any(context, t, acc.lowering.tainted)) { acc }
@@ -1954,7 +1970,7 @@ fn lemma_instances(
               {
                 lowering: lemma_instance(acc.lowering, context, lemma, terms, unfolds - 1),
                 apart: acc.apart || (lemma.apart && results),
-                fitted: acc.fitted || results,
+                matched: acc.matched || results,
               }
             },
           },
@@ -2001,7 +2017,7 @@ fn fitted_all(
       match acc {
         None -> None,
         Some(bs) -> match ((patterns.at(i), ts.at(i))) {
-          (Some(p), Some(t)) -> fitted(lowering, context, p, t, bs),
+          (Some(p), Some(t)) -> match_pattern(lowering, context, p, t, bs),
           _ -> None,
         },
       })
@@ -2009,7 +2025,7 @@ fn fitted_all(
 
 /// What the trigger's pattern binds when the term `t` fits it: a binder binds the term, a global or a
 /// literal is the term it lowers to, and a call or a list fits one of the same shape.
-fn fitted(
+fn match_pattern(
   lowering: Lowering,
   context: Context,
   pattern: Code,
@@ -2128,7 +2144,7 @@ fn where_owed(lowering: Lowering, owing: Lowering, fact: Int) -> LoweredTerm / {
 }
 
 /// A `Float` builtin over literals: the bits a run returns, which every machine agrees on.
-fn folded_builtin(
+fn evaluate_builtin(
   lowering: Lowering,
   name: String,
   args: List<Int>,
@@ -2227,7 +2243,7 @@ fn apply_function(
 ) -> LoweredTerm / {abort.raise} =
   if unfolds <= 0 {
     let sorts = args.map(|a: Int| sort_of(lowering.terms, a));
-    let lw = if function_total(lowering, context, f, sorts) { lowering }
+    let lw = if function_always_returns(lowering, context, f, sorts) { lowering }
     else { require_unreachable(lowering) };
     if function_pure(lowering, context, f) { lift(lw, app(lw.terms, f, args, None)) }
     else { lift({ ..lw, impure: true }, symbol(lw.terms, None)) }
@@ -2252,7 +2268,7 @@ fn remainder(
   let f = match args.at(args.len() - 1) { Some(t) -> t, None -> 0 };
   // `f` is handed the list's elements and what the other arguments start it at.
   let sorts = args.take(args.len() - 1).map(|a: Int| sort_of(lowering.terms, a));
-  let lw = if function_total(lowering, context, f, sorts) { lowering }
+  let lw = if function_always_returns(lowering, context, f, sorts) { lowering }
   else { require_unreachable(lowering) };
   if function_pure(lowering, context, f) { lift(lw, app(lw.terms, head, args, sort)) }
   else { lift({ ..lw, impure: true }, symbol(lw.terms, sort)) }
@@ -2448,7 +2464,13 @@ fn callee_is_total(
   args: List<Int>,
 ) -> Bool / {abort.raise} =
   match who {
-    Local -> function_total(lowering, context, head, args.map(|a: Int| sort_of(lowering.terms, a))),
+    Local ->
+      function_always_returns(
+        lowering,
+        context,
+        head,
+        args.map(|a: Int| sort_of(lowering.terms, a)),
+      ),
     Named(name) -> ctor(context, name) != None || lowering.total.contains(name),
     Unresolved(name) ->
       builtin_returns(context, name, args.map(|a: Int| sort_of(lowering.terms, a))),
@@ -2513,13 +2535,13 @@ fn try_unfold(
   if unfolds <= 0 || lowering.unfolds_left <= 0 || size(lowering.terms) >= max_terms() { None }
   else {
     let unrolling = lowering.unrolled.contains(name);
-    let whole = args.fold(true, |all: Bool, a: Int| all && in_view(lowering.terms, a));
+    let whole = args.fold(true, |all: Bool, a: Int| all && has_known_structure(lowering.terms, a));
     // A recursion that ends, over a value in view, runs as a call of it does: as deep as `unfolds`
     // allows, apart from the depth an unfolding inside another counts.
     let over_view = !unrolling && is_recursive(context, name) && terminates(context, name)
-      && args.any(|a: Int| in_view(lowering.terms, a) && !is_literal(lowering.terms, a))
+      && args.any(|a: Int| has_known_structure(lowering.terms, a) && !is_literal(lowering.terms, a))
       && args.all(|a: Int|
-        in_view(lowering.terms, a) || scalar(context, sort_of(lowering.terms, a)));
+        has_known_structure(lowering.terms, a) || scalar(context, sort_of(lowering.terms, a)));
     if !over_view && lowering.depth >= lowering.unfold_limit { None }
     // One step of a recursive definition: the hypothesis speaks about the call that remains. A call
     // on values in view needs no hypothesis, and unrolls as far as the depth allows.
@@ -2582,7 +2604,8 @@ fn scalar(context: Context, sort: Option<Sort>) -> Bool =
 
 /// A value the lowering sees all of that a recursion could take apart: a literal, a constructor of
 /// them, or a list's whole spine, whatever its elements.
-fn in_view(terms: Terms, t: Int) -> Bool / {abort.raise} = seen_whole(terms, t, size(terms))
+fn has_known_structure(terms: Terms, t: Int) -> Bool / {abort.raise} =
+  seen_whole(terms, t, size(terms))
 
 /// A term's arguments are made before it, so no chain of them is longer than the store.
 fn seen_whole(terms: Terms, t: Int, depth_left: Int) -> Bool / {abort.raise} =
@@ -3020,8 +3043,8 @@ pub fn field_sorts(c: Constructor, sort: Option<Sort>) -> List<Option<Sort>> = {
   let args = match sort {
     Some(NamedSort(name, xs)) -> if name == c.declaration.name && xs.len() == c.declaration.params {
       xs
-    } else { range(0, c.declaration.params).map(|p: Int| foreign(SortVariable(p))) },
-    _ -> range(0, c.declaration.params).map(|p: Int| foreign(SortVariable(p))),
+    } else { range(0, c.declaration.params).map(|p: Int| shift_variables(SortVariable(p))) },
+    _ -> range(0, c.declaration.params).map(|p: Int| shift_variables(SortVariable(p))),
   };
   c.variant.fields.map(|f: Sort| Some(substituted(f, args)))
 }
@@ -3045,7 +3068,7 @@ fn constructor_result_sort(c: Constructor, args: List<Int>, terms: Terms) -> Opt
     NamedSort(
       c.declaration.name,
       range(0, c.declaration.params).map(|p: Int|
-        match substitution.get(p) { Some(s) -> s, None -> foreign(SortVariable(p)) }),
+        match substitution.get(p) { Some(s) -> s, None -> shift_variables(SortVariable(p)) }),
     ),
   )
 }

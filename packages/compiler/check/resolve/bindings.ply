@@ -35,7 +35,7 @@ pub type Refers =
   | Local(Int)
   | Definition({ qualified: Bytes, namespace: Namespace })
   | Operation({ effect: Bytes, name: Bytes })
-  | Module(Int)
+  | ModuleQualifier(Int)
   | Unbound
 
 pub type Reference = {
@@ -43,7 +43,7 @@ pub type Reference = {
   start: Int,
   end: Int,
   name: Bytes,
-  refers: Refers,
+  target: Refers,
   shorthand: Bool,
 }
 
@@ -74,7 +74,7 @@ fn walk_of(resolved: Resolution, index: Int) -> Walk =
     members: None,
   }
 
-fn unresolved() -> Walk =
+fn empty_walk() -> Walk =
   {
     find: |_: Namespace, _: QName| None,
     module_named: |_: Bytes| None,
@@ -89,11 +89,11 @@ fn reference(name: Identifier, refers: Refers, shorthand: Bool) -> Reference =
     start: name.span.start,
     end: name.span.end,
     name: name.name,
-    refers: refers,
+    target: refers,
     shorthand: shorthand,
   }
 
-fn noted(w: Walk, name: Identifier, refers: Refers, shorthand: Bool) -> Walk =
+fn record_reference(w: Walk, name: Identifier, refers: Refers, shorthand: Bool) -> Walk =
   { ..w, found: w.found.insert(name.span.site, reference(name, refers, shorthand)) }
 
 fn member(w: Walk, name: Identifier, kind: MemberKind) -> Walk =
@@ -114,7 +114,7 @@ fn member(w: Walk, name: Identifier, kind: MemberKind) -> Walk =
   }
 
 fn refers_of(w: Walk, name: Identifier) -> Refers =
-  match w.found.get(name.span.site) { Some(r) -> r.refers, None -> Unbound }
+  match w.found.get(name.span.site) { Some(r) -> r.target, None -> Unbound }
 
 fn pushed(w: Walk) -> Walk = { ..w, scopes: w.scopes.push(Map::new()) }
 
@@ -126,7 +126,7 @@ fn scoped(w: Walk, name: Bytes, refers: Refers) -> Walk / {abort.raise} = {
   { ..w, scopes: w.scopes.take(w.scopes.len() - 1).push(inner.insert(name, refers)) }
 }
 
-fn local(w: Walk, name: Bytes) -> Option<Refers> =
+fn find_local(w: Walk, name: Bytes) -> Option<Refers> =
   w.scopes.fold(None, |found: Option<Refers>, scope: Map<Bytes, Refers>|
     match scope.get(name) { Some(r) -> Some(r), None -> found })
 
@@ -137,9 +137,11 @@ fn binder(w: Walk, name: Identifier, shorthand: Bool, again: Bool) -> Walk / {ab
     panic(
       "a binder has no site: numbering gives every written one a site, and a maker mints one for each it makes",
     )
-  } else if again { noted(w, name, local(w, name.name).unwrap_or(Unbound), shorthand) } else {
+  } else if again {
+    record_reference(w, name, find_local(w, name.name).unwrap_or(Unbound), shorthand)
+  } else {
     let site = name.span.site;
-    noted(scoped(w, name.name, Local(site)), name, Local(site), shorthand)
+    record_reference(scoped(w, name.name, Local(site)), name, Local(site), shorthand)
   }
 
 fn bare(name: Identifier) -> QName = { module: None, name: name, span: name.span }
@@ -154,23 +156,23 @@ fn qualifier(w: Walk, qname: QName) -> Walk / {abort.raise} =
   match qname.module {
     None -> w,
     Some(q) -> match (w.module_named)(q.name) {
-      Some(m) -> noted(w, q, Module(m), false),
+      Some(m) -> record_reference(w, q, ModuleQualifier(m), false),
       None -> match definition(w, TypeSpace, bare(q)) {
         Unbound -> w,
-        type_named -> noted(w, q, type_named, false),
+        type_named -> record_reference(w, q, type_named, false),
       },
     },
   }
 
 fn value_named(w: Walk, qname: QName, shorthand: Bool) -> Walk / {abort.raise} = {
   let refers = match qname.module {
-    None -> match local(w, qname.name.name) {
+    None -> match find_local(w, qname.name.name) {
       Some(r) -> r,
       None -> definition(w, ValueSpace, qname),
     },
     Some(_) -> definition(w, ValueSpace, qname),
   };
-  noted(qualifier(w, qname), qname.name, refers, shorthand)
+  record_reference(qualifier(w, qname), qname.name, refers, shorthand)
 }
 
 fn made_field(name: Identifier, at: Span) -> Bool =
@@ -192,13 +194,13 @@ fn walk_field(w: Walk, field: RecordLiteralField) -> Walk / {abort.raise} =
   }
 
 fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
-  noted(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
+  record_reference(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
 
 fn effect_of(w: Walk, eff: QName) -> Bytes / {abort.raise} =
   match (w.find)(EffectSpace, eff) { Some(b) -> b.qualified, None -> eff.name.name }
 
 fn operation(w: Walk, eff: QName, op: Identifier) -> Walk / {abort.raise} =
-  noted(
+  record_reference(
     named_in(w, EffectSpace, eff),
     op,
     Operation({ effect: effect_of(w, eff), name: op.name }),
@@ -303,7 +305,10 @@ fn walk_statement(w: Walk, s: Statement) -> Walk / {abort.raise} =
       ),
     ExpressionStatement(e) -> walk_expression(w, e),
     AssignmentStatement(a) ->
-      walk_expression(noted(w, a.name, local(w, a.name.name).unwrap_or(Unbound), false), a.value),
+      walk_expression(
+        record_reference(w, a.name, find_local(w, a.name.name).unwrap_or(Unbound), false),
+        a.value,
+      ),
   }
 
 fn in_scope(w: Walk, vars: List<HandlerVar>) -> Walk / {abort.raise} =
@@ -362,11 +367,15 @@ fn walk_expression(w: Walk, e: Expression) -> Walk / {abort.raise} =
     FieldExpression(f) -> member(walk_expression(w, f.base), f.field, FieldName),
     ListExpression(l) -> l.items.fold(w, walk_expression),
     PerformExpression(p) -> match if p.effect_name.module == None {
-        local(w, p.effect_name.name.name)
+        find_local(w, p.effect_name.name.name)
       } else { None } {
       Some(Local(b)) ->
         p.args.fold(
-          member(noted(w, p.effect_name.name, Local(b), false), p.op, CalledName(p.span.site)),
+          member(
+            record_reference(w, p.effect_name.name, Local(b), false),
+            p.op,
+            CalledName(p.span.site),
+          ),
           walk_expression,
         ),
       _ -> p.args.fold(operation(w, p.effect_name, p.op), walk_expression),
@@ -403,7 +412,8 @@ fn walk_fn(w: Walk, f: FnDefinition) -> Walk / {abort.raise} = {
   let params = walk_params(named_in(w, ValueSpace, bare(f.name)), f.params);
   let typed = walk_optional_effects(walk_optional_type(params, f.ret), f.effects);
   let returned = match f.returns {
-    Some(ReturnsParam(p)) -> noted(typed, p, local(typed, p.name).unwrap_or(Unbound), false),
+    Some(ReturnsParam(p)) ->
+      record_reference(typed, p, find_local(typed, p.name).unwrap_or(Unbound), false),
     _ -> typed,
   };
   let specs = f.spec.fold(returned, |acc: Walk, s: SpecClause| walk_spec(acc, f.params, s));
@@ -445,7 +455,7 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
     EffectItem(eff) -> {
       let qualified = effect_of(w, bare(eff.name));
       eff.operations.fold(named_in(w, EffectSpace, bare(eff.name)), |acc: Walk, op: OpDefinition| {
-        let declared = noted(
+        let declared = record_reference(
           acc,
           op.name,
           Operation({ effect: qualified, name: op.name.name }),
@@ -517,14 +527,14 @@ pub fn expression_binders(
   binders_of(walk_expression(walk_of(resolved, index), expression).found)
 
 pub fn body_binders(params: List<Identifier>, body: Expression) -> Map<Int, Int> / {abort.raise} =
-  binders_of(walk_expression(params.fold(pushed(unresolved()), bound), body).found)
+  binders_of(walk_expression(params.fold(pushed(empty_walk()), bound), body).found)
 
 pub fn item_locals(item: Item) -> Map<Int, Int> / {abort.raise} =
-  binders_of(walk_item(unresolved(), item).found)
+  binders_of(walk_item(empty_walk(), item).found)
 
 fn binders_of(found: Map<Int, Reference>) -> Map<Int, Int> =
   found.fold(Map::new(), |binders: Map<Int, Int>, site: Int, r: Reference|
-    match r.refers { Local(b) -> binders.insert(site, b), _ -> binders })
+    match r.target { Local(b) -> binders.insert(site, b), _ -> binders })
 
 pub fn written(resolved: Resolution, index: Int, module: Module) -> List<Written> / {abort.raise} =
   module.items.fold(

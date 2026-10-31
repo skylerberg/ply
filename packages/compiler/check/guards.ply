@@ -72,7 +72,7 @@ pub fn no_guards() -> Guards =
     ranged: None,
   }
 
-pub fn after_branch(now: Guards, before: Guards) -> Guards =
+pub fn restore_assumptions(now: Guards, before: Guards) -> Guards =
   { ..now, holds: before.holds, apart: before.apart, met: before.met, ranged: None }
 
 fn limit() -> Int = 4611686018427387904
@@ -128,7 +128,7 @@ fn plus(a: Linear, b: Linear, by: Int) -> Option<Linear> =
 fn times(a: Linear, by: Int) -> Option<Linear> =
   if by == 0 { Some(constant(0)) } else { plus(constant(0), a, by) }
 
-fn below(l: Linear) -> Option<Linear> = plus(l, constant(1), 0 - 1)
+fn strictly_positive(l: Linear) -> Option<Linear> = plus(l, constant(1), 0 - 1)
 
 fn negation(l: Linear) -> Option<Linear> = plus(constant(0 - 1), l, 0 - 1)
 
@@ -152,13 +152,13 @@ fn max_eliminations() -> Int = 12
 fn unsatisfiable(facts: List<Linear>, fuel: Int) -> Bool / {abort.raise} =
   if facts.fold(false, |no: Bool, l: Linear| no || refuted(l)) { true }
   else if fuel <= 0 || facts.len() > max_inequalities() { false } else {
-    match pivot(facts) {
+    match term_to_eliminate(facts) {
       None -> false,
       Some(term) -> unsatisfiable(eliminated(facts, term), fuel - 1),
     }
   }
 
-fn pivot(facts: List<Linear>) -> Option<Int> = {
+fn term_to_eliminate(facts: List<Linear>) -> Option<Int> = {
   let terms = facts.fold([], |acc: List<Int>, l: Linear|
     l.terms.fold(acc, |a: List<Int>, x: Scaled| a.push_unique(x.term)));
   terms.fold({ best: None, cost: 0 }, |acc: { best: Option<Int>, cost: Int }, term: Int| {
@@ -173,10 +173,10 @@ fn eliminated(facts: List<Linear>, term: Int) -> List<Linear> / {abort.raise} = 
   let under = facts.filter(|l: Linear| coefficient(l, term) < 0);
   above.fold(facts.filter(|l: Linear| coefficient(l, term) == 0), |acc: List<Linear>, p: Linear|
     under.fold(acc, |a: List<Linear>, n: Linear|
-      match combined(p, n, term) { Some(l) -> a.push(l), None -> a }))
+      match cancel_term(p, n, term) { Some(l) -> a.push(l), None -> a }))
 }
 
-fn combined(p: Linear, n: Linear, term: Int) -> Option<Linear> / {abort.raise} =
+fn cancel_term(p: Linear, n: Linear, term: Int) -> Option<Linear> / {abort.raise} =
   match times(p, 0 - coefficient(n, term)) {
     None -> None,
     Some(scaled) -> match plus(scaled, n, coefficient(p, term)) {
@@ -282,7 +282,7 @@ fn shown_by(facts: List<Linear>, l: Linear) -> Bool / {abort.raise} =
     None -> false,
   }
 
-fn mask_over(n: Int) -> Int =
+fn ones_mask(n: Int) -> Int =
   range(0, 62).fold(0, |m: Int, _i: Int| if m >= n { m } else { m * 2 + 1 })
 
 fn rule_facts(facts: List<Linear>, rule: Rule) -> List<Linear> / {abort.raise} =
@@ -293,7 +293,7 @@ fn rule_facts(facts: List<Linear>, rule: Rule) -> List<Linear> / {abort.raise} =
       (Some(x), Some(y)) -> if x < 0 || y < 0 { facts } else {
         match ((ceiling_of(facts, j.x), ceiling_of(facts, j.y))) {
           (Some(a), Some(b)) -> {
-            let top = mask_over(max(a, b));
+            let top = ones_mask(max(a, b));
             match plus(constant(top), of_term(j.term), 0 - 1) {
               Some(under) -> facts.push(of_term(j.term)).push(under),
               None -> facts,
@@ -306,7 +306,7 @@ fn rule_facts(facts: List<Linear>, rule: Rule) -> List<Linear> / {abort.raise} =
     },
   }
 
-type RelevantFacts = { ge: List<Linear>, ne: List<Linear> }
+type RelevantFacts = { non_negative: List<Linear>, ne: List<Linear> }
 
 fn relevant_facts(g: Guards, l: Linear) -> RelevantFacts / {abort.raise} = {
   let plain = g.results.fold(g.always.concat(g.holds), |acc: List<Linear>, a: EnsuredResult|
@@ -316,18 +316,21 @@ fn relevant_facts(g: Guards, l: Linear) -> RelevantFacts / {abort.raise} = {
   let about = |x: Linear| x.terms.any(|t: Scaled| near.contains(t.term));
   let ne = g.apart.filter(about);
   {
-    ge: g.rules.fold(ne.fold(plain.filter(about), sided), |acc: List<Linear>, r: Rule|
-      if rule_terms(r).any(|t: Int| near.contains(t)) { rule_facts(acc, r) } else { acc }),
+    non_negative: g.rules.fold(
+      ne.fold(plain.filter(about), sign_bounds),
+      |acc: List<Linear>, r: Rule|
+        if rule_terms(r).any(|t: Int| near.contains(t)) { rule_facts(acc, r) } else { acc },
+    ),
     ne: ne,
   }
 }
 
-fn sided(facts: List<Linear>, d: Linear) -> List<Linear> / {abort.raise} =
+fn sign_bounds(facts: List<Linear>, d: Linear) -> List<Linear> / {abort.raise} =
   match times(d, 0 - 1) {
     None -> facts,
     Some(negated) -> {
-      let side = if evident(facts, d) { below(d) }
-      else if evident(facts, negated) { below(negated) }
+      let side = if evident(facts, d) { strictly_positive(d) }
+      else if evident(facts, negated) { strictly_positive(negated) }
       else { None };
       match side { Some(l) -> facts.push(l), None -> facts }
     },
@@ -339,7 +342,7 @@ fn follows(g: Guards, l: Linear) -> Bool / {abort.raise} =
       None -> false,
       Some(not) -> {
         let b = relevant_facts(g, l);
-        impossible(b.ge.push(not), b.ne, 2)
+        impossible(b.non_negative.push(not), b.ne, 2)
       },
     }
   }
@@ -350,14 +353,14 @@ fn differs(g: Guards, l: Linear) -> Bool / {abort.raise} =
       None -> false,
       Some(negated) -> {
         let b = relevant_facts(g, l);
-        impossible(b.ge.push(l).push(negated), b.ne, 2)
+        impossible(b.non_negative.push(l).push(negated), b.ne, 2)
       },
     }
   }
 
-type Termed = { g: Guards, term: Int, fresh: Bool }
+type TermLookup = { g: Guards, term: Int, fresh: Bool }
 
-fn term(g: Guards, key: Bytes) -> Termed =
+fn term(g: Guards, key: Bytes) -> TermLookup =
   match g.terms.get(key) {
     Some(t) -> { g: g, term: t, fresh: false },
     None -> {
@@ -444,7 +447,7 @@ fn read_typed(reader: Reader, g: Guards, key: Bytes, ty: Type) -> ReadResult / {
 
 fn local_term(binder: Int) -> Bytes = b"v".concat(ascii_of_int(binder))
 
-fn place(
+fn path_of(
   reader: Reader,
   g: Guards,
   e: Expression,
@@ -458,7 +461,7 @@ fn place(
         }),
       _ -> None,
     },
-    FieldExpression(f) -> match place(reader, g, f.base) {
+    FieldExpression(f) -> match path_of(reader, g, f.base) {
       None -> None,
       Some(p) -> match record_fields((reader.head)(p.ty)) {
         None -> None,
@@ -487,7 +490,7 @@ fn read_within(
       _ -> unknown_value(g),
     },
     NameExpression(v) -> read_name(reader, g, v.name),
-    FieldExpression(_) -> match place(reader, g, e) {
+    FieldExpression(_) -> match path_of(reader, g, e) {
       Some(p) -> read_typed(reader, g, p.key, p.ty),
       None -> unknown_value(g),
     },
@@ -631,7 +634,7 @@ fn add_ensures(
     let within_clause = clause_reader(reader, st, values, Number(of_term(term)));
     st.ensures.fold(g, |acc: Guards, c: Clause| {
       let s = suppose(within_clause, acc, c.holds, true, budget - 1);
-      s.ge.fold(s.g, |known: Guards, l: Linear|
+      s.non_negative.fold(s.g, |known: Guards, l: Linear|
         if l.terms.len() == 0 { known }
         else if st.raises { { ..known, results: known.results.push({ term: term, holds: l }) } }
         else { add_fact(known, l) })
@@ -651,8 +654,8 @@ fn read_operator(g: Guards, op: Bytes, x: Linear, y: Linear) -> ReadResult / {ab
     let q = of_term(t.term);
     {
       g: if !t.fresh { t.g }
-      else if op == b"div" { quotient(t.g, q, x, y) }
-      else if op == b"rem" { remainder(t.g, q, x, y) }
+      else if op == b"div" { with_quotient(t.g, q, x, y) }
+      else if op == b"rem" { with_remainder(t.g, q, x, y) }
       else if op == b"bitand" { masked(masked(t.g, q, x), q, y) }
       else if op == b"bitor" || op == b"bitxor" {
         { ..t.g, rules: t.g.rules.push(Bitwise({ term: t.term, x: x, y: y })) }
@@ -662,9 +665,9 @@ fn read_operator(g: Guards, op: Bytes, x: Linear, y: Linear) -> ReadResult / {ab
     }
   }
 
-fn quotient(g: Guards, q: Linear, x: Linear, y: Linear) -> Guards / {abort.raise} =
+fn with_quotient(g: Guards, q: Linear, x: Linear, y: Linear) -> Guards / {abort.raise} =
   if y.terms.len() > 0 {
-    let positive = [below(y), Some(x)];
+    let positive = [strictly_positive(y), Some(x)];
     add_rule(add_rule(g, positive, Some(q)), positive, plus(x, q, 0 - 1))
   } else if y.k < 1 { g } else {
     let whole = times(q, y.k);
@@ -679,8 +682,8 @@ fn quotient(g: Guards, q: Linear, x: Linear, y: Linear) -> Guards / {abort.raise
     )
   }
 
-fn remainder(g: Guards, r: Linear, x: Linear, y: Linear) -> Guards / {abort.raise} = {
-  let positive = below(y);
+fn with_remainder(g: Guards, r: Linear, x: Linear, y: Linear) -> Guards / {abort.raise} = {
+  let positive = strictly_positive(y);
   let budget = match positive { Some(p) -> plus(p, r, 0 - 1), None -> None };
   let back = match positive { Some(p) -> plus(p, r, 1), None -> None };
   add_rule(
@@ -714,9 +717,9 @@ fn shifted(g: Guards, s: Linear, x: Linear, y: Linear, logical: Bool) -> Guards 
     }
   }
 
-type Supposition = { g: Guards, ge: List<Linear>, ne: List<Linear> }
+type Supposition = { g: Guards, non_negative: List<Linear>, ne: List<Linear> }
 
-fn no_supposition(g: Guards) -> Supposition = { g: g, ge: [], ne: [] }
+fn no_supposition(g: Guards) -> Supposition = { g: g, non_negative: [], ne: [] }
 
 fn comparison(op: Bytes) -> Bool =
   op == b"lt" || op == b"le" || op == b"gt" || op == b"ge" || op == b"eq" || op == b"ne"
@@ -743,7 +746,7 @@ fn suppose(
       if b.op == b"and" != truth { no_supposition(g) } else {
         let l = suppose(reader, g, b.lhs, truth, budget);
         let r = suppose(reader, l.g, b.rhs, truth, budget);
-        { g: r.g, ge: l.ge.concat(r.ge), ne: l.ne.concat(r.ne) }
+        { g: r.g, non_negative: l.non_negative.concat(r.non_negative), ne: l.ne.concat(r.ne) }
       }
     } else if !comparison(b.op) { no_supposition(g) } else {
       let l = read_within(reader, g, b.lhs, budget);
@@ -767,11 +770,11 @@ fn suppose(
 fn compared(g: Guards, op: Bytes, x: Linear, y: Linear) -> Supposition / {abort.raise} = {
   let up = plus(y, x, 0 - 1);
   let down = plus(x, y, 0 - 1);
-  let strictly = |d: Option<Linear>| match d { Some(l) -> below(l), None -> None };
+  let strictly = |d: Option<Linear>| match d { Some(l) -> strictly_positive(l), None -> None };
   let ge = |ds: List<Option<Linear>>|
     {
       g: g,
-      ge: ds.fold([], |acc: List<Linear>, d: Option<Linear>|
+      non_negative: ds.fold([], |acc: List<Linear>, d: Option<Linear>|
         match d { Some(l) -> acc.push(tightened(l)), None -> acc }),
       ne: [],
     };
@@ -780,12 +783,12 @@ fn compared(g: Guards, op: Bytes, x: Linear, y: Linear) -> Supposition / {abort.
   else if op == b"gt" { ge([strictly(down)]) }
   else if op == b"ge" { ge([down]) }
   else if op == b"eq" { ge([up, down]) }
-  else { { g: g, ge: [], ne: match down { Some(l) -> [l], None -> [] } } }
+  else { { g: g, non_negative: [], ne: match down { Some(l) -> [l], None -> [] } } }
 }
 
 pub fn assume(reader: Reader, g: Guards, e: Expression, truth: Bool) -> Guards / {abort.raise} = {
   let s = suppose(reader, g, e, truth, depth());
-  with_facts(s.g, s.ge, s.ne)
+  with_facts(s.g, s.non_negative, s.ne)
 }
 
 fn with_facts(g: Guards, ge: List<Linear>, ne: List<Linear>) -> Guards =
@@ -825,7 +828,7 @@ fn prove(
             Number(y) ->
               {
                 g: r.g,
-                ok: comparison_holds(r.g, if truth { b.op } else { opposite(b.op) }, x, y),
+                ok: comparison_implied(r.g, if truth { b.op } else { opposite(b.op) }, x, y),
               },
             _ -> { g: r.g, ok: false },
           }
@@ -839,10 +842,12 @@ fn prove(
     _ -> { g: g, ok: false },
   }
 
-fn comparison_holds(g: Guards, op: Bytes, x: Linear, y: Linear) -> Bool / {abort.raise} = {
+fn comparison_implied(g: Guards, op: Bytes, x: Linear, y: Linear) -> Bool / {abort.raise} = {
   let s = compared(g, op, x, y);
-  if op == b"ne" { s.ne.len() > 0 && s.ne.all(|l: Linear| differs(g, l)) }
-  else { s.ge.len() == (if op == b"eq" { 2 } else { 1 }) && s.ge.all(|l: Linear| follows(g, l)) }
+  if op == b"ne" { s.ne.len() > 0 && s.ne.all(|l: Linear| differs(g, l)) } else {
+    s.non_negative.len() == (if op == b"eq" { 2 } else { 1 })
+      && s.non_negative.all(|l: Linear| follows(g, l))
+  }
 }
 
 fn arguments(reader: Reader, g: Guards, args: List<Expression>) -> Arguments / {abort.raise} =
@@ -924,7 +929,7 @@ pub fn enter_range_lambda(reader: Reader, g: Guards, last: Named) -> Guards / {a
           match p.value {
             Number(x) -> {
               let from = plus(x, r.lo, 0 - 1);
-              let to = match plus(r.hi, x, 0 - 1) { Some(d) -> below(d), None -> None };
+              let to = match plus(r.hi, x, 0 - 1) { Some(d) -> strictly_positive(d), None -> None };
               with_facts(
                 p.g,
                 [from, to].fold([], |acc: List<Linear>, d: Option<Linear>|
@@ -1002,7 +1007,7 @@ fn length_of(
   }
 }
 
-fn tightened_all(ds: List<Option<Linear>>) -> List<Linear> / {abort.raise} =
+fn tightened_some(ds: List<Option<Linear>>) -> List<Linear> / {abort.raise} =
   ds.fold([], |acc: List<Linear>, d: Option<Linear>|
     match d { Some(l) -> acc.push(tightened(l)), None -> acc })
 
@@ -1033,7 +1038,7 @@ fn bounded(reader: Reader, g: Guards, scrutinee: Expression, b: Bounds) -> Guard
     Number(x) ->
       with_facts(
         r.g,
-        tightened_all([plus(x, constant(b.lo), 0 - 1), plus(constant(b.hi), x, 0 - 1)]),
+        tightened_some([plus(x, constant(b.lo), 0 - 1), plus(constant(b.hi), x, 0 - 1)]),
         [],
       ),
     _ -> r.g,
@@ -1068,9 +1073,12 @@ pub fn matched(
         Some(x) ->
           with_facts(
             found.g,
-            tightened_all([
+            tightened_some([
               Some(x.index),
-              match plus(x.length, x.index, 0 - 1) { Some(d) -> below(d), None -> None },
+              match plus(x.length, x.index, 0 - 1) {
+                Some(d) -> strictly_positive(d),
+                None -> None,
+              },
             ]),
             [],
           ),
@@ -1086,7 +1094,7 @@ pub fn matched(
             Some(_) -> None,
             None -> match over { Some(d) -> times(d, 0 - 1), None -> None },
           };
-          with_facts(n.g, tightened_all([over, under]), [])
+          with_facts(n.g, tightened_some([over, under]), [])
         },
       }
     },
@@ -1107,7 +1115,7 @@ pub fn unmatched(
         match r.value {
           Number(x) -> {
             let s = compared(r.g, b"ne", x, constant(k));
-            with_facts(s.g, s.ge, s.ne)
+            with_facts(s.g, s.non_negative, s.ne)
           },
           _ -> r.g,
         }
@@ -1125,11 +1133,11 @@ pub fn unmatched(
             let shown = |d: Option<Linear>| match d { Some(l) -> follows(r.g, l), None -> false };
             let past = |d: Option<Linear>|
               match d {
-                Some(l) -> match times(l, 0 - 1) { Some(n) -> below(n), None -> None },
+                Some(l) -> match times(l, 0 - 1) { Some(n) -> strictly_positive(n), None -> None },
                 None -> None,
               };
-            if shown(from) { with_facts(r.g, tightened_all([past(to)]), []) }
-            else if shown(to) { with_facts(r.g, tightened_all([past(from)]), []) }
+            if shown(from) { with_facts(r.g, tightened_some([past(to)]), []) }
+            else if shown(to) { with_facts(r.g, tightened_some([past(from)]), []) }
             else { r.g }
           },
           _ -> r.g,
@@ -1143,7 +1151,7 @@ pub fn unmatched(
       None -> if l.items.len() > 0 { g } else {
         let n = length_of(reader, g, scrutinee);
         match n.length {
-          Some(length) -> with_facts(n.g, tightened_all([below(length)]), []),
+          Some(length) -> with_facts(n.g, tightened_some([strictly_positive(length)]), []),
           None -> n.g,
         }
       },
@@ -1153,7 +1161,7 @@ pub fn unmatched(
 
 fn sum(terms: List<Scaled>, k: Int) -> Linear = { terms: terms, k: k }
 
-fn holding_all(facts: List<Linear>) -> Guards = { ..no_guards(), holds: facts }
+fn guards_assuming(facts: List<Linear>) -> Guards = { ..no_guards(), holds: facts }
 
 test "two bounds that cross admit no integers, and two that meet admit one" {
   let x = { term: 0, by: 1 };
@@ -1175,7 +1183,7 @@ test "an inequality is tightened to the integers, which is what refutes a half" 
 }
 
 test "a sum follows from the bounds that add up to it, through a term they share" {
-  let g = holding_all([
+  let g = guards_assuming([
     sum([{ term: 0, by: 1 }], 0),
     sum([{ term: 1, by: 1 }], 0),
     sum([{ term: 0, by: 0 - 1 }, { term: 1, by: 0 - 1 }, { term: 2, by: 1 }], 0),
@@ -1191,10 +1199,10 @@ test "a sum follows from the bounds that add up to it, through a term they share
 
 test "a value known to differ from zero is above it where it is not below" {
   let n = sum([{ term: 0, by: 1 }], 0);
-  let apart = { ..holding_all([n]), apart: [n] };
+  let apart = { ..guards_assuming([n]), apart: [n] };
   assert(differs(apart, n));
   assert(follows(apart, sum([{ term: 0, by: 1 }], 0 - 1)));
-  assert(!follows(holding_all([n]), sum([{ term: 0, by: 1 }], 0 - 1)));
+  assert(!follows(guards_assuming([n]), sum([{ term: 0, by: 1 }], 0 - 1)));
   assert(!differs({ ..no_guards(), holds: [], apart: [sum([{ term: 1, by: 1 }], 0)] }, n))
 }
 
@@ -1242,12 +1250,12 @@ test "an operator's result is bounded as the operator bounds it" {
   }
 }
 
-fn minus_one(l: Linear) -> Linear = match below(l) { Some(x) -> x, None -> l }
+fn minus_one(l: Linear) -> Linear = match strictly_positive(l) { Some(x) -> x, None -> l }
 
 test "a coefficient too big for the arithmetic gives no result, never a wrong one" {
   let big = sum([{ term: 0, by: limit() - 1 }], 0);
   assert_eq(plus(big, big, 1), None);
   assert_eq(times(big, 2), None);
   assert_eq(plus(constant(limit() - 1), constant(1), 1), None);
-  assert(!follows(holding_all([big]), sum([{ term: 1, by: 1 }], 0)))
+  assert(!follows(guards_assuming([big]), sum([{ term: 1, by: 1 }], 0)))
 }

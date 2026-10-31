@@ -17,7 +17,7 @@
 //!
 //! Mail writes a long or non-ASCII parameter value as RFC 2231 defines: in sections, `name*0`,
 //! `name*1`, and with a charset, `name*` or `name*0*`. A reader returns those parameters as
-//! written. `joined` returns each such value whole under its name, and `sectioned` writes one.
+//! written. `joined` returns each such value whole under its name, and `split_into_sections` writes one.
 //!
 //! `of_extension` and `of_path` return the type a file name's extension names, and `extension` and
 //! `extensions` return the extensions a type is written under. The table is this module's own,
@@ -94,8 +94,8 @@ pub effect mime {
 /// are skipped.
 pub fn read(text: String) -> MediaType / {mime.fail, abort.raise} = {
   let b = Bytes::of_string(text);
-  let one = read_at(b, b.skip(0, blanks()));
-  let end = b.skip(one.at, blanks());
+  let one = read_at(b, b.skip(0, optional_whitespace()));
+  let end = b.skip(one.at, optional_whitespace());
   if end < b.len() { fail(end, Trailing) } else { one.value }
 }
 
@@ -119,7 +119,7 @@ pub fn parse_list(text: String) -> Result<List<MediaType>, Error> / {abort.raise
 pub fn read_params(text: String, at: Int) -> List<Param> / {mime.fail, abort.raise} = {
   let b = Bytes::of_string(text);
   let held = parameters(b, { at: at, params: [], seen: Map::new() }, b.len() + 1);
-  let end = b.skip(held.at, blanks());
+  let end = b.skip(held.at, optional_whitespace());
   if end < b.len() { fail(end, Trailing) } else { held.params }
 }
 
@@ -156,14 +156,14 @@ fn fail<a>(at: Int, reason: ErrorKind) -> a / {mime.fail} = mime.fail({ at: at, 
 fn tchars() -> Bytes =
   b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-fn blanks() -> Bytes = b" \t"
+fn optional_whitespace() -> Bytes = b" \t"
 
 /// What ends a run of plain text in a quoted string: its quote, a backslash, and each control byte
 /// but a tab.
 fn quoted_stops() -> Bytes =
   b"\"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
 
-fn lowered(b: Bytes, from: Int, to: Int) -> String / {abort.raise} =
+fn ascii_lower_slice(b: Bytes, from: Int, to: Int) -> String / {abort.raise} =
   String::of_bytes(b.slice(from, to)).ascii_lower()
 
 type ReadResult = { value: MediaType, at: Int }
@@ -177,7 +177,11 @@ fn read_at(b: Bytes, at: Int) -> ReadResult / {mime.fail, abort.raise} = {
     if end == slash + 1 { fail(end, NoToken) } else {
       let held = parameters(b, { at: end, params: [], seen: Map::new() }, b.len() + 1);
       {
-        value: MediaType(lowered(b, at, slash), lowered(b, slash + 1, end), held.params),
+        value: MediaType(
+          ascii_lower_slice(b, at, slash),
+          ascii_lower_slice(b, slash + 1, end),
+          held.params,
+        ),
         at: held.at,
       }
     }
@@ -194,7 +198,7 @@ fn listed(
   if left <= 0 { acc }
   else if start >= b.len() { acc } else {
     let one = read_at(b, start);
-    let end = b.skip(one.at, blanks());
+    let end = b.skip(one.at, optional_whitespace());
     if end < b.len() && b.at(end) != b',' { fail(end, Trailing) }
     else { listed(b, end, acc.push(one.value), left - 1) }
   }
@@ -205,10 +209,10 @@ type ParamScan = { at: Int, params: List<Param>, seen: Map<String, Unit> }
 /// The parameters from `held.at` on. `left` bounds the recursion: each step consumes at least a
 /// `;`.
 fn parameters(b: Bytes, held: ParamScan, left: Int) -> ParamScan / {mime.fail, abort.raise} = {
-  let semi = b.skip(held.at, blanks());
+  let semi = b.skip(held.at, optional_whitespace());
   if left <= 0 { held }
   else if b.peek(semi) != b';' { held } else {
-    let start = b.skip(semi + 1, blanks());
+    let start = b.skip(semi + 1, optional_whitespace());
     let equals = b.skip(start, tchars());
     if equals == start { parameters(b, { ..held, at: start }, left - 1) }
     else if b.peek(equals) != b'=' { fail(equals, NoEquals) }
@@ -222,7 +226,7 @@ fn with_parameter(
   start: Int,
   equals: Int,
 ) -> ParamScan / {mime.fail, abort.raise} = {
-  let name = lowered(b, start, equals);
+  let name = ascii_lower_slice(b, start, equals);
   if held.seen.contains(name) { fail(start, Repeated(name)) } else {
     let value = value_at(b, equals + 1);
     {
@@ -281,9 +285,9 @@ pub fn render(m: MediaType) -> String =
 
 /// One parameter as `render` writes it: its name in lower case, `=`, and its value, quoted when it
 /// is not a token.
-pub fn param_text(p: Param) -> String = p.name.ascii_lower() ++ "=" ++ written(p.value)
+pub fn param_text(p: Param) -> String = p.name.ascii_lower() ++ "=" ++ quote_value(p.value)
 
-fn written(value: String) -> String =
+fn quote_value(value: String) -> String =
   if is_token(value) { value } else {
     "\""
       ++ String::of_chars(
@@ -312,11 +316,11 @@ pub fn is_quotable(text: String) -> Bool =
   text.chars().fold(true, |ok: Bool, c: Char|
     ok && (c == '\t' || (Int::of_char(c) >= 32 && Int::of_char(c) != 127)))
 
-type Identity = { top: String, subtype: String, params: List<Param> }
+type MediaTypeKey = { top: String, subtype: String, params: List<Param> }
 
 /// The key two media types are compared by: the names in lower case, and the parameters sorted,
 /// with a `charset`'s value in lower case too.
-fn identity(m: MediaType) -> Identity =
+fn identity(m: MediaType) -> MediaTypeKey =
   match m {
     MediaType(top, subtype, held) ->
       {
@@ -546,10 +550,14 @@ fn join_sections(
 /// `max_length` characters. Otherwise it is RFC 2231's extended sections, `name*` alone or
 /// `name*0*`, `name*1*` and so on, each at most `max_length` characters unless one character's
 /// escapes are longer. `joined` turns the result back into `name=value`.
-pub fn sectioned(name: String, value: String, max_length: Int) -> List<Param> / {abort.raise} = {
+pub fn split_into_sections(
+  name: String,
+  value: String,
+  max_length: Int,
+) -> List<Param> / {abort.raise} = {
   let b = Bytes::of_string(value);
   if b.skip(0, plain_value_bytes()) == b.len()
-      && name.len() + 1 + written(value).len() <= max_length { [{ name: name, value: value }] }
+      && name.len() + 1 + quote_value(value).len() <= max_length { [{ name: name, value: value }] }
   else {
     match encode_sections(value, max_length - name.len() - 6) {
       [only] -> [{ name: name ++ "*", value: only }],
@@ -1039,7 +1047,7 @@ type Written = { text: String, canonical: String }
 
 /// Texts that are media types, each with what `show` writes of it. The first four are RFC 9110
 /// §8.3.1's and the `multipart` ones RFC 2046 §5.1.1's.
-fn readable() -> List<Written> =
+fn valid_media_types() -> List<Written> =
   [
     { text: "text/html;charset=utf-8", canonical: "text/html; charset=utf-8" },
     { text: "Text/HTML;Charset=\"utf-8\"", canonical: "text/html; charset=utf-8" },
@@ -1078,7 +1086,7 @@ fn readable() -> List<Written> =
     },
   ]
 
-test "reads {show(c.text)}" for c: Written in readable() {
+test "reads {show(c.text)}" for c: Written in valid_media_types() {
   assert_eq(match parse(c.text) { Ok(m) -> Some(render(m)), Err(_) -> None }, Some(c.canonical));
   assert_eq(parse(c.canonical), parse(c.text))
 }
@@ -1236,9 +1244,9 @@ test "a range covers the types it names, and a wider range is less specific" {
   )
 }
 
-type Weighed = { text: String, weight: Option<Int> }
+type WeightedCase = { text: String, weight: Option<Int> }
 
-fn weights() -> List<Weighed> =
+fn weights() -> List<WeightedCase> =
   [
     { text: "text/html", weight: Some(1000) },
     { text: "text/html;q=1", weight: Some(1000) },
@@ -1262,7 +1270,7 @@ fn weights() -> List<Weighed> =
     { text: "text/html;q=0.x", weight: None },
   ]
 
-test "weighs {show(c.text)}" for c: Weighed in weights() {
+test "weighs {show(c.text)}" for c: WeightedCase in weights() {
   assert_eq(quality(range_of(c.text)), c.weight)
 }
 
@@ -1343,7 +1351,7 @@ fn seed_media_type(s: Seed) -> MediaType =
 
 /// The media type `seed_media_type` builds from a seed, made directly with the constructor and its
 /// names in upper case.
-fn shouted(s: Seed) -> MediaType =
+fn upper_media_type(s: Seed) -> MediaType =
   MediaType(tokenized(s.top).ascii_upper(), tokenized(s.subtype).ascii_upper(), [
     { name: tokenized(s.name).ascii_upper(), value: quoted_text(s.value) },
   ])
@@ -1365,7 +1373,7 @@ test "a media type's canonical text reads back as the same media type" {
 }
 
 test "a media type is equal however its names are cased" {
-  gen::check(seeds(), |x: Seed| agrees(shouted, seed_media_type, x))
+  gen::check(seeds(), |x: Seed| agrees(upper_media_type, seed_media_type, x))
 }
 
 type Named = { ext: String, named: String }
@@ -1496,7 +1504,7 @@ type Joined = { text: String, params: List<Param> }
 
 /// Media types whose parameters RFC 2231 writes in sections or with a charset, each with what
 /// they are once joined. The first three are RFC 2231 §3's and §4's.
-fn continued() -> List<Joined> =
+fn section_cases() -> List<Joined> =
   [
     {
       text: "message/external-body; access-type=URL; URL*0=\"ftp://\"; URL*1=\"cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar\"",
@@ -1538,7 +1546,7 @@ fn continued() -> List<Joined> =
     { text: "text/plain", params: [] },
   ]
 
-test "joins the sections of {show(c.text)}" for c: Joined in continued() {
+test "joins the sections of {show(c.text)}" for c: Joined in section_cases() {
   assert_eq(match parse(c.text) { Ok(m) -> join(params(m)), Err(_) -> Ok([]) }, Ok(c.params))
 }
 
@@ -1559,27 +1567,31 @@ test "sections that are not numbered from zero, or cannot be read, are rejected 
 }
 
 test "a value is written plain where it is short ASCII, and in extended sections otherwise" {
-  assert_eq(sectioned("filename", "report.pdf", 60), [{ name: "filename", value: "report.pdf" }]);
-  assert_eq(sectioned("filename", "my report.pdf", 60), [
+  assert_eq(split_into_sections("filename", "report.pdf", 60), [
+    { name: "filename", value: "report.pdf" },
+  ]);
+  assert_eq(split_into_sections("filename", "my report.pdf", 60), [
     { name: "filename", value: "my report.pdf" },
   ]);
-  assert_eq(sectioned("filename", "it's 100%.txt", 60), [
+  assert_eq(split_into_sections("filename", "it's 100%.txt", 60), [
     { name: "filename*", value: "UTF-8''it%27s%20100%25.txt" },
   ]);
-  assert_eq(sectioned("filename", "a\"b\\c*", 60), [
+  assert_eq(split_into_sections("filename", "a\"b\\c*", 60), [
     { name: "filename*", value: "UTF-8''a%22b%5Cc%2A" },
   ]);
-  assert_eq(sectioned("filename", "na\u{ef}ve.pdf", 60), [
+  assert_eq(split_into_sections("filename", "na\u{ef}ve.pdf", 60), [
     { name: "filename*", value: "UTF-8''na%C3%AFve.pdf" },
   ]);
-  assert_eq(sectioned("filename", "\u{20ac}\u{20ac}\u{20ac}\u{20ac}.txt", 34), [
+  assert_eq(split_into_sections("filename", "\u{20ac}\u{20ac}\u{20ac}\u{20ac}.txt", 34), [
     { name: "filename*0*", value: "UTF-8''%E2%82%AC" },
     { name: "filename*1*", value: "%E2%82%AC%E2%82%AC" },
     { name: "filename*2*", value: "%E2%82%AC.txt" },
   ]);
-  assert_eq(sectioned("a", "line\r\nbreak", 60), [{ name: "a*", value: "UTF-8''line%0D%0Abreak" }]);
+  assert_eq(split_into_sections("a", "line\r\nbreak", 60), [
+    { name: "a*", value: "UTF-8''line%0D%0Abreak" },
+  ]);
   assert_eq(
-    render(MediaType("text", "plain", sectioned("name", "a b \u{e9}", 60))),
+    render(MediaType("text", "plain", split_into_sections("name", "a b \u{e9}", 60))),
     "text/plain; name*=UTF-8''a%20b%20%C3%A9",
   )
 }

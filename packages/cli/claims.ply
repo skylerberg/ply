@@ -34,13 +34,14 @@ import std.term (Style, plain, dim, red, green, yellow)
 import proof.obligation (Binding, Builds, CacheRejected, Certificate, Change, Changed, ClaimRow,
                          Cost, Counterexample, Coverage, Definition, InternalError, Ensures, Fault,
                          Frame, Fresh, FromProof, Reason, Judgement, PointFailed, PointFaulted,
-                         PointHeld, PointRaised, PointRejected, Kind, Law, Laws, ChangeState, Never,
-                         NoWitness, Open, Outcome, Proved, Pure, Raised, CacheStatus, ClaimSnapshot,
-                         Refuted, Space, Stopped, Uncached, Unchanged, UnhandledEffect, Unproved,
-                         Vacuous, Writes, WrittenLaw, certificate_summary, coverage, fault_message,
-                         fault_notes, fault_summary, cache_writes, frame_summary, reason_summary,
-                         reason_word, hits, is_proved, laws_of, cache_status_word, select,
-                         specified, stopped_summary, vacuity_summary, verdict_of, plural)
+                         PointPassed, PointRaised, PointRejected, Kind, Law, Laws, ChangeState,
+                         Never, NoWitness, Open, Outcome, Proved, NoWrites, Raised, CacheStatus,
+                         ClaimSnapshot, Refuted, Space, Stopped, Uncached, Unchanged,
+                         UnhandledEffect, Unproved, Vacuous, Writes, WrittenLaw,
+                         certificate_summary, coverage, fault_message, fault_notes, fault_summary,
+                         cache_writes, frame_summary, reason_summary, reason_word, cache_hit_count,
+                         is_proved, laws_of, cache_status_word, select, specified_count,
+                         stopped_summary, vacuity_summary, verdict_of, plural)
 import std.value (Value, VBool, VInt, VList, render)
 import std.value
 import std.machine as entering
@@ -88,7 +89,7 @@ pub type Claim = {
   guarded: Bool,
   frame: Frame,
   at: ModuleSpan,
-  unperformed: List<String>,
+  unused_effects: List<String>,
   schema: Option<String>,
 }
 
@@ -160,9 +161,9 @@ pub fn own_claims(analysis: Analysis, built: ProverInputResult) -> OwnClaims / {
         guarded: o.guards.len() > 0,
         frame: o.frame,
         at: o.at,
-        unperformed: match o.kind {
+        unused_effects: match o.kind {
           Ensures(_) -> match definitions.get(o.owner) {
-            Some(d) -> provenance(d).unperformed,
+            Some(d) -> provenance(d).unused_effects,
             None -> [],
           },
           _ -> [],
@@ -463,8 +464,8 @@ pub fn claim_rows(
       Some(claim) -> match outcomes.at(i) { None -> acc, Some(o) -> acc.push(claim_row(claim, o)) },
     })
 
-pub fn carried_by(collection: Collection) -> Int =
-  specified(
+pub fn count_specified(collection: Collection) -> Int =
+  specified_count(
     collection.definitions.map(|definition: Definition| definition.name),
     laws_in(collection),
     collection.claims.map(|claim: Claim| { owner: claim.owner, kind: claim.kind }),
@@ -562,8 +563,8 @@ pub fn decide_claims<| e>(
           laws_in(collection),
           claim_rows(collection, wanted, all),
         ),
-        cached: hits(selection),
-        specified: carried_by(collection),
+        cached: cache_hit_count(selection),
+        specified: count_specified(collection),
         duration_ms: d.duration_ms,
         warnings: selection.warnings.map(rejection_warning).concat(d.warnings).concat(stored),
       })
@@ -621,7 +622,7 @@ pub effect decisions {
   write known(row: Row) -> Unit
 }
 
-pub fn discharge_on_unit(
+pub fn discharge_library(
   front: LoadedAnalysis,
   collection: Collection,
   runs: List<Int>,
@@ -667,7 +668,7 @@ pub fn discharge_runs(
       |q: RuntimeRequest|
         match q {
           JudgePoints(batches) -> {
-            let j = judge_in_lanes(p, batches, collection.lanes);
+            let j = judge_parallel(p, batches, collection.lanes);
             entry_warnings.ended(j.warnings);
             Judgements(j.each)
           },
@@ -697,7 +698,7 @@ effect entry_warnings {
   write ended(warnings: List<Diagnostic>) -> Unit
 }
 
-fn judge_in_lanes(
+fn judge_parallel(
   p: ProofContext,
   batches: List<Batch>,
   lanes: Option<Int>,
@@ -779,7 +780,7 @@ pub fn judge_batch(
                 let g = guard(p, r, point);
                 {
                   result: match g.result {
-                    Ok(true) -> PointHeld,
+                    Ok(true) -> PointPassed,
                     Ok(false) -> PointRejected,
                     Err(j) -> j,
                   },
@@ -803,7 +804,7 @@ fn ends_batch(mode: JudgeMode, j: Judgement) -> Bool =
     (_, PointFaulted(_)) -> true,
     (WholeClaim, PointFailed) -> true,
     (WholeClaim, PointRaised(_)) -> true,
-    (WitnessSearch, PointHeld) -> true,
+    (WitnessSearch, PointPassed) -> true,
     (GuardFilter, PointRaised(_)) -> true,
     _ -> false,
   }
@@ -818,9 +819,9 @@ fn judge_point(
     Err(j) -> { result: j, warnings: g.warnings },
     Ok(false) -> { result: PointRejected, warnings: g.warnings },
     Ok(true) -> {
-      let b = proposition_holds(p, r, point);
+      let b = evaluate_proposition(p, r, point);
       {
-        result: match b.result { Err(j) -> j, Ok(true) -> PointHeld, Ok(false) -> PointFailed },
+        result: match b.result { Err(j) -> j, Ok(true) -> PointPassed, Ok(false) -> PointFailed },
         warnings: g.warnings.concat(b.warnings),
       }
     },
@@ -844,7 +845,7 @@ fn guard(
       },
   )
 
-fn proposition_holds(
+fn evaluate_proposition(
   p: ProofContext,
   r: ClaimRoots,
   point: List<Value>,
@@ -893,10 +894,10 @@ fn enter_root(
     ..entering::unbounded(),
     timeout_ms: p.timeout_ms,
   });
-  { result: result_of_entry(o.ended, root), warnings: machine::warnings_of(o, p.roots) }
+  { result: root_value(o.ended, root), warnings: machine::warnings_of(o, p.roots) }
 }
 
-fn result_of_entry(
+fn root_value(
   ended: entering::Termination,
   root: String,
 ) -> Result<Value, Judgement> / {abort.raise} =
@@ -999,7 +1000,7 @@ pub fn run_interleaving(
         timeout_ms: p.timeout_ms,
         seed: Some({ root: seed.root, path: seed.path, steps: max(steps, 1) }),
       });
-      let verdict = match as_boolean(result_of_entry(o.ended, r.body)) {
+      let verdict = match as_boolean(root_value(o.ended, r.body)) {
         Ok(true) -> Passed,
         Ok(false) -> Failed(PointFailed),
         Err(j) -> Failed(j),
@@ -1036,9 +1037,9 @@ pub fn claim_at(claims: List<Claim>, i: Int) -> Claim =
         owner: "",
         kind: Ensures(0),
         guarded: false,
-        frame: Pure,
+        frame: NoWrites,
         at: { module: 0, start: 0, end: 0 },
-        unperformed: [],
+        unused_effects: [],
         schema: None,
       },
   }
@@ -1319,9 +1320,9 @@ pub fn a_claim(owner: String, kind: Kind) -> Claim =
     owner: owner,
     kind: kind,
     guarded: false,
-    frame: Pure,
+    frame: NoWrites,
     at: a_span(),
-    unperformed: [],
+    unused_effects: [],
     schema: None,
   }
 

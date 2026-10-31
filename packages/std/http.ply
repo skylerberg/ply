@@ -842,7 +842,7 @@ fn quoted_from(
 }
 
 /// RFC 7239's `obfnode` and `obfport`: `_`, then letters, digits, `.`, `_` and `-`.
-fn is_obscured(b: Bytes) -> Bool =
+fn is_obfuscated_identifier(b: Bytes) -> Bool =
   b.len() > 1 && b.at(0) == b'_'
     && b.scan(1, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-", b.len())
     == b.len()
@@ -855,7 +855,7 @@ fn hop_of(node: String) -> Hop / {abort.raise} = {
   if n == 0 { Unknown }
   else if node.eq_ignore_ascii_case("unknown") { Unknown } else if b.at(0) == b'_' {
     let end = b.scan_until(0, b":", n);
-    if is_obscured(b.slice(0, end)) && node_port(b, end) != None {
+    if is_obfuscated_identifier(b.slice(0, end)) && node_port(b, end) != None {
       Obscured(String::of_bytes_lossy(b.slice(0, end)))
     } else { Unknown }
   } else if b.at(0) == b'[' {
@@ -888,7 +888,7 @@ fn node_port(b: Bytes, at: Int) -> Option<Option<Int>> / {abort.raise} = {
   if at >= n { Some(None) }
   else if b.at(at) != b':' { None } else {
     let rest = b.slice(at + 1, n);
-    if is_obscured(rest) { Some(None) } else if all_digits(rest) && rest.len() <= 5 {
+    if is_obfuscated_identifier(rest) { Some(None) } else if all_digits(rest) && rest.len() <= 5 {
       match rest.int_of_ascii() {
         Some(port) -> if port <= 65535 { Some(Some(port)) } else { None },
         None -> None,
@@ -1067,7 +1067,7 @@ fn chunk_step(
 ) -> BodyStep / {abort.raise} =
   if fuel <= 0 { Await({ state: state, consumed: at, out: Bytes::concat_all(out) }) } else {
     match state.phase {
-      AtSize -> chunk_size(state, buf, at, out, fuel),
+      AtSize -> read_chunk_size(state, buf, at, out, fuel),
       InData -> chunk_data(state, buf, at, out, fuel),
       AfterData -> chunk_crlf(state, buf, at, out, fuel),
       InTrailers -> chunk_trailers(state, buf, at, out),
@@ -1076,7 +1076,7 @@ fn chunk_step(
     }
   }
 
-fn waiting(state: BodyState, at: Int, out: List<Bytes>) -> BodyStep =
+fn need_more_bytes(state: BodyState, at: Int, out: List<Bytes>) -> BodyStep =
   Await({ state: state, consumed: at, out: Bytes::concat_all(out) })
 
 fn with_phase(state: BodyState, phase: ChunkPhase, remaining: Int, inbound_body: Int) -> BodyState =
@@ -1089,7 +1089,7 @@ fn with_phase(state: BodyState, phase: ChunkPhase, remaining: Int, inbound_body:
   }
 
 /// A chunk-size line is hex digits, optionally followed by `;` and extensions, terminated by CRLF.
-fn chunk_size(
+fn read_chunk_size(
   state: BodyState,
   buf: Bytes,
   at: Int,
@@ -1097,7 +1097,7 @@ fn chunk_size(
   fuel: Int,
 ) -> BodyStep / {abort.raise} =
   match read_line(buf, at, state.limits.max_chunk_line) {
-    LineIncomplete -> waiting(state, at, out),
+    LineIncomplete -> need_more_bytes(state, at, out),
     LineTooLong ->
       Rejected({
         status: 400,
@@ -1182,7 +1182,7 @@ reuse fn chunk_data(
     state.received + take,
   );
   if take >= state.remaining { chunk_step(next, buf, at + take, taken, fuel) }
-  else { waiting(next, at + take, taken) }
+  else { need_more_bytes(next, at + take, taken) }
 }
 
 fn chunk_crlf(
@@ -1192,7 +1192,7 @@ fn chunk_crlf(
   out: List<Bytes>,
   fuel: Int,
 ) -> BodyStep / {abort.raise} =
-  if buf.len() < at + 2 { waiting(state, at, out) }
+  if buf.len() < at + 2 { need_more_bytes(state, at, out) }
   else if buf.at(at) != b'\r' || buf.at(at + 1) != b'\n' {
     Rejected({ status: 400, reason: "a chunk's data must be followed by CRLF" })
   } else { chunk_step(with_phase(state, AtSize, 0, state.received), buf, at + 2, out, fuel - 1) }
@@ -1206,7 +1206,7 @@ fn chunk_trailers(
 ) -> BodyStep / {abort.raise} = {
   let trailer_limits = { ..state.limits, max_header_bytes: state.limits.max_trailer_bytes };
   match fields(buf, at, at, trailer_limits) {
-    FieldsIncomplete -> waiting(state, at, out),
+    FieldsIncomplete -> need_more_bytes(state, at, out),
     FieldsRejected(r) -> Rejected(r),
     FieldsDone(done) ->
       Complete({ consumed: done.next, out: Bytes::concat_all(out), trailers: done.headers }),
@@ -1280,7 +1280,7 @@ pub fn request_trailers(request: Request) -> Headers / {incoming.trailers} =
 pub fn response<| e>(status: Int, body: Bytes) -> Response<| e> =
   { status: status, headers: empty_headers(), body: Whole(body) }
 
-/// A `text/plain` UTF-8 response.
+/// A `text/default_fetch` UTF-8 response.
 pub fn text_response<| e>(status: Int, text: String) -> Response<| e> =
   {
     status: status,
@@ -1388,7 +1388,7 @@ pub reuse fn encode_head<| e>(
     head,
     Bytes::concat_all(fields),
     framing_fields(version, r),
-    connection_field(version, keep_alive && !close_framed(version, r)),
+    connection_field(version, keep_alive && !ends_at_close(version, r)),
     b"\r\n",
   ])
 }
@@ -1417,7 +1417,7 @@ fn framing_fields<| e>(version: Version, r: Response<| e>) -> Bytes =
   }
 
 /// An HTTP/1.0 stream of no known length ends where its connection closes.
-fn close_framed<| e>(version: Version, r: Response<| e>) -> Bool =
+fn ends_at_close<| e>(version: Version, r: Response<| e>) -> Bool =
   version == Http10 && !bodiless(r.status) && body_length(r.body) == None
 
 fn connection_field(version: Version, keep_alive: Bool) -> Bytes =
@@ -2813,7 +2813,7 @@ pub fn respond<[l] | e>(
       send_all[l](c, encode(method, version, keep_alive, r), limits.write_timeout_ms) && keep_alive,
     Streamed(s) ->
       bracket(|| s, |held: Stream<| e>| (held.close)(), |held: Stream<| e>| {
-        let keep = keep_alive && !close_framed(version, r);
+        let keep = keep_alive && !ends_at_close(version, r);
         if !send_all[l](c, encode_head(method, version, keep, r), limits.write_timeout_ms) { false }
         else if method == Head || bodiless(r.status) { keep }
         else { send_stream[l](c, limits, version, held) && keep }
@@ -2946,7 +2946,7 @@ fn clock_ms() -> Int / {clock.read} = nanos_at(clock.now()) / 1000000
 fn ms_at(i: Instant) -> Int = nanos_at(i) / 1000000
 
 /// The most turns one HTTP/2 connection takes: as many reads as its requests' heads could.
-fn h2_turns(limits: Limits) -> Int = limits.max_keep_alive * max_reads()
+fn h2_max_steps(limits: Limits) -> Int = limits.max_keep_alive * max_reads()
 
 /// Serves a connection that uses HTTP/2 from its first byte, as one that ALPN chose `h2` for does,
 /// with `app` until `stop` is closed, then drains it. A first `GOAWAY` names the last stream there
@@ -3039,7 +3039,7 @@ fn start_h2<[l] | e>(
     at_millis(now),
   );
   let begun = h2_result_requests(opened, Map::new(), app, from, limits, now);
-  h2_loop[l](c, limits, app, stopping, from, begun, now, false, h2_turns(limits))
+  h2_loop[l](c, limits, app, stopping, from, begun, now, false, h2_max_steps(limits))
 }
 
 /// Handles each request among `r`'s events with `app`, adding a streamed response's body to
@@ -3120,7 +3120,7 @@ fn h2_feed_bodies<| e>(
 fn h2_backlog() -> Int = 65536
 
 /// The most chunks one stream's body produces in one turn.
-fn h2_pulls() -> Int = 64
+fn h2_chunks_per_step() -> Int = 64
 
 fn feed_stream<| e>(
   t: TurnState<| {Reading | e}>,
@@ -3130,13 +3130,13 @@ fn feed_stream<| e>(
 ) -> TurnState<| {Reading | e}> / {abort.raise | e} = {
   let cap = f.body.length.unwrap_or(-1);
   let ran = iterate(
-    { connection: t.connection, feeding: f, pulls: h2_pulls(), over: false },
-    h2_pulls() + 1,
+    { connection: t.connection, feeding: f, pulls: h2_chunks_per_step(), over: false },
+    h2_chunks_per_step() + 1,
     |s: { connection: http2::Connection, feeding: OutgoingBody<| {Reading | e}>, pulls: Int, over: Bool }| {
       let g = s.feeding;
       match http2::backlog(s.connection, stream) {
         None -> Stop({ ..s, over: true }),
-        Some(waiting) -> if waiting >= h2_backlog() || s.pulls <= 0 { Stop(s) }
+        Some(need_more_bytes) -> if need_more_bytes >= h2_backlog() || s.pulls <= 0 { Stop(s) }
         else if g.left <= 0 {
           Stop({ ..s, connection: http2::cancel(s.connection, stream, at_millis(now)), over: true })
         } else {
@@ -3321,8 +3321,9 @@ fn exchange_h2<[l]>(
     None -> Err(NotSent),
     Some(sent) -> {
       let asked = http2::take_output(sent.connection);
-      if !send_all[l](c, asked.bytes, limits.write_timeout_ms) { Err(NotSent) }
-      else { await_h2_response[l](c, asked.connection, sent.stream, limits, now, h2_turns(limits)) }
+      if !send_all[l](c, asked.bytes, limits.write_timeout_ms) { Err(NotSent) } else {
+        await_h2_response[l](c, asked.connection, sent.stream, limits, now, h2_max_steps(limits))
+      }
     },
   }
 }
@@ -3428,11 +3429,11 @@ pub fn default_shedding() -> Shedding =
 
 /// What a pool did with the connections it accepted: served them, or shed them because the queue
 /// was full or because they had waited too long.
-pub type PoolStats = { served: Int, shed_full: Int, shed_late: Int }
+pub type PoolStats = { served: Int, shed_full: Int, shed_timed_out: Int }
 
 type QueuedConnection = { conn: Int, at: Instant }
 
-type WorkerStats = { served: Int, late: Int }
+type WorkerStats = { served: Int, shed_timed_out: Int }
 
 /// Accepts up to `count` connections on `listener` and serves each with `app`, `shedding.workers`
 /// at once, queuing and shedding load as `Shedding` sets. When `accept` reports that the listener
@@ -3498,15 +3499,19 @@ fn pool<[l] | e>(
   let line: Chan<QueuedConnection> = task.channel(shedding.queue);
   let stop: Chan<Unit> = task.channel(0);
   let workers = range(0, shedding.workers).map(|_i: Int|
-    task.spawn(|| worker(line, stop, shedding, handled, { served: 0, late: 0 }, count)));
+    task.spawn(|| worker(line, stop, shedding, handled, { served: 0, shed_timed_out: 0 }, count)));
   let accepted = accept_loop[l](listener, line, handled, count, 0);
   task.close(stop);
   task.close(line);
   workers.fold(
-    { served: 0, shed_full: accepted, shed_late: 0 },
+    { served: 0, shed_full: accepted, shed_timed_out: 0 },
     |p: PoolStats, w: Task<WorkerStats>| {
       let done = task.join(w);
-      { served: p.served + done.served, shed_full: p.shed_full, shed_late: p.shed_late + done.late }
+      {
+        served: p.served + done.served,
+        shed_full: p.shed_full,
+        shed_timed_out: p.shed_timed_out + done.shed_timed_out,
+      }
     },
   )
 }
@@ -3560,7 +3565,7 @@ fn worker<| e>(
           stop,
           shedding,
           handled,
-          { served: done.served, late: done.late + 1 },
+          { served: done.served, shed_timed_out: done.shed_timed_out + 1 },
           left - 1,
         )
       } else {
@@ -3570,7 +3575,7 @@ fn worker<| e>(
           stop,
           shedding,
           handled,
-          { served: done.served + 1, late: done.late },
+          { served: done.served + 1, shed_timed_out: done.shed_timed_out },
           left - 1,
         )
       },
@@ -3633,7 +3638,7 @@ fn limits_with(
   header_bytes: Int,
   header_count: Int,
   body: Int,
-  chunk_size: Int,
+  read_chunk_size: Int,
   chunk_line: Int,
   trailer_bytes: Int,
 ) -> Limits = {
@@ -3644,7 +3649,7 @@ fn limits_with(
     max_header_bytes: header_bytes,
     max_header_count: header_count,
     max_body: body,
-    max_chunk_size: chunk_size,
+    max_chunk_size: read_chunk_size,
     max_chunk_line: chunk_line,
     max_trailer_bytes: trailer_bytes,
   }
@@ -4261,7 +4266,7 @@ fn reference_length(raw: Bytes) -> Int / {abort.raise} = {
     if te.len() > 0 && cl.len() > 0 { -1 }
     else if te.len() > 0 { if last_string(te) == "chunked" { -2 } else { -1 } }
     else if cl.len() > 1 { -1 }
-    else { match cl { [only] -> reference_int(only), _ -> 0 } }
+    else { match cl { [only] -> parse_content_length(only), _ -> 0 } }
   }
 }
 
@@ -4271,7 +4276,7 @@ fn values_of(lines: List<String>, prefix: String) -> List<String> / {abort.raise
       acc.push(line.slice(prefix.len(), line.len()).ascii_trim().ascii_lower())
     } else { acc })
 
-fn reference_int(raw: String) -> Int / {abort.raise} = {
+fn parse_content_length(raw: String) -> Int / {abort.raise} = {
   let b = Bytes::of_string(raw);
   if !all_digits(b) { -1 } else { match b.int_of_ascii() { Some(n) -> n, None -> -1 } }
 }
@@ -4506,7 +4511,7 @@ test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connecti
   );
   assert_eq(closing.out, result_of(200, "GET /a|", false));
   // The second request is still unsent: it was never read.
-  assert_eq(net::mem_unmet(closing.net, served_conn()), [second]);
+  assert_eq(net::mem_remaining_script(closing.net, served_conn()), [second]);
   // The `max_keep_alive`th response sends `close` and the connection ends there.
   let bounded = served(
     [Sends(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), second],
@@ -4514,7 +4519,7 @@ test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connecti
     echo_app,
   );
   assert_eq(bounded.out, result_of(200, "GET /a|", false));
-  assert_eq(net::mem_unmet(bounded.net, served_conn()), [second])
+  assert_eq(net::mem_remaining_script(bounded.net, served_conn()), [second])
 }
 
 test "a body the handler ignores is drained before the next request is framed" {
@@ -4652,7 +4657,7 @@ test "a framing error gets one response and the connection is not reused" {
       text_response(400, "a request carries `Content-Length` or `Transfer-Encoding`, never both\n"),
     ),
   );
-  assert_eq(net::mem_unmet(ran.net, served_conn()), [second])
+  assert_eq(net::mem_remaining_script(ran.net, served_conn()), [second])
 }
 
 test "a 100-continue is written before the body is read" {
@@ -5077,7 +5082,7 @@ fn fetched(
   script: List<Step>,
   reached: Bool,
 ) -> Result<Plain, ClientError> / {ip.fail, abort.raise} =
-  plainly(
+  read_plain(
     net::on_mem(if reached { serving("h", script) } else { net::mem_empty() }, ||
       request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())).value,
   )
@@ -5085,7 +5090,9 @@ fn fetched(
 /// A response a client read, its body whole, as a value a test compares.
 type Plain = { status: Int, headers: Headers, body: Bytes }
 
-fn plainly(r: Result<Response<| {}>, ClientError>) -> Result<Plain, ClientError> / {abort.raise} =
+fn read_plain(
+  r: Result<Response<| {}>, ClientError>,
+) -> Result<Plain, ClientError> / {abort.raise} =
   match r {
     Ok(res) -> Ok({ status: res.status, headers: res.headers, body: whole_bytes(res.body) }),
     Err(reason) -> Err(reason),
@@ -5170,7 +5177,7 @@ test "a kept-alive connection sends every request but the last without `Connecti
     });
   // One connection for all three exchanges, played to its end and closed once.
   assert_eq(ran.net.conns.len(), 1);
-  assert_eq(net::mem_unmet(ran.net, 1), []);
+  assert_eq(net::mem_remaining_script(ran.net, 1), []);
   assert_eq(ran.net.closed, [1]);
   let expected = Ok({
     status: 200,
@@ -5178,7 +5185,11 @@ test "a kept-alive connection sends every request but the last without `Connecti
     body: b"hello",
   });
   let (first, second, last) = ran.value;
-  assert_eq((plainly(first), plainly(second), plainly(last)), (expected, expected, expected))
+  assert_eq((read_plain(first), read_plain(second), read_plain(last)), (
+    expected,
+    expected,
+    expected,
+  ))
 }
 
 fn shown_hop(fetch_with_redirects: Hop) -> String =
@@ -5238,9 +5249,14 @@ test "the hops of several field lines are read in the order the lines came" {
   ])
 }
 
-type Vouched = { peer: String, forwarded: String, trusted: List<String>, client: Option<String> }
+type ForwardedCase = {
+  peer: String,
+  forwarded: String,
+  trusted: List<String>,
+  client: Option<String>,
+}
 
-test "from {c.peer} with `{c.forwarded}`, trusting {c.trusted}, the client is read past the trusted proxies only" for c: Vouched in [
+test "from {c.peer} with `{c.forwarded}`, trusting {c.trusted}, the client is read past the trusted proxies only" for c: ForwardedCase in [
     // No proxy is trusted, so the field is whatever a client wrote and is not read.
     {
       peer: "203.0.113.9:4000",
@@ -5430,13 +5446,13 @@ test "a body that is not a form is rejected for what it is" {
       form(request_to(Post, "example.org", "/", b""), multipart::default_limits())),
     Ok(Err(NotAForm(None))),
   );
-  assert_eq(form_status(posted("multipart/form-data", upload())), 415);
+  assert_eq(form_error_status(posted("multipart/form-data", upload())), 415);
   let cut = posted("multipart/form-data; boundary=XyZ", upload().slice(0, 40));
   match read_whole(empty_headers(), || form(cut, multipart::default_limits())) {
     Ok(Err(Unreadable(_))) -> (),
     _ -> panic("a body cut short is unreadable"),
   };
-  assert_eq(form_status(cut), 400);
+  assert_eq(form_error_status(cut), 400);
   let small = { ..multipart::default_limits(), max_body: 10 };
   assert_eq(
     read_whole(empty_headers(), ||
@@ -5445,7 +5461,7 @@ test "a body that is not a form is rejected for what it is" {
   )
 }
 
-fn form_status(request: Request) -> Int / {abort.raise} =
+fn form_error_status(request: Request) -> Int / {abort.raise} =
   match read_whole(empty_headers(), || form_app(request).status) { Ok(s) -> s, Err(r) -> r.status }
 
 test "a response names its date and when its resource last changed" {
@@ -5538,19 +5554,19 @@ fn world_of(sites: List<Site>) -> MemNet / {ip.fail, abort.raise} = {
     net::mem_serving(n, ip::socket_at(ip::read(s.at), s.port), s.scripts))
 }
 
-fn said(r: Response<| {}>) -> Step / {abort.raise} = Sends(encode(Get, Http11, false, r))
+fn sends_response(r: Response<| {}>) -> Step / {abort.raise} = Sends(encode(Get, Http11, false, r))
 
 fn redirect(status: Int, location: String) -> Response<| {}> =
   { ..response(status, b""), headers: set_header(empty_headers(), "location", location) }
 
-fn shop(scripts: List<List<Step>>) -> Site =
+fn example_shop_site(scripts: List<List<Step>>) -> Site =
   { name: "shop.example", at: "192.0.2.10", port: 80, scripts: scripts }
 
 fn sent_text(n: MemNet, conn: Int) -> String = String::of_bytes_lossy(net::mem_sent(n, conn))
 
 type Fetch = { method: Method, url: Url, headers: Headers, body: Bytes, options: FetchOptions }
 
-fn plain(method: Method, to: Url, body: Bytes) -> Fetch =
+fn default_fetch(method: Method, to: Url, body: Bytes) -> Fetch =
   {
     method: method,
     url: to,
@@ -5578,17 +5594,17 @@ fn status_of(r: Result<FetchResult, FetchError>) -> Int =
 test "a redirected POST is fetched again with GET, and carries what the first response set" {
   let ran = fetched_over(
     world_of([
-      shop([
+      example_shop_site([
         [
-          said({
+          sends_response({
             ..redirect(302, "/next"),
             headers: add_header(redirect(302, "/next").headers, "set-cookie", "s=1; Path=/"),
           }),
         ],
-        [said(text_response(200, "done"))],
+        [sends_response(text_response(200, "done"))],
       ]),
     ]),
-    plain(Post, url"http://shop.example/start", b"x"),
+    default_fetch(Post, url"http://shop.example/start", b"x"),
   );
   match ran.value {
     Ok(f) -> {
@@ -5612,12 +5628,12 @@ test "a redirected POST is fetched again with GET, and carries what the first re
 test "a 307 is fetched again with the original method and body" {
   let ran = fetched_over(
     world_of([
-      shop([
-        [said(redirect(307, "http://shop.example/again"))],
-        [said(text_response(201, "made"))],
+      example_shop_site([
+        [sends_response(redirect(307, "http://shop.example/again"))],
+        [sends_response(text_response(201, "made"))],
       ]),
     ]),
-    plain(Post, url"http://shop.example/orders", b"x"),
+    default_fetch(Post, url"http://shop.example/orders", b"x"),
   );
   assert_eq(status_of(ran.value), 201);
   assert_eq(
@@ -5628,7 +5644,7 @@ test "a 307 is fetched again with the original method and body" {
 
 test "credentials go no further than the origin they were written for" {
   let asked = {
-    ..plain(Get, url"http://shop.example/", b""),
+    ..default_fetch(Get, url"http://shop.example/", b""),
     headers: set_header(
       set_header(empty_headers(), "authorization", "Bearer t"),
       "cookie",
@@ -5637,12 +5653,15 @@ test "credentials go no further than the origin they were written for" {
   };
   let ran = fetched_over(
     world_of([
-      shop([[said(redirect(302, "/same"))], [said(redirect(301, "http://other.example/x"))]]),
+      example_shop_site([
+        [sends_response(redirect(302, "/same"))],
+        [sends_response(redirect(301, "http://other.example/x"))],
+      ]),
       {
         name: "other.example",
         at: "192.0.2.20",
         port: 80,
-        scripts: [[said(text_response(200, "there"))]],
+        scripts: [[sends_response(text_response(200, "there"))]],
       },
     ]),
     asked,
@@ -5664,14 +5683,18 @@ test "a redirect from https to http is not followed, and nor is one past the bou
     ],
   };
   assert_eq(
-    fetched_over(world_of([secure]), plain(Get, url"https://secure.example/", b"")).value,
+    fetched_over(world_of([secure]), default_fetch(Get, url"https://secure.example/", b"")).value,
     Err(Downgraded("http://secure.example/")),
   );
   let looping = world_of([
-    shop([[said(redirect(302, "/a"))], [said(redirect(302, "/b"))], [said(redirect(302, "/c"))]]),
+    example_shop_site([
+      [sends_response(redirect(302, "/a"))],
+      [sends_response(redirect(302, "/b"))],
+      [sends_response(redirect(302, "/c"))],
+    ]),
   ]);
   let bounded = {
-    ..plain(Get, url"http://shop.example/", b""),
+    ..default_fetch(Get, url"http://shop.example/", b""),
     options: { ..default_fetch_options(), max_redirects: 2 },
   };
   assert_eq(fetched_over(looping, bounded).value, Err(TooManyRedirects(2)))
@@ -5687,7 +5710,7 @@ test "an https URL is fetched over TLS, over HTTP/2 if its host agrees, or repor
         scripts: [[net::Upgrades, Sends(h2_returning(text_response(200, "secret"))), Silent]],
       },
     ]),
-    plain(Get, url"https://secure.example/parts", b""),
+    default_fetch(Get, url"https://secure.example/parts", b""),
   );
   match ran.value {
     Ok(f) -> assert_eq((f.response.status, whole_bytes(f.response.body)), (200, b"secret")),
@@ -5696,11 +5719,11 @@ test "an https URL is fetched over TLS, over HTTP/2 if its host agrees, or repor
   assert_eq(net::mem_secured(ran.net, 1), Some("secure.example"));
   assert(net::mem_sent(ran.net, 1).starts_with(http2::preface()));
   assert_eq(
-    fetched_over(world_of([]), plain(Get, url"http://nowhere.example/", b"")).value,
+    fetched_over(world_of([]), default_fetch(Get, url"http://nowhere.example/", b"")).value,
     Err(NoConnection(net::NameNotFound)),
   );
   assert_eq(
-    fetched_over(world_of([]), plain(Get, url"ftp://files.example/", b"")).value,
+    fetched_over(world_of([]), default_fetch(Get, url"ftp://files.example/", b"")).value,
     Err(NotHttp("ftp://files.example/")),
   )
 }
@@ -5716,8 +5739,8 @@ fn via_proxy(f: Fetch) -> Fetch =
 
 test "through a proxy an http URL is requested in absolute form" {
   let ran = fetched_over(
-    world_of([proxy_site([[said(text_response(200, "proxied"))]])]),
-    via_proxy(plain(Get, url"http://shop.example/parts?x=1", b"")),
+    world_of([proxy_site([[sends_response(text_response(200, "proxied"))]])]),
+    via_proxy(default_fetch(Get, url"http://shop.example/parts?x=1", b"")),
   );
   assert_eq(status_of(ran.value), 200);
   assert(
@@ -5739,7 +5762,7 @@ test "through a proxy an https URL is tunnelled and secured to its host, or reje
         ],
       ]),
     ]),
-    via_proxy(plain(Get, url"https://secure.example/parts", b"")),
+    via_proxy(default_fetch(Get, url"https://secure.example/parts", b"")),
   );
   match ran.value {
     Ok(f) -> assert_eq(whole_bytes(f.response.body), b"inside"),
@@ -5755,7 +5778,7 @@ test "through a proxy an https URL is tunnelled and secured to its host, or reje
         [Sends(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")],
       ]),
     ]),
-    via_proxy(plain(Get, url"https://secure.example/parts", b"")),
+    via_proxy(default_fetch(Get, url"https://secure.example/parts", b"")),
   );
   assert_eq(rejected.value, Err(ProxyRejected(407)))
 }
@@ -5794,12 +5817,12 @@ test "past a full queue a connection is shed with 503 and Retry-After, and no mo
       )
     });
   let p = ran.value;
-  assert_eq((p.served + p.shed_full, p.shed_late), (5, 0));
+  assert_eq((p.served + p.shed_full, p.shed_timed_out), (5, 0));
   // One worker busy and one connection queued is all the pool holds while it accepts.
   assert(p.served >= 1 && p.served <= 2);
-  let said = results(ran.net, 5);
-  assert(said.all(one_result));
-  assert_eq(said.filter(|a: String| a.contains("retry-after: 1\r\n")).len(), p.shed_full);
+  let sends_response = results(ran.net, 5);
+  assert(sends_response.all(one_result));
+  assert_eq(sends_response.filter(|a: String| a.contains("retry-after: 1\r\n")).len(), p.shed_full);
   assert_eq(ran.net.closed.len(), 5)
 }
 
@@ -5817,8 +5840,8 @@ test "a connection that waited past its bound for a worker is shed rather than s
     });
   let p = ran.value;
   assert_eq(p.served, 1);
-  assert_eq(p.shed_full + p.shed_late, 2);
-  assert(p.shed_late >= 1);
+  assert_eq(p.shed_full + p.shed_timed_out, 2);
+  assert(p.shed_timed_out >= 1);
   assert(results(ran.net, 3).all(one_result))
 }
 
@@ -5860,7 +5883,7 @@ test "a kept-alive connection a pool is serving as it stops gets a response, the
         echo_app,
       )
     });
-  assert_eq(ran.value, { served: 1, shed_full: 0, shed_late: 0 });
+  assert_eq(ran.value, { served: 1, shed_full: 0, shed_timed_out: 0 });
   // Kept alive if the stop came after it, and closing if before.
   let out = net::mem_sent(ran.net, 2);
   assert(out == result_of(200, "GET /a|", true) || out == result_of(200, "GET /a|", false));
@@ -5925,12 +5948,12 @@ test "a shed connection is told when to retry" {
 fn h2_field(name: String, value: String) -> http2::Field =
   { name: Bytes::of_string(name), value: Bytes::of_string(value) }
 
-type Asking = { encoder: http2::Encoder, frames: List<Bytes> }
+type RequestFrames = { encoder: http2::Encoder, frames: List<Bytes> }
 
 /// What a client that uses HTTP/2 from its first byte sends to request each of `paths` with a
 /// `GET`, on streams 1, 3 and so on, keeping its header table across them. It acknowledges the
 /// server's `SETTINGS` before it has them, as no scripted client can wait for them.
-fn h2_asking(paths: List<String>) -> Bytes / {abort.raise} = {
+fn h2_requests(paths: List<String>) -> Bytes / {abort.raise} = {
   let opening = Bytes::concat_all([
     http2::preface(),
     http2::encode_frame(http2::SettingsFrame({ ack: false, settings: [] })),
@@ -5938,7 +5961,7 @@ fn h2_asking(paths: List<String>) -> Bytes / {abort.raise} = {
   ]);
   let asked = range(0, paths.len()).fold(
     { encoder: http2::encoder(4096), frames: [opening] },
-    |w: Asking, i: Int| {
+    |w: RequestFrames, i: Int| {
       let e = http2::encode(w.encoder, [
         h2_field(":method", "GET"),
         h2_field(":scheme", "http"),
@@ -5996,7 +6019,7 @@ fn h2_shown(f: http2::Frame) -> String / {abort.raise} =
 fn h2_greeting() -> List<String> = ["SETTINGS", "WINDOW_UPDATE", "SETTINGS ACK"]
 
 test "a connection with the HTTP/2 preface is served HTTP/2, and drained with GOAWAY at the stop" {
-  let n = drained([Sends(h2_asking(["/a?x=1"])), Silent]);
+  let n = drained([Sends(h2_requests(["/a?x=1"])), Silent]);
   assert_eq(
     h2_frames(net::mem_sent(n, served_conn())),
     h2_greeting().concat([
@@ -6031,7 +6054,7 @@ fn pooled_one(
   )
 
 test "a pool serves each HTTP/2 stream as it arrives, as an Http2 request from its peer" {
-  let wrote = pooled_one([Sends(h2_asking(["/a", "/b?q=2"])), Silent], |request: Request|
+  let wrote = pooled_one([Sends(h2_requests(["/a", "/b?q=2"])), Silent], |request: Request|
     text_response(
       200,
       method_name(request.method) ++ " " ++ request.path ++ "?" ++ request.query ++ " "
@@ -6058,7 +6081,7 @@ fn pieces_result<| e>(pieces: List<Bytes>) -> Response<| e> =
   { status: 200, headers: empty_headers(), body: chunked(seq::of_list(pieces)) }
 
 test "a streamed response over HTTP/2 is sent as DATA frames as it is pulled" {
-  let wrote = pooled_one([Sends(h2_asking(["/a"])), Silent], |request: Request|
+  let wrote = pooled_one([Sends(h2_requests(["/a"])), Silent], |request: Request|
     pieces_result([b"one ", b"two ", b"three"]));
   assert_eq(
     h2_frames(wrote).take(8),
@@ -6081,7 +6104,7 @@ test "a streamed response over HTTP/2 that states its length and sends fewer byt
     };
     { status: 200, headers: empty_headers(), body: Streamed(held) }
   };
-  let frames = h2_frames(pooled_one([Sends(h2_asking(["/a"])), Silent], short));
+  let frames = h2_frames(pooled_one([Sends(h2_requests(["/a"])), Silent], short));
   assert_eq(frames.drop(3).take(3), ["HEADERS 1", "DATA 1 four", "RST_STREAM 1"])
 }
 
@@ -6133,7 +6156,7 @@ test "a body past max_body is rejected at the piece that passes it, and what fol
     ran.out,
     encode(Post, Http11, false, text_response(413, "the body is longer than 8 bytes\n")),
   );
-  assert_eq(net::mem_unmet(ran.net, served_conn()), [rest])
+  assert_eq(net::mem_remaining_script(ran.net, served_conn()), [rest])
 }
 
 test "a client waiting to send its body gets no 100 Continue when its handler responds without it" {
@@ -6147,7 +6170,7 @@ test "a client waiting to send its body gets no 100 Continue when its handler re
     ignore_body_app,
   );
   assert_eq(ran.out, result_of(200, "/a", false));
-  assert_eq(net::mem_unmet(ran.net, served_conn()), [body])
+  assert_eq(net::mem_remaining_script(ran.net, served_conn()), [body])
 }
 
 test "a stream that names its length is sent under Content-Length, and one that falls short ends the connection" {
@@ -6169,7 +6192,7 @@ test "a stream that names its length is sent under Content-Length, and one that 
 }
 
 test "an HTTP/2 request whose body never arrives gets 408 at its deadline, closing the connection" {
-  let opening = h2_asking([]);
+  let opening = h2_requests([]);
   let open_head = http2::encode(http2::encoder(4096), [
     h2_field(":method", "POST"),
     h2_field(":scheme", "http"),
@@ -6225,7 +6248,7 @@ test "a pool serves an HTTP/1.1 connection unchanged by its HTTP/2 support" {
 }
 
 test "serve_connection supports only HTTP/1.1, and rejects the HTTP/2 preface as another version" {
-  let ran = served([Sends(h2_asking(["/a"]))], default_limits(), echo_app);
+  let ran = served([Sends(h2_requests(["/a"]))], default_limits(), echo_app);
   assert(String::of_bytes_lossy(ran.out).starts_with("HTTP/1.1 505 "))
 }
 
@@ -6292,9 +6315,9 @@ fn h2_returning(r: Response<| {}>) -> Bytes / {abort.raise} = {
 
 test "fetch with prior knowledge requests an http URL over HTTP/2 from the first byte" {
   let ran = fetched_over(
-    world_of([shop([[Sends(h2_returning(text_response(200, "over h2"))), Silent]])]),
+    world_of([example_shop_site([[Sends(h2_returning(text_response(200, "over h2"))), Silent]])]),
     {
-      ..plain(Get, url"http://shop.example/parts?x=1", b""),
+      ..default_fetch(Get, url"http://shop.example/parts?x=1", b""),
       options: { ..default_fetch_options(), prior_knowledge: true },
     },
   );
@@ -6317,12 +6340,12 @@ test "fetch with prior knowledge requests an http URL over HTTP/2 from the first
 test "fetch with prior knowledge reports a server that closes before it responds" {
   let ran = fetched_over(
     world_of([
-      shop([
+      example_shop_site([
         [Sends(http2::encode_frame(http2::SettingsFrame({ ack: false, settings: [] }))), Leaves],
       ]),
     ]),
     {
-      ..plain(Get, url"http://shop.example/", b""),
+      ..default_fetch(Get, url"http://shop.example/", b""),
       options: { ..default_fetch_options(), prior_knowledge: true },
     },
   );
@@ -6332,7 +6355,7 @@ test "fetch with prior knowledge reports a server that closes before it responds
 test "a TLS pool secures each connection offering h2, and serves one that agrees over HTTP/2" {
   let callers = net::mem_calling(net::mem_empty(), caller(), [
     net::Upgrades,
-    Sends(h2_asking(["/a"])),
+    Sends(h2_requests(["/a"])),
     Silent,
   ]);
   let ran = net::on_mem(net::mem_credential(callers, "api"), ||
@@ -6351,7 +6374,7 @@ test "a TLS pool secures each connection offering h2, and serves one that agrees
           ),
       )
     });
-  assert_eq(ran.value, { served: 1, shed_full: 0, shed_late: 0 });
+  assert_eq(ran.value, { served: 1, shed_full: 0, shed_timed_out: 0 });
   assert_eq(net::mem_secured(ran.net, served_conn()), Some("api"));
   // The server sends first over TLS, so its `SETTINGS` may go before the stop and its drain.
   let frames = h2_frames(net::mem_sent(ran.net, served_conn()));
@@ -6377,9 +6400,9 @@ test "a connection shed over TLS is secured offering only http/1.1, then told wh
       )
     },
   );
-  let said = String::of_bytes_lossy(net::mem_sent(ran.net, served_conn()));
-  assert(said.starts_with("HTTP/1.1 503 "));
-  assert(said.contains("retry-after: 1\r\n"));
+  let sends_response = String::of_bytes_lossy(net::mem_sent(ran.net, served_conn()));
+  assert(sends_response.starts_with("HTTP/1.1 503 "));
+  assert(sends_response.contains("retry-after: 1\r\n"));
   assert_eq(net::mem_secured(ran.net, served_conn()), Some("api"));
   assert_eq(ran.net.closed, [served_conn()])
 }

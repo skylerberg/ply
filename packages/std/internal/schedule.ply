@@ -76,7 +76,7 @@ pub type Request<v> =
 /// What the runtime knows about a request: where it was performed, the brackets the task is inside
 /// if a cancel waits for it to leave them (otherwise none), and the run's clock, which a production
 /// scheduler reads.
-pub type RequestContext = { site: Site, shields: Shields, now: Int }
+pub type RequestContext = { site: Site, acquire_release_depth: Shields, now: Int }
 
 /// What a task receives when it runs again.
 pub type Reply<v> =
@@ -180,7 +180,7 @@ type Member<v> = {
   id: Int,
   state: State<v>,
   origin: Site,
-  joiners: List<Int>,
+  waiters: List<Int>,
   /// A cancel reached it. A later cancel changes nothing, and every step it takes reads this.
   cancelled: Bool,
 }
@@ -257,7 +257,7 @@ fn new_scheduler<v>(policy: Policy, id: Int, site: Site, t: Trail) -> Scheduler<
       id: 0,
       state: Ready(Start),
       origin: site,
-      joiners: [],
+      waiters: [],
       cancelled: false,
     }),
     stamps: match policy { Seeded -> [[0]], Production -> [] },
@@ -820,7 +820,7 @@ fn task_born<v>(s: Scheduler<v>, site: Site, stamp: List<Int>) -> Scheduler<v> =
       id: s.next_id,
       state: Ready(Start),
       origin: site,
-      joiners: [],
+      waiters: [],
       cancelled: false,
     }),
     stamps: match s.policy { Seeded -> s.stamps.push(stamp), Production -> s.stamps },
@@ -849,7 +849,7 @@ fn apply_join<v>(
       },
       Live -> if !s.tasks.contains(t.id) { fail_scheduler(s, unknown_task(site, t.id)) } else {
         let wait_description = task_set(s, t.id, |x: Member<v>|
-          { ..x, joiners: x.joiners.push(task) });
+          { ..x, waiters: x.waiters.push(task) });
         block_task(
           wait_description,
           task,
@@ -967,7 +967,7 @@ fn remove_joiner<v>(s: Scheduler<v>, on: Int, joiner: Int) -> Scheduler<v> =
   {
     ..s,
     tasks: s.tasks.update(on, |t: Member<v>|
-      { ..t, joiners: t.joiners.filter(|j: Int| j != joiner) }),
+      { ..t, waiters: t.waiters.filter(|j: Int| j != joiner) }),
   }
 
 /// Removes task `id` from each of `chans`' waiting lists.
@@ -991,7 +991,8 @@ fn unwind_if_cancelled<v>(
   task: Int,
   context: RequestContext,
 ) -> Scheduler<v> / {abort.raise} =
-  if !context.shields.stopping || context.shields.releasing > 0 { s } else {
+  if !context.acquire_release_depth.stopping || context.acquire_release_depth.releasing > 0 { s }
+  else {
     let wait = match s.tasks.get(task) {
       Some(t) -> match t.state { Blocked(w, _) -> Some(w), _ -> None },
       None -> None,
@@ -1010,7 +1011,7 @@ fn unwind_if_cancelled<v>(
 /// Marks a cancelled task, whether running or never started, as ended. An await of it returns that
 /// it was cancelled, and a join raises.
 fn finish_cancel<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> / {abort.raise} = {
-  let joiners = match s.tasks.get(id) { Some(t) -> Some(t.joiners), None -> None };
+  let joiners = match s.tasks.get(id) { Some(t) -> Some(t.waiters), None -> None };
   match joiners {
     None -> s,
     Some(js) -> {
@@ -1040,7 +1041,7 @@ fn finish_cancel<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> / {abort.raise} = 
         },
       );
       match woken.policy {
-        Seeded -> task_set(woken, id, |x: Member<v>| { ..x, joiners: [] }),
+        Seeded -> task_set(woken, id, |x: Member<v>| { ..x, waiters: [] }),
         Production -> task_removed(woken, id),
       }
     },
@@ -1050,7 +1051,7 @@ fn finish_cancel<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> / {abort.raise} = 
 /// The running task returned, and its handle stores the result. Each task waiting on it is
 /// notified.
 fn finish_task<v>(s: Scheduler<v>, task: Int) -> Scheduler<v> / {abort.raise} = {
-  let joiners = match s.tasks.get(task) { Some(t) -> Some(t.joiners), None -> None };
+  let joiners = match s.tasks.get(task) { Some(t) -> Some(t.waiters), None -> None };
   match joiners {
     None ->
       fail_scheduler(
@@ -1083,7 +1084,7 @@ fn finish_task<v>(s: Scheduler<v>, task: Int) -> Scheduler<v> / {abort.raise} = 
       );
       let done = stopped_running(woken, task, Done);
       match done.policy {
-        Seeded -> task_set(done, task, |x: Member<v>| { ..x, joiners: [] }),
+        Seeded -> task_set(done, task, |x: Member<v>| { ..x, waiters: [] }),
         Production -> task_removed(done, task),
       }
     },
@@ -2487,7 +2488,7 @@ fn run_simulation(
           let child = chosen.next_id;
           let context = {
             site: { root: asked_site(s, 0), start: asked_site(s, 1), end: asked_site(s, 2) },
-            shields: waited_shields(s, task),
+            acquire_release_depth: waited_shields(s, task),
             now: 0,
           };
           let touched = if footprint_held() == 0 { chosen }
@@ -2641,7 +2642,7 @@ fn serve_turn(
       let child = r.next_id;
       let context = {
         site: { root: asked_site(s, 0), start: asked_site(s, 1), end: asked_site(s, 2) },
-        shields: waited_shields(s, task),
+        acquire_release_depth: waited_shields(s, task),
         now: host_now(),
       };
       let request = request_of(s, r, task, code);
@@ -2709,7 +2710,7 @@ extern fn clock_sleep(nanos: Int) -> Unit / {native.read}
 
 // --- Tests --------------------------------------------------------------------------
 
-fn here() -> RequestContext = { site: nowhere(), shields: unshielded(), now: 0 }
+fn here() -> RequestContext = { site: nowhere(), acquire_release_depth: unshielded(), now: 0 }
 
 fn scheduler_site() -> Site = { root: 1, start: 0, end: 10 }
 

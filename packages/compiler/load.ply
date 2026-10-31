@@ -2,9 +2,9 @@ import compiler.front.published (no_rows, dump_of)
 import compiler.front.rows (Dump, Rows, module_of, HashTableRow, DefinitionHashRow)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, view_dump)
 import compiler.front (ShippedInputs, analyse_pulling_std_with, checked_staged, dependencies_of,
-                       shipped_inputs_of, staged_pulling_std_with, viewed_text, embed_inputs_of,
+                       shipped_inputs_of, load_with_shipped, viewed_text, embed_inputs_of,
                        shipped_bytes, EmbedRecord, embeds_wanted)
-import compiler.front.facts (ShippedView, ModuleShape, assembled_load)
+import compiler.front.facts (ShippedModuleSummary, ModuleShape, assembled_load)
 import compiler.expand.embed (ModuleEmbed, EmbedBytesResult, EmbedResult, EmbedRequest, embed_file,
                               request_of_key)
 import compiler.store.hash.forms (HashOutput, ModuleHashes, joined_cached_hashes)
@@ -191,11 +191,11 @@ fn embed_target(file: String, path: String) -> String = normalize(join(parent(fi
 fn read_error(target: String, what: String) -> EmbedBytesResult =
   Err(Bytes::of_string("`" ++ target ++ "` " ++ what))
 
-pub type Unwalked = { path: String, reason: String }
+pub type EmbeddedFilesError = { path: String, reason: String }
 
 pub fn embedded_below<[r]>(
   dir: String,
-) -> Result<Map<String, String>, Unwalked> / {fs.list_dir[r]} =
+) -> Result<Map<String, String>, EmbeddedFilesError> / {fs.list_dir[r]} =
   embedded_in[r](dir, "", Map::new(), max_directory_depth())
 
 fn embedded_in<[r]>(
@@ -203,11 +203,11 @@ fn embedded_in<[r]>(
   under: String,
   found: Map<String, String>,
   depth_left: Int,
-) -> Result<Map<String, String>, Unwalked> / {fs.list_dir[r]} =
+) -> Result<Map<String, String>, EmbeddedFilesError> / {fs.list_dir[r]} =
   match fs.list_dir[r](joined(dir, under)) {
     None -> Err({ path: joined(dir, under), reason: "could not be listed" }),
     Some(entries) ->
-      entries.fold(Ok(found), |acc: Result<Map<String, String>, Unwalked>, l: Listed|
+      entries.fold(Ok(found), |acc: Result<Map<String, String>, EmbeddedFilesError>, l: Listed|
         match acc {
           Err(_) -> acc,
           Ok(m) -> if l.name.starts_with(".") { acc } else {
@@ -363,7 +363,7 @@ fn open_memo_store<a, [r], [s]>(
       shipped_module_text,
       || shipped.names().map(Bytes::of_string),
       |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want),
-      |ask: Bytes| encoded_derivation(w, ask),
+      |ask: Bytes| derivation_response(w, ask),
       kind,
       at,
     );
@@ -376,7 +376,7 @@ fn open_memo_store<a, [r], [s]>(
   }
 }
 
-pub fn encoded_derivation(w: LoadInputs, at: Bytes) -> Option<Bytes> / {Derives, abort.raise} =
+pub fn derivation_response(w: LoadInputs, at: Bytes) -> Option<Bytes> / {Derives, abort.raise} =
   match bin::decode(at, deriver_request_bin()) {
     Ok(ask) -> if value::decode(ask.declaration) == None { None }
     else { Some(bin::encode(derivation_result(ask, w.texts), deriver_response_bin())) },
@@ -440,7 +440,7 @@ pub fn fresh_check_results<[s]>(
         shipped_module_text,
         || shipped.names().map(Bytes::of_string),
         |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want),
-        |ask: Bytes| encoded_derivation(w, ask),
+        |ask: Bytes| derivation_response(w, ask),
         kind,
         at,
       ),
@@ -487,7 +487,7 @@ pub fn checked_program<[s]>(
   p: ProgramPackages,
   check_modules: CheckResults,
   tested: Bool,
-) -> Result<CheckedProgram, LoadFailure> / {shipped.names, shipped.module, shipped.report_reached, fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
+) -> Result<CheckedProgram, LoadFailure> / {shipped.names, shipped.module, shipped.report_view_used, fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
   let texts = pulled_texts(check_modules.pulled);
   let files_below = shipped.names().map(Bytes::of_string);
   let mine = indexed_sources(p.own, p.dependencies, check_modules.pulled, texts);
@@ -567,8 +567,11 @@ pub fn shipped_for(
   )
 }
 
-pub fn report_viewed(viewed: List<ShippedView>, pulled: Bool) -> Unit / {shipped.report_reached} =
-  if viewed.len() == 0 { () } else { shipped.report_reached(viewed_text(viewed), pulled) }
+pub fn report_viewed(
+  viewed: List<ShippedModuleSummary>,
+  pulled: Bool,
+) -> Unit / {shipped.report_view_used} =
+  if viewed.len() == 0 { () } else { shipped.report_view_used(viewed_text(viewed), pulled) }
 
 fn texts_of(shipped_sources: List<Source>) -> Map<Bytes, Bytes> =
   shipped_sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, source: Source|
@@ -589,7 +592,7 @@ fn input_read(inputs: Map<Bytes, Bytes>, want: EmbedRequest) -> EmbedResult / {a
 pub fn analyse_in_memory(
   files: List<SourceFile>,
   inputs: Map<Bytes, Bytes>,
-) -> InMemoryAnalysis / {shipped.names, shipped.module, shipped.report_reached, abort.raise} = {
+) -> InMemoryAnalysis / {shipped.names, shipped.module, shipped.report_view_used, abort.raise} = {
   let packages = { root: b"", manifest: None, supplied: [] };
   let shipping = shipped_for(sources_of(files), packages);
   let own = { root: "", manifest: None, files: files };
@@ -610,7 +613,7 @@ pub fn analyse_in_memory(
 pub fn check_in_memory(
   files: List<SourceFile>,
   inputs: Map<Bytes, Bytes>,
-) -> Result<LoadedAnalysis, LoadFailure> / {shipped.names, shipped.module, shipped.report_reached, abort.raise} = {
+) -> Result<LoadedAnalysis, LoadFailure> / {shipped.names, shipped.module, shipped.report_view_used, abort.raise} = {
   let returned = analyse_in_memory(files, inputs);
   let own = files.fold(Map::new(), |acc: Map<Bytes, Bool>, f: SourceFile|
     acc.insert(Bytes::of_string(f.name), true));
@@ -671,7 +674,7 @@ pub fn load<[r]>(
     },
   }
 
-pub effect set Derives = {shipped.names, shipped.module, shipped.digests, shipped.report_reached, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
+pub effect set Derives = {shipped.names, shipped.module, shipped.digests, shipped.report_view_used, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
 
 type ReachedModule = { name: Bytes, text: Bytes }
 
@@ -941,14 +944,14 @@ fn loaded_from(
 ) -> Result<LoadedProgram, List<Diagnostic>> / {abort.raise} = {
   let tree = fs::mem_of(files);
   handle {
-    deriving_nothing(|| load[t]("p"))
+    forbid_derivers(|| load[t]("p"))
   } with {
     fs.list_dir[t](path) -> fs::mem_list(tree, path),
     fs.kind[t](path) -> fs::mem_kind(tree, path),
     fs.read_file[t](path) -> fs::mem_read(tree, path),
     shipped.names() -> names.push("std.prelude"),
     shipped.module(name) -> prelude_named(name),
-    shipped.report_reached(view, pulled) -> (),
+    shipped.report_view_used(view, pulled) -> (),
     shipped.runtime() -> bare_runtime(),
     shipped.read_pack(path, offset, len) -> None,
     shipped.definitions() -> listed_queries(),
@@ -960,7 +963,7 @@ test "a derivation asked with a declaration that is no value returns nothing, an
   let w = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let ask = { module: b"std.derive.map", declaration: b"no value" };
   assert_eq(
-    deriving_nothing(|| encoded_derivation(w, bin::encode(ask, deriver_request_bin()))),
+    forbid_derivers(|| derivation_response(w, bin::encode(ask, deriver_request_bin()))),
     None,
   )
 }
@@ -980,7 +983,7 @@ test "a deriver's reach is every module of the load's own it imports, whatever e
   assert_eq(reach(own.insert(b"std.derive.map", b"import std.derive\n"), b"std.derive.map"), [])
 }
 
-pub fn deriving_nothing<a | e>(
+pub fn forbid_derivers<a | e>(
   work: () -> a / {shipped.digests, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e},
 ) -> a / {abort.raise | e} =
   handle {
@@ -1130,7 +1133,7 @@ test "a dependency's module that does not check is labelled in its own file" {
   }
 }
 
-fn greeting() -> List<{ path: String, body: Bytes }> =
+fn embedding_program_files() -> List<{ path: String, body: Bytes }> =
   [
     {
       path: "p/m.ply",
@@ -1140,7 +1143,7 @@ fn greeting() -> List<{ path: String, body: Bytes }> =
   ]
 
 test "a module embeds a file beside it, which its result knows by digest and its unit holds" {
-  match loaded_from(greeting()) {
+  match loaded_from(embedding_program_files()) {
     Err(diagnostics) -> panic(messages(diagnostics)),
     Ok(l) -> {
       assert_eq(l.front.dump.embeds.map(|e: ModuleEmbed| e.read), [
@@ -1179,9 +1182,9 @@ test "a program held in memory embeds the file its embed names by digest, as one
     } with {
       shipped.names() -> [],
       shipped.module(name) -> None,
-      shipped.report_reached(view, pulled) -> (),
+      shipped.report_view_used(view, pulled) -> (),
     };
-  let read = match loaded_from(greeting()) {
+  let read = match loaded_from(embedding_program_files()) {
     Ok(l) -> l.front.dump,
     Err(diagnostics) -> panic(messages(diagnostics)),
   };
@@ -1200,9 +1203,9 @@ test "a program held in memory embeds the file its embed names by digest, as one
 }
 
 test "an embed whose file reads otherwise once the program is checked is rejected, not emitted" {
-  let tree = fs::mem_of(greeting());
+  let tree = fs::mem_of(embedding_program_files());
   let loaded = handle {
-    deriving_nothing(|| load[t]("p"))
+    forbid_derivers(|| load[t]("p"))
   } with {
     var reads: Int = 0,
     fs.list_dir[t](path) -> fs::mem_list(tree, path),
@@ -1213,7 +1216,7 @@ test "an embed whose file reads otherwise once the program is checked is rejecte
     },
     shipped.names() -> [],
     shipped.module(name) -> None,
-    shipped.report_reached(view, pulled) -> (),
+    shipped.report_view_used(view, pulled) -> (),
     shipped.runtime() -> bare_runtime(),
     shipped.read_pack(path, offset, len) -> None,
     shipped.definitions() -> listed_queries(),
@@ -1232,7 +1235,7 @@ test "a shipped module a program imports embeds a data file the binary holds" {
   ]);
   let over = |data: Option<Bytes>|
     handle {
-      deriving_nothing(|| load[t]("p"))
+      forbid_derivers(|| load[t]("p"))
     } with {
       fs.list_dir[t](path) -> fs::mem_list(tree, path),
       fs.kind[t](path) -> fs::mem_kind(tree, path),
@@ -1242,7 +1245,7 @@ test "a shipped module a program imports embeds a data file the binary holds" {
         Some(b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n")
       } else if name == "std/words/list.txt" { data }
       else { prelude_named(name) },
-      shipped.report_reached(view, pulled) -> (),
+      shipped.report_view_used(view, pulled) -> (),
       shipped.runtime() -> bare_runtime(),
       shipped.read_pack(path, offset, len) -> None,
       shipped.definitions() -> listed_queries(),
@@ -1266,14 +1269,14 @@ test "a shipped module is placed as the load read it, what a module importing it
     { path: "p/m.ply", body: b"import std.words (count)\n\nfn main() -> Int = count()\n" },
   ]);
   let loaded = handle {
-    deriving_nothing(|| load[t]("p"))
+    forbid_derivers(|| load[t]("p"))
   } with {
     fs.list_dir[t](path) -> fs::mem_list(tree, path),
     fs.kind[t](path) -> fs::mem_kind(tree, path),
     fs.read_file[t](path) -> fs::mem_read(tree, path),
     shipped.names() -> ["std.words", "std.prelude"],
     shipped.module(name) -> if name == "std.words" { Some(whole) } else { prelude_named(name) },
-    shipped.report_reached(view, pulled) -> (),
+    shipped.report_view_used(view, pulled) -> (),
     shipped.runtime() -> bare_runtime(),
     shipped.read_pack(path, offset, len) -> None,
     shipped.definitions() -> listed_queries(),

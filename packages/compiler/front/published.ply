@@ -27,8 +27,8 @@ import compiler.store.hash.printer (print_bodies, Printed, Unprintable)
 import compiler.check.typed
 import compiler.check.typed (TypedBody, TypedExpression, TypedCall, TypedRead, ReadDefinition,
                              BodyPart, WholeBody, MeasureBody, ClauseBody, TypedParam, body_retyped,
-                             unwitnessed, typed_expression_nodes, typed_expression_nodes_mapped,
-                             ReadBuiltin, unreleased)
+                             without_witnesses, typed_expression_nodes,
+                             typed_expression_nodes_mapped, ReadBuiltin, without_releases)
 import compiler.check.infer (CheckOutput, BodyFacts, types_joined, decode_facts, no_body_facts,
                              elaborate, terminating_definitions, measured_definitions, bodies_with,
                              bodies_read, check_output_with, EmitFacts)
@@ -58,7 +58,7 @@ import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefinitionRo
 import compiler.front.facts (Analysis, PackageTables, package_tables, toolchain_tree, tree_named,
                              home_of, ToolchainTree, NoTree)
 import compiler.front.emitter_input (test_root_at, checked_program_of, view_dump, Analysed,
-                                     AnalysisOutcome, Rejected, known_from_rows, InferredFacts,
+                                     AnalysisOutcome, Rejected, cache_from_rows, InferredFacts,
                                      inferred_facts_of, rows_from)
 
 pub fn no_rows() -> Rows = { definitions: [], tests: [], types: Map::new() }
@@ -311,10 +311,10 @@ fn interface_type(
   }
 }
 
-fn interface_domain() -> Bytes = b"ply.interface.1"
+fn interface_digest_prefix() -> Bytes = b"ply.interface.1"
 
 pub fn interface_digest(i: DefinitionInterface) -> Bytes / {abort.raise} =
-  blake3(interface_domain().concat(bin::encode(i, definition_interface_bin())))
+  blake3(interface_digest_prefix().concat(bin::encode(i, definition_interface_bin())))
 
 pub type StoredBody = { hash: Bytes, body: Bytes }
 
@@ -382,7 +382,7 @@ pub fn analyse_with(
     acc.insert(p.name, p.src));
   let declared = homes_declaring(|h: Bytes| texts.get(h));
   let unimported = if declared.len() == 0 && !texts.contains(scheduler_module()) { Map::new() }
-  else { unimported_read(all.map(|p: ParsedSource| { name: p.name, src: p.src }), declared) };
+  else { missing_imports(all.map(|p: ParsedSource| { name: p.name, src: p.src }), declared) };
   analyse_closure(
     all,
     clo,
@@ -393,7 +393,7 @@ pub fn analyse_with(
   )
 }
 
-pub fn unimported_read(
+pub fn missing_imports(
   sources: List<Source>,
   declared: List<HomeNames>,
 ) -> Map<Bytes, List<Bytes>> / {abort.raise} =
@@ -429,7 +429,7 @@ fn with_prelude_module(
   }
 }
 
-pub fn squats(
+pub fn reserved_prefix_diagnostics(
   own: List<Bytes>,
   listed: List<Bytes>,
 ) -> List<{ slot: Int, diagnostic: ParseDiagnostic }> / {abort.raise} =
@@ -576,7 +576,7 @@ pub fn checked_closure(
   walks: BodyChecking,
 ) -> AnalysisOutcome / {abort.raise} = {
   let out = check_output_with(h.r, h.modules, {
-    ..known_from_rows(rows, h.root_count),
+    ..cache_from_rows(rows, h.root_count),
     walks: walks,
   });
   let checked: CheckOutput = out.checked;
@@ -588,7 +588,7 @@ pub fn checked_closure(
       checked: checked,
       index: h.index,
       hashes: {
-        let kept = kept_calls(h.modules, checked);
+        let kept = cached_member_sites(h.modules, checked);
         checked_hashes(
           h.hashes,
           checked.facts.members.concat(kept.sites),
@@ -612,7 +612,7 @@ pub fn checked_closure(
   }
 }
 
-fn kept_calls(
+fn cached_member_sites(
   modules: List<ParsedModule>,
   checked: CheckOutput,
 ) -> { sites: List<MemberSite>, unread: Map<Bytes, Bool> } / {abort.raise} = {
@@ -668,7 +668,7 @@ fn analyse_closure(
     Err(diagnostics) -> Rejected(diagnostics),
     Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module()) {
         None
-      } else { prelude_cut(parsed, h) } {
+      } else { prune_prelude(parsed, h) } {
       None -> checked_closure(h, rows, CheckEvery),
       Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
         Err(diagnostics) -> Rejected(diagnostics),
@@ -677,7 +677,7 @@ fn analyse_closure(
     },
   }
 
-fn prelude_cut(
+fn prune_prelude(
   parsed: List<ParsedSource>,
   h: HashedProgram,
 ) -> Option<List<ParsedSource>> / {abort.raise} = {
@@ -734,7 +734,7 @@ pub fn runtime_dump(d: Dump) -> Dump =
     walked: b"",
   }
 
-type Reaching = { seen: Map<Bytes, Bool>, frontier: List<Bytes> }
+type ReachSearch = { seen: Map<Bytes, Bool>, frontier: List<Bytes> }
 
 fn names_reached(hashes: List<HashTableRow>, entry: Bytes) -> Map<Bytes, Bool> / {abort.raise} = {
   let dependencies = hashes.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, frame: HashTableRow|
@@ -742,14 +742,14 @@ fn names_reached(hashes: List<HashTableRow>, entry: Bytes) -> Map<Bytes, Bool> /
   iterate(
     { seen: Map::new().insert(entry, true), frontier: [entry] },
     hashes.len() + 2,
-    |w: Reaching|
+    |w: ReachSearch|
       if w.frontier.len() == 0 { Stop(w.seen) } else {
         Continue(
-          w.frontier.fold({ seen: w.seen, frontier: [] }, |acc: Reaching, name: Bytes|
+          w.frontier.fold({ seen: w.seen, frontier: [] }, |acc: ReachSearch, name: Bytes|
             List::fold(
               match dependencies.get(name) { Some(qualified_code) -> qualified_code, None -> [] },
               acc,
-              |met: Reaching, dependency: Bytes|
+              |met: ReachSearch, dependency: Bytes|
                 if met.seen.contains(dependency) { met } else {
                   {
                     seen: met.seen.insert(dependency, true),
@@ -856,7 +856,7 @@ fn resolved_by_owner(bodies: List<TypedBody<Type>>) -> Resolved =
   bodies.fold(Map::new(), |m: Resolved, b: TypedBody<Type>|
     m.insert(b.owner, match m.get(b.owner) { Some(xs) -> xs.push(b), None -> [b] }))
 
-fn claimed(
+fn lowered_part(
   resolved: Resolved,
   owner: Bytes,
   part: BodyPart,
@@ -884,7 +884,7 @@ fn resolved_at(
     None -> None,
     Some(b) ->
       Some(
-        body_retyped(unwitnessed(b), (), {
+        body_retyped(without_witnesses(b), (), {
           ty: |t: Type, u: Unit| { ty: t, state: u },
           effects: |r: Effects| r,
           entry: |a: Effect| a,
@@ -944,7 +944,7 @@ fn definition_claim(
 ) -> Claim / {abort.raise} = {
   let full = qualify(module, definition.name.name);
   let labels = definition.generics.labels.map(|i: Identifier| i.name);
-  let code = |part: BodyPart| claimed(resolved, full, part, definition.span.start, labels);
+  let code = |part: BodyPart| lowered_part(resolved, full, part, definition.span.start, labels);
   let costed = range(0, definition.params.len()).filter(|i: Int|
     definition.params.get(i).cost != None);
   let spaced = range(0, definition.params.len()).filter(|i: Int|
@@ -981,7 +981,7 @@ fn given_opt(c: Option<Code>, given: Map<Int, Code>) -> Option<Code> =
 fn given_fields(fs: List<CodeField>, given: Map<Int, Code>) -> List<CodeField> =
   fs.map(|field: CodeField| { name: field.name, value: given_in(field.value, given) })
 
-fn given_past(
+fn split_given_captures(
   captures: List<Capture>,
   given: Map<Int, Code>,
 ) -> { captures: List<Capture>, given: Map<Int, Code> } =
@@ -1045,14 +1045,14 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
     CodePerform(p) ->
       { ..c, node: CodePerform({ ..p, label: given_opt(p.label, given), args: gs(p.args) }) },
     CodeLambda(l) -> {
-      let past = given_past(l.captures, given);
+      let past = split_given_captures(l.captures, given);
       {
         ..c,
         node: CodeLambda({ ..l, captures: past.captures, body: given_in(l.body, past.given) }),
       }
     },
     CodeSimulate(x) -> {
-      let past = given_past(x.captures, given);
+      let past = split_given_captures(x.captures, given);
       {
         ..c,
         node: CodeSimulate({ ..x, captures: past.captures, body: given_in(x.body, past.given) }),
@@ -1066,12 +1066,12 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
           ..h,
           body: g(h.body),
           clauses: h.clauses.map(|clause: CodeClause| {
-            let past = given_past(clause.captures, given);
+            let past = split_given_captures(clause.captures, given);
             { ..clause, captures: past.captures, body: given_in(clause.body, past.given) }
           }),
           ret: match h.ret {
             Some(x) -> {
-              let past = given_past(x.captures, given);
+              let past = split_given_captures(x.captures, given);
               Some({ ..x, captures: past.captures, body: given_in(x.body, past.given) })
             },
             None -> None,
@@ -1082,7 +1082,11 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
     CodeUpdate(u) ->
       {
         ..c,
-        node: CodeUpdate({ base: g(u.base), copies: u.copies, sets: given_fields(u.sets, given) }),
+        node: CodeUpdate({
+          base: g(u.base),
+          copied_fields: u.copied_fields,
+          sets: given_fields(u.sets, given),
+        }),
       },
   }
 }
@@ -1155,11 +1159,11 @@ fn law_statement(
     Some(of) -> match resolved_at(resolved, owner, part, law_definition.span.start) {
       Some(b) -> match instantiated(modules, resolved, law_definition.binders.len(), of, b.body) {
         Some(w) -> Some(w),
-        None -> claimed(resolved, owner, part, law_definition.span.start),
+        None -> lowered_part(resolved, owner, part, law_definition.span.start),
       },
       None -> None,
     },
-    None -> claimed(resolved, owner, part, law_definition.span.start),
+    None -> lowered_part(resolved, owner, part, law_definition.span.start),
   }
 
 fn law_claim(
@@ -1196,7 +1200,7 @@ fn claims_of_modules(
 ) -> List<Claim> / {abort.raise} = {
   let modelled = prover_modelled();
   let resolved = resolved_by_owner(
-    bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, unreleased(b))),
+    bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, without_releases(b))),
   );
   wanted.fold([], |acc: List<Claim>, i: Int| {
     let m = modules.get(i);
@@ -1300,7 +1304,7 @@ pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> List<TypedBody<Type>>
       match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name), true), _ -> a })
   });
   let rows = rows_of(analysis);
-  let known = known_from_rows(
+  let known = cache_from_rows(
     {
       definitions: rows.definitions.filter(|row: KnownDefinitionRow| !walked.contains(row.name)),
       tests: rows.tests,

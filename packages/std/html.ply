@@ -127,12 +127,9 @@ fn contains_markup(h: Html) -> Bool =
 /// can build a `Value`, so this trusts `v` to come from `reflect`. A value read from outside a
 /// program, such as a JSON document, has no constructor and is never a fragment.
 pub fn of_value(v: Value) -> Option<Html> =
-  match v {
-    VRecord([{ name: "pieces", value: VList(shown) }]) -> pieces_of_values(shown),
-    _ -> None,
-  }
+  match v { VRecord([{ name: "pieces", value: VList(shown) }]) -> html_of_values(shown), _ -> None }
 
-fn pieces_of_values(shown: List<Value>) -> Option<Html> =
+fn html_of_values(shown: List<Value>) -> Option<Html> =
   match Option::traverse(shown, piece_of_value) {
     Some(pieces) -> Some({ pieces: pieces }),
     None -> None,
@@ -306,7 +303,7 @@ fn numeric_reference_error(code: Int) -> Option<ParseError> =
   else if code > 0x10FFFF { Some(CharacterReferenceOutsideUnicodeRange) }
   else if code >= 0xD800 && code <= 0xDFFF { Some(SurrogateCharacterReference) }
   else if noncharacter(code) { Some(NoncharacterCharacterReference) }
-  else if code == 0x0D || (control(code) && code != 9 && code != 10 && code != 12) {
+  else if code == 0x0D || (is_control_code(code) && code != 9 && code != 10 && code != 12) {
     Some(ControlCharacterReference)
   } else { None }
 
@@ -314,7 +311,7 @@ fn numeric_reference_error(code: Int) -> Option<ParseError> =
 fn noncharacter(code: Int) -> Bool = (code >= 0xFDD0 && code <= 0xFDEF) || code & 0xFFFE == 0xFFFE
 
 /// Whether `code` is a C0 or a C1 control, or DEL.
-fn control(code: Int) -> Bool = code < 0x20 || (code >= 0x7F && code <= 0x9F)
+fn is_control_code(code: Int) -> Bool = code < 0x20 || (code >= 0x7F && code <= 0x9F)
 
 /// The code point a numeric reference to `code` is read as.
 fn numeric_reference_character(code: Int) -> Int =
@@ -625,7 +622,7 @@ pub type ErrorKind =
   | NameTooLong
   | ValueTooLong
   | OutputTooLong
-  | Defect(String)
+  | InternalError(String)
 
 /// A reading error, and the byte of the input the reading was at.
 pub type Error = new { offset: Int, reason: ErrorKind }
@@ -694,7 +691,7 @@ type Mode =
   | AfterDoctypeName
   | AfterKeyword(Bool)
   | BeforeId(Bool)
-  | InId(Bool, Int)
+  | InQuotedId(Bool, Int)
   | AfterId(Bool)
   | BetweenIds
   | BogusDoctype
@@ -768,7 +765,7 @@ type Machine = {
   url: UrlState,
   word: Bytes,
   held: List<Bytes>,
-  stray: Option<Stray>,
+  stray: Option<InvalidCharacter>,
 }
 
 fn no_tag() -> PartialTag = { name: [], end: false, attributes: [], closing: false }
@@ -850,7 +847,7 @@ fn current(m: Machine) -> Bytes / {abort.raise} =
 fn is_space(c: Int) -> Bool = c == 9 || c == 10 || c == 12 || c == 32
 
 /// The machine past the character it reads next.
-fn ahead(m: Machine) -> Machine / {abort.raise} = { ..m, at: m.at + width(m.input, m.at) }
+fn advance(m: Machine) -> Machine / {abort.raise} = { ..m, at: m.at + width(m.input, m.at) }
 
 /// The machine past the character it reads next, in `mode`.
 fn into(m: Machine, mode: Mode) -> Machine / {abort.raise} =
@@ -887,7 +884,7 @@ fn run_of(m: Machine, stops: Bytes) -> Bytes / {abort.raise} =
   m.input.slice(m.at, m.input.skip_until(m.at, stops))
 
 /// `b` with `A` to `Z` in lower case.
-fn lowered(b: Bytes) -> Bytes / {abort.raise} =
+fn to_ascii_lower(b: Bytes) -> Bytes / {abort.raise} =
   if b.len() == 0 || b.skip_until(0, upper_letters()) == b.len() { b }
   else { Bytes::of_string(String::of_bytes_lossy(b).ascii_lower()) }
 
@@ -899,7 +896,7 @@ fn name_grown(m: Machine, size: Int) -> Machine =
   else { { ..m, name_size: size } }
 
 /// Grows the value being read to `size` bytes, and fails past the value limit.
-fn value_grown(m: Machine, size: Int) -> Machine =
+fn set_value_size(m: Machine, size: Int) -> Machine =
   if size > m.limits.value { fail({ ..m, value_size: size }, ValueTooLong) }
   else { { ..m, value_size: size } }
 
@@ -916,7 +913,7 @@ fn tag_named(m: Machine, piece: Bytes, to: Int) -> Machine = {
 }
 
 fn data_added(m: Machine, piece: Bytes) -> Machine =
-  value_grown({ ..m, data: m.data.push(piece) }, m.value_size + piece.len())
+  set_value_size({ ..m, data: m.data.push(piece) }, m.value_size + piece.len())
 
 fn joined_bytes(pieces: List<Bytes>) -> String = String::of_bytes_lossy(Bytes::concat_all(pieces))
 
@@ -925,7 +922,7 @@ fn joined_bytes(pieces: List<Bytes>) -> String = String::of_bytes_lossy(Bytes::c
 /// The first bytes of the characters the input stream may report an error for: the C0 controls
 /// except ASCII whitespace and NUL, DEL, and the lead bytes of the C1 controls and of every
 /// noncharacter.
-fn suspects() -> Bytes =
+fn error_lead_bytes() -> Bytes =
   b"\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f\xc2\xef\xf0\xf1\xf2\xf3\xf4"
 
 /// The code point of the UTF-8 character at `at`.
@@ -942,13 +939,13 @@ fn code_point(input: Bytes, at: Int) -> Int / {abort.raise} = {
 /// except ASCII whitespace and NUL, and each noncharacter, at its first byte.
 fn input_stream_problems(input: Bytes, from: Int) -> List<Problem> / {abort.raise} =
   iterate({ at: from, found: [] }, input.len() + 2, |s: { at: Int, found: List<Problem> }| {
-    let i = input.skip_until(s.at, suspects());
+    let i = input.skip_until(s.at, error_lead_bytes());
     if i >= input.len() { Stop(s.found) } else {
       let point = code_point(input, i);
       let next = i + width(input, i);
       if noncharacter(point) {
         Continue({ at: next, found: s.found.push(problem(NoncharacterInInputStream, i)) })
-      } else if control(point) {
+      } else if is_control_code(point) {
         Continue({ at: next, found: s.found.push(problem(ControlCharacterInInputStream, i)) })
       } else { Continue({ at: next, found: s.found }) }
     }
@@ -1045,15 +1042,15 @@ fn replacement() -> Bytes = b"\xef\xbf\xbd"
 fn letters() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 /// A line feed, for the line feed or the carriage return read next.
-fn newline(m: Machine) -> Machine / {abort.raise} = add_text(ahead(m), b"\n", m.at)
+fn newline(m: Machine) -> Machine / {abort.raise} = add_text(advance(m), b"\n", m.at)
 
 /// A NUL read in text: U+FFFD, and its parse error.
 fn null_text(m: Machine) -> Machine / {abort.raise} =
-  add_text(ahead(fault(m, UnexpectedNullCharacter)), replacement(), m.at)
+  add_text(advance(fault(m, UnexpectedNullCharacter)), replacement(), m.at)
 
 /// Reads the whole character reference that the next `&` begins. The machine waits if its input
 /// ends before the reference is decided.
-fn reference(m: Machine, attribute: Bool) -> Machine / {abort.raise} =
+fn read_character_reference(m: Machine, attribute: Bool) -> Machine / {abort.raise} =
   match read_reference(m.input, m.at, names(), attribute, m.ended) {
     None -> { ..m, waiting: true },
     Some(r) -> {
@@ -1063,18 +1060,18 @@ fn reference(m: Machine, attribute: Bool) -> Machine / {abort.raise} =
     },
   }
 
-fn reading(m: Machine, s: State) -> Machine / {abort.raise} = {
+fn read_state(m: Machine, s: State) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c < 0 {
     if s == CdataSection { emit_end_of_file(fault(m, EofInCdata)) } else { emit_end_of_file(m) }
   } else if c == 10 { newline(m) } else {
     match s {
       Data -> if c == b'<' { { ..m, mode: TagOpen, at: m.at + 1, from: m.at } }
-      else if c == b'&' { reference(m, false) }
-      else if c == 0 { add_text(ahead(fault(m, UnexpectedNullCharacter)), b"\x00", m.at) }
+      else if c == b'&' { read_character_reference(m, false) }
+      else if c == 0 { add_text(advance(fault(m, UnexpectedNullCharacter)), b"\x00", m.at) }
       else { run_text(m, b"<&\r\x00") },
       Rcdata -> if c == b'<' { { ..m, mode: TextLessThan(RcdataText), at: m.at + 1, from: m.at } }
-      else if c == b'&' { reference(m, false) }
+      else if c == b'&' { read_character_reference(m, false) }
       else if c == 0 { null_text(m) }
       else { run_text(m, b"<&\r\x00") },
       Rawtext -> if c == b'<' { { ..m, mode: TextLessThan(RawText), at: m.at + 1, from: m.at } }
@@ -1096,7 +1093,7 @@ fn cdata_bracket(m: Machine) -> Machine / {abort.raise} =
 
 fn cdata_end(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if c == b']' { add_text(ahead(m), b"]", m.at - 2) }
+  if c == b']' { add_text(advance(m), b"]", m.at - 2) }
   else if c == b'>' { into(m, Reading(Data)) }
   else { reconsume(add_text(m, b"]]", m.at - 2), Reading(CdataSection)) }
 }
@@ -1142,7 +1139,7 @@ fn tag_name(m: Machine) -> Machine / {abort.raise} = {
   else if c == 0 { tag_named(fault(m, UnexpectedNullCharacter), replacement(), m.at + 1) }
   else if c < 0 { emit_end_of_file(fault(m, EofInTag)) } else {
     let run = run_of(m, b"\t\n\x0c\r />\x00");
-    tag_named(m, lowered(run), m.at + run.len())
+    tag_named(m, to_ascii_lower(run), m.at + run.len())
   }
 }
 
@@ -1184,7 +1181,7 @@ fn tag_emitted(m: Machine) -> Machine / {abort.raise} = {
 }
 
 /// Whether the end tag read closes the last start tag.
-fn appropriate(m: Machine) -> Bool =
+fn matches_last_start(m: Machine) -> Bool =
   m.last_start.len() > 0 && Bytes::concat_all(m.tag.name) == m.last_start
 
 /// The state in which text of this kind is read.
@@ -1213,10 +1210,10 @@ fn text_end_name(m: Machine, kind: TextKind) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_letter(c) {
     let run = m.input.slice(m.at, m.input.skip(m.at, letters()));
-    { ..tag_named(m, lowered(run), m.at + run.len()), temp: m.temp.concat(run) }
-  } else if is_space(c) && appropriate(m) { into(m, BeforeAttributeName) }
-  else if c == b'/' && appropriate(m) { into(m, SelfClosing) }
-  else if c == b'>' && appropriate(m) { tag_emitted(m) }
+    { ..tag_named(m, to_ascii_lower(run), m.at + run.len()), temp: m.temp.concat(run) }
+  } else if is_space(c) && matches_last_start(m) { into(m, BeforeAttributeName) }
+  else if c == b'/' && matches_last_start(m) { into(m, SelfClosing) }
+  else if c == b'>' && matches_last_start(m) { tag_emitted(m) }
   else { reconsume(add_text(m, b"</".concat(m.temp), m.from), back(kind)) }
 }
 
@@ -1233,7 +1230,7 @@ fn escaped(m: Machine, double: Bool, dashes: Int) -> Machine / {abort.raise} = {
   let c = next_of(m);
   let raw_text = if double { DoubleEscaped } else { Escaped };
   if c == b'-' {
-    if dashes == 2 { add_text(ahead(m), b"-", m.at) } else {
+    if dashes == 2 { add_text(advance(m), b"-", m.at) } else {
       let more = if double { if dashes == 0 { DoubleEscapedDash } else { DoubleEscapedDashDash } }
       else if dashes == 0 { EscapedDash }
       else { EscapedDashDash };
@@ -1260,7 +1257,7 @@ fn double_escape(m: Machine, ending: Bool) -> Machine / {abort.raise} = {
     add_text(into(m, next), current(m), m.at)
   } else if is_letter(c) {
     let run = m.input.slice(m.at, m.input.skip(m.at, letters()));
-    add_text({ ..m, at: m.at + run.len(), temp: m.temp.concat(lowered(run)) }, run, m.at)
+    add_text({ ..m, at: m.at + run.len(), temp: m.temp.concat(to_ascii_lower(run)) }, run, m.at)
   } else { reconsume(m, if ending { DoubleEscaped } else { Escaped }) }
 }
 
@@ -1326,12 +1323,12 @@ fn with_value(m: Machine, piece: Bytes, to: Int) -> Machine / {abort.raise} = {
     value_size: size,
   };
   let limited = if size > m.limits.value { fail(grown, ValueTooLong) } else { grown };
-  if m.link == NoUrl { limited } else { url_read(limited, piece) }
+  if m.link == NoUrl { limited } else { scan_url(limited, piece) }
 }
 
 fn before_attribute_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { ahead(m) }
+  if is_space(c) { advance(m) }
   else if c == b'/' || c == b'>' || c < 0 { reconsume(m, AfterAttributeName) } else if c == b'=' {
     reconsume(
       attribute_named(
@@ -1353,13 +1350,13 @@ fn attribute_name(m: Machine) -> Machine / {abort.raise} = {
     attribute_named(fault(m, UnexpectedCharacterInAttributeName), current(m), m.at + 1)
   } else {
     let run = run_of(m, b"\t\n\x0c\r />=\x00\"'<");
-    attribute_named(m, lowered(run), m.at + run.len())
+    attribute_named(m, to_ascii_lower(run), m.at + run.len())
   }
 }
 
 fn after_attribute_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { ahead(m) }
+  if is_space(c) { advance(m) }
   else if c == b'/' { into(m, SelfClosing) }
   else if c == b'=' { into(m, BeforeAttributeValue) }
   else if c == b'>' { tag_emitted(m) }
@@ -1369,7 +1366,7 @@ fn after_attribute_name(m: Machine) -> Machine / {abort.raise} = {
 
 fn before_attribute_value(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { ahead(m) }
+  if is_space(c) { advance(m) }
   else if c == b'"' || c == b'\'' { into(value_opened(m), AttributeValue(c)) }
   else if c == b'>' { tag_emitted(fault(m, MissingAttributeValue)) }
   else { reconsume(value_opened(m), AttributeValue(0)) }
@@ -1377,7 +1374,7 @@ fn before_attribute_value(m: Machine) -> Machine / {abort.raise} = {
 
 fn attribute_value(m: Machine, quote: Int) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if c == b'&' { reference(m, true) }
+  if c == b'&' { read_character_reference(m, true) }
   else if c == 0 { with_value(fault(m, UnexpectedNullCharacter), replacement(), m.at + 1) }
   else if c < 0 { emit_end_of_file(fault(m, EofInTag)) } else if quote != 0 {
     if c == quote { into(m, AfterAttributeValue) }
@@ -1430,8 +1427,8 @@ fn bogus_comment(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == b'>' { emit_comment(m) }
   else if c < 0 { comment_ended(m) }
-  else if c == 0 { ahead(data_added(fault(m, UnexpectedNullCharacter), replacement())) }
-  else if c == 10 { ahead(data_added(m, b"\n")) } else {
+  else if c == 0 { advance(data_added(fault(m, UnexpectedNullCharacter), replacement())) }
+  else if c == 10 { advance(data_added(m, b"\n")) } else {
     let run = run_of(m, b">\r\x00");
     data_added({ ..m, at: m.at + run.len() }, run)
   }
@@ -1439,15 +1436,16 @@ fn bogus_comment(m: Machine) -> Machine / {abort.raise} = {
 
 /// Whether the input from `at` could still become `--`, `DOCTYPE` or `[CDATA[` if more input
 /// follows.
-fn undecided(input: Bytes, at: Int) -> Bool / {abort.raise} = {
+fn is_declaration_prefix(input: Bytes, at: Int) -> Bool / {abort.raise} = {
   let rest = input.slice(at, input.len());
-  b"--".starts_with(rest) || b"doctype".starts_with(lowered(rest)) || b"[CDATA[".starts_with(rest)
+  b"--".starts_with(rest) || b"doctype".starts_with(to_ascii_lower(rest))
+    || b"[CDATA[".starts_with(rest)
 }
 
 fn declaration(m: Machine) -> Machine / {abort.raise} =
   if m.input.starts_at(m.at, b"--") {
     { ..m, at: m.at + 2, mode: CommentStart, data: [], value_size: 0 }
-  } else if lowered(m.input.slice(m.at, min(m.at + 7, m.input.len()))) == b"doctype" {
+  } else if to_ascii_lower(m.input.slice(m.at, min(m.at + 7, m.input.len()))) == b"doctype" {
     { ..m, at: m.at + 7, mode: DoctypeOpen, doctype: no_doctype(), name_size: 0, value_size: 0 }
   } else if m.input.starts_at(m.at, b"[CDATA[") {
     if m.foreign { { ..m, at: m.at + 7, mode: Reading(CdataSection) } } else {
@@ -1459,7 +1457,7 @@ fn declaration(m: Machine) -> Machine / {abort.raise} =
         value_size: 7,
       }
     }
-  } else if !m.ended && undecided(m.input, m.at) { { ..m, waiting: true } }
+  } else if !m.ended && is_declaration_prefix(m.input, m.at) { { ..m, waiting: true } }
   else { { ..fault(m, IncorrectlyOpenedComment), mode: BogusComment, data: [], value_size: 0 } }
 
 fn comment_state(m: Machine) -> Machine / {abort.raise} = {
@@ -1474,14 +1472,14 @@ fn comment_state(m: Machine) -> Machine / {abort.raise} = {
     else { reconsume(data_added(m, b"-"), InComment) },
     InComment -> if c == b'<' { into(data_added(m, b"<"), CommentLessThan) }
     else if c == b'-' { into(m, CommentEndDash) }
-    else if c == 0 { ahead(data_added(fault(m, UnexpectedNullCharacter), replacement())) }
+    else if c == 0 { advance(data_added(fault(m, UnexpectedNullCharacter), replacement())) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
-    else if c == 10 { ahead(data_added(m, b"\n")) } else {
+    else if c == 10 { advance(data_added(m, b"\n")) } else {
       let run = run_of(m, b"<-\r\x00");
       data_added({ ..m, at: m.at + run.len() }, run)
     },
     CommentLessThan -> if c == b'!' { into(data_added(m, b"!"), CommentLessThanBang) }
-    else if c == b'<' { ahead(data_added(m, b"<")) }
+    else if c == b'<' { advance(data_added(m, b"<")) }
     else { reconsume(m, InComment) },
     CommentLessThanBang -> if c == b'-' { into(m, CommentLessThanBangDash) }
     else { reconsume(m, InComment) },
@@ -1494,7 +1492,7 @@ fn comment_state(m: Machine) -> Machine / {abort.raise} = {
     else { reconsume(data_added(m, b"-"), InComment) },
     CommentEnd -> if c == b'>' { emit_comment(m) }
     else if c == b'!' { into(m, CommentEndBang) }
-    else if c == b'-' { ahead(data_added(m, b"-")) }
+    else if c == b'-' { advance(data_added(m, b"-")) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
     else { reconsume(data_added(m, b"--"), InComment) },
     _ -> if c == b'-' { into(data_added(m, b"--!"), CommentEndDash) }
@@ -1541,7 +1539,7 @@ fn id_added(m: Machine, public: Bool, piece: Bytes) -> Machine = {
       Some(p) -> Some(if piece.len() == 0 { p } else { p.push(piece) }),
       None -> Some(if piece.len() == 0 { [] } else { [piece] }),
     };
-  value_grown(
+  set_value_size(
     if public { { ..m, doctype: { ..m.doctype, public_id: grow(m.doctype.public_id) } } }
     else { { ..m, doctype: { ..m.doctype, system_id: grow(m.doctype.system_id) } } },
     m.value_size + piece.len(),
@@ -1558,28 +1556,28 @@ fn doctype_open(m: Machine) -> Machine / {abort.raise} = {
 
 fn before_doctype_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { ahead(m) } else if c == 0 {
+  if is_space(c) { advance(m) } else if c == 0 {
     into(doctype_named(fault(m, UnexpectedNullCharacter), replacement()), DoctypeName)
   } else if c == b'>' { emit_doctype(set_force_quirks(fault(m, MissingDoctypeName))) }
   else if c < 0 { doctype_ended(m) }
-  else { into(doctype_named(m, lowered(current(m))), DoctypeName) }
+  else { into(doctype_named(m, to_ascii_lower(current(m))), DoctypeName) }
 }
 
 fn doctype_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { into(m, AfterDoctypeName) }
   else if c == b'>' { emit_doctype(m) }
-  else if c == 0 { ahead(doctype_named(fault(m, UnexpectedNullCharacter), replacement())) }
+  else if c == 0 { advance(doctype_named(fault(m, UnexpectedNullCharacter), replacement())) }
   else if c < 0 { doctype_ended(m) } else {
     let run = run_of(m, b"\t\n\x0c\r >\x00");
-    doctype_named({ ..m, at: m.at + run.len() }, lowered(run))
+    doctype_named({ ..m, at: m.at + run.len() }, to_ascii_lower(run))
   }
 }
 
 fn after_doctype_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  let word = lowered(m.input.slice(m.at, min(m.at + 6, m.input.len())));
-  if is_space(c) { ahead(m) }
+  let word = to_ascii_lower(m.input.slice(m.at, min(m.at + 6, m.input.len())));
+  if is_space(c) { advance(m) }
   else if c == b'>' { emit_doctype(m) }
   else if c < 0 { doctype_ended(m) }
   else if word == b"public" { { ..m, at: m.at + 6, mode: AfterKeyword(true) } }
@@ -1603,7 +1601,7 @@ fn after_keyword(m: Machine, public: Bool) -> Machine / {abort.raise} = {
   if is_space(c) { into(m, BeforeId(public)) } else if c == b'"' || c == b'\'' {
     let e = if public { MissingWhitespaceAfterDoctypePublicKeyword }
     else { MissingWhitespaceAfterDoctypeSystemKeyword };
-    into(id_added(fault(m, e), public, b""), InId(public, c))
+    into(id_added(fault(m, e), public, b""), InQuotedId(public, c))
   } else if c == b'>' { emit_doctype(set_force_quirks(fault(m, missing_id(public)))) }
   else if c < 0 { doctype_ended(m) }
   else { reconsume(set_force_quirks(fault(m, missing_quote(public))), BogusDoctype) }
@@ -1611,8 +1609,8 @@ fn after_keyword(m: Machine, public: Bool) -> Machine / {abort.raise} = {
 
 fn before_id(m: Machine, public: Bool) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { ahead(m) }
-  else if c == b'"' || c == b'\'' { into(id_added(m, public, b""), InId(public, c)) }
+  if is_space(c) { advance(m) }
+  else if c == b'"' || c == b'\'' { into(id_added(m, public, b""), InQuotedId(public, c)) }
   else if c == b'>' { emit_doctype(set_force_quirks(fault(m, missing_id(public)))) }
   else if c < 0 { doctype_ended(m) }
   else { reconsume(set_force_quirks(fault(m, missing_quote(public))), BogusDoctype) }
@@ -1621,12 +1619,12 @@ fn before_id(m: Machine, public: Bool) -> Machine / {abort.raise} = {
 fn in_id(m: Machine, public: Bool, quote: Int) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == quote { into(m, AfterId(public)) }
-  else if c == 0 { ahead(id_added(fault(m, UnexpectedNullCharacter), public, replacement())) }
+  else if c == 0 { advance(id_added(fault(m, UnexpectedNullCharacter), public, replacement())) }
   else if c == b'>' {
     let e = if public { AbruptDoctypePublicIdentifier } else { AbruptDoctypeSystemIdentifier };
     emit_doctype(set_force_quirks(fault(m, e)))
   } else if c < 0 { doctype_ended(m) }
-  else if c == 10 { ahead(id_added(m, public, b"\n")) } else {
+  else if c == 10 { advance(id_added(m, public, b"\n")) } else {
     let run = run_of(m, if quote == b'"' { b"\">\r\x00" } else { b"'>\r\x00" });
     id_added({ ..m, at: m.at + run.len() }, public, run)
   }
@@ -1634,23 +1632,23 @@ fn in_id(m: Machine, public: Bool, quote: Int) -> Machine / {abort.raise} = {
 
 fn after_id(m: Machine, public: Bool) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { if public { into(m, BetweenIds) } else { ahead(m) } }
+  if is_space(c) { if public { into(m, BetweenIds) } else { advance(m) } }
   else if c == b'>' { emit_doctype(m) }
   else if c < 0 { doctype_ended(m) } else if public && (c == b'"' || c == b'\'') {
     into(
       id_added(fault(m, MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers), false, b""),
-      InId(false, c),
+      InQuotedId(false, c),
     )
   } else if public {
     reconsume(set_force_quirks(fault(m, MissingQuoteBeforeDoctypeSystemIdentifier)), BogusDoctype)
   } else { reconsume(fault(m, UnexpectedCharacterAfterDoctypeSystemIdentifier), BogusDoctype) }
 }
 
-fn between_ids(m: Machine) -> Machine / {abort.raise} = {
+fn between_doctype_ids(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) { ahead(m) }
+  if is_space(c) { advance(m) }
   else if c == b'>' { emit_doctype(m) }
-  else if c == b'"' || c == b'\'' { into(id_added(m, false, b""), InId(false, c)) }
+  else if c == b'"' || c == b'\'' { into(id_added(m, false, b""), InQuotedId(false, c)) }
   else if c < 0 { doctype_ended(m) } else {
     reconsume(set_force_quirks(fault(m, MissingQuoteBeforeDoctypeSystemIdentifier)), BogusDoctype)
   }
@@ -1659,7 +1657,7 @@ fn between_ids(m: Machine) -> Machine / {abort.raise} = {
 fn bogus_doctype(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == b'>' { emit_doctype(m) }
-  else if c == 0 { ahead(fault(m, UnexpectedNullCharacter)) }
+  else if c == 0 { advance(fault(m, UnexpectedNullCharacter)) }
   else if c < 0 { emit_end_of_file(emit(m, doctype_token(m), m.from, m.at)) }
   else { { ..m, at: m.input.skip_until(m.at + 1, b">\x00") } }
 }
@@ -1667,7 +1665,7 @@ fn bogus_doctype(m: Machine) -> Machine / {abort.raise} = {
 // --- Processing instructions -----------------------------------------------------
 
 /// Turns `?` and the target read so far into a bogus comment's data, and reads on as one.
-fn bogus_target(m: Machine, e: ParseError) -> Machine =
+fn instruction_as_comment(m: Machine, e: ParseError) -> Machine =
   reconsume(
     { ..fault(m, e), data: [b"?".concat(m.temp)], value_size: m.temp.len() + 1 },
     BogusComment,
@@ -1677,15 +1675,15 @@ fn instruction_open(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_letter(c) || c == b'_' { reconsume(m, InstructionTarget) }
   else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
-  else { bogus_target(m, InvalidFirstCharacterOfProcessingInstructionTarget) }
+  else { instruction_as_comment(m, InvalidFirstCharacterOfProcessingInstructionTarget) }
 }
 
 fn instruction_target(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) || c == b'?' || c == b'>' {
-    let target = lowered(m.temp);
+    let target = to_ascii_lower(m.temp);
     if target == b"xml" || target == b"xml-stylesheet" {
-      bogus_target(m, DisallowedProcessingInstructionTarget)
+      instruction_as_comment(m, DisallowedProcessingInstructionTarget)
     } else { reconsume({ ..m, data: [], value_size: 0 }, AfterInstructionTarget) }
   } else if is_letter(c) || is_digit(c) || c == b'-' || c == b'_' {
     let run = m.input.slice(
@@ -1694,7 +1692,7 @@ fn instruction_target(m: Machine) -> Machine / {abort.raise} = {
     );
     name_grown({ ..m, at: m.at + run.len(), temp: m.temp.concat(run) }, m.temp.len() + run.len())
   } else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
-  else { bogus_target(m, InvalidProcessingInstructionTarget) }
+  else { instruction_as_comment(m, InvalidProcessingInstructionTarget) }
 }
 
 fn emit_instruction(m: Machine) -> Machine / {abort.raise} =
@@ -1708,14 +1706,14 @@ fn emit_instruction(m: Machine) -> Machine / {abort.raise} =
 fn instruction_data(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   match m.mode {
-    AfterInstructionTarget -> if is_space(c) { ahead(m) } else { reconsume(m, InstructionData) },
+    AfterInstructionTarget -> if is_space(c) { advance(m) } else { reconsume(m, InstructionData) },
     InstructionQuestion -> if c == b'>' { emit_instruction(m) }
     else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
     else { reconsume(data_added(m, b"?"), InstructionData) },
     _ -> if c == b'?' { into(m, InstructionQuestion) }
     else if c == b'>' { emit_instruction(m) }
     else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
-    else if c == 10 { ahead(data_added(m, b"\n")) } else {
+    else if c == 10 { advance(data_added(m, b"\n")) } else {
       let run = run_of(m, b"?>\r");
       data_added({ ..m, at: m.at + run.len() }, run)
     },
@@ -1726,7 +1724,7 @@ fn instruction_data(m: Machine) -> Machine / {abort.raise} = {
 
 fn step(m: Machine) -> Machine / {abort.raise} =
   match m.mode {
-    Reading(s) -> reading(m, s),
+    Reading(s) -> read_state(m, s),
     CdataBracket -> cdata_bracket(m),
     CdataEnd -> cdata_end(m),
     TagOpen -> tag_open(m),
@@ -1761,9 +1759,9 @@ fn step(m: Machine) -> Machine / {abort.raise} =
     AfterDoctypeName -> after_doctype_name(m),
     AfterKeyword(public) -> after_keyword(m, public),
     BeforeId(public) -> before_id(m, public),
-    InId(public, quote) -> in_id(m, public, quote),
+    InQuotedId(public, quote) -> in_id(m, public, quote),
     AfterId(public) -> after_id(m, public),
-    BetweenIds -> between_ids(m),
+    BetweenIds -> between_doctype_ids(m),
     BogusDoctype -> bogus_doctype(m),
     InstructionOpen -> instruction_open(m),
     InstructionTarget -> instruction_target(m),
@@ -1830,7 +1828,8 @@ pub fn next(c: Cursor) -> Option<{ lexeme: Lexeme, rest: Cursor }> / {html.fail}
     handle {
       run_machine(m)
     } with {
-      abort.raise(add_text) -> { ..m, stop: Some({ offset: m.at, reason: Defect(add_text) }) },
+      abort.raise(add_text) ->
+        { ..m, stop: Some({ offset: m.at, reason: InternalError(add_text) }) },
     }
   };
   match read.stop {
@@ -1896,7 +1895,7 @@ fn check_scheme(url: String, trusted: Bool, opens: Bool) -> Result<String, Strin
   let stop = text.skip_until(0, b":/?#");
   if text.peek(stop) != b':' || trusted { Ok(url) } else {
     let scheme = text.slice(0, stop);
-    if opens && is_allowed_scheme(lowered(scheme)) { Ok(url) }
+    if opens && is_allowed_scheme(to_ascii_lower(scheme)) { Ok(url) }
     else { Err(String::of_bytes(scheme)) }
   }
 }
@@ -1924,7 +1923,7 @@ pub fn browser_scheme(url: String) -> Option<String> / {abort.raise} = {
       let c = bytes.at(i);
       if !s.open || c == 9 || c == 10 || c == 13 || (s.name == b"" && c <= 32) { s }
       else if c == b':' { { ..s, open: false, colon: true } }
-      else if is_scheme_char(c) { { ..s, name: s.name.concat(lowered(byte_of_int(c))) } }
+      else if is_scheme_char(c) { { ..s, name: s.name.concat(to_ascii_lower(byte_of_int(c))) } }
       else { { ..s, open: false } }
     },
   );
@@ -1973,7 +1972,7 @@ fn url_attributes() -> List<Bytes> =
 
 /// Whether an attribute of this name contains a URL, ignoring a `data-` prefix or a namespace,
 /// which a script or an SVG reads the same way.
-fn holds_url(attribute: Bytes) -> Bool / {abort.raise} = {
+fn contains_url(attribute: Bytes) -> Bool / {abort.raise} = {
   let named_reference = if attribute.starts_with(b"data-") { attribute.slice(5, attribute.len()) }
   else {
     match attribute.index_of(b":") {
@@ -2014,7 +2013,7 @@ type UrlState =
   | AfterKey
 
 /// A character that is not allowed where it appears in the markup, with its offset in the input.
-type Stray = { message: String, offset: Int }
+type InvalidCharacter = { message: String, offset: Int }
 
 /// Whether the tag being read declares a refresh: `http-equiv` with the value `refresh`.
 fn refresh_declared(m: Machine) -> Bool =
@@ -2030,7 +2029,7 @@ fn value_opened(m: Machine) -> Machine / {abort.raise} =
     else if name == b"ping" { SpaceSeparatedUrls }
     else if name == b"content" && Bytes::concat_all(m.tag.name) == b"meta" && refresh_declared(m) {
       RefreshUrl
-    } else if holds_url(name) { SingleUrl }
+    } else if contains_url(name) { SingleUrl }
     else { NoUrl };
     {
       ..m,
@@ -2059,7 +2058,7 @@ fn url_step(t: UrlScan, c: Int) -> UrlScan / {abort.raise} = {
     else if c == b'"' || c == b'\'' { fresh }
     else { in_url(fresh, c) },
     UrlKey -> {
-      let longer = t.word.concat(lowered(byte_of_int(c)));
+      let longer = t.word.concat(to_ascii_lower(byte_of_int(c)));
       if b"url".starts_with(longer) { { ..t, word: longer } }
       else if t.word == b"url" && is_space(c) { t }
       else if t.word == b"url" && c == b'=' { to(AfterKey) }
@@ -2077,11 +2076,11 @@ fn in_url(t: UrlScan, c: Int) -> UrlScan / {abort.raise} = {
   let to = |u: UrlState|
     { url: u, word: if u == DisallowedScheme { t.word } else { b"" }, broken: false };
   match t.url {
-    UrlStart -> if c <= 32 { t }
-    else if is_letter(c) { { url: SchemeLetters, word: lowered(byte_of_int(c)), broken: false } }
-    else { to(after_first_part(c)) },
+    UrlStart -> if c <= 32 { t } else if is_letter(c) {
+      { url: SchemeLetters, word: to_ascii_lower(byte_of_int(c)), broken: false }
+    } else { to(after_first_part(c)) },
     SchemeLetters -> if c == 9 || c == 10 || c == 13 { t }
-    else if is_scheme_char(c) { { ..t, word: t.word.concat(lowered(byte_of_int(c))) } }
+    else if is_scheme_char(c) { { ..t, word: t.word.concat(to_ascii_lower(byte_of_int(c))) } }
     else if c == b':' { to(if is_allowed_scheme(t.word) { InPath } else { DisallowedScheme }) }
     else { to(after_first_part(c)) },
     HoleInFirstPart -> if c == b':' { { ..t, broken: true } }
@@ -2111,12 +2110,12 @@ fn linked_step(link: UrlLayout, t: UrlScan, c: Int) -> UrlScan / {abort.raise} =
 
 /// Reads `piece` into the URL in the attribute's value. A `:` that would make a hole's value the
 /// URL's scheme is recorded as the first stray.
-fn url_read(m: Machine, piece: Bytes) -> Machine / {abort.raise} = {
+fn scan_url(m: Machine, piece: Bytes) -> Machine / {abort.raise} = {
   let start = max(m.at - piece.len(), 0);
   let read = iterate(
     { i: 0, t: { url: m.url, word: m.word, broken: false }, stray: m.stray },
     piece.len() + 1,
-    |s: { i: Int, t: UrlScan, stray: Option<Stray> }|
+    |s: { i: Int, t: UrlScan, stray: Option<InvalidCharacter> }|
       if s.i >= piece.len() { Stop(s) } else {
         let t = linked_step(m.link, s.t, piece.at(s.i));
         let stray = if t.broken && s.stray == None {
@@ -2336,7 +2335,7 @@ fn hole_position(m: Machine) -> Result<HolePosition, String> / {abort.raise} = {
         Err(raw),
       BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLessThan | CommentLessThanBang | CommentLessThanBangDash | CommentLessThanBangDashDash | CommentEndDash | CommentEnd | CommentEndBang ->
         Err("a comment holds no hole"),
-      DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InId(_, _) | AfterId(_) | BetweenIds | BogusDoctype ->
+      DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InQuotedId(_, _) | AfterId(_) | BetweenIds | BogusDoctype ->
         Err("a doctype holds no hole"),
       InstructionOpen | InstructionTarget | AfterInstructionTarget | InstructionData | InstructionQuestion ->
         Err("a processing instruction holds no hole"),
@@ -2354,10 +2353,10 @@ pub fn hole(at: Context) -> Result<Hole, String> / {abort.raise} =
 
 /// What markup that ends at `at` is missing, if anything: `None` if the input could end there
 /// with no parse error and no text element left open.
-pub fn unfinished(at: Context) -> Option<String> / {abort.raise} = {
+pub fn missing_markup(at: Context) -> Option<String> / {abort.raise} = {
   let m = machine_at(at);
   match m.mode {
-    Reading(Data) | TagOpen | EndTagOpen | TagName | BeforeAttributeName | AttributeName | AfterAttributeName | BeforeAttributeValue | AttributeValue(_) | AfterAttributeValue | SelfClosing | BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLessThan | CommentLessThanBang | CommentLessThanBangDash | CommentLessThanBangDashDash | CommentEndDash | CommentEnd | CommentEndBang | DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InId(_, _) | AfterId(_) | BetweenIds | BogusDoctype | InstructionOpen | InstructionTarget | AfterInstructionTarget | InstructionData | InstructionQuestion -> {
+    Reading(Data) | TagOpen | EndTagOpen | TagName | BeforeAttributeName | AttributeName | AfterAttributeName | BeforeAttributeValue | AttributeValue(_) | AfterAttributeValue | SelfClosing | BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLessThan | CommentLessThanBang | CommentLessThanBangDash | CommentLessThanBangDashDash | CommentEndDash | CommentEnd | CommentEndBang | DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InQuotedId(_, _) | AfterId(_) | BetweenIds | BogusDoctype | InstructionOpen | InstructionTarget | AfterInstructionTarget | InstructionData | InstructionQuestion -> {
       let d = drain({ ..m, ended: true, waiting: false });
       match first_problem(d, b"", 0) {
         Some(amiss) -> Some(amiss.message),
@@ -2503,7 +2502,7 @@ pub opaque type Draft = new { pieces: List<Piece>, at: Context }
 pub fn draft(urls: Bool) -> Draft = { pieces: [], at: reader(urls) }
 
 /// Appends `r` to the draft, or returns `None` if `r` was not read from the draft's position.
-pub fn write(d: Draft, r: Run) -> Option<Draft> / {abort.raise} =
+pub fn append_markup(d: Draft, r: Run) -> Option<Draft> / {abort.raise} =
   if follows(d.at, r.from) { Some({ pieces: d.pieces.push(Markup(r.markup)), at: r.to }) }
   else { None }
 
@@ -2517,7 +2516,7 @@ pub fn place(d: Draft, h: Hole, value: Html) -> Option<Draft> / {abort.raise} =
 /// The fragment the draft has built, or `None` if its markup is not finished: a tag, a value, a
 /// comment or a text element left open, or a parse error at its end.
 pub fn finish(d: Draft) -> Option<Html> / {abort.raise} =
-  if unfinished(d.at) == None { Some({ pieces: d.pieces }) } else { None }
+  if missing_markup(d.at) == None { Some({ pieces: d.pieces }) } else { None }
 
 /// The text a value is written as when `h` is in a URL: percent-encoded as its part, with its
 /// commas as `%2C` when the URL is one of a `srcset`'s. The error is the scheme it would give the
@@ -2592,7 +2591,7 @@ pub fn compile(parts: List<String>) -> Result<Template, CompileError> / {abort.r
                   }),
               }
             } else {
-              match unfinished(r.to) {
+              match missing_markup(r.to) {
                 Some(message) -> ends(message),
                 None -> Ok({ ..c, at: r.to }),
               }
@@ -2872,52 +2871,59 @@ test "each escape writes the references its place needs, and no other" {
 }
 
 /// A text, what it is read as in an element's content, and what it is read as in an attribute.
-type Referring = { text: String, content: String, value: String }
+type ReferenceCase = { text: String, content: String, value: String }
 
-fn alike(text: String, read: String) -> Referring = { text: text, content: read, value: read }
+fn same_in_both(text: String, read: String) -> ReferenceCase =
+  { text: text, content: read, value: read }
 
 /// The standard's own examples of a name without its `;` (§13.2.5.78), and a case for each rule
 /// of its states for a reference.
-fn referrings() -> List<Referring> =
+fn reference_cases() -> List<ReferenceCase> =
   [
     {
       text: "I'm &notit; I tell you",
       content: "I'm \u{ac}it; I tell you",
       value: "I'm &notit; I tell you",
     },
-    alike("I'm &notin; I tell you", "I'm \u{2209} I tell you"),
-    alike("&lt;p&gt; &amp; &quot;q&quot; &apos;", "<p> & \"q\" '"),
-    alike("&amp;lt;", "&lt;"),
-    alike("&amp", "&"),
-    alike("&amp &amp. &amp; &amp<", "& &. & &<"),
+    same_in_both("I'm &notin; I tell you", "I'm \u{2209} I tell you"),
+    same_in_both("&lt;p&gt; &amp; &quot;q&quot; &apos;", "<p> & \"q\" '"),
+    same_in_both("&amp;lt;", "&lt;"),
+    same_in_both("&amp", "&"),
+    same_in_both("&amp &amp. &amp; &amp<", "& &. & &<"),
     { text: "&ampx", content: "&x", value: "&ampx" },
     { text: "&amp=1", content: "&=1", value: "&amp=1" },
     { text: "&copy2024", content: "\u{a9}2024", value: "&copy2024" },
     { text: "?a=1&not=2&lt=3", content: "?a=1\u{ac}=2<=3", value: "?a=1&not=2&lt=3" },
-    alike("&copy 2024", "\u{a9} 2024"),
-    alike("&AMP; &LT &GT; &QUOT", "& < > \""),
-    alike("&Amp; &unknown; &a; &;", "&Amp; &unknown; &a; &;"),
-    alike("&notin; &notindot; &notinE;", "\u{2209} \u{22f5}\u{338} \u{22f9}\u{338}"),
-    alike("&NotEqualTilde; &fjlig;", "\u{2242}\u{338} fj"),
-    alike("&CounterClockwiseContourIntegral;", "\u{2233}"),
-    alike("&CounterClockwiseContourIntegralx;", "&CounterClockwiseContourIntegralx;"),
-    alike("&#65;&#x42;&#X43;&#x6a;&#x6A;", "ABCjj"),
-    alike("&#65 &#x42 &#65", "A B A"),
-    alike("&#x41g &#65a", "Ag Aa"),
-    alike("&#; &#x; &#xg; &#a; &# &#x", "&#; &#x; &#xg; &#a; &# &#x"),
-    alike("&#0; &#x0; &#00", "\u{fffd} \u{fffd} \u{fffd}"),
-    alike("&#xD800; &#xDFFF; &#55296;", "\u{fffd} \u{fffd} \u{fffd}"),
-    alike("&#x110000; &#1114112; &#99999999999999999999999999;", "\u{fffd} \u{fffd} \u{fffd}"),
-    alike("&#x10FFFF; &#xFFFF; &#xFDD0;", "\u{10ffff} \u{ffff} \u{fdd0}"),
-    alike("&#x80; &#x82; &#x8C; &#x9F; &#150;", "\u{20ac} \u{201a} \u{152} \u{178} \u{2013}"),
-    alike("&#x81; &#x8D; &#x8F; &#x90; &#x9D;", "\u{81} \u{8d} \u{8f} \u{90} \u{9d}"),
-    alike("&#x7F; &#xA0; &#x1; &#xD;", "\u{7f} \u{a0} \u{1} \r"),
-    alike("& && &&amp; a&b", "& && && a&b"),
-    alike("caf\u{e9} &eacute; \u{1F600} &#x1F600;", "caf\u{e9} \u{e9} \u{1F600} \u{1F600}"),
-    alike("", ""),
+    same_in_both("&copy 2024", "\u{a9} 2024"),
+    same_in_both("&AMP; &LT &GT; &QUOT", "& < > \""),
+    same_in_both("&Amp; &unknown; &a; &;", "&Amp; &unknown; &a; &;"),
+    same_in_both("&notin; &notindot; &notinE;", "\u{2209} \u{22f5}\u{338} \u{22f9}\u{338}"),
+    same_in_both("&NotEqualTilde; &fjlig;", "\u{2242}\u{338} fj"),
+    same_in_both("&CounterClockwiseContourIntegral;", "\u{2233}"),
+    same_in_both("&CounterClockwiseContourIntegralx;", "&CounterClockwiseContourIntegralx;"),
+    same_in_both("&#65;&#x42;&#X43;&#x6a;&#x6A;", "ABCjj"),
+    same_in_both("&#65 &#x42 &#65", "A B A"),
+    same_in_both("&#x41g &#65a", "Ag Aa"),
+    same_in_both("&#; &#x; &#xg; &#a; &# &#x", "&#; &#x; &#xg; &#a; &# &#x"),
+    same_in_both("&#0; &#x0; &#00", "\u{fffd} \u{fffd} \u{fffd}"),
+    same_in_both("&#xD800; &#xDFFF; &#55296;", "\u{fffd} \u{fffd} \u{fffd}"),
+    same_in_both(
+      "&#x110000; &#1114112; &#99999999999999999999999999;",
+      "\u{fffd} \u{fffd} \u{fffd}",
+    ),
+    same_in_both("&#x10FFFF; &#xFFFF; &#xFDD0;", "\u{10ffff} \u{ffff} \u{fdd0}"),
+    same_in_both(
+      "&#x80; &#x82; &#x8C; &#x9F; &#150;",
+      "\u{20ac} \u{201a} \u{152} \u{178} \u{2013}",
+    ),
+    same_in_both("&#x81; &#x8D; &#x8F; &#x90; &#x9D;", "\u{81} \u{8d} \u{8f} \u{90} \u{9d}"),
+    same_in_both("&#x7F; &#xA0; &#x1; &#xD;", "\u{7f} \u{a0} \u{1} \r"),
+    same_in_both("& && &&amp; a&b", "& && && a&b"),
+    same_in_both("caf\u{e9} &eacute; \u{1F600} &#x1F600;", "caf\u{e9} \u{e9} \u{1F600} \u{1F600}"),
+    same_in_both("", ""),
   ]
 
-test "`{c.text}` is read as the standard reads it" for c: Referring in referrings() {
+test "`{c.text}` is read as the standard reads it" for c: ReferenceCase in reference_cases() {
   assert_eq(unescape(c.text), c.content);
   assert_eq(unescape_attribute(c.text), c.value)
 }
@@ -3174,12 +3180,18 @@ test "a value written where a URL starts gives it no scheme except an allowed on
   })
 }
 
-fn drafted(steps: List<Result<String, Html>>, urls: Bool) -> Option<String> / {abort.raise} = {
+fn markup_of_steps(
+  steps: List<Result<String, Html>>,
+  urls: Bool,
+) -> Option<String> / {abort.raise} = {
   let end = steps.fold(Some(draft(urls)), |d: Option<Draft>, s: Result<String, Html>|
     match d {
       None -> None,
       Some(so_far) -> match s {
-        Ok(markup) -> match run(so_far.at, markup) { Ok(r) -> write(so_far, r), Err(_) -> None },
+        Ok(markup) -> match run(so_far.at, markup) {
+          Ok(r) -> append_markup(so_far, r),
+          Err(_) -> None,
+        },
         Err(value) -> match hole(so_far.at) { Ok(h) -> place(so_far, h, value), Err(_) -> None },
       },
     });
@@ -3192,18 +3204,18 @@ fn drafted(steps: List<Result<String, Html>>, urls: Bool) -> Option<String> / {a
 test "a draft built from runs and holes in the order they were read is the literal's fragment" {
   let value = text("a\"<b>&");
   assert_eq(
-    drafted(
+    markup_of_steps(
       [Ok("<p class="), Err(value), Ok(" id='x-"), Err(value), Ok("'>"), Err(value), Ok("</p>")],
       false,
     ),
     Some(written(["<p class=", " id='x-", "'>", "</p>"], [value, value, value])),
   );
-  assert_eq(drafted([], false), Some(""));
-  assert_eq(drafted([Ok("<p"), Ok(">x</p>")], true), Some("<p>x</p>"));
+  assert_eq(markup_of_steps([], false), Some(""));
+  assert_eq(markup_of_steps([Ok("<p"), Ok(">x</p>")], true), Some("<p>x</p>"));
   // Left in a tag, a value or a comment, it is not a fragment.
-  assert_eq(drafted([Ok("<p")], false), None);
-  assert_eq(drafted([Ok("<p title='"), Err(value)], false), None);
-  assert_eq(drafted([Ok("<!-- ")], false), None)
+  assert_eq(markup_of_steps([Ok("<p")], false), None);
+  assert_eq(markup_of_steps([Ok("<p title='"), Err(value)], false), None);
+  assert_eq(markup_of_steps([Ok("<!-- ")], false), None)
 }
 
 test "a draft accepts no run and no hole read from a position other than its own" {
@@ -3212,14 +3224,14 @@ test "a draft accepts no run and no hole read from a position other than its own
   let more = match run(tag.to, "class='a'>") { Ok(r) -> r, Err(_) -> panic("refused") };
   let content = match hole(start) { Ok(h) -> h, Err(_) -> panic("refused") };
   let d = draft(true);
-  assert(write(d, more) == None);
-  assert(write(d, tag) != None);
-  let in_tag = match write(d, tag) { Some(next) -> next, None -> d };
+  assert(append_markup(d, more) == None);
+  assert(append_markup(d, tag) != None);
+  let in_tag = match append_markup(d, tag) { Some(next) -> next, None -> d };
   assert(place(in_tag, content, text("x")) == None);
-  assert(write(in_tag, tag) == None);
-  assert(write(in_tag, more) != None);
+  assert(append_markup(in_tag, tag) == None);
+  assert(append_markup(in_tag, more) != None);
   // A reader that follows URLs and one that does not are at different positions.
-  assert(write(draft(false), tag) == None)
+  assert(append_markup(draft(false), tag) == None)
 }
 
 fn read_from(from: Context, markup: String) -> Run / {abort.raise} =
@@ -3233,7 +3245,7 @@ test "what was read as more of a tag's name is not written after an attribute of
   assert(match hole(longer.to) { Ok(h) -> h.place == Content, Err(_) -> false });
   let written = |runs: List<Run>|
     runs.fold(Some(draft(false)), |d: Option<Draft>, r: Run|
-      match d { Some(so_far) -> write(so_far, r), None -> None });
+      match d { Some(so_far) -> append_markup(so_far, r), None -> None });
   assert(written([named_reference, longer]) != None);
   assert(written([named_reference, attribute]) != None);
   assert(written([named_reference, attribute, longer]) == None);

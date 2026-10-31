@@ -31,8 +31,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     RecordLiteralField, expression_span, is_arithmetic,
                                     is_order_comparison, TaggedLiteralExpression, TaggedLiteral,
                                     Hole, tagged_parser, tagged_filler, call_operator,
-                                    written_operator, is_exit_effect, exit_op, try_spans,
-                                    prelude_module, tagged_parts, TaggedPart)
+                                    written_operator, is_exit_effect, exit_operation_name,
+                                    try_spans, prelude_module, tagged_parts, TaggedPart)
 import compiler.syntax.calls (Slot, FromName, FromDefault)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
                                  PatternRange, PatternConstructor, PatternRecord, PatternList,
@@ -52,10 +52,11 @@ import compiler.check.types (NamedResource, SingletonResource, ResourceVariable,
                              solve_continuation_effects, free_variables, unify, unify_effects,
                              is_covariant_container, env_push, env_pop, env_bind, env_lookup,
                              env_local, env_locals, instantiate_with, instantiate, rename_scheme,
-                             apply_arguments, scope_mark, written_label, type_after_scope,
-                             label_type, resolve_effect, effect_text, resource_text, type_text,
-                             effects_text, printer_new, print_type, print_effects, NominalType,
-                             record_fields, InScope, env_depth, owning_fn_type)
+                             apply_arguments, label_scope_separator, written_label,
+                             type_after_scope, label_type, resolve_effect, effect_text,
+                             resource_text, type_text, effects_text, printer_new, print_type,
+                             print_effects, NominalType, record_fields, InScope, env_depth,
+                             owning_fn_type)
 import compiler.check.known (is_integer_name, is_float, is_string, is_bytes, bool_name,
                              columns_name, secret_name, columns_row, list_item, scoped_parts,
                              result_parts, result_type, scoped_type, fixed_widths)
@@ -82,23 +83,24 @@ import compiler.check.infer.checker (OpInfo, EffectInfo, DefinitionConstraint, N
                                      ConcatSite, ColumnsSite, UpdateField, UpdateSite,
                                      LabelApplication, Assumption, ClauseSite, SpawnSite,
                                      HandoffSite, OpenScope, ScopeSite, CapturedLocal, RigidParam,
-                                     ConstraintSite, GroupDefinition, Checker, Assignable, barred,
-                                     unbarred, Inference, WithType, WithVar, WithEffects, WithName,
-                                     ExpectResult, WithKey, WithOperation, WithResource,
-                                     Instantiation, scoped_effect, scoped_read, is_scoped_effect,
-                                     location_of, module_name, scope_of, report, report_error_at,
-                                     report_error_at_and, report_error_with_labels, backticked_text,
-                                     plural, supplied, new_type, new_type_var, new_effects,
-                                     new_effect_variable, resolve, resolve_effects_in, with_unified,
-                                     is_prelude_effect, seed_effect, abort_effect,
-                                     builtin_type_arity, constructor_of, effect_of, definition_of,
-                                     simulated_effects, mode_eq, literal_type, record_perform,
-                                     record_perform_under, order_needs, ConstructorInfo)
+                                     ConstraintSite, GroupDefinition, Checker, Assignable,
+                                     forbid_assignment, restore_assignable, Inference, WithType,
+                                     WithVar, WithEffects, WithName, ExpectResult, WithKey,
+                                     WithOperation, WithResource, Instantiation, scoped_effect,
+                                     scoped_read, is_scoped_effect, location_of, module_name,
+                                     scope_of, report, report_error_at, report_error_at_and,
+                                     report_error_with_labels, backticked_text, plural, supplied,
+                                     new_type, new_type_var, new_effects, new_effect_variable,
+                                     resolve, resolve_effects_in, with_unified, is_prelude_effect,
+                                     seed_effect, abort_effect, builtin_type_arity, constructor_of,
+                                     effect_of, definition_of, simulated_effects, mode_eq,
+                                     literal_type, record_perform, record_perform_under,
+                                     order_needs, ConstructorInfo)
 import compiler.check.infer.names (value_key, NotLanguageType, Found, NoLanguageFunction,
                                    look_up_language_type, declared_value, constructor_name,
                                    unknown_name, unknown_name_diagnostic, private_name_diagnostic,
                                    language_function, module_declares, no_function_diagnostic,
-                                   written_binder, simple_name_of, local_at)
+                                   is_explicit_binding, simple_name_of, local_at)
 import compiler.check.infer.declarations (convert_type, op_named, effect_name, duplicate, assume,
                                           check_scoped_placement, open_scope_named, rigid_params,
                                           assumed_for, OrderedPart, own_parts, note_parts,
@@ -141,15 +143,15 @@ fn reader_of(checker: Checker) -> Reader =
   }
 
 fn builtin_key(checker: Checker, at: Span) -> Bytes =
-  Bytes::concat_all([checker.walking, b"#", ascii_of_int(at.site)])
+  Bytes::concat_all([checker.current_definition, b"#", ascii_of_int(at.site)])
 
 fn assume_condition(checker: Checker, cond: Expression, truth: Bool) -> Checker / {abort.raise} =
   { ..checker, guards: guards::assume(reader_of(checker), checker.guards, cond, truth) }
 
 fn restore_guards(checker: Checker, before: Guards) -> Checker =
-  { ..checker, guards: guards::after_branch(checker.guards, before) }
+  { ..checker, guards: guards::restore_assumptions(checker.guards, before) }
 
-fn known_as(
+fn bind_guarded_value(
   before: Checker,
   bound: Checker,
   pattern: Pattern,
@@ -942,8 +944,8 @@ pub fn infer_whole(
 ) -> Inference / {abort.raise} = {
   let o: Inference = infer(checker, expression, hint);
   let typed = o.checker.copied_defaults.fold(
-    { checker: { ..o.checker, copied_defaults: [] }, copies: [] },
-    |acc: { checker: Checker, copies: List<Option<Walked>> }, d: { expression: Expression, ty: Type }| {
+    { checker: { ..o.checker, copied_defaults: [] }, copied_fields: [] },
+    |acc: { checker: Checker, copied_fields: List<Option<Walked>> }, d: { expression: Expression, ty: Type }| {
       let t: Inference = infer(acc.checker, d.expression, hint_of(d.ty));
       {
         checker: expect_or_widen(
@@ -953,13 +955,13 @@ pub fn infer_whole(
           t.ty,
           b"a parameter's default",
         ),
-        copies: acc.copies.push(typed_at(t, expression_span(d.expression))),
+        copied_fields: acc.copied_fields.push(typed_at(t, expression_span(d.expression))),
       }
     },
   );
   let whole = match typed_at(o, expression_span(expression)) {
     Some(e) -> if typed.checker.copied_defaults.len() > 0 { None }
-    else { defaults_filled(e, typed.copies) },
+    else { defaults_filled(e, typed.copied_fields) },
     None -> None,
   };
   {
@@ -995,22 +997,26 @@ fn callee_repeats(
   }
 }
 
-fn fn_holding(
+fn callback_parameters_of(
   checker: Checker,
   name: Bytes,
 ) -> { checker: Checker, params: List<Int> } / {abort.raise} =
-  match checker.fn_holding.get(name) {
+  match checker.function_parameters.get(name) {
     Some(params) -> { checker: checker, params: params },
     None -> {
       let params = match env_lookup(checker.env, name) {
         Some(scheme) -> match scheme.ty {
-          FunctionType(f) -> range(0, f.params.len()).filter(|i: Int| holds_fn(f.params.get(i))),
+          FunctionType(f) ->
+            range(0, f.params.len()).filter(|i: Int| contains_function(f.params.get(i))),
           _ -> [],
         },
         None -> [],
       };
       {
-        checker: { ..checker, fn_holding: checker.fn_holding.insert(name, params) },
+        checker: {
+          ..checker,
+          function_parameters: checker.function_parameters.insert(name, params),
+        },
         params: params,
       }
     },
@@ -1071,14 +1077,14 @@ fn effects_of(
     VariableType(_) -> acc,
   }
 
-pub fn scales_like(scales: List<Effect>, a: Effect) -> Bool =
+pub fn repeated_effects_include(scales: List<Effect>, a: Effect) -> Bool =
   scales.fold(false, |found: Bool, s: Effect|
     found
       || (s.effect == a.effect && mode_eq(s.mode, a.mode) && s.op == a.op
       && (s.resource == a.resource
       || (match s.resource { ResourceVariable(_) -> true, _ -> false }))))
 
-fn repeat_variable(
+fn record_repeated_variable(
   checker: Checker,
   variable: Option<Int>,
   vars: List<Int>,
@@ -1187,7 +1193,7 @@ fn infer_here(
             var: o.var,
             locals: env_locals(checker.env),
             declared: if checker.effects_written { Some(checker.declared_effects) } else { None },
-            owner: checker.walking,
+            owner: checker.current_definition,
             text: h.text,
           }),
         },
@@ -1270,7 +1276,7 @@ fn infer_here(
     BinaryExpression(b) -> infer_binary(checker, b.span, b.op, b.lhs, b.rhs),
     LambdaExpression(l) -> {
       let outer = checker;
-      let checker = barred(outer, b"a lambda");
+      let checker = forbid_assignment(outer, b"a lambda");
       let pushed: Checker = { ..checker, env: env_push(checker.env) };
       let expected = match hint_type(checker, hint) { Some(FunctionType(f)) -> f.params, _ -> [] };
       let ps = l.params.fold(
@@ -1350,7 +1356,7 @@ fn infer_here(
           body.effects,
         ),
       };
-      unbarred(outer, made)
+      restore_assignable(outer, made)
     },
     CallExpression(a) -> match a.function {
       FieldExpression(f) -> {
@@ -1468,7 +1474,7 @@ fn infer_here(
       let agreed: Joined = statements.fallbacks.fold(
         { checker: tail.checker, ty: tail.ty, variables: [] },
         |acc: Joined, f: LetElse|
-          join_next(acc, f.span, f.ty, b"the `else` of a `let ... else` is its block's value"),
+          join_type_into(acc, f.span, f.ty, b"the `else` of a `let ... else` is its block's value"),
       );
       let closed: Checker = close_effect_variables(agreed.checker, agreed.variables);
       {
@@ -1581,7 +1587,7 @@ fn infer_here(
         |acc: { checker: Checker, effects: Effects, ty: Type, variables: List<Int>, nodes: List<Option<Walked>> }, x: Expression| {
           let o: Inference = infer(acc.checker, x, hint_after(each, acc.ty));
           let j: WithEffects = join(o.checker, l.span, acc.effects, o.effects);
-          let n: Joined = join_next(
+          let n: Joined = join_type_into(
             { checker: j.checker, ty: acc.ty, variables: acc.variables },
             expression_span(x),
             o.ty,
@@ -1634,10 +1640,10 @@ fn infer_here(
     },
     HandleExpression(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, h.vars, hint),
     WithScopeExpression(c) ->
-      unbarred(
+      restore_assignable(
         checker,
         infer_with_scope(
-          barred(checker, b"a `with_scope` scope"),
+          forbid_assignment(checker, b"a `with_scope` scope"),
           c.span,
           c.resource,
           c.acquire,
@@ -1648,19 +1654,19 @@ fn infer_here(
         ),
       ),
     SimulateExpression(s) ->
-      unbarred(
+      restore_assignable(
         checker,
-        infer_simulate(barred(checker, b"a `simulate` body"), s.span, s.body, hint),
+        infer_simulate(forbid_assignment(checker, b"a `simulate` body"), s.span, s.body, hint),
       ),
     ParallelExpression(v) ->
-      unbarred(
+      restore_assignable(
         checker,
-        infer_parallel(barred(checker, b"a `parallel` branch"), v.span, v.branches),
+        infer_parallel(forbid_assignment(checker, b"a `parallel` branch"), v.span, v.branches),
       ),
     TryBlockExpression(t) ->
-      unbarred(
+      restore_assignable(
         checker,
-        infer_try_block(barred(checker, b"a `try` body"), t.span, t.raise, t.body, hint),
+        infer_try_block(forbid_assignment(checker, b"a `try` body"), t.span, t.raise, t.body, hint),
       ),
     TaggedLiteralExpression(t) -> infer_tagged(checker, t),
   }
@@ -1734,7 +1740,12 @@ fn tag_fn(
       let c: Checker = if !named.own_functions.contains(name) { named } else {
         {
           ..named,
-          tag_uses: named.tag_uses.push({ owner: named.walking, name: name, t: t, callee: callee }),
+          tag_uses: named.tag_uses.push({
+            owner: named.current_definition,
+            name: name,
+            t: t,
+            callee: callee,
+          }),
         }
       };
       match resolve(c, f.ty) {
@@ -1784,7 +1795,7 @@ fn infer_tagged(checker: Checker, t: TaggedLiteral) -> Inference / {abort.raise}
       checker: parsed.checker,
       ty: value.ty,
       effects: no_effects(),
-      node: tagged_node(parsed.checker, t, parsed.callee, result, value.ty, None),
+      node: tagged_literal_node(parsed.checker, t, parsed.callee, result, value.ty, None),
     }
   } else {
     let hole: WithType = new_type(parsed.checker);
@@ -1822,7 +1833,7 @@ fn infer_tagged(checker: Checker, t: TaggedLiteral) -> Inference / {abort.raise}
       checker: j.checker,
       ty: returned.ty,
       effects: j.effects,
-      node: tagged_node(
+      node: tagged_literal_node(
         j.checker,
         t,
         parsed.callee,
@@ -1834,7 +1845,7 @@ fn infer_tagged(checker: Checker, t: TaggedLiteral) -> Inference / {abort.raise}
   }
 }
 
-fn tagged_node(
+fn tagged_literal_node(
   checker: Checker,
   t: TaggedLiteral,
   parser: Option<Walked>,
@@ -2117,7 +2128,7 @@ fn infer_record_update(
             base: b.ty,
             written: fs.fs,
             result: t.ty,
-            owner: c.walking,
+            owner: c.current_definition,
           }),
         },
         ty: t.ty,
@@ -2217,7 +2228,7 @@ fn update_shape(
 pub fn check_updates(checker: Checker) -> Checker / {abort.raise} = {
   let entries = checker.updates;
   entries.fold({ ..checker, updates: [] }, |c: Checker, entry: UpdateSite| {
-    let in_module: Checker = { ..c, module: entry.module, walking: entry.owner };
+    let in_module: Checker = { ..c, module: entry.module, current_definition: entry.owner };
     let o: WithType = update_shape(
       in_module,
       entry.span,
@@ -2232,7 +2243,7 @@ pub fn check_updates(checker: Checker) -> Checker / {abort.raise} = {
       o.ty,
       b"record update",
     ).checker;
-    { ..unified, module: c.module, walking: c.walking }
+    { ..unified, module: c.module, current_definition: c.current_definition }
   })
 }
 
@@ -2264,8 +2275,13 @@ fn read_local(
   sc: Scheme,
 ) -> Inference / {abort.raise} = {
   let inst = instantiate_with(sc, checker.fresh);
-  let c: Checker = crossed({ ..checker, fresh: inst.fresh }, binder, qname.name.name, at);
-  let noted: Checker = made_columns(note_instance(c, at, inst.ty), at, inst.ty);
+  let c: Checker = record_marshalling(
+    { ..checker, fresh: inst.fresh },
+    binder,
+    qname.name.name,
+    at,
+  );
+  let noted: Checker = record_columns(note_instance(c, at, inst.ty), at, inst.ty);
   {
     checker: noted,
     ty: inst.ty,
@@ -2311,7 +2327,7 @@ fn read_global(
               qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
               name: m.qname.name.name,
               callee: TypePath,
-              owner: constrained.walking,
+              owner: constrained.current_definition,
             }),
           }
         },
@@ -2329,7 +2345,7 @@ fn read_global(
           qualifier: method_binder(constrained.resolved.scopes.get(t.owner).module),
           name: member_name(t.simple, qname.name.name),
           callee: TypePath,
-          owner: constrained.walking,
+          owner: constrained.current_definition,
         }),
       },
   };
@@ -2347,7 +2363,7 @@ fn read_global(
   };
   let ls = if inst.labels.len() > 0 && noted.constructor_index.contains(g.name) { [] }
   else { inst.labels };
-  let typed: Checker = made_columns(noted, at, inst.ty);
+  let typed: Checker = record_columns(noted, at, inst.ty);
   let rows = inst.effect_variables.map(open_effects);
   let reading = match constructor_of(typed, g.name) {
     Some(ctor) ->
@@ -2382,20 +2398,25 @@ fn read_global(
   }
 }
 
-fn made_columns(checker: Checker, at: Span, ty: Type) -> Checker / {abort.raise} = {
+fn record_columns(checker: Checker, at: Span, ty: Type) -> Checker / {abort.raise} = {
   let made = match ty { FunctionType(f) -> f.ret, other -> other };
   if !mentions_columns(made) { checker } else {
     { ..checker, columns: checker.columns.push({ module: checker.module, span: at, ty: made }) }
   }
 }
 
-fn crossed(checker: Checker, binder: Int, name: Bytes, span: Span) -> Checker / {abort.raise} =
+fn record_marshalling(
+  checker: Checker,
+  binder: Int,
+  name: Bytes,
+  span: Span,
+) -> Checker / {abort.raise} =
   if checker.simulation_scope == 0 { checker } else {
     match env_local(checker.env, binder) {
       Some(l) -> if l.depth < checker.simulation_scope {
         {
           ..checker,
-          marshallings: checker.marshallings.push({ binder: binder, name: name, span: span }),
+          captured_locals: checker.captured_locals.push({ binder: binder, name: name, span: span }),
         }
       } else { checker },
       None -> checker,
@@ -2614,7 +2635,7 @@ fn infer_statement(
     },
     LetStatement(l) -> {
       let b: LetBinding = let_bound(checker, l.pattern, l.ty, l.value);
-      let bound: Checker = known_as(
+      let bound: Checker = bind_guarded_value(
         b.checker,
         bind_all(or_let_covers(b.checker, l.pattern), b.out),
         l.pattern,
@@ -2673,7 +2694,7 @@ fn infer_statement(
             node: None,
           }
         },
-        Some(v) -> match checker.assignable.barred {
+        Some(v) -> match checker.assignable.assignment_forbidden_in {
           Some(place) -> {
             let o: Inference = infer(checker, a.value, hint_of(v.ty));
             {
@@ -3110,7 +3131,7 @@ fn infer_member_call(
             qualifier: b"",
             name: b"",
             callee: CallsField,
-            owner: o.checker.walking,
+            owner: o.checker.current_definition,
             reaches: [],
             named: [],
           }),
@@ -3136,7 +3157,7 @@ fn infer_member_call(
           qualifier: match m.qname.module { Some(q) -> q.name, None -> prelude_binder() },
           name: m.qname.name.name,
           callee: CallsFunction(m.callee),
-          owner: o.checker.walking,
+          owner: o.checker.current_definition,
           reaches: d.reaches,
           named: range(0, d.rest.len()).fold(
             [],
@@ -3220,7 +3241,7 @@ fn note_labels(
         written: vars.filter(|v: Int| !scopes.contains(v)),
         params: checker.label_params,
         called: false,
-        owner: checker.walking,
+        owner: checker.current_definition,
       }),
     }
   }
@@ -3439,24 +3460,24 @@ fn widen_fn(
 }
 
 fn widened_effects(checker: Checker, ty: Type) -> Widened / {abort.raise} =
-  opened(checker, ty, checker.substitution.ty.len())
+  widened_to_depth(checker, ty, checker.substitution.ty.len())
 
-fn opened(checker: Checker, ty: Type, room: Int) -> Widened / {abort.raise} =
+fn widened_to_depth(checker: Checker, ty: Type, room: Int) -> Widened / {abort.raise} =
   match ty {
     VariableType(v) -> match checker.substitution.ty.get(v) {
       None -> unwidened(checker, ty),
       Some(bound) -> if room <= 0 { panic("a type bound to itself") } else {
-        let w: Widened = opened(checker, bound, room - 1);
+        let w: Widened = widened_to_depth(checker, bound, room - 1);
         if w.variables.len() == 0 { unwidened(w.checker, ty) } else { w }
       },
     },
-    FunctionType(g) -> widen_fn(opened(checker, g.ret, room), ty, g),
+    FunctionType(g) -> widen_fn(widened_to_depth(checker, g.ret, room), ty, g),
     RecordType(fs) -> {
       let o: WidenedItems<Field> = range(0, fs.len()).fold(
         { checker: checker, items: fs, variables: [] },
         |acc: WidenedItems<Field>, i: Int| {
           let x = fs.get(i);
-          let w: Widened = opened(acc.checker, x.ty, room);
+          let w: Widened = widened_to_depth(acc.checker, x.ty, room);
           if w.variables.len() == 0 { acc } else {
             {
               checker: w.checker,
@@ -3474,7 +3495,7 @@ fn opened(checker: Checker, ty: Type, room: Int) -> Widened / {abort.raise} =
       let o: WidenedItems<Type> = range(0, c.args.len()).fold(
         { checker: checker, items: c.args, variables: [] },
         |acc: WidenedItems<Type>, i: Int| {
-          let w: Widened = opened(acc.checker, c.args.get(i), room);
+          let w: Widened = widened_to_depth(acc.checker, c.args.get(i), room);
           if w.variables.len() == 0 { acc } else {
             {
               checker: w.checker,
@@ -3517,7 +3538,7 @@ pub fn expect_or_widen(
 
 type Joined = { checker: Checker, ty: Type, variables: List<Int> }
 
-fn join_next(acc: Joined, span: Span, found: Type, context: Bytes) -> Joined / {abort.raise} = {
+fn join_type_into(acc: Joined, span: Span, found: Type, context: Bytes) -> Joined / {abort.raise} = {
   let u = unify(acc.checker.substitution, acc.checker.fresh, acc.ty, found);
   match u.error {
     None -> { checker: with_unified(acc.checker, u), ty: acc.ty, variables: acc.variables },
@@ -3556,7 +3577,12 @@ fn agree(
   second: Type,
   context: Bytes,
 ) -> { checker: Checker, ty: Type } / {abort.raise} = {
-  let j: Joined = join_next({ checker: checker, ty: first, variables: [] }, span, second, context);
+  let j: Joined = join_type_into(
+    { checker: checker, ty: first, variables: [] },
+    span,
+    second,
+    context,
+  );
   { checker: close_effect_variables(j.checker, j.variables), ty: j.ty }
 }
 
@@ -3849,7 +3875,7 @@ fn applied_call(
       let holding: { checker: Checker, params: List<Int> } = match repeats.waits {
         Some(g) -> if effects.listed.len() == 0 && effects.variable == None {
           { checker: obliged, params: [] }
-        } else { fn_holding(obliged, g) },
+        } else { callback_parameters_of(obliged, g) },
         None -> { checker: obliged, params: [] },
       };
       let held = holding.params.map(|i: Int|
@@ -3892,7 +3918,7 @@ fn applied_call(
         _ -> [],
       };
       let j: WithEffects = join(
-        repeat_variable(recorded, effects.variable, scaled.vars, variable_waits, span),
+        record_repeated_variable(recorded, effects.variable, scaled.vars, variable_waits, span),
         span,
         j0.effects,
         effects,
@@ -3911,7 +3937,7 @@ fn applied_call(
         b"callee type",
       );
       let j: WithEffects = join(
-        repeat_variable(x.checker, eff.effects.variable, [], [], span),
+        record_repeated_variable(x.checker, eff.effects.variable, [], [], span),
         span,
         j0.effects,
         eff.effects,
@@ -4389,7 +4415,7 @@ fn infer_match(
         Some(_) -> left,
       };
       let popped: Checker = { ..missed, env: env_pop(missed.env) };
-      let n: Joined = join_next(
+      let n: Joined = join_type_into(
         { checker: popped, ty: acc.ty, variables: acc.variables },
         expression_span(arm.body),
         body.ty,
@@ -4443,7 +4469,7 @@ fn resolve_exit_raise(checker: Checker, eff: QName) -> WithOperation / {abort.ra
   let result: WithVar = new_type_var(carried.checker);
   let at = { module: checker.module, span: eff.span };
   let op = {
-    name: exit_op(),
+    name: exit_operation_name(),
     mode: RaiseMode,
     resource_param: false,
     params: [carried.ty],
@@ -4549,20 +4575,23 @@ pub fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise}
       Some(n) -> Some(n),
       None -> {
         let simple = match effect_of(checker, eff) { Some(info) -> info.simple_name, None -> eff };
-        scope.modules.filter(written_binder).fold(None, |acc: Option<Bytes>, mb: ModuleBinding|
-          match acc {
-            Some(_) -> acc,
-            None -> match lookup_declared(
-                checker.resolved.declarations.get(mb.target),
-                EffectSpace,
-                simple,
-              ) {
-              Some(d) -> if d.qualified == eff {
-                Some(Bytes::concat_all([mb.binder, b"::", simple]))
-              } else { None },
-              None -> None,
+        scope.modules.filter(is_explicit_binding).fold(
+          None,
+          |acc: Option<Bytes>, mb: ModuleBinding|
+            match acc {
+              Some(_) -> acc,
+              None -> match lookup_declared(
+                  checker.resolved.declarations.get(mb.target),
+                  EffectSpace,
+                  simple,
+                ) {
+                Some(d) -> if d.qualified == eff {
+                  Some(Bytes::concat_all([mb.binder, b"::", simple]))
+                } else { None },
+                None -> None,
+              },
             },
-          })
+        )
       },
     }
   }
@@ -4719,7 +4748,7 @@ fn instantiate_op(checker: Checker, op_info: OpInfo) -> OperationType / {abort.r
   }
 }
 
-fn note_perform_order(
+fn record_operation_instance(
   shape: OperationType,
   span: Span,
   op_info: OpInfo,
@@ -4739,11 +4768,11 @@ pub fn is_shipped_effect(info: EffectInfo) -> Bool = info.module == b"" || is_sh
 
 pub fn marshalling_variables(op_info: OpInfo) -> List<Int> / {abort.raise} = {
   let sc = op_scheme(op_info);
-  let named = marshalling_own(op_info.params, op_info.ret, op_info.mode, sc.type_variables);
+  let named = variables_in_signature(op_info.params, op_info.ret, op_info.mode, sc.type_variables);
   range(0, sc.type_variables.len()).filter(|i: Int| named.contains(sc.type_variables.get(i)))
 }
 
-pub fn marshalling_own(
+pub fn variables_in_signature(
   params: List<Type>,
   ret: Type,
   mode: Mode,
@@ -4866,7 +4895,7 @@ fn infer_perform(
           { checker: o.checker, ty: o.ty, effects: as_.effects, node: None }
         },
         Some(resource_) -> {
-          let shape: OperationType = note_perform_order(
+          let shape: OperationType = record_operation_instance(
             instantiate_op(res.checker, hit.op),
             span,
             hit.op,
@@ -5071,7 +5100,11 @@ fn with_handler_variables(
   );
   {
     ..bound.checker,
-    assignable: { vars: bound.vars, barred: barred, frame: env_depth(checker.env) },
+    assignable: {
+      vars: bound.vars,
+      assignment_forbidden_in: barred,
+      frame: env_depth(checker.env),
+    },
   }
 }
 
@@ -5087,12 +5120,13 @@ fn infer_handle(
   let made: HandlerVariables = infer_handler_variables(checker, vars);
   let around: Assignable = checker.assignable;
   let mark = made.checker.performs.len();
-  let b: Inference = unbarred(
+  let b: Inference = restore_assignable(
     made.checker,
-    infer(barred(made.checker, b"the body of a `handle` inside the clause"), body, match ret {
-      Some(_) -> None,
-      None -> hint,
-    }),
+    infer(
+      forbid_assignment(made.checker, b"the body of a `handle` inside the clause"),
+      body,
+      match ret { Some(_) -> None, None -> hint },
+    ),
   );
   let spawned = { before: spawn_counts(made.checker), after: spawn_counts(b.checker) };
   let general = clauses.fold(false, |acc: Bool, c: HandleClause|
@@ -5397,20 +5431,33 @@ fn infer_handle(
       ).checker,
     None -> returned.checker,
   };
-  let opened = opened_to_clauses(agreed, b.effects, walked.around.map(|c: ClauseSite| c.op));
-  let body_effects = resolve_effects_in(opened, b.effects);
+  let widened_to_depth = opened_to_clauses(
+    agreed,
+    b.effects,
+    walked.around.map(|c: ClauseSite| c.op),
+  );
+  let body_effects = resolve_effects_in(widened_to_depth, b.effects);
   let remaining = body_effects.listed.filter(|a: Effect|
-    !clause_discharges(opened, walked.handled, walked.selected, a));
+    !clause_discharges(widened_to_depth, walked.handled, walked.selected, a));
   let missing = remaining.filter(|a: Effect|
-    effects_cover(walked.handled, a) && !effects_cover(opened.declared_effects, a));
+    effects_cover(walked.handled, a) && !effects_cover(widened_to_depth.declared_effects, a));
   let sites = resolved_sites(
-    opened.substitution,
-    opened.performs.drop(mark).take(body_mark - mark),
+    widened_to_depth.substitution,
+    widened_to_depth.performs.drop(mark).take(body_mark - mark),
   );
   let after = clauses.fold(span.start, |acc: Int, cl: HandleClause|
     max(acc, expression_span(cl.body).end));
-  let judged: Checker = if missing.len() == 0 { opened }
-  else { incomplete(opened, span, after, sites, walked.handled, walked.selected, missing) };
+  let judged: Checker = if missing.len() == 0 { widened_to_depth } else {
+    report_incomplete_handling(
+      widened_to_depth,
+      span,
+      after,
+      sites,
+      walked.handled,
+      walked.selected,
+      missing,
+    )
+  };
   let kept = effects_difference(remaining, missing);
   let discharged: Checker = discharge(
     judged,
@@ -5592,7 +5639,7 @@ fn reject_passed_raise(
 fn try_handles(a: Effect) -> Bool =
   is_raise(a.mode) && a != abort_effect() && !is_exit_effect(a.effect)
 
-fn carried_type(params: List<Type>) -> Type / {abort.raise} =
+fn parameters_as_type(params: List<Type>) -> Type / {abort.raise} =
   match params {
     [] -> unit_type(),
     [one] -> one,
@@ -5648,10 +5695,10 @@ fn infer_try_block(
         mode: hit.op.mode,
         op: Some(hit.op.name),
       };
-      let opened = opened_to_clauses(chosen.checker, b.effects, [entry]);
-      let returned_effects = resolve_effects_in(opened, b.effects);
-      let c: Checker = reject_passed_raise(opened, span, returned_effects, entry);
-      let carried = carried_type(hit.op.params);
+      let widened_to_depth = opened_to_clauses(chosen.checker, b.effects, [entry]);
+      let returned_effects = resolve_effects_in(widened_to_depth, b.effects);
+      let c: Checker = reject_passed_raise(widened_to_depth, span, returned_effects, entry);
+      let carried = parameters_as_type(hit.op.params);
       let result = result_type(b.ty, carried);
       {
         checker: discharge(c, mark, body_mark, [entry]),
@@ -5660,7 +5707,7 @@ fn infer_try_block(
           listed: returned_effects.listed.filter(|a: Effect| a != entry),
           variable: returned_effects.variable,
         },
-        node: tried_node(
+        node: try_block_node(
           c,
           span,
           typed_at(b, expression_span(body)),
@@ -5674,7 +5721,7 @@ fn infer_try_block(
   }
 }
 
-fn tried_node(
+fn try_block_node(
   checker: Checker,
   span: Span,
   body: Option<Walked>,
@@ -5795,7 +5842,7 @@ fn tried_node(
     _ -> None,
   }
 
-fn reach_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
+fn perform_site_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
   let a = backticked_text(written_effect_text(checker, site.entry));
   match site.source {
     DirectPerform -> b"performs ".concat(a),
@@ -5806,7 +5853,7 @@ fn reach_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
   }
 }
 
-fn incomplete(
+fn report_incomplete_handling(
   checker: Checker,
   span: Span,
   after: Int,
@@ -5825,7 +5872,7 @@ fn incomplete(
   };
   let labels = missing.fold([], |acc: List<Label>, a: Effect|
     match site_among(sites, a) {
-      Some(s) -> acc.push(label_at(s.module, s.span, true, reach_label(checker, s))),
+      Some(s) -> acc.push(label_at(s.module, s.span, true, perform_site_label(checker, s))),
       None -> acc,
     });
   let notes = missing.fold([], |acc: List<Bytes>, a: Effect|
@@ -5968,7 +6015,7 @@ fn reject_reopened_scope(checker: Checker, resource: Identifier, outer: OpenScop
   )
 
 fn scope_label(checker: Checker, name: Bytes) -> Bytes =
-  Bytes::concat_all([name, scope_mark(), checker.walking])
+  Bytes::concat_all([name, label_scope_separator(), checker.current_definition])
 
 fn open_scope(checker: Checker, name: Bytes, label: Bytes, span: Span) -> Checker =
   {
@@ -6132,16 +6179,24 @@ fn infer_with_scope(
             span: synthetic_span_at(binder.span, span, role_scope_body_param()),
           },
           typed_at(b, expression_span(body)),
-          { held: a.ty, hold: hold_type, result: b.ty },
+          { held: a.ty, pending_key_token: hold_type, result: b.ty },
           { acquired: a.effects, released: entering.effects, body: b.effects, all: j.effects },
         ),
       }
     },
     None -> {
-      let opened: Checker = open_scope(entering.checker, resource.name, label, resource.span);
-      let mark = opened.performs.len();
+      let widened_to_depth: Checker = open_scope(
+        entering.checker,
+        resource.name,
+        label,
+        resource.span,
+      );
+      let mark = widened_to_depth.performs.len();
       let b: Inference = infer(
-        { ..opened, env: env_bind(env_push(opened.env), binder, monomorphic(hold_type)) },
+        {
+          ..widened_to_depth,
+          env: env_bind(env_push(widened_to_depth.env), binder, monomorphic(hold_type)),
+        },
         body,
         hint,
       );
@@ -6186,7 +6241,7 @@ fn infer_with_scope(
             span: synthetic_span_at(binder.span, span, role_scope_body_param()),
           },
           typed_at(b, expression_span(body)),
-          { held: a.ty, hold: hold_type, result: b.ty },
+          { held: a.ty, pending_key_token: hold_type, result: b.ty },
           { acquired: a.effects, released: entering.effects, body: b.effects, all: j.effects },
         ),
       }
@@ -6199,7 +6254,7 @@ fn scoped_node(
   given: { acquire: Option<Walked>, release: Option<Walked> },
   binder: { name: Bytes, span: Span },
   body: Option<Walked>,
-  types: { held: Type, hold: Type, result: Type },
+  types: { held: Type, pending_key_token: Type, result: Type },
   effects: { acquired: Effects, released: Effects, body: Effects, all: Effects },
 ) -> Option<WalkedNode> =
   match ((given.acquire, given.release, body)) {
@@ -6232,10 +6287,15 @@ fn scoped_node(
           span: place,
           ty: fn_type(params.map(|q: TypedParam<Type>| q.ty), inner.ty, effects),
         };
-      let opened = lambda(
+      let widened_to_depth = lambda(
         [],
         call(
-          builtin(b"?scope_new", fn_of([types.held], types.hold), at(role_scope_new_callee()), []),
+          builtin(
+            b"?scope_new",
+            fn_of([types.held], types.pending_key_token),
+            at(role_scope_new_callee()),
+            [],
+          ),
           [
             call(
               read(
@@ -6250,7 +6310,7 @@ fn scoped_node(
               effects.acquired,
             ),
           ],
-          types.hold,
+          types.pending_key_token,
           at(role_scope_new()),
           no_effects(),
         ),
@@ -6258,7 +6318,7 @@ fn scoped_node(
         at(role_scope_open()),
       );
       let closed = lambda(
-        [{ name: b"?held", ty: types.hold, span: at(role_scope_close_param()) }],
+        [{ name: b"?held", ty: types.pending_key_token, span: at(role_scope_close_param()) }],
         call(
           read(
             b"?release",
@@ -6270,7 +6330,7 @@ fn scoped_node(
             call(
               builtin(
                 b"?scope_take",
-                fn_of([types.hold], types.held),
+                fn_of([types.pending_key_token], types.held),
                 at(role_scope_take_callee()),
                 [],
               ),
@@ -6278,7 +6338,7 @@ fn scoped_node(
                 read(
                   b"?held",
                   role_scope_close_param(),
-                  types.hold,
+                  types.pending_key_token,
                   at(role_scope_take_scoped_read()),
                 ),
               ],
@@ -6295,7 +6355,7 @@ fn scoped_node(
         at(role_scope_close()),
       );
       let ran = lambda(
-        [{ name: binder.name, ty: types.hold, span: binder.span }],
+        [{ name: binder.name, ty: types.pending_key_token, span: binder.span }],
         region,
         effects.body,
         at(role_scope_body()),
@@ -6344,11 +6404,11 @@ fn scoped_node(
             call(
               builtin(
                 b"?hold_bracket",
-                fn_of([opened.ty, closed.ty, ran.ty], types.result),
+                fn_of([widened_to_depth.ty, closed.ty, ran.ty], types.result),
                 at(role_scope_bracket_callee()),
                 [effects.all],
               ),
-              [opened, closed, ran],
+              [widened_to_depth, closed, ran],
               types.result,
               at(role_scope_bracket()),
               no_effects(),
@@ -6363,10 +6423,10 @@ fn scoped_node(
 fn task_carriers(checker: Checker) -> List<{ binder: Int, ty: Type }> / {abort.raise} =
   env_locals(checker.env).fold([], |acc: List<{ binder: Int, ty: Type }>, l: InScope| {
     let ty = resolve(checker, l.sc.ty);
-    if holds_task(ty) { acc.push({ binder: l.binder, ty: ty }) } else { acc }
+    if contains_task(ty) { acc.push({ binder: l.binder, ty: ty }) } else { acc }
   })
 
-fn carried_in(
+fn captured_task_locals(
   xs: List<CapturedLocal>,
   carriers: List<{ binder: Int, ty: Type }>,
 ) -> List<{ name: Bytes, span: Span, ty: Type }> =
@@ -6387,7 +6447,7 @@ fn infer_simulate(
   hint: Option<Hint>,
 ) -> Inference / {abort.raise} = {
   let mark = checker.performs.len();
-  let crossed_at = checker.marshallings.len();
+  let crossed_at = checker.captured_locals.len();
   let carriers = task_carriers(checker);
   let b: Inference = infer(
     {
@@ -6402,7 +6462,7 @@ fn infer_simulate(
     ..b.checker,
     simulate_depth: b.checker.simulate_depth - 1,
     simulation_scope: checker.simulation_scope,
-    marshallings: b.checker.marshallings.take(crossed_at),
+    captured_locals: b.checker.captured_locals.take(crossed_at),
   };
   let handled = simulated_effects();
   let discharged: Checker = discharge(c, mark, c.performs.len(), handled);
@@ -6415,7 +6475,7 @@ fn infer_simulate(
       body_type: b.ty,
       body_effects: b.effects,
       exits: scope_exits(body, []),
-      entering: carried_in(b.checker.marshallings.drop(crossed_at), carriers),
+      entering: captured_task_locals(b.checker.captured_locals.drop(crossed_at), carriers),
     }),
   };
   let seed = seed_effect();
@@ -6434,12 +6494,13 @@ fn infer_simulate(
   }
 }
 
-pub fn holds_fn(t: Type) -> Bool =
+pub fn contains_function(t: Type) -> Bool =
   match t {
     FunctionType(_) -> true,
-    NamedType(c) -> c.args.fold(false, |b: Bool, x: Type| b || holds_fn(x)),
-    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || holds_fn(field.ty)),
-    NominalType(n) -> n.fields.fold(false, |b: Bool, field: Field| b || holds_fn(field.ty)),
+    NamedType(c) -> c.args.fold(false, |b: Bool, x: Type| b || contains_function(x)),
+    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || contains_function(field.ty)),
+    NominalType(n) ->
+      n.fields.fold(false, |b: Bool, field: Field| b || contains_function(field.ty)),
     VariableType(_) -> false,
   }
 
@@ -6475,20 +6536,23 @@ pub fn ordered_parts(
 }
 
 pub fn ordered_variables(checker: Checker, t: Type) -> List<Int> / {abort.raise} =
-  ordered_parts(checker.carrying, t, []).fold([], |acc: List<Int>, p: OrderedPart|
-    ints_union(acc, order_needs(p.key, checker.ordering)))
+  ordered_parts(checker.ordered_parameters, t, []).fold([], |acc: List<Int>, p: OrderedPart|
+    ints_union(acc, order_needs(p.key, checker.type_shapes)))
 
 fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
-  note_parts(checker, span, ordered_parts(checker.carrying, ty, []))
+  note_parts(checker, span, ordered_parts(checker.ordered_parameters, ty, []))
 
 fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
   note_type_constraints_in(
     note_map_key_sites(
       checker,
       span,
-      ordered_parts(checker.carrying, ty, []).fold([], |acc: List<OrderedKey>, p: OrderedPart|
-        order_needs(p.key, checker.ordering).fold(acc, |b: List<OrderedKey>, v: Int|
-          b.push({ key: VariableType(v), whole: p.key, carrier: p.carrier }))),
+      ordered_parts(checker.ordered_parameters, ty, []).fold(
+        [],
+        |acc: List<OrderedKey>, p: OrderedPart|
+          order_needs(p.key, checker.type_shapes).fold(acc, |b: List<OrderedKey>, v: Int|
+            b.push({ key: VariableType(v), whole: p.key, carrier: p.carrier })),
+      ),
     ),
     span,
     ty,
@@ -6540,7 +6604,7 @@ fn note_constraints(
             assumed: assumed_for(checker, c.deriver),
             params: params,
             called: false,
-            owner: checker.walking,
+            owner: checker.current_definition,
             stated: None,
           })
         });
@@ -6564,12 +6628,12 @@ fn mark_called(checker: Checker, span: Span) -> Checker / {abort.raise} = {
   { ..checker, constrained_uses: marked.uses }
 }
 
-fn holds_task(t: Type) -> Bool =
+fn contains_task(t: Type) -> Bool =
   match t {
     NamedType(c) ->
-      is_scheduler_handle(c.name) || c.args.fold(false, |b: Bool, a: Type| b || holds_task(a)),
-    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || holds_task(field.ty)),
-    NominalType(n) -> n.fields.fold(false, |b: Bool, field: Field| b || holds_task(field.ty)),
+      is_scheduler_handle(c.name) || c.args.fold(false, |b: Bool, a: Type| b || contains_task(a)),
+    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || contains_task(field.ty)),
+    NominalType(n) -> n.fields.fold(false, |b: Bool, field: Field| b || contains_task(field.ty)),
     FunctionType(_) -> false,
     VariableType(_) -> false,
   }

@@ -19,7 +19,7 @@ import compiler.syntax.items (FunctionItem)
 import compiler.syntax.parsing (Span)
 import domain (Sort, SortVariable, FunctionSort, RecordSort, NamedSort, Declaration, Variant,
                substituted)
-import sort (canonical, foreign, foreign_base)
+import sort (canonical, shift_variables, external_variable_base)
 import prover_input (BuiltinSignature, Operation, Signature, ProverInput)
 import std.graph
 
@@ -43,7 +43,7 @@ pub type Definition = {
 
 pub type Law = { guard: Option<LoweredClause>, body: Code }
 
-/// `read`: the program the claims were read from, where they were (`claims_read`).
+/// `read`: the program the claims were read from, where they were (`claims_from_analysis`).
 pub type Claims = {
   definitions: Map<String, Definition>,
   laws: Map<String, Law>,
@@ -75,7 +75,7 @@ pub type Context = {
   measured: Map<String, Bool>,
   /// The sum types a case split may range over.
   sums: Map<String, Bool>,
-  inhabited: Map<String, Bool>,
+  inhabited_sums: Map<String, Bool>,
   // Nominal types that state a `key` or a `numeric`, or whose declaration reaches one that does:
   // what a comparison or an operator calls unseen, which the cost reader reads.
   keyed_types: Map<String, Bool>,
@@ -133,7 +133,7 @@ pub fn claims_of(cs: List<Claim>) -> Claims =
 
 /// The claims of the modules at `modules` of `analysis`, a module not `owned` opaque, read so that a
 /// body's moves can be read off it as the build lowers it (`moved_bodies`).
-pub fn claims_read(
+pub fn claims_from_analysis(
   analysis: Analysis,
   modules: List<Int>,
   owned: (Bytes) -> Bool,
@@ -346,7 +346,7 @@ pub fn context(claims: Claims, world: ProverInput) -> Context / {abort.raise} = 
   );
   let rec = recursive_definitions(claims.definitions);
   let signatures = world.signatures.fold(Map::new(), |m: Map<String, Signature>, s: Signature|
-    m.insert(s.name, { ..s, ty: foreign(canonical(s.ty)) }));
+    m.insert(s.name, { ..s, ty: shift_variables(canonical(s.ty)) }));
   let measures = measure_definitions(claims.definitions, signatures);
   {
     claims: { ..claims, definitions: claims.definitions.merge(measures.definitions) },
@@ -358,15 +358,15 @@ pub fn context(claims: Claims, world: ProverInput) -> Context / {abort.raise} = 
     groups: rec.groups,
     measured: Map::new(),
     sums: sums,
-    inhabited: inhabited_sum_types(declarations, sums),
+    inhabited_sums: inhabited_sum_types(declarations, sums),
     keyed_types: {
       let stated = world.keys.map(|k: { type_name: String, by: String }| k.type_name).concat(
         world.numerics.map(|n: { type_name: String, functions: List<String> }| n.type_name),
       );
-      if stated.len() == 0 { Map::new() } else { reaching_types(declarations, set_of(stated)) }
+      if stated.len() == 0 { Map::new() } else { types_containing(declarations, set_of(stated)) }
     },
     compared_by_key: if world.keys.len() == 0 { Map::new() } else {
-      reaching_types(
+      types_containing(
         declarations,
         set_of(world.keys.map(|k: { type_name: String, by: String }| k.type_name)),
       )
@@ -383,7 +383,7 @@ pub fn context(claims: Claims, world: ProverInput) -> Context / {abort.raise} = 
     builtins: world.builtins.fold(
       Map::new(),
       |m: Map<String, BuiltinSignature>, b: BuiltinSignature|
-        m.insert(b.name, { ..b, ty: foreign(canonical(b.ty)) }),
+        m.insert(b.name, { ..b, ty: shift_variables(canonical(b.ty)) }),
     ),
     invariants: world.invariants.fold(
       Map::new(),
@@ -391,7 +391,7 @@ pub fn context(claims: Claims, world: ProverInput) -> Context / {abort.raise} = 
     ),
     operations: world.operations.fold(Map::new(), |m: Map<String, Option<Sort>>, o: Operation| {
       let key = o.effect ++ "." ++ o.op;
-      let results = foreign(canonical(o.results));
+      let results = shift_variables(canonical(o.results));
       match m.get(key) {
         None -> m.insert(key, Some(results)),
         Some(Some(t)) -> if t == results { m } else { m.insert(key, None) },
@@ -413,24 +413,29 @@ pub fn operation_sort(context: Context, global: Bytes, op: Bytes) -> Option<Sort
 
 /// Whether a value of `ty` holds one of a type that states a `key` or a `numeric`, whose `==` or
 /// whose operators call a function no body shows.
-pub fn reaches_key(context: Context, ty: Sort) -> Bool =
-  context.keyed_types.len() > 0 && reaches(ty, context.keyed_types, false)
+pub fn contains_keyed_type(context: Context, ty: Sort) -> Bool =
+  context.keyed_types.len() > 0 && contains_declared_type(ty, context.keyed_types, false)
 
 /// Whether `==` at `sort` may call a key, which may end the run: the sort holds a type that states
 /// one, or a variable the prover never resolved, or is not known, where any type states one.
 pub fn may_call_key(context: Context, sort: Option<Sort>) -> Bool =
   context.compared_by_key.len() > 0
-    && (match sort { Some(t) -> reaches(t, context.compared_by_key, true), None -> true })
+    && (match sort {
+      Some(t) -> contains_declared_type(t, context.compared_by_key, true),
+      None -> true,
+    })
 
-/// `open`: a variable numbered past `foreign_base()`, unresolved by the prover, may be any type.
-fn reaches(t: Sort, declared: Map<String, Bool>, open: Bool) -> Bool =
+/// `open`: a variable numbered past `external_variable_base()`, unresolved by the prover, may be any type.
+fn contains_declared_type(t: Sort, declared: Map<String, Bool>, open: Bool) -> Bool =
   match t {
     NamedSort(name, args) ->
-      declared.contains(name) || args.any(|a: Sort| reaches(a, declared, open)),
+      declared.contains(name) || args.any(|a: Sort| contains_declared_type(a, declared, open)),
     FunctionSort(params, ret, _) ->
-      params.any(|p: Sort| reaches(p, declared, open)) || reaches(ret, declared, open),
-    RecordSort(fields) -> fields.any(|x: { name: String, ty: Sort }| reaches(x.ty, declared, open)),
-    SortVariable(v) -> open && v >= foreign_base(),
+      params.any(|p: Sort| contains_declared_type(p, declared, open))
+        || contains_declared_type(ret, declared, open),
+    RecordSort(fields) ->
+      fields.any(|x: { name: String, ty: Sort }| contains_declared_type(x.ty, declared, open)),
+    SortVariable(v) -> open && v >= external_variable_base(),
   }
 
 /// Whether `==` at `ty` is identity: two values are `==` exactly when they are one value, which is
@@ -518,7 +523,7 @@ pub fn inhabited(context: Context, ty: Sort) -> Bool =
     FunctionSort(_, ret, _) -> inhabited(context, ret),
     RecordSort(fields) ->
       fields.fold(true, |ok: Bool, f: { name: String, ty: Sort }| ok && inhabited(context, f.ty)),
-    NamedSort(name, _) -> !context.sums.contains(name) || context.inhabited.contains(name),
+    NamedSort(name, _) -> !context.sums.contains(name) || context.inhabited_sums.contains(name),
   }
 
 /// Whether equal calls must return equal values, so they may share one term.
@@ -529,19 +534,19 @@ pub fn is_recursive(context: Context, name: String) -> Bool = context.recursive.
 
 /// Not in a recursive component, with no effects, and with a body the lowering reached.
 pub fn unfoldable(context: Context, name: String) -> Option<Definition> =
-  if context.recursive.contains(name) { None } else { reached_pure(context, name) }
+  if context.recursive.contains(name) { None } else { pure_definition(context, name) }
 
 /// In a recursive component, with no effects, and with a body the lowering reached: what a
 /// call over values in view runs.
 pub fn recursive_body(context: Context, name: String) -> Option<Definition> =
-  if context.recursive.contains(name) { reached_pure(context, name) } else { None }
+  if context.recursive.contains(name) { pure_definition(context, name) } else { None }
 
 /// Calling only itself, with no effects, and with a body the lowering reached: what induction
 /// may unroll once it has shown the recursion decreases.
 pub fn self_recursive(context: Context, name: String) -> Option<Definition> =
-  if context.self_recursive.contains(name) { reached_pure(context, name) } else { None }
+  if context.self_recursive.contains(name) { pure_definition(context, name) } else { None }
 
-fn reached_pure(context: Context, name: String) -> Option<Definition> =
+fn pure_definition(context: Context, name: String) -> Option<Definition> =
   match signature(context, name) {
     None -> None,
     Some(s) -> if !s.pure { None } else {
@@ -554,7 +559,7 @@ fn reached_pure(context: Context, name: String) -> Option<Definition> =
 
 /// The types that reach `seeds`, those included. A least fixed point, so chains of declarations and
 /// recursive ones both settle.
-fn reaching_types(
+fn types_containing(
   declarations: List<Declaration>,
   seeds: Map<String, Bool>,
 ) -> Map<String, Bool> / {abort.raise} =
@@ -562,9 +567,10 @@ fn reaching_types(
     let grown = declarations.fold(found, |acc: Map<String, Bool>, declaration: Declaration|
       if acc.contains(declaration.name) { acc }
       else if declaration.variants.fold(false, |f: Bool, variant: Variant|
-          f || variant.fields.fold(false, |g: Bool, ty: Sort| g || reaches(ty, found, false))) {
-        acc.insert(declaration.name, true)
-      } else { acc });
+          f
+            || variant.fields.fold(false, |g: Bool, ty: Sort|
+              g || contains_declared_type(ty, found, false))) { acc.insert(declaration.name, true) }
+      else { acc });
     if grown.len() == found.len() { Stop(found) } else { Continue(grown) }
   })
 
