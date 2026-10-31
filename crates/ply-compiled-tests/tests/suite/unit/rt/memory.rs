@@ -48,14 +48,14 @@ fn free(ctx: &mut Ctx, w: Word, bytes: Word) {
 }
 
 #[test]
-fn the_fields_a_drop_root_keeps_follow_those_every_unit_reads() {
+fn the_context_fields_release_depth_and_release_waiting_are_at_the_offsets_compiled_code_expects() {
     use std::mem::offset_of;
     assert_eq!(offset_of!(Ctx, release_depth), 72);
     assert_eq!(offset_of!(Ctx, release_waiting), 80);
 }
 
 #[test]
-fn a_block_is_allocated_by_its_bytes_and_given_back_at_them() {
+fn a_block_is_allocated_and_freed_with_the_same_byte_size_and_then_reused() {
     let mut ctx = context();
     let w = alloc(&mut ctx, sized(4));
     assert_eq!(count(w), 1);
@@ -72,7 +72,7 @@ fn a_block_is_allocated_by_its_bytes_and_given_back_at_them() {
 }
 
 #[test]
-fn a_block_freed_under_another_context_goes_back_to_the_heap_it_came_from() {
+fn a_block_freed_through_another_context_goes_back_to_the_heap_it_came_from() {
     let (mut mine, mut other) = (context(), context());
     let w = alloc(&mut mine, 32);
     free(&mut other, w, 32);
@@ -104,7 +104,8 @@ fn a_block_freed_at_another_size_than_it_was_allocated_at_is_rejected() {
 }
 
 #[test]
-fn a_kept_block_is_immortal_and_outlives_the_entry_that_made_it() {
+fn a_block_from_rt_alloc_kept_is_never_freed_and_stays_valid_after_the_entry_that_allocated_it_ends()
+ {
     let mut ctx = context();
     let kept: Alloc = helper("rt_alloc_kept");
     ctx.begin();
@@ -118,7 +119,7 @@ fn a_kept_block_is_immortal_and_outlives_the_entry_that_made_it() {
 }
 
 #[test]
-fn of_holders_on_many_threads_only_the_last_to_let_a_shared_block_go_releases_it() {
+fn a_shared_block_used_by_many_threads_is_freed_only_by_the_last_thread_to_release_it() {
     const HOLDERS: u32 = 8;
     let mut ctx = context();
     let w = alloc(&mut ctx, 32);
@@ -140,7 +141,7 @@ fn of_holders_on_many_threads_only_the_last_to_let_a_shared_block_go_releases_it
 }
 
 #[test]
-fn a_native_object_is_given_back_with_what_it_holds() {
+fn freeing_a_native_object_also_drops_the_value_it_contains() {
     let mut ctx = context();
     let held: Arc<str> = Arc::from("held");
     let b = ctx.heap.native(Box::new(Holding(Arc::clone(&held))));
@@ -152,7 +153,7 @@ fn a_native_object_is_given_back_with_what_it_holds() {
 }
 
 #[test]
-fn a_scoped_value_keeps_what_it_holds_at_the_word_the_runtime_describes() {
+fn a_scoped_value_stores_the_word_it_wraps_at_the_offset_the_runtime_reports() {
     use ply_compiled::c::builtin_helper_name;
     let mut ctx = context();
     ctx.begin();
@@ -170,7 +171,7 @@ fn a_scoped_value_keeps_what_it_holds_at_the_word_the_runtime_describes() {
 }
 
 #[test]
-fn a_block_given_back_is_counted_zero_until_it_is_taken_again() {
+fn a_freed_block_has_a_reference_count_of_zero_however_it_was_freed() {
     let (mut mine, mut other) = (context(), context());
     let sized = alloc(&mut mine, 32);
     let elsewhere = alloc(&mut mine, 32);
@@ -199,7 +200,7 @@ fn own_test_name(leaf: &str) -> String {
 }
 
 #[test]
-fn a_block_released_twice_ends_the_run_naming_where() {
+fn releasing_a_block_twice_stops_the_program_and_reports_the_source_location() {
     let name = own_test_name("releases_a_block_twice");
     let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
         .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
@@ -321,7 +322,8 @@ fn comb(ctx: &mut Ctx) -> Word {
 }
 
 #[test]
-fn a_release_a_hundred_thousand_deep_frees_everything_and_nests_no_deeper_than_the_bound() {
+fn releasing_a_tree_a_hundred_thousand_nodes_deep_frees_every_node_without_exceeding_the_recursion_limit()
+ {
     for (build, nodes) in [(chain as fn(&mut Ctx) -> Word, DEEP), (comb, 2 * DEEP)] {
         let (live, deepest, put_off, depth, waiting) = released(build);
         assert_eq!(live, 0, "of {nodes} nodes");
@@ -332,7 +334,7 @@ fn a_release_a_hundred_thousand_deep_frees_everything_and_nests_no_deeper_than_t
 }
 
 #[test]
-fn a_release_within_the_bound_puts_nothing_off() {
+fn releasing_a_tree_no_deeper_than_the_recursion_limit_never_postpones_any_release() {
     let shallow = |ctx: &mut Ctx| (0..RELEASE_DEPTH).fold(0, |under, _| node(ctx, under, 0));
     let (live, deepest, put_off, depth, waiting) = released(shallow);
     assert_eq!(live, 0);
@@ -342,7 +344,7 @@ fn a_release_within_the_bound_puts_nothing_off() {
 }
 
 #[test]
-fn a_node_held_twice_outlives_the_release_of_the_tree_past_the_bound() {
+fn a_node_with_two_references_survives_the_release_of_a_tree_deeper_than_the_recursion_limit() {
     std::thread::Builder::new()
         .stack_size(256 << 10)
         .spawn(|| {

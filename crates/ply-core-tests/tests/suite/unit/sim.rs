@@ -1,7 +1,8 @@
 use ply_core::sim::*;
 
 #[test]
-fn a_seed_prints_its_root_and_then_its_path() {
+fn a_seed_prints_as_its_root_number_and_then_a_colon_and_its_dotted_path_when_the_path_is_not_empty()
+ {
     assert_eq!(Seed::at(7, Vec::new()).to_string(), "7");
     assert_eq!(Seed::at(0, vec![1, 0, 2]).to_string(), "0:1.0.2");
     assert_eq!(

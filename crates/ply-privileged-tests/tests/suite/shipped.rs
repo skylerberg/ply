@@ -10,7 +10,7 @@ fn held(path: &str) -> &'static [u8] {
 }
 
 #[test]
-fn a_shipped_module_below_the_library_is_named_by_its_place() {
+fn a_standard_library_module_in_the_binary_is_listed_by_its_dotted_module_name() {
     let names = shipped_modules::names();
     assert!(names.iter().any(|n| n == "std.hash"), "{names:?}");
     assert!(names.iter().any(|n| n == "std.hash.legacy"), "{names:?}");
@@ -27,7 +27,7 @@ fn a_shipped_module_below_the_library_is_named_by_its_place() {
 }
 
 #[test]
-fn a_compiler_module_below_the_compiler_is_named_by_its_place() {
+fn a_compiler_module_in_the_binary_is_listed_by_its_dotted_module_name() {
     let names = shipped_modules::names();
     assert!(names.iter().any(|n| n == "compiler.front"), "{names:?}");
     assert!(
@@ -49,7 +49,8 @@ fn a_compiler_module_below_the_compiler_is_named_by_its_place() {
 }
 
 #[test]
-fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
+fn a_data_file_embedded_by_a_shipped_module_is_stored_under_its_path_and_is_not_listed_as_a_module()
+{
     let name = "std/oid/names.txt";
     let bytes = held("std/oid/names.txt");
     assert!(shipped_modules::data_names().iter().any(|n| n == name));

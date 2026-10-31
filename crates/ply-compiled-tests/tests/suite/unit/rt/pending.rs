@@ -96,7 +96,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
 }
 
 #[test]
-fn a_rejection_raised_on_through_the_bridge_keeps_its_note() {
+fn a_rejection_raised_again_from_a_stored_failure_keeps_its_explanatory_text() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     rejected(&mut ctx);
@@ -104,7 +104,7 @@ fn a_rejection_raised_on_through_the_bridge_keeps_its_note() {
 }
 
 #[test]
-fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
+fn an_assertion_failure_raised_again_from_a_stored_failure_is_still_an_assertion_failure() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     let said = "the sides differ";
@@ -125,7 +125,7 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
 }
 
 #[test]
-fn a_clause_is_handed_the_message_of_a_raise_left_pending() {
+fn a_handler_receives_the_message_of_a_stored_raise_as_a_string() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     rejected(&mut ctx);

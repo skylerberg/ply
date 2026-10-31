@@ -27,7 +27,7 @@ fn addr(bytes: &[u8]) -> (Addr, I64) {
 }
 
 #[test]
-fn a_native_that_asks_the_machine_leaves_the_run_having_read_it() {
+fn a_native_function_that_reads_the_operating_system_marks_the_run_as_not_repeatable() {
     let mut ctx = context();
     assert!(!ctx.take_host_use().acted());
     let cpus = unsafe { rt_os_cpus(&mut ctx) };
@@ -63,7 +63,8 @@ fn hosted(ctx: &mut Ctx) -> Rc<dyn HostRuntime> {
 }
 
 #[test]
-fn a_secret_line_is_taken_from_its_run_and_none_outlives_the_entry_point() {
+fn reading_a_secret_line_removes_it_from_the_run_and_ending_the_entry_point_deletes_unread_secret_lines()
+ {
     let mut ctx = context();
     let runtime = hosted(&mut ctx);
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
@@ -82,7 +83,7 @@ fn a_secret_line_is_taken_from_its_run_and_none_outlives_the_entry_point() {
 }
 
 #[test]
-fn a_run_that_listens_for_no_stop_installs_no_signal_handler() {
+fn a_run_that_does_not_handle_stop_signals_installs_no_signal_handler() {
     let mut ctx = context();
     let _runtime = hosted(&mut ctx);
     assert_eq!(unsafe { rt_signal_arrived(&mut ctx, I64(1)) }.0, 0);
@@ -103,7 +104,8 @@ fn a_run_that_listens_for_no_stop_installs_no_signal_handler() {
 }
 
 #[test]
-fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
+fn a_file_read_through_the_real_file_handler_is_recorded_in_the_run_trace_with_its_root_directory_name()
+ {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.db"), b"data").unwrap();
     let spec = ply_host::fs::RootSpec {
@@ -152,7 +154,7 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
 }
 
 #[test]
-fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {
+fn reading_the_program_binary_through_the_real_handler_is_recorded_in_the_run_trace() {
     let runtime = ply_host::Host::new().runtime();
     let mut ctx = context();
     ctx.set_host(
@@ -185,7 +187,7 @@ fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {
 }
 
 #[test]
-fn a_jobs_bytes_come_back_through_job_wait() {
+fn waiting_for_a_job_returns_the_bytes_the_job_computed() {
     let mut ctx = context();
     let ticket = submitted(&mut ctx, Work::Computing, "a test job", || {
         Ok(b"computed".to_vec())
@@ -211,7 +213,8 @@ fn a_failed_job_fails_the_run_that_waits_on_it() {
 }
 
 #[test]
-fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_rejected() {
+fn a_bcrypt_hash_job_returns_the_known_hash_without_using_the_operating_system_and_rejects_a_cost_of_31()
+ {
     let mut ctx = context();
     let (password_at, password_len) = addr(b"");
     let secret = unsafe { rt_secret_of(&mut ctx, password_at, password_len, I64(0)) };

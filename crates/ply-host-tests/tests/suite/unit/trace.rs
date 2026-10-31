@@ -177,7 +177,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
 }
 
 #[test]
-fn a_span_closed_on_another_channel_is_rejected() {
+fn closing_a_span_with_a_different_trace_channel_than_it_was_opened_with_is_rejected() {
     let f = fixture();
     let id = enter(&f, "http", "request");
     let reason = f
@@ -227,7 +227,7 @@ fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
 }
 
 #[test]
-fn closing_an_outer_span_abandons_the_spans_above_it() {
+fn closing_an_outer_span_writes_each_open_inner_span_as_ended_without_a_close() {
     let f = fixture();
     let outer = enter(&f, "orders", "place_order");
     let _inner = enter(&f, "orders", "reserve");
@@ -295,7 +295,7 @@ fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
 }
 
 #[test]
-fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
+fn when_a_task_ends_the_spans_it_left_open_are_written_with_an_abandoned_status() {
     let f = fixture();
     let task = TaskId(3);
     f.enter_as(Some(task), "http", "request");
@@ -330,7 +330,7 @@ fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
 }
 
 #[test]
-fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_ends() {
+fn a_span_left_open_by_a_task_that_has_ended_produces_warning_w0609_when_the_entry_point_ends() {
     let f = fixture();
     f.enter_as(Some(TaskId(3)), "db", "query");
     f.trace.end_task(f.machine, TaskId(3));
@@ -360,7 +360,7 @@ fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_end
 }
 
 #[test]
-fn the_spans_left_open_are_what_the_warnings_counted() {
+fn warning_w0609_counts_spans_left_open_by_ended_tasks_and_by_the_entry_point() {
     let f = fixture();
     let outer = enter(&f, "orders", "place_order");
     enter(&f, "orders", "reserve");
@@ -399,7 +399,8 @@ fn the_spans_left_open_are_what_the_warnings_counted() {
 }
 
 #[test]
-fn teardown_writes_before_it_flushes() {
+fn ending_the_entry_point_writes_the_closing_records_without_flushing_the_output_and_a_later_explicit_flush_does()
+ {
     let f = fixture();
     enter(&f, "orders", "place_order");
     assert_eq!(f.sink.flushes(), 0);
@@ -411,7 +412,8 @@ fn teardown_writes_before_it_flushes() {
 }
 
 #[test]
-fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
+fn the_count_gauge_and_time_metric_calls_each_write_a_trace_record_to_the_channel_the_caller_passes_in()
+ {
     let f = fixture();
     let owner = f.owner(None);
     let gauge: ply_core::Decimal = "41.75".parse().expect("a decimal");
@@ -472,7 +474,8 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
 }
 
 #[test]
-fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
+fn spans_are_still_tracked_when_trace_records_are_dropped_so_span_errors_and_warnings_are_the_same_whatever_output_is_used()
+ {
     let (trace, _) = discarding();
     let machine = MachineId::next();
     let id = trace.enter((machine, Some(TaskId(1))), "http", "request", &[]);
@@ -535,7 +538,8 @@ fn a_closing_span_carries_the_duration_the_sink_measured() {
 }
 
 #[test]
-fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
+fn a_program_field_named_level_span_or_ts_does_not_overwrite_the_trace_line_own_field_with_that_name()
+ {
     let f = fixture();
     f.event_with(
         "orders",
@@ -555,7 +559,8 @@ fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
 }
 
 #[test]
-fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
+fn every_kind_of_trace_field_value_renders_as_json_and_an_event_with_no_fields_still_writes_an_empty_fields_object()
+ {
     let f = fixture();
     let render = |value: Field| -> String {
         f.event_with("orders", Level::Info, "x", &field("f", value));

@@ -33,7 +33,8 @@ dependencies = [
 "#;
 
 #[test]
-fn the_runtime_reaches_its_own_entries_of_the_lock_and_no_others() {
+fn the_runtime_lock_text_contains_the_requested_packages_and_their_dependencies_but_no_unrelated_packages()
+ {
     let reached = lock_closure(LOCK, &["a"]);
     assert!(reached.contains("name = \"a\"") && reached.contains("name = \"b\""));
     assert!(reached.contains("version = \"1.0.0\""), "{reached}");

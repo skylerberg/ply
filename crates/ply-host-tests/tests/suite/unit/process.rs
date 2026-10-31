@@ -47,7 +47,7 @@ fn a_captured_sink_collects_both_streams_in_order() {
 }
 
 #[test]
-fn bytes_are_written_as_they_are_and_a_line_keeps_its_place_among_them() {
+fn raw_bytes_and_lines_written_to_stdout_and_stderr_are_captured_in_the_order_written() {
     let host = host(&[]);
     let raw = b"\x00\xff no newline";
     assert!(host.write(Stream::Out, raw, S).expect("a write"));
@@ -67,14 +67,15 @@ fn bytes_are_written_as_they_are_and_a_line_keeps_its_place_among_them() {
 }
 
 #[test]
-fn a_host_whose_streams_are_captured_leaves_an_unhandled_raise_to_the_run() {
+fn a_host_that_captures_streams_does_not_handle_a_raised_effect_and_leaves_it_to_the_running_program()
+ {
     let host = host(&[]);
     host.unhandled(&Symbol::new(PIPE_EFFECT), &Symbol::new(PIPE_BROKEN));
     host.settle();
 }
 
 #[test]
-fn exit_records_the_first_code_and_unwinds() {
+fn exit_records_the_first_exit_code_and_ignores_codes_from_later_exits() {
     let host = host(&[]);
     assert_eq!(host.exit(3, S).code, codes::PROCESS_EXIT);
     assert_eq!(host.requested_exit(), Some(3));
@@ -87,7 +88,7 @@ fn exit_records_the_first_code_and_unwinds() {
 }
 
 #[test]
-fn a_host_that_only_starts_programs_withholds_the_runs_own_process() {
+fn a_host_that_only_starts_programs_rejects_command_line_arguments_standard_streams_and_exit() {
     let host = ProcessHost::spawning(Executables::new());
     let rejections = [
         host.args(S).map(|_| ()).expect_err("no arguments"),
@@ -168,7 +169,7 @@ fn spawn(
 }
 
 #[test]
-fn a_spawn_returns_the_code_and_everything_both_streams_took() {
+fn a_spawn_returns_the_exit_code_and_everything_the_child_wrote_to_both_output_streams() {
     let host = spawning("sh", SH);
     let done = spawn(
         &host,
@@ -184,14 +185,14 @@ fn a_spawn_returns_the_code_and_everything_both_streams_took() {
 }
 
 #[test]
-fn a_signal_is_an_ending_of_its_own_rather_than_a_code() {
+fn a_child_killed_by_a_signal_reports_the_signal_number_and_not_an_exit_code() {
     let host = spawning("sh", SH);
     let done = spawn(&host, "sh", &["-c", "kill -9 $$"], "", &[PATH]).expect("a spawn");
     assert_eq!(done.ended, Ended::Signalled(9));
 }
 
 #[test]
-fn ending_the_children_ends_a_spawn_still_running() {
+fn end_children_kills_a_spawned_child_process_that_is_still_running() {
     let host = spawning("sh", SH);
     let args = ["-c".to_string(), "exec sleep 600".to_string()];
     let job = host.spawn("sh", &args, "", &[], S).expect("a spawn");
@@ -241,7 +242,8 @@ fn a_spawn_runs_in_the_directory_it_was_given() {
 }
 
 #[test]
-fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
+fn spawning_a_program_name_with_no_bound_path_fails_and_the_error_names_the_exec_flag_that_binds_a_path_to_it()
+ {
     let host = spawning("sh", SH);
     let rejected =
         spawn(&host, "cc", &["-c", "true"], "", &[]).expect_err("`cc` is bound to nothing");
@@ -275,7 +277,8 @@ fn bound_returns_whether_the_run_bound_a_program_to_the_label() {
 }
 
 #[test]
-fn an_exec_that_cannot_be_started_does_not_bind() {
+fn binding_a_program_fails_when_the_path_is_missing_is_a_directory_or_is_a_file_without_execute_permission()
+ {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let plain = dir.path().join("notes.txt");
     std::fs::write(&plain, b"not a program").unwrap();
@@ -310,7 +313,8 @@ fn an_exec_that_cannot_be_started_does_not_bind() {
 }
 
 #[test]
-fn an_exec_argument_is_a_label_and_a_path() {
+fn an_exec_argument_of_the_form_name_equals_path_parses_and_malformed_ones_like_a_bare_name_or_empty_path_fail()
+ {
     assert_eq!(
         ExecSpec::parse("cc=/usr/bin/cc").expect("a well-formed pair"),
         ExecSpec {
@@ -429,7 +433,7 @@ fn sleeper(host: &Arc<ProcessHost>) -> (i64, String) {
 }
 
 #[test]
-fn a_started_child_runs_beside_the_program_until_a_wait_hands_it_back() {
+fn a_started_child_runs_alongside_the_program_and_wait_returns_its_result_only_after_it_finishes() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -456,7 +460,7 @@ fn a_started_child_runs_beside_the_program_until_a_wait_hands_it_back() {
 }
 
 #[test]
-fn a_terminated_child_ends_by_the_signal() {
+fn a_child_sent_the_terminate_signal_ends_with_that_signal_as_its_result() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -512,7 +516,7 @@ fn a_child_fed_over_its_input_responds_with_what_it_read() {
 }
 
 #[test]
-fn a_child_started_without_input_reads_nothing_and_takes_nothing() {
+fn a_child_started_without_input_rejects_written_bytes_and_sees_empty_input() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -529,7 +533,7 @@ fn a_child_started_without_input_reads_nothing_and_takes_nothing() {
 }
 
 #[test]
-fn lines_arrive_one_at_a_time_and_the_unread_ones_come_back_at_the_wait() {
+fn lines_can_be_read_one_at_a_time_and_wait_returns_the_lines_not_yet_read() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -553,7 +557,8 @@ fn lines_arrive_one_at_a_time_and_the_unread_ones_come_back_at_the_wait() {
 }
 
 #[test]
-fn a_quiet_child_is_quiet_until_it_speaks_and_closed_once_it_is_done() {
+fn reading_a_line_from_a_child_that_is_silent_times_out_then_returns_the_line_when_it_prints_then_reports_closed()
+ {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -576,7 +581,8 @@ fn a_quiet_child_is_quiet_until_it_speaks_and_closed_once_it_is_done() {
 }
 
 #[test]
-fn both_streams_as_lines_arrive_in_one_order_and_go_back_to_their_own_stream() {
+fn lines_from_stdout_and_stderr_are_read_in_the_order_printed_and_wait_returns_lines_not_yet_read_from_each_stream()
+ {
     let host = spawning("sh", SH);
     let read = start(
         &host,
@@ -643,7 +649,8 @@ fn a_file_output_lands_in_the_childs_directory_and_starts_empty() {
 }
 
 #[test]
-fn kept_output_past_the_bound_is_drained_and_rejected_at_the_wait() {
+fn captured_output_over_the_size_limit_is_discarded_and_wait_fails_with_an_output_too_large_error()
+{
     let host = spawning("sh", SH);
     let over = MAX_CAPTURE_BYTES + 1;
     let child = start(
@@ -664,7 +671,7 @@ fn kept_output_past_the_bound_is_drained_and_rejected_at_the_wait() {
 }
 
 #[test]
-fn a_spent_handle_and_one_never_returned_are_rejections_rather_than_children() {
+fn a_child_handle_that_was_already_waited_on_or_never_existed_is_rejected_with_an_error() {
     let host = spawning("sh", SH);
     let child = start(
         &host,
@@ -721,7 +728,8 @@ fn a_child_is_used_under_the_label_it_was_started_as() {
 }
 
 #[test]
-fn a_start_of_an_unbound_label_names_the_flag_that_would_bind_it() {
+fn starting_a_program_name_with_no_bound_path_fails_and_the_error_names_the_exec_flag_that_binds_a_path_to_it()
+ {
     let host = spawning("sh", SH);
     let rejected = launched(
         &host,
@@ -745,7 +753,7 @@ fn a_start_of_an_unbound_label_names_the_flag_that_would_bind_it() {
 }
 
 #[test]
-fn a_child_that_cannot_start_is_a_result_rather_than_a_diagnostic() {
+fn a_child_that_cannot_start_returns_an_error_value_to_the_program_and_does_not_raise_an_error() {
     let host = spawning("sh", SH);
     let nowhere = launched(
         &host,
@@ -812,7 +820,7 @@ fn a_child_left_running_is_killed_and_reaped_when_the_host_ends_its_children() {
 }
 
 #[test]
-fn dropping_the_host_kills_and_reaps_the_children_it_holds() {
+fn dropping_the_host_kills_and_reaps_the_child_processes_it_started() {
     let host = spawning("sh", SH);
     let (_, pid) = sleeper(&host);
     drop(host);
@@ -820,7 +828,7 @@ fn dropping_the_host_kills_and_reaps_the_children_it_holds() {
 }
 
 #[test]
-fn the_runs_teardown_ends_the_children_it_leaves() {
+fn shutting_down_the_runtime_kills_the_child_processes_that_are_still_running() {
     let mut executables = Executables::new();
     executables
         .bind("sh", std::path::Path::new(SH), S)
@@ -834,7 +842,7 @@ fn the_runs_teardown_ends_the_children_it_leaves() {
 }
 
 #[test]
-fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
+fn a_run_waiting_on_both_a_child_and_a_socket_wakes_when_either_one_finishes() {
     let host = spawning("sh", SH);
     let net = ply_host::tcp::TcpHost::new();
     let listener = net.listen("listener", 0, S).expect("a listen");

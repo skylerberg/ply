@@ -4,7 +4,8 @@ use ply_compiled::c::linked::install;
 use ply_compiled::heap::imm_value;
 
 #[test]
-fn a_linked_program_loads_from_the_descriptor_its_main_hands_over() {
+fn a_program_compiled_into_the_executable_loads_from_the_program_table_passed_by_its_main_function()
+{
     let dir = tempfile::tempdir().expect("a scratch directory");
     let defs = [def("m.seven", 0, "  return ply_imm(7);")];
     let text = units::text(&defs, &units::exports_of(&defs));

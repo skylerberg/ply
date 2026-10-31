@@ -15,7 +15,7 @@ fn every_declared_helper_has_an_address() {
 }
 
 #[test]
-fn a_natives_signature_is_its_functions_type() {
+fn a_native_function_signature_is_derived_from_its_rust_function_type() {
     use ply_compiled::emitted::{Handed, PlyType};
     use ply_compiled::heap::Word;
     use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
@@ -52,7 +52,8 @@ fn a_natives_signature_is_its_functions_type() {
 }
 
 #[test]
-fn every_native_over_machine_data_has_a_helper_of_its_own() {
+fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_runtime_helper_with_the_same_signature()
+ {
     use ply_compiled::c::machine_natives;
     use ply_compiled::native::Machine;
     let machine = machine_natives();
@@ -89,7 +90,8 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
 }
 
 #[test]
-fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
+fn the_text_the_runtime_describes_itself_with_lists_helpers_and_native_functions_and_struct_offsets_and_sizes_matching_the_rust_code()
+ {
     use ply_compiled::rt::Ctx;
     let text = ply_compiled::c::described();
     assert_eq!(text.lines().next(), Some("ply runtime 1"));
@@ -132,7 +134,7 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
 }
 
 #[test]
-fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
+fn helpers_recorded_in_a_unit_export_table_bind_by_name_to_the_runtime_helper_addresses() {
     let mut exports = units::exports_of(&[]);
     exports.helpers.reverse();
     let read = ply_compiled::c::Exports::decode(&exports.encode()).expect("the table reads back");
@@ -148,7 +150,7 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
 }
 
 #[test]
-fn a_units_table_reads_as_a_unit_writes_it() {
+fn an_exports_table_decodes_to_the_values_a_unit_wrote_and_encodes_back_to_the_same_text() {
     let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nfields 1\nop\nentered m.main\n";
     let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
@@ -159,7 +161,8 @@ fn a_units_table_reads_as_a_unit_writes_it() {
 }
 
 #[test]
-fn a_table_listing_rejections_reads_as_one_without_them() {
+fn decoding_an_exports_table_drops_its_list_of_functions_that_were_not_compiled_so_encoding_omits_it()
+ {
     let listed = "helpers 0\nconstants 0\nmodules 3\nrefused 1\nm.f\nwhy\nfields 1\nop\n\
                   entered m.main\n";
     let bare = "helpers 0\nconstants 0\nmodules 3\nfields 1\nop\nentered m.main\n";
@@ -168,7 +171,8 @@ fn a_table_listing_rejections_reads_as_one_without_them() {
 }
 
 #[test]
-fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_rejected_by_name() {
+fn a_unit_that_records_a_helper_the_runtime_lacks_or_with_a_different_argument_count_fails_to_bind_and_the_error_message_names_the_helper()
+ {
     let mut retired = units::exports_of(&[]);
     retired.helpers.push(HelperShape {
         name: "rt_retired".to_string(),
@@ -205,7 +209,7 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_rejected_by_
 }
 
 #[test]
-fn a_unit_compiles_loads_binds_and_returns() {
+fn a_compiled_unit_loads_binds_its_helpers_and_returns_the_right_result_when_called() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let probe = def(
         "m.probe",
@@ -289,7 +293,7 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
 }
 
 #[test]
-fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
+fn a_recursion_deeper_than_the_first_stack_chunk_grows_the_stack_in_place_and_returns() {
     let Some((result, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
         return;
     };
@@ -302,7 +306,7 @@ fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
 }
 
 #[test]
-fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
+fn a_recursion_deeper_than_the_thread_stack_limit_fails_with_an_out_of_stack_error() {
     let ran = std::thread::Builder::new()
         .stack_size(4 << 20)
         .spawn(|| {
@@ -336,7 +340,7 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
 const RESTART: &str = "  ply_loop: { char probe; if ((uintptr_t)&probe < (uintptr_t)*(volatile int64_t *)&ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
 #[test]
-fn a_loop_past_its_clock_ends_at_its_next_restart() {
+fn a_loop_running_past_the_time_limit_stops_with_a_timed_out_failure_at_its_next_loop_restart() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let forever = def(
         "m.forever",
@@ -360,7 +364,8 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
 }
 
 #[test]
-fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
+fn a_time_limit_on_an_entry_that_already_ended_does_not_change_the_context_stack_floor_value_later()
+{
     let native = units::opened(
         tempfile::tempdir().expect("a scratch directory").path(),
         &[],
@@ -378,7 +383,8 @@ fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
 }
 
 #[test]
-fn a_unit_says_its_constants_slots() {
+fn decoding_an_exports_table_reads_a_number_of_slots_for_each_constant_and_fails_if_a_constant_has_none()
+ {
     let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nfields 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
@@ -390,7 +396,8 @@ fn a_unit_says_its_constants_slots() {
 }
 
 #[test]
-fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
+fn decoding_an_exports_table_reads_the_entered_function_lines_after_the_other_sections_and_ignores_unknown_lines_after_them()
+ {
     let tables = "helpers 0\nconstants 0\nmodules 0\nfields 0\n";
     let said = format!("{tables}entered m.main\nentered m.run\n");
     let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");

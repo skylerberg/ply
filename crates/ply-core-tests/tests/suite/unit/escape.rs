@@ -2,7 +2,7 @@ use ply_core::escape::*;
 use ply_core::{Span, codes};
 
 #[test]
-fn an_entry_points_result_rejects_a_continuation_by_the_way_to_it() {
+fn an_entry_point_returning_a_continuation_is_rejected_and_the_message_gives_the_path_to_it() {
     let boundary = Boundary::EntryResult { name: "m.parked" };
     let escapee = Escapee {
         handle: Handle::Continuation,
@@ -28,7 +28,8 @@ fn an_entry_points_result_rejects_a_continuation_by_the_way_to_it() {
 }
 
 #[test]
-fn a_handle_reached_directly_names_no_way() {
+fn a_task_handle_returned_directly_from_an_entry_point_is_rejected_with_a_message_that_has_no_field_path()
+ {
     let escapee = Escapee {
         handle: Handle::Task,
         route: Vec::new(),

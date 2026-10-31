@@ -56,7 +56,7 @@ fn of_name(ctx: &mut Ctx, native_name: &str, name: &str) -> Word {
 }
 
 #[test]
-fn a_secret_holds_a_copy_and_verifies_only_its_own_string() {
+fn a_secret_stores_its_own_copy_of_the_bytes_and_verify_succeeds_only_for_identical_bytes() {
     let mut ctx = context();
     let verify = |ctx: &mut Ctx, s: Word, b: &[u8]| unsafe {
         let (p, n) = borrowed(b);
@@ -85,7 +85,7 @@ fn a_secret_holds_a_copy_and_verifies_only_its_own_string() {
 }
 
 #[test]
-fn a_secret_text_is_written_and_read_in_the_encoding_its_name_names() {
+fn a_secret_is_encoded_to_text_and_decoded_back_using_the_encoding_named_by_the_name_argument() {
     let mut ctx = context();
     for (name, writes) in [("hex", 1), ("base32", 1), ("base32-typed", 0), ("rot13", 0)] {
         assert_eq!(of_name(&mut ctx, "?secret_encodes", name), writes, "{name}");
@@ -190,7 +190,8 @@ fn joined_texts(ctx: &mut Ctx, private: &[Vec<u8>]) -> Word {
 }
 
 #[test]
-fn an_rsa_jwk_is_the_document_its_numbers_came_from_and_numbers_that_disagree_are_none() {
+fn an_rsa_json_web_key_rebuilds_the_original_der_key_document_and_returns_empty_for_inconsistent_numbers()
+ {
     let mut ctx = context();
     let document = std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -215,7 +216,7 @@ fn an_rsa_jwk_is_the_document_its_numbers_came_from_and_numbers_that_disagree_ar
 }
 
 #[test]
-fn a_keyed_hash_returns_under_the_hash_its_name_names() {
+fn a_keyed_hash_is_computed_with_the_hash_function_named_by_its_argument() {
     let mut ctx = context();
     let key = sealed(&mut ctx, b"key", false);
     let hmac = |ctx: &mut Ctx, hash: &str| {
@@ -323,7 +324,7 @@ fn sealing(
 }
 
 #[test]
-fn a_sealed_message_opens_under_its_key_alone() {
+fn a_sealed_message_opens_with_the_same_key_and_fails_with_a_wrong_key_or_cipher() {
     let mut ctx = context();
     for (cipher, nonce) in [
         ("aes-256-gcm", 12),
@@ -354,7 +355,7 @@ fn a_sealed_message_opens_under_its_key_alone() {
 }
 
 #[test]
-fn a_signature_and_a_public_key_are_found_under_their_scheme() {
+fn a_signature_and_a_public_key_are_produced_and_verified_for_the_named_scheme() {
     let mut ctx = context();
     let seed = sealed(&mut ctx, &[5; 32], false);
     let public = |ctx: &mut Ctx, scheme: &str, key: Word| {
@@ -393,7 +394,7 @@ fn a_signature_and_a_public_key_are_found_under_their_scheme() {
 }
 
 #[test]
-fn two_keys_agree_on_one_secret_and_a_point_of_small_order_on_none() {
+fn two_keys_agree_on_one_shared_secret_and_a_low_order_point_yields_no_secret() {
     let mut ctx = context();
     assert_eq!(of_name(&mut ctx, "crypto_agrees", "x25519"), 1);
     assert_eq!(of_name(&mut ctx, "crypto_agrees", "p384"), 0);

@@ -50,7 +50,7 @@ fn body(run: unsafe fn(*mut Ctx, usize), scheduler: *mut Scheduler) -> Body {
 }
 
 #[test]
-fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
+fn a_task_runs_on_its_own_stack_until_it_pauses_and_continues_from_there_when_resumed() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -72,7 +72,7 @@ fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
 }
 
 #[test]
-fn tasks_interleave_through_their_loop_each_where_it_stopped() {
+fn tasks_take_turns_in_the_scheduler_loop_and_each_continues_where_it_paused() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, false);
     let r: *mut Scheduler = &mut *scheduler;
@@ -103,7 +103,8 @@ unsafe fn breaks(ctx: *mut Ctx, _: usize) {
 }
 
 #[test]
-fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
+fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_restore_recreates_the_failure()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let mut scheduler = Scheduler::open(c, true);
@@ -136,7 +137,8 @@ unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
 }
 
 #[test]
-fn a_scheduler_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
+fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_most_tasks_that_ran_at_once()
+ {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, false);
     let r: *mut Scheduler = &mut *scheduler;
@@ -174,7 +176,8 @@ fn a_scheduler_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
 }
 
 #[test]
-fn a_task_the_scheduler_never_ran_lets_go_of_its_body() {
+fn freeing_a_task_that_never_ran_releases_its_closure_and_dropping_the_scheduler_releases_the_rest()
+{
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -196,7 +199,7 @@ unsafe fn acquires(_ctx: *mut Ctx, scheduler: usize) {
 }
 
 #[test]
-fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
+fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_the_acquire_ends() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -220,7 +223,8 @@ fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
 }
 
 #[test]
-fn a_schedulers_failure_reads_as_the_scheduler_writes_it() {
+fn failure_bytes_from_the_scheduler_decode_into_a_diagnostic_and_an_unknown_code_or_truncated_bytes_fail()
+ {
     let ctx = context();
     let bytes = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
     let d = failure_of(&ctx, bytes).expect("it reads");
@@ -242,7 +246,7 @@ fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
 }
 
 #[test]
-fn a_watched_ticket_wakes_the_park_and_its_result_is_taken_in_bytes() {
+fn waiting_on_watched_jobs_returns_when_one_finishes_and_reports_that_job_s_id_as_bytes() {
     let mut ctx = context();
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
@@ -284,7 +288,7 @@ fn a_watched_ticket_wakes_the_park_and_its_result_is_taken_in_bytes() {
 }
 
 #[test]
-fn a_ticket_another_run_handed_out_is_rejected() {
+fn watching_a_job_id_from_another_run_returns_0_and_sets_a_failure_on_the_context() {
     let mut ctx = context();
     ctx.set_host(
         Arc::new(ply_core::HostBinding::unbound()),
@@ -341,7 +345,7 @@ fn let_go(ctx: &mut Ctx, w: Word) {
 }
 
 #[test]
-fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
+fn the_effects_a_step_accessed_are_returned_encoded_as_bytes_and_then_cleared() {
     let mut ctx = context();
     ctx.accesses.push((
         tasks::Touched::Effect {
@@ -370,7 +374,8 @@ fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
 }
 
 #[test]
-fn a_kept_value_opens_at_the_type_it_was_kept_at_and_fails_the_run_at_another() {
+fn a_value_saved_with_rt_keep_opens_as_its_saved_type_and_opening_it_as_another_type_sets_a_failure()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let k = word_of(unsafe { tasks::rt_keep(c, handed(42), &INTS) });
@@ -470,7 +475,8 @@ fn started(
 }
 
 #[test]
-fn a_task_runs_its_body_with_the_words_its_maker_held_and_returns_into_its_handle() {
+fn a_started_task_runs_its_body_with_its_descriptor_and_captured_values_and_stores_the_result_in_its_handle()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let descriptor = [1, 0, -1];
@@ -500,7 +506,8 @@ fn a_task_runs_its_body_with_the_words_its_maker_held_and_returns_into_its_handl
 }
 
 #[test]
-fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes_it() {
+fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_span_and_can_be_resumed_to_unwind_or_fail()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     (ctx.performed_root, ctx.performed_start, ctx.performed_end) = (9, 10, 11);

@@ -95,7 +95,7 @@ fn rendered(diagnostic: &Diagnostic) -> String {
 }
 
 #[test]
-fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
+fn tracing_spans_from_two_unrelated_entry_points_never_become_the_parent_of_each_other() {
     let d = driver();
     let a = entry_point();
     let b = entry_point();
@@ -210,7 +210,8 @@ fn a_task_resumed_later_records_under_the_span_it_opened() {
 }
 
 #[test]
-fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work() {
+fn the_span_id_a_program_gets_from_entering_a_span_does_not_change_when_an_unrelated_entry_point_enters_spans()
+ {
     let d = driver();
     let alone = d.enter(entry_point(), "orders", "place_order");
 
@@ -239,7 +240,7 @@ fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work(
 }
 
 #[test]
-fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
+fn an_unbalanced_exit_is_diagnosed_using_only_the_spans_of_its_own_entry_point() {
     let program_span = 1;
 
     let d = driver();
@@ -283,7 +284,7 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
 }
 
 #[test]
-fn a_span_open_on_another_task_of_the_same_entry_point_still_names_it() {
+fn exiting_a_span_opened_on_another_task_of_the_same_entry_point_fails_and_names_that_task() {
     let d = driver();
     let mine = entry_point();
     let theirs = d.enter(mine.in_task(1), "orders", "place_order");
@@ -335,7 +336,7 @@ fn snapshot(entries: &[(&str, &str, bool)]) -> Snapshot {
 }
 
 #[test]
-fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
+fn every_entry_point_reads_one_shared_configuration_and_no_read_can_change_it() {
     let before = snapshot(&[
         ("SERVICE_REGION", "eu", false),
         ("SERVICE_PORT", "8137", false),
@@ -401,7 +402,7 @@ fn until_phase_two(shutdown: &Arc<Shutdown>) {
 }
 
 #[test]
-fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
+fn a_stop_requested_on_one_run_does_not_stop_any_other_run() {
     let asked = Shutdown::new(Bounds::default());
     let untouched = Shutdown::new(Bounds::default());
     assert!(asked.request(ShutdownSignal::Terminate));
@@ -422,7 +423,7 @@ fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
 }
 
 #[test]
-fn a_host_with_no_coordinator_is_never_stopping() {
+fn a_host_created_without_a_shutdown_object_never_reports_that_it_is_stopping() {
     let stopping = Shutdown::new(Bounds::default());
     assert!(stopping.request(ShutdownSignal::Interrupt));
     until_phase_two(&stopping);
@@ -444,7 +445,8 @@ fn a_host_with_no_coordinator_is_never_stopping() {
 }
 
 #[test]
-fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
+fn a_shutdown_signal_received_before_the_tcp_network_is_registered_still_makes_accept_return_zero()
+{
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
         drain: Duration::from_secs(5),
@@ -492,7 +494,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
 }
 
 #[test]
-fn a_signal_after_the_coordinator_is_wired_stops_accept() {
+fn a_shutdown_signal_received_after_the_tcp_network_is_registered_makes_accept_return_zero() {
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
         drain: Duration::from_secs(5),
@@ -512,7 +514,7 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
 }
 
 #[test]
-fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop() {
+fn the_connection_counts_in_the_shutdown_message_are_recorded_before_the_run_sees_the_stop() {
     use std::sync::atomic::AtomicUsize;
 
     struct SlowToWake {

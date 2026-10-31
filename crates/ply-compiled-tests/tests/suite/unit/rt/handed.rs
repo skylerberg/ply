@@ -106,7 +106,7 @@ fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
 }
 
 #[test]
-fn an_unhandled_raise_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
+fn an_effect_with_no_handler_fails_the_run_with_its_value_in_the_error_and_frees_that_value() {
     let mut ctx = naming(&["m", "boom"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -127,7 +127,7 @@ fn an_unhandled_raise_shows_its_payload_lowered_through_its_type_and_lets_it_go(
 type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 
 #[test]
-fn an_unhandled_raise_waits_for_the_code_whose_clause_handles_its_operation() {
+fn a_raised_effect_is_caught_only_by_a_handler_for_the_same_operation() {
     let mut ctx = naming(&["m", "boom", "other"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -146,7 +146,7 @@ fn an_unhandled_raise_waits_for_the_code_whose_clause_handles_its_operation() {
 }
 
 #[test]
-fn an_unhandled_panic_says_its_message_lowered_through_its_type() {
+fn an_unhandled_panic_fails_the_entry_with_its_message_text() {
     let mut ctx = naming(&["abort", "raise"]);
     ctx.begin();
     let message: &str = "it broke";
@@ -157,7 +157,7 @@ fn an_unhandled_panic_says_its_message_lowered_through_its_type() {
 }
 
 #[test]
-fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go() {
+fn performing_an_operation_with_no_handler_fails_naming_it_and_frees_its_arguments() {
     let mut ctx = naming(&["m", "ask"]);
     ctx.begin();
     let arg = boxed(&mut ctx, 7);
@@ -251,7 +251,7 @@ fn bracket(ctx: &mut Ctx, acquire_desc: &'static PlyFnDesc) -> Word {
 }
 
 #[test]
-fn a_bracket_of_emitted_closures_cleans_up_what_it_acquired_and_lets_every_closure_go() {
+fn bracket_runs_its_cleanup_after_acquiring_and_frees_every_closure_the_compiler_generated() {
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
@@ -267,7 +267,7 @@ unsafe extern "C" fn acquire_six(ctx: *mut Ctx, _f: Word, _args: *const Word) ->
 }
 
 #[test]
-fn a_bracket_cleans_up_after_a_body_that_unwinds() {
+fn bracket_cleans_up_what_it_acquired_after_a_body_that_unwinds() {
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
@@ -307,7 +307,7 @@ static STRING_T: PlyType = PlyType {
 type LabelString = unsafe extern "C" fn(*mut Ctx, Word, *const PlyType) -> Word;
 
 #[test]
-fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
+fn the_operation_label_matched_by_a_handler_is_converted_to_a_string_and_then_freed() {
     let mut ctx = naming(&["m", "ask", "*", "files"]);
     ctx.begin();
     LIFTED.with(|l| l.borrow_mut().clear());

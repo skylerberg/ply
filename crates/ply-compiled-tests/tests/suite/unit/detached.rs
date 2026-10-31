@@ -261,7 +261,8 @@ fn failure(ctx: *mut Ctx) -> String {
 const TOKEN: (bool, bool) = (true, true);
 
 #[test]
-fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
+fn resuming_a_suspended_computation_once_lets_it_run_to_the_end_and_releases_every_resource_exactly_once()
+ {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
@@ -280,7 +281,8 @@ fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
 }
 
 #[test]
-fn a_second_resumption_of_a_stop_is_rejected_and_everything_comes_back_once() {
+fn resuming_a_suspended_computation_a_second_time_fails_and_every_resource_is_still_released_exactly_once()
+ {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
@@ -298,7 +300,7 @@ fn a_second_resumption_of_a_stop_is_rejected_and_everything_comes_back_once() {
 }
 
 #[test]
-fn a_body_whose_continuation_dies_unresumed_gives_back_what_it_held_once() {
+fn dropping_a_suspended_computation_without_resuming_it_releases_its_resources_exactly_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
@@ -316,7 +318,8 @@ fn a_body_whose_continuation_dies_unresumed_gives_back_what_it_held_once() {
 }
 
 #[test]
-fn an_entry_ending_with_a_body_suspended_gives_back_what_it_held_once() {
+fn ending_an_entry_call_while_a_computation_is_still_suspended_releases_the_resources_of_that_computation_exactly_once()
+ {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {

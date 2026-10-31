@@ -135,7 +135,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
 }
 
 #[test]
-fn a_queued_pool_handles_more_operations_than_a_thread_each_would_be_given() {
+fn a_queued_pool_handles_more_operations_than_it_has_threads() {
     let pool = Pool::queued(2);
     let asking = run();
     let asked: Vec<(i64, Pending)> = (0..4 * MAX_BLOCKING_OPERATIONS as i64)
@@ -181,7 +181,7 @@ fn a_queued_pool_runs_no_more_at_once_than_it_has_threads() {
 }
 
 #[test]
-fn a_job_that_panics_fails_its_own_operation_and_the_next_is_handled() {
+fn a_job_that_panics_fails_its_own_operation_without_affecting_the_next_job() {
     for pool in [Pool::queued(1), Pool::new()] {
         let asking = run();
         let broken = pool
@@ -203,7 +203,7 @@ fn a_job_that_panics_fails_its_own_operation_and_the_next_is_handled() {
 }
 
 #[test]
-fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
+fn no_two_pools_create_the_same_token_and_no_pool_creates_a_zero_token() {
     let pools = [Pool::new(), Pool::new(), Pool::queued(1)];
     let asking = run();
     let minted: Vec<Vec<Pending>> = std::thread::scope(|scope| {
@@ -228,7 +228,7 @@ fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
 }
 
 #[test]
-fn a_park_wakes_for_its_own_result_and_not_for_anothers() {
+fn a_run_waiting_on_its_job_wakes_when_that_job_finishes_and_not_when_another_run_s_job_does() {
     let bell = Arc::new(Bell::default());
     let (mine, theirs) = (Run::new(Arc::clone(&bell)), Run::new(Arc::clone(&bell)));
     let pool = Pool::new();
@@ -263,7 +263,7 @@ fn secret(text: &str) -> Kept {
 }
 
 #[test]
-fn a_secret_is_taken_once_and_by_the_run_that_stored_it() {
+fn a_stored_secret_can_be_removed_once_and_only_by_the_run_that_stored_it() {
     let (mine, theirs) = (run(), run());
     let kept = mine.keep_secret(secret("hunter2"));
     assert_ne!(kept, mine.keep_secret(secret("other")));
@@ -279,7 +279,7 @@ fn a_secret_is_taken_once_and_by_the_run_that_stored_it() {
 }
 
 #[test]
-fn a_secret_an_entry_point_did_not_take_is_dropped_when_it_ends() {
+fn a_stored_secret_that_no_entry_point_removed_is_dropped_when_the_entry_point_ends() {
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
     let left = run.keep_secret(secret("hunter2"));

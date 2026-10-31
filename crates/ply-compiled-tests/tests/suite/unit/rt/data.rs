@@ -37,7 +37,7 @@ fn rejected_text(what: Word, p: Option<&[u8]>, q: &[u8]) -> Diagnostic {
 }
 
 #[test]
-fn a_length_rejected_raises_as_the_operation_of_that_length_does() {
+fn a_rejected_length_fails_with_a_message_naming_the_operation_and_the_allowed_range() {
     for (what, name, n) in [
         (0, "Array::new", -1),
         (1, "Columns::new", 1 << 27),
@@ -52,7 +52,7 @@ fn a_length_rejected_raises_as_the_operation_of_that_length_does() {
 }
 
 #[test]
-fn an_index_rejected_raises_as_the_operation_of_that_index_does() {
+fn a_rejected_index_fails_with_a_message_naming_the_operation_and_the_size_of_the_value() {
     for (what, name, n) in [
         (4, "Array::get", 3),
         (5, "Array::set", -1),
@@ -67,7 +67,7 @@ fn an_index_rejected_raises_as_the_operation_of_that_index_does() {
 }
 
 #[test]
-fn an_operation_no_number_names_fails_the_entry_as_plys_fault() {
+fn an_unknown_operation_number_fails_the_entry_as_an_internal_error() {
     for d in [
         rejected(23, 0, 0, 0),
         rejected(-1, 0, 0, 0),
@@ -125,7 +125,8 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
 }
 
 #[test]
-fn a_rejection_is_a_raise_where_its_builtin_raises_and_fails_the_run_where_it_fails() {
+fn a_rejected_argument_raises_a_catchable_effect_for_array_get_bytes_at_and_string_find_but_range_fails_the_run()
+ {
     let numbers = |what: Word, a: Word, b: Word| {
         failed_under_a_clause(|c| unsafe {
             helper::<Rejected>(&builtin_helper_name("?refused"))(c, what, a, b, 0)

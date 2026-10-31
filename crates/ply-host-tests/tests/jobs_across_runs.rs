@@ -29,7 +29,8 @@ fn abandon_a_finished_job() {
 }
 
 #[test]
-fn a_run_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
+fn a_run_still_waits_for_its_own_job_when_an_earlier_run_ended_without_reading_its_finished_job_result()
+ {
     abandon_a_finished_job();
     let rt = unbound()();
     let ticket = submitted(&*rt, Work::Computing, "a hash", || {
@@ -70,7 +71,7 @@ fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
 }
 
 #[test]
-fn one_runs_token_is_none_of_anothers() {
+fn a_run_cannot_watch_or_read_the_result_of_a_job_that_a_different_run_submitted() {
     let factory = unbound();
     let (mine, theirs) = (factory(), factory());
     let ticket = submitted(&*mine, Work::Waiting, "a lookup", || Ok(b"mine".to_vec()));

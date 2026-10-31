@@ -3,7 +3,8 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn a_program_stopped_by_a_signal_is_said_to_be() {
+fn a_program_killed_by_a_signal_returns_a_message_naming_the_signal_and_an_exited_program_returns_no_message()
+ {
     let shell = Path::new("/bin/sh");
     let stopped = Command::new(shell)
         .args(["-c", "kill -SEGV $$"])

@@ -11,7 +11,8 @@ fn line_col_is_one_based_and_char_counted() {
 }
 
 #[test]
-fn a_span_is_bounded_by_its_texts_length_alone() {
+fn a_span_past_the_end_of_the_text_or_reversed_has_an_empty_snippet_and_a_span_cutting_a_character_gives_a_replacement_character()
+ {
     let mut sm = SourceMap::new();
     let id = sm.add("t.ply", "fn f() = \"é\"\n");
     for outside in [Span::new(id, 21, 26), Span::new(id, 5, 2)] {
@@ -54,7 +55,8 @@ fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
 }
 
 #[test]
-fn a_placed_diagnostic_keeps_each_label_it_can_place_as_a_note() {
+fn placing_a_diagnostic_turns_each_label_that_has_a_source_span_into_a_note_with_file_line_and_column_and_drops_the_others()
+ {
     let mut sources = SourceMap::new();
     let id = sources.add("app/m.ply", "fn f() -> Int = 1\nfn g() -> Int = \"x\"\n");
     let d = Diagnostic::error(codes::RUNTIME_ERROR, "type mismatch")

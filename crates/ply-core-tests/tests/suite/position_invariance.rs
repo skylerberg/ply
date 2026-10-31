@@ -142,7 +142,7 @@ fn digest(src: &str) -> String {
 }
 
 #[test]
-fn the_pairs_are_the_five_shapes_they_say_they_are() {
+fn in_each_pair_the_two_programs_differ_and_no_two_pairs_share_the_same_worst_case_program() {
     let pairs = all_pairs();
     assert_eq!(pairs.len(), EXPECTED_PAIRS, "a pair was lost or gained");
 

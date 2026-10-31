@@ -145,7 +145,7 @@ fn left_apart(ctx: &mut Ctx) -> Word {
 }
 
 #[test]
-fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
+fn a_block_entered_on_a_parallel_branch_runs_on_its_own_thread_without_touching_the_outer_blocks() {
     if !multicore() {
         return;
     }
@@ -168,7 +168,7 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
 }
 
 #[test]
-fn branches_emitted_code_made_return_in_their_slots_and_are_let_go() {
+fn parallel_branches_store_their_results_in_their_slots_and_free_their_closures() {
     let mut ctx = context();
     ctx.begin();
     let [a, b] = branches(&mut ctx, [&FIRST, &SECOND]);
@@ -181,7 +181,7 @@ fn branches_emitted_code_made_return_in_their_slots_and_are_let_go() {
 }
 
 #[test]
-fn a_branch_marshalled_across_threads_is_marked_by_its_descriptor() {
+fn a_closure_sent_to_another_thread_has_its_captured_values_found_through_its_layout_table() {
     if !multicore() {
         return;
     }
@@ -200,7 +200,7 @@ fn a_branch_marshalled_across_threads_is_marked_by_its_descriptor() {
 }
 
 #[test]
-fn a_failing_branch_in_turn_leaves_0_and_those_after_it_are_let_go_unrun() {
+fn when_a_parallel_branch_fails_its_result_is_0_and_the_later_branches_are_freed_without_running() {
     let mut ctx = context();
     ctx.begin();
     let slots = branches(&mut ctx, [&FAILS_HERE, &UNRUN]);
@@ -213,7 +213,7 @@ fn a_failing_branch_in_turn_leaves_0_and_those_after_it_are_let_go_unrun() {
 }
 
 #[test]
-fn a_branch_that_returned_past_one_that_failed_is_left_for_emitted_code() {
+fn a_branch_that_returns_after_another_branch_failed_still_returns_its_result_in_its_slot() {
     if !multicore() {
         return;
     }

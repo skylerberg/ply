@@ -266,7 +266,7 @@ fn encoded(x: f64) -> Vec<u8> {
 }
 
 #[test]
-fn a_nan_reads_as_the_one_nan_whatever_bits_made_it() {
+fn every_nan_bit_pattern_becomes_the_same_canonical_nan_for_bits_ordering_and_encoding() {
     for nan in [
         f64::NAN,
         -f64::NAN,

@@ -2,7 +2,7 @@
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
 #[test]
-fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
+fn the_count_allocations_flag_is_found_anywhere_in_the_arguments_and_removed_from_them() {
     for line in [
         vec!["--count-allocations=out.json", "run", "p.ply"],
         vec!["run", "--count-allocations=out.json", "p.ply"],
@@ -44,14 +44,15 @@ fn the_count_allocations_flag_requires_a_path() {
 }
 
 #[test]
-fn a_line_without_the_flag_keeps_its_words() {
+fn arguments_without_the_count_allocations_flag_are_returned_unchanged() {
     let mut argv: Vec<String> = ["run", "p.ply"].iter().map(|s| s.to_string()).collect();
     assert!(ply_launcher::count::flag(&mut argv).unwrap().is_none());
     assert_eq!(argv, vec!["run".to_string(), "p.ply".to_string()]);
 }
 
 #[test]
-fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
+fn count_window_counts_the_allocations_made_by_the_function_it_calls_and_lists_allocation_sites_only_when_asked()
+ {
     let (result, counted, sites) = ply_launcher::count::window(
         || {
             let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
@@ -119,7 +120,7 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
 }
 
 #[test]
-fn the_sites_flags_choose_between_every_allocation_and_a_sample() {
+fn the_allocation_sites_flags_choose_between_recording_every_allocation_and_recording_a_sample() {
     for (line, exact) in [
         (vec!["run", "--count-allocation-sites=out.json"], false),
         (vec!["run", "--count-allocation-sites-exact=out.json"], true),
@@ -157,7 +158,7 @@ fn the_sites_flags_choose_between_every_allocation_and_a_sample() {
 }
 
 #[test]
-fn the_sample_does_not_fall_on_one_period_of_the_window() {
+fn sampled_allocations_are_not_spaced_at_a_fixed_interval() {
     let every = ply_launcher::count::SAMPLED;
     let hits: Vec<u64> = (0..(1u64 << 20))
         .filter(|n| ply_launcher::count::sampled_nth(*n, every))

@@ -44,7 +44,7 @@ fn a_span_opened_inside_another_names_it_as_its_parent() {
 }
 
 #[test]
-fn closing_an_outer_span_abandons_every_span_above_it_innermost_first() {
+fn closing_an_outer_span_also_closes_the_spans_opened_inside_it_and_returns_them_innermost_first() {
     let mut spans = Spans::new();
     let owner = (machine(), None);
     let outer = enter(&mut spans, owner, "orders", "place_order");
@@ -72,7 +72,7 @@ fn closing_an_outer_span_abandons_every_span_above_it_innermost_first() {
 }
 
 #[test]
-fn two_tasks_of_one_machine_keep_separate_stacks() {
+fn two_tasks_of_one_program_run_keep_separate_span_stacks() {
     let mut spans = Spans::new();
     let id = machine();
     let first = (id, Some(TaskId(1)));
@@ -119,7 +119,7 @@ fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
 }
 
 #[test]
-fn the_three_ways_an_exit_names_a_span_that_is_not_open_are_told_apart() {
+fn exiting_a_span_returns_a_different_error_for_already_closed_never_opened_and_wrong_channel() {
     let mut spans = Spans::new();
     let owner = (machine(), None);
     let opened = enter(&mut spans, owner, "http", "request");
@@ -146,7 +146,7 @@ fn the_three_ways_an_exit_names_a_span_that_is_not_open_are_told_apart() {
 }
 
 #[test]
-fn teardown_closes_this_machines_spans_and_leaves_every_other_machines_alone() {
+fn ending_a_program_closes_its_own_open_spans_and_leaves_other_programs_spans_open() {
     let mut spans = Spans::new();
     let mine = machine();
     let theirs = machine();
@@ -184,7 +184,7 @@ fn teardown_reports_the_innermost_span_first() {
 }
 
 #[test]
-fn a_retired_task_closes_its_own_spans_innermost_first_and_nothing_else() {
+fn ending_a_task_closes_only_that_tasks_open_spans_innermost_first() {
     let mut spans = Spans::new();
     let mine = machine();
     let retired = (mine, Some(TaskId(1)));
@@ -218,7 +218,7 @@ fn a_retired_task_closes_its_own_spans_innermost_first_and_nothing_else() {
 }
 
 #[test]
-fn retiring_a_task_that_closed_every_span_drops_its_stack() {
+fn ending_a_task_whose_spans_are_all_closed_removes_its_span_stack_and_reports_no_unclosed_spans() {
     let mut spans = Spans::new();
     let mine = machine();
     let owner = (mine, Some(TaskId(1)));
@@ -234,7 +234,7 @@ fn retiring_a_task_that_closed_every_span_drops_its_stack() {
 }
 
 #[test]
-fn ten_thousand_retired_tasks_each_abandoning_a_span_keep_the_summary_bounded() {
+fn ten_thousand_ended_tasks_that_left_spans_open_record_a_bounded_list_of_span_names_and_a_count() {
     let mut spans = Spans::new();
     let mine = machine();
     for task in 0..10_000 {
@@ -263,7 +263,8 @@ fn ten_thousand_retired_tasks_each_abandoning_a_span_keep_the_summary_bounded() 
 }
 
 #[test]
-fn an_entry_points_own_spans_are_named_before_its_retired_tasks_and_no_other_machines() {
+fn ending_a_program_lists_its_own_open_spans_before_those_left_by_its_ended_tasks_and_ignores_other_programs()
+ {
     let mut spans = Spans::new();
     let mine = machine();
     let theirs = machine();

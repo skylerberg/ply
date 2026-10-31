@@ -2,7 +2,7 @@ use ply_core::Span;
 use ply_core::rc::*;
 
 #[test]
-fn arming_site_recording_clears_what_the_last_caller_left() {
+fn turning_on_recording_of_update_sites_clears_the_update_sites_recorded_before() {
     let span = Span::new(ply_core::SourceId(0), 0, 1);
     record_sites(true);
     note_update_of(true, 0, span);

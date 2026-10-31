@@ -53,7 +53,8 @@ fn boxed(ctx: &mut Ctx) -> Word {
 }
 
 #[test]
-fn a_carried_value_is_counted_and_let_go_through_its_type() {
+fn a_carried_value_adds_a_reference_when_duplicated_and_frees_its_block_when_the_last_reference_is_released()
+ {
     let mut ctx = context();
     let w = boxed(&mut ctx);
     let held = unsafe { Carried::new(Handed::of(w), &BOX) };
@@ -72,7 +73,8 @@ fn a_carried_value_is_counted_and_let_go_through_its_type() {
 }
 
 #[test]
-fn a_carried_value_handed_back_is_the_word_and_the_count_it_came_with() {
+fn a_carried_value_converted_back_into_a_raw_word_gives_the_same_word_and_the_same_reference_count_it_was_created_with()
+ {
     let mut ctx = context();
     let w = boxed(&mut ctx);
     let held = unsafe { Carried::new(Handed::of(w), &BOX) };

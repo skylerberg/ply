@@ -61,7 +61,7 @@ fn decimal_words(d: Decimal) -> (Word, Word) {
 }
 
 #[test]
-fn the_natives_write_what_the_codec_writes() {
+fn the_native_output_functions_write_the_same_bytes_as_the_encoder_for_every_kind_of_value() {
     let mut ctx = context();
     let d = Decimal::new(-12345, 3);
     let bytes = lowered(&mut ctx, |ctx| unsafe {
@@ -121,7 +121,7 @@ fn block(rc: u32) -> Box<[u64; 2]> {
 }
 
 #[test]
-fn a_value_written_twice_is_written_again() {
+fn a_value_that_appears_twice_is_serialized_completely_each_time_and_is_not_shared() {
     let mut ctx = context();
     let (a, b) = (block(1), block(1));
     let (shared, inner) = (a.as_ptr() as Word, b.as_ptr() as Word);
@@ -168,7 +168,7 @@ fn a_value_written_twice_is_written_again() {
 }
 
 #[test]
-fn a_static_is_written_whole_each_time_a_lowering_shares() {
+fn an_immortal_value_that_appears_twice_is_serialized_completely_each_time() {
     let mut ctx = context();
     let s = block(ply_compiled::heap::IMMORTAL);
     let w = s.as_ptr() as Word;
@@ -190,7 +190,7 @@ fn a_static_is_written_whole_each_time_a_lowering_shares() {
 }
 
 #[test]
-fn the_natives_read_what_the_codec_writes() {
+fn the_native_input_functions_read_back_every_kind_of_value_the_encoder_writes() {
     let mut ctx = context();
     let d = Decimal::new(271828, 5);
     let bytes = written(|w| {
@@ -241,7 +241,7 @@ fn the_natives_read_what_the_codec_writes() {
 }
 
 #[test]
-fn a_descriptors_rejection_fails_the_entry() {
+fn helpers_that_reject_a_type_descriptor_make_the_current_entry_fail_with_a_reason() {
     for (rejection, said) in [
         ("rt_never_lifted", "lifts only a `String`"),
         ("rt_never_shown", "does not lower it"),
@@ -276,7 +276,7 @@ fn lift_and(bytes: &[u8], read: impl FnOnce(*mut Ctx)) -> String {
 }
 
 #[test]
-fn bytes_that_do_not_read_as_the_type_fail_the_context() {
+fn reading_bytes_that_do_not_match_the_expected_type_fails_with_a_diagnostic() {
     let int = written(|w| w.int(3));
     let said = lift_and(&int, |c| unsafe {
         native::<A0>("?in_float")(c);
@@ -300,7 +300,7 @@ fn bytes_that_do_not_read_as_the_type_fail_the_context() {
 }
 
 #[test]
-fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
+fn a_128_bit_value_is_read_as_a_low_word_and_its_high_word_is_read_right_after() {
     let mut ctx = context();
     let wide = (5u128 << 64) | 9;
     let bytes = written(|w| {
@@ -336,7 +336,7 @@ fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
 }
 
 #[test]
-fn a_128_bit_widths_two_words_box_as_its_two_words() {
+fn rt_box_wide_boxes_a_128_bit_integer_from_two_words_and_fails_for_narrower_widths() {
     let boxed: A3 = helper("rt_box_wide");
     let mut ctx = context();
     for (ty, bits) in [
@@ -355,7 +355,8 @@ fn a_128_bit_widths_two_words_box_as_its_two_words() {
 }
 
 #[test]
-fn marshalling_inside_marshalling_leaves_the_outer_as_it_was() {
+fn encoding_or_decoding_a_value_in_the_middle_of_another_encoding_leaves_the_outer_encoding_unchanged()
+ {
     let mut ctx = context();
     let inner_bytes = written(|w| w.int(7));
     let mut written_inside = Vec::new();
@@ -388,7 +389,7 @@ fn marshalling_inside_marshalling_leaves_the_outer_as_it_was() {
 }
 
 #[test]
-fn a_value_written_with_no_lowering_open_fails_the_context() {
+fn writing_a_value_with_no_encoding_started_fails_with_a_diagnostic() {
     let mut ctx = context();
     unsafe { native::<N1>("?out_int")(&mut ctx, 1) };
     let said = ctx.take_failure().expect("a diagnostic").message;
@@ -443,7 +444,7 @@ unsafe extern "C" fn lower_pair(ctx: *mut Ctx, w: Word) -> Word {
 }
 
 #[test]
-fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
+fn the_encoding_of_a_value_for_a_diagnostic_never_contains_the_bytes_of_a_secret() {
     let mut ctx = context();
     let secret = sealed(&mut ctx, b"hunter2", true);
     let c: *mut Ctx = &mut ctx;
@@ -500,7 +501,7 @@ fn a_failed_assertion_raises_showing_the_expected_value_then_the_actual() {
 }
 
 #[test]
-fn a_function_the_program_wrote_crosses_by_its_name() {
+fn a_function_written_by_the_program_is_encoded_as_its_name() {
     let mut ctx = context();
     let name = b"m.double";
     let named = lowered(&mut ctx, |c| unsafe {
@@ -515,7 +516,7 @@ fn a_function_the_program_wrote_crosses_by_its_name() {
 }
 
 #[test]
-fn taken_bytes_are_copied_out_at_their_count_alone() {
+fn copying_out_fewer_bytes_than_were_encoded_fails_with_a_diagnostic() {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let mut out = [0u8; 4];
@@ -531,7 +532,7 @@ fn taken_bytes_are_copied_out_at_their_count_alone() {
 }
 
 #[test]
-fn handed_words_are_the_words_compiled_code_passes() {
+fn the_handed_type_returned_from_helpers_is_a_plain_machine_word_like_compiled_code_uses() {
     assert_eq!(
         unsafe { std::mem::transmute::<Handed, Word>(<Handed as Returned>::of(5)) },
         5
@@ -543,7 +544,7 @@ fn resumes(w: &mut Writer) {
 }
 
 #[test]
-fn data_holding_no_continuation_has_no_way_to_one() {
+fn continuation_in_returns_no_continuation_for_encoded_data_that_has_none() {
     let bytes = written(|w| {
         w.count(tag::LIST, 4);
         w.int(1);
@@ -555,7 +556,7 @@ fn data_holding_no_continuation_has_no_way_to_one() {
 }
 
 #[test]
-fn the_way_to_a_continuation_reads_outermost_first() {
+fn continuation_in_returns_the_location_of_a_continuation_as_steps_listed_from_the_outside_in() {
     let bytes = written(|w| {
         w.count(tag::LIST, 2);
         w.int(0);
@@ -579,7 +580,8 @@ fn the_way_to_a_continuation_reads_outermost_first() {
 }
 
 #[test]
-fn a_continuation_is_found_past_every_kind_of_part_before_it() {
+fn continuation_in_finds_a_continuation_after_arrays_maps_floats_chars_decimals_and_function_tables()
+ {
     let bytes = written(|w| {
         w.count(tag::ARRAY, 1);
         w.count(tag::MAP, 2);

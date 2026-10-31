@@ -93,7 +93,7 @@ unsafe extern "C" fn seven(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_value_its_keep_root_rejects_is_cached_nowhere_and_each_read_evaluates_it() {
+fn a_constant_whose_cache_check_rejects_its_value_is_not_cached_and_is_recomputed_on_each_read() {
     let mut ctx = defining(seven);
     let c: *mut Ctx = &mut ctx;
     let first = read(c, keeps_nothing);
@@ -135,7 +135,7 @@ fn an_evaluation_that_fails_returns_0_caches_nothing_and_the_next_read_evaluates
 }
 
 #[test]
-fn a_definition_outside_the_code_table_fails_the_context() {
+fn reading_a_definition_index_outside_the_code_table_fails_with_a_diagnostic() {
     let mut ctx = defining(seven);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(unsafe { helper::<Memo>("rt_memo")(c, 3, keep_box) }, 0);
@@ -196,7 +196,7 @@ type Entered = unsafe extern "C" fn(*mut Ctx) -> Word;
 type Left = unsafe extern "C" fn(*mut Ctx, Word);
 
 #[test]
-fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
+fn the_scheduler_blocks_stay_separate_from_the_program_blocks_at_any_nesting_depth() {
     let mut ctx = context_of(&[], Vec::new());
     ctx.begin();
     let c: *mut Ctx = &mut ctx;
@@ -258,7 +258,7 @@ unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
+fn an_effect_raised_inside_a_constant_fails_the_run_with_an_error_that_no_handler_can_catch() {
     let mut ctx = defining(failing);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(read_const(c), 0);

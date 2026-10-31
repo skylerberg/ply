@@ -171,7 +171,7 @@ fn laid(stack: &Stack, sp: usize) -> *mut PlyFrame {
 }
 
 #[test]
-fn the_chain_head_follows_the_eight_fields_every_unit_reads_and_a_record_is_two_words() {
+fn the_frame_list_in_the_context_struct_is_at_byte_64_and_each_frame_struct_is_16_bytes() {
     use std::mem::offset_of;
     assert_eq!(offset_of!(Ctx, frames), 64);
     assert_eq!(size_of::<PlyFrame>(), 16);
@@ -180,7 +180,7 @@ fn the_chain_head_follows_the_eight_fields_every_unit_reads_and_a_record_is_two_
 }
 
 #[test]
-fn a_live_chain_released_lets_go_of_every_record_once() {
+fn releasing_a_live_frame_list_releases_every_frame_exactly_once() {
     let mut ctx = context();
     let stack = Stack::take().expect("the system maps a stack");
     let head = laid(&stack, stack.top() - 4096);
@@ -189,7 +189,7 @@ fn a_live_chain_released_lets_go_of_every_record_once() {
 }
 
 #[test]
-fn a_chain_with_no_record_walks_nothing() {
+fn releasing_frames_from_a_null_frame_list_or_an_empty_frame_list_releases_nothing() {
     let mut ctx = context();
     for head in [std::ptr::null_mut(), base()] {
         unsafe { release_live(&mut ctx, head) };
@@ -198,7 +198,7 @@ fn a_chain_with_no_record_walks_nothing() {
 }
 
 #[test]
-fn a_runtime_frames_record_lets_go_of_each_slot_as_its_kind_is_counted() {
+fn a_runtime_frame_is_added_to_the_frame_list_during_its_call_and_releases_each_slot_by_its_type() {
     let mut owned = context();
     owned.frames = base();
     let ctx = &raw mut owned;
@@ -228,7 +228,7 @@ fn a_runtime_frames_record_lets_go_of_each_slot_as_its_kind_is_counted() {
 }
 
 #[test]
-fn a_runtime_frame_abandoned_under_its_call_lets_go_of_each_slot_once() {
+fn releasing_the_live_frame_list_in_the_middle_of_a_call_releases_every_slot_once() {
     let mut owned = context();
     owned.frames = base();
     let ctx = &raw mut owned;
@@ -242,7 +242,7 @@ fn a_runtime_frame_abandoned_under_its_call_lets_go_of_each_slot_once() {
 }
 
 #[test]
-fn a_runtime_frame_on_a_stack_that_records_nothing_links_nothing() {
+fn a_call_with_no_slots_to_release_adds_no_runtime_frame_to_the_frame_list() {
     let mut owned = context();
     let ctx = &raw mut owned;
     let (linked, []) = unsafe { held_across(ctx, [], || !(*ctx).frames.is_null()) };

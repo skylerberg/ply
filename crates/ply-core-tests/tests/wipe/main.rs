@@ -347,7 +347,7 @@ fn a_dropped_secret_leaves_no_copy_of_its_bytes_on_the_heap() {
 }
 
 #[test]
-fn the_watch_sees_a_plain_copy_freed_unwiped() {
+fn the_memory_wipe_watch_reports_a_freed_ordinary_copy_of_a_value_as_never_zeroed() {
     let _one = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

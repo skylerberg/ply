@@ -116,7 +116,7 @@ impl Net {
 }
 
 #[test]
-fn a_connection_knows_both_its_ends_and_carries_bytes_each_way() {
+fn a_connection_reports_its_local_and_peer_addresses_and_carries_bytes_in_both_directions() {
     let net = Net::new();
     let (listener, here) = net.listening(loopback());
     let (client, server) = net.joined(listener, &here);
@@ -150,7 +150,7 @@ fn a_connection_knows_both_its_ends_and_carries_bytes_each_way() {
 }
 
 #[test]
-fn a_connection_where_nothing_listens_is_refused_and_a_bound_address_binds_once() {
+fn connecting_to_an_address_with_no_listener_fails_and_listening_on_a_used_address_fails() {
     let net = Net::new();
     let (listener, here) = net.listening(loopback());
     assert_eq!(
@@ -163,7 +163,7 @@ fn a_connection_where_nothing_listens_is_refused_and_a_bound_address_binds_once(
 }
 
 #[test]
-fn an_ipv6_connection_knows_both_its_ends_where_the_machine_has_ipv6() {
+fn an_ipv6_connection_reports_its_local_and_peer_addresses_where_the_machine_supports_ipv6() {
     let net = Net::new();
     let six = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let Ok(listening) = outcome(net.host.listen_on("listener", &at(six, 0), &[])) else {
@@ -180,7 +180,7 @@ fn an_ipv6_connection_knows_both_its_ends_where_the_machine_has_ipv6() {
 }
 
 #[test]
-fn a_read_shorter_than_what_waits_leaves_the_rest_for_the_next() {
+fn a_read_shorter_than_the_available_bytes_leaves_the_remaining_bytes_for_the_next_read() {
     let net = Net::new();
     let (listener, here) = net.listening(loopback());
     let (client, server) = net.joined(listener, &here);
@@ -266,7 +266,8 @@ fn options_set_as_a_socket_opens_and_afterwards_are_read_back() {
 }
 
 #[test]
-fn a_handle_is_held_to_its_kind_its_label_and_its_lifetime() {
+fn using_a_socket_handle_under_a_different_name_or_as_the_wrong_kind_of_socket_or_after_closing_fails()
+ {
     let net = Net::new();
     let (listener, here) = net.listening(loopback());
     let (client, server) = net.joined(listener, &here);
@@ -308,7 +309,7 @@ fn a_handle_is_held_to_its_kind_its_label_and_its_lifetime() {
 }
 
 #[test]
-fn a_connection_by_name_reaches_a_listener_and_a_name_not_reached_is_none() {
+fn connecting_to_localhost_succeeds_and_connecting_to_an_unresolvable_host_name_returns_none() {
     let net = Net::new();
     let (listener, here) = net.listening(loopback());
     let connecting = net
@@ -354,7 +355,7 @@ mod unix {
     }
 
     #[test]
-    fn a_unix_socket_is_a_path_under_a_root_and_goes_with_its_listener() {
+    fn a_unix_socket_is_a_file_under_its_root_directory_and_is_removed_when_its_listener_closes() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().expect("a temp dir");
         let net = rooted(dir.path());
@@ -431,7 +432,7 @@ mod unix {
     }
 
     #[test]
-    fn a_unix_socket_stays_inside_a_root_the_run_bound() {
+    fn a_unix_socket_path_cannot_leave_its_root_directory_or_use_a_root_name_that_does_not_exist() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let net = rooted(dir.path());
         let escaping = net
@@ -551,7 +552,7 @@ fn certificate(net: &Net, label: &str, conn: i64) -> Option<Vec<u8>> {
 }
 
 #[test]
-fn an_open_connection_is_secured_at_both_ends_and_carries_bytes_after() {
+fn an_open_connection_upgraded_to_tls_is_secured_at_both_ends_and_still_sends_and_receives_bytes() {
     let material = material();
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
@@ -599,7 +600,7 @@ fn an_open_connection_is_secured_at_both_ends_and_carries_bytes_after() {
 }
 
 #[test]
-fn a_connection_presenting_a_credential_is_who_its_server_sees() {
+fn a_socket_presenting_a_credential_shows_its_certificate_to_the_server() {
     let material = material();
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
@@ -775,7 +776,7 @@ fn a_server_the_client_cannot_verify_as_its_name_is_rejected() {
 }
 
 #[test]
-fn a_peer_that_never_handshakes_is_a_deadline_on_the_whole_handshake() {
+fn a_tls_upgrade_times_out_when_the_peer_never_completes_the_handshake() {
     let material = material();
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
@@ -799,7 +800,8 @@ fn a_peer_that_never_handshakes_is_a_deadline_on_the_whole_handshake() {
 }
 
 #[test]
-fn an_upgrade_is_rejected_under_a_read_still_waiting_and_twice() {
+fn a_tls_upgrade_is_rejected_while_a_read_on_the_connection_is_pending_and_when_the_connection_is_already_secured()
+ {
     let material = material();
     let net = material.net(true);
     let (listener, here) = net.listening(loopback());
@@ -929,7 +931,8 @@ fn sent_to(net: &Net, label: &str, socket: i64, to: &Endpoint, payload: &[u8]) -
 }
 
 #[test]
-fn a_datagram_crosses_loopback_names_its_sender_and_says_where_it_was_cut() {
+fn a_datagram_sent_over_loopback_arrives_with_its_sender_address_and_a_truncated_flag_set_when_it_was_cut_to_fit_the_buffer()
+ {
     let net = Net::new();
     let (server, there) = datagram_socket(&net, "socket");
     let (client, here) = datagram_socket(&net, "other");
@@ -1024,7 +1027,7 @@ fn a_datagram_sockets_options_are_set_and_read_back() {
 }
 
 #[test]
-fn the_flat_forms_read_back_as_they_are_written() {
+fn every_socket_option_converts_to_a_flat_list_of_values_and_back_to_the_same_option() {
     let probing = Probing {
         idle: Duration::from_secs(60),
         interval: Some(Duration::from_secs(5)),
@@ -1064,7 +1067,7 @@ fn the_flat_forms_read_back_as_they_are_written() {
 }
 
 #[test]
-fn localhost_resolves_to_loopback_each_address_once_and_a_name_that_cannot_exist_fails() {
+fn localhost_resolves_to_loopback_addresses_without_duplicates_and_an_invalid_host_name_fails() {
     let result = ply_host::dns::lookup("localhost");
     let (kind, rest) = result.split_first().expect("a result");
     assert_eq!(*kind, 1, "every machine names itself");

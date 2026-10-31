@@ -126,7 +126,7 @@ fn bcrypt_returns_jbcrypts_vectors() {
 }
 
 #[test]
-fn bcrypt_reads_seventy_two_bytes_of_a_password() {
+fn bcrypt_uses_only_the_first_seventy_two_bytes_of_a_password() {
     let salt = [7u8; 16];
     let hashed = |secret: &[u8]| password::bcrypt(secret, &salt, 4).expect("within the bounds");
     let long = [b'x'; 80];

@@ -60,7 +60,7 @@ fn a_running_service_has_no_deadline() {
 }
 
 #[test]
-fn the_lead_is_not_charged_to_the_drain() {
+fn the_delay_before_accepting_stops_is_not_counted_against_the_shutdown_grace_period() {
     let shutdown = Shutdown::new(bounds(150, 5_000));
     assert!(shutdown.request(ShutdownSignal::Terminate));
     assert!(shutdown.stopping(), "the flag is set before anything else");
@@ -84,7 +84,7 @@ fn the_lead_is_not_charged_to_the_drain() {
 }
 
 #[test]
-fn a_drain_that_runs_out_says_so() {
+fn a_shutdown_grace_period_that_runs_out_reports_expired_and_has_zero_time_left() {
     let shutdown = Shutdown::new(bounds(0, 30));
     assert!(shutdown.request(ShutdownSignal::Interrupt));
     until_stopped_accepting(&shutdown);
@@ -145,7 +145,7 @@ fn accept_returns_zero_once_the_run_has_stopped_accepting() {
 }
 
 #[test]
-fn the_program_can_still_close_a_listener_the_drain_closed() {
+fn closing_a_listener_that_shutdown_already_closed_succeeds() {
     let host = Arc::new(TcpHost::new());
     let listener = listen(&host, 0);
     let shutdown = Shutdown::new(bounds(0, 5_000));
@@ -158,7 +158,7 @@ fn the_program_can_still_close_a_listener_the_drain_closed() {
 }
 
 #[test]
-fn a_parked_accept_returns_when_the_run_stops_accepting() {
+fn a_blocked_accept_returns_when_the_run_stops_accepting_connections() {
     let host = Arc::new(TcpHost::new());
     let listener = listen(&host, 0);
 
@@ -248,7 +248,7 @@ fn stopping_twice_closes_the_listeners_once() {
 }
 
 #[test]
-fn the_drain_can_still_name_a_listener_it_closed() {
+fn after_accepting_stops_the_host_still_lists_the_address_of_the_listener_it_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let wanted = listener.local_addr().expect("a bound address");
     drop(listener);
@@ -285,7 +285,7 @@ fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
 }
 
 #[test]
-fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
+fn arrived_reports_a_signal_as_received_once_however_many_times_it_was_sent() {
     let shutdown = Shutdown::new(Bounds::default());
     assert!(
         !shutdown

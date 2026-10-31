@@ -301,7 +301,8 @@ fn passed(from: &mut rustls::Connection, to: &mut rustls::Connection) -> Result<
 }
 
 #[test]
-fn one_name_holds_several_certificates_and_a_client_is_sent_the_one_for_its_name() {
+fn one_credential_name_can_have_several_certificates_and_a_client_gets_the_one_matching_its_server_name()
+ {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (first, a) = issued_into(dir.path(), "a", &["a.example"]);
     let (second, b) = issued_into(dir.path(), "b", &["b.example"]);
@@ -368,7 +369,8 @@ fn a_certificate_whose_files_change_is_served_anew_without_a_restart() {
 }
 
 #[test]
-fn a_client_certificate_the_run_trusts_is_who_the_client_is_and_none_is_still_served() {
+fn a_trusted_client_certificate_identifies_the_client_to_the_server_and_the_server_accepts_a_client_that_sends_no_certificate()
+ {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
     let (_, caller) = issued_into(dir.path(), "caller", &["caller.example"]);
@@ -422,7 +424,8 @@ fn a_listener_that_requires_a_client_certificate_rejects_a_client_without_one() 
 }
 
 #[test]
-fn requiring_a_client_certificate_wants_the_credential_and_something_to_verify_it() {
+fn requiring_a_client_certificate_fails_unless_the_credential_exists_and_trusted_certificates_are_configured()
+ {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (server, _) = issued_into(dir.path(), "server", &["localhost"]);
     let trusted = dir.path().join("server.pem");
@@ -451,7 +454,7 @@ fn requiring_a_client_certificate_wants_the_credential_and_something_to_verify_i
 }
 
 #[test]
-fn a_client_presenting_a_credential_is_who_the_server_sees() {
+fn a_tls_client_presenting_a_credential_shows_its_certificate_to_the_server() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
     let (caller, called) = issued_into(dir.path(), "caller", &["caller.example"]);
@@ -501,7 +504,7 @@ fn a_client_that_comes_back_resumes_its_session_from_a_ticket() {
 }
 
 #[test]
-fn a_secured_session_keeps_the_certificate_its_peer_presented() {
+fn a_secured_session_reports_the_peer_certificate_and_negotiated_protocol_after_the_handshake() {
     let material = material();
     let peer = peer(&material);
     let client = speak(
@@ -535,7 +538,7 @@ fn a_secured_session_keeps_the_certificate_its_peer_presented() {
 }
 
 #[test]
-fn the_argument_shape_is_a_usage_error_with_the_form_in_it() {
+fn a_malformed_credential_argument_fails_with_a_usage_error_that_shows_the_expected_format() {
     let good =
         CredentialSpec::parse("api=certs/api.pem,certs/api.key").expect("the canonical form");
     assert_eq!(good.name, "api");
@@ -552,7 +555,7 @@ fn the_argument_shape_is_a_usage_error_with_the_form_in_it() {
 }
 
 #[test]
-fn an_unconfigured_credential_lists_the_ones_there_are() {
+fn an_unknown_credential_name_fails_with_an_error_that_lists_the_configured_credentials() {
     let material = material();
     let credentials = material.credentials("api");
     let diagnostic = credentials
@@ -593,7 +596,7 @@ fn an_unconfigured_credential_lists_the_ones_there_are() {
 }
 
 #[test]
-fn nothing_about_a_credential_renders_its_key() {
+fn the_debug_output_of_a_credential_never_contains_its_private_key() {
     let material = material();
     let key = std::fs::read_to_string(&material.key).expect("the key file");
     let rendered = format!("{:?}", material.credentials("api"));
@@ -835,7 +838,8 @@ fn a_read_deadline_returns_none_and_leaves_the_session_open() {
 }
 
 #[test]
-fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
+fn every_handshake_rejection_maps_to_one_reason_from_a_fixed_list_each_a_short_message_with_a_suggested_fix()
+ {
     let cases = [
         (TlsError::NoApplicationProtocol, REASON_ALPN),
         (
@@ -879,7 +883,7 @@ fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
 }
 
 #[test]
-fn the_reasons_are_reported_most_frequent_first_and_then_alphabetically() {
+fn handshake_rejection_reasons_are_sorted_by_count_highest_first_then_alphabetically() {
     let handshakes = Handshakes::default();
     for reason in [REASON_NOT_TLS, REASON_ALPN, REASON_NOT_TLS, REASON_GONE] {
         handshakes.rejected(reason);
@@ -897,7 +901,7 @@ fn the_reasons_are_reported_most_frequent_first_and_then_alphabetically() {
 }
 
 #[test]
-fn the_listing_names_the_version_that_is_actually_linked() {
+fn the_rustls_version_reported_by_the_ply_host_crate_matches_the_version_in_cargo_lock() {
     let lock =
         std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"))
             .expect("the workspace lockfile");
@@ -920,7 +924,7 @@ fn the_listing_names_the_version_that_is_actually_linked() {
 }
 
 #[test]
-fn the_provider_is_the_one_this_module_names() {
+fn tls_uses_the_ring_crypto_provider_and_installs_no_process_wide_default_provider() {
     assert_eq!(PROVIDER, "ring");
     assert!(
         CryptoProvider::get_default().is_none(),

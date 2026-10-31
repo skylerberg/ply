@@ -5,8 +5,7 @@ type Made = unsafe extern "C" fn(*mut Ctx, i64) -> i64;
 type Held = unsafe extern "C" fn(*mut Ctx, i64) -> i64;
 
 #[test]
-fn a_scoped_value_passes_borrowed_and_hands_back_the_word_it_was_made_of_and_rejects_a_read_once_let_go()
- {
+fn a_scoped_value_can_be_read_repeatedly_and_reading_it_after_release_fails() {
     let made: Made = helper("builtin_elaborated_hold_made");
     let read: Held = helper("builtin_elaborated_hold_read");
     let taken: Held = helper("builtin_elaborated_hold_taken");

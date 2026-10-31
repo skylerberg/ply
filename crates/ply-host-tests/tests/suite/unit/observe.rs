@@ -53,7 +53,7 @@ fn lines(trace: &str) -> Vec<&str> {
 }
 
 #[test]
-fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
+fn a_run_s_trace_lists_only_what_it_read_under_the_roots_and_ignores_files_it_wrote() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a.ply"), b"one").unwrap();
@@ -77,7 +77,7 @@ fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
 }
 
 #[test]
-fn a_listing_moves_when_a_name_comes_to_name_something_else() {
+fn a_directory_listing_in_a_trace_changes_when_an_entry_is_replaced_by_one_of_another_kind() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a"), b"one").unwrap();
@@ -92,7 +92,7 @@ fn a_listing_moves_when_a_name_comes_to_name_something_else() {
 }
 
 #[test]
-fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
+fn a_trace_of_a_directory_excludes_entries_that_the_run_itself_wrote() {
     let dir = tempfile::tempdir().unwrap();
     let pkg = dir.path().join("pkg");
     std::fs::create_dir(&pkg).unwrap();
@@ -123,7 +123,7 @@ fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
 }
 
 #[test]
-fn a_trace_reads_the_same_from_another_directory_under_the_same_root() {
+fn a_trace_is_still_valid_in_another_directory_with_the_same_contents_under_the_same_root_name() {
     let one = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     for dir in [one.path(), other.path()] {
@@ -136,7 +136,8 @@ fn a_trace_reads_the_same_from_another_directory_under_the_same_root() {
 }
 
 #[test]
-fn a_run_that_reached_the_host_stands_for_its_binding_alone() {
+fn a_trace_of_a_run_that_used_the_host_contains_only_the_binding_line_and_goes_stale_when_the_roots_change()
+ {
     let recorder = Recorder::default();
     let trace = observe::finished(&recorder, &world(&[], "lent"), true).unwrap();
     assert_eq!(lines(&trace), ["binding"]);
@@ -152,7 +153,7 @@ fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 #[test]
-fn a_configuration_read_stands_while_its_key_returns_what_it_did() {
+fn a_trace_of_configuration_reads_is_valid_until_a_key_it_read_has_a_different_value() {
     let recorder = Recorder::default();
     recorder.configured("SERVICE_REGION", Some("eu"));
     recorder.configured("SERVICE_ABSENT", None);
@@ -177,7 +178,7 @@ fn a_configuration_read_stands_while_its_key_returns_what_it_did() {
 }
 
 #[test]
-fn a_run_that_read_a_secret_files_no_trace() {
+fn a_run_that_read_a_secret_produces_no_trace() {
     let recorder = Recorder::default();
     recorder.configured("SERVICE_REGION", Some("eu"));
     recorder.read_secret("SERVICE_API_KEY");
@@ -185,7 +186,7 @@ fn a_run_that_read_a_secret_files_no_trace() {
 }
 
 #[test]
-fn a_nested_run_s_configuration_is_its_caller_s_handing_and_no_read_of_the_caller_s() {
+fn a_nested_run_s_configuration_and_secret_reads_are_not_added_to_the_caller_s_trace() {
     let inner = Recorder::default();
     inner.configured("SERVICE_REGION", Some("handed"));
     inner.read_secret("SERVICE_API_KEY");
@@ -198,7 +199,7 @@ fn a_nested_run_s_configuration_is_its_caller_s_handing_and_no_read_of_the_calle
 }
 
 #[test]
-fn shipped_modules_and_the_program_are_recorded_at_the_binary_s_digests() {
+fn a_trace_records_the_digests_of_the_program_and_the_standard_library_modules_it_used() {
     let recorder = Recorder::default();
     recorder.shipped("std.list");
     recorder.shipped("std.gone");
@@ -223,7 +224,8 @@ fn shipped_modules_and_the_program_are_recorded_at_the_binary_s_digests() {
 }
 
 #[test]
-fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_link() {
+fn reading_the_standard_library_modules_through_a_symbolic_link_to_their_directory_is_traced_as_library_reads()
+ {
     let dir = tempfile::tempdir().unwrap();
     let real = dir.path().join("real");
     std::fs::create_dir_all(real.join("shipped")).unwrap();
@@ -253,7 +255,8 @@ const VIEW: &str =
     "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.take\thash\n";
 
 #[test]
-fn a_view_stands_for_one_whole_read_of_the_modules_it_names() {
+fn a_recorded_summary_of_standard_library_modules_replaces_the_separate_records_of_reading_those_modules()
+ {
     let recorder = Recorder::default();
     recorder.shipped("std.list");
     recorder.shipped("std.list");
@@ -270,7 +273,8 @@ fn a_view_stands_for_one_whole_read_of_the_modules_it_names() {
 }
 
 #[test]
-fn a_view_of_a_load_already_read_adds_to_what_its_view_holds() {
+fn a_summary_recorded_after_a_module_was_already_read_adds_its_definitions_to_the_earlier_summary()
+{
     let recorder = Recorder::default();
     recorder.shipped("std.list");
     recorder.reached(VIEW, true);
@@ -290,7 +294,7 @@ fn a_view_of_a_load_already_read_adds_to_what_its_view_holds() {
 }
 
 #[test]
-fn a_view_stands_here_while_its_module_s_text_does() {
+fn a_module_summary_is_valid_while_the_module_s_digest_is_unchanged_and_invalid_when_it_differs() {
     assert!(stands(VIEW, &world(&[], "b")));
     let moved_list = VIEW.replace("list digest", "another digest");
     assert_eq!(
@@ -300,7 +304,7 @@ fn a_view_stands_here_while_its_module_s_text_does() {
 }
 
 #[test]
-fn a_ply_it_started_reports_its_views() {
+fn a_trace_includes_the_module_summaries_reported_by_a_child_ply_process() {
     let recorder = Recorder::default();
     let file = recorder.child_trace();
     std::fs::write(&file, format!("{VIEW}end\n")).unwrap();
@@ -315,7 +319,7 @@ fn a_ply_it_started_reports_its_views() {
 }
 
 #[test]
-fn a_run_records_into_the_record_it_was_handed_and_one_handed_none_records_nothing() {
+fn a_run_records_reads_into_the_recorder_it_is_given_and_a_run_with_no_recorder_records_no_reads() {
     let dir = tempfile::tempdir().unwrap();
     let roots = rooted(dir.path());
     let host = ply_host::Host::new();
@@ -338,7 +342,8 @@ fn a_run_records_into_the_record_it_was_handed_and_one_handed_none_records_nothi
 }
 
 #[test]
-fn a_test_a_test_ran_is_read_by_the_outer_one_too() {
+fn a_recorder_that_absorbs_another_recorder_includes_the_reads_of_the_other_recorder_in_its_trace()
+{
     let dir = tempfile::tempdir().unwrap();
     let roots = rooted(dir.path());
     let (outer, inner) = (Recorder::default(), Recorder::default());
@@ -351,7 +356,8 @@ fn a_test_a_test_ran_is_read_by_the_outer_one_too() {
 }
 
 #[test]
-fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_it() {
+fn a_finished_child_ply_trace_is_merged_into_the_recorder_trace_and_an_unfinished_child_trace_makes_the_trace_invalid()
+ {
     let dir = tempfile::tempdir().unwrap();
     let roots = rooted(dir.path());
     let recorder = Recorder::default();
@@ -377,7 +383,7 @@ fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_i
 }
 
 #[test]
-fn checking_a_trace_enters_what_it_read_into_the_asker_s_record() {
+fn checking_a_trace_records_its_reads_into_the_recorder_of_the_run_that_checked_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ply"), b"one").unwrap();
     let roots = rooted(dir.path());
@@ -391,7 +397,8 @@ fn checking_a_trace_enters_what_it_read_into_the_asker_s_record() {
 }
 
 #[test]
-fn a_trace_naming_a_root_the_run_is_not_granted_never_yields_a_cached_result() {
+fn a_trace_that_read_a_root_missing_from_the_current_run_is_invalid_so_its_cached_result_is_not_used()
+ {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ply"), b"one").unwrap();
     let roots = rooted(dir.path());
@@ -402,7 +409,7 @@ fn a_trace_naming_a_root_the_run_is_not_granted_never_yields_a_cached_result() {
 }
 
 #[test]
-fn a_front_end_s_store_is_neither_read_nor_listed() {
+fn the_cache_directory_of_a_ply_front_end_is_not_recorded_as_read_in_a_trace() {
     let dir = tempfile::tempdir().unwrap();
     let pkg = dir.path().join("pkg");
     std::fs::create_dir(&pkg).unwrap();
@@ -420,7 +427,7 @@ fn a_front_end_s_store_is_neither_read_nor_listed() {
 }
 
 #[test]
-fn a_checkout_s_version_control_is_no_input() {
+fn reads_of_git_metadata_in_a_checkout_are_not_recorded_in_a_trace() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = Recorder::default();
     recorder.read(Read::File, &dir.path().join(".git/HEAD"));

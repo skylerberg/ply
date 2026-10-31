@@ -124,7 +124,7 @@ fn steady(times: usize, mut each: impl FnMut()) -> usize {
 }
 
 #[test]
-fn a_discarded_event_allocates_nothing_and_reads_no_clock() {
+fn an_event_that_the_trace_handler_discards_allocates_no_memory_and_does_not_read_the_time() {
     let b = bench(Arc::new(Discard));
     assert!(!b.trace.wants(Level::Info), "the handler writes no field");
     let allocs = steady(EVENTS, || b.event(Level::Info));
@@ -148,7 +148,7 @@ fn a_discarded_metric_allocates_nothing() {
 }
 
 #[test]
-fn a_debug_event_under_a_warn_filter_costs_what_a_discarded_one_costs() {
+fn a_debug_event_when_the_level_filter_is_warn_allocates_no_memory_and_does_not_read_the_time() {
     let b = bench(Arc::new(Json::new(Level::Warn)));
     assert!(!b.trace.wants(Level::Debug), "the handler writes no field");
     let allocs = steady(EVENTS, || b.event(Level::Debug));
@@ -160,7 +160,8 @@ fn a_debug_event_under_a_warn_filter_costs_what_a_discarded_one_costs() {
 }
 
 #[test]
-fn a_discarded_span_costs_less_than_a_collected_one_and_reads_no_clock() {
+fn a_span_that_the_trace_handler_discards_makes_fewer_allocations_than_a_recorded_span_and_does_not_read_the_time()
+ {
     const SPANS: usize = 200;
     let discarded = bench(Arc::new(Discard));
     let discarding = steady(SPANS, || discarded.span());
@@ -181,7 +182,7 @@ fn a_discarded_span_costs_less_than_a_collected_one_and_reads_no_clock() {
 }
 
 #[test]
-fn a_collected_event_pays_for_the_record_it_asked_for() {
+fn an_event_recorded_by_the_sink_allocates_memory_for_its_record() {
     let sink = Arc::new(ply_host::trace::sink::Recording::new(Level::Debug));
     let b = bench(Arc::clone(&sink) as Arc<dyn Sink>);
     const COLLECTED: usize = 200;

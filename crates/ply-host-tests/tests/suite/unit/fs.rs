@@ -81,7 +81,7 @@ fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_rejected() {
 }
 
 #[test]
-fn a_root_that_is_not_a_directory_does_not_bind() {
+fn binding_a_file_path_as_a_filesystem_root_fails_and_leaves_the_set_of_roots_empty() {
     let dir = root();
     let file = dir.path().join("a.ply");
     std::fs::write(&file, b"x").unwrap();
@@ -94,7 +94,8 @@ fn a_root_that_is_not_a_directory_does_not_bind() {
 }
 
 #[test]
-fn an_unbound_label_names_the_flag_that_would_bind_it() {
+fn using_a_root_name_that_has_no_directory_bound_fails_with_an_error_that_shows_the_fs_flag_to_bind_one()
+ {
     let d = unbound(Op::Lock, "src", span());
     assert_eq!(d.code, codes::FS_ROOT_UNBOUND);
     assert!(d.message.contains("`fs.lock`"), "{}", d.message);
@@ -131,7 +132,8 @@ fn a_lock_is_taken_once_and_released_only_by_its_holder() {
 }
 
 #[test]
-fn a_lock_this_run_did_not_take_is_not_its_to_release() {
+fn releasing_a_lock_that_this_run_did_not_acquire_returns_false_and_does_not_delete_the_lock_file()
+{
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let lock = real.join("lock");
@@ -260,7 +262,7 @@ fn read_at(fs: &FsHost, path: &str, offset: i64, len: i64) -> Option<Vec<u8>> {
 }
 
 #[test]
-fn an_append_creates_the_log_and_returns_where_each_frame_landed() {
+fn an_append_creates_the_log_file_and_returns_the_offset_where_each_record_starts() {
     let dir = root();
     let fs = rooted(dir.path());
 
@@ -276,7 +278,7 @@ fn an_append_creates_the_log_and_returns_where_each_frame_landed() {
 }
 
 #[test]
-fn an_append_with_no_directory_to_hold_it_returns_none() {
+fn an_append_returns_none_when_the_parent_directory_is_missing_or_the_path_is_a_directory() {
     let dir = root();
     let fs = rooted(dir.path());
     assert_eq!(append(&fs, "absent/frontend.dat", b"frame"), None);
@@ -303,7 +305,7 @@ fn a_ranged_read_returns_what_is_there_and_is_short_past_the_end() {
 }
 
 #[test]
-fn a_ranged_read_of_what_is_not_a_file_is_none() {
+fn a_ranged_read_of_a_missing_path_or_a_directory_returns_none() {
     let dir = root();
     let fs = rooted(dir.path());
     std::fs::create_dir(dir.path().canonicalize().unwrap().join("sub")).unwrap();
@@ -312,7 +314,7 @@ fn a_ranged_read_of_what_is_not_a_file_is_none() {
 }
 
 #[test]
-fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
+fn a_read_larger_than_the_size_limit_is_rejected_with_a_note_pointing_to_ranged_reads() {
     let dir = root();
     let fs = rooted(dir.path());
     let rejected = perform(
@@ -335,7 +337,7 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
 }
 
 #[test]
-fn a_sync_flushes_a_file_or_a_directory_and_returns_false_for_neither() {
+fn a_sync_flushes_a_file_or_a_directory_and_returns_false_for_a_path_that_is_neither() {
     let dir = root();
     let fs = rooted(dir.path());
     assert_eq!(append(&fs, "frontend.dat", b"frame"), Some(0));
@@ -423,7 +425,8 @@ fn a_tree_is_removed_whole_and_a_link_in_it_is_not_followed() {
 }
 
 #[test]
-fn a_temporary_directory_is_new_each_time_and_named_as_the_root_names_it() {
+fn creating_a_temporary_directory_makes_a_different_directory_each_time_named_with_the_prefix_under_the_given_path()
+ {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -471,7 +474,7 @@ fn canonical_returns_the_real_path_and_nothing_for_a_missing_one() {
 }
 
 #[test]
-fn a_mode_reads_and_sets_the_nine_bits() {
+fn a_mode_reads_and_sets_the_nine_unix_read_write_and_execute_permission_bits() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -488,7 +491,8 @@ fn a_mode_reads_and_sets_the_nine_bits() {
 }
 
 #[test]
-fn a_link_is_made_inside_the_root_and_one_out_of_it_is_rejected() {
+fn a_symbolic_link_can_be_created_when_its_target_stays_within_the_root_directory_and_is_rejected_when_its_target_is_outside()
+ {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -587,7 +591,8 @@ fn a_walk_is_depth_first_in_byte_order_and_never_follows_a_link() {
 }
 
 #[test]
-fn a_listing_says_of_each_name_in_byte_order_what_kind_says_of_its_path() {
+fn listing_a_directory_returns_entries_sorted_by_name_bytes_with_the_same_file_type_that_a_type_check_of_each_path_returns()
+ {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -695,7 +700,7 @@ fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
 }
 
 #[test]
-fn an_open_says_why_a_file_did_not_open_and_is_confined_like_every_other() {
+fn opening_a_file_reports_why_it_failed_to_open_and_rejects_a_path_outside_the_root() {
     let dir = root();
     let fs = rooted(dir.path());
     std::fs::create_dir(dir.path().join("d")).unwrap();
@@ -720,7 +725,7 @@ fn an_open_says_why_a_file_did_not_open_and_is_confined_like_every_other() {
 }
 
 #[test]
-fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
+fn a_chunk_read_returns_at_most_the_requested_bytes_and_rejects_a_request_over_the_read_limit() {
     let dir = root();
     let fs = rooted(dir.path());
     std::fs::write(dir.path().join("log"), vec![7u8; 4096]).unwrap();
@@ -737,7 +742,7 @@ fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
 }
 
 #[test]
-fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is() {
+fn an_exclusive_create_makes_a_file_only_the_owner_can_access_and_fails_if_the_path_exists() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -807,7 +812,7 @@ fn read_secret(
 }
 
 #[test]
-fn a_secret_is_written_in_its_frame_as_its_owners_alone_whatever_was_there() {
+fn write_secret_creates_or_replaces_a_file_that_only_the_owner_can_access() {
     use std::os::unix::fs::PermissionsExt;
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
@@ -839,7 +844,8 @@ fn a_secret_is_written_in_its_frame_as_its_owners_alone_whatever_was_there() {
 }
 
 #[test]
-fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
+fn read_secret_returns_a_value_only_when_the_file_starts_with_the_prefix_and_ends_with_the_suffix_and_its_text_is_valid_for_the_encoding()
+ {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -867,7 +873,7 @@ fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
 }
 
 #[test]
-fn a_secret_read_for_a_run_that_has_ended_is_stored_by_no_one() {
+fn reading_a_secret_returns_nothing_when_the_run_has_already_ended() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -935,7 +941,8 @@ fn linked(fs: &FsHost, path: &str, to: &str) -> Result<(), Vec<u8>> {
 }
 
 #[test]
-fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
+fn stat_returns_the_kind_size_mode_and_identity_of_a_file_directory_or_link_and_returns_nothing_for_a_missing_path()
+ {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
@@ -977,7 +984,7 @@ fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
 }
 
 #[test]
-fn a_scan_is_a_walk_with_a_look_at_each_entry_and_goes_below_only_when_asked() {
+fn a_scan_returns_each_entry_with_its_stat_and_descends_into_subdirectories_only_when_asked() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -1039,7 +1046,7 @@ fn a_scan_is_a_walk_with_a_look_at_each_entry_and_goes_below_only_when_asked() {
 }
 
 #[test]
-fn a_file_takes_a_second_name_and_nothing_else_does() {
+fn a_hard_link_gives_a_file_a_second_name_and_links_to_directories_or_missing_files_fail() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -1081,7 +1088,7 @@ fn a_file_takes_a_second_name_and_nothing_else_does() {
 }
 
 #[test]
-fn the_room_of_a_file_system_is_returned_for_a_path_that_names_something() {
+fn the_space_operation_returns_the_file_system_size_and_free_space_for_an_existing_path() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -1247,7 +1254,7 @@ fn given(op: Op, path: &str) -> Vec<(String, Second, bool)> {
 }
 
 #[test]
-fn no_operation_reaches_through_a_link_out_of_the_root() {
+fn no_operation_follows_a_symbolic_link_out_of_the_root_and_none_changes_files_outside_it() {
     for op in Op::ALL {
         for way in Way::ALL {
             for (path, second, itself) in given(op, way.path()) {
@@ -1275,7 +1282,7 @@ fn no_operation_reaches_through_a_link_out_of_the_root() {
 }
 
 #[test]
-fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
+fn operations_on_a_symbolic_link_itself_work_even_when_the_link_points_outside_the_root() {
     for name in ["gone", "file", "out"] {
         let (inside, outside) = linked_out();
         let here = inside.path().canonicalize().unwrap();
@@ -1341,7 +1348,7 @@ fn chain(at: &Path, first: &str, links: usize, to: &str) {
 }
 
 #[test]
-fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further() {
+fn a_symbolic_link_inside_the_root_is_followed_in_paths_but_a_chain_of_over_forty_links_fails() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
@@ -1388,7 +1395,8 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
 }
 
 #[test]
-fn a_read_is_found_in_place_or_not_at_all() {
+fn found_bytes_returns_the_bytes_a_successful_read_added_to_the_buffer_and_returns_nothing_when_the_read_fails()
+ {
     let read = found_read(3, |out| {
         out.extend_from_slice(b"abc");
         Ok(3)

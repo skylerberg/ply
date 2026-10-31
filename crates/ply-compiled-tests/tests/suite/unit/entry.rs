@@ -126,7 +126,7 @@ fn run() -> Run {
 }
 
 #[test]
-fn a_root_that_takes_nothing_is_handed_the_empty_list() {
+fn the_argument_list_passed_to_an_entry_function_that_takes_no_arguments_is_empty() {
     assert_eq!(entry::NO_ARGUMENTS, ints(&[]));
 }
 
@@ -153,7 +153,7 @@ fn int_returned(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i6
 }
 
 #[test]
-fn a_root_returns_the_bytes_its_entry_wrote() {
+fn calling_an_exported_function_returns_its_result_as_encoded_bytes() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
@@ -179,7 +179,7 @@ fn a_root_returns_the_bytes_its_entry_wrote() {
 }
 
 #[test]
-fn a_unit_is_entered_only_at_its_roots() {
+fn calling_a_function_that_is_not_exported_fails_with_a_no_root_error() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
@@ -195,7 +195,7 @@ fn a_unit_is_entered_only_at_its_roots() {
 }
 
 #[test]
-fn a_result_holding_a_function_or_a_handle_stays_in_its_run() {
+fn a_result_containing_a_function_or_a_runtime_handle_is_not_returned_and_fails_instead() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
@@ -211,7 +211,7 @@ fn a_result_holding_a_function_or_a_handle_stays_in_its_run() {
 }
 
 #[test]
-fn a_raise_ends_its_entry_and_no_other() {
+fn a_failed_assertion_fails_only_that_call_and_later_calls_still_succeed() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
@@ -239,7 +239,7 @@ fn an_entry_inside_another_runs_on_a_context_of_its_own() {
 }
 
 #[test]
-fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
+fn a_call_made_from_a_small_stack_thread_still_recurses_100000_levels_deep_and_returns() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
@@ -262,7 +262,7 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
 }
 
 #[test]
-fn a_tests_entry_counts_the_objects_it_left_live() {
+fn a_call_in_test_mode_reports_how_many_objects_it_allocated_and_never_freed() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let defs = vec![
         def("m.kept", 1, "  rt_alloc_bytes_p(ctx, 16);\n  return p0;"),
@@ -295,7 +295,7 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
 }
 
 #[test]
-fn a_task_in_an_entrys_result_is_rejected_at_the_boundary() {
+fn an_exported_function_that_returns_a_task_fails_with_a_diagnostic_naming_the_task() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;

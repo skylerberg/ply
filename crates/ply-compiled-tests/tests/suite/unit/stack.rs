@@ -129,7 +129,7 @@ fn a_task_runs_on_its_own_stack_and_yields_back_in_order() {
 }
 
 #[test]
-fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
+fn a_recursion_deeper_than_the_first_chunk_of_a_stack_extends_within_the_same_reserved_memory() {
     let stack = taken();
     let mut d = descent(&stack, 1);
     let d = &raw mut d;
@@ -167,7 +167,8 @@ fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
 }
 
 #[test]
-fn a_stack_extends_until_its_reservation_is_spent_and_its_floor_keeps_the_margin() {
+fn a_stack_can_extend_until_its_reserved_memory_is_used_up_and_its_floor_stays_above_the_stack_margin()
+ {
     let stack = taken();
     let top = stack.top();
     assert_eq!(stack.floor(), top - CHUNK + STACK_MARGIN);
@@ -182,7 +183,7 @@ fn a_stack_extends_until_its_reservation_is_spent_and_its_floor_keeps_the_margin
 }
 
 #[test]
-fn a_stack_given_back_unextended_is_taken_again_and_one_that_grew_is_not() {
+fn a_stack_returned_without_being_extended_is_reused_but_an_extended_stack_is_not_reused() {
     let first = taken();
     let top = first.top();
     drop(first);
@@ -199,7 +200,7 @@ fn a_stack_given_back_unextended_is_taken_again_and_one_that_grew_is_not() {
 }
 
 #[test]
-fn ten_thousand_stacks_are_held_at_once_and_given_back_on_one_thread() {
+fn ten_thousand_stacks_can_be_in_use_at_once_and_are_all_returned_on_one_thread() {
     let stacks: Vec<Stack> = (0..10_000).map(|_| taken()).collect();
     for s in &stacks {
         unsafe { ((s.top() - 8) as *mut u64).write(1) };
@@ -233,7 +234,7 @@ extern "C" fn grow_then_stop(arg: usize) {
 }
 
 #[test]
-fn a_task_that_grew_resumes_under_its_own_floor() {
+fn a_task_that_grew_its_stack_resumes_with_the_stack_limit_of_its_own_stack() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(loaded) = units::opened(dir.path(), &[], |_| {}) else {
         return;

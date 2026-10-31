@@ -2,7 +2,8 @@ use ply_core::host::err_withheld;
 use ply_core::{Span, Symbol, codes};
 
 #[test]
-fn a_withheld_rejection_names_the_handler_and_where_it_serves() {
+fn an_unbound_handler_error_names_the_effect_and_the_handler_and_says_which_command_the_handler_serves_it_under()
+ {
     let d = err_withheld(
         Span::DUMMY,
         "std.process.process.out[proc]",
