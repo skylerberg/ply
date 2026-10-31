@@ -1,57 +1,31 @@
-# `build` compiles the workspace into one nextest archive, and each `nextest` job runs one shard of
-# it. `build-ply` bootstraps `ply`. `self-host` bootstraps it again with the `ply` just built, when
-# that second build could differ. Each `runs` job runs the Ply test runs that `.github/ci-shards.sh`
-# lists for it. `ci` is the single check that reports whether a run is green. The Rust toolchain
-# version is pinned in every workflow under .github/: raise it in all of them at once.
-
 name: CI
 
-# Pushes run only on main, because a branch with a pull request is already run by `pull_request`. A
-# change to prose files alone starts no run. This is safe only while no build or test reads a `.md`
-# file. So `CI` cannot be a required check: a pull request that only changes prose would wait on it
-# forever.
 on:
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     paths-ignore: ["**.md", "docs/**"]
-  # Runs nightly and on demand. Every job starts without anything an earlier run cached
-  # (`PLY_CI_COLD`), so cached results are verified from scratch. The CLI test modules that pull
-  # requests do not run also run here.
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
 
-# A newer push to a pull request supersedes its run; a merge to main never cancels the run before
-# it, whose `publish` job puts out the `ply` the next bootstraps start from.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
-  # `gh run download` of another run's artifact.
   actions: read
 
 env:
-  # Both versions are part of the Rust cache key, so changing either rebuilds everything from
-  # scratch.
   RUST_TOOLCHAIN: "1.93.1"
   NEXTEST_VERSION: "0.9.143"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Line tables are enough for the backtraces of failing tests. A developer's build keeps full DWARF
-  # so that `ply --count-allocation-sites` can name inlined frames (see Cargo.toml), and CI never
-  # runs that command.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: "1"
-  # A cold run restores nothing that an earlier Ply run saved: no stage, store, C cache or record of
-  # passed Rust tests. Rust's own build caches are still restored, because they cannot change a
-  # test's result.
   PLY_CI_COLD: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-  # The directories where the jobs' cache steps save and restore the C cache and the stages. They
-  # are outside the runner's home directory, which the cache steps cannot save from.
   PLY_C_CACHE: /tmp/ply-c-cache
   PLY_C_STAGE: /tmp/ply-c-stage
 
@@ -84,8 +58,6 @@ jobs:
           echo "runs=$runs" >> "$GITHUB_OUTPUT"
           jq -r '.include[].id' <<< "$runs"
 
-      # The runner's awk differs from the one developers use. The self-test checks that both compute
-      # the same timestamps and durations, which is cheaper than finding out from a wrong report.
       - name: Self-test the timings tool
         run: .github/ci-timings.sh --self-test
 
@@ -101,30 +73,20 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
-      # rust-cache keys on every Cargo.toml and Cargo.lock and the job itself, and falls back to the
-      # job's last entry when they move. A key of our own would be part of that fallback's prefix,
-      # so a changed manifest would find nothing and rebuild every dependency.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      # Runs even when clippy failed, so one run reports both clippy and formatting failures.
       - name: Check the Rust formatting
         if: ${{ !cancelled() }}
         run: cargo fmt --all --check
 
-  # The archive is keyed by the Rust key alone, so a run that changed no Rust does not rebuild it.
-  # It restores the archive cached by main's run or by this pull request's last run. On main it
-  # downloads the archive that the pull request's run uploaded as an artifact, because main cannot
-  # read a pull request's cache. Whether the Rust tests already passed is found the same way.
   build:
     name: Build the Rust test archive
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
       key: ${{ steps.rust.outputs.key }}
-      # Whether an earlier run already passed every Rust test for this Rust key. If so, this run
-      # skips the Rust tests.
       passed: ${{ steps.tests.outputs.yes != 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -152,7 +114,6 @@ jobs:
           echo "$KEY" > /tmp/rust-passed
           echo "found=true" >> "$GITHUB_OUTPUT"
           echo "run $run passed this Rust's tests"
-      # Saves the passed marker in the cache, so every later run can find it there.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.passed-reuse.outputs.found == 'true'
         with:
@@ -191,9 +152,6 @@ jobs:
         if: steps.builds.outputs.yes == 'true'
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # rust-cache keys on every Cargo.toml and Cargo.lock and the job itself, and falls back to the
-      # job's last entry when they move. A key of our own would be part of that fallback's prefix,
-      # so a changed manifest would find nothing and rebuild every dependency.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.builds.outputs.yes == 'true'
         with:
@@ -207,7 +165,6 @@ jobs:
         if: steps.builds.outputs.yes == 'true'
         run: cargo nextest archive --locked --workspace --archive-file nextest.tar.zst
 
-      # The window is part of the format: every job that unpacks this must pass `--long=30` too.
       - name: Recompress the archive with a whole-tree window
         if: steps.builds.outputs.yes == 'true'
         run: |
@@ -215,9 +172,6 @@ jobs:
           zstd -d -c nextest.tar.zst | zstd -q -T0 -3 --long=30 -o nextest.long.tar.zst
           mv nextest.long.tar.zst nextest.tar.zst
 
-      # Uploads the archive as an artifact as well as caching it, so the jobs below can still find
-      # it when the cache does not contain it. A cache save that cannot reserve its key only warns,
-      # and other runs evict cache entries (`.github/actions/archive`).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.builds.outputs.yes == 'true'
         with:
@@ -237,33 +191,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      # Disables the cache sweep, which deletes cached files when the cache exceeds its size limit
-      # or a file is old. This job already runs `ci-warm.sh used`, which deletes what the job did
-      # not read. Without this setting, a sweep during the first `ply` could delete restored std
-      # records that have not been read yet, because the records are large and an hour old.
       PLY_C_CACHE_MAX: "0"
     outputs:
-      # Whether the `self-host` job bootstraps again with the `ply` that this job built. This is
-      # true when this job bootstrapped and the new bootstrap would produce a different result than
-      # the bootstrap the release `ply` just did. If the two would be the same, a second bootstrap
-      # is pointless.
       self-hosts: ${{ steps.boots.outputs.yes == 'true' && steps.bootstrap.outputs.replays != 'true' }}
       ply_saved: ${{ steps.found.outputs.toolchain != '' }}
-      # The name of the artifact containing the C cache and stages that the run's other jobs read.
-      # It is set only when this job bootstrapped a toolchain whose stage was not cached; otherwise
-      # it is empty.
       stage: ${{ steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && steps.stage-name.outputs.name || '' }}
-      # The key of the toolchain of the `ply` this run uses. It is this tree's key when this job
-      # bootstrapped, and otherwise the key of the cached `ply`. Each job caches its stage and
-      # stores under this key.
       toolchain: ${{ steps.boots.outputs.yes == 'true' && steps.toolchain.outputs.key || steps.found.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # A cache rather than an artifact: every suite job wants these two files, and the artifact
-      # service is the one part of a run that fails on its own.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: tcc
         with:
@@ -284,12 +222,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/stage0.sh target/stage0/ply
-      # Computes the toolchain key, which depends on what `ply bootstrap` reads from this tree. The
-      # cached `ply` and the stage below are cached under this key.
       - uses: ./.github/actions/toolchain-key
         id: toolchain
-      # Restores the `ply` that main bootstrapped for this toolchain key, or else the newest cached
-      # `ply` with the same `core` output of the toolchain-key action.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: env.PLY_CI_COLD != 'true'
         id: built
@@ -297,10 +231,6 @@ jobs:
           path: target/release/ply
           key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
           restore-keys: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.core }}-
-      # Names the toolchain of the cached `ply` this run may use. On main it must be this tree's own
-      # toolchain, so main bootstraps whenever its library changed and publishes a `ply` that its
-      # own run tested. On a pull request it may be any toolchain with the same core, because that
-      # `ply` reads the library from this tree's sources.
       - name: Name the toolchain of the kept ply this run can take
         id: found
         env:
@@ -314,9 +244,6 @@ jobs:
           if [[ -z $MATCHED || ($EVENT == push && $found != "$OWN") ]]; then found=; fi
           echo "toolchain=$found" >> "$GITHUB_OUTPUT"
           echo "cached ply of toolchain: ${found:-none}"
-      # Checks whether the stage left by that cached `ply`'s bootstrap is still cached. If a cached
-      # `ply` was found and its stage is still cached, this job bootstraps nothing, and the run's
-      # other jobs restore that stage themselves.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.found.outputs.toolchain != ''
         id: stage-kept
@@ -331,8 +258,6 @@ jobs:
         if: steps.found.outputs.toolchain == '' || steps.stage-kept.outputs.cache-hit != 'true'
         run: echo "yes=true" >> "$GITHUB_OUTPUT"
 
-      # A toolchain that has not moved has every result and object of the bootstrap from an earlier
-      # run.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.boots.outputs.yes == 'true' && env.PLY_CI_COLD != 'true'
         id: stage-cache
@@ -341,23 +266,17 @@ jobs:
             /tmp/ply-c-cache
             /tmp/ply-c-stage
           key: ply-c-stage-sources-${{ steps.toolchain.outputs.key }}
-      # Runs before this job's first `ply`, so files that a `ply` reads or writes afterwards are
-      # newer than the mark and all other files are older.
       - name: Mark when this job's `ply` runs start
         run: touch /tmp/ply-c-used.mark
       - name: Name the stage of this toolchain
         id: stage-name
         run: echo "name=ply-stage-${{ steps.toolchain.outputs.key }}" >> "$GITHUB_OUTPUT"
-      # Runs after the mark is created, so the downloaded files are newer than the mark and the cut
-      # below does not delete them.
       - name: Download a stage another branch built from this toolchain
         id: shared
         if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && env.PLY_CI_COLD != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/ci-warm.sh shared "${{ steps.stage-name.outputs.name }}"
-      # If neither the stage cache nor a downloaded stage was found, restores the C cache of another
-      # toolchain.
       - uses: ./.github/actions/c-cache
         if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && steps.shared.outputs.found != 'true' && env.PLY_CI_COLD != 'true'
         with:
@@ -369,15 +288,9 @@ jobs:
         with:
           out: target/release/ply
 
-      # Deletes everything this job's `ply`s did not read or write, so the stage passed to the run's
-      # other jobs contains only files they can use.
       - name: Cut the stage to what this job used
         if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true'
         run: .github/ci-warm.sh used /tmp/ply-c-used.mark
-      # Uploads what this job's `ply`s compiled and cached as an artifact. The run's other jobs
-      # restore it, and so do later runs of this toolchain on any branch, especially main after a
-      # merge (`ci-warm.sh shared`). A failure here does not fail the run: a job that finds no stage
-      # builds what it needs.
       - name: Pack the stage for the run's jobs
         if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -391,8 +304,6 @@ jobs:
           retention-days: 2
           compression-level: 0
           if-no-files-found: error
-      # On main, when no `self-host` job follows, saves the toolchain's cache entries that
-      # `self-host` would otherwise save after bootstrapping again.
       - uses: ./.github/actions/keep-toolchain
         if: github.event_name == 'push' && steps.bootstrap.outputs.replays == 'true'
         with:
@@ -400,9 +311,6 @@ jobs:
           stage: ${{ steps.stage-cache.outputs.cache-hit != 'true' }}
           ply_saved: ${{ steps.found.outputs.toolchain != '' }}
 
-      # Uploads the `ply` that every suite job runs. The tree's own compiler generates the same C
-      # for each unit whichever builder compiled that compiler, so the suites need not wait for
-      # `self-host`.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ply
@@ -410,10 +318,6 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # `self-host` uses the `ply` that `build-ply` bootstrapped to bootstrap the tree again, so its
-  # builder is this tree's compiler compiled by itself. That `ply` is what main publishes. On a pull
-  # request it checks that the tree can build itself, in parallel with the suites rather than before
-  # them.
   self-host:
     name: Bootstrap ply again with the ply this tree built
     needs: [build-ply]
@@ -424,8 +328,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Creates the mark before the stage from `build-ply` is restored, so the cut below keeps all
-      # of that stage.
       - name: Mark when this job's C cache and stages are laid down
         run: touch /tmp/ply-c-used.mark
       - uses: ./.github/actions/suite
@@ -436,11 +338,6 @@ jobs:
         with:
           driver: target/debug/ply
           out: target/release/ply
-      # On main, saves two things to the cache for later CI runs: the compiled output of the
-      # toolchain (the `stage`, which `build-ply` produced) and the builder this job compiled. A
-      # bootstrap run by main's published `ply` needs the builder. Only main saves them, because
-      # other runs cannot read a pull request's cache. If the `ply` were saved without the stage,
-      # every later job would compile the toolchain's C again.
       - uses: ./.github/actions/keep-toolchain
         if: github.event_name == 'push'
         with:
@@ -455,9 +352,6 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # Rust tests depend only on the Rust code, so once the tests have passed for a given Rust key, a
-  # later run with the same key skips them. The Rust key is a hash of everything the Rust tests
-  # depend on.
   nextest:
     name: Run Rust tests, shard ${{ matrix.shard }}/${{ matrix.of }}
     needs: [plan, build]
@@ -473,7 +367,6 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/archive
 
-      # The awk strips colour first: nextest colours its summary line.
       - name: Run the shard's tests
         id: run
         env:
@@ -499,8 +392,6 @@ jobs:
           [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
           echo "ran=$ran" >> "$GITHUB_OUTPUT"
 
-      # Records how long each test in this shard took, for the report that lists the duration of
-      # every test.
       - name: Record the durations this shard measured
         env:
           SHARD: ${{ matrix.shard }}
@@ -521,10 +412,6 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Saves a marker file, named by the Rust key, after every Rust test shard and the `hosts` job (the
-  # tests of the packages that use sockets and processes) have passed. A later run with the same
-  # Rust key finds the marker and skips the Rust tests. The Rust key is a hash of the Rust sources
-  # and build settings.
   rust-passed:
     name: Record that this Rust's tests passed
     needs: [build, nextest, hosts]
@@ -538,8 +425,6 @@ jobs:
         with:
           path: /tmp/rust-passed
           key: rust-passed-${{ needs.build.outputs.key }}
-      # Uploads the `rust-passed` marker file as an artifact on pull requests, because main's run
-      # after the merge cannot read a pull request's cache.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name == 'pull_request'
         with:
@@ -548,8 +433,6 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # This job is not a dependency of the `ci` job, so CI does not fail when the cost report or the
-  # cache pruning fails.
   passes:
     name: Report what each test cost and prune the caches
     if: ${{ !cancelled() }}
@@ -569,8 +452,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/stage0.sh target/stage0/ply
 
-      # Collects how long each test took, slowest first, from the Ply tests and from nextest. This
-      # runs even when some jobs failed.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ !cancelled() }}
         with:
@@ -611,9 +492,6 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      # Deletes two kinds of cache entry that no later run will restore: entries of this branch that
-      # this run replaced, and entries whose key does not start with any prefix that `ci-shards.sh`
-      # lists as one a workflow saves.
       - name: Delete the cache entries nothing restores again
         if: ${{ !cancelled() }}
         env:
@@ -627,11 +505,6 @@ jobs:
           fi
           .github/ci-shards.sh supersede "${{ github.run_id }}" "${{ github.ref }}"
 
-  # Uploads main's Linux `ply` to the rolling release that `scripts/stage0.sh` downloads, once the
-  # run that tested it passes. Every later bootstrap starts from that release. This job also starts
-  # a separate workflow that bootstraps the macOS `ply`, and no job waits for that workflow. The
-  # condition uses `!cancelled()` instead of the implicit `success()`, because `success()` would
-  # fail this job whenever a job upstream of `ci` is skipped.
   publish:
     name: Publish main's ply for Linux and start the macOS bootstrap
     if: ${{ !cancelled() && github.event_name == 'push' && needs.ci.result == 'success' }}
@@ -640,12 +513,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-      # Lets the job start the macOS workflow with `gh workflow run`.
       actions: write
     steps:
-      # Downloads the `ply` built by the `self-host` job, which compiles this commit's own compiler.
-      # If `self-host` did not succeed, downloads the `ply` from the `build-ply` job instead, which
-      # main bootstrapped for the same toolchain and cached.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.self-host.result == 'success' && 'ply-self-hosted' || 'ply' }}
@@ -662,8 +531,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run publish-macos.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f sha="$GITHUB_SHA"
 
-  # Checks the formatting and lockfiles of the tree's Ply sources, including sources that no test
-  # compiles.
   sources:
     name: Check the Ply sources' formatting and lockfiles
     needs: [build-ply]
@@ -680,7 +547,6 @@ jobs:
       - name: Make the downloaded `ply` runnable
         run: chmod +x target/debug/ply
 
-      # A source committed unformatted puts its reformatting into the next change that touches it.
       - name: Check the maintained Ply sources are formatted
         run: |
           set -euo pipefail
@@ -688,7 +554,6 @@ jobs:
           target/debug/ply fmt --check "${sources[@]}" ||
             { echo "run 'ply fmt' on what it names and commit that" >&2; exit 1; }
 
-      # Agents copy the style of the code they read, so one comment leads to more comments.
       - name: Check that the compiler, the CLI and the Rust code have no comments
         if: ${{ !cancelled() }}
         run: |
@@ -699,12 +564,6 @@ jobs:
             exit 1
           fi
 
-      # Checks that every lockfile matches the sources: `ply resolve` must change no lock. A lock
-      # records the names and versions of a package's dependencies, but a path dependency inside
-      # this checkout has no digest, so editing one does not change a lock. CI checks the merge with
-      # main, not only the branch, because two changes that each updated a lock can leave main's
-      # lock out of date. This job runs next to the Ply runs instead of in `build-ply`, because
-      # every Ply run waits for `build-ply` to finish.
       - name: Check every lockfile pins this tree
         if: ${{ !cancelled() }}
         run: |
@@ -713,7 +572,6 @@ jobs:
           for lock in "${locks[@]}"; do target/debug/ply resolve "$(dirname "$lock")" >/dev/null; done
           git diff --exit-code -- "${locks[@]}" || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
 
-  # The host packages, whose tests bind sockets and processes, which no shard binds.
   hosts:
     name: Run the host packages' tests
     needs: [plan, build]
@@ -735,11 +593,6 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --no-tests=pass --success-output immediate -E "$filter"
 
-  # Runs the Ply tests and proofs for one job id. `ci-shards.sh` lists which `ply test` and `ply
-  # prove` commands each job id runs. Each package is loaded by exactly one command, which runs all
-  # of that package's tests. After a job finishes, it caches the packages' result stores (the
-  # directories where `ply` saves compiled code and test results). The next CI run of the same job
-  # restores them, so a package whose inputs did not change reuses the cached results.
   runs:
     name: Run ${{ matrix.id }}
     needs: [plan, build-ply]
@@ -749,9 +602,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.runs) }}
     steps:
-      # Ends the job's runs 26 minutes after it starts, four minutes before the 30-minute limit, so
-      # the later steps have time to save the caches. A job cancelled by the limit saves nothing, so
-      # its re-run would start with empty caches.
       - name: Set the deadline the job's runs end by
         run: echo "PLY_CI_DEADLINE=$(($(date +%s) + 26 * 60))" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -763,9 +613,6 @@ jobs:
           toolchain: ${{ needs.build-ply.outputs.toolchain }}
       - uses: ./.github/actions/rust-key
         id: rust
-      # Hashes the names and content hashes of the files git tracks in the source trees that
-      # `ply.work` lists. The result stores that `ply` writes during a run are not tracked by git,
-      # so they do not change the hash.
       - name: Hash the sources
         id: sources
         env:
@@ -773,8 +620,7 @@ jobs:
         run: |
           set -euo pipefail
           trees=$(.github/ci-shards.sh ply-trees)
-          # shellcheck disable=SC2086 # `$trees` is unquoted on purpose, so each line becomes its
-          # own path argument
+          # shellcheck disable=SC2086
           ply=$(git ls-files -s -- $trees | sha256sum | cut -c1-64)
           echo "digest=$(printf '%s\n' "$RUST" "$ply" | sha256sum | cut -c1-40)" >> "$GITHUB_OUTPUT"
       - name: Name where the runs keep their stores
@@ -782,9 +628,6 @@ jobs:
         run: |
           set -euo pipefail
           { echo 'paths<<EOF'; .github/ci-shards.sh store-paths; echo EOF; } >> "$GITHUB_OUTPUT"
-      # Restores the C code that main's last run of this job compiled and saved (`ci-ply.sh keep`).
-      # Without it, the job's first `ply test` generates C for the whole package and its
-      # dependencies before running any test.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: env.PLY_CI_COLD != 'true'
         with:
@@ -795,14 +638,6 @@ jobs:
             ply-c-runs-
       - name: Merge this job's kept C under the stage
         run: .github/ci-ply.sh restore /tmp/ply-c-runs
-      # Restores the result stores (the directories where `ply` saves compiled code and test
-      # results) that earlier runs saved for this job. It looks in three places, in order: the cache
-      # of this branch or main; then the artifact that jobs on other branches upload with `ci-ply.sh
-      # hand`, which is how main's run gets them after a branch merges; then, as a fallback, stores
-      # written by a different toolchain. Those cannot be reused for compiled code, but a passing
-      # test result in them is still valid if that test's code did not change. The paths are glob
-      # patterns that match every package's store, so adding a package does not change the cache
-      # key.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: stores
         if: env.PLY_CI_COLD != 'true'
@@ -824,8 +659,6 @@ jobs:
           restore-keys: ply-stores-${{ matrix.id }}-
       - name: Mark when this job's compiling starts
         run: .github/ci-ply.sh mark
-      # A single test may run for minutes and start many processes or network connections. The step
-      # stops any test that runs longer than 15 minutes.
       - name: Run the Ply tests
         env:
           ID: ${{ matrix.id }}
@@ -845,10 +678,6 @@ jobs:
         with:
           path: ${{ steps.stores-at.outputs.paths }}
           key: ply-stores-${{ matrix.id }}-${{ needs.build-ply.outputs.toolchain }}-${{ github.run_id }}
-      # Packs the result stores into an artifact, only on a pull request whose toolchain main has
-      # not yet built. That is the same run that uploads the toolchain's stage (its compiled
-      # output). Main saves its stores to the cache instead. If packing fails, the run does not
-      # fail: a job that finds no stores builds its own.
       - name: Pack the stores for a run of this toolchain on another branch
         if: ${{ !cancelled() && needs.build-ply.outputs.stage != '' && github.event_name != 'push' }}
         continue-on-error: true
@@ -862,7 +691,6 @@ jobs:
           retention-days: 2
           compression-level: 0
           if-no-files-found: ignore
-      # From main, what this run compiled, for every later run of this job.
       - name: Keep what this run compiled
         if: github.event_name == 'push'
         run: .github/ci-ply.sh keep /tmp/ply-c-runs
@@ -872,10 +700,6 @@ jobs:
           path: /tmp/ply-c-runs
           key: ply-c-runs-${{ matrix.id }}-${{ steps.sources.outputs.digest }}
 
-  # Runs, on a schedule, the test modules that pull requests skip (`ci-shards.sh nightly-modules`
-  # lists them). These are the CLI suite's audits of the repository's own code for unused
-  # definitions and duplicated functions, and the standard library's tests of its postgres client.
-  # Those tests start their own postgres server, which the runner image provides.
   nightly:
     name: Run the suites' nightly modules
     needs: [plan, build-ply]
@@ -898,9 +722,6 @@ jobs:
             if [ "${#modules[@]}" -gt 0 ]; then .github/ci-ply.sh nightly "$role" "${modules[@]}"; fi
           done
 
-  # The editor grammar is a second reading of the language beside the compiler's, so it gets its own
-  # check: regenerate the committed parser, hold the grammar to its test cases, and parse every Ply
-  # module in the tree with it.
   treesitter:
     name: Generate and test the tree-sitter grammar
     runs-on: ubuntu-24.04
@@ -919,7 +740,6 @@ jobs:
           npx tree-sitter generate
           git diff --exit-code -- src
           npx tree-sitter test
-      # A malformed query compiles to nothing, so it is one the build has to refuse.
       - name: Compile the highlight and indent queries
         working-directory: editors/tree-sitter-ply
         run: |
@@ -934,7 +754,6 @@ jobs:
       - name: Parse every Ply module in the tree
         run: editors/tree-sitter-ply/scripts/parse-modules.sh
 
-  # The one check that says a run is green.
   ci:
     name: CI
     if: always()
@@ -949,9 +768,6 @@ jobs:
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # A skipped job counts as passing in three cases: `nightly` runs only on a schedule,
-          # `self-host` is skipped when nothing needed bootstrapping, and `nextest` and `hosts` are
-          # skipped when the Rust tests already passed for this Rust key.
           not_ok=$(jq -r --arg passed "$PASSED" '
             to_entries[]
             | select(.value.result != "success")

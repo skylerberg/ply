@@ -1,10 +1,3 @@
-// Tree-sitter grammar for Ply. The language is defined by `packages/compiler`; this grammar
-// follows the lexer and the parser there, and parses every `.ply` file in the tree without error.
-//
-// Reserved words (from `lexer.ply`'s `is_keyword`): pub import fn type effect nondet test let if
-// else match handle with true false. Every other keyword the language uses is contextual, and this
-// grammar accepts it only where the language does.
-
 const PREC = {
   or: 1,
   and: 2,
@@ -25,7 +18,6 @@ const PREC = {
 const RESERVED = ['fn', 'if', 'pub', 'let', 'type', 'test', 'else', 'with', 'true', 'false', 'match',
   'import', 'effect', 'nondet', 'handle'];
 
-// A field name may be any reserved word (`{nondet: Bool}`), but a punned field may not.
 const FIELD_NAME = $ => choice($.identifier, ...RESERVED);
 
 module.exports = grammar({
@@ -33,8 +25,6 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
-  // `>` closing a type argument is one of the adjacent `>`s the lexer keeps apart, so a scanner
-  // emits them one at a time while `>>` and `>>>` stay expression tokens.
   externals: $ => [$.type_gt, $.label],
 
   extras: $ => [
@@ -55,8 +45,6 @@ module.exports = grammar({
   rules: {
     source_file: $ => repeat(choice($.import_declaration, $._item)),
 
-    // --- Imports ------------------------------------------------------------
-
     import_declaration: $ => seq(
       'import',
       $.module_path,
@@ -67,8 +55,6 @@ module.exports = grammar({
     ),
 
     module_path: $ => seq($.identifier, repeat(seq('.', $.identifier))),
-
-    // --- Items --------------------------------------------------------------
 
     _item: $ => choice(
       $.function_definition,
@@ -169,8 +155,6 @@ module.exports = grammar({
     label_parameter: $ => seq('[', commaSep1($.identifier), ']'),
     effect_parameter: $ => $.identifier,
 
-    // --- Types --------------------------------------------------------------
-
     type_definition: $ => seq(
       optional('pub'),
       optional('opaque'),
@@ -211,9 +195,6 @@ module.exports = grammar({
       $.unit_type,
     ),
 
-    // `List<Int>`, `Map<k, v>`, `fs::MemFs`, `bin::BinCodec<EmbedRead>`; a bare name is a
-    // `type_variable` in a signature and a `type_constructor` in a body, which the checker tells
-    // apart by case, so one token serves both and a query reads the case.
     type_application: $ => choice(
       seq(
         optional(seq(field('module', $.identifier), '::')),
@@ -249,8 +230,6 @@ module.exports = grammar({
 
     record_type: $ => seq('{', commaSep1($.record_type_field), '}'),
     record_type_field: $ => seq(field('name', FIELD_NAME($)), ':', field('type', $._type)),
-
-    // --- Effects ------------------------------------------------------------
 
     effect_definition: $ => seq(
       optional('pub'),
@@ -288,7 +267,6 @@ module.exports = grammar({
     effect_set: $ => seq('{', commaSep1($._effect_set_entry), '}'),
     _effect_set_entry: $ => choice($.effect, $.qualified_name, $.identifier),
 
-    // `name.mode[resource]`, or `name.mode` for a singleton.
     effect: $ => choice(
       'diverges',
       seq(
@@ -310,8 +288,6 @@ module.exports = grammar({
     ),
     listed_effect: $ => seq(choice($.effect, $.qualified_name, $.identifier), optional('bounded')),
     effect_variable: $ => $.identifier,
-
-    // --- Tests and laws -----------------------------------------------------
 
     test_declaration: $ => seq(
       'test',
@@ -352,8 +328,6 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    // The compiler reads a leading `identity(a)` as a constraint where `a` is a type variable of the
-    // claim and as the guard elsewhere; a grammar that cannot see types reads each as an expression.
     _law_where: $ => seq(
       'where',
       field('condition', $._expression),
@@ -390,8 +364,6 @@ module.exports = grammar({
       ':',
       field('function', choice($.identifier, $.qualified_name)),
     ),
-
-    // --- Expressions --------------------------------------------------------
 
     _expression: $ => choice(
       $._literal,
@@ -448,8 +420,6 @@ module.exports = grammar({
       field('operand', $._expression),
     )),
 
-    // A node of its own: were it hidden, an expression would recurse through hidden rules, and a
-    // query that walks past one never finishes compiling.
     binary_expression: $ => choice(
       $._or_expression,
       $._and_expression,
@@ -472,7 +442,6 @@ module.exports = grammar({
     _bitor_expression: $ => prec.left(PREC.bitor, seq($._expression, '|', $._expression)),
     _bitxor_expression: $ => prec.left(PREC.bitxor, seq($._expression, '^', $._expression)),
     _bitand_expression: $ => prec.left(PREC.bitand, seq($._expression, '&', $._expression)),
-    // `>>` and `>>>` are two and three `>` tokens: a type argument closes with adjacent `>`s.
     _shift_expression: $ => prec.left(PREC.shift, seq(
       $._expression,
       choice('<<', '>>', '>>>'),
@@ -530,7 +499,6 @@ module.exports = grammar({
       $.assignment_statement,
       $.expression_statement,
     ),
-    // `x = v` gives a handler's variable a new value; its `;` may be left off before the `}`.
     assignment_statement: $ => seq(
       field('name', $.identifier),
       '=',
@@ -548,7 +516,6 @@ module.exports = grammar({
     ),
     expression_statement: $ => seq($._expression, optional(';')),
 
-    // `{x}` is a block whose value is `x`; a record needs a named field or, punned, a comma.
     record_literal: $ => prec(1, seq('{', choice(
       seq($.record_field_value, repeat(seq(',', $.record_field)), optional(',')),
       seq($.record_field_punned, repeat1(seq(',', $.record_field)), optional(',')),
@@ -629,8 +596,6 @@ module.exports = grammar({
       '}',
     ),
 
-    // --- Patterns -----------------------------------------------------------
-
     _pattern: $ => choice(
       $.wildcard,
       $.identifier,
@@ -696,8 +661,6 @@ module.exports = grammar({
 
     or_pattern: $ => prec.left(seq($._pattern, '|', $._pattern)),
 
-    // --- Literals -----------------------------------------------------------
-
     _literal: $ => choice(
       $.number,
       $.boolean,
@@ -758,8 +721,6 @@ module.exports = grammar({
     byte_literal: $ => token(/b'(\\.|[^'\\\n])*'/),
 
     line_string: $ => token(/(\\\\[^\n]*)(\n[ \t]*\\\\[^\n]*)*/),
-
-    // --- Comments -----------------------------------------------------------
 
     line_comment: $ => token(/\/\/[^\n]*/),
     module_doc_comment: $ => token(prec(3, /\/\/![^\n]*/)),

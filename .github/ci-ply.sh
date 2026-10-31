@@ -1,25 +1,15 @@
 #!/usr/bin/env bash
-# Runs the `ply` commands of CI jobs, and saves and restores the caches they use. The subcommands
-# are `run`, `nightly`, `mark`, `keep`, `restore`, `compact`, `pack` and `unpack`. The usage message
-# at the end of the script lists their arguments, and the comment above each step of the script says
-# what that step does.
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
-# Each path `ply.work` gives a role, as the job's `ply` reads it.
 work() { "$ply" work "$root" | awk -v r="$1" '$1 == r { print $2 }'; }
 TAB=$'\t'
-# The caches `ply` reads, where the workflow restores them.
 caches=/tmp
 mark=$caches/ply-c-runs.mark
-# `ms<TAB>package<TAB>key` per test this job ran, which the job uploads for the run's table of what
-# each test cost.
 durations=$caches/ply-test-durations.tsv
 
-# The directory holding postgres and its tools, for the library's tests that start a cluster: the
-# first on PATH, else the newest of Debian's per-version directories, which are off PATH.
 postgres_bin() {
   local found
   found=$(command -v initdb 2>/dev/null || true)
@@ -28,29 +18,18 @@ postgres_bin() {
 }
 pg=$(postgres_bin)
 
-# The options for running the CLI's test suite. The suite's tests run CLI commands inside the test
-# process, so they need the `ply` binary and `sh` and `git` to start, the working directory, the
-# filesystem root and the repository as filesystems, and the permissions `--allow machine`, `--allow
-# shipped` and `--allow toolchain`, which let tests read the machine, the files shipped with `ply`
-# and the toolchain.
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root"
   --allow machine --allow shipped --allow toolchain)
 
-# The epoch second every `ply` this job starts must end by; empty for no end.
 deadline=${PLY_CI_DEADLINE:-}
-# A run's status when the deadline stopped it, or came before it could start.
 STOPPED=124
 
 past_deadline() { [[ -n $deadline ]] && (($(date +%s) >= deadline)); }
 
-# Milliseconds since the epoch. `date +%s%3N` is GNU's: a Mac's `date` prints the `3N`.
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 
-# Runs the command, and stops it together with every process it started when the deadline arrives.
-# Returns `STOPPED` if the deadline stopped the command, or if the deadline had already passed
-# before the command started.
 bounded() {
   local status=0
   [[ -n $deadline ]] || { "$@"; return; }
@@ -60,19 +39,14 @@ bounded() {
   return "$status"
 }
 
-# Prints an error saying that run ID was stopped at the job's deadline. The error includes the
-# seconds elapsed since STARTED, a time in milliseconds since the epoch.
 stopped_run() {
   echo "::error::the run $2 was stopped at the job's deadline after $((($(now_ms) - $1) / 1000))s: what it finished is cached, and a re-run of this job starts from it"
 }
 
-# Whether the run left a report at $1: a `ply` that crashed or was killed wrote none.
 reported() {
   jq -e 'type == "object"' "$1" > /dev/null 2>&1
 }
 
-# Prints a message saying that run ID ended with STATUS and wrote no report. The tests that finished
-# before it ended are shown in the log above.
 unreported() {
   if (($2 > 128)); then
     echo "the run $1 crashed: signal $(($2 - 128)) ended it before it wrote a report" >&2
@@ -81,21 +55,6 @@ unreported() {
   fi
 }
 
-# Runs `ply test` on the package at PATH (relative to the repository) with ARGS, giving it the
-# permissions its tests need.
-#
-# The CLI's suite runs from a new temporary directory that contains an empty `.ply-scratch` file,
-# because its test harness empties the working directory before each test and refuses to run without
-# that file.
-#
-# The standard library's suites get an emptied directory as the `scratch` filesystem, also with
-# `.ply-scratch`. Tests that check the real handlers, which touch the real file system and programs
-# rather than test doubles, write there. These tests also get permission to run `sh`, so that they
-# can run the shell on the text that `std.text` quotes for it and check the result. The path of the
-# scratch directory is the same in every run, because a cached test pass is valid only for the
-# permissions it ran with.
-#
-# Any other package runs as plain `ply test` with no permissions.
 tested() {
   local path=$1 status=0 dir
   shift
@@ -117,8 +76,6 @@ tested() {
   return "$status"
 }
 
-# What a red run said: each failed test and diagnostic, and a rejected run's diagnostics, each with
-# its notes, which name what was rejected. The report itself is one line too long for a log to show.
 red() {
   jq -r '
     (.failures[]? | ("FAILED \(.key // .name): \(.diagnostic.code // "") \(.diagnostic.message // "")",
@@ -128,15 +85,10 @@ red() {
   ' "$1" 2>/dev/null || cat "$1"
 }
 
-# `ms<TAB>package<TAB>key` per test the report at $1, a run of the package at $2, ran.
 timed() {
   jq -r --arg p "$2" '.results[]? | "\((.duration_ms // 0) | floor)\t\($p)\t\(.key // .name)"' "$1" 2>/dev/null
 }
 
-# Prints one line for each test the report selected, giving the reason it was selected. For a
-# `changed` test the line also names what changed. The marker `unfiled` means the test passed but
-# its result was not saved in the cache. The function also lists each test that was taken from the
-# cache. The result of each test that ran was already printed when it finished.
 listed() {
   jq -r '(.results // [] | map({key: (.key // .name), value: .cached}) | from_entries) as $ran
     | .selection.tests[]? | .key as $key
@@ -144,29 +96,16 @@ listed() {
     | "\(.reason)\t\($key)\(if .moved then ": " + .moved else "" end)\(if $ran[$key] == false then " (unfiled)" else "" end)"' "$1" 2>/dev/null
 }
 
-# How the tests of a run ended, counted.
 summed() {
   jq -r '.summary // {} | "summary: \(.passed // 0) passed, \(.failed // 0) failed, \(.abandoned // 0) abandoned, \(.cached // 0) cached"' "$1" 2>/dev/null
 }
 
-# A jq expression that appends a summary of how the report was loaded. A report's front end loads
-# results by queries, and each query either takes its result from a store or computes it. The
-# summary gives three counts: results taken from a store, results computed, and results computed
-# even though the report named a stored result for them, which happens when that result is missing
-# from every store. The expression yields nothing for a report that has no queries, such as one
-# copied from a cached result.
 answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) query results reused, \([.front_end.queries[].run] | add // 0) computed and \(.front_end.lost // 0) lost" else "" end)'
 
-# Succeeds if some report reports a stored result that it needed but could not find in any store.
-# This happens only when a store is damaged, so stores that are intact never cause it, whatever
-# source edits were made.
 lost() {
   jq -s -e 'any(.[]; (.front_end.lost // 0) > 0)' "$1" > /dev/null 2>&1
 }
 
-# Prints where a `ply test` spent its wall-clock time WALL (in milliseconds), taken from its report.
-# It lists each phase the report timed, counted from the start of the process, and adds `other` for
-# the time after the report was written.
 spent() {
   jq -r --argjson wall "$2" '
     def s(ms): (ms / 1000 | floor | tostring) + "s";
@@ -176,9 +115,6 @@ spent() {
   ' "$1" 2>/dev/null
 }
 
-# Looks up the run ID and sets the caller's variables `path` to the package it tests, `picked` to
-# one `--filter` option for each substring that selects its tests, and `part` to the part of the
-# suite it runs. Returns 2 if the run is unknown.
 placed() {
   local line rest filter
   line=$("$shards" run-line "$1") || return 2
@@ -189,8 +125,6 @@ placed() {
   for filter in ${rest%%"$TAB"*}; do picked+=(--filter "$filter"); done
 }
 
-# `ply test` of the run ID with ARGs added: each test's result as it finishes, then why each ran,
-# where the time went, and what failed. STOPPED when the deadline ended it.
 tests_of() {
   local id=$1 path part status=0 selected out started
   local -a picked=()
@@ -232,9 +166,6 @@ tests_of() {
   rm -f "$out"
 }
 
-# `ply prove` of the run ID with ARGs added, the library's and its fixtures' claims (`proofs`) or a
-# package's (`laws-<id>`): each claim as it is decided, then the tally. It fails when it proves no
-# claim. STOPPED when the deadline ended it.
 proofs_of() {
   local id=$1 path part status=0 out started all cached discharging
   local -a picked=()
@@ -273,8 +204,6 @@ proofs_of() {
   rm -f "$out"
 }
 
-# Prints why a proof run failed: each claim that was not proved, with its outcome and location, and
-# the diagnostics of a run that `ply` rejected.
 disproved() {
   jq -r '
     (.obligations[]? | select(.outcome != "proved")
@@ -289,8 +218,6 @@ marked() {
   [ -f "$mark" ] || { echo "nothing is marked: run 'ci-ply.sh mark' before the runs" >&2; return 1; }
 }
 
-# Prints the absolute path of each directory under which a run keeps a store: every path that
-# `ply.work` places for the standard library, compiler, CLI and packages, but not the test fixtures.
 store_dirs() {
   local dir
   for dir in $(work std) $(work std-tests) $(work compiler) $(work cli) $(work cli-tests) \
@@ -299,17 +226,9 @@ store_dirs() {
   done | LC_ALL=C sort -u
 }
 
-# The directory, relative to the cache directory, that contains the stores of cached records,
-# including the stored results of the C emitter. Each store is one subdirectory. The `sweep`
-# command, which deletes the stale files of a cache, takes each store directory whole and does not
-# look inside it (its `STORES` option).
-# shellcheck disable=SC2100 # `ci-shards.sh verify` reads this line exactly as written.
+# shellcheck disable=SC2100
 stores=ply-c-cache/bodies
 
-# Copies into DIR every store that a run used since `mark` was run, with all its files except those
-# that a running `ply` creates while it uses the store: files named `run*`, the lock file and
-# `*.tmp` files. The store's manifest, the file that lists which of its data files are current, and
-# its segments, the data files holding the records, are copied.
 kept_answers() {
   local dir=$1 store
   rm -rf "$dir"
@@ -355,8 +274,6 @@ case "${1:-}" in
     : > "$durations"
     out=$(mktemp)
     status=0
-    # Turns each leading MODULE argument into a `--filter` option, and passes every argument from
-    # the first one that starts with `-` onward to `ply test` unchanged.
     args=()
     given=0
     for arg in "${@:3}"; do
@@ -364,8 +281,6 @@ case "${1:-}" in
       if ((given)); then args+=("$arg"); else args+=(--filter "$arg."); fi
     done
     [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-ply.sh nightly ROLE [MODULE...] [ARG...]" >&2; exit 2; }
-    # The library's TLS tests trust a certificate for `localhost` alone, made before the run, since
-    # `ply` reads what `--trust` names as it starts.
     if [[ $role == std-tests ]]; then
       certificate=$(mktemp -d)
       openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost \
@@ -402,9 +317,6 @@ case "${1:-}" in
   restore)
     dir=${2:?a directory}
     [ -d "$dir" ] || exit 0
-    # Deletes each store that DIR contains from the cache directory before copying, so a saved store
-    # replaces the existing one completely. The saved store grew from the existing one, and segment
-    # files that belong to different manifests cannot be mixed in one store.
     for store in "$dir/$stores"/*/; do
       [ -d "$store" ] && rm -rf "${caches:?}/$stores/$(basename "$store")"
     done
@@ -414,8 +326,6 @@ case "${1:-}" in
     marked || exit 2
     for dir in $(store_dirs); do
       [ -d "$dir/.ply-cache" ] || continue
-      # Every `ply` that opens a store creates a new directory in it. If nothing in the store is
-      # newer than the file that `ci-ply.sh mark` touched, no run since the mark opened the store.
       if [ -z "$(find "$dir/.ply-cache" -newer "$mark" -print -quit)" ]; then
         rm -rf "$dir/.ply-cache"
         echo "=== ${dir#"$root"/}: opened by no run of this job, and removed"

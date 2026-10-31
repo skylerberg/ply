@@ -58,7 +58,6 @@ trap cleanup EXIT
 
 echo "== 1. the whole suite against the fake, hermetically =="
 "$ply" --color never test "$here/service.ply" --no-cache | tee "$work/step1.out"
-# `ply test` exits 0 over a run that evaluated nothing, so the counts are read, not the status.
 counts="$(grep -E '^[[:space:]]*[0-9]+ failed, [0-9]+ passed, [0-9]+ cached' "$work/step1.out" | tail -n 1 || true)"
 if [ -z "$counts" ]; then
   echo "step 1 printed no summary line to read its counts from" >&2
@@ -87,9 +86,6 @@ if [ -z "$db" ]; then
 fi
 
 echo "== 2. the schema, from examples/service.sql =="
-# Both stores must start from the same seeded state. A database that already has the service's
-# tables is reset only when `--reset` is passed, because a database given with `--db` may contain
-# data.
 if psql -tA -d "$db" -c "select to_regclass('public.items')" | grep -q items; then
   if [ "$reset" -eq 1 ]; then
     psql -v ON_ERROR_STOP=1 -q -d "$db" \
@@ -104,9 +100,6 @@ fi
 psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$here/service.sql"
 echo
 
-# Both services check the same API key, and this script sends that key with every request. If the
-# two services checked different keys, the script's requests would be rejected with 401 by one of
-# them, and a comparison of two identical 401 responses would wrongly pass.
 export SERVICE_API_KEY="${SERVICE_API_KEY:-same-tests-key}"
 
 serve() {
@@ -132,9 +125,6 @@ pg_pid="$(serve postgres "$pg_port" "$work/postgres.log")"
 wait_for "$mem_port" || { echo "the fake never answered:"; cat "$work/memory.log"; exit 1; }
 wait_for "$pg_port" || { echo "postgres never answered:"; cat "$work/postgres.log"; exit 1; }
 
-# Sends one request to both services and compares the two responses. The arguments are the HTTP
-# method, the path, and an optional JSON body. Writes go to both stores, so later reads compare two
-# stores that have seen the same requests. Prints `DIVERGED` and the diff when the responses differ.
 ask() {
   local method="$1" path="$2" body="${3:-}" port out
   for port in "$mem_port" "$pg_port"; do
