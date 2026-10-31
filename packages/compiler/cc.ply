@@ -14,7 +14,6 @@ pub effect toolchain {
   read cache() -> String
   read reuse_dir() -> String
   read bodies_dir() -> String
-  read jobs() -> Int
   read exists(path: String) -> Bool
   read read_file(path: String) -> Option<Bytes>
   write write_file(path: String, bytes: Bytes) -> Bool
@@ -162,51 +161,32 @@ pub fn release() -> Profile =
 
 pub fn profiles() -> List<Profile> = [development(), release()]
 
+type Started = { job: Int, args: List<String> }
+
 fn run_all<[c]>(
   runs: List<List<String>>,
-) -> Result<Unit, String> / {compilers.write[c], toolchain.read, abort.raise} = {
-  let jobs = toolchain.jobs();
-  let rejection = |run: { job: Int, args: List<String> }|
-    match compilers.wait[c](run.job) {
-      None -> None,
-      Some(err) ->
-        Some(
-          "the C compiler rejected `" ++ String::join(run.args, " ") ++ "`:\n"
-            ++ String::of_bytes_lossy(err),
-        ),
-    };
-  let rejected = iterate(
-    { next: 0, running: [], rejected: [], stopped: false },
-    2 * runs.len() + 2,
-    |s: { next: Int, running: List<{ job: Int, args: List<String> }>, rejected: List<String>, stopped: Bool }|
-      if !s.stopped && s.next < runs.len() && s.running.len() < jobs {
-        match compilers.start[c](runs.get(s.next)) {
-          Ok(job) ->
-            Continue({
-              ..s,
-              next: s.next + 1,
-              running: s.running.push({ job: job, args: runs.get(s.next) }),
-            }),
-          Err(reason) ->
-            Continue({
-              ..s,
-              rejected: s.rejected.push("the C compiler could not be started: " ++ reason),
-              stopped: true,
-            }),
-        }
-      } else {
-        match s.running {
-          [] -> Stop(s.rejected),
-          [first, ..rest] ->
-            Continue({
-              ..s,
-              running: rest,
-              rejected: match rejection(first) {
-                Some(reason) -> s.rejected.push(reason),
-                None -> s.rejected,
-              },
-            }),
-        }
+) -> Result<Unit, String> / {compilers.write[c], abort.raise} = {
+  let asked = runs.fold(
+    { started: [], refused: None },
+    |s: { started: List<Started>, refused: Option<String> }, args: List<String>|
+      match s.refused {
+        Some(_) -> s,
+        None -> match compilers.start[c](args) {
+          Ok(job) -> { ..s, started: s.started.push({ job: job, args: args }) },
+          Err(reason) -> { ..s, refused: Some("the C compiler could not be started: " ++ reason) },
+        },
+      },
+  );
+  let rejected = asked.started.fold(
+    match asked.refused { Some(reason) -> [reason], None -> [] },
+    |acc: List<String>, run: Started|
+      match compilers.wait[c](run.job) {
+        None -> acc,
+        Some(err) ->
+          acc.push(
+            "the C compiler rejected `" ++ String::join(run.args, " ") ++ "`:\n"
+              ++ String::of_bytes_lossy(err),
+          ),
       },
   );
   match rejected {
@@ -527,7 +507,6 @@ fn toolchain_handler<a | e>(
     toolchain.cache() -> String::of_bytes_lossy(toolchain_cache()),
     toolchain.reuse_dir() -> String::of_bytes_lossy(toolchain_reused()),
     toolchain.bodies_dir() -> String::of_bytes_lossy(toolchain_bodies()),
-    toolchain.jobs() -> toolchain_jobs(),
     toolchain.exists(path) -> toolchain_holds(path),
     toolchain.read_file(path) -> found(toolchain_held(path)),
     toolchain.write_file(path, bytes) -> toolchain_written(path, bytes),
@@ -554,8 +533,6 @@ extern fn toolchain_cache() -> Bytes / {native.read}
 extern fn toolchain_reused() -> Bytes / {native.read}
 
 extern fn toolchain_bodies() -> Bytes / {native.read}
-
-extern fn toolchain_jobs() -> Int / {native.read}
 
 extern fn toolchain_holds(path: String) -> Bool / {native.read}
 
@@ -701,32 +678,36 @@ test "both profiles optimise native programs the same" {
 fn run_all_with(
   runs: List<List<String>>,
   said: (String) -> Option<Bytes>,
-) -> { result: Result<Unit, String>, started: Int } / {abort.raise} =
+  starts: Int,
+) -> { result: Result<Unit, String>, asked: List<String> } / {abort.raise} =
   handle {
     run_all[cc](runs)
   } with {
-    var started = 0,
+    var asked: List<String> = [],
     compilers.start[cc](args) -> {
-      started = started + 1;
-      Ok(started - 1)
+      let file = match args.last() { Some(f) -> f, None -> "" };
+      if asked.len() == starts {
+        asked = asked.push("refused " ++ file);
+        Err("no `cc` is installed")
+      } else {
+        asked = asked.push("start " ++ file);
+        Ok(asked.len() - 1)
+      }
     },
-    compilers.wait[cc](job) -> said(match runs.get(job).last() { Some(f) -> f, None -> "" }),
-    toolchain.jobs() -> 1,
-    toolchain.cache() -> panic("a run reads no cache"),
-    toolchain.reuse_dir() -> panic("a run reads no cache"),
-    toolchain.bodies_dir() -> panic("a run reads no cache"),
-    toolchain.exists(path) -> panic("a run reads no cache"),
-    toolchain.read_file(path) -> panic("a run reads no cache"),
-    toolchain.libraries() -> panic("a run links no library"),
-    return result -> { result: result, started: started },
+    compilers.wait[cc](job) -> {
+      let file = match runs.get(job).last() { Some(f) -> f, None -> "" };
+      asked = asked.push("wait " ++ file);
+      said(file)
+    },
+    return result -> { result: result, asked: asked },
   }
 
-test "a compile runs every part, and fails once with what the compiler said of each part it rejected" {
+test "a compile starts every part before it waits on any, and fails once with what the compiler said of each part it rejected" {
   let runs = [["-c", "a.c"], ["-c", "b.c"], ["-c", "c.c"]];
   let said = |file: String|
     if file == "b.c" { None } else { Some(Bytes::of_string(file ++ ":1: error: no")) };
-  let r = run_all_with(runs, said);
-  assert_eq(r.started, 3);
+  let r = run_all_with(runs, said, runs.len());
+  assert_eq(r.asked, ["start a.c", "start b.c", "start c.c", "wait a.c", "wait b.c", "wait c.c"]);
   match r.result {
     Ok(_) -> assert(false, Some("a compile two parts rejected succeeded")),
     Err(reason) -> {
@@ -743,11 +724,20 @@ test "a compile runs every part, and fails once with what the compiler said of e
     },
   };
   assert_eq(
-    run_all_with(runs, |file: String|
-      if file == "c.c" { Some(Bytes::of_string("bad")) } else { None }).result,
+    run_all_with(
+      runs,
+      |file: String| if file == "c.c" { Some(Bytes::of_string("bad")) } else { None },
+      runs.len(),
+    ).result,
     Err("the C compiler rejected `-c c.c`:\nbad"),
   );
-  assert_eq(run_all_with(runs, |_: String| None).result, Ok(()))
+  assert_eq(run_all_with(runs, |_: String| None, runs.len()).result, Ok(()))
+}
+
+test "a compiler that will not start stops the runs after it, and the runs it started are still waited on" {
+  let r = run_all_with([["-c", "a.c"], ["-c", "b.c"], ["-c", "c.c"]], |_: String| None, 1);
+  assert_eq(r.asked, ["start a.c", "refused b.c", "wait a.c"]);
+  assert_eq(r.result, Err("the C compiler could not be started: no `cc` is installed"))
 }
 
 fn probe_with(
@@ -765,7 +755,6 @@ fn probe_with(
     },
     compilers.wait[cc](job) -> said,
     toolchain.cache() -> "/cache",
-    toolchain.jobs() -> 1,
     toolchain.exists(path) -> false,
     toolchain.write_file(path, bytes) -> cache_sources,
     toolchain.reuse_dir() -> panic("a probe reads no store"),
@@ -814,7 +803,6 @@ fn fake_build<a>(
     },
     compilers.wait[cc](job) -> None,
     toolchain.cache() -> "/cache",
-    toolchain.jobs() -> 1,
     toolchain.exists(path) -> files.contains(path),
     toolchain.read_file(path) -> files.get(path),
     toolchain.write_file(path, bytes) -> {

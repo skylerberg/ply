@@ -1,5 +1,5 @@
 //! `compiler.cc`'s natives, the family `toolchain` that `--allow toolchain` grants: the C
-//! compilers by label, each run a job of the run's on the waiting pool; the toolchain's cache,
+//! compilers by label, each run a job of the run's in line for a core; the toolchain's cache,
 //! read and written below it and nowhere else, and the programs linked there, each run a job too;
 //! and the asking program's own heap. What to compile, with what flags and what to keep is the
 //! program's: this side only runs what it is asked to and confines where it writes. A compiler's
@@ -37,10 +37,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
         machine_native(
             "toolchain_bodies",
             rt_toolchain_bodies as unsafe extern "C" fn(_) -> _,
-        ),
-        machine_native(
-            "toolchain_jobs",
-            rt_toolchain_jobs as unsafe extern "C" fn(_) -> _,
         ),
         machine_native(
             "toolchain_holds",
@@ -258,9 +254,11 @@ pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> T
     })
 }
 
-/// The compiler the label at `lp` names started with the arguments at `ap`, as parts: byte 1 and
-/// the ticket of its end, eight bytes, which returns byte 0 where it succeeded and byte 1 and what
-/// it wrote to standard error where it did not; or byte 0 and why it could not start.
+/// The compiler the label at `lp` names, run with the arguments at `ap` once a core is free: byte 1
+/// and the ticket of its end, eight bytes, which returns byte 0 where it succeeded and byte 1 and
+/// what it wrote to standard error, or why it did not start, where it did not; or byte 0 and why no
+/// compiler has the label. Runs start in the order asked, as many at once as the machine has cores,
+/// so a program asks for every run before it waits on any.
 pub unsafe extern "C" fn rt_compilers_started(
     ctx: *mut Ctx,
     lp: Addr,
@@ -281,28 +279,21 @@ pub unsafe extern "C" fn rt_compilers_started(
                 let reason = format!("no `{label}` is installed");
                 return c.given([&[0u8][..], reason.as_bytes()].concat());
             };
-            let child = Command::new(&program)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn();
-            let child = match child {
-                Ok(child) => child,
-                Err(e) => {
-                    let reason = format!("`{}`: {e}", program.display());
-                    return c.given([&[0u8][..], reason.as_bytes()].concat());
-                }
-            };
-            let ticket = c.submitted(
+            let ticket = c.queued(
                 "compilers_started",
                 "a compiler",
-                Work::Waiting,
+                Work::Computing,
                 move || {
-                    Ok(match child.wait_with_output() {
+                    let ran = Command::new(&program)
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .output();
+                    Ok(match ran {
                         Ok(out) if out.status.success() => vec![0],
                         Ok(out) => found(Some(out.stderr)),
-                        Err(e) => found(Some(e.to_string().into_bytes())),
+                        Err(e) => found(Some(format!("`{}`: {e}", program.display()).into_bytes())),
                     })
                 },
             );
@@ -334,13 +325,6 @@ pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
 pub unsafe extern "C" fn rt_toolchain_bodies(ctx: *mut Ctx) -> TakenBytes {
     borrowed_toolchain(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::bodies_dir().display().to_string().into_bytes())
-    })
-}
-
-/// How many compilers run at once: the processors the process may run on.
-pub unsafe extern "C" fn rt_toolchain_jobs(ctx: *mut Ctx) -> I64 {
-    borrowed_toolchain(ctx, "toolchain_jobs", Deterministic, I64(1), |_| {
-        I64(std::thread::available_parallelism().map_or(1, |n| n.get()) as i64)
     })
 }
 
