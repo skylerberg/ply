@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 const EFFECT: &str = "std.process.process";
 
-const SERVED_BY: &str = "std.process::host_process";
+const HANDLER_FUNCTION: &str = "std.process::host_process";
 
 pub const PIPE_EFFECT: &str = "std.process.pipe";
 pub const PIPE_BROKEN: &str = "broken";
@@ -39,7 +39,7 @@ impl OutputSink {
         OutputSink::Captured(Mutex::new(Vec::new()))
     }
 
-    fn is_real(&self) -> bool {
+    fn is_uncaptured(&self) -> bool {
         matches!(self, OutputSink::Real { .. })
     }
 
@@ -75,7 +75,7 @@ impl OutputSink {
     }
 
     fn make_way(&self) {
-        if self.is_real() {
+        if self.is_uncaptured() {
             stdio::make_way();
         }
     }
@@ -193,8 +193,8 @@ fn is_executable(_: &Path) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Reach {
-    Own,
+pub enum OperationTarget {
+    OwnProcess,
     Executable,
 }
 
@@ -245,26 +245,26 @@ impl ProcessHost {
         }
     }
 
-    fn owns_the_streams(&self) -> bool {
-        self.whole && self.sink.is_real()
+    fn controls_stdio(&self) -> bool {
+        self.whole && self.sink.is_uncaptured()
     }
 
     pub fn settle(&self) {
-        if self.owns_the_streams() && stdio::settle() {
-            self.end_of_broken_pipe();
+        if self.controls_stdio() && stdio::settle() {
+            self.exit_on_broken_pipe();
         }
     }
 
-    pub fn end_of_broken_pipe(&self) -> ! {
+    pub fn exit_on_broken_pipe(&self) -> ! {
         self.children.end_all();
         stdio::settle();
-        crate::observe::exiting();
+        crate::observe::report_at_exit();
         std::process::exit(stdio::BROKEN_PIPE_STATUS);
     }
 
     pub fn unhandled(&self, effect: &Symbol, op: &Symbol) {
-        if self.owns_the_streams() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
-            self.end_of_broken_pipe();
+        if self.controls_stdio() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
+            self.exit_on_broken_pipe();
         }
     }
 
@@ -280,7 +280,7 @@ impl ProcessHost {
         if self.whole {
             Ok(())
         } else {
-            Err(withheld(op, Reach::Own, span))
+            Err(withheld(op, OperationTarget::OwnProcess, span))
         }
     }
 
@@ -301,7 +301,7 @@ impl ProcessHost {
         self.own(op, span)?;
         match self.sink.line(stream, text) {
             Ok(()) => Ok(()),
-            Err(e) if stdio::reader_gone(&e) => self.end_of_broken_pipe(),
+            Err(e) if stdio::reader_gone(&e) => self.exit_on_broken_pipe(),
             Err(e) => Err(err_write(op, &e, span)),
         }
     }
@@ -381,9 +381,9 @@ impl ProcessHost {
             let (_, child) = started.map_err(Failure::Said)?;
             match child.wait(None) {
                 Ok(Some(exit)) => Ok(exit.flat()),
-                Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(too_much(
-                    "spawn", &program, out, err, span,
-                ))),
+                Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(
+                    err_output_over_limit("spawn", &program, out, err, span),
+                )),
                 Err(ProcessError::Unreaped(reason)) => Err(Failure::Said(format!(
                     "`{}`'s ending could not be read: {reason}",
                     program.display()
@@ -493,21 +493,21 @@ impl ProcessHost {
     }
 }
 
-const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
+const RUN_ONLY_HINT: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
-const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
+const EXEC_LABEL_HINT: &str = "for a label `--exec` binds to a program";
 
 #[cold]
-pub fn withheld(op: &'static str, reach: Reach, span: Span) -> Diagnostic {
+pub fn withheld(op: &'static str, reach: OperationTarget, span: Span) -> Diagnostic {
     let served = match reach {
-        Reach::Own => ONLY_A_RUN,
-        Reach::Executable => AN_EXECUTABLE,
+        OperationTarget::OwnProcess => RUN_ONLY_HINT,
+        OperationTarget::Executable => EXEC_LABEL_HINT,
     };
-    ply_core::host::err_withheld(
+    ply_core::host::err_unbound_operation(
         span,
         &format!("process.{op}"),
         &Symbol::new(EFFECT),
-        SERVED_BY,
+        HANDLER_FUNCTION,
         served,
     )
 }
@@ -527,7 +527,7 @@ fn rejected(
     match rejection {
         ProcessError::Spent => Failure::Rejected(raced(op, handle, span)),
         ProcessError::TooMuch { out, err } => {
-            Failure::Rejected(too_much(op, child.program(), out, err, span))
+            Failure::Rejected(err_output_over_limit(op, child.program(), out, err, span))
         }
         ProcessError::Unreaped(reason) => Failure::Said(format!(
             "child {handle}'s ending could not be read: {reason}"
@@ -570,7 +570,13 @@ pub fn unbound(op: &str, label: &str, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn too_much(op: &str, program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
+fn err_output_over_limit(
+    op: &str,
+    program: &Path,
+    out: usize,
+    err: usize,
+    span: Span,
+) -> Diagnostic {
     Diagnostic::error(
         codes::PROCESS_OUTPUT_TOO_LARGE,
         format!(
@@ -603,7 +609,7 @@ fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) 
         )
         .primary(span, "this handle is spent")
         .note("`process.wait` hands a child back once it has ended, and its handle names nothing after that"),
-        Unusable::Elsewhere(started) => Diagnostic::error(
+        Unusable::StartedUnderOtherLabel(started) => Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!(
                 "child {handle} was started as `process.start{started}` and is used as `process.{op}{at}`"

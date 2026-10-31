@@ -12,19 +12,19 @@ pub struct Counted {
 
 static ON: AtomicBool = AtomicBool::new(false);
 static ATTRIBUTE: AtomicBool = AtomicBool::new(false);
-static SAMPLE: AtomicU32 = AtomicU32::new(0);
+static SITE_WALK_EVERY: AtomicU32 = AtomicU32::new(0);
 static SEEN: AtomicU64 = AtomicU64::new(0);
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
-static ATTRIBUTING: AtomicU64 = AtomicU64::new(0);
+static ATTRIBUTIONS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static SITES: Mutex<BTreeMap<String, Counted>> = Mutex::new(BTreeMap::new());
-static RESOLVED: Mutex<BTreeMap<usize, Vec<String>>> = Mutex::new(BTreeMap::new());
+static SYMBOL_NAMES_BY_ADDRESS: Mutex<BTreeMap<usize, Vec<String>>> = Mutex::new(BTreeMap::new());
 
 thread_local! {
     static INSIDE: Cell<bool> = const { Cell::new(false) };
 }
 
-const FRAMES: usize = 3;
+const SITE_FRAME_LIMIT: usize = 3;
 
 pub struct Counting;
 
@@ -49,14 +49,14 @@ impl Counting {
 
     #[inline(never)]
     fn attribute(allocations: u64, bytes: u64) {
-        ATTRIBUTING.fetch_add(1, Ordering::SeqCst);
+        ATTRIBUTIONS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         if !ON.load(Ordering::SeqCst) {
-            ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
+            ATTRIBUTIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             return;
         }
         let already = INSIDE.with(|c| c.replace(true));
         if already {
-            ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
+            ATTRIBUTIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             return;
         }
         ALLOCS.fetch_add(allocations, Ordering::Relaxed);
@@ -70,19 +70,19 @@ impl Counting {
             }
         }
         INSIDE.with(|c| c.set(false));
-        ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
+        ATTRIBUTIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 #[inline]
 fn sampled() -> bool {
-    sampled_nth(
+    is_sampled(
         SEEN.fetch_add(1, Ordering::Relaxed),
-        SAMPLE.load(Ordering::Relaxed),
+        SITE_WALK_EVERY.load(Ordering::Relaxed),
     )
 }
 
-pub fn sampled_nth(n: u64, every: u32) -> bool {
+pub fn is_sampled(n: u64, every: u32) -> bool {
     every <= 1 || (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58).is_multiple_of(u64::from(every))
 }
 
@@ -90,9 +90,9 @@ fn site() -> String {
     let mut frames: Vec<String> = Vec::new();
     backtrace::trace(|frame| {
         named(frame, &mut frames);
-        frames.len() < FRAMES
+        frames.len() < SITE_FRAME_LIMIT
     });
-    frames.truncate(FRAMES);
+    frames.truncate(SITE_FRAME_LIMIT);
     if frames.is_empty() {
         "<no ply frame>".to_string()
     } else {
@@ -110,7 +110,7 @@ fn named(frame: &backtrace::Frame, into: &mut Vec<String>) {
 
 fn resolved_names(frame: &backtrace::Frame) -> Vec<String> {
     let at = frame.ip() as usize;
-    if let Ok(cache) = RESOLVED.lock()
+    if let Ok(cache) = SYMBOL_NAMES_BY_ADDRESS.lock()
         && let Some(hit) = cache.get(&at)
     {
         return hit.clone();
@@ -127,7 +127,7 @@ fn resolved_names(frame: &backtrace::Frame) -> Vec<String> {
             found.push(cut.to_string());
         }
     });
-    if let Ok(mut cache) = RESOLVED.lock() {
+    if let Ok(mut cache) = SYMBOL_NAMES_BY_ADDRESS.lock() {
         cache.insert(at, found.clone());
     }
     found
@@ -158,10 +158,10 @@ pub fn window<R>(
     f: impl FnOnce() -> R,
     attribute: bool,
 ) -> (R, Counted, BTreeMap<String, Counted>) {
-    window_sampled(f, u32::from(attribute))
+    count_allocations_sampled(f, u32::from(attribute))
 }
 
-pub fn window_sampled<R>(
+pub fn count_allocations_sampled<R>(
     f: impl FnOnce() -> R,
     every: u32,
 ) -> (R, Counted, BTreeMap<String, Counted>) {
@@ -171,13 +171,13 @@ pub fn window_sampled<R>(
     if let Ok(mut sites) = SITES.lock() {
         sites.clear();
     }
-    SAMPLE.store(every, Ordering::Relaxed);
+    SITE_WALK_EVERY.store(every, Ordering::Relaxed);
     ATTRIBUTE.store(every >= 1, Ordering::Relaxed);
     ON.store(true, Ordering::Relaxed);
     let result = f();
     ON.store(false, Ordering::Relaxed);
     ATTRIBUTE.store(false, Ordering::Relaxed);
-    while ATTRIBUTING.load(Ordering::SeqCst) != 0 {
+    while ATTRIBUTIONS_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
         std::hint::spin_loop();
     }
     let counted = Counted {

@@ -8,7 +8,7 @@ pub const TRACE_VAR: &str = "PLY_TRACE";
 
 const END: &str = "end";
 
-const SPLIT: &str = "split";
+const SPLIT_EVENT: &str = "split";
 
 const OWN: char = '\u{1f}';
 
@@ -30,7 +30,7 @@ impl Read {
         }
     }
 
-    fn of_word(word: &str) -> Option<Read> {
+    fn from_name(word: &str) -> Option<Read> {
         match word {
             "file" => Some(Read::File),
             "dir" => Some(Read::Dir),
@@ -48,7 +48,7 @@ struct Reads {
 }
 
 #[derive(Default)]
-struct Observed {
+struct Observations {
     reads: BTreeSet<(Read, PathBuf)>,
     writes: BTreeSet<PathBuf>,
     shipped: BTreeMap<String, Reads>,
@@ -63,7 +63,7 @@ struct Observed {
 
 #[derive(Default)]
 pub struct Recorder {
-    observed: Mutex<Observed>,
+    observed: Mutex<Observations>,
 }
 
 static PROCESS: OnceLock<Arc<Recorder>> = OnceLock::new();
@@ -84,11 +84,11 @@ static SHIPPED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 static CACHE_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
-const STORE: &str = ".ply-cache";
+const CACHE_DIR_NAME: &str = ".ply-cache";
 
 const VCS: &str = ".git";
 
-pub fn laid_out(shipped_dir: &Path, cache_dirs: Vec<PathBuf>) {
+pub fn set_shipped_and_cache_dirs(shipped_dir: &Path, cache_dirs: Vec<PathBuf>) {
     let _ = SHIPPED_DIR.set(resolved(shipped_dir));
     set_cache_dirs(cache_dirs);
 }
@@ -127,7 +127,7 @@ pub fn at_exit(f: extern "C" fn()) {
 
 fn is_ignored(path: &Path) -> bool {
     path.components()
-        .any(|c| c.as_os_str() == STORE || c.as_os_str() == VCS)
+        .any(|c| c.as_os_str() == CACHE_DIR_NAME || c.as_os_str() == VCS)
         || CACHE_DIRS
             .get()
             .is_some_and(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
@@ -145,7 +145,7 @@ pub fn reports_with(reporter: Reporter) {
     let _ = REPORTER.set(reporter);
 }
 
-pub fn exiting() {
+pub fn report_at_exit() {
     if let Some(report) = REPORTER.get() {
         report();
     }
@@ -158,7 +158,7 @@ pub fn process_wrote(path: &Path) {
 }
 
 impl Recorder {
-    fn observed(&self) -> MutexGuard<'_, Observed> {
+    fn observed(&self) -> MutexGuard<'_, Observations> {
         self.observed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -264,7 +264,7 @@ impl Recorder {
     }
 }
 
-fn merge(into: &mut Observed, from: &Observed) {
+fn merge(into: &mut Observations, from: &Observations) {
     into.reads.extend(from.reads.iter().cloned());
     into.writes.extend(from.writes.iter().cloned());
     for (name, reads) in &from.shipped {
@@ -288,7 +288,7 @@ fn settle(lines: &mut BTreeMap<String, String>, line: String, digest: String) {
         .entry(line)
         .and_modify(|held| {
             if *held != digest {
-                *held = SPLIT.to_string();
+                *held = SPLIT_EVENT.to_string();
             }
         })
         .or_insert(digest);
@@ -299,7 +299,7 @@ pub struct Binary<'a> {
     pub program: String,
 }
 
-fn digested(o: &Observed, binary: &Binary<'_>) -> BTreeMap<String, String> {
+fn digested(o: &Observations, binary: &Binary<'_>) -> BTreeMap<String, String> {
     let mut lines = o.digested.clone();
     for (name, reads) in &o.shipped {
         if reads.read > reads.viewed {
@@ -318,7 +318,7 @@ fn digested(o: &Observed, binary: &Binary<'_>) -> BTreeMap<String, String> {
 
 pub fn report(recorder: &Recorder, binary: &Binary<'_>) -> String {
     let mut o = recorder.observed();
-    fold_children(&mut o);
+    merge_child_observations(&mut o);
     let mut out = String::new();
     for (how, path) in &o.reads {
         out.push_str(&format!("read\t{}\t{}\n", how.word(), path.display()));
@@ -337,7 +337,7 @@ pub fn report(recorder: &Recorder, binary: &Binary<'_>) -> String {
     out
 }
 
-fn fold_children(o: &mut Observed) {
+fn merge_child_observations(o: &mut Observations) {
     for file in std::mem::take(&mut o.children) {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
@@ -352,7 +352,7 @@ fn fold_children(o: &mut Observed) {
             let fields: Vec<&str> = line.split('\t').collect();
             match fields.as_slice() {
                 ["read", how, path] => {
-                    if let Some(how) = Read::of_word(how) {
+                    if let Some(how) = Read::from_name(how) {
                         o.reads.insert((how, PathBuf::from(path)));
                     }
                 }
@@ -425,7 +425,7 @@ fn returned(how: Read, path: &Path, own: &[PathBuf]) -> String {
             Some(entries) => {
                 hasher.update(b"entries\0");
                 for (name, kind) in entries {
-                    if name == STORE || own.iter().any(|o| o == Path::new(&name)) {
+                    if name == CACHE_DIR_NAME || own.iter().any(|o| o == Path::new(&name)) {
                         continue;
                     }
                     hasher.update(name.as_bytes());
@@ -445,12 +445,12 @@ fn returned(how: Read, path: &Path, own: &[PathBuf]) -> String {
             };
             hasher.update(kind.as_bytes());
         }
-        Read::Tree => tree_into(&mut hasher, path, Path::new(""), own),
+        Read::Tree => hash_tree(&mut hasher, path, Path::new(""), own),
     }
     hasher.finalize().to_hex().to_string()
 }
 
-fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[PathBuf]) {
+fn hash_tree(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[PathBuf]) {
     let Ok(entries) = std::fs::read_dir(root.join(below)) else {
         hasher.update(b"none");
         return;
@@ -459,7 +459,7 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[Path
     names.sort();
     for name in names {
         let rel = below.join(&name);
-        if name == STORE || own.iter().any(|o| rel.starts_with(o)) {
+        if name == CACHE_DIR_NAME || own.iter().any(|o| rel.starts_with(o)) {
             continue;
         }
         hasher.update(rel.to_string_lossy().as_bytes());
@@ -470,7 +470,7 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[Path
             }
             Ok(m) if m.is_dir() => {
                 hasher.update(b"dir\0");
-                tree_into(hasher, root, &rel, own);
+                hash_tree(hasher, root, &rel, own);
             }
             Ok(_) => {
                 hasher.update(b"file\0");
@@ -509,7 +509,7 @@ fn configured_digest(value: Option<&str>) -> String {
 
 pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<Trace> {
     let mut observed = recorder.observed();
-    fold_children(&mut observed);
+    merge_child_observations(&mut observed);
     if !observed.opaque.is_empty() || !observed.secrets.is_empty() {
         return None;
     }
@@ -525,7 +525,7 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
         if observed.writes.iter().any(|w| path.starts_with(w)) {
             continue;
         }
-        let own = own_below(*how, path, &observed.writes);
+        let own = paths_written_under(*how, path, &observed.writes);
         let (root, rest) = rooted(path, roots);
         let listed: Vec<String> = own
             .iter()
@@ -548,7 +548,7 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
     )
 }
 
-fn own_below(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+fn paths_written_under(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let below = writes.iter().filter_map(|w| w.strip_prefix(path).ok());
     let own: BTreeSet<PathBuf> = match how {
         Read::Dir => below
@@ -592,7 +592,7 @@ pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<
                 noted(&|r| r.configured(key, now));
                 configured_digest(now) == *digest
             }
-            [how, root, rest, own, digest] => match Read::of_word(how) {
+            [how, root, rest, own, digest] => match Read::from_name(how) {
                 Some(how) => match located(root, rest, world.roots) {
                     Some(path) => {
                         let own: Vec<PathBuf> = own

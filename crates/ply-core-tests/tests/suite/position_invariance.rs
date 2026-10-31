@@ -13,7 +13,7 @@ test "the growing argument is last in the call" {
 }
 "#;
 
-const CALL_ARG_PESSIMAL: &str = r#"
+const CALL_ARG_WORST_CASE: &str = r#"
 fn go(acc: List<Int>, i: Int) -> List<Int> =
   if i >= 200 { acc } else { go(push(acc, i), i + 1) }
 
@@ -32,7 +32,7 @@ test "the growing field is last in its literal" {
 }
 "#;
 
-const RECORD_FIELD_PESSIMAL: &str = r#"
+const RECORD_FIELD_WORST_CASE: &str = r#"
 fn go(i: Int, s: {k: Int, out: List<Int>}) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go(i + 1, {out: push(s.out, i), k: s.k + 1}) }
 
@@ -42,7 +42,7 @@ test "the growing field is first in its literal" {
 }
 "#;
 
-const COMPOUNDING_PESSIMAL: &str = r#"
+const GROWING_LAST_FIELD_PROGRAM: &str = r#"
 fn go(s: {k: Int, out: List<Int>}, i: Int) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go({k: s.k + 1, out: push(s.out, i)}, i + 1) }
 
@@ -68,7 +68,7 @@ test "the accumulator arrives as a let binding" {
 }
 "#;
 
-const PARAM_VS_LET_PESSIMAL: &str = r#"
+const PARAM_VS_LET_WORST_CASE: &str = r#"
 fn inner(xs: List<Int>) -> Int = {
   let t = push(xs, 1);
   let u = 7;
@@ -95,7 +95,7 @@ test "a fold accumulator appended in last position" {
 }
 "#;
 
-const FOLD_CLOSURE_PESSIMAL: &str = r#"
+const FOLD_CLOSURE_WORST_CASE: &str = r#"
 fn keep_first(a: List<Int>, i: Int) -> List<Int> = a
 
 fn build() -> List<Int> = fold(range(0, 200), [], |acc, x| keep_first(push(acc, x), x))
@@ -112,27 +112,27 @@ fn all_pairs() -> Vec<Pair> {
         Pair {
             name: "call argument",
             canonical: CALL_ARG_CANONICAL,
-            pessimal: CALL_ARG_PESSIMAL,
+            pessimal: CALL_ARG_WORST_CASE,
         },
         Pair {
             name: "record field",
             canonical: RECORD_FIELD_CANONICAL,
-            pessimal: RECORD_FIELD_PESSIMAL,
+            pessimal: RECORD_FIELD_WORST_CASE,
         },
         Pair {
             name: "compounding: field last, record first",
             canonical: RECORD_FIELD_CANONICAL,
-            pessimal: COMPOUNDING_PESSIMAL,
+            pessimal: GROWING_LAST_FIELD_PROGRAM,
         },
         Pair {
             name: "let binding against parameter",
             canonical: PARAM_VS_LET_CANONICAL,
-            pessimal: PARAM_VS_LET_PESSIMAL,
+            pessimal: PARAM_VS_LET_WORST_CASE,
         },
         Pair {
             name: "fold closure accumulator",
             canonical: FOLD_CLOSURE_CANONICAL,
-            pessimal: FOLD_CLOSURE_PESSIMAL,
+            pessimal: FOLD_CLOSURE_WORST_CASE,
         },
     ]
 }

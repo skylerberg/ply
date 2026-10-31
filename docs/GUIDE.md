@@ -327,13 +327,12 @@ bytes can therefore write byte literals such as `b'{'` as patterns in `match` in
 (§6.2).
 
 **Interpolated strings.** `f"a {x} b"` means `"a " ++ display(x) ++ " b"`. Each `{...}` in the
-string is a *hole*. In this expansion, `display(x)` stands for the following rule: if `x` is a
-`String` or `Char`, the string contains `x` unchanged. Otherwise it contains the text that `show`
-writes for `x`. A hole may contain any expression. `{{` and `}}` are literal braces. The value in a
-hole must be *showable*, meaning `show` can write it. A function, `Secret`, `Task` or `Chan` in a
-hole is an error (`E0206`). A module that interpolates imports `std.show` automatically. If
-`std.show` or a module it imports interpolated, that would make an import cycle, so those modules
-cannot interpolate.
+string is a *hole*. Here `display(x)` is `x` itself when `x` is a `String` or `Char`, and otherwise
+the text that `show` writes for `x`. A hole may contain any expression. `{{` and `}}` are literal
+braces. The value in a hole must be *showable*, meaning `show` can write it. A function, `Secret`,
+`Task` or `Chan` in a hole is an error (`E0206`). A module that interpolates imports `std.show`
+automatically. If `std.show` or a module it imports interpolated, that would make an import cycle,
+so those modules cannot interpolate.
 
 **Line strings.** Each line starts with `\\`, after optional spaces. The text after `\\` is taken
 exactly as written, with no escapes. Lines are joined with `\n`, and no newline follows the last
@@ -438,7 +437,8 @@ From loosest to tightest binding. Every binary operator is left-associative.
   not fit in the type's range. The second is a `Decimal` result that cannot be represented exactly
   in `Decimal`. The third is a shift by a negative count, or by a count at least as large as the
   type's width in bits. Division by zero is different, because it raises `abort.raise`. These three
-  do not raise it: they end the program directly, so they do not appear in a function's effects.
+  do not raise `abort.raise`: they end the program directly, so they do not appear in a function's
+  effects.
 - `+%`, `-%` and `*%` wrap at the type's width, and `+|`, `-|` and `*|` saturate at its limits:
   `255u8 +% 1u8` is `0u8` and `250u8 +| 10u8` is `255u8`. They never fail. Write a space before a
   lambda used as a right operand (`a + |x| x`), since `+|` would otherwise be one operator.
@@ -496,11 +496,10 @@ pub fn reward_of(r: Rewards, p: Player) -> Float = ..
 `???`, or `..` in place of a body, is a *hole*: code not written yet. A hole has whatever type is
 needed and performs no effects, so the program still checks and runs. Each hole produces a warning
 (`W0613`). The warning reports three things: the type the hole must have, the effects the hole may
-perform, and up to eight names in scope whose type could fill the hole. Running a hole at run time
-fails with the `abort.raise` effect, which aborts the program. Tests that run a hole therefore fail,
-and all other tests pass. You can write a file of signatures whose bodies are all holes and run `ply
-check` on it. The check shows whether the types and effects of the design fit together before any
-body exists.
+perform, and up to eight names in scope whose type could fill the hole. Running a hole raises
+`abort.raise`, so the tests that run a hole fail and all other tests pass. You can write a file of
+signatures whose bodies are all holes and run `ply check` on it. The check shows whether the types
+and effects of the design fit together before any body exists.
 
 ### 4.3 Imports and visibility
 

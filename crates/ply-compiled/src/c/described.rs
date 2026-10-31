@@ -1,15 +1,15 @@
-use super::prelude::{machine_natives, own_helpers};
-use crate::blocks::{self, Filling, Page, Segment};
+use super::prelude::{runtime_helpers, runtime_natives};
+use crate::blocks::{self, ActivePages, Page, Segment};
 use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
 use crate::frames::PlyFrame;
 use crate::heap::{self, Alloc, Obj};
-use crate::native::{Machine, Signature};
+use crate::native::{MachineType, Signature};
 use crate::rt::Ctx;
 use std::fmt::Write;
 use std::mem::{offset_of, size_of};
 
 pub fn natives() -> impl Iterator<Item = (&'static str, Signature)> {
-    machine_natives().iter().map(|n| (n.name, n.signature))
+    runtime_natives().iter().map(|n| (n.name, n.signature))
 }
 
 fn field_bytes<S, F>(_field: fn(&S) -> &F) -> usize {
@@ -38,7 +38,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
     laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
         listed, spare);
-    laid!(out, Filling as "PlyFilling": pages, name, reused);
+    laid!(out, ActivePages as "PlyFilling": pages, name, reused);
     laid!(out, Alloc as "PlyAlloc": blocks, count, slow);
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
@@ -49,8 +49,8 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("alloc.segment", blocks::SEGMENT),
         ("alloc.page", blocks::PAGE),
         ("alloc.pages_at", offset_of!(Segment, pages)),
-        ("alloc.word_classes", blocks::WORD_CLASSES),
-        ("alloc.link_at", blocks::LINK_AT),
+        ("alloc.word_classes", blocks::WORD_STEP_SIZE_CLASSES),
+        ("alloc.link_at", blocks::LINK_OFFSET),
         ("count.frame", heap::FRAME as usize),
         ("count.immortal", heap::IMMORTAL as usize),
         ("count.shared", heap::SHARED as usize),
@@ -58,10 +58,13 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("release_depth", crate::rt::RELEASE_DEPTH as usize),
         ("hold.held", crate::rt::SCOPED_VALUE),
         ("closure.descriptor", heap::CLOSURE_CODE),
-        ("failed.target", crate::rt::FAILED_TARGET as usize),
-        ("failed.pending", crate::rt::FAILED_PENDING as usize),
+        (
+            "failed.target",
+            crate::rt::FAILED_UNWOUND_TO_HANDLER as usize,
+        ),
+        ("failed.pending", crate::rt::FAILED_PENDING_RAISE as usize),
         ("unwinding.words", crate::rt::UNWINDING_WORDS),
-        ("instance.head", crate::detached::INSTANCE_HEAD),
+        ("instance.head", crate::detached::INSTANCE_HEADER_WORDS),
         ("instance.detached", crate::detached::INSTANCE_DETACHED),
         ("instance.vars", crate::detached::INSTANCE_VARS),
         ("record.closure", crate::detached::RECORD_CLOSURE),
@@ -72,7 +75,7 @@ fn facts() -> Vec<(&'static str, usize)> {
 }
 
 fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
-    let result = s.result.map_or("-", Machine::name);
+    let result = s.result.map_or("-", MachineType::name);
     let _ = write!(out, "{kind} {name} {} {result}", u8::from(s.raises));
     for p in s.params {
         let _ = write!(out, " {}", p.name());
@@ -88,7 +91,7 @@ pub fn described() -> &'static str {
         for (name, s) in natives() {
             function_line(&mut out, "native", name, s);
         }
-        for h in own_helpers() {
+        for h in runtime_helpers() {
             function_line(&mut out, "helper", h.name, h.signature);
         }
         for (name, value) in facts() {

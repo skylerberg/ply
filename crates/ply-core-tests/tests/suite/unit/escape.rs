@@ -3,8 +3,8 @@ use ply_core::{Span, codes};
 
 #[test]
 fn an_entry_point_returning_a_continuation_is_rejected_and_the_message_gives_the_path_to_it() {
-    let boundary = Boundary::EntryResult { name: "m.parked" };
-    let escapee = Escapee {
+    let boundary = Boundary::ReturnedFromEntry { name: "m.parked" };
+    let escapee = EscapedHandle {
         handle: Handle::Continuation,
         route: vec!["item 1".into(), "`m.Just`'s argument 1".into()],
     };
@@ -30,13 +30,13 @@ fn an_entry_point_returning_a_continuation_is_rejected_and_the_message_gives_the
 #[test]
 fn a_task_handle_returned_directly_from_an_entry_point_is_rejected_with_a_message_that_has_no_field_path()
  {
-    let escapee = Escapee {
+    let escapee = EscapedHandle {
         handle: Handle::Task,
         route: Vec::new(),
     };
     assert_eq!(escapee.reached(), "");
     let d = rejected(
-        &Boundary::EntryResult { name: "m.spawned" },
+        &Boundary::ReturnedFromEntry { name: "m.spawned" },
         &escapee,
         Span::DUMMY,
     );

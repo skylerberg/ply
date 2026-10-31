@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# `examples/service.ply`'s endpoints run unchanged against its in-memory fake and against postgres,
-# checked the two ways that can be checked:
+# Checks that the endpoints of `examples/service.ply` behave the same against its in-memory fake
+# store and against postgres.
 #
-#   1. `ply test examples/service.ply --no-cache`: the whole suite against the fake, hermetic, and
-#      every test evaluated rather than served from a cache.
-#   2. The one service started twice, `SERVICE_STORE=memory` and `SERVICE_STORE=postgres`, the same requests
-#      sent to both, and the answers compared byte for byte.
-#   3. The transactional route against postgres, checked in the database: an order that commits
-#      leaves a row, and one refused after its row was inserted leaves none.
+# The script runs three checks: 1. `ply test examples/service.ply --no-cache` runs the whole suite
+# against the fake store. `--no-cache` makes every test run again instead of reusing an earlier
+# result. 2. It starts the service twice, once with `SERVICE_STORE=memory` and once with
+# `SERVICE_STORE=postgres`. It sends the same requests to both and compares the responses byte for
+# byte. 3. It queries postgres to check the transactional route. An order that commits must leave a
+# row in the orders table. An order that is rejected after its row was inserted must leave no row.
 #
-#     examples/same-tests.sh                              # starts a postgres of its own
-#     examples/same-tests.sh --db postgres://localhost/x  # uses the one you name
-#     examples/same-tests.sh --db ... --reset             # drops its tables first
-#     PLY_BIN=target/release/ply examples/same-tests.sh   # measures the binary you name
+# Usage: examples/same-tests.sh                              # starts a postgres server of its own
+# examples/same-tests.sh --db postgres://localhost/x  # uses the database you name
+# examples/same-tests.sh --db ... --reset             # drops the service's tables first
+# PLY_BIN=target/release/ply examples/same-tests.sh   # runs the `ply` binary you name
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,7 +72,6 @@ if [ "$cached" -ne 0 ] || [ "$passed" -lt 1 ]; then
 fi
 echo
 
-# A cluster of the script's own, on a port and in a directory nothing else uses.
 if [ -z "$db" ]; then
   command -v initdb >/dev/null || { echo "no --db and no initdb on PATH" >&2; exit 2; }
   cluster_port="${PLY_PG_CLUSTER_PORT:-55433}"
@@ -88,8 +87,9 @@ if [ -z "$db" ]; then
 fi
 
 echo "== 2. the schema, from examples/service.sql =="
-# Both stores start from the seeded state, so a database with the tables in it is reset only when
-# asked: one named with `--db` may hold data.
+# Both stores must start from the same seeded state. A database that already has the service's
+# tables is reset only when `--reset` is passed, because a database given with `--db` may contain
+# data.
 if psql -tA -d "$db" -c "select to_regclass('public.items')" | grep -q items; then
   if [ "$reset" -eq 1 ]; then
     psql -v ON_ERROR_STOP=1 -q -d "$db" \
@@ -104,7 +104,9 @@ fi
 psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$here/service.sql"
 echo
 
-# One credential for both services: two that refused each other's key would agree on every 401.
+# Both services check the same API key, and this script sends that key with every request. If the
+# two services checked different keys, the script's requests would be rejected with 401 by one of
+# them, and a comparison of two identical 401 responses would wrongly pass.
 export SERVICE_API_KEY="${SERVICE_API_KEY:-same-tests-key}"
 
 serve() {
@@ -130,8 +132,9 @@ pg_pid="$(serve postgres "$pg_port" "$work/postgres.log")"
 wait_for "$mem_port" || { echo "the fake never answered:"; cat "$work/memory.log"; exit 1; }
 wait_for "$pg_port" || { echo "postgres never answered:"; cat "$work/postgres.log"; exit 1; }
 
-# One request to both services. The writes move both stores in step, so the reads after them compare
-# two stores that have seen the same history.
+# Sends one request to both services and compares the two responses. The arguments are the HTTP
+# method, the path, and an optional JSON body. Writes go to both stores, so later reads compare two
+# stores that have seen the same requests. Prints `DIVERGED` and the diff when the responses differ.
 ask() {
   local method="$1" path="$2" body="${3:-}" port out
   for port in "$mem_port" "$pg_port"; do

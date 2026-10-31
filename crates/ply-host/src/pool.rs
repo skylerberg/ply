@@ -16,47 +16,47 @@ pub type JobOutput = Result<Vec<u8>, Failure>;
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
 #[derive(Default)]
-pub struct Bell {
-    rung: Mutex<u64>,
+pub struct WakeCounter {
+    count: Mutex<u64>,
     heard: Condvar,
 }
 
-impl Bell {
-    pub fn rung(&self) -> u64 {
-        *lock(&self.rung)
+impl WakeCounter {
+    pub fn count(&self) -> u64 {
+        *lock(&self.count)
     }
 
-    pub fn wait_past(&self, seen: u64) {
-        let mut rung = lock(&self.rung);
-        while *rung == seen {
-            rung = wait(&self.heard, rung);
+    pub fn wait_for_change(&self, seen: u64) {
+        let mut count = lock(&self.count);
+        while *count == seen {
+            count = wait(&self.heard, count);
         }
     }
 
-    pub fn wait_past_for(&self, seen: u64, bound: Duration) {
-        let rung = lock(&self.rung);
-        if *rung == seen {
-            drop(wait_timeout(&self.heard, rung, bound));
+    pub fn wait_for_change_timeout(&self, seen: u64, bound: Duration) {
+        let count = lock(&self.count);
+        if *count == seen {
+            drop(wait_timeout(&self.heard, count, bound));
         }
     }
 
     pub(crate) fn ring(&self) {
-        *lock(&self.rung) += 1;
+        *lock(&self.count) += 1;
         self.heard.notify_all();
     }
 }
 
 pub struct Run {
     held: Mutex<HashMap<u64, Held>>,
-    secrets: Mutex<Secrets>,
+    secrets: Mutex<SecretTable>,
     recorder: Mutex<Option<Arc<Recorder>>>,
-    bell: Arc<Bell>,
+    bell: Arc<WakeCounter>,
 }
 
 pub type Kept = Zeroizing<Vec<u8>>;
 
 #[derive(Default)]
-struct Secrets {
+struct SecretTable {
     last: i64,
     kept: HashMap<i64, Kept>,
 }
@@ -69,16 +69,16 @@ struct Held {
 }
 
 impl Run {
-    pub fn new(bell: Arc<Bell>) -> Arc<Run> {
+    pub fn new(bell: Arc<WakeCounter>) -> Arc<Run> {
         Arc::new(Run {
             held: Mutex::new(HashMap::new()),
-            secrets: Mutex::new(Secrets::default()),
+            secrets: Mutex::new(SecretTable::default()),
             recorder: Mutex::new(None),
             bell,
         })
     }
 
-    pub fn bell(&self) -> &Arc<Bell> {
+    pub fn bell(&self) -> &Arc<WakeCounter> {
         &self.bell
     }
 
@@ -90,7 +90,7 @@ impl Run {
         lock(&self.recorder).clone()
     }
 
-    pub fn keep_secret(&self, secret: Kept) -> i64 {
+    pub fn store_secret(&self, secret: Kept) -> i64 {
         let mut secrets = lock(&self.secrets);
         secrets.last += 1;
         let number = secrets.last;
@@ -98,7 +98,7 @@ impl Run {
         number
     }
 
-    pub fn take_secret(&self, number: i64) -> Option<Kept> {
+    pub fn remove_secret(&self, number: i64) -> Option<Kept> {
         lock(&self.secrets).kept.remove(&number)
     }
 
@@ -148,7 +148,7 @@ impl Run {
                 held.watched = true;
                 Ok(())
             }
-            None => Err(err_unowned(pending)),
+            None => Err(err_token_not_pending_here(pending)),
         }
     }
 
@@ -170,7 +170,7 @@ impl Run {
     pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
-            None => return Err(err_unowned(pending)),
+            None => return Err(err_token_not_pending_here(pending)),
             Some(h) if h.result.is_none() => return Ok(None),
             Some(_) => {}
         }
@@ -194,18 +194,18 @@ impl Run {
     ) -> Result<Option<Vec<u8>>, Diagnostic> {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
-            let seen = self.bell.rung();
+            let seen = self.bell.count();
             if let Some(result) = self.taken(pending)? {
                 return Ok(Some(result));
             }
             match until {
-                None => self.bell.wait_past(seen),
+                None => self.bell.wait_for_change(seen),
                 Some(until) => {
                     let left = until.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return Ok(None);
                     }
-                    self.bell.wait_past_for(seen, left);
+                    self.bell.wait_for_change_timeout(seen, left);
                 }
             }
         }
@@ -214,7 +214,7 @@ impl Run {
     pub fn park(&self, bound: Option<Duration>, stop: &dyn Fn() -> bool) -> bool {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
-            let seen = self.bell.rung();
+            let seen = self.bell.count();
             if self.ready() || stop() {
                 return true;
             }
@@ -223,14 +223,14 @@ impl Run {
                     if !lock(&self.held).values().any(|held| held.watched) {
                         return false;
                     }
-                    self.bell.wait_past(seen);
+                    self.bell.wait_for_change(seen);
                 }
                 Some(until) => {
                     let left = until.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return true;
                     }
-                    self.bell.wait_past_for(seen, left);
+                    self.bell.wait_for_change_timeout(seen, left);
                 }
             }
         }
@@ -339,7 +339,7 @@ impl Pool {
         {
             let mut running = lock(&self.shared.running);
             if *running >= MAX_BLOCKING_OPERATIONS {
-                return Err(err_bounded(what, span));
+                return Err(err_too_many_blocking_operations(what, span));
             }
             *running += 1;
         }
@@ -428,7 +428,7 @@ fn work(shared: &Shared) {
 
 #[cold]
 #[inline(never)]
-fn err_unowned(pending: &Pending) -> Diagnostic {
+fn err_token_not_pending_here(pending: &Pending) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("the run holds no pending token `{pending}`"),
@@ -454,7 +454,7 @@ pub(crate) fn err_nothing_outstanding() -> Diagnostic {
 }
 
 #[cold]
-fn err_bounded(what: &str, span: Span) -> Diagnostic {
+fn err_too_many_blocking_operations(what: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!(

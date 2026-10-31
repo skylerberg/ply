@@ -255,12 +255,14 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
     };
     assert!(held(none).bytes().is_empty());
     let info = hex("f0f1f2f3f4f5f6f7f8f9");
-    let (ip, in_) = borrowed(&info);
+    let (ip, info_byte_count) = borrowed(&info);
     let expands = |ctx: &mut Ctx, length: Word| unsafe {
         native::<A3>("?secret_hkdf_expands")(ctx, hp, hn, length)
     };
     let expand = |ctx: &mut Ctx, length: Word| {
-        let w = unsafe { native::<A6>("?secret_hkdf_expand")(ctx, hp, hn, prk, ip, in_, length) };
+        let w = unsafe {
+            native::<A6>("?secret_hkdf_expand")(ctx, hp, hn, prk, ip, info_byte_count, length)
+        };
         held(w).bytes().to_vec()
     };
     assert_eq!(

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub const FRONT: &str = "program/front";
 
-const FRONT_FORMAT: &[u8] = b"ply entry 1\n";
+const ENTRY_HEADER: &[u8] = b"ply entry 1\n";
 
 pub struct Program {
     pub entry: String,
@@ -15,15 +15,15 @@ pub struct Program {
 pub fn linked_program() -> Result<Program, Diagnostic> {
     let pack = ply_pack::installed();
     let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
-        return Err(unlinked(format!("its pack carries no `{FRONT}`")));
+        return Err(link_failure(format!("its pack carries no `{FRONT}`")));
     };
-    let Some(rest) = bytes.strip_prefix(FRONT_FORMAT) else {
-        return Err(unlinked(format!(
+    let Some(rest) = bytes.strip_prefix(ENTRY_HEADER) else {
+        return Err(link_failure(format!(
             "`{FRONT}` is not a front this launcher reads"
         )));
     };
     let text =
-        std::str::from_utf8(rest).map_err(|_| unlinked(format!("`{FRONT}` is not UTF-8")))?;
+        std::str::from_utf8(rest).map_err(|_| link_failure(format!("`{FRONT}` is not UTF-8")))?;
     let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
@@ -34,7 +34,7 @@ pub fn linked_program() -> Result<Program, Diagnostic> {
 }
 
 #[cold]
-fn unlinked(reason: String) -> Diagnostic {
+fn link_failure(reason: String) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("this executable's program cannot be entered: {reason}"),
@@ -47,7 +47,7 @@ fn unlinked(reason: String) -> Diagnostic {
 
 const SHIPPED_MARKER: &str = "SHIPPED.ok";
 
-pub fn install_own_pack() -> Result<(), String> {
+pub fn install_binary_pack() -> Result<(), String> {
     let binary =
         std::env::current_exe().map_err(|e| format!("this binary cannot be found: {e}"))?;
     match ply_pack::Pack::of_binary(&binary)? {
@@ -192,14 +192,14 @@ fn reporting() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
     Some(write)
 }
 
-pub struct Launched {
+pub struct RunOutcome {
     pub code: Result<i32, String>,
     pub warnings: Vec<Diagnostic>,
 }
 
-impl Launched {
-    fn rejected(d: Diagnostic) -> Launched {
-        Launched {
+impl RunOutcome {
+    fn rejected(d: Diagnostic) -> RunOutcome {
+        RunOutcome {
             code: Err(d.to_string()),
             warnings: Vec::new(),
         }
@@ -211,15 +211,15 @@ pub fn run(
     root: &Path,
     argv: Vec<String>,
     count: Option<crate::count::Asked>,
-) -> Launched {
+) -> RunOutcome {
     ply_compiled::c::sweep::once();
     ply_privileged::binder::install();
     let definitions = program.definitions;
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
-        Err(rejected) => return Launched::rejected(rejected),
+        Err(rejected) => return RunOutcome::rejected(rejected),
     };
-    ply_host::observe::laid_out(&shipped, ply_compiled::c::cache_dirs());
+    ply_host::observe::set_shipped_and_cache_dirs(&shipped, ply_compiled::c::cache_dirs());
     let reporting = reporting();
     ply_privileged::shipped::stamp(stamps());
     ply_privileged::shipped::entered(&program.entry, definitions);
@@ -233,7 +233,7 @@ pub fn run(
             match count {
                 Some(asked) => {
                     let (launched, counted, sites) =
-                        crate::count::window_sampled(launch, asked.every());
+                        crate::count::count_allocations_sampled(launch, asked.every());
                     if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
                     {
                         eprintln!(
@@ -256,7 +256,7 @@ pub fn run(
             }
             Err(panic) => std::panic::resume_unwind(panic),
         },
-        Err(e) => Launched::rejected(
+        Err(e) => RunOutcome::rejected(
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("the program could not be started on a thread of its own: {e}"),
@@ -266,11 +266,11 @@ pub fn run(
     }
 }
 
-fn entered(entry: &str, grants: &Grants) -> Launched {
+fn entered(entry: &str, grants: &Grants) -> RunOutcome {
     let opened = match Opened::linked() {
         Ok(opened) => opened,
         Err(reason) => {
-            return Launched::rejected(Diagnostic::error(
+            return RunOutcome::rejected(Diagnostic::error(
                 codes::BACKEND_UNAVAILABLE,
                 format!("the program linked into this executable could not be bound: {reason}"),
             ));
@@ -279,7 +279,7 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
     let hosts = match ply_privileged::hosts::Hosts::granted(grants) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
-            return Launched::rejected(diagnostics.into_iter().next().unwrap_or_else(|| {
+            return RunOutcome::rejected(diagnostics.into_iter().next().unwrap_or_else(|| {
                 Diagnostic::error(
                     codes::INTERNAL_ERROR,
                     "the program's hosts could not be bound, and nothing said why",
@@ -296,7 +296,7 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
         Some(&hosts),
         None,
     );
-    let _ = hosts.torn_down();
+    let _ = hosts.shutdown_reports();
     let code = match (hosts.requested_exit(), outcome.ended) {
         (Some(code), _) => Ok(code),
         (None, Ended::Returned(_)) => Ok(0),
@@ -314,7 +314,7 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
             codes::INTERNAL_ERROR
         )),
     };
-    Launched {
+    RunOutcome {
         code,
         warnings: outcome.warnings,
     }

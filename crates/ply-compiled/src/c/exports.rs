@@ -20,15 +20,15 @@ pub fn helpers_digest() -> String {
 }
 
 #[derive(Debug)]
-pub struct Unserved(pub String);
+pub struct RuntimeMismatch(pub String);
 
-impl std::fmt::Display for Unserved {
+impl std::fmt::Display for RuntimeMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "the unit does not serve this runtime: {}", self.0)
     }
 }
 
-impl std::error::Error for Unserved {}
+impl std::error::Error for RuntimeMismatch {}
 
 #[derive(Clone)]
 pub struct Exports {
@@ -42,7 +42,7 @@ pub struct Exports {
 pub const ENTERED: &str = "entered ";
 
 impl Exports {
-    pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
+    pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, RuntimeMismatch> {
         let said = |h: &HelperShape| {
             format!(
                 "taking {} and {}",
@@ -61,7 +61,7 @@ impl Exports {
                     Some(h) if h.args() == mine.args && h.results() == mine.results => {
                         Ok(h.address as *mut std::ffi::c_void)
                     }
-                    Some(h) => Err(Unserved(format!(
+                    Some(h) => Err(RuntimeMismatch(format!(
                         "it was emitted against `{}` {}, and this runtime's is {}",
                         mine.name,
                         said(mine),
@@ -71,7 +71,7 @@ impl Exports {
                             results: h.results(),
                         }),
                     ))),
-                    None => Err(Unserved(format!(
+                    None => Err(RuntimeMismatch(format!(
                         "it calls `{}`, which this runtime does not have",
                         mine.name
                     ))),

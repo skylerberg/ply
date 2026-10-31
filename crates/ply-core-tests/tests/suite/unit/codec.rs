@@ -1,6 +1,6 @@
 use ply_core::codec::{FORMAT, Reader, Writer, fun, tag};
 use ply_core::float::bits;
-use ply_core::{Decimal, Fixed, IntTy};
+use ply_core::{Decimal, Fixed, IntegerType};
 
 fn read(bytes: &[u8]) -> Reader<&[u8]> {
     Reader::new(bytes).expect("bytes that open with the format")
@@ -21,12 +21,12 @@ fn every_kind_of_value_the_codec_writes_is_read_back_unchanged() {
     let ints = [0, 1, -1, 63, -64, 64, i64::MIN, i64::MAX];
     let decimal = Decimal::new(-12345, 3);
     let fixed = [
-        Fixed::new(IntTy::U8, 255),
-        Fixed::new(IntTy::I8, -5i128 as u128),
-        Fixed::new(IntTy::I64, i128::from(i64::MIN) as u128),
-        Fixed::new(IntTy::U64, u128::from(u64::MAX)),
-        Fixed::new(IntTy::I128, i128::MIN as u128),
-        Fixed::new(IntTy::U128, u128::MAX),
+        Fixed::new(IntegerType::U8, 255),
+        Fixed::new(IntegerType::I8, -5i128 as u128),
+        Fixed::new(IntegerType::I64, i128::from(i64::MIN) as u128),
+        Fixed::new(IntegerType::U64, u128::from(u64::MAX)),
+        Fixed::new(IntegerType::I128, i128::MIN as u128),
+        Fixed::new(IntegerType::U128, u128::MAX),
     ];
     let bytes = written(|w| {
         w.count(tag::LIST, 3);
@@ -89,7 +89,7 @@ fn every_kind_of_value_the_codec_writes_is_read_back_unchanged() {
     r.expect(tag::FUN).unwrap();
     assert_eq!(r.byte().unwrap(), fun::PROJECT);
     assert_eq!((r.varint().unwrap(), r.varint().unwrap()), (2, 1));
-    r.expect(tag::AGAIN).unwrap();
+    r.expect(tag::BACK_REFERENCE).unwrap();
     assert_eq!(r.varint().unwrap(), 4);
     r.end().unwrap();
 }

@@ -1,5 +1,5 @@
-use super::{Nondeterministic, asked, done, from_host, given, handed, waited};
-use crate::c::{MachineNative, machine_native};
+use super::{Nondeterministic, asked, done, given, handed, waited, with_host_facilities};
+use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -12,139 +12,139 @@ use std::time::Duration;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "net_listen",
             rt_net_listen as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_listen_tls",
             rt_net_listen_tls as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_listen_on",
             rt_net_listen_on as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_listen_unix",
             rt_net_listen_unix as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect",
             rt_net_connect as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect_tls",
             rt_net_connect_tls as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect_to",
             rt_net_connect_to as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect_unix",
             rt_net_connect_unix as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_handshake",
             rt_net_handshake as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_start_tls",
             rt_net_start_tls as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_serve_tls",
             rt_net_serve_tls as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_accept",
             rt_net_accept as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_recv",
             rt_net_recv as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_send",
             rt_net_send as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_send_secret",
             rt_net_send_secret as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_close_write",
             rt_net_close_write as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "net_close",
             rt_net_close as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "net_set_option",
             rt_net_set_option as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_local_port",
             rt_net_local_port as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_local_address",
             rt_net_local_address as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_peer_address",
             rt_net_peer_address as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_peer_credentials",
             rt_net_peer_credentials as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_peer_certificate",
             rt_net_peer_certificate as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_protocol",
             rt_net_protocol as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_options",
             rt_net_options as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_bind",
             rt_udp_bind as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_connect",
             rt_udp_connect as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_send_to",
             rt_udp_send_to as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_send",
             rt_udp_send as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_recv_from",
             rt_udp_recv_from as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_set_option",
             rt_udp_set_option as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_close",
             rt_udp_close as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "udp_local_address",
             rt_udp_local_address as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_options",
             rt_udp_options as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
@@ -153,7 +153,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
 
 fn labelled<'a>(c: &mut Ctx, label: &'a [u8]) -> Option<(Arc<TcpHost>, &'a str)> {
     let label = c.text(label)?;
-    let net = from_host(c, |facilities| Arc::clone(facilities.sockets()))?;
+    let net = with_host_facilities(c, |facilities| Arc::clone(facilities.sockets()))?;
     Some((net, label))
 }
 
@@ -246,8 +246,8 @@ pub unsafe extern "C" fn rt_net_listen_on(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn rt_net_listen_on(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
                 handed(c, "net_listen_on", "an address", to),
@@ -374,8 +374,8 @@ pub unsafe extern "C" fn rt_net_connect_to(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     options_at: Addr,
     options_n: I64,
     timeout_ms: I64,
@@ -389,7 +389,7 @@ pub unsafe extern "C" fn rt_net_connect_to(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options), Some(timeout)) = (
                 handed(c, "net_connect_to", "an address", to),
@@ -609,7 +609,7 @@ pub unsafe extern "C" fn rt_net_send(
     label_n: I64,
     conn: I64,
     payload_at: Addr,
-    payload_n: I64,
+    payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
@@ -619,7 +619,7 @@ pub unsafe extern "C" fn rt_net_send(
         let Some(timeout) = handed(c, "net_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
+        let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
         let job = net.send(label, conn.0, payload, timeout, c.site());
         waited(c, "net_send", "`net.send`", job)
     })
@@ -691,8 +691,8 @@ pub unsafe extern "C" fn rt_net_set_option(
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    option_at: Addr,
-    option_n: I64,
+    option_addr: Addr,
+    option_len: I64,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -706,8 +706,8 @@ pub unsafe extern "C" fn rt_net_set_option(
                 label_at,
                 label_n,
                 socket,
-                option_at,
-                option_n,
+                option_addr,
+                option_len,
                 false,
             )
         },
@@ -721,24 +721,24 @@ fn set_option(
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    option_at: Addr,
-    option_n: I64,
+    option_addr: Addr,
+    option_len: I64,
     datagram: bool,
 ) -> TakenBytes {
     let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
         return TakenBytes(0);
     };
-    let option = SocketOption::read(unsafe { borrowed(option_at, option_n) });
+    let option = SocketOption::read(unsafe { borrowed(option_addr, option_len) });
     let Some(option) = handed(c, native, "a socket option", option) else {
         return TakenBytes(0);
     };
     let span = c.site();
-    let result = held_datagram(&net, label, socket, datagram, span)
+    let result = register_datagram_when_requested(&net, label, socket, datagram, span)
         .and_then(|()| net.set_option(label, socket.0, option, span));
     given(c, result)
 }
 
-fn held_datagram(
+fn register_datagram_when_requested(
     net: &TcpHost,
     label: &str,
     socket: I64,
@@ -777,7 +777,7 @@ pub unsafe extern "C" fn rt_net_local_port(
     )
 }
 
-type Described = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
+type SocketInfoReader = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
 
 fn described(
     ctx: *mut Ctx,
@@ -786,7 +786,7 @@ fn described(
     label_n: I64,
     socket: I64,
     datagram: bool,
-    read: Described,
+    read: SocketInfoReader,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -798,7 +798,7 @@ fn described(
                 return TakenBytes(0);
             };
             let span = c.site();
-            let result = held_datagram(&net, label, socket, datagram, span)
+            let result = register_datagram_when_requested(&net, label, socket, datagram, span)
                 .and_then(|()| read(&net, label, socket.0, span));
             given(c, result)
         },
@@ -911,8 +911,8 @@ pub unsafe extern "C" fn rt_udp_bind(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
@@ -925,7 +925,7 @@ pub unsafe extern "C" fn rt_udp_bind(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
                 handed(c, "udp_bind", "an address", to),
@@ -943,8 +943,8 @@ pub unsafe extern "C" fn rt_udp_connect(
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -955,7 +955,7 @@ pub unsafe extern "C" fn rt_udp_connect(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let Some(to) = handed(c, "udp_connect", "an address", to) else {
                 return TakenBytes(0);
             };
@@ -971,10 +971,10 @@ pub unsafe extern "C" fn rt_udp_send_to(
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     payload_at: Addr,
-    payload_n: I64,
+    payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     asked(
@@ -986,14 +986,14 @@ pub unsafe extern "C" fn rt_udp_send_to(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let (Some(to), Some(timeout)) = (
                 handed(c, "udp_send_to", "an address", to),
                 handed(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
-            let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
+            let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
             let job = ply_host::udp::send_to(&net, label, socket.0, to, payload, timeout, c.site());
             waited(c, "udp_send_to", "`udp.send_to`", job)
         },
@@ -1006,7 +1006,7 @@ pub unsafe extern "C" fn rt_udp_send(
     label_n: I64,
     socket: I64,
     payload_at: Addr,
-    payload_n: I64,
+    payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
@@ -1016,7 +1016,7 @@ pub unsafe extern "C" fn rt_udp_send(
         let Some(timeout) = handed(c, "udp_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
+        let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
         let job = ply_host::udp::send(&net, label, socket.0, payload, timeout, c.site());
         waited(c, "udp_send", "`udp.send`", job)
     })
@@ -1056,8 +1056,8 @@ pub unsafe extern "C" fn rt_udp_set_option(
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    option_at: Addr,
-    option_n: I64,
+    option_addr: Addr,
+    option_len: I64,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -1071,8 +1071,8 @@ pub unsafe extern "C" fn rt_udp_set_option(
                 label_at,
                 label_n,
                 socket,
-                option_at,
-                option_n,
+                option_addr,
+                option_len,
                 true,
             )
         },
@@ -1085,7 +1085,7 @@ pub unsafe extern "C" fn rt_udp_close(ctx: *mut Ctx, label_at: Addr, label_n: I6
             return;
         };
         let span = c.site();
-        let closed = held_datagram(&net, label, socket, true, span)
+        let closed = register_datagram_when_requested(&net, label, socket, true, span)
             .and_then(|()| net.close(label, socket.0, span));
         done(c, closed);
     });

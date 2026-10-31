@@ -1,115 +1,115 @@
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::heap;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
-use ply_core::crypto::{self, Encodes};
+use ply_core::crypto::{self, EncodingSupport};
 use ply_core::{Diagnostic, Span, codes};
 use zeroize::Zeroizing;
 
 pub fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "?secret_of",
             rt_secret_of as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_verify",
             rt_secret_verify as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_equal",
             rt_secret_equal as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_len",
             rt_secret_len as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_bytes",
             rt_secret_bytes as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_concat",
             rt_secret_concat as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_encodes",
             rt_secret_encodes as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_encoded",
             rt_secret_encoded as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_decodes",
             rt_secret_decodes as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_decoded",
             rt_secret_decoded as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_key_scheme",
             rt_secret_key_scheme as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_key",
             rt_secret_key as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_rsa_jwk",
             rt_secret_rsa_jwk as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_hmac",
             rt_secret_hmac as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_hkdf_extract",
             rt_secret_hkdf_extract as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_hkdf_expands",
             rt_secret_hkdf_expands as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_hkdf_expand",
             rt_secret_hkdf_expand as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?secret_pbkdf2",
             rt_secret_pbkdf2 as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_nonce_length",
             rt_crypto_nonce_length as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_sealed",
             rt_crypto_sealed as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_opened",
             rt_crypto_opened as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_public_key",
             rt_crypto_public_key as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_signature",
             rt_crypto_signature as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_verified",
             rt_crypto_verified as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_agrees",
             rt_crypto_agrees as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "crypto_agreed",
             rt_crypto_agreed as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
@@ -175,7 +175,7 @@ fn found(bytes: Option<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-fn given_or_none(c: &mut Ctx, bytes: Option<Vec<u8>>) -> I64 {
+fn optional_bytes_handle(c: &mut Ctx, bytes: Option<Vec<u8>>) -> I64 {
     match bytes {
         Some(bytes) => c.give(bytes),
         None => I64(-1),
@@ -247,7 +247,7 @@ pub unsafe extern "C" fn rt_secret_concat(
 
 pub unsafe extern "C" fn rt_secret_encodes(_ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     I64(i64::from(
-        crypto::encoding(unsafe { name(p, n) }) == Encodes::WritesAndReads,
+        crypto::encoding(unsafe { name(p, n) }) == EncodingSupport::WritesAndReads,
     ))
 }
 
@@ -273,7 +273,7 @@ pub unsafe extern "C" fn rt_secret_decodes(
 ) -> I64 {
     let c = unsafe { &mut *ctx };
     let name = unsafe { name(p, n) };
-    if crypto::encoding(name) == Encodes::Neither {
+    if crypto::encoding(name) == EncodingSupport::Neither {
         return I64(-2);
     }
     let Some(held) = held(c, &text) else {
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn rt_secret_key_scheme(ctx: *mut Ctx, der: SecretHandle) 
         return I64(-1);
     };
     let scheme = crypto::private_key(&held.bytes).map(|(scheme, _)| scheme.as_bytes().to_vec());
-    given_or_none(c, scheme)
+    optional_bytes_handle(c, scheme)
 }
 
 pub unsafe extern "C" fn rt_secret_key(
@@ -362,7 +362,7 @@ pub unsafe extern "C" fn rt_secret_hmac(
     };
     let message = unsafe { borrowed(mp, mn) };
     let tag = crypto::hmac(unsafe { name(hp, hn) }, &held.bytes, message);
-    given_or_none(c, tag)
+    optional_bytes_handle(c, tag)
 }
 
 pub unsafe extern "C" fn rt_secret_hkdf_extract(
@@ -399,14 +399,14 @@ pub unsafe extern "C" fn rt_secret_hkdf_expand(
     hn: I64,
     key: SecretHandle,
     ip: Addr,
-    in_: I64,
+    info_byte_count: I64,
     length: I64,
 ) -> SecretHandle {
     let c = unsafe { &mut *ctx };
     let Some(held) = held(c, &key) else {
         return SecretHandle::of(0);
     };
-    let info = unsafe { borrowed(ip, in_) };
+    let info = unsafe { borrowed(ip, info_byte_count) };
     let okm = crypto::hkdf_expand(unsafe { name(hp, hn) }, &held.bytes, info, length.0);
     sealed_bytes(c, okm.unwrap_or_default())
 }

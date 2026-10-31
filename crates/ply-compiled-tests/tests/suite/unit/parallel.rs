@@ -62,7 +62,7 @@ unsafe extern "C" fn walks_then_marks(_ctx: *mut Ctx, f: Word) -> Word {
     1
 }
 
-static UNRUN_RAN: AtomicBool = AtomicBool::new(false);
+static SKIPPED_BRANCH_STARTED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn first(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     block(ctx, 1)
@@ -73,7 +73,7 @@ unsafe extern "C" fn second(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word
 }
 
 unsafe extern "C" fn unrun(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
-    UNRUN_RAN.store(true, Ordering::SeqCst);
+    SKIPPED_BRANCH_STARTED.store(true, Ordering::SeqCst);
     block(ctx, 3)
 }
 
@@ -113,7 +113,7 @@ static FAILS_HERE: PlyFnDesc = desc(fails, stays);
 static UNRUN: PlyFnDesc = desc(unrun, crosses);
 static WALKS: PlyFnDesc = desc(first, walks_then_marks);
 static ENTERS: PlyFnDesc = desc(enters, crosses);
-static APART: PlyFnDesc = PlyFnDesc {
+static BRANCH_REPORTING_OTHER_THREAD: PlyFnDesc = PlyFnDesc {
     release: release_pair,
     ..desc(apart, crosses)
 };
@@ -132,7 +132,13 @@ fn branches(ctx: &mut Ctx, descs: [&'static PlyFnDesc; 2]) -> [Word; 2] {
 fn left_apart(ctx: &mut Ctx) -> Word {
     let c: *mut Ctx = ctx;
     ctx.begin();
-    let mut slots = [0; 2].map(|_| alloc(c, PAIR, &[&raw const APART as Word, c as Word]));
+    let mut slots = [0; 2].map(|_| {
+        alloc(
+            c,
+            PAIR,
+            &[&raw const BRANCH_REPORTING_OTHER_THREAD as Word, c as Word],
+        )
+    });
     unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) };
     assert_eq!(ctx.failed, 0);
     let left = held(slots[0]) + held(slots[1]);
@@ -206,7 +212,7 @@ fn when_a_parallel_branch_fails_its_result_is_0_and_the_later_branches_are_freed
     let slots = branches(&mut ctx, [&FAILS_HERE, &UNRUN]);
     assert_eq!(ctx.failed, 1);
     assert_eq!(slots, [0, 0]);
-    assert!(!UNRUN_RAN.load(Ordering::SeqCst));
+    assert!(!SKIPPED_BRANCH_STARTED.load(Ordering::SeqCst));
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
     ctx.end();

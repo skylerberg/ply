@@ -1,4 +1,4 @@
-use crate::dns::{address_bytes, address_of};
+use crate::dns::{address_bytes, ip_address_from_bytes};
 use crate::native::{int, int_of, parts, parts_of};
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -117,7 +117,7 @@ impl Endpoint {
         };
         let zone = std::str::from_utf8(zone).ok()?;
         Some(Endpoint {
-            ip: address_of(ip)?,
+            ip: ip_address_from_bytes(ip)?,
             port: u16::from_be_bytes(port.try_into().ok()?),
             zone: (!zone.is_empty()).then(|| zone.to_string()),
         })
@@ -198,7 +198,7 @@ impl SocketOption {
             };
             let interface = std::str::from_utf8(interface).ok()?;
             Some((
-                address_of(group)?,
+                ip_address_from_bytes(group)?,
                 (!interface.is_empty()).then(|| interface.to_string()),
             ))
         };
@@ -277,7 +277,7 @@ impl SocketOption {
         parts(&each)
     }
 
-    pub fn is_setting(&self) -> bool {
+    pub fn can_read_back(&self) -> bool {
         !matches!(
             self,
             SocketOption::JoinGroup(..)

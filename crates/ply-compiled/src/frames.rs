@@ -14,18 +14,18 @@ struct Base(PlyFrame);
 
 unsafe impl Sync for Base {}
 
-unsafe extern "C" fn holds_nothing(_ctx: *mut Ctx, _slots: *mut Word, _d: i64) {}
+unsafe extern "C" fn release_nothing(_ctx: *mut Ctx, _slots: *mut Word, _d: i64) {}
 
 static BASE: Base = Base(PlyFrame {
     prev: std::ptr::null_mut(),
-    each: holds_nothing,
+    each: release_nothing,
 });
 
 pub fn base() -> *mut PlyFrame {
     (&raw const BASE.0).cast_mut()
 }
 
-pub unsafe fn release_live(ctx: *mut Ctx, head: *mut PlyFrame) {
+pub unsafe fn release_frames(ctx: *mut Ctx, head: *mut PlyFrame) {
     let mut record = head;
     while !record.is_null() && record != base() {
         let (prev, each) = unsafe { ((*record).prev, (*record).each) };
@@ -67,14 +67,14 @@ struct RtFrame<const N: usize> {
     held: [Held; N],
 }
 
-unsafe extern "C" fn held_each<const N: usize>(ctx: *mut Ctx, slots: *mut Word, _d: i64) {
+unsafe extern "C" fn release_slots<const N: usize>(ctx: *mut Ctx, slots: *mut Word, _d: i64) {
     let held = slots.cast::<Held>();
     for i in 0..N {
         unsafe { held.add(i).read().release(ctx) };
     }
 }
 
-pub unsafe fn held_across<const N: usize, R>(
+pub unsafe fn call_recording_slots<const N: usize, R>(
     ctx: *mut Ctx,
     held: [Held; N],
     call: impl FnOnce() -> R,
@@ -83,7 +83,7 @@ pub unsafe fn held_across<const N: usize, R>(
     let mut record = RtFrame {
         h: PlyFrame {
             prev: below,
-            each: held_each::<N>,
+            each: release_slots::<N>,
         },
         held,
     };

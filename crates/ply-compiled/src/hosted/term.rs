@@ -1,5 +1,5 @@
-use super::{Nondeterministic, asked, from_host, handed, waited};
-use crate::c::{MachineNative, machine_native};
+use super::{Nondeterministic, asked, handed, waited, with_host_facilities};
+use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{I64, TakenBytes};
 use crate::rt::Ctx;
@@ -14,21 +14,21 @@ use zeroize::Zeroizing;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "term_is_terminal",
             rt_term_is_terminal as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native("term_size", rt_term_size as unsafe extern "C" fn(_) -> _),
-        machine_native("term_mode", rt_term_mode as unsafe extern "C" fn(_, _) -> _),
-        machine_native(
+        runtime_native("term_size", rt_term_size as unsafe extern "C" fn(_) -> _),
+        runtime_native("term_mode", rt_term_mode as unsafe extern "C" fn(_, _) -> _),
+        runtime_native(
             "term_input",
             rt_term_input as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "term_secret_line",
             rt_term_secret_line as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "term_secret_taken",
             rt_term_secret_taken as unsafe extern "C" fn(_, _) -> _,
         ),
@@ -38,7 +38,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
 fn mode_of(n: i64) -> Option<Mode> {
     match n {
         0 => Some(Mode::Cooked),
-        1 => Some(Mode::Silent),
+        1 => Some(Mode::NoEcho),
         2 => Some(Mode::Raw),
         _ => None,
     }
@@ -47,7 +47,7 @@ fn mode_of(n: i64) -> Option<Mode> {
 fn mode_number(mode: Mode) -> i64 {
     match mode {
         Mode::Cooked => 0,
-        Mode::Silent => 1,
+        Mode::NoEcho => 1,
         Mode::Raw => 2,
     }
 }
@@ -138,13 +138,14 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some(run) = from_host(c, |facilities| Arc::downgrade(facilities.run())) else {
+            let Some(run) = with_host_facilities(c, |facilities| Arc::downgrade(facilities.run()))
+            else {
                 return I64(0);
             };
             let job: Job = Box::new(move || match stdio::read_secret_line() {
                 Ok(Some(mut line)) => {
                     let kept = ply_host::pool::Kept::new(std::mem::take(&mut *line).into_bytes());
-                    Ok(found(run.upgrade().map(|run| int(run.keep_secret(kept)))))
+                    Ok(found(run.upgrade().map(|run| int(run.store_secret(kept)))))
                 }
                 Ok(None) => Ok(found(None::<[u8; 8]>)),
                 Err(e) => Err(format!("standard input could not be read: {e}")),
@@ -161,7 +162,9 @@ pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> Sec
         Nondeterministic,
         SecretHandle::of(0),
         |c: &mut Ctx| {
-            let line = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();
+            let line =
+                with_host_facilities(c, |facilities| facilities.run().remove_secret(number.0))
+                    .flatten();
             match handed(c, "term_secret_taken", "a line's number", line) {
                 Some(line) if std::str::from_utf8(&line).is_ok() => secret::sealed(c, true, line),
                 Some(_) => secret::sealed(c, true, Zeroizing::new(Vec::new())),

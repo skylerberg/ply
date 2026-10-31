@@ -270,7 +270,7 @@ pub fn opened(
     let mut exports = exports_of(defs);
     adjust(&mut exports);
     let lib = library(dir, &text(defs, &exports))?;
-    Some(ply_compiled::c::load_opened(&lib).map_err(|e| format!("{e:#}")))
+    Some(ply_compiled::c::load_from_path(&lib).map_err(|e| format!("{e:#}")))
 }
 
 pub fn entered(

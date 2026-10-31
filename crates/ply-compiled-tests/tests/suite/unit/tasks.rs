@@ -2,11 +2,13 @@ use crate::bare::context;
 use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
 use ply_compiled::native::{Addr, I64, Returned};
-use ply_compiled::rt::{Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, rt_taken};
+use ply_compiled::rt::{
+    Ctx, FAILED_CANCELLED, FAILED_PENDING_RAISE, FAILED_UNWOUND_TO_HANDLER, rt_taken,
+};
 use ply_compiled::tasks::{
-    self, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, RETURNED, Scheduler, Shield,
-    Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
-    rt_tickets_park, ticket_taken,
+    self, Body, BracketPhase, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, RETURNED,
+    Scheduler, Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
+    rt_tickets_park, take_ticket_bytes,
 };
 use ply_core::{Span, codes};
 use ply_host::jobs::{self, Work};
@@ -32,8 +34,8 @@ fn asking(code: i64, n: i64) -> Message {
 
 unsafe fn asks_twice(_ctx: *mut Ctx, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
-    let first = unsafe { tasks::to_loop(scheduler, asking(1, 10)) };
-    let second = unsafe { tasks::to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
+    let first = unsafe { tasks::switch_to_loop(scheduler, asking(1, 10)) };
+    let second = unsafe { tasks::switch_to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
     HEARD.with(|h| h.borrow_mut().push(second.numbers[0]));
 }
 
@@ -95,7 +97,7 @@ unsafe fn unwinds(ctx: *mut Ctx, _: usize) {
 }
 
 unsafe fn raises(ctx: *mut Ctx, _: usize) {
-    unsafe { (*ctx).failed = FAILED_TARGET };
+    unsafe { (*ctx).failed = FAILED_UNWOUND_TO_HANDLER };
 }
 
 unsafe fn breaks(ctx: *mut Ctx, _: usize) {
@@ -124,7 +126,7 @@ fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_resto
         "an unwound task leaves nothing"
     );
     assert!(scheduler.restore(2, None));
-    assert_eq!(unsafe { (*c).failed }, FAILED_TARGET);
+    assert_eq!(unsafe { (*c).failed }, FAILED_UNWOUND_TO_HANDLER);
     unsafe { (*c).failed = 0 };
     assert!(scheduler.restore(3, Some("noted".to_string())));
     assert_eq!(unsafe { (*c).failed }, 1);
@@ -133,7 +135,7 @@ fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_resto
 }
 
 unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
-    unsafe { tasks::to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
+    unsafe { tasks::switch_to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
 }
 
 #[test]
@@ -192,9 +194,9 @@ fn freeing_a_task_that_never_ran_releases_its_closure_and_dropping_the_scheduler
 
 unsafe fn acquires(_ctx: *mut Ctx, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
-    let id = unsafe { (*scheduler).shield(Shield::Acquire) }.expect("a task runs");
-    unsafe { tasks::to_loop(scheduler, asking(1, 0)) };
-    let lands = unsafe { (*scheduler).unshield(id, Shield::Acquire) };
+    let id = unsafe { (*scheduler).shield(BracketPhase::Acquire) }.expect("a task runs");
+    unsafe { tasks::switch_to_loop(scheduler, asking(1, 0)) };
+    let lands = unsafe { (*scheduler).leave_phase(id, BracketPhase::Acquire) };
     HEARD.with(|h| h.borrow_mut().push(i64::from(lands)));
 }
 
@@ -212,7 +214,7 @@ fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_t
     };
     assert_eq!(scheduler.shields(1), inside);
     assert_eq!(scheduler.shielded(), [(1, inside)]);
-    scheduler.hold_back(1, true);
+    scheduler.set_stopping(1, true);
     assert_eq!(
         unsafe { tasks::resume(r, 1, Message::default()) }.code,
         FINISHED
@@ -276,7 +278,7 @@ fn waiting_on_watched_jobs_returns_when_one_finishes_and_reports_that_job_s_id_a
     assert_eq!(unsafe { rt_tickets_park(&mut ctx, I64(-1)) }.0, 1);
     let n = unsafe { rt_tickets_answered(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), watched.to_le_bytes());
-    let n = ticket_taken(&mut ctx, I64(watched as i64));
+    let n = take_ticket_bytes(&mut ctx, I64(watched as i64));
     assert_eq!(taken(&mut ctx, n.0), b"watched");
     let n = unsafe { rt_tickets_answered(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), b"", "a ticket taken is resolved once");
@@ -348,7 +350,7 @@ fn let_go(ctx: &mut Ctx, w: Word) {
 fn the_effects_a_step_accessed_are_returned_encoded_as_bytes_and_then_cleared() {
     let mut ctx = context();
     ctx.accesses.push((
-        tasks::Touched::Effect {
+        tasks::Access::Effect {
             effect: ply_core::Symbol::new("log"),
             resource: Some(ply_core::Symbol::new("x")),
             write: true,
@@ -356,7 +358,7 @@ fn the_effects_a_step_accessed_are_returned_encoded_as_bytes_and_then_cleared() 
         [3, 1, 2],
     ));
     ctx.accesses.push((
-        tasks::Touched::ScopedValue {
+        tasks::Access::ScopedValue {
             id: 9,
             write: false,
         },
@@ -400,7 +402,7 @@ thread_local! {
 }
 
 #[repr(C, align(8))]
-struct Immortal {
+struct ImmortalClosure {
     rc: u32,
     desc: &'static PlyFnDesc,
 }
@@ -441,22 +443,22 @@ unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> 
 
 static FIVE: PlyFnDesc = function(results_five);
 static THREE: PlyFnDesc = function(asks_three);
-static RESULTS_FIVE: Immortal = Immortal {
+static RESULTS_FIVE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
     desc: &FIVE,
 };
-static ASKS_THREE: Immortal = Immortal {
+static YIELDS_CODE_THREE_CLOSURE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
     desc: &THREE,
 };
 
-fn block(f: &'static Immortal) -> Block {
-    <Block as Returned>::of(f as *const Immortal as Word)
+fn block(f: &'static ImmortalClosure) -> Block {
+    <Block as Returned>::of(f as *const ImmortalClosure as Word)
 }
 
 fn started(
     ctx: &mut Ctx,
-    f: &'static Immortal,
+    f: &'static ImmortalClosure,
     descriptor: &[Word],
     words: &mut [Word],
 ) -> (Word, Word) {
@@ -511,7 +513,7 @@ fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_sp
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     (ctx.performed_root, ctx.performed_start, ctx.performed_end) = (9, 10, 11);
-    let (s, t) = started(&mut ctx, &ASKS_THREE, &[0], &mut []);
+    let (s, t) = started(&mut ctx, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
     let asked = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     assert_eq!(asked.0, 3);
     let said = |f: unsafe extern "C" fn(*mut Ctx, Handle, I64) -> I64, i| unsafe { f(c, handle(s), I64(i)) }.0;
@@ -531,7 +533,7 @@ fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_sp
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);
 
-    let (s, t) = started(&mut ctx, &ASKS_THREE, &[0], &mut []);
+    let (s, t) = started(&mut ctx, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
     unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     let failure = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
     let ended = unsafe {
@@ -549,7 +551,7 @@ fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_sp
         unsafe { tasks::rt_task_restored(c, handle(s), I64(1), none, I64(0)) }.0,
         1
     );
-    assert_eq!(ctx.failed, FAILED_PENDING);
+    assert_eq!(ctx.failed, FAILED_PENDING_RAISE);
     let d = ctx.take_failure().expect("the raise is put back");
     assert_eq!(d.message, "m");
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };

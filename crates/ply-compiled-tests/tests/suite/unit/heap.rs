@@ -1,8 +1,8 @@
 use crate::bare::context;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{
-    HEADER, Heap, Native, Obj, Word, enter, leave, native_of, poison, poisoning, release_object,
-    word_at,
+    HEADER, Heap, Native, Obj, Word, enter, leave, native_of, poison_freed, poisoning_enabled,
+    release_object, word_at,
 };
 use ply_compiled::rt::Ctx;
 use std::sync::Arc;
@@ -189,7 +189,7 @@ fn with_heap_poisoning_on_using_a_freed_native_object_pointer_after_its_block_is
 #[ignore = "run under `PLY_HEAP_POISON` by the test above"]
 #[should_panic(expected = "a stale read: a block that has died")]
 fn using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poison_values() {
-    assert!(poisoning(), "`PLY_HEAP_POISON` is not set");
+    assert!(poisoning_enabled(), "`PLY_HEAP_POISON` is not set");
     let mut ctx = context();
     let stale = ctx.heap.native(holding("first"));
     release_object(&raw mut ctx, stale);
@@ -203,7 +203,7 @@ fn using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poi
     let payload = unsafe { word_at(stale as *mut Obj, 1) };
     assert_eq!(
         payload,
-        poison::word(),
+        poison_freed::word(),
         "the dead native object's payload was not poisoned"
     );
     held_by(stale);

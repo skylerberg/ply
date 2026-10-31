@@ -10,12 +10,12 @@ pub mod stage;
 pub mod sweep;
 pub mod tables;
 
-pub use build::{Native, load_linked, load_opened};
+pub use build::{Native, load_from_path, load_linked};
 pub use described::described;
-pub use exports::{Exports, Unserved};
+pub use exports::{Exports, RuntimeMismatch};
 pub use load::{Library, cache_dir};
-pub(crate) use prelude::machine_native;
-pub use prelude::{MachineNative, builtin_helper_name, helpers, machine_natives, own_helpers};
+pub(crate) use prelude::runtime_native;
+pub use prelude::{MachineNative, builtin_helper_name, helpers, runtime_helpers, runtime_natives};
 
 pub fn semantics_digest() -> &'static str {
     env!("PLY_SEMANTICS_DIGEST")

@@ -3,8 +3,8 @@ use crate::flat::Reader;
 use crate::heap::{self, Native, Word, native_of};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{
-    Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, Unhandled, borrowed, no_stack_to_take,
-    switch_keeping,
+    Ctx, FAILED_CANCELLED, FAILED_PENDING_RAISE, FAILED_UNWOUND_TO_HANDLER, Unhandled, borrowed,
+    fail_out_of_stack, switch_stack_preserving_context,
 };
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
@@ -41,19 +41,19 @@ pub struct Shields {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shield {
+pub enum BracketPhase {
     Acquire,
     Release,
 }
 
-struct Stashed {
+struct SavedFailure {
     failed: i64,
     diagnostic: Option<Diagnostic>,
     pending: Option<Unhandled>,
     target: Word,
 }
 
-impl Stashed {
+impl SavedFailure {
     fn release(self) {
         if let Some(p) = self.pending {
             p.release();
@@ -68,15 +68,15 @@ struct Slot {
     body: Option<Body>,
     stack_index: Option<usize>,
     shields: Shields,
-    stashed: Option<Stashed>,
-    runs_as: Option<i64>,
+    saved_failure: Option<SavedFailure>,
+    context_task_number: Option<i64>,
 }
 
 pub struct Scheduler {
     ctx: *mut Ctx,
     seeded: bool,
-    opened_on: usize,
-    loop_sp: usize,
+    opening_stack_index: usize,
+    loop_stack_pointer: usize,
     running: Option<u64>,
     slots: HashMap<u64, Box<Slot>>,
     spare: Vec<Stack>,
@@ -91,8 +91,8 @@ impl Scheduler {
         Box::new(Scheduler {
             ctx,
             seeded,
-            opened_on: unsafe { (*ctx).current },
-            loop_sp: 0,
+            opening_stack_index: unsafe { (*ctx).current },
+            loop_stack_pointer: 0,
             running: None,
             slots: HashMap::new(),
             spare: Vec::new(),
@@ -126,7 +126,7 @@ impl Scheduler {
     pub fn start(&mut self, id: u64, body: Body) {
         let slot = Slot {
             body: Some(body),
-            runs_as: (id != 0).then(task_number),
+            context_task_number: (id != 0).then(task_number),
             ..Slot::default()
         };
         if let Some(old) = self.slots.insert(id, Box::new(slot)) {
@@ -147,30 +147,30 @@ impl Scheduler {
         out
     }
 
-    pub fn hold_back(&mut self, id: u64, stopping: bool) {
+    pub fn set_stopping(&mut self, id: u64, stopping: bool) {
         if let Some(slot) = self.slots.get_mut(&id) {
             slot.shields.stopping = stopping;
         }
     }
 
-    pub fn shield(&mut self, shield: Shield) -> Option<u64> {
+    pub fn shield(&mut self, shield: BracketPhase) -> Option<u64> {
         let id = self.running?;
         let slot = self.slots.get_mut(&id)?;
         match shield {
-            Shield::Acquire => slot.shields.acquiring += 1,
-            Shield::Release => slot.shields.releasing += 1,
+            BracketPhase::Acquire => slot.shields.acquiring += 1,
+            BracketPhase::Release => slot.shields.releasing += 1,
         }
         Some(id)
     }
 
-    pub fn unshield(&mut self, id: u64, shield: Shield) -> bool {
+    pub fn leave_phase(&mut self, id: u64, shield: BracketPhase) -> bool {
         let Some(slot) = self.slots.get_mut(&id) else {
             return false;
         };
         let s = &mut slot.shields;
         match shield {
-            Shield::Acquire => s.acquiring = s.acquiring.saturating_sub(1),
-            Shield::Release => s.releasing = s.releasing.saturating_sub(1),
+            BracketPhase::Acquire => s.acquiring = s.acquiring.saturating_sub(1),
+            BracketPhase::Release => s.releasing = s.releasing.saturating_sub(1),
         }
         let lands = s.stopping && s.acquiring == 0 && s.releasing == 0;
         if lands {
@@ -180,7 +180,11 @@ impl Scheduler {
     }
 
     pub fn restore(&mut self, id: u64, note: Option<String>) -> bool {
-        let Some(s) = self.slots.get_mut(&id).and_then(|slot| slot.stashed.take()) else {
+        let Some(s) = self
+            .slots
+            .get_mut(&id)
+            .and_then(|slot| slot.saved_failure.take())
+        else {
             return false;
         };
         let c = unsafe { &mut *self.ctx };
@@ -205,7 +209,7 @@ impl Scheduler {
         if let Some(body) = slot.body {
             unsafe { (body.release)(self.ctx, body.arg) };
         }
-        if let Some(s) = slot.stashed {
+        if let Some(s) = slot.saved_failure {
             s.release();
         }
         if let Some(index) = slot.stack_index {
@@ -242,7 +246,7 @@ pub unsafe fn resume(scheduler: *mut Scheduler, id: u64, result: Message) -> Mes
     };
     if slot.stack.is_none() {
         let Some(stack) = r.spare.pop().or_else(Stack::take) else {
-            no_stack_to_take(c);
+            fail_out_of_stack(c);
             return ended(FAILED);
         };
         slot.sp = stack.prepare(task_entry, scheduler as usize);
@@ -252,13 +256,13 @@ pub unsafe fn resume(scheduler: *mut Scheduler, id: u64, result: Message) -> Mes
         r.peak = r.peak.max(r.live);
     }
     let to = slot.sp;
-    c.current = slot.stack_index.unwrap_or(r.opened_on);
+    c.current = slot.stack_index.unwrap_or(r.opening_stack_index);
     r.message = result;
     r.running = Some(id);
-    unsafe { switch_keeping(ctx, &raw mut r.loop_sp, to) };
+    unsafe { switch_stack_preserving_context(ctx, &raw mut r.loop_stack_pointer, to) };
     let r = unsafe { &mut *scheduler };
     r.running = None;
-    unsafe { (*ctx).current = r.opened_on };
+    unsafe { (*ctx).current = r.opening_stack_index };
     r.message
 }
 
@@ -267,7 +271,7 @@ pub(crate) fn task_number() -> i64 {
     NEXT.fetch_sub(1, Ordering::Relaxed)
 }
 
-pub unsafe fn to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
+pub unsafe fn switch_to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
     let r = unsafe { &mut *scheduler };
     let Some(id) = r.running else {
         let c = unsafe { &mut *r.ctx };
@@ -280,11 +284,11 @@ pub unsafe fn to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
     let slot = r.slots.get_mut(&id).expect("a running task has its slot");
     r.message = request;
     let from = &raw mut slot.sp;
-    unsafe { switch_keeping(r.ctx, from, r.loop_sp) };
+    unsafe { switch_stack_preserving_context(r.ctx, from, r.loop_stack_pointer) };
     unsafe { (*scheduler).message }
 }
 
-unsafe fn runs_on(scheduler: *mut Scheduler, heard: &Message) -> bool {
+unsafe fn continues_running(scheduler: *mut Scheduler, heard: &Message) -> bool {
     let r = unsafe { &mut *scheduler };
     let c = unsafe { &mut *r.ctx };
     match heard.code {
@@ -297,42 +301,42 @@ unsafe fn runs_on(scheduler: *mut Scheduler, heard: &Message) -> bool {
                 Diagnostic::error(codes::INTERNAL_ERROR, "a task was resumed to raise nothing")
             });
             let message = d.message.clone();
-            c.pend(d, message);
+            c.fail_unhandled_abort(d, message);
             false
         }
         _ => c.failed == 0,
     }
 }
 
-pub const ASK_SLEEP: i64 = 11;
-pub const ASK_TICKET: i64 = 15;
+pub const REQUEST_SLEEP: i64 = 11;
+pub const REQUEST_JOB_RESULT: i64 = 15;
 
-fn production_running(c: &Ctx) -> Option<*mut Scheduler> {
+fn running_unseeded_scheduler(c: &Ctx) -> Option<*mut Scheduler> {
     let (scheduler, _) = c.schedulers.last()?;
     let r = unsafe { &**scheduler };
     (!r.is_seeded() && r.running().is_some()).then_some(*scheduler)
 }
 
-pub(crate) fn production_task(c: &Ctx) -> Option<TaskId> {
-    let scheduler = production_running(c)?;
+pub(crate) fn running_unseeded_task(c: &Ctx) -> Option<TaskId> {
+    let scheduler = running_unseeded_scheduler(c)?;
     unsafe { (*scheduler).running() }.map(TaskId)
 }
 
 pub(crate) fn waited(c: &mut Ctx, code: i64, n: i64) -> Option<bool> {
-    let scheduler = production_running(c)?;
+    let scheduler = running_unseeded_scheduler(c)?;
     let request = Message {
         code,
         numbers: [n, 0],
         word: 0,
         site: [c.performed_root, c.performed_start, c.performed_end],
     };
-    let was = c.scheduler_entered();
+    let was = c.begin_scheduling();
     let ctx: *mut Ctx = c;
-    let heard = unsafe { to_loop(scheduler, request) };
+    let heard = unsafe { switch_to_loop(scheduler, request) };
     if !was {
         unsafe { &mut *ctx }.program_entered();
     }
-    Some(unsafe { runs_on(scheduler, &heard) })
+    Some(unsafe { continues_running(scheduler, &heard) })
 }
 
 fn ended(code: i64) -> Message {
@@ -353,7 +357,7 @@ extern "C" fn task_entry(arg: usize) {
         c.stack_floor
             .store(unsafe { own.enter() }, Ordering::Relaxed);
         c.frames = std::ptr::null_mut();
-        if let Some(n) = slot.runs_as {
+        if let Some(n) = slot.context_task_number {
             c.task = n;
         }
         (r.ctx, id, slot.body.take())
@@ -362,17 +366,17 @@ extern "C" fn task_entry(arg: usize) {
         unsafe { (body.run)(ctx, body.arg) };
     }
     let c = unsafe { &mut *ctx };
-    c.scheduler_entered();
+    c.begin_scheduling();
     let site = [c.site_root, c.site_start, c.site_end];
-    let (code, stashed) = match c.failed {
+    let (code, saved_failure) = match c.failed {
         0 => (FINISHED, None),
         FAILED_CANCELLED => {
             c.failed = 0;
             (UNWOUND, None)
         }
         failed => {
-            let raised = matches!(failed, FAILED_TARGET | FAILED_PENDING);
-            let s = Stashed {
+            let raised = matches!(failed, FAILED_UNWOUND_TO_HANDLER | FAILED_PENDING_RAISE);
+            let s = SavedFailure {
                 failed,
                 diagnostic: c.diagnostic.take(),
                 pending: c.pending.take(),
@@ -384,19 +388,19 @@ extern "C" fn task_entry(arg: usize) {
     };
     let r = unsafe { &mut *scheduler };
     let slot = r.slots.get_mut(&id).expect("an ending task has its slot");
-    slot.stashed = stashed;
+    slot.saved_failure = saved_failure;
     r.message = Message {
         code,
         site,
         ..Message::default()
     };
     let from = &raw mut slot.sp;
-    unsafe { switch(&mut *from, r.loop_sp) };
+    unsafe { switch(&mut *from, r.loop_stack_pointer) };
     std::process::abort();
 }
 
 pub fn natives() -> Vec<crate::c::MachineNative> {
-    use crate::c::machine_native as n;
+    use crate::c::runtime_native as n;
     vec![
         n("keep", rt_keep as unsafe extern "C" fn(_, _, _) -> _),
         n("open", rt_open as unsafe extern "C" fn(_, _, _) -> _),
@@ -617,7 +621,7 @@ impl Native for Stacks {
         let scheduler = self.scheduler();
         let c = unsafe { &mut *ctx };
         c.schedulers.retain(|(r, _)| *r != scheduler);
-        c.rearm_recording();
+        c.refresh_recording_flag();
         drop(self.scheduler.take());
         for w in [self.asked.word, self.heard.word] {
             if w != 0 {
@@ -649,7 +653,7 @@ struct Started {
 
 impl Started {
     fn release(self, ctx: *mut Ctx) {
-        unsafe { self.body.let_go_function(ctx) };
+        unsafe { self.body.release_function_if_last(ctx) };
         heap::release_object(ctx, self.task);
     }
 }
@@ -681,12 +685,12 @@ impl Native for SchedulerTask {
     }
 }
 
-pub struct SchedulerChan {
+pub struct SchedulerChannel {
     scheduler: i64,
     id: i64,
 }
 
-impl Native for SchedulerChan {
+impl Native for SchedulerChannel {
     fn release(&mut self, _ctx: *mut Ctx) {}
 
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
@@ -751,15 +755,15 @@ pub unsafe extern "C" fn rt_keep_compared(
 }
 
 pub unsafe extern "C" fn rt_kept_equal(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
-    I64(i64::from(kept_compared(ctx, &a, &b, false) != 0))
+    I64(i64::from(compare_stored_values(ctx, &a, &b, false) != 0))
 }
 
 pub unsafe extern "C" fn rt_kept_order(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
-    I64(kept_compared(ctx, &a, &b, true).signum())
+    I64(compare_stored_values(ctx, &a, &b, true).signum())
 }
 
-fn kept_compared(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
-    let (Some(x), Some(y)) = (compared_of(ctx, a), compared_of(ctx, b)) else {
+fn compare_stored_values(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
+    let (Some(x), Some(y)) = (comparison_operand(ctx, a), comparison_operand(ctx, b)) else {
         return 0;
     };
     if x.ty.identity != y.ty.identity {
@@ -790,17 +794,17 @@ fn kept_compared(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
     }
 }
 
-struct Compared {
+struct ComparisonOperand {
     word: Word,
     ty: &'static PlyType,
     kept: Option<&'static PlyKept>,
 }
 
-fn compared_of(ctx: *mut Ctx, h: &Handle) -> Option<Compared> {
+fn comparison_operand(ctx: *mut Ctx, h: &Handle) -> Option<ComparisonOperand> {
     let kept = object::<Kept>(ctx, h, "a kept value")?;
     let compared = kept.compared;
     match &kept.value {
-        Some(v) => Some(Compared {
+        Some(v) => Some(ComparisonOperand {
             word: v.word(),
             ty: v.ty(),
             kept: compared,
@@ -854,7 +858,7 @@ pub unsafe extern "C" fn rt_stacks_opened(
     let mut scheduler = Scheduler::open(ctx, seeded.0 != 0);
     c.schedulers
         .push((&mut *scheduler, [root.0, start.0, end.0]));
-    c.rearm_recording();
+    c.refresh_recording_flag();
     let stacks = Stacks {
         scheduler: Some(scheduler),
         id,
@@ -887,7 +891,7 @@ pub fn seeded_scheduler(c: &Ctx) -> Option<Span> {
 pub unsafe extern "C" fn rt_program_resumed(
     ctx: *mut Ctx,
     body: Handed,
-    _handed: *const PlyType,
+    _body_value_type: *const PlyType,
     _returned: *const PlyType,
 ) -> Handed {
     unsafe { &mut *ctx }.program_entered();
@@ -899,7 +903,7 @@ pub unsafe extern "C" fn rt_program_paused(
     result: Handed,
     ty: *const PlyType,
 ) -> Handle {
-    unsafe { &mut *ctx }.scheduler_entered();
+    unsafe { &mut *ctx }.begin_scheduling();
     unsafe { rt_keep(ctx, result, ty) }
 }
 
@@ -907,31 +911,31 @@ pub unsafe extern "C" fn rt_handle_as(_ctx: *mut Ctx, h: Handle) -> Handle {
     Handle::of(held(h.word()))
 }
 
-pub(crate) struct Bracketed {
+pub(crate) struct OpenBracket {
     scheduler: *mut Scheduler,
     task: u64,
-    shield: Shield,
+    shield: BracketPhase,
 }
 
-pub(crate) fn shielded(c: &mut Ctx, shield: Shield) -> Option<Bracketed> {
+pub(crate) fn shielded(c: &mut Ctx, shield: BracketPhase) -> Option<OpenBracket> {
     let (scheduler, _) = c.schedulers.last().copied()?;
     let task = unsafe { (*scheduler).shield(shield) }?;
-    Some(Bracketed {
+    Some(OpenBracket {
         scheduler,
         task,
         shield,
     })
 }
 
-pub(crate) fn unshielded(c: &mut Ctx, entered: Option<Bracketed>) -> bool {
+pub(crate) fn leave_bracket(c: &mut Ctx, entered: Option<OpenBracket>) -> bool {
     entered.is_some_and(|b| {
         c.schedulers.iter().any(|(r, _)| *r == b.scheduler)
-            && unsafe { (*b.scheduler).unshield(b.task, b.shield) }
+            && unsafe { (*b.scheduler).leave_phase(b.task, b.shield) }
     })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Touched {
+pub enum Access {
     Effect {
         effect: ply_core::Symbol,
         resource: Option<ply_core::Symbol>,
@@ -1006,7 +1010,7 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
     let mut w = crate::flat::Writer::new();
     w.list(touched.iter(), |w, (t, site)| {
         match t {
-            Touched::Effect {
+            Access::Effect {
                 effect,
                 resource,
                 write,
@@ -1018,7 +1022,7 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
                 };
                 w.tag(u64::from(*write)).tag(0);
             }
-            Touched::ScopedValue { id, write } => {
+            Access::ScopedValue { id, write } => {
                 w.tag(2).count(*id).tag(u64::from(*write));
             }
         }
@@ -1042,7 +1046,7 @@ pub unsafe extern "C" fn rt_task_body(
     let n = if desc.is_null() {
         0
     } else {
-        described_words(desc)
+        effect_word_count(desc)
     };
     let words = if n == 0 {
         Vec::new()
@@ -1059,7 +1063,7 @@ pub unsafe extern "C" fn rt_task_body(
     object_made(ctx, Box::new(TaskBody(Some(started))))
 }
 
-fn described_words(d: *const Word) -> usize {
+fn effect_word_count(d: *const Word) -> usize {
     let n = usize::try_from(unsafe { *d }).unwrap_or(0);
     let labels = (0..n)
         .filter(|i| unsafe { *d.add(2 + 2 * i) } == -3)
@@ -1089,11 +1093,11 @@ unsafe fn run_started(ctx: *mut Ctx, arg: usize) {
         t.ended = RETURNED;
     }
     drop(words);
-    unsafe { body.let_go_function(ctx) };
+    unsafe { body.release_function_if_last(ctx) };
     heap::release_object(ctx, task);
 }
 
-unsafe fn release_started(ctx: *mut Ctx, arg: usize) {
+unsafe fn discard_started_task(ctx: *mut Ctx, arg: usize) {
     unsafe { Box::from_raw(arg as *mut Started) }.release(ctx);
 }
 
@@ -1118,7 +1122,7 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
     }
     let body = Body {
         run: run_started,
-        release: release_started,
+        release: discard_started_task,
         arg: Box::into_raw(Box::new(started)) as usize,
     };
     match &mut stacks.scheduler {
@@ -1129,15 +1133,15 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
 
 fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) -> I64 {
     let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     };
     let scheduler = stacks.scheduler();
     let Ok(task) = u64::try_from(id.0) else {
         internal(unsafe { &mut *ctx }, "a task was resumed under no id");
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     };
     if scheduler.is_null() {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     }
     let result = Message {
         code,
@@ -1154,7 +1158,7 @@ fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) ->
     I64(asked.code)
 }
 
-fn tasks_failed(ctx: *mut Ctx, kept: Word) -> i64 {
+fn release_and_fail_task(ctx: *mut Ctx, kept: Word) -> i64 {
     if kept != 0 {
         heap::release_object(ctx, kept);
     }
@@ -1227,10 +1231,14 @@ pub unsafe extern "C" fn rt_asked_site(ctx: *mut Ctx, s: Handle, i: I64) -> I64 
 }
 
 pub unsafe extern "C" fn rt_asked_kept(ctx: *mut Ctx, s: Handle) -> Handle {
-    taken_word(ctx, &s, |s| &mut s.asked)
+    take_message_word(ctx, &s, |s| &mut s.asked)
 }
 
-fn taken_word(ctx: *mut Ctx, s: &Handle, of: impl FnOnce(&mut Stacks) -> &mut Message) -> Handle {
+fn take_message_word(
+    ctx: *mut Ctx,
+    s: &Handle,
+    of: impl FnOnce(&mut Stacks) -> &mut Message,
+) -> Handle {
     let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
         return Handle::of(0);
     };
@@ -1246,11 +1254,11 @@ fn taken_word(ctx: *mut Ctx, s: &Handle, of: impl FnOnce(&mut Stacks) -> &mut Me
 
 fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) -> I64 {
     let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     };
     let scheduler = stacks.scheduler();
     if scheduler.is_null() {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     }
     let c = unsafe { &*ctx };
     let request = Message {
@@ -1259,13 +1267,13 @@ fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) 
         word: kept,
         site: [c.performed_root, c.performed_start, c.performed_end],
     };
-    let heard = unsafe { to_loop(scheduler, request) };
+    let heard = unsafe { switch_to_loop(scheduler, request) };
     let stacks = object::<Stacks>(ctx, s, "a scheduler's stacks").expect("the stacks it ran under");
     let left = std::mem::replace(&mut stacks.heard, heard);
     if left.word != 0 {
         heap::release_object(ctx, left.word);
     }
-    unsafe { runs_on(scheduler, &heard) };
+    unsafe { continues_running(scheduler, &heard) };
     I64(heard.code)
 }
 
@@ -1295,7 +1303,7 @@ pub unsafe extern "C" fn rt_heard_number(ctx: *mut Ctx, s: Handle) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_heard_kept(ctx: *mut Ctx, s: Handle) -> Handle {
-    taken_word(ctx, &s, |s| &mut s.heard)
+    take_message_word(ctx, &s, |s| &mut s.heard)
 }
 
 pub unsafe extern "C" fn rt_task_freed(ctx: *mut Ctx, s: Handle, id: I64) {
@@ -1358,7 +1366,7 @@ pub unsafe extern "C" fn rt_task_held_back(ctx: *mut Ctx, s: Handle, id: I64, st
     if let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks")
         && let (Ok(task), Some(r)) = (u64::try_from(id.0), &mut stacks.scheduler)
     {
-        r.hold_back(task, stopping.0 != 0);
+        r.set_stopping(task, stopping.0 != 0);
     }
 }
 
@@ -1411,7 +1419,7 @@ pub unsafe extern "C" fn rt_task_answer(ctx: *mut Ctx, t: Handle) -> Handle {
 pub unsafe extern "C" fn rt_chan_made(ctx: *mut Ctx, scheduler: I64, id: I64) -> Handle {
     object_made(
         ctx,
-        Box::new(SchedulerChan {
+        Box::new(SchedulerChannel {
             scheduler: scheduler.0,
             id: id.0,
         }),
@@ -1420,7 +1428,7 @@ pub unsafe extern "C" fn rt_chan_made(ctx: *mut Ctx, scheduler: I64, id: I64) ->
 
 pub unsafe extern "C" fn rt_chan_said(ctx: *mut Ctx, c: Handle, which: I64) -> I64 {
     I64(
-        object::<SchedulerChan>(ctx, &c, "a channel's handle").map_or(-1, |c| match which.0 {
+        object::<SchedulerChannel>(ctx, &c, "a channel's handle").map_or(-1, |c| match which.0 {
             0 => c.scheduler,
             _ => c.id,
         }),
@@ -1512,7 +1520,7 @@ pub unsafe extern "C" fn rt_tickets_answered(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-pub fn ticket_taken(ctx: *mut Ctx, token: I64) -> TakenBytes {
+pub fn take_ticket_bytes(ctx: *mut Ctx, token: I64) -> TakenBytes {
     with_run(ctx, TakenBytes(0), |c, run| taken(c, run, token))
 }
 

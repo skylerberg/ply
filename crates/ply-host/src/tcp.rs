@@ -133,7 +133,7 @@ fn not_upgradable(what: &str, handle: i64, reason: &str, span: Span) -> Diagnost
 }
 
 #[cold]
-fn a_datagram_socket(handle: i64, span: Span) -> Diagnostic {
+fn err_datagram_for_stream_socket(handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("socket {handle} is a datagram socket, and this operation wants a `net` one"),

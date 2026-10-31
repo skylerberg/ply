@@ -577,7 +577,7 @@ fn a_statement_is_read_a_page_at_a_time() {
     done(&mut engine, "CREATE TABLE t (a INTEGER) STRICT");
     done(&mut engine, "INSERT INTO t VALUES (1), (2), (3), (4), (5)");
     let mut pages = Vec::new();
-    engine.paged("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
+    engine.run_in_pages("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
         pages.push(page);
         Some(2)
     });
@@ -587,14 +587,14 @@ fn a_statement_is_read_a_page_at_a_time() {
     assert_eq!(pages[3].rows, vec![vec![Scalar::Int(5)]]);
 
     let mut stopped = Vec::new();
-    engine.paged("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
+    engine.run_in_pages("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
         stopped.push(page);
         (stopped.len() < 2).then_some(2)
     });
     assert_eq!(stopped.len(), 2);
 
     let mut over = Vec::new();
-    engine.paged(
+    engine.run_in_pages(
         "SELECT a FROM t",
         &[],
         Limits { rows: 3, ..roomy() },
@@ -615,7 +615,7 @@ fn a_statement_is_read_a_page_at_a_time() {
 }
 
 fn over(image: &[u8], sql: &str, params: &[Scalar], reads_only: bool) -> (Reply, Option<Vec<u8>>) {
-    ply_core::sqlite::run_over(image, sql, params, roomy(), reads_only, true)
+    ply_core::sqlite::run_on_image(image, sql, params, roomy(), reads_only, true)
 }
 
 #[test]

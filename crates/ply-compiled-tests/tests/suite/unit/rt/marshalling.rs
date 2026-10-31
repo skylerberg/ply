@@ -7,7 +7,7 @@ use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
 use ply_core::codec::{Writer, fun, shown, tag};
 use ply_core::float::bits;
-use ply_core::{Decimal, Fixed, INT_TYPES, IntTy};
+use ply_core::{Decimal, Fixed, INT_TYPES, IntegerType};
 
 type N0 = unsafe extern "C" fn(*mut Ctx);
 type A0 = unsafe extern "C" fn(*mut Ctx) -> Word;
@@ -39,7 +39,7 @@ fn lowered(ctx: &mut Ctx, write: impl FnOnce(*mut Ctx)) -> Vec<u8> {
 }
 
 fn lift_open(ctx: *mut Ctx, bytes: &[u8]) {
-    unsafe { &mut *ctx }.lift_from(bytes.to_vec());
+    unsafe { &mut *ctx }.open_decoding(bytes.to_vec());
 }
 
 fn written(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
@@ -48,7 +48,7 @@ fn written(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
     w.finish()
 }
 
-fn width(ty: IntTy) -> Word {
+fn width(ty: IntegerType) -> Word {
     INT_TYPES.iter().position(|t| *t == ty).expect("a width") as Word
 }
 
@@ -70,9 +70,9 @@ fn the_native_output_functions_write_the_same_bytes_as_the_encoder_for_every_kin
         text(ctx, "?out_name", b"a_decimal");
         native::<N2>("?out_decimal")(ctx, lo, hi);
         text(ctx, "?out_name", b"b_narrow");
-        native::<N3>("?out_fixed")(ctx, width(IntTy::I8), 0xff, 0);
+        native::<N3>("?out_fixed")(ctx, width(IntegerType::I8), 0xff, 0);
         text(ctx, "?out_name", b"c_wide");
-        native::<N3>("?out_fixed")(ctx, width(IntTy::U128), -1, 7);
+        native::<N3>("?out_fixed")(ctx, width(IntegerType::U128), -1, 7);
         text(ctx, "?out_name", b"d_int");
         native::<N1>("?out_int")(ctx, -5);
         text(ctx, "?out_name", b"e_text");
@@ -95,9 +95,9 @@ fn the_native_output_functions_write_the_same_bytes_as_the_encoder_for_every_kin
         w.name(b"a_decimal");
         w.decimal(d.serialize());
         w.name(b"b_narrow");
-        w.fixed(Fixed::new(IntTy::I8, -1i128 as u128));
+        w.fixed(Fixed::new(IntegerType::I8, -1i128 as u128));
         w.name(b"c_wide");
-        w.fixed(Fixed::new(IntTy::U128, wide));
+        w.fixed(Fixed::new(IntegerType::U128, wide));
         w.name(b"d_int");
         w.int(-5);
         w.name(b"e_text");
@@ -204,7 +204,7 @@ fn the_native_input_functions_read_back_every_kind_of_value_the_encoder_writes()
         w.name(b"y");
         w.char(u32::from('é'));
         w.decimal(d.serialize());
-        w.fixed(Fixed::new(IntTy::I16, -2i128 as u128));
+        w.fixed(Fixed::new(IntegerType::I16, -2i128 as u128));
         w.tag(tag::FALSE);
     });
     let c: *mut Ctx = &mut ctx;
@@ -232,7 +232,7 @@ fn the_native_input_functions_read_back_every_kind_of_value_the_encoder_writes()
         let high: A0 = native("?in_high");
         let lo = native::<A0>("?in_decimal")(c);
         assert_eq!((lo, high(c)), decimal_words(d));
-        let lo = native::<A1>("?in_fixed")(c, width(IntTy::I16));
+        let lo = native::<A1>("?in_fixed")(c, width(IntegerType::I16));
         assert_eq!((lo, high(c)), (-2, -1), "sign-extended to 128 bits");
         assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
         native::<N0>("?lift_close")(c);
@@ -305,30 +305,30 @@ fn a_128_bit_value_is_read_as_a_low_word_and_its_high_word_is_read_right_after()
     let wide = (5u128 << 64) | 9;
     let bytes = written(|w| {
         w.count(tag::LIST, 4);
-        w.fixed(Fixed::new(IntTy::U128, wide));
-        w.fixed(Fixed::new(IntTy::I128, -3i128 as u128));
-        w.fixed(Fixed::new(IntTy::U8, 255));
-        w.fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX)));
+        w.fixed(Fixed::new(IntegerType::U128, wide));
+        w.fixed(Fixed::new(IntegerType::I128, -3i128 as u128));
+        w.fixed(Fixed::new(IntegerType::U8, 255));
+        w.fixed(Fixed::new(IntegerType::U64, u128::from(u64::MAX)));
     });
     let c: *mut Ctx = &mut ctx;
     lift_open(c, &bytes);
     unsafe {
         assert_eq!(native::<A1>("?in_count")(c, tag::LIST as Word), 4);
         let (fixed, high): (A1, A0) = (native("?in_fixed"), native("?in_high"));
-        assert_eq!((fixed(c, width(IntTy::U128)), high(c)), (9, 5));
-        assert_eq!((fixed(c, width(IntTy::I128)), high(c)), (-3, -1));
-        assert_eq!((fixed(c, width(IntTy::U8)), high(c)), (255, 0));
+        assert_eq!((fixed(c, width(IntegerType::U128)), high(c)), (9, 5));
+        assert_eq!((fixed(c, width(IntegerType::I128)), high(c)), (-3, -1));
+        assert_eq!((fixed(c, width(IntegerType::U8)), high(c)), (255, 0));
         assert_eq!(
-            (fixed(c, width(IntTy::U64)), high(c)),
+            (fixed(c, width(IntegerType::U64)), high(c)),
             (-1, 0),
             "zero-extended past its 64 bits"
         );
         native::<N0>("?lift_close")(c);
     }
     unfailed(&mut ctx);
-    let one = written(|w| w.fixed(Fixed::new(IntTy::U128, wide)));
+    let one = written(|w| w.fixed(Fixed::new(IntegerType::U128, wide)));
     let said = lift_and(&one, |c| unsafe {
-        native::<A1>("?in_fixed")(c, width(IntTy::U128));
+        native::<A1>("?in_fixed")(c, width(IntegerType::U128));
         native::<A0>("?in_high")(c);
         native::<A0>("?in_high")(c);
     });
@@ -340,8 +340,8 @@ fn rt_box_wide_boxes_a_128_bit_integer_from_two_words_and_fails_for_narrower_wid
     let boxed: A3 = helper("rt_box_wide");
     let mut ctx = context();
     for (ty, bits) in [
-        (IntTy::U128, (5u128 << 64) | 9),
-        (IntTy::I128, -3i128 as u128),
+        (IntegerType::U128, (5u128 << 64) | 9),
+        (IntegerType::I128, -3i128 as u128),
     ] {
         let (lo, hi) = (bits as u64 as Word, (bits >> 64) as u64 as Word);
         let w = unsafe { boxed(&mut ctx, lo, hi, width(ty)) };
@@ -349,7 +349,7 @@ fn rt_box_wide_boxes_a_128_bit_integer_from_two_words_and_fails_for_narrower_wid
         assert_eq!(unsafe { (word_at(o, 0), word_at(o, 1)) }, (lo, hi));
     }
     unfailed(&mut ctx);
-    unsafe { boxed(&mut ctx, 1, 0, width(IntTy::U64)) };
+    unsafe { boxed(&mut ctx, 1, 0, width(IntegerType::U64)) };
     let said = ctx.take_failure().expect("a diagnostic").message;
     assert!(said.contains("no 128-bit width"), "{said}");
 }
@@ -540,7 +540,7 @@ fn the_handed_type_returned_from_helpers_is_a_plain_machine_word_like_compiled_c
 }
 
 fn resumes(w: &mut Writer) {
-    w.fun(fun::RESUMES);
+    w.fun(fun::RESUMPTION);
 }
 
 #[test]

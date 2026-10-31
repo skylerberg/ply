@@ -1,17 +1,17 @@
 use super::*;
 
 impl Ctx {
-    pub(crate) fn scheduler_entered(&mut self) -> bool {
-        self.heap.set_scheduling(true)
+    pub(crate) fn begin_scheduling(&mut self) -> bool {
+        self.heap.replace_scheduler_active(true)
     }
 
     pub(crate) fn program_entered(&mut self) {
-        self.heap.set_scheduling(false);
+        self.heap.replace_scheduler_active(false);
     }
 }
 
 pub unsafe extern "C" fn rt_scheduler_entered(ctx: *mut Ctx) -> Word {
-    Word::from(unsafe { &mut *ctx }.scheduler_entered())
+    Word::from(unsafe { &mut *ctx }.begin_scheduling())
 }
 
 pub unsafe extern "C" fn rt_scheduler_left(ctx: *mut Ctx, was: Word) {
@@ -33,7 +33,7 @@ pub unsafe extern "C" fn rt_const(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> 
     }
     let w = unsafe { evaluated(ctx, index, keep) };
     let c = unsafe { &mut *ctx };
-    if c.failed == FAILED_PENDING {
+    if c.failed == FAILED_PENDING_RAISE {
         if let Some(p) = c.pending.take() {
             p.release();
         }

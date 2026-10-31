@@ -2,7 +2,7 @@ use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
 use ply_compiled::heap::Word;
-use ply_compiled::rt::{Ctx, FAILED_PENDING};
+use ply_compiled::rt::{Ctx, FAILED_PENDING_RAISE};
 use ply_core::{Diagnostic, codes};
 
 type Rejected = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
@@ -112,7 +112,7 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
     let failed = unsafe {
         refuse(c);
         let failed = (*c).failed;
-        if failed == FAILED_PENDING {
+        if failed == FAILED_PENDING_RAISE {
             helper::<Pending>("rt_pending_raised")(c, &STRING_T, 0);
             assert_eq!((*c).failed, 0, "the clause handled the raise");
         }
@@ -132,8 +132,12 @@ fn a_rejected_argument_raises_a_catchable_effect_for_array_get_bytes_at_and_stri
             helper::<Rejected>(&builtin_helper_name("?refused"))(c, what, a, b, 0)
         })
     };
-    assert_eq!(numbers(4, 9, 2), FAILED_PENDING, "`Array::get` raises");
-    assert_eq!(numbers(8, 9, 2), FAILED_PENDING, "`Bytes::at` raises");
+    assert_eq!(
+        numbers(4, 9, 2),
+        FAILED_PENDING_RAISE,
+        "`Array::get` raises"
+    );
+    assert_eq!(numbers(8, 9, 2), FAILED_PENDING_RAISE, "`Bytes::at` raises");
     assert_eq!(numbers(17, 0, 20_000_000), 1, "`range` fails the run");
     let text = failed_under_a_clause(|c| unsafe {
         helper::<RejectedText>(&builtin_helper_name("?refused_text"))(
@@ -145,5 +149,5 @@ fn a_rejected_argument_raises_a_catchable_effect_for_array_get_bytes_at_and_stri
             1,
         )
     });
-    assert_eq!(text, FAILED_PENDING, "`String::find` raises");
+    assert_eq!(text, FAILED_PENDING_RAISE, "`String::find` raises");
 }

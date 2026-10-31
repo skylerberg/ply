@@ -48,14 +48,18 @@ impl Pack {
     }
 
     pub fn data_below<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
-        self.below_in(dir, false)
+        self.modules_or_data_below(dir, false)
     }
 
     pub fn modules_below<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
-        self.below_in(dir, true)
+        self.modules_or_data_below(dir, true)
     }
 
-    fn below_in<'a>(&'a self, dir: &str, modules: bool) -> impl Iterator<Item = &'a str> + 'a {
+    fn modules_or_data_below<'a>(
+        &'a self,
+        dir: &str,
+        modules: bool,
+    ) -> impl Iterator<Item = &'a str> + 'a {
         let prefix = format!("{dir}/");
         self.paths().filter(move |path| {
             path.starts_with(prefix.as_str()) && path.ends_with(MODULE) == modules

@@ -1,10 +1,10 @@
-use ply_core::host::err_withheld;
+use ply_core::host::err_unbound_operation;
 use ply_core::{Span, Symbol, codes};
 
 #[test]
 fn an_unbound_handler_error_names_the_effect_and_the_handler_and_says_which_command_the_handler_serves_it_under()
  {
-    let d = err_withheld(
+    let d = err_unbound_operation(
         Span::DUMMY,
         "std.process.process.out[proc]",
         &Symbol::new("std.process.process"),

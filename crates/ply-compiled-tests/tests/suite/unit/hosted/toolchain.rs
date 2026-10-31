@@ -1,4 +1,4 @@
-use ply_compiled::hosted::toolchain::{ended, support_flags};
+use ply_compiled::hosted::toolchain::{ended, tinycc_library_flags};
 use std::path::Path;
 use std::process::Command;
 
@@ -32,17 +32,17 @@ fn a_tcc_that_is_not_installed_is_told_where_its_support_library_is() {
     std::fs::create_dir_all(&lib).expect("a scratch directory");
 
     assert!(
-        support_flags(&installed.join("cc")).is_empty(),
+        tinycc_library_flags(&installed.join("cc")).is_empty(),
         "a compiler that is not tcc was handed a tcc flag"
     );
     assert!(
-        support_flags(&installed.join("tcc")).is_empty(),
+        tinycc_library_flags(&installed.join("tcc")).is_empty(),
         "a tcc with no support library in reach should be left to its own defaults"
     );
 
     std::fs::write(lib.join("libtcc1.a"), b"").expect("a scratch file");
     assert_eq!(
-        support_flags(&installed.join("tcc")),
+        tinycc_library_flags(&installed.join("tcc")),
         vec![format!("-B{}", installed.join("../lib/tcc").display())],
         "an installed layout was not found"
     );
@@ -51,7 +51,7 @@ fn a_tcc_that_is_not_installed_is_told_where_its_support_library_is() {
     std::fs::create_dir_all(&beside).expect("a scratch directory");
     std::fs::write(beside.join("libtcc1.a"), b"").expect("a scratch file");
     assert_eq!(
-        support_flags(&beside.join("tcc")),
+        tinycc_library_flags(&beside.join("tcc")),
         vec![format!("-B{}", beside.display())],
         "a source build's own directory was not found"
     );

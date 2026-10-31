@@ -70,11 +70,11 @@ impl Trace {
         }
     }
 
-    pub fn sink_path(&self) -> &'static str {
+    pub fn sink_module_path(&self) -> &'static str {
         self.sink.path()
     }
 
-    pub fn sink_destination(&self) -> &'static str {
+    pub fn sink_destination_name(&self) -> &'static str {
         self.sink.destination()
     }
 

@@ -20,9 +20,9 @@ const MAP_NORESERVE: i32 = 0;
 #[cfg(target_os = "linux")]
 const MAP_NORESERVE: i32 = 0x4000;
 #[cfg(target_os = "macos")]
-const MADV_LET_GO: i32 = 5;
+const MADV_FREE: i32 = 5;
 #[cfg(target_os = "linux")]
-const MADV_LET_GO: i32 = 4;
+const MADV_FREE: i32 = 4;
 #[cfg(target_os = "linux")]
 const MADV_NOHUGEPAGE: i32 = 15;
 
@@ -88,5 +88,5 @@ pub unsafe fn unmap(addr: *mut u8, len: usize) {
 }
 
 pub unsafe fn let_go(addr: *mut u8, len: usize) {
-    unsafe { madvise(addr, len, MADV_LET_GO) };
+    unsafe { madvise(addr, len, MADV_FREE) };
 }

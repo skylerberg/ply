@@ -1,5 +1,5 @@
 use super::{Determinism, Deterministic, Nondeterministic, granted, text_at, texts_at};
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
 use ply_core::{Diagnostic, codes};
@@ -11,78 +11,78 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "compilers_found",
             rt_compilers_found as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "compilers_started",
             rt_compilers_started as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_cache",
             rt_toolchain_cache as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_reused",
             rt_toolchain_reused as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_bodies",
             rt_toolchain_bodies as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_jobs",
             rt_toolchain_jobs as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_holds",
             rt_toolchain_holds as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_held",
             rt_toolchain_held as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_written",
             rt_toolchain_written as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_moved",
             rt_toolchain_moved as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_appended",
             rt_toolchain_appended as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_scratch",
             rt_toolchain_scratch as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_cleared",
             rt_toolchain_cleared as unsafe extern "C" fn(_, _, _),
         ),
-        machine_native(
+        runtime_native(
             "toolchain_libraries",
             rt_toolchain_libraries as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "toolchain_ran",
             rt_toolchain_ran as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "memory_heap",
             rt_memory_heap as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "memory_census",
             rt_memory_census as unsafe extern "C" fn(_) -> _,
         ),
     ]
 }
 
-fn borrowed_toolchain<R>(
+fn run_if_toolchain_allowed<R>(
     ctx: *mut Ctx,
     native: &'static str,
     determinism: Determinism,
@@ -106,7 +106,7 @@ pub fn compiler_path(label: &str) -> Option<PathBuf> {
         .find(|program| program.is_file())
 }
 
-pub fn support_flags(resolved: &Path) -> Vec<String> {
+pub fn tinycc_library_flags(resolved: &Path) -> Vec<String> {
     let is_tcc = resolved
         .file_name()
         .is_some_and(|name| name.to_string_lossy().ends_with("tcc"));
@@ -181,7 +181,7 @@ fn below(c: &mut Ctx, path: &str) -> Option<PathBuf> {
     Some(crate::c::cache_dir().join(relative))
 }
 
-fn below_at(c: &mut Ctx, p: Addr, n: I64) -> Option<PathBuf> {
+fn cache_path_from_text(c: &mut Ctx, p: Addr, n: I64) -> Option<PathBuf> {
     let path = text_at(c, p, n)?;
     below(c, &path)
 }
@@ -201,7 +201,7 @@ fn landed(target: &Path, bytes: &[u8]) -> bool {
 }
 
 pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    borrowed_toolchain(ctx, "compilers_found", Deterministic, TakenBytes(0), |c| {
+    run_if_toolchain_allowed(ctx, "compilers_found", Deterministic, TakenBytes(0), |c| {
         let Some(label) = text_at(c, p, n) else {
             return TakenBytes(0);
         };
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> T
             .unwrap_or_default();
         let shown = resolved.display().to_string();
         let identity = format!("{shown}\0{stamp}");
-        let support = support_flags(&resolved);
+        let support = tinycc_library_flags(&resolved);
         let support: Vec<&[u8]> = support.iter().map(|s| s.as_bytes()).collect();
         let flags = parts(&support);
         c.given(found(Some(parts(&[
@@ -240,7 +240,7 @@ pub unsafe extern "C" fn rt_compilers_started(
     ap: Addr,
     an: I64,
 ) -> TakenBytes {
-    borrowed_toolchain(
+    run_if_toolchain_allowed(
         ctx,
         "compilers_started",
         Deterministic,
@@ -287,33 +287,33 @@ pub unsafe extern "C" fn rt_compilers_started(
 }
 
 pub unsafe extern "C" fn rt_toolchain_cache(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(ctx, "toolchain_cache", Deterministic, TakenBytes(0), |c| {
+    run_if_toolchain_allowed(ctx, "toolchain_cache", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::cache_dir().display().to_string().into_bytes())
     })
 }
 
 pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(ctx, "toolchain_reused", Deterministic, TakenBytes(0), |c| {
+    run_if_toolchain_allowed(ctx, "toolchain_reused", Deterministic, TakenBytes(0), |c| {
         let dir = crate::c::stage::stage_dir(crate::c::sweep::REUSED);
         c.given(dir.display().to_string().into_bytes())
     })
 }
 
 pub unsafe extern "C" fn rt_toolchain_bodies(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
+    run_if_toolchain_allowed(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::bodies_dir().display().to_string().into_bytes())
     })
 }
 
 pub unsafe extern "C" fn rt_toolchain_jobs(ctx: *mut Ctx) -> I64 {
-    borrowed_toolchain(ctx, "toolchain_jobs", Deterministic, I64(1), |_| {
+    run_if_toolchain_allowed(ctx, "toolchain_jobs", Deterministic, I64(1), |_| {
         I64(std::thread::available_parallelism().map_or(1, |n| n.get()) as i64)
     })
 }
 
 pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    borrowed_toolchain(ctx, "toolchain_holds", Deterministic, I64(0), |c| {
-        let Some(at) = below_at(c, p, n) else {
+    run_if_toolchain_allowed(ctx, "toolchain_holds", Deterministic, I64(0), |c| {
+        let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
         let held = at.is_file();
@@ -325,8 +325,8 @@ pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I
 }
 
 pub unsafe extern "C" fn rt_toolchain_held(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    borrowed_toolchain(ctx, "toolchain_held", Deterministic, TakenBytes(0), |c| {
-        let Some(at) = below_at(c, p, n) else {
+    run_if_toolchain_allowed(ctx, "toolchain_held", Deterministic, TakenBytes(0), |c| {
+        let Some(at) = cache_path_from_text(c, p, n) else {
             return TakenBytes(0);
         };
         c.given(found(std::fs::read(&at).ok()))
@@ -340,8 +340,8 @@ pub unsafe extern "C" fn rt_toolchain_written(
     bp: Addr,
     bn: I64,
 ) -> I64 {
-    borrowed_toolchain(ctx, "toolchain_written", Deterministic, I64(0), |c| {
-        let Some(at) = below_at(c, p, n) else {
+    run_if_toolchain_allowed(ctx, "toolchain_written", Deterministic, I64(0), |c| {
+        let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
         I64(i64::from(landed(&at, unsafe { borrowed(bp, bn) })))
@@ -351,12 +351,15 @@ pub unsafe extern "C" fn rt_toolchain_written(
 pub unsafe extern "C" fn rt_toolchain_moved(
     ctx: *mut Ctx,
     fp: Addr,
-    fnn: I64,
+    source_path_length: I64,
     tp: Addr,
     tn: I64,
 ) -> I64 {
-    borrowed_toolchain(ctx, "toolchain_moved", Deterministic, I64(0), |c| {
-        let (Some(from), Some(to)) = (below_at(c, fp, fnn), below_at(c, tp, tn)) else {
+    run_if_toolchain_allowed(ctx, "toolchain_moved", Deterministic, I64(0), |c| {
+        let (Some(from), Some(to)) = (
+            cache_path_from_text(c, fp, source_path_length),
+            cache_path_from_text(c, tp, tn),
+        ) else {
             return I64(0);
         };
         let parent_made = to
@@ -376,8 +379,8 @@ pub unsafe extern "C" fn rt_toolchain_appended(
     bn: I64,
 ) -> I64 {
     use std::io::Write;
-    borrowed_toolchain(ctx, "toolchain_appended", Deterministic, I64(0), |c| {
-        let Some(at) = below_at(c, p, n) else {
+    run_if_toolchain_allowed(ctx, "toolchain_appended", Deterministic, I64(0), |c| {
+        let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
         let bytes = unsafe { borrowed(bp, bn) };
@@ -390,7 +393,7 @@ pub unsafe extern "C" fn rt_toolchain_appended(
 }
 
 pub unsafe extern "C" fn rt_toolchain_scratch(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(
+    run_if_toolchain_allowed(
         ctx,
         "toolchain_scratch",
         Deterministic,
@@ -416,15 +419,15 @@ pub unsafe extern "C" fn rt_toolchain_scratch(ctx: *mut Ctx) -> TakenBytes {
 }
 
 pub unsafe extern "C" fn rt_toolchain_cleared(ctx: *mut Ctx, p: Addr, n: I64) {
-    borrowed_toolchain(ctx, "toolchain_cleared", Deterministic, (), |c| {
-        if let Some(at) = below_at(c, p, n) {
+    run_if_toolchain_allowed(ctx, "toolchain_cleared", Deterministic, (), |c| {
+        if let Some(at) = cache_path_from_text(c, p, n) {
             let _ = std::fs::remove_dir_all(at);
         }
     });
 }
 
 pub unsafe extern "C" fn rt_toolchain_libraries(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(
+    run_if_toolchain_allowed(
         ctx,
         "toolchain_libraries",
         Deterministic,
@@ -443,8 +446,9 @@ pub unsafe extern "C" fn rt_toolchain_ran(
     ap: Addr,
     an: I64,
 ) -> I64 {
-    borrowed_toolchain(ctx, "toolchain_ran", Deterministic, I64(0), |c| {
-        let (Some(program), Some(args)) = (below_at(c, p, n), texts_at(c, ap, an)) else {
+    run_if_toolchain_allowed(ctx, "toolchain_ran", Deterministic, I64(0), |c| {
+        let (Some(program), Some(args)) = (cache_path_from_text(c, p, n), texts_at(c, ap, an))
+        else {
             return I64(0);
         };
         c.submitted(
@@ -477,14 +481,14 @@ pub unsafe extern "C" fn rt_toolchain_ran(
 }
 
 pub unsafe extern "C" fn rt_memory_heap(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(ctx, "memory_heap", Nondeterministic, TakenBytes(0), |c| {
+    run_if_toolchain_allowed(ctx, "memory_heap", Nondeterministic, TakenBytes(0), |c| {
         let (live, held) = (c.live_bytes() as i64, c.held() as i64);
         c.given(parts(&[&int(live)[..], &int(held)[..]]))
     })
 }
 
 pub unsafe extern "C" fn rt_memory_census(ctx: *mut Ctx) -> TakenBytes {
-    borrowed_toolchain(ctx, "memory_census", Nondeterministic, TakenBytes(0), |c| {
+    run_if_toolchain_allowed(ctx, "memory_census", Nondeterministic, TakenBytes(0), |c| {
         let each: Vec<Vec<u8>> = c
             .census()
             .into_iter()

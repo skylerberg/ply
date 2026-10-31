@@ -39,7 +39,7 @@ pub struct MachineNative {
 
 macro_rules! machine {
     ($($name:literal => $f:ident($($t:ty),*) $(-> $r:ty)?;)*) => {
-        fn machine_table() -> Vec<MachineNative> {
+        fn runtime_native_table() -> Vec<MachineNative> {
             vec![$({
                 let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = crate::rt::$f;
                 let helper = Box::leak(builtin_helper_name($name).into_boxed_str());
@@ -57,7 +57,7 @@ fn signature_of<F: Native>(_: F) -> Signature {
     F::SIGNATURE
 }
 
-pub(crate) fn machine_native<F: Native>(name: &'static str, f: F) -> MachineNative {
+pub(crate) fn runtime_native<F: Native>(name: &'static str, f: F) -> MachineNative {
     let helper = Box::leak(builtin_helper_name(name).into_boxed_str());
     MachineNative {
         name,
@@ -105,10 +105,10 @@ machine! {
     "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
 }
 
-pub fn machine_natives() -> &'static [MachineNative] {
+pub fn runtime_natives() -> &'static [MachineNative] {
     static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        let mut all = machine_table();
+        let mut all = runtime_native_table();
         all.extend(crate::machine::natives());
         all.extend(crate::secret::natives());
         all.extend(crate::hosted::natives());
@@ -214,12 +214,12 @@ pub fn builtin_helper_name(builtin: &str) -> String {
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        let machine = machine_natives().iter().map(|n| n.helper);
+        let machine = runtime_natives().iter().map(|n| n.helper);
         own().into_iter().chain(machine).collect()
     })
 }
 
-pub fn own_helpers() -> &'static [Helper] {
+pub fn runtime_helpers() -> &'static [Helper] {
     let all = helpers();
-    &all[..all.len() - machine_natives().len()]
+    &all[..all.len() - runtime_natives().len()]
 }

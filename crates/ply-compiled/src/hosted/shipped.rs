@@ -1,5 +1,5 @@
 use super::{Deterministic, granted, text_at};
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::entry::{self, Ended, Opened, Run};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -25,43 +25,43 @@ pub fn install(ships: Box<dyn Ships>) {
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "shipped_names",
             rt_shipped_names as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_module",
             rt_shipped_module as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_answer",
             rt_shipped_answer as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_digests",
             rt_shipped_digests as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_version",
             rt_shipped_version as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_binary_bytes",
             rt_shipped_binary_bytes as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_stamps",
             rt_shipped_stamps as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_described",
             rt_shipped_described as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_definitions",
             rt_shipped_definitions as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "shipped_entered",
             rt_shipped_entered as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
@@ -183,7 +183,7 @@ pub unsafe extern "C" fn rt_shipped_entered(
         let (Some(library), Some(root)) = (text_at(c, lp, ln), text_at(c, rp, rn)) else {
             return TakenBytes(0);
         };
-        let opened = match opened_unit(Path::new(&library)) {
+        let opened = match open_cached(Path::new(&library)) {
             Ok(opened) => opened,
             Err(reason) => {
                 c.fail(ply_core::Diagnostic::error(
@@ -209,9 +209,9 @@ pub unsafe extern "C" fn rt_shipped_entered(
     })
 }
 
-fn opened_unit(library: &Path) -> Result<Arc<Opened>, String> {
-    type Units = Mutex<HashMap<PathBuf, Arc<Opened>>>;
-    static UNITS: OnceLock<Units> = OnceLock::new();
+fn open_cached(library: &Path) -> Result<Arc<Opened>, String> {
+    type LibraryCache = Mutex<HashMap<PathBuf, Arc<Opened>>>;
+    static UNITS: OnceLock<LibraryCache> = OnceLock::new();
     let units = UNITS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(opened) = units.lock().unwrap_or_else(|e| e.into_inner()).get(library) {
         return Ok(Arc::clone(opened));

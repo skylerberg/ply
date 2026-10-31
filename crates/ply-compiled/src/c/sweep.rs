@@ -180,7 +180,7 @@ pub fn used(path: &Path) {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|at| at.elapsed().ok())
-        .is_some_and(|age| age < MARKED);
+        .is_some_and(|age| age < MARK_REFRESH_AGE);
     if fresh {
         return;
     }
@@ -191,7 +191,7 @@ pub fn used(path: &Path) {
     }
 }
 
-const MARKED: Duration = Duration::from_secs(600);
+const MARK_REFRESH_AGE: Duration = Duration::from_secs(600);
 
 pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
     let Ok(read) = std::fs::read_dir(root) else {

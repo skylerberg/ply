@@ -15,7 +15,7 @@ pub fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-pub fn lock_closure(lock: &str, roots: &[&str]) -> String {
+pub fn reachable_lock_entries(lock: &str, roots: &[&str]) -> String {
     let blocks: Vec<&str> = lock.split("\n[[package]]\n").skip(1).collect();
     let field = |block: &str, key: &str| -> Option<String> {
         block

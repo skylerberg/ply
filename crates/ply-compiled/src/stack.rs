@@ -88,7 +88,7 @@ impl Stack {
 
     #[must_use]
     pub unsafe fn enter(&self) -> usize {
-        unsafe { limit::set_running(Some(self.reserved())) };
+        unsafe { limit::set_active_stack(Some(self.reserved())) };
         self.floor()
     }
 

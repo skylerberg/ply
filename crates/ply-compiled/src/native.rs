@@ -2,7 +2,7 @@ use crate::heap::Word;
 use crate::rt::Ctx;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Machine {
+pub enum MachineType {
     Word,
     Words,
     I64,
@@ -20,32 +20,32 @@ pub enum Machine {
     Secret,
 }
 
-impl Machine {
+impl MachineType {
     pub fn name(self) -> &'static str {
         match self {
-            Machine::Word => "Word",
-            Machine::Words => "Words",
-            Machine::I64 => "I64",
-            Machine::F64 => "F64",
-            Machine::Addr => "Addr",
-            Machine::Out => "Out",
-            Machine::Handle => "Handle",
-            Machine::Handed => "Handed",
-            Machine::Block => "Block",
-            Machine::Type => "Type",
-            Machine::Op => "Op",
-            Machine::DropRoot => "DropRoot",
-            Machine::KeepRoot => "KeepRoot",
-            Machine::Taken => "Taken",
-            Machine::Secret => "Secret",
+            MachineType::Word => "Word",
+            MachineType::Words => "Words",
+            MachineType::I64 => "I64",
+            MachineType::F64 => "F64",
+            MachineType::Addr => "Addr",
+            MachineType::Out => "Out",
+            MachineType::Handle => "Handle",
+            MachineType::Handed => "Handed",
+            MachineType::Block => "Block",
+            MachineType::Type => "Type",
+            MachineType::Op => "Op",
+            MachineType::DropRoot => "DropRoot",
+            MachineType::KeepRoot => "KeepRoot",
+            MachineType::Taken => "Taken",
+            MachineType::Secret => "Secret",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signature {
-    pub params: &'static [Machine],
-    pub result: Option<Machine>,
+    pub params: &'static [MachineType],
+    pub result: Option<MachineType>,
     pub raises: bool,
 }
 
@@ -84,47 +84,47 @@ pub struct TakenBytes(pub i64);
 pub struct Out(pub *mut i64);
 
 pub unsafe trait Taken {
-    const MACHINE: Machine;
+    const MACHINE: MachineType;
 }
 
 unsafe impl Taken for Word {
-    const MACHINE: Machine = Machine::Word;
+    const MACHINE: MachineType = MachineType::Word;
 }
 
 unsafe impl Taken for *const Word {
-    const MACHINE: Machine = Machine::Words;
+    const MACHINE: MachineType = MachineType::Words;
 }
 
 unsafe impl Taken for I64 {
-    const MACHINE: Machine = Machine::I64;
+    const MACHINE: MachineType = MachineType::I64;
 }
 
 unsafe impl Taken for F64 {
-    const MACHINE: Machine = Machine::F64;
+    const MACHINE: MachineType = MachineType::F64;
 }
 
 unsafe impl Taken for Addr {
-    const MACHINE: Machine = Machine::Addr;
+    const MACHINE: MachineType = MachineType::Addr;
 }
 
 unsafe impl Taken for Out {
-    const MACHINE: Machine = Machine::Out;
+    const MACHINE: MachineType = MachineType::Out;
 }
 
 pub unsafe trait Returned {
-    const MACHINE: Option<Machine>;
+    const MACHINE: Option<MachineType>;
     const RAISES: bool;
     fn of(w: Word) -> Self;
 }
 
 unsafe impl Returned for () {
-    const MACHINE: Option<Machine> = None;
+    const MACHINE: Option<MachineType> = None;
     const RAISES: bool = false;
     fn of(_: Word) -> Self {}
 }
 
 unsafe impl Returned for Word {
-    const MACHINE: Option<Machine> = Some(Machine::Word);
+    const MACHINE: Option<MachineType> = Some(MachineType::Word);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
         w
@@ -132,7 +132,7 @@ unsafe impl Returned for Word {
 }
 
 unsafe impl Returned for Raises {
-    const MACHINE: Option<Machine> = None;
+    const MACHINE: Option<MachineType> = None;
     const RAISES: bool = true;
     fn of(_: Word) -> Self {
         Raises(())
@@ -140,7 +140,7 @@ unsafe impl Returned for Raises {
 }
 
 unsafe impl Returned for I64 {
-    const MACHINE: Option<Machine> = Some(Machine::I64);
+    const MACHINE: Option<MachineType> = Some(MachineType::I64);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
         I64(w)
@@ -148,7 +148,7 @@ unsafe impl Returned for I64 {
 }
 
 unsafe impl Returned for F64 {
-    const MACHINE: Option<Machine> = Some(Machine::F64);
+    const MACHINE: Option<MachineType> = Some(MachineType::F64);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
         F64(w as u64)
@@ -156,7 +156,7 @@ unsafe impl Returned for F64 {
 }
 
 unsafe impl Returned for TakenBytes {
-    const MACHINE: Option<Machine> = Some(Machine::Taken);
+    const MACHINE: Option<MachineType> = Some(MachineType::Taken);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
         TakenBytes(w)

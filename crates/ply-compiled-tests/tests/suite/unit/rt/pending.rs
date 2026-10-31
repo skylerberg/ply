@@ -2,7 +2,7 @@ use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
 use ply_compiled::heap::{HEADER, Word};
-use ply_compiled::rt::{Ctx, FAILED_PENDING};
+use ply_compiled::rt::{Ctx, FAILED_PENDING_RAISE};
 use std::cell::RefCell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -74,7 +74,10 @@ fn rejected(ctx: &mut Ctx) {
 }
 
 fn raised_on_keeps(ctx: &mut Ctx) {
-    assert_eq!(ctx.failed, FAILED_PENDING, "nothing handles the rejection");
+    assert_eq!(
+        ctx.failed, FAILED_PENDING_RAISE,
+        "nothing handles the rejection"
+    );
     let left = ctx
         .diagnostic
         .clone()
@@ -82,7 +85,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
     let message = unsafe { helper::<Pending>("rt_pending_raised")(ctx, &STRING_T, 1) };
     assert_eq!(message, 0, "nothing is handed over to the bridge");
     assert_eq!(
-        ctx.failed, FAILED_PENDING,
+        ctx.failed, FAILED_PENDING_RAISE,
         "nothing handles it the second time"
     );
     let now = ctx.diagnostic.clone().expect("the entry fails");

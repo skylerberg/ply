@@ -1,18 +1,21 @@
 use crate::emitted::{Block, Handed, PlyFnDesc, PlyType};
 use crate::frames::{self, PlyFrame};
 use crate::heap::{HEADER, Word};
-use crate::rt::{Ctx, Kept, call_clause, call_fun, no_stack_to_take, release_fun, switch_keeping};
+use crate::rt::{
+    Ctx, Kept, call_clause, call_fun, fail_out_of_stack, release_fun,
+    switch_stack_preserving_context,
+};
 use crate::stack::{Stack, switch};
 use ply_core::{Diagnostic, codes};
 
 pub struct Detached {
     stack: Option<Stack>,
-    own_stack: usize,
+    stack_index: usize,
     sp: usize,
     saved_current: usize,
     head: *mut PlyFrame,
-    resumer_sp: usize,
-    resumer_current: usize,
+    caller_stack_pointer: usize,
+    resumer_stack_index: usize,
     request: Option<Stopped>,
     result: Word,
     body: Word,
@@ -24,7 +27,7 @@ pub struct Detached {
     instance: Option<Word>,
 }
 
-pub const INSTANCE_HEAD: usize = 7;
+pub const INSTANCE_HEADER_WORDS: usize = 7;
 pub const INSTANCE_DETACHED: usize = 4;
 pub const INSTANCE_VARS: usize = 5;
 
@@ -32,13 +35,13 @@ pub const RECORD_CLOSURE: usize = 0;
 pub const RECORD_INSTANCE: usize = 1;
 pub const RECORD_STRING: usize = 3;
 
-const FORWARDS_MAPPED: usize = 1;
-const FORWARDS_OWN: usize = 2;
+const FORWARDS_MAP_FUNCTION: usize = 1;
+const FORWARDS_DESCRIPTOR: usize = 2;
 const FORWARDS_COUNT: usize = 3;
 const FORWARDS_WORDS: usize = 4;
 const FORWARDS_TARGETS: usize = 5;
 
-type Mapped =
+type MapFunction =
     unsafe extern "C" fn(*mut Ctx, *const Word, *const Word, *const Word, *const Word, *mut Word);
 
 fn forwards_words(block: Word) -> *mut Word {
@@ -67,11 +70,11 @@ fn retargeted(ctx: *mut Ctx, id: usize) {
     };
     let targets = unsafe { b.add(FORWARDS_TARGETS) };
     let old: Vec<Word> = (0..m).map(|i| unsafe { *targets.add(i) }).collect();
-    let mapped: Mapped = unsafe { std::mem::transmute(*b.add(FORWARDS_MAPPED)) };
+    let mapped: MapFunction = unsafe { std::mem::transmute(*b.add(FORWARDS_MAP_FUNCTION)) };
     unsafe {
         mapped(
             ctx,
-            *b.add(FORWARDS_OWN) as *const Word,
+            *b.add(FORWARDS_DESCRIPTOR) as *const Word,
             targets.add(2 * m),
             site as *const Word,
             words as *const Word,
@@ -89,7 +92,7 @@ fn retargeted(ctx: *mut Ctx, id: usize) {
     }
 }
 
-fn tasks_handed(block: Word, task: i64) {
+fn assign_forwarded_task(block: Word, task: i64) {
     let b = forwards_words(block);
     let m = unsafe { *b.add(FORWARDS_COUNT) } as usize;
     for i in 0..m {
@@ -115,7 +118,7 @@ enum Stopped {
     Failed,
 }
 
-pub(crate) unsafe fn open_over(
+pub(crate) unsafe fn open_detached(
     ctx: *mut Ctx,
     body: Word,
     forwards: Option<Word>,
@@ -128,10 +131,10 @@ pub(crate) unsafe fn open_over(
         if let Some(block) = forwards {
             unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
         }
-        return no_stack_to_take(c);
+        return fail_out_of_stack(c);
     };
     let id = c.detached.len();
-    let own_stack = c.open_stack();
+    let stack_index = c.open_stack();
     Block::of(instance).dup();
     unsafe {
         instance_head(instance)
@@ -139,17 +142,17 @@ pub(crate) unsafe fn open_over(
             .write(id as Word)
     };
     if let Some(block) = forwards {
-        tasks_handed(block, c.task);
+        assign_forwarded_task(block, c.task);
     }
     let sp = stack.prepare(entry, ctx as usize);
     c.detached.push(Detached {
         stack: Some(stack),
-        own_stack,
+        stack_index,
         sp,
-        saved_current: own_stack,
+        saved_current: stack_index,
         head: std::ptr::null_mut(),
-        resumer_sp: 0,
-        resumer_current: 0,
+        caller_stack_pointer: 0,
+        resumer_stack_index: 0,
         request: None,
         result: 0,
         body,
@@ -175,10 +178,10 @@ fn instance_vars(block: Word) -> (*mut Word, usize) {
             *head.add(INSTANCE_VARS + 1) as usize,
         )
     };
-    (unsafe { head.add(INSTANCE_HEAD + place) }, count)
+    (unsafe { head.add(INSTANCE_HEADER_WORDS + place) }, count)
 }
 
-fn vars_kept(ctx: *mut Ctx, block: Word) -> Vec<Word> {
+fn copy_instance_vars(ctx: *mut Ctx, block: Word) -> Vec<Word> {
     let (vars, count) = instance_vars(block);
     (0..count)
         .map(|j| unsafe {
@@ -217,7 +220,7 @@ fn vars_typed(ctx: *mut Ctx, block: Word) -> Vec<(Word, Word)> {
         .collect()
 }
 
-fn vars_held(ctx: *mut Ctx, values: &[(Word, Word)]) -> Vec<Word> {
+fn retain_vars(ctx: *mut Ctx, values: &[(Word, Word)]) -> Vec<Word> {
     values
         .iter()
         .map(|&(v, ty)| {
@@ -229,7 +232,7 @@ fn vars_held(ctx: *mut Ctx, values: &[(Word, Word)]) -> Vec<Word> {
         .collect()
 }
 
-fn vars_let_go(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
+fn release_vars(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
     for (v, ty) in values {
         if ty != 0 {
             unsafe { ((*(ty as *const PlyType)).dec)(ctx, v) };
@@ -237,7 +240,7 @@ fn vars_let_go(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
     }
 }
 
-pub(crate) unsafe fn stop_over(
+pub(crate) unsafe fn stop_detached(
     ctx: *mut Ctx,
     record: *const Word,
     args: Vec<Word>,
@@ -250,7 +253,7 @@ pub(crate) unsafe fn stop_over(
             *record.add(RECORD_STRING),
         )
     };
-    let id = unsafe { *instance.sub(INSTANCE_HEAD).add(INSTANCE_DETACHED) } as usize;
+    let id = unsafe { *instance.sub(INSTANCE_HEADER_WORDS).add(INSTANCE_DETACHED) } as usize;
     let mut bound = args;
     if string != 0 {
         let c = unsafe { &*ctx };
@@ -296,10 +299,10 @@ pub(crate) unsafe fn resume(
     let mut clause_vars = None;
     if let (Some(block), Some(k)) = (instance, capture) {
         if clause_running(c, id) {
-            clause_vars = Some(vars_kept(ctx, block));
+            clause_vars = Some(copy_instance_vars(ctx, block));
         } else {
-            let at_stop = vars_held(ctx, &unsafe { &*ctx }.detached[id].captures[k].vars);
-            vars_put(ctx, block, at_stop);
+            let stop_counts = retain_vars(ctx, &unsafe { &*ctx }.detached[id].captures[k].vars);
+            vars_put(ctx, block, stop_counts);
         }
     }
     let c = unsafe { &mut *ctx };
@@ -307,23 +310,23 @@ pub(crate) unsafe fn resume(
     if let Some(a) = result {
         d.result = a;
     }
-    d.resumer_current = c.current;
+    d.resumer_stack_index = c.current;
     d.state = State::Running;
     let (current, sp) = (d.saved_current, d.sp);
     c.current = current;
     if d.state == State::Running && d.starting.is_some() {
         c.starting_detached = Some(id);
     }
-    let from = &mut c.detached[id].resumer_sp as *mut usize;
-    unsafe { switch_keeping(ctx, from, sp) };
+    let from = &mut c.detached[id].caller_stack_pointer as *mut usize;
+    unsafe { switch_stack_preserving_context(ctx, from, sp) };
 
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
-    c.current = d.resumer_current;
+    c.current = d.resumer_stack_index;
     let r = match d.request.take() {
         Some(Stopped::Performed { closure, mut args }) => {
             d.state = State::Suspended;
-            let k = capture_stop(ctx, id);
+            let k = new_capture(ctx, id);
             if let Some(block) = instance {
                 let kept = vars_typed(ctx, block);
                 unsafe { &mut *ctx }.detached[id].captures[k].vars = kept;
@@ -333,7 +336,7 @@ pub(crate) unsafe fn resume(
             let here = c.keep(Kept::Clause(id));
             let r = call_clause(ctx, closure, args);
             let c = unsafe { &mut *ctx };
-            c.kept_back(here);
+            c.pop_saved(here);
             release_if_finished(c, id);
             drain(ctx);
             r
@@ -399,7 +402,7 @@ fn give_back(c: &mut Ctx, id: usize) {
     release_if_finished(c, id);
 }
 
-fn capture_stop(ctx: *mut Ctx, id: usize) -> usize {
+fn new_capture(ctx: *mut Ctx, id: usize) -> usize {
     let d = &mut unsafe { &mut *ctx }.detached[id];
     d.captures.push(Capture { vars: Vec::new() });
     let k = d.captures.len() - 1;
@@ -414,9 +417,9 @@ unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>) -> W
     d.request = Some(Stopped::Performed { closure, args });
     d.saved_current = c.current;
     d.head = head;
-    let to = d.resumer_sp;
+    let to = d.caller_stack_pointer;
     let from = &mut d.sp as *mut usize;
-    unsafe { switch_keeping(ctx, from, to) };
+    unsafe { switch_stack_preserving_context(ctx, from, to) };
     let c = unsafe { &mut *ctx };
     std::mem::take(&mut c.detached[id].result)
 }
@@ -449,7 +452,7 @@ extern "C" fn entry(arg: usize) {
         Stopped::Finished(r)
     });
     d.saved_current = c.current;
-    let to = d.resumer_sp;
+    let to = d.caller_stack_pointer;
     let from = &mut d.sp as *mut usize;
     unsafe { switch(&mut *from, to) };
     std::process::abort();
@@ -475,8 +478,8 @@ static TOKEN: PlyFnDesc = PlyFnDesc {
     typed: None,
     convention: 0,
     release: token_released,
-    share: crosses_nowhere,
-    keep: crosses_nowhere,
+    share: inert_continuation,
+    keep: inert_continuation,
 };
 
 unsafe fn token_words(k: Word) -> (i64, i64) {
@@ -489,7 +492,7 @@ unsafe extern "C" fn token_resumed(ctx: *mut Ctx, k: Word, args: *const Word) ->
     let (id, capture) = unpacked(packed);
     let v = unsafe { *args };
     let c = unsafe { &mut *ctx };
-    if !captured_here(c, entry, id, capture) {
+    if !capture_exists(c, entry, id, capture) {
         return c.fail(err_stale_continuation());
     }
     retargeted(ctx, id);
@@ -501,14 +504,14 @@ unsafe extern "C" fn token_released(ctx: *mut Ctx, k: Handed) -> Word {
     let (packed, entry) = unsafe { token_words(k) };
     let (id, capture) = unpacked(packed);
     let c = unsafe { &mut *ctx };
-    if captured_here(c, entry, id, capture) {
+    if capture_exists(c, entry, id, capture) {
         c.continuations_died.push((id, capture));
     }
     unsafe { Block::of(k).free(&raw mut c.heap, TOKEN_BYTES) };
     0
 }
 
-unsafe extern "C" fn crosses_nowhere(_ctx: *mut Ctx, _k: Word) -> Word {
+unsafe extern "C" fn inert_continuation(_ctx: *mut Ctx, _k: Word) -> Word {
     0
 }
 
@@ -517,7 +520,7 @@ fn unpacked(packed: i64) -> (usize, usize) {
     (packed >> 32, packed & 0xffff_ffff)
 }
 
-fn captured_here(c: &Ctx, entry: i64, id: usize, k: usize) -> bool {
+fn capture_exists(c: &Ctx, entry: i64, id: usize, k: usize) -> bool {
     entry == c.entry as i64 && c.detached.get(id).is_some_and(|d| k < d.captures.len())
 }
 
@@ -531,7 +534,7 @@ fn drop_stop(ctx: *mut Ctx, id: usize, k: usize) {
     let d = &mut unsafe { &mut *ctx }.detached[id];
     let vars = std::mem::take(&mut d.captures[k].vars);
     let waiting = d.state == State::Suspended && d.live == Some(k);
-    vars_let_go(ctx, vars);
+    release_vars(ctx, vars);
     if waiting {
         abandon(ctx, id);
     }
@@ -547,19 +550,19 @@ fn abandon(ctx: *mut Ctx, id: usize) {
     d.live = None;
     let (head, own) = (
         std::mem::replace(&mut d.head, std::ptr::null_mut()),
-        d.own_stack,
+        d.stack_index,
     );
-    unsafe { frames::release_live(ctx, head) };
-    let_go_of_stack(ctx, own);
+    unsafe { frames::release_frames(ctx, head) };
+    release_stack(ctx, own);
 }
 
-fn let_go_of_stack(ctx: *mut Ctx, own: usize) {
+fn release_stack(ctx: *mut Ctx, own: usize) {
     if let Some(s) = unsafe { &mut *ctx }.stacks.get_mut(own) {
-        let_go_of_kept(std::mem::take(s));
+        release_kept(std::mem::take(s));
     }
 }
 
-fn let_go_of_kept(kept: Vec<Kept>) {
+fn release_kept(kept: Vec<Kept>) {
     kept.into_iter().for_each(Kept::release);
 }
 
@@ -572,17 +575,17 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
             (
                 d.state == State::Suspended,
                 d.state == State::Done,
-                d.own_stack,
+                d.stack_index,
             )
         };
         if suspended {
             abandon(ctx, id);
         } else if !done {
-            let_go_of_stack(ctx, own);
+            release_stack(ctx, own);
         }
         for k in 0..unsafe { &*ctx }.detached[id].captures.len() {
             let vars = std::mem::take(&mut unsafe { &mut *ctx }.detached[id].captures[k].vars);
-            vars_let_go(ctx, vars);
+            release_vars(ctx, vars);
         }
         let c = unsafe { &mut *ctx };
         let d = &mut c.detached[id];

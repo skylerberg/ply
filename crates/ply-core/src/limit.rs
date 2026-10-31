@@ -15,7 +15,7 @@ pub fn running() -> Option<NonNull<dyn Reserved>> {
     RUNNING.with(Cell::get)
 }
 
-pub unsafe fn set_running(stack: Option<NonNull<dyn Reserved>>) {
+pub unsafe fn set_active_stack(stack: Option<NonNull<dyn Reserved>>) {
     RUNNING.with(|r| r.set(stack));
 }
 
@@ -24,7 +24,7 @@ fn with_running<R>(f: impl FnOnce(&dyn Reserved) -> R) -> Option<R> {
     Some(f(unsafe { stack.as_ref() }))
 }
 
-pub fn running_low(at: usize) -> Option<usize> {
+pub fn writable_stack_start(at: usize) -> Option<usize> {
     with_running(|stack| {
         let (low, top) = stack.writable();
         (low..top).contains(&at).then_some(low)
@@ -32,6 +32,6 @@ pub fn running_low(at: usize) -> Option<usize> {
     .flatten()
 }
 
-pub fn extend_running() -> bool {
+pub fn grow_active_stack() -> bool {
     with_running(|stack| stack.extend()).unwrap_or(false)
 }

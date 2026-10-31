@@ -1,25 +1,25 @@
 use super::frames::{boxed, count, every_kind, freed, release_box};
 use crate::bare::{context_of, helper};
-use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEAD, INSTANCE_VARS};
+use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEADER_WORDS, INSTANCE_VARS};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
-use ply_compiled::frames::{PlyFrame, held_across};
+use ply_compiled::frames::{PlyFrame, call_recording_slots};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
 use ply_compiled::native::{I64, Returned};
 use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_perform};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
-const AMB: i64 = 0;
-const FLIP: i64 = 1;
+const CHOICE_EFFECT_ID: i64 = 0;
+const FLIP_OPERATION: i64 = 1;
 
-const HELD: [Word; 5] = [1, 2, 3, 4, 5];
+const BOX_PAYLOADS: [Word; 5] = [1, 2, 3, 4, 5];
 
 thread_local! {
     static TEXT: Arc<str> = Arc::from("held across a stop");
     static SEEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-    static CLAUSES_UNRECORDED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-    static TOKENS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
-    static STOP: Cell<*const Word> = const { Cell::new(std::ptr::null()) };
+    static STACK_EMPTY_AT_CLAUSE: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static CONTINUATION_UNTYPED_LOCAL_FLAGS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
+    static HANDLER_RECORD_POINTER: Cell<*const Word> = const { Cell::new(std::ptr::null()) };
 }
 
 fn seen(n: u32) {
@@ -72,8 +72,8 @@ unsafe fn holding_a_box(ctx: *mut Ctx, marker: Word, call: impl FnOnce() -> Word
 }
 
 static FLIP_OP: PlyOp = PlyOp {
-    effect: AMB,
-    op: FLIP,
+    effect: CHOICE_EFFECT_ID,
+    op: FLIP_OPERATION,
     answer: std::ptr::null(),
     own: 0,
     params_len: 0,
@@ -83,16 +83,22 @@ static FLIP_OP: PlyOp = PlyOp {
 };
 
 unsafe extern "C" fn body(ctx: *mut Ctx, _block: Word, _args: *const Word) -> Word {
-    unsafe { holding_a_box(ctx, HELD[0], || through_a_runtime_frame(ctx)) }
+    unsafe { holding_a_box(ctx, BOX_PAYLOADS[0], || through_a_runtime_frame(ctx)) }
 }
 
 unsafe fn through_a_runtime_frame(ctx: *mut Ctx) -> Word {
-    let (held, words) = TEXT.with(|t| every_kind(ctx, [HELD[1], HELD[2], HELD[3]], t));
+    let (held, words) =
+        TEXT.with(|t| every_kind(ctx, [BOX_PAYLOADS[1], BOX_PAYLOADS[2], BOX_PAYLOADS[3]], t));
     let (r, back) = unsafe {
-        held_across(ctx, held, || {
-            holding_a_box(ctx, HELD[4], || {
-                let flip =
-                    rt_detached_perform(ctx, STOP.get(), &FLIP_OP, I64(-1), std::ptr::null());
+        call_recording_slots(ctx, held, || {
+            holding_a_box(ctx, BOX_PAYLOADS[4], || {
+                let flip = rt_detached_perform(
+                    ctx,
+                    HANDLER_RECORD_POINTER.get(),
+                    &FLIP_OP,
+                    I64(-1),
+                    std::ptr::null(),
+                );
                 let flip = std::mem::transmute::<Handed, Word>(flip);
                 if (*ctx).failed != 0 {
                     0
@@ -117,11 +123,11 @@ unsafe fn through_a_runtime_frame(ctx: *mut Ctx) -> Word {
 
 unsafe fn clause_ran(ctx: *mut Ctx, k: Word) {
     let unrecorded = unsafe { (*ctx).frames.is_null() };
-    CLAUSES_UNRECORDED.with(|c| c.borrow_mut().push(unrecorded));
+    STACK_EMPTY_AT_CLAUSE.with(|c| c.borrow_mut().push(unrecorded));
     let desc = unsafe { &**(k as *const *const PlyFnDesc).byte_add(HEADER) };
     let crosses = unsafe { (desc.share)(ctx, k) != 0 || (desc.keep)(ctx, k) != 0 };
     let seen = (desc.typed.is_none(), !crosses);
-    TOKENS.with(|t| t.borrow_mut().push(seen));
+    CONTINUATION_UNTYPED_LOCAL_FLAGS.with(|t| t.borrow_mut().push(seen));
 }
 
 unsafe extern "C" fn once(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
@@ -129,7 +135,7 @@ unsafe extern "C" fn once(ctx: *mut Ctx, _block: Word, args: *const Word) -> Wor
         clause_ran(ctx, *args);
         let k = Block::of(*args);
         let first = k.call(ctx, &[imm(1)]);
-        k.let_go_function(ctx);
+        k.release_function_if_last(ctx);
         if (*ctx).failed != 0 {
             return 0;
         }
@@ -147,7 +153,7 @@ unsafe extern "C" fn twice(ctx: *mut Ctx, _block: Word, args: *const Word) -> Wo
         } else {
             0
         };
-        k.let_go_function(ctx);
+        k.release_function_if_last(ctx);
         if (*ctx).failed != 0 {
             return 0;
         }
@@ -158,7 +164,7 @@ unsafe extern "C" fn twice(ctx: *mut Ctx, _block: Word, args: *const Word) -> Wo
 unsafe extern "C" fn never(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
     unsafe {
         clause_ran(ctx, *args);
-        Block::of(*args).let_go_function(ctx);
+        Block::of(*args).release_function_if_last(ctx);
     }
     imm(42)
 }
@@ -206,21 +212,23 @@ static BODY: PlyFnDesc = desc(body);
 static ONCE: PlyFnDesc = desc(once);
 static TWICE: PlyFnDesc = desc(twice);
 static NEVER: PlyFnDesc = desc(never);
-static PARKS: PlyFnDesc = desc(parks);
+static RETURNS_CONTINUATION: PlyFnDesc = desc(parks);
 
 fn unit() -> Ctx {
     context_of(&["amb", "flip"], Vec::new())
 }
 
 const RECORD: usize = 4;
-const INSTANCE: Word = (HEADER + 8 * (INSTANCE_HEAD + RECORD)) as Word;
+const INSTANCE_BYTES: Word = (HEADER + 8 * (INSTANCE_HEADER_WORDS + RECORD)) as Word;
 
 unsafe extern "C" fn instance_released(ctx: *mut Ctx, h: Handed) -> Word {
     let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
     unsafe {
-        let clause = *(w as *const Word).byte_add(HEADER).add(INSTANCE_HEAD);
-        Block::of(clause).let_go_function(ctx);
-        helper::<Free>("rt_free")(ctx, w, INSTANCE);
+        let clause = *(w as *const Word)
+            .byte_add(HEADER)
+            .add(INSTANCE_HEADER_WORDS);
+        Block::of(clause).release_function_if_last(ctx);
+        helper::<Free>("rt_free")(ctx, w, INSTANCE_BYTES);
     }
     0
 }
@@ -231,15 +239,15 @@ static INSTANCE_DESC: PlyFnDesc = PlyFnDesc {
 };
 
 fn instance(ctx: *mut Ctx, clause: Word) -> (Word, *const Word) {
-    let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, INSTANCE) };
+    let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, INSTANCE_BYTES) };
     let head = unsafe { (w as *mut Word).byte_add(HEADER) };
-    let record = unsafe { head.add(INSTANCE_HEAD) };
-    let mut words = [0; INSTANCE_HEAD + RECORD];
+    let record = unsafe { head.add(INSTANCE_HEADER_WORDS) };
+    let mut words = [0; INSTANCE_HEADER_WORDS + RECORD];
     words[0] = (&raw const INSTANCE_DESC) as Word;
     words[1] = RECORD as Word;
     words[INSTANCE_DETACHED] = -1;
     words[INSTANCE_VARS] = RECORD as Word;
-    words[INSTANCE_HEAD..].copy_from_slice(&[clause, record as Word, 0, 0]);
+    words[INSTANCE_HEADER_WORDS..].copy_from_slice(&[clause, record as Word, 0, 0]);
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), head, words.len()) };
     (w, record)
 }
@@ -247,10 +255,10 @@ fn instance(ctx: *mut Ctx, clause: Word) -> (Word, *const Word) {
 unsafe fn handled(ctx: *mut Ctx, clause: &'static PlyFnDesc) -> Word {
     let body = closure(ctx, &BODY);
     let (instance, record) = instance(ctx, closure(ctx, clause));
-    STOP.set(record);
+    HANDLER_RECORD_POINTER.set(record);
     let result =
         unsafe { rt_detached_open(ctx, Block::of(body), Block::of(0), Block::of(instance)) };
-    unsafe { Block::of(instance).let_go_function(ctx) };
+    unsafe { Block::of(instance).release_function_if_last(ctx) };
     unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
 
@@ -271,9 +279,9 @@ fn resuming_a_suspended_computation_once_lets_it_run_to_the_end_and_releases_eve
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
         assert_eq!(imm_value(result), 10);
         assert_eq!(taken(&SEEN), [1; 5]);
-        assert_eq!(taken(&CLAUSES_UNRECORDED), [true]);
-        assert_eq!(taken(&TOKENS), [TOKEN]);
-        assert_eq!(freed(), HELD);
+        assert_eq!(taken(&STACK_EMPTY_AT_CLAUSE), [true]);
+        assert_eq!(taken(&CONTINUATION_UNTYPED_LOCAL_FLAGS), [TOKEN]);
+        assert_eq!(freed(), BOX_PAYLOADS);
         assert_eq!(text_holders(), 1);
         assert_eq!((*ctx).heap.live(), 0);
         (*ctx).end();
@@ -292,7 +300,7 @@ fn resuming_a_suspended_computation_a_second_time_fails_and_every_resource_is_st
         let said = failure(ctx);
         assert!(said.contains("resumed a second time"), "{said}");
         assert_eq!(taken(&SEEN), [1; 5]);
-        assert_eq!(freed(), HELD);
+        assert_eq!(freed(), BOX_PAYLOADS);
         assert_eq!(text_holders(), 1);
         assert_eq!((*ctx).heap.live(), 0);
         (*ctx).end();
@@ -309,8 +317,8 @@ fn dropping_a_suspended_computation_without_resuming_it_releases_its_resources_e
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
         assert_eq!(imm_value(result), 42);
         assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
-        assert_eq!(taken(&TOKENS), [TOKEN]);
-        assert_eq!(freed(), HELD);
+        assert_eq!(taken(&CONTINUATION_UNTYPED_LOCAL_FLAGS), [TOKEN]);
+        assert_eq!(freed(), BOX_PAYLOADS);
         assert_eq!(text_holders(), 1);
         assert_eq!((*ctx).heap.live(), 0);
         (*ctx).end();
@@ -324,13 +332,13 @@ fn ending_an_entry_call_while_a_computation_is_still_suspended_releases_the_reso
     let ctx = &raw mut owned;
     unsafe {
         (*ctx).begin();
-        handled(ctx, &PARKS);
+        handled(ctx, &RETURNS_CONTINUATION);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
         assert!(freed().is_empty());
         assert!(text_holders() > 1);
         (*ctx).end();
         assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
-        assert_eq!(freed(), HELD);
+        assert_eq!(freed(), BOX_PAYLOADS);
         assert_eq!(text_holders(), 1);
     }
 }

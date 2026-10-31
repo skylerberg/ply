@@ -1,4 +1,4 @@
-use crate::pool::Bell;
+use crate::pool::WakeCounter;
 use crate::process::Children;
 use ply_core::{Diagnostic, Span, codes};
 use std::net::{SocketAddr, TcpStream};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_DRAIN_MS: u64 = 30_000;
 
-pub const DEFAULT_LEAD_MS: u64 = 0;
+pub const DEFAULT_STOP_DELAY_MS: u64 = 0;
 
 pub const DRAIN_POLL: Duration = Duration::from_millis(20);
 
@@ -72,7 +72,7 @@ pub struct Bounds {
 impl Default for Bounds {
     fn default() -> Bounds {
         Bounds {
-            lead: Duration::from_millis(DEFAULT_LEAD_MS),
+            lead: Duration::from_millis(DEFAULT_STOP_DELAY_MS),
             drain: Duration::from_millis(DEFAULT_DRAIN_MS),
         }
     }
@@ -108,7 +108,7 @@ pub struct Shutdown {
     signals: Vec<ShutdownSignal>,
     net: Mutex<Option<Arc<dyn Accepting>>>,
     children: Mutex<Option<Weak<Children>>>,
-    bell: Mutex<Option<Arc<Bell>>>,
+    bell: Mutex<Option<Arc<WakeCounter>>>,
 }
 
 static WATCHES: std::sync::LazyLock<[Watch; 4]> = std::sync::LazyLock::new(Default::default);
@@ -128,7 +128,7 @@ impl Shutdown {
         Shutdown::made(bounds, true)
     }
 
-    pub fn at_once() -> Arc<Shutdown> {
+    pub fn without_drain() -> Arc<Shutdown> {
         Shutdown::made(Bounds::default(), false)
     }
 
@@ -148,7 +148,7 @@ impl Shutdown {
         })
     }
 
-    pub fn attach_bell(&self, bell: &Arc<Bell>) {
+    pub fn attach_notifier(&self, bell: &Arc<WakeCounter>) {
         *lock(&self.bell) = Some(Arc::clone(bell));
     }
 
@@ -233,7 +233,7 @@ impl Shutdown {
         lock(&self.state).signal
     }
 
-    pub fn at_stop(&self) -> (usize, usize) {
+    pub fn stop_counts(&self) -> (usize, usize) {
         let state = lock(&self.state);
         (state.listeners_closed, state.in_flight_at_stop)
     }
@@ -258,9 +258,9 @@ impl Shutdown {
         let coordinator = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("ply-host-drain".to_string())
-            .spawn(move || coordinator.lead_then_stop());
+            .spawn(move || coordinator.delay_then_stop_accepting());
         if spawned.is_err() {
-            self.lead_then_stop();
+            self.delay_then_stop_accepting();
         }
         true
     }
@@ -269,7 +269,7 @@ impl Shutdown {
         self.second.load(Ordering::Acquire)
     }
 
-    fn lead_then_stop(&self) {
+    fn delay_then_stop_accepting(&self) {
         if !self.bounds.lead.is_zero() {
             let state = lock(&self.state);
             let _ = self.woke.wait_timeout(state, self.bounds.lead);
@@ -441,12 +441,17 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
     }
     shutdown.end_children();
     crate::stdio::settle();
-    crate::observe::exiting();
+    crate::observe::report_at_exit();
     std::process::exit(which.exit_code());
 }
 
 #[cold]
-pub fn err_unheard(what: &str, which: Asked, e: &std::io::Error, span: Span) -> Diagnostic {
+pub fn err_signal_watch_failed(
+    what: &str,
+    which: Asked,
+    e: &std::io::Error,
+    span: Span,
+) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("{what} could not listen for SIG{}: {e}", which.name()),

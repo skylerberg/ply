@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# scripts/iterate.sh PATH [FILTER...]: the edit loop that needs no bootstrap: `ply check` the
-# package at PATH, then `ply test` it with each FILTER as a --filter substring of a test key, run
-# by the newest `ply` the checkout already has (the bootstrap in target/, else the last release,
-# else the one on PATH). A load inside the checkout reads the standard library and the compiler
-# from it, so an edit to either is checked and tested here, and the compiler's tests compile their
-# fixtures with the `ply` that runs them, so a parser, checker or diagnostic change is too; a
-# bootstrap is for what `ply` itself must do anew: a language rule in a real program, the emitter,
-# the CLI, a native a shipped module calls, and what a test's own loads read of the library, as
-# the CLI's suite's do.
+# scripts/iterate.sh PATH [FILTER...]: checks and tests the package at PATH without a bootstrap.
+#
+# It runs `ply check` on the package, then `ply test` with each FILTER passed as `--filter`, which
+# selects the tests whose names contain that text. It uses the newest `ply` available:
+# `target/debug/ply`, else the downloaded release in `target/stage0`, else the `ply` on PATH.
+#
+# Inside a checkout, `ply` reads the standard library and the compiler from the checkout's sources.
+# An edit to either is therefore checked and tested without a bootstrap. The compiler's tests
+# compile their fixtures with the `ply` that runs them, so edits to the parser, checker and
+# diagnostics are covered too.
+#
+# Bootstrap instead when the change affects the `ply` binary itself: a language rule you want to try
+# in a real program, the C emitter, the CLI, or a native function that a standard library module
+# calls. Also bootstrap to see library changes in the CLI's tests, because the programs those tests
+# run use the library embedded in the binary, not the checkout's sources.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "${1:-}" in

@@ -18,10 +18,10 @@ fn every_declared_helper_has_an_address() {
 fn a_native_function_signature_is_derived_from_its_rust_function_type() {
     use ply_compiled::emitted::{Handed, PlyType};
     use ply_compiled::heap::Word;
-    use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
+    use ply_compiled::native::MachineType::{self, Addr, Handed as Moved, I64, Type, Words};
     use ply_compiled::native::{Native, Raises, Signature};
     use ply_compiled::rt::Ctx;
-    let of = |params: &'static [Machine], result, raises| Signature {
+    let of = |params: &'static [MachineType], result, raises| Signature {
         params,
         result,
         raises,
@@ -32,13 +32,13 @@ fn a_native_function_signature_is_derived_from_its_rust_function_type() {
     );
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word as Native>::SIGNATURE,
-        of(&[Machine::Word, Words], Some(Machine::Word), false)
+        of(&[MachineType::Word, Words], Some(MachineType::Word), false)
     );
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx, Word, Word) -> Raises as Native>::SIGNATURE,
-        of(&[Machine::Word; 2], None, true)
+        of(&[MachineType::Word; 2], None, true)
     );
-    type Typed = unsafe extern "C" fn(
+    type NativeTakingType = unsafe extern "C" fn(
         *mut Ctx,
         ply_compiled::native::Addr,
         ply_compiled::native::I64,
@@ -46,7 +46,7 @@ fn a_native_function_signature_is_derived_from_its_rust_function_type() {
         *const PlyType,
     ) -> ply_compiled::native::I64;
     assert_eq!(
-        <Typed as Native>::SIGNATURE,
+        <NativeTakingType as Native>::SIGNATURE,
         of(&[Addr, I64, Moved, Type], Some(I64), false)
     );
 }
@@ -54,9 +54,9 @@ fn a_native_function_signature_is_derived_from_its_rust_function_type() {
 #[test]
 fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_runtime_helper_with_the_same_signature()
  {
-    use ply_compiled::c::machine_natives;
-    use ply_compiled::native::Machine;
-    let machine = machine_natives();
+    use ply_compiled::c::runtime_natives;
+    use ply_compiled::native::MachineType;
+    let machine = runtime_natives();
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
     let declared: Vec<&str> = ply_compiled::hosted::natives()
         .iter()
@@ -76,7 +76,7 @@ fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_run
         assert_eq!(found.len(), 1, "`{name}`");
         assert_eq!(found[0].signature, n.signature, "`{name}`");
         assert!(
-            !n.signature.params.contains(&Machine::Word),
+            !n.signature.params.contains(&MachineType::Word),
             "`{}` takes a uniform word",
             n.name
         );
@@ -85,7 +85,10 @@ fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_run
         .iter()
         .find(|n| n.name == "?out_str")
         .expect("`?out_str`");
-    assert_eq!(out_str.signature.params, [Machine::Addr, Machine::I64]);
+    assert_eq!(
+        out_str.signature.params,
+        [MachineType::Addr, MachineType::I64]
+    );
     assert_eq!(out_str.signature.result, None);
 }
 
@@ -104,7 +107,7 @@ fn the_text_the_runtime_describes_itself_with_lists_helpers_and_native_functions
     ] {
         assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
     }
-    let own = ply_compiled::c::own_helpers();
+    let own = ply_compiled::c::runtime_helpers();
     let helpers = text.lines().filter(|l| l.starts_with("helper ")).count();
     assert_eq!(helpers, own.len());
     assert!(own.iter().all(|h| !h.name.starts_with("builtin_")));
@@ -353,7 +356,7 @@ fn a_loop_running_past_the_time_limit_stops_with_a_timed_out_failure_at_its_next
     let native = loaded.expect("the unit loads");
     let entry = native.entry("m.forever").expect("`m.forever` is taken");
     let mut ctx = native.context();
-    ctx.begin_bounded(20);
+    ctx.begin_with_time_limit(20);
     let args = [imm(0)];
     let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
@@ -375,7 +378,7 @@ fn a_time_limit_on_an_entry_that_already_ended_does_not_change_the_context_stack
         return;
     };
     let mut ctx = loaded.expect("the unit loads").context();
-    ctx.begin_bounded(1);
+    ctx.begin_with_time_limit(1);
     ctx.end();
     ctx.stack_floor.store(7, Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(50));

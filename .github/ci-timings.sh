@@ -1,31 +1,10 @@
 #!/usr/bin/env bash
-#
-# What a CI run cost, and where its minutes went.
-#
-#   .github/ci-timings.sh runs [N]           the last N runs of `CI`: how much of each was queue
-#   .github/ci-timings.sh jobs [RUN] [NAME]  the jobs of RUN longest first, the chain of them that
-#                                            decided when it ended, and, with NAME, their steps
-#   .github/ci-timings.sh why [RUN] [NAME]   one job: its steps, what the actions inside it did,
-#                                            the cache entries it found and wrote, its pauses
-#   .github/ci-timings.sh tests [RUN] [N]    the N slowest tests of RUN (default 40), from the
-#                                            `test-durations` artifact its `passes` job uploads
-#   .github/ci-timings.sh --self-test        the timestamp arithmetic and the chain, against fixtures
-#
-# RUN is a run id, a run URL, or a branch with a run; with none, the newest run of `CI`. NAME is a
-# case-insensitive substring of a job's name; with none, `why` explains the run's longest job.
-#
-# `jobs` is the API's view, and it reports a composite action as the one step that invokes it.
-# `why` also reads the job's log, which is where the steps inside `./.github/actions/suite` and
-# every action beside it are timed, and the only place a cache entry is visible: two runs that
-# differ by minutes differ in `Cache restored from key:`. Neither shows the time inside a step
-# that emits nothing while it works, so `why` reports the pauses between lines as well: gaps of
-# 5s or more, or of `PAUSE` seconds where a longer one is asked for.
-#
-# Needs `gh` and `jq`.
+# the last N runs of `CI`, with how long each run waited in the queue
 set -euo pipefail
 
-# The helpers every awk below starts with: `awk "$TIME_AWK"'program'`, the
-# two adjacent so that they are the one argument awk wants.
+# The awk helpers that every awk program below starts with. Each program is `awk
+# "$TIME_AWK"'program'`: the two strings are written with no space between them so that awk receives
+# them as one program argument.
 TIME_AWK='
 # Seconds since the epoch, fractional seconds included, from an ISO-8601 UTC stamp: days from the
 # civil date by the usual era/doy/doe arithmetic, so no `date`, whose flags are not the same on
@@ -64,7 +43,8 @@ awk_time() { awk "$TIME_AWK$1" "${@:2}"; }
 spell() { awk_time "BEGIN { printf \"%s\", spell($1) }"; }
 die() { echo "ci-timings.sh: $*" >&2; exit 2; }
 
-# A run id, from a run id, a run URL, or a branch that has a run; with nothing, the newest run.
+# Prints the id of the run that the argument names: a run id, a run URL, or a branch that has a run.
+# With no argument it prints the newest run. Prints nothing when no run matches.
 resolve_run() {
   local want=${1:-}
   case "$want" in
@@ -82,8 +62,9 @@ resolve_run() {
   esac
 }
 
-# The run and its jobs, read once into $tmp however many questions a mode asks of them. A skipped
-# job ran nothing, and a re-run stamps it as ending before it starts.
+# Fetches the run and its jobs once into $tmp, so every mode reads the same data however many
+# questions it asks. Skipped jobs are left out. Fails when the run does not exist or no job has
+# started.
 fetch() {
   gh api "repos/{owner}/{repo}/actions/runs/$1" > "$tmp/run.json" ||
     die "no run $1 in this repository"
@@ -108,7 +89,7 @@ jobs_tsv() {
         print s, e, $3 }'
 }
 
-# The first step of the run and the completion of its last job, in epoch seconds.
+# Prints the earliest job start and the latest job completion of the run, in epoch seconds.
 span_tsv() {
   jobs_tsv | awk -F'\t' '
     $1 > 0 && (first == 0 || $1 < first) { first = $1 }
@@ -130,7 +111,6 @@ steps_tsv() {
     sort -t"$(printf '\t')" -k1,1nr
 }
 
-# A job's steps, one per line.
 print_steps() {
   steps_tsv "$1" | awk_time '
     BEGIN { FS = OFS = "\t" }
@@ -153,7 +133,8 @@ log_sections() {                                   # $1 the job's start; the log
     got {
       now = epoch(substr($0, 1, index($0, "Z")))
       text = substr($0, index($0, "Z") + 2)
-      # nextest colours its lines, and a report is not a terminal.
+      # nextest colours its output with escape codes, and the log is read as plain text, so remove
+      # them.
       gsub(/\033\[[0-9;]*m/, "", text)
       # Only where the line before the gap is not a marker: a marker already accounts for the time
       # of the step it opens, and the marker of a *previous* step would account for it twice.
@@ -251,8 +232,9 @@ chain() {                                          # $1 the run's first start, $
       # `>=`: of jobs that ended in the same second, the one that ended the run is the last one
       # the API lists, which is the `ci` gate.
       for (i = 1; i <= n; i++) if (e[i] >= e[cur]) cur = i
-      # A link ends before the one after it does, so the walk only moves back: a job that took no
-      # time is not its own predecessor. A chain has at most one link a job.
+      # Each job on the chain ends strictly before the job after it ends, so the walk only moves
+      # back in time and a job is never its own predecessor, even when it took no time. The chain
+      # therefore has at most one entry per job.
       while (cur != 0 && k < n) {
         k++; link[k] = name[cur]; dur[k] = e[cur] - s[cur]
         prev = 0
@@ -274,7 +256,8 @@ cmd_jobs() {
     [.head_branch, .event, (if (.conclusion // "") == "" then .status else .conclusion end),
      .run_attempt] | @tsv' "$tmp/run.json")
   read -r first last < <(span_tsv)
-  # A job still running has no completion, so a run younger than its first job has no span yet.
+  # A job that is still running has no completion time, so a run whose jobs have not finished has no
+  # span yet.
   span=$((last > first ? last - first : 0))
   # A re-run lists each job's latest execution: a late start may be a job run again, not a queue.
   if [ "$attempt" -gt 1 ]; then again=" · attempt $attempt"; fi
@@ -296,7 +279,7 @@ cmd_jobs() {
   fi
 }
 
-# The steps of every job whose name holds PATTERN.
+# Prints the steps of every job whose name contains PATTERN, ignoring case.
 steps_for() {
   local id name
   while IFS=$'\t' read -r id name; do
@@ -328,7 +311,8 @@ cmd_why() {
       '.jobs[] | select(.name | ascii_downcase | contains($p | ascii_downcase)) | [.id, .name] | @tsv' \
       "$tmp/jobs.json")
   else
-    # Nothing named: the job the run spent the most on, which is the one worth explaining.
+    # No job name was given, so use the job with the longest duration, which is the one most worth
+    # explaining.
     name=$(jobs_tsv | awk -F'\t' '$1 > 0 && $2 > $1 && $2 - $1 > d { d = $2 - $1; n = $3 } END { print n }')
     rows=$(jq -r --arg n "$name" '.jobs[] | select(.name == $n) | [.id, .name] | @tsv' "$tmp/jobs.json")
     echo "(no job named: the longest, \"$name\")"
@@ -361,8 +345,8 @@ cmd_why() {
   log_sections "$s" < "$tmp/log" | log_report
 }
 
-# The arithmetic the parsers rest on, against fixtures: a wrong number here is a report that lies,
-# and nothing else would notice.
+# Checks the timestamp and duration calculations against fixed expected values. A wrong calculation
+# would make the reports wrong without any other failure.
 self_test() {
   local fail=0 got want
   check() {

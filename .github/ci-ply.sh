@@ -1,49 +1,8 @@
 #!/usr/bin/env bash
-# The Ply runs (`ci-shards.sh`'s), each one `ply test` of a package: over the CLI's suite with the
-# grants its harness drives `ply` with, from a scratch directory of the run's own, or a package's own
-# suite as `ply test` runs it, the standard library's among them; the proof runs, the standard
-# library's (`proofs`) and each package's (`laws-<id>`), are a `ply prove` each. Each prints every
-# result to the log as it finishes, on standard error, and the report `--json` writes when it ends
-# is read for the rest. A run fails when a test fails or a claim does not hold, when it is rejected
-# or ends without a report, and when it selects no test or proves no claim, so a renamed test never
-# stops being run quietly; a part of the CLI's suite takes the tests whose keys hash to it, which may
-# be none. It fails too when its load ran a body again because a store had lost the result its
-# record names, which is a run made cold by a bug in Ply and not by an edit.
-#
-#   ci-ply.sh run ID [ARG...]
-#       the runs the job ID takes (`ci-shards.sh job-runs ID`), in turn, or one run, or one module
-#       of the CLI's suite (`cli-<module>`), with ARGs added to each `ply test` or `ply prove`. Every
-#       `ply` is stopped at PLY_CI_DEADLINE, the epoch second the job set its runs to end by, and
-#       none starts after it: the job then fails naming the run it stopped and the ones it never
-#       started, and the steps after it still keep what the runs wrote, so a re-run starts from
-#       there rather than cold.
-#   ci-ply.sh nightly ROLE [MODULE...] [ARG...]
-#       the modules of the suite `ply.work` gives ROLE that no pull request runs (`ci-shards.sh`'s
-#       NIGHTLY), every MODULE in one `ply test` with the suite's grants and ARGs such as
-#       `--shard K/N` or a case's `--filter` added
-#   ci-ply.sh mark                  the moment `keep` gathers from
-#   ci-ply.sh keep DIR              each store of kept records `ply` used since `mark`, the emitter's
-#                                   results among them, whole into DIR for a later run: a result is
-#                                   keyed by its definition, the emitter and the runtime's sources,
-#                                   so another tree reuses what still applies. Objects stay out: one
-#                                   compiles from its bodies in seconds. The stages are build-ply's
-#                                   to ship, and the packages' stores are carried apart.
-#   ci-ply.sh restore DIR           a DIR from `keep` laid under what `ply` reads: each store in it
-#                                   replaces the one in place, and any other file is kept where one
-#                                   is there
-#   ci-ply.sh compact               each package's store a run since `mark` opened compacted, and
-#                                   every other removed, before a job saves them: a store only
-#                                   grows, and the job's next run restores what it saves, which is
-#                                   then the stores its own runs use and no other job's
-#   ci-ply.sh hand FILE             the stores this job keeps, as one file: a pull request's cache
-#                                   reaches no other run, so a run of its toolchain on another
-#                                   branch, main's after the merge most of all, takes them as an
-#                                   artifact
-#   ci-ply.sh handed NAME           the artifact NAME, which a run of this toolchain packed with
-#                                   `hand`, as this job's stores: unpacked aside and laid only when
-#                                   whole, since a load fails over a store that lost a result. Sets
-#                                   the step's `found`. Nothing found, or a download that failed,
-#                                   leaves the job to what a cache holds
+# Runs the `ply` commands of CI jobs, and saves and restores the caches they use. The subcommands
+# are `run`, `nightly`, `mark`, `keep`, `restore`, `compact`, `hand` and `handed`. The usage message
+# at the end of the script lists their arguments, and the comment above each step of the script says
+# what that step does.
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -69,9 +28,11 @@ postgres_bin() {
 }
 pg=$(postgres_bin)
 
-# What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
-# it, its scratch directory and the filesystem, the repository, and every family a command enters a
-# program with, since its tests run the commands in this process.
+# The options for running the CLI's test suite. The suite's tests run CLI commands inside the test
+# process, so they need the `ply` binary and `sh` and `git` to start, the working directory, the
+# filesystem root and the repository as filesystems, and the permissions `--allow machine`, `--allow
+# shipped` and `--allow toolchain`, which let tests read the machine, the files shipped with `ply`
+# and the toolchain.
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root"
@@ -87,8 +48,9 @@ past_deadline() { [[ -n $deadline ]] && (($(date +%s) >= deadline)); }
 # Milliseconds since the epoch. `date +%s%3N` is GNU's: a Mac's `date` prints the `3N`.
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 
-# The command, ended when the deadline comes along with everything it started: STOPPED then, and
-# when the deadline had already come.
+# Runs the command, and stops it together with every process it started when the deadline arrives.
+# Returns `STOPPED` if the deadline stopped the command, or if the deadline had already passed
+# before the command started.
 bounded() {
   local status=0
   [[ -n $deadline ]] || { "$@"; return; }
@@ -98,7 +60,8 @@ bounded() {
   return "$status"
 }
 
-# What the run ID says once the deadline ended it, the milliseconds since STARTED into it.
+# Prints an error saying that run ID was stopped at the job's deadline. The error includes the
+# seconds elapsed since STARTED, a time in milliseconds since the epoch.
 stopped_run() {
   echo "::error::the run $2 was stopped at the job's deadline after $((($(now_ms) - $1) / 1000))s: what it finished is cached, and a re-run of this job starts from it"
 }
@@ -108,7 +71,8 @@ reported() {
   jq -e 'type == "object"' "$1" > /dev/null 2>&1
 }
 
-# What the run ID says when it ended with STATUS and no report. What it finished is in the log above.
+# Prints a message saying that run ID ended with STATUS and wrote no report. The tests that finished
+# before it ended are shown in the log above.
 unreported() {
   if (($2 > 128)); then
     echo "the run $1 crashed: signal $(($2 - 128)) ended it before it wrote a report" >&2
@@ -117,13 +81,21 @@ unreported() {
   fi
 }
 
-# `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
-# directory of its own, which its harness empties before each test and rejects without the marker;
-# the standard library's suites granted an emptied directory as the root `scratch`, marked as the
-# CLI's is, which the tests of its real handlers write under (`tests/std/scratch.ply`), and `sh`,
-# which reads back what `std.text` quotes for it; and any other package as `ply test` runs it,
-# granted nothing. The scratch root's path is the same every run, since a pass is cached for the
-# binding it ran under.
+# Runs `ply test` on the package at PATH (relative to the repository) with ARGS, giving it the
+# permissions its tests need.
+#
+# The CLI's suite runs from a new temporary directory that contains an empty `.ply-scratch` file,
+# because its test harness empties the working directory before each test and refuses to run without
+# that file.
+#
+# The standard library's suites get an emptied directory as the `scratch` filesystem, also with
+# `.ply-scratch`. Tests that check the real handlers, which touch the real file system and programs
+# rather than test doubles, write there. These tests also get permission to run `sh`, so that they
+# can run the shell on the text that `std.text` quotes for it and check the result. The path of the
+# scratch directory is the same in every run, because a cached test pass is valid only for the
+# permissions it ran with.
+#
+# Any other package runs as plain `ply test` with no permissions.
 tested() {
   local path=$1 status=0 dir
   shift
@@ -161,9 +133,10 @@ timed() {
   jq -r --arg p "$2" '.results[]? | "\((.duration_ms // 0) | floor)\t\($p)\t\(.key // .name)"' "$1" 2>/dev/null
 }
 
-# Why each test a run ran was selected (the read that moved, for a `changed` one), with `unfiled`
-# for a pass no trace stands in for; and each test it took from the cache. How each one that ran
-# ended was printed as it finished.
+# Prints one line for each test the report selected, giving the reason it was selected. For a
+# `changed` test the line also names what changed. The marker `unfiled` means the test passed but
+# its result was not saved in the cache. The function also lists each test that was taken from the
+# cache. The result of each test that ran was already printed when it finished.
 listed() {
   jq -r '(.results // [] | map({key: (.key // .name), value: .cached}) | from_entries) as $ran
     | .selection.tests[]? | .key as $key
@@ -176,18 +149,24 @@ summed() {
   jq -r '.summary // {} | "summary: \(.passed // 0) passed, \(.failed // 0) failed, \(.abandoned // 0) abandoned, \(.cached // 0) cached"' "$1" 2>/dev/null
 }
 
-# What a report's load took from the stores, what it ran anew, and how many of those it ran
-# although their records stood, the results they name being in no store. Nothing for a report no load
-# made: a cached result's.
+# A jq expression that appends a summary of how the report was loaded. A report's front end loads
+# results by queries, and each query either takes its result from a store or computes it. The
+# summary gives three counts: results taken from a store, results computed, and results computed
+# even though the report named a stored result for them, which happens when that result is missing
+# from every store. The expression yields nothing for a report that has no queries, such as one
+# copied from a cached result.
 answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) answers taken, \([.front_end.queries[].run] | add // 0) run and \(.front_end.lost // 0) lost" else "" end)'
 
-# Whether a report's load lost a result: none is lost over stores that are whole, whatever moved.
+# Succeeds if some report reports a stored result that it needed but could not find in any store.
+# This happens only when a store is damaged, so stores that are intact never cause it, whatever
+# source edits were made.
 lost() {
   jq -s -e 'any(.[]; (.front_end.lost // 0) > 0)' "$1" > /dev/null 2>&1
 }
 
-# Where a `ply test` spent its wall clock WALL (ms), from its report: the phases its clock, which
-# counts from the process's start, measured, and `other` for what follows the report.
+# Prints where a `ply test` spent its wall-clock time WALL (in milliseconds), taken from its report.
+# It lists each phase the report timed, counted from the start of the process, and adds `other` for
+# the time after the report was written.
 spent() {
   jq -r --argjson wall "$2" '
     def s(ms): (ms / 1000 | floor | tostring) + "s";
@@ -197,8 +176,9 @@ spent() {
   ' "$1" 2>/dev/null
 }
 
-# The package the run ID tests, a `--filter` per substring it picks its tests by and its part, into
-# the caller's `path`, `picked` and `part`.
+# Looks up the run ID and sets the caller's variables `path` to the package it tests, `picked` to
+# one `--filter` option for each substring that selects its tests, and `part` to the part of the
+# suite it runs. Returns 2 if the run is unknown.
 placed() {
   local line rest filter
   line=$("$shards" run-line "$1") || return 2
@@ -293,8 +273,8 @@ proofs_of() {
   rm -f "$out"
 }
 
-# What a red proof run said: each claim nothing proved, how and where, and a rejected run's
-# diagnostics.
+# Prints why a proof run failed: each claim that was not proved, with its outcome and location, and
+# the diagnostics of a run that `ply` rejected.
 disproved() {
   jq -r '
     (.obligations[]? | select(.outcome != "proved")
@@ -309,7 +289,8 @@ marked() {
   [ -f "$mark" ] || { echo "nothing is marked: run 'ci-ply.sh mark' before the runs" >&2; return 1; }
 }
 
-# Every directory a run keeps a store under: each `ply.work` places, but its fixtures.
+# Prints the absolute path of each directory under which a run keeps a store: every path that
+# `ply.work` places for the standard library, compiler, CLI and packages, but not the test fixtures.
 store_dirs() {
   local dir
   for dir in $(work std) $(work std-tests) $(work compiler) $(work cli) $(work cli-tests) \
@@ -318,13 +299,17 @@ store_dirs() {
   done | LC_ALL=C sort -u
 }
 
-# Stores of cached records, the emitter's results among them, each a directory `sweep` takes whole
-# (its `STORES`).
-# shellcheck disable=SC2100 # `ci-shards.sh verify` reads this line as written.
+# The directory, relative to the cache directory, that contains the stores of cached records,
+# including the stored results of the C emitter. Each store is one subdirectory. The `sweep`
+# command, which deletes the stale files of a cache, takes each store directory whole and does not
+# look inside it (its `STORES` option).
+# shellcheck disable=SC2100 # `ci-shards.sh verify` reads this line exactly as written.
 stores=ply-c-cache/bodies
 
-# Each store a run since the mark used, into DIR whole: its manifest and segments, without what a
-# run holds open in it.
+# Copies into DIR every store that a run used since `mark` was run, with all its files except those
+# that a running `ply` creates while it uses the store: files named `run*`, the lock file and
+# `*.tmp` files. The store's manifest, the file that lists which of its data files are current, and
+# its segments, the data files holding the records, are copied.
 kept_answers() {
   local dir=$1 store
   rm -rf "$dir"
@@ -370,7 +355,8 @@ case "${1:-}" in
     : > "$durations"
     out=$(mktemp)
     status=0
-    # The modules, each a filter, up to the first of what `ply test` is also given.
+    # Turns each leading MODULE argument into a `--filter` option, and passes every argument from
+    # the first one that starts with `-` onward to `ply test` unchanged.
     args=()
     given=0
     for arg in "${@:3}"; do
@@ -416,8 +402,9 @@ case "${1:-}" in
   restore)
     dir=${2:?a directory}
     [ -d "$dir" ] || exit 0
-    # A saved store replaces the one in place whole: it grew from it, and the segments of two
-    # manifests do not mix file by file.
+    # Deletes each store that DIR contains from the cache directory before copying, so a saved store
+    # replaces the existing one completely. The saved store grew from the existing one, and segment
+    # files that belong to different manifests cannot be mixed in one store.
     for store in "$dir/$stores"/*/; do
       [ -d "$store" ] && rm -rf "${caches:?}/$stores/$(basename "$store")"
     done
@@ -427,8 +414,8 @@ case "${1:-}" in
     marked || exit 2
     for dir in $(store_dirs); do
       [ -d "$dir/.ply-cache" ] || continue
-      # A `ply` that opens a store makes a directory of its own in it, so one nothing here is newer
-      # than the mark in was opened by no run of this job.
+      # Every `ply` that opens a store creates a new directory in it. If nothing in the store is
+      # newer than the file that `ci-ply.sh mark` touched, no run since the mark opened the store.
       if [ -z "$(find "$dir/.ply-cache" -newer "$mark" -print -quit)" ]; then
         rm -rf "$dir/.ply-cache"
         echo "=== ${dir#"$root"/}: opened by no run of this job, and removed"

@@ -23,7 +23,7 @@ fn main() {
         digest(
             &repo,
             &crate_files(&repo, RUNTIME),
-            &[code::lock_closure(&lock, RUNTIME).as_bytes()]
+            &[code::reachable_lock_entries(&lock, RUNTIME).as_bytes()]
         )
     );
 }

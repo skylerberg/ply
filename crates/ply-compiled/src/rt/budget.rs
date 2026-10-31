@@ -15,7 +15,7 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
         c.stack_floor.store(floor, Relaxed);
         return 1;
     }
-    if ply_core::limit::running_low(at).is_some() && ply_core::limit::extend_running() {
+    if ply_core::limit::writable_stack_start(at).is_some() && ply_core::limit::grow_active_stack() {
         c.grown += 1;
         c.stack_floor.store(stack_floor(), Relaxed);
         return 1;
@@ -29,12 +29,12 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     0
 }
 
-pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
+pub unsafe fn switch_stack_preserving_context(ctx: *mut Ctx, from: *mut usize, to: usize) {
     let (frames, task) = unsafe { ((*ctx).frames, (*ctx).task) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
-        ply_core::limit::set_running(running);
+        ply_core::limit::set_active_stack(running);
         (*ctx).frames = frames;
         (*ctx).task = task;
         (*ctx).stack_floor.store(stack_floor(), Relaxed);
@@ -47,7 +47,7 @@ pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
         return call();
     }
     let Some(stack) = Stack::take() else {
-        return no_stack_to_take(unsafe { &mut *ctx });
+        return fail_out_of_stack(unsafe { &mut *ctx });
     };
     let mut hop = Hop {
         ctx,
@@ -57,8 +57,8 @@ pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
         back: 0,
     };
     let handover = &raw mut hop;
-    let sp = stack.prepare(hopped::<F>, handover as usize);
-    unsafe { switch_keeping(ctx, &raw mut (*handover).back, sp) };
+    let sp = stack.prepare(run_on_new_stack::<F>, handover as usize);
+    unsafe { switch_stack_preserving_context(ctx, &raw mut (*handover).back, sp) };
     unsafe { (*handover).result }
 }
 
@@ -70,7 +70,7 @@ struct Hop<'a, F> {
     back: usize,
 }
 
-extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
+extern "C" fn run_on_new_stack<F: FnOnce() -> Word>(arg: usize) {
     let hop = arg as *mut Hop<'_, F>;
     let call = unsafe {
         (*(*hop).ctx)
@@ -89,14 +89,14 @@ extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
     std::process::abort();
 }
 
-pub(crate) fn no_stack_to_take(c: &mut Ctx) -> Word {
+pub(crate) fn fail_out_of_stack(c: &mut Ctx) -> Word {
     let d = error("the system would map no further stack").note(
         "each live task, and each `handle` body whose clause resumes off the tail, holds one until it ends",
     );
     c.fail_with(FAILED_OUT_OF_STACK, d)
 }
 
-const REWATCH: Duration = Duration::from_millis(10);
+const DEADLINE_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 struct Watch {
     watched: Mutex<Vec<(usize, Instant)>>,
@@ -104,9 +104,9 @@ struct Watch {
 }
 
 fn watch() -> &'static Watch {
-    static WATCH: OnceLock<Watch> = OnceLock::new();
+    static DEADLINE_WATCHDOG: OnceLock<Watch> = OnceLock::new();
     static STARTED: Once = Once::new();
-    let w = WATCH.get_or_init(|| Watch {
+    let w = DEADLINE_WATCHDOG.get_or_init(|| Watch {
         watched: Mutex::new(Vec::new()),
         changed: Condvar::new(),
     });
@@ -128,7 +128,7 @@ impl Watch {
             for &(floor, deadline) in watched.iter() {
                 let next = if deadline <= now {
                     unsafe { (*(floor as *const AtomicUsize)).store(usize::MAX, Relaxed) };
-                    now + REWATCH
+                    now + DEADLINE_RECHECK_INTERVAL
                 } else {
                     deadline
                 };
@@ -170,7 +170,7 @@ thread_local! {
     static OWN: (usize, usize) = stack_of_this_thread();
 }
 
-pub(crate) fn let_go_below_here() {
+pub(crate) fn release_unused_stack_pages() {
     const KEPT: usize = 64 << 10;
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
@@ -189,7 +189,7 @@ pub(crate) fn let_go_below_here() {
 pub(crate) fn floor_here() -> Option<usize> {
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
-    if let Some(low) = ply_core::limit::running_low(at) {
+    if let Some(low) = ply_core::limit::writable_stack_start(at) {
         return Some(low + STACK_MARGIN);
     }
     OWN.with(|&(bottom, top)| {

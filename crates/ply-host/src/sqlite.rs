@@ -15,7 +15,7 @@ pub const MAX_CONNECTIONS: usize = 64;
 
 const SIDE_FILES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-enum Ask {
+enum WorkerRequest {
     Run {
         sql: String,
         params: Vec<Scalar>,
@@ -40,7 +40,7 @@ enum Response {
 }
 
 struct Command {
-    ask: Ask,
+    ask: WorkerRequest,
     result: Sender<Response>,
 }
 
@@ -80,7 +80,7 @@ impl SqliteHost {
                 .collect()
         };
         for handle in left {
-            asked(&handle.commands, Ask::Close);
+            asked(&handle.commands, WorkerRequest::Close);
         }
     }
 
@@ -100,7 +100,7 @@ impl SqliteHost {
                 Some(target) => {
                     match opened(&connections, &root, &target, &path, mode, options, machine) {
                         Ok(id) => [&[1u8][..], &int(id)].concat(),
-                        Err(failure) => [&[0u8][..], &failure_written(&failure)].concat(),
+                        Err(failure) => [&[0u8][..], &encode_failure(&failure)].concat(),
                     }
                 }
                 None => {
@@ -109,7 +109,7 @@ impl SqliteHost {
                         "",
                         format!("`{path}` passes through a symbolic link"),
                     );
-                    [&[0u8][..], &failure_written(&failure)].concat()
+                    [&[0u8][..], &encode_failure(&failure)].concat()
                 }
             })
         }))
@@ -125,7 +125,8 @@ impl SqliteHost {
                     _ => None,
                 }
             };
-            let closed = handle.is_some_and(|handle| asked(&handle.commands, Ask::Close).is_some());
+            let closed = handle
+                .is_some_and(|handle| asked(&handle.commands, WorkerRequest::Close).is_some());
             Ok(vec![u8::from(closed)])
         })
     }
@@ -139,10 +140,10 @@ impl SqliteHost {
         limits: Limits,
         reads_only: bool,
     ) -> Job {
-        self.replying(
+        self.reply_job(
             root,
             id,
-            Ask::Run {
+            WorkerRequest::Run {
                 sql,
                 params,
                 limits,
@@ -152,7 +153,7 @@ impl SqliteHost {
     }
 
     pub fn control(&self, root: PathBuf, id: i64, step: Control) -> Job {
-        self.replying(root, id, Ask::Control(step))
+        self.reply_job(root, id, WorkerRequest::Control(step))
     }
 
     pub fn cursor(
@@ -163,10 +164,10 @@ impl SqliteHost {
         params: Vec<Scalar>,
         limits: Limits,
     ) -> Job {
-        self.replying(
+        self.reply_job(
             root,
             id,
-            Ask::Cursor {
+            WorkerRequest::Cursor {
                 sql,
                 params,
                 limits,
@@ -175,14 +176,14 @@ impl SqliteHost {
     }
 
     pub fn fetch(&self, root: PathBuf, id: i64, rows: i64) -> Job {
-        self.replying(root, id, Ask::Fetch(rows))
+        self.reply_job(root, id, WorkerRequest::Fetch(rows))
     }
 
     pub fn finish(&self, root: PathBuf, id: i64) -> Job {
         let connections = Arc::clone(&self.connections);
         Box::new(move || {
             let done = commands_of(&connections, &root, id)
-                .and_then(|commands| asked(&commands, Ask::Finish));
+                .and_then(|commands| asked(&commands, WorkerRequest::Finish));
             Ok(vec![u8::from(matches!(done, Some(Response::Done(true))))])
         })
     }
@@ -199,7 +200,7 @@ impl SqliteHost {
         Ok(Box::new(move || {
             let reply = match to {
                 Some(to) if std::fs::symlink_metadata(&to).is_err() => {
-                    reply_of(&connections, &root, id, Ask::Backup(to))
+                    reply_of(&connections, &root, id, WorkerRequest::Backup(to))
                 }
                 _ => Reply::failed(Failure::new(
                     "exists",
@@ -207,13 +208,13 @@ impl SqliteHost {
                     format!("`{path}` is there already, and a backup writes a new file"),
                 )),
             };
-            Ok(reply_written(&reply))
+            Ok(encode_reply(&reply))
         }))
     }
 
-    fn replying(&self, root: PathBuf, id: i64, ask: Ask) -> Job {
+    fn reply_job(&self, root: PathBuf, id: i64, ask: WorkerRequest) -> Job {
         let connections = Arc::clone(&self.connections);
-        Box::new(move || Ok(reply_written(&reply_of(&connections, &root, id, ask))))
+        Box::new(move || Ok(encode_reply(&reply_of(&connections, &root, id, ask))))
     }
 }
 
@@ -224,7 +225,7 @@ pub fn root_of(roots: &Roots, label: &str, what: &str, span: Span) -> Result<Pat
     }
 }
 
-pub fn scalars_read(flat: &[u8]) -> Option<Vec<Scalar>> {
+pub fn decode_scalars(flat: &[u8]) -> Option<Vec<Scalar>> {
     parts_of(flat)?
         .into_iter()
         .map(|scalar| {
@@ -244,7 +245,7 @@ pub fn scalars_read(flat: &[u8]) -> Option<Vec<Scalar>> {
         .collect()
 }
 
-pub fn limits_read(flat: &[u8]) -> Option<Limits> {
+pub fn decode_limits(flat: &[u8]) -> Option<Limits> {
     if flat.len() != 40 {
         return None;
     }
@@ -258,7 +259,7 @@ pub fn limits_read(flat: &[u8]) -> Option<Limits> {
     })
 }
 
-fn scalar_written(scalar: &Scalar) -> Vec<u8> {
+fn encode_scalar(scalar: &Scalar) -> Vec<u8> {
     match scalar {
         Scalar::Null => vec![0],
         Scalar::Int(n) => [&[1u8][..], &int(*n)].concat(),
@@ -268,7 +269,7 @@ fn scalar_written(scalar: &Scalar) -> Vec<u8> {
     }
 }
 
-fn failure_written(failure: &Failure) -> Vec<u8> {
+fn encode_failure(failure: &Failure) -> Vec<u8> {
     parts(&[
         failure.kind.as_bytes(),
         failure.name.as_bytes(),
@@ -276,7 +277,7 @@ fn failure_written(failure: &Failure) -> Vec<u8> {
     ])
 }
 
-pub fn reply_written(reply: &Reply) -> Vec<u8> {
+pub fn encode_reply(reply: &Reply) -> Vec<u8> {
     let listed = |each: Vec<Vec<u8>>| {
         let slices: Vec<&[u8]> = each.iter().map(Vec::as_slice).collect();
         parts(&slices)
@@ -292,10 +293,10 @@ pub fn reply_written(reply: &Reply) -> Vec<u8> {
         reply
             .rows
             .iter()
-            .map(|row| listed(row.iter().map(scalar_written).collect()))
+            .map(|row| listed(row.iter().map(encode_scalar).collect()))
             .collect(),
     );
-    let failure = found(reply.failure.as_ref().map(failure_written));
+    let failure = found(reply.failure.as_ref().map(encode_failure));
     parts(&[
         &columns,
         &rows,
@@ -319,13 +320,13 @@ fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option
         .map(|handle| handle.commands.clone())
 }
 
-fn asked(commands: &Sender<Command>, ask: Ask) -> Option<Response> {
+fn asked(commands: &Sender<Command>, ask: WorkerRequest) -> Option<Response> {
     let (result, returned) = channel();
     commands.send(Command { ask, result }).ok()?;
     returned.recv().ok()
 }
 
-fn reply_of(connections: &Mutex<Connections>, root: &Path, id: i64, ask: Ask) -> Reply {
+fn reply_of(connections: &Mutex<Connections>, root: &Path, id: i64, ask: WorkerRequest) -> Reply {
     match commands_of(connections, root, id).and_then(|commands| asked(&commands, ask)) {
         Some(Response::Reply(reply)) => reply,
         _ => Reply::failed(Failure::new(
@@ -440,27 +441,27 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
     let mut next: Option<Command> = None;
     while let Some(Command { ask, result }) = next.take().or_else(|| commands.recv().ok()) {
         let said = match ask {
-            Ask::Close => {
+            WorkerRequest::Close => {
                 drop(engine);
                 let _ = result.send(Response::Done(true));
                 return;
             }
-            Ask::Run {
+            WorkerRequest::Run {
                 sql,
                 params,
                 limits,
                 reads_only,
             } => Response::Reply(engine.run(&sql, &params, limits, reads_only)),
-            Ask::Control(step) => Response::Reply(engine.control(step)),
-            Ask::Backup(to) => Response::Reply(engine.backup(&to)),
-            Ask::Fetch(_) if folded => Response::Reply(Reply::default()),
-            Ask::Fetch(_) => Response::Reply(Reply::failed(Failure::new(
+            WorkerRequest::Control(step) => Response::Reply(engine.control(step)),
+            WorkerRequest::Backup(to) => Response::Reply(engine.backup(&to)),
+            WorkerRequest::Fetch(_) if folded => Response::Reply(Reply::default()),
+            WorkerRequest::Fetch(_) => Response::Reply(Reply::failed(Failure::new(
                 "closed",
                 "",
                 "no fold is open on this connection",
             ))),
-            Ask::Finish => Response::Done(std::mem::take(&mut folded)),
-            Ask::Cursor {
+            WorkerRequest::Finish => Response::Done(std::mem::take(&mut folded)),
+            WorkerRequest::Cursor {
                 sql,
                 params,
                 limits,
@@ -468,7 +469,7 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                 let mut waiting = Some(result);
                 let mut opened = false;
                 let mut finished = false;
-                engine.paged(&sql, &params, limits, true, |page| {
+                engine.run_in_pages(&sql, &params, limits, true, |page| {
                     let over = page.ended;
                     finished = !opened && page.failure.is_some();
                     opened = true;
@@ -482,21 +483,21 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                         match commands.recv() {
                             Err(_) => return None,
                             Ok(Command {
-                                ask: Ask::Fetch(rows),
+                                ask: WorkerRequest::Fetch(rows),
                                 result,
                             }) => {
                                 waiting = Some(result);
                                 return Some(rows.max(0));
                             }
                             Ok(Command {
-                                ask: Ask::Finish,
+                                ask: WorkerRequest::Finish,
                                 result,
                             }) => {
                                 finished = true;
                                 let _ = result.send(Response::Done(true));
                                 return None;
                             }
-                            Ok(close @ Command { ask: Ask::Close, .. }) => {
+                            Ok(close @ Command { ask: WorkerRequest::Close, .. }) => {
                                 finished = true;
                                 next = Some(close);
                                 return None;

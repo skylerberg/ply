@@ -1,25 +1,27 @@
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, F64, I64, Raises};
-use crate::rt::{Ctx, Rejected, borrowed, refuse, rejected_numbered, rejected_unknown};
+use crate::rt::{
+    Ctx, Rejected, borrowed, fail_unknown_rejected_operation, refuse, rejected_operation_from_id,
+};
 use ply_core::builtins::{assert_failure, not_found};
 use ply_core::{Decimal, Diagnostic, Span, codes};
 
 pub fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native("?blake3", rt_blake3 as unsafe extern "C" fn(_, _, _) -> _),
-        machine_native(
+        runtime_native("?blake3", rt_blake3 as unsafe extern "C" fn(_, _, _) -> _),
+        runtime_native(
             "?scalar_encoded",
             rt_scalar_encoded as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?text_encoded",
             rt_text_encoded as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?functions_compared",
             rt_functions_compared as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "?refused_text",
             rt_refused_text as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
@@ -36,7 +38,7 @@ macro_rules! float_functions {
         })+
 
         fn float_natives() -> Vec<MachineNative> {
-            vec![$(machine_native($name, $f as unsafe extern "C" fn(*mut Ctx, $(float_functions!(@f64 $a)),+) -> F64)),+]
+            vec![$(runtime_native($name, $f as unsafe extern "C" fn(*mut Ctx, $(float_functions!(@f64 $a)),+) -> F64)),+]
         }
     };
     (@f64 $a:ident) => { F64 };
@@ -153,8 +155,8 @@ pub unsafe extern "C" fn rt_refused_text(
 ) -> Raises {
     let c = unsafe { &mut *ctx };
     let site = c.site();
-    let Some(r) = rejected_numbered(what) else {
-        rejected_unknown(c, what);
+    let Some(r) = rejected_operation_from_id(what) else {
+        fail_unknown_rejected_operation(c, what);
         return Raises(());
     };
     let rejected = match r {
@@ -191,7 +193,7 @@ pub unsafe extern "C" fn rt_refused_text(
             ply_core::crypto::misuse(site, what, reason)
         }
         _ => {
-            rejected_unknown(c, what);
+            fail_unknown_rejected_operation(c, what);
             return Raises(());
         }
     };

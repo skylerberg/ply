@@ -1,73 +1,73 @@
-use super::{Determinism, Nondeterministic, asked, from_host, text_at, texts_at};
-use crate::c::{MachineNative, machine_native};
+use super::{Determinism, Nondeterministic, asked, text_at, texts_at, with_host_facilities};
+use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
 use ply_core::{Diagnostic, codes};
 use ply_host::jobs::Work;
 use ply_host::native::{int, parts_of};
 use ply_host::observe;
-use ply_host::process::{Io, Output, ProcessHost, Reach, Signal, Stream, withheld};
+use ply_host::process::{Io, OperationTarget, Output, ProcessHost, Signal, Stream, withheld};
 use std::path::Path;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "process_args",
             rt_process_args as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_bound",
             rt_process_bound as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_line",
             rt_process_line as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "process_write",
             rt_process_write as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_flush",
             rt_process_flush as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_read_line",
             rt_process_read_line as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_read",
             rt_process_read as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_exit",
             rt_process_exit as unsafe extern "C" fn(_, _),
         ),
-        machine_native(
+        runtime_native(
             "process_spawn",
             rt_process_spawn as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_start",
             rt_process_start as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_wait",
             rt_process_wait as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_signal",
             rt_process_signal as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_input",
             rt_process_input as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "process_end_input",
             rt_process_end_input as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "process_output_line",
             rt_process_output_line as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
@@ -79,12 +79,13 @@ fn hosted<R: Copy>(
     native: &'static str,
     op: &'static str,
     determinism: Determinism,
-    reach: Reach,
+    reach: OperationTarget,
     rejected: R,
     result: impl FnOnce(&mut Ctx, &ProcessHost) -> Result<R, Diagnostic>,
 ) -> R {
     asked(ctx, native, determinism, rejected, |c| {
-        let Some(found) = from_host(c, |facilities| facilities.process().cloned()) else {
+        let Some(found) = with_host_facilities(c, |facilities| facilities.process().cloned())
+        else {
             return rejected;
         };
         let returned = match found {
@@ -135,7 +136,7 @@ pub unsafe extern "C" fn rt_process_args(ctx: *mut Ctx) -> TakenBytes {
         "process_args",
         "args",
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         none,
         |c, host| {
             let args = host.args(c.site())?;
@@ -151,7 +152,7 @@ pub unsafe extern "C" fn rt_process_bound(ctx: *mut Ctx, p: Addr, n: I64) -> I64
         "process_bound",
         "bound",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         I64(0),
         |c, host| Ok(text_at(c, p, n).map_or(I64(0), |label| I64(i64::from(host.bound(&label))))),
     )
@@ -167,7 +168,7 @@ pub unsafe extern "C" fn rt_process_line(ctx: *mut Ctx, stream: I64, p: Addr, n:
         "process_line",
         op,
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         (),
         |c, host| match text_at(c, p, n) {
             Some(text) => host.line(stream_of(stream), &text, c.site()),
@@ -186,7 +187,7 @@ pub unsafe extern "C" fn rt_process_write(ctx: *mut Ctx, stream: I64, p: Addr, n
         "process_write",
         op,
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         I64(0),
         |c, host| {
             let bytes = unsafe { borrowed(p, n) };
@@ -205,7 +206,7 @@ pub unsafe extern "C" fn rt_process_flush(ctx: *mut Ctx) -> I64 {
         "process_flush",
         "flush",
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         I64(0),
         |c, host| Ok(I64(i64::from(host.flush(c.site())?))),
     )
@@ -217,7 +218,7 @@ pub unsafe extern "C" fn rt_process_read_line(ctx: *mut Ctx) -> I64 {
         "process_read_line",
         "line",
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         I64(0),
         |c, host| {
             let job = host.read_line(c.site())?;
@@ -232,7 +233,7 @@ pub unsafe extern "C" fn rt_process_read(ctx: *mut Ctx, max: I64) -> I64 {
         "process_read",
         "in_bytes",
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         I64(0),
         |c, host| {
             let Some(max) =
@@ -252,7 +253,7 @@ pub unsafe extern "C" fn rt_process_exit(ctx: *mut Ctx, code: I64) {
         "process_exit",
         "exit",
         Nondeterministic,
-        Reach::Own,
+        OperationTarget::OwnProcess,
         (),
         |c, host| {
             let Some(code) = super::handed(
@@ -285,7 +286,7 @@ pub unsafe extern "C" fn rt_process_spawn(
         "process_spawn",
         "spawn",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         I64(0),
         |c, host| {
             let (Some(label), Some(args), Some(dir), Some(env)) = (
@@ -302,7 +303,7 @@ pub unsafe extern "C" fn rt_process_spawn(
     )
 }
 
-fn wiring_of(wiring: &[u8]) -> Option<Io> {
+fn parse_stdio(wiring: &[u8]) -> Option<Io> {
     let parts = parts_of(wiring)?;
     let [kinds, out_file, err_file] = parts.as_slice() else {
         return None;
@@ -337,7 +338,7 @@ pub unsafe extern "C" fn rt_process_start(
         "process_start",
         "start",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         TakenBytes(0),
         |c, host| {
             let (Some(label), Some(args), Some(dir), Some(env)) = (
@@ -348,7 +349,7 @@ pub unsafe extern "C" fn rt_process_start(
             ) else {
                 return Ok(TakenBytes(0));
             };
-            let wiring = wiring_of(unsafe { borrowed(wp, wn) });
+            let wiring = parse_stdio(unsafe { borrowed(wp, wn) });
             let Some(io) = super::handed(c, "process_start", "a wiring", wiring) else {
                 return Ok(TakenBytes(0));
             };
@@ -382,7 +383,7 @@ pub unsafe extern "C" fn rt_process_wait(
         "process_wait",
         "wait",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         I64(0),
         |c, host| {
             let Some(label) = text_at(c, lp, ln) else {
@@ -406,7 +407,7 @@ pub unsafe extern "C" fn rt_process_signal(
         "process_signal",
         "signal",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         I64(0),
         |c, host| {
             let (Some(label), Some(signal)) = (
@@ -438,7 +439,7 @@ pub unsafe extern "C" fn rt_process_input(
         "process_input",
         "input",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         I64(0),
         |c, host| {
             let Some(label) = text_at(c, lp, ln) else {
@@ -457,7 +458,7 @@ pub unsafe extern "C" fn rt_process_end_input(ctx: *mut Ctx, lp: Addr, ln: I64, 
         "process_end_input",
         "end_input",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         (),
         |c, host| match text_at(c, lp, ln) {
             Some(label) => host.end_input(&label, child.0, c.site()),
@@ -478,7 +479,7 @@ pub unsafe extern "C" fn rt_process_output_line(
         "process_output_line",
         "output_line",
         Nondeterministic,
-        Reach::Executable,
+        OperationTarget::Executable,
         I64(0),
         |c, host| {
             let Some(label) = text_at(c, lp, ln) else {

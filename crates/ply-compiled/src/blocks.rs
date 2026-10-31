@@ -9,18 +9,18 @@ use std::sync::{Mutex, PoisonError};
 pub(crate) const SEGMENT: usize = 4 << 20;
 pub(crate) const PAGE: usize = 64 << 10;
 const PAGES: usize = SEGMENT / PAGE;
-pub(crate) const WORD_CLASSES: usize = 16;
-pub(crate) const LINK_AT: usize = 8;
+pub(crate) const WORD_STEP_SIZE_CLASSES: usize = 16;
+pub(crate) const LINK_OFFSET: usize = 8;
 pub const SMALL: usize = 8 << 10;
 const CLASSES: usize = 65;
-const SPARES: usize = 32;
+const MAX_SPARE_PAGES: usize = 32;
 const HEAD: usize = size_of::<Segment>().next_multiple_of(16);
-const LEAD: usize = 16;
-const EMPTIED: usize = 64;
+const LARGE_HEADER_BYTES: usize = 16;
+const MAX_POOLED_SEGMENTS: usize = 64;
 
 static EMPTIED_SEGMENTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-fn segment_taken() -> *mut Segment {
+fn allocate_segment() -> *mut Segment {
     let emptied = EMPTIED_SEGMENTS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -31,12 +31,12 @@ fn segment_taken() -> *mut Segment {
     }
 }
 
-unsafe fn segment_given(segment: *mut Segment) {
+unsafe fn release_segment(segment: *mut Segment) {
     unsafe { segment.write_bytes(0, 1) };
     let mut emptied = EMPTIED_SEGMENTS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if emptied.len() < EMPTIED {
+    if emptied.len() < MAX_POOLED_SEGMENTS {
         emptied.push(segment.addr());
         return;
     }
@@ -74,7 +74,7 @@ pub(crate) struct Segment {
 
 pub fn class_of(bytes: usize) -> usize {
     let words = bytes / 8;
-    if words <= WORD_CLASSES {
+    if words <= WORD_STEP_SIZE_CLASSES {
         return words;
     }
     let n = words - 1;
@@ -82,19 +82,19 @@ pub fn class_of(bytes: usize) -> usize {
     8 * (top - 2) + ((n >> (top - 3)) & 7) + 1
 }
 
-pub fn block_of(class: usize) -> usize {
-    if class <= WORD_CLASSES {
+pub fn class_block_bytes(class: usize) -> usize {
+    if class <= WORD_STEP_SIZE_CLASSES {
         return class * 8;
     }
-    let k = class - WORD_CLASSES - 1;
+    let k = class - WORD_STEP_SIZE_CLASSES - 1;
     (9 + k % 8) << (k / 8 + 4)
 }
 
-pub fn taken_bytes(bytes: usize) -> usize {
+pub fn reserved_bytes(bytes: usize) -> usize {
     if bytes > SMALL {
         bytes
     } else {
-        block_of(class_of(bytes))
+        class_block_bytes(class_of(bytes))
     }
 }
 
@@ -117,13 +117,13 @@ unsafe fn room(page: *mut Page) -> (*mut u8, usize) {
 }
 
 unsafe fn link(block: *mut u8) -> *mut *mut u8 {
-    unsafe { block.add(LINK_AT).cast() }
+    unsafe { block.add(LINK_OFFSET).cast() }
 }
 
 unsafe fn owner(block: *mut u8, bytes: usize) -> &'static AtomicPtr<Returned> {
     unsafe {
         if bytes > SMALL {
-            &*block.sub(LEAD).cast()
+            &*block.sub(LARGE_HEADER_BYTES).cast()
         } else {
             &(*page_of(block)).owner
         }
@@ -133,7 +133,7 @@ unsafe fn owner(block: *mut u8, bytes: usize) -> &'static AtomicPtr<Returned> {
 unsafe fn handing(block: *mut u8, bytes: usize) -> &'static AtomicU32 {
     unsafe {
         if bytes > SMALL {
-            &*block.sub(LEAD - 8).cast()
+            &*block.sub(LARGE_HEADER_BYTES - 8).cast()
         } else {
             &(*page_of(block)).handing
         }
@@ -147,7 +147,7 @@ fn waited(handing: &AtomicU32) {
 }
 
 fn large(bytes: usize) -> Layout {
-    Layout::from_size_align(bytes + LEAD, 16).expect("a block's layout")
+    Layout::from_size_align(bytes + LARGE_HEADER_BYTES, 16).expect("a block's layout")
 }
 
 unsafe fn push(list: &mut *mut Page, page: *mut Page) {
@@ -162,7 +162,7 @@ unsafe fn push(list: &mut *mut Page, page: *mut Page) {
     }
 }
 
-unsafe fn push_behind(list: &mut *mut Page, page: *mut Page) {
+unsafe fn push_after_head(list: &mut *mut Page, page: *mut Page) {
     let head = *list;
     if head.is_null() {
         return unsafe { push(list, page) };
@@ -215,7 +215,7 @@ unsafe fn pop(page: *mut Page, reused: &mut usize) -> *mut u8 {
     }
 }
 
-pub unsafe fn hand_back(block: *mut u8, bytes: usize) {
+pub unsafe fn free_block(block: *mut u8, bytes: usize) {
     unsafe { Handing::begin(block, bytes).finish() }
 }
 
@@ -266,7 +266,7 @@ impl Drop for Handing {
 }
 
 #[repr(C)]
-pub(crate) struct Filling {
+pub(crate) struct ActivePages {
     pub(crate) pages: [*mut Page; CLASSES],
     pub(crate) name: *const Returned,
     pub(crate) reused: usize,
@@ -274,9 +274,9 @@ pub(crate) struct Filling {
 
 pub struct Blocks {
     returned: Box<Returned>,
-    filling: Box<Filling>,
+    filling: Box<ActivePages>,
     spare: *mut Page,
-    spares: usize,
+    spare_page_count: usize,
     clean: *mut Page,
     empty: usize,
     segments: BTreeSet<usize>,
@@ -286,7 +286,7 @@ pub struct Blocks {
 impl Default for Blocks {
     fn default() -> Blocks {
         let returned = Box::<Returned>::default();
-        let filling = Box::new(Filling {
+        let filling = Box::new(ActivePages {
             pages: [null_mut(); CLASSES],
             name: &raw const *returned,
             reused: 0,
@@ -295,7 +295,7 @@ impl Default for Blocks {
             returned,
             filling,
             spare: null_mut(),
-            spares: 0,
+            spare_page_count: 0,
             clean: null_mut(),
             empty: 0,
             segments: BTreeSet::new(),
@@ -309,7 +309,7 @@ impl Blocks {
         (&raw const *self.returned).cast_mut()
     }
 
-    pub(crate) fn filling(&mut self) -> *mut Filling {
+    pub(crate) fn filling(&mut self) -> *mut ActivePages {
         &raw mut *self.filling
     }
 
@@ -318,14 +318,14 @@ impl Blocks {
         unsafe {
             if bytes > SMALL {
                 if !self.returned.large.load(Relaxed).is_null() {
-                    self.regain(self.name());
+                    self.reclaim_remote_frees(self.name());
                 }
                 let base = alloc(large(bytes));
                 assert!(!base.is_null(), "the heap is out of memory");
                 base.cast::<AtomicPtr<Returned>>()
                     .write(AtomicPtr::new(self.name()));
                 base.add(8).cast::<AtomicU32>().write(AtomicU32::new(0));
-                let block = base.add(LEAD);
+                let block = base.add(LARGE_HEADER_BYTES);
                 self.large.insert(block.addr(), bytes);
                 return block;
             }
@@ -347,7 +347,7 @@ impl Blocks {
             loop {
                 let page = self.filling.pages[class];
                 if page.is_null() {
-                    if self.regain(self.name()) {
+                    if self.reclaim_remote_frees(self.name()) {
                         continue;
                     }
                     let page = self.page(class);
@@ -363,7 +363,7 @@ impl Blocks {
         }
     }
 
-    unsafe fn regain(&mut self, returned: *const Returned) -> bool {
+    unsafe fn reclaim_remote_frees(&mut self, returned: *const Returned) -> bool {
         unsafe {
             let mut small = (*returned).small.swap(null_mut(), Acquire);
             let mut large = (*returned).large.swap(null_mut(), Acquire);
@@ -386,7 +386,7 @@ impl Blocks {
         unsafe {
             let page = if self.spare.is_null() {
                 if self.clean.is_null() {
-                    let segment = segment_taken();
+                    let segment = allocate_segment();
                     assert!(!segment.is_null(), "the heap is out of memory");
                     self.segments.insert(segment.addr());
                     self.list(segment);
@@ -397,13 +397,13 @@ impl Blocks {
             } else {
                 let page = self.spare;
                 unlink(&mut self.spare, page);
-                self.spares -= 1;
+                self.spare_page_count -= 1;
                 (*page).spare = false;
                 page
             };
             self.empty -= 1;
             let (start, len) = room(page);
-            let size = block_of(class);
+            let size = class_block_bytes(class);
             (*page).free = null_mut();
             (*page).fresh = start;
             (*page).end = start.add(len / size * size);
@@ -431,7 +431,7 @@ impl Blocks {
         unsafe {
             if bytes > SMALL {
                 if let Some(bytes) = self.large.remove(&block.addr()) {
-                    dealloc(block.sub(LEAD), large(bytes));
+                    dealloc(block.sub(LARGE_HEADER_BYTES), large(bytes));
                 }
                 return;
             }
@@ -445,7 +445,7 @@ impl Blocks {
                     self.retire(page);
                 }
             } else if !(*page).listed {
-                push_behind(&mut self.filling.pages[class], page);
+                push_after_head(&mut self.filling.pages[class], page);
             }
         }
     }
@@ -455,7 +455,7 @@ impl Blocks {
             if (*page).listed {
                 unlink(&mut self.filling.pages[(*page).class as usize], page);
             }
-            self.shelve(page);
+            self.recycle_empty_page(page);
             let segment = segment_of(page);
             (*segment).held -= 1;
             if (*segment).held > 0 || self.empty < 2 * PAGES {
@@ -464,7 +464,7 @@ impl Blocks {
             for i in 0..PAGES {
                 let page = &raw mut (*segment).pages[i];
                 if (*page).spare {
-                    self.spares -= 1;
+                    self.spare_page_count -= 1;
                     unlink(&mut self.spare, page);
                 } else {
                     unlink(&mut self.clean, page);
@@ -472,16 +472,16 @@ impl Blocks {
             }
             self.empty -= PAGES;
             self.segments.remove(&segment.addr());
-            segment_given(segment);
+            release_segment(segment);
         }
     }
 
-    unsafe fn shelve(&mut self, page: *mut Page) {
+    unsafe fn recycle_empty_page(&mut self, page: *mut Page) {
         unsafe {
             (*page).block = 0;
-            (*page).spare = self.spares < SPARES;
+            (*page).spare = self.spare_page_count < MAX_SPARE_PAGES;
             if (*page).spare {
-                self.spares += 1;
+                self.spare_page_count += 1;
                 push(&mut self.spare, page);
             } else {
                 let (start, len) = room(page);
@@ -549,7 +549,7 @@ impl Blocks {
     }
 
     pub fn kept(&self) -> usize {
-        self.spares * PAGE
+        self.spare_page_count * PAGE
     }
 
     pub fn live(&self) -> usize {
@@ -580,7 +580,7 @@ impl Blocks {
             other.segments.retain(|&address| {
                 let segment = address as *mut Segment;
                 if (*segment).pages.iter().all(|page| page.live == 0) && self.empty >= PAGES {
-                    segment_given(segment);
+                    release_segment(segment);
                     return false;
                 }
                 for i in 0..PAGES {
@@ -588,13 +588,13 @@ impl Blocks {
                     if (*page).live > 0 {
                         (*page).owner.store(self.name(), SeqCst);
                         if (*page).listed {
-                            push_behind(&mut self.filling.pages[(*page).class as usize], page);
+                            push_after_head(&mut self.filling.pages[(*page).class as usize], page);
                         }
                     } else if (*page).block > 0 || (*page).spare {
                         if (*page).block > 0 {
                             (*segment).held -= 1;
                         }
-                        self.shelve(page);
+                        self.recycle_empty_page(page);
                     } else {
                         push(&mut self.clean, page);
                         self.empty += 1;
@@ -609,7 +609,7 @@ impl Blocks {
             self.segments.append(&mut other.segments);
             self.large.append(&mut other.large);
             self.filling.reused += other.filling.reused;
-            self.regain(other.name());
+            self.reclaim_remote_frees(other.name());
         }
     }
 
@@ -631,12 +631,12 @@ impl Blocks {
         self.quiet();
         unsafe {
             for (address, bytes) in std::mem::take(&mut self.large) {
-                dealloc((address as *mut u8).sub(LEAD), large(bytes));
+                dealloc((address as *mut u8).sub(LARGE_HEADER_BYTES), large(bytes));
             }
             let kept = self.segments.first().copied();
             self.segments.retain(|&address| {
                 if Some(address) != kept {
-                    segment_given(address as *mut Segment);
+                    release_segment(address as *mut Segment);
                 }
                 Some(address) == kept
             });
@@ -644,7 +644,7 @@ impl Blocks {
             self.filling.pages = [null_mut(); CLASSES];
             self.filling.reused = 0;
             self.spare = null_mut();
-            self.spares = 0;
+            self.spare_page_count = 0;
             self.clean = null_mut();
             self.empty = 0;
             if let Some(address) = kept {
@@ -661,10 +661,10 @@ impl Drop for Blocks {
         self.quiet();
         unsafe {
             for (&address, &bytes) in &self.large {
-                dealloc((address as *mut u8).sub(LEAD), large(bytes));
+                dealloc((address as *mut u8).sub(LARGE_HEADER_BYTES), large(bytes));
             }
             for &address in &self.segments {
-                segment_given(address as *mut Segment);
+                release_segment(address as *mut Segment);
             }
         }
     }

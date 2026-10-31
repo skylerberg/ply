@@ -6,17 +6,17 @@ use zeroize::Zeroizing;
 
 const SLOTS: usize = 1 << 18;
 const EMPTY: usize = 0;
-const GONE: usize = 1;
-const MARK: usize = 64;
+const FREED: usize = 1;
+const MARKER_CAPACITY: usize = 64;
 
 static PTRS: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(EMPTY) }; SLOTS];
 static SIZES: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-static MARKER: [AtomicU8; MARK] = [const { AtomicU8::new(0) }; MARK];
+static MARKER: [AtomicU8; MARKER_CAPACITY] = [const { AtomicU8::new(0) }; MARKER_CAPACITY];
 static MARKER_LEN: AtomicUsize = AtomicUsize::new(0);
 static WATCHING: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicBool = AtomicBool::new(false);
 static FULL: AtomicBool = AtomicBool::new(false);
-static FREED_HOLDING: AtomicUsize = AtomicUsize::new(0);
+static FREED_WITH_MARKER: AtomicUsize = AtomicUsize::new(0);
 
 struct Watching;
 
@@ -62,7 +62,7 @@ unsafe impl GlobalAlloc for Watching {
             let mut placed = false;
             for _ in 0..SLOTS {
                 let held = PTRS[at].load(Ordering::Relaxed);
-                if held == EMPTY || held == GONE {
+                if held == EMPTY || held == FREED {
                     PTRS[at].store(ptr as usize, Ordering::Relaxed);
                     SIZES[at].store(layout.size(), Ordering::Relaxed);
                     placed = true;
@@ -87,9 +87,9 @@ unsafe impl GlobalAlloc for Watching {
                 break;
             }
             if held == ptr as usize {
-                PTRS[at].store(GONE, Ordering::Relaxed);
+                PTRS[at].store(FREED, Ordering::Relaxed);
                 if unsafe { holds(ptr, SIZES[at].load(Ordering::Relaxed)) } {
-                    FREED_HOLDING.fetch_add(1, Ordering::Relaxed);
+                    FREED_WITH_MARKER.fetch_add(1, Ordering::Relaxed);
                 }
                 break;
             }
@@ -101,7 +101,7 @@ unsafe impl GlobalAlloc for Watching {
 }
 
 fn watch(marker: &[u8]) {
-    assert!(marker.len() <= MARK);
+    assert!(marker.len() <= MARKER_CAPACITY);
     lock();
     for slot in &PTRS {
         slot.store(EMPTY, Ordering::Relaxed);
@@ -110,7 +110,7 @@ fn watch(marker: &[u8]) {
         MARKER[i].store(*b, Ordering::Relaxed);
     }
     MARKER_LEN.store(marker.len(), Ordering::Relaxed);
-    FREED_HOLDING.store(0, Ordering::Relaxed);
+    FREED_WITH_MARKER.store(0, Ordering::Relaxed);
     FULL.store(false, Ordering::Relaxed);
     WATCHING.store(true, Ordering::Relaxed);
     unlock();
@@ -121,11 +121,11 @@ fn seen() -> (usize, usize) {
     let mut live = 0;
     for (slot, size) in PTRS.iter().zip(&SIZES) {
         let ptr = slot.load(Ordering::Relaxed);
-        if ptr > GONE && unsafe { holds(ptr as *const u8, size.load(Ordering::Relaxed)) } {
+        if ptr > FREED && unsafe { holds(ptr as *const u8, size.load(Ordering::Relaxed)) } {
             live += 1;
         }
     }
-    let freed = FREED_HOLDING.load(Ordering::Relaxed);
+    let freed = FREED_WITH_MARKER.load(Ordering::Relaxed);
     unlock();
     assert!(!FULL.load(Ordering::Relaxed), "the watch table filled");
     (live, freed)
@@ -203,7 +203,7 @@ fn paths() -> Vec<Path> {
                     let framing = Framing::named(name, "a frame", Span::DUMMY).expect("a framing");
                     out.push(
                         framing
-                            .unframed(&line, b"key ", b"\n")
+                            .decode_framed(&line, b"key ", b"\n")
                             .expect("its own frame"),
                     );
                     out.push(line);

@@ -2,8 +2,8 @@ use ply_core::crypto::Framing;
 use ply_core::{Diagnostic, Span, codes};
 use ply_host::fs::*;
 use ply_host::jobs::Failure;
-use ply_host::native::{found_read, int_of, parts_of};
-use ply_host::pool::{Bell, Run};
+use ply_host::native::{int_of, parts_of, read_result_or_none};
+use ply_host::pool::{Run, WakeCounter};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -359,7 +359,11 @@ fn every_operation_rejects_a_label_no_root_is_bound_to() {
             assert_eq!(rejected.code, codes::FS_ROOT_UNBOUND, "{}", op.what());
         }
     }
-    for chunk in [Chunk::Read(1), Chunk::Write(b"x".to_vec()), Chunk::Close] {
+    for chunk in [
+        OpenFileAction::Read(1),
+        OpenFileAction::Write(b"x".to_vec()),
+        OpenFileAction::Close,
+    ] {
         let rejected = fs
             .on_file("elsewhere", 1, chunk, span())
             .map(|_| ())
@@ -661,7 +665,7 @@ fn opened(fs: &FsHost, label: &str, path: &str, how: Opening) -> Result<i64, Vec
     }
 }
 
-fn on_file(fs: &FsHost, label: &str, descriptor: i64, chunk: Chunk) -> Vec<u8> {
+fn on_file(fs: &FsHost, label: &str, descriptor: i64, chunk: OpenFileAction) -> Vec<u8> {
     ran(fs
         .on_file(label, descriptor, chunk, span())
         .unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message)))
@@ -669,11 +673,11 @@ fn on_file(fs: &FsHost, label: &str, descriptor: i64, chunk: Chunk) -> Vec<u8> {
 }
 
 fn chunk(fs: &FsHost, label: &str, descriptor: i64, max: u64) -> Option<Vec<u8>> {
-    found_bytes(on_file(fs, label, descriptor, Chunk::Read(max)))
+    found_bytes(on_file(fs, label, descriptor, OpenFileAction::Read(max)))
 }
 
 fn closed(fs: &FsHost, label: &str, descriptor: i64) -> bool {
-    did(on_file(fs, label, descriptor, Chunk::Close))
+    did(on_file(fs, label, descriptor, OpenFileAction::Close))
 }
 
 #[test]
@@ -734,7 +738,12 @@ fn a_chunk_read_returns_at_most_the_requested_bytes_and_rejects_a_request_over_t
     assert_eq!(chunk(&fs, "cache", file, 100).map(|b| b.len()), Some(100));
 
     let over = fs
-        .on_file("cache", file, Chunk::Read(MAX_READ_BYTES + 1), span())
+        .on_file(
+            "cache",
+            file,
+            OpenFileAction::Read(MAX_READ_BYTES + 1),
+            span(),
+        )
         .map(|_| ())
         .expect_err("more than one read returns");
     assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
@@ -755,7 +764,7 @@ fn an_exclusive_create_makes_a_file_only_the_owner_can_access_and_fails_if_the_p
         &fs,
         "cache",
         made,
-        Chunk::Write(b"mine".to_vec())
+        OpenFileAction::Write(b"mine".to_vec())
     )));
     assert!(closed(&fs, "cache", made));
     assert_eq!(std::fs::read(real.join("d/new")).unwrap(), b"mine");
@@ -795,7 +804,7 @@ fn read_secret(
     encoding: &str,
     after: &[u8],
 ) -> Option<Vec<u8>> {
-    let run = Run::new(Arc::new(Bell::default()));
+    let run = Run::new(Arc::new(WakeCounter::default()));
     let framing = Framing::named(encoding, Op::ReadSecret.what(), span()).expect("an encoding");
     let said = on(
         fs,
@@ -808,7 +817,11 @@ fn read_secret(
             keeper: Arc::downgrade(&run),
         },
     );
-    found_int(said).map(|number| run.take_secret(number).expect("the run keeps it").to_vec())
+    found_int(said).map(|number| {
+        run.remove_secret(number)
+            .expect("the run keeps it")
+            .to_vec()
+    })
 }
 
 #[test]
@@ -1113,36 +1126,36 @@ fn the_space_operation_returns_the_file_system_size_and_free_space_for_an_existi
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Way {
     Dangling,
-    ToFile,
+    LinkToFile,
     BelowDangling,
-    Through,
-    ThroughToNew,
-    Climbing,
+    FileThroughLink,
+    MissingNameThroughLink,
+    ParentAfterLink,
 }
 
 impl Way {
     const ALL: [Way; 6] = [
         Way::Dangling,
-        Way::ToFile,
+        Way::LinkToFile,
         Way::BelowDangling,
-        Way::Through,
-        Way::ThroughToNew,
-        Way::Climbing,
+        Way::FileThroughLink,
+        Way::MissingNameThroughLink,
+        Way::ParentAfterLink,
     ];
 
     fn path(self) -> &'static str {
         match self {
             Way::Dangling => "gone",
-            Way::ToFile => "file",
+            Way::LinkToFile => "file",
             Way::BelowDangling => "gone/new",
-            Way::Through => "out/secret.txt",
-            Way::ThroughToNew => "out/new",
-            Way::Climbing => "in/../plain.txt",
+            Way::FileThroughLink => "out/secret.txt",
+            Way::MissingNameThroughLink => "out/new",
+            Way::ParentAfterLink => "in/../plain.txt",
         }
     }
 
     fn names_the_link(self) -> bool {
-        matches!(self, Way::Dangling | Way::ToFile)
+        matches!(self, Way::Dangling | Way::LinkToFile)
     }
 }
 
@@ -1196,7 +1209,7 @@ fn given(op: Op, path: &str) -> Vec<(String, Second, bool)> {
     match op {
         Op::ReadFile
         | Op::ListDir
-        | Op::Resolved
+        | Op::ResolvePath
         | Op::FileSize
         | Op::ModifiedMs
         | Op::CreateDir
@@ -1378,7 +1391,7 @@ fn a_symbolic_link_inside_the_root_is_followed_in_paths_but_a_chain_of_over_fort
             "{nowhere}"
         );
         assert_eq!(
-            kind(on(&fs, Op::Resolved, nowhere, Second::None)),
+            kind(on(&fs, Op::ResolvePath, nowhere, Second::None)),
             Kind::Missing,
             "{nowhere}"
         );
@@ -1397,11 +1410,11 @@ fn a_symbolic_link_inside_the_root_is_followed_in_paths_but_a_chain_of_over_fort
 #[test]
 fn found_bytes_returns_the_bytes_a_successful_read_added_to_the_buffer_and_returns_nothing_when_the_read_fails()
  {
-    let read = found_read(3, |out| {
+    let read = read_result_or_none(3, |out| {
         out.extend_from_slice(b"abc");
         Ok(3)
     });
     assert_eq!(found_bytes(read), Some(b"abc".to_vec()));
-    let failed = found_read(3, |_| Err(std::io::Error::other("unreadable")));
+    let failed = read_result_or_none(3, |_| Err(std::io::Error::other("unreadable")));
     assert_eq!(found_bytes(failed), None);
 }

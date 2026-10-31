@@ -40,7 +40,7 @@ pub enum BinOp {
     BitXor,
     Shl,
     Shr,
-    Ushr,
+    UnsignedShiftRight,
 }
 
 impl BinOp {
@@ -65,7 +65,7 @@ impl BinOp {
             BinOp::BitXor => "^",
             BinOp::Shl => "<<",
             BinOp::Shr => ">>",
-            BinOp::Ushr => ">>>",
+            BinOp::UnsignedShiftRight => ">>>",
         }
     }
 }

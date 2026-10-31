@@ -230,7 +230,7 @@ fn reading_the_standard_library_modules_through_a_symbolic_link_to_their_directo
     let real = dir.path().join("real");
     std::fs::create_dir_all(real.join("shipped")).unwrap();
     std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
-    observe::laid_out(&dir.path().join("link/shipped"), Vec::new());
+    observe::set_shipped_and_cache_dirs(&dir.path().join("link/shipped"), Vec::new());
     let real = real.canonicalize().unwrap();
     let recorder = Recorder::default();
     recorder.read(Read::File, &real.join("shipped/std.list.ply"));

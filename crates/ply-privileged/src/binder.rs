@@ -20,7 +20,7 @@ impl ply_compiled::entry::Binder for Binder {
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>> {
         let hosts = Hosts::granted(&grants)?;
         Ok(Arc::new(Borrowed {
-            world: Worldly::of(&grants),
+            world: GrantedContext::of(&grants),
             hosts,
         }))
     }
@@ -44,7 +44,7 @@ impl ply_compiled::entry::Binder for Binder {
                 .list(tls::ALPN.iter(), |w, a| {
                     w.str(a);
                 })
-                .str(tls::ROOTS)
+                .str(tls::ROOT_CERTIFICATES_LIBRARY)
                 .str(tls::ROOTS_VERSION)
                 .count(c.trusted() as u64)
                 .list(
@@ -65,8 +65,8 @@ impl ply_compiled::entry::Binder for Binder {
         });
         let trace = crate::trace::TraceOptions::of_grants(grants);
         let opened = trace.open();
-        let sink = opened.sink_path();
-        w.str(sink).str(opened.sink_destination()).option(
+        let sink = opened.sink_module_path();
+        w.str(sink).str(opened.sink_destination_name()).option(
             (sink != ply_host::trace::DISCARD_PATH).then_some(trace.level_name()),
             |w, level| {
                 w.str(level);
@@ -79,7 +79,7 @@ impl ply_compiled::entry::Binder for Binder {
     }
 
     fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String> {
-        ply_host::observe::moved(trace, &Worldly::of(grants).world(), caller)
+        ply_host::observe::moved(trace, &GrantedContext::of(grants).world(), caller)
     }
 }
 
@@ -120,7 +120,7 @@ fn roots_of(grants: &Grants) -> Result<ply_host::fs::Roots, Diagnostic> {
 
 struct Borrowed {
     hosts: Hosts,
-    world: Worldly,
+    world: GrantedContext,
 }
 
 impl Bound for Borrowed {
@@ -141,19 +141,19 @@ impl Bound for Borrowed {
     }
 
     fn unbind(&self) -> Vec<(String, Vec<u8>)> {
-        self.hosts.torn_down()
+        self.hosts.shutdown_reports()
     }
 }
 
 #[derive(Clone)]
-struct Worldly {
+struct GrantedContext {
     roots: Vec<(String, PathBuf)>,
     binding: String,
     config: BTreeMap<String, String>,
 }
 
-impl Worldly {
-    fn of(grants: &Grants) -> Worldly {
+impl GrantedContext {
+    fn of(grants: &Grants) -> GrantedContext {
         let roots = roots_of(grants)
             .map(|roots| {
                 roots
@@ -168,7 +168,7 @@ impl Worldly {
                 _ => None,
             })
             .collect();
-        Worldly {
+        GrantedContext {
             roots,
             binding: binding_digest(grants),
             config,

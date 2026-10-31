@@ -137,7 +137,7 @@ impl Work {
                 "{passes} passes over {memory} KiB, and one hash fills at most {MAX_ARGON2_WORK} KiB over all its passes"
             ));
         }
-        let length = length_in(length, argon2::Params::MIN_OUTPUT_LEN)?;
+        let length = checked_length(length, argon2::Params::MIN_OUTPUT_LEN)?;
         if salt.len() < argon2::MIN_SALT_LEN {
             return Err(format!(
                 "a salt of {} bytes, and Argon2 takes at least {}",
@@ -190,7 +190,7 @@ impl Work {
                 "N = 2^{log_n}, r = {r} and p = {p}, and their product is at most {MAX_SCRYPT_WORK}"
             ));
         }
-        let length = length_in(length, 1)?;
+        let length = checked_length(length, 1)?;
         let log_n = u8::try_from(log_n).map_err(|e| e.to_string())?;
         let params = scrypt::Params::new(log_n, narrow(r)?, narrow(p)?)
             .map_err(|_| "parameters scrypt does not define".to_string())?;
@@ -257,7 +257,7 @@ impl Work {
             iterations,
             password: Zeroizing::new(password.to_vec()),
             salt: salt.to_vec(),
-            length: length_in(length, 1)?,
+            length: checked_length(length, 1)?,
         }))
     }
 
@@ -335,7 +335,7 @@ impl Work {
     }
 }
 
-fn length_in(length: i64, least: usize) -> Result<usize, String> {
+fn checked_length(length: i64, least: usize) -> Result<usize, String> {
     usize::try_from(length)
         .ok()
         .filter(|n| *n >= least && length <= MAX_LENGTH)

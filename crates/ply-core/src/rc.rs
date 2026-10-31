@@ -25,16 +25,16 @@ thread_local! {
         elements_copied: 0,
     }) };
     static RECORDING: Cell<bool> = const { Cell::new(false) };
-    static SITES: RefCell<FxHashMap<Span, SiteCount>> = RefCell::new(FxHashMap::default());
+    static SITES: RefCell<FxHashMap<Span, UpdateCounts>> = RefCell::new(FxHashMap::default());
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct SiteCount {
+pub struct UpdateCounts {
     pub in_place: u64,
     pub copies: u64,
 }
 
-impl SiteCount {
+impl UpdateCounts {
     pub fn total(&self) -> u64 {
         self.in_place + self.copies
     }
@@ -52,7 +52,7 @@ pub fn record_sites(on: bool) {
     let _ = SITES.try_with(|c| c.borrow_mut().clear());
 }
 
-pub fn sites() -> Vec<(Span, SiteCount)> {
+pub fn sites() -> Vec<(Span, UpdateCounts)> {
     SITES
         .try_with(|c| c.borrow().iter().map(|(k, v)| (*k, *v)).collect())
         .unwrap_or_default()
@@ -71,7 +71,7 @@ pub fn reset() {
     let _ = SITES.try_with(|c| c.borrow_mut().clear());
 }
 
-pub fn note_update_of(in_place: bool, copied: usize, span: Span) {
+pub fn record_update(in_place: bool, copied: usize, span: Span) {
     bump(|s| {
         s.updates += 1;
         s.updates_in_place += u64::from(in_place);

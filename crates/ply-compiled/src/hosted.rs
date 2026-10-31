@@ -12,7 +12,7 @@ pub mod time;
 pub mod toolchain;
 mod trace;
 
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -29,66 +29,66 @@ use zeroize::Zeroizing;
 
 pub fn natives() -> Vec<MachineNative> {
     let mut natives = vec![
-        machine_native("job_wait", rt_job_wait as unsafe extern "C" fn(_, _) -> _),
-        machine_native(
+        runtime_native("job_wait", rt_job_wait as unsafe extern "C" fn(_, _) -> _),
+        runtime_native(
             "observed",
             rt_observed as unsafe extern "C" fn(_, _, _, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "certgen_issue",
             rt_certgen_issue as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "config_get",
             rt_config_get as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "config_secret_held",
             rt_config_secret_held as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "config_secret",
             rt_config_secret as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "kdf_argon2",
             rt_kdf_argon2 as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "kdf_scrypt",
             rt_kdf_scrypt as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "kdf_bcrypt",
             rt_kdf_bcrypt as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "kdf_pbkdf2",
             rt_kdf_pbkdf2 as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native("os_system", rt_os_system as unsafe extern "C" fn(_) -> _),
-        machine_native("os_machine", rt_os_machine as unsafe extern "C" fn(_) -> _),
-        machine_native("os_uname", rt_os_uname as unsafe extern "C" fn(_) -> _),
-        machine_native(
+        runtime_native("os_system", rt_os_system as unsafe extern "C" fn(_) -> _),
+        runtime_native("os_machine", rt_os_machine as unsafe extern "C" fn(_) -> _),
+        runtime_native("os_uname", rt_os_uname as unsafe extern "C" fn(_) -> _),
+        runtime_native(
             "os_hostname",
             rt_os_hostname as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native("os_cpus", rt_os_cpus as unsafe extern "C" fn(_) -> _),
-        machine_native("os_uid", rt_os_uid as unsafe extern "C" fn(_) -> _),
-        machine_native(
+        runtime_native("os_cpus", rt_os_cpus as unsafe extern "C" fn(_) -> _),
+        runtime_native("os_uid", rt_os_uid as unsafe extern "C" fn(_) -> _),
+        runtime_native(
             "os_user_name",
             rt_os_user_name as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native("os_pid", rt_os_pid as unsafe extern "C" fn(_) -> _),
-        machine_native(
+        runtime_native("os_pid", rt_os_pid as unsafe extern "C" fn(_) -> _),
+        runtime_native(
             "os_executable",
             rt_os_executable as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "os_big_endian",
             rt_os_big_endian as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "os_pointer_bits",
             rt_os_pointer_bits as unsafe extern "C" fn(_) -> _,
         ),
@@ -110,7 +110,7 @@ pub fn natives() -> Vec<MachineNative> {
 }
 
 impl Ctx {
-    fn reaches_host(&mut self, native: &'static str, determinism: Determinism) -> bool {
+    fn check_host_allowed(&mut self, native: &'static str, determinism: Determinism) -> bool {
         let operation = format!("the native `{native}`");
         let span = self.site();
         if let Some(scheduler) = crate::tasks::seeded_scheduler(self) {
@@ -143,7 +143,7 @@ impl Ctx {
         job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
     ) -> I64 {
         let span = self.site();
-        let here = work != Work::Waiting && crate::tasks::production_task(self).is_none();
+        let here = work != Work::Waiting && crate::tasks::running_unseeded_task(self).is_none();
         let runtime = self.host_runtime();
         let submitted = ply_host::registry::run_of(&*runtime).and_then(|run| {
             if here {
@@ -186,7 +186,7 @@ fn asked<R>(
     result: impl FnOnce(&mut Ctx) -> R,
 ) -> R {
     let c = unsafe { &mut *ctx };
-    if c.reaches_host(native, determinism) {
+    if c.check_host_allowed(native, determinism) {
         result(c)
     } else {
         rejected
@@ -217,7 +217,7 @@ fn granted<R>(
     asked(ctx, native, determinism, rejected, result)
 }
 
-fn from_host<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
+fn with_host_facilities<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
     let runtime = c.host_runtime();
     match ply_host::registry::facilities_of(&*runtime) {
         Some(facilities) => Some(read(facilities)),
@@ -294,8 +294,8 @@ fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
 
 pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    match crate::tasks::waited(c, crate::tasks::ASK_TICKET, ticket.0) {
-        Some(true) => crate::tasks::ticket_taken(ctx, ticket),
+    match crate::tasks::waited(c, crate::tasks::REQUEST_JOB_RESULT, ticket.0) {
+        Some(true) => crate::tasks::take_ticket_bytes(ctx, ticket),
         Some(false) => TakenBytes(0),
         None => {
             let pending = Pending {
@@ -348,7 +348,7 @@ pub unsafe extern "C" fn rt_observed(
         }
     };
     let resource = Resource::Named(ply_core::Symbol::new(label));
-    let Some(Some(root)) = from_host(c, |facilities| {
+    let Some(Some(root)) = with_host_facilities(c, |facilities| {
         facilities.roots().get(&resource).map(Path::to_path_buf)
     }) else {
         return;

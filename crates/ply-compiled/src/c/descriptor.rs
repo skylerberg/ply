@@ -3,13 +3,13 @@ use std::ffi::{c_char, c_void};
 pub const SYMBOL: &str = "ply_descriptor";
 
 #[repr(C)]
-pub struct TakenRow {
+pub struct FunctionRow {
     name: *const c_char,
     entry: *mut c_void,
     arity: usize,
 }
 
-impl TakenRow {
+impl FunctionRow {
     pub fn name(&self) -> &str {
         let bytes = unsafe { std::ffi::CStr::from_ptr(self.name) }.to_bytes();
         std::str::from_utf8(bytes).unwrap_or("")
@@ -29,10 +29,10 @@ pub struct Descriptor {
     exports: *const c_char,
     exports_len: usize,
     bind: *mut c_void,
-    _unbound: *mut c_void,
+    _reserved: *mut c_void,
     code: *const *mut c_void,
     code_count: usize,
-    taken: *const TakenRow,
+    taken: *const FunctionRow,
     taken_count: usize,
 }
 
@@ -54,11 +54,11 @@ impl Descriptor {
         unsafe { std::slice::from_raw_parts(self.code, self.code_count) }
     }
 
-    pub fn taken(&self) -> &[TakenRow] {
+    pub fn taken(&self) -> &[FunctionRow] {
         unsafe { std::slice::from_raw_parts(self.taken, self.taken_count) }
     }
 
-    pub fn taking(&self, name: &str) -> Option<&TakenRow> {
+    pub fn taking(&self, name: &str) -> Option<&FunctionRow> {
         let rows = self.taken();
         rows.binary_search_by(|row| row.name().as_bytes().cmp(name.as_bytes()))
             .ok()

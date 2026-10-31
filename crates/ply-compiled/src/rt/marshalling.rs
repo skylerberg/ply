@@ -2,26 +2,26 @@ use super::*;
 use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
 use crate::native::{Addr, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
-use ply_core::{Escapee, escape};
+use ply_core::{EscapedHandle, escape};
 
 pub(crate) enum Marshalling {
     Lowering(Lowering),
-    Lifting(Lifting),
+    Decoding(Decoding),
 }
 
 pub(crate) struct Lowering {
     w: Writer,
     handles: u64,
-    sharing: Option<Sharing>,
-    shareables: u64,
+    sharing: Option<SharedValueIndex>,
+    heap_value_count: u64,
     functions: bool,
     resumes: bool,
-    results_entry: bool,
+    writes_entry_result: bool,
     escaping: Option<escape::Handle>,
     shown: bool,
 }
 
-struct Sharing {
+struct SharedValueIndex {
     numbered: HashMap<Word, u64>,
     next: Option<Word>,
 }
@@ -31,14 +31,14 @@ impl Lowering {
         Lowering {
             w: Writer::new(),
             handles: 0,
-            sharing: again.then(|| Sharing {
+            sharing: again.then(|| SharedValueIndex {
                 numbered: HashMap::new(),
                 next: None,
             }),
-            shareables: 0,
+            heap_value_count: 0,
             functions: false,
             resumes: false,
-            results_entry: false,
+            writes_entry_result: false,
             escaping: None,
             shown: false,
         }
@@ -51,9 +51,9 @@ impl Lowering {
         }
     }
 
-    fn opens_shareable(&mut self) {
-        let n = self.shareables;
-        self.shareables += 1;
+    fn begin_shared_value(&mut self) {
+        let n = self.heap_value_count;
+        self.heap_value_count += 1;
         if let Some(s) = &mut self.sharing
             && let Some(w) = s.next.take()
         {
@@ -67,14 +67,14 @@ impl Lowering {
     }
 }
 
-pub(crate) struct Lifting {
+pub(crate) struct Decoding {
     r: Reader<Vec<u8>>,
     name: Option<Symbol>,
     high: Option<i64>,
 }
 
-impl Lifting {
-    fn keep_high(&mut self, bits: u128) -> i64 {
+impl Decoding {
+    fn store_high_return_low(&mut self, bits: u128) -> i64 {
         self.high = Some((bits >> 64) as u64 as i64);
         bits as u64 as i64
     }
@@ -106,17 +106,17 @@ impl Ctx {
         matches!(self.marshallings.last(), Some(Marshalling::Lowering(l)) if l.shown)
     }
 
-    fn lifting(&mut self) -> Result<&mut Lifting, i64> {
-        if !matches!(self.marshallings.last(), Some(Marshalling::Lifting(_))) {
+    fn lifting(&mut self) -> Result<&mut Decoding, i64> {
+        if !matches!(self.marshallings.last(), Some(Marshalling::Decoding(_))) {
             return Err(self.fail(err_marshalling("a value read with no lifting open")));
         }
         match self.marshallings.last_mut() {
-            Some(Marshalling::Lifting(l)) => Ok(l),
+            Some(Marshalling::Decoding(l)) => Ok(l),
             _ => unreachable!("the innermost marshalling is a lifting"),
         }
     }
 
-    fn read<T: Default>(&mut self, read: impl FnOnce(&mut Lifting) -> Result<T, String>) -> T {
+    fn read<T: Default>(&mut self, read: impl FnOnce(&mut Decoding) -> Result<T, String>) -> T {
         let r = match self.lifting() {
             Ok(l) => read(l),
             Err(_) => return T::default(),
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn rt_out_char(ctx: *mut Ctx, c: I64) {
 pub unsafe extern "C" fn rt_out_str(ctx: *mut Ctx, p: Addr, n: I64) {
     let s = unsafe { borrowed(p, n) };
     unsafe { &mut *ctx }.write(|l| {
-        l.opens_shareable();
+        l.begin_shared_value();
         l.w.str(s);
     });
 }
@@ -214,7 +214,7 @@ pub unsafe extern "C" fn rt_out_str(ctx: *mut Ctx, p: Addr, n: I64) {
 pub unsafe extern "C" fn rt_out_bytes(ctx: *mut Ctx, p: Addr, n: I64) {
     let b = unsafe { borrowed(p, n) };
     unsafe { &mut *ctx }.write(|l| {
-        l.opens_shareable();
+        l.begin_shared_value();
         l.w.bytes(b);
     });
 }
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn rt_out_count(ctx: *mut Ctx, t: I64, n: I64) {
     };
     c.write(|l| {
         if codec::shareable(t) {
-            l.opens_shareable();
+            l.begin_shared_value();
         }
         l.w.count(t, n);
     });
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     if heap::is_native(w)
         && let Some(escaping) = unsafe { heap::native_escapes(w) }
         && let Ok(l) = c.lowering()
-        && l.results_entry
+        && l.writes_entry_result
     {
         l.escaping.get_or_insert(escaping);
     }
@@ -281,7 +281,7 @@ pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I
     unsafe { &mut *ctx }.write(|l| {
         if !leaves {
             l.resumes = true;
-            l.w.fun(fun::RESUMES);
+            l.w.fun(fun::RESUMPTION);
             return;
         }
         l.functions = true;
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn rt_in_decimal(ctx: *mut Ctx) -> I64 {
     I64(unsafe { &mut *ctx }.read(|l| {
         l.r.expect(tag::DECIMAL)?;
         let d = u128::from_le_bytes(l.r.array()?);
-        Ok(l.keep_high(d))
+        Ok(l.store_high_return_low(d))
     }))
 }
 
@@ -358,7 +358,7 @@ pub unsafe extern "C" fn rt_in_fixed(ctx: *mut Ctx, width: I64) -> I64 {
         if at != usize::try_from(width.0).ok() {
             return Err(format!("a {:?} where width {} was read", f.ty, width.0));
         }
-        Ok(l.keep_high(f.bits()))
+        Ok(l.store_high_return_low(f.bits()))
     }))
 }
 
@@ -472,7 +472,7 @@ pub unsafe extern "C" fn rt_lift_close(ctx: *mut Ctx) {
     if c.lifting().is_err() {
         return;
     }
-    if let Err(reason) = c.close_lifting() {
+    if let Err(reason) = c.close_decoding() {
         c.fail(err_marshalling(&reason));
     }
 }
@@ -492,7 +492,7 @@ pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
 }
 
 impl Ctx {
-    pub fn lift_from(&mut self, bytes: Vec<u8>) {
+    pub fn open_decoding(&mut self, bytes: Vec<u8>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
             Err(reason) => {
@@ -500,15 +500,15 @@ impl Ctx {
                 Reader::new(codec::FORMAT.to_vec()).expect("the format alone opens")
             }
         };
-        self.marshallings.push(Marshalling::Lifting(Lifting {
+        self.marshallings.push(Marshalling::Decoding(Decoding {
             r,
             name: None,
             high: None,
         }));
     }
 
-    fn close_lifting(&mut self) -> Result<(), String> {
-        let Some(Marshalling::Lifting(l)) = self.marshallings.pop() else {
+    fn close_decoding(&mut self) -> Result<(), String> {
+        let Some(Marshalling::Decoding(l)) = self.marshallings.pop() else {
             unreachable!("the innermost marshalling is a lifting");
         };
         l.r.end()
@@ -543,16 +543,16 @@ fn lowering(
     Ok(l)
 }
 
-pub(crate) fn string_lifted(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {
+pub(crate) fn decode_string(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {
     let mut w = codec::Writer::new();
     w.str(s.as_bytes());
-    lifted_from(ctx, w.finish(), string)
+    decode_bytes(ctx, w.finish(), string)
 }
 
-fn lifted_from(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
+fn decode_bytes(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
     let c = unsafe { &mut *ctx };
     let depth = c.marshallings.len();
-    c.lift_from(bytes);
+    c.open_decoding(bytes);
     let w = unsafe { (ty.lift)(ctx) };
     let c = unsafe { &mut *ctx };
     if c.marshallings.len() != depth + 1 {
@@ -561,19 +561,19 @@ fn lifted_from(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
             "a lifting left a marshalling of its own open",
         ));
     }
-    if let Err(reason) = c.close_lifting() {
+    if let Err(reason) = c.close_decoding() {
         c.fail(err_marshalling(&reason));
     }
     (c.failed == 0).then(|| <Handed as crate::native::Returned>::of(w))
 }
 
 impl Ctx {
-    pub(crate) fn open_entry(&mut self, bytes: Vec<u8>) {
+    pub(crate) fn open_entry_call(&mut self, bytes: Vec<u8>) {
         self.marshallings.push(Marshalling::Lowering(Lowering {
-            results_entry: true,
+            writes_entry_result: true,
             ..Lowering::new(false)
         }));
-        self.lift_from(bytes);
+        self.open_decoding(bytes);
     }
 }
 
@@ -581,15 +581,15 @@ pub(crate) enum EntryBytes {
     Bytes(Vec<u8>),
     Holding,
     Function,
-    Escaping(Escapee),
+    EscapingHandle(EscapedHandle),
 }
 
-pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
-    let l = entry_lowering(ctx)?;
+pub(crate) fn close_entry_call(ctx: *mut Ctx) -> Result<EntryBytes, String> {
+    let l = pop_entry_result(ctx)?;
     let held = l.handles > 0;
     let bytes = l.w.finish();
     if let Some(handle) = l.escaping {
-        return Ok(EntryBytes::Escaping(Escapee {
+        return Ok(EntryBytes::EscapingHandle(EscapedHandle {
             handle,
             route: Vec::new(),
         }));
@@ -600,7 +600,7 @@ pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
     if l.resumes
         && let Some(route) = continuation_in(&bytes)?
     {
-        return Ok(EntryBytes::Escaping(Escapee {
+        return Ok(EntryBytes::EscapingHandle(EscapedHandle {
             handle: escape::Handle::Continuation,
             route,
         }));
@@ -641,7 +641,7 @@ fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String
         tag::FIXED => {
             r.fixed()?;
         }
-        tag::CHAR | tag::HANDLE | tag::AGAIN => {
+        tag::CHAR | tag::HANDLE | tag::BACK_REFERENCE => {
             r.varint()?;
         }
         tag::STR | tag::BYTES => {
@@ -682,7 +682,7 @@ fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String
             }
         }
         tag::FUN => match r.byte()? {
-            fun::RESUMES => return Ok(true),
+            fun::RESUMPTION => return Ok(true),
             fun::NAMED => {
                 r.symbol()?;
             }
@@ -711,7 +711,7 @@ fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String
     Ok(false)
 }
 
-fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
+fn pop_entry_result(ctx: *mut Ctx) -> Result<Lowering, String> {
     let c = unsafe { &mut *ctx };
     let open = c.marshallings.len();
     if open != 1 {

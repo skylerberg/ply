@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
 
-pub const ROOTS: &str = "webpki-roots";
+pub const ROOT_CERTIFICATES_LIBRARY: &str = "webpki-roots";
 pub const ROOTS_VERSION: &str = "1.0.9";
 
 pub const PROVIDER: &str = "ring";
@@ -69,29 +69,29 @@ pub struct Credential {
     config: Arc<ServerConfig>,
     fingerprint: String,
     certificates: usize,
-    chooser: Arc<Chooser>,
+    chooser: Arc<CertificateResolver>,
 }
 
 #[derive(Debug)]
-struct Loaded {
+struct LoadedCertificate {
     spec: CredentialSpec,
     key: Arc<CertifiedKey>,
     stamp: Option<(SystemTime, SystemTime)>,
 }
 
 #[derive(Debug)]
-pub struct Chooser {
-    loaded: Mutex<Vec<Loaded>>,
+pub struct CertificateResolver {
+    loaded: Mutex<Vec<LoadedCertificate>>,
     looked: Mutex<Instant>,
 }
 
-const RELOAD_LOOK: Duration = Duration::from_secs(1);
+const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-impl Chooser {
+impl CertificateResolver {
     fn refresh(&self, now: bool) {
         {
             let mut looked = lock(&self.looked);
-            if !now && looked.elapsed() < RELOAD_LOOK {
+            if !now && looked.elapsed() < RELOAD_CHECK_INTERVAL {
                 return;
             }
             *looked = Instant::now();
@@ -120,7 +120,7 @@ impl Chooser {
     }
 }
 
-impl ResolvesClientCert for Chooser {
+impl ResolvesClientCert for CertificateResolver {
     fn resolve(
         &self,
         _root_hint_subjects: &[&[u8]],
@@ -135,7 +135,7 @@ impl ResolvesClientCert for Chooser {
     }
 }
 
-impl ResolvesServerCert for Chooser {
+impl ResolvesServerCert for CertificateResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         self.refresh(false);
         let loaded = lock(&self.loaded);
@@ -161,13 +161,13 @@ fn stamp(spec: &CredentialSpec) -> Option<(SystemTime, SystemTime)> {
     Some((modified(&spec.certificate)?, modified(&spec.key)?))
 }
 
-struct Certified {
+struct CertificateWithKey {
     key: Arc<CertifiedKey>,
     fingerprint: String,
     certificates: usize,
 }
 
-fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
+fn certified(spec: &CredentialSpec) -> Result<CertificateWithKey, Diagnostic> {
     let chain =
         certificates(&spec.certificate).map_err(|reason| err_invalid(&spec.certificate, reason))?;
     let key = private_key(&spec.key)?;
@@ -176,7 +176,7 @@ fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
     let key =
         CertifiedKey::from_der(chain, key, &provider()).map_err(|e| err_mismatch(spec, &e))?;
     key.keys_match().map_err(|e| err_mismatch(spec, &e))?;
-    Ok(Certified {
+    Ok(CertificateWithKey {
         key: Arc::new(key),
         fingerprint,
         certificates,
@@ -192,7 +192,7 @@ impl Credential {
         self.certificates
     }
 
-    pub fn chooser(&self) -> &Arc<Chooser> {
+    pub fn chooser(&self) -> &Arc<CertificateResolver> {
         &self.chooser
     }
 
@@ -220,7 +220,7 @@ impl Credentials {
         trusted: &[PathBuf],
         required: &[String],
     ) -> Result<Credentials, Vec<Diagnostic>> {
-        let mut grouped: BTreeMap<String, Vec<Loaded>> = BTreeMap::new();
+        let mut grouped: BTreeMap<String, Vec<LoadedCertificate>> = BTreeMap::new();
         let mut firsts: BTreeMap<String, (String, usize)> = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut anchors = Vec::new();
@@ -236,11 +236,14 @@ impl Credentials {
                     firsts
                         .entry(spec.name.clone())
                         .or_insert((c.fingerprint, c.certificates));
-                    grouped.entry(spec.name.clone()).or_default().push(Loaded {
-                        spec: spec.clone(),
-                        key: c.key,
-                        stamp: stamp(spec),
-                    });
+                    grouped
+                        .entry(spec.name.clone())
+                        .or_default()
+                        .push(LoadedCertificate {
+                            spec: spec.clone(),
+                            key: c.key,
+                            stamp: stamp(spec),
+                        });
                 }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -259,7 +262,7 @@ impl Credentials {
         let mut entries: BTreeMap<String, Credential> = BTreeMap::new();
         let mut presenting: BTreeMap<String, Arc<ClientConfig>> = BTreeMap::new();
         for (name, loaded) in grouped {
-            let chooser = Arc::new(Chooser {
+            let chooser = Arc::new(CertificateResolver {
                 loaded: Mutex::new(loaded),
                 looked: Mutex::new(Instant::now()),
             });
@@ -343,7 +346,7 @@ impl fmt::Debug for Credentials {
 
 struct Shared {
     verifier: Option<Arc<dyn ClientCertVerifier>>,
-    requiring: Option<Arc<dyn ClientCertVerifier>>,
+    required_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
     tickets: Arc<dyn ProducesTickets>,
 }
 
@@ -356,23 +359,23 @@ impl Shared {
             )
         })?;
         let verifier = client_verifier(anchors, false)?;
-        let requiring = client_verifier(anchors, true)?;
+        let required_client_verifier = client_verifier(anchors, true)?;
         Ok(Shared {
             verifier,
-            requiring,
+            required_client_verifier,
             tickets,
         })
     }
 
     fn server(
         &self,
-        chooser: &Arc<Chooser>,
+        chooser: &Arc<CertificateResolver>,
         required: bool,
     ) -> Result<Arc<ServerConfig>, TlsError> {
         let versions = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()?;
         let verifier = if required {
-            &self.requiring
+            &self.required_client_verifier
         } else {
             &self.verifier
         };
@@ -384,7 +387,7 @@ impl Shared {
             verified.with_cert_resolver(Arc::clone(chooser) as Arc<dyn ResolvesServerCert>);
         config.alpn_protocols = ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
         config.ticketer = Arc::clone(&self.tickets);
-        config.session_storage = ServerSessionMemoryCache::new(SESSIONS);
+        config.session_storage = ServerSessionMemoryCache::new(SESSION_CACHE_SIZE);
         Ok(Arc::new(config))
     }
 }
@@ -413,7 +416,7 @@ fn client_verifier(
     Ok(Some(built))
 }
 
-const SESSIONS: usize = 1024;
+const SESSION_CACHE_SIZE: usize = 1024;
 
 pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -421,13 +424,13 @@ pub fn provider() -> Arc<CryptoProvider> {
 
 fn client_config(
     trusted: Vec<CertificateDer<'static>>,
-    presenting: Option<Arc<Chooser>>,
+    presenting: Option<Arc<CertificateResolver>>,
 ) -> Result<Arc<ClientConfig>, Diagnostic> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let (_, ignored) = roots.add_parsable_certificates(trusted);
     if ignored > 0 {
-        return Err(err_trust(ignored));
+        return Err(err_unparsable_trust(ignored));
     }
     let rooted = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
@@ -549,18 +552,24 @@ impl Stream {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Unfinished {
+pub enum ShutdownFailure {
     Expired,
     Rejected(&'static str),
 }
 
-pub fn client_offering(config: &ClientConfig, alpn: &[String]) -> Arc<ClientConfig> {
+pub fn client_config_offering_protocols(
+    config: &ClientConfig,
+    alpn: &[String],
+) -> Arc<ClientConfig> {
     let mut config = config.clone();
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     Arc::new(config)
 }
 
-pub fn server_accepting(config: &ServerConfig, alpn: &[String]) -> Arc<ServerConfig> {
+pub fn server_config_accepting_protocols(
+    config: &ServerConfig,
+    alpn: &[String],
+) -> Arc<ServerConfig> {
     let mut config = config.clone();
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     Arc::new(config)
@@ -604,7 +613,7 @@ impl Write for Stream {
 pub struct Session {
     socket: Arc<TcpStream>,
     session: Mutex<Option<Stream>>,
-    handshakes: Arc<Handshakes>,
+    handshakes: Arc<HandshakeStats>,
     took: Mutex<Option<u64>>,
     peer: Mutex<Option<Vec<u8>>>,
     agreed: Mutex<Option<String>>,
@@ -614,7 +623,7 @@ impl Session {
     pub fn new(
         config: Arc<ServerConfig>,
         socket: Arc<TcpStream>,
-        handshakes: Arc<Handshakes>,
+        handshakes: Arc<HandshakeStats>,
     ) -> Session {
         let started = ServerConnection::new(config).ok().map(|connection| {
             Stream::Server(StreamOwned::new(connection, Socket(Arc::clone(&socket))))
@@ -626,7 +635,7 @@ impl Session {
         config: Arc<ClientConfig>,
         name: ServerName<'static>,
         socket: Arc<TcpStream>,
-        handshakes: Arc<Handshakes>,
+        handshakes: Arc<HandshakeStats>,
     ) -> Session {
         let started = ClientConnection::new(config, name).ok().map(|connection| {
             Stream::Client(StreamOwned::new(connection, Socket(Arc::clone(&socket))))
@@ -637,7 +646,7 @@ impl Session {
     fn started(
         started: Option<Stream>,
         socket: Arc<TcpStream>,
-        handshakes: Arc<Handshakes>,
+        handshakes: Arc<HandshakeStats>,
     ) -> Session {
         match started {
             Some(stream) => Session {
@@ -654,7 +663,7 @@ impl Session {
 
     pub fn rejected(
         socket: Arc<TcpStream>,
-        handshakes: Arc<Handshakes>,
+        handshakes: Arc<HandshakeStats>,
         reason: &'static str,
     ) -> Session {
         handshakes.rejected(reason);
@@ -696,11 +705,11 @@ impl Session {
         &self.socket
     }
 
-    pub fn finish_within(&self, timeout: Duration) -> Result<Option<String>, Unfinished> {
+    pub fn finish_within(&self, timeout: Duration) -> Result<Option<String>, ShutdownFailure> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
         let Some(stream) = guard.as_mut() else {
-            return Err(Unfinished::Rejected(REASON_CONFIGURATION));
+            return Err(ShutdownFailure::Rejected(REASON_CONFIGURATION));
         };
         loop {
             if !stream.is_handshaking() {
@@ -712,24 +721,24 @@ impl Session {
                 .filter(|d| !d.is_zero())
             else {
                 self.finish(&mut guard, Some(REASON_SLOW));
-                return Err(Unfinished::Expired);
+                return Err(ShutdownFailure::Expired);
             };
             let _ = self.socket.set_read_timeout(Some(left));
             let _ = self.socket.set_write_timeout(Some(left));
             match stream.complete_io() {
                 Ok((0, 0)) if stream.is_handshaking() => {
                     self.finish(&mut guard, Some(REASON_GONE));
-                    return Err(Unfinished::Rejected(REASON_GONE));
+                    return Err(ShutdownFailure::Rejected(REASON_GONE));
                 }
                 Ok(_) => {}
                 Err(e) if expired(&e) => {
                     self.finish(&mut guard, Some(REASON_SLOW));
-                    return Err(Unfinished::Expired);
+                    return Err(ShutdownFailure::Expired);
                 }
                 Err(e) => {
                     let reason = reason(true, &e);
                     self.finish(&mut guard, Some(reason));
-                    return Err(Unfinished::Rejected(reason));
+                    return Err(ShutdownFailure::Rejected(reason));
                 }
             }
         }
@@ -868,8 +877,8 @@ pub const REASON_CERTIFICATE: &str = "the peer's certificate was rejected";
 pub const REASON_GONE: &str = "the peer went away mid-handshake";
 pub const REASON_TRANSPORT: &str = "the connection failed mid-handshake";
 pub const REASON_SLOW: &str = "the handshake did not complete before its deadline";
-pub const REASON_INJECTED: &str = "plaintext was waiting when the handshake was to begin";
-pub const REASON_NAME: &str =
+pub const REASON_EARLY_PLAINTEXT: &str = "plaintext was waiting when the handshake was to begin";
+pub const REASON_INVALID_SERVER_NAME: &str =
     "the name is neither a DNS name nor an IP address, so no certificate can be verified as it";
 pub const REASON_OTHER: &str = "the TLS session failed";
 
@@ -922,7 +931,7 @@ pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
 }
 
 #[derive(Default)]
-pub struct Handshakes {
+pub struct HandshakeStats {
     counts: Mutex<Counts>,
 }
 
@@ -932,7 +941,7 @@ struct Counts {
     rejected: BTreeMap<&'static str, u64>,
 }
 
-impl Handshakes {
+impl HandshakeStats {
     pub fn completed(&self) {
         lock(&self.counts).completed += 1;
     }
@@ -1045,7 +1054,7 @@ fn err_mismatch(spec: &CredentialSpec, error: &TlsError) -> Diagnostic {
 }
 
 #[cold]
-fn err_trust(ignored: usize) -> Diagnostic {
+fn err_unparsable_trust(ignored: usize) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
         format!("{ignored} certificate(s) to trust could not be parsed"),

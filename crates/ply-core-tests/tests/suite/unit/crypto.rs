@@ -1,4 +1,4 @@
-use ply_core::crypto::{self, Encodes};
+use ply_core::crypto::{self, EncodingSupport};
 use ply_core::{Span, codes};
 
 fn hex(digits: &str) -> Vec<u8> {
@@ -106,12 +106,16 @@ fn decoding_accepts_only_the_canonical_text_of_each_encoding_and_returns_none_fo
 fn each_encoding_reports_whether_it_can_encode_and_decode_and_an_unknown_encoding_name_does_neither()
  {
     for name in ["hex", "base64", "base64url", "base32"] {
-        assert_eq!(crypto::encoding(name), Encodes::WritesAndReads, "{name}");
+        assert_eq!(
+            crypto::encoding(name),
+            EncodingSupport::WritesAndReads,
+            "{name}"
+        );
     }
-    assert_eq!(crypto::encoding("base32-typed"), Encodes::Reads);
+    assert_eq!(crypto::encoding("base32-typed"), EncodingSupport::Reads);
     assert!(crypto::encode("base32-typed", b"key").is_none());
     for name in ["rot13", "raw", "HEX", ""] {
-        assert_eq!(crypto::encoding(name), Encodes::Neither, "{name}");
+        assert_eq!(crypto::encoding(name), EncodingSupport::Neither, "{name}");
         assert!(crypto::encode(name, b"key").is_none(), "{name}");
         assert!(crypto::decode(name, b"6b6579").is_none(), "{name}");
     }
@@ -256,21 +260,21 @@ fn a_secret_framed_with_a_prefix_and_suffix_reads_back_exactly_and_a_different_p
             let secret = &every[256 - n..];
             let line = framing.framed(b"key ", secret, b"\n");
             assert!(line.starts_with(b"key ") && line.ends_with(b"\n"));
-            let back = framing.unframed(&line, b"key ", b"\n");
+            let back = framing.decode_framed(&line, b"key ", b"\n");
             assert_eq!(
                 back.as_deref().map(|b| &b[..]),
                 Some(secret),
                 "{encoding} of {n}"
             );
-            assert!(framing.unframed(&line, b"kez ", b"\n").is_none());
-            assert!(framing.unframed(&line, b"key ", b"\r\n").is_none());
-            assert!(framing.unframed(&line[..3], b"key ", b"\n").is_none());
+            assert!(framing.decode_framed(&line, b"kez ", b"\n").is_none());
+            assert!(framing.decode_framed(&line, b"key ", b"\r\n").is_none());
+            assert!(framing.decode_framed(&line[..3], b"key ", b"\n").is_none());
         }
     }
     let hex = named("hex").unwrap();
     assert_eq!(&hex.framed(b"", b"\xab", b"")[..], b"ab");
-    assert!(hex.unframed(b"AB", b"", b"").is_none());
-    assert!(hex.unframed(b"abc", b"", b"").is_none());
+    assert!(hex.decode_framed(b"AB", b"", b"").is_none());
+    assert!(hex.decode_framed(b"abc", b"", b"").is_none());
     for rejected in ["rot13", "base32-typed", "RAW", ""] {
         let d = named(rejected)
             .err()

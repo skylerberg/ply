@@ -76,10 +76,10 @@ pub fn not_found(span: Span, s: &str, needle: &str) -> Diagnostic {
     )
     .primary(span, "this substring does not occur")
     .note("guard with `String::contains`, which answers the same question as a `Bool`")
-    .showing(vec![text_shown(needle), text_shown(s)])
+    .showing(vec![encode_text(needle), encode_text(s)])
 }
 
-fn text_shown(s: &str) -> Vec<u8> {
+fn encode_text(s: &str) -> Vec<u8> {
     let mut w = Writer::new();
     w.str(s.as_bytes());
     w.finish()

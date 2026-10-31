@@ -1,7 +1,7 @@
 use super::heap::Holding;
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
-use ply_compiled::frames::{Held, PlyFrame, base, held_across, release_live};
+use ply_compiled::frames::{Held, PlyFrame, base, call_recording_slots, release_frames};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
@@ -78,7 +78,7 @@ unsafe extern "C" fn nothing(_ctx: *mut Ctx) -> Word {
     0
 }
 
-static COUNTED: PlyType = PlyType {
+static BOX_TYPE: PlyType = PlyType {
     identity: 1,
     spelled: b"m.Box".as_ptr(),
     spelled_len: 5,
@@ -133,7 +133,7 @@ pub(super) fn every_kind(
     let held = unsafe {
         [
             Held::Closure(Block::of(f)),
-            Held::Carried(Carried::new(Handed::of(x), &COUNTED)),
+            Held::Carried(Carried::new(Handed::of(x), &BOX_TYPE)),
             Held::Handle(Block::of(h)),
         ]
     };
@@ -184,7 +184,7 @@ fn releasing_a_live_frame_list_releases_every_frame_exactly_once() {
     let mut ctx = context();
     let stack = Stack::take().expect("the system maps a stack");
     let head = laid(&stack, stack.top() - 4096);
-    unsafe { release_live(&mut ctx, head) };
+    unsafe { release_frames(&mut ctx, head) };
     assert_eq!(walked(), [(3, -1), (2, -1), (1, -1)]);
 }
 
@@ -192,7 +192,7 @@ fn releasing_a_live_frame_list_releases_every_frame_exactly_once() {
 fn releasing_frames_from_a_null_frame_list_or_an_empty_frame_list_releases_nothing() {
     let mut ctx = context();
     for head in [std::ptr::null_mut(), base()] {
-        unsafe { release_live(&mut ctx, head) };
+        unsafe { release_frames(&mut ctx, head) };
     }
     assert!(walked().is_empty());
 }
@@ -206,7 +206,7 @@ fn a_runtime_frame_is_added_to_the_frame_list_during_its_call_and_releases_each_
     let (held, words) = every_kind(ctx, [5, 2, 3], &text);
     words.iter().copied().for_each(dup);
     let (seen, back) = unsafe {
-        held_across(ctx, held, || {
+        call_recording_slots(ctx, held, || {
             let record = (*ctx).frames;
             let linked = record != base() && (*record).prev == base();
             ((*record).each)(ctx, record.add(1).cast::<Word>(), -1);
@@ -235,7 +235,7 @@ fn releasing_the_live_frame_list_in_the_middle_of_a_call_releases_every_slot_onc
     let text: Arc<str> = Arc::from("held");
     let (held, _) = every_kind(ctx, [5, 2, 3], &text);
     let ((), _never_given_back) =
-        unsafe { held_across(ctx, held, || release_live(ctx, (*ctx).frames)) };
+        unsafe { call_recording_slots(ctx, held, || release_frames(ctx, (*ctx).frames)) };
     assert_eq!(freed(), [2, 3, 5]);
     assert_eq!(Arc::strong_count(&text), 1);
     assert_eq!(unsafe { (*ctx).heap.live() }, 0);
@@ -245,6 +245,6 @@ fn releasing_the_live_frame_list_in_the_middle_of_a_call_releases_every_slot_onc
 fn a_call_with_no_slots_to_release_adds_no_runtime_frame_to_the_frame_list() {
     let mut owned = context();
     let ctx = &raw mut owned;
-    let (linked, []) = unsafe { held_across(ctx, [], || !(*ctx).frames.is_null()) };
+    let (linked, []) = unsafe { call_recording_slots(ctx, [], || !(*ctx).frames.is_null()) };
     assert!(!linked);
 }

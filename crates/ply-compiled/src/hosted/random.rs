@@ -1,5 +1,5 @@
 use super::{Nondeterministic, asked};
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::I64;
 use crate::rt::Ctx;
@@ -7,11 +7,11 @@ use crate::secret;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "entropy_next",
             rt_entropy_next as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "entropy_secret",
             rt_entropy_secret as unsafe extern "C" fn(_, _) -> _,
         ),

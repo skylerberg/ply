@@ -1,7 +1,7 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, borrowed};
+use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_UNWOUND_TO_HANDLER, borrowed};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
@@ -22,7 +22,7 @@ unsafe impl Sync for Opened {}
 impl Opened {
     pub fn open(library: &std::path::Path) -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let native = crate::c::load_opened(library).map_err(|e| format!("{e:#}"))?;
+        let native = crate::c::load_from_path(library).map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),
@@ -39,7 +39,7 @@ impl Opened {
     }
 
     pub fn roots(&self) -> usize {
-        self.native.entered_names().len()
+        self.native.entry_point_names().len()
     }
 
     pub fn nanos(&self) -> u64 {
@@ -214,7 +214,7 @@ pub fn enter(
                 ended,
                 usage: Usage {
                     nanos,
-                    host: ctx.host_use.acted(),
+                    host: ctx.host_use.used_nondeterminism(),
                     performs: last.performs,
                     held: last.held,
                     updates: counters.updates.saturating_sub(counted.updates),
@@ -270,11 +270,11 @@ fn abandoned(mut ctx: Box<Ctx>) {
     std::mem::forget(ctx);
 }
 
-struct GivingBack(*mut Ctx);
+struct RestoreThreadOnDrop(*mut Ctx);
 
-impl Drop for GivingBack {
+impl Drop for RestoreThreadOnDrop {
     fn drop(&mut self) {
-        unsafe { (*self.0).give_thread_back() };
+        unsafe { (*self.0).restore_thread_state() };
     }
 }
 
@@ -285,14 +285,14 @@ fn entered(
     run: &Run,
     root: &str,
 ) -> (Ended, Last) {
-    ctx.begin_bounded(run.timeout_ms);
-    let giving_back = GivingBack(std::ptr::from_mut(ctx));
-    ctx.open_entry(arguments);
+    ctx.begin_with_time_limit(run.timeout_ms);
+    let giving_back = RestoreThreadOnDrop(std::ptr::from_mut(ctx));
+    ctx.open_entry_call(arguments);
     let entering = std::ptr::from_mut(ctx);
     let none: [i64; 0] = [];
     crate::rt::on_known_stack(entering, || unsafe { entry(entering, none.as_ptr()) });
     if ctx.failed == crate::rt::FAILED_OUT_OF_STACK {
-        crate::rt::let_go_below_here();
+        crate::rt::release_unused_stack_pages();
     }
     let mut last = returned(ctx);
     let ended = if ctx.failed != 0 {
@@ -301,7 +301,7 @@ fn entered(
         ended_with_result(ctx, root)
     };
     if run.tested && matches!(ended, Ended::Returned(_)) {
-        last.live = ctx.left_live() as u64;
+        last.live = ctx.teardown_and_count_live() as u64;
     }
     ctx.end();
     std::mem::forget(giving_back);
@@ -328,13 +328,13 @@ fn returned(ctx: &mut Ctx) -> Last {
 }
 
 fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
-    match crate::rt::close_entry(ctx) {
+    match crate::rt::close_entry_call(ctx) {
         Ok(EntryBytes::Bytes(bytes)) => Ended::Returned(bytes),
         Ok(EntryBytes::Function) => {
             Ended::NotReturnable("its result holds a function the program wrote")
         }
-        Ok(EntryBytes::Escaping(escapee)) => {
-            let boundary = ply_core::Boundary::EntryResult { name: root };
+        Ok(EntryBytes::EscapingHandle(escapee)) => {
+            let boundary = ply_core::Boundary::ReturnedFromEntry { name: root };
             Ended::Failed(ply_core::escape::rejected(&boundary, &escapee, Span::DUMMY))
         }
         Ok(EntryBytes::Holding) => Ended::NotReturnable("its result holds a handle of its run"),
@@ -344,7 +344,7 @@ fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
 
 fn failure(ctx: &mut Ctx) -> Ended {
     let failed = ctx.take_failure().unwrap_or_else(|| match ctx.failed {
-        FAILED_TARGET => Diagnostic::error(
+        FAILED_UNWOUND_TO_HANDLER => Diagnostic::error(
             codes::RUNTIME_ERROR,
             "a `handle` clause unwound past the compiled fragment's entry",
         ),
@@ -375,37 +375,37 @@ fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-static BINDER: OnceLock<Box<dyn Binder>> = OnceLock::new();
+static INSTALLED_BINDER: OnceLock<Box<dyn Binder>> = OnceLock::new();
 
 pub fn install(binder: Box<dyn Binder>) {
-    let _ = BINDER.set(binder);
+    let _ = INSTALLED_BINDER.set(binder);
 }
 
 pub fn natives() -> Vec<crate::c::MachineNative> {
-    use crate::c::machine_native;
+    use crate::c::runtime_native;
     vec![
-        machine_native(
+        runtime_native(
             "unit_open",
             rt_unit_open as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native("unit_close", rt_unit_close as unsafe extern "C" fn(_, _)),
-        machine_native(
+        runtime_native("unit_close", rt_unit_close as unsafe extern "C" fn(_, _)),
+        runtime_native(
             "unit_bind",
             rt_unit_bind as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "unit_unbind",
             rt_unit_unbind as unsafe extern "C" fn(_, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "unit_hosting",
             rt_unit_hosting as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "unit_moved",
             rt_unit_moved as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "unit_enter",
             rt_unit_enter as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
@@ -486,7 +486,7 @@ unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
     if !allowed(c, "machine.bind") {
         return TakenBytes(0);
     }
-    let made = match BINDER.get() {
+    let made = match INSTALLED_BINDER.get() {
         Some(binder) => binder.bind(grants),
         None => Err(vec![err_no_binder()]),
     };
@@ -519,7 +519,7 @@ unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenByt
     let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
-    let Some(binder) = BINDER.get() else {
+    let Some(binder) = INSTALLED_BINDER.get() else {
         return TakenBytes(c.fail(err_no_binder()));
     };
     let mut w = Writer::new();
@@ -541,7 +541,7 @@ unsafe extern "C" fn rt_unit_moved(
     if !allowed(c, "machine.moved") {
         return TakenBytes(0);
     }
-    let Some(binder) = BINDER.get() else {
+    let Some(binder) = INSTALLED_BINDER.get() else {
         return TakenBytes(c.fail(err_no_binder()));
     };
     let trace = String::from_utf8_lossy(unsafe { borrowed(tp, tn) }).into_owned();
@@ -558,22 +558,26 @@ unsafe extern "C" fn rt_unit_moved(
 unsafe extern "C" fn rt_unit_enter(
     ctx: *mut Ctx,
     unit: I64,
-    root_p: Addr,
+    root_pointer: Addr,
     root_n: I64,
-    arguments_p: Addr,
-    arguments_n: I64,
-    run_p: Addr,
-    run_n: I64,
+    arguments_pointer: Addr,
+    arguments_length: I64,
+    run_pointer: Addr,
+    run_length: I64,
 ) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(asked) = read_or_fail(c, unsafe { borrowed(run_p, run_n) }, read_run) else {
+    let Some(asked) = read_or_fail(
+        c,
+        unsafe { borrowed(run_pointer, run_length) },
+        read_run_options,
+    ) else {
         return TakenBytes(0);
     };
     if (asked.run.timeout_ms > 0 || asked.run.measure) && !allowed(c, "machine.enter") {
         return TakenBytes(0);
     }
-    let root = String::from_utf8_lossy(unsafe { borrowed(root_p, root_n) }).into_owned();
-    let arguments = unsafe { borrowed(arguments_p, arguments_n) }.to_vec();
+    let root = String::from_utf8_lossy(unsafe { borrowed(root_pointer, root_n) }).into_owned();
+    let arguments = unsafe { borrowed(arguments_pointer, arguments_length) }.to_vec();
     let Some(opened) = units().get(unit.0) else {
         return TakenBytes(c.fail(err_unknown_handle("unit", unit.0)));
     };
@@ -647,7 +651,7 @@ struct Asked {
     run: Run,
 }
 
-fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
+fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
     let timeout_ms = r.count()?;

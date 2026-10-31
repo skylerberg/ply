@@ -1,4 +1,4 @@
-use super::descriptor::{Descriptor, TakenRow};
+use super::descriptor::{Descriptor, FunctionRow};
 use super::exports::Exports;
 use super::load::Library;
 use super::tables::root_id;
@@ -19,7 +19,7 @@ pub struct Native {
     _lib: Library,
 }
 
-fn entry_of(row: &TakenRow) -> Option<Entry> {
+fn entry_of(row: &FunctionRow) -> Option<Entry> {
     (row.entry()).map(|entry| unsafe { std::mem::transmute::<*mut c_void, Entry>(entry) })
 }
 
@@ -35,14 +35,14 @@ impl Native {
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
-        self.unit.taking(name).map(TakenRow::arity)
+        self.unit.taking(name).map(FunctionRow::arity)
     }
 
     pub fn entered(&self, name: &str) -> Option<Entry> {
         self.entered.get(name).copied()
     }
 
-    pub fn entered_names(&self) -> Vec<String> {
+    pub fn entry_point_names(&self) -> Vec<String> {
         self.entered.keys().cloned().collect()
     }
 
@@ -55,7 +55,7 @@ impl Native {
     }
 }
 
-pub fn load_opened(path: &std::path::Path) -> Result<Native> {
+pub fn load_from_path(path: &std::path::Path) -> Result<Native> {
     finish_unit(Library::open(path)?)
 }
 
@@ -93,7 +93,7 @@ fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<N
         .map(|root| {
             let through = format!("{root}#entered");
             let row = unit.taking(&through);
-            match (row.map(TakenRow::arity), row.and_then(entry_of)) {
+            match (row.map(FunctionRow::arity), row.and_then(entry_of)) {
                 (Some(0), Some(entry)) => Ok((root, entry)),
                 (Some(arity), _) if arity != 0 => bail!(
                     "`{through}` takes {arity} words, where `{root}` is entered through it with none"

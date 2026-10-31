@@ -1,20 +1,20 @@
 use super::{Nondeterministic, asked, text_at};
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::Ctx;
 use ply_host::native::{found, parts};
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "env_variable",
             rt_env_variable as unsafe extern "C" fn(_, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "env_variables",
             rt_env_variables as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "env_working_directory",
             rt_env_working_directory as unsafe extern "C" fn(_) -> _,
         ),

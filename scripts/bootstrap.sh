@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# scripts/bootstrap.sh [--release]: this checkout's `ply`, at `target/debug/ply` or with `--release`
-# at `target/release/ply`. Cargo builds the runtime's library, and `ply bootstrap` links the rest,
-# run by the `ply` already there or, where there is none, by the last release (`stage0.sh`), which
-# drives the first bootstrap only: the script then runs once more, so the toolchain it made —
-# which checks far faster than the release — drives, as CI's two bootstraps have it. A stage0 too
-# old to read `ply.work` is fetched again; one behind the release is named. PLY_C_PHASES=1 prints
-# what each step of a bootstrap took.
+# scripts/bootstrap.sh [--release]: builds this checkout's `ply` at `target/debug/ply`, or at
+# `target/release/ply` with `--release`.
+#
+# Cargo builds the runtime library, then `ply bootstrap` builds the rest. `ply bootstrap` is run by
+# a `ply` that already exists. The first run uses the `ply` already at the output path. If there is
+# none, it uses the latest release, which `stage0.sh` downloads into `target/stage0`.
+#
+# The script then bootstraps a second time, using the `ply` it just built. That `ply` is the
+# checkout's own and type-checks faster than the release. CI also bootstraps twice.
+#
+# If the downloaded release is too old to read `ply.work`, the script downloads it again. If a newer
+# release exists than the one downloaded, the script prints a warning.
+#
+# Set `PLY_C_PHASES=1` to print how long each step of a bootstrap took.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "${1:-}" in
@@ -19,13 +26,13 @@ driving=checkout
 if [ ! -x "$ply" ]; then
   ply="$root/target/stage0/ply"
   driving=stage0
-  # A stage0 too old to read `ply.work` is no driver; fetch this machine's release again.
   if [ -x "$ply" ] && ! "$ply" work "$root" >/dev/null 2>&1; then
     echo "stage0: the downloaded release cannot read ply.work; fetching a fresh one" >&2
     rm -f "$ply"
   fi
   [ -x "$ply" ] || "$root/scripts/stage0.sh" "$ply" >/dev/null
-  # The release rolls with main: name a stage0 it has moved past.
+  # The `main-latest` release is republished on every change to main. Warns when it is newer than
+  # the downloaded stage0 `ply`.
   if updated=$(gh release view main-latest --repo skylerberg/ply --json assets \
       --jq '.assets[0].updatedAt' 2>/dev/null); then
     released=$(date -u -jf "%Y-%m-%dT%H:%M:%SZ" "$updated" +%s 2>/dev/null \

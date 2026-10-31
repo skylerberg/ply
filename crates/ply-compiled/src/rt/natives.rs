@@ -2,17 +2,17 @@ use super::*;
 
 pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
     let message = d.described(&d.message);
-    ctx.pend(d, message)
+    ctx.fail_unhandled_abort(d, message)
 }
 
-pub(super) fn scoped_new(c: &mut Ctx, held: Word) -> Word {
+pub(super) fn new_scoped_value(c: &mut Ctx, held: Word) -> Word {
     c.scoped_made += 1;
     scoped_word(&mut c.heap, Some(held), c.scoped_made)
 }
 
 pub unsafe extern "C" fn rt_hold_made(ctx: *mut Ctx, held: Handed) -> crate::emitted::Handle {
     let c = unsafe { &mut *ctx };
-    crate::emitted::Handle::of(scoped_new(c, held.word()))
+    crate::emitted::Handle::of(new_scoped_value(c, held.word()))
 }
 
 pub unsafe extern "C" fn rt_hold_read(ctx: *mut Ctx, h: crate::emitted::Handle) -> Handed {
@@ -47,12 +47,12 @@ fn live_scoped_object(
         return None;
     };
     if let Some(id) = scoped_id(h.word()) {
-        c.touched(crate::tasks::Touched::ScopedValue {
+        c.touched(crate::tasks::Access::ScopedValue {
             id,
             write: mode == Mode::Write,
         });
     }
-    if scoped_let_go(o) {
+    if scoped_already_released(o) {
         let site = c.site();
         c.fail(scoped_released(
             site,
@@ -80,7 +80,7 @@ pub(crate) fn scoped_word(heap: &mut Heap, held: Option<Word>, id: u64) -> Word 
     o as Word
 }
 
-pub(crate) fn scoped_let_go(o: *mut heap::Obj) -> bool {
+pub(crate) fn scoped_already_released(o: *mut heap::Obj) -> bool {
     heap::imm_value(unsafe { word_at(o, SCOPED_RELEASE) }) != 0
 }
 

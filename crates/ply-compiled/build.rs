@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 const CRATES: &[&str] = &["ply-compiled", "ply-core"];
 
-const OUTSIDE_SEMANTICS: &[&str] = &[
+const EXCLUDED_FROM_DIGEST: &[&str] = &[
     "ply-compiled/src/c/linked.rs",
     "ply-compiled/src/c/load.rs",
     "ply-compiled/src/c/stage.rs",
@@ -24,7 +24,7 @@ fn main() {
             .to_string_lossy()
             .into_owned()
     };
-    for outside in OUTSIDE_SEMANTICS {
+    for outside in EXCLUDED_FROM_DIGEST {
         assert!(
             files.iter().any(|path| named(path) == *outside),
             "`{outside}` is left out of the semantics digest and no longer exists"
@@ -32,7 +32,7 @@ fn main() {
     }
     let mut semantic: Vec<PathBuf> = files
         .iter()
-        .filter(|path| !OUTSIDE_SEMANTICS.contains(&named(path).as_str()))
+        .filter(|path| !EXCLUDED_FROM_DIGEST.contains(&named(path).as_str()))
         .cloned()
         .collect();
     for name in CRATES {

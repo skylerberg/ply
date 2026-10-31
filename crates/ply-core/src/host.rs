@@ -164,7 +164,7 @@ impl HostUse {
         self.operations == 0
     }
 
-    pub fn acted(&self) -> bool {
+    pub fn used_nondeterminism(&self) -> bool {
         self.nondeterministic > 0
     }
 
@@ -230,7 +230,7 @@ fn err_no_clock(what: &str) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-pub fn err_unserved(span: Span, operation: &str) -> Diagnostic {
+pub fn err_unhandled_operation(span: Span, operation: &str) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_UNBOUND,
         format!("`{operation}` reached the host boundary, and nothing serves it"),
@@ -241,7 +241,7 @@ pub fn err_unserved(span: Span, operation: &str) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-pub fn err_withheld(
+pub fn err_unbound_operation(
     span: Span,
     operation: &str,
     effect: &Symbol,

@@ -12,7 +12,7 @@ pub const MAX_VALUE_BYTES: i32 = 64 * 1024 * 1024;
 
 pub const MAX_DEPTH: u32 = 32;
 
-const STEP_GRAIN: i32 = 1000;
+const PROGRESS_CHECK_INTERVAL: i32 = 1000;
 
 const REJECTED: &str = "refused: ";
 
@@ -123,7 +123,7 @@ const INTERNAL_FUNCTIONS: &[&str] = &[
     "stat_get",
 ];
 
-const CLOCKED: &[&str] = &[
+const CLOCK_READING_FUNCTIONS: &[&str] = &[
     "date",
     "time",
     "datetime",
@@ -268,21 +268,21 @@ pub enum Control {
 }
 
 #[derive(Default)]
-struct Guard {
+struct SandboxState {
     internal: AtomicBool,
     rejected: Mutex<Option<String>>,
     steps: AtomicI64,
     spent: AtomicBool,
-    last_row_id_taken: AtomicBool,
+    left_row_at_max_row_id: AtomicBool,
 }
 
-impl Guard {
+impl SandboxState {
     fn refuse(&self, reason: String) -> Authorization {
         *self.rejected.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
         Authorization::Deny
     }
 
-    fn take_rejection(&self) -> Option<String> {
+    fn take_rejection_reason(&self) -> Option<String> {
         self.rejected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -292,7 +292,7 @@ impl Guard {
 
 pub struct Engine {
     conn: Connection,
-    guard: Arc<Guard>,
+    guard: Arc<SandboxState>,
     depth: u32,
     strict: bool,
     read_only: bool,
@@ -309,7 +309,7 @@ impl Engine {
             conn.deserialize_read_exact(MAIN_DB, image, image.len(), false)
                 .map_err(unopened)?;
         }
-        let guard = Arc::new(Guard::default());
+        let guard = Arc::new(SandboxState::default());
         configure(&conn, &guard, 0).map_err(unopened)?;
         Ok(Engine {
             conn,
@@ -321,7 +321,7 @@ impl Engine {
     }
 
     pub fn file(conn: Connection, mode: Mode, options: Options) -> Result<Engine, Failure> {
-        let guard = Arc::new(Guard::default());
+        let guard = Arc::new(SandboxState::default());
         let statements = usize::try_from(options.statements).unwrap_or(0);
         configure(&conn, &guard, statements).map_err(unopened)?;
         let engine = Engine {
@@ -356,7 +356,7 @@ impl Engine {
 
     pub fn run(&mut self, sql: &str, params: &[Scalar], limits: Limits, reads_only: bool) -> Reply {
         let mut pages = Vec::new();
-        self.paged(sql, params, limits, reads_only, |page| {
+        self.run_in_pages(sql, params, limits, reads_only, |page| {
             pages.push(page);
             (pages.len() == 1).then_some(i64::MAX)
         });
@@ -371,7 +371,7 @@ impl Engine {
         }
     }
 
-    pub fn paged(
+    pub fn run_in_pages(
         &mut self,
         sql: &str,
         params: &[Scalar],
@@ -383,7 +383,7 @@ impl Engine {
             pager(Reply::failed(failure));
             return;
         }
-        self.guard.take_rejection();
+        self.guard.take_rejection_reason();
         let mut stmt = match self.conn.prepare_cached(sql) {
             Ok(stmt) => stmt,
             Err(e) => {
@@ -448,7 +448,9 @@ impl Engine {
         stmt.reset_status(StatementStatus::VmStep);
         self.guard.steps.store(limits.steps, Ordering::Relaxed);
         self.guard.spent.store(false, Ordering::Relaxed);
-        self.guard.last_row_id_taken.store(false, Ordering::Relaxed);
+        self.guard
+            .left_row_at_max_row_id
+            .store(false, Ordering::Relaxed);
         unsafe { ffi::sqlite3_set_last_insert_rowid(self.conn.handle(), 0) };
         let changes_before = self.conn.total_changes();
         let width = stmt.column_count();
@@ -509,7 +511,7 @@ impl Engine {
         match last {
             Ok(page) => {
                 reply.rows = page;
-                reply.failure = self.left_behind(sql);
+                reply.failure = self.check_schema_and_row_ids(sql);
             }
             Err(failure) => reply.failure = Some(failure),
         }
@@ -614,8 +616,8 @@ impl Engine {
         Ok(())
     }
 
-    fn left_behind(&self, sql: &str) -> Option<Failure> {
-        if self.guard.last_row_id_taken.load(Ordering::Relaxed) {
+    fn check_schema_and_row_ids(&self, sql: &str) -> Option<Failure> {
+        if self.guard.left_row_at_max_row_id.load(Ordering::Relaxed) {
             return Some(Failure::rejected(format!(
                 "a row id of {} is rejected: past it the engine draws row ids at random",
                 i64::MAX
@@ -676,7 +678,7 @@ impl Engine {
     }
 
     fn failure_of(&self, e: rusqlite::Error) -> Failure {
-        if let Some(reason) = self.guard.take_rejection() {
+        if let Some(reason) = self.guard.take_rejection_reason() {
             return Failure::rejected(reason);
         }
         let spent = self.guard.spent.swap(false, Ordering::Relaxed);
@@ -695,10 +697,10 @@ impl Engine {
                 } else {
                     String::new()
                 };
-                by_code(error, format!("{msg}{at}"), spent)
+                failure_from_sqlite_code(error, format!("{msg}{at}"), spent)
             }
             rusqlite::Error::SqliteFailure(error, msg) => {
-                by_code(error, msg.unwrap_or_default(), spent)
+                failure_from_sqlite_code(error, msg.unwrap_or_default(), spent)
             }
             other => Failure::new("engine", "", other.to_string()),
         }
@@ -723,7 +725,7 @@ pub fn unopened(e: rusqlite::Error) -> Failure {
     Failure::new("unopened", "", detail)
 }
 
-fn by_code(error: ffi::Error, msg: String, spent: bool) -> Failure {
+fn failure_from_sqlite_code(error: ffi::Error, msg: String, spent: bool) -> Failure {
     let extended = error.extended_code;
     match extended & 0xff {
         ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED => Failure::new("busy", "", msg),
@@ -826,7 +828,11 @@ fn unreadable(e: rusqlite::Error) -> Failure {
     Failure::new("engine", "", e.to_string())
 }
 
-fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqlite::Result<()> {
+fn configure(
+    conn: &Connection,
+    guard: &Arc<SandboxState>,
+    statements: usize,
+) -> rusqlite::Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
@@ -845,7 +851,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     conn.set_limit(Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 32)?;
     conn.set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)?;
     conn.set_prepared_statement_cache_capacity(statements);
-    for &name in CLOCKED {
+    for &name in CLOCK_READING_FUNCTIONS {
         conn.create_scalar_function(
             name,
             -1,
@@ -867,7 +873,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     }))?;
     let counting = Arc::clone(guard);
     conn.progress_handler(
-        STEP_GRAIN,
+        PROGRESS_CHECK_INTERVAL,
         Some(move || {
             if counting.internal.load(Ordering::Relaxed) {
                 return false;
@@ -883,7 +889,9 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     conn.update_hook(Some(
         move |action: Action, _: &str, _: &str, row_id: i64| {
             if row_id == i64::MAX && action != Action::SQLITE_DELETE {
-                watching.last_row_id_taken.store(true, Ordering::Relaxed);
+                watching
+                    .left_row_at_max_row_id
+                    .store(true, Ordering::Relaxed);
             }
         },
     ))?;
@@ -946,7 +954,7 @@ fn rejection(action: AuthAction<'_>) -> Option<String> {
 }
 
 thread_local! {
-    static UNGUARDED: Option<Connection> = Connection::open_in_memory().ok();
+    static EMPTY_DATE_FUNCTION_CONNECTION: Option<Connection> = Connection::open_in_memory().ok();
 }
 
 fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::types::Value> {
@@ -985,7 +993,7 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
             }
         }
     }
-    UNGUARDED.with(|unguarded| {
+    EMPTY_DATE_FUNCTION_CONNECTION.with(|unguarded| {
         let Some(conn) = unguarded else {
             return refuse(format!("{REJECTED}`{name}` could not be evaluated"));
         };
@@ -995,7 +1003,7 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
     })
 }
 
-pub fn run_over(
+pub fn run_on_image(
     image: &[u8],
     sql: &str,
     params: &[Scalar],

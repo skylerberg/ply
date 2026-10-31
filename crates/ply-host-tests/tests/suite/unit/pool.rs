@@ -1,6 +1,6 @@
 use ply_core::host::MachineId;
 use ply_core::{Diagnostic, Pending, Span, codes};
-use ply_host::pool::{Bell, JobOutput, Kept, MAX_BLOCKING_OPERATIONS, Pool, Run};
+use ply_host::pool::{JobOutput, Kept, MAX_BLOCKING_OPERATIONS, Pool, Run, WakeCounter};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn run() -> Arc<Run> {
-    Run::new(Arc::new(Bell::default()))
+    Run::new(Arc::new(WakeCounter::default()))
 }
 
 fn written(n: i64) -> Vec<u8> {
@@ -229,7 +229,7 @@ fn no_two_pools_create_the_same_token_and_no_pool_creates_a_zero_token() {
 
 #[test]
 fn a_run_waiting_on_its_job_wakes_when_that_job_finishes_and_not_when_another_run_s_job_does() {
-    let bell = Arc::new(Bell::default());
+    let bell = Arc::new(WakeCounter::default());
     let (mine, theirs) = (Run::new(Arc::clone(&bell)), Run::new(Arc::clone(&bell)));
     let pool = Pool::new();
     let slow = pool
@@ -265,27 +265,27 @@ fn secret(text: &str) -> Kept {
 #[test]
 fn a_stored_secret_can_be_removed_once_and_only_by_the_run_that_stored_it() {
     let (mine, theirs) = (run(), run());
-    let kept = mine.keep_secret(secret("hunter2"));
-    assert_ne!(kept, mine.keep_secret(secret("other")));
+    let kept = mine.store_secret(secret("hunter2"));
+    assert_ne!(kept, mine.store_secret(secret("other")));
     assert!(
-        theirs.take_secret(kept).is_none(),
+        theirs.remove_secret(kept).is_none(),
         "another run's number names nothing of this one's"
     );
     assert_eq!(
-        mine.take_secret(kept).as_deref().map(Vec::as_slice),
+        mine.remove_secret(kept).as_deref().map(Vec::as_slice),
         Some(&b"hunter2"[..])
     );
-    assert!(mine.take_secret(kept).is_none(), "a secret is taken once");
+    assert!(mine.remove_secret(kept).is_none(), "a secret is taken once");
 }
 
 #[test]
 fn a_stored_secret_that_no_entry_point_removed_is_dropped_when_the_entry_point_ends() {
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
-    let left = run.keep_secret(secret("hunter2"));
+    let left = run.store_secret(secret("hunter2"));
     let _ = runtime.end_entry_point(MachineId::next());
     assert!(
-        run.take_secret(left).is_none(),
+        run.remove_secret(left).is_none(),
         "the line outlived its entry point"
     );
 }

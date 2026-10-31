@@ -1,4 +1,4 @@
-use crate::{Decimal, IntTy};
+use crate::{Decimal, IntegerType};
 
 pub fn short(digest: &[u8; 32]) -> String {
     let mut out = String::from("b3:");
@@ -12,7 +12,7 @@ pub enum Scalar {
     Unit,
     Bool(bool),
     Int(i64),
-    Width(IntTy, u128),
+    Width(IntegerType, u128),
     Char(u32),
     Decimal(Decimal),
 }

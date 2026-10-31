@@ -45,7 +45,7 @@ pub fn reverse(address: IpAddr) -> Vec<u8> {
     }
 }
 
-pub fn address_of(bytes: &[u8]) -> Option<IpAddr> {
+pub fn ip_address_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
     match bytes.len() {
         4 => Some(IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?)),
         16 => Some(IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)),

@@ -1,5 +1,5 @@
 use crate::units;
-use ply_compiled::rt::{STACK_MARGIN, switch_keeping};
+use ply_compiled::rt::{STACK_MARGIN, switch_stack_preserving_context};
 use ply_compiled::stack::{CHUNK, RESERVE, Stack, switch};
 use std::cell::RefCell;
 use std::sync::atomic::Ordering::Relaxed;
@@ -225,7 +225,7 @@ extern "C" fn grow_then_stop(arg: usize) {
         if task.extend() {
             (*(*g).ctx).stack_floor.store(task.floor(), Relaxed);
         }
-        switch_keeping((*g).ctx, &raw mut (*g).sp, (*g).main);
+        switch_stack_preserving_context((*g).ctx, &raw mut (*g).sp, (*g).main);
         (*g).floor_when_resumed = (*(*g).ctx).stack_floor.load(Relaxed);
         let mut spent = 0;
         switch(&mut spent, (*g).main);
@@ -253,7 +253,7 @@ fn a_task_that_grew_its_stack_resumes_with_the_stack_limit_of_its_own_stack() {
     let g = &raw mut g;
     unsafe {
         let first = task.prepare(grow_then_stop, g as usize);
-        switch_keeping((*g).ctx, &raw mut (*g).main, first);
+        switch_stack_preserving_context((*g).ctx, &raw mut (*g).main, first);
         assert!(
             !task.holds((*(*g).ctx).stack_floor.load(Relaxed)),
             "the stack the task stopped to kept its floor"
@@ -261,7 +261,7 @@ fn a_task_that_grew_its_stack_resumes_with_the_stack_limit_of_its_own_stack() {
         (*(*g).ctx)
             .stack_floor
             .store(task.top() - CHUNK + STACK_MARGIN, Relaxed);
-        switch_keeping((*g).ctx, &raw mut (*g).main, (*g).sp);
+        switch_stack_preserving_context((*g).ctx, &raw mut (*g).main, (*g).sp);
         assert!(
             task.floor() < task.top() - CHUNK + STACK_MARGIN,
             "the task never grew"

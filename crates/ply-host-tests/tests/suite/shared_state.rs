@@ -487,7 +487,7 @@ fn a_shutdown_signal_received_before_the_tcp_network_is_registered_still_makes_a
     shutdown.attach_net(Arc::clone(&late) as Arc<dyn Accepting>);
     assert_eq!(accepted(&late, listener), 0);
     assert_eq!(
-        shutdown.at_stop().0,
+        shutdown.stop_counts().0,
         1,
         "the listener the catch-up closed is counted, so the banner is not short by it"
     );
@@ -560,7 +560,7 @@ fn the_connection_counts_in_the_shutdown_message_are_recorded_before_the_run_see
     );
 
     assert_eq!(
-        shutdown.at_stop(),
+        shutdown.stop_counts(),
         (1, 1),
         "the counts are readable from the instant the run could notice the stop"
     );
@@ -574,5 +574,5 @@ fn the_connection_counts_in_the_shutdown_message_are_recorded_before_the_run_see
     while net.accepts_in_flight() > 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(shutdown.at_stop(), (1, 1));
+    assert_eq!(shutdown.stop_counts(), (1, 1));
 }

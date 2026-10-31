@@ -10,8 +10,8 @@ const PANICKED: c_int = 101;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ply_runtime_described() -> *const c_char {
-    static DESCRIBED: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
-    DESCRIBED
+    static DESCRIPTION: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    DESCRIPTION
         .get_or_init(|| {
             std::ffi::CString::new(ply_compiled::c::described())
                 .expect("a description holds no NUL")
@@ -35,7 +35,7 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
         eprintln!("ply: {reason}");
         return 2;
     }
-    if let Err(reason) = ply_launcher::install_own_pack() {
+    if let Err(reason) = ply_launcher::install_binary_pack() {
         eprintln!("ply: {reason}");
         return 2;
     }

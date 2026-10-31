@@ -25,11 +25,15 @@ impl Hosts {
                 std::time::Duration::from_millis(ms.unwrap_or(default))
             };
             ply_host::signal::Shutdown::new(ply_host::signal::Bounds {
-                lead: ms(0, ply_host::signal::DEFAULT_LEAD_MS),
+                lead: ms(0, ply_host::signal::DEFAULT_STOP_DELAY_MS),
                 drain: ms(1, ply_host::signal::DEFAULT_DRAIN_MS),
             })
         });
-        let stop = draining.or_else(|| grants.has("end").then(ply_host::signal::Shutdown::at_once));
+        let stop = draining.or_else(|| {
+            grants
+                .has("end")
+                .then(ply_host::signal::Shutdown::without_drain)
+        });
         if let Some(stop) = &stop {
             ply_host::signal::listen(stop).map_err(|d| vec![d])?;
         }
@@ -94,7 +98,7 @@ impl Hosts {
         })
     }
 
-    pub fn torn_down(&self) -> Vec<(String, Vec<u8>)> {
+    pub fn shutdown_reports(&self) -> Vec<(String, Vec<u8>)> {
         use ply_compiled::flat::Writer;
         let mut reports = Vec::new();
         let mut report = |name: &str, write: &dyn Fn(&mut Writer)| {
@@ -117,7 +121,7 @@ impl Hosts {
             });
         }
         if let Some(stop) = self.stop.as_ref().filter(|s| s.stopping()) {
-            let (listeners, connections) = stop.at_stop();
+            let (listeners, connections) = stop.stop_counts();
             report("stopping", &|w| {
                 w.option(stop.signal(), |w, s| {
                     w.str(s.name());
@@ -169,7 +173,7 @@ impl ply_compiled::entry::Bound for Hosts {
     }
 
     fn unbind(&self) -> Vec<(String, Vec<u8>)> {
-        self.torn_down()
+        self.shutdown_reports()
     }
 }
 

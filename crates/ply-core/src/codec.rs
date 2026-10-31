@@ -1,4 +1,4 @@
-use crate::{Fixed, INT_TYPES, IntTy, Symbol};
+use crate::{Fixed, INT_TYPES, IntegerType, Symbol};
 use std::collections::HashMap;
 
 pub const FORMAT: &[u8; 4] = b"PLV1";
@@ -21,7 +21,7 @@ pub mod tag {
     pub const ARRAY: u8 = 14;
     pub const HANDLE: u8 = 15;
     pub const FUN: u8 = 16;
-    pub const AGAIN: u8 = 17;
+    pub const BACK_REFERENCE: u8 = 17;
 }
 
 pub mod fun {
@@ -30,7 +30,7 @@ pub mod fun {
     pub const CONST: u8 = 2;
     pub const PROJECT: u8 = 3;
     pub const TABLE: u8 = 4;
-    pub const RESUMES: u8 = 5;
+    pub const RESUMPTION: u8 = 5;
 }
 
 pub mod shown {
@@ -133,7 +133,7 @@ impl Writer {
     }
 
     pub fn again(&mut self, n: u64) {
-        self.out.push(tag::AGAIN);
+        self.out.push(tag::BACK_REFERENCE);
         self.varint(n);
     }
 
@@ -293,7 +293,7 @@ impl<B: AsRef<[u8]>> Reader<B> {
     }
 }
 
-fn width_index(ty: IntTy) -> u8 {
+fn width_index(ty: IntegerType) -> u8 {
     INT_TYPES
         .iter()
         .position(|t| *t == ty)

@@ -1,5 +1,5 @@
 use crate::heap::{self, HEADER, Heap, IMMORTAL, Obj, SHARED, Word};
-use crate::native::{Machine, Returned, Taken};
+use crate::native::{MachineType, Returned, Taken};
 use crate::rt::Ctx;
 
 #[repr(transparent)]
@@ -194,7 +194,7 @@ impl Block {
         unsafe { (self.desc().share)(ctx, self.0) != 0 }
     }
 
-    pub unsafe fn let_go_function(self, ctx: *mut Ctx) {
+    pub unsafe fn release_function_if_last(self, ctx: *mut Ctx) {
         unsafe {
             if self.last() {
                 self.release_function(ctx);
@@ -268,38 +268,38 @@ pub struct PlyFnDesc {
 unsafe impl Sync for PlyFnDesc {}
 
 unsafe impl Taken for Block {
-    const MACHINE: Machine = Machine::Block;
+    const MACHINE: MachineType = MachineType::Block;
 }
 unsafe impl Taken for Handed {
-    const MACHINE: Machine = Machine::Handed;
+    const MACHINE: MachineType = MachineType::Handed;
 }
 unsafe impl Taken for Handle {
-    const MACHINE: Machine = Machine::Handle;
+    const MACHINE: MachineType = MachineType::Handle;
 }
 unsafe impl Taken for SecretHandle {
-    const MACHINE: Machine = Machine::Secret;
+    const MACHINE: MachineType = MachineType::Secret;
 }
 unsafe impl Taken for DropRoot {
-    const MACHINE: Machine = Machine::DropRoot;
+    const MACHINE: MachineType = MachineType::DropRoot;
 }
 unsafe impl Taken for KeepRoot {
-    const MACHINE: Machine = Machine::KeepRoot;
+    const MACHINE: MachineType = MachineType::KeepRoot;
 }
 unsafe impl Taken for *const PlyType {
-    const MACHINE: Machine = Machine::Type;
+    const MACHINE: MachineType = MachineType::Type;
 }
 unsafe impl Taken for *const PlyOp {
-    const MACHINE: Machine = Machine::Op;
+    const MACHINE: MachineType = MachineType::Op;
 }
 unsafe impl Taken for *const PlyKept {
-    const MACHINE: Machine = Machine::Type;
+    const MACHINE: MachineType = MachineType::Type;
 }
 unsafe impl Taken for *const Handed {
-    const MACHINE: Machine = Machine::Words;
+    const MACHINE: MachineType = MachineType::Words;
 }
 
 unsafe impl Returned for Block {
-    const MACHINE: Option<Machine> = Some(Machine::Block);
+    const MACHINE: Option<MachineType> = Some(MachineType::Block);
     const RAISES: bool = false;
     fn of(w: Word) -> Block {
         Block(w)
@@ -307,7 +307,7 @@ unsafe impl Returned for Block {
 }
 
 unsafe impl Returned for Handed {
-    const MACHINE: Option<Machine> = Some(Machine::Handed);
+    const MACHINE: Option<MachineType> = Some(MachineType::Handed);
     const RAISES: bool = false;
     fn of(w: Word) -> Handed {
         Handed(w)
@@ -315,7 +315,7 @@ unsafe impl Returned for Handed {
 }
 
 unsafe impl Returned for Handle {
-    const MACHINE: Option<Machine> = Some(Machine::Handle);
+    const MACHINE: Option<MachineType> = Some(MachineType::Handle);
     const RAISES: bool = false;
     fn of(w: Word) -> Handle {
         Handle(w)
@@ -323,7 +323,7 @@ unsafe impl Returned for Handle {
 }
 
 unsafe impl Returned for SecretHandle {
-    const MACHINE: Option<Machine> = Some(Machine::Secret);
+    const MACHINE: Option<MachineType> = Some(MachineType::Secret);
     const RAISES: bool = false;
     fn of(w: Word) -> SecretHandle {
         SecretHandle(w)

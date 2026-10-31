@@ -12,7 +12,7 @@ pub fn found(bytes: Option<impl AsRef<[u8]>>) -> Vec<u8> {
     }
 }
 
-pub fn found_read(
+pub fn read_result_or_none(
     capacity: usize,
     read: impl FnOnce(&mut Vec<u8>) -> std::io::Result<usize>,
 ) -> Vec<u8> {

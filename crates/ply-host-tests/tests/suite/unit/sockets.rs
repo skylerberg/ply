@@ -730,7 +730,7 @@ fn plaintext_ahead_of_a_handshake_is_rejected_and_ends_the_connection() {
         .handshakes()
         .reasons
         .iter()
-        .filter(|(reason, _)| *reason == ply_host::tls::REASON_INJECTED)
+        .filter(|(reason, _)| *reason == ply_host::tls::REASON_EARLY_PLAINTEXT)
         .map(|(_, n)| *n)
         .sum();
     assert_eq!(injected, 3, "each rejection is counted under its reason");
@@ -1074,7 +1074,7 @@ fn localhost_resolves_to_loopback_addresses_without_duplicates_and_an_invalid_ho
     let found: Vec<IpAddr> = parts_of(rest)
         .expect("parts")
         .into_iter()
-        .map(|b| ply_host::dns::address_of(b).expect("an address"))
+        .map(|b| ply_host::dns::ip_address_from_bytes(b).expect("an address"))
         .collect();
     assert!(
         !found.is_empty() && found.iter().all(IpAddr::is_loopback),

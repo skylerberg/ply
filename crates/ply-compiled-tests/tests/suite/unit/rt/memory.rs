@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type Counted = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
-type Given = unsafe extern "C" fn(*mut Ctx, Word);
+type WordConsumer = unsafe extern "C" fn(*mut Ctx, Word);
 type Later = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type Drain = unsafe extern "C" fn(*mut Ctx);
 type Root = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -22,8 +22,8 @@ struct Bound {
 }
 
 fn bound() -> &'static Bound {
-    static BOUND: OnceLock<Bound> = OnceLock::new();
-    BOUND.get_or_init(|| Bound {
+    static MEMORY_FUNCTIONS: OnceLock<Bound> = OnceLock::new();
+    MEMORY_FUNCTIONS.get_or_init(|| Bound {
         alloc: helper("rt_alloc_bytes"),
         free: helper("rt_free"),
         later: helper("rt_release_later"),
@@ -120,13 +120,13 @@ fn a_block_from_rt_alloc_kept_is_never_freed_and_stays_valid_after_the_entry_tha
 
 #[test]
 fn a_shared_block_used_by_many_threads_is_freed_only_by_the_last_thread_to_release_it() {
-    const HOLDERS: u32 = 8;
+    const THREAD_COUNT: u32 = 8;
     let mut ctx = context();
     let w = alloc(&mut ctx, 32);
-    unsafe { *(w as *mut u32) = SHARED | HOLDERS };
+    unsafe { *(w as *mut u32) = SHARED | THREAD_COUNT };
     let last: Counted = helper("rt_dec_shared_last");
     let lasts: Word = std::thread::scope(|s| {
-        let holders: Vec<_> = (0..HOLDERS)
+        let holders: Vec<_> = (0..THREAD_COUNT)
             .map(|_| s.spawn(move || unsafe { last(std::ptr::null_mut(), w) }))
             .collect();
         holders
@@ -145,7 +145,7 @@ fn freeing_a_native_object_also_drops_the_value_it_contains() {
     let mut ctx = context();
     let held: Arc<str> = Arc::from("held");
     let b = ctx.heap.native(Box::new(Holding(Arc::clone(&held))));
-    let free_handle: Given = helper("rt_handle_free");
+    let free_handle: WordConsumer = helper("rt_handle_free");
     unsafe { free_handle(&mut ctx, b) };
     assert_eq!(count(b), 0);
     assert_eq!(Arc::strong_count(&held), 1);
@@ -164,7 +164,7 @@ fn a_scoped_value_stores_the_word_it_wraps_at_the_offset_the_runtime_reports() {
     assert_eq!(unsafe { word_at(obj(h), at) }, held);
     unsafe { *(h as *mut Word).byte_add(HEADER).add(at) = 0 };
     free(&mut ctx, held, sized(1));
-    let free_handle: Given = helper("rt_handle_free");
+    let free_handle: WordConsumer = helper("rt_handle_free");
     unsafe { free_handle(&mut ctx, h) };
     assert_eq!(ctx.heap.live(), 0);
     ctx.end();
@@ -179,7 +179,7 @@ fn a_freed_block_has_a_reference_count_of_zero_however_it_was_freed() {
     let released = mine.heap.native(Box::new(Holding(Arc::from("released"))));
     free(&mut mine, sized, 32);
     free(&mut other, elsewhere, 32);
-    let free_handle: Given = helper("rt_handle_free");
+    let free_handle: WordConsumer = helper("rt_handle_free");
     unsafe { free_handle(&mut mine, given_back) };
     ply_compiled::heap::release_object(&raw mut mine, released);
     for (w, given) in [
@@ -224,7 +224,7 @@ fn releases_a_block_twice() {
     let mut ctx = context();
     let w = alloc(&mut ctx, 32);
     (ctx.site_root, ctx.site_start, ctx.site_end) = (7, 3, 9);
-    let twice: Given = helper("rt_released_twice");
+    let twice: WordConsumer = helper("rt_released_twice");
     unsafe { twice(&mut ctx, w) };
 }
 
@@ -233,7 +233,7 @@ const NODE: Word = (HEADER + 8 * 2) as Word;
 thread_local! {
     static NESTED: Cell<i64> = const { Cell::new(0) };
     static DEEPEST: Cell<i64> = const { Cell::new(0) };
-    static PUT_OFF: Cell<u64> = const { Cell::new(0) };
+    static DEFERRED_RELEASES: Cell<u64> = const { Cell::new(0) };
 }
 
 fn last(w: Word) -> bool {
@@ -252,7 +252,7 @@ unsafe extern "C" fn drop_node(ctx: *mut Ctx, o: Word) -> Word {
     unsafe {
         if (*ctx).release_depth >= RELEASE_DEPTH {
             (b.later)(ctx, o, drop_node as Root as usize as Word);
-            PUT_OFF.with(|n| n.set(n.get() + 1));
+            DEFERRED_RELEASES.with(|n| n.set(n.get() + 1));
             return 0;
         }
         (*ctx).release_depth += 1;
@@ -298,7 +298,7 @@ fn released(build: fn(&mut Ctx) -> Word) -> (usize, i64, u64, i64, i64) {
             (
                 ctx.heap.live(),
                 DEEPEST.with(Cell::get),
-                PUT_OFF.with(Cell::get),
+                DEFERRED_RELEASES.with(Cell::get),
                 ctx.release_depth,
                 ctx.release_waiting,
             )

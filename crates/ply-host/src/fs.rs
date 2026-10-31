@@ -1,5 +1,5 @@
 use crate::jobs::{Failure, FallibleJob};
-use crate::native::{found, found_read, int, parts};
+use crate::native::{found, int, parts, read_result_or_none};
 use crate::pool::Run;
 use ply_core::crypto::Framing;
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
@@ -27,7 +27,7 @@ pub enum Op {
     ReadAt,
     ListDir,
     Kind,
-    Resolved,
+    ResolvePath,
     Exists,
     FileSize,
     ModifiedMs,
@@ -67,7 +67,7 @@ impl Op {
         Op::ReadAt,
         Op::ListDir,
         Op::Kind,
-        Op::Resolved,
+        Op::ResolvePath,
         Op::Exists,
         Op::FileSize,
         Op::ModifiedMs,
@@ -107,7 +107,7 @@ impl Op {
             Op::ReadAt => "`fs.read_at`",
             Op::ListDir => "`fs.list_dir`",
             Op::Kind => "`fs.kind`",
-            Op::Resolved => "`fs.resolved`",
+            Op::ResolvePath => "`fs.resolved`",
             Op::Exists => "`fs.exists`",
             Op::FileSize => "`fs.file_size`",
             Op::ModifiedMs => "`fs.modified_ms`",
@@ -155,13 +155,13 @@ impl Op {
             | Op::ReadLink
             | Op::Stat
             | Op::Link => Last::Kept,
-            _ => Last::Followed,
+            _ => Last::FollowLinks,
         }
     }
 
     fn nothing(self) -> Vec<u8> {
         match self {
-            Op::Kind | Op::Resolved => vec![Kind::Missing.number()],
+            Op::Kind | Op::ResolvePath => vec![Kind::Missing.number()],
             Op::Open | Op::Link => tried(Err(FileError::NotFound)),
             _ => vec![0],
         }
@@ -304,7 +304,7 @@ pub enum Second {
     Deep(bool),
 }
 
-pub enum Chunk {
+pub enum OpenFileAction {
     Read(u64),
     Write(Vec<u8>),
     Close,
@@ -373,42 +373,47 @@ impl FsHost {
         &self,
         label: &str,
         descriptor: i64,
-        chunk: Chunk,
+        chunk: OpenFileAction,
         span: Span,
     ) -> Result<FallibleJob, Diagnostic> {
         let op = match chunk {
-            Chunk::Read(_) => Op::ReadChunk,
-            Chunk::Write(_) => Op::WriteChunk,
-            Chunk::Close => Op::Close,
+            OpenFileAction::Read(_) => Op::ReadChunk,
+            OpenFileAction::Write(_) => Op::WriteChunk,
+            OpenFileAction::Close => Op::Close,
         };
         let root = self.root(op, label, span)?;
-        if let Chunk::Read(max) = chunk
+        if let OpenFileAction::Read(max) = chunk
             && max > MAX_READ_BYTES
         {
             return Err(chunk_too_large(max, span));
         }
         let descriptors = Arc::clone(&self.descriptors);
         Ok(Box::new(move || {
-            Ok(on_open_file(&descriptors, &root, descriptor, chunk))
+            Ok(operate_on_open_file(&descriptors, &root, descriptor, chunk))
         }))
     }
 }
 
-fn on_open_file(descriptors: &Mutex<Descriptors>, root: &Path, id: i64, work: Chunk) -> Vec<u8> {
+fn operate_on_open_file(
+    descriptors: &Mutex<Descriptors>,
+    root: &Path,
+    id: i64,
+    work: OpenFileAction,
+) -> Vec<u8> {
     let mut held = descriptors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let open = held.open.get_mut(&id).filter(|open| open.root == root);
     match work {
-        Chunk::Read(max) => match open.filter(|open| open.how == Opening::Read) {
-            Some(open) => found_read(0, |out| (&open.file).take(max).read_to_end(out)),
+        OpenFileAction::Read(max) => match open.filter(|open| open.how == Opening::Read) {
+            Some(open) => read_result_or_none(0, |out| (&open.file).take(max).read_to_end(out)),
             None => found(None::<Vec<u8>>),
         },
-        Chunk::Write(body) => done(
+        OpenFileAction::Write(body) => done(
             open.filter(|open| open.how != Opening::Read)
                 .is_some_and(|open| open.file.write_all(&body).is_ok()),
         ),
-        Chunk::Close => {
+        OpenFileAction::Close => {
             let there = open.is_some();
             if there {
                 held.open.remove(&id);
@@ -436,7 +441,7 @@ fn open_file(
         Opening::Append => options.append(true).create(true),
         Opening::Create => options.write(true).create_new(true).mode(0o600),
     };
-    let file = unfollowed(&mut options, target).map_err(|e| rejection(&e))?;
+    let file = open_without_following_links(&mut options, target).map_err(|e| rejection(&e))?;
     let mut held = descriptors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -490,15 +495,15 @@ fn run(
             Ok(meta) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
                 return Err(Failure::Rejected(too_large(meta.len(), path, span)));
             }
-            Ok(meta) if meta.is_file() => found_read(meta.len() as usize, |out| {
-                unfollowed(OpenOptions::new().read(true), &target)
+            Ok(meta) if meta.is_file() => read_result_or_none(meta.len() as usize, |out| {
+                open_without_following_links(OpenOptions::new().read(true), &target)
                     .and_then(|mut file| file.read_to_end(out))
             }),
             _ => found(None::<Vec<u8>>),
         },
-        (Op::ListDir, _) => found(listed(&target).map(|entries| entries_flat(&entries))),
+        (Op::ListDir, _) => found(listed(&target).map(|entries| encode_entries(&entries))),
         (Op::Kind, _) => vec![Kind::of(std::fs::symlink_metadata(&target).ok().as_ref()).number()],
-        (Op::Resolved, _) => vec![
+        (Op::ResolvePath, _) => vec![
             match Kind::of(std::fs::symlink_metadata(&target).ok().as_ref()) {
                 Kind::Symlink => Kind::Missing,
                 kind => kind,
@@ -522,7 +527,7 @@ fn run(
                 .map(int),
         ),
         (Op::WriteFile, Second::Body(body)) => done(
-            unfollowed(
+            open_without_following_links(
                 OpenOptions::new().write(true).create(true).truncate(true),
                 &target,
             )
@@ -544,8 +549,8 @@ fn run(
             }
             Ok(meta) if meta.is_file() => {
                 let read = read_private(&target, meta.len())
-                    .and_then(|held| framing.unframed(&held, &before, &after));
-                found(read.and_then(|secret| Some(int(keeper.upgrade()?.keep_secret(secret)))))
+                    .and_then(|held| framing.decode_framed(&held, &before, &after));
+                found(read.and_then(|secret| Some(int(keeper.upgrade()?.store_secret(secret)))))
             }
             _ => found(None::<Vec<u8>>),
         },
@@ -564,7 +569,7 @@ fn run(
         (Op::Sync, _) => done(sync_path(&target)),
         (Op::Lock, _) => done(take_lock(&target, held)),
         (Op::Unlock, _) => done(drop_lock(&target, held)),
-        (Op::Copy, Second::Path(to)) => match other(&to, Last::Followed)? {
+        (Op::Copy, Second::Path(to)) => match other(&to, Last::FollowLinks)? {
             Some(destination) => done(copy_file(&target, &destination)),
             None => op.nothing(),
         },
@@ -588,7 +593,7 @@ fn run(
                 .and_then(|to| to.to_str().map(str::to_string)),
         ),
         (Op::Walk, _) => match walk(path, &target) {
-            Ok(entries) => found(entries.map(|entries| entries_flat(&entries))),
+            Ok(entries) => found(entries.map(|entries| encode_entries(&entries))),
             Err(bytes) => return Err(Failure::Rejected(walk_too_large(bytes, path, span))),
         },
         (Op::SetModified, Second::Millis(ms)) => done(set_modified(&target, ms)),
@@ -987,7 +992,7 @@ pub(crate) fn listed(at: &Path) -> Option<Vec<(String, Kind)>> {
     Some(entries)
 }
 
-fn entries_flat(entries: &[(String, Kind)]) -> Vec<u8> {
+fn encode_entries(entries: &[(String, Kind)]) -> Vec<u8> {
     let entries: Vec<Vec<u8>> = entries
         .iter()
         .map(|(path, kind)| parts(&[path.as_bytes(), &[kind.number()][..]]))
@@ -1043,13 +1048,14 @@ fn set_modified(target: &Path, ms: i64) -> bool {
     let Ok(ms) = u64::try_from(ms) else {
         return false;
     };
-    unfollowed(OpenOptions::new().read(true), target)
+    open_without_following_links(OpenOptions::new().read(true), target)
         .and_then(|file| file.set_modified(UNIX_EPOCH + Duration::from_millis(ms)))
         .is_ok()
 }
 
 fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
-    let mut file = unfollowed(OpenOptions::new().append(true).create(true), target).ok()?;
+    let mut file =
+        open_without_following_links(OpenOptions::new().append(true).create(true), target).ok()?;
     if body.is_empty() {
         return i64::try_from(file.metadata().ok()?.len()).ok();
     }
@@ -1060,7 +1066,7 @@ fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
 
 fn write_private(target: &Path, body: &[u8]) -> bool {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let Ok(mut file) = unfollowed(
+    let Ok(mut file) = open_without_following_links(
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -1079,7 +1085,7 @@ fn write_private(target: &Path, body: &[u8]) -> bool {
 fn read_private(target: &Path, size: u64) -> Option<Zeroizing<Vec<u8>>> {
     let size = usize::try_from(size).ok()?;
     let mut bytes = Zeroizing::new(vec![0u8; size]);
-    let mut file = unfollowed(OpenOptions::new().read(true), target).ok()?;
+    let mut file = open_without_following_links(OpenOptions::new().read(true), target).ok()?;
     file.read_exact(&mut bytes).ok()?;
     let mut past = [0u8; 1];
     (file.read(&mut past).ok()? == 0).then_some(bytes)
@@ -1087,7 +1093,7 @@ fn read_private(target: &Path, size: u64) -> Option<Zeroizing<Vec<u8>>> {
 
 fn read_range(target: &Path, offset: i64, len: i64) -> Option<Vec<u8>> {
     let (offset, len) = (u64::try_from(offset).ok()?, u64::try_from(len).ok()?);
-    let mut file = unfollowed(OpenOptions::new().read(true), target).ok()?;
+    let mut file = open_without_following_links(OpenOptions::new().read(true), target).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
     }
@@ -1107,7 +1113,7 @@ fn sync_path(target: &Path) -> bool {
     } else {
         how.write(true);
     }
-    unfollowed(&mut how, target)
+    open_without_following_links(&mut how, target)
         .and_then(|file| file.sync_all())
         .is_ok()
 }
@@ -1159,12 +1165,12 @@ const LINK_HOPS: usize = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Last {
-    Followed,
+    FollowLinks,
     Kept,
 }
 
 pub fn confine(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
-    walked(root, path, Last::Followed, span)
+    walked(root, path, Last::FollowLinks, span)
 }
 
 fn walked(root: &Path, path: &str, last: Last, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
@@ -1243,7 +1249,7 @@ fn steps(path: &Path) -> impl DoubleEndedIterator<Item = OsString> + '_ {
     })
 }
 
-fn unfollowed(options: &mut OpenOptions, target: &Path) -> std::io::Result<File> {
+fn open_without_following_links(options: &mut OpenOptions, target: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_NOFOLLOW).open(target)
 }

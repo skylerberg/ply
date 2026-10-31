@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
-# ci-warm.sh used MARK    the C cache and the stages cut to what the `ply`s since MARK used: a load
-#                         marks what it reads, so the rest is what earlier runs left that this one
-#                         did not read, and every job after would restore it for nothing. A stage
-#                         and a store of cached records go whole, by their `.used`.
-# ci-warm.sh pack TAR     the C cache and the stages as one file, for `handed` in this run's other
-#                         jobs and `shared` on another branch
-# ci-warm.sh shared NAME  the artifact NAME, which a run of these sources packed, laid over the C
-#                         cache and the stages as files this run wrote. A cache reaches only its own
-#                         branch and main; an artifact reaches every run. Sets the step's `found`.
-#                         Nothing found, or a download that failed, leaves the run to build.
-# ci-warm.sh handed NAME  likewise the artifact NAME of this run, which `build-ply` packed for the
-#                         run's other jobs
-# ci-warm.sh foreign      the C cache and stages another toolchain's run left, less the stages but
-#                         `memo-std`: each file of the C cache is named by what decides it, and each
-#                         of std's records is keyed by its query's code and held to its reads, so
-#                         either serves any toolchain that names it, but a stage holds what one
-#                         toolchain's binary built and recorded for itself
+# Usage: ci-warm.sh used MARK | pack TAR | shared NAME | handed NAME | foreign. The C cache and the
+# stages are the directories that hold the C compiler's outputs and the `ply` programs' cached
+# results.
+#
+# `used MARK` deletes every file from the C cache and the stages that no `ply` read or wrote since
+# the file MARK was created. Earlier runs left those files, and every later job would restore them
+# without using them. A stage, or a store of cached records, is deleted or kept as a whole,
+# according to its `.used`.
+#
+# `pack TAR` writes the C cache and the stages into the single file TAR. The same run's other jobs
+# download it with `handed`, and runs on other branches download it with `shared`.
+#
+# `shared NAME` downloads the artifact NAME, which an earlier run of the same sources packed with
+# `pack`, and copies its files into the C cache and the stages. A cache is readable only from its
+# own branch and main, but an artifact is readable from every run. It sets the step output `found`.
+# If no artifact exists or the download fails, the run builds what it needs.
+#
+# `handed NAME` does the same for the artifact NAME that this run's `build-ply` job packed for the
+# run's other jobs.
+#
+# `foreign` deletes the files that another toolchain's run left in the C cache and the stages,
+# except the stage `memo-std`. Each file of the C cache is named by the inputs that determine its
+# content, and each record in `memo-std` is keyed by its query's code and checked against what it
+# read, so any toolchain can use them. Any other stage contains what one toolchain's binary built
+# for itself, so other toolchains cannot use it.
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
 stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
-# The stores of cached records, each a directory `sweep` takes whole (its `STORES`).
+# The stores of cached records. `sweep` (its `STORES`) deletes or keeps each store directory as a
+# whole.
 stores=$cache/bodies
 
 megabytes() { du -sm "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
@@ -34,8 +43,9 @@ shared() {
   laid "$run" "$name"
 }
 
-# The artifact NAME of run RUN, unpacked aside and copied in only when whole, so a download cut short
-# leaves no half of an object.
+# Downloads the artifact NAME of run RUN and unpacks it in a temporary directory. It copies the
+# files into the cache and the stages only after unpacking succeeds, so an interrupted download
+# never leaves a partial file there.
 laid() {
   local run=$1 name=$2 dir
   dir=$(mktemp -d)
@@ -43,7 +53,8 @@ laid() {
   mkdir "$dir/unpacked"
   zstd -d -c "$dir/stage.tar.zst" | tar -xf - -C "$dir/unpacked" || return 1
   mkdir -p "$cache" "$stage"
-  # Copied without their times: `used` keeps what is newer than the job's mark.
+  # `cp` gives the copies new modification times, so every restored file is newer than the job's
+  # mark and `used` keeps it.
   if [ -d "$dir/unpacked/cache" ]; then cp -R "$dir/unpacked/cache/." "$cache/" || return 1; fi
   if [ -d "$dir/unpacked/stage" ]; then cp -R "$dir/unpacked/stage/." "$stage/" || return 1; fi
   rm -rf "$dir"
@@ -55,9 +66,10 @@ case "${1:-}" in
     mark=${2:?usage: ci-warm.sh used MARK}
     [ -f "$mark" ] || { echo "nothing is marked at $mark" >&2; exit 2; }
     before=$(megabytes "$cache" "$stage")
-    # A store goes whole, kept where a run since the mark used it: its segments were written by
-    # earlier runs, so its use is its `.used` or its own time, which the directory each run makes
-    # there moves, as `sweep`'s `last_use` reads it.
+    # Deletes each store directory unless a run since the mark used it. A store's last use is the
+    # newer of the modification time of its `.used` file and of the directory itself. A run that
+    # adds an entry to the directory updates the directory's time. The function `last_use` in
+    # `sweep` computes the last use the same way.
     for dir in "$stores"/*/; do
       [ -d "$dir" ] || continue
       [ "$dir.used" -nt "$mark" ] || [ "$dir" -nt "$mark" ] || rm -rf "$dir"
@@ -68,16 +80,18 @@ case "${1:-}" in
       for dir in "$stage"/*/; do
         [ -d "$dir" ] || continue
         case "$(basename "$dir")" in
-          # Files swept one by one, as `sweep`'s `BY_FILE` takes them: each a runnable or an
-          # individual cached result.
+          # Deletes these files one at a time when they are not newer than the mark, as `BY_FILE` in
+          # `sweep` does. Each file is an independent executable or cached result.
           answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
-          # A stage, and a memo store, go whole, kept where it or anything in it is newer than the
-          # mark: a stage's `.used`, or a store's own time, which each run's directory there moves.
+          # Deletes a stage or memo store unless some file in it is newer than the mark. For a stage
+          # that file is its `.used`; for a store it is the directory itself, whose time changes
+          # when each run creates a directory inside it.
           *) [ -n "$(find "$dir" -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
         esac
       done
     fi
-    # A file beside the stages is what an older layout stored, which nothing this run read.
+    # Deletes loose files directly in the stage directory that this run did not read or write. They
+    # do not belong to any stage.
     [ -d "$stage" ] && find "$stage" -maxdepth 1 -type f ! -name '.*' ! -newer "$mark" -delete
     find "$cache" "$stage" -mindepth 1 -type d -empty -delete 2>/dev/null || true
     echo "the C cache and stages kept $(megabytes "$cache" "$stage") MB of $before MB"

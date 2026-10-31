@@ -22,11 +22,11 @@ fn host_use_counts_every_recorded_operation_and_reports_it_acted_only_after_a_no
     assert!(use_.is_empty());
     use_.record(Determinism::Deterministic);
     assert!(
-        !use_.acted(),
+        !use_.used_nondeterminism(),
         "a deterministic handler returns the same on a re-run"
     );
     use_.record(Determinism::Nondeterministic);
     assert_eq!(use_.operations, 2);
     assert!(!use_.is_empty());
-    assert!(use_.acted());
+    assert!(use_.used_nondeterminism());
 }

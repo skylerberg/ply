@@ -621,7 +621,7 @@ fn client(der: &rustls::pki_types::CertificateDer<'static>, alpn: &[&str]) -> Cl
 struct Peer {
     listener: TcpListener,
     config: Arc<ServerConfig>,
-    handshakes: Arc<Handshakes>,
+    handshakes: Arc<HandshakeStats>,
 }
 
 fn peer(material: &Material) -> Peer {
@@ -633,7 +633,7 @@ fn peer(material: &Material) -> Peer {
     Peer {
         listener,
         config,
-        handshakes: Arc::new(Handshakes::default()),
+        handshakes: Arc::new(HandshakeStats::default()),
     }
 }
 
@@ -884,7 +884,7 @@ fn every_handshake_rejection_maps_to_one_reason_from_a_fixed_list_each_a_short_m
 
 #[test]
 fn handshake_rejection_reasons_are_sorted_by_count_highest_first_then_alphabetically() {
-    let handshakes = Handshakes::default();
+    let handshakes = HandshakeStats::default();
     for reason in [REASON_NOT_TLS, REASON_ALPN, REASON_NOT_TLS, REASON_GONE] {
         handshakes.rejected(reason);
     }

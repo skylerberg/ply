@@ -50,7 +50,7 @@ pub struct Ctx {
     pub(crate) sim_steps: u32,
     pub(crate) entered_sims: u32,
     pub(crate) schedulers: Vec<(*mut crate::tasks::Scheduler, [i64; 3])>,
-    pub accesses: Vec<(crate::tasks::Touched, [i64; 3])>,
+    pub accesses: Vec<(crate::tasks::Access, [i64; 3])>,
     pub(crate) last_trail: Option<Vec<u8>>,
     pub(crate) held_at_root: Option<crate::entry::Held>,
     pub interleaving: Option<Vec<u8>>,
@@ -127,9 +127,9 @@ impl Ctx {
             entering_desc: 0,
             entering_words: 0,
             recording: 0,
-            bridge: object_word(&BRIDGE),
+            bridge: object_word(&NO_HANDLER_OBJECT),
             hosted: 0,
-            unserved: object_word(&UNSERVED),
+            unserved: object_word(&UNHANDLED_OPERATION),
             performed_root: -1,
             performed_start: 0,
             performed_end: 0,
@@ -184,7 +184,7 @@ impl Ctx {
         s
     }
 
-    pub(crate) fn kept_back(&mut self, s: usize) -> Kept {
+    pub(crate) fn pop_saved(&mut self, s: usize) -> Kept {
         self.stacks[s]
             .pop()
             .expect("a runtime frame finds what it kept when its call returns")
@@ -203,18 +203,18 @@ impl Ctx {
         b.sim_steps = self.sim_steps;
         b.task = self.task;
         b.traced = self.recording != 0;
-        b.rearm_recording();
+        b.refresh_recording_flag();
         b
     }
 
-    pub(crate) fn rearm_recording(&mut self) {
+    pub(crate) fn refresh_recording_flag(&mut self) {
         let seeded = (self.schedulers.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
         self.recording = i64::from(self.traced || seeded);
     }
 
     pub fn trace_performs(&mut self, traced: bool) {
         self.traced = traced;
-        self.rearm_recording();
+        self.refresh_recording_flag();
     }
 
     pub(crate) fn absorb(&mut self, mut branch: Ctx) {
@@ -230,7 +230,7 @@ impl Ctx {
         !(self.schedulers.iter()).any(|(r, _)| unsafe { (**r).is_seeded() })
     }
 
-    pub(crate) fn fail_from_branch(&mut self, f: BranchFailure) {
+    pub(crate) fn merge_concurrent_failure(&mut self, f: BranchFailure) {
         if self.failed == 0 {
             self.failed = f.code;
             self.pending = f.pending;
@@ -243,14 +243,14 @@ impl Ctx {
     }
 
     pub fn begin(&mut self) {
-        self.begin_bounded(0);
+        self.begin_with_time_limit(0);
     }
 
-    pub fn begin_bounded(&mut self, time_budget_ms: u64) {
-        self.unwatch();
+    pub fn begin_with_time_limit(&mut self, time_budget_ms: u64) {
+        self.stop_deadline_watch();
         self.failed = 0;
         self.grown = 0;
-        self.heap.set_scheduling(false);
+        self.heap.replace_scheduler_active(false);
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
@@ -280,7 +280,7 @@ impl Ctx {
         self.target = 0;
         self.entering_desc = 0;
         self.entering_words = 0;
-        self.rearm_recording();
+        self.refresh_recording_flag();
         self.release_later.clear();
         self.marshallings.clear();
         self.taken.clear();
@@ -292,7 +292,7 @@ impl Ctx {
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.outer = (
             heap::swap_current(&mut self.heap),
-            heap::poison::swap(&raw const self.site_root),
+            heap::poison_freed::swap(&raw const self.site_root),
         );
         self.outer_running = swap_running(self);
         self.watch();
@@ -304,7 +304,7 @@ impl Ctx {
         }
     }
 
-    pub(crate) fn unwatch(&self) {
+    pub(crate) fn stop_deadline_watch(&self) {
         if self.deadline.is_some() {
             unwatched(&self.stack_floor);
         }
@@ -326,16 +326,16 @@ impl Ctx {
         true
     }
 
-    pub(crate) fn give_thread_back(&mut self) {
-        self.unwatch();
-        heap::poison::swap(self.outer.1);
+    pub(crate) fn restore_thread_state(&mut self) {
+        self.stop_deadline_watch();
+        heap::poison_freed::swap(self.outer.1);
         heap::swap_current(self.outer.0);
         swap_running(self.outer_running);
         self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.outer_running = std::ptr::null_mut();
     }
 
-    pub fn left_live(&mut self) -> usize {
+    pub fn teardown_and_count_live(&mut self) -> usize {
         crate::detached::teardown(self);
         self.live()
     }
@@ -349,7 +349,7 @@ impl Ctx {
             self.release_later.is_empty() && self.release_depth == 0,
             "an entry ended with a release still running or waiting"
         );
-        self.give_thread_back();
+        self.restore_thread_state();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
@@ -395,20 +395,20 @@ impl Ctx {
 
     pub fn live(&self) -> usize {
         let branches: usize = if self.pooled {
-            crate::parallel::worker_blocks(self.id.0, heap::program_live_in)
+            crate::parallel::worker_blocks(self.id.0, heap::program_live_block_count_in)
                 .into_iter()
                 .sum()
         } else {
             0
         };
-        self.heap.program_live() + branches
+        self.heap.program_live_block_count() + branches
     }
 
     pub fn census(&self) -> Vec<(usize, usize, usize)> {
         let mut rows = self.heap.census();
         if self.pooled {
-            for tally in crate::parallel::worker_blocks(self.id.0, heap::census_in) {
-                rows = heap::census_merged(rows, tally);
+            for tally in crate::parallel::worker_blocks(self.id.0, heap::size_histogram_in) {
+                rows = heap::merge_size_histograms(rows, tally);
             }
         }
         rows
@@ -461,15 +461,15 @@ impl Ctx {
         self.fail_with(FAILED, d)
     }
 
-    pub(crate) fn pend(&mut self, d: Diagnostic, message: String) -> i64 {
+    pub(crate) fn fail_unhandled_abort(&mut self, d: Diagnostic, message: String) -> i64 {
         if self.failed != 0 {
             return 0;
         }
         self.pending = Some(Unhandled::Abort(message));
-        self.fail_with(FAILED_PENDING, d)
+        self.fail_with(FAILED_PENDING_RAISE, d)
     }
 
-    pub(crate) fn pend_raised(
+    pub(crate) fn fail_with_pending_raise(
         &mut self,
         d: Diagnostic,
         effect: Symbol,
@@ -481,10 +481,10 @@ impl Ctx {
             return 0;
         }
         self.pending = Some(Unhandled::Raised { effect, op, args });
-        self.fail_with(FAILED_PENDING, d)
+        self.fail_with(FAILED_PENDING_RAISE, d)
     }
 
-    pub(crate) fn take_branch_failure(&mut self) -> Option<BranchFailure> {
+    pub(crate) fn take_failure_to_merge(&mut self) -> Option<BranchFailure> {
         if self.failed == 0 {
             return None;
         }
@@ -509,8 +509,8 @@ impl Ctx {
         self.span_at(self.site_root, self.site_start, self.site_end)
     }
 
-    pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
-        if let crate::tasks::Touched::Effect { effect, .. } = &touched
+    pub(crate) fn touched(&mut self, touched: crate::tasks::Access) {
+        if let crate::tasks::Access::Effect { effect, .. } = &touched
             && matches!(effect.as_str(), "task" | "clock")
         {
             return;
@@ -578,7 +578,7 @@ impl Ctx {
         self.diagnostic.take()
     }
 
-    pub fn take_host_use(&mut self) -> ply_core::host::HostUse {
+    pub fn take_host_usage(&mut self) -> ply_core::host::HostUse {
         std::mem::take(&mut self.host_use)
     }
 }

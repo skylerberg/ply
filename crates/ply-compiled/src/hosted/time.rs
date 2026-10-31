@@ -1,25 +1,25 @@
 use super::{Nondeterministic, asked};
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::native::I64;
 use crate::rt::Ctx;
 use std::time::Duration;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "time_now_ms",
             rt_time_now_ms as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "time_elapsed_ns",
             rt_time_elapsed_ns as unsafe extern "C" fn(_) -> _,
         ),
-        machine_native(
+        runtime_native(
             "time_sleep_ms",
             rt_time_sleep_ms as unsafe extern "C" fn(_, _),
         ),
-        machine_native("clock_now", rt_clock_now as unsafe extern "C" fn(_) -> _),
-        machine_native("clock_sleep", rt_clock_sleep as unsafe extern "C" fn(_, _)),
+        runtime_native("clock_now", rt_clock_now as unsafe extern "C" fn(_) -> _),
+        runtime_native("clock_sleep", rt_clock_sleep as unsafe extern "C" fn(_, _)),
     ]
 }
 
@@ -55,7 +55,7 @@ pub unsafe extern "C" fn rt_clock_now(ctx: *mut Ctx) -> I64 {
 
 pub unsafe extern "C" fn rt_clock_sleep(ctx: *mut Ctx, nanos: I64) {
     asked(ctx, "clock_sleep", Nondeterministic, (), |c| {
-        if crate::tasks::waited(c, crate::tasks::ASK_SLEEP, nanos.0).is_none() {
+        if crate::tasks::waited(c, crate::tasks::REQUEST_SLEEP, nanos.0).is_none() {
             std::thread::sleep(Duration::from_nanos(u64::try_from(nanos.0).unwrap_or(0)));
         }
     });

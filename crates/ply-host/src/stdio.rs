@@ -12,13 +12,13 @@ const IN: i32 = libc::STDIN_FILENO;
 const OUT: i32 = libc::STDOUT_FILENO;
 const ERR: i32 = libc::STDERR_FILENO;
 
-static HELD_OUT: Mutex<Output> = Mutex::new(Output {
+static OUTPUT_BUFFER: Mutex<Output> = Mutex::new(Output {
     held: Vec::new(),
     gone: false,
     untold: false,
 });
 
-static HELD_IN: Mutex<Input> = Mutex::new(Input {
+static INPUT_BUFFER: Mutex<Input> = Mutex::new(Input {
     held: Vec::new(),
     at: 0,
 });
@@ -60,7 +60,7 @@ impl Output {
 }
 
 pub fn write_out(bytes: &[u8]) -> Result<()> {
-    let mut out = lock(&HELD_OUT);
+    let mut out = lock(&OUTPUT_BUFFER);
     if !out.gone {
         out.held.extend_from_slice(bytes);
     }
@@ -73,13 +73,13 @@ pub fn write_out(bytes: &[u8]) -> Result<()> {
 }
 
 pub fn flush_out() -> Result<()> {
-    let mut out = lock(&HELD_OUT);
+    let mut out = lock(&OUTPUT_BUFFER);
     let wrote = out.written();
     out.told(wrote)
 }
 
 pub fn make_way() {
-    let mut out = lock(&HELD_OUT);
+    let mut out = lock(&OUTPUT_BUFFER);
     if !out.gone && !out.held.is_empty() && out.written().is_err_and(|e| reader_gone(&e)) {
         out.untold = true;
     }
@@ -153,7 +153,7 @@ pub fn read(max: usize) -> Result<Vec<u8>> {
 pub fn read_within(max: usize, deadline: Option<Instant>) -> Result<Option<Vec<u8>>> {
     make_way();
     let max = max.min(MAX_READ_BYTES);
-    let mut input = lock(&HELD_IN);
+    let mut input = lock(&INPUT_BUFFER);
     if input.unread().is_empty() {
         if max == 0 {
             return Ok(Some(Vec::new()));
@@ -171,7 +171,7 @@ pub fn read_within(max: usize, deadline: Option<Instant>) -> Result<Option<Vec<u
 
 pub fn read_line() -> Result<Option<String>> {
     make_way();
-    let mut input = lock(&HELD_IN);
+    let mut input = lock(&INPUT_BUFFER);
     let mut searched = 0;
     let line = loop {
         if let Some(i) = input.unread()[searched..].iter().position(|b| *b == b'\n') {
@@ -259,7 +259,7 @@ pub fn terminal_size() -> Option<(u16, u16)> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Cooked,
-    Silent,
+    NoEcho,
     Raw,
 }
 
@@ -287,7 +287,7 @@ pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
     let mut wanted = original;
     match mode {
         Mode::Cooked => {}
-        Mode::Silent => wanted.c_lflag &= !libc::ECHO,
+        Mode::NoEcho => wanted.c_lflag &= !libc::ECHO,
         Mode::Raw => {
             unsafe { libc::cfmakeraw(&mut wanted) };
             wanted.c_cc[libc::VMIN] = 1;
@@ -302,7 +302,7 @@ pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
 
 pub fn settle() -> bool {
     make_way();
-    let untold = std::mem::take(&mut lock(&HELD_OUT).untold);
+    let untold = std::mem::take(&mut lock(&OUTPUT_BUFFER).untold);
     restore_terminal();
     untold
 }

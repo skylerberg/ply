@@ -121,7 +121,7 @@ pub(super) struct Launch<'a> {
 pub(super) enum Unusable {
     Unknown,
     Spent,
-    Elsewhere(Resource),
+    StartedUnderOtherLabel(Resource),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -212,7 +212,7 @@ impl Children {
             child.end();
             return Err("the run is ending, so the child was killed as it started".to_string());
         }
-        table.open.retain(|_, held| !held.is_spent());
+        table.open.retain(|_, held| !held.is_waited());
         let handle = table.next;
         table.next += 1;
         table.open.insert(handle, Arc::clone(&child));
@@ -222,8 +222,10 @@ impl Children {
     pub(super) fn get(&self, handle: i64, at: &Resource) -> Result<Arc<Child>, Unusable> {
         let table = lock(&self.table);
         match table.open.get(&handle) {
-            Some(child) if child.is_spent() => Err(Unusable::Spent),
-            Some(child) if child.label != *at => Err(Unusable::Elsewhere(child.label.clone())),
+            Some(child) if child.is_waited() => Err(Unusable::Spent),
+            Some(child) if child.label != *at => {
+                Err(Unusable::StartedUnderOtherLabel(child.label.clone()))
+            }
             Some(child) => Ok(Arc::clone(child)),
             None if handle > 0 && handle < table.next => Err(Unusable::Spent),
             None => Err(Unusable::Unknown),
@@ -265,7 +267,7 @@ impl Child {
         lock(&self.state)
     }
 
-    fn is_spent(&self) -> bool {
+    fn is_waited(&self) -> bool {
         self.lock().spent
     }
 
@@ -313,7 +315,7 @@ impl Child {
             if let Some(line) = state.next_line() {
                 return Ok(Heard::Said(line));
             }
-            if !state.lines_open() {
+            if !state.line_streams_open() {
                 return Ok(Heard::Closed);
             }
             state = match until(&self.changed, state, deadline) {
@@ -401,23 +403,23 @@ impl State {
         let held = self.held(stream);
         held.written += chunk.len();
         match held.collect {
-            Collect::Nothing => {}
-            Collect::Keep => {
+            OutputHandling::Nothing => {}
+            OutputHandling::Keep => {
                 held.hold(chunk);
             }
-            Collect::Lines => {
+            OutputHandling::Lines => {
                 let from = held.bytes.len();
                 if held.hold(chunk) {
-                    let ended = carve(&mut held.bytes, from);
+                    let ended = take_complete_lines(&mut held.bytes, from);
                     held.queued += ended.iter().map(Vec::len).sum::<usize>();
                     self.lines
                         .extend(ended.into_iter().map(|line| (stream, line)));
                 }
             }
-            Collect::Forward(to) => {
+            OutputHandling::Forward(to) => {
                 let from = held.bytes.len();
                 held.bytes.extend_from_slice(chunk);
-                for line in carve(&mut held.bytes, from) {
+                for line in take_complete_lines(&mut held.bytes, from) {
                     forward(sink, to, &line);
                 }
             }
@@ -431,13 +433,13 @@ impl State {
             return;
         }
         match held.collect {
-            Collect::Lines => {
+            OutputHandling::Lines => {
                 let tail = std::mem::take(&mut held.bytes);
                 held.queued += tail.len();
                 self.lines.push_back((stream, tail));
             }
-            Collect::Forward(to) => forward(sink, to, &std::mem::take(&mut held.bytes)),
-            Collect::Nothing | Collect::Keep => {}
+            OutputHandling::Forward(to) => forward(sink, to, &std::mem::take(&mut held.bytes)),
+            OutputHandling::Nothing | OutputHandling::Keep => {}
         }
     }
 
@@ -447,22 +449,22 @@ impl State {
         Some(text_of(&line))
     }
 
-    fn lines_open(&self) -> bool {
+    fn line_streams_open(&self) -> bool {
         [&self.out, &self.err]
             .iter()
-            .any(|held| held.collect == Collect::Lines && held.open)
+            .any(|held| held.collect == OutputHandling::Lines && held.open)
     }
 
     fn lines_overflowed(&self) -> bool {
         [&self.out, &self.err]
             .iter()
-            .any(|held| held.collect == Collect::Lines && held.overflowed)
+            .any(|held| held.collect == OutputHandling::Lines && held.overflowed)
     }
 
     fn collected(&mut self, stream: Stream) -> Vec<u8> {
         match self.held(stream).collect {
-            Collect::Keep => std::mem::take(&mut self.held(stream).bytes),
-            Collect::Lines => {
+            OutputHandling::Keep => std::mem::take(&mut self.held(stream).bytes),
+            OutputHandling::Lines => {
                 let mut unread = Vec::new();
                 self.lines.retain(|(from, line)| {
                     if *from == stream {
@@ -475,13 +477,13 @@ impl State {
                 self.held(stream).queued = 0;
                 unread
             }
-            Collect::Nothing | Collect::Forward(_) => Vec::new(),
+            OutputHandling::Nothing | OutputHandling::Forward(_) => Vec::new(),
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Collect {
+enum OutputHandling {
     Nothing,
     Keep,
     Lines,
@@ -489,7 +491,7 @@ enum Collect {
 }
 
 struct CollectedStream {
-    collect: Collect,
+    collect: OutputHandling,
     open: bool,
     bytes: Vec<u8>,
     queued: usize,
@@ -498,10 +500,10 @@ struct CollectedStream {
 }
 
 impl CollectedStream {
-    fn new(collect: Collect) -> CollectedStream {
+    fn new(collect: OutputHandling) -> CollectedStream {
         CollectedStream {
             collect,
-            open: collect != Collect::Nothing,
+            open: collect != OutputHandling::Nothing,
             bytes: Vec::new(),
             queued: 0,
             written: 0,
@@ -519,7 +521,7 @@ impl CollectedStream {
     }
 }
 
-fn carve(bytes: &mut Vec<u8>, from: usize) -> Vec<Vec<u8>> {
+fn take_complete_lines(bytes: &mut Vec<u8>, from: usize) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut at = from;
@@ -545,7 +547,7 @@ fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
 
 struct Destination {
     stdio: Stdio,
-    collect: Collect,
+    collect: OutputHandling,
 }
 
 fn destinations(
@@ -562,11 +564,11 @@ fn destinations(
         return Ok((
             Destination {
                 stdio: file.into(),
-                collect: Collect::Nothing,
+                collect: OutputHandling::Nothing,
             },
             Destination {
                 stdio: shared.into(),
-                collect: Collect::Nothing,
+                collect: OutputHandling::Nothing,
             },
         ));
     }
@@ -587,22 +589,22 @@ fn destination(
         collect,
     };
     Ok(match output {
-        Output::Keep => piped(Collect::Keep),
-        Output::Lines => piped(Collect::Lines),
+        Output::Keep => piped(OutputHandling::Keep),
+        Output::Lines => piped(OutputHandling::Lines),
         Output::Discard => Destination {
             stdio: Stdio::null(),
-            collect: Collect::Nothing,
+            collect: OutputHandling::Nothing,
         },
         Output::File(path) => Destination {
             stdio: create(dir, path)?.into(),
-            collect: Collect::Nothing,
+            collect: OutputHandling::Nothing,
         },
         Output::Inherit => match sink {
             OutputSink::Real { out } => Destination {
                 stdio: inherited(stream, *out),
-                collect: Collect::Nothing,
+                collect: OutputHandling::Nothing,
             },
-            OutputSink::Captured(_) => piped(Collect::Forward(stream)),
+            OutputSink::Captured(_) => piped(OutputHandling::Forward(stream)),
         },
     })
 }

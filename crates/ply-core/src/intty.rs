@@ -1,7 +1,7 @@
 use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum IntTy {
+pub enum IntegerType {
     U8,
     U16,
     U32,
@@ -14,53 +14,57 @@ pub enum IntTy {
     I128,
 }
 
-pub const INT_TYPES: [IntTy; 10] = [
-    IntTy::U8,
-    IntTy::U16,
-    IntTy::U32,
-    IntTy::U64,
-    IntTy::I8,
-    IntTy::I16,
-    IntTy::I32,
-    IntTy::I64,
-    IntTy::U128,
-    IntTy::I128,
+pub const INT_TYPES: [IntegerType; 10] = [
+    IntegerType::U8,
+    IntegerType::U16,
+    IntegerType::U32,
+    IntegerType::U64,
+    IntegerType::I8,
+    IntegerType::I16,
+    IntegerType::I32,
+    IntegerType::I64,
+    IntegerType::U128,
+    IntegerType::I128,
 ];
 
-impl IntTy {
+impl IntegerType {
     pub fn name(self) -> &'static str {
         match self {
-            IntTy::U8 => "U8",
-            IntTy::U16 => "U16",
-            IntTy::U32 => "U32",
-            IntTy::U64 => "U64",
-            IntTy::I8 => "I8",
-            IntTy::I16 => "I16",
-            IntTy::I32 => "I32",
-            IntTy::I64 => "I64",
-            IntTy::U128 => "U128",
-            IntTy::I128 => "I128",
+            IntegerType::U8 => "U8",
+            IntegerType::U16 => "U16",
+            IntegerType::U32 => "U32",
+            IntegerType::U64 => "U64",
+            IntegerType::I8 => "I8",
+            IntegerType::I16 => "I16",
+            IntegerType::I32 => "I32",
+            IntegerType::I64 => "I64",
+            IntegerType::U128 => "U128",
+            IntegerType::I128 => "I128",
         }
     }
 
-    pub fn from_name(name: &str) -> Option<IntTy> {
+    pub fn from_name(name: &str) -> Option<IntegerType> {
         INT_TYPES.into_iter().find(|t| t.name() == name)
     }
 
     pub fn bits(self) -> u32 {
         match self {
-            IntTy::U8 | IntTy::I8 => 8,
-            IntTy::U16 | IntTy::I16 => 16,
-            IntTy::U32 | IntTy::I32 => 32,
-            IntTy::U64 | IntTy::I64 => 64,
-            IntTy::U128 | IntTy::I128 => 128,
+            IntegerType::U8 | IntegerType::I8 => 8,
+            IntegerType::U16 | IntegerType::I16 => 16,
+            IntegerType::U32 | IntegerType::I32 => 32,
+            IntegerType::U64 | IntegerType::I64 => 64,
+            IntegerType::U128 | IntegerType::I128 => 128,
         }
     }
 
     pub fn signed(self) -> bool {
         matches!(
             self,
-            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128
+            IntegerType::I8
+                | IntegerType::I16
+                | IntegerType::I32
+                | IntegerType::I64
+                | IntegerType::I128
         )
     }
 
@@ -98,7 +102,7 @@ impl IntTy {
     }
 }
 
-impl fmt::Display for IntTy {
+impl fmt::Display for IntegerType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
@@ -106,12 +110,12 @@ impl fmt::Display for IntTy {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Fixed {
-    pub ty: IntTy,
+    pub ty: IntegerType,
     bits: u128,
 }
 
 impl Fixed {
-    pub fn new(ty: IntTy, bits: u128) -> Fixed {
+    pub fn new(ty: IntegerType, bits: u128) -> Fixed {
         Fixed {
             ty,
             bits: ty.normalize(bits),

@@ -34,15 +34,15 @@ fn symbol(c: u8, ranges: &[(u8, u8, u8)]) -> (u32, i32) {
 struct Encoding {
     ranges: &'static [(u8, u8, u8)],
     bits: u32,
-    quantum: usize,
+    symbols_per_block: usize,
     padded: bool,
 }
 
 fn named(name: &str) -> Option<Encoding> {
-    let coded = |ranges, bits, quantum, padded| Encoding {
+    let coded = |ranges, bits, symbols_per_block, padded| Encoding {
         ranges,
         bits,
-        quantum,
+        symbols_per_block,
         padded,
     };
     Some(match name {
@@ -71,33 +71,33 @@ const BASE64URL: &[(u8, u8, u8)] = &[
     (b'_', b'_', 63),
 ];
 
-const BASE32_TYPED: Encoding = Encoding {
+const BASE32_UNPADDED: Encoding = Encoding {
     ranges: BASE32,
     bits: 5,
-    quantum: 8,
+    symbols_per_block: 8,
     padded: false,
 };
 
 fn decoded(e: &Encoding, text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     let body = if e.padded {
-        if !text.len().is_multiple_of(e.quantum) {
+        if !text.len().is_multiple_of(e.symbols_per_block) {
             return None;
         }
         let fill = text
             .iter()
             .rev()
-            .take(e.quantum - 1)
+            .take(e.symbols_per_block - 1)
             .take_while(|c| **c == b'=')
             .count();
         let body = text.len() - fill;
-        if fill != (e.quantum - body % e.quantum) % e.quantum {
+        if fill != (e.symbols_per_block - body % e.symbols_per_block) % e.symbols_per_block {
             return None;
         }
         body
     } else {
         text.len()
     };
-    let spare = (body as u32 % e.quantum as u32 * e.bits) % 8;
+    let spare = (body as u32 % e.symbols_per_block as u32 * e.bits) % 8;
     if spare >= e.bits {
         return None;
     }
@@ -142,7 +142,7 @@ fn character(value: u32, ranges: &[(u8, u8, u8)]) -> u8 {
 fn encoded(e: &Encoding, bytes: &[u8]) -> Zeroizing<Vec<u8>> {
     let mask = (1u32 << e.bits) - 1;
     let mut out = Zeroizing::new(Vec::with_capacity(
-        bytes.len() * 8 / e.bits as usize + e.quantum,
+        bytes.len() * 8 / e.bits as usize + e.symbols_per_block,
     ));
     let (mut held, mut count) = (0u32, 0u32);
     for b in bytes {
@@ -157,31 +157,31 @@ fn encoded(e: &Encoding, bytes: &[u8]) -> Zeroizing<Vec<u8>> {
     if count > 0 {
         out.push(character((held << (e.bits - count)) & mask, e.ranges));
     }
-    while e.padded && !out.len().is_multiple_of(e.quantum) {
+    while e.padded && !out.len().is_multiple_of(e.symbols_per_block) {
         out.push(b'=');
     }
     out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Encodes {
+pub enum EncodingSupport {
     WritesAndReads,
     Reads,
     Neither,
 }
 
-pub fn encoding(name: &str) -> Encodes {
+pub fn encoding(name: &str) -> EncodingSupport {
     match (name, named(name)) {
-        (_, Some(_)) => Encodes::WritesAndReads,
-        ("base32-typed", None) => Encodes::Reads,
-        _ => Encodes::Neither,
+        (_, Some(_)) => EncodingSupport::WritesAndReads,
+        ("base32-typed", None) => EncodingSupport::Reads,
+        _ => EncodingSupport::Neither,
     }
 }
 
 pub fn decode(name: &str, text: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     match (name, named(name)) {
         (_, Some(e)) => decoded(&e, text),
-        ("base32-typed", None) => decoded(&BASE32_TYPED, &typed(text)),
+        ("base32-typed", None) => decoded(&BASE32_UNPADDED, &typed(text)),
         _ => None,
     }
 }
@@ -222,7 +222,12 @@ impl Framing {
         out
     }
 
-    pub fn unframed(self, held: &[u8], before: &[u8], after: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    pub fn decode_framed(
+        self,
+        held: &[u8],
+        before: &[u8],
+        after: &[u8],
+    ) -> Option<Zeroizing<Vec<u8>>> {
         if held.len() < before.len() + after.len() {
             return None;
         }
@@ -721,7 +726,7 @@ pub fn rsa_jwk(n: &[u8], e: &[u8], private: [&[u8]; 6]) -> Option<Zeroizing<Vec<
     let unpadded = Encoding {
         ranges: BASE64URL,
         bits: 6,
-        quantum: 4,
+        symbols_per_block: 4,
         padded: false,
     };
     let mut numbers = Vec::with_capacity(6);

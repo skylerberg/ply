@@ -8,9 +8,9 @@ pub const FAILED_TIMED_OUT: i64 = 5;
 
 pub const FAILED_CANCELLED: i64 = 7;
 
-pub const FAILED_TARGET: i64 = 9;
+pub const FAILED_UNWOUND_TO_HANDLER: i64 = 9;
 
-pub const FAILED_PENDING: i64 = 10;
+pub const FAILED_PENDING_RAISE: i64 = 10;
 
 pub(super) const MODE_RAISE: i64 = 2;
 
@@ -23,7 +23,7 @@ pub(crate) fn call_fun(ctx: *mut Ctx, f: Word, args: &[Word]) -> Word {
 }
 
 pub(crate) fn release_fun(f: Word) {
-    unsafe { Block::of(f).let_go_function(running()) };
+    unsafe { Block::of(f).release_function_if_last(running()) };
 }
 
 pub(crate) enum Kept {
@@ -48,7 +48,7 @@ pub(crate) fn call_clause(ctx: *mut Ctx, clause: Word, args: Vec<Word>) -> Word 
     let n = args.len();
     let here = c.keep(Kept::Args(args));
     let r = call_fun(ctx, clause, unsafe { std::slice::from_raw_parts(at, n) });
-    unsafe { &mut *ctx }.kept_back(here).release();
+    unsafe { &mut *ctx }.pop_saved(here).release();
     r
 }
 

@@ -17,7 +17,7 @@ pub type FallibleJob = Box<dyn FnOnce() -> Result<Vec<u8>, Failure> + Send>;
 pub enum Work {
     Computing,
     Waiting,
-    Filing,
+    WritingFiles,
 }
 
 struct Jobs {
@@ -69,7 +69,7 @@ pub fn refusing(
     let pool = match work {
         Work::Computing => &jobs().computing,
         Work::Waiting => &jobs().waiting,
-        Work::Filing => &jobs().filing,
+        Work::WritingFiles => &jobs().filing,
     };
     pool.submit(run, span, label, what, Box::new(job))
 }

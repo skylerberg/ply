@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 thread_local! {
-    static RUN: Rc<dyn HostRuntime> = ply_host::Host::new().runtime();
+    static HOST_RUNTIME: Rc<dyn HostRuntime> = ply_host::Host::new().runtime();
 }
 
 fn the_run() -> Rc<dyn HostRuntime> {
-    RUN.with(Rc::clone)
+    HOST_RUNTIME.with(Rc::clone)
 }
 
 fn host(argv: &[&str]) -> Arc<ProcessHost> {

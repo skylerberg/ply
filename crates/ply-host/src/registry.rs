@@ -1,6 +1,6 @@
 use crate::config;
 use crate::fs;
-use crate::pool::{Bell, Run, err_nothing_outstanding};
+use crate::pool::{Run, WakeCounter, err_nothing_outstanding};
 use crate::process;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::sqlite;
@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub struct Host {
-    bell: Arc<Bell>,
+    bell: Arc<WakeCounter>,
     config: Arc<config::Snapshot>,
     fs: Arc<fs::FsHost>,
     net: Arc<tcp::TcpHost>,
@@ -37,7 +37,7 @@ impl Host {
 
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
         Host {
-            bell: Arc::new(Bell::default()),
+            bell: Arc::new(WakeCounter::default()),
             config: Arc::new(config::Snapshot::unopened()),
             fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
             net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
@@ -119,7 +119,7 @@ impl Host {
 
     pub fn stopping_on(self, shutdown: Arc<Shutdown>) -> Host {
         shutdown.attach_net(Arc::clone(&self.net) as Arc<dyn signal::Accepting>);
-        shutdown.attach_bell(&self.bell);
+        shutdown.attach_notifier(&self.bell);
         if let Some(process) = &self.process {
             shutdown.attach_children(process.children());
         }
@@ -204,7 +204,7 @@ impl Facilities {
         &self.fs
     }
 
-    pub fn databases(&self) -> &Arc<sqlite::SqliteHost> {
+    pub fn sqlite_host(&self) -> &Arc<sqlite::SqliteHost> {
         &self.sqlite
     }
 

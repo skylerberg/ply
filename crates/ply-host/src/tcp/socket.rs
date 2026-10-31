@@ -1,12 +1,12 @@
 use super::wire::{self, Credentials, Endpoint, NetError, Probing, SocketOption};
 use super::{
-    Handles, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener, not_a_stream,
-    not_upgradable, unknown_handle,
+    Handles, Upgrade, bind, err_datagram_for_stream_socket, not_a_datagram_socket, not_a_listener,
+    not_a_stream, not_upgradable, unknown_handle,
 };
 use crate::fs;
 use crate::jobs::Job;
 use crate::native::{found, int};
-use crate::tls::{self, Credentials as TlsCredentials, Handshakes};
+use crate::tls::{self, Credentials as TlsCredentials, HandshakeStats};
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
 use rustls::pki_types::ServerName;
 use rustls::server::ServerConfig;
@@ -92,16 +92,16 @@ impl Plain {
 }
 
 #[derive(Clone)]
-enum Listening {
+enum ListenerKind {
     Tcp(Arc<TcpListener>, Option<Arc<ServerConfig>>),
     #[cfg(unix)]
     Unix(Arc<UnixListener>, Arc<PathBuf>),
 }
 
-impl Listening {
-    fn accept(&self, handshakes: &Arc<Handshakes>) -> io::Result<Socket> {
+impl ListenerKind {
+    fn accept(&self, handshakes: &Arc<HandshakeStats>) -> io::Result<Socket> {
         match self {
-            Listening::Tcp(listener, config) => {
+            ListenerKind::Tcp(listener, config) => {
                 let (stream, _) = listener.accept()?;
                 let _ = stream.set_nodelay(true);
                 let stream = Arc::new(stream);
@@ -115,7 +115,7 @@ impl Listening {
                 })
             }
             #[cfg(unix)]
-            Listening::Unix(listener, _) => {
+            ListenerKind::Unix(listener, _) => {
                 let (stream, _) = listener.accept()?;
                 Ok(Socket::Stream(Plain::Unix(Arc::new(stream))))
             }
@@ -124,7 +124,7 @@ impl Listening {
 }
 
 enum Socket {
-    Listener(Listening),
+    Listener(ListenerKind),
     Stream(Plain),
     Tls(Arc<tls::Session>),
     Datagram(Arc<UdpSocket>),
@@ -148,12 +148,12 @@ impl Sockets {
         handle
     }
 
-    fn listener(&self, handle: i64, label: &str, span: Span) -> Result<Listening, Diagnostic> {
+    fn listener(&self, handle: i64, label: &str, span: Span) -> Result<ListenerKind, Diagnostic> {
         self.handles.check(handle, label, span)?;
         match lock(&self.open).get(&handle) {
             Some(Socket::Listener(listening)) => Ok(listening.clone()),
             Some(Socket::Stream(_) | Socket::Tls(_)) => Err(not_a_listener(handle, span)),
-            Some(Socket::Datagram(_)) => Err(a_datagram_socket(handle, span)),
+            Some(Socket::Datagram(_)) => Err(err_datagram_for_stream_socket(handle, span)),
             Some(Socket::Finished) => Err(not_a_listener(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
@@ -174,7 +174,7 @@ impl Sockets {
             Some(Socket::Stream(s)) => Ok(Connection::Plain(s.clone())),
             Some(Socket::Tls(s)) => Ok(Connection::Tls(Arc::clone(s))),
             Some(Socket::Listener(..) | Socket::Finished) => Err(not_a_stream(handle, span)),
-            Some(Socket::Datagram(_)) => Err(a_datagram_socket(handle, span)),
+            Some(Socket::Datagram(_)) => Err(err_datagram_for_stream_socket(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
     }
@@ -211,7 +211,7 @@ impl Sockets {
             Some(Socket::Listener(..) | Socket::Finished) => {
                 return Err(not_a_stream(handle, span));
             }
-            Some(Socket::Datagram(_)) => return Err(a_datagram_socket(handle, span)),
+            Some(Socket::Datagram(_)) => return Err(err_datagram_for_stream_socket(handle, span)),
             None => return Err(unknown_handle(handle, span)),
         };
         let session = secured(Arc::clone(&stream));
@@ -245,11 +245,11 @@ impl Drop for Accepting {
 pub struct TcpHost {
     sockets: Arc<Sockets>,
     credentials: TlsCredentials,
-    handshakes: Arc<Handshakes>,
+    handshakes: Arc<HandshakeStats>,
     roots: Mutex<fs::Roots>,
     stopping: Arc<AtomicBool>,
     accepts: Arc<AtomicUsize>,
-    closed_at: Mutex<Vec<SocketAddr>>,
+    closed_listener_addresses: Mutex<Vec<SocketAddr>>,
     presenting: Arc<Mutex<BTreeMap<i64, String>>>,
 }
 
@@ -271,11 +271,11 @@ impl TcpHost {
                 handles: Handles::new(),
             }),
             credentials,
-            handshakes: Arc::new(Handshakes::default()),
+            handshakes: Arc::new(HandshakeStats::default()),
             roots: Mutex::new(fs::Roots::new()),
             stopping: Arc::new(AtomicBool::new(false)),
             accepts: Arc::new(AtomicUsize::new(0)),
-            closed_at: Mutex::new(Vec::new()),
+            closed_listener_addresses: Mutex::new(Vec::new()),
             presenting: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -294,7 +294,7 @@ impl TcpHost {
 
     pub fn local_addr(&self, handle: i64) -> Option<SocketAddr> {
         match lock(&self.sockets.open).get(&handle) {
-            Some(Socket::Listener(Listening::Tcp(l, _))) => l.local_addr().ok(),
+            Some(Socket::Listener(ListenerKind::Tcp(l, _))) => l.local_addr().ok(),
             _ => None,
         }
     }
@@ -351,7 +351,7 @@ impl TcpHost {
         let listener = bind("`net.listen`", port, span)?;
         Ok(self.sockets.insert(
             Some(label),
-            Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
+            Socket::Listener(ListenerKind::Tcp(Arc::new(listener), None)),
         ))
     }
 
@@ -366,7 +366,7 @@ impl TcpHost {
         let listener = bind("`net.listen_tls`", port, span)?;
         Ok(self.sockets.insert(
             Some(label),
-            Socket::Listener(Listening::Tcp(Arc::new(listener), Some(config))),
+            Socket::Listener(ListenerKind::Tcp(Arc::new(listener), Some(config))),
         ))
     }
 
@@ -374,7 +374,7 @@ impl TcpHost {
         wire::result(bound(to, options).map(|listener| {
             let handle = self.sockets.insert(
                 Some(label),
-                Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
+                Socket::Listener(ListenerKind::Tcp(Arc::new(listener), None)),
             );
             int(handle).to_vec()
         }))
@@ -393,7 +393,7 @@ impl TcpHost {
             Ok(listener) => {
                 let handle = self.sockets.insert(
                     Some(label),
-                    Socket::Listener(Listening::Unix(Arc::new(listener), Arc::new(path))),
+                    Socket::Listener(ListenerKind::Unix(Arc::new(listener), Arc::new(path))),
                 );
                 Ok(int(handle).to_vec())
             }
@@ -449,7 +449,7 @@ impl TcpHost {
         let presenting = Arc::clone(&self.presenting);
         let label = label.to_string();
         Box::new(move || {
-            Ok(wire::result(reach_to(&to, &options, timeout).map(
+            Ok(wire::result(connect_tcp(&to, &options, timeout).map(
                 |stream| {
                     let handle =
                         sockets.insert(Some(&label), Socket::Stream(Plain::Tcp(Arc::new(stream))));
@@ -519,11 +519,11 @@ impl TcpHost {
     ) -> Result<Job, Diagnostic> {
         let server = ServerName::try_from(name.to_string());
         let early = if upgrade.unread > 0 {
-            Some((tls::REASON_INJECTED, NetError::Injected))
+            Some((tls::REASON_EARLY_PLAINTEXT, NetError::Injected))
         } else if server.is_err() {
             Some((
-                tls::REASON_NAME,
-                NetError::Handshake(tls::REASON_NAME.to_string()),
+                tls::REASON_INVALID_SERVER_NAME,
+                NetError::Handshake(tls::REASON_INVALID_SERVER_NAME.to_string()),
             ))
         } else {
             None
@@ -534,7 +534,7 @@ impl TcpHost {
             Some(name) => self.credentials.presenting(&name, span)?,
             None => self.credentials.client(),
         };
-        let config = tls::client_offering(&client, &upgrade.alpn);
+        let config = tls::client_config_offering_protocols(&client, &upgrade.alpn);
         let handshakes = Arc::clone(&self.handshakes);
         let (stream, session) =
             self.sockets
@@ -546,7 +546,7 @@ impl TcpHost {
                         (reason, _) => tls::Session::rejected(
                             stream,
                             handshakes,
-                            reason.unwrap_or(tls::REASON_NAME),
+                            reason.unwrap_or(tls::REASON_INVALID_SERVER_NAME),
                         ),
                     })
                 })?;
@@ -555,7 +555,7 @@ impl TcpHost {
         }
         Ok(Box::new(move || {
             if tls::plaintext_waiting(&stream) {
-                session.refuse(tls::REASON_INJECTED);
+                session.refuse(tls::REASON_EARLY_PLAINTEXT);
                 return Ok(wire::result(Err(NetError::Injected)));
             }
             Ok(finished(&session, upgrade.timeout))
@@ -571,14 +571,14 @@ impl TcpHost {
         span: Span,
     ) -> Result<Job, Diagnostic> {
         let credential = self.credentials.resolve(credential, span)?;
-        let config = tls::server_accepting(&credential, &upgrade.alpn);
+        let config = tls::server_config_accepting_protocols(&credential, &upgrade.alpn);
         let handshakes = Arc::clone(&self.handshakes);
         let injected = upgrade.unread > 0;
         let (_, session) =
             self.sockets
                 .upgraded("`net.serve_tls`", conn, label, span, move |stream| {
                     Arc::new(if injected {
-                        tls::Session::rejected(stream, handshakes, tls::REASON_INJECTED)
+                        tls::Session::rejected(stream, handshakes, tls::REASON_EARLY_PLAINTEXT)
                     } else {
                         tls::Session::new(config, stream, handshakes)
                     })
@@ -705,11 +705,12 @@ impl TcpHost {
             Some(Socket::Stream(s)) => s.shutdown(Shutdown::Both),
             Some(Socket::Tls(s)) => s.close(),
             #[cfg(unix)]
-            Some(Socket::Listener(Listening::Unix(_, path))) => {
+            Some(Socket::Listener(ListenerKind::Unix(_, path))) => {
                 let _ = std::fs::remove_file(&*path);
             }
-            Some(Socket::Listener(Listening::Tcp(..)) | Socket::Datagram(_) | Socket::Finished) => {
-            }
+            Some(
+                Socket::Listener(ListenerKind::Tcp(..)) | Socket::Datagram(_) | Socket::Finished,
+            ) => {}
             None => return Err(unknown_handle(socket, span)),
         }
         Ok(())
@@ -815,18 +816,18 @@ fn finished(session: &tls::Session, timeout: Duration) -> Vec<u8> {
     let outcome = session
         .finish_within(timeout)
         .map_err(|reason| match reason {
-            tls::Unfinished::Expired => NetError::TimedOut,
-            tls::Unfinished::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
-            tls::Unfinished::Rejected(tls::REASON_GONE) => NetError::Reset,
-            tls::Unfinished::Rejected(reason) => NetError::Handshake(reason.to_string()),
+            tls::ShutdownFailure::Expired => NetError::TimedOut,
+            tls::ShutdownFailure::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
+            tls::ShutdownFailure::Rejected(tls::REASON_GONE) => NetError::Reset,
+            tls::ShutdownFailure::Rejected(reason) => NetError::Handshake(reason.to_string()),
         });
     wire::result(outcome.map(found))
 }
 
 fn accepted(
-    listening: &Listening,
+    listening: &ListenerKind,
     sockets: &Sockets,
-    handshakes: &Arc<Handshakes>,
+    handshakes: &Arc<HandshakeStats>,
     stopping: &AtomicBool,
 ) -> i64 {
     for _ in 0..=ACCEPT_RETRIES {
@@ -855,20 +856,20 @@ impl crate::signal::Accepting for TcpHost {
         let mut closed = Vec::new();
         for handle in &listeners {
             match open.insert(*handle, Socket::Finished) {
-                Some(Socket::Listener(Listening::Tcp(l, _))) => {
+                Some(Socket::Listener(ListenerKind::Tcp(l, _))) => {
                     if let Ok(address) = l.local_addr() {
                         closed.push(address);
                     }
                 }
                 #[cfg(unix)]
-                Some(Socket::Listener(Listening::Unix(_, path))) => {
+                Some(Socket::Listener(ListenerKind::Unix(_, path))) => {
                     drop(UnixStream::connect(&*path));
                     let _ = std::fs::remove_file(&*path);
                 }
                 _ => {}
             }
         }
-        *lock(&self.closed_at) = closed;
+        *lock(&self.closed_listener_addresses) = closed;
         listeners.len()
     }
 
@@ -876,11 +877,11 @@ impl crate::signal::Accepting for TcpHost {
         let mut addresses: Vec<SocketAddr> = lock(&self.sockets.open)
             .values()
             .filter_map(|s| match s {
-                Socket::Listener(Listening::Tcp(l, _)) => l.local_addr().ok(),
+                Socket::Listener(ListenerKind::Tcp(l, _)) => l.local_addr().ok(),
                 _ => None,
             })
             .collect();
-        addresses.extend(lock(&self.closed_at).iter().copied());
+        addresses.extend(lock(&self.closed_listener_addresses).iter().copied());
         addresses.sort();
         addresses.dedup();
         addresses
@@ -936,7 +937,7 @@ fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
     Some(stream)
 }
 
-fn reach_to(
+fn connect_tcp(
     to: &Endpoint,
     options: &[SocketOption],
     timeout: Duration,
@@ -1001,9 +1002,9 @@ fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, NetErro
 
 fn raw_of(sock: &Socket) -> Option<SockRef<'_>> {
     match sock {
-        Socket::Listener(Listening::Tcp(l, _)) => Some(SockRef::from(&**l)),
+        Socket::Listener(ListenerKind::Tcp(l, _)) => Some(SockRef::from(&**l)),
         #[cfg(unix)]
-        Socket::Listener(Listening::Unix(l, _)) => Some(SockRef::from(&**l)),
+        Socket::Listener(ListenerKind::Unix(l, _)) => Some(SockRef::from(&**l)),
         Socket::Stream(s) => Some(s.raw()),
         Socket::Tls(s) => Some(SockRef::from(s.socket())),
         Socket::Datagram(s) => Some(SockRef::from(&**s)),
@@ -1013,7 +1014,7 @@ fn raw_of(sock: &Socket) -> Option<SockRef<'_>> {
 
 fn local_of(sock: &Socket) -> Option<SocketAddr> {
     match sock {
-        Socket::Listener(Listening::Tcp(l, _)) => l.local_addr().ok(),
+        Socket::Listener(ListenerKind::Tcp(l, _)) => l.local_addr().ok(),
         Socket::Stream(Plain::Tcp(s)) => s.local_addr().ok(),
         Socket::Tls(s) => s.local_addr().ok(),
         Socket::Datagram(s) => s.local_addr().ok(),

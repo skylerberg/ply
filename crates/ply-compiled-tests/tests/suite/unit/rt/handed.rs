@@ -7,7 +7,7 @@ use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
-use ply_compiled::rt::{BRIDGE, Ctx, FAILED_TARGET};
+use ply_compiled::rt::{Ctx, FAILED_UNWOUND_TO_HANDLER, NO_HANDLER_OBJECT};
 use ply_core::{Effect, Mode, Resource};
 use std::cell::Cell;
 
@@ -100,7 +100,7 @@ fn op(params: &'static Params) -> PlyOp {
 }
 
 fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
-    let entry = BRIDGE.slot.entry;
+    let entry = NO_HANDLER_OBJECT.slot.entry;
     let result = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
     unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
@@ -124,7 +124,7 @@ fn an_effect_with_no_handler_fails_the_run_with_its_value_in_the_error_and_frees
     ctx.end();
 }
 
-type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
+type TakeRaisedPayload = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 
 #[test]
 fn a_raised_effect_is_caught_only_by_a_handler_for_the_same_operation() {
@@ -133,7 +133,7 @@ fn a_raised_effect_is_caught_only_by_a_handler_for_the_same_operation() {
     let payload = boxed(&mut ctx, 42);
     performed(&mut ctx, &op(&BOXES), 2, &[payload]);
     assert_ne!(ctx.failed, 0, "the raise left the entry failed");
-    let at = helper::<PendingAt>("rt_pending_raised_at");
+    let at = helper::<TakeRaisedPayload>("rt_pending_raised_at");
     assert_eq!(unsafe { at(&mut ctx, 0, 2) }, 0);
     assert_ne!(ctx.failed, 0);
     let words = unsafe { at(&mut ctx, 0, 1) } as *const Word;
@@ -218,7 +218,7 @@ unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let n = unsafe { *(held as *const Word).byte_add(HEADER) };
     unsafe { box_dec(ctx, held) };
     if n == 6 {
-        unsafe { (*ctx).failed = FAILED_TARGET };
+        unsafe { (*ctx).failed = FAILED_UNWOUND_TO_HANDLER };
         return 0;
     }
     7
@@ -272,7 +272,7 @@ fn bracket_cleans_up_what_it_acquired_after_a_body_that_unwinds() {
     ctx.begin();
     CLEANED.with(|c| c.set(0));
     let result = bracket(&mut ctx, &ACQUIRE_SIX);
-    assert_eq!((result, ctx.failed), (0, FAILED_TARGET));
+    assert_eq!((result, ctx.failed), (0, FAILED_UNWOUND_TO_HANDLER));
     assert_eq!(CLEANED.with(Cell::get), 6);
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
@@ -280,7 +280,7 @@ fn bracket_cleans_up_what_it_acquired_after_a_body_that_unwinds() {
 }
 
 thread_local! {
-    static LIFTED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static RECEIVED_STRING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 unsafe extern "C" fn string_lift(ctx: *mut Ctx) -> Word {
@@ -290,7 +290,7 @@ unsafe extern "C" fn string_lift(ctx: *mut Ctx) -> Word {
     let n = unsafe { text(ctx) };
     let mut b = vec![0u8; n as usize];
     unsafe { taken(ctx, b.as_mut_ptr(), n) };
-    LIFTED.with(|l| *l.borrow_mut() = String::from_utf8(b).expect("UTF-8"));
+    RECEIVED_STRING.with(|l| *l.borrow_mut() = String::from_utf8(b).expect("UTF-8"));
     boxed(unsafe { &mut *ctx }, n)
 }
 
@@ -310,10 +310,10 @@ type LabelString = unsafe extern "C" fn(*mut Ctx, Word, *const PlyType) -> Word;
 fn the_operation_label_matched_by_a_handler_is_converted_to_a_string_and_then_freed() {
     let mut ctx = naming(&["m", "ask", "*", "files"]);
     ctx.begin();
-    LIFTED.with(|l| l.borrow_mut().clear());
+    RECEIVED_STRING.with(|l| l.borrow_mut().clear());
     let label = unsafe { helper::<LabelString>("rt_label_string")(&mut ctx, 3, &STRING_T) };
     super::marshalling::unfailed(&mut ctx);
-    assert_eq!(LIFTED.with(|l| l.borrow().clone()), "files");
+    assert_eq!(RECEIVED_STRING.with(|l| l.borrow().clone()), "files");
     unsafe { box_dec(&mut ctx, label) };
     assert_eq!(ctx.heap.live(), 0, "the label was not let go");
     ctx.end();

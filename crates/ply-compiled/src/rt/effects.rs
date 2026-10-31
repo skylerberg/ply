@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
-    string_lifted(ctx, label.as_str(), string).map_or(0, Handed::word)
+    decode_string(ctx, label.as_str(), string).map_or(0, Handed::word)
 }
 
 pub unsafe extern "C" fn rt_label_string(
@@ -30,7 +30,7 @@ pub unsafe extern "C" fn rt_detached_open(
     let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
     let instance = unsafe { std::mem::transmute::<Block, Word>(instance) };
     let forwards = (forwards != 0).then_some(forwards);
-    Handed::of(unsafe { crate::detached::open_over(ctx, body, forwards, instance) })
+    Handed::of(unsafe { crate::detached::open_detached(ctx, body, forwards, instance) })
 }
 
 pub unsafe extern "C" fn rt_detached_perform(
@@ -42,7 +42,7 @@ pub unsafe extern "C" fn rt_detached_perform(
 ) -> Handed {
     let described = unsafe { &*op };
     let args = args_of(args.cast(), described.params_len).to_vec();
-    Handed::of(unsafe { crate::detached::stop_over(ctx, record, args, resource.0) })
+    Handed::of(unsafe { crate::detached::stop_detached(ctx, record, args, resource.0) })
 }
 
 pub unsafe extern "C" fn rt_detached_stop(
@@ -72,7 +72,7 @@ pub struct Slot {
     pub env: Word,
 }
 
-pub static BRIDGE: RuntimeObject = RuntimeObject {
+pub static NO_HANDLER_OBJECT: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
         entry: bridged,
@@ -80,7 +80,7 @@ pub static BRIDGE: RuntimeObject = RuntimeObject {
     },
 };
 
-pub static UNSERVED: RuntimeObject = RuntimeObject {
+pub static UNHANDLED_OPERATION: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
         entry: unserved,
@@ -100,7 +100,7 @@ unsafe extern "C" fn bridged(
     resource: I64,
     args: *const Handed,
 ) -> Handed {
-    unsafe { at_entry(ctx, op, mode, resource, args, true) }
+    unsafe { perform_operation(ctx, op, mode, resource, args, true) }
 }
 
 unsafe extern "C" fn unserved(
@@ -111,10 +111,10 @@ unsafe extern "C" fn unserved(
     resource: I64,
     args: *const Handed,
 ) -> Handed {
-    unsafe { at_entry(ctx, op, mode, resource, args, false) }
+    unsafe { perform_operation(ctx, op, mode, resource, args, false) }
 }
 
-unsafe fn at_entry(
+unsafe fn perform_operation(
     ctx: *mut Ctx,
     op: *const PlyOp,
     mode: I64,
@@ -141,7 +141,7 @@ unsafe fn at_entry(
         ply_core::handler::err_unhandled(site, &effect, &name, resource.as_ref())
     } else {
         let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
-        ply_core::host::err_unserved(site, &operation)
+        ply_core::host::err_unhandled_operation(site, &operation)
     };
     Handed::of(c.fail(d))
 }
@@ -175,7 +175,7 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
         mode,
         op.clone(),
     );
-    c.touched(crate::tasks::Touched::Effect {
+    c.touched(crate::tasks::Access::Effect {
         effect: effect.clone(),
         resource: resource.cloned(),
         write: mode == Mode::Write,
@@ -255,7 +255,7 @@ pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Rai
         args.release();
         let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
             .primary(c.site(), "raised here");
-        return c.pend(d, message);
+        return c.fail_unhandled_abort(d, message);
     }
     let carried: Result<Vec<Vec<u8>>, String> = args.0.iter().map(|v| shown(c, v)).collect();
     let carried = match carried {
@@ -278,7 +278,7 @@ pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Rai
     .note("a `try` around the call handles it as an `Err`, and a `handle` clause as it likes")
     .showing(carried)
     .primary(c.site(), "raised here");
-    c.pend_raised(d, effect.clone(), op.clone(), args)
+    c.fail_with_pending_raise(d, effect.clone(), op.clone(), args)
 }
 
 fn raised_message(c: &mut Ctx, args: &Raised) -> String {
@@ -301,7 +301,7 @@ pub unsafe extern "C" fn rt_pending_raised(
     bridged: I64,
 ) -> Handed {
     let c = unsafe { &mut *ctx };
-    if c.failed != FAILED_PENDING || bridged.0 != 0 {
+    if c.failed != FAILED_PENDING_RAISE || bridged.0 != 0 {
         return Handed::of(0);
     }
     let message = match c.pending.take() {
@@ -313,12 +313,12 @@ pub unsafe extern "C" fn rt_pending_raised(
     };
     c.failed = 0;
     c.diagnostic = None;
-    string_lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+    decode_string(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
 }
 
 pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I64) -> Handed {
     let c = unsafe { &mut *ctx };
-    if c.failed != FAILED_PENDING {
+    if c.failed != FAILED_PENDING_RAISE {
         return Handed::of(0);
     }
     let named = |s: &Symbol, i: I64| c.tables.fields.get(i.0 as usize) == Some(s);

@@ -86,7 +86,7 @@ fn count_window_counts_the_allocations_made_by_the_function_it_calls_and_lists_a
         bytes, counted.bytes,
         "the rows' bytes are the window's bytes"
     );
-    let (result, counted, sites) = ply_launcher::count::window_sampled(
+    let (result, counted, sites) = ply_launcher::count::count_allocations_sampled(
         || {
             let mut v: Vec<Vec<u64>> = Vec::new();
             for n in 0..4096u64 {
@@ -161,7 +161,7 @@ fn the_allocation_sites_flags_choose_between_recording_every_allocation_and_reco
 fn sampled_allocations_are_not_spaced_at_a_fixed_interval() {
     let every = ply_launcher::count::SAMPLED;
     let hits: Vec<u64> = (0..(1u64 << 20))
-        .filter(|n| ply_launcher::count::sampled_nth(*n, every))
+        .filter(|n| ply_launcher::count::is_sampled(*n, every))
         .collect();
     let expected = (1usize << 20) / every as usize;
     assert!(
@@ -174,9 +174,6 @@ fn sampled_allocations_are_not_spaced_at_a_fixed_interval() {
             .any(|pair| pair[1] - pair[0] != u64::from(every)),
         "every gap is {every}: the sample is periodic after all"
     );
-    assert!(ply_launcher::count::sampled_nth(0, 1), "exact walks all");
-    assert!(
-        ply_launcher::count::sampled_nth(7, 0),
-        "no sites walks none"
-    );
+    assert!(ply_launcher::count::is_sampled(0, 1), "exact walks all");
+    assert!(ply_launcher::count::is_sampled(7, 0), "no sites walks none");
 }
