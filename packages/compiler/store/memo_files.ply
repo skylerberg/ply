@@ -3,14 +3,14 @@ import std.fs
 import std.fs (fs)
 import std.list
 import compiler.store.fact_store
-import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Change, fact_damage,
+import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
-import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, digest_of, fact_details_bin,
-                            first_waiting, inline_output, location_id, memo, memo_store,
-                            nothing_waiting, pack_digest_of, pack_inline_of, pack_record_bytes,
-                            pack_row_key, query, query_output, sealed_lookup, start_run,
-                            stored_fact_bin, stored_input_bin, with_mark, without_mark)
+import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, defers, digest_of,
+                            fact_details_bin, first_waiting, inline_output, location_id, memo,
+                            memo_store, nothing_waiting, pack_digest_of, pack_inline_of,
+                            pack_record_bytes, pack_row_key, query, query_output, sealed_lookup,
+                            start_run, stored_fact_bin, stored_input_bin, with_mark, without_mark)
 import compiler.store.packs
 import compiler.store.segments
 
@@ -25,12 +25,17 @@ type StoreRun = {
   trusted: Bool,
   pack_differs: Bool,
   waiting: Waiting,
-  changes: List<Change>,
+  changes: List<Bytes>,
+  edited: Bool,
 }
 
 fn max_cached_size() -> Int = 268435456
 
 fn pack_id_name() -> Bytes = b"\x00pack"
+
+fn cursor_name() -> Bytes = b"\x00products read the log up to"
+
+fn int_bytes(n: Int) -> Bytes / {abort.raise} = bin::encode(n, bin::int_bin())
 
 fn code_key(name: Bytes) -> Bytes = name.blake3()
 
@@ -94,6 +99,7 @@ fn over_database<a, [r] | e>(
       pack_differs: false,
       waiting: nothing_waiting(),
       changes: [],
+      edited: false,
     },
     memo_store.fact(key) -> match fact_store::value_of[r](st.db, Facts, key) {
       Some(b) -> Some(undecoded(b, stored_fact_bin())),
@@ -211,9 +217,42 @@ fn over_database<a, [r] | e>(
     memo_store.settle(key) -> {
       st = { ..st, waiting: without_mark(st.waiting, key) };
     },
-    memo_store.log_change(query, input) -> {
-      st = { ..st, changes: st.changes.push({ query: query, input: input }) };
+    memo_store.log_change(key) -> {
+      st = { ..st, changes: st.changes.push(key) };
     },
+    memo_store.note_edit() -> {
+      st = { ..st, edited: true };
+    },
+    memo_store.defers(key) -> defers(st.waiting, key),
+    memo_store.defer_products(prefixes) -> {
+      st = { ..st, waiting: { ..st.waiting, products: prefixes } };
+    },
+    memo_store.push_products(pushing) -> {
+      st = { ..st, waiting: { ..st.waiting, pushing: pushing } };
+    },
+    memo_store.logged_changes() -> {
+      let cursor = match fact_store::value_of[r](st.db, Codes, code_key(cursor_name())) {
+        Some(b) -> undecoded(b, bin::int_bin()),
+        None -> 0,
+      };
+      fact_store::changes_after[r](st.db, cursor).fold(
+        st.changes,
+        |keys: List<Bytes>, entry: fact_store::LogEntry| keys.concat(entry.changes),
+      )
+    },
+    memo_store.log_read() -> {
+      st = {
+        ..st,
+        changes: [],
+        db: fact_store::with_value(
+          st.db,
+          Codes,
+          code_key(cursor_name()),
+          int_bytes(fact_store::log_end(st.db) + if st.edited { 1 } else { 0 }),
+        ),
+      };
+    },
+    memo_store.edit_offset() -> fact_store::log_end(st.db) + if st.edited { 1 } else { 0 },
     memo_store.running(id) -> {
       let trusted = match st.pack.index {
         Some(i) -> packs::is_trusted(i, id, world),
@@ -229,7 +268,11 @@ fn over_database<a, [r] | e>(
       };
     },
     return value -> {
-      fact_store::commit[r](fact_store::append_change(st.db, st.changes));
+      fact_store::commit[r](
+        if st.edited || st.changes.len() > 0 { fact_store::append_change(st.db, st.changes) }
+        else { st.db },
+        live_results[r],
+      );
       value
     },
   }
@@ -255,6 +298,25 @@ pub fn with_memo_store<a, [r] | e>(
     };
     fact_store::close[r](db);
     value
+  })
+
+pub fn product_is_current<[r]>(
+  dir: String,
+  product: String,
+) -> Bool / {fs.read[r], abort.raise} =
+  with_recent_reads(|| fact_store::undamaged(|| {
+    let db = fact_store::read_only[r](dir);
+    fact_store::cursor[r](db, product) == fact_store::log_end(db)
+  }))
+
+pub fn product_read_log<[r]>(
+  dir: String,
+  product: String,
+) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
+  with_recent_reads(|| {
+    let db = fact_store::read_only[r](dir);
+    fact_store::move_cursor[r](db, product, fact_store::log_end(db));
+    ()
   })
 
 pub type Usage = {

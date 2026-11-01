@@ -19,8 +19,9 @@ import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front (PulledAnalysis, published, shipped_wants_bin)
 import compiler.front.published (encode_rows)
 import compiler.front.facts (ModuleShape, ModuleTables, no_shape, module_shape_bin, encode_tables,
-                             decode_tables, read_outline, named_imports)
-import compiler.front.rows (OutlineItem, OutlinedTest, OutlinedLaw)
+                             decode_tables, read_outline, named_imports, pulled_next)
+import compiler.syntax.expressions (prelude_module)
+import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw)
 import compiler.syntax.items (Module, Item, TypeItem, LawItem, ImportDeclaration, SelectedNames,
                               header, header_of, parse, is_explicit_import)
 import compiler.expand.derive (import_path)
@@ -38,13 +39,15 @@ import compiler.store.hash.forms (CachedNode, CachedTest, CachedLaw, CachedHashe
                                   record_digest)
 import compiler.front.pages (Page, module_pages, pages_bin)
 import compiler.front.checking.world (ModuleKey, ModuleResult, module_key_bin, interface_key_bin,
-                                      module_result_bin, shipped_names_kind, decode_cache,
+                                      module_result_bin, shipped_names_kind, own_modules_kind,
+                                      decode_cache,
                                       QueryEffects, text_key, read_once, context_once,
                                       owner_interfaces_once, decoded, package_location_of,
                                       shipped_for, owner_interfaces_of, owner_interface_bytes_of,
                                       module_query, owner_interfaces_query, ModuleRead,
                                       module_origin_of, text_of, module_read, module_origins_of,
-                                      module_origin_lookup, imports_query, imports_result, absent,
+                                      module_origin_lookup, imports_query, imports_result, ImportOf,
+                                      imports_of_bin, absent,
                                       hash_result_bin, Context, Setting, setting_bin, context_bin,
                                       context_query)
 
@@ -350,12 +353,65 @@ fn visible_modules_of(named: ModuleKey) -> List<Bytes> / {memo.read, abort.raise
 
 pub fn value_call_modules_query() -> Bytes = b"answering"
 
+pub fn symbols_query() -> Bytes = b"symbols"
+
+pub fn symbol_query() -> Bytes = b"symbol"
+
+type SymbolKey = { shipped: Bool, name: Bytes }
+
+derive bin for SymbolKey
+
+fn symbols_input(shipped: Bool) -> Bytes = if shipped { b"shipped" } else { b"project" }
+
+pub fn symbols_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let shipped = input == symbols_input(true);
+  let listed = match memo.external(shipped_names_kind(), b"") {
+    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
+    None -> [],
+  };
+  let own = if shipped { [] } else {
+    match memo.external(own_modules_kind(), b"") {
+      Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the program's modules"),
+      None -> [],
+    }
+  };
+  let declaring = own.concat(listed.filter(|m: Bytes| !own.contains(m))).fold(
+    Map::new(),
+    |found: Map<Bytes, List<Bytes>>, m: Bytes|
+      names_of({ module: m, shipped: shipped_for(shipped, m), tested: false }).filter(|n: Bytes|
+        n.starts_with(b"::")).fold(found, |by: Map<Bytes, List<Bytes>>, n: Bytes|
+        by.insert(n, (match by.get(n) { Some(ms) -> ms, None -> [] }).push(m))),
+  );
+  declaring.fold((), |_: Unit, name: Bytes, modules: List<Bytes>|
+    memo.provide(
+      symbol_query(),
+      bin::encode({ shipped: shipped, name: name }, symbol_key_bin()),
+      bin::encode(modules, bin::list_bin(bin::bytes_bin())),
+    ));
+  b""
+}
+
+pub fn symbol_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let key = decoded(input, symbol_key_bin(), "a name");
+  match memo.written_by(symbols_query(), symbols_input(key.shipped)) {
+    Some(o) -> o,
+    None -> bin::encode([], bin::list_bin(bin::bytes_bin())),
+  }
+}
+
 pub fn declaring_modules_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let key = decoded(input, interface_key_bin(), "an entry's name");
+  let declaring = decoded(
+    memo.fetch(
+      symbol_query(),
+      bin::encode({ shipped: key.shipped, name: any_module_name(key.name) }, symbol_key_bin()),
+    ),
+    bin::list_bin(bin::bytes_bin()),
+    "the modules that declare a name",
+  );
   bin::encode(
     visible_modules_of({ module: key.module, shipped: key.shipped, tested: key.full_text }).filter(
-      |m: Bytes|
-        declared_of(m, shipped_for(key.shipped, m), false, any_module_name(key.name)).len() > 0,
+      |m: Bytes| declaring.contains(m),
     ),
     bin::list_bin(bin::bytes_bin()),
   )
@@ -2173,6 +2229,146 @@ pub fn documented_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = 
   )
 }
 
+pub type ModuleSummary = {
+  rejected: Bool,
+  warned: Bool,
+  functions: Int,
+  tests: Int,
+  written: List<Bytes>,
+  checked_later: Bool,
+}
+
+pub type ProgramSummary = {
+  clean: Bool,
+  pulled: List<Bytes>,
+  modules: Int,
+  definitions: Int,
+  tests: Int,
+  checked_later: Bool,
+}
+
+derive bin for ModuleSummary
+
+derive bin for ProgramSummary
+
+pub fn module_summary_query() -> Bytes = b"module summary"
+
+pub fn program_summary_query() -> Bytes = b"program summary"
+
+fn asks_for_later_check(item: OutlineItem) -> Bool =
+  match item {
+    OutlinedFunction(f) -> f.reuse || f.returns || f.measured,
+    _ -> false,
+  }
+
+pub fn module_summary_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let m = decoded(memo.fetch(module_query(), input), module_result_bin(), "a module's result");
+  let items = m.shape.outline.items;
+  bin::encode(
+    {
+      rejected: m.rejected.len() > 0,
+      warned: m.warnings.len() > 0,
+      functions: items.fold(0, |n: Int, item: OutlineItem|
+        match item { OutlinedFunction(_) -> n + 1, _ -> n }),
+      tests: items.fold(0, |n: Int, item: OutlineItem|
+        match item { OutlinedTest(_) -> n + 1, _ -> n }),
+      written: m.shape.written,
+      checked_later: m.shape.tagged.len() + m.shape.statements.len() > 0
+        || items.any(asks_for_later_check),
+    },
+    module_summary_bin(),
+  )
+}
+
+fn summary_of(named: ModuleKey) -> ModuleSummary / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(module_summary_query(), bin::encode(named, module_key_bin())),
+    module_summary_bin(),
+    "a module's summary",
+  )
+
+fn imports_of_module(named: ModuleKey) -> List<ImportOf> / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(imports_query(), bin::encode(named, module_key_bin())),
+    imports_of_bin(),
+    "a module's imports",
+  ).imports
+
+fn has_import_cycle(own: List<Bytes>) -> Bool / {memo.read, abort.raise} = {
+  let edges = own.fold(Map::new(), |found: Map<Bytes, List<Bytes>>, m: Bytes|
+    found.insert(
+      m,
+      imports_of_module({ module: m, shipped: false, tested: false }).filter(|i: ImportOf|
+        !i.named.shipped).map(|i: ImportOf| i.named.module),
+    ));
+  iterate(own, own.len() + 2, |left: List<Bytes>| {
+    let waiting = left.fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes| found.insert(m, true));
+    let blocked = left.filter(|m: Bytes|
+      List::any(match edges.get(m) { Some(es) -> es, None -> [] }, |d: Bytes|
+        waiting.contains(d)));
+    if blocked.len() == 0 { Stop(false) }
+    else if blocked.len() == left.len() { Stop(true) }
+    else { Continue(blocked) }
+  })
+}
+
+pub fn program_summary_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let own = decoded(input, bin::list_bin(bin::bytes_bin()), "a program's modules");
+  let nothing = {
+    clean: false,
+    pulled: [],
+    modules: 0,
+    definitions: 0,
+    tests: 0,
+    checked_later: false,
+  };
+  if has_import_cycle(own) { bin::encode(nothing, program_summary_bin()) } else {
+    let mine = own.map(|m: Bytes| summary_of({ module: m, shipped: false, tested: false }));
+    let listed = match memo.external(shipped_names_kind(), b"") {
+      Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
+      None -> [],
+    }.fold(Map::new(), |found: Map<Bytes, Bool>, n: Bytes| found.insert(n, true));
+    let written = range(0, own.len()).fold(
+      Map::new(),
+      |found: Map<Bytes, List<Bytes>>, i: Int| found.insert(own.get(i), mine.get(i).written),
+    );
+    let pulled = iterate(
+      { written: written, read: own, pulled: [], functions: 0 },
+      listed.len() + 2,
+      |x: { written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes>, functions: Int }| {
+        let fresh = pulled_next(x.read, x.written, listed, []);
+        if fresh.len() == 0 { Stop(x) } else {
+          Continue(
+            fresh.fold(
+              { ..x, read: x.read.concat(fresh), pulled: x.pulled.concat(fresh) },
+              |sofar: { written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes>, functions: Int }, n: Bytes| {
+                let m = summary_of({ module: n, shipped: true, tested: false });
+                {
+                  ..sofar,
+                  written: sofar.written.insert(n, m.written),
+                  functions: if n == prelude_module() { sofar.functions }
+                  else { sofar.functions + m.functions },
+                }
+              },
+            ),
+          )
+        }
+      },
+    );
+    bin::encode(
+      {
+        clean: !mine.any(|m: ModuleSummary| m.rejected || m.warned),
+        pulled: pulled.pulled,
+        modules: own.len() + pulled.pulled.len(),
+        definitions: mine.fold(pulled.functions, |n: Int, m: ModuleSummary| n + m.functions),
+        tests: mine.fold(0, |n: Int, m: ModuleSummary| n + m.tests),
+        checked_later: mine.any(|m: ModuleSummary| m.checked_later),
+      },
+      program_summary_bin(),
+    )
+  }
+}
+
 pub fn declaring_query() -> Bytes = b"declaring"
 
 pub fn documenting_modules_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
@@ -2208,6 +2404,26 @@ pub fn declaring_bin() -> bin::BinCodec<Map<Bytes, List<Bytes>>> =
 
 pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }> =
   [
+    {
+      name: symbols_query(),
+      definition: b"compiler.front.checking.groups.symbols_result",
+      body: symbols_result,
+    },
+    {
+      name: symbol_query(),
+      definition: b"compiler.front.checking.groups.symbol_result",
+      body: symbol_result,
+    },
+    {
+      name: module_summary_query(),
+      definition: b"compiler.front.checking.groups.module_summary_result",
+      body: module_summary_result,
+    },
+    {
+      name: program_summary_query(),
+      definition: b"compiler.front.checking.groups.program_summary_result",
+      body: program_summary_result,
+    },
     {
       name: owners_query(),
       definition: b"compiler.front.checking.groups.owners_result",

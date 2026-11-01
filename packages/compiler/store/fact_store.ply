@@ -25,11 +25,7 @@ pub effect recent_reads {
 
 pub type Tree = | Facts | Dependents | Inputs | Codes | Errors | References
 
-pub type Change = { query: Bytes, input: Bytes }
-
-derive bin for Change
-
-pub type LogEntry = { offset: Int, changes: List<Change> }
+pub type LogEntry = { offset: Int, changes: List<Bytes> }
 
 pub type Snapshot = Map<Int, TreeRoot>
 
@@ -75,7 +71,7 @@ fn tree_number(tree: Tree) -> Int =
     References -> 6,
   }
 
-fn changes_codec() -> bin::BinCodec<List<Change>> = bin::list_bin(change_bin())
+fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
 fn whole_table_after() -> Int = 256
 
@@ -374,15 +370,14 @@ pub fn result_of<[r]>(
     },
   }
 
-pub fn append_change(db: Database, changes: List<Change>) -> Database / {abort.raise} =
-  if changes.len() == 0 { db } else {
-    let offset = db.log_end + 1;
-    {
-      ..db,
-      unwritten_log: db.unwritten_log.insert(offset, bin::encode(changes, changes_codec())),
-      log_end: offset,
-    }
+pub fn append_change(db: Database, changes: List<Bytes>) -> Database / {abort.raise} = {
+  let offset = db.log_end + 1;
+  {
+    ..db,
+    unwritten_log: db.unwritten_log.insert(offset, bin::encode(changes, changes_codec())),
+    log_end: offset,
   }
+}
 
 pub fn changes_after<[r]>(
   db: Database,
@@ -398,6 +393,8 @@ pub fn changes_after<[r]>(
       None -> fact_damage.damaged("the change log has a gap"),
     }
   })
+
+pub fn log_end(db: Database) -> Int = db.log_end
 
 pub fn cursor<[r]>(
   db: Database,
@@ -544,6 +541,7 @@ fn removed_after_refusal<[r]>(db: Database, result: CommitResult) -> CommitResul
 
 pub fn commit<[r]>(
   db: Database,
+  live_results: (Database) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
 ) -> CommitResult / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
   let rewrite = rewritten[r](db);
   if rewrite.snapshot == db.snapshot && db.unwritten_log.len() == 0 && !db.starts_over
@@ -572,7 +570,15 @@ pub fn commit<[r]>(
         } else { StoreChanged };
         match installed {
           Committed(m) -> {
-            merge_tail[r](db, m);
+            merge_tail[r](
+              {
+                ..fresh_database(db.dir, m),
+                snapshot: rewrite.snapshot,
+                log_end: db.log_end,
+                run: db.run,
+              },
+              live_results,
+            );
             installed
           },
           _ -> removed_after_refusal[r](db, installed),
@@ -673,20 +679,23 @@ fn rewritten_segments<[r]>(
 
 fn merge_tail<[r]>(
   db: Database,
-  m: Manifest,
+  live_results: (Database) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
 ) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let m = db.manifest;
   let from = segments::merge_start(m);
-  let merged = if from >= m.segments.len() - 1 { false } else {
-    rewritten_segments[r](
-      { ..db, manifest: m },
-      m,
-      from,
-      segments::segment_token(db.run, m.generation, 1),
-      |_: Int, _: Bytes| true,
-    )
+  if from < m.segments.len() - 1 {
+    let token = segments::segment_token(db.run, m.generation, 1);
+    if from > 0 { rewritten_segments[r](db, m, from, token, |_: Int, _: Bytes| true); () } else {
+      let nodes = tree_nodes[r](db, db.snapshot.values());
+      let results = live_results(db);
+      rewritten_segments[r](db, m, 0, token, |table: Int, key: Bytes|
+        if table == nodes_table() { nodes.contains(key) }
+        else if table == results_table() { results.contains(key) }
+        else { true });
+      ()
+    }
   };
-  match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run, []), None -> () };
-  if merged { () }
+  match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run, []), None -> () }
 }
 
 pub fn move_cursor<[r]>(
@@ -774,7 +783,7 @@ pub fn store_size(db: Database) -> { segments: Int, bytes: Int } =
 
 fn key_of(text: String) -> Bytes = Bytes::of_string(text).blake3()
 
-fn sample_change(name: String) -> Change = { query: b"parse", input: Bytes::of_string(name) }
+fn sample_change(name: String) -> Bytes = key_of(name)
 
 fn first_edit(db: Database) -> Database / {abort.raise} =
   append_change(
@@ -820,10 +829,12 @@ pub fn undamaged<a | e>(go: () -> a / {fact_damage.damaged | e}) -> a / {abort.r
     fact_damage.damaged(reason) -> panic("the fact database is damaged: " ++ reason),
   }
 
+fn no_results<[r]>(db: Database) -> Map<Bytes, Bool> = Map::new()
+
 fn committed<[r]>(
   db: Database,
 ) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match commit[r](db) { Committed(_) -> (), other -> panic("the commit failed: " ++ show(other)) }
+  match commit[r](db, no_results[r]) { Committed(_) -> (), other -> panic("the commit failed: " ++ show(other)) }
 
 fn after_first(tree: fs::MemFs) -> fs::MemFs / {abort.raise} =
   fs::on_mem[abs](tree, || in_store[abs](|db: Database| committed[abs](first_edit(db)))).tree
@@ -865,13 +876,11 @@ test "a result is found by its digest in the run that wrote it and after a commi
   assert_eq(read.value, Some(b"value"))
 }
 
-test "reading the log returns the entries after an offset, and a commit with no changes adds no entry" {
+test "reading the log returns the entries after an offset" {
   let tree = fs::on_mem[abs](after_first(fs::mem_of([])), ||
     in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
-  let idle = fs::on_mem[abs](tree, ||
-    in_store[abs](|db: Database| committed[abs](append_change(db, [])))).tree;
-  assert_eq(log_stored(idle, 0).map(|e: LogEntry| e.offset), [1, 2]);
-  assert_eq(log_stored(idle, 1).map(|e: LogEntry| e.changes), [[sample_change("second")]])
+  assert_eq(log_stored(tree, 0).map(|e: LogEntry| e.offset), [1, 2]);
+  assert_eq(log_stored(tree, 1).map(|e: LogEntry| e.changes), [[sample_change("second")]])
 }
 
 test "two kinds of product read the log at independent cursors" {
@@ -890,7 +899,7 @@ test "a product that moves its cursor while an edit runs does not fail the edit'
   let raced = fs::on_mem[abs](after_first(fs::mem_of([])), ||
     in_store[abs](|db: Database| {
       move_cursor[abs](db, "tests", 1);
-      commit[abs](second_edit(db))
+      commit[abs](second_edit(db), no_results[abs])
     }));
   assert(match raced.value { Committed(_) -> true, _ -> false });
   assert_eq(value_stored(raced.tree, key_of("second")), Some(b"two"))
@@ -900,7 +909,7 @@ test "a run that started from an older snapshot cannot commit, so a snapshot nev
   let raced = fs::on_mem[abs](after_first(fs::mem_of([])), ||
     in_store[abs](|db: Database| {
       in_store[abs](|other: Database| committed[abs](second_edit(other)));
-      commit[abs](with_value(db, Facts, key_of("third"), b"three"))
+      commit[abs](with_value(db, Facts, key_of("third"), b"three"), no_results[abs])
     }));
   assert_eq(raced.value, StoreChanged);
   assert_eq(value_stored(raced.tree, key_of("third")), None)
@@ -910,7 +919,7 @@ test "a disk that fails at any write leaves the old snapshot or the whole new on
   let start = after_first(fs::mem_of([]));
   iterate(0, 1000, |n: Int| {
     let died = fs::on_mem_failing[abs](start, n, ||
-      in_store[abs](|db: Database| commit[abs](second_edit(db))));
+      in_store[abs](|db: Database| commit[abs](second_edit(db), no_results[abs])));
     let first = value_stored(died.tree, key_of("first"));
     let second = value_stored(died.tree, key_of("second"));
     assert(first != second);

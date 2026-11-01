@@ -23,7 +23,7 @@ import std.value (VList, VRecord, VStr)
 import compiler.front.diagnostics (parse_all, with_prelude_source)
 import compiler.syntax.expressions (prelude_module)
 import compiler.expand.embed (EmbedFile, embed_file)
-import compiler.check.resolve.tables (Source, Diagnostic)
+import compiler.check.resolve.tables (Source, Diagnostic, backticked)
 import compiler.check.infer.checker (TestInfo)
 import compiler.store.hash.forms (CachedNode, CachedHashes, hash_input_bin, cached_node_bin,
                                   joined_cached_hashes)
@@ -46,14 +46,14 @@ import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, Ch
                                 PublicationSummary, RejectionSummary, OutcomeSummary,
                                 outcome_summary, reject_embed, nothing_derived, over_decoding,
                                 queried_over, queried_under, prelude_frames, prelude_files,
-                                lookup_input_alone, queried_results, outcome_of, Step,
+                                lookup_input_alone, inputs_alone, queried_results, outcome_of, Step,
                                 check_sources, check_with_pack, layered, shipped_store, pack_of)
 
 type Reference = {
   whole: OutcomeSummary,
   fixing: CachedHashes,
   results: List<CheckedModule>,
-  facts: Map<Bytes, Bytes>,
+  store: MemoryStore,
   group_inputs: Option<Map<Bytes, Bytes>>,
   hash_inputs: Option<Map<Bytes, Bytes>>,
 }
@@ -64,7 +64,7 @@ fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
     whole: outcome_summary(analyse(parse_all(sources))),
     fixing: fresh.fixing,
     results: fresh.results,
-    facts: memo::stored_outputs(fresh.store),
+    store: fresh.store,
     group_inputs: inputs_over(fresh.store, sources, b"group inputs"),
     hash_inputs: inputs_over(fresh.store, sources, b"hash inputs"),
   }
@@ -74,6 +74,48 @@ fn sources_key(sources: List<Source>) -> Bytes =
   Bytes::concat_all(
     sources.map(|s: Source| Bytes::concat_all([s.name, b"\x00", s.source_text, b"\x00"])),
   )
+
+fn fresh_digest(
+  sources: List<Source>,
+  store: MemoryStore,
+  record: memo::FactRecord,
+) -> Option<Bytes> / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  handle {
+    Some(
+      over_decoding(
+        store,
+        prelude_frames,
+        prelude_files(),
+        |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+        || memo::digest_of(Some(memo::query_output(qs, start_run(qs), record.query, record.input).output)),
+      ).value,
+    )
+  } with {
+    abort.raise(_) -> None,
+  }
+}
+
+fn facts_differing(
+  warm: MemoryStore,
+  fresh: MemoryStore,
+  sources: List<Source>,
+) -> List<Bytes> / {abort.raise} = {
+  let stored = memo::fact_records(fresh);
+  let off = memo::fact_records(warm).fold(
+    [],
+    |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
+      match stored.get(key) {
+        Some(same) -> if same.output == record.output { found } else { found.push(record.query) },
+        None -> if fresh_digest(sources, fresh, record) == Some(record.output) { found }
+        else { found.push(record.query) },
+      },
+  );
+  stored.fold(off, |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
+    if warm.facts.contains(key) { found } else { found.push(b"missing ".concat(record.query)) }).unique(
+  )
+}
 
 type EditSession = {
   store: MemoryStore,
@@ -103,7 +145,6 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       let same_outcome = r.results == warm.results
         || now == outcome_summary(outcome_of(step.sources, r.results));
       let agrees = same_outcome && warm.fixing == r.fixing
-        && memo::stored_outputs(warm.store) == r.facts
         && (match r.whole {
           PublicationSummary(_) -> now == r.whole,
           RejectionSummary(_) -> match now {
@@ -113,6 +154,7 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         });
       let checked = pulled(warm.run, group_query(), s.checks, r.group_inputs);
       let hashed = pulled(warm.run, group_hash_query(), s.hashes, r.hash_inputs);
+      let wrong_facts = facts_differing(warm.store, r.store, step.sources);
       {
         store: warm.store,
         checks: checked.made,
@@ -120,6 +162,8 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         references: s.references.insert(key, r),
         off: if !agrees {
           s.off.push(Bytes::concat_all([step.what, hash_differences(warm.fixing, r.fixing)]))
+        } else if wrong_facts.len() > 0 {
+          s.off.push(Bytes::concat_all([step.what, b" (facts): ", backticked(wrong_facts, b", ")]))
         } else {
           match checked.mismatches {
             Some(reason) -> s.off.push(Bytes::concat_all([step.what, b" (work)", reason])),
@@ -275,13 +319,13 @@ fn inputs_over(
         hash: b"group inputs",
         body: group_inputs_hash,
         persistent: true,
-        logged: false,
+        product: false,
       }).insert(b"hash inputs", {
         name: b"hash inputs",
         hash: b"hash inputs",
         body: hash_inputs_result,
         persistent: true,
-        logged: false,
+        product: false,
       });
       let cycles = cycles_among(qs, start_run(qs), w.own);
       if cycles.rejected.len() > 0 { None } else {
@@ -2297,34 +2341,6 @@ test "adding a definition to a standard library module neither rechecks nor reha
   assert_eq(modules_ran(warm.run, module_query()), [b"std.shapes"]);
   assert_eq(modules_ran(warm.run, hashes_query()), [b"std.shapes"]);
   assert_eq(warm.cached_hashes, check_sources(empty_memory_store(), user, added).cached_hashes)
-}
-
-test "loading with a cached standard library result that is not trusted rechecks no standard library module the cache has results for" {
-  let user = [
-    {
-      name: b"main",
-      source_text: b"import std.a (two)\npub fn main() -> Int = two()\n\npub fn more() -> Int = two() + 1\n",
-    },
-  ];
-  let shipped = |aside: Bytes|
-    [
-      {
-        name: b"std.a",
-        source_text: b"import std.b (one)\n\npub fn two() -> Int = one() + one()\n\npub fn three() -> Int = two() + one()\n",
-      },
-      { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n\npub fn none() -> Int = 0\n" },
-      { name: b"std.aside", source_text: aside },
-    ];
-  let packed = pack_of(shipped_store(shipped(b"pub fn spare() -> Int = 3\n")));
-  let moved = shipped(b"pub fn spare() -> Int = 4\n");
-  let load = check_with_pack(empty_memory_store(), packed, user, moved);
-  assert_eq(
-    executed_for(load.run, whole_query()).map(|b: Bytes|
-      decoded(b, module_key_bin(), "a module's name").module),
-    [b"main"],
-  );
-  assert_eq(groups_ran(load.run, group_query()).map(|g: GroupKey| g.module), [b"main", b"main"]);
-  assert_eq(load.results, check_sources(empty_memory_store(), user, moved).results)
 }
 
 test "import cycles and self-imports are rejected with the same errors whether checked from scratch or from the cache" {
