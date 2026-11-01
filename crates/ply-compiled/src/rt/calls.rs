@@ -47,7 +47,7 @@ pub unsafe extern "C" fn rt_const_failed(ctx: *mut Ctx) {
         c.failed = FAILED;
         c.diagnostic = c.diagnostic.take().map(|d| {
             d.note(
-                "a `const fn` must return a value: a raise that leaves its body ends the run, \
+                "a constant must return a value: a raise that leaves its body ends the run, \
                  and no handler around the read can catch it",
             )
         });

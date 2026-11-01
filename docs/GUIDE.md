@@ -443,8 +443,8 @@ body with `let`s is a block, in braces.
 A top-level `fn` writes every parameter type and its return type (`E0126`, which shows the inferred
 type), and its effects, if it has any. A parameter the body does not use may be written `_`.
 
-**Defaults.** A parameter with a default may be left out of a call. A default must be a constant: a
-literal, or a constructor, record or list of literals (`E0121`). On a `pub fn`, a default may not
+**Defaults.** A parameter with a default may be left out of a call. A default must be a literal, a
+`const` (§4.5), or a constructor, record or list of those (`E0121`). On a `pub fn`, a default may not
 use anything its module does not export (`E0122`).
 
 **Functions of a type.** `fn Stack::size(s: Stack) -> Int` declares the function `size` of the type
@@ -453,8 +453,7 @@ in scope. It need not take a `Stack`: `Stack::empty()` can make one. Only the mo
 type may declare its functions (`E0208`), and the type must be a sum or a `new` record (`E0217`).
 
 **Modifiers.** `reuse fn` promises that every list update in the body happens in place (§6.10).
-`transparent fn` lets other packages' proofs read the body (§11). `const fn` is a value computed
-once (§4.5).
+`transparent fn` lets other packages' proofs read the body (§11).
 
 **The entry point** is `main`, of any type and effects. A program with no `main` is `E0101`, and one
 with several is `E0112`. Name a file to choose its `main`: `ply run tools/gen.ply`.
@@ -523,19 +522,28 @@ rules beyond its shape should write its codec by hand. A `Secret` is the type no
 ```ply
 type Status = { code: Int, reason: String }
 
-const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
+pub const max_redirects: Int = 5
+const statuses: Array<Status> = parsed(embed("status_codes.csv"))
+
+fn allowed(hops: Int) -> Bool = hops <= max_redirects
 ```
 
-A `const fn` is computed the first time a run reads it. Later reads in the same process return the
-same value. Use it to parse a data file once.
+A `const` names a value. Its type is required, and it is read by name, with no parentheses. Another
+module imports it like a function and reads it as `http::max_redirects`, or as `max_redirects` after
+`import http (max_redirects)`.
 
-- It takes no parameters, type parameters or effects.
-- Its body may raise and do nothing else, and must terminate. Its value must be data: no function,
-  `Task`, `Chan` or `Secret`. Anything else is `E0156`.
-- A raise in the body ends the run, whatever handlers surround the read. Test what it returns.
+A `const` is computed the first time a run reads it. Later reads in the same process return the same
+value. Use it to parse a data file once.
 
-A `const fn` of type `std.sql.Schema` is a database schema. The SQL statements of its module, and of
+- Its value may raise and do nothing else, and must terminate. It must be data: no function, `Task`,
+  `Chan` or `Secret`. Anything else is `E0156`.
+- A raise in the value ends the run, whatever handlers surround the read. Test what it returns.
+- A local variable, a parameter or a pattern variable of the same name hides it.
+
+A `const` of type `std.sql.Schema` is a database schema. The SQL statements of its module, and of
 every module that imports it, are checked against it before the program runs (§14.8).
+
+`const fn name() -> Type = value` declares the same constant, read with a call: `name()`.
 
 A plain function with no parameters that performs nothing is also computed only once per process.
 
@@ -2308,7 +2316,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | host, trace and drain flags, `--digest` |
 | `ply doc NAME [path]` | a definition's signature, doc, clauses, location, hash and the laws that use it; a type's fields or variants and functions; an effect's operations; a module's exports |
-| `ply std` | the standard library's modules. `--show [NAME]` prints a module's source; `--digest`. `--answers DIR` and `--answering` are for `ply bootstrap`. |
+| `ply std` | the standard library's modules. `--show [NAME]` prints a module's source; `--digest`. `--answers DIR` and `--answering` are for the bootstrap, which runs them on the `ply` it builds. |
 | `ply explain CODE` | what a diagnostic code means; `--all` lists every code |
 | `ply fmt [paths]` | formats files in place; `--check` changes nothing and exits 1 if a file would change; `--json` needs `--check` |
 | `ply rename --map FILE [paths]` | renames definitions, variables, fields, operations and modules (§17.6) |
@@ -2329,7 +2337,6 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |
-| `ply bootstrap [checkout]` | builds `ply` from a checkout of this repository: `--profile development\|release`, `--runtime LIBRARY`, `--out PATH`, `--identity` |
 
 ### 17.4 Reusing results
 

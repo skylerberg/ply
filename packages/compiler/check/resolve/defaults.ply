@@ -1,4 +1,6 @@
-import compiler.syntax.parsing (Span, Identifier, dummy_span, is_bare, starts_upper)
+import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, is_bare, span_to, starts_upper,
+                                synthetic_span, synthetic_span_at, role_constant_read,
+                                role_member_field, role_member_receiver)
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDefinition, SpecClause,
                               Binder, parse, is_pub)
 import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
@@ -16,9 +18,9 @@ import compiler.syntax.calls (slotted, ordered_arguments, Slot, FromDefault, Unm
                               NoSuchParameter, FilledByPosition)
 import std.list
 import compiler.check.known (none_constructor)
-import compiler.check.resolve.tables (ParsedModule, ValueSpace, ModuleBinding, Scope, Diagnostic,
-                                      Resolution, lookup_declared, find_module_binding, qualify,
-                                      error_at, list_names, ParamInfo, Parameters)
+import compiler.check.resolve.tables (ParsedModule, ValueSpace, EffectSpace, ModuleBinding, Scope,
+                                      Diagnostic, Resolution, lookup_declared, find_module_binding,
+                                      qualify, error_at, list_names, ParamInfo, Parameters)
 import compiler.check.resolve.scopes (find, method_binder)
 import compiler.check.resolve.sets (add_module_binding, concat_diagnostics)
 import compiler.check.resolve.bindings (item_binders)
@@ -31,6 +33,7 @@ type Qualifier = {
   imports: List<ModuleBinding>,
   diagnostics: List<Diagnostic>,
   rejected: Bool,
+  constants: Map<Bytes, Bool>,
 }
 
 fn rejected(qualifier: Qualifier, span: Span) -> Qualifier =
@@ -46,10 +49,30 @@ fn rejected(qualifier: Qualifier, span: Span) -> Qualifier =
         b"this runs, rather than being a value",
         [
           b"the default is copied into every call that omits the argument, so a call or a `perform` in it would run at the caller and not here",
-          b"a literal, a constructor applied to literals, a record or a list is fine",
+          b"a literal, a `const`, a constructor applied to these, a record or a list is fine",
         ],
       ),
     ),
+  }
+
+fn constant_read(span: Span, name: QName) -> Expression =
+  CallExpression({
+    span: synthetic_span(span, role_constant_read()),
+    function: NameExpression({ span: span, name: name }),
+    named: [],
+    args: [],
+    labels: [],
+  })
+
+fn names_constant(
+  r: Resolution,
+  constants: Map<Bytes, Bool>,
+  module: Int,
+  name: QName,
+) -> Bool / {abort.raise} =
+  match find(r, module, ValueSpace, name) {
+    Some(b) -> constants.contains(b.qualified),
+    None -> false,
   }
 
 type QualifyResult = { q: Qualifier, e: Expression }
@@ -61,7 +84,11 @@ fn qualify_expression(
 ) -> QualifyResult / {abort.raise} =
   match expression {
     HoleExpression(_) -> { q: qualifier, e: expression },
-    NameExpression(v) -> if !is_bare(v.name) { { q: qualifier, e: expression } } else {
+    NameExpression(v) -> if !is_bare(v.name) {
+      if names_constant(resolved, qualifier.constants, qualifier.owner, v.name) {
+        { q: qualifier, e: constant_read(v.span, v.name) }
+      } else { { q: qualifier, e: expression } }
+    } else {
       match qualifier.binders.get(v.name.name.span.site) {
         Some(binder) -> if !qualifier.params.contains(binder) { { q: qualifier, e: expression } }
         else {
@@ -120,16 +147,15 @@ fn qualify_expression(
               None ->
                 qualifier.imports.push({ binder: module, target: b.owner, span: dummy_span() }),
             };
+            let name = {
+              module: Some({ name: module, span: v.name.span }),
+              name: v.name.name,
+              span: v.name.span,
+            };
             {
               q: { ..qualifier, imports: imports },
-              e: NameExpression({
-                span: v.span,
-                name: {
-                  module: Some({ name: module, span: v.name.span }),
-                  name: v.name.name,
-                  span: v.name.span,
-                },
-              }),
+              e: if qualifier.constants.contains(b.qualified) { constant_read(v.span, name) }
+              else { NameExpression({ span: v.span, name: name }) },
             }
           },
         },
@@ -297,12 +323,16 @@ type SignatureCollection = {
 fn collect_signatures(
   resolved: Resolution,
   modules: List<ParsedModule>,
+  constants: Map<Bytes, Bool>,
 ) -> SignatureCollection / {abort.raise} =
   range(0, modules.len()).fold(
     { sigs: [], owner_imports: [], diagnostics: [] },
     |acc: SignatureCollection, m: Int|
       modules.get(m).module.items.fold(acc, |c: SignatureCollection, item: Item|
-        match item { FunctionItem(f) -> collect_signature(resolved, modules, m, c, f), _ -> c }),
+        match item {
+          FunctionItem(f) -> collect_signature(resolved, modules, m, c, f, constants),
+          _ -> c,
+        }),
   )
 
 fn collect_signature(
@@ -311,6 +341,7 @@ fn collect_signature(
   m: Int,
   c: SignatureCollection,
   definition: FnDefinition,
+  constants: Map<Bytes, Bool>,
 ) -> SignatureCollection / {abort.raise} = {
   let binders = if definition.params.any(|param: Param| param.default != None) {
     item_binders(resolved, m, FunctionItem(definition))
@@ -333,6 +364,7 @@ fn collect_signature(
               imports: [],
               diagnostics: acc.c.diagnostics,
               rejected: false,
+              constants: constants,
             },
             d,
           );
@@ -401,7 +433,37 @@ type Filler = {
 
 type FillResult = { filler: Filler, expression: Expression }
 
-type FillContext = { r: Resolution, index: Map<Bytes, Parameters> }
+type FillContext = { r: Resolution, index: Map<Bytes, Parameters>, constants: Map<Bytes, Bool> }
+
+fn is_local(filler: Filler, name: QName) -> Bool =
+  is_bare(name) && filler.binders.contains(name.name.span.site)
+
+fn reads_constant(f: FillContext, filler: Filler, name: QName) -> Bool / {abort.raise} =
+  !is_local(filler, name) && names_constant(f.r, f.constants, filler.module, name)
+
+type Perform = {
+  span: Span,
+  effect_name: QName,
+  op: Identifier,
+  resource: Option<Identifier>,
+  args: List<Expression>,
+}
+
+fn method_of_constant(p: Perform, args: List<Expression>) -> Expression =
+  CallExpression({
+    span: p.span,
+    function: FieldExpression({
+      span: synthetic_span_at(span_to(p.effect_name.span, p.op.span), p.span, role_member_field()),
+      base: constant_read(
+        synthetic_span_at(p.effect_name.span, p.span, role_member_receiver()),
+        p.effect_name,
+      ),
+      field: p.op,
+    }),
+    named: [],
+    args: args,
+    labels: match p.resource { Some(r) -> [r], None -> [] },
+  })
 
 fn fill_expression(
   f: FillContext,
@@ -429,7 +491,12 @@ fn fill_children(
       );
       { filler: filled.filler, expression: TaggedLiteralExpression({ ..t, holes: filled.holes }) }
     },
-    NameExpression(_) -> { filler: filler, expression: expression },
+    NameExpression(v) ->
+      {
+        filler: filler,
+        expression: if reads_constant(f, filler, v.name) { constant_read(v.span, v.name) }
+        else { expression },
+      },
     HoleExpression(_) -> { filler: filler, expression: expression },
     InvalidExpression(_) -> { filler: filler, expression: expression },
     BinaryExpression(b) -> {
@@ -613,15 +680,12 @@ fn fill_children(
     },
     PerformExpression(p) -> {
       let o = fill_expressions(f, filler, p.args);
+      let declared = find(f.r, filler.module, EffectSpace, p.effect_name);
       {
         filler: o.filler,
-        expression: PerformExpression({
-          span: p.span,
-          effect_name: p.effect_name,
-          op: p.op,
-          resource: p.resource,
-          args: o.xs,
-        }),
+        expression: if declared == None && reads_constant(f, filler, p.effect_name) {
+          method_of_constant(p, o.xs)
+        } else { PerformExpression({ ..p, args: o.xs }) },
       }
     },
     HandleExpression(h) -> {
@@ -917,6 +981,23 @@ fn fill_slots(filler: Filler, call: Call, signature: Parameters) -> FillResult /
   }
 }
 
+fn fill_params(
+  f: FillContext,
+  filler: Filler,
+  params: List<Param>,
+) -> { filler: Filler, xs: List<Param> } / {abort.raise} =
+  params.fold(
+    { filler: filler, xs: [] },
+    |acc: { filler: Filler, xs: List<Param> }, param: Param|
+      match param.default {
+        None -> { ..acc, xs: acc.xs.push(param) },
+        Some(d) -> {
+          let o = fill_expression(f, acc.filler, d);
+          { filler: o.filler, xs: acc.xs.push({ ..param, default: Some(o.expression) }) }
+        },
+      },
+  )
+
 fn fill_item(
   f: FillContext,
   filler: Filler,
@@ -924,8 +1005,9 @@ fn fill_item(
 ) -> { filler: Filler, it: Item } / {abort.raise} =
   match item {
     FunctionItem(d) -> {
+      let params = fill_params(f, filler, d.params);
       let spec: { filler: Filler, xs: List<SpecClause> } = d.spec.fold(
-        { filler: filler, xs: [] },
+        { filler: params.filler, xs: [] },
         |acc: { filler: Filler, xs: List<SpecClause> }, clause: SpecClause| {
           let o = fill_expression(f, acc.filler, clause.expression);
           { filler: o.filler, xs: acc.xs.push({ ..clause, expression: o.expression }) }
@@ -945,7 +1027,7 @@ fn fill_item(
           visibility: d.visibility,
           name: d.name,
           generics: d.generics,
-          params: d.params,
+          params: params.xs,
           ret: d.ret,
           effects: d.effects,
           constraints: d.constraints,
@@ -1000,12 +1082,25 @@ pub type ResolvedProgram = {
   diagnostics: List<Diagnostic>,
 }
 
+fn constants_read_by_name(modules: List<ParsedModule>) -> Map<Bytes, Bool> =
+  modules.fold(Map::new(), |found: Map<Bytes, Bool>, m: ParsedModule|
+    m.module.items.fold(found, |acc: Map<Bytes, Bool>, item: Item|
+      match item {
+        FunctionItem(d) -> match d.constant {
+          Some(c) -> if c.read_by_name { acc.insert(qualify(m.name, d.name.name), true) }
+          else { acc },
+          None -> acc,
+        },
+        _ -> acc,
+      }))
+
 pub fn fill_defaults(
   r: Resolution,
   modules: List<ParsedModule>,
   diagnostics: List<Diagnostic>,
 ) -> ResolvedProgram / {abort.raise} = {
-  let c = collect_signatures(r, modules);
+  let constants = constants_read_by_name(modules);
+  let c = collect_signatures(r, modules, constants);
   let r2 = c.owner_imports.fold(
     r,
     |acc: Resolution, oi: { module: Int, binder: Bytes, target: Int }|
@@ -1018,6 +1113,7 @@ pub fn fill_defaults(
         Some(_) -> acc,
         None -> acc.insert(signature.name, signature),
       }),
+    constants: constants,
   };
   let walked = range(0, modules.len()).fold(
     { resolution: r2, modules: [], diagnostics: concat_diagnostics(diagnostics, c.diagnostics) },

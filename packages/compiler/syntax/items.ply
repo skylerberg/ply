@@ -118,6 +118,8 @@ pub fn result_name() -> Bytes = b"result"
 
 pub type ReturnsClause = | ReturnsFresh(Span) | ReturnsParam(Identifier)
 
+pub type ConstantMark = { span: Span, read_by_name: Bool }
+
 pub type FnDefinition = {
   visibility: Visibility,
   name: Identifier,
@@ -130,7 +132,7 @@ pub type FnDefinition = {
   returns: Option<ReturnsClause>,
   reuse: Option<Span>,
   transparent: Option<Span>,
-  constant: Option<Span>,
+  constant: Option<ConstantMark>,
   decreases: Option<Expression>,
   body: Expression,
   doc: Option<Doc>,
@@ -473,6 +475,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
     || at_const_start(input, parser)
+    || at_const_declaration(input, parser)
     || at_opaque_start(input, parser)
     || at_extern_start(input, parser)
     || at_instance_start(input, parser)
@@ -525,6 +528,11 @@ pub fn at_transparent_start(input: Input, parser: Parser) -> Bool =
 
 pub fn at_const_start(input: Input, parser: Parser) -> Bool =
   at_identifier_text(input, parser, b"const") && token_kind_at(input, parser, 1) == keyword_fn()
+
+pub fn at_const_declaration(input: Input, parser: Parser) -> Bool =
+  at_identifier_text(input, parser, b"const")
+    && token_is_identifier(token_kind_at(input, parser, 1))
+    && token_kind_at(input, parser, 2) == token_colon()
 
 pub fn at_opaque_start(input: Input, parser: Parser) -> Bool =
   at_identifier_text(input, parser, b"opaque") && token_kind_at(input, parser, 1) == keyword_type()
@@ -970,7 +978,7 @@ pub fn fn_definition(
   vis: Visibility,
   reuse: Option<Span>,
   transparent: Option<Span>,
-  constant: Option<Span> = None,
+  constant: Option<ConstantMark> = None,
 ) -> Result<ParseOutput<FnDefinition>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = fn_name(input, st.parser, b"a function name after `fn`")?;
@@ -1015,6 +1023,31 @@ pub fn fn_definition(
       decreases: dec,
       body: body,
       doc: None,
+      span: span_to(st.node, expression_span(body)),
+    },
+  })
+}
+
+fn const_declaration(
+  input: Input,
+  parser: Parser,
+  vis: Visibility,
+) -> Result<ParseOutput<FnDefinition>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, node: name } = expect_identifier(input, st.parser, b"a name after `const`")?;
+  let { parser, .. } = expect(input, parser, token_colon(), b"`:` before the constant's type")?;
+  let { parser, node: written } = ty(input, parser)?;
+  let { parser, .. } = expect(input, parser, token_eq(), b"`=` before the constant's value")?;
+  let { parser, node: body } = expression(input, parser)?;
+  Ok({
+    parser: parser,
+    node: {
+      ..no_fn(),
+      visibility: vis,
+      name: name,
+      ret: Some(written),
+      constant: Some({ span: st.node, read_by_name: true }),
+      body: body,
       span: span_to(st.node, expression_span(body)),
     },
   })
@@ -2216,6 +2249,7 @@ pub fn reject_pub(
 fn at_fn_start(input: Input, parser: Parser) -> Bool =
   at_transparent_start(input, parser) || at_reuse_start(input, parser)
     || at_const_start(input, parser)
+    || at_const_declaration(input, parser)
     || at_token(input, parser, keyword_fn())
 
 fn written_fn(
@@ -2234,8 +2268,9 @@ fn written_fn(
     fn_definition(input, a.parser, vis, Some(a.node), None)
   } else if at_const_start(input, parser) {
     let a = advance(input, parser);
-    fn_definition(input, a.parser, vis, None, None, Some(a.node))
-  } else { fn_definition(input, parser, vis, None, None) }
+    fn_definition(input, a.parser, vis, None, None, Some({ span: a.node, read_by_name: false }))
+  } else if at_const_declaration(input, parser) { const_declaration(input, parser, vis) }
+  else { fn_definition(input, parser, vis, None, None) }
 
 pub fn item_at(
   input: Input,
@@ -3001,6 +3036,8 @@ fn piece_kind(input: Input, here: Parser, last: Int) -> ItemKind / {abort.raise}
       Some(n) -> PrivateItem([n]),
       None -> ExportedItem,
     }
+  } else if at_const_declaration(input, here) {
+    match token_kind_at(input, here, 1) { Identifier(n) -> PrivateItem([n]), _ -> ExportedItem }
   } else { ExportedItem }
 }
 
@@ -3193,7 +3230,7 @@ pub fn dump_fn(definition: FnDefinition) -> Bytes / {abort.raise} =
       Some(e) -> dump_word(b"decreases").concat(dump_expression(e)),
       None -> b"",
     },
-    match definition.constant { Some(s) -> dump_node(s, b"cst"), None -> b"" },
+    match definition.constant { Some(c) -> dump_node(c.span, b"cst"), None -> b"" },
     dump_expression(definition.body),
     dump_doc_if(definition.doc),
   ])
@@ -3501,6 +3538,18 @@ test "a const fn keeps the marker's span, and const stays a name elsewhere" {
   assert(!named.contains(":cst;"));
   let field = dump(b"fn f(r: { const: Int }) -> Int = r.const\n");
   assert(!field.contains(":cst;"))
+}
+
+test "a `const` declaration is a constant with a name, a type and a value, and no parameter list" {
+  let declared = dump(b"pub const limit: Int = 40\n");
+  assert(declared.contains("4:9:cst;"));
+  assert(declared.contains("%pub;"));
+  assert(declared.contains("10:15:ident;"));
+  let missing = dump(b"const limit = 40\n");
+  assert(missing.contains("!E"));
+  assert(!missing.contains(":cst;"));
+  let typeless = dump(b"const limit: = 40\n");
+  assert(typeless.contains("!E"))
 }
 
 test "a `returns` clause names `fresh` or a parameter, and naming anything else is rejected" {
