@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/stage0.sh [DEST]: the `ply` CI last published from main for this machine, written to DEST
-# (`target/stage0/ply` by default): what `ply bootstrap` runs on in a checkout with no `ply` yet, and
+# (`target/stage0/ply` by default): what a bootstrap runs on in a checkout with no `ply` yet, and
 # what reads `ply.work` (`ply work`) where a job has built none.
 set -euo pipefail
 dest=${1:-target/stage0/ply}

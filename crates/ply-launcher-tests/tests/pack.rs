@@ -1,4 +1,4 @@
-//! The pack a native program carries after its code, read back as `ply bootstrap` lays it out.
+//! The pack a native program carries after its code, read back as a bootstrap lays it out.
 
 use std::io::Write;
 

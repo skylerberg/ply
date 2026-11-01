@@ -899,54 +899,67 @@ fn loaded_built(
 ) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, MachineAccess, process.err[proc], env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, fs.write[abs], Derives, abort.raise} = {
   let asked = time.elapsed_ms();
   let front = loaded_analysis(timed, view);
-  let emitted = units::whole_library(front, options.profile);
   let offered = entries::narrowed_to(entries::of_front(front), flags.paths);
-  let runnable = entries::runnable_of(front);
-  let rejected = |diagnostics: List<Diagnostic>|
-    Err({ diagnostics: diagnostics, places: timed.program.source_texts, artifact: None });
-  let loaded = match emitted {
-    Err(diagnostics) -> rejected(diagnostics),
-    Ok(library) -> match entering::machine.open(library) {
-      Err(reason) -> rejected([machine::unit_load_error(reason)]),
-      Ok(unit) ->
-        Ok({
-          target: program_of(
-            {
-              root: machine::project_root(root_of(flags).machine),
-              files: front.files.map(|f: SourceFile| f.path),
-              places: front.files.map(|f: SourceFile| { path: f.path, text: f.text }),
-            },
-            offered.mains,
-            offered.modules,
-          ),
-          unit: unit,
-          runnable: runnable,
-        }),
+  let target = program_of(
+    {
+      root: machine::project_root(root_of(flags).machine),
+      files: front.files.map(|f: SourceFile| f.path),
+      places: front.files.map(|f: SourceFile| { path: f.path, text: f.text }),
     },
-  };
-  let l = {
-    reused: false,
-    key: key.hex_of(),
-    read_ms: timed.read_ms,
-    front_end_ms: timed.front_end_ms,
-    store_ms: timed.store_ms,
-    load_ms: time.elapsed_ms() - asked,
-  };
-  match ((loaded, emitted)) {
-    (Ok(_), Ok(library)) -> {
-      let _ = cache_command(
-        flags.paths,
-        project,
-        key,
-        timed.program,
-        entries::encode_load(offered, library, front.files, runnable),
+    offered.mains,
+    offered.modules,
+  );
+  let timing = ||
+    {
+      reused: false,
+      key: key.hex_of(),
+      read_ms: timed.read_ms,
+      front_end_ms: timed.front_end_ms,
+      store_ms: timed.store_ms,
+      load_ms: time.elapsed_ms() - asked,
+    };
+  match entry_of(target) {
+    Err(d) -> with_timing(style, flags, Some(timing()), || entry_error_output(style, target, d)),
+    Ok(entry_name) -> {
+      let emitted = units::entered_library(
+        front,
+        view.frame.hashes,
+        entered_by(entry_name, options),
+        options.profile,
       );
-      ()
+      let runnable = entries::runnable_of(front);
+      let rejected = |diagnostics: List<Diagnostic>|
+        Err({ diagnostics: diagnostics, places: timed.program.source_texts, artifact: None });
+      let loaded = match emitted {
+        Err(diagnostics) -> rejected(diagnostics),
+        Ok(library) -> match entering::machine.open(library) {
+          Err(reason) -> rejected([machine::unit_load_error(reason)]),
+          Ok(unit) -> Ok({ target: target, unit: unit, runnable: runnable }),
+        },
+      };
+      let l = timing();
+      match ((loaded, emitted)) {
+        (Ok(_), Ok(library)) -> {
+          let _ = cache_command(
+            flags.paths,
+            project,
+            key,
+            timed.program,
+            entries::encode_load(offered, library, front.files, runnable),
+          );
+          ()
+        },
+        _ -> (),
+      };
+      run_loaded(style, flags, options, loaded, Some(l))
     },
-    _ -> (),
-  };
-  run_loaded(style, flags, options, loaded, Some(l))
+  }
 }
+
+fn entered_by(entry_name: String, options: Options) -> List<Bytes> =
+  [entry_name].concat(match options.config.schema { Some(s) -> [s], None -> [] }).map(
+    |name: String| Bytes::of_string(name),
+  )
 
 fn run_loaded(
   style: Style,
@@ -982,12 +995,20 @@ fn run_target<| e>(
 ) -> CommandOutput / {process.err[proc], abort.raise | e} =
   match target {
     Err(reason) -> load_error_output(style, reason),
-    Ok(t) -> match l {
-      None -> choose_entry(style, flags, t, config, bind),
-      Some(loading) -> {
-        if flags.explain && !flags.json { process.err[proc](load_timing_line(style, loading)) };
-        with_load_timing(flags, loading, choose_entry(style, flags, t, config, bind))
-      },
+    Ok(t) -> with_timing(style, flags, l, || choose_entry(style, flags, t, config, bind)),
+  }
+
+fn with_timing<| e>(
+  style: Style,
+  flags: Flags,
+  l: Option<LoadTiming>,
+  output: () -> CommandOutput / e,
+) -> CommandOutput / {process.err[proc], abort.raise | e} =
+  match l {
+    None -> output(),
+    Some(loading) -> {
+      if flags.explain && !flags.json { process.err[proc](load_timing_line(style, loading)) };
+      with_load_timing(flags, loading, output())
     },
   }
 
@@ -1613,6 +1634,15 @@ test "a walk places its modules, the root's first, and its manifests apart" {
   let w: ProjectSources = project_sources(project);
   assert_eq(w.modules.map(|p: SourceText| p.path), ["main.ply", "util.ply", "/w/lib/deep.ply"]);
   assert_eq(w.manifests.map(|p: SourceText| p.path), ["ply.pkg", "/w/lib/ply.pkg"])
+}
+
+test "a run enters its entry, and the function `--config-schema` names" {
+  let options = machine::default_options();
+  assert_eq(entered_by("m.main", options), [b"m.main"]);
+  assert_eq(
+    entered_by("m.main", { ..options, config: { ..options.config, schema: Some("m.spec") } }),
+    [b"m.main", b"m.spec"],
+  )
 }
 
 test "a run of sources is asked under its paths, `--config-schema` and `--profile`, and no flag it reads afresh" {

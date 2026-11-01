@@ -2315,7 +2315,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | host, trace and drain flags, `--digest` |
 | `ply doc NAME [path]` | a definition's signature, doc, clauses, location, hash and the laws that use it; a type's fields or variants and functions; an effect's operations; a module's exports |
-| `ply std` | the standard library's modules. `--show [NAME]` prints a module's source; `--digest`. `--answers DIR` and `--answering` are for `ply bootstrap`. |
+| `ply std` | the standard library's modules. `--show [NAME]` prints a module's source; `--digest`. `--answers DIR` and `--answering` are for the bootstrap, which runs them on the `ply` it builds. |
 | `ply explain CODE` | what a diagnostic code means; `--all` lists every code |
 | `ply fmt [paths]` | formats files in place; `--check` changes nothing and exits 1 if a file would change; `--json` needs `--check` |
 | `ply rename --map FILE [paths]` | renames definitions, variables, fields, operations and modules (§17.6) |
@@ -2336,7 +2336,6 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |
-| `ply bootstrap [checkout]` | builds `ply` from a checkout of this repository: `--profile development\|release`, `--runtime LIBRARY`, `--out PATH`, `--identity` |
 
 ### 17.4 Reusing results
 

@@ -1,6 +1,6 @@
 //! What a native Ply program carries after its code: the shipped modules a load of another program
 //! compiles against, their results below [`ANSWERS`], and the program's own front end, each a
-//! file keyed by its path. `ply bootstrap` appends one to every program it links; the program maps
+//! file keyed by its path. a bootstrap appends one to `ply`; the program maps
 //! it back at startup.
 //!
 //! A pack is the files' bytes, then a table of `(path, offset, length, digest)` ascending by path,
@@ -45,7 +45,7 @@ impl Pack {
     pub fn of_binary(binary: &Path) -> Result<Option<Pack>, String> {
         let file = std::fs::File::open(binary)
             .map_err(|e| format!("`{}` could not be opened: {e}", binary.display()))?;
-        // SAFETY: a binary is not written while it runs; `ply bootstrap` lands a new one by a rename.
+        // SAFETY: a binary is not written while it runs; a bootstrap lands a new one by a rename.
         let mapped = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| format!("`{}` could not be mapped: {e}", binary.display()))?;
         Pack::of_mapped(mapped)

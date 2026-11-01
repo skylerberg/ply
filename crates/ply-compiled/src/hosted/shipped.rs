@@ -4,7 +4,7 @@
 
 use super::{Deterministic, granted, text_at};
 use crate::c::{MachineNative, machine_native};
-use crate::entry::{self, Ended, Opened, Run};
+use crate::entry::{self, Opened};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
 use ply_host::native::{found, int, parts};
@@ -221,18 +221,9 @@ pub unsafe extern "C" fn rt_shipped_entered(
             }
         };
         let arguments = unsafe { borrowed(ap, an) }.to_vec();
-        let run = Run {
-            timeout_ms: u64::try_from(timeout_ms.0).unwrap_or(0),
-            ..Run::unbounded()
-        };
-        let returned = entry::on_program_thread(|| {
-            match entry::enter(&opened, &root, arguments, &run, None, None).ended {
-                Ended::Returned(bytes) => Some(bytes),
-                _ => None,
-            }
-        })
-        .flatten();
-        c.given(found(returned))
+        let timeout_ms = u64::try_from(timeout_ms.0).unwrap_or(0);
+        let returned = entry::run_to_result(&opened, &root, arguments, timeout_ms);
+        c.given(found(returned.ok()))
     })
 }
 
