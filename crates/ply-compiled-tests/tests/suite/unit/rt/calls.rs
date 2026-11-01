@@ -18,7 +18,7 @@ fn boxed(context: *mut Context, n: Word) -> Word {
     w
 }
 
-fn held(w: Word) -> Word {
+fn first_word(w: Word) -> Word {
     unsafe { *(w as *const Word).byte_add(HEADER) }
 }
 
@@ -32,13 +32,13 @@ fn let_go(context: *mut Context, w: Word) {
     }
 }
 
-unsafe extern "C" fn keep_box(context: *mut Context, w: Word) -> Word {
+unsafe extern "C" fn copy_to_immortal_box(context: *mut Context, w: Word) -> Word {
     let kept = unsafe { helper::<Alloc>("rt_alloc_kept")(context, BOX) };
-    unsafe { *(kept as *mut Word).byte_add(HEADER) = held(w) };
+    unsafe { *(kept as *mut Word).byte_add(HEADER) = first_word(w) };
     kept
 }
 
-unsafe extern "C" fn keeps_nothing(_context: *mut Context, _w: Word) -> Word {
+unsafe extern "C" fn returns_zero(_context: *mut Context, _w: Word) -> Word {
     0
 }
 
@@ -63,17 +63,17 @@ unsafe extern "C" fn forty_two(context: *mut Context, _args: *const Word) -> Wor
 fn the_first_read_evaluates_and_caches_and_each_later_one_returns_the_copy() {
     let mut context = defining(forty_two);
     let c: *mut Context = &mut context;
-    let first = read(c, keep_box);
+    let first = read(c, copy_to_immortal_box);
     assert_eq!(
-        (held(first), count(first)),
+        (first_word(first), count(first)),
         (42, 1),
         "the evaluation's own value"
     );
-    let second = read(c, keep_box);
-    let third = read(c, keep_box);
+    let second = read(c, copy_to_immortal_box);
+    let third = read(c, copy_to_immortal_box);
     assert_eq!(FORTY_TWOS.load(Ordering::SeqCst), 1, "evaluated once");
     assert_ne!(second, first);
-    assert_eq!((held(second), count(second)), (42, IMMORTAL));
+    assert_eq!((first_word(second), count(second)), (42, IMMORTAL));
     assert_eq!(third, second, "every later read returns the one copy kept");
     let_go(c, first);
     assert_eq!(
@@ -95,8 +95,8 @@ unsafe extern "C" fn seven(context: *mut Context, _args: *const Word) -> Word {
 fn a_constant_whose_cache_check_rejects_its_value_is_not_cached_and_is_recomputed_on_each_read() {
     let mut context = defining(seven);
     let c: *mut Context = &mut context;
-    let first = read(c, keeps_nothing);
-    let second = read(c, keeps_nothing);
+    let first = read(c, returns_zero);
+    let second = read(c, returns_zero);
     assert_eq!(SEVENS.load(Ordering::SeqCst), 2);
     assert_eq!((count(first), count(second)), (1, 1));
     assert_eq!(context.tables.memoized(0), None);
@@ -120,15 +120,15 @@ unsafe extern "C" fn nine_after_a_failure(context: *mut Context, _args: *const W
 fn an_evaluation_that_fails_returns_0_caches_nothing_and_the_next_read_evaluates_again() {
     let mut context = defining(nine_after_a_failure);
     let c: *mut Context = &mut context;
-    assert_eq!(read(c, keep_box), 0);
+    assert_eq!(read(c, copy_to_immortal_box), 0);
     assert_eq!(context.failed, 1, "the context as the evaluation left it");
     assert_eq!(context.tables.memoized(0), None);
     context.failed = 0;
-    let evaluated = read(c, keep_box);
-    let kept = read(c, keep_box);
+    let evaluated = read(c, copy_to_immortal_box);
+    let kept = read(c, copy_to_immortal_box);
     assert_eq!(NINES.load(Ordering::SeqCst), 2);
-    assert_eq!((held(evaluated), count(evaluated)), (9, 1));
-    assert_eq!((held(kept), count(kept)), (9, IMMORTAL));
+    assert_eq!((first_word(evaluated), count(evaluated)), (9, 1));
+    assert_eq!((first_word(kept), count(kept)), (9, IMMORTAL));
     let_go(c, evaluated);
     context.end();
 }
@@ -137,7 +137,10 @@ fn an_evaluation_that_fails_returns_0_caches_nothing_and_the_next_read_evaluates
 fn reading_a_definition_index_outside_the_code_table_fails_with_a_diagnostic() {
     let mut context = defining(seven);
     let c: *mut Context = &mut context;
-    assert_eq!(unsafe { helper::<Memo>("rt_memo")(c, 3, keep_box) }, 0);
+    assert_eq!(
+        unsafe { helper::<Memo>("rt_memo")(c, 3, copy_to_immortal_box) },
+        0
+    );
     let said = context.take_failure().expect("a diagnostic").message;
     assert!(said.contains("definition 3 of a code table of 1"), "{said}");
     context.end();
@@ -169,8 +172,8 @@ fn contexts_reading_one_definition_at_once_each_return_it_and_one_copy_is_cached
                 mine.begin();
                 let c: *mut Context = &mut mine;
                 barrier.wait();
-                let w = read(c, keep_box);
-                let returned = held(w);
+                let w = read(c, copy_to_immortal_box);
+                let returned = first_word(w);
                 let_go(c, w);
                 assert_eq!(mine.heap.live(), 0);
                 mine.end();
@@ -184,7 +187,7 @@ fn contexts_reading_one_definition_at_once_each_return_it_and_one_copy_is_cached
     let kept = context.tables.memoized(0).expect("a copy was kept");
     let c: *mut Context = &mut context;
     assert_eq!(
-        read(c, keep_box),
+        read(c, copy_to_immortal_box),
         kept,
         "a later read returns the copy kept first"
     );
@@ -224,7 +227,7 @@ fn the_scheduler_blocks_stay_separate_from_the_program_blocks_at_any_nesting_dep
 }
 
 fn read_const(context: *mut Context) -> Word {
-    unsafe { helper::<Memo>("rt_const")(context, 0, keep_box) }
+    unsafe { helper::<Memo>("rt_const")(context, 0, copy_to_immortal_box) }
 }
 
 static TENS: AtomicUsize = AtomicUsize::new(0);
@@ -242,8 +245,8 @@ fn a_constant_is_evaluated_once_and_every_later_read_returns_the_copy() {
     let second = read_const(c);
     let third = read_const(c);
     assert_eq!(TENS.load(Ordering::SeqCst), 1, "evaluated once");
-    assert_eq!(held(first), 10);
-    assert_eq!((held(second), count(second)), (10, IMMORTAL));
+    assert_eq!(first_word(first), 10);
+    assert_eq!((first_word(second), count(second)), (10, IMMORTAL));
     assert_eq!(third, second);
     let_go(c, first);
     context.end();

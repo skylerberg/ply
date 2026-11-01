@@ -16,9 +16,9 @@ fn every_declared_helper_has_an_address() {
 
 #[test]
 fn a_native_function_signature_is_derived_from_its_rust_function_type() {
-    use ply_compiled::emitted::{Handed, PlyType};
+    use ply_compiled::emitted::{OwnedWord, PlyType};
     use ply_compiled::heap::Word;
-    use ply_compiled::native::MachineType::{self, Address, Handed as Moved, I64, Type, Words};
+    use ply_compiled::native::MachineType::{self, Address, I64, OwnedWord as Moved, Type, Words};
     use ply_compiled::native::{Native, Signature};
     use ply_compiled::rt::Context;
     let of = |params: &'static [MachineType], result| Signature { params, result };
@@ -34,7 +34,7 @@ fn a_native_function_signature_is_derived_from_its_rust_function_type() {
         *mut Context,
         ply_compiled::native::Address,
         ply_compiled::native::I64,
-        Handed,
+        OwnedWord,
         *const PlyType,
     ) -> ply_compiled::native::I64;
     assert_eq!(

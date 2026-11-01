@@ -81,7 +81,7 @@ fn hosted<R: Copy>(
     native: &'static str,
     op: &'static str,
     determinism: Determinism,
-    reach: OperationTarget,
+    target: OperationTarget,
     rejected: R,
     result: impl FnOnce(&mut Context, &ProcessHost) -> Result<R, Diagnostic>,
 ) -> R {
@@ -92,7 +92,7 @@ fn hosted<R: Copy>(
         };
         let returned = match found {
             Some(host) => result(c, &host),
-            None => Err(withheld(op, reach, c.site())),
+            None => Err(withheld(op, target, c.site())),
         };
         returned.unwrap_or_else(|d| {
             c.fail(d);

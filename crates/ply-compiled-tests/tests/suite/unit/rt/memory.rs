@@ -1,5 +1,5 @@
 use crate::bare::{helper, new_context};
-use crate::unit::heap::Holding;
+use crate::unit::heap::TextNative;
 use crate::unit::ignored_test_command;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{HEADER, IMMORTAL, SHARED, Word, object, word_at};
@@ -144,7 +144,7 @@ fn a_shared_block_used_by_many_threads_is_freed_only_by_the_last_thread_to_relea
 fn freeing_a_native_object_also_drops_the_value_it_contains() {
     let mut context = new_context();
     let held: Arc<str> = Arc::from("held");
-    let b = context.heap.native(Box::new(Holding(Arc::clone(&held))));
+    let b = context.heap.native(Box::new(TextNative(Arc::clone(&held))));
     let free_handle: WordConsumer = helper("rt_handle_free");
     unsafe { free_handle(&mut context, b) };
     assert_eq!(count(b), 0);
@@ -175,8 +175,12 @@ fn a_freed_block_has_a_reference_count_of_zero_however_it_was_freed() {
     let (mut mine, mut other) = (new_context(), new_context());
     let sized = alloc(&mut mine, 32);
     let elsewhere = alloc(&mut mine, 32);
-    let given_back = mine.heap.native(Box::new(Holding(Arc::from("given back"))));
-    let released = mine.heap.native(Box::new(Holding(Arc::from("released"))));
+    let given_back = mine
+        .heap
+        .native(Box::new(TextNative(Arc::from("given back"))));
+    let released = mine
+        .heap
+        .native(Box::new(TextNative(Arc::from("released"))));
     free(&mut mine, sized, 32);
     free(&mut other, elsewhere, 32);
     let free_handle: WordConsumer = helper("rt_handle_free");

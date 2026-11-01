@@ -1,7 +1,7 @@
 use crate::bare::{helper, new_context};
 use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
-use ply_compiled::emitted::{Handed, PlyType};
+use ply_compiled::emitted::{OwnedWord, PlyType};
 use ply_compiled::heap::{Word, imm};
 use ply_compiled::native::Returned;
 use ply_compiled::rt::Context;
@@ -522,7 +522,7 @@ fn copying_out_fewer_bytes_than_were_encoded_fails_with_a_diagnostic() {
 #[test]
 fn the_handed_type_returned_from_helpers_is_a_plain_machine_word_like_compiled_code_uses() {
     assert_eq!(
-        unsafe { std::mem::transmute::<Handed, Word>(<Handed as Returned>::of(5)) },
+        unsafe { std::mem::transmute::<OwnedWord, Word>(<OwnedWord as Returned>::of(5)) },
         5
     );
 }

@@ -64,7 +64,7 @@ impl FrameObject {
 #[repr(C)]
 struct RtFrame<const N: usize> {
     h: PlyFrame,
-    held: [FrameObject; N],
+    objects: [FrameObject; N],
 }
 
 unsafe extern "C" fn release_slots<const N: usize>(
@@ -89,7 +89,7 @@ pub unsafe fn call_recording_slots<const N: usize, R>(
             previous: below,
             each: release_slots::<N>,
         },
-        held,
+        objects: held,
     };
     let me = (&raw mut record).cast::<PlyFrame>();
     if !below.is_null() {
@@ -101,5 +101,5 @@ pub unsafe fn call_recording_slots<const N: usize, R>(
             (*context).frames = (*me).previous;
         }
     }
-    (r, record.held)
+    (r, record.objects)
 }

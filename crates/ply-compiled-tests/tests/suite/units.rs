@@ -121,7 +121,7 @@ pub struct Taken {
 }
 
 pub struct Laid {
-    says: Exports,
+    exports: Exports,
     pub lambdas: Vec<String>,
     pub taken: Vec<Taken>,
     pub constants: Vec<String>,
@@ -131,19 +131,19 @@ impl Deref for Laid {
     type Target = Exports;
 
     fn deref(&self) -> &Exports {
-        &self.says
+        &self.exports
     }
 }
 
 impl DerefMut for Laid {
     fn deref_mut(&mut self) -> &mut Exports {
-        &mut self.says
+        &mut self.exports
     }
 }
 
 pub fn exports_of(defs: &[Def]) -> Laid {
     Laid {
-        says: Exports {
+        exports: Exports {
             helpers: (helpers().iter())
                 .map(|h| HelperShape {
                     name: h.name.to_string(),
@@ -195,7 +195,7 @@ pub fn text(defs: &[Def], exports: &Laid) -> String {
         constants: (exports.constants.iter())
             .map(|name| (name.clone(), slot_of(name)))
             .collect(),
-        ..exports.says.clone()
+        ..exports.exports.clone()
     };
     out.push_str("const char ply_exports[] =\n");
     for line in said.encode().lines() {

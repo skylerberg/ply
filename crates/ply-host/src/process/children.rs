@@ -392,7 +392,7 @@ struct State {
 }
 
 impl State {
-    fn held(&mut self, stream: Stream) -> &mut CollectedStream {
+    fn stream_buffer(&mut self, stream: Stream) -> &mut CollectedStream {
         match stream {
             Stream::Out => &mut self.out,
             Stream::Err => &mut self.err,
@@ -400,16 +400,16 @@ impl State {
     }
 
     fn take(&mut self, stream: Stream, chunk: &[u8], sink: &OutputSink) {
-        let held = self.held(stream);
+        let held = self.stream_buffer(stream);
         held.written += chunk.len();
         match held.collect {
             OutputHandling::Nothing => {}
             OutputHandling::Keep => {
-                held.hold(chunk);
+                held.append(chunk);
             }
             OutputHandling::Lines => {
                 let from = held.bytes.len();
-                if held.hold(chunk) {
+                if held.append(chunk) {
                     let ended = take_complete_lines(&mut held.bytes, from);
                     held.queued += ended.iter().map(Vec::len).sum::<usize>();
                     self.lines
@@ -427,7 +427,7 @@ impl State {
     }
 
     fn close(&mut self, stream: Stream, sink: &OutputSink) {
-        let held = self.held(stream);
+        let held = self.stream_buffer(stream);
         held.open = false;
         if held.bytes.is_empty() {
             return;
@@ -445,7 +445,7 @@ impl State {
 
     fn next_line(&mut self) -> Option<String> {
         let (stream, line) = self.lines.pop_front()?;
-        self.held(stream).queued -= line.len();
+        self.stream_buffer(stream).queued -= line.len();
         Some(text_of(&line))
     }
 
@@ -462,8 +462,8 @@ impl State {
     }
 
     fn collected(&mut self, stream: Stream) -> Vec<u8> {
-        match self.held(stream).collect {
-            OutputHandling::Keep => std::mem::take(&mut self.held(stream).bytes),
+        match self.stream_buffer(stream).collect {
+            OutputHandling::Keep => std::mem::take(&mut self.stream_buffer(stream).bytes),
             OutputHandling::Lines => {
                 let mut unread = Vec::new();
                 self.lines.retain(|(from, line)| {
@@ -474,7 +474,7 @@ impl State {
                         true
                     }
                 });
-                self.held(stream).queued = 0;
+                self.stream_buffer(stream).queued = 0;
                 unread
             }
             OutputHandling::Nothing | OutputHandling::Forward(_) => Vec::new(),
@@ -511,7 +511,7 @@ impl CollectedStream {
         }
     }
 
-    fn hold(&mut self, chunk: &[u8]) -> bool {
+    fn append(&mut self, chunk: &[u8]) -> bool {
         if self.overflowed || self.queued + self.bytes.len() + chunk.len() > MAX_CAPTURE_BYTES {
             self.overflowed = true;
             return false;

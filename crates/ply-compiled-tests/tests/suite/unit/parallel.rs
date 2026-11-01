@@ -1,5 +1,5 @@
 use crate::bare::{helper, new_context};
-use ply_compiled::emitted::{Handed, PlyFunctionDescriptor};
+use ply_compiled::emitted::{OwnedWord, PlyFunctionDescriptor};
 use ply_compiled::heap::{HEADER, SHARED, Word};
 use ply_compiled::rt::Context;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,7 +24,7 @@ fn block(context: *mut Context, word: Word) -> Word {
     alloc(context, BLOCK, &[word])
 }
 
-fn held(w: Word) -> Word {
+fn first_word(w: Word) -> Word {
     unsafe { *(w as *const Word).byte_add(HEADER) }
 }
 
@@ -32,13 +32,15 @@ fn free(context: *mut Context, w: Word) {
     unsafe { helper::<Free>("rt_free")(context, w, BLOCK) };
 }
 
-unsafe extern "C" fn release(context: *mut Context, f: Handed) -> Word {
-    free(context, unsafe { std::mem::transmute::<Handed, Word>(f) });
+unsafe extern "C" fn release(context: *mut Context, f: OwnedWord) -> Word {
+    free(context, unsafe {
+        std::mem::transmute::<OwnedWord, Word>(f)
+    });
     0
 }
 
-unsafe extern "C" fn release_pair(context: *mut Context, f: Handed) -> Word {
-    let w = unsafe { std::mem::transmute::<Handed, Word>(f) };
+unsafe extern "C" fn release_pair(context: *mut Context, f: OwnedWord) -> Word {
+    let w = unsafe { std::mem::transmute::<OwnedWord, Word>(f) };
     unsafe { helper::<Free>("rt_free")(context, w, PAIR) };
     0
 }
@@ -141,7 +143,7 @@ fn left_apart(context: &mut Context) -> Word {
     });
     unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) };
     assert_eq!(context.failed, 0);
-    let left = held(slots[0]) + held(slots[1]);
+    let left = first_word(slots[0]) + first_word(slots[1]);
     for w in slots {
         free(c, w);
     }
@@ -164,7 +166,7 @@ fn a_block_entered_on_a_parallel_branch_runs_on_its_own_thread_without_touching_
     context.begin();
     let [a, b] = branches(&mut context, [&ENTERS, &ENTERS]);
     assert_eq!(
-        held(a) + held(b),
+        first_word(a) + first_word(b),
         0,
         "the two blocks entered on the outer block's branches"
     );
@@ -179,7 +181,7 @@ fn parallel_branches_store_their_results_in_their_slots_and_free_their_closures(
     context.begin();
     let [a, b] = branches(&mut context, [&FIRST, &SECOND]);
     assert_eq!(context.failed, 0);
-    assert_eq!((held(a), held(b)), (1, 2));
+    assert_eq!((first_word(a), first_word(b)), (1, 2));
     free(&mut context, a);
     free(&mut context, b);
     assert_eq!(context.heap.live(), 0, "a branch's closure was not let go");
@@ -198,7 +200,7 @@ fn a_closure_sent_to_another_thread_has_its_captured_values_found_through_its_la
         WALKED.load(Ordering::SeqCst),
         "the closure was marked before its descriptor walked it"
     );
-    assert_eq!((held(a), held(b)), (1, 2));
+    assert_eq!((first_word(a), first_word(b)), (1, 2));
     free(&mut context, a);
     free(&mut context, b);
     assert_eq!(context.heap.live(), 0);
@@ -227,7 +229,7 @@ fn a_branch_that_returns_after_another_branch_failed_still_returns_its_result_in
     context.begin();
     let [failed, returned] = branches(&mut context, [&FAILS, &SECOND]);
     assert_eq!((context.failed, failed), (1, 0));
-    assert_eq!(held(returned), 2);
+    assert_eq!(first_word(returned), 2);
     free(&mut context, returned);
     assert_eq!(context.heap.live(), 0);
     context.failed = 0;

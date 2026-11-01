@@ -39,7 +39,7 @@ pub(super) fn sealed(context: &mut Context, bytes: &[u8], text: bool) -> Word {
     unsafe { native::<A3>("?secret_of")(context, p, n, Word::from(text)) }
 }
 
-fn held(w: Word) -> &'static Sealed {
+fn sealed_of(w: Word) -> &'static Sealed {
     unsafe { heap::native_of::<Sealed>(w) }.expect("a secret")
 }
 
@@ -77,8 +77,8 @@ fn a_secret_stores_its_own_copy_of_the_bytes_and_verify_succeeds_only_for_identi
     let text = sealed(&mut context, &typed, true);
     let raw = sealed(&mut context, b"hunter2", false);
     drop(typed);
-    assert_eq!(held(text).bytes(), b"hunter2");
-    assert!(held(text).is_text() && !held(raw).is_text());
+    assert_eq!(sealed_of(text).bytes(), b"hunter2");
+    assert!(sealed_of(text).is_text() && !sealed_of(raw).is_text());
     assert_eq!(verify(&mut context, text, b"hunter2"), 1);
     assert_eq!(verify(&mut context, text, b"hunter3"), 0);
     assert_eq!(verify(&mut context, text, b""), 0);
@@ -91,7 +91,7 @@ fn a_secret_stores_its_own_copy_of_the_bytes_and_verify_succeeds_only_for_identi
     assert_eq!(equal(&mut context, text, raw), 0);
     let tail = sealed(&mut context, b"!", false);
     let joined = unsafe { native::<A2>("?secret_concat")(&mut context, raw, tail) };
-    assert_eq!(held(joined).bytes(), b"hunter2!");
+    assert_eq!(sealed_of(joined).bytes(), b"hunter2!");
     assert_eq!(
         unsafe { native::<A1>("?secret_len")(&mut context, joined) },
         8
@@ -111,16 +111,16 @@ fn a_secret_is_encoded_to_text_and_decoded_back_using_the_encoding_named_by_the_
     }
     let bytes = sealed(&mut context, b"foobar", false);
     let text = named_secret(&mut context, "?secret_encoded", "hex", bytes);
-    assert!(held(text).is_text());
-    assert_eq!(held(text).bytes(), b"666f6f626172");
+    assert!(sealed_of(text).is_text());
+    assert_eq!(sealed_of(text).bytes(), b"666f6f626172");
     let unwritten = named_secret(&mut context, "?secret_encoded", "rot13", bytes);
-    assert!(held(unwritten).is_text() && held(unwritten).bytes().is_empty());
+    assert!(sealed_of(unwritten).is_text() && sealed_of(unwritten).bytes().is_empty());
     let typed = sealed(&mut context, b"mzxw 6ytb-oi", true);
     let wrong = sealed(&mut context, b"6g", true);
     let reads = |context: &mut Context, name: &str, text: Word| {
         (
             named_secret(context, "?secret_decodes", name, text),
-            held(named_secret(context, "?secret_decoded", name, text))
+            sealed_of(named_secret(context, "?secret_decoded", name, text))
                 .bytes()
                 .to_vec(),
         )
@@ -150,7 +150,7 @@ fn a_private_key_is_read_out_of_its_document_by_its_scheme() {
     };
     let key = |context: &mut Context, der: Word, scheme: &str| {
         let (p, n) = borrowed(scheme.as_bytes());
-        held(unsafe { native::<A3>("?secret_key")(context, der, p, n) })
+        sealed_of(unsafe { native::<A3>("?secret_key")(context, der, p, n) })
             .bytes()
             .to_vec()
     };
@@ -221,7 +221,7 @@ fn an_rsa_json_web_key_rebuilds_the_original_der_key_document_and_returns_empty_
     let ((np, nn), (ep, en)) = (borrowed(&numbers[1]), borrowed(&numbers[2]));
     let made = |context: &mut Context, texts: Word| {
         let w = unsafe { native::<A5>("?secret_rsa_jwk")(context, np, nn, ep, en, texts) };
-        held(w).bytes().to_vec()
+        sealed_of(w).bytes().to_vec()
     };
     let six = joined_texts(&mut context, &numbers[3..]);
     assert_eq!(made(&mut context, six), document);
@@ -267,7 +267,7 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
         native::<A5>("?secret_hkdf_extract")(&mut context, hp, hn, stack_pointer, sn, ikm)
     };
     assert_eq!(
-        held(prk).bytes(),
+        sealed_of(prk).bytes(),
         hex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
     );
     let unknown = borrowed(b"MD5");
@@ -281,7 +281,7 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
             ikm,
         )
     };
-    assert!(held(none).bytes().is_empty());
+    assert!(sealed_of(none).bytes().is_empty());
     let info = hex("f0f1f2f3f4f5f6f7f8f9");
     let (ip, info_byte_count) = borrowed(&info);
     let expands = |context: &mut Context, length: Word| unsafe {
@@ -291,7 +291,7 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
         let w = unsafe {
             native::<A6>("?secret_hkdf_expand")(context, hp, hn, prk, ip, info_byte_count, length)
         };
-        held(w).bytes().to_vec()
+        sealed_of(w).bytes().to_vec()
     };
     assert_eq!(
         expand(&mut context, 42),
@@ -336,7 +336,7 @@ fn pbkdf2_derives_as_rfc_6070_says_within_its_bounds() {
                 length,
             )
         };
-        held(w).bytes().to_vec()
+        sealed_of(w).bytes().to_vec()
     };
     assert_eq!(
         derive(&mut context, 1, 20),
@@ -488,7 +488,7 @@ fn two_keys_agree_on_one_shared_secret_and_a_low_order_point_yields_no_secret() 
     };
     let agreed = |context: &mut Context, key: Word, peer: &[u8]| {
         let ((p, n), (pp, pn)) = (borrowed(b"x25519"), borrowed(peer));
-        held(unsafe { native::<A5>("crypto_agreed")(context, p, n, key, pp, pn) })
+        sealed_of(unsafe { native::<A5>("crypto_agreed")(context, p, n, key, pp, pn) })
             .bytes()
             .to_vec()
     };

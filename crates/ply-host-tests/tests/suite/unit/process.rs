@@ -395,7 +395,7 @@ fn input(host: &Arc<ProcessHost>, child: i64, bytes: &[u8]) -> Result<bool, Diag
     Ok(job().expect("a write returns") == [1])
 }
 
-fn heard(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> OutputEvent {
+fn next_output(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> OutputEvent {
     let flat = ran(host
         .output_line("sh", child, timeout_ms, S)
         .expect("a usable child"))
@@ -423,7 +423,7 @@ fn sleeper(host: &Arc<ProcessHost>) -> (i64, String) {
         "",
         wired(false, Output::Lines, Output::Discard),
     );
-    match heard(host, child, 10_000) {
+    match next_output(host, child, 10_000) {
         OutputEvent::Line(pid) => {
             assert!(alive(&pid), "the child {pid} is running");
             (child, pid)
@@ -542,11 +542,11 @@ fn lines_can_be_read_one_at_a_time_and_wait_returns_the_lines_not_yet_read() {
         wired(false, Output::Lines, Output::Keep),
     );
     assert_eq!(
-        heard(&host, child, 10_000),
+        next_output(&host, child, 10_000),
         OutputEvent::Line("one".to_string())
     );
     assert_eq!(
-        heard(&host, child, 10_000),
+        next_output(&host, child, 10_000),
         OutputEvent::Line("two".to_string()),
         "a carriage return and a newline are one ending"
     );
@@ -569,14 +569,14 @@ fn reading_a_line_from_a_child_that_is_silent_times_out_then_returns_the_line_wh
         "",
         wired(false, Output::Lines, Output::Discard),
     );
-    assert_eq!(heard(&host, child, 50), OutputEvent::Quiet);
+    assert_eq!(next_output(&host, child, 50), OutputEvent::Quiet);
     assert_eq!(
-        heard(&host, child, -1),
+        next_output(&host, child, -1),
         OutputEvent::Line("late".to_string())
     );
-    assert_eq!(heard(&host, child, -1), OutputEvent::Closed);
+    assert_eq!(next_output(&host, child, -1), OutputEvent::Closed);
     assert_eq!(
-        heard(&host, child, 0),
+        next_output(&host, child, 0),
         OutputEvent::Closed,
         "the end is not a one-shot result"
     );
@@ -597,14 +597,14 @@ fn lines_from_stdout_and_stderr_are_read_in_the_order_printed_and_wait_returns_l
         wired(false, Output::Lines, Output::Lines),
     );
     assert_eq!(
-        heard(&host, read, 10_000),
+        next_output(&host, read, 10_000),
         OutputEvent::Line("first".to_string())
     );
     assert_eq!(
-        heard(&host, read, 10_000),
+        next_output(&host, read, 10_000),
         OutputEvent::Line("second".to_string())
     );
-    assert_eq!(heard(&host, read, 10_000), OutputEvent::Closed);
+    assert_eq!(next_output(&host, read, 10_000), OutputEvent::Closed);
 
     let unread = start(
         &host,
@@ -628,7 +628,7 @@ fn a_child_with_no_lines_to_read_is_closed_at_once() {
         "",
         wired(false, Output::Discard, Output::Keep),
     );
-    assert_eq!(heard(&host, child, -1), OutputEvent::Closed);
+    assert_eq!(next_output(&host, child, -1), OutputEvent::Closed);
 }
 
 #[test]

@@ -8,7 +8,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
     cleanup: Block,
     held: *const PlyType,
     result: *const PlyType,
-) -> Handed {
+) -> OwnedWord {
     use crate::frames::{FrameObject, call_recording_slots};
     let c = unsafe { &mut *context };
     let words = (c.entering_descriptor, c.entering_words);
@@ -47,14 +47,14 @@ pub unsafe extern "C" fn rt_with_cleanup(
             cleanup.release_function_if_last(context);
             body.release_function_if_last(context);
         }
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
-    let held = unsafe { Carried::new(Handed::of(acquired), held) };
+    let held = unsafe { Carried::new(OwnedWord::of(acquired), held) };
     let (returned, body, cleanup, held) = if cancelled {
         c.failed = FAILED_CANCELLED;
         (None, body, cleanup, held)
     } else {
-        let given = held.dup(context).handed().word();
+        let given = held.dup(context).into_owned_word().word();
         let f = body.word();
         let holding = [
             FrameObject::Closure(body),
@@ -73,7 +73,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         else {
             unreachable!("a record gives back what it held");
         };
-        let r = unsafe { Carried::new(Handed::of(r), result) };
+        let r = unsafe { Carried::new(OwnedWord::of(r), result) };
         (Some(r), body, cleanup, held)
     };
     unsafe { body.release_function_if_last(context) };
@@ -82,10 +82,10 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let Some(aside) = Unwinding::suspend_failure(c) else {
         held.release(context);
         unsafe { cleanup.release_function_if_last(context) };
-        return Handed::of(0);
+        return OwnedWord::of(0);
     };
     let returned = returned.filter(|_| ending == 0);
-    let (f, given) = (cleanup.word(), held.handed().word());
+    let (f, given) = (cleanup.word(), held.into_owned_word().word());
     let call = || {
         entering();
         unsafe { Block::of(f).call(context, &[given]) }
@@ -118,9 +118,9 @@ pub unsafe extern "C" fn rt_with_cleanup(
         if let Some(a) = returned {
             a.release(context);
         }
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
-    returned.map_or(Handed::of(0), Carried::handed)
+    returned.map_or(OwnedWord::of(0), Carried::into_owned_word)
 }
 
 #[repr(C)]

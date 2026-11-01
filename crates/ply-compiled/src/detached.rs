@@ -1,4 +1,4 @@
-use crate::emitted::{Block, Handed, PlyFunctionDescriptor, PlyType};
+use crate::emitted::{Block, OwnedWord, PlyFunctionDescriptor, PlyType};
 use crate::frames::{self, PlyFrame};
 use crate::heap::{HEADER, Word};
 use crate::rt::{
@@ -511,7 +511,7 @@ unsafe extern "C" fn token_resumed(context: *mut Context, k: Word, args: *const 
     unsafe { resume(context, id, Some(capture), Some(v)) }
 }
 
-unsafe extern "C" fn token_released(context: *mut Context, k: Handed) -> Word {
+unsafe extern "C" fn token_released(context: *mut Context, k: OwnedWord) -> Word {
     let k = k.word();
     let (packed, entry) = unsafe { token_words(k) };
     let (id, capture) = unpacked(packed);

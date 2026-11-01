@@ -217,7 +217,7 @@ pub fn enter(
                 nanos,
                 host: context.host_use.used_nondeterminism(),
                 performs: last.performs,
-                retained: last.held,
+                retained: last.retained,
                 runtime_blocks: last.runtime_blocks,
                 live: last.live,
             },
@@ -343,7 +343,7 @@ pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T>
 
 struct Last {
     performs: u64,
-    held: Retained,
+    retained: Retained,
     interleaving: Option<Vec<u8>>,
     runtime_blocks: u64,
     live: u64,
@@ -411,7 +411,7 @@ fn returned(context: &mut Context) -> Last {
     }
     Last {
         performs: context.performed.len() as u64,
-        held,
+        retained: held,
         interleaving: context.interleaving.take(),
         runtime_blocks: 0,
         live: 0,

@@ -64,7 +64,7 @@ impl Block {
     }
 
     pub unsafe fn release_function(self, context: *mut Context) {
-        unsafe { (self.descriptor().release)(context, Handed(self.0)) };
+        unsafe { (self.descriptor().release)(context, OwnedWord(self.0)) };
     }
 
     unsafe fn descriptor(&self) -> &'static PlyFunctionDescriptor {
@@ -86,15 +86,15 @@ fn payload(bytes: Word) -> usize {
 }
 
 #[repr(transparent)]
-pub struct Handed(Word);
+pub struct OwnedWord(Word);
 
-impl Handed {
+impl OwnedWord {
     pub(crate) fn word(self) -> Word {
         self.0
     }
 
-    pub(crate) fn of(w: Word) -> Handed {
-        Handed(w)
+    pub(crate) fn of(w: Word) -> OwnedWord {
+        OwnedWord(w)
     }
 }
 
@@ -219,7 +219,7 @@ pub struct Carried {
 }
 
 impl Carried {
-    pub unsafe fn new(w: Handed, ty: *const PlyType) -> Carried {
+    pub unsafe fn new(w: OwnedWord, ty: *const PlyType) -> Carried {
         Carried {
             word: w.0,
             ty: unsafe { &*ty },
@@ -246,12 +246,12 @@ impl Carried {
         unsafe { (self.ty.dec)(context, self.word) };
     }
 
-    pub fn handed(self) -> Handed {
-        Handed(self.word)
+    pub fn into_owned_word(self) -> OwnedWord {
+        OwnedWord(self.word)
     }
 }
 
-pub type DropRoot = unsafe extern "C" fn(*mut Context, Handed) -> Word;
+pub type DropRoot = unsafe extern "C" fn(*mut Context, OwnedWord) -> Word;
 
 pub type KeepRoot = unsafe extern "C" fn(*mut Context, Word) -> Word;
 
@@ -270,8 +270,8 @@ unsafe impl Sync for PlyFunctionDescriptor {}
 unsafe impl Taken for Block {
     const MACHINE: MachineType = MachineType::Block;
 }
-unsafe impl Taken for Handed {
-    const MACHINE: MachineType = MachineType::Handed;
+unsafe impl Taken for OwnedWord {
+    const MACHINE: MachineType = MachineType::OwnedWord;
 }
 unsafe impl Taken for Handle {
     const MACHINE: MachineType = MachineType::Handle;
@@ -294,7 +294,7 @@ unsafe impl Taken for *const PlyOp {
 unsafe impl Taken for *const PlyKept {
     const MACHINE: MachineType = MachineType::Type;
 }
-unsafe impl Taken for *const Handed {
+unsafe impl Taken for *const OwnedWord {
     const MACHINE: MachineType = MachineType::Words;
 }
 
@@ -305,10 +305,10 @@ unsafe impl Returned for Block {
     }
 }
 
-unsafe impl Returned for Handed {
-    const MACHINE: Option<MachineType> = Some(MachineType::Handed);
-    fn of(w: Word) -> Handed {
-        Handed(w)
+unsafe impl Returned for OwnedWord {
+    const MACHINE: Option<MachineType> = Some(MachineType::OwnedWord);
+    fn of(w: Word) -> OwnedWord {
+        OwnedWord(w)
     }
 }
 

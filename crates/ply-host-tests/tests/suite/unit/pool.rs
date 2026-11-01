@@ -15,7 +15,7 @@ fn written(n: i64) -> Vec<u8> {
     n.to_be_bytes().to_vec()
 }
 
-fn said(n: i64) -> JobOutput {
+fn written_output(n: i64) -> JobOutput {
     Ok(written(n))
 }
 
@@ -25,7 +25,7 @@ fn submitted(pool: &Pool, run: &Arc<Run>, result: i64) -> Pending {
         Span::DUMMY,
         "test",
         "a test job",
-        Box::new(move || said(result)),
+        Box::new(move || written_output(result)),
     )
     .expect("the pool takes the job")
 }
@@ -93,7 +93,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             "a held job",
             Box::new(move || {
                 let _ = released.lock().map(|r| r.recv());
-                said(0)
+                written_output(0)
             }),
         )
         .expect("the pool takes the job");
@@ -104,7 +104,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             Span::DUMMY,
             "test",
             "one too many",
-            Box::new(|| said(0))
+            Box::new(|| written_output(0))
         )
         .is_err(),
         "every thread is held"
@@ -119,7 +119,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             Span::DUMMY,
             "test",
             "a later job",
-            Box::new(|| said(9)),
+            Box::new(|| written_output(9)),
         ) {
             Ok(pending) => break pending,
             Err(_) => {
@@ -164,7 +164,7 @@ fn a_queued_pool_runs_no_more_at_once_than_it_has_threads() {
                     most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(20));
                     running.fetch_sub(1, Ordering::SeqCst);
-                    said(0)
+                    written_output(0)
                 }),
             )
             .expect("the pool takes the job")
@@ -240,7 +240,7 @@ fn a_run_waiting_on_its_job_wakes_when_that_job_finishes_and_not_when_another_ru
             "a slow job",
             Box::new(|| {
                 std::thread::sleep(Duration::from_millis(200));
-                said(1)
+                written_output(1)
             }),
         )
         .expect("the pool takes the job");

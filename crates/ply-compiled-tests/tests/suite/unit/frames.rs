@@ -1,6 +1,6 @@
-use super::heap::Holding;
+use super::heap::TextNative;
 use crate::bare::{helper, new_context};
-use ply_compiled::emitted::{Block, Carried, Handed, PlyFunctionDescriptor, PlyType};
+use ply_compiled::emitted::{Block, Carried, OwnedWord, PlyFunctionDescriptor, PlyType};
 use ply_compiled::frames::{FrameObject, PlyFrame, base, call_recording_slots, release_frames};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::Returned;
@@ -92,8 +92,8 @@ unsafe extern "C" fn uncalled(_context: *mut Context, _block: Word, _args: *cons
     unreachable!("nothing here calls a closure")
 }
 
-unsafe extern "C" fn closure_released(context: *mut Context, h: Handed) -> Word {
-    let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
+unsafe extern "C" fn closure_released(context: *mut Context, h: OwnedWord) -> Word {
+    let w = unsafe { std::mem::transmute::<OwnedWord, Word>(h) };
     unsafe {
         release_box(context, *word(w, 2));
         FREED.with(|f| f.borrow_mut().push(*word(w, 1)));
@@ -129,11 +129,15 @@ pub(super) fn every_kind(
     let [f, capture, x] = markers;
     let f = closure(context, f, boxed(context, capture));
     let x = boxed(context, x);
-    let h = unsafe { (*context).heap.native(Box::new(Holding(Arc::clone(text)))) };
+    let h = unsafe {
+        (*context)
+            .heap
+            .native(Box::new(TextNative(Arc::clone(text))))
+    };
     let held = unsafe {
         [
             FrameObject::Closure(Block::of(f)),
-            FrameObject::Carried(Carried::new(Handed::of(x), &BOX_TYPE)),
+            FrameObject::Carried(Carried::new(OwnedWord::of(x), &BOX_TYPE)),
             FrameObject::Handle(Block::of(h)),
         ]
     };

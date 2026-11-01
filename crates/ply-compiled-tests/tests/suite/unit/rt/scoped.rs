@@ -2,13 +2,13 @@ use crate::bare::{helper, new_context};
 use ply_compiled::rt::Context;
 
 type Made = unsafe extern "C" fn(*mut Context, i64) -> i64;
-type Held = unsafe extern "C" fn(*mut Context, i64) -> i64;
+type ScopedCall = unsafe extern "C" fn(*mut Context, i64) -> i64;
 
 #[test]
 fn a_scoped_value_can_be_read_repeatedly_and_reading_it_after_release_fails() {
     let made: Made = helper("builtin_elaborated_hold_made");
-    let read: Held = helper("builtin_elaborated_hold_read");
-    let taken: Held = helper("builtin_elaborated_hold_taken");
+    let read: ScopedCall = helper("builtin_elaborated_hold_read");
+    let taken: ScopedCall = helper("builtin_elaborated_hold_taken");
     let mut context = new_context();
     context.begin();
     let c: *mut Context = &mut context;

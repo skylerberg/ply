@@ -42,16 +42,16 @@ pub unsafe extern "C" fn rt_const_failed(context: *mut Context) {
     }
 }
 
-pub unsafe extern "C" fn rt_memo(context: *mut Context, index: I64, keep: KeepRoot) -> Handed {
+pub unsafe extern "C" fn rt_memo(context: *mut Context, index: I64, keep: KeepRoot) -> OwnedWord {
     if let Some(w) = memoized(unsafe { &*context }, index) {
-        return Handed::of(w);
+        return OwnedWord::of(w);
     }
     unsafe { evaluated(context, index, keep) }
 }
 
-pub unsafe extern "C" fn rt_const(context: *mut Context, index: I64, keep: KeepRoot) -> Handed {
+pub unsafe extern "C" fn rt_const(context: *mut Context, index: I64, keep: KeepRoot) -> OwnedWord {
     if let Some(w) = memoized(unsafe { &*context }, index) {
-        return Handed::of(w);
+        return OwnedWord::of(w);
     }
     let w = unsafe { evaluated(context, index, keep) };
     unsafe { rt_const_failed(context) };
@@ -62,7 +62,7 @@ fn memoized(c: &Context, index: I64) -> Option<Word> {
     c.tables.memoized(usize::try_from(index.0).ok()?)
 }
 
-unsafe fn evaluated(context: *mut Context, index: I64, keep: KeepRoot) -> Handed {
+unsafe fn evaluated(context: *mut Context, index: I64, keep: KeepRoot) -> OwnedWord {
     let c = unsafe { &mut *context };
     let tables = Arc::clone(&c.tables);
     let Some(&code) = usize::try_from(index.0)
@@ -74,17 +74,17 @@ unsafe fn evaluated(context: *mut Context, index: I64, keep: KeepRoot) -> Handed
             index.0,
             tables.functions.len()
         )));
-        return Handed::of(0);
+        return OwnedWord::of(0);
     };
     let index = index.0 as usize;
     let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(code) };
     let w = unsafe { f(context, std::ptr::null()) };
     if unsafe { (*context).failed } != 0 {
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
     let kept = unsafe { keep(context, w) };
     if kept != 0 && unsafe { (*context).failed } == 0 {
         tables.keep(index, kept);
     }
-    Handed::of(w)
+    OwnedWord::of(w)
 }

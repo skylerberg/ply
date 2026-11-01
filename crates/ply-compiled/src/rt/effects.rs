@@ -1,23 +1,23 @@
 use super::*;
 
 pub(crate) fn label_word(context: *mut Context, string: &'static PlyType, label: &Symbol) -> Word {
-    decode_string(context, label.as_str(), string).map_or(0, Handed::word)
+    decode_string(context, label.as_str(), string).map_or(0, OwnedWord::word)
 }
 
 pub unsafe extern "C" fn rt_label_string(
     context: *mut Context,
     resource: I64,
     string: *const PlyType,
-) -> Handed {
+) -> OwnedWord {
     let c = unsafe { &mut *context };
     let Some(label) = usize::try_from(resource.0)
         .ok()
         .and_then(|i| c.tables.fields.get(i))
         .cloned()
     else {
-        return Handed::of(c.fail(error("a clause on every label was performed at no label")));
+        return OwnedWord::of(c.fail(error("a clause on every label was performed at no label")));
     };
-    Handed::of(label_word(context, unsafe { &*string }, &label))
+    OwnedWord::of(label_word(context, unsafe { &*string }, &label))
 }
 
 pub unsafe extern "C" fn rt_detached_open(
@@ -25,12 +25,12 @@ pub unsafe extern "C" fn rt_detached_open(
     body: Block,
     forwards: Block,
     instance: Block,
-) -> Handed {
+) -> OwnedWord {
     let body = unsafe { std::mem::transmute::<Block, Word>(body) };
     let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
     let instance = unsafe { std::mem::transmute::<Block, Word>(instance) };
     let forwards = (forwards != 0).then_some(forwards);
-    Handed::of(unsafe { crate::detached::open_detached(context, body, forwards, instance) })
+    OwnedWord::of(unsafe { crate::detached::open_detached(context, body, forwards, instance) })
 }
 
 pub unsafe extern "C" fn rt_detached_perform(
@@ -38,11 +38,11 @@ pub unsafe extern "C" fn rt_detached_perform(
     record: *const Word,
     op: *const PlyOp,
     resource: I64,
-    args: *const Handed,
-) -> Handed {
+    args: *const OwnedWord,
+) -> OwnedWord {
     let described = unsafe { &*op };
     let args = args_of(args.cast(), described.params_len).to_vec();
-    Handed::of(unsafe { crate::detached::stop_detached(context, record, args, resource.0) })
+    OwnedWord::of(unsafe { crate::detached::stop_detached(context, record, args, resource.0) })
 }
 
 pub unsafe extern "C" fn rt_detached_stop(
@@ -50,14 +50,14 @@ pub unsafe extern "C" fn rt_detached_stop(
     record: *const Word,
     op: *const PlyOp,
     resource: I64,
-    args: *const Handed,
+    args: *const OwnedWord,
     _again: I64,
-) -> Handed {
+) -> OwnedWord {
     unsafe { rt_detached_perform(context, record, op, resource, args) }
 }
 
 pub type OpEntry =
-    unsafe extern "C" fn(*mut Context, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
+    unsafe extern "C" fn(*mut Context, Word, *const PlyOp, I64, I64, *const OwnedWord) -> OwnedWord;
 
 pub const EVIDENCE_ONE_SLOT: i64 = 1;
 
@@ -102,8 +102,8 @@ unsafe extern "C" fn bridged(
     op: *const PlyOp,
     mode: I64,
     resource: I64,
-    args: *const Handed,
-) -> Handed {
+    args: *const OwnedWord,
+) -> OwnedWord {
     unsafe { perform_operation(context, op, mode, resource, args, true) }
 }
 
@@ -113,8 +113,8 @@ unsafe extern "C" fn unserved(
     op: *const PlyOp,
     mode: I64,
     resource: I64,
-    args: *const Handed,
-) -> Handed {
+    args: *const OwnedWord,
+) -> OwnedWord {
     unsafe { perform_operation(context, op, mode, resource, args, false) }
 }
 
@@ -123,15 +123,15 @@ unsafe fn perform_operation(
     op: *const PlyOp,
     mode: I64,
     resource: I64,
-    args: *const Handed,
+    args: *const OwnedWord,
     unhandled: bool,
-) -> Handed {
+) -> OwnedWord {
     let c = unsafe { &mut *context };
     let described = unsafe { &*op };
     let (effect, name) = named_op(c, described);
     let args = args_of(args.cast(), described.params_len);
     if mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()) {
-        return Handed::of(pending_raise(c, &effect, &name, raised_of(args, described)));
+        return OwnedWord::of(pending_raise(c, &effect, &name, raised_of(args, described)));
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
     if unhandled {
@@ -147,7 +147,7 @@ unsafe fn perform_operation(
         let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
         ply_core::host::err_unhandled_operation(site, &operation)
     };
-    Handed::of(c.fail(d))
+    OwnedWord::of(c.fail(d))
 }
 
 fn named_op(c: &Context, described: &PlyOp) -> (Symbol, Symbol) {
@@ -157,7 +157,7 @@ fn named_op(c: &Context, described: &PlyOp) -> (Symbol, Symbol) {
 
 fn let_go(context: *mut Context, args: &[Word], described: &PlyOp) {
     for (w, ty) in args.iter().zip(described.params()) {
-        unsafe { Carried::new(Handed::of(*w), *ty) }.release(context);
+        unsafe { Carried::new(OwnedWord::of(*w), *ty) }.release(context);
     }
 }
 
@@ -165,7 +165,7 @@ fn raised_of(args: &[Word], described: &PlyOp) -> Raised {
     Raised(
         args.iter()
             .zip(described.params())
-            .map(|(w, ty)| unsafe { Carried::new(Handed::of(*w), *ty) })
+            .map(|(w, ty)| unsafe { Carried::new(OwnedWord::of(*w), *ty) })
             .collect(),
     )
 }
@@ -217,7 +217,7 @@ pub unsafe extern "C" fn rt_task_captures(context: *mut Context, op: *const PlyO
 pub unsafe extern "C" fn rt_task_raises(
     context: *mut Context,
     op: *const PlyOp,
-    args: *const Handed,
+    args: *const OwnedWord,
 ) -> Word {
     let c = unsafe { &mut *context };
     let described = unsafe { &*op };
@@ -308,31 +308,31 @@ pub unsafe extern "C" fn rt_pending_raised(
     context: *mut Context,
     string: *const PlyType,
     bridged: I64,
-) -> Handed {
+) -> OwnedWord {
     let c = unsafe { &mut *context };
     if c.failed != FAILED_PENDING_RAISE || bridged.0 != 0 {
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
     let message = match c.pending.take() {
         Some(Unhandled::Abort(message)) => message,
         other => {
             c.pending = other;
-            return Handed::of(0);
+            return OwnedWord::of(0);
         }
     };
     c.failed = 0;
     c.diagnostic = None;
-    decode_string(context, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+    decode_string(context, &message, unsafe { &*string }).unwrap_or(OwnedWord::of(0))
 }
 
 pub unsafe extern "C" fn rt_pending_raised_at(
     context: *mut Context,
     effect: I64,
     op: I64,
-) -> Handed {
+) -> OwnedWord {
     let c = unsafe { &mut *context };
     if c.failed != FAILED_PENDING_RAISE {
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
     let named = |s: &Symbol, i: I64| c.tables.fields.get(i.0 as usize) == Some(s);
     let ours = match &c.pending {
@@ -342,23 +342,23 @@ pub unsafe extern "C" fn rt_pending_raised_at(
         _ => false,
     };
     if !ours {
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
     let Some(Unhandled::Raised { args, .. }) = c.pending.take() else {
         unreachable!("the pending raise was just read");
     };
     c.failed = 0;
     c.diagnostic = None;
-    c.pending_words = args.handed();
+    c.pending_words = args.into_words();
     c.pending_words.push(0);
-    Handed::of(c.pending_words.as_ptr() as Word)
+    OwnedWord::of(c.pending_words.as_ptr() as Word)
 }
 
 pub unsafe extern "C" fn rt_inc_shared(_context: *mut Context, w: i64) {
     heap::inc_shared(w);
 }
 
-pub unsafe extern "C" fn rt_branches(context: *mut Context, slots: *const Handed, n: I64) {
+pub unsafe extern "C" fn rt_branches(context: *mut Context, slots: *const OwnedWord, n: I64) {
     let allowed = unsafe { &*context }.runs_branches_at_once();
     let slots = slots.cast::<Word>().cast_mut();
     unsafe { crate::parallel::run(context, slots, n.0 as usize, allowed) }

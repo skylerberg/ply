@@ -1,5 +1,5 @@
 use super::*;
-use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
+use crate::emitted::{Block, Carried, Handle, OwnedWord, PlyType};
 use crate::native::{Address, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 use ply_core::{EscapedHandle, escape};
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn rt_out_handle(context: *mut Context, h: Handle) {
     c.write(Lowering::handle);
 }
 
-pub unsafe extern "C" fn rt_out_carried(context: *mut Context, w: Handed, ty: *const PlyType) {
+pub unsafe extern "C" fn rt_out_carried(context: *mut Context, w: OwnedWord, ty: *const PlyType) {
     if unsafe { &*context }.showing() {
         unsafe { ((*ty).lower)(context, w.word()) };
         return;
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn rt_out_carried(context: *mut Context, w: Handed, ty: *c
     unsafe { &mut *context }.write(Lowering::handle);
 }
 
-pub unsafe extern "C" fn rt_out_fun(context: *mut Context, f: Handed, name: Address, len: I64) {
+pub unsafe extern "C" fn rt_out_fun(context: *mut Context, f: OwnedWord, name: Address, len: I64) {
     let name = unsafe { borrowed(name, len) };
     let leaves = !name.is_empty() || unsafe { Block::of(f.word()).share(context) };
     unsafe { &mut *context }.write(|l| {
@@ -294,7 +294,7 @@ pub unsafe extern "C" fn rt_out_fun(context: *mut Context, f: Handed, name: Addr
     });
 }
 
-pub unsafe extern "C" fn rt_out_again(context: *mut Context, w: Handed) -> I64 {
+pub unsafe extern "C" fn rt_out_again(context: *mut Context, w: OwnedWord) -> I64 {
     let c = unsafe { &mut *context };
     let Ok(l) = c.lowering() else {
         return I64(0);
@@ -543,13 +543,13 @@ fn lowering(
     Ok(l)
 }
 
-pub(crate) fn decode_string(context: *mut Context, s: &str, string: &PlyType) -> Option<Handed> {
+pub(crate) fn decode_string(context: *mut Context, s: &str, string: &PlyType) -> Option<OwnedWord> {
     let mut w = codec::Writer::new();
     w.str(s.as_bytes());
     decode_bytes(context, w.finish(), string)
 }
 
-fn decode_bytes(context: *mut Context, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
+fn decode_bytes(context: *mut Context, bytes: Vec<u8>, ty: &PlyType) -> Option<OwnedWord> {
     let c = unsafe { &mut *context };
     let depth = c.marshallings.len();
     c.open_decoding(bytes);
@@ -564,7 +564,7 @@ fn decode_bytes(context: *mut Context, bytes: Vec<u8>, ty: &PlyType) -> Option<H
     if let Err(reason) = c.close_decoding() {
         c.fail(err_marshalling(&reason));
     }
-    (c.failed == 0).then(|| <Handed as crate::native::Returned>::of(w))
+    (c.failed == 0).then(|| <OwnedWord as crate::native::Returned>::of(w))
 }
 
 impl Context {

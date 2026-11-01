@@ -189,7 +189,7 @@ fn ran(job: ply_host::jobs::FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     })
 }
 
-fn asked(
+fn run(
     fs: &FsHost,
     op: Op,
     label: &str,
@@ -200,7 +200,7 @@ fn asked(
 }
 
 fn perform(fs: &FsHost, op: Op, path: &str, second: Second) -> Result<Vec<u8>, Diagnostic> {
-    asked(fs, op, "cache", path, second)
+    run(fs, op, "cache", path, second)
 }
 
 fn on(fs: &FsHost, op: Op, path: &str, second: Second) -> Vec<u8> {
@@ -355,7 +355,7 @@ fn every_operation_rejects_a_label_no_root_is_bound_to() {
     for op in Op::ALL {
         for (path, second, _) in given(op, "a") {
             let rejected =
-                asked(&fs, op, "elsewhere", &path, second).expect_err("`elsewhere` has no root");
+                run(&fs, op, "elsewhere", &path, second).expect_err("`elsewhere` has no root");
             assert_eq!(rejected.code, codes::FS_ROOT_UNBOUND, "{}", op.what());
         }
     }
@@ -656,7 +656,7 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
 }
 
 fn opened(fs: &FsHost, label: &str, path: &str, how: Opening) -> Result<i64, Vec<u8>> {
-    let said = asked(fs, Op::Open, label, path, Second::Opening(how))
+    let said = run(fs, Op::Open, label, path, Second::Opening(how))
         .unwrap_or_else(|d| panic!("rejected: {} {}", d.code, d.message));
     match said.split_first() {
         Some((1, descriptor)) => Ok(int_of(descriptor).expect("eight bytes")),

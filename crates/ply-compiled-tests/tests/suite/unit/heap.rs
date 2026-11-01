@@ -16,18 +16,18 @@ fn freed(h: &mut Heap, w: Word, payload: usize) {
     unsafe { std::mem::transmute::<Word, Block>(w).free(h, (HEADER + payload) as Word) }
 }
 
-pub(super) struct Holding(pub(super) Arc<str>);
+pub(super) struct TextNative(pub(super) Arc<str>);
 
-impl Native for Holding {
+impl Native for TextNative {
     fn release(&mut self, _context: *mut Context) {}
 }
 
-fn holding(text: &str) -> Box<dyn Native> {
-    Box::new(Holding(Arc::from(text)))
+fn text_native(text: &str) -> Box<dyn Native> {
+    Box::new(TextNative(Arc::from(text)))
 }
 
-fn held_by(w: Word) -> Arc<str> {
-    let held = unsafe { native_of::<Holding>(w) }.expect("a native object holding text");
+fn text_of_native(w: Word) -> Arc<str> {
+    let held = unsafe { native_of::<TextNative>(w) }.expect("a native object holding text");
     Arc::clone(&held.0)
 }
 
@@ -98,14 +98,14 @@ fn a_block_given_back_is_reused_by_the_next_of_its_size_within_an_entry() {
 #[test]
 fn the_block_of_a_freed_native_object_is_reused_for_the_next_native_object() {
     let mut context = new_context();
-    let first = context.heap.native(holding("first"));
+    let first = context.heap.native(text_native("first"));
     release_object(&raw mut context, first);
-    let again = context.heap.native(holding("second"));
+    let again = context.heap.native(text_native("second"));
     assert_eq!(
         again, first,
         "a dead native object's block is the next native object's"
     );
-    assert_eq!(&*held_by(again), "second");
+    assert_eq!(&*text_of_native(again), "second");
     assert_eq!(context.heap.natives(), 1);
 }
 
@@ -114,7 +114,7 @@ fn the_heap_lists_each_live_native_object_once_and_ending_the_heap_frees_each_na
     let mut context = new_context();
     let held: Arc<str> = Arc::from("held");
     let words: Vec<Word> = (0..8)
-        .map(|_| context.heap.native(Box::new(Holding(Arc::clone(&held)))))
+        .map(|_| context.heap.native(Box::new(TextNative(Arc::clone(&held)))))
         .collect();
     for i in [3, 0, 7, 4] {
         release_object(&raw mut context, words[i]);
@@ -127,7 +127,7 @@ fn the_heap_lists_each_live_native_object_once_and_ending_the_heap_frees_each_na
     assert_eq!(Arc::strong_count(&held), 5);
 
     let reused: Vec<Word> = (0..4)
-        .map(|i| context.heap.native(holding(&i.to_string())))
+        .map(|i| context.heap.native(text_native(&i.to_string())))
         .collect();
     assert!(
         reused.iter().all(|w| words.contains(w)),
@@ -135,10 +135,10 @@ fn the_heap_lists_each_live_native_object_once_and_ending_the_heap_frees_each_na
     );
     assert_eq!(context.heap.natives(), 8);
     for (i, w) in reused.iter().enumerate() {
-        assert_eq!(&*held_by(*w), i.to_string());
+        assert_eq!(&*text_of_native(*w), i.to_string());
     }
     for i in [1, 2, 5, 6] {
-        assert!(Arc::ptr_eq(&held_by(words[i]), &held));
+        assert!(Arc::ptr_eq(&text_of_native(words[i]), &held));
     }
 
     for w in [reused[1], words[6], reused[3], words[1], reused[0]] {
@@ -188,14 +188,14 @@ fn with_heap_poisoning_on_using_a_freed_native_object_pointer_after_its_block_is
 fn using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poison_values() {
     assert!(poisoning_enabled(), "`PLY_HEAP_POISON` is not set");
     let mut context = new_context();
-    let stale = context.heap.native(holding("first"));
+    let stale = context.heap.native(text_native("first"));
     release_object(&raw mut context, stale);
-    let tenant = context.heap.native(holding("second"));
+    let tenant = context.heap.native(text_native("second"));
     assert_eq!(
         tenant, stale,
         "the dead native object's block was not reused"
     );
-    assert_eq!(&*held_by(tenant), "second");
+    assert_eq!(&*text_of_native(tenant), "second");
     release_object(&raw mut context, tenant);
     let payload = unsafe { word_at(stale as *mut Object, 1) };
     assert_eq!(
@@ -203,7 +203,7 @@ fn using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poi
         poison_freed::word(),
         "the dead native object's payload was not poisoned"
     );
-    held_by(stale);
+    text_of_native(stale);
 }
 
 #[test]
@@ -230,10 +230,10 @@ fn merging_a_branch_heap_into_a_parent_heap_moves_the_branch_blocks_and_native_o
  {
     let mut context = new_context();
     block(&mut context.heap, 8);
-    let own = context.heap.native(holding("the parent's"));
+    let own = context.heap.native(text_native("the parent's"));
     let mut branch = Heap::new();
     block(&mut branch, 24);
-    let adopted = branch.native(holding("the branch's"));
+    let adopted = branch.native(text_native("the branch's"));
     let (mine, theirs) = (context.heap.live(), branch.live());
     context.heap.adopt_heap(branch);
     block(&mut context.heap, 8);
@@ -243,10 +243,10 @@ fn merging_a_branch_heap_into_a_parent_heap_moves_the_branch_blocks_and_native_o
         "the branch's blocks are the parent's"
     );
     assert_eq!(context.heap.natives(), 2);
-    assert_eq!(&*held_by(adopted), "the branch's");
+    assert_eq!(&*text_of_native(adopted), "the branch's");
     release_object(&raw mut context, adopted);
     assert_eq!(context.heap.natives(), 1);
-    assert_eq!(&*held_by(own), "the parent's");
+    assert_eq!(&*text_of_native(own), "the parent's");
     context.heap.end();
 }
 

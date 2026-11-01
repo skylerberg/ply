@@ -1,5 +1,5 @@
 use crate::bare::{helper, new_context};
-use ply_compiled::emitted::{Carried, Handed, PlyType};
+use ply_compiled::emitted::{Carried, OwnedWord, PlyType};
 use ply_compiled::heap::{HEADER, Object, Word};
 use ply_compiled::native::Returned;
 use ply_compiled::rt::Context;
@@ -57,7 +57,7 @@ fn a_carried_value_adds_a_reference_when_duplicated_and_frees_its_block_when_the
  {
     let mut context = new_context();
     let w = boxed(&mut context);
-    let held = unsafe { Carried::new(Handed::of(w), &BOX) };
+    let held = unsafe { Carried::new(OwnedWord::of(w), &BOX) };
     let again = held.dup(&mut context);
     assert_eq!(count(w), 2);
     held.release(&mut context);
@@ -77,8 +77,8 @@ fn a_carried_value_converted_back_into_a_raw_word_gives_the_same_word_and_the_sa
  {
     let mut context = new_context();
     let w = boxed(&mut context);
-    let held = unsafe { Carried::new(Handed::of(w), &BOX) };
+    let held = unsafe { Carried::new(OwnedWord::of(w), &BOX) };
     assert!(std::ptr::eq(held.ty(), &BOX));
-    let back = unsafe { std::mem::transmute::<Handed, Word>(held.handed()) };
+    let back = unsafe { std::mem::transmute::<OwnedWord, Word>(held.into_owned_word()) };
     assert_eq!((back, count(w)), (w, 1));
 }

@@ -1,5 +1,5 @@
 use crate::bare::new_context;
-use ply_compiled::emitted::{Block, Handed, Handle, PlyFunctionDescriptor, PlyType};
+use ply_compiled::emitted::{Block, Handle, OwnedWord, PlyFunctionDescriptor, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
 use ply_compiled::native::{Address, I64, Returned};
 use ply_compiled::rt::{
@@ -16,15 +16,15 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 thread_local! {
-    static HEARD: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static RECEIVED: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static RELEASED: Cell<usize> = const { Cell::new(0) };
 }
 
-fn heard() -> Vec<i64> {
-    HEARD.with(|h| std::mem::take(&mut *h.borrow_mut()))
+fn take_received() -> Vec<i64> {
+    RECEIVED.with(|h| std::mem::take(&mut *h.borrow_mut()))
 }
 
-fn asking(code: i64, n: i64) -> Message {
+fn request_message(code: i64, n: i64) -> Message {
     Message {
         code,
         numbers: [n, 0],
@@ -32,11 +32,12 @@ fn asking(code: i64, n: i64) -> Message {
     }
 }
 
-unsafe fn asks_twice(_context: *mut Context, scheduler: usize) {
+unsafe fn requests_twice(_context: *mut Context, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
-    let first = unsafe { tasks::switch_to_loop(scheduler, asking(1, 10)) };
-    let second = unsafe { tasks::switch_to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
-    HEARD.with(|h| h.borrow_mut().push(second.numbers[0]));
+    let first = unsafe { tasks::switch_to_loop(scheduler, request_message(1, 10)) };
+    let second =
+        unsafe { tasks::switch_to_loop(scheduler, request_message(2, first.numbers[0] + 1)) };
+    RECEIVED.with(|h| h.borrow_mut().push(second.numbers[0]));
 }
 
 unsafe fn released(_context: *mut Context, _arg: usize) {
@@ -56,14 +57,14 @@ fn a_task_runs_on_its_own_stack_until_it_pauses_and_continues_from_there_when_re
     let mut context = new_context();
     let mut scheduler = Scheduler::open(&mut context, true);
     let r: *mut Scheduler = &mut *scheduler;
-    scheduler.start(1, body(asks_twice, r));
+    scheduler.start(1, body(requests_twice, r));
     let first = unsafe { tasks::resume(r, 1, Message::default()) };
     assert_eq!((first.code, first.numbers[0]), (1, 10));
-    let second = unsafe { tasks::resume(r, 1, asking(0, 41)) };
+    let second = unsafe { tasks::resume(r, 1, request_message(0, 41)) };
     assert_eq!((second.code, second.numbers[0]), (2, 42));
-    let end = unsafe { tasks::resume(r, 1, asking(0, 7)) };
+    let end = unsafe { tasks::resume(r, 1, request_message(0, 7)) };
     assert_eq!(end.code, FINISHED);
-    assert_eq!(heard(), [7]);
+    assert_eq!(take_received(), [7]);
     scheduler.free(1);
     assert_eq!(
         RELEASED.with(Cell::get),
@@ -78,17 +79,17 @@ fn tasks_take_turns_in_the_scheduler_loop_and_each_continues_where_it_paused() {
     let mut context = new_context();
     let mut scheduler = Scheduler::open(&mut context, false);
     let r: *mut Scheduler = &mut *scheduler;
-    scheduler.start(1, body(asks_twice, r));
-    scheduler.start(2, body(asks_twice, r));
+    scheduler.start(1, body(requests_twice, r));
+    scheduler.start(2, body(requests_twice, r));
     unsafe {
         assert_eq!(tasks::resume(r, 1, Message::default()).code, 1);
         assert_eq!(tasks::resume(r, 2, Message::default()).code, 1);
-        assert_eq!(tasks::resume(r, 2, asking(0, 100)).numbers[0], 101);
-        assert_eq!(tasks::resume(r, 1, asking(0, 200)).numbers[0], 201);
-        assert_eq!(tasks::resume(r, 1, asking(0, 1)).code, FINISHED);
-        assert_eq!(tasks::resume(r, 2, asking(0, 2)).code, FINISHED);
+        assert_eq!(tasks::resume(r, 2, request_message(0, 100)).numbers[0], 101);
+        assert_eq!(tasks::resume(r, 1, request_message(0, 200)).numbers[0], 201);
+        assert_eq!(tasks::resume(r, 1, request_message(0, 1)).code, FINISHED);
+        assert_eq!(tasks::resume(r, 2, request_message(0, 2)).code, FINISHED);
     }
-    assert_eq!(heard(), [1, 2]);
+    assert_eq!(take_received(), [1, 2]);
     drop(scheduler);
 }
 
@@ -134,8 +135,8 @@ fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_resto
     drop(scheduler);
 }
 
-unsafe fn asks_once(_context: *mut Context, scheduler: usize) {
-    unsafe { tasks::switch_to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
+unsafe fn requests_once(_context: *mut Context, scheduler: usize) {
+    unsafe { tasks::switch_to_loop(scheduler as *mut Scheduler, request_message(1, 0)) };
 }
 
 #[test]
@@ -145,7 +146,7 @@ fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_mos
     let mut scheduler = Scheduler::open(&mut context, false);
     let r: *mut Scheduler = &mut *scheduler;
     for id in 1..=3 {
-        scheduler.start(id, body(asks_once, r));
+        scheduler.start(id, body(requests_once, r));
         unsafe { tasks::resume(r, id, Message::default()) };
     }
     assert_eq!(scheduler.stacks(), 3);
@@ -162,7 +163,7 @@ fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_mos
         "the stacks wait for the scheduler's next tasks"
     );
     for id in 4..=5 {
-        scheduler.start(id, body(asks_once, r));
+        scheduler.start(id, body(requests_once, r));
         unsafe { tasks::resume(r, id, Message::default()) };
     }
     assert_eq!(
@@ -184,8 +185,8 @@ fn freeing_a_task_that_never_ran_releases_its_closure_and_dropping_the_scheduler
     let mut scheduler = Scheduler::open(&mut context, true);
     let r: *mut Scheduler = &mut *scheduler;
     let before = RELEASED.with(Cell::get);
-    scheduler.start(1, body(asks_once, r));
-    scheduler.start(2, body(asks_once, r));
+    scheduler.start(1, body(requests_once, r));
+    scheduler.start(2, body(requests_once, r));
     scheduler.free(1);
     assert_eq!(RELEASED.with(Cell::get), before + 1);
     drop(scheduler);
@@ -195,9 +196,9 @@ fn freeing_a_task_that_never_ran_releases_its_closure_and_dropping_the_scheduler
 unsafe fn acquires(_context: *mut Context, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
     let id = unsafe { (*scheduler).shield(BracketPhase::Acquire) }.expect("a task runs");
-    unsafe { tasks::switch_to_loop(scheduler, asking(1, 0)) };
+    unsafe { tasks::switch_to_loop(scheduler, request_message(1, 0)) };
     let lands = unsafe { (*scheduler).leave_phase(id, BracketPhase::Acquire) };
-    HEARD.with(|h| h.borrow_mut().push(i64::from(lands)));
+    RECEIVED.with(|h| h.borrow_mut().push(i64::from(lands)));
 }
 
 #[test]
@@ -219,7 +220,7 @@ fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_t
         unsafe { tasks::resume(r, 1, Message::default()) }.code,
         FINISHED
     );
-    assert_eq!(heard(), [1]);
+    assert_eq!(take_received(), [1]);
     assert_eq!(scheduler.shields(1), Shields::default());
     drop(scheduler);
 }
@@ -342,8 +343,8 @@ fn handle(w: Word) -> Handle {
     <Handle as Returned>::of(w)
 }
 
-fn handed(w: Word) -> Handed {
-    <Handed as Returned>::of(w)
+fn owned(w: Word) -> OwnedWord {
+    <OwnedWord as Returned>::of(w)
 }
 
 fn let_go(context: &mut Context, w: Word) {
@@ -384,7 +385,7 @@ fn a_value_saved_with_rt_keep_opens_as_its_saved_type_and_opening_it_as_another_
  {
     let mut context = new_context();
     let c: *mut Context = &mut context;
-    let k = word_of(unsafe { tasks::rt_keep(c, handed(42), &INTS) });
+    let k = word_of(unsafe { tasks::rt_keep(c, owned(42), &INTS) });
     assert_eq!(word_of(unsafe { tasks::rt_open(c, handle(k), &INTS) }), 42);
     assert!(context.take_failure().is_none());
     unsafe { tasks::rt_open(c, handle(k), &TEXTS) };
@@ -411,7 +412,7 @@ struct ImmortalClosure {
     descriptor: &'static PlyFunctionDescriptor,
 }
 
-unsafe extern "C" fn kept_alone(_context: *mut Context, _f: Handed) -> Word {
+unsafe extern "C" fn ignores_value(_context: *mut Context, _f: OwnedWord) -> Word {
     0
 }
 
@@ -422,7 +423,7 @@ const fn function(
         uniform,
         typed: None,
         convention: 0,
-        release: kept_alone,
+        release: ignores_value,
         share: untouched,
         keep: untouched,
     }
@@ -438,17 +439,17 @@ unsafe extern "C" fn results_five(context: *mut Context, _f: Word, _args: *const
     ENTERED.with(|e| e.borrow_mut().extend([c.entering_descriptor, first]));
     c.entering_descriptor = 0;
     c.entering_words = 0;
-    word_of(unsafe { tasks::rt_keep(context, handed(5), &INTS) })
+    word_of(unsafe { tasks::rt_keep(context, owned(5), &INTS) })
 }
 
-unsafe extern "C" fn asks_three(context: *mut Context, _f: Word, _args: *const Word) -> Word {
+unsafe extern "C" fn requests_three(context: *mut Context, _f: Word, _args: *const Word) -> Word {
     let s = STACKS.with(Cell::get);
     unsafe { tasks::rt_task_yielded(context, handle(s), I64(3), I64(4), I64(5)) };
     0
 }
 
 static FIVE: PlyFunctionDescriptor = function(results_five);
-static THREE: PlyFunctionDescriptor = function(asks_three);
+static THREE: PlyFunctionDescriptor = function(requests_three);
 static RESULTS_FIVE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
     descriptor: &FIVE,

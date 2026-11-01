@@ -62,7 +62,10 @@ impl Raised {
         self.0.into_iter().for_each(|v| v.release(context));
     }
 
-    pub(crate) fn handed(self) -> Vec<Word> {
-        self.0.into_iter().map(|v| v.handed().word()).collect()
+    pub(crate) fn into_words(self) -> Vec<Word> {
+        self.0
+            .into_iter()
+            .map(|v| v.into_owned_word().word())
+            .collect()
     }
 }

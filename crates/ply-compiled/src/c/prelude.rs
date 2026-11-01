@@ -1,4 +1,4 @@
-use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
+use crate::emitted::{Block, DropRoot, Handle, KeepRoot, OwnedWord, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::native::{Address, F64, I64, Native, Signature};
 use crate::rt::Context;
@@ -79,9 +79,9 @@ machine! {
     "?out_ctor" => rt_out_ctor(Address, I64, I64);
     "?out_name" => rt_out_name(Address, I64);
     "?out_handle" => rt_out_handle(Handle);
-    "?out_carried" => rt_out_carried(Handed, *const PlyType);
-    "?out_fun" => rt_out_fun(Handed, Address, I64);
-    "?out_again" => rt_out_again(Handed) -> I64;
+    "?out_carried" => rt_out_carried(OwnedWord, *const PlyType);
+    "?out_fun" => rt_out_fun(OwnedWord, Address, I64);
+    "?out_again" => rt_out_again(OwnedWord) -> I64;
     "?in_tag" => rt_in_tag() -> I64;
     "?in_int" => rt_in_int() -> I64;
     "?in_float" => rt_in_float() -> F64;
@@ -98,9 +98,9 @@ machine! {
     "?lower_close" => rt_lower_close() -> I64;
     "?lift_close" => rt_lift_close();
     "?taken" => rt_taken(Address, I64);
-    "?hold_made" => rt_hold_made(Handed) -> Handle;
-    "?hold_read" => rt_hold_read(Handle) -> Handed;
-    "?hold_taken" => rt_hold_taken(Handle) -> Handed;
+    "?hold_made" => rt_hold_made(OwnedWord) -> Handle;
+    "?hold_read" => rt_hold_read(Handle) -> OwnedWord;
+    "?hold_taken" => rt_hold_taken(Handle) -> OwnedWord;
 }
 
 pub fn runtime_natives() -> &'static [MachineNative] {
@@ -149,43 +149,43 @@ helpers! {
     rt_dec_shared_last(o: Block) -> Word;
     rt_handle_free(h: Block);
     rt_released_twice(o: Block);
-    rt_release_later(w: Handed, root: DropRoot);
+    rt_release_later(w: OwnedWord, root: DropRoot);
     rt_release_drain();
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
     rt_scheduler_entered() -> Word;
     rt_scheduler_left(was);
-    rt_pending_raised_at(effect: I64, op: I64) -> Handed;
-    rt_label_string(resource: I64, string: *const PlyType) -> Handed;
+    rt_pending_raised_at(effect: I64, op: I64) -> OwnedWord;
+    rt_label_string(resource: I64, string: *const PlyType) -> OwnedWord;
     rt_task_abandons(op: *const PlyOp) -> Word;
     rt_task_captures(op: *const PlyOp) -> Word;
-    rt_task_raises(op: *const PlyOp, args: *const Handed) -> Word;
-    rt_detached_open(body: Block, forwards: Block, instance: Block) -> Handed;
+    rt_task_raises(op: *const PlyOp, args: *const OwnedWord) -> Word;
+    rt_detached_open(body: Block, forwards: Block, instance: Block) -> OwnedWord;
     rt_detached_perform(
         record: *const Word,
         op: *const PlyOp,
         resource: I64,
-        args: *const Handed
-    ) -> Handed;
+        args: *const OwnedWord
+    ) -> OwnedWord;
     rt_detached_stop(
         record: *const Word,
         op: *const PlyOp,
         resource: I64,
-        args: *const Handed,
+        args: *const OwnedWord,
         again: I64
-    ) -> Handed;
-    rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
+    ) -> OwnedWord;
+    rt_pending_raised(string: *const PlyType, bridged: I64) -> OwnedWord;
     rt_with_cleanup(
         acquire: Block,
         body: Block,
         cleanup: Block,
         held: *const PlyType,
         result: *const PlyType
-    ) -> Handed;
+    ) -> OwnedWord;
     rt_unwind_hold(held) -> Word;
     rt_unwind_resume(held);
-    rt_branches(slots: *const Handed, n: I64);
-    rt_memo(index: I64, keep: KeepRoot) -> Handed;
-    rt_const(index: I64, keep: KeepRoot) -> Handed;
+    rt_branches(slots: *const OwnedWord, n: I64);
+    rt_memo(index: I64, keep: KeepRoot) -> OwnedWord;
+    rt_const(index: I64, keep: KeepRoot) -> OwnedWord;
     rt_keep_constant(index: I64, kept);
     rt_const_failed();
     rt_never_lifted();

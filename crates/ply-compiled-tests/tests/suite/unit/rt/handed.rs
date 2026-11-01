@@ -4,7 +4,7 @@ fn naming(fields: &[&str]) -> Context {
     context_of(fields, Vec::new())
 }
 use ply_compiled::c::builtin_helper_name;
-use ply_compiled::emitted::{Handed, PlyFunctionDescriptor, PlyOp, PlyType};
+use ply_compiled::emitted::{OwnedWord, PlyFunctionDescriptor, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
 use ply_compiled::rt::{Context, FAILED_UNWOUND_TO_HANDLER, NO_HANDLER_OBJECT};
@@ -103,7 +103,7 @@ fn op(params: &'static Params) -> PlyOp {
 fn performed(context: &mut Context, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
     let entry = NO_HANDLER_OBJECT.slot.entry;
     let result = unsafe { entry(context, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
-    unsafe { std::mem::transmute::<Handed, Word>(result) }
+    unsafe { std::mem::transmute::<OwnedWord, Word>(result) }
 }
 
 #[test]
@@ -184,8 +184,8 @@ thread_local! {
 
 const CLOSURE: Word = HEADER as Word + 8;
 
-unsafe extern "C" fn closure_release(context: *mut Context, block: Handed) -> Word {
-    let w = unsafe { std::mem::transmute::<Handed, Word>(block) };
+unsafe extern "C" fn closure_release(context: *mut Context, block: OwnedWord) -> Word {
+    let w = unsafe { std::mem::transmute::<OwnedWord, Word>(block) };
     unsafe { helper::<Free>("rt_free")(context, w, CLOSURE) };
     0
 }

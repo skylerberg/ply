@@ -59,7 +59,7 @@ pub struct Context {
     pub(crate) traced: bool,
     pub(super) scoped_made: u64,
     pub(super) outer: (*mut Heap, *const i64),
-    pub(crate) release_later: Vec<(crate::emitted::Handed, crate::emitted::DropRoot)>,
+    pub(crate) release_later: Vec<(crate::emitted::OwnedWord, crate::emitted::DropRoot)>,
     pub(crate) continuations_died: Vec<(usize, usize)>,
     pub(crate) marshallings: Vec<Marshalling>,
     pub(crate) taken: Vec<u8>,

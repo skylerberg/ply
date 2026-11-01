@@ -1,4 +1,4 @@
-use crate::emitted::{Block, Carried, Handed, Handle, PlyKept, PlyType};
+use crate::emitted::{Block, Carried, Handle, OwnedWord, PlyKept, PlyType};
 use crate::flat::Reader;
 use crate::heap::{self, Native, Word, native_of};
 use crate::native::{Address, I64, TakenBytes};
@@ -718,7 +718,7 @@ fn object<'a, T: Native>(context: *mut Context, h: &Handle, what: &str) -> Optio
     found
 }
 
-fn held(w: Word) -> Word {
+fn duplicated(w: Word) -> Word {
     Block::of(w).dup();
     w
 }
@@ -727,7 +727,11 @@ fn object_made(context: *mut Context, held: Box<dyn Native>) -> Handle {
     Handle::of(unsafe { (*context).heap.native(held) })
 }
 
-pub unsafe extern "C" fn rt_keep(context: *mut Context, x: Handed, ty: *const PlyType) -> Handle {
+pub unsafe extern "C" fn rt_keep(
+    context: *mut Context,
+    x: OwnedWord,
+    ty: *const PlyType,
+) -> Handle {
     let value = Some(unsafe { Carried::new(x, ty) });
     object_made(
         context,
@@ -740,7 +744,7 @@ pub unsafe extern "C" fn rt_keep(context: *mut Context, x: Handed, ty: *const Pl
 
 pub unsafe extern "C" fn rt_keep_compared(
     context: *mut Context,
-    x: Handed,
+    x: OwnedWord,
     kept: *const PlyKept,
 ) -> Handle {
     let kept = unsafe { &*kept };
@@ -824,13 +828,17 @@ fn comparison_operand(context: *mut Context, h: &Handle) -> Option<ComparisonOpe
     }
 }
 
-pub unsafe extern "C" fn rt_open(context: *mut Context, k: Handle, ty: *const PlyType) -> Handed {
+pub unsafe extern "C" fn rt_open(
+    context: *mut Context,
+    k: Handle,
+    ty: *const PlyType,
+) -> OwnedWord {
     let want = unsafe { &*ty };
     let Some(kept) = object::<StoredValue>(context, &k, "a kept value") else {
-        return Handed::of(0);
+        return OwnedWord::of(0);
     };
     match &kept.value {
-        Some(v) if v.ty().identity == want.identity => v.dup(context).handed(),
+        Some(v) if v.ty().identity == want.identity => v.dup(context).into_owned_word(),
         Some(v) => {
             let reason = format!(
                 "a kept `{}` was opened as `{}`",
@@ -838,14 +846,14 @@ pub unsafe extern "C" fn rt_open(context: *mut Context, k: Handle, ty: *const Pl
                 spelled(want)
             );
             internal(unsafe { &mut *context }, reason);
-            Handed::of(0)
+            OwnedWord::of(0)
         }
         None => {
             internal(
                 unsafe { &mut *context },
                 "a kept value was opened after it was let go of",
             );
-            Handed::of(0)
+            OwnedWord::of(0)
         }
     }
 }
@@ -895,17 +903,17 @@ pub fn seeded_scheduler(c: &Context) -> Option<Span> {
 
 pub unsafe extern "C" fn rt_program_resumed(
     context: *mut Context,
-    body: Handed,
+    body: OwnedWord,
     _body_value_type: *const PlyType,
     _returned: *const PlyType,
-) -> Handed {
+) -> OwnedWord {
     unsafe { &mut *context }.program_entered();
     body
 }
 
 pub unsafe extern "C" fn rt_program_paused(
     context: *mut Context,
-    result: Handed,
+    result: OwnedWord,
     ty: *const PlyType,
 ) -> Handle {
     unsafe { &mut *context }.begin_scheduling();
@@ -913,7 +921,7 @@ pub unsafe extern "C" fn rt_program_paused(
 }
 
 pub unsafe extern "C" fn rt_handle_as(_context: *mut Context, h: Handle) -> Handle {
-    Handle::of(held(h.word()))
+    Handle::of(duplicated(h.word()))
 }
 
 pub(crate) struct OpenBracket {
@@ -1069,7 +1077,7 @@ pub unsafe extern "C" fn rt_task_body(
         body,
         descriptor: descriptor as Word,
         words,
-        task: held(t.word()),
+        task: duplicated(t.word()),
     };
     object_made(context, Box::new(TaskBody(Some(started))))
 }
@@ -1128,7 +1136,7 @@ pub unsafe extern "C" fn rt_task_started(context: *mut Context, s: Handle, id: I
     if let Some(t) = unsafe { native_of::<SchedulerTask>(started.task) } {
         t.id = id.0;
     }
-    if let Some(old) = stacks.tasks.insert(n, held(started.task)) {
+    if let Some(old) = stacks.tasks.insert(n, duplicated(started.task)) {
         heap::release_object(context, old);
     }
     let body = Body {
@@ -1195,7 +1203,7 @@ pub unsafe extern "C" fn rt_task_resumed_kept(
     n: I64,
     kept: Handle,
 ) -> I64 {
-    resumed(context, &s, id, code.0, n.0, held(kept.word()))
+    resumed(context, &s, id, code.0, n.0, duplicated(kept.word()))
 }
 
 pub unsafe extern "C" fn rt_task_resumed_raising(
@@ -1308,7 +1316,7 @@ pub unsafe extern "C" fn rt_task_yielded_kept(
     b: I64,
     kept: Handle,
 ) -> I64 {
-    yielded(context, &s, code.0, [a.0, b.0], held(kept.word()))
+    yielded(context, &s, code.0, [a.0, b.0], duplicated(kept.word()))
 }
 
 pub unsafe extern "C" fn rt_heard_number(context: *mut Context, s: Handle) -> I64 {
@@ -1428,7 +1436,7 @@ pub unsafe extern "C" fn rt_task_said(context: *mut Context, t: Handle, which: I
 
 pub unsafe extern "C" fn rt_task_answer(context: *mut Context, t: Handle) -> Handle {
     match object::<SchedulerTask>(context, &t, "a task's handle").and_then(|t| t.result) {
-        Some(w) => Handle::of(held(w)),
+        Some(w) => Handle::of(duplicated(w)),
         None => {
             internal(
                 unsafe { &mut *context },

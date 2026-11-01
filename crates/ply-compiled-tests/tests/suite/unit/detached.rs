@@ -1,7 +1,7 @@
 use super::frames::{boxed, count, every_kind, freed, release_box};
 use crate::bare::{context_of, helper};
 use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEADER_WORDS, INSTANCE_VARIABLES};
-use ply_compiled::emitted::{Block, Handed, PlyFunctionDescriptor, PlyOp};
+use ply_compiled::emitted::{Block, OwnedWord, PlyFunctionDescriptor, PlyOp};
 use ply_compiled::frames::{PlyFrame, call_recording_slots};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
 use ply_compiled::native::{I64, Returned};
@@ -44,7 +44,11 @@ unsafe extern "C" fn box_each(context: *mut Context, slots: *mut Word, _d: i64) 
     release_box(context, unsafe { *slots });
 }
 
-unsafe fn holding_a_box(context: *mut Context, marker: Word, call: impl FnOnce() -> Word) -> Word {
+unsafe fn with_box_in_frame(
+    context: *mut Context,
+    marker: Word,
+    call: impl FnOnce() -> Word,
+) -> Word {
     let mut frame = Linked {
         h: PlyFrame {
             previous: std::ptr::null_mut(),
@@ -84,7 +88,7 @@ static FLIP_OP: PlyOp = PlyOp {
 
 unsafe extern "C" fn body(context: *mut Context, _block: Word, _args: *const Word) -> Word {
     unsafe {
-        holding_a_box(context, BOX_PAYLOADS[0], || {
+        with_box_in_frame(context, BOX_PAYLOADS[0], || {
             through_a_runtime_frame(context)
         })
     }
@@ -100,7 +104,7 @@ unsafe fn through_a_runtime_frame(context: *mut Context) -> Word {
     });
     let (r, back) = unsafe {
         call_recording_slots(context, held, || {
-            holding_a_box(context, BOX_PAYLOADS[4], || {
+            with_box_in_frame(context, BOX_PAYLOADS[4], || {
                 let flip = rt_detached_perform(
                     context,
                     HANDLER_RECORD_POINTER.get(),
@@ -108,7 +112,7 @@ unsafe fn through_a_runtime_frame(context: *mut Context) -> Word {
                     I64(-1),
                     std::ptr::null(),
                 );
-                let flip = std::mem::transmute::<Handed, Word>(flip);
+                let flip = std::mem::transmute::<OwnedWord, Word>(flip);
                 if (*context).failed != 0 {
                     0
                 } else {
@@ -197,8 +201,8 @@ fn closure(context: *mut Context, descriptor: &'static PlyFunctionDescriptor) ->
     w
 }
 
-unsafe extern "C" fn released(context: *mut Context, h: Handed) -> Word {
-    let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
+unsafe extern "C" fn released(context: *mut Context, h: OwnedWord) -> Word {
+    let w = unsafe { std::mem::transmute::<OwnedWord, Word>(h) };
     unsafe { helper::<Free>("rt_free")(context, w, CLOSURE) };
     0
 }
@@ -233,8 +237,8 @@ fn unit() -> Context {
 const RECORD: usize = 4;
 const INSTANCE_BYTES: Word = (HEADER + 8 * (INSTANCE_HEADER_WORDS + RECORD)) as Word;
 
-unsafe extern "C" fn instance_released(context: *mut Context, h: Handed) -> Word {
-    let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
+unsafe extern "C" fn instance_released(context: *mut Context, h: OwnedWord) -> Word {
+    let w = unsafe { std::mem::transmute::<OwnedWord, Word>(h) };
     unsafe {
         let clause = *(w as *const Word)
             .byte_add(HEADER)
@@ -271,7 +275,7 @@ unsafe fn handled(context: *mut Context, clause: &'static PlyFunctionDescriptor)
     let result =
         unsafe { rt_detached_open(context, Block::of(body), Block::of(0), Block::of(instance)) };
     unsafe { Block::of(instance).release_function_if_last(context) };
-    unsafe { std::mem::transmute::<Handed, Word>(result) }
+    unsafe { std::mem::transmute::<OwnedWord, Word>(result) }
 }
 
 fn failure(context: *mut Context) -> String {

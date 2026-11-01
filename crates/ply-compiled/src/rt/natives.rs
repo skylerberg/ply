@@ -12,22 +12,28 @@ pub(super) fn new_scoped_value(c: &mut Context, held: Word) -> Word {
 
 pub unsafe extern "C" fn rt_hold_made(
     context: *mut Context,
-    held: Handed,
+    value: OwnedWord,
 ) -> crate::emitted::Handle {
     let c = unsafe { &mut *context };
-    crate::emitted::Handle::of(new_scoped_value(c, held.word()))
+    crate::emitted::Handle::of(new_scoped_value(c, value.word()))
 }
 
-pub unsafe extern "C" fn rt_hold_read(context: *mut Context, h: crate::emitted::Handle) -> Handed {
+pub unsafe extern "C" fn rt_hold_read(
+    context: *mut Context,
+    h: crate::emitted::Handle,
+) -> OwnedWord {
     let c = unsafe { &mut *context };
-    Handed::of(
+    OwnedWord::of(
         live_scoped_object(c, &h, Mode::Read).map_or(0, |o| unsafe { word_at(o, SCOPED_VALUE) }),
     )
 }
 
-pub unsafe extern "C" fn rt_hold_taken(context: *mut Context, h: crate::emitted::Handle) -> Handed {
+pub unsafe extern "C" fn rt_hold_taken(
+    context: *mut Context,
+    h: crate::emitted::Handle,
+) -> OwnedWord {
     let c = unsafe { &mut *context };
-    Handed::of(
+    OwnedWord::of(
         live_scoped_object(c, &h, Mode::Write).map_or(0, |o| unsafe {
             let held = word_at(o, SCOPED_VALUE);
             set_word(o, SCOPED_VALUE, 0);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::emitted::{Block, DropRoot, Handed};
+use crate::emitted::{Block, DropRoot, OwnedWord};
 
 pub const RELEASE_DEPTH: i64 = 32;
 
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn rt_released_twice(context: *mut Context, o: Block) {
     );
 }
 
-pub unsafe extern "C" fn rt_release_later(context: *mut Context, w: Handed, root: DropRoot) {
+pub unsafe extern "C" fn rt_release_later(context: *mut Context, w: OwnedWord, root: DropRoot) {
     let c = unsafe { &mut *context };
     debug_assert!(
         c.release_depth >= RELEASE_DEPTH,

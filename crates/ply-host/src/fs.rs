@@ -467,7 +467,7 @@ fn run(
     root: &Path,
     path: &str,
     second: Second,
-    held: &Mutex<BTreeSet<PathBuf>>,
+    locked_paths: &Mutex<BTreeSet<PathBuf>>,
     descriptors: &Mutex<Descriptors>,
     span: Span,
 ) -> Result<Vec<u8>, Failure> {
@@ -567,8 +567,8 @@ fn run(
         (Op::ReadAt, Second::Range { offset, len }) => found(read_range(&target, offset, len)),
         (Op::Append, Second::Body(body)) => found(append_to(&target, &body).map(int)),
         (Op::Sync, _) => done(sync_path(&target)),
-        (Op::Lock, _) => done(take_lock(&target, held)),
-        (Op::Unlock, _) => done(drop_lock(&target, held)),
+        (Op::Lock, _) => done(take_lock(&target, locked_paths)),
+        (Op::Unlock, _) => done(drop_lock(&target, locked_paths)),
         (Op::Copy, Second::Path(to)) => match other(&to, Last::FollowLinks)? {
             Some(destination) => done(copy_file(&target, &destination)),
             None => op.nothing(),
