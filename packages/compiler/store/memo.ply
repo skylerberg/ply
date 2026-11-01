@@ -566,57 +566,57 @@ fn dependencies_unchanged<| e>(
       })
   }
 
-fn query_dependency_id(name: Bytes, input: Bytes) -> Bytes =
-  blake3(Bytes::concat_all([b"ply.memo.asked\x00", length_prefixed(name), input]))
+type Summing = { seen: Map<Bytes, Bool>, summary: List<Dependency>, whole: Bool }
 
-type Summing = {
-  pending: List<Dependency>,
-  seen: Map<Bytes, Bool>,
-  summary: List<Dependency>,
-  whole: Bool,
-}
+fn query_seen(name: Bytes, input: Bytes) -> Bytes =
+  Bytes::concat_all([b"asked\x00", length_prefixed(name), input])
 
-fn add_to_summary(x: Summing, rest: List<Dependency>, id: Bytes, r: Dependency) -> Summing =
-  if x.seen.contains(id) { { ..x, pending: rest } }
-  else { { ..x, pending: rest, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
+fn place_seen(kind: Bytes, at: Bytes) -> Bytes =
+  Bytes::concat_all([b"place\x00", length_prefixed(kind), at])
+
+fn add_to_summary(x: Summing, id: Bytes, r: Dependency) -> Summing =
+  if x.seen.contains(id) { x }
+  else { { ..x, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
+
+fn summed_through<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  x: Summing,
+  reads: List<Dependency>,
+  left: Int,
+) -> Summing / {memo_store.read, abort.raise} =
+  if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
+    reads.fold(x, |accumulator: Summing, r: Dependency|
+      if !accumulator.whole { accumulator } else {
+        match r {
+          ExternalDependency(kind, at, _) -> add_to_summary(accumulator, place_seen(kind, at), r),
+          QueryDependency(name, input, _) -> match queries.get(name) {
+            None -> { ..accumulator, whole: false },
+            Some(aq) -> if aq.summarized || memo_store.has_trusted_record(key_of(aq, input)) {
+              add_to_summary(accumulator, query_seen(name, input), r)
+            } else {
+              let id = query_seen(name, input);
+              if accumulator.seen.contains(id) { accumulator } else {
+                let defined = add_to_summary(
+                  { ..accumulator, seen: accumulator.seen.insert(id, true) },
+                  place_seen(query_kind(), name),
+                  ExternalDependency(query_kind(), name, digest_of(Some(aq.hash))),
+                );
+                match memo_store.record(key_of(aq, input)) {
+                  None -> { ..defined, whole: false },
+                  Some(below) -> summed_through(queries, defined, below.reads, left - 1),
+                }
+              }
+            },
+          },
+        }
+      })
+  }
 
 fn summary_of<| e>(
   queries: Map<Bytes, Query<| e>>,
   reads: List<Dependency>,
 ) -> Option<List<Dependency>> / {memo_store.read, abort.raise} = {
-  let made = iterate(
-    { pending: reads, seen: Map::new(), summary: [], whole: true },
-    100000000,
-    |x: Summing|
-      match x.pending {
-        [] -> Stop(x),
-        [r, ..rest] -> match r {
-          ExternalDependency(kind, at, _) ->
-            Continue(add_to_summary(x, rest, location_id(kind, at), r)),
-          QueryDependency(name, input, _) -> match queries.get(name) {
-            None -> Stop({ ..x, whole: false }),
-            Some(aq) -> if aq.summarized {
-              Continue(add_to_summary(x, rest, query_dependency_id(name, input), r))
-            } else {
-              let id = query_dependency_id(name, input);
-              if x.seen.contains(id) { Continue({ ..x, pending: rest }) } else {
-                let defined = add_to_summary(
-                  { ..x, seen: x.seen.insert(id, true) },
-                  rest,
-                  location_id(query_kind(), name),
-                  ExternalDependency(query_kind(), name, digest_of(Some(aq.hash))),
-                );
-                match memo_store.record(key_of(aq, input)) {
-                  None -> Stop({ ..defined, whole: false }),
-                  Some(below) ->
-                    Continue({ ..defined, pending: below.reads.concat(defined.pending) }),
-                }
-              }
-            },
-          },
-        },
-      },
-  );
+  let made = summed_through(queries, { seen: Map::new(), summary: [], whole: true }, reads, 100000);
   if made.whole { Some(made.summary) } else { None }
 }
 
@@ -1140,7 +1140,7 @@ fn test_world(files: List<{ at: Bytes, text: Bytes }>) -> TestEnvironment =
     read: 0,
   }
 
-fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> Query<| {}> =
+pub fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> Query<| {}> =
   { name: name, hash: hash, body: body, persistent: true, summarized: false }
 
 fn length_of(input: Bytes) -> Bytes / {memo.read} =
@@ -1491,9 +1491,11 @@ test "a run reads each file once, even if the file's contents change later in th
   assert_eq(next.executed, 1)
 }
 
-fn exclaim_middle(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"middle", input).concat(b"!")
+pub fn exclaim_middle(input: Bytes) -> Bytes / {memo.read} =
+  memo.fetch(b"middle", input).concat(b"!")
 
-fn middle_label(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.fetch(b"length", input))
+pub fn middle_label(input: Bytes) -> Bytes / {memo.read} =
+  b"mid ".concat(memo.fetch(b"length", input))
 
 fn summed() -> Map<Bytes, Query<| {}>> =
   test_queries(b"h1").insert(b"top", {

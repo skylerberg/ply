@@ -1,4 +1,4 @@
-import std.bytes (ascii_of_int)
+import std.bytes (first_offset, occurrences, contains_bytes, ascii_of_int)
 import compiler.syntax.parsing (span_between)
 import compiler.check.types (Type, NamedType, RecordType, fields_sorted, int_type, string_type)
 import compiler.emit.pieces (Piece, Text, merged, pieces_text)
@@ -7,10 +7,10 @@ import compiler.emit.keys (Root, Named, Unboxed, Release, root_name, root_text)
 import compiler.emit.roots (symbol_of)
 import compiler.emit.representations (constructors_of)
 import compiler.emit.release (root_of)
-import compiler.emit.typed_ir (Representation, AsInt, AsWord, AsFlattened, AsReuseToken, Variable,
-                               Rvalue, Call, Primitive, Native, Block, Do, Increment, Decrement,
-                               Free, IntOperand, VariableOperand, OwnedResult, is_refcounted,
-                               may_suspend, handle_suspends)
+import compiler.emit.typed_ir (local_var, Representation, AsInt, AsWord, AsFlattened, AsReuseToken,
+                               Variable, Rvalue, Call, Primitive, Native, Block, Do, Increment,
+                               Decrement, Free, IntOperand, VariableOperand, OwnedResult,
+                               is_refcounted, may_suspend, handle_suspends)
 import compiler.emit.typed_ir.handling (HandleSite, Clause, empty_instance)
 import compiler.emit.print.text (Printing, InstructionContext, empty_printing, function_body, line,
                                  named, name_of, part_names)
@@ -264,9 +264,6 @@ fn each_named(
   }
 }
 
-fn local(id: Int, ty: Type, rep: Representation) -> Variable =
-  { id: id, ty: ty, representation: rep }
-
 fn string_int_type() -> Type / {abort.raise} =
   RecordType(fields_sorted([{ name: b"a", ty: string_type() }, { name: b"b", ty: int_type() }]))
 
@@ -298,7 +295,7 @@ fn call_of(stops: Bool) -> Rvalue =
   })
 
 fn frame_setup() -> { printing: Printing, s: Variable, flat: Variable, n: Variable, token: Variable } / {abort.raise} = {
-  let s = local(0, string_type(), AsWord);
+  let s = local_var(0, string_type(), AsWord);
   let flat = {
     id: 1,
     ty: string_int_type(),
@@ -307,7 +304,7 @@ fn frame_setup() -> { printing: Printing, s: Variable, flat: Variable, n: Variab
       { name: b"b", representation: AsInt },
     ]),
   };
-  let n = local(2, int_type(), AsInt);
+  let n = local_var(2, int_type(), AsInt);
   let token = { ..flat, id: 3, representation: AsReuseToken(2) };
   let printing = named(
     named(named(empty_printing(Map::new().insert(0, b"p0")), flat).printing, n).printing,
@@ -316,17 +313,11 @@ fn frame_setup() -> { printing: Printing, s: Variable, flat: Variable, n: Variab
   { printing: printing, s: s, flat: flat, n: n, token: token }
 }
 
-fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
-
-fn has(t: Bytes, s: Bytes) -> Bool = t.index_of(s) != None
-
-fn at(t: Bytes, s: Bytes) -> Int = match t.index_of(s) { Some(i) -> i, None -> 0 - 1 }
-
 fn links(text: Bytes, record: Bytes) -> Bool =
-  has(text, Bytes::concat_all([b"= &", record, b".h;"]))
+  contains_bytes(text, Bytes::concat_all([b"= &", record, b".h;"]))
 
 fn unlinks(text: Bytes, record: Bytes) -> Bool =
-  has(text, Bytes::concat_all([b"= ", record, b".h.prev;"]))
+  contains_bytes(text, Bytes::concat_all([b"= ", record, b".h.prev;"]))
 
 test "a runtime call that can pause the program but cannot fail still links a frame record into the frame chain, like a call that can fail" {
   let h = frame_setup();
@@ -338,7 +329,7 @@ test "a runtime call that can pause the program but cannot fail still links a fr
   let l = site_linked(place(), h.printing, [h.s], quiet);
   let r = match l.record { Some(r) -> r, None -> b"" };
   let text = pieces_text(l.printing.out);
-  assert(links(text, r) && has(text, b"= p0;"), Some(String::of_bytes_lossy(text)));
+  assert(links(text, r) && contains_bytes(text, b"= p0;"), Some(String::of_bytes_lossy(text)));
   assert(unlinks(pieces_text(unlinked({ ..l.printing, out: [] }, 0, l).out), r), None)
 }
 
@@ -348,13 +339,13 @@ test "a call that can pause links a frame record of the values still live and co
   let r = match l.record { Some(r) -> r, None -> b"" };
   let text = pieces_text(l.printing.out);
   assert(
-    links(text, r) && has(text, b"= p0;") && has(text, b"= t1_0;"),
+    links(text, r) && contains_bytes(text, b"= p0;") && contains_bytes(text, b"= t1_0;"),
     Some(String::of_bytes_lossy(text)),
   );
-  assert(!has(text, b"= t2;"), None);
-  assert(has(record_declared(l.printing), b"s[2]"), None);
+  assert(!contains_bytes(text, b"= t2;"), None);
+  assert(contains_bytes(record_declared(l.printing), b"s[2]"), None);
   assert(
-    unlinks(l.leave, r) && at(l.leave, b".h.prev") < at(l.leave, b"goto "),
+    unlinks(l.leave, r) && first_offset(l.leave, b".h.prev") < first_offset(l.leave, b"goto "),
     Some(String::of_bytes_lossy(l.leave)),
   );
   assert(unlinks(pieces_text(unlinked({ ..l.printing, out: [] }, 0, l).out), r), None)
@@ -377,8 +368,14 @@ test "a frame record's cleanup function releases every value stored in the recor
     slots.fold(named, |q: Printing, v: Variable|
       count_printed(place(), q, Increment({ var: v, n: 1 }))).out,
   );
-  assert(has(each, b"= s[0];") && has(each, b"= s[1];"), Some(String::of_bytes_lossy(each)));
-  assert(has(each, down) && !has(each, up), Some(String::of_bytes_lossy(each)))
+  assert(
+    contains_bytes(each, b"= s[0];") && contains_bytes(each, b"= s[1];"),
+    Some(String::of_bytes_lossy(each)),
+  );
+  assert(
+    contains_bytes(each, down) && !contains_bytes(each, up),
+    Some(String::of_bytes_lossy(each)),
+  )
 }
 
 test "a frame record's cleanup function releases a value through its type's release function, and for wide sums and records with `Int` fields it loads only the counted words" {
@@ -419,11 +416,14 @@ test "a frame record's cleanup function releases a value through its type's rele
     );
     let name = |k: Int| b"x0_".concat(ascii_of_int(k));
     let named_at = |k: Int|
-      [b",", b")", b"}", b";"].any(|end: Bytes| has(each, name(k).concat(end)));
-    let loaded = |k: Int| has(each, name(k).concat(b" = s["));
+      [b",", b")", b"}", b";"].any(|end: Bytes| contains_bytes(each, name(k).concat(end)));
+    let loaded = |k: Int| contains_bytes(each, name(k).concat(b" = s["));
     let message = Some(String::of_bytes_lossy(each));
     assert(
-      has(each, symbol_of(root_text(root_name(root_of(Unboxed(Release), ty)))).concat(b"(ctx, ")),
+      contains_bytes(
+        each,
+        symbol_of(root_text(root_name(root_of(Unboxed(Release), ty)))).concat(b"(ctx, "),
+      ),
       message,
     );
     assert_eq(
@@ -461,14 +461,19 @@ test "a reuse token live across a pausing call is freed, if it was not reused, b
   let r = match l.record { Some(r) -> r, None -> b"" };
   let text = pieces_text(l.printing.out);
   assert(
-    has(text, freed) && links(text, r) && at(text, freed) < at(text, b"= &"),
+    contains_bytes(text, freed) && links(text, r)
+      && first_offset(text, freed) < first_offset(text, b"= &"),
     Some(String::of_bytes_lossy(text)),
   );
-  assert(!has(text, b"= t3;") && has(record_declared(l.printing), b"s[1]"), None);
+  assert(
+    !contains_bytes(text, b"= t3;") && contains_bytes(record_declared(l.printing), b"s[1]"),
+    None,
+  );
   let alone = site_linked(place(), h.printing, [h.token], call_of(true));
   assert_eq(alone.record, None);
   assert(
-    has(pieces_text(alone.printing.out), freed) && !has(pieces_text(alone.printing.out), b"= &"),
+    contains_bytes(pieces_text(alone.printing.out), freed)
+      && !contains_bytes(pieces_text(alone.printing.out), b"= &"),
     None,
   )
 }
@@ -484,7 +489,7 @@ test "call sites with identical live values share one cleanup function, and the 
     [occurrences(text, b"h.each = m_f_each0;"), occurrences(text, b"h.each = m_f_each1;")],
     [2, 1],
   );
-  assert(has(record_declared(wider.printing), b"s[2]"), None);
+  assert(contains_bytes(record_declared(wider.printing), b"s[2]"), None);
   assert_eq(
     occurrences(pieces_text(each_functions_printed(b"m_f", wider.printing)), b" m_f_each"),
     2,
@@ -503,7 +508,8 @@ test "an effect handler whose body can pause links its own frame record of the c
   let r = match l.record { Some(r) -> r, None -> b"" };
   let text = pieces_text(l.printing.out);
   assert(
-    links(text, r) && has(text, b"= p0;") && !has(text, b"= t2;") && has(text, b"s[1]"),
+    links(text, r) && contains_bytes(text, b"= p0;") && !contains_bytes(text, b"= t2;")
+      && contains_bytes(text, b"s[1]"),
     Some(String::of_bytes_lossy(text)),
   );
   assert_eq(record_declared(l.printing), b"");

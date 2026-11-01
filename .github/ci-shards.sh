@@ -10,7 +10,7 @@ TAB=$'\t'
 
 CLI_PARTS=4
 RUNS_ALONE=(package-compiler)
-NIGHTLY=(cli-tests:repository_audit cli-tests:copies std-tests:db_driver std-tests:pg_client)
+NIGHTLY=(cli-tests:repository_audit cli-tests:copies cli-tests:edit_sessions std-tests:db_driver std-tests:pg_client)
 RUNS_MARGIN=4
 HOST_PACKAGES=(ply-host-tests)
 
