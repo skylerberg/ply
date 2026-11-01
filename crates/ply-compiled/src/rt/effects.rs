@@ -82,8 +82,8 @@ pub type OpEntry =
 /// operation from its descriptor.
 pub const EVIDENCE_ONE_SLOT: i64 = 1;
 
-/// The flag of an evidence object any thread may perform through while the thread that holds it
-/// waits: nothing it reaches is written, and no clause it reaches unwinds that thread's stack.
+/// The flag of an evidence object that any thread may call while the thread that created it waits.
+/// Its clauses write no shared state and do not unwind that thread's stack.
 pub const EVIDENCE_SHARED: i64 = 2;
 
 /// An evidence object of the runtime's own, laid out as an evidence object is: its flags, then an
