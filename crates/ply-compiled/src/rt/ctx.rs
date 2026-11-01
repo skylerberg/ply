@@ -51,7 +51,7 @@ pub struct Ctx {
     /// ([`BRIDGE`]).
     pub bridge: Word,
     /// A word no code reads, where the release's compiler lays the context out with one.
-    pub hosted: Word,
+    pub marshal: Word,
     /// What an entry hands its root for an effect nothing handles ([`UNSERVED`]).
     pub unserved: Word,
     /// Where the perform a clause handles stood, as the site fields hold one, which compiled code
@@ -80,8 +80,8 @@ pub struct Ctx {
     /// Indices of `stacks` a finished production task gave back, which nothing names any longer.
     pub(super) free_stacks: Vec<usize>,
     pub(crate) current: usize,
-    /// Every effect a compiled `perform` performed since the entry began, for the machine's trace.
-    pub performed: Vec<Effect>,
+    /// How many compiled `perform`s ran since the entry began, for the machine's trace.
+    pub performed: u64,
     /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
@@ -133,6 +133,10 @@ pub struct Ctx {
     pub(crate) marshallings: Vec<Marshalling>,
     /// The bytes a native returned, until compiled code copies them out with [`rt_taken`].
     pub(crate) taken: Vec<u8>,
+    /// The arguments an entry's `R#entered` asks for with [`rt_entry_arguments`].
+    pub(crate) entry_arguments: Vec<u8>,
+    /// What an entry's `R#entered` said of its result through [`rt_entry_returned`].
+    pub(crate) entry_returned: Option<EntryBytes>,
     /// The context running on this thread when this one's entry began, put back when it ends.
     pub(super) outer_running: *mut Ctx,
 }
@@ -211,7 +215,7 @@ impl Ctx {
             entering_words: 0,
             recording: 0,
             bridge: object_word(&BRIDGE),
-            hosted: 0,
+            marshal: 0,
             unserved: object_word(&UNSERVED),
             performed_root: -1,
             performed_start: 0,
@@ -228,7 +232,7 @@ impl Ctx {
             stacks: vec![Vec::new()],
             free_stacks: Vec::new(),
             current: 0,
-            performed: Vec::new(),
+            performed: 0,
             detached: Vec::new(),
             starting_detached: None,
             entry: 0,
@@ -257,6 +261,8 @@ impl Ctx {
             continuations_died: Vec::new(),
             marshallings: Vec::new(),
             taken: Vec::new(),
+            entry_arguments: Vec::new(),
+            entry_returned: None,
             outer_running: std::ptr::null_mut(),
         }
     }
@@ -316,7 +322,7 @@ impl Ctx {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.pooled |= branch.pooled;
         self.grown += branch.grown;
-        self.performed.append(&mut branch.performed);
+        self.performed += branch.performed;
         self.host_use.absorb(&branch.host_use);
         self.teardown.append(&mut branch.teardown);
     }
@@ -365,7 +371,7 @@ impl Ctx {
         self.stacks.push(Vec::new());
         self.free_stacks.clear();
         self.current = 0;
-        self.performed.clear();
+        self.performed = 0;
         self.starting_detached = None;
         self.entered_sims = 0;
         self.schedulers.clear();
@@ -384,8 +390,11 @@ impl Ctx {
         self.entering_words = 0;
         self.rearm_recording();
         self.release_later.clear();
+        self.marshal = 0;
         self.marshallings.clear();
         self.taken.clear();
+        self.entry_arguments.clear();
+        self.entry_returned = None;
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.held() != 0 {
             self.end();
@@ -631,12 +640,6 @@ impl Ctx {
     /// opened, made where the body last stored a site; nothing where no such step runs, and nothing
     /// of a `task` or `clock` operation.
     pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
-        // The scheduler orders what its own operations touch itself.
-        if let crate::tasks::Touched::Effect { effect, .. } = &touched
-            && matches!(effect.as_str(), "task" | "clock")
-        {
-            return;
-        }
         let stepping =
             (self.schedulers.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
         if stepping {

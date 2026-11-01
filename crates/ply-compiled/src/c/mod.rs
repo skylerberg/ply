@@ -15,6 +15,7 @@ pub mod tables;
 
 pub use build::{Native, load_linked, load_opened};
 pub use described::described;
+pub use descriptor::Raised;
 pub use exports::{Exports, Unserved};
 pub use load::{Library, cache_dir};
 pub(crate) use prelude::machine_native;

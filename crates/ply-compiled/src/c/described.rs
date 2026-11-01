@@ -44,8 +44,11 @@ fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
     laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
         frames, release_depth, release_waiting, target, entering_desc, entering_words,
-        recording, bridge, hosted, unserved, performed_root,
+        recording, bridge, marshal, unserved, performed_root,
         performed_start, performed_end, task, alloc, constants);
+    // The release's compiler lays out `marshal` under this name.
+    out.push(("PlyCtx.hosted.at", offset_of!(Ctx, marshal)));
+    out.push(("PlyCtx.hosted.bytes", size_of::<crate::heap::Word>()));
     laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
     laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
         listed, spare);

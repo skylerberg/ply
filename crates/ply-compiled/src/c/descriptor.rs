@@ -3,6 +3,8 @@
 //! address. A compiler and a linker place all of it, so loading such a unit looks no symbol up by
 //! name and writes no table of its own.
 
+use crate::emitted::{Handed, PlyOp};
+use crate::rt::Ctx;
 use std::ffi::{c_char, c_void};
 
 /// The symbol a library's descriptor is read from.
@@ -34,6 +36,17 @@ impl TakenRow {
     }
 }
 
+/// The functions of a unit's C the runtime calls.
+#[repr(C)]
+pub struct Callbacks {
+    /// Leaves a raise nothing handles pending, the operation's arguments its to take: not 0 where
+    /// the perform is a raise, which is then done with.
+    pub raised: Raised,
+}
+
+/// `Callbacks::raised`: the context, the operation's descriptor, its mode and its arguments' words.
+pub type Raised = unsafe extern "C" fn(*mut Ctx, *const PlyOp, i64, *const Handed) -> i64;
+
 /// A `struct ply_descriptor`, as `compiler.unit` writes one after a unit's runtime. Its rows of
 /// [`TakenRow`] ascend by the bytes of their names, and each table is as long as its count.
 #[repr(C)]
@@ -41,8 +54,8 @@ pub struct Descriptor {
     exports: *const c_char,
     exports_len: usize,
     bind: *mut c_void,
-    /// Null in every unit, read by nothing.
-    _unbound: *mut c_void,
+    /// What the runtime calls back into: [`Callbacks`]. Null in a unit of the release's compiler.
+    callbacks: *const Callbacks,
     code: *const *mut c_void,
     code_count: usize,
     taken: *const TakenRow,
@@ -65,6 +78,12 @@ impl Descriptor {
     /// The unit's `ply_bind`, which takes the address of each helper it calls.
     pub fn bind(&self) -> *mut c_void {
         self.bind
+    }
+
+    /// The unit's raise function, where its compiler writes one.
+    pub fn raised(&self) -> Option<Raised> {
+        // SAFETY: a unit lays its callbacks out as `Callbacks` does.
+        unsafe { self.callbacks.as_ref() }.map(|c| c.raised)
     }
 
     /// Each compiled function's address, by its position in the unit's code table.

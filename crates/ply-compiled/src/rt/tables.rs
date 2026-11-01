@@ -13,6 +13,9 @@ pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 /// A unit's tables, which every thread running the unit reads: what a `parallel` branch may change
 /// is behind an atomic or a lock.
 pub struct Tables {
+    /// The unit's raise function: compiled code then writes and reads its own values, and an entry
+    /// hands it its arguments by [`rt_entry_arguments`].
+    pub raised: Option<crate::c::Raised>,
     /// Every field name a compiled body reads, so a field access is an index.
     pub fields: Vec<Symbol>,
     /// Every compiled function's finalized address by index, for building native closures.

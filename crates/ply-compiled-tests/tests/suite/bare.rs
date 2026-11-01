@@ -19,6 +19,7 @@ pub fn context() -> Ctx {
 #[allow(clippy::arc_with_non_send_sync)]
 pub fn context_of(fields: &[&str], functions: Vec<usize>) -> Ctx {
     Ctx::new(Arc::new(Tables {
+        raised: None,
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
         memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
         functions,
