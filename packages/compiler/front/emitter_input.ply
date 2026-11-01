@@ -421,32 +421,13 @@ pub fn root_keys(
   checked: CheckOutput,
   hashes: HashOutput,
   values: Map<Bytes, ConstantData>,
-  within: Option<TestRunScope> = None,
 ) -> List<KeyRow> / {abort.raise} = {
   let own = by_name(hashes.own);
   let sentences = by_name_many(hashes.spec_texts);
   let dependencies = by_name_names(hashes.dependencies);
   let declarations = by_name(hashes.declarations);
-  let owned = |name: Bytes| match within { Some(w) -> w.owners.contains(name), None -> true };
-  let tested = |key: Bytes| match within { Some(w) -> w.tests.contains(key), None -> true };
-  let read = match within {
-    None -> None,
-    Some(w) ->
-      Some(
-        w.owners.keys().concat(w.tests.keys()).fold(
-          Map::new(),
-          |accumulator: Map<Bytes, Bool>, name: Bytes|
-            List::fold(
-              match dependencies.get(name) { Some(ns) -> ns, None -> [] },
-              accumulator.insert(name, true),
-              |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true),
-            ),
-        ),
-      ),
-  };
   let published = Map::of_entries(
-    checked.definitions.filter(|d: DefinitionInfo|
-      match read { Some(r) -> r.contains(d.name), None -> true }).map(|d: DefinitionInfo|
+    checked.definitions.map(|d: DefinitionInfo|
       { key: d.name, value: emitted_signature_text(d, values) }),
   );
   let guarded = checked.laws.fold(Map::new(), |accumulator: Map<Bytes, Bool>, l: LawInfo|
@@ -454,7 +435,7 @@ pub fn root_keys(
   outlines.fold([], |accumulator: List<KeyRow>, o: Outline|
     o.items.fold(accumulator, |a: List<KeyRow>, item: OutlineItem|
       match item {
-        OutlinedFunction(f) -> if !owned(qualify(o.name, f.name)) { a } else {
+        OutlinedFunction(f) ->
           function_key_rows(
             published,
             own,
@@ -464,39 +445,33 @@ pub fn root_keys(
             a,
             qualify(o.name, f.name),
             f.spec,
-          )
-        },
+          ),
         OutlinedTest(t) -> {
           let name = qualify(o.name, t.name);
-          if !tested(name) { a } else {
-            let read = root_inputs_digest(published, dependencies, declarations, name, None);
-            let root = test_key(o.name, t.name);
-            let run = a.push({ root: root_text(root_name(root)), key: b"test+".concat(read) });
-            if !t.cases { run } else {
-              run.push({ root: root_text(root_name(TestCases(root))), key: b"cases+".concat(read) })
-            }
+          let read = root_inputs_digest(published, dependencies, declarations, name, None);
+          let root = test_key(o.name, t.name);
+          let run = a.push({ root: root_text(root_name(root)), key: b"test+".concat(read) });
+          if !t.cases { run } else {
+            run.push({ root: root_text(root_name(TestCases(root))), key: b"cases+".concat(read) })
           }
         },
-        OutlinedLaw(l) -> match within {
-          Some(_) -> a,
-          None -> {
-            let name = qualify(o.name, l.name);
-            match hashes.law_texts.get(name) {
-              None -> a,
-              Some(text) -> {
-                let read = root_inputs_digest(published, dependencies, declarations, name, None);
-                List::fold(
-                  if guarded.get(name) == Some(true) { [LawGuard, LawBody] } else { [LawBody] },
-                  a,
-                  |b: List<KeyRow>, part: LawPart|
-                    b.push({
-                      root: root_text(root_name(law_key(o.name, l.name, part))),
-                      key: Bytes::concat_all([hex(text), b"#", part_name(part), b"+", read]),
-                    }),
-                )
-              },
-            }
-          },
+        OutlinedLaw(l) -> {
+          let name = qualify(o.name, l.name);
+          match hashes.law_texts.get(name) {
+            None -> a,
+            Some(text) -> {
+              let read = root_inputs_digest(published, dependencies, declarations, name, None);
+              List::fold(
+                if guarded.get(name) == Some(true) { [LawGuard, LawBody] } else { [LawBody] },
+                a,
+                |b: List<KeyRow>, part: LawPart|
+                  b.push({
+                    root: root_text(root_name(law_key(o.name, l.name, part))),
+                    key: Bytes::concat_all([hex(text), b"#", part_name(part), b"+", read]),
+                  }),
+              )
+            },
+          }
         },
         _ -> a,
       }))
@@ -737,9 +712,7 @@ fn emitter_roots(
   outlines: List<Outline>,
   checked: CheckOutput,
   width_sums: WidthSums,
-  within: Option<TestRunScope> = None,
 ) -> List<EmitterRoot> / {abort.raise} = {
-  let owned = |name: Bytes| match within { Some(w) -> w.owners.contains(name), None -> true };
   let definitions = Map::of_entries(
     checked.definitions.map(|d: DefinitionInfo| { key: d.name, value: d }),
   );
@@ -754,7 +727,7 @@ fn emitter_roots(
           match item {
             OutlinedFunction(f) -> {
               let name = qualify(o.name, f.name);
-              match if owned(name) { definitions.get(name) } else { None } {
+              match definitions.get(name) {
                 None -> a,
                 Some(definition) -> {
                   let sig = emit_signature(definition.scheme.ty);
@@ -834,36 +807,30 @@ fn emitter_roots(
               };
               { ..a, tests: a.tests.push(row), specs: listed }
             },
-            OutlinedLaw(l) -> match within {
-              Some(_) -> a,
-              None -> {
-                let name = qualify(o.name, l.name);
-                let law = laws.get(name);
-                let guarded = match law { Some(x) -> x.has_guard, None -> false };
-                let binders = match law {
-                  Some(x) -> x.binders.map(|b: LawBinder| b.ty),
-                  None -> [],
-                };
-                let law_variables = variables_in(binders);
-                let place = match law {
-                  Some(x) -> span_at(x.at.module, x.at.span),
-                  None -> no_module_span(),
-                };
-                let rows = List::map(
-                  if guarded { [LawGuard, LawBody] } else { [LawBody] },
-                  |part: LawPart| {
-                    proposition_root(
-                      width_sums,
-                      law_variables,
-                      [],
-                      law_key(o.name, l.name, part),
-                      binders,
-                      place,
-                    )
-                  },
-                );
-                { ..a, specs: a.specs.concat(rows) }
-              },
+            OutlinedLaw(l) -> {
+              let name = qualify(o.name, l.name);
+              let law = laws.get(name);
+              let guarded = match law { Some(x) -> x.has_guard, None -> false };
+              let binders = match law { Some(x) -> x.binders.map(|b: LawBinder| b.ty), None -> [] };
+              let law_variables = variables_in(binders);
+              let place = match law {
+                Some(x) -> span_at(x.at.module, x.at.span),
+                None -> no_module_span(),
+              };
+              let rows = List::map(
+                if guarded { [LawGuard, LawBody] } else { [LawBody] },
+                |part: LawPart| {
+                  proposition_root(
+                    width_sums,
+                    law_variables,
+                    [],
+                    law_key(o.name, l.name, part),
+                    binders,
+                    place,
+                  )
+                },
+              );
+              { ..a, specs: a.specs.concat(rows) }
             },
             _ -> a,
           },
@@ -913,7 +880,6 @@ fn tables(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-  within: Option<TestRunScope> = None,
 ) -> Dump / {abort.raise} = {
   let functions = written_functions(outlines);
   let effs = effect_visibility(outlines);
@@ -946,8 +912,8 @@ fn tables(
     constructors: checked.constructors.map(constructor_row),
     hashes: hash_rows(outlines, hashes),
     hashes_digest: digest(hashes),
-    keys: root_keys(outlines, checked, hashes, constant_values(rows), within),
-    emitter_roots: emitter_roots(outlines, checked, width_sums, within),
+    keys: root_keys(outlines, checked, hashes, constant_values(rows)),
+    emitter_roots: emitter_roots(outlines, checked, width_sums),
     emitter_constructors: emitter_constructors_of(outlines, checked, width_sums),
     ordinals: outlines.map(ordinal_row),
     bodies: hashes.bodies,
@@ -998,7 +964,7 @@ pub fn checked_program_of(w: Analysis) -> CheckedProgram / {abort.raise} =
     checked: w.checked,
   }
 
-pub fn view_dump(v: CheckedProgram, within: Option<TestRunScope>) -> Dump / {abort.raise} = {
+pub fn view_dump(v: CheckedProgram) -> Dump / {abort.raise} = {
   let f = v.frame;
   tables(
     f.warnings,
@@ -1012,7 +978,6 @@ pub fn view_dump(v: CheckedProgram, within: Option<TestRunScope>) -> Dump / {abo
     f.pins,
     f.module_packages,
     f.embeds,
-    within,
   )
 }
 

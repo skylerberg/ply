@@ -42,10 +42,10 @@ import compiler.front (analyse_pulling_std_with)
 import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
 import compiler.check.infer (dump_flag)
-import compiler.check.infer.definitions (Extern, declared_natives, program_natives, MachineCall,
-                                         MachineValue, MachineInt, MachineFloat, MachineText,
-                                         MachineSecret, MachineObject, MachineTypeVariable,
-                                         MachineFunction, MachineUnit)
+import compiler.check.infer.definitions (Extern, extern_bin, declared_natives, program_natives,
+                                         MachineCall, MachineValue, MachineInt, MachineFloat,
+                                         MachineText, MachineSecret, MachineObject,
+                                         MachineTypeVariable, MachineFunction, MachineUnit)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.print.unit_header (unit_header, unit_tail, bound_functions, pointer_declared)
 import compiler.cc
@@ -1566,8 +1566,10 @@ pub fn part_library(
       )),
     inputs,
     |called: Map<Bytes, Bool>|
-      codes.fold([], |accumulator: List<Native>, c: UnitCode|
-        accumulator.concat(c.natives.filter(|n: Native| called.contains(n.name)))),
+      codes.fold(Map::new(), |accumulator: Map<Bytes, Native>, c: UnitCode|
+        extern_natives(c.externs).fold(accumulator, |m: Map<Bytes, Native>, n: Native|
+          if called.contains(n.name) { m.insert(n.name, n) } else { m })).values(
+      ),
     { bits: part_rule().bits, min: library_part_size(), max: library_part_size() },
     Map::new(),
     Map::new(),
@@ -1585,67 +1587,6 @@ pub fn cache_parts(
 
 pub fn read_back(sources: List<Source>) -> Result<Bytes, String> / {toolchain.read, abort.raise} =
   cc::read_back(unit_header(), sources)
-
-fn body_names(body: UnitBody) -> List<RootName> =
-  if body.tables.members.len() == 0 { [body.name] } else { body.tables.members.map(root_name) }
-
-fn request_text(roots: Map<RootName, RequestedRoot>, body: UnitBody) -> Bytes =
-  Bytes::concat_all(
-    body_names(body).map(|name: RootName|
-      match roots.get(name) {
-        Some(o) ->
-          Bytes::concat_all([
-            root_text(name),
-            b" ",
-            ascii_of_int(o.arity),
-            if o.constant { b" constant\n" } else { b"\n" },
-          ]),
-        None -> root_text(name).concat(b" unoffered\n"),
-      }),
-  )
-
-pub fn codes(made: UnitContents) -> Map<RootName, Bytes> / {abort.raise} = {
-  let bodies = made.bodies;
-  let n = bodies.len();
-  let index = range(0, n).fold(Map::new(), |accumulator: Map<RootName, Int>, i: Int|
-    body_names(bodies.get(i)).fold(accumulator, |m: Map<RootName, Int>, name: RootName|
-      m.insert(name, i)));
-  let roots = made.requested.fold(
-    Map::new(),
-    |accumulator: Map<RootName, RequestedRoot>, o: RequestedRoot| accumulator.insert(o.name, o),
-  );
-  let own = bodies.map(|b: UnitBody|
-    blake3(
-      Bytes::concat_all([
-        blake3(root_text(b.name)),
-        b.body,
-        blake3(bin::encode({ ..b.tables, shared: [] }, tables_bin())),
-        blake3(request_text(roots, b)),
-      ]),
-    ));
-  let adj = bodies.map(|b: UnitBody|
-    b.tables.calls.fold([], |accumulator: List<Int>, c: RootKey|
-      match index.get(root_name(c)) { Some(j) -> accumulator.push(j), None -> accumulator }));
-  let components = graph::components({ out: adj });
-  let downstream_digests = components.fold(Map::new(), |done: Map<Int, Bytes>, comp: List<Int>| {
-    let inside = comp.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
-    let below = comp.fold([], |accumulator: List<Bytes>, i: Int|
-      adj.get(i).fold(accumulator, |a: List<Bytes>, j: Int|
-        if inside.contains(j) { a }
-        else { match done.get(j) { Some(d) -> a.push(d), None -> a } }));
-    let digest = blake3(
-      Bytes::concat_all(sorted_unique(comp.map(|i: Int| own.get(i))).concat(sorted_unique(below))),
-    );
-    comp.fold(done, |m: Map<Int, Bytes>, i: Int| m.insert(i, digest))
-  });
-  range(0, n).fold(Map::new(), |accumulator: Map<RootName, Bytes>, i: Int| {
-    let code = blake3(
-      own.get(i).concat(match downstream_digests.get(i) { Some(d) -> d, None -> b"" }),
-    );
-    body_names(bodies.get(i)).fold(accumulator, |m: Map<RootName, Bytes>, name: RootName|
-      m.insert(name, code))
-  })
-}
 
 pub type Program = {
   roots: Map<RootName, EmitterRoot>,
@@ -2900,6 +2841,9 @@ fn entered_roots(
     EntryPoint,
   )
 
+pub fn entry_points(dump: Dump, roots: List<RootKey>) -> List<RootKey> / {abort.raise} =
+  entered_roots(program_of(dump, [], roots), roots, None)
+
 fn walked_whole<| e>(
   dump: Dump,
   p: Program,
@@ -2973,7 +2917,7 @@ pub type UnitSummary = {
 pub type UnitCode = {
   results: List<RootOutput>,
   requested: List<RequestedRoot>,
-  natives: List<Native>,
+  externs: List<Extern>,
 }
 
 derive bin for RootSummary
@@ -3167,12 +3111,12 @@ fn unit_finished<s>(w: UnitWalk<s>) -> LoweredUnit / {abort.raise} = {
           } else { accumulator },
           None -> accumulator,
         }),
-      natives: w.batches.fold(
+      externs: w.batches.fold(
         Map::new(),
-        |accumulator: Map<Bytes, Native>, _: RootName, b: LoweredBatch|
-          extern_natives(called_externs(called_natives, b.natives)).fold(
+        |accumulator: Map<Bytes, Extern>, _: RootName, b: LoweredBatch|
+          called_externs(called_natives, b.natives).fold(
             accumulator,
-            |m: Map<Bytes, Native>, x: Native| m.insert(x.name, x),
+            |m: Map<Bytes, Extern>, x: Extern| m.insert(x.name, x),
           ),
       ).values(
       ),
@@ -3751,6 +3695,37 @@ fn unmade(reason: Bytes) -> Diagnostic =
     b"this is Ply's fault, not the program's",
   ])
 
+pub fn entry_rejections(dump: Dump) -> List<Diagnostic> / {abort.raise} =
+  match requested_roots(dump).unkeyed {
+    [] -> [],
+    unkeyed ->
+      [
+        unmade(
+          Bytes::concat_all([
+            b"the entry points ",
+            Bytes::join(unkeyed.map(|n: Bytes| Bytes::concat_all([b"`", n, b"`"])), b", "),
+            b" declare no effects, so the compiler cannot identify them",
+          ]),
+        ),
+      ],
+  }
+
+pub fn code_rejections(
+  runtime: Runtime,
+  codes: List<UnitCode>,
+) -> List<Diagnostic> / {abort.raise} = {
+  let unserved = runtime_mismatches(runtime);
+  let refused = unbound(
+    runtime.natives,
+    codes.fold(Map::new(), |found: Map<Bytes, Extern>, c: UnitCode|
+      c.externs.fold(found, |m: Map<Bytes, Extern>, x: Extern| m.insert(x.name, x))).values(
+    ),
+  );
+  if unserved.len() > 0 { [runtime_rejected(unserved)] }
+  else if refused.len() > 0 { [natives_rejected(refused)] }
+  else { [] }
+}
+
 pub fn unit_parts(
   dump: Dump,
   emission: Result<Emission, Bytes>,
@@ -3762,19 +3737,7 @@ pub fn unit_parts(
     else if e.signature_mismatches.len() > 0 {
       Err([signature_mismatch_error(e.signature_mismatches)])
     } else {
-      match requested_roots(dump).unkeyed {
-        [] -> Ok(e.produced.parts),
-        unkeyed ->
-          Err([
-            unmade(
-              Bytes::concat_all([
-                b"the entry points ",
-                Bytes::join(unkeyed.map(|n: Bytes| Bytes::concat_all([b"`", n, b"`"])), b", "),
-                b" declare no effects, so the compiler cannot identify them",
-              ]),
-            ),
-          ]),
-      }
+      match entry_rejections(dump) { [] -> Ok(e.produced.parts), rejected -> Err(rejected) }
     },
   }
 
@@ -4333,77 +4296,6 @@ fn with_head(a: Output, head: Prototype) -> Output =
 fn edited_body(name: Bytes) -> Output / {abort.raise} = {
   let b = one_body(name, []);
   { ..b, text: b.text.concat(b"\n/* edited */") }
-}
-
-fn root_codes(
-  results: List<{ key: Bytes, value: Output }>,
-  offered: List<Bytes>,
-  constants: List<Bytes>,
-) -> Map<Bytes, Bytes> / {abort.raise} =
-  codes(
-    fresh(
-      [],
-      offered.map(|n: Bytes| { ..request(n, 0), constant: constants.contains(n) }),
-      1,
-      by_definition(results),
-      Map::new(),
-      no_machine,
-      part_rule(),
-    ).made,
-  ).fold(Map::new(), |m: Map<Bytes, Bytes>, n: RootName, code: Bytes| m.insert(root_text(n), code))
-
-test "a root's code changes when any body it can call changes, and not when an unrelated body changes" {
-  let program = |g: Output|
-    root_codes(
-      [
-        { key: b"m.f", value: one_body(b"m.f", [b"m.g"]) },
-        { key: b"m.g", value: g },
-        { key: b"m.h", value: one_body(b"m.h", []) },
-      ],
-      [b"m.f", b"m.g", b"m.h"],
-      [],
-    );
-  let before = program(one_body(b"m.g", []));
-  let after = program(edited_body(b"m.g"));
-  assert(before.get(b"m.f") != after.get(b"m.f"), None);
-  assert(before.get(b"m.g") != after.get(b"m.g"), None);
-  assert_eq(before.get(b"m.h"), after.get(b"m.h"));
-  assert(before.get(b"m.f") != before.get(b"m.h"), None)
-}
-
-test "a root's code hash changes when the root or a function it calls is passed as a constant, but not when an unrelated root is" {
-  let program = |constants: List<Bytes>|
-    root_codes(
-      [
-        { key: b"m.f", value: one_body(b"m.f", [b"m.g"]) },
-        { key: b"m.g", value: one_body(b"m.g", []) },
-        { key: b"m.h", value: one_body(b"m.h", []) },
-      ],
-      [b"m.f", b"m.g", b"m.h"],
-      constants,
-    );
-  let called = program([]);
-  let only_g = program([b"m.g"]);
-  assert(called.get(b"m.g") != only_g.get(b"m.g"), None);
-  assert(called.get(b"m.f") != only_g.get(b"m.f"), None);
-  assert_eq(called.get(b"m.h"), only_g.get(b"m.h"))
-}
-
-test "functions that call each other in a cycle get the same code hashes whatever order the roots are given in" {
-  let cycle = |b: Output, order: List<Bytes>|
-    root_codes(
-      [{ key: b"m.a", value: one_body(b"m.a", [b"m.b"]) }, { key: b"m.b", value: b }],
-      order,
-      [],
-    );
-  let one = cycle(one_body(b"m.b", [b"m.a"]), [b"m.a", b"m.b"]);
-  assert_eq(cycle(one_body(b"m.b", [b"m.a"]), [b"m.b", b"m.a"]), one);
-  assert(one.get(b"m.a") != one.get(b"m.b"), None);
-  let edited = {
-    let b = edited_body(b"m.b");
-    { ..b, tables: { ..b.tables, calls: [Named(b"m.a")] } }
-  };
-  assert(cycle(edited, [b"m.a", b"m.b"]).get(b"m.a") != one.get(b"m.a"), None)
 }
 
 test "a constructor's tag in a section's C code is filled in from the unit's constructor table, at the constructor's position" {
@@ -6881,24 +6773,6 @@ test "a unit lists its definitions sorted by name in byte order, with each name 
     ),
     Some(String::of_bytes_lossy(tables)),
   )
-}
-
-test "a definition's generated code changes when the `key for` function of a type that the definition mentions changes" {
-  let program = |key: Output, calls: List<Bytes>|
-    root_codes(
-      [
-        { key: b"m.make", value: one_body(b"m.make", calls) },
-        { key: b"m.area", value: key },
-        { key: b"m.edge", value: one_body(b"m.edge", []) },
-      ],
-      [b"m.make", b"m.area", b"m.edge"],
-      [],
-    );
-  let results_and_keys = program(one_body(b"m.area", []), [b"m.area"]);
-  let edited = program(edited_body(b"m.area"), [b"m.area"]);
-  let other = program(one_body(b"m.area", []), [b"m.edge"]);
-  assert(results_and_keys.get(b"m.make") != edited.get(b"m.make"), None);
-  assert(results_and_keys.get(b"m.make") != other.get(b"m.make"), None)
 }
 
 test "reading a definition that has no parameters computes its value once and caches it permanently, using the cache function for its result type" {

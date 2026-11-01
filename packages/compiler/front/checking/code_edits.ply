@@ -5,14 +5,14 @@ import compiler.emit.keys (Named, EntryPoint, test_key)
 import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone, over_decoding,
                                 prelude_frames, prelude_files, query_load)
 import compiler.front.checking.groups (GroupKey)
-import compiler.front.checking.units (CodeUnit, OfGroup, Entries, PartMembers, code_query,
-                                      code_unit_bin, program_reached, unit_code, made_part,
-                                      part_written, first_build)
-import compiler.front.checking.world (CheckQuery, RunEffects)
+import compiler.front.checking.units (OfGroup, Entries, PartCode, code_query, code_unit_bin,
+                                      codes_of_part, part_text, program_code)
+import compiler.front.checking.world (decode_cache)
 import compiler.cc (WrittenPart)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.published (analyse, dump_of)
-import compiler.store.memo (MemoryStore, Run, empty_memory_store, executed_for, in_session, reading)
+import compiler.store.memo (memo, MemoryStore, QueryStats, Run, empty_memory_store, executed_for,
+                            in_session, query_stats, reading)
 import compiler.unit (UnitCode, unit_code_bin, lowered_whole, requested_roots, sources_in_order)
 
 type Built = { codes: Map<Bytes, Bytes>, text: Bytes }
@@ -25,39 +25,22 @@ fn main_entry() -> Entries / {abort.raise} =
     tested: false,
   }
 
-fn built_over(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-) -> { run: Run, value: { run: Run, value: Built } } / {RunEffects, abort.raise} = {
-  let reached = program_reached(qs, run, main_entry());
-  let walked = reached.value.parts.fold(
-    { run: reached.run, codes: Map::new(), text: b"" },
-    |accumulator: { run: Run, codes: Map<Bytes, Bytes>, text: Bytes }, part: PartMembers| {
-      let made = made_part(qs, accumulator.run, part);
-      let written = part_written(qs, made.run, part, made.value, Map::new());
-      let coded = part.units.fold(
-        { run: written.run, codes: accumulator.codes },
-        |a: { run: Run, codes: Map<Bytes, Bytes> }, u: CodeUnit| {
-          let c = unit_code(qs, a.run, u);
-          {
-            run: c.run,
-            codes: a.codes.insert(
-              bin::encode(u, code_unit_bin()),
-              bin::encode(c.value, unit_code_bin()),
-            ),
-          }
-        },
-      );
-      {
-        run: coded.run,
-        codes: coded.codes,
-        text: written.value.fold(accumulator.text, |t: Bytes, p: WrittenPart|
-          match p.text { Some(x) -> t.concat(x), None -> t }),
-      }
-    },
-  );
-  let built = { codes: walked.codes, text: walked.text };
-  { run: walked.run, value: { run: walked.run, value: built } }
+fn built_program() -> Built / {memo.read, abort.raise} = {
+  let code = program_code(main_entry());
+  code.parts.fold({ codes: Map::new(), text: b"" }, |accumulator: Built, p: PartCode| {
+    let codes = codes_of_part(p.part);
+    {
+      codes: range(0, codes.len()).fold(accumulator.codes, |m: Map<Bytes, Bytes>, i: Int|
+        m.insert(
+          bin::encode(p.part.units.get(i), code_unit_bin()),
+          bin::encode(codes.get(i), unit_code_bin()),
+        )),
+      text: part_text(p.made, codes, Map::new()).fold(
+        accumulator.text,
+        |t: Bytes, w: WrittenPart| match w.text { Some(x) -> t.concat(x), None -> t },
+      ),
+    }
+  })
 }
 
 fn built_from(store: MemoryStore, sources: List<Source>, whole: Bool) -> Finished / {abort.raise} = {
@@ -81,11 +64,12 @@ fn built_from(store: MemoryStore, sources: List<Source>, whole: Bool) -> Finishe
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run| {
-        let checked = reading(qs, run, || query_load(w.own, [], false));
-        built_over(qs, match first {
-          Some(l) -> first_build(qs, checked.run, l, false),
-          None -> checked.run,
-        })
+        let done = reading(qs, run, || {
+          query_load(w.own, [], false);
+          match first { Some(l) -> decode_cache.cache_whole_lowering(l), None -> () };
+          built_program()
+        });
+        { run: done.run, value: done }
       }),
   );
   { store: done.store, run: done.value.run, built: done.value.value }
@@ -141,4 +125,52 @@ test "after a series of edits each unit's code equals a build from nothing" {
     warm.store
   });
   ()
+}
+
+fn chain_of(size: Int, body: Bytes) -> List<Source> = {
+  let name = |i: Int| b"lib".concat(Bytes::of_string(i.to_string()));
+  [
+    {
+      name: name(0),
+      source_text: Bytes::concat_all([b"pub fn step(n: Int) -> Int = ", body, b"\n"]),
+    },
+  ].concat(
+    range(1, size).map(|i: Int|
+      {
+        name: name(i),
+        source_text: Bytes::concat_all([
+          b"import ",
+          name(i - 1),
+          b"\npub fn step(n: Int) -> Int = ",
+          name(i - 1),
+          b"::step(n) + 1\n",
+        ]),
+      }),
+  ).push({
+    name: b"app",
+    source_text: Bytes::concat_all([
+      b"import ",
+      name(size - 1),
+      b"\npub fn main() -> Int = ",
+      name(size - 1),
+      b"::step(1)\ntest \"it adds\" { assert_eq(main(), main()) }\n",
+    ]),
+  })
+}
+
+fn queries_run(run: Run) -> List<{ query: Bytes, ran: Int }> =
+  query_stats(run).filter(|t: QueryStats| t.ran > 0).map(|t: QueryStats|
+    { query: t.query, ran: t.ran })
+
+test "a body edit runs the same queries at two program sizes, through code and parts" {
+  let edit_at = |size: Int| {
+    let cold = built_from(empty_memory_store(), chain_of(size, b"n * 3"), false);
+    queries_run(built_from(cold.store, chain_of(size, b"n * 4"), false).run)
+  };
+  assert_eq(edit_at(3), edit_at(9))
+}
+
+test "code built with nothing changed runs no query" {
+  let cold = built_from(empty_memory_store(), chain_of(3, b"n * 3"), false);
+  assert_eq(queries_run(built_from(cold.store, chain_of(3, b"n * 3"), false).run), [])
 }

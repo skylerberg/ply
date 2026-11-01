@@ -1,18 +1,18 @@
 import compiler.load (Derives, LoadedAnalysis, every_root)
 import args (Flags, could_match_filters, matches_filters, module_names)
 import units
-import units (emit, Emitted, whole_emitted)
+import units (CodeProgram, emit, Emitted, whole_emitted)
+import compiler.front.checking.units (Entries, closure_codes)
 import std.hash (blake3)
 import std.fs (fs)
 import std.time (time)
 import surface
 import machine
 import compiler.front.published (no_rows)
-import compiler.front.emitter_input (Analysed, Rejected, TestRunScope, checked_program_of,
-                                     test_root_at)
+import compiler.front.emitter_input (Analysed, Rejected, checked_program_of, test_root_at)
 import compiler.front.facts (ProgramListing, listing_of, test_label_spans)
 import compiler.front (analyse_pulling_std_with)
-import compiler.unit (codes, shipped)
+import compiler.unit (shipped)
 import compiler.store.hash.forms (ItemKeyed, ModuleHashes, Subject, reachable_by_tests,
                                   reachable_functions)
 import compiler.check.infer.checker (TestInfo, Location)
@@ -103,105 +103,55 @@ pub fn over_cases(
     })
 }
 
-type ListingScope = { front: LoadedAnalysis, reach: Map<Bytes, Bool> }
+fn test_entries(front: LoadedAnalysis) -> Entries / {abort.raise} =
+  {
+    roots: range(0, front.dump.tests.len()).fold([], |found: List<RootKey>, k: Int|
+      match test_root_at(front.dump, k) {
+        Some(r) -> found.push(r).push(TestCases(r)),
+        None -> found,
+      }),
+    tested: false,
+  }
 
 pub fn list_cases(
   testing: TestRun,
-  lister: Option<ListingScope>,
+  lister: Option<CodeProgram>,
   test_indices: List<Int>,
-) -> Result<Map<Int, Result<List<ListedCase>, ListingFailure>>, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
+) -> Result<Map<Int, Result<List<ListedCase>, ListingFailure>>, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.code, emit.compiled, emit.libraries, abort.raise} =
   match lister {
     None -> Ok(Map::new()),
-    Some(l) -> {
-      let front = l.front;
-      let tables = test_indices.fold(Map::new(), |accumulator: Map<RootName, Bool>, i: Int|
-        match test_root_at(front.dump, i) {
-          Some(r) -> accumulator.insert(root_name(TestCases(r)), true),
-          None -> accumulator,
-        });
-      match emit.unit(front, reachable_roots(front, tables, l.reach), None) {
+    Some(program) -> {
+      let front = program.front;
+      match units::library_over(
+          emit.code(program, test_entries(front)),
+          testing.options.machine.profile,
+        ) {
         Err(diagnostics) -> Err(diagnostics),
-        Ok(e) -> match units::library(e.sources, testing.options.machine.profile) {
+        Ok(library) -> match tester::unit_of(testing, front, Some(library), false) {
           Err(diagnostics) -> Err(diagnostics),
-          Ok(library) -> match tester::unit_of(testing, front, Some(library), false) {
-            Err(diagnostics) -> Err(diagnostics),
-            Ok(unit) -> {
-              let cases = test_indices.fold(
-                Map::new(),
-                |accumulator: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int|
-                  accumulator.insert(i, tester::cases(unit, i)),
-              );
-              tester::close_unit(unit);
-              Ok(cases)
-            },
+          Ok(unit) -> {
+            let cases = test_indices.fold(
+              Map::new(),
+              |accumulator: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int|
+                accumulator.insert(i, tester::cases(unit, i)),
+            );
+            tester::close_unit(unit);
+            Ok(cases)
           },
         },
       }
     },
   }
 
-pub fn scope_for_listing(
-  analysis: ProgramListing,
-  listing: List<Int>,
-) -> TestRunScope / {abort.raise} = {
-  let keys = listing.fold([], |accumulator: List<Bytes>, i: Int|
-    match test_at(analysis, i) { Some(t) -> accumulator.push(t.key), None -> accumulator });
-  {
-    owners: reachable_by_tests(analysis.hashes, keys),
-    tests: Map::of_entries(keys.map(|k: Bytes| { key: k, value: true })),
-  }
-}
-
-pub fn run_within(over: ExpandedTests, running: List<Int>) -> TestRunScope / {abort.raise} =
-  {
-    owners: reachable_from(over.analysis, running),
-    tests: running.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: Int|
-      match over.entries.at(k) {
-        Some(entry) -> accumulator.insert(entry.key, true),
-        None -> accumulator,
-      }),
-  }
-
-fn reachable_from(analysis: ProgramListing, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
-  reachable_functions(
-    analysis.hashes,
-    tests.fold([], |accumulator: List<Subject>, i: Int|
-      match test_at(analysis, i) {
-        Some(t) -> accumulator.push(ItemKeyed(t.key)),
-        None -> accumulator,
-      }),
-  )
-
-fn reachable_roots(
-  front: LoadedAnalysis,
-  own: Map<RootName, Bool>,
-  reachable_functions: Map<Bytes, Bool>,
-) -> List<RootKey> / {abort.raise} =
-  every_root(front).filter(|r: RootKey|
-    own.contains(root_name(r))
-      || (match root_owner(r) { Named(d) -> reachable_functions.contains(d), _ -> false }))
-
-fn root_owner(root: RootKey) -> RootKey = match root { Clause(c) -> c.definition, _ -> root }
-
 pub fn run_unit(
-  front: LoadedAnalysis,
-  over: ExpandedTests,
+  program: CodeProgram,
   tests: List<Int>,
-  reachable_functions: Map<Bytes, Bool>,
   schema: Bool,
-) -> Result<Option<Emitted>, List<Diagnostic>> / {emit.unit, abort.raise} =
+) -> Result<Option<Emitted>, List<Diagnostic>> / {emit.code, abort.raise} =
   if schema {
-    match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diagnostics) -> Err(diagnostics) }
+    match whole_emitted(program) { Ok(e) -> Ok(Some(e)), Err(diagnostics) -> Err(diagnostics) }
   } else if tests.len() == 0 { Ok(None) } else {
-    let own = tests.fold(Map::new(), |accumulator: Map<RootName, Bool>, k: Int|
-      match over.entries.at(k) {
-        Some(entry) -> match test_root_at(front.dump, entry.test) {
-          Some(r) -> accumulator.insert(root_name(r), true).insert(root_name(TestCases(r)), true),
-          None -> accumulator,
-        },
-        None -> accumulator,
-      });
-    match emit.unit(front, reachable_roots(front, own, reachable_functions), None) {
+    match emit.code(program, test_entries(program.front)) {
       Ok(e) -> Ok(Some(e)),
       Err(diagnostics) -> Err(diagnostics),
     }
@@ -464,7 +414,7 @@ pub fn codes_of(
   emitted: Emitted,
   entries: List<Entry>,
 ) -> Map<Int, Bytes> / {abort.raise} = {
-  let ran = codes(emitted.contents);
+  let ran = closure_codes(emitted.code);
   let code_of = |k: Int|
     match test_root_at(front.dump, k) { Some(r) -> ran.get(root_name(r)), None -> None };
   range(0, entries.len()).fold(Map::new(), |accumulator: Map<Int, Bytes>, i: Int|

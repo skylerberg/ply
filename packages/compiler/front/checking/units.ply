@@ -1,5 +1,6 @@
 import std.bin
 import std.bytes
+import std.graph
 import std.hash (blake3)
 import std.list
 import compiler.check.resolve.tables (module_of_name, qualify)
@@ -28,7 +29,7 @@ import compiler.front.published (dump_of)
 import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
                             KnownDefinitionRow)
 import compiler.store.hash.template (emitted_code)
-import compiler.store.memo (memo, query_output, Run)
+import compiler.store.memo (memo)
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (CalleeFacts, LoweredBatch, LoweredUnit, UnitCode, UnitSummary, RootSummary,
@@ -47,9 +48,15 @@ pub type Entries = { roots: List<RootKey>, tested: Bool }
 
 pub type PartMembers = { module: Bytes, label: Bytes, units: List<CodeUnit> }
 
-pub type Reached = { parts: List<PartMembers>, roots: List<RootKey> }
+pub type RootLink = { root: RootName, unit: Bytes, calls: List<RootName> }
 
-pub type MadePart = { identity: Bytes, foreign: Map<RootName, Prototype> }
+pub type Reached = { parts: List<PartMembers>, roots: List<RootKey>, links: List<RootLink> }
+
+pub type MadePart = { identity: Bytes, foreign: Map<RootName, Prototype>, codes: List<Bytes> }
+
+pub type PartCode = { part: PartMembers, made: MadePart }
+
+pub type ProgramCode = { parts: List<PartCode>, roots: List<RootKey>, links: List<RootLink> }
 
 type ProgramKey = { group: GroupKey, also: List<Mention> }
 
@@ -65,9 +72,15 @@ derive bin for Entries
 
 derive bin for PartMembers
 
+derive bin for RootLink
+
 derive bin for Reached
 
 derive bin for MadePart
+
+derive bin for PartCode
+
+derive bin for ProgramCode
 
 derive bin for ProgramKey
 
@@ -566,6 +579,7 @@ type ReachWalk = {
   seen: Map<RootName, Bool>,
   units: Map<Bytes, CodeUnit>,
   modules: Map<Bytes, ModuleUnits>,
+  links: List<RootLink>,
 }
 
 fn copy_buckets() -> Int = 16
@@ -627,21 +641,29 @@ fn with_part(
 pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let entries = decoded(input, entries_bin(), "a program's entries");
   let walked = iterate(
-    { work: entries.roots, next: 0, seen: Map::new(), units: Map::new(), modules: Map::new() },
+    {
+      work: entries.roots,
+      next: 0,
+      seen: Map::new(),
+      units: Map::new(),
+      modules: Map::new(),
+      links: [],
+    },
     1099511627776,
     |w: ReachWalk|
       match w.work.at(w.next) {
         None -> Stop(w),
         Some(k) -> if w.seen.contains(root_name(k)) { Continue({ ..w, next: w.next + 1 }) } else {
           let unit = unit_of_root(k, entries.tested);
+          let at = bin::encode(unit, code_unit_bin());
           let calls = if unit == NoCode { [] } else { roots_called(summary_of(unit), k) };
           Continue({
             ..w,
             next: w.next + 1,
             seen: w.seen.insert(root_name(k), true),
-            units: if unit == NoCode { w.units }
-            else { w.units.insert(bin::encode(unit, code_unit_bin()), unit) },
+            units: if unit == NoCode { w.units } else { w.units.insert(at, unit) },
             work: calls.fold(w.work, |all: List<RootKey>, c: RootKey| all.push(c)),
+            links: w.links.push({ root: root_name(k), unit: at, calls: calls.map(root_name) }),
           })
         },
       },
@@ -650,7 +672,10 @@ pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
     { walk: walked, parts: Map::new() },
     |b: PartsBuilt, at: Bytes, unit: CodeUnit| with_part(b, at, unit),
   );
-  bin::encode({ parts: built.parts.values(), roots: walked.work.unique() }, reached_bin())
+  bin::encode(
+    { parts: built.parts.values(), roots: walked.work.unique(), links: walked.links },
+    reached_bin(),
+  )
 }
 
 fn unit_code_of(unit: CodeUnit) -> UnitCode / {memo.read, abort.raise} =
@@ -693,15 +718,17 @@ pub fn part_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
       r.result.tables.calls.fold(f, |x: Map<RootName, Prototype>, k: RootKey|
         if own.contains(root_name(k)) || x.contains(root_name(k)) { x }
         else { foreign_head(x, k, tested) })));
+  let digests = part.units.map(|u: CodeUnit|
+    memo.output_digest(code_query(), bin::encode(u, code_unit_bin())));
   bin::encode(
     {
       identity: blake3(
-        Bytes::concat_all(
-          part.units.map(|u: CodeUnit|
-            memo.output_digest(code_query(), bin::encode(u, code_unit_bin()))),
+        Bytes::concat_all(digests).concat(
+          bin::encode(foreign, bin::map_bin(root_name_bin(), prototype_bin())),
         ),
       ),
       foreign: foreign,
+      codes: digests,
     },
     made_part_bin(),
   )
@@ -757,66 +784,118 @@ pub fn code_product_queries() -> List<Bytes> =
     constant_values_query(),
   ]
 
-pub fn program_reached(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  entries: Entries,
-) -> { run: Run, value: Reached } / {RunEffects, abort.raise} = {
-  let a = query_output(qs, run, reachable_query(), bin::encode(entries, entries_bin()));
-  { run: a.run, value: decoded(a.output, reached_bin(), "what a program reaches") }
+pub fn program_code(entries: Entries) -> ProgramCode / {memo.read, abort.raise} = {
+  let reached = decoded(
+    memo.fetch(reachable_query(), bin::encode(entries, entries_bin())),
+    reached_bin(),
+    "what a program reaches",
+  );
+  {
+    parts: reached.parts.map(|part: PartMembers|
+      {
+        part: part,
+        made: decoded(
+          memo.fetch(part_query(), bin::encode(part, part_members_bin())),
+          made_part_bin(),
+          "a part",
+        ),
+      }),
+    roots: reached.roots,
+    links: reached.links,
+  }
 }
 
-pub fn made_part(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  part: PartMembers,
-) -> { run: Run, value: MadePart } / {RunEffects, abort.raise} = {
-  let a = query_output(qs, run, part_query(), bin::encode(part, part_members_bin()));
-  { run: a.run, value: decoded(a.output, made_part_bin(), "a part") }
-}
+fn unit_digests(code: ProgramCode) -> Map<Bytes, Bytes> / {abort.raise} =
+  code.parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: PartCode|
+    range(0, p.part.units.len()).fold(found, |m: Map<Bytes, Bytes>, i: Int|
+      m.insert(bin::encode(p.part.units.get(i), code_unit_bin()), p.made.codes.get(i))))
 
-pub fn part_written(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  part: PartMembers,
-  made: MadePart,
-  inputs: Map<Bytes, Bytes>,
-) -> { run: Run, value: List<WrittenPart> } / {RunEffects, abort.raise} = {
-  let codes = part.units.fold(
-    { run: run, codes: [] },
-    |accumulator: { run: Run, codes: List<UnitCode> }, u: CodeUnit| {
-      let a = unit_code(qs, accumulator.run, u);
-      { run: a.run, codes: accumulator.codes.push(a.value) }
+pub fn closure_codes(code: ProgramCode) -> Map<RootName, Bytes> / {abort.raise} = {
+  let links = code.links;
+  let digests = unit_digests(code);
+  let own = links.map(|l: RootLink| match digests.get(l.unit) { Some(d) -> d, None -> b"" });
+  let index = range(0, links.len()).fold(Map::new(), |m: Map<RootName, Int>, i: Int|
+    m.insert(links.get(i).root, i));
+  let edges = links.map(|l: RootLink|
+    l.calls.fold([], |found: List<Int>, c: RootName|
+      match index.get(c) { Some(j) -> found.push(j), None -> found }));
+  let below = graph::components({ out: edges }).fold(
+    Map::new(),
+    |done: Map<Int, Bytes>, component: List<Int>| {
+      let inside = component.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
+      let reached = component.fold([], |found: List<Bytes>, i: Int|
+        edges.get(i).fold(found, |a: List<Bytes>, j: Int|
+          if inside.contains(j) { a }
+          else { match done.get(j) { Some(d) -> a.push(d), None -> a } }));
+      let digest = blake3(
+        Bytes::concat_all(
+          component.map(|i: Int| own.get(i)).sort().unique().concat(reached.sort().unique()),
+        ),
+      );
+      component.fold(done, |m: Map<Int, Bytes>, i: Int| m.insert(i, digest))
     },
   );
-  { run: codes.run, value: part_library(codes.codes, made.foreign, inputs).parts }
+  range(0, links.len()).fold(Map::new(), |found: Map<RootName, Bytes>, i: Int|
+    found.insert(links.get(i).root, match below.get(i) { Some(d) -> d, None -> b"" }))
 }
 
-pub fn unit_code(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  unit: CodeUnit,
-) -> { run: Run, value: UnitCode } / {RunEffects, abort.raise} = {
-  let a = query_output(qs, run, code_query(), bin::encode(unit, code_unit_bin()));
-  { run: a.run, value: decoded(a.output, unit_code_bin(), "a unit's code") }
+pub fn codes_of_part(part: PartMembers) -> List<UnitCode> / {memo.read, abort.raise} =
+  part.units.map(unit_code_of)
+
+pub fn decoded_code(bytes: Bytes) -> UnitCode / {abort.raise} =
+  decoded(bytes, unit_code_bin(), "a unit's code")
+
+pub fn encoded_code(code: UnitCode) -> Bytes / {abort.raise} = bin::encode(code, unit_code_bin())
+
+pub fn part_text(
+  made: MadePart,
+  codes: List<UnitCode>,
+  inputs: Map<Bytes, Bytes>,
+) -> List<WrittenPart> / {abort.raise} = part_library(codes, made.foreign, inputs).parts
+
+fn is_lowered(k: RootKey, tested: Bool) -> Bool / {memo.read, abort.raise} =
+  match unit_of_root(k, tested) {
+    NoCode -> true,
+    unit -> memo.is_cached(code_query(), bin::encode(unit, code_unit_bin())),
+  }
+
+pub fn whole_lowering_pays(entries: Entries) -> Bool / {memo.read, abort.raise} = {
+  let missing = entries.roots.filter(|k: RootKey| !is_lowered(k, entries.tested)).len();
+  missing > 0 && missing * 2 >= entries.roots.len()
 }
 
-pub fn first_build(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  whole: WholeLowering,
-  tested: Bool,
-) -> Run / {RunEffects, abort.raise} = {
-  decode_cache.cache_whole_lowering(whole);
-  whole.order.filter(is_named).fold(run, |r: Run, k: RootKey| {
-    let at = query_output(
-      qs,
-      r,
-      root_unit_query(),
-      bin::encode({ key: k, tested: tested }, root_at_bin()),
-    );
-    query_output(qs, at.run, code_query(), at.output).run
-  })
-}
+fn linked_program(
+  digests: Map<Bytes, Bytes>,
+  calls: Map<Bytes, List<Bytes>>,
+) -> ProgramCode / {abort.raise} =
+  {
+    parts: [
+      {
+        part: {
+          module: b"m",
+          label: b"",
+          units: digests.keys().map(|n: Bytes| OfRoot({ key: Named(n), tested: false })),
+        },
+        made: { identity: b"", foreign: Map::new(), codes: digests.values() },
+      },
+    ],
+    roots: [],
+    links: digests.keys().map(|n: Bytes|
+      {
+        root: root_name(Named(n)),
+        unit: bin::encode(OfRoot({ key: Named(n), tested: false }), code_unit_bin()),
+        calls: match calls.get(n) {
+          Some(cs) -> cs.map(|c: Bytes| root_name(Named(c))),
+          None -> [],
+        },
+      }),
+  }
 
-fn is_named(k: RootKey) -> Bool = match k { Named(_) -> true, _ -> false }
+test "a root's code digest changes when anything it can call changes, and not otherwise" {
+  let calls = Map::new().insert(b"f", [b"g"]).insert(b"g", [b"f"]);
+  let digests = |g: Bytes| Map::new().insert(b"f", b"1").insert(b"g", g).insert(b"h", b"3");
+  let before = closure_codes(linked_program(digests(b"2"), calls));
+  let after = closure_codes(linked_program(digests(b"4"), calls));
+  assert(before.get(root_name(Named(b"f"))) != after.get(root_name(Named(b"f"))), None);
+  assert_eq(before.get(root_name(Named(b"h"))), after.get(root_name(Named(b"h"))))
+}

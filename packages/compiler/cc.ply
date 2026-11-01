@@ -330,24 +330,32 @@ pub fn objects<[c]>(
 
 fn link_shared<[c]>(
   t: Toolchain,
-  objects: List<String>,
+  objects: List<List<String>>,
   work: String,
-) -> Result<String, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
-  let library = library_path(t, objects);
-  if toolchain.exists(library) { Ok(cache ++ "/" ++ library) } else {
-    let made = work ++ "/unit.so";
-    match run_all[c]([
-        t.support_flags.concat(["-shared", "-o", cache ++ "/" ++ made].concat(objects)),
-      ]) {
-      Err(reason) -> Err(reason),
-      Ok(_) -> match toolchain.read_file(made) {
-        None -> Err("the C compiler linked no library"),
-        Some(linked) -> if toolchain.write_file(made, with_stack_header(linked))
-            && toolchain.rename(made, library) { Ok(cache ++ "/" ++ library) }
-        else { Err("the library could not be written to the toolchain's cache") },
-      },
-    }
+  let libraries = objects.map(|o: List<String>| library_path(t, o));
+  let missing = range(0, objects.len()).filter(|i: Int| !toolchain.exists(libraries.get(i)));
+  let made = |i: Int| work ++ "/" ++ i.to_string() ++ ".so";
+  match run_all[c](
+      missing.map(|i: Int|
+        t.support_flags.concat(["-shared", "-o", cache ++ "/" ++ made(i)].concat(objects.get(i)))),
+    ) {
+    Err(reason) -> Err(reason),
+    Ok(_) ->
+      missing.fold(
+        Ok(libraries.map(|l: String| cache ++ "/" ++ l)),
+        |done: Result<List<String>, String>, i: Int|
+          match done {
+            Err(reason) -> Err(reason),
+            Ok(paths) -> match toolchain.read_file(made(i)) {
+              None -> Err("the C compiler linked no library"),
+              Some(linked) -> if toolchain.write_file(made(i), with_stack_header(linked))
+                  && toolchain.rename(made(i), libraries.get(i)) { Ok(paths) }
+              else { Err("the library could not be written to the toolchain's cache") },
+            },
+          },
+      ),
   }
 }
 
@@ -419,26 +427,92 @@ pub fn library<[c]>(
   p: Profile,
   sources: List<Source>,
 ) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
+  match libraries[c](p, [sources]) { Ok(paths) -> Ok(paths.get(0)), Err(reason) -> Err(reason) }
+
+pub fn libraries<[c]>(
+  p: Profile,
+  sets: List<List<Source>>,
+) -> Result<List<String>, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
   match compilers.find[c]() {
     None -> Err("no C compiler is installed to compile the unit with"),
     Some(compiler) -> {
       let t = toolchain_of(compiler, p.unit, p.checked);
       let flags = library_flags();
       let cache = toolchain.cache();
-      let made = library_path(t, sources.map(|s: Source| cache ++ "/" ++ object_path(t, flags, s)));
-      if toolchain.exists(made) { Ok(cache ++ "/" ++ made) } else {
+      let objects_of = |sources: List<Source>|
+        sources.map(|s: Source| cache ++ "/" ++ object_path(t, flags, s));
+      let lists = sets.map(objects_of);
+      let wanted = range(0, sets.len()).filter(|i: Int|
+        !toolchain.exists(library_path(t, lists.get(i))));
+      if wanted.len() == 0 { Ok(lists.map(|o: List<String>| cache ++ "/" ++ library_path(t, o))) }
+      else {
         match toolchain.temp_dir() {
           None -> Err("the toolchain's cache has no room to compile in"),
           Some(work) -> {
-            let built = match objects[c](t, sources, flags, work) {
+            let compiled = objects[c](
+              t,
+              unique_sources(wanted.fold([], |all: List<Source>, i: Int| all.concat(sets.get(i)))),
+              flags,
+              work,
+            );
+            let built = match compiled {
               Err(reason) -> Err(reason),
-              Ok(compiled) -> link_shared[c](t, compiled.paths, work),
+              Ok(_) -> link_shared[c](t, lists, work),
             };
             toolchain.remove_tree(work);
             built
           },
         }
       }
+    },
+  }
+
+fn unique_sources(sources: List<Source>) -> List<Source> =
+  sources.fold(Map::new(), |found: Map<String, Source>, s: Source|
+    found.insert(s.digest, s)).values(
+  )
+
+fn part_record<[c]>(
+  p: Profile,
+  identity: Bytes,
+) -> Option<String> / {compilers.read[c], abort.raise} =
+  match compilers.find[c]() {
+    None -> None,
+    Some(compiler) ->
+      Some(
+        "parts/"
+          ++ cache_key(toolchain_of(compiler, p.unit, p.checked), library_flags(), [identity]),
+      ),
+  }
+
+pub fn known_part_library<[c]>(
+  p: Profile,
+  identity: Bytes,
+) -> Option<String> / {compilers.read[c], toolchain.read, abort.raise} =
+  match part_record[c](p, identity) {
+    None -> None,
+    Some(record) -> match toolchain.read_file(record) {
+      None -> None,
+      Some(found) -> {
+        let library = String::of_bytes_lossy(found);
+        if toolchain.exists(library) { Some(toolchain.cache() ++ "/" ++ library) } else { None }
+      },
+    },
+  }
+
+pub fn remember_part_library<[c]>(
+  p: Profile,
+  identity: Bytes,
+  library: String,
+) -> Unit / {compilers.read[c], toolchain.read, toolchain.write, abort.raise} =
+  match part_record[c](p, identity) {
+    None -> (),
+    Some(record) -> {
+      toolchain.write_file(
+        record,
+        Bytes::of_string(library.slice(toolchain.cache().len() + 1, library.len())),
+      );
+      ()
     },
   }
 

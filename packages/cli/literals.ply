@@ -1,11 +1,8 @@
 import compiler.syntax.expressions (TaggedPart)
 import compiler.front.facts (CheckedProgram, Frame, TaggedSite)
-import compiler.front.emitter_input (TestRunScope)
-import compiler.store.hash.forms (FunctionNamed, reach)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (length_prefixed)
 import compiler.syntax.lexer (utf8_len)
-import compiler.load (entry_roots, LoadedAnalysis)
 import compiler.syntax.parsing (Span, span_between)
 import compiler.check.resolve.tables (Diagnostic, error_at)
 import compiler.unit (shipped, shipped_runtime, compiler_roots, entered_timeout_ms, identity_of)
@@ -16,7 +13,7 @@ import compiler.cc (toolchain)
 import machine
 import machine (CallResult)
 import std.machine as entering
-import program (TimedLoad, loaded_analysis, program_view, runs_statements)
+import program (TimedLoad, program_view, runs_statements)
 import sources
 import statements
 import statements (CheckSite, CheckResult, Unchecked, check_sites, check_statements,
@@ -28,8 +25,9 @@ import std.list
 import std.random (entropy)
 import std.time (time)
 import std.value (Value, VCtor, VInt, VList, VRecord, VStr, render, field_named)
+import compiler.emit.keys (Named)
 import units
-import units (emit)
+import units (CodeProgram, emit)
 import std.path (strip_root)
 
 pub type Verdict =
@@ -281,32 +279,24 @@ fn argument_of(a: EvaluationRequest) -> Value = {
   match texts { [text] -> text, _ -> VList(texts) }
 }
 
-fn test_run_scope(frame: Frame, names: List<Bytes>) -> TestRunScope / {abort.raise} =
-  {
-    owners: reach(frame.hashes, names.map(|n: Bytes| FunctionNamed(n))).functions,
-    tests: Map::new(),
-  }
-
 fn callees(requests: List<EvaluationRequest>) -> List<Bytes> =
   requests.fold([], |accumulator: List<Bytes>, a: EvaluationRequest|
     if accumulator.contains(a.callee) { accumulator } else { accumulator.push(a.callee) })
 
 fn evaluate(
-  front: LoadedAnalysis,
-  frame: Frame,
+  program: CodeProgram,
   requests: List<EvaluationRequest>,
-) -> Result<List<Verdict>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
+) -> Result<List<Verdict>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
   if requests.len() == 0 { Ok([]) } else {
-    let names = callees(requests);
     match units::library_over(
-        emit.unit(front, entry_roots(front, frame.hashes, names), None),
+        emit.code(program, { roots: callees(requests).map(Named), tested: false }),
         cc::development(),
       ) {
       Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(reason) -> Err([machine::unit_load_error(reason)]),
         Ok(opened) -> {
-          let roots = machine::roots_of(front.dump);
+          let roots = machine::roots_of(program.front.dump);
           let call = |name: Bytes, args: List<Value>|
             machine::machine_call(
               opened.unit,
@@ -356,7 +346,7 @@ type KeyedRequest = { request: EvaluationRequest, key: Bytes, cached: Option<Ver
 
 pub fn with_evaluation_cache<a | e>(
   body: () -> a / {evaluation.verdicts, evaluation.statements | e},
-) -> a / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, toolchain.bodies_dir, shipped.version, fs.read[abs], fs.write[abs], abort.raise | e} =
+) -> a / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, toolchain.bodies_dir, shipped.version, fs.read[abs], fs.write[abs], abort.raise | e} =
   handle {
     body()
   } with {
@@ -411,10 +401,9 @@ fn evaluate_and_cache(
   view: CheckedProgram,
   sought: List<KeyedRequest>,
   open: List<KeyedRequest>,
-) -> Result<List<Verdict>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.put[lit], abort.raise} = {
+) -> Result<List<Verdict>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.put[lit], abort.raise} = {
   let requests = open.map(|s: KeyedRequest| s.request);
-  let front = loaded_analysis(timed, view, Some(test_run_scope(view.frame, callees(requests))));
-  match evaluate(front, view.frame, requests) {
+  match evaluate(units::code_program(timed, view), requests) {
     Err(diagnostics) -> Err(diagnostics),
     Ok(found) -> {
       record_store.put[lit](
@@ -444,7 +433,7 @@ fn judgements(
   timed: TimedLoad,
   frame: Frame,
   checks: List<statements::StatementCheck>,
-) -> Result<List<CheckResult>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.get[lit], record_store.put[lit], abort.raise} = {
+) -> Result<List<CheckResult>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.get[lit], record_store.put[lit], abort.raise} = {
   let keyed = checks.map(|a: statements::StatementCheck| {
     let key = check_result_key(toolchain, a);
     {
@@ -467,8 +456,7 @@ fn judgements(
         None -> Err(timed.program.diagnostics),
         Some(view) ->
           check_statements(
-            |within: TestRunScope| loaded_analysis(timed, view, Some(within)),
-            frame,
+            units::code_program(timed, view),
             open.map(|k: KeyedStatement| k.request),
           ),
       } {

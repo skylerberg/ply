@@ -5,8 +5,7 @@ import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
-import compiler.front.emitter_input (Rejected, Analysed, TestRunScope, view_dump,
-                                     checked_program_of)
+import compiler.front.emitter_input (Rejected, Analysed, view_dump, checked_program_of)
 import compiler.front.facts (Analysis, ShippedModuleSummary, CheckedProgram, Frame, TableReads,
                              ModuleShape, ProgramListing, assembled_load, no_reads,
                              is_shipped_module, statement_modules)
@@ -45,7 +44,7 @@ import compiler.front.checking (CheckedModule, LoadInputs, packages_rejected, re
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
 import compiler.front.checking.view (Modules)
-import compiler.front.checking.world (ModuleResult)
+import compiler.front.checking.world (ModuleResult, SessionReads)
 import std.random (entropy)
 import std.list
 import std.string
@@ -523,7 +522,7 @@ fn assembled(
 
 pub fn in_program_store<a>(
   place: ProgramPlace,
-  work: (LoadInputs) -> a / {memo.read, abort.raise},
+  work: (LoadInputs) -> a / {SessionReads, abort.raise},
 ) -> Opened<a> / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise} =
   match place.store {
     None -> module_queries::temporary_session(place.project, work),
@@ -641,14 +640,14 @@ fn source_files(program: Program, frame: Frame) -> List<SourceFile> / {abort.rai
     })
 }
 
-fn store_of(resolved: paths::ResolvedPath) -> String =
+pub fn store_of(resolved: paths::ResolvedPath) -> String =
   paths::in_root(resolved, ".ply-cache/memo").path
 
 fn over_project<a>(
   paths: List<paths::ResolvedPath>,
   project: Project,
   no_cache: Bool,
-  work: (LoadInputs) -> a / {memo.read, abort.raise},
+  work: (LoadInputs) -> a / {SessionReads, abort.raise},
 ) -> Opened<a> / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise} =
   in_program_store({ project: project, store: if no_cache { None } else { paths.at(0) } }, work)
 
@@ -852,18 +851,21 @@ pub fn load_program(
   verify: Bool,
 ) -> Program / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let project = load_resolved(paths);
-  let results = stored_results(paths, project);
+  let results = stored_results(paths, project, false);
   program_from(paths, project, results, verify, shipping_cached(results.pulled, results.wants))
 }
 
 fn stored_results(
   paths: List<paths::ResolvedPath>,
   project: Project,
+  listed: Bool,
 ) -> QueryResults / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise} =
   if !usable(project) { module_queries::nothing() } else {
     module_queries::results_of(
       project,
-      over_project(paths, project, false, |w: LoadInputs| module_queries::module_results(w.own)),
+      over_project(paths, project, false, |w: LoadInputs|
+        if listed { module_queries::listed_results(w.own) }
+        else { module_queries::module_results(w.own) }),
     )
   }
 
@@ -917,16 +919,9 @@ pub fn pins_for(
   }
 }
 
-pub fn loaded_analysis(
-  timed: TimedLoad,
-  view: CheckedProgram,
-  within: Option<TestRunScope> = None,
-) -> LoadedAnalysis / {abort.raise} = {
+pub fn loaded_analysis(timed: TimedLoad, view: CheckedProgram) -> LoadedAnalysis / {abort.raise} = {
   {
-    dump: view_dump(
-      { ..view, frame: { ..view.frame, warnings: timed.program.diagnostics } },
-      within,
-    ),
+    dump: view_dump({ ..view, frame: { ..view.frame, warnings: timed.program.diagnostics } }),
     files: source_files(timed.program, view.frame),
     inputs: timed.program.inputs,
     read_ms: timed.read_ms,
@@ -950,9 +945,10 @@ pub fn no_loaded_analysis() -> LoadedAnalysis / {abort.raise} =
 pub fn timed_load(
   paths: List<paths::ResolvedPath>,
   verify: Bool,
+  listed: Bool = false,
 ) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let started = time.elapsed_ms();
-  timed_over(paths, load_resolved(paths), started, verify)
+  timed_over(paths, load_resolved(paths), started, verify, listed: listed)
 }
 
 pub fn timed_over(
@@ -960,10 +956,28 @@ pub fn timed_over(
   project: Project,
   started: Int,
   verify: Bool,
+  listed: Bool = false,
 ) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
-  let results = stored_results(paths, project);
+  let results = stored_results(paths, project, listed);
   let shipping = shipping_cached(results.pulled, results.wants);
   timed_from(paths, project, results, verify, shipping, time.elapsed_ms() - started, true)
+}
+
+pub type WholeFront = { front: LoadedAnalysis, hashes: HashOutput }
+
+pub fn whole_front(
+  place: ProgramPlace,
+) -> WholeFront / {entropy.next, time.now_ms, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.report_view_used, Derives, abort.raise} = {
+  let timed = timed_over(
+    match place.store { Some(r) -> [r], None -> [] },
+    place.project,
+    time.elapsed_ms(),
+    false,
+  );
+  match program_view(timed.program) {
+    Some(view) -> { front: loaded_analysis(timed, view), hashes: view.frame.hashes },
+    None -> panic("a program that checked did not load for code generation"),
+  }
 }
 
 pub fn timed_uncached(
@@ -995,7 +1009,7 @@ fn timed_from(
   let read_done = time.elapsed_ms();
   let p = program_from(paths, project, results, verify, shipping);
   {
-    program: { ..p, place: { project: project, store: None } },
+    program: { ..p, place: { project: project, store: if cached { paths.at(0) } else { None } } },
     read_ms: read_ms,
     front_end_ms: time.elapsed_ms() - read_done,
     store_ms: 0,
