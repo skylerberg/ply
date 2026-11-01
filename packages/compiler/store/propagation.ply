@@ -1,0 +1,258 @@
+import std.graph
+import std.list
+
+pub type Recomputed<d> = { group: List<d>, interface_changed: List<d> }
+
+pub fn groups_of<d | e>(
+  definitions: List<d>,
+  reads: (d) -> List<d> / e,
+) -> List<List<d>> / {abort.raise | e}
+  where derivable(ord, d)
+= {
+  let keyed = graph::keyed(definitions, reads);
+  graph::components(keyed.graph).map(|component: List<Int>| graph::named(keyed, component.sort()))
+}
+
+pub fn regrouped<d | e>(
+  changed: List<d>,
+  dependents: (d) -> List<d> / e,
+  reads: (d) -> List<d> / e,
+) -> List<List<d>> / {abort.raise | e}
+  where derivable(ord, d)
+=
+  match graph::explore(changed, dependents, 1000000000) {
+    Some(above) -> groups_of(above.keys, reads),
+    None -> panic("the definitions above an edit are more than the walk allows"),
+  }
+
+fn by_first_member<d | e>(
+  definitions: List<d>,
+  group_of: (d) -> List<d> / e,
+) -> Map<d, List<d>> / {abort.raise | e}
+  where derivable(ord, d)
+=
+  definitions.fold(Map::new(), |groups: Map<d, List<d>>, definition: d| {
+    let group = group_of(definition);
+    groups.insert(group.get(0), group)
+  })
+
+fn dependencies_first<d | e>(
+  groups: Map<d, List<d>>,
+  dependents: (d) -> List<d> / e,
+) -> List<List<d>> / {abort.raise | e}
+  where derivable(ord, d)
+=
+  if groups.len() < 2 { groups.values() } else {
+    let first_member = groups.fold(Map::new(), |found: Map<d, d>, first: d, group: List<d>|
+      group.fold(found, |members: Map<d, d>, member: d| members.insert(member, first)));
+    let readers = |first: d|
+      match groups.get(first) {
+        None -> [],
+        Some(group) ->
+          group.flat_map(dependents).fold([], |found: List<d>, reader: d|
+            match first_member.get(reader) { Some(other) -> found.push(other), None -> found }),
+      };
+    let keyed = graph::keyed(groups.keys(), readers);
+    graph::named(keyed, graph::components(keyed.graph).reverse().flatten()).fold(
+      [],
+      |ordered: List<List<d>>, first: d|
+        match groups.get(first) { Some(group) -> ordered.push(group), None -> ordered },
+    )
+  }
+
+type Round<d> = { left: Map<d, Unit>, waiting: Map<d, Unit>, recomputed: List<Recomputed<d>> }
+
+fn woken<d | e>(
+  round: Round<d>,
+  group: List<d>,
+  interface_changed: List<d>,
+  group_of: (d) -> List<d> / e,
+  dependents: (d) -> List<d> / e,
+) -> Map<d, Unit> / {abort.raise | e}
+  where derivable(ord, d)
+=
+  interface_changed.flat_map(dependents).fold(round.waiting, |waiting: Map<d, Unit>, reader: d| {
+    let first = group_of(reader).get(0);
+    if first == group.get(0) || round.left.contains(first) { waiting }
+    else { waiting.insert(reader, ()) }
+  })
+
+fn run_round<d | e>(
+  queue: List<List<d>>,
+  recomputed: List<Recomputed<d>>,
+  group_of: (d) -> List<d> / e,
+  dependents: (d) -> List<d> / e,
+  recompute: (List<d>) -> List<d> / e,
+) -> Round<d> / {abort.raise | e}
+  where derivable(ord, d)
+= {
+  let start = {
+    left: queue.fold(Map::new(), |left: Map<d, Unit>, group: List<d>|
+      left.insert(group.get(0), ())),
+    waiting: Map::new(),
+    recomputed: recomputed,
+  };
+  queue.fold(start, |round: Round<d>, group: List<d>| {
+    let interface_changed = recompute(group);
+    let running = { ..round, left: round.left.remove(group.get(0)) };
+    {
+      ..running,
+      waiting: woken(running, group, interface_changed, group_of, dependents),
+      recomputed: running.recomputed.push({ group: group, interface_changed: interface_changed }),
+    }
+  })
+}
+
+type Walk<d> = { waiting: List<d>, recomputed: List<Recomputed<d>>, met: Map<d, Unit>, count: Int }
+
+pub fn propagate<d | e>(
+  changed: List<d>,
+  group_of: (d) -> List<d> / e,
+  dependents: (d) -> List<d> / e,
+  recompute: (List<d>) -> List<d> / e,
+) -> List<Recomputed<d>> / {abort.raise | e}
+  where derivable(ord, d)
+=
+  iterate(
+    { waiting: changed, recomputed: [], met: Map::new(), count: 0 },
+    1000000000,
+    |walk: Walk<d>|
+      if walk.waiting.len() == 0 { Stop(walk.recomputed) } else {
+        let groups = by_first_member(walk.waiting, group_of);
+        let all_met = groups.fold(walk.met, |seen: Map<d, Unit>, first: d, _: List<d>|
+          seen.insert(first, ()));
+        if walk.count > all_met.len() {
+          panic("a change returned to a group it left, so `group_of` does not match `dependents`")
+        };
+        let ran = run_round(
+          dependencies_first(groups, dependents),
+          walk.recomputed,
+          group_of,
+          dependents,
+          recompute,
+        );
+        Continue({
+          waiting: ran.waiting.keys(),
+          recomputed: ran.recomputed,
+          met: all_met,
+          count: walk.count + 1,
+        })
+      },
+  )
+
+effect tally {
+  write one() -> Unit
+  read total() -> Int
+}
+
+fn alone(definition: String) -> List<String> = [definition]
+
+fn readers_from(edges: Map<String, List<String>>) -> (String) -> List<String> =
+  |definition: String| match edges.get(definition) { Some(readers) -> readers, None -> [] }
+
+fn changing(names: List<String>) -> (List<String>) -> List<String> =
+  |group: List<String>| group.filter(|definition: String| names.contains(definition))
+
+fn groups_recomputed(recomputed: List<Recomputed<String>>) -> List<List<String>> =
+  recomputed.map(|r: Recomputed<String>| r.group)
+
+fn chain() -> Map<String, List<String>> =
+  Map::of_entries([{ key: "a", value: ["b"] }, { key: "b", value: ["c"] }])
+
+test "a change whose interface did not change recomputes one definition and never reads the dependents index" {
+  let found = handle {
+    let readers = readers_from(chain());
+    let recomputed = propagate(
+      ["a"],
+      alone,
+      |definition: String| {
+        tally.one();
+        readers(definition)
+      },
+      changing([]),
+    );
+    (recomputed, tally.total())
+  } with {
+    var reads = 0,
+    tally.one() -> {
+      reads = reads + 1;
+    },
+    tally.total() -> reads,
+  };
+  assert_eq(found._0, [{ group: ["a"], interface_changed: [] }]);
+  assert_eq(found._1, 0)
+}
+
+test "a change stops at the first definition whose interface did not change" {
+  assert_eq(groups_recomputed(propagate(["a"], alone, readers_from(chain()), changing(["a"]))), [
+    ["a"],
+    ["b"],
+  ]);
+  assert_eq(
+    groups_recomputed(propagate(["a"], alone, readers_from(chain()), changing(["a", "b"]))),
+    [["a"], ["b"], ["c"]],
+  )
+}
+
+test "a group is recomputed whole and once, and readers inside it are not woken by its own change" {
+  let group_of = |definition: String|
+    if definition == "x" || definition == "y" { ["x", "y"] } else { [definition] };
+  let readers = readers_from(
+    Map::of_entries([{ key: "x", value: ["y", "z"] }, { key: "y", value: ["x"] }]),
+  );
+  assert_eq(groups_recomputed(propagate(["y", "x"], group_of, readers, changing(["x", "y"]))), [
+    ["x", "y"],
+    ["z"],
+  ])
+}
+
+test "changed definitions that read each other run dependencies first, so a reader runs once" {
+  let readers = readers_from(Map::of_entries([{ key: "z", value: ["a"] }]));
+  assert_eq(groups_recomputed(propagate(["a", "z"], alone, readers, changing(["a", "z"]))), [
+    ["z"],
+    ["a"],
+  ])
+}
+
+test "a reader on a longer path runs again after the path reaches it, and ends on the last value" {
+  let readers = readers_from(
+    Map::of_entries([
+      { key: "low", value: ["middle", "top"] },
+      { key: "middle", value: ["upper"] },
+      { key: "upper", value: ["top"] },
+    ]),
+  );
+  let recomputed = propagate(["low"], alone, readers, changing(["low", "middle", "upper"]));
+  assert_eq(groups_recomputed(recomputed).last(), Some(["top"]))
+}
+
+test "`propagate` raises rather than loops when `group_of` hides a cycle" {
+  let readers = readers_from(
+    Map::of_entries([{ key: "a", value: ["b"] }, { key: "b", value: ["a"] }]),
+  );
+  assert(match try[abort.raise] { propagate(["a"], alone, readers, changing(["a", "b"])) } {
+    Ok(_) -> false,
+    Err(_) -> true,
+  })
+}
+
+test "`groups_of` lists dependencies first, and sorts each group" {
+  let reads = readers_from(
+    Map::of_entries([
+      { key: "top", value: ["y"] },
+      { key: "y", value: ["x"] },
+      { key: "x", value: ["y", "low"] },
+    ]),
+  );
+  assert_eq(groups_of(["top", "x", "y", "low"], reads), [["low"], ["x", "y"], ["top"]])
+}
+
+test "`regrouped` finds a cycle an edit closed by looking only above the edit" {
+  let dependents = readers_from(
+    Map::of_entries([{ key: "b", value: ["a"] }, { key: "a", value: ["b"] }]),
+  );
+  let reads = readers_from(
+    Map::of_entries([{ key: "a", value: ["b", "below"] }, { key: "b", value: ["a"] }]),
+  );
+  assert_eq(regrouped(["a"], dependents, reads), [["a", "b"]])
+}

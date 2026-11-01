@@ -1,0 +1,395 @@
+import std.bin
+import std.bytes
+import std.gen
+import std.list
+
+pub type TreeRoot = { hash: Bytes, count: Int }
+
+derive bin for TreeRoot
+
+pub type TreeChild = { slot: Int, root: TreeRoot }
+
+derive bin for TreeChild
+
+pub type TreeEntry = { key: Bytes, value: Bytes }
+
+derive bin for TreeEntry
+
+pub type TreeBranch = { depth: Int, common: Bytes, children: List<TreeChild> }
+
+derive bin for TreeBranch
+
+pub type TreeNode = | Bucket(List<TreeEntry>) | Branch(TreeBranch)
+
+derive bin for TreeNode
+
+pub type TreeWrite = { key: Bytes, value: Option<Bytes> }
+
+pub type TreeUpdate = { root: Option<TreeRoot>, fresh: Map<Bytes, Bytes> }
+
+fn bucket_limit() -> Int = 8
+
+fn tree_height() -> Int = 130
+
+fn nibble(key: Bytes, depth: Int) -> Int / {abort.raise} = {
+  let byte = key.at(depth / 2);
+  if depth % 2 == 0 { byte >> 4 } else { byte & 15 }
+}
+
+fn shared_nibbles(a: Bytes, b: Bytes, from: Int, limit: Int) -> Int / {abort.raise} =
+  if from >= limit || nibble(a, from) != nibble(b, from) { from }
+  else { shared_nibbles(a, b, from + 1, limit) }
+
+fn prefix_of(key: Bytes, depth: Int) -> Bytes / {abort.raise} = {
+  let whole = key.slice(0, (depth + 1) / 2);
+  if depth % 2 == 0 { whole } else { whole.with_byte(whole.len() - 1, nibble(key, depth - 1) << 4) }
+}
+
+fn child_at(branch: TreeBranch, slot: Int) -> Option<TreeRoot> =
+  branch.children.fold(None, |found: Option<TreeRoot>, child: TreeChild|
+    if child.slot == slot { Some(child.root) } else { found })
+
+fn too_deep<a>() -> a / {abort.raise} = panic("a tree is deeper than its keys are long")
+
+fn find_within<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  key: Bytes,
+  room: Int,
+) -> Option<Bytes> / {abort.raise | e} =
+  if room <= 0 { too_deep() } else {
+    match root {
+      None -> None,
+      Some(found) -> match load(found.hash) {
+        Bucket(entries) ->
+          entries.fold(None, |value: Option<Bytes>, entry: TreeEntry|
+            if entry.key == key { Some(entry.value) } else { value }),
+        Branch(branch) ->
+          find_within(load, child_at(branch, nibble(key, branch.depth)), key, room - 1),
+      },
+    }
+  }
+
+pub fn find<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  key: Bytes,
+) -> Option<Bytes> / {abort.raise | e} = find_within(load, root, key, tree_height())
+
+fn entries_within<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  prefix: Bytes,
+  room: Int,
+) -> List<TreeEntry> / {abort.raise | e} =
+  if room <= 0 { too_deep() } else {
+    match root {
+      None -> [],
+      Some(found) -> match load(found.hash) {
+        Bucket(entries) -> entries.filter(|entry: TreeEntry| entry.key.starts_with(prefix)),
+        Branch(branch) -> {
+          let wanted = prefix.len() * 2;
+          let known = min(branch.depth, wanted);
+          if shared_nibbles(branch.common, prefix, 0, known) < known { [] }
+          else if branch.depth < wanted {
+            entries_within(load, child_at(branch, nibble(prefix, branch.depth)), prefix, room - 1)
+          } else {
+            branch.children.flat_map(|child: TreeChild|
+              entries_within(load, Some(child.root), prefix, room - 1))
+          }
+        },
+      },
+    }
+  }
+
+pub fn entries_under<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  prefix: Bytes,
+) -> List<TreeEntry> / {abort.raise | e} = entries_within(load, root, prefix, tree_height())
+
+fn stored(node: TreeNode, count: Int, fresh: Map<Bytes, Bytes>) -> TreeUpdate / {abort.raise} = {
+  let bytes = bin::encode(node, tree_node_bin());
+  let hash = bytes.blake3();
+  { root: Some({ hash: hash, count: count }), fresh: fresh.insert(hash, bytes) }
+}
+
+fn entries_by_slot(
+  entries: List<TreeEntry>,
+  depth: Int,
+) -> Map<Int, List<TreeEntry>> / {abort.raise} =
+  entries.fold(Map::new(), |slots: Map<Int, List<TreeEntry>>, entry: TreeEntry| {
+    let slot = nibble(entry.key, depth);
+    slots.insert(slot, (match slots.get(slot) { Some(found) -> found, None -> [] }).push(entry))
+  })
+
+fn built_within(
+  entries: List<TreeEntry>,
+  fresh: Map<Bytes, Bytes>,
+  room: Int,
+) -> TreeUpdate / {abort.raise} =
+  if room <= 0 { too_deep() }
+  else if entries.len() == 0 { { root: None, fresh: fresh } }
+  else if entries.len() <= bucket_limit() { stored(Bucket(entries), entries.len(), fresh) } else {
+    let first = entries.get(0).key;
+    let depth = shared_nibbles(first, entries.get(entries.len() - 1).key, 0, first.len() * 2);
+    let filled = entries_by_slot(entries, depth).fold(
+      { children: [], fresh: fresh },
+      |sofar: { children: List<TreeChild>, fresh: Map<Bytes, Bytes> }, slot: Int, group: List<TreeEntry>| {
+        let child = built_within(group, sofar.fresh, room - 1);
+        match child.root {
+          Some(root) ->
+            { children: sofar.children.push({ slot: slot, root: root }), fresh: child.fresh },
+          None -> sofar,
+        }
+      },
+    );
+    stored(
+      Branch({ depth: depth, common: prefix_of(first, depth), children: filled.children }),
+      entries.len(),
+      filled.fresh,
+    )
+  }
+
+fn built(entries: List<TreeEntry>, fresh: Map<Bytes, Bytes>) -> TreeUpdate / {abort.raise} =
+  built_within(entries, fresh, tree_height())
+
+fn applied(entries: List<TreeEntry>, writes: List<TreeWrite>) -> List<TreeEntry> = {
+  let existing = entries.fold(Map::new(), |found: Map<Bytes, Bytes>, entry: TreeEntry|
+    found.insert(entry.key, entry.value));
+  writes.fold(existing, |found: Map<Bytes, Bytes>, write: TreeWrite|
+    match write.value {
+      Some(value) -> found.insert(write.key, value),
+      None -> found.remove(write.key),
+    }).entries(
+  )
+}
+
+fn loaded_with<| e>(
+  load: (Bytes) -> TreeNode / e,
+  fresh: Map<Bytes, Bytes>,
+  hash: Bytes,
+) -> TreeNode / {abort.raise | e} =
+  match fresh.get(hash) {
+    None -> load(hash),
+    Some(bytes) -> match bin::decode(bytes, tree_node_bin()) {
+      Ok(node) -> node,
+      Err(_) -> panic("a tree node written in this run does not decode"),
+    },
+  }
+
+fn writes_by_slot(
+  writes: List<TreeWrite>,
+  depth: Int,
+) -> Map<Int, List<TreeWrite>> / {abort.raise} =
+  writes.fold(Map::new(), |slots: Map<Int, List<TreeWrite>>, write: TreeWrite| {
+    let slot = nibble(write.key, depth);
+    slots.insert(slot, (match slots.get(slot) { Some(found) -> found, None -> [] }).push(write))
+  })
+
+type RewrittenChildren = { children: Map<Int, TreeRoot>, fresh: Map<Bytes, Bytes> }
+
+fn canonical_branch<| e>(
+  load: (Bytes) -> TreeNode / e,
+  branch: TreeBranch,
+  rewritten: RewrittenChildren,
+) -> TreeUpdate / {abort.raise | e} = {
+  let count = rewritten.children.fold(0, |total: Int, _: Int, root: TreeRoot| total + root.count);
+  if count <= bucket_limit() {
+    built(
+      rewritten.children.values().flat_map(|root: TreeRoot|
+        entries_under(|hash: Bytes| loaded_with(load, rewritten.fresh, hash), Some(root), b"")),
+      rewritten.fresh,
+    )
+  } else if rewritten.children.len() == 1 {
+    { root: rewritten.children.values().at(0), fresh: rewritten.fresh }
+  } else {
+    stored(
+      Branch({
+        ..branch,
+        children: rewritten.children.fold(
+          [],
+          |children: List<TreeChild>, slot: Int, root: TreeRoot|
+            children.push({ slot: slot, root: root }),
+        ),
+      }),
+      count,
+      rewritten.fresh,
+    )
+  }
+}
+
+fn updated_within<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  writes: List<TreeWrite>,
+  fresh: Map<Bytes, Bytes>,
+  room: Int,
+) -> TreeUpdate / {abort.raise | e} =
+  if room <= 0 { too_deep() }
+  else if writes.len() == 0 { { root: root, fresh: fresh } } else {
+    match root {
+      None -> built(applied([], writes), fresh),
+      Some(found) -> match loaded_with(load, fresh, found.hash) {
+        Bucket(entries) -> built(applied(entries, writes), fresh),
+        Branch(branch) -> {
+          let split = writes.fold(branch.depth, |depth: Int, write: TreeWrite|
+            shared_nibbles(branch.common, write.key, 0, depth));
+          let outer = if split == branch.depth { branch } else {
+            {
+              depth: split,
+              common: prefix_of(branch.common, split),
+              children: [{ slot: nibble(branch.common, split), root: found }],
+            }
+          };
+          let existing = outer.children.fold(
+            Map::new(),
+            |children: Map<Int, TreeRoot>, child: TreeChild|
+              children.insert(child.slot, child.root),
+          );
+          canonical_branch(
+            load,
+            outer,
+            writes_by_slot(writes, outer.depth).fold(
+              { children: existing, fresh: fresh },
+              |sofar: RewrittenChildren, slot: Int, group: List<TreeWrite>| {
+                let child = updated_within(
+                  load,
+                  sofar.children.get(slot),
+                  group,
+                  sofar.fresh,
+                  room - 1,
+                );
+                {
+                  children: match child.root {
+                    Some(rewritten) -> sofar.children.insert(slot, rewritten),
+                    None -> sofar.children.remove(slot),
+                  },
+                  fresh: child.fresh,
+                }
+              },
+            ),
+          )
+        },
+      },
+    }
+  }
+
+pub fn updated<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  writes: List<TreeWrite>,
+  fresh: Map<Bytes, Bytes>,
+) -> TreeUpdate / {abort.raise | e} = updated_within(load, root, writes, fresh, tree_height())
+
+fn node_in(nodes: Map<Bytes, Bytes>, hash: Bytes) -> TreeNode / {abort.raise} =
+  match nodes.get(hash) {
+    None -> panic("the test's tree has no such node"),
+    Some(bytes) -> match bin::decode(bytes, tree_node_bin()) {
+      Ok(node) -> node,
+      Err(_) -> panic("the test's tree node does not decode"),
+    },
+  }
+
+fn written_entries(entries: Map<Bytes, Bytes>) -> List<TreeWrite> =
+  entries.fold([], |writes: List<TreeWrite>, key: Bytes, value: Bytes|
+    writes.push({ key: key, value: Some(value) }))
+
+fn pair_key(group: Int, member: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([byte_of_int(group), b"\x00\x00\x00", byte_of_int(member)])
+
+type Grown = { root: Option<TreeRoot>, nodes: Map<Bytes, Bytes>, model: Map<Bytes, Bytes> }
+
+fn grown(state: Grown, draw: Int) -> Grown / {abort.raise} = {
+  let key = pair_key(draw % 3, draw / 3 % 200);
+  let write = {
+    key: key,
+    value: if draw / 600 % 3 == 0 { None } else { Some(byte_of_int(draw / 1800 % 7)) },
+  };
+  let update = updated(|hash: Bytes| node_in(state.nodes, hash), state.root, [write], state.nodes);
+  {
+    root: update.root,
+    nodes: update.fresh,
+    model: match write.value {
+      Some(value) -> state.model.insert(key, value),
+      None -> state.model.remove(key),
+    },
+  }
+}
+
+test "a tree holds the entries a map would, and its root depends only on those entries, not on the order of the edits" {
+  gen::check(
+    gen::list_of(gen::below(100000), 400),
+    |draws: List<Int>| {
+      let end = draws.fold({ root: None, nodes: Map::new(), model: Map::new() }, grown);
+      let fresh_tree = built(end.model.entries(), Map::new());
+      let all = entries_under(|hash: Bytes| node_in(end.nodes, hash), end.root, b"");
+      end.root == fresh_tree.root && all == end.model.entries()
+    },
+    cases: 40,
+  )
+}
+
+test "a batch of writes gives the same root as the same writes one at a time" {
+  gen::check(
+    gen::list_of(gen::below(100000), 200),
+    |draws: List<Int>| {
+      let split = draws.len() / 2;
+      let middle = draws.take(split).fold(
+        { root: None, nodes: Map::new(), model: Map::new() },
+        grown,
+      );
+      let end = draws.drop(split).fold(middle, grown);
+      let removed = middle.model.fold([], |writes: List<TreeWrite>, key: Bytes, _: Bytes|
+        if end.model.contains(key) { writes } else { writes.push({ key: key, value: None }) });
+      let batch = removed.concat(written_entries(end.model));
+      updated(|hash: Bytes| node_in(middle.nodes, hash), middle.root, batch, middle.nodes).root
+        == end.root
+    },
+    cases: 25,
+  )
+}
+
+test "`find` and `entries_under` agree with the entries, for keys that share a long prefix and for keys that are absent" {
+  gen::check(
+    gen::list_of(gen::below(100000), 400),
+    |draws: List<Int>| {
+      let end = draws.fold({ root: None, nodes: Map::new(), model: Map::new() }, grown);
+      let load = |hash: Bytes| node_in(end.nodes, hash);
+      let groups_agree = range(0, 4).all(|group: Int| {
+        let prefix = byte_of_int(group).concat(b"\x00\x00\x00");
+        entries_under(load, end.root, prefix)
+          == end.model.entries().filter(|entry: TreeEntry| entry.key.starts_with(prefix))
+      });
+      let keys_agree = range(0, 40).all(|member: Int| {
+        let key = pair_key(member % 4, member * 5);
+        find(load, end.root, key) == end.model.get(key)
+      });
+      groups_agree && keys_agree
+    },
+    cases: 25,
+  )
+}
+
+test "changing one entry rewrites only the path down to it" {
+  let entries = range(0, 4096).fold(Map::new(), |found: Map<Bytes, Bytes>, i: Int|
+    found.insert(u64_key(i), b"value"));
+  let whole = built(entries.entries(), Map::new());
+  let edit = updated(
+    |hash: Bytes| node_in(whole.fresh, hash),
+    whole.root,
+    [{ key: u64_key(77), value: Some(b"edited") }],
+    Map::new(),
+  );
+  assert(edit.fresh.len() * 64 < whole.fresh.len(), None);
+  let back = updated(
+    |hash: Bytes| node_in(whole.fresh.merge(edit.fresh), hash),
+    edit.root,
+    [{ key: u64_key(77), value: Some(b"value") }],
+    Map::new(),
+  );
+  assert_eq(back.root, whole.root);
+  assert(back.fresh.keys().all(|hash: Bytes| whole.fresh.contains(hash)), None)
+}
+
+fn u64_key(i: Int) -> Bytes / {abort.raise} = bin::encode(i, bin::int_bin()).blake3()

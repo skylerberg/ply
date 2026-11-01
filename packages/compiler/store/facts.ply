@@ -1,0 +1,143 @@
+import std.bin
+import std.list
+
+pub type TreeState = Map<String, Bytes>
+
+pub type FileDifferences = { added: List<String>, removed: List<String>, changed: List<String> }
+
+pub fn differing_files(before: TreeState, after: TreeState) -> FileDifferences = {
+  let present = after.fold(
+    { added: [], removed: [], changed: [] },
+    |differences: FileDifferences, path: String, digest: Bytes|
+      match before.get(path) {
+        None -> { ..differences, added: differences.added.push(path) },
+        Some(earlier) -> if earlier == digest { differences }
+        else { { ..differences, changed: differences.changed.push(path) } },
+      },
+  );
+  {
+    ..present,
+    removed: before.fold([], |gone: List<String>, path: String, _: Bytes|
+      if after.contains(path) { gone } else { gone.push(path) }),
+  }
+}
+
+pub fn has_differences(differences: FileDifferences) -> Bool =
+  differences.added.len() + differences.removed.len() + differences.changed.len() > 0
+
+pub type Definition = {
+  path: String,
+  name: String,
+  own_hash: Bytes,
+  interface: Bytes,
+  check: Bytes,
+  group: Bytes,
+  reads: List<Bytes>,
+}
+
+derive bin for Definition
+
+pub type SourceModule = { path: String, definitions: List<Bytes>, lookups: List<Bytes> }
+
+derive bin for SourceModule
+
+pub type StoredFile = { path: String, digest: Bytes }
+
+derive bin for StoredFile
+
+pub fn name_key(name: String) -> Bytes = Bytes::of_string(name).blake3()
+
+pub fn module_key(path: String) -> Bytes = name_key(path)
+
+pub fn definition_key(path: String, name: String) -> Bytes =
+  name_key(path).concat(Bytes::of_string(name)).blake3()
+
+pub type ComparedDefinition = { definition: Bytes, own_hash: Bytes, interface: Bytes }
+
+pub type ChangeKind = | Added | Removed | Changed
+
+derive bin for ChangeKind
+
+pub type Change = { definition: Bytes, kind: ChangeKind, interface_changed: Bool }
+
+derive bin for Change
+
+fn by_definition(definitions: List<ComparedDefinition>) -> Map<Bytes, ComparedDefinition> =
+  definitions.fold(Map::new(), |found: Map<Bytes, ComparedDefinition>, d: ComparedDefinition|
+    found.insert(d.definition, d))
+
+pub fn compare_definitions(
+  before: List<ComparedDefinition>,
+  after: List<ComparedDefinition>,
+) -> List<Change> = {
+  let earlier = by_definition(before);
+  let later = by_definition(after);
+  let kept = later.fold(
+    [],
+    |changes: List<Change>, definition: Bytes, current: ComparedDefinition|
+      match earlier.get(definition) {
+        None -> changes.push({ definition: definition, kind: Added, interface_changed: true }),
+        Some(previous) -> if previous == current { changes } else {
+          changes.push({
+            definition: definition,
+            kind: Changed,
+            interface_changed: previous.interface != current.interface,
+          })
+        },
+      },
+  );
+  earlier.fold(kept, |changes: List<Change>, definition: Bytes, _: ComparedDefinition|
+    if later.contains(definition) { changes }
+    else { changes.push({ definition: definition, kind: Removed, interface_changed: true }) })
+}
+
+fn compared(name: String, own_hash: Bytes, interface: Bytes) -> ComparedDefinition =
+  { definition: name_key(name), own_hash: own_hash, interface: interface }
+
+test "`differing_files` finds added, removed and changed files, and an equal tree has no differences" {
+  let before = Map::of_entries([
+    { key: "kept", value: b"1" },
+    { key: "edited", value: b"2" },
+    { key: "deleted", value: b"3" },
+  ]);
+  let after = Map::of_entries([
+    { key: "kept", value: b"1" },
+    { key: "edited", value: b"changed" },
+    { key: "created", value: b"4" },
+  ]);
+  assert_eq(differing_files(before, after), {
+    added: ["created"],
+    removed: ["deleted"],
+    changed: ["edited"],
+  });
+  assert(has_differences(differing_files(before, after)));
+  assert(!has_differences(differing_files(before, before)))
+}
+
+test "`compare_definitions` reports added, removed and changed definitions, and says whether each interface changed" {
+  let found = compare_definitions(
+    [
+      compared("same", b"a", b"i"),
+      compared("body", b"b", b"i"),
+      compared("signature", b"c", b"i"),
+      compared("reached", b"d", b"i"),
+      compared("gone", b"e", b"i"),
+    ],
+    [
+      compared("same", b"a", b"i"),
+      compared("body", b"edited", b"i"),
+      compared("signature", b"edited", b"edited"),
+      compared("reached", b"d", b"edited"),
+      compared("new", b"f", b"i"),
+    ],
+  );
+  let change_of = |name: String|
+    found.filter(|c: Change| c.definition == name_key(name)).map(|c: Change|
+      (c.kind, c.interface_changed));
+  assert_eq(change_of("same"), []);
+  assert_eq(change_of("body"), [(Changed, false)]);
+  assert_eq(change_of("signature"), [(Changed, true)]);
+  assert_eq(change_of("reached"), [(Changed, true)]);
+  assert_eq(change_of("gone"), [(Removed, true)]);
+  assert_eq(change_of("new"), [(Added, true)])
+}
