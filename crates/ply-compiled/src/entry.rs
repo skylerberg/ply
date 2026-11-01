@@ -452,7 +452,11 @@ fn entered(
 ) -> (Ended, Last) {
     ctx.begin_bounded(run.timeout_ms);
     let giving_back = GivingBack(std::ptr::from_mut(ctx));
-    ctx.open_entry(arguments);
+    if ctx.tables.raised.is_some() {
+        ctx.entry_arguments = arguments;
+    } else {
+        ctx.open_entry(arguments);
+    }
     let entering = std::ptr::from_mut(ctx);
     let none: [i64; 0] = [];
     // SAFETY: the unit owns the entry's pages and outlives the call, `ctx` is this entry's alone,
@@ -500,7 +504,13 @@ fn returned(ctx: &mut Ctx) -> Last {
 
 /// How an entry whose root returned ended: its result's bytes, or why the boundary keeps it.
 fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
-    match crate::rt::close_entry(ctx) {
+    let result = if ctx.tables.raised.is_some() {
+        (ctx.entry_returned.take())
+            .ok_or_else(|| "the entry said nothing of its result".to_string())
+    } else {
+        crate::rt::close_entry(ctx)
+    };
+    match result {
         Ok(EntryBytes::Bytes(bytes)) => Ended::Returned(bytes),
         Ok(EntryBytes::Function) => {
             Ended::NotReturnable("its result holds a function the program wrote")

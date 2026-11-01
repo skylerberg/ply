@@ -143,6 +143,7 @@ fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<N
         })
         .collect();
     let tables = Tables {
+        raised: unit.raised(),
         fields,
         memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
         functions,

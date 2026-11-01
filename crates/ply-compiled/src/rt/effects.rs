@@ -163,8 +163,16 @@ unsafe fn at_entry(
     let c = unsafe { &mut *ctx };
     let described = unsafe { &*op };
     let (effect, name) = named_op(c, described);
+    if let Some(raised) = c.tables.raised
+        && unsafe { raised(ctx, op, mode.0, args) } != 0
+    {
+        return Handed::of(0);
+    }
+    let c = unsafe { &mut *ctx };
     let args = args_of(args.cast(), described.params_len);
-    if mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()) {
+    if c.tables.raised.is_none()
+        && (mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()))
+    {
         return Handed::of(pending_raise(c, &effect, &name, raised_of(args, described)));
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
@@ -344,6 +352,40 @@ pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Rai
     .showing(carried)
     .primary(c.site(), "raised here");
     c.pend_raised(d, effect.clone(), op.clone(), args)
+}
+
+/// Leaves pending the raise compiled code described: `texts` holds an address and a byte count
+/// for each of the code, the message, the primary label, what a clause for `abort.raise` is handed,
+/// `notes` notes and `shown` values as PLV1 bytes. `op` names the raise where it is not
+/// `abort.raise`, and this takes its arguments, the words at `args`. The diagnostic is placed at
+/// the site the body last stored.
+pub unsafe extern "C" fn rt_pended(
+    ctx: *mut Ctx,
+    op: *const PlyOp,
+    args: *const Handed,
+    texts: *const Word,
+    notes: I64,
+    shown: I64,
+) {
+    let c = unsafe { &mut *ctx };
+    let bytes = |at: usize| {
+        let (address, count) = unsafe { (*texts.add(2 * at), *texts.add(2 * at + 1)) };
+        unsafe { borrowed(crate::native::Addr(address as *mut u8), I64(count)) }
+    };
+    let text = |at: usize| String::from_utf8_lossy(bytes(at)).into_owned();
+    let (notes, shown) = (notes.0 as usize, shown.0 as usize);
+    let code = ply_core::intern_code(&text(0));
+    let noted = (4..4 + notes).fold(Diagnostic::error(code, text(1)), |d, at| d.note(text(at)));
+    let values = (4 + notes..4 + notes + shown).map(|at| bytes(at).to_vec());
+    let d = noted.showing(values.collect()).primary(c.site(), text(2));
+    if op.is_null() {
+        c.pend(d, text(3));
+        return;
+    }
+    let described = unsafe { &*op };
+    let (effect, name) = named_op(c, described);
+    let raised = raised_of(args_of(args.cast(), described.params_len), described);
+    c.pend_raised(d, effect, name, raised);
 }
 
 /// The message an `abort.raise` carries, empty where it does not lower to a string.

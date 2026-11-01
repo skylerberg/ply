@@ -565,6 +565,39 @@ pub unsafe extern "C" fn rt_lift_close(ctx: *mut Ctx) {
     }
 }
 
+/// How many bytes are taken.
+pub unsafe extern "C" fn rt_taken_count(ctx: *mut Ctx) -> I64 {
+    I64(unsafe { &*ctx }.taken.len() as i64)
+}
+
+/// How many bytes an entry's arguments are, the bytes left as the taken bytes.
+pub unsafe extern "C" fn rt_entry_arguments(ctx: *mut Ctx) -> I64 {
+    let c = unsafe { &mut *ctx };
+    let bytes = std::mem::take(&mut c.entry_arguments);
+    c.give(bytes)
+}
+
+/// What an entry's `R#entered` wrote of its root's result: the `n` bytes at `at` where `kind` is 0,
+/// and for 1 and 2 what the result holds that no bytes can.
+pub unsafe extern "C" fn rt_entry_returned(ctx: *mut Ctx, kind: I64, at: Addr, n: I64) {
+    let bytes = unsafe { borrowed(at, n) };
+    unsafe { &mut *ctx }.entry_returned = Some(match kind.0 {
+        0 => EntryBytes::Bytes(bytes.to_vec()),
+        1 => EntryBytes::Function,
+        _ => EntryBytes::Holding,
+    });
+}
+
+/// How many bytes the name of field-table entry `i` is, the bytes left as the taken bytes.
+pub unsafe extern "C" fn rt_field_text(ctx: *mut Ctx, i: I64) -> I64 {
+    let c = unsafe { &mut *ctx };
+    let name = usize::try_from(i.0)
+        .ok()
+        .and_then(|i| c.tables.fields.get(i));
+    let bytes = name.map_or(Vec::new(), |n| n.as_bytes().to_vec());
+    c.give(bytes)
+}
+
 /// Copies the taken bytes, `n` of them, to `dst`.
 pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
     let c = unsafe { &mut *ctx };
@@ -640,6 +673,11 @@ fn lowering(
 /// `s` lifted through `string`, the type of `String`; `None` with the context failed where it does
 /// not cross.
 pub(crate) fn string_lifted(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {
+    if unsafe { &*ctx }.tables.raised.is_some() {
+        unsafe { &mut *ctx }.give(s.as_bytes().to_vec());
+        let w = unsafe { (string.lift)(ctx) };
+        return (unsafe { &*ctx }.failed == 0).then(|| Handed::of(w));
+    }
     let mut w = codec::Writer::new();
     w.str(s.as_bytes());
     lifted_from(ctx, w.finish(), string)

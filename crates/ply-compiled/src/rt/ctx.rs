@@ -51,7 +51,7 @@ pub struct Ctx {
     /// ([`BRIDGE`]).
     pub bridge: Word,
     /// A word no code reads, where the release's compiler lays the context out with one.
-    pub hosted: Word,
+    pub marshal: Word,
     /// What an entry hands its root for an effect nothing handles ([`UNSERVED`]).
     pub unserved: Word,
     /// Where the perform a clause handles stood, as the site fields hold one, which compiled code
@@ -133,6 +133,10 @@ pub struct Ctx {
     pub(crate) marshallings: Vec<Marshalling>,
     /// The bytes a native returned, until compiled code copies them out with [`rt_taken`].
     pub(crate) taken: Vec<u8>,
+    /// The arguments an entry's `R#entered` asks for with [`rt_entry_arguments`].
+    pub(crate) entry_arguments: Vec<u8>,
+    /// What an entry's `R#entered` said of its result through [`rt_entry_returned`].
+    pub(crate) entry_returned: Option<EntryBytes>,
     /// The context running on this thread when this one's entry began, put back when it ends.
     pub(super) outer_running: *mut Ctx,
 }
@@ -211,7 +215,7 @@ impl Ctx {
             entering_words: 0,
             recording: 0,
             bridge: object_word(&BRIDGE),
-            hosted: 0,
+            marshal: 0,
             unserved: object_word(&UNSERVED),
             performed_root: -1,
             performed_start: 0,
@@ -257,6 +261,8 @@ impl Ctx {
             continuations_died: Vec::new(),
             marshallings: Vec::new(),
             taken: Vec::new(),
+            entry_arguments: Vec::new(),
+            entry_returned: None,
             outer_running: std::ptr::null_mut(),
         }
     }
@@ -384,8 +390,11 @@ impl Ctx {
         self.entering_words = 0;
         self.rearm_recording();
         self.release_later.clear();
+        self.marshal = 0;
         self.marshallings.clear();
         self.taken.clear();
+        self.entry_arguments.clear();
+        self.entry_returned = None;
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.held() != 0 {
             self.end();
