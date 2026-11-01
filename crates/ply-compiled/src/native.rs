@@ -34,8 +34,6 @@ pub enum Machine {
     Op,
     /// A drop root's address.
     DropRoot,
-    /// A keep root's address.
-    KeepRoot,
     /// How many bytes a native left as the context's taken bytes, which emitted code copies out.
     Taken,
     /// A `Secret`'s handle: borrowed by a native that takes one, owned by the code a native returns
@@ -59,7 +57,6 @@ impl Machine {
             Machine::Type => "Type",
             Machine::Op => "Op",
             Machine::DropRoot => "DropRoot",
-            Machine::KeepRoot => "KeepRoot",
             Machine::Taken => "Taken",
             Machine::Secret => "Secret",
         }

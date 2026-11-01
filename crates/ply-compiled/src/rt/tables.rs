@@ -35,12 +35,6 @@ pub struct Root {
 }
 
 impl Tables {
-    /// The memo's word for the pure nullary function at `index`, if it has one.
-    pub fn memoized(&self, index: usize) -> Option<Word> {
-        let w = self.memo.get(index)?.load(Acquire);
-        (w != 0).then_some(w)
-    }
-
     /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s
     /// result. The first kept stays; one another thread keeps after it stays in the unit's
     /// persistent heap, unread.
