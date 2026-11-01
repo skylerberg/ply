@@ -2,7 +2,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Raises, Signature};
+use crate::native::{Addr, F64, I64, Native, Signature};
 use crate::rt::Ctx;
 
 /// A runtime helper the emitted C may call: what it takes past the context and returns, as its
@@ -113,8 +113,6 @@ machine! {
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
-    "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
-    "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
 }
 
 /// The natives over machine data: marshalling's and the rest of this table's, then strings' and
@@ -159,17 +157,6 @@ macro_rules! helpers {
 }
 
 helpers! {
-    rt_box_decimal(lo, hi) -> Word;
-    rt_no_match();
-    rt_let_no_match();
-    rt_overflow(what);
-    rt_decimal_overflow(what);
-    rt_by_zero(what);
-    rt_not_an_int(value);
-    rt_not_an_int_wide(lo, hi, signed);
-    rt_not_that_width(which, value);
-    rt_iterate_bad(what, n);
-    rt_shift_count(n, which);
     rt_stack_more() -> Word;
     rt_inc_shared(w);
     rt_note_update(in_place, copied);
@@ -215,7 +202,6 @@ helpers! {
     ) -> Handed;
     rt_unwind_hold(held) -> Word;
     rt_unwind_resume(held);
-    rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_branches(slots: *const Handed, n: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
     rt_const(index: I64, keep: KeepRoot) -> Handed;
@@ -223,6 +209,31 @@ helpers! {
     rt_const_failed();
     rt_never_lifted();
     rt_never_shown();
+}
+
+macro_rules! never_called {
+    ($($name:literal($($t:ty),*) $(-> $r:ty)?;)*) => {
+        /// The names a unit from the release's compiler binds and never calls, which
+        /// [`Exports::bound`](super::Exports::bound) needs to find here.
+        fn never_called() -> Vec<Helper> {
+            vec![$({
+                unsafe extern "C" fn never(_: *mut Ctx $(, _: $t)*) $(-> $r)? {
+                    unreachable!(concat!($name, " is bound and never called"))
+                }
+                let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = never;
+                Helper::of($name, f)
+            }),*]
+        }
+    };
+}
+
+never_called! {
+    "builtin_elaborated_refused"(I64, I64, I64, I64);
+    "builtin_elaborated_refused_text"(I64, Addr, I64, Addr, I64);
+    "builtin_elaborated_assert_failed"(Addr, I64, Addr, I64);
+    "builtin_elaborated_scalar_encoded"(I64, I64, I64, I64) -> I64;
+    "builtin_elaborated_text_encoded"(I64, Addr, I64) -> I64;
+    "builtin_elaborated_functions_compared"() -> I64;
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
@@ -235,17 +246,22 @@ pub fn builtin_helper_name(builtin: &str) -> String {
     }
 }
 
-/// Every helper a unit may bind: the runtime's own, then a native over machine data.
+/// Every helper a unit may bind: the runtime's own, those it binds and never calls, then a native
+/// over machine data.
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let machine = machine_natives().iter().map(|n| n.helper);
-        own().into_iter().chain(machine).collect()
+        own()
+            .into_iter()
+            .chain(never_called())
+            .chain(machine)
+            .collect()
     })
 }
 
 /// The runtime's own helpers, which are no native's.
 pub fn own_helpers() -> &'static [Helper] {
     let all = helpers();
-    &all[..all.len() - machine_natives().len()]
+    &all[..all.len() - machine_natives().len() - never_called().len()]
 }

@@ -6,7 +6,7 @@ use crate::bare::{context, helper};
 use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyType};
-use ply_compiled::heap::{Word, imm, word_at};
+use ply_compiled::heap::{Word, imm};
 use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
 use ply_core::codec::{Writer, fun, shown, tag};
@@ -20,7 +20,6 @@ type A1 = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type N2 = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type A2 = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 type N3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word);
-type A3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word) -> Word;
 
 /// The native the compiler declares as `name`, at `F`, as a unit binds it.
 fn native<F: Copy>(name: &str) -> F {
@@ -359,26 +358,6 @@ fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
     assert!(said.contains("no wide value was read"), "{said}");
 }
 
-/// A 128-bit width read as its two words is made a box of them.
-#[test]
-fn a_128_bit_widths_two_words_box_as_its_two_words() {
-    let boxed: A3 = helper("rt_box_wide");
-    let mut ctx = context();
-    for (ty, bits) in [
-        (IntTy::U128, (5u128 << 64) | 9),
-        (IntTy::I128, -3i128 as u128),
-    ] {
-        let (lo, hi) = (bits as u64 as Word, (bits >> 64) as u64 as Word);
-        let w = unsafe { boxed(&mut ctx, lo, hi, width(ty)) };
-        let o = w as *mut ply_compiled::heap::Obj;
-        assert_eq!(unsafe { (word_at(o, 0), word_at(o, 1)) }, (lo, hi));
-    }
-    unfailed(&mut ctx);
-    unsafe { boxed(&mut ctx, 1, 0, width(IntTy::U64)) };
-    let said = ctx.take_failure().expect("a diagnostic").message;
-    assert!(said.contains("no 128-bit width"), "{said}");
-}
-
 /// Marshalling begun inside another works on a frame of its own, and the outer one goes on where it
 /// was.
 #[test]
@@ -510,29 +489,37 @@ fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
     assert!(!bytes.windows(7).any(|b| b == b"hunter2"));
 }
 
-/// An `assert_eq` that failed raises `E0501` showing the expected value and then the actual, each the
-/// bytes it was handed, and a clause for the raise is told each by its kind.
+/// A failure keeps each value as the bytes it was handed, and a clause for the raise is told each
+/// by its kind.
 #[test]
-fn a_failed_assertion_raises_showing_the_expected_value_then_the_actual() {
-    type N4 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
+fn a_failure_shows_its_values_in_order_and_describes_each_by_its_kind() {
+    type Failed = unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word);
     let mut ctx = context();
     let actual = written(|w| w.int(2));
     let expected = written(|w| w.str(b"x"));
-    unsafe {
-        native::<N4>("?assert_failed")(
-            &mut ctx,
-            actual.as_ptr() as Word,
-            actual.len() as Word,
-            expected.as_ptr() as Word,
-            expected.len() as Word,
-        )
-    };
-    let d = ctx.take_failure().expect("the assertion raised");
+    let message = format!(
+        "expected {}, found {}",
+        ply_core::slot(0),
+        ply_core::slot(1)
+    );
+    let texts: [&[u8]; 5] = [
+        b"E0501",
+        message.as_bytes(),
+        b"here",
+        expected.as_slice(),
+        actual.as_slice(),
+    ];
+    let words: Vec<Word> = texts
+        .iter()
+        .flat_map(|t| [t.as_ptr() as Word, t.len() as Word])
+        .collect();
+    unsafe { helper::<Failed>("rt_failed")(&mut ctx, 1, words.as_ptr(), 0, 2) };
+    let d = ctx.take_failure().expect("the failure raised");
     assert_eq!(d.code, ply_core::codes::ASSERTION_FAILED);
     assert_eq!(d.values.iter().collect::<Vec<_>>(), [&expected, &actual]);
     assert_eq!(
         d.described(&d.message),
-        "assertion failed: expected a `String`, found an `Int`"
+        "expected a `String`, found an `Int`"
     );
 }
 
