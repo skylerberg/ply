@@ -33,7 +33,7 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
         codes::RUNTIME_ERROR,
         "this call would nest past what the native stack holds",
     )
-    .primary(c.site(), "the call that nested too deep");
+    .primary(c.site(), "the function that nested too deep");
     c.fail_with(FAILED_OUT_OF_STACK, d);
     0
 }

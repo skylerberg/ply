@@ -328,6 +328,24 @@ pub(crate) struct Filling {
     pub(crate) reused: usize,
 }
 
+/// No pages, and a name no page's owner holds, so that compiled code finds nothing to take here
+/// and no block to give back here, and sends every block to the runtime.
+struct NoFilling(Filling);
+
+// SAFETY: nothing writes to it: compiled code writes only to the pages it finds, and it holds none.
+unsafe impl Sync for NoFilling {}
+
+static NO_FILLING: NoFilling = NoFilling(Filling {
+    pages: [std::ptr::null_mut(); CLASSES],
+    name: std::ptr::dangling(),
+    reused: 0,
+});
+
+/// What compiled code reads while a heap's blocks must all go through the runtime.
+pub(crate) fn no_filling() -> *mut Filling {
+    (&raw const NO_FILLING.0).cast_mut()
+}
+
 /// One heap's blocks. Only the thread running the heap takes from it and gives to it; any thread
 /// may [`hand_back`] a block of it.
 pub struct Blocks {

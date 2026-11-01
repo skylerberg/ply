@@ -32,7 +32,7 @@ import compiler.emit.print.text (BodyContext, InstructionContext, Printing, Prin
                                  empty_printing, function_body, line, text, pieces, pad, named,
                                  name_of, arg_text, assigned, label, check, failing_return,
                                  source_position, slot, part_names, part_name, unsupported,
-                                 native_noted)
+                                 native_noted, has_place)
 import compiler.emit.print.ownership (block_opened, block_closed, count_printed, walk_value,
                                       last_of, updated, failure_exit_through)
 import compiler.emit.print.value_printing (c_type, as_word, word_as, word_to_parts, value_printing,
@@ -117,7 +117,8 @@ fn root_printed(
     { printing: body, out: [] }
   } else { runtime_entry(body, name, entry_signature_of(f)) };
   let opening = match f.kind {
-    Metered -> if needs_stack_check(f) { head_probe(f.convention.result) } else { b"" },
+    Metered -> if needs_stack_check(f) { head_probe(f.convention.result, f.key, sited) }
+    else { b"" },
     Plain -> if !is_drop_root(f.key) { b"" }
     else { Bytes::concat_all([b"  if (ply_drop_deep(ctx, p0, ", name, b")) return 0;\n"]) },
   };
@@ -175,6 +176,7 @@ fn group_printed(
     base: f.base,
     result: f.convention.result,
     site: None,
+    placed: has_place(f.key),
     arm: None,
     looping: None,
     handler_jump: None,
@@ -267,7 +269,10 @@ fn group_printed(
           Bytes::concat_all(group_buffers(f).map(|d: Bytes| Bytes::concat_all([b"  ", d, b"\n"]))),
           record_declared(switched),
           b"  ply_loop: ",
-          probe(f.convention.result),
+          match f.members.at(0) {
+            Some(m) -> probe(f.convention.result, m.key, Some(InGroup(0))),
+            None -> probe(f.convention.result, f.key, None),
+          },
           b"\n  switch (which) {\n",
         ]),
       ),
@@ -359,6 +364,7 @@ fn body_printed(
     base: f.base,
     result: f.convention.result,
     site: sited,
+    placed: has_place(f.key),
     arm: None,
     looping: None,
     handler_jump: match f.links.pending { Some(_) -> Some(b"goto ply_pending;"), None -> None },
@@ -371,7 +377,7 @@ fn body_printed(
     |q: Printing, l: Bytes| line(q, 0, l),
   );
   let viewed = declare_list_views(f, opened);
-  let probed = match f.kind { Metered -> probe(f.convention.result), _ -> b";" };
+  let probed = match f.kind { Metered -> probe(f.convention.result, f.key, sited), _ -> b";" };
   let looped = if restarts(f.body) {
     text(viewed, Bytes::concat_all([b"  ply_loop: ", probed, b"\n"]))
   } else { viewed };
@@ -475,7 +481,12 @@ fn with_site_scope(s: BlockState, borrowed: Option<SiteOrigin>) -> BlockState =
     Some(l) ->
       {
         ..s,
-        context: { ..s.context, site: Some(LambdaOwner(l.root)), base: l.base },
+        context: {
+          ..s.context,
+          site: Some(LambdaOwner(l.root)),
+          placed: has_place(l.root),
+          base: l.base,
+        },
         outer: s.outer.push(s.context),
       },
     None -> match s.outer.at(s.outer.len() - 1) {
