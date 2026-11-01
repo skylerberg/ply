@@ -1,0 +1,155 @@
+//! `derive bin` over every shape it accepts: what a derived codec writes of a drawn value reads back
+//! as that value, it keeps what JSON cannot (a NaN's bits, the wide widths' range), and it rejects
+//! bytes it did not write.
+
+import std.bin
+import std.gen
+import std.gen (Gen)
+
+type Colour = | Red | Green | Blue
+
+type Tree = | Leaf | Node(Tree, Tree)
+
+type Leafy = {
+  name: String,
+  raw: Bytes,
+  weight: Decimal,
+  count: Int,
+  flag: Bool,
+  nothing: Unit,
+  small: U8,
+  wide: I64,
+  tags: List<String>,
+  maybe: Option<Option<Int>>,
+}
+
+type Deep = {
+  by_name: Map<String, Colour>,
+  by_num: Map<Int, List<Colour>>,
+  leaf: Leafy,
+  inner: List<Leafy>,
+  results: List<Result<Int, String>>,
+  tree: Tree,
+  pair: (Int, Option<Unit>),
+}
+
+type Reading = { ratio: Float, at: U64, big: I128, tag: Ordering }
+
+type Chain = | End | Link(Chain, Int)
+
+derive bin for Colour
+derive bin for Tree
+derive bin for Leafy
+derive bin for Deep
+derive bin for Reading
+derive bin for Chain
+
+fn round(d: Deep) -> Bool / {abort.raise} =
+  bin::decode(bin::encode(d, deep_bin()), deep_bin()) == Ok(d)
+
+fn colours() -> Gen<Colour> = gen::elements([Red, Green, Blue])
+
+fn trees(depth: Int) -> Gen<Tree> =
+  if depth <= 0 { gen::constant(Leaf) } else {
+    gen::one_of([
+      gen::constant(Leaf),
+      gen::map2(trees(depth - 1), trees(depth - 1), |l: Tree, r: Tree| Node(l, r)),
+    ])
+  }
+
+fn leafies() -> Gen<Leafy> =
+  gen::map3(
+    gen::map4(
+      gen::text(),
+      gen::bytes(),
+      gen::decimal(),
+      gen::any_int(),
+      |name: String, raw: Bytes, weight: Decimal, count: Int| (name, raw, weight, count),
+    ),
+    gen::map3(gen::bool(), gen::below(256), gen::any_int(), |flag: Bool, small: Int, wide: Int|
+      (flag, small, wide)),
+    gen::map2(
+      gen::list_of(gen::text(), 3),
+      gen::option_of(gen::option_of(gen::any_int())),
+      |tags: List<String>, maybe: Option<Option<Int>>| (tags, maybe),
+    ),
+    |a: (String, Bytes, Decimal, Int), b: (Bool, Int, Int), c: (List<String>, Option<Option<Int>>)|
+      {
+        name: a._0,
+        raw: a._1,
+        weight: a._2,
+        count: a._3,
+        flag: b._0,
+        nothing: (),
+        small: U8::of_int(b._1),
+        wide: I64::of_int(b._2),
+        tags: c._0,
+        maybe: c._1,
+      },
+  )
+
+fn deeps() -> Gen<Deep> =
+  gen::map2(
+    gen::map4(
+      gen::map_of(gen::text(), colours()),
+      gen::map_of(gen::any_int(), gen::list_of(colours(), 3)),
+      leafies(),
+      gen::list_of(leafies(), 2),
+      |by_name: Map<String, Colour>, by_num: Map<Int, List<Colour>>, leaf: Leafy, inner: List<Leafy>|
+        (by_name, by_num, leaf, inner),
+    ),
+    gen::map3(
+      gen::list_of(gen::result_of(gen::any_int(), gen::text()), 3),
+      trees(3),
+      gen::map2(gen::any_int(), gen::option_of(gen::constant(())), |n: Int, u: Option<Unit>|
+        (n, u)),
+      |results: List<Result<Int, String>>, tree: Tree, pair: (Int, Option<Unit>)|
+        (results, tree, pair),
+    ),
+    |a: (Map<String, Colour>, Map<Int, List<Colour>>, Leafy, List<Leafy>), b: (List<Result<Int, String>>, Tree, (Int, Option<Unit>))|
+      {
+        by_name: a._0,
+        by_num: a._1,
+        leaf: a._2,
+        inner: a._3,
+        results: b._0,
+        tree: b._1,
+        pair: b._2,
+      },
+  )
+
+test "a derived codec round-trips a drawn value of every shape through the bytes" {
+  gen::check(deeps(), round)
+}
+
+test "a NaN keeps its bits and the wide widths keep their range" {
+  let nan = Float::of_bits(9221120237041090561);
+  let least = match I128::of_string("-170141183460469231731687303715884105728") {
+    Some(n) -> n,
+    None -> 0i128,
+  };
+  let r = { ratio: nan, at: 18446744073709551615u64, big: least, tag: Greater };
+  match bin::decode(bin::encode(r, reading_bin()), reading_bin()) {
+    Ok(s) -> {
+      assert_eq(bits_of_float(s.ratio), bits_of_float(nan));
+      assert_eq(s.at, r.at);
+      assert_eq(s.big, r.big);
+      assert_eq(s.tag, Greater)
+    },
+    Err(e) -> assert_eq(bin::error_to_string(e), "it should have decoded"),
+  }
+}
+
+fn deep(n: Int, t: Chain) -> Chain = if n <= 0 { t } else { deep(n - 1, Link(t, n)) }
+
+test "a deep recursive value round-trips" {
+  let t = deep(500, End);
+  assert_eq(bin::decode(bin::encode(t, chain_bin()), chain_bin()), Ok(t))
+}
+
+test "a constructor index past the type's is rejected, not guessed" {
+  match bin::decode(b"\x02", chain_bin()) {
+    Ok(_) -> assert(false),
+    Err(e) -> assert_eq(bin::error_to_string(e), "constructor 2 of a type with 2 (at byte 0)"),
+  }
+}

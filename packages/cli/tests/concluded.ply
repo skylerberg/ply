@@ -47,8 +47,10 @@ import std.text (shell_join)
 import signature (effect_texts)
 import std.option
 import compiler.syntax.parsing (no_module)
+import std.term (Style)
 import tests.report (Entry, RunDecision, cached_count, Program, Cost, SearchSummary, Outcome, Site,
-                     Failed, Fault, RunReport, no_time_spent, case_of, test_at, canonical)
+                     finished_line, display_name_at, Failed, Fault, RunReport, no_time_spent,
+                     case_of, test_at, canonical)
 
 pub fn test_hash_at(analysis: CheckedProgram, i: Int) -> Option<Bytes> =
   match test_at(analysis, i) { Some(t) -> analysis.frame.hashes.tests.get(t.key), None -> None }
@@ -62,9 +64,16 @@ pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
 pub fn entry_of(index: Int, key: Bytes) -> Entry =
   { test: index, key: key, case: None, unlisted: None }
 
-type SearchOptions = { plan: plan::Plan, measuring: Bool, lanes: Option<Int> }
+pub type Reporting = { style: Style, width: Int, to_stderr: Bool }
 
-type Job = { unit: TestUnit, test: Int, entry: Entry, search: Option<plan::Plan> }
+type SearchOptions = {
+  plan: plan::Plan,
+  measuring: Bool,
+  lanes: Option<Int>,
+  reporting: Option<Reporting>,
+}
+
+type Job = { unit: TestUnit, test: Int, name: String, entry: Entry, search: Option<plan::Plan> }
 
 pub type JobResult = {
   test: Int,
@@ -82,11 +91,19 @@ pub fn job_of(
   searching: plan::Plan,
 ) -> Job / {abort.raise} =
   match case_of(program, index) {
-    None -> { unit: program.unit, test: index, entry: entry_of(index, b""), search: None },
+    None ->
+      {
+        unit: program.unit,
+        test: index,
+        name: display_name_at(program, index),
+        entry: entry_of(index, b""),
+        search: None,
+      },
     Some(c) ->
       {
         unit: program.unit,
         test: index,
+        name: display_name_at(program, index),
         entry: c.entry,
         search: if !c.seeded { None } else {
           match narrowing.filter(|n: { index: Int, roots: List<Int> }| n.index == index) {
@@ -100,32 +117,52 @@ pub fn job_of(
 pub fn run_class(
   jobs: List<Job>,
   search_options: SearchOptions,
-) -> List<JobResult> / {entering::machine.enter, abort.raise} = {
+) -> List<JobResult> / {entering::machine.enter, entering::machine.report, abort.raise} = {
   let lanes = machine::split_into_lanes(jobs, search_options.lanes);
-  machine::merge_lanes(run_lanes(lanes, search_options.measuring, 0, lanes.len(), 64))
+  machine::merge_lanes(
+    run_lanes(lanes, search_options.measuring, search_options.reporting, 0, lanes.len(), 64),
+  )
+}
+
+fn reported(
+  done: JobResult,
+  j: Job,
+  reporting: Option<Reporting>,
+) -> JobResult / {entering::machine.report} = {
+  match reporting {
+    Some(r) ->
+      entering::machine.report(
+        finished_line(r.style, j.name, done.status, done.usage.duration_us, r.width),
+        r.to_stderr,
+      ),
+    None -> (),
+  };
+  done
 }
 
 fn run_lanes(
   lanes: List<List<Job>>,
   measuring: Bool,
+  reporting: Option<Reporting>,
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<List<JobResult>> / {entering::machine.enter, abort.raise} =
+) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || depth_left <= 0 {
     range(lo, hi).fold([], |lanes_done: List<List<JobResult>>, i: Int|
       match lanes.at(i) {
         Some(lane) ->
           lanes_done.push(
-            lane.fold([], |out: List<JobResult>, j: Job| out.push(run_job(j, measuring))),
+            lane.fold([], |out: List<JobResult>, j: Job|
+              out.push(reported(run_job(j, measuring), j, reporting))),
           ),
         None -> lanes_done,
       })
   } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      run_lanes(lanes, measuring, lo, mid, depth_left - 1),
-      run_lanes(lanes, measuring, mid, hi, depth_left - 1),
+      run_lanes(lanes, measuring, reporting, lo, mid, depth_left - 1),
+      run_lanes(lanes, measuring, reporting, mid, hi, depth_left - 1),
     };
     halves._0.concat(halves._1)
   }

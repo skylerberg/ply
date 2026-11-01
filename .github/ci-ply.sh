@@ -49,8 +49,12 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
-# Each path `ply.work` gives a role, as the job's `ply` reads it.
-work() { "$ply" work "$root" | awk -v r="$1" '$1 == r { print $2 }'; }
+# Each path `ply.work` gives a role, as the job's `ply` reads it. `in-process` names a suite that
+# `ply.work` lists with no role of its own.
+work() {
+  if [[ $1 == in-process ]]; then "$shards" in-process-suite; return; fi
+  "$ply" work "$root" | awk -v r="$1" '$1 == r { print $2 }'
+}
 TAB=$'\t'
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
@@ -70,12 +74,13 @@ postgres_bin() {
 pg=$(postgres_bin)
 
 # What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
-# it, its scratch directory and the filesystem, the repository, and every family a command enters a
-# program with, since its tests run the commands in this process.
+# it, its scratch directory and the filesystem, and the repository.
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
-  --fs cwd=. --fs abs=/ --fs "repo=$root"
-  --allow machine --allow shipped --allow toolchain)
+  --fs cwd=. --fs abs=/ --fs "repo=$root")
+# The in-process suite takes those and every family a command enters a program with, since its tests
+# run the commands in this process.
+in_process_grants=("${cli_grants[@]}" --allow machine --allow shipped --allow toolchain)
 
 # The epoch second every `ply` this job starts must end by; empty for no end.
 deadline=${PLY_CI_DEADLINE:-}
@@ -117,8 +122,9 @@ unreported() {
   fi
 }
 
-# `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
-# directory of its own, which its harness empties before each test and rejects without the marker;
+# `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite and the
+# in-process suite from a directory of their own, which the harness empties before each test and
+# rejects without the marker;
 # the standard library's suites granted an emptied directory as the root `scratch`, marked as the
 # CLI's is, which the tests of its real handlers write under (`tests/std/scratch.ply`), and `sh`,
 # which reads back what `std.text` quotes for it; and any other package as `ply test` runs it,
@@ -127,10 +133,12 @@ unreported() {
 tested() {
   local path=$1 status=0 dir
   shift
-  if [[ $path == "$(work cli-tests)" ]]; then
+  if [[ $path == "$(work cli-tests)" || $path == "$(work in-process)" ]]; then
+    local -a grants=("${cli_grants[@]}")
+    [[ $path == "$(work in-process)" ]] && grants=("${in_process_grants[@]}")
     dir=$(mktemp -d)
     touch "$dir/.ply-scratch"
-    (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
+    (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${grants[@]}") || status=$?
     rm -rf "$dir"
   elif [[ $path == "$(work std)" || $path == "$(work std-tests)" ]]; then
     dir=$caches/ply-std-scratch

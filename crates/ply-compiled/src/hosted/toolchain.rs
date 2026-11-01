@@ -254,11 +254,12 @@ pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> T
     })
 }
 
-/// The compiler the label at `lp` names, run with the arguments at `ap` once a core is free: byte 1
-/// and the ticket of its end, eight bytes, which returns byte 0 where it succeeded and byte 1 and
-/// what it wrote to standard error, or why it did not start, where it did not; or byte 0 and why no
-/// compiler has the label. Runs start in the order asked, as many at once as the machine has cores,
-/// so a program asks for every run before it waits on any.
+/// Queues the compiler named by the label at `lp` to run with the arguments at `ap` when a core is
+/// free. Returns byte 1 and an eight-byte ticket, or byte 0 and the reason if no compiler has that
+/// label. The ticket returns byte 0 if the compiler succeeded. Otherwise it returns byte 1 and what
+/// the compiler wrote to standard error, or why it did not start. Compilers start in the order
+/// queued, as many at once as the machine has cores, so a program can queue every run before it
+/// waits for any.
 pub unsafe extern "C" fn rt_compilers_started(
     ctx: *mut Ctx,
     lp: Addr,

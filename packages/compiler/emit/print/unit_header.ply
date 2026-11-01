@@ -9,22 +9,24 @@ import compiler.emit.typed_ir.handling (raise_offset, task_offset)
 import compiler.emit.roots (builtin_helper)
 import compiler.cc (runtime_part_mark)
 import compiler.emit.print.frames (chain_defined)
-import compiler.emit.print.count_functions (dup_fn, last_fn, release_fn, release_sum_fn,
-                                            release_box_fn, free_fn, increment_shared_fn,
-                                            dec_shared_last_fn, runtime_free_fn, alloc_fn,
-                                            alloc_block_fn, release_later_fn, drain_releases_fn,
-                                            released_twice_fn, sized_box_release_fn,
-                                            never_lifted_fn, never_lifted_runtime_fn,
-                                            never_shown_fn, never_shown_rt_fn, call_text, calls)
+import compiler.emit.print.count_functions (dup_fn, last_fn, dup_marked_fn, last_marked_fn,
+                                            release_fn, release_sum_fn, release_box_fn, free_fn,
+                                            increment_shared_fn, dec_shared_last_fn,
+                                            runtime_free_fn, alloc_fn, alloc_block_fn,
+                                            release_later_fn, drain_releases_fn, released_twice_fn,
+                                            sized_box_release_fn, never_lifted_fn,
+                                            never_lifted_runtime_fn, never_shown_fn,
+                                            never_shown_rt_fn, call_text, calls)
 import compiler.emit.release (uncounted_functions, box_functions, scalar_box_words)
 import compiler.emit.print.probe (probed_helper, probed_fn)
-import compiler.emit.print.lists (list_helpers, item_fn, list_leaf_fn)
+import compiler.emit.print.lists (list_helpers, writable_list_fn, opened_list_fn)
 import compiler.emit.print.ownership (walk_helpers, persistent_copy_fn, fresh_block_fn, unshared_fn,
-                                      mark_shared_fn)
+                                      mark_shared_fn, kept_list_fn, fresh_list_fn)
 import compiler.emit.print.wide (wide_helpers)
 import compiler.emit.print.decimal (decimal_helpers)
 import compiler.emit.print.failures (failures_declared, failures_defined)
 import compiler.emit.print.encoded (encoders_declared, encoders_defined)
+import compiler.emit.print.constants (constant_helpers, constant_made)
 
 pub fn unit_header() -> Bytes / {abort.raise} =
   Bytes::concat_all([
@@ -59,6 +61,7 @@ pub fn unit_tail(natives: List<Native>) -> Bytes / {abort.raise} = {
       }),
     ),
     b"}\n",
+    constant_made(),
     tail_part(),
   ])
 }
@@ -167,6 +170,7 @@ fn header_part() -> Bytes / {abort.raise} =
     chain_defined(),
     drop_helpers(),
     shared_sequences(),
+    constant_helpers(),
   ])
 
 fn entries_defined() -> Bytes =
@@ -410,16 +414,7 @@ fn tail_part() -> Bytes / {abort.raise} =
   ])
 
 fn shared_sequences() -> Bytes =
-  Bytes::concat_all([probed_helper(), list_helpers(), walk_helpers(), writable_helper()])
-
-pub fn writable_fn() -> Bytes = b"ply_writable"
-
-fn writable_helper() -> Bytes =
-  Bytes::concat_all([
-    b"static inline Word ",
-    writable_fn(),
-    b"(PlyCtx *ctx, Word a, PlyDrop copy, int64_t n) { int in_place = ply_obj(a)->rc == 1; if (!in_place) a = copy(ctx, a); rt_note_update_p(ctx, in_place, in_place ? 0 : n); return a; }\n",
-  ])
+  Bytes::concat_all([probed_helper(), list_helpers(), walk_helpers()])
 
 fn drop_helpers() -> Bytes = {
   let depth = b"ctx->release_depth";
@@ -460,13 +455,22 @@ fn helpers() -> Bytes = {
     b"#else\n",
     b"#  define ply_released_twice(ctx, o, rc)\n",
     b"#endif\n",
+    b"static inline __attribute__((noinline)) void ",
+    call_text(dup_marked_fn(), [b"Word o"]),
+    b" { if (ply_obj(o)->rc < PLY_RC_FRAME) ",
+    call_text(increment_shared_fn(), [b"0", b"o"]),
+    b"; }\n",
+    b"static inline __attribute__((noinline)) int ",
+    call_text(last_marked_fn(), [b"PlyCtx *ctx", b"Word o"]),
+    b" { return ply_obj(o)->rc < PLY_RC_FRAME && ",
+    call_text(dec_shared_last_fn(), [b"ctx", b"o"]),
+    b"; }\n",
     b"#define ",
     call_text(last_fn(), [b"ctx", b"o"]),
     b" ({ \\\n",
     b"  Word ply_last_o = (o); PlyObj *h = ply_obj(ply_last_o); uint32_t rc = h->rc; int ply_last_r = 0; \\\n",
-    b"  if (rc >= PLY_RC_FRAME) {} \\\n",
-    b"  else if (rc >= UINT32_C(0x80000000)) ply_last_r = (int)",
-    call_text(dec_shared_last_fn(), [b"ctx", b"ply_last_o"]),
+    b"  if (rc >= UINT32_C(0x80000000)) ply_last_r = ",
+    call_text(last_marked_fn(), [b"ctx", b"ply_last_o"]),
     b"; \\\n",
     b"  else if (rc > 1) h->rc = rc - 1; \\\n",
     b"  else { ply_released_twice(ctx, ply_last_o, rc) ply_last_r = 1; } \\\n",
@@ -478,8 +482,8 @@ fn helpers() -> Bytes = {
     b"  if (ply_dup_o) { \\\n",
     b"    PlyObj *h = ply_obj(ply_dup_o); uint32_t rc = h->rc; \\\n",
     b"    if (rc < UINT32_C(0x80000000)) h->rc = rc + 1; \\\n",
-    b"    else if (rc < PLY_RC_FRAME) ",
-    call_text(increment_shared_fn(), [b"0", b"ply_dup_o"]),
+    b"    else ",
+    call_text(dup_marked_fn(), [b"ply_dup_o"]),
     b"; \\\n",
     b"  } })\n",
     b"typedef Word (*PlyDrop)(PlyCtx *, Word);\n",
@@ -902,13 +906,14 @@ test "each sequence the printers share is defined once in the head, which each u
   let h = header_part();
   let shared = [
     probed_fn(),
-    item_fn(),
-    list_leaf_fn(),
+    writable_list_fn(),
+    opened_list_fn(),
     persistent_copy_fn(),
     fresh_block_fn(),
+    kept_list_fn(),
+    fresh_list_fn(),
     unshared_fn(),
     mark_shared_fn(),
-    writable_fn(),
   ];
   assert_eq(shared.filter(|f: Bytes| h.split(f.concat(b"(")).len() != 2), []);
   assert(

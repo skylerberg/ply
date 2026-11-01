@@ -1,7 +1,10 @@
-//! Warm returns what cold does through every kind of edit to every kind of item. Each edit is made
-//! to a module of a project whose cache the last check wrote: the check that reads that cache must
-//! return what a check from nothing returns, hashes, types and effects included; once the edit is
-//! undone, what it returned before the edit.
+//! A warm `ply` returns what a cold one does after an edit, through the real binary, its shipped
+//! pack and the cache on disk. Each edit is made to a module of a project whose cache the last run
+//! wrote: `ply check` and `ply test` over that cache must return what they return from nothing,
+//! hashes, types, effects and test results included, and once the edit is undone, what they
+//! returned before the edit. A pull request runs the fixtures no in-process test reaches, with an
+//! edit for each way a cached result stops standing; `edit_matrix` runs every edit over every
+//! fixture nightly.
 
 import compiler.syntax.items (parse, Module, Item, FunctionItem, TypeItem, EffectItem, DeriveItem,
                               EffectSetItem, InstanceItem, NumericItem, FnDefinition, SumBody,
@@ -9,8 +12,9 @@ import compiler.syntax.items (parse, Module, Item, FunctionItem, TypeItem, Effec
 import compiler.syntax.expressions (expression_span)
 import compiler.syntax.fmt (line_end)
 import compiler.expand.embed (EmbedRequest, embed_requests)
-import harness (Source, RunResult, WorkingDirectory, PlyProcess, write_project, stable_report,
-                json_of, spawned, spawned_from_scratch, json_text, at, items, bool)
+import spawning.harness (Source, RunResult, WorkingDirectory, PlyProcess, write_project,
+                         stable_report, json_of, spawned, spawned_from_scratch, json_text, at,
+                         items, nth, bool)
 import std.fs (fs)
 import std.location (spliced)
 import std.json (Json, Object, Array)
@@ -18,7 +22,7 @@ import std.list
 import std.string
 
 /// A kind of edit the gate makes to a module.
-type Edit =
+pub type Edit =
   | AddFn
   | Comment
   | WrapBody
@@ -36,7 +40,7 @@ type Edit =
   | AddOp
   | TouchEmbed
 
-fn every_edit() -> List<Edit> =
+pub fn every_edit() -> List<Edit> =
   [
     AddFn,
     Comment,
@@ -375,10 +379,15 @@ fn warm_of(runs: Bool) -> Json / {PlyProcess, abort.raise} =
 fn cold_of(runs: Bool) -> Json / {PlyProcess, WorkingDirectory, abort.raise} =
   observed_state(runs, spawned_from_scratch)
 
+/// What a session makes of its project: the edits, and whether a run of the tests follows the check
+/// once an edit is undone, which only a pass that wrongly outlived the undo could fail.
+pub type Plan = { edits: List<Edit>, tests_after_undo: Bool }
+
 /// One step of a session, its edit made: what the warm result and the cold one say, and, once
 /// `undo` undid it, what the warm one says against `start`.
 fn record_step(
   start: Json,
+  plan: Plan,
   out: Session,
   step: String,
   undo: () -> Unit / {WorkingDirectory, abort.raise},
@@ -388,35 +397,39 @@ fn record_step(
   let seen = if warm == fresh { out.mismatches }
   else { out.mismatches.push(step ++ ": " ++ difference(warm, fresh, "answer")) };
   undo();
-  let back = warm_of(true);
+  let back = warm_of(plan.tests_after_undo);
+  let wanted = if plan.tests_after_undo { start } else { nth(start, 0) };
   {
-    mismatches: if back == start { seen }
-    else { seen.push(step ++ ", undone: " ++ difference(back, start, "answer")) },
+    mismatches: if back == wanted { seen }
+    else { seen.push(step ++ ", undone: " ++ difference(back, wanted, "answer")) },
     made: out.made + 1,
   }
 }
 
-/// Each kind of edit made to each module at `paths` under the working directory, one at a time and
-/// undone after, the project checked and its tests run after each.
-fn disagreements(paths: List<String>) -> Session / {PlyProcess, WorkingDirectory, abort.raise} = {
+/// Each edit `plan` names made to each module at `paths` under the working directory, one at a time
+/// and undone after, the project checked and its tests run after each.
+fn disagreements(
+  paths: List<String>,
+  plan: Plan,
+) -> Session / {PlyProcess, WorkingDirectory, abort.raise} = {
   let start = warm_of(true);
   let cold = cold_of(true);
   let before_any = if start == cold { [] }
   else { ["before any edit: " ++ difference(start, cold, "answer")] };
   paths.fold({ mismatches: before_any, made: 0 }, |acc: Session, path: String|
-    every_edit().fold(acc, |out: Session, e: Edit|
+    plan.edits.fold(acc, |out: Session, e: Edit|
       match edited(e, path, read_bytes(path)) {
         None -> out,
         Some(changes) -> {
           let before = changes.map(|c: Change| { path: c.path, bytes: read_bytes(c.path) });
           changes.fold((), |_: Unit, c: Change| write_change(c));
-          record_step(start, out, path ++ ", " ++ edit_name(e), ||
+          record_step(start, plan, out, path ++ ", " ++ edit_name(e), ||
             before.fold((), |_: Unit, c: Change| write_change(c)))
         },
       }))
 }
 
-fn agrees(paths: List<String>) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
+fn agrees(paths: List<String>, plan: Plan) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
   let opening = cold_of(false);
   assert(
     bool(at(opening, "ok")) && items(at(opening, "diagnostics")).len() == 0,
@@ -425,8 +438,8 @@ fn agrees(paths: List<String>) -> Unit / {PlyProcess, WorkingDirectory, abort.ra
         ++ clipped(json_text(at(opening, "diagnostics"))),
     ),
   );
-  let session = disagreements(paths);
-  assert(session.made >= paths.len(), Some("each module is edited at least once"));
+  let session = disagreements(paths, plan);
+  assert(session.made > 0, Some("a session makes an edit"));
   assert(
     session.mismatches.len() == 0,
     Some(
@@ -559,13 +572,31 @@ fn fixture(name: String) -> Fixture / {abort.raise} =
     None -> panic("no fixture is named `" ++ name ++ "`"),
   }
 
-fn fixture_names() -> List<String> = catalogue().map(|f: Fixture| f.name)
+pub fn fixture_names() -> List<String> = catalogue().map(|f: Fixture| f.name)
 
-test/nondet "{name} agrees warm and cold through every edit to its modules" for name: String in fixture_names(
-  ) {
+/// `plan` made over the project the fixture named `name` holds.
+pub fn session_agrees(
+  name: String,
+  plan: Plan,
+) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
   let f = fixture(name);
   write_project(f.files);
-  agrees(f.files.filter(|s: Source| s.path.ends_with(".ply")).map(|s: Source| s.path))
+  agrees(f.files.filter(|s: Source| s.path.ends_with(".ply")).map(|s: Source| s.path), plan)
+}
+
+/// The fixtures whose checks compile and enter code, or that depend on how a `test` over cases is
+/// cached, which no in-process test reaches, with `fn` to show that the gate itself works.
+fn pull_request_fixtures() -> List<String> =
+  ["fn", "derive", "const fn", "tagged literal", "test over cases"]
+
+/// An edit for each way a cached result stops standing: a body, a name, an import and a new test.
+fn pull_request_edits() -> List<Edit> = [WrapBody, RenameFn, AddImport, AddTest]
+
+test/nondet "{name} agrees warm and cold through an edit of each way a result stops standing" for name: String in pull_request_fixtures(
+  ) { session_agrees(name, { edits: pull_request_edits(), tests_after_undo: false }) }
+
+test/nondet "a file an embed reads agrees warm and cold when it changes" {
+  session_agrees("embed", { edits: [TouchEmbed], tests_after_undo: false })
 }
 
 test "an edit is made where its kind of item is, and nowhere it is not" {

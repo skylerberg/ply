@@ -70,8 +70,9 @@ import std.time (time)
 import compiler.syntax.parsing (no_module)
 import compiler.syntax.items (RequiresClause, EnsuresClause, spec_kind_text)
 import compiler.syntax.expressions (prelude_module)
-import compiler.emit.print.count_functions (identity_fn)
+import compiler.emit.print.count_functions (identity_fn, allocates)
 import std.list (positions)
+import compiler.emit.print.constants (constant_read_fn, const_fn_read_fn)
 
 pub effect shipped {
   read names() -> List<String>
@@ -2225,6 +2226,7 @@ type EmissionProgress<s> = {
 
 pub type LevelTally = {
   place: Int,
+  places: Int,
   roots: Int,
   cached: Int,
   asked: Int,
@@ -2279,7 +2281,7 @@ fn walk_levels<s | e>(
       match at.get(l) {
         None -> w,
         Some(roots) ->
-          report_level(phases, l, w, ||
+          report_level(phases, l, last + 1, w, ||
             walk_level(p, types, program, w, roots, cached, read, keep, ask)),
       },
   )
@@ -2295,6 +2297,7 @@ fn materials_of(p: Program, types: Bytes, keys: Map<RootName, RootKey>) -> Map<R
 fn report_level<s | e>(
   phases: Option<{ now: () -> Int / e, outcome: (LevelTally) -> Unit / e }>,
   l: Int,
+  places: Int,
   w: EmissionProgress<s>,
   run: () -> { walk: EmissionProgress<s>, steps: Int } / {abort.raise | e},
 ) -> EmissionProgress<s> / {abort.raise | e} =
@@ -2305,6 +2308,7 @@ fn report_level<s | e>(
       let r = run();
       t.outcome({
         place: l,
+        places: places,
         roots: r.walk.keys.len() - w.keys.len(),
         cached: r.walk.cached - w.cached,
         asked: r.walk.asked - w.asked,
@@ -5369,6 +5373,7 @@ test "a unit tells each place it walks to a build's phases as it ends, in the pl
           key: ascii_of_int(r.place),
           bytes: Bytes::concat_all(range(0, r.asked).map(|_: Int| b"x")),
         },
+        { key: b"places", bytes: ascii_of_int(r.places) },
         {
           key: b"told",
           bytes: (match body_store.get(b"told") { Some(b) -> b, None -> b"" }).concat(
@@ -5393,6 +5398,10 @@ test "a unit tells each place it walks to a build's phases as it ends, in the pl
         assert(
           order.len() > 0 && range(1, order.len()).all(|i: Int| order.get(i - 1) < order.get(i)),
           None,
+        );
+        assert_eq(
+          match body_store.get(b"places") { Some(b) -> digits(b), None -> 0 },
+          order.get(order.len() - 1) + 1,
         );
         assert_eq(
           order.fold(0, |n: Int, l: Int|
@@ -5459,7 +5468,7 @@ test "a unit whose bodies write externs in place asks the runtime for no native 
     ),
     0,
   );
-  let calls = b"\npub fn pushed(xs: List<Int>) -> List<Int> = ListNode::tail_push(xs, 1)\npub fn emptied(m: Map<Int, Int>) -> Map<Int, Int> = MapNode::map_swap(m, None, 0, 0).map\n";
+  let calls = b"\npub fn pushed(xs: List<Int>) -> List<Int> = xs.push(1)\npub fn emptied(m: Map<Int, Int>) -> Map<Int, Int> = MapNode::map_swap(m, None, 0, 0).map\n";
   let program = [{ name: b"std.prelude", src: prelude_source::text().concat(calls) }];
   match unit_against_runtime(program, [], implemented) {
     Ok(c) -> {
@@ -6226,22 +6235,96 @@ test "a read of a definition of no parameters keeps its value for good through i
   let text = unit_text(unit.produced.parts);
   let read_with = |keep: Bytes|
     text.index_of(Bytes::concat_all([b", (Word)(intptr_t)", keep, b")"])) != None;
-  assert(text.index_of(b"rt_memo_p(ctx, ") != None, None);
+  assert(text.index_of(read_of(constant_read_fn())) != None, None);
   assert(read_with(identity_fn()), None);
   assert(read_with(symbol_of(printed(root_of(keys::Keep, string_type())))), None);
 }
 
-test "a read of a `const fn` is charged nothing, and a read of a plain definition what it cost" {
+fn read_of(helper: Bytes) -> Bytes = helper.concat(b"(ctx, ply_part")
+
+test "a `const fn` is read through the check that no raise left it, and a plain definition is not" {
   let reads = |table: Bytes| {
     let k = unit_builder(Bytes::concat_all([table, b"fn read() -> Int = table().len()\n"]));
     let text = unit_text(k.unit([b"m.table", b"m.read"].map(Named)).produced.parts);
-    let count = |helper: Bytes| text.split(helper).len() - 1;
-    [count(b"rt_const_p(ctx, "), count(b"rt_memo_p(ctx, ")]
+    let count = |helper: Bytes| text.split(read_of(helper)).len() - 1;
+    [count(const_fn_read_fn()), count(constant_read_fn())]
   };
   let constant = reads(b"const fn table() -> List<Int> = [1, 2]\n");
   let plain = reads(b"fn table() -> List<Int> = [1, 2]\n");
   assert_eq(constant, [1, plain.get(1) - 1]);
   assert_eq(plain.get(0), 0)
+}
+
+test "a read of a definition whose body is data made of literals is that data, with no allocation" {
+  let text = |source: Bytes|
+    unit_text(unit_builder(source).unit([Named(b"m.read")]).produced.parts);
+  let reads = |source: Bytes, helper: Bytes| text(source).index_of(read_of(helper)) != None;
+  let read_body = |unit: Bytes| {
+    let at = match unit.index_of(symbol_of(b"m.read").concat(b"(PlyCtx *ctx, int64_t p0) {")) {
+      Some(i) -> i,
+      None -> panic("the unit defines m.read"),
+    };
+    let body = unit.slice(at, unit.len());
+    body.slice(0, match body.index_of(b"\n}\n") { Some(i) -> i, None -> body.len() })
+  };
+  let int = text(b"fn kept() -> Int = 300\nfn read(n: Int) -> Int = n + kept()\n");
+  assert(int.index_of(b"INT64_C(300)") != None, None);
+  assert(int.index_of(read_of(constant_read_fn())) == None, None);
+  assert(int.index_of(b"ply_m_kept_") == None, None);
+  let wide = text(
+    b"type W = { a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Bytes }\nfn kept() -> W = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: b\"abc\" }\nfn read(n: Int) -> Int = n + kept().i\n",
+  );
+  assert(wide.index_of(read_of(constant_read_fn())) == None, None);
+  assert(wide.index_of(b"ply_m_kept_") == None, None);
+  assert(!allocates(read_body(wide)), None);
+  let boxed = text(
+    b"type T = | Off | Pair(Int, Option<Bytes>)\nfn kept() -> T = Pair(7, Some(b\"abc\"))\nfn read(n: Int) -> Int = match kept() { Pair(k, _) -> k + n, Off -> n }\n",
+  );
+  assert(boxed.index_of(read_of(constant_read_fn())) == None, None);
+  assert(!allocates(read_body(boxed)), None);
+  assert(
+    !reads(
+      b"type R = { a: Option<Int>, b: Bool }\nfn kept() -> R = { a: None, b: true }\nfn read(n: Int) -> Int = if kept().b { n } else { 0 }\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    reads(
+      b"fn kept() -> List<Int> = [1, 2]\nfn read(n: Int) -> Int = n + kept().len()\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    reads(
+      b"type T = | Make(Int)\nfn kept() -> { make: (Int) -> T } = { make: Make }\nfn read(n: Int) -> T = (kept().make)(n)\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    !reads(
+      b"fn kept() -> Bytes = b\"abc\"\nfn read(n: Int) -> Int = n + kept().len()\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    !reads(b"fn kept() -> U8 = 200u8\nfn read(_: Int) -> U8 = kept()\n", constant_read_fn()),
+    None,
+  );
+  assert(
+    !reads(
+      b"const fn kept() -> String = \"abc\"\nfn read(n: Int) -> Int = n + kept().len()\n",
+      const_fn_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    reads(b"fn kept() -> Int = 1 + 2\nfn read(n: Int) -> Int = n + kept()\n", constant_read_fn()),
+    None,
+  )
 }
 
 fn unit_in_store(

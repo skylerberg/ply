@@ -22,24 +22,16 @@ fn a_natives_signature_is_its_functions_type() {
     use ply_compiled::emitted::{Handed, PlyType};
     use ply_compiled::heap::Word;
     use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
-    use ply_compiled::native::{Native, Raises, Signature};
+    use ply_compiled::native::{Native, Signature};
     use ply_compiled::rt::Ctx;
-    let of = |params: &'static [Machine], result, raises| Signature {
-        params,
-        result,
-        raises,
-    };
+    let of = |params: &'static [Machine], result| Signature { params, result };
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx) as Native>::SIGNATURE,
-        of(&[], None, false)
+        of(&[], None)
     );
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word as Native>::SIGNATURE,
-        of(&[Machine::Word, Words], Some(Machine::Word), false)
-    );
-    assert_eq!(
-        <unsafe extern "C" fn(*mut Ctx, Word, Word) -> Raises as Native>::SIGNATURE,
-        of(&[Machine::Word; 2], None, true)
+        of(&[Machine::Word, Words], Some(Machine::Word))
     );
     type Typed = unsafe extern "C" fn(
         *mut Ctx,
@@ -50,7 +42,7 @@ fn a_natives_signature_is_its_functions_type() {
     ) -> ply_compiled::native::I64;
     assert_eq!(
         <Typed as Native>::SIGNATURE,
-        of(&[Addr, I64, Moved, Type], Some(I64), false)
+        of(&[Addr, I64, Moved, Type], Some(I64))
     );
 }
 
@@ -105,9 +97,9 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     for line in [
         "helper rt_release_later 0 - Handed DropRoot",
         "helper rt_alloc_bytes 0 Block Word",
-        "helper rt_no_match 0 -",
+        "helper rt_release_drain 0 -",
         "native ?out_str 0 - Addr I64",
-        "native ?refused 1 - I64 I64 I64 I64",
+        "helper rt_failed 0 - I64 Words I64 I64",
     ] {
         assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
     }

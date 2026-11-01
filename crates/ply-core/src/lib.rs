@@ -18,19 +18,16 @@ pub mod limit;
 pub use expr::{BinOp, render_float};
 
 pub use intty::{Fixed, INT_TYPES, IntTy};
-pub mod rc;
 pub mod sim;
 mod span;
 pub mod sqlite;
 
-pub use builtins::assert_failure;
 pub use crypto::constant_time_eq;
 pub use effects::{Effect, Mode, Resource, label_var_name};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Determinism, HostBinding, HostRuntime, HostUse, Pending, RuntimeFactory, ShutdownReport,
 };
-pub use rc::RcStats;
 pub use rust_decimal::Decimal;
 pub use sim::{Seed, SimId, TaskId};
 pub use span::{

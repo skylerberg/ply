@@ -33,7 +33,9 @@ import std.bytes (ascii_of_int)
 import std.option
 import std.string
 import compiler.check.borrowing (ParameterMode, parameter_mode)
-import compiler.check.typed (TypedExpression, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
+import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralEmbedded)
+import compiler.check.typed (ConstantData, LiteralData, constant_data_bin, data_of, TypedLiteral,
+                             TypedExpression, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
                              ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
                              typed_body_bin, typed_expression_nodes, part_key, TypedRead,
                              TypedUpdate, WholeBody, TypedParam, NumericWitness, ConcreteWitness,
@@ -59,9 +61,9 @@ import compiler.check.infer.declarations (collect_nominals, collect_types, colle
                                           reject_irregular)
 import compiler.check.infer.expression (check_bit_ops, check_concats, check_columns, check_updates,
                                         kept_type)
-import compiler.check.infer.definitions (ModuleSignatures, bind_signatures, externs_of, externs_in,
-                                         check_bodies, check_numerics, check_tests, check_laws,
-                                         check_schemas, check_specs, unlowered_of)
+import compiler.check.infer.definitions (Extern, ModuleSignatures, bind_signatures, externs_of,
+                                         externs_in, check_bodies, check_numerics, check_tests,
+                                         check_laws, check_schemas, check_specs, unlowered_of)
 import compiler.check.infer.derivable (with_orders, check_map_keys, check_constraints,
                                        resolved_witness)
 import compiler.check.infer.solved (collect_instances, check_instances, blame_deriver_errors,
@@ -223,23 +225,43 @@ fn with_owner(facts: BodyFacts, module: Int, owner: Bytes) -> BodyFacts =
     bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
   }
 
-fn facts_format() -> Int = 7
+fn facts_format() -> Int = 8
+
+type FactsHead = { value: Option<ConstantData> }
+
+derive bin for FactsHead
+
+pub fn whole_body_data(facts: BodyFacts) -> Option<ConstantData> =
+  match facts.bodies.find(|b: TypedBody<Bytes>| b.part == WholeBody) {
+    Some(b) -> data_of(b.body, facts.types),
+    None -> None,
+  }
 
 pub fn encode_facts(facts: BodyFacts) -> Bytes / {abort.raise} =
-  byte_of_int(facts_format()).concat(
+  Bytes::concat_all([
+    byte_of_int(facts_format()),
+    bin::encode({ value: whole_body_data(facts) }, facts_head_bin()),
     bin::encode(with_owner({ ..facts, types: Map::new() }, 0, b""), body_facts_bin()),
-  )
+  ])
+
+fn facts_head(recorded: Bytes) -> Option<bin::Taken<FactsHead>> / {abort.raise} =
+  if recorded.len() == 0 || recorded.at(0) != facts_format() { None }
+  else { match facts_head_bin().take(recorded, 1) { Ok(t) -> Some(t), Err(_) -> None } }
+
+pub fn recorded_data(recorded: Bytes) -> Option<ConstantData> / {abort.raise} =
+  match facts_head(recorded) { Some(t) -> t.value.value, None -> None }
 
 pub fn decode_facts(
   recorded: Bytes,
   module: Int,
   owner: Bytes,
 ) -> Option<BodyFacts> / {abort.raise} =
-  if recorded.len() == 0 || recorded.at(0) != facts_format() { None } else {
-    match bin::decode(recorded.slice(1, recorded.len()), body_facts_bin()) {
+  match facts_head(recorded) {
+    None -> None,
+    Some(t) -> match bin::decode(recorded.slice(t.at, recorded.len()), body_facts_bin()) {
       Ok(f) -> Some(with_owner(f, module, owner)),
       Err(_) -> None,
-    }
+    },
   }
 
 fn restore_owners(checker: Checker) -> Checker =
@@ -252,14 +274,32 @@ fn restore_owners(checker: Checker) -> Checker =
 fn emit_facts(all: Checker) -> EmitFacts / {abort.raise} = {
   let checker = restore_owners(all);
   let keyed = keyed_bodies(resolved_bodies(checker), checker.known.types);
+  let bodies = grouped(keyed.bodies, |x: TypedBody<Bytes>| x.owner);
   {
     pure: checker.definitions.fold([], |acc: List<Bytes>, definition_info: DefinitionInfo|
       if is_pure_definition(definition_info) { acc.push(definition_info.name) } else { acc }),
     orders: checker.witness_orders,
-    members: grouped(checker.member_sites, |x: MemberSite| x.owner),
+    members: in_body_order(checker.member_sites, bodies),
     types: keyed.types,
-    bodies: grouped(keyed.bodies, |x: TypedBody<Bytes>| x.owner),
+    bodies: bodies,
   }
+}
+
+fn in_body_order(sites: List<MemberSite>, bodies: List<TypedBody<Bytes>>) -> List<MemberSite> = {
+  let by = sites.fold(Map::new(), |acc: Map<Bytes, List<MemberSite>>, x: MemberSite|
+    acc.insert(x.owner, match acc.get(x.owner) { Some(ys) -> ys.push(x), None -> [x] }));
+  let listed = bodies.fold(
+    { out: [], named: Map::new() },
+    |acc: { out: List<MemberSite>, named: Map<Bytes, Bool> }, b: TypedBody<Bytes>|
+      match by.get(b.owner) {
+        Some(ys) -> if acc.named.contains(b.owner) { acc }
+        else { { out: acc.out.concat(ys), named: acc.named.insert(b.owner, true) } },
+        None -> acc,
+      },
+  );
+  listed.out.concat(
+    grouped(sites.filter(|x: MemberSite| !listed.named.contains(x.owner)), |x: MemberSite| x.owner),
+  )
 }
 
 fn grouped<a>(xs: List<a>, owner: (a) -> Bytes) -> List<a> = {
@@ -1606,6 +1646,27 @@ test "a callback may perform less than its parameter's effects permit, and nothi
     b"effect ctl { write run(k: () -> Unit / {a.x, a.z}) -> Unit }\nfn go() -> Unit / {ctl.write} = ctl.run(|| a.x())",
   );
   assert_eq(check_codes(handed), [])
+}
+
+test "recorded facts hold a body's data ahead of the body, and decode as they were encoded" {
+  let of_literal = |l: SourceLiteral| {
+    let body = {
+      owner: b"m.kept",
+      module: 0,
+      part: WholeBody,
+      params: [],
+      body: { node: TypedLiteral(l), span: dummy_span(), ty: b"", releases: [] },
+    };
+    encode_facts({ ..no_body_facts(), bodies: [body] })
+  };
+  let literal = LiteralInt(300);
+  assert_eq(recorded_data(of_literal(literal)), Some(LiteralData(literal)));
+  assert_eq(recorded_data(of_literal(LiteralEmbedded(b"digest", 1))), None);
+  assert_eq(recorded_data(encode_facts(no_body_facts())), None);
+  let decoded = |recorded: Bytes|
+    decode_facts(recorded, 0, b"m.kept").map(|f: BodyFacts| f.bodies.len());
+  assert_eq(decoded(of_literal(literal)), Some(1));
+  assert_eq(decoded(encode_facts(no_body_facts())), Some(0))
 }
 
 test "a claim may pass a pure callback to a function generic over its effects" {
@@ -5175,21 +5236,20 @@ test "an `extern type` is its shipped module's, typed by its parameters, and not
 
 test "the prelude's functions of its own types are the externs the emitter writes in place and a native that reads a list's leaves, no builtin" {
   let text = prelude_source::text();
-  let own = externs_of(prelude_module(), parse(text).node).map(|b: Builtin| b.name);
-  let leaf_of = qualify(prelude_module(), b"ListNode::leaf_of");
-  assert_eq(
-    own.sort(),
-    intrinsics().map(|i: { name: Bytes, op: Intrinsic }| i.name).push(leaf_of).sort(),
-  );
+  let declared = externs_of(prelude_module(), parse(text).node).map(|b: Builtin| b.name);
+  let of_a_list = |n: Bytes| n.starts_with(qualify(prelude_module(), b"ListNode::"));
+  let own = declared.filter(|n: Bytes| !of_a_list(n));
+  assert_eq(own.sort(), intrinsics().map(|i: { name: Bytes, op: Intrinsic }| i.name).sort());
   assert_eq(
     builtins().filter(|b: Builtin| own.contains(qualify(prelude_module(), b.name))).map(
       |b: Builtin| b.name,
     ),
     [],
   );
-  assert_eq(externs_in(prelude_module(), text), [
-    { module: prelude_module(), name: b"ListNode::leaf_of", words: 2, raises: false, call: None },
-  ]);
+  assert_eq(
+    externs_in(prelude_module(), text).map(|e: Extern| qualify(e.module, e.name)).sort(),
+    declared.filter(of_a_list).sort(),
+  );
   let prelude = { name: prelude_module(), src: text };
   let user = |src: Bytes| codes_of([prelude, { name: b"m", src: src }]);
   assert_eq(user(b"fn f(xs: List<Int>) -> Int = ListNode::start(xs)\n"), [b"E0101"]);

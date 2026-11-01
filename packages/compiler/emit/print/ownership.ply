@@ -1,8 +1,8 @@
 import std.bytes (occurrences, ascii_of_int)
 import compiler.syntax.parsing (span_between)
 import compiler.check.types (Type, NamedType, FunctionType, RecordType, int_type, no_effects,
-                             unit_type, string_type, decimal_type, label_type)
-import compiler.check.known (list_node_type, array_type, chan_type, scoped_type, width_type)
+                             unit_type, string_type, decimal_type, label_type, list_type)
+import compiler.check.known (array_type, chan_type, scoped_type, width_type)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Root, Generated, TypeOp, Drop, Dup, Share, Keep, Copy,
                            root_name, root_text, op_name)
@@ -27,9 +27,9 @@ import compiler.emit.pieces (Piece, Text, Hole, Symbol, pieces_text)
 import compiler.emit.representations (Constructors, constructors_of, inside_layout, known_layout)
 import compiler.emit.release (Part, WordAt, ByCase, CountedWord, Object, CaseBox, SumWord,
                               ScalarWord, ThroughDescriptor, RuntimeHandle, BlockContents,
-                              WordBlock, ScopedContents, BytesBlock, ListOf, ListNodeOf, MapOf,
-                              MapNodeOf, ArrayOf, ColumnsOf, ScalarBox, ClosureBlock, HandleBlock,
-                              InlineSum, BlockPart, counted_parts, block_contents, stored_parts,
+                              WordBlock, ScopedContents, BytesBlock, ListOf, MapOf, MapNodeOf,
+                              ArrayOf, ColumnsOf, ScalarBox, ClosureBlock, HandleBlock, InlineSum,
+                              BlockPart, counted_parts, block_contents, stored_parts,
                               root_of_representation, case_root, sole_boxed_payload, drop_of,
                               root_of, case_blocks, holds_unkeepable_value, counted_through,
                               generated, layout_parts)
@@ -816,40 +816,18 @@ fn contents_released(
       },
     ListOf(l) -> {
       let laid = container_layouts().list;
-      let w = item_read_at(x, laid.tail, l.stride);
+      let w = item_read_at(x, laid.items, l.stride);
       let items = parts_released(printing, l.item, w.names);
-      let root = drop_root_call(items.printing, l.node, release_fn(), slot(x, laid.root));
-      let tail = if items.out.len() == 0 { [] } else { [Text(w.read)].concat(items.out) };
+      let owner = drop_root_call(items.printing, l.whole, release_fn(), slot(x, laid.owner));
+      let each = if items.out.len() == 0 { [] } else { [Text(w.read)].concat(items.out) };
       {
-        printing: root.printing,
-        out: [Text(b"{ ")].concat(looped(field(list_head(), x, b"tail_len"), tail)).push(
-          Text(b" "),
-        ).concat(
-          root.out,
-        ).push(
-          Text(Bytes::concat_all([b" ", freed_bytes(x, block_size(x, opening)), b" }"])),
-        ),
-      }
-    },
-    ListNodeOf(n) -> {
-      let trie = container_layouts().trie;
-      let kids = drop_root_call(
-        printing,
-        n.node,
-        release_fn(),
-        word_slot(x, offset_index(trie.first, b"ply_i")),
-      );
-      let w = item_read_at(x, trie.first, n.stride);
-      let items = parts_released(kids.printing, n.item, w.names);
-      let leaves = if items.out.len() == 0 { [] } else { [Text(w.read)].concat(items.out) };
-      {
-        printing: items.printing,
-        out: [Text(Bytes::concat_all([b"if (", node_is(x, trie.branch), b") { "]))].concat(
-          looped(field(node_head(), x, b"len"), kids.out),
+        printing: owner.printing,
+        out: [Text(Bytes::concat_all([b"if (", slot(x, laid.owner), b") { "]))].concat(
+          owner.out,
         ).push(
           Text(b" } else { "),
         ).concat(
-          looped(field(node_head(), x, b"len"), leaves),
+          looped(field(list_head(), x, b"claimed"), each),
         ).push(
           Text(Bytes::concat_all([b" } ", freed_bytes(x, block_size(x, opening))])),
         ),
@@ -1104,7 +1082,6 @@ pub fn walk_block(
             ]),
           ),
         _ -> {
-          let size = block_size(x, opening);
           let parts = each_counted_slot(
             n.printing,
             a,
@@ -1127,7 +1104,7 @@ pub fn walk_block(
                   b" != UINT32_MAX) { ",
                   a,
                   b" = ",
-                  call_text(persistent_copy_fn(), [b"ctx", x, size]),
+                  kept_copy(x, opening),
                   b"; ",
                 ]),
               ),
@@ -1145,7 +1122,6 @@ pub fn walk_block(
       HandleBlock -> unsupported(b"a runtime handle copied", var_text(of)),
       ScopedContents(_) -> unsupported(b"a scoped value copied", var_text(of)),
       _ -> {
-        let size = block_size(x, opening);
         let duped_slots = each_counted_slot(
           n.printing,
           a,
@@ -1159,15 +1135,7 @@ pub fn walk_block(
         fragment_line(depth, {
           printing: let_go.printing,
           out: [
-            Text(
-              Bytes::concat_all([
-                b"Word ",
-                a,
-                b" = ",
-                call_text(fresh_block_fn(), [b"ctx", x, size]),
-                b"; ",
-              ]),
-            ),
+            Text(Bytes::concat_all([b"Word ", a, b" = ", fresh_copy(x, opening), b"; "])),
           ].concat(
             spaced(duped_slots.out, let_go.out),
           ),
@@ -1431,12 +1399,13 @@ fn block_size(x: Bytes, o: BlockContents) -> Bytes =
       Bytes::concat_all([
         ascii_of_int(header_bytes()),
         b" + 8 * (",
-        ascii_of_int(container_layouts().list.tail),
-        b" + ",
+        ascii_of_int(container_layouts().list.items),
+        b" + (",
+        slot(x, container_layouts().list.owner),
+        b" ? 0 : ",
         items_words(Bytes::concat_all([b"(int64_t)", field(list_head(), x, b"room")]), l.stride),
-        b")",
+        b"))",
       ]),
-    ListNodeOf(_) -> node_bytes(x),
     MapOf(_) -> ascii_of_int(header_bytes() + 8 * container_layouts().map.words),
     MapNodeOf(_) -> node_bytes(x),
     ArrayOf(a) ->
@@ -1457,13 +1426,78 @@ fn node_bytes(x: Bytes) -> Bytes =
     field(node_head(), x, b"room"),
   ])
 
+fn kept_copy(x: Bytes, o: BlockContents) -> Bytes =
+  match o {
+    ListOf(l) -> call_text(kept_list_fn(), [b"ctx", x, ascii_of_int(l.stride)]),
+    _ -> call_text(persistent_copy_fn(), [b"ctx", x, block_size(x, o)]),
+  }
+
+fn fresh_copy(x: Bytes, o: BlockContents) -> Bytes =
+  match o {
+    ListOf(l) -> call_text(fresh_list_fn(), [b"ctx", x, ascii_of_int(l.stride)]),
+    _ -> call_text(fresh_block_fn(), [b"ctx", x, block_size(x, o)]),
+  }
+
 pub fn persistent_copy_fn() -> Bytes = b"ply_kept_block"
 
 pub fn fresh_block_fn() -> Bytes = b"ply_fresh_block"
 
+pub fn kept_list_fn() -> Bytes = b"ply_kept_list"
+
+pub fn fresh_list_fn() -> Bytes = b"ply_fresh_list"
+
 pub fn unshared_fn() -> Bytes = b"ply_unshared"
 
 pub fn mark_shared_fn() -> Bytes = b"ply_mark_shared"
+
+fn list_copy_helpers() -> Bytes = {
+  let laid = container_layouts().list;
+  let lh = |x: Bytes, f: Bytes| field(list_head(), x, f);
+  let items_at = ascii_of_int(laid.items);
+  let moved = Bytes::concat_all([
+    b"  memcpy(&",
+    word_slot(b"c", items_at),
+    b", ply_list_item(x, 0, stride), (size_t)(n * stride) * sizeof(Word));\n",
+    b"  return c;\n}\n",
+  ]);
+  let count = Bytes::concat_all([b"  int64_t n = (int64_t)", lh(b"x", b"len"), b";\n"]);
+  Bytes::concat_all([
+    b"static inline Word ",
+    kept_list_fn(),
+    b"(PlyCtx *ctx, Word x, int64_t stride) {\n",
+    count,
+    b"  Word c = rt_alloc_kept_p(ctx, ",
+    ascii_of_int(header_bytes() + 8 * laid.items),
+    b" + 8 * n * stride);\n  ",
+    lh(b"c", b"len"),
+    b" = (uint32_t)n; ",
+    lh(b"c", b"room"),
+    b" = (uint32_t)n; ",
+    lh(b"c", b"claimed"),
+    b" = (uint32_t)n; ",
+    lh(b"c", b"first"),
+    b" = ",
+    items_at,
+    b"; ",
+    slot(b"c", laid.owner),
+    b" = 0;\n",
+    moved,
+    b"static inline Word ",
+    fresh_list_fn(),
+    b"(PlyCtx *ctx, Word x, int64_t stride) {\n",
+    count,
+    b"  Word c = ply_list_room(ctx, ",
+    slot(b"x", laid.owner),
+    b" ? n : (int64_t)",
+    lh(b"x", b"room"),
+    b", stride);\n  ",
+    lh(b"c", b"len"),
+    b" = (uint32_t)n; ",
+    lh(b"c", b"claimed"),
+    b" = (uint32_t)n;\n",
+    moved,
+  ])
+}
 
 pub fn walk_helpers() -> Bytes = {
   let copied = |made: Bytes|
@@ -1485,6 +1519,7 @@ pub fn walk_helpers() -> Bytes = {
     b"static inline Word ",
     fresh_block_fn(),
     copied(b"ply_alloc"),
+    list_copy_helpers(),
     b"static inline int ",
     unshared_fn(),
     b"(Word x) { return x && ",
@@ -1520,27 +1555,17 @@ pub fn each_counted_slot(
     ScopedContents(h) ->
       each(printing, [{ ps: stored_parts(printing.constructors, h), ws: [slot(b, h.at)] }]),
     ListOf(l) -> {
-      let items = act(printing, l.item, item_slots_at(b, container_layouts().list.tail, l.stride));
-      let root = act(items.printing, node(l.node), [slot(b, container_layouts().list.root)]);
+      let laid = container_layouts().list;
+      let items = act(printing, l.item, item_slots_at(b, laid.items, l.stride));
+      let owner = act(items.printing, node(l.whole), [slot(b, laid.owner)]);
       {
-        printing: root.printing,
-        out: spaced(looped(field(list_head(), b, b"tail_len"), items.out), root.out),
-      }
-    },
-    ListNodeOf(n) -> {
-      let first = container_layouts().trie.first;
-      let kids = act(printing, node(n.node), [word_slot(b, offset_index(first, b"ply_i"))]);
-      let items = act(kids.printing, n.item, item_slots_at(b, first, n.stride));
-      {
-        printing: items.printing,
-        out: [
-          Text(Bytes::concat_all([b"if (", node_is(b, container_layouts().trie.branch), b") { "])),
-        ].concat(
-          looped(field(node_head(), b, b"len"), kids.out),
+        printing: owner.printing,
+        out: [Text(Bytes::concat_all([b"if (", slot(b, laid.owner), b") { "]))].concat(
+          owner.out,
         ).push(
           Text(b" } else { "),
         ).concat(
-          looped(field(node_head(), b, b"len"), items.out),
+          looped(field(list_head(), b, b"claimed"), items.out),
         ).push(
           Text(b" }"),
         ),
@@ -2332,32 +2357,34 @@ test "a box opened reads its counted words, a wide sum's every word, and gives t
   assert_eq(per_part(s, part_names(b"t2", s)), [[b"t2_0", b"t2_1"]])
 }
 
-test "a list opened lets go of its tail's items and its trie, and gives itself back by its room" {
+test "a list opened lets go of its owner or else its items, and gives itself back by its room" {
   let item = drop_of(string_type());
-  let node = drop_of(list_node_type(string()));
+  let whole = drop_of(list_type(string()));
   let opened = opened_block(
     empty_printing(Map::new().insert(0, b"p0")),
     0,
     placeholder_var(0, AsWord),
     [],
-    ListOf({ node: node, item: [word(0, Object(item))], stride: 1 }),
+    ListOf({ whole: whole, item: [word(0, Object(item))], stride: 1 }),
   );
   let text = pieces_text(opened.out);
+  let owner = Bytes::concat_all([
+    b"ply_words(p0)[",
+    ascii_of_int(container_layouts().list.owner),
+    b"]",
+  ]);
   assert(
     [
-      head_field(list_head(), b"p0", b"tail_len"),
+      Bytes::concat_all([b"if (", owner, b") { "]),
+      head_field(list_head(), b"p0", b"claimed"),
       root_symbol_text(item),
-      called(release_fn(), [
-        b"ctx",
-        Bytes::concat_all([b"ply_words(p0)[", ascii_of_int(container_layouts().list.root), b"]"]),
-        root_symbol_text(node),
-      ]),
+      called(release_fn(), [b"ctx", owner, root_symbol_text(whole)]),
       call_start(free_fn(), [b"ctx", b"p0"]),
       head_field(list_head(), b"p0", b"room"),
     ].all(|part: Bytes| text.contains(part)),
     Some(String::of_bytes_lossy(text)),
   );
-  assert_eq(opened.calls, [item, node])
+  assert_eq(opened.calls, [item, whole])
 }
 
 test "an array let go of loops over its elements, its head counting them, and gives back their words" {
@@ -2654,28 +2681,26 @@ fn walk_fragment(
   { text: paired(pieces_text(w.out)), calls: w.calls }
 }
 
-test "a node copied is a fresh block of its head and words, each counted once more, the original let go" {
+test "a list copied is a fresh list of its items, each counted once more, the original let go" {
   let item = drop_of(string_type());
-  let node = drop_of(list_node_type(string()));
+  let whole = drop_of(list_type(string()));
   let copy = walk_fragment(
     Copy,
-    ListNodeOf({ node: node, item: [word(0, Object(item))], stride: 1 }),
-    node,
+    ListOf({ whole: whole, item: [word(0, Object(item))], stride: 1 }),
+    whole,
   );
   [
-    call_text(fresh_block_fn(), [b"ctx", b"p0", node_bytes(b"p0")]),
+    call_text(fresh_list_fn(), [b"ctx", b"p0", b"1"]),
     Bytes::concat_all([
-      b"if (",
-      node_is(b"t1", container_layouts().trie.branch),
-      b") { for (int64_t ply_i = 0; ply_i < ",
-      field(node_head(), b"t1", b"len"),
+      b"for (int64_t ply_i = 0; ply_i < ",
+      field(list_head(), b"t1", b"claimed"),
       b"; ply_i++) { ",
-      called(dup_fn(), [b"ply_words(t1)[1 + ply_i]"]),
-      b" } }",
+      called(dup_fn(), [b"ply_words(t1)[4 + ply_i]"]),
+      b" }",
     ]),
-    called(release_fn(), [b"ctx", b"p0", root_symbol_text(node)]).concat(b"\n"),
+    called(release_fn(), [b"ctx", b"p0", root_symbol_text(whole)]).concat(b"\n"),
   ].fold((), |_: Unit, part: Bytes| assert(copy.text.contains(part), None));
-  assert_eq(copy.calls, [node])
+  assert_eq(copy.calls, [whole])
 }
 
 test "a sum of one word walks the block its case holds, a chain of its own type in a loop" {
@@ -2847,7 +2872,7 @@ test "what is or reaches a runtime handle, a scoped value or a function value is
   let inner = RecordType([{ name: b"c", ty: chan }, { name: b"n", ty: int }]);
   let outer = RecordType([{ name: b"r", ty: inner }, { name: b"s", ty: string }]);
   let closures = ListOf({
-    node: drop_of(list_node_type(int)),
+    whole: drop_of(list_type(int)),
     item: [word(0, ThroughDescriptor)],
     stride: 1,
   });

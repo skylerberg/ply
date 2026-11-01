@@ -431,7 +431,6 @@ unsafe impl Taken for *const Handed {
 // SAFETY: each is returned as one machine word, as an `int64_t` is.
 unsafe impl Returned for Block {
     const MACHINE: Option<Machine> = Some(Machine::Block);
-    const RAISES: bool = false;
     fn of(w: Word) -> Block {
         Block(w)
     }
@@ -439,7 +438,6 @@ unsafe impl Returned for Block {
 
 unsafe impl Returned for Handed {
     const MACHINE: Option<Machine> = Some(Machine::Handed);
-    const RAISES: bool = false;
     fn of(w: Word) -> Handed {
         Handed(w)
     }
@@ -447,7 +445,6 @@ unsafe impl Returned for Handed {
 
 unsafe impl Returned for Handle {
     const MACHINE: Option<Machine> = Some(Machine::Handle);
-    const RAISES: bool = false;
     fn of(w: Word) -> Handle {
         Handle(w)
     }
@@ -455,7 +452,6 @@ unsafe impl Returned for Handle {
 
 unsafe impl Returned for SecretHandle {
     const MACHINE: Option<Machine> = Some(Machine::Secret);
-    const RAISES: bool = false;
     fn of(w: Word) -> SecretHandle {
         SecretHandle(w)
     }
