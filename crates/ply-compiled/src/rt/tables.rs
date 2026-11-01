@@ -21,11 +21,6 @@ pub struct Root {
 }
 
 impl Tables {
-    pub fn memoized(&self, index: usize) -> Option<Word> {
-        let w = self.memo.get(index)?.load(Acquire);
-        (w != 0).then_some(w)
-    }
-
     pub fn keep(&self, index: usize, kept: Word) {
         if let Some(slot) = self.memo.get(index) {
             let _ = slot.compare_exchange(0, kept, AcqRel, Acquire);

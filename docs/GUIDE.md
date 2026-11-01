@@ -574,9 +574,9 @@ value. Use it to parse a data file once.
 A `const` of type `std.sql.Schema` is a database schema. The SQL statements of its module, and of
 every module that imports it, are checked against it before the program runs (§14.8).
 
-`const fn name() -> Type = value` declares the same constant, read with a call: `name()`.
-
-A plain function with no parameters that performs nothing is also computed only once per process.
+A plain function with no parameters that performs nothing and cannot raise is also computed only
+once per process. A function that can raise runs every time it is called, so a caught failure can be
+retried. Use a `const` for a value that must not fail.
 
 ### 4.6 Embedding files
 

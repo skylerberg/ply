@@ -15,7 +15,6 @@ pub enum MachineType {
     Type,
     Op,
     DropRoot,
-    KeepRoot,
     Taken,
     Secret,
 }
@@ -35,7 +34,6 @@ impl MachineType {
             MachineType::Type => "Type",
             MachineType::Op => "Op",
             MachineType::DropRoot => "DropRoot",
-            MachineType::KeepRoot => "KeepRoot",
             MachineType::Taken => "Taken",
             MachineType::Secret => "Secret",
         }
