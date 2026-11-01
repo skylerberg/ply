@@ -3,9 +3,10 @@
 //! unit here is written by hand (`crate::units`), so no program is compiled.
 
 use crate::units::{self, Def, def, int_entry, lifting, native};
-use ply_compiled::entry::{self, Ended, Opened, Run};
+use ply_compiled::entry::{self, Ended, Opened, Run, overdue_lines};
 use ply_core::codec::{Reader, Writer, tag};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A string read from the lifting into `buf`, its length `n`.
 pub fn string_read() -> String {
@@ -337,4 +338,18 @@ fn a_task_in_an_entrys_result_is_rejected_at_the_boundary() {
         }
         _ => panic!("the boundary did not reject the task"),
     }
+}
+
+#[test]
+fn the_heartbeat_names_only_tests_past_its_interval_longest_first() {
+    let now = Instant::now();
+    let tests = [
+        ("quick".to_string(), now - Duration::from_secs(5)),
+        ("slow".to_string(), now - Duration::from_secs(40)),
+        ("slowest".to_string(), now - Duration::from_secs(95)),
+    ];
+    assert_eq!(
+        overdue_lines(&tests, now, Duration::from_secs(30)),
+        ["   running for 95s: slowest", "   running for 40s: slow"]
+    );
 }

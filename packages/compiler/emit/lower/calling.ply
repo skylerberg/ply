@@ -6,6 +6,7 @@ import compiler.emit.code (Code, CodeVar, NDefinition, NConstructor, NBuiltin, C
                            CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm, CodeClause,
                            CodeListPattern, CodeBindingPattern, KnownLambdaCall, labels_among,
                            code_children)
+import compiler.check.typed (ConstantData, LiteralData, RecordData, CaseData)
 import compiler.check.types (Type, FunctionType, VariableType, NamedType, Scheme, Effects, Effect,
                              ResourceVariable, int_type, bool_type, option_type, run_needs,
                              no_effects)
@@ -57,13 +58,13 @@ import compiler.emit.lower.base (Context, Lowering, LoweredValue, Target, ToCons
                                  note_frame_entry, retyped, with_need, no_captured_evidence,
                                  EvidenceValues, listed_evidence_values, evidence_values_of,
                                  substitute_evidence_vars, exit_block)
-import compiler.emit.lower.data (constructed)
+import compiler.emit.lower.data (constructed, record_literal)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read,
-                                       empty_list_with_capacity, intrinsic_call)
+                                       empty_list_with_capacity, intrinsic_call, list_pushed)
 import compiler.emit.lower.marshalling (pending_abort_raise)
 import compiler.emit.lower.strings (range_guarded)
 import compiler.emit.lower.handling (performed)
-import compiler.emit.lower.scalars (release_value)
+import compiler.emit.lower.scalars (release_value, literal)
 import compiler.emit.lower.evidence (EvidenceArguments, evidence_parameters,
                                      with_evidence_parameters, evidence_arguments,
                                      evidence_arguments_filled, function_value_evidence,
@@ -338,18 +339,24 @@ pub fn target(
     } else { Some(ToInlinedBody(KnownLambda)) },
     CodeVar(_) -> Some(ToValue),
     NConstructor(c) -> Some(ToConstructor(c.name)),
-    NDefinition(f) -> match defined(context, f.full) {
-      Some(d) -> match walk_of(context, d, function, args) {
-        Some(w) -> Some(ToInlinedBody(WalkFunction(w))),
-        None -> Some(ToDefinition(d.full)),
+    NDefinition(f) -> match list_builtin_of(f.full) {
+      Some(b) -> Some(ToBuiltin(b)),
+      None -> match defined(context, f.full) {
+        Some(d) -> match walk_of(context, d, function, args) {
+          Some(w) -> Some(ToInlinedBody(WalkFunction(w))),
+          None -> Some(ToDefinition(d.full)),
+        },
+        None -> None,
       },
-      None -> None,
     },
     NBuiltin(b) -> if b.name == b"iterate" && iterate_inlinable(args) {
       Some(ToInlinedBody(IterateStep))
     } else { Some(ToBuiltin(simple_name_of(b.name))) },
     _ -> Some(ToValue),
   }
+
+fn list_builtin_of(full: Bytes) -> Option<Bytes> =
+  [b"List::at", b"List::push", b"List::set"].find(|b: Bytes| qualify(prelude_module(), b) == full)
 
 fn walk_of(
   context: Context,
@@ -466,7 +473,10 @@ pub fn named_function_call(
               None -> acc,
             },
         );
-        called(context, read.st, d.full, f, a.args, read.args, false, f.span)
+        match list_builtin_of(v.full) {
+          Some(b) -> called_builtin(context, read.st, b, read.args, f, f.span),
+          None -> called(context, read.st, d.full, f, a.args, read.args, false, f.span),
+        }
       },
       _ -> unreachable(b"a definition named as a value the module does not define"),
     },
@@ -601,7 +611,10 @@ pub fn called(
     } else if args.len() != d.definition.arity {
       unreachable(b"a call that does not fill its parameters: ".concat(full_name))
     } else if args.len() == 0 && d.definition.pure && !generic(d.definition) {
-      constant_read(context, st, d, function, at)
+      match d.definition.value {
+        Some(v) -> constant_lowered(context, st, v, at),
+        None -> constant_read(context, st, d, function, at),
+      }
     } else {
       match if tail { tail_jump(context, st, d, function, codes, args, at) } else { None } {
         Some(j) -> j,
@@ -1289,12 +1302,19 @@ fn exit_walk(
   let went = |s: Lowering, held: Arg| emitted(s, Next([after.arg, held]));
   let item = match w.kind {
     Mapping -> {
-      let o = list_push(context, after.st, VarOperand(v.accumulator), body.arg, w.accumulator, at);
+      let o = list_pushed(
+        context,
+        after.st,
+        VarOperand(v.accumulator),
+        body.arg,
+        w.accumulator,
+        at,
+      );
       went(o.st, o.arg)
     },
     Filtering -> {
       let k = represented_as({ st: after.st, arg: body.arg }, AsBool, at);
-      let o = list_push(
+      let o = list_pushed(
         context,
         enter_block(k.st),
         VarOperand(v.accumulator),
@@ -1322,6 +1342,7 @@ fn exit_walk(
         Some(Some(init)) -> represented_as({ st: s, arg: init }, v.accumulator.representation, at),
         _ -> unreachable(b"a fold with no first accumulator"),
       },
+      Filtering -> empty_list_with_capacity(context, s, w.accumulator, IntOperand(0), at),
       _ -> empty_list_with_capacity(context, s, w.accumulator, n, at),
     };
     let ended = fresh(first.st, bool_type(), AsBool);
@@ -1473,22 +1494,6 @@ fn exit_map_walk(
     _ -> unreachable(b"a fold of a map with no map or no seed"),
   }
 }
-
-fn list_push(
-  context: Context,
-  st: Lowering,
-  out: Arg,
-  x: Arg,
-  list: Type,
-  at: Span,
-) -> LoweredValue / {abort.raise} =
-  match ((prelude_defined(context, b"List::push"), list)) {
-    (Some(d), NamedType(c)) -> match c.args.at(0) {
-      Some(item) -> defined_called(context, st, d, [item], [], [], [out, x], at),
-      None -> unreachable(b"a push onto a list of no item type"),
-    },
-    _ -> unreachable(b"a push the prelude defines no `List::push` for"),
-  }
 
 fn prelude_defined(context: Context, name: Bytes) -> Option<NamedDefinition> =
   if context.setting.module == prelude_module() {
@@ -2552,6 +2557,36 @@ fn generic(d: Definition) -> Bool =
   match d.scheme {
     Some(sc) -> sc.type_variables.len() > 0 || sc.effect_variables.len() > 0,
     None -> false,
+  }
+
+fn constant_lowered(
+  context: Context,
+  st: Lowering,
+  value: ConstantData,
+  at: Span,
+) -> LoweredValue / {abort.raise} =
+  match value {
+    LiteralData(l) -> literal(context, st, l, at),
+    RecordData(r) -> {
+      let made = r.fields.fold(
+        { st: st, fields: [] },
+        |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, f: { name: Bytes, value: ConstantData }| {
+          let o = constant_lowered(context, acc.st, f.value, at);
+          { st: o.st, fields: acc.fields.push({ name: f.name, arg: o.arg }) }
+        },
+      );
+      record_literal(context, made.st, made.fields, r.ty, at)
+    },
+    CaseData(c) -> {
+      let made = c.args.fold(
+        { st: st, args: [] },
+        |acc: { st: Lowering, args: List<Arg> }, x: ConstantData| {
+          let o = constant_lowered(context, acc.st, x, at);
+          { st: o.st, args: acc.args.push(o.arg) }
+        },
+      );
+      constructed(context, made.st, c.name, made.args, c.ty, at)
+    },
   }
 
 fn constant_read(
