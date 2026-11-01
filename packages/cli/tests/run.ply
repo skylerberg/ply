@@ -26,12 +26,14 @@ import compiler.syntax.type_syntax
 import compiler.syntax.type_syntax (WriteMode)
 import diagnostic (SourceText, shown)
 import paths
-import program (TimedLoad, loaded_analysis, modules_of, own_diagnostics, timed_over,
+import program (TimedLoad, loaded_analysis, modules_of, own_diagnostics, passed_unchanged,
+                record_passed, timed_over,
                 timed_uncached_over, unchanged, program_view)
-import report (CommandOutput, indent, rejected, reuse_members, with_front_end)
+import report (CommandOutput, indent, ok_code, rejected, reuse_members, with_front_end)
 import sources (Embed, File, Project, load_resolved)
 import std.process (process)
 import std.json (object)
+import std.show (show)
 import std.term (Style)
 import tester
 import tester (result_cache, ListedCase, Options, TestRun, TestUnit, ListingFailure)
@@ -48,11 +50,11 @@ import proof.context (set_of)
 import std.option
 import tests.report (Entry, Case, group_of_class, classes_of, run_decision_of, Program, TimeSpent,
                      no_time_spent, primary_of, placed_cases, unbound, test_at, canonical,
-                     outside_effects_text)
+                     outside_effects_text, all_cached_line)
 import tests.concluded (hash_at, test_hash_at, uses_simulation, entry_of, cases_of)
 import tests.cases (Scope, scope_of, over_cases, list_cases, scope_for_listing, run_within,
                     run_unit, ExpandedTests, expand_cases, codes_of, passed_by_code, concluded_run,
-                    search_of, sim_json)
+                    search_of, sim_json, passing_run)
 import semantics (semantics)
 
 pub type Iteration = { result: CommandOutput, cached_load: Option<TimedLoad>, embeds: List<Embed> }
@@ -81,6 +83,11 @@ fn load_or_reuse(
   }
 }
 
+fn may_skip_when_unchanged(flags: Flags, options: Options, cached_load: Option<TimedLoad>) -> Bool =
+  cached_load == None && !flags.no_cache && !flags.json && !flags.explain && !options.coverage
+    && flags.filters.len() == 0
+    && options.machine.config.schema == None
+
 pub fn run_once(
   flags: Flags,
   options: Options,
@@ -90,8 +97,44 @@ pub fn run_once(
   let begun = time.elapsed_us();
   process.err[proc](indent() ++ "checking the program");
   let started = time.elapsed_ms();
-  let project = load_resolved(flags.paths);
-  run_loaded_program(flags, options, s, load_or_reuse(flags, cached_load, project, started), begun)
+  let may_skip = may_skip_when_unchanged(flags, options, cached_load);
+  let selection = shipped_stamps().runtime_digest ++ show(options);
+  match if may_skip { passed_unchanged(flags.paths, selection) } else { None } {
+    Some(passed) ->
+      {
+        result: {
+          json: object([]),
+          lines: [all_cached_line(s, passed)],
+          errs: [],
+          code: ok_code(),
+        },
+        cached_load: None,
+        embeds: [],
+      },
+    None -> {
+      let project = load_resolved(flags.paths);
+      let done = handle {
+        run_loaded_program(
+          flags,
+          options,
+          s,
+          load_or_reuse(flags, cached_load, project, started),
+          begun,
+        )
+      } with {
+        var passed = None,
+        passing_run.all_passed(count) -> {
+          passed = Some(count);
+        },
+        return it -> { it: it, passed: passed },
+      };
+      match done.passed {
+        Some(count) -> if may_skip { record_passed(flags.paths, selection, count) },
+        None -> (),
+      };
+      done.it
+    },
+  }
 }
 
 fn run_loaded_program(
@@ -100,7 +143,7 @@ fn run_loaded_program(
   s: Style,
   t: TimedLoad,
   begun: Int,
-) -> Iteration / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, shipped.read_pack, Derives, abort.raise, evaluation.verdicts, evaluation.statements} =
+) -> Iteration / {passing_run.all_passed, semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, shipped.read_pack, Derives, abort.raise, evaluation.verdicts, evaluation.statements} =
   match program_view(t.program) {
     None ->
       {
@@ -266,7 +309,7 @@ fn tests_over(
   timed: TimedLoad,
   analysis: CheckedProgram,
   begun: Int,
-) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, Derives, abort.raise} = {
+) -> CommandOutput / {passing_run.all_passed, semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, Derives, abort.raise} = {
   let loaded_at = time.elapsed_us();
   let unkept = reuse_violations(timed.program, analysis.frame);
   let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, analysis.frame) };
@@ -283,7 +326,7 @@ fn selected(
   timed: TimedLoad,
   analysis: CheckedProgram,
   spent: TimeSpent,
-) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, Derives, abort.raise} = {
+) -> CommandOutput / {passing_run.all_passed, semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, Derives, abort.raise} = {
   let configuring = time.elapsed_us();
   let testing = tester::start_run(options);
   results::with_result_cache(results::store_for(flags.paths, flags.no_cache), || {
@@ -399,7 +442,7 @@ fn decided_run(
   testing: TestRun,
   timed: TimedLoad,
   over: ExpandedTests,
-  analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
+  analysis_for: (TestRunScope) -> LoadedAnalysis / {passing_run.all_passed, abort.raise},
   opened: List<Diagnostic>,
   spent: TimeSpent,
   listing: Int,

@@ -3,7 +3,7 @@ import std.fs
 import std.fs (fs)
 import std.list
 import compiler.store.fact_store
-import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, fact_damage,
+import compiler.store.fact_store (Database, Dependents, Facts, Past, Inputs, Codes, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
 import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, defers, digest_of,
@@ -167,7 +167,16 @@ fn over_database<a, [r] | e>(
       l.looked.digest
     },
     memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
-    memo_store.times_marked(key) -> match st.waiting.marks.get(key) { Some(n) -> n, None -> 0 },
+    memo_store.past(key) -> match fact_store::value_of[r](st.db, Past, key) {
+      Some(b) -> Some(undecoded(b, stored_fact_bin())),
+      None -> None,
+    },
+    memo_store.keep_past(key, fact) -> {
+      st = { ..st, db: fact_store::with_value(st.db, Past, key, bin::encode(fact, stored_fact_bin())) };
+    },
+    memo_store.put_fact(key, fact) -> {
+      st = { ..st, db: fact_store::with_value(st.db, Facts, key, bin::encode(fact, stored_fact_bin())) };
+    },
     memo_store.next_out_of_date() -> first_waiting(st.waiting),
     memo_store.put(key, fact, details, output, lasting) -> {
       let persisted = lasting || inline_output(output) != None;
@@ -271,7 +280,7 @@ fn over_database<a, [r] | e>(
       fact_store::commit[r](
         if st.edited || st.changes.len() > 0 { fact_store::append_change(st.db, st.changes) }
         else { st.db },
-        live_results[r],
+        |db: Database| live_results[r](db),
       );
       value
     },
@@ -309,6 +318,20 @@ pub fn product_is_current<[r]>(
     fact_store::cursor[r](db, product) == fact_store::log_end(db)
   }))
 
+pub fn product_value<[r]>(dir: String, product: String) -> Int / {fs.read[r], abort.raise} =
+  with_recent_reads(|| fact_store::undamaged(||
+    fact_store::cursor[r](fact_store::read_only[r](dir), product)))
+
+pub fn product_set_value<[r]>(
+  dir: String,
+  product: String,
+  value: Int,
+) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
+  with_recent_reads(|| {
+    fact_store::move_cursor[r](fact_store::read_only[r](dir), product, value);
+    ()
+  })
+
 pub fn product_read_log<[r]>(
   dir: String,
   product: String,
@@ -333,13 +356,12 @@ pub type Usage = {
 fn live_results<[r]>(
   db: Database,
 ) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  fact_store::entries_under[r](db, Facts, b"").fold(
-    Map::new(),
-    |found: Map<Bytes, Bool>, _: Bytes, b: Bytes| {
-      let f = undecoded(b, stored_fact_bin());
-      found.insert(result_key(f.output), true).insert(f.details, true)
-    },
-  )
+  fact_store::entries_under[r](db, Past, b"").values().concat(
+    fact_store::entries_under[r](db, Facts, b"").values(),
+  ).fold(Map::new(), |found: Map<Bytes, Bool>, b: Bytes| {
+    let f = undecoded(b, stored_fact_bin());
+    found.insert(result_key(f.output), true).insert(f.details, true)
+  })
 
 pub fn usage<[r]>(dir: String, queries: List<Bytes>) -> Usage / {fs.read[r], abort.raise} =
   with_recent_reads(|| fact_store::undamaged(|| {
