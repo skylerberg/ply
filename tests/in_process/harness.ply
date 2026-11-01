@@ -2,14 +2,17 @@
 //! as a value, `on_disk` over the working directory, and `load_program` for a program a test
 //! enters. Each is slower per command than a spawned `ply`, whose compiler is an optimized build,
 //! but runs alongside other tests and is cached until the code it reaches moves. `on_disk` and
-//! `in_memory` reject a command that compiles the program, which `tests/cli` starts as a process.
+//! `in_memory` reject a command that compiles the program. `on_disk_faked` and `in_memory_faked` run
+//! one with its compile faked, so that what a command decides, stores and reports is real and only
+//! the program's entries are stated by the test.
 
-import spawning.harness (Repo, RunResult, Source, WorkingDirectory, agreeing, at, bodies_dir,
-                         checking, diagnostic, environment, exists, failed, first, int, items,
-                         joined, json_of, manifest, not_ok, own_modules, parent, path, read,
-                         repo_file, reused_dir, scratch_marker, send, sources_here, spawned,
-                         stable_report, str, var_of, working_directory, write, write_project)
-import cli.ply (main)
+import support.harness (Repo, RunResult, Source, WorkingDirectory, agreeing, at, bodies_dir,
+                        checking, diagnostic, environment, exists, failed, first, int, items,
+                        joined, json_of, manifest, not_ok, own_modules, parent, path, read,
+                        repo_file, reused_dir, scratch_marker, send, sources_here, stable_report,
+                        str, var_of, working_directory, write, write_project)
+import cli.ply (main, execute)
+import cli.units (emit)
 import cli.paths
 import cli.program (packages_of)
 import cli.sources
@@ -19,8 +22,11 @@ import compiler.front.pkg (SuppliedPackage)
 import compiler.checkout (ShippedFile, digests_of)
 import std.env (env)
 import compiler.unit
-import compiler.unit (shipped)
-import compiler.front.rows (ModuleSpan, module_of)
+import compiler.unit (UnitBody, shipped)
+import compiler.emit.keys (RootKey, RootName, root_name)
+import compiler.emit.output (no_tables)
+import compiler.front.rows (Dump, HashTableRow, ModuleSpan, TestHashRow, TestRow, module_of)
+import compiler.front.emitter_input (test_root_at)
 import compiler.load
 import compiler.check.resolve.tables (Diagnostic)
 import cli.diagnostic
@@ -46,26 +52,14 @@ import std.process (process, Var, FakeProcess, captured, args_step, out_step, er
                     with_input, line_step, Line)
 import std.term (term)
 import std.time (time)
-import std.value (Value)
+import std.value
+import std.value (Value, VInt, VList, VUnit)
 import std.path (join, normalize)
 import std.pkg (Dependency, Manifest, Path, ToolchainParts, Workspace)
 import std.string
 
 fn captured_result(c: FakeProcess) -> RunResult =
   { out: c.out, err: c.err, code: match c.code { Some(n) -> n, None -> 0 } }
-
-/// Whether the program in the working directory compiles and its unit opens.
-pub fn loads_here() -> Bool / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
-  match library_here() {
-    Err(_) -> false,
-    Ok(c) -> match entering::machine.open(c.library) {
-      Ok(o) -> {
-        entering::machine.close(o.unit);
-        true
-      },
-      Err(_) -> false,
-    },
-  }
 
 /// What the first of `diagnostics` says, for a test that stops where a step it relies on failed.
 pub fn first_message(diagnostics: List<Diagnostic>) -> String =
@@ -158,17 +152,6 @@ pub fn call(
     Err(r) -> Err(diagnostic::shown(r)),
   }
 
-/// [`call`], where a raise is the test's failure.
-pub fn call_value(
-  l: LoadedProgram,
-  entry: String,
-  args: List<Value>,
-) -> Value / {entering::machine.enter, abort.raise} =
-  match call(l, entry, args) {
-    Ok(v) -> v,
-    Err(d) -> panic("`" ++ entry ++ "` returns: " ++ String::of_bytes_lossy(d.message)),
-  }
-
 /// What the repository's `ply.work` states: where each of its packages lies.
 pub fn workspace() -> Workspace / {Repo, abort.raise} =
   match pkg::check_workspace(Bytes::of_string(repo_file(library::workspace_file()))).workspace {
@@ -192,14 +175,6 @@ fn manifest_at(dir: String) -> Manifest / {Repo, abort.raise} =
 
 /// The name the package at `dir`, below the repository, gives itself.
 pub fn package_name(dir: String) -> String / {Repo, abort.raise} = manifest_at(dir).name
-
-/// The directory below the repository of the package `ply.work` lists whose `ply.pkg` names it
-/// `name`.
-pub fn package_dir(name: String) -> String / {Repo, abort.raise} =
-  match workspace().packages.filter(|dir: String| package_name(dir) == name) {
-    [dir, ..] -> dir,
-    [] -> panic("`ply.work` lists no package named `" ++ name ++ "`"),
-  }
 
 /// The working directory's program checked as it stands, through its memo store.
 pub fn warm_check_report() -> Json / {CliEffects, Shipped, abort.raise, diverges} =
@@ -465,14 +440,18 @@ pub fn shipped_dirs() -> List<String> / {Repo, abort.raise} = {
 /// A tree whose working directory holds `files`. Its root is the filesystem's and the working
 /// directory is `/w`, so a test can place a file beside the project as well as in it.
 pub fn tree(files: List<Source>) -> MemFs / {abort.raise} =
-  files.fold(fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, source: Source| {
-    let at = "w/" ++ source.path;
-    fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, Bytes::of_string(source.text)).fs
-  })
+  files.fold(fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, source: Source|
+    with_file(t, source.path, source.text))
 
 /// A tree whose working directory holds one module, `m.ply`.
 pub fn one_module_tree(text: String) -> MemFs / {abort.raise} =
   tree([{ path: "m.ply", text: text }])
+
+/// `t` with `text` at `path` under its working directory.
+pub fn with_file(t: MemFs, path: String, text: String) -> MemFs / {abort.raise} = {
+  let at = "w/" ++ path;
+  fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, Bytes::of_string(text)).fs
+}
 
 /// What a file under a tree's working directory holds, as text.
 pub fn file_of(t: MemFs, path: String) -> Option<String> / {abort.raise} =
@@ -854,7 +833,7 @@ fn compiling() -> List<String> = ["attest", "build", "prove", "review", "run", "
 /// Why `ply ARGV` may not run in this process, as a test failure says it.
 fn not_here(argv: List<String>, what: String) -> String =
   "`ply " ++ String::join(argv, " ") ++ "` " ++ what
-    ++ ": start it with `spawned`, in a `test/nondet` over the working directory"
+    ++ ": run it with `in_memory_faked`, or start it with `spawned` in `tests/cli`"
 
 /// Whether `argv` runs a command that compiles the program.
 fn compiles(argv: List<String>) -> Bool / {abort.raise} =
@@ -891,7 +870,7 @@ fn with_default_path(argv: List<String>) -> List<String> / {abort.raise} = {
 /// own roots and every family a command drives a machine with is granted by `--allow`. The streams,
 /// the environment, the text `ply replace` reads and the shipped modules are the harness's. The
 /// command is this suite's own copy of the CLI, which rejects a command that compiles the program:
-/// that runs under `spawned`.
+/// that runs under `on_disk_faked`, or as a process in `tests/cli`.
 pub fn on_disk(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
   on_disk_with(argv, [], None)
 
@@ -933,12 +912,13 @@ fn on_disk_with_overrides(
   stdin: Option<String>,
   overrides: List<Source>,
   only: Bool = false,
+  faked: Option<(String) -> entering::Termination> = None,
 ) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} = {
-  let rejecting = overrides.len() == 0;
+  let rejecting = overrides.len() == 0 && (match faked { Some(_) -> false, None -> true });
   if rejecting && compiles(argv) { panic(not_here(argv, "compiles the program")) };
   let pwd = working_directory();
   let ran = handle {
-    main()
+    match faked { Some(ended) -> main_compiling_nothing(ended), None -> main() }
   } with {
     var io = with_input(captured(with_default_path(argv)), input_lines(stdin)),
     process.args[proc]() -> args_step(io),
@@ -998,6 +978,133 @@ fn on_disk_with_overrides(
   };
   ran
 }
+
+/// `main` over a compile that makes an empty unit, whose entries end as `ended` says of each name:
+/// a test's `module.name`, a case of one's `module.name[position]`, or the root of any other entry.
+fn main_compiling_nothing(
+  ended: (String) -> entering::Termination,
+) -> Unit / {CliEffects, Shipped, shipped.binary_size, env.variable, env.variables, env.working_directory, fs.list_dir[shipped], fs.read_file[shipped], process.args[proc], process.err[proc], process.exit[proc], process.line[proc], process.out[proc], term.is_terminal, abort.raise, diverges} =
+  handle {
+    match command_line::parse(surface(), process.args[proc]()) {
+      command_line::Run(parsed) ->
+        process.exit[proc](handle {
+          execute(parsed)
+        } with {
+          emit.unit(front, offered, entered) ->
+            Ok({
+              sources: [],
+              contents: {
+                bodies: faked_bodies(front.dump, offered),
+                requested: [],
+                named: Map::new(),
+              },
+            }),
+          emit.compiled(sources, profile) -> Ok("faked"),
+        }),
+      _ -> main(),
+    }
+  } with {
+    entering::machine.open(library) -> Ok({ unit: 1, root_count: 0, nanos: 0, threads: 1 }),
+    entering::machine.hosting(grants) -> entering::machine.hosting(entering::no_grants()),
+    entering::machine.bind(grants) -> entering::machine.bind(entering::no_grants()),
+    entering::machine.enter(unit, root, arguments, run) ->
+      {
+        ended: ended(faked_entry(root, arguments, run.label)),
+        exit: None,
+        usage: {
+          nanos: 0,
+          host: false,
+          performs: 0,
+          native_objects: 0,
+          scheduled: 0,
+          task_stacks: 0,
+          frame_tables: 0,
+          runtime_blocks: 0,
+          live: 0,
+        },
+        warnings: [],
+        interleaving: match run.seed {
+          Some(_) -> Some({ steps: [], virtual_time: 0 }),
+          None -> None,
+        },
+        trace: Some(b""),
+      },
+    entering::machine.close(unit) -> (),
+  }
+
+/// The name a faked entry goes by: see `main_compiling_nothing`.
+fn faked_entry(root: String, arguments: Bytes, label: String) -> String / {abort.raise} =
+  if label == "" { root } else {
+    match value::decode(arguments) {
+      Some(VList([VInt(position), ..])) -> label ++ "[" ++ position.to_string() ++ "]",
+      _ -> label,
+    }
+  }
+
+/// A faked unit's bodies: a test's hash stands for its code, so that code moves with what the test
+/// means and with nothing the compiler does.
+fn faked_bodies(dump: Dump, offered: List<RootKey>) -> List<UnitBody> / {abort.raise} = {
+  let hashed = dump.hashes.fold(Map::new(), |acc: Map<Bytes, Bytes>, row: HashTableRow|
+    match row { TestHashRow(t) -> acc.insert(t.key, t.hash), _ -> acc });
+  let coded = dump.tests.fold(Map::new(), |acc: Map<RootName, Bytes>, t: TestRow|
+    match test_root_at(dump, t.index) {
+      Some(root) -> acc.insert(root_name(root), hashed.get(t.key).unwrap_or(b"")),
+      None -> acc,
+    });
+  offered.map(|root: RootKey|
+    {
+      name: root_name(root),
+      text: b"",
+      tables: no_tables(),
+      body: coded.get(root_name(root)).unwrap_or(b""),
+      size: 0,
+    })
+}
+
+/// `ply` over the working directory with its compile faked: see `main_compiling_nothing`.
+pub fn on_disk_faked(
+  argv: List<String>,
+  ended: keep (String) -> entering::Termination,
+  vars: List<Var> = [],
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, vars, None, [], false, Some(ended))
+
+/// `ply` over `t` with its compile faked: see `main_compiling_nothing`. Each of `shipped` stands in
+/// for what this binary ships, as in `on_disk_shipping`.
+pub fn in_memory_faked(
+  t: MemFs,
+  argv: List<String>,
+  ended: keep (String) -> entering::Termination,
+  shipped: List<Source> = [],
+  vars: List<Var> = [],
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} = {
+  let o = over_tree(t, || on_disk_with_overrides(argv, vars, None, shipped, false, Some(ended)));
+  { ran: o.value, tree: o.tree }
+}
+
+/// An entry that returns `Unit`, as a passing test does.
+pub fn returned_unit() -> entering::Termination = returned(VUnit)
+
+/// An entry that returns `v`.
+pub fn returned(v: Value) -> entering::Termination =
+  entering::Returned(match value::encode(v) { Some(b) -> b, None -> b"" })
+
+/// An entry that ends the way a failed `assert` does, saying `message`.
+pub fn failed_assertion(message: String) -> entering::Termination =
+  entering::Failed({
+    code: "E0501",
+    severity: entering::Error,
+    message: message,
+    labels: [],
+    notes: [],
+    values: [],
+  })
+
+/// What every test does, but those `failing` names by `module.name`, which fail.
+pub fn passing_except(failing: List<String>) -> (String) -> entering::Termination =
+  |name: String|
+    if failing.contains(name) { failed_assertion("the test says it failed") }
+    else { returned_unit() }
 
 pub fn cache_entry(name: String) -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {

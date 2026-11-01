@@ -1,82 +1,33 @@
-//! The host boundary as a test run meets it: what a simulation handles itself and what it
-//! rejects, what a handler in scope keeps from the host, and a reply the host gives later, waited
-//! for outside a scheduler and by a task of the run's scheduler while the others run.
+//! The host boundary as a process meets it: what a simulation rejects, which no handler catches, how
+//! a seed reaches a simulation in a task of the run's scheduler, and what a run does once.
 
-import spawning.harness (spawned, at, failure_codes, json_of, write_program, read, all_output,
-                         json_text, str, stdout)
-
-/// A test that reads a file inside a simulation.
-fn reads_in_a_scope() -> String =
-  \\import std.fs (fs)
-  \\
-  \\test/nondet "reads inside a simulation" {
-  \\  simulate {
-  \\    let read = fs.read_file[cwd]("m.ply");
-  \\    assert(read != None)
-  \\  }
-  \\}
-  \\
+import harness (spawned, failure_codes)
+import support.harness (at, json_of, write_program, read, all_output, json_text, str, stdout)
 
 // A search re-runs a simulation whole for every schedule it explores, so whatever the host returned
-// would differ between interleavings: E0425 is terminal.
-test/nondet "a host operation inside a simulation is rejected" {
-  write_program(reads_in_a_scope());
+// would differ between interleavings: E0425 is terminal. A host handler replies from the machine
+// through natives, which fail inside a simulation as a host operation does.
+test/nondet "a host operation and a fact of the machine inside a simulation are rejected" {
+  write_program(
+    \\import std.fs (fs)
+    \\import std.os (os)
+    \\
+    \\test/nondet "reads inside a simulation" {
+    \\  simulate {
+    \\    let read = fs.read_file[cwd]("m.ply");
+    \\    assert(read != None)
+    \\  }
+    \\}
+    \\
+    \\test/nondet "asks inside a simulation" {
+    \\  simulate {
+    \\    assert(os.cpus() >= 1)
+    \\  }
+    \\}
+    \\
+  );
   let ran = json_of(spawned(["test", ".", "--fs", "cwd=.", "--no-cache", "--json"]));
-  assert(failure_codes(ran) == ["E0425"], Some(json_text(ran)))
-}
-
-// A host handler replies from the machine through natives, which fail inside a simulation as a host
-// operation does.
-test/nondet "a fact of the machine asked inside a simulation is rejected" {
-  write_program(
-    "import std.os (os)\n\ntest/nondet \"asks inside a region\" {\n  simulate {\n    assert(os.cpus() >= 1)\n  }\n}\n",
-  );
-  let ran = json_of(spawned(["test", ".", "--no-cache", "--json"]));
-  assert(failure_codes(ran) == ["E0425"], Some(json_text(ran)))
-}
-
-// What a simulation schedules itself never reaches the boundary, so the binding's scheduler is
-// shadowed.
-test/nondet "a scheduler handles the task operations it schedules" {
-  write_program(
-    "test/nondet \"spawns inside a region\" {\n  let n = simulate {\n    let t = task.spawn(|| 20 + 1);\n    task.join(t)\n  };\n  assert_eq(n, 21)\n}\n",
-  );
-  let ran = spawned(["test", ".", "--no-cache"]);
-  assert(ran.code == 0, Some(all_output(ran)))
-}
-
-// A clause around the operation handles it, so the run reaches no handler and needs no root.
-test/nondet "a handler in scope shadows the host" {
-  write_program(
-    "import std.fs (fs)\n\ntest/nondet \"the double answers\" {\n  let read = handle { fs.read_file[cwd](\"absent\") } with {\n    fs.read_file[cwd](p) -> Some(b\"double\"),\n  };\n  assert_eq(read, Some(b\"double\"))\n}\n",
-  );
-  let ran = spawned(["test", ".", "--no-cache"]);
-  assert(ran.code == 0, Some(all_output(ran)))
-}
-
-/// Starts a shell that exits 7, a child the host waits on: a response that comes later.
-fn waits_on_a_child(inside: String) -> String =
-  "import std.process (process, exit_code)\n\nfn child() -> Int / {process.spawn[sh]} =\n  match exit_code(process.spawn[sh]([\"-c\", \"exit 7\"], \"\", [])) { Some(c) -> c, None -> 0 }\n\ntest/nondet \"waits\" {\n"
-    ++ inside
-    ++ "\n}\n"
-
-// Outside any scheduler nothing else could run meanwhile, so the run blocks on the response.
-test/nondet "a response the host gives later is waited for outside a scheduler" {
-  write_program(waits_on_a_child("  assert_eq(child(), 7)"));
-  let ran = spawned(["test", ".", "--exec", "sh=/bin/sh", "--no-cache"]);
-  assert(ran.code == 0, Some(all_output(ran)))
-}
-
-// A test performing `task` runs under the run's scheduler, where a task waiting on the host waits
-// and the others run; each join returns its own task's result.
-test/nondet "tasks waiting on the host park in a production scheduler and each join returns its own" {
-  write_program(
-    waits_on_a_child(
-      "  let ts = range(0, 4).map(|i: Int| task.spawn(|| child() + i));\n  assert_eq(ts.map(|t: Task<Int>| task.join(t)), [7, 8, 9, 10])",
-    ),
-  );
-  let ran = spawned(["test", ".", "--exec", "sh=/bin/sh", "--no-cache"]);
-  assert(ran.code == 0, Some(all_output(ran)))
+  assert(failure_codes(ran) == ["E0425", "E0425"], Some(json_text(ran)))
 }
 
 /// A program whose `main` returns which of two racing tasks a simulation heard first, the
@@ -98,21 +49,6 @@ test/nondet "a simulate inside a task of the run's scheduler runs and takes its 
   let outside = returned("raced()");
   assert(outside == "12" || outside == "21", Some(outside));
   assert_eq(returned("task.join(task.spawn(|| raced()))"), outside)
-}
-
-/// `ply test` over the working directory's program, its child processes started by `sh` and its
-/// files below the working directory.
-fn hosted_test_arguments() -> List<String> =
-  ["test", ".", "--exec", "sh=/bin/sh", "--fs", "cwd=.", "--no-cache"]
-
-// Each task opens its scope, then waits on a child the host reports later and parks; each still
-// reads its own scoped value once it wakes, whichever scope closed first.
-test/nondet "tasks parked on the host keep their scoped values when the other's scope closes first" {
-  write_program(
-    "import std.process (process, exit_code)\n\nfn child(code: Int) -> Int / {process.spawn[sh]} =\n  match exit_code(process.spawn[sh]([\"-c\", \"exit \" ++ code.to_string()], \"\", [])) { Some(c) -> c, None -> 0 }\n\ntest/nondet \"each task reads its hold after the other's region closed\" {\n  let first = task.spawn(|| with_scope[a](10, |x: Int| ()) { c -> {\n    let got = child(5);\n    c.get() + got\n  } });\n  let second = task.spawn(|| with_scope[b](20, |x: Int| ()) { c -> {\n    let got = child(5);\n    c.get() + got\n  } });\n  assert_eq(task.join(first) + task.join(second), 40)\n}\n",
-  );
-  let ran = spawned(hosted_test_arguments());
-  assert(ran.code == 0, Some(all_output(ran)))
 }
 
 // A simulation ends before the operation beside it, which the run does once, outside any schedule.
@@ -139,6 +75,8 @@ fn milliseconds(lines: String, name: String) -> Int / {abort.raise} =
     _ -> panic(lines),
   }
 
+// A wall clock in a process of its own: a suite that runs its tests side by side would share the
+// machine with this one.
 test/nondet "a parallel block that uses a host effect runs its branches at the same time, and one that reaches a handler variable runs them in order" {
   write_program(String::of_bytes_lossy(embed("../programs/host_boundary/parallel_blocks.ply")));
   let ran = spawned(["run", "."]);

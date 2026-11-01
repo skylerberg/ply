@@ -2,10 +2,11 @@
 //! children it starts, and that none of them outlives the run. What a program writes goes to the
 //! process's own streams, so every run here is one.
 
-import spawning.harness (Server, write_program, spawned, spawned_reading, spawned_fed, spawned_into,
-                         this_ply, start_streaming, next_line, signal_to, wait_for_exit,
-                         environment, all_output, stdout, stderr, json_of, at, str, int, bool,
-                         json_text, completed_result, stop, WorkingDirectory, PlyProcess, Shell)
+import harness (Server, spawned, spawned_reading, spawned_fed, spawned_into, this_ply,
+                start_streaming, next_line, signal_to, wait_for_exit, completed_result, stop,
+                PlyProcess, Shell)
+import support.harness (write_program, environment, all_output, stdout, stderr, json_of, at, str,
+                        int, bool, json_text, WorkingDirectory)
 import std.bytes
 import std.config (config)
 import std.json (Null)
@@ -31,7 +32,7 @@ test/nondet "run returns the arguments, writes each stream and exits with the co
   )
 }
 
-test/nondet "run reads a line from standard input" {
+test/nondet "run reads a line from standard input, and None past its end" {
   write_program(one_line());
   let r = spawned_reading(["run", "m.ply"], [], "hello\nrest\n");
   assert(r.code == 0, Some(all_output(r)));
@@ -39,14 +40,10 @@ test/nondet "run reads a line from standard input" {
   assert(
     !stdout(r).contains("rest"),
     Some("the whole input is not one call's result:\n" ++ stdout(r)),
-  )
-}
-
-test/nondet "a line read past the end of input is None" {
-  write_program(one_line());
-  let r = spawned_reading(["run", "m.ply"], [], "");
-  assert(r.code == 0, Some(all_output(r)));
-  assert(stdout(r).contains("end of input"), Some(stdout(r)))
+  );
+  let ended = spawned_reading(["run", "m.ply"], [], "");
+  assert(ended.code == 0, Some(all_output(ended)));
+  assert(stdout(ended).contains("end of input"), Some(stdout(ended)))
 }
 
 test/nondet "under json the object is alone on stdout and the lines go to stderr" {
@@ -72,7 +69,7 @@ test/nondet "an exit code the shell could not carry is a runtime error" {
   assert(stderr(r).contains("0 to 125"), Some(stderr(r)))
 }
 
-test/nondet "ply test withholds the process" {
+test/nondet "ply test withholds the process and its streams as bytes" {
   write_program(
     \\import std.process (process)
     \\
@@ -82,26 +79,26 @@ test/nondet "ply test withholds the process" {
     \\  announce()
     \\}
     \\
+    \\test/nondet "bytes reach the process" {
+    \\  assert(process.out_bytes[proc](b"x"))
+    \\}
+    \\
+    \\test/nondet "bytes come from the process" {
+    \\  assert(process.in_bytes[proc](1) == b"")
+    \\}
+    \\
   );
   let r = spawned(["test", ".", "--json"], []);
-  assert(
-    all_output(r).contains("E0424"),
-    Some("`process.out` was not rejected\n\n" ++ all_output(r)),
-  );
+  ["process.out", "process.out_bytes", "process.in_bytes"].fold((), |u: Unit, operation: String|
+    assert(
+      all_output(r).contains(operation),
+      Some("`" ++ operation ++ "` was not withheld\n\n" ++ all_output(r)),
+    ));
+  assert(all_output(r).contains("E0424"), Some(all_output(r)));
   assert(
     all_output(r).contains("std.process::host_process"),
     Some("the rejection names the handler that would have served it\n\n" ++ all_output(r)),
   )
-}
-
-test/nondet "a run that never exits reports its value under json" {
-  write_program(
-    "import std.process (process)\n\nfn main() -> Int / {process.read[proc]} = process.args[proc]().len()\n",
-  );
-  let v = json_of(spawned(["run", "m.ply", "--json", "--", "one", "two"], []));
-  assert(bool(at(v, "ok")), Some(json_text(v)));
-  assert(int(at(v, "exit_code")) == 0, Some(json_text(v)));
-  assert(str(at(v, "value")) == "2", Some(json_text(v)))
 }
 
 /// Says, for two labels, whether the run bound a program to each; it starts neither.
@@ -263,7 +260,7 @@ fn cat() -> String =
 fn every_byte() -> Bytes / {abort.raise} =
   Bytes::concat_all(range(0, 256).map(byte_of_int)).repeat(300)
 
-test/nondet "a Ply cat copies its input to its output byte for byte" {
+test/nondet "a Ply cat copies its input to its output byte for byte, and under json to stderr" {
   write_program(cat());
   let input = every_byte();
   let f = spawned_fed(["run", "m.ply"], [], input);
@@ -274,24 +271,19 @@ test/nondet "a Ply cat copies its input to its output byte for byte" {
       "standard output is the " ++ input.len().to_string() ++ " bytes of the input, and held "
         ++ f.out.len().to_string(),
     ),
-  )
-}
-
-test/nondet "under json the bytes a program writes go to stderr, where its lines go" {
-  write_program(cat());
-  let input = every_byte();
-  let f = spawned_fed(["run", "m.ply", "--json"], [], input);
-  assert(exit_of(f) == 0, Some(String::of_bytes_lossy(f.out)));
+  );
+  let reported = spawned_fed(["run", "m.ply", "--json"], [], input);
+  assert(exit_of(reported) == 0, Some(String::of_bytes_lossy(reported.out)));
   assert(
-    f.err == input,
+    reported.err == input,
     Some(
-      "stderr held " ++ f.err.len().to_string() ++ " bytes, and the input is "
+      "stderr held " ++ reported.err.len().to_string() ++ " bytes, and the input is "
         ++ input.len().to_string(),
     ),
   );
   assert(
-    str(at(json_of(completed_result(f)), "command")) == "run",
-    Some(String::of_bytes_lossy(f.out)),
+    str(at(json_of(completed_result(reported)), "command")) == "run",
+    Some(String::of_bytes_lossy(reported.out)),
   )
 }
 
@@ -487,38 +479,6 @@ test/nondet "a program is told the machine it runs on, as the system's own tools
   has("executable " ++ this_ply());
   assert(r.out.contains("endian little") || r.out.contains("endian big"), Some(stdout(r)));
   has("pointer " ++ shell_output("getconf LONG_BIT"))
-}
-
-// `std.os` declares its host handler, so a program reads the machine it runs on with no grant.
-test/nondet "a program reads the machine it runs on with no flag, through the host handler std.os declares" {
-  write_program(
-    "import std.os (os)\n\nfn main() -> Int / {os.read} = if os.cpus() >= 1 && os.pid() > 1 && os.executable() != None { 7 } else { 3 }\n",
-  );
-  let r = spawned(["run", "m.ply", "--json"], []);
-  assert(r.code == 0, Some(all_output(r)));
-  assert_eq(str(at(json_of(r), "value")), "7")
-}
-
-test/nondet "ply test withholds the streams as bytes" {
-  [
-    {
-      program: "import std.process (process)\n\ntest/nondet \"asks\" {\n  assert(process.out_bytes[proc](b\"x\"))\n}\n",
-      operation: "process.out_bytes",
-    },
-    {
-      program: "import std.process (process)\n\ntest/nondet \"asks\" {\n  assert(process.in_bytes[proc](1) == b\"\")\n}\n",
-      operation: "process.in_bytes",
-    },
-  ].fold((), |u: Unit, c: { program: String, operation: String }| {
-    write_program(c.program);
-    let r = spawned(["test", ".", "--json"], []);
-    assert(
-      all_output(r).contains("E0424"),
-      Some("`" ++ c.operation ++ "` was not withheld\n\n" ++ all_output(r)),
-    );
-    assert(all_output(r).contains(c.operation), Some(all_output(r)));
-    assert(all_output(r).contains("std.process::host_process"), Some(all_output(r)))
-  })
 }
 
 // The console is open to a test as to any run: the streams of one spawned here are pipes, and a

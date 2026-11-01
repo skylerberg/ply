@@ -1,121 +1,69 @@
-//! The commands as a person meets them: `check`, `run`, `hosts`, `hash` and `--help`, and what each
-//! prints, exits with and rejects.
+//! Each command as a process: that the binary reaches it, what `ply run` writes to each stream, and
+//! the code it exits with. `tests/in_process/commands.ply` holds what the commands decide and print.
 
-import spawning.harness (spawned, write_program, write_project, write, stdout, stderr, all_output,
-                         json_of, at, path, nth, items, str, int, bool, json_text, code_of,
-                         diagnostic, value_of)
-import std.fs (fs, Dir)
-import std.json
+import harness (spawned, spawned_reading)
+import support.harness (write, write_program, write_project, stdout, stderr, all_output, json_of,
+                        at, items, path, str, bool, json_text, code_of, manifest, value_of)
+import std.json (Json)
 import std.string
 
 fn green() -> String = String::of_bytes_lossy(embed("../programs/commands/green.ply"))
 
-// Run twice, so a warning survives whatever the second run takes from the cache.
-test/nondet "an unused definition warns without failing check or test" {
-  write_program(
-    "fn dead() -> Int = 1\npub fn live() -> Int = 2\ntest \"live is two\" { assert_eq(live(), 2) }\n",
-  );
-  [["check", "."], ["check", "."], ["test", "."]].fold((), |u: Unit, argv: List<String>| {
-    let r = spawned(argv);
-    let what = String::join(argv, " ");
-    assert(r.code == 0, Some(what ++ ":\n" ++ all_output(r)));
-    assert(
-      stdout(r).contains("warning: fn `m.dead` is never used"),
-      Some(what ++ ":\n" ++ stdout(r)),
-    );
-    assert(!stdout(r).contains("`m.live`"), Some(what ++ ":\n" ++ stdout(r)))
-  });
-  let v = json_of(spawned(["check", ".", "--json"]));
-  assert(bool(at(v, "ok")), Some(json_text(v)));
-  let d = diagnostic(v);
-  assert(str(at(d, "code")) == "W0611", Some(json_text(v)));
-  assert(str(at(d, "severity")) == "warning", Some(json_text(v)));
-  assert(str(at(nth(at(d, "labels"), 0), "snippet")) == "dead", Some(json_text(v)))
-}
+/// A line a command accepts and a line it rejects, over `green` in the working directory.
+type Wired = { accepted: List<String>, rejected: List<String> }
 
-// Run twice, so a warning survives whatever the second run takes from the cache.
-test/nondet "a hole warns with what it must be and may do, and a test that reaches it fails by it" {
-  write_program(
-    "pub fn pick(n: Int) -> Int = if n > 3 { 9 } else { ??? }\ntest \"a big n\" { assert_eq(pick(5), 9) }\ntest \"a small n\" { assert_eq(pick(1), 1) }\n",
-  );
-  [["check", "."], ["check", "."]].fold((), |u: Unit, argv: List<String>| {
-    let r = spawned(argv);
-    assert(r.code == 0, Some(all_output(r)));
-    assert(stdout(r).contains("Warning[W0613]: unfilled hole"), Some(stdout(r)));
-    assert(stdout(r).contains("expected `Int`"), Some(stdout(r)));
-    assert(stdout(r).contains("a run that reaches the hole raises `abort.raise`"), Some(stdout(r)))
-  });
-  let v = json_of(spawned(["check", ".", "--json"]));
-  assert(bool(at(v, "ok")), Some(json_text(v)));
-  let d = diagnostic(v);
-  assert(str(at(d, "code")) == "W0613", Some(json_text(v)));
-  assert(str(at(d, "severity")) == "warning", Some(json_text(v)));
-  assert(str(at(nth(at(d, "labels"), 0), "snippet")) == "???", Some(json_text(v)));
-  assert(
-    str(nth(at(d, "notes"), 1)).contains("in scope of that type: `n: Int`"),
-    Some(json_text(v)),
-  );
-  // A run that reaches the hole fails by it; one that does not passes.
-  let t = spawned(["test", "."]);
-  assert(t.code == 1, Some(all_output(t)));
-  assert(stdout(t).contains("1 failed, 1 passed"), Some(stdout(t)));
-  assert(stdout(t).contains("unfilled hole"), Some(stdout(t)))
-}
+fn wired() -> List<Wired> =
+  [
+    { accepted: ["--help"], rejected: ["frobnicate"] },
+    { accepted: ["check", "."], rejected: ["check", "nowhere"] },
+    { accepted: ["hash", "."], rejected: ["hash", "nowhere"] },
+    { accepted: ["definitions", "."], rejected: ["definitions", "nowhere"] },
+    { accepted: ["hosts", "."], rejected: ["hosts", "nowhere"] },
+    { accepted: ["callers", "double", "."], rejected: ["callers", "nothing", "."] },
+    { accepted: ["show", "double", "."], rejected: ["show", "nothing", "."] },
+    { accepted: ["doc", "double", "."], rejected: ["doc", "nothing", "."] },
+    { accepted: ["unused", "."], rejected: ["unused", "nowhere"] },
+    { accepted: ["fmt", "."], rejected: ["fmt", "nowhere"] },
+    { accepted: ["explain", "E0001"], rejected: ["explain", "E9999"] },
+    { accepted: ["std", "--digest"], rejected: ["std", "--show", "nothing"] },
+    { accepted: ["new", "fresh"], rejected: ["new", "Bad"] },
+    { accepted: ["resolve", "."], rejected: ["resolve", "nowhere"] },
+    { accepted: ["vendor", "."], rejected: ["vendor", "nowhere"] },
+    { accepted: ["cache", "stats", "."], rejected: ["cache", "inspect", "nothing", "."] },
+    {
+      accepted: ["replace", "double", ".", "--with", "double.txt"],
+      rejected: ["replace", "double", ".", "--with", "absent.txt"],
+    },
+    {
+      accepted: ["rename", "--map", "map.txt", "."],
+      rejected: ["rename", "--map", "absent.txt", "."],
+    },
+  ]
 
-test/nondet "two modules may label a test identically and the output says which is which" {
-  write_project([
-    { path: "alpha.ply", text: "test \"shared\" { assert_eq(1, 1) }\n" },
-    { path: "beta.ply", text: "test \"shared\" { assert_eq(2, 3) }\n" },
-  ]);
-  let r = spawned(["test", "."]);
-  assert(r.code == 1, Some(all_output(r)));
-  assert(stdout(r).contains("alpha.shared"), Some(stdout(r)));
-  assert(stdout(r).contains("beta.shared"), Some(stdout(r)))
-}
-
-test/nondet "filter accepts a module prefix" {
-  write_project([
-    { path: "alpha.ply", text: "test \"shared\" { assert_eq(1, 1) }\n" },
-    { path: "beta.ply", text: "test \"shared\" { assert_eq(2, 2) }\n" },
-  ]);
-  let v = json_of(spawned(["test", ".", "--json", "--filter", "beta."]));
-  assert(int(path(v, ["selection", "total"])) == 1, Some(json_text(v)));
-  assert(
-    str(at(nth(path(v, ["selection", "tests"]), 0), "key")) == "beta.shared",
-    Some(json_text(v)),
-  )
-}
-
-test/nondet "the cache directory is never parsed as source" {
+test/nondet "every command exits zero on what it accepts, and two on what it rejects" {
   write_program(green());
-  assert(spawned(["test", "."]).code == 0, None);
-  assert(fs.kind[cwd](".ply-cache") == Dir, None);
-  write(".ply-cache/decoy.ply", "!!! not ply !!!\n");
-  let r = spawned(["test", "."]);
-  assert(r.code == 0, Some(all_output(r)))
+  write("map.txt", "double twice\n");
+  write("double.txt", "fn double(x: Int) -> Int = x * 2\n");
+  wired().fold((), |u: Unit, w: Wired| {
+    let accepted = spawned(w.accepted);
+    assert(
+      accepted.code == 0,
+      Some(String::join(w.accepted, " ") ++ ":\n" ++ all_output(accepted)),
+    );
+    let rejected = spawned(w.rejected);
+    assert(rejected.code == 2, Some(String::join(w.rejected, " ") ++ ":\n" ++ all_output(rejected)))
+  })
 }
 
-test/nondet "run evaluates main and writes nothing of its own, not even the value" {
+test/nondet "run evaluates main and writes nothing of its own, and --json reports the value" {
   write_program(green());
   let r = spawned(["run", "."]);
   assert(r.code == 0, Some(all_output(r)));
-  assert(r.out == [] && !all_output(r).contains("42"), Some(all_output(r)))
-}
-
-test/nondet "run --json reports the value" {
-  write_program(green());
+  assert(r.out == [] && !all_output(r).contains("42"), Some(all_output(r)));
   let v = json_of(spawned(["run", ".", "--json"]));
   assert(str(at(v, "command")) == "run", Some(json_text(v)));
   assert(bool(at(v, "ok")), Some(json_text(v)));
   assert(str(at(v, "value")) == "42", Some(json_text(v)))
-}
-
-test/nondet "run without a main explains what to add" {
-  write_program("fn f() -> Int = 1\n");
-  let r = spawned(["run", "."]);
-  assert(r.code == 2, Some(all_output(r)));
-  assert(stderr(r).contains("no `main` to run"), Some(stderr(r)));
-  assert(stderr(r).contains("fn main"), Some(stderr(r)))
 }
 
 test/nondet "a raising main exits one" {
@@ -140,88 +88,6 @@ test/nondet "the entry is bounded by the clock the flag names" {
   assert(code_of(v) == "W0612", Some(json_text(v)))
 }
 
-test/nondet "run finds the one main wherever it lives" {
-  write_project([
-    { path: "lib.ply", text: "pub fn answer() -> Int = 42\n" },
-    { path: "app.ply", text: "import lib\nfn main() -> Int = lib::answer()\n" },
-  ]);
-  let v = json_of(spawned(["run", ".", "--json"]));
-  assert(bool(at(v, "ok")), Some(json_text(v)));
-  assert(str(at(v, "value")) == "42", Some(json_text(v)));
-  assert(str(at(v, "entry")) == "app.main", Some(json_text(v)));
-  assert(str(at(v, "module")) == "app", Some(json_text(v)))
-}
-
-test/nondet "two mains are reported rather than resolved by load order" {
-  write_project([
-    { path: "one.ply", text: "fn main() -> Int = 1\n" },
-    { path: "two.ply", text: "fn main() -> Int = 2\n" },
-  ]);
-  let r = spawned(["run", ".", "--json"]);
-  assert(r.code == 2, Some(all_output(r)));
-  let v = json_of(r);
-  assert(code_of(v) == "E0112", Some(json_text(v)));
-  let notes = json_text(at(diagnostic(v), "notes"));
-  assert(notes.contains("one.ply") && notes.contains("two.ply"), Some(notes));
-  // Naming the file picks the module, which is the fix the notes suggest.
-  let picked = json_of(spawned(["run", "two.ply", "--json"]));
-  assert(str(at(picked, "value")) == "2", Some(json_text(picked)));
-  assert(str(at(picked, "entry")) == "two.main", Some(json_text(picked)))
-}
-
-test/nondet "a task performs against the handlers around its spawn" {
-  write_program(String::of_bytes_lossy(embed("../programs/commands/spawn_handlers.ply")));
-  assert_eq(value_of(spawned(["run", ".", "--json"])), "41")
-}
-
-// A sleep parks the task that performs it: the thirty seconds the body sleeps for are cut at its
-// deadline, and the ten ticks beside it end before that.
-test/nondet "a deadline fires on time while the task beside it keeps sleeping and waking" {
-  write_program(
-    \\import std.task
-    \\import std.task (Done, TimedOut)
-    \\import std.time
-    \\
-    \\fn ticked(n: Int) -> Instant / {clock.read, clock.write} = {
-    \\  range(0, n).fold((), |_done: Unit, _i: Int| clock.sleep(time::millis(10)));
-    \\  clock.now()
-    \\}
-    \\
-    \\fn main() -> Int / {task.write, clock.read, clock.write, abort.raise} =
-    \\  task::unbounded(|| {
-    \\    let started = clock.now();
-    \\    let beside = task.spawn(|| ticked(10));
-    \\    let ended = task::timeout(time::millis(300), || {
-    \\      clock.sleep(time::seconds(30));
-    \\      0
-    \\    });
-    \\    let fired = time::as_millis(time::between(started, clock.now()));
-    \\    let ticks = time::as_millis(time::between(started, task.join(beside)));
-    \\    match ended {
-    \\      Done(_) -> abort.raise("the body outran its deadline"),
-    \\      TimedOut -> (),
-    \\    };
-    \\    assert(ticks >= 100 && ticks < fired, Some("ten ticks ended at " ++ ticks.to_string() ++ "ms"));
-    \\    fired
-    \\  })
-    \\
-  );
-  let fired = match value_of(spawned(["run", ".", "--json"])).int_of_string() {
-    Some(ms) -> ms,
-    None -> 0 - 1,
-  };
-  assert(fired >= 300 && fired < 10000, Some("a 300ms deadline fired at " ++ fired.to_string()))
-}
-
-test/nondet "the clock outside `simulate` is the host's" {
-  write_program(String::of_bytes_lossy(embed("../programs/commands/host_clock.ply")));
-  let waited = match value_of(spawned(["run", ".", "--json"])).int_of_string() {
-    Some(ms) -> ms,
-    None -> 0 - 1,
-  };
-  assert(waited >= 20 && waited < 10000, Some("a 20ms sleep took " ++ waited.to_string()))
-}
-
 // Spawned, since what this guards against is the process going down with the task.
 test/nondet "a task that fails is reported rather than aborting the process" {
   write_program(String::of_bytes_lossy(embed("../programs/commands/failing_task.ply")));
@@ -231,9 +97,10 @@ test/nondet "a task that fails is reported rather than aborting the process" {
   assert(!stderr(r).contains("panicked"), Some(stderr(r)))
 }
 
-// A clause that resumes off its tail would capture the spawner's continuation, not the task's.
-// Spawned, since what this guards against is a panic.
-test/nondet "a task reaching a clause that resumes off its tail is rejected with a diagnostic" {
+// A clause that resumes off its tail would capture the spawner's continuation, and one that stops the
+// body would abandon the spawner's, which the task has no part of. Spawned, since what this guards
+// against is a panic.
+test/nondet "a task reaching a clause that would take its spawner's body is rejected with a diagnostic" {
   write_program(
     \\effect ask {
     \\  read q() -> Int
@@ -241,7 +108,7 @@ test/nondet "a task reaching a clause that resumes off its tail is rejected with
     \\
     \\fn work() -> Int / {ask.read} = ask.q()
     \\
-    \\test "a task cannot reach a clause that resumes off its tail" {
+    \\test "a clause that resumes off its tail" {
     \\  let r = simulate {
     \\    handle {
     \\      let t = task.spawn(|| work());
@@ -253,26 +120,10 @@ test/nondet "a task reaching a clause that resumes off its tail is rejected with
     \\  assert_eq(r, 3)
     \\}
     \\
-  );
-  let r = spawned(["test", ".", "--no-cache"], []);
-  assert(r.code != 0, Some(all_output(r)));
-  assert(all_output(r).contains("resumes off the tail"), Some(all_output(r)));
-  assert(!all_output(r).contains("panicked"), Some(all_output(r)))
-}
-
-// A clause that stops the body would abandon the spawner's, which the task has no part of.
-test/nondet "a task reaching a clause that does not resume is rejected with a diagnostic" {
-  write_program(
-    \\effect ask {
-    \\  read q() -> Int
-    \\}
-    \\
-    \\fn work() -> Int / {ask.read} = ask.q() + 1
-    \\
-    \\test "a task cannot reach a clause that does not resume" {
+    \\test "a clause that does not resume" {
     \\  let r = simulate {
     \\    handle {
-    \\      let t = task.spawn(|| work());
+    \\      let t = task.spawn(|| work() + 1);
     \\      task.join(t)
     \\    } with {
     \\      ask.q() resume k -> 7,
@@ -284,28 +135,34 @@ test/nondet "a task reaching a clause that does not resume is rejected with a di
   );
   let r = spawned(["test", ".", "--no-cache", "--json"], []);
   assert(r.code != 0, Some(all_output(r)));
+  assert(!all_output(r).contains("panicked"), Some(all_output(r)));
   let failed = items(at(json_of(r), "failures"));
-  assert_eq(failed.len(), 1);
-  let d = at(failed.get(0), "diagnostic");
-  assert(str(at(d, "code")) == "E0502", Some(json_text(d)));
-  assert(str(at(d, "message")).contains("its handler did not resume it"), Some(json_text(d)))
+  assert_eq(failed.map(|f: Json| str(path(f, ["diagnostic", "code"]))), ["E0502", "E0502"]);
+  let messages = json_text(at(json_of(r), "failures"));
+  assert(messages.contains("resumes off the tail"), Some(messages));
+  assert(messages.contains("its handler did not resume it"), Some(messages))
 }
 
-// A run generates its own certificate: nothing checked in is trusted by anything.
-test/nondet "a program generates a certificate for itself" {
-  write_program(String::of_bytes_lossy(embed("../programs/commands/self_signed_certificate.ply")));
-  let der = match value_of(spawned(["run", ".", "--json"])).int_of_string() {
-    Some(n) -> n,
-    None -> 0,
-  };
-  assert(der > 0, Some("the certificate has no DER"))
-}
-
-// `ply run` chooses which interleaving rather than how many: exploration is a test-time activity.
-test/nondet "run accepts a seed and takes only that interleaving" {
-  write_program(green());
-  let r = spawned(["run", ".", "--json", "--seed", "3:1"]);
+// The program still runs after the splice, so the root's own definition and the dependency's both
+// work.
+test/nondet "a definition replaced in a packaged project runs" {
+  write_project([
+    {
+      path: "app/ply.pkg",
+      text: manifest(
+        "app",
+        "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}",
+      ),
+    },
+    {
+      path: "app/main.ply",
+      text: "import lib.answer\n\nfn base() -> Int = 1\n\npub fn twice() -> Int = base() + base()\n\nfn main() -> Int = twice() + answer::answer()\n",
+    },
+    { path: "lib/ply.pkg", text: manifest("lib", "") },
+    { path: "lib/answer.ply", text: "import extra\npub fn answer() -> Int = extra::hidden()\n" },
+    { path: "lib/extra.ply", text: "pub fn hidden() -> Int = 7\n" },
+  ]);
+  let r = spawned_reading(["replace", "twice", "app"], [], "pub fn twice() -> Int = base() * 2\n");
   assert(r.code == 0, Some(all_output(r)));
-  assert(str(at(json_of(r), "value")) == "42", Some(all_output(r)));
-  assert(spawned(["run", ".", "--seed", "3:"]).code == 2, None)
+  assert_eq(value_of(spawned(["run", "--json", "app"])), "9")
 }

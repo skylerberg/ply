@@ -12,7 +12,8 @@
 #
 #   ci-ply.sh run ID [ARG...]
 #       the runs the job ID takes (`ci-shards.sh job-runs ID`), in turn, or one run, or one module
-#       of the CLI's suite (`cli-<module>`), with ARGs added to each `ply test` or `ply prove`. Every
+#       of the CLI's suite (`cli-<module>`) or the in-process suite (`in-process-<module>`), with ARGs
+#       added to each `ply test` or `ply prove`, where a `--filter` adds to what a run selects. Every
 #       `ply` is stopped at PLY_CI_DEADLINE, the epoch second the job set its runs to end by, and
 #       none starts after it: the job then fails naming the run it stopped and the ones it never
 #       started, and the steps after it still keep what the runs wrote, so a re-run starts from
@@ -78,9 +79,10 @@ pg=$(postgres_bin)
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root")
-# The in-process suite takes those and every family a command enters a program with, since its tests
-# run the commands in this process.
-in_process_grants=("${cli_grants[@]}" --allow machine --allow shipped --allow toolchain)
+# The in-process suite starts no `ply`. It takes every family a command enters a program with, since
+# its tests run the commands in this process, and `git`, which a dependency is fetched with.
+in_process_grants=(--timeout 900000 --json --exec "git=$(command -v git)"
+  --fs cwd=. --fs abs=/ --fs "repo=$root" --allow machine --allow shipped --allow toolchain)
 
 # The epoch second every `ply` this job starts must end by; empty for no end.
 deadline=${PLY_CI_DEADLINE:-}

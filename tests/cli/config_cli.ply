@@ -2,9 +2,8 @@
 //! rejected by name when it is malformed, and a secret that reaches no stream; a test reads the
 //! environment as a run does.
 
-import spawning.harness (RunResult, write_program, write, spawned, all_output, stdout, stderr,
-                         json_of, at, path, items, str, int, bool, json_text, value_of, PlyProcess)
-import std.json (Json)
+import harness (spawned, PlyProcess)
+import support.harness (RunResult, write_program, all_output, stderr, json_of, path, int, value_of)
 import std.process (Var, var)
 import std.string
 import std.list
@@ -12,121 +11,6 @@ import std.list
 fn service() -> String = String::of_bytes_lossy(embed("../programs/config_cli/service.ply"))
 
 fn secret_main() -> String = String::of_bytes_lossy(embed("../programs/config_cli/secret_main.ply"))
-
-/// Its whole output is the resolved configuration, so precedence is read from it. A schema is entered
-/// on a unit of the program compiled for it, which only a `ply` of its own may do.
-fn hosts(extra: List<String>, vars: List<Var>) -> RunResult / {PlyProcess, abort.raise} =
-  spawned(["hosts", ".", "--json"].concat(extra), vars)
-
-fn key_of(report: Json, name: String) -> Json / {abort.raise} =
-  match items(path(report, ["configuration", "keys"])).filter(|k: Json|
-      str(at(k, "name")) == name) {
-    [k, ..] -> k,
-    [] -> panic("`" ++ name ++ "` is not in " ++ json_text(report)),
-  }
-
-fn service_region_key(ran: RunResult) -> Json / {abort.raise} =
-  key_of(json_of(ran), "SERVICE_REGION")
-
-test/nondet "precedence is set, then file, then environment, then default" {
-  write_program(service());
-  write("deploy.env", "SERVICE_REGION=file\n");
-  let schema = ["--config-schema", "m.spec", "--set", "SERVICE_PORT=8137"];
-  let everything = [var("SERVICE_REGION", "environment"), var("SERVICE_API_KEY", "k")];
-
-  let all = service_region_key(
-    hosts(schema.concat(["--set", "SERVICE_REGION=set", "--config", "deploy.env"]), everything),
-  );
-  assert_eq(str(at(all, "value")), "set");
-  assert_eq(str(at(all, "source")), "--set");
-
-  let no_set = service_region_key(hosts(schema.concat(["--config", "deploy.env"]), everything));
-  assert_eq(str(at(no_set, "value")), "file");
-  assert_eq(str(at(no_set, "source")), "deploy.env");
-
-  let no_files = service_region_key(hosts(schema, everything));
-  assert_eq(str(at(no_files, "value")), "environment");
-  assert_eq(str(at(no_files, "source")), "env");
-
-  let nothing = service_region_key(hosts(schema, [var("SERVICE_API_KEY", "k")]));
-  assert_eq(str(at(nothing, "value")), "us");
-  assert_eq(str(at(nothing, "source")), "default")
-}
-
-test/nondet "a required key nothing supplies is E0441 at startup" {
-  write_program(service());
-  let r = spawned(["run", ".", "--explain", "--config-schema", "m.spec"], []);
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(text.contains("E0441"), Some(text));
-  assert(text.contains("SERVICE_PORT"), Some(text));
-  assert(text.contains("SERVICE_API_KEY"), Some(text));
-  assert(text.contains("environment variable"), Some(text));
-  assert(
-    !text.contains("binding host"),
-    Some("the rejection comes before anything is bound: " ++ text),
-  )
-}
-
-test/nondet "a value that is not of its shape is E0442 naming the source" {
-  write_program(service());
-  let r = spawned(["run", ".", "--config-schema", "m.spec", "--set", "SERVICE_PORT=eight"], [
-    var("SERVICE_API_KEY", "k"),
-  ]);
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(text.contains("E0442"), Some(text));
-  assert(text.contains("SERVICE_PORT"), Some(text));
-  assert(text.contains("--set"), Some(text));
-  assert(text.contains("eight"), Some("a plain value is shown: " ++ text))
-}
-
-// The one rejection that must not quote what it rejected.
-test/nondet "a malformed secret is E0442 and prints no value" {
-  write_program(service());
-  let r = spawned(
-    [
-      "run",
-      ".",
-      "--config-schema",
-      "m.spec",
-      "--set",
-      "SERVICE_PORT=8137",
-      "--set",
-      "SERVICE_API_KEY=",
-    ],
-    [],
-  );
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(text.contains("E0442"), Some(text));
-  assert(text.contains("SERVICE_API_KEY"), Some(text));
-  assert(text.contains("not printed"), Some(text))
-}
-
-test/nondet "an undeclared set warns and an undeclared environment key does not" {
-  write_program(service());
-  let r = spawned(
-    [
-      "hosts",
-      ".",
-      "--config-schema",
-      "m.spec",
-      "--set",
-      "SERVICE_PORT=8137",
-      "--set",
-      "SERVICE_PROT=8138",
-    ],
-    [var("SERVICE_API_KEY", "k"), var("AWS_PROFILE", "nothing to do with this program")],
-  );
-  assert(r.code == 0, Some(stderr(r)));
-  assert(all_output(r).contains("W0607"), Some(all_output(r)));
-  assert(all_output(r).contains("SERVICE_PROT"), Some(all_output(r)));
-  assert(
-    !all_output(r).contains("AWS_PROFILE"),
-    Some("an environment name is not a typo somebody made in this run: " ++ all_output(r)),
-  )
-}
 
 test/nondet "get cannot read a key the schema declares secret" {
   write_program(
@@ -175,30 +59,6 @@ test/nondet "a secret arrives as a secret and appears in no stream" {
     ))
 }
 
-test/nondet "the JSON report carries a secret's key and source and not its value" {
-  write_program(secret_main());
-  let r = hosts(["--config-schema", "m.spec"], [var("SERVICE_API_KEY", "correct-horse")]);
-  let key = key_of(json_of(r), "SERVICE_API_KEY");
-  assert_eq(str(at(key, "value")), "****");
-  assert_eq(str(at(key, "source")), "env");
-  assert(bool(at(key, "secret")), Some(json_text(key)));
-  assert(!stdout(r).contains("correct-horse"), Some(stdout(r)))
-}
-
-test/nondet "a test supplying configuration is det and cached" {
-  write_program(service());
-  let report = json_of(spawned(["test", ".", "--json"]));
-  assert(bool(at(report, "ok")), Some(json_text(report)));
-  let second = json_of(spawned(["test", ".", "--json"]));
-  assert(bool(at(second, "ok")), Some(json_text(second)));
-  assert(
-    int(path(second, ["summary", "cached"])) == 1,
-    Some("the second run is a cache hit: " ++ json_text(second)),
-  );
-  assert(int(path(second, ["selection", "selected"])) == 0, Some(json_text(second)));
-  assert(int(path(second, ["selection", "same_code"])) == 0, Some(json_text(second)))
-}
-
 /// Of a `ply test --json` with `vars`, how many tests had cached results.
 fn cached_with(vars: List<Var>) -> Int / {PlyProcess, abort.raise} = {
   let ran = spawned(["test", ".", "--json"], vars);
@@ -216,24 +76,6 @@ test/nondet "a test that reads configuration is cached while each key it read re
   assert_eq(cached_with(us), 1);
   // A key the test never read moves nothing.
   assert_eq(cached_with(us.push(var("SERVICE_UNREAD", "any"))), 2)
-}
-
-test/nondet "an unhandled config read in a det test is E0412" {
-  write_program(
-    \\import std.config
-    \\import std.config (config)
-    \\
-    \\pub fn region() -> Option<String> / {config.read[server]} =
-    \\  config.get[server]("SERVICE_REGION")
-    \\
-    \\test "reaches the environment" {
-    \\  assert_eq(region(), None)
-    \\}
-    \\
-  );
-  let r = spawned(["test", "."]);
-  assert(r.code != 0, Some(stderr(r)));
-  assert(stderr(r).contains("E0412"), Some(stderr(r)))
 }
 
 test/nondet "a run and a test read configuration from the environment, `--set` over it" {

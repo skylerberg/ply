@@ -738,6 +738,22 @@ fn prelude_pack() -> Option<packs::PackFiles> / {abort.raise} = pack_of(shipped_
 pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
   packs::frame_in(prelude_pack(), path, offset, len)
 
+pub fn queried_packages(
+  store: MemoryStore,
+  root: OwnPackage,
+  dependencies: List<OwnPackage>,
+) -> { store: MemoryStore, run: Run, results: List<CheckedModule> } / {abort.raise} = {
+  let w = load_inputs_of(root, dependencies);
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    || query_alone(fresh_registry(), w),
+  );
+  { store: done.store, run: done.value.run, results: done.value.results }
+}
+
 fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
   load_inputs_of(
     { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
@@ -929,8 +945,16 @@ test "a module's hashes read back as they were recorded" {
 fn embedding_queried(
   src: Bytes,
   files: Map<Bytes, Bytes>,
+) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} =
+  embedding_queried_over(empty_memory_store(), src, files, [])
+
+fn embedding_queried_over(
+  store: MemoryStore,
+  src: Bytes,
+  files: Map<Bytes, Bytes>,
+  others: List<Source>,
 ) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
-  let w = inputs_alone([{ name: b"m", src: src }]);
+  let w = inputs_alone([{ name: b"m", src: src }].concat(others));
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
     match files.get(want.path) {
@@ -938,7 +962,7 @@ fn embedding_queried(
       None -> Err(b"no file is there"),
     };
   let done = over_decoding(
-    empty_memory_store(),
+    store,
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
@@ -987,6 +1011,28 @@ test "an embedded file's bytes move the definition that embeds it, and no other"
   assert(fixed_hash(moved, b"m.b") != fixed_hash(first, b"m.b"));
   let same = over(b"one", b"one");
   assert_eq(fixed_hash(same, b"m.a"), fixed_hash(same, b"m.b"))
+}
+
+test "a check sees that a file a module embeds is gone, though no module moved" {
+  let src = b"pub fn words() -> Bytes = embed(\"words.txt\")\n";
+  let others = [{ name: b"count", src: b"import m\npub fn count() -> Int = m::words().len()\n" }];
+  let kept = embedding_queried_over(
+    empty_memory_store(),
+    src,
+    Map::new().insert(b"words.txt", b"one two\n"),
+    others,
+  );
+  assert_eq(rejected_first(kept.results), []);
+  let gone = embedding_queried_over(kept.store, src, Map::new(), others);
+  assert_eq(
+    gone.results,
+    embedding_queried_over(empty_memory_store(), src, Map::new(), others).results,
+  );
+  assert_eq(
+    rejected_first(gone.results).fold([], |acc: List<Bytes>, a: CheckedModule|
+      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
+    [b"E0146"],
+  )
 }
 
 type CheckedSources = {
@@ -1263,6 +1309,23 @@ test "an import that names no module fails its module, though nothing reads it" 
       acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0106"],
   )
+}
+
+test "an import of a module that does not ship lists the ones that do, and points at the import" {
+  let f = check_sources(
+    empty_memory_store(),
+    [{ name: b"app", src: b"import std.nonesuch\nfn f() -> Int = 1\n" }],
+    [{ name: b"std.net", src: b"pub fn drain() -> Int = 1\n" }],
+  );
+  match f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule|
+      acc.concat(a.result.rejected)) {
+    [d] -> {
+      assert_eq(d.code, b"E0106");
+      assert(d.labels != []);
+      assert(d.notes_text.any(|note: Bytes| note.index_of(b"std.net") != None))
+    },
+    _ -> panic("one import is rejected"),
+  }
 }
 
 test "two imports that bind one module name fail their module, though nothing reads either" {

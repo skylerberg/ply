@@ -72,9 +72,9 @@ TAB=$'\t'
 # (`workspace`).
 # The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: its
 # `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
-# another. A change to the compiler runs every test again, and each part must finish all of its
-# tests within its job's deadline.
-CLI_PARTS=2
+# another. A change to the compiler runs every test again, and a part must finish all of its tests
+# within its job's deadline.
+CLI_PARTS=1
 # The suite that calls the compiler and the CLI in its own process, which `ply.work` lists among its
 # suites. `ci-ply.sh` gives it the CLI suite's grants.
 IN_PROCESS_SUITE=tests/in_process
@@ -85,7 +85,7 @@ RUNS_ALONE=(package-compiler package-in_process)
 # `ply.work` gives their suite: minutes each, the repository audit checking packages cold and the copies
 # audit listing every one, or against a postgres they start, or random edit sessions drawn anew each
 # day, or every edit over every fixture of the edit gate. `in-process` names `IN_PROCESS_SUITE`.
-NIGHTLY=(in-process:repository_audit in-process:copies in-process:edit_sessions cli-tests:edit_matrix std-tests:db_driver std-tests:pg_client)
+NIGHTLY=(cli-tests:repository_audit cli-tests:copies in-process:edit_sessions cli-tests:edit_matrix std-tests:db_driver std-tests:pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
@@ -351,6 +351,10 @@ cmd_run_line() {
     cli-*)
       [[ -f "$root/$CLI_SUITE/${id#cli-}.ply" ]] || { echo "the CLI's suite has no module '${id#cli-}'" >&2; return 1; }
       printf '%s\t%s.\t\n' "$CLI_SUITE" "${id#cli-}"
+      ;;
+    in-process-*)
+      [[ -f "$root/$IN_PROCESS_SUITE/${id#in-process-}.ply" ]] || { echo "the in-process suite has no module '${id#in-process-}'" >&2; return 1; }
+      printf '%s\t%s.\t\n' "$IN_PROCESS_SUITE" "${id#in-process-}"
       ;;
     *)
       echo "no run named '$id'" >&2

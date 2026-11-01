@@ -111,16 +111,19 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   alongside CI.
 - Rust tests live in sibling `<crate>-tests` crates, so a `pub` change can break crates you didn't
   touch.
-- The CLI's tests are the Ply package `tests/cli`. Each starts `ply` as a process, and the suite does
-  not import the CLI, so it loads in seconds. A test belongs there only if it needs a real process:
-  exit codes, streams, signals, a terminal, sockets, or a command that compiles and runs a program.
+- The CLI's tests are the Ply package `tests/cli`, the only suite that starts `ply`. It does not import
+  the CLI, so it loads in seconds. A test belongs there only if it needs a real process: exit codes,
+  streams, signals, a terminal, sockets, or a program that must really compile and run.
   `.github/ci-ply.sh run cli-<module>` runs one module with the permissions CI gives it.
 - `tests/in_process` calls the compiler and the CLI in the test's own process, for what cannot live
   beside the code: a test that calls `main` would import the package it tests, and a fixture embedded
   from `packages/compiler` or `packages/cli` becomes a bootstrap input. Its compiler is built at `-O0`,
   so `main` in process costs no less than a spawned `ply`, and compiling a program in process costs
   far more. Test a function beside its code, or a program in `tests/lang`, before reaching for it.
-  `.github/ci-ply.sh run package-in_process --filter <module>.` runs one module.
+  `in_memory_faked` runs a command that compiles with its compile faked, so what the command decides,
+  stores and reports is real and the test states how each entry ended. It cannot show what a program
+  does. `.github/ci-ply.sh run in-process-<module>` runs one module. `tests/support` is what the two
+  suites share.
 - CI is `.github/workflows/ci.yml`. `.github/ci-shards.sh` lists CI's Ply test runs (each is `ply
   test` of one package) and which job runs each.
 - A pull request bootstraps only when it changes the runtime's Rust, `ply.work`, the bootstrap, the

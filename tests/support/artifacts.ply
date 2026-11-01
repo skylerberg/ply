@@ -1,0 +1,171 @@
+//! A `.plyx` read apart and sealed again, as the container lays it out, so a test can tamper with one
+//! and a reader checks it as it would a build.
+
+import harness (Source)
+import compiler.store.plyx (Header, Section, SectionLocation, decode, encode, digest_of, domain,
+                            offset_digest)
+import std.bytes (u32_le)
+import std.gzip (try_gunzip)
+import std.string
+
+/// The header a writer supplies and each section's payload, in the order the file holds them.
+pub type Parts = { head: Header, sections: List<Section> }
+
+pub fn parts_of(b: Bytes) -> Parts / {abort.raise} =
+  match decode(b) {
+    Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
+    Ok(o) ->
+      {
+        head: { frontend: o.frontend, runtime: o.runtime, entry: o.entry },
+        sections: o.sections.map(|p: SectionLocation|
+          { name: p.name, count: p.count, payload: b.slice(p.at, p.at + p.len) }),
+      },
+  }
+
+/// Where the container placed each section of `b`.
+pub fn section_locations(b: Bytes) -> List<SectionLocation> / {abort.raise} =
+  match decode(b) {
+    Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
+    Ok(o) -> o.sections,
+  }
+
+/// Laid out and sealed as `ply build` writes one, so a reader checks it as it would a build.
+pub fn sealed(parts: Parts) -> Bytes / {abort.raise} = {
+  let encoded = encode(parts.head, parts.sections);
+  match digest_of(domain(), encoded) {
+    None -> panic("a container this short carries no digest"),
+    Some(d) ->
+      Bytes::concat_all([
+        encoded.slice(0, offset_digest()),
+        d,
+        encoded.slice(offset_digest() + 32, encoded.len()),
+      ]),
+  }
+}
+
+pub fn section(parts: Parts, name: Bytes) -> Section / {abort.raise} =
+  match parts.sections.filter(|s: Section| s.name == name) {
+    [s, ..] -> s,
+    [] -> panic("the artifact carries no `" ++ String::of_bytes(name) ++ "` section"),
+  }
+
+pub fn with_section(parts: Parts, s: Section) -> Parts =
+  { ..parts, sections: parts.sections.map(|x: Section| if x.name == s.name { s } else { x }) }
+
+fn word(b: Bytes, i: Int) -> Int / {abort.raise} =
+  match b.u32_at(i) { Some(w) -> w, None -> panic("a record runs past its section") }
+
+pub type Body = { hash: Bytes, body: Bytes }
+
+/// Each record is the hash, the body's length, and the body.
+pub fn bodies_of(parts: Parts) -> List<Body> / {abort.raise} = {
+  let s = section(parts, b"bodies");
+  let decoded = range(0, s.count).fold(
+    { at: 0, out: [] },
+    |acc: { at: Int, out: List<Body> }, _i: Int| {
+      let n = word(s.payload, acc.at + 32);
+      {
+        at: acc.at + 36 + n,
+        out: acc.out.push({
+          hash: s.payload.slice(acc.at, acc.at + 32),
+          body: s.payload.slice(acc.at + 36, acc.at + 36 + n),
+        }),
+      }
+    },
+  );
+  decoded.out
+}
+
+pub fn with_bodies(parts: Parts, bodies: List<Body>) -> Parts / {abort.raise} =
+  with_section(parts, {
+    name: b"bodies",
+    count: bodies.len(),
+    payload: Bytes::concat_all(
+      bodies.map(|b: Body| Bytes::concat_all([b.hash, u32_le(b.body.len()), b.body])),
+    ),
+  })
+
+pub type NameRecord = { name: String, hash: Bytes }
+
+/// Each record is where its name lies in the string section, the name's length, and the hash.
+pub fn names_of(parts: Parts) -> List<NameRecord> / {abort.raise} = {
+  let s = section(parts, b"names");
+  let strings = section(parts, b"strings").payload;
+  range(0, s.count).map(|i: Int| {
+    let off = word(s.payload, i * 40);
+    {
+      name: String::of_bytes(strings.slice(off, off + word(s.payload, i * 40 + 4))),
+      hash: s.payload.slice(i * 40 + 8, i * 40 + 40),
+    }
+  })
+}
+
+/// Each name's text is written once, in record order, as the writer lays the string section out.
+pub fn with_names(parts: Parts, names: List<NameRecord>) -> Parts / {abort.raise} = {
+  let encoded = names.fold(
+    { strings: b"", placed: Map::new(), records: [] },
+    |acc: { strings: Bytes, placed: Map<String, Int>, records: List<Bytes> }, named: NameRecord| {
+      let known = acc.placed.get(named.name);
+      let offset = match known { Some(o) -> o, None -> acc.strings.len() };
+      let text = Bytes::of_string(named.name);
+      {
+        strings: match known { Some(_) -> acc.strings, None -> acc.strings.concat(text) },
+        placed: acc.placed.insert(named.name, offset),
+        records: acc.records.push(
+          Bytes::concat_all([u32_le(offset), u32_le(text.len()), named.hash]),
+        ),
+      }
+    },
+  );
+  with_section(
+    with_section(parts, {
+      name: b"names",
+      count: names.len(),
+      payload: Bytes::concat_all(encoded.records),
+    }),
+    { name: b"strings", count: encoded.strings.len(), payload: encoded.strings },
+  )
+}
+
+/// Each record is a module's path and its text, each after its length.
+pub fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
+  let s = section(parts, b"closure");
+  let decoded = range(0, s.count).fold(
+    { at: 0, out: [] },
+    |acc: { at: Int, out: List<Source> }, _i: Int| {
+      let path_len = word(s.payload, acc.at);
+      let text_at = acc.at + 8 + path_len;
+      let text_len = word(s.payload, acc.at + 4 + path_len);
+      {
+        at: text_at + text_len,
+        out: acc.out.push({
+          path: String::of_bytes(s.payload.slice(acc.at + 4, acc.at + 4 + path_len)),
+          text: String::of_bytes(s.payload.slice(text_at, text_at + text_len)),
+        }),
+      }
+    },
+  );
+  decoded.out
+}
+
+pub fn with_files(parts: Parts, files: List<Source>) -> Parts / {abort.raise} =
+  with_section(parts, {
+    name: b"closure",
+    count: files.len(),
+    payload: Bytes::concat_all(
+      files.map(|f: Source| {
+        let file = Bytes::of_string(f.path);
+        let text = Bytes::of_string(f.text);
+        Bytes::concat_all([u32_le(file.len()), file, u32_le(text.len()), text])
+      }),
+    ),
+  })
+
+/// What the runnable and the unit hold: the runnable's roots and effects as its encoding spells
+/// their names, and the unit's C, unpacked.
+pub fn runnable_text(parts: Parts) -> String / {abort.raise} =
+  String::of_bytes_lossy(section(parts, b"runnable").payload)
+    ++ (match try_gunzip(section(parts, b"unit").payload, 67108864) {
+      Ok(b) -> String::of_bytes_lossy(b),
+      Err(rejection) -> panic(f"the unit section does not unpack: {rejection}"),
+    })
