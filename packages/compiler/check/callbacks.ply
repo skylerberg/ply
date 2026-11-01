@@ -333,91 +333,34 @@ fn pass(
 
 type Reading = { back: Expression, bound: Option<Bytes> }
 
-fn leading_read(body: Expression, read: (Expression) -> Bool) -> Reading =
-  match unwrap_block(body) {
-    BlockExpression(b) -> match ((b.statements, b.tail)) {
-      ([LetStatement(l)], Some(t)) -> match l.pattern {
-        PatternVariable(v) -> if read(l.value) { { back: t, bound: Some(v.name.name) } }
-        else { { back: body, bound: None } },
-        _ -> { back: body, bound: None },
-      },
-      _ -> { back: body, bound: None },
-    },
-    _ -> { back: body, bound: None },
-  }
-
 fn steps_to_next_position(walk: FnDefinition, back: Expression) -> Bool / {abort.raise} =
   match ((walk.params, unwrap_block(back))) {
-    ([xs, start, held, p, _, _, _], CallExpression(b)) ->
-      b.args.len() == 7 && is_var(b.args.get(0), xs.name.name)
-        && is_var(b.args.get(1), start.name.name)
-        && is_var(b.args.get(2), held.name.name)
-        && is_increment(b.args.get(3), p.name.name),
+    ([xs, p, _, _], CallExpression(b)) ->
+      b.args.len() == 4 && is_var(b.args.get(0), xs.name.name)
+        && is_increment(b.args.get(1), p.name.name),
     _ -> false,
   }
 
 fn list_walk_pass(walk: FnDefinition) -> Option<Pass> / {abort.raise} =
   match walk.params {
-    [xs, _, held, p, _, f, acc] -> {
+    [xs, p, f, acc] -> {
       let xn = xs.name.name;
       let pn = p.name.name;
-      let hn = held.name.name;
       let an = acc.name.name;
-      let in_tail = |e: Expression|
-        match call_arguments(e, b"ListNode::tail_at") {
-          Some([l, i]) ->
-            is_var(l, xn)
-              && (match binary(i, b"sub") {
-                Some(d) -> is_var(d.lhs, pn) && is_var(d.rhs, hn),
-                None -> false,
-              }),
-          _ -> false,
-        };
       match unwrap_block(walk.body) {
         IfExpression(outer) -> match ((at_least(outer.cond, pn), unwrap_block(outer.else_branch))) {
-          (Some(len), IfExpression(inner)) -> {
-            let guarded = calls_on(len, b"List::len", [xn]) && is_var(outer.then_branch, an)
-              && (match at_least(inner.cond, pn) { Some(h) -> is_var(h, hn), None -> false })
-              && uses_exactly(walk.body, f.name.name, 2, 2);
-            let tail = leading_read(inner.then_branch, in_tail);
-            match ((
-                guarded && steps_to_next_position(walk, tail.back),
-                unwrap_block(inner.else_branch),
-              )) {
-              (true, BlockExpression(b)) -> match ((b.statements.last(), b.tail)) {
-                (Some(LetStatement(l)), Some(MatchExpression(m))) -> match ((l.pattern, m.arms)) {
-                  (PatternVariable(leaf), [some, none]) -> match some_arm(some) {
-                    None -> None,
-                    Some(s) -> if !is_var(m.scrutinee, leaf.name.name) || !none_arm(none, an) {
-                      None
-                    } else {
-                      let in_leaf = |e: Expression|
-                        match call_arguments(e, b"ListNode::leaf_at") {
-                          Some([node, _]) -> is_var(node, s.element),
-                          _ -> false,
-                        };
-                      let r = leading_read(s.body, in_leaf);
-                      let carried = match unwrap_block(r.back) {
-                        CallExpression(c) ->
-                          c.args.len() == 7 && is_var(c.args.get(4), leaf.name.name),
-                        _ -> false,
-                      };
-                      match ((
-                          steps_to_next_position(walk, r.back) && carried,
-                          pass(walk, 5, 6, r, in_leaf),
-                          pass(walk, 5, 6, tail, in_tail),
-                        )) {
-                        (true, Some(a), Some(t)) -> if a == t { Some(a) } else { None },
-                        _ -> None,
-                      }
-                    },
-                  },
-                  _ -> None,
-                },
-                _ -> None,
-              },
-              _ -> None,
-            }
+          (Some(len), MatchExpression(m)) -> match m.arms {
+            [some, none] -> match some_arm(some) {
+              Some(s) -> if calls_on(len, b"List::len", [xn]) && is_var(outer.then_branch, an)
+                  && calls_on(m.scrutinee, b"List::at", [xn, pn])
+                  && none_arm(none, an)
+                  && uses_exactly(walk.body, f.name.name, 1, 1)
+                  && steps_to_next_position(walk, s.body) {
+                pass(walk, 2, 3, { back: s.body, bound: Some(s.element) }, |_: Expression| false)
+              } else { None },
+              None -> None,
+            },
+            _ -> None,
           },
           _ -> None,
         },
@@ -821,20 +764,9 @@ fn derive_list_entry(
 ) -> Option<CallbackUse> / {abort.raise} =
   match unwrap_block(definition.body) {
     CallExpression(a) -> match ((var_name(a.function), a.args)) {
-      (Some(w), [xs, start, held, p, n, f, init]) -> match ((
-          functions.get(w),
-          var_name(xs),
-          var_name(f),
-        )) {
+      (Some(w), [xs, p, f, init]) -> match ((functions.get(w), var_name(xs), var_name(f))) {
         (Some(walk), Some(xn), Some(fname)) -> {
-          let entered = calls_on(start, b"ListNode::start", [xn]) && is_zero(p)
-            && is_var(n, none_constructor())
-            && (match binary(held, b"sub") {
-              Some(h) ->
-                calls_on(h.lhs, b"List::len", [xn]) && calls_on(h.rhs, b"ListNode::tail_len", [xn]),
-              None -> false,
-            })
-            && uses_exactly(definition.body, fname, 0, 1);
+          let entered = is_zero(p) && uses_exactly(definition.body, fname, 0, 1);
           match ((
               entered,
               list_walk_pass(walk),
@@ -889,60 +821,42 @@ test "each entry for a function the prelude writes in Ply is what its body does"
     })
 }
 
-type ListMapWalk = {
-  tail_next: Bytes,
-  tail_step: Bytes,
-  call: Bytes,
-  step: Bytes,
-  aside: Bytes,
-  start: Bytes,
-}
+type ListMapWalk = { read: Bytes, call: Bytes, step: Bytes, aside: Bytes, start: Bytes }
 
 fn list_map_as_written() -> ListMapWalk =
-  {
-    tail_next: b"List::push(out, f(ListNode::tail_at(xs, p - held)))",
-    tail_step: b"p + 1",
-    call: b"f(ListNode::leaf_at(m, q & 31))",
-    step: b"p + 1",
-    aside: b"",
-    start: b"0",
-  }
+  { read: b"List::at(xs, p)", call: b"f(x)", step: b"p + 1", aside: b"", start: b"0" }
 
 fn list_map_entry(w: ListMapWalk) -> Option<CallbackUse> / {abort.raise} = {
   let functions = functions_of(
     parse(
       Bytes::concat_all([
-        b"fn mapped_from<a, b | e>(xs: List<a>, start: Int, held: Int, p: Int, n: Option<ListNode<a>>, f: (a) -> b / e, out: List<b>) -> List<b> / e =\n",
-        b"  if p >= List::len(xs) { out } else if p >= held { mapped_from(xs, start, held, ",
-        w.tail_step,
-        b", n, f, ",
-        w.tail_next,
-        b") } else { let q = start + p; ",
+        b"fn mapped_from<a, b | e>(xs: List<a>, p: Int, f: (a) -> b / e, out: List<b>) -> List<b> / e =\n",
+        b"  if p >= List::len(xs) { out } else { ",
         w.aside,
-        b"let leaf = ListNode::leaf_of(xs, q >> 5); match leaf { Some(m) -> mapped_from(xs, start, held, ",
+        b"match ",
+        w.read,
+        b" { Some(x) -> mapped_from(xs, ",
         w.step,
-        b", leaf, f, List::push(out, ",
+        b", f, List::push(out, ",
         w.call,
         b")), None -> out } }\n",
         b"pub fn List::map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e =\n",
-        b"  mapped_from(xs, ListNode::start(xs), List::len(xs) - ListNode::tail_len(xs), ",
+        b"  mapped_from(xs, ",
         w.start,
-        b", None, f, List::with_capacity(List::len(xs)))\n",
+        b", f, List::with_capacity(List::len(xs)))\n",
       ]),
     ).node.items,
   );
   match functions.get(b"List::map") { Some(d) -> derive_entry(functions, d), None -> None }
 }
 
-test "a walk that skips an item, calls twice or aside, reads no item, steps past one, or starts past the first earns no entry" {
+test "a walk that reads one item over and over, calls twice or aside, passes no item, steps past one, or starts past the first earns no entry" {
   assert_eq(list_map_entry(list_map_as_written()), callback_use(b"std.prelude.List::map"));
   [
-    { ..list_map_as_written(), tail_next: b"out" },
-    { ..list_map_as_written(), tail_next: b"List::push(out, f(ListNode::tail_at(xs, p)))" },
-    { ..list_map_as_written(), tail_step: b"p + 2" },
+    { ..list_map_as_written(), read: b"List::at(xs, 0)" },
     { ..list_map_as_written(), step: b"p + 2" },
-    { ..list_map_as_written(), call: b"f(f(ListNode::leaf_at(m, q & 31)))" },
-    { ..list_map_as_written(), call: b"f(ListNode::leaf_at(n, q & 31))" },
+    { ..list_map_as_written(), call: b"f(f(x))" },
+    { ..list_map_as_written(), call: b"f(y)" },
     {
       ..list_map_as_written(),
       aside: b"let _ = List::fold(xs, out, |a: List<b>, x: a| List::push(a, f(x))); ",

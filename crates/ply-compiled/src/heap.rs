@@ -228,8 +228,11 @@ pub struct Heap {
     /// The native objects whose contents the end drops, each block's [`LISTED_AT`] its index here.
     natives: Vec<*mut Obj>,
     persistent: bool,
-    /// Whether the scheduler's own work runs: the program's live blocks do not count the blocks it
-    /// makes.
+    /// Blocks the program took through the runtime since the last reset: each past what compiled
+    /// code takes inline, and one each time a page of smaller blocks fills.
+    runtime_blocks: usize,
+    /// Whether the scheduler's own work runs: the program's live blocks and `runtime_blocks` do not
+    /// count the blocks it makes.
     scheduling: bool,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
@@ -476,6 +479,7 @@ impl Heap {
             alloc,
             natives: Vec::new(),
             persistent: false,
+            runtime_blocks: 0,
             scheduling: false,
             delayed: std::collections::VecDeque::new(),
             poison,
@@ -503,6 +507,7 @@ impl Heap {
             self.natives.push(o);
         }
         self.delayed.extend(other.delayed.drain(..));
+        self.runtime_blocks += other.runtime_blocks;
     }
 
     /// `blocks` in place of the blocks this heap takes from, which it returns.
@@ -539,6 +544,11 @@ impl Heap {
     /// The bytes of the memory holding the entry's blocks, whatever is live in it.
     pub fn held(&self) -> usize {
         self.blocks.held()
+    }
+
+    /// Blocks the program took through the runtime since the last reset.
+    pub fn runtime_blocks(&self) -> usize {
+        self.runtime_blocks
     }
 
     /// How many live blocks the program made, the scheduler's own not among them.
@@ -592,6 +602,9 @@ impl Heap {
                 made_by_scheduler: self.scheduling,
             })
         };
+        if !self.scheduling {
+            self.runtime_blocks += 1;
+        }
         p
     }
 
@@ -614,6 +627,7 @@ impl Heap {
         }
         self.drop_natives();
         self.blocks.reset();
+        self.runtime_blocks = 0;
         self.delayed.clear();
     }
 }
