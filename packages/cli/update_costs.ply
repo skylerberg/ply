@@ -1,28 +1,30 @@
-import compiler.emit.costs (Report, Costed, Site, ReturnMismatch, CostInput, Costing, costs,
-                            cost_keys, cost_input_of, report_bin)
-import compiler.expand.embed (ModuleEmbed, EmbedFile, embed_file)
-import compiler.front.facts (Analysis, Frame, is_shipped_module)
-import compiler.front.rows (Outline, OutlineItem, OutlinedFunction)
-import compiler.front (analyse_pulling_std_with, module_form_digest)
-import compiler.front.published (no_rows)
+import compiler.emit.costs (Report, Costed, Site, ReturnMismatch, placed_span, report_of)
+import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_checked)
 import compiler.front.emitter_input (Analysed, Rejected)
+import compiler.front.exports (InRoot)
+import compiler.front.facts (Frame)
+import compiler.front.published (checked_bodies)
+import compiler.front.rows (Outline, OutlineItem, OutlinedFunction, FunctionOutline)
 import compiler.store.hash.encoding (hex)
-import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, error_at, error_at_and)
-import compiler.check.resolve.scopes (PackageDependencies)
+import compiler.check.resolve.tables (Source, Diagnostic, error_at, error_at_and)
 import compiler.syntax.parsing (Span, no_module, dummy_span, span_between)
 import compiler.unit (identity_of, shipped)
-import compiler.store.records (Record, record_store, with_record_store)
+import compiler.store.records (record_store, with_record_store)
+import compiler.front.checking.world (CheckQuery)
+import compiler.load (Derives)
 import diagnostic (SourceText, position_of)
 import compiler.cc (toolchain)
-import program (Program, whole_of)
+import program (Program, ProgramPlace, in_program_store)
+import module_queries (PromiseFacts, promise_facts, body_programs)
+import compiler.front.checking (LoadInputs, fresh_registry, inputs_alone, lookup_input_alone,
+                                over_decoding, prelude_files, prelude_frames)
+import compiler.store.memo (empty_memory_store)
+import proof.static_prover (UnprovedMeasure, unproved_measures)
 import report (indent)
-import sources
 import std.term (Style, bold, dim, red, green, yellow, plain)
 import std.bin
 import std.fs (fs)
 import std.hash (blake3)
-import std.random (entropy)
-import std.time (time)
 import std.string
 import std.list
 import proof.obligation (plural)
@@ -30,199 +32,215 @@ import std.path (strip_root)
 
 fn location_width() -> Int = 22
 
+pub type PromiseAsk = { place: ProgramPlace, costs: Bool, measures: Bool }
+
+pub type Promises = { report: Option<Report>, walked: Int, unproved: List<Diagnostic> }
+
 pub effect cost_checker {
-  read report(p: CostInput) -> Costing
+  read report(ask: PromiseAsk) -> Promises
 }
 
-pub fn costs_of(
+fn functions_asking(program: Program, frame: Frame, wanted: (FunctionOutline) -> Bool) -> Bool =
+  frame.outlines.take(program.files.len()).fold(false, |any: Bool, o: Outline|
+    any
+      || o.items.fold(false, |a: Bool, it: OutlineItem|
+        a || (match it { OutlinedFunction(f) -> wanted(f), _ -> false })))
+
+pub fn has_promises(program: Program, frame: Frame) -> Bool =
+  functions_asking(program, frame, |f: FunctionOutline| f.reuse || f.returns)
+
+pub fn has_measures(program: Program, frame: Frame) -> Bool =
+  functions_asking(program, frame, |f: FunctionOutline| f.measured)
+
+pub fn promises_of(
   program: Program,
-  analysis: Analysis,
-) -> Costing / {cost_checker.report, abort.raise} = {
-  let sources = range(0, analysis.modules.len()).map(|i: Int|
-    match program.source_texts.at(i) {
-      Some(example_sources) -> example_sources.text,
-      None -> b"",
-    });
-  let c = cost_checker.report(cost_input_of(analysis, sources));
-  {
-    ..c,
-    report: {
-      ..c.report,
-      definitions: c.report.definitions.filter(|d: Costed| d.module < program.files.len()),
-    },
-  }
+  frame: Frame,
+  costs: Bool,
+) -> Promises / {cost_checker.report, abort.raise} = {
+  let measures = has_measures(program, frame);
+  if !costs && !measures { { report: None, walked: 0, unproved: [] } }
+  else { cost_checker.report({ place: program.place, costs: costs, measures: measures }) }
 }
+
+pub fn report_violations(r: Report) -> List<Diagnostic> =
+  if !r.ok { [unresolved()] } else {
+    r.return_mismatches.fold(
+      report_reuse_violations(r),
+      |accumulator: List<Diagnostic>, u: ReturnMismatch| accumulator.push(broken_returns_clause(u)),
+    )
+  }
+
+pub fn promise_errors(promises: Promises) -> List<Diagnostic> =
+  if promises.unproved.len() > 0 { promises.unproved }
+  else { match promises.report { None -> [], Some(r) -> report_violations(r) } }
 
 pub fn reuse_violations(
   program: Program,
   frame: Frame,
 ) -> List<Diagnostic> / {cost_checker.report, abort.raise} =
-  if !has_promises(program, frame) { [] } else {
-    match whole_of(program) {
-      Err(ds) -> ds,
-      Ok(w) -> {
-        let r = costs_of(program, w).report;
-        if !r.ok { [unresolved()] } else {
-          r.return_mismatches.fold(
-            report_reuse_violations(r),
-            |accumulator: List<Diagnostic>, u: ReturnMismatch|
-              accumulator.push(broken_returns_clause(u)),
-          )
-        }
-      },
-    }
+  promise_errors(promises_of(program, frame, has_promises(program, frame)))
+
+pub fn measure_errors(
+  program: Program,
+  frame: Frame,
+) -> List<Diagnostic> / {cost_checker.report, abort.raise} =
+  promises_of(program, frame, false).unproved
+
+type MeasureFailure = { owner: Bytes, start: Int, end: Int, reason: List<String>, descends: Bool }
+
+derive bin for MeasureFailure
+
+fn measure_failures(p: BodyProgram) -> List<MeasureFailure> / {abort.raise} = {
+  let own_module = p.source.source.name;
+  let owned = |m: Bytes| m == own_module || p.places.get(m) == Some(InRoot);
+  let c = body_program_checked(p);
+  match c.pulled.out {
+    Rejected(ds) ->
+      p.measured.map(|name: Bytes|
+        {
+          owner: name,
+          start: 0,
+          end: 0,
+          reason: ds.map(|d: Diagnostic| String::of_bytes_lossy(d.message)),
+          descends: false,
+        }),
+    Analysed(w) ->
+      unproved_measures(w, owned, Some(checked_bodies(w)), Some(p.measured)).map(
+        |u: UnprovedMeasure|
+          {
+            owner: Bytes::of_string(u.measure.owner),
+            start: u.measure.at.start - p.source.offset,
+            end: u.measure.at.end - p.source.offset,
+            reason: u.reason,
+            descends: u.descends,
+          },
+      ),
   }
+}
 
-fn checker_roots() -> List<Bytes> =
-  [
-    b"compiler.emit.costs.costs",
-    b"compiler.emit.costs.cost_keys",
-    b"compiler.front.analyse_pulling_std_with",
-  ]
+fn measure_diagnostic(e: MeasureEntry, module: Int, f: MeasureFailure) -> Diagnostic =
+  error_at(
+    b"E0467",
+    module,
+    placed_span(e.items, span_between(f.start, f.end)),
+    Bytes::concat_all([
+      b"the measure of `",
+      f.owner,
+      b"` is not proved to decrease at every recursive call, including calls between definitions that call each other",
+    ]),
+    b"the checker cannot prove that this `measure` decreases",
+    f.reason.map(Bytes::of_string).push(if f.descends {
+      b"the checker can see that the definition ends without the measure, so remove the `measure` clause"
+    } else {
+      b"a definition is read as ending on its measure only once a proof shows it; restructure it so the checker sees it descend, or state a measure a proof can follow"
+    }),
+  )
 
-fn costs_key(
-  identity: Bytes,
-  names: List<Bytes>,
-  sources: List<Bytes>,
-  packages: List<PackageDependencies>,
-  module_packages: List<Int>,
-  shipped: Int,
-  embeds: List<ModuleEmbed>,
-) -> Bytes / {abort.raise} = {
-  let n = |i: Int| Bytes::of_string(i.to_string());
-  let read = |e: ModuleEmbed|
-    match e.read {
-      Ok(files) ->
-        Bytes::concat_all(files.map(|f: EmbedFile| Bytes::concat_all([f.name, b"\x00", f.digest]))),
-      Err(reason) -> b"!".concat(reason),
-    };
+fn prover_roots() -> List<Bytes> = [b"update_costs.with_cost_cache"]
+
+fn verdict_key(prover: Bytes, program: Bytes) -> Bytes / {abort.raise} =
   hex(
     blake3(
       Bytes::concat_all([
-        b"ply.costs.1\x00",
-        hex(bin::shape_digest(report_bin())),
+        b"ply.measure.1\x00",
+        hex(bin::shape_digest(bin::list_bin(measure_failure_bin()))),
         b"\x00",
-        identity,
+        prover,
         b"\x00",
-        Bytes::concat_all(
-          range(0, names.len()).map(|i: Int|
-            Bytes::concat_all([
-              match names.at(i) { Some(x) -> x, None -> b"" },
-              b"\x00",
-              match sources.at(i) { Some(x) -> blake3(x), None -> b"" },
-            ])),
-        ),
-        b"\x00",
-        Bytes::concat_all(
-          packages.map(|p: PackageDependencies|
-            Bytes::concat_all([
-              p.prefix,
-              b"(",
-              Bytes::concat_all(p.dependencies.map(|d: Bytes| d.concat(b","))),
-              b")",
-            ])),
-        ),
-        b"\x00",
-        Bytes::concat_all(module_packages.map(|k: Int| n(k).concat(b","))),
-        b"\x00",
-        n(shipped),
-        b"\x00",
-        Bytes::concat_all(
-          embeds.map(|e: ModuleEmbed|
-            Bytes::concat_all([e.module, b"\x00", e.key, b"\x00", read(e), b"\x00"])),
-        ),
+        program,
       ]),
     ),
   )
-}
 
-fn keyed_sources(a: Analysis, sources: List<Bytes>) -> List<Bytes> / {abort.raise} = {
-  let owner = |name: Bytes| {
-    let dot = range(0, name.len()).fold(0 - 1, |accumulator: Int, i: Int|
-      if name.at(i) == 46 { i } else { accumulator });
-    if dot < 0 { b"" } else { name.slice(0, dot) }
-  };
-  let module_lines = a.hashes.definitions.concat(a.hashes.declarations).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Bytes>>, d: { name: Bytes, hash: Bytes }| {
-      let m = owner(d.name);
-      accumulator.insert(
-        m,
-        List::push(
-          match accumulator.get(m) { Some(xs) -> xs, None -> [] },
-          Bytes::concat_all([d.name, b" ", d.hash, b"\n"]),
-        ),
-      )
-    },
-  );
-  range(0, a.modules.len()).map(|i: Int| {
-    let m = a.modules.get(i);
-    let source = match sources.at(i) { Some(x) -> x, None -> b"" };
-    if !is_shipped_module(a.packages, a.module_packages, i) { source } else {
-      Bytes::concat_all(
-        [b"shipped\x00", module_form_digest(m.module, source), b"\x00"].concat(
-          match module_lines.get(m.name) { Some(xs) -> xs, None -> [] },
-        ),
-      )
-    }
-  })
-}
+type KnownVerdict = { entry: MeasureEntry, key: Bytes, failures: Option<List<MeasureFailure>> }
 
-pub fn with_cost_cache<a | e>(
-  body: () -> a / {cost_checker.report | e},
-) -> a / {abort.raise, shipped.definitions, toolchain.bodies_dir, fs.read[abs], fs.write[abs] | e} =
-  handle {
-    body()
-  } with {
-    cost_checker.report(p) -> {
-      let identity = identity_of(shipped.definitions(), checker_roots());
-      let store = strip_root(toolchain.bodies_dir()) ++ "/costs-"
-        ++ String::of_bytes(identity.slice(0, 16));
-      with_record_store[abs, reports](store, || {
-        let a = p.analysis;
-        let key = costs_key(
-          identity,
-          a.modules.map(|m: ParsedModule| m.name),
-          keyed_sources(a, p.sources),
-          a.packages,
-          a.module_packages,
-          a.packages.len(),
-          a.embeds,
-        );
-        let cached_report = match record_store.get[reports](key) {
-          Some(bytes) -> match bin::decode(bytes, report_bin()) {
-            Ok(r) -> Some(r),
-            Err(_) -> None,
-          },
-          None -> None,
-        };
-        match cached_report {
-          Some(r) -> { report: r, cached: [], walked_modules: 0, lowered: 0 },
-          None -> {
-            let keys = cost_keys(p, identity);
-            let c = costs(
-              p,
-              keys.map(|k: Bytes| if k.len() == 0 { None } else { record_store.get[reports](k) }),
-            );
-            record_store.put[reports](
-              range(0, keys.len()).fold([], |accumulator: List<Record>, i: Int|
-                match ((c.cached.at(i), keys.at(i))) {
-                  (Some(Some(bytes)), Some(k)) -> accumulator.push({ key: k, bytes: bytes }),
-                  _ -> accumulator,
-                }).push({ key: key, bytes: bin::encode(c.report, report_bin()) }),
-            );
-            { ..c, cached: [] }
-          },
-        }
-      })
+fn decoded_verdict(bytes: Option<Bytes>) -> Option<List<MeasureFailure>> / {abort.raise} =
+  match bytes {
+    None -> None,
+    Some(b) -> match bin::decode(b, bin::list_bin(measure_failure_bin())) {
+      Ok(failures) -> Some(failures),
+      Err(_) -> None,
     },
   }
 
-pub fn has_promises(program: Program, frame: Frame) -> Bool =
-  frame.outlines.take(program.files.len()).fold(false, |any: Bool, o: Outline|
-    any
-      || o.items.fold(false, |a: Bool, it: OutlineItem|
-        a || (match it { OutlinedFunction(f) -> f.reuse || f.returns, _ -> false })))
+fn measures_settled(
+  place: ProgramPlace,
+  modules: List<Bytes>,
+  entries: List<MeasureEntry>,
+) -> List<Diagnostic> / {shipped.definitions, toolchain.bodies_dir, fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+  let prover = identity_of(shipped.definitions(), prover_roots());
+  let store = strip_root(toolchain.bodies_dir()) ++ "/measures-"
+    ++ String::of_bytes(prover.slice(0, 16));
+  with_record_store[abs, proofs](store, || {
+    let known = entries.map(|e: MeasureEntry| {
+      let key = verdict_key(prover, e.program);
+      { entry: e, key: key, failures: decoded_verdict(record_store.get[proofs](key)) }
+    });
+    let open = known.filter(|k: KnownVerdict| k.failures == None);
+    let proved = if open.len() == 0 { [] } else {
+      in_program_store(place, |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
+        body_programs(qs, open.map(|k: KnownVerdict| k.entry.unit))).map(
+        measure_failures,
+      )
+    };
+    if open.len() > 0 {
+      record_store.put[proofs](
+        range(0, open.len()).map(|i: Int|
+          {
+            key: open.get(i).key,
+            bytes: bin::encode(proved.get(i), bin::list_bin(measure_failure_bin())),
+          }),
+      )
+    };
+    let by_key = range(0, open.len()).fold(
+      Map::new(),
+      |accumulator: Map<Bytes, List<MeasureFailure>>, i: Int|
+        accumulator.insert(open.get(i).key, proved.get(i)),
+    );
+    known.fold([], |accumulator: List<Diagnostic>, k: KnownVerdict| {
+      let module = range(0, modules.len()).fold(0, |found: Int, i: Int|
+        if modules.get(i) == k.entry.unit.module { i } else { found });
+      let failures = match k.failures {
+        Some(fs) -> fs,
+        None -> match by_key.get(k.key) { Some(fs) -> fs, None -> [] },
+      };
+      accumulator.concat(failures.map(|f: MeasureFailure| measure_diagnostic(k.entry, module, f)))
+    })
+  })
+}
+
+fn at_module(index: Int, m: Report) -> Report =
+  {
+    ..m,
+    definitions: m.definitions.map(|d: Costed| { ..d, module: index }),
+    return_mismatches: m.return_mismatches.map(|u: ReturnMismatch| { ..u, module: index }),
+  }
+
+pub fn with_cost_cache<a | e>(
+  body: () -> a / {cost_checker.report | e},
+) -> a / {shipped.definitions, toolchain.bodies_dir, fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise | e} =
+  handle {
+    body()
+  } with {
+    cost_checker.report(ask) -> {
+      let modules = ask.place.project.sources.map(|s: Source| s.name);
+      let facts: PromiseFacts = in_program_store(
+        ask.place,
+        |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
+          promise_facts(qs, modules, ask.costs, ask.measures),
+      );
+      {
+        report: if !ask.costs { None } else {
+          Some(
+            report_of(range(0, facts.costs.len()).map(|i: Int| at_module(i, facts.costs.get(i)))),
+          )
+        },
+        walked: facts.walked,
+        unproved: if facts.measures.len() == 0 { [] }
+        else { measures_settled(ask.place, modules, facts.measures) },
+      }
+    },
+  }
 
 fn broken_returns_clause(u: ReturnMismatch) -> Diagnostic =
   error_at(
@@ -403,37 +421,67 @@ pub fn report_reuse_violations(report: Report) -> List<Diagnostic> =
           else { diagnostics.push(reuse_violation(d, promise, site)) }),
     })
 
-test "the cache key of an update-cost report changes with the checker, any module's text, the module-to-package mapping or an embedded file" {
-  let sources = [b"fn f() -> Int = 1", b"fn g() -> Int = 2"];
-  let embedded = |bytes: Bytes|
-    [{ module: b"m", key: b"file:x", read: Ok([embed_file(b"", bytes)]) }];
-  let key = |identity: Bytes, texts: List<Bytes>, module_packages: List<Int>, embeds: List<ModuleEmbed>|
-    costs_key(identity, [b"m", b"n"], texts, [], module_packages, 1, embeds);
-  let base = key(b"c", sources, [0, 0], []);
-  assert_eq(key(b"c", sources, [0, 0], []), base);
-  assert(key(b"d", sources, [0, 0], []) != base, None);
-  assert(key(b"c", [b"fn f() -> Int = 1", b"fn g() -> Int = 3"], [0, 0], []) != base, None);
-  assert(key(b"c", sources, [0, 1], []) != base, None);
-  assert(
-    key(b"c", sources, [0, 0], embedded(b"1")) != key(b"c", sources, [0, 0], embedded(b"2")),
-    None,
+fn failures_over(sources: List<Source>) -> List<MeasureFailure> / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  over_decoding(
+    empty_memory_store(),
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    || {
+      let listed = promise_facts(qs, sources.map(|s: Source| s.name), false, true);
+      body_programs(qs, listed.measures.map(|e: MeasureEntry| e.unit))
+    },
+  ).value.fold([], |accumulator: List<MeasureFailure>, p: BodyProgram|
+    accumulator.concat(measure_failures(p)))
+}
+
+fn measure_failures_in(source: Bytes) -> List<MeasureFailure> / {abort.raise} =
+  failures_over([{ name: b"m", source_text: source }])
+
+fn failed_measures(source: Bytes) -> List<Bytes> / {abort.raise} =
+  measure_failures_in(source).map(|f: MeasureFailure| f.owner)
+
+test "a measure is proved from its function's own program, which holds the bodies it calls" {
+  assert_eq(
+    failed_measures(
+      b"fn is_small(n: Int) -> Bool = n <= 0\nfn lowered(n: Int) -> Int decreases n = if is_small(n) { 0 } else { lowered(n - 1) + 1 }\n",
+    ),
+    [],
   )
 }
 
-test "the cache key of an update-cost report ignores an unused function added to a standard library module, but changes when a used function changes" {
-  let user: Source = { name: b"m", source_text: b"import std.x (f)\npub fn use() -> Int = f()\n" };
-  let keyed = |x: Bytes|
-    match analyse_pulling_std_with([user], [{ name: b"std.x", source_text: x }], no_rows()).out {
-      Analysed(a) ->
-        keyed_sources(
-          a,
-          a.modules.map(|m: ParsedModule| if m.name == b"std.x" { x } else { user.source_text }),
-        ),
-      Rejected(_) -> panic("the test program fails to check"),
-    };
-  let base = keyed(b"pub fn f() -> Int = 1\n");
-  assert_eq(keyed(b"pub fn f() -> Int = 1\n\npub fn g() -> Int = 2\n"), base);
-  assert(keyed(b"pub fn f() -> Int = 2\n") != base, Some("what the program reaches moved"))
+test "a measure proof reads the body of a callee in another module of the package" {
+  assert_eq(
+    failures_over([
+      { name: b"util", source_text: b"pub fn is_small(n: Int) -> Bool = n <= 0\n" },
+      {
+        name: b"m",
+        source_text: b"import util (is_small)\n\nfn lowered(n: Int) -> Int decreases n = if is_small(n) { 0 } else { lowered(n - 1) + 1 }\n",
+      },
+    ]).map(|f: MeasureFailure| f.owner),
+    [],
+  )
+}
+
+test "a measure proof covers each function of a cycle, and a measure that does not fall fails" {
+  assert_eq(
+    failed_measures(
+      b"fn up(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { across(a + 1, b - 2) }\nfn across(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { up(a - 2, b + 1) }\n",
+    ),
+    [],
+  );
+  assert_eq(
+    failed_measures(b"fn stall(n: Int) -> Int decreases n = if n <= 0 { 0 } else { stall(n) }\n"),
+    [b"m.stall"],
+  )
+}
+
+test "a failed measure is placed at its clause, relative to the text of its unit" {
+  let source = b"fn stall(n: Int) -> Int decreases n + 1 = if n <= 0 { 0 } else { stall(n) }\n";
+  let f = measure_failures_in(source).get(0);
+  assert_eq(source.slice(f.start, f.end), b"n + 1")
 }
 
 fn example_sources() -> List<SourceText> =

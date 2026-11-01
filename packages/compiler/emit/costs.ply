@@ -1,4 +1,4 @@
-import compiler.syntax.parsing (Span, dummy_span, span_bin, span_between)
+import compiler.syntax.parsing (Span, span_bin, span_between)
 import compiler.emit.code (Code, CodeLiteral, CodeVariable, NDefinition, NConstructor, NBuiltin,
                            CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLambda, CodeSimulate,
@@ -8,35 +8,27 @@ import compiler.emit.code (Code, CodeLiteral, CodeVariable, NDefinition, NConstr
 import compiler.emit.moves (Moves, no_moves, read_moved, capture_moved, field_moved, root_moves)
 import compiler.emit.lower.module_context (ModuleContext, ItemRoot, module_contexts_in)
 import compiler.check.infer.definitions (Extern, parsed_natives)
-import compiler.syntax.items (Module, DeriveOrigin, Item, FunctionItem, TestItem, LawItem,
-                              FnDefinition, ReturnsFresh, ReturnsParam, parse)
-import compiler.expand.derive (derivation_of)
-import compiler.syntax.expressions (Param, prelude_module, prelude_own)
-import compiler.expand.embed (ModuleEmbed, EmbedFile, embed_tables, inline_embeds_by_name)
-import compiler.check.resolve.tables (ParsedModule, Resolution, Source, qualify)
-import compiler.check.resolve (ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_packaged)
-import compiler.check.resolve.scopes (no_packages)
-import compiler.check.infer.checker (Builtin, builtins, WitnessOrder, MemberSite)
-import compiler.emit.keys (test_owner, law_owner)
-import compiler.check.infer (BodyFacts, body_facts_bin, types_named)
-import compiler.check.typed (TypedBody, witness_param_name)
-import compiler.front.facts (Analysis, cuts_of)
-import compiler.front.rows (Rows, KnownDefinitionRow, KnownTestRow, Cut)
+import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDefinition, ReturnsFresh,
+                              ReturnsParam)
+import compiler.syntax.expressions (Param, prelude_own)
+import compiler.expand.embed (ModuleEmbed, embed_tables, inline_embeds_by_name)
+import compiler.check.resolve.tables (ParsedModule, Resolution, qualify)
+import compiler.check.infer.checker (Builtin, builtins, WitnessOrder)
+import compiler.check.infer (CheckOutput)
+import compiler.check.typed (witness_param_name)
+import compiler.front.facts (Analysis)
+import compiler.front.rows (Rows)
 import compiler.front.emitter_input (InferredFacts, Analysed, Rejected)
 import compiler.front.published (analyse, rows_of, inferred_facts)
-import compiler.front (analyse_pulling_std)
-import compiler.store.hash.encoding (hex)
-import compiler.front.interface (blank_cuts)
+import compiler.front.exports (ItemAt)
 import compiler.check.callbacks (CallbackArgument, Element, Accumulator, ExtractedFrom, Number,
                                  UnknownArgument, Folded, prelude_callback_use)
-import compiler.front.diagnostics (parse_all, parse_at, parse_from)
+import compiler.front.diagnostics (parse_all)
 import std.bin
-import std.hash (blake3)
 import std.list
 import std.bytes (ascii_of_int)
-import compiler.prelude_source
 
-type Cause =
+pub type Cause =
   | ReadAgain
   | MapEntry
   | CapturedValue
@@ -47,29 +39,27 @@ type Cause =
   | HandlerResult
   | ClosureParam
 
-type Reason = { cause: Cause, text: Bytes }
+pub type Reason = { cause: Cause, text: Bytes }
 
-type Owner = | FreshOwner | ParamOwner(Int) | SharedOwner(Reason) | UnknownOwner(Reason)
+pub type Owner = | FreshOwner | ParamOwner(Int) | SharedOwner(Reason) | UnknownOwner(Reason)
 
-type ParamSharing = | SoleParam | UnsureParam(Reason) | SharedParam(Reason)
+pub type ParamSharing = | SoleParam | UnsureParam(Reason) | SharedParam(Reason)
 
-type ReturnOwnership =
+pub type ReturnOwnership =
   | FreshReturn
   | ReturnOfParam(Int)
   | SharedReturn(Reason)
   | UnsureReturn(Reason)
 
-type Tables = { params: List<List<ParamSharing>>, rets: List<ReturnOwnership> }
+type Tables = { rets: List<ReturnOwnership> }
 
 type Bind = { slot: Int, owner: Owner }
 
 type PassedArgument = { callee: Int, param: Int, owner: Owner }
 
-type RawSite = { span: Span, builtin_name: Bytes, owner: Owner }
+pub type RawSite = { span: Span, builtin_name: Bytes, owner: Owner }
 
 type ReturnRead = { callee: Int, return_ownership: ReturnOwnership }
-
-type NameLookup = { name: Bytes, bound: Option<Bytes>, has_definition: Option<Int> }
 
 type CostState = {
   chain: List<Bind>,
@@ -77,47 +67,62 @@ type CostState = {
   demands: List<PassedArgument>,
   escaped: List<Int>,
   reads: List<ReturnRead>,
-  lookups: List<NameLookup>,
 }
 
-type CachedLookup = { name: Bytes, bound: Option<Bytes>, has_definition: Bool }
+pub type Demand = { callee: Bytes, param: Int, owner: Owner }
 
-type CachedRead = { callee: Bytes, return_ownership: ReturnOwnership }
+pub type Escape = { callee: Bytes, arity: Int }
 
-type CachedDemand = { callee: Bytes, param: Int, owner: Owner }
-
-type CachedWalk = {
-  reads: List<CachedRead>,
-  sites: List<RawSite>,
-  demands: List<CachedDemand>,
-  escaped: List<Bytes>,
-  return_owner: Owner,
-}
-
-type CachedBody = {
-  kind: Bytes,
+pub type WalkedBody = {
+  item_kind: Bytes,
+  module_name: Bytes,
   name: Bytes,
   label: Bytes,
   definition: Option<Bytes>,
-  arity: Int,
   reuse: Option<Span>,
-  lookups: List<CachedLookup>,
-  walks: List<CachedWalk>,
+  sites: List<RawSite>,
+  demands: List<Demand>,
+  escaped: List<Escape>,
+  returned: ReturnOwnership,
 }
 
-type CachedModule = { bodies: List<CachedBody> }
+pub type DeclaredReturn = {
+  module_name: Bytes,
+  definition: Bytes,
+  params: List<Bytes>,
+  declared: ReturnOwnership,
+  span: Span,
+}
+
+pub type GroupWalk = { ok: Bool, bodies: List<WalkedBody>, declared: List<DeclaredReturn> }
+
+pub type BodyDemands = {
+  caller: Option<Bytes>,
+  label: Bytes,
+  escaped: List<Escape>,
+  demands: List<Demand>,
+}
+
+pub type ModuleDemands = { ok: Bool, bodies: List<BodyDemands> }
+
+pub type ParamTable = Map<Bytes, Map<Int, ParamSharing>>
+
+pub type Parameters = { table: Map<Bytes, Map<Int, ParamSharing>>, rounds: Int }
 
 derive bin for Cause
 derive bin for Reason
 derive bin for Owner
+derive bin for ParamSharing
 derive bin for ReturnOwnership
 derive bin for RawSite
-derive bin for CachedLookup
-derive bin for CachedRead
-derive bin for CachedDemand
-derive bin for CachedWalk
-derive bin for CachedBody
-derive bin for CachedModule
+derive bin for Demand
+derive bin for Escape
+derive bin for WalkedBody
+derive bin for DeclaredReturn
+derive bin for GroupWalk
+derive bin for BodyDemands
+derive bin for ModuleDemands
+derive bin for Parameters
 
 type WithOwner = { state: CostState, owner: Owner }
 
@@ -127,7 +132,6 @@ type Args = { state: CostState, owners: List<Owner> }
 
 type Definition = {
   name: Bytes,
-  module_index: Int,
   module_name: Bytes,
   params: List<Bytes>,
   arity: Int,
@@ -143,13 +147,9 @@ type Body = {
   label: Bytes,
   definition_index: Int,
   arity: Int,
-  span: Span,
-  code: Option<Code>,
+  code: Code,
   moves: Moves,
-  lowered: Bool,
   reuse: Option<Span>,
-  looked: List<CachedLookup>,
-  cached_walks: List<WalkResult>,
 }
 
 type WalkResult = {
@@ -158,11 +158,9 @@ type WalkResult = {
   used_as_values: List<Int>,
   return_owner: Owner,
   reads: List<ReturnRead>,
-  lookups: List<NameLookup>,
 }
 
 type Program = {
-  r: Resolution,
   index: Map<Bytes, Int>,
   builtins: Map<Bytes, Bool>,
   definitions: List<Definition>,
@@ -170,8 +168,6 @@ type Program = {
 }
 
 type Env = { prog: Program, module: Int, tables: Tables, moves: Moves }
-
-type Parsed = { name: Bytes, module: Module, derived: List<DeriveOrigin>, bad: Bool }
 
 fn blocked(cause: Cause, text: Bytes) -> Owner = SharedOwner({ cause: cause, text: text })
 
@@ -209,16 +205,6 @@ fn add_demand(state: CostState, d: PassedArgument) -> CostState =
   { ..state, demands: state.demands.push(d) }
 
 fn add_escaped(state: CostState, d: Int) -> CostState = { ..state, escaped: state.escaped.push(d) }
-
-fn look(state: CostState, name: Bytes, found: Bound) -> CostState =
-  {
-    ..state,
-    lookups: state.lookups.push({
-      name: name,
-      bound: found.bound,
-      has_definition: found.definition,
-    }),
-  }
 
 fn with_chain(state: CostState, chain: List<Bind>) -> CostState = { ..state, chain: chain }
 
@@ -533,37 +519,34 @@ fn variable_owner(env: Env, name: Bytes, slot: Int, moved: Bool, state: CostStat
     None -> { state: state, owner: unbound_owner(name) },
   }
 
-fn global_named(prog: Program, c: Code) -> Option<{ name: Bytes, found: Bound }> =
+type NamedGlobal = { name: Bytes, definition: Option<Int> }
+
+fn global_named(prog: Program, c: Code) -> Option<NamedGlobal> =
   match c.node {
     NDefinition(d) -> match prelude_own(d.full) {
-      Some(name) -> Some({ name: name, found: { bound: None, definition: None } }),
-      None ->
-        Some({ name: d.full, found: { bound: Some(d.full), definition: prog.index.get(d.full) } }),
+      Some(name) -> Some({ name: name, definition: None }),
+      None -> Some({ name: d.full, definition: prog.index.get(d.full) }),
     },
-    NConstructor(k) -> Some({ name: k.name, found: { bound: Some(k.name), definition: None } }),
-    NBuiltin(b) -> Some({ name: b.name, found: { bound: None, definition: None } }),
+    NConstructor(k) -> Some({ name: k.name, definition: None }),
+    NBuiltin(b) -> Some({ name: b.name, definition: None }),
     _ -> None,
   }
 
 fn global_read(env: Env, c: Code, state: CostState) -> WithOwner =
   match global_named(env.prog, c) { Some(n) -> global_owner(n, state), None -> fresh(state) }
 
-fn global_owner(named: { name: Bytes, found: Bound }, state: CostState) -> WithOwner = {
-  let looked = look(state, named.name, named.found);
-  match named.found.definition {
+fn global_owner(named: NamedGlobal, state: CostState) -> WithOwner =
+  match named.definition {
     Some(d) ->
       {
-        state: add_escaped(looked, d),
+        state: add_escaped(state, d),
         owner: blocked(
           TopLevelValue,
           b"a top-level definition, which stays alive for the whole program",
         ),
       },
-    None -> { state: looked, owner: unbound_owner(named.name) },
+    None -> { state: state, owner: unbound_owner(named.name) },
   }
-}
-
-type Bound = { bound: Option<Bytes>, definition: Option<Int> }
 
 fn app(
   env: Env,
@@ -573,15 +556,15 @@ fn app(
   state: CostState,
 ) -> WithOwner / {abort.raise} = {
   let named = global_named(env.prog, function);
-  let callee = match named { Some(x) -> x.found.definition, None -> None };
+  let callee = match named { Some(x) -> x.definition, None -> None };
   let builtin = match named {
-    Some(x) -> if x.found.definition != None || !env.prog.builtins.contains(x.name) { None }
+    Some(x) -> if x.definition != None || !env.prog.builtins.contains(x.name) { None }
     else { Some(x.name) },
     None -> None,
   };
   let n = args.len();
   let before = match named {
-    Some(x) -> look(state, x.name, x.found),
+    Some(_) -> state,
     None -> match function.node { CodeVariable(_) -> state, _ -> walk(env, function, state).state },
   };
   let walked: Args = args.fold({ state: before, owners: [] }, |accumulator: Args, arg: Code| {
@@ -737,27 +720,20 @@ fn sharing_rank(p: ParamSharing) -> Int =
 fn meet(a: ParamSharing, b: ParamSharing) -> ParamSharing =
   if sharing_rank(b) < sharing_rank(a) { b } else { a }
 
-fn param_at(tables: Tables, d: Int, k: Int) -> Option<ParamSharing> =
-  match tables.params.at(d) { Some(slots) -> slots.at(k), None -> None }
-
-fn combine_all_params(tables: Tables, d: Int, p: ParamSharing) -> Tables =
-  match tables.params.at(d) {
-    None -> tables,
-    Some(slots) ->
-      { ..tables, params: tables.params.set(d, slots.map(|s: ParamSharing| meet(s, p))) },
-  }
-
-fn combine_param(tables: Tables, d: Int, j: Int, p: ParamSharing) -> Tables =
-  match tables.params.at(d) {
-    None -> tables,
-    Some(slots) -> match slots.at(j) {
-      None -> tables,
-      Some(s) -> { ..tables, params: tables.params.set(d, slots.set(j, meet(s, p))) },
+fn param_at(table: ParamTable, name: Option<Bytes>, k: Int) -> Option<ParamSharing> =
+  match name {
+    None -> None,
+    Some(n) -> match table.get(n) {
+      None -> Some(SoleParam),
+      Some(slots) -> match slots.get(k) { Some(p) -> Some(p), None -> Some(SoleParam) },
     },
   }
 
-fn with_return(tables: Tables, d: Int, r: ReturnOwnership) -> Tables / {abort.raise} =
-  { ..tables, rets: tables.rets.set(d, r) }
+fn combine_param(table: ParamTable, callee: Bytes, param: Int, p: ParamSharing) -> ParamTable = {
+  let slots = match table.get(callee) { Some(s) -> s, None -> Map::new() };
+  let met = meet(match slots.get(param) { Some(s) -> s, None -> SoleParam }, p);
+  match met { SoleParam -> table, _ -> table.insert(callee, slots.insert(param, met)) }
+}
 
 fn return_of(owner: Owner) -> ReturnOwnership =
   match owner {
@@ -767,7 +743,7 @@ fn return_of(owner: Owner) -> ReturnOwnership =
     UnknownOwner(reason) -> UnsureReturn(reason),
   }
 
-fn interpret(owner: Owner, caller: Int, tables: Tables, label: Bytes) -> ParamSharing =
+fn interpret(owner: Owner, caller: Option<Bytes>, table: ParamTable, label: Bytes) -> ParamSharing =
   match owner {
     FreshOwner -> SoleParam,
     SharedOwner(reason) ->
@@ -778,7 +754,7 @@ fn interpret(owner: Owner, caller: Int, tables: Tables, label: Bytes) -> ParamSh
       UnsureParam(
         reworded(reason, Bytes::concat_all([label, b" passes a value; reason: ", reason.text])),
       ),
-    ParamOwner(k) -> match param_at(tables, caller, k) {
+    ParamOwner(k) -> match param_at(table, caller, k) {
       Some(SoleParam) -> SoleParam,
       Some(UnsureParam(reason)) ->
         UnsureParam(
@@ -812,9 +788,8 @@ fn interpret(owner: Owner, caller: Int, tables: Tables, label: Bytes) -> ParamSh
     },
   }
 
-fn start_tables(definitions: List<Definition>) -> Tables =
+fn start_returns(definitions: List<Definition>) -> Tables =
   {
-    params: definitions.map(|d: Definition| range(0, d.arity).map(|_: Int| SoleParam)),
     rets: definitions.map(|d: Definition|
       if d.own { FreshReturn } else {
         match d.declared_return {
@@ -832,269 +807,164 @@ fn start_tables(definitions: List<Definition>) -> Tables =
       }),
   }
 
-fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} =
-  match b.code {
-    None ->
-      {
-        sites: [],
-        demands: [],
-        used_as_values: [],
-        return_owner: unknown(
-          CallResult,
-          b"the value a call returned, which the callee may still reference",
-        ),
-        reads: [],
-        lookups: [],
-      },
-    Some(c) -> {
-      let chain = range(0, b.arity).map(|k: Int|
-        { slot: k, owner: if b.definition_index < 0 { FreshOwner } else { ParamOwner(k) } });
-      let w = walk({ ..env, moves: b.moves }, c, {
-        chain: chain,
-        sites: [],
-        demands: [],
-        escaped: [],
-        reads: [],
-        lookups: [],
-      });
-      {
-        sites: w.state.sites,
-        demands: w.state.demands,
-        used_as_values: w.state.escaped,
-        return_owner: w.owner,
-        reads: w.state.reads,
-        lookups: w.state.lookups,
-      }
-    },
+fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} = {
+  let chain = range(0, b.arity).map(|k: Int|
+    { slot: k, owner: if b.definition_index < 0 { FreshOwner } else { ParamOwner(k) } });
+  let w = walk({ ..env, moves: b.moves }, b.code, {
+    chain: chain,
+    sites: [],
+    demands: [],
+    escaped: [],
+    reads: [],
+  });
+  {
+    sites: w.state.sites,
+    demands: w.state.demands,
+    used_as_values: w.state.escaped,
+    return_owner: w.owner,
+    reads: w.state.reads,
   }
-
-fn resolve(program: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
-  range(0, program.bodies.len()).fold(
-    start_tables(program.definitions),
-    |accumulator: Tables, i: Int| {
-      let b: Body = program.bodies.get(i);
-      let f: WalkResult = found.get(i);
-      let escaped = f.used_as_values.fold(accumulator, |s: Tables, d: Int|
-        combine_all_params(
-          s,
-          d,
-          UnsureParam({
-            cause: TopLevelValue,
-            text: Bytes::concat_all([
-              b"`",
-              program.definitions.get(d).name,
-              b"` is used as a value in ",
-              b.label,
-              b", so not every caller of it is known",
-            ]),
-          }),
-        ));
-      let demanded = f.demands.fold(escaped, |s: Tables, dm: PassedArgument|
-        combine_param(
-          s,
-          dm.callee,
-          dm.param,
-          interpret(dm.owner, b.definition_index, tables, b.label),
-        ));
-      if b.definition_index < 0 { demanded }
-      else { with_return(demanded, b.definition_index, return_of(f.return_owner)) }
-    },
-  )
-
-fn no_walk_result() -> WalkResult =
-  { sites: [], demands: [], used_as_values: [], return_owner: FreshOwner, reads: [], lookups: [] }
-
-type WalkSource = | Unchanged | MadeThisRun(Int) | Cached(Int) | NeedsWalk
-
-type Run = {
-  prog: Program,
-  found: List<WalkResult>,
-  used_cached: List<List<Int>>,
-  made: List<List<WalkResult>>,
-  whole_program: Option<WholeProgram>,
-  fresh: Map<Int, Bool>,
-  lowered_count: Int,
-  failed: Bool,
 }
 
-type Resolved = { run: Run, tables: Tables, rounds: Int }
+fn walks(prog: Program, tables: Tables) -> List<WalkResult> / {abort.raise} =
+  prog.bodies.map(|b: Body|
+    walk_body({ prog: prog, module: b.module, tables: tables, moves: no_moves() }, b))
 
-fn reads_unchanged(f: WalkResult, rets: List<ReturnOwnership>) -> Bool =
-  f.reads.fold(true, |accumulator: Bool, r: ReturnRead|
-    accumulator && rets.at(r.callee) == Some(r.return_ownership))
+fn with_returns(prog: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
+  range(0, prog.bodies.len()).fold(tables, |accumulator: Tables, i: Int| {
+    let b: Body = prog.bodies.get(i);
+    if b.definition_index < 0 { accumulator } else {
+      { rets: accumulator.rets.set(b.definition_index, return_of(found.get(i).return_owner)) }
+    }
+  })
 
-fn first_valid(
-  walks: List<WalkResult>,
-  rets: List<ReturnOwnership>,
-) -> Option<Int> / {abort.raise} =
-  range(0, walks.len()).fold(None, |accumulator: Option<Int>, j: Int|
-    match accumulator {
-      Some(_) -> accumulator,
-      None -> if reads_unchanged(walks.get(j), rets) { Some(j) } else { None },
-    })
+type Settled = { found: List<WalkResult>, tables: Tables }
 
-fn keys_of(m: Map<Int, Bool>) -> List<Int> =
-  m.fold([], |accumulator: List<Int>, k: Int, _: Bool| accumulator.push(k))
+fn settled_walks(prog: Program, tables: Tables, rounds: Int) -> Settled / {abort.raise} = {
+  let found = walks(prog, tables);
+  let next = with_returns(prog, found, tables);
+  if next == tables || rounds + 1 >= 24 { { found: found, tables: next } }
+  else { settled_walks(prog, next, rounds + 1) }
+}
 
-fn evaluate(p: CostInput, run: Run, which: (Int) -> Bool, tables: Tables) -> Run / {abort.raise} =
-  if run.failed { run } else {
-    let n = run.prog.bodies.len();
-    let tried = range(0, n).map(|i: Int|
-      if !which(i) { Unchanged } else {
-        match first_valid(run.made.get(i), tables.rets) {
-          Some(j) -> MadeThisRun(j),
-          None -> match first_valid(run.prog.bodies.get(i).cached_walks, tables.rets) {
-            Some(j) -> Cached(j),
-            None -> NeedsWalk,
-          },
-        }
-      });
-    let unlowered = range(0, n).fold(Map::new(), |accumulator: Map<Int, Bool>, i: Int|
-      match tried.get(i) {
-        NeedsWalk -> {
-          let b: Body = run.prog.bodies.get(i);
-          if b.lowered { accumulator } else { accumulator.insert(b.module, true) }
-        },
-        _ -> accumulator,
-      });
-    let ready = if unlowered.len() == 0 { run } else { relowered(p, run, keys_of(unlowered)) };
-    if ready.failed { ready } else {
-      let which = range(0, n).filter(|i: Int| match tried.get(i) { NeedsWalk -> true, _ -> false });
-      let found = walks_at_once(
-        { prog: ready.prog, tables: tables, body_indexes: which },
-        0,
-        which.len(),
-        64,
-      );
-      let walks = range(0, which.len()).fold(
-        Map::new(),
-        |accumulator: Map<Int, WalkResult>, k: Int| accumulator.insert(which.get(k), found.get(k)),
-      );
-      let walked = |i: Int| match walks.get(i) { Some(f) -> f, None -> no_walk_result() };
-      {
-        ..ready,
-        found: range(0, n).map(|i: Int|
-          match tried.get(i) {
-            Unchanged -> ready.found.get(i),
-            MadeThisRun(j) -> ready.made.get(i).get(j),
-            Cached(j) -> ready.prog.bodies.get(i).cached_walks.get(j),
-            NeedsWalk -> walked(i),
-          }),
-        used_cached: range(0, n).map(|i: Int| {
-          let took: List<Int> = ready.used_cached.get(i);
-          match tried.get(i) {
-            Cached(j) -> if took.contains(j) { took } else { took.push(j) },
-            _ -> took,
-          }
-        }),
-        made: range(0, n).map(|i: Int|
-          match tried.get(i) {
-            NeedsWalk -> ready.made.get(i).push(walked(i)),
-            _ -> ready.made.get(i),
+fn called_outside(prog: Program, found: List<WalkResult>) -> List<Int> = {
+  let inside = prog.bodies.fold(Map::new(), |accumulator: Map<Int, Bool>, b: Body|
+    accumulator.insert(b.definition_index, true));
+  found.fold(Map::new(), |accumulator: Map<Int, Bool>, f: WalkResult|
+    f.reads.fold(accumulator, |m: Map<Int, Bool>, r: ReturnRead|
+      if inside.contains(r.callee) { m } else { m.insert(r.callee, true) })).keys(
+  )
+}
+
+fn relative(p: CostInput, span: Span) -> Span =
+  { ..span, start: span.start - p.origin, end: span.end - p.origin }
+
+fn walked_body(p: CostInput, prog: Program, b: Body, f: WalkResult) -> WalkedBody / {abort.raise} = {
+  let own = |d: Int| prog.definitions.get(d).own;
+  let name = |d: Int| prog.definitions.get(d).name;
+  {
+    item_kind: b.item_kind,
+    module_name: b.module_name,
+    name: b.name,
+    label: b.label,
+    definition: if b.definition_index < 0 { None } else { Some(name(b.definition_index)) },
+    reuse: match b.reuse { Some(s) -> Some(relative(p, s)), None -> None },
+    sites: f.sites.map(|s: RawSite| { ..s, span: relative(p, s.span) }),
+    demands: f.demands.filter(|d: PassedArgument| own(d.callee)).map(|d: PassedArgument|
+      { callee: name(d.callee), param: d.param, owner: d.owner }),
+    escaped: f.used_as_values.filter(own).map(|d: Int|
+      { callee: name(d), arity: prog.definitions.get(d).arity }),
+    returned: return_of(f.return_owner),
+  }
+}
+
+fn declared_in(p: CostInput, prog: Program) -> List<DeclaredReturn> / {abort.raise} =
+  prog.bodies.fold([], |accumulator: List<DeclaredReturn>, b: Body|
+    if b.definition_index < 0 { accumulator } else {
+      let d: Definition = prog.definitions.get(b.definition_index);
+      match d.declared_return {
+        None -> accumulator,
+        Some(x) ->
+          accumulator.push({
+            module_name: d.module_name,
+            definition: d.name,
+            params: d.params,
+            declared: x.return_type,
+            span: relative(p, x.span),
           }),
       }
-    }
-  }
-
-type WalkBatch = { prog: Program, tables: Tables, body_indexes: List<Int> }
-
-fn walks_at_once(x: WalkBatch, lo: Int, hi: Int, room: Int) -> List<WalkResult> / {abort.raise} =
-  if hi - lo <= 16 {
-    range(lo, hi).map(|k: Int| {
-      let b: Body = x.prog.bodies.get(x.body_indexes.get(k));
-      walk_body({ prog: x.prog, module: b.module, tables: x.tables, moves: no_moves() }, b)
     })
-  } else if room <= 0 {
-    panic("the list of bodies was split in half more times than its length allows")
-  } else {
-    let mid = lo + (hi - lo) / 2;
-    let both = parallel {
-      walks_at_once(x, lo, mid, room - 1),
-      walks_at_once(x, mid, hi, room - 1),
-    };
-    both._0.concat(both._1)
-  }
 
-fn relowered(p: CostInput, run: Run, modules: List<Int>) -> Run / {abort.raise} =
-  match lower(p, run.whole_program, modules, run.prog.index) {
-    None -> { ..run, failed: true },
-    Some(l) -> {
-      let made = range(0, modules.len()).fold(
-        Map::new(),
-        |accumulator: Map<Int, List<Body>>, k: Int|
-          accumulator.insert(modules.get(k), l.bodies.get(k)),
-      );
-      let placed = run.prog.bodies.fold(
-        { bodies: [], seen: Map::new() },
-        |accumulator: { bodies: List<Body>, seen: Map<Int, Int> }, b: Body|
-          match made.get(b.module) {
-            None -> { ..accumulator, bodies: accumulator.bodies.push(b) },
-            Some(lowered) -> {
-              let k = match accumulator.seen.get(b.module) { Some(x) -> x, None -> 0 };
-              match lowered.at(k) {
-                Some(m) -> if m.label != b.label || m.item_kind != b.item_kind {
-                  panic(
-                    "recompiling a module produced different function bodies than the module had before",
-                  )
-                } else {
-                  {
-                    bodies: accumulator.bodies.push({
-                      ..b,
-                      code: m.code,
-                      span: m.span,
-                      moves: m.moves,
-                      lowered: true,
-                    }),
-                    seen: accumulator.seen.insert(b.module, k + 1),
-                  }
-                },
-                None ->
-                  panic(
-                    "a module was lowered to fewer function bodies than the program already contained for it",
-                  ),
-              }
-            },
-          },
-      );
+pub fn walked_group<| e>(
+  p: CostInput,
+  returned: (Bytes) -> ReturnOwnership / {abort.raise | e},
+) -> GroupWalk / {abort.raise | e} =
+  match program_of(p) {
+    None -> { ok: false, bodies: [], declared: [] },
+    Some(prog) -> {
+      let start = start_returns(prog.definitions);
+      let outside = called_outside(prog, walks(prog, start)).filter(|d: Int|
+        prog.definitions.get(d).own);
+      let tables = outside.fold(start, |accumulator: Tables, d: Int|
+        { rets: accumulator.rets.set(d, returned(prog.definitions.get(d).name)) });
+      let settled = settled_walks(prog, tables, 0);
       {
-        ..run,
-        prog: { ..run.prog, r: prefer_whole(l.whole, run.prog.r), bodies: placed.bodies },
-        whole_program: l.whole,
-        lowered_count: run.lowered_count + modules.len(),
+        ok: true,
+        bodies: range(0, prog.bodies.len()).map(|i: Int|
+          walked_body(p, prog, prog.bodies.get(i), settled.found.get(i))),
+        declared: declared_in(p, prog),
       }
     },
   }
 
-fn readers_of(found: List<WalkResult>) -> Map<Int, List<Int>> / {abort.raise} =
-  range(0, found.len()).fold(Map::new(), |accumulator: Map<Int, List<Int>>, i: Int|
-    found.get(i).reads.fold(accumulator, |m: Map<Int, List<Int>>, r: ReturnRead| {
-      let was = match m.get(r.callee) { Some(xs) -> xs, None -> [] };
-      if was.len() > 0 && was.get(was.len() - 1) == i { m } else { m.insert(r.callee, was.push(i)) }
+pub fn demands_of(walked: List<GroupWalk>) -> ModuleDemands =
+  {
+    ok: walked.all(|w: GroupWalk| w.ok),
+    bodies: walked.fold([], |accumulator: List<BodyDemands>, w: GroupWalk|
+      w.bodies.fold(accumulator, |a: List<BodyDemands>, b: WalkedBody|
+        if b.demands.len() == 0 && b.escaped.len() == 0 { a } else {
+          a.push({ caller: b.definition, label: b.label, escaped: b.escaped, demands: b.demands })
+        })),
+  }
+
+fn escaped_from(table: ParamTable, label: Bytes, e: Escape) -> ParamTable / {abort.raise} =
+  range(0, e.arity).fold(table, |accumulator: ParamTable, k: Int|
+    combine_param(
+      accumulator,
+      e.callee,
+      k,
+      UnsureParam({
+        cause: TopLevelValue,
+        text: Bytes::concat_all([
+          b"`",
+          e.callee,
+          b"` is used as a value in ",
+          label,
+          b", so not every caller of it is known",
+        ]),
+      }),
+    ))
+
+fn parameters_round(rollups: List<ModuleDemands>, table: ParamTable) -> ParamTable / {abort.raise} =
+  rollups.fold(Map::new(), |accumulator: ParamTable, m: ModuleDemands|
+    m.bodies.fold(accumulator, |round: ParamTable, b: BodyDemands| {
+      let escaped = b.escaped.fold(round, |s: ParamTable, e: Escape| escaped_from(s, b.label, e));
+      b.demands.fold(escaped, |s: ParamTable, d: Demand|
+        combine_param(s, d.callee, d.param, interpret(d.owner, b.caller, table, b.label)))
     }))
 
-fn moved_readers(readers: Map<Int, List<Int>>, before: Tables, after: Tables) -> Map<Int, Bool> =
-  range(0, after.rets.len()).fold(Map::new(), |accumulator: Map<Int, Bool>, d: Int|
-    if before.rets.at(d) == after.rets.at(d) { accumulator } else {
-      match readers.get(d) {
-        None -> accumulator,
-        Some(xs) -> xs.fold(accumulator, |m: Map<Int, Bool>, i: Int| m.insert(i, true)),
-      }
-    })
-
-fn iterate(
-  p: CostInput,
-  run: Run,
-  readers: Map<Int, List<Int>>,
-  tables: Tables,
+fn settled_parameters(
+  rollups: List<ModuleDemands>,
+  table: ParamTable,
   rounds: Int,
-) -> Resolved / {abort.raise} = {
-  let next = resolve(run.prog, run.found, tables);
-  let moved = moved_readers(readers, tables, next);
-  let walked = evaluate(p, run, |i: Int| moved.contains(i), next);
-  if walked.failed || next == tables || rounds + 1 >= 24 {
-    { run: walked, tables: next, rounds: rounds + 1 }
-  } else { iterate(p, walked, readers, next, rounds + 1) }
+) -> Parameters / {abort.raise} = {
+  let next = parameters_round(rollups, table);
+  if next == table || rounds + 1 >= 24 { { table: next, rounds: rounds + 1 } }
+  else { settled_parameters(rollups, next, rounds + 1) }
 }
+
+pub fn parameters_of(rollups: List<ModuleDemands>) -> Parameters / {abort.raise} =
+  settled_parameters(rollups, Map::new(), 0)
 
 fn suggestion_for(cause: Option<Cause>) -> Bytes =
   match cause {
@@ -1149,7 +1019,16 @@ derive bin for Costed
 derive bin for ReturnMismatch
 derive bin for Report
 
-fn finish(raw: RawSite, definition: Int, tables: Tables) -> Site = {
+fn placed_at(items: List<ItemAt>, relative_position: Int) -> Int =
+  match items.find(|x: ItemAt| x.from <= relative_position && relative_position <= x.from + x.len) {
+    Some(x) -> x.to + relative_position - x.from,
+    None -> relative_position,
+  }
+
+pub fn placed_span(items: List<ItemAt>, span: Span) -> Span =
+  { ..span, start: placed_at(items, span.start), end: placed_at(items, span.end) }
+
+fn finish(raw: RawSite, definition: Option<Bytes>, table: ParamTable) -> Site = {
   let sited = |verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int|
     {
       start: raw.span.start,
@@ -1183,7 +1062,7 @@ fn finish(raw: RawSite, definition: Int, tables: Tables) -> Site = {
         b" is parameter ",
         ascii_of_int(k),
       ]);
-      match param_at(tables, definition, k) {
+      match param_at(table, definition, k) {
         Some(SoleParam) ->
           sited(
             b"reuses",
@@ -1253,7 +1132,7 @@ fn module_bodies(
   let m = setting.module;
   roots.fold([], |a: List<Body>, ir: ItemRoot| {
     let moves = root_moves(s, ir.root);
-    let body = |kind: Bytes, name: Bytes, label: Bytes, definition: Int, span: Span, reuse: Option<Span>|
+    let body = |kind: Bytes, name: Bytes, label: Bytes, definition: Int, reuse: Option<Span>|
       {
         item_kind: kind,
         module: i,
@@ -1262,13 +1141,9 @@ fn module_bodies(
         label: label,
         definition_index: definition,
         arity: ir.root.params.len(),
-        span: span,
-        code: Some(ir.root.code),
+        code: ir.root.code,
         moves: moves,
-        lowered: true,
         reuse: reuse,
-        looked: [],
-        cached_walks: [],
       };
     match ir.item {
       FunctionItem(d) ->
@@ -1278,31 +1153,16 @@ fn module_bodies(
             d.name.name,
             Bytes::concat_all([m, b".", d.name.name]),
             match index.get(qualify(m, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
-            d.span,
             d.reuse,
           ),
         ),
       TestItem(t) ->
         a.push(
-          body(
-            b"test",
-            t.name,
-            Bytes::concat_all([m, b": test ", quoted(t.name)]),
-            0 - 1,
-            t.span,
-            None,
-          ),
+          body(b"test", t.name, Bytes::concat_all([m, b": test ", quoted(t.name)]), 0 - 1, None),
         ),
       LawItem(l) ->
         a.push(
-          body(
-            b"law",
-            l.name,
-            Bytes::concat_all([m, b": law ", quoted(l.name)]),
-            0 - 1,
-            l.span,
-            None,
-          ),
+          body(b"law", l.name, Bytes::concat_all([m, b": law ", quoted(l.name)]), 0 - 1, None),
         ),
       _ -> a,
     }
@@ -1311,7 +1171,6 @@ fn module_bodies(
 
 fn definition_of_function(
   module: Bytes,
-  i: Int,
   own: Bool,
   definition: FnDefinition,
   witnesses: List<Bytes>,
@@ -1319,7 +1178,6 @@ fn definition_of_function(
   let params = witnesses.concat(definition.params.map(|param: Param| param.name.name));
   {
     name: qualify(module, definition.name.name),
-    module_index: i,
     module_name: module,
     params: params,
     arity: params.len(),
@@ -1346,52 +1204,51 @@ fn violates(declared: ReturnOwnership, got: ReturnOwnership) -> Bool =
     _ -> true,
   }
 
-fn return_text(d: Definition, r: ReturnOwnership) -> Bytes =
+fn return_text(params: List<Bytes>, r: ReturnOwnership) -> Bytes =
   match r {
     FreshReturn -> b"fresh",
     ReturnOfParam(k) ->
       Bytes::concat_all([
         b"its parameter `",
-        match d.params.at(k) { Some(n) -> n, None -> ascii_of_int(k) },
+        match params.at(k) { Some(n) -> n, None -> ascii_of_int(k) },
         b"`",
       ]),
     SharedReturn(reason) -> reason.text,
     UnsureReturn(reason) -> reason.text,
   }
 
-fn return_mismatches_of(program: Program, tables: Tables) -> List<ReturnMismatch> / {abort.raise} =
-  range(0, program.definitions.len()).fold([], |accumulator: List<ReturnMismatch>, i: Int| {
-    let d: Definition = program.definitions.get(i);
-    match d.declared_return {
-      None -> accumulator,
-      Some(x) -> if !d.own { accumulator } else {
-        match tables.rets.at(i) {
-          Some(got) -> if !violates(x.return_type, got) { accumulator } else {
-            accumulator.push({
-              module: d.module_index,
-              module_name: d.module_name,
-              name: d.name,
-              start: x.span.start,
-              end: x.span.end,
-              declared: return_text(d, x.return_type),
-              actual: return_text(d, got),
-            })
-          },
-          None -> accumulator,
-        }
-      },
-    }
-  })
-
 fn builtin_names() -> List<Bytes> / {abort.raise} = builtins().map(|b: Builtin| b.name)
 
-pub type CostInput = { analysis: Analysis, sources: List<Bytes>, rows: Rows, facts: InferredFacts }
+pub type CostInput = {
+  modules: List<ParsedModule>,
+  r: Resolution,
+  checked: CheckOutput,
+  module_packages: List<Int>,
+  embeds: List<ModuleEmbed>,
+  rows: Rows,
+  facts: InferredFacts,
+  walked: List<Int>,
+  roots: Option<Map<Bytes, Bool>>,
+  origin: Int,
+}
 
-pub fn cost_input_of(analysis: Analysis, sources: List<Bytes>) -> CostInput / {abort.raise} =
-  { analysis: analysis, sources: sources, rows: rows_of(analysis), facts: inferred_facts(analysis) }
+pub fn cost_input_of(analysis: Analysis) -> CostInput / {abort.raise} =
+  {
+    modules: analysis.modules,
+    r: analysis.r,
+    checked: analysis.checked,
+    module_packages: analysis.module_packages,
+    embeds: analysis.embeds,
+    rows: rows_of(analysis),
+    facts: inferred_facts(analysis),
+    walked: range(0, analysis.modules.len()).filter(|i: Int|
+      own_module(analysis.module_packages, i)),
+    roots: None,
+    origin: 0,
+  }
 
-fn own_module(a: Analysis, i: Int) -> Bool =
-  match a.module_packages.at(i) { Some(k) -> k == 0, None -> true }
+fn own_module(module_packages: List<Int>, i: Int) -> Bool =
+  match module_packages.at(i) { Some(k) -> k == 0, None -> true }
 
 fn places(modules: List<ParsedModule>) -> Map<Bytes, Int> / {abort.raise} =
   range(0, modules.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
@@ -1415,574 +1272,149 @@ fn orders_by_module(
     })
 }
 
-fn definitions_of(a: Analysis, walked: InferredFacts) -> List<Definition> / {abort.raise} = {
-  let orders = orders_by_module(walked, a.modules);
-  range(0, a.modules.len()).fold([], |accumulator: List<Definition>, i: Int| {
-    let m: ParsedModule = a.modules.get(i);
+fn definitions_of(p: CostInput) -> List<Definition> / {abort.raise} = {
+  let orders = orders_by_module(p.facts, p.modules);
+  range(0, p.modules.len()).fold([], |accumulator: List<Definition>, i: Int| {
+    let m: ParsedModule = p.modules.get(i);
     let ws = match orders.get(i) { Some(o) -> o, None -> Map::new() };
     m.module.items.fold(accumulator, |xs: List<Definition>, item: Item|
       match item {
         FunctionItem(d) ->
           xs.push(
-            definition_of_function(m.name, i, own_module(a, i), d, match ws.get(d.name.name) {
-              Some(w) -> w.map(witness_param_name),
-              None -> [],
-            }),
+            definition_of_function(
+              m.name,
+              own_module(p.module_packages, i),
+              d,
+              match ws.get(d.name.name) { Some(w) -> w.map(witness_param_name), None -> [] },
+            ),
           ),
         _ -> xs,
       })
   })
 }
 
-type WholeProgram = { modules: List<ParsedModule>, r: Resolution }
-
-fn whole_program_of(p: CostInput) -> Option<WholeProgram> / {abort.raise} = {
-  let a = p.analysis;
-  let tables = embed_tables(a.embeds);
-  let parsed = range(0, a.modules.len()).map(|i: Int| {
-    let name = a.modules.get(i).name;
-    let source = {
-      name: name,
-      source_text: match p.sources.at(i) { Some(source_text) -> source_text, None -> b"" },
-    };
-    let x = parse_from(
-      i,
-      source,
-      parse(source.source_text),
-      derivations: a.modules.get(i).derived.map(derivation_of),
-    );
-    let e = inline_embeds_by_name(tables, name, x.module.module);
-    {
-      name: name,
-      module: e.module,
-      derived: x.module.derived,
-      bad: x.diagnostics.len() > 0 || e.diagnostics.len() > 0,
-    }
-  });
-  if parsed.fold(false, |accumulator: Bool, x: Parsed| accumulator || x.bad) { None } else {
-    match resolved_as(
-        a,
-        parsed.map(|x: Parsed| { name: x.name, module: x.module, derived: x.derived }),
-      ) {
-      ResolveFailed(_) -> None,
-      ResolveSucceeded(x) -> Some({ modules: x.modules, r: x.resolution }),
-    }
-  }
-}
-
-fn resolved_as(a: Analysis, modules: List<ParsedModule>) -> ResolveOutcome / {abort.raise} = {
-  let shipped = a.packages.len();
-  let packaged = if shipped == 0 { no_packages(modules) } else {
-    {
-      packages: a.packages,
-      module_packages: a.module_packages,
-      std: shipped - 2,
-      compiler: shipped - 1,
-      other_shipped_package: shipped,
-    }
-  };
-  resolve_packaged(
-    modules,
-    packaged.packages,
-    packaged.module_packages,
-    packaged.std,
-    packaged.compiler,
-    packaged.other_shipped_package,
-  )
-}
-
-type Lowered = { bodies: List<List<Body>>, whole: Option<WholeProgram> }
-
-fn lower(
-  p: CostInput,
-  whole: Option<WholeProgram>,
-  wanted: List<Int>,
-  index: Map<Bytes, Int>,
-) -> Option<Lowered> / {abort.raise} =
-  if wanted.len() == 0 { Some({ bodies: [], whole: whole }) } else {
-    let a = p.analysis;
-    let cut = |i: Int| a.stub_cuts.contains(a.modules.get(i).name);
-    let needs = wanted.fold(false, |accumulator: Bool, i: Int| accumulator || cut(i));
-    let taken = match whole {
-      Some(_) -> whole,
-      None -> if needs { whole_program_of(p) } else { None },
-    };
-    let missing = match taken { Some(_) -> false, None -> needs };
-    if missing { None } else {
-      let tables = embed_tables(a.embeds);
-      let wants = wanted.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
-      let read = range(0, a.modules.len()).fold(
-        { modules: [], bad: false },
-        |accumulator: { modules: List<ParsedModule>, bad: Bool }, i: Int|
-          if !wants.contains(i) {
-            { ..accumulator, modules: accumulator.modules.push(a.modules.get(i)) }
-          } else if cut(i) {
-            {
-              ..accumulator,
-              modules: accumulator.modules.push(match taken {
-                Some(w) -> w.modules.get(i),
-                None -> a.modules.get(i),
-              }),
-            }
-          } else {
-            let m: ParsedModule = a.modules.get(i);
-            let e = inline_embeds_by_name(tables, m.name, m.module);
-            {
-              modules: accumulator.modules.push({ ..m, module: e.module }),
-              bad: accumulator.bad || e.diagnostics.len() > 0,
-            }
-          },
-      );
-      if read.bad { None } else {
-        let natives = parsed_natives(a.modules).map(|e: Extern| e.name);
-        let resolved = match taken { Some(w) -> { ..a, r: w.r }, None -> a };
-        match module_contexts_in(
-            resolved,
-            p.rows,
-            p.facts,
-            read.modules,
-            wanted,
-            |i: Int, s: ModuleContext, roots: List<ItemRoot>|
-              module_bodies(i, s, roots, natives, index),
-          ) {
-          Err(_) -> None,
-          Ok(bodies) -> Some({ bodies: bodies, whole: taken }),
+fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / {abort.raise} = {
+  let tables = embed_tables(p.embeds);
+  let wants = p.walked.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
+  let read = range(0, p.modules.len()).fold(
+    { modules: [], bad: false },
+    |accumulator: { modules: List<ParsedModule>, bad: Bool }, i: Int| {
+      let m: ParsedModule = p.modules.get(i);
+      if !wants.contains(i) { { ..accumulator, modules: accumulator.modules.push(m) } } else {
+        let e = inline_embeds_by_name(tables, m.name, m.module);
+        {
+          modules: accumulator.modules.push({ ..m, module: e.module }),
+          bad: accumulator.bad || e.diagnostics.len() > 0,
         }
       }
-    }
-  }
-
-fn found_of(index: Map<Bytes, Int>, w: CachedWalk) -> Option<WalkResult> = {
-  let reads = w.reads.fold(Some([]), |accumulator: Option<List<ReturnRead>>, r: CachedRead|
-    match ((accumulator, index.get(r.callee))) {
-      (Some(xs), Some(d)) -> Some(xs.push({ callee: d, return_ownership: r.return_ownership })),
-      _ -> None,
-    });
-  let demands = w.demands.fold(
-    Some([]),
-    |accumulator: Option<List<PassedArgument>>, x: CachedDemand|
-      match ((accumulator, index.get(x.callee))) {
-        (Some(xs), Some(d)) -> Some(xs.push({ callee: d, param: x.param, owner: x.owner })),
-        _ -> None,
-      },
-  );
-  let escaped = w.escaped.fold(Some([]), |accumulator: Option<List<Int>>, name: Bytes|
-    match ((accumulator, index.get(name))) { (Some(xs), Some(d)) -> Some(xs.push(d)), _ -> None });
-  match ((reads, demands, escaped)) {
-    (Some(r), Some(d), Some(e)) ->
-      Some({
-        sites: w.sites,
-        demands: d,
-        used_as_values: e,
-        return_owner: w.return_owner,
-        reads: r,
-        lookups: [],
-      }),
-    _ -> None,
-  }
-}
-
-fn cached_body(prog: Program, i: Int, module_name: Bytes, k: CachedBody) -> Option<Body> = {
-  let definition = match k.definition { None -> Some(0 - 1), Some(name) -> prog.index.get(name) };
-  match definition {
-    None -> None,
-    Some(d) -> {
-      let lookups_unchanged = k.lookups.fold(true, |accumulator: Bool, l: CachedLookup|
-        accumulator
-          && (match l.bound {
-            None -> true,
-            Some(q) -> prog.index.contains(q) == l.has_definition,
-          }));
-      Some({
-        item_kind: k.kind,
-        module: i,
-        module_name: module_name,
-        name: k.name,
-        label: k.label,
-        definition_index: d,
-        arity: k.arity,
-        span: dummy_span(),
-        code: None,
-        moves: no_moves(),
-        lowered: false,
-        reuse: k.reuse,
-        looked: k.lookups,
-        cached_walks: if !lookups_unchanged { [] } else {
-          k.walks.fold([], |accumulator: List<WalkResult>, w: CachedWalk|
-            match found_of(prog.index, w) { Some(f) -> accumulator.push(f), None -> accumulator })
-        },
-      })
     },
-  }
-}
-
-fn cached_bodies(
-  prog: Program,
-  i: Int,
-  module_name: Bytes,
-  bytes: Bytes,
-) -> Option<List<Body>> / {abort.raise} =
-  match bin::decode(bytes, cached_module_bin()) {
-    Err(_) -> None,
-    Ok(m) ->
-      m.bodies.fold(Some([]), |accumulator: Option<List<Body>>, k: CachedBody|
-        match accumulator {
+  );
+  if read.bad { None } else {
+    let natives = parsed_natives(p.modules).map(|e: Extern| e.name);
+    match module_contexts_in(
+        p.r,
+        p.checked,
+        p.rows,
+        p.facts,
+        read.modules,
+        p.walked,
+        |i: Int, s: ModuleContext, roots: List<ItemRoot>|
+          module_bodies(i, s, roots, natives, index),
+        match p.roots {
           None -> None,
-          Some(bs) -> match cached_body(prog, i, module_name, k) {
-            Some(b) -> Some(bs.push(b)),
-            None -> None,
-          },
-        }),
-  }
-
-fn prefer_whole(whole: Option<WholeProgram>, r: Resolution) -> Resolution =
-  match whole { Some(w) -> w.r, None -> r }
-
-fn failed_run(prog: Program) -> Run =
-  {
-    prog: prog,
-    found: [],
-    used_cached: [],
-    made: [],
-    whole_program: None,
-    fresh: Map::new(),
-    lowered_count: 0,
-    failed: true,
-  }
-
-fn initial_run(p: CostInput, stored_modules: List<Option<Bytes>>) -> Run / {abort.raise} = {
-  let a = p.analysis;
-  let definitions = definitions_of(a, p.facts);
-  let base = {
-    r: a.r,
-    index: range(0, definitions.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
-      accumulator.insert(definitions.get(i).name, i)),
-    builtins: builtin_names().fold(Map::new(), |accumulator: Map<Bytes, Bool>, b: Bytes|
-      accumulator.insert(b, true)),
-    definitions: definitions,
-    bodies: [],
-  };
-  let container_name = range(0, a.modules.len()).map(|i: Int|
-    if !own_module(a, i) { None } else {
-      match stored_modules.at(i) {
-        Some(Some(bytes)) -> cached_bodies(base, i, a.modules.get(i).name, bytes),
-        _ -> None,
-      }
-    });
-  let missed = range(0, a.modules.len()).filter(|i: Int|
-    own_module(a, i) && (match container_name.get(i) { Some(_) -> false, None -> true }));
-  match lower(p, None, missed, base.index) {
-    None -> failed_run(base),
-    Some(l) -> {
-      let fresh = range(0, missed.len()).fold(
-        Map::new(),
-        |accumulator: Map<Int, List<Body>>, k: Int|
-          accumulator.insert(missed.get(k), l.bodies.get(k)),
-      );
-      let bodies = range(0, a.modules.len()).fold([], |accumulator: List<Body>, i: Int|
-        match container_name.get(i) {
-          Some(bs) -> accumulator.concat(bs),
-          None -> match fresh.get(i) { Some(bs) -> accumulator.concat(bs), None -> accumulator },
-        });
-      let none: List<Int> = [];
-      let unmade: List<WalkResult> = [];
-      {
-        prog: { ..base, r: prefer_whole(l.whole, base.r), bodies: bodies },
-        found: bodies.map(|_: Body| no_walk_result()),
-        used_cached: bodies.map(|_: Body| none),
-        made: bodies.map(|_: Body| unmade),
-        whole_program: l.whole,
-        fresh: missed.fold(Map::new(), |accumulator: Map<Int, Bool>, i: Int|
-          accumulator.insert(i, true)),
-        lowered_count: missed.len(),
-        failed: false,
-      }
-    },
-  }
-}
-
-fn to_cached_walk(prog: Program, f: WalkResult) -> CachedWalk / {abort.raise} = {
-  let name = |d: Int| prog.definitions.get(d).name;
-  {
-    reads: f.reads.map(|r: ReturnRead|
-      { callee: name(r.callee), return_ownership: r.return_ownership }),
-    sites: f.sites,
-    demands: f.demands.map(|x: PassedArgument|
-      { callee: name(x.callee), param: x.param, owner: x.owner }),
-    escaped: f.used_as_values.map(|d: Int| name(d)),
-    return_owner: f.return_owner,
-  }
-}
-
-fn looked_of(f: WalkResult) -> List<CachedLookup> =
-  f.lookups.fold(Map::new(), |accumulator: Map<Bytes, CachedLookup>, l: NameLookup|
-    accumulator.insert(l.name, {
-      name: l.name,
-      bound: l.bound,
-      has_definition: l.has_definition != None,
-    })).fold([], |accumulator: List<CachedLookup>, _: Bytes, l: CachedLookup| accumulator.push(l))
-
-fn to_cached_body(run: Run, i: Int) -> CachedBody / {abort.raise} = {
-  let b: Body = run.prog.bodies.get(i);
-  let made: List<WalkResult> = run.made.get(i);
-  {
-    kind: b.item_kind,
-    name: b.name,
-    label: b.label,
-    definition: if b.definition_index < 0 { None }
-    else { Some(run.prog.definitions.get(b.definition_index).name) },
-    arity: b.arity,
-    reuse: b.reuse,
-    lookups: match made.at(0) { Some(f) -> looked_of(f), None -> b.looked },
-    walks: run.used_cached.get(i).map(|j: Int|
-      to_cached_walk(run.prog, b.cached_walks.get(j))).concat(
-      made.map(|f: WalkResult| to_cached_walk(run.prog, f)),
-    ),
-  }
-}
-
-fn own_sites(f: WalkResult, span: Span) -> Bool =
-  f.sites.fold(true, |accumulator: Bool, s: RawSite|
-    accumulator && s.span.start >= span.start && s.span.end <= span.end)
-
-fn cache_entries(run: Run, n: Int) -> List<Option<Bytes>> / {abort.raise} = {
-  let prog = run.prog;
-  let by_module = range(0, prog.bodies.len()).fold(
-    Map::new(),
-    |accumulator: Map<Int, List<Int>>, i: Int| {
-      let m = prog.bodies.get(i).module;
-      accumulator.insert(m, List::push(match accumulator.get(m) { Some(xs) -> xs, None -> [] }, i))
-    },
-  );
-  range(0, n).map(|m: Int| {
-    let xs = match by_module.get(m) { Some(xs) -> xs, None -> [] };
-    let moved = run.fresh.contains(m)
-      || xs.fold(false, |accumulator: Bool, i: Int|
-        accumulator || run.made.get(i).len() > 0
-          || run.used_cached.get(i).len() < prog.bodies.get(i).cached_walks.len());
-    let own = xs.fold(true, |accumulator: Bool, i: Int|
-      accumulator
-        && run.made.get(i).fold(true, |ok: Bool, f: WalkResult|
-          ok && own_sites(f, prog.bodies.get(i).span)));
-    if !moved || !own { None } else {
-      Some(bin::encode({ bodies: xs.map(|i: Int| to_cached_body(run, i)) }, cached_module_bin()))
+          Some(roots) ->
+            Some({
+              roots: roots,
+              modules: p.walked.fold(Map::new(), |m: Map<Bytes, Bool>, i: Int|
+                m.insert(p.modules.get(i).name, true)),
+            }),
+        },
+      ) {
+      Err(_) -> None,
+      Ok(bodies) -> Some(bodies.fold([], |a: List<Body>, b: List<Body>| a.concat(b))),
     }
-  })
+  }
 }
 
-fn report_of(run: Run, tables: Tables, rounds: Int) -> Report / {abort.raise} = {
-  let prog = run.prog;
-  {
-    ok: true,
-    rounds: rounds,
-    definitions: range(0, prog.bodies.len()).fold([], |accumulator: List<Costed>, i: Int| {
-      let b: Body = prog.bodies.get(i);
-      let f: WalkResult = run.found.get(i);
-      if f.sites.len() == 0 { accumulator } else {
+fn program_of(p: CostInput) -> Option<Program> / {abort.raise} = {
+  let definitions = definitions_of(p);
+  let index = range(0, definitions.len()).fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Int>, i: Int| accumulator.insert(definitions.get(i).name, i),
+  );
+  match lowered_bodies(p, index) {
+    None -> None,
+    Some(bodies) ->
+      Some({
+        index: index,
+        builtins: builtin_names().fold(Map::new(), |accumulator: Map<Bytes, Bool>, b: Bytes|
+          accumulator.insert(b, true)),
+        definitions: definitions,
+        bodies: bodies,
+      }),
+  }
+}
+
+pub type PlacedWalk = { items: List<ItemAt>, walk: GroupWalk }
+
+fn costed_in(table: ParamTable, placed: PlacedWalk) -> List<Costed> =
+  placed.walk.bodies.fold([], |accumulator: List<Costed>, b: WalkedBody|
+    if b.sites.len() == 0 { accumulator } else {
+      accumulator.push({
+        item_kind: b.item_kind,
+        module: 0,
+        module_name: b.module_name,
+        name: b.name,
+        label: b.label,
+        reuse_keyword: match b.reuse {
+          Some(s) -> Some(placed_span(placed.items, s)),
+          None -> None,
+        },
+        sites: b.sites.map(|raw: RawSite|
+          finish({ ..raw, span: placed_span(placed.items, raw.span) }, b.definition, table)),
+      })
+    })
+
+fn mismatches_in(placed: PlacedWalk) -> List<ReturnMismatch> =
+  placed.walk.declared.fold([], |accumulator: List<ReturnMismatch>, d: DeclaredReturn|
+    match placed.walk.bodies.find(|b: WalkedBody| b.definition == Some(d.definition)) {
+      None -> accumulator,
+      Some(b) -> if !violates(d.declared, b.returned) { accumulator } else {
+        let at = placed_span(placed.items, d.span);
         accumulator.push({
-          item_kind: b.item_kind,
-          module: b.module,
-          module_name: b.module_name,
-          name: b.name,
-          label: b.label,
-          reuse_keyword: b.reuse,
-          sites: f.sites.map(|raw: RawSite| finish(raw, b.definition_index, tables)),
+          module: 0,
+          module_name: d.module_name,
+          name: d.definition,
+          start: at.start,
+          end: at.end,
+          declared: return_text(d.params, d.declared),
+          actual: return_text(d.params, b.returned),
         })
-      }
-    }),
-    return_mismatches: return_mismatches_of(prog, tables),
-  }
-}
-
-pub type Costing = {
-  report: Report,
-  cached: List<Option<Bytes>>,
-  walked_modules: Int,
-  lowered: Int,
-}
-
-pub fn costs(p: CostInput, stored_modules: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
-  let n = p.analysis.modules.len();
-  let rejected = {
-    report: { ok: false, rounds: 0, definitions: [], return_mismatches: [] },
-    cached: range(0, n).map(|_: Int| None),
-    walked_modules: 0,
-    lowered: 0,
-  };
-  let start = initial_run(p, stored_modules);
-  let tables = start_tables(start.prog.definitions);
-  let first = evaluate(p, start, |_: Int| true, tables);
-  if first.failed { rejected } else {
-    let resolved = iterate(p, first, readers_of(first.found), tables, 0);
-    if resolved.run.failed { rejected } else {
-      {
-        report: report_of(resolved.run, resolved.tables, resolved.rounds),
-        cached: cache_entries(resolved.run, n),
-        walked_modules: resolved.run.made.fold(0, |accumulator: Int, xs: List<WalkResult>|
-          if xs.len() > 0 { accumulator + 1 } else { accumulator }),
-        lowered: resolved.run.lowered_count,
-      }
-    }
-  }
-}
-
-pub fn cost_keys(p: CostInput, identity: Bytes) -> List<Bytes> / {abort.raise} = {
-  let a = p.analysis;
-  let owns = a.hashes.own.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, o: { name: Bytes, hash: Bytes }|
-      accumulator.insert(o.name, o.hash),
-  );
-  let definitions = p.rows.definitions.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, r: KnownDefinitionRow|
-      accumulator.insert(r.name, blake3(r.facts)),
-  );
-  let tests = p.rows.tests.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, r: KnownTestRow|
-    accumulator.insert(r.owner, blake3(r.body_facts)));
-  let embeds = embeds_by_module(a.embeds);
-  let loose = laws_by_module(p.facts, a.modules);
-  let orders = orders_by_module(p.facts, a.modules);
-  let head = Bytes::concat_all([
-    b"ply.costs.module.1\x00",
-    hex(bin::shape_digest(cached_module_bin())),
-    b"\x00",
-    identity,
-    b"\x00",
-  ]);
-  let entry = |m: Map<Bytes, Bytes>, k: Bytes| match m.get(k) { Some(x) -> x, None -> b"!" };
-  range(0, a.modules.len()).map(|i: Int| {
-    let m: ParsedModule = a.modules.get(i);
-    let items = m.module.items.fold(
-      { parts: [], formless: false },
-      |x: { parts: List<Bytes>, formless: Bool }, item: Item|
-        match item {
-          FunctionItem(d) -> {
-            let name = qualify(m.name, d.name.name);
-            match owns.get(name) {
-              None -> { ..x, formless: true },
-              Some(own) ->
-                {
-                  ..x,
-                  parts: x.parts.push(
-                    Bytes::concat_all([
-                      b"f",
-                      name,
-                      b"\x00",
-                      own,
-                      b"\x00",
-                      entry(definitions, name),
-                    ]),
-                  ),
-                },
-            }
-          },
-          TestItem(d) -> {
-            let owner = test_owner(m.name, d.name);
-            match a.hashes.test_texts.get(qualify(m.name, d.name)) {
-              None -> { ..x, formless: true },
-              Some(own) ->
-                {
-                  ..x,
-                  parts: x.parts.push(
-                    Bytes::concat_all([b"t", owner, b"\x00", own, b"\x00", entry(tests, owner)]),
-                  ),
-                },
-            }
-          },
-          LawItem(d) -> match a.hashes.law_texts.get(qualify(m.name, d.name)) {
-            None -> { ..x, formless: true },
-            Some(own) -> { ..x, parts: x.parts.push(b"l".concat(own)) },
-          },
-          _ -> x,
-        },
-    );
-    if !own_module(a, i) || items.formless { b"" } else {
-      hex(
-        blake3(
-          Bytes::concat_all([
-            head,
-            m.name,
-            b"\x00",
-            blake3(match p.sources.at(i) { Some(source) -> source, None -> b"" }),
-            b"\x00",
-            match embeds.get(m.name) { Some(e) -> e, None -> b"" },
-            b"\x00",
-            Bytes::concat_all(items.parts.map(|part: Bytes| part.concat(b"\x00"))),
-            b"\x00",
-            match loose.get(i) { Some(l) -> l, None -> b"" },
-            b"\x00",
-            match orders.get(i) {
-              Some(o) ->
-                o.fold(b"", |accumulator2: Bytes, name: Bytes, params: List<Bytes>|
-                  Bytes::concat_all([
-                    accumulator2,
-                    name,
-                    b"(",
-                    Bytes::concat_all(params.map(|q: Bytes| q.concat(b","))),
-                    b")",
-                  ])),
-              None -> b"",
-            },
-          ]),
-        ),
-      )
-    }
-  })
-}
-
-fn embeds_by_module(embeds: List<ModuleEmbed>) -> Map<Bytes, Bytes> =
-  embeds.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, e: ModuleEmbed|
-    accumulator.insert(
-      e.module,
-      Bytes::concat_all([
-        match accumulator.get(e.module) { Some(was) -> was, None -> b"" },
-        e.key,
-        b"\x00",
-        match e.read {
-          Ok(files) ->
-            Bytes::concat_all(
-              files.map(|f: EmbedFile| Bytes::concat_all([f.name, b"\x00", f.digest, b"\x00"])),
-            ),
-          Err(reason) -> b"!".concat(reason),
-        },
-        b"\x00",
-      ]),
-    ))
-
-fn laws_by_module(
-  w: InferredFacts,
-  modules: List<ParsedModule>,
-) -> Map<Int, Bytes> / {abort.raise} = {
-  let here = range(0, modules.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int| {
-    let m = modules.get(i);
-    m.module.items.fold(accumulator, |a: Map<Bytes, Int>, item: Item|
-      match item { LawItem(l) -> a.insert(law_owner(m.name, l.name), i), _ -> a })
-  });
-  w.law_facts.fold(
-    Map::new(),
-    |accumulator: Map<Int, Bytes>, l: { owner: Bytes, facts: BodyFacts }|
-      match here.get(l.owner) {
-        None -> accumulator,
-        Some(i) ->
-          accumulator.insert(
-            i,
-            Bytes::concat_all([
-              match accumulator.get(i) { Some(was) -> was, None -> b"" },
-              l.owner,
-              b"\x00",
-              bin::encode(recorded_facts_of(l.facts), body_facts_bin()),
-            ]),
-          ),
       },
-  )
-}
+    })
 
-fn recorded_facts_of(f: BodyFacts) -> BodyFacts / {abort.raise} =
+fn first_site(c: Costed) -> Int = match c.sites.at(0) { Some(s) -> s.start, None -> 0 }
+
+pub fn module_costs(walks: List<PlacedWalk>, parameters: Parameters) -> Report =
   {
-    members: f.members.map(|x: MemberSite| { ..x, module: 0 }),
-    types: types_named(f.types, f.bodies),
-    bodies: f.bodies.map(|x: TypedBody<Bytes>| { ..x, module: 0 }),
+    ok: walks.all(|w: PlacedWalk| w.walk.ok),
+    rounds: parameters.rounds,
+    definitions: walks.fold([], |accumulator: List<Costed>, w: PlacedWalk|
+      accumulator.concat(costed_in(parameters.table, w))).sort_by(|a: Costed, b: Costed|
+      first_site(a) <= first_site(b)),
+    return_mismatches: walks.fold([], |accumulator: List<ReturnMismatch>, w: PlacedWalk|
+      accumulator.concat(mismatches_in(w))).sort_by(|a: ReturnMismatch, b: ReturnMismatch|
+      a.start <= b.start),
+  }
+
+pub fn report_of(modules: List<Report>) -> Report =
+  {
+    ok: modules.all(|m: Report| m.ok),
+    rounds: match modules.at(0) { Some(m) -> m.rounds, None -> 0 },
+    definitions: modules.fold([], |accumulator: List<Costed>, m: Report|
+      accumulator.concat(m.definitions)),
+    return_mismatches: modules.fold([], |accumulator: List<ReturnMismatch>, m: Report|
+      accumulator.concat(m.return_mismatches)),
   }
 
 fn checked_cost_input(
@@ -1997,20 +1429,23 @@ fn checked_cost_input(
     ) {
     Rejected(_) -> panic("the checker rejected a program that should be valid"),
     Analysed(w) ->
-      cost_input_of(
-        {
-          ..w,
-          module_packages: module_packages.concat(w.module_packages.drop(module_packages.len())),
-        },
-        sources,
-      ),
+      cost_input_of({
+        ..w,
+        module_packages: module_packages.concat(w.module_packages.drop(module_packages.len())),
+      }),
   }
+
+pub fn report_over_one_walk(p: CostInput) -> Report / {abort.raise} = {
+  let walked = walked_group(p, |_: Bytes| FreshReturn);
+  report_of([module_costs([{ items: [], walk: walked }], parameters_of([demands_of([walked])]))])
+}
 
 fn reported(
   names: List<Bytes>,
   sources: List<Bytes>,
   module_packages: List<Int> = [],
-) -> Report / {abort.raise} = costs(checked_cost_input(names, sources, module_packages)).report
+) -> Report / {abort.raise} =
+  report_over_one_walk(checked_cost_input(names, sources, module_packages))
 
 test "a cost report gives each update's source location, whether it copies or reuses, the reason, and an edit that would avoid the copy" {
   let source = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match m.get(0) { Some(xs) -> xs.push(n), None -> [] }\n";
@@ -2151,145 +1586,45 @@ test "`fold` is treated as returning whatever its callback returns" {
   assert_eq(r.return_mismatches, [])
 }
 
-fn costed_over(
-  store: Map<Bytes, Bytes>,
-  p: CostInput,
-) -> { costing: Costing, store: Map<Bytes, Bytes> } / {abort.raise} = {
-  let keys = cost_keys(p, b"checker");
-  let c = costs(p, keys.map(|k: Bytes| if k.len() == 0 { None } else { store.get(k) }));
-  {
-    costing: c,
-    store: range(0, keys.len()).fold(store, |accumulator: Map<Bytes, Bytes>, i: Int|
-      match c.cached.at(i) {
-        Some(Some(bytes)) -> accumulator.insert(keys.get(i), bytes),
-        _ -> accumulator,
-      }),
-  }
+test "a callee in another body is read through the given return, and a demand names the callee" {
+  let source = b"pub fn kept(xs: List<Int>) -> List<Int> = xs\nfn grow(xs: List<Int>, n: Int) -> List<Int> = kept(xs).push(n)\n";
+  let p = checked_cost_input([b"m"], [source]);
+  let only_grow = { ..p, roots: Some(Map::new().insert(b"m.grow", true)) };
+  let walked = walked_group(only_grow, |name: Bytes|
+    if name == b"m.kept" { ReturnOfParam(0) } else { FreshReturn });
+  assert_eq(walked.bodies.map(|b: WalkedBody| b.definition), [Some(b"m.grow")]);
+  assert_eq(walked.bodies.get(0).demands, [{ callee: b"m.kept", param: 0, owner: ParamOwner(0) }])
 }
 
-fn three_module_program(mk: Bytes) -> CostInput / {abort.raise} =
-  checked_cost_input([b"a", b"b", b"c"], [
-    b"pub fn table() -> Map<Int, List<Int>> = Map::new()\npub fn keep(xs: List<Int>) -> List<Int> = xs\n".concat(
-      mk,
-    ),
-    b"import a (mk, keep)\nfn grow(n: Int) -> List<Int> = mk(n).push(n)\nfn hold(xs: List<Int>, n: Int) -> List<Int> = keep(xs).push(n)\ntest \"grows\" { assert_eq(grow(1), [0, 1]) }\n",
-    b"fn solo(xs: List<Int>) -> List<Int> = xs.push(1)\n",
-  ])
-
-fn made_fresh() -> Bytes = b"pub fn mk(n: Int) -> List<Int> = range(0, n)\n"
-
-fn made_shared() -> Bytes =
-  b"pub fn mk(n: Int) -> List<Int> = match table().get(0) { Some(xs) -> xs, None -> range(0, n) }\n"
-
-test "a cost run that reuses stored results from earlier runs gives the same report as a fresh run and reanalyzes only the changed modules" {
-  let first = costed_over(Map::new(), three_module_program(made_fresh()));
-  assert(first.costing.walked_modules > 0 && first.costing.lowered > 0);
-  let again = costed_over(first.store, three_module_program(made_fresh()));
-  assert_eq(again.costing.report, first.costing.report);
-  assert_eq([again.costing.walked_modules, again.costing.lowered], [0, 0]);
-  let shared = three_module_program(made_shared());
-  let moved = costed_over(again.store, shared);
-  assert_eq(moved.costing.report, costs(shared).report);
-  assert_eq(verdicts(moved.costing.report), [b"grow copies", b"hold reuses", b"solo reuses"]);
-  assert(
-    moved.costing.walked_modules > 0 && moved.costing.walked_modules < first.costing.walked_modules,
-  );
-  assert(moved.costing.lowered < first.costing.lowered);
-  let back = costed_over(moved.store, three_module_program(made_fresh()));
-  assert_eq(back.costing.report, first.costing.report);
-  assert_eq([back.costing.walked_modules, back.costing.lowered], [0, 0])
-}
-
-fn std_cost_input(user: List<Source>, shipped: List<Source>) -> CostInput / {abort.raise} = {
-  let texts = user.concat(shipped).fold(
-    Map::new().insert(prelude_module(), prelude_source::text()),
-    |accumulator: Map<Bytes, Bytes>, x: Source| accumulator.insert(x.name, x.source_text),
-  );
-  match analyse_pulling_std(user, shipped).out {
-    Rejected(_) -> panic("the checker rejected a program that should be valid"),
-    Analysed(w) ->
-      cost_input_of(
-        w,
-        w.modules.map(|m: ParsedModule|
-          match texts.get(m.name) { Some(source) -> source, None -> b"" }),
-      ),
-  }
-}
-
-fn as_stub(whole: CostInput, name: Bytes) -> CostInput / {abort.raise} = {
-  let a = whole.analysis;
-  let i = range(0, a.modules.len()).fold(0, |accumulator: Int, k: Int|
-    if a.modules.get(k).name == name { k } else { accumulator });
-  let cuts = cuts_of(a.modules.get(i)).filter(|c: Cut| c.name.len() > 0);
-  let stub = parse_at(i, {
-    name: name,
-    source_text: blank_cuts(whole.sources.get(i), cuts),
-  }).module;
-  match resolved_as(
-      a,
-      range(0, a.modules.len()).map(|k: Int| if k == i { stub } else { a.modules.get(k) }),
-    ) {
-    ResolveFailed(_) -> panic("name resolution failed after replacing the module with its stub"),
-    ResolveSucceeded(x) ->
+test "parameters stay sole until a caller's demand reaches them through its own parameter" {
+  let rollup: ModuleDemands = {
+    ok: true,
+    bodies: [
       {
-        ..whole,
-        analysis: {
-          ..a,
-          modules: x.modules,
-          r: x.resolution,
-          stub_cuts: Map::new().insert(name, cuts),
-        },
-      },
-  }
-}
-
-fn interpolating(mk: Bytes) -> CostInput / {abort.raise} =
-  std_cost_input(
-    [
-      {
-        name: b"a",
-        source_text: b"pub fn table() -> Map<Int, List<Int>> = Map::new()\n".concat(mk),
+        caller: Some(b"m.outer"),
+        label: b"m.outer",
+        escaped: [],
+        demands: [{ callee: b"m.inner", param: 0, owner: ParamOwner(0) }],
       },
       {
-        name: b"b",
-        source_text: b"import a (mk)\nfn grow(n: Int) -> List<Int> = mk(String::len(f\"{n}\")).push(n)\nfn told(xs: List<Int>, n: Int) -> List<Int> = xs.push(String::len(f\"{n}\"))\n",
+        caller: None,
+        label: b"m: test",
+        escaped: [],
+        demands: [
+          {
+            callee: b"m.outer",
+            param: 0,
+            owner: SharedOwner({ cause: ReadAgain, text: b"read again" }),
+          },
+        ],
       },
     ],
-    [{ name: b"std.show", source_text: b"pub fn display(n: Int) -> String = n.to_string()\n" }],
-  )
-
-test "a module supplied only as a stub is lowered from its source and analyzed in full, like a module supplied whole" {
-  let first = costed_over(Map::new(), interpolating(made_fresh()));
-  let shared = interpolating(made_shared());
-  let stubbed_b = as_stub(shared, b"b");
-  assert_eq(costs(stubbed_b).report, costs(shared).report);
-  let moved = costed_over(first.store, stubbed_b);
-  assert_eq(moved.costing.report, costs(shared).report);
-  assert_eq([moved.costing.walked_modules, moved.costing.lowered], [3, 2]);
-  let key = cost_keys(shared, b"checker").get(1);
-  assert_eq(moved.store.get(key), costed_over(first.store, shared).store.get(key))
-}
-
-test "a stored analysis of a module is discarded when a name its body looks up no longer refers to a definition" {
-  let p = three_module_program(made_fresh());
-  let first = costed_over(Map::new(), p);
-  let key = cost_keys(p, b"checker").get(1);
-  let stored_module = match first.store.get(key) {
-    Some(bytes) -> match bin::decode(bytes, cached_module_bin()) {
-      Ok(m) -> m,
-      Err(_) -> panic("a kept entry decodes"),
-    },
-    None -> panic("the module's entry is kept"),
   };
-  let renamed = {
-    bodies: stored_module.bodies.map(|k: CachedBody|
-      {
-        ..k,
-        lookups: k.lookups.map(|l: CachedLookup|
-          if l.name == b"a.mk" { { ..l, has_definition: false } } else { l }),
-      }),
-  };
-  let again = costed_over(first.store.insert(key, bin::encode(renamed, cached_module_bin())), p);
-  assert_eq(again.costing.report, first.costing.report);
-  assert_eq([again.costing.walked_modules, again.costing.lowered], [1, 1])
+  let settled = parameters_of([rollup]);
+  assert(settled.rounds > 1);
+  assert(match param_at(settled.table, Some(b"m.inner"), 0) {
+    Some(SharedParam(_)) -> true,
+    _ -> false,
+  });
+  assert_eq(param_at(settled.table, Some(b"m.other"), 0), Some(SoleParam))
 }

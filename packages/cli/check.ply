@@ -4,12 +4,12 @@ import compiler.unit (shipped)
 import std.random (entropy)
 import builder (builder)
 import args (Flags, style_of)
-import update_costs (costs_of, cost_checker, has_promises, report_reuse_violations, report_lines,
-                     unresolved)
+import update_costs (Promises, cost_checker, has_promises, promise_errors, promises_of,
+                     report_lines, unresolved)
 import literals (evaluation, evaluation_errors)
 import diagnostic (SourceText, all_to_json, to_text)
 import program (Program, TimedLoad, ModuleReport, timed_load, module_reports, definitions_in_order,
-                own_tests, location_of, whole_of, no_program, program_view, clean_summary)
+                own_tests, location_of, no_program, program_view, clean_summary)
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.cc (toolchain)
 import compiler.store.hash.encoding (hex)
@@ -19,7 +19,7 @@ import signature (SetLine, Provenance, counted_lines, effect_sets, head_lines, p
                   provenance_lines, set_lines, effect_texts, raise_text, raise_kind)
 import signature
 import std.term (Style, bold, dim, green, plain)
-import compiler.emit.costs (Report, Costing)
+import compiler.emit.costs (Report)
 import compiler.check.termination (Terminates, TerminatesByDecreases, Diverges, Site)
 import compiler.front.facts (CheckedProgram, Frame, written_functions_of, tests_of)
 import compiler.front.rows (Outline)
@@ -128,26 +128,17 @@ fn tally_lines(style: Style, program: Program) -> List<String> =
         ++ (if t.lost > 0 { ", " ++ t.lost.to_string() ++ " not kept" } else { "" })),
   )
 
-fn cost_lines(style: Style, pass: Option<Costing>) -> List<String> / {abort.raise} =
-  match pass {
+fn cost_lines(style: Style, pass: Promises) -> List<String> / {abort.raise} =
+  match pass.report {
     None -> [],
-    Some(c) ->
-      [
-        "",
-        indent() ++ bold(style, "cost pass"),
-        count_line("walked", c.walked_modules, "body"),
-        count_line("lowered", c.lowered, "module"),
-      ],
+    Some(_) ->
+      ["", indent() ++ bold(style, "cost pass"), count_line("walked", pass.walked, "unit")],
   }
 
-fn cost_json(pass: Option<Costing>) -> Json =
-  match pass {
+fn cost_json(pass: Promises) -> Json =
+  match pass.report {
     None -> Null,
-    Some(c) ->
-      object([
-        { key: "walked", value: int(c.walked_modules) },
-        { key: "lowered", value: int(c.lowered) },
-      ]),
+    Some(_) -> object([{ key: "walked", value: int(pass.walked) }]),
   }
 
 fn operation_lines(style: Style, o: OperationInfo) -> List<String> / {abort.raise} = {
@@ -545,7 +536,7 @@ fn document(
   views: List<ModuleReport>,
   definitions: List<DefinitionInfo>,
   warnings: List<Diagnostic>,
-  pass: Option<Costing>,
+  pass: Promises,
 ) -> Json / {abort.raise} = {
   let p: Program = timed.program;
   let located = locations(definitions);
@@ -625,7 +616,7 @@ fn check_output(
   flags: Flags,
   timed: TimedLoad,
   frame: Frame,
-  pass: Option<Costing>,
+  pass: Promises,
   warnings: List<Diagnostic>,
 ) -> CommandOutput / {abort.raise} = {
   let holes = warnings.filter(|d: Diagnostic| d.code == b"W0613");
@@ -663,8 +654,8 @@ fn check_output(
       },
       None -> object([]),
     },
-    lines: match pass {
-      Some(c) -> with_cost_report(style, flags, timed.program.source_texts, c.report, typed),
+    lines: match pass.report {
+      Some(r) -> with_cost_report(style, flags, timed.program.source_texts, r, typed),
       None -> typed,
     },
     errs: [],
@@ -679,30 +670,12 @@ fn checked(
   frame: Frame,
 ) -> CommandOutput / {cost_checker.report, evaluation.verdicts, evaluation.statements, abort.raise} = {
   let promised = has_promises(timed.program, frame);
-  let pass = if !promised && !flags.costs { Ok(None) } else {
-    match whole_of(timed.program) {
-      Ok(w) -> Ok(Some(costs_of(timed.program, w))),
-      Err(diagnostics) -> Err(diagnostics),
-    }
-  };
-  let unkept = match pass {
-    Err(diagnostics) -> diagnostics,
-    Ok(None) -> [],
-    Ok(Some(c)) -> if !c.report.ok { [unresolved()] }
-    else if promised { report_reuse_violations(c.report) }
-    else { [] },
-  };
+  let promises = promises_of(timed.program, frame, promised || flags.costs);
+  let unkept = if promised || promises.unproved.len() > 0 { promise_errors(promises) }
+  else { match promises.report { Some(r) -> if r.ok { [] } else { [unresolved()] }, None -> [] } };
   let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, frame) };
-  if broken.len() > 0 { rejected(style, "check", broken, timed.program.source_texts) } else {
-    check_output(
-      style,
-      flags,
-      timed,
-      frame,
-      match pass { Ok(p) -> p, Err(_) -> None },
-      timed.program.diagnostics,
-    )
-  }
+  if broken.len() > 0 { rejected(style, "check", broken, timed.program.source_texts) }
+  else { check_output(style, flags, timed, frame, promises, timed.program.diagnostics) }
 }
 
 fn rejected_load(flags: Flags, timed: TimedLoad) -> CommandOutput / {abort.raise} = {

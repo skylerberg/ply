@@ -133,10 +133,13 @@ fn runs_text(runs: Map<String, Int>) -> String =
   runs.fold("", |accumulator: String, q: String, n: Int|
     accumulator ++ q ++ "=" ++ n.to_string() ++ " ")
 
-fn cost_pass() -> { walked: Int, lowered: Int } / {CliEffects, Shipped, abort.raise, diverges} = {
-  let c = path(json_of(on_disk(["check", "--json", "--explain", "--costs"])), ["cost_pass"]);
-  { walked: int(at(c, "walked")), lowered: int(at(c, "lowered")) }
-}
+fn cost_pass() -> Int / {CliEffects, Shipped, abort.raise, diverges} =
+  int(
+    at(
+      path(json_of(on_disk(["check", "--json", "--explain", "--costs"])), ["cost_pass"]),
+      "walked",
+    ),
+  )
 
 test "an edit reruns the cost analysis only on bodies whose analysis result changed" {
   scratch(|| {
@@ -145,23 +148,47 @@ test "an edit reruns the cost analysis only on bodies whose analysis result chan
       { path: "b.ply", text: "import a (mk)\n\nfn grow(n: Int) -> List<Int> = mk(n).push(n)\n" },
       { path: "c.ply", text: "fn solo(xs: List<Int>) -> List<Int> = xs.push(1)\n" },
     ]);
-    let cold = cost_pass();
-    assert(cold.walked == 3 && cold.lowered == 3, Some("a cold pass walks every body"));
-    let warm = cost_pass();
-    assert(warm.walked == 0 && warm.lowered == 0, Some("an unchanged program walks nothing"));
+    assert(cost_pass() == 3, Some("a cold pass walks every body"));
+    assert(cost_pass() == 0, Some("an unchanged program walks nothing"));
     edit(
       "a.ply",
       "= range(0, n)",
       "= match Map::new().get(n) { Some(xs) -> xs, None -> range(0, n) }",
     );
-    let shared = cost_pass();
-    assert(
-      shared.walked == 2 && shared.lowered == 2,
-      Some("`mk` is walked, and `grow`, which reads what it returns"),
-    );
+    assert(cost_pass() == 2, Some("`mk` is walked, and `grow`, which reads what it returns"));
     edit("c.ply", "xs.push(1)", "xs.push(2)");
-    let apart = cost_pass();
-    assert(apart.walked == 1 && apart.lowered == 1, Some("`solo` is walked, and nothing reads it"));
+    assert(cost_pass() == 1, Some("`solo` is walked, and nothing reads it"));
+    ()
+  })
+}
+
+fn stalled_measure(path: String) -> Unit / {CliEffects, Shipped, abort.raise, diverges} = {
+  let r = on_disk(["check", "--json", path]);
+  assert(r.code == 2, Some(all_output(r)));
+  assert(
+    items(at(json_of(r), "diagnostics")).filter(|d: Json| str(at(d, "code")) == "E0467").len() > 0,
+    Some(all_output(r)),
+  )
+}
+
+test "a `decreases` failure is still reported after an edit that does not reach the function" {
+  scratch(|| {
+    write_project([
+      {
+        path: "a.ply",
+        text: "pub fn stall(n: Int) -> Int decreases n = if n <= 0 { 0 } else { stall(n) }\n",
+      },
+      { path: "b.ply", text: "pub fn spare() -> Int = 1\n" },
+    ]);
+    stalled_measure(".");
+    edit("b.ply", "= 1", "= 2");
+    stalled_measure(".");
+    assert(
+      on_disk(["hash", "--json"]).code == 0,
+      Some("a command that does not run the program does not pay for the proof"),
+    );
+    edit("a.ply", "stall(n) }", "stall(n - 1) }");
+    assert(on_disk(["check"]).code == 0, Some("a proof that now holds clears the failure"));
     ()
   })
 }

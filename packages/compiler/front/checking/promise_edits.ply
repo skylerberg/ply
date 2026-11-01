@@ -1,0 +1,171 @@
+import std.bin
+import std.list
+import compiler.store.memo (MemoryStore, Run, empty_memory_store, executed_for, in_session,
+                            query_output)
+import compiler.emit.costs (Costed, Report, cost_input_of, report_bin, report_of,
+                            report_over_one_walk)
+import compiler.check.resolve.tables (Source)
+import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone, over_decoding,
+                                prelude_files, prelude_frames)
+import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_bin,
+                                         body_program_checked, body_program_query,
+                                         cost_demands_query, cost_parameters_query, cost_walk_query,
+                                         measure_entry_bin, measures_query, module_costs_query)
+import compiler.front.checking.groups (GroupKey, group_key_bin)
+import compiler.front.checking.world (decoded, module_key_bin)
+import compiler.front.diagnostics (parse_all)
+import compiler.front.emitter_input (Analysed, Rejected)
+import compiler.front.published (analyse)
+
+type Asked = { store: MemoryStore, run: Run, outputs: List<Bytes> }
+
+fn asked(
+  store: MemoryStore,
+  sources: List<Source>,
+  query: Bytes,
+  inputs: List<Bytes>,
+) -> Asked / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run| {
+        let read = inputs.fold(
+          { run: run, outputs: [] },
+          |accumulator: { run: Run, outputs: List<Bytes> }, input: Bytes| {
+            let a = query_output(qs, accumulator.run, query, input);
+            { run: a.run, outputs: accumulator.outputs.push(a.output) }
+          },
+        );
+        { run: read.run, value: read }
+      }),
+  );
+  { store: done.store, run: done.value.run, outputs: done.value.outputs }
+}
+
+fn module_input(s: Source) -> Bytes / {abort.raise} =
+  bin::encode({ module: s.name, shipped: false, tested: false }, module_key_bin())
+
+fn costs_asked(store: MemoryStore, sources: List<Source>) -> Asked / {abort.raise} =
+  asked(store, sources, module_costs_query(), sources.map(module_input))
+
+fn report_in(a: Asked) -> Report / {abort.raise} =
+  report_of(a.outputs.map(|b: Bytes| decoded(b, report_bin(), "a module's costs")))
+
+fn costed_sources(pushed: Bytes, kept_twice: Bool) -> List<Source> =
+  [
+    { name: b"a", source_text: b"pub fn keep(xs: List<Int>) -> List<Int> = xs.push(0)\n" },
+    {
+      name: b"b",
+      source_text: Bytes::concat_all([
+        b"import a (keep)\n\nfn grow(xs: List<Int>) -> List<Int> = keep(xs).push(",
+        pushed,
+        b")\n\nfn sized(xs: List<Int>) -> Int = ",
+        if kept_twice { b"keep(xs).len() + xs.len()" } else { b"keep(xs).len()" },
+        b"\n",
+      ]),
+    },
+  ]
+
+test "an edit to a body that leaves its demands alone stops at its module's rollup" {
+  let first = costs_asked(empty_memory_store(), costed_sources(b"1", false));
+  let edited = costs_asked(first.store, costed_sources(b"2", false));
+  assert(executed_for(edited.run, cost_walk_query()).len() > 0);
+  assert(executed_for(edited.run, cost_demands_query()).len() > 0);
+  assert_eq(executed_for(edited.run, cost_parameters_query()), []);
+  assert_eq(
+    report_in(edited),
+    report_in(costs_asked(empty_memory_store(), costed_sources(b"2", false))),
+  )
+}
+
+test "an edit that changes what a body demands reaches the parameters of its callee" {
+  let first = costs_asked(empty_memory_store(), costed_sources(b"1", false));
+  let edited = costs_asked(first.store, costed_sources(b"1", true));
+  assert(executed_for(edited.run, cost_parameters_query()).len() > 0);
+  assert_eq(
+    report_in(edited),
+    report_in(costs_asked(empty_memory_store(), costed_sources(b"1", true))),
+  )
+}
+
+test "a cost report asked twice runs no walk the second time" {
+  let first = costs_asked(empty_memory_store(), costed_sources(b"1", false));
+  let again = costs_asked(first.store, costed_sources(b"1", false));
+  assert_eq(executed_for(again.run, cost_walk_query()), []);
+  assert_eq(report_in(again), report_in(first))
+}
+
+fn varied_sources() -> List<Source> =
+  [
+    {
+      name: b"a",
+      source_text: b"pub type Box = { items: List<Int> }\n\npub fn add(b: Box, n: Int) -> Box = { ..b, items: b.items.push(n) }\n\npub fn keep(xs: List<Int>) -> List<Int> returns xs = xs\n\npub fn made(n: Int) -> List<Int> returns fresh = range(0, n)\n",
+    },
+    {
+      name: b"b",
+      source_text: b"import a (Box, add, keep, made)\n\nfn ping(xs: List<Int>, n: Int) -> List<Int> = if n <= 0 { xs } else { pong(xs.push(n), n - 1) }\n\nfn pong(xs: List<Int>, n: Int) -> List<Int> = if n <= 0 { xs } else { ping(xs.push(n), n - 1) }\n\nreuse fn once(xs: List<Int>) -> List<Int> = keep(xs).push(1)\n\nfn both(xs: List<Int>) -> List<Int> = keep(xs).push(xs.len())\n\nfn mapped(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|ys: List<Int>| ys.push(1))\n\nfn boxed(b: Box) -> Box = add(b, 1)\n\ntest \"counts down\" {\n  assert_eq(ping(made(1), 2), [0, 2, 1]);\n  assert_eq(boxed({ items: [] }).items, [1])\n}\n",
+    },
+  ]
+
+fn sites_by_label(r: Report) -> List<Costed> =
+  r.definitions.sort_by(|a: Costed, b: Costed|
+    match compare_values(a.label, b.label) { Greater -> false, _ -> true })
+
+test "the report over one walk of each unit equals the report over one walk of the whole program" {
+  let sources = varied_sources();
+  let by_units = report_in(costs_asked(empty_memory_store(), sources));
+  match analyse(parse_all(sources)) {
+    Rejected(_) -> panic("the checker rejected a program that should be valid"),
+    Analysed(w) -> {
+      let whole = report_over_one_walk(cost_input_of(w));
+      assert(by_units.ok);
+      assert(by_units.definitions.len() > 0);
+      assert_eq(sites_by_label(by_units), sites_by_label(whole));
+      assert_eq(by_units.return_mismatches, whole.return_mismatches)
+    },
+  }
+}
+
+fn measured_sources(spare: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      source_text: b"fn is_small(n: Int) -> Bool = n <= 0\n\nfn lowered(n: Int) -> Int decreases n = if is_small(n) { 0 } else { lowered(n - 1) + 1 }\n",
+    },
+    { name: b"n", source_text: Bytes::concat_all([b"pub fn spare() -> Int = ", spare, b"\n"]) },
+  ]
+
+fn measures_asked(store: MemoryStore, sources: List<Source>) -> Asked / {abort.raise} =
+  asked(store, sources, measures_query(), sources.map(module_input))
+
+fn entries_in(a: Asked) -> List<MeasureEntry> / {abort.raise} =
+  a.outputs.fold([], |accumulator: List<MeasureEntry>, b: Bytes|
+    accumulator.concat(decoded(b, bin::list_bin(measure_entry_bin()), "a module's measures")))
+
+test "an edit that a measured function does not reach leaves its program alone" {
+  let first = measures_asked(empty_memory_store(), measured_sources(b"1"));
+  assert_eq(entries_in(first).len(), 1);
+  let edited = measures_asked(first.store, measured_sources(b"2"));
+  assert_eq(executed_for(edited.run, body_program_query()), []);
+  assert_eq(entries_in(edited), entries_in(first))
+}
+
+test "a measured function's program holds the bodies it calls and checks on its own" {
+  let first = measures_asked(empty_memory_store(), measured_sources(b"1"));
+  let unit: GroupKey = entries_in(first).get(0).unit;
+  let read = asked(first.store, measured_sources(b"1"), body_program_query(), [
+    bin::encode(unit, group_key_bin()),
+  ]);
+  let p: BodyProgram = decoded(read.outputs.get(0), body_program_bin(), "a body program");
+  assert_eq(p.measured, [b"m.lowered"]);
+  assert(
+    p.source.source.source_text.index_of(b"is_small(n: Int) -> Bool = n <= 0") != None,
+    Some(String::of_bytes_lossy(p.source.source.source_text)),
+  );
+  assert(match body_program_checked(p).pulled.out { Analysed(_) -> true, Rejected(_) -> false })
+}

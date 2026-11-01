@@ -4,7 +4,7 @@ import std.path (strip_root)
 import compiler.cc (toolchain)
 import compiler.store.memo
 import compiler.store.memo (Run, QueryStats, reachable_keys, missing_count, query_output,
-                            in_session, in_session_of, query_stats)
+                            in_session, in_session_of, query_stats, executed_for)
 import compiler.store.memo_files
 import compiler.store.packs
 import compiler.unit (shipped, pack_frame)
@@ -13,9 +13,14 @@ import compiler.front.checking (CheckedModule, PackageFile, OwnPackage, LoadInpu
                                 lookup_input, nothing_derived, rejected_first, registry,
                                 check_shipped_modules, shipped_queries, wanted_all, load_inputs_of,
                                 package_location_in)
-import compiler.front.checking.world (CheckQuery, RunEffects, ModuleKey, with_decode_cache, decoded)
-import compiler.front.checking.groups (ProgramSummary, declarers_input, program_summary_bin,
-                                       program_summary_query, symbol_query)
+import compiler.front.checking.world (CheckQuery, RunEffects, ModuleKey, with_decode_cache, decoded,
+                                      module_key_bin)
+import compiler.front.checking.groups (GroupKey, ProgramSummary, declarers_input, group_key_bin,
+                                       program_summary_bin, program_summary_query, symbol_query)
+import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_bin,
+                                         body_program_query, cost_walk_query, measure_entry_bin,
+                                         measures_query, module_costs_query)
+import compiler.emit.costs (Report, report_bin)
 import compiler.load (Derives, derivation_response)
 import compiler.front.pages (Pages)
 import compiler.front (ShippedWants, embed_inputs_of, shipped_bytes)
@@ -235,7 +240,7 @@ pub fn query_through_store<[r]>(
   queried_of(project, w, ran.value, ran.seen)
 }
 
-fn over_project_store<a, [r]>(
+pub fn over_project_store<a, [r]>(
   dir: String,
   project: Project,
   work: (Map<Bytes, CheckQuery>, LoadInputs) -> a / {RunEffects, abort.raise},
@@ -256,6 +261,81 @@ fn over_project_store<a, [r]>(
     || with_decode_cache(|| work(qs, w)),
   )
 }
+
+pub fn over_temporary_store<a>(
+  project: Project,
+  work: (Map<Bytes, CheckQuery>, LoadInputs) -> a / {RunEffects, abort.raise},
+) -> a / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+  let qs = running_queries();
+  let w = query_inputs(project);
+  memo::with_temporary_store(
+    pack_frame,
+    shipped_files(),
+    |kind: Bytes, at: Bytes|
+      read_project_input(
+        w,
+        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+        kind,
+        at,
+      ),
+    || with_decode_cache(|| work(qs, w)),
+  )
+}
+
+pub type PromiseFacts = { costs: List<Report>, measures: List<MeasureEntry>, walked: Int }
+
+fn root_keys(modules: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  modules.map(|m: Bytes|
+    bin::encode({ module: m, shipped: false, tested: false }, module_key_bin()))
+
+fn outputs_of(
+  qs: Map<Bytes, CheckQuery>,
+  run: Run,
+  name: Bytes,
+  inputs: List<Bytes>,
+) -> { run: Run, value: List<Bytes> } / {RunEffects, abort.raise} =
+  inputs.fold(
+    { run: run, value: [] },
+    |accumulator: { run: Run, value: List<Bytes> }, input: Bytes| {
+      let a = query_output(qs, accumulator.run, name, input);
+      { run: a.run, value: accumulator.value.push(a.output) }
+    },
+  )
+
+pub fn promise_facts(
+  qs: Map<Bytes, CheckQuery>,
+  modules: List<Bytes>,
+  costs: Bool,
+  measures: Bool,
+) -> PromiseFacts / {RunEffects, abort.raise} =
+  in_session(qs, |run: Run| {
+    let inputs = root_keys(modules);
+    let costed = outputs_of(qs, run, module_costs_query(), if costs { inputs } else { [] });
+    let listed = outputs_of(qs, costed.run, measures_query(), if measures { inputs } else { [] });
+    {
+      run: listed.run,
+      value: {
+        costs: costed.value.map(|b: Bytes| decoded(b, report_bin(), "a module's costs")),
+        measures: listed.value.fold([], |accumulator: List<MeasureEntry>, b: Bytes|
+          accumulator.concat(
+            decoded(b, bin::list_bin(measure_entry_bin()), "a module's measures"),
+          )),
+        walked: executed_for(listed.run, cost_walk_query()).len(),
+      },
+    }
+  })
+
+pub fn body_programs(
+  qs: Map<Bytes, CheckQuery>,
+  units: List<GroupKey>,
+) -> List<BodyProgram> / {RunEffects, abort.raise} =
+  in_session(qs, |run: Run|
+    outputs_of(
+      qs,
+      run,
+      body_program_query(),
+      units.map(|u: GroupKey| bin::encode(u, group_key_bin())),
+    )).map(|b: Bytes| decoded(b, body_program_bin(), "a body program"))
 
 pub fn checked_summary<[r]>(
   dir: String,
