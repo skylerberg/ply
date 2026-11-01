@@ -78,8 +78,6 @@ fn new_run() -> Run =
     provisional: Map::new(),
   }
 
-pub fn driver_dependencies(run: Run) -> List<Dependency> = run.requested_dependencies
-
 fn dependency_keys<| e>(
   queries: Map<Bytes, Query<| e>>,
   reads: List<Dependency>,
@@ -179,14 +177,6 @@ pub fn location_id(kind: Bytes, at: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.place\x00", length_prefixed(kind), at]))
 
 fn query_kind() -> Bytes = b"query"
-
-pub fn pack_kind() -> Bytes = b"pack"
-
-pub fn pack_place(index: Option<packs::Index>, world: Bytes) -> Option<Bytes> =
-  match index {
-    Some(i) -> Some(blake3(Bytes::concat_all([length_prefixed(i.id), world]))),
-    None -> None,
-  }
 
 pub fn queries_id<| e>(queries: Map<Bytes, Query<| e>>) -> Bytes =
   blake3(
@@ -310,7 +300,6 @@ pub effect memo_store {
   write store_record(key: Bytes, r: Record) -> Unit
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
-  read looked() -> List<Dependency>
   read has_trusted_record(key: Bytes) -> Bool
   read pack_record(key: Bytes) -> Option<Record>
   write running(id: Bytes, queries: List<Bytes>) -> Unit
@@ -867,45 +856,7 @@ fn execute<| e>(
     { run_index: s.run, head: d }
   }
 
-pub fn cached_output<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  key: Bytes,
-) -> Option<Bytes> / {memo_store.read, abort.raise} =
-  match memo_store.record(key) {
-    None -> None,
-    Some(r) -> if r.summary.len() > 0
-        && r.summary.fold(true, |ok: Bool, s: Dependency|
-          ok
-            && (match s {
-              ExternalDependency(kind, at, d) -> external_digest_at(queries, kind, at) == d,
-              QueryDependency(_, _, _) -> false,
-            })) { memo_store.output(r.output) }
-    else { None },
-  }
-
-pub fn record_output<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  key: Bytes,
-  hash: Bytes,
-  reads: List<Dependency>,
-  looked: List<Dependency>,
-  output: Bytes,
-) -> Unit / {memo_store.read, memo_store.write, abort.raise} = {
-  memo_store.running(queries_id(queries), hashes_of(queries));
-  let defined = queries.fold(looked, |accumulator: List<Dependency>, name: Bytes, q: Query<| e>|
-    accumulator.push(ExternalDependency(query_kind(), name, digest_of(Some(q.hash)))));
-  let record = {
-    query: hash,
-    input: b"",
-    reads: reads,
-    output: digest_of(Some(output)),
-    summary: defined,
-  };
-  keep_previous(key, record);
-  memo_store.put(key, record, output, true)
-}
-
-pub type ExternalRead = { kind: Bytes, at: Bytes, value: Option<Bytes>, digest: Bytes }
+pub type ExternalRead = { value: Option<Bytes>, digest: Bytes }
 
 type MemoryRunState = {
   looked: Map<Bytes, ExternalRead>,
@@ -969,9 +920,8 @@ pub fn with_memory_store<a | e>(
     match r.looked.get(id) {
       Some(x) -> { running: r, looked: x },
       None -> {
-        let value = if kind == pack_kind() { pack_place(r.pack.index, world) }
-        else { look(kind, at) };
-        let x = { kind: kind, at: at, value: value, digest: digest_of(value) };
+        let value = look(kind, at);
+        let x = { value: value, digest: digest_of(value) };
         { running: { ..r, looked: r.looked.insert(id, x) }, looked: x }
       },
     }
@@ -1044,8 +994,6 @@ pub fn with_memory_store<a | e>(
       running = l.running;
       l.looked.digest
     },
-    memo_store.looked() ->
-      running.looked.values().map(|x: ExternalRead| ExternalDependency(x.kind, x.at, x.digest)),
     memo_store.pack_record(key) -> if !store.records.contains(key) { None } else {
       let p = packed_at(running, inlined, key);
       running = p.running;
@@ -1066,10 +1014,6 @@ pub fn with_memory_store<a | e>(
           None -> false,
         },
       };
-      if running.pack.index != None {
-        let l = looked(running, pack_kind(), b"");
-        running = l.running;
-      }
     },
     return value -> { store: store, value: value },
   }
@@ -1682,88 +1626,6 @@ test "a run takes the results for changed files from the pack in use instead of 
   );
   assert_eq(next.output, b"5");
   assert_eq(next.executed, 0)
-}
-
-fn commanded_over(
-  q: Map<Bytes, Query<| {}>>,
-  w: TestEnvironment,
-  packed: Option<packs::PackFiles>,
-  name: Bytes,
-  key: Bytes,
-) -> { took: Bool, output: Bytes, executed: Int, world: TestEnvironment } / {abort.raise} = {
-  let done = with_memory_store(
-    w.store,
-    |path: String, offset: Int, len: Int| packs::frame_in(packed, path, offset, len),
-    files_of(w),
-    |_: Bytes, at: Bytes| w.files.get(at),
-    || {
-      let run = start_run(q);
-      match cached_output(q, key) {
-        Some(o) -> { took: true, output: o, executed: 0 },
-        None -> {
-          let a = query_output(q, run, name, b"a");
-          let result_text = b"said ".concat(a.output);
-          record_output(
-            q,
-            key,
-            b"c1",
-            driver_dependencies(a.run),
-            memo_store.looked(),
-            result_text,
-          );
-          { took: false, output: result_text, executed: executed_count(a.run) }
-        },
-      }
-    },
-  );
-  {
-    took: done.value.took,
-    output: done.value.output,
-    executed: done.value.executed,
-    world: { ..w, store: done.store },
-  }
-}
-
-test "a cached command result is reused while every file the run read is unchanged" {
-  let q = test_queries(b"h1");
-  let first = commanded_over(q, test_world([{ at: b"a", text: b"four" }]), None, b"longer", b"k");
-  assert_eq(first.output, b"said long 4");
-  assert(!first.took);
-  let again = commanded_over(q, first.world, None, b"longer", b"k");
-  assert(again.took);
-  assert_eq(again.output, b"said long 4");
-  let same = commanded_over(q, edited(again.world, b"a", b"FOUR"), None, b"longer", b"k");
-  assert(!same.took);
-  assert_eq([same.output, Bytes::of_string(same.executed.to_string())], [b"said long 4", b"1"]);
-  let moved = commanded_over(q, edited(same.world, b"a", b"forty"), None, b"longer", b"k");
-  assert(!moved.took);
-  assert_eq(moved.output, b"said long 5");
-  assert(commanded_over(q, moved.world, None, b"longer", b"k").took)
-}
-
-test "a cached command result is not reused after the definition of a query it used changes" {
-  let first = commanded_over(
-    test_queries(b"h1"),
-    test_world([{ at: b"a", text: b"four" }]),
-    None,
-    b"longer",
-    b"k",
-  );
-  assert(!commanded_over(test_queries(b"h2"), first.world, None, b"longer", b"k").took)
-}
-
-test "a command result that depends on a pack result is not reused when the store is later used with a different pack" {
-  let q = test_queries(b"h1");
-  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let forty = run_query(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
-  let commanded = |memory_store: MemoryStore, w: TestEnvironment|
-    commanded_over(q, { ..w, store: memory_store }, Some(pack_over(q, w)), b"length", b"k");
-  let first = commanded(empty_memory_store(), four.world);
-  assert_eq(first.output, b"said 4");
-  assert(commanded(first.world.store, four.world).took);
-  let moved = commanded(first.world.store, forty.world);
-  assert(!moved.took);
-  assert_eq(moved.output, b"said 5")
 }
 
 test "a record whose result is no longer cached is computed again" {

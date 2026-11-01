@@ -57,7 +57,7 @@ type FrameLocation = { token: Bytes, offset: Int, size: Int }
 
 type KeyState = { row: Row, query: Bytes, seen: Int }
 
-type OwnRow = { result: Bytes, query: Bytes, seen: Int, frame: Option<{ offset: Int, size: Int }> }
+type OwnRow = { result: Bytes, query: Bytes, frame: Option<{ offset: Int, size: Int }> }
 
 type OpenStore = {
   own: Map<Bytes, Bool>,
@@ -302,28 +302,20 @@ fn commit<[r]>(
         })
       },
     );
-    let seen = o.written_rows.fold(
-      o.own.fold(Map::new(), |seen: Map<Bytes, Int>, query: Bytes, _: Bool|
-        seen.insert(query, o.now)),
-      |seen: Map<Bytes, Int>, _: Bytes, x: OwnRow| last_seen(seen, x.query, x.seen),
-    );
+    let seen = o.own.fold(Map::new(), |seen: Map<Bytes, Int>, query: Bytes, _: Bool|
+      seen.insert(query, o.now));
     match segments::finish[r](dir, schema(), token, o.out, tables_of(key_rows, seen, o.results)) {
       None -> (),
       Some(seg) -> match segments::commit[r](dir, schema(), seg, without: o.unreadable_segments) {
         Committed(m) -> {
           let from = segments::merge_start(m);
           if from < m.segments.len() - 1 {
-            let own = o.written_rows.fold(
-              o.own,
-              |accumulator: Map<Bytes, Bool>, _: Bytes, x: OwnRow|
-                accumulator.insert(x.query, true),
-            );
             merge_segments[r](
               dir,
               m,
               from,
               segments::segment_token(Some(run), m.generation, 1),
-              KeepRecent(own),
+              KeepRecent(o.own),
             );
             ()
           };
@@ -657,7 +649,6 @@ pub fn with_memo_store<a, [r] | e>(
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-  commands: List<Bytes> = [],
 ) -> a / {fs.read[r], fs.write[r], abort.raise | e} = {
   let run = segments::start_run[r](dir);
   let manifest = segments::manifest[r](dir, schema());
@@ -704,9 +695,8 @@ pub fn with_memo_store<a, [r] | e>(
     match o.looked.get(id) {
       Some(x) -> { open: o, looked: x },
       None -> {
-        let value = if kind == memo::pack_kind() { memo::pack_place(o.pack.index, world) }
-        else { look(kind, place) };
-        let x = { kind: kind, at: place, value: value, digest: digest_of(value) };
+        let value = look(kind, place);
+        let x = { value: value, digest: digest_of(value) };
         { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
       },
     }
@@ -792,7 +782,6 @@ pub fn with_memo_store<a, [r] | e>(
           written_rows: o3.written_rows.insert(key, {
             result: name,
             query: record.query.blake3(),
-            seen: o3.now,
             frame: Some({ offset: f.at, size: bytes.len() }),
           }),
         }
@@ -921,8 +910,6 @@ pub fn with_memo_store<a, [r] | e>(
       st = l.open;
       l.looked.digest
     },
-    memo_store.looked() ->
-      st.looked.values().map(|x: ExternalRead| memo::ExternalDependency(x.kind, x.at, x.digest)),
     memo_store.has_trusted_record(key) -> {
       let p = standing_at(st, key);
       st = p.open;
@@ -943,14 +930,10 @@ pub fn with_memo_store<a, [r] | e>(
     memo_store.running(id, queries) -> {
       st = {
         ..st,
-        own: queries.concat(commands).fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
+        own: queries.fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
           own.insert(q.blake3(), true)),
         trusted: match st.pack.index { Some(i) -> packs::is_trusted(i, id, world), None -> false },
       };
-      if st.pack.index != None {
-        let l = looked(st, memo::pack_kind(), b"");
-        st = l.open;
-      }
     },
     return value -> {
       match run { Some(path) -> commit[r](dir, path, token, st), None -> () };
@@ -981,12 +964,6 @@ fn record_bytes_at<[r]>(
     },
   }
 }
-
-pub fn record_at<[r]>(dir: String, key: Bytes) -> Option<Record> / {fs.read[r], abort.raise} =
-  match record_bytes_at[r](dir, open_store(segments::manifest[r](dir, schema()), 0), key).bytes {
-    Some(b) -> record_from(b),
-    None -> None,
-  }
 
 type PackBuild = {
   open: OpenStore,
@@ -1205,7 +1182,7 @@ pub fn compact<[r]>(
   match done { Some(d) -> d, None -> { records: 0, results: 0, bytes: 0 } }
 }
 
-pub fn quoted(input: Bytes) -> Bytes / {memo.read} =
+fn quoted(input: Bytes) -> Bytes / {memo.read} =
   Bytes::concat_all([b"\"", memo.fetch(b"text", input), b"\""])
 
 fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query<| {}>> =
@@ -1403,41 +1380,6 @@ test "a store shared by several `ply`s contains the writing `ply`'s records and 
   assert_eq(after(four, b"a").value, 2)
 }
 
-fn command_record_stored<[r]>(
-  output: Bytes,
-  text: Bytes,
-  commands: List<Bytes>,
-) -> Bool / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = test_queries(b"");
-  let key = b"a command".blake3();
-  with_memo_store[r](
-    "s",
-    packs::no_pack,
-    b"",
-    |_: Bytes, _: Bytes| Some(text),
-    || memo::record_output(queries, key, b"p", [], [], output),
-    commands: commands,
-  );
-  with_memo_store[r](
-    "s",
-    packs::no_pack,
-    b"",
-    |_: Bytes, _: Bytes| Some(text),
-    || memo::executed_count(query_output(queries, start_run(queries), b"quoted", b"a").run),
-    commands: commands,
-  );
-  record_at[r]("s", key) != None
-}
-
-test "a run that rewrites the store retains the results of its own commands, including large ones" {
-  let output = b"handle ".repeat(1200);
-  let text = b"text ".repeat(600);
-  assert(
-    fs::on_mem[abs](fs::mem_of([]), || command_record_stored[abs](output, text, [b"p"])).value,
-  );
-  assert(!fs::on_mem[abs](fs::mem_of([]), || command_record_stored[abs](output, text, [])).value)
-}
-
 test "a large result is stored once, and a large result with corrupted stored bytes is recomputed once and then reused" {
   let long = b"long ".repeat(1000);
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](long, b""));
@@ -1557,65 +1499,6 @@ test "a result computed in a run whose pack was built from other files is recomp
   let moved = quoted_below(first.tree, pack, b"other files", b"forty");
   assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
   assert_eq(quoted_below(moved.tree, pack, b"other files", b"forty").value.ran, 0)
-}
-
-test "a record a run writes survives the segment merge that its write triggers, but a later run's merge can delete it" {
-  let queries = test_queries(b"");
-  let key = b"command".blake3();
-  let large_output = b"done ".repeat(40000);
-  let look = |_: Bytes, at: Bytes| Some(b"long ".repeat(1200).concat(at));
-  let session = |tree: fs::MemFs, work: () -> Option<Bytes> / {memo_store.read, memo_store.write, abort.raise}|
-    fs::on_mem[abs](tree, || with_memo_store[abs]("s", packs::no_pack, b"", look, work));
-  let has_record = |tree: fs::MemFs|
-    match fs::on_mem[abs](tree, || record_at[abs]("s", key)).value {
-      Some(_) -> true,
-      None -> false,
-    };
-  let loaded = fs::on_mem[abs](fs::mem_of([]), ||
-    with_memo_store[abs]("s", packs::no_pack, b"", look, ||
-      memo::driver_dependencies(query_output(queries, start_run(queries), b"quoted", b"a").run)));
-  let recorded = session(loaded.tree, || {
-    memo::record_output(queries, key, b"c1", loaded.value, [], large_output);
-    None
-  });
-  assert(has_record(recorded.tree), Some("the run's own record outlives the merge its write made"));
-  assert_eq(session(recorded.tree, || memo::cached_output(queries, key)).value, Some(large_output));
-  let later = session(recorded.tree, || {
-    range(0, 10).fold(start_run(queries), |run: memo::Run, i: Int|
-      query_output(queries, run, b"quoted", Bytes::of_string(i.to_string())).run);
-    None
-  });
-  assert(!has_record(later.tree), Some("another run's merge drops a record of a query not its own"))
-}
-
-test "reusing a command's result makes the same few file system calls, however many results are cached" {
-  let queries = test_queries(b"");
-  let key = b"command".blake3();
-  let world = |_: Bytes, at: Bytes| Some(at);
-  let built = |files: Int|
-    fs::on_mem[abs](fs::mem_of([]), || {
-      with_memo_store[abs]("s", packs::no_pack, b"", world, || {
-        let run = range(0, files).fold(start_run(queries), |run: memo::Run, i: Int|
-          query_output(queries, run, b"quoted", Bytes::of_string(i.to_string())).run);
-        memo::record_output(
-          queries,
-          key,
-          b"c1",
-          memo::driver_dependencies(run),
-          memo_store.looked(),
-          b"done",
-        )
-      });
-      compact[abs]("s", [b"t1", b"q1", b"c1"])
-    }).tree;
-  let taken = |tree: fs::MemFs|
-    fs::on_mem_counted[abs](tree, ||
-      with_memo_store[abs]("s", packs::no_pack, b"", world, || memo::cached_output(queries, key)));
-  let few = taken(built(3));
-  let many = taken(built(200));
-  assert_eq(many.value, Some(b"done"));
-  assert_eq(few.operations, many.operations);
-  assert(many.operations <= 12)
 }
 
 fn quoting_all(input: Bytes) -> Bytes / {memo.read} =

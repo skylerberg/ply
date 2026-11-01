@@ -2526,10 +2526,9 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 
 ### 17.4 Reusing results
 
-`ply check`, `ply test`, `ply run` and `ply definitions` remember their last result for the same
-command line. While nothing that result depended on has changed, they return it without loading the
-program. Otherwise they check again only what depends on a change. `--explain` reports whether a
-result was reused. `ply build`, `ply hosts` and `--no-cache` always check from scratch.
+`ply check`, `ply test`, `ply run` and `ply definitions` load the program on every run. They check
+again only what depends on a change. `ply build`, `ply hosts` and `--no-cache` always check from
+scratch.
 
 ### 17.5 Compiling
 
