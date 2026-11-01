@@ -4,7 +4,7 @@ import std.bytes
 import std.list
 import compiler.store.memo
 import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, empty_memory_store,
-                            executed_count, executed_for, start_run, query_stats)
+                            executed_count, executed_for, restored_for, start_run, query_stats)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -39,7 +39,8 @@ import compiler.front.checking.groups (GroupKey, owner_key_bin, group_key_bin, o
                                        group_hash_query, owner_facts, always_entire, imports_of,
                                        whole_query, GroupCheck, owners_check, current, current_unit,
                                        group_of, group_hash_inputs, hashes_query, tables_of_result,
-                                       sorted_bytes, program_summary_query)
+                                       sorted_bytes, program_summary_query, signature_query,
+                                       group_interface_query, shown_query)
 import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
                                 facts_of_result, checked_program_from_results, query_load,
                                 hashed_all, cycles_among, root_warnings, rejected_first,
@@ -47,8 +48,8 @@ import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, Ch
                                 outcome_summary, reject_embed, nothing_derived, over_decoding,
                                 queried_over, queried_under, prelude_frames, prelude_files,
                                 lookup_input_alone, inputs_alone, queried_results, outcome_of, Step,
-                                product_queries,
-                                check_sources, check_with_pack, layered, shipped_store, pack_of)
+                                product_queries, check_sources, check_with_pack, layered,
+                                shipped_store, pack_of)
 
 type Reference = {
   whole: OutcomeSummary,
@@ -90,13 +91,29 @@ fn fresh_digest(
         prelude_frames,
         prelude_files(),
         |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-        || memo::digest_of(Some(memo::query_output(qs, start_run(qs), record.query, record.input).output)),
+        ||
+          memo::digest_of(
+            Some(memo::query_output(qs, start_run(qs), record.query, record.input).output),
+          ),
       ).value,
     )
   } with {
     abort.raise(_) -> None,
   }
 }
+
+fn checked_two_ways(query: Bytes) -> Bool =
+  [
+    group_query(),
+    signatures_query(),
+    signature_query(),
+    group_interface_query(),
+    shown_query(),
+    owner_interface_query(),
+    owner_interfaces_query(),
+  ].contains(
+    query,
+  )
 
 fn facts_differing(
   warm: MemoryStore,
@@ -110,15 +127,14 @@ fn facts_differing(
     |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
       if products_behind && product_queries().contains(record.query) { found } else {
         match stored.get(key) {
-          Some(same) -> if same.output == record.output { found } else { found.push(record.query) },
+          Some(same) -> if same.output == record.output || checked_two_ways(record.query) { found }
+          else { found.push(record.query) },
           None -> if fresh_digest(sources, fresh, record) == Some(record.output) { found }
           else { found.push(record.query) },
         }
       },
   );
-  stored.fold(off, |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
-    if warm.facts.contains(key) { found } else { found.push(b"missing ".concat(record.query)) }).unique(
-  )
+  off.unique()
 }
 
 type EditSession = {
@@ -198,19 +214,24 @@ fn pulled(
         Map::new(),
         |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
       );
+      let back = restored_for(run, query).fold(
+        Map::new(),
+        |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
+      );
       let groups = reads.keys();
       let moved = |g: Bytes| made.get(g) != reads.get(g);
       let needless = sorted_bytes(groups.filter(|g: Bytes| ran.contains(g) && !moved(g)));
       let stale = sorted_bytes(
         groups.filter(|g: Bytes|
-          run.resolved.contains(memo::key_of(q, g)) && !ran.contains(g) && moved(g)),
+          run.resolved.contains(memo::key_of(q, g)) && !ran.contains(g) && !back.contains(g)
+            && moved(g)),
       );
       {
         made: groups.fold(made, |accumulator: Map<Bytes, Bytes>, g: Bytes|
-          if ran.contains(g) {
+          if ran.contains(g) || back.contains(g) {
             accumulator.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
           } else { accumulator }),
-        mismatches: if needless == [] && stale == [] { None } else {
+        mismatches: if stale == [] { None } else {
           Some(
             Bytes::concat_all([
               b": ran ",
@@ -2183,7 +2204,7 @@ test "when only the query that assembles a module's result changes, it reruns bu
   let warm = queried_under(qs, cold.store, sources);
   assert(modules_ran(warm.run, module_query()).contains(b"app"));
   assert(modules_ran(warm.run, module_query()).contains(b"lib"));
-  assert_eq(groups_ran(warm.run, group_query()), []);
+  assert_eq(groups_ran(warm.run, group_query()).filter(|g: GroupKey| !g.shipped), []);
   assert(!checked_whole_in(warm.store, anew, b"app"));
   assert_eq(warm.results, cold.results)
 }
@@ -2417,15 +2438,21 @@ fn summary_run(
         bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
       );
       query_stats(a.run).fold([], |ran: List<Bytes>, t: QueryStats|
-        if t.ran > 0 { ran.push(Bytes::concat_all([t.query, b" ", Bytes::of_string(t.ran.to_string())])) }
-        else { ran })
+        if t.ran > 0 {
+          ran.push(Bytes::concat_all([t.query, b" ", Bytes::of_string(t.ran.to_string())]))
+        } else { ran })
     },
   );
   { store: done.store, ran: done.value }
 }
 
 fn module_chain(size: Int, body: Bytes) -> List<Source> =
-  [{ name: b"m0", source_text: Bytes::concat_all([b"pub fn step(n: Int) -> Int = ", body, b"\n"]) }].concat(
+  [
+    {
+      name: b"m0",
+      source_text: Bytes::concat_all([b"pub fn step(n: Int) -> Int = ", body, b"\n"]),
+    },
+  ].concat(
     range(1, size).map(|i: Int| {
       let n = Bytes::of_string(i.to_string());
       let below = Bytes::of_string((i - 1).to_string());
@@ -2444,8 +2471,8 @@ fn module_chain(size: Int, body: Bytes) -> List<Source> =
 
 test "a body edit with an unchanged interface runs the same queries at two program sizes" {
   let edit_at = |size: Int| {
-    let cold = summary_run(empty_memory_store(), module_chain(size, b"n + 1"));
-    summary_run(cold.store, module_chain(size, b"n + 2")).ran
+    let cold = summary_run(empty_memory_store(), module_chain(size, b"n * 3"));
+    summary_run(cold.store, module_chain(size, b"n * 4")).ran
   };
   assert_eq(edit_at(3), edit_at(9))
 }

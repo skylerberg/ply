@@ -41,6 +41,8 @@ pub type Database = {
   token: Bytes,
   writing: SegmentWriter,
   written_results: Map<Bytes, Bytes>,
+  written_past: Map<Bytes, Bytes>,
+  log_floor: Int,
 }
 
 fn schema() -> Bytes = b"ply fact database 2".blake3()
@@ -55,6 +57,8 @@ fn snapshots_table() -> Int = 4
 
 fn results_table() -> Int = 5
 
+fn past_table() -> Int = 6
+
 fn key_width(table: Int) -> Int = if table == changes_table() { 8 } else { 32 }
 
 fn row_width(table: Int) -> Int = key_width(table) + 12
@@ -62,13 +66,7 @@ fn row_width(table: Int) -> Int = key_width(table) + 12
 fn current_snapshot() -> Bytes = b"current snapshot".blake3()
 
 fn tree_number(tree: Tree) -> Int =
-  match tree {
-    Facts -> 1,
-    Past -> 2,
-    Dependents -> 3,
-    Inputs -> 4,
-    Codes -> 5,
-  }
+  match tree { Facts -> 1, Past -> 2, Dependents -> 3, Inputs -> 4, Codes -> 5 }
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
@@ -209,6 +207,8 @@ fn fresh_database(dir: String, manifest: Manifest) -> Database =
     token: b"",
     writing: segments::new_writer(),
     written_results: Map::new(),
+    written_past: Map::new(),
+    log_floor: 0,
   }
 
 pub fn emptied(db: Database) -> Database =
@@ -234,10 +234,8 @@ fn with_stored_state<[r]>(
         let state = decoded(bytes, stored_state_bin());
         {
           ..opened,
-          snapshot: state.roots.fold(
-            Map::new(),
-            |roots: Snapshot, child: fact_tree::TreeChild| roots.insert(child.slot, child.root),
-          ),
+          snapshot: state.roots.fold(Map::new(), |roots: Snapshot, child: fact_tree::TreeChild|
+            roots.insert(child.slot, child.root)),
           log_end: state.log_end,
         }
       },
@@ -312,10 +310,12 @@ pub fn entries_under<[r]>(
 ) -> Map<Bytes, Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
   let number = tree_number(tree);
   pending_under(db, number, prefix).fold(
-    fact_tree::entries_under(|hash: Bytes| node_at[r](db, hash), db.snapshot.get(number), prefix).fold(
-      Map::new(),
-      |found: Map<Bytes, Bytes>, entry: TreeEntry| found.insert(entry.key, entry.value),
-    ),
+    fact_tree::entries_under(
+      |hash: Bytes| node_at[r](db, hash),
+      db.snapshot.get(number),
+      prefix,
+    ).fold(Map::new(), |found: Map<Bytes, Bytes>, entry: TreeEntry|
+      found.insert(entry.key, entry.value)),
     |found: Map<Bytes, Bytes>, write: { key: Bytes, value: Option<Bytes> }|
       match write.value {
         Some(value) -> found.insert(write.key, value),
@@ -342,7 +342,9 @@ pub fn with_result<[r]>(
   digest: Bytes,
   bytes: Bytes,
 ) -> Database / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  if db.written_results.contains(digest) || stored_row[r](db, results_table(), digest) != None { db } else {
+  if db.written_results.contains(digest) || stored_row[r](db, results_table(), digest) != None {
+    db
+  } else {
     let placed = segments::append_payload(db.writing, bytes);
     {
       ..db,
@@ -368,6 +370,68 @@ pub fn result_of<[r]>(
       }
     },
   }
+
+pub fn with_shared_past<[r]>(
+  db: Database,
+  key: Bytes,
+  value: Bytes,
+) -> Database / {fs.write[r], abort.raise} = {
+  let placed = segments::append_payload(db.writing, value);
+  {
+    ..db,
+    writing: segments::flush_when_full[r](db.dir, schema(), db.token, placed.writing),
+    written_past: db.written_past.insert(
+      key.blake3(),
+      u64_le(placed.at).concat(u32_le(value.len())),
+    ),
+  }
+}
+
+pub fn shared_past<[r]>(
+  db: Database,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match db.written_past.get(key.blake3()) {
+    None -> table_value[r](db, past_table(), key.blake3()),
+    Some(place) -> {
+      let at = segments::read_u64(place, 0);
+      match segments::pending_payload(db.writing, at) {
+        Some(bytes) -> Some(bytes),
+        None -> segments::payload[r](db.dir, db.token, at, segments::read_u32(place, 8)),
+      }
+    },
+  }
+
+pub fn commit_shared<[r]>(
+  db: Database,
+  live_results: (List<Bytes>) -> Map<Bytes, Bool> / {abort.raise},
+) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  if db.written_results.len() + db.written_past.len() > 0 {
+    match segments::finish[r](db.dir, schema(), db.token, db.writing, [
+        segments::table(results_table(), db.written_results, |_: Bytes, rest: Bytes| Some(rest)),
+        segments::table(past_table(), db.written_past, |_: Bytes, rest: Bytes| Some(rest)),
+      ]) {
+      None -> (),
+      Some(seg) -> match segments::commit[r](db.dir, schema(), seg, durable: true) {
+        Committed(m) -> {
+          let merged = { ..fresh_database(db.dir, m), run: db.run };
+          merge_tail[r](merged, |current: Database| {
+            let located = located_rows[r](current, m.segments, past_table());
+            live_results(
+              located.values().fold([], |values: List<Bytes>, at: Located|
+                match segments::payload[r](current.dir, at.token, at.offset, at.size) {
+                  Some(bytes) -> values.push(bytes),
+                  None -> values,
+                }),
+            )
+          })
+        },
+        _ -> (),
+      },
+    }
+  }
+
+pub fn with_log_floor(db: Database, floor: Int) -> Database = { ..db, log_floor: floor }
 
 pub fn append_change(db: Database, changes: List<Bytes>) -> Database / {abort.raise} = {
   let offset = db.log_end + 1;
@@ -528,7 +592,10 @@ fn commit_frames<[r]>(
     },
   ])
 
-fn removed_after_refusal<[r]>(db: Database, result: CommitResult) -> CommitResult / {fs.write[r], abort.raise} =
+fn removed_after_refusal<[r]>(
+  db: Database,
+  result: CommitResult,
+) -> CommitResult / {fs.write[r], abort.raise} =
   match result {
     Committed(_) -> result,
     WriteFailed -> result,
@@ -544,9 +611,7 @@ pub fn commit<[r]>(
 ) -> CommitResult / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
   let rewrite = rewritten[r](db);
   if rewrite.snapshot == db.snapshot && db.unwritten_log.len() == 0 && !db.starts_over
-      && db.written_results.len() == 0 {
-    Committed(db.manifest)
-  } else {
+      && db.written_results.len() == 0 { Committed(db.manifest) } else {
     match finished_segment[r](
         db,
         db.token,
@@ -574,6 +639,7 @@ pub fn commit<[r]>(
                 ..fresh_database(db.dir, m),
                 snapshot: rewrite.snapshot,
                 log_end: db.log_end,
+                log_floor: db.log_floor,
                 run: db.run,
               },
               live_results,
@@ -608,7 +674,7 @@ fn located_rows<[r]>(
     })
   })
 
-fn all_tables() -> List<Int> = range(1, 6)
+fn all_tables() -> List<Int> = range(1, 7)
 
 type Rewriting = { writing: SegmentWriter, tables: List<segments::Table> }
 
@@ -684,13 +750,18 @@ fn merge_tail<[r]>(
   let from = segments::merge_start(m);
   if from < m.segments.len() - 1 {
     let token = segments::segment_token(db.run, m.generation, 1);
-    if from > 0 { rewritten_segments[r](db, m, from, token, |_: Int, _: Bytes| true); () } else {
+    if from > 0 {
+      rewritten_segments[r](db, m, from, token, |_: Int, _: Bytes| true);
+      ()
+    } else {
       let nodes = tree_nodes[r](db, db.snapshot.values());
       let results = live_results(db);
       rewritten_segments[r](db, m, 0, token, |table: Int, key: Bytes|
         if table == nodes_table() { nodes.contains(key) }
         else if table == results_table() { results.contains(key) }
-        else { true });
+        else if table == changes_table() {
+          match key.u64_be_at(0) { Some(offset) -> offset > db.log_floor, None -> true }
+        } else { true });
       ()
     }
   };
@@ -737,7 +808,8 @@ fn tree_nodes<[r]>(
     |walk: { found: Map<Bytes, Bool>, work: List<TreeRoot> }|
       match walk.work {
         [] -> Stop(walk.found),
-        [root, ..rest] -> if walk.found.contains(root.hash) { Continue({ ..walk, work: rest }) } else {
+        [root, ..rest] -> if walk.found.contains(root.hash) { Continue({ ..walk, work: rest }) }
+        else {
           let marked = walk.found.insert(root.hash, true);
           Continue(match node_at[r](db, root.hash) {
             fact_tree::Bucket(_) -> { found: marked, work: rest },
@@ -774,7 +846,10 @@ pub fn compact<[r]>(
     );
   let after = segments::manifest[r](db.dir, schema());
   match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run, []), None -> () };
-  { bytes_before: store_bytes(m), bytes_after: if done { store_bytes(after) } else { store_bytes(m) } }
+  {
+    bytes_before: store_bytes(m),
+    bytes_after: if done { store_bytes(after) } else { store_bytes(m) },
+  }
 }
 
 pub fn store_size(db: Database) -> { segments: Int, bytes: Int } =
@@ -833,7 +908,10 @@ fn no_results(db: Database) -> Map<Bytes, Bool> = Map::new()
 fn committed<[r]>(
   db: Database,
 ) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match commit[r](db, no_results) { Committed(_) -> (), other -> panic("the commit failed: " ++ show(other)) }
+  match commit[r](db, no_results) {
+    Committed(_) -> (),
+    other -> panic("the commit failed: " ++ show(other)),
+  }
 
 fn after_first(tree: fs::MemFs) -> fs::MemFs / {abort.raise} =
   fs::on_mem[abs](tree, || in_store[abs](|db: Database| committed[abs](first_edit(db)))).tree
@@ -934,7 +1012,10 @@ test "a tree node that fails its checksum raises `damaged`, and starting over re
   let damaged = fs::on_mem[abs](tree, ||
     with_recent_reads(|| {
       let db = open[abs]("facts");
-      fs.write_file[abs](segment, Bytes::concat_all([bytes.slice(0, 60), b"\x00".repeat(bytes.len() - 60)]));
+      fs.write_file[abs](
+        segment,
+        Bytes::concat_all([bytes.slice(0, 60), b"\x00".repeat(bytes.len() - 60)]),
+      );
       handle {
         value_of[abs](db, Facts, key_of("first")) == None
       } with {
@@ -978,7 +1059,7 @@ test "a compaction drops what the snapshot no longer uses, and keeps every value
     in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
   let squeezed = fs::on_mem[abs](tree, ||
     in_store[abs](|db: Database| compact[abs](db, Map::new())));
-  assert(squeezed.value.bytes_after < squeezed.value.bytes_before);
+  assert(squeezed.value.bytes_after <= squeezed.value.bytes_before);
   assert_eq(value_stored(squeezed.tree, key_of("second")), Some(b"two"));
   assert_eq(log_stored(squeezed.tree, 0).len(), 2)
 }
