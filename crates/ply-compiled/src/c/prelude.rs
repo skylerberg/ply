@@ -1,12 +1,8 @@
-//! The helpers a loaded unit binds, each read off its function's type.
-
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::native::{Addr, F64, I64, Native, Signature};
 use crate::rt::Ctx;
 
-/// A runtime helper the emitted C may call: what it takes past the context and returns, as its
-/// function's type says, and the function a loaded unit binds it to.
 #[derive(Clone, Copy)]
 pub struct Helper {
     pub name: &'static str,
@@ -14,12 +10,10 @@ pub struct Helper {
     pub address: *const (),
 }
 
-// SAFETY: an address is read and never written through.
 unsafe impl Send for Helper {}
 unsafe impl Sync for Helper {}
 
 impl Helper {
-    /// The helper `name` bound to `f`, taking and returning what `f`'s type says.
     fn of<F: Native>(name: &'static str, f: F) -> Helper {
         Helper {
             name,
@@ -28,7 +22,6 @@ impl Helper {
         }
     }
 
-    /// The words a call passes past the context.
     pub fn args(&self) -> usize {
         self.signature.words()
     }
@@ -38,9 +31,6 @@ impl Helper {
     }
 }
 
-/// A native over machine data, under the name the compiler or a shipped module's `extern fn`
-/// declares and with its function's signature; bound as the helper [`builtin_helper_name`] names
-/// for it.
 pub struct MachineNative {
     pub name: &'static str,
     pub signature: Signature,
@@ -49,7 +39,7 @@ pub struct MachineNative {
 
 macro_rules! machine {
     ($($name:literal => $f:ident($($t:ty),*) $(-> $r:ty)?;)*) => {
-        fn machine_table() -> Vec<MachineNative> {
+        fn runtime_native_table() -> Vec<MachineNative> {
             vec![$({
                 let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = crate::rt::$f;
                 let helper = Box::leak(builtin_helper_name($name).into_boxed_str());
@@ -67,9 +57,7 @@ fn signature_of<F: Native>(_: F) -> Signature {
     F::SIGNATURE
 }
 
-/// The native the compiler declares as `name`, bound to `f` and taking and returning what `f`'s
-/// type says.
-pub(crate) fn machine_native<F: Native>(name: &'static str, f: F) -> MachineNative {
+pub(crate) fn runtime_native<F: Native>(name: &'static str, f: F) -> MachineNative {
     let helper = Box::leak(builtin_helper_name(name).into_boxed_str());
     MachineNative {
         name,
@@ -115,14 +103,10 @@ machine! {
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
 }
 
-/// The natives over machine data: marshalling's and the rest of this table's, then strings' and
-/// byte strings' (`crate::machine`), then those the standard library's host handlers call
-/// (`crate::hosted`), then what `std.machine` declares (`crate::entry`) and what
-/// `std.internal.schedule` does (`crate::tasks`).
-pub fn machine_natives() -> &'static [MachineNative] {
+pub fn runtime_natives() -> &'static [MachineNative] {
     static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        let mut all = machine_table();
+        let mut all = runtime_native_table();
         all.extend(crate::machine::natives());
         all.extend(crate::secret::natives());
         all.extend(crate::hosted::natives());
@@ -132,7 +116,6 @@ pub fn machine_natives() -> &'static [MachineNative] {
     })
 }
 
-/// A helper's parameter as its function takes it: a `Word` unless written otherwise.
 macro_rules! taken {
     ($p:ident) => {
         Word
@@ -144,8 +127,6 @@ macro_rules! taken {
 
 macro_rules! helpers {
     ($($f:ident($($p:ident $(: $t:ty)?),*) $(-> $r:ty)?;)*) => {
-        /// The helpers that are no builtin's: what the emitted C does to values and handlers. Each
-        /// is written as its function's type, which that function must have.
         fn own() -> Vec<Helper> {
             vec![$({
                 let f: unsafe extern "C" fn(*mut Ctx $(, taken!($p $(: $t)?))*) $(-> $r)? =
@@ -213,8 +194,6 @@ helpers! {
 
 macro_rules! never_called {
     ($($name:literal($($t:ty),*) $(-> $r:ty)?;)*) => {
-        /// The names a unit from the release's compiler binds and never calls, which
-        /// [`Exports::bound`](super::Exports::bound) needs to find here.
         fn never_called() -> Vec<Helper> {
             vec![$({
                 unsafe extern "C" fn never(_: *mut Ctx $(, _: $t)*) $(-> $r)? {
@@ -236,8 +215,6 @@ never_called! {
     "builtin_elaborated_functions_compared"() -> I64;
 }
 
-/// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
-/// no C name holds one, and a function of a type is its type in lower case, `_` and its name.
 pub fn builtin_helper_name(builtin: &str) -> String {
     match (builtin.strip_prefix('?'), builtin.split_once("::")) {
         (Some(written), _) => format!("builtin_elaborated_{written}"),
@@ -246,12 +223,10 @@ pub fn builtin_helper_name(builtin: &str) -> String {
     }
 }
 
-/// Every helper a unit may bind: the runtime's own, those it binds and never calls, then a native
-/// over machine data.
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        let machine = machine_natives().iter().map(|n| n.helper);
+        let machine = runtime_natives().iter().map(|n| n.helper);
         own()
             .into_iter()
             .chain(never_called())
@@ -260,8 +235,7 @@ pub fn helpers() -> &'static [Helper] {
     })
 }
 
-/// The runtime's own helpers, which are no native's.
-pub fn own_helpers() -> &'static [Helper] {
+pub fn runtime_helpers() -> &'static [Helper] {
     let all = helpers();
-    &all[..all.len() - machine_natives().len() - never_called().len()]
+    &all[..all.len() - runtime_natives().len() - never_called().len()]
 }

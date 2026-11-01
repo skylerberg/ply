@@ -13,10 +13,10 @@ import compiler.check.infer.walked (WalkedExpression, WalkedLiteral, WalkedRead,
                                     WalkedPerform, WalkedLambda, WalkedSimulate, WalkedParallel,
                                     WalkedHandle, WalkedDefault, WalkedArm, WalkedStatement,
                                     WalkedLet, WalkedLetElse, WalkedDo, WalkedAssign, WalkedField,
-                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVar,
+                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVariable,
                                     walked_expression_nodes_folded)
 import compiler.check.resolve.tables (Diagnostic, error_at, error_at_and)
-import compiler.check.infer.checker (simulated_ops)
+import compiler.check.infer.checker (simulated_operations)
 import compiler.check.infer.names (simple_name_of)
 import std.list
 import std.option
@@ -30,9 +30,9 @@ pub type Facts = {
   opened: (Type) -> Bool / {abort.raise},
 }
 
-pub type ArgumentModes = { kept: List<Int>, all: Bool }
+pub type ArgumentModes = { taken_indices: List<Int>, all: Bool }
 
-fn keeps_argument(t: ArgumentModes, i: Int) -> Bool = t.all || t.kept.contains(i)
+fn takes_argument(t: ArgumentModes, i: Int) -> Bool = t.all || t.taken_indices.contains(i)
 
 pub type Param = { name: Bytes, span: Span, ty: Type, keep: Bool }
 
@@ -140,9 +140,9 @@ pub fn check_ownership(
         in_flight: [],
       },
     },
-    |acc: ScopedState, p: Param| {
+    |accumulator: ScopedState, p: Param| {
       let t = f.resolved(p.ty);
-      bind(acc, p.name, p.span, t, f.resource(t), p.keep)
+      bind(accumulator, p.name, p.span, t, f.resource(t), p.keep)
     },
   );
   let walked = release_scope(
@@ -156,7 +156,7 @@ pub fn check_ownership(
   {
     diagnostics: walked.diagnostics,
     releases: walked.releases,
-    owned_values: walked.releases.fold([], |acc: List<OwnedValue>, r: Release| {
+    owned_values: walked.releases.fold([], |accumulator: List<OwnedValue>, r: Release| {
       let bind = walked.bindings.get(holder_key(r.holder));
       let x = {
         holder: r.holder,
@@ -166,7 +166,7 @@ pub fn check_ownership(
         name: match bind { Some(b) -> b.name, None -> b"a value" },
         returned: r.returned,
       };
-      if acc.contains(x) { acc } else { acc.push(x) }
+      if accumulator.contains(x) { accumulator } else { accumulator.push(x) }
     }),
   }
 }
@@ -188,19 +188,19 @@ fn release_scope(
   at: Span,
   usage: Usage,
 ) -> OwnershipState / {abort.raise} =
-  s.block.reverse().fold(state, |acc: OwnershipState, site: Int|
-    match acc.bindings.get(site) {
-      Some(b) -> if !live(b) { acc } else {
-        let place = release_point(acc, b, last);
+  s.block.reverse().fold(state, |accumulator: OwnershipState, site: Int|
+    match accumulator.bindings.get(site) {
+      Some(b) -> if !live(b) { accumulator } else {
+        let place = release_point(accumulator, b, last);
         release_binding(
-          consume(acc, b, at, b"let go where its block ends"),
+          consume(accumulator, b, at, b"let go where its block ends"),
           b,
           place.at,
           place.place,
           owned_result(f, last, place.place, usage),
         )
       },
-      None -> acc,
+      None -> accumulator,
     })
 
 fn owned_result(
@@ -222,19 +222,28 @@ fn release_binding(
   value: List<ReleaseTarget>,
 ) -> OwnershipState = {
   let w = { effects: b.effects, handled_operations: b.returned };
-  let held = released_values(state, b);
-  let holders = held.map(|x: ReleaseTarget| x.owning_package);
-  let check_ownership = state.bindings.fold([], |acc: List<ReleaseTarget>, key: Int, x: Binding|
-    if x.frame == b.frame && key != b.key && !holders.contains(x.owning_package) && live(x) {
-      acc.concat(released_values(state, x))
-    } else { acc });
+  let released_targets = released_values(state, b);
+  let holders = released_targets.map(|x: ReleaseTarget| x.owning_package);
+  let check_ownership = state.bindings.fold(
+    [],
+    |accumulator: List<ReleaseTarget>, key: Int, x: Binding|
+      if x.frame == b.frame && key != b.key && !holders.contains(x.owning_package) && live(x) {
+        accumulator.concat(released_values(state, x))
+      } else { accumulator },
+  );
   let around = value.concat(state.in_flight.reverse().concat(check_ownership));
-  held.fold(
-    { st: add_releases(state, held, at, place, w), later: held },
-    |acc: { st: OwnershipState, later: List<ReleaseTarget> }, x: ReleaseTarget| {
-      let later = acc.later.drop(1);
+  released_targets.fold(
+    { st: add_releases(state, released_targets, at, place, w), later: released_targets },
+    |accumulator: { st: OwnershipState, later: List<ReleaseTarget> }, x: ReleaseTarget| {
+      let later = accumulator.later.drop(1);
       {
-        st: add_releases(acc.st, later.concat(around), at, ReleaseFailing(x.owning_package), w),
+        st: add_releases(
+          accumulator.st,
+          later.concat(around),
+          at,
+          ReleaseFailing(x.owning_package),
+          w,
+        ),
         later: later,
       }
     },
@@ -269,12 +278,12 @@ fn check_borrowed_bindings(
   last: WalkedExpression,
 ) -> OwnershipState / {abort.raise} =
   if !has_resource_type(f, last) { state } else {
-    sites.fold(state, |acc: OwnershipState, key: Int|
-      match acc.bindings.get(key) {
+    sites.fold(state, |accumulator: OwnershipState, key: Int|
+      match accumulator.bindings.get(key) {
         Some(b) -> if live(b) && may_return_binding(last, b.key) {
-          report(acc, new_resource_dropped(f, last, Borrowed))
-        } else { acc },
-        None -> acc,
+          report(accumulator, new_resource_dropped(f, last, Borrowed))
+        } else { accumulator },
+        None -> accumulator,
       })
   }
 
@@ -290,23 +299,28 @@ fn may_return_binding(e: WalkedExpression, key: Int) -> Bool =
   }
 
 fn release_after(state: OwnershipState, sites: List<Int>, at: Span) -> OwnershipState =
-  sites.reverse().fold(state, |acc: OwnershipState, key: Int|
-    match acc.bindings.get(key) {
-      Some(b) -> if !live(b) { acc } else {
-        release_binding(consume(acc, b, at, b"let go where its block ends"), b, at, ReleaseAfter, [
-        ])
+  sites.reverse().fold(state, |accumulator: OwnershipState, key: Int|
+    match accumulator.bindings.get(key) {
+      Some(b) -> if !live(b) { accumulator } else {
+        release_binding(
+          consume(accumulator, b, at, b"let go where its block ends"),
+          b,
+          at,
+          ReleaseAfter,
+          [],
+        )
       },
-      None -> acc,
+      None -> accumulator,
     })
 
 fn move_to_frame(state: OwnershipState, keys: List<Int>, frame: Int) -> OwnershipState =
-  keys.fold(state, |acc: OwnershipState, key: Int|
-    match acc.bindings.get(key) {
-      Some(b) -> store_binding(acc, { ..b, frame: frame }),
-      None -> acc,
+  keys.fold(state, |accumulator: OwnershipState, key: Int|
+    match accumulator.bindings.get(key) {
+      Some(b) -> store_binding(accumulator, { ..b, frame: frame }),
+      None -> accumulator,
     })
 
-fn never_raises(op: Bytes) -> Bool =
+fn never_raises(operator: Bytes) -> Bool =
   [
     b"or",
     b"and",
@@ -321,7 +335,7 @@ fn never_raises(op: Bytes) -> Bool =
     b"bitand",
     b"concat",
   ].contains(
-    op,
+    operator,
   )
 
 type Walk = { s: Scope, st: OwnershipState, at: Int }
@@ -332,34 +346,34 @@ fn released_values(state: OwnershipState, b: Binding) -> List<ReleaseTarget> =
   match b.kind {
     Value -> [{ owning_package: b.owning_package, ty: b.ty }],
     OwningFunction ->
-      b.captured_resources.fold([], |acc: List<ReleaseTarget>, site: Int|
+      b.captured_resources.fold([], |accumulator: List<ReleaseTarget>, site: Int|
         match state.bindings.get(site) {
-          Some(x) -> acc.push({ owning_package: x.owning_package, ty: x.ty }),
-          None -> acc,
+          Some(x) -> accumulator.push({ owning_package: x.owning_package, ty: x.ty }),
+          None -> accumulator,
         }),
     Continuation -> [],
   }
 
 fn resource_keys(state: OwnershipState, keys: List<Int>) -> List<Int> =
-  keys.fold([], |acc: List<Int>, key: Int|
+  keys.fold([], |accumulator: List<Int>, key: Int|
     match state.bindings.get(key) {
       Some(x) -> if x.kind == OwningFunction {
-        x.captured_resources.fold(acc, |ys: List<Int>, k: Int| ys.push_unique(k))
-      } else { acc.push_unique(key) },
-      None -> acc,
+        x.captured_resources.fold(accumulator, |ys: List<Int>, k: Int| ys.push_unique(k))
+      } else { accumulator.push_unique(key) },
+      None -> accumulator,
     })
 
 fn add_releases(
   state: OwnershipState,
-  held: List<ReleaseTarget>,
+  targets: List<ReleaseTarget>,
   at: Span,
   place: ReleasePlace,
   w: ReleaseContext,
 ) -> OwnershipState =
   {
     ..state,
-    releases: held.fold(state.releases, |acc: List<Release>, x: ReleaseTarget|
-      acc.push({
+    releases: targets.fold(state.releases, |accumulator: List<Release>, x: ReleaseTarget|
+      accumulator.push({
         holder: x.owning_package,
         ty: x.ty,
         at: at,
@@ -380,9 +394,9 @@ fn release_point(
   }
 
 fn mentions_binding(state: OwnershipState, e: WalkedExpression, b: Binding) -> Bool = {
-  let keys = state.bindings.fold([b.key], |acc: List<Int>, key: Int, x: Binding|
-    if x.borrows.contains(b.key) || x.captured_resources.contains(b.key) { acc.push(key) }
-    else { acc });
+  let keys = state.bindings.fold([b.key], |accumulator: List<Int>, key: Int, x: Binding|
+    if x.borrows.contains(b.key) || x.captured_resources.contains(b.key) { accumulator.push(key) }
+    else { accumulator });
   walked_expression_nodes_folded(e, false, |found: Bool, x: WalkedExpression|
     found
       || (match x.node {
@@ -392,18 +406,18 @@ fn mentions_binding(state: OwnershipState, e: WalkedExpression, b: Binding) -> B
 }
 
 fn release_before_last(state: OwnershipState, s: Scope, last: WalkedExpression) -> OwnershipState =
-  s.block.reverse().fold(state, |acc: OwnershipState, key: Int|
-    match acc.bindings.get(key) {
-      Some(b) -> if !live(b) || mentions_binding(acc, last, b) { acc } else {
+  s.block.reverse().fold(state, |accumulator: OwnershipState, key: Int|
+    match accumulator.bindings.get(key) {
+      Some(b) -> if !live(b) || mentions_binding(accumulator, last, b) { accumulator } else {
         release_binding(
-          consume(acc, b, last.span, b"let go before its block's last expression"),
+          consume(accumulator, b, last.span, b"let go before its block's last expression"),
           b,
           last.span,
           ReleaseBefore,
           [],
         )
       },
-      None -> acc,
+      None -> accumulator,
     })
 
 fn release_on_exit(
@@ -414,18 +428,18 @@ fn release_on_exit(
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
   let value = owned_result(f, at, ReleaseAfter, usage);
-  let leaving = sites.reverse().fold(state, |acc: OwnershipState, site: Int|
-    match acc.bindings.get(site) {
-      Some(b) -> if !live(b) { acc } else {
+  let leaving = sites.reverse().fold(state, |accumulator: OwnershipState, site: Int|
+    match accumulator.bindings.get(site) {
+      Some(b) -> if !live(b) { accumulator } else {
         release_binding(
-          consume(acc, b, at.span, b"let go on a way out of its block"),
+          consume(accumulator, b, at.span, b"dropped when control leaves its block early"),
           b,
           at.span,
           ReleaseAfter,
           value,
         )
       },
-      None -> acc,
+      None -> accumulator,
     });
   { ..state, releases: leaving.releases }
 }
@@ -436,8 +450,9 @@ fn release_on_failure(s: Scope, state: OwnershipState, at: Span) -> OwnershipSta
 fn failing(s: Scope, state: OwnershipState, at: Span, place: ReleasePlace) -> OwnershipState = {
   let check_ownership = state.bindings.fold(
     [],
-    |acc: List<ReleaseTarget>, site: Int, b: Binding|
-      if b.frame == s.frame && live(b) { acc.concat(released_values(state, b)) } else { acc },
+    |accumulator: List<ReleaseTarget>, site: Int, b: Binding|
+      if b.frame == s.frame && live(b) { accumulator.concat(released_values(state, b)) }
+      else { accumulator },
   );
   add_releases(
     state,
@@ -494,8 +509,8 @@ fn bind_as(
 fn release_context(s: Scope) -> ReleaseContext =
   {
     effects: s.effects,
-    handled_operations: s.handles.fold([], |acc: List<Bytes>, h: EnclosingHandle|
-      if h.body == s.body { acc.concat(h.operations) } else { acc }),
+    handled_operations: s.handles.fold([], |accumulator: List<Bytes>, h: EnclosingHandle|
+      if h.body == s.body { accumulator.concat(h.operations) } else { accumulator }),
   }
 
 fn binding_of(state: OwnershipState, l: { name: Bytes, binder: Int }) -> Option<Binding> =
@@ -521,14 +536,14 @@ fn check_use(
   span: Span,
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
-  let crossed = s.functions.drop(b.depth);
+  let enclosing_functions = s.functions.drop(b.depth);
   let called = match usage { Called -> true, _ -> false };
   let once = match b.ty { FunctionType(t) -> t.once, _ -> false };
   let use = if !called { usage } else if b.owned || once { Moved(b"called") } else { Borrowed };
   match b.consumed {
     Some(g) -> report(state, used_after_consumed(f, b, span, g)),
     None -> match consumed_borrowed_from(state, b) {
-      Some(lender) -> report(state, borrow_after_consumed(f, b, span, lender)),
+      Some(borrowed_from) -> report(state, borrow_after_consumed(f, b, span, borrowed_from)),
       None -> if b.taken.len() > 0 && use != Read { report(state, partly_moved(f, b, span)) }
       else if b.kind == OwningFunction && b.owned && !called && use != Read && use != Discarded {
         report(state, owning_function_passed(f, b, span))
@@ -537,15 +552,15 @@ fn check_use(
           Moved(how) -> if b.kind == OwningFunction && !b.owned {
             report(state, escaping_borrower_error(f, b, span))
           } else if !b.owned { report(state, consumed_borrowed(f, b, span, how)) } else {
-            match crossed.find(|x: EnclosingFunction| !x.local) {
+            match enclosing_functions.find(|x: EnclosingFunction| !x.local) {
               Some(fun) ->
                 report(consume(state, b, span, how), consumed_in_lambda(f, b, span, fun)),
-              None -> record_capture(consume(state, b, span, how), crossed, b, true),
+              None -> record_capture(consume(state, b, span, how), enclosing_functions, b, true),
             }
           },
-          Borrowed -> match crossed.find(|x: EnclosingFunction| x.escapes) {
+          Borrowed -> match enclosing_functions.find(|x: EnclosingFunction| x.escapes) {
             Some(fun) -> report(state, escaping_borrow_error(f, b, span, fun)),
-            None -> record_capture(state, crossed, b, false),
+            None -> record_capture(state, enclosing_functions, b, false),
           },
           Read -> report(state, resource_copied_error(f, b, span)),
           Discarded -> if b.owned { report(state, dropped_binding(f, b, span)) } else { state },
@@ -558,26 +573,26 @@ fn check_use(
 
 fn record_capture(
   state: OwnershipState,
-  crossed: List<EnclosingFunction>,
+  enclosing_functions: List<EnclosingFunction>,
   b: Binding,
   consumed: Bool,
 ) -> OwnershipState =
-  crossed.fold(state, |acc: OwnershipState, fun: EnclosingFunction|
-    if !fun.local { acc } else {
-      let was = match acc.captured.get(fun.span.site) {
+  enclosing_functions.fold(state, |accumulator: OwnershipState, fun: EnclosingFunction|
+    if !fun.local { accumulator } else {
+      let was = match accumulator.captured.get(fun.span.site) {
         Some(c) -> c,
         None -> { consumed: [], borrows: [] },
       };
       let borrowed = b.borrows.fold(was.borrows, |xs: List<Int>, k: Int| xs.push_unique(k));
       let now = if consumed { { consumed: was.consumed.push_unique(b.key), borrows: borrowed } }
       else { { ..was, borrows: borrowed.push_unique(b.key) } };
-      { ..acc, captured: acc.captured.insert(fun.span.site, now) }
+      { ..accumulator, captured: accumulator.captured.insert(fun.span.site, now) }
     })
 
 fn consumed_borrowed_from(state: OwnershipState, b: Binding) -> Option<Binding> =
-  b.borrows.fold(None, |acc: Option<Binding>, k: Int|
-    match acc {
-      Some(_) -> acc,
+  b.borrows.fold(None, |accumulator: Option<Binding>, k: Int|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> match state.bindings.get(k) {
         Some(x) -> if x.consumed != None || x.taken.len() > 0 { Some(x) } else { None },
         None -> None,
@@ -600,25 +615,25 @@ fn walk(
     },
     WalkedRead(_) -> state,
     WalkedBinary(b) -> {
-      let sides = [b.lhs, b.rhs].fold(
+      let sides = [b.left_operand, b.right_operand].fold(
         { st: state, left: state },
-        |acc: { st: OwnershipState, left: OwnershipState }, x: WalkedExpression|
-          { st: walk(f, s, acc.st, x, Read), left: acc.st },
+        |accumulator: { st: OwnershipState, left: OwnershipState }, x: WalkedExpression|
+          { st: walk(f, s, accumulator.st, x, Read), left: accumulator.st },
       );
-      let both = if b.op == b"and" || b.op == b"or" {
+      let both = if b.operation == b"and" || b.operation == b"or" {
         check_guard_consumed(
           f,
           sides.left,
           sides.st,
-          b.rhs.span,
+          b.right_operand.span,
           b"the right of `&&` or `||`, which may not run",
         )
       } else { sides.st };
-      if never_raises(b.op) { both } else { release_on_failure(s, both, e.span) }
+      if never_raises(b.operation) { both } else { release_on_failure(s, both, e.span) }
     },
     WalkedUnary(u) -> {
       let operand = walk(f, s, state, u.operand, Read);
-      if u.op == b"neg" { release_on_failure(s, operand, e.span) } else { operand }
+      if u.operation == b"neg" { release_on_failure(s, operand, e.span) } else { operand }
     },
     WalkedLambda(l) ->
       check_new_value(
@@ -653,10 +668,10 @@ fn walk(
         && (match b.statements.at(last) { Some(WalkedDo(_)) -> true, _ -> false });
       let walked = b.statements.fold(
         { s: { ..s, block: [], result: usage }, st: state, at: 0 },
-        |acc: Walk, x: WalkedStatement|
-          if ends_in_statement && acc.at == last { acc } else {
-            let o = walk_statement(f, { s: acc.s, st: acc.st }, x);
-            { s: o.s, st: o.st, at: acc.at + 1 }
+        |accumulator: Walk, x: WalkedStatement|
+          if ends_in_statement && accumulator.at == last { accumulator } else {
+            let o = walk_statement(f, { s: accumulator.s, st: accumulator.st }, x);
+            { s: o.s, st: o.st, at: accumulator.at + 1 }
           },
       );
       match b.tail {
@@ -690,16 +705,16 @@ fn walk(
       }
     },
     WalkedRecord(fs) -> {
-      let held = fs.fold(state, |acc: OwnershipState, x: WalkedField|
+      let state_with_values = fs.fold(state, |accumulator: OwnershipState, x: WalkedField|
         put_in_flight(
           f,
           s,
-          acc,
-          walk(f, s, acc, x.value, stored_in_record()),
+          accumulator,
+          walk(f, s, accumulator, x.value, stored_in_record()),
           x.value,
           stored_in_record(),
         ));
-      check_new_value(f, { ..held, in_flight: state.in_flight }, e, usage)
+      check_new_value(f, { ..state_with_values, in_flight: state.in_flight }, e, usage)
     },
     WalkedUpdate(u) -> {
       let how = if has_resource_type(f, u.base) { Moved(b"updated into a new record") }
@@ -714,19 +729,19 @@ fn walk(
         },
         None -> check_overwritten_fields(f, s, walk(f, s, state, u.base, how), u.base, u.sets),
       };
-      let held = u.sets.fold(
+      let state_with_values = u.sets.fold(
         put_in_flight(f, s, state, base, u.base, how),
-        |acc: OwnershipState, x: WalkedField|
+        |accumulator: OwnershipState, x: WalkedField|
           put_in_flight(
             f,
             s,
-            acc,
-            walk(f, s, acc, x.value, stored_in_record()),
+            accumulator,
+            walk(f, s, accumulator, x.value, stored_in_record()),
             x.value,
             stored_in_record(),
           ),
       );
-      check_new_value(f, { ..held, in_flight: state.in_flight }, e, usage)
+      check_new_value(f, { ..state_with_values, in_flight: state.in_flight }, e, usage)
     },
     WalkedFieldRead(x) ->
       walk_field(
@@ -744,28 +759,32 @@ fn walk(
       ),
     WalkedList(items) -> {
       let how = Moved(b"stored in a list");
-      let held = items.fold(state, |acc: OwnershipState, x: WalkedExpression|
-        put_in_flight(f, s, acc, walk(f, s, acc, x, how), x, how));
-      check_new_value(f, { ..held, in_flight: state.in_flight }, e, usage)
+      let state_with_values = items.fold(
+        state,
+        |accumulator: OwnershipState, x: WalkedExpression|
+          put_in_flight(f, s, accumulator, walk(f, s, accumulator, x, how), x, how),
+      );
+      check_new_value(f, { ..state_with_values, in_flight: state.in_flight }, e, usage)
     },
     WalkedPerform(p) -> {
-      let kept = f.operation_consumed_parameters(p.effect, p.op);
+      let consumed_parameters = f.operation_consumed_parameters(p.effect, p.operation);
       let how = Bytes::concat_all([
         b"handed to `",
         simple_name_of(p.effect),
         b".",
-        p.op,
-        b"`, which takes it",
+        p.operation,
+        b"`, which consumes the value",
       ]);
       let args = p.args.fold(
         { st: state, at: 0 },
-        |acc: { st: OwnershipState, at: Int }, x: WalkedExpression|
+        |accumulator: { st: OwnershipState, at: Int }, x: WalkedExpression|
           {
             st: {
-              let usage = if kept.contains(acc.at) { Moved(how) } else { Borrowed };
-              put_in_flight(f, s, acc.st, walk(f, s, acc.st, x, usage), x, usage)
+              let usage = if consumed_parameters.contains(accumulator.at) { Moved(how) }
+              else { Borrowed };
+              put_in_flight(f, s, accumulator.st, walk(f, s, accumulator.st, x, usage), x, usage)
             },
-            at: acc.at + 1,
+            at: accumulator.at + 1,
           },
       ).st;
       check_new_value(f, arguments_taken(s, state, args, e.span), e, usage)
@@ -778,7 +797,7 @@ fn walk(
           f,
           {
             ..isolated_scope(s, t.body.span),
-            handles: s.handles.push({ operations: simulated_ops(), body: s.body }),
+            handles: s.handles.push({ operations: simulated_operations(), body: s.body }),
           },
           { ..state, in_flight: [] },
           t.body,
@@ -788,12 +807,12 @@ fn walk(
       ),
     WalkedParallel(ts) -> {
       let how = Moved(b"returned by a branch");
-      let held = ts.fold(state, |acc: OwnershipState, t: WalkedThunk|
+      let state_with_values = ts.fold(state, |accumulator: OwnershipState, t: WalkedThunk|
         {
-          ..walk(f, isolated_scope(s, t.body.span), { ..acc, in_flight: [] }, t.body, how),
-          in_flight: acc.in_flight,
+          ..walk(f, isolated_scope(s, t.body.span), { ..accumulator, in_flight: [] }, t.body, how),
+          in_flight: accumulator.in_flight,
         });
-      check_new_value(f, release_on_failure(s, held, e.span), e, usage)
+      check_new_value(f, release_on_failure(s, state_with_values, e.span), e, usage)
     },
   }
 
@@ -812,11 +831,12 @@ fn release_after_handler(
 ) -> OwnershipState = {
   let staying = before.bindings.fold(
     before.in_flight,
-    |acc: List<ReleaseTarget>, key: Int, b: Binding|
-      if !live(b) { acc } else {
+    |accumulator: List<ReleaseTarget>, key: Int, b: Binding|
+      if !live(b) { accumulator } else {
         match after.bindings.get(key) {
-          Some(y) -> if live(y) { acc.concat(released_values(after, y)) } else { acc },
-          None -> acc,
+          Some(y) -> if live(y) { accumulator.concat(released_values(after, y)) }
+          else { accumulator },
+          None -> accumulator,
         }
       },
   );
@@ -850,11 +870,12 @@ fn check_overwritten_fields(
     None -> [],
   };
   let written = sets.filter(|x: WalkedField| resources.contains(x.name));
-  let held = binding_read(s, state, base);
-  let moved = match held { Some(b) -> b.taken, None -> [] };
-  let rejected = written.fold(state, |acc: OwnershipState, x: WalkedField|
-    if moved.contains(x.name) { acc } else { report(acc, written_over(f, x.name, x.value.span)) });
-  match held {
+  let record_binding = binding_read(s, state, base);
+  let moved = match record_binding { Some(b) -> b.taken, None -> [] };
+  let rejected = written.fold(state, |accumulator: OwnershipState, x: WalkedField|
+    if moved.contains(x.name) { accumulator }
+    else { report(accumulator, written_over(f, x.name, x.value.span)) });
+  match record_binding {
     Some(b) -> if moved.len() > 0 && moved.all(|n: Bytes| sets.any(|x: WalkedField| x.name == n)) {
       store_binding(rejected, { ..b, taken: [] })
     } else { rejected },
@@ -870,7 +891,8 @@ fn put_in_flight(
   x: WalkedExpression,
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
-  let flying = |held: List<ReleaseTarget>| { ..walked, in_flight: walked.in_flight.concat(held) };
+  let flying = |targets: List<ReleaseTarget>|
+    { ..walked, in_flight: walked.in_flight.concat(targets) };
   match usage {
     Moved(_) -> match x.node {
       WalkedRead(WalkedLocal(l)) -> match binding_of(state, l) {
@@ -949,7 +971,7 @@ fn walk_call(
       walk_arguments(f, s, walk(f, s, state, function, Read), value_call_modes(f, function), args),
   }
 
-fn all_taken() -> ArgumentModes = { kept: [], all: true }
+fn all_taken() -> ArgumentModes = { taken_indices: [], all: true }
 
 type CallModes = { taking: ArgumentModes, params: List<Type> }
 
@@ -965,8 +987,9 @@ fn named(f: Facts, function: WalkedExpression, key: Bytes) -> CallModes / {abort
 
 fn value_call_modes(f: Facts, function: WalkedExpression) -> CallModes / {abort.raise} =
   match type_of(f, function) {
-    FunctionType(t) -> { taking: { kept: t.kept, all: false }, params: t.params },
-    _ -> { taking: { kept: [], all: false }, params: [] },
+    FunctionType(t) ->
+      { taking: { taken_indices: t.keep_parameters, all: false }, params: t.params },
+    _ -> { taking: { taken_indices: [], all: false }, params: [] },
   }
 
 fn walk_arguments(
@@ -976,11 +999,21 @@ fn walk_arguments(
   c: CallModes,
   args: List<WalkedExpression>,
 ) -> OwnershipState / {abort.raise} =
-  args.fold({ st: state, at: 0 }, |acc: { st: OwnershipState, at: Int }, x: WalkedExpression|
-    {
-      st: walk_argument(f, s, acc.st, x, keeps_argument(c.taking, acc.at), c.params.at(acc.at)),
-      at: acc.at + 1,
-    }).st
+  args.fold(
+    { st: state, at: 0 },
+    |accumulator: { st: OwnershipState, at: Int }, x: WalkedExpression|
+      {
+        st: walk_argument(
+          f,
+          s,
+          accumulator.st,
+          x,
+          takes_argument(c.taking, accumulator.at),
+          c.params.at(accumulator.at),
+        ),
+        at: accumulator.at + 1,
+      },
+  ).st
 
 fn walk_argument(
   f: Facts,
@@ -990,11 +1023,11 @@ fn walk_argument(
   keep: Bool,
   ty: Option<Type>,
 ) -> OwnershipState / {abort.raise} = {
-  let usage = if keep { Moved(b"handed to a parameter that takes it") } else { Borrowed };
+  let usage = if keep { Moved(b"passed to a `keep` parameter") } else { Borrowed };
   match arg.node {
     WalkedLambda(l) ->
       walk_lambda(f, s, state, arg, l, enclosing_function_at(arg.span, usage), match ty {
-        Some(FunctionType(t)) -> t.kept,
+        Some(FunctionType(t)) -> t.keep_parameters,
         _ -> [],
       }).st,
     _ -> put_in_flight(f, s, state, walk(f, s, state, arg, usage), arg, usage),
@@ -1064,7 +1097,7 @@ fn walk_lambda(
   s: Scope,
   state: OwnershipState,
   e: WalkedExpression,
-  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: WalkedExpression, effects: Effects },
+  l: { params: List<TypedParam<Type>>, owned_parameters: List<Int>, body: WalkedExpression, effects: Effects },
   fun: EnclosingFunction,
   given: List<Int>,
 ) -> { st: OwnershipState, captured: Captures } / {abort.raise} = {
@@ -1079,10 +1112,17 @@ fn walk_lambda(
     },
     st: { ..state, in_flight: [] },
   };
-  let params = range(0, l.params.len()).fold(inner, |acc: ScopedState, i: Int| {
+  let params = range(0, l.params.len()).fold(inner, |accumulator: ScopedState, i: Int| {
     let p = l.params.get(i);
     let t = f.resolved(p.ty);
-    bind(acc, p.name, p.span, t, f.resource(t), l.kept.contains(i) || given.contains(i))
+    bind(
+      accumulator,
+      p.name,
+      p.span,
+      t,
+      f.resource(t),
+      l.owned_parameters.contains(i) || given.contains(i),
+    )
   });
   let body = release_scope(
     f,
@@ -1157,7 +1197,7 @@ fn bind_lambda(
   name: Bytes,
   at: Span,
   e: WalkedExpression,
-  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: WalkedExpression, effects: Effects },
+  l: { params: List<TypedParam<Type>>, owned_parameters: List<Int>, body: WalkedExpression, effects: Effects },
 ) -> ScopedState / {abort.raise} = {
   let local: EnclosingFunction = { span: e.span, escapes: false, local: true };
   let first = walk_lambda(f, b.s, b.st, e, l, local, []);
@@ -1203,8 +1243,8 @@ fn bind_pattern(
   let checked = if check_ownership { check_wildcard_resources(f, b.st, pattern) } else { b.st };
   binders(f, pattern).fold(
     { s: b.s, st: checked },
-    |acc: ScopedState, p: { name: Bytes, span: Span, ty: Type }|
-      bind(acc, p.name, p.span, p.ty, f.resource(p.ty), check_ownership),
+    |accumulator: ScopedState, p: { name: Bytes, span: Span, ty: Type }|
+      bind(accumulator, p.name, p.span, p.ty, f.resource(p.ty), check_ownership),
   )
 }
 
@@ -1274,11 +1314,11 @@ fn check_wildcard_resources(
     TypedWild(w) -> if f.resource(f.resolved(w.ty)) { report(state, wildcard_resource(f, w.span)) }
     else { state },
     TypedCase(c) ->
-      c.args.fold(state, |acc: OwnershipState, a: TypedPattern<Type>|
-        check_wildcard_resources(f, acc, a)),
+      c.args.fold(state, |accumulator: OwnershipState, a: TypedPattern<Type>|
+        check_wildcard_resources(f, accumulator, a)),
     TypedRecordPattern(r) -> {
-      let named = r.fields.fold(state, |acc: OwnershipState, x: TypedFieldPattern<Type>|
-        check_wildcard_resources(f, acc, x.pattern));
+      let named = r.fields.fold(state, |accumulator: OwnershipState, x: TypedFieldPattern<Type>|
+        check_wildcard_resources(f, accumulator, x.pattern));
       if !r.rest { named } else {
         let left = match record_fields(f.resolved(r.ty)) {
           Some(fs) ->
@@ -1290,8 +1330,8 @@ fn check_wildcard_resources(
       }
     },
     TypedListPattern(l) -> {
-      let items = l.items.fold(state, |acc: OwnershipState, a: TypedPattern<Type>|
-        check_wildcard_resources(f, acc, a));
+      let items = l.items.fold(state, |accumulator: OwnershipState, a: TypedPattern<Type>|
+        check_wildcard_resources(f, accumulator, a));
       match l.rest {
         Some(TypedWild(w)) -> if f.resource(f.resolved(w.ty)) {
           report(items, rest_dropped(f, w.span))
@@ -1301,8 +1341,8 @@ fn check_wildcard_resources(
       }
     },
     TypedOr(alts) ->
-      alts.fold(state, |acc: OwnershipState, a: TypedPattern<Type>|
-        check_wildcard_resources(f, acc, a)),
+      alts.fold(state, |accumulator: OwnershipState, a: TypedPattern<Type>|
+        check_wildcard_resources(f, accumulator, a)),
     _ -> state,
   }
 
@@ -1316,14 +1356,16 @@ fn join_paths(
 ) -> OwnershipState / {abort.raise} = {
   let ending = range(0, ends.len()).map(|i: Int| {
     let branch = branches.get(i);
-    let unconsumed = before.bindings.fold([], |acc: List<Binding>, key: Int, b: Binding|
+    let unconsumed = before.bindings.fold([], |accumulator: List<Binding>, key: Int, b: Binding|
       if !live(b)
           || !ends.any(|x: OwnershipState|
-            match x.bindings.get(key) { Some(y) -> y.consumed != None, None -> false }) { acc }
-      else {
+            match x.bindings.get(key) { Some(y) -> y.consumed != None, None -> false }) {
+        accumulator
+      } else {
         match ends.get(i).bindings.get(key) {
-          Some(y) -> if y.consumed == None && y.taken.len() == 0 { acc.push(b) } else { acc },
-          None -> acc,
+          Some(y) -> if y.consumed == None && y.taken.len() == 0 { accumulator.push(b) }
+          else { accumulator },
+          None -> accumulator,
         }
       });
     let early = unconsumed.filter(|b: Binding|
@@ -1336,7 +1378,7 @@ fn join_paths(
         match x.bindings.get(b.key) {
           Some(z) ->
             release_binding(
-              consume(x, z, at, b"let go where a branch that does not take it runs"),
+              consume(x, z, at, b"dropped in a branch that does not consume it"),
               z,
               at,
               place,
@@ -1361,51 +1403,60 @@ fn join_paths(
   let merged = ends.fold(
     { st: before, at: 0 },
     |w: { st: OwnershipState, at: Int }, x: OwnershipState| {
-      let acc = w.st;
+      let accumulator = w.st;
       let mine = ending.get(w.at);
       let first = mine.first.filter(|r: Release| r.place == ReleaseBefore).map(|r: Release|
         r.holder);
       let fails = |r: Release| on_failure(r.place) && first.contains(r.holder);
       {
         st: {
-          module: acc.module,
-          bindings: x.bindings.fold(acc.bindings, |m: Map<Int, Binding>, key: Int, b: Binding|
-            match m.get(key) {
-              Some(was) -> if was.consumed == None
-                  && (b.consumed != None || was.taken.len() < b.taken.len()) { m.insert(key, b) }
-              else { m },
-              None -> m.insert(key, b),
-            }),
-          diagnostics: acc.diagnostics.concat(x.diagnostics.drop(before.diagnostics.len())).concat(
+          module: accumulator.module,
+          bindings: x.bindings.fold(
+            accumulator.bindings,
+            |m: Map<Int, Binding>, key: Int, b: Binding|
+              match m.get(key) {
+                Some(was) -> if was.consumed == None
+                    && (b.consumed != None || was.taken.len() < b.taken.len()) { m.insert(key, b) }
+                else { m },
+                None -> m.insert(key, b),
+              },
+          ),
+          diagnostics: accumulator.diagnostics.concat(
+            x.diagnostics.drop(before.diagnostics.len()),
+          ).concat(
             mine.rejected,
           ),
-          releases: acc.releases.concat(mine.first).concat(
+          releases: accumulator.releases.concat(mine.first).concat(
             x.releases.drop(before.releases.len()).filter(|r: Release| !fails(r)),
           ).concat(
             mine.last,
           ),
-          in_flight: acc.in_flight,
-          captured: x.captured.fold(acc.captured, |m: Map<Int, Captures>, k: Int, c: Captures|
-            match m.get(k) {
-              Some(was) ->
-                m.insert(k, {
-                  consumed: c.consumed.fold(was.consumed, |xs: List<Int>, i: Int|
-                    xs.push_unique(i)),
-                  borrows: c.borrows.fold(was.borrows, |bs: List<Int>, i: Int| bs.push_unique(i)),
-                }),
-              None -> m.insert(k, c),
-            }),
+          in_flight: accumulator.in_flight,
+          captured: x.captured.fold(
+            accumulator.captured,
+            |m: Map<Int, Captures>, k: Int, c: Captures|
+              match m.get(k) {
+                Some(was) ->
+                  m.insert(k, {
+                    consumed: c.consumed.fold(was.consumed, |xs: List<Int>, i: Int|
+                      xs.push_unique(i)),
+                    borrows: c.borrows.fold(was.borrows, |bs: List<Int>, i: Int| bs.push_unique(i)),
+                  }),
+                None -> m.insert(k, c),
+              },
+          ),
         },
         at: w.at + 1,
       }
     },
   ).st;
-  before.bindings.fold(merged, |acc: OwnershipState, key: Int, b: Binding| {
+  before.bindings.fold(merged, |accumulator: OwnershipState, key: Int, b: Binding| {
     let after = ends.map(|x: OwnershipState| x.bindings.get(key));
     let moved = after.any(|y: Option<Binding>|
       match y { Some(z) -> z.consumed == None && z.taken.len() > 0, None -> false });
     let whole = after.any(|y: Option<Binding>| match y { Some(z) -> live(z), None -> false });
-    if live(b) && moved && whole { report(acc, moved_on_one_path(acc.module, b)) } else { acc }
+    if live(b) && moved && whole { report(accumulator, moved_on_one_path(accumulator.module, b)) }
+    else { accumulator }
   })
 }
 
@@ -1419,7 +1470,7 @@ fn walk_match(
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
   let at = scrutinee.span;
-  let held = binding_read(s, state, scrutinee);
+  let scrutinee_binding = binding_read(s, state, scrutinee);
   let ty = type_of(f, scrutinee);
   let opened = f.opened(ty);
   let through = match scrutinee.node {
@@ -1429,8 +1480,8 @@ fn walk_match(
     _ -> false,
   };
   let local = match scrutinee.node { WalkedRead(WalkedLocal(_)) -> true, _ -> false };
-  let made = held == None && !local && !through && f.resource(ty);
-  let start: OwnershipState = match held {
+  let made = scrutinee_binding == None && !local && !through && f.resource(ty);
+  let start: OwnershipState = match scrutinee_binding {
     Some(b) -> check_use(f, s, state, b, at, Borrowed),
     None -> if made {
       store_binding(walk(f, s, state, scrutinee, Moved(b"matched")), {
@@ -1452,11 +1503,11 @@ fn walk_match(
       })
     } else { walk(f, s, state, scrutinee, if through { Borrowed } else { Read }) },
   };
-  let key = match held {
+  let key = match scrutinee_binding {
     Some(b) -> if b.owned { Some(b.key) } else { None },
     None -> if made { Some(at.site) } else { None },
   };
-  let check_ownership = match held { Some(b) -> b.owned, None -> made };
+  let check_ownership = match scrutinee_binding { Some(b) -> b.owned, None -> made };
   let ends = arms.map(|a: WalkedArm| {
     let binds = opened || binds_resource(f, a.pattern);
     let taken: OwnershipState = match key {
@@ -1465,7 +1516,7 @@ fn walk_match(
           Some(b) ->
             check_wildcard_resources(
               f,
-              consume(start, b, a.pattern_span, b"taken apart by a `match` arm"),
+              consume(start, b, a.pattern_span, b"destructured by a `match` arm"),
               a.pattern,
             ),
           None -> start,
@@ -1475,8 +1526,8 @@ fn walk_match(
     };
     let inner = binders(f, a.pattern).fold(
       { s: { ..s, block: [] }, st: taken },
-      |acc: ScopedState, p: { name: Bytes, span: Span, ty: Type }|
-        bind(acc, p.name, p.span, p.ty, f.resource(p.ty), check_ownership),
+      |accumulator: ScopedState, p: { name: Bytes, span: Span, ty: Type }|
+        bind(accumulator, p.name, p.span, p.ty, f.resource(p.ty), check_ownership),
     );
     let guarded = match a.guard {
       Some(g) ->
@@ -1485,7 +1536,7 @@ fn walk_match(
           inner.st,
           walk(f, inner.s, inner.st, g, Read),
           g.span,
-          b"a guard, which hands the value to the next arm where it fails",
+          b"a guard, which passes the value on to the next arm when the guard fails",
         ),
       None -> inner.st,
     };
@@ -1536,12 +1587,12 @@ fn check_outer_consumed(
   block: List<Int>,
   at: Span,
 ) -> OwnershipState =
-  before.bindings.fold(out, |acc: OwnershipState, key: Int, b: Binding|
+  before.bindings.fold(out, |accumulator: OwnershipState, key: Int, b: Binding|
     match after.bindings.get(key) {
       Some(y) -> if live(b) && !live(y) && !block.contains(key) {
-        report(acc, fallback_consumed(f, b, at))
-      } else { acc },
-      None -> acc,
+        report(accumulator, fallback_consumed(f, b, at))
+      } else { accumulator },
+      None -> accumulator,
     })
 
 fn check_guard_consumed(
@@ -1551,12 +1602,12 @@ fn check_guard_consumed(
   at: Span,
   what: Bytes,
 ) -> OwnershipState =
-  before.bindings.fold(after, |acc: OwnershipState, key: Int, b: Binding|
+  before.bindings.fold(after, |accumulator: OwnershipState, key: Int, b: Binding|
     match after.bindings.get(key) {
       Some(y) -> if live(b) && !live(y) {
-        report(store_binding(acc, b), guard_consumed(f, b, at, what))
-      } else { acc },
-      None -> acc,
+        report(store_binding(accumulator, b), guard_consumed(f, b, at, what))
+      } else { accumulator },
+      None -> accumulator,
     })
 
 fn walk_handle(
@@ -1564,36 +1615,47 @@ fn walk_handle(
   s: Scope,
   state: OwnershipState,
   e: WalkedExpression,
-  h: { body: WalkedExpression, effects: Effects, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> },
+  h: { body: WalkedExpression, effects: Effects, clauses: List<WalkedClause>, return_clause: Option<WalkedReturn>, variables: List<WalkedHandlerVariable> },
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
-  let ops = h.clauses.map(|c: WalkedClause| Bytes::concat_all([c.effect, b".", c.op]));
-  let vars = h.vars.fold({ s: s, st: state }, |acc: ScopedState, v: WalkedHandlerVar| {
-    let held = has_resource_type(f, v.init);
-    let walked = walk(f, acc.s, acc.st, v.init, if held { Moved(b"stored in a handler's variable") }
-    else { Read });
-    { ..acc, st: if held { report(walked, handler_variable_resource(f, v)) } else { walked } }
-  });
+  let operation_names = h.clauses.map(|c: WalkedClause|
+    Bytes::concat_all([c.effect, b".", c.operation]));
+  let handler_scope = h.variables.fold(
+    { s: s, st: state },
+    |accumulator: ScopedState, v: WalkedHandlerVariable| {
+      let is_resource = has_resource_type(f, v.init);
+      let walked = walk(f, accumulator.s, accumulator.st, v.init, if is_resource {
+        Moved(b"stored in a handler's variable")
+      } else { Read });
+      {
+        ..accumulator,
+        st: if is_resource { report(walked, handler_variable_resource(f, v)) } else { walked },
+      }
+    },
+  );
   let inside = release_after_handler(
-    vars.st,
+    handler_scope.st,
     walk(
       f,
-      { ..s, handles: s.handles.push({ operations: ops, body: s.body }) },
-      vars.st,
+      { ..s, handles: s.handles.push({ operations: operation_names, body: s.body }) },
+      handler_scope.st,
       h.body,
-      match h.ret { Some(_) -> Moved(b"returned to the `return` clause"), None -> usage },
+      match h.return_clause { Some(_) -> Moved(b"returned to the `return` clause"), None -> usage },
     ),
     e.span,
     release_context(s),
   );
-  let clauses = h.clauses.fold(inside, |acc: OwnershipState, c: WalkedClause| {
-    let kept = f.operation_consumed_parameters(c.effect, c.op);
+  let clauses = h.clauses.fold(inside, |accumulator: OwnershipState, c: WalkedClause| {
+    let consumed_parameters = f.operation_consumed_parameters(c.effect, c.operation);
     let given = range(0, c.params.len()).fold(
-      { s: { ..isolated_scope(vars.s, c.span), block: [] }, st: { ..acc, in_flight: [] } },
+      {
+        s: { ..isolated_scope(handler_scope.s, c.span), block: [] },
+        st: { ..accumulator, in_flight: [] },
+      },
       |x: ScopedState, i: Int| {
         let p = c.params.get(i);
         let t = f.resolved(p.ty);
-        bind(x, p.name, p.span, t, f.resource(t), kept.contains(i))
+        bind(x, p.name, p.span, t, f.resource(t), consumed_parameters.contains(i))
       },
     );
     let resumed = match c.continuation {
@@ -1614,27 +1676,33 @@ fn walk_handle(
       c.body.span,
       usage,
     );
-    { ..ended, in_flight: acc.in_flight }
+    { ..ended, in_flight: accumulator.in_flight }
   });
-  match h.ret {
+  match h.return_clause {
     None -> clauses,
     Some(r) -> {
       let inner: ScopedState = {
-        s: { ..isolated_scope(vars.s, r.span), block: [] },
+        s: { ..isolated_scope(handler_scope.s, r.span), block: [] },
         st: { ..clauses, in_flight: [] },
       };
       let t = type_of(f, h.body);
-      let held = bind(inner, r.binder.name, r.binder.span, t, f.resource(t), true);
+      let return_scope = bind(inner, r.binder.name, r.binder.span, t, f.resource(t), true);
       let ended = release_scope(
         f,
         check_borrowed_result(
           f,
-          walk(f, held.s, release_before_last(held.st, held.s, r.body), r.body, usage),
-          held.s,
+          walk(
+            f,
+            return_scope.s,
+            release_before_last(return_scope.st, return_scope.s, r.body),
+            r.body,
+            usage,
+          ),
+          return_scope.s,
           r.body,
           usage,
         ),
-        held.s,
+        return_scope.s,
         r.body,
         r.body.span,
         usage,
@@ -1655,12 +1723,12 @@ fn used_after_consumed(f: Facts, b: Binding, span: Span, g: Consumption) -> Diag
     g.at,
     Bytes::concat_all([b"consumed here: ", g.how]),
     [
-      b"a resource is never copied, so once something takes it, nothing else may read it",
+      b"a resource is never copied, so once it is consumed, nothing else may read it",
       b"read it before it is consumed: a parameter not written `keep` only borrows it",
     ],
   )
 
-fn borrow_after_consumed(f: Facts, b: Binding, span: Span, lender: Binding) -> Diagnostic =
+fn borrow_after_consumed(f: Facts, b: Binding, span: Span, borrowed: Binding) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1668,14 +1736,16 @@ fn borrow_after_consumed(f: Facts, b: Binding, span: Span, lender: Binding) -> D
     Bytes::concat_all([
       backticked_text(b.name),
       b" borrows ",
-      backticked_text(lender.name),
+      backticked_text(borrowed.name),
       b", which was consumed",
     ]),
     b"used here",
     f.module,
-    match lender.consumed { Some(g) -> g.at, None -> lender.at },
+    match borrowed.consumed { Some(g) -> g.at, None -> borrowed.at },
     b"consumed here",
-    [b"a function that borrows a resource is usable only while the resource is"],
+    [
+      b"a function that borrows a resource can be used only while that resource has not been consumed",
+    ],
   )
 
 fn partly_moved(f: Facts, b: Binding, span: Span) -> Diagnostic / {abort.raise} =
@@ -1685,12 +1755,12 @@ fn partly_moved(f: Facts, b: Binding, span: Span) -> Diagnostic / {abort.raise} 
     span,
     Bytes::concat_all([
       backticked_text(b.name),
-      b" is used whole after its field ",
+      b" is used after its field ",
       backticked_text(b.taken.get(0)),
       b" was moved out",
     ]),
     b"used here",
-    [b"its other fields may still be read, but not the record whole"],
+    [b"its other fields may still be read, but the record as a whole may not be used"],
   )
 
 fn field_twice(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic =
@@ -1716,7 +1786,7 @@ fn field_move_error(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic
       backticked_text(name),
       b" out of ",
       backticked_text(b.name),
-      b" would leave another resource in it",
+      b", which would leave another resource in the record",
     ]),
     b"moved out here",
     [
@@ -1741,8 +1811,8 @@ fn consumed_borrowed(f: Facts, b: Binding, span: Span, how: Bytes) -> Diagnostic
     b.at,
     b"borrowed here",
     [
-      b"a resource handed to a parameter is borrowed by the call unless the parameter is written `keep`: the body may use it and pass it on borrowed, and its caller lets it go",
-      b"write `keep` before the parameter's type to take it",
+      b"a resource passed to a parameter is borrowed by the call unless the parameter is written `keep`; the function may use a borrowed resource and pass it on as borrowed, and the caller still owns the resource after the call",
+      b"write `keep` before the parameter's type to make the function consume the resource",
     ],
   )
 
@@ -1758,9 +1828,9 @@ fn consumed_in_lambda(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) 
     b"consumed here",
     f.module,
     fun.span,
-    b"this function is handed on, and may be called again or never",
+    b"this function is passed elsewhere, so it may be called more than once or not at all",
     [
-      b"a resource is consumed once, so only a function a `let` binds, and calls, may take one it captured",
+      b"a resource is consumed once, so only a function that a `let` binds and calls directly may consume a resource it captured",
     ],
   )
 
@@ -1769,17 +1839,20 @@ fn owning_function_passed(f: Facts, b: Binding, span: Span) -> Diagnostic =
     b"E0316",
     f.module,
     span,
-    Bytes::concat_all([backticked_text(b.name), b" consumed a resource, and is only called"]),
-    b"handed on here",
+    Bytes::concat_all([
+      backticked_text(b.name),
+      b" consumes a resource, so it may only be called, not passed elsewhere",
+    ]),
+    b"passed elsewhere here",
     f.module,
     b.at,
     b"bound here",
     [
-      b"what it took is consumed by its one call, or let go with it where its block ends, so it is never handed to what may call it again",
+      b"calling the function consumes the resource, so the function can be called only once and must not be passed to code that may call it again",
     ],
   )
 
-fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diagnostic =
+fn handler_variable_resource(f: Facts, v: WalkedHandlerVariable) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,
@@ -1787,9 +1860,9 @@ fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diagnostic =
     Bytes::concat_all([
       b"the handler's variable ",
       backticked_text(v.name),
-      b" would keep a resource",
+      b" is a resource, and nothing would clean it up",
     ]),
-    b"nothing lets a handler's variable go where its `handle` ends",
+    b"nothing cleans up a handler's variable when its `handle` ends",
     [
       b"bind the resource with `let` around the `handle`, and pass it borrowed to the clauses that use it",
     ],
@@ -1804,9 +1877,9 @@ fn moved_through(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic =
     b"moved out here",
     f.module,
     b.at,
-    b"owned from here",
+    b"record bound here",
     [
-      b"a resource is moved out of a record one field at a time, so the record knows what it still holds: bind the field holding it first, `let inner = r.inner;`",
+      b"a resource can only be moved out of a record through its own field: bind that field first, `let inner = r.inner;`",
     ],
   )
 
@@ -1818,9 +1891,9 @@ fn written_over(f: Facts, name: Bytes, at: Span) -> Diagnostic =
     Bytes::concat_all([
       b"the record's ",
       backticked_text(name),
-      b" would be dropped without its release",
+      b" would be dropped without being cleaned up",
     ]),
-    b"written over here",
+    b"overwritten here",
     [
       Bytes::concat_all([
         b"move the field out first, `let old = r.",
@@ -1837,14 +1910,14 @@ fn fallback_consumed(f: Facts, b: Binding, at: Span) -> Diagnostic =
     at,
     Bytes::concat_all([
       backticked_text(b.name),
-      b" is consumed by an `else` its block goes on past",
+      b" is consumed by an `else` in a block, but the code after the block still needs it",
     ]),
-    b"this `else` returns from its block and consumes it",
+    b"this `else` leaves its block and consumes the variable",
     f.module,
     b.at,
-    b"owned from here, outside that block",
+    b"variable bound here, outside that block",
     [
-      b"an `else` returns from the block it is in, which the code after goes on owning what is bound outside it: consume it after the block",
+      b"an `else` returns from the block it is in, but the code after that block still uses every variable bound outside the block: consume the variable after the block",
     ],
   )
 
@@ -1857,9 +1930,9 @@ fn guard_consumed(f: Facts, b: Binding, at: Span, what: Bytes) -> Diagnostic =
     b"consumed here",
     f.module,
     b.at,
-    b"owned from here",
+    b"variable bound here",
     [
-      b"what may not run, or may run more than once, only borrows: consume it where it surely runs once",
+      b"code that may not run, or may run more than once, can only borrow a variable: consume the variable where the code surely runs exactly once",
     ],
   )
 
@@ -1874,7 +1947,7 @@ fn escaping_borrower_error(f: Facts, b: Binding, span: Span) -> Diagnostic =
     b.at,
     b"bound here",
     [
-      b"a function that borrows a resource is called, or passed borrowed to a call, while the resource is: consume the resource inside it to move it in instead",
+      b"a function that borrows a resource can be called, or passed to a call, only while the resource exists: to move the resource into the function instead, consume the resource inside the function",
     ],
   )
 
@@ -1887,9 +1960,9 @@ fn escaping_borrow_error(f: Facts, b: Binding, span: Span, fun: EnclosingFunctio
     b"borrowed here",
     f.module,
     fun.span,
-    b"this function may be kept, returned or stored in a value",
+    b"this function may be stored, returned or put in a value",
     [
-      b"a function that borrows a resource may be called only while the resource is: consume the resource inside it to move it in instead",
+      b"a function that borrows a resource may be called only while the resource exists: consume the resource inside the function to move it in instead",
     ],
   )
 
@@ -1901,7 +1974,7 @@ fn resource_copied_error(f: Facts, b: Binding, span: Span) -> Diagnostic =
     Bytes::concat_all([backticked_text(b.name), b" is a resource, and would be copied here"]),
     b"read as a copy",
     [
-      b"a resource is not data: it is not compared, combined or read as a value, only handed to what borrows or takes it",
+      b"a resource is not data: you cannot compare it, combine it or read it as a value, only pass it to a function that borrows or consumes it",
     ],
   )
 
@@ -1910,9 +1983,14 @@ fn dropped_binding(f: Facts, b: Binding, span: Span) -> Diagnostic =
     b"E0322",
     f.module,
     span,
-    Bytes::concat_all([backticked_text(b.name), b" would be let go of here without its release"]),
-    b"a statement that does nothing with it",
-    [b"pass it to what consumes it, or leave it bound: it is let go where its block ends"],
+    Bytes::concat_all([
+      backticked_text(b.name),
+      b" would be dropped here without being cleaned up",
+    ]),
+    b"a statement that does nothing with the resource",
+    [
+      b"pass the resource to a function that consumes it, or leave it bound: it is cleaned up where its block ends",
+    ],
   )
 
 fn new_resource_dropped(f: Facts, e: WalkedExpression, usage: Usage) -> Diagnostic =
@@ -1920,13 +1998,15 @@ fn new_resource_dropped(f: Facts, e: WalkedExpression, usage: Usage) -> Diagnost
     b"E0322",
     f.module,
     e.span,
-    b"a resource is made here and nothing holds it",
+    b"a resource is created here and not bound to anything",
     match usage {
-      Borrowed -> b"borrowed by a call, which never keeps it",
+      Borrowed -> b"only borrowed by a call, which does not store it",
       Read -> b"read as a copy",
       _ -> b"its value is dropped",
     },
-    [b"bind it with `let`, so it is let go where its block ends, or hand it to what takes it"],
+    [
+      b"bind the resource with `let`, so it is cleaned up where its block ends, or pass it to a function that consumes it",
+    ],
   )
 
 fn moved_on_one_path(module: Int, b: Binding) -> Diagnostic =
@@ -1949,8 +2029,10 @@ fn rest_dropped(f: Facts, span: Span) -> Diagnostic =
     f.module,
     span,
     b"`..` cannot drop a resource",
-    b"what this leaves out holds a resource, which would be dropped without its release",
-    [b"name what holds it, so it is let go where its block ends, or consume it"],
+    b"the fields left out by `..` include a resource, which would be dropped without being cleaned up",
+    [
+      b"name the field that contains the resource, so it is cleaned up where its block ends, or consume it",
+    ],
   )
 
 fn wildcard_resource(f: Facts, span: Span) -> Diagnostic =
@@ -1959,6 +2041,8 @@ fn wildcard_resource(f: Facts, span: Span) -> Diagnostic =
     f.module,
     span,
     b"`_` cannot bind a resource",
-    b"this resource would be dropped without its release",
-    [b"name it, so it is let go where its block ends, or pass it to its release to let it go now"],
+    b"this resource would be dropped without being cleaned up",
+    [
+      b"name the resource, so it is cleaned up where its block ends, or pass it to its cleanup function to clean it up now",
+    ],
   )

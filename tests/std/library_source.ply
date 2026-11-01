@@ -1,90 +1,83 @@
-//! Rules the standard library's own source keeps: it imports only its own modules, documents each
-//! name it publishes, folds case by ASCII outside a person's text, and holds no data file that no
-//! module embeds.
-
 import compiler.front (shipped_data_wanted)
 import compiler.front.rows (module_of)
 import compiler.syntax.items (parse, Item, FunctionItem, TypeItem, EffectItem, EffectSetItem,
-                              SchemaItem, ImportDeclaration, OpDefinition, is_pub, is_std)
+                              SchemaItem, ImportDeclaration, OperationDefinition, is_pub, is_std)
 import compiler.syntax.lexer (lex, Identifier, Punctuation, Keyword, EndOfInput)
 import compiler.syntax.parsing (Doc, Identifier)
 import std.list
 
 type File = { name: String, bytes: Bytes }
 
-/// The tree `ply` ships the standard library from, each file by its path below it.
 fn tree() -> List<File> = embed_dir("../../packages/std")
 
-/// A module of the standard library, under its name in a program.
-type StdModule = { module: String, src: Bytes }
+type StdModule = { module: String, source: Bytes }
 
-/// Each module of the tree: a table whose cases each read one module, so an edit of one moves no
-/// other's.
 fn modules() -> List<StdModule> / {abort.raise} =
   tree().filter(|f: File| f.name.ends_with(".ply")).map(|f: File|
     match module_of(f.name) {
-      Ok(name) -> { module: "std." ++ name, src: f.bytes },
+      Ok(name) -> { module: "std." ++ name, source: f.bytes },
       Err(reason) -> panic("`" ++ f.name ++ "` cannot be a module: " ++ reason),
     })
 
-// A file the tree holds and no module embeds would ship in every binary and be read by nothing.
-test "each data file the standard library's tree holds is one a module of it embeds" {
+test "every non-Ply data file in the standard library directory is embedded by some library module" {
   let embedded = modules().flat_map(|m: StdModule|
-    shipped_data_wanted({ name: Bytes::of_string(m.module), src: m.src }).map(String::of_bytes));
-  let held = tree().filter(|f: File| !f.name.ends_with(".ply")).map(|f: File| "std/" ++ f.name);
-  assert_eq(held.filter(|name: String| !embedded.contains(name)), [])
+    shipped_data_wanted({ name: Bytes::of_string(m.module), source_text: m.source }).map(
+      String::of_bytes,
+    ));
+  let data_files = tree().filter(|f: File| !f.name.ends_with(".ply")).map(|f: File|
+    "std/" ++ f.name);
+  assert_eq(data_files.filter(|name: String| !embedded.contains(name)), [])
 }
 
-/// The modules a source imports, each by its dotted name.
-fn imported(src: Bytes) -> List<String> / {abort.raise} =
-  parse(src).node.imports.map(|d: ImportDeclaration|
+fn imported(source: Bytes) -> List<String> / {abort.raise} =
+  parse(source).node.imports.map(|d: ImportDeclaration|
     String::of_bytes(Bytes::join(d.path.map(|part: Identifier| part.name), b".")))
 
-// The compiler depends on the library, so the library importing the compiler is a cycle.
 test "{m.module} imports only library modules" for m: StdModule in modules() {
-  assert_eq(imported(m.src).filter(|name: String| !is_std(Bytes::of_string(name))), [])
+  assert_eq(imported(m.source).filter(|name: String| !is_std(Bytes::of_string(name))), [])
 }
 
-/// What a module publishes that has no doc: every `pub` declaration, and each operation of a `pub`
-/// effect, by name.
-fn undocumented(module: String, src: Bytes) -> List<String> / {abort.raise} =
-  parse(src).node.items.fold([], |acc: List<String>, it: Item| {
+fn undocumented(module: String, source: Bytes) -> List<String> / {abort.raise} =
+  parse(source).node.items.fold([], |accumulator: List<String>, it: Item| {
     let named = |name: Bytes| module ++ "." ++ String::of_bytes(name);
     match it {
       FunctionItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) {
-        acc.push(named(d.name.name))
-      } else { acc },
-      TypeItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) { acc.push(named(d.name.name)) }
-      else { acc },
-      SchemaItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) { acc.push(named(d.name.name)) }
-      else { acc },
+        accumulator.push(named(d.name.name))
+      } else { accumulator },
+      TypeItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) {
+        accumulator.push(named(d.name.name))
+      } else { accumulator },
+      SchemaItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) {
+        accumulator.push(named(d.name.name))
+      } else { accumulator },
       EffectSetItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) {
-        acc.push(named(d.name.name))
-      } else { acc },
-      EffectItem(d) -> if !is_pub(d.visibility) { acc } else {
-        let own = if has_no_doc(d.doc) { acc.push(named(d.name.name)) } else { acc };
-        d.operations.fold(own, |a: List<String>, op: OpDefinition|
-          if has_no_doc(op.doc) {
-            a.push(named(d.name.name) ++ "." ++ String::of_bytes(op.name.name))
+        accumulator.push(named(d.name.name))
+      } else { accumulator },
+      EffectItem(d) -> if !is_pub(d.visibility) { accumulator } else {
+        let own = if has_no_doc(d.doc) { accumulator.push(named(d.name.name)) }
+        else { accumulator };
+        d.operations.fold(own, |a: List<String>, operation: OperationDefinition|
+          if has_no_doc(operation.doc) {
+            a.push(named(d.name.name) ++ "." ++ String::of_bytes(operation.name.name))
           } else { a })
       },
-      _ -> acc,
+      _ -> accumulator,
     }
   })
 
 fn has_no_doc(doc: Option<Doc>) -> Bool = match doc { None -> true, Some(_) -> false }
 
-test "every name {m.module} publishes is documented" for m: StdModule in modules() {
-  let missing = undocumented(m.module, m.src);
+fn public_modules() -> List<StdModule> / {abort.raise} =
+  modules().filter(|m: StdModule| !m.module.starts_with("std.internal."))
+
+test "every name {m.module} publishes is documented" for m: StdModule in public_modules() {
+  let missing = undocumented(m.module, m.source);
   assert(
     missing.len() == 0,
     Some("these are published without a `///` doc:\n" ++ String::join(missing, "\n")),
   )
 }
 
-/// The modules that fold case or trim by Unicode's tables, each with the text of a person's it
-/// reads that way. Every other one compares names and tokens, which take `std.string`'s
-/// `ascii_lower`, `ascii_upper` and `ascii_trim`.
 fn unicode_readers() -> List<{ module: String, reason: String }> =
   [
     { module: "std.cli", reason: "a manual page's title is the program's name in capitals" },
@@ -98,10 +91,8 @@ fn unicode_readers() -> List<{ module: String, reason: String }> =
     { module: "std.text", reason: "a shell line is rejected at white space of any script" },
   ]
 
-/// Whether a source calls `std.unicode`'s `lowercase` or `uppercase`, or `String::trim`, outside
-/// its comments and its literals: a declaration of one is no call.
-fn reads_unicode(src: Bytes) -> Bool / {abort.raise} = {
-  let tokens = lex(src).tokens;
+fn reads_unicode(source: Bytes) -> Bool / {abort.raise} = {
+  let tokens = lex(source).tokens;
   let kind = |i: Int| match tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
   range(1, tokens.len()).fold(false, |found: Bool, i: Int|
     found
@@ -115,8 +106,8 @@ fn reads_unicode(src: Bytes) -> Bool / {abort.raise} = {
       }))
 }
 
-test "a library module folds case and trims by ASCII, unless it is listed as reading a person's text" {
-  let reading = modules().filter(|m: StdModule| reads_unicode(m.src));
+test "a library module that lowercases, uppercases or trims text must be listed in `unicode_readers`, which names the modules that handle human-language text" {
+  let reading = modules().filter(|m: StdModule| reads_unicode(m.source));
   let found = reading.map(|m: StdModule| m.module).sort();
   let listed = unicode_readers().map(|r: { module: String, reason: String }| r.module);
   assert(

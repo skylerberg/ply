@@ -1,4 +1,4 @@
-use ply_core::crypto::{self, Encodes};
+use ply_core::crypto::{self, EncodingSupport};
 use ply_core::{Span, codes};
 
 fn hex(digits: &str) -> Vec<u8> {
@@ -18,7 +18,7 @@ fn encoded(encoding: &str, bytes: &[u8]) -> String {
 }
 
 #[test]
-fn hchacha20_is_the_drafts() {
+fn hchacha20_matches_the_test_vector_in_the_xchacha20_draft() {
     let key: [u8; 32] = std::array::from_fn(|i| i as u8);
     let nonce: [u8; 16] = hex("000000090000004a0000000031415927").try_into().unwrap();
     assert_eq!(
@@ -28,9 +28,8 @@ fn hchacha20_is_the_drafts() {
 }
 
 #[test]
-fn an_hmac_is_rfc_4231s_and_each_scheme_makes_a_public_key_and_a_signature() {
+fn hmac_matches_an_rfc_4231_vector_and_each_algorithm_gives_a_public_key_or_a_64_byte_signature() {
     let key = [7; 32];
-    // RFC 4231, case 2.
     assert_eq!(
         crypto::hmac("SHA-256", b"Jefe", b"what do ya want for nothing?"),
         Some(hex(
@@ -48,7 +47,8 @@ fn an_hmac_is_rfc_4231s_and_each_scheme_makes_a_public_key_and_a_signature() {
 }
 
 #[test]
-fn a_hash_the_runtime_does_not_key_returns_nothing() {
+fn hmac_hkdf_pbkdf2_and_digest_length_accept_sha_1_256_384_and_512_and_reject_any_other_hash_name()
+{
     let key = [7; 32];
     let results = |hash: &str| {
         [
@@ -68,7 +68,7 @@ fn a_hash_the_runtime_does_not_key_returns_nothing() {
 }
 
 #[test]
-fn a_text_decodes_only_as_its_encoding_writes_it() {
+fn decoding_accepts_only_the_canonical_text_of_each_encoding_and_returns_none_for_anything_else() {
     let cases: [(&str, &str, Option<&[u8]>); 22] = [
         ("hex", "", Some(b"")),
         ("hex", "666f", Some(b"fo")),
@@ -103,21 +103,27 @@ fn a_text_decodes_only_as_its_encoding_writes_it() {
 }
 
 #[test]
-fn each_encoding_says_what_it_does_and_one_it_does_not_have_does_nothing() {
+fn each_encoding_reports_whether_it_can_encode_and_decode_and_an_unknown_encoding_name_does_neither()
+ {
     for name in ["hex", "base64", "base64url", "base32"] {
-        assert_eq!(crypto::encoding(name), Encodes::WritesAndReads, "{name}");
+        assert_eq!(
+            crypto::encoding(name),
+            EncodingSupport::WritesAndReads,
+            "{name}"
+        );
     }
-    assert_eq!(crypto::encoding("base32-typed"), Encodes::Reads);
+    assert_eq!(crypto::encoding("base32-typed"), EncodingSupport::Reads);
     assert!(crypto::encode("base32-typed", b"key").is_none());
     for name in ["rot13", "raw", "HEX", ""] {
-        assert_eq!(crypto::encoding(name), Encodes::Neither, "{name}");
+        assert_eq!(crypto::encoding(name), EncodingSupport::Neither, "{name}");
         assert!(crypto::encode(name, b"key").is_none(), "{name}");
         assert!(crypto::decode(name, b"6b6579").is_none(), "{name}");
     }
 }
 
 #[test]
-fn a_misuse_is_rejected_and_the_rejection_names_no_key() {
+fn crypto_functions_given_invalid_keys_or_nonces_fail_with_an_error_that_does_not_contain_the_key()
+{
     let short = b"hunter2hunter2";
     let key = [7; 32];
     let rejections = [
@@ -137,7 +143,7 @@ fn a_misuse_is_rejected_and_the_rejection_names_no_key() {
 }
 
 #[test]
-fn a_key_that_is_none_of_its_scheme_returns_nothing() {
+fn key_bytes_that_are_invalid_for_a_scheme_return_no_public_key_signature_or_shared_secret() {
     let short = b"short";
     assert_eq!(crypto::public("ed25519", short), Ok(None));
     assert_eq!(crypto::public("p256", &[0; 32]), Ok(None));
@@ -149,9 +155,7 @@ fn a_key_that_is_none_of_its_scheme_returns_nothing() {
             .unwrap()
             .map(|s| s.to_vec())
     };
-    // A point of small order sends every key to zero.
     assert_eq!(agreed("x25519", &[0; 32]), None);
-    // The point at infinity's place, and a point off the curve.
     assert_eq!(agreed("p256", &[0]), None);
     let mut off = vec![4u8];
     off.extend([1u8; 64]);
@@ -161,7 +165,6 @@ fn a_key_that_is_none_of_its_scheme_returns_nothing() {
 
 #[test]
 fn a_private_key_is_read_from_its_document_as_the_scheme_it_names() {
-    // RFC 8410, section 10.3.
     let seed = hex("d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842");
     let mut document = hex("302e020100300506032b657004220420");
     document.extend(&seed);
@@ -175,7 +178,7 @@ fn a_private_key_is_read_from_its_document_as_the_scheme_it_names() {
 }
 
 #[test]
-fn what_is_sealed_opens_and_a_turned_bit_does_not() {
+fn a_sealed_message_opens_but_fails_to_open_if_the_associated_data_differs_or_any_bit_is_flipped() {
     let key = [7; 32];
     for cipher in ["aes-256-gcm", "chacha20-poly1305", "xchacha20-poly1305"] {
         let nonce = vec![1u8; crypto::nonce_length(cipher).expect("a cipher it has")];
@@ -199,8 +202,7 @@ fn what_is_sealed_opens_and_a_turned_bit_does_not() {
 }
 
 #[test]
-fn bytes_encode_as_rfc_4648_writes_and_decode_back() {
-    // RFC 4648, section 10.
+fn bytes_encode_to_the_rfc_4648_test_vectors_and_decode_back() {
     let words = ["", "f", "fo", "foo", "foob", "fooba", "foobar"];
     let base64 = [
         "", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy",
@@ -247,7 +249,8 @@ fn bytes_encode_as_rfc_4648_writes_and_decode_back() {
 }
 
 #[test]
-fn a_frame_reads_back_what_it_wrote_and_nothing_it_did_not() {
+fn a_secret_framed_with_a_prefix_and_suffix_reads_back_exactly_and_a_different_prefix_or_suffix_is_rejected()
+ {
     use ply_core::crypto::Framing;
     let named = |name: &str| Framing::named(name, "`fs.write_secret`", Span::DUMMY);
     let every: Vec<u8> = (0..=255).collect();
@@ -257,21 +260,21 @@ fn a_frame_reads_back_what_it_wrote_and_nothing_it_did_not() {
             let secret = &every[256 - n..];
             let line = framing.framed(b"key ", secret, b"\n");
             assert!(line.starts_with(b"key ") && line.ends_with(b"\n"));
-            let back = framing.unframed(&line, b"key ", b"\n");
+            let back = framing.decode_framed(&line, b"key ", b"\n");
             assert_eq!(
                 back.as_deref().map(|b| &b[..]),
                 Some(secret),
                 "{encoding} of {n}"
             );
-            assert!(framing.unframed(&line, b"kez ", b"\n").is_none());
-            assert!(framing.unframed(&line, b"key ", b"\r\n").is_none());
-            assert!(framing.unframed(&line[..3], b"key ", b"\n").is_none());
+            assert!(framing.decode_framed(&line, b"kez ", b"\n").is_none());
+            assert!(framing.decode_framed(&line, b"key ", b"\r\n").is_none());
+            assert!(framing.decode_framed(&line[..3], b"key ", b"\n").is_none());
         }
     }
     let hex = named("hex").unwrap();
     assert_eq!(&hex.framed(b"", b"\xab", b"")[..], b"ab");
-    assert!(hex.unframed(b"AB", b"", b"").is_none());
-    assert!(hex.unframed(b"abc", b"", b"").is_none());
+    assert!(hex.decode_framed(b"AB", b"", b"").is_none());
+    assert!(hex.decode_framed(b"abc", b"", b"").is_none());
     for rejected in ["rot13", "base32-typed", "RAW", ""] {
         let d = named(rejected)
             .err()
@@ -289,7 +292,8 @@ fn rsa_document() -> Vec<u8> {
 }
 
 #[test]
-fn a_pss_signature_is_a_function_of_the_key_and_the_message_and_verifies() {
+fn an_rsa_pss_signature_is_the_same_for_the_same_key_and_message_and_verifies_only_for_that_message()
+ {
     let document = rsa_document();
     let public = crypto::public("rsa", &document).unwrap().unwrap();
     for digest in ["sha256", "sha384", "sha512"] {
@@ -307,7 +311,8 @@ fn a_pss_signature_is_a_function_of_the_key_and_the_message_and_verifies() {
 }
 
 #[test]
-fn every_curve_signs_as_its_verifier_reads_and_a_high_s_secp256k1_signature_is_its_twin() {
+fn ecdsa_on_each_curve_gives_correct_key_and_signature_lengths_and_verifies_and_so_does_a_secp256k1_signature_with_s_replaced_by_order_minus_s()
+ {
     for (curve, scheme, size) in [
         ("p256", "ecdsa-p256-sha256", 32),
         ("p384", "ecdsa-p384-sha384", 48),
@@ -329,7 +334,6 @@ fn every_curve_signs_as_its_verifier_reads_and_a_high_s_secp256k1_signature_is_i
         assert_eq!(verified(&raw, b"m"), Ok(true), "{curve}");
         assert_eq!(verified(&raw, b"n"), Ok(false), "{curve}");
     }
-    // secp256k1's order; `s` and `n - s` are one signature.
     let order = hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
     let scalar = [3u8; 32];
     let public = crypto::public("k256", &scalar).unwrap().unwrap();
@@ -353,7 +357,6 @@ fn every_curve_signs_as_its_verifier_reads_and_a_high_s_secp256k1_signature_is_i
     }
 }
 
-/// The contents of each `INTEGER` a DER `SEQUENCE` of them holds.
 fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     fn length(der: &[u8], at: &mut usize) -> usize {
         let first = der[*at];
@@ -382,7 +385,8 @@ fn integers(der: &[u8]) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn an_rsa_jwk_makes_the_document_its_numbers_came_from_and_numbers_that_disagree_make_none() {
+fn an_rsa_jwk_converts_back_to_the_der_private_key_it_came_from_and_inconsistent_numbers_return_none()
+ {
     let document = rsa_document();
     let numbers = integers(&document);
     assert_eq!(numbers.len(), 9);

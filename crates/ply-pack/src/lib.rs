@@ -1,25 +1,12 @@
-//! What a native Ply program carries after its code: the shipped modules a load of another program
-//! compiles against, their results below [`ANSWERS`], and the program's own front end, each a
-//! file keyed by its path. a bootstrap appends one to `ply`; the program maps
-//! it back at startup.
-//!
-//! A pack is the files' bytes, then a table of `(path, offset, length, digest)` ascending by path,
-//! then a trailer of the pack's and the table's lengths and [`MAGIC`].
-
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// The standard library: each `.ply` file at or below it is a shipped module, `hash/legacy.ply`
-/// being `std.hash.legacy`. Every other file at or below it is data those modules embed.
 pub const STD: &str = "std";
 
 const MODULE: &str = ".ply";
 
-/// The compiler's own modules, `emit/roots.ply` being `compiler.emit.roots`.
 pub const COMPILER: &str = "compiler";
 
-/// Shipped modules' cached results, as `ply std --answers` writes them: a file of zstd frames and
-/// its index, itself one frame.
 pub const ANSWERS: &str = "answers";
 
 const MAGIC: &[u8; 8] = b"PLYPACK1";
@@ -28,7 +15,6 @@ const TRAILER: usize = 8 + 8 + MAGIC.len();
 pub type Digest = [u8; 32];
 
 pub struct Pack {
-    /// Ascending by path.
     entries: Vec<Entry>,
     mapped: memmap2::Mmap,
 }
@@ -41,11 +27,9 @@ struct Entry {
 }
 
 impl Pack {
-    /// The pack appended to the binary at `binary`, or `None` when it carries none.
     pub fn of_binary(binary: &Path) -> Result<Option<Pack>, String> {
         let file = std::fs::File::open(binary)
             .map_err(|e| format!("`{}` could not be opened: {e}", binary.display()))?;
-        // SAFETY: a binary is not written while it runs; a bootstrap lands a new one by a rename.
         let mapped = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| format!("`{}` could not be mapped: {e}", binary.display()))?;
         Pack::of_mapped(mapped)
@@ -63,18 +47,19 @@ impl Pack {
         self.entries.iter().map(|entry| entry.path.as_str())
     }
 
-    /// The paths of the data files at or below `dir`, ascending: every file there that is no
-    /// module.
     pub fn data_below<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
-        self.below_in(dir, false)
+        self.modules_or_data_below(dir, false)
     }
 
-    /// The paths of the modules at or below `dir`, ascending.
     pub fn modules_below<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
-        self.below_in(dir, true)
+        self.modules_or_data_below(dir, true)
     }
 
-    fn below_in<'a>(&'a self, dir: &str, modules: bool) -> impl Iterator<Item = &'a str> + 'a {
+    fn modules_or_data_below<'a>(
+        &'a self,
+        dir: &str,
+        modules: bool,
+    ) -> impl Iterator<Item = &'a str> + 'a {
         let prefix = format!("{dir}/");
         self.paths().filter(move |path| {
             path.starts_with(prefix.as_str()) && path.ends_with(MODULE) == modules
@@ -86,9 +71,6 @@ impl Pack {
             .map(|entry| &self.mapped[entry.at..entry.at + entry.len])
     }
 
-    /// What the zstd frame `len` bytes long at `offset` of the cached file `path` holds; a `len`
-    /// of 0 reads to the file's end. `None` where there is no such file, the range runs past it, or
-    /// its bytes are not whole frames.
     pub fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
         let file = self.bytes(&format!("{ANSWERS}/{path}"))?;
         let end = if len == 0 {
@@ -99,7 +81,6 @@ impl Pack {
         zstd::stream::decode_all(file.get(offset..end)?).ok()
     }
 
-    /// A text the pack carries. The sources are UTF-8, as the front end reads them.
     pub fn text(&self, path: &str) -> Option<&str> {
         self.bytes(path).map(|bytes| {
             std::str::from_utf8(bytes)
@@ -111,7 +92,6 @@ impl Pack {
         self.entry(path).map(|entry| entry.digest)
     }
 
-    /// The whole pack: every path and what its bytes digest to.
     pub fn digest(&self) -> Digest {
         let mut hasher = blake3::Hasher::new();
         for entry in &self.entries {
@@ -122,8 +102,6 @@ impl Pack {
         *hasher.finalize().as_bytes()
     }
 
-    /// The files at or below `roots`: each one's path and what its bytes digest to, so it moves
-    /// when one of them is added, dropped or edited, and with nothing outside them.
     pub fn digest_below(&self, roots: &[&str]) -> Digest {
         let mut hasher = blake3::Hasher::new();
         let below = |path: &str| {
@@ -148,7 +126,6 @@ impl Pack {
     }
 }
 
-/// Where a pack starts and where its table does, when `binary` ends in one.
 fn located(binary: &[u8]) -> Result<Option<(usize, usize)>, String> {
     if binary.len() < TRAILER || &binary[binary.len() - MAGIC.len()..] != MAGIC {
         return Ok(None);
@@ -196,8 +173,6 @@ fn read_table(table: &[u8], start: usize, end: usize) -> Result<Vec<Entry>, Stri
 
 static INSTALLED: OnceLock<Pack> = OnceLock::new();
 
-/// The pack this process reads, which a native program installs from its own binary before
-/// anything runs.
 pub fn install(pack: Pack) {
     if INSTALLED.set(pack).is_err() {
         panic!("a process installs one pack");

@@ -1,8 +1,3 @@
-//! `ply test` as a person meets it from outside: its exit codes, what it writes to each stream and
-//! when, `--watch`, and what only a test that really ran can show: what it read, what it performed,
-//! what it was bound, and that tests run at once. `tests/in_process/test_runs.ply` holds what a run
-//! decides, stores and reports.
-
 import harness (spawned, Server, start_streaming, next_line, stop, PlyProcess, test_report)
 import support.harness (RunResult, write_program, write_project, write, stdout, stderr, all_output,
                         json_of, at, path, nth, items, str, int, bool, json_text, WorkingDirectory,
@@ -25,7 +20,6 @@ fn red() -> String =
   \\test "this one is fine" { assert_eq(1 + 1, 2) }
   \\
 
-/// The first line a run printed, without the indent a report gives it.
 fn first_line(result_names: RunResult) -> String =
   match result_names.out { [l, ..] -> l.ascii_trim(), [] -> "" }
 
@@ -39,17 +33,15 @@ fn result_of(v: Json, name: String) -> Json =
 
 fn status_of(v: Json, name: String) -> String = str(at(result_of(v, name), "status"))
 
-test/nondet "test leads with the selection line" {
+test/nondet "`ply test` prints a first line saying how many tests were selected out of the total and how many were cached" {
   write_program(green());
   let r = spawned(["test", "."]);
   assert(r.code == 0, Some(all_output(r)));
   assert(first_line(r) == "selected 2 of 2 (0 cached)", Some(stdout(r)));
-  // The worker count is the machine's, which a deterministic run does not know.
   assert(stdout(r).contains(" worker"), Some(stdout(r)));
   assert(stdout(r).contains("0 failed, 2 passed, 0 cached"), Some(stdout(r)))
 }
 
-/// The next report a watching run wrote, one document a line.
 fn next_report(server: Server, what: String) -> Json / {PlyProcess, abort.raise} =
   match next_line(server, 60000) {
     None -> {
@@ -65,9 +57,6 @@ fn next_report(server: Server, what: String) -> Json / {PlyProcess, abort.raise}
     },
   }
 
-/// `text` written over `file` until its modification time moves off `before`, which is the whole
-/// signal an unchanged save leaves: a filesystem that stamps coarsely would otherwise hand the
-/// watcher two equal walks.
 fn save(
   file: String,
   text: String,
@@ -86,14 +75,12 @@ fn save(
   })
 }
 
-test/nondet "watch reruns on a save and keeps the front end it already had" {
+test/nondet "`--watch` reruns the tests after each save, and a save that changes no bytes does not recompile the program" {
   write_program(green());
   let s = start_streaming(["test", ".", "--watch", "--json"], []);
   let first = next_report(s, "reported no first iteration");
-  // Saved byte for byte as it is: the common case, and the one that must not cost a front end.
   let stamped = save("m.ply", green(), fs.modified_ms[cwd]("m.ply"));
   let second = next_report(s, "did not run again when the tree moved");
-  // An edit, which the next report has to be about rather than the program the watch began with.
   let _ = save("m.ply", red(), stamped);
   let edited = next_report(s, "did not report the edit");
   stop(s);
@@ -103,7 +90,6 @@ test/nondet "watch reruns on a save and keeps the front end it already had" {
   );
   assert(bool(at(first, "ok")), Some(json_text(first)));
   assert(bool(at(second, "ok")), Some(json_text(second)));
-  // The save changed no byte, so the second iteration re-derived no front end.
   assert(
     number(path(second, ["front_end", "phases", "total"])) == 0.0,
     Some(
@@ -122,9 +108,7 @@ test/nondet "watch reruns on a save and keeps the front end it already had" {
 
 fn reused(v: Json) -> Bool = bool(path(v, ["front_end", "reused"]))
 
-// A read is recorded by the handler that serves it, so one a test serves itself is no part of
-// its pass.
-test/nondet "a read a test handles itself is not recorded, and a pass stands until a file it read moves" {
+test/nondet "a file read intercepted by a handler inside the test is not a dependency, and a cached pass is reused until a file the test reads from disk changes" {
   write_program(
     \\import std.fs (fs)
     \\
@@ -153,9 +137,7 @@ test/nondet "a read a test handles itself is not recorded, and a pass stands unt
   assert(int(path(moved, ["selection", "selected"])) == 1, Some(json_text(moved)))
 }
 
-// `ply test` loads twice: once to select, and once more to parse the modules a selected test needs a
-// body from.
-test/nondet "a nondet test elsewhere does not cost an edited module its body" {
+test/nondet "a `test/nondet` test in another module does not stop an edited module's tests from running with their compiled code" {
   let counted = |n: String|
     "fn size() -> Int = " ++ n ++ "\ntest \"size is known\" { assert_eq(size(), " ++ n ++ ") }\n";
   write_project([
@@ -180,7 +162,7 @@ test/nondet "a nondet test elsewhere does not cost an edited module its body" {
   assert(!stdout(r).contains("cache clear"), Some("a body went missing:\n" ++ stdout(r)))
 }
 
-test/nondet "test exits one on a failure and names the changes" {
+test/nondet "`ply test` exits with code 1 on a failure and prints the definitions the failing test depends on" {
   write_program(red());
   let r = spawned(["test", "."]);
   assert(r.code == 1, Some(all_output(r)));
@@ -226,8 +208,6 @@ test/nondet "test --json is exactly one object on stdout, and each result on std
   let label = nth(path(failure, ["diagnostic", "labels"]), 0);
   assert(str(at(label, "file")) == "m.ply", Some(json_text(failure)));
   assert(is_number(path(label, ["start", "line"])), Some(json_text(failure)));
-  // Ranked, so a consumer reading only `changes[0]` gets the best guess rather than the
-  // alphabetically first.
   assert(str(at(nth(at(failure, "changes"), 0), "name")) == "m.balance", Some(json_text(failure)));
   assert(items(at(failure, "changes")).len() == 1, Some(json_text(failure)));
   assert(
@@ -244,9 +224,7 @@ test/nondet "test --json is exactly one object on stdout, and each result on std
   )
 }
 
-// Each operation a test performs is counted, once whatever its clause does: nine bumps and a peek,
-// and none past a clause that stops the body at the third bump.
-test/nondet "a result counts each perform a handle handles once, whether its clause returns, resumes or stops" {
+test/nondet "a test's reported effect operation count includes each operation a `handle` intercepts once, whether its clause returns a value, resumes or aborts" {
   write_program(String::of_bytes_lossy(embed("../programs/test_runs/handled_perform_counts.ply")));
   let v = test_report(["--no-cache"]);
   let performs = |name: String|
@@ -269,8 +247,7 @@ test/nondet "isolated tests run at the same time, and each runs its own parallel
   assert(summed > 3 * int(path(v, ["phases", "tests"])) / 2, Some(json_text(v)))
 }
 
-// Ten simulated minutes cost a run no wall clock worth the name: a wait would take them all.
-test/nondet "a simulated sleep is a jump rather than a wait" {
+test/nondet "a simulated sleep advances the simulated clock instead of waiting in real time" {
   write_program(String::of_bytes_lossy(embed("../programs/test_runs/simulated_sleep.ply")));
   let started = time.elapsed_ms();
   let r = spawned(["test", ".", "--no-cache"]);
@@ -296,8 +273,6 @@ test/nondet "each phase prints as it starts, and each test prints as it finishes
   assert(position("a quick test") < position("a slow test"), Some(text))
 }
 
-// A test is no process: it may start and drive the programs `--exec` names, and nothing else of
-// `process`. It asks which labels its run bound, and an unbound one is reported rather than withheld.
 test/nondet "a test run binds what --exec names, tells a test what it bound, and withholds the rest of process" {
   write_program(
     \\import std.process (process, Discard, Keep)
@@ -337,14 +312,13 @@ test/nondet "a test run binds what --exec names, tells a test what it bound, and
     str(path(nth(at(v, "failures"), 0), ["diagnostic", "code"])) == "E0424",
     Some(json_text(v)),
   );
-  let asked = test_report(["--no-cache", "--filter", "bound"]);
-  assert(status_of(asked, "echo is bound") == "failed", Some(json_text(asked)));
-  assert(status_of(asked, "cc is not bound") == "passed", Some(json_text(asked)));
+  let filtered = test_report(["--no-cache", "--filter", "bound"]);
+  assert(status_of(filtered, "echo is bound") == "failed", Some(json_text(filtered)));
+  assert(status_of(filtered, "cc is not bound") == "passed", Some(json_text(filtered)));
   assert(
-    str(path(nth(at(asked, "failures"), 0), ["diagnostic", "code"])) != "E0424",
-    Some(json_text(asked)),
+    str(path(nth(at(filtered, "failures"), 0), ["diagnostic", "code"])) != "E0424",
+    Some(json_text(filtered)),
   );
-  // Without `--exec`, the label is unbound, and the error says how to bind it.
   let bare = stdout(spawned(["test", ".", "--filter", "spawns"]));
   assert(bare.contains("no executable is bound to it"), Some(bare));
   assert(bare.contains("--exec echo="), Some(bare))

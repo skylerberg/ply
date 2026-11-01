@@ -1,28 +1,29 @@
 //! OTLP, the OpenTelemetry protocol: its traces and metrics as values, the two encodings a
 //! collector accepts over HTTP, and an exporter that is a `trace` handler.
 //!
-//! The model is the protocol's own, with a field's width where the protocol gives it one: a time
-//! is a `U64` of nanoseconds since the Unix epoch and a dropped count a `U32`, so every value of a
-//! type has an encoding and reads back as itself. A trace id and a span id are
-//! `std.traceparent`'s. Metrics are a gauge, a sum and a histogram with explicit bounds. An
-//! exponential histogram and a summary are not modelled, and a reader rejects a metric of either
-//! kind, naming it. Exemplars, a data point's flags, a metric's metadata and a resource's entity
-//! references are skipped, as is any field a later version adds.
+//! The model follows the protocol, using the protocol's field widths where it gives them: a time is
+//! a `U64` of nanoseconds since the Unix epoch and a dropped count is a `U32`, so every value of a
+//! type has an encoding and reads back as itself. Trace ids and span ids are the types from
+//! `std.traceparent`. Metrics are a gauge, a sum and a histogram with explicit bounds. Exponential
+//! histograms and summaries are not modelled, and a reader rejects a metric of either kind and
+//! names it. Exemplars, a data point's flags, a metric's metadata and a resource's entity
+//! references are skipped, as is any field a later protocol version adds.
 //!
 //! `encode_traces` and `encode_metrics` write a request in either `Encoding`. `Protobuf` is the
-//! binary form a collector expects by default, written by field number over `std.protobuf`.
-//! `Json` is OTLP's JSON mapping and not proto3's: ids are hex, a 64-bit number is a decimal
+//! binary form a collector expects by default, written by field number over `std.protobuf`. `Json`
+//! is OTLP's JSON mapping, which differs from proto3's: ids are hex, a 64-bit number is a decimal
 //! string, an enum is its number, keys are lowerCamelCase and bytes are base64. A double that JSON
-//! has no number for is written as a string: `NaN`, `Infinity`, `-Infinity`, or its digits when
-//! `std.json`'s `Decimal` cannot represent them, which the mapping allows a reader to accept.
-//! Either reader takes its `Limits`, skips a field it does not know, and reports why and where it
-//! fails. The `decode_` functions return the error as an `Err`, and the `read_` ones raise it. The
-//! field numbers are those of `opentelemetry-proto` 1.11.1.
+//! has no number for is written as a string: `NaN`, `Infinity` or `-Infinity`. A finite double that
+//! `std.json`'s `Decimal` cannot represent is written as a string of its decimal digits. Readers
+//! also accept these strings, as the mapping allows. Either reader takes its `Limits`, skips a
+//! field it does not know, and reports why and where it fails. The `decode_` functions return the
+//! error as an `Err`, and the `read_` functions raise it. The field numbers are those of
+//! `opentelemetry-proto` 1.11.1.
 //!
 //! `exporting` is the sink: a handler for `trace` that records what a program traces, a span from
 //! its `enter` to its `exit` and each counter, gauge and timing as a series. It sends them to a
-//! collector through `std.http`'s client in batches, from a bounded queue, with retries. Nothing
-//! is exported until a program installs it.
+//! collector through `std.http`'s client in batches, from a bounded queue, with retries. Nothing is
+//! exported until a program installs it.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes
@@ -50,8 +51,6 @@ import std.trace (Fields, trace)
 import std.traceparent
 import std.traceparent (SpanId, TraceId)
 
-// --- The model ----------------------------------------------------------------
-
 /// An attribute's value.
 pub type AnyValue =
   | StringValue(String)
@@ -65,13 +64,14 @@ pub type AnyValue =
   /// A value that was not set, which the protocol allows, and which an array's null element is.
   | NoValue
 
-/// One attribute.
+/// A key and its value, used for attributes on resources, scopes, spans, events and links.
 pub type KeyValue = new { key: String, value: AnyValue }
 
 /// What produced the telemetry: `service.name` and its siblings.
 pub type Resource = new { attributes: List<KeyValue>, dropped_attributes: U32 }
 
-/// The instrumentation that recorded it; this module's exporter names a `trace` channel here.
+/// The instrumentation that recorded the telemetry. The exporter in this module sets `name` to the
+/// `trace` channel name that produced each span.
 pub type Scope = new {
   name: String,
   version: String,
@@ -114,8 +114,9 @@ pub type Span = new {
   trace_state: String,
   /// `None` on a trace's first span.
   parent: Option<SpanId>,
-  /// The W3C trace flags in the low eight bits. Bit 8 is set when it is known whether the parent
-  /// is in another process, and bit 9 when it is.
+  /// The span's flags. The low eight bits are the W3C trace flags. Bit 8 is set when the flags say
+  /// whether the parent span is remote (in another process), and bit 9 is set when the parent is
+  /// remote. Bit 9 means nothing unless bit 8 is set.
   flags: U32,
   name: String,
   kind: SpanKind,
@@ -219,10 +220,6 @@ pub fn traces_path() -> String = "/v1/traces"
 /// The HTTP path where a collector accepts metrics.
 pub fn metrics_path() -> String = "/v1/metrics"
 
-// --- Generators ---------------------------------------------------------------
-
-/// Every double except NaN, which is not equal to itself, so a property cannot compare it after a
-/// round trip.
 fn doubles() -> Gen<Float> =
   gen::one_of([
     gen::elements([
@@ -254,8 +251,8 @@ fn texts() -> Gen<String> =
     ]),
     gen::map(gen::list_of(gen::int_between(32, 767), 12), |points: List<Int>|
       String::of_chars(
-        points.fold([], |acc: List<Char>, p: Int|
-          match Char::of_int(p) { Some(c) -> acc.push(c), None -> acc }),
+        points.fold([], |accumulator: List<Char>, p: Int|
+          match Char::of_int(p) { Some(c) -> accumulator.push(c), None -> accumulator }),
       )),
   ])
 
@@ -325,15 +322,14 @@ fn u64_at(xs: List<U64>, i: Int) -> U64 = match xs.at(i) { Some(x) -> x, None ->
 fn stat_at(xs: List<Option<Float>>, i: Int) -> Option<Float> =
   match xs.at(i) { Some(x) -> x, None -> None }
 
-// --- Errors --------------------------------------------------------------------
-
 /// Why a reader rejected a request.
 pub type ErrorKind =
   /// The bytes are not the protobuf of a request: `std.protobuf`'s own error.
   | NotProtobuf(protobuf::ErrorKind)
   /// The text is not JSON, with the parser's message.
   | NotJson(String)
-  /// A JSON value of the wrong kind for its field, with the kind the field takes.
+  /// A JSON value has the wrong type for its field. The `String` names the type the field expects,
+  /// such as `a string` or `an array`.
   | WrongKind(String)
   /// A trace id that is not sixteen bytes or a span id that is not eight, or one all zeros.
   | BadId
@@ -345,8 +341,8 @@ pub type ErrorKind =
   | BadText
   /// A metric of a kind this module does not model: `exponential_histogram` or `summary`.
   | Unsupported(String)
-  /// Something a message must contain and does not: a metric's data, a point's value, how a sum
-  /// or a histogram adds up over time.
+  /// A required part of a message is absent: a metric's data, a point's value, or a sum or
+  /// histogram's aggregation temporality (whether its values are cumulative or per interval).
   | Missing(String)
   /// Longer than `Limits.length`.
   | TooLong
@@ -364,14 +360,15 @@ pub type Error = new {
   field: String,
 }
 
-/// What this module's readers raise when they fail, and what a program requests of the exporter
-/// around it.
+/// The operations a program performs on the OTLP exporter (the handler that queues telemetry and
+/// sends it to a collector), plus the failure that this module's readers raise.
 pub effect otlp {
   /// The bytes are not a request this module models.
   raise fail(e: Error)
-  /// Sends everything the exporter around the caller has queued, and returns its statistics.
+  /// Sends all the telemetry the exporter has queued to the collector, and returns the exporter's
+  /// statistics.
   write flush() -> Stats
-  /// What the exporter around the caller has done so far.
+  /// Returns the exporter's statistics so far.
   read stats() -> Stats
 }
 
@@ -383,14 +380,12 @@ pub type Limits = new {
   depth: Int,
 }
 
-/// Four mebibytes and 64 levels: what a collector accepts by default, and deeper than any
-/// request this module writes.
+/// Returns the limits a collector accepts by default. They are larger than any request this module
+/// writes.
 pub fn default_limits() -> Limits = { length: 4194304, depth: 64 }
 
 fn fail<a>(reason: ErrorKind, at: Int, field: String) -> a / {otlp.fail} =
   otlp.fail({ reason: reason, at: at, field: field })
-
-// --- The two encodings ----------------------------------------------------------
 
 /// How a request is written.
 pub type Encoding =
@@ -399,7 +394,8 @@ pub type Encoding =
   /// OTLP's JSON mapping: `application/json`.
   | Json
 
-/// Which request a receipt replies to, since the two name rejected items differently.
+/// Says whether a collector's reply belongs to a traces request or a metrics request. The JSON
+/// reply names rejected spans and rejected data points with different field names.
 pub type Signal = | TraceSignal | MetricSignal
 
 /// The `Content-Type` a request in this encoding is sent with.
@@ -414,7 +410,8 @@ pub fn encode_traces(e: Encoding, t: Traces) -> Bytes / {abort.raise} =
 pub fn encode_metrics(e: Encoding, m: Metrics) -> Bytes / {abort.raise} =
   match e { Protobuf -> metrics_body(m), Json -> json::to_bytes(metrics_json(m)) }
 
-/// A collector's reply. An empty receipt is the empty message.
+/// Encodes a collector's reply to `signal` in the given encoding. A reply that rejects nothing and
+/// has no message encodes as the empty protobuf message.
 pub fn encode_response(e: Encoding, signal: Signal, r: ExportResponse) -> Bytes / {abort.raise} =
   match e { Protobuf -> response_body(r), Json -> json::to_bytes(response_json(signal, r)) }
 
@@ -471,8 +468,6 @@ pub fn decode_response(
   limits: Limits,
 ) -> Result<ExportResponse, Error> / {abort.raise} = try { read_response(e, signal, data, limits) }
 
-// --- Protobuf: writing ----------------------------------------------------------
-
 fn string_if_set(field: Int, s: String) -> Bytes / {abort.raise} =
   if s == "" { b"" } else { protobuf::string_field(field, s) }
 
@@ -503,7 +498,7 @@ fn value_body(v: AnyValue) -> Bytes / {abort.raise} =
 fn key_value_body(key_value: KeyValue) -> Bytes / {abort.raise} =
   string_if_set(1, key_value.key).concat(match key_value.value {
     NoValue -> b"",
-    held -> protobuf::message_field(2, value_body(held)),
+    value -> protobuf::message_field(2, value_body(value)),
   })
 
 fn attributes_at(field: Int, kvs: List<KeyValue>) -> Bytes / {abort.raise} =
@@ -679,9 +674,6 @@ fn response_body(r: ExportResponse) -> Bytes / {abort.raise} =
   if r.rejected == 0 && r.message == "" { b"" }
   else { protobuf::message_field(1, int_if_set(1, r.rejected).concat(string_if_set(2, r.message))) }
 
-// --- Protobuf: reading ----------------------------------------------------------
-
-/// `read` over `data` as a message, with a wire format error returned as this module's error.
 fn from_protobuf<a>(
   data: Bytes,
   limits: Limits,
@@ -698,7 +690,7 @@ effect set Reading = {otlp.fail, protobuf.fail, abort.raise}
 
 fn value_of(m: Message, depth_left: Int) -> AnyValue / {Reading} =
   if depth_left <= 0 { fail(TooDeep, protobuf::offset(m), "value") } else {
-    protobuf::fields(m).fold(NoValue, |held: AnyValue, f: Field|
+    protobuf::fields(m).fold(NoValue, |value: AnyValue, f: Field|
       match f.number {
         1 -> StringValue(protobuf::string_of(f)),
         2 -> BoolValue(protobuf::bool_of(f)),
@@ -707,19 +699,22 @@ fn value_of(m: Message, depth_left: Int) -> AnyValue / {Reading} =
         5 -> ArrayValue(values_in(protobuf::message_of(f), depth_left - 1)),
         6 -> KvlistValue(key_values_in(protobuf::message_of(f), 1, depth_left - 1)),
         7 -> BytesValue(protobuf::bytes_of(f)),
-        _ -> held,
+        _ -> value,
       })
   }
 
 fn values_in(m: Message, depth_left: Int) -> List<AnyValue> / {Reading} =
-  protobuf::fields(m).fold([], |acc: List<AnyValue>, f: Field|
-    match f.number { 1 -> acc.push(value_of(protobuf::message_of(f), depth_left)), _ -> acc })
+  protobuf::fields(m).fold([], |accumulator: List<AnyValue>, f: Field|
+    match f.number {
+      1 -> accumulator.push(value_of(protobuf::message_of(f), depth_left)),
+      _ -> accumulator,
+    })
 
-/// Every `KeyValue` under the field `number` of `m`.
 fn key_values_in(m: Message, int_if_set: Int, depth_left: Int) -> List<KeyValue> / {Reading} =
-  protobuf::fields(m).fold([], |acc: List<KeyValue>, f: Field|
-    if f.number == int_if_set { acc.push(key_value_of(protobuf::message_of(f), depth_left)) }
-    else { acc })
+  protobuf::fields(m).fold([], |accumulator: List<KeyValue>, f: Field|
+    if f.number == int_if_set {
+      accumulator.push(key_value_of(protobuf::message_of(f), depth_left))
+    } else { accumulator })
 
 fn key_value_of(m: Message, depth_left: Int) -> KeyValue / {Reading} = {
   let start: KeyValue = { key: "", value: NoValue };
@@ -794,7 +789,6 @@ fn event_of(m: Message, depth_left: Int) -> Event / {Reading} = {
     })
 }
 
-/// A span's or a link's fields before the lengths of its ids are checked.
 type Raw = {
   trace_id: Bytes,
   span_id: Bytes,
@@ -842,7 +836,6 @@ fn trace_id_of(raw: Bytes, at: Int) -> TraceId / {otlp.fail, abort.raise} =
 fn span_id_of(raw: Bytes, at: Int, field: String) -> SpanId / {otlp.fail, abort.raise} =
   match traceparent::span_id(raw) { Some(id) -> id, None -> fail(BadId, at, field) }
 
-/// A parent of no bytes, or of eight zeros as some writers send it, is `None`.
 fn parent_of(raw: Bytes, at: Int) -> Option<SpanId> / {otlp.fail, abort.raise} =
   if raw.len() == 0 || raw == b"\x00\x00\x00\x00\x00\x00\x00\x00" { None }
   else { Some(span_id_of(raw, at, "parentSpanId")) }
@@ -1019,15 +1012,17 @@ fn histogram_point_of(m: Message, depth_left: Int) -> HistogramPoint / {Reading}
       6 ->
         {
           ..p,
-          bucket_counts: protobuf::fixed64s_of(f).fold(p.bucket_counts, |acc: List<U64>, n: U64|
-            acc.push(n)),
+          bucket_counts: protobuf::fixed64s_of(f).fold(
+            p.bucket_counts,
+            |accumulator: List<U64>, n: U64| accumulator.push(n),
+          ),
         },
       7 ->
         {
           ..p,
           explicit_bounds: protobuf::doubles_of(f).fold(
             p.explicit_bounds,
-            |acc: List<Float>, x: Float| acc.push(x),
+            |accumulator: List<Float>, x: Float| accumulator.push(x),
           ),
         },
       9 ->
@@ -1037,7 +1032,6 @@ fn histogram_point_of(m: Message, depth_left: Int) -> HistogramPoint / {Reading}
       _ -> p,
     })
 
-/// The points, temporality and monotonicity a gauge, a sum or a histogram message contains.
 type RawData<p> = { points: List<p>, temporality: Int, monotonic: Bool }
 
 fn number_data_of(m: Message, depth_left: Int) -> RawData<NumberPoint> / {Reading} = {
@@ -1125,15 +1119,15 @@ fn resource_metrics_of(m: Message, depth_left: Int) -> ResourceMetrics / {Readin
 
 fn metrics_of(m: Message, depth_left: Int) -> Metrics / {Reading} = {
   let start: Metrics = { resource_metrics: [] };
-  protobuf::fields(m).fold(start, |held: Metrics, f: Field|
+  protobuf::fields(m).fold(start, |metrics: Metrics, f: Field|
     match f.number {
       1 ->
         {
-          resource_metrics: held.resource_metrics.push(
+          resource_metrics: metrics.resource_metrics.push(
             resource_metrics_of(protobuf::message_of(f), depth_left),
           ),
         },
-      _ -> held,
+      _ -> metrics,
     })
 }
 
@@ -1152,19 +1146,14 @@ fn response_of(m: Message) -> ExportResponse / {protobuf.fail, abort.raise} = {
     })
 }
 
-// --- JSON: writing ---------------------------------------------------------------
-
 type Member = { key: String, value: Json }
 
-/// An object of the members that are set: a member whose value is `Null` is left out.
 fn object(members: List<Member>) -> Json =
   json::Object(
     members.fold(Map::new(), |m: Map<String, Json>, e: Member|
       match e.value { Null -> m, held -> m.insert(e.key, held) }),
   )
 
-/// `j` when a field is set, or `Null`, which `object` leaves out, when it contains the value a
-/// reader assumes for a missing field.
 fn json_if(present: Bool, j: Json) -> Json = if present { j } else { Null }
 
 fn text_json(s: String) -> Json = json_if(s != "", Str(s))
@@ -1403,8 +1392,6 @@ fn response_json(signal: Signal, r: ExportResponse) -> Json =
     ])
   }
 
-// --- JSON: reading ---------------------------------------------------------------
-
 type Members = Map<String, Json>
 
 fn parsed(data: Bytes, limits: Limits) -> Json / {otlp.fail, abort.raise} =
@@ -1417,14 +1404,12 @@ fn parsed(data: Bytes, limits: Limits) -> Json / {otlp.fail, abort.raise} =
 
 fn fail_field<a>(reason: ErrorKind, field: String) -> a / {otlp.fail} = fail(reason, -1, field)
 
-/// A member's value, with `null` read as a missing member, as the mapping requires.
 fn member(o: Members, name: String) -> Option<Json> =
   match o.get(name) { Some(Null) -> None, other -> other }
 
 fn members_of(j: Json, field: String) -> Members / {otlp.fail} =
   match j { json::Object(m) -> m, _ -> fail_field(WrongKind("an object"), field) }
 
-/// The object under `name`, or an empty one if it is missing.
 fn members_in(o: Members, name: String) -> Members / {otlp.fail} =
   match member(o, name) { Some(j) -> members_of(j, name), None -> Map::new() }
 
@@ -1445,7 +1430,6 @@ fn text_in(o: Members, name: String) -> String / {otlp.fail} =
 fn all_digits(raw: Bytes) -> Bool =
   raw.len() > 0 && raw.scan(0, b"0123456789", raw.len()) >= raw.len()
 
-/// The whole number a 64-bit field contains: a decimal string, or a JSON number that is whole.
 fn whole_text(j: Json, field: String) -> String / {otlp.fail} =
   match j {
     Str(s) -> s,
@@ -1488,7 +1472,6 @@ fn int_of_json(j: Json, field: String) -> Int / {otlp.fail, abort.raise} = {
 fn int_in(o: Members, name: String) -> Int / {otlp.fail, abort.raise} =
   match member(o, name) { Some(j) -> int_of_json(j, name), None -> 0 }
 
-/// A 32-bit field: a JSON number, whole and in range.
 fn u32_in(o: Members, name: String) -> U32 / {otlp.fail, abort.raise} =
   match member(o, name) {
     None -> 0u32,
@@ -1498,7 +1481,6 @@ fn u32_in(o: Members, name: String) -> U32 / {otlp.fail, abort.raise} =
     },
   }
 
-/// An enum's number: the mapping writes no names.
 fn enum_in(o: Members, name: String) -> Int / {otlp.fail, abort.raise} =
   match member(o, name) {
     None -> 0,
@@ -1529,7 +1511,6 @@ fn bool_in(o: Members, name: String) -> Bool / {otlp.fail} =
     None -> false,
   }
 
-/// An id's bytes: hex in either case, as the mapping writes one.
 fn hex_in(o: Members, name: String) -> Bytes / {otlp.fail} = {
   let written = text_in(o, name).ascii_lower();
   match try[abort.raise] { Bytes::of_hex(written) } {
@@ -1555,14 +1536,16 @@ fn compound_of_json(o: Members, depth_left: Int) -> AnyValue / {otlp.fail, abort
   match member(o, "doubleValue") {
     Some(f) -> DoubleValue(double_of_json(f, "doubleValue")),
     None -> match member(o, "arrayValue") {
-      Some(held) ->
+      Some(array_value) ->
         ArrayValue(
-          items_in(members_of(held, "arrayValue"), "values").map(|x: Json|
+          items_in(members_of(array_value, "arrayValue"), "values").map(|x: Json|
             value_of_json(x, depth_left)),
         ),
       None -> match member(o, "kvlistValue") {
-        Some(held) ->
-          KvlistValue(key_values_of_json(members_of(held, "kvlistValue"), "values", depth_left)),
+        Some(kvlist_value) ->
+          KvlistValue(
+            key_values_of_json(members_of(kvlist_value, "kvlistValue"), "values", depth_left),
+          ),
         None -> match member(o, "bytesValue") {
           Some(Str(string_if_set)) -> match base64_decode(string_if_set) {
             Some(raw) -> BytesValue(raw),
@@ -1659,11 +1642,11 @@ fn traces_of_json(j: Json, depth_left: Int) -> Traces / {otlp.fail, abort.raise}
       {
         resource: resource_of_json(members_in(o, "resource"), depth_left),
         scope_spans: items_in(o, "scopeSpans").map(|s: Json| -> ScopeSpans {
-          let held = members_of(s, "scopeSpans");
+          let scope_members = members_of(s, "scopeSpans");
           {
-            scope: scope_of_json(members_in(held, "scope"), depth_left),
-            spans: items_in(held, "spans").map(|x: Json| span_of_json(x, depth_left)),
-            schema_url: text_in(held, "schemaUrl"),
+            scope: scope_of_json(members_in(scope_members, "scope"), depth_left),
+            spans: items_in(scope_members, "spans").map(|x: Json| span_of_json(x, depth_left)),
+            schema_url: text_in(scope_members, "schemaUrl"),
           }
         }),
         schema_url: text_in(o, "schemaUrl"),
@@ -1709,18 +1692,19 @@ fn data_of_json(o: Members, depth_left: Int) -> Data / {otlp.fail, abort.raise} 
           number_point_of_json(p, depth_left)),
       ),
     (_, Some(s), _) -> {
-      let held = members_of(s, "sum");
+      let sum_members = members_of(s, "sum");
       Sum(
-        items_in(held, "dataPoints").map(|p: Json| number_point_of_json(p, depth_left)),
-        temporality_of(enum_in(held, "aggregationTemporality"), -1),
-        bool_in(held, "isMonotonic"),
+        items_in(sum_members, "dataPoints").map(|p: Json| number_point_of_json(p, depth_left)),
+        temporality_of(enum_in(sum_members, "aggregationTemporality"), -1),
+        bool_in(sum_members, "isMonotonic"),
       )
     },
     (_, _, Some(h)) -> {
-      let held = members_of(h, "histogram");
+      let histogram_members = members_of(h, "histogram");
       Histogram(
-        items_in(held, "dataPoints").map(|p: Json| histogram_point_of_json(p, depth_left)),
-        temporality_of(enum_in(held, "aggregationTemporality"), -1),
+        items_in(histogram_members, "dataPoints").map(|p: Json|
+          histogram_point_of_json(p, depth_left)),
+        temporality_of(enum_in(histogram_members, "aggregationTemporality"), -1),
       )
     },
     _ -> if o.contains("exponentialHistogram") {
@@ -1737,10 +1721,10 @@ fn metrics_of_json(j: Json, depth_left: Int) -> Metrics / {otlp.fail, abort.rais
         {
           resource: resource_of_json(members_in(o, "resource"), depth_left),
           scope_metrics: items_in(o, "scopeMetrics").map(|s: Json| -> ScopeMetrics {
-            let held = members_of(s, "scopeMetrics");
+            let scope_members = members_of(s, "scopeMetrics");
             {
-              scope: scope_of_json(members_in(held, "scope"), depth_left),
-              metrics: items_in(held, "metrics").map(|x: Json| -> Metric {
+              scope: scope_of_json(members_in(scope_members, "scope"), depth_left),
+              metrics: items_in(scope_members, "metrics").map(|x: Json| -> Metric {
                 let m = members_of(x, "metrics");
                 {
                   name: text_in(m, "name"),
@@ -1749,7 +1733,7 @@ fn metrics_of_json(j: Json, depth_left: Int) -> Metrics / {otlp.fail, abort.rais
                   data: data_of_json(m, depth_left),
                 }
               }),
-              schema_url: text_in(held, "schemaUrl"),
+              schema_url: text_in(scope_members, "schemaUrl"),
             }
           }),
           schema_url: text_in(o, "schemaUrl"),
@@ -1762,8 +1746,6 @@ fn response_of_json(signal: Signal, j: Json) -> ExportResponse / {otlp.fail, abo
   let partial = members_in(members_of(j, ""), "partialSuccess");
   { rejected: int_in(partial, rejected_name(signal)), message: text_in(partial, "errorMessage") }
 }
-
-// --- The exporter ---------------------------------------------------------------
 
 /// What an exporter has done so far.
 pub type Stats = new {
@@ -1810,7 +1792,7 @@ pub type Config = new {
   /// The most finished spans that may wait. A span that ends when the queue is full is dropped
   /// and counted.
   queue: Int,
-  /// The most spans one request carries, and how many waiting make a request due.
+  /// The most spans one request carries. Once this many spans are queued, a request is sent.
   batch: Int,
   /// How long, in milliseconds, a span waits before a request is due whatever the count.
   max_age_ms: Int,
@@ -1826,16 +1808,18 @@ pub type Config = new {
   max_backoff_ms: Int,
   /// How long, in milliseconds, a flush may take. Anything still waiting after it stays queued.
   flush_ms: Int,
-  /// The upper bounds, in seconds, a timing is counted under.
+  /// The upper bounds, in seconds, of the histogram buckets that durations are counted in.
   bounds: List<Float>,
   /// The deadlines of one request, and the most bytes of a reply.
   limits: http::Limits,
 }
 
-/// An exporter for the service `service` to the collector at `host` and `port`, over plain
-/// HTTP in protobuf, with OpenTelemetry's SDK defaults: every trace recorded, 2048 spans queued,
-/// 512 spans a request, a request after five seconds, metrics every minute, five attempts from one
-/// to thirty seconds apart, ten seconds for a request and thirty for a flush.
+/// Returns a configuration for the service `service` that exports to the collector at `host` and
+/// `port` over plain HTTP using protobuf. The other fields get OpenTelemetry's SDK defaults: every
+/// trace is recorded, the queue holds 2048 spans, a request carries up to 512 spans and is sent
+/// after at most five seconds, and metrics are sent every minute. A request is tried up to five
+/// times, waiting between one and thirty seconds before each retry. Requests time out after ten
+/// seconds and a flush after thirty.
 pub fn config(service: String, host: String, port: Int) -> Config = {
   let base: http::Limits = http::default_limits();
   {
@@ -1875,7 +1859,6 @@ pub fn config(service: String, host: String, port: Int) -> Config = {
   }
 }
 
-/// A span that is open.
 type OpenSpan = {
   id: Int,
   channel: String,
@@ -1885,37 +1868,23 @@ type OpenSpan = {
   fields: Fields,
 }
 
-/// A span that ended, with the channel it was on.
 type EndedSpan = { channel: String, span: Span }
 
-/// A request, encoded: what it contains, how many times it has been sent, and when it may be
-/// sent again.
 type Outbound = { signal: Signal, body: Bytes, items: Int, attempts: Int, not_before: Int }
 
-/// The current value of one series of a metric.
-type Tally =
-  /// A counter's total, and whether every step so far added to it.
-  | Count(Int, Bool)
-  | Level(Float)
-  /// A timing's count in each bucket, and its sum, least and greatest, in seconds.
-  | Timing(List<Int>, Float, Float, Float)
+type Tally = | Count(Int, Bool) | Level(Float) | Timing(List<Int>, Float, Float, Float)
 
 type Series = { channel: String, name: String, fields: Fields, value: Tally }
 
 type State = {
-  /// Innermost first.
   open: List<OpenSpan>,
   next: Int,
   queue: List<EndedSpan>,
-  /// When the oldest span in the queue joined it.
   queued_at: Int,
   pending: Option<Outbound>,
   busy: Bool,
-  /// Keyed by channel, kind, name and fields, so one metric's series are adjacent.
   series: Map<String, Series>,
-  /// How many series each metric has.
   widths: Map<String, Int>,
-  /// Whether a metric moved since the metrics were last sent.
   dirty: Bool,
   metrics_at: Int,
   started: U64,
@@ -1959,7 +1928,6 @@ fn stats_of(s: State) -> Stats =
       }),
   }
 
-/// Nanoseconds since the Unix epoch: the wall clock read once, and the monotonic clock since.
 fn nanos_now(wall_ms: Int, mono_us: Int, now_us: Int) -> U64 =
   match try[abort.raise] { U64::of_int(max(wall_ms * 1000 + (now_us - mono_us), 0) * 1000) } {
     Ok(n) -> n,
@@ -1995,7 +1963,6 @@ fn value_of_field(f: trace::Field) -> AnyValue / {abort.raise} =
     trace::JsonField(j) -> StringValue(json::to_string(j)),
   }
 
-/// Fields as attributes, in the order of their names.
 fn attributes_of(fields: Fields) -> List<KeyValue> / {abort.raise} =
   fields.entries().map(|e: { key: String, value: trace::Field }| -> KeyValue {
     { key: e.key, value: value_of_field(e.value) }
@@ -2010,8 +1977,6 @@ fn kind_from(kind: telemetry::Kind) -> SpanKind =
     telemetry::Consumer -> Consumer,
   }
 
-/// A span that ended successfully has an unset status, as OpenTelemetry requires of
-/// instrumentation.
 fn status_for(outcome: trace::Outcome) -> Status =
   match outcome {
     trace::Ok -> unset(),
@@ -2046,7 +2011,6 @@ fn finished(o: OpenSpan, outcome: trace::Outcome, at: U64) -> EndedSpan / {abort
 
 fn is_sampled(o: OpenSpan) -> Bool = traceparent::sampled(o.who.context.parent)
 
-/// `s` with `done` waiting to be sent, or counted as dropped when the queue is full.
 fn queued(s: State, config: Config, done: EndedSpan, now_ms: Int) -> State =
   if s.queue.len() >= max(config.queue, 1) {
     { ..s, stats: { ..s.stats, dropped: s.stats.dropped + 1 } }
@@ -2060,8 +2024,6 @@ fn queued(s: State, config: Config, done: EndedSpan, now_ms: Int) -> State =
 
 type ClosingSpans = { closing: List<SpanId>, still_open: List<OpenSpan>, state: State }
 
-/// `s` with the span `span` closed as `outcome`, and every span opened under it that is still
-/// open closed as abandoned, as `trace.exit` documents.
 fn closed(
   s: State,
   config: Config,
@@ -2078,17 +2040,24 @@ fn closed(
         still_open: [],
         state: s,
       };
-      let swept = s.open.reverse().fold(start, |acc: ClosingSpans, o: OpenSpan| -> ClosingSpans {
-        let under = match o.who.parent { Some(p) -> acc.closing.contains(p), None -> false };
-        if o.id == target.id { { ..acc, state: ended(acc.state, config, o, outcome, at, now_ms) } }
-        else if under {
-          {
-            closing: acc.closing.push(o.who.context.parent.parent_id),
-            still_open: acc.still_open,
-            state: ended(acc.state, config, o, trace::Abandoned, at, now_ms),
-          }
-        } else { { ..acc, still_open: acc.still_open.push(o) } }
-      });
+      let swept = s.open.reverse().fold(
+        start,
+        |accumulator: ClosingSpans, o: OpenSpan| -> ClosingSpans {
+          let under = match o.who.parent {
+            Some(p) -> accumulator.closing.contains(p),
+            None -> false,
+          };
+          if o.id == target.id {
+            { ..accumulator, state: ended(accumulator.state, config, o, outcome, at, now_ms) }
+          } else if under {
+            {
+              closing: accumulator.closing.push(o.who.context.parent.parent_id),
+              still_open: accumulator.still_open,
+              state: ended(accumulator.state, config, o, trace::Abandoned, at, now_ms),
+            }
+          } else { { ..accumulator, still_open: accumulator.still_open.push(o) } }
+        },
+      );
       { ..swept.state, open: swept.still_open.reverse() }
     },
   }
@@ -2112,8 +2081,6 @@ fn annotated(s: State, span: SpanId, fields: Fields) -> State =
       else { o }),
   }
 
-/// `s` with one metric's series under `fields` updated by `step`, which is given the series'
-/// current value. A label set past the metric's `max_series` is counted and not stored.
 fn update_series(
   s: State,
   config: Config,
@@ -2126,8 +2093,15 @@ fn update_series(
   let metric = channel ++ "\u{0}" ++ kind ++ "\u{0}" ++ name;
   let key = metric ++ "\u{0}" ++ show(fields);
   match s.series.get(key) {
-    Some(held) ->
-      { ..s, dirty: true, series: s.series.insert(key, { ..held, value: step(Some(held.value)) }) },
+    Some(existing_series) ->
+      {
+        ..s,
+        dirty: true,
+        series: s.series.insert(key, {
+          ..existing_series,
+          value: step(Some(existing_series.value)),
+        }),
+      },
     None -> {
       let width = match s.widths.get(metric) { Some(n) -> n, None -> 0 };
       if width >= max(config.max_series, 1) {
@@ -2149,14 +2123,14 @@ fn update_series(
   }
 }
 
-fn add_count(held: Option<Tally>, delta: Int) -> Tally =
-  match held {
+fn add_count(previous_tally: Option<Tally>, delta: Int) -> Tally =
+  match previous_tally {
     Some(Count(total, rising)) -> Count(total + delta, rising && delta >= 0),
     _ -> Count(delta, delta >= 0),
   }
 
-fn add_timing(held: Option<Tally>, bounds: List<Float>, seconds: Float) -> Tally =
-  match held {
+fn add_timing(previous_tally: Option<Tally>, bounds: List<Float>, seconds: Float) -> Tally =
+  match previous_tally {
     Some(Timing(counts, sum, least, greatest)) ->
       Timing(
         telemetry::add_to_buckets(bounds, counts, seconds),
@@ -2170,13 +2144,17 @@ fn add_timing(held: Option<Tally>, bounds: List<Float>, seconds: Float) -> Tally
 fn u64_of_int(n: Int) -> U64 =
   match try[abort.raise] { U64::of_int(max(n, 0)) } { Ok(w) -> w, Err(_) -> 0u64 }
 
-/// One series as a metric containing its single point.
-fn metric_of_series(config: Config, held: Series, started: U64, at: U64) -> Metric / {abort.raise} = {
-  let attributes = attributes_of(held.fields);
-  match held.value {
+fn metric_of_series(
+  config: Config,
+  series: Series,
+  started: U64,
+  at: U64,
+) -> Metric / {abort.raise} = {
+  let attributes = attributes_of(series.fields);
+  match series.value {
     Count(total, rising) ->
       {
-        name: held.name,
+        name: series.name,
         description: "",
         unit: "",
         data: Sum(
@@ -2187,14 +2165,14 @@ fn metric_of_series(config: Config, held: Series, started: U64, at: U64) -> Metr
       },
     Level(level) ->
       {
-        name: held.name,
+        name: series.name,
         description: "",
         unit: "",
         data: Gauge([{ attributes: attributes, start: 0u64, time: at, value: AsDouble(level) }]),
       },
     Timing(counts, sum, least, greatest) ->
       {
-        name: held.name,
+        name: series.name,
         description: "",
         unit: "s",
         data: Histogram(
@@ -2217,7 +2195,6 @@ fn metric_of_series(config: Config, held: Series, started: U64, at: U64) -> Metr
   }
 }
 
-/// Two metrics of one name and kind as one, the second's points after the first's.
 fn joined_data(a: Data, b: Data) -> Option<Data> =
   match ((a, b)) {
     (Gauge(xs), Gauge(ys)) -> Some(Gauge(xs.concat(ys))),
@@ -2243,21 +2220,18 @@ fn with_scoped(scopes: List<ScopeMetrics>, channel: String, m: Metric) -> List<S
     None -> [{ scope: scope(channel), metrics: [m], schema_url: "" }],
   }
 
-/// Every series as a request: a scope for each channel, a metric for each name and kind.
 fn metrics_request(config: Config, s: State, at: U64) -> Metrics / {abort.raise} =
   {
     resource_metrics: [
       {
         resource: config.resource,
-        scope_metrics: s.series.values().fold([], |scopes: List<ScopeMetrics>, held: Series|
-          with_scoped(scopes, held.channel, metric_of_series(config, held, s.started, at))),
+        scope_metrics: s.series.values().fold([], |scopes: List<ScopeMetrics>, series: Series|
+          with_scoped(scopes, series.channel, metric_of_series(config, series, s.started, at))),
         schema_url: "",
       },
     ],
   }
 
-/// Finished spans as a request: a scope for each channel, in the order the channels first
-/// appear.
 fn traces_request(config: Config, batch: List<EndedSpan>) -> Traces =
   {
     resource_spans: [
@@ -2266,10 +2240,11 @@ fn traces_request(config: Config, batch: List<EndedSpan>) -> Traces =
         scope_spans: batch.fold(
           [],
           |scopes: List<ScopeSpans>, done: EndedSpan| -> List<ScopeSpans> {
-            if scopes.any(|held: ScopeSpans| held.scope.name == done.channel) {
-              scopes.map(|held: ScopeSpans|
-                if held.scope.name == done.channel { { ..held, spans: held.spans.push(done.span) } }
-                else { held })
+            if scopes.any(|scope_spans: ScopeSpans| scope_spans.scope.name == done.channel) {
+              scopes.map(|scope_spans: ScopeSpans|
+                if scope_spans.scope.name == done.channel {
+                  { ..scope_spans, spans: scope_spans.spans.push(done.span) }
+                } else { scope_spans })
             } else {
               scopes.push({ scope: scope(done.channel), spans: [done.span], schema_url: "" })
             }
@@ -2285,10 +2260,6 @@ fn compressed(config: Config, body: Bytes) -> Bytes / {abort.raise} =
 
 type Plan = { state: State, send: Option<Outbound>, wait_ms: Int }
 
-/// What is due to be sent at `now_ms`. First, a request waiting to be sent again, once its wait
-/// has passed. Otherwise, a batch of spans, if enough are waiting or the oldest has waited long
-/// enough. Otherwise, the metrics, if one changed and their interval has passed. `force` means a
-/// flush: everything waiting is due, and a request waiting on its backoff is sent after it.
 fn planned(s: State, config: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {abort.raise} =
   if s.busy { { state: s, send: None, wait_ms: 0 } } else {
     match s.pending {
@@ -2339,19 +2310,12 @@ fn planned(s: State, config: Config, now_ms: Int, at: U64, force: Bool) -> Plan 
     }
   }
 
-/// How a request ended.
-type SendOutcome =
-  /// The collector accepted it, and reports what part of it was rejected.
-  | Accepted(ExportResponse)
-  /// It failed in a way that may be temporary: no reply, or a 429, 502, 503 or 504, with the
-  /// milliseconds its `Retry-After` requested.
-  | Retryable(Option<Int>)
-  /// The collector rejected it, and would reject it again.
-  | Rejected
+type SendOutcome = | Accepted(ExportResponse) | Retryable(Option<Int>) | Rejected
 
-/// How long to wait before attempt `attempt` (the first retry is 1): the backoff doubled for each
-/// earlier retry, capped at the longest, and placed in its upper half by `draw` out of a thousand.
-/// If `Retry-After` requested a longer wait, that wait instead.
+/// Returns how many milliseconds to wait before retry number `attempt` (the first retry is 1). The
+/// wait starts at `config.backoff_ms`, doubles for each earlier retry, and is limited to
+/// `config.max_backoff_ms`. It is then reduced by a random amount: `draw` (0 to 999) picks a point
+/// between half of that wait and all of it. If `retry_after_ms` is longer, it is returned instead.
 pub fn retry_wait(config: Config, attempt: Int, retry_after_ms: Option<Int>, draw: Int) -> Int = {
   let doubled = range(1, min(max(attempt, 1), 32)).fold(
     max(config.backoff_ms, 0),
@@ -2359,7 +2323,7 @@ pub fn retry_wait(config: Config, attempt: Int, retry_after_ms: Option<Int>, dra
   );
   let capped = min(doubled, max(config.max_backoff_ms, 0));
   let jittered = capped / 2 + capped / 2 * min(max(draw, 0), 999) / 1000;
-  match retry_after_ms { Some(asked) -> max(asked, jittered), None -> jittered }
+  match retry_after_ms { Some(retry_after) -> max(retry_after, jittered), None -> jittered }
 }
 
 fn record_outcome(
@@ -2371,11 +2335,10 @@ fn record_outcome(
   draw: Int,
 ) -> State = {
   let free = { ..s, busy: false };
-  let lost = |held: State| -> State {
+  let lost = |state: State| -> State {
     match out.signal {
-      TraceSignal -> { ..held, stats: { ..held.stats, failed: held.stats.failed + out.items } },
-      // The series still contain what the request sent, so the next request sends it again.
-      MetricSignal -> { ..held, dirty: true },
+      TraceSignal -> { ..state, stats: { ..state.stats, failed: state.stats.failed + out.items } },
+      MetricSignal -> { ..state, dirty: true },
     }
   };
   match how {
@@ -2404,7 +2367,6 @@ fn record_outcome(
   }
 }
 
-/// The milliseconds a `Retry-After` of whole seconds requests. A date is not parsed.
 fn retry_after(headers: http::Headers) -> Option<Int> =
   match http::header(headers, "retry-after") {
     Some(string_if_set) -> match try[abort.raise] {
@@ -2419,25 +2381,24 @@ fn retry_after(headers: http::Headers) -> Option<Int> =
 fn outcome_of(
   config: Config,
   signal: Signal,
-  res: http::Response<| {}>,
+  response: http::Response<| {}>,
 ) -> SendOutcome / {abort.raise} =
-  if res.status >= 200 && res.status < 300 {
+  if response.status >= 200 && response.status < 300 {
     Accepted(
       match decode_response(
           config.encoding,
           signal,
-          http::whole_bytes(res.body),
+          http::whole_bytes(response.body),
           default_limits(),
         ) {
         Ok(receipt) -> receipt,
         Err(_) -> { rejected: 0, message: "" },
       },
     )
-  } else if res.status == 429 || res.status == 502 || res.status == 503 || res.status == 504 {
-    Retryable(retry_after(res.headers))
-  } else { Rejected }
+  } else if response.status == 429 || response.status == 502 || response.status == 503
+      || response.status == 504 { Retryable(retry_after(response.headers)) }
+  else { Rejected }
 
-/// The HTTP request for `out`, to the collector `config` names.
 fn request_of(config: Config, out: Outbound) -> http::Request / {abort.raise} = {
   let path = config.prefix
     ++ (match out.signal { TraceSignal -> traces_path(), MetricSignal -> metrics_path() });
@@ -2461,22 +2422,19 @@ fn request_collector<[l]>(
   if config.tls {
     match http::dial_tls[l](config.host, config.port, config.limits) {
       Err(e) -> Err(e),
-      Ok(conn) ->
-        bracket(|| conn, |c: http::Connection| http::close[l](c), |c: http::Connection|
+      Ok(connection) ->
+        bracket(|| connection, |c: http::Connection| http::close[l](c), |c: http::Connection|
           http::round_trip_last[l](c, request_of(config, out), config.limits)),
     }
   } else { http::request[l](config.host, config.port, request_of(config, out), config.limits) }
 
-/// Sends one request and returns how it ended. Nothing it does raises: a request that cannot be
-/// written, such as one with a header among `config.headers` that `std.http` will not send, counts as
-/// rejected by the collector.
 fn send_request<[l]>(
   config: Config,
   out: Outbound,
 ) -> SendOutcome / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l]} =
   match try[abort.raise] {
       match request_collector[l](config, out) {
-        Ok(res) -> outcome_of(config, out.signal, res),
+        Ok(response) -> outcome_of(config, out.signal, response),
         Err(_) -> Retryable(None),
       }
     } {
@@ -2484,30 +2442,32 @@ fn send_request<[l]>(
     Err(_) -> Rejected,
   }
 
-/// What an exporter performs besides `net` on its collector's label: the host's clocks, and its
-/// entropy for ids and jitter.
+/// The effects an exporter performs besides `net`: reading the clocks, sleeping, and drawing random
+/// numbers for ids and jitter.
 pub effect set Exporting = {time.now_ms, time.elapsed_ms, time.elapsed_us, time.sleep_ms, entropy.next, entropy.below}
 
-/// Runs `body`, sending its spans, counters, gauges and timings to the collector `config` names, over
-/// connections under the label the call gives. `exporting[collector](config, ..)` performs `net` on
-/// `collector` and on nothing else, so telemetry goes wherever a run binds that label.
+/// Runs `body` and sends its spans, counters, gauges and timings to the collector that `config`
+/// describes. `exporting[collector](config, ..)` performs `net` only on the effect label
+/// `collector`, so the caller chooses where telemetry goes by what it binds to that label.
 ///
-/// It handles every `trace.enter`, `trace.exit`, `trace.count`, `trace.gauge` and `trace.time`
-/// that `body` performs, on any channel, and `std.telemetry`'s `tracing`. `trace.event` passes to
+/// It handles every `trace.enter`, `trace.exit`, `trace.count`, `trace.gauge` and `trace.time` that
+/// `body` performs, on any channel, and `std.telemetry`'s `tracing`. `trace.event` is passed on to
 /// whatever handles it outside. A span's channel is its instrumentation scope. A span opened by
-/// `std.telemetry` states its parent. Any other span is a child of the span this handler most
-/// recently saw opened and not yet closed. That is one stack for the whole program, not one per
-/// task, so a program whose tasks open spans concurrently should open them with `in_span`.
+/// `std.telemetry` carries its own parent. Any other span becomes a child of the most recently
+/// opened span that is still open. That is one stack for the whole program, not one per task, so
+/// tasks that open spans concurrently should use `in_span`.
 ///
-/// An event never waits on the collector. A span that ends while `config.queue` spans are waiting is
-/// dropped and counted. The task whose event makes a request due, by count or by age, sends that
-/// request itself, within the deadlines of `config.limits`. Meanwhile every other event is queued or
-/// counted. A request that fails in a way that may be temporary (no reply, or a 429, 502, 503 or
-/// 504) is retained and sent again by a later event once its backoff has passed, `config.attempts`
-/// times in all. Nothing here raises because of a collector. There is no timer: age and backoff
-/// are checked when the program next traces something. A `Retry-After` is honoured as a number of
-/// seconds; a date is not parsed. `flush` sends everything waiting, sleeping through a backoff
-/// when it must, for at most `config.flush_ms`. `exporting` itself does the same however `body` ends.
+/// An event never waits on the collector. A span that ends while `config.queue` spans are already
+/// waiting is dropped and counted. When an event makes a request due, by item count or by age, the
+/// task that raised the event sends the request itself, within the deadlines of `config.limits`;
+/// other events are only queued or counted meanwhile. A request that fails in a way that may be
+/// temporary (no reply, or a 429, 502, 503 or 504) is sent again by a later event once its backoff
+/// has passed, up to `config.attempts` times in all. A collector failure never raises. There is no
+/// timer: age and backoff are checked only when the program next traces something. A `Retry-After`
+/// header is honoured as a number of seconds; a date is not parsed.
+///
+/// `flush` sends everything waiting, sleeping through backoffs when needed, for at most
+/// `config.flush_ms`. `exporting` does the same when `body` ends, whether it returns or fails.
 pub fn exporting<a, [l] | e>(
   config: Config,
   body: () -> a / {trace.enter[*], trace.exit[*], trace.count[*], trace.gauge[*], trace.time[*], Tracing, otlp.flush, otlp.stats | e},
@@ -2515,7 +2475,6 @@ pub fn exporting<a, [l] | e>(
   let wall_ms = time.now_ms();
   let mono_us = time.elapsed_us();
   handle {
-    // `patience` is how long a flush may still wait; an event's own request waits for nothing.
     let pump = |force: Bool, patience: Int| {
       let before = exporter_state.get();
       let plan = planned(
@@ -2540,9 +2499,9 @@ pub fn exporting<a, [l] | e>(
       }
     };
     let flushed = || {
-      let held = exporter_state.get();
+      let state = exporter_state.get();
       let began = time.elapsed_ms();
-      let rounds = (held.queue.len() / max(config.batch, 1) + 3) * (max(config.attempts, 1) + 1);
+      let rounds = (state.queue.len() / max(config.batch, 1) + 3) * (max(config.attempts, 1) + 1);
       range(0, rounds).fold(true, |more: Bool, _: Int| {
         let left = config.flush_ms - (time.elapsed_ms() - began);
         if more && left > 0 { pump(true, left) } else { false }
@@ -2560,11 +2519,11 @@ pub fn exporting<a, [l] | e>(
           body()
         } with {
           trace.enter[*c](name, fields) -> {
-            let held = exporter_state.get();
+            let state = exporter_state.get();
             let who = match telemetry::identity(fields) {
               Some(named) -> named,
               None -> {
-                let above = match held.open { [inner, ..] -> Some(inner.who.context), [] -> None };
+                let above = match state.open { [inner, ..] -> Some(inner.who.context), [] -> None };
                 let made: telemetry::Identity = {
                   context: telemetry::begin(above, config.sampler),
                   parent: match above { Some(up) -> Some(up.parent.parent_id), None -> None },
@@ -2575,7 +2534,7 @@ pub fn exporting<a, [l] | e>(
             };
             exporter_state.put(
               opened(
-                held,
+                state,
                 c,
                 name,
                 who,
@@ -2583,7 +2542,7 @@ pub fn exporting<a, [l] | e>(
                 nanos_now(wall_ms, mono_us, time.elapsed_us()),
               ),
             );
-            { id: held.next, channel: c }
+            { id: state.next, channel: c }
           },
           trace.exit[*c](span, outcome) -> {
             exporter_state.put(
@@ -2608,7 +2567,7 @@ pub fn exporting<a, [l] | e>(
                 "sum",
                 name,
                 fields,
-                |held: Option<Tally>| add_count(held, delta),
+                |previous_tally: Option<Tally>| add_count(previous_tally, delta),
               ),
             );
             pump(false, 0);
@@ -2638,8 +2597,8 @@ pub fn exporting<a, [l] | e>(
                 "histogram",
                 name,
                 fields,
-                |held: Option<Tally>|
-                  add_timing(held, config.bounds, Float::of_int(micros) / 1000000.0),
+                |previous_tally: Option<Tally>|
+                  add_timing(previous_tally, config.bounds, Float::of_int(micros) / 1000000.0),
               ),
             );
             pump(false, 0);
@@ -2662,20 +2621,17 @@ pub fn exporting<a, [l] | e>(
   }
 }
 
-/// The state of the exporter `exporting` runs, which its events and its flushes share.
 effect exporter_state {
   read get() -> State
   write put(next: State) -> Unit
 }
 
-/// Sends everything the exporter around the caller has queued, waiting through any request's
-/// backoff, and returns the exporter's statistics. A program calls this before it exits.
+/// Sends everything the enclosing `exporting` has queued, waiting through any request's backoff,
+/// and returns its statistics. A program calls this before it exits.
 pub fn flush() -> Stats / {otlp.flush} = otlp.flush()
 
 /// What the exporter around the caller has done so far.
 pub fn stats() -> Stats / {otlp.stats} = otlp.stats()
-
-// --- Tests: the codecs --------------------------------------------------------
 
 fn trace_of(hex: String) -> TraceId / {abort.raise} =
   match traceparent::trace_id_of_hex(hex) { Some(id) -> id, None -> panic("a trace id") }
@@ -2874,7 +2830,7 @@ test "metrics follow OTLP's JSON mapping" {
   )
 }
 
-test "a request reads back from its protobuf, and the two encodings read as one model" {
+test "`decode_traces` and `decode_metrics` return the original sample from its protobuf encoding, and JSON metrics decode to the same value as protobuf metrics" {
   let wire = encode_traces(Protobuf, sample_traces());
   assert_eq(decode_traces(Protobuf, wire, default_limits()), Ok(sample_traces()));
   let metrics = encode_metrics(Protobuf, sample_metrics());
@@ -2885,12 +2841,10 @@ test "a request reads back from its protobuf, and the two encodings read as one 
   )
 }
 
-/// Generates a `Traces` for a test.
 fn traces_drawn() -> gen::Gen<Traces> =
   gen::map(gen::list_of(resource_spans_drawn(), 2), |resource_spans: List<ResourceSpans>|
     { resource_spans: resource_spans })
 
-/// Generates a `ResourceSpans` for a test.
 fn resource_spans_drawn() -> gen::Gen<ResourceSpans> =
   gen::map3(
     resources(),
@@ -2900,7 +2854,6 @@ fn resource_spans_drawn() -> gen::Gen<ResourceSpans> =
       { resource: resource, scope_spans: scope_spans, schema_url: schema_url },
   )
 
-/// Generates a `Resource` for a test.
 fn resources() -> gen::Gen<Resource> =
   gen::map2(
     gen::list_of(key_values(), 2),
@@ -2909,11 +2862,9 @@ fn resources() -> gen::Gen<Resource> =
       { attributes: attributes, dropped_attributes: dropped_attributes },
   )
 
-/// Generates a `KeyValue` for a test.
 fn key_values() -> gen::Gen<KeyValue> =
   gen::map2(gen::text(), any_values(), |key: String, value: AnyValue| { key: key, value: value })
 
-/// Generates a `ScopeSpans` for a test.
 fn scope_spans_drawn() -> gen::Gen<ScopeSpans> =
   gen::map3(
     scopes(),
@@ -2923,7 +2874,6 @@ fn scope_spans_drawn() -> gen::Gen<ScopeSpans> =
       { scope: scope, spans: spans, schema_url: schema_url },
   )
 
-/// Generates a `Scope` for a test.
 fn scopes() -> gen::Gen<Scope> =
   gen::map4(
     gen::text(),
@@ -2939,7 +2889,6 @@ fn scopes() -> gen::Gen<Scope> =
       },
   )
 
-/// Generates a `Span` for a test.
 fn spans() -> gen::Gen<Span> =
   gen::and_then(traceparent::trace_ids(), |trace_id: TraceId|
     gen::and_then(traceparent::span_ids(), |span_id: SpanId|
@@ -2982,11 +2931,9 @@ fn spans() -> gen::Gen<Span> =
                             ))),
                     ))))))))))
 
-/// Generates a `SpanKind` for a test.
 fn span_kinds() -> gen::Gen<SpanKind> =
   gen::elements([Unspecified, Internal, Server, Client, Producer, Consumer])
 
-/// Generates an `Event` for a test.
 fn events() -> gen::Gen<Event> =
   gen::map4(
     gen::u64(),
@@ -2997,7 +2944,6 @@ fn events() -> gen::Gen<Event> =
       { time: time, name: name, attributes: attributes, dropped_attributes: dropped_attributes },
   )
 
-/// Generates a `Link` for a test.
 fn links() -> gen::Gen<Link> =
   gen::and_then(traceparent::trace_ids(), |trace_id: TraceId|
     gen::and_then(traceparent::span_ids(), |span_id: SpanId|
@@ -3017,20 +2963,16 @@ fn links() -> gen::Gen<Link> =
           },
       )))
 
-/// Generates a `Status` for a test.
 fn status_drawn() -> gen::Gen<Status> =
   gen::map2(status_codes(), gen::text(), |code: StatusCode, message: String|
     { code: code, message: message })
 
-/// Generates a `StatusCode` for a test.
 fn status_codes() -> gen::Gen<StatusCode> = gen::elements([StatusUnset, StatusOk, StatusError])
 
-/// Generates a `Metrics` for a test.
 fn metrics_drawn() -> gen::Gen<Metrics> =
   gen::map(gen::list_of(resource_metrics_drawn(), 2), |resource_metrics: List<ResourceMetrics>|
     { resource_metrics: resource_metrics })
 
-/// Generates a `ResourceMetrics` for a test.
 fn resource_metrics_drawn() -> gen::Gen<ResourceMetrics> =
   gen::map3(
     resources(),
@@ -3040,7 +2982,6 @@ fn resource_metrics_drawn() -> gen::Gen<ResourceMetrics> =
       { resource: resource, scope_metrics: scope_metrics, schema_url: schema_url },
   )
 
-/// Generates a `ScopeMetrics` for a test.
 fn scope_metrics_drawn() -> gen::Gen<ScopeMetrics> =
   gen::map3(
     scopes(),
@@ -3050,7 +2991,6 @@ fn scope_metrics_drawn() -> gen::Gen<ScopeMetrics> =
       { scope: scope, metrics: metrics, schema_url: schema_url },
   )
 
-/// Generates a `Metric` for a test.
 fn metrics() -> gen::Gen<Metric> =
   gen::map4(
     gen::text(),
@@ -3061,7 +3001,6 @@ fn metrics() -> gen::Gen<Metric> =
       { name: name, description: description, unit: unit, data: data },
   )
 
-/// Generates a `Data` for a test.
 fn datas() -> gen::Gen<Data> =
   gen::one_of([
     gen::map(gen::list_of(number_points(), 2), |f0: List<NumberPoint>| Gauge(f0)),
@@ -3078,7 +3017,6 @@ fn datas() -> gen::Gen<Data> =
     ),
   ])
 
-/// Generates a `NumberPoint` for a test.
 fn number_points() -> gen::Gen<NumberPoint> =
   gen::map4(
     gen::list_of(key_values(), 2),
@@ -3089,22 +3027,21 @@ fn number_points() -> gen::Gen<NumberPoint> =
       { attributes: attributes, start: start, time: time, value: value },
   )
 
-/// Generates a `Temporality` for a test.
 fn temporalities() -> gen::Gen<Temporality> = gen::elements([Delta, Cumulative])
 
-test "traces read back from their JSON" {
+test "`decode_traces` returns the original traces from their JSON encoding, for any traces" {
   gen::check(traces_drawn(), |t: Traces| {
     decode_traces(Json, encode_traces(Json, t), default_limits()) == Ok(t)
   })
 }
 
-test "metrics read back from their JSON" {
+test "`decode_metrics` returns the original metrics from their JSON encoding, for any metrics" {
   gen::check(metrics_drawn(), |m: Metrics| {
     decode_metrics(Json, encode_metrics(Json, m), default_limits()) == Ok(m)
   })
 }
 
-test "a receipt reads back from either encoding" {
+test "`decode_response` returns the original export response from either protobuf or JSON encoding" {
   gen::check2(gen::any_int(), gen::text(), |rejected: Int, message: String| {
     let receipt: ExportResponse = { rejected: rejected, message: message };
     decode_response(
@@ -3261,7 +3198,8 @@ fn rejected_traces() -> List<RejectedCase> / {abort.raise} =
     },
   ]
 
-test "traces are rejected: {c.name}" for c: RejectedCase in rejected_traces() {
+test "`decode_traces` rejects the invalid request {c.name} with the expected reason and field" for c: RejectedCase in rejected_traces(
+  ) {
   match decode_traces(c.encoding, c.body, default_limits()) {
     Ok(_) -> panic("accepted"),
     Err(refusal) -> {
@@ -3330,7 +3268,8 @@ fn rejected_metrics() -> List<RejectedCase> / {abort.raise} =
     },
   ]
 
-test "metrics are rejected: {c.name}" for c: RejectedCase in rejected_metrics() {
+test "`decode_metrics` rejects the invalid request {c.name} with the expected reason and field" for c: RejectedCase in rejected_metrics(
+  ) {
   match decode_metrics(c.encoding, c.body, default_limits()) {
     Ok(_) -> panic("accepted"),
     Err(refusal) -> {
@@ -3352,7 +3291,6 @@ test "a field a reader does not know is skipped, in either encoding" {
   let wire = encode_traces(Protobuf, sample_traces());
   let extended = wire.concat(protobuf::string_field(900, "from a later version"));
   assert_eq(decode_traces(Protobuf, extended, default_limits()), Ok(sample_traces()));
-  // A 64-bit number may be written as a JSON number, and an id in upper case.
   let loose = span_json_with(
     "\"traceId\":\"5B8EFFF798038103D269B633813FC60C\",\"spanId\":\"EEE19B7EC3C1B174\",\"startTimeUnixNano\":12,\"parentSpanId\":\"\"",
   );
@@ -3387,7 +3325,7 @@ test "a request past its limits is rejected" {
   }
 }
 
-test "an empty receipt is the empty message, and a partial one reports what was rejected" {
+test "an export response with nothing rejected encodes as empty, and one with rejected items encodes the count and message" {
   let none: ExportResponse = { rejected: 0, message: "" };
   assert_eq(encode_response(Protobuf, TraceSignal, none), b"");
   assert_eq(encode_response(Json, TraceSignal, none), b"{}");
@@ -3402,34 +3340,19 @@ test "an empty receipt is the empty message, and a partial one reports what was 
   )
 }
 
-// --- Tests: the exporter ---------------------------------------------------------
+type Reply = | Down | Take | Partial(Int) | Busy(Int, Option<Int>) | Bad
 
-/// What a test's collector does with a request.
-type Reply =
-  /// Refuses the connection.
-  | Down
-  | Take
-  /// Accepts it and reports that it rejected this many.
-  | Partial(Int)
-  /// Replies with this status, and this many seconds of `Retry-After`.
-  | Busy(Int, Option<Int>)
-  | Bad
-
-/// What the collector saw.
 type Collector = {
   traces: List<Traces>,
   metrics: List<Metrics>,
-  /// When each request arrived, in milliseconds on the virtual clock.
   arrivals: List<Int>,
   types: List<String>,
   gzipped: Int,
 }
 
-/// One connection: what its client wrote, and what is left of the reply.
-type Conn = { written: Bytes, result: Bytes, served: Bool }
+type CollectorConnection = { written: Bytes, result: Bytes, served: Bool }
 
 effect collector {
-  /// Whether the next connection is refused, which takes a `Down` off the script.
   write rejects() -> Bool
   write next(content_type: String, gzipped: Bool) -> Reply
   write took_traces(t: Traces) -> Unit
@@ -3476,7 +3399,6 @@ fn accept_export<| r>(
     }
   } else { http::text_response(404, "no such signal") }
 
-/// An OTLP receiver over `std.http`: both paths, both encodings, gzipped or not.
 fn receive<| r>(
   request: http::Request,
 ) -> http::Response<| r> / {collector.next, collector.took_traces, collector.took_metrics, http::Reading} = {
@@ -3492,11 +3414,14 @@ fn receive<| r>(
       Take | Down -> accept_export(e, request.path, body, 0),
       Partial(n) -> accept_export(e, request.path, body, n),
       Busy(status, after) -> {
-        let res = http::text_response(status, "later");
+        let response = http::text_response(status, "later");
         match after {
           Some(seconds) ->
-            { ..res, headers: http::set_header(res.headers, "retry-after", seconds.to_string()) },
-          None -> res,
+            {
+              ..response,
+              headers: http::set_header(response.headers, "retry-after", seconds.to_string()),
+            },
+          None -> response,
         }
       },
       Bad -> http::text_response(400, "no"),
@@ -3507,16 +3432,14 @@ fn receive<| r>(
   }
 }
 
-/// What `receive` under `std.http`'s serve loop writes back for the bytes one connection's client
-/// wrote.
 fn serve_bytes(
   written: Bytes,
 ) -> Bytes / {collector.next, collector.took_traces, collector.took_metrics, abort.raise} = {
   let client = ip::socket_at(ip::loopback_v4(), 49152);
   let ran = net::on_mem(net::mem_calling(net::mem_empty(), client, [Sends(written)]), || {
-    let conn = net.accept[listener](net.listen[listener](0));
-    http::serve_connection[inner](conn, http::default_limits(), receive);
-    conn
+    let connection = net.accept[listener](net.listen[listener](0));
+    http::serve_connection[inner](connection, http::default_limits(), receive);
+    connection
   });
   net::mem_sent(ran.net, ran.value)
 }
@@ -3525,9 +3448,6 @@ type CollectorRun<a> = { value: a, seen: Collector }
 
 fn collector_host() -> String = "collector.test"
 
-/// `body` with the label `collector` bound to a collector at `collector.test:4318` that runs in
-/// place: a connection's request is served by `receive` when its client first reads, and a
-/// connection anywhere else is refused.
 fn collected<a | e>(
   script: List<Reply>,
   body: () -> a / {net.connect[collector], net.connect_tls[collector], net.send[collector], net.recv[collector], net.close[collector] | e},
@@ -3536,40 +3456,44 @@ fn collected<a | e>(
     handle {
       body()
     } with {
-      var conns: Map<Int, Conn> = Map::new(),
+      var conns: Map<Int, CollectorConnection> = Map::new(),
       var next = 1,
       net.connect[collector](host, port, t) -> if collector.rejects() || host != collector_host()
           || port != 4318 { None } else {
-        let conn: Conn = { written: b"", result: b"", served: false };
-        conns = conns.insert(next, conn);
+        let connection: CollectorConnection = { written: b"", result: b"", served: false };
+        conns = conns.insert(next, connection);
         next = next + 1;
         Some(next - 1)
       },
       net.connect_tls[collector](host, port, t) -> None,
-      net.send[collector](conn, payload, t) -> match conns.get(conn) {
+      net.send[collector](connection_id, payload, t) -> match conns.get(connection_id) {
         Some(c) -> {
-          conns = conns.insert(conn, { ..c, written: c.written.concat(payload) });
+          conns = conns.insert(connection_id, { ..c, written: c.written.concat(payload) });
           Some(payload.len())
         },
         None -> None,
       },
-      net.recv[collector](conn, most, t) -> match conns.get(conn) {
+      net.recv[collector](connection_id, most, t) -> match conns.get(connection_id) {
         None -> Some(b""),
         Some(c) -> {
           let ready = if c.served { c } else {
-            let out: Conn = { written: c.written, result: serve_bytes(c.written), served: true };
+            let out: CollectorConnection = {
+              written: c.written,
+              result: serve_bytes(c.written),
+              served: true,
+            };
             out
           };
           let n = min(most, ready.result.len());
-          conns = conns.insert(conn, {
+          conns = conns.insert(connection_id, {
             ..ready,
             result: ready.result.slice(n, ready.result.len()),
           });
           Some(ready.result.slice(0, n))
         },
       },
-      net.close[collector](conn) -> {
-        conns = conns.remove(conn);
+      net.close[collector](connection_id) -> {
+        conns = conns.remove(connection_id);
       },
     }
   } with {
@@ -3607,10 +3531,8 @@ fn collected<a | e>(
   }
 }
 
-/// The wall clock when a test starts: 2023-11-14T22:13:20Z.
 fn epoch_ms() -> Int = 1700000000000
 
-/// Runs `body` with the host's clocks handled by the simulation's, so a wait takes no real time.
 fn on_clock<a | e>(
   body: () -> a / {time.now_ms, time.elapsed_ms, time.elapsed_us, time.sleep_ms | e},
 ) -> a / {clock.now, clock.sleep | e} =
@@ -3628,8 +3550,6 @@ fn test_config() -> Config = {
   { ..base, backoff_ms: 100, max_backoff_ms: 1000 }
 }
 
-/// A span opened through `std.telemetry`, a bare one inside it, an annotation, and one of each
-/// metric.
 fn emit_sample_telemetry() -> Unit / {trace.enter[shop], trace.exit[shop], trace.count[shop], trace.gauge[shop], trace.time[shop], Tracing, entropy.next, time.sleep_ms, abort.raise} =
   telemetry::in_span[shop](
     "checkout",
@@ -3647,7 +3567,6 @@ fn emit_sample_telemetry() -> Unit / {trace.enter[shop], trace.exit[shop], trace
     },
   )
 
-/// `exporting` to the label `collector`: its effects name no other.
 fn shipping(
   config: Config,
 ) -> Stats / {net.connect[collector], net.connect_tls[collector], net.send[collector], net.recv[collector], net.close[collector], Exporting, abort.raise} =
@@ -3658,7 +3577,6 @@ fn shipping(
 
 fn nanos_at(ms: Int) -> U64 / {abort.raise} = U64::of_int((epoch_ms() + ms) * 1000000)
 
-/// What `emit_sample_telemetry` traces, with the ids that a stream seeded with `seed` generates.
 fn expected_traces(config: Config, seed: Int) -> Traces / {abort.raise} = {
   let trace_drawn = traceparent::rand_trace_id(rand(seed));
   let root = traceparent::rand_span_id(trace_drawn.rand);
@@ -3797,7 +3715,8 @@ fn shipments() -> List<Shipment> =
     { name: "gzipped JSON", encoding: Json, gzip: true },
   ]
 
-test "a collector decodes what was traced, sent as {c.name}" for c: Shipment in shipments() {
+test "a collector receives and decodes the exported traces and metrics when they are sent as {c.name}" for c: Shipment in shipments(
+  ) {
   let base: Config = test_config();
   let config: Config = { ..base, encoding: c.encoding, gzip: c.gzip };
   let ran = with_rand(rand(41), ||
@@ -3817,8 +3736,8 @@ fn step<[c]>(name: String) -> Unit / {trace.enter[c], trace.exit[c]} = {
 }
 
 fn span_names(t: Traces) -> List<String> =
-  t.resource_spans.fold([], |acc: List<String>, r: ResourceSpans|
-    r.scope_spans.fold(acc, |inner: List<String>, s: ScopeSpans|
+  t.resource_spans.fold([], |accumulator: List<String>, r: ResourceSpans|
+    r.scope_spans.fold(accumulator, |inner: List<String>, s: ScopeSpans|
       s.spans.fold(inner, |names: List<String>, x: Span| names.push(x.name))))
 
 test "a request the collector cannot accept yet is sent again after Retry-After and the backoff" {
@@ -3839,8 +3758,6 @@ test "a request the collector cannot accept yet is sent again after Retry-After 
   match ran.seen.arrivals {
     [first, second, third] -> {
       assert_eq(first, 0);
-      // `Retry-After: 2` is longer than the first backoff, and the second backoff is 200 ms,
-      // waited somewhere in its upper half.
       assert_eq(second, 2000);
       assert(third >= 2100 && third < 2200)
     },
@@ -3848,7 +3765,7 @@ test "a request the collector cannot accept yet is sent again after Retry-After 
   }
 }
 
-test "a failed request waits for an event after its backoff, and the events before it queue" {
+test "after a request fails, spans only queue until one ends after the retry delay, and that span's end resends the failed request" {
   let base: Config = test_config();
   let config: Config = { ..base, batch: 1 };
   let ran = with_rand(rand(8), ||
@@ -3865,11 +3782,9 @@ test "a failed request waits for an event after its backoff, and the events befo
             { waiting: waiting, resent: resent, done: flush() }
           })))
     }).value;
-  // `a` failed and waits; `b` queued behind it without a request of its own.
   assert_eq(ran.value.waiting.retries, 1);
   assert_eq(ran.value.waiting.queued, 2);
   assert_eq(ran.value.waiting.exported, 0);
-  // `c` came after the backoff, so its event sent `a` again.
   assert_eq(ran.value.resent.exported, 1);
   assert_eq(ran.value.resent.queued, 2);
   assert_eq(ran.seen.traces.map(span_names), [["a"], ["b"], ["c"]]);
@@ -3932,7 +3847,7 @@ test "a request is abandoned when the collector rejects it or it fails every att
   assert_eq(tired.seen.traces, [])
 }
 
-test "spans are sent when enough wait or the oldest has waited long enough, and metrics on their interval" {
+test "spans are sent when the batch size is reached or the oldest span exceeds the maximum age, and metrics at their interval" {
   let base: Config = test_config();
   let config: Config = { ..base, batch: 3, max_age_ms: 5000, metrics_every_ms: 60000 };
   let ran = with_rand(rand(11), ||
@@ -3984,7 +3899,7 @@ fn remote(sampled: Bool) -> http::Request / {abort.raise} = {
   }
 }
 
-test "a trace that is not recorded is not sent, and a span takes the decision of its caller" {
+test "with the sampler set to always off, no spans are exported, except spans inside a request whose incoming trace is marked as sampled" {
   let base: Config = test_config();
   let config: Config = { ..base, sampler: telemetry::AlwaysOff };
   let ran = with_rand(rand(12), ||
@@ -4050,15 +3965,15 @@ test "a ratio sampler records the traces whose ids it selects, and no others" {
     }).value;
   assert_eq(ran.value.exported + ran.value.unsampled, 24);
   assert(ran.value.exported > 4 && ran.value.unsampled > 4);
-  let kept = ran.seen.traces.fold(true, |all_kept: Bool, t: Traces|
+  let all_sampled = ran.seen.traces.fold(true, |all_kept: Bool, t: Traces|
     t.resource_spans.fold(all_kept, |a: Bool, r: ResourceSpans|
       r.scope_spans.fold(a, |b: Bool, s: ScopeSpans|
         s.spans.fold(b, |c: Bool, x: Span|
           c && telemetry::should_sample(telemetry::Ratio(1, 2), x.trace_id)))));
-  assert(kept)
+  assert(all_sampled)
 }
 
-test "a partial accept is believed, and a metric tracks no more series than its bound" {
+test "a partially accepted export counts as exported, and a metric tracks at most `max_series` series" {
   let base: Config = test_config();
   let config: Config = { ..base, max_series: 2 };
   let ran = with_rand(rand(14), ||
@@ -4085,7 +4000,7 @@ test "a partial accept is believed, and a metric tracks no more series than its 
   }
 }
 
-test "closing a span closes the spans left open under it, and an exit of a span not open is counted" {
+test "closing a span ends its still-open child spans as abandoned, and exiting a span that is not open increments `unmatched_exits`" {
   let config: Config = test_config();
   let ran = with_rand(rand(15), ||
     simulate {
@@ -4133,7 +4048,7 @@ test "a flush waits no longer than it is given, and what it could not send stays
   assert_eq(ran.seen.arrivals, [0, 60000])
 }
 
-test "a retry's wait doubles to its bound, lies in its upper half, and is never under Retry-After" {
+test "`retry_wait` doubles with each attempt up to a maximum, picks a random wait in the upper half of that range, and is never below Retry-After" {
   let config: Config = test_config();
   assert_eq(retry_wait(config, 1, None, 0), 50);
   assert_eq(retry_wait(config, 1, None, 999), 99);

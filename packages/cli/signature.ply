@@ -41,15 +41,23 @@ fn without_effects(scheme: Scheme) -> SplitSignature / {abort.raise} =
 fn split_signature(
   scheme: Scheme,
   params: List<Type>,
-  ret: Type,
+  return_type: Type,
   effects: Effects,
 ) -> SplitSignature / {abort.raise} = {
   let reserved: Printer = reserve_effects(printer_new(), effects.listed);
   let head = print_scheme(reserved, {
     ..scheme,
     ty: match scheme.ty {
-      FunctionType(f) -> FunctionType({ ..f, params: params, ret: ret, effects: no_effects() }),
-      _ -> FunctionType({ kept: [], once: false, params: params, ret: ret, effects: no_effects() }),
+      FunctionType(f) ->
+        FunctionType({ ..f, params: params, return_type: return_type, effects: no_effects() }),
+      _ ->
+        FunctionType({
+          keep_parameters: [],
+          once: false,
+          params: params,
+          return_type: return_type,
+          effects: no_effects(),
+        }),
     },
   });
   let listed = print_effect_list(head.printer, effects.listed);
@@ -71,7 +79,7 @@ fn split_signature(
 pub fn split(scheme: Scheme) -> SplitSignature / {abort.raise} =
   match scheme.ty {
     FunctionType(f) -> if is_pure(f.effects) { without_effects(scheme) }
-    else { split_signature(scheme, f.params, f.ret, f.effects) },
+    else { split_signature(scheme, f.params, f.return_type, f.effects) },
     _ -> without_effects(scheme),
   }
 
@@ -88,15 +96,15 @@ pub fn fill(
     let start = rest.len();
     let opened = first.len();
     let empty: Filling = { lines: [], line: first, column: opened };
-    let out = range(0, items.len()).fold(empty, |acc: Filling, i: Int| {
+    let out = range(0, items.len()).fold(empty, |accumulator: Filling, i: Int| {
       let item = match items.at(i) { Some(x) -> x, None -> "" };
       let last = i + 1 == items.len();
       let piece = if last { item ++ suffix } else { item ++ ", " };
       let printed = if last { piece.len() } else { piece.len() - 1 };
-      let fresh = if acc.lines.len() == 0 { opened } else { start };
-      let placed: Filling = if acc.column > fresh && acc.column + printed > width {
-        { lines: acc.lines.push(trim_end(acc.line)), line: rest, column: start }
-      } else { acc };
+      let fresh = if accumulator.lines.len() == 0 { opened } else { start };
+      let placed: Filling = if accumulator.column > fresh && accumulator.column + printed > width {
+        { lines: accumulator.lines.push(trim_end(accumulator.line)), line: rest, column: start }
+      } else { accumulator };
       { lines: placed.lines, line: placed.line ++ piece, column: placed.column + piece.len() }
     });
     out.lines.push(trim_end(out.line))
@@ -131,11 +139,11 @@ pub fn counted_lines(
   definition_info: DefinitionInfo,
   call_at: Option<String>,
 ) -> List<String> / {abort.raise} = {
-  let sp: SplitSignature = split(definition_info.scheme);
-  let marked = match ((sp.effects, definition_info.scheme.ty)) {
+  let signature: SplitSignature = split(definition_info.scheme);
+  let marked = match ((signature.effects, definition_info.scheme.ty)) {
     (Some(r), FunctionType(f)) ->
       {
-        ..sp,
+        ..signature,
         effects: Some({
           listed: range(0, r.listed.len()).map(|i: Int|
             r.listed.at_or(i, "") ++ " "
@@ -149,7 +157,7 @@ pub fn counted_lines(
           },
         }),
       },
-    _ -> sp,
+    _ -> signature,
   };
   let lines = split_lines(indent, label_width, label, marked);
   match definition_info.ending {
@@ -165,8 +173,9 @@ pub fn counted_lines(
 fn nonreturn_reason(through: Option<Bytes>, looped: Bool, call_at: Option<String>) -> String = {
   let at_ = match call_at { Some(p) -> " at " ++ p, None -> "" };
   match through {
-    None -> if looped { "its recursion" ++ at_ ++ " is not seen to descend" }
-    else { "its recursion" ++ at_ ++ " is past what the check follows" },
+    None -> if looped {
+      "its recursion" ++ at_ ++ " does not clearly shrink its argument, so it may never end"
+    } else { "its recursion" ++ at_ ++ " is too complex for the check to prove that it ends" },
     Some(name) ->
       "calls `" ++ String::of_bytes_lossy(name) ++ "`" ++ at_ ++ ", which may not return",
   }
@@ -178,11 +187,11 @@ fn split_lines(
   indent: Int,
   label_width: Int,
   label: String,
-  sp: SplitSignature,
+  signature: SplitSignature,
 ) -> List<String> / {abort.raise} = {
   let first = label.pad_right(label_width, " ") ++ " : ";
-  let heads = head_lines(width() - indent, first, sp.head);
-  match sp.effects {
+  let heads = head_lines(width() - indent, first, signature.head);
+  match signature.effects {
     None -> heads,
     Some(r) ->
       heads.concat(effects_lines(indent, " ".repeat(label_column(label_width, label) + 3), r)),
@@ -215,24 +224,27 @@ fn head_parts(
   let text = |from: Int, to: Int| String::of_bytes_lossy(b.slice(from, to));
   let walked = range(0, b.len()).fold(
     { depth: 0, open: 0 - 1, start: 0, close: 0 - 1, params: [] },
-    |acc: { depth: Int, open: Int, start: Int, close: Int, params: List<String> }, i: Int| {
+    |accumulator: { depth: Int, open: Int, start: Int, close: Int, params: List<String> }, i: Int| {
       let c = b.at(i);
       let arrow = c == 62 && i > 0 && b.at(i - 1) == 45;
-      if acc.close >= 0 || arrow { acc } else if c == 40 || c == 60 || c == 91 || c == 123 {
-        if c == 40 && acc.depth == 0 && acc.open < 0 { { ..acc, depth: 1, open: i, start: i + 1 } }
-        else { { ..acc, depth: acc.depth + 1 } }
+      if accumulator.close >= 0 || arrow { accumulator }
+      else if c == 40 || c == 60 || c == 91 || c == 123 {
+        if c == 40 && accumulator.depth == 0 && accumulator.open < 0 {
+          { ..accumulator, depth: 1, open: i, start: i + 1 }
+        } else { { ..accumulator, depth: accumulator.depth + 1 } }
       } else if c == 41 || c == 62 || c == 93 || c == 125 {
-        if acc.depth == 1 && acc.open >= 0 {
+        if accumulator.depth == 1 && accumulator.open >= 0 {
           {
-            ..acc,
+            ..accumulator,
             depth: 0,
             close: i,
-            params: if i > acc.start { acc.params.push(text(acc.start, i)) } else { acc.params },
+            params: if i > accumulator.start { accumulator.params.push(text(accumulator.start, i)) }
+            else { accumulator.params },
           }
-        } else { { ..acc, depth: acc.depth - 1 } }
-      } else if c == 44 && acc.depth == 1 && acc.open >= 0 {
-        { ..acc, start: i + 2, params: acc.params.push(text(acc.start, i)) }
-      } else { acc }
+        } else { { ..accumulator, depth: accumulator.depth - 1 } }
+      } else if c == 44 && accumulator.depth == 1 && accumulator.open >= 0 {
+        { ..accumulator, start: i + 2, params: accumulator.params.push(text(accumulator.start, i)) }
+      } else { accumulator }
     },
   );
   if walked.open < 0 || walked.close < 0 { None } else {
@@ -249,25 +261,27 @@ fn label_column(label_width: Int, label: String) -> Int =
   if label_width > label.len() { label_width } else { label.len() }
 
 fn includes_of(sets: List<EffectSetRow>, name: Bytes) -> List<Bytes> =
-  sets.fold([], |acc: List<Bytes>, s: EffectSetRow| if s.name == name { s.includes } else { acc })
+  sets.fold([], |accumulator: List<Bytes>, s: EffectSetRow|
+    if s.name == name { s.includes } else { accumulator })
 
 fn with_name(names: List<Bytes>, name: Bytes) -> List<Bytes> =
-  if names.fold(false, |acc: Bool, n: Bytes| acc || n == name) { names } else { names.push(name) }
+  if names.fold(false, |accumulator: Bool, n: Bytes| accumulator || n == name) { names }
+  else { names.push(name) }
 
 fn one_round(sets: List<EffectSetRow>, seen: List<Bytes>) -> List<Bytes> =
-  seen.fold(seen, |acc: List<Bytes>, n: Bytes|
-    includes_of(sets, n).fold(acc, |a: List<Bytes>, x: Bytes| with_name(a, x)))
+  seen.fold(seen, |accumulator: List<Bytes>, n: Bytes|
+    includes_of(sets, n).fold(accumulator, |a: List<Bytes>, x: Bytes| with_name(a, x)))
 
 fn expanded_names(sets: List<EffectSetRow>, aliases: List<Bytes>) -> List<Bytes> =
-  range(0, sets.len() + 1).fold(aliases.fold([], with_name), |acc: List<Bytes>, i: Int|
-    one_round(sets, acc))
+  range(0, sets.len() + 1).fold(aliases.fold([], with_name), |accumulator: List<Bytes>, i: Int|
+    one_round(sets, accumulator))
 
 fn bumped(uses: Map<Bytes, Int>, name: Bytes) -> Map<Bytes, Int> =
   match uses.get(name) { Some(k) -> uses.insert(name, k + 1), None -> uses.insert(name, 1) }
 
 fn counted(sets: List<EffectSetRow>, definitions: List<DefinitionInfo>) -> Map<Bytes, Int> =
-  definitions.fold(Map::new(), |acc: Map<Bytes, Int>, definition_info: DefinitionInfo|
-    expanded_names(sets, definition_info.effect_aliases).fold(acc, bumped))
+  definitions.fold(Map::new(), |accumulator: Map<Bytes, Int>, definition_info: DefinitionInfo|
+    expanded_names(sets, definition_info.effect_aliases).fold(accumulator, bumped))
 
 pub fn effect_sets(
   sets: List<EffectSetRow>,
@@ -288,7 +302,7 @@ pub fn set_lines(v: SetLine, indent: Int) -> List<String> / {abort.raise} =
   )
 
 fn performs(performed: List<Effect>, declared: Effect) -> Bool =
-  performed.fold(false, |acc: Bool, p: Effect| acc || effect_covers(declared, p))
+  performed.fold(false, |accumulator: Bool, p: Effect| accumulator || effect_covers(declared, p))
 
 pub fn provenance(definition_info: DefinitionInfo) -> Provenance / {abort.raise} = {
   let undone = definition_info.effects.filter(|a: Effect| !performs(definition_info.performed, a));
@@ -354,17 +368,17 @@ pub fn effect_texts(effects: List<Effect>) -> List<String> / {abort.raise} =
 
 pub fn braced(effects: List<String>) -> String = "{" ++ String::join(effects, ", ") ++ "}"
 
-fn fn_scheme(effects: Effects, row_variables: List<Int>) -> Scheme =
+fn function_scheme(effects: Effects, row_variables: List<Int>) -> Scheme =
   {
     type_variables: [],
     effect_variables: row_variables,
     keep_variables: [],
     label_variables: [],
     ty: FunctionType({
-      kept: [],
+      keep_parameters: [],
       once: false,
       params: [named_type(b"Request")],
-      ret: named_type(b"Response"),
+      return_type: named_type(b"Response"),
       effects: effects,
     }),
   }
@@ -373,12 +387,12 @@ fn an_effect(eff: Bytes, mode: Mode, resource: Option<Bytes>) -> Effect =
   {
     effect: eff,
     mode: mode,
-    op: None,
+    operation: None,
     resource: match resource { Some(r) -> NamedResource(r), None -> SingletonResource },
   }
 
 test "a pure definition prints no effects at all" {
-  assert_eq(definition_lines(5, 12, "endpoint_of", fn_scheme(no_effects(), [])), [
+  assert_eq(definition_lines(5, 12, "endpoint_of", function_scheme(no_effects(), [])), [
     "endpoint_of  : (Request) -> Response",
   ])
 }
@@ -392,76 +406,85 @@ test "a long list of effects wraps inside the brace and aligns" {
     an_effect(b"http", WriteMode, Some(b"outbound")),
     an_effect(b"log", WriteMode, None),
   ]);
-  assert_eq(definition_lines(5, 12, "create_order", fn_scheme(effects, [])), [
+  assert_eq(definition_lines(5, 12, "create_order", function_scheme(effects, [])), [
     "create_order : (Request) -> Response",
     "               / {db.read[inventory], db.read[orders], db.write[orders],",
     "                  db.read[users], http.write[outbound], log.write}",
   ])
 }
 
-test "a long head wraps between its parameters and aligns" {
+test "a signature with many parameters wraps between parameters and aligns the continuation line" {
   let node = NamedType({ name: b"std.prelude.ListNode", args: [VariableType(1)] });
-  let sc: Scheme = {
+  let scheme: Scheme = {
     type_variables: [1],
     effect_variables: [],
     keep_variables: [],
     label_variables: [],
     ty: FunctionType({
-      kept: [],
+      keep_parameters: [],
       once: false,
       params: [node, named_type(b"Int"), named_type(b"Int"), node],
-      ret: node,
+      return_type: node,
       effects: no_effects(),
     }),
   };
-  assert_eq(definition_lines(5, 13, "trie_inserted", sc), [
+  assert_eq(definition_lines(5, 13, "trie_inserted", scheme), [
     "trie_inserted : <a>(std.prelude.ListNode<a>, Int, Int,",
     "                    std.prelude.ListNode<a>) -> std.prelude.ListNode<a>",
   ]);
   assert_eq(
     definition_lines(5, 4, "path", {
-      ..sc,
-      ty: FunctionType({ kept: [], once: false, params: [], ret: node, effects: no_effects() }),
+      ..scheme,
+      ty: FunctionType({
+        keep_parameters: [],
+        once: false,
+        params: [],
+        return_type: node,
+        effects: no_effects(),
+      }),
     }),
     ["path : <a>() -> std.prelude.ListNode<a>"],
   );
-  assert_eq(definition_lines(5, 20, "gathered", sc), [
+  assert_eq(definition_lines(5, 20, "gathered", scheme), [
     "gathered             : <a>(std.prelude.ListNode<a>, Int, Int,",
     "                           std.prelude.ListNode<a>)",
     "                           -> std.prelude.ListNode<a>",
   ])
 }
 
-test "an effect variable survives the split with one name" {
+test "a signature printed on two lines shows its effect variable under the same name in both parts" {
   let effects: Effects = {
     listed: [an_effect(b"net", WriteMode, Some(b"conn"))],
     variable: Some(3),
   };
-  assert_eq(definition_lines(5, 4, "serve", fn_scheme(effects, [3])), [
+  assert_eq(definition_lines(5, 4, "serve", function_scheme(effects, [3])), [
     "serve : <| e>(Request) -> Response",
     "        / {net.write[conn] | e}",
   ]);
-  assert_eq(definition_lines(5, 3, "run", fn_scheme({ listed: [], variable: Some(0) }, [0])), [
-    "run : <| e>(Request) -> Response",
-    "      / e",
-  ])
+  assert_eq(
+    definition_lines(5, 3, "run", function_scheme({ listed: [], variable: Some(0) }, [0])),
+    ["run : <| e>(Request) -> Response", "      / e"],
+  )
 }
 
-test "a type variable keeps its letter across the split" {
-  let sc: Scheme = {
+test "a type variable is printed with the same letter in the type parameters and in the parameter and result types" {
+  let scheme: Scheme = {
     type_variables: [1],
     effect_variables: [2],
     keep_variables: [],
     label_variables: [],
     ty: FunctionType({
-      kept: [],
+      keep_parameters: [],
       once: false,
       params: [VariableType(1)],
-      ret: VariableType(1),
+      return_type: VariableType(1),
       effects: { listed: [an_effect(b"log", WriteMode, None)], variable: Some(2) },
     }),
   };
-  assert_eq(definition_lines(5, 2, "id", sc), ["id : <a | e>(a) -> a", "     / {log.write | e}"])
+  assert_eq(definition_lines(5, 2, "id", scheme), [
+    "id : <a | e>(a) -> a",
+    "     / {log.write | e}",
+  ])
 }
 
 fn counted_definition(
@@ -471,12 +494,12 @@ fn counted_definition(
 ) -> DefinitionInfo =
   {
     ..definition_of([], effects.listed, effects.listed),
-    scheme: fn_scheme(effects, match effects.variable { Some(v) -> [v], None -> [] }),
+    scheme: function_scheme(effects, match effects.variable { Some(v) -> [v], None -> [] }),
     scaling: scaling,
     repeats: repeats,
   }
 
-test "each effect and the effect variable print with how many times a call performs them" {
+test "a signature marks each effect and the effect variable `scaling` if a call performs it a growing number of times, else `bounded`" {
   let query = an_effect(b"db", ReadMode, Some(b"orders"));
   let log = an_effect(b"log", WriteMode, None);
   let effects: Effects = { listed: [query, log], variable: Some(3) };
@@ -506,7 +529,7 @@ test "an effect variable too wide to sit beside the last effect takes a line of 
 
 fn a_site(caller: Bytes) -> Site = { caller: caller, span: span_between(4, 9) }
 
-test "a definition that may not return says by which call, and where" {
+test "a definition that may not return prints the call that may not return and the location of that call" {
   let pure: Effects = { listed: [], variable: None };
   let looping = {
     ..counted_definition(pure, [], []),
@@ -518,7 +541,7 @@ test "a definition that may not return says by which call, and where" {
   };
   assert_eq(counted_lines(5, 4, "spin", looping, Some("m.ply:3:5")), [
     "spin : (Request) -> Response",
-    "       diverges: its recursion at m.ply:3:5 is not seen to descend",
+    "       diverges: its recursion at m.ply:3:5 does not clearly shrink its argument, so it may never end",
   ]);
   assert_eq(counted_lines(5, 4, "wait", calling, Some("m.ply:7:3")), [
     "wait : (Request) -> Response",
@@ -534,17 +557,17 @@ test "a definition that may not return says by which call, and where" {
   };
   assert_eq(counted_lines(5, 4, "wide", unread, Some("m.ply:3:5")), [
     "wide : (Request) -> Response",
-    "       diverges: its recursion at m.ply:3:5 is past what the check follows",
+    "       diverges: its recursion at m.ply:3:5 is too complex for the check to prove that it ends",
   ])
 }
 
-test "filling never splits an item, even when one item is too wide" {
-  let wide = range(0, 90).fold("", |acc: String, i: Int| acc ++ "a");
+test "`fill` never breaks a list entry across lines, even when a single entry is wider than the line" {
+  let wide = range(0, 90).fold("", |accumulator: String, i: Int| accumulator ++ "a");
   assert_eq(fill("[", " ", [wide, "b"], "]", 20), ["[" ++ wide ++ ",", " b]"]);
   assert_eq(fill("= {", "   ", [], "}", 40), ["= {}"])
 }
 
-test "the set block names the set and spells out its expansion" {
+test "an effect set prints its name, the effects it contains and how many definitions use it" {
   let view: SetLine = {
     name: "Web",
     used_by: 4,
@@ -579,7 +602,7 @@ fn definition_of(
     name: b"m.create_order",
     module: b"m",
     simple_name: b"create_order",
-    scheme: fn_scheme(no_effects(), []),
+    scheme: function_scheme(no_effects(), []),
     effects: declared,
     performed: performed,
     scaling: [],
@@ -595,7 +618,7 @@ fn definition_of(
     at: { module: 0, span: dummy_span() },
   }
 
-test "provenance names the alias and the difference the alias hides" {
+test "a definition declared with an effect set prints the set name, the effects it performs and the declared effects it does not perform" {
   let p = provenance(
     definition_of(
       [b"Web"],
@@ -614,7 +637,7 @@ test "provenance names the alias and the difference the alias hides" {
   ])
 }
 
-test "an alias the body uses completely reports only how it was written" {
+test "a definition that performs exactly the effects of its declared set prints only the set name" {
   let exact = [an_effect(b"log", WriteMode, None)];
   let p = provenance(definition_of([b"Web"], exact, exact));
   assert_eq(provenance_lines(p, 5), ["  written as     / {Web}"]);
@@ -638,7 +661,7 @@ test "declared effects wider than the body's are reported without any alias" {
   ])
 }
 
-test "a set is used by every definition that reaches it, through another set or not" {
+test "`effect_sets` counts each effect set's users, including definitions that use it only through another effect set" {
   let reads: EffectSetRow = {
     name: b"Reads",
     includes: [],

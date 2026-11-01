@@ -1,17 +1,18 @@
 //! Facts about the machine and the process a program runs in, as an effect.
 //!
-//! Every result comes from the host, not from the program, so the effect is `nondet`. Results
-//! differ from one machine to the next, and `pid`, `hostname` and `cpus` from one run to the next.
-//! A test fixes them with `with_machine` and a `FakeMachine`, and so can run the code for a system it is not
-//! running on. None of the operations reads the environment, which is `std.env`'s job. `user`
-//! looks up the name of the process's user id in the system's own records, and `hostname` queries
-//! the kernel, not a DNS resolver.
+//! Every result comes from the host, not from the program, so the effect is `nondet`. Results can
+//! differ from one machine to another. `pid`, `hostname` and `cpus` can also differ from one run to
+//! the next. A test replaces the host with `with_machine` and a `FakeMachine`, so it can run code
+//! that depends on a system other than the one the test runs on. None of the operations reads the
+//! environment; that is the job of `std.env`. `user` looks up the name for the process's user id in
+//! the system's own records, and `hostname` asks the kernel, not a DNS resolver.
 //!
-//! The results describe the machine a program runs on, never the one that built it. A `const fn`
-//! performs no effects, so no build stores a result, and a built program queries again where it
-//! runs. That is why `endian` and `pointer_bits` are operations. When the program has no handler
-//! for them, the machine handles them: `host_handler` is the effect's host handler. Every entry
-//! point whose effects includes `os` runs under it, without needing a grant.
+//! The results describe the machine the program runs on, never the one that built it. A `const fn`
+//! performs no effects, so a build cannot store a result from the build machine. A built program
+//! queries the facts again when it runs. For this reason `endian` and `pointer_bits` are operations
+//! rather than constants. When the program installs no handler for the `os` effect, the host
+//! handles it: `host_handler` is the effect's host handler. Every entry point whose effects include
+//! `os` runs under `host_handler` without needing any permission.
 
 import std.internal.native (found_text, native, told, found)
 
@@ -19,7 +20,7 @@ import std.internal.native (found_text, native, told, found)
 /// `executable` stay the same for a whole run. `name`, `hostname` and `cpus` are what the system
 /// reports at the time of the call.
 pub nondet effect os {
-  /// The operating system.
+  /// Returns the operating system family the process runs on.
   read family() -> Family
   /// The system's own name for itself and its release, as `uname -sr` prints them:
   /// `Darwin 24.6.0`, `Linux 6.8.0-45-generic`.
@@ -58,8 +59,9 @@ pub type Endian = | Little | Big
 /// when there is no record, as in a container run under an arbitrary id.
 pub type User = { id: Int, name: Option<String> }
 
-/// The name tools give an operating system: `linux`, `macos`, `windows`, `freebsd`, `openbsd`,
-/// `netbsd`.
+/// Returns the lowercase name that build tools and target triples use for an operating system:
+/// `linux`, `macos`, `windows`, `freebsd`, `openbsd` or `netbsd`. For `OtherFamily(name)` it
+/// returns `name`.
 pub fn family_name(f: Family) -> String =
   match f {
     Linux -> "linux",
@@ -71,7 +73,8 @@ pub fn family_name(f: Family) -> String =
     OtherFamily(name) -> name,
   }
 
-/// The name tools give an architecture: `x86_64`, `aarch64`, `x86`, `arm`, `riscv64`.
+/// Returns the name that build tools and target triples use for an architecture: `x86_64`,
+/// `aarch64`, `x86`, `arm` or `riscv64`. For `OtherArch(name)` it returns `name`.
 pub fn arch_name(a: Arch) -> String =
   match a {
     X86_64 -> "x86_64",
@@ -84,8 +87,6 @@ pub fn arch_name(a: Arch) -> String =
 
 /// Whether a system is one of the Unix family: every listed one but Windows.
 pub fn is_unix(f: Family) -> Bool = match f { Windows -> false, OtherFamily(_) -> false, _ -> true }
-
-// --- The fake ---------------------------------------------------------------
 
 /// What a test passes to `with_machine` in place of the host: a result for each operation.
 pub type FakeMachine = {
@@ -134,11 +135,8 @@ pub fn with_machine<a | e>(m: FakeMachine, go: () -> a / {os.read | e}) -> a / e
     os.pointer_bits() -> m.pointer_bits,
   }
 
-// --- The host handler -------------------------------------------------------
-
 host for os by host_handler
 
-/// Runs `go`, handling every operation by querying the machine the program runs on.
 fn host_handler<a | e>(go: () -> a / {os.read | e}) -> a / {native.read, abort.raise | e} =
   handle {
     go()
@@ -155,7 +153,6 @@ fn host_handler<a | e>(go: () -> a / {os.read | e}) -> a / {native.read, abort.r
     os.pointer_bits() -> os_pointer_bits(),
   }
 
-/// The system `name` refers to, in the toolchain's names (`family_name`).
 fn family_of(name: String) -> Family =
   match name {
     "linux" -> Linux,
@@ -167,7 +164,6 @@ fn family_of(name: String) -> Family =
     _ -> OtherFamily(name),
   }
 
-/// The architecture `name` refers to, in the toolchain's names (`arch_name`).
 fn arch_of(name: String) -> Arch =
   match name {
     "x86_64" -> X86_64,
@@ -178,55 +174,36 @@ fn arch_of(name: String) -> Arch =
     _ -> OtherArch(name),
   }
 
-/// The user of id `id`, and the name the system's records give it.
 fn user_of(id: Int) -> User / {native.read} = { id: id, name: found_text(os_user_name(id)) }
 
-// Each native queries the machine the program runs on, not the one that built it.
-
-/// The name the toolchain gives the system this binary was built for: `linux`, `macos`, ...
 extern fn os_system() -> String / {native.read}
 
-/// The name the toolchain gives the architecture this binary was built for: `x86_64`, ...
 extern fn os_machine() -> String / {native.read}
 
-/// The system's name and release, as `uname -sr` prints them, in the form `told` decodes.
 extern fn os_uname() -> Bytes / {native.read}
 
-/// The kernel's name for the machine, in the form `told` decodes. No DNS resolver is queried.
 extern fn os_hostname() -> Bytes / {native.read}
 
-/// The processors the process may run on at once, at least one.
 extern fn os_cpus() -> Int / {native.read}
 
-/// The id of the user the process runs as.
 extern fn os_uid() -> Int / {native.read}
 
-/// The name the system's records give the user of id `id`, in the form `found` decodes.
 extern fn os_user_name(id: Int) -> Bytes / {native.read}
 
-/// The process's id.
 extern fn os_pid() -> Int / {native.read}
 
-/// The absolute path of the executable the process runs, with symbolic links resolved, in the form
-/// `found` decodes.
 extern fn os_executable() -> Bytes / {native.read}
 
-/// Whether the machine's words are big-endian.
 extern fn os_big_endian() -> Bool / {native.read}
 
-/// The width of an address on the machine, in bits.
 extern fn os_pointer_bits() -> Int / {native.read}
 
-// --- Tests ------------------------------------------------------------------
-
-/// A log line's prefix that names where a service runs.
 fn origin() -> String / {os.hostname, os.pid, os.user} =
   match os.user().name {
     Some(name) -> name ++ "@" ++ os.hostname() ++ "[" ++ os.pid().to_string() ++ "]",
     None -> os.user().id.to_string() ++ "@" ++ os.hostname() ++ "[" ++ os.pid().to_string() ++ "]",
   }
 
-/// Where a tool keeps its settings, by the system's convention.
 fn settings_dir(home: String) -> String / {os.family} =
   match os.family() {
     Windows -> home ++ "\\AppData\\Roaming\\tool",
@@ -234,10 +211,9 @@ fn settings_dir(home: String) -> String / {os.family} =
     _ -> home ++ "/.config/tool",
   }
 
-/// One worker for each processor the process may use, keeping one free where there are several.
 fn workers() -> Int / {os.cpus} = max(1, os.cpus() - 1)
 
-test "a test fixes every fact, so code that reads them is deterministic" {
+test "a test fixes every machine property, such as the system, CPU count and host name, so code that reads them is deterministic" {
   let m = machine();
   with_machine(m, || {
     assert_eq(os.family(), Linux);
@@ -255,7 +231,7 @@ test "a test fixes every fact, so code that reads them is deterministic" {
   assert_eq(with_machine({ ..m, user: { id: 70123, name: None } }, origin), "70123@host[4242]")
 }
 
-test "the branch for {family_name(f)} runs on any machine" for f: Family in [
+test "`settings_dir` returns the settings directory for the operating system family {family_name(f)}, on any host" for f: Family in [
     Linux,
     MacOs,
     Windows,
@@ -275,7 +251,7 @@ test "work is sized by the processors the process may use" {
   assert_eq(with_machine({ ..machine(), cpus: 1 }, workers), 1)
 }
 
-test "a family and an architecture have the names tools give them, and an unlisted one its own" {
+test "`family_name` and `arch_name` return lowercase names such as `linux` and `x86_64`, and an unlisted family or architecture returns the text it was created with" {
   assert_eq([Linux, MacOs, Windows, FreeBsd, OpenBsd, NetBsd].map(family_name), [
     "linux",
     "macos",
@@ -298,7 +274,7 @@ test "a family and an architecture have the names tools give them, and an unlist
   assert(!is_unix(OtherFamily("wasi")))
 }
 
-test "the toolchain's name for a system or an architecture reads back as the same value" {
+test "`family_of` and `arch_of` turn the names from `family_name` and `arch_name` back into the original value" {
   [Linux, MacOs, Windows, FreeBsd, OpenBsd, NetBsd, OtherFamily("plan9")].fold(
     (),
     |_: Unit, f: Family| assert_eq(family_of(family_name(f)), f),

@@ -11,14 +11,14 @@
 //!
 //! The caller chooses which checks apply, in an `Options` that has no default. `strict` turns on
 //! every check: the rules a registry or a resolver applies to a name. `web` is the set the URL
-//! Standard applies to a host, which lets a browser reach names that are in use but break a rule.
+//! Standard applies to a host, which accepts names that are in use even though they break a rule.
 //! `to_ascii` rejects a name that fails a check, with every problem found and the label of each.
 //! `to_unicode` returns the name converted as far as possible, together with its problems. It
 //! produces the name to display, and a wrong name is still displayed.
 //!
 //! The rules behind the options come from IDNA2008: the hyphen rules of RFC 5891, the Bidi rule of
-//! RFC 5893 and the two joiner rules of RFC 5892. Its other contextual rules, and its narrower
-//! table of permitted characters, are not applied, since UTS #46 does not apply them.
+//! RFC 5893 and the two joiner rules of RFC 5892. The other contextual rules of IDNA2008, and its
+//! narrower table of permitted characters, are not applied, since UTS #46 does not apply them.
 
 import std.char
 import std.char (sample_text, text_of)
@@ -29,18 +29,7 @@ import std.ucd (SequencePool, Run, Table, ValueRun)
 import std.unicode
 import std.gen
 
-// --- The table --------------------------------------------------------------------
-
-/// The contents of `ucd/idna.txt`, arranged for lookup.
-type IdnaTable = {
-  /// One word per code point. From the low bits up: its status in three bits, its Bidi_Class in
-  /// four, its Joining_Type in three, a virama bit, a bit set when it maps to several code points,
-  /// and the mapping in twenty-two bits. The mapping is the distance to the one code point it maps
-  /// to, or the position of its several code points in `points`.
-  words: Table,
-  /// Every mapping to several code points, or to none, stored together.
-  points: Array<Int>,
-}
+type IdnaTable = { words: Table, points: Array<Int> }
 
 fn disallowed() -> Int = 0
 
@@ -59,10 +48,9 @@ fn status(letter: Bytes) -> Int / {abort.raise} =
     b"d" -> deviation(),
     b"i" -> ignored(),
     b"m" -> mapped(),
-    _ -> panic("a status is v, d, i or m"),
+    _ -> panic("an IDNA status letter is v (valid), d (deviation), i (ignored) or m (mapped)"),
   }
 
-/// The number a word stores for a Bidi_Class the Bidi rule distinguishes. Any other class is zero.
 fn bidi(name: Bytes) -> Int =
   match name {
     b"L" -> 1,
@@ -91,7 +79,6 @@ fn european_number() -> Int = 5
 
 fn nonspacing() -> Int = 11
 
-/// The bits a word stores for the Joining_Type the joiner rules read, and for a virama.
 fn joining_type_bits(letters: Bytes) -> Int / {abort.raise} =
   range(0, letters.len()).fold(0, |bits: Int, i: Int|
     bits
@@ -101,12 +88,14 @@ fn joining_type_bits(letters: Bytes) -> Int / {abort.raise} =
         b'R' -> 3 << 7,
         b'T' -> 4 << 7,
         b'v' -> 1 << 10,
-        _ -> panic("a joining type is D, L, R or T, and v marks a virama"),
+        _ ->
+          panic(
+            "a joining type letter must be D, L, R or T (dual, left, right or transparent joining), or `v` for a virama (a combining mark that removes a vowel)",
+          ),
       }))
 
 fn sequence_mapping_bit() -> Int = 1 << 11
 
-/// The table while it is being built.
 type TableBuilder = { valued: List<ValueRun>, pool: SequencePool }
 
 fn idna_table_of(runs: List<Run>) -> IdnaTable / {abort.raise} = {
@@ -145,8 +134,6 @@ fn bidi_of(word: Int) -> Int = word >> 3 & 15
 fn joining_of(word: Int) -> Int = word >> 7 & 7
 
 fn is_virama(word: Int) -> Bool = word >> 10 & 1 == 1
-
-// --- Options and problems ---------------------------------------------------------
 
 /// Which of UTS #46's checks a name must pass. There is no default: `strict` and `web` are the two
 /// named sets.
@@ -221,16 +208,22 @@ pub type Problem = { label: Int, reason: ErrorKind }
 /// The broken rule as a sentence, for a diagnostic.
 pub fn reason(reason: ErrorKind) -> String =
   match reason {
-    Disallowed -> "a label holds a character no domain name holds",
-    Hyphens -> "a label opens or closes with a hyphen, or has hyphens third and fourth",
-    Punycode -> "a label that opens `xn--` is the Punycode of a text outside ASCII",
-    NotNormalized -> "a label read from Punycode is in Normalization Form C",
-    LeadingMark -> "a label does not open with a combining mark",
-    Joiner -> "a zero-width joiner or non-joiner stands only where its script lets it",
-    Bidi -> "a name with a right-to-left label keeps the Bidi rule in every label",
-    EmptyLabel -> "a label is not empty",
-    LongLabel -> "a label is at most 63 characters of ASCII",
-    LongName -> "a name is at most 253 characters of ASCII",
+    Disallowed -> "a label contains a character that a domain name may not contain",
+    Hyphens ->
+      "a label starts or ends with a hyphen, or has hyphens as its third and fourth characters",
+    Punycode ->
+      "a label that starts with `xn--` must be valid Punycode (an ASCII encoding of Unicode text) that decodes to text with a non-ASCII character",
+    NotNormalized ->
+      "a label decoded from Punycode must be in Unicode Normalization Form C (composed characters)",
+    LeadingMark ->
+      "a label must not start with a combining mark (a character that attaches to the one before it)",
+    Joiner ->
+      "a zero-width joiner or zero-width non-joiner may appear in a label only where the rules for the label's script allow it",
+    Bidi ->
+      "if a name has a right-to-left label, every label in the name must follow the Unicode bidirectional text rule (RFC 5893)",
+    EmptyLabel -> "a label must not be empty",
+    LongLabel -> "a label must be at most 63 characters of ASCII",
+    LongName -> "a name must be at most 253 characters of ASCII",
   }
 
 /// A name as `to_unicode` converts it, and every problem found on the way.
@@ -242,42 +235,31 @@ pub effect idna {
   raise fail(problems: List<Problem>)
 }
 
-// --- Mapping ----------------------------------------------------------------------
-
-/// `out` followed by what the table maps `cp` to: `cp` itself when it is valid, a deviation or
-/// disallowed; nothing when it is ignored; and its mapping when it has one.
-fn mapped_into(table: IdnaTable, out: List<Int>, cp: Int) -> List<Int> =
-  if cp >= 0x61 && cp <= 0x7A { out.push(cp) } else {
-    let word = ucd::lookup(table.words, cp);
+fn mapped_into(table: IdnaTable, out: List<Int>, code_point: Int) -> List<Int> =
+  if code_point >= 0x61 && code_point <= 0x7A { out.push(code_point) } else {
+    let word = ucd::lookup(table.words, code_point);
     let kind = status_of(word);
     if kind == ignored() { out }
-    else if kind != mapped() { out.push(cp) }
-    else if word & sequence_mapping_bit() == 0 { out.push(ucd::apply_distance(cp, word >> 12)) }
-    else { out.concat(ucd::sequence(table.points, word >> 12)) }
+    else if kind != mapped() { out.push(code_point) } else if word & sequence_mapping_bit() == 0 {
+      out.push(ucd::apply_distance(code_point, word >> 12))
+    } else { out.concat(ucd::sequence(table.points, word >> 12)) }
   }
 
 fn points_of(text: String) -> List<Int> = text.chars().map(Int::of_char)
 
-/// The labels split off so far, and the one being collected.
 type LabelSplit = { labels: List<List<Int>>, label: List<Int> }
 
-/// `points` split at each full stop.
 fn labels_of(points: List<Int>) -> List<List<Int>> = {
-  let cut = points.fold({ labels: [], label: [] }, |so_far: LabelSplit, cp: Int|
-    if cp == 0x2E { { labels: so_far.labels.push(so_far.label), label: [] } }
-    else { { labels: so_far.labels, label: so_far.label.push(cp) } });
+  let cut = points.fold({ labels: [], label: [] }, |so_far: LabelSplit, code_point: Int|
+    if code_point == 0x2E { { labels: so_far.labels.push(so_far.label), label: [] } }
+    else { { labels: so_far.labels, label: so_far.label.push(code_point) } });
   cut.labels.push(cut.label)
 }
 
-// --- A label's validity -----------------------------------------------------------
-
 fn is_ace(label: List<Int>) -> Bool = label.take(4) == [0x78, 0x6E, 0x2D, 0x2D]
 
-fn is_ascii(label: List<Int>) -> Bool = label.all(|cp: Int| cp < 128)
+fn is_ascii(label: List<Int>) -> Bool = label.all(|code_point: Int| code_point < 128)
 
-/// Whether a joiner at position `i` of the label's `words` is where RFC 5892 allows it: after a
-/// virama, or, for the non-joiner, between a letter that joins to its left and one that joins to
-/// its right, ignoring transparent marks.
 fn joins(words: Array<Int>, i: Int, non_joiner: Bool) -> Bool =
   match words.at(i - 1) {
     None -> false,
@@ -286,8 +268,6 @@ fn joins(words: Array<Int>, i: Int, non_joiner: Bool) -> Bool =
         || (non_joiner && joined_before(words, i - 1) && joined_after(words, i + 1)),
   }
 
-/// Whether the first word at or before `i` that is not transparent joins to its left: a
-/// Joining_Type of L or D.
 fn joined_before(words: Array<Int>, i: Int) -> Bool =
   if i < 0 { false } else {
     match words.at(i) {
@@ -297,8 +277,6 @@ fn joined_before(words: Array<Int>, i: Int) -> Bool =
     }
   }
 
-/// Whether the first word at or after `i` that is not transparent joins to its right: a
-/// Joining_Type of R or D.
 fn joined_after(words: Array<Int>, i: Int) -> Bool =
   match words.at(i) {
     None -> false,
@@ -315,17 +293,17 @@ fn joiners_allowed(label: List<Int>, words: Array<Int>) -> Bool =
         _ -> true,
       }))
 
-/// What is wrong with `label` under the validity criteria of UTS #46 section 4.1, except the Bidi
-/// rule, which applies to the whole name. `read` is true when the label was decoded from Punycode.
 fn faults(table: IdnaTable, label: List<Int>, options: Options, read: Bool) -> List<ErrorKind> = {
-  let words = label.map(|cp: Int| ucd::lookup(table.words, cp));
+  let words = label.map(|code_point: Int| ucd::lookup(table.words, code_point));
   let hyphen = |i: Int| label.at(i) == Some(0x2D);
   let allowed = |i: Int| {
-    let cp = label.at_or(i, 0);
+    let code_point = label.at_or(i, 0);
     let kind = status_of(words.at_or(i, 0));
-    (kind == valid() || kind == deviation()) && cp != 0x2E
-      && !(options.use_std3_ascii_rules && cp < 128
-        && !((cp >= 0x61 && cp <= 0x7A) || (cp >= 0x30 && cp <= 0x39) || cp == 0x2D))
+    (kind == valid() || kind == deviation()) && code_point != 0x2E
+      && !(options.use_std3_ascii_rules && code_point < 128
+        && !((code_point >= 0x61 && code_point <= 0x7A)
+          || (code_point >= 0x30 && code_point <= 0x39)
+          || code_point == 0x2D))
   };
   let found = |reason: ErrorKind, invalid_name_cases: Bool|
     if invalid_name_cases { [reason] } else { [] };
@@ -337,7 +315,10 @@ fn faults(table: IdnaTable, label: List<Int>, options: Options, read: Bool) -> L
   ).concat(
     found(Punycode, !options.check_hyphens && is_ace(label)).concat(
       found(LeadingMark, match label.at(0) {
-        Some(cp) -> match Char::of_int(cp) { Some(c) -> c.is_mark(), None -> false },
+        Some(code_point) -> match Char::of_int(code_point) {
+          Some(c) -> c.is_mark(),
+          None -> false,
+        },
         None -> false,
       }),
     ).concat(
@@ -348,24 +329,18 @@ fn faults(table: IdnaTable, label: List<Int>, options: Options, read: Bool) -> L
   )
 }
 
-// --- The Bidi rule ----------------------------------------------------------------
-
 fn is_rtl(class: Int) -> Bool = class == right() || class == arabic_letter()
 
-/// Whether `classes`, a label's Bidi classes, contain a right-to-left character: R, AL or AN.
 fn has_rtl(classes: List<Int>) -> Bool =
   classes.any(|class: Int| is_rtl(class) || class == arabic_number())
 
-/// The class of the last character that is not a nonspacing mark, or zero.
 fn last_spacing(classes: List<Int>) -> Int =
   classes.fold(0, |last: Int, class: Int| if class == nonspacing() { last } else { class })
 
-/// Whether a label of these Bidi classes meets the six conditions of RFC 5893 section 2.
 fn meets_bidi_rule(classes: List<Int>) -> Bool =
   match classes {
     [] -> true,
     [first, ..] -> if is_rtl(first) {
-      // ES, CS, ET, ON, BN and NSM are 6 to 11.
       classes.all(|c: Int| is_rtl(c) || c == arabic_number() || c == european_number() || c >= 6)
         && (is_rtl(last_spacing(classes)) || last_spacing(classes) == european_number()
         || last_spacing(classes) == arabic_number())
@@ -378,13 +353,8 @@ fn meets_bidi_rule(classes: List<Int>) -> Bool =
     },
   }
 
-// --- Processing -------------------------------------------------------------------
-
-/// A label as it was converted, and what was found wrong with it.
 type Label = { points: List<Int>, errors: List<ErrorKind> }
 
-/// `label` converted and checked: decoded from Punycode when it starts with `xn--`, then checked
-/// against the validity criteria.
 fn convert_label(table: IdnaTable, label: List<Int>, options: Options) -> Label / {abort.raise} =
   if !is_ace(label) { { points: label, errors: faults(table, label, options, false) } }
   else if !is_ascii(label) { { points: label, errors: [Punycode] } } else {
@@ -404,8 +374,6 @@ fn convert_label(table: IdnaTable, label: List<Int>, options: Options) -> Label 
     }
   }
 
-/// Section 4 of UTS #46: `domain` mapped, normalized, split into labels, and each label converted
-/// and checked, with the Bidi rule checked across all of them.
 fn process_domain(domain: String, options: Options) -> List<Label> / {abort.raise} = {
   let table = idna_table();
   let mapped = domain.chars().fold([], |out: List<Int>, c: Char|
@@ -413,7 +381,7 @@ fn process_domain(domain: String, options: Options) -> List<Label> / {abort.rais
   let labels = labels_of(points_of(unicode::nfc(text_of(mapped)))).map(|label: List<Int>|
     convert_label(table, label, options));
   let classes = labels.map(|l: Label|
-    l.points.map(|cp: Int| bidi_of(ucd::lookup(table.words, cp))));
+    l.points.map(|code_point: Int| bidi_of(ucd::lookup(table.words, code_point))));
   if !options.check_bidi || !classes.any(has_rtl) { labels } else {
     range(0, labels.len()).map(|i: Int| {
       let l = labels.at_or(i, { points: [], errors: [] });
@@ -433,9 +401,9 @@ fn problems_of(labels: List<Label>) -> List<Problem> =
 fn dotted(labels: List<String>) -> String =
   labels.drop(1).fold(labels.at_or(0, ""), |name: String, label: String| name ++ "." ++ label)
 
-/// `domain` in the form to display: mapped, normalized, and with every valid Punycode `xn--` label
-/// decoded. It returns the name whatever is wrong with it, with a label that could not be decoded
-/// left as written, together with every problem found.
+/// Returns `domain` in display form: mapped, normalized, with every valid Punycode `xn--` label
+/// decoded. A bad name does not make it fail. It returns the name together with every problem
+/// found, and a label that cannot be decoded stays as written.
 pub fn to_unicode(domain: String, options: Options) -> ConversionResult / {abort.raise} = {
   let labels = process_domain(domain, options);
   { name: dotted(labels.map(|l: Label| text_of(l.points))), problems: problems_of(labels) }
@@ -456,12 +424,9 @@ pub fn ascii(domain: String, options: Options) -> String / {idna.fail, abort.rai
       if length == 0 { found.push({ label: i, reason: EmptyLabel }) }
       else if length > 63 { found.push({ label: i, reason: LongLabel }) }
       else { found }
-    }).concat(
-      // The root's empty label and its full stop are not counted.
-      if name.len() - (if name.ends_with(".") { 1 } else { 0 }) > 253 {
-        [{ label: -1, reason: LongName }]
-      } else { [] },
-    )
+    }).concat(if name.len() - (if name.ends_with(".") { 1 } else { 0 }) > 253 {
+      [{ label: -1, reason: LongName }]
+    } else { [] })
   };
   let problems = problems_of(labels).concat(lengths);
   if problems.len() > 0 { idna.fail(problems) } else { name }
@@ -471,10 +436,6 @@ pub fn ascii(domain: String, options: Options) -> String / {idna.fail, abort.rai
 pub fn to_ascii(domain: String, options: Options) -> Result<String, List<Problem>> / {abort.raise} =
   try { ascii(domain, options) }
 
-// --- Properties -------------------------------------------------------------------
-
-/// Labels to build names from: ASCII, capitals, accents composed, labels already in Punycode,
-/// right-to-left ones, wide forms, a mark out of place and a hyphen out of place.
 fn labels() -> List<String> =
   [
     "example",
@@ -498,8 +459,6 @@ fn labels() -> List<String> =
     "\u{301}x",
   ]
 
-/// A name of one to three of `labels`, chosen by `seed`, with full stops of either width between
-/// them.
 fn drawn_name(seed: Int) -> String = {
   let n = seed & 0x7FFFFFFF;
   let label = |i: Int| labels().at_or(i % 19, "");
@@ -524,7 +483,7 @@ test "a name on the wire converts to itself, and displays the same as the name i
   })
 }
 
-test "any text has a result, and text that passes every check also converts under the web's" {
+test "text that `to_ascii` accepts with strict rules gives the same result with web rules, and `to_unicode` with web rules reports no problems" {
   gen::check(gen::any_int(), |seed: Int| {
     let text = sample_text(seed);
     match to_ascii(text, strict()) {
@@ -533,8 +492,6 @@ test "any text has a result, and text that passes every check also converts unde
     }
   })
 }
-
-// --- Tests ------------------------------------------------------------------------
 
 type Name = { written: String, ascii: String, unicode: String }
 
@@ -583,7 +540,8 @@ fn names() -> List<Name> =
     { written: "\u{1F600}.example", ascii: "xn--e28h.example", unicode: "\u{1F600}.example" },
   ]
 
-test "{c.written} is {c.ascii} on the wire and converts back" for c: Name in names() {
+test "`to_ascii` converts the name {c.written} to {c.ascii}, and `to_unicode` converts both back to the same Unicode name" for c: Name in names(
+  ) {
   assert_eq(to_ascii(c.written, strict()), Ok(c.ascii));
   assert_eq(to_unicode(c.written, strict()), { name: c.unicode, problems: [] });
   assert_eq(to_unicode(c.ascii, strict()), { name: c.unicode, problems: [] });
@@ -617,9 +575,8 @@ fn invalid_name_cases() -> List<Wrong> =
     { written: "\u{FFFD}.example", problems: [{ label: 0, reason: Disallowed }] },
   ]
 
-test "{c.written} is rejected with what is wrong with it" for c: Wrong in invalid_name_cases() {
-  assert_eq(to_ascii(c.written, strict()), Err(c.problems))
-}
+test "`to_ascii` with strict rules rejects the name {c.written} and returns the problems found in it" for c: Wrong in invalid_name_cases(
+  ) { assert_eq(to_ascii(c.written, strict()), Err(c.problems)) }
 
 test "a label is at most 63 characters on the wire and a name at most 253" {
   let label = |n: Int| String::of_chars(range(0, n).map(|_: Int| 'a'));
@@ -632,7 +589,7 @@ test "a label is at most 63 characters on the wire and a name at most 253" {
   assert_eq(to_ascii(label(64) ++ ".example", web()), Ok(label(64) ++ ".example"))
 }
 
-test "the web's checks allow the rules that names in use break, and enforce the rest" {
+test "`to_ascii` with web rules accepts underscores, leading hyphens and a trailing dot, but rejects zero-width joiners and invalid Punycode" {
   assert_eq(to_ascii("a_b.example", web()), Ok("a_b.example"));
   assert_eq(to_ascii("-a.example", web()), Ok("-a.example"));
   assert_eq(

@@ -5,7 +5,6 @@ use std::cmp::Ordering;
 
 const RM: RoundingMode = RoundingMode::ToEven;
 
-/// The `Float` nearest `r`, ties to even, read off its mantissa words: `value = 0.m * 2^e`.
 fn nearest(r: &BigFloat) -> f64 {
     if r.is_zero() {
         return 0.0;
@@ -22,7 +21,6 @@ fn nearest(r: &BigFloat) -> f64 {
     let m = (u128::from(words[n_words - 1]) << 64) | u128::from(words[n_words - 2]);
     let mut sticky = inexact || words[..n_words - 2].iter().any(|w| *w != 0);
     let e = i64::from(e);
-    // How many leading bits the result keeps: 53, fewer for a subnormal.
     let kept = (e + 1074).min(53);
     let (mut q, half) = if kept < 0 {
         sticky = true;
@@ -54,8 +52,6 @@ fn nearest(r: &BigFloat) -> f64 {
     if sign == Sign::Neg { -f } else { f }
 }
 
-/// The correctly rounded result `r` approximates to `p` bits, or `None` where it lies too near a
-/// midpoint between two `Float`s for `p` bits to say which side.
 fn decided(r: &BigFloat, p: usize) -> Option<f64> {
     if r.is_nan() {
         return None;
@@ -73,12 +69,10 @@ fn decided(r: &BigFloat, p: usize) -> Option<f64> {
     (bits(below) == bits(above)).then_some(below)
 }
 
-/// Bits enough that argument reduction of `x` keeps 256 of them.
 fn precision(x: f64) -> usize {
     256 + (x.abs().log2().max(0.0) as usize)
 }
 
-/// A `Float` function the runtime computes correctly rounded.
 #[derive(Clone, Copy, Debug)]
 enum Function {
     Sqrt,
@@ -98,7 +92,6 @@ enum Function {
 }
 
 impl Function {
-    /// Its name in the prelude.
     fn name(self) -> String {
         format!("Float::{}", format!("{self:?}").to_lowercase())
     }
@@ -119,7 +112,6 @@ fn reference(b: Function, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
         Function::Asin => big(x).asin(p, RM, cc),
         Function::Acos => big(x).acos(p, RM, cc),
         Function::Atan => big(x).atan(p, RM, cc),
-        // `Float::exp(y * ln |x|)`, odd powers of a negative base negated.
         Function::Pow => {
             let wide = p + 128;
             let magnitude = BigFloat::from_f64(y, wide)
@@ -141,7 +133,6 @@ fn reference(b: Function, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
                 .add(&by.mul(&by, p, RM), p, RM)
                 .sqrt(p, RM)
         }
-        // `Float::atan(y / x)` turned by `pi` into the half-plane of a negative `x`.
         Function::Atan2 => {
             let (yy, xx) = (x, y);
             let a = big(yy).div(&big(xx), p, RM).atan(p, RM, cc);
@@ -171,14 +162,12 @@ impl Rng {
         lo + (hi - lo) * ((self.next() >> 11) as f64 / (1u64 << 53) as f64)
     }
 
-    /// A `Float` of either sign whose exponent is uniform in `lo..=hi`.
     fn spread(&mut self, lo: i64, hi: i64) -> f64 {
         let e = lo + (self.next() % (hi - lo + 1) as u64) as i64;
         let x = f64::from_bits((((e + 1023) as u64) << 52) | (self.next() & ((1 << 52) - 1)));
         if self.next() & 1 == 0 { x } else { -x }
     }
 
-    /// Arguments for `b` across its domain, the ranges an implementation treats apart included.
     fn arguments(&mut self, b: Function, i: usize) -> (f64, f64) {
         match (b, i % 3) {
             (Function::Sqrt, _) => (self.spread(-1074, 1023).abs(), 0.0),
@@ -207,7 +196,6 @@ impl Rng {
     }
 }
 
-/// What the runtime's function for builtin `b` returns over `x`, and `y` where it takes two.
 fn returned(b: Function, x: f64, y: f64) -> f64 {
     match b {
         Function::Sqrt => x.sqrt(),
@@ -278,7 +266,7 @@ fn encoded(x: f64) -> Vec<u8> {
 }
 
 #[test]
-fn a_nan_reads_as_the_one_nan_whatever_bits_made_it() {
+fn every_nan_bit_pattern_becomes_the_same_canonical_nan_for_bits_ordering_and_encoding() {
     for nan in [
         f64::NAN,
         -f64::NAN,

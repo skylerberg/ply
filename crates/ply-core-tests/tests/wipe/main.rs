@@ -1,7 +1,3 @@
-//! A binary of its own: it installs a `#[global_allocator]` that, while a test watches, keeps every
-//! block allocated and looks at each one as it is freed, so the test can say whether a credential's
-//! bytes are anywhere on the heap and whether a block that held them was given back unwiped.
-
 use ply_core::Span;
 use ply_core::crypto::{self, Framing};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -10,17 +6,17 @@ use zeroize::Zeroizing;
 
 const SLOTS: usize = 1 << 18;
 const EMPTY: usize = 0;
-const GONE: usize = 1;
-const MARK: usize = 64;
+const FREED: usize = 1;
+const MARKER_CAPACITY: usize = 64;
 
 static PTRS: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(EMPTY) }; SLOTS];
 static SIZES: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
-static MARKER: [AtomicU8; MARK] = [const { AtomicU8::new(0) }; MARK];
+static MARKER: [AtomicU8; MARKER_CAPACITY] = [const { AtomicU8::new(0) }; MARKER_CAPACITY];
 static MARKER_LEN: AtomicUsize = AtomicUsize::new(0);
 static WATCHING: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicBool = AtomicBool::new(false);
 static FULL: AtomicBool = AtomicBool::new(false);
-static FREED_HOLDING: AtomicUsize = AtomicUsize::new(0);
+static FREED_WITH_MARKER: AtomicUsize = AtomicUsize::new(0);
 
 struct Watching;
 
@@ -44,7 +40,6 @@ fn home(ptr: usize) -> usize {
     ((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 46) & (SLOTS - 1)
 }
 
-/// Whether `size` bytes at `ptr` hold the marker. Called under the lock, allocating nothing.
 unsafe fn holds(ptr: *const u8, size: usize) -> bool {
     let len = MARKER_LEN.load(Ordering::Relaxed);
     if len == 0 || size < len {
@@ -67,7 +62,7 @@ unsafe impl GlobalAlloc for Watching {
             let mut placed = false;
             for _ in 0..SLOTS {
                 let held = PTRS[at].load(Ordering::Relaxed);
-                if held == EMPTY || held == GONE {
+                if held == EMPTY || held == FREED {
                     PTRS[at].store(ptr as usize, Ordering::Relaxed);
                     SIZES[at].store(layout.size(), Ordering::Relaxed);
                     placed = true;
@@ -92,9 +87,9 @@ unsafe impl GlobalAlloc for Watching {
                 break;
             }
             if held == ptr as usize {
-                PTRS[at].store(GONE, Ordering::Relaxed);
+                PTRS[at].store(FREED, Ordering::Relaxed);
                 if unsafe { holds(ptr, SIZES[at].load(Ordering::Relaxed)) } {
-                    FREED_HOLDING.fetch_add(1, Ordering::Relaxed);
+                    FREED_WITH_MARKER.fetch_add(1, Ordering::Relaxed);
                 }
                 break;
             }
@@ -105,9 +100,8 @@ unsafe impl GlobalAlloc for Watching {
     }
 }
 
-/// From here on every block allocated is kept, and `marker` is what is looked for.
 fn watch(marker: &[u8]) {
-    assert!(marker.len() <= MARK);
+    assert!(marker.len() <= MARKER_CAPACITY);
     lock();
     for slot in &PTRS {
         slot.store(EMPTY, Ordering::Relaxed);
@@ -116,23 +110,22 @@ fn watch(marker: &[u8]) {
         MARKER[i].store(*b, Ordering::Relaxed);
     }
     MARKER_LEN.store(marker.len(), Ordering::Relaxed);
-    FREED_HOLDING.store(0, Ordering::Relaxed);
+    FREED_WITH_MARKER.store(0, Ordering::Relaxed);
     FULL.store(false, Ordering::Relaxed);
     WATCHING.store(true, Ordering::Relaxed);
     unlock();
 }
 
-/// How many blocks kept since `watch` hold the marker now, and how many held it when freed.
 fn seen() -> (usize, usize) {
     lock();
     let mut live = 0;
     for (slot, size) in PTRS.iter().zip(&SIZES) {
         let ptr = slot.load(Ordering::Relaxed);
-        if ptr > GONE && unsafe { holds(ptr as *const u8, size.load(Ordering::Relaxed)) } {
+        if ptr > FREED && unsafe { holds(ptr as *const u8, size.load(Ordering::Relaxed)) } {
             live += 1;
         }
     }
-    let freed = FREED_HOLDING.load(Ordering::Relaxed);
+    let freed = FREED_WITH_MARKER.load(Ordering::Relaxed);
     unlock();
     assert!(!FULL.load(Ordering::Relaxed), "the watch table filled");
     (live, freed)
@@ -147,8 +140,6 @@ fn stop() {
 
 type Wiped = Zeroizing<Vec<u8>>;
 
-/// A path a secret takes: what it is called, the bytes looked for, and what it makes of the plain
-/// bytes it is handed, every one of them made before the watch starts.
 struct Path {
     name: &'static str,
     marker: Vec<u8>,
@@ -212,7 +203,7 @@ fn paths() -> Vec<Path> {
                     let framing = Framing::named(name, "a frame", Span::DUMMY).expect("a framing");
                     out.push(
                         framing
-                            .unframed(&line, b"key ", b"\n")
+                            .decode_framed(&line, b"key ", b"\n")
                             .expect("its own frame"),
                     );
                     out.push(line);
@@ -285,7 +276,6 @@ fn paths() -> Vec<Path> {
     ]
 }
 
-/// The contents of each `INTEGER` a DER `SEQUENCE` of them holds.
 fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     fn length(der: &[u8], at: &mut usize) -> usize {
         let first = der[*at];
@@ -318,7 +308,6 @@ fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// `n` and `e` as bytes, then each private number of a PKCS #1 document as its base64url text.
 fn jwk_texts(document: &[u8]) -> Vec<Vec<u8>> {
     let numbers = integers(document);
     let mut out = vec![numbers[1].clone(), numbers[2].clone()];
@@ -332,7 +321,6 @@ fn jwk_texts(document: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// One test at a time: the watch is the process's.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
@@ -359,7 +347,7 @@ fn a_dropped_secret_leaves_no_copy_of_its_bytes_on_the_heap() {
 }
 
 #[test]
-fn the_watch_sees_a_plain_copy_freed_unwiped() {
+fn the_memory_wipe_watch_reports_a_freed_ordinary_copy_of_a_value_as_never_zeroed() {
     let _one = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

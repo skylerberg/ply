@@ -1,14 +1,8 @@
-//! The runtime's stamp: a digest of the sources of the crates that run a test or a law, and of the
-//! `Cargo.lock` entries they reach. It digests sources, not the binary, so both profiles record
-//! the same.
-
 #[path = "src/code.rs"]
 mod code;
 
 use std::path::{Path, PathBuf};
 
-/// What runs a test or law, the handlers a cached pass's trace was read through, and the launcher a
-/// `ply` it started ran under.
 const RUNTIME: &[&str] = &[
     "ply-core",
     "ply-compiled",
@@ -29,12 +23,11 @@ fn main() {
         digest(
             &repo,
             &crate_files(&repo, RUNTIME),
-            &[code::lock_closure(&lock, RUNTIME).as_bytes()]
+            &[code::reachable_lock_entries(&lock, RUNTIME).as_bytes()]
         )
     );
 }
 
-/// Every file under each crate's `src/`, and each crate's manifest.
 fn crate_files(repo: &Path, crates: &[&str]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for name in crates {
@@ -46,7 +39,6 @@ fn crate_files(repo: &Path, crates: &[&str]) -> Vec<PathBuf> {
     paths
 }
 
-/// The files keyed by their paths relative to the repository, then `extra`.
 fn digest(repo: &Path, files: &[PathBuf], extra: &[&[u8]]) -> String {
     let mut paths = files.to_vec();
     paths.sort();

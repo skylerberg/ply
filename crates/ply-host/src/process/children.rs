@@ -1,5 +1,3 @@
-//! Children that run beside the program: started, fed, read, signalled and reaped by handle.
-
 use super::{MAX_CAPTURE_BYTES, OutputSink, Stream};
 use crate::native::{int, parts};
 use ply_core::Resource;
@@ -11,20 +9,16 @@ use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// What one read from a child's pipe takes at most.
 const CHUNK: usize = 64 * 1024;
 
-/// How soon a watcher looks again at a child that changed state without ending.
 const RECHECK: Duration = Duration::from_millis(10);
 
-/// How a spawned process ended: its own code, or the signal that killed it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ended {
     Exited(i64),
     Signalled(i64),
 }
 
-/// How a child ended and what it left in each stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Finished {
     pub ended: Ended,
@@ -33,7 +27,6 @@ pub struct Finished {
 }
 
 impl Finished {
-    /// As parts: 0 for an exit or 1 for a signal, the code or the signal, then each stream.
     pub fn flat(self) -> Vec<u8> {
         let (kind, n) = match self.ended {
             Ended::Exited(code) => (0, code),
@@ -43,7 +36,6 @@ impl Finished {
     }
 }
 
-/// What a read of a child's `Lines` streams heard.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Heard {
     Said(String),
@@ -52,7 +44,6 @@ pub enum Heard {
 }
 
 impl Heard {
-    /// Byte 0 and the line, byte 1 for nothing before the timeout, or byte 2 for the end.
     pub fn flat(self) -> Vec<u8> {
         match self {
             Heard::Said(line) => [&[0u8][..], line.as_bytes()].concat(),
@@ -62,20 +53,16 @@ impl Heard {
     }
 }
 
-/// Where one of a child's output streams goes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Output {
     Keep,
     Discard,
     Inherit,
     Lines,
-    /// A file, relative to the child's directory, written from empty.
     File(String),
 }
 
 impl Output {
-    /// The output `kind` numbers, `file` its path where it is a file: `Keep` 0, `Discard` 1,
-    /// `Inherit` 2, `Lines` 3 and `File` 4.
     pub fn of(kind: i64, file: &str) -> Option<Output> {
         Some(match kind {
             0 => Output::Keep,
@@ -88,8 +75,6 @@ impl Output {
     }
 }
 
-/// How a started child is wired: whether it reads what the program writes, and where each of its
-/// output streams goes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Io {
     pub input: bool,
@@ -97,7 +82,6 @@ pub struct Io {
     pub err: Output,
 }
 
-/// A signal a child may be sent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Signal {
     Hangup,
@@ -110,7 +94,6 @@ pub enum Signal {
 }
 
 impl Signal {
-    /// The signal `number` numbers, in the order the variants are declared from 0.
     pub fn of(number: i64) -> Option<Signal> {
         Some(match number {
             0 => Signal::Hangup,
@@ -125,7 +108,6 @@ impl Signal {
     }
 }
 
-/// What one `process.start` asked for, with the executable its label resolved to.
 pub(super) struct Launch<'a> {
     pub(super) label: &'a Resource,
     pub(super) program: &'a Path,
@@ -135,38 +117,27 @@ pub(super) struct Launch<'a> {
     pub(super) io: &'a Io,
 }
 
-/// Why a handle names no child the program may use.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum Unusable {
     Unknown,
-    /// A `wait` has handed the child back.
     Spent,
-    /// Started under another label.
-    Elsewhere(Resource),
+    StartedUnderOtherLabel(Resource),
 }
 
-/// Why a job on a child returned no value.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum ProcessError {
-    /// Another `wait` handed the child back first.
     Spent,
-    /// A stream outgrew the bound: everything the child wrote to each.
     TooMuch { out: usize, err: usize },
-    /// The child's ending could not be read.
     Unreaped(String),
 }
 
-/// Every child a host has started and the program has not waited on. Dropping it kills and reaps
-/// whatever is still running.
 pub struct Children {
     table: Mutex<Table>,
 }
 
 struct Table {
     open: BTreeMap<i64, Arc<Child>>,
-    /// Handles ascend from 1 and are never reused, so a stale one names nothing.
     next: i64,
-    /// Set by [`Children::end_all`]: a child started after it is ended at once.
     ended: bool,
 }
 
@@ -187,13 +158,10 @@ impl Children {
         }
     }
 
-    /// The handle of a child now running, or why it could not be started.
     pub(super) fn start(&self, launch: &Launch<'_>, sink: &Arc<OutputSink>) -> Result<i64, String> {
         self.started(launch, sink).map(|(handle, _)| handle)
     }
 
-    /// A child now running and held here, so [`Children::end_all`] ends it however it is waited
-    /// on, with its handle; or why it could not be started.
     pub(super) fn started(
         &self,
         launch: &Launch<'_>,
@@ -244,26 +212,26 @@ impl Children {
             child.end();
             return Err("the run is ending, so the child was killed as it started".to_string());
         }
-        table.open.retain(|_, held| !held.is_spent());
+        table.open.retain(|_, held| !held.is_waited());
         let handle = table.next;
         table.next += 1;
         table.open.insert(handle, Arc::clone(&child));
         Ok((handle, child))
     }
 
-    /// The child `handle` names, if the program may use it under `at`.
     pub(super) fn get(&self, handle: i64, at: &Resource) -> Result<Arc<Child>, Unusable> {
         let table = lock(&self.table);
         match table.open.get(&handle) {
-            Some(child) if child.is_spent() => Err(Unusable::Spent),
-            Some(child) if child.label != *at => Err(Unusable::Elsewhere(child.label.clone())),
+            Some(child) if child.is_waited() => Err(Unusable::Spent),
+            Some(child) if child.label != *at => {
+                Err(Unusable::StartedUnderOtherLabel(child.label.clone()))
+            }
             Some(child) => Ok(Arc::clone(child)),
             None if handle > 0 && handle < table.next => Err(Unusable::Spent),
             None => Err(Unusable::Unknown),
         }
     }
 
-    /// Kills and reaps every child still running; one started afterwards is killed as it starts.
     pub fn end_all(&self) {
         let open = {
             let mut table = lock(&self.table);
@@ -287,7 +255,6 @@ pub(super) struct Child {
     program: PathBuf,
     pid: u32,
     state: Mutex<State>,
-    /// Notified when the child is reaped, when a drain takes a chunk, and when a stream ends.
     changed: Condvar,
 }
 
@@ -300,13 +267,10 @@ impl Child {
         lock(&self.state)
     }
 
-    fn is_spent(&self) -> bool {
+    fn is_waited(&self) -> bool {
         self.lock().spent
     }
 
-    /// Once the child has ended and every stream the host collects has ended too, its ending and
-    /// what those streams hold; `None` at the deadline, and no deadline waits for as long as it
-    /// takes.
     pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Finished>, ProcessError> {
         let mut state = self.lock();
         loop {
@@ -336,12 +300,9 @@ impl Child {
         }
     }
 
-    /// The next line any `Lines` stream took, `Quiet` at the deadline, and `Closed` once every
-    /// `Lines` stream has ended and each of its lines has been returned.
     pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, ProcessError> {
         let mut state = self.lock();
         loop {
-            // A `wait` has handed back whatever was unread.
             if state.spent {
                 return Ok(Heard::Closed);
             }
@@ -354,7 +315,7 @@ impl Child {
             if let Some(line) = state.next_line() {
                 return Ok(Heard::Said(line));
             }
-            if !state.lines_open() {
+            if !state.line_streams_open() {
                 return Ok(Heard::Closed);
             }
             state = match until(&self.changed, state, deadline) {
@@ -364,8 +325,6 @@ impl Child {
         }
     }
 
-    /// Writes every byte to the child's input: `false` once that input is closed, whether by
-    /// `end_input`, by the child, or by never having been opened, and once the child has ended.
     pub(super) fn input(&self, bytes: &[u8]) -> bool {
         let pipe = {
             let state = self.lock();
@@ -384,12 +343,10 @@ impl Child {
             .is_ok()
     }
 
-    /// A write still in flight holds the pipe open until it finishes.
     pub(super) fn end_input(&self) {
         self.lock().stdin = None;
     }
 
-    /// Delivers `signal`, returning `false` when the child had already ended.
     pub(super) fn signal(&self, signal: Signal) -> std::io::Result<bool> {
         let mut state = self.lock();
         if state.ended.is_some() {
@@ -405,7 +362,6 @@ impl Child {
         Ok(true)
     }
 
-    /// Kills the child if it is still running, and reaps it.
     fn end(&self) {
         let mut state = self.lock();
         state.stdin = None;
@@ -427,12 +383,10 @@ impl Child {
 
 struct State {
     process: std::process::Child,
-    /// Set once the child is reaped, and only under this lock.
     ended: Option<Result<Ended, String>>,
     stdin: Option<Arc<ChildStdin>>,
     out: CollectedStream,
     err: CollectedStream,
-    /// Lines the `Lines` streams took and no `output_line` has returned, in the order they arrived.
     lines: VecDeque<(Stream, Vec<u8>)>,
     spent: bool,
 }
@@ -449,30 +403,29 @@ impl State {
         let held = self.held(stream);
         held.written += chunk.len();
         match held.collect {
-            Collect::Nothing => {}
-            Collect::Keep => {
+            OutputHandling::Nothing => {}
+            OutputHandling::Keep => {
                 held.hold(chunk);
             }
-            Collect::Lines => {
+            OutputHandling::Lines => {
                 let from = held.bytes.len();
                 if held.hold(chunk) {
-                    let ended = carve(&mut held.bytes, from);
+                    let ended = take_complete_lines(&mut held.bytes, from);
                     held.queued += ended.iter().map(Vec::len).sum::<usize>();
                     self.lines
                         .extend(ended.into_iter().map(|line| (stream, line)));
                 }
             }
-            Collect::Forward(to) => {
+            OutputHandling::Forward(to) => {
                 let from = held.bytes.len();
                 held.bytes.extend_from_slice(chunk);
-                for line in carve(&mut held.bytes, from) {
+                for line in take_complete_lines(&mut held.bytes, from) {
                     forward(sink, to, &line);
                 }
             }
         }
     }
 
-    /// The last line of a stream need not end in a newline.
     fn close(&mut self, stream: Stream, sink: &OutputSink) {
         let held = self.held(stream);
         held.open = false;
@@ -480,13 +433,13 @@ impl State {
             return;
         }
         match held.collect {
-            Collect::Lines => {
+            OutputHandling::Lines => {
                 let tail = std::mem::take(&mut held.bytes);
                 held.queued += tail.len();
                 self.lines.push_back((stream, tail));
             }
-            Collect::Forward(to) => forward(sink, to, &std::mem::take(&mut held.bytes)),
-            Collect::Nothing | Collect::Keep => {}
+            OutputHandling::Forward(to) => forward(sink, to, &std::mem::take(&mut held.bytes)),
+            OutputHandling::Nothing | OutputHandling::Keep => {}
         }
     }
 
@@ -496,24 +449,22 @@ impl State {
         Some(text_of(&line))
     }
 
-    fn lines_open(&self) -> bool {
+    fn line_streams_open(&self) -> bool {
         [&self.out, &self.err]
             .iter()
-            .any(|held| held.collect == Collect::Lines && held.open)
+            .any(|held| held.collect == OutputHandling::Lines && held.open)
     }
 
     fn lines_overflowed(&self) -> bool {
         [&self.out, &self.err]
             .iter()
-            .any(|held| held.collect == Collect::Lines && held.overflowed)
+            .any(|held| held.collect == OutputHandling::Lines && held.overflowed)
     }
 
-    /// What a `wait` hands back of one stream: all a `Keep` stream took, or a `Lines` stream's
-    /// unread lines.
     fn collected(&mut self, stream: Stream) -> Vec<u8> {
         match self.held(stream).collect {
-            Collect::Keep => std::mem::take(&mut self.held(stream).bytes),
-            Collect::Lines => {
+            OutputHandling::Keep => std::mem::take(&mut self.held(stream).bytes),
+            OutputHandling::Lines => {
                 let mut unread = Vec::new();
                 self.lines.retain(|(from, line)| {
                     if *from == stream {
@@ -526,41 +477,33 @@ impl State {
                 self.held(stream).queued = 0;
                 unread
             }
-            Collect::Nothing | Collect::Forward(_) => Vec::new(),
+            OutputHandling::Nothing | OutputHandling::Forward(_) => Vec::new(),
         }
     }
 }
 
-/// What the host does with one of a child's output streams.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Collect {
+enum OutputHandling {
     Nothing,
     Keep,
     Lines,
-    /// `Inherit` under a captured sink, which takes lines where a real one takes a descriptor.
     Forward(Stream),
 }
 
-/// One output stream, as the host collects it.
 struct CollectedStream {
-    collect: Collect,
-    /// Its drain has not reached the end of the stream.
+    collect: OutputHandling,
     open: bool,
-    /// `Keep`: everything so far. `Lines` and a forwarded stream: the line not yet ended.
     bytes: Vec<u8>,
-    /// `Lines`: the bytes of this stream's lines waiting in `State::lines`.
     queued: usize,
-    /// Everything the child wrote to the stream.
     written: usize,
-    /// The stream outgrew the bound, and nothing more of it is held.
     overflowed: bool,
 }
 
 impl CollectedStream {
-    fn new(collect: Collect) -> CollectedStream {
+    fn new(collect: OutputHandling) -> CollectedStream {
         CollectedStream {
             collect,
-            open: collect != Collect::Nothing,
+            open: collect != OutputHandling::Nothing,
             bytes: Vec::new(),
             queued: 0,
             written: 0,
@@ -568,8 +511,6 @@ impl CollectedStream {
         }
     }
 
-    /// Whether `chunk` fit under the bound; a stream that outgrows it is still drained, so the
-    /// child never blocks on a full pipe.
     fn hold(&mut self, chunk: &[u8]) -> bool {
         if self.overflowed || self.queued + self.bytes.len() + chunk.len() > MAX_CAPTURE_BYTES {
             self.overflowed = true;
@@ -580,8 +521,7 @@ impl CollectedStream {
     }
 }
 
-/// Splits every line `bytes` ends from `from` on, each with its ending; earlier bytes hold none.
-fn carve(bytes: &mut Vec<u8>, from: usize) -> Vec<Vec<u8>> {
+fn take_complete_lines(bytes: &mut Vec<u8>, from: usize) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut at = from;
@@ -595,28 +535,25 @@ fn carve(bytes: &mut Vec<u8>, from: usize) -> Vec<Vec<u8>> {
     lines
 }
 
-/// A line without its ending; a byte that is not UTF-8 reads as U+FFFD.
 fn text_of(line: &[u8]) -> String {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     String::from_utf8_lossy(line).into_owned()
 }
 
-/// A sink that rejects a line has nowhere else to put it, and the child is not the one to tell.
 fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
     let _ = sink.line(to, &text_of(line));
 }
 
 struct Destination {
     stdio: Stdio,
-    collect: Collect,
+    collect: OutputHandling,
 }
 
 fn destinations(
     launch: &Launch<'_>,
     sink: &OutputSink,
 ) -> Result<(Destination, Destination), String> {
-    // One file named for both streams is opened once, so the two interleave as `2>&1` does.
     if let (Output::File(out), Output::File(err)) = (&launch.io.out, &launch.io.err)
         && out == err
     {
@@ -627,11 +564,11 @@ fn destinations(
         return Ok((
             Destination {
                 stdio: file.into(),
-                collect: Collect::Nothing,
+                collect: OutputHandling::Nothing,
             },
             Destination {
                 stdio: shared.into(),
-                collect: Collect::Nothing,
+                collect: OutputHandling::Nothing,
             },
         ));
     }
@@ -652,27 +589,26 @@ fn destination(
         collect,
     };
     Ok(match output {
-        Output::Keep => piped(Collect::Keep),
-        Output::Lines => piped(Collect::Lines),
+        Output::Keep => piped(OutputHandling::Keep),
+        Output::Lines => piped(OutputHandling::Lines),
         Output::Discard => Destination {
             stdio: Stdio::null(),
-            collect: Collect::Nothing,
+            collect: OutputHandling::Nothing,
         },
         Output::File(path) => Destination {
             stdio: create(dir, path)?.into(),
-            collect: Collect::Nothing,
+            collect: OutputHandling::Nothing,
         },
         Output::Inherit => match sink {
             OutputSink::Real { out } => Destination {
                 stdio: inherited(stream, *out),
-                collect: Collect::Nothing,
+                collect: OutputHandling::Nothing,
             },
-            OutputSink::Captured(_) => piped(Collect::Forward(stream)),
+            OutputSink::Captured(_) => piped(OutputHandling::Forward(stream)),
         },
     })
 }
 
-/// The program's own stream: stdout is wherever `process.out` goes, which `--json` moves to stderr.
 fn inherited(stream: Stream, out: Stream) -> Stdio {
     match (stream, out) {
         (Stream::Out, Stream::Err) => std::io::stderr().into(),
@@ -680,7 +616,6 @@ fn inherited(stream: Stream, out: Stream) -> Stdio {
     }
 }
 
-/// Relative to the child's directory, where a shell redirection in it would land; truncated.
 fn create(dir: &str, path: &str) -> Result<File, String> {
     let at = Path::new(dir).join(path);
     File::create(&at).map_err(|e| {
@@ -691,7 +626,6 @@ fn create(dir: &str, path: &str) -> Result<File, String> {
     })
 }
 
-/// A watcher that reaps the child, and a drain for each stream the host collects.
 fn attend(
     child: &Arc<Child>,
     stdout: Option<ChildStdout>,
@@ -721,8 +655,6 @@ fn helper(name: String, work: impl FnOnce() + Send + 'static) -> std::io::Result
     std::thread::Builder::new().name(name).spawn(work).map(drop)
 }
 
-/// Reaps the child once it has ended, under the lock `signal` takes, so a signal never reaches a
-/// pid the kernel has handed to another process.
 fn watch(child: &Child) {
     loop {
         until_ended(child.pid);
@@ -732,7 +664,6 @@ fn watch(child: &Child) {
         }
         match state.process.try_wait() {
             Ok(Some(status)) => state.ended = Some(Ok(ending(&status))),
-            // Stopped rather than ended, which macOS's `waitid` reports too.
             Ok(None) => {
                 drop(state);
                 std::thread::sleep(RECHECK);
@@ -746,11 +677,9 @@ fn watch(child: &Child) {
     }
 }
 
-/// Blocks until the child has ended without reaping it.
 #[cfg(unix)]
 fn until_ended(pid: u32) {
     loop {
-        // SAFETY: `info` is plain data the call only writes, and `WNOWAIT` leaves the child unreaped.
         let returned = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             libc::waitid(
@@ -766,7 +695,6 @@ fn until_ended(pid: u32) {
     }
 }
 
-/// Nothing waits without reaping here, so the watcher looks every [`RECHECK`].
 #[cfg(not(unix))]
 fn until_ended(_: u32) {}
 
@@ -781,7 +709,6 @@ fn deliver(_: &mut std::process::Child, pid: u32, signal: Signal) -> std::io::Re
         Signal::User2 => libc::SIGUSR2,
         Signal::WindowChange => libc::SIGWINCH,
     };
-    // SAFETY: a plain system call; the child is unreaped, so its pid names no other process.
     if unsafe { libc::kill(pid as libc::pid_t, number) } == 0 {
         Ok(())
     } else {
@@ -834,7 +761,6 @@ fn signal_of(_: &ExitStatus) -> i64 {
     0
 }
 
-/// Waits for a change, or returns `None` once `deadline` has passed; no deadline waits forever.
 fn until<'a>(
     changed: &Condvar,
     state: MutexGuard<'a, State>,
@@ -855,7 +781,6 @@ fn until<'a>(
     )
 }
 
-/// The guarded state has no invariant a panicking holder can break, so recovering is correct.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

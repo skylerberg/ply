@@ -1,7 +1,3 @@
-//! Configuration: `--set` over `--config` files over the environment over a default, each source
-//! rejected by name when it is malformed, and a secret that reaches no stream; a test reads the
-//! environment as a run does.
-
 import harness (Hermetic, RunWithTree, Shipped, in_memory_faked, one_module_tree, on_disk, returned,
                 passing_except, scratch, tree)
 import support.harness (RunResult, all_output, at, bool, int, items, json_of, json_text, path,
@@ -9,7 +5,7 @@ import support.harness (RunResult, all_output, at, bool, int, items, json_of, js
 import std.fs (MemFs)
 import std.json (Json)
 import std.machine as entering
-import std.process (Var, var)
+import std.process (EnvironmentVariable, environment_variable)
 import std.string
 import std.list
 import std.value (Value, VBool, VCtor, VList, VRecord, VStr)
@@ -18,7 +14,6 @@ fn service() -> String = String::of_bytes_lossy(embed("../programs/config_cli/se
 
 fn secret_main() -> String = String::of_bytes_lossy(embed("../programs/config_cli/secret_main.ply"))
 
-/// A key of a `ConfigSpec`, as the value of `config::required` or `config::with_default`.
 fn key_value(name: String, shape: String, required: Bool, default: Option<String>) -> Value =
   VRecord([
     {
@@ -30,7 +25,6 @@ fn key_value(name: String, shape: String, required: Bool, default: Option<String
     { name: "shape", value: VCtor("std.config." ++ shape, []) },
   ])
 
-/// What `m.spec` of `service` returns.
 fn service_spec() -> List<Value> =
   [
     key_value("SERVICE_REGION", "SText", false, Some("us")),
@@ -38,30 +32,26 @@ fn service_spec() -> List<Value> =
     key_value("SERVICE_API_KEY", "SSecret", true, None),
   ]
 
-/// What `m.spec` of `secret_main` returns.
 fn secret_spec() -> List<Value> = [key_value("SERVICE_API_KEY", "SSecret", true, None)]
 
-/// The entries of a faked run: `m.spec` returns a `ConfigSpec` of `keys`, and everything else passes.
 fn spec_of(keys: List<Value>) -> (String) -> entering::Termination =
   |name: String|
     if name == "m.spec" { returned(VRecord([{ name: "keys", value: VList(keys) }])) }
     else { passing_except([])(name) }
 
-/// `ply` over `t` with `vars` in its environment, as `spec_of(keys)` faked.
 fn over_schema(
   t: MemFs,
   keys: List<Value>,
   argv: List<String>,
-  vars: List<Var>,
+  vars: List<EnvironmentVariable>,
 ) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
   in_memory_faked(t, argv, spec_of(keys), [], vars).ran
 
-/// `ply hosts` of `t`, whose whole output is the resolved configuration, so precedence is read from it.
 fn hosts(
   t: MemFs,
   keys: List<Value>,
   extra: List<String>,
-  vars: List<Var>,
+  vars: List<EnvironmentVariable>,
 ) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
   over_schema(t, keys, ["hosts", ".", "--json"].concat(extra), vars)
 
@@ -105,7 +95,7 @@ test "an unreadable config file is E0440" {
   })
 }
 
-test "a config schema naming no definition lists what the program has" {
+test "`--config-schema` naming a nonexistent definition fails with E0440 and lists the program's definitions" {
   scratch(|| {
     write_program(service());
     let r = on_disk(["hosts", "--config-schema", "m.confg"]);
@@ -121,7 +111,10 @@ test "precedence is set, then file, then environment, then default" {
     { path: "deploy.env", text: "SERVICE_REGION=file\n" },
   ]);
   let schema = ["--config-schema", "m.spec", "--set", "SERVICE_PORT=8137"];
-  let everything = [var("SERVICE_REGION", "environment"), var("SERVICE_API_KEY", "k")];
+  let everything = [
+    environment_variable("SERVICE_REGION", "environment"),
+    environment_variable("SERVICE_API_KEY", "k"),
+  ];
 
   let all = service_region_key(
     hosts(
@@ -144,7 +137,9 @@ test "precedence is set, then file, then environment, then default" {
   assert_eq(str(at(no_files, "value")), "environment");
   assert_eq(str(at(no_files, "source")), "env");
 
-  let nothing = service_region_key(hosts(t, service_spec(), schema, [var("SERVICE_API_KEY", "k")]));
+  let nothing = service_region_key(
+    hosts(t, service_spec(), schema, [environment_variable("SERVICE_API_KEY", "k")]),
+  );
   assert_eq(str(at(nothing, "value")), "us");
   assert_eq(str(at(nothing, "source")), "default")
 }
@@ -173,7 +168,7 @@ test "a value that is not of its shape is E0442 naming the source" {
     one_module_tree(service()),
     service_spec(),
     ["run", ".", "--config-schema", "m.spec", "--set", "SERVICE_PORT=eight"],
-    [var("SERVICE_API_KEY", "k")],
+    [environment_variable("SERVICE_API_KEY", "k")],
   );
   let text = stderr(r);
   assert(r.code != 0, Some(text));
@@ -183,7 +178,6 @@ test "a value that is not of its shape is E0442 naming the source" {
   assert(text.contains("eight"), Some("a plain value is shown: " ++ text))
 }
 
-// The one rejection that must not quote what it rejected.
 test "a malformed secret is E0442 and prints no value" {
   let r = over_schema(
     one_module_tree(service()),
@@ -207,7 +201,7 @@ test "a malformed secret is E0442 and prints no value" {
   assert(text.contains("not printed"), Some(text))
 }
 
-test "an undeclared set warns and an undeclared environment key does not" {
+test "`--set` of a key the config schema does not declare warns, but an unrelated environment variable does not" {
   let r = over_schema(
     one_module_tree(service()),
     service_spec(),
@@ -221,7 +215,10 @@ test "an undeclared set warns and an undeclared environment key does not" {
       "--set",
       "SERVICE_PROT=8138",
     ],
-    [var("SERVICE_API_KEY", "k"), var("AWS_PROFILE", "nothing to do with this program")],
+    [
+      environment_variable("SERVICE_API_KEY", "k"),
+      environment_variable("AWS_PROFILE", "nothing to do with this program"),
+    ],
   );
   assert(r.code == 0, Some(stderr(r)));
   assert(all_output(r).contains("W0607"), Some(all_output(r)));
@@ -234,7 +231,7 @@ test "an undeclared set warns and an undeclared environment key does not" {
 
 test "the JSON report carries a secret's key and source and not its value" {
   let r = hosts(one_module_tree(secret_main()), secret_spec(), ["--config-schema", "m.spec"], [
-    var("SERVICE_API_KEY", "correct-horse"),
+    environment_variable("SERVICE_API_KEY", "correct-horse"),
   ]);
   let key = key_of(json_of(r), "SERVICE_API_KEY");
   assert_eq(str(at(key, "value")), "****");
@@ -243,7 +240,7 @@ test "the JSON report carries a secret's key and source and not its value" {
   assert(!stdout(r).contains("correct-horse"), Some(stdout(r)))
 }
 
-test "a test supplying configuration is det and cached" {
+test "a deterministic test that is given configuration passes, and its second run is a cache hit" {
   let first = in_memory_faked(
     one_module_tree(service()),
     ["test", ".", "--json"],
@@ -263,7 +260,7 @@ test "a test supplying configuration is det and cached" {
   assert(int(path(second, ["selection", "same_code"])) == 0, Some(json_text(second)))
 }
 
-test "an unhandled config read in a det test is E0412" {
+test "a deterministic test that reads configuration without a handler fails with E0412" {
   let r = in_memory_faked(
     one_module_tree(
       \\import std.config

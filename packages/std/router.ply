@@ -1,8 +1,9 @@
-//! Routes as data: a table is a `List<Route<a>>`, matched by a pure function.
+//! Routes as data: a table is a `List<Route<a>>`, and a pure function matches a request against it.
 //!
-//! The endpoint is a tag the caller `match`es on. Paths split on `/` before each segment is
-//! percent-decoded, so a `%2F` never introduces a boundary, and are never normalized implicitly
-//! (`normalize_path` is explicit). `conflicts`, `well_formed`, `listing` and `route_lines` inspect a table.
+//! The endpoint is a tag the caller `match`es on. A path is split on `/` first, and each segment is
+//! percent-decoded afterwards, so a `%2F` never creates a segment boundary. Matching never
+//! normalizes a path; call `normalize_path` to do that. `conflicts`, `well_formed`, `listing` and
+//! `route_lines` inspect a table.
 
 import std.bytes
 import std.http
@@ -10,10 +11,8 @@ import std.laws (inverse)
 import std.list
 import std.gen
 
-// --- The table --------------------------------------------------------------
-
-/// What a `Typed` segment accepts: an `Int`, a `Decimal` or a `Bool` as `int_of_text`,
-/// `decimal_of_text` and `bool_of_text` read one.
+/// The type a `Typed` segment requires its text to parse as: an `Int` (`int_of_text`), a `Decimal`
+/// (`decimal_of_text`) or a `Bool` (`bool_of_text`).
 pub type ParamType = | IntParam | DecimalParam | BoolParam
 
 /// A typed parameter's name and the kind its segment must parse as.
@@ -42,11 +41,8 @@ pub type RouteResult<a> =
   /// The most specific matching route's endpoint, and what its parameters captured.
   | Found({ endpoint: a, params: Map<String, String> })
 
-// --- Matching ---------------------------------------------------------------
-
 type RouteMatch<a> = { endpoint: a, params: Map<String, String>, rank: List<Int> }
 
-/// Methods of routes whose path matched under another method; read only when `best` is `None`.
 type Search<a> = { best: Option<RouteMatch<a>>, allowed: List<http::Method> }
 
 /// The most specific route whose method and path match (`more_specific`); a tie goes to the earlier
@@ -58,30 +54,30 @@ pub fn route<a>(
 ) -> RouteResult<a> / {abort.raise} = {
   let segments = path_segments(path);
   search_result(
-    table.fold({ best: None, allowed: [] }, |acc: Search<a>, r: Route<a>|
-      consider(acc, r, method, segments)),
+    table.fold({ best: None, allowed: [] }, |accumulator: Search<a>, r: Route<a>|
+      consider(accumulator, r, method, segments)),
   )
 }
 
 fn consider<a>(
-  acc: Search<a>,
+  accumulator: Search<a>,
   r: Route<a>,
   method: http::Method,
   segments: List<String>,
 ) -> Search<a> / {abort.raise} =
   match capture(r.path, segments, Map::new()) {
-    None -> acc,
+    None -> accumulator,
     Some(params) -> if r.method == method {
-      take(acc, { endpoint: r.endpoint, params: params, rank: ranks(r.path) })
-    } else { { best: acc.best, allowed: acc.allowed.push(r.method) } },
+      take(accumulator, { endpoint: r.endpoint, params: params, rank: ranks(r.path) })
+    } else { { best: accumulator.best, allowed: accumulator.allowed.push(r.method) } },
   }
 
-/// Strictly more specific, so a tie leaves the earlier entry in place.
-fn take<a>(acc: Search<a>, hit: RouteMatch<a>) -> Search<a> =
-  match acc.best {
-    None -> { best: Some(hit), allowed: acc.allowed },
-    Some(prev) -> if outranks(hit.rank, prev.rank) { { best: Some(hit), allowed: acc.allowed } }
-    else { acc },
+fn take<a>(accumulator: Search<a>, hit: RouteMatch<a>) -> Search<a> =
+  match accumulator.best {
+    None -> { best: Some(hit), allowed: accumulator.allowed },
+    Some(current_best) -> if outranks(hit.rank, current_best.rank) {
+      { best: Some(hit), allowed: accumulator.allowed }
+    } else { accumulator },
   }
 
 fn search_result<a>(s: Search<a>) -> RouteResult<a> =
@@ -91,70 +87,67 @@ fn search_result<a>(s: Search<a>) -> RouteResult<a> =
     else { MethodNotAllowed(sorted_methods(s.allowed)) },
   }
 
-/// A `Rest` consumes what is left and ignores later pattern segments, which `well_formed` reports.
 fn capture(
   pattern: List<Segment>,
   segments: List<String>,
-  acc: Map<String, String>,
+  accumulator: Map<String, String>,
 ) -> Option<Map<String, String>> / {abort.raise} =
   match pattern {
-    [] -> if segments.len() == 0 { Some(acc) } else { None },
-    [first, ..rest] -> capture_one(first, rest, segments, acc),
+    [] -> if segments.len() == 0 { Some(accumulator) } else { None },
+    [first, ..rest] -> capture_one(first, rest, segments, accumulator),
   }
 
 fn capture_one(
   first: Segment,
   rest: List<Segment>,
   segments: List<String>,
-  acc: Map<String, String>,
+  accumulator: Map<String, String>,
 ) -> Option<Map<String, String>> / {abort.raise} =
   match first {
-    Rest(name) -> Some(acc.insert(name, join_segments(segments))),
-    Literal(text) -> capture_literal(text, rest, segments, acc),
-    Param(name) -> capture_param(name, rest, segments, acc),
-    Typed(binding) -> capture_typed(binding, rest, segments, acc),
+    Rest(name) -> Some(accumulator.insert(name, join_segments(segments))),
+    Literal(text) -> capture_literal(text, rest, segments, accumulator),
+    Param(name) -> capture_param(name, rest, segments, accumulator),
+    Typed(binding) -> capture_typed(binding, rest, segments, accumulator),
   }
 
 fn capture_literal(
   text: String,
   rest: List<Segment>,
   segments: List<String>,
-  acc: Map<String, String>,
+  accumulator: Map<String, String>,
 ) -> Option<Map<String, String>> / {abort.raise} =
   match segments {
     [] -> None,
-    [s, ..more] -> if s == text { capture(rest, more, acc) } else { None },
+    [s, ..more] -> if s == text { capture(rest, more, accumulator) } else { None },
   }
 
 fn capture_param(
   name: String,
   rest: List<Segment>,
   segments: List<String>,
-  acc: Map<String, String>,
+  accumulator: Map<String, String>,
 ) -> Option<Map<String, String>> / {abort.raise} =
-  match segments { [] -> None, [s, ..more] -> capture(rest, more, acc.insert(name, s)) }
+  match segments { [] -> None, [s, ..more] -> capture(rest, more, accumulator.insert(name, s)) }
 
 fn capture_typed(
   binding: Binding,
   rest: List<Segment>,
   segments: List<String>,
-  acc: Map<String, String>,
+  accumulator: Map<String, String>,
 ) -> Option<Map<String, String>> / {abort.raise} =
   match segments {
     [] -> None,
-    [s, ..more] -> if parses(s, binding.kind) { capture(rest, more, acc.insert(binding.name, s)) }
-    else { None },
+    [s, ..more] -> if parses(s, binding.kind) {
+      capture(rest, more, accumulator.insert(binding.name, s))
+    } else { None },
   }
 
-/// The match-time check and the read-time parse share code, so a match always reads back.
 fn parses(text: String, kind: ParamType) -> Bool / {abort.raise} =
   match kind {
     IntParam -> match int_of_text(text) { Some(_) -> true, None -> false },
     DecimalParam -> match decimal_of_text(text) { Some(_) -> true, None -> false },
     BoolParam -> match bool_of_text(text) { Some(_) -> true, None -> false },
   }
-
-// --- Reading a parameter ----------------------------------------------------
 
 /// What the matched route captured under `name`, as text.
 pub fn param(params: Map<String, String>, name: String) -> Option<String> = params.get(name)
@@ -163,37 +156,42 @@ pub fn param(params: Map<String, String>, name: String) -> Option<String> = para
 pub fn param_or(params: Map<String, String>, name: String, fallback: String) -> String =
   match params.get(name) { Some(t) -> t, None -> fallback }
 
-/// `Some` for every parameter the matched route declared `IntParam`.
+/// Returns the parameter `name` parsed as an `Int`. Returns `None` when the route captured nothing
+/// under `name` or the text is not a valid `Int` as `int_of_text` defines it. A parameter declared
+/// `IntParam` always parses.
 pub fn int_param(params: Map<String, String>, name: String) -> Option<Int> / {abort.raise} =
   match params.get(name) { Some(t) -> int_of_text(t), None -> None }
 
-/// `int_param`, or `fallback`.
+/// Returns the parameter `name` parsed as an `Int`, or `fallback` when `int_param` returns `None`.
 pub fn int_param_or(
   params: Map<String, String>,
   name: String,
   fallback: Int,
 ) -> Int / {abort.raise} = match int_param(params, name) { Some(n) -> n, None -> fallback }
 
-/// `Some` for every parameter the matched route declared `DecimalParam`.
+/// Returns the parameter `name` parsed as a `Decimal`. Returns `None` when the route captured
+/// nothing under `name` or the text is not a valid `Decimal` as `decimal_of_text` defines it. A
+/// parameter declared `DecimalParam` always parses.
 pub fn decimal_param(params: Map<String, String>, name: String) -> Option<Decimal> / {abort.raise} =
   match params.get(name) { Some(t) -> decimal_of_text(t), None -> None }
 
-/// `decimal_param`, or `fallback`.
+/// Returns the parameter `name` parsed as a `Decimal`, or `fallback` when `decimal_param` returns
+/// `None`.
 pub fn decimal_param_or(
   params: Map<String, String>,
   name: String,
   fallback: Decimal,
 ) -> Decimal / {abort.raise} = match decimal_param(params, name) { Some(d) -> d, None -> fallback }
 
-/// `Some` for every parameter the matched route declared `BoolParam`.
+/// Returns the parameter `name` parsed as a `Bool`. Returns `None` when the route captured nothing
+/// under `name` or the text is not `true` or `false`. A parameter declared `BoolParam` always
+/// parses.
 pub fn bool_param(params: Map<String, String>, name: String) -> Option<Bool> =
   match params.get(name) { Some(t) -> bool_of_text(t), None -> None }
 
-/// `bool_param`, or `fallback`.
+/// Returns the parameter `name` parsed as a `Bool`, or `fallback` when `bool_param` returns `None`.
 pub fn bool_param_or(params: Map<String, String>, name: String, fallback: Bool) -> Bool =
   match bool_param(params, name) { Some(b) -> b, None -> fallback }
-
-// --- Parameter syntax -------------------------------------------------------
 
 /// Parses an `Int` from its one canonical text: no `+`, no leading zeros, no `-0`, no whitespace
 /// and no exponent.
@@ -212,16 +210,14 @@ fn whole(raw: Bytes, start: Int, n: Int) -> Bool / {abort.raise} = {
   end == n && digits_are_canonical(raw, start, end) && !negative_zero(raw, start, end)
 }
 
-/// A single `0` is the only run of digits that may begin with one.
 fn digits_are_canonical(raw: Bytes, start: Int, end: Int) -> Bool / {abort.raise} =
   if end <= start { false } else if raw.at(start) != 48 { true } else { end - start == 1 }
 
-/// The second way to write zero, rejected so that an `Int` parameter and its text stay in
-/// bijection.
 fn negative_zero(raw: Bytes, start: Int, end: Int) -> Bool / {abort.raise} =
   start == 1 && end - start == 1 && raw.at(start) == 48
 
-/// The same grammar with an optional fraction.
+/// Parses a `Decimal` from its canonical text, or returns `None`. The text follows the `Int` rules
+/// in `int_of_text`, and may add a fraction: a `.` followed by at least one digit.
 pub fn decimal_of_text(text: String) -> Option<Decimal> / {abort.raise} =
   if canonical_decimal(Bytes::of_string(text)) { Decimal::of_string(text) } else { None }
 
@@ -244,9 +240,9 @@ pub fn bool_of_text(text: String) -> Option<Bool> =
 
 fn digits() -> Bytes = b"0123456789"
 
-// --- Precedence -------------------------------------------------------------
-
-/// At the first position the kinds differ, `Literal` > `Typed` > `Param` > `Rest`, and absent loses.
+/// Returns whether pattern `x` ranks above pattern `y`. Segments are compared left to right. At the
+/// first position where their kinds differ, the higher kind wins, in the order `Literal`, `Typed`,
+/// `Param`, `Rest`. If one pattern runs out of segments first, the longer pattern wins.
 pub fn more_specific(x: List<Segment>, y: List<Segment>) -> Bool = outranks(ranks(x), ranks(y))
 
 fn ranks(pattern: List<Segment>) -> List<Int> = pattern.map(|s: Segment| kind_rank(s))
@@ -260,28 +256,25 @@ fn outranks(x: List<Int>, y: List<Int>) -> Bool =
     [a, ..xs] -> match y { [] -> true, [b, ..ys] -> if a == b { outranks(xs, ys) } else { a > b } },
   }
 
-// --- The table as a value: what being data buys -----------------------------
-
 /// Every pair of entries that can match one path at equal precedence, so the earlier silently wins.
 pub fn conflicts<a>(table: List<Route<a>>) -> List<{ first: Int, second: Int }> / {} =
   pairs(indexed_routes(table), [])
 
 fn pairs<a>(
   entries: List<IndexedRoute<a>>,
-  acc: List<{ first: Int, second: Int }>,
+  accumulator: List<{ first: Int, second: Int }>,
 ) -> List<{ first: Int, second: Int }> =
   match entries {
-    [] -> acc,
+    [] -> accumulator,
     [x, ..rest] ->
       pairs(
         rest,
-        rest.fold(acc, |found: List<{ first: Int, second: Int }>, y: IndexedRoute<a>|
+        rest.fold(accumulator, |found: List<{ first: Int, second: Int }>, y: IndexedRoute<a>|
           if ambiguous(x.route, y.route) { found.push({ first: x.index, second: y.index }) }
           else { found }),
       ),
   }
 
-/// Some path matches both at equal precedence: same method, and equal, overlapping kinds throughout.
 fn ambiguous<a>(x: Route<a>, y: Route<a>) -> Bool =
   x.method == y.method && overlapping_patterns(x.path, y.path)
 
@@ -302,7 +295,6 @@ fn overlapping(x: Segment, y: Segment) -> Bool =
     Typed(p) -> match y { Typed(q) -> kinds_overlap(p.kind, q.kind), _ -> false },
   }
 
-/// Every integer text is a decimal text; nothing that parses as a `Bool` parses as either.
 fn kinds_overlap(p: ParamType, q: ParamType) -> Bool =
   match p {
     BoolParam -> match q { BoolParam -> true, _ -> false },
@@ -310,10 +302,15 @@ fn kinds_overlap(p: ParamType, q: ParamType) -> Bool =
     DecimalParam -> match q { BoolParam -> false, _ -> true },
   }
 
-/// A `Rest` not last, a name bound twice, a nameless binder, or no segments, which matches nothing.
+/// Returns every fault found in the table, each with the index of its route and a reason. The
+/// faults are a `Rest` segment that is not last, a name bound by more than one segment, a segment
+/// with an empty name, and a pattern with no segments, which can match no path.
 pub fn well_formed<a>(table: List<Route<a>>) -> List<{ index: Int, reason: String }> / {} =
-  indexed_routes(table).fold([], |acc: List<{ index: Int, reason: String }>, e: IndexedRoute<a>|
-    concat_faults(acc, faults(e.index, e.route.path)))
+  indexed_routes(table).fold(
+    [],
+    |accumulator: List<{ index: Int, reason: String }>, e: IndexedRoute<a>|
+      concat_faults(accumulator, faults(e.index, e.route.path)),
+  )
 
 fn faults(index: Int, pattern: List<Segment>) -> List<{ index: Int, reason: String }> =
   concat_faults(shape_faults(index, pattern), name_faults(index, binder_names(pattern)))
@@ -335,8 +332,8 @@ fn rest_is_early(pattern: List<Segment>) -> Bool =
 fn is_rest(s: Segment) -> Bool = match s { Rest(_) -> true, _ -> false }
 
 reuse fn binder_names(pattern: List<Segment>) -> List<String> =
-  pattern.fold([], |acc: List<String>, s: Segment|
-    match binder_name(s) { Some(n) -> acc.push(n), None -> acc })
+  pattern.fold([], |accumulator: List<String>, s: Segment|
+    match binder_name(s) { Some(n) -> accumulator.push(n), None -> accumulator })
 
 fn binder_name(s: Segment) -> Option<String> =
   match s {
@@ -346,14 +343,13 @@ fn binder_name(s: Segment) -> Option<String> =
     Rest(name) -> Some(name),
   }
 
-/// Through a `Map`, so faults come in name order whatever order the segments were written in.
 fn name_faults(index: Int, names: List<String>) -> List<{ index: Int, reason: String }> = {
-  let counts = names.fold(Map::new(), |acc: Map<String, Int>, n: String|
-    acc.insert(n, count_of(acc, n) + 1));
+  let counts = names.fold(Map::new(), |accumulator: Map<String, Int>, n: String|
+    accumulator.insert(n, count_of(accumulator, n) + 1));
   counts.entries().fold(
     [],
-    |acc: List<{ index: Int, reason: String }>, e: { key: String, value: Int }|
-      concat_faults(acc, name_fault(index, e)),
+    |accumulator: List<{ index: Int, reason: String }>, e: { key: String, value: Int }|
+      concat_faults(accumulator, name_fault(index, e)),
   )
 }
 
@@ -370,21 +366,25 @@ reuse fn concat_faults(
   x: List<{ index: Int, reason: String }>,
   y: List<{ index: Int, reason: String }>,
 ) -> List<{ index: Int, reason: String }> =
-  y.fold(x, |acc: List<{ index: Int, reason: String }>, f: { index: Int, reason: String }|
-    acc.push(f))
+  y.fold(
+    x,
+    |accumulator: List<{ index: Int, reason: String }>, f: { index: Int, reason: String }|
+      accumulator.push(f),
+  )
 
 type IndexedRoute<a> = { index: Int, route: Route<a> }
 
 type IndexingState<a> = { out: List<IndexedRoute<a>>, next: Int }
 
-/// `out` is last in the literal: a growing container built anywhere else is copied at every step.
 fn indexed_routes<a>(table: List<Route<a>>) -> List<IndexedRoute<a>> =
-  table.fold({ next: 0, out: [] }, |acc: IndexingState<a>, r: Route<a>|
-    { next: acc.next + 1, out: acc.out.push({ index: acc.next, route: r }) }).out
+  table.fold({ next: 0, out: [] }, |accumulator: IndexingState<a>, r: Route<a>|
+    {
+      next: accumulator.next + 1,
+      out: accumulator.out.push({ index: accumulator.next, route: r }),
+    }).out
 
-// --- The surface a service can print ----------------------------------------
-
-/// One route as a service prints its surface: method, pattern and the endpoint's name.
+/// One row in a listing of a table: a route's method, its pattern as text, and the name of its
+/// endpoint.
 pub type Listing = { method: http::Method, pattern: String, endpoint: String }
 
 /// Each route of the table, its endpoint named by `show`.
@@ -395,7 +395,8 @@ pub fn listing<a | e>(
   table.map(|r: Route<a>|
     { method: r.method, pattern: pattern_to_string(r.path), endpoint: show(r.endpoint) })
 
-/// Each route as a line, `GET /orders/{id:Int} -> show_order`.
+/// Returns one line of text for each route in the table, made from its method, pattern and endpoint
+/// name as `show` gives it.
 pub fn route_lines<a | e>(
   table: List<Route<a>>,
   show: (a) -> String / e,
@@ -408,8 +409,11 @@ pub fn route_lines<a | e>(
 pub fn allowed<a>(table: List<Route<a>>, path: String) -> List<http::Method> / {abort.raise} = {
   let segments = path_segments(path);
   sorted_methods(
-    table.fold([], |acc: List<http::Method>, r: Route<a>|
-      match capture(r.path, segments, Map::new()) { None -> acc, Some(_) -> acc.push(r.method) }),
+    table.fold([], |accumulator: List<http::Method>, r: Route<a>|
+      match capture(r.path, segments, Map::new()) {
+        None -> accumulator,
+        Some(_) -> accumulator.push(r.method),
+      }),
   )
 }
 
@@ -417,11 +421,10 @@ pub fn allowed<a>(table: List<Route<a>>, path: String) -> List<http::Method> / {
 pub fn declared_methods<a>(table: List<Route<a>>) -> List<http::Method> / {} =
   sorted_methods(table.map(|r: Route<a>| r.method))
 
-/// Sorted by `Map` order, so `Allow` depends on the table and not on declaration order.
 fn sorted_methods(ms: List<http::Method>) -> List<http::Method> =
-  ms.fold(Map::new(), |acc: Map<http::Method, Unit>, m: http::Method| acc.insert(m, ())).keys()
-
-// --- Paths ------------------------------------------------------------------
+  ms.fold(Map::new(), |accumulator: Map<http::Method, Unit>, m: http::Method|
+    accumulator.insert(m, ())).keys(
+  )
 
 /// The path split on `/`, then each segment decoded, in that order.
 pub fn path_segments(path: String) -> List<String> / {abort.raise} =
@@ -434,13 +437,12 @@ pub fn split_path(path: String) -> List<String> =
 fn drop_leading(parts: List<String>, leading: Bool) -> List<String> =
   if leading { match parts { [_, ..rest] -> rest, [] -> [] } } else { parts }
 
-/// Rejoined with `/`, so `a/b` and `a%2Fb` capture the same text.
 fn join_segments(segments: List<String>) -> String / {abort.raise} =
   String::of_bytes(Bytes::join(segments.map(|s: String| Bytes::of_string(s)), b"/"))
 
-// --- Percent-encoding -------------------------------------------------------
-
-/// Per segment and after splitting, so a `%2F` can never introduce a boundary.
+/// Returns `text` with each `%XX` escape replaced by the byte it names. Returns `text` unchanged if
+/// the decoded bytes are not valid UTF-8. Decode a single path segment after splitting the path on
+/// `/`, so that `%2F` never splits a segment.
 pub fn percent_decode(text: String) -> String / {abort.raise} = {
   let raw = Bytes::of_string(text);
   match raw.index_of_byte(37) { None -> text, Some(_) -> as_text(text, decoded_bytes(raw)) }
@@ -449,7 +451,6 @@ pub fn percent_decode(text: String) -> String / {abort.raise} = {
 fn as_text(original: String, decoded: Bytes) -> String / {abort.raise} =
   if decoded.is_utf8() { String::of_bytes(decoded) } else { original }
 
-/// Not recursive per escape, so a long run of escapes takes no more stack than a short one.
 fn decoded_bytes(raw: Bytes) -> Bytes / {abort.raise} = {
   let hex = hex_table();
   let table = byte_table();
@@ -460,7 +461,6 @@ fn decoded_bytes(raw: Bytes) -> Bytes / {abort.raise} = {
   }
 }
 
-/// The split leaves an escape's two digits at the start of its part; a shorter part is a bad escape.
 fn decode_escape(part: Bytes, hex: Bytes, table: Bytes) -> Bytes / {abort.raise} = {
   let n = part.len();
   let hi = if n < 2 { 0 } else { hex.at(part.at(0)) };
@@ -470,7 +470,6 @@ fn decode_escape(part: Bytes, hex: Bytes, table: Bytes) -> Bytes / {abort.raise}
   else { table.slice((hi - 1) * 16 + lo - 1, (hi - 1) * 16 + lo).concat(part.slice(2, n)) }
 }
 
-/// A byte's hex value plus one, or `0` for a non-hex byte, so "not a digit" and "zero" differ.
 fn hex_table() -> Bytes =
   b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x00\x00\x00\x00\x00\x00\x00\x0b\x0c\x0d\x0e\x0f\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0b\x0c\x0d\x0e\x0f\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 
@@ -490,7 +489,6 @@ pub fn percent_encode(text: String) -> String / {abort.raise} = {
 fn encode_byte(c: Int, escapes: Bytes, table: Bytes) -> Bytes / {abort.raise} =
   match escapes.index_of_byte(c) { Some(_) -> escaped(c), None -> table.slice(c, c + 1) }
 
-/// Bytes that could change how a path is split or decoded, plus control bytes and space.
 fn must_encode() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x7f%/?#"
 
@@ -501,13 +499,13 @@ fn hex_char(v: Int) -> Bytes / {abort.raise} = b"0123456789ABCDEF".slice(v, v + 
 fn byte_table() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
 
-// --- Normalization, which the program requests -------------------------------
-
-/// Drops empty and `.` segments, resolves `..` within the root, and re-encodes so `route` agrees.
+/// Returns the canonical form of `path`. Empty and `.` segments are dropped, and `..` removes the
+/// previous segment (at the root it does nothing). Each segment is percent-decoded before `..` is
+/// resolved and then encoded again, so `route` splits the result into the same segments as the
+/// original path.
 pub fn normalize_path(path: String) -> String / {abort.raise} =
   "/" ++ join_segments(remove_dot_segments(path_segments(path)).map(|s: String| percent_encode(s)))
 
-/// Keyed by depth: dropping a `List`'s last element costs its length, making `..` runs quadratic.
 type Stack = { items: Map<Int, String>, depth: Int }
 
 fn remove_dot_segments(segments: List<String>) -> List<String> = {
@@ -521,11 +519,8 @@ fn step_segment(st: Stack, s: String) -> Stack =
   else if s == ".." { { items: st.items, depth: if st.depth > 0 { st.depth - 1 } else { 0 } } }
   else { { items: st.items.insert(st.depth, s), depth: st.depth + 1 } }
 
-/// Every index below `depth` was written; the fallback keeps this total rather than panicking.
 fn stack_at(items: Map<Int, String>, i: Int) -> String =
   match items.get(i) { Some(s) -> s, None -> "" }
-
-// --- Patterns as text -------------------------------------------------------
 
 /// Parses a pattern from text. A segment is a literal, `{name}` for a parameter, `{name:Type}` for
 /// a typed parameter, or `{..name}` for the rest. Raises for an unknown type.
@@ -545,14 +540,14 @@ fn binder_of_string(inner: String) -> Segment / {abort.raise} =
 fn typed_of_string(inner: String, colon: Int) -> Segment / {abort.raise} =
   Typed({ name: inner.slice(0, colon), kind: kind_of_string(inner.slice(colon + 1, inner.len())) })
 
-/// A misspelled type panics rather than becoming a literal that silently never matches.
 fn kind_of_string(name: String) -> ParamType / {abort.raise} =
   if name == "Int" { IntParam }
   else if name == "Decimal" { DecimalParam }
   else if name == "Bool" { BoolParam }
   else { panic("`" ++ name ++ "` names no parameter type; they are `Int`, `Decimal` and `Bool`") }
 
-/// The pattern as `pattern_of_string` reads it back.
+/// Returns the text form of `pattern`. `pattern_of_string` parses that text back into the same
+/// pattern.
 pub fn pattern_to_string(pattern: List<Segment>) -> String / {abort.raise} =
   "/" ++ join_segments(pattern.map(|s: Segment| segment_to_string(s)))
 
@@ -567,9 +562,6 @@ fn segment_to_string(s: Segment) -> String =
 fn kind_to_string(kind: ParamType) -> String =
   match kind { IntParam -> "Int", DecimalParam -> "Decimal", BoolParam -> "Bool" }
 
-// --- Properties -------------------------------------------------------------
-
-/// Generates a `Segment` for a test.
 fn segments() -> gen::Gen<Segment> =
   gen::one_of([
     gen::map(gen::text(), |f0: String| Literal(f0)),
@@ -578,11 +570,9 @@ fn segments() -> gen::Gen<Segment> =
     gen::map(gen::text(), |f0: String| Rest(f0)),
   ])
 
-/// Generates a `Binding` for a test.
 fn bindings() -> gen::Gen<Binding> =
   gen::map2(gen::text(), param_types(), |name: String, kind: ParamType| { name: name, kind: kind })
 
-/// Generates a `ParamType` for a test.
 fn param_types() -> gen::Gen<ParamType> = gen::elements([IntParam, DecimalParam, BoolParam])
 
 test "decoding undoes encoding" {
@@ -594,8 +584,6 @@ test "two patterns cannot each be more specific than the other" {
     !(more_specific(x, y) && more_specific(y, x))
   })
 }
-
-// --- Tests ------------------------------------------------------------------
 
 type Endpoint = | ListOrders | CreateOrder | GetOrder | GetOrderLines | LatestOrder | Files | Health
 
@@ -630,7 +618,7 @@ fn params_of(m: RouteResult<Endpoint>) -> Map<String, String> / {abort.raise} =
 
 fn get(path: String) -> RouteResult<Endpoint> / {abort.raise} = route(table(), http::Get, path)
 
-test "the table this module tests with is unambiguous and well formed" {
+test "the example route table has no conflicting entries and no malformed entries" {
   assert_eq(conflicts(table()), []);
   assert_eq(well_formed(table()), [])
 }
@@ -659,15 +647,14 @@ test "a parameter that does not parse is not a match" {
   assert_eq(get("/orders/99999999999999999999999999999999"), NotFound)
 }
 
-test "a wildcard captures the rest, joined, and zero segments is enough" {
+test "a wildcard segment captures the remaining segments joined by slashes, and may capture none" {
   assert_eq(found(get("/files/a/b/c.txt")), Files);
   assert_eq(param(params_of(get("/files/a/b/c.txt")), "rest"), Some("a/b/c.txt"));
   assert_eq(param(params_of(get("/files")), "rest"), Some(""));
   assert_eq(param(params_of(get("/files/")), "rest"), Some(""))
 }
 
-// A program that treats a `Rest` capture as a path must normalize it itself.
-test "a wildcard capture does not show where its segment boundaries were" {
+test "a wildcard segment captures the decoded text, so `a%2Fb` gives the same capture as `a/b`" {
   assert_eq(
     param(params_of(get("/files/a%2Fb")), "rest"),
     param(params_of(get("/files/a/b")), "rest"),
@@ -687,7 +674,6 @@ test "literal beats typed beats parameter beats wildcard, left to right" {
   assert_eq(found(route(t, http::Get, "/orders/a/b")), Files)
 }
 
-// Left to right, so a literal in a later position does not rescue a parameter in an earlier one.
 test "precedence is decided at the first position where two patterns differ" {
   let t = [
     { method: http::Get, path: pattern_of_string("/{a}/lines"), endpoint: GetOrderLines },
@@ -698,8 +684,7 @@ test "precedence is decided at the first position where two patterns differ" {
   assert_eq(more_specific(pattern_of_string("/{a}/lines"), pattern_of_string("/orders/{b}")), false)
 }
 
-// Why `/files/{..rest}` loses to `/files/{name}` on a path both match.
-test "a longer pattern wins at a position the shorter one does not have" {
+test "a request for `/files` matches the shorter pattern `/files`, not the longer wildcard pattern `/files/{..rest}`" {
   let t = [
     { method: http::Get, path: pattern_of_string("/files"), endpoint: Health },
     { method: http::Get, path: pattern_of_string("/files/{..rest}"), endpoint: Files },
@@ -707,7 +692,7 @@ test "a longer pattern wins at a position the shorter one does not have" {
   assert_eq(found(route(t, http::Get, "/files")), Files)
 }
 
-test "a tie goes to the earlier entry, and conflicts reports it" {
+test "a tie between two patterns routes to the earlier entry, and `conflicts` reports that pair" {
   let t = [
     { method: http::Get, path: pattern_of_string("/orders/{id}"), endpoint: GetOrder },
     { method: http::Get, path: pattern_of_string("/orders/{name}"), endpoint: ListOrders },
@@ -717,7 +702,7 @@ test "a tie goes to the earlier entry, and conflicts reports it" {
   assert_eq(conflicts(t), [{ first: 0, second: 1 }])
 }
 
-test "conflicts reports only pairs some path can reach" {
+test "`conflicts` reports a pair only when some path matches both patterns with equal precedence" {
   assert_eq(
     conflicts([
       { method: http::Get, path: pattern_of_string("/a"), endpoint: Health },
@@ -725,7 +710,6 @@ test "conflicts reports only pairs some path can reach" {
     ]),
     [],
   );
-  // Different kinds are ordered by precedence, so they never tie.
   assert_eq(
     conflicts([
       { method: http::Get, path: pattern_of_string("/{id:Int}"), endpoint: GetOrder },
@@ -733,7 +717,6 @@ test "conflicts reports only pairs some path can reach" {
     ]),
     [],
   );
-  // Nothing parses as both a `Bool` and an `Int`.
   assert_eq(
     conflicts([
       { method: http::Get, path: pattern_of_string("/{id:Int}"), endpoint: GetOrder },
@@ -741,7 +724,6 @@ test "conflicts reports only pairs some path can reach" {
     ]),
     [],
   );
-  // Every integer text is a decimal text, so these two do tie.
   assert_eq(
     conflicts([
       { method: http::Get, path: pattern_of_string("/{id:Int}"), endpoint: GetOrder },
@@ -760,8 +742,7 @@ test "a path no route matches is not found" {
   assert_eq(well_formed([]), [])
 }
 
-// A route whose parameter must be non-empty should use a `Typed`, where empty text does not parse.
-test "a parameter binds an empty segment and a typed one does not" {
+test "an untyped parameter captures an empty segment, but an `Int` parameter does not match one" {
   let t = [
     { method: http::Get, path: pattern_of_string("/users/{name}"), endpoint: ListOrders },
     { method: http::Get, path: pattern_of_string("/orders/{id:Int}"), endpoint: GetOrder },
@@ -770,7 +751,7 @@ test "a parameter binds an empty segment and a typed one does not" {
   assert_eq(route(t, http::Get, "/orders/"), NotFound)
 }
 
-test "a Rest that is not last consumes the rest anyway" {
+test "a `Rest` segment that is not last still captures all remaining segments, and `well_formed` reports the misplaced `Rest` segment" {
   let t = [{ method: http::Get, path: [Rest("r"), Literal("x")], endpoint: Files }];
   assert_eq(found(route(t, http::Get, "/a/b")), Files);
   assert_eq(param(params_of(route(t, http::Get, "/a/b")), "r"), Some("a/b"));
@@ -794,8 +775,7 @@ test "the allowed methods are deduplicated" {
   assert_eq(declared_methods(t), [http::Get, http::Post])
 }
 
-// The rule that decides whether a route and an authorization check can disagree.
-test "percent-decoding happens after splitting and introduces no boundary" {
+test "`path_segments` splits on slashes before percent-decoding, so `%2F` stays inside one segment" {
   assert_eq(path_segments("/a%2Fb"), ["a/b"]);
   assert_eq(path_segments("/a/b"), ["a", "b"]);
   assert_eq(path_segments("/a%2Fb").len(), 1);
@@ -811,11 +791,10 @@ test "an invalid escape is left as written" {
   assert_eq(percent_decode("a%20b%"), "a b%");
   assert_eq(percent_decode("%41%42"), "AB");
   assert_eq(percent_decode("%c3%a9"), "é");
-  // A pair of escapes that is not UTF-8 leaves the segment exactly as it was.
   assert_eq(percent_decode("%ff"), "%ff")
 }
 
-test "empty segments are kept, so a trailing slash is a different path" {
+test "`path_segments` preserves empty segments, so `/orders` and `/orders/` route to different endpoints" {
   assert_eq(path_segments("/orders/"), ["orders", ""]);
   assert_eq(path_segments("/a//b"), ["a", "", "b"]);
   assert_eq(path_segments("/"), [""]);
@@ -832,7 +811,7 @@ test "matching is byte-exact and case-sensitive" {
   assert_eq(get("/health "), NotFound)
 }
 
-test "well_formed reports the patterns that cannot mean what they say" {
+test "`well_formed` reports entries that can never match as written, such as a misplaced `Rest` or a repeated name" {
   assert_eq(
     well_formed([{ method: http::Get, path: [Rest("rest"), Literal("x")], endpoint: Files }]),
     [{ index: 0, reason: "a `Rest` segment captures what is left, so it must be the last one" }],
@@ -851,7 +830,6 @@ test "well_formed reports the patterns that cannot mean what they say" {
     { index: 0, reason: "a segment binds a parameter with no name" },
   ]);
 
-  // A name repeated across `Typed` and `Rest` is one fault, indexed by entry, not segment.
   assert_eq(
     well_formed([
       { method: http::Get, path: pattern_of_string("/ok"), endpoint: Health },
@@ -874,7 +852,7 @@ test "a pattern written as text is the same value read back" {
   assert_eq(pattern_of_string("/a{b}c"), [Literal("a{b}c")])
 }
 
-test "a table can describe its own surface" {
+test "`route_lines` and `listing` describe each table entry as its method, pattern and endpoint name" {
   assert_eq(route_lines(table(), |e: Endpoint| endpoint_name(e)), [
     "GET /health -> Health",
     "GET /orders -> ListOrders",
@@ -906,7 +884,7 @@ fn endpoint_name(e: Endpoint) -> String =
     Health -> "Health",
   }
 
-test "an unrecognised method reaches routing and is handled there" {
+test "`route` returns `MethodNotAllowed` for an unrecognised method with no table entry, and matches the entry when the table has one" {
   assert_eq(
     route(table(), http::Other("BREW"), "/orders"),
     MethodNotAllowed([http::Get, http::Post]),
@@ -915,7 +893,7 @@ test "an unrecognised method reaches routing and is handled there" {
   assert_eq(found(route(t, http::Other("BREW"), "/coffee")), Health)
 }
 
-test "the canonical integer is the only text that names it" {
+test "`int_of_text` parses only the canonical decimal form of an integer and returns `None` for any other text" {
   assert_eq(int_of_text("0"), Some(0));
   assert_eq(int_of_text("-7"), Some(-7));
   assert_eq(int_of_text("2147483648"), Some(2147483648));
@@ -952,16 +930,14 @@ test "a decimal and a bool parameter match only what parses" {
   assert_eq(route(t, http::Get, "/flag/1"), NotFound)
 }
 
-test "normalization is the program's call, and it decodes before it cancels" {
+test "`normalize_path` percent-decodes before removing `.` and `..` segments, and keeps an encoded slash inside one segment" {
   assert_eq(normalize_path("/a//b/"), "/a/b");
   assert_eq(normalize_path("/a/./b"), "/a/b");
   assert_eq(normalize_path("/a/../b"), "/b");
   assert_eq(normalize_path("/../../b"), "/b");
   assert_eq(normalize_path("/"), "/");
   assert_eq(normalize_path("/a/.."), "/");
-  // The bypass a normalizer that worked on the raw text would leave behind.
   assert_eq(normalize_path("/a/%2e%2e/b"), "/b");
-  // What was one segment stays one segment, and routes the same either way.
   assert_eq(normalize_path("/a%2Fb"), "/a%2Fb");
   assert_eq(path_segments(normalize_path("/a%2Fb")), ["a/b"]);
   assert_eq(normalize_path("/a b"), "/a%20b");
@@ -976,8 +952,6 @@ test "an encoded segment survives a round trip whatever it contains" {
   assert_eq(split_path("/" ++ percent_encode("a/b/c")).len(), 1)
 }
 
-// --- Tests: adversarial paths -------------------------------------------------
-
 type Guarded = | Admin | Wild | Item | Slug | Posted | Deleted | Any | One
 
 fn guarded() -> List<Route<Guarded>> / {abort.raise} =
@@ -990,8 +964,6 @@ fn guarded() -> List<Route<Guarded>> / {abort.raise} =
     { method: http::Delete, path: pattern_of_string("/orders/{slug}"), endpoint: Deleted },
   ]
 
-/// The same six routes written in the opposite order: a table is a value, so "the same table" is a
-/// claim a test can make.
 fn guarded_reversed() -> List<Route<Guarded>> / {abort.raise} = guarded().reverse()
 
 fn guarded_get(path: String) -> RouteResult<Guarded> / {abort.raise} =
@@ -1010,7 +982,7 @@ test "a dot-dot segment never leaves the route it was matched against" {
   assert_eq(found(guarded_get("/admin")), Admin)
 }
 
-test "an encoded dot is a dot and is still only a segment" {
+test "an encoded dot (`%2e`) decodes to a dot segment, so `..` cannot be used to escape a route" {
   assert_eq(path_segments("/public/%2e%2e/admin"), ["public", "..", "admin"]);
   assert_eq(path_segments("/public/%2E%2E/admin"), ["public", "..", "admin"]);
   assert_eq(guarded_get("/public/%2e%2e/admin"), NotFound);
@@ -1032,13 +1004,13 @@ test "an encoded separator is a byte inside one segment" {
   assert_eq(guarded_get("/files%2F..%2F..%2Fetc"), NotFound)
 }
 
-test "a null byte is a byte and matches no literal that lacks one" {
+test "a percent-encoded null byte is part of the segment, so `/admin%00` does not match the literal `admin`" {
   assert_eq(guarded_get("/admin%00"), NotFound);
   assert_eq(path_segments("/admin%00").len(), 1);
   assert_eq(captured_param(guarded_get("/orders/x%00"), "slug"), "x\0")
 }
 
-test "the reversed table routes every path the same way" {
+test "a table with its entries in reverse order returns the same `route` result as the original table for every tested path" {
   assert_eq(conflicts(guarded()), []);
   assert_eq(conflicts(guarded_reversed()), []);
   assert_eq(well_formed(guarded()), []);
@@ -1065,7 +1037,7 @@ test "the reversed table routes every path the same way" {
     assert_eq(route(guarded(), http::Get, p), route(guarded_reversed(), http::Get, p)))
 }
 
-test "a method that matches beats one that only would have" {
+test "`route` picks the entry whose method matches the request over an earlier entry for another method" {
   let t = [
     { method: http::Post, path: pattern_of_string("/p"), endpoint: Posted },
     { method: http::Get, path: pattern_of_string("/p"), endpoint: Admin },
@@ -1082,7 +1054,7 @@ test "a typed parameter that does not parse falls through rather than 404ing" {
   assert_eq(captured_param(guarded_get("/orders/"), "slug"), "")
 }
 
-test "a wildcard cannot reach outside its prefix" {
+test "a wildcard matches only its own prefix, so `/file`, `/filesx` and `/x/files/a` are not found" {
   assert_eq(found(guarded_get("/files")), Wild);
   assert_eq(found(guarded_get("/files/")), Wild);
   assert_eq(captured_param(guarded_get("/files"), "rest"), "");
@@ -1104,7 +1076,7 @@ test "a wildcard written first shadows nothing that follows it" {
   assert_eq(conflicts(t), [])
 }
 
-test "a route that can only ever lose is a reported conflict" {
+test "`conflicts` reports an entry that is shadowed, because an earlier entry matches the same paths first" {
   let t = [
     { method: http::Get, path: pattern_of_string("/x/{a}"), endpoint: Admin },
     { method: http::Get, path: pattern_of_string("/x/{b}"), endpoint: Slug },
@@ -1159,7 +1131,7 @@ test "a method is matched byte-exactly, so a lowercase token is another method" 
   assert_eq(guarded_get("/Admin"), NotFound)
 }
 
-test "empty segments are kept and a trailing slash is another path" {
+test "`path_segments` preserves empty segments, so `/admin/` and `//admin` do not match `/admin`" {
   assert_eq(path_segments("/"), [""]);
   assert_eq(path_segments("/a//b"), ["a", "", "b"]);
   assert_eq(path_segments("/admin/"), ["admin", ""]);
@@ -1181,27 +1153,23 @@ test "an invalid escape is text rather than an error" {
 }
 
 test "a path with two thousand segments is routed" {
-  let deep = range(0, 2000).fold("", |acc: String, _: Int| acc ++ "/a");
+  let deep = range(0, 2000).fold("", |accumulator: String, _: Int| accumulator ++ "/a");
   assert_eq(path_segments(deep).len(), 2000);
   assert_eq(route(guarded(), http::Get, deep), NotFound);
   assert_eq(captured_param(route(guarded(), http::Get, "/files" ++ deep), "rest").len(), 3999)
 }
 
-// --- Tests: the cost property -----------------------------------------------
-
 fn repeated(s: String, k: Int) -> String = range(0, k).fold(s, |a: String, _: Int| a ++ a)
 
-test "a long run of escapes decodes to a value rather than ending the run" {
+test "`percent_decode` decodes a very long sequence of escapes in full without stopping early" {
   let decoded = percent_decode(repeated("%41", 15));
   assert_eq(decoded.len(), 32768);
   assert_eq(decoded.slice(0, 4), "AAAA");
-  // The same for the encoder, one escape per byte.
   assert_eq(percent_encode(repeated(" ", 15)).len(), 98304)
 }
 
 test "a path of nothing but escapes routes, whatever its length" {
   let t = [{ method: http::Get, path: pattern_of_string("/orders/{id:Int}"), endpoint: GetOrder }];
-  // As long as the default `max_request_line` admits, and all of it escapes.
   assert_eq(route(t, http::Get, "/" ++ repeated("%41%41%41%41%41", 9)), NotFound);
   assert_eq(path_segments("/" ++ repeated("%41", 10)).len(), 1);
   assert_eq(percent_decode(repeated("%41", 10)).len(), 1024)

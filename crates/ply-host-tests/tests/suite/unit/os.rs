@@ -1,6 +1,5 @@
 use ply_host::os::*;
 
-/// What a command of the system's own writes, without its ending.
 fn said(program: &str, args: &[&str]) -> String {
     let done = std::process::Command::new(program)
         .args(args)
@@ -11,7 +10,7 @@ fn said(program: &str, args: &[&str]) -> String {
 
 #[cfg(unix)]
 #[test]
-fn the_process_and_the_machine_return_what_the_systems_own_tools_do() {
+fn the_process_and_machine_information_matches_what_the_operating_system_commands_report() {
     assert_eq!(name().expect("uname returns"), said("uname", &["-sr"]));
     assert_eq!(
         hostname().expect("the kernel names the machine"),
@@ -31,7 +30,7 @@ fn the_process_and_the_machine_return_what_the_systems_own_tools_do() {
 }
 
 #[test]
-fn an_id_no_record_holds_has_no_name() {
+fn a_user_id_that_does_not_exist_has_no_user_name() {
     assert_eq!(user_name(-1), None);
 }
 

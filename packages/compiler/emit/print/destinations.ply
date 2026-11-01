@@ -1,13 +1,13 @@
 import std.map
 import compiler.emit.keys (Callee)
-import compiler.emit.typed_ir (LoopVariable, Fn, Block, Inst, Rvalue, Var, Arg, VarOperand,
-                               Convention, Let, Do, Assign, If, Case, Match, Loop, Next, Done,
-                               Return, Restart, Jump, Handle, Inc, Dec, Reset, Free, Destructure,
-                               Allocate, RecordAllocation, Update, Call, FieldWrite, OwnedResult,
-                               operands, suspends_in)
+import compiler.emit.typed_ir (LoopVariable, Function, Block, Instruction, Rvalue, Variable, Arg,
+                               VariableOperand, Convention, Let, Do, Assign, If, Case, Match, Loop,
+                               Next, Done, Return, Restart, Jump, Handle, Increment, Decrement,
+                               Reset, Free, Destructure, Allocate, RecordAllocation, Update, Call,
+                               FieldWrite, OwnedResult, operands, suspends_in)
 import compiler.emit.print.text (Destinations)
 
-pub fn destinations_of(f: Fn) -> Destinations = {
+pub fn destinations_of(f: Function) -> Destinations = {
   let m = mentions(f.body, false, no_mentions());
   let destined = f.convention.destination_passing && f.convention.returned == OwnedResult
     && f.members.len() == 0;
@@ -34,9 +34,9 @@ fn no_mentions() -> Mentions =
   { reads: Map::new(), releases: Map::new(), taken: Map::new(), inside_handle: Map::new() }
 
 fn mentions(b: Block, inside: Bool, m: Mentions) -> Mentions =
-  b.fold(m, |acc: Mentions, i: Inst| inst_mentions(acc, inside, i))
+  b.fold(m, |accumulator: Mentions, i: Instruction| instruction_mentions(accumulator, inside, i))
 
-fn inst_mentions(m: Mentions, inside: Bool, i: Inst) -> Mentions =
+fn instruction_mentions(m: Mentions, inside: Bool, i: Instruction) -> Mentions =
   match i {
     Let(l) -> released(value_mentions(m, inside, l.value), inside, l.unwind),
     Do(d) -> released(value_mentions(m, inside, d.value), inside, d.unwind),
@@ -51,11 +51,18 @@ fn inst_mentions(m: Mentions, inside: Bool, i: Inst) -> Mentions =
       mentions(
         c.rest,
         inside,
-        c.arms.fold(read(m, inside, c.on, false), |acc: Mentions, a: { when: Int, body: Block }|
-          mentions(a.body, inside, acc)),
+        c.arms.fold(
+          read(m, inside, c.on, false),
+          |accumulator: Mentions, a: { when: Int, body: Block }|
+            mentions(a.body, inside, accumulator),
+        ),
       ),
     Match(x) ->
-      mentions(x.rest, inside, x.arms.fold(m, |acc: Mentions, a: Block| mentions(a, inside, acc))),
+      mentions(
+        x.rest,
+        inside,
+        x.arms.fold(m, |accumulator: Mentions, a: Block| mentions(a, inside, accumulator)),
+      ),
     Loop(l) ->
       mentions(
         l.body,
@@ -69,8 +76,8 @@ fn inst_mentions(m: Mentions, inside: Bool, i: Inst) -> Mentions =
     Jump(e) -> consumed_arguments(m, inside, e.args),
     Handle(h) ->
       released(mentions(h.body, true, consumed_arguments(m, inside, h.args)), inside, h.unwind),
-    Inc(n) -> read(m, inside, n.var, true),
-    Dec(v) -> released(m, inside, [v]),
+    Increment(n) -> read(m, inside, n.var, true),
+    Decrement(v) -> released(m, inside, [v]),
     Reset(r) -> read(m, inside, r.of, true),
     Free(x) -> read_args(read(m, inside, x.of, true), inside, [x.bytes], true),
     Destructure(o) -> read(m, inside, o.of, true),
@@ -78,17 +85,17 @@ fn inst_mentions(m: Mentions, inside: Bool, i: Inst) -> Mentions =
   }
 
 fn value_mentions(m: Mentions, inside: Bool, v: Rvalue) -> Mentions =
-  operands(v).fold(m, |acc: Mentions, o: { arg: Arg, takes: Bool }|
-    read_args(acc, inside, [o.arg], o.takes))
+  operands(v).fold(m, |accumulator: Mentions, o: { arg: Arg, takes: Bool }|
+    read_args(accumulator, inside, [o.arg], o.takes))
 
 fn consumed_arguments(m: Mentions, inside: Bool, args: List<Arg>) -> Mentions =
   read_args(m, inside, args, true)
 
 fn read_args(m: Mentions, inside: Bool, args: List<Arg>, takes: Bool) -> Mentions =
-  args.fold(m, |acc: Mentions, a: Arg|
-    match a { VarOperand(v) -> read(acc, inside, v, takes), _ -> acc })
+  args.fold(m, |accumulator: Mentions, a: Arg|
+    match a { VariableOperand(v) -> read(accumulator, inside, v, takes), _ -> accumulator })
 
-fn read(m: Mentions, inside: Bool, v: Var, takes: Bool) -> Mentions =
+fn read(m: Mentions, inside: Bool, v: Variable, takes: Bool) -> Mentions =
   {
     reads: incremented(m.reads, v.id),
     releases: m.releases,
@@ -96,21 +103,23 @@ fn read(m: Mentions, inside: Bool, v: Var, takes: Bool) -> Mentions =
     inside_handle: if inside { incremented(m.inside_handle, v.id) } else { m.inside_handle },
   }
 
-fn released(m: Mentions, inside: Bool, vs: List<Var>) -> Mentions =
-  vs.fold(m, |acc: Mentions, v: Var|
+fn released(m: Mentions, inside: Bool, vs: List<Variable>) -> Mentions =
+  vs.fold(m, |accumulator: Mentions, v: Variable|
     {
-      ..acc,
-      releases: incremented(acc.releases, v.id),
-      inside_handle: if inside { incremented(acc.inside_handle, v.id) } else { acc.inside_handle },
+      ..accumulator,
+      releases: incremented(accumulator.releases, v.id),
+      inside_handle: if inside { incremented(accumulator.inside_handle, v.id) }
+      else { accumulator.inside_handle },
     })
 
 fn incremented(m: Map<Int, Int>, id: Int) -> Map<Int, Int> =
   m.insert(id, match m.get(id) { Some(n) -> n + 1, None -> 1 })
 
-fn results_in(b: Block, m: Mentions, acc: Map<Int, Bool>) -> Map<Int, Bool> = {
-  let here = b.fold(acc, |found: Map<Int, Bool>, i: Inst|
+fn results_in(b: Block, m: Mentions, accumulator: Map<Int, Bool>) -> Map<Int, Bool> = {
+  let here = b.fold(accumulator, |found: Map<Int, Bool>, i: Instruction|
     match i {
-      Return(VarOperand(x)) -> if m.reads.get_or(x.id, 0) == 1 && m.releases.get_or(x.id, 0) == 0
+      Return(VariableOperand(x)) -> if m.reads.get_or(x.id, 0) == 1
+          && m.releases.get_or(x.id, 0) == 0
           && built_for_destination(b, x) { found.insert(x.id, true) }
       else { found },
       _ -> found,
@@ -118,8 +127,8 @@ fn results_in(b: Block, m: Mentions, acc: Map<Int, Bool>) -> Map<Int, Bool> = {
   fold_nested(b, here, |inner: Block, a: Map<Int, Bool>| results_in(inner, m, a))
 }
 
-fn built_for_destination(b: Block, x: Var) -> Bool =
-  b.any(|i: Inst|
+fn built_for_destination(b: Block, x: Variable) -> Bool =
+  b.any(|i: Instruction|
     match i { Let(l) -> l.var.id == x.id && can_take_destination(l.value), _ -> false })
 
 fn can_take_destination(v: Rvalue) -> Bool =
@@ -134,8 +143,13 @@ fn call_takes_destination(
   c: { callee: Callee, args: List<Arg>, convention: Convention, suspends: Bool },
 ) -> Bool = c.convention.destination_passing && c.convention.returned == OwnedResult && !c.suspends
 
-fn slots_in(b: Block, m: Mentions, results: Map<Int, Bool>, acc: Map<Int, Bool>) -> Map<Int, Bool> = {
-  let here = b.fold(acc, |found: Map<Int, Bool>, i: Inst|
+fn slots_in(
+  b: Block,
+  m: Mentions,
+  results: Map<Int, Bool>,
+  accumulator: Map<Int, Bool>,
+) -> Map<Int, Bool> = {
+  let here = b.fold(accumulator, |found: Map<Int, Bool>, i: Instruction|
     match i {
       Let(l) -> match l.value {
         Call(c) -> if call_takes_destination(c) && !results.contains(l.var.id)
@@ -149,11 +163,11 @@ fn slots_in(b: Block, m: Mentions, results: Map<Int, Bool>, acc: Map<Int, Bool>)
   fold_nested(b, here, |inner: Block, a: Map<Int, Bool>| slots_in(inner, m, results, a))
 }
 
-fn moves_in(b: Block, slots: Map<Int, Bool>, acc: Map<Int, Int>) -> Map<Int, Int> = {
-  let here = range(0, b.len()).fold(acc, |found: Map<Int, Int>, k: Int|
+fn moves_in(b: Block, slots: Map<Int, Bool>, accumulator: Map<Int, Int>) -> Map<Int, Int> = {
+  let here = range(0, b.len()).fold(accumulator, |found: Map<Int, Int>, k: Int|
     match b.at(k) {
       Some(Let(l)) ->
-        field_reads(l.value).fold(found, |q: Map<Int, Int>, v: Var|
+        field_reads(l.value).fold(found, |q: Map<Int, Int>, v: Variable|
           if slots.contains(v.id) && released_next(b, k + 1, v) { q.insert(v.id, l.var.id) }
           else { q }),
       _ -> found,
@@ -161,30 +175,31 @@ fn moves_in(b: Block, slots: Map<Int, Bool>, acc: Map<Int, Int>) -> Map<Int, Int
   fold_nested(b, here, |inner: Block, a: Map<Int, Int>| moves_in(inner, slots, a))
 }
 
-fn field_reads(value: Rvalue) -> List<Var> = {
+fn field_reads(value: Rvalue) -> List<Variable> = {
   let once = |args: List<Arg>|
-    args.fold([], |acc: List<Var>, a: Arg|
+    args.fold([], |accumulator: List<Variable>, a: Arg|
       match a {
-        VarOperand(v) -> if args.filter(|x: Arg| x == a).len() == 1 { acc.push(v) } else { acc },
-        _ -> acc,
+        VariableOperand(v) -> if args.filter(|x: Arg| x == a).len() == 1 { accumulator.push(v) }
+        else { accumulator },
+        _ -> accumulator,
       });
   match value {
     Allocate(k) -> match k.made { RecordAllocation(_) -> once(k.args), _ -> [] },
-    Update(u) -> once(u.sets.map(|s: FieldWrite| s.arg)).filter(|v: Var| v.id != u.of.id),
+    Update(u) -> once(u.sets.map(|s: FieldWrite| s.arg)).filter(|v: Variable| v.id != u.of.id),
     _ -> [],
   }
 }
 
-fn released_next(b: Block, k: Int, v: Var) -> Bool =
+fn released_next(b: Block, k: Int, v: Variable) -> Bool =
   match b.at(k) {
-    Some(Dec(x)) -> x.id == v.id || released_next(b, k + 1, v),
-    Some(Inc(x)) -> x.var.id != v.id && released_next(b, k + 1, v),
+    Some(Decrement(x)) -> x.id == v.id || released_next(b, k + 1, v),
+    Some(Increment(x)) -> x.var.id != v.id && released_next(b, k + 1, v),
     Some(Free(_)) -> released_next(b, k + 1, v),
     _ -> false,
   }
 
-fn fold_nested<s>(b: Block, acc: s, each: (Block, s) -> s) -> s =
-  b.fold(acc, |a: s, i: Inst|
+fn fold_nested<s>(b: Block, accumulator: s, each: (Block, s) -> s) -> s =
+  b.fold(accumulator, |a: s, i: Instruction|
     match i {
       If(x) -> each(x.otherwise, each(x.then, a)),
       Case(c) ->

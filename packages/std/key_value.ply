@@ -1,79 +1,85 @@
 //! An embedded key-value store that maps bytes to bytes, stored in files in a directory under an
-//! `fs` root.
+//! `fs` root. Use it when one program stores keyed bytes beside itself and needs them back after a
+//! crash; use `std.sqlite` when the data needs more than key lookups.
 //!
-//! A store is a log. A commit appends one frame containing every key it puts or deletes, so a
-//! batch is either complete or absent. Each batch takes the next sequence number, which becomes
-//! the version of every key it wrote. A program's handle on an open store is a `Store` value: the
-//! index, a `Map` from each key to where its value is, and where the log ends. A commit returns
-//! the next `Store` value, a `Snapshot` is the index at one point in time, and a read is one
-//! `fs.read_at` checked against the checksum in the index. So reads through an old snapshot see
-//! no later write. Use this when one program keeps keyed bytes next to itself and needs them back
-//! after a crash; use `std.sqlite` when the data needs more than one kind of query.
+//! The store is a log. A batch is a set of puts and deletes that commit together. A commit appends
+//! one frame, the unit written to the log, that contains every key the batch puts or deletes, so a
+//! batch is either fully present or absent. Each batch takes the next sequence number, which
+//! becomes the version of every key it wrote. An open store is a `Store` value that contains an
+//! index (a `Map` from each key to where its value is stored) and the position where the log ends.
+//! A commit returns the next `Store` value. A `Snapshot` is the index at one point in time. A read
+//! is one `fs.read_at`, checked against the checksum in the index, so a read through an old
+//! snapshot never sees a later write.
 //!
-//! `open` takes the directory's lock and returns the store, and `close` releases the lock: they
-//! are the pair to pass to `with_scope`. The lock is `fs.lock`'s file, which a later locker removes
-//! once it is thirty seconds old. So the lock file stores its holder's token and the position
-//! where its log ends, and every commit reads it back and writes it again, as a compaction does
-//! between its records. A store that is in use is therefore never mistaken for a dead one. A store
-//! that sat idle past that age and had its lock taken finds another token and fails with
-//! `LockLost`. A `Store` value that is not the latest one a commit returned finds a different log
-//! position and fails with `Stale`. Both checks happen before anything is written. So a store has
-//! one writer, which uses its `Store` values in the order its commits returned them, and tasks
-//! that share a store commit one at a time (`std.task`'s `with_permit`). This cannot detect a
-//! locker that removes the lock in the instant between its holder's read and write. But a frame
-//! written anywhere other than where its writer expected the log to end does not verify, so what
-//! such a pair appends is cut off by the next `open` and never read as a batch.
+//! `open` takes the directory's lock and returns the store. `close` releases the lock. Together
+//! they are the pair to pass to `with_scope`. The lock is `fs.lock`'s file, and the next program to
+//! lock the directory removes it once it is thirty seconds old. To keep a store in use from looking
+//! dead, the lock file contains the owner's token and the position where the owner's log ends, and
+//! every commit reads the file and writes it again (as a compaction does between its records). If a
+//! store sat idle past that age and another program took the lock, the lock file now contains a
+//! different token and the commit fails with `LockLost`. If a `Store` value is not the latest one a
+//! commit returned, the lock file contains a different log position and the commit fails with
+//! `Stale`. Both checks run before anything is written. So a store has one writer, which must use
+//! its `Store` values in the order its commits returned them, and tasks that share a store commit
+//! one at a time (`std.task`'s `with_permit`). One race remains: another program can remove the
+//! lock between the owner's read and write of the lock file. A frame written anywhere other than
+//! where its writer expected the log to end does not verify, so the next `open` cuts it off and it
+//! is never read as a batch.
 //!
-//! Each commit chooses its durability. `Durable` syncs the log before it returns, so a power loss
-//! afterwards keeps the commit. `Fast` returns once the frame is appended: every reader sees it,
-//! but a power loss may lose it along with every commit since the last durable one. A power loss
+//! Each commit chooses its durability. `Durable` syncs the log before the commit returns, so the
+//! commit survives a power loss. `Fast` returns once the frame is appended: every reader sees it,
+//! but a power loss may lose it, along with every commit since the last durable one. A power loss
 //! never loses a commit without also losing every commit after it.
 //!
-//! The file formats follow. Every number is little-endian, and sizes are in bytes.
+//! File formats. Every number is little-endian, and sizes are in bytes.
 //!
-//! A segment, `NNNNNNNN.log`, numbered from 1, is a 64-byte header followed by frames. The header
-//! is `PLYKVLOG`; the format, 1, in four bytes; four bytes of flags; the segment's number in
-//! eight; the sequence number of the last batch committed before its first frame, in eight; and
-//! the 32 bytes of the store's shape, all zeros for a store of raw bytes. Flag bit 0 marks the
-//! segment as a base: a segment a compaction wrote in full, which replaces every segment numbered
-//! below it.
+//! A segment is a file named `NNNNNNNN.log`, numbered from 1. It is a 64-byte header followed by
+//! frames. The header is `PLYKVLOG`; the format number, 1, in four bytes; four bytes of flags; the
+//! segment's number in eight bytes; the sequence number of the last batch committed before the
+//! segment's first frame, in eight bytes; and 32 bytes describing the store's codecs (its shape),
+//! all zeros for a store of raw bytes. Flag bit 0 marks a base segment: one that a compaction wrote
+//! in full, which replaces every segment with a lower number.
 //!
-//! A frame is a 24-byte head and a body. The head is `F1 6B 76 0A`; the body's length in four; an
-//! eight-byte checksum; and the mark in eight. The checksum is the first eight bytes of the BLAKE3
-//! of the frame's offset in its segment (in eight), the length, the mark and the body. The mark is
-//! the offset up to which the segment was known to be synced when the frame was written. The body
-//! is the batch's sequence number in eight, or zero in a base; the number of records in four; and
-//! the records. A record is its kind in one byte (1 a put, 2 a delete, 3 a value a compaction
-//! kept); the key's length in four and the value's in four; for kind 3, the value's version in
-//! eight; the key; and the value. A base contains only frames of kept values, ends with a frame of
-//! no records, and is never appended to.
+//! A frame is a 24-byte head and a body. The head is `F1 6B 76 0A`; the body's length in four
+//! bytes; an eight-byte checksum; and the sync mark in eight bytes, which is the offset up to which
+//! the segment was known to be synced when the frame was written. The checksum is the first eight
+//! bytes of the BLAKE3 hash of the frame's offset in its segment (eight bytes), the length, the
+//! mark and the body. The body is the batch's sequence number in eight bytes (zero in a base); the
+//! number of records in four bytes; and the records. A record is its kind in one byte (1 is a put,
+//! 2 is a delete, 3 is a value that a compaction copied into a base); the key's length in four
+//! bytes; the value's length in four bytes; for kind 3, the value's version in eight bytes; the
+//! key; and the value. A base contains only frames of kind 3 records, ends with a frame of no
+//! records, and is never appended to.
 //!
-//! A hint, `NNNNNNNN.hint`, summarizes a full segment's frames, so opening reads the hint instead
-//! of the segment. It is `PLYKVHNT`; the format in four; four zero bytes; the segment's number in
-//! eight; the segment's length in eight; the sequence number after its last batch in eight; the
-//! number of entries in eight; the size of the segment's records in eight, each counted as 17 plus
-//! its key and value; the entries; and an eight-byte checksum over everything before. An entry is
-//! 1 for a value or 2 for a deleted key; the version in eight; the value's offset in its segment in
-//! eight; its length in four; the first eight bytes of its BLAKE3; the key's length in four; and
-//! the key.
+//! A hint is a file named `NNNNNNNN.hint` that summarizes the frames of a full segment, so `open`
+//! can read the hint instead of the segment. It is `PLYKVHNT`; the format number in four bytes;
+//! four zero bytes; the segment's number in eight bytes; the segment's length in eight bytes; the
+//! sequence number after the segment's last batch in eight bytes; the number of entries in eight
+//! bytes; the total size of the segment's records in eight bytes, counting each record as 17 plus
+//! its key and value lengths; the entries; and an eight-byte checksum over everything before it. An
+//! entry is 1 for a value or 2 for a deleted key; the version in eight bytes; the value's offset in
+//! its segment in eight bytes; its length in four bytes; the first eight bytes of its BLAKE3 hash;
+//! the key's length in four bytes; and the key.
 //!
-//! `lock` contains the 32 characters of its holder's token. Once the store is open, it also
-//! contains the number of the last segment and that segment's length as the last commit expected
-//! to leave them, eight bytes each.
+//! The `lock` file contains the 32 characters of the owner's token. Once the store is open, it also
+//! contains two eight-byte numbers: the number of the last segment and that segment's length, as
+//! the last commit expected them to be after it wrote.
 //!
-//! Opening finds the newest base and removes what it replaced. It reads each full segment through
-//! its hint, or frame by frame if the hint is missing or belongs to a different segment, and reads
-//! the last segment frame by frame. In the last segment, a frame that does not verify, with no
-//! later frame whose mark is past it, is a write that never finished, and the log is cut there.
-//! Anything else is an error that names the file and the offset, and nothing is skipped: a frame
-//! that does not verify elsewhere, a frame out of sequence, a base that does not end properly, or
-//! a header that does not belong to this store. Damage to the frames at the end of the log as of
-//! its last sync, with nothing written after, is the one loss that looks like an unfinished write.
-//! A segment that reaches `Limits.file` is synced, given its hint, and followed by the next one.
-//! `compact` writes every live value into one new base next to the log and renames it into place
-//! as `fs::write_atomic` does. So a crash leaves either the old segments or the new base, never
-//! neither. The replaced segments stay on disk for the snapshots that read them, until `discard`
-//! or the next `open` removes them.
+//! Opening finds the newest base and removes the segments it replaced. It reads each full segment
+//! through its hint, or frame by frame if the hint is missing or belongs to a different segment,
+//! and reads the last segment frame by frame. In the last segment, a frame that does not verify is
+//! treated as a write that never finished, and the log is cut there, unless a later frame has a
+//! sync mark beyond the offset of the bad frame. Such a mark shows that the bad frame had already
+//! been synced, so the damage is an error. Every other problem is also an error that names the file
+//! and the offset, and nothing is skipped: a frame that does not verify anywhere else, a frame out
+//! of sequence, a base that does not end properly, or a header that does not belong to this store.
+//! One kind of damage cannot be told apart from an unfinished write and is treated as one: damage
+//! to the last synced frames when nothing was written after them. A segment that grows to
+//! `Limits.file` bytes is synced, given a hint, and followed by the next segment. `compact` writes
+//! every live value into one new base next to the log and renames it into place as
+//! `fs::write_atomic` does, so a crash leaves either the old segments or the new base, never
+//! neither. The replaced segments stay on disk so that snapshots can still read them, until
+//! `discard` or the next `open` removes them.
 
 import std.bin
 import std.bin (BinCodec)
@@ -95,12 +101,11 @@ import std.seq (Seq, seq)
 import std.string
 import std.gen
 
-// --- Limits, errors and values ----------------------------------------------------
-
-/// A store's limits: the most bytes in a key, in a value, and in all the keys and values of one
-/// batch, and how many bytes a segment may reach before the next one is started. A key is at
-/// least one byte. The batch limit is at least the largest key and value together, and at most
-/// what one read returns (64 MiB), since a frame is written and read whole.
+/// The limits of a store, in bytes: the largest key, the largest value, the largest total of all
+/// keys and values in one batch, and the size at which a segment is closed and the next one
+/// started. A key must have at least one byte. The batch limit must be at least the largest key and
+/// value together, and at most 64 MiB, the most one read returns, because a frame is written and
+/// read whole.
 pub type Limits = new { key: Int, value: Int, batch: Int, file: Int }
 
 /// When a store compacts.
@@ -121,9 +126,10 @@ pub type Error =
   /// The lock no longer belongs to this store: it sat past the age at which a lock is considered
   /// dead and another store took it, or its own scope ended. Nothing was written.
   | LockLost
-  /// The `Store` value is behind its log. Either another value of the same store committed or
-  /// compacted after it, and that newer value can still commit, or an operation through it raised
-  /// `Failed` after it began to write, and the store must be opened again. Nothing was committed.
+  /// The `Store` value is out of date with its log. This has two causes. Another `Store` value of
+  /// the same store has committed or compacted since; that newer value can still commit. Or an
+  /// operation on this value failed with `Failed` after it began writing; then the store must be
+  /// opened again. Nothing was committed.
   | Stale
   /// A file does not contain what this module wrote: the file, and the offset where reading
   /// stopped.
@@ -153,7 +159,7 @@ pub effect key_value {
 fn fail<a>(error_of: Error) -> a / {key_value.fail} = key_value.fail(error_of)
 
 /// One step of a batch: a value put under a key, or a key deleted.
-pub type Op = | Put(Bytes, Bytes) | Delete(Bytes)
+pub type Operation = | Put(Bytes, Bytes) | Delete(Bytes)
 
 /// Where a value is stored: the batch that wrote it, its segment, its offset and length there,
 /// and the first eight bytes of its BLAKE3.
@@ -199,8 +205,6 @@ pub type CompareAndSetResult = { store: Store, done: Bool }
 /// compaction drops; its number of segments; and the sequence number of its last batch.
 pub type Stats = { entries: Int, total: Int, live: Int, segments: Int, sequence: Int }
 
-// --- Names and bytes --------------------------------------------------------------
-
 /// The format version this module writes, which every file's header contains.
 pub fn format_version() -> Int = 1
 
@@ -212,17 +216,13 @@ fn head_size() -> Int = 24
 fn body_head_size() -> Int = 12
 fn hint_header_size() -> Int = 56
 
-/// How much a record counts toward a store's `total` and `live`: its size as a compaction writes
-/// it.
 fn record_size(key: Bytes, value: Int) -> Int = 17 + key.len() + value
 fn frame_magic() -> Bytes = b"\xf1kv\n"
 fn log_magic() -> Bytes = b"PLYKVLOG"
 fn hint_magic() -> Bytes = b"PLYKVHNT"
 
-/// The most bytes read from a file at once.
 fn read_chunk_size() -> Int = 0x10_0000
 
-/// The longest body a frame of a store with these limits has: a batch of one-byte keys.
 fn longest_body(limits: Limits) -> Int = body_head_size() + 18 * limits.batch
 
 fn digits(n: Int) -> String = n.to_string().pad_left(8, "0")
@@ -230,7 +230,6 @@ fn log_name(n: Int) -> String = digits(n) ++ ".log"
 fn hint_name(n: Int) -> String = digits(n) ++ ".hint"
 fn lock_path(dir: String) -> String = join(dir, "lock")
 
-/// The number in a file's name before `suffix`, if the name is one this module would write.
 fn file_number(name: String, suffix: String) -> Option<Int> / {abort.raise} =
   if !name.ends_with(suffix) { None } else {
     let stem = name.slice(0, name.len() - suffix.len());
@@ -253,8 +252,6 @@ fn header_bytes(number: Int, base: Bool, before: Int, shape: Bytes) -> Bytes =
     shape,
   ])
 
-/// The frame of `body` at offset `at` in its segment. The checksum covers the offset, so the same
-/// bytes at any other offset are not a valid frame.
 fn frame(at: Int, synced: Int, body: Bytes) -> Bytes / {abort.raise} = {
   let length = u32_le(body.len());
   let mark = u64_le(synced);
@@ -277,8 +274,8 @@ fn record(kind: Int, key: Bytes, version: Bytes, value: Bytes) -> Bytes / {abort
     value,
   ])
 
-fn op_bytes(op: Op) -> Bytes / {abort.raise} =
-  match op {
+fn operation_bytes(operation: Operation) -> Bytes / {abort.raise} =
+  match operation {
     Put(key, value) -> record(1, key, b"", value),
     Delete(key) -> record(2, key, b"", b""),
   }
@@ -286,15 +283,8 @@ fn op_bytes(op: Op) -> Bytes / {abort.raise} =
 fn body_of(sequence: Int, records: List<Bytes>) -> Bytes =
   Bytes::concat_all([u64_le(sequence), u32_le(records.len()), Bytes::concat_all(records)])
 
-// --- Reading a log ----------------------------------------------------------------
-
-/// What reading frames builds: the index, the sequence number of the last batch read, the keys
-/// the frames wrote, with whether each was put, and the size of their records.
 type ReadState = { index: Map<Bytes, Slot>, sequence: Int, touched: Map<Bytes, Bool>, weight: Int }
 
-/// `made` updated with the frame whose body is at `at` in segment `number`, in the file `name`.
-/// The frame is the batch after the last one, or, in a base (when `kept` is true), a frame of kept
-/// values.
 fn apply_frame(
   state: ReadState,
   name: String,
@@ -349,34 +339,26 @@ fn apply_frame(
   }
 }
 
-/// Whether the bytes at `p` in `held`, which are at `at` in their segment, are one complete frame
-/// of a store with these limits.
-fn is_whole_frame(held: Bytes, p: Int, at: Int, limits: Limits) -> Bool / {abort.raise} = {
-  let size = held.len();
-  if p + head_size() > size || held.slice(p, p + 4) != frame_magic() { false } else {
-    let length = read_u32(held, p + 4);
+fn is_whole_frame(segment_bytes: Bytes, p: Int, at: Int, limits: Limits) -> Bool / {abort.raise} = {
+  let size = segment_bytes.len();
+  if p + head_size() > size || segment_bytes.slice(p, p + 4) != frame_magic() { false } else {
+    let length = read_u32(segment_bytes, p + 4);
     let ends = p + head_size() + length;
     length <= longest_body(limits) && ends <= size
       && checksum(
         Bytes::concat_all([
           u64_le(at),
-          held.slice(p + 4, p + 8),
-          held.slice(p + 16, p + 24),
-          held.slice(p + 24, ends),
+          segment_bytes.slice(p + 4, p + 8),
+          segment_bytes.slice(p + 16, p + 24),
+          segment_bytes.slice(p + 24, ends),
         ]),
       )
-      == held.slice(p + 8, p + 16)
+      == segment_bytes.slice(p + 8, p + 16)
   }
 }
 
-/// The state of a pass through a segment's frames: what they build, the offset of the next frame,
-/// the bytes buffered from there, the file's length, whether the bytes at that offset are not a
-/// frame, and whether the last frame read has no records.
 type SegmentScan = { made: ReadState, at: Int, buffered: Bytes, size: Int, bad: Bool, closed: Bool }
 
-/// Reads the frames of the segment at `path` from its header on, a piece of the file at a time,
-/// and stops at its end or at the first bytes that are not a frame. `kept` means the segment is a
-/// base.
 fn scan_segment<[l]>(
   path: String,
   name: String,
@@ -427,7 +409,6 @@ fn scan_segment<[l]>(
     },
   )
 
-/// The bytes of the file at `path` from `from` to `to`, read a piece at a time.
 fn read_range<[l]>(
   path: String,
   from: Int,
@@ -445,9 +426,6 @@ fn read_range<[l]>(
       }),
   )
 
-/// Whether `tail`, the bytes after a frame at `bad` that did not verify, contains a complete frame
-/// whose mark is past `bad`. Such a frame was written after a sync covered the bytes at `bad`, so
-/// those bytes were then complete on disk, and their failure is damage, not an unfinished write.
 fn has_synced_frame_after(tail: Bytes, bad: Int, limits: Limits) -> Bool / {abort.raise} =
   iterate(1, tail.len() + 2, |from: Int|
     match tail.index_of_from(frame_magic(), min(from, tail.len())) {
@@ -457,7 +435,6 @@ fn has_synced_frame_after(tail: Bytes, bad: Int, limits: Limits) -> Bool / {abor
       else { Continue(p + head_size() + read_u32(tail, p + 4)) },
     })
 
-/// A segment's header, checked to belong to this store: its number, its shape and this format.
 type Header = { is_base: Bool, before: Int }
 
 fn header_of<[l]>(
@@ -477,8 +454,6 @@ fn header_of<[l]>(
   }
 }
 
-// --- Hints ----------------------------------------------------------------------
-
 fn hint_entry(key: Bytes, slot: Option<Slot>) -> Bytes =
   match slot {
     Some(s) ->
@@ -494,8 +469,6 @@ fn hint_entry(key: Bytes, slot: Option<Slot>) -> Bytes =
     None -> Bytes::concat_all([b"\x02", b"\x00".repeat(28), u32_le(key.len()), key]),
   }
 
-/// The hint for segment `number`, `size` bytes long, whose frames wrote `touched` in records of
-/// `weight` bytes and left the index in its current state.
 fn hint_bytes(
   number: Int,
   size: Int,
@@ -506,7 +479,7 @@ fn hint_bytes(
 ) -> Bytes / {abort.raise} = {
   let entries = touched.fold([], |out: List<Bytes>, key: Bytes, put: Bool|
     out.push(hint_entry(key, if put { index.get(key) } else { None })));
-  let said = Bytes::concat_all([
+  let body = Bytes::concat_all([
     hint_magic(),
     u32_le(format_version()),
     u32_le(0),
@@ -517,12 +490,9 @@ fn hint_bytes(
     u64_le(weight),
     Bytes::concat_all(entries),
   ]);
-  said.concat(checksum(said))
+  body.concat(checksum(body))
 }
 
-/// `made` updated with segment `number`, `size` bytes long, as `hint` describes it. `None` if the
-/// bytes are not a valid hint for that segment in its current state, in which case the segment is
-/// read frame by frame.
 fn apply_hint(
   state: ReadState,
   hint: Bytes,
@@ -577,17 +547,14 @@ fn apply_hint(
   }
 }
 
-// --- The lock ---------------------------------------------------------------------
-
-/// Takes the directory's lock, trying `tries` times, and writes a new token into it.
 fn take_lock<[l]>(
   dir: String,
   tries: Int,
 ) -> String / {fs.lock[l], fs.unlock[l], fs.write_file[l], key_value.fail, entropy.next, abort.raise} = {
-  let asks = max(tries, 1);
-  let taken = iterate(1, asks + 1, |n: Int|
+  let attempts = max(tries, 1);
+  let taken = iterate(1, attempts + 1, |n: Int|
     if fs.lock[l](lock_path(dir)) { Stop(true) }
-    else if n >= asks { Stop(false) }
+    else if n >= attempts { Stop(false) }
     else { Continue(n + 1) });
   let token = token_hex(16);
   if !taken { fail(Locked) }
@@ -597,12 +564,8 @@ fn take_lock<[l]>(
   }
 }
 
-/// What a lock file contains after its token: the active segment's number and where the log ends.
 fn log_position_of(active: Int, end: Int) -> Bytes = u64_le(active).concat(u64_le(end))
 
-/// Reads the lock back and writes it again with `next` as the position after its token, which
-/// keeps the lock from ageing. Fails with `LockLost` if the token is no longer this store's, and
-/// with `Stale` if the position is not `was`, writing nothing in either case.
 fn renew_lock<[l]>(
   dir: String,
   token: String,
@@ -619,12 +582,8 @@ fn renew_lock<[l]>(
   }
 }
 
-/// The log position the lock should contain for the `Store` value `s`.
 fn log_position(s: Store) -> Bytes = log_position_of(s.active, s.end)
 
-// --- Opening ----------------------------------------------------------------------
-
-/// Writes a file completely or not at all, reporting a file system failure as the store's own.
 fn write_whole<[l]>(
   path: String,
   body: Bytes,
@@ -636,8 +595,6 @@ fn write_whole<[l]>(
   match wrote { Ok(_) -> (), Err((at, error_of)) -> fail(Failed(at, error_of)) }
 }
 
-/// Cuts the segment at `path` to its first `keep` bytes, by copying it next to itself and renaming
-/// the copy over it, so a crash leaves it either unchanged or cut.
 fn truncate<[l]>(
   path: String,
   keep: Int,
@@ -658,13 +615,9 @@ fn truncate<[l]>(
   match wrote { Ok(_) -> (), Err((at, error_of)) -> fail(Failed(at, error_of)) }
 }
 
-/// The length of the file at `path`.
 fn size_of<[l]>(path: String) -> Int / {fs.file_size[l], key_value.fail} =
   match fs.file_size[l](path) { Some(n) -> n, None -> fail(Missing(path)) }
 
-/// `made` updated with the full segment `number`: through its hint if it has one, and otherwise
-/// frame by frame. Reading frame by frame rejects any bytes that are not a frame and a base
-/// (`kept`) that does not end properly, and writes the hint.
 fn read_full_segment<[l]>(
   dir: String,
   number: Int,
@@ -712,7 +665,6 @@ fn read_full_segment<[l]>(
   }
 }
 
-/// The store that a directory's files make up, under a lock already taken.
 fn recover<[l]>(
   dir: String,
   token: String,
@@ -756,7 +708,9 @@ fn recover<[l]>(
       empty
     },
     Some(top) -> {
-      let lowest = logs.at(0).expect("the lowest segment");
+      let lowest = logs.at(0).expect(
+        "the store has no log segments, so there is no lowest segment",
+      );
       let base = iterate(top, top + 1, |n: Int|
         if header_of[l](dir, n, shape).is_base || n == 1 { Stop(n) }
         else if n > lowest { Continue(n - 1) }
@@ -844,21 +798,20 @@ fn recover<[l]>(
   store
 }
 
-/// The size of the records an index refers to.
 fn live_of(index: Map<Bytes, Slot>) -> Int =
   index.fold(0, |bytes: Int, key: Bytes, slot: Slot| bytes + record_size(key, slot.len))
 
-/// Opens the store in the directory `dir` under the root `l`, creating the directory and an empty
-/// store if there is none, and returns it with the directory's lock taken. Use it as a `with_scope`
-/// acquire function, with `close` to release. The lock is requested `tries` times, each waiting on
-/// a holder as `fs.lock` does, and the result is `Locked` if another store still has it. A holder
-/// that died leaves its lock behind, which can be taken once it is thirty seconds old: sixteen
-/// tries wait that long. `shape` is `raw()` for a store of raw bytes, or `shape_of` the codecs it
-/// is read with. A store written under another shape fails with `OtherShape`, and none of it is
-/// read.
+/// Opens the store in the directory `dir` of the file system `l`, creating the directory and an
+/// empty store if the directory does not exist, and returns it with the directory's lock taken. Use
+/// it as the acquire function of `with_scope`, with `close` to release. The lock is requested up to
+/// `tries` times, each waiting as `fs.lock` does, and fails with `Locked` if another store still
+/// has it. A program that died leaves its lock file behind, which can be taken once it is thirty
+/// seconds old, and sixteen tries wait that long. `shape` is `raw()` for a store of raw bytes, or
+/// `shape_of` the codecs the store is read with. A store written with another shape fails with
+/// `OtherShape`, and none of it is read.
 ///
-/// The result contains what the files contain: every batch whose frame is complete, in order, up
-/// to the first that is not. A failure releases the lock.
+/// The returned store contains every batch whose frame is complete, in order, up to the first frame
+/// that is not. If opening fails, the lock is released.
 pub fn open<[l]>(
   dir: String,
   limits: Limits,
@@ -871,7 +824,7 @@ pub fn open<[l]>(
       || limits.file < 1
       || shape.len() != 32 {
     panic(
-      "a store's limits are a key of a byte or more, a batch that holds a key and a value and is at most 64 MiB, and a file of a byte or more, and its shape is 32 bytes",
+      "invalid store limits or shape: `limits.key` must be at least 1 byte, `limits.batch` must be at least `limits.key + limits.value` and at most 64 MiB, `limits.file` must be at least 1 byte, and `shape` must be 32 bytes long",
     )
   } else if !fs.create_dir[l](dir) { fail(Failed(dir, fs::operation_failed("create_dir"))) } else {
     let token = take_lock[l](dir, tries);
@@ -897,8 +850,6 @@ pub fn close<[l]>(s: Store) -> Unit / {fs.read_file[l], fs.unlock[l]} =
     None -> (),
   }
 
-// --- Reading ----------------------------------------------------------------------
-
 fn value_at<[l]>(dir: String, slot: Slot) -> Bytes / {fs.read_at[l], key_value.fail, abort.raise} = {
   let name = log_name(slot.segment);
   match fs.read_at[l](join(dir, name), slot.at, slot.len) {
@@ -909,9 +860,9 @@ fn value_at<[l]>(dir: String, slot: Slot) -> Bytes / {fs.read_at[l], key_value.f
   }
 }
 
-/// The store's current contents, as a value: reads through it see no later commit. It reads the
-/// files its store had, so it stays valid while they exist, which is until the store `discard`s
-/// what a compaction replaced or is opened again.
+/// Returns the store's current contents as a value: reads through it do not see later commits. A
+/// snapshot reads the segment files the store had when it was taken, so it stays valid until
+/// `discard` removes the segments a compaction replaced, or until the store is opened again.
 pub fn snapshot(s: Store) -> Snapshot = { dir: s.dir, index: s.index }
 
 /// The value under `key` in the snapshot, read from its segment and checked against its checksum.
@@ -921,7 +872,7 @@ pub fn read<[l]>(
 ) -> Option<Bytes> / {fs.read_at[l], key_value.fail, abort.raise} =
   match snap.index.get(key) { Some(slot) -> Some(value_at[l](snap.dir, slot)), None -> None }
 
-/// The value under `key`.
+/// Returns the value stored under `key`, or `None` if the store has no such key.
 pub fn get<[l]>(
   s: Store,
   key: Bytes,
@@ -950,8 +901,9 @@ fn bounded(
 fn first_from(snap: Snapshot, from: Option<Bytes>) -> Option<{ key: Bytes, value: Slot }> =
   match from { Some(key) -> snap.index.ceiling(key), None -> snap.index.first() }
 
-/// The snapshot's keys from `from` up to but not including `until`, in byte order, with no bound
-/// at an end that is `None`. Nothing is read from disk: a pull is one step in the index.
+/// Returns the snapshot's keys from `from` up to but not including `until`, in byte order. A bound
+/// that is `None` leaves that end open. Reads nothing from disk: each key comes from the in-memory
+/// index.
 pub fn keys(snap: Snapshot, from: Option<Bytes>, until: Option<Bytes>) -> Seq<Bytes | {}> =
   seq::unfold(bounded(first_from(snap, from), until), |next: Option<{ key: Bytes, value: Slot }>|
     match next {
@@ -959,10 +911,10 @@ pub fn keys(snap: Snapshot, from: Option<Bytes>, until: Option<Bytes>) -> Seq<By
       Some(entry) -> Some({ value: entry.key, next: bounded(snap.index.above(entry.key), until) }),
     })
 
-/// The snapshot's entries with keys from `from` up to but not including `until`, in byte order of
-/// their keys, with no bound at an end that is `None`. A pull reads one value, so a consumer's
-/// budget limits what a scan reads. A scan in progress is not affected by commits made while it is
-/// pulled.
+/// Returns the snapshot's entries with keys from `from` up to but not including `until`, in byte
+/// order of their keys. A bound that is `None` leaves that end open. Each value is read from disk
+/// only when its element is taken from the sequence, so stopping early reads no more. Commits made
+/// while a scan is in progress do not affect it.
 pub fn scan<[l]>(
   snap: Snapshot,
   from: Option<Bytes>,
@@ -982,8 +934,6 @@ pub fn scan<[l]>(
         }),
     })
 
-/// The smallest bytes greater than every key that begins with `prefix`. `None` if there are none,
-/// which is when `prefix` is empty or all `FF`.
 fn prefix_end(prefix: Bytes) -> Option<Bytes> / {abort.raise} =
   iterate(prefix.len(), prefix.len() + 1, |n: Int|
     if n == 0 { Stop(None) }
@@ -997,7 +947,9 @@ pub fn prefixed<[l]>(
 ) -> Seq<Pair | {fs.read_at[l], key_value.fail, abort.raise}> / {abort.raise} =
   scan[l](snap, Some(prefix), prefix_end(prefix))
 
-/// A summary of what the store contains.
+/// Returns the store's counts: `entries` is the number of keys, `total` and `live` are the sizes of
+/// all records and of those the index still refers to, `segments` is the number of segment files in
+/// the log, and `sequence` is the sequence number of the last batch.
 pub fn stats(s: Store) -> Stats =
   {
     entries: s.index.len(),
@@ -1007,33 +959,22 @@ pub fn stats(s: Store) -> Stats =
     sequence: s.sequence,
   }
 
-// --- Committing -------------------------------------------------------------------
-
-/// The total size of the keys and values in a batch, with each op checked against the store's
-/// limits.
-fn batch_weight(limits: Limits, ops: List<Op>) -> Int / {key_value.fail} =
-  ops.fold(0, |bytes: Int, op: Op| {
-    let key = match op { Put(k, _) -> k, Delete(k) -> k };
-    let value = match op { Put(_, v) -> v.len(), Delete(_) -> 0 };
+fn batch_weight(limits: Limits, operations: List<Operation>) -> Int / {key_value.fail} =
+  operations.fold(0, |bytes: Int, operation: Operation| {
+    let key = match operation { Put(k, _) -> k, Delete(k) -> k };
+    let value = match operation { Put(_, v) -> v.len(), Delete(_) -> 0 };
     if key.len() < 1 || key.len() > limits.key { fail(Unfit(Key)) }
     else if value > limits.value { fail(Unfit(Value)) }
     else { bytes + key.len() + value }
   })
 
-/// Whether a commit through `s` begins a segment: its active one is full.
 fn segment_full(s: Store) -> Bool = s.end >= s.limits.file
 
-/// The path of segment `number` of `s`, which is about to be started. Fails with `Stale` if it
-/// already exists, because then another writer started it, and its contents must not be
-/// overwritten.
 fn new_segment_path<[l]>(s: Store, number: Int) -> String / {fs.exists[l], key_value.fail} = {
   let path = join(s.dir, log_name(number));
   if fs.exists[l](path) { fail(Stale) } else { path }
 }
 
-/// If the active segment is full, the store with that segment closed and the next one started.
-/// The full segment is synced and given its hint before the next segment exists to show that it
-/// is full.
 fn rotate_segment<[l]>(
   s: Store,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
@@ -1058,11 +999,12 @@ fn rotate_segment<[l]>(
     }
   }
 
-/// Commits `ops` as one batch. Once it returns, all of them are in the store, in order, so a key
-/// the batch names twice has the value its last op left. If it raises before the frame is
-/// appended, none of them are. The batch takes the next sequence number, which becomes the version
-/// of each key it puts. An empty batch commits nothing. `Durable` syncs the log before returning;
-/// `Fast` does not. A store whose policy requires it compacts before returning.
+/// Commits `operations` as one batch. Once it returns, all of them are in the store, in order, so a key
+/// the batch names twice has the value of its last op. If it raises before the frame is appended,
+/// none of them are. The batch takes the next sequence number, which becomes the version of each
+/// key it puts. An empty batch commits nothing. `Durable` syncs the log before returning; `Fast`
+/// does not. If the store's compaction policy calls for a compaction, the store compacts before
+/// this function returns.
 ///
 /// It raises `Unfit` for an op or a batch past the store's limits, and `LockLost` and `Stale` as
 /// the module documentation describes, each with nothing committed. It raises `Failed` when the
@@ -1071,13 +1013,13 @@ fn rotate_segment<[l]>(
 /// `Stale` otherwise. Open the store again to read what the log contains.
 pub fn batch<[l]>(
   s: Store,
-  ops: List<Op>,
+  operations: List<Operation>,
   durability: Durability,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
-  if ops.len() == 0 { s }
-  else if batch_weight(s.limits, ops) > s.limits.batch { fail(Unfit(Batch)) } else {
+  if operations.len() == 0 { s }
+  else if batch_weight(s.limits, operations) > s.limits.batch { fail(Unfit(Batch)) } else {
     let at = if segment_full(s) { header_size() } else { s.end };
-    let body = body_of(s.sequence + 1, ops.map(op_bytes));
+    let body = body_of(s.sequence + 1, operations.map(operation_bytes));
     let bytes = frame(at, if segment_full(s) { header_size() } else { s.synced_bodies }, body);
     let end = at + bytes.len();
     renew_lock[l](
@@ -1111,23 +1053,21 @@ pub fn batch<[l]>(
           end: end,
           synced_bodies: if durability == Durable { end } else { r.synced_bodies },
           total: r.total + state.weight,
-          live: r.live + live_weight(state.index, ops) - live_weight(r.index, ops),
+          live: r.live + live_weight(state.index, operations) - live_weight(r.index, operations),
           weight: r.weight + state.weight,
         })
       },
     }
   }
 
-/// The size of the records the index has for the keys `ops` names, counting each key once.
-fn live_weight(index: Map<Bytes, Slot>, ops: List<Op>) -> Int =
-  ops.fold(Map::new(), |seen: Map<Bytes, Unit>, op: Op|
-    seen.insert(match op { Put(k, _) -> k, Delete(k) -> k }, ())).fold(
+fn live_weight(index: Map<Bytes, Slot>, operations: List<Operation>) -> Int =
+  operations.fold(Map::new(), |seen: Map<Bytes, Unit>, operation: Operation|
+    seen.insert(match operation { Put(k, _) -> k, Delete(k) -> k }, ())).fold(
     0,
     |bytes: Int, key: Bytes, _: Unit|
       match index.get(key) { Some(slot) -> bytes + record_size(key, slot.len), None -> bytes },
   )
 
-/// The store, compacted if its policy says enough of its log is dead.
 fn compact_if_due<[l]>(
   s: Store,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
@@ -1140,7 +1080,7 @@ fn compact_if_due<[l]>(
     },
   }
 
-/// Puts `value` under `key`: a batch of one.
+/// Puts `value` under `key` by committing a batch that contains only that put.
 pub fn put<[l]>(
   s: Store,
   key: Bytes,
@@ -1149,7 +1089,8 @@ pub fn put<[l]>(
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
   batch[l](s, [Put(key, value)], durability)
 
-/// Deletes `key`, which need not be there: a batch of one.
+/// Deletes `key` by committing a batch that contains only that delete. It is not an error if the
+/// key is absent.
 pub fn delete<[l]>(
   s: Store,
   key: Bytes,
@@ -1179,11 +1120,6 @@ pub fn compare_and_set<[l]>(
     }
   }
 
-// --- Compacting -------------------------------------------------------------------
-
-/// A compaction in progress: the kept records waiting for a frame and the size of their keys and
-/// values, where each one's value is within its record, the offset to write the next frame at, the
-/// index of what is written, and how much has been copied since the lock was renewed.
 type CompactionState = {
   waiting: List<Bytes>,
   weight: Int,
@@ -1194,12 +1130,8 @@ type CompactionState = {
   since_renewal: Int,
 }
 
-/// How much a compaction copies between renewals of its lock, where each value counts as one plus
-/// one for each 16 KiB of it.
 fn renew_interval() -> Int = 64
 
-/// Writes the waiting records as a frame into the sink, and updates the index with their values at
-/// their new offsets.
 fn flush_frame<[l]>(
   p: CompactionState,
   number: Int,
@@ -1231,10 +1163,6 @@ fn flush_frame<[l]>(
     }
   }
 
-/// The store with every value it contains written into one new base segment, which is renamed into
-/// place whole, followed by a new active segment. The lock records the log position after the
-/// compaction before the base gets its name, so no `Store` value from before the compaction can
-/// commit afterwards.
 fn rewrite_as_base<[l]>(
   s: Store,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} = {
@@ -1243,10 +1171,10 @@ fn rewrite_as_base<[l]>(
   let here = log_position(s);
   let wrote: Result<CompactionState, (String, fs::FileError)> = try[files.fail] {
     io::replacing[l](path, Durable, None, |sink: Sink<| {fs.write_chunk[l]}>| {
-      let said = |bytes: Bytes|
+      let write_bytes = |bytes: Bytes|
         if (sink.push)(bytes) { () }
         else { fail(Failed(path, fs::operation_failed("write_chunk"))) };
-      said(header_bytes(number, true, s.sequence, s.shape));
+      write_bytes(header_bytes(number, true, s.sequence, s.shape));
       let copied = s.index.fold(
         {
           waiting: [],
@@ -1283,7 +1211,7 @@ fn rewrite_as_base<[l]>(
       );
       let done = flush_frame[l](copied, number, path, sink);
       let last = frame(done.at, header_size(), body_of(0, []));
-      said(last);
+      write_bytes(last);
       renew_lock[l](s.dir, s.token, here, log_position_of(number + 1, header_size()));
       { ..done, at: done.at + last.len() }
     })
@@ -1320,12 +1248,13 @@ fn rewrite_as_base<[l]>(
   }
 }
 
-/// Writes every value the store contains into one new base segment, and renames it into place.
-/// Space taken by deleted and overwritten records is no longer read, and a store opened after a
-/// crash at any step finds either the old segments or the base, never neither. Versions are
-/// preserved. The lock is renewed as the values are copied, so a compaction of any length is not
-/// mistaken for a dead store. The replaced segments stay on disk for snapshots taken before the
-/// compaction, until `discard` or the next `open`.
+/// Writes every value in the store into one new base segment and renames it into place. Records
+/// that were deleted or overwritten are not copied, so their space is no longer used once the
+/// replaced segments are removed. If a crash happens at any step, opening the store finds either
+/// the old segments or the new base segment. Each key keeps its version. The lock is renewed while
+/// values are copied, so a long compaction is not mistaken for a store that has stopped running.
+/// The replaced segments stay on disk so that snapshots taken before the compaction can still read
+/// them, until `discard` or the next `open` removes them.
 pub fn compact<[l]>(
   s: Store,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} = {
@@ -1333,8 +1262,8 @@ pub fn compact<[l]>(
   rewrite_as_base[l](s)
 }
 
-/// Removes the segments compactions replaced. A snapshot taken before the compaction that
-/// replaced one can no longer read it, and raises `Missing` where it tries.
+/// Removes the segments that earlier compactions replaced. A snapshot taken before one of those
+/// compactions can no longer read the removed segments, and raises `Missing` when it tries.
 pub fn discard<[l]>(
   s: Store,
 ) -> Store / {fs.read_file[l], fs.write_file[l], fs.remove[l], key_value.fail} = {
@@ -1347,14 +1276,12 @@ pub fn discard<[l]>(
   { ..s, replaced: [] }
 }
 
-// --- Values of a type -------------------------------------------------------------
-
 /// The codecs a store's keys and values are written with.
 pub type Codecs<k, v> = { key: BinCodec<k>, value: BinCodec<v> }
 
-/// The shape to open a store with to read it through `codecs`: a digest of both types as
-/// `bin::shape_digest` computes it. So `open` rejects a store written before a type changed, and
-/// none of its values is read as the new type.
+/// Returns the shape to pass to `open` when reading the store with `codecs`. It is a digest of the
+/// key and value types, as computed by `bin::shape_digest`. `open` rejects a store written with
+/// different types, so no value is decoded as the wrong type.
 pub fn shape_of<k, v>(codecs: Codecs<k, v>) -> Bytes / {abort.raise} =
   bin::shape_digest(codecs.key).concat(bin::shape_digest(codecs.value)).blake3()
 
@@ -1364,7 +1291,7 @@ pub fn key_bytes<k, v>(codecs: Codecs<k, v>, key: k) -> Bytes / {abort.raise} =
   bin::encode(key, codecs.key)
 
 /// The op that puts `value` under `key`, for a batch.
-pub fn put_op<k, v>(codecs: Codecs<k, v>, key: k, value: v) -> Op / {abort.raise} =
+pub fn put_operation<k, v>(codecs: Codecs<k, v>, key: k, value: v) -> Operation / {abort.raise} =
   Put(bin::encode(key, codecs.key), bin::encode(value, codecs.value))
 
 /// A scan's entry decoded to the types it was written from. Fails with `Undecodable` if its bytes
@@ -1389,7 +1316,7 @@ pub fn put_as<k, v, [l]>(
   value: v,
   durability: Durability,
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
-  batch[l](s, [put_op(codecs, key, value)], durability)
+  batch[l](s, [put_operation(codecs, key, value)], durability)
 
 /// The value under `key`, read with its codec. Fails with `Undecodable` if the bytes are not a
 /// value of the type.
@@ -1406,16 +1333,10 @@ pub fn get_as<k, v, [l]>(
     },
   }
 
-// --- Tests ------------------------------------------------------------------------
-
-/// Limits under which the third commit of a short value begins a segment.
 fn small() -> Limits = { key: 8, value: 64, batch: 96, file: 160 }
 
-/// Limits under which nothing a test here commits fills a segment.
 fn large_limits() -> Limits = { key: 8, value: 64, batch: 4096, file: 0x10_0000 }
 
-/// What `go` returns for the store in `db` of `tree`, opened with entropy from `seed` and closed
-/// afterwards, or why the store failed, along with the resulting tree.
 fn opened<a>(
   tree: MemFs,
   seed: Int,
@@ -1428,12 +1349,11 @@ fn opened<a>(
     with_rand(rand(seed), || {
       let ran: Result<a, Error> = try[key_value.fail] {
         with_scope[store](open[d]("db", limits, policy, shape, 1), |s: Store|
-          close[d](s)) { held -> go(held.get()) }
+          close[d](s)) { store_scope -> go(store_scope.get()) }
       };
       ran
     }).value)
 
-/// `opened` for a store of raw bytes that compacts only on request.
 fn session<a>(
   tree: MemFs,
   seed: Int,
@@ -1443,32 +1363,33 @@ fn session<a>(
 
 fn listed<a | e>(found: Seq<a | e>) -> List<a> / {abort.raise | e} = {
   let all: Result<List<a>, Int> = try[seq.spent] { seq::to_list(found, 100000) };
-  match all { Ok(list) -> list, Err(_) -> panic("a sequence longer than a test reads") }
+  match all {
+    Ok(list) -> list,
+    Err(_) -> panic("the sequence has more than 100000 items, which is more than a test can read"),
+  }
 }
 
 fn error_of<a>(r: Result<a, Error>) -> Option<Error> = match r { Ok(_) -> None, Err(w) -> Some(w) }
 
-/// A store's contents in the form a map gives them: its entries in key order, and how many batches
-/// it took.
 type Shown = { pairs: List<Pair>, sequence: Int }
 
 fn shown<[l]>(s: Store) -> Shown / {fs.read_at[l], key_value.fail, abort.raise} =
   { pairs: listed(scan[l](snapshot(s), None, None)), sequence: stats(s).sequence }
 
-/// What a map containing `m` contains after one batch.
-fn stepped(m: Shown, ops: List<Op>) -> Shown =
-  if ops.len() == 0 { m } else {
+fn stepped(m: Shown, operations: List<Operation>) -> Shown =
+  if operations.len() == 0 { m } else {
     let version = m.sequence + 1;
-    let before = m.pairs.fold(Map::new(), |held: Map<Bytes, Pair>, p: Pair| held.insert(p.key, p));
-    let after = ops.fold(before, |held: Map<Bytes, Pair>, op: Op|
-      match op {
-        Put(key, value) -> held.insert(key, { key: key, value: value, version: version }),
-        Delete(key) -> held.remove(key),
+    let before = m.pairs.fold(Map::new(), |pairs_by_key: Map<Bytes, Pair>, p: Pair|
+      pairs_by_key.insert(p.key, p));
+    let after = operations.fold(before, |pairs_by_key: Map<Bytes, Pair>, operation: Operation|
+      match operation {
+        Put(key, value) -> pairs_by_key.insert(key, { key: key, value: value, version: version }),
+        Delete(key) -> pairs_by_key.remove(key),
       });
     { pairs: after.values(), sequence: version }
   }
 
-test "a put is read back under its batch's number, a delete removes it, and an older store value reads what it had" {
+test "a read at a batch's version returns that batch's puts, a delete removes the key, and a read at an older version returns the values from that version" {
   let over = session(mem_empty(), 1, small(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"one", Fast);
     let s2 = batch[d](s1, [Put(b"b", b"two"), Put(b"a", b"uno"), Delete(b"c")], Durable);
@@ -1510,17 +1431,16 @@ test "a reopened store has what was committed, each key under its version, and n
     let s1 = batch[d](s0, [Put(b"a", b"1"), Put(b"b", b"2")], Fast);
     shown[d](delete[d](put[d](s1, b"c", b"3", Durable), b"a", Fast))
   });
-  let held = {
+  let expected = {
     pairs: [{ key: b"b", value: b"2", version: 1 }, { key: b"c", value: b"3", version: 2 }],
     sequence: 3,
   };
-  assert_eq(first.value, Ok(held));
+  assert_eq(first.value, Ok(expected));
   let second = session(first.tree, 2, small(), |s: Store|
     (shown[d](s), version(put[d](s, b"d", b"4", Fast), b"d")));
-  assert_eq(second.value, Ok((held, Some(4))))
+  assert_eq(second.value, Ok((expected, Some(4))))
 }
 
-/// A frame as the format states it, from its offset, its length, its mark and its body.
 fn expected_frame(at: Int, mark: Int, body: Bytes) -> Bytes / {abort.raise} = {
   let length = u32_le(body.len());
   let sum = Bytes::concat_all([u64_le(at), length, u64_le(mark), body]).blake3();
@@ -1574,7 +1494,7 @@ test "a store's files follow the format its module documents" {
     expected_frame(64, 64, kept_body),
     expected_frame(119, 64, u64_le(0).concat(u32_le(0))),
   ]);
-  let said = Bytes::concat_all([
+  let hint = Bytes::concat_all([
     b"PLYKVHNT",
     u32_le(1),
     u32_le(0),
@@ -1597,14 +1517,14 @@ test "a store's files follow the format its module documents" {
   );
   assert_eq(mem_read(over.tree, "db/00000001.log"), Some(log));
   assert_eq(mem_read(over.tree, "db/00000002.log"), Some(base));
-  assert_eq(mem_read(over.tree, "db/00000002.hint"), Some(said.concat(said.blake3().slice(0, 8))));
+  assert_eq(mem_read(over.tree, "db/00000002.hint"), Some(hint.concat(hint.blake3().slice(0, 8))));
   assert_eq(mem_read(over.tree, "db/00000003.log"), Some(header(0, 3, 1)))
 }
 
 test "a key, a value or a batch past a store's limits is rejected, and nothing is written for it" {
-  let tried = |ops: List<Op>|
+  let tried = |operations: List<Operation>|
     session(mem_empty(), 1, small(), |s: Store| {
-      batch[d](s, ops, Fast);
+      batch[d](s, operations, Fast);
       fs.file_size[d]("db/00000001.log")
     }).value;
   assert_eq(tried([Put(b"", b"v")]), Err(Unfit(Key)));
@@ -1622,7 +1542,6 @@ test "a key, a value or a batch past a store's limits is rejected, and nothing i
   assert_eq(unwritten.value, Ok((Some(Unfit(Value)), Some(64))))
 }
 
-/// What `go` returns, and how many ranged reads of the root it made.
 fn counting<a, [l] | e>(
   go: () -> a / {fs.read_at[l] | e},
 ) -> { value: a, reads: Int } / {fs.read_at[l] | e} =
@@ -1640,7 +1559,7 @@ fn counting<a, [l] | e>(
 fn keys_of<| e>(found: Seq<Pair | e>) -> List<Bytes> / {abort.raise | e} =
   listed(found).map(|p: Pair| p.key)
 
-test "a scan returns a range of keys in byte order, a prefix its keys, and reads no more than is pulled" {
+test "`scan` returns keys in byte order within a range, `prefixed` returns the keys with a given prefix, and a scan reads only as many entries as the caller consumes" {
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s = [b"b/2", b"a", b"b/1", b"c", b"b", b"b/\xff"].fold(s0, |s: Store, key: Bytes|
       put[d](s, key, b"at ".concat(key), Fast));
@@ -1728,7 +1647,6 @@ test "a snapshot reads what its store had when it was taken, through later commi
   )
 }
 
-/// A store of six keys under `small`, which fills two segments and begins a third.
 fn six_key_store() -> MemResult<Result<Shown, Error>> / {abort.raise} =
   session(mem_empty(), 1, small(), |s0: Store|
     shown[d](
@@ -1736,9 +1654,8 @@ fn six_key_store() -> MemResult<Result<Shown, Error>> / {abort.raise} =
         put[d](s, b"k".concat(byte_of_int(48 + i)), byte_of_int(48 + i).repeat(20), Fast)),
     ))
 
-/// The tree with one byte of the file at `path` changed.
 fn flip_byte(tree: MemFs, path: String, at: Int) -> MemFs / {abort.raise} = {
-  let had = mem_read(tree, path).expect("the file to damage");
+  let had = mem_read(tree, path).expect("the file to change does not exist");
   mem_write(
     tree,
     path,
@@ -1750,28 +1667,31 @@ fn flip_byte(tree: MemFs, path: String, at: Int) -> MemFs / {abort.raise} = {
   ).fs
 }
 
-/// The tree with the file at `path` cut to its first `keep` bytes.
 fn shortened(tree: MemFs, path: String, keep: Int) -> MemFs / {abort.raise} =
-  mem_write(tree, path, mem_read(tree, path).expect("the file to cut").slice(0, keep)).fs
+  mem_write(
+    tree,
+    path,
+    mem_read(tree, path).expect("the file to shorten does not exist").slice(0, keep),
+  ).fs
 
-test "a full segment has a hint that opening reads instead, and a hint for another segment is ignored and written again" {
+test "opening a store reads the hint file (a summary of a completed log segment) instead of that segment, and ignores and rewrites a hint that is missing or belongs to another segment" {
   let state = six_key_store();
   let hint = "db/00000001.hint";
   assert_eq(
     fs::listed_names(mem_list(state.tree, "db")),
     Some(["00000001.hint", "00000001.log", "00000002.hint", "00000002.log", "00000003.log"]),
   );
-  let held = |tree: MemFs| session(tree, 2, small(), |s: Store| (shown[d](s), stats(s)));
-  let whole = held(state.tree);
+  let reopened = |tree: MemFs| session(tree, 2, small(), |s: Store| (shown[d](s), stats(s)));
+  let whole = reopened(state.tree);
   assert_eq(whole.value, match state.value {
     Ok(all) -> Ok((all, { entries: 6, total: 234, live: 234, segments: 3, sequence: 6 })),
     Err(rejection) -> Err(rejection),
   });
-  assert_eq(held(flip_byte(state.tree, "db/00000001.log", 70)).value, whole.value);
-  let unhinted = held(mem_remove(state.tree, hint).fs);
+  assert_eq(reopened(flip_byte(state.tree, "db/00000001.log", 70)).value, whole.value);
+  let unhinted = reopened(mem_remove(state.tree, hint).fs);
   assert_eq(unhinted.value, whole.value);
   assert_eq(mem_read(unhinted.tree, hint), mem_read(state.tree, hint));
-  let misled = held(flip_byte(state.tree, hint, 60));
+  let misled = reopened(flip_byte(state.tree, hint, 60));
   assert_eq(misled.value, whole.value);
   assert_eq(mem_read(misled.tree, hint), mem_read(state.tree, hint));
   let rotten = flip_byte(state.tree, "db/00000001.log", 115);
@@ -1780,10 +1700,10 @@ test "a full segment has a hint that opening reads instead, and a hint for anoth
     (lost, get[d](s, b"k2"))
   });
   assert_eq(read.value, Ok((Err(Corrupt("00000001.log", 111)), Some(b"2".repeat(20)))));
-  assert_eq(held(mem_remove(rotten, hint).fs).value, Err(Corrupt("00000001.log", 64)))
+  assert_eq(reopened(mem_remove(rotten, hint).fs).value, Err(Corrupt("00000001.log", 64)))
 }
 
-test "a compaction keeps every value under its version in one base, and what it replaced stays until it is discarded" {
+test "a compaction merges every value and its version into one set of files, and the files it replaced remain until `discard` is called" {
   let over = session(mem_empty(), 1, small(), |s0: Store| {
     let filled = range(0, 6).fold(s0, |s: Store, i: Int|
       put[d](s, if i % 2 == 0 { b"even" } else { b"odd" }, byte_of_int(48 + i).repeat(20), Fast));
@@ -1795,18 +1715,18 @@ test "a compaction keeps every value under its version in one base, and what it 
     {
       before: before,
       packed: (shown[d](packed), stats(packed)),
-      kept: is_base,
+      retained: is_base,
       left: fs::listed_names(fs.list_dir[d]("db")),
       next: version(put[d](cleared, b"new", b"n", Durable), b"new"),
     }
   });
-  let held = { pairs: [{ key: b"even", value: b"4".repeat(20), version: 5 }], sequence: 7 };
+  let expected = { pairs: [{ key: b"even", value: b"4".repeat(20), version: 5 }], sequence: 7 };
   assert_eq(
     over.value,
     Ok({
-      before: (held, { entries: 1, total: 263, live: 41, segments: 4, sequence: 7 }),
-      packed: (held, { entries: 1, total: 41, live: 41, segments: 2, sequence: 7 }),
-      kept: Some([
+      before: (expected, { entries: 1, total: 263, live: 41, segments: 4, sequence: 7 }),
+      packed: (expected, { entries: 1, total: 41, live: 41, segments: 2, sequence: 7 }),
+      retained: Some([
         "00000001.hint",
         "00000001.log",
         "00000002.hint",
@@ -1827,13 +1747,13 @@ test "a compaction keeps every value under its version in one base, and what it 
   assert_eq(
     again.value,
     Ok((
-      stepped(held, [Put(b"new", b"n")]),
+      stepped(expected, [Put(b"new", b"n")]),
       { entries: 2, total: 62, live: 62, segments: 2, sequence: 8 },
     )),
   )
 }
 
-test "a store set to compact does so in the commit that leaves enough of its log dead, and not again until as much is" {
+test "a store set to compact when 50 bytes are obsolete compacts in the commit that reaches that amount, and does not compact again until another 50 bytes are obsolete" {
   let over = opened(mem_empty(), 1, large_limits(), WhenDead(50, 40), raw(), |s0: Store| {
     let s1 = put[d](s0, b"k", b"1".repeat(20), Fast);
     let s2 = put[d](s1, b"k", b"2".repeat(20), Fast);
@@ -1861,7 +1781,7 @@ test "a store set to compact does so in the commit that leaves enough of its log
   )
 }
 
-test "a log that ends inside a frame opens to the batches before it, is cut to them, and takes the next commit" {
+test "a log that ends partway through a batch opens with the complete batches before it, is truncated to them, and accepts the next commit" {
   let batches = [
     [Put(b"a", b"first")],
     [Put(b"b", b"second"), Delete(b"a")],
@@ -1871,8 +1791,8 @@ test "a log that ends inside a frame opens to the batches before it, is cut to t
   let state = session(mem_empty(), 1, large_limits(), |s0: Store|
     batches.fold(
       { store: s0, ends: [] },
-      |at: { store: Store, ends: List<Int> }, ops: List<Op>| {
-        let next = batch[d](at.store, ops, Fast);
+      |at: { store: Store, ends: List<Int> }, operations: List<Operation>| {
+        let next = batch[d](at.store, operations, Fast);
         { store: next, ends: at.ends.push(fs.file_size[d](log).expect("the log")) }
       },
     ).ends);
@@ -1880,20 +1800,20 @@ test "a log that ends inside a frame opens to the batches before it, is cut to t
   assert_eq(ends, [115, 177, 228]);
   range(64, 229).fold((), |_: Unit, keep: Int| {
     let whole = ends.filter(|end: Int| end <= keep).len();
-    let held = batches.take(whole).fold({ pairs: [], sequence: 0 }, stepped);
+    let expected = batches.take(whole).fold({ pairs: [], sequence: 0 }, stepped);
     let again = session(shortened(state.tree, log, keep), 2, large_limits(), |s: Store| {
       let found = (shown[d](s), fs.file_size[d](log));
       put[d](s, b"z", b"after", Durable);
       found
     });
     let truncate = match ends.at(whole - 1) { Some(end) -> end, None -> 64 };
-    assert_eq(again.value, Ok((held, Some(truncate))));
+    assert_eq(again.value, Ok((expected, Some(truncate))));
     let after = session(again.tree, 3, large_limits(), |s: Store| shown[d](s));
-    assert_eq(after.value, Ok(stepped(held, [Put(b"z", b"after")])))
+    assert_eq(after.value, Ok(stepped(expected, [Put(b"z", b"after")])))
   })
 }
 
-test "damage that a sync had covered is reported where it is, and what no sync covered is cut with all that follows it" {
+test "corruption in log data already synced to disk is reported as an error, and unsynced data from the first corruption onward is cut off" {
   let log = "db/00000001.log";
   let state = |first: Durability, second: Durability|
     session(mem_empty(), 1, large_limits(), |s0: Store| {
@@ -1901,16 +1821,16 @@ test "damage that a sync had covered is reported where it is, and what no sync c
       put[d](put[d](s1, b"b", b"second", second), b"c", b"third", Fast);
       ()
     }).tree;
-  let held = |tree: MemFs|
+  let listed_keys = |tree: MemFs|
     session(tree, 2, large_limits(), |s: Store| listed(keys(snapshot(s), None, None))).value;
   let early = state(Durable, Fast);
-  assert_eq(held(flip_byte(early, log, 100)), Err(Corrupt("00000001.log", 64)));
-  assert_eq(held(flip_byte(early, log, 150)), Ok([b"a"]));
-  assert_eq(held(flip_byte(early, log, 200)), Ok([b"a", b"b"]));
+  assert_eq(listed_keys(flip_byte(early, log, 100)), Err(Corrupt("00000001.log", 64)));
+  assert_eq(listed_keys(flip_byte(early, log, 150)), Ok([b"a"]));
+  assert_eq(listed_keys(flip_byte(early, log, 200)), Ok([b"a", b"b"]));
   let late = state(Fast, Durable);
-  assert_eq(held(flip_byte(late, log, 100)), Err(Corrupt("00000001.log", 64)));
-  assert_eq(held(flip_byte(late, log, 150)), Err(Corrupt("00000001.log", 115)));
-  assert_eq(held(flip_byte(late, log, 200)), Ok([b"a", b"b"]));
+  assert_eq(listed_keys(flip_byte(late, log, 100)), Err(Corrupt("00000001.log", 64)));
+  assert_eq(listed_keys(flip_byte(late, log, 150)), Err(Corrupt("00000001.log", 115)));
+  assert_eq(listed_keys(flip_byte(late, log, 200)), Ok([b"a", b"b"]));
   let rejected = session(flip_byte(late, log, 100), 2, large_limits(), |s: Store| ());
   assert_eq(mem_read(rejected.tree, log), mem_read(flip_byte(late, log, 100), log));
   assert_eq(fs::listed_names(mem_list(rejected.tree, "db")), Some(["00000001.log"]))
@@ -1956,7 +1876,7 @@ test "a directory that is not a complete store is rejected with what is wrong wi
   )
 }
 
-test "one store has a directory at a time, and a value of a store that is closed, or behind another, commits nothing" {
+test "a second store cannot open a directory that is already open, and a commit through a closed store or a store handle older than a later commit fails and writes nothing" {
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let second: Result<Store, Error> = try[key_value.fail] {
@@ -2006,7 +1926,7 @@ test "one store has a directory at a time, and a value of a store that is closed
   assert_eq(beside_another.value, Ok((Some(LockLost), [b"a"])))
 }
 
-test "a commit the file system failed, or one that finds its next segment started, leaves a store that commits nothing until reopened" {
+test "a commit that the file system fails, or that finds a newer log file already started, makes the store fail every commit until it is reopened" {
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"1", Fast);
@@ -2040,14 +1960,14 @@ test "a commit the file system failed, or one that finds its next segment starte
   assert_eq(planted.value, Ok((Some(Stale), Some(Stale), Some(b"another writer's"))))
 }
 
-test "a frame written past another writer's fails as stale, and is not a batch to the store opened after" {
+test "a batch written after another writer has taken over the directory fails as stale, and is not read as a batch when the store is reopened" {
   let log = "db/00000001.log";
   let over = session(mem_empty(), 1, large_limits(), |s0: Store| {
     let s1 = put[d](s0, b"a", b"1", Fast);
-    let held = fs.read_file[d]("db/lock");
+    let lock_file = fs.read_file[d]("db/lock");
     fs.remove[d]("db/lock");
     close[d](put[d](open[d]("db", large_limits(), Manual, raw(), 1), b"theirs", b"2", Fast));
-    fs.write_file[d]("db/lock", match held { Some(bytes) -> bytes, None -> b"" });
+    fs.write_file[d]("db/lock", match lock_file { Some(bytes) -> bytes, None -> b"" });
     let ours: Result<Store, Error> = try[key_value.fail] { put[d](s1, b"ours", b"3", Fast) };
     (error_of(ours), fs.file_size[d](log))
   });
@@ -2069,24 +1989,17 @@ test "a frame written past another writer's fails as stale, and is not a batch t
   )
 }
 
-/// What happened to a store whose lock a rival requested.
 type LockTakeoverOutcome = {
   compaction_error: Option<Error>,
   taken: Bool,
   late_commit_error: Option<Error>,
 }
 
-/// The rival `with_rival` runs.
 effect contender {
-  /// Whether the rival has taken the lock.
   read taken() -> Bool
-  /// Lets `ms` pass, after which the rival requests the lock.
   write idle(ms: Int) -> Unit
 }
 
-/// Runs `go` on a clock that each ranged read of the root advances by `read_ms`, with a rival that
-/// requests the lock after each such read and each `contender.idle`. A whole write of the lock file is
-/// stamped with the clock, and every other operation of the root is passed through unchanged.
 fn with_rival<a, [l] | e>(
   read_ms: Int,
   go: () -> a / {fs.read[l], fs.write[l], contender.taken, contender.idle | e},
@@ -2100,7 +2013,7 @@ fn with_rival<a, [l] | e>(
     contender.idle(ms) -> {
       now = now + ms;
       let had = taken;
-      taken = rival_holds[l](now, taken);
+      taken = rival_has_lock[l](now, taken);
       if taken && !had {
         fs.set_modified[l]("db/lock", now);
         ()
@@ -2108,7 +2021,7 @@ fn with_rival<a, [l] | e>(
     },
     fs.read_at[l](p, offset, most) -> {
       now = now + read_ms;
-      taken = rival_holds[l](now, taken);
+      taken = rival_has_lock[l](now, taken);
       fs.read_at[l](p, offset, most)
     },
     fs.write_file[l](p, body) -> {
@@ -2153,9 +2066,7 @@ fn with_rival<a, [l] | e>(
     fs.link[l](p, to) -> fs.link[l](p, to),
   }
 
-/// Whether the rival has the lock after requesting it at `now`, where `taken` reports whether it
-/// had it already. A lock file thirty seconds old is the rival's to take.
-fn rival_holds<[l]>(now: Int, taken: Bool) -> Bool / {fs.read[l], fs.write[l]} =
+fn rival_has_lock<[l]>(now: Int, taken: Bool) -> Bool / {fs.read[l], fs.write[l]} =
   match fs.modified_ms[l]("db/lock") {
     Some(stamp) -> if now - stamp >= 30000 && !taken {
       fs.remove[l]("db/lock");
@@ -2165,9 +2076,6 @@ fn rival_holds<[l]>(now: Int, taken: Bool) -> Bool / {fs.read[l], fs.write[l]} =
     None -> taken,
   }
 
-/// A store of two hundred values that compacts, sits idle for thirty-one seconds and commits once
-/// more, on a disk where each ranged read takes `read_ms`. A rival requests the lock after every
-/// read, as `fs.lock` would, and a lock file thirty seconds old is the rival's.
 fn lock_takeover_outcome(read_ms: Int) -> MemResult<LockTakeoverOutcome> / {abort.raise} =
   on_mem[d](mem_empty(), ||
     with_rand(rand(1), ||
@@ -2191,7 +2099,7 @@ fn lock_takeover_outcome(read_ms: Int) -> MemResult<LockTakeoverOutcome> / {abor
         }
       })).value)
 
-test "a lock renewed as a compaction copies is never old enough to take, and a store that sat idle past the age has lost it and writes nothing" {
+test "a store that renews its lock during a compaction keeps the lock, but a store idle for longer than the lock's expiry time loses the lock and writes nothing" {
   let is_base = lock_takeover_outcome(400);
   assert_eq(is_base.value, {
     compaction_error: None,
@@ -2223,7 +2131,7 @@ test "values of a type are put and read through their codecs, and a store writte
     let s1 = put_as[d](s0, lists, "primes", [2, 3, 5], Durable);
     let s2 = batch[d](
       s1,
-      [put_op(lists, "evens", [0, 2]), Put(key_bytes(lists, "torn"), b"\xff")],
+      [put_operation(lists, "evens", [0, 2]), Put(key_bytes(lists, "torn"), b"\xff")],
       Fast,
     );
     let torn: Result<Option<List<Int>>, Error> = try[key_value.fail] {
@@ -2279,7 +2187,6 @@ test "a compare-and-set commits only against the version it is given, or absence
   )
 }
 
-/// One more than the decimal count in `had`, with none counting as zero.
 fn one_more(had: Option<Bytes>) -> Bytes / {abort.raise} =
   Bytes::of_string(
     Int::to_string(
@@ -2287,14 +2194,11 @@ fn one_more(had: Option<Bytes>) -> Bytes / {abort.raise} =
     ),
   )
 
-/// The store a test's tasks share.
 effect newest {
   read store() -> Store
   write replace(s: Store) -> Unit
 }
 
-/// Runs `body` with its tasks sharing the store `s` through `newest`, and returns the store once
-/// it is done.
 fn with_store<a | e>(
   s: Store,
   body: () -> a / {newest.store, newest.replace | e},
@@ -2302,15 +2206,15 @@ fn with_store<a | e>(
   handle {
     body()
   } with {
-    var held = s,
-    newest.store() -> held,
+    var current_store = s,
+    newest.store() -> current_store,
     newest.replace(next) -> {
-      held = next;
+      current_store = next;
     },
-    return value -> { value: value, store: held },
+    return value -> { value: value, store: current_store },
   }
 
-test "two tasks that add to one count by compare-and-set lose no addition, wherever their reads and commits fall" {
+test "two tasks that each add to one count with compare-and-set lose no addition, however their reads and commits interleave" {
   let over = on_mem[d](mem_empty(), ||
     with_rand(rand(1), || {
       let ran: Result<{ ended: List<Option<Error>>, held: Shown }, Error> = try[key_value.fail] {
@@ -2354,7 +2258,7 @@ test "two tasks that add to one count by compare-and-set lose no addition, where
   )
 }
 
-test "a reader sees all of a batch or none of it, wherever its reads fall among a writer's commits" {
+test "a reader sees all of a batch or none of it, however its reads interleave with a writer's commits" {
   let over = on_mem[d](mem_empty(), ||
     with_rand(rand(1), || {
       let ran: Result<{ wrote: Option<Error>, read: Result<Bool, Error> }, Error> = try[key_value.fail] {
@@ -2391,15 +2295,9 @@ test "a reader sees all of a batch or none of it, wherever its reads fall among 
   assert_eq(over.value, Ok({ wrote: None, read: Ok(true) }))
 }
 
-// --- Crashes ----------------------------------------------------------------------
-
-/// A step of a history: one key put, two keys put in one batch, or one key deleted, each with
-/// whether it waits for the disk; or a compaction.
 type Act = | One(Bool) | Two(Bool) | Drop(Bool) | Compact
 
-/// The batch the step at `i` of a history commits, which is empty for a compaction. Both keys of
-/// a batch get the same value, so half a batch would be visible.
-fn ops_of(act: Act, i: Int) -> List<Op> = {
+fn operations_of(act: Act, i: Int) -> List<Operation> = {
   let value = b"value ".concat(byte_of_int(97 + i % 26).repeat(14));
   match act {
     One(_) -> [Put(if i % 2 == 0 { b"a" } else { b"b" }, value)],
@@ -2409,7 +2307,6 @@ fn ops_of(act: Act, i: Int) -> List<Op> = {
   }
 }
 
-/// Whether a power loss keeps a step that returned, as it keeps a compaction.
 fn waits(act: Act) -> Bool =
   match act {
     One(durable) -> durable,
@@ -2425,16 +2322,13 @@ fn acted<[l]>(
 ) -> Store / {fs.read[l], fs.write[l], key_value.fail, entropy.next, abort.raise} =
   match act {
     Compact -> compact[l](s),
-    _ -> batch[l](s, ops_of(act, i), if waits(act) { Durable } else { Fast }),
+    _ -> batch[l](s, operations_of(act, i), if waits(act) { Durable } else { Fast }),
   }
 
-/// What a map contains after each number of a history's steps, starting with none.
 fn contents_after_each(acts: List<Act>) -> List<Shown> / {abort.raise} =
   acts.fold([{ pairs: [], sequence: 0 }], |all: List<Shown>, act: Act|
-    all.push(stepped(all.at(all.len() - 1).expect("the last"), ops_of(act, all.len() - 1))))
+    all.push(stepped(all.at(all.len() - 1).expect("the last"), operations_of(act, all.len() - 1))))
 
-/// How many steps of a history returned on a disk that accepts `writes` more writes and then
-/// fails, along with the tree the run left.
 fn completed_actions(
   acts: List<Act>,
   limits: Limits,
@@ -2444,9 +2338,9 @@ fn completed_actions(
     with_rand(rand(1), || {
       let ran: Result<Int, Error> = try[key_value.fail] {
         with_scope[store](open[d]("db", limits, Manual, raw(), 1), |s: Store|
-          close[d](s)) { held ->
+          close[d](s)) { store_scope ->
           iterate(
-            { store: held.get(), done: 0 },
+            { store: store_scope.get(), done: 0 },
             acts.len() + 1,
             |at: { store: Store, done: Int }|
               match acts.at(at.done) {
@@ -2467,8 +2361,6 @@ fn completed_actions(
       match ran { Ok(done) -> done, Err(_) -> 0 }
     }).value)
 
-/// Whether the tree a dead store left opens, once its lock is gone, to what a map contains after
-/// some number of steps from `least` to `most`, accepts a commit, and opens again with both.
 fn revives(
   tree: MemFs,
   limits: Limits,
@@ -2490,32 +2382,25 @@ fn revives(
   }
 }
 
-/// Kills a run at each number of writes in turn, up to the number that lets it finish and close.
-/// Returns how many numbers that is, and the first, if any, whose tree `holds` returns false for.
-/// `holds` is called on each tree as the run left it, and as a power loss then leaves it, which
-/// its last argument indicates, along with what the run returned.
 fn crashes(
   whole: Int,
   run: (Int) -> MemResult<Int> / {abort.raise},
-  holds: (MemFs, Int, Bool) -> Bool / {abort.raise},
+  is_consistent: (MemFs, Int, Bool) -> Bool / {abort.raise},
 ) -> { points: Int, broken: Option<Int> } / {abort.raise} =
   iterate(0, 100000, |writes: Int| {
     let ran = run(writes);
-    if !holds(ran.tree, ran.value, false) || !holds(mem_crashed(ran.tree), ran.value, true) {
+    if !is_consistent(ran.tree, ran.value, false)
+        || !is_consistent(mem_crashed(ran.tree), ran.value, true) {
       Stop({ points: writes + 1, broken: Some(writes) })
     } else if ran.value == whole && !mem_exists(ran.tree, "db/lock") {
       Stop({ points: writes + 1, broken: None })
     } else { Continue(writes + 1) }
   })
 
-/// How many of the first `done` steps a power loss must keep: those up to the last one that
-/// waited for the disk.
 fn durable_prefix_length(acts: List<Act>, done: Int) -> Int =
   range(0, done).fold(0, |is_base: Int, i: Int|
     match acts.at(i) { Some(act) -> if waits(act) { i + 1 } else { is_base }, None -> is_base })
 
-/// Kills a history at each of its writes. Opening what is left gives a number of its steps from
-/// those that had returned, or after a power loss those that had to be kept, up to one more.
 fn check_crash_recovery(
   acts: List<Act>,
   limits: Limits,
@@ -2535,12 +2420,11 @@ fn check_crash_recovery(
   )
 }
 
-law "a store that dies at any write of three steps opens to a prefix of them, with every step that returned and, after a loss of power, every durable one"
+law "a store that crashes during any of three writes reopens to the state after some prefix of those writes, including every write that returned and, after a power loss, every durable write"
   forall (first: Act, second: Act, third: Act) {
     check_crash_recovery([first, second, third], small()).broken == None
   }
 
-/// A generator of `Act` for tests.
 fn acts() -> gen::Gen<Act> =
   gen::one_of([
     gen::map(gen::bool(), |f0: Bool| One(f0)),
@@ -2549,7 +2433,6 @@ fn acts() -> gen::Gen<Act> =
     gen::constant(Compact),
   ])
 
-/// A generator of `Step` for tests.
 fn steps() -> gen::Gen<Step> =
   gen::one_of([
     gen::map2(names(), gen::any_int(), |f0: Name, f1: Int| Set(f0, f1)),
@@ -2558,10 +2441,9 @@ fn steps() -> gen::Gen<Step> =
     gen::constant(Tidy),
   ])
 
-/// A generator of `Name` for tests.
 fn names() -> gen::Gen<Name> = gen::elements([Ka, Kb, Kc])
 
-test "a longer history that dies at a random write opens to a prefix with everything it must keep" {
+test "after a crash at a random write in a long sequence of writes, reopening gives the state after some prefix of the writes, and that prefix includes every write that had returned (and every synced write after a power loss)" {
   gen::check2(gen::list(acts()), gen::any_int(), |drawn: List<Act>, at: Int| {
     let acts = drawn.take(16);
     let all = contents_after_each(acts);
@@ -2573,7 +2455,7 @@ test "a longer history that dies at a random write opens to a prefix with everyt
   })
 }
 
-test "a compaction that dies at any of its writes, a renewal of its lock among them, leaves every value to the store opened after it" {
+test "a compaction that crashes at any of its writes, including renewing its lock, loses no values in the store reopened afterward" {
   let limits: Limits = { key: 8, value: 64, batch: 96, file: 1024 };
   let state = session(mem_empty(), 1, limits, |s0: Store|
     shown[d](
@@ -2581,35 +2463,34 @@ test "a compaction that dies at any of its writes, a renewal of its lock among t
         put[d](s, Bytes::of_string(Int::to_string(100 + i)), b"v", if i == 69 { Durable }
         else { Fast })),
     ));
-  let held = match state.value { Ok(found) -> found, Err(_) -> panic("the store rejected") };
-  assert_eq(held.pairs.len(), 70);
+  let expected = match state.value { Ok(found) -> found, Err(_) -> panic("the store rejected") };
+  assert_eq(expected.pairs.len(), 70);
   let died = crashes(
     1,
     |writes: Int|
       on_mem_failing[d](state.tree, writes, ||
         with_rand(rand(4), || {
           let ran: Result<Store, Error> = try[key_value.fail] {
-            with_scope[store](open[d]("db", limits, Manual, raw(), 1), |s: Store|
-              close[d](s)) { held -> compact[d](held.get()) }
+            with_scope[store](
+              open[d]("db", limits, Manual, raw(), 1),
+              |s: Store| close[d](s),
+            ) { store_scope -> compact[d](store_scope.get()) }
           };
           match ran { Ok(_) -> 1, Err(_) -> 0 }
         }).value),
-    |tree: MemFs, _: Int, _: Bool| revives(tree, limits, [held], 0, 0),
+    |tree: MemFs, _: Int, _: Bool| revives(tree, limits, [expected], 0, 0),
   );
   assert_eq(died.broken, None);
   assert(died.points > 20)
 }
 
-// --- A store against a map ----------------------------------------------------------
-
 type Name = | Ka | Kb | Kc
 
-/// A step of a random history: a put, a delete, two puts in one batch, or a compaction.
 type Step = | Set(Name, Int) | Unset(Name) | Both(Name, Name, Int) | Tidy
 
 fn name_of(name: Name) -> Bytes = match name { Ka -> b"a", Kb -> b"b", Kc -> b"c" }
 
-fn step_ops(step: Step) -> List<Op> =
+fn step_operations(step: Step) -> List<Operation> =
   match step {
     Set(name, n) -> [Put(name_of(name), Bytes::of_string(n.to_string()))],
     Unset(name) -> [Delete(name_of(name))],
@@ -2620,19 +2501,18 @@ fn step_ops(step: Step) -> List<Op> =
     Tidy -> [],
   }
 
-/// What a store shows after a history, each step one batch or one compaction.
 fn after(steps: List<Step>) -> Shown / {abort.raise} = {
   let ran = session(mem_empty(), 1, small(), |s0: Store|
     shown[d](
       steps.fold(s0, |s: Store, step: Step|
-        match step { Tidy -> compact[d](s), _ -> batch[d](s, step_ops(step), Fast) }),
+        match step { Tidy -> compact[d](s), _ -> batch[d](s, step_operations(step), Fast) }),
     ));
   match ran.value { Ok(found) -> found, Err(_) -> panic("the store rejected") }
 }
 
 fn append_step(steps: List<Step>, step: Step) -> List<Step> = steps.push(step)
 
-fn as_a_map(held: Shown, step: Step) -> Shown = stepped(held, step_ops(step))
+fn as_a_map(state: Shown, step: Step) -> Shown = stepped(state, step_operations(step))
 
 test "a store changes its contents as a map does, with a version being its batch's number and a compaction changing nothing" {
   gen::check2(gen::list(steps()), steps(), |x: List<Step>, y: Step|

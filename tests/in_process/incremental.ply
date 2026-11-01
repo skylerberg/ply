@@ -1,8 +1,3 @@
-//! The memo store on the path every command takes, as a command reports it: a load computes each
-//! module through its queries, taking each record whose every read returns what it did. That
-//! results through a store kept across edits are the fresh ones is the compiler's own property, in
-//! `compiler.front.checking.edits`.
-
 import harness (scratch, on_disk, on_disk_faked, passing_except, returned, warm_matches_cold,
                 module_reuse, module_reuse_at, in_memory, tree, CliEffects, Shipped, cache_entry)
 import support.harness (RunResult, assert_ok, dependency, write_project, write, read, all_output,
@@ -24,7 +19,7 @@ fn shop_module_source() -> String =
   \\import core
   \\
   \\fn total(items: List<core::Item>) -> Int =
-  \\  items.fold(0, |acc, i: core::Item| acc + core::price(i))
+  \\  items.fold(0, |accumulator, i: core::Item| accumulator + core::price(i))
   \\
   \\fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)
   \\
@@ -42,18 +37,16 @@ fn shop_project() -> Unit / {WorkingDirectory, abort.raise} =
     { path: "leaf.ply", text: leaf() },
   ])
 
-// The toolchain supplies every shipped module, so a check takes each and checks only the project's.
-test "a second check takes every module as kept and an edit checks only the module it moved" {
+test "a second check reuses every module's cached result, and after an edit it checks only the edited module" {
   scratch(|| {
     shop_project();
     let cold = module_reuse();
-    assert(cold.cached == cold.shipped && cold.checked == 3, Some("a cold store keeps nothing"));
+    assert(cold.cached == cold.shipped && cold.checked == 3, Some("a cold store retains nothing"));
     let warm = module_reuse();
     assert(
       warm.cached == warm.shipped + 3 && warm.checked == 0,
-      Some("a warm check takes every module as kept"),
+      Some("a warm check treats every module as unchanged"),
     );
-    // Nothing imports `leaf`, so it is the only module the edit checks again.
     edit("leaf.ply", "one() + one()", "one() + one() + 0");
     let edited = module_reuse();
     assert(
@@ -65,21 +58,19 @@ test "a second check takes every module as kept and an edit checks only the modu
   })
 }
 
-/// What a report's `front_end` counts over every query its load asked: the cached results taken,
-/// the bodies run, and of those the bodies of the `module` query.
 fn reuse_of(front: Json) -> { taken: Int, ran: Int, modules: Int } =
   items(at(front, "queries")).fold(
     { taken: 0, ran: 0, modules: 0 },
-    |acc: { taken: Int, ran: Int, modules: Int }, q: Json|
+    |accumulator: { taken: Int, ran: Int, modules: Int }, q: Json|
       {
-        taken: acc.taken + int(at(q, "taken")),
-        ran: acc.ran + int(at(q, "run")),
-        modules: acc.modules
+        taken: accumulator.taken + int(at(q, "taken")),
+        ran: accumulator.ran + int(at(q, "run")),
+        modules: accumulator.modules
           + (if str(at(q, "query")) == "module" { int(at(q, "run")) } else { 0 }),
       },
   )
 
-test "a report counts what its load took and ran: an unchanged project runs no body, and an edit runs only what it reached" {
+test "a report counts the work a load did: an unchanged project runs no function bodies, and an edit runs only the affected bodies" {
   scratch(|| {
     write_project([
       { path: "leaf.ply", text: leaf() ++ "\ntest \"two is two\" { assert_eq(two(), 2) }\n" },
@@ -103,9 +94,7 @@ test "a report counts what its load took and ran: an unchanged project runs no b
   })
 }
 
-// `app` imports `lib`, whose check fails, so the load asks nothing of it; and `lib`, rejected
-// whole, is asked for none of its groups.
-test "a load that rejects says what it took and ran, which is nothing of a module that imports the one that rejected" {
+test "a load that fails reports the work it did, and does no work for a module that imports the failed module" {
   scratch(|| {
     write_project([
       { path: "lib.ply", text: "pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n" },
@@ -115,7 +104,8 @@ test "a load that rejects says what it took and ran, which is nothing of a modul
     assert_eq(cold.code, 2);
     let runs = items(path(json_of(cold), ["front_end", "queries"])).fold(
       Map::new(),
-      |acc: Map<String, Int>, q: Json| acc.insert(str(at(q, "query")), int(at(q, "run"))),
+      |accumulator: Map<String, Int>, q: Json|
+        accumulator.insert(str(at(q, "query")), int(at(q, "run"))),
     );
     assert_eq(runs.get_or("module", 0), 1);
     assert_eq(runs.get_or("group", 0), 0);
@@ -127,15 +117,12 @@ test "a load that rejects says what it took and ran, which is nothing of a modul
   })
 }
 
-/// What the cost pass walked of the project here: the bodies it walked, and the modules it lowered.
 fn cost_pass() -> { walked: Int, lowered: Int } / {CliEffects, Shipped, abort.raise, diverges} = {
   let c = path(json_of(on_disk(["check", "--json", "--explain", "--costs"])), ["cost_pass"]);
   { walked: int(at(c, "walked")), lowered: int(at(c, "lowered")) }
 }
 
-// The cost pass stores each module's walks under its text and what its check read, so an edit walks
-// the bodies of the module it moved and those that read what a moved body returns.
-test "an edit walks only the bodies whose walk it moved" {
+test "an edit reruns the cost analysis only on bodies whose analysis result changed" {
   scratch(|| {
     write_project([
       { path: "a.ply", text: "pub fn mk(n: Int) -> List<Int> = range(0, n)\n" },
@@ -163,7 +150,7 @@ test "an edit walks only the bodies whose walk it moved" {
   })
 }
 
-test "an unchanged check takes the result its last one recorded, and an edit checks again" {
+test "an unchanged check reuses the result of the previous check, and an edit makes it check again" {
   scratch(|| {
     shop_project();
     let first = json_of(on_disk(["check", "--json"]));
@@ -178,7 +165,7 @@ test "an unchanged check takes the result its last one recorded, and an edit che
   })
 }
 
-test "a file no package holds is checked with the module it imports, until that module is gone" {
+test "`ply check` on a file outside any package also checks the module it imports, and fails with E0106 once that module is deleted" {
   scratch(|| {
     write_project([
       { path: "main.ply", text: "import beside\n\npub fn main() -> Int = beside::two()\n" },
@@ -187,7 +174,6 @@ test "a file no package holds is checked with the module it imports, until that 
     ]);
     let cold = json_of(on_disk(["check", "main.ply", "--json"]));
     assert_eq(own_modules(cold).sort(), ["beside", "main"]);
-    // The file's load sees less than the directory's, and leaves what that one cached standing.
     let whole = json_of(on_disk(["check", ".", "--json"]));
     assert(int(at(whole, "exit_code")) == 0, Some(json_text(whole)));
     let warm = on_disk(["check", "main.ply"]);
@@ -200,7 +186,7 @@ test "a file no package holds is checked with the module it imports, until that 
   })
 }
 
-test "an unchanged listing takes the result its last one cached, and an edit lists again" {
+test "a repeated `ply definitions` run with no edits reuses the previous run's result, and an edit makes it recompute" {
   scratch(|| {
     shop_project();
     let first = json_of(on_disk(["definitions", "--json"]));
@@ -214,7 +200,7 @@ test "an unchanged listing takes the result its last one cached, and an edit lis
   })
 }
 
-test "a check that cannot record its result still succeeds, and says it recorded nothing" {
+test "a check that cannot record its result still succeeds, and reports that it recorded nothing" {
   scratch(|| {
     shop_project();
     write(".ply-cache/memo", "a file where the memo store would go");
@@ -243,7 +229,6 @@ test "a project that imports `std.fs` and opens no file checks, cold and warm" {
 
 fn streaming() -> String = String::of_bytes_lossy(embed("../programs/incremental/streaming.ply"))
 
-// The project names three of `std.io`'s functions, so its load is what those reach.
 test "a project that streams a file through `std.io` checks, cold and warm" {
   scratch(|| {
     write_project([{ path: "m.ply", text: streaming() }]);
@@ -255,8 +240,6 @@ test "a project that streams a file through `std.io` checks, cold and warm" {
   })
 }
 
-// Structurally identical definitions in two modules share a hash while their schemes name different
-// types: each is recorded under its own name, and each is seeded with its own row.
 test "two definitions that share a hash each keep their own interface" {
   scratch(|| {
     let body = "pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
@@ -281,13 +264,11 @@ test "two definitions that share a hash each keep their own interface" {
           ++ json_text(b),
       ),
     );
-    // Each has a slot of its own under the shared hash, holding its own interface.
     assert(str(path(a, ["interface", "type"])) == "(a.Thing) -> Int", Some(json_text(a)));
     assert(str(path(b, ["interface", "type"])) == "(b.Thing) -> Int", Some(json_text(b)))
   })
 }
 
-/// Each segment the memo store here has, rewritten as `f` makes it of what it held.
 fn segments_rewritten(
   f: (Bytes) -> Bytes / {abort.raise},
 ) -> Unit / {WorkingDirectory, abort.raise} = {
@@ -296,7 +277,7 @@ fn segments_rewritten(
     match listed_names(fs.list_dir[cwd](dir)) { Some(names) -> names, None -> [] },
     |name: String| name.starts_with("seg-"),
   );
-  if names.len() == 0 { panic("the run kept no segment") };
+  if names.len() == 0 { panic("the run retained no segment") };
   names.fold((), |u: Unit, name: String| {
     let path = dir ++ "/" ++ name;
     let bytes = match fs.read_file[cwd](path) { Some(b) -> b, None -> b"" };
@@ -304,24 +285,24 @@ fn segments_rewritten(
   })
 }
 
-test "a memo store whose records do not read degrades to a cold check and is repaired" {
+test "a cache whose records cannot be read falls back to a cold check, and the records are rewritten" {
   scratch(|| {
     shop_project();
     let _ = warm_matches_cold("cold");
     segments_rewritten(|_: Bytes| b"not a segment at all");
-    // What is taken is what the toolchain supplies.
     let damaged = module_reuse();
     assert(
       damaged.cached == damaged.shipped,
       Some("nothing is taken from a record that did not read"),
     );
     let _ = warm_matches_cold("after the records were rewritten");
-    assert(module_reuse().checked == 0, Some("the run that met the damage kept its records again"))
+    assert(
+      module_reuse().checked == 0,
+      Some("the run that found the damage retained its records again"),
+    )
   })
 }
 
-// Mangled past its first bytes rather than replaced: a segment whose rows do not match their
-// checksum is no segment.
 test "a cache mangled mid-session degrades and recovers" {
   scratch(|| {
     shop_project();
@@ -355,9 +336,7 @@ fn lib_dependency(at_path: String) -> String =
   "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"" ++ at_path
     ++ "\")}"
 
-// A `reuse fn` is checked whole-program, so a warm check must reject a broken promise as a cold one
-// does.
-test "a promise is known on every run and still rejected" {
+test "a `reuse fn` that fails its check is rejected with E0127 on both the first and the second run" {
   scratch(|| {
     write_project([
       {
@@ -378,7 +357,7 @@ test "a promise is known on every run and still rejected" {
 
 fn measured() -> String = String::of_bytes_lossy(embed("../programs/incremental/measured.ply"))
 
-test/nondet "a load that pulls shipped modules returns what a load of their source does" {
+test/nondet "a cached load of a project and the standard library modules it imports gives the same results as a load from source" {
   write_project([{ path: "app.ply", text: measured() }]);
   let _ = warm_matches_cold("cold");
   let _ = warm_matches_cold("warm");
@@ -399,7 +378,6 @@ test/nondet "a load that pulls shipped modules returns what a load of their sour
     warm_single == cold_single,
     Some("warm: " ++ json_text(warm_single) ++ "\ncold: " ++ json_text(cold_single)),
   );
-  // `replace` re-checks a spliced program as the load read it.
   write("distance.txt", "pub fn distance(a: Int, b: Int) -> Int = abs(b - a)\n");
   let replaced = on_disk(["replace", "distance", "--with", "distance.txt"]);
   assert(replaced.code == 0, Some(all_output(replaced)));
@@ -408,7 +386,7 @@ test/nondet "a load that pulls shipped modules returns what a load of their sour
   assert(!fs.exists[cwd](".ply-cache/memo"), Some("clearing the cache discards the memo store"))
 }
 
-test/nondet "a dependency's modules return what their source does" {
+test/nondet "a cached load of a project with a dependency gives the same results as a load from source, before and after an edit" {
   packaged_project();
   let check = ["check", "app", "--explain", "--json"];
   let agrees = |what: String| {
@@ -421,19 +399,16 @@ test/nondet "a dependency's modules return what their source does" {
   };
   agrees("cold");
   agrees("warm");
-  assert(module_reuse_at("app").checked == 0, Some("every module is taken as kept"));
-  // A dependency's unused definition is its own package's to report.
+  assert(module_reuse_at("app").checked == 0, Some("every module is treated as unchanged"));
   assert(!diagnostic_codes(json_of(on_disk(["check", "app", "--json"]))).contains("W0611"), None);
   assert(diagnostic_codes(json_of(on_disk(["check", "lib", "--json"]))).contains("W0611"), None);
   edit("lib/answer.ply", "= 42", "= {\n  let _ = helper();\n  42\n}");
-  // The dependency's body moved, and neither its contract nor what it publishes did: its module
-  // alone is checked again.
   assert(module_reuse_at("app").checked == 1, Some("only the edited module is checked"));
   agrees("after the dependency moved");
   agrees("and again")
 }
 
-test "a `reuse fn` keeps its promise through another package's `returns` clause" {
+test "a `reuse fn` passes its check using another package's `returns fresh` clause, and fails with E0127 once the clause is removed" {
   scratch(|| {
     write_project([
       { path: "app/ply.pkg", text: manifest("app", lib_dependency("../lib")) },
@@ -447,21 +422,18 @@ test "a `reuse fn` keeps its promise through another package's `returns` clause"
         text: "pub fn made(n: Int) -> List<Int>\n  returns fresh\n= range(0, n)\n",
       },
     ]);
-    let kept = json_of(on_disk(["check", "app", "--json"]));
-    assert(int(at(kept, "exit_code")) == 0, Some(json_text(kept)));
+    let unchanged_report = json_of(on_disk(["check", "app", "--json"]));
+    assert(int(at(unchanged_report, "exit_code")) == 0, Some(json_text(unchanged_report)));
     assert(on_disk(["check", "lib"]).code == 0, None);
-    // Without the clause nothing says the result is fresh, whatever the body does.
     edit("lib/lists.ply", "  returns fresh\n", "");
     let rejected = json_of(on_disk(["check", "app", "--json"]));
     assert(diagnostic_codes(rejected).contains("E0127"), Some(json_text(rejected)))
   })
 }
 
-/// `ply` with its compile faked and every entry returning, which is all a test here reads of one.
 fn faked(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
   on_disk_faked(argv, passing_except([]))
 
-/// What a report's `front_end` ran of every query its load asked.
 fn bodies_run(front: Json) -> Int =
   items(at(front, "queries")).fold(0, |n: Int, q: Json| n + int(at(q, "run")))
 
@@ -501,8 +473,7 @@ fn assert_cache_empty(what: String) -> Unit / {fs.list_dir[cwd], abort.raise} =
     Some(what ++ " recorded into the cache"),
   )
 
-// What turns caching off files nothing: `ply build`, `ply hosts` and `--no-cache`.
-test "a command that does not cache files nothing" {
+test "`ply test --no-cache`, `ply hosts` and `ply build` write nothing to the cache" {
   scratch(|| {
     write_project([
       { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
@@ -519,8 +490,6 @@ test "a command that does not cache files nothing" {
   })
 }
 
-// A warm `ply prove` resolves every obligation from the cache, across modules that import one
-// another.
 test "a warm prove resolves every obligation from the cache" {
   scratch(|| {
     write_project([
@@ -555,7 +524,6 @@ test "a warm prove resolves every obligation from the cache" {
           \\
       },
     ]);
-    // A clause's entry returns a `Bool`, and this run's first pass is to find each one holds.
     let proved = |args: List<String>|
       on_disk_faked(["prove", "."].concat(args), |name: String| returned(VBool(true)));
     let first_run = proved([]);
@@ -585,10 +553,8 @@ test "a dependency's body moved leaves its proof standing, and its test runs aga
       int(path(json_of(faked(["test", "app", "--json"])), ["selection", "cached"])) == 0,
       None,
     );
-    // A run answers for its own package; the dependency's obligation is its own run's.
     assert_eq(owners(json_of(faked(["prove", "app", "--json"]))), ["main.kept"]);
     assert_eq(owners(json_of(faked(["prove", "lib", "--json"]))), ["more.more"]);
-    // `--workspace` runs each package it reaches by path as its own root, dependencies first.
     let both = items(at(json_of(faked(["prove", "app", "--workspace", "--json"])), "packages"));
     assert_eq(both.map(|p: Json| str(at(p, "root"))), ["lib", "app"]);
     assert_eq(both.map(|p: Json| owners(at(p, "answer"))), [["more.more"], ["main.kept"]])
@@ -617,7 +583,7 @@ test "a dependent proves through a transparent definition, and is proved again w
   })
 }
 
-test "an unwritable store never fails a run and says what failed" {
+test "`test` still succeeds when the cache cannot be written, and it reports a warning naming the failed write" {
   scratch(|| {
     write_project([
       { path: "m.ply", text: "pub fn f() -> Int = 1\n\ntest \"one\" {\n  assert_eq(f(), 1)\n}\n" },
@@ -630,7 +596,6 @@ test "an unwritable store never fails a run and says what failed" {
       [name, ..] -> ".ply-cache/" ++ name,
       [] -> panic("the run recorded no store"),
     };
-    // `rename` cannot replace a directory, so only the manifest's atomic write fails.
     if !(fs.remove[cwd](manifest) && fs.create_dir[cwd](manifest)) {
       panic("the blocking directory is made")
     };

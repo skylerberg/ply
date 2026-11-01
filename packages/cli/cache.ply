@@ -8,8 +8,8 @@ import compiler.front.facts (CheckedProgram)
 import compiler.front.rows (OutlineItem, OutlinedType, KnownTestRow)
 import compiler.front.published (StoredBody, stored_bodies)
 import compiler.front.emitter_input (all_body_facts, definition_known_row)
-import compiler.check.infer.checker (ConstructorInfo, DefinitionInfo, EffectInfo, OpInfo, TestInfo,
-                                     Location)
+import compiler.check.infer.checker (ConstructorInfo, DefinitionInfo, EffectInfo, OperationInfo,
+                                     TestInfo, Location)
 import compiler.store.memo_files
 import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.syntax.type_syntax (mode_text)
@@ -91,7 +91,7 @@ pub type Operation = {
   name: String,
   resource: Bool,
   params: List<String>,
-  ret: String,
+  return_type: String,
 }
 
 pub type Interface =
@@ -266,7 +266,11 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
   } else { head };
   if stats.results == 0 { advised } else {
     advised.push(
-      indent() ++ "  " ++ dim(style, "a result entry is one proven configuration, not one test"),
+      indent() ++ "  "
+        ++ dim(
+          style,
+          "the cache stores one result per test per version of its code, so a test can have several results",
+        ),
     )
   }
 }
@@ -300,7 +304,10 @@ fn compact_lines(style: Style, c: CompactResult) -> List<String> / {abort.raise}
   let d = c.dropped;
   let head = [indent() ++ green(style, "compacted") ++ " " ++ dim(style, c.directory)];
   let pruned = if d.texts == 0 { head } else {
-    head.push(indent() ++ "  dropped " ++ count_of(d.texts, "definition text") ++ " no pass ran")
+    head.push(
+      indent() ++ "  dropped " ++ count_of(d.texts, "cached source text")
+        ++ " that no check or build used",
+    )
   };
   let swept = if c.memo.records + c.memo.results == 0 { pruned } else {
     pruned.push(
@@ -320,7 +327,9 @@ fn compact_lines(style: Style, c: CompactResult) -> List<String> / {abort.raise}
         ++ " reclaimed)",
     )
   };
-  sized.push(indent() ++ "  " ++ dim(style, "every result is kept, so no test re-runs"))
+  sized.push(
+    indent() ++ "  " ++ dim(style, "compacting keeps every test result, so no test runs again"),
+  )
 }
 
 fn clear_json(c: ClearResult) -> Json / {abort.raise} =
@@ -375,7 +384,7 @@ fn variant_text(v: Variant) -> String =
 fn operation_text(o: Operation) -> String = {
   let resource = if o.resource { "[r]" } else { "" };
   o.mode ++ " " ++ o.name ++ resource ++ "(" ++ String::join(o.params, ", ") ++ ")"
-    ++ (if o.mode == "raise" { "" } else { " -> " ++ o.ret })
+    ++ (if o.mode == "raise" { "" } else { " -> " ++ o.return_type })
 }
 
 fn labeled_fields(label: String, values: List<String>) -> List<Field> =
@@ -389,9 +398,9 @@ fn rows_of(entry: Entry) -> List<Field> = {
       [{ label: "parameters", value: parameters.to_string() }].concat(
         labeled_fields("variants", variants.map(variant_text)),
       ),
-    EffectInterface(nd, ops) ->
+    EffectInterface(nd, operations) ->
       [{ label: "nondet", value: yes_no(nd) }].concat(
-        labeled_fields("operations", ops.map(operation_text)),
+        labeled_fields("operations", operations.map(operation_text)),
       ),
     TestInterface(nd) -> [{ label: "nondet", value: yes_no(nd) }],
   };
@@ -403,26 +412,27 @@ fn rows_of(entry: Entry) -> List<Field> = {
 
 fn not_a_test(entry: Entry) -> String =
   match entry.interface {
-    TestInterface(_) -> "— not proven at this hash, so it runs next time",
+    TestInterface(_) ->
+      "— no passing result is cached for this version of the test, so it runs next time",
     _ -> "— not a test",
   }
 
 fn result_line(entry: Entry) -> String =
   match entry.outcome {
-    Some(Passed) -> "passed — this hash re-runs only when something its run read changes",
+    Some(Passed) -> "passed — the test runs again only when something it read changes",
     Some(Failed(message)) -> "failed: " ++ message,
     None -> not_a_test(entry),
   }
 
 fn effect_hashes_line(e: Entry) -> String =
-  if e.effect_hashes.len() == 0 { "— names no effect" } else {
+  if e.effect_hashes.len() == 0 { "— no effects" } else {
     String::join(e.effect_hashes.map(|w: EffectHash| w.name ++ " → " ++ short_hash(w.hash)), ", ")
   }
 
 fn body_line(entry: Entry) -> String / {abort.raise} =
   match entry.body {
     Some(bytes) -> count_of(bytes, "byte"),
-    None -> "— none: a declaration's is its form",
+    None -> "— no body: this declaration states only a signature",
   }
 
 fn field_line(label: String, value: String) -> String =
@@ -434,8 +444,8 @@ fn entry_lines(style: Style, entry: Entry) -> List<String> / {abort.raise} = {
     ++ kind_text(entry.kind)
     ++ "  "
     ++ dim(style, entry_location(entry));
-  let shape = rows_of(entry).fold([head], |acc: List<String>, f: Field|
-    acc.push(field_line(f.label, f.value)));
+  let shape = rows_of(entry).fold([head], |accumulator: List<String>, f: Field|
+    accumulator.push(field_line(f.label, f.value)));
   shape.concat([
     field_line("effects", effect_hashes_line(entry)),
     field_line("body", body_line(entry)),
@@ -451,10 +461,10 @@ fn interface_json(i: Interface) -> Json =
         { key: "parameters", value: int(parameters) },
         { key: "variants", value: strings(variants.map(variant_text)) },
       ]),
-    EffectInterface(nd, ops) ->
+    EffectInterface(nd, operations) ->
       object([
         { key: "nondet", value: Bool(nd) },
-        { key: "operations", value: strings(ops.map(operation_text)) },
+        { key: "operations", value: strings(operations.map(operation_text)) },
       ]),
     TestInterface(nd) -> object([{ key: "nondet", value: Bool(nd) }]),
   }
@@ -494,12 +504,12 @@ fn before(a: Entry, b: Entry) -> Bool =
   }
 
 fn sorted_entries(entries: List<Entry>) -> List<Entry> =
-  entries.fold([], |acc: List<Entry>, entry: Entry| {
-    let n = acc.len();
+  entries.fold([], |accumulator: List<Entry>, entry: Entry| {
+    let n = accumulator.len();
     let i = range(0, n).fold(n, |p: Int, j: Int|
-      if p < n { p } else if before(entry, acc.at_or(j, entry)) { j } else { p });
-    range(0, i).map(|j: Int| acc.at_or(j, entry)).push(entry).concat(
-      range(i, n).map(|j: Int| acc.at_or(j, entry)),
+      if p < n { p } else if before(entry, accumulator.at_or(j, entry)) { j } else { p });
+    range(0, i).map(|j: Int| accumulator.at_or(j, entry)).push(entry).concat(
+      range(i, n).map(|j: Int| accumulator.at_or(j, entry)),
     )
   })
 
@@ -520,8 +530,11 @@ fn inspect_lines(
   query: String,
   entries: List<Entry>,
 ) -> List<String> / {abort.raise} = {
-  let body = entries.fold([], |acc: List<String>, entry: Entry|
-    List::concat(if acc.len() == 0 { acc } else { acc.push("") }, entry_lines(style, entry)));
+  let body = entries.fold([], |accumulator: List<String>, entry: Entry|
+    List::concat(
+      if accumulator.len() == 0 { accumulator } else { accumulator.push("") },
+      entry_lines(style, entry),
+    ));
   if entries.len() < 2 { body } else {
     body.concat([
       "",
@@ -714,13 +727,13 @@ fn file_location(
     None -> { file: "", location: None },
   }
 
-fn operation_of(o: OpInfo) -> Operation / {abort.raise} =
+fn operation_of(o: OperationInfo) -> Operation / {abort.raise} =
   {
     mode: String::of_bytes_lossy(mode_text(o.mode)),
     name: String::of_bytes_lossy(o.name),
     resource: o.resource_param,
     params: o.params.map(|t: Type| String::of_bytes_lossy(type_text(t))),
-    ret: String::of_bytes_lossy(type_text(o.ret)),
+    return_type: String::of_bytes_lossy(type_text(o.return_type)),
   }
 
 fn matches_in(
@@ -734,19 +747,19 @@ fn matches_in(
   let read = all_body_facts(w.checked);
   let bodies = stored_bodies(w.frame.hashes).fold(
     Map::new(),
-    |acc: Map<Bytes, Int>, b: StoredBody| acc.insert(b.hash, b.body.len()),
+    |accumulator: Map<Bytes, Int>, b: StoredBody| accumulator.insert(b.hash, b.body.len()),
   );
   let hash_of = |name: Bytes, m: Map<Bytes, Bytes>| match m.get(name) { Some(h) -> h, None -> b"" };
   let body_of = |hash: Bytes| bodies.get(hash);
-  let functions = w.checked.definitions.fold([], |acc: List<Entry>, d: DefinitionInfo| {
+  let functions = w.checked.definitions.fold([], |accumulator: List<Entry>, d: DefinitionInfo| {
     let hash = hash_of(d.name, definitions);
-    if !matches_query(query, d.name, hash) { acc } else {
+    if !matches_query(query, d.name, hash) { accumulator } else {
       let at = file_location(program, d.at);
       let row = match definitions.get(d.name) {
         Some(h) -> Some(definition_known_row(declarations, d, h, read)),
         None -> None,
       };
-      acc.push({
+      accumulator.push({
         name: String::of_bytes_lossy(d.name),
         kind: FnEntry,
         hash: hash.hex_of(),
@@ -763,46 +776,49 @@ fn matches_in(
       })
     }
   });
-  let types = range(0, w.frame.outlines.len()).fold(functions, |acc: List<Entry>, i: Int| {
-    let o = w.frame.outlines.get(i);
-    o.items.fold(acc, |a: List<Entry>, item: OutlineItem|
-      match item {
-        OutlinedType(t) -> {
-          let name = qualify(o.name, t.name);
-          let hash = hash_of(name, declarations);
-          if !matches_query(query, name, hash) { a } else {
-            let at = file_location(program, { module: i, span: t.span });
-            a.push({
-              name: String::of_bytes_lossy(name),
-              kind: TypeEntry,
-              hash: hash.hex_of(),
-              file: at.file,
-              location: at.location,
-              interface: TypeInterface(
-                t.arity,
-                w.checked.constructors.filter(|c: ConstructorInfo| c.type_name == name).map(
-                  |c: ConstructorInfo|
-                    {
-                      name: String::of_bytes_lossy(c.simple_name),
-                      fields: c.fields.map(|f: Type| String::of_bytes_lossy(type_text(f))),
-                    },
+  let types = range(0, w.frame.outlines.len()).fold(
+    functions,
+    |accumulator: List<Entry>, i: Int| {
+      let o = w.frame.outlines.get(i);
+      o.items.fold(accumulator, |a: List<Entry>, item: OutlineItem|
+        match item {
+          OutlinedType(t) -> {
+            let name = qualify(o.name, t.name);
+            let hash = hash_of(name, declarations);
+            if !matches_query(query, name, hash) { a } else {
+              let at = file_location(program, { module: i, span: t.span });
+              a.push({
+                name: String::of_bytes_lossy(name),
+                kind: TypeEntry,
+                hash: hash.hex_of(),
+                file: at.file,
+                location: at.location,
+                interface: TypeInterface(
+                  t.arity,
+                  w.checked.constructors.filter(|c: ConstructorInfo| c.type_name == name).map(
+                    |c: ConstructorInfo|
+                      {
+                        name: String::of_bytes_lossy(c.simple_name),
+                        fields: c.fields.map(|f: Type| String::of_bytes_lossy(type_text(f))),
+                      },
+                  ),
                 ),
-              ),
-              effects: None,
-              effect_hashes: [],
-              body: None,
-              outcome: None,
-            })
-          }
-        },
-        _ -> a,
-      })
-  });
-  let effects = w.checked.effects.fold(types, |acc: List<Entry>, e: EffectInfo| {
+                effects: None,
+                effect_hashes: [],
+                body: None,
+                outcome: None,
+              })
+            }
+          },
+          _ -> a,
+        })
+    },
+  );
+  let effects = w.checked.effects.fold(types, |accumulator: List<Entry>, e: EffectInfo| {
     let hash = hash_of(e.name, declarations);
-    if !matches_query(query, e.name, hash) { acc } else {
+    if !matches_query(query, e.name, hash) { accumulator } else {
       let at = file_location(program, e.at);
-      acc.push({
+      accumulator.push({
         name: String::of_bytes_lossy(e.name),
         kind: EffectEntry,
         hash: hash.hex_of(),
@@ -818,14 +834,15 @@ fn matches_in(
   });
   let rows = emitter_input::rows_from(w.checked, w.frame.hashes).tests.fold(
     Map::new(),
-    |acc: Map<Bytes, KnownTestRow>, r: KnownTestRow| acc.insert(r.key, r),
+    |accumulator: Map<Bytes, KnownTestRow>, r: KnownTestRow| accumulator.insert(r.key, r),
   );
-  w.checked.tests.fold(effects, |acc: List<Entry>, t: TestInfo| {
+  w.checked.tests.fold(effects, |accumulator: List<Entry>, t: TestInfo| {
     let hash = match w.frame.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" };
-    if !matches_query(query, t.name, hash) && !matches_query(query, t.key, hash) { acc } else {
+    if !matches_query(query, t.name, hash) && !matches_query(query, t.key, hash) { accumulator }
+    else {
       let at = file_location(program, t.at);
       let row = rows.get(t.key);
-      acc.push({
+      accumulator.push({
         name: String::of_bytes_lossy(t.name),
         kind: TestEntry(t.nondet),
         hash: hash.hex_of(),
@@ -857,8 +874,9 @@ fn inspect_store<[r]>(
       let c = tables::open_cache[r](place.dir, place.stamps);
       let proven = w.frame.hashes.tests.values().fold(
         Map::new(),
-        |acc: Map<Bytes, Bool>, h: Bytes|
-          if tables::passed[r](c, h).value == Some(true) { acc.insert(h, true) } else { acc },
+        |accumulator: Map<Bytes, Bool>, h: Bytes|
+          if tables::passed[r](c, h).value == Some(true) { accumulator.insert(h, true) }
+          else { accumulator },
       );
       Ok({
         directory: display_path(place, ""),
@@ -936,7 +954,7 @@ fn an_entry() -> Entry =
     outcome: None,
   }
 
-test "a size is exact in bytes and two decimals above that" {
+test "`size_text` shows bytes exactly and larger sizes in KiB or MiB with two decimal places" {
   assert_eq(size_text(0), "0 B");
   assert_eq(size_text(999), "999 B");
   assert_eq(size_text(1024), "1.00 KiB");
@@ -944,7 +962,7 @@ test "a size is exact in bytes and two decimals above that" {
   assert_eq(size_text(1048575), "1.00 MiB")
 }
 
-test "a store half of whose bytes are unreachable is where compaction starts being suggested" {
+test "`compact_suggested` is true only when more than half of a store's bytes are garbage that compaction would remove" {
   let half: Stats = { ..no_stats(), data_bytes: 1000, garbage_bytes: 400 };
   assert(!compact_suggested(half));
   assert(compact_suggested({ ..half, garbage_bytes: 501 }));
@@ -963,7 +981,7 @@ test "a store half of whose bytes are unreachable is where compaction starts bei
   assert(!compact_suggested({ ..half, memo: { ..results, reclaimable_bytes: 600 } }))
 }
 
-test "the statistics read as five lines and the sizes under them" {
+test "`stats_lines` prints the cache directory, open time, format and counts, followed by lines for the store and result sizes" {
   let st: Stats = {
     ..no_stats(),
     open_us: 1234,
@@ -999,7 +1017,10 @@ test "the statistics read as five lines and the sizes under them" {
     lines.at_or(8, ""),
     "     2 segments 4.00 KiB · results 2.00 KiB · reclaimable 1.00 KiB (2 records of another `ply`)",
   );
-  assert_eq(lines.at_or(9, ""), "     a result entry is one proven configuration, not one test")
+  assert_eq(
+    lines.at_or(9, ""),
+    "     the cache stores one result per test per version of its code, so a test can have several results",
+  )
 }
 
 test "an empty store has nothing to reclaim and no note about what an entry counts" {
@@ -1021,7 +1042,7 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
   assert_eq(compact_lines(plain(), c), [
     "   compacted /p/.ply-cache",
     "     900 B · nothing to reclaim",
-    "     every result is kept, so no test re-runs",
+    "     compacting keeps every test result, so no test runs again",
   ]);
   let swept: CompactResult = {
     ..c,
@@ -1031,10 +1052,10 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
   };
   assert_eq(compact_lines(plain(), swept), [
     "   compacted /p/.ply-cache",
-    "     dropped 2 definition texts no pass ran",
+    "     dropped 2 cached source texts that no check or build used",
     "     dropped 1 record · 3 results nothing reads",
     "     900 B → 400 B (500 B reclaimed)",
-    "     every result is kept, so no test re-runs",
+    "     compacting keeps every test result, so no test runs again",
   ])
 }
 
@@ -1053,22 +1074,22 @@ test "a function's entry prints its resolved type rather than a serialization" {
     "   m.active  9f2c1a4e8b03  fn  m.ply:4:1",
     "     type       (Int) -> List<Int>",
     "     performs   {m.db.read[users]}",
-    "     effects    — names no effect",
-    "     body       — none: a declaration's is its form",
+    "     effects    — no effects",
+    "     body       — no body: this declaration states only a signature",
     "     result     — not a test",
   ])
 }
 
 test "an effect declaration is one row per operation, and a type one per variant" {
-  let ops = [
-    { mode: "read", name: "now", resource: false, params: [], ret: "Int" },
-    { mode: "write", name: "set", resource: true, params: ["Int"], ret: "Unit" },
+  let operations = [
+    { mode: "read", name: "now", resource: false, params: [], return_type: "Int" },
+    { mode: "write", name: "set", resource: true, params: ["Int"], return_type: "Unit" },
   ];
   let e: Entry = {
     ..an_entry(),
     name: "m.wall",
     kind: EffectEntry,
-    interface: EffectInterface(true, ops),
+    interface: EffectInterface(true, operations),
   };
   assert_eq(rows_of(e), [
     { label: "nondet", value: "yes" },
@@ -1091,21 +1112,24 @@ test "an effect declaration is one row per operation, and a type one per variant
   ])
 }
 
-test "a test's result line says whether this very hash is proven" {
+test "a test's result line says whether the test has a recorded pass at its current hash, and so whether it will run again" {
   let unproven: Entry = {
     ..an_entry(),
     name: "one is one",
     kind: TestEntry(false),
     interface: TestInterface(false),
   };
-  assert_eq(result_line(unproven), "— not proven at this hash, so it runs next time");
+  assert_eq(
+    result_line(unproven),
+    "— no passing result is cached for this version of the test, so it runs next time",
+  );
   assert_eq(
     result_line({ ..unproven, kind: TestEntry(true), interface: TestInterface(true) }),
-    "— not proven at this hash, so it runs next time",
+    "— no passing result is cached for this version of the test, so it runs next time",
   );
   assert_eq(
     result_line({ ..unproven, outcome: Some(Passed) }),
-    "passed — this hash re-runs only when something its run read changes",
+    "passed — the test runs again only when something it read changes",
   );
   assert_eq(result_line({ ..unproven, outcome: Some(Failed("1 != 2")) }), "failed: 1 != 2");
   assert_eq(title_of(unproven), "\"one is one\"");
@@ -1124,7 +1148,7 @@ test "a name declared twice is ordered by name, then hash, then file" {
   ])
 }
 
-test "a second match is separated by a blank line and counted under both" {
+test "`inspect_lines` puts a blank line between the output for two matching entries, and ends with a line giving the number of entries matched" {
   let one: Entry = { ..an_entry(), name: "alpha.shared", file: "alpha.ply" };
   let two: Entry = { ..an_entry(), name: "beta.shared", file: "beta.ply" };
   let lines = inspect_lines(plain(), "shared", [one, two]);
@@ -1155,7 +1179,7 @@ fn flags_of(action: String, query: String, json: Bool) -> Flags =
 fn only_stats(flags: Flags, stats: Stats) -> CommandOutput / {abort.raise} =
   run_with(flags, Ok(stats), Err(no_rejection()), Err(no_rejection()), Err(no_rejection()))
 
-test "the action picks the subcommand, and its object keys off `command` and `action`" {
+test "the `action` flag selects the cache subcommand, and the JSON output contains `command` and `action`" {
   let result = only_stats(flags_of("stats", "", true), { ..no_stats(), results: 2, data_bytes: 8 });
   assert_eq(result.code, 0);
   assert_eq(result.errs, []);
@@ -1168,7 +1192,7 @@ test "the action picks the subcommand, and its object keys off `command` and `ac
   assert(text.contains("\"format\":1"))
 }
 
-test "a store that never opened is exit 2 and names no cache" {
+test "a cache store that cannot be opened exits with code 2 and its JSON output has no cache directory" {
   let reason: Rejection = {
     directory: None,
     diagnostics: [

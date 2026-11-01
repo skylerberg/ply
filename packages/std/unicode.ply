@@ -1,25 +1,25 @@
 //! Text as Unicode compares it: the four normalization forms, full case mapping and case folding,
 //! and case-insensitive matching.
 //!
-//! One text can be written several ways, such as an accented letter as one character or as a
-//! letter followed by a mark. A normalization form picks one way. `nfc` and `nfd` keep the text's
+//! One text can be written several ways, such as an accented letter as one character or as a letter
+//! followed by a mark. A normalization form picks one way. `nfc` and `nfd` preserve the text's
 //! meaning, and canonically equivalent texts have the same NFC and the same NFD: `equivalent`
-//! compares by them. `nfkc` and `nfkd` also replace compatibility characters, such as a ligature
-//! or a full-width letter, by what they represent, which loses the distinction. Most text is
-//! already in the requested form, and one pass that builds nothing detects that: in a fixed number
-//! of steps for ASCII, and in two steps per character for other text. Hangul syllables are
-//! composed and decomposed by arithmetic. Nothing limits how many marks may follow one character,
-//! so a text is reordered as a whole. `stream_safe` applies the standard's limit of thirty, for
-//! code that must reorder text as it arrives.
+//! compares by them. `nfkc` and `nfkd` also replace compatibility characters, such as a ligature or
+//! a full-width letter, by what they represent, which loses the distinction. Most text is already
+//! in the requested form, so each function first scans the text without building anything to check
+//! this. The scan takes constant time for ASCII and time proportional to the number of characters
+//! for other text. Hangul syllables are composed and decomposed by arithmetic. Nothing limits how
+//! many marks may follow one character, so a text is reordered as a whole. `stream_safe` applies
+//! the standard's limit of thirty, for code that must reorder text as it arrives.
 //!
 //! `uppercase`, `lowercase` and `titlecase` are the full case mappings, which the one-character
 //! mappings of `std.char` cannot express: `U+00DF` in capitals is two letters, a capital sigma
 //! lowers to one of two letters depending on its position, and Turkish, Azeri and Lithuanian map
 //! `i` their own way. A language's mappings are requested by name, as a `Tailoring`. Nothing is
-//! read from the environment a program runs in. `case_fold` is for comparing, not for display,
-//! and `caseless` is the comparison. Folding alone misses texts that differ only in how they write
-//! an accent, so `caseless` folds between two decompositions, as the standard defines a canonical
-//! caseless match.
+//! read from the environment a program runs in. `case_fold` is for comparing, not for display, and
+//! `caseless` is the comparison. Folding alone misses texts that differ only in how they write an
+//! accent, so `caseless` decomposes, folds, decomposes again and folds again, as the standard
+//! defines a canonical caseless match.
 //!
 //! The tables come from `std.ucd`, for the Unicode version it names. `std.segment` splits a text
 //! into what a reader sees as characters, or into words, and `std.width` measures its width in a
@@ -34,20 +34,7 @@ import std.ucd
 import std.ucd (SequencePool, Run, Table, ValueRun)
 import std.gen
 
-// --- Normalization data -----------------------------------------------------------
-
-/// The contents of `ucd/normalization.txt`, arranged for lookup.
-type NormalizationTable = {
-  /// One word per code point: its combining class in the low eight bits, a bit for each quick
-  /// check that is not Yes, then the positions in `points` of its full canonical decomposition and
-  /// its full compatibility decomposition, twenty-two bits each and zero for none.
-  words: Table,
-  /// Every full decomposition, collected in one array.
-  points: Array<Int>,
-  /// The primary composite of each pair of code points, keyed by the first shifted above the
-  /// second.
-  pairs: Map<Int, Int>,
-}
+type NormalizationTable = { words: Table, points: Array<Int>, pairs: Map<Int, Int> }
 
 fn nfc_no() -> Int = 0x100
 
@@ -61,21 +48,20 @@ fn canonical_decomposition_position(word: Int) -> Int = word >> 12 & 0x3FFFFF
 
 fn compatibility_decomposition_position(word: Int) -> Int = word >> 34 & 0x3FFFFF
 
-/// The quick check bit that a table's letter represents.
 fn quick_bit(letter: Int) -> Int / {abort.raise} =
   match letter {
     b'C' -> nfc_no(),
     b'c' -> nfc_maybe(),
     b'K' -> nfkc_no(),
     b'k' -> nfkc_maybe(),
-    _ -> panic("a quick check is C, c, K or k"),
+    _ ->
+      panic(
+        "a quick check letter must be C (NFC no), c (NFC maybe), K (NFKC no) or k (NFKC maybe)",
+      ),
   }
 
-/// One step of a decomposition, and whether it is a compatibility one.
 type DecompositionMapping = { compatibility: Bool, to: List<Int> }
 
-/// A parsed line of the table: its run, class and quick checks, and its decomposition step if it
-/// has one.
 type Entry = { first: Int, last: Int, bits: Int, decomposition: Option<DecompositionMapping> }
 
 fn entry(run: Run) -> Entry / {abort.raise} = {
@@ -99,27 +85,22 @@ fn entry(run: Run) -> Entry / {abort.raise} = {
   }
 }
 
-/// The full decomposition of `cp`, applying steps recursively, and compatibility steps only when
-/// `compatibility` is true. `depth` limits the nesting of steps, which the database keeps to a few
-/// levels.
 fn expanded(
   steps: Map<Int, DecompositionMapping>,
-  cp: Int,
+  code_point: Int,
   compatibility: Bool,
   depth: Int,
 ) -> List<Int> =
-  if depth <= 0 { [cp] } else {
-    match steps.get(cp) {
-      None -> [cp],
-      Some(step) -> if step.compatibility && !compatibility { [cp] } else {
+  if depth <= 0 { [code_point] } else {
+    match steps.get(code_point) {
+      None -> [code_point],
+      Some(step) -> if step.compatibility && !compatibility { [code_point] } else {
         step.to.fold([], |all: List<Int>, next: Int|
           all.concat(expanded(steps, next, compatibility, depth - 1)))
       },
     }
   }
 
-/// The table while it is being built: the runs with their values, the decompositions collected so
-/// far, and the pairs.
 type NormalizationState = { valued: List<ValueRun>, gathering: SequencePool, pairs: Map<Int, Int> }
 
 fn normalization_table_of(runs: List<Run>) -> NormalizationTable / {abort.raise} = {
@@ -128,8 +109,10 @@ fn normalization_table_of(runs: List<Run>) -> NormalizationTable / {abort.raise}
     match e.decomposition {
       None -> all,
       Some(step) ->
-        range(e.first, e.last + 1).fold(all, |table: Map<Int, DecompositionMapping>, cp: Int|
-          table.insert(cp, step)),
+        range(e.first, e.last + 1).fold(
+          all,
+          |table: Map<Int, DecompositionMapping>, code_point: Int| table.insert(code_point, step),
+        ),
     });
   let made = entries.fold(
     { valued: [], gathering: ucd::empty_pool(), pairs: Map::new() },
@@ -171,13 +154,8 @@ fn normalization_table_of(runs: List<Run>) -> NormalizationTable / {abort.raise}
 const fn normalization_table() -> NormalizationTable =
   normalization_table_of(ucd::runs(embed("ucd/normalization.txt")))
 
-// --- Hangul -----------------------------------------------------------------------
+fn is_syllable(code_point: Int) -> Bool = code_point >= 0xAC00 && code_point <= 0xD7A3
 
-/// Whether `cp` is one of the 11172 Hangul syllables, which decompose and compose by arithmetic.
-fn is_syllable(cp: Int) -> Bool = cp >= 0xAC00 && cp <= 0xD7A3
-
-/// The syllable a leading consonant and a vowel make, or a syllable of those two and a trailing
-/// consonant; `-1` for any other pair.
 fn hangul_syllable(a: Int, b: Int) -> Int =
   if a >= 0x1100 && a <= 0x1112 && b >= 0x1161 && b <= 0x1175 {
     0xAC00 + ((a - 0x1100) * 21 + (b - 0x1161)) * 28
@@ -185,18 +163,12 @@ fn hangul_syllable(a: Int, b: Int) -> Int =
     a + (b - 0x11A7)
   } else { -1 }
 
-/// The two or three conjoining letters of the syllable `cp`.
-fn letters(cp: Int) -> List<Int> = {
-  let index = cp - 0xAC00;
+fn letters(code_point: Int) -> List<Int> = {
+  let index = code_point - 0xAC00;
   let pair = [0x1100 + index / 588, 0x1161 + index % 588 / 28];
   if index % 28 == 0 { pair } else { pair.push(0x11A7 + index % 28) }
 }
 
-// --- Decomposing ------------------------------------------------------------------
-
-/// The code points ordered so far, and the marks since the last starter, which are not ordered
-/// yet. Each mark is packed under its class and then its position among the marks, so sorting them
-/// gives the canonical order.
 type OrderState = { out: List<Int>, marks: List<Int> }
 
 fn flush_marks(so_far: OrderState) -> List<Int> =
@@ -207,38 +179,37 @@ fn flush_marks(so_far: OrderState) -> List<Int> =
       so_far.marks.sort().fold(so_far.out, |out: List<Int>, mark: Int| out.push(mark & 0x1FFFFF)),
   }
 
-fn add_ordered(so_far: OrderState, cp: Int, class: Int) -> OrderState =
-  if class == 0 { { out: flush_marks(so_far).push(cp), marks: [] } } else {
-    { out: so_far.out, marks: so_far.marks.push(class << 42 | so_far.marks.len() << 21 | cp) }
+fn add_ordered(so_far: OrderState, code_point: Int, class: Int) -> OrderState =
+  if class == 0 { { out: flush_marks(so_far).push(code_point), marks: [] } } else {
+    {
+      out: so_far.out,
+      marks: so_far.marks.push(class << 42 | so_far.marks.len() << 21 | code_point),
+    }
   }
 
 fn decompose_into(
   table: NormalizationTable,
   so_far: OrderState,
-  cp: Int,
+  code_point: Int,
   compatibility: Bool,
 ) -> OrderState =
-  if is_syllable(cp) { { out: flush_marks(so_far).concat(letters(cp)), marks: [] } } else {
-    let word = ucd::lookup(table.words, cp);
+  if is_syllable(code_point) { { out: flush_marks(so_far).concat(letters(code_point)), marks: [] } }
+  else {
+    let word = ucd::lookup(table.words, code_point);
     let mapping_handle = if compatibility { compatibility_decomposition_position(word) }
     else { canonical_decomposition_position(word) };
-    if mapping_handle == 0 { add_ordered(so_far, cp, word & 255) } else {
+    if mapping_handle == 0 { add_ordered(so_far, code_point, word & 255) } else {
       ucd::sequence(table.points, mapping_handle).fold(so_far, |ordering: OrderState, part: Int|
         add_ordered(ordering, part, ucd::lookup(table.words, part) & 255))
     }
   }
 
-/// The full decomposition of `chars` in canonical order.
 fn decomposed(table: NormalizationTable, chars: List<Char>, compatibility: Bool) -> List<Int> =
   flush_marks(
     chars.fold({ out: [], marks: [] }, |so_far: OrderState, c: Char|
       decompose_into(table, so_far, Int::of_char(c), compatibility)),
   )
 
-// --- Composing --------------------------------------------------------------------
-
-/// The output composed so far, the starter that may still combine with a mark (`-1` for none), the
-/// marks after it that it did not combine with, and the class of the last of those.
 type ComposeState = { out: List<Int>, starter: Int, marks: List<Int>, last: Int }
 
 fn finish_composition(so_far: ComposeState) -> List<Int> =
@@ -247,42 +218,47 @@ fn finish_composition(so_far: ComposeState) -> List<Int> =
     |out: List<Int>, mark: Int| out.push(mark),
   )
 
-/// The primary composite of `a` and `b`, or `-1`.
 fn primary_composite(table: NormalizationTable, a: Int, b: Int) -> Int = {
   let made = hangul_syllable(a, b);
   if made >= 0 { made }
   else { match table.pairs.get(a << 21 | b) { Some(composite) -> composite, None -> -1 } }
 }
 
-fn compose_next(table: NormalizationTable, so_far: ComposeState, cp: Int) -> ComposeState = {
-  let class = ucd::lookup(table.words, cp) & 255;
+fn compose_next(table: NormalizationTable, so_far: ComposeState, code_point: Int) -> ComposeState = {
+  let class = ucd::lookup(table.words, code_point) & 255;
   if so_far.starter < 0 {
-    if class == 0 { { out: so_far.out, starter: cp, marks: [], last: 0 } }
-    else { { out: so_far.out.push(cp), starter: -1, marks: [], last: 0 } }
+    if class == 0 { { out: so_far.out, starter: code_point, marks: [], last: 0 } }
+    else { { out: so_far.out.push(code_point), starter: -1, marks: [], last: 0 } }
   } else {
-    // A mark between the starter and this one blocks it unless its class is lower.
     let blocked = so_far.marks.len() > 0 && so_far.last >= class;
-    let composite = if blocked { -1 } else { primary_composite(table, so_far.starter, cp) };
+    let composite = if blocked { -1 } else { primary_composite(table, so_far.starter, code_point) };
     if composite >= 0 {
       { out: so_far.out, starter: composite, marks: so_far.marks, last: so_far.last }
-    } else if class == 0 { { out: finish_composition(so_far), starter: cp, marks: [], last: 0 } }
-    else { { out: so_far.out, starter: so_far.starter, marks: so_far.marks.push(cp), last: class } }
+    } else if class == 0 {
+      { out: finish_composition(so_far), starter: code_point, marks: [], last: 0 }
+    } else {
+      {
+        out: so_far.out,
+        starter: so_far.starter,
+        marks: so_far.marks.push(code_point),
+        last: class,
+      }
+    }
   }
 }
 
-/// `points`, which are decomposed and in canonical order, with every unblocked pair that has a
-/// primary composite replaced by it.
 fn composed(table: NormalizationTable, points: List<Int>) -> List<Int> =
   finish_composition(
-    points.fold({ out: [], starter: -1, marks: [], last: 0 }, |so_far: ComposeState, cp: Int|
-      compose_next(table, so_far, cp)),
+    points.fold(
+      { out: [], starter: -1, marks: [], last: 0 },
+      |so_far: ComposeState, code_point: Int| compose_next(table, so_far, code_point),
+    ),
   )
 
-// --- The forms --------------------------------------------------------------------
-
-/// A normalization form.
+/// A Unicode normalization form: a standard way to write text so that equivalent texts become
+/// identical.
 pub type Form =
-  /// Canonical decomposition, then canonical composition: the form text is usually stored in.
+  /// Canonical decomposition followed by canonical composition. Most text is stored in this form.
   | Nfc
   /// Canonical decomposition.
   | Nfd
@@ -291,17 +267,16 @@ pub type Form =
   /// Compatibility decomposition.
   | Nfkd
 
-/// The result of a quick check.
+/// The outcome of a quick check, which inspects text in one pass without normalizing it.
 pub type QuickCheckResult =
   /// The text is in the form.
   | Yes
-  /// The text is in the form unless a character in it composes with one before it. Only
-  /// normalizing it can decide which.
+  /// The text is in the form unless a character in it composes with an earlier character. Only
+  /// normalizing the text can tell whether one does.
   | Maybe
   /// The text is not in the form.
   | No
 
-/// What a form's quick check tests in a word: the bits that mean No and those that mean Maybe.
 type QuickCheckMasks = { no: Int, maybe: Int, decomposes: Bool }
 
 fn quick_check_masks(form: Form) -> QuickCheckMasks =
@@ -312,17 +287,15 @@ fn quick_check_masks(form: Form) -> QuickCheckMasks =
     Nfkd -> { no: 0x3FFFFF << 34, maybe: 0, decomposes: true },
   }
 
-/// The quick check of `chars` as a number: `0` for Yes, `1` for Maybe and `2` for No, in the
-/// bits above the class of the last character seen.
 fn quick_check_code(table: NormalizationTable, chars: List<Char>, form: Form) -> Int = {
   let reads = quick_check_masks(form);
   chars.fold(0, |state: Int, c: Char|
       if state >> 8 == 2 { state } else {
-        let cp = Int::of_char(c);
-        let word = ucd::lookup(table.words, cp);
+        let code_point = Int::of_char(c);
+        let word = ucd::lookup(table.words, code_point);
         let class = word & 255;
         if (class != 0 && state & 255 > class) || word & reads.no != 0
-            || (reads.decomposes && is_syllable(cp)) { 2 << 8 }
+            || (reads.decomposes && is_syllable(code_point)) { 2 << 8 }
         else if word & reads.maybe != 0 { class | 1 << 8 }
         else { class | state >> 8 << 8 }
       })
@@ -360,14 +333,16 @@ pub fn normalize(text: String, form: Form) -> String =
 /// `text` in Normalization Form C: canonically equivalent texts have one NFC.
 pub fn nfc(text: String) -> String = normalize(text, Nfc)
 
-/// `text` in Normalization Form D.
+/// Returns `text` with every character canonically decomposed and its marks in canonical order.
 pub fn nfd(text: String) -> String = normalize(text, Nfd)
 
 /// `text` in Normalization Form KC, which also replaces compatibility characters, such as a
 /// ligature or a full-width letter, by what they represent, and so loses the distinction.
 pub fn nfkc(text: String) -> String = normalize(text, Nfkc)
 
-/// `text` in Normalization Form KD.
+/// Returns `text` with every character decomposed, including compatibility characters, and its
+/// marks in canonical order. Like `nfkc`, it loses the distinction between compatibility characters
+/// and what they represent.
 pub fn nfkd(text: String) -> String = normalize(text, Nfkd)
 
 /// Whether `text` is in `form`: the quick check's result when it is `Yes` or `No`, and a comparison
@@ -384,18 +359,15 @@ pub fn equivalent(a: String, b: String) -> Bool = a == b || nfd(a) == nfd(b)
 pub fn combining_class(c: Char) -> Int =
   ucd::lookup(normalization_table().words, Int::of_char(c)) & 255
 
-/// The most marks the stream-safe format allows in a row.
 fn stream_safe_run() -> Int = 30
 
-/// The number of marks since the last starter, in the compatibility decomposition of the text so
-/// far.
 type StreamSafeState = { out: List<Char>, run: Int }
 
-/// `text` in the Stream-Safe Text Format of UAX #15. `U+034F`, the combining grapheme joiner, is
-/// inserted wherever more than thirty marks would follow one another once the text is decomposed,
-/// so normalizing it never needs to buffer more than thirty marks to order them. Text that needs
-/// no insertion is unchanged. An inserted joiner changes how the marks around it are ordered,
-/// which is the cost of the bound.
+/// Returns `text` in the Stream-Safe Text Format of UAX #15. Inserts `U+034F`, the combining
+/// grapheme joiner, wherever more than thirty marks in a row would otherwise appear once the text
+/// is decomposed, so that normalizing the result never buffers more than thirty marks to order
+/// them. Text that needs no insertion is returned unchanged. An inserted joiner changes how the
+/// marks around it are ordered.
 pub fn stream_safe(text: String) -> String =
   if text.is_ascii() { text } else {
     let table = normalization_table();
@@ -403,7 +375,7 @@ pub fn stream_safe(text: String) -> String =
       text.chars().fold({ out: [], run: 0 }, |so_far: StreamSafeState, c: Char| {
         let marks = flush_marks(
           decompose_into(table, { out: [], marks: [] }, Int::of_char(c), true),
-        ).map(|cp: Int| ucd::lookup(table.words, cp) & 255 != 0);
+        ).map(|code_point: Int| ucd::lookup(table.words, code_point) & 255 != 0);
         let leading = marks.fold(
           { count: 0, open: true },
           |lead: { count: Int, open: Bool }, mark: Bool|
@@ -421,20 +393,7 @@ pub fn stream_safe(text: String) -> String =
     )
   }
 
-// --- Case mapping data ------------------------------------------------------------
-
-/// The contents of `ucd/casing.txt`, arranged for lookup.
-type Casing = {
-  /// One word per code point: the offset to its simple folding in the low twenty bits, a bit for
-  /// each flag, then its row in `rows`, or zero for a code point with no row.
-  words: Table,
-  /// A row for each code point with a mapping that differs from its simple mapping: the positions
-  /// in `points` of its full folding and its full lowercase, titlecase and uppercase, fifteen bits
-  /// each, and zero where the mapping is the simple one.
-  rows: Array<Int>,
-  /// Every mapping to several characters, collected in one array.
-  points: Array<Int>,
-}
+type Casing = { words: Table, rows: Array<Int>, points: Array<Int> }
 
 fn is_cased() -> Int = 0x100000
 
@@ -446,7 +405,6 @@ fn is_above() -> Int = 0x800000
 
 fn is_mark() -> Int = 0x1000000
 
-/// The flag bit that a table's letter represents.
 fn case_bit(letter: Int) -> Int / {abort.raise} =
   match letter {
     b'c' -> is_cased(),
@@ -454,10 +412,12 @@ fn case_bit(letter: Int) -> Int / {abort.raise} =
     b's' -> is_soft_dotted(),
     b'a' -> is_above(),
     b'b' -> is_mark(),
-    _ -> panic("a casing flag is c, i, s, a or b"),
+    _ ->
+      panic(
+        "a casing flag letter must be c (cased), i (case-ignorable), s (soft-dotted), a (above) or b (mark)",
+      ),
   }
 
-/// The table while it is being built.
 type CasingState = { valued: List<ValueRun>, gathering: SequencePool, mapping_positions: List<Int> }
 
 fn casing_of(runs: List<Run>) -> Casing / {abort.raise} = {
@@ -472,8 +432,11 @@ fn casing_of(runs: List<Run>) -> Casing / {abort.raise} = {
       let title = ucd::intern(lower.gathering, ucd::code_points(field(3)));
       let upper = ucd::intern(title.gathering, ucd::code_points(field(4)));
       let row = append_fold.place | lower.place << 15 | title.place << 30 | upper.place << 45;
-      if upper.place >= 0x8000 { panic("the mappings of several characters outgrow their places") }
-      else {
+      if upper.place >= 0x8000 {
+        panic(
+          "the case mappings of several characters are too large to store: the code points they map to start beyond the first 32768 entries of the table",
+        )
+      } else {
         {
           valued: m.valued.push({
             first: run.first,
@@ -497,7 +460,6 @@ fn casing_of(runs: List<Run>) -> Casing / {abort.raise} = {
 
 const fn casing() -> Casing = casing_of(ucd::runs(embed("ucd/casing.txt")))
 
-/// The bit offset of each mapping within a row.
 fn fold_shift() -> Int = 0
 
 fn lowercase_shift() -> Int = 15
@@ -506,118 +468,101 @@ fn titlecase_shift() -> Int = 30
 
 fn uppercase_shift() -> Int = 45
 
-/// The position of the multi-character mapping stored `shift` bits up in `word`'s row, or zero.
 fn mapping_handle(table: Casing, word: Int, shift: Int) -> Int =
   match table.rows.at(word >> 25) { Some(row) -> row >> shift & 0x7FFF, None -> 0 }
 
-/// `cp` mapped by `simple`.
-fn simple_mapping(cp: Int, simple: (Char) -> Char) -> Int =
-  match Char::of_int(cp) { Some(c) -> Int::of_char(simple(c)), None -> cp }
+fn simple_mapping(code_point: Int, simple: (Char) -> Char) -> Int =
+  match Char::of_int(code_point) { Some(c) -> Int::of_char(simple(c)), None -> code_point }
 
-/// `out` followed by the full mapping of `cp` stored `shift` bits up in its row: the row's mapping
-/// if it has one, and `simple`'s result if not.
 fn append_mapping(
   table: Casing,
   out: List<Int>,
-  cp: Int,
+  code_point: Int,
   shift: Int,
   simple: (Char) -> Char,
 ) -> List<Int> = {
-  let word = ucd::lookup(table.words, cp);
-  // A character whose word is empty is not cased, and only a cased one has a mapping.
-  if word == 0 { out.push(cp) } else {
+  let word = ucd::lookup(table.words, code_point);
+  if word == 0 { out.push(code_point) } else {
     let at = mapping_handle(table, word, shift);
-    if at == 0 { out.push(simple_mapping(cp, simple)) }
+    if at == 0 { out.push(simple_mapping(code_point, simple)) }
     else { ucd::sequence(table.points, at).fold(out, |all: List<Int>, part: Int| all.push(part)) }
   }
 }
 
-// --- The context around a character -----------------------------------------------
-
-/// A text as its code points, with the table the context conditions use.
 type CasingContext = { code_points: Array<Int>, casing: Casing }
 
-fn has_flag(around: CasingContext, cp: Int, flag: Int) -> Bool =
-  ucd::lookup(around.casing.words, cp) & flag != 0
+fn has_flag(around: CasingContext, code_point: Int, flag: Int) -> Bool =
+  ucd::lookup(around.casing.words, code_point) & flag != 0
 
-/// Whether a cased letter is the first thing at or before `i` that is not case-ignorable.
 fn cased_before(around: CasingContext, i: Int) -> Bool =
   if i < 0 { false } else {
     match around.code_points.at(i) {
       None -> false,
-      Some(cp) -> if has_flag(around, cp, is_ignorable()) { cased_before(around, i - 1) }
-      else { has_flag(around, cp, is_cased()) },
+      Some(code_point) -> if has_flag(around, code_point, is_ignorable()) {
+        cased_before(around, i - 1)
+      } else { has_flag(around, code_point, is_cased()) },
     }
   }
 
-/// Whether a cased letter is the first thing at or after `i` that is not case-ignorable.
 fn cased_after(around: CasingContext, i: Int) -> Bool =
   match around.code_points.at(i) {
     None -> false,
-    Some(cp) -> if has_flag(around, cp, is_ignorable()) { cased_after(around, i + 1) }
-    else { has_flag(around, cp, is_cased()) },
+    Some(code_point) -> if has_flag(around, code_point, is_ignorable()) {
+      cased_after(around, i + 1)
+    } else { has_flag(around, code_point, is_cased()) },
   }
 
-/// Whether a capital sigma at `i` ends a word, and so lowers to the final small sigma: a cased
-/// letter comes before it and none after it. Case-ignorable characters are skipped, even when they
-/// are cased themselves.
 fn final_sigma(around: CasingContext, i: Int) -> Bool =
   cased_before(around, i - 1) && !cased_after(around, i + 1)
 
-/// Whether, from `i` on, a mark of class 230 comes before anything of class 0: the More_Above
-/// condition. With `dot`, it looks for the dot above, `U+0307`, instead, and a mark of class 230
-/// ends the search as a starter does: the Before_Dot condition.
 fn above_after(around: CasingContext, i: Int, dot: Bool) -> Bool =
   match around.code_points.at(i) {
     None -> false,
-    Some(cp) -> if dot && cp == 0x307 { true }
-    else if has_flag(around, cp, is_above()) { !dot }
-    else { has_flag(around, cp, is_mark()) && above_after(around, i + 1, dot) },
+    Some(code_point) -> if dot && code_point == 0x307 { true }
+    else if has_flag(around, code_point, is_above()) { !dot }
+    else { has_flag(around, code_point, is_mark()) && above_after(around, i + 1, dot) },
   }
 
-/// Whether, searching back from `i`, a soft-dotted letter comes before anything of class 0 or 230:
-/// the After_Soft_Dotted condition. With `capital_i`, it looks for `I` instead: the After_I
-/// condition.
 fn dotted_before(around: CasingContext, i: Int, capital_i: Bool) -> Bool =
   if i < 0 { false } else {
     match around.code_points.at(i) {
       None -> false,
-      Some(cp) -> if capital_i && cp == 0x49 { true }
-      else if !capital_i && has_flag(around, cp, is_soft_dotted()) { true }
-      else { has_flag(around, cp, is_mark()) && dotted_before(around, i - 1, capital_i) },
+      Some(code_point) -> if capital_i && code_point == 0x49 { true }
+      else if !capital_i && has_flag(around, code_point, is_soft_dotted()) { true }
+      else { has_flag(around, code_point, is_mark()) && dotted_before(around, i - 1, capital_i) },
     }
   }
-
-// --- Case mapping -----------------------------------------------------------------
 
 /// A language with its own case mappings. No function here reads the language from the
 /// environment.
 pub type Tailoring =
   /// The mappings of every language except those below.
   | Untailored
-  /// Turkish and Azeri, where dotted and dotless `i` are two letters with a capital each: `i`
-  /// and `U+0130`, `U+0131` and `I`.
+  /// Turkish and Azeri, which have two separate letters for `i`: a dotted pair, lowercase `i` with
+  /// capital `U+0130`, and a dotless pair, lowercase `U+0131` with capital `I`.
   | Turkic
-  /// Lithuanian, where a small `i` keeps its dot under an accent. When the capitals of `i`, `j`
-  /// and `i` with ogonek are lowercased before a mark above, a dot is added after them, and the dot
-  /// is removed when they are uppercased.
+  /// Lithuanian, where a lowercase `i` keeps its dot when an accent sits above it. Lowercasing a
+  /// capital `I`, `J` or `Į` (`I` with ogonek, `U+012E`) before a mark above adds a dot (`U+0307`)
+  /// after the letter. Uppercasing removes that dot.
   | Lithuanian
 
 fn append_lowercase(
   around: CasingContext,
   out: List<Int>,
   i: Int,
-  cp: Int,
+  code_point: Int,
   tailoring: Tailoring,
 ) -> List<Int> =
-  if cp == 0x3A3 { out.push(if final_sigma(around, i) { 0x3C2 } else { 0x3C3 }) } else {
+  if code_point == 0x3A3 { out.push(if final_sigma(around, i) { 0x3C2 } else { 0x3C3 }) } else {
     match tailoring {
-      Untailored -> append_mapping(around.casing, out, cp, lowercase_shift(), Char::to_lowercase),
-      Turkic -> if cp == 0x130 { out.push(0x69) }
-      else if cp == 0x307 && dotted_before(around, i - 1, true) { out }
-      else if cp == 0x49 && !above_after(around, i + 1, true) { out.push(0x131) }
-      else { append_mapping(around.casing, out, cp, lowercase_shift(), Char::to_lowercase) },
-      Lithuanian -> append_lithuanian_lowercase(around, out, i, cp),
+      Untailored ->
+        append_mapping(around.casing, out, code_point, lowercase_shift(), Char::to_lowercase),
+      Turkic -> if code_point == 0x130 { out.push(0x69) }
+      else if code_point == 0x307 && dotted_before(around, i - 1, true) { out }
+      else if code_point == 0x49 && !above_after(around, i + 1, true) { out.push(0x131) } else {
+        append_mapping(around.casing, out, code_point, lowercase_shift(), Char::to_lowercase)
+      },
+      Lithuanian -> append_lithuanian_lowercase(around, out, i, code_point),
     }
   }
 
@@ -625,35 +570,33 @@ fn append_lithuanian_lowercase(
   around: CasingContext,
   out: List<Int>,
   i: Int,
-  cp: Int,
+  code_point: Int,
 ) -> List<Int> =
-  match cp {
+  match code_point {
     0x49 | 0x4A | 0x12E -> {
-      let small = out.push(simple_mapping(cp, Char::to_lowercase));
+      let small = out.push(simple_mapping(code_point, Char::to_lowercase));
       if above_after(around, i + 1, false) { small.push(0x307) } else { small }
     },
     0xCC -> out.push(0x69).push(0x307).push(0x300),
     0xCD -> out.push(0x69).push(0x307).push(0x301),
     0x128 -> out.push(0x69).push(0x307).push(0x303),
-    _ -> append_mapping(around.casing, out, cp, lowercase_shift(), Char::to_lowercase),
+    _ -> append_mapping(around.casing, out, code_point, lowercase_shift(), Char::to_lowercase),
   }
 
-/// The uppercase of `cp`, or its titlecase where `shift` and `simple` are the titlecase's.
 fn append_uppercase(
   around: CasingContext,
   out: List<Int>,
   i: Int,
-  cp: Int,
+  code_point: Int,
   tailoring: Tailoring,
   shift: Int,
   simple: (Char) -> Char,
 ) -> List<Int> =
-  if tailoring == Turkic && cp == 0x69 { out.push(0x130) }
-  else if tailoring == Lithuanian && cp == 0x307 && dotted_before(around, i - 1, false) { out }
-  else { append_mapping(around.casing, out, cp, shift, simple) }
+  if tailoring == Turkic && code_point == 0x69 { out.push(0x130) }
+  else if tailoring == Lithuanian && code_point == 0x307 && dotted_before(around, i - 1, false) {
+    out
+  } else { append_mapping(around.casing, out, code_point, shift, simple) }
 
-/// `text` with each code point mapped by `each`, which is passed the output so far, the position,
-/// and the code point there.
 fn map_code_points(
   text: String,
   each: (CasingContext, List<Int>, Int, Int) -> List<Int>,
@@ -661,7 +604,10 @@ fn map_code_points(
   let around = { code_points: Array::of_list(text.chars().map(Int::of_char)), casing: casing() };
   text_of(
     range(0, around.code_points.len()).fold([], |out: List<Int>, i: Int|
-      match around.code_points.at(i) { Some(cp) -> each(around, out, i, cp), None -> out }),
+      match around.code_points.at(i) {
+        Some(code_point) -> each(around, out, i, code_point),
+        None -> out,
+      }),
   )
 }
 
@@ -673,8 +619,8 @@ pub fn lowercase(text: String, tailoring: Tailoring = Untailored) -> String =
   if text.is_ascii() && tailoring != Turkic {
     String::of_chars(text.chars().map(Char::to_ascii_lowercase))
   } else {
-    map_code_points(text, |around: CasingContext, out: List<Int>, i: Int, cp: Int|
-      append_lowercase(around, out, i, cp, tailoring))
+    map_code_points(text, |around: CasingContext, out: List<Int>, i: Int, code_point: Int|
+      append_lowercase(around, out, i, code_point, tailoring))
   }
 
 /// `text` in uppercase, by the full mappings: `U+00DF` becomes `SS`, and a ligature becomes its
@@ -683,8 +629,16 @@ pub fn uppercase(text: String, tailoring: Tailoring = Untailored) -> String =
   if text.is_ascii() && tailoring != Turkic {
     String::of_chars(text.chars().map(Char::to_ascii_uppercase))
   } else {
-    map_code_points(text, |around: CasingContext, out: List<Int>, i: Int, cp: Int|
-      append_uppercase(around, out, i, cp, tailoring, uppercase_shift(), Char::to_uppercase))
+    map_code_points(text, |around: CasingContext, out: List<Int>, i: Int, code_point: Int|
+      append_uppercase(
+        around,
+        out,
+        i,
+        code_point,
+        tailoring,
+        uppercase_shift(),
+        Char::to_uppercase,
+      ))
   }
 
 /// `text` as one word in titlecase: its first cased character in titlecase, every later character
@@ -698,51 +652,49 @@ pub fn titlecase(text: String, tailoring: Tailoring = Untailored) -> String = {
       |so_far: { out: List<Int>, begun: Bool }, i: Int|
         match around.code_points.at(i) {
           None -> so_far,
-          Some(cp) -> if so_far.begun {
-            { out: append_lowercase(around, so_far.out, i, cp, tailoring), begun: true }
-          } else if has_flag(around, cp, is_cased()) {
+          Some(code_point) -> if so_far.begun {
+            { out: append_lowercase(around, so_far.out, i, code_point, tailoring), begun: true }
+          } else if has_flag(around, code_point, is_cased()) {
             {
               out: append_uppercase(
                 around,
                 so_far.out,
                 i,
-                cp,
+                code_point,
                 tailoring,
                 titlecase_shift(),
                 Char::to_titlecase,
               ),
               begun: true,
             }
-          } else { { out: so_far.out.push(cp), begun: false } },
+          } else { { out: so_far.out.push(code_point), begun: false } },
         },
     ).out,
   )
 }
 
-// --- Case folding -----------------------------------------------------------------
+fn simple_fold(table: Casing, code_point: Int, turkic: Bool) -> Int =
+  if turkic && code_point == 0x49 { 0x131 }
+  else if turkic && code_point == 0x130 { 0x69 }
+  else { ucd::apply_distance(code_point, ucd::lookup(table.words, code_point)) }
 
-/// The simple folding of `cp`, the Turkic one when `turkic` is true.
-fn simple_fold(table: Casing, cp: Int, turkic: Bool) -> Int =
-  if turkic && cp == 0x49 { 0x131 }
-  else if turkic && cp == 0x130 { 0x69 }
-  else { ucd::apply_distance(cp, ucd::lookup(table.words, cp)) }
-
-/// `out` followed by the full folding of `cp`, the Turkic one when `turkic` is true.
-fn append_fold(table: Casing, out: List<Int>, cp: Int, turkic: Bool) -> List<Int> = {
-  let at = if turkic && (cp == 0x49 || cp == 0x130) { 0 }
-  else { mapping_handle(table, ucd::lookup(table.words, cp), fold_shift()) };
-  if at == 0 { out.push(simple_fold(table, cp, turkic)) }
+fn append_fold(table: Casing, out: List<Int>, code_point: Int, turkic: Bool) -> List<Int> = {
+  let at = if turkic && (code_point == 0x49 || code_point == 0x130) { 0 }
+  else { mapping_handle(table, ucd::lookup(table.words, code_point), fold_shift()) };
+  if at == 0 { out.push(simple_fold(table, code_point, turkic)) }
   else { ucd::sequence(table.points, at).fold(out, |all: List<Int>, part: Int| all.push(part)) }
 }
 
-/// `text` with full case folding, for case-insensitive comparison. Every character is replaced by
-/// what all its cases fold to, which may be several characters, so `U+00DF` and `SS` fold the
-/// same. With `turkic`, `I` folds to dotless `U+0131` and `U+0130` folds to `i`, as in Turkish and
-/// Azeri. Folded text is for comparing and is not the same as lowercase.
+/// Returns `text` with full case folding, for case-insensitive comparison. Each character is
+/// replaced by its folded form, which may be several characters, so `U+00DF` and `SS` fold to the
+/// same text. With `turkic`, `I` folds to dotless `U+0131` and `U+0130` folds to `i`, as in Turkish
+/// and Azeri. Folded text is for comparing and is not the same as lowercase.
 ///
-/// Each character folds on its own, so two ways of writing one text may fold differently: an iota
-/// subscript written before another mark, or with `turkic`, an `I` and its dot above written as
-/// two characters. `caseless` and `caseless_key` compare texts however they are written.
+/// Each character folds on its own, so two ways of writing the same text can fold to different
+/// results. For example, a text with an iota subscript placed before another combining mark can
+/// fold differently from the same text with the subscript placed after that mark. With `turkic`,
+/// `U+0130` folds differently from `I` followed by a separate dot above `U+0307`. `caseless` and
+/// `caseless_key` compare texts correctly however they are written.
 pub fn case_fold(text: String, turkic: Bool = false) -> String =
   if text.is_ascii() && !turkic { String::of_chars(text.chars().map(Char::to_ascii_lowercase)) }
   else {
@@ -753,22 +705,20 @@ pub fn case_fold(text: String, turkic: Bool = false) -> String =
     )
   }
 
-/// `text` case-folded one character to one character. As `case_fold`, but a character whose full
-/// folding is several characters uses its one-character simple folding instead. So the text keeps
-/// its length, and `U+00DF` does not fold to the same text as `ss`.
+/// Returns `text` case-folded one character to one character. Works like `case_fold`, except that a
+/// character whose full folding is several characters uses its single-character simple folding. The
+/// result has the same number of characters as `text`, and `U+00DF` does not fold to the same text
+/// as `ss`.
 pub fn simple_case_fold(text: String, turkic: Bool = false) -> String = {
   let table = casing();
   text_of(text.chars().map(|c: Char| simple_fold(table, Int::of_char(c), turkic)))
 }
 
-/// A decomposed text folded for Turkish and Azeri, so that every way of writing one text folds the
-/// same. `I` followed by its dot above folds to `i` without the dot, just as `U+0130`, which
-/// decomposes to those two, does.
 fn turkic_folded(decomposed: String) -> String =
-  map_code_points(decomposed, |around: CasingContext, out: List<Int>, i: Int, cp: Int|
-    if cp == 0x307 && dotted_before(around, i - 1, true) { out }
-    else if cp == 0x49 && above_after(around, i + 1, true) { out.push(0x69) }
-    else { append_fold(around.casing, out, cp, true) })
+  map_code_points(decomposed, |around: CasingContext, out: List<Int>, i: Int, code_point: Int|
+    if code_point == 0x307 && dotted_before(around, i - 1, true) { out }
+    else if code_point == 0x49 && above_after(around, i + 1, true) { out.push(0x69) }
+    else { append_fold(around.casing, out, code_point, true) })
 
 /// What `caseless` compares: `text` decomposed, folded and decomposed again, as the standard
 /// defines a canonical caseless match. Two texts match case-insensitively exactly when their keys
@@ -777,19 +727,17 @@ fn turkic_folded(decomposed: String) -> String =
 pub fn caseless_key(text: String, turkic: Bool = false) -> String =
   nfd(if turkic { turkic_folded(nfd(text)) } else { case_fold(nfd(text)) })
 
-/// Whether `a` and `b` are the same text ignoring case, however each writes its accents: a
-/// canonical caseless match. Comparing lowercased or folded texts alone gets accented and
-/// multi-letter cases wrong, and a text need not match its own `case_fold` unless it was
-/// decomposed first. With `turkic`, `I` matches `U+0131` and `U+0130` matches `i`, and neither
-/// pair matches the other.
+/// Returns whether `a` and `b` are the same text ignoring case, however each writes its accents (a
+/// canonical caseless match). Comparing lowercased or case-folded texts directly gets accented and
+/// multi-letter characters wrong: two canonically equivalent texts can fold to different results
+/// unless each is decomposed first. With `turkic`, `I` matches `U+0131` and `U+0130` matches `i`,
+/// but `I` does not match `i`, and `U+0130` does not match `U+0131`.
 pub fn caseless(a: String, b: String, turkic: Bool = false) -> Bool =
   a == b || caseless_key(a, turkic) == caseless_key(b, turkic)
 
-// --- Properties -------------------------------------------------------------------
-
 fn forms() -> List<Form> = [Nfc, Nfd, Nfkc, Nfkd]
 
-test "normalizing a normalized text changes nothing, and no check disagrees" {
+test "normalizing already normalized text changes nothing, and `is_normalized` is true and `quick_check` is not `No`" {
   gen::check(gen::any_int(), |seed: Int| {
     let text = sample_text(seed);
     forms().all(|form: Form| {
@@ -801,7 +749,7 @@ test "normalizing a normalized text changes nothing, and no check disagrees" {
   })
 }
 
-test "a quick check that returns Yes or No is right" {
+test "`quick_check` returning `Yes` means `normalize` leaves the text unchanged, and `No` means it changes the text" {
   gen::check(gen::any_int(), |seed: Int| {
     let text = sample_text(seed);
     forms().all(|form: Form|
@@ -813,14 +761,14 @@ test "a quick check that returns Yes or No is right" {
   })
 }
 
-test "a text is equivalent to itself and to each of its canonical forms" {
+test "a text is canonically equivalent to itself, to its `nfc` form and to its `nfd` form" {
   gen::check(gen::any_int(), |seed: Int| {
     let text = sample_text(seed);
     equivalent(text, text) && equivalent(text, nfc(text)) && equivalent(nfd(text), text)
   })
 }
 
-test "caseless matching is an equivalence refined by canonical equivalence, with a stable key" {
+test "`caseless` is symmetric and ignores canonical differences, and `caseless_key` is unchanged when applied again" {
   gen::check3(gen::any_int(), gen::any_int(), gen::bool(), |seed: Int, other: Int, turkic: Bool| {
     let a = sample_text(seed);
     let b = sample_text(other);
@@ -833,9 +781,7 @@ test "caseless matching is an equivalence refined by canonical equivalence, with
   })
 }
 
-// --- Tests ------------------------------------------------------------------------
-
-test "a text composes and decomposes, canonically and by compatibility" {
+test "`nfc`, `nfd`, `nfkc` and `nfkd` compose and decompose text, using canonical and compatibility mappings" {
   assert_eq(nfc("e\u{301}"), "\u{E9}");
   assert_eq(nfd("\u{E9}"), "e\u{301}");
   assert_eq(nfc("\u{1E9B}\u{323}"), "\u{1E9B}\u{323}");
@@ -849,7 +795,7 @@ test "a text composes and decomposes, canonically and by compatibility" {
   assert_eq(nfd(""), "")
 }
 
-test "marks on one starter are put in the order of their classes, those of one class as they came" {
+test "normalization sorts combining marks after a base character by combining class, and keeps marks of equal class in their original order" {
   assert_eq(nfd("a\u{301}\u{323}"), "a\u{323}\u{301}");
   assert_eq(nfd("a\u{301}\u{300}"), "a\u{301}\u{300}");
   assert_eq(nfc("a\u{323}\u{301}"), "\u{1EA1}\u{301}");
@@ -859,7 +805,7 @@ test "marks on one starter are put in the order of their classes, those of one c
   assert_eq(nfc("a\u{301}\u{300}"), "\u{E1}\u{300}")
 }
 
-test "a Hangul syllable is its letters by arithmetic" {
+test "`nfd` and `nfc` split a Hangul syllable into its jamo letters and join them back by computation" {
   assert_eq(nfd("\u{AC00}"), "\u{1100}\u{1161}");
   assert_eq(nfd("\u{D4DB}"), "\u{1111}\u{1171}\u{11B6}");
   assert_eq(nfc("\u{1111}\u{1171}\u{11B6}"), "\u{D4DB}");
@@ -869,7 +815,7 @@ test "a Hangul syllable is its letters by arithmetic" {
   assert_eq(nfc("\u{1100}\u{1100}"), "\u{1100}\u{1100}")
 }
 
-test "a quick check reports what one pass can, and is_normalized resolves a Maybe" {
+test "`quick_check` returns `Yes`, `No` or `Maybe` after one scan, and `is_normalized` returns a definite true or false even when `quick_check` returns `Maybe`" {
   assert_eq(quick_check("abc", Nfc), Yes);
   assert_eq(quick_check("\u{E9}", Nfc), Yes);
   assert_eq(quick_check("\u{E9}", Nfd), No);
@@ -886,7 +832,7 @@ test "a quick check reports what one pass can, and is_normalized resolves a Mayb
   assert(is_normalized("e\u{301}", Nfd) && !is_normalized("\u{E9}", Nfkd))
 }
 
-test "texts that write one thing two ways are equivalent, and compatibility characters are not" {
+test "`equivalent` is true for texts that are different spellings of the same character, but false for compatibility characters such as the `fi` ligature" {
   assert(equivalent("\u{E9}", "e\u{301}"));
   assert(equivalent("\u{212B}", "\u{C5}"));
   assert(equivalent("\u{D4DB}", "\u{1111}\u{1171}\u{11B6}"));
@@ -894,7 +840,7 @@ test "texts that write one thing two ways are equivalent, and compatibility char
   assert(!equivalent("a", "A"))
 }
 
-test "a mark has its class and a starter has none" {
+test "`combining_class` returns a nonzero class for combining marks and 0 for base characters" {
   assert_eq(['a', '\u{301}', '\u{323}', '\u{94D}', '\u{AC00}'].map(combining_class), [
     0,
     230,
@@ -904,7 +850,7 @@ test "a mark has its class and a starter has none" {
   ])
 }
 
-test "the stream-safe format lets thirty marks follow one another and puts a joiner before the next" {
+test "`stream_safe` allows up to thirty combining marks in a row and inserts a combining grapheme joiner before the next mark" {
   let marks = |n: Int| String::of_chars(range(0, n).map(|_: Int| '\u{301}'));
   assert_eq(stream_safe("a" ++ marks(30)), "a" ++ marks(30));
   assert_eq(stream_safe("a" ++ marks(31)), "a" ++ marks(30) ++ "\u{34F}\u{301}");
@@ -913,7 +859,7 @@ test "the stream-safe format lets thirty marks follow one another and puts a joi
   assert_eq(stream_safe("plain"), "plain")
 }
 
-test "the full mappings make several characters of one where a language writes it so" {
+test "`uppercase`, `lowercase` and `titlecase` map one character to several where Unicode defines it, such as `ß` to `SS`" {
   assert_eq(uppercase("stra\u{DF}e"), "STRASSE");
   assert_eq(uppercase("\u{FB03}"), "FFI");
   assert_eq(uppercase("\u{149}"), "\u{2BC}N");
@@ -927,7 +873,7 @@ test "the full mappings make several characters of one where a language writes i
   assert_eq(uppercase(""), "")
 }
 
-test "a capital sigma is lowered to the final sigma where it ends a word" {
+test "`lowercase` turns a capital sigma into the final sigma when it ends a word" {
   assert_eq(lowercase("\u{39F}\u{394}\u{39F}\u{3A3}"), "\u{3BF}\u{3B4}\u{3BF}\u{3C2}");
   assert_eq(lowercase("\u{3A3}"), "\u{3C3}");
   assert_eq(lowercase("\u{3A3}\u{391}"), "\u{3C3}\u{3B1}");
@@ -938,7 +884,7 @@ test "a capital sigma is lowered to the final sigma where it ends a word" {
   assert_eq(titlecase("\u{3BF}\u{394}\u{39F}\u{3A3}"), "\u{39F}\u{3B4}\u{3BF}\u{3C2}")
 }
 
-test "Turkish and Azeri keep dotted and dotless i apart" {
+test "with the Turkish and Azeri option, dotted and dotless i stay distinct when changing case or folding case" {
   assert_eq(uppercase("i\u{131}", Turkic), "\u{130}I");
   assert_eq(lowercase("I\u{130}", Turkic), "\u{131}i");
   assert_eq(lowercase("I\u{307}", Turkic), "i");
@@ -951,7 +897,7 @@ test "Turkish and Azeri keep dotted and dotless i apart" {
   assert_eq(simple_case_fold("I\u{130}"), "i\u{130}")
 }
 
-test "Lithuanian keeps the dot of i under an accent, and drops it from a capital" {
+test "with the Lithuanian option, `lowercase` keeps the dot on i when an accent is above it, and `uppercase` removes that dot" {
   assert_eq(lowercase("I\u{300}", Lithuanian), "i\u{307}\u{300}");
   assert_eq(lowercase("J\u{303}", Lithuanian), "j\u{307}\u{303}");
   assert_eq(lowercase("\u{12E}\u{301}", Lithuanian), "\u{12F}\u{307}\u{301}");
@@ -963,7 +909,7 @@ test "Lithuanian keeps the dot of i under an accent, and drops it from a capital
   assert_eq(uppercase("i\u{307}"), "I\u{307}")
 }
 
-test "folding makes all cases of a letter the same, in full or one character to one" {
+test "`case_fold` maps all case variants of a letter to one form, possibly to several characters, and `simple_case_fold` maps one character to one" {
   assert_eq(case_fold("Stra\u{DF}e"), "strasse");
   assert_eq(simple_case_fold("Stra\u{DF}e"), "stra\u{DF}e");
   assert_eq(case_fold("\u{1E9E}"), "ss");
@@ -975,7 +921,7 @@ test "folding makes all cases of a letter the same, in full or one character to 
   assert_eq(case_fold("PLAIN Text"), "plain text")
 }
 
-test "texts match ignoring case however their accents are written" {
+test "`caseless` matches texts that differ only in case, whichever way their accents are written" {
   assert(caseless("Stra\u{DF}e", "STRASSE"));
   assert(caseless("\u{C9}COLE", "e\u{301}cole"));
   assert(
@@ -988,7 +934,7 @@ test "texts match ignoring case however their accents are written" {
   assert_eq(caseless_key("\u{C5}"), "a\u{30A}")
 }
 
-test "a match decomposes before it folds, since folding an iota subscript makes a letter of a mark" {
+test "`caseless` decomposes text before case folding, because folding an iota subscript turns that combining mark into a letter" {
   let written = "\u{1FB3}\u{313}";
   let composed = "\u{1F80}";
   assert(equivalent(written, composed));
@@ -999,7 +945,7 @@ test "a match decomposes before it folds, since folding an iota subscript makes 
   assert(caseless("\u{1FBC}\u{313}", "\u{3B1}\u{313}\u{3B9}"))
 }
 
-test "for Turkish and Azeri the dotted and the dotless i match their own capitals, however written" {
+test "with the Turkish and Azeri option, `caseless` matches dotted i with dotted capital İ and dotless ı with I, in any canonical spelling" {
   assert(!caseless("I", "\u{131}"));
   assert(caseless("I", "\u{131}", turkic: true));
   assert(!caseless("I", "i", turkic: true));
@@ -1016,8 +962,6 @@ test "for Turkish and Azeri the dotted and the dotless i match their own capital
 
 type CaseExample = { text: String, ascii: String, unicode: String }
 
-/// Texts whose ASCII and Unicode lowercase differ. The ASCII fold must not change their characters
-/// outside ASCII.
 fn lowercase_examples() -> List<CaseExample> =
   [
     { text: "\u{212A}", ascii: "\u{212A}", unicode: "k" },
@@ -1026,8 +970,6 @@ fn lowercase_examples() -> List<CaseExample> =
     { text: "ΟΔΟΣ", ascii: "ΟΔΟΣ", unicode: "οδος" },
   ]
 
-/// Texts whose ASCII and Unicode uppercase differ, the first three because the Unicode one is
-/// longer.
 fn uppercase_examples() -> List<CaseExample> =
   [
     { text: "straße", ascii: "STRAßE", unicode: "STRASSE" },
@@ -1037,7 +979,7 @@ fn uppercase_examples() -> List<CaseExample> =
     { text: "\u{131}d", ascii: "\u{131}D", unicode: "ID" },
   ]
 
-test "outside ASCII the fold leaves a text unchanged where Unicode's lowercase changes it" {
+test "outside ASCII, `ascii_lower` leaves characters unchanged where `lowercase` changes them" {
   lowercase_examples().fold((), |_: Unit, c: CaseExample| {
     assert_eq(c.text.ascii_lower(), c.ascii);
     assert_eq(lowercase(c.text), c.unicode);
@@ -1045,7 +987,7 @@ test "outside ASCII the fold leaves a text unchanged where Unicode's lowercase c
   })
 }
 
-test "outside ASCII the fold leaves a text unchanged where Unicode's uppercase changes it" {
+test "outside ASCII, `ascii_upper` leaves characters unchanged where `uppercase` changes them" {
   uppercase_examples().fold((), |_: Unit, c: CaseExample| {
     assert_eq(c.text.ascii_upper(), c.ascii);
     assert_eq(uppercase(c.text), c.unicode);
@@ -1053,7 +995,7 @@ test "outside ASCII the fold leaves a text unchanged where Unicode's uppercase c
   })
 }
 
-test "for every character, a full mapping to one character equals `std.char`'s simple mapping" {
+test "for every character, when `uppercase` or `lowercase` returns one character it equals the result of `std.char`'s `to_uppercase` or `to_lowercase`" {
   let unlike = range(0, 0x110000).fold([], |found: List<Int>, n: Int|
     match Char::of_int(n) {
       Some(c) -> {
@@ -1068,8 +1010,7 @@ test "for every character, a full mapping to one character equals `std.char`'s s
   assert_eq(unlike, [])
 }
 
-// Includes a result longer than the text, a final sigma, and an ASCII letter from a non-ASCII one.
-test "untailored, a text maps by Unicode's full mappings outside ASCII" {
+test "without a language option, `lowercase` and `uppercase` use Unicode's full case mappings for characters outside ASCII" {
   let cases = [
     ("AbC1 é", "abc1 é", "ABC1 É"),
     ("straße", "straße", "STRASSE"),

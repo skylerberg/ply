@@ -14,9 +14,9 @@ import compiler.emit.lower.module_context (ModuleContext, Root, module_context_i
 import compiler.emit.borrow_inference (OwnershipSignature, InferenceTarget, inference_targets_of,
                                        declared_borrows, infer_signatures, ownership_text,
                                        reset_params, with_conventions)
-import compiler.emit.typed_ir (with_ownerships, Inst, Block, Fn, Member, ParamOwnership, Reset, If,
-                               Case, Match, Loop, Handle, OwnedParam, BorrowedParam, Let, Do, Call,
-                               Lambda, Closure, Arg, Convention)
+import compiler.emit.typed_ir (with_ownerships, Instruction, Block, Function, Member,
+                               ParamOwnership, Reset, If, Case, Match, Loop, Handle, OwnedParam,
+                               BorrowedParam, Let, Do, Call, Lambda, Closure, Arg, Convention)
 import compiler.emit.keys (Callee, Generic)
 import compiler.emit.own (insert_reference_counts, may_reuse)
 import compiler.emit.verify (ownership_fault)
@@ -47,10 +47,10 @@ fn corpus() -> Bytes =
     b"fn later(f: keep (Int) -> Int) -> () -> Int = || f(1)\n",
   ])
 
-fn analysed(src: Bytes) -> Analysis / {abort.raise} = analysed_as(b"m", src)
+fn analysed(source: Bytes) -> Analysis / {abort.raise} = analysed_as(b"m", source)
 
-fn analysed_as(name: Bytes, src: Bytes) -> Analysis / {abort.raise} =
-  match analyse(parse_all([{ name: name, src: src }])) {
+fn analysed_as(name: Bytes, source: Bytes) -> Analysis / {abort.raise} =
+  match analyse(parse_all([{ name: name, source_text: source }])) {
     Rejected(diagnostics) ->
       panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
     Analysed(a) -> a,
@@ -71,7 +71,11 @@ fn emitter_input(
       },
   }
 
-fn lowered_functions(a: Analysis, s: ModuleContext, roots: List<Root>) -> List<Fn> / {abort.raise} = {
+fn lowered_functions(
+  a: Analysis,
+  s: ModuleContext,
+  roots: List<Root>,
+) -> List<Function> / {abort.raise} = {
   let named = roots.fold(Map::new(), |m: Map<RootName, Root>, r: Root|
     m.insert(root_name(r.key), r));
   let order = range(0, roots.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
@@ -81,11 +85,11 @@ fn lowered_functions(a: Analysis, s: ModuleContext, roots: List<Root>) -> List<F
       Some(r) -> Some({ code: r.code, recorded: recorded_in(a, full) }),
       None -> None,
     };
-  roots.fold([], |acc: List<Fn>, r: Root| {
+  roots.fold([], |accumulator: List<Function>, r: Root| {
     let keys = tail_loop_of(s, order, read_of, r.key);
-    if keys.len() < 2 { acc.push(root_lowered(s, r)) }
-    else if keys.at(0) != Some(r.key) { acc } else {
-      acc.push(
+    if keys.len() < 2 { accumulator.push(root_lowered(s, r)) }
+    else if keys.at(0) != Some(r.key) { accumulator } else {
+      accumulator.push(
         group_lowered(
           s,
           keys.fold([], |ms: List<Root>, k: RootKey|
@@ -109,12 +113,12 @@ fn declared_of(s: ModuleContext) -> Map<RootName, List<Int>> =
   declared_borrows(Map::new(), s.module, s.definitions)
 
 fn inferred_ownership(
-  src: Bytes,
+  source: Bytes,
   module: Bytes,
   names: List<Bytes>,
 ) -> Map<RootName, OwnershipSignature> / {abort.raise} =
   infer_signatures(
-    inference_inputs(analysed(src), module, names),
+    inference_inputs(analysed(source), module, names),
     Map::new(),
     Map::new(),
   ).signatures
@@ -131,10 +135,10 @@ fn ownership_texts(
 ) -> List<{ name: Bytes, signature: Bytes }> =
   names.map(|n: Bytes| { name: n, signature: shown_text(inferred, qualify(b"m", n)) })
 
-fn with_ownership(f: Fn, params: List<ParamOwnership>) -> Fn =
+fn with_ownership(f: Function, params: List<ParamOwnership>) -> Function =
   { ..f, convention: with_ownerships(f.convention, params) }
 
-test "a reader borrows, a builder and a keeper give, and a borrowed result reaches its callers" {
+test "ownership inference borrows parameters that are only read, takes ownership of values a function builds or stores, and marks a result as borrowed from its arguments" {
   let names = [
     b"size",
     b"mirror",
@@ -163,14 +167,14 @@ test "a reader borrows, a builder and a keeper give, and a borrowed result reach
   ])
 }
 
-test "an update or a literal of a record a type variable lays out takes what it writes, as its specialisations do" {
-  let src = Bytes::concat_all([
+test "a record update or literal with a type-variable field takes ownership of the values it writes, as it does when the type is known" {
+  let source = Bytes::concat_all([
     b"fn renamed<a>(r: { inner: a, label: String }, m: String) -> { inner: a, label: String } = { ..r, label: m }\n",
     b"fn wrapped<a>(x: a, label: String) -> { inner: a, label: String } = { inner: x, label: label }\n",
     b"fn label_of<a>(r: { inner: a, label: String }) -> String = r.label\n",
   ]);
   assert_eq(
-    ownership_texts(inferred_ownership(src, b"m", []), [b"renamed", b"wrapped", b"label_of"]),
+    ownership_texts(inferred_ownership(source, b"m", []), [b"renamed", b"wrapped", b"label_of"]),
     [
       { name: b"renamed", signature: b"[given, given] owned" },
       { name: b"wrapped", signature: b"[given, given] owned" },
@@ -179,17 +183,17 @@ test "an update or a literal of a record a type variable lays out takes what it 
   )
 }
 
-test "borrowing costs no reuse: each body handed as inferred resets what it resets with every parameter given" {
+test "inferred borrowing loses no memory reuse: each function reuses as many values in place as when all its parameters are owned" {
   let lendings = inference_inputs(analysed(corpus()), b"m", []);
   let inferred = infer_signatures(lendings, Map::new(), Map::new()).signatures;
   let resets = |l: InferenceTarget, params: List<ParamOwnership>|
     resets_in(insert_reference_counts(with_ownership(l.member, params)).body).len();
-  let lost = lendings.fold([], |acc: List<RootName>, l: InferenceTarget|
+  let lost = lendings.fold([], |accumulator: List<RootName>, l: InferenceTarget|
     match inferred.get(l.definition) {
       Some(h) -> if resets(l, h.params) == resets(l, h.params.map(|_: ParamOwnership| OwnedParam)) {
-        acc
-      } else { acc.push(l.definition) },
-      None -> acc.push(l.definition),
+        accumulator
+      } else { accumulator.push(l.definition) },
+      None -> accumulator.push(l.definition),
     });
   assert_eq(lost, []);
   assert(
@@ -206,7 +210,7 @@ test "borrowing costs no reuse: each body handed as inferred resets what it rese
   )
 }
 
-test "every body written against the handings inferred for it and its callees is counted and passes the check" {
+test "every function body gets reference counts using the parameter ownership inferred for it and its callees, and passes the ownership check" {
   let a = analysed(corpus());
   let s = emitter_input(a, b"m", []);
   let functions = lowered_functions(a, s.setting, s.roots);
@@ -216,16 +220,16 @@ test "every body written against the handings inferred for it and its callees is
     declared_of(s.setting),
   ).signatures;
   assert_eq(
-    functions.fold([], |acc: List<{ root: Bytes, reason: Bytes }>, f: Fn|
+    functions.fold([], |accumulator: List<{ root: Bytes, reason: Bytes }>, f: Function|
       match ownership_fault(insert_reference_counts(with_conventions(f, inferred))) {
-        Some(reason) -> acc.push({ root: root_text(root_name(f.key)), reason: reason }),
-        None -> acc,
+        Some(reason) -> accumulator.push({ root: root_text(root_name(f.key)), reason: reason }),
+        None -> accumulator,
       }),
     [],
   )
 }
 
-test "a tail group borrowing as inferred passes the ownership check where a member hands another a value it made" {
+test "a group of functions that tail call each other passes the ownership check with inferred borrowing, including when one member passes another a value it created" {
   let a = analysed(corpus());
   let names = [b"m.hop", b"m.skip"];
   let s = emitter_input(a, b"m", names);
@@ -251,7 +255,7 @@ test "a tail group borrowing as inferred passes the ownership check where a memb
   assert(checked(|_: RootName| [BorrowedParam, BorrowedParam]) != None)
 }
 
-test "a function parameter not declared borrowed is inferred as any other: borrowed where only called, given where held" {
+test "an undeclared function parameter is inferred as borrowed if the function only calls it, and as owned if the function stores it" {
   assert_eq(
     ownership_texts(inferred_ownership(corpus(), b"m", []), [
       b"twice",
@@ -268,7 +272,7 @@ test "a function parameter not declared borrowed is inferred as any other: borro
   )
 }
 
-test "the prelude's map read and list read borrow what they read, and return an item they wrap afresh" {
+test "the prelude's `Map::get` and `List::at` borrow both arguments and return an owned `Option` that they build" {
   let inferred = infer_signatures(
     inference_inputs(analysed_as(prelude_module(), prelude_source::text()), prelude_module(), [
       b"std.prelude.List::at",
@@ -302,16 +306,16 @@ fn evidence_array_corpus() -> Bytes =
 type FunctionCall = { callee: Callee, args: List<Arg>, convention: Convention, suspends: Bool }
 
 fn calls_in(b: Block) -> List<FunctionCall> =
-  b.fold([], |acc: List<FunctionCall>, i: Inst|
+  b.fold([], |accumulator: List<FunctionCall>, i: Instruction|
     match i {
-      Let(l) -> match l.value { Call(c) -> acc.push(c), _ -> acc },
-      Do(d) -> match d.value { Call(c) -> acc.push(c), _ -> acc },
-      If(x) -> acc.concat(calls_in(x.then)).concat(calls_in(x.otherwise)),
-      Handle(h) -> acc.concat(calls_in(h.body)),
-      _ -> acc,
+      Let(l) -> match l.value { Call(c) -> accumulator.push(c), _ -> accumulator },
+      Do(d) -> match d.value { Call(c) -> accumulator.push(c), _ -> accumulator },
+      If(x) -> accumulator.concat(calls_in(x.then)).concat(calls_in(x.otherwise)),
+      Handle(h) -> accumulator.concat(calls_in(h.body)),
+      _ -> accumulator,
     })
 
-test "a call of a specialisation whose words go as one array is written against its definition's handing" {
+test "a call to a specialisation whose effect evidence is passed as one array follows the ownership signature of the called definition" {
   let a = analysed(evidence_array_corpus());
   let s = emitter_input(a, b"m", []);
   let functions = lowered_functions(a, s.setting, s.roots);
@@ -321,14 +325,14 @@ test "a call of a specialisation whose words go as one array is written against 
     declared_of(s.setting),
   ).signatures;
   let function_named = |name: Bytes|
-    match functions.find(|f: Fn| root_name(f.key) == root_name(Named(name))) {
+    match functions.find(|f: Function| root_name(f.key) == root_name(Named(name))) {
       Some(f) -> f,
       None -> panic(String::of_bytes_lossy(name.concat(b" did not lower"))),
     };
   let called = function_named(b"m.answered").lambdas.fold(
     [],
-    |acc: List<FunctionCall>, l: Lambda|
-      match l { Closure(c) -> acc.concat(calls_in(c.body.body)) },
+    |accumulator: List<FunctionCall>, l: Lambda|
+      match l { Closure(c) -> accumulator.concat(calls_in(c.body.body)) },
   );
   let generic = called.filter(|c: FunctionCall| match c.callee { Generic(_) -> true, _ -> false });
   assert_eq(
@@ -337,29 +341,29 @@ test "a call of a specialisation whose words go as one array is written against 
     [true],
   );
   assert_eq(
-    functions.fold([], |acc: List<{ root: Bytes, reason: Bytes }>, f: Fn|
+    functions.fold([], |accumulator: List<{ root: Bytes, reason: Bytes }>, f: Function|
       match ownership_fault(insert_reference_counts(with_conventions(f, inferred))) {
-        Some(reason) -> acc.push({ root: root_text(root_name(f.key)), reason: reason }),
-        None -> acc,
+        Some(reason) -> accumulator.push({ root: root_text(root_name(f.key)), reason: reason }),
+        None -> accumulator,
       }),
     [],
   )
 }
 
 fn resets_in(b: Block) -> List<Int> =
-  b.fold([], |acc: List<Int>, i: Inst|
+  b.fold([], |accumulator: List<Int>, i: Instruction|
     match i {
-      Reset(r) -> acc.push(r.of.id),
-      If(x) -> acc.concat(resets_in(x.then)).concat(resets_in(x.otherwise)),
+      Reset(r) -> accumulator.push(r.of.id),
+      If(x) -> accumulator.concat(resets_in(x.then)).concat(resets_in(x.otherwise)),
       Case(c) ->
         c.arms.fold(
-          acc.concat(resets_in(c.rest)),
+          accumulator.concat(resets_in(c.rest)),
           |a: List<Int>, arm: { when: Int, body: Block }| a.concat(resets_in(arm.body)),
         ),
       Match(m) ->
-        m.arms.fold(acc.concat(resets_in(m.rest)), |a: List<Int>, arm: Block|
+        m.arms.fold(accumulator.concat(resets_in(m.rest)), |a: List<Int>, arm: Block|
           a.concat(resets_in(arm))),
-      Loop(l) -> acc.concat(resets_in(l.body)),
-      Handle(h) -> acc.concat(resets_in(h.body)),
-      _ -> acc,
+      Loop(l) -> accumulator.concat(resets_in(l.body)),
+      Handle(h) -> accumulator.concat(resets_in(h.body)),
+      _ -> accumulator,
     })

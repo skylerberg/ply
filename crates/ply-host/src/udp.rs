@@ -1,7 +1,3 @@
-//! `std.udp`'s datagram sockets, in the socket host's table, so a datagram socket is labelled,
-//! closed and tuned as a stream socket is. A datagram received is parts: the address it came from
-//! as `wire` writes one, its payload, and byte 1 where it was cut short.
-
 use crate::jobs::Job;
 use crate::native::{int, parts};
 use crate::tcp::TcpHost;
@@ -12,16 +8,12 @@ use std::mem::MaybeUninit;
 use std::net::UdpSocket;
 use std::time::Duration;
 
-/// The most bytes one `recv_from` allocates for: no datagram is longer.
 pub const MAX_DATAGRAM: usize = 65535;
 
-/// A socket bound at `to`, with `options` set before the bind: its handle, or why not. Which
-/// addresses a run may bind is the host handler's to hold it to.
 pub fn bind(net: &TcpHost, label: &str, to: &Endpoint, options: &[SocketOption]) -> Vec<u8> {
     wire::result(bound(to, options).map(|socket| int(net.open_datagram(label, socket)).to_vec()))
 }
 
-/// Fixes the socket's far end: nothing, or why not.
 pub fn connect(
     net: &TcpHost,
     label: &str,
@@ -36,7 +28,6 @@ pub fn connect(
     Ok(wire::result(connected.map(|()| Vec::new())))
 }
 
-/// Sends `payload` to `to` as one datagram: its length, or why not.
 pub fn send_to(
     net: &TcpHost,
     label: &str,
@@ -56,7 +47,6 @@ pub fn send_to(
     }))
 }
 
-/// `send_to` the far end `connect` fixed; a socket with none is a runtime error.
 pub fn send(
     net: &TcpHost,
     label: &str,
@@ -76,8 +66,6 @@ pub fn send(
     }))
 }
 
-/// The next datagram, at most `max` bytes of it, which is capped at [`MAX_DATAGRAM`]: the
-/// datagram, or why not.
 pub fn recv_from(
     net: &TcpHost,
     label: &str,
@@ -94,12 +82,8 @@ pub fn recv_from(
     }))
 }
 
-/// One datagram, at most `max` bytes of it; what the kernel cut off a longer one is gone, and the
-/// result says it was.
 fn received(socket: &UdpSocket, max: usize) -> Result<Vec<u8>, NetError> {
     let mut buffer = vec![0u8; max];
-    // SAFETY: `u8` and `MaybeUninit<u8>` share a layout, and a receive writes only initialised
-    // bytes into the buffer.
     let spare =
         unsafe { &mut *(std::ptr::from_mut::<[u8]>(&mut buffer) as *mut [MaybeUninit<u8>]) };
     let (read, flags, from) = SockRef::from(socket)
@@ -119,7 +103,6 @@ fn received(socket: &UdpSocket, max: usize) -> Result<Vec<u8>, NetError> {
     ]))
 }
 
-/// A socket bound at `to` with `options` set before the bind.
 fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<UdpSocket, NetError> {
     let address = to.socket_addr()?;
     let rejection = |e: std::io::Error| NetError::of(&e);

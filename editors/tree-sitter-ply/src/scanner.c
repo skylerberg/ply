@@ -1,15 +1,5 @@
 #include "tree_sitter/parser.h"
 
-// Two tokens the lexer cannot decide on its own.
-//
-// `GT`: a `>` that closes a type argument. Ply lexes `>>` as two tokens and joins adjacent `>`s
-// when closing types, so a grammar that keeps `>>` and `>>>` as expression tokens must hand the
-// type context one `>` at a time. The scanner runs only where `_gt` can be accepted, so an
-// expression's `>` and `>>` are untouched.
-//
-// `LABEL`: the quoted name of a `test` or `law`. A test's label is an interpolated string only when
-// a `for` follows it, and reading it either way then needs the other's tokens; the scanner reads the
-// whole quoted string (holes, nested strings and escapes included) and hands it over as one token.
 enum TokenType {
   GT,
   LABEL,
@@ -89,13 +79,10 @@ bool tree_sitter_ply_external_scanner_scan(void *payload, TSLexer *lexer, const 
       if (c == '"') {
         lexer->advance(lexer, false);
         if (depth == 0) {
-          // The end of both a plain string and a template.
           lexer->mark_end(lexer);
           lexer->result_symbol = LABEL;
           return true;
         }
-        // Inside a hole a `"` opens a nested string; if the template never closes, this quote was
-        // the end of a plain string, and the last `mark_end` before it keeps that end.
         lexer->mark_end(lexer);
         candidate = true;
         scan_nested_string(lexer);
@@ -103,7 +90,6 @@ bool tree_sitter_ply_external_scanner_scan(void *payload, TSLexer *lexer, const 
       }
       lexer->advance(lexer, false);
     }
-    // Unterminated: hand the rest of the line over as the label so recovery keeps its place.
     if (!candidate) {
       lexer->mark_end(lexer);
     }

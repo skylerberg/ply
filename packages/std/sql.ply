@@ -1,10 +1,9 @@
-//! SQL statements as values, and the parser that determines what a statement does before it runs.
+//! SQL statements as values, and a parser that works out what a statement does before it runs.
 //!
-//! A `Statement` is a statement's text, and a `Param` is a value bound to one of its placeholders. A
-//! `Row` is one row a statement returns, with a `Datum` per column, and a `QueryResult` is its
-//! rows, its count or the database's error. A `Schema` is a database's tables as a value. `std.db`
-//! runs statements on PostgreSQL and `std.sqlite` on SQLite, and both parse a statement with
-//! `scan_statement`, in the `Dialect` it is written in, before they run it.
+//! A `Statement` is a statement's text. A `Param` is a value bound to one of its placeholders. A
+//! `Row` is one row a statement returns, holding a `Datum` per column. A `QueryResult` is the rows,
+//! the count or the database error a statement produced. A `Schema` is a database's tables as a
+//! value.
 //!
 //! `check_statement` checks a statement against the call that runs it and against a schema: its
 //! tables and columns, the type each placeholder represents, and the columns it returns, compared
@@ -31,7 +30,7 @@ pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refuse
 pub type Statement = { sql: String }
 
 /// A statement of this text.
-pub fn stmt(sql: String) -> Statement = { sql: sql }
+pub fn statement_of(sql: String) -> Statement = { sql: sql }
 
 /// A value bound to a statement's placeholder.
 pub type Param =
@@ -45,7 +44,7 @@ pub type Param =
   | JsonParameter(json::Json)
   | ArrayParameter(List<Param>)
 
-/// One value out of one column.
+/// A value in one column of a row: null, or a value of one of the SQL types the library supports.
 pub type Datum =
   | NullDatum
   | IntDatum(Int)
@@ -57,16 +56,16 @@ pub type Datum =
   | JsonDatum(json::Json)
   | ArrayDatum(List<Datum>)
 
-/// One row, by column name.
+/// A row returned by a statement, as a map from column name to the `Datum` in that column.
 pub type Row = Map<String, Datum>
 
-/// The SQLSTATE the server returned and the object it named.
+/// An error from the database: the SQLSTATE code the server returned, the name of the violated
+/// `constraint` and a `detail` message. `constraint` and `detail` are empty strings when the server
+/// gave none.
 pub type DbError = { code: String, constraint: String, detail: String }
 
 /// Rows for a statement that returns them, a count for one that writes, or the server's error.
 pub type QueryResult = | Rows(List<Row>) | Count(Int) | Failed(DbError)
-
-// --- A schema is a value --------------------------------------------------------
 
 /// A column's type in a `Schema`; `TNumeric(precision, scale)`.
 pub type ColumnType =
@@ -83,7 +82,8 @@ pub type ColumnType =
 /// a literal.
 pub type ColumnDefault = | DNone | SequenceDefault(String) | LiteralDefault(Param)
 
-/// A column: its name, its type, whether it may be null, and its default.
+/// A column of a table in a `Schema`. `nullable` says whether the column may hold null, and
+/// `default` is the value an insert gives it when it supplies none.
 pub type Column = { name: String, ty: ColumnType, nullable: Bool, default: ColumnDefault }
 
 /// A foreign key: `columns` of this table refer to `refers_to` of the table `references`.
@@ -97,10 +97,12 @@ pub type ForeignKey = {
 /// A named check constraint over SQL text.
 pub type Check = { name: String, expression: String }
 
-/// A named unique constraint.
+/// A unique constraint named `name` that requires the combination of values in `columns` to be
+/// unique across the table's rows.
 pub type Unique = { name: String, columns: List<String> }
 
-/// A table as a value, which `create_schema` renders and the fake enforces.
+/// A table in a `Schema`. `create_schema` renders it as SQL, and the in-memory database in
+/// `std.sql` enforces its keys and constraints.
 pub type Table = {
   name: String,
   columns: List<Column>,
@@ -113,7 +115,8 @@ pub type Table = {
 /// The tables of a database, in the order they are created.
 pub type Schema = { tables: List<Table> }
 
-/// An error with this SQLSTATE, constraint and detail, as the fake returns one.
+/// Returns a `DbError` with the given SQLSTATE `code`, `constraint` and `detail`, as the in-memory
+/// database returns when a statement violates a constraint.
 pub fn db_error(code: String, constraint: String, detail: String) -> DbError =
   { code: code, constraint: constraint, detail: detail }
 
@@ -130,19 +133,18 @@ fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13 || c 
 fn is_word_byte(c: Int) -> Bool =
   (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57)
 
-// --- Parsing a statement ----------------------------------------------------------
-
-// Endpoints are scheduled by a statement's tables, so one whose tables cannot be found is rejected.
-
-/// The SQL dialect a statement is written in, which decides how the parser tokenizes it and how
-/// much of it is parsed. A `Postgres` statement is parsed whole, for the tables it reaches. A
-/// `Sqlite` statement is parsed only for its verb and for the words that would read a clock or draw
-/// a random number. Its label is its database, so its tables are not part of its effects, and the engine
-/// itself rejects the rest when it prepares the statement (`std.sqlite`).
+/// The SQL dialect a statement is written in. The dialect decides how the parser splits the
+/// statement into tokens and how much of it the parser reads.
+///
+/// A `Postgres` statement is parsed completely, so the tables it reads and writes are known. A
+/// `Sqlite` statement is parsed only for its verb and for the words that read a clock or draw a
+/// random number, so its tables are not known. The SQLite engine rejects any other error when it
+/// prepares the statement (`std.sqlite`).
 pub type Dialect = | Postgres | Sqlite
 
-/// What a statement does, which decides the operations that may perform it. Only a `Sqlite`
-/// statement can be `SchemaChange`, which creates, drops or alters a schema object, or `Pragma`.
+/// The kind of a statement, which decides what permission a program needs to run it. Only a
+/// `Sqlite` statement can be `SchemaChange`, which creates, drops or alters a schema object, or
+/// `Pragma`.
 pub type StatementKind = | Select | Insert | Update | Delete | Values | SchemaChange | Pragma
 
 /// Whether a statement of this kind writes. A pragma may read or set a value, which only the engine
@@ -185,13 +187,10 @@ fn sql_note_read(t: SqlTables, name: String) -> SqlTables / {abort.raise} =
 
 fn sql_merge_tables(t: SqlTables, other: SqlTables) -> SqlTables / {abort.raise} =
   other.written.fold(
-    other.read.fold(t, |acc: SqlTables, n: String| sql_note_read(acc, n)),
-    |acc: SqlTables, n: String| sql_note_written(acc, n),
+    other.read.fold(t, |accumulator: SqlTables, n: String| sql_note_read(accumulator, n)),
+    |accumulator: SqlTables, n: String| sql_note_written(accumulator, n),
   )
 
-/// Keeps the names sorted, so a set of tables has one list: two statements that touch the same
-/// tables give the same list however they were written, and a comparison against a row does not
-/// depend on the order of the text.
 fn sql_insert_sorted(names: List<String>, name: String) -> List<String> / {abort.raise} =
   if names.contains(name) { names } else { sql_in_order(names, name, []) }
 
@@ -206,12 +205,10 @@ fn sql_in_order(
     else { sql_in_order(rest, name, before.push(h)) },
   }
 
-/// A name's bytes, compared as postgres compares them: byte by byte, so `"Items"` sorts before
-/// `items`.
 fn sql_name_before(a: String, b: String) -> Bool / {abort.raise} =
-  sql_bytes_cmp(Bytes::of_string(a), Bytes::of_string(b)) < 0
+  sql_bytes_compare(Bytes::of_string(a), Bytes::of_string(b)) < 0
 
-fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int / {abort.raise} = {
+fn sql_bytes_compare(a: Bytes, b: Bytes) -> Int / {abort.raise} = {
   let shorter = if a.len() < b.len() { a.len() } else { b.len() };
   let first = range(0, shorter).fold(0, |found: Int, i: Int|
     if found != 0 { found }
@@ -240,9 +237,8 @@ fn sql_merge_names(a: List<String>, b: List<String>) -> List<String> / {abort.ra
   }
 
 fn sql_without_table(names: List<String>, name: String) -> List<String> =
-  names.fold([], |acc: List<String>, n: String| if n == name { acc } else { acc.push(n) })
-
-// --- The tokens --------------------------------------------------------------------
+  names.fold([], |accumulator: List<String>, n: String|
+    if n == name { accumulator } else { accumulator.push(n) })
 
 /// A token, with the source text it was read from, so an error can name it.
 pub type SqlToken =
@@ -267,9 +263,9 @@ pub fn sql_is_punctuation(t: SqlToken, p: String) -> Bool =
 /// Whether the token is a `;`.
 pub fn sql_is_semicolon(t: SqlToken) -> Bool = match t { SqlSemicolon -> true, _ -> false }
 
-/// The tokens of `sql`, in order, as `dialect` tokenizes them. Whitespace and comments are dropped.
-/// A quote that is never closed is rejected rather than guessed at: after one, the parser cannot
-/// tell text from statement.
+/// Splits `sql` into tokens, in order, using the rules of `dialect`. Whitespace and comments are
+/// dropped. Returns a `DbError` if a quote or block comment is never closed, because the parser
+/// could not tell where quoted text ends and SQL begins.
 pub fn tokenize(
   dialect: Dialect,
   sql: String,
@@ -278,34 +274,32 @@ pub fn tokenize(
   sql_tokens_from(dialect, b, 0, [], b.len() + 1)
 }
 
-/// `left` limits the number of tokens, since each takes at least one byte.
 fn sql_tokens_from(
   dialect: Dialect,
   b: Bytes,
   at: Int,
-  acc: List<SqlTokenAt>,
+  accumulator: List<SqlTokenAt>,
   left: Int,
 ) -> Result<List<SqlTokenAt>, DbError> / {abort.raise} =
-  if left <= 0 { panic("more rounds than input") } else {
+  if left <= 0 { panic("the SQL scanner looped more times than the input is long") } else {
     let i = sql_skip_trivia(dialect, b, at, b.len() + 1)?;
-    if i >= b.len() { Ok(acc) } else {
+    if i >= b.len() { Ok(accumulator) } else {
       let lexed = match dialect {
         Postgres -> sql_next_token(b, i),
         Sqlite -> sqlite_next_token(b, i),
       };
       let step = lexed?;
-      sql_tokens_from(dialect, b, step.next, acc.push(step.token), left - 1)
+      sql_tokens_from(dialect, b, step.next, accumulator.push(step.token), left - 1)
     }
   }
 
-/// `left` limits the number of rounds, since each takes at least one byte.
 fn sql_skip_trivia(
   dialect: Dialect,
   b: Bytes,
   at: Int,
   left: Int,
 ) -> Result<Int, DbError> / {abort.raise} =
-  if left <= 0 { panic("more rounds than input") } else {
+  if left <= 0 { panic("the SQL scanner looped more times than the input is long") } else {
     if at >= b.len() { Ok(at) }
     else if is_space_byte(b.at(at)) { sql_skip_trivia(dialect, b, at + 1, left - 1) }
     else if b.at(at) == 45 && sql_byte_is(b, at + 1, 45) {
@@ -318,8 +312,6 @@ fn sql_skip_trivia(
     } else { Ok(at) }
   }
 
-/// Postgres nests block comments, and SQLite ends one at its first `*/`. Parsed the other way, a
-/// comment could hide statement text from the parser that the engine still runs.
 fn sql_comments_nest(dialect: Dialect) -> Bool = match dialect { Postgres -> true, Sqlite -> false }
 
 fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool / {abort.raise} = at < b.len() && b.at(at) == c
@@ -327,8 +319,6 @@ fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool / {abort.raise} = at < b.len()
 fn sql_past_line(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at >= b.len() { at } else if b.at(at) == 10 { at + 1 } else { sql_past_line(b, at + 1) }
 
-/// Where a block comment ends. Where comments nest, stopping at the first `*/` would leave
-/// statement text behind.
 fn sql_past_comment(
   b: Bytes,
   at: Int,
@@ -369,9 +359,6 @@ fn sql_next_token(
   }
 }
 
-/// One token as SQLite tokenizes it: no backslash escape and no dollar quote, a name quoted with
-/// `"`, `` ` `` or `[`, and a placeholder written `?` or `?3`. A named parameter is rejected, since
-/// a statement's parameters are bound by position.
 fn sqlite_next_token(
   b: Bytes,
   at: Int,
@@ -403,8 +390,6 @@ fn sqlite_next_token(
   }
 }
 
-/// A name SQLite quotes with `` ` `` or `[`, closed by `close`, where a doubled `` ` `` represents
-/// one.
 fn sqlite_quoted_word(
   b: Bytes,
   at: Int,
@@ -451,17 +436,16 @@ fn sql_unclosed(b: Bytes, at: Int, what: String) -> DbError =
     "0A000",
     "",
     what ++ " opened" ++ sql_byte_prefix() ++ at.to_string()
-      ++ " is never closed, and past one the reader cannot tell text from statement",
+      ++ " is never closed, so the parser cannot tell where it ends and treats the rest of the statement as part of it",
   )
 
-/// The end of a string literal, from just after its opening quote.
 fn sql_end_of_literal(
   b: Bytes,
   at: Int,
   open: Int,
   escapes: Bool,
 ) -> Result<Int, DbError> / {abort.raise} =
-  if at >= b.len() { Err(sql_unclosed(b, open, "a string sql_literal")) }
+  if at >= b.len() { Err(sql_unclosed(b, open, "a string literal")) }
   else if escapes && b.at(at) == 92 { sql_end_of_literal(b, at + 2, open, escapes) }
   else if b.at(at) == 39 && sql_byte_is(b, at + 1, 39) {
     sql_end_of_literal(b, at + 2, open, escapes)
@@ -505,17 +489,15 @@ fn sql_quoted_word(
       ),
   }
 
-/// The name inside `"…"`, with a doubled quote representing one.
-fn sql_unquoted(b: Bytes, at: Int, end: Int, acc: Bytes) -> String / {abort.raise} =
-  if at >= end { String::of_bytes(acc) } else if b.at(at) == 34 && sql_byte_is(b, at + 1, 34) {
-    sql_unquoted(b, at + 2, end, acc.concat(byte_of_int(34)))
-  } else { sql_unquoted(b, at + 1, end, acc.concat(byte_of_int(b.at(at)))) }
+fn sql_unquoted(b: Bytes, at: Int, end: Int, accumulator: Bytes) -> String / {abort.raise} =
+  if at >= end { String::of_bytes(accumulator) }
+  else if b.at(at) == 34 && sql_byte_is(b, at + 1, 34) {
+    sql_unquoted(b, at + 2, end, accumulator.concat(byte_of_int(34)))
+  } else { sql_unquoted(b, at + 1, end, accumulator.concat(byte_of_int(b.at(at)))) }
 
-/// `$1` … `$9`: where the digits end, or `None` when this is a dollar quote instead.
 fn sql_digit_end(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
   if at >= b.len() || !is_digit(b.at(at)) { None } else { Some(sql_past_number(b, at)) }
 
-/// `$tag$ … $tag$`, where the tag may be empty.
 fn sql_dollar_quoted(
   b: Bytes,
   at: Int,
@@ -541,9 +523,9 @@ fn sql_find_tag(b: Bytes, tag: Bytes, at: Int) -> Option<Int> / {abort.raise} =
     else { Continue(i + 1) })
 
 fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool / {abort.raise} =
-  range(0, tag.len()).fold(true, |acc: Bool, i: Int| acc && b.at(at + i) == tag.at(i))
+  range(0, tag.len()).fold(true, |accumulator: Bool, i: Int|
+    accumulator && b.at(at + i) == tag.at(i))
 
-/// A number runs to the next byte that is not part of one, as postgres's own tokenizer reads it.
 fn sql_past_number(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at < b.len() && (is_word_byte(b.at(at)) || b.at(at) == 46) { sql_past_number(b, at + 1) }
   else { at }
@@ -577,18 +559,15 @@ pub fn sql_tokenize_summary(
     Ok(ts) -> Ok(ts.map(|t: SqlTokenAt| sql_token_summary(t))),
   }
 
-// --- The parser --------------------------------------------------------------------
-
-/// What a statement does and which tables its text reaches. The effects of the definition that
-/// reached the call site are checked against `written` and `read`, so a construct the parser cannot
-/// account for is rejected rather than run with effects that under-report.
+/// Describes a parsed statement: its kind, and the tables it writes and reads. The effects declared
+/// at the call site are checked against `written` and `read`. The parser therefore rejects any
+/// construct it cannot analyze, since it could do more than those effects say.
 pub type SqlScan = { kind: StatementKind, tables: SqlTables }
 
-/// A statement that writes anywhere — including inside a `with` — is a write wherever it leads.
+/// Returns whether the statement writes. It is a write if its kind is a write or if it writes any
+/// table, including a write inside a `with` clause.
 pub fn scan_writes(s: SqlScan) -> Bool = kind_writes(s.kind) || s.tables.written.len() > 0
 
-/// The parser's position: the tokens left, the common table expressions in scope, and how deep the
-/// statement has nested.
 type SqlParser = { tokens: List<SqlTokenAt>, ctes: List<String>, depth: Int, end_pos: Int }
 
 fn sql_max_depth() -> Int = 32
@@ -615,10 +594,10 @@ fn sql_second_statement_error(at: Int) -> DbError =
   db_error(
     "0A000",
     "",
-    "the database driver rejects this statement: `Statement` holds more than one statement, and a `;` is"
+    "the database driver rejects this statement: a `Statement` must contain exactly one SQL statement, but it contains a second one after a `;`"
       ++ sql_byte_prefix()
       ++ at.to_string()
-      ++ ". One `Statement` is one statement, which is what removes the stacked-statement payload an injected fragment would otherwise become",
+      ++ ". Allowing only one statement stops injected text from adding a second statement",
   )
 
 fn sql_head(tokens: List<SqlTokenAt>) -> Option<SqlTokenAt> =
@@ -667,7 +646,6 @@ fn sql_identifier(
     None -> Err(sql_reject_here(parser, what ++ " was expected here")),
   }
 
-/// `[schema.]name`, returning the last segment.
 fn sql_qualified_name(
   parser: SqlParser,
   rest: Int,
@@ -676,13 +654,14 @@ fn sql_qualified_name(
   sql_more_names(first.parser, first.name, first.parser.tokens.len() + 1)
 }
 
-/// `left` limits the number of rounds, since each takes at least one token.
 fn sql_more_names(
   parser: SqlParser,
   name: String,
   left: Int,
 ) -> Result<{ parser: SqlParser, name: String }, DbError> =
-  if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
+  if left <= 0 {
+    Err(db_error("XX000", "", "the SQL scanner looped more times than the input is long"))
+  } else {
     if !sql_at_punctuation(parser, ".") { Ok({ parser: parser, name: name }) } else {
       match sql_nth(parser.tokens, 1) {
         Some(next) -> match next.token {
@@ -697,8 +676,6 @@ fn sql_more_names(
     }
   }
 
-/// `[AS] alias [(columns)]`, if there is one. A word that is reserved cannot be an alias without
-/// `AS`, so a statement is not parsed as though a clause word were a name.
 fn sql_alias(parser: SqlParser) -> Result<SqlParser, DbError> = {
   let as_ = sql_eat_word(parser, "as");
   if as_.ate {
@@ -721,25 +698,19 @@ fn sql_alias_columns(parser: SqlParser) -> Result<SqlParser, DbError> = {
   if open.ate { sql_name_list(open.parser, open.parser.tokens.len() + 1) } else { Ok(parser) }
 }
 
-/// A column list, which consumes its own `)`. `left` limits the number of rounds, since each takes
-/// at least one token.
 fn sql_name_list(parser: SqlParser, left: Int) -> Result<SqlParser, DbError> =
-  if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
+  if left <= 0 {
+    Err(db_error("XX000", "", "the SQL scanner looped more times than the input is long"))
+  } else {
     let first = sql_identifier(parser, "a column name")?;
     let comma = sql_eat_punctuation(first.parser, ",");
     if comma.ate { sql_name_list(comma.parser, left - 1) }
     else { sql_expect_punctuation(first.parser, ")") }
   }
 
-// --- What the parser allows ---------------------------------------------------------
-
-/// Words that may precede a `(` without being a call.
 fn sql_syntactic_forms() -> List<String> =
   ["array", "cast", "exists", "row", "any", "some", "nullif"]
 
-/// Functions whose result does not depend only on the program's state. They are rejected inside
-/// statement text: a timestamp belongs in the row as a parameter, where the effect system can see
-/// it.
 fn sql_nondeterministic_functions() -> List<String> =
   [
     "now",
@@ -756,8 +727,6 @@ fn sql_nondeterministic_functions() -> List<String> =
     "gen_random_uuid",
   ]
 
-/// The functions a statement may call. A call is the only place an allowed statement can reach
-/// outside its own tables, so the list is closed.
 fn sql_allowed_functions() -> List<String> =
   [
     "avg",
@@ -826,7 +795,6 @@ fn sql_allowed_functions() -> List<String> =
     "to_jsonb",
   ]
 
-/// Words that end an expression at depth zero.
 fn sql_clause_words() -> List<String> =
   [
     "from",
@@ -902,8 +870,6 @@ fn sql_reserved(word: String) -> Bool =
       word,
     )
 
-/// A word followed by `(` is a call unless it is reserved, a syntactic form, or one of the names
-/// above. Any other call is rejected where it is written.
 fn sql_check_call(parser: SqlParser) -> Result<SqlParser, DbError> =
   match sql_head(parser.tokens) {
     None -> Ok(parser),
@@ -914,7 +880,7 @@ fn sql_check_call(parser: SqlParser) -> Result<SqlParser, DbError> =
         Err(
           sql_reject_token(
             t,
-            "this call is not one the reader will vouch for: a call is the one place an admitted statement reaches outside its own table set, and it can only report the relations it was selected from",
+            "this function call is not allowed: a call can read tables that are not in the statement's own table list, and the checker can only report the tables named in the statement",
           ),
         )
       },
@@ -928,7 +894,6 @@ fn sql_reject_nondeterministic(parser: SqlParser) -> Result<SqlParser, DbError> 
     Ok(_) -> Ok(parser),
   }
 
-/// Rejects the first unquoted word of `tokens` that is one of `words`.
 fn sql_reject_in(words: List<String>, tokens: List<SqlTokenAt>) -> Result<(), DbError> =
   match tokens {
     [] -> Ok(()),
@@ -944,19 +909,17 @@ fn sql_nondeterministic_error(t: SqlTokenAt, word: String) -> DbError =
   sql_reject_token(
     t,
     "`" ++ word
-      ++ "` is not a function of the program's state, so it cannot be hidden in statement text: pass the value as a parameter, where the row the effect system sees says where it came from",
+      ++ "` returns a different value each time it runs, so it is not allowed in statement text: pass the value as a parameter, so the call site shows where the value comes from",
   )
-
-// --- The statement ------------------------------------------------------------------
 
 fn sql_statement(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let deeper = { ..parser, depth: parser.depth + 1 };
     if deeper.depth > sql_max_depth() {
-      Err(sql_reject_here(parser, "this statement nests deeper than the reader will follow"))
+      Err(sql_reject_here(parser, "this statement is nested too deeply for the SQL parser"))
     } else {
       match sql_reject_nondeterministic(deeper) {
         Err(e) -> Err(e),
@@ -965,13 +928,11 @@ fn sql_statement(
     }
   }
 
-/// `with` is the only allowed construct that can hide a verb: a CTE's body is a whole statement, so
-/// a `delete` inside one makes a statement that starts with `select` a write.
 fn sql_with_clause(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let opening = sql_eat_word(parser, "with");
     if !opening.ate { sql_body(parser, left - 1) } else {
       let recursive = sql_eat_word(opening.parser, "recursive");
@@ -985,7 +946,7 @@ fn sql_cte_list(
   gathered: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     match sql_cte(parser, recursive, left - 1) {
       Err(e) -> Err(e),
       Ok(one) -> {
@@ -1010,9 +971,8 @@ fn sql_cte(
   recursive: Bool,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let named = sql_identifier(parser, "a common table expression's name")?;
-    // A `recursive` CTE names itself in its body, so its name is in scope before the body.
     let scope = if recursive { named.parser.ctes.push(named.name) } else { named.parser.ctes };
     let in_scope = { ..named.parser, ctes: scope };
     let columns = sql_eat_punctuation(in_scope, "(");
@@ -1042,24 +1002,23 @@ fn sql_cte(
     }
   }
 
-/// The column list after a table name, if there is one.
 fn sql_after_columns(columns: { parser: SqlParser, ate: Bool }) -> Result<SqlParser, DbError> =
   if columns.ate { sql_name_list(columns.parser, columns.parser.tokens.len() + 1) }
   else { Ok(columns.parser) }
 
-/// A nested statement, which inherits the enclosing `WITH`'s names: a reference to a CTE names that
-/// expression rather than a table.
 fn sql_without_names(tables: SqlTables, names: List<String>) -> SqlTables =
   {
-    written: names.fold(tables.written, |acc: List<String>, n: String| sql_without_table(acc, n)),
-    read: names.fold(tables.read, |acc: List<String>, n: String| sql_without_table(acc, n)),
+    written: names.fold(tables.written, |accumulator: List<String>, n: String|
+      sql_without_table(accumulator, n)),
+    read: names.fold(tables.read, |accumulator: List<String>, n: String|
+      sql_without_table(accumulator, n)),
   }
 
 fn sql_body(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     match sql_head(parser.tokens) {
       None -> Err(sql_reject_here(parser, "this statement is empty")),
       Some(t) -> if sql_is_semicolon(t.token) { Err(sql_second_statement_error(t.at)) }
@@ -1090,7 +1049,7 @@ fn sql_select_statement(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     match sql_select_core(parser, left - 1) {
       Err(e) -> Err(e),
       Ok(core) -> {
@@ -1107,7 +1066,7 @@ fn sql_set_operations(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     if sql_at_word(parser, "union") || sql_at_word(parser, "intersect")
         || sql_at_word(parser, "except") {
       let opened = sql_step(parser);
@@ -1125,7 +1084,7 @@ fn sql_select_tail(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let ordered = sql_eat_word(parser, "order");
     let after_order = if ordered.ate {
       match sql_expect_word(ordered.parser, "by") {
@@ -1142,7 +1101,7 @@ fn sql_limit_clauses(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     if sql_at_word(parser, "limit") || sql_at_word(parser, "offset") {
       let opened = sql_step(parser);
       match sql_skip_expression(
@@ -1161,7 +1120,7 @@ fn sql_limit_clauses(
           Err(
             sql_reject_token(
               t,
-              "`fetch` and the row-locking clauses are outside the statements this reader admits: a row lock is a write it cannot express",
+              "`fetch` and the row-locking clauses are not supported: a row lock is a write, and this checker only accepts read-only statements",
             ),
           ),
         None -> Err(sql_reject_here(parser, "the statement ends mid-clause")),
@@ -1173,7 +1132,7 @@ fn sql_select_core(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let open = sql_eat_punctuation(parser, "(");
     if open.ate {
       match sql_select_statement(open.parser, left - 1) {
@@ -1216,7 +1175,7 @@ fn sql_select_rest(
   at: { parser: SqlParser, tables: SqlTables },
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let from = sql_source_after_from(at, left - 1)?;
     let filtered = sql_select_filter(from, left - 1)?;
     let grouped = sql_select_grouped(filtered, left - 1)?;
@@ -1227,7 +1186,7 @@ fn sql_source_after_from(
   at: { parser: SqlParser, tables: SqlTables },
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let from = sql_eat_word(at.parser, "from");
     if from.ate { sql_source_list(from.parser, at.tables, left - 1) } else { Ok(at) }
   }
@@ -1236,7 +1195,7 @@ fn sql_select_filter(
   at: { parser: SqlParser, tables: SqlTables },
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let where_ = sql_eat_word(at.parser, "where");
     if where_.ate {
       sql_skip_expression(where_.parser, at.tables, sql_clause_words(), false, left - 1)
@@ -1247,7 +1206,7 @@ fn sql_select_grouped(
   at: { parser: SqlParser, tables: SqlTables },
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let group = sql_eat_word(at.parser, "group");
     if group.ate {
       match sql_expect_word(group.parser, "by") {
@@ -1261,7 +1220,7 @@ fn sql_select_having(
   at: { parser: SqlParser, tables: SqlTables },
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let having = sql_eat_word(at.parser, "having");
     let after = if having.ate {
       sql_skip_expression(having.parser, at.tables, sql_clause_words(), false, left - 1)
@@ -1282,7 +1241,7 @@ fn sql_source_list(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     match sql_source_item(parser, tables, left - 1) {
       Err(e) -> Err(e),
       Ok(one) -> {
@@ -1297,7 +1256,7 @@ fn sql_source_item(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     match sql_source_base(parser, tables, left - 1) {
       Err(e) -> Err(e),
       Ok(base) -> sql_joins(base.parser, base.tables, left - 1),
@@ -1309,7 +1268,7 @@ fn sql_joins(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let natural = sql_eat_word(parser, "natural");
     let joined = sql_at_word(natural.parser, "join") || sql_at_word(natural.parser, "inner")
       || sql_at_word(natural.parser, "left")
@@ -1365,7 +1324,7 @@ fn sql_source_base(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser recursed more times than the statement has tokens") } else {
     let lateral = sql_eat_word(parser, "lateral");
     let open_at = match sql_head(lateral.parser.tokens) {
       Some(t) -> t.at,
@@ -1389,11 +1348,7 @@ fn sql_source_base(
             },
           },
         }
-      } else {
-        Err(
-          sql_reject("`(`", open_at, "a parenthesised from-item is not a shape the reader models"),
-        )
-      }
+      } else { Err(sql_reject("`(`", open_at, "a parenthesised item in `from` is not supported")) }
     } else {
       let only = sql_eat_word(lateral.parser, "only");
       match sql_qualified_name(only.parser, 0) {
@@ -1404,7 +1359,7 @@ fn sql_source_base(
               Err(
                 sql_reject_token(
                   t,
-                  "a set-returning function in `from` reads tables no reader can name",
+                  "a function that returns rows in `from` is not supported: the checker cannot tell which tables it reads",
                 ),
               ),
             None -> Err(sql_reject_here(named.parser, "the statement ends mid-clause")),
@@ -1427,7 +1382,8 @@ fn sql_target_list(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     match sql_skip_expression(parser, tables, sql_clause_words(), true, left - 1) {
       Err(e) -> Err(e),
       Ok(item) -> {
@@ -1450,13 +1406,12 @@ fn sql_target_list(
     }
   }
 
-// --- The four verbs -----------------------------------------------------------------
-
 fn sql_insert(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     let after_insert = sql_expect_word(parser, "insert")?;
     let into = sql_expect_word(after_insert, "into")?;
     let named = sql_qualified_name(into, 0)?;
@@ -1495,13 +1450,13 @@ fn sql_insert(
     }
   }
 
-/// `default values`, or a `select` that returns the rows.
 fn sql_insert_source(
   default: { parser: SqlParser, ate: Bool },
   after_columns: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     if default.ate {
       match sql_expect_word(default.parser, "values") {
         Err(e) -> Err(e),
@@ -1514,7 +1469,8 @@ fn sql_update(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     let after_update = sql_expect_word(parser, "update")?;
     let only = sql_eat_word(after_update, "only");
     let named = sql_qualified_name(only.parser, 0)?;
@@ -1554,7 +1510,8 @@ fn sql_delete(
   parser: SqlParser,
   left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     let after_delete = sql_expect_word(parser, "delete")?;
     let from = sql_expect_word(after_delete, "from")?;
     let only = sql_eat_word(from, "only");
@@ -1587,20 +1544,23 @@ fn sql_returning(
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     let returning = sql_eat_word(parser, "returning");
     if returning.ate { sql_skip_expression(returning.parser, tables, [], false, left - 1) }
     else { Ok({ parser: parser, tables: tables }) }
   }
 
-/// `values (…), (…)`: the rows are expressions, but a subquery inside one is still a statement.
-/// `left` limits the number of rows, since each but the last takes a comma.
 fn sql_values_rows(
   parser: SqlParser,
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> =
-  if left <= 0 { Err(db_error("XX000", "", "more rows than tokens")) } else {
+  if left <= 0 {
+    Err(
+      db_error("XX000", "", "the SQL parser read more `values` rows than the statement has tokens"),
+    )
+  } else {
     let open = sql_expect_punctuation(parser, "(");
     match open {
       Err(e) -> Err(e),
@@ -1614,14 +1574,21 @@ fn sql_values_rows(
     }
   }
 
-/// `left` limits the number of rounds, since each takes at least one token.
 fn sql_row_body(
   parser: SqlParser,
   tables: SqlTables,
   depth: Int,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> =
-  if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
+  if left <= 0 {
+    Err(
+      db_error(
+        "XX000",
+        "",
+        "the SQL parser took more steps in a row than the statement has tokens",
+      ),
+    )
+  } else {
     match sql_head(parser.tokens) {
       None -> Err(sql_reject_here(parser, "this row is never closed")),
       Some(t) -> if sql_is_punctuation(t.token, "(") {
@@ -1638,10 +1605,6 @@ fn sql_row_body(
     }
   }
 
-// --- Expressions ----------------------------------------------------------------------
-
-/// Skips an expression, following subqueries, up to the next stop word at depth zero. This is where
-/// a subquery's tables are collected: a `select` inside a `where` reaches tables of its own.
 fn sql_skip_expression(
   parser: SqlParser,
   tables: SqlTables,
@@ -1649,7 +1612,8 @@ fn sql_skip_expression(
   stop_at_comma: Bool,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     match sql_head(parser.tokens) {
       None -> Ok({ parser: parser, tables: tables }),
       Some(t) -> if sql_is_semicolon(t.token) { Err(sql_second_statement_error(t.at)) }
@@ -1670,7 +1634,8 @@ fn sql_skip_word(
   stop_at_comma: Bool,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     match t.token {
       SqlWord(w) -> if !w.quoted && stops.contains(w.text) {
         Ok({ parser: parser, tables: tables })
@@ -1687,8 +1652,6 @@ fn sql_skip_word(
     }
   }
 
-/// A `(` inside an expression opens either a subquery, whose tables count, or a group, whose
-/// contents are traversed but whose depth the stop words do not see into.
 fn sql_skip_paren(
   parser: SqlParser,
   tables: SqlTables,
@@ -1696,7 +1659,8 @@ fn sql_skip_paren(
   stop_at_comma: Bool,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     let opened = sql_step(parser);
     if sql_at_word(opened, "select") || sql_at_word(opened, "values")
         || sql_at_word(opened, "with") {
@@ -1723,16 +1687,16 @@ fn sql_skip_paren(
     }
   }
 
-/// The body of a group, from just after its `(`, to just past the `)` that closes it.
 fn sql_skip_group(
   parser: SqlParser,
   tables: SqlTables,
   depth: Int,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     match sql_head(parser.tokens) {
-      None -> Err(sql_reject_here(parser, "this group is never closed")),
+      None -> Err(sql_reject_here(parser, "this `(` has no matching `)`")),
       Some(t) -> if sql_is_semicolon(t.token) { Err(sql_second_statement_error(t.at)) }
       else if sql_is_punctuation(t.token, "(") {
         match sql_check_call(parser) {
@@ -1767,29 +1731,24 @@ fn sql_skip_group(
     }
   }
 
-/// The body of a parenthesised group whose opening paren is already consumed.
 fn sql_skip_parens(
   parser: SqlParser,
   tables: SqlTables,
   left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if left <= 0 { panic("more calls than tokens allow") } else {
+  if left <= 0 { panic("the SQL parser made more nested calls than the statement has tokens") }
+  else {
     match sql_skip_group(parser, tables, 1, left - 1) {
       Err(e) -> Err(e),
       Ok(closed) -> Ok({ parser: closed.parser, tables: closed.tables }),
     }
   }
 
-// --- The entry point ------------------------------------------------------------------
-
-/// Every cycle through the parser takes a token, so a path reaches each of its thirty functions at
-/// most once per token. The parser's step budget is therefore the token count plus one, times
-/// thirty.
 fn reader_function_count() -> Int = 30
 
-/// What `sql` does and which tables it reaches, or why it is rejected. Nothing below the driver's
-/// own parse of the verb depends on a guess: an unmodelled construct would give a wrong table set,
-/// and a wrong table set lets the scheduler run two writers side by side.
+/// Scans a statement and returns what it does and which tables it uses, or an error saying why it
+/// is rejected. The scanner rejects any construct it does not model, because a wrong table set
+/// could let the scheduler run two writers on the same table at once.
 pub fn scan_statement(dialect: Dialect, sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
   match tokenize(dialect, sql) {
     Err(e) -> Err(e),
@@ -1810,7 +1769,6 @@ pub fn scan_statement(dialect: Dialect, sql: String) -> Result<SqlScan, DbError>
 pub fn rejection_byte(e: DbError) -> Option<Int> / {abort.raise} = {
   let words = Bytes::of_string(e.detail);
   let marker = Bytes::of_string(sql_byte_prefix());
-  // The last marker: any statement text the error quotes comes before the byte position.
   let last = iterate(
     { from: 0, found: None },
     words.len() + 1,
@@ -1830,24 +1788,15 @@ pub fn rejection_byte(e: DbError) -> Option<Int> / {abort.raise} = {
   }
 }
 
-/// What every parser error writes before its byte position.
 fn sql_byte_prefix() -> String = " at byte "
 
-// --- A SQLite statement's shape ------------------------------------------------------------
-
-/// The words that read SQLite's clock wherever they appear. Each is reserved, so none is a name.
 fn sqlite_clock_words() -> List<String> = ["current_timestamp", "current_date", "current_time"]
 
-/// SQLite's functions that draw a random number.
 fn sqlite_random_functions() -> List<String> = ["random", "randomblob"]
 
-/// SQLite's date and time functions, which read the clock for the time `now` or for none.
 fn sqlite_date_functions() -> List<String> =
   ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"]
 
-/// What a SQLite statement does, by the verb it starts with, or why it is rejected. The engine
-/// rejects each of these too; rejecting them here means a tagged literal is rejected when the
-/// program is checked.
 fn sqlite_scan(tokens: List<SqlTokenAt>, end: Int) -> Result<SqlScan, DbError> =
   match tokens {
     [] -> Err(sql_reject("the statement ends", end, "this statement is empty")),
@@ -1875,14 +1824,13 @@ fn sqlite_kind(t: SqlTokenAt, rest: List<SqlTokenAt>) -> Result<StatementKind, D
 
 fn sqlite_verb_rejection(verb: String) -> String =
   if ["attach", "detach", "vacuum"].contains(verb) {
-    "a connection reaches its own database and no other file: `std.sqlite`'s `backup` writes a copy under a root"
+    "`attach`, `detach` and `vacuum` are not allowed: a connection can use only the database it was opened with. To write a copy of the database into a directory, use `backup` from `std.sqlite`"
   } else if ["begin", "commit", "end", "rollback", "savepoint", "release"].contains(verb) {
-    "a transaction is opened and closed by `std.sqlite`'s `transaction`, never by a statement"
+    "a statement cannot begin or end a transaction: use `transaction` from `std.sqlite`"
   } else {
-    "a statement begins with one of `select`, `insert`, `replace`, `update`, `delete`, `values`, `with`, `create`, `drop`, `alter`, `reindex`, `analyze` or `pragma`"
+    "a statement must begin with one of `select`, `insert`, `replace`, `update`, `delete`, `values`, `with`, `create`, `drop`, `alter`, `reindex`, `analyze` or `pragma`"
   }
 
-/// The verb a `with` leads to: the first one outside its parentheses.
 fn sqlite_after_with(
   with_: SqlTokenAt,
   tokens: List<SqlTokenAt>,
@@ -1901,7 +1849,6 @@ fn sqlite_after_with(
     else { sqlite_after_with(with_, rest, depth) },
   }
 
-/// `create`, rejected for what belongs to a connection and for a virtual table.
 fn sqlite_create_kind(
   create: SqlTokenAt,
   rest: List<SqlTokenAt>,
@@ -1915,14 +1862,11 @@ fn sqlite_create_kind(
         ),
       )
     } else if sql_is_word(t.token, "virtual") {
-      Err(sql_reject_token(t, "virtual tables are not admitted"))
+      Err(sql_reject_token(t, "virtual tables are not supported"))
     } else { Ok(SchemaChange) },
-    [] -> Err(sql_reject_token(create, "this `create` makes nothing")),
+    [] -> Err(sql_reject_token(create, "this `create` is not followed by anything to create")),
   }
 
-/// Rejects a call that draws a random number, and a date or time function written with no time,
-/// with the time `'now'`, or with the modifier `'localtime'` or `'utc'`. A name is distinguished
-/// from a call by the `(` after it, so a table named `random` is written `"random"`.
 fn sqlite_check_calls(tokens: List<SqlTokenAt>) -> Result<(), DbError> =
   match tokens {
     [] -> Ok(()),
@@ -1942,7 +1886,6 @@ fn sqlite_check_calls(tokens: List<SqlTokenAt>) -> Result<(), DbError> =
 fn sql_opens_parenthesis(tokens: List<SqlTokenAt>) -> Bool =
   match tokens { [t, ..] -> sql_is_punctuation(t.token, "("), [] -> false }
 
-/// The arguments of a date or time call, from just past its `(`: `bare` while none has been read.
 fn sqlite_check_date_arguments(
   call: SqlTokenAt,
   name: String,
@@ -1959,7 +1902,7 @@ fn sqlite_check_date_arguments(
           sql_reject_token(
             call,
             "`" ++ name
-              ++ "` with no time reads the clock: pass the time as a parameter, where the row the effect system sees says where it came from",
+              ++ "` called without a time argument reads the current time from the clock: pass the time as a parameter, so the effects the program declares show where the time comes from",
           ),
         )
       } else { Ok(()) }
@@ -1970,7 +1913,7 @@ fn sqlite_check_date_arguments(
         sql_reject_token(
           t,
           "`" ++ name ++ "` of " ++ t.text
-            ++ " reads the machine's clock or its time zone: pass the time as a parameter, where the row the effect system sees says where it came from",
+            ++ " reads the machine's clock or its time zone: pass the time as a parameter, so the effect system can see where the time comes from",
         ),
       )
     } else { sqlite_check_date_arguments(call, name, rest, depth, false) },
@@ -1985,8 +1928,6 @@ fn sqlite_reads_system_clock(t: SqlTokenAt) -> Bool =
     _ -> false,
   }
 
-/// A statement ends where the first one does: a `;` after it is a second statement, and any other
-/// token is a construct the parser did not account for.
 fn sql_nothing_left(parser: SqlParser) -> Result<(), DbError> =
   match sql_head(parser.tokens) {
     None -> Ok(()),
@@ -1994,7 +1935,8 @@ fn sql_nothing_left(parser: SqlParser) -> Result<(), DbError> =
     else { Err(sql_reject_token(t, "the statement ends here")) },
   }
 
-/// What a statement touches, for an error that reports why a label does not fit it.
+/// Returns the tables a statement writes and reads as text for an error message, such as "`a`
+/// (written) and `b` (read)", or "no table" when there are none.
 pub fn describe_tables(t: SqlTables) -> String =
   if t.written.len() > 0 && t.read.len() > 0 {
     "`" ++ String::join(t.written, "`, `") ++ "` (written) and `" ++ String::join(t.read, "`, `")
@@ -2003,7 +1945,7 @@ pub fn describe_tables(t: SqlTables) -> String =
   else if t.read.len() > 0 { "`" ++ String::join(t.read, "`, `") ++ "` (read)" }
   else { "no table" }
 
-/// The postgres name of a value's type, as an error that quotes one writes it.
+/// Returns the postgres name of a value's type, as used in error messages.
 pub fn datum_type(v: Datum) -> String =
   match v {
     NullDatum -> "unknown",
@@ -2016,11 +1958,6 @@ pub fn datum_type(v: Datum) -> String =
     JsonDatum(_) -> "jsonb",
     ArrayDatum(_) -> "array",
   }
-
-// --- A statement checked where it is performed --------------------------------------------
-//
-// Against a schema, a statement the check cannot follow is rejected where it stops, never passed on
-// a guess.
 
 /// How a call performs its statement: `Reads` returns rows and may not write, `Writes` writes and
 /// returns a count, `WritesRows` writes and returns the rows its `returning` names, and `ReadWrite`
@@ -2043,10 +1980,12 @@ pub type FieldKind =
 /// A field of a row type: the column it is read from, by name, and what it contains.
 pub type Field = { name: String, kind: FieldKind }
 
-/// What a call states about the statement it performs: the dialect, how it performs it, the table
-/// its label names when the label is a table (`std.db`'s; a `std.sqlite` label is a database), the
-/// constructor of each parameter it passes when it writes them as a list (`None` for one that is
-/// not a constructor), and the fields of the row type it reads rows into.
+/// Describes a call that performs a statement, so the statement can be checked against a schema.
+/// `operation` is how the call performs it. `label` is the table the call names, when the label is
+/// a table (a `std.db` label is a table; a `std.sqlite` label is a database).
+/// `parameter_constructors` lists, for each parameter written in a list, the name of its
+/// constructor, or `None` when it is not a constructor call. `row` lists the fields of the row type
+/// the rows are read into.
 pub type CallSite = {
   dialect: Dialect,
   operation: Operation,
@@ -2107,26 +2046,24 @@ pub fn check_statement(
     },
   }
 
-/// A statement that creates or alters the schema, a pragma, and a bare `values` name no table to
-/// resolve.
 fn names_no_table(k: StatementKind) -> Bool =
   match k { SchemaChange -> true, Pragma -> true, Values -> true, _ -> false }
 
-/// How a placeholder is written in the dialect: `$1` or `?1`.
 fn placeholder_mark(dialect: Dialect) -> String = match dialect { Postgres -> "$", Sqlite -> "?" }
 
-/// Each placeholder rewritten as `$n`, including a SQLite `?`, which gets the number after the
-/// highest before it, as SQLite numbers one.
 fn number_placeholders(tokens: List<SqlTokenAt>) -> List<SqlTokenAt> / {abort.raise} =
   tokens.fold(
     { out: [], high: 0 },
-    |acc: { out: List<SqlTokenAt>, high: Int }, t: SqlTokenAt|
+    |accumulator: { out: List<SqlTokenAt>, high: Int }, t: SqlTokenAt|
       match t.token {
         SqlPlaceholder -> {
-          let n = placeholder_number(t.text, acc.high);
-          { out: acc.out.push({ ..t, text: "$" ++ n.to_string() }), high: max(acc.high, n) }
+          let n = placeholder_number(t.text, accumulator.high);
+          {
+            out: accumulator.out.push({ ..t, text: "$" ++ n.to_string() }),
+            high: max(accumulator.high, n),
+          }
         },
-        _ -> { out: acc.out.push(t), high: acc.high },
+        _ -> { out: accumulator.out.push(t), high: accumulator.high },
       },
   ).out
 
@@ -2137,7 +2074,6 @@ fn highest_placeholder(tokens: List<SqlTokenAt>) -> Int / {abort.raise} =
   tokens.fold(0, |high: Int, t: SqlTokenAt|
     match t.token { SqlPlaceholder -> max(high, placeholder_number(t.text, high)), _ -> high })
 
-/// Whether `returning` appears outside every parenthesis.
 fn has_returning(tokens: List<SqlTokenAt>) -> Bool =
   tokens.fold({ depth: 0, found: false }, |s: { depth: Int, found: Bool }, t: SqlTokenAt|
     if sql_is_punctuation(t.token, "(") { { ..s, depth: s.depth + 1 } }
@@ -2152,9 +2088,9 @@ fn check_label(site: CallSite, scan: SqlScan) -> List<Finding> / {abort.raise} =
         {
           kind: LabelMismatch,
           at: 0,
-          message: "the call names `" ++ label ++ "`, and the statement touches "
+          message: "the call names the table `" ++ label ++ "`, but the statement uses "
             ++ describe_tables(scan.tables)
-            ++ ": label the call with a table the statement names, or split the statement",
+            ++ ": change the table name in the call to a table the statement uses, or split the statement into several statements",
         },
       ]
     },
@@ -2167,7 +2103,7 @@ fn check_operation(site: CallSite, scan: SqlScan, returns: Bool) -> List<Finding
   match site.operation {
     Reads -> if scan_writes(scan) {
       wrong(
-        "the statement writes, and the call only reads: perform it as `execute` or `returning`, or two endpoints that both write would be run beside each other",
+        "the statement writes, but the call is read-only, and a read-only call cannot run a write: use `execute` or `returning` instead. Read-only calls may run at the same time as other calls, but two writes must not run at the same time",
       )
     } else { [] },
     Writes -> if !writes {
@@ -2234,7 +2170,7 @@ fn check_against_schema(
     ) {
     Err(f) -> [f],
     Ok(statement) -> {
-      let judged = type_check_statement(
+      let checked = type_check_statement(
         {
           findings: [],
           placed: [],
@@ -2247,22 +2183,18 @@ fn check_against_schema(
       );
       let shaped = match site.row {
         None -> [],
-        Some(fields) -> if judged.j.findings.len() > 0 { [] }
-        else { check_row_fields(fields, judged.returned) },
+        Some(fields) -> if checked.j.findings.len() > 0 { [] }
+        else { check_row_fields(fields, checked.returned) },
       };
       let bound = match site.parameter_constructors {
         None -> [],
-        Some(given) -> check_parameter_types(site.dialect, given, judged.j.placed),
+        Some(given) -> check_parameter_types(site.dialect, given, checked.j.placed),
       };
-      judged.j.findings.concat(shaped).concat(bound)
+      checked.j.findings.concat(shaped).concat(bound)
     },
   }
 }
 
-// --- The statement, as the check follows it ----------------------------------------------
-
-/// A value's type as the check tracks it: `UnknownType` is one it cannot determine, which agrees
-/// with every type, and `NullType` is the literal `null`.
 type ValueType =
   | IntType
   | BoolType
@@ -2275,7 +2207,6 @@ type ValueType =
   | NullType
   | UnknownType
 
-/// A column as the statement names it: `table` is empty when the name is bare.
 type ColumnReference = { table: String, column: String, at: Int }
 
 type QueryExpression =
@@ -2285,7 +2216,7 @@ type QueryExpression =
   | NullExpression
   | CallExpression({ name: String, args: List<QueryExpression> })
   | CountStarExpression
-  | BinaryExpression({ op: String, lhs: QueryExpression, rhs: QueryExpression })
+  | BinaryExpression({ operation: String, left_operand: QueryExpression, right_operand: QueryExpression })
   | NotExpression(QueryExpression)
   | NegateExpression(QueryExpression)
   | IsNullExpression(QueryExpression)
@@ -2300,13 +2231,10 @@ type QueryExpression =
 
 type When = { cond: QueryExpression, value: QueryExpression }
 
-/// A returned column: `*` or `t.*`, or an expression, with its alias and the span of its text.
 type SelectItem =
   | Wildcard({ table: String, at: Int })
   | ExpressionItem({ value: QueryExpression, name: Option<String>, from: Int, to: Int })
 
-/// A table a statement reads, by the name it is written under. A `left join` makes the table it
-/// joins `optional`, a `right join` every table before it, and a `full join` both.
 type Source = { table: String, alias: String, at: Int, optional: Bool }
 
 type SelectQuery = {
@@ -2336,7 +2264,7 @@ type FromClause = { sources: List<Source>, conditions: List<QueryExpression> }
 
 type JoinKind = { parser: SqlParser, optional: Bool, before: Bool, cross: Bool }
 
-type Operator = { op: String, parser: SqlParser }
+type Operator = { operator: String, parser: SqlParser }
 
 fn parse_output<a>(parser: SqlParser, value: a) -> ParseOutput<a> = { parser: parser, value: value }
 
@@ -2349,7 +2277,7 @@ fn unsupported<a>(parser: SqlParser, what: String) -> Result<a, Finding> =
 fn unsupported_here<a>(parser: SqlParser) -> Result<a, Finding> =
   match sql_head(parser.tokens) {
     Some(t) -> unsupported(parser, "`" ++ t.text ++ "` here"),
-    None -> unsupported(parser, "a statement that ends here"),
+    None -> unsupported(parser, "the statement ends here, but the parser expected more tokens"),
   }
 
 fn too_deep<a>(parser: SqlParser) -> Result<a, Finding> =
@@ -2361,7 +2289,6 @@ fn expect_word(parser: SqlParser, word: String) -> Result<SqlParser, Finding> =
 fn expect_punctuation(parser: SqlParser, p: String) -> Result<SqlParser, Finding> =
   if sql_at_punctuation(parser, p) { Ok(sql_step(parser)) } else { unsupported_here(parser) }
 
-/// A name, quoted or not; of a dotted one, the last segment.
 fn parse_name(
   parser: SqlParser,
   left: Int,
@@ -2384,7 +2311,6 @@ fn parse_name(
     }
   }
 
-/// `[as] alias`, where one is written: a reserved word is not an alias without `as`.
 fn parse_alias(parser: SqlParser) -> Result<ParseOutput<Option<String>>, Finding> = {
   let as_ = sql_eat_word(parser, "as");
   match sql_head(as_.parser.tokens) {
@@ -2423,7 +2349,6 @@ fn parse_by_verb(
   else if sql_at_word(parser, "delete") { parse_delete(parser, left) }
   else { unsupported_here(parser) }
 
-/// Skips `select` and its `distinct` or `all`.
 fn parse_select_prefix(parser: SqlParser) -> Result<SqlParser, Finding> = {
   let opened = sql_step(parser);
   let distinct = sql_eat_word(opened, "distinct");
@@ -2441,7 +2366,6 @@ fn parse_from(
   if sql_at_word(parser, word) { parse_sources(sql_step(parser), [], [], left) }
   else { Ok(parse_output(parser, { sources: [], conditions: [] })) }
 
-/// `word by` and the expressions after it, as `group by` and `order by` are written.
 fn parse_by(
   parser: SqlParser,
   word: String,
@@ -2481,14 +2405,14 @@ fn parse_select(
 
 fn parse_select_items(
   parser: SqlParser,
-  acc: List<SelectItem>,
+  accumulator: List<SelectItem>,
   left: Int,
 ) -> Result<ParseOutput<List<SelectItem>>, Finding> / {abort.raise} =
   if left <= 0 { too_deep(parser) } else {
     let one = parse_select_item(parser, left - 1)?;
     let comma = sql_eat_punctuation(one.parser, ",");
-    if comma.ate { parse_select_items(comma.parser, acc.push(one.value), left - 1) }
-    else { Ok(parse_output(one.parser, acc.push(one.value))) }
+    if comma.ate { parse_select_items(comma.parser, accumulator.push(one.value), left - 1) }
+    else { Ok(parse_output(one.parser, accumulator.push(one.value))) }
   }
 
 fn parse_select_item(
@@ -2524,7 +2448,6 @@ fn parse_select_item(
     }
   }
 
-/// The table of a `t.*`, where that is what is written.
 fn qualified_wildcard_table(parser: SqlParser) -> Option<String> =
   match ((sql_head(parser.tokens), sql_nth(parser.tokens, 1), sql_nth(parser.tokens, 2))) {
     (Some(t), Some(d), Some(s)) -> match t.token {
@@ -2572,7 +2495,6 @@ fn parse_joins(
     }
   }
 
-/// The join at the head, parsed up to and including its `join`.
 fn parse_join_kind(parser: SqlParser) -> Option<JoinKind> = {
   let past = |p: SqlParser, optional: Bool, before: Bool, cross: Bool|
     if sql_at_word(p, "join") {
@@ -2612,7 +2534,6 @@ fn parse_source(
     }
   }
 
-/// The condition after `word`, as `where`, `having` and `on` are written, where it is.
 fn parse_condition(
   parser: SqlParser,
   word: String,
@@ -2625,19 +2546,19 @@ fn parse_condition(
 
 fn parse_expressions(
   parser: SqlParser,
-  acc: List<QueryExpression>,
+  accumulator: List<QueryExpression>,
   left: Int,
 ) -> Result<ParseOutput<List<QueryExpression>>, Finding> / {abort.raise} =
   if left <= 0 { too_deep(parser) } else {
     let one = parse_expression(parser, left - 1)?;
     let comma = sql_eat_punctuation(one.parser, ",");
-    if comma.ate { parse_expressions(comma.parser, acc.push(one.value), left - 1) }
-    else { Ok(parse_output(one.parser, acc.push(one.value))) }
+    if comma.ate { parse_expressions(comma.parser, accumulator.push(one.value), left - 1) }
+    else { Ok(parse_output(one.parser, accumulator.push(one.value))) }
   }
 
 fn parse_order(
   parser: SqlParser,
-  acc: List<QueryExpression>,
+  accumulator: List<QueryExpression>,
   left: Int,
 ) -> Result<ParseOutput<List<QueryExpression>>, Finding> / {abort.raise} =
   if left <= 0 { too_deep(parser) } else {
@@ -2650,29 +2571,29 @@ fn parse_order(
       sql_step(sql_step(ordered))
     } else { ordered };
     let comma = sql_eat_punctuation(nulls, ",");
-    if comma.ate { parse_order(comma.parser, acc.push(one.value), left - 1) }
-    else { Ok(parse_output(nulls, acc.push(one.value))) }
+    if comma.ate { parse_order(comma.parser, accumulator.push(one.value), left - 1) }
+    else { Ok(parse_output(nulls, accumulator.push(one.value))) }
   }
 
 fn parse_limit_offset(
   parser: SqlParser,
-  acc: List<QueryExpression>,
+  accumulator: List<QueryExpression>,
   left: Int,
 ) -> Result<ParseOutput<List<QueryExpression>>, Finding> / {abort.raise} =
   if left <= 0 { too_deep(parser) } else if sql_at_word(parser, "limit") {
     if sql_at_word(sql_step(parser), "all") {
-      parse_limit_offset(sql_step(sql_step(parser)), acc, left - 1)
+      parse_limit_offset(sql_step(sql_step(parser)), accumulator, left - 1)
     } else {
       let n = parse_expression(sql_step(parser), left - 1)?;
-      parse_limit_offset(n.parser, acc.push(n.value), left - 1)
+      parse_limit_offset(n.parser, accumulator.push(n.value), left - 1)
     }
   } else if sql_at_word(parser, "offset") {
     let n = parse_expression(sql_step(parser), left - 1)?;
     let past = if sql_at_word(n.parser, "row") || sql_at_word(n.parser, "rows") {
       sql_step(n.parser)
     } else { n.parser };
-    parse_limit_offset(past, acc.push(n.value), left - 1)
-  } else { Ok(parse_output(parser, acc)) }
+    parse_limit_offset(past, accumulator.push(n.value), left - 1)
+  } else { Ok(parse_output(parser, accumulator)) }
 
 fn parse_expression(
   parser: SqlParser,
@@ -2690,7 +2611,14 @@ fn parse_or_more(
   if left <= 0 { too_deep(so_far.parser) } else if sql_at_word(so_far.parser, "or") {
     let next = parse_and(sql_step(so_far.parser), left - 1)?;
     parse_or_more(
-      parse_output(next.parser, BinaryExpression({ op: "or", lhs: so_far.value, rhs: next.value })),
+      parse_output(
+        next.parser,
+        BinaryExpression({
+          operation: "or",
+          left_operand: so_far.value,
+          right_operand: next.value,
+        }),
+      ),
       left - 1,
     )
   } else { Ok(so_far) }
@@ -2713,7 +2641,11 @@ fn parse_and_more(
     parse_and_more(
       parse_output(
         next.parser,
-        BinaryExpression({ op: "and", lhs: so_far.value, rhs: next.value }),
+        BinaryExpression({
+          operation: "and",
+          left_operand: so_far.value,
+          right_operand: next.value,
+        }),
       ),
       left - 1,
     )
@@ -2727,42 +2659,56 @@ fn parse_not(
     let inner = parse_not(sql_step(parser), left - 1)?;
     Ok(parse_output(inner.parser, NotExpression(inner.value)))
   } else {
-    let lhs = parse_sum(parser, left - 1)?;
-    parse_predicate(lhs, left - 1)
+    let left_operand = parse_sum(parser, left - 1)?;
+    parse_predicate(left_operand, left - 1)
   }
 
 fn parse_predicate(
-  lhs: ParseOutput<QueryExpression>,
+  left_operand: ParseOutput<QueryExpression>,
   left: Int,
 ) -> Result<ParseOutput<QueryExpression>, Finding> / {abort.raise} =
-  if left <= 0 { too_deep(lhs.parser) } else {
-    match parse_comparison(lhs.parser) {
+  if left <= 0 { too_deep(left_operand.parser) } else {
+    match parse_comparison(left_operand.parser) {
       Some(c) -> {
-        let rhs = parse_sum(c.parser, left - 1)?;
-        Ok(parse_output(rhs.parser, BinaryExpression({ op: c.op, lhs: lhs.value, rhs: rhs.value })))
+        let right_operand = parse_sum(c.parser, left - 1)?;
+        Ok(
+          parse_output(
+            right_operand.parser,
+            BinaryExpression({
+              operation: c.operator,
+              left_operand: left_operand.value,
+              right_operand: right_operand.value,
+            }),
+          ),
+        )
       },
-      None -> if sql_at_word(lhs.parser, "is") {
-        let p = sql_eat_word(sql_step(lhs.parser), "not").parser;
-        if sql_at_word(p, "null") { Ok(parse_output(sql_step(p), IsNullExpression(lhs.value))) }
-        else if sql_at_word(p, "true") || sql_at_word(p, "false") {
+      None -> if sql_at_word(left_operand.parser, "is") {
+        let p = sql_eat_word(sql_step(left_operand.parser), "not").parser;
+        if sql_at_word(p, "null") {
+          Ok(parse_output(sql_step(p), IsNullExpression(left_operand.value)))
+        } else if sql_at_word(p, "true") || sql_at_word(p, "false") {
           Ok(
             parse_output(
               sql_step(p),
-              BinaryExpression({ op: "=", lhs: lhs.value, rhs: LiteralExpression(BoolType) }),
+              BinaryExpression({
+                operation: "=",
+                left_operand: left_operand.value,
+                right_operand: LiteralExpression(BoolType),
+              }),
             ),
           )
         } else { unsupported_here(p) }
       } else {
-        let negated = sql_eat_word(lhs.parser, "not");
+        let negated = sql_eat_word(left_operand.parser, "not");
         let p = negated.parser;
-        if sql_at_word(p, "in") { parse_in(lhs.value, sql_step(p), left - 1) }
+        if sql_at_word(p, "in") { parse_in(left_operand.value, sql_step(p), left - 1) }
         else if sql_at_word(p, "between") {
           let low = parse_sum(sql_step(p), left - 1)?;
           let high = parse_sum(expect_word(low.parser, "and")?, left - 1)?;
           Ok(
             parse_output(
               high.parser,
-              BetweenExpression({ value: lhs.value, low: low.value, high: high.value }),
+              BetweenExpression({ value: left_operand.value, low: low.value, high: high.value }),
             ),
           )
         } else if sql_at_word(p, "like") || sql_at_word(p, "ilike") {
@@ -2770,11 +2716,15 @@ fn parse_predicate(
           Ok(
             parse_output(
               pattern.parser,
-              BinaryExpression({ op: "like", lhs: lhs.value, rhs: pattern.value }),
+              BinaryExpression({
+                operation: "like",
+                left_operand: left_operand.value,
+                right_operand: pattern.value,
+              }),
             ),
           )
         } else if negated.ate { unsupported_here(p) }
-        else { Ok(lhs) }
+        else { Ok(left_operand) }
       },
     }
   }
@@ -2805,7 +2755,6 @@ fn parse_in(
     }
   }
 
-/// The punctuation that touches `t`, the head of `parser`, or nothing.
 fn touching_punctuation(parser: SqlParser, t: SqlTokenAt) -> String =
   match sql_nth(parser.tokens, 1) {
     Some(n) -> match n.token {
@@ -2815,20 +2764,20 @@ fn touching_punctuation(parser: SqlParser, t: SqlTokenAt) -> String =
     None -> "",
   }
 
-/// The comparison at the head, consumed: `<=`, `>=`, `<>` and `!=` are two adjacent tokens.
 fn parse_comparison(parser: SqlParser) -> Option<Operator> =
   match sql_head(parser.tokens) {
     Some(t) -> match t.token {
       SqlPunctuation(p) -> {
         let second = touching_punctuation(parser, t);
         let two = sql_step(sql_step(parser));
-        if p == "=" && second == "" { Some({ op: "=", parser: sql_step(parser) }) }
+        if p == "=" && second == "" { Some({ operator: "=", parser: sql_step(parser) }) }
         else if p == "<" && (second == "=" || second == ">") {
-          Some({ op: p ++ second, parser: two })
-        } else if p == ">" && second == "=" { Some({ op: ">=", parser: two }) }
-        else if p == "!" && second == "=" { Some({ op: "<>", parser: two }) }
-        else if (p == "<" || p == ">") && second == "" { Some({ op: p, parser: sql_step(parser) }) }
-        else { None }
+          Some({ operator: p ++ second, parser: two })
+        } else if p == ">" && second == "=" { Some({ operator: ">=", parser: two }) }
+        else if p == "!" && second == "=" { Some({ operator: "<>", parser: two }) }
+        else if (p == "<" || p == ">") && second == "" {
+          Some({ operator: p, parser: sql_step(parser) })
+        } else { None }
       },
       _ -> None,
     },
@@ -2858,7 +2807,11 @@ fn parse_sum_more(
             parse_sum_more(
               parse_output(
                 next.parser,
-                BinaryExpression({ op: "||", lhs: so_far.value, rhs: next.value }),
+                BinaryExpression({
+                  operation: "||",
+                  left_operand: so_far.value,
+                  right_operand: next.value,
+                }),
               ),
               left - 1,
             )
@@ -2867,7 +2820,11 @@ fn parse_sum_more(
             parse_sum_more(
               parse_output(
                 next.parser,
-                BinaryExpression({ op: p, lhs: so_far.value, rhs: next.value }),
+                BinaryExpression({
+                  operation: p,
+                  left_operand: so_far.value,
+                  right_operand: next.value,
+                }),
               ),
               left - 1,
             )
@@ -2901,7 +2858,11 @@ fn parse_product_more(
           parse_product_more(
             parse_output(
               next.parser,
-              BinaryExpression({ op: p, lhs: so_far.value, rhs: next.value }),
+              BinaryExpression({
+                operation: p,
+                left_operand: so_far.value,
+                right_operand: next.value,
+              }),
             ),
             left - 1,
           )
@@ -2925,7 +2886,6 @@ fn parse_unary(
     parse_casts(primary, left - 1)
   }
 
-/// Each `::type` written after a value.
 fn parse_casts(
   so_far: ParseOutput<QueryExpression>,
   left: Int,
@@ -2967,7 +2927,6 @@ fn parse_type(parser: SqlParser, left: Int) -> Result<ParseOutput<ValueType>, Fi
     None -> unsupported_here(parser),
   }
 
-/// Skips a type's `(precision, scale)`, when it has one.
 fn parse_type_size(parser: SqlParser, left: Int) -> Result<SqlParser, Finding> =
   if sql_at_punctuation(parser, "(") { parse_type_size_list(sql_step(parser), left) }
   else { Ok(parser) }
@@ -3042,7 +3001,6 @@ fn parse_parenthesized(
     else { Ok(parse_output(expect_punctuation(inner.parser, ")")?, inner.value)) }
   }
 
-/// A word at the head of a value: a literal, a form the grammar defines, a call, or a column.
 fn parse_word(
   parser: SqlParser,
   word: String,
@@ -3076,8 +3034,6 @@ fn parse_word(
     parse_call(sql_step(sql_step(parser)), word, left - 1)
   } else { parse_column(parser, word, at) }
 
-/// A call, from just past its `(`. One followed by `over`, `filter` or `within` is a window or an
-/// aggregate's clause, which the check does not follow.
 fn parse_call(
   parser: SqlParser,
   name: String,
@@ -3111,7 +3067,6 @@ fn parse_arguments(
     )
   }
 
-/// A column, bare or named with its table; one named by three parts is not followed.
 fn parse_column(
   parser: SqlParser,
   word: String,
@@ -3152,7 +3107,6 @@ fn parse_case(
     )
   }
 
-/// The value a `case` compares each `when` with, where it has one.
 fn parse_case_subject(
   parser: SqlParser,
   left: Int,
@@ -3164,15 +3118,20 @@ fn parse_case_subject(
 
 fn parse_whens(
   parser: SqlParser,
-  acc: List<When>,
+  accumulator: List<When>,
   left: Int,
 ) -> Result<ParseOutput<List<When>>, Finding> / {abort.raise} =
   if left <= 0 { too_deep(parser) } else if !sql_at_word(parser, "when") {
-    if acc.len() == 0 { unsupported_here(parser) } else { Ok(parse_output(parser, acc)) }
+    if accumulator.len() == 0 { unsupported_here(parser) }
+    else { Ok(parse_output(parser, accumulator)) }
   } else {
     let tested = parse_expression(sql_step(parser), left - 1)?;
     let value = parse_expression(expect_word(tested.parser, "then")?, left - 1)?;
-    parse_whens(value.parser, acc.push({ cond: tested.value, value: value.value }), left - 1)
+    parse_whens(
+      value.parser,
+      accumulator.push({ cond: tested.value, value: value.value }),
+      left - 1,
+    )
   }
 
 fn parse_insert(
@@ -3207,7 +3166,6 @@ fn parse_insert(
     }
   }
 
-/// The name an insert's table is written under: an `as` alias, or its own.
 fn parse_into_alias(
   parser: SqlParser,
   table: String,
@@ -3218,7 +3176,6 @@ fn parse_into_alias(
     Ok(parse_output(a.parser, a.value.name))
   } else { Ok(parse_output(parser, table)) }
 
-/// An insert's column list, where it has one.
 fn parse_insert_columns(
   parser: SqlParser,
   left: Int,
@@ -3226,18 +3183,17 @@ fn parse_insert_columns(
   if sql_at_punctuation(parser, "(") { parse_column_list(sql_step(parser), [], left) }
   else { Ok(parse_output(parser, [])) }
 
-/// A column list, from just past its `(`, through its `)`.
 fn parse_column_list(
   parser: SqlParser,
-  acc: List<ColumnReference>,
+  accumulator: List<ColumnReference>,
   left: Int,
 ) -> Result<ParseOutput<List<ColumnReference>>, Finding> =
   if left <= 0 { too_deep(parser) } else {
     let one = parse_name(parser, left - 1)?;
     let column = { table: "", column: one.value.name, at: one.value.at };
     let comma = sql_eat_punctuation(one.parser, ",");
-    if comma.ate { parse_column_list(comma.parser, acc.push(column), left - 1) }
-    else { Ok(parse_output(expect_punctuation(one.parser, ")")?, acc.push(column))) }
+    if comma.ate { parse_column_list(comma.parser, accumulator.push(column), left - 1) }
+    else { Ok(parse_output(expect_punctuation(one.parser, ")")?, accumulator.push(column))) }
   }
 
 fn parse_insert_source(
@@ -3256,15 +3212,15 @@ fn parse_insert_source(
 
 fn parse_value_rows(
   parser: SqlParser,
-  acc: List<List<QueryExpression>>,
+  accumulator: List<List<QueryExpression>>,
   left: Int,
 ) -> Result<ParseOutput<List<List<QueryExpression>>>, Finding> / {abort.raise} =
   if left <= 0 { too_deep(parser) } else {
     let values = parse_expressions(expect_punctuation(parser, "(")?, [], left - 1)?;
     let closed = expect_punctuation(values.parser, ")")?;
     let comma = sql_eat_punctuation(closed, ",");
-    if comma.ate { parse_value_rows(comma.parser, acc.push(values.value), left - 1) }
-    else { Ok(parse_output(closed, acc.push(values.value))) }
+    if comma.ate { parse_value_rows(comma.parser, accumulator.push(values.value), left - 1) }
+    else { Ok(parse_output(closed, accumulator.push(values.value))) }
   }
 
 fn parse_returning(
@@ -3303,11 +3259,15 @@ fn parse_update(
 
 fn parse_assignments(
   parser: SqlParser,
-  acc: List<Assignment>,
+  accumulator: List<Assignment>,
   left: Int,
 ) -> Result<ParseOutput<List<Assignment>>, Finding> / {abort.raise} =
-  if left <= 0 { too_deep(parser) }
-  else if sql_at_punctuation(parser, "(") { unsupported(parser, "columns set together") } else {
+  if left <= 0 { too_deep(parser) } else if sql_at_punctuation(parser, "(") {
+    unsupported(
+      parser,
+      "assigning several columns at once with `set (a, b) = ...` is not supported",
+    )
+  } else {
     let column = parse_name(parser, left - 1)?;
     let eq = expect_punctuation(column.parser, "=")?;
     let value = parse_expression(eq, left - 1)?;
@@ -3316,8 +3276,8 @@ fn parse_assignments(
       value: value.value,
     };
     let comma = sql_eat_punctuation(value.parser, ",");
-    if comma.ate { parse_assignments(comma.parser, acc.push(one), left - 1) }
-    else { Ok(parse_output(value.parser, acc.push(one))) }
+    if comma.ate { parse_assignments(comma.parser, accumulator.push(one), left - 1) }
+    else { Ok(parse_output(value.parser, accumulator.push(one))) }
   }
 
 fn parse_delete(
@@ -3343,22 +3303,14 @@ fn parse_delete(
     )
   }
 
-// --- The statement, against the schema ------------------------------------------------------
-
-/// A table in scope, by the name the statement writes it under. `table` is `None` when the schema
-/// does not declare it, and the check then cannot know its columns.
 type TableBinding = { name: String, table: Option<Table>, optional: Bool }
 
 type ExpressionType = { ty: ValueType, nullable: Bool }
 
-/// A placeholder, the type of what it represents, and what that is.
 type PlaceholderType = { n: Int, at: Int, ty: ValueType, what: String }
 
-/// A column a statement returns.
 type ResultColumn = { name: String, ty: ValueType, nullable: Bool }
 
-/// What the check of a statement has found so far: what is wrong, and the types it has given
-/// placeholders.
 type CheckState = {
   findings: List<Finding>,
   placed: List<PlaceholderType>,
@@ -3395,8 +3347,6 @@ fn column_value_type(t: ColumnType) -> ValueType =
     TArray(inner) -> ArrayType(column_value_type(inner)),
   }
 
-/// A column of `t` as a statement reads it: nullable when the schema allows null and the column is
-/// not in the primary key, or when its table is joined optionally.
 fn column_type_in(t: Table, optional: Bool, name: String) -> Option<ExpressionType> =
   match t.columns.find(|c: Column| c.name == name) {
     None -> None,
@@ -3428,9 +3378,9 @@ fn bind_sources(
 ) -> { j: CheckState, level: List<TableBinding> } =
   sources.fold(
     { j: j, level: [] },
-    |acc: { j: CheckState, level: List<TableBinding> }, s: Source| {
-      let b = bind_source(acc.j, s);
-      { j: b.j, level: acc.level.push(b.bound) }
+    |accumulator: { j: CheckState, level: List<TableBinding> }, s: Source| {
+      let b = bind_source(accumulator.j, s);
+      { j: b.j, level: accumulator.level.push(b.bound) }
     },
   )
 
@@ -3465,15 +3415,13 @@ fn lookup_column(scope: List<List<TableBinding>>, r: ColumnReference) -> Lookup 
     }
   }
 
-/// A bare column, from the innermost scope out: one table that has it, two that are ambiguous, or
-/// none, which is `missing`.
 fn lookup_bare_column(scope: List<List<TableBinding>>, column: String, missing: String) -> Lookup =
   match scope {
     [] -> Missing(missing),
     [level, ..outer] -> {
-      let holding = level.filter(|b: TableBinding|
+      let matching_bindings = level.filter(|b: TableBinding|
         match b.table { Some(t) -> column_type_in(t, false, column) != None, None -> false });
-      match holding {
+      match matching_bindings {
         [first, second, ..] ->
           Missing(
             "names the column `" ++ column ++ "`, which `" ++ binding_table_name(first) ++ "` and `"
@@ -3512,7 +3460,6 @@ fn record_placeholder(j: CheckState, n: Int, at: Int, ty: ValueType, what: Strin
 fn is_placeholder(e: QueryExpression) -> Bool =
   match e { PlaceholderExpression(_) -> true, _ -> false }
 
-/// What a placeholder compared with `e` represents.
 fn operand_description(e: QueryExpression) -> String =
   match e {
     ColumnExpression(r) ->
@@ -3541,7 +3488,17 @@ fn check_expression(
       NullExpression -> type_result(j, NullType, true),
       CountStarExpression -> type_result(j, IntType, false),
       CallExpression(c) -> check_call(j, scope, c.name, c.args, want, left - 1),
-      BinaryExpression(o) -> check_operator(j, scope, o.op, o.lhs, o.rhs, want, what, left - 1),
+      BinaryExpression(o) ->
+        check_operator(
+          j,
+          scope,
+          o.operation,
+          o.left_operand,
+          o.right_operand,
+          want,
+          what,
+          left - 1,
+        ),
       NotExpression(x) -> {
         let inner = check_expression(j, scope, x, BoolType, "a condition", left - 1);
         type_result(inner.j, BoolType, inner.t.nullable)
@@ -3614,51 +3571,82 @@ fn check_expression(
     }
   }
 
-fn is_comparison(op: String) -> Bool = ["=", "<>", "<", "<=", ">", ">="].contains(op)
+fn is_comparison(operator: String) -> Bool = ["=", "<>", "<", "<=", ">", ">="].contains(operator)
 
 fn check_operator(
   j: CheckState,
   scope: List<List<TableBinding>>,
-  op: String,
-  lhs: QueryExpression,
-  rhs: QueryExpression,
+  operator: String,
+  left_operand: QueryExpression,
+  right_operand: QueryExpression,
   want: ValueType,
   what: String,
   left: Int,
 ) -> TypeResult / {abort.raise} =
-  if op == "and" || op == "or" {
-    let l = check_expression(j, scope, lhs, BoolType, "a condition", left - 1);
-    let r = check_expression(l.j, scope, rhs, BoolType, "a condition", left - 1);
+  if operator == "and" || operator == "or" {
+    let l = check_expression(j, scope, left_operand, BoolType, "a condition", left - 1);
+    let r = check_expression(l.j, scope, right_operand, BoolType, "a condition", left - 1);
     type_result(r.j, BoolType, l.t.nullable || r.t.nullable)
-  } else if op == "||" || op == "like" {
-    let l = check_expression(j, scope, lhs, TextType, operand_description(rhs), left - 1);
-    let r = check_expression(l.j, scope, rhs, TextType, operand_description(lhs), left - 1);
-    type_result(r.j, if op == "like" { BoolType } else { TextType }, l.t.nullable || r.t.nullable)
-  } else if is_comparison(op) {
-    let pair = check_operands(j, scope, lhs, rhs, UnknownType, "", left - 1);
+  } else if operator == "||" || operator == "like" {
+    let l = check_expression(
+      j,
+      scope,
+      left_operand,
+      TextType,
+      operand_description(right_operand),
+      left - 1,
+    );
+    let r = check_expression(
+      l.j,
+      scope,
+      right_operand,
+      TextType,
+      operand_description(left_operand),
+      left - 1,
+    );
+    type_result(
+      r.j,
+      if operator == "like" { BoolType } else { TextType },
+      l.t.nullable || r.t.nullable,
+    )
+  } else if is_comparison(operator) {
+    let pair = check_operands(j, scope, left_operand, right_operand, UnknownType, "", left - 1);
     type_result(pair.j, BoolType, pair.l.nullable || pair.r.nullable)
   } else {
-    let pair = check_operands(j, scope, lhs, rhs, want, what, left - 1);
+    let pair = check_operands(j, scope, left_operand, right_operand, want, what, left - 1);
     type_result(pair.j, arithmetic_type(pair.l.ty, pair.r.ty), pair.l.nullable || pair.r.nullable)
   }
 
-/// Two operands typed by each other: a placeholder takes the other side's type.
 fn check_operands(
   j: CheckState,
   scope: List<List<TableBinding>>,
-  lhs: QueryExpression,
-  rhs: QueryExpression,
+  left_operand: QueryExpression,
+  right_operand: QueryExpression,
   want: ValueType,
   what: String,
   left: Int,
 ) -> { j: CheckState, l: ExpressionType, r: ExpressionType } / {abort.raise} =
-  if is_placeholder(lhs) && !is_placeholder(rhs) {
-    let r = check_expression(j, scope, rhs, want, what, left);
-    let l = check_expression(r.j, scope, lhs, r.t.ty, operand_description(rhs), left);
+  if is_placeholder(left_operand) && !is_placeholder(right_operand) {
+    let r = check_expression(j, scope, right_operand, want, what, left);
+    let l = check_expression(
+      r.j,
+      scope,
+      left_operand,
+      r.t.ty,
+      operand_description(right_operand),
+      left,
+    );
     { j: l.j, l: l.t, r: r.t }
   } else {
-    let l = check_expression(j, scope, lhs, want, what, left);
-    let r = check_expression(l.j, scope, rhs, l.t.ty, operand_description(lhs), left);
+    let l = check_expression(j, scope, left_operand, want, what, left);
+    let r = check_expression(
+      l.j,
+      scope,
+      right_operand,
+      l.t.ty,
+      operand_description(left_operand),
+      left,
+    );
     { j: r.j, l: l.t, r: r.t }
   }
 
@@ -3692,13 +3680,11 @@ fn check_in_list(
     )
   } else {
     let v = check_expression(j, scope, value, UnknownType, "", left);
-    let listed = items.fold(v.j, |acc: CheckState, x: QueryExpression|
-      check_expression(acc, scope, x, v.t.ty, operand_description(value), left).j);
+    let listed = items.fold(v.j, |accumulator: CheckState, x: QueryExpression|
+      check_expression(accumulator, scope, x, v.t.ty, operand_description(value), left).j);
     type_result(listed, BoolType, true)
   }
 
-/// Arguments typed in order; when `follow`, each takes the type of the ones before it, as
-/// `coalesce`'s do.
 fn check_arguments(
   j: CheckState,
   scope: List<List<TableBinding>>,
@@ -3709,16 +3695,15 @@ fn check_arguments(
 ) -> { j: CheckState, types: List<ExpressionType> } / {abort.raise} =
   args.fold(
     { j: j, types: [] },
-    |acc: { j: CheckState, types: List<ExpressionType> }, x: QueryExpression| {
+    |accumulator: { j: CheckState, types: List<ExpressionType> }, x: QueryExpression| {
       let lead = if !follow { UnknownType }
       else if want != UnknownType { want }
-      else { first_known_type(acc.types) };
-      let t = check_expression(acc.j, scope, x, lead, "an argument", left);
-      { j: t.j, types: acc.types.push(t.t) }
+      else { first_known_type(accumulator.types) };
+      let t = check_expression(accumulator.j, scope, x, lead, "an argument", left);
+      { j: t.j, types: accumulator.types.push(t.t) }
     },
   )
 
-/// The first type among `types` the check can determine.
 fn first_known_type(types: List<ExpressionType>) -> ValueType =
   types.fold(UnknownType, |found: ValueType, t: ExpressionType|
     if found == UnknownType && t.ty != NullType { t.ty } else { found })
@@ -3841,11 +3826,11 @@ fn check_case(
   };
   let arms = whens.fold(
     { j: tested.j, types: [] },
-    |acc: { j: CheckState, types: List<ExpressionType> }, w: When| {
-      let tried = check_expression(acc.j, scope, w.cond, tested.ty, tested.what, left);
-      let lead = if want != UnknownType { want } else { first_known_type(acc.types) };
+    |accumulator: { j: CheckState, types: List<ExpressionType> }, w: When| {
+      let tried = check_expression(accumulator.j, scope, w.cond, tested.ty, tested.what, left);
+      let lead = if want != UnknownType { want } else { first_known_type(accumulator.types) };
       let value = check_expression(tried.j, scope, w.value, lead, what, left);
-      { j: value.j, types: acc.types.push(value.t) }
+      { j: value.j, types: accumulator.types.push(value.t) }
     },
   );
   match otherwise {
@@ -3875,8 +3860,8 @@ fn check_conditions(
   conditions: List<QueryExpression>,
   left: Int,
 ) -> CheckState / {abort.raise} =
-  conditions.fold(j, |acc: CheckState, c: QueryExpression|
-    check_expression(acc, scope, c, BoolType, "a condition", left).j)
+  conditions.fold(j, |accumulator: CheckState, c: QueryExpression|
+    check_expression(accumulator, scope, c, BoolType, "a condition", left).j)
 
 fn option_to_list(e: Option<QueryExpression>) -> List<QueryExpression> =
   match e { Some(x) -> [x], None -> [] }
@@ -3896,20 +3881,20 @@ fn check_select(
       q.conditions.concat(option_to_list(q.filter)),
       left - 1,
     );
-    let grouped = q.group.fold(conditioned, |acc: CheckState, g: QueryExpression|
-      check_expression(acc, scope, g, UnknownType, "", left - 1).j);
+    let grouped = q.group.fold(conditioned, |accumulator: CheckState, g: QueryExpression|
+      check_expression(accumulator, scope, g, UnknownType, "", left - 1).j);
     let had = check_conditions(grouped, scope, option_to_list(q.having), left - 1);
     let items = check_result_columns(had, scope, bound.level, q.items, left - 1);
     let names = items.returned.map(|a: ResultColumn| a.name);
-    let ordered = q.order.fold(items.j, |acc: CheckState, o: QueryExpression|
+    let ordered = q.order.fold(items.j, |accumulator: CheckState, o: QueryExpression|
       match o {
-        ColumnExpression(r) -> if r.table == "" && names.contains(r.column) { acc }
-        else { check_expression(acc, scope, o, UnknownType, "", left - 1).j },
-        LiteralExpression(_) -> acc,
-        _ -> check_expression(acc, scope, o, UnknownType, "", left - 1).j,
+        ColumnExpression(r) -> if r.table == "" && names.contains(r.column) { accumulator }
+        else { check_expression(accumulator, scope, o, UnknownType, "", left - 1).j },
+        LiteralExpression(_) -> accumulator,
+        _ -> check_expression(accumulator, scope, o, UnknownType, "", left - 1).j,
       });
-    let bounded = q.bounds.fold(ordered, |acc: CheckState, b: QueryExpression|
-      check_expression(acc, scope, b, IntType, "a `limit` or an `offset`", left - 1).j);
+    let bounded = q.bounds.fold(ordered, |accumulator: CheckState, b: QueryExpression|
+      check_expression(accumulator, scope, b, IntType, "a `limit` or an `offset`", left - 1).j);
     { j: bounded, returned: items.returned }
   }
 
@@ -3920,25 +3905,32 @@ fn check_result_columns(
   items: List<SelectItem>,
   left: Int,
 ) -> ResultColumns / {abort.raise} =
-  items.fold({ j: j, returned: [] }, |acc: ResultColumns, item: SelectItem|
+  items.fold({ j: j, returned: [] }, |accumulator: ResultColumns, item: SelectItem|
     match item {
       Wildcard(a) ->
         {
           j: add_finding(
-            acc.j,
+            accumulator.j,
             SelectStar,
             a.at,
             "`*` returns whatever columns "
               ++ (if a.table == "" { "the tables have" } else { "`" ++ a.table ++ "` has" })
               ++ " when the statement runs, so a column added to the schema changes every row it returns: name the columns",
           ),
-          returned: acc.returned.concat(every_column(level, a.table)),
+          returned: accumulator.returned.concat(every_column(level, a.table)),
         },
       ExpressionItem(o) -> {
-        let t = check_expression(acc.j, scope, o.value, UnknownType, "a returned expression", left);
+        let t = check_expression(
+          accumulator.j,
+          scope,
+          o.value,
+          UnknownType,
+          "a returned expression",
+          left,
+        );
         {
           j: t.j,
-          returned: acc.returned.push({
+          returned: accumulator.returned.push({
             name: result_column_name(j.dialect, j.sql, o.value, o.name, o.from, o.to),
             ty: t.t.ty,
             nullable: t.t.nullable,
@@ -3948,12 +3940,12 @@ fn check_result_columns(
     })
 
 fn every_column(level: List<TableBinding>, table: String) -> List<ResultColumn> =
-  level.fold([], |acc: List<ResultColumn>, b: TableBinding|
-    if table != "" && b.name != table { acc } else {
+  level.fold([], |accumulator: List<ResultColumn>, b: TableBinding|
+    if table != "" && b.name != table { accumulator } else {
       match b.table {
-        None -> acc,
+        None -> accumulator,
         Some(t) ->
-          acc.concat(
+          accumulator.concat(
             t.columns.map(|c: Column| {
               let typed = column_type_in(t, b.optional, c.name).unwrap_or({
                 ty: UnknownType,
@@ -3965,8 +3957,6 @@ fn every_column(level: List<TableBinding>, table: String) -> List<ResultColumn> 
       }
     })
 
-/// The name a column is returned under: its alias; otherwise, in postgres, the column, the function
-/// or the type it is cast to, and in SQLite the column or the expression's own text.
 fn result_column_name(
   dialect: Dialect,
   sql: Bytes,
@@ -4032,8 +4022,8 @@ fn type_check_statement(
       let columns = insert_targets(target.j, target.bound, i.columns);
       let filled = match i.rows {
         ByValues(tuples) ->
-          tuples.fold(columns.j, |acc: CheckState, tuple: List<QueryExpression>|
-            check_value_row(acc, columns.targets, tuple, i.target.at, left - 1)),
+          tuples.fold(columns.j, |accumulator: CheckState, tuple: List<QueryExpression>|
+            check_value_row(accumulator, columns.targets, tuple, i.target.at, left - 1)),
         BySelect(q) -> {
           let a = check_select(columns.j, [], q, left - 1);
           if columns.targets.len() == 0 || a.returned.len() == columns.targets.len() { a.j } else {
@@ -4054,8 +4044,8 @@ fn type_check_statement(
       let target = bind_source(j, u.target);
       let others = bind_sources(target.j, u.sources);
       let level = [target.bound].concat(others.level);
-      let set = u.sets.fold(others.j, |acc: CheckState, a: Assignment|
-        check_assignment(acc, [level], target.bound, a, left - 1));
+      let set = u.sets.fold(others.j, |accumulator: CheckState, a: Assignment|
+        check_assignment(accumulator, [level], target.bound, a, left - 1));
       let filtered = check_conditions(
         set,
         [level],
@@ -4078,7 +4068,6 @@ fn type_check_statement(
     },
   }
 
-/// The columns an insert fills, in order: those it names, or every column of its table.
 fn insert_targets(j: CheckState, bound: TableBinding, columns: List<ColumnReference>) -> Targets =
   match bound.table {
     None ->
@@ -4094,12 +4083,12 @@ fn insert_targets(j: CheckState, bound: TableBinding, columns: List<ColumnRefere
           { description: "`" ++ t.name ++ "." ++ c.name ++ "`", ty: column_value_type(c.ty) }),
       }
     } else {
-      columns.fold({ j: j, targets: [] }, |acc: Targets, r: ColumnReference|
+      columns.fold({ j: j, targets: [] }, |accumulator: Targets, r: ColumnReference|
         match t.columns.find(|c: Column| c.name == r.column) {
           Some(c) ->
             {
-              j: acc.j,
-              targets: acc.targets.push({
+              j: accumulator.j,
+              targets: accumulator.targets.push({
                 description: "`" ++ t.name ++ "." ++ c.name ++ "`",
                 ty: column_value_type(c.ty),
               }),
@@ -4107,12 +4096,15 @@ fn insert_targets(j: CheckState, bound: TableBinding, columns: List<ColumnRefere
           None ->
             {
               j: add_finding(
-                acc.j,
+                accumulator.j,
                 Undeclared,
                 r.at,
                 "names the column `" ++ r.column ++ "`, which `" ++ t.name ++ "` does not have",
               ),
-              targets: acc.targets.push({ description: "`" ++ r.column ++ "`", ty: UnknownType }),
+              targets: accumulator.targets.push({
+                description: "`" ++ r.column ++ "`",
+                ty: UnknownType,
+              }),
             },
         })
     },
@@ -4134,12 +4126,12 @@ fn check_value_row(
         ++ count_text(targets.len(), "column"),
     )
   };
-  range(0, tuple.len()).fold(counted, |acc: CheckState, i: Int|
+  range(0, tuple.len()).fold(counted, |accumulator: CheckState, i: Int|
     match tuple.at(i) {
-      None -> acc,
+      None -> accumulator,
       Some(x) -> match targets.at(i) {
-        Some(target) -> check_expression(acc, [], x, target.ty, target.description, left).j,
-        None -> check_expression(acc, [], x, UnknownType, "", left).j,
+        Some(target) -> check_expression(accumulator, [], x, target.ty, target.description, left).j,
+        None -> check_expression(accumulator, [], x, UnknownType, "", left).j,
       },
     })
 }
@@ -4180,47 +4172,44 @@ fn check_assignment(
     },
   }
 
-// --- The statement against its call -------------------------------------------------------
-
 fn row_mismatch(reason: String) -> Finding = { kind: RowMismatch, at: 0, message: reason }
 
-/// Checks the row type's fields against the columns the statement returns, by name.
 fn check_row_fields(fields: List<Field>, returned: List<ResultColumn>) -> List<Finding> = {
   let named = returned.fold(
     { seen: [], found: [] },
-    |acc: { seen: List<String>, found: List<Finding> }, a: ResultColumn|
-      if acc.seen.contains(a.name) {
+    |accumulator: { seen: List<String>, found: List<Finding> }, a: ResultColumn|
+      if accumulator.seen.contains(a.name) {
         {
-          seen: acc.seen,
-          found: acc.found.push(
+          seen: accumulator.seen,
+          found: accumulator.found.push(
             row_mismatch(
               "the statement returns two columns named `" ++ a.name ++ "`: name one with `as`",
             ),
           ),
         }
-      } else { { seen: acc.seen.push(a.name), found: acc.found } },
+      } else { { seen: accumulator.seen.push(a.name), found: accumulator.found } },
   );
-  let fielded = fields.fold(named.found, |acc: List<Finding>, f: Field|
+  let fielded = fields.fold(named.found, |accumulator: List<Finding>, f: Field|
     match returned.find(|a: ResultColumn| a.name == f.name) {
       None ->
-        acc.push(
+        accumulator.push(
           row_mismatch(
             "the row type's field `" ++ f.name ++ "` is no column the statement returns",
           ),
         ),
       Some(a) -> match field_mismatch(f.kind, a) {
-        None -> acc,
-        Some(reason) -> acc.push(row_mismatch(reason)),
+        None -> accumulator,
+        Some(reason) -> accumulator.push(row_mismatch(reason)),
       },
     });
-  returned.fold(fielded, |acc: List<Finding>, a: ResultColumn|
+  returned.fold(fielded, |accumulator: List<Finding>, a: ResultColumn|
     if fields.find(|f: Field| f.name == a.name) == None {
-      acc.push(
+      accumulator.push(
         row_mismatch(
           "the statement returns `" ++ a.name ++ "`, and the row type has no field for it",
         ),
       )
-    } else { acc })
+    } else { accumulator })
 }
 
 fn field_mismatch(kind: FieldKind, a: ResultColumn) -> Option<String> =
@@ -4285,61 +4274,61 @@ pub fn field_text(kind: FieldKind) -> String =
     OptionalField(inner) -> "an `Option` of " ++ field_text(inner),
   }
 
-/// Checks the parameters a call writes as constructors against what each placeholder represents.
 fn check_parameter_types(
   dialect: Dialect,
   given: List<Option<String>>,
   placed: List<PlaceholderType>,
 ) -> List<Finding> =
-  placed.fold([], |acc: List<Finding>, p: PlaceholderType|
+  placed.fold([], |accumulator: List<Finding>, p: PlaceholderType|
     match given.at(p.n - 1) {
-      Some(Some(ctor)) -> if parameter_fits(ctor, p.ty) { acc } else {
-        acc.push({
+      Some(Some(constructor)) -> if parameter_fits(constructor, p.ty) { accumulator } else {
+        accumulator.push({
           kind: ValueMismatch,
           at: p.at,
           message: "`" ++ placeholder_mark(dialect) ++ p.n.to_string() ++ "` stands for " ++ p.what
             ++ ", which is "
             ++ value_type_text(p.ty)
             ++ ", and the call passes a `"
-            ++ ctor
+            ++ constructor
             ++ "`",
         })
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
-fn parameter_fits(ctor: String, ty: ValueType) -> Bool =
-  ctor == "PNull"
+fn parameter_fits(constructor: String, ty: ValueType) -> Bool =
+  constructor == "PNull"
     || (match ty {
       UnknownType -> true,
       NullType -> true,
-      TextType -> ctor == "PText",
-      IntType -> ctor == "PInt",
-      BoolType -> ctor == "PBool",
-      BytesType -> ctor == "PBytes",
-      FloatType -> ctor == "PFloat" || ctor == "PInt" || ctor == "PNumeric",
-      NumericType -> ctor == "PNumeric" || ctor == "PInt" || ctor == "PFloat",
-      JsonType -> ctor == "PJson",
-      ArrayType(_) -> ctor == "PArray",
+      TextType -> constructor == "PText",
+      IntType -> constructor == "PInt",
+      BoolType -> constructor == "PBool",
+      BytesType -> constructor == "PBytes",
+      FloatType -> constructor == "PFloat" || constructor == "PInt" || constructor == "PNumeric",
+      NumericType -> constructor == "PNumeric" || constructor == "PInt" || constructor == "PFloat",
+      JsonType -> constructor == "PJson",
+      ArrayType(_) -> constructor == "PArray",
     })
-
-// --- A row as a value of a record type ------------------------------------------------------
 
 /// Why a row could not be read as a value: the column, what the field expected, and what the row
 /// contained.
 pub type RowError = { column: String, expected: String, found: String }
 
-/// How one field is read from its column and written as a parameter, and what it contains.
+/// Describes how one record field maps to a database column: `read` converts a column value to the
+/// field's value, `write` converts the field's value to a statement parameter, and `kind` is the
+/// field's column type.
 pub type FieldCodec<a> = {
   kind: FieldKind,
   read: (Datum) -> Option<a> / {abort.raise},
   write: (a) -> Param / {abort.raise},
 }
 
-/// How a record type maps to rows: its fields, by column, how a row is read as a record, and the
-/// parameters a record is written as, in field order. `derive sql for T` writes `t_row()`. The
-/// check reads its fields from `T` itself, and checks the columns of each statement that
-/// `std.db`'s `fetch` reads with it against them.
+/// Describes how a record type `a` maps to database rows: its columns, how to decode a row into a
+/// record, and how to turn a record into statement parameters in column order. `derive sql for T`
+/// generates a function `t_row()` that returns this value. The statement checker takes the columns
+/// from `T`'s definition, and compares them with the columns of each statement that `std.db`'s
+/// `fetch` decodes with this codec.
 pub type RowCodec<a> = {
   fields: List<Field>,
   decode: (Row) -> Result<a, RowError> / {abort.raise},
@@ -4359,9 +4348,9 @@ pub fn decode_rows<a>(
     Failed(e) -> Err(Rejected(e)),
     Count(n) -> Err(UnexpectedCount(n)),
     Rows(rows) ->
-      rows.fold(Ok([]), |acc: Result<List<a>, FetchError>, r: Row|
-        match acc {
-          Err(_) -> acc,
+      rows.fold(Ok([]), |accumulator: Result<List<a>, FetchError>, r: Row|
+        match accumulator {
+          Err(_) -> accumulator,
           Ok(xs) -> match (codec.decode)(r) {
             Ok(x) -> Ok(xs.push(x)),
             Err(e) -> Err(InvalidRow(e)),
@@ -4473,8 +4462,8 @@ pub fn array_field<a>(r: FieldCodec<a>) -> FieldCodec<List<a>> =
     read: |d: Datum|
       match d {
         ArrayDatum(items) ->
-          items.fold(Some([]), |acc: Option<List<a>>, item: Datum|
-            match acc {
+          items.fold(Some([]), |accumulator: Option<List<a>>, item: Datum|
+            match accumulator {
               None -> None,
               Some(xs) -> match (r.read)(item) { Some(x) -> Some(xs.push(x)), None -> None },
             }),
@@ -4483,7 +4472,7 @@ pub fn array_field<a>(r: FieldCodec<a>) -> FieldCodec<List<a>> =
     write: |xs: List<a>| ArrayParameter(xs.map(r.write)),
   }
 
-test "a statement's words fold and a quoted identifier keeps its case" {
+test "the tokenizer lowercases keywords and unquoted names, and a quoted identifier keeps its original case" {
   assert_eq(
     sql_tokenize_summary(Postgres, "SELECT t.Sku FROM parts AS t"),
     Ok([
@@ -4527,7 +4516,7 @@ test "a semicolon is its own token, and one inside a literal is text" {
   assert_eq(sql_tokenize_summary(Postgres, "select 'it''s'"), Ok(["word:select", "text:'it''s'"]))
 }
 
-test "a placeholder is not a dollar quote, and a string may be escaped" {
+test "`$1` is a placeholder token, not the start of a `$tag$` quoted string, and `e'..'`, `b'..'` and `x'..'` literals are text tokens" {
   assert_eq(
     sql_tokenize_summary(Postgres, "select $1, $23"),
     Ok(["word:select", "placeholder:$1", "punct:,", "placeholder:$23"]),
@@ -4592,7 +4581,7 @@ test "a quote that is never closed is rejected, not guessed at" {
 
 fn is_error<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, Ok(_) -> false }
 
-test "SQLite's lexer is its own: no nested comment, no dollar quote, three quotes for a name" {
+test "SQLite tokenizing differs from Postgres: block comments do not nest, `$tag$` strings are not recognized, and backticks, brackets and double quotes quote names" {
   assert_eq(
     sql_tokenize_summary(Sqlite, "select /* a /* b */ random() -- c\n"),
     Ok(["word:select", "word:random", "punct:(", "punct:)"]),
@@ -4657,9 +4646,8 @@ fn sqlite_kind_cases() -> List<KindCase> =
     { sql: "insert into time (at) values (?1)", kind: Insert },
   ]
 
-test "the parser reports what {c.sql} does" for c: KindCase in sqlite_kind_cases() {
-  assert_eq(scan_statement(Sqlite, c.sql).map(|s: SqlScan| s.kind), Ok(c.kind))
-}
+test "`scan_statement` returns the expected statement kind for the SQLite statement {c.sql}" for c: KindCase in sqlite_kind_cases(
+  ) { assert_eq(scan_statement(Sqlite, c.sql).map(|s: SqlScan| s.kind), Ok(c.kind)) }
 
 type ErrorCase = { sql: String, at: Int }
 
@@ -4688,22 +4676,18 @@ fn sqlite_rejection_cases() -> List<ErrorCase> =
     { sql: "select 1 where a = $1", at: 19 },
   ]
 
-test "the parser rejects {c.sql} at the right byte" for c: ErrorCase in sqlite_rejection_cases() {
+test "`scan_statement` rejects the SQLite statement {c.sql} and reports the byte offset where it fails" for c: ErrorCase in sqlite_rejection_cases(
+  ) {
   assert_eq(scan_statement(Sqlite, c.sql).map_err(|e: DbError| rejection_byte(e)), Err(Some(c.at)))
 }
 
-test "an error's byte is the one after its last marker, whatever the statement quotes" {
+test "`rejection_byte` returns the number after the last `at byte` in an error message, even when the quoted statement also contains `at byte`, and returns `None` when the message has none" {
   assert_eq(
     rejection_byte(db_error("0A000", "", "`' at byte 9'` at byte 31. the statement ends here")),
     Some(31),
   );
   assert_eq(rejection_byte(db_error("23505", "items_pkey", "a duplicate key")), None)
 }
-
-// --- What the parser accepts and what it rejects ---------------------------------------
-//
-// A parser that accepts one of these under-reports effects, the one failure that silently
-// corrupts scheduling.
 
 fn scan_ok(sql: String) -> SqlScan / {abort.raise} =
   match scan_statement(Postgres, sql) { Err(e) -> panic(e.detail), Ok(s) -> s }
@@ -4742,7 +4726,7 @@ test "a join names both tables" {
   assert_eq(scan_names("select * from a join b using (x)"), ["a", "b"])
 }
 
-test "a set operation names every arm" {
+test "a set operation (`union`, `intersect`, `except`) reports the tables of every select in it" {
   assert_eq(scan_names("select sku from items union all select sku from orders"), [
     "items",
     "orders",
@@ -4755,7 +4739,7 @@ test "a set operation names every arm" {
   assert_eq(scan_names("(select a from x) union (select a from y)"), ["x", "y"])
 }
 
-test "a subquery is followed rather than ignored" {
+test "the tables used inside subqueries are included in the tables a statement reads" {
   assert_eq(scan_names("select sku from items where sku in (select sku from orders)"), [
     "items",
     "orders",
@@ -4832,18 +4816,18 @@ test "a schema-qualified name is its last segment" {
   assert_eq(scan_names("insert into public.items values ($1)"), ["items"])
 }
 
-test "case folding follows postgres rather than the parser" {
+test "unquoted table names are lowercased as Postgres does, and quoted names keep their case" {
   assert_eq(scan_names("SELECT * FROM Items"), ["items"]);
   assert_eq(scan_names("select * from \"Items\""), ["Items"]);
   assert_eq(scan_names("select * from \"has space\""), ["has space"])
 }
 
-test "a second statement is rejected and named" {
+test "a second statement after a semicolon is rejected, and the error gives its position" {
   assert(scan_rejects_at("select 1 from items; drop table items", 19));
   assert(scan_rejects("insert into items values (1); delete from items"))
 }
 
-test "a semicolon inside a literal is text" {
+test "a semicolon inside a string literal or quoted name does not end the statement" {
   assert_eq(scan_names("select * from items where sku = '; drop table items; --'"), ["items"]);
   assert_eq(scan_names("select * from items where sku = $tag$; drop table items$tag$"), ["items"]);
   assert_eq(scan_names("select * from items where sku = $$;$$"), ["items"]);
@@ -4852,7 +4836,7 @@ test "a semicolon inside a literal is text" {
   assert_eq(scan_names("select * from \"weird;name\""), ["weird;name"])
 }
 
-test "a comment is not statement text" {
+test "comments are ignored when scanning a statement, and an unclosed comment is rejected" {
   assert_eq(scan_names("select 1 from items -- ; drop table items"), ["items"]);
   assert_eq(scan_names("select 1 /* ; drop table items */ from items"), ["items"]);
   assert_eq(scan_names("select 1 /* outer /* inner ; */ still comment */ from items"), ["items"]);
@@ -4865,7 +4849,7 @@ test "an unterminated literal is rejected rather than guessed at" {
   assert(scan_rejects_at("select * from items where sku = $tag$open", 32))
 }
 
-test "every statement shape outside the allowed set is rejected" {
+test "statements other than select, insert, update, delete, values and with are rejected, as is empty text" {
   assert(scan_rejects("create table t (a int)"));
   assert(scan_rejects("alter table t add column b int"));
   assert(scan_rejects("drop table t"));
@@ -4888,19 +4872,16 @@ test "every statement shape outside the allowed set is rejected" {
   assert(scan_rejects("   "))
 }
 
-test "a construct the parser cannot account for is rejected by name" {
-  // A set-returning function's relations live in a function body.
+test "constructs whose table reads or writes the scanner cannot report, such as row locks and upserts, are rejected" {
   assert(scan_rejects("select * from generate_series(1, 10)"));
-  // A row lock is a write the parser has no way to report through a read.
   assert(scan_rejects("select * from items for update"));
   assert(scan_rejects("select * from items limit 1 for share"));
-  // An upsert's outcome is not reproducible by the engine.
   assert(scan_rejects("insert into items values ($1) on conflict do nothing"));
   assert(scan_rejects("select rank() over w from items window w as (order by sku)"));
   assert(scan_rejects("select * from (items join orders on true)"))
 }
 
-test "an alias in the select list is a name and not a clause" {
+test "a column alias in the select list is not read as a table name" {
   assert_eq(scan_names("select id as ident from items"), ["items"]);
   assert_eq(scan_names("select count(*) as n from items"), ["items"]);
   assert_eq(scan_names("select id ident from items"), ["items"]);
@@ -4938,7 +4919,6 @@ test "a function the parser does not allow is rejected" {
   assert_eq(scan_names("select case when n > $1 then upper(sku) else sku end from items"), [
     "items",
   ]);
-  // Quoted, it is a name and not a call.
   assert_eq(scan_names("select \"pg_sleep\" from items"), ["items"])
 }
 
@@ -4948,7 +4928,6 @@ test "a nondeterministic function in statement text is rejected" {
   assert(scan_rejects("select random() from items"));
   assert(scan_rejects("update items set at = clock_timestamp()"));
   assert(scan_rejects("select * from items where d = current_date"));
-  // Quoted, it is a column name and not a call.
   assert_eq(scan_names("select \"now\" from items"), ["items"])
 }
 
@@ -4959,9 +4938,7 @@ fn nested_selects(n: Int) -> String = nested_from("select * from items", n)
 fn nested_from(sql: String, n: Int) -> String =
   if n <= 0 { sql } else { nested_from("select * from (" ++ sql ++ ") t", n - 1) }
 
-test "malformed input gets a result and never a panic" {
-  // A panic would fail this test, so calling the parser is the assertion: whatever it returns is
-  // fine, as long as a program that built the text is not killed by the driver's own check.
+test "malformed SQL makes `scan_statement` return normally and never panic" {
   let _ = scan_statement(Postgres, "select");
   let _ = scan_statement(Postgres, "select * from");
   let _ = scan_statement(Postgres, "select * from (");
@@ -4989,27 +4966,24 @@ test "malformed input gets a result and never a panic" {
   let _ = scan_statement(Postgres, "select * from items where (");
   let _ = scan_statement(Postgres, "натурально");
   let _ = scan_statement(Postgres, "select * from ünïcode");
-  // A statement cut short may be parsed as far as it goes; what must not happen is a panic.
   assert(scan_rejects("with a as ("))
 }
 
-test "the payloads that change a statement's shape are rejected" {
+test "a statement with an injected second statement is rejected, and an injected `union select` lists its second table" {
   assert(scan_rejects("select * from items where sku = '' ; drop table items --'"));
-  // Accepted here: the injected table is in the scan, so the effects check rejects it.
   assert_eq(scan_names("select * from items where sku = '' union select * from pg_shadow --'"), [
     "items",
     "pg_shadow",
   ]);
-  // A legal `or` reads no new table; the defense is that parameters never become syntax.
   assert_eq(scan_names("select * from items where sku = '' or 1=1"), ["items"])
 }
 
-test "a placeholder is a token and never a value" {
+test "a `$1` placeholder is scanned as a parameter and is never replaced by text" {
   assert_eq(scan_names("select * from items where sku = $1 and n > $22"), ["items"]);
   assert_eq(scan_names("insert into items values ($1, $2, $3) returning sku"), ["items"])
 }
 
-test "the statement kind is reported so a read label over a write can be rejected" {
+test "the scan reports whether a statement writes, so a read-only call that runs a write statement can be rejected" {
   assert(!kind_writes(scan_ok("select * from items").kind));
   assert(!kind_writes(scan_ok("values (1), (2)").kind));
   assert(kind_writes(scan_ok("insert into items values ($1)").kind));
@@ -5017,8 +4991,6 @@ test "the statement kind is reported so a read label over a write can be rejecte
   assert(kind_writes(scan_ok("delete from items").kind));
   assert(scan_writes(scan_ok("with gone as (delete from items returning id) select * from gone")))
 }
-
-// --- What the check finds -------------------------------------------------------------------
 
 fn test_schema() -> Schema =
   {
@@ -5079,7 +5051,7 @@ fn test_row_findings(row: List<Field>, sql: String) -> List<FindingKind> / {abor
     |f: Finding| f.kind,
   )
 
-test "a table or a column the schema does not declare is found where the statement names it" {
+test "the check reports an error at the position of a table or column the schema does not declare" {
   let reads = test_site(Reads, "items");
   assert_eq(
     test_findings(reads, "select sku, name, price from items where on_hand > $1 order by sku"),
@@ -5091,7 +5063,6 @@ test "a table or a column the schema does not declare is found where the stateme
       f.message),
     ["names the column `nmae`, which `items` does not have"],
   );
-  // Of a table it cannot find, the check guesses no column.
   assert_eq(test_findings(test_site(Reads, "itemz"), "select sku from itemz"), [
     { kind: Undeclared, at: 16 },
   ]);
@@ -5108,7 +5079,7 @@ test "a table or a column the schema does not declare is found where the stateme
   )
 }
 
-test "a column in two tables is named with its table, and a left join's columns may be null" {
+test "a column in two tables must be qualified with its table name, and left-joined columns must be optional" {
   assert_eq(
     check_statement(
       Some(test_schema()),
@@ -5130,7 +5101,7 @@ test "a column in two tables is named with its table, and a left join's columns 
   )
 }
 
-test "the label is one of the statement's tables, and the call performs what the statement does" {
+test "the check fails when the call's table is not in the statement or its operation differs from the statement's" {
   assert_eq(test_findings(test_site(Reads, "orders"), "select sku from items"), [
     { kind: LabelMismatch, at: 0 },
   ]);
@@ -5153,7 +5124,7 @@ test "the label is one of the statement's tables, and the call performs what the
   )
 }
 
-test "a `*` is found, and what the check does not follow is named where it stops" {
+test "the check reports `*` selections and unsupported constructs at their position in the statement" {
   let reads = test_site(Reads, "items");
   assert_eq(test_findings(reads, "select * from items"), [{ kind: SelectStar, at: 7 }]);
   assert_eq(test_findings(reads, "select i.* from items i"), [{ kind: SelectStar, at: 7 }]);
@@ -5219,7 +5190,7 @@ test "a call passes as many parameters as the statement has placeholders" {
   )
 }
 
-test "a row type's fields are checked against a statement's columns, by name, type and null" {
+test "the check fails when a row type's fields differ from the statement's columns in name, type or nullability" {
   let priced = "select sku, price from items";
   assert_eq(
     test_row_findings([field("sku", text_field()), field("price", numeric_field())], priced),
@@ -5254,7 +5225,7 @@ test "a row type's fields are checked against a statement's columns, by name, ty
   )
 }
 
-test "without a schema, the check compares a statement with its call alone" {
+test "without a schema, the check compares a statement only with the call's table and operation" {
   assert_eq(check_statement(None, test_site(Reads, "items"), "select nmae from items"), []);
   assert_eq(
     check_statement(None, test_site(Reads, "items"), "delete from items").map(|f: Finding| f.kind),
@@ -5262,7 +5233,7 @@ test "without a schema, the check compares a statement with its call alone" {
   )
 }
 
-test "for text the parser rejects, the check reports only that" {
+test "for SQL the parser rejects, the check reports a single unreadable-statement error" {
   assert_eq(test_findings(test_site(Reads, "items"), "select sku from items; drop table items"), [
     { kind: Unreadable, at: 21 },
   ])
@@ -5288,7 +5259,7 @@ test "a SQLite statement is checked in its own dialect, its columns named as SQL
   )
 }
 
-test "a statement the check cannot follow gets a result and never a panic" {
+test "the check returns findings and never panics on unsupported or malformed statements" {
   let reads = test_site(Reads, "items");
   let _ = check_statement(Some(test_schema()), reads, "select sku from items where (");
   let _ = check_statement(
@@ -5338,7 +5309,7 @@ fn test_part_row() -> RowCodec<TestPart> =
       [to_parameter(text_field(), p.sku), to_parameter(optional_field(text_field()), p.note)],
   }
 
-test "a row reads into its fields, and a column of another type reports which" {
+test "a row decodes into its fields, and a column of the wrong type returns an error naming the column" {
   let row = Map::new().insert("sku", TextDatum("a")).insert("note", NullDatum);
   assert_eq(decode_rows(Rows([row]), test_part_row()), Ok([{ sku: "a", note: None }]));
   assert_eq(

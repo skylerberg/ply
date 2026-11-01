@@ -1,16 +1,9 @@
-//! The runtime's evidence objects, raises left pending, detached bodies' entries and `parallel`.
-
 use super::*;
 
-/// The label a clause written `[*t]` reads, lifted through the `String` type its `handle` site
-/// handed; 0 with the context failed where it does not lift.
 pub(crate) fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
-    string_lifted(ctx, label.as_str(), string).map_or(0, Handed::word)
+    decode_string(ctx, label.as_str(), string).map_or(0, Handed::word)
 }
 
-/// The label the field-table entry `resource` names, lifted through `string`, the type of `String`:
-/// what a clause written `[*t]` is handed beside its arguments. 0 with the context failed where it
-/// names no label or does not lift.
 pub unsafe extern "C" fn rt_label_string(
     ctx: *mut Ctx,
     resource: I64,
@@ -27,10 +20,6 @@ pub unsafe extern "C" fn rt_label_string(
     Handed::of(label_word(ctx, unsafe { &*string }, &label))
 }
 
-/// The body of a `handle` whose objects enter its clauses, `body` a nullary closure, run on a stack
-/// of its own until it stops or ends, its landing its own; returns the `handle`'s value. Takes the
-/// body and `forwards`, the block forwarding what is around the `handle`, and holds `instance`, the
-/// instance's counted block, once more.
 pub unsafe extern "C" fn rt_detached_open(
     ctx: *mut Ctx,
     body: Block,
@@ -41,13 +30,9 @@ pub unsafe extern "C" fn rt_detached_open(
     let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
     let instance = unsafe { std::mem::transmute::<Block, Word>(instance) };
     let forwards = (forwards != 0).then_some(forwards);
-    Handed::of(unsafe { crate::detached::open_over(ctx, body, forwards, instance) })
+    Handed::of(unsafe { crate::detached::open_detached(ctx, body, forwards, instance) })
 }
 
-/// The perform of the operation `op` describes, on the field-table entry `resource` and with the
-/// words at `args`, which this takes, handled off its tail by the clause whose record is at
-/// `record`: the `handle`'s body stops there, and the clause runs where it was entered or resumed
-/// from. Returns what the body is resumed with.
 pub unsafe extern "C" fn rt_detached_perform(
     ctx: *mut Ctx,
     record: *const Word,
@@ -57,11 +42,9 @@ pub unsafe extern "C" fn rt_detached_perform(
 ) -> Handed {
     let described = unsafe { &*op };
     let args = args_of(args.cast(), described.params_len).to_vec();
-    Handed::of(unsafe { crate::detached::stop_over(ctx, record, args, resource.0) })
+    Handed::of(unsafe { crate::detached::stop_detached(ctx, record, args, resource.0) })
 }
 
-/// [`rt_detached_perform`] under the name and signature the released compiler's emitted code binds,
-/// which hands one word more; nothing reads it.
 pub unsafe extern "C" fn rt_detached_stop(
     ctx: *mut Ctx,
     record: *const Word,
@@ -73,28 +56,19 @@ pub unsafe extern "C" fn rt_detached_stop(
     unsafe { rt_detached_perform(ctx, record, op, resource, args) }
 }
 
-/// An operation's entry in an evidence object, as compiled code calls it: the slot's environment,
-/// the operation's descriptor, its mode, the resource (negative for none) and its arguments' words.
 pub type OpEntry =
     unsafe extern "C" fn(*mut Ctx, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
 
-/// The flag of an evidence object with one slot, which handles every operation and reads the
-/// operation from its descriptor.
 pub const EVIDENCE_ONE_SLOT: i64 = 1;
 
-/// The flag of an evidence object that any thread may call while the thread that created it waits.
-/// Its clauses write no shared state and do not unwind that thread's stack.
 pub const EVIDENCE_SHARED: i64 = 2;
 
-/// An evidence object of the runtime's own, laid out as an evidence object is: its flags, then an
-/// entry and its environment per operation, or the one slot [`EVIDENCE_ONE_SLOT`] says.
 #[repr(C)]
 pub struct RuntimeObject {
     pub flags: i64,
     pub slot: Slot,
 }
 
-/// An operation's slot in an evidence object.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Slot {
@@ -102,9 +76,7 @@ pub struct Slot {
     pub env: Word,
 }
 
-/// The bridge: what code that holds no word for an effect performs it through: an operation is
-/// unhandled, and a raise is left pending.
-pub static BRIDGE: RuntimeObject = RuntimeObject {
+pub static NO_HANDLER_OBJECT: RuntimeObject = RuntimeObject {
     flags: EVIDENCE_ONE_SLOT | EVIDENCE_SHARED,
     slot: Slot {
         entry: bridged,
@@ -112,9 +84,7 @@ pub static BRIDGE: RuntimeObject = RuntimeObject {
     },
 };
 
-/// What an entry hands its root for an effect nothing handles: an operation is rejected (`E0424`),
-/// and a raise is left unanswered.
-pub static UNSERVED: RuntimeObject = RuntimeObject {
+pub static UNHANDLED_OPERATION: RuntimeObject = RuntimeObject {
     flags: EVIDENCE_ONE_SLOT | EVIDENCE_SHARED,
     slot: Slot {
         entry: unserved,
@@ -122,7 +92,6 @@ pub static UNSERVED: RuntimeObject = RuntimeObject {
     },
 };
 
-/// The word compiled code holds `object` by.
 pub(crate) fn object_word(object: &'static RuntimeObject) -> Word {
     std::ptr::from_ref(object) as Word
 }
@@ -135,7 +104,7 @@ unsafe extern "C" fn bridged(
     resource: I64,
     args: *const Handed,
 ) -> Handed {
-    unsafe { at_entry(ctx, op, mode, resource, args, true) }
+    unsafe { perform_operation(ctx, op, mode, resource, args, true) }
 }
 
 unsafe extern "C" fn unserved(
@@ -146,13 +115,10 @@ unsafe extern "C" fn unserved(
     resource: I64,
     args: *const Handed,
 ) -> Handed {
-    unsafe { at_entry(ctx, op, mode, resource, args, false) }
+    unsafe { perform_operation(ctx, op, mode, resource, args, false) }
 }
 
-/// A perform the object its entry hands handles, since nothing between handles it: a raise left
-/// unhandled, and any other operation rejected, as unhandled where the object is the bridge and
-/// as unserved otherwise.
-unsafe fn at_entry(
+unsafe fn perform_operation(
     ctx: *mut Ctx,
     op: *const PlyOp,
     mode: I64,
@@ -179,27 +145,22 @@ unsafe fn at_entry(
         ply_core::handler::err_unhandled(site, &effect, &name, resource.as_ref())
     } else {
         let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
-        ply_core::host::err_unserved(site, &operation)
+        ply_core::host::err_unhandled_operation(site, &operation)
     };
     Handed::of(c.fail(d))
 }
 
-/// The effect and the operation `described` describes, by their program-wide names.
 fn named_op(c: &Ctx, described: &PlyOp) -> (Symbol, Symbol) {
     let name = |i: i64| c.tables.fields[i as usize].clone();
     (name(described.effect), name(described.op))
 }
 
-/// Lets go of `args`, what a perform handed the operation `described` describes, through the
-/// operation's parameters' types.
 fn let_go(ctx: *mut Ctx, args: &[Word], described: &PlyOp) {
     for (w, ty) in args.iter().zip(described.params()) {
         unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
     }
 }
 
-/// What a raise hands the operation `described` describes, `args` its words, held through the
-/// operation's parameters' types.
 fn raised_of(args: &[Word], described: &PlyOp) -> Raised {
     Raised(
         args.iter()
@@ -209,8 +170,6 @@ fn raised_of(args: &[Word], described: &PlyOp) -> Raised {
     )
 }
 
-/// A perform of `effect.op` on `resource` in `mode` noted where this entry's performs are read: in
-/// its trace, and as a scheduler's step access.
 fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>, mode: Mode) {
     let performed = Effect::operation(
         effect.clone(),
@@ -220,7 +179,7 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
         mode,
         op.clone(),
     );
-    c.touched(crate::tasks::Touched::Effect {
+    c.touched(crate::tasks::Access::Effect {
         effect: effect.clone(),
         resource: resource.cloned(),
         write: mode == Mode::Write,
@@ -228,9 +187,6 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
     c.performed.push(performed);
 }
 
-/// Notes a perform of the operation `op` describes, on the field-table entry `resource` (negative
-/// for none) in `mode`, that a clause handled, as the entry's objects note each perform they are
-/// handed. Compiled code calls it only while [`Ctx::recording`] is armed.
 pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource: I64, mode: I64) {
     let c = unsafe { &mut *ctx };
     let (effect, name) = named_op(c, unsafe { &*op });
@@ -239,8 +195,6 @@ pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource:
     recorded(c, &effect, &name, resource.as_ref(), mode);
 }
 
-/// Rejects a clause leaving an instance another task opened, the operation `op` describes performed
-/// in a task: what it would leave is the spawner's, not the task's. 0 with the context failed.
 pub unsafe extern "C" fn rt_task_abandons(ctx: *mut Ctx, op: *const PlyOp) -> Word {
     let c = unsafe { &mut *ctx };
     let (effect, name) = named_op(c, unsafe { &*op });
@@ -248,9 +202,6 @@ pub unsafe extern "C" fn rt_task_abandons(ctx: *mut Ctx, op: *const PlyOp) -> Wo
     c.fail(err_task_not_resumed(&effect, &name, site))
 }
 
-/// Rejects a clause resuming off its tail that would stop a detached body another task began, the
-/// operation `op` describes performed in a task: what it would capture is the spawner's
-/// continuation, not the task's. 0 with the context failed.
 pub unsafe extern "C" fn rt_task_captures(ctx: *mut Ctx, op: *const PlyOp) -> Word {
     let c = unsafe { &mut *ctx };
     let (effect, name) = named_op(c, unsafe { &*op });
@@ -258,10 +209,6 @@ pub unsafe extern "C" fn rt_task_captures(ctx: *mut Ctx, op: *const PlyOp) -> Wo
     c.fail(err_task_captures(&effect, &name, site))
 }
 
-/// Leaves unanswered a raise, the operation `op` describes with the `args` it takes, that a task
-/// made and a clause of an instance another task opened would handle: no clause for a raise
-/// handles a task from around its spawn, so the raise leaves the task, and its scheduler raises it
-/// again where the scheduler was opened. 0 with the context failed.
 pub unsafe extern "C" fn rt_task_raises(
     ctx: *mut Ctx,
     op: *const PlyOp,
@@ -274,8 +221,6 @@ pub unsafe extern "C" fn rt_task_raises(
     pending_raise(c, &effect, &name, raised_of(args, described))
 }
 
-/// A task's perform handled by a clause, of a `handle` around its spawn, that stopped the body
-/// rather than resume it: what it would abandon is the spawner's, not the task's.
 #[cold]
 #[inline(never)]
 fn err_task_not_resumed(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
@@ -290,8 +235,6 @@ fn err_task_not_resumed(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic 
     )
 }
 
-/// A task's perform handled by a clause, of a `handle` around its spawn, that resumes off its tail:
-/// what it would capture is the continuation of the spawner's body, not the task's.
 #[cold]
 #[inline(never)]
 fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
@@ -306,9 +249,6 @@ fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
     )
 }
 
-/// A raise no `handle` handles, left pending for the code around it, as [`Ctx::pend`] says, with
-/// what the entry fails with should nothing take it: `abort.raise` a panic of its message, any other
-/// raise naming the operation and what it carried. Takes the arguments.
 pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised) -> i64 {
     if c.failed != 0 {
         args.release();
@@ -319,9 +259,8 @@ pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Rai
         args.release();
         let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
             .primary(c.site(), "raised here");
-        return c.pend(d, message);
+        return c.fail_unhandled_abort(d, message);
     }
-    // Only a raise nothing handles is shown what it carried: one a clause takes is not read.
     let carried: Result<Vec<Vec<u8>>, String> = args.0.iter().map(|v| shown(c, v)).collect();
     let carried = match carried {
         Ok(carried) => carried,
@@ -343,10 +282,9 @@ pub(super) fn pending_raise(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Rai
     .note("a `try` around the call handles it as an `Err`, and a `handle` clause as it likes")
     .showing(carried)
     .primary(c.site(), "raised here");
-    c.pend_raised(d, effect.clone(), op.clone(), args)
+    c.fail_with_pending_raise(d, effect.clone(), op.clone(), args)
 }
 
-/// The message an `abort.raise` carries, empty where it does not lower to a string.
 fn raised_message(c: &mut Ctx, args: &Raised) -> String {
     let text = |bytes: Vec<u8>| -> Option<String> {
         let mut r = ply_core::codec::Reader::new(bytes).ok()?;
@@ -361,18 +299,13 @@ fn raised_message(c: &mut Ctx, args: &Raised) -> String {
         .unwrap_or_default()
 }
 
-/// The message of the raise [`FAILED_PENDING`] stands for, as `string`, the type of `String`, lays
-/// it out, the entry no longer failed: for compiled code to raise it through the word that handles
-/// it. Where that word's slot is [`BRIDGE`]'s or [`UNSERVED`]'s (`bridged` not 0), the raise
-/// stays pending as it is, its diagnostic kept, for the code around to take. 0 with the entry
-/// failed as it was where nothing is pending or the raise stays so.
 pub unsafe extern "C" fn rt_pending_raised(
     ctx: *mut Ctx,
     string: *const PlyType,
     bridged: I64,
 ) -> Handed {
     let c = unsafe { &mut *ctx };
-    if c.failed != FAILED_PENDING || bridged.0 != 0 {
+    if c.failed != FAILED_PENDING_RAISE || bridged.0 != 0 {
         return Handed::of(0);
     }
     let message = match c.pending.take() {
@@ -384,17 +317,12 @@ pub unsafe extern "C" fn rt_pending_raised(
     };
     c.failed = 0;
     c.diagnostic = None;
-    string_lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+    decode_string(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
 }
 
-/// The words of the raise [`FAILED_PENDING`] stands for, where it is a raise of the effect and
-/// operation the field-table entries `effect` and `op` name and not `abort.raise`, the entry no
-/// longer failed: for compiled code to hand the clause that handles it, which takes them. The array
-/// has a word to spare past them and lasts until the next such raise. 0 with the entry failed as it
-/// was otherwise.
 pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I64) -> Handed {
     let c = unsafe { &mut *ctx };
-    if c.failed != FAILED_PENDING {
+    if c.failed != FAILED_PENDING_RAISE {
         return Handed::of(0);
     }
     let named = |s: &Symbol, i: I64| c.tables.fields.get(i.0 as usize) == Some(s);
@@ -417,15 +345,10 @@ pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I6
     Handed::of(c.pending_words.as_ptr() as Word)
 }
 
-/// One more holder of a shared block, for compiled code, which has no atomics of its own.
 pub unsafe extern "C" fn rt_inc_shared(_ctx: *mut Ctx, w: i64) {
     heap::inc_shared(w);
 }
 
-/// `parallel { .. }`: the `n` slots at `slots` hold closure blocks, which this takes, and each
-/// branch's result is written over its closure uncounted. Where the block fails, a branch that
-/// failed or never ran leaves 0, and one that returned its result, for emitted code to let go at
-/// its type.
 pub unsafe extern "C" fn rt_branches(ctx: *mut Ctx, slots: *const Handed, n: I64) {
     let allowed = unsafe { &*ctx }.runs_branches_at_once();
     let slots = slots.cast::<Word>().cast_mut();

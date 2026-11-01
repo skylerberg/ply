@@ -1,19 +1,14 @@
-//! A raise the runtime left pending, which a closure holding a word for `abort` raises through it as
-//! it leaves: handed over as its message to a clause's slot, and through the bridge's raised on as
-//! the raise it is, its diagnostic kept where nothing handles it the second time either.
-
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
 use ply_compiled::heap::{HEADER, Word};
-use ply_compiled::rt::{Ctx, FAILED_PENDING};
+use ply_compiled::rt::{Ctx, FAILED_PENDING_RAISE};
 use std::cell::RefCell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type Pending = unsafe extern "C" fn(*mut Ctx, *const PlyType, Word) -> Word;
 
-/// A `String` as emitted code holds one here: a block of one word, the place of its text in `TEXTS`.
 const BOX: Word = HEADER as Word + 8;
 
 thread_local! {
@@ -72,7 +67,6 @@ static STRING_T: PlyType = PlyType {
     lift: text_lift,
 };
 
-/// A failure compiled code wrote and raised, with the text `note`, left pending.
 fn failed(ctx: &mut Ctx, code: &[u8], message: &[u8], note: &[u8]) {
     let raised: unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word) = helper("rt_failed");
     let label = b"here";
@@ -89,10 +83,11 @@ fn failed(ctx: &mut Ctx, code: &[u8], message: &[u8], note: &[u8]) {
     unsafe { raised(ctx, 1, words.as_ptr(), 1, 0) };
 }
 
-/// Through the bridge, which handles no raise, the entry fails as the runtime left it failing:
-/// `left`'s code, message and notes, not a `panic:` made of its text.
 fn raised_on_keeps(ctx: &mut Ctx) {
-    assert_eq!(ctx.failed, FAILED_PENDING, "nothing handles the rejection");
+    assert_eq!(
+        ctx.failed, FAILED_PENDING_RAISE,
+        "nothing handles the rejection"
+    );
     let left = ctx
         .diagnostic
         .clone()
@@ -100,7 +95,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
     let message = unsafe { helper::<Pending>("rt_pending_raised")(ctx, &STRING_T, 1) };
     assert_eq!(message, 0, "nothing is handed over to the bridge");
     assert_eq!(
-        ctx.failed, FAILED_PENDING,
+        ctx.failed, FAILED_PENDING_RAISE,
         "nothing handles it the second time"
     );
     let now = ctx.diagnostic.clone().expect("the entry fails");
@@ -114,16 +109,15 @@ fn raised_on_keeps(ctx: &mut Ctx) {
 }
 
 #[test]
-fn a_rejection_raised_on_through_the_bridge_keeps_its_note() {
+fn a_rejection_raised_again_from_a_stored_failure_keeps_its_explanatory_text() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     failed(&mut ctx, b"E0502", b"it failed", b"why it failed");
     raised_on_keeps(&mut ctx);
 }
 
-/// A failed `assert` inside a lambda of a test is this: unanswered, it is `E0501` with its message.
 #[test]
-fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
+fn an_assertion_failure_raised_again_from_a_stored_failure_is_still_an_assertion_failure() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     failed(&mut ctx, b"E0501", b"assertion failed", b"the sides differ");
@@ -131,9 +125,8 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
     raised_on_keeps(&mut ctx);
 }
 
-/// A clause's slot is handed the message, and the entry fails no longer: the clause handles it.
 #[test]
-fn a_clause_is_handed_the_message_of_a_raise_left_pending() {
+fn a_handler_receives_the_message_of_a_stored_raise_as_a_string() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     failed(&mut ctx, b"E0502", b"it failed", b"why it failed");

@@ -1,32 +1,33 @@
-//! Lazy sequences: elements made one at a time, as a consumer requests them.
+//! Lazy sequences: elements produced one at a time, as a consumer asks for them.
 //!
-//! A `Seq<a | e>` is a function that returns its next `Step`: an element and the rest, the rest
-//! alone, or the end. Nothing runs until a consumer pulls. An adapter (`map`, `filter`, `take` and
-//! the others) wraps that function without calling it. So a pipeline keeps one element at a time
-//! and no list per stage, and each stage adds a closure and a step to every pull through it. The
-//! effects `e` are what a pull performs: a sequence whose steps read a file or a socket shows it in
-//! its type, and the effect is handled where the sequence is consumed. A sequence is a value, so
-//! pulling it again from its start runs its steps again and performs their effects again.
+//! A `Seq<a | e>` is a function that returns its next `Step`: an element and the rest of the
+//! sequence, a skip and the rest, or the end. Nothing runs until a consumer pulls. An adapter
+//! (`map`, `filter`, `take` and others) wraps a sequence in a new function without calling it. A
+//! pipeline therefore holds one element at a time, not a list per stage, and each stage adds a
+//! closure and a step to every pull. The effects `e` are what a pull performs: a sequence whose
+//! steps read a file or a socket shows that in its type, and the effect is handled where the
+//! sequence is consumed. A sequence is a value, so pulling it again from the start runs its steps
+//! and performs their effects again.
 //!
-//! A sequence may have no end, as `repeat`, `cycle`, `iterate` and an `unfold` that never returns
-//! `None` have none, and no type distinguishes such a sequence from one that ends. A sequence with
-//! an end may still skip any number of times before its next element, as a `filter` over an endless
-//! sequence does. So `take` bounds the elements a consumer sees, not the pulls it makes. Two rules
-//! keep a consumer from running forever without output. First, a pull does a bounded amount of
-//! work, which is what `Skip` is for: an adapter that drops an element returns the rest instead of
-//! looking for the next element. Second, every consumer takes a budget, as the prelude's `iterate`
-//! does: the most elements and skips it may pull. A consumer that would pull more raises
-//! `seq.spent`, so it never returns a result for part of a sequence as if for the whole; `try`
-//! turns that raise into an `Err`. The pull that returns `Done` is not counted, so
-//! `to_list(of_list(xs), xs.len())` is `xs`.
+//! A sequence may be endless, as `repeat`, `cycle`, `iterate` and an `unfold` that never returns
+//! `None` are, and no type tells an endless sequence from a finite one. A finite sequence may also
+//! skip many times before its next element, as a `filter` over an endless sequence does. So `take`
+//! limits the elements a consumer sees, not the pulls it makes. Two rules stop a consumer from
+//! running forever without output. First, each pull does a bounded amount of work, which is what
+//! `Skip` is for: an adapter that drops an element returns `Skip` instead of searching for the next
+//! element. Second, every consumer takes a budget, as the prelude's `iterate` does: the most
+//! elements and skips it may pull. A consumer that would pull more raises `seq.spent`, so it never
+//! returns part of a sequence as if it were the whole; `try` turns that raise into an `Err`. The
+//! final pull that returns `Done` does not count toward the budget, so `to_list(of_list(xs),
+//! xs.len())` is `xs`.
 //!
-//! `combinations`, `permutations` and `cartesian` return the selections from a list one at a time,
-//! since there are too many to fit in a list long before the list they are taken from is long.
+//! `combinations`, `permutations` and `cartesian` return their selections one at a time, because
+//! the number of selections grows too fast to build them all as a list.
 //!
 //! `range` and `iterate` are also prelude names, and `map`, `filter` and `fold` are also list
 //! functions, so qualify them: `seq::map(s, f)`. An adapter's pulls nest as deep as the pipeline,
-//! so a sequence built by appending in a loop is as deep as the loop was long. `flat_map` over the
-//! parts stays flat.
+//! so a sequence built by appending in a loop is as deep as the loop ran. `flat_map` over the
+//! sequences to append stays flat.
 
 import std.laws (agrees)
 import std.list
@@ -51,11 +52,7 @@ pub effect seq {
   raise spent(budget: Int)
 }
 
-/// The pulls an adapter counts down, which is the measure that proves its definition terminates. No
-/// run reaches it, and it is the largest count a closure can store in a word.
 fn max_pulls() -> Int = 4611686018427387903
-
-// --- Builders ---------------------------------------------------------------
 
 /// The empty sequence.
 pub fn empty<a | e>() -> Seq<a | e> = || Done
@@ -69,9 +66,9 @@ pub fn of_list<a | e>(xs: List<a>) -> Seq<a | e> = from_index(xs, 0)
 fn from_index<a | e>(xs: List<a>, i: Int) -> Seq<a | e> =
   || match xs.at(i) { Some(x) -> Yield(x, from_index(xs, i + 1)), None -> Done }
 
-/// The integers from `lo` toward `hi`, `step` apart, without reaching `hi`. They go upward for a
-/// positive `step` and downward for a negative one. A `step` of zero gives the empty sequence, and
-/// a range that would pass the last `Int` ends there.
+/// Returns the integers from `lo` toward `hi`, each `step` after the previous one, stopping before
+/// `hi`. It counts up for a positive `step` and down for a negative one. A `step` of zero gives the
+/// empty sequence, and the sequence ends before it would overflow `Int`.
 pub fn range<| e>(lo: Int, hi: Int, step: Int = 1) -> Seq<Int | e> =
   stepped(lo, hi, step, max_pulls())
 
@@ -82,7 +79,7 @@ fn stepped<| e>(at: Int, hi: Int, step: Int, fuel: Int) -> Seq<Int | e> =
       Yield(at, if next > at == (step > 0) { stepped(next, hi, step, fuel - 1) } else { empty() })
     }
 
-/// `x`, without end.
+/// Returns a sequence that repeats `x` without end.
 pub fn repeat<a | e>(x: a) -> Seq<a | e> = repeated(x, max_pulls())
 
 fn repeated<a | e>(x: a, fuel: Int) -> Seq<a | e> =
@@ -151,7 +148,6 @@ fn lines_from<| e>(data: Bytes, at: Int, fuel: Int) -> Seq<String | e> =
       }
     }
 
-/// Where the line starting at `at` ends: `at` is inside the text or just past it.
 fn line_end(data: Bytes, at: Int) -> Option<Int> =
   handle { data.index_of_from(b"\n", at) } with { abort.raise(_) -> None }
 
@@ -176,8 +172,6 @@ fn sliced<| e>(data: Bytes, size: Int, at: Int, fuel: Int) -> Seq<Bytes | e> =
         sliced(data, size, end, fuel - 1),
       )
     }
-
-// --- Selections --------------------------------------------------------------
 
 /// Every way to choose `k` of the elements of `xs`, each as a list in the order of `xs`. The
 /// choices come in order of the positions chosen: the first is the first `k` elements, and the last
@@ -211,8 +205,6 @@ pub fn cartesian<a | e>(xss: List<List<a>>) -> Seq<List<a> | e> =
     list::filter_map(list::zip(xss, digits), |taken: { first: List<a>, second: Int }|
       taken.first.at(taken.second)))
 
-/// What `pick` returns for each row of digits in turn. The digit at each place counts from zero up
-/// to that place's radix, and the last place counts fastest. A radix below one leaves no rows.
 fn odometer<a | e>(radices: List<Int>, pick: keep (List<Int>) -> a) -> Seq<a | e> =
   rows_from(
     if radices.all(|radix: Int| radix > 0) { Some(counted(0, 0, radices.len(), [])) } else { None },
@@ -220,20 +212,16 @@ fn odometer<a | e>(radices: List<Int>, pick: keep (List<Int>) -> a) -> Seq<a | e
     pick,
   )
 
-/// What `pick` returns for the row `first` and for each row `next` returns after it, until `next`
-/// returns `None`.
 fn rows_from<a | e>(
   first: Option<List<Int>>,
   next: keep (List<Int>) -> Option<List<Int>>,
   pick: keep (List<Int>) -> a,
 ) -> Seq<a | e> = {
-  let step: (Option<List<Int>>) -> Option<{ value: a, next: Option<List<Int>> }> / e = |held: Option<List<Int>>|
-    match held { None -> None, Some(row) -> Some({ value: pick(row), next: next(row) }) };
+  let step: (Option<List<Int>>) -> Option<{ value: a, next: Option<List<Int>> }> / e = |current_row: Option<List<Int>>|
+    match current_row { None -> None, Some(row) -> Some({ value: pick(row), next: next(row) }) };
   unfold(first, step)
 }
 
-/// The row after `digits`, or `None` after the last row. The last place still below its radix goes
-/// up by one, and the places after it restart at zero.
 fn next_digits(digits: List<Int>, radices: List<Int>) -> Option<List<Int>> =
   match list::enumerate(list::zip(digits, radices)).find_last(
       |place: { index: Int, value: { first: Int, second: Int } }|
@@ -251,18 +239,14 @@ fn next_digits(digits: List<Int>, radices: List<Int>) -> Option<List<Int>> =
       ),
   }
 
-/// The choice of positions out of `n` that follows `positions`, or `None` after the last choice.
-/// The last position with room ahead of it moves up by one, and the positions after it follow
-/// directly behind it.
 fn next_choice(positions: List<Int>, n: Int) -> Option<List<Int>> =
-  match list::enumerate(positions).find_last(|held: { index: Int, value: Int }|
-      held.value < n - positions.len() + held.index) {
+  match list::enumerate(positions).find_last(|candidate: { index: Int, value: Int }|
+      candidate.value < n - positions.len() + candidate.index) {
     None -> None,
     Some(moved) ->
       Some(counted(moved.value + 1, 1, positions.len() - moved.index, positions.take(moved.index))),
   }
 
-/// The elements the digits pick in turn, each digit indexing the elements still `left`.
 fn arranged<a>(digits: List<Int>, left: List<a>, out: List<a>) -> List<a> =
   match digits {
     [] -> out,
@@ -272,13 +256,10 @@ fn arranged<a>(digits: List<Int>, left: List<a>, out: List<a>) -> List<a> =
     },
   }
 
-/// `out` followed by `count` numbers, starting at `from` and `step` apart.
 fn counted(from: Int, step: Int, count: Int, out: List<Int>) -> List<Int> =
   if count <= 0 { out } else { counted(from + step, step, count - 1, out.push(from)) }
 
-// --- Adapters ---------------------------------------------------------------
-
-/// `f` of each element, called when the element is pulled.
+/// Returns a sequence that applies `f` to each element of `s` when that element is pulled.
 pub fn map<a, b | e>(s: Seq<a | e>, f: keep (a) -> b / e) -> Seq<b | e> = mapped(s, f, max_pulls())
 
 fn mapped<a, b | e>(s: Seq<a | e>, f: keep (a) -> b / e, fuel: Int) -> Seq<b | e> =
@@ -362,7 +343,8 @@ fn taken<a | e>(s: Seq<a | e>, n: Int, fuel: Int) -> Seq<a | e> =
       }
     }
 
-/// Everything but the first `n` elements, each of which becomes a skip.
+/// Returns `s` without its first `n` elements. While it drops them, the sequence yields `Skip` for
+/// each dropped element instead of `Yield`.
 pub fn drop<a | e>(s: Seq<a | e>, n: Int) -> Seq<a | e> =
   if n <= 0 { s } else { dropped(s, n, max_pulls()) }
 
@@ -376,8 +358,8 @@ fn dropped<a | e>(s: Seq<a | e>, n: Int, fuel: Int) -> Seq<a | e> =
       }
     }
 
-/// The longest prefix for whose every element `ok` returns true. `ok` is not called past the first
-/// element for which it returns false, and `s` is pulled no further.
+/// Returns the longest prefix of `s` in which `ok` returns true for every element. `ok` is not
+/// called on elements after the first one it rejects, and `s` is not pulled any further.
 pub fn take_while<a | e>(s: Seq<a | e>, ok: keep (a) -> Bool / e) -> Seq<a | e> =
   taken_while(s, ok, max_pulls())
 
@@ -452,20 +434,19 @@ pub fn zip<a, b | e>(a: Seq<a | e>, b: Seq<b | e>) -> Seq<{ first: a, second: b 
 pub fn zip_with<a, b, c | e>(a: Seq<a | e>, b: Seq<b | e>, f: keep (a, b) -> c / e) -> Seq<c | e> =
   zipped(a, None, b, f, max_pulls())
 
-/// `held` is an element pulled from the left while the right returned a skip.
 fn zipped<a, b, c | e>(
   left: Seq<a | e>,
-  held: Option<a>,
+  pending_left: Option<a>,
   right: Seq<b | e>,
   f: keep (a, b) -> c / e,
   fuel: Int,
 ) -> Seq<c | e> =
   ||
     if fuel <= 0 { Done } else {
-      match held {
+      match pending_left {
         Some(x) -> match right() {
           Done -> Done,
-          Skip(more) -> Skip(zipped(left, held, more, f, fuel - 1)),
+          Skip(more) -> Skip(zipped(left, pending_left, more, f, fuel - 1)),
           Yield(y, more) -> Yield(f(x, y), zipped(left, None, more, f, fuel - 1)),
         },
         None -> match left() {
@@ -499,14 +480,19 @@ fn enumerated<a | e>(s: Seq<a | e>, i: Int, fuel: Int) -> Seq<{ index: Int, valu
 pub fn scan<a, b | e>(s: Seq<a | e>, init: b, f: keep (b, a) -> b / e) -> Seq<b | e> =
   scanned(s, init, f, max_pulls())
 
-fn scanned<a, b | e>(s: Seq<a | e>, acc: b, f: keep (b, a) -> b / e, fuel: Int) -> Seq<b | e> =
+fn scanned<a, b | e>(
+  s: Seq<a | e>,
+  accumulator: b,
+  f: keep (b, a) -> b / e,
+  fuel: Int,
+) -> Seq<b | e> =
   ||
     if fuel <= 0 { Done } else {
       match s() {
         Done -> Done,
-        Skip(rest) -> Skip(scanned(rest, acc, f, fuel - 1)),
+        Skip(rest) -> Skip(scanned(rest, accumulator, f, fuel - 1)),
         Yield(x, rest) -> {
-          let next = f(acc, x);
+          let next = f(accumulator, x);
           Yield(next, scanned(rest, next, f, fuel - 1))
         },
       }
@@ -525,8 +511,8 @@ fn appended<a | e>(a: Seq<a | e>, b: Seq<a | e>, fuel: Int) -> Seq<a | e> =
       }
     }
 
-/// An element of `a`, then one of `b`, and so on in turn; once either has ended, the rest of the
-/// other.
+/// Returns the elements of `a` and `b` alternately, starting with `a`. When one sequence ends, the
+/// rest of the other sequence follows.
 pub fn interleave<a | e>(a: Seq<a | e>, b: Seq<a | e>) -> Seq<a | e> =
   interleaved(a, b, max_pulls())
 
@@ -575,13 +561,11 @@ fn inspected<a | e>(s: Seq<a | e>, f: keep (a) -> Unit / e, fuel: Int) -> Seq<a 
       }
     }
 
-/// The state of one side of a merge: a sequence not yet pulled for its next element, that element
-/// with the rest, or the end.
 type Side<a | e> = | Unread(Seq<a | e>) | Read(a, Seq<a | e>) | Exhausted
 
-/// The elements of both sequences in one order, given that each is already in that order. `before`
-/// returns whether its first argument comes first; of two elements it does not order, `a`'s comes
-/// first.
+/// Returns the elements of both sequences in sorted order, given that each is already sorted by
+/// `before`. `before(x, y)` returns true when `x` comes before `y`. When neither of two elements
+/// comes before the other, the element from `a` comes first.
 pub fn merge_sorted<a | e>(
   a: Seq<a | e>,
   b: Seq<a | e>,
@@ -616,8 +600,6 @@ fn merged<a | e>(
 fn side_of<a | e>(step: Step<a | e>) -> Side<a | e> =
   match step { Done -> Exhausted, Skip(rest) -> Unread(rest), Yield(x, rest) -> Read(x, rest) }
 
-// --- Consumers --------------------------------------------------------------
-
 /// Folds `f` over the elements in order, starting from `init`. Each call gets the result of the
 /// previous one.
 pub fn fold<a, b | e>(
@@ -631,15 +613,15 @@ fn folded<a, b | e>(
   s: Seq<a | e>,
   budget: Int,
   left: Int,
-  acc: b,
+  accumulator: b,
   f: (b, a) -> b / e,
 ) -> b / {seq.spent | e} =
   match s() {
-    Done -> acc,
+    Done -> accumulator,
     Skip(rest) -> if left <= 0 { seq.spent(budget) }
-    else { folded(rest, budget, left - 1, acc, f) },
+    else { folded(rest, budget, left - 1, accumulator, f) },
     Yield(x, rest) -> if left <= 0 { seq.spent(budget) }
-    else { folded(rest, budget, left - 1, f(acc, x), f) },
+    else { folded(rest, budget, left - 1, f(accumulator, x), f) },
   }
 
 /// A fold that may stop early. `f` returns `Continue` with the next accumulator, or `Stop` with the
@@ -656,15 +638,15 @@ fn folded_while<a, b | e>(
   s: Seq<a | e>,
   budget: Int,
   left: Int,
-  acc: b,
+  accumulator: b,
   f: (b, a) -> Iter<b, b> / e,
 ) -> b / {seq.spent | e} =
   match s() {
-    Done -> acc,
+    Done -> accumulator,
     Skip(rest) -> if left <= 0 { seq.spent(budget) }
-    else { folded_while(rest, budget, left - 1, acc, f) },
+    else { folded_while(rest, budget, left - 1, accumulator, f) },
     Yield(x, rest) -> if left <= 0 { seq.spent(budget) } else {
-      match f(acc, x) {
+      match f(accumulator, x) {
         Continue(next) -> folded_while(rest, budget, left - 1, next, f),
         Stop(result) -> result,
       }
@@ -690,7 +672,7 @@ fn pulled<a | e>(
 
 /// The elements as a list.
 pub fn to_list<a | e>(s: Seq<a | e>, budget: Int) -> List<a> / {seq.spent | e} =
-  fold(s, budget, [], |acc: List<a>, x: a| acc.push(x))
+  fold(s, budget, [], |accumulator: List<a>, x: a| accumulator.push(x))
 
 /// How many elements the sequence has.
 pub fn length<a | e>(s: Seq<a | e>, budget: Int) -> Int / {seq.spent | e} =
@@ -732,17 +714,12 @@ pub fn all<a | e>(s: Seq<a | e>, budget: Int, ok: (a) -> Bool / e) -> Bool / {se
 pub fn for_each<a | e>(s: Seq<a | e>, budget: Int, f: (a) -> Unit / e) -> Unit / {seq.spent | e} =
   fold(s, budget, (), |_: Unit, x: a| f(x))
 
-// --- Tests ------------------------------------------------------------------
-
-/// A pure sequence's elements, under a budget no test here comes near.
 fn listed<a>(s: Seq<a | {}>) -> List<a> / {seq.spent} = to_list(s, 1000000)
 
-/// The integers from zero up to `n`, as the prelude's `range` returns them. This module's own
-/// `range` hides the prelude's name.
 fn upto(n: Int) -> List<Int> =
   list::enumerate(List::replicate((), n)).map(|p: { index: Int, value: Unit }| p.index)
 
-test "the builders make what they say, and nothing more" {
+test "`empty`, `once`, `of_list`, `repeat`, `iterate`, `cycle` and `unfold` each produce exactly their expected elements, including when empty" {
   let none: Seq<Int | {}> = empty();
   assert_eq(listed(none), []);
   assert_eq(listed(once(7)), [7]);
@@ -758,7 +735,7 @@ test "the builders make what they say, and nothing more" {
   )
 }
 
-test "combinations choose positions in their order, and there is one choice of nothing" {
+test "`combinations` returns choices in input order, and choosing zero elements returns one empty choice" {
   assert_eq(listed(combinations(["a", "b", "c", "d"], 2)), [
     ["a", "b"],
     ["a", "c"],
@@ -778,7 +755,7 @@ test "combinations choose positions in their order, and there is one choice of n
   assert_eq(listed(combinations(none, 1)), [])
 }
 
-test "permutations arrange positions in rows, the last place changing first" {
+test "`permutations` returns orderings in lexicographic order, with the last position varying fastest" {
   assert_eq(listed(permutations([1, 2, 3], 2)), [[1, 2], [1, 3], [2, 1], [2, 3], [3, 1], [3, 2]]);
   assert_eq(listed(permutations([1, 2, 3], 3)), [
     [1, 2, 3],
@@ -797,7 +774,7 @@ test "permutations arrange positions in rows, the last place changing first" {
   assert_eq(listed(permutations(none, 1)), [])
 }
 
-test "cartesian takes one element from each list, the last list's changing first" {
+test "`cartesian` takes one element from each list, with the last list varying fastest" {
   assert_eq(listed(cartesian([[1, 2], [3], [4, 5]])), [[1, 3, 4], [1, 3, 5], [2, 3, 4], [2, 3, 5]]);
   assert_eq(listed(cartesian([[1, 2]])), [[1], [2]]);
   assert_eq(listed(cartesian([[1, 2], []])), []);
@@ -811,7 +788,7 @@ test "a selection is made when it is pulled, however many there are" {
   assert_eq(listed(take(cartesian(List::replicate([0, 1], 62)), 5)).len(), 5)
 }
 
-test "a range steps from its first bound toward its second, which it does not reach" {
+test "`range` steps from its start toward its end, and excludes the end value" {
   assert_eq(listed(range(0, 4)), [0, 1, 2, 3]);
   assert_eq(listed(range(2, 11, 3)), [2, 5, 8]);
   assert_eq(listed(range(5, 0, 0 - 2)), [5, 3, 1]);
@@ -824,7 +801,7 @@ test "a range steps from its first bound toward its second, which it does not re
   assert_eq(listed(range(0 - top, 0 - top - 1, 0 - 3)), [0 - top])
 }
 
-test "lines are split as the string module splits them, and slices are cut to a size" {
+test "`lines` splits text at `\n` and `\r\n` and keeps empty lines, and `slices` cuts bytes into chunks of at most the given length" {
   assert_eq(listed(lines("one\ntwo\r\nthree")), ["one", "two", "three"]);
   assert_eq(listed(lines("one\n")), ["one", ""]);
   assert_eq(listed(lines("\n\n")), ["", "", ""]);
@@ -885,7 +862,7 @@ test "chunks and windows gather neighbours into lists" {
   assert_eq(listed(take(windows(repeat(0), 3), 2)), [[0, 0, 0], [0, 0, 0]])
 }
 
-test "zip, enumerate, scan, append, interleave and dedup pair, number and join sequences" {
+test "`zip`, `zip_with`, `enumerate`, `scan`, `append`, `interleave` and `dedup` return the expected elements, including for sequences of unequal length" {
   let s = of_list([1, 2, 3]);
   assert_eq(listed(zip(s, of_list(["a", "b"]))), [
     { first: 1, second: "a" },
@@ -906,8 +883,12 @@ test "zip, enumerate, scan, append, interleave and dedup pair, number and join s
     { index: 0, value: "a" },
     { index: 1, value: "b" },
   ]);
-  assert_eq(listed(scan(s, 0, |acc: Int, x: Int| acc + x)), [1, 3, 6]);
-  assert_eq(listed(scan(s, "", |acc: String, x: Int| acc ++ x.to_string())), ["1", "12", "123"]);
+  assert_eq(listed(scan(s, 0, |accumulator: Int, x: Int| accumulator + x)), [1, 3, 6]);
+  assert_eq(listed(scan(s, "", |accumulator: String, x: Int| accumulator ++ x.to_string())), [
+    "1",
+    "12",
+    "123",
+  ]);
   assert_eq(listed(append(s, of_list([9]))), [1, 2, 3, 9]);
   assert_eq(listed(append(empty(), s)), [1, 2, 3]);
   assert_eq(listed(take(append(s, repeat(0)), 5)), [1, 2, 3, 0, 0]);
@@ -917,7 +898,7 @@ test "zip, enumerate, scan, append, interleave and dedup pair, number and join s
   assert_eq(listed(dedup(of_list(["a"]))), ["a"])
 }
 
-test "a merge of two ordered sequences is ordered, and of two equals the first's comes first" {
+test "`merge_sorted` of two ordered sequences is ordered, and elements that compare equal come from the first sequence first" {
   let before = |x: Int, y: Int| x < y;
   assert_eq(listed(merge_sorted(of_list([1, 4, 6]), of_list([2, 3, 7, 8]), before)), [
     1,
@@ -945,9 +926,9 @@ test "a merge of two ordered sequences is ordered, and of two equals the first's
   assert_eq(listed(map(tagged, |x: { k: Int, tag: String }| x.tag)), ["a", "b", "a", "b"])
 }
 
-test "each consumer returns the right result for the elements" {
+test "`fold`, `fold_while`, `to_list`, `length`, `count`, `first`, `last`, `nth`, `find`, `any` and `all` return the correct value for a sequence, and a sensible one for an empty sequence" {
   let s = of_list([3, 1, 4, 1, 5]);
-  assert_eq(fold(s, 5, 0, |acc: Int, x: Int| acc * 10 + x), 31415);
+  assert_eq(fold(s, 5, 0, |accumulator: Int, x: Int| accumulator * 10 + x), 31415);
   assert_eq(to_list(s, 5), [3, 1, 4, 1, 5]);
   assert_eq(length(s, 5), 5);
   assert_eq(count(s, 5, |x: Int| x == 1), 2);
@@ -963,10 +944,11 @@ test "each consumer returns the right result for the elements" {
   assert(all(s, 5, |x: Int| x > 0));
   assert(!all(s, 5, |x: Int| x > 1));
   assert_eq(
-    fold_while(s, 5, 0, |acc: Int, x: Int| if x == 4 { Stop(acc) } else { Continue(acc + x) }),
+    fold_while(s, 5, 0, |accumulator: Int, x: Int|
+      if x == 4 { Stop(accumulator) } else { Continue(accumulator + x) }),
     4,
   );
-  assert_eq(fold_while(s, 5, 0, |acc: Int, x: Int| Continue(acc + x)), 14);
+  assert_eq(fold_while(s, 5, 0, |accumulator: Int, x: Int| Continue(accumulator + x)), 14);
   let none: Seq<Int | {}> = empty();
   assert_eq(first(none, 0), None);
   assert_eq(last(none, 0), None);
@@ -988,7 +970,7 @@ test "pull returns the first element and the sequence after it" {
   match pull(none, 0) { Some(_) -> assert(false), None -> () }
 }
 
-test "a consumer pulls within its budget or raises, and the pull that ends a sequence is free" {
+test "a consumer fails when it must take more elements than its limit allows, but finding the end of the sequence does not count against the limit" {
   assert_eq(try { to_list(of_list([1, 2, 3]), 3) }, Ok([1, 2, 3]));
   assert_eq(try { to_list(of_list([1, 2, 3]), 2) }, Err(2));
   assert_eq(try { to_list(take(repeat(7), 3), 3) }, Ok([7, 7, 7]));
@@ -1011,16 +993,13 @@ effect feed {
   write next() -> Option<Int>
 }
 
-/// The values `feed.next` returns, each requested when it is pulled.
 fn feed_values() -> Seq<Int | {feed.next}> =
   unfold((), |_: Unit| match feed.next() { Some(x) -> Some({ value: x, next: () }), None -> None })
 
-/// What `body` returns when `feed.next` returns the integers from zero up to `n`, and how many
-/// times `feed.next` was called.
 fn count_pulls<a>(
   n: Int,
   body: () -> a / {feed.next, seq.spent},
-) -> { value: a, asked: Int } / {seq.spent} =
+) -> { value: a, requested: Int } / {seq.spent} =
   handle {
     body()
   } with {
@@ -1030,58 +1009,61 @@ fn count_pulls<a>(
       at = i + 1;
       if i < n { Some(i) } else { None }
     },
-    return value -> { value: value, asked: at },
+    return value -> { value: value, requested: at },
   }
 
 test "a step runs when its element is pulled, and only then" {
   assert_eq(
     count_pulls(9, ||
       [feed_values(), take(feed_values(), 3), filter(feed_values(), |x: Int| x > 4)].len()),
-    { value: 3, asked: 0 },
+    { value: 3, requested: 0 },
   );
-  assert_eq(count_pulls(9, || to_list(take(feed_values(), 3), 3)), { value: [0, 1, 2], asked: 3 });
-  assert_eq(count_pulls(4, || to_list(feed_values(), 4)), { value: [0, 1, 2, 3], asked: 5 });
+  assert_eq(count_pulls(9, || to_list(take(feed_values(), 3), 3)), {
+    value: [0, 1, 2],
+    requested: 3,
+  });
+  assert_eq(count_pulls(4, || to_list(feed_values(), 4)), { value: [0, 1, 2, 3], requested: 5 });
   assert_eq(count_pulls(9, || to_list(take(drop(feed_values(), 2), 2), 4)), {
     value: [2, 3],
-    asked: 4,
+    requested: 4,
   });
   assert_eq(count_pulls(9, || to_list(take_while(feed_values(), |x: Int| x < 2), 9)), {
     value: [0, 1],
-    asked: 3,
+    requested: 3,
   });
   assert_eq(
     count_pulls(9, ||
       to_list(take(zip_with(feed_values(), feed_values(), |x: Int, y: Int| x * 10 + y), 2), 2)),
-    { value: [1, 23], asked: 4 },
+    { value: [1, 23], requested: 4 },
   );
   assert_eq(
     count_pulls(9, || to_list(take(append(take(feed_values(), 2), feed_values()), 3), 3)),
-    { value: [0, 1, 2], asked: 3 },
+    { value: [0, 1, 2], requested: 3 },
   )
 }
 
 test "a consumer that has its result pulls nothing more" {
-  assert_eq(count_pulls(100, || first(feed_values(), 100)), { value: Some(0), asked: 1 });
-  assert_eq(count_pulls(100, || nth(feed_values(), 100, 3)), { value: Some(3), asked: 4 });
+  assert_eq(count_pulls(100, || first(feed_values(), 100)), { value: Some(0), requested: 1 });
+  assert_eq(count_pulls(100, || nth(feed_values(), 100, 3)), { value: Some(3), requested: 4 });
   assert_eq(count_pulls(100, || find(feed_values(), 100, |x: Int| x == 5)), {
     value: Some(5),
-    asked: 6,
+    requested: 6,
   });
   assert_eq(count_pulls(100, || any(feed_values(), 100, |x: Int| x == 2)), {
     value: true,
-    asked: 3,
+    requested: 3,
   });
   assert_eq(count_pulls(100, || all(feed_values(), 100, |x: Int| x < 2)), {
     value: false,
-    asked: 3,
+    requested: 3,
   });
   assert_eq(
     count_pulls(100, ||
-      fold_while(feed_values(), 100, 0, |acc: Int, x: Int|
-        if acc > 5 { Stop(acc) } else { Continue(acc + x) })),
-    { value: 6, asked: 5 },
+      fold_while(feed_values(), 100, 0, |accumulator: Int, x: Int|
+        if accumulator > 5 { Stop(accumulator) } else { Continue(accumulator + x) })),
+    { value: 6, requested: 5 },
   );
-  assert_eq(count_pulls(7, || last(feed_values(), 7)), { value: Some(6), asked: 8 })
+  assert_eq(count_pulls(7, || last(feed_values(), 7)), { value: Some(6), requested: 8 })
 }
 
 test "a step past what a consumer requested never runs" {
@@ -1097,7 +1079,7 @@ test "a sequence is a value: pulled again from its start, it runs its steps agai
   let s = map(feed_values(), |x: Int| x * 2);
   assert_eq(count_pulls(9, || to_list(take(s, 2), 2).concat(to_list(take(s, 2), 2))), {
     value: [0, 2, 4, 6],
-    asked: 4,
+    requested: 4,
   });
   let pure = map(of_list([1, 2]), |x: Int| x + 1);
   assert_eq(listed(pure), listed(pure))
@@ -1107,26 +1089,26 @@ test "inspect and for_each call their function once for each element pulled" {
   let ask = |_: Int| match feed.next() { _ -> () };
   assert_eq(count_pulls(9, || to_list(take(inspect(of_list([5, 6, 7]), ask), 2), 2)), {
     value: [5, 6],
-    asked: 2,
+    requested: 2,
   });
-  assert_eq(count_pulls(9, || for_each(of_list([5, 6, 7]), 3, ask)), { value: (), asked: 3 })
+  assert_eq(count_pulls(9, || for_each(of_list([5, 6, 7]), 3, ask)), { value: (), requested: 3 })
 }
 
-test "a sequence over an effect shows it in its type and is handled where it is consumed" {
+test "a `Seq` over an effect carries the effect in its type, and the effect is handled where the `Seq` is consumed" {
   let evens: Seq<Int | {feed.next}> = filter(feed_values(), |x: Int| x % 2 == 0);
   let texts: Seq<String | {feed.next}> = map(evens, |x: Int| x.to_string());
-  assert_eq(count_pulls(9, || to_list(take(texts, 3), 8)), { value: ["0", "2", "4"], asked: 5 })
+  assert_eq(count_pulls(9, || to_list(take(texts, 3), 8)), { value: ["0", "2", "4"], requested: 5 })
 }
 
 test "a consumer runs as a loop however long the sequence is" {
   assert_eq(length(map(range(0, 50000), |x: Int| x + 1), 50000), 50000);
   assert_eq(
-    fold(filter(range(0, 50000), |x: Int| x % 2 == 0), 50000, 0, |acc: Int, x: Int| acc + x),
+    fold(filter(range(0, 50000), |x: Int| x % 2 == 0), 50000, 0, |accumulator: Int, x: Int|
+      accumulator + x),
     624975000,
   )
 }
 
-/// Every choice of `k` elements of `xs`, built by deciding whether the first element is among them.
 fn chosen(xs: List<Int>, k: Int) -> List<List<Int>> =
   if k == 0 { [[]] } else {
     match xs {
@@ -1138,7 +1120,6 @@ fn chosen(xs: List<Int>, k: Int) -> List<List<Int>> =
     }
   }
 
-/// Every arrangement of `k` elements of `xs`, built by deciding which element comes first.
 fn rows(xs: List<Int>, k: Int) -> List<List<Int>> =
   if k <= 0 { if k == 0 { [[]] } else { [] } } else {
     list::enumerate(xs).flat_map(|head: { index: Int, value: Int }|
@@ -1146,25 +1127,20 @@ fn rows(xs: List<Int>, k: Int) -> List<List<Int>> =
         list::prepend(head.value, others)))
   }
 
-/// The elements of `xs` with a skip before each one, as an adapter's source may produce them.
 fn with_skips(xs: List<Int>) -> Seq<Int | {}> = flat_map(of_list(xs), |x: Int| once(x))
 
-/// A list and a small number, which a test draws together.
 type Cut = { xs: List<Int>, n: Int }
 
-/// Two lists, which a test draws together.
 type Two = { xs: List<Int>, ys: List<Int> }
 
-/// A `Cut` as a test draws one.
 fn cuts() -> gen::Gen<Cut> =
   gen::map2(gen::list(gen::any_int()), gen::any_int(), |xs: List<Int>, n: Int| { xs: xs, n: n })
 
-/// A `Two` as a test draws one.
 fn twos() -> gen::Gen<Two> =
   gen::map2(gen::list(gen::any_int()), gen::list(gen::any_int()), |xs: List<Int>, ys: List<Int>|
     { xs: xs, ys: ys })
 
-test "a list comes back from the sequence made of it" {
+test "`to_list` of `of_list(xs)` returns the original list `xs`" {
   gen::check(gen::list(gen::any_int()), |x: List<Int>|
     agrees(|xs: List<Int>| to_list(of_list(xs), xs.len()), |xs: List<Int>| xs, x))
 }

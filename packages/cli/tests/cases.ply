@@ -13,7 +13,7 @@ import compiler.front.emitter_input (Analysed, Rejected, TestRunScope, checked_p
 import compiler.front.facts (CheckedProgram, test_label_spans)
 import compiler.front (analyse_pulling_std_with)
 import compiler.unit (codes, shipped)
-import compiler.store.hash.forms (ItemKeyed, Subject, reached_by_tests, reached_functions)
+import compiler.store.hash.forms (ItemKeyed, Subject, reachable_by_tests, reachable_functions)
 import compiler.check.infer.checker (TestInfo, Location)
 import compiler.emit.keys (RootKey, Named, TestCases, Clause, RootName, root_name)
 import compiler.check.resolve.tables (Diagnostic, Label, Source, qualify)
@@ -79,12 +79,16 @@ fn has_no_warnings(result: CommandOutput) -> Bool =
 pub type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
 fn root_modules(analysis: CheckedProgram) -> Map<String, Bool> =
-  range(0, analysis.frame.outlines.len()).fold(Map::new(), |acc: Map<String, Bool>, i: Int|
-    match ((analysis.frame.outlines.at(i), analysis.frame.module_packages.at(i))) {
-      (Some(o), Some(pkg)) -> if pkg == 0 { acc.insert(String::of_bytes_lossy(o.name), true) }
-      else { acc },
-      _ -> acc,
-    })
+  range(0, analysis.frame.outlines.len()).fold(
+    Map::new(),
+    |accumulator: Map<String, Bool>, i: Int|
+      match ((analysis.frame.outlines.at(i), analysis.frame.module_packages.at(i))) {
+        (Some(o), Some(pkg)) -> if pkg == 0 {
+          accumulator.insert(String::of_bytes_lossy(o.name), true)
+        } else { accumulator },
+        _ -> accumulator,
+      },
+  )
 
 pub fn scope_of(
   analysis: CheckedProgram,
@@ -111,12 +115,12 @@ pub fn scope_of(
       });
   range(0, analysis.checked.tests.len()).fold(
     { visible: [], out: [], filtered_out: 0 },
-    |acc: Scope, i: Int|
+    |accumulator: Scope, i: Int|
       match test_at(analysis, i) {
-        None -> acc,
-        Some(t) -> if !in_scope(t) { { ..acc, out: acc.out.push(i) } }
-        else if matches(t) { { ..acc, visible: acc.visible.push(i) } }
-        else { { ..acc, filtered_out: acc.filtered_out + 1 } },
+        None -> accumulator,
+        Some(t) -> if !in_scope(t) { { ..accumulator, out: accumulator.out.push(i) } }
+        else if matches(t) { { ..accumulator, visible: accumulator.visible.push(i) } }
+        else { { ..accumulator, filtered_out: accumulator.filtered_out + 1 } },
       },
   )
 }
@@ -148,28 +152,28 @@ type ListingScope = { front: LoadedAnalysis, reach: Map<Bytes, Bool> }
 pub fn list_cases(
   testing: TestRun,
   lister: Option<ListingScope>,
-  asked: List<Int>,
+  test_indices: List<Int>,
 ) -> Result<Map<Int, Result<List<ListedCase>, ListingFailure>>, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
   match lister {
     None -> Ok(Map::new()),
     Some(l) -> {
-      let handed = l.front;
-      let tables = asked.fold(Map::new(), |acc: Map<RootName, Bool>, i: Int|
-        match test_root_at(handed.dump, i) {
-          Some(r) -> acc.insert(root_name(TestCases(r)), true),
-          None -> acc,
+      let front = l.front;
+      let tables = test_indices.fold(Map::new(), |accumulator: Map<RootName, Bool>, i: Int|
+        match test_root_at(front.dump, i) {
+          Some(r) -> accumulator.insert(root_name(TestCases(r)), true),
+          None -> accumulator,
         });
-      match emit.unit(handed, reachable_roots(handed, tables, l.reach), None) {
+      match emit.unit(front, reachable_roots(front, tables, l.reach), None) {
         Err(diagnostics) -> Err(diagnostics),
         Ok(e) -> match units::library(e.sources, testing.options.machine.profile) {
           Err(diagnostics) -> Err(diagnostics),
-          Ok(library) -> match tester::unit_of(testing, handed, Some(library), false) {
+          Ok(library) -> match tester::unit_of(testing, front, Some(library), false) {
             Err(diagnostics) -> Err(diagnostics),
             Ok(unit) -> {
-              let cases = asked.fold(
+              let cases = test_indices.fold(
                 Map::new(),
-                |acc: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int|
-                  acc.insert(i, tester::cases(unit, i)),
+                |accumulator: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int|
+                  accumulator.insert(i, tester::cases(unit, i)),
               );
               tester::close_unit(unit);
               Ok(cases)
@@ -184,36 +188,42 @@ pub fn scope_for_listing(
   analysis: CheckedProgram,
   listing: List<Int>,
 ) -> TestRunScope / {abort.raise} = {
-  let keys = listing.fold([], |acc: List<Bytes>, i: Int|
-    match test_at(analysis, i) { Some(t) -> acc.push(t.key), None -> acc });
+  let keys = listing.fold([], |accumulator: List<Bytes>, i: Int|
+    match test_at(analysis, i) { Some(t) -> accumulator.push(t.key), None -> accumulator });
   {
-    owners: reached_by_tests(analysis.frame.hashes, keys),
+    owners: reachable_by_tests(analysis.frame.hashes, keys),
     tests: Map::of_entries(keys.map(|k: Bytes| { key: k, value: true })),
   }
 }
 
 pub fn run_within(over: ExpandedTests, running: List<Int>) -> TestRunScope / {abort.raise} =
   {
-    owners: reached_by(over.analysis, running),
-    tests: running.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Int|
-      match over.entries.at(k) { Some(entry) -> acc.insert(entry.key, true), None -> acc }),
+    owners: reachable_from(over.analysis, running),
+    tests: running.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: Int|
+      match over.entries.at(k) {
+        Some(entry) -> accumulator.insert(entry.key, true),
+        None -> accumulator,
+      }),
   }
 
-fn reached_by(analysis: CheckedProgram, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
-  reached_functions(
+fn reachable_from(analysis: CheckedProgram, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
+  reachable_functions(
     analysis.frame.hashes,
-    tests.fold([], |acc: List<Subject>, i: Int|
-      match test_at(analysis, i) { Some(t) -> acc.push(ItemKeyed(t.key)), None -> acc }),
+    tests.fold([], |accumulator: List<Subject>, i: Int|
+      match test_at(analysis, i) {
+        Some(t) -> accumulator.push(ItemKeyed(t.key)),
+        None -> accumulator,
+      }),
   )
 
 fn reachable_roots(
   front: LoadedAnalysis,
   own: Map<RootName, Bool>,
-  reached: Map<Bytes, Bool>,
+  reachable_functions: Map<Bytes, Bool>,
 ) -> List<RootKey> / {abort.raise} =
   every_root(front).filter(|r: RootKey|
     own.contains(root_name(r))
-      || (match root_owner(r) { Named(d) -> reached.contains(d), _ -> false }))
+      || (match root_owner(r) { Named(d) -> reachable_functions.contains(d), _ -> false }))
 
 fn root_owner(root: RootKey) -> RootKey = match root { Clause(c) -> c.definition, _ -> root }
 
@@ -221,27 +231,31 @@ pub fn run_unit(
   front: LoadedAnalysis,
   over: ExpandedTests,
   tests: List<Int>,
-  reached: Map<Bytes, Bool>,
+  reachable_functions: Map<Bytes, Bool>,
   schema: Bool,
 ) -> Result<Option<Emitted>, List<Diagnostic>> / {emit.unit, abort.raise} =
   if schema {
     match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diagnostics) -> Err(diagnostics) }
   } else if tests.len() == 0 { Ok(None) } else {
-    let own = tests.fold(Map::new(), |acc: Map<RootName, Bool>, k: Int|
+    let own = tests.fold(Map::new(), |accumulator: Map<RootName, Bool>, k: Int|
       match over.entries.at(k) {
         Some(entry) -> match test_root_at(front.dump, entry.test) {
-          Some(r) -> acc.insert(root_name(r), true).insert(root_name(TestCases(r)), true),
-          None -> acc,
+          Some(r) -> accumulator.insert(root_name(r), true).insert(root_name(TestCases(r)), true),
+          None -> accumulator,
         },
-        None -> acc,
+        None -> accumulator,
       });
-    match emit.unit(front, reachable_roots(front, own, reached), None) {
+    match emit.unit(front, reachable_roots(front, own, reachable_functions), None) {
       Ok(e) -> Ok(Some(e)),
       Err(diagnostics) -> Err(diagnostics),
     }
   }
 
-pub type ExpandedTests = { analysis: CheckedProgram, judged: CheckedProgram, entries: List<Entry> }
+pub type ExpandedTests = {
+  analysis: CheckedProgram,
+  run_analysis: CheckedProgram,
+  entries: List<Entry>,
+}
 
 type ExpansionState = {
   tests: List<TestInfo>,
@@ -254,21 +268,24 @@ type ExpansionState = {
 fn add_starts(
   starts: Map<Bytes, List<Int>>,
   key: Bytes,
-  reached: Option<List<Int>>,
+  new_starts: Option<List<Int>>,
 ) -> Map<Bytes, List<Int>> =
-  match reached {
+  match new_starts {
     None -> starts,
     Some(vs) ->
       starts.insert(
         key,
-        List::concat(match starts.get(key) { Some(held) -> held, None -> [] }, vs),
+        List::concat(match starts.get(key) { Some(existing) -> existing, None -> [] }, vs),
       ),
   }
 
 type Claim = { test: Int, case: Option<Int> }
 
 fn claimed(claims: Map<Bytes, List<Claim>>, key: Bytes, by: Claim) -> Map<Bytes, List<Claim>> =
-  claims.insert(key, List::push(match claims.get(key) { Some(held) -> held, None -> [] }, by))
+  claims.insert(
+    key,
+    List::push(match claims.get(key) { Some(existing) -> existing, None -> [] }, by),
+  )
 
 fn distinct_labels(
   tests: List<TestInfo>,
@@ -276,25 +293,28 @@ fn distinct_labels(
   listings: Map<Int, Result<List<ListedCase>, ListingFailure>>,
 ) -> Map<Int, Result<List<ListedCase>, ListingFailure>> = {
   let case_key = |t: TestInfo, c: ListedCase| qualify(t.module, Bytes::of_string(c.label));
-  let claims = range(0, tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Claim>>, i: Int|
-    match tests.at(i) {
-      None -> acc,
-      Some(t) -> {
-        let named = claimed(acc, t.key, { test: i, case: None });
-        match listings.get(i) {
-          Some(Ok(listing)) ->
-            range(0, listing.len()).fold(named, |a: Map<Bytes, List<Claim>>, k: Int|
-              match listing.at(k) {
-                Some(c) -> claimed(a, case_key(t, c), { test: i, case: Some(k) }),
-                None -> a,
-              }),
-          _ -> named,
-        }
+  let claims = range(0, tests.len()).fold(
+    Map::new(),
+    |accumulator: Map<Bytes, List<Claim>>, i: Int|
+      match tests.at(i) {
+        None -> accumulator,
+        Some(t) -> {
+          let named = claimed(accumulator, t.key, { test: i, case: None });
+          match listings.get(i) {
+            Some(Ok(listing)) ->
+              range(0, listing.len()).fold(named, |a: Map<Bytes, List<Claim>>, k: Int|
+                match listing.at(k) {
+                  Some(c) -> claimed(a, case_key(t, c), { test: i, case: Some(k) }),
+                  None -> a,
+                }),
+            _ -> named,
+          }
+        },
       },
-    });
+  );
   listings.fold(
     listings,
-    |acc: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int, list_cases: Result<List<ListedCase>, ListingFailure>|
+    |accumulator: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int, list_cases: Result<List<ListedCase>, ListingFailure>|
       match ((list_cases, tests.at(i))) {
         (Ok(listing), Some(t)) -> {
           let first = range(0, listing.len()).fold(None, |found: Option<ListingFailure>, k: Int|
@@ -306,9 +326,9 @@ fn distinct_labels(
                 }),
               _ -> found,
             });
-          match first { Some(reason) -> acc.insert(i, Err(reason)), None -> acc }
+          match first { Some(reason) -> accumulator.insert(i, Err(reason)), None -> accumulator }
         },
-        _ -> acc,
+        _ -> accumulator,
       },
   )
 }
@@ -407,7 +427,7 @@ pub fn expand_cases(
   let cases = distinct_labels(tests, test_label_spans(analysis.frame.outlines), listings);
   let plain = range(0, tests.len()).map(|i: Int|
     entry_of(i, match tests.at(i) { Some(t) -> t.key, None -> b"" }));
-  if cases.len() == 0 { { analysis: analysis, judged: analysis, entries: plain } } else {
+  if cases.len() == 0 { { analysis: analysis, run_analysis: analysis, entries: plain } } else {
     let walked = range(0, tests.len()).fold(
       {
         tests: [],
@@ -416,13 +436,13 @@ pub fn expand_cases(
         starts: analysis.frame.hashes.refs.items,
         runs: analysis.frame.hashes.refs.items,
       },
-      |acc: ExpansionState, i: Int|
+      |accumulator: ExpansionState, i: Int|
         match ((tests.at(i), plain.at(i))) {
           (Some(t), Some(whole)) -> {
             let hash = analysis.frame.hashes.tests.get(t.key);
             match cases.get(i) {
               Some(Ok(listing)) ->
-                range(0, listing.len()).fold(acc, |a: ExpansionState, k: Int|
+                range(0, listing.len()).fold(accumulator, |a: ExpansionState, k: Int|
                   match listing.at(k) {
                     None -> a,
                     Some(c) -> {
@@ -453,20 +473,23 @@ pub fn expand_cases(
                   }),
               other ->
                 {
-                  ..acc,
-                  tests: acc.tests.push({ ..t, index: acc.tests.len() }),
-                  hashes: match hash { Some(h) -> acc.hashes.insert(t.key, h), None -> acc.hashes },
-                  entries: acc.entries.push(match other {
+                  ..accumulator,
+                  tests: accumulator.tests.push({ ..t, index: accumulator.tests.len() }),
+                  hashes: match hash {
+                    Some(h) -> accumulator.hashes.insert(t.key, h),
+                    None -> accumulator.hashes,
+                  },
+                  entries: accumulator.entries.push(match other {
                     Some(Err(reason)) -> { ..whole, unlisted: Some(reason) },
                     _ -> whole,
                   }),
                 },
             }
           },
-          _ -> acc,
+          _ -> accumulator,
         },
     );
-    let reaching = |starts: Map<Bytes, List<Int>>|
+    let with_starts = |starts: Map<Bytes, List<Int>>|
       {
         frame: {
           ..analysis.frame,
@@ -478,7 +501,11 @@ pub fn expand_cases(
         },
         checked: { ..analysis.checked, tests: walked.tests },
       };
-    { analysis: reaching(walked.starts), judged: reaching(walked.runs), entries: walked.entries }
+    {
+      analysis: with_starts(walked.starts),
+      run_analysis: with_starts(walked.runs),
+      entries: walked.entries,
+    }
   }
 }
 
@@ -490,13 +517,16 @@ pub fn codes_of(
   let ran = codes(emitted.contents);
   let code_of = |k: Int|
     match test_root_at(front.dump, k) { Some(r) -> ran.get(root_name(r)), None -> None };
-  range(0, entries.len()).fold(Map::new(), |acc: Map<Int, Bytes>, i: Int|
+  range(0, entries.len()).fold(Map::new(), |accumulator: Map<Int, Bytes>, i: Int|
     match entries.at(i) {
-      None -> acc,
+      None -> accumulator,
       Some(entry) -> match code_of(entry.test) {
-        None -> acc,
+        None -> accumulator,
         Some(code) ->
-          acc.insert(i, match entry.case { Some(c) -> case_hash(code, c.identity), None -> code }),
+          accumulator.insert(i, match entry.case {
+            Some(c) -> case_hash(code, c.identity),
+            None -> code,
+          }),
       },
     })
 }
@@ -508,26 +538,26 @@ pub fn passed_by_code(
   options: Options,
   supplied: machine::RunConfiguration,
 ) -> Map<Int, Bytes> / {result_cache.code_passes, entering::machine.changed_read, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let asked = code_keys_to_query(decisions, keyed);
-  let results = if asked.len() == 0 { [] }
-  else { result_cache.code_passes(asked.map(|a: { index: Int, key: Bytes }| a.key)) };
+  let queries = code_keys_to_query(decisions, keyed);
+  let results = if queries.len() == 0 { [] }
+  else { result_cache.code_passes(queries.map(|a: { index: Int, key: Bytes }| a.key)) };
   let now = views::shipped_state_of(views::views_in(traces_of(results)), |m: Bytes|
     views::read_shipped_text(loaded, m));
-  range(0, asked.len()).fold(Map::new(), |acc: Map<Int, Bytes>, i: Int|
+  range(0, queries.len()).fold(Map::new(), |accumulator: Map<Int, Bytes>, i: Int|
     match results.at(i) {
       Some(Some(trace)) -> if pass_status(now, Some(trace), options, supplied) == Some(Passing) {
-        acc.insert(asked.at_or(i, { index: 0 - 1, key: b"" }).index, trace)
-      } else { acc },
-      _ -> acc,
+        accumulator.insert(queries.at_or(i, { index: 0 - 1, key: b"" }).index, trace)
+      } else { accumulator },
+      _ -> accumulator,
     })
 }
 
 fn program_binding_report(program: Program) -> BindingReport / {abort.raise} = {
   let hosted = tester::binding_report_of(program.unit.testing, program.unit);
-  let reached = set_of(hosted.host_test_indices);
+  let host_tests = set_of(hosted.host_test_indices);
   {
     ..hosted,
-    host_test_indices: program.cases.filter(|case: Case| reached.contains(case.entry.test)).map(
+    host_test_indices: program.cases.filter(|case: Case| host_tests.contains(case.entry.test)).map(
       |case: Case| case.index,
     ),
   }
@@ -540,22 +570,22 @@ pub fn concluded_run(
   program: Program,
   timed: TimedLoad,
   analysis: CheckedProgram,
-  judged: CheckedProgram,
+  run_analysis: CheckedProgram,
   scope: Scope,
   decisions: List<Decision>,
   decided: RunDecision,
   keyed: Map<Int, Bytes>,
-  keeps: { written_passes: List<Pass>, kept: Option<CacheTarget> },
+  cache_plan: { written_passes: List<Pass>, retained: Option<CacheTarget> },
   searching: plan::Plan,
   configured: List<Diagnostic>,
   spent: TimeSpent,
 ) -> CommandOutput / {process.out[proc], time.elapsed_us, entering::machine.enter, entering::machine.report, entering::machine.unbind, result_cache.open_warnings, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing, shipped.read_pack, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise} = {
-  let refiled = keeps.written_passes;
-  let kept = keeps.kept;
-  let after = match kept { Some(k) -> k.after, None -> false };
+  let refiled = cache_plan.written_passes;
+  let cache_target = cache_plan.retained;
+  let after = match cache_target { Some(k) -> k.after, None -> false };
   let shown = !after;
   let width = name_column(program, decided);
-  let asked = {
+  let search_options = {
     plan: searching,
     measuring: options.sim.measure_reduction,
     lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
@@ -568,7 +598,10 @@ pub fn concluded_run(
   if shown { printed(opening) };
   let started = time.elapsed_us();
   let done = decided.classes.flat_map(|group: Group| {
-    let ran = run_class(group.tests.map(|i: Int| job_of(program, i, narrowing, searching)), asked);
+    let ran = run_class(
+      group.tests.map(|i: Int| job_of(program, i, narrowing, searching)),
+      search_options,
+    );
     if shown {
       printed(
         detailed_result_lines(
@@ -582,10 +615,10 @@ pub fn concluded_run(
     ran
   });
   let elapsed = time.elapsed_us() - started;
-  let h = hashes_of(judged, results::snapshot_digest_of(timed.program.modules));
+  let h = hashes_of(run_analysis, results::snapshot_digest_of(timed.program.modules));
   let running = set_of(decided.runs);
-  let by_test = done.fold(Map::new(), |acc: Map<Int, JobResult>, d: JobResult|
-    acc.insert(d.test, d));
+  let by_test = done.fold(Map::new(), |accumulator: Map<Int, JobResult>, d: JobResult|
+    accumulator.insert(d.test, d));
   let c: Conclusion<RuntimeDiagnostic> = conclude::conclude_run(
     conclude_tests(analysis, program),
     h,
@@ -593,19 +626,19 @@ pub fn concluded_run(
       groups: decided.classes.map(|group: Group| group.tests),
       recorded: pass_keys_by_test(decisions, decided.search).fold(
         Map::new(),
-        |acc: Map<Int, List<Bytes>>, e: { index: Int, keys: List<Bytes> }|
-          if running.contains(e.index) { acc.insert(e.index, e.keys) } else { acc },
+        |accumulator: Map<Int, List<Bytes>>, e: { index: Int, keys: List<Bytes> }|
+          if running.contains(e.index) { accumulator.insert(e.index, e.keys) } else { accumulator },
       ),
-      codes: keyed.fold(Map::new(), |acc: Map<Int, List<Bytes>>, i: Int, k: Bytes|
-        if running.contains(i) { acc.insert(i, [k]) } else { acc }),
-      reasons: decisions.fold(Map::new(), |acc: Map<Int, Reason>, d: Decision|
-        acc.insert(d.case.index, d.reason)),
+      codes: keyed.fold(Map::new(), |accumulator: Map<Int, List<Bytes>>, i: Int, k: Bytes|
+        if running.contains(i) { accumulator.insert(i, [k]) } else { accumulator }),
+      reasons: decisions.fold(Map::new(), |accumulator: Map<Int, Reason>, d: Decision|
+        accumulator.insert(d.case.index, d.reason)),
       out_of_scope: scope.out,
     },
     if flags.no_cache { Map::new() } else { seen_of(h) },
     done.map(conclusion_of),
   );
-  let said = if flags.no_cache { [] } else {
+  let cache_warnings = if flags.no_cache { [] } else {
     store_history(
       analysis,
       sources_of(timed.program, analysis.frame),
@@ -621,12 +654,12 @@ pub fn concluded_run(
       "the run itself is valid; every test will simply be re-run next time",
     )
   };
-  let stored = if after { [] } else { said };
+  let stored = if after { [] } else { cache_warnings };
   let r = {
     ..run_report_of(options, program, analysis, h, decided, hosted, c, by_test, elapsed, configured.concat(stored)),
     handshakes: tester::unbind(program.unit.testing),
   };
-  let found = diagnosed_all(flags.no_cache, timed, judged, c, r.failures);
+  let found = diagnosed_all(flags.no_cache, timed, run_analysis, c, r.failures);
   let lazily = if flags.no_cache || after { [] } else { result_cache.open_warnings() };
   let concluding = time.elapsed_us() - started - elapsed;
   let result = test_output(
@@ -642,7 +675,7 @@ pub fn concluded_run(
     found.diffs,
     decided,
   );
-  match kept {
+  match cache_target {
     Some(k) -> if decided.runs.len() == 0 && result.code == ok_code() && has_no_warnings(result)
         && all_cached(decisions, scope) {
       let _ = cache_command(
@@ -711,7 +744,7 @@ pub fn sim_json(p: plan::Plan, sim: machine::SimulationOptions) -> Json / {abort
     { key: "steps", value: int(p.steps) },
   ])
 
-test "the search a seeded test is keyed on is the plan the flags name, and the document says it" {
+test "`sim_plan_of` turns the search flags into a search, and the JSON report shows the seed, mode and root seeds" {
   let p = machine::sim_plan_of({
     ..machine::no_sim_options(),
     mode: "random",
@@ -725,26 +758,26 @@ test "the search a seeded test is keyed on is the plan the flags name, and the d
   assert(doc.contains("\"roots\":[16]"))
 }
 
-test "a run takes in its root's tests, the library's own tree's among them, and no pulled module's" {
+test "a run selects the tests of the module it was started on, even a library's, but not those of modules it imports" {
   let library = {
     name: b"std.y",
-    src: b"pub fn one() -> Int = 1\ntest \"library\" { assert_eq(one(), 1) }\n",
+    source_text: b"pub fn one() -> Int = 1\ntest \"library\" { assert_eq(one(), 1) }\n",
   };
   let compiler = {
     name: b"compiler.x",
-    src: b"pub fn one() -> Int = 1\ntest \"compiler\" { assert_eq(one(), 1) }\n",
+    source_text: b"pub fn one() -> Int = 1\ntest \"compiler\" { assert_eq(one(), 1) }\n",
   };
   let keys = |user: List<Source>, shipped: List<Source>| {
-    let w = match analyse_pulling_std_with(user, shipped, no_rows(), reached: false).out {
+    let w = match analyse_pulling_std_with(user, shipped, no_rows(), cut_unused: false).out {
       Analysed(w) -> checked_program_of(w),
-      Rejected(_) -> panic("the fixture checks"),
+      Rejected(_) -> panic("the fixture program was rejected by the checker"),
     };
     scope_of(w, [], None, None).visible.map(|i: Int|
       match test_at(w, i) { Some(t) -> t.key, None -> b"" })
   };
   let program = {
     name: b"m",
-    src: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
+    source_text: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
   };
   assert_eq(keys([program], [library, compiler]), [b"m.own"]);
   assert_eq(keys([library], [library, compiler]), [b"std.y.library"])

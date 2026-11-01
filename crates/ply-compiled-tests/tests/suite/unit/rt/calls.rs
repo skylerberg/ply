@@ -1,8 +1,3 @@
-//! Reads of a pure nullary definition, as emitted code writes one: the first evaluates the
-//! definition and keeps its value for good through the type's keep root, and each later read
-//! returns that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
-//! roots here are written as emitted code writes them, over blocks laid out as it lays one.
-
 use crate::bare::{context_of, helper};
 use ply_compiled::emitted::KeepRoot;
 use ply_compiled::heap::{HEADER, IMMORTAL, Word};
@@ -15,7 +10,6 @@ type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type Memo = unsafe extern "C" fn(*mut Ctx, Word, KeepRoot) -> Word;
 type Definition = unsafe extern "C" fn(*mut Ctx, *const Word) -> Word;
 
-/// A value of `m.Box`: a block of one word, the number it holds.
 const BOX: Word = HEADER as Word + 8;
 
 fn boxed(ctx: *mut Ctx, n: Word) -> Word {
@@ -32,21 +26,18 @@ fn count(w: Word) -> u32 {
     unsafe { *(w as *const u32) }
 }
 
-/// Lets go of a box the caller holds the last count of; a kept one is immortal, and nothing frees it.
 fn let_go(ctx: *mut Ctx, w: Word) {
     if count(w) != IMMORTAL {
         unsafe { helper::<Free>("rt_free")(ctx, w, BOX) };
     }
 }
 
-/// `keep#m.Box`: the box copied onto the unit's persistent heap.
 unsafe extern "C" fn keep_box(ctx: *mut Ctx, w: Word) -> Word {
     let kept = unsafe { helper::<Alloc>("rt_alloc_kept")(ctx, BOX) };
     unsafe { *(kept as *mut Word).byte_add(HEADER) = held(w) };
     kept
 }
 
-/// The keep root of a type whose values may not outlive their entry.
 unsafe extern "C" fn keeps_nothing(_ctx: *mut Ctx, _w: Word) -> Word {
     0
 }
@@ -55,7 +46,6 @@ fn read(ctx: *mut Ctx, keep: KeepRoot) -> Word {
     unsafe { helper::<Memo>("rt_memo")(ctx, 0, keep) }
 }
 
-/// A context over a unit of the one definition `f`.
 fn defining(f: Definition) -> Ctx {
     let mut ctx = context_of(&[], vec![f as usize]);
     ctx.begin();
@@ -102,7 +92,7 @@ unsafe extern "C" fn seven(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_value_its_keep_root_rejects_is_cached_nowhere_and_each_read_evaluates_it() {
+fn a_constant_whose_cache_check_rejects_its_value_is_not_cached_and_is_recomputed_on_each_read() {
     let mut ctx = defining(seven);
     let c: *mut Ctx = &mut ctx;
     let first = read(c, keeps_nothing);
@@ -118,7 +108,6 @@ fn a_value_its_keep_root_rejects_is_cached_nowhere_and_each_read_evaluates_it() 
 
 static NINES: AtomicUsize = AtomicUsize::new(0);
 
-/// Fails the first time it is evaluated, and returns a box of 9 after.
 unsafe extern "C" fn nine_after_a_failure(ctx: *mut Ctx, _args: *const Word) -> Word {
     if NINES.fetch_add(1, Ordering::SeqCst) == 0 {
         unsafe { (*ctx).failed = 1 };
@@ -145,7 +134,7 @@ fn an_evaluation_that_fails_returns_0_caches_nothing_and_the_next_read_evaluates
 }
 
 #[test]
-fn a_definition_outside_the_code_table_fails_the_context() {
+fn reading_a_definition_index_outside_the_code_table_fails_with_a_diagnostic() {
     let mut ctx = defining(seven);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(unsafe { helper::<Memo>("rt_memo")(c, 3, keep_box) }, 0);
@@ -154,12 +143,10 @@ fn a_definition_outside_the_code_table_fails_the_context() {
     ctx.end();
 }
 
-/// A unit's tables, shared with threads as a `parallel` block's branches share them.
 struct Shared(Arc<Tables>);
 unsafe impl Send for Shared {}
 
 impl Shared {
-    /// A context over the tables, on the thread that takes them.
     fn context(self) -> Ctx {
         Ctx::new(self.0)
     }
@@ -208,7 +195,7 @@ type Entered = unsafe extern "C" fn(*mut Ctx) -> Word;
 type Left = unsafe extern "C" fn(*mut Ctx, Word);
 
 #[test]
-fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
+fn the_scheduler_blocks_stay_separate_from_the_program_blocks_at_any_nesting_depth() {
     let mut ctx = context_of(&[], Vec::new());
     ctx.begin();
     let c: *mut Ctx = &mut ctx;
@@ -262,7 +249,6 @@ fn a_constant_is_evaluated_once_and_every_later_read_returns_the_copy() {
     ctx.end();
 }
 
-/// A failure compiled code wrote, left pending as a raise of `abort.raise`.
 unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
     let raised: unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word) = helper("rt_failed");
     let texts = [b"E0502".as_slice(), b"it failed", b"here"];
@@ -275,7 +261,7 @@ unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
+fn an_effect_raised_inside_a_constant_fails_the_run_with_an_error_that_no_handler_can_catch() {
     let mut ctx = defining(failing);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(read_const(c), 0);

@@ -1,5 +1,5 @@
 import compiler.syntax.parsing (Span)
-import compiler.syntax.items (Item, FunctionItem, FnDefinition, Deriver, EqDeriver, OrdDeriver,
+import compiler.syntax.items (Item, FunctionItem, FnDefinition, Deriver, EqDeriver, OrderingDeriver,
                               ShowDeriver, HashDeriver, NumericDeriver, IntegerDeriver,
                               is_predicate, deriver_text, deriver_tag, InstanceItem, InstanceKind,
                               KeyInstance, ShowInstance)
@@ -9,13 +9,14 @@ import compiler.check.types (Type, VariableType, NamedType, RecordType, Function
 import compiler.check.resolve.tables (Diagnostic, Label, qualify, default_binder, error_at,
                                       label_at)
 import compiler.check.typed (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
-import compiler.check.infer.derivability (DeriveRejection, HoldsFunction, HoldsHandle, HoldsFloat,
-                                          Unconstrained, HoldsSecret, HoldsNative, rejection_note,
-                                          secret_reason, float_reason)
+import compiler.check.infer.derivability (DeriveRejection, ContainsFunction, ContainsHandle,
+                                          ContainsFloat, Unconstrained, ContainsSecret,
+                                          ContainsNative, rejection_note, secret_reason,
+                                          float_reason)
 import std.bytes
 import std.option
 import std.string
-import compiler.check.infer.checker (RecordDeclaration, OpInfo, EffectInfo, InstanceInfo,
+import compiler.check.infer.checker (RecordDeclaration, OperationInfo, EffectInfo, InstanceInfo,
                                      Assumption, RigidParam, MapKeySite, ConstraintSite,
                                      DefinitionConstraint, AliasConstraint, insert_constraint,
                                      Checker, report, report_error_at, report_error_with_labels,
@@ -24,7 +25,7 @@ import compiler.check.infer.checker (RecordDeclaration, OpInfo, EffectInfo, Inst
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (assume, written_signature, OrderedPart, note_parts,
                                           note_type_constraint)
-import compiler.check.infer.expression (op_free_variables, numeric_of, ordered_parts,
+import compiler.check.infer.expression (operation_free_variables, numeric_of, ordered_parts,
                                         note_type_constraints_in)
 import compiler.check.known (name_of, is_integer_name, is_float, is_decimal)
 import compiler.check.infer.definitions (algebraic_shapes, is_key)
@@ -44,13 +45,14 @@ pub fn native_notes(blocker: Bytes, deriver: Deriver) -> List<Bytes> =
   ]
 
 pub fn secret_rejection_notes(deriver: Deriver) -> List<Bytes> =
-  match rejection_note(HoldsSecret, deriver) {
+  match rejection_note(ContainsSecret, deriver) {
     Some(n) -> [secret_reason(deriver), n],
     None -> [secret_reason(deriver)],
   }
 
 fn param_name(params: List<RigidParam>, v: Int, fallback: Bytes) -> Bytes =
-  params.fold(fallback, |acc: Bytes, p: RigidParam| if p.var == v { p.name } else { acc })
+  params.fold(fallback, |accumulator: Bytes, p: RigidParam|
+    if p.var == v { p.name } else { accumulator })
 
 fn reason_notes_for_map_key(
   w: DeriveRejection,
@@ -59,13 +61,13 @@ fn reason_notes_for_map_key(
   params: List<RigidParam>,
 ) -> List<Bytes> =
   match w {
-    HoldsFloat ->
+    ContainsFloat ->
       [
-        b"`Float` has no total order: `NaN` is not equal to itself, so a key would have no position the next lookup could find it at",
-        b"use `Decimal` for exact numbers, or key on something else",
+        b"`Float` has no total order: `NaN` is not equal to itself, so the `Map` could not reliably find a key it stored",
+        b"use `Decimal` for exact numbers, or use a different key type",
       ],
-    HoldsFunction -> [b"a function has no order to sort keys by"],
-    HoldsHandle ->
+    ContainsFunction -> [b"a function has no order to sort keys by"],
+    ContainsHandle ->
       [
         Bytes::concat_all([
           b"a `",
@@ -73,8 +75,8 @@ fn reason_notes_for_map_key(
           b"` names a location rather than a value, so two of them have no order",
         ]),
       ],
-    HoldsSecret -> secret_rejection_notes(OrdDeriver),
-    HoldsNative -> native_notes(blocker, OrdDeriver),
+    ContainsSecret -> secret_rejection_notes(OrderingDeriver),
+    ContainsNative -> native_notes(blocker, OrderingDeriver),
     Unconstrained(v) ->
       [
         Bytes::concat_all([
@@ -93,7 +95,7 @@ fn reason_notes_for_constraint(
   params: List<RigidParam>,
 ) -> List<Bytes> =
   match w {
-    HoldsFunction ->
+    ContainsFunction ->
       [
         Bytes::concat_all([
           b"`",
@@ -102,7 +104,7 @@ fn reason_notes_for_constraint(
           deriver_description(deriver),
         ]),
       ],
-    HoldsHandle ->
+    ContainsHandle ->
       [
         Bytes::concat_all([
           b"a `",
@@ -110,9 +112,9 @@ fn reason_notes_for_constraint(
           b"` names a location rather than a value, so it has no encoding",
         ]),
       ],
-    HoldsFloat -> [float_reason(deriver), b"use `Decimal` for exact numbers"],
-    HoldsSecret -> secret_rejection_notes(deriver),
-    HoldsNative -> native_notes(blocker, deriver),
+    ContainsFloat -> [float_reason(deriver), b"use `Decimal` for exact numbers"],
+    ContainsSecret -> secret_rejection_notes(deriver),
+    ContainsNative -> native_notes(blocker, deriver),
     Unconstrained(v) ->
       [
         Bytes::concat_all([
@@ -127,9 +129,9 @@ fn reason_notes_for_constraint(
 
 fn comparison_shapes(checker: Checker) -> Shapes / {abort.raise} =
   if checker.keyed_names.len() == 0 { algebraic_shapes(checker) } else {
-    range(0, checker.modules.len()).fold(algebraic_shapes(checker), |acc: Shapes, i: Int| {
+    range(0, checker.modules.len()).fold(algebraic_shapes(checker), |accumulator: Shapes, i: Int| {
       let m = checker.modules.get(i);
-      m.module.items.fold(acc, |shapes: Shapes, item: Item|
+      m.module.items.fold(accumulator, |shapes: Shapes, item: Item|
         match item {
           InstanceItem(definition) -> if !is_key(definition.kind) { shapes } else {
             let type_name = qualify(m.name, definition.target.name);
@@ -152,12 +154,12 @@ fn comparison_shapes(checker: Checker) -> Shapes / {abort.raise} =
                     match s.sig.params.at(0) {
                       None -> None,
                       Some(p) -> match own_params(p, type_name) {
-                        Some(own) -> if variables_of_type(s.sig.ret).all(|v: Int|
+                        Some(own) -> if variables_of_type(s.sig.return_type).all(|v: Int|
                             own.params.contains(v)) {
                           Some({
                             params: own.params,
                             effect_params: own.effect_params,
-                            result: s.sig.ret,
+                            result: s.sig.return_type,
                           })
                         } else { None },
                         None -> None,
@@ -187,38 +189,48 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
   let ordering = comparison_shapes(checker);
   let sums = algebraic_shapes(checker).fold(
     [],
-    |acc: List<TypeContents>, name: Bytes, s: AlgebraicShape|
-      acc.push({ name: name, params: s.params, fields: s.fields }),
+    |accumulator: List<TypeContents>, name: Bytes, s: AlgebraicShape|
+      accumulator.push({ name: name, params: s.params, fields: s.fields }),
   );
-  let held = checker.nominals.fold(
+  let type_contents = checker.nominals.fold(
     sums,
-    |acc: List<TypeContents>, name: Bytes, r: RecordDeclaration|
+    |accumulator: List<TypeContents>, name: Bytes, r: RecordDeclaration|
       match r.ty {
         NominalType(n) ->
-          acc.push({ name: name, params: r.type_variables, fields: n.fields.map(|f: Field| f.ty) }),
-        _ -> acc,
+          accumulator.push({
+            name: name,
+            params: r.type_variables,
+            fields: n.fields.map(|f: Field| f.ty),
+          }),
+        _ -> accumulator,
       },
   );
-  let carrying = ordered_params_of(held.filter(|h: TypeContents| h.params.len() > 0), ordering);
-  let stated = declared_type_constraints(held, checker.stated, checker.alias_constraints);
-  let declared: Checker = held.fold({ ..checker, stated: stated }, |c: Checker, h: TypeContents|
-    match c.types.get(h.name) {
-      None -> c,
-      Some(declaration) -> {
-        let noted = h.fields.fold({ ..c, module: declaration.owner }, |cc: Checker, f: Type|
-          note_type_constraints_in(cc, declaration.span, f));
-        let hinted = c.alias_constraints.fold(noted, |cc: Checker, hint: AliasConstraint|
-          if hint.type_name != h.name { cc } else {
-            note_type_constraint(cc, declaration.span, hint.deriver, hint.ty, hint.from, true)
-          });
-        { ..hinted, module: c.module }
+  let carrying = ordered_params_of(
+    type_contents.filter(|h: TypeContents| h.params.len() > 0),
+    ordering,
+  );
+  let stated = declared_type_constraints(type_contents, checker.stated, checker.alias_constraints);
+  let declared: Checker = type_contents.fold(
+    { ..checker, stated: stated },
+    |c: Checker, h: TypeContents|
+      match c.types.get(h.name) {
+        None -> c,
+        Some(declaration) -> {
+          let noted = h.fields.fold({ ..c, module: declaration.owner }, |cc: Checker, f: Type|
+            note_type_constraints_in(cc, declaration.span, f));
+          let hinted = c.alias_constraints.fold(noted, |cc: Checker, hint: AliasConstraint|
+            if hint.type_name != h.name { cc } else {
+              note_type_constraint(cc, declaration.span, hint.deriver, hint.ty, hint.from, true)
+            });
+          { ..hinted, module: c.module }
+        },
       },
-    });
+  );
   let carried_in = |types: List<Type>|
     types.fold([], |ps: List<OrderedPart>, t: Type| ordered_parts(carrying, t, ps)).filter(
       |p: OrderedPart| match p.container { Some(_) -> true, None -> false },
     );
-  let typed = held.fold(
+  let typed = type_contents.fold(
     { ..declared, type_shapes: ordering, ordered_parameters: carrying, aliases: Map::new() },
     |c: Checker, h: TypeContents|
       match c.types.get(h.name) {
@@ -228,13 +240,13 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
       },
   );
   typed.effects.fold(typed, |c: Checker, e: EffectInfo|
-    e.operations.fold(c, |cc: Checker, op: OpInfo|
+    e.operations.fold(c, |cc: Checker, operation: OperationInfo|
       note_parts_at(
         cc,
-        op.at.module,
-        op.at.span,
-        op_free_variables(op),
-        carried_in(op.params.push(op.ret)),
+        operation.at.module,
+        operation.at.span,
+        operation_free_variables(operation),
+        carried_in(operation.params.push(operation.return_type)),
       )))
 }
 
@@ -250,7 +262,7 @@ fn note_parts_at(
       {
         ..checker,
         module: module,
-        assumed: params.fold([], |xs: List<Assumption>, v: Int| assume(xs, OrdDeriver, v)),
+        assumed: params.fold([], |xs: List<Assumption>, v: Int| assume(xs, OrderingDeriver, v)),
       },
       span,
       parts,
@@ -279,43 +291,44 @@ fn variable_constraints(
     match table.get(name) {
       None -> out,
       Some(cs) ->
-        cs.fold(out, |acc: List<VariableConstraint>, dc: DefinitionConstraint|
+        cs.fold(out, |accumulator: List<VariableConstraint>, dc: DefinitionConstraint|
           match args.at(dc.param) {
-            None -> acc,
+            None -> accumulator,
             Some(a) ->
-              variables_of_type(a).fold(acc, |b: List<VariableConstraint>, v: Int|
+              variables_of_type(a).fold(accumulator, |b: List<VariableConstraint>, v: Int|
                 push_constraint(b, dc.deriver, v)),
           }),
     };
-  let within = |types: List<Type>, acc: List<VariableConstraint>|
-    types.fold(acc, |a: List<VariableConstraint>, ty: Type| variable_constraints(table, ty, a));
+  let within = |types: List<Type>, accumulator: List<VariableConstraint>|
+    types.fold(accumulator, |a: List<VariableConstraint>, ty: Type|
+      variable_constraints(table, ty, a));
   match t {
     NamedType(c) -> within(c.args, carried(c.name, c.args)),
     NominalType(n) -> within(n.args, carried(n.name, n.args)),
     RecordType(fs) -> within(fs.map(|f: Field| f.ty), out),
-    FunctionType(f) -> within(f.params.push(f.ret), out),
+    FunctionType(f) -> within(f.params.push(f.return_type), out),
     VariableType(_) -> out,
   }
 }
 
 fn declared_type_constraints(
-  held: List<TypeContents>,
+  type_contents: List<TypeContents>,
   seeds: Map<Bytes, List<DefinitionConstraint>>,
   hints: List<AliasConstraint>,
 ) -> Map<Bytes, List<DefinitionConstraint>> / {abort.raise} = {
-  let room = held.fold(2, |n: Int, h: TypeContents| n + h.params.len());
+  let room = type_contents.fold(2, |n: Int, h: TypeContents| n + h.params.len());
   iterate(seeds, room, |table: Map<Bytes, List<DefinitionConstraint>>| {
-    let next = held.fold(
+    let next = type_contents.fold(
       { table: table, grew: false },
-      |acc: { table: Map<Bytes, List<DefinitionConstraint>>, grew: Bool }, h: TypeContents| {
+      |accumulator: { table: Map<Bytes, List<DefinitionConstraint>>, grew: Bool }, h: TypeContents| {
         let needed = h.fields.fold([], |vs: List<VariableConstraint>, f: Type|
-          variable_constraints(acc.table, f, vs));
+          variable_constraints(accumulator.table, f, vs));
         let all = hints.fold(needed, |vs: List<VariableConstraint>, hint: AliasConstraint|
           if hint.type_name != h.name { vs } else {
             variables_of_type(hint.ty).fold(vs, |b: List<VariableConstraint>, v: Int|
               push_constraint(b, hint.deriver, v))
           });
-        let had = match acc.table.get(h.name) { Some(xs) -> xs, None -> [] };
+        let had = match accumulator.table.get(h.name) { Some(xs) -> xs, None -> [] };
         let added = all.fold(had, |cs: List<DefinitionConstraint>, x: VariableConstraint|
           match h.params.find_index(|p: Int| p == x.var) {
             None -> cs,
@@ -323,8 +336,8 @@ fn declared_type_constraints(
               cs
             } else { insert_constraint(cs, { deriver: x.deriver, param: i }) },
           });
-        if added.len() == had.len() { acc }
-        else { { table: acc.table.insert(h.name, added), grew: true } }
+        if added.len() == had.len() { accumulator }
+        else { { table: accumulator.table.insert(h.name, added), grew: true } }
       },
     );
     if next.grew { Continue(next.table) } else { Stop(next.table) }
@@ -332,52 +345,57 @@ fn declared_type_constraints(
 }
 
 fn ordered_params_of(
-  held: List<TypeContents>,
+  type_contents: List<TypeContents>,
   ordering: Shapes,
 ) -> Map<Bytes, List<Int>> / {abort.raise} = {
-  let room = held.fold(2, |n: Int, h: TypeContents| n + h.params.len());
+  let room = type_contents.fold(2, |n: Int, h: TypeContents| n + h.params.len());
   iterate(Map::new(), room, |table: Map<Bytes, List<Int>>| {
-    let next = held.fold(
+    let next = type_contents.fold(
       { table: table, grew: false },
-      |acc: { table: Map<Bytes, List<Int>>, grew: Bool }, h: TypeContents| {
+      |accumulator: { table: Map<Bytes, List<Int>>, grew: Bool }, h: TypeContents| {
         let needed = h.fields.fold([], |vs: List<Int>, f: Type|
-          ordered_parts(acc.table, f, []).fold(vs, |ws: List<Int>, p: OrderedPart|
+          ordered_parts(accumulator.table, f, []).fold(vs, |ws: List<Int>, p: OrderedPart|
             ints_union(ws, order_needs(p.key, ordering))));
         let ps = positions_among(h.params, needed);
-        let had = match acc.table.get(h.name) { Some(xs) -> xs, None -> [] };
-        if ps.len() == had.len() { acc }
-        else { { table: acc.table.insert(h.name, ps), grew: true } }
+        let had = match accumulator.table.get(h.name) { Some(xs) -> xs, None -> [] };
+        if ps.len() == had.len() { accumulator }
+        else { { table: accumulator.table.insert(h.name, ps), grew: true } }
       },
     );
     if next.grew { Continue(next.table) } else { Stop(next.table) }
   })
 }
 
-fn positions_among(vars: List<Int>, keyed: List<Int>) -> List<Int> =
-  range(0, vars.len()).filter(|i: Int|
-    match vars.at(i) { Some(v) -> keyed.contains(v), None -> false })
+fn positions_among(variables: List<Int>, keyed: List<Int>) -> List<Int> =
+  range(0, variables.len()).filter(|i: Int|
+    match variables.at(i) { Some(v) -> keyed.contains(v), None -> false })
 
 pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
-  let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), OrdDeriver);
+  let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), OrderingDeriver);
   let walked = checker.map_keys.fold(
     { checker: { ..checker, map_keys: [] }, seen: [] },
-    |acc: { checker: Checker, seen: List<SeenKey> }, site: MapKeySite| {
-      let key = resolve(acc.checker, site.key);
-      match derivable(OrdDeriver, key, ordered, with_flexible(acc.checker, key, site.assumed)) {
-        None -> acc,
+    |accumulator: { checker: Checker, seen: List<SeenKey> }, site: MapKeySite| {
+      let key = resolve(accumulator.checker, site.key);
+      match derivable(
+          OrderingDeriver,
+          key,
+          ordered,
+          with_flexible(accumulator.checker, key, site.assumed),
+        ) {
+        None -> accumulator,
         Some(blocked) -> {
-          let pr = print_type(printer_new(), resolve(acc.checker, site.whole));
-          let rendered = pr.text;
-          let blocker = print_type(pr.printer, blocked.ty).text;
+          let printed = print_type(printer_new(), resolve(accumulator.checker, site.whole));
+          let rendered = printed.text;
+          let blocker = print_type(printed.printer, blocked.ty).text;
           let carried = match site.carrier { Some(_) -> true, None -> false };
-          let dup = acc.seen.fold(false, |b: Bool, s: SeenKey|
+          let dup = accumulator.seen.fold(false, |b: Bool, s: SeenKey|
             b
               || (s.scope == site.scope
               && (s.text == rendered || (s.blocker == blocker && (s.has_carrier || carried)))));
-          if dup { acc } else {
+          if dup { accumulator } else {
             {
               checker: report(
-                acc.checker,
+                accumulator.checker,
                 error_at(
                   b"E0206",
                   site.module,
@@ -392,7 +410,7 @@ pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
                     Some(t) ->
                       Bytes::concat_all([
                         b"`",
-                        type_text(resolve(acc.checker, t)),
+                        type_text(resolve(accumulator.checker, t)),
                         b"` keys a `Map` by `",
                         rendered,
                         b"`",
@@ -405,12 +423,12 @@ pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
                     None -> [],
                     Some(_) ->
                       [
-                        b"a type that keys a `Map` by a parameter needs it ordered wherever the type is written or built",
+                        b"a type that uses a parameter as a `Map` key requires that parameter to support ordering: add an `ordered` constraint to the parameter everywhere the type is written or constructed",
                       ],
                   }),
                 ),
               ),
-              seen: acc.seen.push({
+              seen: accumulator.seen.push({
                 scope: site.scope,
                 text: rendered,
                 blocker: blocker,
@@ -430,7 +448,11 @@ type SeenKey = { scope: Int, text: Bytes, blocker: Bytes, has_carrier: Bool }
 fn with_alias_note(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
   if via == b"" { notes } else {
     notes.push(
-      Bytes::concat_all([b"`", via, b"` is a type alias, and the `Map` is in what it names"]),
+      Bytes::concat_all([
+        b"`",
+        via,
+        b"` is a type alias, and the `Map` key is in the type it stands for",
+      ]),
     )
   }
 
@@ -442,25 +464,25 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   let shapes = deriver_shapes(checker.instances, adts);
   let walked = checker.constrained_uses.fold(
     { checker: { ..checker, constrained_uses: [] }, seen: [] },
-    |acc: { checker: Checker, seen: List<{ module: Int, span: Span, text: Bytes, tag: Int }> }, site: ConstraintSite| {
-      let ty = resolve(acc.checker, site.ty);
+    |accumulator: { checker: Checker, seen: List<{ module: Int, span: Span, text: Bytes, tag: Int }> }, site: ConstraintSite| {
+      let ty = resolve(accumulator.checker, site.ty);
       if is_predicate(site.deriver) {
-        { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
+        { checker: check_predicate(accumulator.checker, site, ty), seen: accumulator.seen }
       } else {
         let through = shapes_for(shapes, site.deriver);
-        let assumed = with_flexible(acc.checker, ty, site.assumed);
+        let assumed = with_flexible(accumulator.checker, ty, site.assumed);
         match derivable(
             site.deriver,
             ty,
             if is_case_constraint(site) { adts } else { through },
             assumed,
           ) {
-          None -> acc,
+          None -> accumulator,
           Some(blocked) -> {
-            let pr = print_type(printer_new(), ty);
-            let rendered = pr.text;
+            let printed = print_type(printer_new(), ty);
+            let rendered = printed.text;
             let tag = deriver_tag(site.deriver);
-            let dup = acc.seen.fold(
+            let dup = accumulator.seen.fold(
               false,
               |b: Bool, s: { module: Int, span: Span, text: Bytes, tag: Int }|
                 b
@@ -469,13 +491,13 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                   && s.text == rendered
                   && s.tag == tag),
             );
-            if dup { acc } else {
-              let blocker = print_type(pr.printer, blocked.ty).text;
+            if dup { accumulator } else {
+              let blocker = print_type(printed.printer, blocked.ty).text;
               let callee = default_binder(site.callee);
               let dv = deriver_text(site.deriver);
               {
                 checker: report_error_with_labels(
-                  acc.checker,
+                  accumulator.checker,
                   b"E0206",
                   Bytes::concat_all([b"`", rendered, b"` cannot be derived for `", dv, b"`"]),
                   [
@@ -502,7 +524,7 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                           None -> b"` declares the constraint on its signature",
                           Some(written) -> if written {
                             b"` states the constraint on its declaration"
-                          } else { b"` carries the constraint from what it holds" },
+                          } else { b"` gets the constraint from the types it contains" },
                         },
                       ]),
                     ),
@@ -517,12 +539,12 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                     if is_case_constraint(site)
                         && derivable(site.deriver, ty, through, assumed) == None {
                       [
-                        b"a case is told from another by what it holds, so a `key` does not stand in for the type that states it",
+                        b"cases are distinguished by their payload types, so a `key` constraint on another type does not replace the constraint on the type that declares the case",
                       ]
                     } else { [] },
                   ),
                 ),
-                seen: acc.seen.push({
+                seen: accumulator.seen.push({
                   module: site.module,
                   span: site.span,
                   text: rendered,
@@ -556,7 +578,7 @@ fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<Nume
     } else if deriver == NumericDeriver {
       match numeric_of(checker.numeric_types, k.name) {
         Some(x) -> match instance_of(checker.instances, k.name, KeyInstance) {
-          Some(_) -> Some(StatedWitness(x.ctor)),
+          Some(_) -> Some(StatedWitness(x.constructor)),
           None -> None,
         },
         None -> None,
@@ -568,8 +590,8 @@ fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<Nume
 fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
   match ty {
     VariableType(v) -> if !site.assumed.contains(v) { None } else {
-      match site.params.fold(None, |acc: Option<Bytes>, r: RigidParam|
-          if r.var == v { Some(r.name) } else { acc }) {
+      match site.params.fold(None, |accumulator: Option<Bytes>, r: RigidParam|
+          if r.var == v { Some(r.name) } else { accumulator }) {
         Some(name) -> Some(ParamWitness(name)),
         None -> None,
       }
@@ -625,7 +647,11 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
             { ..checker, module: site.module },
             b"E0210",
             site.span,
-            Bytes::concat_all([b"the numeric type `", callee, b"` is called at is not determined"]),
+            Bytes::concat_all([
+              b"the numeric type that `",
+              callee,
+              b"` is called with is not determined",
+            ]),
             b"nothing here says which numeric type this is",
             [b"annotate an argument, or write a literal that pins it (`1`, `1.0`, `1m`)"],
           )
@@ -679,37 +705,38 @@ pub fn instance_of(
   type_name: Bytes,
   kind: InstanceKind,
 ) -> Option<InstanceInfo> =
-  instances.fold(None, |acc: Option<InstanceInfo>, x: InstanceInfo|
-    match acc {
-      Some(_) -> acc,
+  instances.fold(None, |accumulator: Option<InstanceInfo>, x: InstanceInfo|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> if x.type_name == type_name && x.kind == kind { Some(x) } else { None },
     })
 
 fn compares_through_key(deriver: Deriver) -> Bool =
-  deriver == EqDeriver || deriver == OrdDeriver || deriver == HashDeriver
+  deriver == EqDeriver || deriver == OrderingDeriver || deriver == HashDeriver
 
 fn instances_by_type(
   instances: List<InstanceInfo>,
   kind: InstanceKind,
 ) -> Map<Bytes, InstanceInfo> =
-  instances.fold(Map::new(), |acc: Map<Bytes, InstanceInfo>, x: InstanceInfo|
-    if x.kind != kind || acc.contains(x.type_name) { acc } else { acc.insert(x.type_name, x) })
+  instances.fold(Map::new(), |accumulator: Map<Bytes, InstanceInfo>, x: InstanceInfo|
+    if x.kind != kind || accumulator.contains(x.type_name) { accumulator }
+    else { accumulator.insert(x.type_name, x) })
 
 pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
   if instances.len() == 0 { adts } else {
     let keyed = compares_through_key(deriver);
     if !keyed && !(deriver == ShowDeriver) { adts } else {
       let stated = instances_by_type(instances, if keyed { KeyInstance } else { ShowInstance });
-      adts.fold(adts, |acc: Shapes, name: Bytes, shape: AlgebraicShape|
+      adts.fold(adts, |accumulator: Shapes, name: Bytes, shape: AlgebraicShape|
         match stated.get(name) {
           Some(x) ->
-            acc.insert(name, {
+            accumulator.insert(name, {
               ..shape,
               params: x.params,
               effect_params: x.effect_params,
               fields: if keyed { [x.results] } else { [] },
             }),
-          None -> acc,
+          None -> accumulator,
         })
     }
   }
@@ -733,25 +760,28 @@ pub type OwnParams = { params: List<Int>, effect_params: List<Int> }
 pub fn own_params(ty: Type, type_name: Bytes) -> Option<OwnParams> =
   match ty {
     NamedType(c) -> if c.name != type_name { None } else {
-      c.args.fold(Some({ params: [], effect_params: [] }), |acc: Option<OwnParams>, a: Type|
-        match acc {
-          None -> None,
-          Some(own) -> match arg_effects(a) {
-            Some(found) -> match found.variable {
-              Some(v) -> if found.listed.len() > 0 || own.effect_params.contains(v) { None }
-              else { Some({ ..own, effect_params: own.effect_params.push(v) }) },
-              None -> None,
-            },
-            None -> match arg_label(a) {
-              Some(_) -> None,
-              None -> match a {
-                VariableType(v) -> if own.params.contains(v) { None }
-                else { Some({ ..own, params: own.params.push(v) }) },
-                _ -> None,
+      c.args.fold(
+        Some({ params: [], effect_params: [] }),
+        |accumulator: Option<OwnParams>, a: Type|
+          match accumulator {
+            None -> None,
+            Some(own) -> match arg_effects(a) {
+              Some(found) -> match found.variable {
+                Some(v) -> if found.listed.len() > 0 || own.effect_params.contains(v) { None }
+                else { Some({ ..own, effect_params: own.effect_params.push(v) }) },
+                None -> None,
+              },
+              None -> match arg_label(a) {
+                Some(_) -> None,
+                None -> match a {
+                  VariableType(v) -> if own.params.contains(v) { None }
+                  else { Some({ ..own, params: own.params.push(v) }) },
+                  _ -> None,
+                },
               },
             },
           },
-        })
+      )
     },
     _ -> None,
   }

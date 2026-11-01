@@ -1,15 +1,8 @@
-//! Units written by hand: C bodies over a head this harness writes from the runtime's own
-//! description and helper table, beside the table a unit says about itself, compiled by the host's
-//! C compiler into a library the runtime opens. What the emitter writes is the compiler's to test;
-//! these test what the runtime does with a unit.
-
 use ply_compiled::c::exports::HelperShape;
 use ply_compiled::c::{Exports, builtin_helper_name, described, helpers};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
-/// A definition the unit takes: its name, how many words it takes, and its body's C, which reads
-/// them as `p0`, `p1`, ... and the context as `ctx`.
 pub struct Def {
     pub name: &'static str,
     pub arity: usize,
@@ -24,17 +17,14 @@ pub fn def(name: &'static str, arity: usize, body: &str) -> Def {
     }
 }
 
-/// The C pointer a unit calls the native the compiler declares as `name` through.
 pub fn native(name: &str) -> String {
     pointer(&builtin_helper_name(name))
 }
 
-/// The C pointer a unit calls `helper` through.
 fn pointer(helper: &str) -> String {
     format!("{helper}_p")
 }
 
-/// The fact `name` of the runtime's description.
 fn fact(name: &str) -> usize {
     let line = format!("fact {name} ");
     (described().lines())
@@ -43,8 +33,6 @@ fn fact(name: &str) -> usize {
         .unwrap_or_else(|| panic!("the runtime describes no `{name}`"))
 }
 
-/// What a unit here opens with: words and immediates, the context's fields its bodies read, each
-/// where the runtime's description lays it, and each helper's pointer declared.
 fn head() -> String {
     let mut out = String::from(
         "#include <stdint.h>\ntypedef int64_t Word;\n\
@@ -80,7 +68,6 @@ fn head() -> String {
     out
 }
 
-/// The helper pointers defined, and the `ply_bind` that fills them in the runtime's order.
 fn bound() -> String {
     let mut out = String::new();
     for h in helpers() {
@@ -97,7 +84,6 @@ fn bound() -> String {
     out
 }
 
-/// A helper's C return type and parameters: the context, then `args` words.
 fn signature(args: usize, results: bool) -> (&'static str, String) {
     let params = std::iter::once("PlyCtx*").chain(std::iter::repeat_n("Word", args));
     (
@@ -106,8 +92,6 @@ fn signature(args: usize, results: bool) -> (&'static str, String) {
     )
 }
 
-/// The C that opens an `R#entered`: the arguments' list read, `read` reading each, and the
-/// lifting ended, returning where the context failed.
 pub fn lifting(read: &str) -> String {
     format!(
         "  {}(ctx, {});\n{read}\n  {}(ctx);\n  if (ctx->failed) return 0;\n",
@@ -117,7 +101,6 @@ pub fn lifting(read: &str) -> String {
     )
 }
 
-/// The C of an `R#entered` that reads an `Int`, calls `root` on it and writes the `Int` it returns.
 pub fn int_entry(root: &str) -> String {
     format!(
         "{}  Word r = {}(ctx, ply_imm(n));\n  if (ctx->failed) return 0;\n  {}(ctx, ply_imm_value(r));\n  return 0;",
@@ -127,28 +110,20 @@ pub fn int_entry(root: &str) -> String {
     )
 }
 
-/// The C function `name`'s body is written as.
 pub fn symbol(name: &str) -> String {
     format!("ply_t_{}", name.replace(['.', '#'], "_"))
 }
 
-/// One definition a unit holds: its Ply name, how many words it takes, and the C symbol of the
-/// entry the runtime calls it through.
 pub struct Taken {
     pub name: String,
     pub arity: usize,
     pub entry: String,
 }
 
-/// A unit as a test writes one: what it says about itself, which it stands in for, and what its C
-/// lays out for the loader by address.
 pub struct Laid {
     says: Exports,
-    /// The code table's rows, each by the C symbol of its function.
     pub lambdas: Vec<String>,
     pub taken: Vec<Taken>,
-    /// The definitions the seam memoizes, each of which takes the row of the code table its entry
-    /// is at.
     pub constants: Vec<String>,
 }
 
@@ -166,8 +141,6 @@ impl DerefMut for Laid {
     }
 }
 
-/// A unit of `defs`: it says every helper this runtime has, and lays out each definition under
-/// its own symbol.
 pub fn exports_of(defs: &[Def]) -> Laid {
     Laid {
         says: Exports {
@@ -196,9 +169,6 @@ pub fn exports_of(defs: &[Def]) -> Laid {
     }
 }
 
-/// The unit's C: its head, each definition and the entry the runtime calls it through, the helper
-/// pointers bound, and what the unit lays out for its loader: the table `exports` says, and the
-/// code table `exports.lambdas` names and the definitions `exports.taken` names, each by address.
 pub fn text(defs: &[Def], exports: &Laid) -> String {
     let mut out = head();
     for d in defs {
@@ -271,8 +241,6 @@ pub fn text(defs: &[Def], exports: &Laid) -> String {
     out
 }
 
-/// `text` compiled into a library under `dir`, as the toolchain compiles a unit; `None` where the
-/// host has no C compiler.
 pub fn library(dir: &Path, text: &str) -> Option<PathBuf> {
     let c = dir.join("unit.c");
     let lib = dir.join("unit.so");
@@ -294,7 +262,6 @@ pub fn library(dir: &Path, text: &str) -> Option<PathBuf> {
     Some(lib)
 }
 
-/// `defs` compiled and opened, its table as `exports_of` makes it and then as `adjust` leaves it.
 pub fn opened(
     dir: &Path,
     defs: &[Def],
@@ -303,10 +270,9 @@ pub fn opened(
     let mut exports = exports_of(defs);
     adjust(&mut exports);
     let lib = library(dir, &text(defs, &exports))?;
-    Some(ply_compiled::c::load_opened(&lib).map_err(|e| format!("{e:#}")))
+    Some(ply_compiled::c::load_from_path(&lib).map_err(|e| format!("{e:#}")))
 }
 
-/// One entry of `native`'s `name`: what it returned as a word, or what it raised.
 pub fn entered(
     native: &ply_compiled::c::Native,
     name: &str,

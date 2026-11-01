@@ -1,11 +1,5 @@
-//! What the runtime does with values emitted code hands it beside their types: a perform's
-//! arguments, a raise's payload, a label and a bracket's closures, each counted, crossed and let go
-//! through the descriptors emitted code lays out. The blocks here are laid out
-//! as emitted code lays one: a count at offset 0, freed by size.
-
 use crate::bare::{context, context_of, helper};
 
-/// A context over a unit whose field table holds `fields`, which name effects and operations.
 fn naming(fields: &[&str]) -> Ctx {
     context_of(fields, Vec::new())
 }
@@ -13,14 +7,13 @@ use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
-use ply_compiled::rt::{BRIDGE, Ctx, FAILED_TARGET};
+use ply_compiled::rt::{Ctx, FAILED_UNWOUND_TO_HANDLER, NO_HANDLER_OBJECT};
 use ply_core::{Effect, Mode, Resource};
 use std::cell::Cell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 
-/// A value of `m.Box`: a block of one word, the number it holds.
 const BOX: Word = HEADER as Word + 8;
 
 fn boxed(ctx: &mut Ctx, n: Word) -> Word {
@@ -70,7 +63,6 @@ static BOX_T: PlyType = PlyType {
     lift: nothing,
 };
 
-/// A `String` whose word is the address of a Rust string's bytes, which it lowers as.
 unsafe extern "C" fn text_lower(ctx: *mut Ctx, w: Word) -> Word {
     let out: unsafe extern "C" fn(*mut Ctx, Word, Word) = helper(&builtin_helper_name("?out_str"));
     let s: &&str = unsafe { &*(w as *const &str) };
@@ -94,7 +86,6 @@ unsafe impl Sync for Params {}
 static BOXES: Params = Params([&raw const BOX_T]);
 static TEXTS: Params = Params([&raw const TEXT_T]);
 
-/// An operation of the unit's fields 0 and 1, of one parameter of the types `params` holds.
 fn op(params: &'static Params) -> PlyOp {
     PlyOp {
         effect: 0,
@@ -108,15 +99,14 @@ fn op(params: &'static Params) -> PlyOp {
     }
 }
 
-/// A perform through the bridge, as emitted code performs where nothing between handles it.
 fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
-    let entry = BRIDGE.slot.entry;
+    let entry = NO_HANDLER_OBJECT.slot.entry;
     let result = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
     unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
 
 #[test]
-fn an_unhandled_raise_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
+fn an_effect_with_no_handler_fails_the_run_with_its_value_in_the_error_and_frees_that_value() {
     let mut ctx = naming(&["m", "boom"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
@@ -134,20 +124,18 @@ fn an_unhandled_raise_shows_its_payload_lowered_through_its_type_and_lets_it_go(
     ctx.end();
 }
 
-type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
+type TakeRaisedPayload = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 
 #[test]
-fn an_unhandled_raise_waits_for_the_code_whose_clause_handles_its_operation() {
+fn a_raised_effect_is_caught_only_by_a_handler_for_the_same_operation() {
     let mut ctx = naming(&["m", "boom", "other"]);
     ctx.begin();
     let payload = boxed(&mut ctx, 42);
     performed(&mut ctx, &op(&BOXES), 2, &[payload]);
     assert_ne!(ctx.failed, 0, "the raise left the entry failed");
-    let at = helper::<PendingAt>("rt_pending_raised_at");
-    // A clause of another operation does not take it.
+    let at = helper::<TakeRaisedPayload>("rt_pending_raised_at");
     assert_eq!(unsafe { at(&mut ctx, 0, 2) }, 0);
     assert_ne!(ctx.failed, 0);
-    // The clause of its own takes what it carries, the entry no longer failed.
     let words = unsafe { at(&mut ctx, 0, 1) } as *const Word;
     assert!(!words.is_null());
     assert_eq!(ctx.failed, 0);
@@ -158,7 +146,7 @@ fn an_unhandled_raise_waits_for_the_code_whose_clause_handles_its_operation() {
 }
 
 #[test]
-fn an_unhandled_panic_says_its_message_lowered_through_its_type() {
+fn an_unhandled_panic_fails_the_entry_with_its_message_text() {
     let mut ctx = naming(&["abort", "raise"]);
     ctx.begin();
     let message: &str = "it broke";
@@ -168,10 +156,8 @@ fn an_unhandled_panic_says_its_message_lowered_through_its_type() {
     ctx.end();
 }
 
-/// A host operation's arguments cross as their types lower them, and are let go through those
-/// types whatever the host makes of them: here, nothing handles them.
 #[test]
-fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go() {
+fn performing_an_operation_with_no_handler_fails_naming_it_and_frees_its_arguments() {
     let mut ctx = naming(&["m", "ask"]);
     ctx.begin();
     let arg = boxed(&mut ctx, 7);
@@ -195,7 +181,6 @@ thread_local! {
     static CLEANED: Cell<Word> = const { Cell::new(0) };
 }
 
-/// A closure block as emitted code lays one: a count, then the descriptor's address.
 const CLOSURE: Word = HEADER as Word + 8;
 
 unsafe extern "C" fn closure_release(ctx: *mut Ctx, block: Handed) -> Word {
@@ -204,7 +189,6 @@ unsafe extern "C" fn closure_release(ctx: *mut Ctx, block: Handed) -> Word {
     0
 }
 
-/// The closures here cross to no other thread and outlive no entry.
 unsafe extern "C" fn stays_in_its_entry(_ctx: *mut Ctx, _block: Word) -> Word {
     0
 }
@@ -229,13 +213,12 @@ unsafe extern "C" fn acquire(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Wor
     boxed(unsafe { &mut *ctx }, 5)
 }
 
-/// Takes what was acquired and lets it go; returns 7, or unwinds where it was acquired as 6.
 unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let held = unsafe { *args };
     let n = unsafe { *(held as *const Word).byte_add(HEADER) };
     unsafe { box_dec(ctx, held) };
     if n == 6 {
-        unsafe { (*ctx).failed = FAILED_TARGET };
+        unsafe { (*ctx).failed = FAILED_UNWOUND_TO_HANDLER };
         return 0;
     }
     7
@@ -268,7 +251,7 @@ fn bracket(ctx: &mut Ctx, acquire_desc: &'static PlyFnDesc) -> Word {
 }
 
 #[test]
-fn a_bracket_of_emitted_closures_cleans_up_what_it_acquired_and_lets_every_closure_go() {
+fn bracket_runs_its_cleanup_after_acquiring_and_frees_every_closure_the_compiler_generated() {
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
@@ -283,14 +266,13 @@ unsafe extern "C" fn acquire_six(ctx: *mut Ctx, _f: Word, _args: *const Word) ->
     boxed(unsafe { &mut *ctx }, 6)
 }
 
-/// A body a clause unwinds through is cleaned up after, and the unwind goes on.
 #[test]
-fn a_bracket_cleans_up_after_a_body_that_unwinds() {
+fn bracket_cleans_up_what_it_acquired_after_a_body_that_unwinds() {
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
     let result = bracket(&mut ctx, &ACQUIRE_SIX);
-    assert_eq!((result, ctx.failed), (0, FAILED_TARGET));
+    assert_eq!((result, ctx.failed), (0, FAILED_UNWOUND_TO_HANDLER));
     assert_eq!(CLEANED.with(Cell::get), 6);
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
@@ -298,11 +280,9 @@ fn a_bracket_cleans_up_after_a_body_that_unwinds() {
 }
 
 thread_local! {
-    static LIFTED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static RECEIVED_STRING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
-/// A `String` as emitted code lays one, which here is a box standing for the text, the text kept
-/// aside: what the runtime lifts a label through.
 unsafe extern "C" fn string_lift(ctx: *mut Ctx) -> Word {
     let text: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_str"));
     let taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word) =
@@ -310,7 +290,7 @@ unsafe extern "C" fn string_lift(ctx: *mut Ctx) -> Word {
     let n = unsafe { text(ctx) };
     let mut b = vec![0u8; n as usize];
     unsafe { taken(ctx, b.as_mut_ptr(), n) };
-    LIFTED.with(|l| *l.borrow_mut() = String::from_utf8(b).expect("UTF-8"));
+    RECEIVED_STRING.with(|l| *l.borrow_mut() = String::from_utf8(b).expect("UTF-8"));
     boxed(unsafe { &mut *ctx }, n)
 }
 
@@ -326,16 +306,14 @@ static STRING_T: PlyType = PlyType {
 
 type LabelString = unsafe extern "C" fn(*mut Ctx, Word, *const PlyType) -> Word;
 
-/// A clause written `[*t]` reads its label as emitted code lays a `String`, lifted through the type
-/// its site handed, never as a string the runtime made.
 #[test]
-fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
+fn the_operation_label_matched_by_a_handler_is_converted_to_a_string_and_then_freed() {
     let mut ctx = naming(&["m", "ask", "*", "files"]);
     ctx.begin();
-    LIFTED.with(|l| l.borrow_mut().clear());
+    RECEIVED_STRING.with(|l| l.borrow_mut().clear());
     let label = unsafe { helper::<LabelString>("rt_label_string")(&mut ctx, 3, &STRING_T) };
     super::marshalling::unfailed(&mut ctx);
-    assert_eq!(LIFTED.with(|l| l.borrow().clone()), "files");
+    assert_eq!(RECEIVED_STRING.with(|l| l.borrow().clone()), "files");
     unsafe { box_dec(&mut ctx, label) };
     assert_eq!(ctx.heap.live(), 0, "the label was not let go");
     ctx.end();

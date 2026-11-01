@@ -1,7 +1,3 @@
-//! The families this binary serves itself, as the runtime's natives bind them: a binding from what
-//! a run is granted alone, what families register and the facts a run's disclosures print, and the
-//! world a trace of the run's reads is read against.
-
 use crate::hosts::Hosts;
 use ply_compiled::entry::{Bound, Grants};
 use ply_compiled::flat::Writer;
@@ -13,7 +9,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Installs the binder and what the binary ships, once, before a program enters another.
 pub fn install() {
     ply_compiled::entry::install(Box::new(Binder));
     crate::shipped::install();
@@ -25,17 +20,11 @@ impl ply_compiled::entry::Binder for Binder {
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>> {
         let hosts = Hosts::granted(&grants)?;
         Ok(Arc::new(Borrowed {
-            world: Worldly::of(&grants),
+            world: GrantedContext::of(&grants),
             hosts,
         }))
     }
 
-    /// `hosting := list(failure) refusals, option(transport), list(named) roots, sink,
-    /// list(string) signals`; `transport := string library, string version, string provider,
-    /// list(string) versions, list(string) alpn, string roots, string roots_version, int trusted,
-    /// list(credential)`; `credential := string name, string fingerprint, int certificates`;
-    /// `named := string name, string path`; `sink := string sink, string destination,
-    /// option(string) level`.
     fn hosting(&self, grants: &Grants, w: &mut Writer) {
         let mut rejections = Vec::new();
         let credentials = credentials_of(grants)
@@ -55,7 +44,7 @@ impl ply_compiled::entry::Binder for Binder {
                 .list(tls::ALPN.iter(), |w, a| {
                     w.str(a);
                 })
-                .str(tls::ROOTS)
+                .str(tls::ROOT_CERTIFICATES_LIBRARY)
                 .str(tls::ROOTS_VERSION)
                 .count(c.trusted() as u64)
                 .list(
@@ -76,8 +65,8 @@ impl ply_compiled::entry::Binder for Binder {
         });
         let trace = crate::trace::TraceOptions::of_grants(grants);
         let opened = trace.open();
-        let sink = opened.sink_path();
-        w.str(sink).str(opened.sink_destination()).option(
+        let sink = opened.sink_module_path();
+        w.str(sink).str(opened.sink_destination_name()).option(
             (sink != ply_host::trace::DISCARD_PATH).then_some(trace.level_name()),
             |w, level| {
                 w.str(level);
@@ -90,7 +79,7 @@ impl ply_compiled::entry::Binder for Binder {
     }
 
     fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String> {
-        ply_host::observe::moved(trace, &Worldly::of(grants).world(), caller)
+        ply_host::observe::moved(trace, &GrantedContext::of(grants).world(), caller)
     }
 }
 
@@ -129,10 +118,9 @@ fn roots_of(grants: &Grants) -> Result<ply_host::fs::Roots, Diagnostic> {
     ply_host::fs::Roots::load(&specs, ply_core::Span::DUMMY)
 }
 
-/// A binding and the world its runs' traces are read against.
 struct Borrowed {
     hosts: Hosts,
-    world: Worldly,
+    world: GrantedContext,
 }
 
 impl Bound for Borrowed {
@@ -153,21 +141,19 @@ impl Bound for Borrowed {
     }
 
     fn unbind(&self) -> Vec<(String, Vec<u8>)> {
-        self.hosts.torn_down()
+        self.hosts.shutdown_reports()
     }
 }
 
-/// What a trace is read against: the roots a run is granted, what the run binds apart from the
-/// program, and the plain value of each configuration key it is given.
 #[derive(Clone)]
-struct Worldly {
+struct GrantedContext {
     roots: Vec<(String, PathBuf)>,
     binding: String,
     config: BTreeMap<String, String>,
 }
 
-impl Worldly {
-    fn of(grants: &Grants) -> Worldly {
+impl GrantedContext {
+    fn of(grants: &Grants) -> GrantedContext {
         let roots = roots_of(grants)
             .map(|roots| {
                 roots
@@ -182,7 +168,7 @@ impl Worldly {
                 _ => None,
             })
             .collect();
-        Worldly {
+        GrantedContext {
             roots,
             binding: binding_digest(grants),
             config,
@@ -202,8 +188,6 @@ impl Worldly {
     }
 }
 
-/// What a run binds apart from the program, which a pass's key covers: the roots, programs and
-/// families it is granted, by name.
 fn binding_digest(grants: &Grants) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in ["fs", "exec", "allow"] {

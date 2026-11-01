@@ -1,7 +1,3 @@
-//! A simulated search is a function of its seed and its program: not of the process, the worker
-//! count, the company a test keeps, a warm cache, or what ran on the thread before it. What a
-//! search decides is `packages/sim`'s; these hold real runs to it.
-
 import harness (spawned, PlyProcess)
 import support.harness (write_program, json_of, at, path, items, first, str, json_text)
 import std.json
@@ -9,8 +5,6 @@ import std.json (Json, Object, Array, Str)
 import std.string
 import std.list
 
-/// Failures, exhaustive searches and ordinary cached tests at once, so a difference in any of them
-/// shows.
 fn mixed_program() -> String =
   \\effect counter {
   \\  read  get[r]() -> Int
@@ -69,39 +63,36 @@ fn mixed_program() -> String =
   \\test "the arithmetic is not concurrent" { assert_eq(1 + 1, 2) }
   \\
 
-/// Everything a run is allowed to differ in, and nothing else: its clocks, its front end, its pool,
-/// and the units the C backend builds a worker each.
 fn scrub(value: Json) -> Json =
   match value {
     Object(fields) ->
       Object(
-        fields.fold(Map::new(), |acc: Map<String, Json>, k: String, v: Json|
+        fields.fold(Map::new(), |accumulator: Map<String, Json>, k: String, v: Json|
           if k.contains("duration") || k.ends_with("_ms") || k.ends_with("_nanos")
               || k == "front_end"
               || k == "phases"
               || k == "workers"
               || k == "units"
-              || k == "elapsed" { acc }
-          else { acc.insert(k, scrub(v)) }),
+              || k == "elapsed" { accumulator }
+          else { accumulator.insert(k, scrub(v)) }),
       ),
     Array(xs) -> Array(xs.map(scrub)),
     other -> other,
   }
 
-/// `value` without where anything stands in the text, which an edit that changes no hash may move.
 fn without_positions(value: Json) -> Json =
   match value {
     Object(fields) ->
       Object(
-        fields.fold(Map::new(), |acc: Map<String, Json>, k: String, v: Json|
-          if ["start", "end", "line", "end_line", "column", "end_column"].contains(k) { acc }
-          else { acc.insert(k, without_positions(v)) }),
+        fields.fold(Map::new(), |accumulator: Map<String, Json>, k: String, v: Json|
+          if ["start", "end", "line", "end_line", "column", "end_column"].contains(k) {
+            accumulator
+          } else { accumulator.insert(k, without_positions(v)) }),
       ),
     Array(xs) -> Array(xs.map(without_positions)),
     other -> other,
   }
 
-/// Where two artifacts first differ, as a path into them.
 fn difference(a: Json, b: Json, at_path: String) -> Option<String> / {abort.raise} =
   if a == b { None } else {
     let plainly = Some(at_path ++ ": " ++ json_text(a) ++ " against " ++ json_text(b));
@@ -144,13 +135,11 @@ fn difference(a: Json, b: Json, at_path: String) -> Option<String> / {abort.rais
     }
   }
 
-/// The same artifact, or the test fails saying where the two part.
 fn agree(a: Json, b: Json, what: String) -> Unit / {abort.raise} =
   match difference(a, b, "") { None -> (), Some(d) -> panic(what ++ ": " ++ d) }
 
 fn argv_of(args: List<String>) -> List<String> = ["test", ".", "--json", "--no-cache"].concat(args)
 
-/// What a `ply` of its own reported.
 fn scrubbed_report(args: List<String>) -> Json / {PlyProcess, abort.raise} =
   scrub(json_of(spawned(argv_of(args))))
 
@@ -162,9 +151,6 @@ fn result_for(a: Json, key: String) -> Json / {abort.raise} =
 
 fn is_text(j: Json) -> Bool = match j { Str(_) -> true, _ -> false }
 
-// Each comparison is a `ply` of its own: a seed in several processes, a whole search in two, under
-// two worker counts, a test alone against its company, a warm front-end cache and an edit no hash
-// sees.
 test/nondet "a search is a function of its seed and its program, in every process" {
   write_program(mixed_program());
   let seeded = scrubbed_report(["--seed", "0"]);
@@ -175,8 +161,6 @@ test/nondet "a search is a function of its seed and its program, in every proces
       "process " ++ run.to_string() ++ " produced a different artifact for one seed",
     ));
   let searched = scrubbed_report([]);
-  // The artifact must carry the race's own failure with a seed, or this test would pass on an empty
-  // run, or on one the C backend declined.
   assert(
     items(at(searched, "failures")).filter(|f: Json|
         is_text(at(f, "seed")) && str(path(f, ["diagnostic", "code"])) == "E0501").len(
@@ -203,11 +187,8 @@ test/nondet "a search is a function of its seed and its program, in every proces
       result_for(scrubbed_report(["--filter", name]), name) == result_for(searched, name),
       Some("`" ++ name ++ "` reported differently when run alone"),
     ));
-  // Populate the front-end cache, then run against it.
   let _ = spawned(["test", ".", "--json"], []);
   agree(scrubbed_report([]), searched, "a warm front-end cache changed what the search did");
-  // A search is a function of the program, which a hash covers, so renaming locals and adding a
-  // comment moves no interleaving; the comment moves only where a failure stands.
   let edited = [
     { from: "let seen =", to: "// a comment nobody reads\n  let observed =" },
     { from: "seen + 1", to: "observed + 1" },
@@ -229,27 +210,21 @@ test/nondet "a search is a function of its seed and its program, in every proces
   )
 }
 
-/// The tasks reach one handler's variable through the counter's operations, which is what the race
-/// names.
-fn var_race(name: String) -> String =
+fn variable_race(name: String) -> String =
   "test \"" ++ name
     ++ "\" {\n  handle {\n    simulate {\n      let a = task.spawn(|| bump());\n      let b = task.spawn(|| bump());\n      task.join(a);\n      task.join(b);\n      assert_eq(counter.get[n](), 2)\n    }\n  } with {\n    var c = 0,\n    counter.get[n]() -> c,\n    counter.put[n](v) -> {\n      c = v;\n    },\n  }\n}\n"
 
-// Each interleaving is an entry on the backend the test runs on, as is every search before it on that
-// thread, so a race names the variable as a fresh backend does or the report depends on what ran
-// first.
-test/nondet "every search on one thread names a race's variable alike" {
+test/nondet "with one thread, three identical data races on a variable each report the same variable name and accesses" {
   write_program(
     counter_effect()
       ++ String::join(
-        range(0, 3).map(|i: Int| var_race("a lost update on a variable " ++ i.to_string())),
+        range(0, 3).map(|i: Int| variable_race("a lost update on a variable " ++ i.to_string())),
         "",
       ),
   );
   let run = scrubbed_report(["--jobs", "1"]);
   let races = items(at(run, "failures")).map(|f: Json| at(f, "race"));
   assert(races.len() == 3, Some("each copy reaches the lost update: " ++ json_text(run)));
-  // Each copy has spans and a name of its own; what it names of the variable is the same.
   let named = |r: Json|
     [
       at(r, "at"),

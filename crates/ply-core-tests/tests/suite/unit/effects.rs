@@ -1,7 +1,7 @@
 use ply_core::{Effect, Mode, Resource, Symbol, label_var_name};
 
 #[test]
-fn an_operation_atom_prints_its_operation_in_place_of_the_mode() {
+fn an_effect_with_an_operation_name_prints_the_operation_name_instead_of_read_or_write() {
     let conn = || Resource::Named(Symbol::new("conn"));
     assert_eq!(
         Effect::operation("net", conn(), Mode::Write, "send").to_string(),
@@ -17,9 +17,8 @@ fn an_operation_atom_prints_its_operation_in_place_of_the_mode() {
     );
 }
 
-/// A label variable prints under the next letter, and past the last under the round.
 #[test]
-fn a_label_variable_is_named_by_its_place() {
+fn resource_variables_are_named_l_m_n_then_l1_and_onward_as_their_index_grows() {
     assert_eq!(label_var_name(0), "l");
     assert_eq!(label_var_name(2), "n");
     assert_eq!(label_var_name(3), "l1");

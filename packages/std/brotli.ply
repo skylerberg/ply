@@ -1,37 +1,32 @@
-//! Brotli (RFC 7932): reading and writing streams.
+//! Reads and writes Brotli (RFC 7932) streams.
 //!
-//! `decompress` reads anything a writer of the format writes: meta-blocks of commands, of
-//! uncompressed bytes and of bytes to skip; prefix codes that list a few symbols or give every
-//! code length; blocks of several types in each of the three categories; literals and distances
-//! read with the code their context selects; distances relative to the last ones used; and
-//! matches that refer to a word of the format's dictionary, as one of its 121 transforms writes
-//! it. A stream of the large-window extension, which is not part of the RFC, is rejected with its
-//! own reason. The format has no multi-stream form: `decompress_first` reads one stream and
-//! reports where it ended, and every other reader rejects bytes after it.
+//! `decompress` reads any valid stream: every kind of meta-block, every form of prefix code, blocks
+//! of several types, context-selected codes, relative distances, and matches that refer to the
+//! format's dictionary through its transforms. It rejects a stream of the large-window extension,
+//! which is not part of the RFC. The format has no multi-stream form: `decompress_first` reads one
+//! stream and reports where it ended, and every other reader rejects bytes after the stream.
 //!
-//! Every reader takes `Limits`, and none works without them. `output` is the most bytes it
-//! returns, and a meta-block that declares more than are left is rejected at its header. `window`
-//! is the most bytes of history a stream may ask the reader to keep. A stream states in its first
-//! byte how far back a match may reach, whatever it contains: from 1 KiB to 16 MiB, less sixteen
-//! bytes. A stream that asks for more than `window` is rejected there, before anything else is
-//! read, and 16777200 admits them all. An error reports why and at which byte of the input.
-//! `decompress` raises it as `brotli.fail`, and `try_decompress` returns it.
+//! Every reader takes `Limits`. `output` is the most bytes a reader returns, and a meta-block that
+//! declares more is rejected at its header. `window` is the most history a stream may ask the
+//! reader to keep. The first byte of a stream states how far back a match may reach, and a stream
+//! that asks for more than `window` is rejected immediately. An error reports why the input was
+//! rejected and at which byte. `decompress` raises it as `brotli.fail`, and `try_decompress`
+//! returns it.
 //!
-//! `compress` writes one stream. `Fast` looks one place back for each position and gives each
-//! 128 KiB meta-block three prefix codes of its own. It compresses somewhat less than
+//! `compress` writes one stream. `Fast` searches one earlier position for a match at each position
+//! and gives each meta-block three prefix codes of its own. It compresses somewhat less than
 //! `brotli -q 1` on prose and source code, and about as well on binary data. `Stored` writes the
 //! bytes uncompressed. The output of either depends only on the input bytes.
 //!
-//! The dictionary is the 122,784 bytes of the RFC's Appendix A, shipped with this module under the
-//! terms `license` returns. The build stores them unchanged, so a reader's first word costs the
-//! same as any other. No writer here uses a word, so a program that only writes includes none of
-//! them.
+//! The dictionary is RFC 7932's Appendix A, shipped with this module under the terms `license`
+//! returns. The build stores it unchanged, so reading any dictionary word costs the same. A program
+//! that only writes streams includes none of it.
 //!
-//! `decompress_stream` and `compress_stream` are the two directions over a `std.seq` sequence of
-//! chunks, such as `std.io`'s `chunks` gives for a file. A stream is read in the memory of its
-//! window, and written in the memory of the 2 MiB a match can reach, whatever its length.
-//! `decompress_stream` returns the same bytes as `decompress`, or fails as it does, however the
-//! input is cut.
+//! `decompress_stream` and `compress_stream` work on a `std.seq` sequence of chunks, such as
+//! `std.io`'s `chunks` returns for a file. They use memory bounded by the stream's window (reading)
+//! or the longest distance a match can reach (writing), however long the stream is.
+//! `decompress_stream` returns the same bytes as `decompress`, or fails the same way, wherever the
+//! input is split into chunks.
 
 import std.bytes (u32_le)
 import std.checksum (crc32)
@@ -43,8 +38,6 @@ import std.math (bit_length)
 import std.seq
 import std.seq (seq, Seq, Done, Skip, Yield)
 import std.gen
-
-// --- Errors -----------------------------------------------------------------
 
 /// Why a reader rejected its input.
 pub type ErrorKind =
@@ -86,9 +79,6 @@ pub effect brotli {
 fn fail<a>(at: Int, reason: ErrorKind) -> a / {brotli.fail} =
   brotli.fail({ at: at, reason: reason })
 
-/// An error at bit `bit` of input that ends at bit `end` and starts `base` bytes into the stream.
-/// If the reader has read past the end, the error is `Truncated`, since what it read there was not
-/// input.
 fn fail_at_bit<a>(base: Int, bit: Int, end: Int, reason: ErrorKind) -> a / {brotli.fail} =
   fail(base + (min(bit, end) >>> 3), if bit > end { Truncated } else { reason })
 
@@ -96,31 +86,22 @@ fn fail_at_bit<a>(base: Int, bit: Int, end: Int, reason: ErrorKind) -> a / {brot
 /// ask it to keep.
 pub type Limits = new { output: Int, window: Int }
 
-/// Each byte value as a one-byte `Bytes`.
 const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_of_int))
-
-// --- The static dictionary ----------------------------------------------------
 
 /// The terms the dictionary's bytes are shipped under.
 pub const fn license() -> String = String::of_bytes(embed("brotli/LICENSE"))
 
-/// RFC 7932's Appendix A: 122,784 bytes of words, grouped by length from 4 to 24.
 const fn words() -> Bytes = embed("brotli/dictionary.bin")
 
-/// For each length, how many bits number its words: a length has two to that power words.
 fn word_bits() -> Bytes =
   b"\x00\x00\x00\x00\x0a\x0a\x0b\x0b\x0a\x0a\x0a\x0a\x0a\x09\x09\x08\x07\x07\x08\x07\x07\x06\x06\x05\x05"
 
-/// Where the words of each length start, by length.
 const fn word_starts() -> Array<Int> =
   Array::of_list(
     range(0, 25).fold({ out: [], at: 0 }, |s: { out: List<Int>, at: Int }, n: Int|
       { out: s.out.push(s.at), at: s.at + (if n < 4 { 0 } else { n << word_bits().at(n) }) }).out,
   )
 
-/// RFC 7932's Appendix B: the strings a transform puts before and after a word, each preceded by
-/// its length; where each string starts; and the 121 transforms, three bytes each: the string
-/// before, what is done to the word, and the string after.
 const fn affixes() -> Bytes =
   Bytes::of_hex(
     "0120022c2008206f66207468652004206f6620027320012e0520616e64200420696e2001220420746f2002223e010a022e20015d0520666f72200320612006207468617420012706207769746820062066726f6d2004206279200128062e205468652004206f6e200420617320042069732004696e6720020a09013a03656420023d220420617420036c7920012c023d27052e636f6d2f072e20546869732005206e6f74200365722003616c200466756c200469766520056c65737320046573742004697a652002c2a0046f75732005207468652002652000",
@@ -142,9 +123,6 @@ fn affix(i: Int) -> Bytes / {abort.raise} = {
   affixes().slice(at + 1, at + 1 + affixes().at(at))
 }
 
-/// Uppercases the letter at `at` by the format's own rule: an ASCII letter by its case bit, and a
-/// character of two or three UTF-8 bytes by changing bits of its last byte. Returns the bytes and
-/// the character's length in bytes.
 fn uppercased_at(word: Bytes, at: Int) -> { word: Bytes, step: Int } / {abort.raise} = {
   let lead = word.at(at);
   let n = word.len();
@@ -163,8 +141,6 @@ fn uppercased_from(word: Bytes, at: Int, fuel: Int) -> Bytes / {abort.raise} =
     uppercased_from(one.word, at + one.step, fuel - 1)
   }
 
-/// A word of the dictionary as transform `id` writes it: between two strings, either whole, cut
-/// at either end, or with its first letter or all its letters in upper case.
 fn transformed(word: Bytes, id: Int) -> Bytes / {abort.raise} = {
   let kind = transforms().at(3 * id + 1);
   let n = word.len();
@@ -176,19 +152,9 @@ fn transformed(word: Bytes, id: Int) -> Bytes / {abort.raise} = {
   Bytes::concat_all([affix(transforms().at(3 * id)), middle, affix(transforms().at(3 * id + 2))])
 }
 
-// --- Prefix codes -------------------------------------------------------------
-
-// A code is a table indexed by the next eight bits of the stream. An entry at or above zero is a
-// symbol and its code length, `symbol << 4 | length`. An entry below zero, negated, is where the
-// entries of the longer codes that start with those eight bits begin, and how many more bits
-// index them, `start << 4 | bits`.
-
-/// The code after `key` among codes of one length, each read from its last bit. `step` is that
-/// length's highest bit.
 fn next_key(key: Int, step: Int) -> Int =
   if step > 0 && key & step != 0 { next_key(key, step >>> 1) } else { (key & step - 1) + step }
 
-/// Writes `lookup_code` at every `step`th index of `table` from `at` up to `stop`.
 fn fill_at_intervals(
   table: Array<Int>,
   at: Int,
@@ -201,15 +167,11 @@ fn fill_at_intervals(
     fill_at_intervals(table.set(at, lookup_code), at + step, step, lookup_code, stop, fuel - 1)
   }
 
-/// Each symbol that has a code, with its code above bit 14 and its length above bit 10, in the
-/// order of the codes: by length, then by symbol.
 fn canonical(lengths: Array<Int>) -> List<Int> =
   range(0, lengths.len()).map(|s: Int| lengths.get(s) << 10 | s).filter(|v: Int| v >= 1024).sort(
   ).fold({ out: [], key: 0 }, |s: { out: List<Int>, key: Int }, v: Int|
     { out: s.out.push(s.key << 14 | v), key: next_key(s.key, 1 << (v >>> 10) - 1) }).out
 
-/// The table of the code whose symbols have these lengths, where a length of zero means no code.
-/// The lengths form a whole code, or give only one symbol, which then takes no bits.
 fn table_of(lengths: Array<Int>) -> Array<Int> / {abort.raise} = {
   let keyed = canonical(lengths);
   match keyed {
@@ -249,30 +211,25 @@ fn table_of(lengths: Array<Int>) -> Array<Int> / {abort.raise} = {
   }
 }
 
-/// The entry of the code `table` for the next bits `w`, at least fifteen of them.
 fn lookup_code(table: Array<Int>, w: Int) -> Int / {abort.raise} = {
   let e = table.get(w & 255);
   if e >= 0 { e } else { table.get((0 - e >>> 4) + (w >>> 8 & (1 << (0 - e & 15)) - 1)) }
 }
 
-/// A code read, and the bit after it.
 type Code = { table: Array<Int>, bit: Int }
 
-/// Reads a simple code of one to four symbols, each written in as many bits as its alphabet
-/// needs. The code lengths are none for one symbol, `[1, 1]` for two, `[1, 2, 2]` for three, and
-/// for four either two each or, when a final bit is set, `[1, 2, 3, 3]`.
 fn simple_code(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   alphabet: Int,
   base: Int,
 ) -> Code / {brotli.fail, abort.raise} = {
-  let count = src.bits_at(bit + 2, 2) + 1;
+  let count = source.bits_at(bit + 2, 2) + 1;
   let width = bit_length(alphabet - 1);
-  let named = range(0, count).map(|i: Int| src.bits_at(bit + 4 + i * width, width));
+  let named = range(0, count).map(|i: Int| source.bits_at(bit + 4 + i * width, width));
   let after = bit + 4 + count * width;
-  let shape = if count == 4 { src.bits_at(after, 1) } else { 0 };
+  let shape = if count == 4 { source.bits_at(after, 1) } else { 0 };
   let sorted = named.sort();
   let twice = range(1, count).fold(false, |same: Bool, i: Int|
     same || sorted.at(i) == sorted.at(i - 1));
@@ -300,10 +257,8 @@ fn simple_code(
 
 type CodeLengthsResult = { lengths: Array<Int>, bit: Int, space: Int, count: Int }
 
-/// Reads the code that the code lengths are themselves written in: up to eighteen lengths, in the
-/// order the format specifies, each in two to four bits, until they form a whole code.
 fn read_code_length_code(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   i: Int,
   space: Int,
@@ -311,12 +266,12 @@ fn read_code_length_code(
   lengths: Array<Int>,
 ) -> CodeLengthsResult / {abort.raise} =
   if i >= 18 || space <= 0 { { lengths: lengths, bit: bit, space: space, count: count } } else {
-    let next = src.bits_at(bit, 4);
+    let next = source.bits_at(bit, 4);
     let value = b"\x00\x04\x03\x02\x00\x04\x03\x01\x00\x04\x03\x02\x00\x04\x03\x05".at(next);
     let used = b"\x02\x02\x02\x03\x02\x02\x02\x04\x02\x02\x02\x03\x02\x02\x02\x04".at(next);
     let symbol = b"\x01\x02\x03\x04\x00\x05\x11\x06\x10\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f".at(i);
     read_code_length_code(
-      src,
+      source,
       bit + used,
       i + 1,
       if value == 0 { space } else { space - (32 >>> value) },
@@ -325,11 +280,8 @@ fn read_code_length_code(
     )
   }
 
-/// Reads the lengths of a code's symbols from `symbol` on, each decoded with the code `by`. Each
-/// is a length, or a run that repeats the previous length or zero. A run continues the run
-/// before it when both repeat the same value. `space` is the part of the code not yet used.
 fn read_code_lengths(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   by: Array<Int>,
@@ -347,12 +299,12 @@ fn read_code_lengths(
     if space != 0 { fail_at_bit(base, bit, end, PrefixCode) }
     else { { table: table_of(lengths), bit: bit } }
   } else {
-    let e = lookup_code(by, src.bits_at(bit, 16));
+    let e = lookup_code(by, source.bits_at(bit, 16));
     let length = e >>> 4;
     let at = bit + (e & 15);
     if length < 16 {
       read_code_lengths(
-        src,
+        source,
         at,
         end,
         by,
@@ -369,11 +321,11 @@ fn read_code_lengths(
       let width = if length == 16 { 2 } else { 3 };
       let of = if length == 16 { before } else { 0 };
       let had = if run_of == of { run } else { 0 };
-      let grown = (if had > 0 { had - 2 << width } else { 0 }) + src.bits_at(at, width) + 3;
+      let grown = (if had > 0 { had - 2 << width } else { 0 }) + source.bits_at(at, width) + 3;
       let more = grown - had;
       if symbol + more > lengths.len() { fail_at_bit(base, at + width, end, PrefixCode) } else {
         read_code_lengths(
-          src,
+          source,
           at + width,
           end,
           by,
@@ -390,25 +342,22 @@ fn read_code_lengths(
     }
   }
 
-/// Reads a code over `alphabet` symbols from bit `bit`. Two bits tell whether it is a simple code
-/// that lists at most four symbols, or one that gives the lengths of all its symbols, themselves
-/// coded.
 fn prefix_code(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   alphabet: Int,
   base: Int,
 ) -> Code / {brotli.fail, abort.raise} = {
-  let skip = src.bits_at(bit, 2);
+  let skip = source.bits_at(bit, 2);
   if bit > end { fail_at_bit(base, bit, end, Truncated) }
-  else if skip == 1 { simple_code(src, bit, end, alphabet, base) } else {
-    let head = read_code_length_code(src, bit + 2, skip, 32, 0, Array::new(18, 0));
+  else if skip == 1 { simple_code(source, bit, end, alphabet, base) } else {
+    let head = read_code_length_code(source, bit + 2, skip, 32, 0, Array::new(18, 0));
     if head.bit > end || !(head.count == 1 || head.space == 0) {
       fail_at_bit(base, head.bit, end, PrefixCode)
     } else {
       read_code_lengths(
-        src,
+        source,
         head.bit,
         end,
         table_of(head.lengths),
@@ -425,50 +374,37 @@ fn prefix_code(
   }
 }
 
-// --- Meta-blocks --------------------------------------------------------------
-
-/// The base value and extra bits of each insert length code, 0 to 23.
 const fn insert_codes() -> Array<Int> =
   code_bases([0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24], 0)
 
-/// The base value and extra bits of each copy length code, 0 to 23.
 const fn copy_codes() -> Array<Int> =
   code_bases([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24], 2)
 
-/// The base value and extra bits of each block count code, 0 to 25.
 const fn count_codes() -> Array<Int> =
   code_bases([2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24], 1)
 
-/// Reads a number from 0 to 255: one bit for zero, or a one followed by three bits that give how
-/// many more bits follow. Returns the number and the bits it took, `value << 8 | bits`.
-fn small_number(src: Bytes, bit: Int) -> Int / {abort.raise} =
-  if src.bits_at(bit, 1) == 0 { 1 } else {
-    let width = src.bits_at(bit + 1, 3);
+fn small_number(source: Bytes, bit: Int) -> Int / {abort.raise} =
+  if source.bits_at(bit, 1) == 0 { 1 } else {
+    let width = source.bits_at(bit + 1, 3);
     if width == 0 { 1 << 8 | 4 }
-    else { (1 << width) + src.bits_at(bit + 4, width) << 8 | 4 + width }
+    else { (1 << width) + source.bits_at(bit + 4, width) << 8 | 4 + width }
   }
 
-// A category's block state is packed in one `Int`: the current block type, the previous block
-// type above bit 8, and how many symbols the block has left above bit 16.
-
-/// How one of a meta-block's three categories is divided into blocks: how many block types it
-/// has, the codes a block switch is read with, its starting state, and the bit after all of that.
 type Blocks = { type_count: Int, kinds: Array<Int>, counts: Array<Int>, state: Int, bit: Int }
 
-/// The count that a block count code and its extra bits give, and the bit after them.
 fn read_block_count(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   counts: Array<Int>,
 ) -> { count: Int, bit: Int } / {abort.raise} = {
-  let e = lookup_code(counts, src.bits_at(bit, 16));
+  let e = lookup_code(counts, source.bits_at(bit, 16));
   let span = count_codes().get(min(e >>> 4, 25));
   let at = bit + (e & 15);
-  { count: (span >>> 5) + src.bits_at(at, span & 31), bit: at + (span & 31) }
+  { count: (span >>> 5) + source.bits_at(at, span & 31), bit: at + (span & 31) }
 }
 
-fn blocks(src: Bytes, bit: Int, end: Int, base: Int) -> Blocks / {brotli.fail, abort.raise} = {
-  let n = small_number(src, bit);
+fn blocks(source: Bytes, bit: Int, end: Int, base: Int) -> Blocks / {brotli.fail, abort.raise} = {
+  let n = small_number(source, bit);
   let types = (n >>> 8) + 1;
   let at = bit + (n & 255);
   if types < 2 {
@@ -480,9 +416,9 @@ fn blocks(src: Bytes, bit: Int, end: Int, base: Int) -> Blocks / {brotli.fail, a
       bit: at,
     }
   } else {
-    let kinds = prefix_code(src, at, end, types + 2, base);
-    let counts = prefix_code(src, kinds.bit, end, 26, base);
-    let opening = read_block_count(src, counts.bit, counts.table);
+    let kinds = prefix_code(source, at, end, types + 2, base);
+    let counts = prefix_code(source, kinds.bit, end, 26, base);
+    let opening = read_block_count(source, counts.bit, counts.table);
     {
       type_count: types,
       kinds: kinds.table,
@@ -493,20 +429,18 @@ fn blocks(src: Bytes, bit: Int, end: Int, base: Int) -> Blocks / {brotli.fail, a
   }
 }
 
-/// Reads a category's next block. One code gives its type: the previous type, one more than the
-/// current type, or a type number. Another code gives its count.
 fn read_block_switch(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   state: Int,
   b: Blocks,
 ) -> { state: Int, bit: Int } / {abort.raise} = {
-  let e = lookup_code(b.kinds, src.bits_at(bit, 16));
+  let e = lookup_code(b.kinds, source.bits_at(bit, 16));
   let named = e >>> 4;
   let kind = if named == 0 { state >>> 8 & 255 }
   else if named == 1 { (state & 255) + 1 }
   else { named - 2 };
-  let next = read_block_count(src, bit + (e & 15), b.counts);
+  let next = read_block_count(source, bit + (e & 15), b.counts);
   {
     state: next.count << 16 | (state & 255) << 8
       | (if kind >= b.type_count { kind - b.type_count } else { kind }),
@@ -516,11 +450,8 @@ fn read_block_switch(
 
 type ContextMapResult = { map: Bytes, bit: Int }
 
-/// Reads a context map's entries until there are `size` of them. Symbol 0 is tree 0, a symbol
-/// from 1 to `runs` is a run of zeros whose length its extra bits complete, and a larger symbol is
-/// tree `symbol - runs`.
 fn map_entries(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   by: Array<Int>,
@@ -532,13 +463,13 @@ fn map_entries(
 ) -> ContextMapResult / {brotli.fail, abort.raise} =
   if bit > end { fail_at_bit(base, bit, end, Truncated) }
   else if fuel <= 0 || out.len() >= size { { map: out, bit: bit } } else {
-    let e = lookup_code(by, src.bits_at(bit, 16));
+    let e = lookup_code(by, source.bits_at(bit, 16));
     let symbol = e >>> 4;
     let at = bit + (e & 15);
-    if symbol == 0 { map_entries(src, at, end, by, runs, size, out ++ b"\x00", base, fuel - 1) }
+    if symbol == 0 { map_entries(source, at, end, by, runs, size, out ++ b"\x00", base, fuel - 1) }
     else if symbol > runs {
       map_entries(
-        src,
+        source,
         at,
         end,
         by,
@@ -549,10 +480,10 @@ fn map_entries(
         fuel - 1,
       )
     } else {
-      let run = (1 << symbol) + src.bits_at(at, symbol);
+      let run = (1 << symbol) + source.bits_at(at, symbol);
       if out.len() + run > size { fail_at_bit(base, at + symbol, end, ContextMap) } else {
         map_entries(
-          src,
+          source,
           at + symbol,
           end,
           by,
@@ -566,8 +497,6 @@ fn map_entries(
     }
   }
 
-/// Undoes move-to-front coding. Each entry is an index into a list that starts as every byte
-/// value in order, and the value found there is then moved to the list's front.
 fn inverse_move_to_front(map: Bytes, i: Int, order: Bytes, out: Bytes) -> Bytes / {abort.raise} =
   if i >= map.len() { out } else {
     let place = map.at(i);
@@ -580,11 +509,8 @@ fn inverse_move_to_front(map: Bytes, i: Int, order: Bytes, out: Bytes) -> Bytes 
     )
   }
 
-/// Reads a context map of `size` entries over `trees` trees. With one tree it is all zeros.
-/// Otherwise it is coded, with runs of zeros if one bit is set and move-to-front coding if another
-/// is.
 fn context_map(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   size: Int,
@@ -592,10 +518,10 @@ fn context_map(
   base: Int,
 ) -> ContextMapResult / {brotli.fail, abort.raise} =
   if trees < 2 { { map: b"\x00".cycle(size), bit: bit } } else {
-    let runs = if src.bits_at(bit, 1) == 0 { 0 } else { src.bits_at(bit + 1, 4) + 1 };
-    let code = prefix_code(src, bit + (if runs == 0 { 1 } else { 5 }), end, trees + runs, base);
-    let read = map_entries(src, code.bit, end, code.table, runs, size, b"", base, size + 1);
-    if src.bits_at(read.bit, 1) == 0 { { map: read.map, bit: read.bit + 1 } } else {
+    let runs = if source.bits_at(bit, 1) == 0 { 0 } else { source.bits_at(bit + 1, 4) + 1 };
+    let code = prefix_code(source, bit + (if runs == 0 { 1 } else { 5 }), end, trees + runs, base);
+    let read = map_entries(source, code.bit, end, code.table, runs, size, b"", base, size + 1);
+    if source.bits_at(read.bit, 1) == 0 { { map: read.map, bit: read.bit + 1 } } else {
       {
         map: inverse_move_to_front(
           read.map,
@@ -610,9 +536,8 @@ fn context_map(
 
 type Trees = { trees: Array<Array<Int>>, bit: Int }
 
-/// Reads `count` codes over one alphabet, one after another.
 fn tree_group(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   alphabet: Int,
@@ -621,13 +546,10 @@ fn tree_group(
   base: Int,
 ) -> Trees / {brotli.fail, abort.raise} =
   if count <= 0 { { trees: Array::of_list(out), bit: bit } } else {
-    let one = prefix_code(src, bit, end, alphabet, base);
-    tree_group(src, one.bit, end, alphabet, count - 1, out.push(one.table), base)
+    let one = prefix_code(source, bit, end, alphabet, base);
+    tree_group(source, one.bit, end, alphabet, count - 1, out.push(one.table), base)
   }
 
-/// RFC 7932's section 7.1: the context that the two bytes before a literal give it, under each of
-/// the four context modes. Each mode has 512 entries: the first 256 are looked up by the last byte
-/// and the next 256 by the byte before it, and the two results are combined.
 const fn context_lookup() -> Bytes = {
   let text_last = Bytes::of_hex(
     "0000000000000000000404000004000000000000000000000000000000000000080c100c0c140c10181c0c0c200c240c2c2c2c2c2c2c2c2c2c2c202018281c0c0c3034343430343434303434343434303434343434303434343434180c1c0c0c0c383c3c3c383c3c3c383c3c3c3c3c383c3c3c3c3c383c3c3c3c3c180c1c0c00",
@@ -661,9 +583,6 @@ const fn context_lookup() -> Bytes = {
   ])
 }
 
-/// What a meta-block's commands are read with: how each category is divided into blocks, the
-/// context mode of each literal block type as the offset of its entries in the context lookup,
-/// the two context maps, the three groups of codes, and how a distance code is split up.
 type MetaBlockCodes = {
   literals: Blocks,
   commands: Blocks,
@@ -680,38 +599,36 @@ type MetaBlockCodes = {
 
 type MetaBlockCodesResult = { meta: MetaBlockCodes, bit: Int }
 
-/// Reads a compressed meta-block's header after its length: the three categories' blocks, how a
-/// distance code is split up, the literal modes, the context maps, and every code.
 fn read_meta_block_codes(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   base: Int,
 ) -> MetaBlockCodesResult / {brotli.fail, abort.raise} = {
-  let literal_blocks = blocks(src, bit, end, base);
-  let command_blocks = blocks(src, literal_blocks.bit, end, base);
-  let distances = blocks(src, command_blocks.bit, end, base);
+  let literal_blocks = blocks(source, bit, end, base);
+  let command_blocks = blocks(source, literal_blocks.bit, end, base);
+  let distances = blocks(source, command_blocks.bit, end, base);
   let at = distances.bit;
-  let postfix = src.bits_at(at, 2);
-  let direct = src.bits_at(at + 2, 4) << postfix;
+  let postfix = source.bits_at(at, 2);
+  let direct = source.bits_at(at + 2, 4) << postfix;
   let after = at + 6 + 2 * literal_blocks.type_count;
   let modes = if after > end { fail_at_bit(base, after, end, Truncated) } else {
     Array::of_list(
-      range(0, literal_blocks.type_count).map(|i: Int| src.bits_at(at + 6 + 2 * i, 2) << 9),
+      range(0, literal_blocks.type_count).map(|i: Int| source.bits_at(at + 6 + 2 * i, 2) << 9),
     )
   };
-  let literal_count = small_number(src, after);
+  let literal_count = small_number(source, after);
   let literal_map = context_map(
-    src,
+    source,
     after + (literal_count & 255),
     end,
     64 * literal_blocks.type_count,
     (literal_count >>> 8) + 1,
     base,
   );
-  let distance_count = small_number(src, literal_map.bit);
+  let distance_count = small_number(source, literal_map.bit);
   let distance_map = context_map(
-    src,
+    source,
     literal_map.bit + (distance_count & 255),
     end,
     4 * distances.type_count,
@@ -719,7 +636,7 @@ fn read_meta_block_codes(
     base,
   );
   let literal_trees = tree_group(
-    src,
+    source,
     distance_map.bit,
     end,
     256,
@@ -728,7 +645,7 @@ fn read_meta_block_codes(
     base,
   );
   let command_trees = tree_group(
-    src,
+    source,
     literal_trees.bit,
     end,
     704,
@@ -737,7 +654,7 @@ fn read_meta_block_codes(
     base,
   );
   let distance_trees = tree_group(
-    src,
+    source,
     command_trees.bit,
     end,
     16 + direct + (48 << postfix),
@@ -765,15 +682,10 @@ fn read_meta_block_codes(
   }
 }
 
-// --- Commands ---------------------------------------------------------------
-
 type LiteralsResult = { out: Bytes, bit: Int, state: Int }
 
-/// Reads `left` literals after `out`, each with the tree that its block type and the two bytes
-/// before it select, as long as the input lasts. A literal that the input ends inside is not
-/// written, and the returned bit is where that literal starts.
 fn literals(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   bit: Int,
   out: Bytes,
@@ -790,10 +702,10 @@ fn literals(
   fuel: Int,
 ) -> LiteralsResult / {abort.raise} =
   if fuel <= 0 || left <= 0 { { out: out, bit: bit, state: state } } else if state >>> 16 == 0 {
-    let next = read_block_switch(src, bit, state, m.literals);
+    let next = read_block_switch(source, bit, state, m.literals);
     if next.bit > end { { out: out, bit: bit, state: state } } else {
       literals(
-        src,
+        source,
         end,
         next.bit,
         out,
@@ -813,13 +725,13 @@ fn literals(
   } else {
     let context = lookup.at(mode + last) | lookup.at(mode + 256 + before);
     let tree = trees.get(chosen.at(((state & 255) << 6) + context));
-    let w = Int::of_u32(src.u32_le(bit >>> 3)) >>> (bit & 7);
+    let w = Int::of_u32(source.u32_le(bit >>> 3)) >>> (bit & 7);
     let e = tree.get(w & 255);
     let f = if e >= 0 { e } else { tree.get((0 - e >>> 4) + (w >>> 8 & (1 << (0 - e & 15)) - 1)) };
     let after = bit + (f & 15);
     if after > end { { out: out, bit: bit, state: state } } else {
       literals(
-        src,
+        source,
         end,
         after,
         out ++ one.get(f >>> 4),
@@ -838,12 +750,6 @@ fn literals(
     }
   }
 
-/// A reader's position among a meta-block's commands: the bytes written, the next bit to read,
-/// the three categories' block states, the four distances last used (two per `Int`, 25 bits each,
-/// the most recent lowest), and how much of the meta-block is still to write. For a partly read
-/// command, it stores the literals still to insert and the copy still to make, as its length and
-/// whether its distance is the last one used, `length << 1 | same`. The copy is 0 between
-/// commands. `starved` reports that the input ended inside what comes next.
 type Step = {
   out: Bytes,
   bit: Int,
@@ -858,24 +764,17 @@ type Step = {
   starved: Bool,
 }
 
-// A command's limits are packed in an array: index 0 is the number of bytes written before
-// `out`'s first, 1 the window, and 2 the stream offset of the input's first byte.
-
-/// A command's start: the bit after it, its category's block state after it, how many literals
-/// it inserts, and its copy in the form `Step` stores it.
 type CommandHeader = { bit: Int, commands: Int, insert: Int, copy: Int }
 
-/// Reads a command's start. A code gives a range for the number of literals and one for the
-/// copy's length, and whether the distance is the last one used. Extra bits complete both.
 fn read_command_header(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   state: Int,
   m: MetaBlockCodes,
 ) -> CommandHeader / {abort.raise} = {
-  let turned = if state >>> 16 == 0 { read_block_switch(src, bit, state, m.commands) }
+  let turned = if state >>> 16 == 0 { read_block_switch(source, bit, state, m.commands) }
   else { { state: state, bit: bit } };
-  let e = lookup_code(m.command_trees.get(turned.state & 255), src.bits_at(turned.bit, 16));
+  let e = lookup_code(m.command_trees.get(turned.state & 255), source.bits_at(turned.bit, 16));
   let symbol = e >>> 4;
   let cell = symbol >>> 6;
   let insert = insert_codes().get(
@@ -885,27 +784,24 @@ fn read_command_header(
     b"\x00\x08\x00\x08\x00\x08\x10\x00\x10\x08\x10".at(cell) + (symbol & 7),
   );
   let at = turned.bit + (e & 15);
-  let length = (copy >>> 5) + src.bits_at(at + (insert & 31), copy & 31);
+  let length = (copy >>> 5) + source.bits_at(at + (insert & 31), copy & 31);
   {
     bit: at + (insert & 31) + (copy & 31),
     commands: turned.state - 65536,
-    insert: (insert >>> 5) + src.bits_at(at, insert & 31),
+    insert: (insert >>> 5) + source.bits_at(at, insert & 31),
     copy: length << 1 | (if symbol < 128 { 1 } else { 0 }),
   }
 }
 
-/// Reads one command, or as much of it as the input contains and `most` bytes allow, from
-/// wherever the reader is in it: its start, its literals, and then its copy. A command whose
-/// literals end the meta-block makes no copy.
 fn command(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   s: Step,
   m: MetaBlockCodes,
   lim: Array<Int>,
   most: Int,
 ) -> Step / {brotli.fail, abort.raise} = {
-  let head = if s.copy == 0 { read_command_header(src, s.bit, s.commands, m) }
+  let head = if s.copy == 0 { read_command_header(source, s.bit, s.commands, m) }
   else { { bit: s.bit, commands: s.commands, insert: s.insert, copy: s.copy } };
   if head.bit > end { { ..s, insert: 0, copy: 0, starved: true } }
   else if head.insert > s.left { fail_at_bit(lim.get(2), head.bit, end, Length) } else {
@@ -915,7 +811,7 @@ fn command(
     let last = if n > 0 { out.at(n - 1) } else { 0 };
     let before = if n > 1 { out.at(n - 2) } else { 0 };
     let wrote = literals(
-      src,
+      source,
       end,
       head.bit,
       out,
@@ -948,15 +844,12 @@ fn command(
         copy: if done == head.insert && left <= 0 { 0 } else { head.copy },
         starved: done < ask,
       }
-    } else { copied(src, end, moved, m, lim, head.copy, most - done) }
+    } else { copied(source, end, moved, m, lim, head.copy, most - done) }
   }
 }
 
-/// Makes a command's copy, after its literals. The distance is the last one used if the command
-/// said so. Otherwise it is read here, by a code that selects one of the last four distances, a
-/// distance near one of the last two, or a range that extra bits complete.
 fn copied(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   s: Step,
   m: MetaBlockCodes,
@@ -970,11 +863,11 @@ fn copied(
     placed_copy(end, s, lim, length, last, 0, most)
   } else {
     let turned = if s.distances >>> 16 == 0 {
-      read_block_switch(src, s.bit, s.distances, m.distances)
+      read_block_switch(source, s.bit, s.distances, m.distances)
     } else { { state: s.distances, bit: s.bit } };
     let context = if length > 4 { 3 } else { length - 2 };
     let tree = m.distance_trees.get(m.distance_map.at(((turned.state & 255) << 2) + context));
-    let e = lookup_code(tree, src.bits_at(turned.bit, 16));
+    let e = lookup_code(tree, source.bits_at(turned.bit, 16));
     let code = e >>> 4;
     let at = turned.bit + (e & 15);
     let rest = code - m.direct_distance_codes - 16;
@@ -993,7 +886,7 @@ fn copied(
         if code & 1 == 0 { from - off } else { from + off }
       } else if rest < 0 { code - 15 } else {
         let start = (2 + (rest >>> m.postfix & 1) << width) - 4;
-        (start + src.bits_at(at, width) << m.postfix) + (rest & (1 << m.postfix) - 1)
+        (start + source.bits_at(at, width) << m.postfix) + (rest & (1 << m.postfix) - 1)
           + m.direct_distance_codes
           + 1
       };
@@ -1010,10 +903,6 @@ fn copied(
   }
 }
 
-/// Writes the copy: `length` bytes from `dist` back, or only `most` of them if `length` is more,
-/// leaving the rest for the next step. When `dist` reaches before anything written, it writes the
-/// dictionary word that the distance and length select instead. A distance read by any code other
-/// than the one for the last distance becomes the last distance used, unless it selected a word.
 fn placed_copy(
   end: Int,
   s: Step,
@@ -1057,10 +946,8 @@ fn placed_copy(
   }
 }
 
-/// Reads commands until the meta-block is written, the output reaches `stop` bytes, or the input
-/// ends inside a command. That command is read as far as the input goes and continued later.
 fn commands(
-  src: Bytes,
+  source: Bytes,
   end: Int,
   s: Step,
   m: MetaBlockCodes,
@@ -1070,14 +957,9 @@ fn commands(
 ) -> Step / {brotli.fail, abort.raise} =
   if fuel <= 0 || s.starved || (s.left <= 0 && s.copy == 0) || s.out.len() >= stop { s } else {
     let most = stop - s.out.len();
-    commands(src, end, command(src, end, s, m, lim, most), m, lim, stop, fuel - 1)
+    commands(source, end, command(source, end, s, m, lim, most), m, lim, stop, fuel - 1)
   }
 
-// --- Streams ------------------------------------------------------------------
-
-/// A meta-block's header: its kind, 0 for the empty block that ends a stream, 1 for bytes to
-/// skip, 2 for uncompressed bytes and 3 for commands; whether it is the stream's last; how many
-/// bytes it contains; the bit after the header; and what its commands are read with.
 type MetaBlockHeader = { kind: Int, last: Bool, length: Int, bit: Int, meta: MetaBlockCodes }
 
 const fn no_blocks() -> Blocks =
@@ -1104,53 +986,48 @@ const fn no_meta_block_codes() -> MetaBlockCodes =
     direct_distance_codes: 0,
   }
 
-/// The bit where the byte containing `bit` ends. The bits in between must be zeros.
 fn next_byte_boundary(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   base: Int,
 ) -> Int / {brotli.fail, abort.raise} =
-  if src.bits_at(bit, 0 - bit & 7) != 0 { fail_at_bit(base, bit, end, Header) }
+  if source.bits_at(bit, 0 - bit & 7) != 0 { fail_at_bit(base, bit, end, Header) }
   else { bit + (0 - bit & 7) }
 
-/// Reads a meta-block's header: whether it is the last, and whether it is empty; how many digits
-/// its length has, or that it is bytes to skip; the length; whether its bytes are uncompressed;
-/// and for commands, everything `read_meta_block_codes` reads. `room` is how many bytes the stream
-/// may still write.
 fn header(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   room: Int,
   base: Int,
 ) -> MetaBlockHeader / {brotli.fail, abort.raise} = {
-  let last = src.bits_at(bit, 1) == 1;
+  let last = source.bits_at(bit, 1) == 1;
   let at = bit + (if last { 2 } else { 1 });
-  let digits = src.bits_at(at, 2);
+  let digits = source.bits_at(at, 2);
   if at > end { fail_at_bit(base, end + 1, end, Truncated) }
-  else if last && src.bits_at(bit + 1, 1) == 1 {
+  else if last && source.bits_at(bit + 1, 1) == 1 {
     { kind: 0, last: true, length: 0, bit: bit + 2, meta: no_meta_block_codes() }
   } else if digits == 3 {
-    let size = src.bits_at(at + 3, 2);
-    let value = src.bits_at(at + 5, 8 * size);
+    let size = source.bits_at(at + 3, 2);
+    let value = source.bits_at(at + 5, 8 * size);
     let after = at + 5 + 8 * size;
     if after > end { fail_at_bit(base, after, end, Truncated) }
-    else if src.bits_at(at + 2, 1) != 0 || (size > 1 && value >>> 8 * size - 8 == 0) {
+    else if source.bits_at(at + 2, 1) != 0 || (size > 1 && value >>> 8 * size - 8 == 0) {
       fail_at_bit(base, after, end, Header)
     } else {
       {
         kind: 1,
         last: last,
         length: if size == 0 { 0 } else { value + 1 },
-        bit: next_byte_boundary(src, after, end, base),
+        bit: next_byte_boundary(source, after, end, base),
         meta: no_meta_block_codes(),
       }
     }
   } else {
     let width = 4 * (digits + 4);
-    let length = src.bits_at(at + 2, width) + 1;
-    let plain = !last && src.bits_at(at + 2 + width, 1) == 1;
+    let length = source.bits_at(at + 2, width) + 1;
+    let plain = !last && source.bits_at(at + 2 + width, 1) == 1;
     let after = at + 2 + width + (if last { 0 } else { 1 });
     if after > end { fail_at_bit(base, after, end, Truncated) }
     else if digits > 0 && length - 1 >>> width - 4 == 0 { fail_at_bit(base, after, end, Header) }
@@ -1159,23 +1036,16 @@ fn header(
         kind: 2,
         last: false,
         length: length,
-        bit: next_byte_boundary(src, after, end, base),
+        bit: next_byte_boundary(source, after, end, base),
         meta: no_meta_block_codes(),
       }
     } else {
-      let read = read_meta_block_codes(src, after, end, base);
+      let read = read_meta_block_codes(source, after, end, base);
       { kind: 3, last: last, length: length, bit: read.bit, meta: read.meta }
     }
   }
 }
 
-/// All of a reader's state except its two buffers: the next bit of the input to read and the
-/// stream offset of the input's first byte; how much of the history has been returned and how
-/// much dropped from its front; what comes next (0 the stream's first bits, 1 a meta-block's
-/// header, 2 its commands, 3 its uncompressed bytes, 4 bytes to skip, 5 nothing more); whether it
-/// waits for input; the window; whether the meta-block is the last and how much of it is left;
-/// its three categories' block states, the four distances last used and the partly read command,
-/// as `Step` stores them; and what its commands are read with.
 type Core = {
   limits: Limits,
   bit: Int,
@@ -1197,12 +1067,8 @@ type Core = {
   meta: MetaBlockCodes,
 }
 
-/// A reader partway through a stream: the input not yet read, followed by 32 zero bytes so that a
-/// reader slightly past its end reads bits instead of faulting; the bytes written that a copy may
-/// still reach or that are not yet returned; and the rest of its state.
 type Decoder = { input: Bytes, history: Bytes, core: Core }
 
-/// `input` followed by the zeros a reader's input ends with.
 fn padded(input: Bytes) -> Bytes =
   input.concat(
     b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
@@ -1236,8 +1102,6 @@ fn decoder(limits: Limits, input: Bytes) -> Decoder =
 
 fn need_input(d: Decoder) -> Decoder = { ..d, core: { ..d.core, need: 1 } }
 
-/// Reads a stream's first bits, which give how many bytes of history a copy may reach back: one
-/// bit for 64 KiB less sixteen bytes, or three or six more bits for another power of two.
 fn read_stream_header(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   let core = d.core;
   let end = 8 * d.input.len() - 256;
@@ -1255,19 +1119,16 @@ fn read_stream_header(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   else { { ..d, core: { ..core, bit: bit + used, phase: 1, need: 0, window: (1 << power) - 16 } } }
 }
 
-/// The phase after a meta-block: another header, or after the last meta-block, the end, where the
-/// bits that fill the stream's last byte must be zeros.
 fn after_block(
-  src: Bytes,
+  source: Bytes,
   bit: Int,
   end: Int,
   last: Bool,
   base: Int,
 ) -> { phase: Int, bit: Int } / {brotli.fail, abort.raise} =
-  if last { { phase: 5, bit: next_byte_boundary(src, bit, end, base) } }
+  if last { { phase: 5, bit: next_byte_boundary(source, bit, end, base) } }
   else { { phase: 1, bit: bit } }
 
-/// Reads a meta-block's header, when the input contains all of it.
 fn block_start(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   let core = d.core;
   let end = 8 * d.input.len() - 256;
@@ -1301,8 +1162,6 @@ fn block_start(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   }
 }
 
-/// Reads a meta-block's uncompressed bytes, or skips its bytes to skip, as many as the input
-/// contains.
 fn plain_bytes(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   let core = d.core;
   let from = core.bit >>> 3;
@@ -1325,8 +1184,6 @@ fn plain_bytes(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   }
 }
 
-/// Reads a meta-block's commands until it is written, `goal` bytes are waiting to be returned, or
-/// the input ends inside a command.
 fn read_commands(d: Decoder, goal: Int) -> Decoder / {brotli.fail, abort.raise} = {
   let core = d.core;
   let end = 8 * d.input.len() - 256;
@@ -1373,7 +1230,6 @@ fn read_commands(d: Decoder, goal: Int) -> Decoder / {brotli.fail, abort.raise} 
   }
 }
 
-/// One step of a reader. A reader that needs more input than it has reports it in `need`.
 fn step(d: Decoder, goal: Int) -> Decoder / {brotli.fail, abort.raise} = {
   let phase = d.core.phase;
   let whole = 8 * d.input.len() - 256 - d.core.bit >>> 3;
@@ -1385,18 +1241,14 @@ fn step(d: Decoder, goal: Int) -> Decoder / {brotli.fail, abort.raise} = {
   else { plain_bytes(d) }
 }
 
-/// Steps until the reader needs input, has `goal` bytes to return, or, if `one` is set, has read
-/// the stream.
 fn pumped(d: Decoder, goal: Int, one: Bool, fuel: Int) -> Decoder / {brotli.fail, abort.raise} =
   if fuel <= 0 || d.core.need > 0 || (one && d.core.phase == 5)
       || d.history.len() - d.core.sent >= goal { d }
   else { pumped(step(d, goal), goal, one, fuel - 1) }
 
-/// Checks that the reader is past the stream's last byte, as it must be where its input ends.
 fn finished(d: Decoder) -> Decoder / {brotli.fail} =
   if d.core.phase != 5 { fail(d.core.base + d.input.len() - 32, Truncated) } else { d }
 
-/// The bytes written and not yet returned.
 fn unreturned_output(d: Decoder) -> Bytes / {abort.raise} =
   if d.core.sent == 0 { d.history } else { d.history.slice(d.core.sent, d.history.len()) }
 
@@ -1420,9 +1272,6 @@ pub fn decompress_first(data: Bytes, limits: Limits) -> FirstStream / {brotli.fa
   else { { plain: unreturned_output(end), used: end.core.base + (end.core.bit >>> 3) } }
 }
 
-// --- A stream a chunk at a time -----------------------------------------------
-
-/// The reader with `chunk` appended to the input it has not read.
 fn fed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
   let core = d.core;
   let from = core.bit >>> 3;
@@ -1435,8 +1284,6 @@ fn fed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
 
 type DecoderOutput = { out: Bytes, next: Decoder }
 
-/// What the reader has written and not yet returned, and the reader without the history that no
-/// copy can reach, which is everything before the window.
 fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   let core = d.core;
   let n = d.history.len();
@@ -1454,8 +1301,6 @@ fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   } else { { out: out, next: { ..d, core: { ..core, sent: n } } } }
 }
 
-/// How many bytes a reader writes before it returns them: a sixteenth of a megabyte, or an eighth
-/// of the window if that is more.
 fn stride(d: Decoder) -> Int = max(65536, d.core.window >>> 3)
 
 fn flowing<| e>(
@@ -1481,22 +1326,22 @@ fn flowing<| e>(
       }
     }
 
-/// Decompresses the chunks of a stream, with a chunk for each pull that has bytes to return. A
-/// pull reads at most one chunk of `packed` and decompresses until it has a stride of bytes (a
-/// sixteenth of a megabyte or an eighth of the window) or needs the next chunk. Of its input, the
-/// reader keeps one chunk and the part of a meta-block's header that came before it. Of its
-/// output, it keeps no more than the window and a quarter again, a stride and one dictionary word,
-/// however long the stream and whatever its commands. The sequence fails where `decompress` would,
-/// and where `packed` ends before the stream does.
+/// Decompresses a stream chunk by chunk, returning a chunk of output for each pull that produces
+/// bytes. A pull reads at most one chunk of `packed` and decompresses until it has written a stride
+/// of bytes (a sixteenth of a megabyte, or an eighth of the window if that is more) or needs the
+/// next chunk. Memory use stays bounded however long the stream is. The input buffer is at most one
+/// chunk plus the unfinished part of a meta-block header (the data that describes a meta-block).
+/// The output history is at most the window plus a quarter of it, a stride and one dictionary word.
+/// Fails where `decompress` would, and also when `packed` ends before the stream does.
 pub fn decompress_stream<| e>(
   packed: Seq<Bytes | e>,
   limits: Limits,
 ) -> Seq<Bytes | {brotli.fail, abort.raise | e}> =
   flowing(packed, decoder(limits, b""), 0x3FFF_FFFF_FFFF_FFFF)
 
-/// A reader partway through a stream: `read` feeds it and `ended` reports whether the stream has
-/// ended. Of its input, it keeps what a header or a command left unread, and of its output, the
-/// window.
+/// A decompressor in the middle of a stream. `read` feeds it input and `ended` reports whether the
+/// stream has ended. It buffers only the unread input of an unfinished header or command, and the
+/// last window of output.
 pub opaque type Reader = | Reader(Decoder)
 
 /// What a reader returns: the bytes it wrote, and the reader after them.
@@ -1505,9 +1350,10 @@ pub type ReadResult = { out: Bytes, next: Reader }
 /// A reader of a stream under `limits`.
 pub fn reader(limits: Limits) -> Reader = Reader(decoder(limits, b""))
 
-/// Reads `chunk` after the input the reader already has, and returns every byte it then
-/// completes. Fails (`brotli.fail`) where `decompress` would reject the stream, except for a
-/// stream that ends early: the stream has ended only when `ended` returns `true`.
+/// Appends `chunk` to the reader's unread input and returns the bytes that this completes, with the
+/// updated reader. Fails with `brotli.fail` where `decompress` would reject the input. Does not
+/// fail when the input stops before the stream is complete, so call `ended` to find out whether the
+/// stream is complete.
 pub fn read(r: Reader, chunk: Bytes) -> ReadResult / {brotli.fail, abort.raise} =
   match r {
     Reader(d) -> {
@@ -1522,40 +1368,29 @@ pub fn read(r: Reader, chunk: Bytes) -> ReadResult / {brotli.fail, abort.raise} 
     },
   }
 
-/// Whether the stream has ended: its last meta-block read.
+/// Returns whether the reader has read the last meta-block of the stream.
 pub fn ended(r: Reader) -> Bool = match r { Reader(d) -> d.core.phase == 5 }
 
-// --- Writing ----------------------------------------------------------------
+type BitWriter = { out: Bytes, accumulator: Int, n: Int }
 
-/// A stream being written: whole bytes, and the `n` bits after them that do not yet fill a byte.
-type BitWriter = { out: Bytes, acc: Int, n: Int }
-
-/// Writes the low `count` bits of `value`, at most 24, after what is already written.
 fn write_bits(w: BitWriter, value: Int, count: Int) -> BitWriter / {abort.raise} = {
-  let acc = w.acc | value << w.n;
+  let accumulator = w.accumulator | value << w.n;
   let n = w.n + count;
-  { out: flush_bits(w.out, acc, n), acc: acc >>> (n & 0x78), n: n & 7 }
+  { out: flush_bits(w.out, accumulator, n), accumulator: accumulator >>> (n & 0x78), n: n & 7 }
 }
 
-/// Writes zeros to the end of the current byte.
 fn pad_to_byte(w: BitWriter) -> BitWriter / {abort.raise} = write_bits(w, 0, 0 - w.n & 7)
 
-/// Each symbol's code as a writer puts it, `bits << 4 | length`, for symbols of these lengths.
 fn codes_of(lengths: Array<Int>) -> Array<Int> / {abort.raise} =
   match canonical(lengths) {
-    // A code with a single symbol takes no bits.
     [_] -> Array::new(lengths.len(), 0),
     keyed ->
       keyed.fold(Array::new(lengths.len(), 0), |codes: Array<Int>, v: Int|
         codes.set(v & 1023, v >>> 14 << 4 | v >>> 10 & 15)),
   }
 
-/// The fixed code for the lengths of the code-length code, for a length of 0 to 5: the bits and
-/// how many there are, `bits << 4 | count`.
 fn length_spelling() -> Bytes = b"\x02\x74\x33\x22\x12\xF4"
 
-/// Writes the lengths of the code that code lengths are written in, in the format's order, until
-/// they form a whole code.
 fn listed_written(
   w: BitWriter,
   lengths: Array<Int>,
@@ -1571,8 +1406,6 @@ fn listed_written(
     else { space - (32 >>> value) })
   }
 
-/// Writes a code's description: a single symbol by its number, or every symbol's length up to the
-/// last symbol that has a code, each written with a code of the lengths themselves.
 fn code_written(w: BitWriter, lengths: Array<Int>) -> BitWriter / {abort.raise} = {
   let alphabet = lengths.len();
   let present = range(0, alphabet).filter(|s: Int| lengths.get(s) > 0);
@@ -1593,16 +1426,10 @@ fn code_written(w: BitWriter, lengths: Array<Int>) -> BitWriter / {abort.raise} 
   }
 }
 
-/// The code of each insert length below 2114.
 const fn short_inserts() -> Bytes = codes_below(insert_codes(), 0, 2114)
 
-/// The code of each copy length from 2 and below 2118, by the length less two.
 const fn short_copies() -> Bytes = codes_below(copy_codes(), 2, 2116)
 
-/// A command's two symbols: the one for its insert and copy lengths, and above bit 10 the one for
-/// its distance. The distance symbol is 64 when none is written, either because the distance is
-/// the last one used and the lengths' symbol can encode that, or because the command copies
-/// nothing. `dist` is 0 for a command of literals only.
 fn symbols_of(insert: Int, copy: Int, dist: Int, last: Int) -> Int / {abort.raise} = {
   let ic = if insert < 2114 { short_inserts().at(insert) }
   else if insert < 6210 { 21 }
@@ -1623,8 +1450,6 @@ fn symbols_of(insert: Int, copy: Int, dist: Int, last: Int) -> Int / {abort.rais
 
 type Counts = { commands: Array<Int>, distances: Array<Int>, last: Int }
 
-/// How often each command and distance symbol occurs in the sequences from `i`, the last of
-/// which may be literals only.
 fn counted_symbols(
   seqs: Array<Int>,
   i: Int,
@@ -1646,58 +1471,53 @@ fn counted_symbols(
     )
   }
 
-/// Writes the bytes of `buf` from `i` up to `end`, each with its code, three per step while three
-/// remain.
 fn literals_written(
-  buf: Bytes,
+  literal_bytes: Bytes,
   i: Int,
   end: Int,
   codes: Array<Int>,
   out: Bytes,
-  acc: Int,
+  accumulator: Int,
   n: Int,
 ) -> BitWriter / {abort.raise} =
   if i + 3 <= end {
-    let a = codes.get(buf.at(i));
-    let b = codes.get(buf.at(i + 1));
-    let c = codes.get(buf.at(i + 2));
+    let a = codes.get(literal_bytes.at(i));
+    let b = codes.get(literal_bytes.at(i + 1));
+    let c = codes.get(literal_bytes.at(i + 2));
     let two = n + (a & 15);
     let three = two + (b & 15);
-    let all = acc | a >>> 4 << n | b >>> 4 << two | c >>> 4 << three;
-    let held = three + (c & 15);
+    let all = accumulator | a >>> 4 << n | b >>> 4 << two | c >>> 4 << three;
+    let total_bits = three + (c & 15);
     literals_written(
-      buf,
+      literal_bytes,
       i + 3,
       end,
       codes,
-      flush_bits(out, all, held),
-      all >>> (held & 0x78),
-      held & 7,
+      flush_bits(out, all, total_bits),
+      all >>> (total_bits & 0x78),
+      total_bits & 7,
     )
   } else if i < end {
-    let a = codes.get(buf.at(i));
-    let all = acc | a >>> 4 << n;
-    let held = n + (a & 15);
+    let a = codes.get(literal_bytes.at(i));
+    let all = accumulator | a >>> 4 << n;
+    let total_bits = n + (a & 15);
     literals_written(
-      buf,
+      literal_bytes,
       i + 1,
       end,
       codes,
-      flush_bits(out, all, held),
-      all >>> (held & 0x78),
-      held & 7,
+      flush_bits(out, all, total_bits),
+      all >>> (total_bits & 0x78),
+      total_bits & 7,
     )
-  } else { { out: out, acc: acc, n: n } }
+  } else { { out: out, accumulator: accumulator, n: n } }
 
-/// The three codes a meta-block's commands are written with, in the form `codes_of` returns.
 type Coding = { literals: Array<Int>, commands: Array<Int>, distances: Array<Int> }
 
-/// Writes the commands from `i`: for each, its symbol, the extra bits of its insert and copy
-/// lengths, its literals, which are in `buf` from `at`, and its distance if it writes one.
 fn commands_written(
   seqs: Array<Int>,
   i: Int,
-  buf: Bytes,
+  buffer: Bytes,
   at: Int,
   last: Int,
   k: Coding,
@@ -1718,16 +1538,16 @@ fn commands_written(
     let cc = copy_codes().get(
       b"\x00\x08\x00\x08\x00\x08\x10\x00\x10\x08\x10".at(cell) + (symbol & 7),
     );
-    let head = w.acc | code >>> 4 << w.n | insert - (ic >>> 5) << w.n + (code & 15);
-    let held = w.n + (code & 15) + (ic & 31);
-    let lengths = head >>> (held & 0x78) | copy - (cc >>> 5) << (held & 7);
-    let held2 = (held & 7) + (cc & 31);
+    let head = w.accumulator | code >>> 4 << w.n | insert - (ic >>> 5) << w.n + (code & 15);
+    let head_bits = w.n + (code & 15) + (ic & 31);
+    let lengths = head >>> (head_bits & 0x78) | copy - (cc >>> 5) << (head_bits & 7);
+    let held2 = (head_bits & 7) + (cc & 31);
     let wrote = literals_written(
-      buf,
+      buffer,
       at,
       at + insert,
       k.literals,
-      flush_bits(flush_bits(w.out, head, held), lengths, held2),
+      flush_bits(flush_bits(w.out, head, head_bits), lengths, held2),
       lengths >>> (held2 & 0x78),
       held2 & 7,
     );
@@ -1736,7 +1556,7 @@ fn commands_written(
       commands_written(
         seqs,
         i + 1,
-        buf,
+        buffer,
         at + insert + (if dist == 0 { 0 } else { copy }),
         if dist == 0 { last } else { dist },
         k,
@@ -1745,12 +1565,12 @@ fn commands_written(
     } else {
       let dcode = k.distances.get(far);
       let width = if far < 16 { 0 } else { bit_length(dist + 3) - 2 };
-      let tail = wrote.acc | dcode >>> 4 << wrote.n
+      let tail = wrote.accumulator | dcode >>> 4 << wrote.n
         | (dist + 3 & (1 << width) - 1) << wrote.n + (dcode & 15);
       let held3 = wrote.n + (dcode & 15) + width;
-      commands_written(seqs, i + 1, buf, at + insert + copy, dist, k, {
+      commands_written(seqs, i + 1, buffer, at + insert + copy, dist, k, {
         out: flush_bits(wrote.out, tail, held3),
-        acc: tail >>> (held3 & 0x78),
+        accumulator: tail >>> (held3 & 0x78),
         n: held3 & 7,
       })
     }
@@ -1758,22 +1578,18 @@ fn commands_written(
 
 /// How hard a writer searches for repeated bytes.
 pub type Level =
-  /// Not at all: the bytes are written uncompressed, in meta-blocks marked as such. A stream is
-  /// its input plus a few bytes, and reads back without the dictionary.
+  /// Does no compression: writes the bytes uncompressed, in meta-blocks marked as stored. The
+  /// stream is the input plus a few bytes, and decompressing it does not need the dictionary.
   | Stored
-  /// One candidate per position: where the next four bytes last occurred, within 2 MiB, and the
-  /// distance of the previous match. Each 128 KiB meta-block has its own three prefix codes, one
-  /// block type and no context modelling, and never uses a dictionary word.
+  /// Tests one candidate match for each position: where the next four bytes last occurred, within 2
+  /// MiB, and the previous match's distance. Each 128 KiB meta-block gets its own three prefix
+  /// codes, uses a single block type with no context modelling, and never uses a dictionary word.
   | Fast
 
-/// What a writer carries from one meta-block to the next: where each four-byte sequence last
-/// occurred, the distance last used, and the bits that do not yet fill a byte.
-type Packer = { table: Array<Int>, last: Int, acc: Int, n: Int }
+type Packer = { table: Array<Int>, last: Int, accumulator: Int, n: Int }
 
 type Packed = { bytes: Bytes, packer: Packer }
 
-/// Writes a meta-block's first bits: that it is not the last, its length in four or five digits,
-/// and whether its bytes are uncompressed.
 fn block_head(w: BitWriter, length: Int, plain: Bool) -> BitWriter / {abort.raise} = {
   let wide = length > 65536;
   let sized = write_bits(write_bits(w, if wide { 2 } else { 0 }, 3), length - 1, if wide { 20 }
@@ -1781,11 +1597,8 @@ fn block_head(w: BitWriter, length: Int, plain: Bool) -> BitWriter / {abort.rais
   write_bits(sized, if plain { 1 } else { 0 }, 1)
 }
 
-/// Writes the meta-block of `buf` from `from` to `to`, which are at most 128 KiB apart and not
-/// equal: commands with codes of its own if that is shorter than its bytes, and the uncompressed
-/// bytes otherwise.
 fn block_written(
-  buf: Bytes,
+  buffer: Bytes,
   from: Int,
   to: Int,
   shift: Int,
@@ -1793,16 +1606,15 @@ fn block_written(
   p: Packer,
 ) -> Packed / {abort.raise} = {
   let last = p.last;
-  let start: BitWriter = { out: b"", acc: p.acc, n: p.n };
+  let start: BitWriter = { out: b"", accumulator: p.accumulator, n: p.n };
   let raw = pad_to_byte(block_head(start, to - from, true));
-  let stored = raw.out.concat(buf.slice(from, to));
+  let stored = raw.out.concat(buffer.slice(from, to));
   match level {
-    Stored -> { bytes: stored, packer: { table: p.table, last: last, acc: 0, n: 0 } },
+    Stored -> { bytes: stored, packer: { table: p.table, last: last, accumulator: 0, n: 0 } },
     Fast -> {
-      let seen = find_matches(buf, from, from, to, p.table, [], last, shift, to - from + 1);
+      let seen = find_matches(buffer, from, from, to, p.table, [], last, shift, to - from + 1);
       let anchor = seen.anchor;
       let table = seen.table;
-      // The bytes after the last match become one more command, of literals only.
       let seqs = Array::of_list(if anchor < to { seen.sequences.push(to - anchor) }
       else { seen.sequences });
       let counts = counted_symbols(seqs, 0, last, Array::new(704, 0), Array::new(64, 0));
@@ -1811,7 +1623,7 @@ fn block_written(
         |s: { at: Int, pieces: List<Bytes> }, seq: Int|
           {
             at: s.at + (seq & 0xF_FFFF) + (seq >>> 20 & 0xF_FFFF),
-            pieces: s.pieces.push(buf.slice(s.at, s.at + (seq & 0xF_FFFF))),
+            pieces: s.pieces.push(buffer.slice(s.at, s.at + (seq & 0xF_FFFF))),
           },
       ).pieces.fold(b"", |all: Bytes, piece: Bytes| all ++ piece);
       let lengths = |c: Array<Int>|
@@ -1830,7 +1642,7 @@ fn block_written(
       let wrote = commands_written(
         seqs,
         0,
-        buf,
+        buffer,
         from,
         last,
         {
@@ -1841,20 +1653,19 @@ fn block_written(
         spelled,
       );
       if wrote.out.len() >= stored.len() {
-        { bytes: stored, packer: { table: table, last: last, acc: 0, n: 0 } }
+        { bytes: stored, packer: { table: table, last: last, accumulator: 0, n: 0 } }
       } else {
         {
           bytes: wrote.out,
-          packer: { table: table, last: counts.last, acc: wrote.acc, n: wrote.n },
+          packer: { table: table, last: counts.last, accumulator: wrote.accumulator, n: wrote.n },
         }
       }
     },
   }
 }
 
-/// Writes the meta-blocks of `buf` from `from` to `to`.
 fn blocks_written(
-  buf: Bytes,
+  buffer: Bytes,
   from: Int,
   to: Int,
   shift: Int,
@@ -1863,51 +1674,43 @@ fn blocks_written(
   out: List<Bytes>,
 ) -> { out: List<Bytes>, packer: Packer } / {abort.raise} =
   if from >= to { { out: out, packer: p } } else if from >= to - 131072 {
-    let one = block_written(buf, from, to, shift, level, p);
+    let one = block_written(buffer, from, to, shift, level, p);
     { out: out.push(one.bytes), packer: one.packer }
   } else {
-    let one = block_written(buf, from, from + 131072, shift, level, p);
+    let one = block_written(buffer, from, from + 131072, shift, level, p);
     let grown = out.push(one.bytes);
-    blocks_written(buf, from + 131072, to, shift, level, one.packer, grown)
+    blocks_written(buffer, from + 131072, to, shift, level, one.packer, grown)
   }
 
-/// A stream's last bits: an empty meta-block marked as the last, and zeros to a whole byte.
 fn end_of_stream(p: Packer) -> Bytes / {abort.raise} =
-  pad_to_byte(write_bits({ out: b"", acc: p.acc, n: p.n }, 3, 2)).out
+  pad_to_byte(write_bits({ out: b"", accumulator: p.accumulator, n: p.n }, 3, 2)).out
 
 /// Compresses `data` as one stream. Its window is 64 KiB if the data is no longer than that, and
 /// 4 MiB otherwise.
 pub fn compress(data: Bytes, level: Level) -> Bytes / {abort.raise} = {
   let n = data.len();
-  let start: Packer = if n <= 65520 { { table: Array::new(131072, 0), last: 4, acc: 0, n: 1 } }
-  else { { table: Array::new(131072, 0), last: 4, acc: 11, n: 4 } };
+  let start: Packer = if n <= 65520 {
+    { table: Array::new(131072, 0), last: 4, accumulator: 0, n: 1 }
+  } else { { table: Array::new(131072, 0), last: 4, accumulator: 11, n: 4 } };
   let written = blocks_written(data, 0, n, 0, level, start, []);
   Bytes::concat_all(written.out.push(end_of_stream(written.packer)))
 }
 
-// --- Writing a chunk at a time ------------------------------------------------
-
-/// A writer partway through a stream: the bytes a match may reach, followed, from `from`, by the
-/// bytes not yet in any meta-block; the stream offset of the first of them; and what one
-/// meta-block passes to the next.
-type Encoder = { buf: Bytes, from: Int, shift: Int, packer: Packer }
+type Encoder = { buffer: Bytes, from: Int, shift: Int, packer: Packer }
 
 type EncoderOutput = { out: Bytes, next: Encoder }
 
-/// Adds `chunk` to the writer, and writes every whole 128 KiB meta-block it then has. It keeps
-/// the 2 MiB before the bytes not yet written, and drops older bytes once they amount to as much
-/// again.
 fn compress_chunk(w: Encoder, chunk: Bytes, level: Level) -> EncoderOutput / {abort.raise} = {
-  let buf = w.buf.concat(chunk);
-  let whole = (buf.len() - w.from) / 131072 * 131072;
-  if whole == 0 { { out: b"", next: { ..w, buf: buf } } } else {
-    let done = blocks_written(buf, w.from, w.from + whole, w.shift, level, w.packer, []);
+  let buffer = w.buffer.concat(chunk);
+  let whole = (buffer.len() - w.from) / 131072 * 131072;
+  if whole == 0 { { out: b"", next: { ..w, buffer: buffer } } } else {
+    let done = blocks_written(buffer, w.from, w.from + whole, w.shift, level, w.packer, []);
     let at = w.from + whole;
     let cut = if at > 4194304 { at - 2097152 } else { 0 };
     {
       out: Bytes::concat_all(done.out),
       next: {
-        buf: if cut == 0 { buf } else { buf.slice(cut, buf.len()) },
+        buffer: if cut == 0 { buffer } else { buffer.slice(cut, buffer.len()) },
         from: at - cut,
         shift: w.shift + cut,
         packer: done.packer,
@@ -1916,14 +1719,16 @@ fn compress_chunk(w: Encoder, chunk: Bytes, level: Level) -> EncoderOutput / {ab
   }
 }
 
-/// A writer before its first byte. A stream of no known length opens with four bits that give it a
-/// window of 4 MiB.
 fn new_encoder() -> Encoder =
-  { buf: b"", from: 0, shift: 0, packer: { table: Array::new(131072, 0), last: 4, acc: 11, n: 4 } }
+  {
+    buffer: b"",
+    from: 0,
+    shift: 0,
+    packer: { table: Array::new(131072, 0), last: 4, accumulator: 11, n: 4 },
+  }
 
-/// Writes what the writer still has as the meta-blocks that end the stream.
 fn finish_encoder(w: Encoder, level: Level) -> Bytes / {abort.raise} = {
-  let rest = blocks_written(w.buf, w.from, w.buf.len(), w.shift, level, w.packer, []);
+  let rest = blocks_written(w.buffer, w.from, w.buffer.len(), w.shift, level, w.packer, []);
   Bytes::concat_all(rest.out.push(end_of_stream(rest.packer)))
 }
 
@@ -1935,7 +1740,7 @@ fn encoding<| e>(
 ) -> Seq<Bytes | {abort.raise | e}> =
   ||
     if fuel <= 0 { Done } else {
-      let w = match state { Some(held) -> held, None -> new_encoder() };
+      let w = match state { Some(current) -> current, None -> new_encoder() };
       match plain() {
         Done -> Yield(finish_encoder(w, level), seq::empty()),
         Skip(rest) -> Skip(encoding(rest, level, state, fuel - 1)),
@@ -1947,14 +1752,15 @@ fn encoding<| e>(
       }
     }
 
-/// Compresses the chunks of `plain` as one stream, with a chunk for each pull that completes a
-/// 128 KiB meta-block or ends the stream. Its window is 4 MiB. The writer keeps the 2 MiB a match
-/// may reach and up to as much again, the meta-block it is filling, and the chunk it was given.
+/// Compresses the chunks of `plain` as one stream, returning a chunk of output for each pull that
+/// completes a 128 KiB meta-block or ends the stream. The window is 4 MiB. The writer buffers the 2
+/// MiB a match may copy from plus up to 2 MiB more, the meta-block being filled, and the chunk it
+/// was given.
 pub fn compress_stream<| e>(plain: Seq<Bytes | e>, level: Level) -> Seq<Bytes | {abort.raise | e}> =
   encoding(plain, level, None, 0x3FFF_FFFF_FFFF_FFFF)
 
-/// A writer partway through a stream: `write` feeds it and `finish` ends it. It keeps the 2 MiB a
-/// match may reach and up to as much again, and the meta-block it is filling.
+/// A compressor in the middle of a stream. `write` feeds it input and `finish` ends the stream. It
+/// buffers the 2 MiB a match may copy from plus up to 2 MiB more, and the meta-block being filled.
 pub opaque type Writer = | Writer(Encoder)
 
 /// What a writer returns: the bytes it wrote, and the writer after them.
@@ -1976,8 +1782,6 @@ pub fn write(w: Writer, chunk: Bytes, level: Level) -> WriteResult / {abort.rais
 pub fn finish(w: Writer, level: Level) -> Bytes / {abort.raise} =
   match w { Writer(e) -> finish_encoder(e, level) }
 
-// --- Tests ------------------------------------------------------------------
-
 fn sample_sentence() -> Bytes =
   b"Ply checks every effect a program performs, and a test that reads no host is cached. "
 
@@ -1993,7 +1797,6 @@ fn sample_html() -> Bytes =
 
 fn large_limits() -> Limits = { output: 1048576, window: 16777200 }
 
-/// `n` bytes of noise, which no match shortens.
 fn noise(n: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all(
     range(0, n / 4 + 1).fold(
@@ -2037,13 +1840,13 @@ fn samples() -> List<Sample> / {abort.raise} =
     { name: "noise and then a sentence", bytes: noise(5000).concat(sample_sentence().repeat(60)) },
   ]
 
-/// The decompressed chunks of a stream, joined.
 fn gathered(
   chunks: Seq<Bytes | {brotli.fail, abort.raise}>,
 ) -> Bytes / {brotli.fail, seq.spent, abort.raise} =
   Bytes::concat_all(seq::to_list(chunks, 1000000))
 
-test "{s.name} survives each level, whole and a chunk at a time" for s: Sample in samples() {
+test "{s.name} decompresses to the original bytes after `compress` at each level, and after streaming in chunks" for s: Sample in samples(
+  ) {
   let fast = compress(s.bytes, Fast);
   assert(decompress(fast, large_limits()) == s.bytes);
   assert(decompress(compress(s.bytes, Stored), large_limits()) == s.bytes);
@@ -2057,7 +1860,7 @@ test "{s.name} survives each level, whole and a chunk at a time" for s: Sample i
   assert(fast.len() <= s.bytes.len() + 16)
 }
 
-test "a stream starts with its window and ends with an empty meta-block, and text compresses to a hundredth" {
+test "`compress` and `compress_stream` write the exact bytes for empty, one-byte and incompressible input" {
   assert_eq(compress(b"", Fast), b"\x06");
   assert_eq(compress(b"", Stored), b"\x06");
   assert_eq(compress(b"a", Stored), Bytes::of_hex("0000106103"));
@@ -2071,8 +1874,6 @@ test "a stream starts with its window and ends with an empty meta-block, and tex
 
 type Fixture = { name: String, packed: String, plain: Bytes }
 
-/// Streams that `brotli` 1.2.0 wrote: at each quality that decodes differently, with the smallest
-/// and the largest window, and of empty input. Those at quality 5 and above use dictionary words.
 fn streams() -> List<Fixture> =
   [
     {
@@ -2119,7 +1920,8 @@ fn streams() -> List<Fixture> =
     { name: "nothing, from a pipe, which gives the largest window", packed: "3f", plain: b"" },
   ]
 
-test "decompress reads {f.name}, whole and a few bytes at a time" for f: Fixture in streams() {
+test "`decompress` and `decompress_stream` return the original bytes of {f.name}, given whole or in pieces of 1 or 7 bytes" for f: Fixture in streams(
+  ) {
   let packed = Bytes::of_hex(f.packed);
   assert_eq(decompress(packed, large_limits()), f.plain);
   assert_eq(gathered(decompress_stream(seq::slices(packed, 1), large_limits())), f.plain);
@@ -2127,7 +1929,8 @@ test "decompress reads {f.name}, whole and a few bytes at a time" for f: Fixture
   assert_eq(decompress_first(packed.concat(b"more"), large_limits()).used, packed.len())
 }
 
-test "cut short anywhere, {f.name} fails as truncated, at the cut" for f: Fixture in streams() {
+test "`try_decompress` of {f.name} cut to any shorter length fails as truncated, at the cut length" for f: Fixture in streams(
+  ) {
   let whole = Bytes::of_hex(f.packed);
   assert_eq(
     range(0, whole.len()).filter(|n: Int|
@@ -2176,8 +1979,6 @@ test "the first stream can be read alone, with how many bytes of the input it to
   assert_error(try { decompress_first(a.slice(0, 3), large_limits()).plain }, 3, Truncated)
 }
 
-/// Writes a simple code of the four `symbols`, each with a two-bit code, as a meta-block's header
-/// lists one.
 fn write_four_symbols(w: BitWriter, symbols: List<Int>, width: Int) -> BitWriter / {abort.raise} =
   write_bits(
     symbols.fold(write_bits(write_bits(w, 1, 2), 3, 2), |at: BitWriter, s: Int|
@@ -2186,14 +1987,9 @@ fn write_four_symbols(w: BitWriter, symbols: List<Int>, width: Int) -> BitWriter
     1,
   )
 
-/// The start of a stream of one meta-block of `length` bytes, up to its commands. A literal is
-/// one of four letters. A command inserts one and copies two from the last distance, copies
-/// four or inserts two and copies six from a distance it reads, or inserts ten to thirteen and
-/// copies five. A distance is the last one, one less, one or two, or one so far back that it
-/// refers to a dictionary word.
 fn stream_header(length: Int) -> BitWriter / {abort.raise} = {
   let head = write_bits(
-    write_bits(write_bits({ out: b"", acc: 0, n: 1 }, 1, 2), 0, 2),
+    write_bits(write_bits({ out: b"", accumulator: 0, n: 1 }, 1, 2), 0, 2),
     length - 1,
     16,
   );
@@ -2208,7 +2004,7 @@ fn stream_header(length: Int) -> BitWriter / {abort.raise} = {
   )
 }
 
-test "a match from before the first byte is a word of the dictionary, as a transform writes it" {
+test "a copy distance beyond the output so far outputs a word from the built-in dictionary, and a too-short word fails" {
   let named = |extra: Int|
     pad_to_byte(write_bits(write_bits(write_bits(stream_header(8), 2, 2), 3, 2), extra, 13)).out;
   assert_eq(decompress(named(4), large_limits()), b"time in ");
@@ -2219,7 +2015,7 @@ test "a match from before the first byte is a word of the dictionary, as a trans
   assert_error(try_decompress(short, large_limits()), short.len() - 1, Length)
 }
 
-test "a word is found by its length and number, and written between two strings, cut, or in upper case" {
+test "dictionary words are found by length and index, and `transformed` adds a prefix and suffix, drops letters or uppercases them" {
   let word = |length: Int, number: Int| {
     let from = word_starts().get(length) + number * length;
     words().slice(from, from + length)
@@ -2249,7 +2045,7 @@ test "a word is found by its length and number, and written between two strings,
   assert_eq(transformed(b"abc", 42), b"")
 }
 
-test "the dictionary is the bytes of RFC 7932's Appendix A, by their length and CRC-32 as it gives them" {
+test "the dictionary has the length, CRC-32 and SHA-256 that RFC 7932 Appendix A gives for its bytes" {
   assert_eq(words().len(), 122784);
   assert_eq(Int::of_u32(crc32(words())), 0x5136CB04);
   assert_eq(
@@ -2273,7 +2069,7 @@ test "the context lookup is the table of RFC 7932's section 7.1" {
   assert_eq(text(0xA9, 0xC3), 1)
 }
 
-test "the errors only a command can raise are reported at its position" {
+test "a copy command with an invalid distance, length or dictionary word fails with an error at the command's bit position" {
   let ring = 4 | 11 << 25;
   let lim = Array::of_list([0, 1008, 100]);
   let fill_at_intervals = |length: Int, dist: Int, left: Int| -> Result<Bytes, Error> {
@@ -2311,12 +2107,12 @@ test "the errors only a command can raise are reported at its position" {
 }
 
 test "a stream that asks for the largest window is rejected at its first byte under a smaller limit, however long it is" {
-  let asks = |packed: Bytes| try_decompress(packed, { output: 1048576, window: 8388592 });
-  assert_error(asks(b"\x3F"), 0, Window);
-  assert_error(asks(b"\x0F".concat(noise(100000))), 0, Window)
+  let decompress_limited = |packed: Bytes|
+    try_decompress(packed, { output: 1048576, window: 8388592 });
+  assert_error(decompress_limited(b"\x3F"), 0, Window);
+  assert_error(decompress_limited(b"\x0F".concat(noise(100000))), 0, Window)
 }
 
-/// The largest size the history reaches while reading `d` until it needs input.
 fn largest_history(
   d: Decoder,
   most: Int,
@@ -2328,11 +2124,10 @@ fn largest_history(
     largest_history(take_output(moved).next, wide, fuel - 1)
   }
 
-test "a stream is read in a history its window bounds, however long it is and whatever its commands" {
+test "decoding retains at most the window size of earlier output, however long the stream is and whatever its commands" {
   let plain = sample_sentence().repeat(4000);
-  // A stream with a 1 KiB window, in uncompressed meta-blocks of 1000 bytes.
   let blocks = range(0, 340).fold(
-    { out: [], packer: { table: Array::new(1, 0), last: 4, acc: 0x21, n: 7 } },
+    { out: [], packer: { table: Array::new(1, 0), last: 4, accumulator: 0x21, n: 7 } },
     |s: { out: List<Bytes>, packer: Packer }, i: Int| {
       let one = block_written(plain, 1000 * i, 1000 * i + 1000, 0, Stored, s.packer);
       { out: s.out.push(one.bytes), packer: one.packer }
@@ -2346,7 +2141,6 @@ test "a stream is read in a history its window bounds, however long it is and wh
   );
   assert_eq(read.d.core.dropped_history_bytes + read.d.history.len(), 340000);
   assert(read.most < 140000, Some(read.most.to_string()));
-  // What `brotli -q 5 -w 10` wrote of 300000 zeros: one copy of nearly all of them.
   let zeros = Bytes::of_hex(
     "21fdff07001200f15820b9f701faff0f002400e2b00074ef03e27b128004401c1680e62200",
   );
@@ -2363,11 +2157,10 @@ test "a stream written at the fast level reads back" {
   gen::check(gen::bytes(), |p: Bytes| inverse(|x: Bytes| compress(x, Fast), unpacked, p))
 }
 
-/// What `pieces` decompress to as the chunks of a stream, or why they were rejected.
 fn chunked(pieces: List<Bytes>, limits: Limits) -> Result<Bytes, Error> / {seq.spent, abort.raise} =
   try[brotli.fail] { gathered(decompress_stream(seq::of_list(pieces), limits)) }
 
-test "a stream reads the same however its bytes are cut, and so does what is written of them" {
+test "bytes compressed by `compress` or `compress_stream` decompress to the original however the input is split into pieces" {
   gen::check2(gen::bytes(), gen::list(gen::any_int()), |x: Bytes, cuts: List<Int>| {
     let sizes = cuts.map(|c: Int| c & 7);
     let plain = Bytes::concat_all([x, thrice(), x]);
@@ -2376,8 +2169,6 @@ test "a stream reads the same however its bytes are cut, and so does what is wri
   })
 }
 
-/// Whether a reader limited to 4096 bytes returns no more than that or rejects the input, and
-/// raises nothing else.
 fn stays_within_limits(packed: Bytes) -> Bool = {
   let got: Result<Result<Bytes, Error>, String> = try[abort.raise] {
     try_decompress(packed, { output: 4096, window: 65520 })
@@ -2385,7 +2176,7 @@ fn stays_within_limits(packed: Bytes) -> Bool = {
   match got { Ok(Ok(plain)) -> plain.len() <= 4096, Ok(Err(_)) -> true, Err(_) -> false }
 }
 
-test "whatever bytes a reader is given, as a stream, as a meta-block's header or as its commands, it returns within its limits or rejects them" {
+test "`decompress` of arbitrary bytes, alone or after a valid header, returns a result within the size limits or an error" {
   gen::check(gen::bytes(), |x: Bytes| {
     stays_within_limits(x) && stays_within_limits(b"\xE2\x7F\x00".concat(x))
       && stays_within_limits(pad_to_byte(stream_header(2000)).out.concat(x))

@@ -51,23 +51,22 @@ fn get_rejects_a_secret_key_and_secret_rejects_a_plain_one() {
 }
 
 #[test]
-fn without_a_schema_containment_is_only_as_strong_as_the_schema() {
+fn without_a_schema_a_secret_value_is_readable_because_nothing_marks_it_secret() {
     let snapshot = snapshot(&[("SERVICE_API_KEY", "s3cret", false)], false);
     assert_eq!(snapshot.get("SERVICE_API_KEY"), Some("s3cret"));
     assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), Some("s3cret"));
 }
 
-/// `None`, not an empty `Secret`, so unset and set-to-nothing stay distinguishable.
 #[test]
-fn an_unsupplied_secret_returns_none_from_both() {
+fn a_secret_setting_that_was_never_supplied_returns_none_from_both_get_and_plaintext_lookups() {
     let snapshot = snapshot(&[], true);
     assert_eq!(snapshot.get("SERVICE_API_KEY"), None);
     assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), None);
 }
 
-/// The natives read the run's snapshot through its runtime, and a run granted none reads nothing.
 #[test]
-fn a_hosts_runtime_passes_its_snapshot_borrowed_and_an_unbound_one_passes_none() {
+fn a_runtime_made_by_a_host_returns_the_host_s_configuration_and_a_runtime_without_a_host_returns_an_empty_one()
+ {
     let granted = snapshot(
         &[
             ("SERVICE_API_KEY", "s3cret", true),

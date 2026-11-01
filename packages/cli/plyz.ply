@@ -32,14 +32,14 @@ pub fn unpack(b: Bytes) -> Result<ArchiveContents, String> / {abort.raise} =
   match decode_library(b) {
     Err(r) -> Err(String::of_bytes_lossy(r.message)),
     Ok(x) -> match digest_of(library_domain(), b) {
-      None -> Err("the archive is too short to be sealed"),
+      None -> Err("the archive is too short to contain a digest"),
       Some(d) -> if d != x.digest {
         Err("the archive's digest field is not the digest of its bytes")
       } else {
         match section_named(x.sections, b"manifest") {
-          None -> Err("the archive holds no manifest"),
+          None -> Err("the archive contains no manifest"),
           Some(m) -> match section_named(x.sections, b"sources") {
-            None -> Err("the archive holds no sources"),
+            None -> Err("the archive contains no sources"),
             Some(s) -> match read_frames(
                 artifact_builder::payload(b, s),
                 s.count,
@@ -62,7 +62,7 @@ fn section_named(sections: List<SectionLocation>, name: Bytes) -> Option<Section
     match found { Some(_) -> found, None -> if p.name == name { Some(p) } else { None } })
 
 fn read_frames(
-  src: Bytes,
+  section: Bytes,
   count: Int,
   at: Int,
   out: List<Module>,
@@ -70,35 +70,38 @@ fn read_frames(
 ) -> Result<List<Module>, String> / {abort.raise} =
   if left <= 0 { panic("more frames than asked for") } else {
     if out.len() == count {
-      if at == src.len() { Ok(out) }
+      if at == section.len() { Ok(out) }
       else { Err("the sources section runs on past its last module") }
     } else {
-      match frame_at(src, at) {
+      match frame_at(section, at) {
         Err(reason) -> Err(reason),
-        Ok(f) -> read_frames(src, count, f.next, out.push(f.module), left - 1),
+        Ok(f) -> read_frames(section, count, f.next, out.push(f.module), left - 1),
       }
     }
   }
 
-fn frame_at(src: Bytes, at: Int) -> Result<{ module: Module, next: Int }, String> / {abort.raise} =
-  if !src.slice(at, src.len()).starts_with(b"module ") {
+fn frame_at(
+  section: Bytes,
+  at: Int,
+) -> Result<{ module: Module, next: Int }, String> / {abort.raise} =
+  if !section.slice(at, section.len()).starts_with(b"module ") {
     Err("a module in the sources section is not framed `module <name> <length>`")
   } else {
-    match src.index_of_from(b"\n", at) {
+    match section.index_of_from(b"\n", at) {
       None -> Err("a module's frame in the sources section never ends"),
       Some(nl) -> {
-        let head = String::of_bytes_lossy(src.slice(at + 7, nl));
+        let head = String::of_bytes_lossy(section.slice(at + 7, nl));
         match head.split(" ") {
           [name, size] -> match length_of(size) {
             None -> Err("the module `" ++ name ++ "` is framed with no length"),
-            Some(n) -> if nl + 1 + n > src.len() {
+            Some(n) -> if nl + 1 + n > section.len() {
               Err("the module `" ++ name ++ "` runs past the end of the sources section")
             } else {
               match path_of(name) {
                 Err(reason) -> Err(reason),
                 Ok(path) ->
                   Ok({
-                    module: { name: name, path: path, text: src.slice(nl + 1, nl + 1 + n) },
+                    module: { name: name, path: path, text: section.slice(nl + 1, nl + 1 + n) },
                     next: nl + 1 + n,
                   }),
               }
@@ -120,8 +123,8 @@ fn path_of(name: String) -> Result<String, String> / {abort.raise} = {
 }
 
 fn slashed(name: String) -> String =
-  name.split(".").fold("", |acc: String, part: String|
-    if acc == "" { part } else { acc ++ "/" ++ part })
+  name.split(".").fold("", |accumulator: String, part: String|
+    if accumulator == "" { part } else { accumulator ++ "/" ++ part })
 
 fn length_of(text: String) -> Option<Int> / {abort.raise} =
   if text.len() > 12 || text.starts_with("-") { None } else { text.int_of_string() }
@@ -134,7 +137,7 @@ fn a_file(module: String, text: Bytes) -> File = {
 fn nothing_compiled() -> LibraryUnit =
   { head: { frontend: b"", runtime: b"", entry: b"" }, count: 0, payload: b"" }
 
-test "a library frames every module's source under its name" {
+test "a library archive stores each module's source text preceded by a header with the module's name and length" {
   let first = a_file("core", b"pub fn double(n: Int) -> Int = n * 2\n");
   assert_eq(
     source_frame(first),
@@ -151,10 +154,10 @@ test "a library frames every module's source under its name" {
   assert_eq(parts.get(2).payload, b"unit")
 }
 
-test "the sources a library frames read back as the files they were, paths and all" {
+test "reading the stored module sources gives back each module's name, file path and text" {
   let files = [a_file("core", b"pub fn one() -> Int = 1\n"), a_file("util.math", b"")];
-  let src = Bytes::concat_all(files.map(source_frame));
-  match read_frames(src, 2, 0, [], 3) {
+  let section = Bytes::concat_all(files.map(source_frame));
+  match read_frames(section, 2, 0, [], 3) {
     Err(reason) -> panic(reason),
     Ok(modules) -> {
       assert_eq(modules.map(|module: Module| module.name), ["core", "util.math"]);
@@ -165,7 +168,7 @@ test "the sources a library frames read back as the files they were, paths and a
   }
 }
 
-test "a frame that lies about its length, its name or its count is rejected" {
+test "reading stored module sources fails on a wrong length, an invalid module name or a wrong module count" {
   let one = source_frame(a_file("core", b"x"));
   assert(read_frames(one.concat(b"junk"), 1, 0, [], 2) != Ok([]));
   match read_frames(b"module core 99\nx", 1, 0, [], 2) {

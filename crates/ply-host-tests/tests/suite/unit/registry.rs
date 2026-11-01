@@ -3,7 +3,7 @@ use ply_core::host::Pending;
 use ply_host::Host;
 
 #[test]
-fn a_runtime_rejects_a_token_it_did_not_mint() {
+fn a_runtime_rejects_a_token_that_it_did_not_create() {
     let runtime = Host::new().runtime();
     let stray = Pending {
         token: 0,

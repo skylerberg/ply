@@ -70,7 +70,7 @@ pub type RunDecision = {
   search: Search,
   sim: Json,
   reasons: Map<Int, Reason>,
-  owed: Map<Int, Int>,
+  pending_seed_counts: Map<Int, Int>,
   runs: List<Int>,
   running: Map<Int, Bool>,
   at: Map<Int, Int>,
@@ -98,15 +98,18 @@ fn by_code_count(program: Program, decided: RunDecision) -> Int =
 fn group_of(decided: RunDecision, index: Int) -> Option<Int> = decided.at.get(index)
 
 fn pending_seeds(decided: RunDecision, index: Int) -> Int =
-  match decided.owed.get(index) { Some(owed) -> owed, None -> 0 }
+  match decided.pending_seed_counts.get(index) { Some(count) -> count, None -> 0 }
 
 pub fn group_of_class(analysis: CheckedProgram, class: List<Int>) -> Group / {abort.raise} =
   {
     tests: class,
     effects: outside_effects_text(
       canonical(
-        class.fold([], |acc: List<types::Effect>, i: Int|
-          match test_at(analysis, i) { Some(t) -> acc.concat(t.effects), None -> acc }),
+        class.fold([], |accumulator: List<types::Effect>, i: Int|
+          match test_at(analysis, i) {
+            Some(t) -> accumulator.concat(t.effects),
+            None -> accumulator,
+          }),
       ),
     ),
   }
@@ -129,11 +132,11 @@ fn scheduled_of(program: Program, running: Map<Int, Bool>) -> List<ScheduledTest
   program.cases.filter(|case: Case| running.contains(case.index)).map(|case: Case|
     { index: case.index, contended_effects: cross_test_effects(effects_of(case)) })
 
-fn host_use_of(reaches: List<Int>, case: Case) -> { listed: List<Effect>, host: Bool } =
-  { listed: effects_of(case), host: covers(reaches, case.index) }
+fn host_use_of(host_case_indices: List<Int>, case: Case) -> { listed: List<Effect>, host: Bool } =
+  { listed: effects_of(case), host: covers(host_case_indices, case.index) }
 
-pub fn counts_of(program: Program, reaches: List<Int>) -> Counts =
-  counts(program.cases.map(|case: Case| host_use_of(reaches, case)))
+pub fn counts_of(program: Program, host_case_indices: List<Int>) -> Counts =
+  counts(program.cases.map(|case: Case| host_use_of(host_case_indices, case)))
 
 pub fn run_decision_of(
   program: Program,
@@ -148,11 +151,12 @@ pub fn run_decision_of(
   {
     search: search,
     sim: sim,
-    reasons: decisions.fold(Map::new(), |acc: Map<Int, Reason>, x: Decision|
-      if acc.contains(x.case.index) { acc } else { acc.insert(x.case.index, x.reason) }),
-    owed: decisions.fold(Map::new(), |acc: Map<Int, Int>, x: Decision|
-      if !x.case.seeded || acc.contains(x.case.index) { acc } else {
-        acc.insert(x.case.index, match x.case.owed {
+    reasons: decisions.fold(Map::new(), |accumulator: Map<Int, Reason>, x: Decision|
+      if accumulator.contains(x.case.index) { accumulator }
+      else { accumulator.insert(x.case.index, x.reason) }),
+    pending_seed_counts: decisions.fold(Map::new(), |accumulator: Map<Int, Int>, x: Decision|
+      if !x.case.seeded || accumulator.contains(x.case.index) { accumulator } else {
+        accumulator.insert(x.case.index, match x.case.pending_seeds {
           Some(roots) -> roots.len(),
           None -> search.roots.len(),
         })
@@ -170,8 +174,8 @@ pub fn run_decision_of(
 }
 
 fn class_numbers(classes: List<List<Int>>) -> Map<Int, Int> =
-  range(0, classes.len()).fold(Map::new(), |acc: Map<Int, Int>, i: Int|
-    classes.at_or(i, []).fold(acc, |a: Map<Int, Int>, index: Int|
+  range(0, classes.len()).fold(Map::new(), |accumulator: Map<Int, Int>, i: Int|
+    classes.at_or(i, []).fold(accumulator, |a: Map<Int, Int>, index: Int|
       if a.contains(index) { a } else { a.insert(index, i) }))
 
 pub type Group = { tests: List<Int>, effects: String }
@@ -371,8 +375,11 @@ fn dim_place(
   }
 
 pub fn primary_of(diagnostic: Diagnostic) -> Option<Label> =
-  diagnostic.labels.fold(None, |acc: Option<Label>, label: Label|
-    match acc { Some(_) -> acc, None -> if label.primary { Some(label) } else { None } })
+  diagnostic.labels.fold(None, |accumulator: Option<Label>, label: Label|
+    match accumulator {
+      Some(_) -> accumulator,
+      None -> if label.primary { Some(label) } else { None },
+    })
 
 fn label_at(label: Label) -> ModuleSpan =
   { module: label.module, start: label.start, end: label.end }
@@ -386,19 +393,19 @@ fn location_json(places: List<SourceText>, diagnostic: Diagnostic) -> Json / {ab
 fn reason_key(reason: String) -> String = String::join(reason.split(" "), "_")
 
 fn reason_text(reason: String) -> String =
-  if reason == "new" { "this hash has never gone green, so nothing is known about it" }
+  if reason == "new" { "this hash has never passed, so nothing is known about it" }
   else if reason == "changed" {
-    "something its last pass read has changed since, so that pass no longer vouches for it"
+    "something the test read when it last passed has changed since, so that result can no longer be trusted"
   } else if reason == "previous failure" {
-    "the cache holds a failure, and a failure is never trusted"
+    "the last cached result is a failure, and a failure is never reused"
   } else if reason == "cached" {
     "this exact hash already passed; re-running cannot reveal anything new"
   } else if reason == "same code" {
     "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
-  } else { "no hash was produced, so the cache cannot vouch for it" }
+  } else { "no hash was produced, so no cached result can be trusted" }
 
-pub fn isolated_as(reaches: List<Int>, case: Case) -> String =
-  isolation_word(isolation_of(host_use_of(reaches, case)))
+pub fn isolated_as(host_case_indices: List<Int>, case: Case) -> String =
+  isolation_word(isolation_of(host_use_of(host_case_indices, case)))
 
 pub type Opening = { operations: Int, digest: String, tests_using_host: List<Int>, workers: Int }
 
@@ -432,10 +439,10 @@ fn group_line(decided: RunDecision, workers: Int) -> List<String> / {abort.raise
 fn isolated_line(style: Style, c: Counts) -> List<String> / {abort.raise} =
   if c.total == 0 { [] } else {
     let contending = if c.shared == 0 { "" }
-    else { dim(style, " · " ++ count_of(c.shared, "test") ++ " can contend") };
+    else { dim(style, " · " ++ count_of(c.shared, "test") ++ " may conflict") };
     [
-      indent() ++ bold(style, "isolated") ++ " " ++ bold(style, c.isolated.to_string()) ++ " of "
-        ++ c.total.to_string()
+      indent() ++ bold(style, c.isolated.to_string()) ++ " of " ++ c.total.to_string()
+        ++ bold(style, " tests are isolated")
         ++ contending,
     ]
   }
@@ -443,15 +450,11 @@ fn isolated_line(style: Style, c: Counts) -> List<String> / {abort.raise} =
 pub fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abort.raise} =
   if o.operations == 0 { [] } else {
     [
-      indent() ++ bold(style, "host") ++ " " ++ bold(style, c.host.to_string()) ++ " of "
-        ++ c.total.to_string()
+      indent() ++ bold(style, c.host.to_string()) ++ " of " ++ c.total.to_string()
+        ++ bold(style, " tests use the host")
         ++ " · "
-        ++ dim(style, "cached by what each read"),
-      indent()
-        ++ dim(
-          style,
-          "binding host · " ++ count_of(o.operations, "operation") ++ " · " ++ o.digest,
-        ),
+        ++ dim(style, "each result is cached with what the test read from the host"),
+      indent() ++ dim(style, "host: " ++ count_of(o.operations, "operation") ++ " · " ++ o.digest),
     ]
   }
 
@@ -492,9 +495,9 @@ fn backend_lines(style: Style, report: RunReport) -> List<String> =
       [
         indent() ++ bold(style, "backend") ++ " " ++ bold(style, b.name) ++ " · "
           ++ b.entered.to_string()
-          ++ " entered · "
+          ++ " tests run · "
           ++ b.fragment.to_string()
-          ++ " in the fragment",
+          ++ " definitions in the compiled program",
       ].concat(
         compiled_line(style, b),
       ),
@@ -506,7 +509,7 @@ fn bypass_lines(style: Style, flags: Flags) -> List<String> =
 
 fn filtered_lines(style: Style, program: Program) -> List<String> / {abort.raise} =
   if program.filtered_out == 0 { [] }
-  else { [indent() ++ dim(style, "--filter hid " ++ count_of(program.filtered_out, "test"))] }
+  else { [indent() ++ dim(style, "--filter skipped " ++ count_of(program.filtered_out, "test"))] }
 
 fn head_lines(
   style: Style,
@@ -546,8 +549,10 @@ fn run_lines(style: Style, report: RunReport) -> List<String> / {abort.raise} =
 type Phase = { label: String, us: Int }
 
 fn ordered(rows: List<Phase>) -> List<Phase> =
-  rows.fold([], |acc: List<Phase>, p: Phase|
-    acc.filter(|q: Phase| q.us >= p.us).push(p).concat(acc.filter(|q: Phase| q.us < p.us)))
+  rows.fold([], |accumulator: List<Phase>, p: Phase|
+    accumulator.filter(|q: Phase| q.us >= p.us).push(p).concat(
+      accumulator.filter(|q: Phase| q.us < p.us),
+    ))
 
 fn phase_rows(phases: Phases) -> List<Phase> =
   ordered([
@@ -616,11 +621,11 @@ fn explain_effects(isolation: String, case: Case) -> String =
 fn case_line(
   style: Style,
   program: Program,
-  reaches: List<Int>,
+  host_case_indices: List<Int>,
   case: Case,
   decided: RunDecision,
 ) -> String / {abort.raise} = {
-  let isolation = isolated_as(reaches, case);
+  let isolation = isolated_as(host_case_indices, case);
   let reason = reason_word(reason_of(decided, case.index));
   let verb = if runs_test(decided, case.index) { bold(style, "run ") } else { dim(style, "skip") };
   indent() ++ verb ++ " " ++ dim(style, short_of(case.hash)) ++ " " ++ reason.pad_right(16, " ")
@@ -641,17 +646,17 @@ fn case_line(
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
   let recorded = match program.cache_stamp {
     Some(stamp) ->
-      "a pass is recorded under its test's hash and the runtime stamp " ++ short_of(Some(stamp))
-        ++ ", and under the code the test ran, with what its run read",
-    None -> "no pass is recorded: `--no-cache` reads and writes none",
+      "a result is cached under the test's hash and the runtime version " ++ short_of(Some(stamp))
+        ++ ", and under the code the test ran together with the values it read from the system",
+    None -> "nothing is cached: `--no-cache` reads and writes no cache entries",
   };
   ["", indent() ++ dim(style, "key"), indent() ++ "  " ++ dim(style, recorded)]
 }
 
 fn reasons_seen(program: Program, decided: RunDecision) -> List<String> =
-  program.cases.fold([], |acc: List<String>, case: Case| {
+  program.cases.fold([], |accumulator: List<String>, case: Case| {
     let reason = reason_word(reason_of(decided, case.index));
-    if acc.contains(reason) { acc } else { acc.push(reason) }
+    if accumulator.contains(reason) { accumulator } else { accumulator.push(reason) }
   })
 
 fn reason_lines(style: Style, program: Program, decided: RunDecision) -> List<String> = {
@@ -706,21 +711,20 @@ fn search_lines(
         ++ dim(
           style,
           seeded.len().to_string() ++ " of " ++ count_of(program.cases.len(), "test")
-            ++ " keyed on this plan and never on their bare hash",
+            ++ " cached under the simulation mode, seeds, budget and steps shown above, not under the test hash alone",
         ),
     ];
-    seeded.fold(head, |acc: List<String>, case: Case|
-      acc.concat(remaining_seeds_line(style, program, case, decided)))
+    seeded.fold(head, |accumulator: List<String>, case: Case|
+      accumulator.concat(remaining_seeds_line(style, program, case, decided)))
   }
 }
 
 fn group_tally(style: Style, c: Counts, decided: RunDecision) -> String / {abort.raise} = {
-  let hosted = if c.host == 0 { "" }
-  else { " · " ++ c.host.to_string() ++ " host-backed and never free" };
+  let hosted = if c.host == 0 { "" } else { " · " ++ c.host.to_string() ++ " use the host" };
   indent() ++ "  "
     ++ dim(
       style,
-      c.isolated.to_string() ++ " of " ++ c.total.to_string() ++ " isolated and free · "
+      c.isolated.to_string() ++ " of " ++ c.total.to_string() ++ " tests are isolated · "
         ++ count_of(decided.parallelism.shared_groups, "group")
         ++ " for the "
         ++ c.shared.to_string()
@@ -745,9 +749,9 @@ fn group_block(
     indent() ++ "  group " ++ i.to_string() ++ " · " ++ count_of(g.tests.len(), "test") ++ " · "
       ++ dim(style, g.effects),
   );
-  g.tests.fold(head, |acc: List<String>, index: Int| {
+  g.tests.fold(head, |accumulator: List<String>, index: Int| {
     let named = display_name_at(program, index);
-    if named == "" { acc } else { acc.push(indent() ++ "    " ++ named) }
+    if named == "" { accumulator } else { accumulator.push(indent() ++ "    " ++ named) }
   })
 }
 
@@ -760,24 +764,24 @@ fn concurrency_lines(
   if decided.classes.len() == 0 { [] } else {
     range(0, decided.classes.len()).fold(
       ["", indent() ++ dim(style, "concurrency groups"), group_tally(style, c, decided)],
-      |acc: List<String>, i: Int| group_block(style, program, decided, acc, i),
+      |accumulator: List<String>, i: Int| group_block(style, program, decided, accumulator, i),
     )
   }
 
 pub fn explain_lines(
   style: Style,
   program: Program,
-  reaches: List<Int>,
+  host_case_indices: List<Int>,
   decision: RunDecision,
 ) -> List<String> / {abort.raise} =
   [""].concat(
-    program.cases.map(|case: Case| case_line(style, program, reaches, case, decision)),
+    program.cases.map(|case: Case| case_line(style, program, host_case_indices, case, decision)),
   ).concat(
     reason_lines(style, program, decision).concat(key_lines(style, program)),
   ).concat(
     search_lines(style, program, decision),
   ).concat(
-    concurrency_lines(style, program, counts_of(program, reaches), decision),
+    concurrency_lines(style, program, counts_of(program, host_case_indices), decision),
   ).concat(
     phase_lines(style, program.phases),
   )
@@ -812,8 +816,8 @@ fn result_name(program: Program, outcome: Outcome) -> String =
   }
 
 pub fn name_column(program: Program, decided: RunDecision) -> Int = {
-  let widest = decided.classes.fold(0, |acc: Int, g: Group|
-    g.tests.fold(acc, |most: Int, index: Int| {
+  let widest = decided.classes.fold(0, |accumulator: Int, g: Group|
+    g.tests.fold(accumulator, |most: Int, index: Int| {
       let n = display_name_at(program, index).len();
       if n > most { n } else { most }
     }));
@@ -886,8 +890,8 @@ pub fn result_lines(
   outcomes: List<Outcome>,
   width: Int,
 ) -> List<String> / {abort.raise} =
-  outcomes.fold([], |acc: List<String>, outcome: Outcome| {
-    let listed = acc.push(result_line(style, program, outcome, width));
+  outcomes.fold([], |accumulator: List<String>, outcome: Outcome| {
+    let listed = accumulator.push(result_line(style, program, outcome, width));
     let searched = match outcome.search {
       None -> listed,
       Some(e) ->
@@ -901,7 +905,7 @@ pub fn summary_line(style: Style, report: RunReport, counted: Counts) -> String 
   let failures = c.failed.to_string() ++ " failed";
   let passes = c.passed.to_string() ++ " passed";
   let hosted = if counted.host == 0 { "" }
-  else { dim(style, ", " ++ counted.host.to_string() ++ " host-backed") };
+  else { dim(style, ", " ++ counted.host.to_string() ++ " used the host") };
   let given_up = if c.timed_out == 0 { "" }
   else { yellow(style, ", " ++ c.timed_out.to_string() ++ " timed out") };
   indent() ++ (if c.failed > 0 { red(style, failures) } else { dim(style, failures) }) ++ ", "
@@ -989,7 +993,7 @@ fn change_lines(style: Style, fault: Fault) -> List<String> = {
   let named = fault.changes.map(change_text);
   if named.len() > 0 { ["  " ++ yellow(style, "changes:") ++ " " ++ String::join(named, ", ")] }
   else if fault.unchanged {
-    ["  " ++ dim(style, "changes: none — nothing in this test's closure changed")]
+    ["  " ++ dim(style, "changes: none — nothing this test depends on changed")]
   } else { [] }
 }
 
@@ -1017,8 +1021,10 @@ fn failure_blocks(
   program: Program,
   faults: List<Fault>,
 ) -> List<String> / {abort.raise} =
-  faults.fold([], |acc: List<String>, fault: Fault|
-    acc.push("").concat(failure_lines(style, program.places, fault).map(|l: String| indent() ++ l)))
+  faults.fold([], |accumulator: List<String>, fault: Fault|
+    accumulator.push("").concat(
+      failure_lines(style, program.places, fault).map(|l: String| indent() ++ l),
+    ))
 
 fn diff_lines_shown() -> Int = 40
 
@@ -1088,14 +1094,14 @@ fn timed_out_blocks(
 ) -> List<String> / {abort.raise} =
   report.results.filter(|outcome: Outcome| outcome.status == "timed_out").fold(
     [],
-    |acc: List<String>, outcome: Outcome|
-      acc.push("").concat(
+    |accumulator: List<String>, outcome: Outcome|
+      accumulator.push("").concat(
         timed_out_lines(style, program.places, outcome).map(|l: String| indent() ++ l),
       ),
   )
 
 fn unreached_lines(style: Style, names: List<String>) -> List<String> =
-  names.map(|n: String| indent() ++ indent() ++ dim(style, n ++ ": no test reaches it"))
+  names.map(|n: String| indent() ++ indent() ++ dim(style, n ++ ": no test runs it"))
 
 fn coverage_lines(style: Style, report: RunReport) -> List<String> =
   match report.coverage {
@@ -1106,7 +1112,7 @@ fn coverage_lines(style: Style, report: RunReport) -> List<String> =
           ++ Int::to_string(c.definitions - c.unreached.len())
           ++ " of "
           ++ c.definitions.to_string()
-          ++ " definitions reached by a test",
+          ++ " definitions executed by at least one test",
       ].concat(
         unreached_lines(style, c.unreached),
       ),
@@ -1206,10 +1212,11 @@ pub fn case_of(program: Program, index: Int) -> Option<Case> =
   match program.positions.get(index) { Some(place) -> program.cases.at(place), None -> None }
 
 pub fn placed_cases(cases: List<Case>) -> Map<Int, Int> =
-  range(0, cases.len()).fold(Map::new(), |acc: Map<Int, Int>, place: Int|
+  range(0, cases.len()).fold(Map::new(), |accumulator: Map<Int, Int>, place: Int|
     match cases.at(place) {
-      Some(case) -> if acc.contains(case.index) { acc } else { acc.insert(case.index, place) },
-      None -> acc,
+      Some(case) -> if accumulator.contains(case.index) { accumulator }
+      else { accumulator.insert(case.index, place) },
+      None -> accumulator,
     })
 
 fn outcome_json(program: Program, outcome: Outcome, d: RunDecision) -> Json / {abort.raise} = {
@@ -1485,12 +1492,16 @@ fn closing_lines(
     nothing_lines(style, flags, program),
     warned_lines(style, warnings),
     coverage_lines(style, report),
-  ].fold([], |acc: List<String>, part: List<String>| acc.concat(part))
+  ].fold([], |accumulator: List<String>, part: List<String>| accumulator.concat(part))
 
 fn all_warnings(program: Program, report: RunReport) -> List<Diagnostic> =
-  program.warnings.concat(report.warnings).fold([], |acc: List<Diagnostic>, d: Diagnostic|
-    if acc.filter(|x: Diagnostic| x.code == d.code && x.message == d.message).len() > 0 { acc }
-    else { acc.push(d) })
+  program.warnings.concat(report.warnings).fold(
+    [],
+    |accumulator: List<Diagnostic>, d: Diagnostic|
+      if accumulator.filter(|x: Diagnostic| x.code == d.code && x.message == d.message).len() > 0 {
+        accumulator
+      } else { accumulator.push(d) },
+  )
 
 pub fn test_output(
   style: Style,
@@ -1551,7 +1562,7 @@ fn effect_before(a: types::Effect, b: types::Effect) -> Bool =
       _ -> false,
     }
   } else if mode_rank(a.mode) != mode_rank(b.mode) { mode_rank(a.mode) < mode_rank(b.mode) } else {
-    match ((a.op, b.op)) {
+    match ((a.operation, b.operation)) {
       (None, Some(_)) -> true,
       (Some(x), Some(y)) -> compare(x, y) == Less,
       _ -> false,
@@ -1567,7 +1578,7 @@ pub fn outside_effects_text(effects: List<types::Effect>) -> String / {abort.rai
 pub fn with_sim(options: Json, sim: Json) -> Json =
   match options { Object(members) -> Object(members.insert("sim", sim)), other -> other }
 
-test "the mark is a word in a plain run and one glyph in a styled one" {
+test "a test's status mark is a word in plain output and a single symbol in styled output" {
   assert_eq(marked(plain(), "passed"), "ok     ");
   assert_eq(marked(plain(), "failed"), "FAIL   ");
   assert_eq(marked(plain(), "panicked"), "PANIC  ");
@@ -1575,14 +1586,14 @@ test "the mark is a word in a plain run and one glyph in a styled one" {
   assert_eq(Bytes::of_string(marked(ansi(), "passed")), b"\x1b[32m\xe2\x9c\x93\x1b[0m")
 }
 
-test "a reason is spaced in the line and joined in the document" {
+test "a reason is written as separate words in the report line and with underscores in the JSON document" {
   assert_eq(reason_key(reason_word(PreviousFailure)), "previous_failure");
   assert_eq(reason_key(reason_word(New)), "new");
   assert_eq(reason_word(Changed("the file `a.ply`")), "changed");
   assert_eq(reason_word(Unhashed), "unhashed")
 }
 
-test "a search says what it explored and what a blind and an unpruned one would have cost" {
+test "a search report gives the interleavings explored, and how many a search ignoring time or pruning would have explored" {
   let e: SearchSummary = {
     explored: 12,
     exhaustive: true,
@@ -1638,7 +1649,7 @@ test "every reason has an explanation of its own" {
   )
 }
 
-test "a load that fails tallies its errors and binds nothing" {
+test "a failed load exits with code 2 and prints its errors with their count" {
   let result = rejected(
     plain(),
     "test",
@@ -1661,13 +1672,13 @@ test "a binding that does not match the program is a start-up failure naming no 
   ])
 }
 
-test "a program cannot declare either effect the scheduler reads a name of" {
+test "a program cannot declare an effect named `scoped` or `sim`, because the test scheduler reserves those names" {
   let rejected = |name: String|
     match analyse(
         parse_all([
           {
             name: b"",
-            src: Bytes::of_string(
+            source_text: Bytes::of_string(
               "effect " ++ name ++ " {\n  write put[users](v: Int) -> Unit\n}\ntest \"claim\" { "
                 ++ name
                 ++ ".put[users](1) }\n",

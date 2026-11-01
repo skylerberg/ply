@@ -1,18 +1,10 @@
-//! The stacks a scheduler's tasks run on, and the switch between each task and its loop.
-//! Which task runs next and what a request means are the scheduler's, written in Ply
-//! (`std.internal.schedule`); a [`Scheduler`] holds what Ply cannot: each task's stack and where it
-//! stands, where the loop stands, the brackets each task stands in, and how a body that did not
-//! return left the context. Then the objects the scheduler's natives make (a value of any type
-//! kept with its type, scheduler stacks, a task's body, a task's and a channel's handle) and the
-//! natives themselves, and the production scheduler's waits: the run's tickets and its clock.
-
 use crate::emitted::{Block, Carried, Handed, Handle, PlyKept, PlyType};
 use crate::flat::Reader;
 use crate::heap::{self, Native, Word, native_of};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{
-    Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, Unhandled, borrowed, no_stack_to_take,
-    switch_keeping,
+    Ctx, FAILED_CANCELLED, FAILED_PENDING_RAISE, FAILED_UNWOUND_TO_HANDLER, Unhandled, borrowed,
+    fail_out_of_stack, switch_stack_preserving_context,
 };
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
@@ -22,24 +14,17 @@ use ply_host::pool::Run;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-/// What [`resume`] returns where the task's body ended rather than asked: it returned; it unwound
-/// after a cancel; a raise nothing in it handled left it; it failed at run time. A request's own
-/// code is never below 0.
 pub const FINISHED: i64 = -1;
 pub const UNWOUND: i64 = -2;
 pub const RAISED: i64 = -3;
 pub const FAILED: i64 = -4;
 
-/// How a task's body runs: `run` runs it to its end, leaving the context failed as the body left
-/// it; `release` lets go of what `arg` holds where the body never runs.
 pub struct Body {
     pub run: unsafe fn(*mut Ctx, usize),
     pub release: unsafe fn(*mut Ctx, usize),
     pub arg: usize,
 }
 
-/// What passes at a switch between a task and the loop: a code, two numbers, a word, and
-/// where the task stood, a root's id and offsets as the context stores a site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Message {
     pub code: i64,
@@ -48,7 +33,6 @@ pub struct Message {
     pub site: [i64; 3],
 }
 
-/// The brackets a task stands in, and whether a cancel waits for it to leave them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Shields {
     pub acquiring: u32,
@@ -56,22 +40,20 @@ pub struct Shields {
     pub stopping: bool,
 }
 
-/// A bracket's `acquire`, where a cancel is held back, or its `release`, where it takes no wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shield {
+pub enum BracketPhase {
     Acquire,
     Release,
 }
 
-/// How a body that did not return left the context, held while the loop's Ply runs.
-struct Stashed {
+struct SavedFailure {
     failed: i64,
     diagnostic: Option<Diagnostic>,
     pending: Option<Unhandled>,
     target: Word,
 }
 
-impl Stashed {
+impl SavedFailure {
     fn release(self) {
         if let Some(p) = self.pending {
             p.release();
@@ -84,42 +66,33 @@ struct Slot {
     stack: Option<Stack>,
     sp: usize,
     body: Option<Body>,
-    /// The task's stack's index in [`Ctx::stacks`], once it has started.
     stack_index: Option<usize>,
     shields: Shields,
-    stashed: Option<Stashed>,
-    /// What `Ctx.task` says while it runs ([`task_number`]); none for the scheduler's body,
-    /// which runs as the task that opened the scheduler.
-    runs_as: Option<i64>,
+    saved_failure: Option<SavedFailure>,
+    context_task_number: Option<i64>,
 }
 
-/// One open scheduler's tasks. Boxed, so a task's stack can name it while it runs.
 pub struct Scheduler {
     ctx: *mut Ctx,
     seeded: bool,
-    /// The index in [`Ctx::stacks`] of the stack the scheduler was opened on.
-    opened_on: usize,
-    loop_sp: usize,
+    opening_stack_index: usize,
+    loop_stack_pointer: usize,
     running: Option<u64>,
     slots: HashMap<u64, Box<Slot>>,
-    /// Stacks its ended tasks gave back, for its next ones: at most as many as it ever ran
-    /// at once.
     spare: Vec<Stack>,
     live: usize,
     peak: usize,
     message: Message,
-    /// The raise the loop left for the task it resumes raising.
     raising: Option<Diagnostic>,
 }
 
 impl Scheduler {
-    /// A scheduler opened on the running stack of `ctx`, `seeded` for `simulate`.
     pub fn open(ctx: *mut Ctx, seeded: bool) -> Box<Scheduler> {
         Box::new(Scheduler {
             ctx,
             seeded,
-            opened_on: unsafe { (*ctx).current },
-            loop_sp: 0,
+            opening_stack_index: unsafe { (*ctx).current },
+            loop_stack_pointer: 0,
             running: None,
             slots: HashMap::new(),
             spare: Vec::new(),
@@ -134,31 +107,26 @@ impl Scheduler {
         self.seeded
     }
 
-    /// Whether a seeded step runs: one of the scheduler's tasks, recording what it touches.
     pub fn is_stepping(&self) -> bool {
         self.seeded && self.running.is_some()
     }
 
-    /// The task the loop resumed, while it runs.
     pub fn running(&self) -> Option<u64> {
         self.running
     }
 
-    /// The tasks whose stacks the scheduler holds, started or not.
     pub fn tasks(&self) -> usize {
         self.slots.len()
     }
 
-    /// The stacks its tasks run on and those it keeps for its next ones.
     pub fn stacks(&self) -> usize {
         self.live + self.spare.len()
     }
 
-    /// Task `id`, to run `body` the first time the loop resumes it; task 0 is the scheduler's body.
     pub fn start(&mut self, id: u64, body: Body) {
         let slot = Slot {
             body: Some(body),
-            runs_as: (id != 0).then(task_number),
+            context_task_number: (id != 0).then(task_number),
             ..Slot::default()
         };
         if let Some(old) = self.slots.insert(id, Box::new(slot)) {
@@ -166,12 +134,10 @@ impl Scheduler {
         }
     }
 
-    /// The brackets task `id` stands in; none for a task the scheduler does not hold.
     pub fn shields(&self, id: u64) -> Shields {
         self.slots.get(&id).map(|s| s.shields).unwrap_or_default()
     }
 
-    /// Every task standing in a bracket, or held back for one, ascending.
     pub fn shielded(&self) -> Vec<(u64, Shields)> {
         let mut out: Vec<(u64, Shields)> = (self.slots.iter())
             .filter(|(_, s)| s.shields != Shields::default())
@@ -181,34 +147,30 @@ impl Scheduler {
         out
     }
 
-    /// Whether a cancel of task `id` waits for it to leave the brackets it stands in.
-    pub fn hold_back(&mut self, id: u64, stopping: bool) {
+    pub fn set_stopping(&mut self, id: u64, stopping: bool) {
         if let Some(slot) = self.slots.get_mut(&id) {
             slot.shields.stopping = stopping;
         }
     }
 
-    /// The running task enters a bracket's `acquire` or `release`: the task, where one runs.
-    pub fn shield(&mut self, shield: Shield) -> Option<u64> {
+    pub fn shield(&mut self, shield: BracketPhase) -> Option<u64> {
         let id = self.running?;
         let slot = self.slots.get_mut(&id)?;
         match shield {
-            Shield::Acquire => slot.shields.acquiring += 1,
-            Shield::Release => slot.shields.releasing += 1,
+            BracketPhase::Acquire => slot.shields.acquiring += 1,
+            BracketPhase::Release => slot.shields.releasing += 1,
         }
         Some(id)
     }
 
-    /// Task `id` leaves what [`Scheduler::shield`] entered: whether a cancel held back for it
-    /// lands now: the task is to unwind from here.
-    pub fn unshield(&mut self, id: u64, shield: Shield) -> bool {
+    pub fn leave_phase(&mut self, id: u64, shield: BracketPhase) -> bool {
         let Some(slot) = self.slots.get_mut(&id) else {
             return false;
         };
         let s = &mut slot.shields;
         match shield {
-            Shield::Acquire => s.acquiring = s.acquiring.saturating_sub(1),
-            Shield::Release => s.releasing = s.releasing.saturating_sub(1),
+            BracketPhase::Acquire => s.acquiring = s.acquiring.saturating_sub(1),
+            BracketPhase::Release => s.releasing = s.releasing.saturating_sub(1),
         }
         let lands = s.stopping && s.acquiring == 0 && s.releasing == 0;
         if lands {
@@ -217,11 +179,12 @@ impl Scheduler {
         lands
     }
 
-    /// Puts back how task `id`'s body left the context, which [`resume`] returned [`RAISED`] or
-    /// [`FAILED`] for, with `note` where one is given: the context is failed as the body left it.
-    /// `false` where the task left nothing.
     pub fn restore(&mut self, id: u64, note: Option<String>) -> bool {
-        let Some(s) = self.slots.get_mut(&id).and_then(|slot| slot.stashed.take()) else {
+        let Some(s) = self
+            .slots
+            .get_mut(&id)
+            .and_then(|slot| slot.saved_failure.take())
+        else {
             return false;
         };
         let c = unsafe { &mut *self.ctx };
@@ -235,7 +198,6 @@ impl Scheduler {
         true
     }
 
-    /// Lets go of task `id`, its stack back to the scheduler and a body it never ran let go.
     pub fn free(&mut self, id: u64) {
         if let Some(slot) = self.slots.remove(&id) {
             unsafe { self.freed(*slot) };
@@ -247,7 +209,7 @@ impl Scheduler {
         if let Some(body) = slot.body {
             unsafe { (body.release)(self.ctx, body.arg) };
         }
-        if let Some(s) = slot.stashed {
+        if let Some(s) = slot.saved_failure {
             s.release();
         }
         if let Some(index) = slot.stack_index {
@@ -262,7 +224,6 @@ impl Scheduler {
     }
 }
 
-/// A scheduler closing lets go of every task it still holds.
 impl Drop for Scheduler {
     fn drop(&mut self) {
         let ids: Vec<u64> = self.slots.keys().copied().collect();
@@ -272,13 +233,6 @@ impl Drop for Scheduler {
     }
 }
 
-/// Runs task `id` of `scheduler` until it asks something, handing it `result`: what it asked or how
-/// its body ended. A task that has not run starts its body on a stack of its own, the scheduler's
-/// spare one where it has one. One the scheduler does not hold, or that no stack can be had for, is
-/// given [`FAILED`] with the context failed.
-///
-/// # Safety
-/// `scheduler` is open on the running stack of its context, and nothing else runs there.
 pub unsafe fn resume(scheduler: *mut Scheduler, id: u64, result: Message) -> Message {
     let r = unsafe { &mut *scheduler };
     let ctx = r.ctx;
@@ -292,7 +246,7 @@ pub unsafe fn resume(scheduler: *mut Scheduler, id: u64, result: Message) -> Mes
     };
     if slot.stack.is_none() {
         let Some(stack) = r.spare.pop().or_else(Stack::take) else {
-            no_stack_to_take(c);
+            fail_out_of_stack(c);
             return ended(FAILED);
         };
         slot.sp = stack.prepare(task_entry, scheduler as usize);
@@ -302,29 +256,22 @@ pub unsafe fn resume(scheduler: *mut Scheduler, id: u64, result: Message) -> Mes
         r.peak = r.peak.max(r.live);
     }
     let to = slot.sp;
-    c.current = slot.stack_index.unwrap_or(r.opened_on);
+    c.current = slot.stack_index.unwrap_or(r.opening_stack_index);
     r.message = result;
     r.running = Some(id);
-    unsafe { switch_keeping(ctx, &raw mut r.loop_sp, to) };
+    unsafe { switch_stack_preserving_context(ctx, &raw mut r.loop_stack_pointer, to) };
     let r = unsafe { &mut *scheduler };
     r.running = None;
-    unsafe { (*ctx).current = r.opened_on };
+    unsafe { (*ctx).current = r.opening_stack_index };
     r.message
 }
 
-/// A number for `Ctx.task` no other task of any scheduler in the process is given: below 0, so
-/// apart from 0, which no scheduler's task runs as.
 pub(crate) fn task_number() -> i64 {
     static NEXT: AtomicI64 = AtomicI64::new(-1);
     NEXT.fetch_sub(1, Ordering::Relaxed)
 }
 
-/// The running task of `scheduler` hands its loop `request` and waits to resume: returns what the
-/// loop resumed it with.
-///
-/// # Safety
-/// The running stack is the task's, which `scheduler`'s loop resumed.
-pub unsafe fn to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
+pub unsafe fn switch_to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
     let r = unsafe { &mut *scheduler };
     let Some(id) = r.running else {
         let c = unsafe { &mut *r.ctx };
@@ -337,16 +284,11 @@ pub unsafe fn to_loop(scheduler: *mut Scheduler, request: Message) -> Message {
     let slot = r.slots.get_mut(&id).expect("a running task has its slot");
     r.message = request;
     let from = &raw mut slot.sp;
-    unsafe { switch_keeping(r.ctx, from, r.loop_sp) };
+    unsafe { switch_stack_preserving_context(r.ctx, from, r.loop_stack_pointer) };
     unsafe { (*scheduler).message }
 }
 
-/// Whether the task `scheduler`'s loop resumed with `heard` runs on: `false`, context failed, where
-/// it is to unwind after a cancel or to raise what the loop left for it, or the switch failed.
-///
-/// # Safety
-/// `scheduler` is open on the running task's context.
-unsafe fn runs_on(scheduler: *mut Scheduler, heard: &Message) -> bool {
+unsafe fn continues_running(scheduler: *mut Scheduler, heard: &Message) -> bool {
     let r = unsafe { &mut *scheduler };
     let c = unsafe { &mut *r.ctx };
     match heard.code {
@@ -359,50 +301,42 @@ unsafe fn runs_on(scheduler: *mut Scheduler, heard: &Message) -> bool {
                 Diagnostic::error(codes::INTERNAL_ERROR, "a task was resumed to raise nothing")
             });
             let message = d.message.clone();
-            c.pend(d, message);
+            c.fail_unhandled_abort(d, message);
             false
         }
         _ => c.failed == 0,
     }
 }
 
-/// The codes the runtime itself asks the run's scheduler's loop with, as `std.internal.schedule`
-/// reads them: a sleep of some nanoseconds, and a wait on one of the run's tickets.
-pub const ASK_SLEEP: i64 = 11;
-pub const ASK_TICKET: i64 = 15;
+pub const REQUEST_SLEEP: i64 = 11;
+pub const REQUEST_JOB_RESULT: i64 = 15;
 
-/// The innermost scheduler open on `c`, where it is the run's and one of its tasks runs.
-fn production_running(c: &Ctx) -> Option<*mut Scheduler> {
+fn running_unseeded_scheduler(c: &Ctx) -> Option<*mut Scheduler> {
     let (scheduler, _) = c.schedulers.last()?;
     let r = unsafe { &**scheduler };
     (!r.is_seeded() && r.running().is_some()).then_some(*scheduler)
 }
 
-/// The run's scheduler's task running on `c`, where one runs: who performs on the machine, and a
-/// wait on the host waits there.
-pub(crate) fn production_task(c: &Ctx) -> Option<TaskId> {
-    let scheduler = production_running(c)?;
+pub(crate) fn running_unseeded_task(c: &Ctx) -> Option<TaskId> {
+    let scheduler = running_unseeded_scheduler(c)?;
     unsafe { (*scheduler).running() }.map(TaskId)
 }
 
-/// The run's scheduler's running task asks its loop `code` about `n` and waits as the scheduler's
-/// other tasks run: whether it runs on, as [`runs_on`] says. `None` where no task of the run's
-/// scheduler runs on `c`, which then waits itself.
 pub(crate) fn waited(c: &mut Ctx, code: i64, n: i64) -> Option<bool> {
-    let scheduler = production_running(c)?;
+    let scheduler = running_unseeded_scheduler(c)?;
     let request = Message {
         code,
         numbers: [n, 0],
         word: 0,
         site: [c.performed_root, c.performed_start, c.performed_end],
     };
-    let was = c.scheduler_entered();
+    let was = c.begin_scheduling();
     let ctx: *mut Ctx = c;
-    let heard = unsafe { to_loop(scheduler, request) };
+    let heard = unsafe { switch_to_loop(scheduler, request) };
     if !was {
         unsafe { &mut *ctx }.program_entered();
     }
-    Some(unsafe { runs_on(scheduler, &heard) })
+    Some(unsafe { continues_running(scheduler, &heard) })
 }
 
 fn ended(code: i64) -> Message {
@@ -412,8 +346,6 @@ fn ended(code: i64) -> Message {
     }
 }
 
-/// Where a task's stack begins: runs its body, then tells the loop how the body ended, and never
-/// runs again.
 extern "C" fn task_entry(arg: usize) {
     let scheduler = arg as *mut Scheduler;
     let (ctx, id, body) = {
@@ -425,7 +357,7 @@ extern "C" fn task_entry(arg: usize) {
         c.stack_floor
             .store(unsafe { own.enter() }, Ordering::Relaxed);
         c.frames = std::ptr::null_mut();
-        if let Some(n) = slot.runs_as {
+        if let Some(n) = slot.context_task_number {
             c.task = n;
         }
         (r.ctx, id, slot.body.take())
@@ -434,18 +366,17 @@ extern "C" fn task_entry(arg: usize) {
         unsafe { (body.run)(ctx, body.arg) };
     }
     let c = unsafe { &mut *ctx };
-    // A body that failed left without saying the program's work ended.
-    c.scheduler_entered();
+    c.begin_scheduling();
     let site = [c.site_root, c.site_start, c.site_end];
-    let (code, stashed) = match c.failed {
+    let (code, saved_failure) = match c.failed {
         0 => (FINISHED, None),
         FAILED_CANCELLED => {
             c.failed = 0;
             (UNWOUND, None)
         }
         failed => {
-            let raised = matches!(failed, FAILED_TARGET | FAILED_PENDING);
-            let s = Stashed {
+            let raised = matches!(failed, FAILED_UNWOUND_TO_HANDLER | FAILED_PENDING_RAISE);
+            let s = SavedFailure {
                 failed,
                 diagnostic: c.diagnostic.take(),
                 pending: c.pending.take(),
@@ -457,23 +388,19 @@ extern "C" fn task_entry(arg: usize) {
     };
     let r = unsafe { &mut *scheduler };
     let slot = r.slots.get_mut(&id).expect("an ending task has its slot");
-    slot.stashed = stashed;
+    slot.saved_failure = saved_failure;
     r.message = Message {
         code,
         site,
         ..Message::default()
     };
     let from = &raw mut slot.sp;
-    unsafe { switch(&mut *from, r.loop_sp) };
+    unsafe { switch(&mut *from, r.loop_stack_pointer) };
     std::process::abort();
 }
 
-// --- The scheduler's objects -----------------------------------------------------------------
-
-/// Every native `std.internal.schedule` declares, under the name it declares it by, then those
-/// compiled code calls itself where a perform hands a program's clause a kept value.
 pub fn natives() -> Vec<crate::c::MachineNative> {
-    use crate::c::machine_native as n;
+    use crate::c::runtime_native as n;
     vec![
         n("keep", rt_keep as unsafe extern "C" fn(_, _, _) -> _),
         n("open", rt_open as unsafe extern "C" fn(_, _, _) -> _),
@@ -652,20 +579,13 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
     ]
 }
 
-/// How the loop resumes a task that is to unwind after a cancel, or to raise what the loop left
-/// for it ([`rt_task_resumed_raising`]); a task's own codes are never below 0.
 pub const RESUME_UNWIND: i64 = -1;
 pub const RESUME_RAISE: i64 = -2;
 
-/// How a task's handle says the task ended: not yet, returned, or cancelled.
 pub const LIVE: i64 = 0;
 pub const RETURNED: i64 = 1;
 pub const CANCELLED: i64 = 2;
 
-/// A value of any type held beside its type's descriptor: `std.internal.schedule`'s `Kept`, what a
-/// value of an operation's own type parameter crosses as between a perform and its clause, and a
-/// scheduler passes between its tasks. One a perform hands a program's clause holds its `kept#T`
-/// too, through which two of them compare.
 pub struct Kept {
     value: Option<Carried>,
     compared: Option<&'static PlyKept>,
@@ -679,9 +599,6 @@ impl Native for Kept {
     }
 }
 
-/// A scheduler's task stacks (`Stacks`): the scheduler, its id in the entry's schedulers, the
-/// message the loop last heard from a task and the one a task last heard from the loop, and the
-/// handle each started task returns into.
 pub struct Stacks {
     scheduler: Option<Box<Scheduler>>,
     id: i64,
@@ -704,7 +621,7 @@ impl Native for Stacks {
         let scheduler = self.scheduler();
         let c = unsafe { &mut *ctx };
         c.schedulers.retain(|(r, _)| *r != scheduler);
-        c.rearm_recording();
+        c.refresh_recording_flag();
         drop(self.scheduler.take());
         for w in [self.asked.word, self.heard.word] {
             if w != 0 {
@@ -717,7 +634,6 @@ impl Native for Stacks {
     }
 }
 
-/// At the entry's end, with the context going, the scheduler's stacks are left to the process.
 impl Drop for Stacks {
     fn drop(&mut self) {
         if let Some(r) = self.scheduler.take() {
@@ -726,11 +642,8 @@ impl Drop for Stacks {
     }
 }
 
-/// A task's body as `task_body` took it (`TaskBody`), until a scheduler starts it.
 pub struct TaskBody(Option<Started>);
 
-/// A body to start: the function, the descriptor of its effects and the words for it, which it is
-/// handed as the runtime's other calls into code are, and the handle its result goes to.
 struct Started {
     body: Block,
     desc: Word,
@@ -740,7 +653,7 @@ struct Started {
 
 impl Started {
     fn release(self, ctx: *mut Ctx) {
-        unsafe { self.body.let_go_function(ctx) };
+        unsafe { self.body.release_function_if_last(ctx) };
         heap::release_object(ctx, self.task);
     }
 }
@@ -753,7 +666,6 @@ impl Native for TaskBody {
     }
 }
 
-/// A scheduler's task's handle (`Task`): its scheduler, its id, how it ended and its result.
 pub struct SchedulerTask {
     scheduler: i64,
     id: i64,
@@ -773,13 +685,12 @@ impl Native for SchedulerTask {
     }
 }
 
-/// A scheduler's channel's handle (`Chan`): its scheduler and its id.
-pub struct SchedulerChan {
+pub struct SchedulerChannel {
     scheduler: i64,
     id: i64,
 }
 
-impl Native for SchedulerChan {
+impl Native for SchedulerChannel {
     fn release(&mut self, _ctx: *mut Ctx) {}
 
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
@@ -796,7 +707,6 @@ fn spelled(t: &PlyType) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The object of type `T` `h` is, failing the run where it is none.
 fn object<'a, T: Native>(ctx: *mut Ctx, h: &Handle, what: &str) -> Option<&'a mut T> {
     let found = unsafe { native_of::<T>(h.word()) };
     if found.is_none() {
@@ -808,7 +718,6 @@ fn object<'a, T: Native>(ctx: *mut Ctx, h: &Handle, what: &str) -> Option<&'a mu
     found
 }
 
-/// A new holder of the runtime object `w`, borrowed from compiled code.
 fn held(w: Word) -> Word {
     Block::of(w).dup();
     w
@@ -818,7 +727,6 @@ fn object_made(ctx: *mut Ctx, held: Box<dyn Native>) -> Handle {
     Handle::of(unsafe { (*ctx).heap.native(held) })
 }
 
-/// `x`, a value of the type `ty` describes, kept: it holds the count compiled code handed with it.
 pub unsafe extern "C" fn rt_keep(ctx: *mut Ctx, x: Handed, ty: *const PlyType) -> Handle {
     let value = Some(unsafe { Carried::new(x, ty) });
     object_made(
@@ -830,8 +738,6 @@ pub unsafe extern "C" fn rt_keep(ctx: *mut Ctx, x: Handed, ty: *const PlyType) -
     )
 }
 
-/// `x`, a value a perform hands a program's clause, kept beside `kept`, which describes its type
-/// and compares two of its values: it holds the count compiled code handed with it.
 pub unsafe extern "C" fn rt_keep_compared(
     ctx: *mut Ctx,
     x: Handed,
@@ -848,25 +754,16 @@ pub unsafe extern "C" fn rt_keep_compared(
     )
 }
 
-/// 1 where the kept values `a` and `b`, which it borrows, are equal as their type compares them,
-/// else 0. The run fails where `==` is not built at their type, as for a function or a runtime
-/// object, and where the two are of different types, which no program compares.
 pub unsafe extern "C" fn rt_kept_equal(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
-    I64(i64::from(kept_compared(ctx, &a, &b, false) != 0))
+    I64(i64::from(compare_stored_values(ctx, &a, &b, false) != 0))
 }
 
-/// The sign of the order of the kept values `a` and `b`, which it borrows, as their type orders
-/// them: below, at or above zero. The run fails where `compare` is not built at their type, and
-/// where the two are of different types.
 pub unsafe extern "C" fn rt_kept_order(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
-    I64(kept_compared(ctx, &a, &b, true).signum())
+    I64(compare_stored_values(ctx, &a, &b, true).signum())
 }
 
-/// What the entry of the kept values' type returns for them, its equality's or, where `order`, its
-/// order's; 0 where the run fails.
-fn kept_compared(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
-    // Each read out before the next is found: `a` and `b` may be one object.
-    let (Some(x), Some(y)) = (compared_of(ctx, a), compared_of(ctx, b)) else {
+fn compare_stored_values(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
+    let (Some(x), Some(y)) = (comparison_operand(ctx, a), comparison_operand(ctx, b)) else {
         return 0;
     };
     if x.ty.identity != y.ty.identity {
@@ -897,20 +794,17 @@ fn kept_compared(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
     }
 }
 
-/// What a kept value is compared through: its word, its type, and the descriptor of its
-/// comparisons where a perform kept it.
-struct Compared {
+struct ComparisonOperand {
     word: Word,
     ty: &'static PlyType,
     kept: Option<&'static PlyKept>,
 }
 
-/// What the kept value `h` is compared through, failing the run where it is none or let go of.
-fn compared_of(ctx: *mut Ctx, h: &Handle) -> Option<Compared> {
+fn comparison_operand(ctx: *mut Ctx, h: &Handle) -> Option<ComparisonOperand> {
     let kept = object::<Kept>(ctx, h, "a kept value")?;
     let compared = kept.compared;
     match &kept.value {
-        Some(v) => Some(Compared {
+        Some(v) => Some(ComparisonOperand {
             word: v.word(),
             ty: v.ty(),
             kept: compared,
@@ -925,8 +819,6 @@ fn compared_of(ctx: *mut Ctx, h: &Handle) -> Option<Compared> {
     }
 }
 
-/// What `k` keeps, held once more, where it is a value of the type `ty` describes; the run fails
-/// otherwise.
 pub unsafe extern "C" fn rt_open(ctx: *mut Ctx, k: Handle, ty: *const PlyType) -> Handed {
     let want = unsafe { &*ty };
     let Some(kept) = object::<Kept>(ctx, &k, "a kept value") else {
@@ -953,8 +845,6 @@ pub unsafe extern "C" fn rt_open(ctx: *mut Ctx, k: Handle, ty: *const PlyType) -
     }
 }
 
-/// A scheduler's stacks, opened on the running stack, `seeded` (1) for `simulate`, written
-/// at the site `root`, `start` and `end` name.
 pub unsafe extern "C" fn rt_stacks_opened(
     ctx: *mut Ctx,
     seeded: I64,
@@ -968,7 +858,7 @@ pub unsafe extern "C" fn rt_stacks_opened(
     let mut scheduler = Scheduler::open(ctx, seeded.0 != 0);
     c.schedulers
         .push((&mut *scheduler, [root.0, start.0, end.0]));
-    c.rearm_recording();
+    c.refresh_recording_flag();
     let stacks = Stacks {
         scheduler: Some(scheduler),
         id,
@@ -979,8 +869,6 @@ pub unsafe extern "C" fn rt_stacks_opened(
     object_made(ctx, Box::new(stacks))
 }
 
-/// Where a seeded scheduler open in `ctx` before `s`'s was written: its root, start or end by
-/// `which`; a root of -1 where there is none.
 pub unsafe extern "C" fn rt_stacks_outer(ctx: *mut Ctx, s: Handle, which: I64) -> I64 {
     let c = unsafe { &*ctx };
     let scheduler = object::<Stacks>(ctx, &s, "a scheduler's stacks").map(|s| s.scheduler());
@@ -995,73 +883,59 @@ pub unsafe extern "C" fn rt_stacks_outer(ctx: *mut Ctx, s: Handle, which: I64) -
     })
 }
 
-/// Where the innermost scheduler `std.internal.schedule` opened on `c` was written, where it is
-/// seeded, so a rejection of what one of its tasks performs can name it.
 pub fn seeded_scheduler(c: &Ctx) -> Option<Span> {
     let (scheduler, [root, start, end]) = c.schedulers.last()?;
     unsafe { (**scheduler).is_seeded() }.then(|| c.span_at(*root, *start, *end))
 }
 
-/// `body`, which it takes and hands back, the program's own work running from here: its costs go
-/// on from where it left them. The two descriptors are of `body`'s type, as handed and as returned.
 pub unsafe extern "C" fn rt_program_resumed(
     ctx: *mut Ctx,
     body: Handed,
-    _handed: *const PlyType,
+    _body_value_type: *const PlyType,
     _returned: *const PlyType,
 ) -> Handed {
     unsafe { &mut *ctx }.program_entered();
     body
 }
 
-/// `result`, a value of the type `ty` describes, kept as [`rt_keep`] keeps it, the program's own
-/// work having ended with it: the keeping is the scheduler's.
 pub unsafe extern "C" fn rt_program_paused(
     ctx: *mut Ctx,
     result: Handed,
     ty: *const PlyType,
 ) -> Handle {
-    unsafe { &mut *ctx }.scheduler_entered();
+    unsafe { &mut *ctx }.begin_scheduling();
     unsafe { rt_keep(ctx, result, ty) }
 }
 
-/// A task's or a channel's handle as the same handle at another type, held once more.
 pub unsafe extern "C" fn rt_handle_as(_ctx: *mut Ctx, h: Handle) -> Handle {
     Handle::of(held(h.word()))
 }
 
-/// A `bracket`'s `acquire` or `release` the running task of the innermost scheduler stands in.
-pub(crate) struct Bracketed {
+pub(crate) struct OpenBracket {
     scheduler: *mut Scheduler,
     task: u64,
-    shield: Shield,
+    shield: BracketPhase,
 }
 
-/// Enters `shield` for the running task of the innermost scheduler running one.
-pub(crate) fn shielded(c: &mut Ctx, shield: Shield) -> Option<Bracketed> {
+pub(crate) fn shielded(c: &mut Ctx, shield: BracketPhase) -> Option<OpenBracket> {
     let (scheduler, _) = c.schedulers.last().copied()?;
     let task = unsafe { (*scheduler).shield(shield) }?;
-    Some(Bracketed {
+    Some(OpenBracket {
         scheduler,
         task,
         shield,
     })
 }
 
-/// Leaves what [`shielded`] entered: whether a cancel held back for it lands now.
-pub(crate) fn unshielded(c: &mut Ctx, entered: Option<Bracketed>) -> bool {
+pub(crate) fn leave_bracket(c: &mut Ctx, entered: Option<OpenBracket>) -> bool {
     entered.is_some_and(|b| {
         c.schedulers.iter().any(|(r, _)| *r == b.scheduler)
-            && unsafe { (*b.scheduler).unshield(b.task, b.shield) }
+            && unsafe { (*b.scheduler).leave_phase(b.task, b.shield) }
     })
 }
 
-// --- The entry's trail -----------------------------------------------------------------------
-
-/// What a seeded step touched, as `std.internal.trail`'s `Access` holds it: an effect in a mode,
-/// its resource where it names one, or a scoped value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Touched {
+pub enum Access {
     Effect {
         effect: ply_core::Symbol,
         resource: Option<ply_core::Symbol>,
@@ -1073,14 +947,12 @@ pub enum Touched {
     },
 }
 
-/// The trail the entry's last seeded scheduler left, as it wrote it; none before its first.
 pub unsafe extern "C" fn rt_trail_entered(ctx: *mut Ctx) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let kept = c.last_trail.clone().unwrap_or_default();
     c.given(kept)
 }
 
-/// The root of the seed the driver set: its high 32 bits for `which` 0, its low ones for 1.
 pub unsafe extern "C" fn rt_seed_root(ctx: *mut Ctx, which: I64) -> I64 {
     let root = unsafe { &*ctx }.seed.root;
     I64(if which.0 == 0 {
@@ -1090,28 +962,22 @@ pub unsafe extern "C" fn rt_seed_root(ctx: *mut Ctx, which: I64) -> I64 {
     })
 }
 
-/// The seed's path, each choice in two bytes, the least significant first.
 pub unsafe extern "C" fn rt_seed_path(ctx: *mut Ctx) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let path: Vec<u8> = c.seed.path.iter().flat_map(|p| p.to_le_bytes()).collect();
     c.given(path)
 }
 
-/// The scheduling points a seeded scheduler of the entry may take, as the driver set them.
 pub unsafe extern "C" fn rt_seeded_steps(ctx: *mut Ctx) -> I64 {
     I64(i64::from(unsafe { &*ctx }.sim_steps))
 }
 
-/// Keeps the trail the `n` bytes at `p` hold for the next scheduler and the interleaving the
-/// `m` bytes at `q` hold as its outcome's, each as the scheduler wrote it, which this never reads.
 pub unsafe extern "C" fn rt_trail_left(ctx: *mut Ctx, p: Addr, n: I64, q: Addr, m: I64) {
     let c = unsafe { &mut *ctx };
     c.last_trail = Some(unsafe { borrowed(p, n) }.to_vec());
     c.interleaving = Some(unsafe { borrowed(q, m) }.to_vec());
 }
 
-/// The site `root`, `start` and `end` name as an outcome places it, as `std.internal.trail`'s
-/// `Placed` holds it: the definition it lies in, and its root's name and its span there.
 pub unsafe extern "C" fn rt_site_placed(
     ctx: *mut Ctx,
     root: I64,
@@ -1134,20 +1000,17 @@ pub unsafe extern "C" fn rt_site_placed(
     c.given(bytes)
 }
 
-/// How many accesses the running seeded step touched since they were last taken.
 pub unsafe extern "C" fn rt_footprint_held(ctx: *mut Ctx) -> I64 {
     I64(unsafe { &*ctx }.accesses.len() as i64)
 }
 
-/// What the running seeded step touched since this was last asked, each access beside where it was
-/// made, as `std.internal.trail` reads a `List<Touch>`; what it held is let go.
 pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let touched = std::mem::take(&mut c.accesses);
     let mut w = crate::flat::Writer::new();
     w.list(touched.iter(), |w, (t, site)| {
         match t {
-            Touched::Effect {
+            Access::Effect {
                 effect,
                 resource,
                 write,
@@ -1159,7 +1022,7 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
                 };
                 w.tag(u64::from(*write)).tag(0);
             }
-            Touched::ScopedValue { id, write } => {
+            Access::ScopedValue { id, write } => {
                 w.tag(2).count(*id).tag(u64::from(*write));
             }
         }
@@ -1169,13 +1032,10 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
     c.given(bytes)
 }
 
-/// The id of the scheduler `s` holds the stacks of, among its entry's schedulers.
 pub unsafe extern "C" fn rt_stacks_region(ctx: *mut Ctx, s: Handle) -> I64 {
     I64(object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(-1, |s| s.id))
 }
 
-/// The body `body`, to return into the handle `t`, with the descriptor of its effects and the
-/// words for it its caller holds, which it copies, kept until a scheduler starts it.
 pub unsafe extern "C" fn rt_task_body(
     ctx: *mut Ctx,
     t: Handle,
@@ -1186,7 +1046,7 @@ pub unsafe extern "C" fn rt_task_body(
     let n = if desc.is_null() {
         0
     } else {
-        described_words(desc)
+        effect_word_count(desc)
     };
     let words = if n == 0 {
         Vec::new()
@@ -1203,9 +1063,7 @@ pub unsafe extern "C" fn rt_task_body(
     object_made(ctx, Box::new(TaskBody(Some(started))))
 }
 
-/// The words an effects descriptor at `desc` takes: one per entry, and one more per label the
-/// descriptor leaves to the call.
-fn described_words(d: *const Word) -> usize {
+fn effect_word_count(d: *const Word) -> usize {
     let n = usize::try_from(unsafe { *d }).unwrap_or(0);
     let labels = (0..n)
         .filter(|i| unsafe { *d.add(2 + 2 * i) } == -3)
@@ -1235,15 +1093,14 @@ unsafe fn run_started(ctx: *mut Ctx, arg: usize) {
         t.ended = RETURNED;
     }
     drop(words);
-    unsafe { body.let_go_function(ctx) };
+    unsafe { body.release_function_if_last(ctx) };
     heap::release_object(ctx, task);
 }
 
-unsafe fn release_started(ctx: *mut Ctx, arg: usize) {
+unsafe fn discard_started_task(ctx: *mut Ctx, arg: usize) {
     unsafe { Box::from_raw(arg as *mut Started) }.release(ctx);
 }
 
-/// Task `id` of the scheduler `s` holds, to run what `b` holds the first time the loop resumes it.
 pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: Handle) {
     let Some(started) = object::<TaskBody>(ctx, &b, "a task's body").and_then(|b| b.0.take())
     else {
@@ -1265,7 +1122,7 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
     }
     let body = Body {
         run: run_started,
-        release: release_started,
+        release: discard_started_task,
         arg: Box::into_raw(Box::new(started)) as usize,
     };
     match &mut stacks.scheduler {
@@ -1274,20 +1131,17 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
     }
 }
 
-/// Runs task `id` of `s`'s scheduler until it asks its loop something, handing it `code` and
-/// `n`, and `kept` where one is given: the code of what it asked, which the `asked_*` natives read
-/// the rest of.
 fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) -> I64 {
     let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     };
     let scheduler = stacks.scheduler();
     let Ok(task) = u64::try_from(id.0) else {
         internal(unsafe { &mut *ctx }, "a task was resumed under no id");
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     };
     if scheduler.is_null() {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     }
     let result = Message {
         code,
@@ -1304,7 +1158,7 @@ fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) ->
     I64(asked.code)
 }
 
-fn tasks_failed(ctx: *mut Ctx, kept: Word) -> i64 {
+fn release_and_fail_task(ctx: *mut Ctx, kept: Word) -> i64 {
     if kept != 0 {
         heap::release_object(ctx, kept);
     }
@@ -1321,7 +1175,6 @@ pub unsafe extern "C" fn rt_task_resumed(
     resumed(ctx, &s, id, code.0, n.0, 0)
 }
 
-/// [`rt_task_resumed`] handing the task `kept` as well, which it passes borrowed.
 pub unsafe extern "C" fn rt_task_resumed_kept(
     ctx: *mut Ctx,
     s: Handle,
@@ -1333,8 +1186,6 @@ pub unsafe extern "C" fn rt_task_resumed_kept(
     resumed(ctx, &s, id, code.0, n.0, held(kept.word()))
 }
 
-/// Resumes task `id` to raise the failure the `n` bytes at `p` hold as the scheduler writes one: a
-/// raise of `abort.raise` its perform's site handles.
 pub unsafe extern "C" fn rt_task_resumed_raising(
     ctx: *mut Ctx,
     s: Handle,
@@ -1357,7 +1208,6 @@ pub unsafe extern "C" fn rt_task_resumed_raising(
     resumed(ctx, &s, id, RESUME_RAISE, 0, 0)
 }
 
-/// What the task the loop last resumed asked: its `i`th number.
 pub unsafe extern "C" fn rt_asked_number(ctx: *mut Ctx, s: Handle, i: I64) -> I64 {
     I64(
         object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| {
@@ -1369,7 +1219,6 @@ pub unsafe extern "C" fn rt_asked_number(ctx: *mut Ctx, s: Handle, i: I64) -> I6
     )
 }
 
-/// Where the task the loop last resumed stood as it asked: its root, start or end by `i`.
 pub unsafe extern "C" fn rt_asked_site(ctx: *mut Ctx, s: Handle, i: I64) -> I64 {
     I64(
         object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| {
@@ -1381,12 +1230,15 @@ pub unsafe extern "C" fn rt_asked_site(ctx: *mut Ctx, s: Handle, i: I64) -> I64 
     )
 }
 
-/// The value the task the loop last resumed handed with what it asked, taken.
 pub unsafe extern "C" fn rt_asked_kept(ctx: *mut Ctx, s: Handle) -> Handle {
-    taken_word(ctx, &s, |s| &mut s.asked)
+    take_message_word(ctx, &s, |s| &mut s.asked)
 }
 
-fn taken_word(ctx: *mut Ctx, s: &Handle, of: impl FnOnce(&mut Stacks) -> &mut Message) -> Handle {
+fn take_message_word(
+    ctx: *mut Ctx,
+    s: &Handle,
+    of: impl FnOnce(&mut Stacks) -> &mut Message,
+) -> Handle {
     let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
         return Handle::of(0);
     };
@@ -1400,17 +1252,13 @@ fn taken_word(ctx: *mut Ctx, s: &Handle, of: impl FnOnce(&mut Stacks) -> &mut Me
     Handle::of(w)
 }
 
-/// The running task of the scheduler `s` holds hands its loop `code`, `a` and `b`, and `kept` where
-/// one is given, placed where the perform its clause handles stood, and waits: the code the loop
-/// resumes it with, which `heard_*` read the rest of. A task resumed to unwind or to raise leaves
-/// the context failed so, its clause never running on.
 fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) -> I64 {
     let Some(stacks) = object::<Stacks>(ctx, s, "a scheduler's stacks") else {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     };
     let scheduler = stacks.scheduler();
     if scheduler.is_null() {
-        return I64(tasks_failed(ctx, kept));
+        return I64(release_and_fail_task(ctx, kept));
     }
     let c = unsafe { &*ctx };
     let request = Message {
@@ -1419,13 +1267,13 @@ fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) 
         word: kept,
         site: [c.performed_root, c.performed_start, c.performed_end],
     };
-    let heard = unsafe { to_loop(scheduler, request) };
+    let heard = unsafe { switch_to_loop(scheduler, request) };
     let stacks = object::<Stacks>(ctx, s, "a scheduler's stacks").expect("the stacks it ran under");
     let left = std::mem::replace(&mut stacks.heard, heard);
     if left.word != 0 {
         heap::release_object(ctx, left.word);
     }
-    unsafe { runs_on(scheduler, &heard) };
+    unsafe { continues_running(scheduler, &heard) };
     I64(heard.code)
 }
 
@@ -1439,7 +1287,6 @@ pub unsafe extern "C" fn rt_task_yielded(
     yielded(ctx, &s, code.0, [a.0, b.0], 0)
 }
 
-/// [`rt_task_yielded`] handing the loop `kept` as well, which it passes borrowed.
 pub unsafe extern "C" fn rt_task_yielded_kept(
     ctx: *mut Ctx,
     s: Handle,
@@ -1451,17 +1298,14 @@ pub unsafe extern "C" fn rt_task_yielded_kept(
     yielded(ctx, &s, code.0, [a.0, b.0], held(kept.word()))
 }
 
-/// The number the loop resumed the running task with.
 pub unsafe extern "C" fn rt_heard_number(ctx: *mut Ctx, s: Handle) -> I64 {
     I64(object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| s.heard.numbers[0]))
 }
 
-/// The value the loop resumed the running task with, taken.
 pub unsafe extern "C" fn rt_heard_kept(ctx: *mut Ctx, s: Handle) -> Handle {
-    taken_word(ctx, &s, |s| &mut s.heard)
+    take_message_word(ctx, &s, |s| &mut s.heard)
 }
 
-/// Lets go of task `id`: its stack back to the scheduler, a body never run let go, and its handle.
 pub unsafe extern "C" fn rt_task_freed(ctx: *mut Ctx, s: Handle, id: I64) {
     let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         return;
@@ -1477,15 +1321,12 @@ pub unsafe extern "C" fn rt_task_freed(ctx: *mut Ctx, s: Handle, id: I64) {
     if let Some(t) = stacks.tasks.remove(&n) {
         heap::release_object(ctx, t);
     }
-    // A task of the run's scheduler may hold spans of the run's trace open, which close as it ends.
     if production {
         let c = unsafe { &mut *ctx };
         c.host_runtime().end_task(c.id, TaskId(n));
     }
 }
 
-/// Puts back how task `id`'s body left the context where it did not return, with the note the `n`
-/// bytes at `p` hold where there are any: 1, or 0 where the task left nothing.
 pub unsafe extern "C" fn rt_task_restored(
     ctx: *mut Ctx,
     s: Handle,
@@ -1506,8 +1347,6 @@ pub unsafe extern "C" fn rt_task_restored(
     I64(i64::from(restored))
 }
 
-/// The brackets task `id` stands in: how many `acquire`s, how many `release`s, and whether a
-/// cancel waits for it to leave them (1), by `which`.
 pub unsafe extern "C" fn rt_task_shields(ctx: *mut Ctx, s: Handle, id: I64, which: I64) -> I64 {
     let shields =
         object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(Shields::default(), |s| {
@@ -1523,16 +1362,14 @@ pub unsafe extern "C" fn rt_task_shields(ctx: *mut Ctx, s: Handle, id: I64, whic
     })
 }
 
-/// Whether a cancel of task `id` waits for it to leave the brackets it stands in.
 pub unsafe extern "C" fn rt_task_held_back(ctx: *mut Ctx, s: Handle, id: I64, stopping: I64) {
     if let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks")
         && let (Ok(task), Some(r)) = (u64::try_from(id.0), &mut stacks.scheduler)
     {
-        r.hold_back(task, stopping.0 != 0);
+        r.set_stopping(task, stopping.0 != 0);
     }
 }
 
-/// Records on task `id`'s handle that it ended cancelled.
 pub unsafe extern "C" fn rt_task_settled(ctx: *mut Ctx, s: Handle, id: I64) {
     let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         return;
@@ -1546,7 +1383,6 @@ pub unsafe extern "C" fn rt_task_settled(ctx: *mut Ctx, s: Handle, id: I64) {
     }
 }
 
-/// A handle of a task of scheduler `scheduler`, its id set as the scheduler starts it.
 pub unsafe extern "C" fn rt_task_made(ctx: *mut Ctx, scheduler: I64) -> Handle {
     let t = SchedulerTask {
         scheduler: scheduler.0,
@@ -1557,7 +1393,6 @@ pub unsafe extern "C" fn rt_task_made(ctx: *mut Ctx, scheduler: I64) -> Handle {
     object_made(ctx, Box::new(t))
 }
 
-/// What the task's handle `t` says, by `which`: its scheduler, its id, or how it ended.
 pub unsafe extern "C" fn rt_task_said(ctx: *mut Ctx, t: Handle, which: I64) -> I64 {
     I64(
         object::<SchedulerTask>(ctx, &t, "a task's handle").map_or(-1, |t| match which.0 {
@@ -1568,7 +1403,6 @@ pub unsafe extern "C" fn rt_task_said(ctx: *mut Ctx, t: Handle, which: I64) -> I
     )
 }
 
-/// What the task `t` names returned, held once more; the run fails where it has not returned.
 pub unsafe extern "C" fn rt_task_answer(ctx: *mut Ctx, t: Handle) -> Handle {
     match object::<SchedulerTask>(ctx, &t, "a task's handle").and_then(|t| t.result) {
         Some(w) => Handle::of(held(w)),
@@ -1582,31 +1416,25 @@ pub unsafe extern "C" fn rt_task_answer(ctx: *mut Ctx, t: Handle) -> Handle {
     }
 }
 
-/// A handle of channel `id` of scheduler `scheduler`.
 pub unsafe extern "C" fn rt_chan_made(ctx: *mut Ctx, scheduler: I64, id: I64) -> Handle {
     object_made(
         ctx,
-        Box::new(SchedulerChan {
+        Box::new(SchedulerChannel {
             scheduler: scheduler.0,
             id: id.0,
         }),
     )
 }
 
-/// What the channel's handle `c` says, by `which`: its scheduler or its id.
 pub unsafe extern "C" fn rt_chan_said(ctx: *mut Ctx, c: Handle, which: I64) -> I64 {
     I64(
-        object::<SchedulerChan>(ctx, &c, "a channel's handle").map_or(-1, |c| match which.0 {
+        object::<SchedulerChannel>(ctx, &c, "a channel's handle").map_or(-1, |c| match which.0 {
             0 => c.scheduler,
             _ => c.id,
         }),
     )
 }
 
-// --- A scheduler's own failures --------------------------------------------------------
-
-/// The failure `bytes` hold as the scheduler writes one (`std.internal.schedule`'s `Failure`): its
-/// code and message, each label's site, whether it is the primary one and its text, then its notes.
 pub fn failure_of(c: &Ctx, bytes: &[u8]) -> Result<Diagnostic, String> {
     let mut r = Reader::new(bytes);
     let code = r.str()?;
@@ -1643,7 +1471,6 @@ pub fn failure_of(c: &Ctx, bytes: &[u8]) -> Result<Diagnostic, String> {
     Ok(notes.into_iter().fold(labelled, |d, n| d.note(n)))
 }
 
-/// Fails the run with the scheduler's failure the bytes at `p` hold.
 pub unsafe extern "C" fn rt_region_failed(ctx: *mut Ctx, p: Addr, n: I64) {
     let c = unsafe { &mut *ctx };
     let d = failure_of(c, unsafe { borrowed(p, n) }).unwrap_or_else(|reason| {
@@ -1655,9 +1482,6 @@ pub unsafe extern "C" fn rt_region_failed(ctx: *mut Ctx, p: Addr, n: I64) {
     c.fail(d);
 }
 
-// --- The production scheduler's waits ------------------------------------------------
-
-/// The ticket `token` names, as the run that resolves it holds it.
 fn ticket(token: I64) -> Pending {
     Pending {
         token: token.0 as u64,
@@ -1665,8 +1489,6 @@ fn ticket(token: I64) -> Pending {
     }
 }
 
-/// What `f` returns of the context's run, which holds its tickets; `rejected`, with the run failed,
-/// where no host made the context's runtime.
 fn with_run<R>(ctx: *mut Ctx, rejected: R, f: impl FnOnce(&mut Ctx, &Run) -> R) -> R {
     let c = unsafe { &mut *ctx };
     let runtime = c.host_runtime();
@@ -1679,8 +1501,6 @@ fn with_run<R>(ctx: *mut Ctx, rejected: R, f: impl FnOnce(&mut Ctx, &Run) -> R) 
     }
 }
 
-/// Has `tickets_answered` say once `token` is resolved: 1, or 0 with the run failed for a ticket
-/// the run did not hand out.
 pub unsafe extern "C" fn rt_ticket_watch(ctx: *mut Ctx, token: I64) -> I64 {
     with_run(ctx, I64(0), |c, run| match run.watch(&ticket(token)) {
         Ok(()) => I64(1),
@@ -1691,8 +1511,6 @@ pub unsafe extern "C" fn rt_ticket_watch(ctx: *mut Ctx, token: I64) -> I64 {
     })
 }
 
-/// The watched tickets resolved and not yet taken, ascending, each token eight bytes, least
-/// significant first; their results stay for the task that waited on each.
 pub unsafe extern "C" fn rt_tickets_answered(ctx: *mut Ctx) -> TakenBytes {
     with_run(ctx, TakenBytes(0), |c, run| {
         let bytes: Vec<u8> = (run.returned().iter())
@@ -1702,9 +1520,7 @@ pub unsafe extern "C" fn rt_tickets_answered(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-/// The bytes ticket `token` resolved to, taken: a job that failed fails the run, naming what
-/// asked for it, as does a ticket not yet resolved.
-pub fn ticket_taken(ctx: *mut Ctx, token: I64) -> TakenBytes {
+pub fn take_ticket_bytes(ctx: *mut Ctx, token: I64) -> TakenBytes {
     with_run(ctx, TakenBytes(0), |c, run| taken(c, run, token))
 }
 
@@ -1726,9 +1542,6 @@ fn taken(c: &mut Ctx, run: &Run, token: I64) -> TakenBytes {
     c.given(result)
 }
 
-/// Blocks until a watched ticket is resolved, the run is stopped, or the run's clock reaches
-/// `deadline` where it is not below 0: 1, or 0 with the run failed where it watches nothing and has
-/// no deadline, which no response would end.
 pub unsafe extern "C" fn rt_tickets_park(ctx: *mut Ctx, deadline: I64) -> I64 {
     let c = unsafe { &mut *ctx };
     let runtime = c.host_runtime();
@@ -1746,8 +1559,6 @@ pub unsafe extern "C" fn rt_tickets_park(ctx: *mut Ctx, deadline: I64) -> I64 {
     }
 }
 
-/// Notes what the run held as its root's body returned, before the scheduler whose stacks `s` holds
-/// drains its other tasks: `scheduled` tasks the scheduler still holds, and the stacks it keeps.
 pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I64) {
     let Some(stacks) = object::<Stacks>(ctx, &s, "a scheduler's stacks") else {
         return;
@@ -1762,7 +1573,6 @@ pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I
     });
 }
 
-/// The run's clock: nanoseconds since it began. 0, with the run failed, where it has none.
 pub unsafe extern "C" fn rt_host_now(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
     match c.host_runtime().now() {
@@ -1774,14 +1584,11 @@ pub unsafe extern "C" fn rt_host_now(ctx: *mut Ctx) -> I64 {
     }
 }
 
-/// 1 where the run has been told to stop, else 0.
 pub unsafe extern "C" fn rt_run_stopping(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
     I64(i64::from(c.host_runtime().stopping()))
 }
 
-/// 1, with the run failed saying so, where the run's drain after a stop has run out of time; 0
-/// otherwise.
 pub unsafe extern "C" fn rt_run_drained(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
     match c.host_runtime().drain_expired() {

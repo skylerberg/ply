@@ -1,7 +1,3 @@
-//! The registry end to end: the service package `registry` run by `ply run` on a port of its own, and
-//! the commands that talk to it (`ply publish`, `ply resolve`, `ply yank`) over a real socket, with the
-//! store a directory the test reads back.
-
 import harness (Server, reserve_port, start_server, connected, hang_up, stop, spawned, kept_path,
                 PlyProcess, Clock)
 import support.harness (RunResult, write, read, empty_working_directory, working_directory, repo,
@@ -13,28 +9,23 @@ import std.time (time)
 import std.json
 import std.json (Json)
 import std.net
-import std.process (Var)
+import std.process (Variable)
 import std.string
 
 fn token() -> String = "t0k-for-orders"
 
-/// The running service, the URL a client names it by, and the certificate a client names in
-/// `PLY_TRUST` when it serves over TLS.
 type Registry = { server: Server, url: String, trust: Option<String> }
 
 type Tls = { certificate: String, key: String }
 
-/// A stage of the service's own, kept from test to test, so only the first start of a run builds it.
-fn service_stage() -> List<Var> / {fs.read[cwd], abort.raise} =
+fn service_stage() -> List<Variable> / {fs.read[cwd], abort.raise} =
   [{ name: "PLY_C_STAGE", value: working_directory() ++ "/" ++ kept_path("registry") }]
 
-/// Over plain HTTP, or over `--tls` with the certificate and key files `tls` names.
 fn start(
   tls: Option<Tls>,
 ) -> Registry / {Network, PlyProcess, Clock, WorkingDirectory, Repo, abort.raise, diverges} =
   start_with(tls, |_url: String| [])
 
-/// As `start`, with more of the registry's command line, given the URL it will be reached at.
 fn start_with(
   tls: Option<Tls>,
   more: (String) -> List<String>,
@@ -71,8 +62,6 @@ fn start_with(
   );
   let server = start_server(argv, service_stage(), port);
   let secure = match tls { Some(_) -> true, None -> false };
-  // Over plain HTTP, the registry's own response for a package nobody published proves the port is
-  // its; over TLS the reservation already made the port this registry's alone.
   let probed = connected(server, |c: Int|
     secure
       || {
@@ -103,18 +92,17 @@ fn index(name: String) -> Json / {WorkingDirectory, abort.raise} =
     None -> panic("the registry wrote the index"),
   }
 
-/// `ply` pointed at the registry, with the publisher's token when `with_token` says so.
 fn run_with_registry(
   r: Registry,
   with_token: Bool,
   argv: List<String>,
 ) -> RunResult / {PlyProcess, abort.raise} = {
   let named = [{ name: "PLY_REGISTRY", value: r.url }];
-  let vars = if with_token { named.push({ name: "PLY_REGISTRY_TOKEN", value: token() }) }
+  let variables = if with_token { named.push({ name: "PLY_REGISTRY_TOKEN", value: token() }) }
   else { named };
   match r.trust {
-    Some(certificate) -> spawned(argv, vars.push({ name: "PLY_TRUST", value: certificate })),
-    None -> spawned(argv, vars),
+    Some(certificate) -> spawned(argv, variables.push({ name: "PLY_TRUST", value: certificate })),
+    None -> spawned(argv, variables),
   }
 }
 
@@ -124,13 +112,12 @@ fn assert_rejected(ran: RunResult, code: String, words: String) -> Unit / {abort
   assert(all_output(ran).contains(words), Some("`" ++ words ++ "` is not in:\n" ++ all_output(ran)))
 }
 
-/// The first `from` in the file at `p` made `to`.
 fn replace_in_file(p: String, from: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
   match read(p) {
     None -> panic("`" ++ p ++ "` reads"),
     Some(text) -> match text.split_once(from) {
       Some(parts) -> write(p, parts.head ++ to ++ parts.tail),
-      None -> panic("`" ++ p ++ "` no longer holds `" ++ from ++ "`"),
+      None -> panic("`" ++ p ++ "` the claim is now disproved `" ++ from ++ "`"),
     },
   }
 
@@ -143,7 +130,6 @@ fn remove_file(p: String) -> Unit / {fs.remove[cwd], abort.raise} =
 fn copy_file(from: String, to: String) -> Unit / {fs.copy[cwd], abort.raise} =
   if !fs.copy[cwd](from, to) { panic("could not copy `" ++ from ++ "` to `" ++ to ++ "`") }
 
-/// A program depending on `orders` from the registry, at least 0.1.0.
 fn write_app() -> Unit / {WorkingDirectory, abort.raise} = {
   write(
     "app/ply.pkg",
@@ -164,7 +150,7 @@ fn lock() -> Json / {WorkingDirectory, abort.raise} =
 fn locked_package_field(field: String) -> Json / {WorkingDirectory, abort.raise} =
   at(nth(at(lock(), "packages"), 0), field)
 
-test/nondet "a library is published, resolved, built, and its tampered archive rejected" {
+test/nondet "a library is published, resolved and built, and a tampered archive is rejected" {
   empty_working_directory();
   let registry = start(None);
 
@@ -179,8 +165,6 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   assert_eq(str(at(nth(at(index("orders"), "versions"), 0), "digest")), published);
   assert_eq(read("store/orders/0.1.0/package.plyz.b3"), Some(published ++ "\n"));
 
-  // A version is published once: the same bytes again are what the registry holds, and other bytes
-  // under that version are rejected. A publish needs a token the name maps to.
   let again = run_with_registry(registry, true, ["publish", "orders", "--json"]);
   assert_ok(again);
   assert(bool(at(json_of(again), "already")), Some(all_output(again)));
@@ -193,11 +177,8 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
     "PLY_REGISTRY_TOKEN",
   );
 
-  // Nothing reads the registry but `ply resolve`: before it, the dependency is not there.
   write_app();
   assert_rejected(spawned(["check", "app"]), "E0135", "has not been fetched");
-  // In a checkout too, a registry dependency is pinned by its digest and its archive's: the commit
-  // holds neither, wherever the cache keeps its tree.
   write(".git/HEAD", "ref: refs/heads/main\n");
   assert_ok(run_with_registry(registry, false, ["resolve", "app"]));
   assert_eq(str(locked_package_field("name")), "orders");
@@ -207,14 +188,12 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   assert(exists("app/.ply-cache/registry/orders/ply.pkg"), None);
   assert(exists("app/.ply-cache/registry/orders@0.1.0.plyz"), None);
 
-  // Every other command reads the cache, the machine's walk included.
   assert_ok(spawned(["build", "app", "-o", "app.plyx"]));
   assert_eq(value_of(spawned(["run", "--json", "app.plyx"])), "42");
   assert_ok(spawned(["vendor", "app"]));
   assert(exists("app/vendor/orders/lib.ply"), None);
   remove_tree("app/vendor");
 
-  // Sources in the cache that are not what the lock pins are rejected by every reader of the lock.
   let moved = "`orders` is not what `ply.lock` pins";
   replace_in_file("app/.ply-cache/registry/orders/lib.ply", "n * 2", "n * 4");
   assert_rejected(spawned(["build", "app", "-o", "app.plyx"]), "E0138", moved);
@@ -231,8 +210,6 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   assert_rejected(run_with_registry(registry, true, ["publish", "shelf"]), "E0138", moved);
   remove_tree("shelf");
 
-  // A second version, then the first yanked: a lock that pins it keeps it, and a fresh resolution
-  // passes it over.
   replace_in_file(
     "orders/ply.pkg",
     "version: { major: 0, minor: 1, patch: 0 }",
@@ -250,7 +227,6 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   let fresh_lock = lock();
   assert_eq(str(at(nth(at(fresh_lock, "packages"), 0), "version")), "0.2.0");
 
-  // The registry now serves other bytes for 0.2.0, sealed and all: what the lock pins decides.
   ["ply.pkg", "lib.ply"].fold((), |u: Unit, file: String|
     match read("orders/" ++ file) {
       Some(text) -> write("evil/" ++ file, text),
@@ -267,13 +243,11 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   );
   assert(lock() == fresh_lock, Some("a rejected resolve wrote the lock"));
   assert(!exists("app/.ply-cache/registry/orders"), None);
-  // With no lock, the index's own digest is what the archive is held to.
   remove_file("app/ply.lock");
   assert_rejected(run_with_registry(registry, false, ["resolve", "app"]), "E0142", "index lists");
   stop(registry.server)
 }
 
-/// Whether the file at `p` appeared before `ms` milliseconds passed.
 fn appeared(p: String, ms: Int) -> Bool / {fs.exists[cwd], Clock, abort.raise} = {
   let until = time.elapsed_ms() + ms;
   iterate((), ms / 100 + 1, |_u: Unit|
@@ -293,7 +267,7 @@ fn public_hex() -> String / {WorkingDirectory, abort.raise} =
     None -> panic("`ply keygen` wrote the attester's public key"),
   }
 
-test/nondet "a version is attested by the registry's attester, and a consumer reports what was attested" {
+test/nondet "the registry signs each published version with its attestation key, and `check` reports whether each signature is valid" {
   empty_working_directory();
   assert_ok(spawned(["keygen", "attester.key"]));
   let here = working_directory();
@@ -319,7 +293,6 @@ test/nondet "a version is attested by the registry's attester, and a consumer re
     Some("the attester kept no attestation of orders 0.1.0"),
   );
 
-  // A second version whose law does not hold is published, and attested as not holding.
   write(
     "orders/lib.ply",
     "pub fn double(n: Int) -> Int = n * 2\n\nlaw \"doubling is tripling\" forall (n: Int) where n > 0 && n < 9 { double(n) == n * 3 }\n",
@@ -345,7 +318,6 @@ test/nondet "a version is attested by the registry's attester, and a consumer re
   let a = at(nth(at(json_of(first), "packages"), 0), "attestation");
   assert(bool(at(a, "attested")), Some(all_output(first)));
   assert(int(path(a, ["tests", "passed"])) >= 1, Some(all_output(first)));
-  // Without the attester's key named, an attestation is reported and never believed.
   let unnamed = run_with_registry(registry, false, ["resolve", "app", "--json"]);
   assert_ok(unnamed);
   let untrusted = at(nth(at(json_of(unnamed), "packages"), 0), "attestation");
@@ -369,9 +341,7 @@ test/nondet "a version is attested by the registry's attester, and a consumer re
   stop(registry.server)
 }
 
-// A registry under a certificate no public root signed, a company's own CA, here one issued for the
-// test, is reached by naming that certificate in `PLY_TRUST`, and rejected by name without it.
-test/nondet "a registry under a private certificate is reached through PLY_TRUST" {
+test/nondet "a registry with a private certificate works when `PLY_TRUST` names the certificate and fails without it" {
   empty_working_directory();
   let issued = certgen.issue();
   write("registry.pem", issued.certificate);
@@ -384,12 +354,10 @@ test/nondet "a registry under a private certificate is reached through PLY_TRUST
   assert_ok(run_with_registry(registry, false, ["resolve", "app"]));
   assert_eq(str(locked_package_field("version")), "0.1.0");
 
-  // The same registry with nothing naming its certificate: the handshake is what fails.
   let out = spawned(["resolve", "app"], [{ name: "PLY_REGISTRY", value: registry.url }]);
   assert_rejected(out, "E0141", "did not complete a TLS handshake");
   assert(all_output(out).contains("PLY_TRUST"), Some(all_output(out)));
 
-  // A file `PLY_TRUST` names that does not load stops the command before it runs.
   let absent = spawned(["check", "app"], [
     { name: "PLY_TRUST", value: working_directory() ++ "/absent.pem" },
   ]);

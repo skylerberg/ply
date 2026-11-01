@@ -1,23 +1,28 @@
 //! A double-ended queue: elements are added and removed at either end, and read by position.
 //!
-//! A `List` already appends at its back and drops its first element by sharing the rest, so a
-//! first-in, first-out queue needs only `List::push` and a `[x, ..rest]` pattern. What a `List`
-//! lacks is the other two operations: adding an element at the front and removing the last one
-//! each copy the list. A `Deque` is two lists, each with a live range. The back list grows by
-//! `List::push`. The front list stores the leading elements in reverse order, so it grows the same
-//! way. Removing an element moves the edge of a live range, which writes nothing. A push, a pop, a
-//! read by position, a drop and a reversal each take a constant number of steps. A list that is
-//! more than half dead is copied down to its live range, and the removals that emptied it have
-//! already paid for that copy. Keeping a deque and using it again copies one path of a list, as
-//! reusing a shared `List` does. Only the copying down is paid again, by each use that triggers it.
+//! A `List` already appends at its back with `List::push` and drops its first element by sharing
+//! the rest, so a first-in, first-out queue needs only `List::push` and a `[x, ..rest]` pattern. A
+//! `List` cannot cheaply add an element at the front or remove the last one, because each copies
+//! the list.
+//!
+//! A `Deque` is two lists, and each list has a live range: the slice that holds the deque's current
+//! elements. Elements outside the range have been removed but are still stored. The back list grows
+//! by `List::push`. The front list stores the leading elements in reverse order, so it grows the
+//! same way. Removing an element moves the edge of a live range and writes nothing. A push, a pop,
+//! a read by position, a drop and a reversal each take a constant number of steps. When more than
+//! half of a list lies outside its live range, the list is copied to contain only the live range.
+//! The removals that left the list mostly unused have already paid for that copy.
+//!
+//! Using a deque again after modifying it copies one path of a list, as reusing a shared `List`
+//! does. A use that also triggers the compacting copy pays for that copy again.
 //!
 //! A deque equals its elements, front to back. `to_list` is its `key`, so two deques with the same
-//! sequence are `==`, share a `digest` and are the same `Map` key, whatever their lists and limits
-//! are. Every operation is tested against that list, and against `limit` where it has one.
+//! sequence are `==`, have the same `digest` and are the same `Map` key, whatever their lists and
+//! limits are. Every operation is tested against that list, and against `limit` where it has one.
 //!
-//! A bounded deque (`bounded`) stores at most its limit. A push past the limit at one end drops an
-//! element from the other end, which makes a sliding window. The limit is not part of what a deque
-//! equals.
+//! A bounded deque (`bounded`) contains at most its limit. A push past the limit at one end drops
+//! an element from the other end, which makes a sliding window. The limit is not part of what a
+//! deque equals.
 
 import std.gen
 import std.list (prepend)
@@ -25,10 +30,12 @@ import std.list as list
 
 /// A sequence of `a`s that grows and shrinks at both ends.
 ///
-/// The fields are the front list with the start and end of its live range, then the back list with
-/// its live range, then the limit. The front list stores its elements in reverse order. An index
-/// outside its list is read as the nearest index inside it, and a limit below zero as zero, so
-/// every value of the type is a valid deque.
+/// The fields are, in order: the front list, the start and end of the front list's live range, the
+/// back list, the start and end of the back list's live range, and the limit. The live range is the
+/// part of a list that contains the deque's current elements. The front list stores its elements in
+/// reverse order. An index outside its list is treated as the nearest valid index, either 0 or the
+/// list's length, and a limit below zero is treated as zero, so every value of the type is a valid
+/// deque.
 pub type Deque<a> = | Deque(List<a>, Int, Int, List<a>, Int, Int, Option<Int>)
 
 key for Deque by to_list
@@ -39,13 +46,14 @@ pub fn empty<a>() -> Deque<a>
   ensures limit(result) == None
 = Deque([], 0, 0, [], 0, 0, None)
 
-/// An empty deque that keeps at most `most` elements. A `most` below zero counts as zero.
+/// Returns an empty deque that contains at most `most` elements. A `most` below zero counts as
+/// zero.
 pub fn bounded<a>(most: Int) -> Deque<a> = Deque([], 0, 0, [], 0, 0, Some(max(most, 0)))
 
 /// The deque of the elements of `xs`, the first at the front, with no limit.
 pub fn of_list<a>(xs: List<a>) -> Deque<a> = Deque([], 0, 0, xs, 0, xs.len(), None)
 
-/// The most elements the deque keeps, or `None` for one with no limit.
+/// Returns the most elements the deque can contain, or `None` for a deque with no limit.
 pub fn limit<a>(d: Deque<a>) -> Option<Int> =
   match d {
     Deque(_, _, _, _, _, _, most) -> match most {
@@ -54,7 +62,7 @@ pub fn limit<a>(d: Deque<a>) -> Option<Int> =
     },
   }
 
-/// How many elements the deque holds.
+/// Returns the number of elements in the deque.
 pub fn size<a>(d: Deque<a>) -> Int =
   match d {
     Deque(front, front_from, front_to, back, back_from, back_to, _) -> {
@@ -77,9 +85,13 @@ pub fn to_list<a>(d: Deque<a>) -> List<a> =
       let back_start = max(0, min(back_from, back_end));
       if front_end == front_start && back_start == 0 && back_end == back.len() { back } else {
         range(back_start, back_end).fold(
-          range(0, front_end - front_start).fold([], |acc: List<a>, i: Int|
-            match front.at(front_end - 1 - i) { Some(x) -> acc.push(x), None -> acc }),
-          |acc: List<a>, i: Int| match back.at(i) { Some(x) -> acc.push(x), None -> acc },
+          range(0, front_end - front_start).fold([], |accumulator: List<a>, i: Int|
+            match front.at(front_end - 1 - i) {
+              Some(x) -> accumulator.push(x),
+              None -> accumulator,
+            }),
+          |accumulator: List<a>, i: Int|
+            match back.at(i) { Some(x) -> accumulator.push(x), None -> accumulator },
         )
       }
     },
@@ -251,17 +263,16 @@ pub fn reverse<a>(d: Deque<a>) -> Deque<a> =
       Deque(back, back_from, back_to, front, front_from, front_to, most),
   }
 
-/// Returns `d` with a new limit, or with no limit for `None`. Under a limit, it keeps the last
-/// `most` elements.
+/// Returns `d` with limit `most`, or with no limit for `None`. A limit drops elements from the
+/// front until at most `most` remain.
 pub fn with_limit<a>(d: Deque<a>, most: Option<Int>) -> Deque<a> =
   match d {
     Deque(front, front_from, front_to, back, back_from, back_to, _) ->
       trim_front(Deque(front, front_from, front_to, back, back_from, back_to, most)),
   }
 
-/// Returns `a`'s elements followed by `b`'s, under `a`'s limit. A bounded `a` keeps the last
-/// elements that fit. Without a limit, the shorter deque is pushed onto the longer one. With a
-/// limit, `b` is pushed onto `a`.
+/// Returns the elements of `a` followed by the elements of `b`, with `a`'s limit. If `a` has a
+/// limit, the result keeps only the last elements that fit.
 pub fn concat<a>(a: Deque<a>, b: Deque<a>) -> Deque<a> =
   match limit(a) {
     None -> if size(a) < size(b) {
@@ -279,9 +290,10 @@ pub fn fold_front<a, b | e>(d: Deque<a>, init: b, f: (b, a) -> b / e) -> b / e =
       let back_end = max(0, min(back_to, back.len()));
       let back_start = max(0, min(back_from, back_end));
       range(back_start, back_end).fold(
-        range(0, front_end - front_start).fold(init, |acc: b, i: Int|
-          match front.at(front_end - 1 - i) { Some(x) -> f(acc, x), None -> acc }),
-        |acc: b, i: Int| match back.at(i) { Some(x) -> f(acc, x), None -> acc },
+        range(0, front_end - front_start).fold(init, |accumulator: b, i: Int|
+          match front.at(front_end - 1 - i) { Some(x) -> f(accumulator, x), None -> accumulator }),
+        |accumulator: b, i: Int|
+          match back.at(i) { Some(x) -> f(accumulator, x), None -> accumulator },
       )
     },
   }
@@ -290,13 +302,13 @@ pub fn fold_front<a, b | e>(d: Deque<a>, init: b, f: (b, a) -> b / e) -> b / e =
 pub fn fold_back<a, b | e>(d: Deque<a>, init: b, f: (b, a) -> b / e) -> b / e =
   fold_front(reverse(d), init, f)
 
-/// The elements of `xs` that a deque with limit `most` keeps when filled from the back: the last
-/// `most` of them, or all of them with no limit.
+/// Returns the last `most` elements of `xs`, or all of them when `most` is `None`. This is what a
+/// deque with that limit contains after its elements are added at the back.
 pub fn last_within_limit<a>(xs: List<a>, most: Option<Int>) -> List<a> =
   match most { None -> xs, Some(n) -> xs.drop(xs.len() - max(n, 0)) }
 
-/// The elements of `xs` that a deque with limit `most` keeps when filled from the front: the
-/// first `most` of them, or all of them with no limit.
+/// Returns the first `most` elements of `xs`, or all of them when `most` is `None`. This is what a
+/// deque with that limit contains after its elements are added at the front.
 pub fn first_within_limit<a>(xs: List<a>, most: Option<Int>) -> List<a> =
   match most { None -> xs, Some(n) -> xs.take(max(n, 0)) }
 
@@ -306,8 +318,6 @@ fn trim_front<a>(d: Deque<a>) -> Deque<a> =
 fn trim_back<a>(d: Deque<a>) -> Deque<a> =
   match limit(d) { None -> d, Some(most) -> drop_back(d, size(d) - most) }
 
-/// Builds a deque from these live ranges, copying a list that is at least half dead down to its
-/// live range.
 fn compact<a>(
   front: List<a>,
   front_from: Int,
@@ -331,12 +341,8 @@ fn compact<a>(
     )
   }
 
-/// `List::set` at an index the caller has checked is inside the list, which the effects cannot
-/// express.
 fn set_inside<a>(xs: List<a>, i: Int, x: a) -> List<a> =
   handle { xs.set(i, x) } with { abort.raise(_) -> xs }
-
-// --- Tests ------------------------------------------------------------------
 
 fn counting(n: Int) -> Deque<Int> = of_list(range(0, n))
 
@@ -381,7 +387,7 @@ test "an element is read by its index from the front" {
   assert_eq(get(d, 0 - 1), None)
 }
 
-test "reads agree with the list once every edge of both lists has moved" {
+test "`to_list`, `size`, `get` and the other reads match the expected list after pushing and popping at both ends" {
   let ahead = popped_back(
     popped_back(popped_front(range(0, 6).fold(empty(), |d: Deque<Int>, i: Int| push_front(d, i)))),
   );
@@ -396,13 +402,23 @@ test "reads agree with the list once every edge of both lists has moved" {
   assert_eq(to_list(both), [9, 8, 2, 3]);
   assert_eq(size(both), 4);
   assert_eq(range(0, 5).map(|i: Int| get(both, i)), [Some(9), Some(8), Some(2), Some(3), None]);
-  assert_eq(fold_front(both, [], |acc: List<Int>, x: Int| acc.push(x)), [9, 8, 2, 3]);
-  assert_eq(fold_back(both, [], |acc: List<Int>, x: Int| acc.push(x)), [3, 2, 8, 9]);
+  assert_eq(fold_front(both, [], |accumulator: List<Int>, x: Int| accumulator.push(x)), [
+    9,
+    8,
+    2,
+    3,
+  ]);
+  assert_eq(fold_back(both, [], |accumulator: List<Int>, x: Int| accumulator.push(x)), [
+    3,
+    2,
+    8,
+    9,
+  ]);
   assert_eq(to_list(drop_front(both, 3)), [3]);
   assert_eq(to_list(drop_back(both, 3)), [9])
 }
 
-test "a stack at either end writes over what it popped" {
+test "after popping from the back or the front of a deque, pushing new elements at that end replaces the popped ones and leaves the other elements unchanged" {
   let back = popped_back(popped_back(counting(3)));
   assert_eq(to_list(push_back(back, 7)), [0, 7]);
   assert_eq(to_list(push_back(push_back(push_back(back, 7), 8), 9)), [0, 7, 8, 9]);
@@ -415,7 +431,7 @@ test "a stack at either end writes over what it popped" {
   assert_eq(to_list(push_front(with_limit(front, Some(5)), 7)), [7, 0])
 }
 
-test "a drop past one list's live range takes the rest from the other's" {
+test "`drop_front` and `drop_back` remove the correct elements when the count is larger than the elements stored at that end of the deque" {
   let front_first = push_back(
     push_back(
       popped_back(popped_back(range(0, 4).fold(empty(), |d: Deque<Int>, i: Int| push_front(d, i)))),
@@ -447,7 +463,7 @@ test "a bounded deque is a window: a push past its limit drops from the other en
   assert_eq(to_list(push_back(with_limit(window, None), 10)), [7, 8, 9, 10])
 }
 
-test "drops, a reversal and a concatenation match the list operations" {
+test "`drop_front`, `drop_back`, `reverse` and `concat` return the same elements as the matching list operations" {
   let d = push_front(counting(4), 9);
   assert_eq(to_list(drop_front(d, 2)), [1, 2, 3]);
   assert_eq(to_list(drop_back(d, 2)), [9, 0, 1]);
@@ -464,19 +480,18 @@ test "drops, a reversal and a concatenation match the list operations" {
   assert_eq(limit(concat(d, bounded(3))), None)
 }
 
-/// Counts the calls a test's callback makes.
 effect counter {
   write tick() -> Unit
 }
 
 test "a fold runs from either end, and its callback may perform effects" {
   let d = push_front(counting(3), 9);
-  assert_eq(fold_front(d, "", |acc: String, x: Int| acc ++ x.to_string()), "9012");
-  assert_eq(fold_back(d, "", |acc: String, x: Int| acc ++ x.to_string()), "2109");
+  assert_eq(fold_front(d, "", |accumulator: String, x: Int| accumulator ++ x.to_string()), "9012");
+  assert_eq(fold_back(d, "", |accumulator: String, x: Int| accumulator ++ x.to_string()), "2109");
   let calls = handle {
-    fold_front(d, 0, |acc: Int, x: Int| {
+    fold_front(d, 0, |accumulator: Int, x: Int| {
       counter.tick();
-      acc + x
+      accumulator + x
     })
   } with {
     var calls = 0,
@@ -522,7 +537,7 @@ test "a deque is a value: deriving new deques from one leaves it unchanged" {
 fn stored_length(d: Deque<Int>) -> Int =
   match d { Deque(front, _, _, back, _, _, _) -> front.len() + back.len() }
 
-test "a queue that has passed many elements stores lists no longer than its size allows" {
+test "after many pushes and pops, a deque with a size limit contains only the newest elements and stores a bounded number of them" {
   let queue = range(0, 5000).fold(counting(10), |d: Deque<Int>, i: Int|
     push_back(popped_front(d), i));
   assert_eq(to_list(queue), range(4990, 5000));
@@ -540,7 +555,7 @@ test "a queue that has passed many elements stores lists no longer than its size
   )
 }
 
-test "every value of the type is a deque: an index outside its list reads as the nearest inside" {
+test "a `Deque` built directly with head or tail indexes outside its lists still behaves as a deque, using the nearest valid index" {
   let odd = Deque([1, 2, 3], 0 - 5, 99, [4, 5], 7, 1, Some(0 - 2));
   assert_eq(to_list(odd), [3, 2, 1]);
   assert_eq(size(odd), 3);
@@ -554,8 +569,6 @@ test "every value of the type is a deque: an index outside its list reads as the
   assert_eq(to_list(push_back(Deque([1], 0, 1, [2, 3], 0, 2, Some(2)), 4)), [3, 4])
 }
 
-/// Generates any deque: any two lists, any live range of each and any limit, since every value of
-/// the type is a valid deque.
 fn deques() -> gen::Gen<Deque<Int>> = {
   let index = gen::one_of([gen::int_between(0 - 2, 18), gen::any_int()]);
   gen::and_then(
@@ -581,7 +594,7 @@ test "a deque's size, its ends and an element by index match its list's" {
       && peek_back(d) == to_list(d).last())
 }
 
-test "a pop returns the element at its end and the deque without it, under the same limit" {
+test "`pop_front` and `pop_back` return the end element and the remaining deque, which has the same size limit as the original" {
   gen::check(deques(), |d: Deque<Int>|
     (match pop_front(d) {
         None -> to_list(d) == [],
@@ -596,7 +609,7 @@ test "a pop returns the element at its end and the deque without it, under the s
       }))
 }
 
-test "a drop at either end and a reversal match the list's, and keep the limit" {
+test "`drop_front`, `drop_back` and `reverse` return the elements that `drop`, `take` and `reverse` give on the list, and keep the limit" {
   gen::check2(deques(), gen::int_between(0 - 2, 18), |d: Deque<Int>, n: Int|
     to_list(drop_front(d, n)) == to_list(d).drop(n) && limit(drop_front(d, n)) == limit(d)
       && to_list(drop_back(d, n)) == to_list(d).take(to_list(d).len() - max(n, 0))

@@ -13,8 +13,9 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     SimulateExpression, ParallelExpression, TaggedLiteralExpression,
                                     HoleExpression, TryBlockExpression, Statement, LetStatement,
                                     LetElseStatement, ExpressionStatement, AssignmentStatement,
-                                    Param, MatchArm, HandleClause, ReturnClause, HandlerVar,
-                                    RecordLiteralField, NamedArg, Hole, RaiseName)
+                                    Param, MatchArm, HandleClause, ReturnClause,
+                                    HandlerStateVariable, RecordLiteralField, NamedArg, Hole,
+                                    RaiseName)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
                                     UnitTypeExpression, EffectsExpression, EffectExpression, Mode,
@@ -22,8 +23,8 @@ import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, Name
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem,
                               InstanceItem, NumericItem, FnDefinition, TypeDefinition, AliasBody,
                               SumBody, NominalBody, ExternBody, VariantDefinition, EffectDefinition,
-                              OpDefinition, TestDefinition, Constraint, ReturnsFresh, ReturnsParam,
-                              Public, HostInstance)
+                              OperationDefinition, TestDefinition, Constraint, ReturnsFresh,
+                              ReturnsParam, Public, HostInstance)
 import compiler.syntax.fmt (module_text)
 import compiler.syntax.literal_printer (float_text, decimal_text)
 import compiler.check.resolve.tables (qualify, default_binder, backticked)
@@ -79,12 +80,12 @@ pub fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} 
       if s.at >= e.at { Stop(s.lists) } else {
         let list = range(0, read(s.at)).fold(
           { at: s.at + 4, choices: [] },
-          |acc: { at: Int, choices: List<Choice> }, _i: Int| {
-            let k = read(acc.at);
+          |accumulator: { at: Int, choices: List<Choice> }, _i: Int| {
+            let k = read(accumulator.at);
             {
-              at: acc.at + 4 + 4 * k,
-              choices: acc.choices.push({
-                targets: range(0, k).map(|j: Int| read(acc.at + 4 + 4 * j)),
+              at: accumulator.at + 4 + 4 * k,
+              choices: accumulator.choices.push({
+                targets: range(0, k).map(|j: Int| read(accumulator.at + 4 + 4 * j)),
               }),
             }
           },
@@ -100,8 +101,8 @@ fn members_of(packed: Bytes) -> Option<List<Bytes>> / {abort.raise} =
     Some(n) -> {
       let read = range(0, n).fold(
         Some({ at: 4, members: [] }),
-        |acc: Option<{ at: Int, members: List<Bytes> }>, _i: Int|
-          match acc {
+        |accumulator: Option<{ at: Int, members: List<Bytes> }>, _i: Int|
+          match accumulator {
             None -> None,
             Some(s) -> match packed.u32_at(s.at) {
               None -> None,
@@ -126,7 +127,9 @@ fn stored_of(bytes: Bytes, name: Bytes) -> Stored / {abort.raise} =
     Ok(form) -> form,
     Err(e) ->
       panic(
-        String::of_bytes(Bytes::concat_all([b"the stored body of `", name, b"` does not decode: "]))
+        String::of_bytes(
+            Bytes::concat_all([b"the stored definition of `", name, b"` could not be decoded: "]),
+          )
           ++ bin::error_to_string(e),
       ),
   }
@@ -182,7 +185,7 @@ type NamedStatement = { naming: NameState, depth: Depth, node: Statement }
 
 fn local_name(level: Int) -> Bytes = b"_l".concat(ascii_of_int(level))
 
-fn type_var_name(level: Int) -> Bytes = b"_t".concat(ascii_of_int(level))
+fn type_variable_name(level: Int) -> Bytes = b"_t".concat(ascii_of_int(level))
 
 fn effect_variable_label(level: Int) -> Bytes = b"_e".concat(ascii_of_int(level))
 
@@ -192,13 +195,14 @@ fn space_name(at: Int) -> Bytes = b"_s".concat(ascii_of_int(at))
 
 fn short_hex(h: Bytes) -> Bytes / {abort.raise} = hex(h).slice(0, 12)
 
-fn ident(name: Bytes) -> Identifier = { name: name, span: dummy_span() }
+fn identifier(name: Bytes) -> Identifier = { name: name, span: dummy_span() }
 
-fn unqualified(name: Bytes) -> QName = { module: None, name: ident(name), span: dummy_span() }
+fn unqualified(name: Bytes) -> QName = { module: None, name: identifier(name), span: dummy_span() }
 
 fn free_name(free: FreeName) -> QName =
   match free.module {
-    Some(module) -> { module: Some(ident(module)), name: ident(free.name), span: dummy_span() },
+    Some(module) ->
+      { module: Some(identifier(module)), name: identifier(free.name), span: dummy_span() },
     None -> unqualified(free.name),
   }
 
@@ -213,9 +217,9 @@ fn named_in_turn<a, b>(
   items: List<a>,
   name_one: (NameState, a) -> NamedNode<b> / {abort.raise},
 ) -> NamedNode<List<b>> / {abort.raise} =
-  items.fold({ naming: naming, node: [] }, |acc: NamedNode<List<b>>, item: a| {
-    let spelled = name_one(acc.naming, item);
-    { naming: spelled.naming, node: acc.node.push(spelled.node) }
+  items.fold({ naming: naming, node: [] }, |accumulator: NamedNode<List<b>>, item: a| {
+    let spelled = name_one(accumulator.naming, item);
+    { naming: spelled.naming, node: accumulator.node.push(spelled.node) }
   })
 
 fn named_if_any<a, b>(
@@ -236,12 +240,12 @@ fn nameable(layout: Layout, slot: Slot, own: Bytes) -> Bool / {abort.raise} = {
   p.module == own || p.printed || p.public.get(slot.class)
 }
 
-fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes) -> Bool = {
+fn is_reachable(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes) -> Bool = {
   let walked = range(0, g.len() + 1).fold(
     { seen: [from], frontier: [from] },
-    |acc: { seen: List<Bytes>, frontier: List<Bytes> }, _round: Int|
-      acc.frontier.fold(
-        { seen: acc.seen, frontier: [] },
+    |accumulator: { seen: List<Bytes>, frontier: List<Bytes> }, _round: Int|
+      accumulator.frontier.fold(
+        { seen: accumulator.seen, frontier: [] },
         |out: { seen: List<Bytes>, frontier: List<Bytes> }, m: Bytes|
           List::fold(
             match g.get(m) { Some(xs) -> xs, None -> [] },
@@ -266,7 +270,7 @@ fn pick(
   let edges = g.insert(own, mine.keys());
   let safe = |s: Slot| {
     let p = layout.parts.get(s.part);
-    p.module == own || mine.contains(p.module) || !reaches(edges, p.module, own)
+    p.module == own || mine.contains(p.module) || !is_reachable(edges, p.module, own)
   };
   let score = |s: Slot| {
     let p = layout.parts.get(s.part);
@@ -304,8 +308,9 @@ fn target_of(
       if class >= hashes.len() { panic("a reference to a member this component does not have") }
       else { { naming: naming, node: { hash: hashes.get(class), member_index: class } } }
     },
-    Itself -> panic("a stored body refers to its own definition by no hash"),
-    ByName(_) -> panic("a stored body names a definition by its name"),
+    Itself -> panic("a stored definition refers to itself without using a hash"),
+    ByName(_) ->
+      panic("a stored definition refers to another definition by name instead of by hash"),
   }
 
 fn named(
@@ -318,7 +323,7 @@ fn named(
     let part = printer.layout.parts.get(slot.part);
     printer.source_names.contains(qualify(part.module, part.names.get(slot.class)))
   };
-  let told = match printer.layout.by_hash.get(target.hash) {
+  let has_source_name = match printer.layout.by_hash.get(target.hash) {
     Some(slots) -> slots.filter(meant).len() > 0,
     None -> false,
   };
@@ -326,7 +331,7 @@ fn named(
     Some({ part: printer.part, class: target.member_index })
   } else {
     pick(printer.layout, printer.graph, naming.imports, target.hash, printer.module, |slot: Slot|
-      !told || meant(slot))
+      !has_source_name || meant(slot))
   };
   match found {
     None ->
@@ -343,7 +348,11 @@ fn named(
       if part.module == printer.module { { naming: naming, node: unqualified(name) } } else {
         {
           naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
-          node: { module: Some(ident(part.binder)), name: ident(name), span: dummy_span() },
+          node: {
+            module: Some(identifier(part.binder)),
+            name: identifier(name),
+            span: dummy_span(),
+          },
         }
       }
     },
@@ -393,9 +402,10 @@ fn names_body(
   match layout.by_hash.get(hash) {
     None -> false,
     Some(found) ->
-      found.fold(false, |held: Bool, s: Slot| {
+      found.fold(false, |already_named: Bool, s: Slot| {
         let p = layout.parts.get(s.part);
-        held || (p.module == module && p.names.get(s.class) == name && nameable(layout, s, own))
+        already_named
+          || (p.module == module && p.names.get(s.class) == name && nameable(layout, s, own))
       }),
   }
 
@@ -427,13 +437,13 @@ fn tag_binder(
     None ->
       {
         naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
-        node: ident(short_hex(target.hash)),
+        node: identifier(short_hex(target.hash)),
       },
     Some(slot) -> {
       let part = layout.parts.get(slot.part);
       {
         naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
-        node: ident(part.binder),
+        node: identifier(part.binder),
       }
     },
   }
@@ -451,7 +461,7 @@ fn effect_named(
       match target.naming.slots.get(target.node.hash) {
         Some(was) -> if was != slot {
           panic(
-            "two distinct effects share one declaration, which a hash-keyed body cannot tell apart",
+            "two different effects share one declaration, so a definition stored by hash cannot distinguish them",
           )
         } else { named(printer, target.naming, target.node, None) },
         None ->
@@ -483,8 +493,8 @@ fn label_of(depth: Depth, label: Label) -> Identifier / {abort.raise} =
   match label {
     LabelParameter(level) -> if level >= depth.labels {
       panic("a label parameter that is not in scope")
-    } else { ident(label_name(level)) },
-    LabelName(name) -> ident(name),
+    } else { identifier(label_name(level)) },
+    LabelName(name) -> identifier(name),
   }
 
 fn optional_label_of(depth: Depth, label: Option<Label>) -> Option<Identifier> / {abort.raise} =
@@ -516,7 +526,7 @@ fn type_named(
 ) -> NamedNode<QName> / {abort.raise} =
   match name {
     TypeParameter(level) -> if level >= depth.types { panic("a type parameter out of scope") }
-    else { { naming: naming, node: unqualified(type_var_name(level)) } },
+    else { { naming: naming, node: unqualified(type_variable_name(level)) } },
     TypeDefined(reference) -> reference_named(printer, naming, reference, None),
     TypeUnbound(free) -> { naming: naming, node: free_name(free) },
   }
@@ -529,8 +539,10 @@ fn type_of(
 ) -> NamedNode<TypeExpression> / {abort.raise} =
   match original {
     Applied(TypeParameter(level), _, arguments) -> if level >= depth.types || arguments.len() > 0 {
-      panic("a type parameter out of scope, or applied")
-    } else { { naming: naming, node: VariableTypeExpression(ident(type_var_name(level))) } },
+      panic("a type parameter is out of scope or has arguments")
+    } else {
+      { naming: naming, node: VariableTypeExpression(identifier(type_variable_name(level))) }
+    },
     Applied(name, _, arguments) -> {
       let head = type_named(printer, naming, depth, name);
       let spelled = types_of(printer, head.naming, depth, arguments);
@@ -565,7 +577,7 @@ fn type_of(
         }),
       }
     },
-    Function(parameters, returned, effects, kept, once) -> {
+    Function(parameters, returned, effects, retained_parameters, once) -> {
       let spelled_parameters = types_of(printer, naming, depth, parameters);
       let spelled_returned = type_of(printer, spelled_parameters.naming, depth, returned);
       let spelled_effects = optional_effects_of(printer, spelled_returned.naming, depth, effects);
@@ -574,9 +586,9 @@ fn type_of(
         node: FunctionTypeExpression({
           span: dummy_span(),
           params: spelled_parameters.node,
-          kept: kept,
+          keep_indices: retained_parameters,
           once: once,
-          ret: spelled_returned.node,
+          return_type: spelled_returned.node,
           effects: spelled_effects.node,
         }),
       }
@@ -587,7 +599,7 @@ fn type_of(
         fields,
         |so_far: NameState, field: stored::TypeField<Reference, Int>| {
           let field_type = type_of(printer, so_far, depth, field.field_type);
-          { naming: field_type.naming, node: { name: ident(field.name), ty: field_type.node } }
+          { naming: field_type.naming, node: { name: identifier(field.name), ty: field_type.node } }
         },
       );
       {
@@ -614,8 +626,8 @@ fn labelled(depth: Depth, label: Option<Label>) -> Labelled / {abort.raise} =
     None -> { resource: None, every: false, binder: None },
     Some(LabelName(name)) -> if name == b"*" { { resource: None, every: true, binder: None } }
     else if name.starts_with(b"*") {
-      { resource: None, every: true, binder: Some(ident(name.slice(1, name.len()))) }
-    } else { { resource: Some(ident(name)), every: false, binder: None } },
+      { resource: None, every: true, binder: Some(identifier(name.slice(1, name.len()))) }
+    } else { { resource: Some(identifier(name)), every: false, binder: None } },
     Some(parameter) -> { resource: Some(label_of(depth, parameter)), every: false, binder: None },
   }
 
@@ -636,7 +648,7 @@ fn effect_expression_named(
     node: {
       effect_name: effect_name.node,
       mode: mode,
-      op: operation,
+      operation: operation,
       resource: labelled_by.resource,
       resource_wildcard: labelled_by.every,
       bounded: bounded,
@@ -665,7 +677,7 @@ fn effects_of(
             depth,
             performed,
             WriteMode,
-            Some(ident(operation)),
+            Some(identifier(operation)),
             label,
             bounded,
           ),
@@ -680,8 +692,8 @@ fn effects_of(
         None -> None,
         Some(EffectParameter(level)) -> if level >= depth.effects {
           panic("an effect variable that is not in scope")
-        } else { Some(ident(effect_variable_label(level))) },
-        Some(EffectVariableName(name)) -> Some(ident(name)),
+        } else { Some(identifier(effect_variable_label(level))) },
+        Some(EffectVariableName(name)) -> Some(identifier(name)),
       },
       variable_bounded: effects.bounded,
       span: dummy_span(),
@@ -692,7 +704,7 @@ fn effects_of(
 fn integer_width_name(at: Int) -> Bytes / {abort.raise} =
   match widths().at(at) {
     Some(width) -> width.name,
-    None -> panic("a literal of no width the lexer has"),
+    None -> panic("an integer literal has a bit width that no integer type defines"),
   }
 
 fn literal_of(literal: Literal) -> SourceLiteral / {abort.raise} =
@@ -718,9 +730,9 @@ fn patterns_of(
 ) -> BoundPatterns / {abort.raise} =
   originals.fold(
     { naming: naming, depth: depth, node: [] },
-    |acc: BoundPatterns, original: stored::Pattern<Reference, Int>| {
-      let bound = pattern_of(printer, acc.naming, acc.depth, original);
-      { naming: bound.naming, depth: bound.depth, node: acc.node.push(bound.node) }
+    |accumulator: BoundPatterns, original: stored::Pattern<Reference, Int>| {
+      let bound = pattern_of(printer, accumulator.naming, accumulator.depth, original);
+      { naming: bound.naming, depth: bound.depth, node: accumulator.node.push(bound.node) }
     },
   )
 
@@ -737,15 +749,15 @@ fn pattern_of(
       {
         naming: naming,
         depth: { ..depth, values: depth.values + 1 },
-        node: PatternVariable({ span: span, name: ident(local_name(depth.values)) }),
+        node: PatternVariable({ span: span, name: identifier(local_name(depth.values)) }),
       },
     Rebound(level) -> if level >= depth.values {
-      panic("an alternative names a binder that is not in scope")
+      panic("a pattern refers to a variable that is not in scope")
     } else {
       {
         naming: naming,
         depth: depth,
-        node: PatternVariable({ span: span, name: ident(local_name(level)) }),
+        node: PatternVariable({ span: span, name: identifier(local_name(level)) }),
       }
     },
     LiteralPattern(literal) ->
@@ -764,7 +776,7 @@ fn pattern_of(
       let name = match constructor {
         Constructed(reference, simple) -> reference_named(printer, naming, reference, Some(simple)),
         Unbound(free) -> { naming: naming, node: free_name(free) },
-        _ -> panic("a pattern of no constructor"),
+        _ -> panic("a constructor pattern does not name a constructor"),
       };
       let bound = patterns_of(printer, name.naming, depth, arguments);
       {
@@ -776,12 +788,20 @@ fn pattern_of(
     RecordPattern(fields, rest) -> {
       let bound = fields.fold(
         { naming: naming, depth: depth, node: [] },
-        |acc: { naming: NameState, depth: Depth, node: List<{ name: Identifier, pattern: Pattern }> }, field: stored::PatternField<Reference, Int>| {
-          let field_bound = pattern_of(printer, acc.naming, acc.depth, field.pattern);
+        |accumulator: { naming: NameState, depth: Depth, node: List<{ name: Identifier, pattern: Pattern }> }, field: stored::PatternField<Reference, Int>| {
+          let field_bound = pattern_of(
+            printer,
+            accumulator.naming,
+            accumulator.depth,
+            field.pattern,
+          );
           {
             naming: field_bound.naming,
             depth: field_bound.depth,
-            node: acc.node.push({ name: ident(field.name), pattern: field_bound.node }),
+            node: accumulator.node.push({
+              name: identifier(field.name),
+              pattern: field_bound.node,
+            }),
           }
         },
       );
@@ -854,7 +874,7 @@ fn fields_of(
     fields,
     |so_far: NameState, field: stored::RecordField<Reference, Int, Int, Unit>| {
       let value = expression_of(printer, so_far, depth, field.value);
-      { naming: value.naming, node: { name: ident(field.name), value: value.node } }
+      { naming: value.naming, node: { name: identifier(field.name), value: value.node } }
     },
   )
 
@@ -875,8 +895,9 @@ fn on_value_of(
   let after = { ..given.naming, call_index: given.naming.call_index + 1 };
   let named_arguments = range(0, given.node.len()).map(|i: Int|
     {
-      name: if choice.targets.len() == given.node.len() { ident(local_name(choice.targets.get(i))) }
-      else { given.node.get(i).name },
+      name: if choice.targets.len() == given.node.len() {
+        identifier(local_name(choice.targets.get(i)))
+      } else { given.node.get(i).name },
       value: given.node.get(i).value,
       span: span,
     });
@@ -888,7 +909,7 @@ fn on_value_of(
   let on_value = |field: Bytes| {
     let written = CallExpression({
       span: span,
-      function: FieldExpression({ span: span, base: base.node, field: ident(field) }),
+      function: FieldExpression({ span: span, base: base.node, field: identifier(field) }),
       named: named_arguments,
       args: arguments.node,
       labels: labels,
@@ -899,7 +920,7 @@ fn on_value_of(
         PerformExpression({
           span: span,
           effect_name: variable.name,
-          op: ident(field),
+          operation: identifier(field),
           resource: labels.at(0),
           args: arguments.node,
         })
@@ -956,9 +977,9 @@ fn expression_of(
         naming: spelled_right.naming,
         node: BinaryExpression({
           span: span,
-          op: operator,
-          lhs: spelled_left.node,
-          rhs: spelled_right.node,
+          operation: operator,
+          left_operand: spelled_left.node,
+          right_operand: spelled_right.node,
         }),
       }
     },
@@ -966,7 +987,7 @@ fn expression_of(
       let spelled = expression_of(printer, naming, depth, operand);
       {
         naming: spelled.naming,
-        node: UnaryExpression({ span: span, op: operator, operand: spelled.node }),
+        node: UnaryExpression({ span: span, operation: operator, operand: spelled.node }),
       }
     },
     Lambda(annotations, body) -> {
@@ -989,7 +1010,7 @@ fn expression_of(
           body: spelled_body.node,
           params: range(0, annotations.len()).map(|i: Int|
             {
-              name: ident(local_name(depth.values + i)),
+              name: identifier(local_name(depth.values + i)),
               keep: false,
               ty: spelled_annotations.node.get(i),
               cost: None,
@@ -997,7 +1018,7 @@ fn expression_of(
               default: None,
               span: span,
             }),
-          ret: None,
+          return_clause: None,
         }),
       }
     },
@@ -1082,7 +1103,7 @@ fn expression_of(
       let spelled = expression_of(printer, naming, depth, base);
       {
         naming: spelled.naming,
-        node: FieldExpression({ span: span, base: spelled.node, field: ident(name) }),
+        node: FieldExpression({ span: span, base: spelled.node, field: identifier(name) }),
       }
     },
     ListOf(items) -> {
@@ -1097,7 +1118,7 @@ fn expression_of(
         node: PerformExpression({
           span: span,
           effect_name: effect_name.node,
-          op: ident(operation),
+          operation: identifier(operation),
           resource: optional_label_of(depth, label),
           args: spelled_arguments.node,
         }),
@@ -1117,10 +1138,10 @@ fn expression_of(
         naming: spelled_body.naming,
         node: WithScopeExpression({
           span: span,
-          resource: ident(resource),
+          resource: identifier(resource),
           acquire: spelled_acquire.node,
           release: spelled_release.node,
-          binder: ident(local_name(depth.values)),
+          binder: identifier(local_name(depth.values)),
           body: spelled_body.node,
         }),
       }
@@ -1186,7 +1207,7 @@ fn expression_of(
           let effect_name = effect_named(printer, naming, given.effect);
           {
             naming: effect_name.naming,
-            node: Some({ effect_name: effect_name.node, op: ident(given.operation) }),
+            node: Some({ effect_name: effect_name.node, operation: identifier(given.operation) }),
           }
         },
       };
@@ -1201,16 +1222,16 @@ fn expression_of(
       }
     },
     Block(entries, tail) -> {
-      let said = |acc: { naming: NameState, depth: Depth, node: List<Statement> }, statement: StoredStatement| {
-        let spelled = statement_of(printer, acc.naming, acc.depth, statement);
-        { naming: spelled.naming, depth: spelled.depth, node: acc.node.push(spelled.node) }
+      let append_statement = |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, statement: StoredStatement| {
+        let spelled = statement_of(printer, accumulator.naming, accumulator.depth, statement);
+        { naming: spelled.naming, depth: spelled.depth, node: accumulator.node.push(spelled.node) }
       };
       let statements = entries.fold(
         { naming: naming, depth: depth, node: [] },
-        |acc: { naming: NameState, depth: Depth, node: List<Statement> }, entry: stored::Entry<Reference, Int, Int, Unit>|
+        |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, entry: stored::Entry<Reference, Int, Int, Unit>|
           match entry {
-            One(statement) -> said(acc, statement),
-            Commuting(_, members) -> members.fold(acc, said),
+            One(statement) -> append_statement(accumulator, statement),
+            Commuting(_, members) -> members.fold(accumulator, append_statement),
           },
       );
       let spelled_variable = optional_expression_of(
@@ -1238,7 +1259,10 @@ fn parsed_by(
 ) -> NamedNode<Target> / {abort.raise} =
   match value.named {
     Defined(reference) -> target_of(printer, naming, reference),
-    _ -> panic("a tagged literal whose parser is no definition"),
+    _ ->
+      panic(
+        "a literal with a tag must name a defined function to parse it, but the tag names something else",
+      ),
   }
 
 fn handle_of(
@@ -1251,15 +1275,15 @@ fn handle_of(
   let level = depth.values;
   let variables = range(0, handled.variables.len()).fold(
     { naming: naming, node: [] },
-    |acc: NamedNode<List<HandlerVar>>, i: Int| {
+    |accumulator: NamedNode<List<HandlerStateVariable>>, i: Int| {
       let variable = handled.variables.get(i);
       let seeing = { ..depth, values: level + i };
-      let annotation = optional_type_of(printer, acc.naming, seeing, variable.annotation);
+      let annotation = optional_type_of(printer, accumulator.naming, seeing, variable.annotation);
       let first = expression_of(printer, annotation.naming, seeing, variable.first);
       {
         naming: first.naming,
-        node: acc.node.push({
-          name: ident(local_name(level + i)),
+        node: accumulator.node.push({
+          name: identifier(local_name(level + i)),
           ty: annotation.node,
           init: first.node,
           span: span,
@@ -1268,14 +1292,14 @@ fn handle_of(
     },
   );
   let body = expression_of(printer, variables.naming, depth, handled.body);
-  let held = level + handled.variables.len();
+  let level_after_variables = level + handled.variables.len();
   let clauses = named_in_turn(
     body.naming,
     handled.clauses,
     |so_far: NameState, clause: stored::HandlerClause<Reference, Int, Int, Unit>| {
       let effect_name = effect_named(printer, so_far, clause.effect);
       let labelled_by = labelled(depth, clause.label);
-      let bound = held + clause.parameters;
+      let bound = level_after_variables + clause.parameters;
       let clause_body = expression_of(
         printer,
         effect_name.naming,
@@ -1286,14 +1310,14 @@ fn handle_of(
         naming: clause_body.naming,
         node: {
           effect_name: effect_name.node,
-          op: ident(clause.operation),
+          operation: identifier(clause.operation),
           resource: labelled_by.resource,
           wildcard_label: labelled_by.every,
           label_binder: labelled_by.binder,
-          resume: if clause.resumes { Some(ident(local_name(bound))) } else { None },
+          resume: if clause.resumes { Some(identifier(local_name(bound))) } else { None },
           body: clause_body.node,
           span: span,
-          params: range(held, bound).map(|i: Int| ident(local_name(i))),
+          params: range(level_after_variables, bound).map(|i: Int| identifier(local_name(i))),
         },
       }
     },
@@ -1301,10 +1325,19 @@ fn handle_of(
   let returned = match handled.returned {
     None -> { naming: clauses.naming, node: None },
     Some(given) -> {
-      let spelled = expression_of(printer, clauses.naming, { ..depth, values: held + 1 }, given);
+      let spelled = expression_of(
+        printer,
+        clauses.naming,
+        { ..depth, values: level_after_variables + 1 },
+        given,
+      );
       {
         naming: spelled.naming,
-        node: Some({ binder: ident(local_name(held)), body: spelled.node, span: span }),
+        node: Some({
+          binder: identifier(local_name(level_after_variables)),
+          body: spelled.node,
+          span: span,
+        }),
       }
     },
   };
@@ -1313,9 +1346,9 @@ fn handle_of(
     node: HandleExpression({
       span: span,
       body: body.node,
-      ret: returned.node,
+      return_clause: returned.node,
       clauses: clauses.node,
-      vars: variables.node,
+      handler_variables: variables.node,
     }),
   }
 }
@@ -1367,9 +1400,9 @@ fn statement_of(
     Assign(variable, value) -> {
       let name = match variable.named {
         Local(level) -> if level >= depth.values {
-          panic("a handler variable that is not in scope")
-        } else { ident(local_name(level)) },
-        _ -> panic("an assignment to no handler variable"),
+          panic("the assigned name is not a handler variable in scope")
+        } else { identifier(local_name(level)) },
+        _ -> panic("the assignment target is not a handler variable"),
       };
       let spelled = expression_of(printer, naming, depth, value);
       {
@@ -1383,10 +1416,10 @@ fn statement_of(
 
 fn generics_of(generics: stored::Generics) -> Generics =
   {
-    types: range(0, generics.types).map(|i: Int| ident(type_var_name(i))),
-    effects: range(0, generics.effects).map(|i: Int| ident(effect_variable_label(i))),
-    labels: range(0, generics.labels).map(|i: Int| ident(label_name(i))),
-    kept: generics.kept.map(|i: Int| ident(type_var_name(i))),
+    types: range(0, generics.types).map(|i: Int| identifier(type_variable_name(i))),
+    effects: range(0, generics.effects).map(|i: Int| identifier(effect_variable_label(i))),
+    labels: range(0, generics.labels).map(|i: Int| identifier(label_name(i))),
+    retained_types: generics.retained_types.map(|i: Int| identifier(type_variable_name(i))),
   }
 
 fn depth_of(generics: stored::Generics) -> Depth =
@@ -1397,7 +1430,7 @@ fn constraints_of(constraints: List<stored::ParameterConstraint>) -> List<Constr
     {
       deriver: constrained.deriver,
       deriver_span: dummy_span(),
-      param: ident(type_var_name(constrained.level)),
+      param: identifier(type_variable_name(constrained.level)),
       span: dummy_span(),
     })
 
@@ -1413,9 +1446,14 @@ fn items_of(
       let depth = depth_of(function.generics);
       let parameters = range(0, function.parameters.len()).fold(
         { naming: naming, node: [] },
-        |acc: NamedNode<List<Param>>, i: Int| {
+        |accumulator: NamedNode<List<Param>>, i: Int| {
           let parameter = function.parameters.get(i);
-          let annotation = optional_type_of(printer, acc.naming, depth, parameter.annotation);
+          let annotation = optional_type_of(
+            printer,
+            accumulator.naming,
+            depth,
+            parameter.annotation,
+          );
           let default_value = optional_expression_of(
             printer,
             annotation.naming,
@@ -1424,12 +1462,12 @@ fn items_of(
           );
           {
             naming: default_value.naming,
-            node: acc.node.push({
-              name: ident(local_name(i)),
-              keep: parameter.kept,
+            node: accumulator.node.push({
+              name: identifier(local_name(i)),
+              keep: parameter.retained,
               ty: annotation.node,
               cost: None,
-              space: if parameter.spaced { Some(ident(space_name(i))) } else { None },
+              space: if parameter.spaced { Some(identifier(space_name(i))) } else { None },
               default: default_value.node,
               span: span,
             }),
@@ -1446,10 +1484,10 @@ fn items_of(
         node: [
           FunctionItem({
             visibility: Public,
-            name: ident(name),
+            name: identifier(name),
             generics: generics_of(function.generics),
             params: parameters.node,
-            ret: returned.node,
+            return_type: returned.node,
             effects: effects.node,
             constraints: constraints_of(function.constraints),
             spec: [],
@@ -1458,7 +1496,7 @@ fn items_of(
               Fresh -> Some(ReturnsFresh(span)),
               ParameterReturned(i) -> if i >= function.parameters.len() {
                 panic("a `returns` clause names a parameter out of scope")
-              } else { Some(ReturnsParam(ident(local_name(i)))) },
+              } else { Some(ReturnsParam(identifier(local_name(i)))) },
             },
             reuse: None,
             transparent: None,
@@ -1487,7 +1525,12 @@ fn items_of(
               let fields = types_of(printer, so_far, depth, variant.fields);
               {
                 naming: fields.naming,
-                node: { name: ident(variant.name), fields: fields.node, doc: None, span: span },
+                node: {
+                  name: identifier(variant.name),
+                  fields: fields.node,
+                  doc: None,
+                  span: span,
+                },
               }
             },
           );
@@ -1508,8 +1551,8 @@ fn items_of(
             naming: function_name.naming,
             node: InstanceItem({
               kind: through.kind,
-              target: ident(name),
-              function: ident(qualified_name_text(function_name.node)),
+              target: identifier(name),
+              function: identifier(qualified_name_text(function_name.node)),
               span: span,
             }),
           }
@@ -1523,8 +1566,8 @@ fn items_of(
           {
             naming: function_name.naming,
             node: {
-              op: ident(operation.operator),
-              by: ident(qualified_name_text(function_name.node)),
+              operation: identifier(operation.operator),
+              by: identifier(qualified_name_text(function_name.node)),
             },
           }
         },
@@ -1532,7 +1575,7 @@ fn items_of(
       let declaration = TypeItem({
         visibility: Public,
         opaque: if declared.opaque { Some({ span: span, result: [], take: [] }) } else { None },
-        name: ident(name),
+        name: identifier(name),
         generics: generics_of(declared.generics),
         constraints: constraints_of(declared.constraints),
         body: body.node,
@@ -1544,7 +1587,9 @@ fn items_of(
         naming: arithmetic.naming,
         node: List::concat([declaration], instances.node).concat(if arithmetic.node.len() == 0 {
           []
-        } else { [NumericItem({ target: ident(name), operations: arithmetic.node, span: span })] }),
+        } else {
+          [NumericItem({ target: identifier(name), operations: arithmetic.node, span: span })]
+        }),
       }
     },
     EffectOf(declared) -> {
@@ -1558,14 +1603,15 @@ fn items_of(
           {
             naming: returned.naming,
             node: {
-              name: ident(operation.name),
+              name: identifier(operation.name),
               mode: operation.mode,
               resource_param: operation.resource,
-              type_params: range(0, operation.types).map(|i: Int| ident(type_var_name(i))),
+              type_params: range(0, operation.types).map(|i: Int|
+                identifier(type_variable_name(i))),
               params: parameters.node,
               param_names: [],
-              kept: operation.kept,
-              ret: returned.node,
+              keep_indices: operation.retained_parameters,
+              return_type: returned.node,
               doc: None,
               span: span,
             },
@@ -1574,7 +1620,7 @@ fn items_of(
       );
       let declaration = EffectItem({
         visibility: Public,
-        name: ident(name),
+        name: identifier(name),
         is_nondet: declared.nondet,
         operations: operations.node,
         doc: None,
@@ -1591,8 +1637,8 @@ fn items_of(
               declaration,
               InstanceItem({
                 kind: HostInstance,
-                target: ident(name),
-                function: ident(qualified_name_text(function_name.node)),
+                target: identifier(name),
+                function: identifier(qualified_name_text(function_name.node)),
                 span: span,
               }),
             ],
@@ -1601,7 +1647,7 @@ fn items_of(
       }
     },
     TestOf(declared) -> match declared.cases {
-      Some(_) -> panic("a test over cases has no body to print without its table"),
+      Some(_) -> panic("a test with a table of cases cannot be printed without its table"),
       None -> {
         let body = expression_of(
           printer,
@@ -1706,21 +1752,30 @@ fn named_of(
 ) -> { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<PrintError> } / {abort.raise} =
   names.fold(
     { named: Map::new(), bad: None },
-    |acc: { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<PrintError> }, n: { name: Bytes, hash: Bytes, public: Bool }|
-      match acc.bad {
-        Some(_) -> acc,
+    |accumulator: { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<PrintError> }, n: { name: Bytes, hash: Bytes, public: Bool }|
+      match accumulator.bad {
+        Some(_) -> accumulator,
         None -> {
           let simple = default_binder(n.name);
           if simple.len() == n.name.len() {
-            { ..acc, bad: some_error(Bytes::concat_all([b"`", n.name, b"` names no module"]), []) }
+            {
+              ..accumulator,
+              bad: some_error(Bytes::concat_all([b"`", n.name, b"` has no module prefix"]), []),
+            }
           } else if !keys.contains(n.hash) {
-            { ..acc, bad: some_error(Bytes::concat_all([b"`", n.name, b"` has no body"]), []) }
+            {
+              ..accumulator,
+              bad: some_error(
+                Bytes::concat_all([b"`", n.name, b"` has no definition in the store"]),
+                [],
+              ),
+            }
           } else {
             let module = n.name.slice(0, n.name.len() - simple.len() - 1);
-            let had = match acc.named.get(n.hash) { Some(m) -> m, None -> Map::new() };
+            let had = match accumulator.named.get(n.hash) { Some(m) -> m, None -> Map::new() };
             {
-              ..acc,
-              named: acc.named.insert(
+              ..accumulator,
+              named: accumulator.named.insert(
                 n.hash,
                 had.insert(Bytes::concat_all([module, b"\x00", simple]), {
                   module: module,
@@ -1742,8 +1797,8 @@ fn split_by_module(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort
   } else {
     let by_module = range(0, classes.len()).fold(
       Map::new(),
-      |acc: Map<Bytes, List<List<Holder>>>, c: Int|
-        classes.get(c).fold(acc, |a: Map<Bytes, List<List<Holder>>>, n: Holder| {
+      |accumulator: Map<Bytes, List<List<Holder>>>, c: Int|
+        classes.get(c).fold(accumulator, |a: Map<Bytes, List<List<Holder>>>, n: Holder| {
           let rows = match a.get(n.module) {
             Some(r) -> r,
             None -> classes.map(|k: List<Holder>| []),
@@ -1751,27 +1806,30 @@ fn split_by_module(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort
           a.insert(n.module, rows.set(c, rows.get(c).push(n)))
         }),
     );
-    by_module.fold(Some([]), |acc: Option<List<Copied>>, m: Bytes, rows: List<List<Holder>>|
-      match acc {
-        None -> None,
-        Some(out) -> {
-          let count = rows.get(0).len();
-          if rows.fold(false, |b: Bool, r: List<Holder>| b || r.len() != count) { None } else {
-            Some(
-              range(0, count).fold(out, |o: List<Copied>, k: Int|
-                o.push({
-                  module: m,
-                  names: rows.map(|r: List<Holder>| r.get(k).simple),
-                  public: rows.map(|r: List<Holder>| r.get(k).public),
-                })),
-            )
-          }
+    by_module.fold(
+      Some([]),
+      |accumulator: Option<List<Copied>>, m: Bytes, rows: List<List<Holder>>|
+        match accumulator {
+          None -> None,
+          Some(out) -> {
+            let count = rows.get(0).len();
+            if rows.fold(false, |b: Bool, r: List<Holder>| b || r.len() != count) { None } else {
+              Some(
+                range(0, count).fold(out, |o: List<Copied>, k: Int|
+                  o.push({
+                    module: m,
+                    names: rows.map(|r: List<Holder>| r.get(k).simple),
+                    public: rows.map(|r: List<Holder>| r.get(k).public),
+                  })),
+              )
+            }
+          },
         },
-      })
+    )
   }
 
 fn add_component(
-  acc: PartitionState,
+  accumulator: PartitionState,
   component: Component,
   named: Map<Bytes, Map<Bytes, Holder>>,
   shipped: List<Bytes>,
@@ -1779,7 +1837,7 @@ fn add_component(
   let classes = component.hashes.map(|h: Bytes|
     match named.get(h) { Some(m) -> m.values(), None -> [] });
   let checked: PartitionState = range(0, component.hashes.len()).fold(
-    acc,
+    accumulator,
     |a: PartitionState, i: Int|
       match a.error {
         Some(_) -> a,
@@ -1790,7 +1848,7 @@ fn add_component(
             {
               ..a,
               error: some_error(
-                Bytes::concat_all([b"the body `", short_hex(h), b"` has no name"]),
+                Bytes::concat_all([b"the definition `", short_hex(h), b"` has no name"]),
                 [],
               ),
             }
@@ -1839,7 +1897,7 @@ fn add_component(
           ..checked,
           error: some_error(
             listed(classes.fold([], |o: List<Holder>, ns: List<Holder>| o.concat(ns))).concat(
-              b" are a mutually recursive group in which two definitions share one body, so a call cannot say which it reaches",
+              b" are a mutually recursive group in which two definitions are identical, so a call cannot tell which of them it calls",
             ),
             [b"make the definitions differ, or keep one of them"],
           ),
@@ -1847,16 +1905,16 @@ fn add_component(
       Some(cs) ->
         {
           ..checked,
-          parts: cs.fold(checked.parts, |ps: List<Part>, cp: Copied|
+          parts: cs.fold(checked.parts, |ps: List<Part>, copied: Copied|
             ps.push({
               members: component.members,
               picks: component.picks,
               hashes: component.hashes,
-              names: cp.names,
-              public: cp.public,
-              module: cp.module,
-              binder: default_binder(cp.module),
-              printed: !shipped.contains(cp.module),
+              names: copied.names,
+              public: copied.public,
+              module: copied.module,
+              binder: default_binder(copied.module),
+              printed: !shipped.contains(copied.module),
             })),
         },
     },
@@ -1866,13 +1924,14 @@ fn add_component(
 fn is_some(o: Option<PrintError>) -> Bool = match o { Some(_) -> true, None -> false }
 
 fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
-  let sharing = modules.fold(Map::new(), |acc: Map<Bytes, Int>, m: Bytes|
-    acc.insert(
+  let sharing = modules.fold(Map::new(), |accumulator: Map<Bytes, Int>, m: Bytes|
+    accumulator.insert(
       default_binder(m),
-      1 + (match acc.get(default_binder(m)) { Some(k) -> k, None -> 0 }),
+      1 + (match accumulator.get(default_binder(m)) { Some(k) -> k, None -> 0 }),
     ));
   let start = {
-    taken: sharing.fold(Map::new(), |acc: Map<Bytes, Bool>, b: Bytes, k: Int| acc.insert(b, true)),
+    taken: sharing.fold(Map::new(), |accumulator: Map<Bytes, Bool>, b: Bytes, k: Int|
+      accumulator.insert(b, true)),
     out: Map::new(),
   };
   let done = modules.fold(
@@ -1903,24 +1962,28 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
 
 fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout / {abort.raise} = {
   let bound = binders(
-    parts.fold(Map::new(), |acc: Map<Bytes, Bool>, part: Part| acc.insert(part.module, true)).keys(
+    parts.fold(Map::new(), |accumulator: Map<Bytes, Bool>, part: Part|
+      accumulator.insert(part.module, true)).keys(
     ),
   );
   let placed = parts.map(|part: Part|
     { ..part, binder: match bound.get(part.module) { Some(b) -> b, None -> part.binder } });
   {
     parts: placed,
-    by_hash: range(0, placed.len()).fold(Map::new(), |acc: Map<Bytes, List<Slot>>, u: Int| {
-      let hashes = placed.get(u).hashes;
-      range(0, hashes.len()).fold(acc, |a: Map<Bytes, List<Slot>>, c: Int|
-        a.insert(
-          hashes.get(c),
-          List::push(match a.get(hashes.get(c)) { Some(xs) -> xs, None -> [] }, {
-            part: u,
-            class: c,
-          }),
-        ))
-    }),
+    by_hash: range(0, placed.len()).fold(
+      Map::new(),
+      |accumulator: Map<Bytes, List<Slot>>, u: Int| {
+        let hashes = placed.get(u).hashes;
+        range(0, hashes.len()).fold(accumulator, |a: Map<Bytes, List<Slot>>, c: Int|
+          a.insert(
+            hashes.get(c),
+            List::push(match a.get(hashes.get(c)) { Some(xs) -> xs, None -> [] }, {
+              part: u,
+              class: c,
+            }),
+          ))
+      },
+    ),
     source_names: meant,
   }
 }
@@ -1937,18 +2000,18 @@ fn print_parts(
 ) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } / {abort.raise} =
   range(0, layout.parts.len()).fold(
     { modules: Map::new(), missing: Map::new(), graph: Map::new() },
-    |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
+    |accumulator: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
       let p = layout.parts.get(u);
-      if !p.printed { acc } else {
+      if !p.printed { accumulator } else {
         let x = {
           layout: layout,
           part: u,
           module: p.module,
-          graph: acc.graph,
+          graph: accumulator.graph,
           source_names: Map::new(),
         };
         let walked = range(0, p.members.len()).fold(
-          { imports: Map::new(), missing: acc.missing, texts: [] },
+          { imports: Map::new(), missing: accumulator.missing, texts: [] },
           |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, c: Int| {
             let name = p.names.get(c);
             let printer = {
@@ -1973,18 +2036,18 @@ fn print_parts(
             }
           },
         );
-        let had = match acc.modules.get(p.module) {
+        let had = match accumulator.modules.get(p.module) {
           Some(m) -> m,
           None -> { items: [], imports: Map::new() },
         };
         let imports = had.imports.merge(walked.imports.remove(p.module));
         {
-          modules: acc.modules.insert(p.module, {
+          modules: accumulator.modules.insert(p.module, {
             items: had.items.concat(walked.texts),
             imports: imports,
           }),
           missing: walked.missing,
-          graph: acc.graph.insert(p.module, imports.keys()),
+          graph: accumulator.graph.insert(p.module, imports.keys()),
         }
       }
     },
@@ -2003,7 +2066,7 @@ fn print_tests(
       let body = tests.get(i);
       let label = b"t".concat(ascii_of_int(i));
       match envelope(body) {
-        Some(e) -> if e.kind != 0 { panic("a test body that is not a solo body") } else {
+        Some(e) -> if e.kind != 0 { panic("a stored test is not a single definition") } else {
           let t = items_of(
             x,
             fresh_naming(w.imports, w.missing, match picks_of(body, e).at(0) {
@@ -2019,7 +2082,7 @@ fn print_tests(
             texts: w.texts.push(items_text(t.node)),
           }
         },
-        None -> panic("a test body that is not a solo body"),
+        None -> panic("a stored test is not a single definition"),
       }
     },
   )
@@ -2027,8 +2090,8 @@ fn print_tests(
 
 fn sheet_text(sheet: Sheet) -> Bytes / {abort.raise} =
   Bytes::concat_all(
-    sheet.imports.fold([], |acc: List<Bytes>, m: Bytes, b: Bytes|
-      acc.push(
+    sheet.imports.fold([], |accumulator: List<Bytes>, m: Bytes, b: Bytes|
+      accumulator.push(
         Bytes::concat_all([
           b"import ",
           m,
@@ -2050,18 +2113,19 @@ pub fn print_bodies(
   let comps = bodies.map(component_of);
   let n = named_of(
     names,
-    comps.fold(Map::new(), |acc: Map<Bytes, Bool>, component: Component|
-      acc.insert(component.key, true)),
+    comps.fold(Map::new(), |accumulator: Map<Bytes, Bool>, component: Component|
+      accumulator.insert(component.key, true)),
   );
   let parted: PartitionState = match n.bad {
     Some(_) -> { seen: Map::new(), hash_by_name: Map::new(), parts: [], error: n.bad },
     None ->
       comps.fold(
         { seen: Map::new(), hash_by_name: Map::new(), parts: [], error: None },
-        |acc: PartitionState, component: Component|
-          if is_some(acc.error) || acc.seen.contains(component.id) { acc } else {
+        |accumulator: PartitionState, component: Component|
+          if is_some(accumulator.error) || accumulator.seen.contains(component.id) { accumulator }
+          else {
             add_component(
-              { ..acc, seen: acc.seen.insert(component.id, true) },
+              { ..accumulator, seen: accumulator.seen.insert(component.id, true) },
               component,
               n.named,
               shipped,
@@ -2076,11 +2140,11 @@ pub fn print_bodies(
         parted.parts,
         meant.fold(
           Map::new(),
-          |acc: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
-            acc.insert(
+          |accumulator: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
+            accumulator.insert(
               source_names_key(n.name, n.hash),
-              n.names.fold(Map::new(), |held: Map<Bytes, Bool>, name: Bytes|
-                held.insert(name, true)),
+              n.names.fold(Map::new(), |names_so_far: Map<Bytes, Bool>, name: Bytes|
+                names_so_far.insert(name, true)),
             ),
         ),
       );
@@ -2090,7 +2154,7 @@ pub fn print_bodies(
       if missing.len() > 0 {
         Unprintable({
           message: ascii_of_int(missing.len()).concat(
-            b" definitions a body refers to are not among the bodies it can name",
+            b" definitions are used by a printed definition but are missing from the definitions being printed",
           ),
           notes: [
             b"missing: ".concat(
@@ -2101,8 +2165,8 @@ pub fn print_bodies(
       } else {
         let texts = printed.modules.fold(
           [],
-          |acc: List<{ module: Bytes, text: Bytes }>, m: Bytes, sheet: Sheet|
-            acc.push({ module: m, text: sheet_text(sheet) }),
+          |accumulator: List<{ module: Bytes, text: Bytes }>, m: Bytes, sheet: Sheet|
+            accumulator.push({ module: m, text: sheet_text(sheet) }),
         );
         Printed(if tests.len() == 0 { texts } else {
           texts.push({

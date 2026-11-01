@@ -19,7 +19,7 @@ import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.interface (imported)
 import compiler.expand.embed (EmbedFile, embed_file, embed_file_bin, embed_key)
-import compiler.front.pkg (PackageSources, JudgedPackages, judged_packages_bin,
+import compiler.front.pkg (PackageSources, ValidatedPackages, validated_packages_bin,
                            location_placeholder, package_sources_bin)
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, diagnostic_bin, path_span,
                                       source_bin)
@@ -80,8 +80,8 @@ fn derived_read(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.rais
     None ->
       Failed({
         code: b"E0155",
-        message: b"no deriver ran for this derivation",
-        notes: [b"this command reads modules without running their derivers"],
+        message: b"no derived code was generated for this `derive` declaration",
+        notes: [b"this command reads modules without running `derive` generators"],
       }),
   }
 
@@ -140,7 +140,7 @@ pub fn with_decode_cache<a | e>(
   }
 
 pub fn text_key(source: Source) -> Bytes =
-  Bytes::concat_all([source.name, b"\x00", blake3(source.src)])
+  Bytes::concat_all([source.name, b"\x00", blake3(source.source_text)])
 
 pub fn read_once(
   source: Source,
@@ -149,7 +149,7 @@ pub fn read_once(
   match decode_cache.text_read(key) {
     Some(r) -> r,
     None -> {
-      let lexed = start(source.src);
+      let lexed = start(source.source_text);
       let parsed = parse_started(lexed);
       let r = {
         lexed: lexed,
@@ -216,7 +216,7 @@ pub fn owner_interfaces_once(
 pub fn decoded<a>(b: Bytes, codec: bin::BinCodec<a>, what: String) -> a / {abort.raise} =
   match bin::decode(b, codec) {
     Ok(x) -> x,
-    Err(e) -> panic("a query read " ++ what ++ " it cannot decode: " ++ e.message),
+    Err(e) -> panic("cannot decode cached data for " ++ what ++ ": " ++ e.message),
   }
 
 pub fn package_location_of(module: Bytes) -> Option<PackageLocation> / {memo.read, abort.raise} =
@@ -231,15 +231,15 @@ fn shipped_text(module: Bytes) -> Option<Bytes> / {memo.read} =
 fn shipped_module_exists(module: Bytes) -> Bool / {memo.read} =
   memo.external(shipped_exists_kind(), module) != None
 
-fn judged_packages() -> JudgedPackages / {memo.read, abort.raise} =
+fn build_packages() -> ValidatedPackages / {memo.read, abort.raise} =
   match memo.external(layout_kind(), b"") {
-    Some(b) -> decoded(b, judged_packages_bin(), "the load's packages"),
+    Some(b) -> decoded(b, validated_packages_bin(), "the packages of this build"),
     None -> no_packages(),
   }
 
-fn no_packages() -> JudgedPackages = { packages: [], diagnostics: [] }
+fn no_packages() -> ValidatedPackages = { packages: [], diagnostics: [] }
 
-fn packages_of(j: JudgedPackages) -> PackageSources =
+fn packages_of(j: ValidatedPackages) -> PackageSources =
   {
     root: location_placeholder(0),
     manifest: None,
@@ -247,7 +247,7 @@ fn packages_of(j: JudgedPackages) -> PackageSources =
       { root: location_placeholder(k), manifest: None, modules: [] }),
   }
 
-pub fn prefix_in(j: JudgedPackages, package: Int) -> Bytes =
+pub fn prefix_in(j: ValidatedPackages, package: Int) -> Bytes =
   if package <= 0 { b"" } else { match j.packages.at(package) { Some(p) -> p.prefix, None -> b"" } }
 
 fn has_dot(name: Bytes) -> Bool = name.index_of(b".") != None
@@ -352,14 +352,14 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
   let placing = if shipped { None } else { package_location_of(module) };
   match text_of(query_key) {
     None -> None,
-    Some(src) -> {
-      let source = { name: module, src: src };
+    Some(text) -> {
+      let source = { name: module, source_text: text };
       let read = read_once(source);
       let lexed = read.lexed;
       let raw = read.raw;
       let given = read.given;
       let parsed = given.module;
-      let j = if shipped { no_packages() } else { judged_packages() };
+      let j = if shipped { no_packages() } else { build_packages() };
       let packages = packages_of(j);
       let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
       let prefix = prefix_in(j, package);
@@ -398,10 +398,16 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
         })
       };
       let wants = if shipped { shipped_wants_of(source, raw) } else { { texts: [], data: [] } };
-      let whole = wants.texts.fold([], |acc: List<Source>, n: Bytes|
-        match shipped_text(n) { Some(t) -> acc.push({ name: n, src: t }), None -> acc });
-      let data = wants.data.fold([], |acc: List<EmbedFile>, n: Bytes|
-        match memo.external(data_kind(), n) { Some(b) -> acc.push(embed_file(n, b)), None -> acc });
+      let whole = wants.texts.fold([], |accumulator: List<Source>, n: Bytes|
+        match shipped_text(n) {
+          Some(t) -> accumulator.push({ name: n, source_text: t }),
+          None -> accumulator,
+        });
+      let data = wants.data.fold([], |accumulator: List<EmbedFile>, n: Bytes|
+        match memo.external(data_kind(), n) {
+          Some(b) -> accumulator.push(embed_file(n, b)),
+          None -> accumulator,
+        });
       Some({
         source: source,
         tokens: lexed.input.tokens,
@@ -413,7 +419,7 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
         placed: module_origin_of(placing),
         reading: {
           packages: packages,
-          judged: if shipped { None } else { Some(j) },
+          checked_packages: if shipped { None } else { Some(j) },
           tested: !shipped || query_key.tested,
           unread: unread,
           all_sources: whole,
@@ -430,8 +436,9 @@ pub fn module_origins_of(
   shipped: Bool,
   modules: List<Bytes>,
 ) -> Map<Bytes, ModuleOrigin> / {memo.read, abort.raise} =
-  modules.fold(Map::new(), |acc: Map<Bytes, ModuleOrigin>, m: Bytes|
-    acc.insert(m, if shipped { ShippedModule } else { module_origin_of(package_location_of(m)) }))
+  modules.fold(Map::new(), |accumulator: Map<Bytes, ModuleOrigin>, m: Bytes|
+    accumulator.insert(m, if shipped { ShippedModule }
+    else { module_origin_of(package_location_of(m)) }))
 
 pub fn module_origin_lookup(
   places: Map<Bytes, ModuleOrigin>,
@@ -458,15 +465,15 @@ pub fn imports_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
     {
       imports: match text {
         None -> [],
-        Some(src) -> {
-          let raw = match header(src) { Some(m) -> m, None -> parse(src).node };
+        Some(module_text) -> {
+          let raw = match header(module_text) { Some(m) -> m, None -> parse(module_text).node };
           let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
-          let prefix = if query_key.shipped { b"" } else { prefix_in(judged_packages(), package) };
-          raw.imports.fold([], |acc: List<ImportOf>, d: ImportDeclaration| {
+          let prefix = if query_key.shipped { b"" } else { prefix_in(build_packages(), package) };
+          raw.imports.fold([], |accumulator: List<ImportOf>, d: ImportDeclaration| {
             let t = target_of(query_key.shipped, prefix, package, d);
             let there = if t.shipped { shipped_module_exists(t.module) }
             else { package_location_of(t.module) != None };
-            if there { acc.push({ named: t, span: path_span(d) }) } else { acc }
+            if there { accumulator.push({ named: t, span: path_span(d) }) } else { accumulator }
           })
         },
       },
@@ -506,7 +513,7 @@ pub type Context = {
 pub type Setting = {
   origin: ModuleOrigin,
   packages: PackageSources,
-  resolved_packages: Option<JudgedPackages>,
+  resolved_packages: Option<ValidatedPackages>,
   tested: Bool,
   unread: List<Bytes>,
   wanted_texts: List<Source>,

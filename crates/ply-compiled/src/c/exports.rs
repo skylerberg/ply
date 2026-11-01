@@ -1,13 +1,9 @@
-//! What a compiled unit says about itself, embedded in its C so loading reads no source. Helpers
-//! bind by name, so a unit serves while the runtime has every helper its C calls.
-
 use super::descriptor::Descriptor;
 use super::encoding::{count, decode_fields, encode_fields, line};
 use super::prelude::helpers;
 use anyhow::{Result, anyhow};
 use ply_core::Symbol;
 
-/// One runtime helper as a unit records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelperShape {
     pub name: String,
@@ -15,7 +11,6 @@ pub struct HelperShape {
     pub results: bool,
 }
 
-/// A digest of the runtime's whole helper table, for cache keys (stricter than serving needs).
 pub fn helpers_digest() -> String {
     let mut h = blake3::Hasher::new();
     for helper in helpers() {
@@ -24,43 +19,30 @@ pub fn helpers_digest() -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// Why a unit does not serve this runtime: a helper its C calls that the runtime does not have as
-/// the unit knows it.
 #[derive(Debug)]
-pub struct Unserved(pub String);
+pub struct RuntimeMismatch(pub String);
 
-impl std::fmt::Display for Unserved {
+impl std::fmt::Display for RuntimeMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "the unit does not serve this runtime: {}", self.0)
     }
 }
 
-impl std::error::Error for Unserved {}
+impl std::error::Error for RuntimeMismatch {}
 
-/// What a unit's loader reads of it once. What it binds, the code table and each definition's
-/// entry, the unit lays out in its [`Descriptor`] instead.
 #[derive(Clone)]
 pub struct Exports {
     pub helpers: Vec<HelperShape>,
-    /// The pure nullary functions, which the seam memoizes, each with its row of the code table.
     pub constants: Vec<(String, usize)>,
-    /// How many modules the unit was emitted from.
     pub modules: usize,
     pub fields: Vec<Symbol>,
-    /// Each root the unit is entered at through its `R#entered`, as its [`ENTERED`] lines say.
     pub entered: Vec<String>,
 }
 
-/// What opens a line after a unit's tables naming a root `R` the unit is entered at through the
-/// definition `R#entered` it takes, which takes no words: the runtime opens a lowering for the
-/// result and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
-/// writes its result. The runtime enters no root such a line does not name.
 pub const ENTERED: &str = "entered ";
 
 impl Exports {
-    /// The address of each helper the unit binds, in its order; a unit recording one this runtime
-    /// lacks, or has under another shape, is rejected.
-    pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
+    pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, RuntimeMismatch> {
         let said = |h: &HelperShape| {
             format!(
                 "taking {} and {}",
@@ -79,7 +61,7 @@ impl Exports {
                     Some(h) if h.args() == mine.args && h.results() == mine.results => {
                         Ok(h.address as *mut std::ffi::c_void)
                     }
-                    Some(h) => Err(Unserved(format!(
+                    Some(h) => Err(RuntimeMismatch(format!(
                         "it was emitted against `{}` {}, and this runtime's is {}",
                         mine.name,
                         said(mine),
@@ -89,7 +71,7 @@ impl Exports {
                             results: h.results(),
                         }),
                     ))),
-                    None => Err(Unserved(format!(
+                    None => Err(RuntimeMismatch(format!(
                         "it calls `{}`, which this runtime does not have",
                         mine.name
                     ))),
@@ -141,7 +123,6 @@ impl Exports {
             constants.push((name.to_string(), slot.parse().ok()?));
         }
         let modules = count(line(s, &mut at)?, "modules")?;
-        // A unit the last release wrote lists what its emitter rejected, two lines each.
         let mut past = at;
         if let Some(n) = line(s, &mut past).and_then(|l| count(l, "refused")) {
             for _ in 0..2 * n {
@@ -150,7 +131,6 @@ impl Exports {
             at = past;
         }
         let fields = decode_fields(s, &mut at)?;
-        // Each root entered, a line each; a line a later unit says reads as nothing.
         let mut entered = Vec::new();
         while at < s.len() {
             if let Some(root) = line(s, &mut at)?.strip_prefix(ENTERED) {
@@ -166,7 +146,6 @@ impl Exports {
         })
     }
 
-    /// What `unit` says about itself.
     pub fn read(unit: &Descriptor) -> Result<Exports> {
         let text = unit
             .exports()

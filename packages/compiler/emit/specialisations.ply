@@ -14,18 +14,18 @@ import compiler.emit.lower.module_context (ModuleContext, Root, root_body)
 import compiler.emit.lower (group_lowered, tail_calls, TailCall)
 import compiler.emit.lower.calling (has_handle_matching, instance_key)
 import compiler.emit.lower.handling (detaches)
-import compiler.emit.typed_ir (Fn)
+import compiler.emit.typed_ir (Function)
 import compiler.emit.root_emission (root_from_code, root_at)
 
 pub fn specialisations_wanted(wanted: List<RootKey>) -> Map<Bytes, List<RootKey>> =
-  wanted.fold(Map::new(), |acc: Map<Bytes, List<RootKey>>, k: RootKey|
+  wanted.fold(Map::new(), |accumulator: Map<Bytes, List<RootKey>>, k: RootKey|
     match k {
       Specialisation(a, _) ->
-        acc.insert(
+        accumulator.insert(
           a.definition,
-          (match acc.get(a.definition) { Some(l) -> l, None -> [] }).push(k),
+          (match accumulator.get(a.definition) { Some(l) -> l, None -> [] }).push(k),
         ),
-      _ -> acc,
+      _ -> accumulator,
     })
 
 pub fn specialised_lowered(
@@ -34,7 +34,7 @@ pub fn specialised_lowered(
   root: RootKey,
   lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
   recorded: SiteAnnotations,
-) -> Fn / {abort.raise} = {
+) -> Function / {abort.raise} = {
   let args = key_types(root);
   let b = root_body(
     recorded,
@@ -45,7 +45,10 @@ pub fn specialised_lowered(
   );
   let ps = inlined_lambdas(root).fold(b.params, |ps: List<EmitParam>, f: InlinedLambda|
     match lambda_at(f.owner, f.nth) {
-      None -> panic("a lambda this root runs in place of a call is not one its owner lowers"),
+      None ->
+        panic(
+          "this function inlines a lambda in place of a call, but the function that contains the lambda has no such lambda",
+        ),
       Some(bl) ->
         range(0, ps.len()).fold([], |out: List<EmitParam>, i: Int|
           match ps.at(i) {
@@ -61,8 +64,8 @@ pub type DefinitionBody = { code: Code, recorded: SiteAnnotations }
 type TailCallTargets = { key: RootKey, out: List<RootKey>, grown: List<Bytes> }
 
 fn instance_args(recorded: List<Type>, args: List<Type>) -> Option<List<Type>> =
-  recorded.fold(Some([]), |acc: Option<List<Type>>, t: Type|
-    match acc {
+  recorded.fold(Some([]), |accumulator: Option<List<Type>>, t: Type|
+    match accumulator {
       None -> None,
       Some(at) -> if !has_variables(t) { Some(at.push(t)) } else {
         match t {
@@ -80,18 +83,19 @@ fn tail_call_targets(
 ) -> TailCallTargets / {abort.raise} =
   tail_calls(s.definitions, w.code, []).fold(
     { key: Named(b""), out: [], grown: [] },
-    |acc: TailCallTargets, t: TailCall|
+    |accumulator: TailCallTargets, t: TailCall|
       match instance_args(t.args, args) {
-        None -> if acc.grown.contains(t.full) { acc }
-        else { { ..acc, grown: acc.grown.push(t.full) } },
+        None -> if accumulator.grown.contains(t.full) { accumulator }
+        else { { ..accumulator, grown: accumulator.grown.push(t.full) } },
         Some(at) -> {
           let k = instance_key(t.full, at);
-          if acc.out.contains(k) { acc } else { { ..acc, out: acc.out.push(k) } }
+          if accumulator.out.contains(k) { accumulator }
+          else { { ..accumulator, out: accumulator.out.push(k) } }
         },
       },
   )
 
-pub fn tail_reached_definitions(
+pub fn tail_reachable_definitions(
   module: Bytes,
   here: List<Definition>,
   read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
@@ -119,8 +123,8 @@ pub fn tail_loop_members(
   read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
   owner: Bytes,
 ) -> List<Bytes> / {abort.raise} =
-  tail_reached_definitions(module, here, read_of, owner).keys().filter(|d: Bytes|
-    d != owner && tail_reached_definitions(module, here, read_of, d).contains(owner))
+  tail_reachable_definitions(module, here, read_of, owner).keys().filter(|d: Bytes|
+    d != owner && tail_reachable_definitions(module, here, read_of, d).contains(owner))
 
 pub fn tail_loop_of(
   s: ModuleContext,
@@ -128,7 +132,7 @@ pub fn tail_loop_of(
   read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
   key: RootKey,
 ) -> List<RootKey> / {abort.raise} = {
-  let reached = iterate(
+  let targets_by_root = iterate(
     { pairs: Map::new(), work: [key] },
     1000000,
     |r: { pairs: Map<RootName, TailCallTargets>, work: List<RootKey> }|
@@ -146,10 +150,10 @@ pub fn tail_loop_of(
         },
       },
   ).pairs;
-  reached.fold((), |_: Unit, _: RootName, p: TailCallTargets| {
+  targets_by_root.fold((), |_: Unit, _: RootName, p: TailCallTargets| {
     let caller = site_owner_text(p.key);
     match p.grown.find(|callee: Bytes|
-        tail_reached_definitions(s.module, s.definitions, read_of, callee).contains(caller)) {
+        tail_reachable_definitions(s.module, s.definitions, read_of, callee).contains(caller)) {
       None -> (),
       Some(callee) ->
         panic(
@@ -159,7 +163,7 @@ pub fn tail_loop_of(
               caller,
               b"` calls `",
               callee,
-              b"` in tail position at a type grown from a type parameter of its own, which reaches it again",
+              b"` in tail position with a type argument built from the caller's type parameters, and that call can lead back to the caller, which would grow the type forever",
             ]),
           ),
         ),
@@ -167,16 +171,23 @@ pub fn tail_loop_of(
   });
   let back = iterate(
     Map::new().insert(root_name(key), true),
-    reached.len() + 1,
+    targets_by_root.len() + 1,
     |seen: Map<RootName, Bool>| {
-      let more = reached.fold(seen, |acc: Map<RootName, Bool>, n: RootName, p: TailCallTargets|
-        if acc.contains(n) || !p.out.any(|k: RootKey| acc.contains(root_name(k))) { acc }
-        else { acc.insert(n, true) });
+      let more = targets_by_root.fold(
+        seen,
+        |accumulator: Map<RootName, Bool>, n: RootName, p: TailCallTargets|
+          if accumulator.contains(n)
+              || !p.out.any(|k: RootKey| accumulator.contains(root_name(k))) { accumulator }
+          else { accumulator.insert(n, true) },
+      );
       if more.len() == seen.len() { Stop(seen) } else { Continue(more) }
     },
   );
-  let members = reached.fold([], |acc: List<RootKey>, n: RootName, p: TailCallTargets|
-    if back.contains(n) { acc.push(p.key) } else { acc });
+  let members = targets_by_root.fold(
+    [],
+    |accumulator: List<RootKey>, n: RootName, p: TailCallTargets|
+      if back.contains(n) { accumulator.push(p.key) } else { accumulator },
+  );
   let detached = members.any(|k: RootKey|
     match read_of(site_owner_text(k)) {
       Some(w) -> has_handle_matching(w.code, detaches),
@@ -185,7 +196,7 @@ pub fn tail_loop_of(
   let takes_effect_variables = members.any(|k: RootKey|
     s.definitions.any(|d: Definition|
       qualify(s.module, d.name) == site_owner_text(k)
-        && (match d.scheme { Some(sc) -> sc.effect_variables.len() > 0, None -> false })));
+        && (match d.scheme { Some(scheme) -> scheme.effect_variables.len() > 0, None -> false })));
   if members.len() < 2 || detached || takes_effect_variables { [key] }
   else { in_order(order, members) }
 }
@@ -209,9 +220,12 @@ fn tail_loop_member(
   let full = site_owner_text(key);
   let definition = match definitions.get(full) {
     Some(d) -> d,
-    None -> panic("a tail loop's member no definition is"),
+    None -> panic("a function in a tail-call cycle has no definition"),
   };
-  let w = match read_of(full) { Some(w) -> w, None -> panic("a tail loop's member no walk read") };
+  let w = match read_of(full) {
+    Some(w) -> w,
+    None -> panic("a function in a tail-call cycle has no recorded body"),
+  };
   let args = key_types(key);
   let b = root_body(
     w.recorded,
@@ -229,7 +243,7 @@ pub fn tail_loop_lowered(
   definitions: Map<Bytes, FnDefinition>,
   read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
   keys: List<RootKey>,
-) -> List<Fn> / {abort.raise} = {
+) -> List<Function> / {abort.raise} = {
   let f = group_lowered(s, keys.map(|k: RootKey| tail_loop_member(s, definitions, read_of, k)));
   let open = keys.fold(0, |most: Int, k: RootKey| {
     let w = open_variable_count(schemes, k);

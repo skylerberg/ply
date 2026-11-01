@@ -1,6 +1,3 @@
-//! The shipped modules as a binary's pack holds them: each `.ply` file below the library a module
-//! named by its place, and every other file data a module embeds, held by name.
-
 use crate::pack::SHIPPED;
 use ply_privileged::shipped_modules;
 
@@ -12,9 +9,8 @@ fn held(path: &str) -> &'static [u8] {
         .expect("the pack holds the file")
 }
 
-/// `std.hash.legacy` is `hash/legacy.ply` below the library, beside `std.hash`'s `hash.ply`.
 #[test]
-fn a_shipped_module_below_the_library_is_named_by_its_place() {
+fn a_standard_library_module_in_the_binary_is_listed_by_its_dotted_module_name() {
     let names = shipped_modules::names();
     assert!(names.iter().any(|n| n == "std.hash"), "{names:?}");
     assert!(names.iter().any(|n| n == "std.hash.legacy"), "{names:?}");
@@ -30,9 +26,8 @@ fn a_shipped_module_below_the_library_is_named_by_its_place() {
     );
 }
 
-/// `compiler.emit.roots` is `emit/roots.ply` below the compiler, beside `compiler.front`.
 #[test]
-fn a_compiler_module_below_the_compiler_is_named_by_its_place() {
+fn a_compiler_module_in_the_binary_is_listed_by_its_dotted_module_name() {
     let names = shipped_modules::names();
     assert!(names.iter().any(|n| n == "compiler.front"), "{names:?}");
     assert!(
@@ -54,7 +49,8 @@ fn a_compiler_module_below_the_compiler_is_named_by_its_place() {
 }
 
 #[test]
-fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
+fn a_data_file_embedded_by_a_shipped_module_is_stored_under_its_path_and_is_not_listed_as_a_module()
+{
     let name = "std/oid/names.txt";
     let bytes = held("std/oid/names.txt");
     assert!(shipped_modules::data_names().iter().any(|n| n == name));
@@ -67,7 +63,6 @@ fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
         !shipped_modules::names().iter().any(|n| n.contains('/')),
         "a data file was listed as a module"
     );
-    // A module is no data file, and nothing outside the shipped modules is held.
     for other in [
         "std/oid.ply",
         "std/../../Cargo.toml",

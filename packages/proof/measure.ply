@@ -1,20 +1,13 @@
-//! `measure` — what a `decreases` owes. Along the way to each call its definition makes into a member
-//! of its group that states a measure too, the callee's measure at the call's arguments lies below the
-//! caller's, which is not negative. The group's calls on the way are values here: each one before it
-//! was itself below the call it was made from, which is what the measure is proved by.
-
-import compiler.emit.code (Code, Node, CodeLiteral, CodeVar, NDefinition, NConstructor, NBuiltin,
-                           CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
+import compiler.emit.code (Code, Node, CodeLiteral, CodeVariable, NDefinition, NConstructor,
+                           NBuiltin, CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeFieldRead, CodeUpdate,
                            CodeStatement, CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm)
-import compiler.check.types (Type, int_type, bool_type, fn_type, no_effects)
+import compiler.check.types (Type, int_type, bool_type, function_type, no_effects)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (LiteralBool, LiteralInt)
 import context (Context, measure_name, group_of, refs_of, set_of)
 
-/// The definition the obligation is about, how many parameters it binds, its group, and which of the
-/// group state measures.
 type MeasureGroup = {
   current: String,
   params: Int,
@@ -22,10 +15,13 @@ type MeasureGroup = {
   stating: Map<String, Bool>,
 }
 
-/// The claim `definition`'s measure owes, a `Bool` over its parameters, or the reason it has none.
 pub fn descent_of(context: Context, definition: String) -> Result<Code, String> =
   match context.claims.definitions.get(definition) {
-    None -> Err("no claim of `" ++ definition ++ "` was lowered"),
+    None ->
+      Err(
+        "the prover has no claim about `" ++ definition
+          ++ "`, so it cannot check that the measure decreases",
+      ),
     Some(d) -> match ((d.body, d.measure)) {
       (Some(body), Some(_)) -> {
         let members = group_of(context, definition);
@@ -40,18 +36,18 @@ pub fn descent_of(context: Context, definition: String) -> Result<Code, String> 
           group: set_of(members),
           stating: set_of(stating),
         };
-        // A measure that calls back into its own group is no measure of it.
         let circular = stating.fold(false, |found: Bool, m: String|
           found
             || (match context.claims.definitions.get(m) {
               Some(x) -> match x.measure { Some(c) -> mentions(o, c), None -> false },
               None -> false,
             }));
-        if circular { Err("a measure calls into its own group") }
-        else { all_calls_decrease(o, body) }
+        if circular {
+          Err("a measure calls a definition from its own group of mutually recursive definitions")
+        } else { all_calls_decrease(o, body) }
       },
-      (None, _) -> Err("its body was not lowered"),
-      (_, None) -> Err("it states no measure"),
+      (None, _) -> Err("the definition has no body for the prover to read"),
+      (_, None) -> Err("the definition states no measure"),
     },
   }
 
@@ -66,17 +62,21 @@ fn is_true_literal(c: Code) -> Bool = match c.node { CodeLiteral(LiteralBool(b))
 
 fn both(a: Code, b: Code) -> Code =
   if is_true_literal(a) { b }
-  else if is_true_literal(b) { a }
-  else { with_span(CodeBinary({ op: b"and", lhs: a, rhs: b }), a.span, bool_type()) }
+  else if is_true_literal(b) { a } else {
+    with_span(
+      CodeBinary({ operation: b"and", left_operand: a, right_operand: b }),
+      a.span,
+      bool_type(),
+    )
+  }
 
 fn global(name: String, arity: Int, span: Span) -> Code =
   with_span(
     NDefinition({ full: Bytes::of_string(name), args: [], effect_arguments: [], labels: [] }),
     span,
-    fn_type(range(0, arity).map(|_: Int| int_type()), int_type(), no_effects()),
+    function_type(range(0, arity).map(|_: Int| int_type()), int_type(), no_effects()),
   )
 
-/// `definition`'s measure at `args`.
 fn measure_call(definition: String, args: List<Code>, span: Span) -> Code =
   with_span(
     CodeApply({
@@ -88,47 +88,59 @@ fn measure_call(definition: String, args: List<Code>, span: Span) -> Code =
     int_type(),
   )
 
-/// At a call of `callee`, a member stating a measure: `0 <= m(x̄) && m'(ȳ) < m(x̄)`.
 fn decrease_claim(o: MeasureGroup, callee: String, args: List<Code>, span: Span) -> Code = {
   let mine = measure_call(
     o.current,
     range(0, o.params).map(|k: Int|
-      with_span(CodeVar({ name: b"", slot: k }), span, unknown_type())),
+      with_span(CodeVariable({ name: b"", slot: k }), span, unknown_type())),
     span,
   );
   let floor = with_span(
     CodeBinary({
-      op: b"le",
-      lhs: with_span(CodeLiteral(LiteralInt(0)), span, int_type()),
-      rhs: mine,
+      operation: b"le",
+      left_operand: with_span(CodeLiteral(LiteralInt(0)), span, int_type()),
+      right_operand: mine,
     }),
     span,
     bool_type(),
   );
   let below = with_span(
-    CodeBinary({ op: b"lt", lhs: measure_call(callee, args, span), rhs: mine }),
+    CodeBinary({
+      operation: b"lt",
+      left_operand: measure_call(callee, args, span),
+      right_operand: mine,
+    }),
     span,
     bool_type(),
   );
-  with_span(CodeBinary({ op: b"and", lhs: floor, rhs: below }), span, bool_type())
+  with_span(
+    CodeBinary({ operation: b"and", left_operand: floor, right_operand: below }),
+    span,
+    bool_type(),
+  )
 }
 
 fn all_descend(o: MeasureGroup, cs: List<Code>, span: Span) -> Result<Code, String> =
-  cs.fold(Ok(true_literal(span)), |acc: Result<Code, String>, c: Code|
-    match acc {
-      Err(_) -> acc,
+  cs.fold(Ok(true_literal(span)), |accumulator: Result<Code, String>, c: Code|
+    match accumulator {
+      Err(_) -> accumulator,
       Ok(sofar) -> match all_calls_decrease(o, c) {
         Ok(more) -> Ok(both(sofar, more)),
         Err(reason) -> Err(reason),
       },
     })
 
-/// Whether every call into the group that `c` makes, in the order it makes them, descends.
 fn all_calls_decrease(o: MeasureGroup, c: Code) -> Result<Code, String> =
   if !mentions(o, c) { Ok(true_literal(c.span)) } else {
     match c.node {
-      CodeVar(v) -> Err("`" ++ String::of_bytes_lossy(v.name) ++ "` is handed on as a value"),
-      NDefinition(d) -> Err("`" ++ String::of_bytes_lossy(d.full) ++ "` is handed on as a value"),
+      CodeVariable(v) ->
+        Err(
+          "`" ++ String::of_bytes_lossy(v.name) ++ "` is used as a value instead of being called",
+        ),
+      NDefinition(d) ->
+        Err(
+          "`" ++ String::of_bytes_lossy(d.full) ++ "` is used as a value instead of being called",
+        ),
       CodeApply(a) -> {
         let args = all_descend(o, a.args, c.span)?;
         match a.function.node {
@@ -163,16 +175,21 @@ fn all_calls_decrease(o: MeasureGroup, c: Code) -> Result<Code, String> =
         let scrutinee = all_calls_decrease(o, m.scrutinee)?;
         if m.arms.fold(false, |found: Bool, arm: CodeArm|
             found || (match arm.guard { Some(g) -> mentions(o, g), None -> false })) {
-          Err("a call into the group in a guard")
+          Err(
+            "a match guard calls a definition from the measure's own group of mutually recursive definitions",
+          )
         } else {
-          let arms = m.arms.fold(Ok([]), |acc: Result<List<CodeArm>, String>, arm: CodeArm|
-            match acc {
-              Err(_) -> acc,
-              Ok(xs) -> match all_calls_decrease(o, arm.body) {
-                Ok(b) -> Ok(xs.push({ ..arm, body: b })),
-                Err(reason) -> Err(reason),
+          let arms = m.arms.fold(
+            Ok([]),
+            |accumulator: Result<List<CodeArm>, String>, arm: CodeArm|
+              match accumulator {
+                Err(_) -> accumulator,
+                Ok(xs) -> match all_calls_decrease(o, arm.body) {
+                  Ok(b) -> Ok(xs.push({ ..arm, body: b })),
+                  Err(reason) -> Err(reason),
+                },
               },
-            })?;
+          )?;
           Ok(
             both(
               scrutinee,
@@ -186,11 +203,11 @@ fn all_calls_decrease(o: MeasureGroup, c: Code) -> Result<Code, String> =
           Some(t) -> all_calls_decrease(o, t),
           None -> Ok(true_literal(c.span)),
         })?;
-        range(0, b.statements.len()).fold(Ok(tail), |acc: Result<Code, String>, k: Int|
-          match acc {
-            Err(_) -> acc,
+        range(0, b.statements.len()).fold(Ok(tail), |accumulator: Result<Code, String>, k: Int|
+          match accumulator {
+            Err(_) -> accumulator,
             Ok(rest) -> match b.statements.at(b.statements.len() - 1 - k) {
-              None -> acc,
+              None -> accumulator,
               Some(st) -> match st {
                 CodeDo(d) -> match all_calls_decrease(o, d.code) {
                   Ok(x) -> Ok(both(x, rest)),
@@ -203,32 +220,39 @@ fn all_calls_decrease(o: MeasureGroup, c: Code) -> Result<Code, String> =
           })
       },
       CodeBinary(b) -> {
-        let lhs = all_calls_decrease(o, b.lhs)?;
-        let rhs = all_calls_decrease(o, b.rhs)?;
-        // The right of `&&` and `||` is evaluated only where the left lets it be.
-        if b.op == b"and" {
+        let left = all_calls_decrease(o, b.left_operand)?;
+        let right = all_calls_decrease(o, b.right_operand)?;
+        if b.operation == b"and" {
           Ok(
             both(
-              lhs,
+              left,
               with_span(
-                CodeIf({ cond: b.lhs, then_branch: rhs, else_branch: true_literal(c.span) }),
+                CodeIf({
+                  cond: b.left_operand,
+                  then_branch: right,
+                  else_branch: true_literal(c.span),
+                }),
                 c.span,
                 bool_type(),
               ),
             ),
           )
-        } else if b.op == b"or" {
+        } else if b.operation == b"or" {
           Ok(
             both(
-              lhs,
+              left,
               with_span(
-                CodeIf({ cond: b.lhs, then_branch: true_literal(c.span), else_branch: rhs }),
+                CodeIf({
+                  cond: b.left_operand,
+                  then_branch: true_literal(c.span),
+                  else_branch: right,
+                }),
                 c.span,
                 bool_type(),
               ),
             ),
           )
-        } else { Ok(both(lhs, rhs)) }
+        } else { Ok(both(left, right)) }
       },
       CodeUnary(u) -> all_calls_decrease(o, u.operand),
       CodeList(l) -> all_descend(o, l.items, c.span),
@@ -236,11 +260,10 @@ fn all_calls_decrease(o: MeasureGroup, c: Code) -> Result<Code, String> =
       CodeFieldRead(f) -> all_calls_decrease(o, f.base),
       CodeUpdate(u) -> all_descend(o, u.sets.map(|f: CodeField| f.value).push(u.base), c.span),
       CodePerform(p) -> all_descend(o, p.args, c.span),
-      _ -> Err("a call into the group inside a lambda or a simulation"),
+      _ -> Err("a call to a mutually recursive definition inside a lambda or a simulation"),
     }
   }
 
-/// What the bound value owes, then the rest of the block with the binding in scope.
 fn binding_descends(
   o: MeasureGroup,
   st: CodeStatement,

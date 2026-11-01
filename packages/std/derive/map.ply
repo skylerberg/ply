@@ -29,9 +29,12 @@ pub fn derive(declaration: Declaration) -> Result<String, Refused> / {abort.rais
   let target = derive::target(declaration);
   let at = { d: declaration, target: target, names: names_for(target) };
   if target.types.len() == 0 {
-    rejected("`" ++ target.name ++ "` takes no type parameter to map", [])
+    rejected("`" ++ target.name ++ "` has no type parameter, so `map` has nothing to change", [])
   } else if target.labels.len() > 0 {
-    rejected("a type that takes a label holds a function, which `map` reaches no value through", [])
+    rejected(
+      "a type with a label parameter contains a function, and `map` cannot change values inside a function",
+      [],
+    )
   } else {
     match target.body {
       Sum(variants) -> match map_variants(at, variants) {
@@ -46,13 +49,13 @@ pub fn derive(declaration: Declaration) -> Result<String, Refused> / {abort.rais
       Nominal(_) -> rejected("`" ++ target.name ++ "` is a `new` type that is not a record", []),
       Alias(_) ->
         rejected(
-          "`" ++ target.name ++ "` is an alias, and an alias has no functions of its own",
+          "`" ++ target.name ++ "` is an alias, and an alias has no `map` function of its own",
           [
-            "derive `map` for the sum or the `new` record that holds it: a field of an alias's type is mapped through what the alias names",
+            "derive `map` for the `enum` type or the `new` record type that contains a field of this alias: that field is mapped as the type the alias names",
           ],
         ),
       Extern ->
-        rejected("`" ++ target.name ++ "` is laid out by the toolchain, with no field to map", []),
+        rejected("`" ++ target.name ++ "` is an `extern` type, so it has no fields to map", []),
     }
   }
 }
@@ -60,16 +63,10 @@ pub fn derive(declaration: Declaration) -> Result<String, Refused> / {abort.rais
 fn rejected(message: String, notes: List<String>) -> Result<String, Refused> =
   Err({ message: message, at: None, notes: notes })
 
-/// How deep a field's type may nest, with aliases expanded, before deriving `map` fails. Real types
-/// never nest anywhere near this deep.
 fn depth() -> Int = 256
 
-/// What every step of a derivation reads: the declaration, its target and the names it binds.
 type Context = { d: Declaration, target: TypeDeclaration, names: Names }
 
-/// The names the generated function binds, each different from every type parameter of the target:
-/// the value mapped, each parameter's mapped type, the effects its functions perform, and each
-/// field it reads.
 type Names = { value: String, mapped: List<String>, row: String, field: String }
 
 fn names_for(target: TypeDeclaration) -> Names / {abort.raise} = {
@@ -77,15 +74,14 @@ fn names_for(target: TypeDeclaration) -> Names / {abort.raise} = {
   let fresh = |base: String, more: List<String>|
     iterate(base, taken.len() + more.len() + 1, |n: String|
       if taken.contains(n) || more.contains(n) { Continue(n ++ "_") } else { Stop(n) });
-  let mapped = target.types.fold([], |acc: List<String>, p: String|
-    acc.push(fresh(p ++ "_mapped", acc)));
+  let mapped = target.types.fold([], |accumulator: List<String>, p: String|
+    accumulator.push(fresh(p ++ "_mapped", accumulator)));
   let value = fresh("original", mapped);
   let row = fresh("e", mapped.push(value));
   let field = fresh("held", mapped.push(value).push(row));
   { value: value, mapped: mapped, row: row, field: field }
 }
 
-/// The source of the `map` function whose body is `body`.
 fn written(at: Context, body: String) -> String / {abort.raise} = {
   let target = at.target;
   let names = at.names;
@@ -109,25 +105,24 @@ fn written(at: Context, body: String) -> String / {abort.raise} = {
     ++ "\n"
 }
 
-/// The match arm for each variant. It binds the variant's fields and builds the variant again with
-/// each field mapped.
 fn map_variants(
   at: Context,
   variants: List<Variant>,
 ) -> Result<List<String>, Refused> / {abort.raise} =
-  variants.fold(Ok([]), |acc: Result<List<String>, Refused>, v: Variant|
-    match acc {
+  variants.fold(Ok([]), |accumulator: Result<List<String>, Refused>, v: Variant|
+    match accumulator {
       Err(r) -> Err(r),
       Ok(arms) -> {
-        let held = range(0, v.fields.len()).map(|i: Int| at.names.field ++ "_" ++ i.to_string());
+        let field_variables = range(0, v.fields.len()).map(|i: Int|
+          at.names.field ++ "_" ++ i.to_string());
         let built = range(0, v.fields.len()).fold(
           Ok([]),
           |out: Result<List<String>, Refused>, i: Int|
             match out {
               Err(r) -> Err(r),
-              Ok(xs) -> match mapping(at, v.fields.get(i), held.get(i), depth()) {
+              Ok(xs) -> match mapping(at, v.fields.get(i), field_variables.get(i), depth()) {
                 Err(r) -> Err({ ..r, at: Some(v.name) }),
-                Ok(m) -> Ok(xs.push(match m { Some(e) -> e, None -> held.get(i) })),
+                Ok(m) -> Ok(xs.push(match m { Some(e) -> e, None -> field_variables.get(i) })),
               },
             },
         );
@@ -136,14 +131,16 @@ fn map_variants(
           Ok(xs) -> {
             let args = |parts: List<String>|
               if parts.len() == 0 { "" } else { "(" ++ String::join(parts, ", ") ++ ")" };
-            Ok(arms.push("    " ++ v.name ++ args(held) ++ " -> " ++ v.name ++ args(xs) ++ ",\n"))
+            Ok(
+              arms.push(
+                "    " ++ v.name ++ args(field_variables) ++ " -> " ++ v.name ++ args(xs) ++ ",\n",
+              ),
+            )
           },
         }
       },
     })
 
-/// A record of the `fields` of `from`, each mapped. When the record is the target's own, an error
-/// names the field.
 fn map_fields(
   at: Context,
   fields: List<Field>,
@@ -151,8 +148,8 @@ fn map_fields(
   depth: Int,
   own: Bool = false,
 ) -> Result<String, Refused> / {abort.raise} =
-  match fields.fold(Ok([]), |acc: Result<List<String>, Refused>, f: Field|
-      match acc {
+  match fields.fold(Ok([]), |accumulator: Result<List<String>, Refused>, f: Field|
+      match accumulator {
         Err(r) -> Err(r),
         Ok(xs) -> {
           let read = from ++ "." ++ f.name;
@@ -169,8 +166,6 @@ fn map_fields(
 fn too_deep() -> Refused =
   { message: "a field's type nests deeper than `map` follows", at: None, notes: [] }
 
-/// Whether `t` contains one of the target's type parameters, looking through the aliases the module
-/// declares.
 fn contains_parameter(at: Context, t: Type, depth: Int) -> Bool / {abort.raise} =
   if depth <= 0 { true } else {
     match t {
@@ -187,7 +182,6 @@ fn contains_parameter(at: Context, t: Type, depth: Int) -> Bool / {abort.raise} 
     }
   }
 
-/// The type `n` names at `args` when `n` is an alias the module declares, or `None` otherwise.
 fn alias_of(at: Context, n: TypeName, args: List<Type>) -> Option<Type> / {abort.raise} =
   match n.module {
     Some(_) -> None,
@@ -201,7 +195,6 @@ fn alias_of(at: Context, n: TypeName, args: List<Type>) -> Option<Type> / {abort
     },
   }
 
-/// `t` with each of `params` replaced by the argument at its place in `args`.
 fn substitute(t: Type, params: List<String>, args: List<Type>) -> Type / {abort.raise} =
   match t {
     Param(p) -> match range(0, params.len()).find(|i: Int| params.get(i) == p) {
@@ -221,8 +214,6 @@ fn substitute(t: Type, params: List<String>, args: List<Type>) -> Type / {abort.
     Unit -> Unit,
   }
 
-/// The expression that maps `x`, a value of `t`. `None` when `t` contains no parameter, so `x`
-/// stays unchanged.
 fn mapping(
   at: Context,
   t: Type,
@@ -239,7 +230,7 @@ fn mapping(
       },
       Function(_, _, _) ->
         Err({
-          message: "a function holds a type parameter where it is called, and `map` reaches no value through one",
+          message: "a function type contains a type parameter, and `map` cannot change values inside a function",
           at: None,
           notes: [],
         }),
@@ -248,7 +239,6 @@ fn mapping(
     }
   }
 
-/// The expression that maps `x`, a value of the type `n` names at `args`.
 fn applied(
   at: Context,
   n: TypeName,
@@ -266,7 +256,7 @@ fn applied(
     (None, "Option", [inner]) -> one(inner),
     (None, "Map", [key, inner]) -> if contains_parameter(at, key, depth) {
       Err({
-        message: "a `Map` key holds a type parameter, and keys are not mapped",
+        message: "a `Map` key contains a type parameter, and keys are not mapped",
         at: None,
         notes: [],
       })
@@ -283,8 +273,8 @@ fn applied(
             notes: ["derive `map` for `" ++ n.name ++ "` too"],
           })
         } else {
-          match args.fold(Ok([]), |acc: Result<List<String>, Refused>, a: Type|
-              match acc {
+          match args.fold(Ok([]), |accumulator: Result<List<String>, Refused>, a: Type|
+              match accumulator {
                 Err(r) -> Err(r),
                 Ok(fs) -> match lambda(at, a, depth) { Err(r) -> Err(r), Ok(f) -> Ok(fs.push(f)) },
               }) {
@@ -298,9 +288,6 @@ fn applied(
   }
 }
 
-/// The function that maps a value of `t`. When `t` is a type parameter, this is that parameter's
-/// function. Otherwise it is a lambda, which returns its argument unchanged when `t` contains no
-/// parameter.
 fn lambda(at: Context, t: Type, depth: Int) -> Result<String, Refused> / {abort.raise} = {
   let y = at.names.field;
   match t {
@@ -313,10 +300,6 @@ fn lambda(at: Context, t: Type, depth: Int) -> Result<String, Refused> / {abort.
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
-/// The result of deriving `map` for `target` among `types`, with the module deriving `map` for each
-/// type that is not an alias.
 fn derived(
   target: String,
   types: List<TypeDeclaration>,
@@ -332,14 +315,14 @@ fn derived(
     imports: [],
   })
 
-test "deriving `map` fails at the field whose type has values `map` cannot reach" {
+test "deriving `map` fails at the field whose type has values `map` cannot transform, such as a function or a map key" {
   let sum = |fields: List<Type>| [declared_type("T", ["a"], Sum([{ name: "V", fields: fields }]))];
   assert_eq(rejection_of(derived("T", sum([Function([Param("a")], Unit, "")]))).at, Some("V"));
   assert_eq(
     rejection_of(
       derived("T", sum([applied_type("Map", [Param("a"), applied_type("Int", [])])])),
     ).message,
-    "a `Map` key holds a type parameter, and keys are not mapped",
+    "a `Map` key contains a type parameter, and keys are not mapped",
   );
   let unmapped = [
     declared_type("T", ["a"], Sum([{ name: "V", fields: [applied_type("U", [Param("a")])] }])),
@@ -348,11 +331,11 @@ test "deriving `map` fails at the field whose type has values `map` cannot reach
   assert_eq(rejection_of(derived("T", unmapped)).at, Some("V"));
   assert_eq(
     rejection_of(derived("T", [declared_type("T", ["a"], Alias(Param("a")))])).message,
-    "`T` is an alias, and an alias has no functions of its own",
+    "`T` is an alias, and an alias has no `map` function of its own",
   );
   assert_eq(
     rejection_of(derived("T", [declared_type("T", [], Sum([{ name: "V", fields: [] }]))])).message,
-    "`T` takes no type parameter to map",
+    "`T` has no type parameter, so `map` has nothing to change",
   )
 }
 

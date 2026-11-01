@@ -15,30 +15,31 @@ import std.bytes (ascii_of_int, hex_digit)
 import compiler.emit (emit_root_results)
 import compiler.check.infer.definitions (Extern, program_natives)
 import compiler.emit.output
-import compiler.emit.output (RootOutput, GenericCall, SharedFn, needs_specialisation)
+import compiler.emit.output (RootOutput, GenericCall, SharedFunction, needs_specialisation)
 import compiler.emit.root_emission (built_form)
 import compiler.emit.keys (RootKey, InlinedLambda, Named, root_name, root_text)
 import compiler.emit.pieces (Piece, pieces_text, body_text)
 import compiler.emit.roots (symbol_of)
-import compiler.emit.typed_ir (Var, Arg, VarOperand, BoolOperand, AsInt, AsBool, Inst, Declaration,
-                               Assign, If, Return, Restart, Fn, Member)
+import compiler.emit.typed_ir (Variable, Arg, VariableOperand, BoolOperand, AsInt, AsBool,
+                               Instruction, Declaration, Assign, If, Return, Restart, Function,
+                               Member)
 import compiler.emit.lower (root_lowered)
 import compiler.emit.lower.module_context (ModuleContext, Root, module_context_in)
-import compiler.emit.print (printed_fn)
+import compiler.emit.print (printed_function)
 import compiler.emit.print.text (PrintOutput)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
 
-pub type Program = { src: Bytes, analysis: Analysis, setting: ModuleContext, roots: List<Root> }
+pub type Program = { source: Bytes, analysis: Analysis, setting: ModuleContext, roots: List<Root> }
 
-pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
-  match analyse(parse_all([{ name: b"m", src: src }])) {
+pub fn program_of(source: Bytes) -> Result<Program, Bytes> / {abort.raise} =
+  match analyse(parse_all([{ name: b"m", source_text: source }])) {
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
     Analysed(a) -> match module_context_in(a, b"m") {
       Err(reason) -> Err(reason),
       Ok(s) ->
         Ok({
-          src: src,
+          source: source,
           analysis: a,
           setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
           roots: s.roots,
@@ -70,18 +71,18 @@ fn scheduler_stub() -> Bytes =
     b"pub fn crossing_select<a>(arms: List<(Chan<a>, Option<a>)>, wait: Bool) -> Option<(Int, Option<a>)> / {task.select} = None\n",
   ])
 
-pub fn scheduled_program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} = {
+pub fn scheduled_program_of(source: Bytes) -> Result<Program, Bytes> / {abort.raise} = {
   let shipped = [
-    { name: scheduler_module(), src: scheduler_stub() },
-    { name: b"std.internal.native", src: b"pub nondet effect native {}\n" },
+    { name: scheduler_module(), source_text: scheduler_stub() },
+    { name: b"std.internal.native", source_text: b"pub nondet effect native {}\n" },
   ];
-  match analyse_pulling_std_with([{ name: b"m", src: src }], shipped, no_rows()).out {
+  match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped, no_rows()).out {
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
     Analysed(a) -> match module_context_in(a, b"m") {
       Err(reason) -> Err(reason),
       Ok(s) ->
         Ok({
-          src: src,
+          source: source,
           analysis: a,
           setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
           roots: s.roots,
@@ -90,10 +91,10 @@ pub fn scheduled_program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise
   }
 }
 
-pub fn lowered_root(p: Program, name: Bytes) -> Fn / {abort.raise} =
+pub fn lowered_root(p: Program, name: Bytes) -> Function / {abort.raise} =
   lowered_at(p, Named(qualify(b"m", name)))
 
-fn lowered_at(p: Program, key: RootKey) -> Fn / {abort.raise} =
+fn lowered_at(p: Program, key: RootKey) -> Function / {abort.raise} =
   match p.roots.find(|r: Root| r.key == key) {
     None ->
       panic(String::of_bytes_lossy(b"no such definition: ".concat(root_text(root_name(key))))),
@@ -101,12 +102,12 @@ fn lowered_at(p: Program, key: RootKey) -> Fn / {abort.raise} =
   }
 
 pub fn shipped_lowered(
-  src: Bytes,
-  shipped: List<{ name: Bytes, src: Bytes }>,
+  source: Bytes,
+  shipped: List<{ name: Bytes, source_text: Bytes }>,
   module: Bytes,
   name: Bytes,
-) -> Fn / {abort.raise} =
-  match analyse_pulling_std_with([{ name: b"m", src: src }], shipped, no_rows()).out {
+) -> Function / {abort.raise} =
+  match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped, no_rows()).out {
     Rejected(diagnostics) ->
       panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
     Analysed(a) -> match module_context_in(a, module) {
@@ -114,7 +115,7 @@ pub fn shipped_lowered(
       Ok(s) ->
         lowered_at(
           {
-            src: src,
+            source: source,
             analysis: a,
             setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
             roots: s.roots,
@@ -124,7 +125,7 @@ pub fn shipped_lowered(
     },
   }
 
-pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} = {
+pub fn checked(p: Program, name: Bytes) -> Result<Function, Bytes> / {abort.raise} = {
   let counted = insert_reference_counts(lowered_root(p, name));
   match ownership_fault(counted) {
     Some(reason) -> Err(b"rejected by the check: ".concat(reason)),
@@ -133,13 +134,13 @@ pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} = {
 }
 
 pub fn entry_handler_words(text: Bytes) -> List<Bytes> / {abort.raise} = {
-  let desc = b"ctx->entering_desc = ";
+  let descriptor_marker = b"ctx->entering_desc = ";
   let words = b"; ctx->entering_words = ";
   iterate({ from: 0, out: [] }, text.len() + 1, |s: { from: Int, out: List<Bytes> }|
-    match text.slice(s.from, text.len()).index_of(desc) {
+    match text.slice(s.from, text.len()).index_of(descriptor_marker) {
       None -> Stop(s.out),
       Some(i) -> {
-        let start = s.from + i + desc.len();
+        let start = s.from + i + descriptor_marker.len();
         let rest = text.slice(start, text.len());
         match rest.index_of(words) {
           None -> Stop(s.out),
@@ -159,10 +160,10 @@ pub fn entry_handler_words(text: Bytes) -> List<Bytes> / {abort.raise} = {
 pub fn printed_by_ir(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
   match checked(p, name) { Err(reason) -> Err(reason), Ok(form) -> Ok(printed_text(p, form)) }
 
-pub fn printed_in(p: Program, f: Fn) -> PrintOutput / {abort.raise} =
-  printed_fn(f, p.setting.constructors)
+pub fn printed_in(p: Program, f: Function) -> PrintOutput / {abort.raise} =
+  printed_function(f, p.setting.constructors)
 
-pub fn build_failure(p: Program, f: Fn) -> Option<Bytes> = {
+pub fn build_failure(p: Program, f: Function) -> Option<Bytes> = {
   let counted = built_form(f);
   if needs_specialisation(counted.links.needs) { None } else {
     match ownership_fault(counted) {
@@ -181,24 +182,26 @@ pub fn build_failures(
   p: Program,
   names: List<Bytes>,
 ) -> List<{ name: Bytes, reason: Bytes }> / {abort.raise} =
-  names.fold([], |acc: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
+  names.fold([], |accumulator: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
     match build_failure(p, lowered_root(p, n)) {
-      Some(reason) -> acc.push({ name: n, reason: reason }),
-      None -> acc,
+      Some(reason) -> accumulator.push({ name: n, reason: reason }),
+      None -> accumulator,
     })
 
-pub fn printed_text(p: Program, f: Fn) -> Bytes / {abort.raise} = {
-  let pr = printed_in(p, f);
+pub fn printed_text(p: Program, f: Function) -> Bytes / {abort.raise} = {
+  let printed = printed_in(p, f);
   let generics = f.links.generics.map(call_text);
   let members = f.members.map(|m: Member| m.key);
   let symbol = |k: RootKey| symbol_of(root_text(root_name(k)));
   resolved(
     Bytes::concat_all(
-      pr.shared.map(|s: SharedFn| s.text).push(body_text(f.key, members, pr.pieces)),
+      printed.shared.map(|s: SharedFunction| s.text).push(
+        body_text(f.key, members, printed.pieces),
+      ),
     ),
     {
-      f: pr.fields,
-      l: pr.lambdas.map(|ps: List<Piece>| entry_text(pieces_text(ps), generics)),
+      f: printed.fields,
+      l: printed.lambdas.map(|ps: List<Piece>| entry_text(pieces_text(ps), generics)),
       g: generics,
       own: symbol(f.key),
       members: members.map(symbol),
@@ -207,23 +210,24 @@ pub fn printed_text(p: Program, f: Fn) -> Bytes / {abort.raise} = {
 }
 
 pub fn built_c(
-  src: Bytes,
-  shipped: List<{ name: Bytes, src: Bytes }>,
+  source: Bytes,
+  shipped: List<{ name: Bytes, source_text: Bytes }>,
   key: RootKey,
 ) -> Result<Bytes, Bytes> / {abort.raise} = {
   let root = root_name(key);
-  match analyse_pulling_std_with([{ name: b"m", src: src }], shipped, no_rows()).out {
+  match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped, no_rows()).out {
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
     Analysed(a) -> match module_context_in(a, b"m") {
       Err(reason) -> Err(reason),
       Ok(s) -> {
         let d = dump_of(Analysed(a));
         let texts = shipped.fold(
-          Map::new().insert(b"m", src).insert(prelude_module(), prelude_source::text()),
-          |acc: Map<Bytes, Bytes>, x: { name: Bytes, src: Bytes }| acc.insert(x.name, x.src),
+          Map::new().insert(b"m", source).insert(prelude_module(), prelude_source::text()),
+          |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, source_text: Bytes }|
+            accumulator.insert(x.name, x.source_text),
         );
-        let order = d.modules.fold(Map::new(), |acc: Map<Int, Bytes>, row: ModuleRow|
-          acc.insert(row.index, row.name));
+        let order = d.modules.fold(Map::new(), |accumulator: Map<Int, Bytes>, row: ModuleRow|
+          accumulator.insert(row.index, row.name));
         let names = range(0, order.len()).map(|i: Int|
           match order.get(i) { Some(n) -> n, None -> b"" });
         handle {
@@ -238,10 +242,10 @@ pub fn built_c(
               d.rows,
               d.effects,
               d.inferred_facts,
-            ).fold(None, |acc: Option<RootOutput>, r: RootOutput|
-              if r.name == root { Some(r) } else { acc }) {
+            ).fold(None, |accumulator: Option<RootOutput>, r: RootOutput|
+              if r.name == root { Some(r) } else { accumulator }) {
             Some(r) -> Ok(own_written(r)),
-            None -> Err(b"no such root"),
+            None -> Err(b"the program has no definition with that name"),
           }
         } with {
           abort.raise(m) -> Err(Bytes::of_string(m)),
@@ -387,13 +391,13 @@ fn scalar_names() -> List<Bytes> =
     b"wand",
   ]
 
-test "a function probes the stack once where it calls or loops, and a closure's function always" {
-  let src = Bytes::concat_all([
+test "a function probes the stack once if it calls or loops, and a closure's function always probes it once" {
+  let source = Bytes::concat_all([
     scalar_corpus(),
     b"fn adder(n: Int) -> (Int) -> Int = |x: Int| x + n\n",
     b"fn even(n: Int) -> Bool = adder(n)(1) == 0\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let probed = probed_fn().concat(b"(ctx)");
@@ -406,7 +410,7 @@ test "a function probes the stack once where it calls or loops, and a closure's 
   }
 }
 
-test "each table's hole is spelled as the entry it names, so the order a table is filled in does not show" {
+test "a table placeholder in emitted C is replaced by the text of the entry it refers to, so the order entries were added in does not change the result" {
   let none: Entries = { f: [], l: [], g: [], own: b"", members: [] };
   let one = resolved(b"  Word t1 = ply_field(ctx, @@f0@@);", { ..none, f: [b"one"] });
   let two = resolved(b"  Word t1 = ply_field(ctx, @@f1@@);", { ..none, f: [b"zero", b"one"] });
@@ -423,29 +427,32 @@ test "each table's hole is spelled as the entry it names, so the order a table i
   assert_eq(entry_text(b"@@g0@@_entry", [b"m.id<Int>"]), b"@@g=m.id<Int>@@_entry")
 }
 
-fn body_of(src: Bytes, name: Bytes) -> Result<List<Inst>, Bytes> / {abort.raise} =
-  match program_of(src) { Err(reason) -> Err(reason), Ok(p) -> Ok(lowered_root(p, name).body) }
+fn body_of(source: Bytes, name: Bytes) -> Result<List<Instruction>, Bytes> / {abort.raise} =
+  match program_of(source) { Err(reason) -> Err(reason), Ok(p) -> Ok(lowered_root(p, name).body) }
 
 fn join_assignments(
-  body: List<Inst>,
-) -> Option<{ var: Var, then: List<Arg>, otherwise: List<Arg>, returned: Bool }> = {
-  let sets = |b: List<Inst>, j: Var|
-    b.fold([], |acc: List<Arg>, i: Inst|
-      match i { Assign(a) -> if a.var == j { acc.push(a.arg) } else { acc }, _ -> acc });
-  match body.fold(None, |found: Option<Var>, i: Inst|
+  body: List<Instruction>,
+) -> Option<{ var: Variable, then: List<Arg>, otherwise: List<Arg>, returned: Bool }> = {
+  let sets = |b: List<Instruction>, j: Variable|
+    b.fold([], |accumulator: List<Arg>, i: Instruction|
+      match i {
+        Assign(a) -> if a.var == j { accumulator.push(a.arg) } else { accumulator },
+        _ -> accumulator,
+      });
+  match body.fold(None, |found: Option<Variable>, i: Instruction|
       match i { Declaration(v) -> Some(v), _ -> found }) {
     None -> None,
     Some(j) ->
       body.fold(
         None,
-        |found: Option<{ var: Var, then: List<Arg>, otherwise: List<Arg>, returned: Bool }>, i: Inst|
+        |found: Option<{ var: Variable, then: List<Arg>, otherwise: List<Arg>, returned: Bool }>, i: Instruction|
           match i {
             If(x) ->
               Some({
                 var: j,
                 then: sets(x.then, j),
                 otherwise: sets(x.otherwise, j),
-                returned: body.contains(Return(VarOperand(j))),
+                returned: body.contains(Return(VariableOperand(j))),
               }),
             _ -> found,
           },
@@ -453,7 +460,7 @@ fn join_assignments(
   }
 }
 
-test "an if that returns a value joins in a variable of the type its arms return" {
+test "an `if` that returns a value assigns it to one variable of the type its branches return" {
   match join_assignments(
       match body_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick") {
         Ok(b) -> b,
@@ -471,7 +478,7 @@ test "an if that returns a value joins in a variable of the type its arms return
   }
 }
 
-test "a self call in tail position restarts the body, and a join's restarting arm sets nothing" {
+test "a self call in tail position restarts the body, and an `if` branch that restarts assigns no result" {
   match body_of(
       b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc) }\n",
       b"total",
@@ -484,14 +491,14 @@ test "a self call in tail position restarts the body, and a join's restarting ar
           Some(Restart(args)) -> assert_eq(args.len(), 2),
           other -> assert_eq(other, None),
         };
-        assert(!i.otherwise.any(|x: Inst| match x { Assign(_) -> true, _ -> false }), None)
+        assert(!i.otherwise.any(|x: Instruction| match x { Assign(_) -> true, _ -> false }), None)
       },
       other -> assert_eq(other, None),
     },
   }
 }
 
-test "&& joins a Bool from its right operand where the left one does not decide" {
+test "`&&` produces its Bool from the right operand when the left operand does not decide the result" {
   match join_assignments(
       match body_of(b"fn both(a: Bool, b: Bool) -> Bool = a && b\n", b"both") {
         Ok(b) -> b,
@@ -501,14 +508,14 @@ test "&& joins a Bool from its right operand where the left one does not decide"
     Some(j) -> {
       assert_eq(j.var.representation, AsBool);
       assert(j.returned && j.otherwise == [BoolOperand(false)], None);
-      assert(match j.then { [VarOperand(_)] -> true, _ -> false }, None)
+      assert(match j.then { [VariableOperand(_)] -> true, _ -> false }, None)
     },
     None -> assert(false, None),
   }
 }
 
-test "each construct lowers to the form" {
-  let src = Bytes::concat_all([
+test "each language construct in a function body lowers to its own kind of instruction" {
+  let source = Bytes::concat_all([
     b"type P = { a: Int, b: Int }\n",
     b"effect amb {\n  read flip() -> Bool\n}\n",
     b"fn text() -> String = \"a\"\n",
@@ -536,7 +543,7 @@ test "each construct lowers to the form" {
     b"flipped",
     b"handled",
   ];
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
       assert_eq(

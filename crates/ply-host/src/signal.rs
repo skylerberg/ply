@@ -1,7 +1,4 @@
-//! The signals `std.signal`'s host handler asks about, and the coordinator that turns a stop into a
-//! shutdown.
-
-use crate::pool::Bell;
+use crate::pool::WakeCounter;
 use crate::process::Children;
 use ply_core::{Diagnostic, Span, codes};
 use std::net::{SocketAddr, TcpStream};
@@ -9,19 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-/// `--drain-ms`: how long in-flight requests have to finish once accept stops.
 pub const DEFAULT_DRAIN_MS: u64 = 30_000;
 
-/// `--drain-lead-ms`: how long accept keeps running after the signal.
-pub const DEFAULT_LEAD_MS: u64 = 0;
+pub const DEFAULT_STOP_DELAY_MS: u64 = 0;
 
-/// How long [`Shutdown::park`] sleeps before giving the scheduler its turn back.
 pub const DRAIN_POLL: Duration = Duration::from_millis(20);
 
-/// How long a wake connection waits for this process's own listener.
 const WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How long the stop spends waking parked `accept`s before leaving them to the drain deadline.
 const WAKE_BUDGET: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,7 +30,6 @@ impl ShutdownSignal {
         }
     }
 
-    /// What a second signal exits with: `128 + n`, as if the signal had not been caught.
     pub fn exit_code(self) -> i32 {
         match self {
             ShutdownSignal::Interrupt => 130,
@@ -47,8 +38,6 @@ impl ShutdownSignal {
     }
 }
 
-/// A signal a program asks about. Asking is what installs its handler: one nobody asked about
-/// does what the platform does with it, which for all but `WindowChange` is to end the process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Asked {
     Hangup,
@@ -68,15 +57,12 @@ impl Asked {
     }
 }
 
-/// One signal a program may ask about: whether its handler is installed, and whether it has
-/// arrived since it was last asked about.
 #[derive(Default)]
 struct Watch {
     installed: Mutex<bool>,
     arrived: Arc<AtomicBool>,
 }
 
-/// `--drain-lead-ms` and `--drain-ms`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Bounds {
     pub lead: Duration,
@@ -86,20 +72,17 @@ pub struct Bounds {
 impl Default for Bounds {
     fn default() -> Bounds {
         Bounds {
-            lead: Duration::from_millis(DEFAULT_LEAD_MS),
+            lead: Duration::from_millis(DEFAULT_STOP_DELAY_MS),
             drain: Duration::from_millis(DEFAULT_DRAIN_MS),
         }
     }
 }
 
 pub trait Accepting: Send + Sync {
-    /// Return `0` from every further `net.accept`, close the listening sockets, and return any
-    /// `accept` already parked on a pool thread.
     fn stop_accepting(&self) -> usize;
 
     fn listening_at(&self) -> Vec<SocketAddr>;
 
-    /// Accepted connections the program has not closed.
     fn connections_in_flight(&self) -> usize;
 
     fn accepts_in_flight(&self) -> usize;
@@ -111,42 +94,26 @@ struct State {
     at: Option<Instant>,
     deadline: Option<Instant>,
     listeners_closed: usize,
-    /// Connections open at the stop; the banner reports these as in flight.
     in_flight_at_stop: usize,
 }
 
 pub struct Shutdown {
     bounds: Bounds,
-    /// Whether a first signal drains; one that does not ends the children and exits at once.
     drains: bool,
-    /// The whole of what a signal handler touches.
     requested: AtomicBool,
-    /// Set at the stop, so a later `net.accept` returns `0` even if the table is rebuilt.
     stopped_accepting: AtomicBool,
     second: AtomicBool,
     state: Mutex<State>,
-    /// Signalled on the request and each phase end, so an idle park wakes before its bound.
     woke: Condvar,
     signals: Vec<ShutdownSignal>,
     net: Mutex<Option<Arc<dyn Accepting>>>,
-    /// Weak, so the children still go when their host does.
     children: Mutex<Option<Weak<Children>>>,
-    /// Rung with `woke`, so a reactor parked on a sleeper's deadline wakes for the stop too.
-    bell: Mutex<Option<Arc<Bell>>>,
+    bell: Mutex<Option<Arc<WakeCounter>>>,
 }
 
-/// The signals the process has been asked about, indexed by [`Asked`]: a signal is the process's,
-/// so one installed handler serves every run in it.
 static WATCHES: std::sync::LazyLock<[Watch; 4]> = std::sync::LazyLock::new(Default::default);
 
 impl Shutdown {
-    /// Whether `which` has arrived since it was last asked about, however many times it did:
-    /// arrivals are not counted. The first ask installs the handler, for the whole process, and
-    /// returns `false`. Only a run that listens for a stop holds a `Shutdown` to ask through, so a
-    /// run that does not, as a test's, leaves every signal as the platform has it.
-    ///
-    /// # Errors
-    /// The handler could not be installed.
     pub fn arrived(&self, which: Asked) -> std::io::Result<bool> {
         let watch = &WATCHES[which as usize];
         let mut installed = lock(&watch.installed);
@@ -157,14 +124,11 @@ impl Shutdown {
         Ok(watch.arrived.swap(false, Ordering::AcqRel))
     }
 
-    /// A stop that drains within `bounds`, and exits at a second signal.
     pub fn new(bounds: Bounds) -> Arc<Shutdown> {
         Shutdown::made(bounds, true)
     }
 
-    /// A stop that ends the run's children and exits with the signal's code at the first signal,
-    /// for a run with children and nothing to drain.
-    pub fn at_once() -> Arc<Shutdown> {
+    pub fn without_drain() -> Arc<Shutdown> {
         Shutdown::made(Bounds::default(), false)
     }
 
@@ -184,11 +148,10 @@ impl Shutdown {
         })
     }
 
-    pub fn attach_bell(&self, bell: &Arc<Bell>) {
+    pub fn attach_notifier(&self, bell: &Arc<WakeCounter>) {
         *lock(&self.bell) = Some(Arc::clone(bell));
     }
 
-    /// Wakes whatever waits on the stop: the request and each phase end.
     fn wake(&self) {
         self.woke.notify_all();
         if let Some(bell) = lock(&self.bell).as_ref() {
@@ -204,7 +167,6 @@ impl Shutdown {
         &self.signals
     }
 
-    /// Hand over the socket table, catching up with a phase machine that has already run.
     pub fn attach_net(&self, net: Arc<dyn Accepting>) {
         let mut slot = lock(&self.net);
         *slot = Some(Arc::clone(&net));
@@ -217,12 +179,10 @@ impl Shutdown {
         state.in_flight_at_stop = net.connections_in_flight();
         drop(state);
         drop(slot);
-        // An `accept` posted before the close may still be parked inside it.
         wake_parked_accepts(net.as_ref());
         self.wake();
     }
 
-    /// The children a second signal ends before it exits, since that exit skips the teardown.
     pub fn attach_children(&self, children: &Arc<Children>) {
         *lock(&self.children) = Some(Arc::downgrade(children));
     }
@@ -238,7 +198,6 @@ impl Shutdown {
         self.requested.load(Ordering::Acquire)
     }
 
-    /// Milliseconds left before the run stops scheduling, and `-1` when no stop has been requested.
     pub fn deadline_ms(&self) -> i64 {
         if !self.stopping() {
             return -1;
@@ -246,7 +205,6 @@ impl Shutdown {
         let state = lock(&self.state);
         let left = match (state.deadline, state.at) {
             (Some(deadline), _) => deadline.saturating_duration_since(Instant::now()),
-            // Still in the lead: the rest of the lead plus the whole drain.
             (None, Some(at)) => {
                 let lead_left = self.bounds.lead.saturating_sub(at.elapsed());
                 lead_left + self.bounds.drain
@@ -275,19 +233,16 @@ impl Shutdown {
         lock(&self.state).signal
     }
 
-    /// What the stop found: listeners closed, and connections open.
-    pub fn at_stop(&self) -> (usize, usize) {
+    pub fn stop_counts(&self) -> (usize, usize) {
         let state = lock(&self.state);
         (state.listeners_closed, state.in_flight_at_stop)
     }
 
-    /// Sleep for at most `bound`, or until the stop moves to its next phase.
     pub fn park(&self, bound: Duration) {
         let state = lock(&self.state);
         let _ = self.woke.wait_timeout(state, bound);
     }
 
-    /// Request a stop; `false` when one was already requested.
     pub fn request(self: &Arc<Shutdown>, signal: ShutdownSignal) -> bool {
         if self.requested.swap(true, Ordering::AcqRel) {
             self.second.store(true, Ordering::Release);
@@ -300,13 +255,12 @@ impl Shutdown {
             state.at = Some(Instant::now());
         }
         self.wake();
-        // Phases run on their own thread so the reactor can still notice a second signal.
         let coordinator = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("ply-host-drain".to_string())
-            .spawn(move || coordinator.lead_then_stop());
+            .spawn(move || coordinator.delay_then_stop_accepting());
         if spawned.is_err() {
-            self.lead_then_stop();
+            self.delay_then_stop_accepting();
         }
         true
     }
@@ -315,14 +269,12 @@ impl Shutdown {
         self.second.load(Ordering::Acquire)
     }
 
-    /// Waits out the lead, then stops accepting and starts the drain.
-    fn lead_then_stop(&self) {
+    fn delay_then_stop_accepting(&self) {
         if !self.bounds.lead.is_zero() {
             let state = lock(&self.state);
             let _ = self.woke.wait_timeout(state, self.bounds.lead);
         }
         let net = {
-            // `net` then `state`, which is the order `attach_net` and `exit_now` take them in too.
             let slot = lock(&self.net);
             let net = slot.clone();
             let mut state = lock(&self.state);
@@ -330,7 +282,6 @@ impl Shutdown {
             self.stopped_accepting.store(true, Ordering::Release);
             state.listeners_closed = closed;
             state.in_flight_at_stop = net.as_ref().map_or(0, |n| n.connections_in_flight());
-            // The drain starts when accept stops, so a lead never shortens the drain.
             state.deadline = Some(Instant::now() + self.bounds.drain);
             net
         };
@@ -368,7 +319,6 @@ fn signals_of_this_platform() -> Vec<ShutdownSignal> {
     vec![Signal::Interrupt]
 }
 
-/// Register with the operating system, on a thread of this coordinator's own.
 pub fn listen(shutdown: &Arc<Shutdown>) -> Result<(), Diagnostic> {
     for which in shutdown.signals().to_vec() {
         let coordinator = Arc::clone(shutdown);
@@ -386,7 +336,6 @@ pub fn listen(shutdown: &Arc<Shutdown>) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-/// One thread and one current-thread `tokio` runtime per signal.
 fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -428,8 +377,6 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
     });
 }
 
-/// Installs the handler for `which` before it returns, on a thread of its own that marks each
-/// arrival.
 #[cfg(unix)]
 fn watch_for(which: Asked, arrived: Arc<AtomicBool>) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -494,13 +441,17 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
     }
     shutdown.end_children();
     crate::stdio::settle();
-    crate::observe::exiting();
+    crate::observe::report_at_exit();
     std::process::exit(which.exit_code());
 }
 
-/// What an ask that could not install its handler fails the run with, naming the operation `what`.
 #[cold]
-pub fn err_unheard(what: &str, which: Asked, e: &std::io::Error, span: Span) -> Diagnostic {
+pub fn err_signal_watch_failed(
+    what: &str,
+    which: Asked,
+    e: &std::io::Error,
+    span: Span,
+) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("{what} could not listen for SIG{}: {e}", which.name()),
@@ -509,7 +460,6 @@ pub fn err_unheard(what: &str, which: Asked, e: &std::io::Error, span: Span) -> 
     .note("without the handler the signal would do what the platform does with it, so the ask fails rather than returning `false`")
 }
 
-/// The guarded state has no invariant a panicking caller can break, so recovering is correct.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

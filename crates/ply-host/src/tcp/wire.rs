@@ -1,18 +1,9 @@
-//! What `std.net`'s and `std.udp`'s host handlers hand their natives and read back, in flat forms
-//! the handlers' own readers and writers in `std.net` share. A socket address is parts: its
-//! address's bytes, its port in two bytes and its zone, empty for none. An option is its setting's
-//! byte, as `std.net` numbers settings, and then what it sets. An error is its kind's byte,
-//! `Rejected` 1 to `Other` 11 in declaration order, then `Handshake`'s reason, or `Other`'s code
-//! and words as parts. A result that may fail is byte 1 and what it returns, or byte 0 and
-//! the error.
-
-use crate::dns::{address_bytes, address_of};
+use crate::dns::{address_bytes, ip_address_from_bytes};
 use crate::native::{int, int_of, parts, parts_of};
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
-/// A `std.net.Error`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NetError {
     Rejected,
@@ -68,7 +59,6 @@ impl NetError {
     }
 }
 
-/// `outcome` as a result that may be an error.
 pub fn result(outcome: Result<Vec<u8>, NetError>) -> Vec<u8> {
     match outcome {
         Ok(returned) => [&[1u8][..], &returned].concat(),
@@ -76,7 +66,6 @@ pub fn result(outcome: Result<Vec<u8>, NetError>) -> Vec<u8> {
     }
 }
 
-/// A `std.ip.SocketAddress`: an address, a port, and the zone of a link-local IPv6 address.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Endpoint {
     pub ip: IpAddr,
@@ -100,8 +89,6 @@ impl Endpoint {
         }
     }
 
-    /// The address a socket call takes; a zone that names no interface of this machine is one
-    /// nothing can be reached through.
     pub fn socket_addr(&self) -> Result<SocketAddr, NetError> {
         match (self.ip, &self.zone) {
             (IpAddr::V4(ip), _) => Ok(SocketAddr::V4(SocketAddrV4::new(ip, self.port))),
@@ -124,33 +111,29 @@ impl Endpoint {
         ])
     }
 
-    /// The socket address `flat` writes; `None` for bytes that write none.
     pub fn read(flat: &[u8]) -> Option<Endpoint> {
         let [ip, port, zone] = parts_of(flat)?[..] else {
             return None;
         };
         let zone = std::str::from_utf8(zone).ok()?;
         Some(Endpoint {
-            ip: address_of(ip)?,
+            ip: ip_address_from_bytes(ip)?,
             port: u16::from_be_bytes(port.try_into().ok()?),
             zone: (!zone.is_empty()).then(|| zone.to_string()),
         })
     }
 }
 
-/// The interface a scope id names, as a zone is written; the number where it names none.
 #[cfg(unix)]
 fn zone_name(scope: u32) -> Option<String> {
     if scope == 0 {
         return None;
     }
     let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
-    // SAFETY: the buffer is `IF_NAMESIZE` bytes, the most the call writes, terminator included.
     let found = unsafe { libc::if_indextoname(scope, name.as_mut_ptr()) };
     if found.is_null() {
         return Some(scope.to_string());
     }
-    // SAFETY: a non-null result is the buffer, holding a terminated name.
     let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
     Some(name.to_string_lossy().into_owned())
 }
@@ -166,7 +149,6 @@ pub fn zone_index(zone: &str) -> Option<u32> {
         return Some(scope);
     }
     let name = std::ffi::CString::new(zone).ok()?;
-    // SAFETY: `name` is a terminated string that outlives the call.
     match unsafe { libc::if_nametoindex(name.as_ptr()) } {
         0 => None,
         scope => Some(scope),
@@ -178,7 +160,6 @@ pub fn zone_index(zone: &str) -> Option<u32> {
     zone.parse().ok()
 }
 
-/// A `std.net.SocketOption`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SocketOption {
     NoDelay(bool),
@@ -190,16 +171,11 @@ pub enum SocketOption {
     Linger(Option<Duration>),
     Broadcast(bool),
     MulticastLoop(bool),
-    /// A multicast group, and the interface it is joined on where one is named.
     JoinGroup(IpAddr, Option<String>),
     LeaveGroup(IpAddr, Option<String>),
-    /// The `--tls` credential a later `start_tls` presents where its server asks for a client
-    /// certificate.
     Presenting(String),
 }
 
-/// A `std.net.Probing`: when an idle connection is probed, how often, and how many unanswered
-/// probes end it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Probing {
     pub idle: Duration,
@@ -208,7 +184,6 @@ pub struct Probing {
 }
 
 impl SocketOption {
-    /// The option `flat` writes; `None` for bytes that write none.
     pub fn read(flat: &[u8]) -> Option<SocketOption> {
         let (setting, rest) = flat.split_first()?;
         let flag = || match rest {
@@ -223,7 +198,7 @@ impl SocketOption {
             };
             let interface = std::str::from_utf8(interface).ok()?;
             Some((
-                address_of(group)?,
+                ip_address_from_bytes(group)?,
                 (!interface.is_empty()).then(|| interface.to_string()),
             ))
         };
@@ -258,7 +233,6 @@ impl SocketOption {
         })
     }
 
-    /// The options `flat` writes as parts, one each.
     pub fn list(flat: &[u8]) -> Option<Vec<SocketOption>> {
         parts_of(flat)?
             .into_iter()
@@ -297,16 +271,13 @@ impl SocketOption {
         }
     }
 
-    /// `options` as parts, one each.
     pub fn listed(options: &[SocketOption]) -> Vec<u8> {
         let written: Vec<Vec<u8>> = options.iter().map(SocketOption::written).collect();
         let each: Vec<&[u8]> = written.iter().map(Vec::as_slice).collect();
         parts(&each)
     }
 
-    /// Whether `options` reads the option back: a group joined or left, and a credential to
-    /// present, are acts rather than settings of the socket.
-    pub fn is_setting(&self) -> bool {
+    pub fn can_read_back(&self) -> bool {
         !matches!(
             self,
             SocketOption::JoinGroup(..)
@@ -317,7 +288,6 @@ impl SocketOption {
 }
 
 impl Probing {
-    /// Parts: the idle wait, then the interval and the count, each empty for none.
     fn read(flat: &[u8]) -> Option<Probing> {
         let [idle, interval, count] = parts_of(flat)?[..] else {
             return None;
@@ -348,17 +318,14 @@ impl Probing {
     }
 }
 
-/// A duration as its nanoseconds' eight bytes.
 fn nanos(d: Duration) -> [u8; 8] {
     int(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
-/// The duration of nanoseconds eight bytes count, which is not negative.
 fn duration_of(bytes: &[u8]) -> Option<Duration> {
     u64::try_from(int_of(bytes)?).ok().map(Duration::from_nanos)
 }
 
-/// A `std.net.PeerCredentials`: who holds the other end of a Unix socket.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Credentials {
     pub user: i64,
@@ -367,7 +334,6 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Parts: the user, the group, and the process, empty where the platform does not say.
     pub fn written(&self) -> Vec<u8> {
         let process = self.process.map(int);
         parts(&[

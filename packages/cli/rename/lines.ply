@@ -8,6 +8,8 @@ pub type Moved = { path: String, new: Bytes }
 
 pub type MemberLine = { file: String, of: Bytes, member: Bytes, new: Bytes }
 
+pub type LocalLine = { file: String, line: Int, old: Bytes, new: Bytes }
+
 pub type Renames = {
   words: Bool,
   names: Map<Bytes, Bytes>,
@@ -15,7 +17,14 @@ pub type Renames = {
   defined: Map<Bytes, Map<String, Bytes>>,
   modules: List<Moved>,
   members: List<MemberLine>,
+  locals: List<LocalLine>,
 }
+
+pub fn only_locals(renames: Renames) -> Bool =
+  renames.names.keys().len() == 0 && renames.fields.keys().len() == 0
+    && renames.defined.keys().len() == 0
+    && renames.modules.len() == 0
+    && renames.members.len() == 0
 
 type Piece = { text: Bytes, word: Bool }
 
@@ -40,9 +49,8 @@ fn is_words(text: Bytes) -> Bool / {abort.raise} = !text.split(b"_").any(|w: Byt
 
 fn fields_of(line: Bytes) -> List<Bytes> / {abort.raise} =
   [b"\t", b"\r"].fold(line.split(b" "), |parts: List<Bytes>, separator: Bytes|
-    parts.fold([], |acc: List<Bytes>, part: Bytes| acc.concat(part.split(separator)))).filter(
-    |f: Bytes| f != b"",
-  )
+    parts.fold([], |accumulator: List<Bytes>, part: Bytes|
+      accumulator.concat(part.split(separator)))).filter(|f: Bytes| f != b"")
 
 fn rejection_of(
   renames: Renames,
@@ -61,8 +69,45 @@ fn rejection_of(
 
 fn names_module(field: Bytes) -> Bool = field.ends_with(b".ply") || field.ends_with(b"/")
 
+fn local_place(field: Bytes) -> Option<{ file: String, line: Int }> / {abort.raise} = {
+  let parts = field.split(b":");
+  if parts.len() != 2 || parts.get(1).len() == 0
+      || range(0, parts.get(1).len()).any(|i: Int|
+        parts.get(1).at(i) < 48 || parts.get(1).at(i) > 57) { None } else {
+    Some({
+      file: String::of_bytes_lossy(parts.get(0)),
+      line: range(0, parts.get(1).len()).fold(0, |number: Int, i: Int|
+        number * 10 + parts.get(1).at(i) - 48),
+    })
+  }
+}
+
+fn with_local(
+  renames: Renames,
+  place: { file: String, line: Int },
+  old: Bytes,
+  new: Bytes,
+) -> Result<Renames, String> / {abort.raise} =
+  if renames.words { Err("`--words` renames words, not one local") }
+  else if !is_name(old) || !is_name(new) {
+    Err(shown(old) ++ " and " ++ shown(new) ++ " must both be valid names")
+  } else if renames.locals.any(|l: LocalLine|
+      l.file == place.file && l.line == place.line && l.old == old) {
+    Err(shown(old) ++ " appears twice for that line")
+  } else {
+    Ok({
+      ..renames,
+      locals: renames.locals.push({ file: place.file, line: place.line, old: old, new: new }),
+    })
+  }
+
 fn with_line(renames: Renames, fields: List<Bytes>) -> Result<Renames, String> / {abort.raise} =
-  if fields.len() == 2 && names_module(fields.get(0)) {
+  if fields.len() == 3 && local_place(fields.get(0)) != None {
+    match local_place(fields.get(0)) {
+      Some(place) -> with_local(renames, place, fields.get(1), fields.get(2)),
+      None -> Err("a line that names a place starts with a path, a colon and a line number"),
+    }
+  } else if fields.len() == 2 && names_module(fields.get(0)) {
     let path = String::of_bytes_lossy(fields.get(0));
     if renames.words { Err("`--words` renames words, not modules") }
     else if renames.modules.any(|m: Moved| m.path == path) { Err(path ++ " appears twice") }
@@ -122,7 +167,7 @@ fn with_line(renames: Renames, fields: List<Bytes>) -> Result<Renames, String> /
     }
   } else {
     Err(
-      "each line needs an old name and a new name, after the file that declares the old name when only that definition is renamed",
+      "each line needs an old name and a new name; to rename only the definition in one file, start the line with that file's path",
     )
   }
 
@@ -136,13 +181,14 @@ pub fn renames_of(text: Bytes, words: Bool) -> Result<Renames, String> / {abort.
       defined: Map::new(),
       modules: [],
       members: [],
+      locals: [],
     }),
-    |acc: Result<Renames, String>, i: Int|
-      match acc {
-        Err(_) -> acc,
+    |accumulator: Result<Renames, String>, i: Int|
+      match accumulator {
+        Err(_) -> accumulator,
         Ok(renames) -> {
           let fields = fields_of(lines.get(i));
-          if fields.len() == 0 { acc } else {
+          if fields.len() == 0 { accumulator } else {
             match with_line(renames, fields) {
               Ok(r) -> Ok(r),
               Err(reason) -> Err("line " ++ (i + 1).to_string() ++ ": " ++ reason),
@@ -184,8 +230,8 @@ fn capitalized(word: Bytes) -> Bytes / {abort.raise} =
   upper(word.slice(0, 1)).concat(word.slice(1, word.len()))
 
 pub fn joined(words: List<Bytes>, separator: Bytes) -> Bytes =
-  words.fold(b"", |acc: Bytes, w: Bytes|
-    if acc == b"" { w } else { Bytes::concat_all([acc, separator, w]) })
+  words.fold(b"", |accumulator: Bytes, w: Bytes|
+    if accumulator == b"" { w } else { Bytes::concat_all([accumulator, separator, w]) })
 
 fn written_as(piece: Bytes, words: List<Bytes>, shouting: Bool) -> Bytes / {abort.raise} =
   if is_lower(piece.at(0)) { joined(words, b"_") }
@@ -223,7 +269,7 @@ pub fn keyword_rejection(new: Bytes) -> Option<Failure> / {abort.raise} =
 fn parse_word_renames(map: Bytes) -> Renames / {abort.raise} =
   match renames_of(map, true) { Ok(r) -> r, Err(reason) -> panic(reason) }
 
-test "`--words` replaces a word inside names, keeps each name's casing and never writes a keyword" {
+test "`--words` replaces a word inside names, preserves each name's casing and never produces a keyword" {
   let r = parse_word_renames(b"ty type\nexpr type_expression\n");
   assert_eq(renamed(r, b"ty_vars"), b"type_vars");
   assert_eq(renamed(r, b"TyCon"), b"TypeCon");
@@ -244,7 +290,7 @@ test "each line of a map needs an old name and a new name" {
   assert_eq(
     rename_map_error(b"a b c d\n", false),
     Some(
-      "line 1: each line needs an old name and a new name, after the file that declares the old name when only that definition is renamed",
+      "line 1: each line needs an old name and a new name; to rename only the definition in one file, start the line with that file's path",
     ),
   );
   assert_eq(rename_map_error(b"m.ply a b\nn.ply a c\n", false), None);

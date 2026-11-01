@@ -16,12 +16,13 @@ import std.gen
 
 /// The order of a unit's two bytes.
 pub type Order =
-  /// The high byte first: UTF-16BE, and the standard's default when no order is given.
+  /// The high byte first: UTF-16BE. RFC 2781 says to assume this order when bytes have no
+  /// byte-order mark.
   | BigEndian
   /// The low byte first: UTF-16LE, the order of Windows and of most files.
   | LittleEndian
 
-/// Why units or bytes are not UTF-16.
+/// The ways reading UTF-16 units or bytes can fail.
 pub type Error =
   /// A surrogate without its partner: the unit and its position. The position counts units when
   /// reading units, and bytes when reading bytes.
@@ -42,24 +43,21 @@ fn is_low(unit: Int) -> Bool = unit >= 0xDC00 && unit <= 0xDFFF
 /// The units of `text`, in order.
 pub fn units(text: String) -> List<Int> =
   text.chars().fold([], |all: List<Int>, c: Char| {
-    let cp = Int::of_char(c);
-    if cp < 0x10000 { all.push(cp) }
-    else { all.push(0xD800 + (cp - 0x10000 >> 10)).push(0xDC00 + (cp - 0x10000 & 0x3FF)) }
+    let code_point = Int::of_char(c);
+    if code_point < 0x10000 { all.push(code_point) } else {
+      all.push(0xD800 + (code_point - 0x10000 >> 10)).push(0xDC00 + (code_point - 0x10000 & 0x3FF))
+    }
   })
 
-/// The code points read so far, the high surrogate waiting for its partner (`-1` for none), and
-/// how many units have been read.
 type PairState = { out: List<Int>, high: Int, read: Int }
 
-/// The text of `units`, each taken as its low sixteen bits. Each surrogate without its partner is
-/// replaced by the code point `unpaired` returns when called with the unit's position and the unit.
 fn decode_units<| e>(units: List<Int>, unpaired: (Int, Int) -> Int / e) -> String / e = {
   let done = units.fold({ out: [], high: -1, read: 0 }, |so_far: PairState, wide: Int| {
     let unit = wide & 0xFFFF;
     let at = so_far.read;
     if so_far.high >= 0 && is_low(unit) {
-      let cp = 0x10000 + (so_far.high - 0xD800 << 10) + (unit - 0xDC00);
-      { out: so_far.out.push(cp), high: -1, read: at + 1 }
+      let code_point = 0x10000 + (so_far.high - 0xD800 << 10) + (unit - 0xDC00);
+      { out: so_far.out.push(code_point), high: -1, read: at + 1 }
     } else {
       let before = if so_far.high >= 0 { so_far.out.push(unpaired(at - 1, so_far.high)) }
       else { so_far.out };
@@ -71,8 +69,8 @@ fn decode_units<| e>(units: List<Int>, unpaired: (Int, Int) -> Int / e) -> Strin
   let points = if done.high >= 0 { done.out.push(unpaired(done.read - 1, done.high)) }
   else { done.out };
   String::of_chars(
-    points.fold([], |text: List<Char>, cp: Int|
-      match Char::of_int(cp) { Some(c) -> text.push(c), None -> text }),
+    points.fold([], |text: List<Char>, code_point: Int|
+      match Char::of_int(code_point) { Some(c) -> text.push(c), None -> text }),
   )
 }
 
@@ -101,11 +99,8 @@ pub fn encode(
   if with_byte_order_mark { unit_bytes(0xFEFF, order).concat(body) } else { body }
 }
 
-/// Bytes read as units: their byte order, the offset where the units start, and the units.
 type ReadResult = { order: Order, from: Int, units: List<Int> }
 
-/// The whole units of `bytes`. When `with_byte_order_mark` is true and the bytes start with a mark,
-/// the mark gives the order; otherwise `order` does.
 fn read_units(
   bytes: Bytes,
   order: Order,
@@ -136,10 +131,10 @@ pub fn read(
   order: Order,
   with_byte_order_mark: Bool = false,
 ) -> String / {utf16.fail, abort.raise} = {
-  let held = read_units(bytes, order, with_byte_order_mark);
-  let text = decode_units(held.units, |at: Int, unit: Int|
-    utf16.fail(Unpaired({ at: held.from + 2 * at, unit: unit })));
-  if (bytes.len() - held.from) % 2 == 1 { utf16.fail(OddLength({ at: bytes.len() - 1 })) }
+  let content = read_units(bytes, order, with_byte_order_mark);
+  let text = decode_units(content.units, |at: Int, unit: Int|
+    utf16.fail(Unpaired({ at: content.from + 2 * at, unit: unit })));
+  if (bytes.len() - content.from) % 2 == 1 { utf16.fail(OddLength({ at: bytes.len() - 1 })) }
   else { text }
 }
 
@@ -157,21 +152,18 @@ pub fn lossy(
   order: Order,
   with_byte_order_mark: Bool = false,
 ) -> String / {abort.raise} = {
-  let held = read_units(bytes, order, with_byte_order_mark);
-  let text = of_units_lossy(held.units);
-  if (bytes.len() - held.from) % 2 == 1 { text ++ "\u{FFFD}" } else { text }
+  let content = read_units(bytes, order, with_byte_order_mark);
+  let text = of_units_lossy(content.units);
+  if (bytes.len() - content.from) % 2 == 1 { text ++ "\u{FFFD}" } else { text }
 }
 
-// --- Properties -------------------------------------------------------------------
-
-test "a text encoded in either order, marked or not, reads back as the text" {
+test "a text encoded in either byte order, with or without a byte order mark, decodes back to the same text" {
   gen::check3(
     gen::text(),
     gen::bool(),
     gen::bool(),
     |text: String, little: Bool, with_byte_order_mark: Bool| {
       let order = if little { LittleEndian } else { BigEndian };
-      // Text starting with U+FEFF or U+FFFE, encoded without a mark, would be read as a mark.
       let own = text.starts_with("\u{FEFF}") || text.starts_with("\u{FFFE}");
       decode(encode(text, order, with_byte_order_mark), order, with_byte_order_mark) == Ok(text)
         && (own || with_byte_order_mark
@@ -181,7 +173,7 @@ test "a text encoded in either order, marked or not, reads back as the text" {
   )
 }
 
-test "a strict read of any bytes returns a valid result, and agrees with a lossy read on success" {
+test "`decode` of any bytes returns either a valid text or a well-formed error, and when it succeeds `lossy` returns the same text" {
   gen::check3(
     gen::bytes(),
     gen::bool(),
@@ -199,9 +191,7 @@ test "a strict read of any bytes returns a valid result, and agrees with a lossy
   )
 }
 
-// --- Tests ------------------------------------------------------------------------
-
-test "a character past U+FFFF is a surrogate pair, and any other is its own unit" {
+test "a character above U+FFFF becomes a surrogate pair of two units, and any other character becomes one unit" {
   assert_eq(units("a\u{E9}\u{4E2D}"), [0x61, 0xE9, 0x4E2D]);
   assert_eq(units("\u{10000}\u{1F600}\u{10FFFF}"), [
     0xD800,
@@ -230,7 +220,7 @@ fn lone_surrogate_cases() -> List<LoneSurrogateCase> =
     { units: [0xD83D, 0xDE00, 0xDE00], at: 2, lossy: "\u{1F600}\u{FFFD}" },
   ]
 
-test "a surrogate without its partner at {c.at} of {c.units} fails there, and reads lossily as U+FFFD" for c: LoneSurrogateCase in lone_surrogate_cases(
+test "a surrogate with no matching partner at code unit {c.at} (of {c.units} units) makes decoding fail at that position, and lossy decoding replaces it with U+FFFD" for c: LoneSurrogateCase in lone_surrogate_cases(
   ) {
   let unit = match c.units.at(c.at) { Some(u) -> u, None -> -1 };
   assert_eq(try { of_units(c.units) }, Err(Unpaired({ at: c.at, unit: unit })));
@@ -240,7 +230,7 @@ test "a surrogate without its partner at {c.at} of {c.units} fails there, and re
   assert_eq(lossy(bytes, LittleEndian), c.lossy)
 }
 
-test "bytes are read in the given order, or in the order a mark gives when one is looked for" {
+test "`decode` uses the byte order given, or the byte order of a byte order mark when `with_byte_order_mark` is true" {
   assert_eq(encode("a\u{1F600}", BigEndian), b"\x00a\xd8\x3d\xde\x00");
   assert_eq(encode("a\u{1F600}", LittleEndian), b"a\x00\x3d\xd8\x00\xde");
   assert_eq(encode("a", LittleEndian, with_byte_order_mark: true), b"\xff\xfea\x00");
@@ -253,7 +243,7 @@ test "bytes are read in the given order, or in the order a mark gives when one i
   assert_eq(decode(b"\xff\xfe", LittleEndian, with_byte_order_mark: true), Ok(""))
 }
 
-test "an odd number of bytes fails at the last byte, and reads lossily with a final U+FFFD" {
+test "`decode` fails on an odd number of bytes at the last byte, and `lossy` decoding ends the string with U+FFFD" {
   assert_eq(decode(b"a\x00b", LittleEndian), Err(OddLength({ at: 2 })));
   assert_eq(decode(b"a", BigEndian, with_byte_order_mark: true), Err(OddLength({ at: 0 })));
   assert_eq(lossy(b"a\x00b", LittleEndian), "a\u{FFFD}");

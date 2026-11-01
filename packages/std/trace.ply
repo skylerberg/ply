@@ -1,9 +1,10 @@
-//! Observability as an effect: events, spans and metrics, each on a channel label.
+//! Observability as an effect: events, spans and metrics, each written to a channel named by the
+//! label `c` on the effect's operations.
 //!
 //! Each record is written when its operation is performed. A span still open when its task finishes
 //! or its entry point ends is closed as `Abandoned`, innermost first, and written. The run then
-//! warns (`W0609`), but its exit code does not change. A test collects records in a `Sink` with the
-//! `_step` functions and reads them with `drain`, `named`, `on_channel` and `counter_total`.
+//! warns (`W0609`), but its exit code does not change. A test collects records in a `Sink` and
+//! reads them with `drain`, `named`, `on_channel` and `counter_total`.
 
 import std.bytes (i64_be)
 import std.internal.native (native, encode_parts)
@@ -25,15 +26,18 @@ pub type Field =
 /// A `Map`, so two field sets built in different orders are equal.
 pub type Fields = Map<String, Field>
 
-/// A span's identity.
+/// Identifies a span by its `id` and the `channel` it was opened on.
 pub type Span = { id: Int, channel: String }
 
 /// How a span ended.
 pub type Outcome = | Ok | Failed(String) | Abandoned
 
-/// Structured records, on the channel the label names.
+/// Writes structured trace records (events, spans and metrics). The label in brackets, such as
+/// `trace.event[orders]`, names the channel: a string that tags each record so a reader can select
+/// the records from one part of the program.
 pub nondet effect trace {
-  /// One event.
+  /// Records one event with a severity `level`, a `name` and extra `fields`, inside the innermost
+  /// open span.
   write event[c](level: Level, name: String, fields: Fields) -> Unit
   /// Opens a span inside the innermost open span.
   write enter[c](name: String, fields: Fields) -> Span
@@ -41,18 +45,15 @@ pub nondet effect trace {
   write exit[c](span: Span, outcome: Outcome) -> Unit
   /// Adds `delta` to a counter.
   write count[c](name: String, delta: Int, fields: Fields) -> Unit
-  /// Sets a gauge.
+  /// Records the current `value` of a measurement that can go up or down, such as a queue length,
+  /// under `name`.
   write gauge[c](name: String, value: Decimal, fields: Fields) -> Unit
   /// Records a duration in microseconds.
   write time[c](name: String, micros: Int, fields: Fields) -> Unit
 }
 
-// --- The host handler ------------------------------------------------------------
-
 host for trace by host_handler
 
-/// Runs `go` with every record written to the run's sink. A record the sink does not want costs
-/// only the check. Each span stays open for the task that opened it until it is closed.
 fn host_handler<a | e>(go: () -> a / {trace.write[*] | e}) -> a / {native.read, abort.raise | e} =
   handle {
     go()
@@ -74,12 +75,8 @@ fn host_handler<a | e>(go: () -> a / {trace.write[*] | e}) -> a / {native.read, 
     trace.time[*channel](name, micros, fields) -> metric(3, channel, name, micros, "", fields),
   }
 
-/// Whether the run's sink writes records at `level`, a number from `level_number`.
 extern fn trace_wants(level: Int) -> Bool / {native.read}
 
-/// Writes one record on `channel`. `kind` is 0 for `event`, 1 for `count`, 2 for `gauge` and 3 for
-/// `time`. `amount` is a count's delta or a time's microseconds, and `value` is a gauge's value as
-/// decimal text.
 extern fn trace_record(
   kind: Int,
   channel: String,
@@ -90,15 +87,10 @@ extern fn trace_record(
   fields: Bytes,
 ) -> Unit / {native.read}
 
-/// Opens a span on `channel` inside the innermost span the calling task has open, and returns its
-/// id.
 extern fn trace_enter(channel: String, name: String, fields: Bytes) -> Int / {native.read}
 
-/// Closes span `id` on `channel`, and every span opened inside it. `outcome` is 0 for `Ok`, 1 for
-/// `Failed` with `reason`, and 2 for `Abandoned`. Closing a span that is not open ends the run.
 extern fn trace_exit(channel: String, id: Int, outcome: Int, reason: String) -> Unit / {native.read}
 
-/// Writes a metric at `Info`, if the sink wants that level.
 fn metric(
   kind: Int,
   channel: String,
@@ -111,15 +103,12 @@ fn metric(
 
 fn level_number(level: Level) -> Int = match level { Debug -> 0, Info -> 1, Warn -> 2, Error -> 3 }
 
-/// Fields encoded for the natives: as parts, each name followed by its field.
 fn encode_fields(fields: Fields) -> Bytes / {abort.raise} =
   encode_parts(
-    fields.fold([], |acc: List<Bytes>, name: String, field: Field|
-      acc.push(Bytes::of_string(name)).push(encode_field(field))),
+    fields.fold([], |accumulator: List<Bytes>, name: String, field: Field|
+      accumulator.push(Bytes::of_string(name)).push(encode_field(field))),
   )
 
-/// A field encoded as its kind's byte followed by its value: a number in eight bytes, a flag in
-/// one, and a decimal or JSON as its text.
 fn encode_field(field: Field) -> Bytes / {abort.raise} =
   match field {
     IntField(n) -> b"\x00".concat(i64_be(n)),
@@ -130,8 +119,6 @@ fn encode_field(field: Field) -> Bytes / {abort.raise} =
     BytesField(b) -> b"\x05".concat(b),
     JsonField(j) -> b"\x06".concat(json::to_bytes(j)),
   }
-
-// --- The collecting fake ---------------------------------------------------------
 
 /// Which operation wrote a record.
 pub type Kind = | Event | Enter | Exit | Count | Gauge | Timing
@@ -152,8 +139,6 @@ pub type Record = {
   value: Decimal,
 }
 
-/// A span still open. A sink keeps its open spans innermost first, so pushing and popping are both
-/// at the head.
 type OpenSpan = { id: Int, channel: String, name: String, parent: Int }
 
 /// The records a test has collected, and the spans still open.
@@ -215,13 +200,14 @@ pub fn on_channel(record_list: List<Record>, c: String) -> List<Record> =
 
 /// The sum of every count recorded under `n`.
 pub fn counter_total(record_list: List<Record>, n: String) -> Int =
-  record_list.fold(0, |acc: Int, r: Record|
-    match r.kind { Count -> if r.name == n { acc + r.amount } else { acc }, _ -> acc })
-
-// --- The fake's own machinery ----------------------------------------------------
+  record_list.fold(0, |accumulator: Int, r: Record|
+    match r.kind {
+      Count -> if r.name == n { accumulator + r.amount } else { accumulator },
+      _ -> accumulator,
+    })
 
 reuse fn cons<a>(x: a, xs: List<a>) -> List<a> =
-  xs.fold([].push(x), |acc: List<a>, y: a| acc.push(y))
+  xs.fold([].push(x), |accumulator: List<a>, y: a| accumulator.push(y))
 
 fn append(s: Sink, r: Record) -> Sink = { open: s.open, next: s.next, records: s.records.push(r) }
 
@@ -255,7 +241,6 @@ fn innermost(s: Sink) -> Option<OpenSpan> = match s.open { [first, ..] -> Some(f
 
 fn current_id(s: Sink) -> Int = match s.open { [first, ..] -> first.id, _ -> 0 }
 
-/// Whether `trace_span` is open. The channel must match as well as the id.
 fn is_open(spans: List<OpenSpan>, trace_span: Span) -> Bool =
   match spans {
     [] -> false,
@@ -263,11 +248,8 @@ fn is_open(spans: List<OpenSpan>, trace_span: Span) -> Bool =
     else { is_open(rest, trace_span) },
   }
 
-/// Pops spans innermost-first, recording each, until `id` has been closed.
 fn close_through(s: Sink, id: Int, o: Outcome) -> Sink = close_spans(s, s.open, id, o)
 
-/// Closes spans from the head of `open`, which starts as `s.open`, until span `id` is closed. The
-/// spans closed before it are `Abandoned`.
 fn close_spans(s: Sink, open: List<OpenSpan>, id: Int, o: Outcome) -> Sink =
   match open {
     [] -> s,
@@ -295,15 +277,11 @@ fn close_spans(s: Sink, open: List<OpenSpan>, id: Int, o: Outcome) -> Sink =
 
 fn close_open_spans(s: Sink) -> Sink = abandon_spans(s, s.open)
 
-/// Closes every span in `open` as `Abandoned`, innermost first. Each round closes the head, which
-/// leaves the rest open.
 fn abandon_spans(s: Sink, open: List<OpenSpan>) -> Sink =
   match open {
     [] -> s,
     [first, ..rest] -> abandon_spans(close_through(s, first.id, Abandoned), rest),
   }
-
-// --- Tests ------------------------------------------------------------------
 
 fn one_field(k: String, v: Field) -> Fields = Map::new().insert(k, v)
 
@@ -372,7 +350,7 @@ test "an event inside a span carries the span it was recorded in" {
   assert_eq(named(drain(noted), "slow").map(|r: Record| r.level), [Warn])
 }
 
-test "closing an outer span abandons the spans still open above it" {
+test "`exit_step` on an outer span also closes the still-open spans entered inside it, giving them the outcome `Abandoned`" {
   let outer = enter_step(sink(), "orders", "place_order", Map::new());
   let inner = enter_step(outer.sink, "orders", "reserve", Map::new());
   let deeper = enter_step(inner.sink, "orders", "charge", Map::new());
@@ -384,7 +362,7 @@ test "closing an outer span abandons the spans still open above it" {
   assert_eq(outcomes(record_list), [Ok, Ok, Ok, Abandoned, Abandoned, Failed("rolled back")])
 }
 
-test "a span nobody closed is drained as abandoned, innermost first" {
+test "`drain` closes spans that were never closed with the outcome `Abandoned`, the most recently entered first" {
   let outer = enter_step(sink(), "http", "request", Map::new());
   let inner = enter_step(outer.sink, "http", "query", Map::new());
   assert_eq(open_spans(inner.sink), 2);
@@ -394,7 +372,6 @@ test "a span nobody closed is drained as abandoned, innermost first" {
   assert_eq(outcomes(record_list), [Ok, Ok, Abandoned, Abandoned])
 }
 
-// A span closed twice, never opened, or opened on another channel is not open.
 test "an exit naming a span that is not open returns false and records nothing" {
   let opened = enter_step(sink(), "http", "request", Map::new());
   let closed = exit_step(opened.sink, opened.span, Ok);
@@ -432,7 +409,7 @@ test "a metric is a record like any other, and a total is a fold over them" {
   assert_eq(named(record_list, "place_order").map(|r: Record| r.amount), [8213])
 }
 
-test "fields survive as a map, so two sets built in different orders are equal" {
+test "event fields are stored as a map, so two field sets inserted in different orders are equal" {
   let one = Map::new().insert("sku", StringField("BOLT-1")).insert("n", IntField(2));
   let other = Map::new().insert("n", IntField(2)).insert("sku", StringField("BOLT-1"));
   let s = event_step(sink(), "orders", Info, "placed", one);

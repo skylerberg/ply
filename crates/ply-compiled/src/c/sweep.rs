@@ -1,13 +1,7 @@
-//! Keeping the content-addressed C cache and the stage directory to a size, gated by a stamp a
-//! sweep leaves when it finishes and run on a background thread so no build waits on it. Both go least recently used first: a
-//! read of an entry is recorded by [`used`], since an entry every run reads is written only once.
-
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, SystemTime};
 
-/// What each of the two roots may hold, in bytes; `PLY_C_CACHE_MAX` overrides it, `0` meaning no
-/// bound.
 const DEFAULT_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn budget() -> Option<u64> {
@@ -24,23 +18,16 @@ pub fn budget() -> Option<u64> {
     }
 }
 
-/// How long a finished sweep stands for.
 const INTERVAL: Duration = Duration::from_secs(600);
 
-/// How long a sweep that began is given before another process may begin one: the process that
-/// began it may have exited mid-walk, which finishes nothing.
 const LEASE: Duration = Duration::from_secs(120);
 
-/// Written when a sweep finishes; its age gates the next.
 pub const STAMP: &str = ".swept";
 
-/// Touched when a sweep begins, so processes starting together do not all walk.
 pub const BEGUN: &str = ".sweeping";
 
 static SWEPT: Once = Once::new();
 
-/// Sweep both roots down to their budget in the background, at most once per process, when the
-/// last sweep to finish is an interval old and none began within the lease.
 pub fn once() {
     SWEPT.call_once(|| {
         let Some(budget) = budget() else { return };
@@ -67,12 +54,10 @@ fn younger(mark: &Path, than: Duration) -> bool {
         .is_some_and(|age| age < than)
 }
 
-/// Whether a sweep is owed: none has finished, or the last to finish is `interval` old.
 pub fn due(root: &Path, interval: Duration) -> bool {
     !younger(&root.join(STAMP), interval)
 }
 
-/// Whether this process may begin a sweep: none began within `lease`, and this one now has.
 pub fn claim(root: &Path, lease: Duration) -> bool {
     let begun = root.join(BEGUN);
     if younger(&begun, lease) || std::fs::create_dir_all(root).is_err() {
@@ -81,7 +66,6 @@ pub fn claim(root: &Path, lease: Duration) -> bool {
     std::fs::write(&begun, b"").is_ok()
 }
 
-/// Records that a sweep ran to its end.
 pub fn finished(root: &Path) {
     let _ = std::fs::write(root.join(STAMP), b"");
 }
@@ -92,9 +76,6 @@ struct Entry {
     last_used: std::time::SystemTime,
 }
 
-/// Remove files at any depth under `root`, least recently used first, until the rest fits in
-/// `budget` or only files used within [`RECENT`] are left; each store below [`STORES`] goes whole.
-/// Errors are ignored.
 pub fn sweep(root: &Path, budget: u64) -> u64 {
     let mut entries = Vec::new();
     let mut total: u64 = 0;
@@ -106,8 +87,6 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
         };
         for e in read.flatten() {
             let path = e.path();
-            // A half-written entry belongs to a running process about to rename it, and the
-            // sweep's own marks are not entries.
             if path.extension().is_some_and(|x| x == "tmp")
                 || e.file_name() == STAMP
                 || e.file_name() == BEGUN
@@ -154,7 +133,6 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
         if total <= budget {
             break;
         }
-        // Unlinking an open file is safe here.
         if removed(&entry.path) {
             total -= entry.bytes.min(total);
             freed += entry.bytes;
@@ -163,16 +141,10 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     freed
 }
 
-/// The C cache's entry holding the stores of cached records: each a directory of segments named by
-/// a manifest, which goes whole by its [`USED`], since a segment alone is no entry.
 pub const STORES: &str = "bodies";
 
-/// Where a stage or a store records its last use, since a directory's own time moves only when it
-/// is written.
 pub const USED: &str = ".used";
 
-/// When the directory `path`, whose metadata is `meta`, was last used: its [`USED`], or its own
-/// time where that is later.
 fn last_use(path: &Path, meta: &std::fs::Metadata) -> SystemTime {
     std::fs::metadata(path.join(USED))
         .and_then(|m| m.modified())
@@ -190,25 +162,14 @@ fn removed(path: &Path) -> bool {
     }
 }
 
-/// The stage-directory entry holding one runnable per program the builder returned in memory,
-/// each swept on its own.
 pub const RETURNED: &str = "answered";
 
-/// The stage-directory entry holding one file per cached result a command takes back over an
-/// unchanged walk (`ply run`'s front end, `ply check`'s result), each swept on its own.
 pub const REUSED: &str = "reused";
 
-/// The stage-directory entries that hold files swept one by one, where any other is a stage swept
-/// whole.
 const BY_FILE: [&str; 2] = [RETURNED, REUSED];
 
-/// An entry used within this long is never swept: a run may be reading it, or about to open what
-/// it just wrote.
 const RECENT: Duration = Duration::from_secs(3600);
 
-/// Records that a stage directory or a cached file was just used. A file is opened for reading
-/// only: an object a loader has mapped may reject a writer. A mark younger than [`MARKED`] stands,
-/// since the sweep orders entries by hours.
 pub fn used(path: &Path) {
     let marked = if path.is_dir() {
         path.join(USED)
@@ -219,7 +180,7 @@ pub fn used(path: &Path) {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|at| at.elapsed().ok())
-        .is_some_and(|age| age < MARKED);
+        .is_some_and(|age| age < MARK_REFRESH_AGE);
     if fresh {
         return;
     }
@@ -230,12 +191,8 @@ pub fn used(path: &Path) {
     }
 }
 
-/// How old a mark may be and still stand for a use now.
-const MARKED: Duration = Duration::from_secs(600);
+const MARK_REFRESH_AGE: Duration = Duration::from_secs(600);
 
-/// Remove stage-directory entries, least recently used first, until the rest fits in `budget`.
-/// Each stage directory goes whole; each file under one of [`BY_FILE`] goes on its own. Errors are
-/// ignored.
 pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
     let Ok(read) = std::fs::read_dir(root) else {
         return 0;

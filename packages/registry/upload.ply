@@ -1,7 +1,3 @@
-//! What a publish must be before the store takes it: made under a token the package's name maps to,
-//! carrying the digest its body seals, and a library archive whose manifest is the package and the
-//! version it was sent as. Each rejection is the status and the sentence the client prints.
-
 import compiler.front.interface (envelope_of, enveloped)
 import std.bin
 import std.pkg (Attestation, attestation_bin)
@@ -22,13 +18,8 @@ import std.string
 fn fail<a>(status: Int, reason: String) -> Result<a, http::Error> =
   Err({ status: status, reason: reason })
 
-// --- Who may publish --------------------------------------------------------------
-
-/// The configuration key holding the token that may publish `name`: one exact name per key, so a
-/// token reaches only the packages it is listed under.
 pub fn token_key(name: String) -> String = "token." ++ name
 
-/// The token `Authorization: Bearer <token>` presents, when it presents one.
 pub fn bearer_token(headers: Headers) -> Option<String> / {abort.raise} =
   match header(headers, "authorization") {
     None -> None,
@@ -38,14 +29,16 @@ pub fn bearer_token(headers: Headers) -> Option<String> / {abort.raise} =
     } else { None },
   }
 
-/// A request allowed to change `name`: 401 without a token, 403 with one this name is not mapped
-/// to. The comparison is the constant-time one a `Secret` allows.
 pub fn authorize(
   name: String,
   headers: Headers,
 ) -> Result<Unit, http::Error> / {config.secret[tokens], abort.raise} =
   match bearer_token(headers) {
-    None -> fail(401, "a publish or a yank carries `Authorization: Bearer <token>`"),
+    None ->
+      fail(
+        401,
+        "publishing or yanking (withdrawing) a version requires `Authorization: Bearer <token>`",
+      ),
     Some(presented) -> match config.secret[tokens](token_key(name)) {
       None -> fail(403, "no token may change `" ++ name ++ "` on this registry"),
       Some(stored) -> if stored.verify(presented) { Ok(()) }
@@ -53,10 +46,6 @@ pub fn authorize(
     },
   }
 
-// --- What may be published ----------------------------------------------------------
-
-/// The index entry a publish of `name` at `version` makes, from the body it was sent and the digest
-/// the client says that body seals. The digest is recomputed here and never taken on trust.
 pub fn validate_archive(
   name: String,
   version: Version,
@@ -95,8 +84,6 @@ fn manifest_of(body: Bytes, sections: List<SectionLocation>) -> Option<Bytes> =
       None -> if p.name == b"manifest" { body.slice_at(p.at, p.len) } else { None },
     })
 
-/// The archive's own manifest, held to what the request says it is: the package and version the
-/// path names, a library, and one whose dependencies whoever depends on it can resolve here.
 fn validate_manifest(
   name: String,
   version: Version,
@@ -117,14 +104,17 @@ fn validate_manifest(
           ++ render_version(version),
       )
     } else if m.entry != None {
-      fail(422, "`" ++ name ++ "` names an entry, and only a library is published")
+      fail(
+        422,
+        "`" ++ name ++ "` has an entry point in its manifest, but only libraries can be published",
+      )
     } else {
       match non_registry_dependency(m) {
         Some(d) ->
           fail(
             422,
             "the dependency `" ++ d.name
-              ++ "` is not from the registry, and a published package depends only on it",
+              ++ "` is not from the registry, and a published package can depend only on registry packages",
           ),
         None -> Ok({ version: version, digest: digest, yanked: false, runtime: m.runtime }),
       }
@@ -132,16 +122,11 @@ fn validate_manifest(
   }
 }
 
-// --- What may be stored beside a version -----------------------------------------------
-
-/// A semantics version as a path names it: hex, so it can never climb out of its directory.
 pub fn is_semantics(s: String) -> Bool =
   s.len() > 0 && s.len() <= 64
     && s.chars().fold(true, |ok: Bool, c: Char|
       ok && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
 
-/// An interface for the version `archive` names, under `semantics`: its frame must say both. What
-/// the payload holds is the consumer's to check, by deriving it again from the archive's sources.
 pub fn validate_interface(
   semantics: String,
   archive: String,
@@ -152,22 +137,20 @@ pub fn validate_interface(
     Some(e) -> if e.semantics != Bytes::of_string(semantics) {
       fail(
         422,
-        "the interface was cut under the semantics " ++ String::of_bytes_lossy(e.semantics)
-          ++ ", and was sent as "
+        "the interface was generated for semantics " ++ String::of_bytes_lossy(e.semantics)
+          ++ ", but the upload is for semantics "
           ++ semantics,
       )
     } else if e.archive != Bytes::of_string(archive) {
       fail(
         422,
-        "the interface was cut from " ++ String::of_bytes_lossy(e.archive)
-          ++ ", and the version is "
+        "the interface was generated from the archive " ++ String::of_bytes_lossy(e.archive)
+          ++ ", but the version's archive is "
           ++ archive,
       )
     } else { Ok(()) },
   }
 
-/// An attestation for the version `archive` names, under `semantics`, signed by the registry's
-/// attester. What it says is the attester's; who said it is the signature's.
 pub fn validate_attestation(
   name: String,
   version: Version,
@@ -200,8 +183,6 @@ fn non_registry_dependency(m: Manifest) -> Option<Dependency> =
   m.dependencies.fold(None, |found: Option<Dependency>, d: Dependency|
     match found { Some(_) -> found, None -> match d.source { Registry -> None, _ -> Some(d) } })
 
-// --- Tests ------------------------------------------------------------------
-
 fn status_of<a>(r: Result<a, http::Error>) -> Int = match r { Ok(_) -> 0, Err(e) -> e.status }
 
 fn reason_of<a>(r: Result<a, http::Error>) -> String = match r { Ok(_) -> "", Err(e) -> e.reason }
@@ -209,7 +190,7 @@ fn reason_of<a>(r: Result<a, http::Error>) -> String = match r { Ok(_) -> "", Er
 fn with_auth(value: String) -> Headers =
   http::set_header(http::empty_headers(), "authorization", value)
 
-test "a bearer token is the word after `Bearer`, and nothing else is one" {
+test "a bearer token is the word after `Bearer` in the authorization header, and any other header gives no token" {
   assert_eq(bearer_token(with_auth("Bearer t0k")), Some("t0k"));
   assert_eq(bearer_token(with_auth("Bearer  t0k\t")), Some("t0k"));
   assert_eq(bearer_token(with_auth("Bearer t0k\u{a0}")), Some("t0k\u{a0}"));
@@ -218,7 +199,7 @@ test "a bearer token is the word after `Bearer`, and nothing else is one" {
   assert_eq(bearer_token(http::empty_headers()), None)
 }
 
-test "a token reaches the exact names it is listed under and no other" {
+test "a token authorizes only the exact package names it is listed for, and no others" {
   let status_for = |name: String, headers: Headers|
     handle {
       status_of(authorize(name, headers))
@@ -232,7 +213,7 @@ test "a token reaches the exact names it is listed under and no other" {
   assert_eq(status_for("billing", with_auth("Bearer t0k")), 403)
 }
 
-test "a publish is the library it says it is, sealed by the digest it carries" {
+test "`validate_archive` accepts an archive that contains the named library and matches its digest, and rejects a missing or wrong digest" {
   let body = fake::archive(fake::library("orders", 2));
   match validate_archive(
       "orders",
@@ -306,7 +287,7 @@ test "an archive of another package, another version or a program is rejected" {
     program,
   );
   assert_eq(status_of(entry), 422);
-  assert(reason_of(entry).contains("only a library is published"));
+  assert(reason_of(entry).contains("only libraries can be published"));
   let pathed = fake::archive(
     fake::manifest(
       "orders",
@@ -324,15 +305,15 @@ test "an archive of another package, another version or a program is rejected" {
   assert(reason_of(dependency).contains("`lib` is not from the registry"))
 }
 
-test "an interface is the version's, under the semantics its path names" {
+test "`validate_interface` accepts an interface only when its wrapper names the language-rules hash from the request path and the version's archive digest" {
   let framed = |semantics: Bytes, archive: Bytes|
     enveloped({ semantics: semantics, archive: archive, payload: b"package" });
   assert_eq(status_of(validate_interface("ab12", "b3:77", framed(b"ab12", b"b3:77"))), 0);
   assert_eq(status_of(validate_interface("ab12", "b3:77", b"not framed")), 422);
   let other = validate_interface("ab12", "b3:77", framed(b"cd34", b"b3:77"));
-  assert(reason_of(other).contains("under the semantics cd34"));
+  assert(reason_of(other).contains("generated for semantics cd34"));
   let non_registry_dependency = validate_interface("ab12", "b3:77", framed(b"ab12", b"b3:88"));
-  assert(reason_of(non_registry_dependency).contains("cut from b3:88"));
+  assert(reason_of(non_registry_dependency).contains("generated from the archive b3:88"));
   assert(is_semantics("0123456789abcdef"));
   assert(!is_semantics(".."));
   assert(!is_semantics(""));

@@ -1,7 +1,3 @@
-//! `--tls NAME=CERT,KEY`: what `ply hosts` discloses of the TLS stack and the credentials a run is
-//! given, what moves the binding's digest, how a credential that does not load is rejected, the
-//! protocol two ends agree over it, and the certificate a client presents and `--mtls` requires.
-
 import harness (spawned, PlyProcess)
 import support.harness (RunResult, write_program, write, working_directory, all_output, stdout,
                         stderr, json_of, at, path, nth, str, int, json_text, value_of,
@@ -9,28 +5,15 @@ import support.harness (RunResult, write_program, write, working_directory, all_
 import std.certgen (certgen)
 import std.json (Str, Array)
 
-/// Creates a TLS listener with the credential `api`.
 fn secure() -> String = String::of_bytes_lossy(embed("../programs/tls_cli/secure.ply"))
 
-/// Opens a connection to its own listener and secures it at both ends, as a `STARTTLS` does, the
-/// server's half in a task of its own since each half waits on the other. It ends by a panic
-/// that says which half failed, and why: the client's where both did, since a client that
-/// rejects its server is what the server then fails on.
 fn upgrading() -> String = String::of_bytes_lossy(embed("../programs/tls_cli/upgrading.ply"))
 
-/// Serves two connections with `std.http`'s TLS pool on a listener of its own: one `fetch` asks
-/// over `https`, offering `h2` and `http/1.1`, and one asks offering `http/1.1` alone. It ends by
-/// a panic that says what was spoken where either was not what its client offered first.
 fn alpn_serving() -> String = String::of_bytes_lossy(embed("../programs/tls_cli/alpn_serving.ply"))
 
-/// Serves two `fetch`es of its own with `std.http`'s TLS pool, the first presenting the `--tls`
-/// credential `caller` and the second none, and returns what each request carried: the
-/// certificate's subject, DNS names and fingerprint as `std.x509` reads them, `none`, or `refused`
-/// where the fetch failed.
 fn client_certified() -> String =
   String::of_bytes_lossy(embed("../programs/tls_cli/client_certified.ply"))
 
-/// Generated rather than checked in: a private key in a repository leaks.
 type Credential = { cert: String, key: String }
 
 fn credential(name: String) -> Credential / {WorkingDirectory, certgen.issue, abort.raise} = {
@@ -45,10 +28,9 @@ fn credential(name: String) -> Credential / {WorkingDirectory, certgen.issue, ab
 
 fn tls_flag_value(name: String, c: Credential) -> String = name ++ "=" ++ c.cert ++ "," ++ c.key
 
-/// `ply` as a process in the working directory, which is what holds a real socket and a credential.
 fn child(argv: List<String>) -> RunResult / {PlyProcess, abort.raise} = spawned(argv, [])
 
-test/nondet "the listing discloses the TLS stack and the credential it was given" {
+test/nondet "`ply hosts --tls` prints the TLS library, provider and protocol versions, and the name and fingerprint of the given credential" {
   write_program(secure());
   let r = child(["hosts", ".", "--tls", tls_flag_value("api", credential("api"))]);
   assert(r.code == 0, Some(stderr(r)));
@@ -66,12 +48,11 @@ test/nondet "the listing discloses the TLS stack and the credential it was given
   assert(text.contains("digest: b3:"), Some(text))
 }
 
-test/nondet "an open connection is secured at both ends by a run that holds and trusts the credential" {
+test/nondet "a run given a TLS credential and `--trust` for its certificate completes a TLS connection, and without `--trust` the client rejects the certificate" {
   write_program(upgrading());
   let api = credential("api");
   let r = child(["run", ".", "--tls", tls_flag_value("api", api), "--trust", api.cert]);
   assert(r.code == 0, Some(all_output(r)));
-  // The same run without the certificate trusted: the client's half rejects it, typed.
   let untrusted = child(["run", ".", "--tls", tls_flag_value("api", api)]);
   assert(untrusted.code != 0, Some(all_output(untrusted)));
   assert(
@@ -89,7 +70,7 @@ test/nondet "a std.http server and client agree h2 over TLS, and a client offeri
   assert(r.code == 0, Some(all_output(r)))
 }
 
-test/nondet "a request over a --tls listener carries the certificate its client presented, one presenting none carries none, and --mtls rejects that one" {
+test/nondet "a request over a `--tls` listener includes the client's certificate when the client sent one, and `--mtls` rejects a request that has no client certificate" {
   write_program(client_certified());
   let api = credential("api");
   let caller = credential("caller");
@@ -124,18 +105,16 @@ test/nondet "a request over a --tls listener carries the certificate its client 
 fn digest(args: List<String>) -> String / {PlyProcess, abort.raise} =
   stdout(child(args.fold(["hosts", ".", "--digest"], List::push))).trim()
 
-test/nondet "the digest is stable across a rotation and moves when a credential is added" {
+test/nondet "the `ply hosts` digest stays the same when a credential's certificate is replaced, and changes when a credential is added or removed" {
   write_program(secure());
   let api = credential("api");
   let one = ["--tls", tls_flag_value("api", api)];
   let before = digest(one);
   assert(before.starts_with("b3:"), Some(before));
-  // The same credential name, a different certificate: an operational fact.
   assert(
     before == digest(["--tls", tls_flag_value("api", credential("rotated"))]),
     Some("a renewed certificate must not move the digest"),
   );
-  // A second credential: a structural change to what the run can serve.
   assert(
     before
       != digest([
@@ -149,7 +128,7 @@ test/nondet "the digest is stable across a rotation and moves when a credential 
   assert(before != digest([]), Some("removing one must move it"))
 }
 
-test/nondet "the JSON object carries the transport and the full fingerprint" {
+test/nondet "`ply hosts --json` reports the TLS library, provider, ALPN protocols and each credential's name and full SHA-256 fingerprint" {
   write_program(secure());
   let report = json_of(
     child(["hosts", ".", "--json", "--tls", tls_flag_value("api", credential("api"))]),
@@ -180,13 +159,12 @@ test/nondet "a credential that does not load is E0430 naming the file" {
     assert(r.code == 2, Some(all_output(r)));
     assert(all_output(r).contains("E0430"), Some(all_output(r)))
   });
-  // A key that is not the leaf's needs both files to catch, and is the one a deploy gets wrong.
   let other = credential("other");
   let r = child(["run", ".", "--tls", tls_flag_value("api", { cert: api.cert, key: other.key })]);
   assert(all_output(r).contains("E0430"), Some(all_output(r)))
 }
 
-test/nondet "a run given no credential holds none, and says which it lacks" {
+test/nondet "a run given no TLS credential fails with E0429 naming the credential it is missing" {
   write_program(secure());
   let r = child(["run", "."]);
   assert(r.code != 0, Some(all_output(r)));

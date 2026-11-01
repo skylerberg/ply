@@ -1,17 +1,10 @@
-//! The natives over machine data that strings and byte strings emitted code lays out reach the
-//! runtime through: each takes the bytes it reads as an address and a count, borrowed for the call,
-//! and returns raw integers, a `Float`'s bits, a runtime object, or bytes left as the context's
-//! taken bytes, which emitted code copies out into a block of its own. None reads or makes a string,
-//! a byte string or a list. What each returns is what the value builtin of the same name returns.
-
-use crate::c::{MachineNative, machine_native};
+use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, F64, I64};
 use crate::rt::{Ctx, borrowed};
 use ply_core::{Diagnostic, Span, codes};
 
-/// Every native here, under the name the compiler declares it by.
 pub fn natives() -> Vec<MachineNative> {
-    vec![machine_native(
+    vec![runtime_native(
         "?blake3",
         rt_blake3 as unsafe extern "C" fn(_, _, _) -> _,
     )]
@@ -20,8 +13,6 @@ pub fn natives() -> Vec<MachineNative> {
     .collect()
 }
 
-/// Each `Float` function as compiled code calls it: its operands' bits in, its result's out,
-/// computed as the value builtin of the same name computes it.
 macro_rules! float_functions {
     ($($name:literal => $f:ident = $($math:ident)::+ ($($a:ident),+);)+) => {
         $(unsafe extern "C" fn $f(_ctx: *mut Ctx, $($a: F64),+) -> F64 {
@@ -29,7 +20,7 @@ macro_rules! float_functions {
         })+
 
         fn float_natives() -> Vec<MachineNative> {
-            vec![$(machine_native($name, $f as unsafe extern "C" fn(*mut Ctx, $(float_functions!(@f64 $a)),+) -> F64)),+]
+            vec![$(runtime_native($name, $f as unsafe extern "C" fn(*mut Ctx, $(float_functions!(@f64 $a)),+) -> F64)),+]
         }
     };
     (@f64 $a:ident) => { F64 };
@@ -63,7 +54,6 @@ fn err_machine(reason: &str) -> Diagnostic {
 }
 
 impl Ctx {
-    /// The UTF-8 of a string, borrowed, which emitted code only ever makes valid.
     pub(crate) fn text<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a str> {
         match std::str::from_utf8(bytes) {
             Ok(s) => Some(s),
@@ -75,7 +65,6 @@ impl Ctx {
     }
 }
 
-/// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { borrowed(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())

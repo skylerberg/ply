@@ -1,25 +1,28 @@
-//! Running a compiled unit: the capability granted to a program that runs other programs, as the
-//! privileged family `machine` (`--allow machine`).
+//! Runs a compiled unit, which is a program compiled to a native library. Running other programs
+//! requires the `machine` capability, which a program is granted with `--allow machine`.
 //!
-//! `open` loads a unit from the library its C was compiled into. `bind` creates a binding of the
-//! host families the runtime handles itself, from only what the run was granted. `enter` runs one
-//! root (an entry point) of the unit on a context of its own on the calling thread. Its arguments
-//! are the PLV1 list of values its entry reads (`std.value.encode`), and its result is the PLV1 its
-//! root wrote, unchanged. No front end is marshalled: the caller decides which root to enter and
-//! what its arguments are, and interprets its result or failure. A failure reports locations as
-//! sites: a root's name and offsets from the start of its definition. A caller that has the
-//! program's front end maps them to source.
+//! `open` loads a unit from a native library. `bind` sets up the host effects that the runtime
+//! implements itself (such as files, processes and credentials) for one run, using only what the
+//! run was granted, and returns a binding, which is an integer handle to that setup. `enter` runs
+//! one root, an entry point of the unit, on the calling thread. Its arguments are a list of values
+//! encoded with `std.value.encode`. Its result is the encoded value the root wrote, returned as it
+//! was written. The caller chooses which root to enter and what arguments to pass, and interprets
+//! the result or failure. A failure names a location as a root's name plus an offset from the start
+//! of that root's definition. A caller that has the program's source can map that location to a
+//! source position.
 //!
-//! `hermetic_machine` provides the same operations using only what they are given. No host is
-//! bound, no clock limits or measures an entry, and `changed_read` never reports a change, so a
-//! test that drives a program through it is deterministic and is cached. It needs no grant.
+//! `hermetic_machine` provides the same operations using only what they are given. It binds no host
+//! effects, it applies no time limit, it does not measure how long an entry takes, and
+//! `changed_read` never reports a change. A test that runs a program through it is therefore
+//! deterministic and its result can be cached. It needs no grant.
 
 import std.bin
 import std.internal.trail as trail
 import std.value
 import std.value (Value)
 
-/// The capability.
+/// Runs compiled units: loads them, binds the host features a program was granted, and runs their
+/// roots.
 pub nondet effect machine {
   /// Loads the unit compiled into the library at `library`, or returns why it did not load, such
   /// as a library built against another runtime.
@@ -28,8 +31,9 @@ pub nondet effect machine {
   /// why it could not: a file root that is not a directory (`E0454`), a program that cannot be
   /// started (`E0457`), or a credential that does not load (`E0430`).
   write bind(grants: Grants) -> Result<Int, List<Failure>>
-  /// Runs `root` of the unit `unit` on a context of its own, within the limits `run` sets.
-  /// `arguments` is the PLV1 list its entry reads.
+  /// Runs `root` of the unit `unit` on the calling thread, separately from any other entry, within
+  /// the limits in `run`. `arguments` is a list of values encoded with `std.value.encode`, which
+  /// the root reads.
   read enter(unit: Int, root: String, arguments: Bytes, run: Run) -> Outcome
   /// Prints `line` for the person watching the run, on standard error if `to_stderr` is true and
   /// otherwise on standard output. It is a `read` so that `parallel` branches can report as they
@@ -38,30 +42,39 @@ pub nondet effect machine {
   /// Describes, for a person, the first read in `trace` that no longer returns what it did under
   /// `grants`, or `None` if no read changed.
   read changed_read(grants: Grants, trace: Bytes) -> Option<String>
-  /// The facts that a run granted `grants` prints in its disclosures.
+  /// Returns the facts about the host effects that the runtime implements itself, for a run granted
+  /// `grants`. They are why a credential or file directory was rejected, the TLS settings and
+  /// credentials the run's connections use, the file directories the run may access, and where log
+  /// output goes. A run prints these when it starts.
   read hosting(grants: Grants) -> Hosting
-  /// Tears down the binding, ends its child processes and flushes its sink, and returns what its
-  /// facilities report.
+  /// Closes the binding: ends its child processes and writes out any buffered output. Returns a
+  /// `Report` from each host feature, covering what happened during the run.
   write unbind(binding: Int) -> List<Report>
-  /// Releases the unit. An entry still running keeps it loaded until the entry ends.
+  /// Releases the unit. If an entry is still running, the unit stays loaded until that entry ends.
   write close(unit: Int) -> Unit
 }
 
-/// `machine`, handled using only what each operation is given.
+/// Has the same operations as `machine`, but each handler uses only the arguments its operation is
+/// given, never any state outside them.
 pub effect hermetic_machine {
-  /// As `machine.open`.
+  /// Loads the unit compiled into the library at `library`, or returns why it did not load.
   write open(library: String) -> Result<LoadedUnit, String>
-  /// As `machine.bind`.
+  /// Sets up the host effects that the runtime implements itself (such as files and processes) from
+  /// `grants`, and returns the binding, or the reasons it could not.
   write bind(grants: Grants) -> Result<Int, List<Failure>>
-  /// As `machine.enter`.
+  /// Runs `root` of unit `unit` within the limits `run` sets, and returns how the run ended.
   read enter(unit: Int, root: String, arguments: Bytes, run: Run) -> Outcome
-  /// As `machine.changed_read`.
+  /// Returns a description of the first read in `trace` whose result differs under `grants`, or
+  /// `None` if no read changed.
   read changed_read(grants: Grants, trace: Bytes) -> Option<String>
-  /// As `machine.hosting`.
+  /// Returns the facts about the host effects that the runtime implements itself (files, TLS, log
+  /// output and so on) for a run given `grants`. A run prints these when it starts.
   read hosting(grants: Grants) -> Hosting
-  /// As `machine.unbind`.
+  /// Tears down the binding `binding`, ends its child processes, writes out any log records still
+  /// buffered, and returns one `Report` from each part of the runtime that has something to say
+  /// about the run.
   write unbind(binding: Int) -> List<Report>
-  /// As `machine.close`.
+  /// Releases the unit `unit`. A run still using it keeps it loaded until the run ends.
   write close(unit: Int) -> Unit
 }
 
@@ -72,36 +85,41 @@ pub type LoadedUnit = { unit: Int, root_count: Int, nanos: Int, threads: Int }
 /// A file root or a program granted to a run, with the name the program's operations use for it.
 pub type NamedPath = { name: String, path: String }
 
-/// What a run is granted. A binding binds every family the runtime handles itself, limited by
-/// `fs`, `exec`, `allow`, `argv`, `stderr` and `spawning`. `given` contains, by name, what the
-/// handlers of other families read.
+/// What a run is allowed to use. The runtime implements some effects itself, such as the file
+/// system and processes. `fs`, `exec`, `allow`, `argv`, `stderr` and `spawning` limit those
+/// effects. `given` supplies named values that the handlers for all other effects read.
 pub type Grants = {
   fs: List<NamedPath>,
   exec: List<NamedPath>,
-  /// The privileged families granted: `machine`, `shipped`, `toolchain`.
+  /// The names of the runtime's restricted families that the run may use. A family is restricted
+  /// when it is unavailable unless listed here. The possible names are `machine`, `shipped` and
+  /// `toolchain`.
   allow: List<String>,
   /// The command line `process.args` returns, or `None` for a run that is not a process, such as
   /// a test.
   argv: Option<List<String>>,
-  /// The process writes its own lines to stderr, because `--json` reserves stdout for its one
-  /// document.
+  /// Whether the program writes its own lines to stderr. It is `true` for a process that prints its
+  /// own messages, because `--json` reserves stdout for its single JSON document.
   stderr: Bool,
-  /// Of `process`, only the operations that start a program `exec` names are bound, as for a
-  /// test.
+  /// Whether `process` may start programs. When `false`, as for a test, a run can start only the
+  /// programs named in `exec`.
   spawning: Bool,
   given: List<GrantEntry>,
 }
 
-/// An entry another family's handler reads.
+/// A named group of values that the handlers of other effects read, with the names of its fields.
 pub type GrantEntry = { name: String, fields: List<String> }
 
-/// Grants that grant nothing.
+/// Returns `Grants` with every list empty, no command line and both flags `false`, so the run may
+/// use nothing.
 pub fn no_grants() -> Grants =
   { fs: [], exec: [], allow: [], argv: None, stderr: false, spawning: false, given: [] }
 
-/// The limits an entry runs under, and what it runs with.
+/// The limits and settings for one run of a root: its time limit, schedule, recording options and
+/// kind.
 pub type Run = {
-  /// The binding the entry is observed under, and handled by when `hosted`, or 0 for none.
+  /// The binding the run uses, as returned by `bind`, or 0 for none. When `hosted` is `true`, that
+  /// binding's handlers handle the run's operations.
   binding: Int,
   hosted: Bool,
   /// The wall-clock milliseconds it may take, where 0 means no limit. Past it, the entry fails
@@ -109,26 +127,27 @@ pub type Run = {
   timeout_ms: Int,
   /// The schedule its `simulate` blocks follow.
   seed: Option<Seed>,
-  /// Whether this is one of several runs of one test that a search makes. If so, reaching the
-  /// host fails.
+  /// Whether this run is one of several runs of the same test made by a search. When `true`, any
+  /// operation that needs the real host fails.
   re_executed: Bool,
   /// Whether to record what it read, in its outcome's trace.
   observe: Bool,
   /// Whether to read the wall clock to measure how long it took.
   measure: Bool,
-  /// Whether the entry is a test's. A test's usage counts every operation it performs, including
-  /// those its own handlers handle, and the objects it leaves live. Any other entry counts only
-  /// the operations that the runtime's own handlers handle.
+  /// Whether the run is a test. A test's `Usage` counts every operation it performs, including
+  /// those its own handlers handle, and the objects still live when it ends. Any other run counts
+  /// only the operations the runtime's own handlers handle.
   tested: Bool,
   /// The name to report for the entry if it runs for a long time, or empty for none.
   label: String,
 }
 
-/// A seed's root value, the choices made before its random stream takes over, and how many
-/// scheduling points an interleaving may take.
+/// Selects one schedule for a run. `root` seeds the random choices, `path` lists choices to replay
+/// first, and `steps` is the most scheduling points the run may take.
 pub type Seed = { root: U64, path: List<Int>, steps: Int }
 
-/// A run with no limits.
+/// Returns a `Run` with no time limit and no schedule, and with recording, measuring and test
+/// counting turned off.
 pub fn unbounded() -> Run =
   {
     binding: 0,
@@ -142,8 +161,9 @@ pub fn unbounded() -> Run =
     label: "",
   }
 
-/// How an entry ended, the code passed to `process.exit`, what it used, the warnings its host
-/// runtime reported as it ended, what its `simulate` blocks did, and what it read.
+/// The result of running a root: how it ended, the code passed to `process.exit` if any, the
+/// resources it used, warnings from the runtime as it ended, the schedule its `simulate` blocks
+/// followed, and a trace of what it read.
 pub type Outcome = {
   ended: Termination,
   exit: Option<Int>,
@@ -155,21 +175,23 @@ pub type Outcome = {
 
 /// How an entry ended.
 pub type Termination =
-  /// The root's result, as the PLV1 its entry wrote.
+  /// The root returned normally. The bytes are its result encoded in the PLV1 value format.
   | Returned(Bytes)
-  /// An unhandled raise, a runtime error, a timeout, or a result the boundary rejects.
+  /// An unhandled raise, a runtime error, a timeout, or a result that cannot be encoded as a value.
   | Failed(Failure)
   /// The runtime itself failed, which is a bug in Ply, with its message.
   | Panicked(String)
   /// The unit has no such root.
   | NoRoot
-  /// The result contains a value that only its own run can have, with the reason.
+  /// The result contains a value that cannot be encoded, such as one tied to this run. The string
+  /// says which value and why.
   | UnencodableResult(String)
 
 /// `nanos` is 0 for a run not measured.
 pub type Usage = {
   nanos: Int,
-  /// Whether it reached a nondeterministic host handler.
+  /// Whether the run used a nondeterministic host handler, one whose results can differ between
+  /// runs.
   host: Bool,
   performs: Int,
   native_objects: Int,
@@ -184,8 +206,8 @@ pub type Usage = {
   live: Int,
 }
 
-/// A runtime diagnostic. `values` contains each value its text refers to, as the PLV1 bytes
-/// `value_of` reads.
+/// A diagnostic from the runtime. `values` contains each value the message refers to, encoded in
+/// the PLV1 value format that `value_of` decodes.
 pub type Failure = {
   code: String,
   severity: Severity,
@@ -208,9 +230,11 @@ pub type Site = { root: String, start: Int, end: Int }
 /// What a run's `simulate` blocks did: each scheduling point, and the virtual time spent.
 pub type Interleaving = { steps: List<Step>, virtual_time: Int }
 
-/// One scheduling point: the scheduler and the task it resumed, every task it could have resumed in
-/// the order `choice` indexes, what the step after it touched and where, and the task's vector
-/// clock.
+/// One scheduling point, where the scheduler picks which task runs next. `scheduler` identifies the
+/// scheduler. `task` is the task it resumed, `enabled` lists the tasks it could have resumed, and
+/// `choice` is the index in `enabled` that it picked. `accesses` lists what the step after this
+/// point read or wrote. `definition` is the name of the function the step was in, and `site` is the
+/// position in it, when known. `stamp` is the task's vector clock.
 pub type Step = {
   scheduler: Int,
   task: Int,
@@ -222,19 +246,22 @@ pub type Step = {
   stamp: List<Int>,
 }
 
-/// What a step touched: an effect's effect, a handler's variable (its `handle` and its index
-/// there), or a scoped value, each either written or only read.
+/// One thing a step read or wrote, with `write` telling which. It is an operation or resource of an
+/// effect, a variable of a handler (identified by the handler's number and the variable's index),
+/// or a scoped value.
 pub type Access =
-  | EffectAccess({ effect: String, resource: Option<String>, write: Bool, op: Option<String> })
+  | EffectAccess({ effect: String, resource: Option<String>, write: Bool, operation: Option<String> })
   | VariableAccess({ handler: Int, index: Int, write: Bool })
   | ScopedAccess({ id: Int, write: Bool })
 
-/// What a facility reports about a run after teardown, by name: `teardown` lists the spans left
-/// open, `handshakes` the lines a run prints about its TLS, `stopping` how a stop went, and
-/// `trace` what the sink received.
+/// What one part of the runtime reports about a run after the binding is torn down. `name` says
+/// which part, and `body` is its content. `teardown` lists the tracing spans that were still open,
+/// `handshakes` lists the lines printed about TLS, `stopping` describes how the run was stopped,
+/// and `trace` contains the log records the log destination received.
 pub type Report = { name: String, body: Bytes }
 
-/// The facts a run's disclosures print about the families the runtime handles itself.
+/// The facts about the host effects that the runtime implements itself, such as TLS, file
+/// directories, log output and signals. A run prints them when it starts.
 pub type Hosting = {
   /// Why a credential or a file root granted to the run does not load.
   rejections: List<Failure>,
@@ -260,8 +287,8 @@ pub type Transport = {
   credentials: List<Credential>,
 }
 
-/// A credential the transport presents: its name, its certificate's fingerprint and how many
-/// certificates its chain holds.
+/// A credential that the run's TLS connections present: its name, the fingerprint of its
+/// certificate, and the number of certificates in its chain.
 pub type Credential = { name: String, fingerprint: String, certificates: Int }
 
 /// `level` is `None` when the records are discarded.
@@ -287,8 +314,6 @@ derive bin for Credential
 derive bin for Transport
 derive bin for Sink
 derive bin for Hosting
-
-// --- The host handlers ---------------------------------------------------------------
 
 host for machine by served
 
@@ -320,13 +345,10 @@ pub fn served_hermetically<a | e>(
     go()
   } with {
     hermetic_machine.open(library) -> loaded_unit_of(unit_open(library)),
-    // No host is bound, so the binding is 0: an entry under it reaches only its own handlers.
     hermetic_machine.bind(grants) -> match hermetic_failure(grants) {
       Some(rejected) -> Err([rejected]),
       None -> Ok(0),
     },
-    // With no host bound, the entry reads nothing outside its inputs, so an observed entry's pass
-    // depends only on them, which an empty trace reports.
     hermetic_machine.enter(unit, root, arguments, run) -> {
       let outcome: Outcome = read(
         unit_enter(
@@ -352,39 +374,36 @@ pub fn served_hermetically<a | e>(
     hermetic_machine.close(unit) -> unit_close(unit),
   }
 
-/// `grants` as a run with no host takes them, without a command line.
 fn without_argv(grants: Grants) -> Grants = { ..grants, argv: None }
 
-/// The error for a hermetic run granted something it would read from disk or start: a file root,
-/// a program or a credential.
 fn hermetic_failure(grants: Grants) -> Option<Failure> =
   if grants.fs.len() == 0 && grants.exec.len() == 0
       && !grants.given.any(|g: GrantEntry| g.name == "tls" || g.name == "trust") { None } else {
     Some({
       code: "E0459",
       severity: Error,
-      message: "`hermetic_machine` binds no host, and the run is lent a root, a program or a credential",
+      message: "`hermetic_machine` does not touch the real computer, so the run cannot be given a directory to read, a program to start or a credential",
       labels: [],
       notes: [
-        "a program that drives a run reaching the host performs `machine`, and its test is `test/nondet`",
+        "a test that reads real files, starts real programs or uses credentials needs the real computer; put it under `test/nondet`",
       ],
       values: [],
     })
   }
 
-// --- What a failure shows ------------------------------------------------------------
-
-/// Decodes a value a failure refers to from the PLV1 the runtime wrote, as `value::decode_shown`
-/// does. Bytes that do not decode are a bug in the runtime.
+/// Decodes a value that a failure shows, from the bytes in the PLV1 value format that the runtime
+/// wrote, as `value::decode_shown` does. Panics if the bytes do not decode, which is a bug in the
+/// runtime.
 pub fn value_of(bytes: Bytes) -> Value / {abort.raise} =
   match value::decode_shown(bytes) {
     Some(v) -> v,
-    None -> panic("a value the runtime wrote does not read"),
+    None -> panic("the runtime wrote a value that cannot be decoded"),
   }
 
-/// What a failure shows: its notes, and each value its text refers to, decoded by `value_of`. An
-/// assertion failure (`E0501`) refers to the expected value and then the actual one. For it, a
-/// note after its own says where the two first differ, with the values that note refers to.
+/// Returns the notes of `f` and the decoded values that the failure's message refers to. An
+/// assertion failure (`E0501`) has two values, the expected one and the actual one. For it, the
+/// result adds a note saying where the two values first differ, along with the values that note
+/// refers to.
 pub fn failure_details(f: Failure) -> { notes: List<String>, values: List<Value> } / {abort.raise} = {
   let values = f.values.map(value_of);
   let parted = if f.code != "E0501" { None } else {
@@ -399,9 +418,6 @@ pub fn failure_details(f: Failure) -> { notes: List<String>, values: List<Value>
   }
 }
 
-// --- Marshalling to the runtime -----------------------------------------------------
-
-/// Encodes `grants` as the runtime reads them: each entry by name with its fields.
 fn encode_grants(grants: Grants) -> Bytes / {abort.raise} =
   bin::encode(entries_of(grants), grant_entries_bin())
 
@@ -416,7 +432,7 @@ fn entries_of(grants: Grants) -> List<GrantEntry> = {
     if grants.stderr { [{ name: "stderr", fields: [] }] } else { [] },
     if grants.spawning { [{ name: "spawning", fields: [] }] } else { [] },
     grants.given,
-  ].fold([], |acc: List<GrantEntry>, part: List<GrantEntry>| acc.concat(part))
+  ].fold([], |accumulator: List<GrantEntry>, part: List<GrantEntry>| accumulator.concat(part))
 }
 
 fn grant_entries_bin() -> bin::BinCodec<List<GrantEntry>> = bin::list_bin(grant_entry_bin())
@@ -432,12 +448,10 @@ fn bound_of(bytes: Bytes) -> Result<Int, List<Failure>> / {abort.raise} =
 fn changed_read_of(bytes: Bytes) -> Option<String> / {abort.raise} =
   read(bytes, bin::option_bin(bin::string_bin()))
 
-/// Decodes what the runtime wrote. The runtime always writes a whole value, so bytes that do not
-/// decode are a bug in Ply.
 fn read<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {abort.raise} =
   match bin::decode(bytes, codec) {
     Ok(x) -> x,
-    Err(e) -> panic("the runtime's result does not read: " ++ bin::error_to_string(e)),
+    Err(e) -> panic("the runtime's result cannot be decoded: " ++ bin::error_to_string(e)),
   }
 
 extern fn unit_open(library: String) -> Bytes
@@ -449,9 +463,6 @@ extern fn unit_unbind(binding: Int) -> Bytes
 extern fn unit_close(unit: Int) -> Unit
 extern fn unit_report(line: String, to_stderr: Bool) -> Unit
 
-// --- Tests ------------------------------------------------------------------------
-
-/// A failure with `code` that shows the encoded `values`.
 fn failure_with_values(code: String, values: List<Value>) -> Failure =
   {
     code: code,
@@ -462,7 +473,7 @@ fn failure_with_values(code: String, values: List<Value>) -> Failure =
     values: values.map(|v: Value| match value::encode(v) { Some(b) -> b, None -> b"" }),
   }
 
-test "a value a failure refers to decodes as the runtime wrote it, with each handle as its kind" {
+test "`value_of` decodes the bytes the runtime wrote for a failure's value, including constructors and the placeholders for secret and scoped values" {
   assert_eq(value_of(b"PLV1\x0c\x00\x04Some\x01\x03\x54"), value::VCtor("Some", [value::VInt(42)]));
   assert_eq(value_of(b"PLV1\x09\x02\x0f\x00\x0f\x01"), value::VList([value::VSecret, value::VHold]))
 }
@@ -482,7 +493,7 @@ test "an assertion's failure notes where its values first differ, and no other f
   )
 }
 
-test "grants are written as the runtime reads them, each entry by name with its fields" {
+test "`entries_of` turns grants into named entries that each hold a list of strings, and `encode_grants` writes bytes that decode to those entries" {
   assert_eq(entries_of(no_grants()), []);
   assert_eq(
     entries_of({
@@ -505,7 +516,7 @@ test "grants are written as the runtime reads them, each entry by name with its 
   )
 }
 
-test "an outcome decodes as the runtime writes it" {
+test "a run result's bytes decode into how the run ended, its exit code, usage counts and warnings, with no scheduling steps" {
   let bytes = Bytes::concat_all([
     b"\x00\x02ok",
     b"\x01\x0e",
@@ -532,7 +543,7 @@ test "an outcome decodes as the runtime writes it" {
   assert_eq(o.interleaving, None)
 }
 
-test "an interleaving that a simulation's trail writes decodes as an outcome's" {
+test "scheduling steps recorded by a simulation, once encoded, decode into the step records a run result contains" {
   let step = {
     scheduler: 0,
     task: 1,
@@ -560,7 +571,12 @@ test "an interleaving that a simulation's trail writes decodes as an outcome's" 
           enabled: [0, 1],
           choice: 1,
           accesses: [
-            EffectAccess({ effect: "task.chan", resource: Some("#0"), write: true, op: None }),
+            EffectAccess({
+              effect: "task.chan",
+              resource: Some("#0"),
+              write: true,
+              operation: None,
+            }),
             ScopedAccess({ id: 2, write: false }),
           ],
           definition: Some("f"),
@@ -575,12 +591,10 @@ test "an interleaving that a simulation's trail writes decodes as an outcome's" 
 
 test "a run is written field by field in the order the runtime reads it" {
   let encode_grants = bin::encode({ ..unbounded(), binding: 3, hosted: true }, run_bin());
-  // binding 3, hosted, no timeout, no seed, not re-executed, no trace, not measured, not tested,
-  // no label.
   assert_eq(encode_grants, b"\x06\x01\x00\x00\x00\x00\x00\x00\x00")
 }
 
-test "the hermetic machine rejects grants it would read from disk or start" {
+test "`hermetic_failure` returns a failure for permissions that read files, run programs or pass credentials, and none for no permissions" {
   assert_eq(hermetic_failure(no_grants()), None);
   assert(hermetic_failure({ ..no_grants(), fs: [{ name: "cwd", path: "." }] }) != None);
   assert(

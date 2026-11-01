@@ -11,8 +11,6 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The one generator the evaluator names, once: `ring`'s RSA signing takes one for a PSS salt, and
-/// it is handed this one, which returns the salt the evaluator made of the key and the message.
 const FIXED_GENERATOR: (&str, &str) = ("crypto.rs", "use ring::test::rand::FixedSliceRandom;");
 
 #[test]
@@ -59,9 +57,8 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
     }
 }
 
-/// A generator crate would put the host's entropy, and its own version, inside a seed's meaning.
 #[test]
-fn the_crate_depends_on_no_generator_and_no_entropy_source() {
+fn the_crate_depends_on_no_random_number_generator_and_no_entropy_source() {
     let manifest = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-core/Cargo.toml"),
     )

@@ -1,8 +1,8 @@
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (LiteralUnit)
 import compiler.check.types (Type, NamedType, FunctionType, RecordType, int_type, bool_type,
-                             string_type, bytes_type, option_type, list_type, fn_type, monomorphic,
-                             no_effects, secret_type, decimal_type)
+                             string_type, bytes_type, option_type, list_type, function_type,
+                             monomorphic, no_effects, secret_type, decimal_type)
 import compiler.check.known (char_type, width_type, some_constructor, none_constructor)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.code (Code, NDefinition, CodeLet)
@@ -14,13 +14,14 @@ import compiler.emit.keys (name_in_module, Root, ContainerWalk, root_name, root_
 import compiler.emit.representations (Definition, EmitParam, SumConstructor, kind_of)
 import compiler.emit.roots (builtin_helper)
 import compiler.emit.typed_ir (reps_of, Representation, AsInt, AsBool, AsFixed, AsDecimal, AsWord,
-                               AsSum, AsImmediate, Var, Arg, VarOperand, IntOperand, ZeroOperand,
-                               Primitive, Get, Path, CasePath, Native, Op, OfContainers, OfStrings,
-                               Allocate, ListAllocation, Call, If, Case, TagTest, string_signature,
-                               operand_representation, AsFlattened, Aggregate)
+                               AsSum, AsImmediate, Variable, Arg, VariableOperand, IntOperand,
+                               ZeroOperand, Primitive, Get, Path, CasePath, Native, OperationCall,
+                               OfContainers, OfStrings, Allocate, ListAllocation, Call, If, Case,
+                               TagTest, string_signature, operand_representation, AsFlattened,
+                               Aggregate)
 import compiler.emit.typed_ir.containers (Length, NodeIntrinsic)
 import compiler.emit.layout (Recast, rejection, rejections, range_limit)
-import compiler.emit.typed_ir.strings (StringOp, AllocateBytes, CopyBytes, ByteSet, ByteRead,
+import compiler.emit.typed_ir.strings (StringOperation, AllocateBytes, CopyBytes, ByteSet, ByteRead,
                                        U32Read, BytesEqual, FindBytes, CharCount, CharStart,
                                        ScanBytes)
 import compiler.emit.lower.module_context (constructor_sum)
@@ -92,7 +93,9 @@ pub fn string_builtin_call(
   let c = { context: context, name: name, at: at };
   let named = if name.starts_with(b"String::") { string_type() } else { bytes_type() };
   let ty = match callee.ty {
-    FunctionType(f) -> if f.ret == string_type() || f.ret == bytes_type() { f.ret } else { named },
+    FunctionType(f) -> if f.return_type == string_type() || f.return_type == bytes_type() {
+      f.return_type
+    } else { named },
     _ -> named,
   };
   if secret_operation(name) { secret_basic_call(c, st, args) }
@@ -118,15 +121,18 @@ pub fn string_builtin_call(
       else if name == b"String::split" || name == b"Bytes::split" { split(c, st, a, b, ty) }
       else if name == b"assert" { asserted(c, st, a, b) }
       else if name == b"Decimal::of_bits" { decimal_of_bits(c, st, a, b) }
-      else { unreachable(b"a string's builtin on two operands: ".concat(name)) },
+      else { unreachable(b"unknown string builtin taking two arguments: ".concat(name)) },
       [a, b, x] -> if name == b"Bytes::slice" { byte_slice(c, st, a, b, x, ty) }
       else if name == b"String::slice" { char_slice(c, st, a, b, x) }
       else if name == b"Bytes::index_of_from" { index_of(c, st, a, b, x) }
-      else { unreachable(b"a string's builtin on three operands: ".concat(name)) },
+      else { unreachable(b"unknown string builtin taking three arguments: ".concat(name)) },
       [h, from, class, budget] ->
         scanned(c, st, h, from, class, budget, name == b"Bytes::scan_until"),
       [a] -> unary_builtin(c, st, a),
-      _ -> unreachable(b"a string's builtin on other operands: ".concat(name)),
+      _ ->
+        unreachable(
+          b"unknown string builtin taking an unsupported number of arguments: ".concat(name),
+        ),
     }
   }
 }
@@ -145,7 +151,7 @@ fn unary_builtin(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abort.
       x.st,
       int_type(),
       AsInt,
-      Primitive({ op: b"scalar_value", on: AsInt, args: [x.arg] }),
+      Primitive({ operation: b"scalar_value", on: AsInt, args: [x.arg] }),
       at,
     );
     option_if_nonnegative(
@@ -157,7 +163,7 @@ fn unary_builtin(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abort.
           s,
           char_type(),
           AsImmediate,
-          Primitive({ op: b"char_of", on: AsInt, args: [k.arg] }),
+          Primitive({ operation: b"char_of", on: AsInt, args: [k.arg] }),
           at,
         ),
       at,
@@ -168,18 +174,18 @@ fn unary_builtin(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abort.
       x.st,
       int_type(),
       AsInt,
-      Primitive({ op: b"char_code", on: AsImmediate, args: [x.arg] }),
+      Primitive({ operation: b"char_code", on: AsImmediate, args: [x.arg] }),
       at,
     )
   } else if n == b"String::of_chars" {
-    let e = strings_op(st, string_type(), AsWord, AllocateBytes, [IntOperand(0)], at);
+    let e = bound_string_operation(st, string_type(), AsWord, AllocateBytes, [IntOperand(0)], at);
     generated_string_call(c, e.st, b"of_chars_from", list_type(char_type()), [
       a,
       IntOperand(0),
       e.arg,
     ])
   } else if n == b"Bytes::concat_all" {
-    let e = strings_op(st, bytes_type(), AsWord, AllocateBytes, [IntOperand(0)], at);
+    let e = bound_string_operation(st, bytes_type(), AsWord, AllocateBytes, [IntOperand(0)], at);
     generated_string_call(c, e.st, b"concat_all_from", list_type(bytes_type()), [
       a,
       IntOperand(0),
@@ -187,7 +193,7 @@ fn unary_builtin(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abort.
     ])
   } else if n == b"String::len" {
     let t = bytes_address(st, a, at);
-    int_op(t.st, CharCount, [t.address, t.count], at)
+    int_operation(t.st, CharCount, [t.address, t.count], at)
   } else if n == b"Bytes::blake3" { blake3_of(st, a, at) }
   else { unary_conversion(c, st, a) }
 }
@@ -243,7 +249,7 @@ fn unary_conversion(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abo
       represented_as(unary_builtin, representation_of(c.context.setting, bytes_type()), at),
       |r: Lowering| raise_rejection(c, r, [i.arg]),
     )
-  } else { unreachable(b"a string's builtin on one operand: ".concat(n)) }
+  } else { unreachable(b"unknown string builtin taking one argument: ".concat(n)) }
 }
 
 fn range_builtin(c: BuiltinCall, st: Lowering, lo: Arg, hi: Arg) -> LoweredValue / {abort.raise} =
@@ -298,34 +304,34 @@ fn empty_list(c: BuiltinCall, st: Lowering, item: Type) -> LoweredValue = {
 fn generated_string_call(
   c: BuiltinCall,
   st: Lowering,
-  op: Bytes,
+  operation: Bytes,
   t: Type,
   args: List<Arg>,
 ) -> LoweredValue = {
-  let typed = string_root_signature(op, t);
+  let typed = string_root_signature(operation, t);
   let conv = typed_convention(
     c.context.setting.constructors,
     typed.params.map(|p: { name: Bytes, ty: Type }| p.ty),
-    typed.ret,
+    typed.result_type,
   );
   let reps = reps_of(conv);
   let given = range(0, args.len()).fold(
     { st: st, args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, i: Int|
+    |accumulator: { st: Lowering, args: List<Arg> }, i: Int|
       match ((args.at(i), reps.at(i))) {
         (Some(a), Some(r)) -> {
-          let h = represented_as({ st: acc.st, arg: a }, r, c.at);
-          { st: h.st, args: acc.args.push(h.arg) }
+          let h = represented_as({ st: accumulator.st, arg: a }, r, c.at);
+          { st: h.st, args: accumulator.args.push(h.arg) }
         },
-        _ -> acc,
+        _ -> accumulator,
       },
   );
   bound_as(
     given.st,
-    typed.ret,
+    typed.result_type,
     conv.result,
     Call({
-      callee: Root(keys::generated_key(ContainerWalk(op), t, c.context.setting.module)),
+      callee: Root(keys::generated_key(ContainerWalk(operation), t, c.context.setting.module)),
       args: given.args,
       convention: conv,
       suspends: false,
@@ -346,7 +352,7 @@ fn starts_or_ends_with(
   let fits = compared(y.st, b"le", y.count, x.count, c.at);
   let from = if start { { st: enter_block(fits.st), arg: IntOperand(0) } }
   else { arithmetic(enter_block(fits.st), b"sub", x.count, y.count, c.at) };
-  let same = strings_op(
+  let same = bound_string_operation(
     from.st,
     bool_type(),
     AsBool,
@@ -367,7 +373,7 @@ fn first_occurrence(
   let x = bytes_address(st, a, at);
   let y = bytes_address(x.st, b, at);
   let f = represented_as({ st: y.st, arg: from }, AsInt, at);
-  int_op(f.st, FindBytes, [x.address, x.count, y.address, y.count, f.arg], at)
+  int_operation(f.st, FindBytes, [x.address, x.count, y.address, y.count, f.arg], at)
 }
 
 fn index_of(
@@ -392,7 +398,7 @@ fn index_of_byte(c: BuiltinCall, st: Lowering, a: Arg, byte: Arg) -> LoweredValu
   let lo = compared(i.st, b"ge", i.arg, IntOperand(0), c.at);
   let hi = compared(enter_block(lo.st), b"le", i.arg, IntOperand(255), c.at);
   let ok = short_circuit(c.context, lo, hi, true, c.at);
-  let unary_builtin = strings_op(
+  let unary_builtin = bound_string_operation(
     enter_block(ok.st),
     bytes_type(),
     AsWord,
@@ -400,7 +406,7 @@ fn index_of_byte(c: BuiltinCall, st: Lowering, a: Arg, byte: Arg) -> LoweredValu
     [IntOperand(1)],
     c.at,
   );
-  let set = string_op_for_effect(
+  let set = string_operation_for_effect(
     unary_builtin.st,
     ByteSet,
     [unary_builtin.arg, IntOperand(0), i.arg],
@@ -416,12 +422,17 @@ fn position(context: Context, l: LoweredValue, at: Span) -> LoweredValue / {abor
 fn string_find(c: BuiltinCall, st: Lowering, a: Arg, b: Arg) -> LoweredValue / {abort.raise} = {
   let x = bytes_address(st, a, c.at);
   let y = bytes_address(x.st, b, c.at);
-  let f = int_op(y.st, FindBytes, [x.address, x.count, y.address, y.count, IntOperand(0)], c.at);
+  let f = int_operation(
+    y.st,
+    FindBytes,
+    [x.address, x.count, y.address, y.count, IntOperand(0)],
+    c.at,
+  );
   let ok = compared(f.st, b"ge", f.arg, IntOperand(0), c.at);
   failing_else(
     c,
     ok,
-    int_op(enter_block(ok.st), CharCount, [x.address, f.arg], c.at),
+    int_operation(enter_block(ok.st), CharCount, [x.address, f.arg], c.at),
     |r: Lowering| rejected_text(c, r, [x.address, x.count, y.address, y.count]),
   )
 }
@@ -453,8 +464,8 @@ fn char_slice(
   let x = bytes_address(st, a, c.at);
   let from = represented_as({ st: x.st, arg: s }, AsInt, c.at);
   let to = represented_as({ st: from.st, arg: e }, AsInt, c.at);
-  let b0 = int_op(to.st, CharStart, [x.address, x.count, from.arg], c.at);
-  let b1 = int_op(b0.st, CharStart, [x.address, x.count, to.arg], c.at);
+  let b0 = int_operation(to.st, CharStart, [x.address, x.count, from.arg], c.at);
+  let b1 = int_operation(b0.st, CharStart, [x.address, x.count, to.arg], c.at);
   let lo = compared(b1.st, b"ge", b0.arg, IntOperand(0), c.at);
   let le = compared(enter_block(lo.st), b"le", b0.arg, b1.arg, c.at);
   let ok = short_circuit(c.context, lo, le, true, c.at);
@@ -464,7 +475,7 @@ fn char_slice(
     ok,
     copied_out(n.st, string_type(), x.address, b0.arg, n.arg, c.at),
     |r: Lowering| {
-      let chars = int_op(r, CharCount, [x.address, x.count], c.at);
+      let chars = int_operation(r, CharCount, [x.address, x.count], c.at);
       raise_rejection(c, chars.st, [from.arg, to.arg, chars.arg])
     },
   )
@@ -485,7 +496,7 @@ fn byte_read(
   let hi = compared(enter_block(lo.st), b"le", k.arg, last.arg, c.at);
   let ok = short_circuit(c.context, lo, hi, true, c.at);
   let read = if four {
-    strings_op(
+    bound_string_operation(
       enter_block(ok.st),
       width_type({ bits: 32, signed: false }),
       AsFixed({ bits: 32, signed: false }),
@@ -493,7 +504,7 @@ fn byte_read(
       [x.address, k.arg],
       c.at,
     )
-  } else { int_op(enter_block(ok.st), ByteRead, [x.address, k.arg], c.at) };
+  } else { int_operation(enter_block(ok.st), ByteRead, [x.address, k.arg], c.at) };
   failing_else(c, ok, read, |r: Lowering| raise_rejection(c, r, [k.arg, x.count]))
 }
 
@@ -524,7 +535,7 @@ fn scanned(
   failing_else(
     c,
     both,
-    int_op(
+    int_operation(
       k.st,
       ScanBytes({ until: until }),
       [x.address, x.count, f.arg, k.address, k.count, b.arg],
@@ -543,10 +554,13 @@ fn secret_basic_call(
   st: Lowering,
   args: List<Arg>,
 ) -> LoweredValue / {abort.raise} = {
-  let h = args.fold({ st: st, words: [] }, |acc: { st: Lowering, words: List<Arg> }, a: Arg| {
-    let w = represented_as({ st: acc.st, arg: a }, AsWord, c.at);
-    { st: w.st, words: acc.words.push(w.arg) }
-  });
+  let h = args.fold(
+    { st: st, words: [] },
+    |accumulator: { st: Lowering, words: List<Arg> }, a: Arg| {
+      let w = represented_as({ st: accumulator.st, arg: a }, AsWord, c.at);
+      { st: w.st, words: accumulator.words.push(w.arg) }
+    },
+  );
   if c.name == b"Secret::len" { native_int(h.st, b"?secret_len", h.words, c.at) }
   else if c.name == b"Secret::is_empty" {
     let n = native_int(h.st, b"?secret_len", h.words, c.at);
@@ -592,18 +606,21 @@ fn secret_derived(c: BuiltinCall, st: Lowering, args: List<Arg>) -> LoweredValue
   let n = c.name;
   match args {
     [der] -> if n == b"Secret::private_key" { private_key_read(c, st, der) }
-    else { unreachable(b"a secret's builtin on one operand: ".concat(n)) },
+    else { unreachable(b"unknown `Secret::` builtin taking one argument: ".concat(n)) },
     [a, b] -> if n == b"Secret::decode" { secret_decoded(c, st, a, b) }
     else if n == b"Secret::encode" { secret_encoded(c, st, a, b) }
-    else { unreachable(b"a secret's builtin on two operands: ".concat(n)) },
+    else { unreachable(b"unknown `Secret::` builtin taking two arguments: ".concat(n)) },
     [a, b, x] -> if n == b"Secret::hmac" { secret_hmac(c, st, a, b, x) }
     else if n == b"Secret::hkdf_extract" { hkdf_extracted(c, st, a, b, x) }
     else if n == b"Secret::rsa_jwk" { secret_rsa_jwk(c, st, a, b, x) }
-    else { unreachable(b"a secret's builtin on three operands: ".concat(n)) },
+    else { unreachable(b"unknown `Secret::` builtin taking three arguments: ".concat(n)) },
     [hash, key, info, length] -> hkdf_expanded(c, st, hash, key, info, length),
     [hash, password, salt, iterations, length] ->
       pbkdf2_derived(c, st, hash, password, salt, iterations, length),
-    _ -> unreachable(b"a secret's builtin on other operands: ".concat(n)),
+    _ ->
+      unreachable(
+        b"unknown `Secret::` builtin taking an unsupported number of arguments: ".concat(n),
+      ),
   }
 }
 
@@ -731,8 +748,8 @@ fn secret_rsa_jwk(
     xs.st,
     int_type(),
     AsInt,
-    Op({
-      op: OfContainers(Length),
+    OperationCall({
+      operation: OfContainers(Length),
       args: [xs.arg],
       uses: { takes: [false], owned: false, fails: false, suspends: false },
     }),
@@ -875,7 +892,9 @@ fn asserted(c: BuiltinCall, st: Lowering, cond: Arg, message: Arg) -> LoweredVal
     c.context,
     {
       ..exit_block(b.st, raise_rejection),
-      insts: b.st.insts.push(If({ cond: b.arg, then: [], otherwise: raise_rejection.insts })),
+      instructions: b.st.instructions.push(
+        If({ cond: b.arg, then: [], otherwise: raise_rejection.instructions }),
+      ),
     },
     LiteralUnit,
     c.at,
@@ -888,16 +907,16 @@ fn assert_failure(c: BuiltinCall, st: Lowering, m: Arg) -> Lowering / {abort.rai
   let o = option_type(string_type());
   let full = some_constructor();
   match m {
-    VarOperand(given) -> match constructor_sum(setting, full) {
+    VariableOperand(given) -> match constructor_sum(setting, full) {
       None -> untold(st),
       Some(sum) -> {
-        let held = represented_as(
-          { st: st, arg: VarOperand({ ..given, ty: o }) },
+        let message_option = represented_as(
+          { st: st, arg: VariableOperand({ ..given, ty: o }) },
           representation_of(setting, o),
           c.at,
         );
-        match message_read(c.context, held, full, sum.index) {
-          None -> unreachable(b"an `assert` message stored as no `Option`"),
+        match message_read(c.context, message_option, full, sum.index) {
+          None -> unreachable(b"an `assert` message is stored as a type other than `Option`"),
           Some(r) -> {
             let text = bound_as(
               enter_block(r.st),
@@ -907,16 +926,16 @@ fn assert_failure(c: BuiltinCall, st: Lowering, m: Arg) -> Lowering / {abort.rai
               c.at,
             );
             let t = bytes_address(text.st, text.arg, c.at);
-            let told = rejected_text(c, t.st, [t.address, t.count]);
-            let none = untold(enter_block(exit_block(r.st, told)));
+            let text_failure = rejected_text(c, t.st, [t.address, t.count]);
+            let none = untold(enter_block(exit_block(r.st, text_failure)));
             {
               ..exit_block(r.st, none),
-              insts: r.st.insts.push(
+              instructions: r.st.instructions.push(
                 Case({
                   on: r.of,
                   test: TagTest(sum.constructors.map(|x: SumConstructor| x.name)),
-                  arms: [{ when: sum.index, body: told.insts }],
-                  rest: none.insts,
+                  arms: [{ when: sum.index, body: text_failure.instructions }],
+                  rest: none.instructions,
                 }),
               ),
             }
@@ -933,9 +952,9 @@ fn message_read(
   l: LoweredValue,
   full: Bytes,
   index: Int,
-) -> Option<{ st: Lowering, of: Var, path: Path }> =
+) -> Option<{ st: Lowering, of: Variable, path: Path }> =
   match l.arg {
-    VarOperand(v) -> match v.representation {
+    VariableOperand(v) -> match v.representation {
       AsSum(x) -> match case_index(v.representation, full) {
         Some(i) -> match case_argument_offset(x.layout, i, 0) {
           Some(w) -> Some({ st: l.st, of: v, path: CasePath({ case: i, at: w }) }),
@@ -1025,7 +1044,7 @@ fn decimal_of_bits(
     hi.st,
     int_type(),
     AsInt,
-    Primitive({ op: b"decimal_flags", on: AsInt, args: [lo.arg] }),
+    Primitive({ operation: b"decimal_flags", on: AsInt, args: [lo.arg] }),
     c.at,
   );
   let d = decimal_type();
@@ -1038,7 +1057,7 @@ fn decimal_of_bits(
         s,
         d,
         AsDecimal,
-        Primitive({ op: b"decimal", on: AsInt, args: [lo.arg, hi.arg] }),
+        Primitive({ operation: b"decimal", on: AsInt, args: [lo.arg, hi.arg] }),
         c.at,
       ),
     c.at,
@@ -1051,8 +1070,8 @@ fn recast(st: Lowering, a: Arg, ty: Type, at: Span) -> LoweredValue = {
     s.st,
     ty,
     AsWord,
-    Op({
-      op: OfContainers(NodeIntrinsic(Recast)),
+    OperationCall({
+      operation: OfContainers(NodeIntrinsic(Recast)),
       args: [s.arg],
       uses: { takes: [true], owned: true, fails: false, suspends: false },
     }),
@@ -1061,34 +1080,67 @@ fn recast(st: Lowering, a: Arg, ty: Type, at: Span) -> LoweredValue = {
 }
 
 fn copied_out(st: Lowering, ty: Type, address: Arg, from: Arg, n: Arg, at: Span) -> LoweredValue = {
-  let o = strings_op(st, ty, AsWord, AllocateBytes, [n], at);
+  let o = bound_string_operation(st, ty, AsWord, AllocateBytes, [n], at);
   {
-    st: string_op_for_effect(o.st, CopyBytes, [o.arg, IntOperand(0), address, from, n], at),
+    st: string_operation_for_effect(o.st, CopyBytes, [o.arg, IntOperand(0), address, from, n], at),
     arg: o.arg,
   }
 }
 
-fn compared(st: Lowering, op: Bytes, a: Arg, b: Arg, at: Span) -> LoweredValue =
-  bound_as(st, bool_type(), AsBool, Primitive({ op: op, on: AsInt, args: [a, b] }), at)
+fn compared(st: Lowering, operation: Bytes, a: Arg, b: Arg, at: Span) -> LoweredValue =
+  bound_as(
+    st,
+    bool_type(),
+    AsBool,
+    Primitive({ operation: operation, on: AsInt, args: [a, b] }),
+    at,
+  )
 
-fn arithmetic(st: Lowering, op: Bytes, a: Arg, b: Arg, at: Span) -> LoweredValue =
-  bound_as(st, int_type(), AsInt, Primitive({ op: op, on: AsInt, args: [a, b] }), at)
+fn arithmetic(st: Lowering, operation: Bytes, a: Arg, b: Arg, at: Span) -> LoweredValue =
+  bound_as(st, int_type(), AsInt, Primitive({ operation: operation, on: AsInt, args: [a, b] }), at)
 
-fn strings_op(
+fn bound_string_operation(
   st: Lowering,
   ty: Type,
   rep: Representation,
-  op: StringOp,
+  operation: StringOperation,
   args: List<Arg>,
   at: Span,
 ) -> LoweredValue =
-  bound_as(st, ty, rep, Op({ op: OfStrings(op), args: args, uses: string_signature(op) }), at)
+  bound_as(
+    st,
+    ty,
+    rep,
+    OperationCall({
+      operation: OfStrings(operation),
+      args: args,
+      uses: string_signature(operation),
+    }),
+    at,
+  )
 
-fn int_op(st: Lowering, op: StringOp, args: List<Arg>, at: Span) -> LoweredValue =
-  strings_op(st, int_type(), AsInt, op, args, at)
+fn int_operation(
+  st: Lowering,
+  operation: StringOperation,
+  args: List<Arg>,
+  at: Span,
+) -> LoweredValue = bound_string_operation(st, int_type(), AsInt, operation, args, at)
 
-fn string_op_for_effect(st: Lowering, op: StringOp, args: List<Arg>, at: Span) -> Lowering =
-  run_for_effect(st, Op({ op: OfStrings(op), args: args, uses: string_signature(op) }), at)
+fn string_operation_for_effect(
+  st: Lowering,
+  operation: StringOperation,
+  args: List<Arg>,
+  at: Span,
+) -> Lowering =
+  run_for_effect(
+    st,
+    OperationCall({
+      operation: OfStrings(operation),
+      args: args,
+      uses: string_signature(operation),
+    }),
+    at,
+  )
 
 fn native_int(
   st: Lowering,
@@ -1110,7 +1162,7 @@ fn native_int(
 
 pub type GeneratedRoot = { params: List<EmitParam>, code: Code, here: List<Definition> }
 
-pub fn strings_root(op: Bytes) -> Bool =
+pub fn strings_root(operation: Bytes) -> Bool =
   [
     b"range_from",
     b"split_from",
@@ -1119,53 +1171,59 @@ pub fn strings_root(op: Bytes) -> Bool =
     b"concat_all_from",
     b"jwk_from",
   ].contains(
-    op,
+    operation,
   )
 
 fn string_root_signature(
-  op: Bytes,
+  operation: Bytes,
   t: Type,
-) -> { params: List<{ name: Bytes, ty: Type }>, ret: Type } = {
+) -> { params: List<{ name: Bytes, ty: Type }>, result_type: Type } = {
   let p = |name: Bytes, ty: Type| { name: name, ty: ty };
-  if op == b"range_from" {
-    { params: [p(b"lo", int_type()), p(b"hi", int_type()), p(b"acc", t)], ret: t }
-  } else if op == b"split_from" {
+  if operation == b"range_from" {
+    { params: [p(b"lo", int_type()), p(b"hi", int_type()), p(b"acc", t)], result_type: t }
+  } else if operation == b"split_from" {
     {
       params: [p(b"s", t), p(b"sep", t), p(b"from", int_type()), p(b"acc", list_type(t))],
-      ret: list_type(t),
+      result_type: list_type(t),
     }
-  } else if op == b"chars_from" {
+  } else if operation == b"chars_from" {
     {
       params: [p(b"s", t), p(b"at", int_type()), p(b"acc", list_type(char_type()))],
-      ret: list_type(char_type()),
+      result_type: list_type(char_type()),
     }
-  } else if op == b"of_chars_from" {
-    { params: [p(b"cs", t), p(b"i", int_type()), p(b"acc", string_type())], ret: string_type() }
-  } else if op == b"jwk_from" {
+  } else if operation == b"of_chars_from" {
+    {
+      params: [p(b"cs", t), p(b"i", int_type()), p(b"acc", string_type())],
+      result_type: string_type(),
+    }
+  } else if operation == b"jwk_from" {
     let joined = secret_of(bytes_type());
-    { params: [p(b"xs", t), p(b"i", int_type()), p(b"acc", joined)], ret: joined }
+    { params: [p(b"xs", t), p(b"i", int_type()), p(b"acc", joined)], result_type: joined }
   } else {
-    { params: [p(b"bs", t), p(b"i", int_type()), p(b"acc", bytes_type())], ret: bytes_type() }
+    {
+      params: [p(b"bs", t), p(b"i", int_type()), p(b"acc", bytes_type())],
+      result_type: bytes_type(),
+    }
   }
 }
 
 fn param_name(ps: List<{ name: Bytes, ty: Type }>, slot: Int) -> Bytes =
   match ps.at(slot) { Some(p) -> p.name, None -> b"" }
 
-pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort.raise} = {
-  let key = keys::generated_key(ContainerWalk(op), t, module);
-  let typed_of = string_root_signature(op, t);
+pub fn strings_code(module: Bytes, operation: Bytes, t: Type) -> GeneratedRoot / {abort.raise} = {
+  let key = keys::generated_key(ContainerWalk(operation), t, module);
+  let typed_of = string_root_signature(operation, t);
   let name = name_in_module(module, root_text(root_name(key)));
   let param_types = typed_of.params.map(|x: { name: Bytes, ty: Type }| x.ty);
   let definition = {
     name: name,
-    ret: Some(kind_of(typed_of.ret).kind),
-    return_type: kind_of(typed_of.ret).ty,
+    return_kind: Some(kind_of(typed_of.result_type).kind),
+    return_type: kind_of(typed_of.result_type).ty,
     pure: true,
     constant: false,
     value: None,
     arity: typed_of.params.len(),
-    scheme: Some(monomorphic(fn_type(param_types, typed_of.ret, no_effects()))),
+    scheme: Some(monomorphic(function_type(param_types, typed_of.result_type, no_effects()))),
     witnesses: 0,
     borrowed: [],
     root: key,
@@ -1179,19 +1237,19 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
     applied(
       unspanned_code(
         NDefinition({ full: qualify(module, name), args: [], effect_arguments: [], labels: [] }),
-        fn_type(param_types, typed_of.ret, no_effects()),
+        function_type(param_types, typed_of.result_type, no_effects()),
       ),
       args,
-      typed_of.ret,
+      typed_of.result_type,
     );
   let literal = int_code;
   let bin = binary_of;
   let cond = if_code;
   let bound = |n: Bytes, slot: Int, value: Code, tail: Code|
     block_code([CodeLet({ name: n, slot: slot, value: value })], tail);
-  let call = |b: Bytes, args: List<Code>, ret: Type| builtin_call(b, [], args, ret);
+  let call = |b: Bytes, args: List<Code>, return_type: Type| builtin_call(b, [], args, return_type);
   let item = match t { NamedType(c) -> match c.args.at(0) { Some(x) -> x, None -> t }, _ -> t };
-  let code = if op == b"range_from" {
+  let code = if operation == b"range_from" {
     cond(
       bin(b"lt", v(0), v(1)),
       again([
@@ -1201,7 +1259,7 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
       ]),
       v(2),
     )
-  } else if op == b"split_from" {
+  } else if operation == b"split_from" {
     let first_occurrence = call(
       b"Bytes::index_of_from",
       [v(0), v(1), v(2)],
@@ -1227,10 +1285,10 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
         list_type(t),
       ),
     )
-  } else if op == b"chars_from" {
+  } else if operation == b"chars_from" {
     let byte = |off: Int| call(b"Bytes::at", [v(0), bin(b"add", v(1), literal(off))], int_type());
-    let more = |acc: Code, off: Int|
-      bin(b"add", bin(b"mul", acc, literal(64)), bin(b"sub", byte(off), literal(128)));
+    let more = |accumulator: Code, off: Int|
+      bin(b"add", bin(b"mul", accumulator, literal(64)), bin(b"sub", byte(off), literal(128)));
     let b0 = slot_code(b"b0", 3, int_type());
     let width = slot_code(b"w", 4, int_type());
     let lead = |base: Int| bin(b"sub", b0, literal(base));
@@ -1278,7 +1336,7 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
       bound(b"b0", 3, byte(0), bound(b"w", 4, w, bound(b"n", 5, scalar, pushed))),
       v(2),
     )
-  } else if op == b"of_chars_from" {
+  } else if operation == b"of_chars_from" {
     let n = slot_code(b"n", 4, int_type());
     let byte_at = |e: Code| call(b"byte_of_int", [e], bytes_type());
     let tail = |shift: Int|
@@ -1326,7 +1384,7 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
       ),
       v(2),
     )
-  } else if op == b"jwk_from" {
+  } else if operation == b"jwk_from" {
     let joined = secret_of(bytes_type());
     let dot = call(b"Secret::of_bytes", [bytes_code(b".")], joined);
     let text = call(b"Secret::bytes", [slot_code(b"x", 3, item)], joined);
@@ -1366,52 +1424,52 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
   }
 }
 
-test "each root written here takes its own parameters and is the one definition its loop calls" {
+test "each generated string or list helper has its own parameters, and the loop in that helper calls only that definition" {
   let cases = [
     {
-      op: b"range_from",
+      operation: b"range_from",
       t: list_type(int_type()),
       params: [int_type(), int_type(), list_type(int_type())],
     },
     {
-      op: b"split_from",
+      operation: b"split_from",
       t: string_type(),
       params: [string_type(), string_type(), int_type(), list_type(string_type())],
     },
     {
-      op: b"chars_from",
+      operation: b"chars_from",
       t: string_type(),
       params: [string_type(), int_type(), list_type(char_type())],
     },
     {
-      op: b"of_chars_from",
+      operation: b"of_chars_from",
       t: list_type(char_type()),
       params: [list_type(char_type()), int_type(), string_type()],
     },
     {
-      op: b"concat_all_from",
+      operation: b"concat_all_from",
       t: list_type(bytes_type()),
       params: [list_type(bytes_type()), int_type(), bytes_type()],
     },
     {
-      op: b"jwk_from",
+      operation: b"jwk_from",
       t: list_type(secret_of(string_type())),
       params: [list_type(secret_of(string_type())), int_type(), secret_of(bytes_type())],
     },
   ];
-  cases.fold((), |_: Unit, x: { op: Bytes, t: Type, params: List<Type> }| {
-    assert(strings_root(x.op), None);
-    let w = strings_code(b"m", x.op, x.t);
+  cases.fold((), |_: Unit, x: { operation: Bytes, t: Type, params: List<Type> }| {
+    assert(strings_root(x.operation), None);
+    let w = strings_code(b"m", x.operation, x.t);
     assert_eq(w.params.map(|p: EmitParam| p.of), x.params.map(|p: Type| Some(p)));
     assert_eq(w.here.map(|d: Definition| d.root), [
-      keys::generated_key(ContainerWalk(x.op), x.t, b"m"),
+      keys::generated_key(ContainerWalk(x.operation), x.t, b"m"),
     ]);
     assert_eq(w.here.map(|d: Definition| d.arity), [x.params.len()])
   });
   assert(!strings_root(b"equal_from"), None)
 }
 
-test "a rejection is numbered as the runtime numbers it, and those between the containers' are builtins written here" {
+test "`rejection` returns the runtime's numeric code for a builtin that is not compiled inline, or -1, and the codes after the container builtins are string builtins" {
   assert_eq(
     [
       b"Array::new",
@@ -1437,7 +1495,7 @@ test "a rejection is numbered as the runtime numbers it, and those between the c
   )
 }
 
-test "the builtins written here are told apart from the rest" {
+test "`string_builtin` is true for the string and bytes builtins implemented in the compiler and false for other builtins" {
   assert([b"String::concat", b"Bytes::at", b"range", b"String::split"].all(string_builtin), None);
   assert(![b"List::len", b"Bytes::len", b"Bytes::position"].any(string_builtin), None)
 }

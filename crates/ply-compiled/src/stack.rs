@@ -1,8 +1,3 @@
-//! Stacks the runtime owns, and the [`switch`] between them: a suspended computation in the
-//! C backend is a C stack, and nothing emitted knows which stack it is on. Each is one reservation
-//! that never moves, made writable from its top down as the computation on it goes deeper, so every
-//! frame keeps its address however deep it lies.
-
 use crate::rt::STACK_MARGIN;
 use crate::vm;
 use ply_core::limit::{self, Reserved};
@@ -10,31 +5,22 @@ use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
-/// The address space each stack reserves, which bounds how deeply a computation on it nests.
 pub const RESERVE: usize = 1 << 30;
 
-/// Made writable at a time, from the top down; a stack starts with one.
 pub const CHUNK: usize = 8 << 20;
 
-/// Reserved below the stack and never made writable: a multiple of every page size (4, 16 and
-/// 64 KB), so the chunks above it start on a page.
 const GUARD: usize = 64 << 10;
 
-/// The stacks a thread keeps that never grew past their first chunk, for its next bodies and tasks.
 const POOLED: usize = 4;
 
 thread_local! {
     static POOL: RefCell<Vec<Reservation>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A stack of the runtime's. Dropping it gives it back: to this thread's pool while it never grew
-/// past its first chunk, else to the system. Boxed, so the name the running stack goes by holds
-/// wherever the `Stack` moves.
 pub struct Stack(ManuallyDrop<Box<Reservation>>);
 
 struct Reservation {
     base: usize,
-    /// The lowest writable address.
     committed: Cell<usize>,
 }
 
@@ -78,22 +64,16 @@ impl Drop for Reservation {
 }
 
 impl Stack {
-    /// A stack of its own: one this thread gave back as it took it, or a new one with its first
-    /// chunk writable. `None` when the system maps no more.
     pub fn take() -> Option<Stack> {
         let pooled = POOL.try_with(|p| p.borrow_mut().pop()).ok().flatten();
         let reservation = pooled.or_else(Reservation::new)?;
         Some(Stack(ManuallyDrop::new(Box::new(reservation))))
     }
 
-    /// The lowest address a compiled frame may begin at: what is writable, less the Rust frames'
-    /// margin.
     pub fn floor(&self) -> usize {
         self.0.committed.get() + STACK_MARGIN
     }
 
-    /// Makes the next chunk below writable, lowering the floor by as much; `false` once the
-    /// reservation is spent.
     pub fn extend(&self) -> bool {
         self.0.extend()
     }
@@ -106,14 +86,9 @@ impl Stack {
         (self.0.base..self.top()).contains(&address)
     }
 
-    /// Names this stack as the one this thread runs on, which a computation's first frame on it
-    /// does before anything else, and returns the floor compiled code honours there.
-    ///
-    /// # Safety
-    /// The stack outlives its time as the running one.
     #[must_use]
     pub unsafe fn enter(&self) -> usize {
-        unsafe { limit::set_running(Some(self.reserved())) };
+        unsafe { limit::set_active_stack(Some(self.reserved())) };
         self.floor()
     }
 
@@ -122,8 +97,6 @@ impl Stack {
         NonNull::from(reservation)
     }
 
-    /// Lays out the frame the first [`switch`] pops, returning into a trampoline that calls
-    /// `entry(arg)`, which must never return: there is nothing below it.
     pub fn prepare(&self, entry: extern "C" fn(usize), arg: usize) -> usize {
         let top = self.top() & !15;
         unsafe { lay_out(top, entry as usize, arg) }
@@ -152,7 +125,6 @@ impl Drop for Stack {
 mod arch {
     use std::arch::naked_asm;
 
-    /// x19..x28, x29, x30 and d8..d15, rounded to 16-byte stack alignment.
     pub const FRAME: usize = 176;
 
     #[unsafe(naked)]
@@ -188,7 +160,6 @@ mod arch {
         )
     }
 
-    /// Where the first switch into a fresh stack lands: entry in x20, argument in x19.
     #[unsafe(naked)]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn ply_stack_trampoline() {
@@ -214,7 +185,6 @@ mod arch {
 mod arch {
     use std::arch::naked_asm;
 
-    /// rbp, rbx, r12..r15 and the return address; the trampoline is entered as after a call.
     pub const FRAME: usize = 64;
 
     #[unsafe(naked)]
@@ -239,7 +209,6 @@ mod arch {
         )
     }
 
-    /// Where the first switch into a fresh stack lands; the `and` realigns for the ABI.
     #[unsafe(naked)]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn ply_stack_trampoline() {
@@ -261,11 +230,6 @@ mod arch {
     }
 }
 
-/// Saves the current stack pointer in `from` and continues `to`; returns when switched back.
-///
-/// # Safety
-/// `to` must be a pointer a previous `switch` stored or [`Stack::prepare`] returned, for a stack
-/// that is still mapped, and nothing may be running on it.
 pub unsafe fn switch(from: &mut usize, to: usize) {
     unsafe { arch::ply_stack_switch(from, to) }
 }

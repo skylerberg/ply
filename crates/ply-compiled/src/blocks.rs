@@ -1,9 +1,3 @@
-//! Where a heap's objects live. A block is one object's memory. Blocks of one size fill a page,
-//! pages are cut from segments mapped from the operating system, and a block too big for a page is
-//! the system allocator's. A dead block is listed through its own second word; a page left with no
-//! live block serves any size next, and a segment left with no such page goes back, kept mapped for
-//! the next heap that needs one while few are.
-
 use crate::vm;
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,34 +6,21 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicPtr, AtomicU32};
 use std::sync::{Mutex, PoisonError};
 
-/// A mapping's bytes, which it is aligned to, so a block's address names its segment and page.
 pub(crate) const SEGMENT: usize = 4 << 20;
 pub(crate) const PAGE: usize = 64 << 10;
 const PAGES: usize = SEGMENT / PAGE;
-/// How many classes, from the first, each hold the blocks of one count of words: a block of at most
-/// this many words is of the class its words number.
-pub(crate) const WORD_CLASSES: usize = 16;
-/// Where a dead block names the next dead one: its second word.
-pub(crate) const LINK_AT: usize = 8;
-/// The largest block a page holds.
+pub(crate) const WORD_STEP_SIZE_CLASSES: usize = 16;
+pub(crate) const LINK_OFFSET: usize = 8;
 pub const SMALL: usize = 8 << 10;
 const CLASSES: usize = 65;
-/// The emptied pages a heap keeps as they are for the next page it needs.
-const SPARES: usize = 32;
-/// A segment's header, which its first page's blocks begin after.
+const MAX_SPARE_PAGES: usize = 32;
 const HEAD: usize = size_of::<Segment>().next_multiple_of(16);
-/// The bytes before a larger block: the first word names its owner, and the second counts the
-/// threads handing the block back to that owner right now, as a page's `handing` does its blocks.
-const LEAD: usize = 16;
-/// The most segments kept mapped that no heap holds.
-const EMPTIED: usize = 64;
+const LARGE_HEADER_BYTES: usize = 16;
+const MAX_POOLED_SEGMENTS: usize = 64;
 
-/// Segments no heap holds, their headers zeros: a heap takes one before it maps one, so a heap that
-/// empties a segment and soon needs another, as a parallel branch's does, costs the system nothing.
 static EMPTIED_SEGMENTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-/// A segment whose header is zeros, or null when the system maps no more.
-fn segment_taken() -> *mut Segment {
+fn allocate_segment() -> *mut Segment {
     let emptied = EMPTIED_SEGMENTS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -50,13 +31,12 @@ fn segment_taken() -> *mut Segment {
     }
 }
 
-/// Gives back a segment none of whose blocks any heap hands out again.
-unsafe fn segment_given(segment: *mut Segment) {
+unsafe fn release_segment(segment: *mut Segment) {
     unsafe { segment.write_bytes(0, 1) };
     let mut emptied = EMPTIED_SEGMENTS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if emptied.len() < EMPTIED {
+    if emptied.len() < MAX_POOLED_SEGMENTS {
         emptied.push(segment.addr());
         return;
     }
@@ -64,50 +44,37 @@ unsafe fn segment_given(segment: *mut Segment) {
     unsafe { vm::unmap(segment.cast(), SEGMENT) };
 }
 
-/// What other threads hand back to a heap: dead blocks, each naming the next in its second word.
 #[derive(Default)]
 pub(crate) struct Returned {
     small: AtomicPtr<u8>,
     large: AtomicPtr<u8>,
 }
 
-/// Laid out as `compiler.emit.abi` declares `PlyPage`: compiled code takes a block from the page
-/// its class fills and gives one back to a page in place, as [`pop`] and [`Blocks::give`] do.
 #[repr(C)]
 pub(crate) struct Page {
-    /// Dead blocks, each naming the next in its second word.
     pub(crate) free: *mut u8,
-    /// Where the blocks never handed out begin, and where the page's blocks end.
     pub(crate) fresh: *mut u8,
     pub(crate) end: *mut u8,
-    /// The heap whose thread alone touches the rest of this.
     pub(crate) owner: AtomicPtr<Returned>,
-    /// Blocks of this page other threads are handing back to `owner` right now (see [`Handing`]).
     pub(crate) handing: AtomicU32,
     pub(crate) next: *mut Page,
     pub(crate) prev: *mut Page,
-    /// A block's bytes; zero while the page holds none and waits for any class.
     pub(crate) block: u32,
     pub(crate) live: u32,
     pub(crate) class: u8,
-    /// On its class's list, or on one of the lists of emptied pages.
     pub(crate) listed: bool,
-    /// Emptied and kept as it is, not let go.
     pub(crate) spare: bool,
 }
 
-/// All zeros is a segment none of whose pages holds a block.
 #[repr(C)]
 pub(crate) struct Segment {
-    /// Pages holding blocks.
     held: usize,
     pub(crate) pages: [Page; PAGES],
 }
 
-/// The size class of a block of `bytes`: every word count up to sixteen, then eight to a doubling.
 pub fn class_of(bytes: usize) -> usize {
     let words = bytes / 8;
-    if words <= WORD_CLASSES {
+    if words <= WORD_STEP_SIZE_CLASSES {
         return words;
     }
     let n = words - 1;
@@ -115,21 +82,19 @@ pub fn class_of(bytes: usize) -> usize {
     8 * (top - 2) + ((n >> (top - 3)) & 7) + 1
 }
 
-/// The bytes of a class's blocks: the most a size of the class asks for.
-pub fn block_of(class: usize) -> usize {
-    if class <= WORD_CLASSES {
+pub fn class_block_bytes(class: usize) -> usize {
+    if class <= WORD_STEP_SIZE_CLASSES {
         return class * 8;
     }
-    let k = class - WORD_CLASSES - 1;
+    let k = class - WORD_STEP_SIZE_CLASSES - 1;
     (9 + k % 8) << (k / 8 + 4)
 }
 
-/// The bytes of the block [`Blocks::take`] hands out for `bytes`.
-pub fn taken_bytes(bytes: usize) -> usize {
+pub fn reserved_bytes(bytes: usize) -> usize {
     if bytes > SMALL {
         bytes
     } else {
-        block_of(class_of(bytes))
+        class_block_bytes(class_of(bytes))
     }
 }
 
@@ -142,7 +107,6 @@ fn segment_of(page: *mut Page) -> *mut Segment {
     (page.addr() & !(SEGMENT - 1)) as *mut Segment
 }
 
-/// Where a page's blocks may lie and how many bytes that is.
 unsafe fn room(page: *mut Page) -> (*mut u8, usize) {
     let segment = segment_of(page);
     unsafe {
@@ -153,34 +117,29 @@ unsafe fn room(page: *mut Page) -> (*mut u8, usize) {
 }
 
 unsafe fn link(block: *mut u8) -> *mut *mut u8 {
-    unsafe { block.add(LINK_AT).cast() }
+    unsafe { block.add(LINK_OFFSET).cast() }
 }
 
-/// The heap a block, of `bytes` when it was taken, was last handed out by or adopted into.
 unsafe fn owner(block: *mut u8, bytes: usize) -> &'static AtomicPtr<Returned> {
     unsafe {
         if bytes > SMALL {
-            &*block.sub(LEAD).cast()
+            &*block.sub(LARGE_HEADER_BYTES).cast()
         } else {
             &(*page_of(block)).owner
         }
     }
 }
 
-/// The count of threads handing a block, of `bytes` when it was taken, back right now: its page's,
-/// or its lead's second word.
 unsafe fn handing(block: *mut u8, bytes: usize) -> &'static AtomicU32 {
     unsafe {
         if bytes > SMALL {
-            &*block.sub(LEAD - 8).cast()
+            &*block.sub(LARGE_HEADER_BYTES - 8).cast()
         } else {
             &(*page_of(block)).handing
         }
     }
 }
 
-/// Waits until no thread is handing back a block whose owner was `handing`'s before it changed: a
-/// thread that marks it after this sees it at zero reads the new owner.
 fn waited(handing: &AtomicU32) {
     while handing.load(SeqCst) != 0 {
         std::hint::spin_loop();
@@ -188,7 +147,7 @@ fn waited(handing: &AtomicU32) {
 }
 
 fn large(bytes: usize) -> Layout {
-    Layout::from_size_align(bytes + LEAD, 16).expect("a block's layout")
+    Layout::from_size_align(bytes + LARGE_HEADER_BYTES, 16).expect("a block's layout")
 }
 
 unsafe fn push(list: &mut *mut Page, page: *mut Page) {
@@ -203,8 +162,7 @@ unsafe fn push(list: &mut *mut Page, page: *mut Page) {
     }
 }
 
-/// Lists a page after the list's first, which stays the one being filled.
-unsafe fn push_behind(list: &mut *mut Page, page: *mut Page) {
+unsafe fn push_after_head(list: &mut *mut Page, page: *mut Page) {
     let head = *list;
     if head.is_null() {
         return unsafe { push(list, page) };
@@ -237,7 +195,6 @@ unsafe fn unlink(list: &mut *mut Page, page: *mut Page) {
     }
 }
 
-/// A block the page has on hand, or null: a dead one first, then one never handed out.
 #[inline]
 unsafe fn pop(page: *mut Page) -> *mut u8 {
     unsafe {
@@ -257,16 +214,10 @@ unsafe fn pop(page: *mut Page) -> *mut u8 {
     }
 }
 
-/// Hands a dead block, of `bytes` when it was taken, back to the heap that owns it, from any
-/// thread: the heap takes it up when it next needs a page.
-pub unsafe fn hand_back(block: *mut u8, bytes: usize) {
+pub unsafe fn free_block(block: *mut u8, bytes: usize) {
     unsafe { Handing::begin(block, bytes).finish() }
 }
 
-/// A dead block on its way back to the heap that owns it, from another thread. While one is, its
-/// page (or a larger block's lead) is marked, and [`Blocks::adopt`] waits for the mark to clear
-/// before it lets the heap the block was read to belong to go, so the push never lands in a freed
-/// heap's list.
 pub struct Handing {
     block: *mut u8,
     bytes: usize,
@@ -274,7 +225,6 @@ pub struct Handing {
 }
 
 impl Handing {
-    /// Marks the block's page as being handed back to, then reads the heap that owns it.
     pub unsafe fn begin(block: *mut u8, bytes: usize) -> Handing {
         unsafe {
             handing(block, bytes).fetch_add(1, SeqCst);
@@ -286,8 +236,6 @@ impl Handing {
         }
     }
 
-    /// Pushes the block onto its heap's list of blocks handed back. A page of an ended heap has no
-    /// owner, and its blocks are already given back.
     pub unsafe fn finish(self) {
         unsafe {
             let Some(heap) = self.heap.as_ref() else {
@@ -316,40 +264,28 @@ impl Drop for Handing {
     }
 }
 
-/// What compiled code reads and writes of a heap's blocks to take and give back a block in place,
-/// laid out as `compiler.emit.abi` declares `PlyFilling`.
 #[repr(C)]
-pub(crate) struct Filling {
-    /// By class, the pages with a block on hand, the first the one being filled.
+pub(crate) struct ActivePages {
     pub(crate) pages: [*mut Page; CLASSES],
-    /// The heap's name, which each page it owns holds as its owner.
     pub(crate) name: *const Returned,
-    /// A word no code reads, where the release's compiler lays this struct out with one.
     pub(crate) reused: usize,
 }
 
-/// One heap's blocks. Only the thread running the heap takes from it and gives to it; any thread
-/// may [`hand_back`] a block of it.
 pub struct Blocks {
-    /// Boxed, so its address is the heap's name wherever the heap moves.
     returned: Box<Returned>,
-    /// Boxed, so compiled code finds it wherever the heap moves.
-    filling: Box<Filling>,
+    filling: Box<ActivePages>,
     spare: *mut Page,
-    spares: usize,
-    /// Emptied pages let go, and pages never used.
+    spare_page_count: usize,
     clean: *mut Page,
-    /// Pages on `spare` and `clean`.
     empty: usize,
     segments: BTreeSet<usize>,
-    /// The bytes of each block the system allocator holds, by its address.
     large: BTreeMap<usize, usize>,
 }
 
 impl Default for Blocks {
     fn default() -> Blocks {
         let returned = Box::<Returned>::default();
-        let filling = Box::new(Filling {
+        let filling = Box::new(ActivePages {
             pages: [null_mut(); CLASSES],
             name: &raw const *returned,
             reused: 0,
@@ -358,7 +294,7 @@ impl Default for Blocks {
             returned,
             filling,
             spare: null_mut(),
-            spares: 0,
+            spare_page_count: 0,
             clean: null_mut(),
             empty: 0,
             segments: BTreeSet::new(),
@@ -372,25 +308,23 @@ impl Blocks {
         (&raw const *self.returned).cast_mut()
     }
 
-    /// What compiled code takes blocks from and gives them back to, wherever these blocks move.
-    pub(crate) fn filling(&mut self) -> *mut Filling {
+    pub(crate) fn filling(&mut self) -> *mut ActivePages {
         &raw mut *self.filling
     }
 
-    /// A block of at least `bytes`, a multiple of eight, holding whatever was last there.
     #[inline]
     pub fn take(&mut self, bytes: usize) -> *mut u8 {
         unsafe {
             if bytes > SMALL {
                 if !self.returned.large.load(Relaxed).is_null() {
-                    self.regain(self.name());
+                    self.reclaim_remote_frees(self.name());
                 }
                 let base = alloc(large(bytes));
                 assert!(!base.is_null(), "the heap is out of memory");
                 base.cast::<AtomicPtr<Returned>>()
                     .write(AtomicPtr::new(self.name()));
                 base.add(8).cast::<AtomicU32>().write(AtomicU32::new(0));
-                let block = base.add(LEAD);
+                let block = base.add(LARGE_HEADER_BYTES);
                 self.large.insert(block.addr(), bytes);
                 return block;
             }
@@ -406,14 +340,13 @@ impl Blocks {
         }
     }
 
-    /// A block of the class's next page with one on hand, which becomes the one being filled.
     #[cold]
     unsafe fn refill(&mut self, class: usize) -> *mut u8 {
         unsafe {
             loop {
                 let page = self.filling.pages[class];
                 if page.is_null() {
-                    if self.regain(self.name()) {
+                    if self.reclaim_remote_frees(self.name()) {
                         continue;
                     }
                     let page = self.page(class);
@@ -429,8 +362,7 @@ impl Blocks {
         }
     }
 
-    /// Takes back the blocks of this heap's that were handed back to `returned`; whether any were.
-    unsafe fn regain(&mut self, returned: *const Returned) -> bool {
+    unsafe fn reclaim_remote_frees(&mut self, returned: *const Returned) -> bool {
         unsafe {
             let mut small = (*returned).small.swap(null_mut(), Acquire);
             let mut large = (*returned).large.swap(null_mut(), Acquire);
@@ -449,12 +381,11 @@ impl Blocks {
         }
     }
 
-    /// An emptied page, or one of a new segment, made `class`'s.
     unsafe fn page(&mut self, class: usize) -> *mut Page {
         unsafe {
             let page = if self.spare.is_null() {
                 if self.clean.is_null() {
-                    let segment = segment_taken();
+                    let segment = allocate_segment();
                     assert!(!segment.is_null(), "the heap is out of memory");
                     self.segments.insert(segment.addr());
                     self.list(segment);
@@ -465,13 +396,13 @@ impl Blocks {
             } else {
                 let page = self.spare;
                 unlink(&mut self.spare, page);
-                self.spares -= 1;
+                self.spare_page_count -= 1;
                 (*page).spare = false;
                 page
             };
             self.empty -= 1;
             let (start, len) = room(page);
-            let size = block_of(class);
+            let size = class_block_bytes(class);
             (*page).free = null_mut();
             (*page).fresh = start;
             (*page).end = start.add(len / size * size);
@@ -484,7 +415,6 @@ impl Blocks {
         }
     }
 
-    /// Lists every page of a segment whose header is zeros as clean, the lowest to be taken first.
     unsafe fn list(&mut self, segment: *mut Segment) {
         for i in (0..PAGES).rev() {
             unsafe { push(&mut self.clean, &raw mut (*segment).pages[i]) };
@@ -492,17 +422,15 @@ impl Blocks {
         self.empty += PAGES;
     }
 
-    /// Whether `block`, of `bytes` when it was taken, is this heap's to take back.
     pub unsafe fn owns(&self, block: *mut u8, bytes: usize) -> bool {
         unsafe { owner(block, bytes).load(Relaxed) == self.name() }
     }
 
-    /// Takes back a dead block this heap [owns](Blocks::owns). Its first word is left as it is.
     pub unsafe fn give(&mut self, block: *mut u8, bytes: usize) {
         unsafe {
             if bytes > SMALL {
                 if let Some(bytes) = self.large.remove(&block.addr()) {
-                    dealloc(block.sub(LEAD), large(bytes));
+                    dealloc(block.sub(LARGE_HEADER_BYTES), large(bytes));
                 }
                 return;
             }
@@ -516,19 +444,17 @@ impl Blocks {
                     self.retire(page);
                 }
             } else if !(*page).listed {
-                push_behind(&mut self.filling.pages[class], page);
+                push_after_head(&mut self.filling.pages[class], page);
             }
         }
     }
 
-    /// A page none of whose blocks is live leaves its class. Its segment goes back with it when that
-    /// leaves the heap a segment's worth of others.
     unsafe fn retire(&mut self, page: *mut Page) {
         unsafe {
             if (*page).listed {
                 unlink(&mut self.filling.pages[(*page).class as usize], page);
             }
-            self.shelve(page);
+            self.recycle_empty_page(page);
             let segment = segment_of(page);
             (*segment).held -= 1;
             if (*segment).held > 0 || self.empty < 2 * PAGES {
@@ -537,7 +463,7 @@ impl Blocks {
             for i in 0..PAGES {
                 let page = &raw mut (*segment).pages[i];
                 if (*page).spare {
-                    self.spares -= 1;
+                    self.spare_page_count -= 1;
                     unlink(&mut self.spare, page);
                 } else {
                     unlink(&mut self.clean, page);
@@ -545,22 +471,19 @@ impl Blocks {
             }
             self.empty -= PAGES;
             self.segments.remove(&segment.addr());
-            segment_given(segment);
+            release_segment(segment);
         }
     }
 
-    /// Lists a page none of whose blocks is live among the emptied: kept as it is while few are,
-    /// else let go.
-    unsafe fn shelve(&mut self, page: *mut Page) {
+    unsafe fn recycle_empty_page(&mut self, page: *mut Page) {
         unsafe {
             (*page).block = 0;
-            (*page).spare = self.spares < SPARES;
+            (*page).spare = self.spare_page_count < MAX_SPARE_PAGES;
             if (*page).spare {
-                self.spares += 1;
+                self.spare_page_count += 1;
                 push(&mut self.spare, page);
             } else {
                 let (start, len) = room(page);
-                // A first page begins after the header, where the system's own pages need not.
                 if len == PAGE {
                     vm::let_go(start, len);
                 }
@@ -570,12 +493,10 @@ impl Blocks {
         }
     }
 
-    /// Whether `address` is where a block this heap handed out begins.
     pub fn holds(&self, address: usize) -> bool {
         self.bytes_at(address).is_some()
     }
 
-    /// The bytes of the block at `address`, where one this heap handed out begins there.
     pub fn bytes_at(&self, address: usize) -> Option<usize> {
         if !self.segments.contains(&(address & !(SEGMENT - 1))) {
             return self.large.get(&address).copied();
@@ -594,8 +515,6 @@ impl Blocks {
         }
     }
 
-    /// Every block handed out and not since emptied with its page, dead ones among them, with its
-    /// bytes.
     pub fn each(&self, mut f: impl FnMut(*mut u8, usize)) {
         unsafe {
             for &address in &self.segments {
@@ -619,7 +538,6 @@ impl Blocks {
         }
     }
 
-    /// The bytes of the pages holding blocks and of the larger blocks, whatever is live in them.
     pub fn held(&self) -> usize {
         let pages: usize = self
             .segments
@@ -629,13 +547,10 @@ impl Blocks {
         pages * PAGE + self.large.values().sum::<usize>()
     }
 
-    /// The bytes of the emptied pages kept as they are, not let go, for the next page needed.
     pub fn kept(&self) -> usize {
-        self.spares * PAGE
+        self.spare_page_count * PAGE
     }
 
-    /// The bytes of the blocks handed out and not given back, each its size class's whole block: a
-    /// block another thread let go of counts until this heap takes it back.
     pub fn live(&self) -> usize {
         let pages: usize = self
             .segments
@@ -651,19 +566,16 @@ impl Blocks {
         pages + self.large.values().sum::<usize>()
     }
 
-    /// The bytes mapped for pages, in use or not.
     pub fn mapped(&self) -> usize {
         self.segments.len() * SEGMENT
     }
 
-    /// Takes over everything `other` holds: its blocks are this heap's from here on, and its pages
-    /// with no live block are kept, let go or given back as this heap's own would be.
     pub fn adopt(&mut self, mut other: Blocks) {
         unsafe {
             other.segments.retain(|&address| {
                 let segment = address as *mut Segment;
                 if (*segment).pages.iter().all(|page| page.live == 0) && self.empty >= PAGES {
-                    segment_given(segment);
+                    release_segment(segment);
                     return false;
                 }
                 for i in 0..PAGES {
@@ -671,14 +583,13 @@ impl Blocks {
                     if (*page).live > 0 {
                         (*page).owner.store(self.name(), SeqCst);
                         if (*page).listed {
-                            push_behind(&mut self.filling.pages[(*page).class as usize], page);
+                            push_after_head(&mut self.filling.pages[(*page).class as usize], page);
                         }
                     } else if (*page).block > 0 || (*page).spare {
-                        // A page the branch was filling holds no live block and was never retired.
                         if (*page).block > 0 {
                             (*segment).held -= 1;
                         }
-                        self.shelve(page);
+                        self.recycle_empty_page(page);
                     } else {
                         push(&mut self.clean, page);
                         self.empty += 1;
@@ -689,18 +600,13 @@ impl Blocks {
             for (&address, &bytes) in &other.large {
                 owner(address as *mut u8, bytes).store(self.name(), SeqCst);
             }
-            // A thread that read `other` as a block's owner before it changed pushes to `other`'s
-            // list: draining that list below misses none, and `other` goes with no thread holding
-            // its name.
             other.quiet();
             self.segments.append(&mut other.segments);
             self.large.append(&mut other.large);
-            self.regain(other.name());
+            self.reclaim_remote_frees(other.name());
         }
     }
 
-    /// Waits until no thread is handing back a block of this heap's, so its list of blocks handed
-    /// back holds every one there will be and nothing still holds its name.
     fn quiet(&self) {
         unsafe {
             for &address in &self.segments {
@@ -715,24 +621,23 @@ impl Blocks {
         }
     }
 
-    /// Gives back everything but one segment, which the next blocks come from.
     pub fn reset(&mut self) {
         self.quiet();
         unsafe {
             for (address, bytes) in std::mem::take(&mut self.large) {
-                dealloc((address as *mut u8).sub(LEAD), large(bytes));
+                dealloc((address as *mut u8).sub(LARGE_HEADER_BYTES), large(bytes));
             }
             let kept = self.segments.first().copied();
             self.segments.retain(|&address| {
                 if Some(address) != kept {
-                    segment_given(address as *mut Segment);
+                    release_segment(address as *mut Segment);
                 }
                 Some(address) == kept
             });
             *self.returned = Returned::default();
             self.filling.pages = [null_mut(); CLASSES];
             self.spare = null_mut();
-            self.spares = 0;
+            self.spare_page_count = 0;
             self.clean = null_mut();
             self.empty = 0;
             if let Some(address) = kept {
@@ -749,10 +654,10 @@ impl Drop for Blocks {
         self.quiet();
         unsafe {
             for (&address, &bytes) in &self.large {
-                dealloc((address as *mut u8).sub(LEAD), large(bytes));
+                dealloc((address as *mut u8).sub(LARGE_HEADER_BYTES), large(bytes));
             }
             for &address in &self.segments {
-                segment_given(address as *mut Segment);
+                release_segment(address as *mut Segment);
             }
         }
     }

@@ -17,18 +17,19 @@ import compiler.emit.representations (Definition, has_variables, layout_variable
 import compiler.emit.output (Layout)
 import compiler.emit.roots (builtin_helper, generated_builtin)
 import compiler.emit.release (released_variables)
-import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsWord, AsSum, AsFlattened, Leaf, Var,
-                               Arg, VarOperand, IntOperand, ZeroOperand, AsUnit, Allocate,
-                               ListAllocation, Native, Op, OfContainers, OfHandling, OfCalling, Let,
-                               Primitive, If, Static, operand_representation)
+import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsWord, AsSum, AsFlattened, Leaf,
+                               Variable, Arg, VariableOperand, IntOperand, ZeroOperand, AsUnit,
+                               Allocate, ListAllocation, Native, OperationCall, OfContainers,
+                               OfHandling, OfCalling, Let, Primitive, If, Static,
+                               operand_representation)
 import compiler.emit.typed_ir.handling (UnspecialisedBuiltin, Entering)
 import compiler.emit.typed_ir.calling (BlackBox)
 import compiler.emit.lower.evidence (function_value_evidence, builtin_effects)
-import compiler.emit.typed_ir.containers (ContainerOp, NodeIntrinsic, Length, ArrayLength, InBounds,
-                                          ArrayNew, ArraySet, ArrayOfList, ArrayGet, ColumnsNew,
-                                          ColumnsSet, ColumnsOfList, ColumnsGet, ColumnField,
-                                          ListInBounds, ListPush, ListSet, ColumnOf, ItemAt, Rest,
-                                          WithCapacity, Position, Element)
+import compiler.emit.typed_ir.containers (ContainerOperation, NodeIntrinsic, Length, ArrayLength,
+                                          InBounds, ArrayNew, ArraySet, ArrayOfList, ArrayGet,
+                                          ColumnsNew, ColumnsSet, ColumnsOfList, ColumnsGet,
+                                          ColumnField, ListInBounds, ListPush, ListSet, ColumnOf,
+                                          ItemAt, Rest, WithCapacity, Position, Element)
 import compiler.emit.lower.module_context (imported_target, qualified, from_import, module_import,
                                            builtin_call_types)
 import compiler.emit.lower.representation (representation_of, layout_leaves)
@@ -45,7 +46,7 @@ import compiler.emit.typed_ir.statics (StaticDefinition)
 import compiler.emit.lower.marshalling (marshalling_builtin, marshalling_builtin_call,
                                         type_descriptor, machine_word_call, fully_known,
                                         left_to_callers, assertion_failed)
-import compiler.emit.lower.kept (kept_builtin, kept_builtin_call)
+import compiler.emit.lower.conversions (conversion_builtin, conversion_builtin_call)
 import compiler.emit.lower.strings
 import compiler.emit.lower.strings (string_builtin)
 
@@ -67,9 +68,12 @@ fn typed_builtin(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match intrinsic_at(context, name) {
-    Some(op) -> match builtin_types_at(context, name, callee).ret {
-      None -> unreachable(b"an extern written in place the checker recorded no type for"),
-      Some(ret) -> intrinsic_call(context, st, op, args, ret, at),
+    Some(intrinsic) -> match builtin_types_at(context, name, callee).return_type {
+      None ->
+        unreachable(
+          b"an `extern` declared inside a function has no type recorded by type checking",
+        ),
+      Some(return_type) -> intrinsic_call(context, st, intrinsic, args, return_type, at),
     },
     None -> match if list_written_in_place(name) { Some(name) } else { resolved(context, name) } {
       None ->
@@ -77,7 +81,7 @@ fn typed_builtin(
       Some(b) -> if b == b"assert_eq" { asserted(context, st, args, at) }
       else if b == b"observe" { observe_call(context, st, args, at) }
       else if b == b"Map::new" && args.len() == 0 { empty_map(context, st, args, callee, at) }
-      else if kept_builtin(b) { kept_builtin_call(context, st, b, args, callee, at) }
+      else if conversion_builtin(b) { conversion_builtin_call(context, st, b, args, callee, at) }
       else if marshalling_builtin(b) { marshalling_builtin_call(context, st, b, args, callee, at) }
       else if string_builtin(b) { strings::string_builtin_call(context, st, b, args, callee, at) }
       else if scalar_builtin(b) { scalar_builtin_call(context, st, b, args, at) } else {
@@ -104,14 +108,23 @@ fn asserted(
     [a, b] -> {
       let ty = type_of(a);
       if has_variables(ty) {
-        left_to_callers(context, st, b"assert_eq", args, { params: [ty, ty], ret: unit_type() }, at)
+        left_to_callers(
+          context,
+          st,
+          b"assert_eq",
+          args,
+          { params: [ty, ty], result_type: unit_type() },
+          at,
+        )
       } else {
         let equal = binary(context, { st: st, arg: a }, { st: st, arg: b }, b"eq", at);
         let failed = assertion_failed(context, enter_block(equal.st), a, b, ty, at);
         {
           st: {
             ..exit_block(equal.st, failed),
-            insts: equal.st.insts.push(If({ cond: equal.arg, then: [], otherwise: failed.insts })),
+            instructions: equal.st.instructions.push(
+              If({ cond: equal.arg, then: [], otherwise: failed.instructions }),
+            ),
           },
           arg: ZeroOperand(AsUnit),
         }
@@ -129,14 +142,18 @@ fn observe_call(
   match args {
     [x] -> {
       let ty = type_of(x);
-      let held = represented_as({ st: st, arg: x }, representation_of(context.setting, ty), at);
+      let represented = represented_as(
+        { st: st, arg: x },
+        representation_of(context.setting, ty),
+        at,
+      );
       bound_as(
-        held.st,
+        represented.st,
         ty,
-        operand_representation(held.arg),
-        Op({
-          op: OfCalling(BlackBox),
-          args: [held.arg],
+        operand_representation(represented.arg),
+        OperationCall({
+          operation: OfCalling(BlackBox),
+          args: [represented.arg],
           uses: { takes: [false], owned: false, fails: false, suspends: false },
         }),
         at,
@@ -152,7 +169,7 @@ fn empty_map(
   callee: Code,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  match builtin_types_at(context, b"Map::new", callee).ret {
+  match builtin_types_at(context, b"Map::new", callee).return_type {
     Some(ty) -> {
       let d = empty_map_static();
       let statics = if st.statics.any(|x: StaticDefinition| x.name == d.name) { st.statics }
@@ -190,7 +207,8 @@ pub fn column_read(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match column_at(context, match base.node { CodeApply(a) -> a.function, _ -> base }, name) {
-    None -> unreachable(b"a field of a Columns' record no column holds: ".concat(name)),
+    None ->
+      unreachable(b"a field of a `Columns` record is not stored in any column: ".concat(name)),
     Some(c) -> match args {
       [xs, i] -> {
         let object = represented_as({ st: st, arg: xs }, AsWord, at);
@@ -199,15 +217,16 @@ pub fn column_read(
           index.st,
           c.ty,
           representation_of(context.setting, c.ty),
-          Op({
-            op: OfContainers(ColumnField({ k: c.k, column: c.column })),
+          OperationCall({
+            operation: OfContainers(ColumnField({ k: c.k, column: c.column })),
             args: [object.arg, index.arg],
             uses: { takes: [false, false], owned: false, fails: true, suspends: false },
           }),
           at,
         )
       },
-      _ -> unreachable(b"a Columns' record read on other operands than two"),
+      _ ->
+        unreachable(b"a read of a `Columns` record was given a number of arguments other than two"),
     },
   }
 
@@ -244,22 +263,22 @@ pub fn list_literal(
   let t = { ty: ty };
   {
     let item = match t.ty { NamedType(c) -> c.args.at(0), _ -> None };
-    let held = items.fold(
+    let represented_items = items.fold(
       { st: match item { Some(i) -> note_element_layout(st, i), None -> st }, args: [] },
-      |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
+      |accumulator: { st: Lowering, args: List<Arg> }, a: Arg| {
         let h = represented_as(
-          { st: acc.st, arg: a },
+          { st: accumulator.st, arg: a },
           match item { Some(i) -> representation_of(context.setting, i), None -> AsWord },
           at,
         );
-        { st: h.st, args: acc.args.push(h.arg) }
+        { st: h.st, args: accumulator.args.push(h.arg) }
       },
     );
     bound_as(
-      held.st,
+      represented_items.st,
       t.ty,
       representation_of(context.setting, t.ty),
-      Allocate({ made: ListAllocation(items.len()), args: held.args, reuse: None }),
+      Allocate({ made: ListAllocation(items.len()), args: represented_items.args, reuse: None }),
       at,
     )
   }
@@ -267,16 +286,16 @@ pub fn list_literal(
 
 pub fn item_read(context: Context, st: Lowering, xs: Arg, i: Arg, item: Type) -> LoweredValue = {
   let v = fresh(st, item, representation_of(context.setting, item));
-  { st: item_read_into(v.st, xs, i, v.var, dummy_span()), arg: VarOperand(v.var) }
+  { st: item_read_into(v.st, xs, i, v.var, dummy_span()), arg: VariableOperand(v.var) }
 }
 
-pub fn item_read_into(st: Lowering, xs: Arg, i: Arg, into: Var, at: Span) -> Lowering =
+pub fn item_read_into(st: Lowering, xs: Arg, i: Arg, into: Variable, at: Span) -> Lowering =
   emitted(
     note_element_layout(st, into.ty),
     Let({
       var: into,
-      value: Op({
-        op: OfContainers(ItemAt),
+      value: OperationCall({
+        operation: OfContainers(ItemAt),
         args: [xs, i],
         uses: { takes: [false, false], owned: false, fails: false, suspends: false },
       }),
@@ -304,8 +323,8 @@ pub fn empty_list_with_capacity(
     count.st,
     list,
     AsWord,
-    Op({
-      op: OfContainers(WithCapacity),
+    OperationCall({
+      operation: OfContainers(WithCapacity),
       args: [count.arg],
       uses: { takes: [false], owned: true, fails: false, suspends: false },
     }),
@@ -318,8 +337,8 @@ pub fn rest_read(st: Lowering, ty: Type, xs: Arg, k: Arg) -> LoweredValue =
     note_block_layout(st, ty),
     ty,
     AsWord,
-    Op({
-      op: OfContainers(Rest),
+    OperationCall({
+      operation: OfContainers(Rest),
       args: [xs, k],
       uses: { takes: [false, false], owned: true, fails: false, suspends: false },
     }),
@@ -327,14 +346,15 @@ pub fn rest_read(st: Lowering, ty: Type, xs: Arg, k: Arg) -> LoweredValue =
   )
 
 fn note_block_layout(st: Lowering, ty: Type) -> Lowering =
-  released_variables(ty).fold(st, |acc: Lowering, v: Int| with_need(acc, { var: v, reads: Layout }))
+  released_variables(ty).fold(st, |accumulator: Lowering, v: Int|
+    with_need(accumulator, { var: v, reads: Layout }))
 
-type BuiltinCallTypes = { ret: Option<Type>, args: List<Type> }
+type BuiltinCallTypes = { return_type: Option<Type>, args: List<Type> }
 
 fn builtin_types_at(context: Context, name: Bytes, callee: Code) -> BuiltinCallTypes =
   {
-    ret: match builtin_call_types(context.setting, Some(read_typed(callee)), name) {
-      Some(c) -> Some(c.ret),
+    return_type: match builtin_call_types(context.setting, Some(read_typed(callee)), name) {
+      Some(c) -> Some(c.result_type),
       None -> None,
     },
     args: read_typed(callee).args,
@@ -354,22 +374,22 @@ fn container_builtin_call(
   } else if name == b"Array::len" && args.len() == 1 {
     read_in_place(st, ArrayLength, args, int_type(), AsInt, at)
   } else if name == b"List::with_capacity" && args.len() == 1 {
-    match ((f.ret, args)) {
-      (Some(ret), [n]) -> empty_list_with_capacity(context, st, ret, n, at),
-      _ -> unreachable(b"an empty list made at no type the checker recorded"),
+    match ((f.return_type, args)) {
+      (Some(return_type), [n]) -> empty_list_with_capacity(context, st, return_type, n, at),
+      _ -> unreachable(b"an empty list has no type recorded by the checker"),
     }
   } else if name == b"numeric_of_int" && args.len() == 2
-      && (match f.ret {
+      && (match f.return_type {
         Some(t) ->
           numeric_sum(context.setting.constructors, t)
             || numeric_in_place(context.setting.constructors, t),
         None -> false,
       }) {
-    match f.ret {
+    match f.return_type {
       Some(t) -> if numeric_sum(context.setting.constructors, t) {
         numeric_function_call(context, st, b"of_int", args.drop(1), [int_type()], t, at)
       } else { numeric_converted(context, st, args.get(1), t, at) },
-      None -> unreachable(b"`numeric_of_int` at no type the checker recorded"),
+      None -> unreachable(b"`numeric_of_int` has no type recorded by the checker"),
     }
   } else if name == b"Bytes::position" { bytes_position(context, st, args, callee, at) }
   else if name == b"bracket" || name == b"?hold_bracket" {
@@ -405,7 +425,14 @@ pub fn list_pushed(
 ) -> LoweredValue / {abort.raise} =
   match list {
     NamedType(c) ->
-      laid_out_builtin(context, st, b"List::push", [out, x], { ret: Some(list), args: c.args }, at),
+      laid_out_builtin(
+        context,
+        st,
+        b"List::push",
+        [out, x],
+        { return_type: Some(list), args: c.args },
+        at,
+      ),
     _ -> unreachable(b"a push onto what is no list"),
   }
 
@@ -435,7 +462,8 @@ fn laid_out_builtin(
   }
 
 fn layouts_needed(st: Lowering, t: Type) -> Lowering =
-  type_variables(t).fold(st, |acc: Lowering, v: Int| with_need(acc, { var: v, reads: Layout }))
+  type_variables(t).fold(st, |accumulator: Lowering, v: Int|
+    with_need(accumulator, { var: v, reads: Layout }))
 
 fn list_builtin_call(
   context: Context,
@@ -503,22 +531,23 @@ fn open_layout_builtin(
   f: BuiltinCallTypes,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  match f.ret {
-    None -> unreachable(b"an array's builtin at no type the checker recorded: ".concat(name)),
-    Some(ret) ->
+  match f.return_type {
+    None ->
+      unreachable(b"an array builtin has no type recorded by the type checker: ".concat(name)),
+    Some(return_type) ->
       represented_as(
         bound_as(
           st,
-          ret,
+          return_type,
           AsWord,
-          Op({
-            op: OfHandling(UnspecialisedBuiltin(name)),
+          OperationCall({
+            operation: OfHandling(UnspecialisedBuiltin(name)),
             args: args,
             uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, suspends: false },
           }),
           at,
         ),
-        representation_of(context.setting, ret),
+        representation_of(context.setting, return_type),
         at,
       ),
   }
@@ -533,16 +562,20 @@ fn runtime_builtin_call(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   if !context.setting.builtins.contains(name) {
-    unreachable(b"a name the program declares no native of: ".concat(name))
+    unreachable(b"the program declares no native function with this name: ".concat(name))
   } else if name == b"?scope_new" || name == b"?scope_take" || name == b"Scoped::get" {
-    match f.ret {
-      Some(ret) -> scoped_builtin_call(context, st, name, args, ret, at),
+    match f.return_type {
+      Some(return_type) -> scoped_builtin_call(context, st, name, args, return_type, at),
       None ->
-        unreachable(b"a scoped value's builtin at no type the checker recorded: ".concat(name)),
+        unreachable(
+          b"a builtin on scoped values (`?scope_new`, `?scope_take` or `Scoped::get`) has no return type recorded by the type checker: ".concat(
+            name,
+          ),
+        ),
     }
   } else {
     match context.setting.machine.get(name) {
-      Some(call) -> machine_word_call(context, st, name, call, args, f.ret, callee, at),
+      Some(call) -> machine_word_call(context, st, name, call, args, f.return_type, callee, at),
       None -> unspecialised_builtin_call(context, st, name, args, f, callee, at),
     }
   }
@@ -558,16 +591,21 @@ fn unspecialised_builtin_call(
 ) -> LoweredValue / {abort.raise} = {
   let types = match builtin_call_types(context.setting, Some(read_typed(callee)), name) {
     Some(t) -> Some(t),
-    None -> match f.ret {
-      Some(ret) -> Some({ params: args.map(type_of), ret: ret }),
+    None -> match f.return_type {
+      Some(return_type) -> Some({ params: args.map(type_of), result_type: return_type }),
       None -> None,
     },
   };
   match types {
-    Some(t) -> if t.params.push(t.ret).all(fully_known) {
-      unreachable(b"a builtin the emitter writes no code for: ".concat(name))
+    Some(t) -> if t.params.push(t.result_type).all(fully_known) {
+      unreachable(b"the compiler generates no code for this builtin: ".concat(name))
     } else { left_to_callers(context, st, name, args, t, at) },
-    None -> unreachable(b"a builtin called at a type neither recorded nor declared: ".concat(name)),
+    None ->
+      unreachable(
+        b"the type checker recorded no types for this builtin call, and the program declares none: ".concat(
+          name,
+        ),
+      ),
   }
 }
 
@@ -576,7 +614,7 @@ fn scoped_builtin_call(
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
-  ret: Type,
+  return_type: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match args {
@@ -587,7 +625,7 @@ fn scoped_builtin_call(
       let native = if made { b"?hold_made" } else if read { b"?hold_read" } else { b"?hold_taken" };
       let result = bound_as(
         w.st,
-        ret,
+        return_type,
         AsWord,
         Native({
           name: builtin_helper(native).concat(b"_p"),
@@ -596,14 +634,20 @@ fn scoped_builtin_call(
         }),
         at,
       );
-      represented_as(result, representation_of(context.setting, ret), at)
+      represented_as(result, representation_of(context.setting, return_type), at)
     },
-    _ -> unreachable(b"a scoped value's builtin of other than one operand: ".concat(name)),
+    _ ->
+      unreachable(
+        b"a builtin on scoped values (`?scope_new`, `?scope_take` or `Scoped::get`) must take exactly one argument: ".concat(
+          name,
+        ),
+      ),
   }
 
 fn note_element_layout(st: Lowering, t: Type) -> Lowering =
   if !has_open_layout(t) { st } else {
-    layout_variables(t).fold(st, |acc: Lowering, v: Int| with_need(acc, { var: v, reads: Layout }))
+    layout_variables(t).fold(st, |accumulator: Lowering, v: Int|
+      with_need(accumulator, { var: v, reads: Layout }))
   }
 
 fn has_open_layout(t: Type) -> Bool =
@@ -616,7 +660,7 @@ fn has_open_layout(t: Type) -> Bool =
 
 fn read_in_place(
   st: Lowering,
-  op: ContainerOp,
+  container_operation: ContainerOperation,
   args: List<Arg>,
   ty: Type,
   rep: Representation,
@@ -624,7 +668,7 @@ fn read_in_place(
 ) -> LoweredValue / {abort.raise} = {
   let object = match args.at(0) {
     Some(a) -> represented_as({ st: st, arg: a }, AsWord, at),
-    None -> unreachable(b"a read of nothing"),
+    None -> unreachable(b"a read from a container has no container argument"),
   };
   let index = match args.at(1) {
     Some(i) -> {
@@ -637,8 +681,8 @@ fn read_in_place(
     index.st,
     ty,
     rep,
-    Op({
-      op: OfContainers(op),
+    OperationCall({
+      operation: OfContainers(container_operation),
       args: index.args,
       uses: { takes: index.args.map(|_: Arg| false), owned: false, fails: false, suspends: false },
     }),
@@ -664,13 +708,13 @@ type IntrinsicShape = { operands: List<Operand>, result: IntrinsicReturn, owned:
 pub fn intrinsic_call(
   context: Context,
   st: Lowering,
-  op: Intrinsic,
+  intrinsic: Intrinsic,
   args: List<Arg>,
   ty: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let l = intrinsic_shape(op);
-  let items = intrinsic_items(op);
+  let l = intrinsic_shape(intrinsic);
+  let items = intrinsic_items(intrinsic);
   let result = match l.result {
     Plain(r) -> Some(r),
     Item -> Some(representation_of(context.setting, ty)),
@@ -680,21 +724,28 @@ pub fn intrinsic_call(
     },
   };
   match result {
-    None -> unreachable(b"a write in place returning a record of a width past a word"),
+    None ->
+      unreachable(
+        b"an extern function that updates a container in place returns a record that does not fit in one machine word",
+      ),
     Some(rep) -> if l.operands.len() != args.len() {
-      unreachable(b"an extern written in place on other operands than it takes")
+      unreachable(
+        b"an extern function that updates a container in place is called with a different number of arguments than it declares",
+      )
     } else if (match l.result { Item -> false, _ -> is_option(ty) && !pointer_option(context, ty) })
         || range(0, args.len()).any(|i: Int|
           l.operands.at(i) == Some(ConsumedOption)
             && (match args.at(i) {
-              Some(VarOperand(v)) -> !pointer_option(context, v.ty),
+              Some(VariableOperand(v)) -> !pointer_option(context, v.ty),
               Some(_) -> false,
               None -> true,
             })) {
-      unreachable(b"an extern written in place over an Option of other than one pointer")
+      unreachable(
+        b"an extern function that updates a container in place uses an `Option` that is not represented as a single pointer",
+      )
     } else {
       let object = match args.at(0) { Some(a) -> type_of(a), None -> ty };
-      let laid_types = match op {
+      let laid_types = match intrinsic {
         OfMap(_) -> match object {
           NamedType(c) -> if c.name == map_name() { [] } else { c.args },
           _ -> [],
@@ -704,12 +755,12 @@ pub fn intrinsic_call(
       let laid_st = laid_types.fold(st, |s: Lowering, t: Type| note_element_layout(s, t));
       let handed_over = range(0, args.len()).fold(
         { st: laid_st, args: [] },
-        |acc: { st: Lowering, args: List<Arg> }, i: Int|
+        |accumulator: { st: Lowering, args: List<Arg> }, i: Int|
           match args.at(i) {
-            None -> acc,
+            None -> accumulator,
             Some(a) -> {
               let h = represented_as(
-                { st: acc.st, arg: a },
+                { st: accumulator.st, arg: a },
                 match l.operands.at(i) {
                   Some(Index) -> AsInt,
                   Some(ConsumedOption) -> AsWord,
@@ -718,11 +769,11 @@ pub fn intrinsic_call(
                 },
                 at,
               );
-              { st: h.st, args: acc.args.push(h.arg) }
+              { st: h.st, args: accumulator.args.push(h.arg) }
             },
           },
       );
-      let copies = l.operands.at(0) == Some(Consumed) && op != Recast;
+      let copies = l.operands.at(0) == Some(Consumed) && intrinsic != Recast;
       let returned = bound_as(
         if copies {
           match args.at(0) {
@@ -732,8 +783,8 @@ pub fn intrinsic_call(
         } else { handed_over.st },
         ty,
         rep,
-        Op({
-          op: OfContainers(NodeIntrinsic(op)),
+        OperationCall({
+          operation: OfContainers(NodeIntrinsic(intrinsic)),
           args: handed_over.args,
           uses: {
             takes: l.operands.map(|o: Operand| o == Consumed || o == ConsumedOption),
@@ -762,8 +813,8 @@ fn returned_record_leaves(context: Context, ty: Type) -> Option<List<Leaf>> = {
 
 type IntrinsicItems = { read: Bool, at: List<Int> }
 
-fn intrinsic_items(op: Intrinsic) -> IntrinsicItems =
-  match op {
+fn intrinsic_items(intrinsic: Intrinsic) -> IntrinsicItems =
+  match intrinsic {
     OfMap(NodeKey) -> { read: true, at: [] },
     OfMap(NodeValue) -> { read: true, at: [] },
     OfMap(ChildMaxKey) -> { read: true, at: [] },
@@ -774,7 +825,7 @@ fn intrinsic_items(op: Intrinsic) -> IntrinsicItems =
     _ -> { read: false, at: [] },
   }
 
-fn intrinsic_shape(op: Intrinsic) -> IntrinsicShape = {
+fn intrinsic_shape(intrinsic: Intrinsic) -> IntrinsicShape = {
   let read = |operands: List<Operand>, rep: Representation|
     { operands: operands, result: Plain(rep), owned: false };
   let item = { operands: [Read, Index], result: Item, owned: false };
@@ -782,7 +833,7 @@ fn intrinsic_shape(op: Intrinsic) -> IntrinsicShape = {
   let written = |operands: List<Operand>|
     { operands: operands, result: Plain(AsWord), owned: true };
   let record = |operands: List<Operand>| { operands: operands, result: Fields, owned: true };
-  match op {
+  match intrinsic {
     OfMap(MapRoot) -> read([Read], AsWord),
     OfMap(NodeCount) -> read([Read], AsInt),
     OfMap(MapHeight) -> read([Read], AsInt),
@@ -817,8 +868,8 @@ fn columns_of(context: Context, ty: Type) -> Option<List<Element>> =
   match record_fields(ty) {
     None -> None,
     Some(fs) ->
-      fs.fold(Some([]), |acc: Option<List<Element>>, x: Field|
-        match acc {
+      fs.fold(Some([]), |accumulator: Option<List<Element>>, x: Field|
+        match accumulator {
           None -> None,
           Some(es) -> match element_of(context, x.ty) { Some(e) -> Some(es.push(e)), None -> None },
         }),
@@ -835,9 +886,9 @@ fn array_builtin_call(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match es.at(0) {
-    None -> unreachable(b"an array whose elements lay out as nothing"),
+    None -> unreachable(b"an array element type has no memory layout"),
     Some(e) -> {
-      let held = representation_of(context.setting, ty);
+      let representation = representation_of(context.setting, ty);
       let array = array_type(ty);
       if name == b"Array::at" {
         found_at(
@@ -858,7 +909,7 @@ fn array_builtin_call(
           st,
           ArrayNew(e),
           args,
-          [AsInt, held],
+          [AsInt, representation],
           [false, true],
           true,
           true,
@@ -871,7 +922,7 @@ fn array_builtin_call(
           st,
           ArraySet(e),
           args,
-          [AsWord, AsInt, held],
+          [AsWord, AsInt, representation],
           [true, false, true],
           true,
           true,
@@ -893,7 +944,9 @@ fn array_builtin_call(
           ty,
           at,
         )
-      } else { unreachable(b"an array's builtin no emitted code writes: ".concat(name)) }
+      } else {
+        unreachable(b"the compiler generates no code for this array builtin: ".concat(name))
+      }
     },
   }
 
@@ -907,7 +960,7 @@ fn columns_builtin_call(
   f: BuiltinCallTypes,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let held = representation_of(context.setting, ty);
+  let representation = representation_of(context.setting, ty);
   let columns = columns_type(ty);
   let first = match record_fields(ty) {
     Some(fs) -> match fs.at(0) { Some(x) -> x.ty, None -> unit_type() },
@@ -920,7 +973,7 @@ fn columns_builtin_call(
         let c0 = column_of(cw.st, cw.arg, 0, first, at);
         read_in_place(c0.st, ArrayLength, [c0.arg], int_type(), AsInt, at)
       },
-      _ -> unreachable(b"a Columns' length on other operands than one"),
+      _ -> unreachable(b"a Columns length must take exactly one operand"),
     }
   } else if name == b"Columns::at" {
     found_at(
@@ -941,7 +994,7 @@ fn columns_builtin_call(
       st,
       ColumnsNew(es),
       args,
-      [AsInt, held],
+      [AsInt, representation],
       [false, true],
       true,
       true,
@@ -954,7 +1007,7 @@ fn columns_builtin_call(
       st,
       ColumnsSet(es),
       args,
-      [AsWord, AsInt, held],
+      [AsWord, AsInt, representation],
       [true, false, true],
       true,
       true,
@@ -987,16 +1040,16 @@ fn columns_builtin_call(
       ty,
       at,
     )
-  } else { unreachable(b"a Columns' builtin no emitted code writes: ".concat(name)) }
+  } else { unreachable(b"the compiler generates no code for this Columns builtin: ".concat(name)) }
 }
 
 fn return_type_or(f: BuiltinCallTypes, otherwise: Type) -> Type =
-  match f.ret { Some(t) -> t, None -> otherwise }
+  match f.return_type { Some(t) -> t, None -> otherwise }
 
 fn container_called(
   context: Context,
   st: Lowering,
-  op: ContainerOp,
+  container_operation: ContainerOperation,
   args: List<Arg>,
   reps: List<Representation>,
   takes: List<Bool>,
@@ -1006,25 +1059,25 @@ fn container_called(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   if args.len() != reps.len() {
-    unreachable(b"a container's builtin on other operands than it takes")
+    unreachable(b"a container builtin has a different number of operands than it takes")
   } else {
     let operands = range(0, args.len()).fold(
       { st: st, args: [] },
-      |acc: { st: Lowering, args: List<Arg> }, i: Int|
+      |accumulator: { st: Lowering, args: List<Arg> }, i: Int|
         match ((args.at(i), reps.at(i))) {
           (Some(a), Some(r)) -> {
-            let h = represented_as({ st: acc.st, arg: a }, r, at);
-            { st: h.st, args: acc.args.push(h.arg) }
+            let h = represented_as({ st: accumulator.st, arg: a }, r, at);
+            { st: h.st, args: accumulator.args.push(h.arg) }
           },
-          _ -> acc,
+          _ -> accumulator,
         },
     );
     bound_as(
       operands.st,
       result,
       representation_of(context.setting, result),
-      Op({
-        op: OfContainers(op),
+      OperationCall({
+        operation: OfContainers(container_operation),
         args: operands.args,
         uses: { takes: takes, owned: owned, fails: fails, suspends: false },
       }),
@@ -1038,8 +1091,8 @@ fn found_at(
   args: List<Arg>,
   item: Type,
   result: Type,
-  inside_test: ContainerOp,
-  get: ContainerOp,
+  inside_test: ContainerOperation,
+  get: ContainerOperation,
   fails: Bool,
   column: Option<Type>,
   at: Span,
@@ -1056,8 +1109,8 @@ fn found_at(
         tested.st,
         bool_type(),
         AsBool,
-        Op({
-          op: OfContainers(inside_test),
+        OperationCall({
+          operation: OfContainers(inside_test),
           args: [tested.arg, iw.arg],
           uses: { takes: [false, false], owned: false, fails: false, suspends: false },
         }),
@@ -1067,8 +1120,8 @@ fn found_at(
         enter_block(inside.st),
         item,
         representation_of(context.setting, item),
-        Op({
-          op: OfContainers(get),
+        OperationCall({
+          operation: OfContainers(get),
           args: [xw.arg, iw.arg],
           uses: { takes: [false, false], owned: false, fails: fails, suspends: false },
         }),
@@ -1085,7 +1138,7 @@ fn found_at(
       );
       base::joined(context, inside, some, none, false, at)
     },
-    _ -> unreachable(b"a container's element looked up on other operands than two"),
+    _ -> unreachable(b"a container element lookup must take exactly two operands"),
   }
 
 fn column_of(st: Lowering, cs: Arg, k: Int, ty: Type, at: Span) -> LoweredValue =
@@ -1093,8 +1146,8 @@ fn column_of(st: Lowering, cs: Arg, k: Int, ty: Type, at: Span) -> LoweredValue 
     st,
     array_type(ty),
     AsWord,
-    Op({
-      op: OfContainers(ColumnOf(k)),
+    OperationCall({
+      operation: OfContainers(ColumnOf(k)),
       args: [cs],
       uses: { takes: [false], owned: false, fails: false, suspends: false },
     }),
@@ -1119,8 +1172,8 @@ fn bytes_position(
         words.st,
         int_type(),
         AsInt,
-        Op({
-          op: OfContainers(Position),
+        OperationCall({
+          operation: OfContainers(Position),
           args: [bw.arg, fr.arg, fw.arg].concat(words.args),
           uses: {
             takes: [false, false, false, false, false],
@@ -1135,7 +1188,7 @@ fn bytes_position(
         index.st,
         bool_type(),
         AsBool,
-        Primitive({ op: b"ge", on: AsInt, args: [index.arg, IntOperand(0)] }),
+        Primitive({ operation: b"ge", on: AsInt, args: [index.arg, IntOperand(0)] }),
         at,
       );
       let some = constructed_as(
@@ -1156,7 +1209,7 @@ fn bytes_position(
       );
       base::joined(context, found, some, none, false, at)
     },
-    _ -> unreachable(b"a byte string's position on other operands than three"),
+    _ -> unreachable(b"a byte string position lookup must take exactly three operands"),
   }
 
 fn bracketed(
@@ -1172,24 +1225,24 @@ fn bracketed(
         let aw = represented_as({ st: st, arg: acquire }, AsWord, at);
         let bw = represented_as({ st: aw.st, arg: body }, AsWord, at);
         let rw = represented_as({ st: bw.st, arg: release }, AsWord, at);
-        let held = type_descriptor(context, rw.st, a.ret, at);
-        let result = type_descriptor(context, held.st, b.ret, at);
+        let resource_descriptor = type_descriptor(context, rw.st, a.return_type, at);
+        let result = type_descriptor(context, resource_descriptor.st, b.return_type, at);
         let words = function_value_evidence(context, result.st, builtin_effects(callee), at);
         let ran = bound_as(
           run_for_effect(
             words.st,
-            Op({
-              op: OfHandling(Entering),
+            OperationCall({
+              operation: OfHandling(Entering),
               args: words.args,
               uses: { takes: [false, false], owned: false, fails: false, suspends: false },
             }),
             at,
           ),
-          b.ret,
+          b.return_type,
           AsWord,
           Native({
             name: b"rt_with_cleanup_p",
-            args: [aw.arg, bw.arg, rw.arg, held.arg, result.arg],
+            args: [aw.arg, bw.arg, rw.arg, resource_descriptor.arg, result.arg],
             uses: {
               takes: [true, true, true, false, false],
               owned: true,
@@ -1199,11 +1252,11 @@ fn bracketed(
           }),
           at,
         );
-        represented_as(ran, representation_of(context.setting, b.ret), at)
+        represented_as(ran, representation_of(context.setting, b.return_type), at)
       },
-      _ -> unreachable(b"a bracket over other than functions"),
+      _ -> unreachable(b"the operands of `bracket` must all be functions"),
     },
-    _ -> unreachable(b"a bracket on other operands than three"),
+    _ -> unreachable(b"`bracket` must take exactly three operands"),
   }
 
 pub fn scalar_builtin(name: Bytes) -> Bool =

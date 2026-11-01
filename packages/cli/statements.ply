@@ -6,7 +6,7 @@ import compiler.front.emitter_input (ConstSite, TestRunScope, consts_of_type)
 import compiler.store.hash.forms (FunctionNamed, reach)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (length_prefixed)
-import compiler.load (reached_roots, LoadedAnalysis)
+import compiler.load (reachable_roots, LoadedAnalysis)
 import compiler.cc
 import compiler.check.resolve.tables (Diagnostic, error_at, error_with_labels, label_at)
 import machine
@@ -98,35 +98,41 @@ pub type CheckSite = { site: StatementSite, check: StatementCheck, schemas: List
 pub fn check_sites(frame: Frame) -> List<CheckSite> / {abort.raise} = {
   let schemas = consts_of_type(frame, schema_type());
   let callees = statement_runners().map(|p: StatementRunner| p.callee);
-  let places = range(0, frame.outlines.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-    acc.insert(frame.outlines.get(i).name, i));
+  let places = range(0, frame.outlines.len()).fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Int>, i: Int| accumulator.insert(frame.outlines.get(i).name, i),
+  );
   let imports = frame.imports.map(|names: List<Bytes>|
-    names.fold([], |acc: List<Int>, n: Bytes|
-      match places.get(n) { Some(i) -> acc.push(i), None -> acc }));
+    names.fold([], |accumulator: List<Int>, n: Bytes|
+      match places.get(n) { Some(i) -> accumulator.push(i), None -> accumulator }));
   frame.statements.filter(|site: StatementSite| callees.contains(site.callee)).fold(
     [],
-    |acc: List<CheckSite>, site: StatementSite|
+    |accumulator: List<CheckSite>, site: StatementSite|
       match statement_check_of(site) {
-        None -> acc,
+        None -> accumulator,
         Some(a) -> {
-          let reached = reached_modules(imports, site.module);
-          let held = schemas.filter(|s: ConstSite| reached.contains(s.module));
-          acc.push({
+          let reachable_modules = transitive_modules(imports, site.module);
+          let reachable_schemas = schemas.filter(|s: ConstSite|
+            reachable_modules.contains(s.module));
+          accumulator.push({
             site: site,
-            check: { ..a, schema: if held.len() == 1 { held.at(0) } else { None } },
-            schemas: held,
+            check: {
+              ..a,
+              schema: if reachable_schemas.len() == 1 { reachable_schemas.at(0) } else { None },
+            },
+            schemas: reachable_schemas,
           })
         },
       },
   )
 }
 
-fn reached_modules(imports: List<List<Int>>, module: Int) -> List<Int> =
+fn transitive_modules(imports: List<List<Int>>, module: Int) -> List<Int> =
   range(0, imports.len()).fold([module], |seen: List<Int>, _: Int|
-    seen.fold(seen, |acc: List<Int>, m: Int|
+    seen.fold(seen, |accumulator: List<Int>, m: Int|
       List::fold(
         match imports.at(m) { Some(xs) -> xs, None -> [] },
-        acc,
+        accumulator,
         |more: List<Int>, x: Int| if more.contains(x) { more } else { more.push(x) },
       )))
 
@@ -279,18 +285,19 @@ pub fn check_result_key(toolchain: Bytes, a: StatementCheck) -> Bytes / {abort.r
     ),
   )
 
-fn callees_in(a: Argument, acc: List<Bytes>, left: Int) -> List<Bytes> =
-  if left <= 0 { acc } else {
+fn callees_in(a: Argument, accumulator: List<Bytes>, left: Int) -> List<Bytes> =
+  if left <= 0 { accumulator } else {
     match a {
       CallArgument(c) ->
         c.args.fold(
-          if acc.contains(c.callee) { acc } else { acc.push(c.callee) },
+          if accumulator.contains(c.callee) { accumulator } else { accumulator.push(c.callee) },
           |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1),
         ),
-      TaggedArgument(t) -> if acc.contains(t.callee) { acc } else { acc.push(t.callee) },
+      TaggedArgument(t) -> if accumulator.contains(t.callee) { accumulator }
+      else { accumulator.push(t.callee) },
       ListArgument(items) ->
-        items.fold(acc, |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1)),
-      _ -> acc,
+        items.fold(accumulator, |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1)),
+      _ -> accumulator,
     }
   }
 
@@ -314,8 +321,8 @@ fn computed_value(
       },
       TaggedArgument(t) -> {
         let texts = t.parts.map(|p: Bytes| VStr(String::of_bytes_lossy(p)));
-        let handed = match texts { [one] -> one, _ -> VList(texts) };
-        match computed_of(call(String::of_bytes_lossy(t.callee), [handed])) {
+        let tag_argument = match texts { [one] -> one, _ -> VList(texts) };
+        match computed_of(call(String::of_bytes_lossy(t.callee), [tag_argument])) {
           Known(VCtor(name, [v])) -> if constructor_name(name) == "Ok" { Known(v) }
           else { Unknown },
           Stopped -> Stopped,
@@ -331,9 +338,9 @@ fn all_computed(
   left: Int,
   call: (String, List<Value>) -> CallResult / {entering::machine.enter, abort.raise},
 ) -> Result<List<Value>, Computed> / {entering::machine.enter, abort.raise} =
-  xs.fold(Ok([]), |acc: Result<List<Value>, Computed>, x: Argument|
-    match acc {
-      Err(_) -> acc,
+  xs.fold(Ok([]), |accumulator: Result<List<Value>, Computed>, x: Argument|
+    match accumulator {
+      Err(_) -> accumulator,
       Ok(vs) -> match computed_value(x, left, call) {
         Known(v) -> Ok(vs.push(v)),
         other -> Err(other),
@@ -349,22 +356,25 @@ fn computed_of(called: CallResult) -> Computed =
 pub fn check_statements(
   analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
   frame: Frame,
-  asked: List<StatementCheck>,
+  statement_checks: List<StatementCheck>,
 ) -> Result<List<Option<CheckResult>>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
-  let schemas = asked.fold([], |acc: List<Bytes>, a: StatementCheck|
+  let schemas = statement_checks.fold([], |accumulator: List<Bytes>, a: StatementCheck|
     match a.schema {
-      Some(s) -> if acc.contains(s.name) { acc } else { acc.push(s.name) },
-      None -> acc,
+      Some(s) -> if accumulator.contains(s.name) { accumulator } else { accumulator.push(s.name) },
+      None -> accumulator,
     });
-  let named = asked.fold(schemas, |acc: List<Bytes>, a: StatementCheck|
-    callees_in(a.statement, acc, 64));
+  let named = statement_checks.fold(schemas, |accumulator: List<Bytes>, a: StatementCheck|
+    callees_in(a.statement, accumulator, 64));
   if named.len() == 0 {
-    Ok(asked.map(|a: StatementCheck| Some(check_result_of(None, a, computed_text(a.statement)))))
+    Ok(
+      statement_checks.map(|a: StatementCheck|
+        Some(check_result_of(None, a, computed_text(a.statement)))),
+    )
   } else {
-    let reached = reach(frame.hashes, named.map(|n: Bytes| FunctionNamed(n))).functions;
-    let front = analysis_for({ owners: reached, tests: Map::new() });
+    let reachable_functions = reach(frame.hashes, named.map(|n: Bytes| FunctionNamed(n))).functions;
+    let front = analysis_for({ owners: reachable_functions, tests: Map::new() });
     match units::library_over(
-        emit.unit(front, reached_roots(front, reached), None),
+        emit.unit(front, reachable_roots(front, reachable_functions), None),
         cc::development(),
       ) {
       Err(diagnostics) -> Err(diagnostics),
@@ -374,17 +384,20 @@ pub fn check_statements(
           let roots = machine::roots_of(front.dump);
           let call = |name: String, args: List<Value>|
             machine::machine_call(opened.unit, roots, name, args, machine::evaluation_limits());
-          let declared = schemas.fold(Map::new(), |acc: Map<Bytes, Computed>, name: Bytes|
-            acc.insert(name, computed_of(call(String::of_bytes_lossy(name), []))));
-          let check_statements = asked.map(|a: StatementCheck| {
+          let declared = schemas.fold(
+            Map::new(),
+            |accumulator: Map<Bytes, Computed>, name: Bytes|
+              accumulator.insert(name, computed_of(call(String::of_bytes_lossy(name), []))),
+          );
+          let check_statements = statement_checks.map(|a: StatementCheck| {
             match match a.schema { Some(s) -> declared.get(s.name), None -> None } {
               Some(Stopped) -> None,
-              held -> match computed_value(a.statement, 64, call) {
+              schema_result -> match computed_value(a.statement, 64, call) {
                 Stopped -> None,
                 value ->
                   Some(
                     check_result_of(
-                      match held { Some(Known(v)) -> schema_of(v), _ -> None },
+                      match schema_result { Some(Known(v)) -> schema_of(v), _ -> None },
                       a,
                       match value { Known(v) -> Some(v), _ -> None },
                     ),
@@ -447,8 +460,8 @@ fn text_in(v: Option<Value>) -> Option<String> = match v { Some(VStr(s)) -> Some
 fn every<a>(v: Option<Value>, f: (Value) -> Option<a>) -> Option<List<a>> =
   match v {
     Some(VList(items)) ->
-      items.fold(Some([]), |acc: Option<List<a>>, item: Value|
-        match acc {
+      items.fold(Some([]), |accumulator: Option<List<a>>, item: Value|
+        match accumulator {
           None -> None,
           Some(xs) -> match f(item) { Some(x) -> Some(xs.push(x)), None -> None },
         }),
@@ -536,7 +549,7 @@ fn statement_of(v: Value) -> Option<String> =
 
 fn source_of(a: Argument) -> Bytes =
   match a {
-    CallArgument(c) -> if c.callee == b"std.sql.stmt" { b"the text written here" }
+    CallArgument(c) -> if c.callee == b"std.sql.statement_of" { b"the text written here" }
     else { Bytes::concat_all([b"`", c.callee, b"()`"]) },
     TaggedArgument(t) -> Bytes::concat_all([b"a tagged literal, read by `", t.callee, b"`"]),
     _ -> b"the text written here",
@@ -560,9 +573,9 @@ pub fn check_diagnostics(a: CheckSite, j: CheckResult) -> List<Diagnostic> / {ab
           Bytes::concat_all([b"this statement ", message, b" in the schema `", schema_name, b"`"])
         } else if f.code == b"E0470" {
           Bytes::concat_all([
-            b"the check does not follow ",
+            b"the SQL schema check does not support ",
             message,
-            b" in a statement it holds to the schema",
+            b" in a statement checked against the schema",
           ])
         } else { message };
         let placed = if f.at <= 0 { [] } else {
@@ -607,20 +620,20 @@ pub fn check_diagnostics(a: CheckSite, j: CheckResult) -> List<Diagnostic> / {ab
       }),
   }
 
-pub fn schemas_rejected(asks: List<CheckSite>) -> List<Diagnostic> =
-  asks.fold(
+pub fn schemas_rejected(check_sites: List<CheckSite>) -> List<Diagnostic> =
+  check_sites.fold(
     { modules: [], diagnostics: [] },
-    |acc: { modules: List<Int>, diagnostics: List<Diagnostic> }, a: CheckSite|
-      if acc.modules.contains(a.site.module) { acc } else {
+    |accumulator: { modules: List<Int>, diagnostics: List<Diagnostic> }, a: CheckSite|
+      if accumulator.modules.contains(a.site.module) { accumulator } else {
         match a.schemas {
           [first, second, ..] ->
             {
-              modules: acc.modules.push(a.site.module),
-              diagnostics: acc.diagnostics.push(
+              modules: accumulator.modules.push(a.site.module),
+              diagnostics: accumulator.diagnostics.push(
                 error_with_labels(
                   b"E0471",
                   Bytes::concat_all([
-                    b"this statement's module reaches two schemas, `",
+                    b"this statement's module uses two SQL schemas, `",
                     first.name,
                     b"` and `",
                     second.name,
@@ -637,7 +650,7 @@ pub fn schemas_rejected(asks: List<CheckSite>) -> List<Diagnostic> =
                 ),
               ),
             },
-          _ -> acc,
+          _ -> accumulator,
         }
       },
   ).diagnostics
@@ -657,7 +670,7 @@ test "every operation and definition that runs a statement is declared in a stat
     ))
 }
 
-test "a call's statement, parameters and row are read from where the call writes them" {
+test "`statement_check_of` reads a database call's query text, parameter types and result row fields from the arguments written at the call" {
   let text = CallArgument({ callee: b"m.items_all", hash: b"h", args: [] });
   let query = statement_check_of(
     a_site(b"std.db.db.query", [text, ListArgument([a_param(b"PInt"), OtherArgument])]),
@@ -696,14 +709,14 @@ test "a call's statement, parameters and row are read from where the call writes
   assert_eq(statement_check_of(a_site(b"m.other", [text])), None)
 }
 
-test "a derived codec's fields are held to the columns as a document where they are not scalars" {
+test "a derived codec's scalar fields map to their column types, and its non-scalar fields map to document or array columns" {
   assert_eq(kind_of(JsonRead), sql::JsonField);
   assert_eq(kind_of(ArrayRead(b"int_field")), sql::ArrayField(sql::IntField));
   assert_eq(kind_of(OptionalRead(DocumentRead)), sql::OptionalField(sql::JsonField));
   assert_eq(scalar_kind(b"numeric_field"), sql::NumericField)
 }
 
-test "a schema reads back from the value the machine returned for it" {
+test "a schema is decoded from the value that evaluating its definition returns" {
   let column = |name: String, ty: Value, nullable: Bool|
     VRecord([
       { name: "default", value: VCtor("std.sql.DNone", []) },
@@ -760,12 +773,12 @@ test "a schema reads back from the value the machine returned for it" {
   )
 }
 
-test "a module's statements are held to the schema it declares or imports, at any depth" {
+test "a module's statements are checked against the schema it declares or imports, directly or indirectly" {
   let imports = [[1], [2], [], [0], []];
-  assert_eq(reached_modules(imports, 0), [0, 1, 2]);
-  assert_eq(reached_modules(imports, 3), [3, 0, 1, 2]);
-  assert_eq(reached_modules(imports, 4), [4]);
-  assert_eq(reached_modules([[1], [0]], 1), [1, 0])
+  assert_eq(transitive_modules(imports, 0), [0, 1, 2]);
+  assert_eq(transitive_modules(imports, 3), [3, 0, 1, 2]);
+  assert_eq(transitive_modules(imports, 4), [4]);
+  assert_eq(transitive_modules([[1], [0]], 1), [1, 0])
 }
 
 test "what the check found is reported at the call, naming the statement and the schema" {

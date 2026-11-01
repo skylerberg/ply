@@ -4,7 +4,6 @@ use ply_compiled::c::sweep::{
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-/// `n` files of `size` bytes, the first written longest ago.
 fn stock(dir: &Path, names: &[&str], size: usize) {
     let base = SystemTime::now() - Duration::from_secs(10_000);
     for (i, name) in names.iter().enumerate() {
@@ -36,7 +35,7 @@ fn a_cache_inside_its_budget_is_left_alone() {
 }
 
 #[test]
-fn a_cached_result_is_swept_with_the_objects() {
+fn the_sweep_removes_the_oldest_cached_result_even_when_newer_objects_exist() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["bodies/old", "obj/b.o", "bodies/new"];
     stock(dir.path(), &names, 100);
@@ -49,7 +48,6 @@ fn the_oldest_entries_go_until_the_rest_fits() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["bodies/a", "bodies/b", "bodies/c", "d.dylib"];
     stock(dir.path(), &names, 100);
-    // Four hundred bytes, and room for two.
     let freed = sweep(dir.path(), 200);
     assert_eq!(freed, 200, "two of the four should have gone");
     assert_eq!(
@@ -69,7 +67,8 @@ fn a_file_at_any_depth_is_swept() {
 }
 
 #[test]
-fn an_object_is_as_removable_as_a_cached_result() {
+fn a_sweep_over_budget_deletes_older_object_files_and_libraries_and_keeps_the_newest_cached_result()
+{
     let dir = tempfile::tempdir().unwrap();
     let names = ["old.dylib", "obj/older.o", "bodies/new"];
     stock(dir.path(), &names, 100);
@@ -77,7 +76,6 @@ fn an_object_is_as_removable_as_a_cached_result() {
     assert_eq!(present(dir.path(), &names), vec!["bodies/new".to_string()]);
 }
 
-/// A run about to open the unit it just linked finds it, however far the cache is over its budget.
 #[test]
 fn an_entry_of_the_last_hour_is_never_swept() {
     let dir = tempfile::tempdir().unwrap();
@@ -88,9 +86,8 @@ fn an_entry_of_the_last_hour_is_never_swept() {
     assert!(dir.path().join("linked.so").exists());
 }
 
-/// An object every run loads was written once, long ago: its use, not its writing, is its age.
 #[test]
-fn an_object_used_lately_outlives_one_written_later() {
+fn an_object_used_recently_survives_the_sweep_while_an_object_written_later_is_removed() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["loaded.dylib", "obj/later.o", "bodies/latest"];
     stock(dir.path(), &names, 100);
@@ -102,9 +99,8 @@ fn an_object_used_lately_outlives_one_written_later() {
     );
 }
 
-/// The sweep orders entries by hours, so a use minutes after the last one writes nothing.
 #[test]
-fn a_recent_mark_stands_and_an_old_one_is_renewed() {
+fn using_a_library_file_sets_its_modified_time_to_now_only_when_that_time_is_over_an_hour_old() {
     let dir = tempfile::tempdir().unwrap();
     let mark = |name: &str, ago: u64| {
         let path = dir.path().join(name);
@@ -124,7 +120,6 @@ fn a_recent_mark_stands_and_an_old_one_is_renewed() {
     assert!(modified(&old) > when);
 }
 
-/// A half-written entry belongs to a run still in progress.
 #[test]
 fn a_temporary_is_never_swept() {
     let dir = tempfile::tempdir().unwrap();
@@ -145,9 +140,8 @@ fn a_temporary_is_never_swept() {
     );
 }
 
-/// So processes starting together do not all walk.
 #[test]
-fn one_process_a_lease_begins_a_sweep_and_the_rest_do_not() {
+fn only_one_process_can_claim_the_sweep_until_its_claim_expires_then_another_can() {
     let dir = tempfile::tempdir().unwrap();
     assert!(
         claim(dir.path(), Duration::from_secs(120)),
@@ -164,9 +158,8 @@ fn one_process_a_lease_begins_a_sweep_and_the_rest_do_not() {
     );
 }
 
-/// A process that exits mid-walk finished nothing, so the next one past the lease sweeps.
 #[test]
-fn a_sweep_is_owed_until_one_finishes() {
+fn a_sweep_stays_needed_until_a_sweep_finishes_and_is_needed_again_after_the_interval_passes() {
     let dir = tempfile::tempdir().unwrap();
     assert!(due(dir.path(), Duration::from_secs(600)));
     assert!(claim(dir.path(), Duration::from_secs(120)));
@@ -182,9 +175,8 @@ fn a_sweep_is_owed_until_one_finishes() {
     );
 }
 
-/// The sweep's own marks are not entries: removing them would hand the sweep to the next process.
 #[test]
-fn the_marks_survive_a_sweep_that_empties_the_cache() {
+fn the_sweep_timestamp_files_remain_after_a_sweep_deletes_every_cache_entry() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["bodies/a", "bodies/b"];
     stock(dir.path(), &names, 100);
@@ -209,8 +201,7 @@ fn set_file(path: &Path, when: SystemTime) {
 }
 
 #[test]
-fn a_budget_of_zero_bytes_is_no_bound_rather_than_an_empty_cache() {
-    // The env var is process-wide, so this asserts the parse rather than setting it.
+fn a_cache_budget_of_zero_bytes_means_unlimited_rather_than_an_empty_cache() {
     assert_eq!(
         "0".parse::<u64>().ok().filter(|n| *n > 0),
         None,
@@ -228,7 +219,6 @@ fn set(path: &Path, when: SystemTime) {
         .unwrap();
 }
 
-/// A stage directory as a run leaves it: `size` bytes of builder, last used `ago` before `now`.
 fn stage(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -240,8 +230,6 @@ fn stage(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
     set(&dir, now - ago);
 }
 
-/// A cached front of `size` bytes under the stage-directory entry `under`, last used `ago` before
-/// `now`.
 fn cache_file(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago: Duration) {
     let dir = root.join(under);
     std::fs::create_dir_all(&dir).unwrap();
@@ -249,7 +237,6 @@ fn cache_file(root: &Path, under: &str, name: &str, size: usize, now: SystemTime
     set(&dir.join(name), now - ago);
 }
 
-/// An opened artifact's cached front.
 fn front(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
     cache_file(root, RETURNED, name, size, now, ago);
 }
@@ -267,10 +254,9 @@ fn a_stage_directory_inside_its_budget_is_left_alone() {
     assert!(root.path().join(RETURNED).join("front.a").exists());
 }
 
-/// A stage goes whole and a front goes on its own, least recently used first, and whatever a run
-/// used within the hour stays however far over budget the rest is.
 #[test]
-fn stages_and_fronts_go_least_recently_used_first() {
+fn sweep_stages_deletes_the_least_recently_used_cached_directories_and_files_first_until_the_rest_fits_the_budget()
+ {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
     front(root.path(), "front.oldest", 100, now, 5 * HOUR);
@@ -288,9 +274,9 @@ fn stages_and_fronts_go_least_recently_used_first() {
     assert!(root.path().join(RETURNED).join("front.fresh").exists());
 }
 
-/// A stage is written once and used by every run after, so its use, not its writing, is its age.
 #[test]
-fn a_stage_used_lately_outlives_one_written_later() {
+fn sweep_stages_keeps_a_cached_directory_used_recently_over_another_directory_written_later_but_used_less_recently()
+ {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
     stage(root.path(), "written-early", 100, now, 9 * HOUR);
@@ -304,10 +290,8 @@ fn a_stage_used_lately_outlives_one_written_later() {
     assert!(!root.path().join("written-late").exists());
 }
 
-/// A store of cached records is its segments and manifest together, written over many runs and read
-/// by more: it goes whole, by when a run last used it, and never a segment of it alone.
 #[test]
-fn a_store_of_cached_records_goes_whole_by_its_last_use() {
+fn the_sweep_deletes_a_directory_of_cached_records_as_a_whole_ordered_by_when_it_was_last_used() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
     let store = |name: &str, written: Duration, used: Duration| {
@@ -321,7 +305,6 @@ fn a_store_of_cached_records_goes_whole_by_its_last_use() {
         set(&dir.join(USED), now - used);
         set(&dir, now - written);
     };
-    // Both were written as long ago; a run read the second since, though it wrote nothing there.
     store("idle", 9 * HOUR, 9 * HOUR);
     store("read", 9 * HOUR, 2 * HOUR);
     std::fs::create_dir_all(root.path().join("obj")).unwrap();
@@ -331,7 +314,6 @@ fn a_store_of_cached_records_goes_whole_by_its_last_use() {
     assert!(!root.path().join(STORES).join("idle").exists());
     assert!(root.path().join(STORES).join("read").join("seg-1").exists());
     assert!(root.path().join("obj/a.o").exists());
-    // One a run used within the hour stays however far over budget the rest is.
     set(&root.path().join(STORES).join("read").join(USED), now);
     sweep(root.path(), 0);
     assert!(
@@ -345,7 +327,8 @@ fn a_store_of_cached_records_goes_whole_by_its_last_use() {
 }
 
 #[test]
-fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
+fn sweep_stages_never_deletes_a_temporary_file_still_being_written_or_the_file_that_records_the_last_sweep()
+ {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
     front(root.path(), "front.1234.tmp", 100, now, 5 * HOUR);
@@ -356,10 +339,9 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
     assert!(root.path().join(STAMP).exists());
 }
 
-/// A result `ply run` or `ply check` cached goes on its own, like an artifact's front, and never as
-/// one stage holding every result: the least recently used go first, and the directory stays.
 #[test]
-fn a_reused_cached_result_goes_on_its_own_least_recently_used_first() {
+fn sweep_stages_deletes_reused_cached_results_and_returned_files_and_stage_directories_together_least_recently_used_first()
+ {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
     cache_file(root.path(), REUSED, "old", 100, now, 6 * HOUR);
@@ -383,8 +365,6 @@ fn a_reused_cached_result_goes_on_its_own_least_recently_used_first() {
     );
 }
 
-/// A cached result half written belongs to a run still writing it, and the directory is no stage to
-/// remove whole however far over budget its files are.
 #[test]
 fn a_reused_cached_result_being_written_is_never_swept() {
     let root = tempfile::tempdir().unwrap();

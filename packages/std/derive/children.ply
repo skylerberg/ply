@@ -1,16 +1,18 @@
-//! `derive children for T`: the walks of a tree of `T`s, each named after `snake_case(T)` as a
-//! codec is, so an alias of a record derives them as a sum does.
+//! `derive children for T` derives functions that walk a tree of `T` values. Their names start with
+//! `snake_case(T)`, the same prefix a codec uses, and they work for an alias of a record as well as
+//! for a sum. Below, `<t>` stands for that prefix.
 //!
-//! - `<t>_children(x)`: the `T`s directly inside `x`, in the order it holds them.
-//! - `<t>_children_mapped(x, f)`: `x` with each of those replaced by what `f` returns for it.
-//! - `<t>_nodes(x)`: `x` and every `T` inside it, each before the `T`s inside it.
-//! - `<t>_nodes_folded(x, init, f)`: what `f` folds over those nodes in that order, from `init`,
-//!   which builds no list of them.
-//! - `<t>_nodes_mapped(x, f)`: `x` rebuilt with `f` applied to each node after the nodes inside it.
+//! - `<t>_children(x)`: returns the `T`s directly inside `x`, in the order `x` stores them. -
+//! `<t>_children_mapped(x, f)`: returns `x` with each of those `T`s replaced by the result of `f`
+//! on it. - `<t>_nodes(x)`: returns `x` and every `T` inside it, each node before the `T`s inside
+//! it. - `<t>_nodes_folded(x, init, f)`: folds `f`, starting from `init`, over those nodes in that
+//! order, without building a list of them. - `<t>_nodes_mapped(x, f)`: returns `x` rebuilt with `f`
+//! applied to each node after the nodes inside it have been rebuilt.
 //!
-//! A `T` inside `x` is reached through the types the module declares, records, `List`s, `Option`s
-//! and the values of a `Map`; every other part is left as it is. `f` runs in the order the walk
-//! reaches the nodes, and what it performs the walk performs.
+//! A walk finds a `T` inside `x` by going through fields whose types are declared in the module,
+//! and through the elements of records, `List`s, `Option`s and the values of a `Map`. All other
+//! parts are left unchanged. `f` runs in the order the walk visits the nodes, and the effects of
+//! `f` are effects of the walk.
 
 import std.derive
 import std.derive (rejection_of, declared_type, applied_type, Declaration, TypeDeclaration, Type,
@@ -20,7 +22,8 @@ import std.list
 import std.string
 import std.text
 
-/// The deriver: the four walks of the declaration's target.
+/// Returns the source of the five walk functions for the declaration's target type, or a `Refused`
+/// when the type has nothing to walk.
 pub fn derive(declaration: Declaration) -> Result<String, Refused> / {abort.raise} = {
   let target = derive::target(declaration);
   let w = {
@@ -31,12 +34,17 @@ pub fn derive(declaration: Declaration) -> Result<String, Refused> / {abort.rais
     folded: fresh_type(target),
   };
   if target.labels.len() > 0 {
-    rejected("a type that takes a label holds a function, which no walk reaches through")
+    rejected(
+      "a type with a label parameter contains a function, and `derive` cannot look inside a function",
+    )
   } else {
     match fields_of(w, target.body) {
       Err(r) -> Err(r),
       Ok(parts) -> if !parts.any(|t: Type| contains_target(w, t)) {
-        rejected("`" ++ target.name ++ "` holds no `" ++ target.name ++ "` to walk to")
+        rejected(
+          "`" ++ target.name ++ "` has no field that contains a `" ++ target.name
+            ++ "`, so `derive` has nothing to traverse",
+        )
       } else {
         match ((
             gathered(w, target.body, "[]", Children),
@@ -69,11 +77,8 @@ pub fn derive(declaration: Declaration) -> Result<String, Refused> / {abort.rais
 fn rejected(message: String) -> Result<String, Refused> =
   Err({ message: message, at: None, notes: [] })
 
-/// How deep a part's type may nest, aliases expanded, before a walk rejects it.
 fn depth() -> Int = 256
 
-/// What every step reads: the declaration, its target, the stem of the walks' names, the target as
-/// its own declaration writes it, `T<a, b>`, and the type a fold's accumulator is.
 type Walking = {
   d: Declaration,
   target: TypeDeclaration,
@@ -82,28 +87,41 @@ type Walking = {
   folded: String,
 }
 
-/// A walk that gathers: the `T`s directly inside a value, every node, or what a fold makes of them.
 type Gathering = | Children | Nodes | Folded
 
-/// The type a gathering walk's accumulator is.
 fn accumulator_type(w: Walking, how: Gathering) -> String =
   match how { Folded -> w.folded, _ -> "List<" ++ w.target_type ++ ">" }
 
-/// A walk that rebuilds: each `T` directly inside a value replaced, or each node after its own.
 type Rebuilding = | ChildrenMapped | NodesMapped
 
-/// The types of the parts of a value of the target, by how its body is declared.
 fn fields_of(w: Walking, body: derive::Body) -> Result<List<Type>, Refused> =
   match body {
     Alias(Record(fields)) -> Ok(fields.map(|f: Field| f.ty)),
     Nominal(Record(fields)) -> Ok(fields.map(|f: Field| f.ty)),
-    Sum(variants) -> Ok(variants.fold([], |acc: List<Type>, v: Variant| acc.concat(v.fields))),
-    Alias(_) -> Err(rejection("`" ++ w.target.name ++ "` is an alias of no record")),
-    Nominal(_) -> Err(rejection("`" ++ w.target.name ++ "` is a `new` type that is not a record")),
-    Extern -> Err(rejection("`" ++ w.target.name ++ "` is laid out by the toolchain")),
+    Sum(variants) ->
+      Ok(variants.fold([], |accumulator: List<Type>, v: Variant| accumulator.concat(v.fields))),
+    Alias(_) ->
+      Err(
+        rejection(
+          "`" ++ w.target.name
+            ++ "` is an alias of a type that is not a record, and `derive` needs a record or a sum type",
+        ),
+      ),
+    Nominal(_) ->
+      Err(
+        rejection(
+          "`" ++ w.target.name
+            ++ "` is a `new` type that is not a record, and `derive` needs a record or a sum type",
+        ),
+      ),
+    Extern ->
+      Err(
+        rejection(
+          "`" ++ w.target.name ++ "` is a built-in type, so `derive` cannot see its fields",
+        ),
+      ),
   }
 
-/// The bodies of the walks, each an expression over `x`.
 type Bodies = {
   children: String,
   nodes: String,
@@ -112,7 +130,6 @@ type Bodies = {
   nodes_mapped: String,
 }
 
-/// The walks, each over the target's own parameters.
 fn walks_text(w: Walking, b: Bodies) -> String / {abort.raise} = {
   let t = w.target;
   let row = fresh_effects(t);
@@ -179,33 +196,30 @@ fn walks_text(w: Walking, b: Bodies) -> String / {abort.raise} = {
   )
 }
 
-/// `<a, b | e>` over the type parameters and effect variables; nothing where there are none.
 fn generics(types: List<String>, rows: List<String>) -> String =
   if types.len() == 0 && rows.len() == 0 { "" }
   else if rows.len() == 0 { "<" ++ String::join(types, ", ") ++ ">" }
   else if types.len() == 0 { "<| " ++ String::join(rows, ", ") ++ ">" }
   else { "<" ++ String::join(types, ", ") ++ " | " ++ String::join(rows, ", ") ++ ">" }
 
-/// A type variable the target does not take, for what a fold accumulates.
 fn fresh_type(t: TypeDeclaration) -> String / {abort.raise} =
   iterate("folded", t.types.len() + t.rows.len() + 1, |n: String|
     if t.types.contains(n) || t.rows.contains(n) { Continue(n ++ "_") } else { Stop(n) })
 
-/// A effect variable the target does not take, for what `f` performs.
 fn fresh_effects(t: TypeDeclaration) -> String / {abort.raise} =
   iterate("e", t.types.len() + t.rows.len() + 1, |n: String|
     if t.types.contains(n) || t.rows.contains(n) { Continue(n ++ "_") } else { Stop(n) })
 
-// --- What holds a `T` ---------------------------------------------------------------------------
-
 fn too_deep() -> Refused =
-  { message: "a part's type nests deeper than a walk follows", at: None, notes: [] }
+  {
+    message: "a part's type has too many levels of nesting for `derive` to follow",
+    at: None,
+    notes: [],
+  }
 
-/// Whether a value of `t` may hold a `T`, through the types the module declares.
 fn contains_target(w: Walking, t: Type) -> Bool / {abort.raise} =
   contains_target_within(w, t, [], depth())
 
-/// `contains_target`, with `seen` the declared types already asked of, whose parts are asked once.
 fn contains_target_within(
   w: Walking,
   t: Type,
@@ -245,14 +259,12 @@ fn contains_target_within(
 
 fn is_target(w: Walking, n: TypeName) -> Bool = n.module == None && n.name == w.target.name
 
-/// The declaration of a type the module declares, other than the target.
 fn own_declaration(w: Walking, n: TypeName) -> Option<TypeDeclaration> =
   match n.module {
     Some(_) -> None,
     None -> if n.name == w.target.name { None } else { declared(w.d, n.name) },
   }
 
-/// `t` with each of `params` replaced by the argument at its place in `args`.
 fn substituted(t: Type, params: List<String>, args: List<Type>) -> Type / {abort.raise} =
   match t {
     Param(p) -> match range(0, params.len()).find(|i: Int| params.get(i) == p) {
@@ -272,21 +284,29 @@ fn substituted(t: Type, params: List<String>, args: List<Type>) -> Type / {abort
     Unit -> Unit,
   }
 
-/// Whether `args` are the target's own parameters, in order: a walk hands each `T` it reaches to a
-/// function of the target's own type.
 fn own_arguments(w: Walking, args: List<Type>) -> Bool =
   args == w.target.types.map(|p: String| Param(p))
 
 fn rejection(message: String) -> Refused = { message: message, at: None, notes: [] }
 
-/// Why a part of type `t`, which contains a `T`, is not visited, when it is not.
 fn walk_rejection(w: Walking, t: Type) -> Option<Refused> =
   match t {
     Function(_, _, _) ->
-      Some(rejection("a function holds a `" ++ w.target.name ++ "`, and no walk reaches into one")),
+      Some(
+        rejection(
+          "a function contains a `" ++ w.target.name
+            ++ "`, and `derive` cannot look inside a function",
+        ),
+      ),
     Applied(n, args, _, _) -> if is_target(w, n) {
-      if own_arguments(w, args) { None }
-      else { Some(rejection("a `" ++ w.target.name ++ "` at other type arguments than its own")) }
+      if own_arguments(w, args) { None } else {
+        Some(
+          rejection(
+            "a `" ++ w.target.name
+              ++ "` appears with type arguments that differ from the parameters of its declaration",
+          ),
+        )
+      }
     } else if n.module == None && (n.name == "List" || n.name == "Option" || n.name == "Map") {
       None
     } else {
@@ -296,7 +316,7 @@ fn walk_rejection(w: Walking, t: Type) -> Option<Refused> =
           Some(
             rejection(
               "`" ++ derive::name_text(n) ++ "` holds a `" ++ w.target.name
-                ++ "`, and a walk reaches only through the types this module declares, records, lists, options and maps",
+                ++ "`, but `derive` looks only inside `List`, `Option`, `Map` and types declared in this module",
             ),
           ),
       }
@@ -304,45 +324,41 @@ fn walk_rejection(w: Walking, t: Type) -> Option<Refused> =
     _ -> None,
   }
 
-// --- Gathering ----------------------------------------------------------------------------------
-
-/// The expression a gathering walk returns for a value of the target, `x`, from `acc`.
 fn gathered(
   w: Walking,
   body: derive::Body,
-  acc: String,
+  accumulator: String,
   how: Gathering,
 ) -> Result<String, Refused> / {abort.raise} =
   match body {
-    Sum(variants) -> gathered_cases(w, variants, [], "x", acc, how, 0, [], depth()),
-    Alias(Record(fields)) -> gathered_fields(w, fields, "x", acc, how, 0, [], depth()),
-    Nominal(Record(fields)) -> gathered_fields(w, fields, "x", acc, how, 0, [], depth()),
-    _ -> Err(rejection("`" ++ w.target.name ++ "` has no parts to walk")),
+    Sum(variants) -> gathered_cases(w, variants, [], "x", accumulator, how, 0, [], depth()),
+    Alias(Record(fields)) -> gathered_fields(w, fields, "x", accumulator, how, 0, [], depth()),
+    Nominal(Record(fields)) -> gathered_fields(w, fields, "x", accumulator, how, 0, [], depth()),
+    _ ->
+      Err(rejection("`" ++ w.target.name ++ "` has no fields or variants for `derive` to look at")),
   }
 
-/// The accumulator once each `T` in `v`, of type `t`, is gathered onto `acc`; `acc` itself where
-/// `t` holds none. `n` numbers the names it binds; `seen` are the declared types it is inside of.
 fn gathering(
   w: Walking,
   t: Type,
   v: String,
-  acc: String,
+  accumulator: String,
   how: Gathering,
   n: Int,
   seen: List<String>,
   depth: Int,
 ) -> Result<String, Refused> / {abort.raise} =
   if depth <= 0 { Err(too_deep()) }
-  else if !contains_target(w, t) { Ok(acc) } else {
+  else if !contains_target(w, t) { Ok(accumulator) } else {
     match walk_rejection(w, t) {
       Some(r) -> Err(r),
       None -> match t {
-        Record(fields) -> gathered_fields(w, fields, v, acc, how, n, seen, depth - 1),
+        Record(fields) -> gathered_fields(w, fields, v, accumulator, how, n, seen, depth - 1),
         Applied(name, args, _, _) -> if is_target(w, name) {
           Ok(match how {
-            Children -> acc ++ ".push(" ++ v ++ ")",
-            Nodes -> w.snake_name ++ "_nodes_onto(" ++ acc ++ ", " ++ v ++ ")",
-            Folded -> w.snake_name ++ "_nodes_folded(" ++ v ++ ", " ++ acc ++ ", f)",
+            Children -> accumulator ++ ".push(" ++ v ++ ")",
+            Nodes -> w.snake_name ++ "_nodes_onto(" ++ accumulator ++ ", " ++ v ++ ")",
+            Folded -> w.snake_name ++ "_nodes_folded(" ++ v ++ ", " ++ accumulator ++ ", f)",
           })
         } else {
           let y = "y" ++ n.to_string();
@@ -353,7 +369,7 @@ fn gathering(
               Err(r) -> Err(r),
               Ok(e) ->
                 Ok(
-                  v ++ ".fold(" ++ acc ++ ", |" ++ a ++ ": " ++ list ++ ", " ++ y ++ ": "
+                  v ++ ".fold(" ++ accumulator ++ ", |" ++ a ++ ": " ++ list ++ ", " ++ y ++ ": "
                     ++ type_text(item)
                     ++ "| "
                     ++ e
@@ -361,13 +377,14 @@ fn gathering(
                 ),
             },
             ("Option", [item]) -> {
-              let held = shared(acc, n);
-              match gathering(w, item, y, held.name, how, n + 1, seen, depth - 1) {
+              let shared_accumulator = shared(accumulator, n);
+              match gathering(w, item, y, shared_accumulator.name, how, n + 1, seen, depth - 1) {
                 Err(r) -> Err(r),
                 Ok(e) ->
                   Ok(
-                    held.around(
-                      "match " ++ v ++ " { Some(" ++ y ++ ") -> " ++ e ++ ", None -> " ++ held.name
+                    shared_accumulator.around(
+                      "match " ++ v ++ " { Some(" ++ y ++ ") -> " ++ e ++ ", None -> "
+                        ++ shared_accumulator.name
                         ++ " }",
                     ),
                   ),
@@ -375,14 +392,18 @@ fn gathering(
             },
             ("Map", [key, item]) -> if contains_target(w, key) {
               Err(
-                rejection("a `Map` key holds a `" ++ w.target.name ++ "`, and keys are not walked"),
+                rejection(
+                  "a `Map` key contains a `" ++ w.target.name
+                    ++ "`, and `derive` does not look inside map keys",
+                ),
               )
             } else {
               match gathering(w, item, y, a, how, n + 1, seen, depth - 1) {
                 Err(r) -> Err(r),
                 Ok(e) ->
                   Ok(
-                    v ++ ".fold(" ++ acc ++ ", |" ++ a ++ ": " ++ list ++ ", k" ++ n.to_string()
+                    v ++ ".fold(" ++ accumulator ++ ", |" ++ a ++ ": " ++ list ++ ", k"
+                      ++ n.to_string()
                       ++ ": "
                       ++ type_text(key)
                       ++ ", "
@@ -396,12 +417,12 @@ fn gathering(
               }
             },
             _ -> match own_declaration(w, name) {
-              None -> Ok(acc),
+              None -> Ok(accumulator),
               Some(u) -> if seen.contains(u.name) {
                 Err(
                   rejection(
                     "`" ++ u.name ++ "` holds itself other than through `" ++ w.target.name
-                      ++ "`, which a walk does not follow",
+                      ++ "`, and `derive` cannot follow a type that contains itself that way",
                   ),
                 )
               } else {
@@ -412,7 +433,7 @@ fn gathering(
                       w,
                       substituted(body, u.types, args),
                       v,
-                      acc,
+                      accumulator,
                       how,
                       n,
                       inner,
@@ -423,58 +444,65 @@ fn gathering(
                       w,
                       fields.map(|f: Field| { name: f.name, ty: substituted(f.ty, u.types, args) }),
                       v,
-                      acc,
+                      accumulator,
                       how,
                       n,
                       inner,
                       depth - 1,
                     ),
                   Sum(variants) ->
-                    gathered_cases(w, variants, u.types, v, acc, how, n, inner, depth - 1, args),
-                  _ -> Ok(acc),
+                    gathered_cases(
+                      w,
+                      variants,
+                      u.types,
+                      v,
+                      accumulator,
+                      how,
+                      n,
+                      inner,
+                      depth - 1,
+                      args,
+                    ),
+                  _ -> Ok(accumulator),
                 }
               },
             },
           }
         },
-        _ -> Ok(acc),
+        _ -> Ok(accumulator),
       },
     }
   }
 
-/// The accumulator once each field of the record `v` is gathered onto `acc` in turn.
 fn gathered_fields(
   w: Walking,
   fields: List<Field>,
   v: String,
-  acc: String,
+  accumulator: String,
   how: Gathering,
   n: Int,
   seen: List<String>,
   depth: Int,
 ) -> Result<String, Refused> / {abort.raise} =
-  fields.fold(Ok(acc), |out: Result<String, Refused>, f: Field|
+  fields.fold(Ok(accumulator), |out: Result<String, Refused>, f: Field|
     match out {
       Err(r) -> Err(r),
       Ok(a) -> gathering(w, f.ty, v ++ "." ++ f.name, a, how, n, seen, depth),
     })
 
-/// A `match` on the sum `v` whose arms gather what each case holds onto `acc`; a case that contains
-/// no `T` returns `acc`. `params` and `args` are the sum's parameters and what this part fills them
-/// with.
 fn gathered_cases(
   w: Walking,
   variants: List<Variant>,
   params: List<String>,
   v: String,
-  acc: String,
+  accumulator: String,
   how: Gathering,
   n: Int,
   seen: List<String>,
   depth: Int,
   args: List<Type> = [],
 ) -> Result<String, Refused> / {abort.raise} = {
-  let held = shared(acc, n);
+  let shared_accumulator = shared(accumulator, n);
   let arms = variants.fold(Ok([]), |out: Result<List<String>, Refused>, c: Variant|
     match out {
       Err(r) -> Err(r),
@@ -484,7 +512,7 @@ fn gathered_cases(
           let names = range(0, fields.len()).map(|i: Int|
             "h" ++ n.to_string() ++ "_" ++ i.to_string());
           let walked = range(0, fields.len()).fold(
-            Ok(held.name),
+            Ok(shared_accumulator.name),
             |e: Result<String, Refused>, i: Int|
               match e {
                 Err(r) -> Err(r),
@@ -504,9 +532,12 @@ fn gathered_cases(
       let all = variants.all(|c: Variant|
         c.fields.any(|t: Type| contains_target(w, substituted(t, params, args))));
       Ok(
-        held.around(
+        shared_accumulator.around(
           "match " ++ v ++ " { "
-            ++ String::join(if all { xs } else { xs.push("_ -> " ++ held.name) }, ", ")
+            ++ String::join(
+              if all { xs } else { xs.push("_ -> " ++ shared_accumulator.name) },
+              ", ",
+            )
             ++ " }",
         ),
       )
@@ -514,17 +545,18 @@ fn gathered_cases(
   }
 }
 
-/// `acc` as more than one arm reads it: by a name bound once around them, `around`, unless it is a
-/// name or an empty list already, which is read where it stands.
-fn shared(acc: String, n: Int) -> { name: String, around: (String) -> String } =
-  if acc == "[]" || !acc.chars().any(|c: Char| c == '(' || c == '{' || c == '[' || c == ' ') {
-    { name: acc, around: |e: String| e }
+fn shared(accumulator: String, n: Int) -> { name: String, around: (String) -> String } =
+  if accumulator == "[]"
+      || !accumulator.chars().any(|c: Char| c == '(' || c == '{' || c == '[' || c == ' ') {
+    { name: accumulator, around: |e: String| e }
   } else {
     let name = "s" ++ n.to_string();
-    { name: name, around: |e: String| "{ let " ++ name ++ " = " ++ acc ++ "; " ++ e ++ " }" }
+    {
+      name: name,
+      around: |e: String| "{ let " ++ name ++ " = " ++ accumulator ++ "; " ++ e ++ " }",
+    }
   }
 
-/// A case's fields as its pattern binds them: those that hold a `T` by name, the rest `_`.
 fn case_pattern(w: Walking, fields: List<Type>, names: List<String>) -> String / {abort.raise} =
   if fields.len() == 0 { "" } else {
     "("
@@ -536,10 +568,6 @@ fn case_pattern(w: Walking, fields: List<Type>, names: List<String>) -> String /
       ++ ")"
   }
 
-// --- Rebuilding ---------------------------------------------------------------------------------
-
-/// The expression a rebuilding walk returns for a value of the target, `x`: `x` with what its parts
-/// contain rebuilt, before a node walk applies `f` to it.
 fn rebuilt_whole(
   w: Walking,
   body: derive::Body,
@@ -552,11 +580,10 @@ fn rebuilt_whole(
     },
     Alias(Record(fields)) -> rebuilt_record(w, fields, "x", how, 0, [], depth()),
     Nominal(Record(fields)) -> rebuilt_record(w, fields, "x", how, 0, [], depth()),
-    _ -> Err(rejection("`" ++ w.target.name ++ "` has no parts to walk")),
+    _ ->
+      Err(rejection("`" ++ w.target.name ++ "` has no fields or variants for `derive` to look at")),
   }
 
-/// `v`, of type `t`, rebuilt with each `T` it contains replaced; nothing where `t` contains none
-/// and `v` is left as it is.
 fn rebuilding(
   w: Walking,
   t: Type,
@@ -607,7 +634,10 @@ fn rebuilding(
             },
             ("Map", [key, item]) -> if contains_target(w, key) {
               Err(
-                rejection("a `Map` key holds a `" ++ w.target.name ++ "`, and keys are not walked"),
+                rejection(
+                  "a `Map` key contains a `" ++ w.target.name
+                    ++ "`, and `derive` does not look inside map keys",
+                ),
               )
             } else {
               match inner(item) {
@@ -626,7 +656,7 @@ fn rebuilding(
                 Err(
                   rejection(
                     "`" ++ u.name ++ "` holds itself other than through `" ++ w.target.name
-                      ++ "`, which a walk does not follow",
+                      ++ "`, and `derive` cannot follow a type that contains itself that way",
                   ),
                 )
               } else {
@@ -659,10 +689,8 @@ fn rebuilding(
     }
   }
 
-/// What rebuilt `y` is: `e` where it was rebuilt, `y` where it was left as it was.
 fn rebuilt(e: Option<String>, y: String) -> String = match e { Some(x) -> x, None -> y }
 
-/// The record `v` with each field that holds a `T` rebuilt.
 fn rebuilt_record(
   w: Walking,
   fields: List<Field>,
@@ -685,8 +713,6 @@ fn rebuilt_record(
     Ok(xs) -> Ok("{ .." ++ v ++ ", " ++ String::join(xs, ", ") ++ " }"),
   }
 
-/// A `match` on the sum `v` whose arms build each case again with what it contains rebuilt; a case
-/// that contains no `T` is left as it is.
 fn rebuilt_cases(
   w: Walking,
   variants: List<Variant>,
@@ -756,9 +782,6 @@ fn rebuilt_cases(
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
-/// What deriving the walks of `target` among `types` returns.
 fn derived(
   target: String,
   types: List<TypeDeclaration>,
@@ -772,7 +795,7 @@ fn derived(
     imports: [],
   })
 
-test "a tree is walked through the records, lists and options its own types hold, and the rest is kept" {
+test "a walk over a type's children descends into records, lists, options and the module's own types, and leaves every other type unchanged" {
   let expression = |args: List<Type>| applied_type("E", args);
   let types = [
     declared_type(
@@ -833,7 +856,7 @@ test "a tree is walked through the records, lists and options its own types hold
   }
 }
 
-test "a type no walk can reach through is rejected, at the case that holds it" {
+test "deriving a walk fails for a type it cannot descend into, and names the variant that contains that type" {
   let sum = |fields: List<Type>|
     [declared_type("T", [], Sum([{ name: "V", fields: fields }, { name: "Leaf", fields: [] }]))];
   assert_eq(
@@ -844,7 +867,7 @@ test "a type no walk can reach through is rejected, at the case that holds it" {
     rejection_of(
       derived("T", sum([applied_type("Map", [applied_type("T", []), applied_type("Int", [])])])),
     ).message,
-    "a `Map` key holds a `T`, and keys are not walked",
+    "a `Map` key contains a `T`, and `derive` does not look inside map keys",
   );
   let loop = [
     declared_type("T", [], Sum([{ name: "V", fields: [applied_type("U", [])] }])),
@@ -859,7 +882,7 @@ test "a type no walk can reach through is rejected, at the case that holds it" {
   ];
   assert_eq(
     rejection_of(derived("T", loop)).message,
-    "`U` holds itself other than through `T`, which a walk does not follow",
+    "`U` holds itself other than through `T`, and `derive` cannot follow a type that contains itself that way",
   );
   assert_eq(
     rejection_of(
@@ -867,6 +890,6 @@ test "a type no walk can reach through is rejected, at the case that holds it" {
         declared_type("T", [], Sum([{ name: "V", fields: [applied_type("Int", [])] }])),
       ]),
     ).message,
-    "`T` holds no `T` to walk to",
+    "`T` has no field that contains a `T`, so `derive` has nothing to traverse",
   )
 }

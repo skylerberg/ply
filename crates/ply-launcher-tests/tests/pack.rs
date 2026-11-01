@@ -1,8 +1,5 @@
-//! The pack a native program carries after its code, read back as a bootstrap lays it out.
-
 use std::io::Write;
 
-/// `files` laid out as a pack after `code`: their bytes, the table ascending by path, the trailer.
 fn binary(code: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut sorted = files.to_vec();
     sorted.sort_by_key(|(path, _)| *path);
@@ -41,7 +38,7 @@ fn framed(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn a_binary_reads_back_each_file_of_the_pack_after_its_code() {
+fn a_binary_with_a_bundle_of_files_appended_after_its_code_lets_each_bundled_file_be_read_back() {
     let pack = read(&binary(
         b"\x7fELF code",
         &[
@@ -68,7 +65,7 @@ fn a_binary_reads_back_each_file_of_the_pack_after_its_code() {
 }
 
 #[test]
-fn a_pack_lists_the_modules_and_the_data_below_a_root() {
+fn a_bundle_of_files_lists_the_module_files_and_the_data_files_under_a_given_directory() {
     let pack = read(&binary(
         b"",
         &[
@@ -97,7 +94,8 @@ fn a_pack_lists_the_modules_and_the_data_below_a_root() {
 }
 
 #[test]
-fn a_cached_result_is_the_frame_a_range_of_the_cached_results_file_holds() {
+fn a_cached_result_is_the_length_prefixed_record_at_an_offset_and_length_within_a_bundled_cache_file()
+ {
     let one = framed(b"one record");
     let two = framed(b"another");
     let store = [one.clone(), two.clone()].concat();
@@ -119,14 +117,14 @@ fn a_cached_result_is_the_frame_a_range_of_the_cached_results_file_holds() {
         Some(b"another".to_vec())
     );
     assert_eq!(pack.result("index", 0, 0), Some(b"index".to_vec()));
-    // Not where a frame starts, past the file, or no file at all.
     assert_eq!(pack.result("store", 1, one.len()), None);
     assert_eq!(pack.result("store", one.len(), two.len() + 1), None);
     assert_eq!(pack.result("records", 0, 0), None);
 }
 
 #[test]
-fn a_packs_digest_moves_with_any_file_and_with_nothing_else() {
+fn a_bundle_digest_changes_when_a_bundled_file_changes_and_does_not_change_when_the_binary_code_changes()
+ {
     let digest = |code: &[u8], files: &[(&str, &[u8])]| {
         read(&binary(code, files))
             .expect("the pack reads")
@@ -140,7 +138,8 @@ fn a_packs_digest_moves_with_any_file_and_with_nothing_else() {
 }
 
 #[test]
-fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
+fn a_bundle_digest_over_the_std_and_compiler_directories_changes_with_files_in_them_but_not_with_files_elsewhere()
+ {
     let below = |files: &[(&str, &[u8])]| {
         read(&binary(b"", files))
             .expect("the pack reads")
@@ -169,7 +168,6 @@ fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
         ("compiler/infer.ply", b"q"),
         ("program/front", b"f"),
     ]));
-    // The program, and a file whose path only starts as a root's does, are no part of it.
     assert!(!moved(&[
         ("std/option.ply", b"a"),
         ("stdlib.txt", b"d"),
@@ -178,10 +176,8 @@ fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
     ]));
 }
 
-// A stage is named for the program, which reaches only some shipped modules: an edit to another,
-// or to a test in one, must still move the directory a rebuilt `ply` reads them from.
 #[test]
-fn a_stages_shipped_directory_moves_with_any_shipped_file() {
+fn the_shipped_directory_name_changes_with_the_build_stage_the_file_set_name_and_the_digest() {
     let name = ply_launcher::shipped_dir_name;
     let base = name("stamps", "definitions", &[1; 32]);
     assert_eq!(name("stamps", "definitions", &[1; 32]), base);
@@ -208,7 +204,6 @@ fn a_torn_pack_is_rejected_rather_than_read() {
         "a trailer naming more than the binary holds"
     );
 
-    // The table claims a file runs past where the table begins.
     let mut overrun = whole.clone();
     let table_len = u64::from_le_bytes(overrun[trailer + 8..trailer + 16].try_into().unwrap());
     let table = trailer - table_len as usize;
@@ -218,7 +213,7 @@ fn a_torn_pack_is_rejected_rather_than_read() {
 }
 
 #[test]
-fn a_table_out_of_order_is_rejected() {
+fn reading_a_bundle_whose_file_list_is_not_sorted_by_path_fails_with_an_error() {
     let mut data = b"12".to_vec();
     let mut table = 2u32.to_le_bytes().to_vec();
     for (path, at) in [("b", 0u64), ("a", 1u64)] {

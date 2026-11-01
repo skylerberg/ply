@@ -44,7 +44,7 @@ fn first(reply: &Reply) -> Scalar {
 }
 
 #[test]
-fn the_engine_is_built_with_the_options_the_tree_asks_for() {
+fn the_sqlite_engine_is_compiled_with_the_options_ply_requires() {
     let mut engine = empty();
     let options: Vec<String> = done(&mut engine, "PRAGMA compile_options")
         .rows
@@ -87,7 +87,6 @@ fn the_engine_is_built_with_the_options_the_tree_asks_for() {
         first(&done(&mut engine, "SELECT sqlite_version()")),
         text("3.53.2")
     );
-    // `PRINTF_PRECISION_LIMIT`, which the engine does not list.
     assert_eq!(
         first(&done(&mut engine, "SELECT length(printf('%.200000d', 1))")),
         Scalar::Int(100_000)
@@ -123,7 +122,7 @@ fn every_kind_of_value_is_read_back_as_it_was_bound() {
 }
 
 #[test]
-fn a_statement_cannot_reach_another_file() {
+fn a_statement_cannot_attach_vacuum_into_read_or_write_another_file_or_load_an_extension() {
     let mut engine = empty();
     for sql in [
         "ATTACH DATABASE '/tmp/ply-sqlite-escape.db' AS other",
@@ -212,7 +211,7 @@ fn time_and_randomness_are_rejected_wherever_they_are_written() {
 }
 
 #[test]
-fn a_date_function_that_reads_no_clock_returns() {
+fn date_functions_that_read_no_clock_return_the_expected_values() {
     let mut engine = empty();
     for (sql, wanted) in [
         (
@@ -309,7 +308,7 @@ fn a_schema_object_may_call_a_date_function_that_reads_no_clock() {
 }
 
 #[test]
-fn the_statements_a_schema_is_kept_with_run() {
+fn ordinary_schema_and_query_statements_such_as_create_alter_drop_and_select_run_successfully() {
     let mut engine = empty();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT) STRICT",
@@ -341,7 +340,7 @@ fn the_statements_a_schema_is_kept_with_run() {
 }
 
 #[test]
-fn what_a_write_changed_is_the_statements_own() {
+fn each_write_statement_reports_its_own_changed_row_count_and_last_inserted_row_id() {
     let mut engine = empty();
     let made = done(
         &mut engine,
@@ -398,7 +397,7 @@ fn a_constraint_failure_says_its_kind_and_what_it_names() {
 }
 
 #[test]
-fn a_query_only_reads_and_a_statement_is_one() {
+fn a_read_only_query_cannot_write_and_sql_text_with_more_than_one_statement_is_rejected() {
     let mut engine = empty();
     done(&mut engine, "CREATE TABLE t (a INTEGER) STRICT");
     let wrote = engine.run("INSERT INTO t VALUES (1)", &[], roomy(), true);
@@ -420,7 +419,8 @@ fn a_query_only_reads_and_a_statement_is_one() {
 }
 
 #[test]
-fn each_limit_rejects_what_passes_it() {
+fn each_query_limit_fails_a_query_whose_result_is_larger_than_the_limit_and_allows_a_result_within_the_limit()
+ {
     let mut engine = empty();
     done(&mut engine, "CREATE TABLE t (a INTEGER) STRICT");
     done(&mut engine, "INSERT INTO t VALUES (1), (2), (3)");
@@ -498,7 +498,6 @@ fn each_limit_rejects_what_passes_it() {
         Some(("steps", String::new()))
     );
     assert_eq!(first(&done(&mut engine, "SELECT 7")), Scalar::Int(7));
-    // A write rejected for what it returned leaves nothing behind.
     assert_eq!(
         limited(
             &mut engine,
@@ -511,7 +510,7 @@ fn each_limit_rejects_what_passes_it() {
 }
 
 #[test]
-fn a_strict_connection_rejects_a_table_that_is_not() {
+fn a_strict_connection_rejects_a_table_that_is_not_declared_strict() {
     let mut strict = Engine::memory(b"", true).unwrap();
     assert_eq!(kind(&mut strict, "CREATE TABLE loose (a)"), "refused");
     assert_eq!(
@@ -529,7 +528,7 @@ fn a_strict_connection_rejects_a_table_that_is_not() {
 }
 
 #[test]
-fn the_largest_row_id_is_rejected() {
+fn an_insert_or_update_that_needs_a_row_id_above_the_maximum_integer_is_rejected() {
     let mut engine = empty();
     done(
         &mut engine,
@@ -578,7 +577,7 @@ fn a_statement_is_read_a_page_at_a_time() {
     done(&mut engine, "CREATE TABLE t (a INTEGER) STRICT");
     done(&mut engine, "INSERT INTO t VALUES (1), (2), (3), (4), (5)");
     let mut pages = Vec::new();
-    engine.paged("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
+    engine.run_in_pages("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
         pages.push(page);
         Some(2)
     });
@@ -588,14 +587,14 @@ fn a_statement_is_read_a_page_at_a_time() {
     assert_eq!(pages[3].rows, vec![vec![Scalar::Int(5)]]);
 
     let mut stopped = Vec::new();
-    engine.paged("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
+    engine.run_in_pages("SELECT a FROM t ORDER BY a", &[], roomy(), true, |page| {
         stopped.push(page);
         (stopped.len() < 2).then_some(2)
     });
     assert_eq!(stopped.len(), 2);
 
     let mut over = Vec::new();
-    engine.paged(
+    engine.run_in_pages(
         "SELECT a FROM t",
         &[],
         Limits { rows: 3, ..roomy() },
@@ -615,13 +614,13 @@ fn a_statement_is_read_a_page_at_a_time() {
     );
 }
 
-/// One statement over `image` as the fake runs it, every table `STRICT`.
 fn over(image: &[u8], sql: &str, params: &[Scalar], reads_only: bool) -> (Reply, Option<Vec<u8>>) {
-    ply_core::sqlite::run_over(image, sql, params, roomy(), reads_only, true)
+    ply_core::sqlite::run_on_image(image, sql, params, roomy(), reads_only, true)
 }
 
 #[test]
-fn a_statement_over_an_image_is_a_function_of_the_image_and_the_statement() {
+fn running_an_sql_statement_on_the_same_database_bytes_twice_returns_equal_results_and_equal_new_database_bytes()
+ {
     let (made, image) = over(b"", "CREATE TABLE t (a INTEGER, b TEXT) STRICT", &[], false);
     assert_eq!(made.failure, None);
     let image = image.expect("a table made is an image left");
@@ -668,7 +667,7 @@ fn a_statement_over_an_image_is_a_function_of_the_image_and_the_statement() {
 }
 
 #[test]
-fn every_admitted_function_is_one_the_engine_has() {
+fn every_function_on_the_allowed_function_list_exists_in_sqlite_and_the_list_is_sorted() {
     let mut sorted = ply_core::sqlite::FUNCTIONS.to_vec();
     sorted.sort_unstable();
     sorted.dedup();

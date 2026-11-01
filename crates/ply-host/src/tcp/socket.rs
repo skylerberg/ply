@@ -1,14 +1,12 @@
-//! The socket table over TCP and Unix sockets, plaintext or TLS, and datagram sockets.
-
 use super::wire::{self, Credentials, Endpoint, NetError, Probing, SocketOption};
 use super::{
-    Handles, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener, not_a_stream,
-    not_upgradable, unknown_handle,
+    Handles, Upgrade, bind, err_datagram_for_stream_socket, not_a_datagram_socket, not_a_listener,
+    not_a_stream, not_upgradable, unknown_handle,
 };
 use crate::fs;
 use crate::jobs::Job;
 use crate::native::{found, int};
-use crate::tls::{self, Credentials as TlsCredentials, Handshakes};
+use crate::tls::{self, Credentials as TlsCredentials, HandshakeStats};
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
 use rustls::pki_types::ServerName;
 use rustls::server::ServerConfig;
@@ -26,10 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-/// How many connections a listener bound here queues before the kernel rejects more.
 const BACKLOG: i32 = 128;
 
-/// A plaintext byte stream.
 #[derive(Clone)]
 enum Plain {
     Tcp(Arc<TcpStream>),
@@ -86,7 +82,6 @@ impl Plain {
         };
     }
 
-    /// The socket's options, whichever kind of socket it is.
     fn raw(&self) -> SockRef<'_> {
         match self {
             Plain::Tcp(s) => SockRef::from(&**s),
@@ -96,22 +91,17 @@ impl Plain {
     }
 }
 
-/// A socket that takes connections, and what each one it takes becomes.
 #[derive(Clone)]
-enum Listening {
-    /// `None` for plaintext; otherwise the config every accepted connection is terminated with.
+enum ListenerKind {
     Tcp(Arc<TcpListener>, Option<Arc<ServerConfig>>),
-    /// With the path it bound, which its close removes.
     #[cfg(unix)]
     Unix(Arc<UnixListener>, Arc<PathBuf>),
 }
 
-impl Listening {
-    /// The next connection, with the listener's transport: a path that dropped TLS would serve in
-    /// the clear.
-    fn accept(&self, handshakes: &Arc<Handshakes>) -> io::Result<Socket> {
+impl ListenerKind {
+    fn accept(&self, handshakes: &Arc<HandshakeStats>) -> io::Result<Socket> {
         match self {
-            Listening::Tcp(listener, config) => {
+            ListenerKind::Tcp(listener, config) => {
                 let (stream, _) = listener.accept()?;
                 let _ = stream.set_nodelay(true);
                 let stream = Arc::new(stream);
@@ -125,7 +115,7 @@ impl Listening {
                 })
             }
             #[cfg(unix)]
-            Listening::Unix(listener, _) => {
+            ListenerKind::Unix(listener, _) => {
                 let (stream, _) = listener.accept()?;
                 Ok(Socket::Stream(Plain::Unix(Arc::new(stream))))
             }
@@ -134,12 +124,10 @@ impl Listening {
 }
 
 enum Socket {
-    Listener(Listening),
+    Listener(ListenerKind),
     Stream(Plain),
     Tls(Arc<tls::Session>),
-    /// `std.udp`'s, which shares this table so one handle space and one label rule serve both.
     Datagram(Arc<UdpSocket>),
-    /// A listener the drain closed.
     Finished,
 }
 
@@ -148,7 +136,6 @@ enum Connection {
     Tls(Arc<tls::Session>),
 }
 
-/// The socket table and handle allocator, together because a completing `accept` inserts into both.
 struct Sockets {
     open: Mutex<BTreeMap<i64, Socket>>,
     handles: Handles,
@@ -161,13 +148,12 @@ impl Sockets {
         handle
     }
 
-    fn listener(&self, handle: i64, label: &str, span: Span) -> Result<Listening, Diagnostic> {
+    fn listener(&self, handle: i64, label: &str, span: Span) -> Result<ListenerKind, Diagnostic> {
         self.handles.check(handle, label, span)?;
         match lock(&self.open).get(&handle) {
             Some(Socket::Listener(listening)) => Ok(listening.clone()),
             Some(Socket::Stream(_) | Socket::Tls(_)) => Err(not_a_listener(handle, span)),
-            Some(Socket::Datagram(_)) => Err(a_datagram_socket(handle, span)),
-            // Unreachable: `accept` checks the stop flag, set before any listener is swapped.
+            Some(Socket::Datagram(_)) => Err(err_datagram_for_stream_socket(handle, span)),
             Some(Socket::Finished) => Err(not_a_listener(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
@@ -188,15 +174,11 @@ impl Sockets {
             Some(Socket::Stream(s)) => Ok(Connection::Plain(s.clone())),
             Some(Socket::Tls(s)) => Ok(Connection::Tls(Arc::clone(s))),
             Some(Socket::Listener(..) | Socket::Finished) => Err(not_a_stream(handle, span)),
-            Some(Socket::Datagram(_)) => Err(a_datagram_socket(handle, span)),
+            Some(Socket::Datagram(_)) => Err(err_datagram_for_stream_socket(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
     }
 
-    /// The plaintext TCP connection an upgrade secures, with the session `secured` makes of it put
-    /// in its place: every later operation on the handle goes through the session. A connection
-    /// another operation still holds is rejected, since that operation would read or write the
-    /// plaintext under the session.
     fn upgraded(
         &self,
         what: &str,
@@ -229,7 +211,7 @@ impl Sockets {
             Some(Socket::Listener(..) | Socket::Finished) => {
                 return Err(not_a_stream(handle, span));
             }
-            Some(Socket::Datagram(_)) => return Err(a_datagram_socket(handle, span)),
+            Some(Socket::Datagram(_)) => return Err(err_datagram_for_stream_socket(handle, span)),
             None => return Err(unknown_handle(handle, span)),
         };
         let session = secured(Arc::clone(&stream));
@@ -245,7 +227,6 @@ impl Sockets {
     }
 }
 
-/// One of the parked `accept`s the drain wakes, counted for as long as its job is held.
 struct Accepting(Arc<AtomicUsize>);
 
 impl Accepting {
@@ -263,18 +244,12 @@ impl Drop for Accepting {
 
 pub struct TcpHost {
     sockets: Arc<Sockets>,
-    /// What `net.listen_tls` resolves a credential name against.
     credentials: TlsCredentials,
-    handshakes: Arc<Handshakes>,
-    /// The roots a Unix socket's path is confined to.
+    handshakes: Arc<HandshakeStats>,
     roots: Mutex<fs::Roots>,
-    /// Set at the stop.
     stopping: Arc<AtomicBool>,
-    /// `accept` operations parked on a pool thread.
     accepts: Arc<AtomicUsize>,
-    /// Where the listeners the stop closed were bound.
-    closed_at: Mutex<Vec<SocketAddr>>,
-    /// The credential each connection's `start_tls` presents, where `Presenting` named one.
+    closed_listener_addresses: Mutex<Vec<SocketAddr>>,
     presenting: Arc<Mutex<BTreeMap<i64, String>>>,
 }
 
@@ -296,16 +271,15 @@ impl TcpHost {
                 handles: Handles::new(),
             }),
             credentials,
-            handshakes: Arc::new(Handshakes::default()),
+            handshakes: Arc::new(HandshakeStats::default()),
             roots: Mutex::new(fs::Roots::new()),
             stopping: Arc::new(AtomicBool::new(false)),
             accepts: Arc::new(AtomicUsize::new(0)),
-            closed_at: Mutex::new(Vec::new()),
+            closed_listener_addresses: Mutex::new(Vec::new()),
             presenting: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    /// The roots `--fs` bound, which is where a Unix socket's path may be.
     pub fn rooted(&self, roots: fs::Roots) {
         *lock(&self.roots) = roots;
     }
@@ -318,21 +292,18 @@ impl TcpHost {
         self.handshakes.snapshot()
     }
 
-    /// The address a listening handle actually bound.
     pub fn local_addr(&self, handle: i64) -> Option<SocketAddr> {
         match lock(&self.sockets.open).get(&handle) {
-            Some(Socket::Listener(Listening::Tcp(l, _))) => l.local_addr().ok(),
+            Some(Socket::Listener(ListenerKind::Tcp(l, _))) => l.local_addr().ok(),
             _ => None,
         }
     }
 
-    /// A datagram socket put in this host's table under `label`, returning its handle.
     pub(crate) fn open_datagram(&self, label: &str, socket: UdpSocket) -> i64 {
         self.sockets
             .insert(Some(label), Socket::Datagram(Arc::new(socket)))
     }
 
-    /// The datagram socket a handle names under `label`.
     pub fn datagram(
         &self,
         handle: i64,
@@ -342,7 +313,6 @@ impl TcpHost {
         self.sockets.datagram(handle, label, span)
     }
 
-    /// Where the Unix socket `path` under the root named `root` is, on this machine.
     fn unix_path(
         &self,
         what: &str,
@@ -360,11 +330,9 @@ impl TcpHost {
             .note(format!("bind one beside the run: `--fs {root}=<directory>`"))
             .note("a Unix socket is a path, and a path is reached only under a root the run was given"));
         };
-        // A path that leads nowhere goes to the system as written, which says nothing is there.
         Ok(fs::confine(base, path, span)?.unwrap_or_else(|| base.join(path)))
     }
 
-    /// The socket a handle names, for an operation that asks what it is.
     fn described<T>(
         &self,
         socket: i64,
@@ -379,17 +347,14 @@ impl TcpHost {
         }
     }
 
-    /// A listener on `port` of the loopback address.
     pub fn listen(&self, label: &str, port: u16, span: Span) -> Result<i64, Diagnostic> {
         let listener = bind("`net.listen`", port, span)?;
         Ok(self.sockets.insert(
             Some(label),
-            Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
+            Socket::Listener(ListenerKind::Tcp(Arc::new(listener), None)),
         ))
     }
 
-    /// A listener on `port` of the loopback address that serves TLS with `credential`; one the
-    /// run lacks is `E0429`.
     pub fn listen_tls(
         &self,
         label: &str,
@@ -401,23 +366,20 @@ impl TcpHost {
         let listener = bind("`net.listen_tls`", port, span)?;
         Ok(self.sockets.insert(
             Some(label),
-            Socket::Listener(Listening::Tcp(Arc::new(listener), Some(config))),
+            Socket::Listener(ListenerKind::Tcp(Arc::new(listener), Some(config))),
         ))
     }
 
-    /// A listener at exactly `to`, with `options` set before the bind: its handle, or why not.
     pub fn listen_on(&self, label: &str, to: &Endpoint, options: &[SocketOption]) -> Vec<u8> {
         wire::result(bound(to, options).map(|listener| {
             let handle = self.sockets.insert(
                 Some(label),
-                Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
+                Socket::Listener(ListenerKind::Tcp(Arc::new(listener), None)),
             );
             int(handle).to_vec()
         }))
     }
 
-    /// A listener on the Unix socket at `path` under the root named `root`: its handle, or why
-    /// not.
     #[cfg(unix)]
     pub fn listen_unix(
         &self,
@@ -431,7 +393,7 @@ impl TcpHost {
             Ok(listener) => {
                 let handle = self.sockets.insert(
                     Some(label),
-                    Socket::Listener(Listening::Unix(Arc::new(listener), Arc::new(path))),
+                    Socket::Listener(ListenerKind::Unix(Arc::new(listener), Arc::new(path))),
                 );
                 Ok(int(handle).to_vec())
             }
@@ -450,8 +412,6 @@ impl TcpHost {
         Ok(wire::result(Err(no_unix_sockets())))
     }
 
-    /// A connection to `host`, its resolution and each address it resolves to tried in turn on the
-    /// job's thread: its handle found, or none where the host was not reached before the deadline.
     pub fn connect(&self, label: &str, host: String, port: u16, timeout: Duration) -> Job {
         let sockets = Arc::clone(&self.sockets);
         let label = label.to_string();
@@ -462,15 +422,12 @@ impl TcpHost {
         })
     }
 
-    /// `connect`, then TLS over it verifying `host`; the handshake is left to the first read or
-    /// write.
     pub fn connect_tls(&self, label: &str, host: String, port: u16, timeout: Duration) -> Job {
         let sockets = Arc::clone(&self.sockets);
         let handshakes = Arc::clone(&self.handshakes);
         let config = self.credentials.client();
         let label = label.to_string();
         Box::new(move || {
-            // A host that is not a DNS name or an IP address is one no server can be verified as.
             let Ok(name) = ServerName::try_from(host.clone()) else {
                 return Ok(found(None::<[u8; 8]>));
             };
@@ -481,8 +438,6 @@ impl TcpHost {
         })
     }
 
-    /// A connection to exactly `to`, no name looked up, with `options` set before it connects:
-    /// its handle, or why not.
     pub fn connect_to(
         &self,
         label: &str,
@@ -494,7 +449,7 @@ impl TcpHost {
         let presenting = Arc::clone(&self.presenting);
         let label = label.to_string();
         Box::new(move || {
-            Ok(wire::result(reach_to(&to, &options, timeout).map(
+            Ok(wire::result(connect_tcp(&to, &options, timeout).map(
                 |stream| {
                     let handle =
                         sockets.insert(Some(&label), Socket::Stream(Plain::Tcp(Arc::new(stream))));
@@ -507,8 +462,6 @@ impl TcpHost {
         })
     }
 
-    /// A connection to the Unix socket at `path` under the root named `root`: its handle, or why
-    /// not.
     #[cfg(unix)]
     pub fn connect_unix(
         &self,
@@ -542,10 +495,6 @@ impl TcpHost {
         Ok(Box::new(|| Ok(wire::result(Err(no_unix_sockets())))))
     }
 
-    /// The TLS handshake, completed now rather than when a request needs it: the microseconds it
-    /// took found, or none for a connection with no handshake to complete. No handshake happens
-    /// on its own: a session handshakes on its first read or write, so a peer that connects and
-    /// says nothing costs nothing.
     pub fn handshake(&self, label: &str, conn: i64, span: Span) -> Result<Job, Diagnostic> {
         let session = match self.sockets.stream(conn, label, span)? {
             Connection::Tls(session) => Some(session),
@@ -560,11 +509,6 @@ impl TcpHost {
         }))
     }
 
-    /// An open plaintext connection secured as the client's end, verifying the server as `name`:
-    /// the protocol agreed found, or why not. The session takes the handle before the handshake
-    /// starts, so nothing reaches the plaintext while it runs. Plaintext the caller holds unread,
-    /// or the socket does, is a rejection: a TLS server never speaks first, so it was sent behind
-    /// the go-ahead to be read as if secured.
     pub fn start_tls(
         &self,
         label: &str,
@@ -575,11 +519,11 @@ impl TcpHost {
     ) -> Result<Job, Diagnostic> {
         let server = ServerName::try_from(name.to_string());
         let early = if upgrade.unread > 0 {
-            Some((tls::REASON_INJECTED, NetError::Injected))
+            Some((tls::REASON_EARLY_PLAINTEXT, NetError::Injected))
         } else if server.is_err() {
             Some((
-                tls::REASON_NAME,
-                NetError::Handshake(tls::REASON_NAME.to_string()),
+                tls::REASON_INVALID_SERVER_NAME,
+                NetError::Handshake(tls::REASON_INVALID_SERVER_NAME.to_string()),
             ))
         } else {
             None
@@ -590,7 +534,7 @@ impl TcpHost {
             Some(name) => self.credentials.presenting(&name, span)?,
             None => self.credentials.client(),
         };
-        let config = tls::client_offering(&client, &upgrade.alpn);
+        let config = tls::client_config_offering_protocols(&client, &upgrade.alpn);
         let handshakes = Arc::clone(&self.handshakes);
         let (stream, session) =
             self.sockets
@@ -602,7 +546,7 @@ impl TcpHost {
                         (reason, _) => tls::Session::rejected(
                             stream,
                             handshakes,
-                            reason.unwrap_or(tls::REASON_NAME),
+                            reason.unwrap_or(tls::REASON_INVALID_SERVER_NAME),
                         ),
                     })
                 })?;
@@ -611,16 +555,13 @@ impl TcpHost {
         }
         Ok(Box::new(move || {
             if tls::plaintext_waiting(&stream) {
-                session.refuse(tls::REASON_INJECTED);
+                session.refuse(tls::REASON_EARLY_PLAINTEXT);
                 return Ok(wire::result(Err(NetError::Injected)));
             }
             Ok(finished(&session, upgrade.timeout))
         }))
     }
 
-    /// The server's end of `start_tls`, with the credential named `credential`. Bytes the socket
-    /// already holds are the client's handshake, which it may send as soon as it has the go-ahead,
-    /// so only what the caller read past the request to upgrade is rejected.
     pub fn serve_tls(
         &self,
         label: &str,
@@ -630,14 +571,14 @@ impl TcpHost {
         span: Span,
     ) -> Result<Job, Diagnostic> {
         let credential = self.credentials.resolve(credential, span)?;
-        let config = tls::server_accepting(&credential, &upgrade.alpn);
+        let config = tls::server_config_accepting_protocols(&credential, &upgrade.alpn);
         let handshakes = Arc::clone(&self.handshakes);
         let injected = upgrade.unread > 0;
         let (_, session) =
             self.sockets
                 .upgraded("`net.serve_tls`", conn, label, span, move |stream| {
                     Arc::new(if injected {
-                        tls::Session::rejected(stream, handshakes, tls::REASON_INJECTED)
+                        tls::Session::rejected(stream, handshakes, tls::REASON_EARLY_PLAINTEXT)
                     } else {
                         tls::Session::new(config, stream, handshakes)
                     })
@@ -648,10 +589,7 @@ impl TcpHost {
         Ok(Box::new(move || Ok(finished(&session, upgrade.timeout))))
     }
 
-    /// The next connection a listener takes, as its handle; `0` once the run has stopped
-    /// accepting.
     pub fn accept(&self, label: &str, listener: i64, span: Span) -> Result<Job, Diagnostic> {
-        // Before the lookup, because `stop_accepting` has already swapped the listener out.
         if self.stopping.load(Ordering::Acquire) {
             self.sockets.handles.check(listener, label, span)?;
             return Ok(Box::new(|| Ok(int(0).to_vec())));
@@ -668,8 +606,6 @@ impl TcpHost {
         }))
     }
 
-    /// At most `max` bytes found, as soon as any arrive: none is the deadline, and an empty result
-    /// the peer done sending.
     pub fn recv(
         &self,
         label: &str,
@@ -681,12 +617,9 @@ impl TcpHost {
         let conn = self.sockets.stream(conn, label, span)?;
         Ok(Box::new(move || match conn {
             Connection::Plain(stream) => {
-                // This job owns the socket for its duration, so setting its timeout is safe.
                 stream.read_within(timeout);
-                // Read behind the byte that says it was found, so the bytes are not copied again.
                 let mut buffer = vec![0u8; max + 1];
                 buffer[0] = 1;
-                // One `read`: a loop would hide short reads and closes from the program.
                 match stream.read(&mut buffer[1..]) {
                     Ok(n) => {
                         buffer.truncate(n + 1);
@@ -697,7 +630,6 @@ impl TcpHost {
                     Err(e) => Err(e.to_string()),
                 }
             }
-            // Never a failure: any TLS failure is "the peer went away", so the accept loop survives.
             Connection::Tls(session) => {
                 session.deadline(timeout);
                 Ok(found(session.read(max)))
@@ -705,8 +637,6 @@ impl TcpHost {
         }))
     }
 
-    /// Writes some prefix of `payload`: how many bytes it took found, none for the deadline and
-    /// `0` for the peer gone.
     pub fn send(
         &self,
         label: &str,
@@ -719,7 +649,6 @@ impl TcpHost {
         Ok(Box::new(move || match conn {
             Connection::Plain(stream) => {
                 stream.write_within(timeout);
-                // One `write`, which may be short under backpressure; `std.net.send_all` loops.
                 match stream.write(&payload) {
                     Ok(n) => Ok(found(Some(int(n as i64)))),
                     Err(e) if expired(&e) => Ok(found(None::<[u8; 8]>)),
@@ -734,8 +663,6 @@ impl TcpHost {
         }))
     }
 
-    /// Every byte of `payload`, which holds a credential: byte 1 once the peer took them all, byte
-    /// 0 for a deadline or a peer gone before it did. The job's copy is wiped when it is dropped.
     pub fn send_secret(
         &self,
         label: &str,
@@ -761,7 +688,6 @@ impl TcpHost {
         }))
     }
 
-    /// Ends this end's sending and leaves its reading open.
     pub fn close_write(&self, label: &str, conn: i64, span: Span) -> Result<(), Diagnostic> {
         match self.sockets.stream(conn, label, span)? {
             Connection::Plain(stream) => stream.shutdown(Shutdown::Write),
@@ -770,31 +696,26 @@ impl TcpHost {
         Ok(())
     }
 
-    /// Closes a socket of any kind; its handle names nothing afterwards.
     pub fn close(&self, label: &str, socket: i64, span: Span) -> Result<(), Diagnostic> {
         self.sockets.handles.check(socket, label, span)?;
         let sock = lock(&self.sockets.open).remove(&socket);
         self.sockets.handles.close(socket);
         lock(&self.presenting).remove(&socket);
         match sock {
-            // Shut down, not just dropped: a `recv` parked on another `Arc` returns only then.
             Some(Socket::Stream(s)) => s.shutdown(Shutdown::Both),
-            // `close_notify` first, so the peer sees a clean end rather than a truncation.
             Some(Socket::Tls(s)) => s.close(),
-            // The file is the listener's, so it goes with it; a path left behind fails the
-            // next bind.
             #[cfg(unix)]
-            Some(Socket::Listener(Listening::Unix(_, path))) => {
+            Some(Socket::Listener(ListenerKind::Unix(_, path))) => {
                 let _ = std::fs::remove_file(&*path);
             }
-            Some(Socket::Listener(Listening::Tcp(..)) | Socket::Datagram(_) | Socket::Finished) => {
-            }
+            Some(
+                Socket::Listener(ListenerKind::Tcp(..)) | Socket::Datagram(_) | Socket::Finished,
+            ) => {}
             None => return Err(unknown_handle(socket, span)),
         }
         Ok(())
     }
 
-    /// Sets one option of a socket of any kind: nothing, or why not.
     pub fn set_option(
         &self,
         label: &str,
@@ -812,7 +733,6 @@ impl TcpHost {
         Ok(wire::result(set.map(|()| Vec::new())))
     }
 
-    /// The port this end of a socket is bound to; `None` for a listener the drain has closed.
     pub fn local_port(
         &self,
         label: &str,
@@ -823,7 +743,6 @@ impl TcpHost {
         Ok(address.map(|a| a.port()))
     }
 
-    /// The address this end of a socket is bound to, found; none for one with no IP address.
     pub fn local_address(
         &self,
         label: &str,
@@ -834,7 +753,6 @@ impl TcpHost {
         Ok(found(address.map(|a| Endpoint::of(a).written())))
     }
 
-    /// The address of a connection's far end, found; none for a listener and for a Unix socket.
     pub fn peer_address(&self, label: &str, conn: i64, span: Span) -> Result<Vec<u8>, Diagnostic> {
         let address = self.described(conn, label, span, |sock| match sock {
             Socket::Stream(Plain::Tcp(s)) => s.peer_addr().ok(),
@@ -844,7 +762,6 @@ impl TcpHost {
         Ok(found(address.map(|a| Endpoint::of(a).written())))
     }
 
-    /// Who holds the far end of a Unix socket, found; none for any other.
     pub fn peer_credentials(
         &self,
         label: &str,
@@ -859,8 +776,6 @@ impl TcpHost {
         Ok(found(credentials.map(|c| c.written())))
     }
 
-    /// The far end's certificate on a secured connection once its handshake completed, found: the
-    /// server's to a client, the client's to a server where it presented one; none for any other.
     pub fn peer_certificate(
         &self,
         label: &str,
@@ -874,8 +789,6 @@ impl TcpHost {
         Ok(found(leaf))
     }
 
-    /// The application protocol a secured connection's handshake agreed once it completed, found;
-    /// none for any other.
     pub fn protocol(&self, label: &str, conn: i64, span: Span) -> Result<Vec<u8>, Diagnostic> {
         let agreed = self.described(conn, label, span, |sock| match sock {
             Socket::Tls(s) => s.protocol(),
@@ -884,7 +797,6 @@ impl TcpHost {
         Ok(found(agreed))
     }
 
-    /// Each option the socket has, as it stands, as parts.
     pub fn options(&self, label: &str, socket: i64, span: Span) -> Result<Vec<u8>, Diagnostic> {
         let options = self.described(socket, label, span, |sock| {
             raw_of(sock).map_or_else(Vec::new, |raw| standing(&raw))
@@ -893,7 +805,6 @@ impl TcpHost {
     }
 }
 
-/// The credential `options` name for a later `start_tls` to present, the last where several do.
 fn presented(options: &[SocketOption]) -> Option<String> {
     options.iter().rev().find_map(|o| match o {
         SocketOption::Presenting(name) => Some(name.clone()),
@@ -901,27 +812,22 @@ fn presented(options: &[SocketOption]) -> Option<String> {
     })
 }
 
-/// The handshake of an upgrade, completed within its deadline: the protocol agreed found, or why
-/// not.
 fn finished(session: &tls::Session, timeout: Duration) -> Vec<u8> {
     let outcome = session
         .finish_within(timeout)
         .map_err(|reason| match reason {
-            tls::Unfinished::Expired => NetError::TimedOut,
-            tls::Unfinished::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
-            tls::Unfinished::Rejected(tls::REASON_GONE) => NetError::Reset,
-            tls::Unfinished::Rejected(reason) => NetError::Handshake(reason.to_string()),
+            tls::ShutdownFailure::Expired => NetError::TimedOut,
+            tls::ShutdownFailure::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
+            tls::ShutdownFailure::Rejected(tls::REASON_GONE) => NetError::Reset,
+            tls::ShutdownFailure::Rejected(reason) => NetError::Handshake(reason.to_string()),
         });
     wire::result(outcome.map(found))
 }
 
-/// The next connection a listener takes, as its handle; `0` once the run has stopped accepting or
-/// the listener failed. A peer that aborts between the SYN and the accept is passed over, up to
-/// [`ACCEPT_RETRIES`] of them.
 fn accepted(
-    listening: &Listening,
+    listening: &ListenerKind,
     sockets: &Sockets,
-    handshakes: &Arc<Handshakes>,
+    handshakes: &Arc<HandshakeStats>,
     stopping: &AtomicBool,
 ) -> i64 {
     for _ in 0..=ACCEPT_RETRIES {
@@ -929,12 +835,9 @@ fn accepted(
             return 0;
         }
         match listening.accept(handshakes) {
-            // Taken as the run stopped accepting: the drain's wake dial, or a client racing it.
             Ok(_) if stopping.load(Ordering::Acquire) => return 0,
-            // No label: the connection takes whichever one the program first uses it under.
             Ok(sock) => return sockets.insert(None, sock),
             Err(e) if transient(&e) => continue,
-            // `0` is never a live handle: handles ascend from 1 and are never reused.
             Err(_) => return 0,
         }
     }
@@ -943,7 +846,6 @@ fn accepted(
 
 impl crate::signal::Accepting for TcpHost {
     fn stop_accepting(&self) -> usize {
-        // Flag before swap, or `accept` could find its listener gone and raise `E0502`.
         self.stopping.store(true, Ordering::Release);
         let mut open = lock(&self.sockets.open);
         let listeners: Vec<i64> = open
@@ -954,23 +856,20 @@ impl crate::signal::Accepting for TcpHost {
         let mut closed = Vec::new();
         for handle in &listeners {
             match open.insert(*handle, Socket::Finished) {
-                Some(Socket::Listener(Listening::Tcp(l, _))) => {
+                Some(Socket::Listener(ListenerKind::Tcp(l, _))) => {
                     if let Ok(address) = l.local_addr() {
                         closed.push(address);
                     }
                 }
-                // An `accept` parked on it returns for a connection, so it is given one, and the
-                // file goes as a close would take it.
                 #[cfg(unix)]
-                Some(Socket::Listener(Listening::Unix(_, path))) => {
+                Some(Socket::Listener(ListenerKind::Unix(_, path))) => {
                     drop(UnixStream::connect(&*path));
                     let _ = std::fs::remove_file(&*path);
                 }
                 _ => {}
             }
         }
-        *lock(&self.closed_at) = closed;
-        // The fd closes when the parked `accept` job drops its `Arc`, shortly after this returns.
+        *lock(&self.closed_listener_addresses) = closed;
         listeners.len()
     }
 
@@ -978,11 +877,11 @@ impl crate::signal::Accepting for TcpHost {
         let mut addresses: Vec<SocketAddr> = lock(&self.sockets.open)
             .values()
             .filter_map(|s| match s {
-                Socket::Listener(Listening::Tcp(l, _)) => l.local_addr().ok(),
+                Socket::Listener(ListenerKind::Tcp(l, _)) => l.local_addr().ok(),
                 _ => None,
             })
             .collect();
-        addresses.extend(lock(&self.closed_at).iter().copied());
+        addresses.extend(lock(&self.closed_listener_addresses).iter().copied());
         addresses.sort();
         addresses.dedup();
         addresses
@@ -1004,7 +903,6 @@ fn expired(e: &io::Error) -> bool {
     )
 }
 
-/// An ordinary outcome, not the program's error: end of stream for a read, `0` for a write.
 fn peer_gone(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -1020,16 +918,12 @@ fn transient(e: &io::Error) -> bool {
     expired(e) || matches!(e.kind(), io::ErrorKind::ConnectionAborted)
 }
 
-/// How many peers may abort between the SYN and the accept before the loop gives up on this call.
 const ACCEPT_RETRIES: usize = 16;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Resolution and the connect on the caller's thread; each address the name resolves to gets the
-/// deadline in turn. A name is ASCII, as it is to `dns.lookup`, whatever the system's resolver
-/// would make of another.
 fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
     use std::net::ToSocketAddrs;
     if !host.is_ascii() {
@@ -1043,9 +937,7 @@ fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
     Some(stream)
 }
 
-/// A connection to one address, its options set before it connects: a buffer's size is part of
-/// what the two ends agree on as they do.
-fn reach_to(
+fn connect_tcp(
     to: &Endpoint,
     options: &[SocketOption],
     timeout: Duration,
@@ -1073,10 +965,8 @@ fn reach_unix(path: &Path, timeout: Duration) -> Result<UnixStream, NetError> {
     let rejection = |e: io::Error| NetError::of(&e);
     let address = SockAddr::unix(path).map_err(rejection)?;
     let socket = RawSocket::new(Domain::UNIX, Type::STREAM, None).map_err(rejection)?;
-    // Linux polls a non-blocking connect to a full queue as ready; a blocking one waits this out.
     socket.set_write_timeout(Some(timeout)).map_err(rejection)?;
     socket.connect(&address).map_err(|e| {
-        // Nothing at the path is nothing listening there.
         if e.kind() == io::ErrorKind::NotFound {
             NetError::Rejected
         } else {
@@ -1091,8 +981,6 @@ fn no_unix_sockets() -> NetError {
     NetError::Other(0, "this platform has no Unix sockets".to_string())
 }
 
-/// A listener at `to` with `options` set before the bind, which is when the reuse options count.
-/// An address is reused as `std`'s own listener reuses it unless an option says otherwise.
 fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, NetError> {
     let address = to.socket_addr()?;
     let rejection = |e: io::Error| NetError::of(&e);
@@ -1112,12 +1000,11 @@ fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, NetErro
     Ok(socket.into())
 }
 
-/// The socket under a handle, for its options; a session's are its socket's.
 fn raw_of(sock: &Socket) -> Option<SockRef<'_>> {
     match sock {
-        Socket::Listener(Listening::Tcp(l, _)) => Some(SockRef::from(&**l)),
+        Socket::Listener(ListenerKind::Tcp(l, _)) => Some(SockRef::from(&**l)),
         #[cfg(unix)]
-        Socket::Listener(Listening::Unix(l, _)) => Some(SockRef::from(&**l)),
+        Socket::Listener(ListenerKind::Unix(l, _)) => Some(SockRef::from(&**l)),
         Socket::Stream(s) => Some(s.raw()),
         Socket::Tls(s) => Some(SockRef::from(s.socket())),
         Socket::Datagram(s) => Some(SockRef::from(&**s)),
@@ -1127,7 +1014,7 @@ fn raw_of(sock: &Socket) -> Option<SockRef<'_>> {
 
 fn local_of(sock: &Socket) -> Option<SocketAddr> {
     match sock {
-        Socket::Listener(Listening::Tcp(l, _)) => l.local_addr().ok(),
+        Socket::Listener(ListenerKind::Tcp(l, _)) => l.local_addr().ok(),
         Socket::Stream(Plain::Tcp(s)) => s.local_addr().ok(),
         Socket::Tls(s) => s.local_addr().ok(),
         Socket::Datagram(s) => s.local_addr().ok(),
@@ -1155,12 +1042,10 @@ pub(crate) fn apply(socket: &RawSocket, option: &SocketOption) -> io::Result<()>
         }
         SocketOption::JoinGroup(group, interface) => membership(socket, group, interface, true),
         SocketOption::LeaveGroup(group, interface) => membership(socket, group, interface, false),
-        // A credential to present is the TLS session's, set at `start_tls`.
         SocketOption::Presenting(_) => Ok(()),
     }
 }
 
-/// Joins or leaves a multicast group on the interface named, or on the one the system picks.
 fn membership(
     socket: &RawSocket,
     group: &IpAddr,
@@ -1188,7 +1073,6 @@ fn membership(
     }
 }
 
-/// The interval and the count are set where the platform has them and left to it elsewhere.
 fn keepalive(probing: &Probing) -> socket2::TcpKeepalive {
     let params = socket2::TcpKeepalive::new().with_time(probing.idle);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1218,8 +1102,6 @@ fn reuse_port(_: &RawSocket, _: bool) -> io::Result<()> {
     ))
 }
 
-/// Each option the socket handles; one it does not have (a Unix socket's `NoDelay`) is left
-/// out.
 fn standing(socket: &RawSocket) -> Vec<SocketOption> {
     let mut options = Vec::new();
     if matches!(socket.r#type(), Ok(Type::DGRAM)) {
@@ -1287,7 +1169,6 @@ fn credentials_of(stream: &UnixStream) -> Option<Credentials> {
         gid: 0,
     };
     let mut len = size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `peer` is plain data of the `len` bytes the call may write.
     let read = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
@@ -1308,13 +1189,11 @@ fn credentials_of(stream: &UnixStream) -> Option<Credentials> {
 fn credentials_of(stream: &UnixStream) -> Option<Credentials> {
     use std::os::fd::AsRawFd;
     let (mut user, mut group): (libc::uid_t, libc::gid_t) = (0, 0);
-    // SAFETY: both are plain integers the call writes.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut user, &raw mut group) } != 0 {
         return None;
     }
     let mut process: libc::pid_t = 0;
     let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `process` is a plain integer of the `len` bytes the call may write.
     let read = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),

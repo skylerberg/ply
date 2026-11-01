@@ -1,9 +1,5 @@
-//! The failure the runtime raises for a scoped value it holds.
-
 use crate::{Diagnostic, Span, codes};
 
-/// A scoped value used after its scope let it go, which only a continuation captured in the scope
-/// and resumed after the release can do.
 #[cold]
 pub fn scoped_released(span: Span, doing: &str) -> Diagnostic {
     Diagnostic::error(

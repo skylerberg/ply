@@ -1,13 +1,3 @@
-//! `kernel` — what makes an induction a proof, checked from the claim alone. The record a certificate
-//! keeps of an induction names one of the claim's own binders, takes it apart below each case it
-//! proves, and unrolls only definitions the checker saw end; the cases it splits the claim into are
-//! lowered and refuted here, whatever search proposed it.
-//!
-//! An unrolled definition is total, so its calls are values and its body may be unrolled with
-//! `f(x̄) == body(x̄)` in hand. The claim is proved at the base case, and at the step from its own
-//! instance below, whose recursive calls are left as they are so the unrolled conclusion meets them by
-//! congruence.
-
 import compiler.emit.code (Code)
 import context (Context, self_recursive, terminates, set_of)
 import goal (Goal, Binder, Limits, Proof, Assertion, RefutationResult, run_refutation, conjunction,
@@ -19,10 +9,9 @@ import rules (RuleLog, Rule, Scheme, Descent, Spine, no_rules, rules_of, inducti
 import solve (Closed)
 import sort (bool_sort, is_named_sort, list_element)
 import term (Terms, ApplicationTerm, Le, Gt, node, int_literal, sub, nil, cons, symbol, not, and,
-             or, cmp, eq)
+             or, comparison, eq)
 import std.list
 
-/// The binder at `slot`, named `binder`, taken apart by `scheme`, with `definitions` unrolled.
 pub type InductionPlan = { binder: String, slot: Int, scheme: Scheme, definitions: List<String> }
 
 pub type InductionResult = { proof: Option<Proof>, used: Int, blockers: List<Blocker> }
@@ -30,7 +19,6 @@ pub type InductionResult = { proof: Option<Proof>, used: Int, blockers: List<Blo
 pub fn add_induction_blocker(blockers: List<Blocker>, reason: String) -> List<Blocker> =
   blockers.push(Induction(reason))
 
-/// The reason a record proves nothing whatever its cases show, or `None` when its cases decide it.
 pub fn rejection(context: Context, g: Goal, r: InductionPlan) -> Option<String> = {
   let result_slot = match g.result { Some(_) -> g.binders.len() - 1, None -> 0 - 1 };
   match g.binders.at(r.slot) {
@@ -40,11 +28,11 @@ pub fn rejection(context: Context, g: Goal, r: InductionPlan) -> Option<String> 
     } else if r.slot == result_slot { Some("`result` is the return value, not a binder") } else {
       let shape = match r.scheme {
         Descent(k) -> if !is_named_sort(b.ty, "Int") { Some("`" ++ b.name ++ "` is not an `Int`") }
-        else if k < 1 { Some("the hypothesis is not below the case it proves") }
+        else if k < 1 { Some("the hypothesis must apply to a smaller case than the one it proves") }
         else { None },
         Spine(k) -> if list_element(b.ty) == None { Some("`" ++ b.name ++ "` is not a list") }
-        else if k < 1 { Some("the hypothesis is not below the case it proves") }
-        else if k > 1 { Some("a spine is taken apart one head at a time") }
+        else if k < 1 { Some("the hypothesis must apply to a smaller case than the one it proves") }
+        else if k > 1 { Some("a list can be split only one element at a time") }
         else { None },
       };
       match shape { Some(reason) -> Some(reason), None -> unroll_rejection(context, r.definitions) }
@@ -53,20 +41,26 @@ pub fn rejection(context: Context, g: Goal, r: InductionPlan) -> Option<String> 
 }
 
 fn unroll_rejection(context: Context, definitions: List<String>) -> Option<String> =
-  if definitions.len() == 0 { Some("it unrolls no definition") } else {
+  if definitions.len() == 0 { Some("the induction names no recursive definition to unfold") } else {
     definitions.fold(None, |reason: Option<String>, name: String|
       match reason {
         Some(_) -> reason,
         None -> match self_recursive(context, name) {
-          None -> Some("`" ++ name ++ "` is not a pure definition calling only itself"),
+          None ->
+            Some(
+              "`" ++ name
+                ++ "` has side effects or calls other functions, so induction cannot unfold it",
+            ),
           Some(_) -> if terminates(context, name) { None } else {
-            Some("the checker does not see every call `" ++ name ++ "` makes of itself descend")
+            Some(
+              "the checker cannot show that every recursive call in `" ++ name
+                ++ "` has a smaller argument",
+            )
           },
         },
       })
   }
 
-/// The record checked, then its cases refuted on `budget`.
 pub fn check_induction(
   context: Context,
   g: Goal,
@@ -93,8 +87,8 @@ pub fn check_induction(
             ..cases,
             proof: Some({
               ..p,
-              rules: r.definitions.fold(p.rules, |acc: List<Rule>, definition: String|
-                acc.push(induction_rule(r.binder, r.scheme, definition))),
+              rules: r.definitions.fold(p.rules, |accumulator: List<Rule>, definition: String|
+                accumulator.push(induction_rule(r.binder, r.scheme, definition))),
             }),
           },
         None -> cases,
@@ -102,7 +96,6 @@ pub fn check_induction(
     },
   }
 
-/// A refutation on the shared budget; `contradictory` when the assertions contradict each other.
 type CountedRefutation = {
   terms: Terms,
   rules: RuleLog,
@@ -130,10 +123,9 @@ fn refute_counting(
   }
 }
 
-fn budget_spent_note(budget: Int) -> String = if budget == 0 { ", the budget spent" } else { "" }
+fn budget_spent_note(budget: Int) -> String =
+  if budget == 0 { ", and the proof search budget ran out" } else { "" }
 
-/// The goal's binders as symbols, each that is no `result` holding its type's invariant: what a
-/// definition returns holds it only once its own `builds` claims are shown.
 fn bind_binders(
   lowering: Lowering,
   context: Context,
@@ -141,9 +133,9 @@ fn bind_binders(
 ) -> { lowering: Lowering, ids: List<Int> } / {abort.raise} = {
   let bound = g.binders.fold(
     { lowering: lowering, ids: [] },
-    |acc: { lowering: Lowering, ids: List<Int> }, binder: Binder| {
-      let r = bind_symbolic(acc.lowering, binder.ty);
-      { lowering: r.lowering, ids: acc.ids.push(r.id) }
+    |accumulator: { lowering: Lowering, ids: List<Int> }, binder: Binder| {
+      let r = bind_symbolic(accumulator.lowering, binder.ty);
+      { lowering: r.lowering, ids: accumulator.ids.push(r.id) }
     },
   );
   let given = match g.result { Some(_) -> bound.ids.take(bound.ids.len() - 1), None -> bound.ids };
@@ -158,12 +150,9 @@ fn bind_binders(
   }
 }
 
-/// A type stating an invariant that `lowering` built a value of and `g` stood on: a step that
-/// unrolls a definition can make what the claim's own reading did not.
 fn untainted_built_type(lowering: Lowering, g: Goal) -> Option<String> =
   lowering.constructed.find(|t: String| !g.tainted.contains(t))
 
-/// `And(body, needs)` when anything is owed.
 fn conjoin_needs(
   terms: Terms,
   body: Int,
@@ -179,7 +168,6 @@ fn conjoin_needs(
   }
 }
 
-/// `Or(!guard, conclusion)` when there is a guard.
 fn guard_implies(
   terms: Terms,
   guards: List<Int>,
@@ -218,7 +206,6 @@ fn guard_satisfiable(
     }
   }
 
-/// The claim at `n <= 0`, then at `n > 0` from its instance at `n - step`.
 fn induct_int(
   context: Context,
   g: Goal,
@@ -252,9 +239,9 @@ fn induct_int(
   let bound = bind_binders(start, context, g);
   let guarded_lw = g.guards.fold(
     { lowering: bound.lowering, ids: [] },
-    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
-      let r = lower_root(acc.lowering, context, guard, bound.ids);
-      { lowering: assume(r.lowering, r.id), ids: acc.ids.push(r.id) }
+    |accumulator: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(accumulator.lowering, context, guard, bound.ids);
+      { lowering: assume(r.lowering, r.id), ids: accumulator.ids.push(r.id) }
     },
   );
   let guard_mark = guarded_lw.lowering.requirements.len();
@@ -263,13 +250,13 @@ fn induct_int(
       { lowering: guarded_lw.lowering, definition: None }
     } else {
       let r = lower_root(
-        { ..guarded_lw.lowering, return_owed: false },
+        { ..guarded_lw.lowering, must_return: false },
         context,
         result_body,
         bound.ids.take(bound.ids.len() - 1),
       );
       {
-        lowering: { ..r.lowering, return_owed: true },
+        lowering: { ..r.lowering, must_return: true },
         definition: Some({
           symbol: match bound.ids.at(bound.ids.len() - 1) { Some(t) -> t, None -> 0 },
           value: r.id,
@@ -281,19 +268,18 @@ fn induct_int(
   let body = lower_root(defined_result.lowering, context, g.body, bound.ids);
   let body_mark = body.lowering.requirements.len();
   let claim_calls = body.lowering.calls;
-  // The hypothesis: the same claim `step` below, its recursive calls left unrolled.
   let down = { ..drop_assumptions(body.lowering), unrolled: Map::new() };
   let below = int_literal(down.terms, step);
   match sub(below.terms, match bound.ids.at(slot) { Some(t) -> t, None -> 0 }, below.id) {
-    None -> no("no term for the step down", 0),
+    None -> no("there is no expression for the smaller argument of the inductive step", 0),
     Some(previous) -> {
-      let lw0 = { ..down, terms: previous.terms };
+      let start_lowering = { ..down, terms: previous.terms };
       let prior0 = bound.ids.set(slot, previous.id);
       let prior_guards = g.guards.fold(
-        { lowering: lw0, ids: [] },
-        |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
-          let r = lower_root(acc.lowering, context, guard, prior0);
-          { lowering: r.lowering, ids: acc.ids.push(r.id) }
+        { lowering: start_lowering, ids: [] },
+        |accumulator: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+          let r = lower_root(accumulator.lowering, context, guard, prior0);
+          { lowering: r.lowering, ids: accumulator.ids.push(r.id) }
         },
       );
       let with_result = match g.result {
@@ -301,40 +287,41 @@ fn induct_int(
           { lowering: prior_guards.lowering, prior: prior0 }
         } else {
           let r = lower_root(
-            { ..prior_guards.lowering, return_owed: false },
+            { ..prior_guards.lowering, must_return: false },
             context,
             result_body,
             prior0.take(prior0.len() - 1),
           );
           {
-            lowering: { ..r.lowering, return_owed: true },
+            lowering: { ..r.lowering, must_return: true },
             prior: prior0.set(prior0.len() - 1, r.id),
           }
         },
         None -> { lowering: prior_guards.lowering, prior: prior0 },
       };
       let prior_body = lower_root(with_result.lowering, context, g.body, with_result.prior);
-      let lw1 = prior_body.lowering;
-      let hypothesis_needs = requirements_since(lw1, body_mark);
-      let unstood = untainted_built_type(lw1, g);
-      // The hypothesis makes values of the calls it reaches; a call it does not reach, and that no
-      // equation defines, is one this induction cannot speak for.
-      let covered = set_of(lw1.calls.drop(claim_calls.len())).keys();
-      let defined = lw1.defined;
+      let prior_lowering = prior_body.lowering;
+      let hypothesis_needs = requirements_since(prior_lowering, body_mark);
+      let unstood = untainted_built_type(prior_lowering, g);
+      let covered = set_of(prior_lowering.calls.drop(claim_calls.len())).keys();
+      let defined = prior_lowering.defined;
       if unstood != None {
         no("it builds a `" ++ unstood.unwrap_or("") ++ "`, whose invariant it stood on", 0)
       } else if claim_calls.fold(false, |f: Bool, c: Int|
           f || (!covered.contains(c) && !defined.contains(c))) {
-        no("a remaining call is not one the hypothesis reaches", 0)
+        no(
+          "a function call in the claim is neither covered by the induction hypothesis nor defined by an equation",
+          0,
+        )
       } else {
-        let requirements = lw1.requirements;
-        let equations = lw1.equations;
+        let requirements = prior_lowering.requirements;
+        let equations = prior_lowering.equations;
         let definition = match defined_result.definition {
           Some(d) -> {
-            let m = eq(lw1.terms, d.symbol, d.value);
+            let m = eq(prior_lowering.terms, d.symbol, d.value);
             { terms: m.terms, eq: Some(m.id), symbol: Some(d.symbol) }
           },
-          None -> { terms: lw1.terms, eq: None, symbol: None },
+          None -> { terms: prior_lowering.terms, eq: None, symbol: None },
         };
         let in_question = set_of(covered.concat(defined));
         let ranges = int_ranges(definition.terms, definition.symbol, in_question);
@@ -345,7 +332,7 @@ fn induct_int(
           None ->
             {
               terms: needed.terms,
-              rules: lw1.rules,
+              rules: prior_lowering.rules,
               budget: budget,
               spent: 0,
               contradictory: true,
@@ -354,7 +341,7 @@ fn induct_int(
             refute_counting(
               needed.terms,
               context,
-              lw1.rules,
+              prior_lowering.rules,
               limits,
               budget,
               0,
@@ -367,12 +354,12 @@ fn induct_int(
           let hypothesis = guard_implies(conclusion.terms, prior_guards.ids, conclusion.id);
           let zero = int_literal(hypothesis.terms, 0);
           let n = match bound.ids.at(slot) { Some(t) -> t, None -> 0 };
-          let base = cmp(zero.terms, Le, n, zero.id);
-          let step = cmp(base.terms, Gt, n, zero.id);
+          let base = comparison(zero.terms, Le, n, zero.id);
+          let step = comparison(base.terms, Gt, n, zero.id);
           let common = ranges.out.concat(true_assertions(guarded_lw.ids)).concat(
             true_assertions(equations),
           ).concat(
-            true_assertions(lw1.facts),
+            true_assertions(prior_lowering.facts),
           ).concat(match definition.eq { Some(d) -> [{ term: d, polarity: true }], None -> [] });
           let base_case = refute_counting(
             step.terms,
@@ -384,7 +371,10 @@ fn induct_int(
             common.concat([{ term: base.id, polarity: true }, { term: claim.id, polarity: false }]),
           );
           if !base_case.contradictory {
-            no("the base case is open" ++ budget_spent_note(base_case.budget), base_case.spent)
+            no(
+              "the base case could not be proved" ++ budget_spent_note(base_case.budget),
+              base_case.spent,
+            )
           } else {
             let covered_ranges = ranges_of(base_case.terms, covered);
             let step_case = refute_counting(
@@ -402,7 +392,10 @@ fn induct_int(
               ).push({ term: claim.id, polarity: false }),
             );
             if !step_case.contradictory {
-              no("the step is open" ++ budget_spent_note(step_case.budget), step_case.spent)
+              no(
+                "the inductive step could not be proved" ++ budget_spent_note(step_case.budget),
+                step_case.spent,
+              )
             } else {
               let sat = guard_satisfiable(
                 step_case.terms,
@@ -421,7 +414,7 @@ fn induct_int(
                   guard_satisfiable: sat.ok,
                 }),
                 used: sat.spent,
-                blockers: blockers.concat(lw1.blockers),
+                blockers: blockers.concat(prior_lowering.blockers),
               }
             }
           }
@@ -431,7 +424,6 @@ fn induct_int(
   }
 }
 
-/// The claim lowered with the binder at `at`: its guards, what they owe, its body and what it owes.
 type Instance = { guards: List<Int>, guard_needs: List<Int>, body: Int, needs: List<Int> }
 
 fn instance(
@@ -441,15 +433,15 @@ fn instance(
   bound: List<Int>,
   slot: Int,
   at: Int,
-) -> { lowering: Lowering, inst: Instance } / {abort.raise} = {
+) -> { lowering: Lowering, instance: Instance } / {abort.raise} = {
   let placed = bound.set(slot, at);
   let start = drop_assumptions(lowering);
   let before = start.requirements.len();
   let guards = g.guards.fold(
     { lowering: start, ids: [] },
-    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
-      let r = lower_root(acc.lowering, context, guard, placed);
-      { lowering: assume(r.lowering, r.id), ids: acc.ids.push(r.id) }
+    |accumulator: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(accumulator.lowering, context, guard, placed);
+      { lowering: assume(r.lowering, r.id), ids: accumulator.ids.push(r.id) }
     },
   );
   let guard_mark = guards.lowering.requirements.len();
@@ -457,7 +449,7 @@ fn instance(
   let after = body.lowering.requirements.len();
   {
     lowering: body.lowering,
-    inst: {
+    instance: {
       guards: guards.ids,
       guard_needs: requirements_between(body.lowering, before, guard_mark),
       body: body.id,
@@ -466,8 +458,6 @@ fn instance(
   }
 }
 
-/// The claim at `[]`, then at `[h, ..t]` from its instance at `t`. Each instance is its own
-/// lowering, so `List::len` and the matches in reach reduce over the spine they are given.
 fn induct_list(
   context: Context,
   g: Goal,
@@ -485,7 +475,8 @@ fn induct_list(
       blockers: add_induction_blocker(blockers, "on `" ++ binder.name ++ "`: " ++ reason),
     };
   match g.result {
-    Some(_) -> no("a clause with a `result` is not inducted over a list", 0),
+    Some(_) ->
+      no("induction over a list cannot prove a claim that mentions the return value `result`", 0),
     None -> {
       let recursive_set = recursive.fold(Map::new(), |m: Map<String, Bool>, n: String|
         m.insert(n, true));
@@ -502,16 +493,15 @@ fn induct_list(
       };
       let bound = bind_binders(start, context, g);
       let sort = binder.ty;
-      let elem = list_element(sort);
+      let element = list_element(sort);
       let empty = nil(bound.lowering.terms, Some(sort));
-      let head = symbol(empty.terms, elem);
+      let head = symbol(empty.terms, element);
       let tail = symbol(head.terms, Some(sort));
       let pair = cons(tail.terms, head.id, tail.id, Some(sort));
-      let lw0 = { ..bound.lowering, terms: pair.terms };
-      let base = instance(lw0, context, g, bound.ids, slot, empty.id);
+      let start_lowering = { ..bound.lowering, terms: pair.terms };
+      let base = instance(start_lowering, context, g, bound.ids, slot, empty.id);
       let step = instance(base.lowering, context, g, bound.ids, slot, pair.id);
       let claim_calls = step.lowering.calls;
-      // A remaining call over a tail the patterns took off the instance is one the hypothesis speaks for.
       let structural = claim_calls.filter(|c: Int|
         match node(step.lowering.terms, c) {
           ApplicationTerm(a) ->
@@ -528,43 +518,46 @@ fn induct_list(
         slot,
         tail.id,
       );
-      let lw1 = hyp.lowering;
-      let covered = set_of(lw1.calls.drop(claim_calls.len())).keys();
-      let defined = lw1.defined;
-      let unstood = untainted_built_type(lw1, g);
+      let hypothesis_lowering = hyp.lowering;
+      let covered = set_of(hypothesis_lowering.calls.drop(claim_calls.len())).keys();
+      let defined = hypothesis_lowering.defined;
+      let unstood = untainted_built_type(hypothesis_lowering, g);
       if unstood != None {
         no("it builds a `" ++ unstood.unwrap_or("") ++ "`, whose invariant it stood on", 0)
       } else if claim_calls.fold(false, |f: Bool, c: Int|
           f || (!covered.contains(c) && !defined.contains(c) && !structural.contains(c))) {
-        no("a remaining call is not one the hypothesis reaches", 0)
+        no(
+          "a function call in the claim is neither covered by the induction hypothesis nor defined by an equation",
+          0,
+        )
       } else {
-        let equations = lw1.equations;
+        let equations = hypothesis_lowering.equations;
         let in_question = set_of(covered.concat(defined).concat(structural));
-        let ranges = int_ranges(lw1.terms, None, in_question);
-        let guards_checked = [base.inst, step.inst].fold(
+        let ranges = int_ranges(hypothesis_lowering.terms, None, in_question);
+        let guards_checked = [base.instance, step.instance].fold(
           {
             st: {
               terms: ranges.terms,
-              rules: lw1.rules,
+              rules: hypothesis_lowering.rules,
               budget: budget,
               spent: 0,
               contradictory: true,
             },
             failed: false,
           },
-          |acc: { st: CountedRefutation, failed: Bool }, case: Instance|
-            if acc.failed { acc } else {
-              let c = conjunction(acc.st.terms, case.guard_needs);
+          |accumulator: { st: CountedRefutation, failed: Bool }, case: Instance|
+            if accumulator.failed { accumulator } else {
+              let c = conjunction(accumulator.st.terms, case.guard_needs);
               match c.id {
-                None -> { st: { ..acc.st, terms: c.terms }, failed: false },
+                None -> { st: { ..accumulator.st, terms: c.terms }, failed: false },
                 Some(conjoined) -> {
                   let s = refute_counting(
                     c.terms,
                     context,
-                    acc.st.rules,
+                    accumulator.st.rules,
                     limits,
-                    acc.st.budget,
-                    acc.st.spent,
+                    accumulator.st.budget,
+                    accumulator.st.spent,
                     ranges.out.push({ term: conjoined, polarity: false }),
                   );
                   { st: s, failed: !s.contradictory }
@@ -574,12 +567,12 @@ fn induct_list(
         );
         if guards_checked.failed { no("the guard can raise", guards_checked.st.spent) } else {
           let gs = guards_checked.st;
-          let base_claim = conjoin_needs(gs.terms, base.inst.body, base.inst.needs);
-          let step_claim = conjoin_needs(base_claim.terms, step.inst.body, step.inst.needs);
-          let conclusion = conjoin_needs(step_claim.terms, hyp.inst.body, hyp.inst.needs);
-          let hypothesis = guard_implies(conclusion.terms, hyp.inst.guards, conclusion.id);
+          let base_claim = conjoin_needs(gs.terms, base.instance.body, base.instance.needs);
+          let step_claim = conjoin_needs(base_claim.terms, step.instance.body, step.instance.needs);
+          let conclusion = conjoin_needs(step_claim.terms, hyp.instance.body, hyp.instance.needs);
+          let hypothesis = guard_implies(conclusion.terms, hyp.instance.guards, conclusion.id);
           let common = ranges.out.concat(true_assertions(equations)).concat(
-            true_assertions(lw1.facts),
+            true_assertions(hypothesis_lowering.facts),
           );
           let base_case = refute_counting(
             hypothesis.terms,
@@ -588,13 +581,16 @@ fn induct_list(
             limits,
             gs.budget,
             gs.spent,
-            common.concat(true_assertions(base.inst.guards)).push({
+            common.concat(true_assertions(base.instance.guards)).push({
               term: base_claim.id,
               polarity: false,
             }),
           );
           if !base_case.contradictory {
-            no("the base case is open" ++ budget_spent_note(base_case.budget), base_case.spent)
+            no(
+              "the base case could not be proved" ++ budget_spent_note(base_case.budget),
+              base_case.spent,
+            )
           } else {
             let covered_ranges = ranges_of(base_case.terms, covered);
             let step_case = refute_counting(
@@ -604,7 +600,7 @@ fn induct_list(
               limits,
               base_case.budget,
               base_case.spent,
-              common.concat(true_assertions(step.inst.guards)).push({
+              common.concat(true_assertions(step.instance.guards)).push({
                 term: hypothesis.id,
                 polarity: true,
               }).concat(
@@ -612,7 +608,10 @@ fn induct_list(
               ).push({ term: step_claim.id, polarity: false }),
             );
             if !step_case.contradictory {
-              no("the step is open" ++ budget_spent_note(step_case.budget), step_case.spent)
+              no(
+                "the inductive step could not be proved" ++ budget_spent_note(step_case.budget),
+                step_case.spent,
+              )
             } else {
               let sat = guard_satisfiable(
                 step_case.terms,
@@ -621,7 +620,7 @@ fn induct_list(
                 step_case.budget,
                 step_case.spent,
                 g.binders,
-                step.inst.guards,
+                step.instance.guards,
               );
               {
                 proof: Some({
@@ -631,7 +630,7 @@ fn induct_list(
                   guard_satisfiable: sat.ok,
                 }),
                 used: sat.spent,
-                blockers: blockers.concat(lw1.blockers),
+                blockers: blockers.concat(hypothesis_lowering.blockers),
               }
             }
           }

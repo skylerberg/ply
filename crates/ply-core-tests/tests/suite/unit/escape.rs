@@ -1,12 +1,10 @@
 use ply_core::escape::*;
 use ply_core::{Span, codes};
 
-/// The boundary a handle leaves by rather than enters by: it names the definition that returned,
-/// the way to the handle, and what to return instead.
 #[test]
-fn an_entry_points_result_rejects_a_continuation_by_the_way_to_it() {
-    let boundary = Boundary::EntryResult { name: "m.parked" };
-    let escapee = Escapee {
+fn an_entry_point_returning_a_continuation_is_rejected_and_the_message_gives_the_path_to_it() {
+    let boundary = Boundary::ReturnedFromEntry { name: "m.parked" };
+    let escapee = EscapedHandle {
         handle: Handle::Continuation,
         route: vec!["item 1".into(), "`m.Just`'s argument 1".into()],
     };
@@ -30,14 +28,15 @@ fn an_entry_points_result_rejects_a_continuation_by_the_way_to_it() {
 }
 
 #[test]
-fn a_handle_reached_directly_names_no_way() {
-    let escapee = Escapee {
+fn a_task_handle_returned_directly_from_an_entry_point_is_rejected_with_a_message_that_has_no_field_path()
+ {
+    let escapee = EscapedHandle {
         handle: Handle::Task,
         route: Vec::new(),
     };
     assert_eq!(escapee.reached(), "");
     let d = rejected(
-        &Boundary::EntryResult { name: "m.spawned" },
+        &Boundary::ReturnedFromEntry { name: "m.spawned" },
         &escapee,
         Span::DUMMY,
     );
