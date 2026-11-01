@@ -11,7 +11,8 @@ import compiler.store.records (Record, record_store, with_record_store)
 import compiler.emit.keys (RootKey, Named, EntryPoint)
 import compiler.front.checking (LoadInputs)
 import compiler.front.checking.units (Entries, PartCode, ProgramCode, codes_of_part, decoded_code,
-                                      encoded_code, part_text, program_code, whole_lowering_pays)
+                                      encoded_code, part_text, program_code, root_enters,
+                                      whole_lowering_pays)
 import compiler.front.checking.world (decode_cache)
 import compiler.store.memo (memo)
 import compiler.store.memo_files
@@ -31,6 +32,8 @@ pub type WholeUnit = { sources: List<cc::Source>, contents: UnitContents }
 
 pub type CodeProgram = { front: LoadedAnalysis, place: ProgramPlace }
 
+pub type RollupRun = { names: List<Bytes>, inputs: Map<Bytes, Bytes>, place: ProgramPlace }
+
 pub type Emitted = {
   code: ProgramCode,
   held: Map<Bytes, Bytes>,
@@ -41,6 +44,7 @@ pub type Emitted = {
 pub effect emit {
   read unit(front: LoadedAnalysis, offered: List<RootKey>, entered: Option<List<RootKey>>) -> Result<WholeUnit, List<Diagnostic>>
   read code(program: CodeProgram, entries: Entries) -> Result<Emitted, List<Diagnostic>>
+  read named(run: RollupRun) -> Result<Emitted, List<Diagnostic>>
   read compiled(sources: List<cc::Source>, profile: cc::Profile) -> Result<String, List<Diagnostic>>
   read libraries(emitted: Emitted, profile: cc::Profile) -> Result<String, List<Diagnostic>>
 }
@@ -182,6 +186,34 @@ pub fn entered_library(
   )
 }
 
+fn named_entries(names: List<Bytes>) -> Entries / {memo.read, abort.raise} = {
+  let roots = names.map(Named);
+  {
+    roots: roots.concat(roots.filter(|k: RootKey| root_enters(k, false)).map(EntryPoint)),
+    tested: false,
+  }
+}
+
+fn named_code(run: RollupRun) -> Result<Emitted, List<Diagnostic>> / {Emits, abort.raise} = {
+  let held = run.place.store == None;
+  let ready = in_program_store(run.place, |_: LoadInputs| {
+    let entries = named_entries(run.names);
+    if whole_lowering_pays(entries) { { entries: entries, built: None } }
+    else { { entries: entries, built: Some(with_codes(program_code(entries), held)) } }
+  }).value;
+  let built = match ready.built {
+    Some(found) -> found,
+    None -> {
+      let whole = whole_lowering(run.place, ready.entries);
+      in_program_store(run.place, |_: LoadInputs| {
+        decode_cache.cache_whole_lowering(whole);
+        with_codes(program_code(ready.entries), held)
+      }).value
+    },
+  };
+  Ok({ code: built.code, held: built.held, place: run.place, inputs: run.inputs })
+}
+
 pub fn library_of(
   emitted: Option<Emitted>,
   profile: cc::Profile,
@@ -196,13 +228,14 @@ pub fn library_of(
 
 pub fn emitting<a | e>(
   reports_levels: Bool,
-  body: () -> a / {emit.unit, emit.code, emit.compiled, emit.libraries | e},
+  body: () -> a / {emit.unit, emit.code, emit.named, emit.compiled, emit.libraries | e},
 ) -> a / {abort.raise, Emits | e} =
   handle {
     body()
   } with {
     emit.unit(front, offered, entered) -> unit_of(front, offered, entered, reports_levels),
     emit.code(program, entries) -> code_of(program, entries),
+    emit.named(run) -> named_code(run),
     emit.compiled(sources, profile) -> compiled_of(sources, profile),
     emit.libraries(emitted, profile) -> if by_tcc(profile) { part_libraries[tcc](emitted, profile) }
     else { part_libraries[cc](emitted, profile) },
@@ -228,8 +261,8 @@ pub fn cached_library(
     Ok(sources) -> library(sources, profile),
   }
 
-fn whole_lowering(program: CodeProgram, entries: Entries) -> WholeLowering / {Emits, abort.raise} = {
-  let whole = whole_front(program.place);
+fn whole_lowering(place: ProgramPlace, entries: Entries) -> WholeLowering / {Emits, abort.raise} = {
+  let whole = whole_front(place);
   let front = whole.front;
   let named = entries.roots.fold([], |found: List<Bytes>, k: RootKey|
     match k { Named(n) -> found.push(n), _ -> found });
@@ -275,7 +308,7 @@ fn code_of(
       let built = match ready {
         Some(found) -> found,
         None -> {
-          let whole = whole_lowering(program, entries);
+          let whole = whole_lowering(program.place, entries);
           in_program_store(program.place, |_: LoadInputs| {
             decode_cache.cache_whole_lowering(whole);
             with_codes(program_code(entries), held)

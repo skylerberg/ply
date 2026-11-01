@@ -4,11 +4,11 @@ import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause, CostClaus
                               ReleaseInstance)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.emit.code (dump)
-import compiler.check.types (Effect, Type, NamedType, FunctionType, RecordType, VariableType,
-                             effect_list_text, positional_effects_text, read_effects, Printer,
-                             printer_new, print_type, Field, canonical_effects, canonical_scheme,
-                             canonical_type, bool_type, int_type, bytes_type, unit_type,
-                             NominalType, TypeTable, variables_in)
+import compiler.check.types (Effect, Type, effect_bin, NamedType, FunctionType, RecordType,
+                             VariableType, effect_list_text, positional_effects_text, read_effects,
+                             Printer, printer_new, print_type, Field, canonical_effects,
+                             canonical_scheme, canonical_type, bool_type, int_type, bytes_type,
+                             unit_type, NominalType, TypeTable, variables_in)
 import compiler.check.known (fixed_widths, list_item, array_element, columns_row, map_parts)
 import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.store.hash.forms (HashOutput, by_name, of_key)
@@ -32,9 +32,10 @@ import compiler.check.resolve.scopes (PackageDependencies)
 import std.bin
 import std.hash (blake3)
 import std.list
-import compiler.expand.embed (ModuleEmbed)
+import compiler.expand.embed (ModuleEmbed, module_embed_bin)
 import std.bytes (ascii_of_int)
-import compiler.front.rows (span_at, location_span, WrittenFunction, written_functions,
+import compiler.front.rows (DeclaredEffect, declared_effect_bin, declared_effects, module_span_bin,
+                            span_at, location_span, WrittenFunction, written_functions,
                             written_function_of, SpannedName, OutlinedEffect, OutlinedFunction,
                             OutlinedLaw, OutlinedTest, OutlinedType, OutlineItem, Outline,
                             module_row, imports_resolved, Cut, KeyRow, EmitterRoot,
@@ -46,10 +47,10 @@ import compiler.front.rows (span_at, location_span, WrittenFunction, written_fun
                             LawHashRow, TestHashRow, HashTableRow, OrdinalRow, Dump,
                             normalized_diagnostic)
 import compiler.front.facts (outlines_of, effect_visibility, effect_hosts, effect_public_of,
-                             type_rows, test_label_spans, law_literals, Frame, CheckedProgram,
-                             Analysis, TaggedSite, tagged_of, root_tagged, TypedConst,
-                             typed_consts_of, root_consts, StatementSite, statements_of,
-                             root_statements)
+                             ModuleShape, ModuleTables, one_module, type_rows, test_label_spans,
+                             law_literals, Frame, CheckedProgram, Analysis, TaggedSite, tagged_of,
+                             root_tagged, TypedConst, typed_consts_of, root_consts, StatementSite,
+                             statements_of, root_statements)
 
 pub fn merge_cuts(a: List<Cut>, b: List<Cut>) -> List<Cut> / {abort.raise} =
   iterate(
@@ -963,6 +964,49 @@ pub fn checked_program_of(w: Analysis) -> CheckedProgram / {abort.raise} =
     },
     checked: w.checked,
   }
+
+pub type RootPlace = { root: Bytes, at: ModuleSpan }
+
+pub type ModuleRollup = {
+  mains: List<RootPlace>,
+  roots: List<RootPlace>,
+  declared: List<DeclaredEffect>,
+  performed: List<Effect>,
+  embeds: List<ModuleEmbed>,
+}
+
+derive bin for RootPlace
+
+derive bin for ModuleRollup
+
+pub fn module_rollup(shape: ModuleShape, tables: ModuleTables) -> ModuleRollup / {abort.raise} = {
+  let module = shape.outline.name;
+  let one = one_module(shape, tables);
+  let checked = one.checked;
+  let width_sums = width_sums_of(checked.constructors);
+  let effs = effect_visibility(one.outlines);
+  let hosts = effect_hosts(one.outlines);
+  let read = all_body_facts(checked);
+  let own = checked.definitions.filter(|d: DefinitionInfo| d.module == module);
+  {
+    mains: own.filter(|d: DefinitionInfo| d.simple_name == b"main").map(|d: DefinitionInfo|
+      { root: d.name, at: location_span(d.at) }),
+    roots: emitter_roots(one.outlines, checked, width_sums).map(|r: EmitterRoot|
+      { root: r.root, at: r.at }),
+    declared: declared_effects(
+      checked.effects.filter(|e: EffectInfo| e.module == module).map(|e: EffectInfo|
+        effect_row(e, effect_public_of(effs, e), hosts, read, width_sums)),
+    ),
+    performed: own.fold([], |found: List<Effect>, d: DefinitionInfo|
+      found.concat(d.effects)).concat(
+      checked.tests.fold([], |found: List<Effect>, t: TestInfo| found.concat(t.effects)),
+    ).concat(
+      checked.laws.fold([], |found: List<Effect>, l: LawInfo| found.concat(l.effects)),
+    ).unique(
+    ),
+    embeds: shape.embeds.map(|e: ModuleEmbed| { ..e, module: module }),
+  }
+}
 
 pub fn view_dump(v: CheckedProgram) -> Dump / {abort.raise} = {
   let f = v.frame;
