@@ -17,6 +17,8 @@ import compiler.check.types (Type, scheme_text, type_text)
 import diagnostic (position_of)
 import project_store
 import paths
+import std.env (env)
+import std.path (join, strip_root)
 import program (Program, load_program, program_view)
 import module_queries
 import std.bin
@@ -184,14 +186,24 @@ fn store_json(stats: Stats) -> Json = {
 
 fn memo_json(u: memo_files::Usage) -> Json =
   object([
-    { key: "records", value: int(u.records) },
-    { key: "answers", value: int(u.results) },
-    { key: "answer_bytes", value: int(u.output_bytes) },
-    { key: "unread_bytes", value: int(u.unreferenced_bytes) },
-    { key: "foreign", value: int(u.foreign) },
+    { key: "facts", value: int(u.records) },
+    { key: "previous_versions", value: int(u.previous_versions) },
+    { key: "results", value: int(u.results) },
+    { key: "result_bytes", value: int(u.output_bytes) },
     { key: "reclaimable_bytes", value: int(u.reclaimable_bytes) },
     { key: "segments", value: int(u.segments) },
     { key: "bytes", value: int(u.bytes) },
+    {
+      key: "kinds",
+      value: Array(
+        u.kinds.map(|k: memo_files::KindUsage|
+          object([
+            { key: "query", value: Str(String::of_bytes_lossy(k.query)) },
+            { key: "facts", value: int(k.facts) },
+            { key: "bytes", value: int(k.bytes) },
+          ])),
+      ),
+    },
   ])
 
 fn stats_json(stats: Stats) -> Json / {abort.raise} =
@@ -254,9 +266,7 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
       ++ " · results "
       ++ dim(style, size_text(stats.memo.output_bytes))
       ++ " · reclaimable "
-      ++ dim(style, size_text(stats.memo.reclaimable_bytes))
-      ++ (if stats.memo.foreign == 0 { "" }
-      else { " (" ++ count_of(stats.memo.foreign, "record") ++ " of another `ply`)" }),
+      ++ dim(style, size_text(stats.memo.reclaimable_bytes)),
   ];
   let advised = if compact_suggested(stats) {
     head.push(
@@ -285,14 +295,7 @@ fn compact_json(c: CompactResult) -> Json / {abort.raise} =
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: int(ok_code()) },
     { key: "directory", value: Str(c.directory) },
-    {
-      key: "dropped",
-      value: object([
-        { key: "texts", value: int(c.dropped.texts) },
-        { key: "records", value: int(c.memo.records) },
-        { key: "answers", value: int(c.memo.results) },
-      ]),
-    },
+    { key: "dropped", value: object([{ key: "texts", value: int(c.dropped.texts) }]) },
     { key: "bytes_before", value: int(c.bytes_before) },
     { key: "bytes_after", value: int(c.bytes_after) },
     { key: "reclaimed_bytes", value: int(reclaimed(c)) },
@@ -309,19 +312,12 @@ fn compact_lines(style: Style, c: CompactResult) -> List<String> / {abort.raise}
         ++ " that no check or build used",
     )
   };
-  let swept = if c.memo.records + c.memo.results == 0 { pruned } else {
-    pruned.push(
-      indent() ++ "  dropped " ++ count_of(c.memo.records, "record") ++ " · "
-        ++ count_of(c.memo.results, "result")
-        ++ " nothing reads",
-    )
-  };
   let sized = if reclaimed(c) == 0 {
-    swept.push(
+    pruned.push(
       indent() ++ "  " ++ size_text(c.bytes_after) ++ " · " ++ dim(style, "nothing to reclaim"),
     )
   } else {
-    swept.push(
+    pruned.push(
       indent() ++ "  " ++ size_text(c.bytes_before) ++ " → " ++ size_text(c.bytes_after) ++ " ("
         ++ bold(style, size_text(reclaimed(c)))
         ++ " reclaimed)",
@@ -621,6 +617,30 @@ fn display_path(place: project_store::StoreLocation, name: String) -> String =
 
 fn memo_dir(place: project_store::StoreLocation) -> String = place.dir ++ "/memo"
 
+fn copied_result(
+  style: Style,
+  flags: Flags,
+) -> CommandOutput / {fs.resolved_kind[cwd], fs.resolved_kind[abs], env.working_directory, fs.read[abs], fs.write[abs], abort.raise} = {
+  let from = paths::resolve(flags.query);
+  let to = match flags.paths.at(0) { Some(r) -> r, None -> paths::resolve(".") };
+  memo_files::copy_database[abs](
+    strip_root(join(from.absolute, ".ply-cache/memo")),
+    strip_root(join(to.absolute, ".ply-cache/memo")),
+  );
+  {
+    json: object([
+      { key: "command", value: Str("cache") },
+      { key: "action", value: Str("copy") },
+      { key: "ok", value: Bool(true) },
+      { key: "exit_code", value: int(ok_code()) },
+      { key: "from", value: Str(flags.query) },
+    ]),
+    lines: [indent() ++ green(style, "copied") ++ " " ++ dim(style, flags.query)],
+    errs: [],
+    code: ok_code(),
+  }
+}
+
 fn stats_of<[r]>(
   place: project_store::StoreLocation,
   current: Map<Bytes, Bool>,
@@ -646,12 +666,12 @@ fn stats_of<[r]>(
     segments: u.segments,
     data_bytes: u.data_bytes,
     garbage_bytes: if u.data_bytes > u.live_bytes { u.data_bytes - u.live_bytes } else { 0 },
-    memo: memo_files::usage[r](memo_dir(place), current.keys()),
+    memo: memo_files::usage[r](memo_dir(place)),
   }
 }
 
 fn disk_bytes<[r]>(place: project_store::StoreLocation) -> Int / {fs.read[r], abort.raise} =
-  engine::disk_usage[r](place.dir) + memo_files::usage[r](memo_dir(place), []).bytes
+  engine::disk_usage[r](place.dir) + memo_files::usage[r](memo_dir(place)).bytes
 
 fn compact_store<[r]>(
   place: project_store::StoreLocation,
@@ -661,7 +681,7 @@ fn compact_store<[r]>(
   let c = tables::open_cache[r](place.dir, place.stamps);
   let pruned = tables::prune[r](c);
   let done = tables::compact_cache[r](pruned.cache);
-  let memo = memo_files::compact[r](memo_dir(place), current.keys());
+  let memo = memo_files::compact[r](memo_dir(place));
   {
     directory: display_path(place, ""),
     warnings: project_store::diagnostics_of(tables::warnings(done)),
@@ -888,7 +908,7 @@ fn inspect_store<[r]>(
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {env.working_directory, semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let place = project_store::store_location_of(flags.paths, project_store::shipped_stamps());
   let cwd = place.label == "cwd";
@@ -906,7 +926,7 @@ pub fn run(
     )
   } else if flags.action == "clear" {
     clear_result(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
-  } else {
+  } else if flags.action == "copy" { copied_result(s, flags) } else {
     let program = load_program(flags.paths, flags.verify_dependencies);
     inspect_result(s, flags.query, if cwd { inspect_store[cwd](place, program, flags.query) }
     else { inspect_store[abs](place, program, flags.query) })
@@ -930,11 +950,11 @@ fn no_stats() -> Stats =
     garbage_bytes: 0,
     memo: {
       records: 0,
+      previous_versions: 0,
       results: 0,
       output_bytes: 0,
-      unreferenced_bytes: 0,
-      foreign: 0,
       reclaimable_bytes: 0,
+      kinds: [],
       segments: 0,
       bytes: 0,
     },
@@ -969,11 +989,11 @@ test "`compact_suggested` is true only when more than half of a store's bytes ar
   assert(!compact_suggested({ ..half, data_bytes: 0, garbage_bytes: 0 }));
   let results = {
     records: 2,
+    previous_versions: 0,
     results: 2,
     output_bytes: 1000,
-    unreferenced_bytes: 501,
-    foreign: 1,
     reclaimable_bytes: 601,
+    kinds: [],
     segments: 1,
     bytes: 1200,
   };
@@ -995,11 +1015,11 @@ test "`stats_lines` prints the cache directory, open time, format and counts, fo
     garbage_bytes: 250,
     memo: {
       records: 3,
+      previous_versions: 0,
       results: 5,
       output_bytes: 2048,
-      unreferenced_bytes: 0,
-      foreign: 2,
       reclaimable_bytes: 1024,
+      kinds: [],
       segments: 2,
       bytes: 4096,
     },
@@ -1034,7 +1054,7 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
     directory: "/p/.ply-cache",
     warnings: [],
     dropped: { texts: 0 },
-    memo: { records: 0, results: 0, bytes: 0 },
+    memo: { bytes: 0 },
     bytes_before: 900,
     bytes_after: 900,
     results: 2,
@@ -1044,16 +1064,10 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
     "     900 B · nothing to reclaim",
     "     compacting keeps every test result, so no test runs again",
   ]);
-  let swept: CompactResult = {
-    ..c,
-    dropped: { texts: 2 },
-    memo: { records: 1, results: 3, bytes: 300 },
-    bytes_after: 400,
-  };
+  let swept: CompactResult = { ..c, dropped: { texts: 2 }, memo: { bytes: 300 }, bytes_after: 400 };
   assert_eq(compact_lines(plain(), swept), [
     "   compacted /p/.ply-cache",
     "     dropped 2 cached source texts that no check or build used",
-    "     dropped 1 record · 3 results nothing reads",
     "     900 B → 400 B (500 B reclaimed)",
     "     compacting keeps every test result, so no test runs again",
   ])
