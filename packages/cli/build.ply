@@ -2,7 +2,7 @@ import std.random (entropy)
 import compiler.cc (toolchain)
 import compiler.load (Derives, LoadedAnalysis, SourceFile)
 import args (Flags, no_flags, style_of, root_of)
-import literals (evaluation, evaluation_errors)
+import literals (evaluation, site_errors)
 import update_costs (measure_errors, cost_checker)
 import entries
 import std.path (normalize)
@@ -30,9 +30,9 @@ import entry (Main, Module, entry_point, span_label)
 import sources (File, Project)
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
-import compiler.front.checking.view (Modules)
-import program (Program, TimedLoad, loaded_analysis, no_loaded_analysis, no_program, session,
-                timed_load, program_view)
+import compiler.front.checking.view (LaterReading, Modules)
+import program (Program, Session, TimedLoad, loaded_analysis, no_loaded_analysis, no_program,
+                session, timed_load, program_view)
 import plyz
 import report (CommandOutput, indent, ok_code, count_of, rejected, reported)
 import std.fs (fs, Missing)
@@ -830,15 +830,16 @@ fn build_from_sources(
       flags.paths,
       flags.verify_dependencies,
       false,
-      |modules: Modules, _: ProgramSummary| view::program_digest(modules),
+      |modules: Modules, _: ProgramSummary|
+        { digest: view::program_digest(modules), later: view::later_reading(modules) },
     ) {
     Err(r) -> rejected(s, "build", r.diagnostics, r.places),
     Ok(opened) -> {
-      let key = build_key(opened.project, opened.value, flags, schema);
+      let key = build_key(opened.project, opened.value.digest, flags, schema);
       match if reuses_output(flags) { unchanged_build(key) } else { None } {
         Some(stored) -> { json: Null, lines: built_lines(s, stored), errs: [], code: ok_code() },
         None -> {
-          let done = fresh_build(s, flags, schema);
+          let done = fresh_build(s, flags, schema, opened);
           match done.written { Some(artifact) -> remember_build(key, artifact), None -> () };
           done.output
         },
@@ -847,16 +848,21 @@ fn build_from_sources(
   }
 }
 
+type BuildReading = { digest: Bytes, later: LaterReading }
+
 fn fresh_build(
   s: Style,
   flags: Flags,
   schema: Option<String>,
+  opened: Session<BuildReading>,
 ) -> { output: CommandOutput, written: Option<StoredArtifact> } / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
   handle {
     match program_view(t.program) {
       None -> rejected(s, "build", t.program.diagnostics, t.program.source_texts),
-      Some(w) -> match measure_errors(t.program, w.frame).concat(evaluation_errors(t, w.frame)) {
+      Some(w) -> match measure_errors(opened.place).concat(
+          site_errors(opened, opened.value.later, t.program.source_texts),
+        ) {
         [] ->
           with_artifacts(||
             build_program(

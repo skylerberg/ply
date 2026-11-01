@@ -1,5 +1,6 @@
 import compiler.syntax.expressions (TaggedPart)
-import compiler.front.facts (CheckedProgram, Frame, TaggedSite)
+import compiler.front.checking.view (LaterReading, ProgramSites)
+import compiler.front.facts (TaggedSite)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (length_prefixed)
 import compiler.syntax.lexer (utf8_len)
@@ -13,7 +14,6 @@ import compiler.cc (toolchain)
 import machine
 import machine (CallResult)
 import std.machine as entering
-import program (TimedLoad, program_view, runs_statements)
 import sources
 import statements
 import statements (CheckSite, CheckResult, Unchecked, check_sites, check_statements,
@@ -26,8 +26,10 @@ import std.random (entropy)
 import std.time (time)
 import std.value (Value, VCtor, VInt, VList, VRecord, VStr, render, field_named)
 import compiler.emit.keys (Named)
+import program (Session)
 import units
-import units (CodeProgram, emit)
+import units (CodeProgram, EmbeddedFiles, emit)
+import update_costs (cost_checker, reuse_violations)
 import std.path (strip_root)
 
 pub type Verdict =
@@ -41,8 +43,8 @@ derive bin for Verdict
 pub type EvaluationRequest = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 
 pub effect evaluation {
-  read verdicts(timed: TimedLoad, frame: Frame, requests: List<EvaluationRequest>) -> Result<List<Verdict>, List<Diagnostic>>
-  read statements(timed: TimedLoad, frame: Frame, requests: List<statements::StatementCheck>) -> Result<List<CheckResult>, List<Diagnostic>>
+  read verdicts(program: CodeProgram, requests: List<EvaluationRequest>) -> Result<List<Verdict>, List<Diagnostic>>
+  read statements(program: CodeProgram, requests: List<statements::StatementCheck>) -> Result<List<CheckResult>, List<Diagnostic>>
 }
 
 fn request_of(site: TaggedSite) -> EvaluationRequest =
@@ -188,40 +190,62 @@ fn timeout_note(whose: Bytes) -> Bytes =
     b" ms of wall clock, and stops it there",
   ])
 
-pub fn evaluation_errors(
-  timed: TimedLoad,
-  frame: Frame,
-) -> List<Diagnostic> / {evaluation.verdicts, evaluation.statements, abort.raise} =
-  literal_errors(timed, frame).concat(statement_errors(timed, frame))
-
-fn statement_errors(
-  timed: TimedLoad,
-  frame: Frame,
-) -> List<Diagnostic> / {evaluation.statements, abort.raise} =
-  if !runs_statements(timed.program, frame) { [] } else {
-    let sites = check_sites(frame).filter(|a: CheckSite| a.site.module < timed.program.files.len());
-    let rejected = schemas_rejected(sites);
-    if sites.len() == 0 { rejected } else {
-      match evaluation.statements(timed, frame, sites.map(|a: CheckSite| a.check)) {
-        Err(diagnostics) -> rejected.concat(diagnostics),
-        Ok(judgements) ->
-          range(0, sites.len()).fold(rejected, |accumulator: List<Diagnostic>, i: Int|
-            match judgements.at(i) {
-              Some(j) -> accumulator.concat(check_diagnostics(sites.get(i), j)),
-              None -> accumulator,
-            }),
-      }
+pub fn site_errors<a>(
+  s: Session<a>,
+  later: LaterReading,
+  places: List<SourceText>,
+) -> List<Diagnostic> / {evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} =
+  if later.sites.tagged.len() + later.sites.statements.len() == 0 { [] } else {
+    match units::code_program_of(s, later.rollups) {
+      Err(diagnostics) -> diagnostics,
+      Ok(program) -> evaluation_errors(program, later.sites, places),
     }
   }
 
+pub fn later_errors<a>(
+  s: Session<a>,
+  later: LaterReading,
+  places: List<SourceText>,
+) -> List<Diagnostic> / {cost_checker.report, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} =
+  match reuse_violations(s.place, s.summary) {
+    [] -> site_errors(s, later, places),
+    broken -> broken,
+  }
+
+pub fn evaluation_errors(
+  program: CodeProgram,
+  sites: ProgramSites,
+  places: List<SourceText>,
+) -> List<Diagnostic> / {evaluation.verdicts, evaluation.statements, abort.raise} =
+  literal_errors(program, sites.tagged, places).concat(statement_errors(program, sites))
+
+fn statement_errors(
+  program: CodeProgram,
+  sites: ProgramSites,
+) -> List<Diagnostic> / {evaluation.statements, abort.raise} = {
+  let checks = check_sites(sites);
+  let rejected = schemas_rejected(checks);
+  if checks.len() == 0 { rejected } else {
+    match evaluation.statements(program, checks.map(|a: CheckSite| a.check)) {
+      Err(diagnostics) -> rejected.concat(diagnostics),
+      Ok(judgements) ->
+        range(0, checks.len()).fold(rejected, |accumulator: List<Diagnostic>, i: Int|
+          match judgements.at(i) {
+            Some(j) -> accumulator.concat(check_diagnostics(checks.get(i), j)),
+            None -> accumulator,
+          }),
+    }
+  }
+}
+
 fn literal_errors(
-  timed: TimedLoad,
-  frame: Frame,
-) -> List<Diagnostic> / {evaluation.verdicts, abort.raise} = {
-  let sites = frame.tagged.filter(|site: TaggedSite| site.module < timed.program.files.len());
+  program: CodeProgram,
+  sites: List<TaggedSite>,
+  places: List<SourceText>,
+) -> List<Diagnostic> / {evaluation.verdicts, abort.raise} =
   if sites.len() == 0 { [] } else {
     let parsers = distinct_requests(sites);
-    match evaluation.verdicts(timed, frame, parsers) {
+    match evaluation.verdicts(program, parsers) {
       Err(diagnostics) -> diagnostics,
       Ok(verdicts) -> {
         let by_identity = range(0, parsers.len()).fold(
@@ -235,7 +259,7 @@ fn literal_errors(
         sites.fold([], |accumulator: List<Diagnostic>, site: TaggedSite|
           match by_identity.get(request_identity(request_of(site))) {
             None -> accumulator,
-            Some(verdict) -> match literal_error(timed.program.source_texts, site, verdict) {
+            Some(verdict) -> match literal_error(places, site, verdict) {
               Some(diagnostic) -> accumulator.push(diagnostic),
               None -> accumulator,
             },
@@ -243,7 +267,6 @@ fn literal_errors(
       },
     }
   }
-}
 
 fn verdict_of(called: CallResult) -> Verdict / {abort.raise} =
   match called.result {
@@ -288,19 +311,15 @@ fn evaluate(
   requests: List<EvaluationRequest>,
 ) -> Result<List<Verdict>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
   if requests.len() == 0 { Ok([]) } else {
-    match units::library_over(
-        emit.code(program, { roots: callees(requests).map(Named), tested: false }),
-        cc::development(),
-      ) {
+    match units::library_over(emit.code(program, callees(requests).map(Named)), cc::development()) {
       Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(reason) -> Err([machine::unit_load_error(reason)]),
         Ok(opened) -> {
-          let roots = machine::roots_of(program.front.dump);
           let call = |name: Bytes, args: List<Value>|
             machine::machine_call(
               opened.unit,
-              roots,
+              program.roots,
               String::of_bytes_lossy(name),
               args,
               machine::evaluation_limits(),
@@ -350,7 +369,7 @@ pub fn with_evaluation_cache<a | e>(
   handle {
     body()
   } with {
-    evaluation.statements(timed, frame, checks) -> {
+    evaluation.statements(program, checks) -> {
       let bodies = strip_root(toolchain.bodies_dir());
       let toolchain = toolchain_key(
         shipped.definitions(),
@@ -358,9 +377,9 @@ pub fn with_evaluation_cache<a | e>(
         shipped.version(),
       );
       with_record_store[abs, lit](literals_store(bodies, toolchain), ||
-        judgements(toolchain, timed, frame, checks))
+        judgements(toolchain, program, checks))
     },
-    evaluation.verdicts(timed, frame, requests) -> {
+    evaluation.verdicts(program, requests) -> {
       let bodies = strip_root(toolchain.bodies_dir());
       let toolchain = toolchain_key(
         shipped.definitions(),
@@ -383,12 +402,8 @@ pub fn with_evaluation_cache<a | e>(
           }
         });
         let open = sought.filter(|s: KeyedRequest| s.cached == None);
-        if open.len() == 0 { Ok(merge_verdicts(sought, [])) } else {
-          match program_view(timed.program) {
-            None -> Err(timed.program.diagnostics),
-            Some(view) -> evaluate_and_cache(timed, view, sought, open),
-          }
-        }
+        if open.len() == 0 { Ok(merge_verdicts(sought, [])) }
+        else { evaluate_and_cache(program, sought, open) }
       })
     },
   }
@@ -397,13 +412,12 @@ fn literals_store(bodies: String, toolchain: Bytes) -> String / {abort.raise} =
   bodies ++ "/literals-" ++ blake3(toolchain).slice(0, 8).hex_of()
 
 fn evaluate_and_cache(
-  timed: TimedLoad,
-  view: CheckedProgram,
+  program: CodeProgram,
   sought: List<KeyedRequest>,
   open: List<KeyedRequest>,
 ) -> Result<List<Verdict>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.put[lit], abort.raise} = {
   let requests = open.map(|s: KeyedRequest| s.request);
-  match evaluate(units::code_program(timed, view), requests) {
+  match evaluate(program, requests) {
     Err(diagnostics) -> Err(diagnostics),
     Ok(found) -> {
       record_store.put[lit](
@@ -430,8 +444,7 @@ type KeyedStatement = {
 
 fn judgements(
   toolchain: Bytes,
-  timed: TimedLoad,
-  frame: Frame,
+  program: CodeProgram,
   checks: List<statements::StatementCheck>,
 ) -> Result<List<CheckResult>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.get[lit], record_store.put[lit], abort.raise} = {
   let keyed = checks.map(|a: statements::StatementCheck| {
@@ -452,14 +465,7 @@ fn judgements(
   if open.len() == 0 {
     Ok(keyed.map(|k: KeyedStatement| match k.cached { Some(j) -> j, None -> Unchecked }))
   } else {
-    match match program_view(timed.program) {
-        None -> Err(timed.program.diagnostics),
-        Some(view) ->
-          check_statements(
-            units::code_program(timed, view),
-            open.map(|k: KeyedStatement| k.request),
-          ),
-      } {
+    match check_statements(program, open.map(|k: KeyedStatement| k.request)) {
       Err(diagnostics) -> Err(diagnostics),
       Ok(found) -> {
         record_store.put[lit](

@@ -34,10 +34,11 @@ import tests.report (PrintedEffect, Phases, Entry, Case, RunDecision, conflictin
                      handshake_lines, simulation_line, opening_lines, phase_lines, run_total,
                      run_phase_lines, explain_lines, name_column, result_line, result_lines,
                      summary_line, secondary_lines, at_lines, seed_lines, change_text, case_json,
-                     placed_cases, fault_json, test_output, test_at)
+                     placed_cases, fault_json, test_output)
 import tests.concluded (entry_of, job_of, run_job, fault_of, replay_of)
-import tests.cases (Scope, scope_of, over_cases, expand_cases, ExpandedTests)
-import tests.run (rows_of, declared_effects, case_view)
+import tests.cases (Scope, scope_of, over_cases, expand_cases, expanded_program, ExpandedTests)
+import tests.listing (TestListing, listing_of_program, test_at)
+import tests.run (rows_of, case_view)
 
 fn a_source_texts() -> List<SourceText> =
   [{ path: "m.ply", text: b"test \"two is two\" { assert_eq(1 + 1, 2) }\n" }]
@@ -93,7 +94,7 @@ fn an_opening() -> Opening = { operations: 0, digest: "", tests_using_host: [], 
 
 fn a_test_run() -> TestRun / {abort.raise} = tester::start_run(options_from(parsed(["test"])))
 
-fn scoped(w: ProgramListing, argv: List<String>) -> Scope / {abort.raise} =
+fn scoped(w: TestListing, argv: List<String>) -> Scope / {abort.raise} =
   scope_of(
     w,
     from_argv("test", argv).filters,
@@ -102,7 +103,7 @@ fn scoped(w: ProgramListing, argv: List<String>) -> Scope / {abort.raise} =
   )
 
 fn selected_case_indices(
-  w: ProgramListing,
+  w: TestListing,
   argv: List<String>,
   named: Option<List<String>>,
 ) -> List<Int> / {abort.raise} = over_cases(w, from_argv("test", argv).filters, named)
@@ -771,31 +772,29 @@ test "a seeded test searches only the seeds not yet searched, and a test without
   })
 }
 
-fn analysed_as(name: String, source: String) -> ProgramListing / {abort.raise} =
+fn analysed_as(name: String, source: String) -> TestListing / {abort.raise} =
   match analyse(
       parse_all([{ name: Bytes::of_string(name), source_text: Bytes::of_string(source) }]),
     ) {
-    Analysed(w) -> listing_of(checked_program_of(w)),
+    Analysed(w) -> listing_of_program(listing_of(checked_program_of(w))),
     Rejected(_) -> panic("the fixture checks"),
   }
 
-fn analysed(source: String) -> ProgramListing / {abort.raise} = analysed_as("", source)
+fn analysed(source: String) -> TestListing / {abort.raise} = analysed_as("", source)
 
-fn cases_of_whole(analysis: ProgramListing) -> List<Case> / {abort.raise} = {
-  let declared = declared_effects(analysis);
-  range(0, analysis.checked.tests.len()).fold([], |accumulator: List<Case>, i: Int|
+fn cases_of_whole(analysis: TestListing) -> List<Case> / {abort.raise} =
+  range(0, analysis.tests.len()).fold([], |accumulator: List<Case>, i: Int|
     match test_at(analysis, i) {
-      Some(t) -> accumulator.push(case_view(analysis, declared, i, t)),
+      Some(t) -> accumulator.push(case_view(analysis, i, t)),
       None -> accumulator,
     })
-}
 
-fn coloured(analysis: ProgramListing) -> List<List<Int>> / {abort.raise} = {
+fn coloured(analysis: TestListing) -> List<List<Int>> / {abort.raise} = {
   let cases = cases_of_whole(analysis);
   classes_of(a_program(cases), cases.map(|case: Case| case.index))
 }
 
-fn texts_of_case(analysis: ProgramListing, i: Int) -> List<String> / {abort.raise} =
+fn texts_of_case(analysis: TestListing, i: Int) -> List<String> / {abort.raise} =
   match cases_of_whole(analysis).at(i) {
     Some(c) -> c.listed.map(|printed: PrintedEffect| printed.text),
     None -> [],
@@ -891,7 +890,7 @@ test "`--shard` puts each test and each case in exactly one shard, even when `--
     ),
   );
   let part = |k: Int, more: List<String>|
-    scoped(over.analysis, ["--shard", k.to_string() ++ "/3"].concat(more));
+    scoped(over.listing, ["--shard", k.to_string() ++ "/3"].concat(more));
   let parts = [1, 2, 3].map(|k: Int| part(k, []).visible);
   assert(parts.all(|shard_indices: List<Int>| shard_indices.len() > 0));
   assert(
@@ -904,7 +903,7 @@ test "`--shard` puts each test and each case in exactly one shard, even when `--
       part(k, ["--filter", "holds 1"]).visible
         == parts.at_or(k - 1, []).filter(|i: Int| i == 2 || i >= 11)),
   );
-  assert_eq(scoped(over.analysis, ["--shard", "1/1"]).visible, range(0, 13));
+  assert_eq(scoped(over.listing, ["--shard", "1/1"]).visible, range(0, 13));
   assert_eq(selected_case_indices(whole, ["--shard", "3/3"], None), [1])
 }
 
@@ -920,7 +919,8 @@ test "a run lists a test with cases only when a filter could match one of its ca
 fn cases_source() -> Bytes =
   b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n"
 
-fn program_with_cases() -> ProgramListing / {abort.raise} = checked_program(cases_source())
+fn program_with_cases() -> TestListing / {abort.raise} =
+  listing_of_program(checked_program(cases_source()))
 
 fn checked_program(source: Bytes) -> ProgramListing / {abort.raise} =
   listing_of(framed_program(source))
@@ -942,7 +942,8 @@ fn framed_program(source: Bytes) -> CheckedProgram / {abort.raise} =
   }
 
 test "`expand_cases` turns each case into its own test keyed by its label, and the case-generating code is not run" {
-  let whole = program_with_cases();
+  let program = checked_program(cases_source());
+  let whole = listing_of_program(program);
   let over = expand_cases(
     whole,
     Map::new().insert(
@@ -950,12 +951,8 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
       Ok([{ label: "holds 1", identity: b"one" }, { label: "holds 2", identity: b"two" }]),
     ),
   );
-  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.key), [
-    b"m.plain",
-    b"m.holds 1",
-    b"m.holds 2",
-  ]);
-  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.index), [0, 1, 2]);
+  assert_eq(over.listing.tests.map(|t: TestInfo| t.key), [b"m.plain", b"m.holds 1", b"m.holds 2"]);
+  assert_eq(over.listing.tests.map(|t: TestInfo| t.index), [0, 1, 2]);
   assert_eq(over.entries.map(|e: Entry| e.test), [0, 1, 1]);
   assert_eq(over.entries.map(|e: Entry| e.key), [b"m.plain", b"m.holds {n}", b"m.holds {n}"]);
   assert_eq(over.entries.map(|e: Entry| e.case), [
@@ -963,8 +960,8 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
     Some({ at: 0, identity: b"one" }),
     Some({ at: 1, identity: b"two" }),
   ]);
-  let hashes = over.analysis.hashes.tests;
-  let of_whole = |key: Bytes| whole.hashes.tests.get(key);
+  let hashes = over.listing.hashes;
+  let of_whole = |key: Bytes| whole.hashes.get(key);
   assert_eq(hashes.get(b"m.plain"), of_whole(b"m.plain"));
   assert_eq(hashes.get(b"m.holds 1"), match of_whole(b"m.holds {n}") {
     Some(h) -> Some(case_hash(h, b"one")),
@@ -973,13 +970,14 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
   assert(hashes.get(b"m.holds 1") != hashes.get(b"m.holds 2"), None);
   let reachable_functions = |a: ProgramListing|
     reach(a.hashes, [ItemKeyed(b"m.holds 1")]).functions.keys();
+  let expanded = expanded_program(program, Map::new().insert(0, 0), over);
   assert(
-    reachable_functions(over.analysis).contains(b"m.table")
-      && reachable_functions(over.analysis).contains(b"m.held"),
+    reachable_functions(expanded.analysis).contains(b"m.table")
+      && reachable_functions(expanded.analysis).contains(b"m.held"),
   );
   assert(
-    !reachable_functions(over.run_analysis).contains(b"m.table")
-      && reachable_functions(over.run_analysis).contains(b"m.held"),
+    !reachable_functions(expanded.run_analysis).contains(b"m.table")
+      && reachable_functions(expanded.run_analysis).contains(b"m.held"),
   )
 }
 
@@ -996,17 +994,13 @@ fn entry_descriptions(over: ExpandedTests) -> List<String> =
 
 test "tests over cases may share a label, but each case in a module needs its own label" {
   let source = b"test \"plain\" { () }\ntest \"holds {n}\" for n: Int in [1, 2] { () }\ntest \"holds {n}\" for n: Int in [3] { () }\n";
-  let whole = checked_program(source);
-  assert_eq(whole.checked.tests.map(|t: TestInfo| t.key), [
-    b"m.plain",
-    b"m.holds {n}",
-    b"m.holds {n} (2)",
-  ]);
+  let whole = listing_of_program(checked_program(source));
+  assert_eq(whole.tests.map(|t: TestInfo| t.key), [b"m.plain", b"m.holds {n}", b"m.holds {n} (2)"]);
   let apart = expand_cases(
     whole,
     Map::new().insert(1, listing(["holds 1", "holds 2"])).insert(2, listing(["holds 3"])),
   );
-  assert_eq(apart.analysis.checked.tests.map(|t: TestInfo| t.key), [
+  assert_eq(apart.listing.tests.map(|t: TestInfo| t.key), [
     b"m.plain",
     b"m.holds 1",
     b"m.holds 2",
@@ -1075,10 +1069,10 @@ test "a test whose cases could not be listed stays one test, and fails with the 
     },
   };
   let over = expand_cases(whole, Map::new().insert(1, Err(reason)));
-  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.key), [b"m.plain", b"m.holds {n}"]);
-  assert_eq(over.analysis.hashes.tests, whole.hashes.tests);
+  assert_eq(over.listing.tests.map(|t: TestInfo| t.key), [b"m.plain", b"m.holds {n}"]);
+  assert_eq(over.listing.hashes, whole.hashes);
   let p = a_program(
-    cases_of_whole(over.analysis).map(|case: Case|
+    cases_of_whole(over.listing).map(|case: Case|
       { ..case, entry: over.entries.at_or(case.index, case.entry) }),
   );
   let ended = handle {

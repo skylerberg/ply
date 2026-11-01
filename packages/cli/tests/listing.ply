@@ -1,0 +1,156 @@
+import std.list
+import compiler.check.infer.checker (EffectInfo, Location, TestInfo, prelude_effects)
+import compiler.check.resolve.tables (Source)
+import compiler.emit.keys (RootKey, TestCases, test_key)
+import compiler.front.checking (LoadInputs)
+import compiler.front.checking.groups (HashSummary, TestHash)
+import compiler.front.checking.view
+import compiler.front.checking.view (LaterReading, Modules, NamedRollup)
+import compiler.front.facts (ProgramListing, test_label_spans)
+import compiler.front.rows (DeclaredEffect, Outline)
+import compiler.store.hash.forms (ModuleHashes)
+import compiler.syntax.parsing (Span)
+import diagnostic (SourceText)
+import program (ProgramStore, Session, in_program_store)
+
+pub type TestListing = {
+  root: Int,
+  names: List<Bytes>,
+  tests: List<TestInfo>,
+  labels: List<Location>,
+  hashes: Map<Bytes, Bytes>,
+  effects: Map<Bytes, Bool>,
+  records: List<Bytes>,
+}
+
+pub type TestReading = { listing: TestListing, later: LaterReading, whole: Option<ProgramListing> }
+
+pub fn test_at(listing: TestListing, i: Int) -> Option<TestInfo> = listing.tests.at(i)
+
+pub fn test_hash_at(listing: TestListing, i: Int) -> Option<Bytes> =
+  match test_at(listing, i) { Some(t) -> listing.hashes.get(t.key), None -> None }
+
+pub fn hash_at(listing: TestListing, i: Int) -> Option<String> / {abort.raise} =
+  match test_hash_at(listing, i) { Some(h) -> Some(h.hex_of()), None -> None }
+
+pub fn test_root_at(listing: TestListing, i: Int) -> Option<RootKey> / {abort.raise} =
+  match test_at(listing, i) { Some(t) -> Some(test_key(t.module, t.name)), None -> None }
+
+pub fn test_roots(listing: TestListing) -> List<RootKey> / {abort.raise} =
+  listing.tests.fold([], |found: List<RootKey>, t: TestInfo| {
+    let root = test_key(t.module, t.name);
+    found.push(root).push(TestCases(root))
+  })
+
+fn effects_by_name(rollups: List<NamedRollup>) -> Map<Bytes, Bool> =
+  rollups.fold(
+    prelude_effects().fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
+      found.insert(e.name, e.nondet)),
+    |found: Map<Bytes, Bool>, r: NamedRollup|
+      r.rollup.declared.fold(found, |m: Map<Bytes, Bool>, d: DeclaredEffect|
+        m.insert(d.name, d.nondet)),
+  )
+
+pub fn listing_over(
+  modules: Modules,
+  rollups: List<NamedRollup>,
+  summaries: List<HashSummary>,
+) -> TestListing / {abort.raise} = {
+  let placed = range(0, modules.own.len()).fold(
+    { tests: [], labels: [] },
+    |found: { tests: List<TestInfo>, labels: List<Location> }, i: Int| {
+      let r = rollups.get(i).rollup;
+      {
+        tests: r.tests.fold(found.tests, |tests: List<TestInfo>, t: TestInfo|
+          tests.push({ ..t, index: tests.len(), at: { ..t.at, module: i } })),
+        labels: found.labels.concat(r.labels.map(|s: Span| { module: i, span: s })),
+      }
+    },
+  );
+  {
+    root: modules.root,
+    names: rollups.map(|r: NamedRollup| r.module),
+    tests: placed.tests,
+    labels: placed.labels,
+    hashes: summaries.fold(Map::new(), |found: Map<Bytes, Bytes>, s: HashSummary|
+      s.tests.fold(found, |m: Map<Bytes, Bytes>, t: TestHash| m.insert(t.key, t.hash))),
+    effects: effects_by_name(rollups),
+    records: summaries.map(|s: HashSummary| s.record),
+  }
+}
+
+pub fn listing_of_program(w: ProgramListing) -> TestListing / {abort.raise} =
+  {
+    root: w.root,
+    names: w.outlines.map(|o: Outline| o.name),
+    tests: w.checked.tests,
+    labels: test_label_spans(w.outlines),
+    hashes: w.hashes.tests,
+    effects: prelude_effects().concat(w.checked.effects).fold(
+      Map::new(),
+      |found: Map<Bytes, Bool>, e: EffectInfo| found.insert(e.name, e.nondet),
+    ),
+    records: w.modules.map(|m: ModuleHashes| m.record),
+  }
+
+pub fn sources_named(names: List<Bytes>, places: List<SourceText>) -> List<Source> / {abort.raise} =
+  range(0, names.len()).map(|i: Int|
+    { name: names.get(i), source_text: places.at(i).map(|p: SourceText| p.text).unwrap_or(b"") })
+
+pub type TestsView = { whole: ProgramListing, places: List<SourceText>, slots: Map<Int, Int> }
+
+fn imported_from(
+  rollups: List<NamedRollup>,
+  start: List<Bytes>,
+) -> Map<Bytes, Bool> / {abort.raise} = {
+  let imports = rollups.fold(Map::new(), |found: Map<Bytes, List<Bytes>>, r: NamedRollup|
+    found.insert(r.module, r.rollup.imports));
+  iterate(
+    { seen: Map::new(), work: start },
+    1000000,
+    |s: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
+      match s.work {
+        [] -> Stop(s.seen),
+        [m, ..rest] -> if s.seen.contains(m) { Continue({ ..s, work: rest }) } else {
+          Continue({
+            seen: s.seen.insert(m, true),
+            work: rest.concat(imports.get(m).unwrap_or([])),
+          })
+        },
+      },
+  )
+}
+
+pub fn view_of_modules(
+  t: Session<TestReading>,
+  places: List<SourceText>,
+  start: List<Bytes>,
+) -> TestsView / {ProgramStore, abort.raise} =
+  match t.value.whole {
+    Some(w) ->
+      {
+        whole: w,
+        places: places,
+        slots: range(0, t.value.listing.names.len()).fold(
+          Map::new(),
+          |found: Map<Int, Int>, i: Int| found.insert(i, i),
+        ),
+      },
+    None -> {
+      let rollups = t.value.later.rollups;
+      let reached = imported_from(rollups, start.push(b"std.prelude"));
+      let slots = range(0, rollups.len()).filter(|i: Int| reached.contains(rollups.get(i).module));
+      let name = |i: Int| rollups.get(i).module;
+      let subset = {
+        root: slots.filter(|i: Int| i < t.modules.root).len(),
+        own: slots.filter(|i: Int| i < t.modules.own.len()).map(name),
+        pulled: slots.filter(|i: Int| i >= t.modules.own.len()).map(name),
+      };
+      {
+        whole: in_program_store(t.place, |_: LoadInputs| view::listed(subset)).value,
+        places: slots.map(|i: Int| places.get(i)),
+        slots: range(0, slots.len()).fold(Map::new(), |found: Map<Int, Int>, k: Int|
+          found.insert(slots.get(k), k)),
+      }
+    },
+  }

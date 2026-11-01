@@ -166,26 +166,23 @@ pub fn store_pass(
   c0: tables::Cache,
   texts: List<{ hash: Bytes, text: Bytes }>,
   modules: List<ModuleHashes>,
+  snapshot: List<Bytes>,
 ) -> tables::Cache / {abort.raise} = {
-  let store_state = texts.fold(c0, |c: tables::Cache, t: { hash: Bytes, text: Bytes }|
+  let with_texts = texts.fold(c0, |c: tables::Cache, t: { hash: Bytes, text: Bytes }|
     tables::put_text(c, t.hash, t.text));
-  if modules.len() == 0 { store_state } else {
-    let record_evidence = modules.fold(store_state, |c: tables::Cache, m: ModuleHashes|
-      if tables::has_module_record(c, m.record) { c }
-      else { tables::put_module_record(c, module_record(m.cached)) });
-    tables::put_snapshot(record_evidence, snapshot_of(modules))
-  }
+  let with_records = modules.fold(with_texts, |c: tables::Cache, m: ModuleHashes|
+    if tables::has_module_record(c, m.record) { c }
+    else { tables::put_module_record(c, module_record(m.cached)) });
+  if snapshot.len() == 0 { with_records }
+  else { tables::put_snapshot(with_records, snapshot.sort()) }
 }
 
-fn snapshot_of(modules: List<ModuleHashes>) -> List<Bytes> =
-  modules.map(|m: ModuleHashes| m.record).sort()
-
-pub fn snapshot_digest_of(modules: List<ModuleHashes>) -> Bytes =
-  tables::snapshot_digest(snapshot_of(modules))
+pub fn snapshot_digest_of(records: List<Bytes>) -> Bytes = tables::snapshot_digest(records.sort())
 
 pub fn put_filing<[r], [u]>(
   c0: tables::Cache,
   f: Filing,
+  seen: List<Bytes>,
 ) -> tables::Cache / {fs.read[r], fs.read[u], abort.raise} = {
   let c1 = f.code_passes.fold(
     f.passes.fold(c0, |c: tables::Cache, p: Pass| {
@@ -206,15 +203,16 @@ pub fn put_filing<[r], [u]>(
       walk_start: e.record.start,
       case: e.record.case,
     }));
-  f.seen.fold(c2, |c: tables::Cache, hash: Bytes|
+  seen.fold(c2, |c: tables::Cache, hash: Bytes|
     if tables::knows_definition(c, hash) { c } else { tables::observe_definition(c, hash) })
 }
 
 fn flush_filing<[r]>(
   cache: tables::Cache,
   f: Filing,
+  seen: List<Bytes>,
 ) -> tables::Cache / {fs.read[r], fs.write[r], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  tables::flush_shared[r, abs](put_filing[r, abs](cache, f))
+  tables::flush_shared[r, abs](put_filing[r, abs](cache, f, seen))
 
 fn without_warnings(k: OpenStore) -> OpenStore =
   { ..k, cache: { ..k.cache, store: { ..k.cache.store, warnings: [] } } }
@@ -224,7 +222,7 @@ fn cache_warnings(cache: tables::Cache) -> List<Diagnostic> =
 
 pub fn with_result_cache<a | e>(
   opened_store: Option<OpenStore>,
-  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing | e},
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.filed, result_cache.history, result_cache.store_filing | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
   handle {
     go()
@@ -281,17 +279,21 @@ pub fn with_result_cache<a | e>(
       None -> [],
       Some(k) -> unstored_in(k.cache, hashes),
     },
-    result_cache.history(texts, modules) -> match store_state {
+    result_cache.filed(records) -> match store_state {
+      None -> records.map(|r: Bytes| true),
+      Some(k) -> records.map(|r: Bytes| tables::has_module_record(k.cache, r)),
+    },
+    result_cache.history(texts, modules, snapshot) -> match store_state {
       None -> (),
       Some(k) -> {
-        store_state = Some({ ..k, cache: store_pass(k.cache, texts, modules) });
+        store_state = Some({ ..k, cache: store_pass(k.cache, texts, modules, snapshot) });
       },
     },
-    result_cache.store_filing(f) -> match store_state {
+    result_cache.store_filing(f, seen) -> match store_state {
       None -> { unflushed: None, warnings: [] },
       Some(k) -> {
-        let c = if k.place.label == "cwd" { flush_filing[cwd](k.cache, f) }
-        else { flush_filing[abs](k.cache, f) };
+        let c = if k.place.label == "cwd" { flush_filing[cwd](k.cache, f, seen) }
+        else { flush_filing[abs](k.cache, f, seen) };
         store_state = Some(without_warnings({ ..k, cache: c }));
         { unflushed: None, warnings: cache_warnings(c) }
       },
@@ -479,14 +481,12 @@ fn a_filing() -> Filing / {abort.raise} =
         key: b"m.t",
         record: {
           test: hashed("t"),
-          era: snapshot_digest_of([a_module()]),
+          era: snapshot_digest_of([a_module().record]),
           start: b"m.t",
           case: false,
         },
       },
     ],
-    seen: [hashed("f")],
-    reachable: { functions: [], declarations: [] },
   }
 
 fn some_stamps() -> tables::Stamps = { runtime_digest: "runtime", code: "code" }
@@ -496,14 +496,16 @@ fn original_definition() -> { hash: Bytes, text: Bytes } =
 
 fn read_back(
   f: Filing,
+  seen: List<Bytes>,
 ) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   run_in_memory(mem_empty(), || {
     let c0 = store_pass(
       tables::open_cache[mem]("cache", some_stamps()),
       [original_definition()],
       [a_module()],
+      [a_module().record],
     );
-    let c1 = tables::flush_cache[mem](put_filing[mem, mem](c0, f));
+    let c1 = tables::flush_cache[mem](put_filing[mem, mem](c0, f, seen));
     let r = tables::open_cache[mem]("cache", some_stamps());
     let moved = tables::open_cache[mem]("cache", { ..some_stamps(), runtime_digest: "another" });
     {
@@ -520,7 +522,7 @@ fn read_back(
   }).value
 
 test "a stored run reads back its passing results, baselines and whether each test ran, and each baseline reads back with its definition text" {
-  let back = read_back(a_filing());
+  let back = read_back(a_filing(), [hashed("f")]);
   assert_eq(back.passes, [Some(b"file\tcwd\ta\td\n"), None]);
   assert_eq(back.codes, [Some(b""), None]);
   assert_eq(back.moved, [None, Some(b"")]);
@@ -540,7 +542,7 @@ test "a stored run reads back its passing results, baselines and whether each te
 
 test "a baseline is not returned when the module record it was made from is missing from the cache" {
   let back = run_in_memory(mem_empty(), || {
-    let c = put_filing[mem, mem](tables::open_cache[mem]("cache", some_stamps()), a_filing());
+    let c = put_filing[mem, mem](tables::open_cache[mem]("cache", some_stamps()), a_filing(), []);
     last_passes_over[mem](tables::put_snapshot(c, [a_module().record]), [b"m.t"]).value
   }).value;
   assert_eq(back, [None])
@@ -552,8 +554,9 @@ test "opening the cache under a different runtime digest drops the stored baseli
       tables::open_cache[mem]("cache", some_stamps()),
       [original_definition()],
       [a_module()],
+      [a_module().record],
     );
-    let c1 = tables::flush_cache[mem](put_filing[mem, mem](recorded, a_filing()));
+    let c1 = tables::flush_cache[mem](put_filing[mem, mem](recorded, a_filing(), []));
     let moved = tables::open_cache[mem]("cache", { ..some_stamps(), runtime_digest: "another" });
     {
       baselines: last_passes_over[mem](moved, [b"m.t"]).value,
@@ -565,13 +568,7 @@ test "opening the cache under a different runtime digest drops the stored baseli
 }
 
 test "storing a run with no results reads back no passing results, no ran-test flags and no baselines" {
-  let back = read_back({
-    passes: [],
-    code_passes: [],
-    records: [],
-    seen: [],
-    reachable: { functions: [], declarations: [] },
-  });
+  let back = read_back({ passes: [], code_passes: [], records: [] }, []);
   assert_eq(back.passes, [None, None]);
   assert_eq(back.seen, [false, false]);
   assert_eq(back.baselines, [None, None])

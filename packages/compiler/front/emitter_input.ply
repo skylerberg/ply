@@ -1,4 +1,4 @@
-import compiler.syntax.parsing (Span, no_module)
+import compiler.syntax.parsing (Span, no_module, span_bin)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause, CostClause, SpaceClause,
                               spec_kind_text, InstanceKind, KeyInstance, ShowInstance,
                               ReleaseInstance)
@@ -17,8 +17,8 @@ import compiler.store.hash (digest)
 import compiler.check.infer (CheckOutput, BodyFacts, decode_facts, facts_by_owner, encode_facts,
                              no_body_facts, body_facts_bin, is_pure_definition, types_named,
                              recorded_data, whole_body_data)
-import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInfo, LawInfo,
-                                     LawBinder, EffectInfo, OperationInfo, ConstructorInfo,
+import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInfo, test_info_bin,
+                                     LawInfo, LawBinder, EffectInfo, OperationInfo, ConstructorInfo,
                                      CheckCache, empty_cache, CachedDefinition, CachedTest,
                                      CachedFacts, WitnessOrder, listing_type, witness_order_bin,
                                      witness_params, InstanceInfo, NumericInfo)
@@ -46,11 +46,12 @@ import compiler.front.rows (DeclaredEffect, declared_effect_bin, declared_effect
                             OperationRow, EffectRow, ConstructorRow, HashRow, DefinitionHashRow,
                             LawHashRow, TestHashRow, HashTableRow, OrdinalRow, Dump,
                             normalized_diagnostic)
-import compiler.front.facts (outlines_of, effect_visibility, effect_hosts, effect_public_of,
-                             ModuleShape, ModuleTables, one_module, type_rows, test_label_spans,
-                             law_literals, Frame, CheckedProgram, Analysis, TaggedSite, tagged_of,
-                             root_tagged, TypedConst, typed_consts_of, root_consts, StatementSite,
-                             statements_of, root_statements)
+import compiler.front.facts (tagged_site_bin, statement_site_bin, outlines_of, effect_visibility,
+                             effect_hosts, effect_public_of, ModuleShape, ModuleTables, one_module,
+                             type_rows, test_label_spans, law_literals, Frame, CheckedProgram,
+                             Analysis, TaggedSite, tagged_of, root_tagged, TypedConst,
+                             typed_consts_of, root_consts, StatementSite, statements_of,
+                             root_statements)
 
 pub fn merge_cuts(a: List<Cut>, b: List<Cut>) -> List<Cut> / {abort.raise} =
   iterate(
@@ -967,12 +968,23 @@ pub fn checked_program_of(w: Analysis) -> CheckedProgram / {abort.raise} =
 
 pub type RootPlace = { root: Bytes, at: ModuleSpan }
 
+pub type LawPlace = { key: Bytes, module: Bytes, name: Bytes }
+
+derive bin for LawPlace
+
 pub type ModuleRollup = {
   mains: List<RootPlace>,
   roots: List<RootPlace>,
   declared: List<DeclaredEffect>,
   performed: List<Effect>,
   embeds: List<ModuleEmbed>,
+  tests: List<TestInfo>,
+  labels: List<Span>,
+  imports: List<Bytes>,
+  tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  constants: List<ConstSite>,
+  laws: List<LawPlace>,
 }
 
 derive bin for RootPlace
@@ -1005,6 +1017,13 @@ pub fn module_rollup(shape: ModuleShape, tables: ModuleTables) -> ModuleRollup /
     ).unique(
     ),
     embeds: shape.embeds.map(|e: ModuleEmbed| { ..e, module: module }),
+    tests: checked.tests,
+    labels: test_label_spans(one.outlines).map(|l: Location| l.span),
+    imports: shape.imports,
+    tagged: shape.tagged,
+    statements: shape.statements,
+    constants: const_sites(shape),
+    laws: checked.laws.map(|l: LawInfo| { key: l.key, module: l.module, name: l.name }),
   }
 }
 
@@ -1027,26 +1046,25 @@ pub fn view_dump(v: CheckedProgram) -> Dump / {abort.raise} = {
 
 pub type AnalysisOutcome = | Rejected(List<Diagnostic>) | Analysed(Analysis)
 
-pub type ConstSite = { module: Int, span: Span, name: Bytes, hash: Bytes }
+pub type ConstSite = { module: Int, span: Span, name: Bytes, type_name: Bytes, hash: Bytes }
 
-pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
-  let named = frame.consts.fold(Map::new(), |accumulator: Map<Bytes, Bool>, c: TypedConst|
-    if c.type_name == type_name { accumulator.insert(c.name, true) } else { accumulator });
-  let hashed = by_name(frame.hashes.definitions);
-  range(0, frame.outlines.len()).fold([], |accumulator: List<ConstSite>, i: Int| {
-    let o = frame.outlines.get(i);
-    o.items.fold(accumulator, |sites: List<ConstSite>, item: OutlineItem|
-      match item {
-        OutlinedFunction(f) -> {
-          let name = qualify(o.name, f.name);
-          match if f.constant && named.contains(name) { hashed.get(name) } else { None } {
-            Some(h) -> sites.push({ module: i, span: f.name_span, name: name, hash: h }),
-            None -> sites,
-          }
-        },
-        _ -> sites,
-      })
-  })
+derive bin for ConstSite
+
+fn const_sites(shape: ModuleShape) -> List<ConstSite> / {abort.raise} = {
+  let typed = shape.consts.fold(Map::new(), |found: Map<Bytes, Bytes>, c: TypedConst|
+    found.insert(c.name, c.type_name));
+  shape.outline.items.fold([], |sites: List<ConstSite>, item: OutlineItem|
+    match item {
+      OutlinedFunction(f) -> {
+        let name = qualify(shape.outline.name, f.name);
+        match if f.constant { typed.get(name) } else { None } {
+          Some(t) ->
+            sites.push({ module: 0, span: f.name_span, name: name, type_name: t, hash: b"" }),
+          None -> sites,
+        }
+      },
+      _ -> sites,
+    })
 }
 
 fn known_definitions(

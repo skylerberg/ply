@@ -1,17 +1,20 @@
 import std.bin
 import std.list
 import compiler.store.memo (memo)
-import compiler.front.emitter_input (ModuleRollup, module_rollup_bin)
-import compiler.front.facts (ProgramListing, decode_tables, program_listing)
+import compiler.front.emitter_input (ConstSite, ModuleRollup, module_rollup_bin)
+import compiler.front.exports (named_node)
+import compiler.front.checking.promises (hash_of_definition)
+import compiler.front.facts (Argument, OneModule, ProgramListing, StatementSite, TaggedSite,
+                             callees_of, decode_tables, one_module, program_listing, with_hashes)
 import compiler.front.rows (Outline)
 import compiler.store.hash.forms (ModuleHashes)
 import compiler.front.pages (Pages)
-import compiler.front.checking (CheckedModule, cycles_among, documented_all, hashed_all, module_of,
-                                rejected_first)
-import compiler.front.checking.groups (ModuleListing, ProgramSummary, declarers_input,
-                                       module_listing_bin, module_listing_query,
-                                       module_rollup_query, owners_result_of, program_summary_bin,
-                                       program_summary_query, symbol_query)
+import compiler.front.checking (CheckedModule, cycles_among, documented_all, hashed_all,
+                                module_hashes, module_of, rejected_first)
+import compiler.front.checking.groups (HashSummary, ModuleListing, ProgramSummary, declarers_input,
+                                       hash_summary_bin, hash_summary_query, module_listing_bin,
+                                       module_listing_query, module_rollup_query, owners_result_of,
+                                       program_summary_bin, program_summary_query, symbol_query)
 import compiler.front.checking.world (ModuleKey, decoded, module_key_bin)
 import compiler.check.resolve.tables (Diagnostic, Label)
 
@@ -112,11 +115,84 @@ pub fn rollups(modules: Modules) -> List<NamedRollup> / {memo.read, abort.raise}
       ),
     })
 
+pub type ProgramSites = {
+  names: List<Bytes>,
+  imports: List<List<Bytes>>,
+  tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  constants: List<ConstSite>,
+}
+
+fn hashes_of_callees(
+  modules: Modules,
+  callees: List<Bytes>,
+) -> Map<Bytes, Bytes> / {memo.read, abort.raise} = {
+  let known = modules.own.concat(modules.pulled).fold(
+    Map::new(),
+    |found: Map<Bytes, Bool>, m: Bytes| found.insert(m, true),
+  );
+  callees.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes|
+    if found.contains(name) || !known.contains(named_node(name).module) { found }
+    else { match hash_of_definition(name) { Some(h) -> found.insert(name, h), None -> found } })
+}
+
+pub fn sites(
+  modules: Modules,
+  rollups: List<NamedRollup>,
+) -> ProgramSites / {memo.read, abort.raise} = {
+  let root = range(0, modules.root);
+  let tagged = root.fold([], |found: List<TaggedSite>, i: Int|
+    found.concat(rollups.get(i).rollup.tagged.map(|t: TaggedSite| { ..t, module: i })));
+  let statements = root.fold([], |found: List<StatementSite>, i: Int|
+    found.concat(rollups.get(i).rollup.statements.map(|x: StatementSite| { ..x, module: i })));
+  let constants = root.fold([], |found: List<ConstSite>, i: Int|
+    found.concat(rollups.get(i).rollup.constants.map(|c: ConstSite| { ..c, module: i })));
+  let hashed = hashes_of_callees(
+    modules,
+    tagged.map(|t: TaggedSite| t.callee).concat(constants.map(|c: ConstSite| c.name)).concat(
+      statements.fold([], |found: List<Bytes>, x: StatementSite|
+        x.args.fold(found, |names: List<Bytes>, a: Argument| names.concat(callees_of(a)))),
+    ),
+  );
+  let hash_of = |name: Bytes| hashed.get(name).unwrap_or(b"");
+  {
+    names: rollups.map(|r: NamedRollup| r.module),
+    imports: rollups.map(|r: NamedRollup| r.rollup.imports),
+    tagged: tagged.map(|t: TaggedSite| { ..t, hash: hash_of(t.callee) }),
+    statements: statements.map(|x: StatementSite| with_hashes(hashed, x)),
+    constants: constants.map(|c: ConstSite| { ..c, hash: hash_of(c.name) }),
+  }
+}
+
+pub type LaterReading = { rollups: List<NamedRollup>, sites: ProgramSites }
+
+pub fn later_reading(modules: Modules) -> LaterReading / {memo.read, abort.raise} = {
+  let read = rollups(modules);
+  { rollups: read, sites: sites(modules, read) }
+}
+
+pub fn hash_summaries(modules: Modules) -> List<HashSummary> / {memo.read, abort.raise} =
+  keys_of(modules).map(|k: ModuleKey|
+    decoded(
+      memo.fetch(hash_summary_query(), bin::encode(k, module_key_bin())),
+      hash_summary_bin(),
+      "a module's hash summary",
+    ))
+
 pub fn program_digest(modules: Modules) -> Bytes / {memo.read, abort.raise} =
-  Bytes::concat_all(
-    hashed_all(modules.own, modules.pulled, false).map(|m: ModuleHashes| m.record),
-  ).blake3(
-  )
+  Bytes::concat_all(hash_summaries(modules).map(|s: HashSummary| s.record)).blake3()
+
+pub type ModuleVersion = { one: OneModule, hashes: ModuleHashes }
+
+pub fn module_version(key: ModuleKey) -> ModuleVersion / {memo.read, abort.raise} = {
+  let input = bin::encode(key, module_key_bin());
+  let listing = decoded(
+    memo.fetch(module_listing_query(), input),
+    module_listing_bin(),
+    "a module's listing",
+  );
+  { one: one_module(listing.shape, decode_tables(listing.tables)), hashes: module_hashes(key) }
+}
 
 pub fn declarers(name: Bytes) -> List<Bytes> / {memo.read, abort.raise} =
   decoded(

@@ -1,7 +1,7 @@
 import compiler.load (Derives, SourceFile)
 import std.random (entropy)
-import update_costs (reuse_violations, cost_checker)
-import literals (evaluation, evaluation_errors)
+import update_costs (cost_checker)
+import literals (evaluation, later_errors)
 import args (Flags, from_argv, style_of, root_of)
 import compiler.front.facts (CheckedProgram)
 import config_schema
@@ -20,19 +20,17 @@ import sources (Project, File, DependencyPackage, shipped_text)
 import std.env (env)
 import paths
 import program
-import program (Session, TimedLoad, program_view, session, timed_of)
-import module_queries
-import module_queries (ModuleResults, listed_results)
+import program (Session, session)
 import compiler.store.memo (memo)
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
-import compiler.front.checking.view (Modules, NamedRollup)
+import compiler.front.checking.view (LaterReading, Modules)
 import compiler.front.emitter_input (RootPlace)
-import compiler.front.rows (DeclaredEffect, DeclaredOperation)
-import compiler.expand.embed (ModuleEmbed)
+import compiler.front.facts (ProgramListing)
 import builder (builder)
+import compiler.emit.keys (Named)
 import units
-import units (emit)
+import units (CodeProgram, emit)
 import std.fs (fs)
 import std.time (time)
 import report (CommandOutput, indent, ok_code, compile_error, count_of, rejected, warned_lines)
@@ -623,7 +621,7 @@ fn handshakes_json(reports: List<entering::Report>) -> Json / {abort.raise} = {
 pub fn run(
   flags: Flags,
   options: Options,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.named, emit.compiled, emit.libraries, toolchain.reuse_dir, shipped.definitions, shipped.runtime, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.compiled, emit.libraries, toolchain.reuse_dir, shipped.definitions, shipped.runtime, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let named = paths::display_path(root_of(flags));
   if is_artifact(named) {
@@ -789,81 +787,55 @@ fn signer_rejection(
 
 fn is_artifact(path: String) -> Bool = path.ends_with(".plyx") || path.ends_with(".plyz")
 
-type RunReading = { rollups: List<NamedRollup>, results: Option<ModuleResults> }
+type RunReading = { later: LaterReading, whole: Option<ProgramListing> }
 
-fn run_reading(
-  options: Options,
-  modules: Modules,
-  read: ProgramSummary,
-) -> RunReading / {memo.read, abort.raise} =
+fn run_reading(options: Options, modules: Modules) -> RunReading / {memo.read, abort.raise} =
   {
-    rollups: view::rollups(modules),
-    results: if read.checked_later || options.config.schema != None {
-      Some(listed_results(modules.own))
-    } else { None },
+    later: view::later_reading(modules),
+    whole: if options.config.schema == None { None } else { Some(view::listed(modules)) },
+  }
+
+fn schema_problem(options: Options, s: Session<RunReading>) -> Option<Diagnostic> / {abort.raise} =
+  match s.value.whole {
+    Some(w) -> config_schema::schema_error(w.checked.definitions, options.config.schema),
+    None -> None,
   }
 
 fn run_sources(
   style: Style,
   flags: Flags,
   options: Options,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.named, emit.compiled, emit.libraries, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} =
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.compiled, emit.libraries, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} =
   match session(
       flags.paths,
       flags.verify_dependencies,
       false,
-      |modules: Modules, read: ProgramSummary| run_reading(options, modules, read),
+      |modules: Modules, _: ProgramSummary| run_reading(options, modules),
     ) {
     Err(r) ->
       load_error_output(style, { diagnostics: r.diagnostics, places: r.places, artifact: None }),
-    Ok(s) -> match s.value.results {
-      Some(results) -> checked_run(style, flags, options, timed_of(s, results, false)),
-      None -> rolled_run(style, flags, options, s),
-    },
-  }
-
-fn checked_run(
-  style: Style,
-  flags: Flags,
-  options: Options,
-  t: TimedLoad,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.named, emit.compiled, emit.libraries, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  match program_view(t.program) {
-    None ->
-      load_error_output(style, {
-        diagnostics: t.program.diagnostics,
-        places: t.program.source_texts,
-        artifact: None,
-      }),
-    Some(w) -> match config_schema::schema_error(w.checked.definitions, options.config.schema) {
-      Some(d) ->
-        unbound(style, { diagnostics: [d], places: t.program.source_texts, artifact: None }),
-      None -> match reuse_violations(t.program, w.frame) {
-        [] -> match evaluation_errors(t, w.frame) {
-          [] -> loaded_built(style, flags, options, t, w),
-          rejected ->
-            load_error_output(style, {
-              diagnostics: rejected,
-              places: t.program.source_texts,
-              artifact: None,
-            }),
+    Ok(s) -> {
+      let places = program::places_of(s);
+      let refused = |diagnostics: List<Diagnostic>|
+        load_error_output(style, { diagnostics: diagnostics, places: places, artifact: None });
+      match schema_problem(options, s) {
+        Some(d) -> unbound(style, { diagnostics: [d], places: places, artifact: None }),
+        None -> match later_errors(s, s.value.later, places) {
+          [] -> match units::code_program_of(s, s.value.later.rollups) {
+            Err(diagnostics) -> refused(diagnostics),
+            Ok(program) -> run_from_rollups(style, flags, options, s, program, places),
+          },
+          rejected -> refused(rejected),
         },
-        broken ->
-          load_error_output(style, {
-            diagnostics: broken,
-            places: t.program.source_texts,
-            artifact: None,
-          }),
-      },
+      }
     },
   }
-}
 
-fn rolled_entries(
+fn entries_from_rollups(
   s: Session<RunReading>,
   places: List<SourceText>,
 ) -> entries::Entries / {abort.raise} = {
-  let rows = s.value.rollups;
+  let rows = s.value.later.rollups;
   let path_at = |i: Int| places.at(i).map(|p: SourceText| p.path).unwrap_or("<unknown>");
   {
     mains: range(0, s.modules.root).fold([], |found: List<Main>, i: Int|
@@ -885,34 +857,16 @@ fn rolled_entries(
   }
 }
 
-fn rolled_runnable(rows: List<NamedRollup>) -> Runnable / {abort.raise} =
-  range(0, rows.len()).fold({ roots: [], declared: [], performed: [] }, |found: Runnable, i: Int| {
-    let r = rows.get(i).rollup;
-    {
-      roots: found.roots.concat(
-        r.roots.map(|p: RootPlace| { root: p.root, at: { ..p.at, module: i } }),
-      ),
-      declared: found.declared.concat(r.declared.map(|d: DeclaredEffect| at_module(d, i))),
-      performed: found.performed.concat(r.performed),
-    }
-  })
-
-fn at_module(d: DeclaredEffect, i: Int) -> DeclaredEffect =
-  {
-    ..d,
-    at: { ..d.at, module: i },
-    operations: d.operations.map(|o: DeclaredOperation| { ..o, at: { ..o.at, module: i } }),
-  }
-
-fn rolled_run(
+fn run_from_rollups(
   style: Style,
   flags: Flags,
   options: Options,
   s: Session<RunReading>,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.named, emit.compiled, emit.libraries, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  program: CodeProgram,
+  places: List<SourceText>,
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.compiled, emit.libraries, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let load_started_ms = time.elapsed_ms();
-  let places = program::places_of(s);
-  let offered = entries::narrowed_to(rolled_entries(s, places), flags.paths);
+  let offered = entries::narrowed_to(entries_from_rollups(s, places), flags.paths);
   let target = program_of(
     {
       root: machine::project_root(root_of(flags).machine),
@@ -934,74 +888,19 @@ fn rolled_run(
   match entry_of(target) {
     Err(d) -> with_timing(style, flags, Some(timing()), || entry_error_output(style, target, d)),
     Ok(entry_name) -> {
-      let loaded = match module_queries::embed_inputs(
-          s.project,
-          s.inputs,
-          s.value.rollups.fold([], |found: List<ModuleEmbed>, r: NamedRollup|
-            found.concat(r.rollup.embeds)),
-          s.seen,
+      let loaded = match units::library_over(
+          emit.code(program, entered_by(entry_name, options).map(Named)),
+          options.profile,
         ) {
-        Err(diagnostics) -> rejected(diagnostics),
-        Ok(inputs) -> match units::library_over(
-            emit.named({
-              names: entered_by(entry_name, options),
-              inputs: inputs,
-              place: { project: s.project, store: s.paths.at(0) },
-            }),
-            options.profile,
-          ) {
-          Err(diagnostics) -> rejected(diagnostics),
-          Ok(library) -> match entering::machine.open(library) {
-            Err(reason) -> rejected([machine::unit_load_error(reason)]),
-            Ok(unit) ->
-              Ok({ target: target, unit: unit, runnable: rolled_runnable(s.value.rollups) }),
-          },
-        },
-      };
-      run_loaded(style, flags, options, loaded, Some(timing()))
-    },
-  }
-}
-
-fn loaded_built(
-  style: Style,
-  flags: Flags,
-  options: Options,
-  timed: TimedLoad,
-  view: CheckedProgram,
-) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, MachineAccess, process.err[proc], env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.code, emit.named, emit.compiled, emit.libraries, fs.write[abs], Derives, abort.raise} = {
-  let load_started_ms = time.elapsed_ms();
-  let code = units::code_program(timed, view);
-  let front = code.front;
-  let offered = entries::narrowed_to(entries::of_front(front), flags.paths);
-  let target = program_of(
-    {
-      root: machine::project_root(root_of(flags).machine),
-      files: front.files.map(|f: SourceFile| f.path),
-      places: front.files.map(|f: SourceFile| { path: f.path, text: f.text }),
-    },
-    offered.mains,
-    offered.modules,
-  );
-  let timing = ||
-    {
-      read_ms: timed.read_ms,
-      front_end_ms: timed.front_end_ms,
-      store_ms: timed.store_ms,
-      load_ms: time.elapsed_ms() - load_started_ms,
-    };
-  match entry_of(target) {
-    Err(d) -> with_timing(style, flags, Some(timing()), || entry_error_output(style, target, d)),
-    Ok(entry_name) -> {
-      let emitted = units::entered_library(code, entered_by(entry_name, options), options.profile);
-      let runnable = entries::runnable_of(front);
-      let rejected = |diagnostics: List<Diagnostic>|
-        Err({ diagnostics: diagnostics, places: timed.program.source_texts, artifact: None });
-      let loaded = match emitted {
         Err(diagnostics) -> rejected(diagnostics),
         Ok(library) -> match entering::machine.open(library) {
           Err(reason) -> rejected([machine::unit_load_error(reason)]),
-          Ok(unit) -> Ok({ target: target, unit: unit, runnable: runnable }),
+          Ok(unit) ->
+            Ok({
+              target: target,
+              unit: unit,
+              runnable: entries::runnable_from_rollups(s.value.later.rollups),
+            }),
         },
       };
       run_loaded(style, flags, options, loaded, Some(timing()))

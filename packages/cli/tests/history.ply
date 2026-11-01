@@ -1,0 +1,77 @@
+import compiler.check.infer.checker (TestInfo)
+import compiler.check.resolve.tables (Source)
+import compiler.front.checking (LoadInputs)
+import compiler.front.checking.view
+import compiler.front.checking.view (ModuleVersion)
+import compiler.store.hash.forms (CachedNode, ModuleHashes)
+import changes (StoredText, module_texts, text_at_test)
+import diagnostic (SourceText)
+import program (ProgramStore, Session, in_program_store)
+import std.list
+import tester (result_cache)
+import testing.conclude (Filing, PassRecord)
+import tests.listing (TestListing, TestReading, sources_named)
+
+pub type ModuleAtSlot = { slot: Int, version: ModuleVersion }
+
+fn run_texts(
+  listing: TestListing,
+  sources: List<Source>,
+  filing: Filing,
+) -> List<StoredText> / {abort.raise} =
+  filing.records.fold([], |found: List<StoredText>, e: { key: Bytes, record: PassRecord }|
+    match listing.tests.find(|t: TestInfo| t.key == e.key) {
+      None -> found,
+      Some(t) -> match text_at_test(sources, t.at, e.record.test) {
+        Some(text) -> found.push(text),
+        None -> found,
+      },
+    })
+
+pub fn store_versions(
+  listing: TestListing,
+  sources: List<Source>,
+  versions: List<ModuleAtSlot>,
+  filing: Filing,
+) -> Unit / {result_cache.unstored, result_cache.history, abort.raise} = {
+  let texts = versions.fold(
+    run_texts(listing, sources, filing),
+    |found: List<StoredText>, m: ModuleAtSlot|
+      found.concat(module_texts(m.version.one, m.version.hashes.cached, sources.get(m.slot))),
+  );
+  let unstored = result_cache.unstored(texts.map(|t: StoredText| t.hash));
+  result_cache.history(
+    texts.filter(|t: StoredText| unstored.contains(t.hash)),
+    versions.map(|m: ModuleAtSlot| m.version.hashes),
+    listing.records,
+  )
+}
+
+fn definitions_passed(versions: List<ModuleAtSlot>) -> List<Bytes> =
+  versions.fold([], |found: List<Bytes>, m: ModuleAtSlot|
+    m.version.hashes.cached.nodes.fold(
+      found.push(m.version.hashes.record),
+      |hashes: List<Bytes>, n: CachedNode| if n.declaration { hashes } else { hashes.push(n.hash) },
+    ))
+
+pub fn store_run(
+  t: Session<TestReading>,
+  listing: TestListing,
+  places: List<SourceText>,
+  filing: Filing,
+  all_passed: Bool,
+) -> List<Bytes> / {result_cache.known, result_cache.filed, result_cache.unstored, result_cache.history, ProgramStore, abort.raise} = {
+  let records = listing.records;
+  let recording = filing.records.len() > 0;
+  let passed = if all_passed { result_cache.known(records) } else { records.map(|r: Bytes| true) };
+  let filed = if recording { result_cache.filed(records) } else { records.map(|r: Bytes| true) };
+  let slots = range(0, records.len()).filter(|i: Int|
+    !passed.at_or(i, true) || !filed.at_or(i, true));
+  let keys = view::keys_of(t.modules);
+  let versions = if slots.len() == 0 { [] } else {
+    in_program_store(t.place, |_: LoadInputs|
+      slots.map(|i: Int| { slot: i, version: view::module_version(keys.get(i)) })).value
+  };
+  if recording { store_versions(listing, sources_named(listing.names, places), versions, filing) };
+  if all_passed { definitions_passed(versions) } else { [] }
+}

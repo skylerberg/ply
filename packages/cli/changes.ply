@@ -1,8 +1,10 @@
 import compiler.front.published (no_rows)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
-import compiler.front.facts (ProgramListing, listing_of)
-import compiler.front.rows (ModuleSpan, OutlinedType, OutlineItem, location_span)
-import compiler.store.hash.forms (ItemKeyed, no_cached_hashes, reach)
+import compiler.front.facts (OneModule, ProgramListing, listing_of)
+import compiler.front.rows (ModuleSpan, Outline, OutlinedType, OutlineItem, location_span)
+import compiler.store.hash.forms (CachedHashes, CachedNode, CachedTest, ItemKeyed, no_cached_hashes,
+                                  reach)
+import compiler.check.infer (CheckOutput)
 import compiler.check.infer.checker (DefinitionInfo, EffectInfo, Location, TestInfo)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.syntax.fmt (line_end, line_start)
@@ -116,20 +118,23 @@ pub type Locations = {
   tests: Map<Bytes, Location>,
 }
 
-fn places_of(analysis: ProgramListing) -> Locations / {abort.raise} = {
-  let effects = analysis.checked.effects.fold(
+fn places_of(analysis: ProgramListing) -> Locations / {abort.raise} =
+  locations(analysis.outlines, analysis.checked)
+
+fn locations(outlines: List<Outline>, checked: CheckOutput) -> Locations / {abort.raise} = {
+  let effects = checked.effects.fold(
     Map::new(),
     |accumulator: Map<Bytes, Location>, e: EffectInfo| accumulator.insert(e.name, e.at),
   );
   {
-    values: analysis.checked.definitions.fold(
+    values: checked.definitions.fold(
       Map::new(),
       |accumulator: Map<Bytes, Location>, d: DefinitionInfo| accumulator.insert(d.name, d.at),
     ),
-    declarations: range(0, analysis.outlines.len()).fold(
+    declarations: range(0, outlines.len()).fold(
       effects,
       |accumulator: Map<Bytes, Location>, i: Int| {
-        let o = analysis.outlines.get(i);
+        let o = outlines.get(i);
         o.items.fold(accumulator, |into: Map<Bytes, Location>, item: OutlineItem|
           match item {
             OutlinedType(t) -> into.insert(qualify(o.name, t.name), { module: i, span: t.span }),
@@ -137,10 +142,8 @@ fn places_of(analysis: ProgramListing) -> Locations / {abort.raise} = {
           })
       },
     ),
-    tests: analysis.checked.tests.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, Location>, t: TestInfo| accumulator.insert(t.key, t.at),
-    ),
+    tests: checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Location>, t: TestInfo|
+      accumulator.insert(t.key, t.at)),
   }
 }
 
@@ -167,39 +170,44 @@ fn defined_at(p: Locations, k: DefinitionKey) -> Option<Location> = {
 fn text_at(pull_request: Tree, at: Option<Location>) -> Option<Bytes> / {abort.raise} =
   match at { Some(l) -> lines_at(pull_request.sources, l), None -> None }
 
-pub fn texts_of(
-  analysis: ProgramListing,
+pub type StoredText = { hash: Bytes, text: Bytes }
+
+pub fn text_at_test(
   sources: List<Source>,
-  wanted: List<Bytes>,
-) -> List<{ hash: Bytes, text: Bytes }> / {abort.raise} = {
-  let wanted_hashes = wanted.fold(Map::new(), |m: Map<Bytes, Bool>, h: Bytes| m.insert(h, true));
-  let p = places_of(analysis);
-  let h = analysis.hashes;
-  let placed = |at: Map<Bytes, Location>, xs: List<{ name: Bytes, hash: Bytes }>|
-    xs.map(|x: { name: Bytes, hash: Bytes }| { hash: x.hash, at: at.get(x.name) });
-  placed(p.values, h.definitions).concat(placed(p.declarations, h.declarations)).concat(
-    h.tests.fold(
-      [],
-      |accumulator: List<{ hash: Bytes, at: Option<Location> }>, key: Bytes, hash: Bytes|
-        accumulator.push({ hash: hash, at: p.tests.get(key) }),
-    ),
-  ).fold(
-    { seen: Map::new(), out: [] },
-    |accumulator: { seen: Map<Bytes, Bool>, out: List<{ hash: Bytes, text: Bytes }> }, x: { hash: Bytes, at: Option<Location> }|
-      if !wanted_hashes.contains(x.hash) || accumulator.seen.contains(x.hash) { accumulator } else {
-        match x.at {
-          None -> accumulator,
-          Some(at) -> match lines_at(sources, at) {
-            None -> accumulator,
-            Some(text) ->
-              {
-                seen: accumulator.seen.insert(x.hash, true),
-                out: accumulator.out.push({ hash: x.hash, text: text }),
-              },
-          },
-        }
+  at: Location,
+  hash: Bytes,
+) -> Option<StoredText> / {abort.raise} =
+  match lines_at(sources, at) { Some(text) -> Some({ hash: hash, text: text }), None -> None }
+
+fn texts_at(
+  sources: List<Source>,
+  placed: List<{ hash: Bytes, at: Option<Location> }>,
+) -> List<StoredText> / {abort.raise} =
+  placed.fold([], |found: List<StoredText>, x: { hash: Bytes, at: Option<Location> }|
+    match x.at {
+      None -> found,
+      Some(at) -> match text_at_test(sources, at, x.hash) {
+        Some(t) -> found.push(t),
+        None -> found,
       },
-  ).out
+    })
+
+pub fn module_texts(
+  one: OneModule,
+  hashes: CachedHashes,
+  source: Source,
+) -> List<StoredText> / {abort.raise} = {
+  let p = locations(one.outlines, one.checked);
+  texts_at(
+    [source],
+    hashes.nodes.map(|n: CachedNode|
+      {
+        hash: n.hash,
+        at: (if n.declaration { p.declarations } else { p.values }).get(n.name),
+      }).concat(
+      hashes.tests.map(|t: CachedTest| { hash: t.hash, at: p.tests.get(t.key) }),
+    ),
+  )
 }
 
 pub type ChangeDiff = {
@@ -278,6 +286,24 @@ fn tree_of_source(source: String) -> Tree / {abort.raise} = {
   }
 }
 
+fn texts_wanted(t: Tree, wanted: List<Bytes>) -> List<StoredText> / {abort.raise} = {
+  let h = t.whole.hashes;
+  let placed = |at: Map<Bytes, Location>, xs: List<{ name: Bytes, hash: Bytes }>|
+    xs.map(|x: { name: Bytes, hash: Bytes }| { hash: x.hash, at: at.get(x.name) });
+  texts_at(
+    t.sources,
+    placed(t.places.values, h.definitions).concat(
+      placed(t.places.declarations, h.declarations),
+    ).concat(
+      h.tests.fold(
+        [],
+        |found: List<{ hash: Bytes, at: Option<Location> }>, key: Bytes, hash: Bytes|
+          found.push({ hash: hash, at: t.places.tests.get(key) }),
+      ),
+    ).filter(|x: { hash: Bytes, at: Option<Location> }| wanted.contains(x.hash)),
+  )
+}
+
 fn hash_of_test(t: Tree, key: String) -> Option<String> / {abort.raise} =
   match t.whole.hashes.tests.get(Bytes::of_string(key)) {
     Some(h) -> Some(h.hex_of()),
@@ -314,7 +340,7 @@ fn over(
   ).concat(
     hashes.tests.values(),
   );
-  let texts = texts_of(before.whole, before.sources, all.filter(recorded));
+  let texts = texts_wanted(before, all.filter(recorded));
   let c = compared(after, key, hash_of_test(after, key), last_passed_hashes(before, key));
   let then = handle {
     stored_baseline_texts([c])
@@ -502,9 +528,7 @@ test "a recorded text is the whole lines of a definition, a type, an effect and 
   ).map(|x: { name: Bytes, hash: Bytes }| x.hash).concat(
     hashes.tests.values(),
   );
-  let texts = texts_of(t.whole, t.sources, wanted).map(|x: { hash: Bytes, text: Bytes }|
-    String::of_bytes_lossy(x.text)).sort(
-  );
+  let texts = texts_wanted(t, wanted).map(|x: StoredText| String::of_bytes_lossy(x.text)).sort();
   assert_eq(texts, [
     "effect db {\n  read get(key: Int) -> Int\n}\n",
     "pub fn size(s: Shape) -> Int =\n  match s { Dot -> 1, Line(n) -> n }\n",

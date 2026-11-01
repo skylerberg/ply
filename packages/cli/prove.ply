@@ -5,7 +5,7 @@ import compiler.load (Derives, LoadedAnalysis)
 import std.random (entropy)
 import args (Flags, from_argv, matches_filters, module_names, style_of)
 import paths (ResolvedPath)
-import literals (evaluation, evaluation_errors)
+import literals (evaluation, site_errors)
 import update_costs (measure_errors, cost_checker)
 import claims
 import compiler.cc (toolchain)
@@ -14,9 +14,10 @@ import results
 import proof.rules (Congruence)
 import units
 import units (emit)
-import program (TimedLoad, loaded_analysis, in_root_package, own_diagnostics, timed_load,
-                timed_uncached, program_view)
-import claim_view (claimed_program)
+import program (own_diagnostics, program_view, session, timed_of)
+import claim_view (claim_reading, claimed_program, discharged_over)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.view (Modules)
 import std.machine as entering
 import proof.obligation (Binding, Certificate, InternalError, Frame, Reason, Open, Outcome, Proved,
                          NoWrites, Raised, Refuted, Stopped, Unproved, Vacuous, frame_summary,
@@ -27,14 +28,14 @@ import proof.evidence (evidence_bytes)
 import std.bytes
 import proof.prover_input (ProverInputResult, empty_prover_input, prover_input_of)
 import claims (OwnClaims, LoadResult, Options, proof_store, discharging, decisions, Claim,
-               Collection, DischargeResult, discharge_library, Rejection, Row, Verdicts,
-               NotCompiled, CacheUnavailable, a_claim, a_counter, a_fault, a_span, a_place, a_plan,
-               count_specified, claimed_part, exit_code_of, collected_part, collection_of,
-               coverage_head, coverage_json, decide_claims, count_internal_errors, diagnostics_of,
-               count_proved, no_static_prover, obligation_json, once_each, own_claims, plan_json,
-               proved, quantifier, failure_output, count_refuted, bindings_text, row_head, rows_of,
-               seconds, StaticProver, static_prover_of, uncovered_lines, count_unproved,
-               detail_indent, count_vacuous)
+               Collection, DischargeResult, Rejection, Row, Verdicts, NotCompiled, CacheUnavailable,
+               a_claim, a_counter, a_fault, a_span, a_place, a_plan, count_specified, claimed_part,
+               exit_code_of, collected_part, collection_of, coverage_head, coverage_json,
+               decide_claims, count_internal_errors, diagnostics_of, count_proved, no_static_prover,
+               obligation_json, once_each, own_claims, plan_json, proved, quantifier,
+               failure_output, count_refuted, bindings_text, row_head, rows_of, seconds,
+               StaticProver, static_prover_of, uncovered_lines, count_unproved, detail_indent,
+               count_vacuous)
 import proof.obligation (Coverage, Cost, Ensures, Fresh, FromProof, Kind, Law, cache_status_word)
 import builder (builder)
 import std.fs (fs)
@@ -279,51 +280,58 @@ pub fn run(
   options: Options,
 ) -> CommandOutput / {semantics.cached, shipped.read_pack, builder.git[vcs], process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, env.variable, env.working_directory, entering::machine.open, entering::machine.enter, entering::machine.close, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, emit.code, emit.compiled, emit.libraries, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used, toolchain.reuse_dir} = {
   let s: Style = style_of(flags);
-  let t: TimedLoad = if options.no_incremental {
-    timed_uncached(flags.paths, flags.verify_dependencies)
-  } else { timed_load(flags.paths, flags.verify_dependencies, listed: true) };
-  let broken = |diagnostics: List<Diagnostic>|
-    with_front_end(
-      failure_output(
-        s,
-        "prove",
-        NotCompiled({ diagnostics: diagnostics, places: t.program.source_texts }),
+  let not_compiled = |diagnostics: List<Diagnostic>, places: List<SourceText>|
+    failure_output(s, "prove", NotCompiled({ diagnostics: diagnostics, places: places }));
+  match session(
+      flags.paths,
+      flags.verify_dependencies,
+      options.no_incremental,
+      |modules: Modules, _: ProgramSummary| claim_reading(options.no_incremental, modules),
+    ) {
+    Err(r) ->
+      with_front_end(
+        not_compiled(r.diagnostics, r.places),
+        reuse_members(r.tallies, r.missing_results),
       ),
-      reuse_members(t.program.tallies, t.program.missing_results),
-    );
-  match program_view(t.program) {
-    None -> broken(t.program.diagnostics),
-    Some(v) -> match measure_errors(t.program, v.frame).concat(evaluation_errors(t, v.frame)) {
-      [] -> {
-        let got = {
-          places: t.program.source_texts,
-          warnings: own_diagnostics(t.program.diagnostics, v.frame),
-        };
+    Ok(opened) -> {
+      let t = timed_of(opened, opened.value.results, false, options.no_incremental);
+      let broken = |diagnostics: List<Diagnostic>|
         with_front_end(
-          results::with_evidence(results::store_for(flags.paths, flags.no_cache), ||
-            match claimed_program(t.program, v, !flags.no_cache, flags.static_prover) {
-              Err(diagnostics) ->
-                failure_output(
-                  s,
-                  "prove",
-                  NotCompiled({ diagnostics: diagnostics, places: t.program.source_texts }),
-                ),
-              Ok(c) ->
-                prove_over(
-                  s,
-                  flags,
-                  options,
-                  got,
-                  c.mine,
-                  c.statics,
-                  |collection: Collection, runs: List<Int>, resolved: List<StaticResult>|
-                    discharge_library(units::code_program(t, v), collection, runs, resolved),
-                ),
-            }),
+          not_compiled(diagnostics, t.program.source_texts),
           reuse_members(t.program.tallies, t.program.missing_results),
-        )
-      },
-      literals -> broken(literals),
+        );
+      match program_view(t.program) {
+        None -> broken(t.program.diagnostics),
+        Some(v) -> match measure_errors(opened.place).concat(
+            site_errors(opened, opened.value.later, t.program.source_texts),
+          ) {
+          [] -> {
+            let got = {
+              places: t.program.source_texts,
+              warnings: own_diagnostics(t.program.diagnostics, v.frame),
+            };
+            with_front_end(
+              results::with_evidence(results::store_for(flags.paths, flags.no_cache), ||
+                match claimed_program(t.program, v, !flags.no_cache, flags.static_prover) {
+                  Err(diagnostics) -> not_compiled(diagnostics, t.program.source_texts),
+                  Ok(c) ->
+                    prove_over(
+                      s,
+                      flags,
+                      options,
+                      got,
+                      c.mine,
+                      c.statics,
+                      |collection: Collection, runs: List<Int>, resolved: List<StaticResult>|
+                        discharged_over(opened, collection, runs, resolved),
+                    ),
+                }),
+              reuse_members(t.program.tallies, t.program.missing_results),
+            )
+          },
+          literals -> broken(literals),
+        },
+      }
     },
   }
 }

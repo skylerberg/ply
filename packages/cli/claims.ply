@@ -16,11 +16,13 @@ import machine
 import surface
 import units
 import units (CodeProgram, emit)
+import compiler.front.checking.view (NamedRollup)
+import compiler.front.emitter_input (LawPlace)
 import compiler.front.facts (Analysis, schemas_instantiated)
 import compiler.front.rows (LawRow, ModuleSpan, module_span_bin)
 import compiler.emit.keys as root_keys
-import compiler.emit.keys (Clause, ClauseKind, LawBody, LawGuard, LawPart, Named, Requires, law_key,
-                           root_name, root_text)
+import compiler.emit.keys (Clause, ClauseKind, LawBody, LawGuard, LawPart, Named, Requires, RootKey,
+                           law_key, root_name, root_text)
 import compiler.check.infer.checker (DefinitionInfo)
 import compiler.cc
 import compiler.check.resolve.tables (Diagnostic, error_with_labels, error_at)
@@ -649,19 +651,31 @@ pub effect decisions {
 
 pub fn discharge_library(
   program: CodeProgram,
+  laws: Map<String, LawPlace>,
   collection: Collection,
   runs: List<Int>,
   resolved: List<StaticResult>,
-) -> Result<DischargeResult, Rejection> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.code, emit.compiled, emit.libraries, discharging.decided, abort.raise} =
+) -> Result<DischargeResult, Rejection> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.code, emit.libraries, discharging.decided, abort.raise} =
   if runs.len() == 0 { Ok({ outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] }) } else {
     let broken = |diagnostics: List<Diagnostic>|
       Err(NotCompiled({ diagnostics: diagnostics, places: collection.places }));
-    match units::whole_library(program, cc::development()) {
+    let roots = runs.fold([], |found: List<RootKey>, i: Int|
+      match collection.world.obligations.at(i) {
+        Some(o) -> found.concat(keys_in(claim_keys(laws, o))),
+        None -> found,
+      });
+    match units::library_over(emit.code(program, roots), cc::development()) {
       Err(diagnostics) -> broken(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(reason) -> broken([machine::unit_load_error(reason)]),
         Ok(o) -> {
-          let p = proof_context_of(o.unit, program.front, collection);
+          let p = {
+            unit_id: o.unit,
+            obligations: collection.world.obligations,
+            laws: laws,
+            roots: program.roots,
+            timeout_ms: collection.plan.timeout_ms,
+          };
           let d = discharge_runs(collection, p, runs, resolved);
           entering::machine.close(o.unit);
           Ok(d)
@@ -767,23 +781,15 @@ fn judge_lanes(
 pub type ProofContext = {
   unit_id: Int,
   obligations: List<Obligation>,
-  laws: Map<String, { module: Bytes, label: Bytes }>,
+  laws: Map<String, LawPlace>,
   roots: Map<Bytes, ModuleSpan>,
   timeout_ms: Int,
 }
 
-pub fn proof_context_of(unit: Int, front: LoadedAnalysis, collection: Collection) -> ProofContext =
-  {
-    unit_id: unit,
-    obligations: collection.world.obligations,
-    laws: front.dump.laws.fold(
-      Map::new(),
-      |accumulator: Map<String, { module: Bytes, label: Bytes }>, l: LawRow|
-        accumulator.insert(String::of_bytes_lossy(l.key), { module: l.module, label: l.name }),
-    ),
-    roots: machine::roots_of(front.dump),
-    timeout_ms: collection.plan.timeout_ms,
-  }
+pub fn laws_by_key(rollups: List<NamedRollup>) -> Map<String, LawPlace> / {abort.raise} =
+  rollups.fold(Map::new(), |found: Map<String, LawPlace>, r: NamedRollup|
+    r.rollup.laws.fold(found, |m: Map<String, LawPlace>, l: LawPlace|
+      m.insert(String::of_bytes_lossy(l.key), l)))
 
 pub type BatchResult = { each: List<Judgement>, warnings: List<Diagnostic> }
 
@@ -958,6 +964,40 @@ fn ply_fault(message: String) -> Judgement =
     values: [],
   })
 
+type ClaimKeys = { guards: List<RootKey>, body: RootKey, call: Option<RootKey> }
+
+fn claim_keys(laws: Map<String, LawPlace>, o: Obligation) -> Option<ClaimKeys> / {abort.raise} = {
+  let owner = Bytes::of_string(o.owner);
+  let clause = |kind: ClauseKind, n: Int| Clause({ definition: Named(owner), kind: kind, n: n });
+  match o.kind {
+    Ensures(index) ->
+      Some({
+        guards: range(0, o.guards.len()).map(|k: Int| clause(Requires, k)),
+        body: clause(root_keys::Ensures, index),
+        call: if o.result != None { Some(Named(owner)) } else { None },
+      }),
+    Law(_) -> match laws.get(o.owner) {
+      Some(at) ->
+        Some({
+          guards: o.guards.map(|g: { module: Int, start: Int, end: Int }|
+            law_key(at.module, at.name, LawGuard)),
+          body: law_key(at.module, at.name, LawBody),
+          call: None,
+        }),
+      None -> None,
+    },
+    _ -> None,
+  }
+}
+
+fn keys_in(keys: Option<ClaimKeys>) -> List<RootKey> =
+  match keys {
+    None -> [],
+    Some(k) -> k.guards.push(k.body).concat(match k.call { Some(c) -> [c], None -> [] }),
+  }
+
+fn root_string(k: RootKey) -> String = String::of_bytes_lossy(root_text(root_name(k)))
+
 fn roots_of(p: ProofContext, claim: Int) -> Result<ClaimRoots, Judgement> / {abort.raise} =
   match p.obligations.at(claim) {
     None ->
@@ -967,32 +1007,14 @@ fn roots_of(p: ProofContext, claim: Int) -> Result<ClaimRoots, Judgement> / {abo
             ++ p.obligations.len().to_string(),
         ),
       ),
-    Some(o) -> {
-      let owner = Bytes::of_string(o.owner);
-      let clause = |kind: ClauseKind, n: Int|
-        String::of_bytes_lossy(
-          root_text(root_name(Clause({ definition: Named(owner), kind: kind, n: n }))),
-        );
-      let law = |at: { module: Bytes, label: Bytes }, part: LawPart|
-        String::of_bytes_lossy(root_text(root_name(law_key(at.module, at.label, part))));
-      match o.kind {
-        Ensures(index) ->
-          Ok({
-            guards: range(0, o.guards.len()).map(|k: Int| clause(Requires, k)),
-            body: clause(root_keys::Ensures, index),
-            call: if o.result != None { Some(o.owner) } else { None },
-          }),
-        Law(_) -> match p.laws.get(o.owner) {
-          Some(at) ->
-            Ok({
-              guards: o.guards.map(|g: { module: Int, start: Int, end: Int }| law(at, LawGuard)),
-              body: law(at, LawBody),
-              call: None,
-            }),
-          None -> Err(missing_claim(o)),
-        },
-        _ -> Err(missing_claim(o)),
-      }
+    Some(o) -> match claim_keys(p.laws, o) {
+      None -> Err(missing_claim(o)),
+      Some(k) ->
+        Ok({
+          guards: k.guards.map(root_string),
+          body: root_string(k.body),
+          call: match k.call { Some(c) -> Some(root_string(c)), None -> None },
+        }),
     },
   }
 
