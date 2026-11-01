@@ -261,6 +261,3 @@ pub unsafe extern "C" fn rt_failed(
         c.fail(d);
     }
 }
-
-/// Does nothing: the release's emitter still calls it in the builder it makes.
-pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, _in_place: i64, _copied: i64) {}
