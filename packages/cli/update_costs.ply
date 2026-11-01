@@ -3,7 +3,6 @@ import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program
                                          cost_walk_query)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.exports (InRoot)
-import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.published (checked_bodies)
 import compiler.store.hash.encoding (hex)
 import compiler.check.resolve.tables (Source, Diagnostic, error_at, error_at_and)
@@ -13,8 +12,8 @@ import compiler.store.records (record_store, with_record_store)
 import compiler.load (Derives)
 import diagnostic (SourceText, position_of)
 import compiler.cc (toolchain)
-import program (ProgramPlace, in_program_store)
-import module_queries (promise_facts, body_programs)
+import program (ProgramPlace, Session, in_program_store)
+import module_queries (PromiseFacts, promise_facts, body_programs)
 import compiler.front.checking (LoadInputs, fresh_registry, inputs_alone, lookup_input_alone,
                                 over_decoding, prelude_files, prelude_frames)
 import compiler.store.memo (QueryStats, Run, empty_memory_store, in_session, reading)
@@ -31,7 +30,14 @@ import std.path (strip_root)
 
 fn location_width() -> Int = 22
 
-pub type PromiseAsk = { place: ProgramPlace, costs: Bool, measures: Bool }
+pub type PromiseRead = { facts: PromiseFacts, walked: Int }
+
+pub type PromiseAsk = {
+  place: ProgramPlace,
+  costs: Bool,
+  measures: Bool,
+  read: Option<PromiseRead>,
+}
 
 pub type Promises = { report: Option<Report>, walked: Int, unproved: List<Diagnostic> }
 
@@ -47,7 +53,24 @@ pub fn promises_of(
   measures: Bool,
 ) -> Promises / {cost_checker.report, abort.raise} =
   if !costs && !measures { no_promises() }
-  else { cost_checker.report({ place: place, costs: costs, measures: measures }) }
+  else { cost_checker.report({ place: place, costs: costs, measures: measures, read: None }) }
+
+fn walks_in(tallies: List<QueryStats>) -> Int =
+  tallies.fold(0, |n: Int, t: QueryStats| if t.query == cost_walk_query() { n + t.ran } else { n })
+
+pub fn promises_read<a>(
+  s: Session<a>,
+  facts: PromiseFacts,
+  costs: Bool,
+) -> Promises / {cost_checker.report, abort.raise} =
+  if !costs && !s.summary.measures { no_promises() } else {
+    cost_checker.report({
+      place: s.place,
+      costs: costs,
+      measures: s.summary.measures,
+      read: Some({ facts: facts, walked: walks_in(s.tallies) }),
+    })
+  }
 
 pub fn report_violations(r: Report) -> List<Diagnostic> =
   if !r.ok { [unresolved()] } else {
@@ -61,11 +84,11 @@ pub fn promise_errors(promises: Promises) -> List<Diagnostic> =
   if promises.unproved.len() > 0 { promises.unproved }
   else { match promises.report { None -> [], Some(r) -> report_violations(r) } }
 
-pub fn reuse_violations(
-  place: ProgramPlace,
-  read: ProgramSummary,
+pub fn reuse_violations<a>(
+  s: Session<a>,
+  facts: PromiseFacts,
 ) -> List<Diagnostic> / {cost_checker.report, abort.raise} =
-  promise_errors(promises_of(place, read.promises, read.measures))
+  promise_errors(promises_read(s, facts, s.summary.promises))
 
 pub fn measure_errors(
   place: ProgramPlace,
@@ -210,17 +233,22 @@ pub fn with_cost_cache<a | e>(
   } with {
     cost_checker.report(ask) -> {
       let modules = ask.place.project.sources.map(|s: Source| s.name);
-      let opened = in_program_store(ask.place, |_: LoadInputs|
-        promise_facts(modules, ask.costs, ask.measures));
-      let facts = opened.value;
+      let read = match ask.read {
+        Some(r) -> r,
+        None -> {
+          let opened = in_program_store(ask.place, |_: LoadInputs|
+            promise_facts(modules, ask.costs, ask.measures));
+          { facts: opened.value, walked: walks_in(opened.tallies) }
+        },
+      };
+      let facts = read.facts;
       {
         report: if !ask.costs { None } else {
           Some(
             report_of(range(0, facts.costs.len()).map(|i: Int| at_module(i, facts.costs.get(i)))),
           )
         },
-        walked: opened.tallies.fold(0, |n: Int, t: QueryStats|
-          if t.query == cost_walk_query() { n + t.ran } else { n }),
+        walked: read.walked,
         unproved: if facts.measures.len() == 0 { [] }
         else { measures_settled(ask.place, modules, facts.measures) },
       }
