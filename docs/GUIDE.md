@@ -1641,9 +1641,11 @@ A test's *outside effects* are the `nondet` effects it performs on the world out
 Tests whose outside effects do not conflict (§7.2) run at the same time, one per core. `--jobs N`
 (`-j N`) splits the tests into `N` lanes that each run their tests in turn.
 
-The report comes in three parts: what was selected and how it will run, then each group's results
-as the group finishes, then a summary with each failure's diagnosis. Under `--json`, the first two
-parts go to standard error as the run goes, and one JSON object goes to standard output at the end.
+The report comes in three parts: what was selected and how it will run, then each test's result as
+it finishes, then a summary with each failure's diagnosis. Each step before the report prints to
+standard error as it starts, and a test still running after 30 seconds is named every 30 seconds.
+Under `--json`, the first two parts go to standard error as the run goes, and one JSON object goes
+to standard output at the end.
 
 `--timeout MS` limits each test's wall-clock time (default 60000; `0` for none). A test over the
 limit does not fail: it *timed out* (`W0612`), is reported apart from failures, and runs again next
@@ -1720,8 +1722,9 @@ values `std.gen` generates.
 | `--jobs N` | split the work into `N` lanes |
 
 `ply prove` prints each claim's outcome as it is decided, then the definitions no proved claim
-covers, then totals. A proof is cached under the claim's hash. Only proofs are cached; any other
-outcome is computed again on every run.
+covers, then totals. Each step before the first outcome prints to standard error as it starts. A
+proof is cached under the claim's hash. Only proofs are cached; any other outcome is computed again
+on every run.
 
 ### 11.3 How claims are proved
 
