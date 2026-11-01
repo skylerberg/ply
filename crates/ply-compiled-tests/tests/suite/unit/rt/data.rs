@@ -151,3 +151,38 @@ fn a_rejected_argument_raises_a_catchable_effect_for_array_get_bytes_at_and_stri
     });
     assert_eq!(text, FAILED_PENDING_RAISE, "`String::find` raises");
 }
+
+type Failed = unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word);
+
+/// `rt_failed` of `texts`, the last `notes` and `shown` of which are notes and then values.
+fn failed(ctx: *mut Ctx, raises: Word, texts: &[&[u8]], notes: Word, shown: Word) {
+    let words: Vec<Word> = texts
+        .iter()
+        .flat_map(|t| [t.as_ptr() as Word, t.len() as Word])
+        .collect();
+    unsafe { helper::<Failed>("rt_failed")(ctx, raises, words.as_ptr(), notes, shown) }
+}
+
+#[test]
+fn a_failure_compiled_code_wrote_keeps_its_code_text_notes_and_values() {
+    let shown = b"PLV1\x00";
+    let d = left(|ctx| {
+        let texts: [&[u8]; 6] = [b"E0501", b"it failed", b"here", b"one", b"two", shown];
+        failed(ctx, 0, &texts, 2, 1);
+    });
+    assert_eq!(d.code, codes::ASSERTION_FAILED);
+    assert_eq!(d.message, "it failed");
+    assert_eq!(d.labels[0].message, "here");
+    assert_eq!(d.notes, ["one", "two"]);
+    assert_eq!(d.values.iter().collect::<Vec<_>>(), [&shown.to_vec()]);
+}
+
+#[test]
+fn a_failure_compiled_code_wrote_raises_only_where_it_says_to() {
+    let texts: [&[u8]; 3] = [b"E0502", b"it failed", b"here"];
+    assert_eq!(
+        failed_under_a_clause(|c| failed(c, 1, &texts, 0, 0)),
+        FAILED_PENDING
+    );
+    assert_eq!(failed_under_a_clause(|c| failed(c, 0, &texts, 0, 0)), 1);
+}

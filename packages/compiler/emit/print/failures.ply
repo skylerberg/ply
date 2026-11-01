@@ -1,0 +1,611 @@
+import std.bytes (ascii_of_int)
+import compiler.emit.c (c_string, width_index, width_named)
+import compiler.emit.layout (rejection, rejections, array_limit, range_limit)
+
+type Failure = { signature: Bytes, body: List<Bytes> }
+
+type WidthRow = { name: Bytes, bits: Int, least: Bytes, most: Bytes }
+
+fn runtime_error() -> Bytes = b"E0502"
+
+fn assertion_failed() -> Bytes = b"E0501"
+
+fn internal_error() -> Bytes = b"E0505"
+
+fn in_compiled_code() -> Bytes = b"in compiled code"
+
+fn called_here() -> Bytes = b"called here"
+
+fn message_room() -> Int = 256
+
+fn crypto_note() -> Bytes =
+  b"`std.crypto` and `std.hash` name what the runtime takes; they are the callers these builtins are for"
+
+fn slot(i: Int) -> Bytes = Bytes::concat_all([b"\x01", ascii_of_int(i), b"\x02"])
+
+fn number(x: Bytes) -> Bytes = b"(long long)".concat(x)
+
+fn formatted(into: Bytes, format: Bytes, args: List<Bytes>) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    [b"snprintf(", into, b", sizeof ", into, b", ", c_string(format)].concat(
+      args.map(|a: Bytes| b", ".concat(a)),
+    ).push(
+      b");",
+    ),
+  )
+
+fn failing(
+  raises: Bytes,
+  code: Bytes,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Bytes / {abort.raise} = {
+  let note = |i: Int| match notes.at(i) { Some(n) -> n, None -> b"0" };
+  Bytes::concat_all([
+    b"ply_fail(ctx, ",
+    raises,
+    b", ",
+    c_string(code),
+    b", ",
+    message,
+    b", ",
+    c_string(label),
+    b", ",
+    note(0),
+    b", ",
+    note(1),
+    b");",
+  ])
+}
+
+fn runtime_failure(raises: Bytes, message: Bytes, notes: List<Bytes>) -> Bytes / {abort.raise} =
+  failing(raises, runtime_error(), message, in_compiled_code(), notes)
+
+fn text_assigned(texts: List<Bytes>, at: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([b"texts[", ascii_of_int(at), b"] = ", texts.get(at), b";"])
+
+fn with_texts(
+  raises: Bytes,
+  texts: List<Bytes>,
+  notes: Int,
+  shown: Int,
+) -> List<Bytes> / {abort.raise} =
+  [Bytes::concat_all([b"PlyText texts[", ascii_of_int(texts.len()), b"];"])].concat(
+    range(0, texts.len()).map(|at: Int| text_assigned(texts, at)),
+  ).push(
+    Bytes::concat_all([
+      b"rt_failed_p(ctx, ",
+      raises,
+      b", (Word)(intptr_t)texts, ",
+      ascii_of_int(notes),
+      b", ",
+      ascii_of_int(shown),
+      b");",
+    ]),
+  )
+
+fn text(b: Bytes) -> Bytes / {abort.raise} = Bytes::concat_all([b"ply_text(", c_string(b), b")"])
+
+fn widths() -> List<WidthRow> =
+  [
+    { name: b"U8", bits: 8, least: b"0", most: b"255" },
+    { name: b"U16", bits: 16, least: b"0", most: b"65535" },
+    { name: b"U32", bits: 32, least: b"0", most: b"4294967295" },
+    { name: b"U64", bits: 64, least: b"0", most: b"18446744073709551615" },
+    { name: b"I8", bits: 8, least: b"-128", most: b"127" },
+    { name: b"I16", bits: 16, least: b"-32768", most: b"32767" },
+    { name: b"I32", bits: 32, least: b"-2147483648", most: b"2147483647" },
+    { name: b"I64", bits: 64, least: b"-9223372036854775808", most: b"9223372036854775807" },
+    { name: b"U128", bits: 128, least: b"0", most: b"340282366920938463463374607431768211455" },
+    {
+      name: b"I128",
+      bits: 128,
+      least: b"-170141183460469231731687303715884105728",
+      most: b"170141183460469231731687303715884105727",
+    },
+  ]
+
+fn text_table(name: Bytes, rows: List<Bytes>) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"static const char *const ",
+    name,
+    b"[] = { ",
+    Bytes::join(rows.map(c_string), b", "),
+    b" };\n",
+  ])
+
+fn case_of(name: Bytes) -> Bytes =
+  Bytes::concat_all([b"    case ", ascii_of_int(rejection(name)), b":\n"])
+
+fn rejected_as(names: List<Bytes>, lines: List<Bytes>) -> Bytes =
+  Bytes::concat_all(
+    names.map(case_of).concat(lines.map(|l: Bytes| Bytes::concat_all([b"      ", l, b"\n"]))).push(
+      b"      break;\n",
+    ),
+  )
+
+fn ends_the_run() -> List<Bytes> = [b"Array::of_list", b"Columns::of_list", b"range"]
+
+fn raises_condition() -> Bytes =
+  Bytes::join(
+    ends_the_run().map(|n: Bytes| Bytes::concat_all([b"what != ", ascii_of_int(rejection(n))])),
+    b" && ",
+  )
+
+fn unknown_rejection() -> Bytes = b"    default:\n      ply_unknown_rejection(ctx, what);\n"
+
+fn supporting_functions() -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"#include <stdio.h>\n",
+    b"#include <stdlib.h>\n",
+    b"typedef struct { Word at, len; } PlyText;\n",
+    b"static PlyText ply_text(const char *s) {\n",
+    b"  PlyText t;\n",
+    b"  t.at = (Word)(intptr_t)s;\n",
+    b"  t.len = (Word)strlen(s);\n",
+    b"  return t;\n",
+    b"}\n",
+    b"static PlyText ply_text_of(Word at, Word len) {\n",
+    b"  PlyText t;\n",
+    b"  t.at = at;\n",
+    b"  t.len = len;\n",
+    b"  return t;\n",
+    b"}\n",
+    b"static PlyText ply_shown_text(PlyCtx *ctx, Word at, Word len) {\n",
+    b"  builtin_elaborated_shown_open_p(ctx);\n",
+    b"  builtin_elaborated_out_str_p(ctx, at, len);\n",
+    b"  Word count = builtin_elaborated_lower_close_p(ctx);\n",
+    b"  void *copy = malloc((size_t)count + 1);\n",
+    b"  builtin_elaborated_taken_p(ctx, (Word)(intptr_t)copy, count);\n",
+    b"  return ply_text_of((Word)(intptr_t)copy, count);\n",
+    b"}\n",
+    b"static void ply_fail(PlyCtx *ctx, Word raises, const char *code, const char *message, const char *label, const char *first, const char *second) {\n",
+    b"  PlyText texts[5];\n",
+    b"  Word notes = (first != 0) + (second != 0);\n",
+    b"  texts[0] = ply_text(code);\n",
+    b"  texts[1] = ply_text(message);\n",
+    b"  texts[2] = ply_text(label);\n",
+    b"  if (first) texts[3] = ply_text(first);\n",
+    b"  if (second) texts[4] = ply_text(second);\n",
+    b"  rt_failed_p(ctx, raises, (Word)(intptr_t)texts, notes, 0);\n",
+    b"}\n",
+    b"static const char *ply_wide_text(char *end, PlyWide x, int is_signed) {\n",
+    b"  int negative = is_signed && (int64_t)x.hi < 0;\n",
+    b"  PlyWide ten = ply_wide(10, 0);\n",
+    b"  if (negative) x = ply_wide_negated(x);\n",
+    b"  *--end = 0;\n",
+    b"  do {\n",
+    b"    PlyWide quotient, remainder;\n",
+    b"    ply_wide_divrem(x, ten, 0, &quotient, &remainder);\n",
+    b"    *--end = (char)('0' + remainder.lo);\n",
+    b"    x = quotient;\n",
+    b"  } while (x.lo != 0 || x.hi != 0);\n",
+    b"  if (negative) *--end = '-';\n",
+    b"  return end;\n",
+    b"}\n",
+    text_table(b"ply_width_names", widths().map(|w: WidthRow| w.name)),
+    text_table(b"ply_width_least", widths().map(|w: WidthRow| w.least)),
+    text_table(b"ply_width_most", widths().map(|w: WidthRow| w.most)),
+    b"static const int ply_width_bits[] = { ",
+    Bytes::join(widths().map(|w: WidthRow| ascii_of_int(w.bits)), b", "),
+    b" };\n",
+    text_table(b"ply_rejected_names", rejections()),
+    b"static void ply_unknown_rejection(PlyCtx *ctx, Word what) {\n",
+    b"  char m[",
+    ascii_of_int(message_room()),
+    b"];\n  ",
+    formatted(b"m", b"a rejected operation numbered %lld, which none is", [number(b"what")]),
+    b"\n  ",
+    failing(b"0", internal_error(), b"m", in_compiled_code(), [
+      c_string(b"this is Ply's fault, not the program's"),
+    ]),
+    b"\n}\n",
+    outside_function(
+      b"ply_index_outside",
+      b"const char *name, Word index, Word count, const char *unit",
+      b"`%s` index %lld is outside a value of %lld %s",
+      [b"name", number(b"index"), b"n", b"unit"],
+      b"this index does not exist",
+      b"valid indices are `0` to `%lld`",
+      b"n > 0 ? n - 1 : 0",
+    ),
+    outside_function(
+      b"ply_range_outside",
+      b"const char *name, Word start, Word end, Word count, const char *unit",
+      b"`%s` range %lld..%lld is outside a value of %lld %s",
+      [b"name", number(b"start"), number(b"end"), b"n", b"unit"],
+      b"this range does not fit",
+      b"a range must satisfy `0 <= start <= end <= %lld`; it is never clamped",
+      b"n",
+    ),
+    outside_function(
+      b"ply_start_outside",
+      b"const char *name, Word start, Word count",
+      b"`%s` start %lld is outside a value of %lld bytes",
+      [b"name", number(b"start"), b"n"],
+      b"this position does not exist",
+      b"a start must satisfy `0 <= from <= %lld`; it is never clamped",
+      b"n",
+    ),
+  ])
+
+fn outside_function(
+  name: Bytes,
+  params: Bytes,
+  message: Bytes,
+  args: List<Bytes>,
+  label: Bytes,
+  note: Bytes,
+  note_arg: Bytes,
+) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"static void ",
+    name,
+    b"(PlyCtx *ctx, Word raises, ",
+    params,
+    b") {\n  char m[",
+    ascii_of_int(message_room()),
+    b"], note[",
+    ascii_of_int(message_room()),
+    b"];\n  long long n = count > 0 ? (long long)count : 0;\n  ",
+    formatted(b"m", message, args),
+    b"\n  ",
+    formatted(b"note", note, [note_arg]),
+    b"\n  ",
+    failing(b"raises", runtime_error(), b"m", label, [b"note"]),
+    b"\n}\n",
+  ])
+
+fn refused_cases() -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    rejected_as([b"Array::new", b"Columns::new", b"Array::of_list", b"Columns::of_list"], [
+      formatted(
+        b"m",
+        Bytes::concat_all([
+          b"`%s` of %lld elements is outside `0` to `",
+          ascii_of_int(array_limit()),
+          b"`",
+        ]),
+        [b"name", number(b"a")],
+      ),
+      failing(b"raises", runtime_error(), b"m", b"no array has this length", []),
+    ]),
+    rejected_as([b"Array::get", b"Array::set", b"Columns::get", b"Columns::set"], [
+      b"ply_index_outside(ctx, raises, name, a, b, \"elements\");",
+    ]),
+    rejected_as([b"Bytes::at"], [b"ply_index_outside(ctx, raises, name, a, b, \"bytes\");"]),
+    rejected_as([b"Bytes::u32_le"], [
+      b"ply_index_outside(ctx, raises, name, (Word)((uint64_t)a + 3), b, \"bytes\");",
+    ]),
+    rejected_as([b"Bytes::slice"], [b"ply_range_outside(ctx, raises, name, a, b, c, \"bytes\");"]),
+    rejected_as([b"String::slice"], [
+      b"ply_range_outside(ctx, raises, name, a, b, c, \"characters\");",
+    ]),
+    rejected_as([b"byte_of_int"], [
+      formatted(b"m", b"`%s` was given %lld", [b"name", number(b"a")]),
+      failing(b"raises", runtime_error(), b"m", b"a byte is 0 to 255", [
+        c_string(b"mask the value before the call if that is what you meant: `n & 0xFF`"),
+      ]),
+    ]),
+    rejected_as([b"Bytes::index_of_byte"], [
+      formatted(b"m", b"`%s` was given %lld, which is not a byte", [b"name", number(b"a")]),
+      failing(b"raises", runtime_error(), b"m", b"a byte is `0` to `255`", [
+        c_string(b"`Bytes::at` returns values in that range, and so does a byte literal's element"),
+      ]),
+    ]),
+    rejected_as([b"Bytes::index_of_from", b"Bytes::position"], [
+      b"ply_start_outside(ctx, raises, name, a, b);",
+    ]),
+    rejected_as([b"Bytes::scan", b"Bytes::scan_until"], [
+      b"if (a < 0 || a > (b > 0 ? b : 0)) { ply_start_outside(ctx, raises, name, a, b); break; }",
+      formatted(b"m", b"`%s` was given a negative budget of %lld", [b"name", number(b"c")]),
+      failing(
+        b"raises",
+        runtime_error(),
+        b"m",
+        b"a scan cannot examine a negative number of bytes",
+        [c_string(b"pass `0` to examine nothing, or `Bytes::len(b)` to leave it unbounded")],
+      ),
+    ]),
+    rejected_as([b"range"], [
+      b"{ int64_t n; if (ply_sub_ov(b, a, &n)) n = b < 0 ? INT64_MIN : INT64_MAX;",
+      formatted(
+        b"m",
+        Bytes::concat_all([
+          b"`%s` of %lld elements exceeds the limit of ",
+          ascii_of_int(range_limit()),
+        ]),
+        [b"name", number(b"n")],
+      ),
+      b"}",
+      failing(b"raises", runtime_error(), b"m", b"this range is too large to materialize", []),
+    ]),
+    rejected_as([b"Bytes::split"], [
+      formatted(b"m", b"`%s` needs a separator, and this one is empty", [b"name"]),
+      failing(
+        b"raises",
+        runtime_error(),
+        b"m",
+        b"an empty separator matches everywhere and nowhere",
+        [c_string(b"pass the bytes that actually separate the parts, as in `b\"\\r\\n\"`")],
+      ),
+    ]),
+    rejected_as([b"String::split"], [
+      formatted(b"m", b"`%s` needs a separator, and this one is empty", [b"name"]),
+      failing(
+        b"raises",
+        runtime_error(),
+        b"m",
+        b"an empty separator matches everywhere and nowhere",
+        [c_string(b"pass the text that actually separates the parts, as in \"\\r\\n\"")],
+      ),
+    ]),
+    rejected_as([b"Secret::rsa_jwk"], [
+      formatted(b"m", b"`%s`: an RSA key's private numbers are six, and this list holds %lld", [
+        b"name",
+        number(b"a"),
+      ]),
+      failing(b"raises", runtime_error(), b"m", called_here(), [c_string(crypto_note())]),
+    ]),
+  ])
+
+fn encoding_rejected(name: Bytes, does: Bytes) -> Bytes / {abort.raise} =
+  rejected_as([name], [
+    b"{ size_t room = (size_t)(n > 0 ? n : 0) + 64;",
+    b"char *message = malloc(room);",
+    Bytes::concat_all([
+      b"snprintf(message, room, ",
+      c_string(Bytes::concat_all([b"`", name, b"`: `%.*s` is no encoding it ", does])),
+      b", (int)n, (const char *)(intptr_t)p);",
+    ]),
+    failing(b"1", runtime_error(), b"message", called_here(), [c_string(crypto_note())]),
+    b"free(message); }",
+  ])
+
+fn refused_text_cases() -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    rejected_as(
+      [b"String::find"],
+      [b"{"].concat(
+        with_texts(
+          b"1",
+          [
+            text(runtime_error()),
+            text(Bytes::concat_all([b"`String::find` did not find ", slot(0), b" in ", slot(1)])),
+            text(b"this substring does not occur"),
+            text(b"guard with `String::contains`, which answers the same question as a `Bool`"),
+            b"ply_shown_text(ctx, q, m)",
+            b"ply_shown_text(ctx, p, n)",
+          ],
+          1,
+          2,
+        ),
+      ).concat([
+        b"free((void *)(intptr_t)texts[4].at);",
+        b"free((void *)(intptr_t)texts[5].at); }",
+      ]),
+    ),
+    rejected_as(
+      [b"assert"],
+      [
+        b"if (n < 0) {",
+        failing(b"1", assertion_failed(), c_string(assert_false()), assert_label(), []),
+        b"break; }",
+        b"{",
+      ].concat(
+        with_texts(
+          b"1",
+          [
+            text(assertion_failed()),
+            text(assert_false()),
+            text(assert_label()),
+            b"ply_text_of(p, n)",
+          ],
+          1,
+          0,
+        ),
+      ).push(
+        b"}",
+      ),
+    ),
+    encoding_rejected(b"Secret::decode", b"reads"),
+    encoding_rejected(b"Secret::encode", b"writes"),
+  ])
+
+fn assert_false() -> Bytes = b"assertion failed: condition is false"
+
+fn assert_label() -> Bytes = b"this condition evaluated to false"
+
+fn failures() -> List<Failure> / {abort.raise} =
+  [
+    {
+      signature: b"void ply_no_match(PlyCtx *ctx)",
+      body: [runtime_failure(b"0", c_string(b"no arm of this `match` matched"), [])],
+    },
+    {
+      signature: b"void ply_let_no_match(PlyCtx *ctx)",
+      body: [runtime_failure(b"1", c_string(b"`let` pattern did not match the bound value"), [])],
+    },
+    {
+      signature: b"void ply_overflow(PlyCtx *ctx, Word what)",
+      body: [
+        b"static const char *const names[] = { \"addition\", \"subtraction\", \"negation\", \"multiplication\", \"division\", \"remainder\" };",
+        b"char m[64];",
+        formatted(b"m", b"integer overflow in %s", [b"names[what]"]),
+        runtime_failure(b"0", b"m", []),
+      ],
+    },
+    {
+      signature: b"void ply_decimal_overflow(PlyCtx *ctx, Word what)",
+      body: [
+        b"const char *name = what == 0 ? \"addition\" : what == 1 ? \"subtraction\" : what == 3 ? \"multiplication\" : \"remainder\";",
+        b"char m[64];",
+        formatted(b"m", b"`Decimal` overflow in %s", [b"name"]),
+        runtime_failure(b"0", b"m", [
+          c_string(b"`Decimal` is exact and bounded; it will not round to make room"),
+        ]),
+      ],
+    },
+    {
+      signature: b"void ply_by_zero(PlyCtx *ctx, Word what)",
+      body: [
+        b"char m[32];",
+        formatted(b"m", b"%s by zero", [b"what == 0 ? \"division\" : \"remainder\""]),
+        runtime_failure(b"1", b"m", []),
+      ],
+    },
+    {
+      signature: b"void ply_not_an_int(PlyCtx *ctx, Word value)",
+      body: [
+        b"char m[64];",
+        formatted(b"m", b"`Int::of_u64` was given %llu", [b"(unsigned long long)(uint64_t)value"]),
+        runtime_failure(b"1", b"m", [
+          c_string(b"an `Int` is 64 bits and signed, so it does not hold every `U64`"),
+        ]),
+      ],
+    },
+    {
+      signature: b"void ply_not_an_int_wide(PlyCtx *ctx, Word lo, Word hi, Word is_signed)",
+      body: [
+        b"PlyWide x;",
+        b"char digits[48], m[96], note[96];",
+        b"x.lo = lo;",
+        b"x.hi = hi;",
+        formatted(b"m", b"`Int::of_%s` was given %s", [
+          b"is_signed ? \"i128\" : \"u128\"",
+          b"ply_wide_text(digits + sizeof digits, x, is_signed != 0)",
+        ]),
+        formatted(b"note", b"an `Int` is 64 bits and signed, so it does not hold every `%s`", [
+          b"is_signed ? \"I128\" : \"U128\"",
+        ]),
+        runtime_failure(b"1", b"m", [b"note"]),
+      ],
+    },
+    {
+      signature: b"void ply_not_that_width(PlyCtx *ctx, Word which, Word value)",
+      body: [
+        b"char m[256];",
+        formatted(b"m", b"`%s::of_int` was given %lld: `%s` holds %s to %s", [
+          b"ply_width_names[which]",
+          number(b"value"),
+          b"ply_width_names[which]",
+          b"ply_width_least[which]",
+          b"ply_width_most[which]",
+        ]),
+        runtime_failure(b"1", b"m", []),
+      ],
+    },
+    {
+      signature: b"void ply_shift_count(PlyCtx *ctx, Word count, Word which)",
+      body: [
+        b"const char *name = which < 0 ? \"Int\" : ply_width_names[which];",
+        b"int bits = which < 0 ? 64 : ply_width_bits[which];",
+        b"char first[64], second[96];",
+        formatted(b"first", b"%lld is not in 0..=%d", [number(b"count"), b"bits - 1"]),
+        formatted(b"second", b"a `%s` is %d bits, so no other count names a shift of it", [
+          b"name",
+          b"bits",
+        ]),
+        runtime_failure(b"0", c_string(b"shift count out of range"), [b"first", b"second"]),
+      ],
+    },
+    {
+      signature: b"void ply_iterate_bad(PlyCtx *ctx, Word has_budget, Word budget)",
+      body: [
+        b"char m[96];",
+        b"if (has_budget) {",
+        formatted(b"m", b"`iterate` did not stop within its budget of %lld", [number(b"budget")]),
+        b"} else {",
+        formatted(b"m", b"`iterate` needs a budget of at least 1, and this is %lld", [
+          number(b"budget"),
+        ]),
+        b"}",
+        runtime_failure(b"1", b"m", []),
+      ],
+    },
+    {
+      signature: b"void ply_refused(PlyCtx *ctx, Word what, Word a, Word b, Word c)",
+      body: [
+        Bytes::concat_all([
+          b"const char *name = what >= 0 && what < ",
+          ascii_of_int(rejections().len()),
+          b" ? ply_rejected_names[what] : \"\";",
+        ]),
+        Bytes::concat_all([b"Word raises = ", raises_condition(), b";"]),
+        Bytes::concat_all([b"char m[", ascii_of_int(message_room()), b"];"]),
+        b"switch (what) {",
+        refused_cases(),
+        unknown_rejection(),
+        b"}",
+      ],
+    },
+    {
+      signature: b"void ply_refused_text(PlyCtx *ctx, Word what, Word p, Word n, Word q, Word m)",
+      body: [b"switch (what) {", refused_text_cases(), unknown_rejection(), b"}"],
+    },
+    {
+      signature: b"void ply_assert_failed(PlyCtx *ctx, Word actual, Word n, Word expected, Word m)",
+      body: with_texts(
+        b"1",
+        [
+          text(assertion_failed()),
+          text(Bytes::concat_all([b"assertion failed: expected ", slot(0), b", found ", slot(1)])),
+          text(b"these values are not equal"),
+          text(b"expected: ".concat(slot(0))),
+          text(b"actual:   ".concat(slot(1))),
+          b"ply_text_of(expected, m)",
+          b"ply_text_of(actual, n)",
+        ],
+        2,
+        2,
+      ),
+    },
+    {
+      signature: b"Word ply_functions_compared(PlyCtx *ctx)",
+      body: [
+        runtime_failure(b"0", c_string(b"cannot compare functions for equality"), []),
+        b"return 0;",
+      ],
+    },
+  ]
+
+fn defined(f: Failure) -> Bytes =
+  Bytes::concat_all(
+    [f.signature, b" {\n"].concat(f.body.map(|l: Bytes| Bytes::concat_all([b"  ", l, b"\n"]))).push(
+      b"}\n",
+    ),
+  )
+
+pub fn failures_declared() -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    failures().map(|f: Failure|
+      Bytes::concat_all([b"__attribute__((cold, visibility(\"hidden\"))) ", f.signature, b";\n"])),
+  )
+
+pub fn failures_defined() -> Bytes / {abort.raise} =
+  supporting_functions().concat(Bytes::concat_all(failures().map(defined)))
+
+test "the width tables list each width at the index compiled code passes" {
+  assert_eq(
+    range(0, widths().len()).filter(|i: Int|
+      match width_named(widths().get(i).name) {
+        Some(w) -> width_index(w) != i || w.bits != widths().get(i).bits,
+        None -> true,
+      }),
+    [],
+  )
+}
+
+test "every rejection the lowering can name has a case" {
+  let text = failures_defined();
+  let cases = range(0, rejections().len()).filter(|i: Int|
+    text.index_of(Bytes::concat_all([b"case ", ascii_of_int(i), b":\n"])) == None);
+  assert_eq(cases, [])
+}
+
+test "a message that shows a value separates the digit after the slot marker from the escape" {
+  let shown = failures().filter(|f: Failure| f.signature.starts_with(b"void ply_assert_failed"));
+  let body = Bytes::concat_all(shown.get(0).body);
+  assert(body.index_of(b"\\0010\\002") != None && body.index_of(b"\\0011\\002") != None, None)
+}
