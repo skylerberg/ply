@@ -1,5 +1,7 @@
-import compiler.unit (shipped)
+import compiler.unit (shipped, product_key)
 import compiler.load (Derives, LoadedAnalysis)
+import std.bin
+import paths (ResolvedPath)
 import std.random (entropy)
 import args (Flags, from_argv, style_of)
 import claims
@@ -7,8 +9,8 @@ import compiler.cc (toolchain)
 import std.env (env)
 import results
 import proof.rules (Congruence)
-import program (TimedLoad, loaded_analysis, in_root_package, own_diagnostics, timed_load,
-                timed_uncached, whole_of, program_view)
+import program (TimedLoad, loaded_analysis, in_root_package, own_diagnostics, product_unchanged,
+                store_product_at, timed_load, timed_uncached, whole_of, program_view)
 import std.machine as entering
 import proof.prover_input (ProverInputResult, prover_input_of)
 import machine
@@ -332,9 +334,59 @@ fn review_changes<| e>(
   }
 }
 
+type StoredReview = { lines: List<String>, code: Int }
+
+derive bin for StoredReview
+
+fn review_product(
+  flags: Flags,
+  options: Options,
+) -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "review "
+    ++ String::of_bytes_lossy(
+      product_key(
+        Bytes::of_string(
+          String::join(
+            [
+              bold(style_of(flags), "review"),
+              match options.prove.budget { Some(n) -> n.to_string(), None -> "" },
+              match options.prove.timeout { Some(n) -> n.to_string(), None -> "" },
+            ].concat(
+              flags.paths.map(|r: ResolvedPath| r.display),
+            ),
+            "\n",
+          ),
+        ),
+      ),
+    )
+
+fn may_reuse_review(flags: Flags, options: Options) -> Bool =
+  !flags.no_cache && !flags.json && !flags.verify_dependencies && !options.no_incremental
+    && flags.action != "accept"
+
 pub fn run(
   flags: Flags,
   options: Options,
+) -> CommandOutput / {semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, env.variable, env.working_directory, entering::machine.open, entering::machine.enter, entering::machine.close, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, emit.compiled, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let product = review_product(flags, options);
+  let stored = match if may_reuse_review(flags, options) { product_unchanged(flags.paths, product) }
+    else { None } {
+    None -> None,
+    Some(c) -> match bin::decode(c.value, stored_review_bin()) {
+      Ok(review) -> Some(review),
+      Err(_) -> None,
+    },
+  };
+  match stored {
+    Some(review) -> { json: object([]), lines: review.lines, errs: [], code: review.code },
+    None -> review_sources(flags, options, product),
+  }
+}
+
+fn review_sources(
+  flags: Flags,
+  options: Options,
+  product: String,
 ) -> CommandOutput / {semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, env.variable, env.working_directory, entering::machine.open, entering::machine.enter, entering::machine.close, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, emit.compiled, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let t: TimedLoad = if options.no_incremental {
@@ -353,7 +405,7 @@ pub fn run(
       Ok(w) -> {
         let owned = in_root_package(v.frame);
         let built: ProverInputResult = prover_input_of(w, owned);
-        results::with_review(results::store_for(flags.paths, flags.no_cache), ||
+        let output = results::with_review(results::store_for(flags.paths, flags.no_cache), ||
           review_over(
             s,
             flags,
@@ -366,7 +418,18 @@ pub fn run(
             static_prover_of(w, built.world, owned),
             |collection: Collection, runs: List<Int>, resolved: List<StaticResult>|
               claims::discharge_library(loaded_analysis(t, v), collection, runs, resolved),
-          ))
+          ));
+        if flags.action == "accept" {
+          store_product_at(flags.paths, t.program.log_position, product, b"")
+        } else if output.errs == [] && may_reuse_review(flags, options) {
+          store_product_at(
+            flags.paths,
+            t.program.log_position,
+            product,
+            bin::encode({ lines: output.lines, code: output.code }, stored_review_bin()),
+          )
+        };
+        output
       },
     },
   }

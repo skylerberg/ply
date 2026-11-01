@@ -352,7 +352,7 @@ fn link_shared<[c]>(
 }
 
 fn library_path(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
-  cache_key(t, ["-shared", "stack-marked"], objects.map(Bytes::of_string)) ++ ".so"
+  cache_key(t, ["-shared", "stack-table-unmapped"], objects.map(Bytes::of_string)) ++ ".so"
 
 fn read_little_endian(b: Bytes, from: Int, count: Int) -> Int / {abort.raise} =
   range(0, count).fold(0, |n: Int, k: Int| n * 256 + b.at(from + count - 1 - k))
@@ -362,6 +362,8 @@ fn little_endian_bytes(n: Int, count: Int) -> Bytes / {abort.raise} =
     { rest: s.rest / 256, out: s.out.concat(byte_of_int(s.rest % 256)) }).out
 
 fn pt_gnu_stack() -> Int = 0x6474E551
+
+fn largest_page() -> Int = 0x10000
 
 pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
   let size = library.len();
@@ -377,7 +379,7 @@ pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
         None -> false,
       });
     if !whole || marked { library } else {
-      let pad = (8 - size % 8) % 8;
+      let pad = (largest_page() - size % largest_page()) % largest_page();
       Bytes::concat_all([
         library.slice(0, 32),
         little_endian_bytes(size + pad, 8),
@@ -924,14 +926,35 @@ fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
 test "`with_stack_header` adds a `PT_GNU_STACK` program header to a library without one and returns a library with one unchanged" {
   let load = little_endian_bytes(1, 4).concat(b"\x00".repeat(52));
   let marked = with_stack_header(elf_of(0, load, 1).concat(b"body"));
-  assert_eq(marked.len(), 128 + 2 * 56);
-  assert_eq(read_little_endian(marked, 32, 8), 128);
+  let at = read_little_endian(marked, 32, 8);
+  assert(at >= 124, None);
   assert_eq(read_little_endian(marked, 56, 2), 2);
   assert_eq(marked.slice(120, 124), b"body");
-  assert_eq(marked.slice(128, 184), load);
-  assert_eq(read_little_endian(marked, 184, 4), pt_gnu_stack());
-  assert_eq(read_little_endian(marked, 188, 4), 6);
+  assert_eq(marked.slice(at, at + 56), load);
+  assert_eq(read_little_endian(marked, at + 56, 4), pt_gnu_stack());
+  assert_eq(read_little_endian(marked, at + 60, 4), 6);
   assert_eq(with_stack_header(marked), marked)
+}
+
+fn loaded_through(end: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    little_endian_bytes(1, 4),
+    b"\x00".repeat(28),
+    little_endian_bytes(end, 8),
+    b"\x00".repeat(16),
+  ])
+
+test "a stack header's table lies past every page a segment maps, where zeroing `.bss` cannot erase it" {
+  let page = 4096;
+  range(0, 3).fold((), |_: Unit, pages: Int|
+    [1, 656, 2344, 3000, 4095, 4096].fold((), |_: Unit, into: Int| {
+      let end = pages * page + into;
+      let library = elf_of(0, loaded_through(end), 1);
+      let whole = library.concat(b"\x00".repeat(end - library.len() + 1528));
+      let at = read_little_endian(with_stack_header(whole), 32, 8);
+      let mapped_to = (end + page - 1) / page * page;
+      assert(at >= mapped_to, Some(end.to_string() ++ " maps past " ++ at.to_string()));
+    }))
 }
 
 test "what is not a 64-bit little-endian ELF file is left as it is" {

@@ -12,26 +12,22 @@ import compiler.check.resolve.tables (Diagnostic, Label)
 import diagnostic (SourceText, RuntimeDiagnostic, Position, runtime_diagnostic_json, shown,
                    position_of, to_json, all_to_json, all_to_text)
 import entries
-import entry (Main, Module, entry_point)
+import entry (Main, Module, entry_point, main_bin, module_bin)
 import compiler.cc
 import compiler.cc (toolchain)
+import compiler.store.hash.encoding (hex)
+import sources (Project, File, DependencyPackage, shipped_text)
 import std.env (env)
 import paths
-import program (ProjectSources, TimedLoad, loaded_analysis, timed_over, usable, program_view,
-                cached_command, cache_command, project_sources, encoded_paths)
+import program (TimedLoad, loaded_analysis, timed_load, program_view, product_unchanged,
+                store_product_at)
 import builder (builder)
-import module_queries
-import module_queries (command_key)
-import std.bytes
-import compiler.front.interface (length_prefixed)
-import sources
 import units
 import units (emit)
-import sources (load_resolved)
 import std.fs (fs)
 import std.time (time)
 import report (CommandOutput, indent, ok_code, compile_error, count_of, rejected, warned_lines)
-import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, to_string, int,
+import std.json (Json, Null, Str, Bool, Array, Member, Object, object, to_string, int,
                  string_or_null, strings)
 import std.value (Value, VInt, VUnit, render)
 import std.process (process, captured, err_step)
@@ -41,12 +37,12 @@ import std.signed (decode_signed, trusted_signer)
 import std.list
 import compiler.store.plyx (digest_of, digest_text, domain, library_domain)
 import compiler.check.resolve.tables (error_at)
-import compiler.unit (shipped)
+import compiler.unit (shipped, product_key)
 import artifact_builder
 import hosts (filesystem_json, transport_json)
 import host_listing
 import host_listing (HostSettings, Listing, RejectionCount)
-import entries (Runnable, RestoredLoad)
+import entries (Runnable, runnable_bin)
 import machine
 import machine (Artifact, RunConfiguration, Deployed, BindingSummary, RunOutcome, MachineAccess,
                 Options, Program, Project, ProgramFiles, Rejection, Signals, StopReport, Target,
@@ -784,86 +780,109 @@ fn signer_rejection(
 
 fn is_artifact(path: String) -> Bool = path.ends_with(".plyx") || path.ends_with(".plyz")
 
+fn built_product(
+  flags: Flags,
+  options: Options,
+) -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "built "
+    ++ String::of_bytes_lossy(
+      product_key(
+        Bytes::of_string(
+          String::join(
+            [options.profile.name, match options.config.schema { Some(s) -> s, None -> "" }].concat(
+              flags.paths.map(|r: paths::ResolvedPath| r.display),
+            ),
+            "\n",
+          ),
+        ),
+      ),
+    )
+
+fn may_reuse_library(flags: Flags) -> Bool = !flags.explain && !flags.verify_dependencies
+
+type StoredPlace = { path: String, module: String }
+
+type StoredRun = {
+  library: String,
+  root: String,
+  places: List<StoredPlace>,
+  mains: List<Main>,
+  modules: List<Module>,
+  runnable: Runnable,
+}
+
+derive bin for StoredPlace
+
+derive bin for StoredRun
+
+fn stored_target(
+  stored: StoredRun,
+  project: Project,
+) -> Target / {fs.read_file[shipped], abort.raise} = {
+  let own = project.files.concat(project.packages.flat_map(|p: DependencyPackage| p.files)).fold(
+    Map::new(),
+    |texts: Map<String, Bytes>, f: File| texts.insert(f.module, f.text),
+  );
+  program_of(
+    {
+      root: stored.root,
+      files: stored.places.map(|p: StoredPlace| p.path),
+      places: stored.places.map(|p: StoredPlace|
+        {
+          path: p.path,
+          text: match own.get(p.module) {
+            Some(text) -> text,
+            None -> match shipped_text(Bytes::of_string(p.module)) {
+              Some(text) -> text,
+              None -> b"",
+            },
+          },
+        }),
+    },
+    stored.mains,
+    stored.modules,
+  )
+}
+
+fn stored_run_of(value: Bytes) -> Option<StoredRun> / {abort.raise} =
+  match bin::decode(value, stored_run_bin()) { Ok(stored) -> Some(stored), Err(_) -> None }
+
 fn run_sources(
   style: Style,
   flags: Flags,
   options: Options,
 ) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let bind_and_run = time.elapsed_ms();
-  let project: sources::Project = load_resolved(flags.paths);
-  let key = command_key(module_queries::program_digest(), command_identity(flags, options));
-  let load_started_ms = time.elapsed_ms();
-  let cached_target = match cached_command(flags.paths, project, key) {
+  let product = built_product(flags, options);
+  let current = if may_reuse_library(flags) { product_unchanged(flags.paths, product) }
+  else { None };
+  let reopened = match current {
     None -> None,
-    Some(bytes) -> match entries::decode_load(bytes) {
+    Some(c) -> match stored_run_of(c.value) {
       None -> None,
-      Some(k) -> reused(root_of(flags).machine, project, k),
+      Some(stored) -> match entering::machine.open(stored.library) {
+        Err(_) -> None,
+        Ok(unit) ->
+          Some({
+            target: stored_target(stored, c.clean.project),
+            unit: unit,
+            runnable: stored.runnable,
+          }),
+      },
     },
   };
-  match cached_target {
-    Some(t) -> {
-      let l = {
-        reused: true,
-        key: key.hex_of(),
-        read_ms: load_started_ms - bind_and_run,
-        front_end_ms: 0,
-        store_ms: 0,
-        load_ms: time.elapsed_ms() - load_started_ms,
-      };
-      run_loaded(style, flags, options, Ok(t), Some(l))
-    },
-    None -> run_uncached(style, flags, options, project, key, bind_and_run),
+  match reopened {
+    Some(t) -> run_loaded(style, flags, options, Ok(t), None),
+    None -> built_sources(style, flags, options, product),
   }
 }
 
-fn reused(
-  root: String,
-  project: sources::Project,
-  taken: RestoredLoad,
-) -> Option<LoadedTarget> / {entering::machine.open} = {
-  let walked: ProjectSources = project_sources(project);
-  match entries::restored_sources(taken.files, walked.modules, walked.manifests) {
-    None -> None,
-    Some(places) -> match entering::machine.open(taken.library) {
-      Err(_) -> None,
-      Ok(unit) ->
-        Some({
-          target: program_of(
-            {
-              root: machine::project_root(root),
-              files: places.map(|p: SourceText| p.path),
-              places: places,
-            },
-            taken.entries.mains,
-            taken.entries.modules,
-          ),
-          unit: unit,
-          runnable: taken.runnable,
-        }),
-    },
-  }
-}
-
-fn command_identity(flags: Flags, options: Options) -> Bytes =
-  Bytes::concat_all([
-    length_prefixed(b"ply run"),
-    encoded_paths(flags.paths),
-    match options.config.schema {
-      Some(s) -> b"+".concat(length_prefixed(Bytes::of_string(s))),
-      None -> b"-",
-    },
-    length_prefixed(Bytes::of_string(options.profile.name)),
-  ])
-
-fn run_uncached(
+fn built_sources(
   style: Style,
   flags: Flags,
   options: Options,
-  project: sources::Project,
-  key: Bytes,
-  bind_and_run: Int,
-) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_view_used} = {
-  let t: TimedLoad = timed_over(flags.paths, project, bind_and_run, flags.verify_dependencies);
+  product: String,
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
   match program_view(t.program) {
     None ->
       load_error_output(style, {
@@ -876,7 +895,7 @@ fn run_uncached(
         unbound(style, { diagnostics: [d], places: t.program.source_texts, artifact: None }),
       None -> match reuse_violations(t.program, w.frame) {
         [] -> match evaluation_errors(t, w.frame) {
-          [] -> loaded_built(style, flags, options, project, t, w, key),
+          [] -> loaded_built(style, flags, options, t, w, product),
           rejected ->
             load_error_output(style, {
               diagnostics: rejected,
@@ -899,10 +918,9 @@ fn loaded_built(
   style: Style,
   flags: Flags,
   options: Options,
-  project: sources::Project,
   timed: TimedLoad,
   view: CheckedProgram,
-  key: Bytes,
+  product: String,
 ) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, MachineAccess, process.err[proc], env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, fs.write[abs], Derives, abort.raise} = {
   let load_started_ms = time.elapsed_ms();
   let front = loaded_analysis(timed, view);
@@ -918,8 +936,6 @@ fn loaded_built(
   );
   let timing = ||
     {
-      reused: false,
-      key: key.hex_of(),
       read_ms: timed.read_ms,
       front_end_ms: timed.front_end_ms,
       store_ms: timed.store_ms,
@@ -941,24 +957,30 @@ fn loaded_built(
         Err(diagnostics) -> rejected(diagnostics),
         Ok(library) -> match entering::machine.open(library) {
           Err(reason) -> rejected([machine::unit_load_error(reason)]),
-          Ok(unit) -> Ok({ target: target, unit: unit, runnable: runnable }),
+          Ok(unit) -> {
+            if may_reuse_library(flags) {
+              store_product_at(
+                flags.paths,
+                timed.program.log_position,
+                product,
+                bin::encode(
+                  {
+                    library: library,
+                    root: machine::project_root(root_of(flags).machine),
+                    places: front.files.map(|f: SourceFile| { path: f.path, module: f.name }),
+                    mains: offered.mains,
+                    modules: offered.modules,
+                    runnable: runnable,
+                  },
+                  stored_run_bin(),
+                ),
+              )
+            };
+            Ok({ target: target, unit: unit, runnable: runnable })
+          },
         },
       };
-      let l = timing();
-      match ((loaded, emitted)) {
-        (Ok(_), Ok(library)) -> {
-          let _ = cache_command(
-            flags.paths,
-            project,
-            key,
-            timed.program,
-            entries::encode_load(offered, library, front.files, runnable),
-          );
-          ()
-        },
-        _ -> (),
-      };
-      run_loaded(style, flags, options, loaded, Some(l))
+      run_loaded(style, flags, options, loaded, Some(timing()))
     },
   }
 }
@@ -1019,38 +1041,28 @@ fn with_timing<| e>(
     },
   }
 
-type LoadTiming = {
-  reused: Bool,
-  key: String,
-  read_ms: Int,
-  front_end_ms: Int,
-  store_ms: Int,
-  load_ms: Int,
-}
+type LoadTiming = { read_ms: Int, front_end_ms: Int, store_ms: Int, load_ms: Int }
 
 fn millis(n: Int) -> String = n.to_string() ++ "ms"
 
-fn load_timing_line(style: Style, l: LoadTiming) -> String / {abort.raise} = {
-  let phases = if l.reused { ["read " ++ millis(l.read_ms), "load " ++ millis(l.load_ms)] } else {
-    [
-      "read " ++ millis(l.read_ms),
-      "front " ++ millis(l.front_end_ms),
-      "write back " ++ millis(l.store_ms),
-      "load " ++ millis(l.load_ms),
-    ]
-  };
+fn load_timing_line(style: Style, l: LoadTiming) -> String / {abort.raise} =
   indent()
     ++ dim(
       style,
-      "front end   " ++ (if l.reused { "reused " } else { "built " }) ++ short_key(l.key) ++ " · "
-        ++ String::join(phases, " · "),
+      "front end   "
+        ++ String::join(
+          [
+            "read " ++ millis(l.read_ms),
+            "front " ++ millis(l.front_end_ms),
+            "write back " ++ millis(l.store_ms),
+            "load " ++ millis(l.load_ms),
+          ],
+          " · ",
+        ),
     )
-}
 
 fn load_timing_json(l: LoadTiming) -> Json =
   object([
-    { key: "reused", value: Bool(l.reused) },
-    { key: "key", value: Str(l.key) },
     {
       key: "phases",
       value: object([
@@ -1070,8 +1082,6 @@ fn with_load_timing(flags: Flags, l: LoadTiming, result: CommandOutput) -> Comma
       _ -> result,
     }
   }
-
-fn short_key(key: String) -> String / {abort.raise} = "b3:" ++ key.slice(0, 12)
 
 fn a_main() -> Main =
   { name: "m.main", module: "m", path: "m.ply", at: { module: 0, start: 3, end: 7 } }
@@ -1524,13 +1534,7 @@ test "a definition's module is its name without its own last segment" {
   assert_eq(module_of("store.orders.main"), "store.orders")
 }
 
-fn a_key() -> String = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-fn a_reuse() -> LoadTiming =
-  { reused: true, key: a_key(), read_ms: 9, front_end_ms: 0, store_ms: 0, load_ms: 41 }
-
-fn a_build() -> LoadTiming =
-  { reused: false, key: a_key(), read_ms: 7, front_end_ms: 1774, store_ms: 44, load_ms: 1392 }
+fn a_load_timing() -> LoadTiming = { read_ms: 7, front_end_ms: 1774, store_ms: 44, load_ms: 1392 }
 
 fn explain_flags() -> Flags / {abort.raise} = from_argv("run", ["--explain"])
 
@@ -1544,39 +1548,34 @@ fn loaded(flags: Flags, l: LoadTiming) -> RunCapture / {abort.raise} =
     Some(l),
   )
 
-test "a run that reuses a cached compiler front end gives the same result as one that builds the front end" {
-  assert_eq(loaded(bare(), a_reuse()), loaded(bare(), a_build()));
-  assert_eq(loaded(json_flags(), a_reuse()), loaded(json_flags(), a_build()));
+test "a run that reports load timing gives the same result as one that does not" {
   assert_eq(
-    loaded(bare(), a_reuse()),
+    loaded(bare(), a_load_timing()),
     run_fixture(bare(), Ok(example_project()), Ok(a_binding()), returned_value(VInt(42))),
   )
 }
 
-test "`--explain` says whether the compiler front end was reused or built, its cache key and how long each step took" {
-  let reused = loaded(explain_flags(), a_reuse());
+test "`--explain` says how long each step of the load took" {
+  let explained = loaded(explain_flags(), a_load_timing());
   assert_eq(
-    reused.err.at_or(0, ""),
-    "   front end   reused b3:0123456789ab · read 9ms · load 41ms",
+    explained.err.at_or(0, ""),
+    "   front end   read 7ms · front 1774ms · write back 44ms · load 1392ms",
   );
-  let run_uncached = loaded(explain_flags(), a_build());
-  assert_eq(
-    run_uncached.err.at_or(0, ""),
-    "   front end   built b3:0123456789ab · read 7ms · front 1774ms · write back 44ms · load 1392ms",
-  );
-  assert_eq(run_uncached.err.at_or(1, ""), "   host: 7 operations · b3:aabbccddeeff");
-  assert_eq(loaded(bare(), a_build()).err, []);
-  assert_eq(run_uncached.result, loaded(bare(), a_build()).result)
+  assert_eq(explained.err.at_or(1, ""), "   host: 7 operations · b3:aabbccddeeff");
+  assert_eq(loaded(bare(), a_load_timing()).err, []);
+  assert_eq(explained.result, loaded(bare(), a_load_timing()).result)
 }
 
 test "`--json --explain` puts the front end details in the JSON document and prints nothing to stderr" {
-  let ran = loaded(from_argv("run", ["--json", "--explain"]), a_reuse());
+  let ran = loaded(from_argv("run", ["--json", "--explain"]), a_load_timing());
   assert_eq(ran.err, []);
   let text = to_string(ran.result.json);
-  assert(text.contains("\"front_end\":{\"key\":\"" ++ a_key() ++ "\""));
-  assert(text.contains("\"phases\":{\"front\":0,\"load\":41,\"read\":9,\"write_back\":0}"));
-  assert(text.contains("\"reused\":true"));
-  assert(!to_string(loaded(json_flags(), a_reuse()).result.json).contains("front_end"))
+  assert(
+    text.contains(
+      "\"front_end\":{\"phases\":{\"front\":1774,\"load\":1392,\"read\":7,\"write_back\":44}}",
+    ),
+  );
+  assert(!to_string(loaded(json_flags(), a_load_timing()).result.json).contains("front_end"))
 }
 
 test "a program that fails to load prints no front end timing under `--explain` and exits 2" {
@@ -1591,56 +1590,10 @@ test "a program that fails to load prints no front end timing under `--explain` 
     Ok(unconfigured()),
     Err(no_rejection()),
     returned_value(VUnit),
-    Some(a_build()),
+    Some(a_load_timing()),
   );
   assert_eq(ran.err, []);
   assert_eq(ran.result.code, 2)
-}
-
-test "a directory walk lists the root package's modules first and lists each package's manifest separately from its modules" {
-  let project = {
-    files: [
-      {
-        path: "main.ply",
-        module: "main",
-        text: b"fn main() -> Int = 1\n",
-        at: { label: "cwd", path: "main.ply" },
-      },
-      {
-        path: "util.ply",
-        module: "util",
-        text: b"pub fn one() -> Int = 1\n",
-        at: { label: "cwd", path: "util.ply" },
-      },
-    ],
-    sources: [],
-    diagnostics: [],
-    manifest: Some({
-      path: "ply.pkg",
-      module: "",
-      text: b"fn package() -> Manifest = app()\n",
-      at: { label: "cwd", path: "ply.pkg" },
-    }),
-    packages: [
-      {
-        root: "/w/lib",
-        dir: "/w/lib",
-        manifest: Some(b"fn package() -> Manifest = lib()\n"),
-        files: [
-          {
-            path: "/w/lib/deep.ply",
-            module: "deep",
-            text: b"pub fn deep() -> Int = 7\n",
-            at: { label: "cwd", path: "/w/lib/deep.ply" },
-          },
-        ],
-      },
-    ],
-    root_key: "/w/app",
-  };
-  let w: ProjectSources = project_sources(project);
-  assert_eq(w.modules.map(|p: SourceText| p.path), ["main.ply", "util.ply", "/w/lib/deep.ply"]);
-  assert_eq(w.manifests.map(|p: SourceText| p.path), ["ply.pkg", "/w/lib/ply.pkg"])
 }
 
 test "a run enters its entry, and the function `--config-schema` names" {
@@ -1650,16 +1603,4 @@ test "a run enters its entry, and the function `--config-schema` names" {
     entered_by("m.main", { ..options, config: { ..options.config, schema: Some("m.spec") } }),
     [b"m.main", b"m.spec"],
   )
-}
-
-test "`command_identity` changes when the source paths, `--config-schema` or `--profile` change, but not when timeout or allow change" {
-  let options = machine::default_options();
-  let base = command_identity(bare(), options);
-  assert(command_identity({ ..bare(), paths: [paths::at_cwd("app")] }, options) != base);
-  assert(
-    command_identity(bare(), { ..options, config: { ..options.config, schema: Some("m.Config") } })
-      != base,
-  );
-  assert(command_identity(bare(), { ..options, profile: cc::release() }) != base);
-  assert_eq(command_identity(bare(), { ..options, timeout: 5, allow: ["net"] }), base)
 }

@@ -218,6 +218,37 @@ pub fn table_rows<[r]>(
     },
   }
 
+pub fn row_on_disk<[r]>(
+  dir: String,
+  seg: Segment,
+  table: Int,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], abort.raise} =
+  match find_table(seg.parts, table) {
+    None -> None,
+    Some(p) -> {
+      let path = segment_path(dir, seg.token);
+      let row_at = |i: Int| read_range[r](path, p.offset + i * p.width, p.width);
+      iterate({ lo: 0, hi: p.count }, 65, |x: { lo: Int, hi: Int }|
+        if x.lo >= x.hi {
+          Stop(if x.lo >= p.count { None } else {
+            match row_at(x.lo) {
+              Some(b) -> if b.slice(0, key.len()) == key { Some(b) } else { None },
+              None -> None,
+            }
+          })
+        } else {
+          let mid = x.lo + (x.hi - x.lo) / 2;
+          match row_at(mid) {
+            None -> Stop(None),
+            Some(b) -> if compare_values(b.slice(0, key.len()), key) == Less {
+              Continue({ lo: mid + 1, hi: x.hi })
+            } else { Continue({ lo: x.lo, hi: mid }) },
+          }
+        })
+    },
+  }
+
 fn key_prefix(b: Bytes, at: Int) -> Int = {
   let le = read_u32(b, at);
   (le & 255) << 24 | (le >> 8 & 255) << 16 | (le >> 16 & 255) << 8 | le >> 24 & 255
@@ -496,7 +527,6 @@ pub fn sweep<[r]>(
   dir: String,
   schema: Bytes,
   run: String,
-  retired: List<String>,
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} = {
   let names = match fs::listed_names(fs.list_dir[r](dir)) { Some(ns) -> ns, None -> [] };
   let now = run_start_ms[r](Some(run));
@@ -507,13 +537,8 @@ pub fn sweep<[r]>(
     fs.remove[r](dir ++ "/" ++ name);
     ()
   };
-  retired.fold((), |_: Unit, name: String|
-    if names.contains(name) {
-      fs.remove_tree[r](dir ++ "/" ++ name);
-      ()
-    });
   let running = names.fold(false, |any: Bool, name: String|
-    if !name.starts_with("run") || retired.contains(name) || run.ends_with("/" ++ name) { any }
+    if !name.starts_with("run") || run.ends_with("/" ++ name) { any }
     else if older(name, stale_run_ms()) {
       removed(name);
       any
@@ -700,7 +725,7 @@ test "`merge_start` returns where to start merging: the newest run of segments i
 }
 
 test "a sweep deletes files that no manifest lists, but deletes nothing while another run is active" {
-  let made = fs::on_mem[abs](fs::mem_of([{ path: "s/records/of-a", body: b"old" }]), || {
+  let made = fs::on_mem[abs](fs::mem_of([]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     commit[abs]("s", test_shapes(), a);
     write_segment[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
@@ -714,16 +739,15 @@ test "a sweep deletes files that no manifest lists, but deletes nothing while an
   let seg = |token: Bytes| segment_name(token);
   let held_back = fs::on_mem[abs](made.tree, || {
     let run = start_run[abs]("s");
-    sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, ["records"]);
+    sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" });
     end_run[abs](run)
   });
   let remaining_names = names_in(held_back.tree, "s");
-  assert(!remaining_names.contains("records"));
   assert(remaining_names.contains(seg(b"token--b")) && remaining_names.contains(seg(b"token--o")));
   let alone = fs::on_mem[abs](held_back.tree, || {
     fs.remove[abs](other);
     let run = start_run[abs]("s");
-    sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, []);
+    sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" });
     end_run[abs](run)
   });
   assert_eq(names_in(alone.tree, "s"), [manifest_name(test_shapes()), seg(b"token--a")])
@@ -740,7 +764,7 @@ test "a sweep keeps the segments of another store in the same directory when tha
     ]);
     commit[abs]("s", other, o);
     let run = start_run[abs]("s");
-    sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, []);
+    sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" });
     end_run[abs](run)
   });
   let remaining_names = names_in(made.tree, "s");
@@ -753,7 +777,7 @@ test "a sweep keeps the segments of another store in the same directory when tha
     let run = start_run[abs]("s");
     let path = match run { Some(p) -> p, None -> "" };
     fs.set_modified[abs](path, run_start_ms[abs](run) + stale_manifest_ms() + 1);
-    sweep[abs]("s", test_shapes(), path, []);
+    sweep[abs]("s", test_shapes(), path);
     end_run[abs](run)
   });
   assert_eq(names_in(later.tree, "s"), [manifest_name(test_shapes()), segment_name(b"token--a")])

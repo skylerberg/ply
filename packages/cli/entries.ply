@@ -4,7 +4,6 @@ import compiler.front.rows (DefinitionRow, Dump, EmitterRoot, ModuleRow, ModuleS
 import compiler.front.published (analyse, dump_of)
 import compiler.check.types (Effect, effect_bin)
 import compiler.load (LoadedAnalysis, SourceFile)
-import diagnostic (SourceText)
 import entry (Main, Module)
 import host_listing
 import host_listing (DeclaredEffect, declared_effect_bin)
@@ -139,115 +138,6 @@ pub fn runnable_of(front: LoadedAnalysis) -> Runnable / {abort.raise} =
 pub fn roots_of(r: Runnable) -> Map<Bytes, ModuleSpan> =
   r.roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, x: RootSpan| m.insert(x.root, x.at))
 
-type EntryRecord = { name: String, module: String, path: String, index: Int, start: Int, end: Int }
-
-pub type CachedFile = { path: String, name: String, text: Bytes }
-
-type CachedLoad = {
-  mains: List<EntryRecord>,
-  modules: List<EntryRecord>,
-  library: String,
-  files: List<CachedFile>,
-  runnable: Runnable,
-}
-
-derive bin for EntryRecord
-derive bin for CachedFile
-derive bin for CachedLoad
-
-pub type RestoredLoad = {
-  entries: Entries,
-  library: String,
-  files: List<CachedFile>,
-  runnable: Runnable,
-}
-
-pub fn encode_load(
-  entries: Entries,
-  library: String,
-  files: List<SourceFile>,
-  runnable: Runnable,
-) -> Bytes / {abort.raise} =
-  bin::encode(
-    {
-      mains: entries.mains.map(|m: Main|
-        {
-          name: m.name,
-          module: m.module,
-          path: m.path,
-          index: m.at.module,
-          start: m.at.start,
-          end: m.at.end,
-        }),
-      modules: entries.modules.map(|m: Module|
-        {
-          name: m.name,
-          module: "",
-          path: m.path,
-          index: m.at.module,
-          start: m.at.start,
-          end: m.at.end,
-        }),
-      library: library,
-      files: files.map(|f: SourceFile|
-        {
-          path: f.path,
-          name: f.name,
-          text: if is_shipped(Bytes::of_string(f.name)) { f.text } else { b"" },
-        }),
-      runnable: runnable,
-    },
-    cached_load_bin(),
-  )
-
-pub fn decode_load(recorded: Bytes) -> Option<RestoredLoad> / {abort.raise} =
-  match bin::decode(recorded, cached_load_bin()) {
-    Err(_) -> None,
-    Ok(k) ->
-      Some({
-        entries: {
-          mains: k.mains.map(|h: EntryRecord|
-            {
-              name: h.name,
-              module: h.module,
-              path: h.path,
-              at: { module: h.index, start: h.start, end: h.end },
-            }),
-          modules: k.modules.map(|h: EntryRecord|
-            { name: h.name, path: h.path, at: { module: h.index, start: h.start, end: h.end } }),
-        },
-        library: k.library,
-        files: k.files,
-        runnable: k.runnable,
-      }),
-  }
-
-pub fn restored_sources(
-  files: List<CachedFile>,
-  modules: List<SourceText>,
-  manifests: List<SourceText>,
-) -> Option<List<SourceText>> = {
-  let own = modules.len();
-  let pulled = files.len() - own - manifests.len();
-  let walked = modules.concat(manifests);
-  if pulled < 0 { None } else {
-    range(0, files.len()).fold(Some([]), |accumulator: Option<List<SourceText>>, i: Int|
-      match ((accumulator, files.at(i))) {
-        (Some(placed), Some(f)) -> if i >= own && i < own + pulled {
-          if is_shipped(Bytes::of_string(f.name)) {
-            Some(placed.push({ path: f.path, text: f.text }))
-          } else { None }
-        } else {
-          match walked.at(if i < own { i } else { i - pulled }) {
-            Some(w) -> Some(placed.push(w)),
-            None -> None,
-          }
-        },
-        _ -> None,
-      })
-  }
-}
-
 type TestModule = { name: String, text: String }
 
 fn front_over(files: List<TestModule>) -> LoadedAnalysis / {abort.raise} =
@@ -310,22 +200,6 @@ test "`modules_of` returns every module the load read, each with a position at t
   ])
 }
 
-test "`decode_load` returns what `encode_load` was given for a cached load, and returns `None` for unrelated bytes" {
-  let front = front_over([{ name: "m", text: "fn main() -> Int = 1\n" }]);
-  let offered = of_front(front);
-  let runnable = runnable_of(front);
-  match decode_load(encode_load(offered, "/cache/m.dylib", front.files, runnable)) {
-    None -> panic("what `kept` wrote reads back"),
-    Some(k) -> {
-      assert_eq(k.entries, offered);
-      assert_eq(k.library, "/cache/m.dylib");
-      assert_eq(k.runnable, runnable);
-      assert_eq(k.files.map(|f: CachedFile| f.text.len() > 0), [false, true])
-    },
-  };
-  assert(decode_load(b"an entry of another shape") == None, None)
-}
-
 test "a run stores the effects the program declares and the effects it performs" {
   let front = front_over([
     {
@@ -336,23 +210,4 @@ test "a run stores the effects the program declares and the effects it performs"
   let runnable = runnable_of(front);
   assert(runnable.declared.any(|d: DeclaredEffect| d.name == b"m.log"));
   assert(runnable.performed.any(|a: Effect| a.effect == b"m.log"))
-}
-
-test "`restored_sources` combines this run's source files with the cached text of standard library modules, and returns `None` if the file lists differ" {
-  let files = [
-    { path: "m.ply", name: "m", text: b"" },
-    { path: "<std>/prelude.ply", name: "std.prelude", text: b"the prelude" },
-    { path: "ply.pkg", name: "", text: b"" },
-  ];
-  let m = { path: "m.ply", text: b"fn main() -> Int = 1\n" };
-  let pkg = { path: "ply.pkg", text: b"fn package() -> Manifest = app()\n" };
-  assert_eq(
-    restored_sources(files, [m], [pkg]),
-    Some([m, { path: "<std>/prelude.ply", text: b"the prelude" }, pkg]),
-  );
-  assert_eq(restored_sources(files, [m, m, m], [pkg]), None);
-  assert_eq(
-    restored_sources([{ path: "n.ply", name: "n", text: b"" }].concat(files), [m], [pkg]),
-    None,
-  )
 }

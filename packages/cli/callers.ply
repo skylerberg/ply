@@ -1,13 +1,16 @@
 import compiler.load (Derives)
 import compiler.cc (toolchain)
-import compiler.unit (shipped)
+import compiler.unit (shipped, product_key)
 import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
 import program (Program, Tables, load_program, definitions_in_order, tables_of, location_of,
                 resolve_definition, unknown_definition, own_tests, own_laws, transitive_callers,
-                direct_callers, program_view)
+                direct_callers, program_view, product_unchanged, store_product_at)
+import paths
+import std.bin
+import std.string
 import report (CommandOutput, schema_version, ok_code, indent, count_of, rejected, reported)
 import std.term (Style, bold)
 import compiler.front.facts (CheckedProgram)
@@ -55,38 +58,49 @@ fn sorted_into(ix: Index, keys: List<Bytes>) -> Group =
       },
     })
 
-fn summary(group: Group) -> String / {abort.raise} =
-  count_of(group.definitions.len(), "definition") ++ ", " ++ count_of(group.tests.len(), "test")
+type CallerNames = { definitions: List<Bytes>, tests: List<Bytes>, laws: List<Bytes> }
+
+type StoredCallers = { name: Bytes, direct: CallerNames, transitive: CallerNames }
+
+derive bin for CallerNames
+
+derive bin for StoredCallers
+
+fn names_in(group: Group) -> CallerNames =
+  {
+    definitions: group.definitions.map(|d: DefinitionInfo| d.name),
+    tests: group.tests.map(|x: TestInfo| x.name),
+    laws: group.laws.map(|x: LawInfo| x.name),
+  }
+
+fn summary(names: CallerNames) -> String / {abort.raise} =
+  count_of(names.definitions.len(), "definition") ++ ", " ++ count_of(names.tests.len(), "test")
     ++ ", "
-    ++ count_of(group.laws.len(), "law")
+    ++ count_of(names.laws.len(), "law")
 
 fn quoted(name: Bytes) -> String = "\"" ++ String::of_bytes_lossy(name) ++ "\""
 
-fn group_lines(title: String, group: Group, lines: List<String>) -> List<String> / {abort.raise} = {
-  let head = lines.push(indent() ++ title ++ ": " ++ summary(group));
-  let after_definitions = group.definitions.fold(
-    head,
-    |accumulator: List<String>, definition_info: DefinitionInfo|
-      accumulator.push(indent() ++ indent() ++ String::of_bytes_lossy(definition_info.name)),
-  );
-  let after_tests = group.tests.fold(after_definitions, |accumulator: List<String>, x: TestInfo|
-    accumulator.push(indent() ++ indent() ++ "test " ++ quoted(x.name)));
-  group.laws.fold(after_tests, |accumulator: List<String>, x: LawInfo|
-    accumulator.push(indent() ++ indent() ++ "law " ++ quoted(x.name)))
+fn group_lines(
+  title: String,
+  names: CallerNames,
+  lines: List<String>,
+) -> List<String> / {abort.raise} = {
+  let head = lines.push(indent() ++ title ++ ": " ++ summary(names));
+  let after_definitions = names.definitions.fold(head, |accumulator: List<String>, name: Bytes|
+    accumulator.push(indent() ++ indent() ++ String::of_bytes_lossy(name)));
+  let after_tests = names.tests.fold(after_definitions, |accumulator: List<String>, name: Bytes|
+    accumulator.push(indent() ++ indent() ++ "test " ++ quoted(name)));
+  names.laws.fold(after_tests, |accumulator: List<String>, name: Bytes|
+    accumulator.push(indent() ++ indent() ++ "law " ++ quoted(name)))
 }
 
-fn text_lines(
-  style: Style,
-  name: Bytes,
-  direct: Group,
-  transitive: Group,
-) -> List<String> / {abort.raise} =
+fn text_lines(style: Style, stored: StoredCallers) -> List<String> / {abort.raise} =
   group_lines(
     "reached from",
-    transitive,
-    group_lines("mentioned by", direct, [
+    stored.transitive,
+    group_lines("mentioned by", stored.direct, [
       "",
-      indent() ++ bold(style, String::of_bytes_lossy(name)),
+      indent() ++ bold(style, String::of_bytes_lossy(stored.name)),
     ]),
   )
 
@@ -127,6 +141,13 @@ fn group_json(program: Program, group: Group) -> Json / {abort.raise} =
     { key: "laws", value: Array(group.laws.map(|x: LawInfo| law_json(program, x))) },
   ])
 
+fn stored_callers(
+  definition_info: DefinitionInfo,
+  direct: Group,
+  transitive: Group,
+) -> StoredCallers =
+  { name: definition_info.name, direct: names_in(direct), transitive: names_in(transitive) }
+
 fn callers_output(
   style: Style,
   program: Program,
@@ -152,30 +173,62 @@ fn callers_output(
       { key: "transitive", value: group_json(program, transitive) },
       { key: "diagnostics", value: Array([]) },
     ]),
-    lines: text_lines(style, definition_info.name, direct, transitive),
+    lines: text_lines(style, stored_callers(definition_info, direct, transitive)),
     errs: [],
     code: ok_code(),
   }
 
-fn callers_of(
-  style: Style,
+fn found_callers(
   program: Program,
   analysis: CheckedProgram,
   definition_info: DefinitionInfo,
-) -> CommandOutput / {abort.raise} = {
+) -> { direct: Group, transitive: Group } / {abort.raise} = {
   let tables: Tables = tables_of(analysis.frame.hashes);
   let ix: Index = indexed(program, analysis);
-  callers_output(
-    style,
-    program,
-    definition_info,
-    sorted_into(ix, direct_callers(tables, definition_info.name)),
-    sorted_into(ix, transitive_callers(tables, definition_info.name)),
-  )
+  {
+    direct: sorted_into(ix, direct_callers(tables, definition_info.name)),
+    transitive: sorted_into(ix, transitive_callers(tables, definition_info.name)),
+  }
 }
+
+fn callers_product(flags: Flags) -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "callers "
+    ++ String::of_bytes_lossy(
+      product_key(
+        Bytes::of_string(
+          String::join(
+            [flags.query].concat(flags.paths.map(|r: paths::ResolvedPath| r.display)),
+            "\n",
+          ),
+        ),
+      ),
+    )
+
+fn may_reuse_callers(flags: Flags) -> Bool = !flags.json && !flags.verify_dependencies
 
 pub fn run(
   flags: Flags,
+) -> CommandOutput / {time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let product = callers_product(flags);
+  let current = if may_reuse_callers(flags) { product_unchanged(flags.paths, product) }
+  else { None };
+  let stored = match current {
+    None -> None,
+    Some(c) -> match bin::decode(c.value, stored_callers_bin()) {
+      Ok(names) -> Some(names),
+      Err(_) -> None,
+    },
+  };
+  match stored {
+    Some(names) ->
+      { json: object([]), lines: text_lines(style_of(flags), names), errs: [], code: ok_code() },
+    None -> callers_from_sources(flags, product),
+  }
+}
+
+fn callers_from_sources(
+  flags: Flags,
+  product: String,
 ) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
   let s = style_of(flags);
@@ -184,7 +237,18 @@ pub fn run(
     Some(w) -> match resolve_definition(definitions_in_order(w), flags.query) {
       Err(names) ->
         reported(s, "callers", [unknown_definition(flags.query, names)], loaded.source_texts),
-      Ok(d) -> callers_of(s, loaded, w, d),
+      Ok(d) -> {
+        let found = found_callers(loaded, w, d);
+        if may_reuse_callers(flags) {
+          store_product_at(
+            flags.paths,
+            loaded.log_position,
+            product,
+            bin::encode(stored_callers(d, found.direct, found.transitive), stored_callers_bin()),
+          )
+        };
+        callers_output(s, loaded, d, found.direct, found.transitive)
+      },
     },
   }
 }
@@ -254,12 +318,12 @@ test "`sorted_into` drops a name that is not a definition, test or law, such as 
   assert_eq(g.definitions.len(), 0);
   assert_eq(g.tests.map(|x: TestInfo| x.name), [b"two is two"]);
   assert_eq(g.laws.map(|x: LawInfo| x.name), [b"three is three"]);
-  assert_eq(summary(g), "0 definitions, 1 test, 1 law")
+  assert_eq(summary(names_in(g)), "0 definitions, 1 test, 1 law")
 }
 
 test "a group is titled, counted, and one indented line each" {
   let g: Group = { definitions: [], tests: [a_test(b"two is two", b"m.two is two", 0)], laws: [] };
-  assert_eq(group_lines("mentioned by", g, []), [
+  assert_eq(group_lines("mentioned by", names_in(g), []), [
     "   mentioned by: 0 definitions, 1 test, 0 laws",
     "      test \"two is two\"",
   ])

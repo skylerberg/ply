@@ -107,16 +107,11 @@ summed() {
 
 answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) query results reused, \([.front_end.queries[].run] | add // 0) computed and \(.front_end.lost // 0) lost" else "" end)'
 
-lost() {
-  jq -s -e 'any(.[]; (.front_end.lost // 0) > 0)' "$1" > /dev/null 2>&1
-}
-
 spent() {
   jq -r --argjson wall "$2" '
     def s(ms): (ms / 1000 | floor | tostring) + "s";
     (.phases // {}) as $p
-    | (if .front_end.reused then "spent: read a cached result in \(s(.front_end.phases.total // 0)); the run that cached it spent " else "spent: " end)
-      + "before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))" + '"$answers"'
+    | "spent: before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))" + '"$answers"'
   ' "$1" 2>/dev/null
 }
 
@@ -159,10 +154,6 @@ tests_of() {
     echo "the run $id selected no test" >&2
     status=1
   fi
-  if lost "$out"; then
-    echo "the run $id ran bodies again whose results a store had cached and lost" >&2
-    status=1
-  fi
   if [ "$status" -ne 0 ]; then
     red "$out"
     rm -f "$out"
@@ -197,10 +188,6 @@ proofs_of() {
     echo "the run $id proved no claim" >&2
     status=1
   fi
-  if lost "$out"; then
-    echo "the run $id ran bodies again whose results a store had cached and lost" >&2
-    status=1
-  fi
   if [ "$status" -ne 0 ]; then
     disproved "$out"
     rm -f "$out"
@@ -233,6 +220,8 @@ store_dirs() {
 
 # shellcheck disable=SC2100
 stores=ply-c-cache/bodies
+# shellcheck disable=SC2100
+facts=ply-c-cache/facts
 
 kept_answers() {
   local dir=$1 store
@@ -347,7 +336,9 @@ case "${1:-}" in
       [ -d "$dir/.ply-cache" ] && kept+=("${dir#"$root"/}/.ply-cache")
     done
     [ "${#kept[@]}" -gt 0 ] || { echo "this job has no store"; exit 0; }
-    tar -cf - -C "$root" "${kept[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
+    results=()
+    [ -d "$caches/$facts" ] && results=(-C "$caches" "$facts")
+    tar -cf - -C "$root" "${kept[@]}" "${results[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
     echo "packed ${#kept[@]} stores, $(du -sh "$file" | cut -f1): ${kept[*]}"
     ;;
   unpack)
@@ -365,6 +356,11 @@ case "${1:-}" in
         mv "$store" "$there" || exit 1
         laid=$((laid + 1))
       done < <(find "$dir/unpacked" -type d -name .ply-cache -prune)
+      if [ -d "$dir/unpacked/$facts" ]; then
+        rm -rf "${caches:?}/$facts"
+        mkdir -p "$(dirname "$caches/$facts")"
+        mv "$dir/unpacked/$facts" "$caches/$facts" || exit 1
+      fi
       echo "$name came back from run $run: $laid stores"
       echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     else

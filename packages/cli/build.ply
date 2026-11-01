@@ -1,3 +1,5 @@
+import std.random (entropy)
+import compiler.cc (toolchain)
 import compiler.load (Derives, LoadedAnalysis, SourceFile)
 import args (Flags, no_flags, style_of, root_of)
 import literals (evaluation, evaluation_errors)
@@ -8,7 +10,8 @@ import builder (builder)
 import artifact_builder (LibraryUnit, BuiltArtifact, Named, PreviousArtifact, Dependencies,
                          artifacts, with_artifacts)
 import units (emit)
-import compiler.unit (shipped)
+import compiler.unit (shipped, product_key)
+import compiler.store.hash.encoding (hex)
 import config_schema
 import lock
 import paths (ResolvedPath, RootedPath, displayed, here, write_file)
@@ -24,8 +27,8 @@ import compiler.check.types (FunctionType)
 import diagnostic (SourceText, all_to_json, all_to_text)
 import entry (Main, Module, entry_point, span_label)
 import sources (File)
-import program (Program, TimedLoad, loaded_analysis, no_loaded_analysis, no_program, timed_uncached,
-                program_view)
+import program (Program, TimedLoad, loaded_analysis, no_loaded_analysis, no_program, timed_load,
+                program_view, product_unchanged, store_product_at)
 import plyz
 import report (CommandOutput, indent, ok_code, count_of, rejected, reported)
 import std.fs (fs, Missing)
@@ -44,6 +47,7 @@ import signing (Provenance, head_commit, provenance_bytes, provenance_of, read_s
                 signatures_path)
 import std.signed
 import std.signed (Signature, countersigned, encode_signed, decode_signed)
+import std.bin
 import std.bytes
 import std.string
 import std.fmt (size)
@@ -305,12 +309,10 @@ fn diff_json(
     { key: "diagnostics", value: all_to_json([], []) },
   ])
 
-fn binary_line(style: Style, loaded: LoadedProgram) -> String =
-  match loaded.binary_bytes {
-    Some(n) ->
-      indent() ++ bold(style, "binary") ++ " ply " ++ loaded.version ++ " · " ++ human_size(n),
-    None ->
-      indent() ++ bold(style, "binary") ++ " ply " ++ loaded.version ++ " · size unavailable",
+fn binary_line(style: Style, binary_bytes: Option<Int>, version: String) -> String =
+  match binary_bytes {
+    Some(n) -> indent() ++ bold(style, "binary") ++ " ply " ++ version ++ " · " ++ human_size(n),
+    None -> indent() ++ bold(style, "binary") ++ " ply " ++ version ++ " · size unavailable",
   }
 
 fn startup_line(style: Style, roots: List<String>) -> String =
@@ -319,24 +321,50 @@ fn startup_line(style: Style, roots: List<String>) -> String =
       ++ " none — this artifact has no startup entry point, so it cannot be run with `--config-schema`"
   } else { indent() ++ bold(style, "startup") ++ " " ++ String::join(roots, " · ") }
 
-fn built_lines(
-  style: Style,
+type StoredArtifact = {
+  entry: String,
+  digest: String,
+  definitions: Int,
+  full: Bytes,
+  bytes: Int,
+  out: String,
+  startup: List<String>,
+  binary_bytes: Option<Int>,
+  version: String,
+}
+
+derive bin for StoredArtifact
+
+fn built_lines(style: Style, stored: StoredArtifact) -> List<String> / {abort.raise} =
+  [
+    indent() ++ green(style, "built") ++ " " ++ stored.entry ++ " · " ++ stored.digest,
+    indent() ++ bold(style, "artifact") ++ " " ++ stored.definitions.to_string() ++ " "
+      ++ plural(stored.definitions, "definition")
+      ++ " · "
+      ++ human_size(stored.bytes)
+      ++ " · "
+      ++ stored.out,
+    binary_line(style, stored.binary_bytes, stored.version),
+    startup_line(style, stored.startup),
+  ]
+
+fn stored_artifact(
   loaded: LoadedProgram,
   made: BuiltArtifact,
   sealed: SealedArtifact,
   out: String,
-) -> List<String> / {abort.raise} =
-  [
-    indent() ++ green(style, "built") ++ " " ++ made.entry ++ " · " ++ sealed.digest,
-    indent() ++ bold(style, "artifact") ++ " " ++ made.definitions.to_string() ++ " "
-      ++ plural(made.definitions, "definition")
-      ++ " · "
-      ++ human_size(sealed.bytes.len())
-      ++ " · "
-      ++ out,
-    binary_line(style, loaded),
-    startup_line(style, made.startup),
-  ]
+) -> StoredArtifact =
+  {
+    entry: made.entry,
+    digest: sealed.digest,
+    definitions: made.definitions,
+    full: sealed.full,
+    bytes: sealed.bytes.len(),
+    out: out,
+    startup: made.startup,
+    binary_bytes: loaded.binary_bytes,
+    version: loaded.version,
+  }
 
 fn built_json(
   loaded: LoadedProgram,
@@ -600,7 +628,7 @@ fn write_artifact(
   loaded: LoadedProgram,
   made: BuiltArtifact,
   sealed: SealedArtifact,
-) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
+) -> CommandOutput / {artifact_written.stored, fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
   let out = match flags.out { Some(v) -> v, None -> default_output(made.entry) };
   match signing_key(flags) {
     Err(d) -> reported(style, "build", [d], loaded.places),
@@ -612,16 +640,18 @@ fn write_artifact(
           built_provenance(flags, loaded, "program", made.entry, sealed),
         ) {
         Err(d) -> reported(style, "build", [d], loaded.places),
-        Ok(signer) ->
+        Ok(signer) -> {
+          artifact_written.stored(stored_artifact(loaded, made, sealed, out));
           {
             json: built_json(loaded, made, sealed, out, signer),
             lines: signer_lines(style, signer).fold(
-              built_lines(style, loaded, made, sealed, out),
+              built_lines(style, stored_artifact(loaded, made, sealed, out)),
               |accumulator: List<String>, l: String| accumulator.push(l),
             ),
             errs: [],
             code: ok_code(),
-          },
+          }
+        },
       },
     },
   }
@@ -661,7 +691,7 @@ fn deliver(
   loaded: LoadedProgram,
   made: BuiltArtifact,
   sealed: SealedArtifact,
-) -> CommandOutput / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
+) -> CommandOutput / {artifact_written.stored, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match flags.diff {
     Some(old) -> diff_output(style, loaded, made, sealed, old),
     None -> if flags.digest {
@@ -687,7 +717,7 @@ fn assemble(
   hashes: HashOutput,
   entry: String,
   startup: List<String>,
-) -> CommandOutput / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
+) -> CommandOutput / {artifact_written.stored, artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match artifacts.made(front, hashes, entry, startup, has_diff(flags)) {
     Err(reason) -> reported(style, "build", reason.diagnostics, loaded.places),
     Ok(m) -> match seal(encode(m.head, m.sections)) {
@@ -705,7 +735,7 @@ fn build_entry(
   hashes: HashOutput,
   definitions: List<Definition>,
   startup: Result<List<String>, Diagnostic>,
-) -> CommandOutput / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
+) -> CommandOutput / {artifact_written.stored, artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match entry_of(p, definitions, flags) {
     Err(d) -> if flags.entry == None && p.mains.len() == 0 {
       build_library(style, flags, loaded, p, front, definitions, d)
@@ -716,29 +746,109 @@ fn build_entry(
     },
   }
 
+fn may_reuse_artifact(flags: Flags) -> Bool =
+  !flags.json && !flags.explain && !flags.digest && !flags.verify_dependencies && flags.diff == None
+    && flags.sign == None
+    && flags.action == "build"
+
+fn artifact_product(
+  flags: Flags,
+  schema: Option<String>,
+) -> String / {shipped.runtime, shipped.definitions, fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  "artifact "
+    ++ String::of_bytes_lossy(
+      product_key(
+        Bytes::concat_all(
+          [
+            match flags.entry { Some(e) -> e, None -> "" },
+            match flags.out { Some(o) -> o, None -> "" },
+            match schema { Some(n) -> n, None -> "" },
+          ].concat(
+            flags.paths.map(|r: ResolvedPath| r.display),
+          ).map(|part: String| Bytes::of_string(part ++ "\n")).push(
+            match paths::read_file(lock::path_of(root_of(flags))) { Some(b) -> b, None -> b"" },
+          ),
+        ),
+      ),
+    )
+
+fn artifact_on_disk(
+  stored: StoredArtifact,
+) -> Bool / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match paths::read_file(paths::rooted_path(stored.out)) {
+    None -> false,
+    Some(bytes) -> digest_of(domain(), bytes) == Some(stored.full),
+  }
+
 pub fn run(
   flags: Flags,
   schema: Option<String>,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let s: Style = style_of(flags);
-  let t: TimedLoad = timed_uncached(flags.paths, flags.verify_dependencies);
-  match program_view(t.program) {
-    None -> rejected(s, "build", t.program.diagnostics, t.program.source_texts),
-    Some(w) -> match evaluation_errors(t, w.frame) {
-      [] ->
-        with_artifacts(||
-          build_program(
-            s,
-            flags,
-            t.program,
-            definitions_of(w),
-            startup_of(w, schema),
-            loaded_analysis(t, w),
-            w.frame.hashes,
-          )),
-      literals -> rejected(s, "build", literals, t.program.source_texts),
-    },
+) -> CommandOutput / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let product = artifact_product(flags, schema);
+  let reusable = if may_reuse_artifact(flags) {
+    match product_unchanged(flags.paths, product) {
+      None -> None,
+      Some(c) -> match bin::decode(c.value, stored_artifact_bin()) {
+        Ok(stored) -> if artifact_on_disk(stored) { Some(stored) } else { None },
+        Err(_) -> None,
+      },
+    }
+  } else { None };
+  match reusable {
+    Some(stored) ->
+      { json: object([]), lines: built_lines(style_of(flags), stored), errs: [], code: ok_code() },
+    None -> build_from_sources(flags, schema, product),
   }
+}
+
+effect artifact_written {
+  write stored(artifact: StoredArtifact) -> Unit
+}
+
+fn build_from_sources(
+  flags: Flags,
+  schema: Option<String>,
+  product: String,
+) -> CommandOutput / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let s: Style = style_of(flags);
+  let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
+  let done = handle {
+    match program_view(t.program) {
+      None -> rejected(s, "build", t.program.diagnostics, t.program.source_texts),
+      Some(w) -> match evaluation_errors(t, w.frame) {
+        [] ->
+          with_artifacts(||
+            build_program(
+              s,
+              flags,
+              t.program,
+              definitions_of(w),
+              startup_of(w, schema),
+              loaded_analysis(t, w),
+              w.frame.hashes,
+            )),
+        literals -> rejected(s, "build", literals, t.program.source_texts),
+      },
+    }
+  } with {
+    var written = None,
+    artifact_written.stored(artifact) -> {
+      written = Some(artifact);
+    },
+    return output -> { output: output, written: written },
+  };
+  match done.written {
+    Some(artifact) -> if may_reuse_artifact(flags) && done.output.code == ok_code() {
+      store_product_at(
+        flags.paths,
+        t.program.log_position,
+        product,
+        bin::encode(artifact, stored_artifact_bin()),
+      )
+    },
+    None -> (),
+  };
+  done.output
 }
 
 pub fn with_read_back<a | e>(
@@ -768,7 +878,7 @@ fn build_program(
   startup: Result<List<String>, Diagnostic>,
   front: LoadedAnalysis,
   hashes: HashOutput,
-) -> CommandOutput / {builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
+) -> CommandOutput / {artifact_written.stored, builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
   let r = root_of(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
   match builder.loaded[build](root_of(flags).machine, front) {
@@ -1182,6 +1292,7 @@ fn build_with(
     fs.write_file[abs](path, body) -> stores || path.ends_with("ply.lock"),
     fs.kind[abs](path) -> Missing,
     artifacts.unit(front, names) -> no_unit(),
+    artifact_written.stored(_) -> (),
   }
 
 fn no_unit() -> Result<LibraryUnit, Rejection> = Err({ diagnostics: [], places: [] })

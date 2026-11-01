@@ -2,7 +2,7 @@ import compiler.cc (toolchain)
 import compiler.load (Derives, LoadedAnalysis, SourceFile, report_viewed, derivation_result)
 import compiler.expand.derive (DeriverRequest)
 import compiler.front.diagnostics (ParsedSource, parse_from)
-import compiler.unit (shipped)
+import compiler.unit (shipped, product_key)
 import std.fs (fs)
 import std.time (time)
 import compiler.front.emitter_input (Rejected, Analysed, TestRunScope, view_dump,
@@ -22,7 +22,7 @@ import compiler.store.hash
 import compiler.store.hash.forms (HashOutput, NodeRef, FunctionNamed, Subject, CachedHashes,
                                   ModuleHashes, no_cached_hashes, joined_cached_hashes)
 import compiler.store.hash.encoding (hex)
-import std.hash (blake3)
+import std.bin
 import compiler.syntax.items (Item, FunctionItem, parse)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, Location)
 import compiler.check.termination (Terminates, unknown_summary)
@@ -38,7 +38,9 @@ import sources (File, Project, DependencyPackage, Embed, load_resolved, shipping
 import builder (builder)
 import module_queries
 import module_queries (QueryResults)
-import compiler.store.memo (Dependency, QueryStats)
+import compiler.store.memo_files
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.store.memo (QueryStats)
 import compiler.front.checking (CheckedModule, packages_rejected, rejected_first, root_warnings,
                                 rows_of_result, checked_program_from_results)
 import compiler.front.checking.world (ModuleResult, ModuleKey)
@@ -47,7 +49,6 @@ import std.random (entropy)
 import std.list
 import std.string
 import compiler.syntax.parsing (no_module, dummy_span, span_between)
-import compiler.front.interface (length_prefixed)
 import compiler.store.hash.forms
 
 pub type Program = {
@@ -69,8 +70,7 @@ pub type Program = {
   shipped_views: List<ShippedModuleSummary>,
   tallies: List<QueryStats>,
   missing_results: Int,
-  requested_dependencies: List<Dependency>,
-  looked_up: List<Dependency>,
+  log_position: Option<Int>,
 }
 
 pub type ModuleView = { name: String, path: String }
@@ -131,8 +131,7 @@ fn failed_program(
     shipped_views: [],
     tallies: [],
     missing_results: 0,
-    requested_dependencies: [],
-    looked_up: [],
+    log_position: None,
   }
 
 pub fn no_program() -> Program =
@@ -155,8 +154,7 @@ pub fn no_program() -> Program =
     shipped_views: [],
     tallies: [],
     missing_results: 0,
-    requested_dependencies: [],
-    looked_up: [],
+    log_position: None,
   }
 
 pub fn packages_of(project: Project) -> PackageSources =
@@ -208,9 +206,9 @@ fn manifest_places(project: Project) -> List<SourceText> = {
   }
 }
 
-pub type ProjectSources = { modules: List<SourceText>, manifests: List<SourceText> }
+type ProjectSources = { modules: List<SourceText>, manifests: List<SourceText> }
 
-pub fn project_sources(project: Project) -> ProjectSources =
+fn project_sources(project: Project) -> ProjectSources =
   {
     modules: own_places(project).concat(dependency_places(project)),
     manifests: manifest_places(project),
@@ -321,8 +319,7 @@ fn analysed(
     shipped_views: loaded.views,
     tallies: [],
     missing_results: 0,
-    requested_dependencies: [],
-    looked_up: [],
+    log_position: None,
   };
   let owned = project.sources.fold(Map::new(), |accumulator: Map<Bytes, Bool>, source: Source|
     accumulator.insert(source.name, true));
@@ -538,8 +535,7 @@ fn unproved_measure(u: UnprovedMeasure) -> Diagnostic =
     }),
   )
 
-pub fn usable(project: Project) -> Bool =
-  project.diagnostics.len() == 0 && project.sources.len() > 0
+fn usable(project: Project) -> Bool = project.diagnostics.len() == 0 && project.sources.len() > 0
 
 fn assembled(
   project: Project,
@@ -551,8 +547,7 @@ fn assembled(
     ..assembled_from(project, shipping, paths, q, true),
     tallies: q.tallies,
     missing_results: q.missing_results,
-    requested_dependencies: q.requested_dependencies,
-    looked_up: q.looked_up,
+    log_position: q.log_position,
   }
 
 fn assembled_from(
@@ -679,74 +674,6 @@ fn check_modules(
     }
   }
 
-pub fn encoded_paths(paths: List<paths::ResolvedPath>) -> Bytes =
-  length_prefixed(Bytes::of_string(paths.len().to_string())).concat(
-    Bytes::concat_all(
-      paths.map(|r: paths::ResolvedPath|
-        Bytes::concat_all(
-          [r.label, r.root_path, r.display, r.inside, r.absolute, r.machine].map(|s: String|
-            length_prefixed(Bytes::of_string(s))),
-        )),
-    ),
-  )
-
-pub fn encoded_command_line(argv: List<String>, paths: List<paths::ResolvedPath>) -> Bytes =
-  Bytes::concat_all([
-    length_prefixed(Bytes::of_string(argv.len().to_string())),
-    Bytes::concat_all(argv.map(|a: String| length_prefixed(Bytes::of_string(a)))),
-    encoded_paths(paths),
-  ])
-
-pub fn cached_command(
-  paths: List<paths::ResolvedPath>,
-  project: Project,
-  key: Bytes,
-) -> Option<Bytes> / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
-  match ((usable(project), paths.at(0))) {
-    (true, Some(r)) -> {
-      let dir = paths::in_root(r, ".ply-cache/memo").path;
-      if r.label == "cwd" { module_queries::cached_command[cwd](dir, project, key) }
-      else { module_queries::cached_command[abs](dir, project, key) }
-    },
-    _ -> None,
-  }
-
-pub fn cache_command(
-  paths: List<paths::ResolvedPath>,
-  project: Project,
-  key: Bytes,
-  program: Program,
-  output: Bytes,
-) -> Bool / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
-  match ((usable(project), paths.at(0))) {
-    (true, Some(r)) -> {
-      let dir = paths::in_root(r, ".ply-cache/memo").path;
-      let made = module_queries::program_digest();
-      if r.label == "cwd" {
-        module_queries::cache_command[cwd](
-          dir,
-          project,
-          key,
-          made,
-          program.requested_dependencies,
-          program.looked_up,
-          output,
-        )
-      } else {
-        module_queries::cache_command[abs](
-          dir,
-          project,
-          key,
-          made,
-          program.requested_dependencies,
-          program.looked_up,
-          output,
-        )
-      }
-    },
-    _ -> false,
-  }
-
 pub fn doc_pages(
   paths: List<paths::ResolvedPath>,
   project: Project,
@@ -760,6 +687,134 @@ pub fn doc_pages(
     },
     _ -> [],
   }
+
+fn store_of(resolved: paths::ResolvedPath) -> String =
+  paths::in_root(resolved, ".ply-cache/memo").path
+
+fn current_product_in(
+  resolved: paths::ResolvedPath,
+  product: String,
+) -> Option<Bytes> / {fs.read[cwd], fs.read[abs], abort.raise} =
+  if resolved.label == "cwd" { memo_files::current_product[cwd](store_of(resolved), product) }
+  else { memo_files::current_product[abs](store_of(resolved), product) }
+
+pub fn store_product_at(
+  paths: List<paths::ResolvedPath>,
+  log_position: Option<Int>,
+  product: String,
+  value: Bytes,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+  match ((paths.at(0), log_position)) {
+    (Some(r), Some(at)) -> if r.label == "cwd" {
+      memo_files::store_product[cwd](store_of(r), product, at, value)
+    } else { memo_files::store_product[abs](store_of(r), product, at, value) },
+    _ -> (),
+  }
+
+pub type CleanProgram = { summary: ProgramSummary, project: Project }
+
+pub fn clean_program(
+  paths: List<paths::ResolvedPath>,
+) -> Option<CleanProgram> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let project: Project = load_resolved(paths);
+  match ((usable(project), paths.at(0))) {
+    (true, Some(r)) -> {
+      let summary = if r.label == "cwd" {
+        module_queries::checked_summary[cwd](store_of(r), project)
+      } else { module_queries::checked_summary[abs](store_of(r), project) };
+      let layout_fine = packages_rejected(
+          packages_of(project),
+          project.sources.map(|s: Source| s.name),
+          project_sources(project).modules.len(),
+          summary.pulled,
+        ).len(
+        )
+        == 0;
+      if summary.clean && layout_fine { Some({ summary: summary, project: project }) } else { None }
+    },
+    _ -> None,
+  }
+}
+
+pub fn declarers_in(
+  resolved: paths::ResolvedPath,
+  project: Project,
+  name: Bytes,
+) -> List<Bytes> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  if resolved.label == "cwd" { module_queries::declarers[cwd](store_of(resolved), project, name) }
+  else { module_queries::declarers[abs](store_of(resolved), project, name) }
+
+fn later_checks() -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "later checks " ++ String::of_bytes_lossy(product_key(b""))
+
+pub fn clean_summary(
+  paths: List<paths::ResolvedPath>,
+) -> Option<ProgramSummary> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match clean_program(paths) {
+    None -> None,
+    Some(clean) -> if !clean.summary.checked_later
+        || (match paths.at(0) {
+          Some(r) -> current_product_in(r, later_checks()) != None,
+          None -> false,
+        }) { Some(clean.summary) }
+    else { None },
+  }
+
+pub fn later_checks_passed(
+  paths: List<paths::ResolvedPath>,
+  log_position: Option<Int>,
+) -> Unit / {shipped.runtime, shipped.definitions, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+  store_product_at(paths, log_position, later_checks(), b"")
+
+pub type CurrentProduct = { value: Bytes, clean: CleanProgram }
+
+pub fn product_unchanged(
+  paths: List<paths::ResolvedPath>,
+  product: String,
+) -> Option<CurrentProduct> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match ((clean_program(paths), paths.at(0))) {
+    (Some(clean), Some(r)) -> match current_product_in(r, product) {
+      Some(value) -> Some({ value: value, clean: clean }),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn tests_product(
+  selection: String,
+) -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "tests passed " ++ String::of_bytes_lossy(product_key(Bytes::of_string(selection)))
+
+pub type StoredPass = { tests: Int, filtered_out: Int }
+
+derive bin for StoredPass
+
+pub fn passed_unchanged(
+  paths: List<paths::ResolvedPath>,
+  selection: String,
+) -> Option<StoredPass> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match product_unchanged(paths, tests_product(selection)) {
+    None -> None,
+    Some(stored) -> match bin::decode(stored.value, stored_pass_bin()) {
+      Ok(pass) -> Some(pass),
+      Err(_) -> None,
+    },
+  }
+
+pub fn record_passed(
+  paths: List<paths::ResolvedPath>,
+  log_position: Option<Int>,
+  selection: String,
+  pass: StoredPass,
+) -> Unit / {shipped.runtime, shipped.definitions, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} = {
+  store_product_at(
+    paths,
+    log_position,
+    tests_product(selection),
+    bin::encode(pass, stored_pass_bin()),
+  );
+  later_checks_passed(paths, log_position)
+}
 
 fn check_modules_uncached(
   project: Project,
@@ -1226,6 +1281,52 @@ test "an unknown definition name gives `E0101`, and a short name matching severa
   assert_eq(many.message, b"`total` names 2 definitions");
   assert_eq(many.notes_text, [b"one of: a.total, b.total"]);
   assert_eq(with_note(many, b"and one more").notes, 2)
+}
+
+test "a directory walk lists the root package's modules first and lists each package's manifest separately from its modules" {
+  let project = {
+    files: [
+      {
+        path: "main.ply",
+        module: "main",
+        text: b"fn main() -> Int = 1\n",
+        at: { label: "cwd", path: "main.ply" },
+      },
+      {
+        path: "util.ply",
+        module: "util",
+        text: b"pub fn one() -> Int = 1\n",
+        at: { label: "cwd", path: "util.ply" },
+      },
+    ],
+    sources: [],
+    diagnostics: [],
+    manifest: Some({
+      path: "ply.pkg",
+      module: "",
+      text: b"fn package() -> Manifest = app()\n",
+      at: { label: "cwd", path: "ply.pkg" },
+    }),
+    packages: [
+      {
+        root: "/w/lib",
+        dir: "/w/lib",
+        manifest: Some(b"fn package() -> Manifest = lib()\n"),
+        files: [
+          {
+            path: "/w/lib/deep.ply",
+            module: "deep",
+            text: b"pub fn deep() -> Int = 7\n",
+            at: { label: "cwd", path: "/w/lib/deep.ply" },
+          },
+        ],
+      },
+    ],
+    root_key: "/w/app",
+  };
+  let w: ProjectSources = project_sources(project);
+  assert_eq(w.modules.map(|p: SourceText| p.path), ["main.ply", "util.ply", "/w/lib/deep.ply"]);
+  assert_eq(w.manifests.map(|p: SourceText| p.path), ["ply.pkg", "/w/lib/ply.pkg"])
 }
 
 test "`location_of` returns `None` for a span that belongs to no module, and a file, line and column for a real span" {

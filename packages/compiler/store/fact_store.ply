@@ -1,0 +1,1159 @@
+import std.fs
+import std.fs (fs)
+import std.bin
+import std.bytes (u32_le, u64_le, u64_be)
+import std.bytes
+import std.list
+import std.show (show)
+import compiler.store.segments
+import compiler.store.segments (CommitResult, Committed, LockHeld, Manifest, Segment, SegmentWriter,
+                                StoreChanged, WriteFailed)
+import compiler.store.fact_tree
+import compiler.store.fact_tree (TreeEntry, TreeNode, TreeRoot, tree_node_bin)
+
+pub effect fact_damage {
+  raise damaged(reason: String)
+}
+
+pub effect recent_reads {
+  read node(hash: Bytes) -> Option<TreeNode>
+  write keep_node(hash: Bytes, node: TreeNode) -> Unit
+  read table(name: Bytes) -> Option<Bytes>
+  write keep_table(name: Bytes, rows: Bytes) -> Unit
+  write lookups_in(name: Bytes) -> Int
+}
+
+pub type Tree = | Facts | Past | Dependents | Inputs | Codes
+
+pub type LogEntry = { offset: Int, changes: List<Bytes> }
+
+pub type Snapshot = Map<Int, TreeRoot>
+
+pub type Database = {
+  dir: String,
+  manifest: Manifest,
+  snapshot: Snapshot,
+  pending: Map<Int, Map<Bytes, Option<Bytes>>>,
+  unwritten_log: Map<Int, Bytes>,
+  log_end: Int,
+  starts_over: Bool,
+  run: Option<String>,
+  token: Bytes,
+  writing: SegmentWriter,
+  written_results: Map<Bytes, Bytes>,
+  written_past: Map<Bytes, Bytes>,
+  log_floor: Int,
+}
+
+fn schema() -> Bytes = b"ply fact database 3".blake3()
+
+fn nodes_table() -> Int = 1
+
+fn changes_table() -> Int = 2
+
+fn cursors_table() -> Int = 3
+
+fn snapshots_table() -> Int = 4
+
+fn results_table() -> Int = 5
+
+fn past_table() -> Int = 6
+
+fn key_width(table: Int) -> Int = if table == changes_table() { 8 } else { 32 }
+
+fn row_width(table: Int) -> Int = key_width(table) + 12
+
+fn current_snapshot() -> Bytes = b"current snapshot".blake3()
+
+fn tree_number(tree: Tree) -> Int =
+  match tree { Facts -> 1, Past -> 2, Dependents -> 3, Inputs -> 4, Codes -> 5 }
+
+fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
+
+fn whole_table_after() -> Int = 256
+
+fn table_name(seg: Segment, table: Int) -> Bytes / {abort.raise} =
+  seg.token.concat(byte_of_int(table))
+
+fn loaded_rows<[r]>(
+  db: Database,
+  seg: Segment,
+  table: Int,
+) -> Bytes / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let name = table_name(seg, table);
+  match recent_reads.table(name) {
+    Some(rows) -> rows,
+    None -> match segments::table_rows[r](db.dir, seg, table) {
+      Some(rows) -> {
+        recent_reads.keep_table(name, rows);
+        rows
+      },
+      None -> fact_damage.damaged("a table does not match its checksum"),
+    },
+  }
+}
+
+fn row_in_segment<[r]>(
+  db: Database,
+  seg: Segment,
+  table: Int,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let name = table_name(seg, table);
+  match recent_reads.table(name) {
+    Some(rows) -> segments::row_of(rows, row_width(table), key),
+    None -> if recent_reads.lookups_in(name) >= whole_table_after() {
+      segments::row_of(loaded_rows[r](db, seg, table), row_width(table), key)
+    } else { segments::row_on_disk[r](db.dir, seg, table, key) },
+  }
+}
+
+type StoredRow = { token: Bytes, row: Bytes }
+
+fn stored_row<[r]>(
+  db: Database,
+  table: Int,
+  key: Bytes,
+) -> Option<StoredRow> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  iterate(db.manifest.segments.len() - 1, db.manifest.segments.len() + 1, |i: Int|
+    if i < 0 || db.starts_over { Stop(None) } else {
+      let seg = db.manifest.segments.get(i);
+      match row_in_segment[r](db, seg, table, key) {
+        Some(row) -> Stop(Some({ token: seg.token, row: row })),
+        None -> Continue(i - 1),
+      }
+    })
+
+fn table_value<[r]>(
+  db: Database,
+  table: Int,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match stored_row[r](db, table, key) {
+    None -> None,
+    Some(found) -> {
+      let at = key_width(table);
+      match segments::payload[r](
+          db.dir,
+          found.token,
+          segments::read_u64(found.row, at),
+          segments::read_u32(found.row, at + 8),
+        ) {
+        Some(bytes) -> Some(bytes),
+        None -> fact_damage.damaged("a stored value does not match its checksum"),
+      }
+    },
+  }
+
+fn decoded<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {fact_damage.damaged, abort.raise} =
+  match bin::decode(bytes, codec) {
+    Ok(value) -> value,
+    Err(_) -> fact_damage.damaged("a stored value does not decode"),
+  }
+
+fn node_at<[r]>(
+  db: Database,
+  hash: Bytes,
+) -> TreeNode / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match recent_reads.node(hash) {
+    Some(node) -> node,
+    None -> match table_value[r](db, nodes_table(), hash) {
+      Some(bytes) -> {
+        let node = decoded(bytes, tree_node_bin());
+        recent_reads.keep_node(hash, node);
+        node
+      },
+      None -> fact_damage.damaged("a snapshot names a tree node that is not stored"),
+    },
+  }
+
+fn node_limit() -> Int = 1048576
+
+pub fn with_recent_reads<a | e>(
+  work: () -> a / {recent_reads.read, recent_reads.write | e},
+) -> a / e =
+  handle {
+    work()
+  } with {
+    var nodes: Map<Bytes, TreeNode> = Map::new(),
+    var tables: Map<Bytes, Bytes> = Map::new(),
+    var lookups: Map<Bytes, Int> = Map::new(),
+    recent_reads.node(hash) -> nodes.get(hash),
+    recent_reads.keep_node(hash, node) -> {
+      nodes = if nodes.len() >= node_limit() { Map::new().insert(hash, node) }
+      else { nodes.insert(hash, node) };
+    },
+    recent_reads.table(name) -> tables.get(name),
+    recent_reads.keep_table(name, rows) -> {
+      tables = tables.insert(name, rows);
+    },
+    recent_reads.lookups_in(name) -> {
+      let count = match lookups.get(name) { Some(n) -> n, None -> 0 };
+      lookups = lookups.insert(name, count + 1);
+      count
+    },
+  }
+
+fn fresh_database(dir: String, manifest: Manifest) -> Database =
+  {
+    dir: dir,
+    manifest: manifest,
+    snapshot: Map::new(),
+    pending: Map::new(),
+    unwritten_log: Map::new(),
+    log_end: 0,
+    starts_over: false,
+    run: None,
+    token: b"",
+    writing: segments::new_writer(),
+    written_results: Map::new(),
+    written_past: Map::new(),
+    log_floor: 0,
+  }
+
+pub fn emptied(db: Database) -> Database =
+  {
+    ..fresh_database(db.dir, db.manifest),
+    starts_over: true,
+    run: db.run,
+    token: db.token,
+    writing: db.writing,
+  }
+
+type StoredState = { roots: List<fact_tree::TreeChild>, log_end: Int }
+
+derive bin for StoredState
+
+fn with_stored_state<[r]>(
+  opened: Database,
+) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  handle {
+    match table_value[r](opened, snapshots_table(), current_snapshot()) {
+      None -> opened,
+      Some(bytes) -> {
+        let state = decoded(bytes, stored_state_bin());
+        {
+          ..opened,
+          snapshot: state.roots.fold(Map::new(), |roots: Snapshot, child: fact_tree::TreeChild|
+            roots.insert(child.slot, child.root)),
+          log_end: state.log_end,
+        }
+      },
+    }
+  } with {
+    fact_damage.damaged(_) -> emptied(opened),
+  }
+
+pub fn read_only<[r]>(
+  dir: String,
+) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  with_stored_state[r](fresh_database(dir, segments::manifest[r](dir, schema())))
+
+pub fn open<[r]>(
+  dir: String,
+) -> Database / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
+  let manifest = segments::manifest[r](dir, schema());
+  let run = segments::start_run[r](dir);
+  with_stored_state[r]({
+    ..fresh_database(dir, manifest),
+    run: run,
+    token: segments::segment_token(run, manifest.generation, 0),
+    writing: if run == None { segments::failed_writer() } else { segments::new_writer() },
+  })
+}
+
+pub fn close<[r]>(db: Database) -> Unit / {fs.write[r]} = segments::end_run[r](db.run)
+
+fn pending_in(db: Database, tree: Int) -> Map<Bytes, Option<Bytes>> =
+  match db.pending.get(tree) { Some(entries) -> entries, None -> Map::new() }
+
+fn written(db: Database, tree: Int, key: Bytes, value: Option<Bytes>) -> Database =
+  { ..db, pending: db.pending.insert(tree, pending_in(db, tree).insert(key, value)) }
+
+pub fn with_value(db: Database, tree: Tree, key: Bytes, value: Bytes) -> Database =
+  written(db, tree_number(tree), key, Some(value))
+
+pub fn without_value(db: Database, tree: Tree, key: Bytes) -> Database =
+  written(db, tree_number(tree), key, None)
+
+pub fn value_of<[r]>(
+  db: Database,
+  tree: Tree,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let number = tree_number(tree);
+  match pending_in(db, number).get(key) {
+    Some(value) -> value,
+    None -> fact_tree::find(|hash: Bytes| node_at[r](db, hash), db.snapshot.get(number), key),
+  }
+}
+
+fn pending_under(
+  db: Database,
+  number: Int,
+  prefix: Bytes,
+) -> List<{ key: Bytes, value: Option<Bytes> }> = {
+  let unwritten = pending_in(db, number);
+  unwritten.range(
+    Some(prefix),
+    true,
+    Some(prefix.concat(b"\xff".repeat(64))),
+    true,
+    unwritten.len(),
+  )
+}
+
+pub fn entries_under<[r]>(
+  db: Database,
+  tree: Tree,
+  prefix: Bytes,
+) -> Map<Bytes, Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let number = tree_number(tree);
+  pending_under(db, number, prefix).fold(
+    fact_tree::entries_under(
+      |hash: Bytes| node_at[r](db, hash),
+      db.snapshot.get(number),
+      prefix,
+    ).fold(Map::new(), |found: Map<Bytes, Bytes>, entry: TreeEntry|
+      found.insert(entry.key, entry.value)),
+    |found: Map<Bytes, Bytes>, write: { key: Bytes, value: Option<Bytes> }|
+      match write.value {
+        Some(value) -> found.insert(write.key, value),
+        None -> found.remove(write.key),
+      },
+  )
+}
+
+pub fn members<[r]>(
+  db: Database,
+  tree: Tree,
+  key: Bytes,
+) -> List<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  entries_under[r](db, tree, key).keys().map(|pair: Bytes| pair.slice(key.len(), pair.len()))
+
+pub fn add_member(db: Database, tree: Tree, key: Bytes, member: Bytes) -> Database =
+  with_value(db, tree, key.concat(member), b"")
+
+pub fn remove_member(db: Database, tree: Tree, key: Bytes, member: Bytes) -> Database =
+  without_value(db, tree, key.concat(member))
+
+pub fn with_result<[r]>(
+  db: Database,
+  digest: Bytes,
+  bytes: Bytes,
+) -> Database / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  if db.written_results.contains(digest) || stored_row[r](db, results_table(), digest) != None {
+    db
+  } else {
+    let placed = segments::append_payload(db.writing, bytes);
+    {
+      ..db,
+      writing: segments::flush_when_full[r](db.dir, schema(), db.token, placed.writing),
+      written_results: db.written_results.insert(
+        digest,
+        u64_le(placed.at).concat(u32_le(bytes.len())),
+      ),
+    }
+  }
+
+pub fn result_of<[r]>(
+  db: Database,
+  digest: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match db.written_results.get(digest) {
+    None -> table_value[r](db, results_table(), digest),
+    Some(place) -> {
+      let at = segments::read_u64(place, 0);
+      match segments::pending_payload(db.writing, at) {
+        Some(bytes) -> Some(bytes),
+        None -> segments::payload[r](db.dir, db.token, at, segments::read_u32(place, 8)),
+      }
+    },
+  }
+
+pub fn with_shared_past<[r]>(
+  db: Database,
+  key: Bytes,
+  value: Bytes,
+) -> Database / {fs.write[r], abort.raise} = {
+  let placed = segments::append_payload(db.writing, value);
+  {
+    ..db,
+    writing: segments::flush_when_full[r](db.dir, schema(), db.token, placed.writing),
+    written_past: db.written_past.insert(
+      key.blake3(),
+      u64_le(placed.at).concat(u32_le(value.len())),
+    ),
+  }
+}
+
+pub fn shared_past<[r]>(
+  db: Database,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match db.written_past.get(key.blake3()) {
+    None -> table_value[r](db, past_table(), key.blake3()),
+    Some(place) -> {
+      let at = segments::read_u64(place, 0);
+      match segments::pending_payload(db.writing, at) {
+        Some(bytes) -> Some(bytes),
+        None -> segments::payload[r](db.dir, db.token, at, segments::read_u32(place, 8)),
+      }
+    },
+  }
+
+pub fn commit_shared<[r]>(
+  db: Database,
+  live_results: (List<Bytes>) -> Map<Bytes, Bool> / {abort.raise},
+) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  if db.written_results.len() + db.written_past.len() > 0 {
+    match segments::finish[r](db.dir, schema(), db.token, db.writing, [
+        segments::table(results_table(), db.written_results, |_: Bytes, rest: Bytes| Some(rest)),
+        segments::table(past_table(), db.written_past, |_: Bytes, rest: Bytes| Some(rest)),
+      ]) {
+      None -> (),
+      Some(seg) -> match if db.starts_over {
+          segments::replace_merged[r](
+            db.dir,
+            schema(),
+            segments::manifest[r](db.dir, schema()),
+            0,
+            seg,
+            true,
+          )
+        } else { segments::commit[r](db.dir, schema(), seg, durable: true) } {
+        Committed(m) -> {
+          let merged = { ..fresh_database(db.dir, m), run: db.run };
+          merge_tail[r](merged, |current: Database|
+            live_results(
+              stored_values[r](current, located_rows[r](current, m.segments, past_table())),
+            ))
+        },
+        _ -> (),
+      },
+    }
+  }
+
+pub fn with_log_floor(db: Database, floor: Int) -> Database = { ..db, log_floor: floor }
+
+pub fn append_change(db: Database, changes: List<Bytes>) -> Database / {abort.raise} = {
+  let offset = db.log_end + 1;
+  {
+    ..db,
+    unwritten_log: db.unwritten_log.insert(offset, bin::encode(changes, changes_codec())),
+    log_end: offset,
+  }
+}
+
+pub fn changes_after<[r]>(
+  db: Database,
+  offset: Int,
+) -> List<LogEntry> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  range(offset + 1, db.log_end + 1).map(|at: Int| {
+    let bytes = match db.unwritten_log.get(at) {
+      Some(unwritten) -> Some(unwritten),
+      None -> table_value[r](db, changes_table(), u64_be(at)),
+    };
+    match bytes {
+      Some(stored) -> { offset: at, changes: decoded(stored, changes_codec()) },
+      None -> fact_damage.damaged("the change log has a gap"),
+    }
+  })
+
+pub fn log_end(db: Database) -> Int = db.log_end
+
+pub type StoredProduct = { at: Int, value: Bytes }
+
+pub fn stored_product<[r]>(
+  db: Database,
+  product: String,
+) -> Option<StoredProduct> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match table_value[r](db, cursors_table(), Bytes::of_string(product).blake3()) {
+    Some(bytes) -> match bytes.u64_at(0) {
+      Some(at) -> Some({ at: at, value: bytes.slice(8, bytes.len()) }),
+      None -> fact_damage.damaged("a stored product has no log position"),
+    },
+    None -> None,
+  }
+
+type RowDraft = { writing: SegmentWriter, rows: Map<Bytes, Bytes> }
+
+fn drafted_rows<[r]>(
+  db: Database,
+  token: Bytes,
+  writing: SegmentWriter,
+  frames: Map<Bytes, Bytes>,
+) -> RowDraft / {fs.write[r], abort.raise} =
+  frames.fold(
+    { writing: writing, rows: Map::new() },
+    |draft: RowDraft, key: Bytes, payload: Bytes| {
+      let placed = segments::append_payload(draft.writing, payload);
+      {
+        writing: segments::flush_when_full[r](db.dir, schema(), token, placed.writing),
+        rows: draft.rows.insert(key, u64_le(placed.at).concat(u32_le(payload.len()))),
+      }
+    },
+  )
+
+type SegmentDraft = { writing: SegmentWriter, tables: List<segments::Table> }
+
+fn finished_segment<[r]>(
+  db: Database,
+  token: Bytes,
+  writing: SegmentWriter,
+  frames: Map<Int, Map<Bytes, Bytes>>,
+  placed_results: Map<Bytes, Bytes>,
+) -> Option<Segment> / {fs.write[r], abort.raise} = {
+  let drafted = frames.fold(
+    { writing: writing, tables: [] },
+    |draft: SegmentDraft, table: Int, table_frames: Map<Bytes, Bytes>| {
+      let rows = drafted_rows[r](db, token, draft.writing, table_frames);
+      {
+        writing: rows.writing,
+        tables: draft.tables.push(
+          segments::table(table, rows.rows, |_: Bytes, rest: Bytes| Some(rest)),
+        ),
+      }
+    },
+  );
+  segments::finish[r](
+    db.dir,
+    schema(),
+    token,
+    drafted.writing,
+    drafted.tables.push(
+      segments::table(results_table(), placed_results, |_: Bytes, rest: Bytes| Some(rest)),
+    ),
+  )
+}
+
+fn tokens(listed: List<Segment>) -> List<Bytes> = listed.map(|seg: Segment| seg.token)
+
+fn only_cursors_since(before: Manifest, now: Manifest) -> Bool = {
+  let count = before.segments.len();
+  tokens(now.segments.take(count)) == tokens(before.segments)
+    && now.segments.drop(count).all(|seg: Segment|
+      seg.parts.all(|part: segments::TableEntry| part.table == cursors_table()))
+}
+
+type Rewrite = { snapshot: Snapshot, fresh: Map<Bytes, Bytes> }
+
+fn rewritten<[r]>(
+  db: Database,
+) -> Rewrite / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  db.pending.fold(
+    { snapshot: db.snapshot, fresh: Map::new() },
+    |rewrite: Rewrite, tree: Int, entries: Map<Bytes, Option<Bytes>>| {
+      let update = fact_tree::updated(
+        |hash: Bytes| node_at[r](db, hash),
+        rewrite.snapshot.get(tree),
+        entries.entries(),
+        rewrite.fresh,
+      );
+      {
+        snapshot: match update.root {
+          Some(root) -> rewrite.snapshot.insert(tree, root),
+          None -> rewrite.snapshot.remove(tree),
+        },
+        fresh: update.fresh,
+      }
+    },
+  )
+
+fn commit_frames<[r]>(
+  db: Database,
+  rewrite: Rewrite,
+) -> Map<Int, Map<Bytes, Bytes>> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  Map::of_entries([
+    {
+      key: nodes_table(),
+      value: rewrite.fresh.fold(
+        Map::new(),
+        |frames: Map<Bytes, Bytes>, hash: Bytes, bytes: Bytes|
+          if stored_row[r](db, nodes_table(), hash) == None { frames.insert(hash, bytes) }
+          else { frames },
+      ),
+    },
+    {
+      key: changes_table(),
+      value: db.unwritten_log.fold(
+        Map::new(),
+        |frames: Map<Bytes, Bytes>, offset: Int, bytes: Bytes| frames.insert(u64_be(offset), bytes),
+      ),
+    },
+    {
+      key: snapshots_table(),
+      value: Map::new().insert(
+        current_snapshot(),
+        bin::encode(
+          {
+            roots: rewrite.snapshot.fold(
+              [],
+              |roots: List<fact_tree::TreeChild>, tree: Int, root: TreeRoot|
+                roots.push({ slot: tree, root: root }),
+            ),
+            log_end: db.log_end,
+          },
+          stored_state_bin(),
+        ),
+      ),
+    },
+  ])
+
+fn removed_after_refusal<[r]>(
+  db: Database,
+  result: CommitResult,
+) -> CommitResult / {fs.write[r], abort.raise} =
+  match result {
+    Committed(_) -> result,
+    WriteFailed -> result,
+    _ -> {
+      fs.remove[r](segments::segment_path(db.dir, db.token));
+      result
+    },
+  }
+
+pub fn commit<[r]>(
+  db: Database,
+  live_results: (Database) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> CommitResult / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let rewrite = rewritten[r](db);
+  if rewrite.snapshot == db.snapshot && db.unwritten_log.len() == 0 && !db.starts_over
+      && db.written_results.len() == 0 { Committed(db.manifest) } else {
+    match finished_segment[r](
+        db,
+        db.token,
+        db.writing,
+        commit_frames[r](db, rewrite),
+        db.written_results,
+      ) {
+      None -> WriteFailed,
+      Some(seg) -> {
+        let now = segments::manifest[r](db.dir, schema());
+        let installed = if only_cursors_since(db.manifest, now) {
+          segments::replace_merged[r](
+            db.dir,
+            schema(),
+            now,
+            if db.starts_over { 0 } else { now.segments.len() },
+            seg,
+            true,
+          )
+        } else { StoreChanged };
+        match installed {
+          Committed(m) -> {
+            merge_tail[r](
+              {
+                ..fresh_database(db.dir, m),
+                snapshot: rewrite.snapshot,
+                log_end: db.log_end,
+                log_floor: db.log_floor,
+                run: db.run,
+              },
+              live_results,
+            );
+            installed
+          },
+          _ -> removed_after_refusal[r](db, installed),
+        }
+      },
+    }
+  }
+}
+
+type Located = { token: Bytes, offset: Int, size: Int }
+
+fn located_rows<[r]>(
+  db: Database,
+  merging: List<Segment>,
+  table: Int,
+) -> Map<Bytes, Located> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  merging.fold(Map::new(), |found: Map<Bytes, Located>, seg: Segment| {
+    let rows = loaded_rows[r](db, seg, table);
+    let width = row_width(table);
+    let keys = key_width(table);
+    segments::rows_folded(rows.len() / width, found, |into: Map<Bytes, Located>, i: Int| {
+      let row = rows.slice(i * width, (i + 1) * width);
+      into.insert(row.slice(0, keys), {
+        token: seg.token,
+        offset: segments::read_u64(row, keys),
+        size: segments::read_u32(row, keys + 8),
+      })
+    })
+  })
+
+fn all_tables() -> List<Int> = range(1, 7)
+
+type Rewriting = { writing: SegmentWriter, tables: List<segments::Table> }
+
+type RowToCopy = { key: Bytes, at: Located }
+
+type Chunk = { token: Bytes, start: Int, end: Int, rows: List<RowToCopy> }
+
+fn copy_chunk_size() -> Int = 16777216
+
+fn chunks_in_file_order(located: Map<Bytes, Located>) -> List<Chunk> = {
+  let files = located.fold(Map::new(), |found: Map<Bytes, Int>, _: Bytes, at: Located|
+    if found.contains(at.token) { found } else { found.insert(at.token, found.len()) });
+  let ordered = located.fold(Map::new(), |by: Map<Int, RowToCopy>, key: Bytes, at: Located|
+    by.insert(
+      (match files.get(at.token) { Some(i) -> i, None -> 0 }) * 1099511627776 + at.offset,
+      { key: key, at: at },
+    ));
+  ordered.fold([], |chunks: List<Chunk>, _: Int, row: RowToCopy| {
+    let size = segments::framed_len(row.at.size);
+    match chunks.at(chunks.len() - 1) {
+      Some(last) -> if last.token == row.at.token && last.end == row.at.offset
+          && last.end - last.start < copy_chunk_size() {
+        chunks.set(chunks.len() - 1, { ..last, end: last.end + size, rows: last.rows.push(row) })
+      } else {
+        chunks.push({
+          token: row.at.token,
+          start: row.at.offset,
+          end: row.at.offset + size,
+          rows: [row],
+        })
+      },
+      None ->
+        chunks.push({
+          token: row.at.token,
+          start: row.at.offset,
+          end: row.at.offset + size,
+          rows: [row],
+        }),
+    }
+  })
+}
+
+fn chunk_bytes<[r]>(
+  db: Database,
+  chunk: Chunk,
+) -> Bytes / {fs.read[r], fact_damage.damaged, abort.raise} =
+  match segments::read_range[r](
+      segments::segment_path(db.dir, chunk.token),
+      chunk.start,
+      chunk.end - chunk.start,
+    ) {
+    Some(bytes) -> bytes,
+    None -> fact_damage.damaged("a segment is shorter than its table says"),
+  }
+
+fn stored_values<[r]>(
+  db: Database,
+  located: Map<Bytes, Located>,
+) -> List<Bytes> / {fs.read[r], fact_damage.damaged, abort.raise} =
+  chunks_in_file_order(located).fold([], |values: List<Bytes>, chunk: Chunk| {
+    let bytes = chunk_bytes[r](db, chunk);
+    chunk.rows.fold(values, |found: List<Bytes>, row: RowToCopy| {
+      let from = row.at.offset - chunk.start;
+      match segments::unframed(bytes.slice(from, from + segments::framed_len(row.at.size))) {
+        Some(value) -> found.push(value),
+        None -> found,
+      }
+    })
+  })
+
+fn table_copied<[r]>(
+  db: Database,
+  token: Bytes,
+  draft: Rewriting,
+  table: Int,
+  located: Map<Bytes, Located>,
+) -> Rewriting / {fs.read[r], fs.write[r], fact_damage.damaged, abort.raise} = {
+  let copied = chunks_in_file_order(located).fold(
+    { writing: draft.writing, rows: Map::new() },
+    |sofar: RowDraft, chunk: Chunk| {
+      let put = segments::append_frames(sofar.writing, chunk_bytes[r](db, chunk));
+      {
+        writing: segments::flush_when_full[r](db.dir, schema(), token, put.writing),
+        rows: chunk.rows.fold(sofar.rows, |rows: Map<Bytes, Bytes>, row: RowToCopy|
+          rows.insert(
+            row.key,
+            u64_le(put.at + row.at.offset - chunk.start).concat(u32_le(row.at.size)),
+          )),
+      }
+    },
+  );
+  {
+    writing: copied.writing,
+    tables: draft.tables.push(
+      segments::table(table, copied.rows, |_: Bytes, rest: Bytes| Some(rest)),
+    ),
+  }
+}
+
+fn rewritten_segments<[r]>(
+  db: Database,
+  m: Manifest,
+  from: Int,
+  token: Bytes,
+  stored: (Int, Bytes) -> Bool / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> Bool / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let merging = m.segments.drop(from);
+  let draft = all_tables().fold(
+    { writing: segments::new_writer(), tables: [] },
+    |sofar: Rewriting, table: Int|
+      table_copied[r](
+        db,
+        token,
+        sofar,
+        table,
+        located_rows[r](db, merging, table).fold(
+          Map::new(),
+          |found: Map<Bytes, Located>, key: Bytes, at: Located|
+            if stored(table, key) { found.insert(key, at) } else { found },
+        ),
+      ),
+  );
+  match segments::finish[r](db.dir, schema(), token, draft.writing, draft.tables) {
+    None -> false,
+    Some(seg) -> match segments::replace_merged[r](db.dir, schema(), m, from, seg, true) {
+      Committed(_) -> true,
+      _ -> {
+        fs.remove[r](segments::segment_path(db.dir, token));
+        false
+      },
+    },
+  }
+}
+
+fn merge_tail<[r]>(
+  db: Database,
+  live_results: (Database) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let m = db.manifest;
+  let from = segments::merge_start(m);
+  if from < m.segments.len() - 1 {
+    let token = segments::segment_token(db.run, m.generation, 1);
+    if from > 0 {
+      rewritten_segments[r](db, m, from, token, |_: Int, _: Bytes| true);
+      ()
+    } else {
+      let nodes = tree_nodes[r](db, db.snapshot.values());
+      let results = live_results(db);
+      rewritten_segments[r](db, m, 0, token, |table: Int, key: Bytes|
+        if table == nodes_table() { nodes.contains(key) }
+        else if table == results_table() { results.contains(key) }
+        else if table == changes_table() {
+          match key.u64_be_at(0) { Some(offset) -> offset > db.log_floor, None -> true }
+        } else { true });
+      ()
+    }
+  };
+  match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run), None -> () }
+}
+
+pub fn store_product<[r]>(
+  db: Database,
+  product: String,
+  stored: StoredProduct,
+) -> CommitResult / {fs.read[r], fs.write[r], abort.raise} =
+  match segments::start_run[r](db.dir) {
+    None -> WriteFailed,
+    Some(run) -> {
+      let token = segments::segment_token(Some(run), db.manifest.generation, 2);
+      let result = match finished_segment[r](
+          db,
+          token,
+          segments::new_writer(),
+          Map::new().insert(
+            cursors_table(),
+            Map::new().insert(
+              Bytes::of_string(product).blake3(),
+              u64_le(stored.at).concat(stored.value),
+            ),
+          ),
+          Map::new(),
+        ) {
+        None -> WriteFailed,
+        Some(seg) -> segments::commit[r](db.dir, schema(), seg, durable: true),
+      };
+      segments::end_run[r](Some(run));
+      result
+    },
+  }
+
+fn tree_nodes<[r]>(
+  db: Database,
+  roots: List<TreeRoot>,
+) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  iterate(
+    { found: Map::new(), work: roots, next: 0 },
+    1099511627776,
+    |walk: { found: Map<Bytes, Bool>, work: List<TreeRoot>, next: Int }|
+      match walk.work.at(walk.next) {
+        None -> Stop(walk.found),
+        Some(root) -> if walk.found.contains(root.hash) {
+          Continue({ ..walk, next: walk.next + 1 })
+        } else {
+          let marked = walk.found.insert(root.hash, true);
+          Continue(match node_at[r](db, root.hash) {
+            fact_tree::Bucket(_) -> { ..walk, found: marked, next: walk.next + 1 },
+            fact_tree::Branch(branch) ->
+              {
+                found: marked,
+                work: branch.children.fold(
+                  walk.work,
+                  |all: List<TreeRoot>, child: fact_tree::TreeChild| all.push(child.root),
+                ),
+                next: walk.next + 1,
+              },
+          })
+        },
+      },
+  )
+
+pub type Compaction = { bytes_before: Int, bytes_after: Int }
+
+fn store_bytes(m: Manifest) -> Int = m.segments.fold(0, |n: Int, seg: Segment| n + seg.size)
+
+pub fn compact<[r]>(
+  db: Database,
+  live_results: Map<Bytes, Bool>,
+) -> Compaction / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let m = segments::manifest[r](db.dir, schema());
+  let nodes = tree_nodes[r](db, db.snapshot.values());
+  let done = m.segments.len() == 0
+    || rewritten_segments[r](
+      { ..db, manifest: m },
+      m,
+      0,
+      segments::segment_token(db.run, m.generation, 3),
+      |table: Int, key: Bytes|
+        if table == nodes_table() { nodes.contains(key) }
+        else if table == results_table() { live_results.contains(key) }
+        else { true },
+    );
+  let after = segments::manifest[r](db.dir, schema());
+  match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run), None -> () };
+  {
+    bytes_before: store_bytes(m),
+    bytes_after: if done { store_bytes(after) } else { store_bytes(m) },
+  }
+}
+
+pub fn store_size(db: Database) -> { segments: Int, bytes: Int } =
+  { segments: db.manifest.segments.len(), bytes: store_bytes(db.manifest) }
+
+fn key_of(text: String) -> Bytes = Bytes::of_string(text).blake3()
+
+fn sample_change(name: String) -> Bytes = key_of(name)
+
+fn first_edit(db: Database) -> Database / {abort.raise} =
+  append_change(
+    add_member(
+      with_value(db, Facts, key_of("first"), b"one"),
+      Dependents,
+      key_of("first"),
+      key_of("reader"),
+    ),
+    [sample_change("first")],
+  )
+
+fn second_edit(db: Database) -> Database / {abort.raise} =
+  append_change(
+    add_member(
+      remove_member(
+        with_value(without_value(db, Facts, key_of("first")), Facts, key_of("second"), b"two"),
+        Dependents,
+        key_of("first"),
+        key_of("reader"),
+      ),
+      Dependents,
+      key_of("first"),
+      key_of("other reader"),
+    ),
+    [sample_change("second")],
+  )
+
+fn in_store<a, [r] | e>(
+  go: (Database) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e},
+) -> a / {fs.read[r], fs.write[r], abort.raise | e} =
+  with_recent_reads(|| {
+    let db = open[r]("facts");
+    let value = undamaged(|| go(db));
+    close[r](db);
+    value
+  })
+
+pub fn undamaged<a | e>(go: () -> a / {fact_damage.damaged | e}) -> a / {abort.raise | e} =
+  handle {
+    go()
+  } with {
+    fact_damage.damaged(reason) -> panic("the fact database is damaged: " ++ reason),
+  }
+
+fn no_results(db: Database) -> Map<Bytes, Bool> = Map::new()
+
+fn committed<[r]>(
+  db: Database,
+) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match commit[r](db, no_results) {
+    Committed(_) -> (),
+    other -> panic("the commit failed: " ++ show(other)),
+  }
+
+fn after_first(tree: fs::MemFs) -> fs::MemFs / {abort.raise} =
+  fs::on_mem[abs](tree, || in_store[abs](|db: Database| committed[abs](first_edit(db)))).tree
+
+fn value_stored(tree: fs::MemFs, key: Bytes) -> Option<Bytes> / {abort.raise} =
+  fs::on_mem[abs](tree, || in_store[abs](|db: Database| value_of[abs](db, Facts, key))).value
+
+fn dependents_stored(tree: fs::MemFs) -> List<Bytes> / {abort.raise} =
+  fs::on_mem[abs](tree, ||
+    in_store[abs](|db: Database| members[abs](db, Dependents, key_of("first")))).value
+
+fn log_stored(tree: fs::MemFs, after: Int) -> List<LogEntry> / {abort.raise} =
+  fs::on_mem[abs](tree, || in_store[abs](|db: Database| changes_after[abs](db, after))).value
+
+test "a commit makes the writes visible to a reopened database" {
+  let tree = after_first(fs::mem_of([]));
+  assert_eq(value_stored(tree, key_of("first")), Some(b"one"));
+  assert_eq(dependents_stored(tree), [key_of("reader")])
+}
+
+test "a member removed in a later snapshot stays removed, and one added later is found beside the older ones" {
+  let tree = fs::on_mem[abs](after_first(fs::mem_of([])), ||
+    in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
+  assert_eq(dependents_stored(tree), [key_of("other reader")]);
+  assert_eq(value_stored(tree, key_of("first")), None);
+  assert_eq(value_stored(tree, key_of("second")), Some(b"two"))
+}
+
+test "rows at one offset of two files are both listed" {
+  let located = Map::new().insert(b"first", { token: b"one", offset: 20, size: 4 }).insert(
+    b"second",
+    { token: b"two", offset: 20, size: 4 },
+  );
+  assert_eq(
+    chunks_in_file_order(located).flat_map(|chunk: Chunk|
+      chunk.rows.map(|row: RowToCopy| row.key)).sort(
+    ),
+    [b"first", b"second"],
+  )
+}
+
+test "a result is found by its digest in the run that wrote it and after a commit" {
+  let digest = key_of("result");
+  let written = fs::on_mem[abs](fs::mem_of([]), ||
+    in_store[abs](|db: Database| {
+      let held = with_result[abs](db, digest, b"value");
+      assert_eq(result_of[abs](held, digest), Some(b"value"));
+      committed[abs](held)
+    }));
+  let read = fs::on_mem[abs](written.tree, ||
+    in_store[abs](|db: Database| result_of[abs](db, digest)));
+  assert_eq(read.value, Some(b"value"))
+}
+
+test "reading the log returns the entries after an offset" {
+  let tree = fs::on_mem[abs](after_first(fs::mem_of([])), ||
+    in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
+  assert_eq(log_stored(tree, 0).map(|e: LogEntry| e.offset), [1, 2]);
+  assert_eq(log_stored(tree, 1).map(|e: LogEntry| e.changes), [[sample_change("second")]])
+}
+
+test "each kind of product keeps its own position and value" {
+  let tree = after_first(fs::mem_of([]));
+  let stored = fs::on_mem[abs](tree, ||
+    in_store[abs](|db: Database| {
+      store_product[abs](db, "tests", { at: 1, value: b"passed" });
+      ()
+    })).tree;
+  let at = fs::on_mem[abs](stored, ||
+    in_store[abs](|db: Database|
+      [stored_product[abs](db, "tests"), stored_product[abs](db, "proofs")]));
+  assert_eq(at.value, [Some({ at: 1, value: b"passed" }), None])
+}
+
+test "a product stored while an edit runs does not fail the edit's commit" {
+  let raced = fs::on_mem[abs](after_first(fs::mem_of([])), ||
+    in_store[abs](|db: Database| {
+      store_product[abs](db, "tests", { at: 1, value: b"" });
+      commit[abs](second_edit(db), no_results)
+    }));
+  assert(match raced.value { Committed(_) -> true, _ -> false });
+  assert_eq(value_stored(raced.tree, key_of("second")), Some(b"two"))
+}
+
+test "a run that started from an older snapshot cannot commit, so a snapshot never mixes two edits" {
+  let raced = fs::on_mem[abs](after_first(fs::mem_of([])), ||
+    in_store[abs](|db: Database| {
+      in_store[abs](|other: Database| committed[abs](second_edit(other)));
+      commit[abs](with_value(db, Facts, key_of("third"), b"three"), no_results)
+    }));
+  assert_eq(raced.value, StoreChanged);
+  assert_eq(value_stored(raced.tree, key_of("third")), None)
+}
+
+test "a disk that fails at any write leaves the old snapshot or the whole new one" {
+  let start = after_first(fs::mem_of([]));
+  iterate(0, 1000, |n: Int| {
+    let died = fs::on_mem_failing[abs](start, n, ||
+      in_store[abs](|db: Database| commit[abs](second_edit(db), no_results)));
+    let first = value_stored(died.tree, key_of("first"));
+    let second = value_stored(died.tree, key_of("second"));
+    assert(first != second);
+    if second == Some(b"two") && died.value != WriteFailed { Stop(()) } else { Continue(n + 1) }
+  })
+}
+
+test "a tree node that fails its checksum raises `damaged`, and starting over replaces the store" {
+  let tree = after_first(fs::mem_of([]));
+  let names = match fs::listed_names(fs::mem_list(tree, "facts")) { Some(n) -> n, None -> [] };
+  let segment = "facts/" ++ names.filter(|n: String| n.starts_with("seg-")).get(0);
+  let bytes = match fs::mem_read(tree, segment) { Some(b) -> b, None -> b"" };
+  let damaged = fs::on_mem[abs](tree, ||
+    with_recent_reads(|| {
+      let db = open[abs]("facts");
+      fs.write_file[abs](
+        segment,
+        Bytes::concat_all([bytes.slice(0, 60), b"\x00".repeat(bytes.len() - 60)]),
+      );
+      handle {
+        value_of[abs](db, Facts, key_of("first")) == None
+      } with {
+        fact_damage.damaged(_) -> {
+          committed_over[abs](emptied(db));
+          true
+        },
+      }
+    }));
+  assert(damaged.value);
+  assert_eq(value_stored(damaged.tree, key_of("first")), None)
+}
+
+fn committed_over<[r]>(
+  db: Database,
+) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} =
+  handle {
+    committed[r](with_value(db, Facts, key_of("restart"), b"new"))
+  } with {
+    fact_damage.damaged(reason) -> panic(reason),
+  }
+
+test "a snapshot that returns to an earlier state writes no tree nodes, because nodes are stored by their hash" {
+  let flip = |value: Bytes| |db: Database| with_value(db, Facts, key_of("first"), value);
+  let sized = |tree: fs::MemFs, value: Bytes|
+    fs::on_mem[abs](tree, ||
+      in_store[abs](|db: Database| {
+        committed[abs](flip(value)(db));
+        ()
+      })).tree;
+  let one = sized(fs::mem_of([]), b"a");
+  let two = sized(one, b"b");
+  let back = sized(two, b"a");
+  let size_of = |tree: fs::MemFs|
+    fs::on_mem[abs](tree, || in_store[abs](|db: Database| store_size(db).bytes)).value;
+  assert(size_of(back) - size_of(two) < 400)
+}
+
+test "a compaction drops what the snapshot no longer uses, and keeps every value it uses" {
+  let tree = fs::on_mem[abs](after_first(fs::mem_of([])), ||
+    in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
+  let squeezed = fs::on_mem[abs](tree, ||
+    in_store[abs](|db: Database| compact[abs](db, Map::new())));
+  assert(squeezed.value.bytes_after <= squeezed.value.bytes_before);
+  assert_eq(value_stored(squeezed.tree, key_of("second")), Some(b"two"));
+  assert_eq(log_stored(squeezed.tree, 0).len(), 2)
+}

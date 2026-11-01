@@ -3,24 +3,17 @@ import compiler.store.memo (QueryStats)
 import compiler.unit (shipped)
 import std.random (entropy)
 import builder (builder)
-import args (Flags, style_of, no_flags)
+import args (Flags, style_of)
 import update_costs (costs_of, cost_checker, has_promises, report_reuse_violations, report_lines,
                      unresolved)
 import literals (evaluation, evaluation_errors)
 import diagnostic (SourceText, all_to_json, to_text)
-import program (Program, TimedLoad, ModuleReport, timed_over, module_reports, definitions_in_order,
-                own_tests, project_sources, location_of, whole_of, no_program, program_view,
-                cached_command, cache_command, encoded_paths)
-import module_queries
-import module_queries (command_key)
+import program (Program, TimedLoad, ModuleReport, timed_load, module_reports, definitions_in_order,
+                own_tests, location_of, whole_of, no_program, program_view, clean_summary,
+                later_checks_passed)
+import compiler.front.checking.groups (ProgramSummary)
 import compiler.cc (toolchain)
-import paths
-import paths (ResolvedPath)
-import sources (Project, load_resolved)
-import std.bytes
 import compiler.store.hash.encoding (hex)
-import std.bin
-import std.hash (blake3)
 import report (CommandOutput, ok_code, count_of, indent, rejected, reuse_members, warning_lines,
                with_front_end)
 import signature (SetLine, Provenance, counted_lines, effect_sets, head_lines, provenance,
@@ -33,20 +26,17 @@ import compiler.front.facts (CheckedProgram, Frame, written_functions_of, tests_
 import compiler.front.rows (Outline)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, EffectInfo, OperationInfo, Location,
                                      Raise, RequirementNotShown, UnguardedBuiltin, RaisingCall)
-import compiler.check.infer (dump_flag)
 import compiler.check.resolve.tables (Diagnostic, Label)
 import compiler.check.types (Effect, Type, NamedType, printer_new, print_effect_list, scheme_text,
                              type_text, effect_text, named_type)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise)
 import std.fs (fs)
-import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, parse_string,
-                 to_string, int)
+import std.json (Json, Member, Str, Bool, Array, Null, object, int)
 import std.time (time)
 import std.list
 import std.string
 import definitions (scheme_of, listed_effects_text)
 import proof.obligation (plural)
-import compiler.front.interface (length_prefixed)
 import compiler.syntax.parsing (dummy_span, span_between)
 
 fn types_indent() -> Int = 5
@@ -716,65 +706,6 @@ fn checked(
   }
 }
 
-type CachedOutput = { lines: List<String>, errs: List<String>, code: Int, json: String }
-
-derive bin for CachedOutput
-
-fn command_identity(flags: Flags) -> Bytes =
-  Bytes::concat_all([
-    length_prefixed(b"ply check"),
-    dump_flag(flags.json),
-    dump_flag(flags.types),
-    dump_flag(flags.costs),
-    dump_flag(flags.color),
-    dump_flag(flags.verify_dependencies),
-    length_prefixed(Bytes::of_string(flags.root)),
-    encoded_paths(flags.paths),
-  ])
-
-fn encode_output(a: CommandOutput) -> Bytes / {abort.raise} =
-  bin::encode(
-    { lines: a.lines, errs: a.errs, code: a.code, json: to_string(a.json) },
-    cached_output_bin(),
-  )
-
-fn decode_output(entry: Option<Bytes>) -> Option<CommandOutput> / {abort.raise} =
-  match entry {
-    None -> None,
-    Some(bytes) -> match bin::decode(bytes, cached_output_bin()) {
-      Err(_) -> None,
-      Ok(r) -> match parse_string(r.json) {
-        Ok(json) -> Some({ json: json, lines: r.lines, errs: r.errs, code: r.code }),
-        Err(_) -> None,
-      },
-    },
-  }
-
-fn with_front_end_member(a: CommandOutput, front: (Json) -> Json) -> CommandOutput =
-  match a.json {
-    Object(members) ->
-      {
-        ..a,
-        json: Object(
-          members.insert(
-            "front_end",
-            front(match members.get("front_end") { Some(f) -> f, None -> Null }),
-          ),
-        ),
-      },
-    _ -> a,
-  }
-
-fn merged_members(front: Json, added_members: List<Member>) -> Json =
-  match front {
-    Object(members) ->
-      Object(
-        added_members.fold(members, |accumulator: Map<String, Json>, m: Member|
-          accumulator.insert(m.key, m.value)),
-      ),
-    _ -> object(added_members),
-  }
-
 fn rejected_load(flags: Flags, timed: TimedLoad) -> CommandOutput / {abort.raise} = {
   let style = style_of(flags);
   let output = with_front_end(
@@ -787,71 +718,39 @@ fn rejected_load(flags: Flags, timed: TimedLoad) -> CommandOutput / {abort.raise
   else { { ..output, lines: phase_lines(style, timed).concat(tally_lines(style, timed.program)) } }
 }
 
-fn check_now(
-  flags: Flags,
-  project: Project,
-  started: Int,
-) -> { result: CommandOutput, recorded: Option<CommandOutput>, program: Program } / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_view_used, toolchain.reuse_dir} = {
-  let t: TimedLoad = timed_over(flags.paths, project, started, flags.verify_dependencies);
-  match t.program.frame {
-    None -> { result: rejected_load(flags, t), recorded: None, program: t.program },
-    Some(f) -> {
-      let result = checked(style_of(flags), flags, t, f);
-      { result: result, recorded: Some(result), program: t.program }
-    },
-  }
-}
+fn summary_line(style: Style, summary: ProgramSummary) -> String / {abort.raise} =
+  indent() ++ green(style, "checked") ++ " " ++ count_of(summary.modules, "module") ++ ", "
+    ++ count_of(summary.definitions, "definition")
+    ++ ", "
+    ++ count_of(summary.tests, "test")
+
+fn only_summary_wanted(flags: Flags) -> Bool =
+  !flags.json && !flags.types && !flags.costs && !flags.explain && !flags.verify_dependencies
+    && !flags.no_cache
 
 pub fn run(
   flags: Flags,
 ) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let started = time.elapsed_ms();
-  let project = load_resolved(flags.paths);
-  if flags.explain { check_now(flags, project, started).result } else {
-    let key = command_key(module_queries::program_digest(), command_identity(flags));
-    let shown = key.hex_of();
-    match decode_output(cached_command(flags.paths, project, key)) {
-      Some(result) -> if !flags.json { result } else {
-        with_front_end_member(result, |_: Json|
-          object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(shown) }]))
+  match if only_summary_wanted(flags) { clean_summary(flags.paths) } else { None } {
+    Some(summary) ->
+      {
+        json: object([]),
+        lines: [summary_line(style_of(flags), summary)],
+        errs: [],
+        code: ok_code(),
       },
-      None -> {
-        let now = check_now(flags, project, started);
-        let recorded = match now.recorded {
-          Some(own) -> cache_command(flags.paths, project, key, now.program, encode_output(own)),
-          None -> false,
-        };
-        if !flags.json { now.result } else {
-          with_front_end_member(now.result, |front: Json|
-            merged_members(front, [
-              { key: "reused", value: Bool(false) },
-              { key: "key", value: Str(shown) },
-              { key: "filed", value: Bool(recorded) },
-            ]))
-        }
-      },
-    }
+    None -> {
+      let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
+      match t.program.frame {
+        None -> rejected_load(flags, t),
+        Some(f) -> {
+          let output = checked(style_of(flags), flags, t, f);
+          if output.code == ok_code() { later_checks_passed(flags.paths, t.program.log_position) };
+          output
+        },
+      }
+    },
   }
-}
-
-test "a check's cache key changes with its paths and result-changing flags, and a cached check result encodes and decodes to the same value" {
-  let flags = { ..no_flags(), paths: [paths::here()] };
-  let base = command_identity(flags);
-  assert_eq(command_identity(flags), base);
-  assert(command_identity({ ..flags, types: true }) != base);
-  assert(command_identity({ ..flags, json: true }) != base);
-  assert(command_identity({ ..flags, costs: true }) != base);
-  assert(command_identity({ ..flags, color: true }) != base);
-  assert(command_identity({ ..flags, verify_dependencies: true }) != base);
-  assert(command_identity({ ..flags, paths: [paths::at_cwd("app")] }) != base);
-  let result: CommandOutput = {
-    json: object([{ key: "ok", value: Bool(true) }]),
-    lines: ["   checked 1 module"],
-    errs: ["a note"],
-    code: 0,
-  };
-  assert_eq(decode_output(Some(encode_output(result))), Some(result));
-  assert_eq(decode_output(Some(b"not a result")), None)
 }
 
 test "`percent_text` prints a share to one decimal place and prints 0.0% instead of dividing when the total time is zero" {

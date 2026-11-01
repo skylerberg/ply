@@ -1,7 +1,9 @@
+import std.bin
 import std.fs (fs)
+import std.path (strip_root)
+import compiler.cc (toolchain)
 import compiler.store.memo
-import compiler.store.memo (Dependency, Run, QueryStats, memo_store, driver_dependencies, digest_of,
-                            reachable_keys, record_output, missing_count, cached_output, start_run,
+import compiler.store.memo (Run, QueryStats, reachable_keys, missing_count, query_output, start_run,
                             query_stats)
 import compiler.store.memo_files
 import compiler.store.packs
@@ -11,22 +13,24 @@ import compiler.front.checking (CheckedModule, PackageFile, OwnPackage, LoadInpu
                                 lookup_input, nothing_derived, rejected_first, registry,
                                 check_shipped_modules, shipped_queries, wanted_all, load_inputs_of,
                                 package_location_in)
-import compiler.front.checking.world (CheckQuery, RunEffects, ModuleKey, with_decode_cache)
+import compiler.front.checking.world (CheckQuery, RunEffects, ModuleKey, with_decode_cache, decoded)
+import compiler.front.checking.groups (ProgramSummary, declarers_input, program_summary_bin,
+                                       program_summary_query, symbol_query)
 import compiler.load (Derives, derivation_response)
 import compiler.front.pages (Pages)
 import compiler.front (ShippedWants, embed_inputs_of, shipped_bytes)
 import compiler.store.hash.forms (ModuleHashes)
 import sources (Project, File, DependencyPackage, Embed, read_module_embed, embed_of, shipped_names,
                 shipped_text)
-import compiler.check.resolve.tables (Diagnostic, diagnostic_bin)
-import interfaces
-import std.bin
+import compiler.check.resolve.tables (Diagnostic)
 import std.hash (blake3)
 import std.zstd
 import std.list
-import compiler.front.interface (length_prefixed)
 import compiler.expand.embed (EmbedBytesResult, ModuleEmbed, EmbedBytes, EmbedFile, EmbedResult,
                               EmbedRequest, request_of_key)
+
+fn shared_store() -> String / {toolchain.read, abort.raise} =
+  strip_root(toolchain.cache() ++ "/facts")
 
 fn own_file(f: File) -> PackageFile = { module: Bytes::of_string(f.module), text: f.text }
 
@@ -41,71 +45,22 @@ fn query_inputs(project: Project) -> LoadInputs / {abort.raise} =
       { root: Bytes::of_string(p.root), manifest: p.manifest, files: p.files.map(own_file) }),
   )
 
-fn file_walk_kind() -> Bytes = b"walk"
-
-fn published_kind() -> Bytes = b"published"
-
-fn encoded_walk(project: Project) -> Bytes / {abort.raise} =
-  bin::encode(
-    {
-      files: project.files.map(placed_file),
-      packages: project.packages.map(|p: DependencyPackage|
-        { root: p.root, dir: p.dir, files: p.files.map(placed_file) }),
-      diagnostics: project.diagnostics,
-    },
-    walk_record_bin(),
-  )
-
-fn placed_file(f: File) -> PlacedFile = { path: f.path, module: f.module }
-
-type PlacedFile = { path: String, module: String }
-
-derive bin for PlacedFile
-
-type PackageWalk = { root: String, dir: String, files: List<PlacedFile> }
-
-derive bin for PackageWalk
-
-type WalkRecord = {
-  files: List<PlacedFile>,
-  packages: List<PackageWalk>,
-  diagnostics: List<Diagnostic>,
-}
-
-derive bin for WalkRecord
-
-fn encoded_slots(project: Project) -> Bytes / {fs.read_file[abs], abort.raise} =
-  bin::encode(
-    interfaces::slots(project.root_key, project.packages.map(|p: DependencyPackage| p.root)).map(
-      |slot: String| { slot: slot, interface_bytes: interfaces::read_slot_interface(slot) },
-    ),
-    bin::list_bin(slot_contents_bin()),
-  )
-
-type SlotContents = { slot: String, interface_bytes: Option<Bytes> }
-
-derive bin for SlotContents
-
 fn read_project_input<| e>(
-  project: Project,
   w: LoadInputs,
   read: (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise | e},
   kind: Bytes,
   at: Bytes,
-) -> Option<Bytes> / {fs.list_dir[shipped], fs.read_file[shipped], fs.read_file[abs], Derives, abort.raise | e} =
-  if kind == file_walk_kind() { Some(encoded_walk(project)) }
-  else if kind == published_kind() { Some(encoded_slots(project)) } else {
-    lookup_input(
-      w,
-      |name: Bytes| shipped_text(name),
-      |name: Bytes| shipped_data(name),
-      || shipped_names(),
-      read,
-      |ask: Bytes| derivation_response(w, ask),
-      kind,
-      at,
-    )
-  }
+) -> Option<Bytes> / {fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise | e} =
+  lookup_input(
+    w,
+    |name: Bytes| shipped_text(name),
+    |name: Bytes| shipped_data(name),
+    || shipped_names(),
+    read,
+    |ask: Bytes| derivation_response(w, ask),
+    kind,
+    at,
+  )
 
 effect embed_reads {
   write record(files: List<EmbedBytes>) -> Unit
@@ -198,10 +153,9 @@ pub type QueryResults = {
   modules: List<ModuleHashes>,
   embeds: List<Embed>,
   inputs: Result<Map<Bytes, Bytes>, List<Diagnostic>>,
-  requested_dependencies: List<Dependency>,
-  looked_up: List<Dependency>,
   tallies: List<QueryStats>,
   missing_results: Int,
+  log_position: Option<Int>,
 }
 
 pub fn nothing() -> QueryResults =
@@ -212,10 +166,9 @@ pub fn nothing() -> QueryResults =
     modules: [],
     embeds: [],
     inputs: Ok(Map::new()),
-    requested_dependencies: [],
-    looked_up: [],
     tallies: [],
     missing_results: 0,
+    log_position: None,
   }
 
 type ModuleResults = {
@@ -223,7 +176,6 @@ type ModuleResults = {
   pulled: List<Bytes>,
   shipped_wants: Map<Bytes, ShippedWants>,
   modules: List<ModuleHashes>,
-  looked_up: List<Dependency>,
 }
 
 fn query_modules(
@@ -237,17 +189,9 @@ fn query_modules(
   let wanted = wanted_all(qs, pulled, false, all.run);
   let fixed = if rejected_first(results).len() > 0 { { run: wanted.run, value: [] } }
   else { hashed_all(qs, own, pulled, false, wanted.run) };
-  memo_store.external_digest(file_walk_kind(), b"");
-  memo_store.external_digest(published_kind(), b"");
   {
     run: fixed.run,
-    value: {
-      results: results,
-      pulled: pulled,
-      shipped_wants: wanted.value,
-      modules: fixed.value,
-      looked_up: memo_store.looked(),
-    },
+    value: { results: results, pulled: pulled, shipped_wants: wanted.value, modules: fixed.value },
   }
 }
 
@@ -264,103 +208,85 @@ fn queried_of(
     modules: done.value.modules,
     embeds: own_embeds(project, w, done.value.results),
     inputs: embedded_inputs(project, w, done.value.results, seen),
-    requested_dependencies: driver_dependencies(done.run),
-    looked_up: done.value.looked_up,
     tallies: query_stats(done.run),
     missing_results: missing_count(done.run),
+    log_position: None,
   }
 
 pub fn query_through_store<[r]>(
   dir: String,
   project: Project,
-) -> QueryResults / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+) -> QueryResults / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
   let ran = recording_embeds(||
-    memo_files::with_memo_store[r](
+    memo_files::with_logged_store[r, abs](
       dir,
+      shared_store(),
       pack_frame,
       shipped_files(),
       |kind: Bytes, at: Bytes|
         read_project_input(
-          project,
           w,
           |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
           kind,
           at,
         ),
       || with_decode_cache(|| query_modules(qs, w.own, start_run(qs))),
-      commands: [program_digest()],
     ));
-  queried_of(project, w, ran.value, ran.seen)
+  { ..queried_of(project, w, ran.value.value, ran.seen), log_position: ran.value.log_position }
 }
 
-pub fn program_digest() -> Bytes / {fs.read_file[shipped]} =
-  blake3(
-    Bytes::concat_all([
-      length_prefixed(match fs.read_file[shipped]("definitions") { Some(b) -> b, None -> b"" }),
-      length_prefixed(match fs.read_file[shipped]("stamps") { Some(b) -> b, None -> b"" }),
-    ]),
-  )
-
-pub fn command_key(program_digest: Bytes, request: Bytes) -> Bytes =
-  blake3(Bytes::concat_all([b"ply command answer\x00", program_digest, b"\x00", blake3(request)]))
-
-pub fn cached_command<[r]>(
+fn over_project_store<a, [r]>(
   dir: String,
   project: Project,
-  key: Bytes,
-) -> Option<Bytes> / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+  work: (Map<Bytes, CheckQuery>, LoadInputs) -> a / {RunEffects, abort.raise},
+) -> a / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
-  memo_files::with_memo_store[r](
+  memo_files::with_memo_store[r, abs](
     dir,
+    shared_store(),
     pack_frame,
     shipped_files(),
     |kind: Bytes, at: Bytes|
       read_project_input(
-        project,
         w,
         |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
         kind,
         at,
       ),
-    || cached_output(qs, key),
-    commands: [program_digest()],
+    || with_decode_cache(|| work(qs, w)),
   )
 }
 
-pub fn cache_command<[r]>(
+pub fn checked_summary<[r]>(
   dir: String,
   project: Project,
-  key: Bytes,
-  program_digest: Bytes,
-  requested_dependencies: List<Dependency>,
-  looked: List<Dependency>,
-  output: Bytes,
-) -> Bool / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  memo_files::with_memo_store[r](
-    dir,
-    pack_frame,
-    shipped_files(),
-    |kind: Bytes, at: Bytes|
-      read_project_input(
-        project,
-        w,
-        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-        kind,
-        at,
-      ),
-    || record_output(qs, key, program_digest, requested_dependencies, looked, output),
-    commands: [program_digest],
-  );
-  match memo_files::record_at[r](dir, key) {
-    Some(record) -> record.output == digest_of(Some(output)),
-    None -> false,
-  }
-}
+) -> ProgramSummary / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
+  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, w: LoadInputs|
+    decoded(
+      query_output(
+        qs,
+        start_run(qs),
+        program_summary_query(),
+        bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
+      ).output,
+      program_summary_bin(),
+      "the program's summary",
+    ))
+
+pub fn declarers<[r]>(
+  dir: String,
+  project: Project,
+  name: Bytes,
+) -> List<Bytes> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
+  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, w: LoadInputs|
+    decoded(
+      query_output(qs, start_run(qs), symbol_query(), declarers_input(name)).output,
+      bin::list_bin(bin::bytes_bin()),
+      "the modules that declare a name",
+    ))
 
 pub fn shipped_results<[r]>(
   store_dir: String,
@@ -369,9 +295,10 @@ pub fn shipped_results<[r]>(
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let wanted = shipped_queries().fold(Map::new(), |accumulator: Map<Bytes, Bool>, name: Bytes|
-    match qs.get(name) { Some(q) -> accumulator.insert(q.hash, true), None -> accumulator });
-  memo_files::with_memo_store[r](
+    accumulator.insert(name, true));
+  memo_files::with_memo_store[r, r](
     store_dir,
+    store_dir ++ "/shared",
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes|
@@ -399,6 +326,7 @@ pub fn write_shipped_pack<[r]>(
 ) -> { written: packs::PackFiles, records: Int } / {fs.read[r], fs.read_file[shipped], abort.raise} =
   memo_files::write_pack[r](
     store_dir,
+    store_dir ++ "/shared",
     keys,
     |b: Bytes| zstd::compress(b, zstd::Fast),
     memo::queries_id(running_queries()),
@@ -418,13 +346,9 @@ pub fn query_uncached(
       pack_frame,
       shipped_files(),
       |kind: Bytes, at: Bytes|
-        lookup_input(
+        read_project_input(
           w,
-          shipped_text,
-          shipped_data,
-          shipped_names,
           |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
-          |ask: Bytes| derivation_response(w, ask),
           kind,
           at,
         ),
@@ -437,25 +361,9 @@ pub fn doc_pages<[r]>(
   dir: String,
   project: Project,
   modules: List<ModuleKey>,
-) -> List<Pages> / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  memo_files::with_memo_store[r](
-    dir,
-    pack_frame,
-    shipped_files(),
-    |kind: Bytes, at: Bytes|
-      read_project_input(
-        project,
-        w,
-        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-        kind,
-        at,
-      ),
-    || with_decode_cache(|| documented_all(qs, modules, start_run(qs)).value),
-    commands: [program_digest()],
-  )
-}
+) -> List<Pages> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
+  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
+    documented_all(qs, modules, start_run(qs)).value)
 
 fn query_shipped<a>(
   query: (Map<Bytes, CheckQuery>, Run) -> a / {RunEffects, abort.raise},
@@ -494,7 +402,5 @@ pub fn shipped_declarations() -> Map<Bytes, List<Bytes>> / {fs.list_dir[shipped]
   query_shipped(|qs: Map<Bytes, CheckQuery>, run: Run| declaring_in(qs, b"std", run).value)
 
 pub fn current_hashes() -> Map<Bytes, Bool> / {fs.read_file[shipped], abort.raise} =
-  running_queries().fold(
-    Map::new().insert(program_digest(), true),
-    |accumulator: Map<Bytes, Bool>, _: Bytes, q: CheckQuery| accumulator.insert(q.hash, true),
-  )
+  running_queries().fold(Map::new(), |accumulator: Map<Bytes, Bool>, _: Bytes, q: CheckQuery|
+    accumulator.insert(q.hash, true))

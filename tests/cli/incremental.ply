@@ -36,6 +36,142 @@ fn reuse_of(front: Json) -> { taken: Int, ran: Int, modules: Int } =
       },
   )
 
+fn printing(n: Int) -> String / {abort.raise} =
+  "import std.process (process)\n\nfn main() -> Unit / {process.write[proc]} = process.out[proc](\""
+    ++ n.to_string()
+    ++ "\")\n"
+
+test/nondet "a stored program runs again, and an edit or its undo runs what the source now says" {
+  write_project([{ path: "m.ply", text: printing(41) }]);
+  let ran = || all_output(spawned(["run", "."]));
+  let first = ran();
+  assert(first.contains("41"), Some(first));
+  assert_eq(ran(), first);
+  write("m.ply", printing(42));
+  assert(ran().contains("42"), None);
+  write("m.ply", printing(41));
+  assert_eq(ran(), first)
+}
+
+test/nondet "a stored artifact is reused while it is on disk and the source is the same" {
+  write_project([{ path: "m.ply", text: printing(41) }]);
+  let built = || stdout(spawned(["build", "."]));
+  let first = built();
+  assert_eq(built(), first);
+  assert(fs.remove[cwd]("m.plyx"), None);
+  assert_eq(built(), first);
+  assert(fs.exists[cwd]("m.plyx"), None);
+  write("m.ply", printing(42));
+  assert(built() != first, None)
+}
+
+test/nondet "a stored proof run ends the same way, and an edit that breaks a claim fails" {
+  let claimed = |result: Int|
+    "pub fn id(n: Int) -> Int ensures result == n = n + " ++ result.to_string() ++ "\n";
+  write_project([{ path: "m.ply", text: claimed(0) }]);
+  assert_eq(spawned(["prove", "."]).code, 0);
+  assert_eq(spawned(["prove", "."]).code, 0);
+  write("m.ply", claimed(1));
+  assert_eq(spawned(["prove", "."]).code, 1)
+}
+
+test/nondet "a second checkout of the same code checks nothing again" {
+  let text = "pub fn answer() -> Int = 42\n";
+  write_project([
+    { path: "one/second_checkout.ply", text: text },
+    { path: "two/second_checkout.ply", text: text },
+  ]);
+  assert_eq(spawned(["check", "one"]).code, 0);
+  let report = json_of(spawned(["check", "two", "--json", "--explain"]));
+  assert_eq(
+    items(path(report, ["front_end", "queries"])).filter(|q: Json|
+      int(at(q, "run")) > 0 && ["group", "module", "whole"].contains(str(at(q, "query")))),
+    [],
+  )
+}
+
+test/nondet "a stored `unused` report follows an edit" {
+  write_project([{ path: "m.ply", text: "pub fn main() -> Int = 1\nfn spare() -> Int = 2\n" }]);
+  let listed = || stdout(spawned(["unused", "."]));
+  let first = listed();
+  assert(first.contains("spare"), Some(first));
+  assert_eq(listed(), first);
+  write("m.ply", "pub fn main() -> Int = spare()\nfn spare() -> Int = 2\n");
+  assert(!listed().contains("spare"), None)
+}
+
+test/nondet "a stored `review` follows `--accept` and an edit" {
+  write_project([{ path: "m.ply", text: "pub fn main() -> Int = 1\n" }]);
+  let reviewed = || stdout(spawned(["review", "."]));
+  let first = reviewed();
+  assert(first.contains("never reviewed"), Some(first));
+  assert_eq(reviewed(), first);
+  assert_eq(spawned(["review", ".", "--accept"]).code, 0);
+  let accepted = reviewed();
+  assert(accepted.contains("no definition changed since the last accepted review"), Some(accepted));
+  write("m.ply", "pub fn main() -> Int = 2\n");
+  assert(!reviewed().contains("no definition changed"), None)
+}
+
+test/nondet "`show` finds a definition by the name index and reports the same thing as a full name" {
+  write_project([
+    { path: "leaf.ply", text: leaf() },
+    { path: "other.ply", text: "pub fn one() -> Int = 1\n" },
+  ]);
+  assert(spawned(["check", "."]).code == 0, None);
+  assert_eq(stdout(spawned(["show", "two", "."])), stdout(spawned(["show", "leaf.two", "."])));
+  assert(stdout(spawned(["show", "two", "."])).contains("one() + one()"), None);
+  assert(spawned(["show", "one", "."]).code != 0, Some("two modules declare `one`"))
+}
+
+test/nondet "a stored `callers` result prints the same lines, and an edit changes them" {
+  write_project([{ path: "leaf.ply", text: leaf() }]);
+  let callers = || stdout(spawned(["callers", "leaf.one", "."]));
+  let first = callers();
+  assert(first.contains("leaf.two"), Some(first));
+  assert_eq(callers(), first);
+  edit("leaf.ply", "one() + one()", "2");
+  assert(!callers().contains("leaf.two"), None)
+}
+
+fn sim_package() -> List<{ path: String, text: String }> / {abort.raise} =
+  [
+    { path: "model.ply", text: String::of_bytes_lossy(embed("../../packages/sim/model.ply")) },
+    { path: "plan.ply", text: String::of_bytes_lossy(embed("../../packages/sim/plan.ply")) },
+    {
+      path: "recording.ply",
+      text: String::of_bytes_lossy(embed("../../packages/sim/recording.ply")),
+    },
+    { path: "search.ply", text: String::of_bytes_lossy(embed("../../packages/sim/search.ply")) },
+  ]
+
+fn appended(name: String, text: String) -> Unit / {WorkingDirectory, abort.raise} =
+  match read(name) {
+    Some(old) -> write(name, old ++ text),
+    None -> panic("`" ++ name ++ "` reads"),
+  }
+
+test/nondet "after edits to a real package, a check through the store reports what a check from nothing reports" {
+  let agrees = |what: String| {
+    let _ = spawned_warm_agrees(what);
+    ()
+  };
+  write_project(sim_package());
+  agrees("the first check");
+  appended("recording.ply", "\npub fn step_limit() -> Int = 1\n");
+  write(
+    "limits.ply",
+    "import recording\n\npub fn doubled() -> Int = recording::step_limit() * 2\n",
+  );
+  agrees("a function and a module added");
+  edit("recording.ply", "step_limit() -> Int = 1", "step_limit() -> Int = 2");
+  agrees("a body edited");
+  edit("recording.ply", "step_limit() -> Int = 2", "step_limit() -> Bool = true");
+  agrees("a signature edited, which makes a type error");
+  edit("recording.ply", "step_limit() -> Bool = true", "step_limit() -> Int = 1");
+  agrees("the type error fixed")
+}
+
 test/nondet "a report counts the work a load did: an unchanged project runs no function bodies, and an edit runs only the affected bodies" {
   write_project([
     { path: "leaf.ply", text: leaf() ++ "\ntest \"two is two\" { assert_eq(two(), 2) }\n" },
@@ -44,7 +180,7 @@ test/nondet "a report counts the work a load did: an unchanged project runs no f
   let front = |args: List<String>| path(json_of(spawned(args)), ["front_end"]);
   let checked = || reuse_of(front(["check", ".", "--json", "--explain"]));
   let cold = checked();
-  assert(cold.ran > 0, Some("a store nothing was kept in runs every body"));
+  assert(cold.ran > 0, Some("a store nothing was stored in runs every body"));
   let warm = checked();
   assert(
     warm.ran == 0 && warm.taken > 0,
@@ -142,17 +278,14 @@ fn one_test() -> Unit / {WorkingDirectory, abort.raise} =
     { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
   ])
 
-test/nondet "`ply test --no-cache`, `ply hosts` and `ply build` write nothing to the cache" {
+test/nondet "`ply test --no-cache` and `ply hosts` write nothing to the cache" {
   one_test();
   let tested = spawned(["test", ".", "--no-cache"]);
   assert(tested.code == 0, Some(all_output(tested)));
   assert_cache_empty("`ply test --no-cache`");
   let hosts = spawned(["hosts", "."]);
   assert(hosts.code == 0, Some(all_output(hosts)));
-  assert_cache_empty("`ply hosts`");
-  let built = spawned(["build", ".", "--digest"]);
-  assert(built.code == 0, Some(all_output(built)));
-  assert_cache_empty("`ply build`")
+  assert_cache_empty("`ply hosts`")
 }
 
 test/nondet "a warm prove resolves every obligation from the cache" {
