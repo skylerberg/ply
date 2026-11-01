@@ -1,8 +1,8 @@
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (Analysis, CheckedProgram, Frame, ModuleShape, assembled_load)
 import compiler.front.interface (blank_cuts)
-import compiler.front.rows (Cut, ModuleDerivations, Outline, OutlineItem, OutlinedFunction,
-                            OutlinedLaw, Rows)
+import compiler.front.rows (Cut, KnownDefinitionRow, ModuleDerivations, Outline, OutlineItem,
+                            OutlinedFunction, OutlinedLaw, Rows)
 import compiler.front.published (no_rows)
 import compiler.front.checking (CheckedModule, checked_program_from_results, fresh_registry,
                                 queried_results, rows_of_result)
@@ -21,7 +21,7 @@ import compiler.front.checking (LoadInputs)
 import compiler.front.checking.groups (HashSummary)
 import compiler.front.checking.view (LaterReading, Modules)
 import compiler.store.memo (memo)
-import module_queries (listed_results, module_results)
+import module_queries (module_results)
 import proof.decide (StaticResult)
 import std.machine as entering
 import std.time (time)
@@ -113,21 +113,13 @@ fn imported_closure(frame: Frame, start: List<Bytes>) -> Map<Bytes, Bool> / {abo
   )
 }
 
-fn without_unreached_bodies(
-  s: Source,
-  outlines: Map<Bytes, Outline>,
-  reached: Map<Bytes, Bool>,
-) -> Source / {abort.raise} =
-  match outlines.get(s.name) {
+fn unreached_cuts(o: Outline, stored: Map<Bytes, Bool>, reached: Map<Bytes, Bool>) -> List<Cut> =
+  o.cuts.filter(|c: Cut| stored.contains(c.name) && !reached.contains(c.name))
+
+fn without_bodies(s: Source, cuts: Map<Bytes, List<Cut>>) -> Source / {abort.raise} =
+  match cuts.get(s.name) {
     None -> s,
-    Some(o) ->
-      {
-        ..s,
-        source_text: blank_cuts(
-          s.source_text,
-          o.cuts.filter(|c: Cut| c.name.len() > 0 && !reached.contains(c.name)),
-        ),
-      },
+    Some(c) -> { ..s, source_text: blank_cuts(s.source_text, c) },
   }
 
 fn rows_outside(program: Program, dropped: Map<Bytes, Bool>) -> Rows / {abort.raise} =
@@ -162,16 +154,21 @@ pub fn claim_view(
   let included = imported_closure(frame, if bearing.len() > 0 { bearing }
   else { program.sources.map(|s: Source| s.name).take(1) });
   let reached = reachable_functions(frame.hashes, subjects);
-  let outlines = own.fold(Map::new(), |found: Map<Bytes, Outline>, o: Outline|
-    found.insert(o.name, o));
   let dropped = program.sources.fold(Map::new(), |found: Map<Bytes, Bool>, s: Source|
     if included.contains(s.name) { found } else { found.insert(s.name, true) });
+  let rows = rows_outside(program, dropped);
+  let stored = rows.definitions.fold(
+    Map::new(),
+    |found: Map<Bytes, Bool>, d: KnownDefinitionRow| found.insert(d.name, true),
+  );
+  let cuts = own.fold(Map::new(), |found: Map<Bytes, List<Cut>>, o: Outline|
+    found.insert(o.name, unreached_cuts(o, stored, reached)));
   match front_end(
       program.sources.map(|s: Source|
-        if included.contains(s.name) { without_unreached_bodies(s, outlines, reached) }
+        if included.contains(s.name) { without_bodies(s, cuts) }
         else { { ..s, source_text: b"" } }),
       program.shipping,
-      rows_outside(program, dropped),
+      rows,
       program.packages,
       program.embeds.filter(|e: Embed| !dropped.contains(e.embedded.module)),
       program.prune_unreached,
@@ -428,8 +425,7 @@ pub fn claims_closure(
 ) -> Result<ClaimClosure, List<Diagnostic>> / {ProgramStore, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
   let included = view::imports_reached(s.value.later.rollups, open);
   let own = modules_within(s.modules, included);
-  let results = in_program_store(s.place, |_: LoadInputs|
-    if from_nothing { module_results(own) } else { listed_results(own) }).value;
+  let results = in_program_store(s.place, |_: LoadInputs| module_results(own)).value;
   let program = program_within(s, included, results, from_nothing);
   match program_view(program) {
     Some(v) -> Ok({ program: program, view: v }),
@@ -492,7 +488,7 @@ const claimed_sources: List<Source> =
     },
     {
       name: b"lib",
-      source_text: b"pub fn twice(n: Int) -> Int = n + n\n\npub fn quad(n: Int) -> Int = n + n + n + n\n",
+      source_text: b"pub fn twice(n: Int) -> Int = n + n\n\npub fn quad(n: Int) -> Int = n + n + n + n\n\npub fn spare(n: Int) -> Int = n + 5\n",
     },
     { name: b"other", source_text: b"pub fn unrelated(n: Int) -> Int = n * 3\n" },
   ]
@@ -544,18 +540,19 @@ test "a claim view holds the claims of the whole program under the same keys, an
 
 test "a body that no claim reaches is blanked in place, and a body that a claim reaches is kept" {
   let source = claimed_sources.get(0);
-  let outlines = program_over(claimed_sources).view.frame.outlines.fold(
-    Map::new(),
-    |found: Map<Bytes, Outline>, o: Outline| found.insert(o.name, o),
-  );
-  let viewed = without_unreached_bodies(
-    source,
-    outlines,
-    Map::new().insert(b"app.four", true),
-  ).source_text;
+  let outline = program_over(claimed_sources).view.frame.outlines.get(0);
+  let stored = Map::new().insert(b"app.four", true).insert(b"app.apart", true);
+  let cuts = unreached_cuts(outline, stored, Map::new().insert(b"app.four", true));
+  let viewed = without_bodies(source, Map::new().insert(source.name, cuts)).source_text;
   assert(viewed.index_of(b"twice(twice(n))") != None);
   assert(viewed.index_of(b"= n + 1") == None);
   assert_eq(viewed.len(), source.source_text.len())
+}
+
+test "a body without a stored row stays, so the view can check it" {
+  let source = claimed_sources.get(0);
+  let outline = program_over(claimed_sources).view.frame.outlines.get(0);
+  assert_eq(unreached_cuts(outline, Map::new(), Map::new()), [])
 }
 
 fn modules_with_claims(size: Int, edited: Bytes) -> List<Source> =
