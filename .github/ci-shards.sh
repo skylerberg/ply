@@ -77,8 +77,8 @@ CLI_PARTS=4
 RUNS_ALONE=(package-compiler)
 # Modules no pull request runs, which the `nightly` job does, as `role:module` with the role
 # `ply.work` gives their suite: minutes each, the repository audit checking packages cold and the copies
-# audit listing every one, or against a postgres they start.
-NIGHTLY=(cli-tests:repository_audit cli-tests:copies std-tests:db_driver std-tests:pg_client)
+# audit listing every one, or against a postgres they start, or random edit sessions drawn anew each day.
+NIGHTLY=(cli-tests:repository_audit cli-tests:copies cli-tests:edit_sessions std-tests:db_driver std-tests:pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
