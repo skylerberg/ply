@@ -1,5 +1,6 @@
 use crate::bare::{context, helper};
 use crate::unit::heap::Holding;
+use crate::unit::ignored_test_command;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{HEADER, IMMORTAL, SHARED, Word, obj, word_at};
 use ply_compiled::rt::{Ctx, RELEASE_DEPTH};
@@ -191,34 +192,25 @@ fn a_freed_block_has_a_reference_count_of_zero_however_it_was_freed() {
     }
 }
 
-fn own_test_name(leaf: &str) -> String {
-    match module_path!().split_once("::") {
-        Some((_binary, module)) => format!("{module}::{leaf}"),
-        None => leaf.to_string(),
-    }
-}
-
 #[test]
 fn releasing_a_block_twice_stops_the_program_and_reports_the_source_location() {
-    let name = own_test_name("releases_a_block_twice");
-    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
+    let out = ignored_test_command(releases_a_block_twice)
         .output()
         .expect("the test binary runs");
-    let said = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "the run went on past the trap:\n{}{said}",
+        "the run went on past the trap:\n{}{stderr}",
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        said.contains("was released after its last holder let it go, at root 7 bytes 3..9"),
-        "{said}"
+        stderr.contains("was released after its last holder let it go, at root 7 bytes 3..9"),
+        "{stderr}"
     );
 }
 
 #[test]
-#[ignore = "ends its process: run by `a_block_released_twice_ends_the_run_naming_where`"]
+#[ignore = "ends its process: run by the test above"]
 fn releases_a_block_twice() {
     let mut ctx = context();
     let w = alloc(&mut ctx, 32);

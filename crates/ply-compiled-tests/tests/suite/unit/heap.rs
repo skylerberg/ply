@@ -155,23 +155,16 @@ fn the_heap_lists_each_live_native_object_once_and_ending_the_heap_frees_each_na
     );
 }
 
-fn own_test_name(leaf: &str) -> String {
-    match module_path!().split_once("::") {
-        Some((_binary, module)) => format!("{module}::{leaf}"),
-        None => leaf.to_string(),
-    }
-}
-
 #[test]
 fn with_heap_poisoning_on_using_a_freed_native_object_pointer_after_its_block_is_reused_is_detected()
  {
-    let name = own_test_name("a_stale_word_meets_a_reused_native_object_block_poisoned");
-    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
-        .env("PLY_HEAP_POISON", "1")
-        .env_remove("PLY_HEAP_DELAY")
-        .output()
-        .expect("the test binary runs");
+    let out = ignored_test_command(
+        using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poison_values,
+    )
+    .env("PLY_HEAP_POISON", "1")
+    .env_remove("PLY_HEAP_DELAY")
+    .output()
+    .expect("the test binary runs");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -180,7 +173,7 @@ fn with_heap_poisoning_on_using_a_freed_native_object_pointer_after_its_block_is
     );
     assert!(
         stdout.contains("1 passed"),
-        "the child ran no test matching `{name}`, and a filter that matches nothing exits 0:\n{stdout}"
+        "the child ran no test, and a filter that matches nothing exits 0:\n{stdout}"
     );
 }
 
