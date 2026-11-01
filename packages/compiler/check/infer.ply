@@ -91,7 +91,7 @@ pub fn check_diagnostics(
 pub type CheckOutput = {
   ok: Bool,
   diagnostics: List<Diagnostic>,
-  holes: List<Diagnostic>,
+  warnings: List<Diagnostic>,
   definitions: List<DefinitionInfo>,
   tests: List<TestInfo>,
   laws: List<LawInfo>,
@@ -116,7 +116,9 @@ pub fn check_output_with(
     checked: {
       ok: !failed,
       diagnostics: if failed { dedup_diagnostics(out.checker.diagnostics) } else { [] },
-      holes: out.checker.diagnostics.filter(|d: Diagnostic| d.code == b"W0613"),
+      warnings: out.checker.diagnostics.filter(|d: Diagnostic| d.code == b"W0613").concat(
+        if failed { [] } else { out.checker.unperformed },
+      ),
       definitions: out.checker.definitions.map(canonical_definition),
       tests: out.checker.tests,
       laws: out.checker.laws,
@@ -266,7 +268,7 @@ pub fn decode_facts(
     },
   }
 
-fn restore_owners(checker: Checker) -> Checker / {abort.raise} =
+fn restore_owners(checker: Checker) -> Checker =
   {
     ..checker,
     member_sites: checker.member_sites.map(|x: MemberSite|
@@ -1122,7 +1124,7 @@ fn placed_in(source: Bytes, from: Bytes, to: Bytes) -> Span / {abort.raise} =
     },
   }
 
-fn placed_effects_text(effects: Effects) -> Bytes / {abort.raise} = {
+fn placed_effects_text(effects: Effects) -> Bytes = {
   let listed = Bytes::join(effects.listed.map(effect_placed_text), b", ");
   let tail = match effects.variable {
     None -> b"",
@@ -1132,7 +1134,7 @@ fn placed_effects_text(effects: Effects) -> Bytes / {abort.raise} = {
   Bytes::concat_all([b"{", listed, tail, b"}"])
 }
 
-fn effect_placed_text(entry: Effect) -> Bytes / {abort.raise} = {
+fn effect_placed_text(entry: Effect) -> Bytes = {
   let resource = match entry.resource {
     SingletonResource -> b"",
     AnyResource -> b"[*]",
@@ -1147,10 +1149,10 @@ fn effect_placed_text(entry: Effect) -> Bytes / {abort.raise} = {
   ])
 }
 
-fn place_text(letter: Bytes, place: Int) -> Bytes / {abort.raise} =
+fn place_text(letter: Bytes, place: Int) -> Bytes =
   if place < 0 { b"?" } else { letter.concat(ascii_of_int(place)) }
 
-fn effects_of_node(e: TypedExpression<Type>) -> List<Bytes> / {abort.raise} = {
+fn effects_of_node(e: TypedExpression<Type>) -> List<Bytes> = {
   let filled = |rows: List<Effects>|
     if rows.len() == 0 { [] }
     else { [Bytes::concat_all([b"[", Bytes::join(rows.map(placed_effects_text), b", "), b"]"])] };
@@ -7441,6 +7443,114 @@ test "a hole with no constraining type reports its type as unconstrained and lis
 test "a hole in a test or a law is reported as one" {
   assert_eq(hole_diagnostics(b"test \"t\" { assert_eq(???, 1) }").len(), 1);
   assert_eq(hole_diagnostics(b"law \"l\" forall (n: Int) { ??? }").len(), 1)
+}
+
+fn with_effects(row_and_body: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"effect log { write emit(Bytes) -> Unit }\n",
+    b"effect net { read recv[r]() -> Int }\n",
+    b"effect tick { read now() -> Int }\n",
+    row_and_body,
+  ])
+
+fn unperformed_in(src: Bytes) -> List<Bytes> / {abort.raise} =
+  valid_module_checker(src).unperformed.flat_map(|d: Diagnostic| d.labels).map(|l: Label|
+    src.slice(l.start, l.end))
+
+fn narrowed(src: Bytes) -> Bytes / {abort.raise} =
+  match fixes_of(valid_module_checker(src).unperformed) {
+    [fix] -> {
+      let fixed = fixed_by(src, fix);
+      assert_eq(unperformed_in(fixed), []);
+      fixed
+    },
+    _ -> panic("expected one fix"),
+  }
+
+test "an effect the body never performs is named, and the fix removes only that" {
+  let performing = b"{ log.emit(b\"x\"); 1 }";
+  let at = |row: Bytes, body: Bytes|
+    with_effects(Bytes::concat_all([b"pub fn f() -> Int", row, b" = ", body]));
+  assert_eq(unperformed_in(at(b" / {log.emit, tick.now}", performing)), [b"tick.now"]);
+  assert_eq(narrowed(at(b" / {log.emit, tick.now}", performing)), at(b" / {log.emit}", performing));
+  assert_eq(narrowed(at(b" / {tick.now, log.emit}", performing)), at(b" / {log.emit}", performing));
+  assert_eq(
+    narrowed(at(b" / {abort.raise, log.emit, tick.now}", performing)),
+    at(b" / {log.emit}", performing),
+  );
+  assert_eq(narrowed(at(b" / {log.emit, tick.now}", b"1")), at(b"", b"1"));
+  assert_eq(unperformed_in(at(b" / {log.emit}", performing)), [])
+}
+
+test "narrowing preserves an effect variable" {
+  let at = |row: Bytes|
+    with_effects(Bytes::concat_all([b"pub fn f<| e>(g: () -> Int / e) -> Int / ", row, b" = g()"]));
+  assert_eq(narrowed(at(b"{log.emit | e}")), at(b"e"));
+  assert_eq(narrowed(at(b"{log.emit, tick.now | e}")), at(b"e"))
+}
+
+test "an effect set counts as performed when any of its members is" {
+  let set = b"effect set Both = {log.emit, tick.now}\n";
+  let partly = with_effects(set.concat(b"pub fn f() -> Int / {Both} = { log.emit(b\"x\"); 1 }"));
+  assert_eq(unperformed_in(partly), []);
+  let idle = with_effects(set.concat(b"pub fn f() -> Int / {Both, abort.raise} = 1"));
+  assert_eq(unperformed_in(idle), [b"abort.raise", b"Both"])
+}
+
+fn unperformed_beside_a_module(src: Bytes) -> List<Bytes> / {abort.raise} =
+  match resolved_all([
+      {
+        name: b"base",
+        source_text: b"pub effect log { write emit(Bytes) -> Unit }\npub effect tick { read now() -> Int }\npub effect set Both = {log.emit, tick.now}\n",
+      },
+      { name: b"m", source_text: src },
+    ]) {
+    Err(rejected) -> panic(String::of_bytes_lossy(rejected)),
+    Ok(x) ->
+      check_program(x.resolution, x.modules).checker.unperformed.flat_map(|d: Diagnostic|
+        d.labels).map(|l: Label| src.slice(l.start, l.end)),
+  }
+
+test "a set from another module is treated the same way" {
+  assert_eq(
+    unperformed_beside_a_module(
+      b"import base (Both, log)\npub fn f() -> Int / {Both} = { log.emit(b\"x\"); 1 }",
+    ),
+    [],
+  );
+  assert_eq(unperformed_beside_a_module(b"import base (Both)\npub fn f() -> Int / {Both} = 1"), [
+    b"Both",
+  ])
+}
+
+test "a function that performs less may be a parameter's default, as it may be an argument" {
+  assert_eq(
+    check_codes(
+      b"pub fn nothing(ask: Bytes) -> Option<Bytes> = None\npub fn f(derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing) -> Bool / {abort.raise} = derived(b\"x\") == None",
+    ),
+    [],
+  )
+}
+
+test "a raise reached only by a call back into the group is not performed" {
+  let src = b"pub fn f(n: Int) -> Int / {abort.raise} = if n <= 0 { 0 } else { f(n - 1) }";
+  assert_eq(unperformed_in(src), [b"abort.raise"])
+}
+
+test "a label the signature binds is the label the body performs on" {
+  let at = |body: Bytes|
+    with_effects(Bytes::concat_all([b"pub fn f<[c]>() -> Int / {net.recv[c]} = ", body]));
+  assert_eq(unperformed_in(at(b"net.recv[c]()")), []);
+  assert_eq(unperformed_in(at(b"1")), [b"net.recv[c]"])
+}
+
+test "no one wrote the effects of a law schema, so none is reported" {
+  assert_eq(
+    unperformed_in(
+      b"pub law schema settles<a | e>(f: (a) -> a / e) forall (x: a) { f(f(x)) == f(x) }",
+    ),
+    [],
+  )
 }
 
 fn connections() -> String =
