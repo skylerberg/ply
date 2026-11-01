@@ -18,7 +18,7 @@ type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 #[derive(Default)]
 pub struct WakeCounter {
     count: Mutex<u64>,
-    heard: Condvar,
+    wake: Condvar,
 }
 
 impl WakeCounter {
@@ -29,39 +29,39 @@ impl WakeCounter {
     pub fn wait_for_change(&self, seen: u64) {
         let mut count = lock(&self.count);
         while *count == seen {
-            count = wait(&self.heard, count);
+            count = wait(&self.wake, count);
         }
     }
 
     pub fn wait_for_change_timeout(&self, seen: u64, bound: Duration) {
         let count = lock(&self.count);
         if *count == seen {
-            drop(wait_timeout(&self.heard, count, bound));
+            drop(wait_timeout(&self.wake, count, bound));
         }
     }
 
     pub(crate) fn ring(&self) {
         *lock(&self.count) += 1;
-        self.heard.notify_all();
+        self.wake.notify_all();
     }
 }
 
 pub struct Run {
-    held: Mutex<HashMap<u64, Held>>,
+    running_jobs: Mutex<HashMap<u64, RunningJob>>,
     secrets: Mutex<SecretTable>,
     recorder: Mutex<Option<Arc<Recorder>>>,
     bell: Arc<WakeCounter>,
 }
 
-pub type Kept = Zeroizing<Vec<u8>>;
+pub type SecretBytes = Zeroizing<Vec<u8>>;
 
 #[derive(Default)]
 struct SecretTable {
     last: i64,
-    kept: HashMap<i64, Kept>,
+    secrets: HashMap<i64, SecretBytes>,
 }
 
-struct Held {
+struct RunningJob {
     span: Span,
     what: &'static str,
     watched: bool,
@@ -71,7 +71,7 @@ struct Held {
 impl Run {
     pub fn new(bell: Arc<WakeCounter>) -> Arc<Run> {
         Arc::new(Run {
-            held: Mutex::new(HashMap::new()),
+            running_jobs: Mutex::new(HashMap::new()),
             secrets: Mutex::new(SecretTable::default()),
             recorder: Mutex::new(None),
             bell,
@@ -90,26 +90,26 @@ impl Run {
         lock(&self.recorder).clone()
     }
 
-    pub fn store_secret(&self, secret: Kept) -> i64 {
+    pub fn store_secret(&self, secret: SecretBytes) -> i64 {
         let mut secrets = lock(&self.secrets);
         secrets.last += 1;
         let number = secrets.last;
-        secrets.kept.insert(number, secret);
+        secrets.secrets.insert(number, secret);
         number
     }
 
-    pub fn remove_secret(&self, number: i64) -> Option<Kept> {
-        lock(&self.secrets).kept.remove(&number)
+    pub fn remove_secret(&self, number: i64) -> Option<SecretBytes> {
+        lock(&self.secrets).secrets.remove(&number)
     }
 
     pub fn drop_secrets(&self) {
-        lock(&self.secrets).kept.clear();
+        lock(&self.secrets).secrets.clear();
     }
 
     fn enter(&self, token: u64, span: Span, what: &'static str) {
-        lock(&self.held).insert(
+        lock(&self.running_jobs).insert(
             token,
-            Held {
+            RunningJob {
                 span,
                 what,
                 watched: false,
@@ -119,7 +119,7 @@ impl Run {
     }
 
     fn forget(&self, token: u64) {
-        lock(&self.held).remove(&token);
+        lock(&self.running_jobs).remove(&token);
     }
 
     pub fn done_here(
@@ -136,14 +136,14 @@ impl Run {
     }
 
     fn file(&self, token: u64, result: JobOutput) {
-        if let Some(held) = lock(&self.held).get_mut(&token) {
+        if let Some(held) = lock(&self.running_jobs).get_mut(&token) {
             held.result = Some(result);
         }
         self.bell.ring();
     }
 
     pub fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
-        match lock(&self.held).get_mut(&pending.token) {
+        match lock(&self.running_jobs).get_mut(&pending.token) {
             Some(held) => {
                 held.watched = true;
                 Ok(())
@@ -153,13 +153,13 @@ impl Run {
     }
 
     pub fn ready(&self) -> bool {
-        lock(&self.held)
+        lock(&self.running_jobs)
             .values()
             .any(|held| held.watched && held.result.is_some())
     }
 
     pub fn returned(&self) -> Vec<u64> {
-        let mut tokens: Vec<u64> = (lock(&self.held).iter())
+        let mut tokens: Vec<u64> = (lock(&self.running_jobs).iter())
             .filter(|(_, h)| h.watched && h.result.is_some())
             .map(|(token, _)| *token)
             .collect();
@@ -168,7 +168,7 @@ impl Run {
     }
 
     pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
-        let mut held = lock(&self.held);
+        let mut held = lock(&self.running_jobs);
         match held.get(&pending.token) {
             None => return Err(err_token_not_pending_here(pending)),
             Some(h) if h.result.is_none() => return Ok(None),
@@ -177,7 +177,7 @@ impl Run {
         let taken = held.remove(&pending.token);
         drop(held);
         match taken {
-            Some(Held {
+            Some(RunningJob {
                 span,
                 what,
                 result: Some(result),
@@ -220,7 +220,7 @@ impl Run {
             }
             match until {
                 None => {
-                    if !lock(&self.held).values().any(|held| held.watched) {
+                    if !lock(&self.running_jobs).values().any(|held| held.watched) {
                         return false;
                     }
                     self.bell.wait_for_change(seen);
@@ -239,7 +239,7 @@ impl Run {
 
 fn bytes_of(span: Span, what: &str, result: JobOutput) -> Result<Vec<u8>, Diagnostic> {
     result.map_err(|failure| match failure {
-        Failure::Said(message) => failed(span, what, &message),
+        Failure::Message(message) => failed(span, what, &message),
         Failure::Rejected(diagnostic) => diagnostic,
     })
 }
@@ -392,7 +392,7 @@ impl Pool {
 
 fn outcome_of(job: Job) -> JobOutput {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-        .unwrap_or_else(|_| Err(Failure::Said("the host panicked doing it".to_string())))
+        .unwrap_or_else(|_| Err(Failure::Message("the host panicked doing it".to_string())))
 }
 
 fn finish(entry: Entry, freed: impl FnOnce()) {

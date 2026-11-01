@@ -51,7 +51,7 @@ impl Output {
         wrote
     }
 
-    fn told(&mut self, wrote: Result<()>) -> Result<()> {
+    fn record_write_result(&mut self, wrote: Result<()>) -> Result<()> {
         if wrote.is_err() {
             self.untold = false;
         }
@@ -69,13 +69,13 @@ pub fn write_out(bytes: &[u8]) -> Result<()> {
     } else {
         Ok(())
     };
-    out.told(wrote)
+    out.record_write_result(wrote)
 }
 
 pub fn flush_out() -> Result<()> {
     let mut out = lock(&OUTPUT_BUFFER);
     let wrote = out.written();
-    out.told(wrote)
+    out.record_write_result(wrote)
 }
 
 pub fn make_way() {
@@ -300,7 +300,7 @@ pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
     Ok(Some(std::mem::replace(&mut terminal.mode, mode)))
 }
 
-pub fn settle() -> bool {
+pub fn flush_output() -> bool {
     make_way();
     let untold = std::mem::take(&mut lock(&OUTPUT_BUFFER).untold);
     restore_terminal();

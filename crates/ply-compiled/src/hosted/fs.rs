@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked, handed, text_at, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, required_argument, text_at, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64};
@@ -17,7 +17,7 @@ fn start_file_job(
     (pp, pn): (Addr, I64),
     second: impl FnOnce(&mut Ctx) -> Option<Second>,
 ) -> I64 {
-    asked(ctx, native, Nondeterministic, I64(0), |c| {
+    if_host_allowed(ctx, native, Nondeterministic, I64(0), |c| {
         let (Some(label), Some(path)) = (text_at(c, lp, ln), text_at(c, pp, pn)) else {
             return I64(0);
         };
@@ -28,8 +28,8 @@ fn start_file_job(
         else {
             return I64(0);
         };
-        match files.asked(op, &label, path, second, c.site()) {
-            Ok(job) => c.refusing(native, op.what(), Work::WritingFiles, job),
+        match files.run_operation(op, &label, path, second, c.site()) {
+            Ok(job) => c.queued_fallible(native, op.what(), Work::WritingFiles, job),
             Err(d) => {
                 c.fail(d);
                 I64(0)
@@ -46,7 +46,7 @@ fn on_file(
     file: I64,
     chunk: OpenFileAction,
 ) -> I64 {
-    asked(ctx, native, Nondeterministic, I64(0), |c| {
+    if_host_allowed(ctx, native, Nondeterministic, I64(0), |c| {
         let Some(label) = text_at(c, lp, ln) else {
             return I64(0);
         };
@@ -60,7 +60,7 @@ fn on_file(
             OpenFileAction::Close => Op::Close,
         };
         match files.on_file(&label, file.0, chunk, c.site()) {
-            Ok(job) => c.refusing(native, op.what(), Work::WritingFiles, job),
+            Ok(job) => c.queued_fallible(native, op.what(), Work::WritingFiles, job),
             Err(d) => {
                 c.fail(d);
                 I64(0)
@@ -315,7 +315,7 @@ pub unsafe extern "C" fn rt_fs_set_mode(
 ) -> I64 {
     start_file_job(ctx, "fs_set_mode", Op::SetMode, (lp, ln), (pp, pn), |c| {
         let bits = u32::try_from(bits.0).ok().filter(|bits| *bits <= 0o777);
-        handed(c, "fs_set_mode", "a mode", bits).map(Second::Mode)
+        required_argument(c, "fs_set_mode", "a mode", bits).map(Second::Mode)
     })
 }
 
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn rt_fs_open(
     how: I64,
 ) -> I64 {
     start_file_job(ctx, "fs_open", Op::Open, (lp, ln), (pp, pn), |c| {
-        handed(c, "fs_open", "an opening", Opening::of(how.0)).map(Second::Opening)
+        required_argument(c, "fs_open", "an opening", Opening::of(how.0)).map(Second::Opening)
     })
 }
 
@@ -426,7 +426,7 @@ pub unsafe extern "C" fn rt_fs_write_secret(
         (lp, ln),
         (pp, pn),
         |c| {
-            let held = secret::held(c, &secret)?;
+            let held = secret::sealed_value(c, &secret)?;
             let encoding = text_at(c, ep, en)?;
             let framing = Framing::named(&encoding, Op::WriteSecret.what(), c.site())
                 .map_err(|d| c.fail(d))
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn rt_fs_read_secret(
 }
 
 pub unsafe extern "C" fn rt_fs_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
-    asked(
+    if_host_allowed(
         ctx,
         "fs_secret_taken",
         Nondeterministic,
@@ -484,7 +484,7 @@ pub unsafe extern "C" fn rt_fs_secret_taken(ctx: *mut Ctx, number: I64) -> Secre
             let kept =
                 with_host_facilities(c, |facilities| facilities.run().remove_secret(number.0))
                     .flatten();
-            match handed(c, "fs_secret_taken", "a secret's number", kept) {
+            match required_argument(c, "fs_secret_taken", "a secret's number", kept) {
                 Some(kept) => secret::sealed(c, false, kept),
                 None => SecretHandle::of(0),
             }

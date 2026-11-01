@@ -82,7 +82,7 @@ fn shipping(
         |c| match SHIPS.get() {
             Some(ships) => result(c, ships.as_ref()),
             None => {
-                super::handed(
+                super::required_argument(
                     c,
                     native,
                     "a binary that installed what it ships",

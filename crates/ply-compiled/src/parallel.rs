@@ -144,11 +144,11 @@ impl Drop for Unwatch {
     }
 }
 
-struct Handed(*mut Branch);
+struct BranchPointer(*mut Branch);
 
-unsafe impl Send for Handed {}
+unsafe impl Send for BranchPointer {}
 
-impl Handed {
+impl BranchPointer {
     unsafe fn run(self) {
         let branch = unsafe { &mut *self.0 };
         let ctx: *mut Ctx = &mut *branch.ctx;
@@ -199,7 +199,7 @@ unsafe fn in_parallel(
         .collect();
     pool.in_place_scope(|scope| {
         for run in runs.iter_mut() {
-            let handed = Handed(run);
+            let handed = BranchPointer(run);
             scope.spawn(move |_| unsafe { handed.run() });
         }
     });

@@ -579,7 +579,7 @@ impl Ctx {
 
 pub(crate) enum EntryBytes {
     Bytes(Vec<u8>),
-    Holding,
+    RetainsHandle,
     Function,
     EscapingHandle(EscapedHandle),
 }
@@ -606,7 +606,7 @@ pub(crate) fn close_entry_call(ctx: *mut Ctx) -> Result<EntryBytes, String> {
         }));
     }
     if held || l.resumes {
-        return Ok(EntryBytes::Holding);
+        return Ok(EntryBytes::RetainsHandle);
     }
     Ok(EntryBytes::Bytes(bytes))
 }

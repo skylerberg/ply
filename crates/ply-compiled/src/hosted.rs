@@ -21,7 +21,7 @@ use ply_core::host::Determinism::{self, Deterministic, Nondeterministic};
 use ply_core::host::{Pending, err_host_in_search, err_host_in_simulation};
 use ply_core::{Diagnostic, Resource, codes};
 use ply_host::jobs::{self, Failure, Job, Work};
-use ply_host::native::{found, parts, parts_of, told};
+use ply_host::native::{found, parts, parts_of, text_or_error};
 use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
@@ -132,7 +132,7 @@ impl Ctx {
         work: Work,
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
-        self.refusing(native, what, work, move || job().map_err(Failure::Said))
+        self.queued_fallible(native, what, work, move || job().map_err(Failure::Message))
     }
 
     fn queued(
@@ -143,11 +143,11 @@ impl Ctx {
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
         self.ticketed(native, what, work, false, move || {
-            job().map_err(Failure::Said)
+            job().map_err(Failure::Message)
         })
     }
 
-    fn refusing(
+    fn queued_fallible(
         &mut self,
         native: &'static str,
         what: &'static str,
@@ -172,7 +172,7 @@ impl Ctx {
             if here {
                 Ok(jobs::done_here(run, span, native, what, job))
             } else {
-                jobs::refusing(work, run, span, native, what, job)
+                jobs::queue_fallible(work, run, span, native, what, job)
             }
         });
         match submitted {
@@ -201,7 +201,7 @@ impl Ctx {
     }
 }
 
-fn asked<R>(
+fn if_host_allowed<R>(
     ctx: *mut Ctx,
     native: &'static str,
     determinism: Determinism,
@@ -237,7 +237,7 @@ fn granted<R>(
         );
         return rejected;
     }
-    asked(ctx, native, determinism, rejected, result)
+    if_host_allowed(ctx, native, determinism, rejected, result)
 }
 
 fn with_host_facilities<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
@@ -254,7 +254,7 @@ fn with_host_facilities<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> 
     }
 }
 
-fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T> {
+fn required_argument<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T> {
     if read.is_none() {
         c.fail(Diagnostic::error(
             codes::INTERNAL_ERROR,
@@ -366,7 +366,7 @@ pub unsafe extern "C" fn rt_observed(
         6 => return recorder.ran_program(),
         7 | 8 => return recorder.reached(path, kind.0 == 7),
         _ => {
-            handed(c, "observed", "a kind of read", None::<()>);
+            required_argument(c, "observed", "a kind of read", None::<()>);
             return;
         }
     };
@@ -384,7 +384,7 @@ pub unsafe extern "C" fn rt_observed(
 }
 
 pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "certgen_issue", Nondeterministic, TakenBytes(0), |c| {
+    if_host_allowed(ctx, "certgen_issue", Nondeterministic, TakenBytes(0), |c| {
         let said = match ply_host::certgen::issue(&[]) {
             Ok(issued) => [
                 &[1u8][..],
@@ -424,7 +424,7 @@ fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
 }
 
 pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    asked(ctx, "config_get", Nondeterministic, TakenBytes(0), |c| {
+    if_host_allowed(ctx, "config_get", Nondeterministic, TakenBytes(0), |c| {
         let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
             return TakenBytes(0);
         };
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenB
 }
 
 pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    asked(ctx, "config_secret_held", Nondeterministic, I64(0), |c| {
+    if_host_allowed(ctx, "config_secret_held", Nondeterministic, I64(0), |c| {
         let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
             return I64(0);
         };
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -
 }
 
 pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> SecretHandle {
-    asked(
+    if_host_allowed(
         ctx,
         "config_secret",
         Nondeterministic,
@@ -474,8 +474,8 @@ pub unsafe extern "C" fn rt_kdf_argon2(
     lanes: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_argon2", Deterministic, I64(0), |c| {
-        let (Some(password), Some(key)) = (secret::held(c, &password), secret::held(c, &key))
+    if_host_allowed(ctx, "kdf_argon2", Deterministic, I64(0), |c| {
+        let (Some(password), Some(key)) = (secret::sealed_value(c, &password), secret::sealed_value(c, &key))
         else {
             return I64(0);
         };
@@ -508,8 +508,8 @@ pub unsafe extern "C" fn rt_kdf_scrypt(
     p: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_scrypt", Deterministic, I64(0), |c| {
-        let Some(password) = secret::held(c, &password) else {
+    if_host_allowed(ctx, "kdf_scrypt", Deterministic, I64(0), |c| {
+        let Some(password) = secret::sealed_value(c, &password) else {
             return I64(0);
         };
         let work = password::Work::scrypt(
@@ -531,8 +531,8 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
     salt_len: I64,
     cost: I64,
 ) -> I64 {
-    asked(ctx, "kdf_bcrypt", Deterministic, I64(0), |c| {
-        let Some(password) = secret::held(c, &password) else {
+    if_host_allowed(ctx, "kdf_bcrypt", Deterministic, I64(0), |c| {
+        let Some(password) = secret::sealed_value(c, &password) else {
             return I64(0);
         };
         let work = password::Work::bcrypt(
@@ -555,8 +555,8 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
     iterations: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_pbkdf2", Deterministic, I64(0), |c| {
-        let Some(password) = secret::held(c, &password) else {
+    if_host_allowed(ctx, "kdf_pbkdf2", Deterministic, I64(0), |c| {
+        let Some(password) = secret::sealed_value(c, &password) else {
             return I64(0);
         };
         let Some(hash) = c.text(unsafe { borrowed(hash_at, hash_len) }) else {
@@ -574,67 +574,67 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
 }
 
 pub unsafe extern "C" fn rt_os_system(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_system", Nondeterministic, TakenBytes(0), |c| {
+    if_host_allowed(ctx, "os_system", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::OS.as_bytes().to_vec())
     })
 }
 
 pub unsafe extern "C" fn rt_os_machine(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_machine", Nondeterministic, TakenBytes(0), |c| {
+    if_host_allowed(ctx, "os_machine", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::ARCH.as_bytes().to_vec())
     })
 }
 
 pub unsafe extern "C" fn rt_os_uname(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_uname", Nondeterministic, TakenBytes(0), |c| {
-        c.given(told(ply_host::os::name()))
+    if_host_allowed(ctx, "os_uname", Nondeterministic, TakenBytes(0), |c| {
+        c.given(text_or_error(ply_host::os::name()))
     })
 }
 
 pub unsafe extern "C" fn rt_os_hostname(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_hostname", Nondeterministic, TakenBytes(0), |c| {
-        c.given(told(ply_host::os::hostname()))
+    if_host_allowed(ctx, "os_hostname", Nondeterministic, TakenBytes(0), |c| {
+        c.given(text_or_error(ply_host::os::hostname()))
     })
 }
 
 pub unsafe extern "C" fn rt_os_cpus(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_cpus", Nondeterministic, I64(0), |_| {
+    if_host_allowed(ctx, "os_cpus", Nondeterministic, I64(0), |_| {
         I64(ply_host::os::cpus())
     })
 }
 
 pub unsafe extern "C" fn rt_os_uid(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_uid", Nondeterministic, I64(0), |_| {
+    if_host_allowed(ctx, "os_uid", Nondeterministic, I64(0), |_| {
         I64(ply_host::os::uid())
     })
 }
 
 pub unsafe extern "C" fn rt_os_user_name(ctx: *mut Ctx, id: I64) -> TakenBytes {
-    asked(ctx, "os_user_name", Nondeterministic, TakenBytes(0), |c| {
+    if_host_allowed(ctx, "os_user_name", Nondeterministic, TakenBytes(0), |c| {
         c.given(found(ply_host::os::user_name(id.0)))
     })
 }
 
 pub unsafe extern "C" fn rt_os_pid(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_pid", Nondeterministic, I64(0), |_| {
+    if_host_allowed(ctx, "os_pid", Nondeterministic, I64(0), |_| {
         I64(i64::from(std::process::id()))
     })
 }
 
 pub unsafe extern "C" fn rt_os_executable(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_executable", Nondeterministic, TakenBytes(0), |c| {
+    if_host_allowed(ctx, "os_executable", Nondeterministic, TakenBytes(0), |c| {
         c.given(found(ply_host::os::executable()))
     })
 }
 
 pub unsafe extern "C" fn rt_os_big_endian(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_big_endian", Nondeterministic, I64(0), |_| {
+    if_host_allowed(ctx, "os_big_endian", Nondeterministic, I64(0), |_| {
         I64(i64::from(cfg!(target_endian = "big")))
     })
 }
 
 pub unsafe extern "C" fn rt_os_pointer_bits(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_pointer_bits", Nondeterministic, I64(0), |_| {
+    if_host_allowed(ctx, "os_pointer_bits", Nondeterministic, I64(0), |_| {
         I64(i64::from(usize::BITS))
     })
 }

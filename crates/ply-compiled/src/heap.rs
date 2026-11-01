@@ -442,8 +442,8 @@ impl Heap {
         self.blocks.live()
     }
 
-    pub fn held(&self) -> usize {
-        self.blocks.held()
+    pub fn retained_bytes(&self) -> usize {
+        self.blocks.retained_bytes()
     }
 
     pub fn runtime_blocks(&self) -> usize {

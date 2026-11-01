@@ -1,7 +1,7 @@
 use super::heap::Holding;
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
-use ply_compiled::frames::{Held, PlyFrame, base, call_recording_slots, release_frames};
+use ply_compiled::frames::{FrameObject, PlyFrame, base, call_recording_slots, release_frames};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
@@ -125,16 +125,16 @@ pub(super) fn every_kind(
     ctx: *mut Ctx,
     markers: [Word; 3],
     text: &Arc<str>,
-) -> ([Held; 3], [Word; 3]) {
+) -> ([FrameObject; 3], [Word; 3]) {
     let [f, capture, x] = markers;
     let f = closure(ctx, f, boxed(ctx, capture));
     let x = boxed(ctx, x);
     let h = unsafe { (*ctx).heap.native(Box::new(Holding(Arc::clone(text)))) };
     let held = unsafe {
         [
-            Held::Closure(Block::of(f)),
-            Held::Carried(Carried::new(Handed::of(x), &BOX_TYPE)),
-            Held::Handle(Block::of(h)),
+            FrameObject::Closure(Block::of(f)),
+            FrameObject::Carried(Carried::new(Handed::of(x), &BOX_TYPE)),
+            FrameObject::Handle(Block::of(h)),
         ]
     };
     (held, [f, x, h])

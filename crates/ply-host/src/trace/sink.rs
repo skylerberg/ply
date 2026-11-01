@@ -255,7 +255,7 @@ pub struct OwnedRecord {
 
 pub struct Recording {
     level: Level,
-    kept: Mutex<Vec<OwnedRecord>>,
+    records: Mutex<Vec<OwnedRecord>>,
     flushes: AtomicU64,
 }
 
@@ -269,13 +269,13 @@ impl Recording {
     pub fn new(level: Level) -> Recording {
         Recording {
             level,
-            kept: Mutex::new(Vec::new()),
+            records: Mutex::new(Vec::new()),
             flushes: AtomicU64::new(0),
         }
     }
 
     pub fn records(&self) -> Vec<OwnedRecord> {
-        lock(&self.kept).clone()
+        lock(&self.records).clone()
     }
 
     pub fn flushes(&self) -> u64 {
@@ -283,7 +283,7 @@ impl Recording {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        lock(&self.kept)
+        lock(&self.records)
             .iter()
             .map(|kept| {
                 let mut line = String::new();
@@ -323,7 +323,7 @@ impl Sink for Recording {
     }
 
     fn write(&self, record: &Record<'_>) {
-        lock(&self.kept).push(OwnedRecord {
+        lock(&self.records).push(OwnedRecord {
             ts: record.ts,
             kind: record.kind,
             level: record.level,

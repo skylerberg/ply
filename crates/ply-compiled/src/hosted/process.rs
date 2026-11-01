@@ -1,4 +1,4 @@
-use super::{Determinism, Nondeterministic, asked, text_at, texts_at, with_host_facilities};
+use super::{Determinism, Nondeterministic, if_host_allowed, text_at, texts_at, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -83,7 +83,7 @@ fn hosted<R: Copy>(
     rejected: R,
     result: impl FnOnce(&mut Ctx, &ProcessHost) -> Result<R, Diagnostic>,
 ) -> R {
-    asked(ctx, native, determinism, rejected, |c| {
+    if_host_allowed(ctx, native, determinism, rejected, |c| {
         let Some(found) = with_host_facilities(c, |facilities| facilities.process().cloned())
         else {
             return rejected;
@@ -237,7 +237,7 @@ pub unsafe extern "C" fn rt_process_read(ctx: *mut Ctx, max: I64) -> I64 {
         I64(0),
         |c, host| {
             let Some(max) =
-                super::handed(c, "process_read", "a length", usize::try_from(max.0).ok())
+                super::required_argument(c, "process_read", "a length", usize::try_from(max.0).ok())
             else {
                 return Ok(I64(0));
             };
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn rt_process_exit(ctx: *mut Ctx, code: I64) {
         OperationTarget::OwnProcess,
         (),
         |c, host| {
-            let Some(code) = super::handed(
+            let Some(code) = super::required_argument(
                 c,
                 "process_exit",
                 "an exit code",
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn rt_process_spawn(
                 return Ok(I64(0));
             };
             let job = host.spawn(&label, &args, &dir, &env, c.site())?;
-            Ok(c.refusing("process_spawn", "`process.spawn`", Work::Waiting, job))
+            Ok(c.queued_fallible("process_spawn", "`process.spawn`", Work::Waiting, job))
         },
     )
 }
@@ -350,7 +350,7 @@ pub unsafe extern "C" fn rt_process_start(
                 return Ok(TakenBytes(0));
             };
             let wiring = parse_stdio(unsafe { borrowed(wp, wn) });
-            let Some(io) = super::handed(c, "process_start", "a wiring", wiring) else {
+            let Some(io) = super::required_argument(c, "process_start", "a wiring", wiring) else {
                 return Ok(TakenBytes(0));
             };
             let said = match host.start(&label, &args, &dir, &env, &io, c.site())? {
@@ -390,7 +390,7 @@ pub unsafe extern "C" fn rt_process_wait(
                 return Ok(I64(0));
             };
             let job = host.wait(&label, child.0, timeout_ms.0, c.site())?;
-            Ok(c.refusing("process_wait", "`process.wait`", Work::Waiting, job))
+            Ok(c.queued_fallible("process_wait", "`process.wait`", Work::Waiting, job))
         },
     )
 }
@@ -412,7 +412,7 @@ pub unsafe extern "C" fn rt_process_signal(
         |c, host| {
             let (Some(label), Some(signal)) = (
                 text_at(c, lp, ln),
-                super::handed(c, "process_signal", "a signal", Signal::of(signal.0)),
+                super::required_argument(c, "process_signal", "a signal", Signal::of(signal.0)),
             ) else {
                 return Ok(I64(0));
             };
@@ -486,7 +486,7 @@ pub unsafe extern "C" fn rt_process_output_line(
                 return Ok(I64(0));
             };
             let job = host.output_line(&label, child.0, timeout_ms.0, c.site())?;
-            Ok(c.refusing(
+            Ok(c.queued_fallible(
                 "process_output_line",
                 "`process.output_line`",
                 Work::Waiting,

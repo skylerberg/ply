@@ -122,7 +122,7 @@ fn a_task_runs_on_its_own_stack_and_yields_back_in_order() {
     for _ in 0..4 {
         run_task();
         seen.push(with(|p| *p.log.last().unwrap()));
-        assert!(stack.holds(with(|p| p.task)));
+        assert!(stack.contains(with(|p| p.task)));
     }
     assert_eq!(seen, [10, 20, 30, 0]);
     PONG.with(|p| *p.borrow_mut() = None);
@@ -148,7 +148,7 @@ fn a_recursion_deeper_than_the_first_chunk_of_a_stack_extends_within_the_same_re
         "a frame lay above its caller's"
     );
     assert!(
-        frames.iter().all(|&f| stack.holds(f)),
+        frames.iter().all(|&f| stack.contains(f)),
         "a frame lay off the stack"
     );
     assert!(
@@ -157,7 +157,7 @@ fn a_recursion_deeper_than_the_first_chunk_of_a_stack_extends_within_the_same_re
     );
     assert!(stack.floor() < stack.top() - 2 * CHUNK + STACK_MARGIN);
     assert!(
-        stack.holds(stopped),
+        stack.contains(stopped),
         "the recursion stopped on its own stack"
     );
     assert!(frames.iter().all(|&f| (stopped..stack.top()).contains(&f)));
@@ -255,7 +255,7 @@ fn a_task_that_grew_its_stack_resumes_with_the_stack_limit_of_its_own_stack() {
         let first = task.prepare(grow_then_stop, g as usize);
         switch_stack_preserving_context((*g).ctx, &raw mut (*g).main, first);
         assert!(
-            !task.holds((*(*g).ctx).stack_floor.load(Relaxed)),
+            !task.contains((*(*g).ctx).stack_floor.load(Relaxed)),
             "the stack the task stopped to kept its floor"
         );
         (*(*g).ctx)

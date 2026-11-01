@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked, done, handed, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, done, required_argument, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64};
 use crate::rt::{Ctx, borrowed};
@@ -46,7 +46,7 @@ fn traced(c: &mut Ctx) -> Option<(Arc<Trace>, Owner)> {
 }
 
 fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Field)>> {
-    handed(
+    required_argument(
         c,
         native,
         "a record's fields",
@@ -55,13 +55,13 @@ fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Fi
 }
 
 pub unsafe extern "C" fn rt_trace_wants(ctx: *mut Ctx, level: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "trace_wants",
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some(level) = handed(c, "trace_wants", "a level", level_of(level)) else {
+            let Some(level) = required_argument(c, "trace_wants", "a level", level_of(level)) else {
                 return I64(0);
             };
             let wants = with_host_facilities(c, |facilities| facilities.tracing().wants(level));
@@ -85,7 +85,7 @@ pub unsafe extern "C" fn rt_trace_record(
     fields_addr: Addr,
     fields_len: I64,
 ) {
-    asked(ctx, "trace_record", Nondeterministic, (), |c: &mut Ctx| {
+    if_host_allowed(ctx, "trace_record", Nondeterministic, (), |c: &mut Ctx| {
         let kind = match kind.0 {
             0 => Some(RecordKind::Event),
             1 => Some(RecordKind::Count),
@@ -94,8 +94,8 @@ pub unsafe extern "C" fn rt_trace_record(
             _ => None,
         };
         let (Some(kind), Some(level)) = (
-            handed(c, "trace_record", "a record's kind", kind),
-            handed(c, "trace_record", "a level", level_of(level)),
+            required_argument(c, "trace_record", "a record's kind", kind),
+            required_argument(c, "trace_record", "a level", level_of(level)),
         ) else {
             return;
         };
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn rt_trace_record(
         let value = match kind {
             RecordKind::Gauge => {
                 let read = Decimal::from_str(value).ok();
-                let Some(value) = handed(c, "trace_record", "a gauge's value", read) else {
+                let Some(value) = required_argument(c, "trace_record", "a gauge's value", read) else {
                     return;
                 };
                 Some(value)
@@ -136,7 +136,7 @@ pub unsafe extern "C" fn rt_trace_enter(
     fields_addr: Addr,
     fields_len: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "trace_enter",
         Nondeterministic,
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn rt_trace_exit(
     reason_addr: Addr,
     reason_len: I64,
 ) {
-    asked(ctx, "trace_exit", Nondeterministic, (), |c: &mut Ctx| {
+    if_host_allowed(ctx, "trace_exit", Nondeterministic, (), |c: &mut Ctx| {
         let (Some(channel), Some(reason)) = (
             c.text(unsafe { borrowed(channel_addr, channel_len) }),
             c.text(unsafe { borrowed(reason_addr, reason_len) }),
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn rt_trace_exit(
             2 => Some(Outcome::Abandoned),
             _ => None,
         };
-        let Some(outcome) = handed(c, "trace_exit", "an outcome", outcome) else {
+        let Some(outcome) = required_argument(c, "trace_exit", "an outcome", outcome) else {
             return;
         };
         let Some((trace, owner)) = traced(c) else {

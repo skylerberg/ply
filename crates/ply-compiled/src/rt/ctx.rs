@@ -32,7 +32,7 @@ pub struct Ctx {
     pub heap: Heap,
     pub tables: Arc<Tables>,
     pub diagnostic: Option<Diagnostic>,
-    pub(crate) stacks: Vec<Vec<Kept>>,
+    pub(crate) stacks: Vec<Vec<SavedState>>,
     pub(super) free_stacks: Vec<usize>,
     pub(crate) current: usize,
     pub performed: Vec<Effect>,
@@ -52,7 +52,7 @@ pub struct Ctx {
     pub(crate) schedulers: Vec<(*mut crate::tasks::Scheduler, [i64; 3])>,
     pub accesses: Vec<(crate::tasks::Access, [i64; 3])>,
     pub(crate) last_trail: Option<Vec<u8>>,
-    pub(crate) held_at_root: Option<crate::entry::Held>,
+    pub(crate) retained_at_root: Option<crate::entry::Retained>,
     pub interleaving: Option<Vec<u8>>,
     pub(crate) pending: Option<Unhandled>,
     pub(crate) pending_words: Vec<Word>,
@@ -164,7 +164,7 @@ impl Ctx {
             schedulers: Vec::new(),
             accesses: Vec::new(),
             last_trail: None,
-            held_at_root: None,
+            retained_at_root: None,
             interleaving: None,
             pending: None,
             pending_words: Vec::new(),
@@ -179,13 +179,13 @@ impl Ctx {
         }
     }
 
-    pub(crate) fn keep(&mut self, k: Kept) -> usize {
+    pub(crate) fn keep(&mut self, k: SavedState) -> usize {
         let s = self.current;
         self.stacks[s].push(k);
         s
     }
 
-    pub(crate) fn pop_saved(&mut self, s: usize) -> Kept {
+    pub(crate) fn pop_saved(&mut self, s: usize) -> SavedState {
         self.stacks[s]
             .pop()
             .expect("a runtime frame finds what it kept when its call returns")
@@ -270,7 +270,7 @@ impl Ctx {
         self.schedulers.clear();
         self.accesses.clear();
         self.last_trail = None;
-        self.held_at_root = None;
+        self.retained_at_root = None;
         self.interleaving = None;
         self.scoped_made = 0;
         if let Some(p) = self.pending.take() {
@@ -285,7 +285,7 @@ impl Ctx {
         self.release_later.clear();
         self.marshallings.clear();
         self.taken.clear();
-        if self.heap.held() != 0 {
+        if self.heap.retained_bytes() != 0 {
             self.end();
         }
         self.detached.clear();
@@ -371,8 +371,8 @@ impl Ctx {
         self.heap.live_bytes() + self.workers(|b| b.live())
     }
 
-    pub fn held(&self) -> usize {
-        self.heap.held() + self.workers(|b| b.held())
+    pub fn retained_bytes(&self) -> usize {
+        self.heap.retained_bytes() + self.workers(|b| b.retained_bytes())
     }
 
     pub fn live(&self) -> usize {

@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked, handed, waited, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, required_argument, waited, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -121,8 +121,8 @@ fn statement(
     limits: &[u8],
 ) -> Option<(String, Vec<Scalar>, Limits)> {
     let sql = c.text(sql)?.to_string();
-    let params = handed(c, native, "a statement's values", decode_scalars(params))?;
-    let limits = handed(c, native, "a statement's limits", decode_limits(limits))?;
+    let params = required_argument(c, native, "a statement's values", decode_scalars(params))?;
+    let limits = required_argument(c, native, "a statement's limits", decode_limits(limits))?;
     Some((sql, params, limits))
 }
 
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn rt_sqlite_open(
     busy_ms: I64,
     statements: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "sqlite_open",
         Nondeterministic,
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn rt_sqlite_open(
                 2 => Some(Mode::Create),
                 _ => None,
             };
-            let Some(mode) = handed(c, "sqlite_open", "a mode", mode) else {
+            let Some(mode) = required_argument(c, "sqlite_open", "a mode", mode) else {
                 return I64(0);
             };
             let options = Options {
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn rt_sqlite_close(
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "sqlite_close",
         Nondeterministic,
@@ -208,7 +208,7 @@ fn ran(
     reads_only: bool,
     cursor: bool,
 ) -> I64 {
-    asked(ctx, native, Nondeterministic, I64(0), |c: &mut Ctx| {
+    if_host_allowed(ctx, native, Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label.0, label.1) }, what)
         else {
             return I64(0);
@@ -319,7 +319,7 @@ pub unsafe extern "C" fn rt_sqlite_control(
     conn: I64,
     step: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "sqlite_control",
         Nondeterministic,
@@ -337,7 +337,7 @@ pub unsafe extern "C" fn rt_sqlite_control(
                 3 => Some(Control::Rollback),
                 _ => None,
             };
-            let Some(step) = handed(c, "sqlite_control", "a transaction's step", step) else {
+            let Some(step) = required_argument(c, "sqlite_control", "a transaction's step", step) else {
                 return I64(0);
             };
             waited(
@@ -358,7 +358,7 @@ pub unsafe extern "C" fn rt_sqlite_backup(
     path_at: Addr,
     path_n: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "sqlite_backup",
         Nondeterministic,
@@ -385,7 +385,7 @@ pub unsafe extern "C" fn rt_sqlite_fetch(
     conn: I64,
     rows: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "sqlite_fetch",
         Nondeterministic,
@@ -412,7 +412,7 @@ pub unsafe extern "C" fn rt_sqlite_finish(
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "sqlite_finish",
         Nondeterministic,

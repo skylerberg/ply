@@ -12,7 +12,7 @@ use ply_core::host::MachineId;
 use ply_core::{HostBinding, HostRuntime, Span};
 use ply_host::jobs::{self, Work};
 use ply_host::observe::{Binary, Recorder, World};
-use ply_host::pool::Kept;
+use ply_host::pool::SecretBytes;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -68,12 +68,12 @@ fn reading_a_secret_line_removes_it_from_the_run_and_ending_the_entry_point_dele
     let mut ctx = context();
     let runtime = hosted(&mut ctx);
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
-    let kept = run.store_secret(Kept::new(b"hunter2".to_vec()));
+    let kept = run.store_secret(SecretBytes::new(b"hunter2".to_vec()));
     let secret = unsafe { rt_term_secret_taken(&mut ctx, I64(kept)) };
     assert!(ctx.take_failure().is_none());
     assert_eq!(unsafe { rt_secret_len(&mut ctx, secret) }.0, 7);
 
-    let left = run.store_secret(Kept::new(b"hunter3".to_vec()));
+    let left = run.store_secret(SecretBytes::new(b"hunter3".to_vec()));
     let _ = runtime.end_entry_point(MachineId::next());
     unsafe { rt_term_secret_taken(&mut ctx, I64(left)) };
     assert!(

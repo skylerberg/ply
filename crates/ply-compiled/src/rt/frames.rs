@@ -26,18 +26,18 @@ pub(crate) fn release_fun(f: Word) {
     unsafe { Block::of(f).release_function_if_last(running()) };
 }
 
-pub(crate) enum Kept {
+pub(crate) enum SavedState {
     Pending(Unhandled, Option<Diagnostic>),
     Args(Vec<Word>),
     Clause(usize),
 }
 
-impl Kept {
+impl SavedState {
     pub(crate) fn release(self) {
         match self {
-            Kept::Pending(raise, _) => raise.release(),
-            Kept::Args(words) => drop(words),
-            Kept::Clause(_) => {}
+            SavedState::Pending(raise, _) => raise.release(),
+            SavedState::Args(words) => drop(words),
+            SavedState::Clause(_) => {}
         }
     }
 }
@@ -46,7 +46,7 @@ pub(crate) fn call_clause(ctx: *mut Ctx, clause: Word, args: Vec<Word>) -> Word 
     let c = unsafe { &mut *ctx };
     let at = args.as_ptr();
     let n = args.len();
-    let here = c.keep(Kept::Args(args));
+    let here = c.keep(SavedState::Args(args));
     let r = call_fun(ctx, clause, unsafe { std::slice::from_raw_parts(at, n) });
     unsafe { &mut *ctx }.pop_saved(here).release();
     r

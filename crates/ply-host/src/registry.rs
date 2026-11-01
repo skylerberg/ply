@@ -280,7 +280,7 @@ impl HostRuntime for Facilities {
         self.trace.flush();
         crate::stdio::restore_terminal();
         if let Some(process) = &self.process {
-            process.settle();
+            process.flush_output();
         }
         ShutdownReport {
             spans_left_open: usize::try_from(self.trace.left_open()).unwrap_or(usize::MAX),

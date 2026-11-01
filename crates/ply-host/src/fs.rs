@@ -154,7 +154,7 @@ impl Op {
             | Op::Symlink
             | Op::ReadLink
             | Op::Stat
-            | Op::Link => Last::Kept,
+            | Op::Link => Last::NoFollow,
             _ => Last::FollowLinks,
         }
     }
@@ -324,7 +324,7 @@ struct Descriptors {
 
 pub struct FsHost {
     roots: Roots,
-    held: Arc<Mutex<BTreeSet<PathBuf>>>,
+    locked_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
     descriptors: Arc<Mutex<Descriptors>>,
 }
 
@@ -332,7 +332,7 @@ impl FsHost {
     pub fn new(roots: Roots) -> FsHost {
         FsHost {
             roots,
-            held: Arc::new(Mutex::new(BTreeSet::new())),
+            locked_paths: Arc::new(Mutex::new(BTreeSet::new())),
             descriptors: Arc::new(Mutex::new(Descriptors::default())),
         }
     }
@@ -348,7 +348,7 @@ impl FsHost {
             .ok_or_else(|| unbound(op, label, span))
     }
 
-    pub fn asked(
+    pub fn run_operation(
         &self,
         op: Op,
         label: &str,
@@ -362,7 +362,7 @@ impl FsHost {
         {
             return Err(too_large(len as u64, &path, span));
         }
-        let held = Arc::clone(&self.held);
+        let held = Arc::clone(&self.locked_paths);
         let descriptors = Arc::clone(&self.descriptors);
         Ok(Box::new(move || {
             run(op, &root, &path, second, &held, &descriptors, span)
@@ -472,7 +472,7 @@ fn run(
     span: Span,
 ) -> Result<Vec<u8>, Failure> {
     let last = match second {
-        Second::Opening(Opening::Create) => Last::Kept,
+        Second::Opening(Opening::Create) => Last::NoFollow,
         _ => op.last(),
     };
     let Some(target) = walked(root, path, last, span).map_err(Failure::Rejected)? else {
@@ -482,7 +482,7 @@ fn run(
         walked(root, to, last, span).map_err(Failure::Rejected)
     };
     let unhanded = |what: &str| {
-        Err(Failure::Said(format!(
+        Err(Failure::Message(format!(
             "{} reached the pool {what}",
             op.what()
         )))
@@ -560,7 +560,7 @@ fn run(
             Ok(meta) if meta.is_dir() => std::fs::remove_dir(&target).is_ok(),
             Ok(_) => std::fs::remove_file(&target).is_ok(),
         }),
-        (Op::Rename, Second::Path(to)) => match other(&to, Last::Kept)? {
+        (Op::Rename, Second::Path(to)) => match other(&to, Last::NoFollow)? {
             Some(destination) => done(std::fs::rename(&target, &destination).is_ok()),
             None => op.nothing(),
         },
@@ -610,7 +610,7 @@ fn run(
             Err(bytes) => return Err(Failure::Rejected(walk_too_large(bytes, path, span))),
         },
         (Op::Space, _) => found(space_of(&target).map(Space::flat)),
-        (Op::Link, Second::Path(to)) => match other(&to, Last::Kept)? {
+        (Op::Link, Second::Path(to)) => match other(&to, Last::NoFollow)? {
             Some(existing) => tried(hard_link(&existing, &target).map(|()| Vec::new())),
             None => op.nothing(),
         },
@@ -1166,7 +1166,7 @@ const LINK_HOPS: usize = 40;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Last {
     FollowLinks,
-    Kept,
+    NoFollow,
 }
 
 pub fn confine(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
@@ -1208,7 +1208,7 @@ fn walked(root: &Path, path: &str, last: Last, span: Span) -> Result<Option<Path
             continue;
         }
         at.push(&name);
-        if missing || (last == Last::Kept && ahead.is_empty()) {
+        if missing || (last == Last::NoFollow && ahead.is_empty()) {
             continue;
         }
         match std::fs::symlink_metadata(&at) {

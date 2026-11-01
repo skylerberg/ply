@@ -185,7 +185,7 @@ fn rooted(at: &Path) -> FsHost {
 fn ran(job: ply_host::jobs::FallibleJob) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
-        Failure::Said(reason) => panic!("the job failed: {reason}"),
+        Failure::Message(reason) => panic!("the job failed: {reason}"),
     })
 }
 
@@ -196,7 +196,7 @@ fn asked(
     path: &str,
     second: Second,
 ) -> Result<Vec<u8>, Diagnostic> {
-    ran(fs.asked(op, label, path.to_string(), second, span())?)
+    ran(fs.run_operation(op, label, path.to_string(), second, span())?)
 }
 
 fn perform(fs: &FsHost, op: Op, path: &str, second: Second) -> Result<Vec<u8>, Diagnostic> {

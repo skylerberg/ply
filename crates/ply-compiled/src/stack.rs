@@ -82,7 +82,7 @@ impl Stack {
         self.0.top()
     }
 
-    pub fn holds(&self, address: usize) -> bool {
+    pub fn contains(&self, address: usize) -> bool {
         (self.0.base..self.top()).contains(&address)
     }
 

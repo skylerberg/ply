@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked, done, given, handed, waited, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, done, given, required_argument, waited, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
@@ -185,7 +185,7 @@ pub unsafe extern "C" fn rt_net_listen(
     label_n: I64,
     at: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_listen",
         Nondeterministic,
@@ -194,7 +194,7 @@ pub unsafe extern "C" fn rt_net_listen(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(at) = handed(c, "net_listen", "a port", port(at)) else {
+            let Some(at) = required_argument(c, "net_listen", "a port", port(at)) else {
                 return I64(0);
             };
             match net.listen(label, at, c.site()) {
@@ -216,7 +216,7 @@ pub unsafe extern "C" fn rt_net_listen_tls(
     credential_at: Addr,
     credential_n: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_listen_tls",
         Nondeterministic,
@@ -225,7 +225,7 @@ pub unsafe extern "C" fn rt_net_listen_tls(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(at) = handed(c, "net_listen_tls", "a port", port(at)) else {
+            let Some(at) = required_argument(c, "net_listen_tls", "a port", port(at)) else {
                 return I64(0);
             };
             let Some(credential) = c.text(unsafe { borrowed(credential_at, credential_n) }) else {
@@ -251,7 +251,7 @@ pub unsafe extern "C" fn rt_net_listen_on(
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "net_listen_on",
         Nondeterministic,
@@ -263,8 +263,8 @@ pub unsafe extern "C" fn rt_net_listen_on(
             let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
-                handed(c, "net_listen_on", "an address", to),
-                handed(c, "net_listen_on", "socket options", options),
+                required_argument(c, "net_listen_on", "an address", to),
+                required_argument(c, "net_listen_on", "socket options", options),
             ) else {
                 return TakenBytes(0);
             };
@@ -282,7 +282,7 @@ pub unsafe extern "C" fn rt_net_listen_unix(
     path_at: Addr,
     path_n: I64,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "net_listen_unix",
         Nondeterministic,
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn rt_net_connect(
     at: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_connect",
         Nondeterministic,
@@ -325,8 +325,8 @@ pub unsafe extern "C" fn rt_net_connect(
                 return I64(0);
             };
             let (Some(at), Some(timeout)) = (
-                handed(c, "net_connect", "a port", port(at)),
-                handed(c, "net_connect", "a deadline", deadline(timeout_ms)),
+                required_argument(c, "net_connect", "a port", port(at)),
+                required_argument(c, "net_connect", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
@@ -345,7 +345,7 @@ pub unsafe extern "C" fn rt_net_connect_tls(
     at: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_connect_tls",
         Nondeterministic,
@@ -358,8 +358,8 @@ pub unsafe extern "C" fn rt_net_connect_tls(
                 return I64(0);
             };
             let (Some(at), Some(timeout)) = (
-                handed(c, "net_connect_tls", "a port", port(at)),
-                handed(c, "net_connect_tls", "a deadline", deadline(timeout_ms)),
+                required_argument(c, "net_connect_tls", "a port", port(at)),
+                required_argument(c, "net_connect_tls", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn rt_net_connect_to(
     options_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_connect_to",
         Nondeterministic,
@@ -392,9 +392,9 @@ pub unsafe extern "C" fn rt_net_connect_to(
             let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options), Some(timeout)) = (
-                handed(c, "net_connect_to", "an address", to),
-                handed(c, "net_connect_to", "socket options", options),
-                handed(c, "net_connect_to", "a deadline", deadline(timeout_ms)),
+                required_argument(c, "net_connect_to", "an address", to),
+                required_argument(c, "net_connect_to", "socket options", options),
+                required_argument(c, "net_connect_to", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
@@ -415,7 +415,7 @@ pub unsafe extern "C" fn rt_net_connect_unix(
     path_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_connect_unix",
         Nondeterministic,
@@ -430,7 +430,7 @@ pub unsafe extern "C" fn rt_net_connect_unix(
             ) else {
                 return I64(0);
             };
-            let Some(timeout) = handed(c, "net_connect_unix", "a deadline", deadline(timeout_ms))
+            let Some(timeout) = required_argument(c, "net_connect_unix", "a deadline", deadline(timeout_ms))
             else {
                 return I64(0);
             };
@@ -446,7 +446,7 @@ pub unsafe extern "C" fn rt_net_handshake(
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_handshake",
         Nondeterministic,
@@ -474,7 +474,7 @@ pub unsafe extern "C" fn rt_net_start_tls(
     unread: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_start_tls",
         Nondeterministic,
@@ -509,7 +509,7 @@ pub unsafe extern "C" fn rt_net_serve_tls(
     unread: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_serve_tls",
         Nondeterministic,
@@ -539,19 +539,19 @@ fn upgrade(
     unread: I64,
     timeout_ms: I64,
 ) -> Option<Upgrade> {
-    let alpn = handed(
+    let alpn = required_argument(
         c,
         native,
         "application protocols",
         texts(unsafe { borrowed(alpn_at, alpn_n) }),
     )?;
-    let unread = handed(
+    let unread = required_argument(
         c,
         native,
         "a count of unread bytes",
         usize::try_from(unread.0).ok(),
     )?;
-    let timeout = handed(c, native, "a deadline", deadline(timeout_ms))?;
+    let timeout = required_argument(c, native, "a deadline", deadline(timeout_ms))?;
     Some(Upgrade {
         alpn,
         unread,
@@ -565,7 +565,7 @@ pub unsafe extern "C" fn rt_net_accept(
     label_n: I64,
     listener: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_accept",
         Nondeterministic,
@@ -588,13 +588,13 @@ pub unsafe extern "C" fn rt_net_recv(
     max: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_recv", Nondeterministic, I64(0), |c: &mut Ctx| {
+    if_host_allowed(ctx, "net_recv", Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return I64(0);
         };
         let (Some(max), Some(timeout)) = (
-            handed(c, "net_recv", "a byte count", count(max)),
-            handed(c, "net_recv", "a deadline", deadline(timeout_ms)),
+            required_argument(c, "net_recv", "a byte count", count(max)),
+            required_argument(c, "net_recv", "a deadline", deadline(timeout_ms)),
         ) else {
             return I64(0);
         };
@@ -612,11 +612,11 @@ pub unsafe extern "C" fn rt_net_send(
     payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
+    if_host_allowed(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return I64(0);
         };
-        let Some(timeout) = handed(c, "net_send", "a deadline", deadline(timeout_ms)) else {
+        let Some(timeout) = required_argument(c, "net_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
         let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
@@ -633,7 +633,7 @@ pub unsafe extern "C" fn rt_net_send_secret(
     framed: SecretHandle,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_send_secret",
         Nondeterministic,
@@ -642,10 +642,10 @@ pub unsafe extern "C" fn rt_net_send_secret(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(framed) = secret::held(c, &framed) else {
+            let Some(framed) = secret::sealed_value(c, &framed) else {
                 return I64(0);
             };
-            let Some(timeout) = handed(c, "net_send_secret", "a deadline", deadline(timeout_ms))
+            let Some(timeout) = required_argument(c, "net_send_secret", "a deadline", deadline(timeout_ms))
             else {
                 return I64(0);
             };
@@ -661,7 +661,7 @@ pub unsafe extern "C" fn rt_net_close_write(
     label_n: I64,
     conn: I64,
 ) {
-    asked(
+    if_host_allowed(
         ctx,
         "net_close_write",
         Nondeterministic,
@@ -677,7 +677,7 @@ pub unsafe extern "C" fn rt_net_close_write(
 }
 
 pub unsafe extern "C" fn rt_net_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
-    asked(ctx, "net_close", Nondeterministic, (), |c: &mut Ctx| {
+    if_host_allowed(ctx, "net_close", Nondeterministic, (), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return;
         };
@@ -694,7 +694,7 @@ pub unsafe extern "C" fn rt_net_set_option(
     option_addr: Addr,
     option_len: I64,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "net_set_option",
         Nondeterministic,
@@ -729,7 +729,7 @@ fn set_option(
         return TakenBytes(0);
     };
     let option = SocketOption::read(unsafe { borrowed(option_addr, option_len) });
-    let Some(option) = handed(c, native, "a socket option", option) else {
+    let Some(option) = required_argument(c, native, "a socket option", option) else {
         return TakenBytes(0);
     };
     let span = c.site();
@@ -757,7 +757,7 @@ pub unsafe extern "C" fn rt_net_local_port(
     label_n: I64,
     socket: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "net_local_port",
         Nondeterministic,
@@ -788,7 +788,7 @@ fn described(
     datagram: bool,
     read: SocketInfoReader,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         native,
         Nondeterministic,
@@ -916,7 +916,7 @@ pub unsafe extern "C" fn rt_udp_bind(
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "udp_bind",
         Nondeterministic,
@@ -928,8 +928,8 @@ pub unsafe extern "C" fn rt_udp_bind(
             let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
-                handed(c, "udp_bind", "an address", to),
-                handed(c, "udp_bind", "socket options", options),
+                required_argument(c, "udp_bind", "an address", to),
+                required_argument(c, "udp_bind", "socket options", options),
             ) else {
                 return TakenBytes(0);
             };
@@ -946,7 +946,7 @@ pub unsafe extern "C" fn rt_udp_connect(
     endpoint_at: Addr,
     endpoint_n: I64,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "udp_connect",
         Nondeterministic,
@@ -956,7 +956,7 @@ pub unsafe extern "C" fn rt_udp_connect(
                 return TakenBytes(0);
             };
             let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
-            let Some(to) = handed(c, "udp_connect", "an address", to) else {
+            let Some(to) = required_argument(c, "udp_connect", "an address", to) else {
                 return TakenBytes(0);
             };
             let result = ply_host::udp::connect(&net, label, socket.0, &to, c.site());
@@ -977,7 +977,7 @@ pub unsafe extern "C" fn rt_udp_send_to(
     payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "udp_send_to",
         Nondeterministic,
@@ -988,8 +988,8 @@ pub unsafe extern "C" fn rt_udp_send_to(
             };
             let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let (Some(to), Some(timeout)) = (
-                handed(c, "udp_send_to", "an address", to),
-                handed(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
+                required_argument(c, "udp_send_to", "an address", to),
+                required_argument(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
@@ -1009,11 +1009,11 @@ pub unsafe extern "C" fn rt_udp_send(
     payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
+    if_host_allowed(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return I64(0);
         };
-        let Some(timeout) = handed(c, "udp_send", "a deadline", deadline(timeout_ms)) else {
+        let Some(timeout) = required_argument(c, "udp_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
         let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
@@ -1030,7 +1030,7 @@ pub unsafe extern "C" fn rt_udp_recv_from(
     max: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "udp_recv_from",
         Nondeterministic,
@@ -1040,8 +1040,8 @@ pub unsafe extern "C" fn rt_udp_recv_from(
                 return I64(0);
             };
             let (Some(max), Some(timeout)) = (
-                handed(c, "udp_recv_from", "a byte count", count(max)),
-                handed(c, "udp_recv_from", "a deadline", deadline(timeout_ms)),
+                required_argument(c, "udp_recv_from", "a byte count", count(max)),
+                required_argument(c, "udp_recv_from", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
@@ -1059,7 +1059,7 @@ pub unsafe extern "C" fn rt_udp_set_option(
     option_addr: Addr,
     option_len: I64,
 ) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "udp_set_option",
         Nondeterministic,
@@ -1080,7 +1080,7 @@ pub unsafe extern "C" fn rt_udp_set_option(
 }
 
 pub unsafe extern "C" fn rt_udp_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
-    asked(ctx, "udp_close", Nondeterministic, (), |c: &mut Ctx| {
+    if_host_allowed(ctx, "udp_close", Nondeterministic, (), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return;
         };

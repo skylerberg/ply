@@ -465,7 +465,7 @@ pub unsafe extern "C" fn rt_toolchain_ran(
 
 pub unsafe extern "C" fn rt_memory_heap(ctx: *mut Ctx) -> TakenBytes {
     run_if_toolchain_allowed(ctx, "memory_heap", Nondeterministic, TakenBytes(0), |c| {
-        let (live, held) = (c.live_bytes() as i64, c.held() as i64);
+        let (live, held) = (c.live_bytes() as i64, c.retained_bytes() as i64);
         c.given(parts(&[&int(live)[..], &int(held)[..]]))
     })
 }

@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked};
+use super::{Nondeterministic, if_host_allowed};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -24,7 +24,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 pub unsafe extern "C" fn rt_dns_lookup(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "dns_lookup",
         Nondeterministic,
@@ -42,7 +42,7 @@ pub unsafe extern "C" fn rt_dns_lookup(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_dns_reverse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "dns_reverse",
         Nondeterministic,
@@ -64,7 +64,7 @@ pub unsafe extern "C" fn rt_dns_reverse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_dns_configuration(ctx: *mut Ctx) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "dns_configuration",
         Nondeterministic,

@@ -7,7 +7,7 @@ pub type Job = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
 
 #[derive(Debug)]
 pub enum Failure {
-    Said(String),
+    Message(String),
     Rejected(Diagnostic),
 }
 
@@ -43,8 +43,8 @@ pub fn submit(
     what: &'static str,
     job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
 ) -> Result<Pending, Diagnostic> {
-    refusing(work, run, span, label, what, move || {
-        job().map_err(Failure::Said)
+    queue_fallible(work, run, span, label, what, move || {
+        job().map_err(Failure::Message)
     })
 }
 
@@ -58,7 +58,7 @@ pub fn done_here(
     run.done_here(span, label, what, job)
 }
 
-pub fn refusing(
+pub fn queue_fallible(
     work: Work,
     run: &Arc<Run>,
     span: Span,

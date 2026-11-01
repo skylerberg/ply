@@ -1,6 +1,6 @@
 use ply_core::host::MachineId;
 use ply_core::{Diagnostic, Pending, Span, codes};
-use ply_host::pool::{JobOutput, Kept, MAX_BLOCKING_OPERATIONS, Pool, Run, WakeCounter};
+use ply_host::pool::{JobOutput, SecretBytes, MAX_BLOCKING_OPERATIONS, Pool, Run, WakeCounter};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -258,8 +258,8 @@ fn a_run_waiting_on_its_job_wakes_when_that_job_finishes_and_not_when_another_ru
     );
 }
 
-fn secret(text: &str) -> Kept {
-    Kept::new(text.as_bytes().to_vec())
+fn secret(text: &str) -> SecretBytes {
+    SecretBytes::new(text.as_bytes().to_vec())
 }
 
 #[test]

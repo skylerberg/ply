@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked};
+use super::{Nondeterministic, if_host_allowed};
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::I64;
@@ -19,7 +19,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 pub unsafe extern "C" fn rt_entropy_next(ctx: *mut Ctx) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "entropy_next",
         Nondeterministic,
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn rt_entropy_next(ctx: *mut Ctx) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_entropy_secret(ctx: *mut Ctx, n: I64) -> SecretHandle {
-    asked(
+    if_host_allowed(
         ctx,
         "entropy_secret",
         Nondeterministic,

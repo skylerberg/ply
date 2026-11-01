@@ -36,9 +36,9 @@ fn ending_a_heap_frees_all_its_memory_and_lets_it_allocate_again() {
     let mut h = Heap::new();
     block(&mut h, 8);
     block(&mut h, 200 << 20);
-    assert!(h.held() > 200 << 20);
+    assert!(h.retained_bytes() > 200 << 20);
     h.end();
-    assert_eq!((h.held(), h.live()), (0, 0));
+    assert_eq!((h.retained_bytes(), h.live()), (0, 0));
     block(&mut h, 8);
     assert_eq!(h.live(), 1, "an ended heap allocates afresh");
 }
@@ -49,11 +49,11 @@ fn a_heap_reserves_little_more_memory_than_its_blocks_need() {
     for _ in 0..4096 {
         block(&mut h, 4096);
     }
-    let held = h.held();
+    let held = h.retained_bytes();
     assert!(held < 4096 * (4096 + HEADER) * 5 / 4, "{held} bytes held");
     let mut big = Heap::new();
     block(&mut big, 1 << 20);
-    assert_eq!(big.held(), (1 << 20) + HEADER);
+    assert_eq!(big.retained_bytes(), (1 << 20) + HEADER);
 }
 
 #[test]
@@ -61,14 +61,14 @@ fn memory_freed_from_blocks_of_one_size_is_reused_for_blocks_of_another_size() {
     let mut h = Heap::new();
     enter(&mut h);
     let small: Vec<Word> = (0..100_000).map(|_| block(&mut h, 8)).collect();
-    let peak = h.held();
+    let peak = h.retained_bytes();
     for w in small {
         freed(&mut h, w, 8);
     }
     for _ in 0..30_000 {
         block(&mut h, 40);
     }
-    assert!(h.held() <= peak, "{} bytes held past {peak}", h.held());
+    assert!(h.retained_bytes() <= peak, "{} bytes held past {peak}", h.retained_bytes());
     leave();
     h.end();
 }
@@ -272,7 +272,7 @@ fn live_bytes_count_the_blocks_of_live_values_and_drop_a_block_once_it_is_freed(
     assert_eq!(h.live_bytes(), Heap::object_size(8) + big);
     freed(&mut h, small, 8);
     assert_eq!(h.live_bytes(), big, "the given-back block still counted");
-    assert!(h.live_bytes() <= h.held());
+    assert!(h.live_bytes() <= h.retained_bytes());
     leave();
     h.end();
 }

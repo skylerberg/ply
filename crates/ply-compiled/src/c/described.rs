@@ -36,7 +36,7 @@ fn facts() -> Vec<(&'static str, usize)> {
         recording, bridge, hosted, unserved, performed_root,
         performed_start, performed_end, task, alloc, constants);
     laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
-    laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
+    laid!(out, Page as "PlyPage": free, fresh, end, owner, remote_free_state, next, prev, block, live, class,
         listed, spare);
     laid!(out, ActivePages as "PlyFilling": pages, name, reused);
     laid!(out, Alloc as "PlyAlloc": blocks, count, slow);

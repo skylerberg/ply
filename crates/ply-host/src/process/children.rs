@@ -37,18 +37,18 @@ impl Finished {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Heard {
-    Said(String),
+pub enum OutputEvent {
+    Line(String),
     Quiet,
     Closed,
 }
 
-impl Heard {
+impl OutputEvent {
     pub fn flat(self) -> Vec<u8> {
         match self {
-            Heard::Said(line) => [&[0u8][..], line.as_bytes()].concat(),
-            Heard::Quiet => vec![1],
-            Heard::Closed => vec![2],
+            OutputEvent::Line(line) => [&[0u8][..], line.as_bytes()].concat(),
+            OutputEvent::Quiet => vec![1],
+            OutputEvent::Closed => vec![2],
         }
     }
 }
@@ -300,11 +300,11 @@ impl Child {
         }
     }
 
-    pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, ProcessError> {
+    pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<OutputEvent, ProcessError> {
         let mut state = self.lock();
         loop {
             if state.spent {
-                return Ok(Heard::Closed);
+                return Ok(OutputEvent::Closed);
             }
             if state.lines_overflowed() {
                 return Err(ProcessError::TooMuch {
@@ -313,14 +313,14 @@ impl Child {
                 });
             }
             if let Some(line) = state.next_line() {
-                return Ok(Heard::Said(line));
+                return Ok(OutputEvent::Line(line));
             }
             if !state.line_streams_open() {
-                return Ok(Heard::Closed);
+                return Ok(OutputEvent::Closed);
             }
             state = match until(&self.changed, state, deadline) {
                 Some(state) => state,
-                None => return Ok(Heard::Quiet),
+                None => return Ok(OutputEvent::Quiet),
             };
         }
     }

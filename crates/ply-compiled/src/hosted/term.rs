@@ -1,4 +1,4 @@
-use super::{Nondeterministic, asked, handed, waited, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, required_argument, waited, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{I64, TakenBytes};
@@ -53,7 +53,7 @@ fn mode_number(mode: Mode) -> i64 {
 }
 
 pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "term_is_terminal",
         Nondeterministic,
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 
                 2 => Some(Standard::Err),
                 _ => None,
             };
-            match handed(c, "term_is_terminal", "a stream", stream) {
+            match required_argument(c, "term_is_terminal", "a stream", stream) {
                 Some(stream) => I64(i64::from(stdio::is_terminal(stream))),
                 None => I64(0),
             }
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 
 }
 
 pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
-    asked(
+    if_host_allowed(
         ctx,
         "term_size",
         Nondeterministic,
@@ -88,13 +88,13 @@ pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
 }
 
 pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "term_mode",
         Nondeterministic,
         I64(-1),
         |c: &mut Ctx| {
-            let Some(mode) = handed(c, "term_mode", "a mode", mode_of(mode.0)) else {
+            let Some(mode) = required_argument(c, "term_mode", "a mode", mode_of(mode.0)) else {
                 return I64(-1);
             };
             match stdio::set_mode(mode) {
@@ -110,13 +110,13 @@ pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "term_input",
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some(max) = handed(c, "term_input", "a length", usize::try_from(max.0).ok()) else {
+            let Some(max) = required_argument(c, "term_input", "a length", usize::try_from(max.0).ok()) else {
                 return I64(0);
             };
             let deadline = u64::try_from(timeout_ms.0)
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64)
 }
 
 pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "term_secret_line",
         Nondeterministic,
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
             };
             let job: Job = Box::new(move || match stdio::read_secret_line() {
                 Ok(Some(mut line)) => {
-                    let kept = ply_host::pool::Kept::new(std::mem::take(&mut *line).into_bytes());
+                    let kept = ply_host::pool::SecretBytes::new(std::mem::take(&mut *line).into_bytes());
                     Ok(found(run.upgrade().map(|run| int(run.store_secret(kept)))))
                 }
                 Ok(None) => Ok(found(None::<[u8; 8]>)),
@@ -156,7 +156,7 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
-    asked(
+    if_host_allowed(
         ctx,
         "term_secret_taken",
         Nondeterministic,
@@ -165,7 +165,7 @@ pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> Sec
             let line =
                 with_host_facilities(c, |facilities| facilities.run().remove_secret(number.0))
                     .flatten();
-            match handed(c, "term_secret_taken", "a line's number", line) {
+            match required_argument(c, "term_secret_taken", "a line's number", line) {
                 Some(line) if std::str::from_utf8(&line).is_ok() => secret::sealed(c, true, line),
                 Some(_) => secret::sealed(c, true, Zeroizing::new(Vec::new())),
                 None => SecretHandle::of(0),

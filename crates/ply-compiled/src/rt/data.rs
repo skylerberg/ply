@@ -9,7 +9,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
     held: *const PlyType,
     result: *const PlyType,
 ) -> Handed {
-    use crate::frames::{Held, call_recording_slots};
+    use crate::frames::{FrameObject, call_recording_slots};
     let c = unsafe { &mut *ctx };
     let words = (c.entering_desc, c.entering_words);
     let entering = move || {
@@ -22,16 +22,16 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let f = acquire.word();
     entering();
     let holding = [
-        Held::Closure(acquire),
-        Held::Closure(body),
-        Held::Closure(cleanup),
+        FrameObject::Closure(acquire),
+        FrameObject::Closure(body),
+        FrameObject::Closure(cleanup),
     ];
     let (acquired, back) =
         unsafe { call_recording_slots(ctx, holding, || Block::of(f).call(ctx, &[])) };
     let [
-        Held::Closure(acquire),
-        Held::Closure(body),
-        Held::Closure(cleanup),
+        FrameObject::Closure(acquire),
+        FrameObject::Closure(body),
+        FrameObject::Closure(cleanup),
     ] = back
     else {
         unreachable!("a record gives back what it held");
@@ -57,17 +57,17 @@ pub unsafe extern "C" fn rt_with_cleanup(
         let given = held.dup(ctx).handed().word();
         let f = body.word();
         let holding = [
-            Held::Closure(body),
-            Held::Closure(cleanup),
-            Held::Carried(held),
+            FrameObject::Closure(body),
+            FrameObject::Closure(cleanup),
+            FrameObject::Carried(held),
         ];
         entering();
         let (r, back) =
             unsafe { call_recording_slots(ctx, holding, || Block::of(f).call(ctx, &[given])) };
         let [
-            Held::Closure(body),
-            Held::Closure(cleanup),
-            Held::Carried(held),
+            FrameObject::Closure(body),
+            FrameObject::Closure(cleanup),
+            FrameObject::Carried(held),
         ] = back
         else {
             unreachable!("a record gives back what it held");
@@ -92,16 +92,16 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let (cleanup, returned) = match returned {
         Some(a) => {
             let (_, back) = unsafe {
-                call_recording_slots(ctx, [Held::Closure(cleanup), Held::Carried(a)], call)
+                call_recording_slots(ctx, [FrameObject::Closure(cleanup), FrameObject::Carried(a)], call)
             };
-            let [Held::Closure(cleanup), Held::Carried(a)] = back else {
+            let [FrameObject::Closure(cleanup), FrameObject::Carried(a)] = back else {
                 unreachable!("a record gives back what it held");
             };
             (cleanup, Some(a))
         }
         None => {
-            let (_, back) = unsafe { call_recording_slots(ctx, [Held::Closure(cleanup)], call) };
-            let [Held::Closure(cleanup)] = back else {
+            let (_, back) = unsafe { call_recording_slots(ctx, [FrameObject::Closure(cleanup)], call) };
+            let [FrameObject::Closure(cleanup)] = back else {
                 unreachable!("a record gives back what it held");
             };
             (cleanup, None)
@@ -143,7 +143,7 @@ impl Unwinding {
         }
         let pending = c.pending.take().map(|raise| {
             let failure = c.diagnostic.take();
-            c.keep(Kept::Pending(raise, failure))
+            c.keep(SavedState::Pending(raise, failure))
         });
         c.failed = 0;
         let entered = crate::tasks::shielded(c, crate::tasks::BracketPhase::Release);
@@ -157,7 +157,7 @@ impl Unwinding {
 
     fn resume_failure(self, c: &mut Ctx) -> bool {
         let pending = self.pending.map(|here| match c.pop_saved(here) {
-            Kept::Pending(raise, failure) => (raise, failure),
+            SavedState::Pending(raise, failure) => (raise, failure),
             _ => unreachable!("a release keeps the pending raise it runs during"),
         });
         let cancelled = crate::tasks::leave_bracket(c, self.entered);

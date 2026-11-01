@@ -125,13 +125,13 @@ pub struct Usage {
     pub nanos: u64,
     pub host: bool,
     pub performs: u64,
-    pub held: Held,
+    pub retained: Retained,
     pub runtime_blocks: u64,
     pub live: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Held {
+pub struct Retained {
     pub native_objects: u64,
     pub scheduled: u64,
     pub task_stacks: u64,
@@ -217,7 +217,7 @@ pub fn enter(
                 nanos,
                 host: ctx.host_use.used_nondeterminism(),
                 performs: last.performs,
-                held: last.held,
+                retained: last.held,
                 runtime_blocks: last.runtime_blocks,
                 live: last.live,
             },
@@ -343,7 +343,7 @@ pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T>
 
 struct Last {
     performs: u64,
-    held: Held,
+    held: Retained,
     interleaving: Option<Vec<u8>>,
     runtime_blocks: u64,
     live: u64,
@@ -399,7 +399,7 @@ fn entered(
 }
 
 fn returned(ctx: &mut Ctx) -> Last {
-    let held = ctx.held_at_root.take().unwrap_or(Held {
+    let held = ctx.retained_at_root.take().unwrap_or(Retained {
         native_objects: ctx.heap.natives() as u64,
         scheduled: 0,
         task_stacks: 0,
@@ -428,7 +428,7 @@ fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
             let boundary = ply_core::Boundary::ReturnedFromEntry { name: root };
             Ended::Failed(ply_core::escape::rejected(&boundary, &escapee, Span::DUMMY))
         }
-        Ok(EntryBytes::Holding) => Ended::NotReturnable("its result holds a handle of its run"),
+        Ok(EntryBytes::RetainsHandle) => Ended::NotReturnable("its result holds a handle of its run"),
         Err(reason) => Ended::Failed(crate::rt::err_marshalling(&reason)),
     }
 }
@@ -748,14 +748,14 @@ pub fn read_grants(r: &mut Reader<'_>) -> Result<Grants, String> {
     })
 }
 
-struct Asked {
+struct EntryRequest {
     binding: i64,
     hosted: bool,
     observe: bool,
     run: Run,
 }
 
-fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
+fn read_run_options(r: &mut Reader<'_>) -> Result<EntryRequest, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
     let timeout_ms = r.count()?;
@@ -765,7 +765,7 @@ fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
     let measure = r.bool()?;
     let tested = r.bool()?;
     let label = r.str()?;
-    Ok(Asked {
+    Ok(EntryRequest {
         binding,
         hosted,
         observe,
@@ -819,10 +819,10 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
     w.count(u.nanos)
         .bool(u.host)
         .count(u.performs)
-        .count(u.held.native_objects)
-        .count(u.held.scheduled)
-        .count(u.held.task_stacks)
-        .count(u.held.frame_tables)
+        .count(u.retained.native_objects)
+        .count(u.retained.scheduled)
+        .count(u.retained.task_stacks)
+        .count(u.retained.frame_tables)
         .count(u.runtime_blocks)
         .count(u.live);
     w.list(outcome.warnings.iter(), |w, d| {

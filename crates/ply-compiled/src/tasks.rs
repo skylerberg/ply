@@ -586,12 +586,12 @@ pub const LIVE: i64 = 0;
 pub const RETURNED: i64 = 1;
 pub const CANCELLED: i64 = 2;
 
-pub struct Kept {
+pub struct StoredValue {
     value: Option<Carried>,
     compared: Option<&'static PlyKept>,
 }
 
-impl Native for Kept {
+impl Native for StoredValue {
     fn release(&mut self, ctx: *mut Ctx) {
         if let Some(v) = self.value.take() {
             v.release(ctx);
@@ -602,8 +602,8 @@ impl Native for Kept {
 pub struct Stacks {
     scheduler: Option<Box<Scheduler>>,
     id: i64,
-    asked: Message,
-    heard: Message,
+    request: Message,
+    response: Message,
     tasks: HashMap<u64, Word>,
 }
 
@@ -623,7 +623,7 @@ impl Native for Stacks {
         c.schedulers.retain(|(r, _)| *r != scheduler);
         c.refresh_recording_flag();
         drop(self.scheduler.take());
-        for w in [self.asked.word, self.heard.word] {
+        for w in [self.request.word, self.response.word] {
             if w != 0 {
                 heap::release_object(ctx, w);
             }
@@ -731,7 +731,7 @@ pub unsafe extern "C" fn rt_keep(ctx: *mut Ctx, x: Handed, ty: *const PlyType) -
     let value = Some(unsafe { Carried::new(x, ty) });
     object_made(
         ctx,
-        Box::new(Kept {
+        Box::new(StoredValue {
             value,
             compared: None,
         }),
@@ -747,7 +747,7 @@ pub unsafe extern "C" fn rt_keep_compared(
     let value = Some(unsafe { Carried::new(x, kept.ty) });
     object_made(
         ctx,
-        Box::new(Kept {
+        Box::new(StoredValue {
             value,
             compared: Some(kept),
         }),
@@ -801,7 +801,7 @@ struct ComparisonOperand {
 }
 
 fn comparison_operand(ctx: *mut Ctx, h: &Handle) -> Option<ComparisonOperand> {
-    let kept = object::<Kept>(ctx, h, "a kept value")?;
+    let kept = object::<StoredValue>(ctx, h, "a kept value")?;
     let compared = kept.compared;
     match &kept.value {
         Some(v) => Some(ComparisonOperand {
@@ -821,7 +821,7 @@ fn comparison_operand(ctx: *mut Ctx, h: &Handle) -> Option<ComparisonOperand> {
 
 pub unsafe extern "C" fn rt_open(ctx: *mut Ctx, k: Handle, ty: *const PlyType) -> Handed {
     let want = unsafe { &*ty };
-    let Some(kept) = object::<Kept>(ctx, &k, "a kept value") else {
+    let Some(kept) = object::<StoredValue>(ctx, &k, "a kept value") else {
         return Handed::of(0);
     };
     match &kept.value {
@@ -862,8 +862,8 @@ pub unsafe extern "C" fn rt_stacks_opened(
     let stacks = Stacks {
         scheduler: Some(scheduler),
         id,
-        asked: Message::default(),
-        heard: Message::default(),
+        request: Message::default(),
+        response: Message::default(),
         tasks: HashMap::new(),
     };
     object_made(ctx, Box::new(stacks))
@@ -1151,7 +1151,7 @@ fn resumed(ctx: *mut Ctx, s: &Handle, id: I64, code: i64, n: i64, kept: Word) ->
     };
     let asked = unsafe { resume(scheduler, task, result) };
     let stacks = object::<Stacks>(ctx, s, "a scheduler's stacks").expect("the stacks it resumed");
-    let left = std::mem::replace(&mut stacks.asked, asked);
+    let left = std::mem::replace(&mut stacks.request, asked);
     if left.word != 0 {
         heap::release_object(ctx, left.word);
     }
@@ -1213,7 +1213,7 @@ pub unsafe extern "C" fn rt_asked_number(ctx: *mut Ctx, s: Handle, i: I64) -> I6
         object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| {
             usize::try_from(i.0)
                 .ok()
-                .and_then(|i| s.asked.numbers.get(i).copied())
+                .and_then(|i| s.request.numbers.get(i).copied())
                 .unwrap_or(0)
         }),
     )
@@ -1224,14 +1224,14 @@ pub unsafe extern "C" fn rt_asked_site(ctx: *mut Ctx, s: Handle, i: I64) -> I64 
         object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| {
             usize::try_from(i.0)
                 .ok()
-                .and_then(|i| s.asked.site.get(i).copied())
+                .and_then(|i| s.request.site.get(i).copied())
                 .unwrap_or(0)
         }),
     )
 }
 
 pub unsafe extern "C" fn rt_asked_kept(ctx: *mut Ctx, s: Handle) -> Handle {
-    take_message_word(ctx, &s, |s| &mut s.asked)
+    take_message_word(ctx, &s, |s| &mut s.request)
 }
 
 fn take_message_word(
@@ -1269,7 +1269,7 @@ fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) 
     };
     let heard = unsafe { switch_to_loop(scheduler, request) };
     let stacks = object::<Stacks>(ctx, s, "a scheduler's stacks").expect("the stacks it ran under");
-    let left = std::mem::replace(&mut stacks.heard, heard);
+    let left = std::mem::replace(&mut stacks.response, heard);
     if left.word != 0 {
         heap::release_object(ctx, left.word);
     }
@@ -1299,11 +1299,11 @@ pub unsafe extern "C" fn rt_task_yielded_kept(
 }
 
 pub unsafe extern "C" fn rt_heard_number(ctx: *mut Ctx, s: Handle) -> I64 {
-    I64(object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| s.heard.numbers[0]))
+    I64(object::<Stacks>(ctx, &s, "a scheduler's stacks").map_or(0, |s| s.response.numbers[0]))
 }
 
 pub unsafe extern "C" fn rt_heard_kept(ctx: *mut Ctx, s: Handle) -> Handle {
-    take_message_word(ctx, &s, |s| &mut s.heard)
+    take_message_word(ctx, &s, |s| &mut s.response)
 }
 
 pub unsafe extern "C" fn rt_task_freed(ctx: *mut Ctx, s: Handle, id: I64) {
@@ -1565,7 +1565,7 @@ pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I
     };
     let task_stacks = stacks.scheduler.as_ref().map_or(0, |r| r.stacks());
     let c = unsafe { &mut *ctx };
-    c.held_at_root = Some(crate::entry::Held {
+    c.retained_at_root = Some(crate::entry::Retained {
         native_objects: c.heap.natives() as u64,
         scheduled: u64::try_from(scheduled.0).unwrap_or(0),
         task_stacks: task_stacks as u64,

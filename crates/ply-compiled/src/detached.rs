@@ -2,7 +2,7 @@ use crate::emitted::{Block, Handed, PlyFnDesc, PlyType};
 use crate::frames::{self, PlyFrame};
 use crate::heap::{HEADER, Word};
 use crate::rt::{
-    Ctx, Kept, call_clause, call_fun, fail_out_of_stack, release_fun,
+    Ctx, SavedState, call_clause, call_fun, fail_out_of_stack, release_fun,
     switch_stack_preserving_context,
 };
 use crate::stack::{Stack, switch};
@@ -333,7 +333,7 @@ pub(crate) unsafe fn resume(
             }
             let c = unsafe { &mut *ctx };
             args.push(token(c, id, k));
-            let here = c.keep(Kept::Clause(id));
+            let here = c.keep(SavedState::Clause(id));
             let r = call_clause(ctx, closure, args);
             let c = unsafe { &mut *ctx };
             c.pop_saved(here);
@@ -379,7 +379,7 @@ fn release_if_finished(c: &mut Ctx, id: usize) {
 fn clause_running(c: &Ctx, id: usize) -> bool {
     c.stacks
         .iter()
-        .any(|s| s.iter().any(|k| matches!(k, Kept::Clause(i) if *i == id)))
+        .any(|s| s.iter().any(|k| matches!(k, SavedState::Clause(i) if *i == id)))
 }
 
 fn finish(c: &mut Ctx, id: usize) {
@@ -558,12 +558,12 @@ fn abandon(ctx: *mut Ctx, id: usize) {
 
 fn release_stack(ctx: *mut Ctx, own: usize) {
     if let Some(s) = unsafe { &mut *ctx }.stacks.get_mut(own) {
-        release_kept(std::mem::take(s));
+        release_saved_states(std::mem::take(s));
     }
 }
 
-fn release_kept(kept: Vec<Kept>) {
-    kept.into_iter().for_each(Kept::release);
+fn release_saved_states(kept: Vec<SavedState>) {
+    kept.into_iter().for_each(SavedState::release);
 }
 
 pub(crate) fn teardown(ctx: *mut Ctx) {

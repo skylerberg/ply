@@ -1,8 +1,8 @@
-use super::{Nondeterministic, asked, handed, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, required_argument, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::I64;
 use crate::rt::Ctx;
-use ply_host::signal::{Asked, err_signal_watch_failed};
+use ply_host::signal::{WatchedSignal, err_signal_watch_failed};
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
@@ -22,7 +22,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 pub unsafe extern "C" fn rt_signal_stopping(ctx: *mut Ctx) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "signal_stopping",
         Nondeterministic,
@@ -37,7 +37,7 @@ pub unsafe extern "C" fn rt_signal_stopping(ctx: *mut Ctx) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "signal_deadline_ms",
         Nondeterministic,
@@ -52,20 +52,20 @@ pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
 }
 
 pub unsafe extern "C" fn rt_signal_arrived(ctx: *mut Ctx, which: I64) -> I64 {
-    asked(
+    if_host_allowed(
         ctx,
         "signal_arrived",
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
             let (asked, what) = match which.0 {
-                0 => (Some(Asked::Hangup), "`signal.hangup`"),
-                1 => (Some(Asked::User1), "`signal.user1`"),
-                2 => (Some(Asked::User2), "`signal.user2`"),
-                3 => (Some(Asked::WindowChange), "`signal.resized`"),
+                0 => (Some(WatchedSignal::Hangup), "`signal.hangup`"),
+                1 => (Some(WatchedSignal::User1), "`signal.user1`"),
+                2 => (Some(WatchedSignal::User2), "`signal.user2`"),
+                3 => (Some(WatchedSignal::WindowChange), "`signal.resized`"),
                 _ => (None, ""),
             };
-            let Some(asked) = handed(c, "signal_arrived", "a signal", asked) else {
+            let Some(asked) = required_argument(c, "signal_arrived", "a signal", asked) else {
                 return I64(0);
             };
             let heard = with_host_facilities(c, |facilities| {
