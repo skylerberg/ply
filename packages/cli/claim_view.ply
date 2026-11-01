@@ -17,18 +17,22 @@ import claims (Claim, Collection, DischargeResult, NotCompiled, OwnClaims, Rejec
                claim_bin, discharge_library, discharging, lacks_proof, laws_by_key,
                no_static_prover, own_claims, proof_store, static_prover_of)
 import compiler.front.checking.view
+import compiler.front.checking (LoadInputs)
+import compiler.front.checking.groups (HashSummary)
 import compiler.front.checking.view (LaterReading, Modules)
 import compiler.store.memo (memo)
-import module_queries (ModuleResults, listed_results, module_results)
+import module_queries (listed_results, module_results)
 import proof.decide (StaticResult)
 import std.machine as entering
 import std.time (time)
 import units
 import units (EmbeddedFiles, emit)
 import compiler.cc (toolchain)
+import compiler.load (Derives)
 import compiler.unit (identity_of, shipped)
-import program (Program, Session, front_end, in_root_package, module_derivations, no_program)
-import proof.obligation (Builds, Kind, Law, WrittenLaw, written_law_bin)
+import program (Program, ProgramStore, Session, front_end, in_program_store, in_root_package,
+                module_derivations, no_program, program_view, timed_of)
+import proof.obligation (Builds, Definition, Kind, Law, WrittenLaw, definition_bin, written_law_bin)
 import proof.prover_input (Obligation, ProverInput, Static, Unhandled, defined, empty_prover_input,
                            invariants_of, prover_input_of)
 import proof.static_prover (claims_for, diagnosis_of, modules_of, prover_of)
@@ -36,21 +40,17 @@ import proof.decide (Proved)
 import proof.goal (default_prove_budget)
 import sources (Embed, File)
 import std.bin
+import std.fs (fs)
 import std.hash (blake3)
 import std.list
+import std.random (entropy)
 import std.string
 import compiler.store.memo (empty_memory_store)
 
-pub type ClaimReading = { later: LaterReading, results: ModuleResults }
+pub type ClaimReading = { later: LaterReading, summaries: List<HashSummary> }
 
-pub fn claim_reading(
-  from_nothing: Bool,
-  modules: Modules,
-) -> ClaimReading / {memo.read, abort.raise} =
-  {
-    later: view::later_reading(modules),
-    results: if from_nothing { module_results(modules.own) } else { listed_results(modules.own) },
-  }
+pub fn claim_reading(modules: Modules) -> ClaimReading / {memo.read, abort.raise} =
+  { later: view::later_reading(modules), summaries: view::hash_summaries(modules) }
 
 pub fn discharge_claims(
   s: Session<ClaimReading>,
@@ -68,7 +68,12 @@ pub type ClaimView = { analysis: Analysis }
 
 pub type ClaimedProgram = { mine: OwnClaims, statics: StaticProver }
 
-pub type ModuleClaims = { claims: List<Claim>, laws: List<WrittenLaw>, warnings: List<Diagnostic> }
+pub type ModuleClaims = {
+  claims: List<Claim>,
+  laws: List<WrittenLaw>,
+  warnings: List<Diagnostic>,
+  definitions: List<Definition>,
+}
 
 derive bin for ModuleClaims
 
@@ -180,23 +185,20 @@ pub fn claim_view(
 
 type KnownModule = { name: Bytes, index: Int, path: String, claims: Option<ModuleClaims> }
 
+pub type ClaimInputs = { names: List<Bytes>, records: List<Bytes>, texts: List<Bytes> }
+
 fn known_module(
   identity: Bytes,
-  program: Program,
-  name: Bytes,
+  inputs: ClaimInputs,
   index: Int,
 ) -> KnownModule / {toolchain.read_file, abort.raise} = {
   let path = "claims/"
     ++ blake3(
-      Bytes::concat_all([
-        identity,
-        program.modules.at(index).map(|m: ModuleHashes| m.record).unwrap_or(b""),
-        program.files.at(index).map(|f: File| f.text.blake3()).unwrap_or(b""),
-      ]),
+      Bytes::concat_all([identity, inputs.records.get(index), inputs.texts.get(index)]),
     ).hex_of(
     );
   {
-    name: name,
+    name: inputs.names.get(index),
     index: index,
     path: path,
     claims: match toolchain.read_file(path) {
@@ -261,21 +263,28 @@ fn belongs_to(names: List<Bytes>, module: Bytes, key: String) -> Bool = {
 
 fn labelled_at(d: Diagnostic, index: Int) -> Bool = d.labels.any(|l: Label| l.module == index)
 
-fn fresh_claims(fresh: OwnClaims, names: List<Bytes>, known: KnownModule) -> ModuleClaims =
+fn fresh_claims(
+  fresh: OwnClaims,
+  v: CheckedProgram,
+  names: List<Bytes>,
+  known: KnownModule,
+) -> ModuleClaims / {abort.raise} =
   {
     claims: fresh.claims.filter(|c: Claim| c.at.module == known.index),
     laws: fresh.laws.filter(|l: WrittenLaw| belongs_to(names, known.name, l.key)),
     warnings: fresh.warnings.filter(|d: Diagnostic| labelled_at(d, known.index)),
+    definitions: defined(
+      v.checked.definitions.filter(|d: DefinitionInfo| d.module == known.name),
+      v.frame.hashes,
+    ),
   }
 
 fn claims_of_program(
-  v: CheckedProgram,
   names: List<Bytes>,
   world: ProverInput,
   held: List<ModuleClaims>,
   fresh: List<WorldClaim>,
 ) -> OwnClaims / {abort.raise} = {
-  let owned = in_root_package(v.frame);
   let stored = held.fold([], |found: List<WorldClaim>, c: ModuleClaims|
     found.concat(
       c.claims.map(|claim: Claim| { claim: claim, obligation: placeholder_obligation(claim) }),
@@ -283,10 +292,8 @@ fn claims_of_program(
   let all = stored.concat(fresh).sort_by(comes_first);
   {
     claims: all.map(|w: WorldClaim| w.claim),
-    definitions: defined(
-      v.checked.definitions.filter(|d: DefinitionInfo| owned(d.module)),
-      v.frame.hashes,
-    ),
+    definitions: held.fold([], |found: List<Definition>, c: ModuleClaims|
+      found.concat(c.definitions)),
     laws: held.fold([], |found: List<WrittenLaw>, c: ModuleClaims| found.concat(c.laws)),
     warnings: held.fold([], |found: List<Diagnostic>, c: ModuleClaims| found.concat(c.warnings)),
     world: { ..world, obligations: all.map(|w: WorldClaim| w.obligation) },
@@ -308,55 +315,39 @@ fn claimed_with_view(
       let owned = in_root_package(v.frame);
       let built = prover_input_of(w, owned);
       let fresh = own_claims(w, built);
-      let recomputed = open.map(|k: KnownModule| {
-        let c = fresh_claims(fresh, names, k);
-        toolchain.write_file(k.path, bin::encode(c, module_claims_bin()));
-        c
-      });
       let open_at = open.map(|k: KnownModule| k.index);
-      let settled = known.filter(|k: KnownModule| !open_at.contains(k.index));
+      let current = known.fold([], |found: List<ModuleClaims>, k: KnownModule|
+        if open_at.contains(k.index) {
+          let c = fresh_claims(fresh, v, names, k);
+          toolchain.write_file(k.path, bin::encode(c, module_claims_bin()));
+          found.push({ ..c, claims: [] })
+        } else { match k.claims { Some(c) -> found.push(c), None -> found } });
       let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
         let c = fresh.claims.get(i);
         if open_at.contains(c.at.module) {
           found.push({ claim: c, obligation: built.world.obligations.get(i) })
         } else { found }
       });
-      let mine = claims_of_program(
-        v,
-        names,
-        built.world,
-        settled.fold([], |found: List<ModuleClaims>, k: KnownModule|
-          match k.claims { Some(c) -> found.push(c), None -> found }),
-        pairs,
-      );
-      Ok({
-        mine: {
-          ..mine,
-          laws: recomputed.fold(mine.laws, |found: List<WrittenLaw>, c: ModuleClaims|
-            found.concat(c.laws)),
-          warnings: recomputed.fold(mine.warnings, |found: List<Diagnostic>, c: ModuleClaims|
-            found.concat(c.warnings)),
-        },
-        statics: static_prover_of(w, mine.world, owned),
-      })
+      let mine = claims_of_program(names, built.world, current, pairs);
+      Ok({ mine: mine, statics: static_prover_of(w, mine.world, owned) })
     },
   }
 
-pub fn claimed_program(
-  program: Program,
-  v: CheckedProgram,
+pub type WholeClaims = { program: Program, view: CheckedProgram }
+
+pub fn claimed_modules<| e>(
+  inputs: ClaimInputs,
   use_cache: Bool,
   every_module: Bool,
-) -> Result<ClaimedProgram, List<Diagnostic>> / {shipped.definitions, toolchain.read_file, toolchain.write_file, proof_store.cached, abort.raise} = {
+  whole: () -> Result<WholeClaims, List<Diagnostic>> / {abort.raise | e},
+) -> Result<ClaimedProgram, List<Diagnostic>> / {shipped.definitions, toolchain.read_file, toolchain.write_file, proof_store.cached, abort.raise | e} = {
   let identity = identity_of(shipped.definitions(), [b"claims.own_claims"]);
-  let names = v.frame.outlines.take(program.files.len()).map(|o: Outline| o.name);
-  let known = range(0, names.len()).map(|i: Int| known_module(identity, program, names.get(i), i));
+  let known = range(0, inputs.names.len()).map(|i: Int| known_module(identity, inputs, i));
   let open = known.filter(|k: KnownModule| wants_view(k, use_cache, every_module));
-  if open.len() > 0 { claimed_with_view(program, v, names, known, open) } else {
+  if open.len() == 0 {
     Ok({
       mine: claims_of_program(
-        v,
-        names,
+        inputs.names,
         empty_prover_input(),
         known.fold([], |found: List<ModuleClaims>, k: KnownModule|
           match k.claims { Some(c) -> found.push(c), None -> found }),
@@ -364,6 +355,31 @@ pub fn claimed_program(
       ),
       statics: no_static_prover(None),
     })
+  } else {
+    match whole() {
+      Err(diagnostics) -> Err(diagnostics),
+      Ok(w) -> claimed_with_view(w.program, w.view, inputs.names, known, open),
+    }
+  }
+}
+
+pub fn claim_inputs(s: Session<ClaimReading>) -> ClaimInputs / {abort.raise} =
+  {
+    names: s.modules.own.take(s.modules.root),
+    records: s.value.summaries.take(s.modules.root).map(|h: HashSummary| h.record),
+    texts: s.project.files.map(|f: File| f.text.blake3()),
+  }
+
+pub fn whole_claims(
+  s: Session<ClaimReading>,
+  from_nothing: Bool,
+) -> Result<WholeClaims, List<Diagnostic>> / {ProgramStore, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
+  let results = in_program_store(s.place, |_: LoadInputs|
+    if from_nothing { module_results(s.modules.own) } else { listed_results(s.modules.own) }).value;
+  let t = timed_of(s, results, false, from_nothing);
+  match program_view(t.program) {
+    Some(v) -> Ok({ program: t.program, view: v }),
+    None -> Err(t.program.diagnostics),
   }
 }
 
@@ -512,8 +528,13 @@ fn records_written(
   stored: Map<String, Bytes>,
 ) -> Map<String, Bytes> / {abort.raise} = {
   let loaded = program_over(sources);
+  let inputs = {
+    names: sources.map(|s: Source| s.name),
+    records: sources.map(|s: Source| b""),
+    texts: sources.map(|s: Source| s.source_text.blake3()),
+  };
   handle {
-    claimed_program(loaded.program, loaded.view, true, false);
+    claimed_modules(inputs, true, false, || Ok(loaded));
     ()
   } with {
     var written = Map::new(),
