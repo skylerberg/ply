@@ -219,6 +219,8 @@ helpers! {
     rt_branches(slots: *const Handed, n: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
     rt_const(index: I64, keep: KeepRoot) -> Handed;
+    rt_keep_constant(index: I64, kept);
+    rt_const_failed();
     rt_never_lifted();
     rt_never_shown();
 }
