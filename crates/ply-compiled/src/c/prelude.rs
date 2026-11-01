@@ -1,4 +1,4 @@
-use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
+use crate::emitted::{Block, DropRoot, Handed, Handle, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::native::{Addr, F64, I64, Native, Signature};
 use crate::rt::Ctx;
@@ -184,8 +184,6 @@ helpers! {
     rt_unwind_hold(held) -> Word;
     rt_unwind_resume(held);
     rt_branches(slots: *const Handed, n: I64);
-    rt_memo(index: I64, keep: KeepRoot) -> Handed;
-    rt_const(index: I64, keep: KeepRoot) -> Handed;
     rt_keep_constant(index: I64, kept);
     rt_const_failed();
     rt_never_lifted();

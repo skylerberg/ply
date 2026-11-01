@@ -1,4 +1,4 @@
-use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyOp, PlyType};
+use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
 use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_word, word_at};
 use crate::native::I64;
 use crate::stack::{Stack, switch};

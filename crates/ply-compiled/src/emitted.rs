@@ -253,8 +253,6 @@ impl Carried {
 
 pub type DropRoot = unsafe extern "C" fn(*mut Ctx, Handed) -> Word;
 
-pub type KeepRoot = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
-
 #[repr(C)]
 pub struct PlyFnDesc {
     pub uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word,
@@ -281,9 +279,6 @@ unsafe impl Taken for SecretHandle {
 }
 unsafe impl Taken for DropRoot {
     const MACHINE: MachineType = MachineType::DropRoot;
-}
-unsafe impl Taken for KeepRoot {
-    const MACHINE: MachineType = MachineType::KeepRoot;
 }
 unsafe impl Taken for *const PlyType {
     const MACHINE: MachineType = MachineType::Type;
