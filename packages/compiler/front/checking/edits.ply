@@ -4,7 +4,7 @@ import std.bytes
 import std.list
 import compiler.store.memo
 import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, empty_memory_store,
-                            executed_count, executed_for, restored_for, start_run, query_stats)
+                            executed_count, executed_for, start_run, query_stats)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -53,6 +53,7 @@ type Reference = {
   whole: OutcomeSummary,
   fixing: CachedHashes,
   results: List<CheckedModule>,
+  facts: Map<Bytes, Bytes>,
   group_inputs: Option<Map<Bytes, Bytes>>,
   hash_inputs: Option<Map<Bytes, Bytes>>,
 }
@@ -63,6 +64,7 @@ fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
     whole: outcome_summary(analyse(parse_all(sources))),
     fixing: fresh.fixing,
     results: fresh.results,
+    facts: memo::stored_outputs(fresh.store),
     group_inputs: inputs_over(fresh.store, sources, b"group inputs"),
     hash_inputs: inputs_over(fresh.store, sources, b"hash inputs"),
   }
@@ -101,6 +103,7 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       let same_outcome = r.results == warm.results
         || now == outcome_summary(outcome_of(step.sources, r.results));
       let agrees = same_outcome && warm.fixing == r.fixing
+        && memo::stored_outputs(warm.store) == r.facts
         && (match r.whole {
           PublicationSummary(_) -> now == r.whole,
           RejectionSummary(_) -> match now {
@@ -147,21 +150,16 @@ fn pulled(
         Map::new(),
         |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
       );
-      let back = restored_for(run, query).fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
-      );
       let groups = reads.keys();
       let moved = |g: Bytes| made.get(g) != reads.get(g);
       let needless = sorted_bytes(groups.filter(|g: Bytes| ran.contains(g) && !moved(g)));
       let stale = sorted_bytes(
         groups.filter(|g: Bytes|
-          run.resolved.contains(memo::key_of(q, g)) && !ran.contains(g) && !back.contains(g)
-            && moved(g)),
+          run.resolved.contains(memo::key_of(q, g)) && !ran.contains(g) && moved(g)),
       );
       {
         made: groups.fold(made, |accumulator: Map<Bytes, Bytes>, g: Bytes|
-          if ran.contains(g) || back.contains(g) {
+          if ran.contains(g) {
             accumulator.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
           } else { accumulator }),
         mismatches: if needless == [] && stale == [] { None } else {
@@ -277,13 +275,13 @@ fn inputs_over(
         hash: b"group inputs",
         body: group_inputs_hash,
         persistent: true,
-        summarized: false,
+        logged: false,
       }).insert(b"hash inputs", {
         name: b"hash inputs",
         hash: b"hash inputs",
         body: hash_inputs_result,
         persistent: true,
-        summarized: false,
+        logged: false,
       });
       let cycles = cycles_among(qs, start_run(qs), w.own);
       if cycles.rejected.len() > 0 { None } else {
@@ -2096,17 +2094,6 @@ test "editing a function's signature rechecks that function and the definitions 
   assert_eq(warm.results, queried_over(empty_memory_store(), widened).results)
 }
 
-fn read_whole_module(store: MemoryStore, g: GroupKey) -> Bool / {abort.raise} =
-  memo::current_records(store).fold(false, |found: Bool, _: Bytes, r: memo::Record|
-    found
-      || (r.query == group_query() && r.input == bin::encode(g, group_key_bin())
-      && r.reads.fold(false, |any: Bool, read: memo::Dependency|
-        any
-          || (match read {
-            memo::ExternalDependency(_, at, _) -> at == whole_query(),
-            memo::QueryDependency(_, _, _) -> false,
-          }))))
-
 test "an edit that affects one definition in a module rechecks that definition alone, and an edit that affects several checks the whole module once" {
   let app = b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 2\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n";
   let over = |lib: Bytes| [{ name: b"lib", source_text: lib }, { name: b"app", source_text: app }];
@@ -2116,18 +2103,15 @@ test "an edit that affects one definition in a module rechecks that definition a
   );
   let one = queried_over(cold.store, over(b"pub fn step(n: Int) -> Int = n + 1\n"));
   assert_eq(groups_ran(one.run, group_query()), [group_in(b"app", [b"go"])]);
-  assert(!read_whole_module(one.store, group_in(b"app", [b"go"])));
   let widened = over(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
   let more = queried_over(one.store, widened);
   let ran = groups_ran(more.run, group_query());
   assert(!ran.contains(group_in(b"app", [b"other"])));
-  assert(read_whole_module(more.store, group_in(b"app", [b"go"])));
-  assert(read_whole_module(more.store, group_in(b"app", [b"again"])));
   assert_eq(more.results, queried_over(empty_memory_store(), widened).results)
 }
 
 fn checked_whole_in(store: MemoryStore, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
-  memo::current_records(store).fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::fact_records(store).fold(false, |found: Bool, _: Bytes, r: memo::FactRecord|
     found
       || (r.query == hash
       && r.input == bin::encode({ module: module, shipped: false, tested: false }, module_key_bin())
@@ -2166,7 +2150,7 @@ fn shared_base_sources(lib: Bytes) -> List<Source> =
   ]
 
 fn reads_own_groups(store: MemoryStore) -> Bool / {abort.raise} =
-  memo::current_records(store).fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::fact_records(store).fold(false, |found: Bool, _: Bytes, r: memo::FactRecord|
     found
       || (r.query == whole_query()
       && {

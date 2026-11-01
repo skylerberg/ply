@@ -1,644 +1,236 @@
+import std.bin
 import std.fs
 import std.fs (fs)
-import std.bytes (u32_le, u64_le)
 import std.list
+import compiler.store.fact_store
+import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Change, fact_damage,
+                                  recent_reads, with_recent_reads)
 import compiler.store.memo
-import compiler.store.memo (query, Record, ExternalRead, memo, memo_store, query_output, start_run,
-                            digest_of, inline_output_of, inline_output, output_digest_of,
-                            record_bytes, record_from)
+import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, digest_of, fact_details_bin,
+                            first_waiting, inline_output, location_id, memo, memo_store,
+                            nothing_waiting, pack_digest_of, pack_inline_of, pack_record_bytes,
+                            pack_row_key, query, query_output, sealed_lookup, start_run,
+                            stored_fact_bin, stored_input_bin, with_mark, without_mark)
 import compiler.store.packs
 import compiler.store.segments
-import compiler.store.segments (Manifest, Segment, Table, SegmentWriter, Committed)
 
-fn schema() -> Bytes = b"ply memo store: rows 3, records 6".blake3()
-
-fn retired_directories() -> List<String> =
-  ["records", "outputs", "places", "links", "marked", "holds", "runs"]
-
-fn records_table() -> Int = 1
-
-fn outputs_table() -> Int = 2
-
-fn queries_table() -> Int = 3
-
-fn record_width() -> Int = 80
-
-fn key_width() -> Int = 32
-
-fn output_row_width() -> Int = 44
-
-fn query_width() -> Int = 40
-
-type Row = { has_record: Bool, query: Int, offset: Int, size: Int, result: Bytes }
-
-fn row_rest(r: Row) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    byte_of_int(if r.has_record { 1 } else { 0 }),
-    byte_of_int(0),
-    byte_of_int(r.query & 255),
-    byte_of_int(r.query >> 8 & 255),
-    u64_le(r.offset),
-    u32_le(r.size),
-    r.result,
-  ])
-
-fn row_from(b: Bytes) -> Row / {abort.raise} =
-  {
-    has_record: b.at(32) & 1 == 1,
-    query: b.at(34) + b.at(35) * 256,
-    offset: segments::read_u64(b, 36),
-    size: segments::read_u32(b, 44),
-    result: b.slice(48, 80),
-  }
-
-fn output_digest_of_key(key: Bytes) -> Bytes = b"=".concat(key)
-
-type FrameLocation = { token: Bytes, offset: Int, size: Int }
-
-type KeyState = { row: Row, query: Bytes, seen: Int }
-
-type OwnRow = { result: Bytes, query: Bytes, frame: Option<{ offset: Int, size: Int }> }
-
-type OpenStore = {
-  own: Map<Bytes, Bool>,
-  now: Int,
-  looked: Map<Bytes, ExternalRead>,
-  manifest: Manifest,
-  tables: Map<Bytes, Bytes>,
-  unreadable_segments: List<Bytes>,
-  known: Map<Bytes, Option<KeyState>>,
-  written_rows: Map<Bytes, OwnRow>,
-  out: SegmentWriter,
-  results: Map<Bytes, Bytes>,
-  inlined: Map<Bytes, Bytes>,
-  named: Map<Bytes, Bytes>,
-  read: Map<Bytes, Bytes>,
-  cached_outputs: Map<Bytes, Bytes>,
-  cached_size: Int,
-  unread: Map<Bytes, Bool>,
+type StoreRun = {
+  db: Database,
+  looked: Map<Bytes, { value: Option<Bytes>, digest: Bytes }>,
+  outputs: Map<Bytes, Bytes>,
+  outputs_size: Int,
+  details: Map<Bytes, FactDetails>,
   transient: Map<Bytes, Bytes>,
   pack: packs::PackReader,
   trusted: Bool,
-  packed: Map<Bytes, Option<Bytes>>,
+  pack_differs: Bool,
+  waiting: Waiting,
+  changes: List<Change>,
 }
 
 fn max_cached_size() -> Int = 268435456
 
-fn cache_output(o: OpenStore, name: Bytes, result: Bytes) -> OpenStore =
-  if o.cached_outputs.contains(name) || o.cached_size + result.len() > max_cached_size() { o }
-  else {
+fn pack_id_name() -> Bytes = b"\x00pack"
+
+fn code_key(name: Bytes) -> Bytes = name.blake3()
+
+fn result_key(digest: Bytes) -> Bytes = match packs::output_key(digest) { Some(k) -> k, None -> digest }
+
+fn input_id(input: StoredInput) -> Bytes / {abort.raise} =
+  if input.kind == b"sealed" { input.at } else { location_id(input.kind, input.at) }
+
+fn undecoded<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {fact_damage.damaged, abort.raise} =
+  match bin::decode(bytes, codec) {
+    Ok(value) -> value,
+    Err(_) -> fact_damage.damaged("a stored fact does not decode"),
+  }
+
+fn remembered_output(o: StoreRun, digest: Bytes, output: Bytes) -> StoreRun =
+  if o.outputs.contains(digest) || o.outputs_size + output.len() > max_cached_size() { o } else {
     {
       ..o,
-      cached_outputs: o.cached_outputs.insert(name, result),
-      cached_size: o.cached_size + result.len(),
+      outputs: o.outputs.insert(digest, output),
+      outputs_size: o.outputs_size + output.len(),
     }
   }
 
-fn open_store(m: Manifest, now: Int) -> OpenStore =
-  {
-    own: Map::new(),
-    now: now,
-    looked: Map::new(),
-    manifest: m,
-    tables: Map::new(),
-    unreadable_segments: [],
-    known: Map::new(),
-    written_rows: Map::new(),
-    out: segments::new_writer(),
-    results: Map::new(),
-    inlined: Map::new(),
-    named: Map::new(),
-    read: Map::new(),
-    cached_outputs: Map::new(),
-    cached_size: 0,
-    unread: Map::new(),
-    transient: Map::new(),
-    pack: packs::empty_reader(),
-    trusted: false,
-    packed: Map::new(),
-  }
+fn stored_output<[r]>(
+  o: StoreRun,
+  digest: Bytes,
+  output: Bytes,
+) -> StoreRun / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  { ..remembered_output(o, digest, output), db: fact_store::with_result[r](o.db, result_key(digest), output) }
 
-fn table<[r]>(
-  dir: String,
-  o: OpenStore,
-  seg: Segment,
-  table: Int,
-) -> { open: OpenStore, rows: Bytes } / {fs.read[r], abort.raise} = {
-  let name = seg.token.concat(byte_of_int(table));
-  match o.tables.get(name) {
-    Some(rows) -> { open: o, rows: rows },
-    None -> match segments::table_rows[r](dir, seg, table) {
-      Some(rows) -> { open: { ..o, tables: o.tables.insert(name, rows) }, rows: rows },
-      None ->
-        {
-          open: {
-            ..o,
-            tables: o.tables.insert(name, b""),
-            unreadable_segments: if o.unreadable_segments.contains(seg.token) {
-              o.unreadable_segments
-            } else { o.unreadable_segments.push(seg.token) },
-          },
-          rows: b"",
-        },
+fn over_database<a, [r] | e>(
+  database: Database,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e} = {
+  let looked = |o: StoreRun, kind: Bytes, at: Bytes| {
+    let id = location_id(kind, at);
+    match o.looked.get(id) {
+      Some(x) -> { open: o, looked: x },
+      None -> {
+        let value = look(kind, at);
+        let x = { value: value, digest: digest_of(value) };
+        { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
+      },
+    }
+  };
+  handle {
+    work()
+  } with {
+    var st: StoreRun = {
+      db: database,
+      looked: Map::new(),
+      outputs: Map::new(),
+      outputs_size: 0,
+      details: Map::new(),
+      transient: Map::new(),
+      pack: packs::open_reader(read),
+      trusted: false,
+      pack_differs: false,
+      waiting: nothing_waiting(),
+      changes: [],
     },
-  }
-}
-
-fn query_in(queries: Bytes, nth: Int) -> { query: Bytes, seen: Int } / {abort.raise} = {
-  let at = nth * query_width();
-  if at + query_width() > queries.len() { { query: b"", seen: 0 } }
-  else { { query: queries.slice(at, at + 32), seen: segments::read_u64(queries, at + 32) } }
-}
-
-fn key_state<[r]>(
-  dir: String,
-  o: OpenStore,
-  key: Bytes,
-) -> { open: OpenStore, known: Option<KeyState> } / {fs.read[r], abort.raise} =
-  match o.known.get(key) {
-    Some(k) -> { open: o, known: k },
-    None -> {
-      let found = iterate(
-        { i: o.manifest.segments.len() - 1, open: o },
-        1000000,
-        |x: { i: Int, open: OpenStore }|
-          if x.i < 0 { Stop({ open: x.open, newest: None }) } else {
-            let seg = x.open.manifest.segments.get(x.i);
-            let t = table[r](dir, x.open, seg, records_table());
-            match segments::row_of(t.rows, record_width(), key) {
-              None -> Continue({ i: x.i - 1, open: t.open }),
-              Some(b) -> Stop({ open: t.open, newest: Some({ row: row_from(b), segment: seg }) }),
-            }
-          },
-      );
-      let known = match found.newest {
-        None -> { open: found.open, known: None },
-        Some(n) -> {
-          let t = table[r](dir, found.open, n.segment, queries_table());
-          let q = query_in(t.rows, n.row.query);
-          { open: t.open, known: Some({ row: n.row, query: q.query, seen: q.seen }) }
-        },
-      };
-      {
-        open: { ..known.open, known: known.open.known.insert(key, known.known) },
-        known: known.known,
-      }
-    },
-  }
-
-fn frame_row<[r]>(
-  dir: String,
-  o: OpenStore,
-  key: Bytes,
-  result: Bytes,
-) -> { open: OpenStore, at: Option<FrameLocation> } / {fs.read[r], abort.raise} =
-  iterate(
-    { i: o.manifest.segments.len() - 1, open: o },
-    1000000,
-    |x: { i: Int, open: OpenStore }|
-      if x.i < 0 { Stop({ open: x.open, at: None }) } else {
-        let seg = x.open.manifest.segments.get(x.i);
-        let t = table[r](dir, x.open, seg, records_table());
-        match segments::row_of(t.rows, record_width(), key) {
-          None -> Continue({ i: x.i - 1, open: t.open }),
-          Some(b) -> {
-            let row = row_from(b);
-            if row.result != result { Stop({ open: t.open, at: None }) } else if row.has_record {
-              Stop({
-                open: t.open,
-                at: Some({ token: seg.token, offset: row.offset, size: row.size }),
-              })
-            } else { Continue({ i: x.i - 1, open: t.open }) }
-          },
-        }
-      },
-  )
-
-fn frame_of<[r]>(
-  dir: String,
-  mine: Bytes,
-  o: OpenStore,
-  at: FrameLocation,
-) -> Option<Bytes> / {fs.read[r], abort.raise} =
-  match if at.token == mine { segments::pending_payload(o.out, at.offset) } else { None } {
-    Some(payload) -> Some(payload),
-    None -> segments::payload[r](dir, at.token, at.offset, at.size),
-  }
-
-fn output_row<[r]>(
-  dir: String,
-  o: OpenStore,
-  name: Bytes,
-) -> { open: OpenStore, at: Option<FrameLocation> } / {fs.read[r], abort.raise} =
-  iterate(
-    { i: o.manifest.segments.len() - 1, open: o },
-    1000000,
-    |x: { i: Int, open: OpenStore }|
-      if x.i < 0 { Stop({ open: x.open, at: None }) } else {
-        let seg = x.open.manifest.segments.get(x.i);
-        let t = table[r](dir, x.open, seg, outputs_table());
-        match segments::row_of(t.rows, output_row_width(), name) {
-          None -> Continue({ i: x.i - 1, open: t.open }),
-          Some(b) ->
-            Stop({
-              open: t.open,
-              at: Some({
-                token: seg.token,
-                offset: segments::read_u64(b, 32),
-                size: segments::read_u32(b, 40),
-              }),
-            }),
-        }
-      },
-  )
-
-type KeyRow = { row: Row, query: Bytes }
-
-fn last_seen(seen: Map<Bytes, Int>, query: Bytes, at: Int) -> Map<Bytes, Int> =
-  match seen.get(query) {
-    Some(was) -> if was >= at { seen } else { seen.insert(query, at) },
-    None -> seen.insert(query, at),
-  }
-
-fn tables_of(
-  key_rows: Map<Bytes, KeyRow>,
-  seen: Map<Bytes, Int>,
-  results: Map<Bytes, Bytes>,
-) -> List<Table> / {abort.raise} = {
-  let nth = seen.fold(Map::new(), |accumulator: Map<Bytes, Int>, query: Bytes, _: Int|
-    accumulator.insert(query, accumulator.len()));
-  [
-    segments::table(records_table(), key_rows, |_: Bytes, t: KeyRow|
-      Some(row_rest({ ..t.row, query: match nth.get(t.query) { Some(i) -> i, None -> 65535 } }))),
-    segments::table(outputs_table(), results, |_: Bytes, at: Bytes| Some(at)),
-    segments::table(queries_table(), seen, |_: Bytes, at: Int| Some(u64_le(at))),
-  ]
-}
-
-fn location_bytes(offset: Int, size: Int) -> Bytes = u64_le(offset).concat(u32_le(size))
-
-fn wrote_nothing(o: OpenStore) -> Bool = o.written_rows.len() == 0
-
-fn commit<[r]>(
-  dir: String,
-  run: String,
-  token: Bytes,
-  o: OpenStore,
-) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
-  if wrote_nothing(o) { () } else {
-    let key_rows = o.written_rows.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, KeyRow>, key: Bytes, x: OwnRow| {
-        let lies = match x.frame { Some(f) -> f, None -> { offset: 0, size: 0 } };
-        accumulator.insert(key, {
-          row: {
-            has_record: x.frame != None,
-            query: 0,
-            offset: lies.offset,
-            size: lies.size,
-            result: x.result,
-          },
-          query: x.query,
-        })
-      },
-    );
-    let seen = o.own.fold(Map::new(), |seen: Map<Bytes, Int>, query: Bytes, _: Bool|
-      seen.insert(query, o.now));
-    match segments::finish[r](dir, schema(), token, o.out, tables_of(key_rows, seen, o.results)) {
-      None -> (),
-      Some(seg) -> match segments::commit[r](dir, schema(), seg, without: o.unreadable_segments) {
-        Committed(m) -> {
-          let from = segments::merge_start(m);
-          if from < m.segments.len() - 1 {
-            merge_segments[r](
-              dir,
-              m,
-              from,
-              segments::segment_token(Some(run), m.generation, 1),
-              KeepRecent(o.own),
-            );
-            ()
-          };
-          segments::sweep[r](dir, schema(), run, retired_directories())
-        },
-        _ -> (),
-      },
-    }
-  }
-
-pub type Compaction = { records: Int, results: Int, bytes: Int }
-
-type MergeInput = { segment: Segment, records: Bytes, queries: Bytes, results: Bytes }
-
-type MergedKey = { row: Row, query: Bytes, from: Option<FrameLocation> }
-
-type Frame = { at: FrameLocation, name: Bytes, result: Bool }
-
-type FrameCopier = {
-  out: SegmentWriter,
-  token: Bytes,
-  start: Int,
-  end: Int,
-  waiting: List<{ frame: Frame, at: Int }>,
-  records: Map<Bytes, Int>,
-  results: Map<Bytes, Bytes>,
-}
-
-fn copy_frames<[r]>(
-  dir: String,
-  token: Bytes,
-  c: FrameCopier,
-) -> FrameCopier / {fs.read[r], fs.write[r], abort.raise} =
-  if c.waiting.len() == 0 { c } else {
-    let rest = { ..c, waiting: [], start: 0, end: 0 };
-    match segments::read_range[r](segments::segment_path(dir, c.token), c.start, c.end - c.start) {
-      None -> rest,
-      Some(bytes) -> {
-        let put = segments::append_frames(c.out, bytes);
-        c.waiting.fold(
-          { ..rest, out: segments::flush_when_full[r](dir, schema(), token, put.writing) },
-          |accumulator: FrameCopier, w: { frame: Frame, at: Int }|
-            if w.frame.result {
-              {
-                ..accumulator,
-                results: accumulator.results.insert(
-                  w.frame.name,
-                  location_bytes(put.at + w.at - c.start, w.frame.at.size),
-                ),
-              }
-            } else {
-              {
-                ..accumulator,
-                records: accumulator.records.insert(w.frame.name, put.at + w.at - c.start),
-              }
-            },
-        )
-      },
-    }
-  }
-
-fn merge_chunk_size() -> Int = 16777216
-
-type RetentionPolicy = | KeepOnly(Map<Bytes, Bool>) | KeepRecent(Map<Bytes, Bool>)
-
-type ForeignQuery = { query: Bytes, bytes: Int, seen: Int }
-
-fn read_all<[r]>(
-  dir: String,
-  merging: List<Segment>,
-) -> Option<List<MergeInput>> / {fs.read[r], abort.raise} =
-  merging.fold(Some([]), |accumulator: Option<List<MergeInput>>, seg: Segment|
-    match accumulator {
+    memo_store.fact(key) -> match fact_store::value_of[r](st.db, Facts, key) {
+      Some(b) -> Some(undecoded(b, stored_fact_bin())),
       None -> None,
-      Some(done) -> match ((
-          segments::table_rows[r](dir, seg, records_table()),
-          segments::table_rows[r](dir, seg, queries_table()),
-          segments::table_rows[r](dir, seg, outputs_table()),
-        )) {
-        (Some(records), Some(queries), Some(results)) ->
-          Some(done.push({ segment: seg, records: records, queries: queries, results: results })),
-        _ -> None,
-      },
-    })
-
-fn merged_keys(all: List<MergeInput>) -> Map<Bytes, MergedKey> / {abort.raise} =
-  all.fold(Map::new(), |accumulator: Map<Bytes, MergedKey>, x: MergeInput|
-    segments::rows_folded(
-      x.records.len() / record_width(),
-      accumulator,
-      |into: Map<Bytes, MergedKey>, i: Int| {
-        let b = x.records.slice(i * record_width(), (i + 1) * record_width());
-        let key = b.slice(0, 32);
-        let row = row_from(b);
-        let here = if row.has_record {
-          Some({ token: x.segment.token, offset: row.offset, size: row.size })
-        } else { None };
-        let query = query_in(x.queries, row.query).query;
-        into.insert(key, {
-          row: row,
-          query: query,
-          from: match here {
-            Some(_) -> here,
-            None -> match into.get(key) {
-              Some(c) -> if c.row.result == row.result { c.from } else { None },
-              None -> None,
-            },
-          },
-        })
-      },
-    ))
-
-fn retained_queries(
-  retention: RetentionPolicy,
-  whole: Bool,
-  all: List<MergeInput>,
-  carried: Map<Bytes, MergedKey>,
-  seen: Map<Bytes, Int>,
-) -> Map<Bytes, Bool> / {abort.raise} =
-  match retention {
-    KeepOnly(queries) -> queries,
-    KeepRecent(own) -> if !whole { own } else {
-      let lengths = all.fold(Map::new(), |accumulator: Map<Bytes, Int>, x: MergeInput|
-        segments::rows_folded(
-          x.results.len() / output_row_width(),
-          accumulator,
-          |into: Map<Bytes, Int>, i: Int|
-            into.insert(
-              x.results.slice(i * output_row_width(), i * output_row_width() + 32),
-              segments::read_u32(x.results, i * output_row_width() + 40),
-            ),
-        ));
-      let query_bytes = carried.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Int>, _: Bytes, c: MergedKey|
-          match c.from {
-            None -> accumulator,
-            Some(f) ->
-              accumulator.insert(
-                c.query,
-                f.size + (match lengths.get(c.row.result) { Some(n) -> n, None -> 0 })
-                  + (match accumulator.get(c.query) { Some(n) -> n, None -> 0 }),
-              ),
-          },
-      );
-      let mine = query_bytes.fold(0, |n: Int, query: Bytes, bytes: Int|
-        if own.contains(query) { n + bytes } else { n });
-      let others = query_bytes.fold(
-        [],
-        |accumulator: List<ForeignQuery>, query: Bytes, bytes: Int|
-          if own.contains(query) { accumulator } else {
-            accumulator.push({
-              query: query,
-              bytes: bytes,
-              seen: match seen.get(query) { Some(at) -> at, None -> 0 },
-            })
-          },
-      ).sort_by(|a: ForeignQuery, b: ForeignQuery| a.seen > b.seen);
-      others.fold(
-        { live: own, room: mine },
-        |accumulator: { live: Map<Bytes, Bool>, room: Int }, x: ForeignQuery|
-          if x.bytes <= accumulator.room {
-            { live: accumulator.live.insert(x.query, true), room: accumulator.room - x.bytes }
-          } else { { ..accumulator, room: 0 } },
-      ).live
     },
-  }
-
-fn merge_segments<[r]>(
-  dir: String,
-  m: Manifest,
-  from: Int,
-  token: Bytes,
-  retention: RetentionPolicy,
-) -> Option<Compaction> / {fs.read[r], fs.write[r], abort.raise} = {
-  let whole = from == 0;
-  let merging = m.segments.drop(from);
-  match read_all[r](dir, merging) {
-    None -> None,
-    Some(all) -> {
-      let seen = all.fold(Map::new(), |accumulator: Map<Bytes, Int>, x: MergeInput|
-        segments::rows_folded(
-          x.queries.len() / query_width(),
-          accumulator,
-          |into: Map<Bytes, Int>, i: Int| {
-            let q = query_in(x.queries, i);
-            last_seen(into, q.query, q.seen)
-          },
-        ));
-      let carried = merged_keys(all);
-      let live = retained_queries(retention, whole, all, carried, seen);
-      let with_memo_store = carried.fold(
-        { keys: Map::new(), dropped: 0 },
-        |accumulator: { keys: Map<Bytes, MergedKey>, dropped: Int }, key: Bytes, c: MergedKey|
-          if !whole { { ..accumulator, keys: accumulator.keys.insert(key, c) } }
-          else if c.from == None { accumulator }
-          else if !live.contains(c.query) { { ..accumulator, dropped: accumulator.dropped + 1 } }
-          else { { ..accumulator, keys: accumulator.keys.insert(key, c) } },
-      );
-      let wanted = with_memo_store.keys.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, _: Bytes, c: MergedKey|
-          accumulator.insert(c.row.result, true),
-      );
-      let nth = range(0, merging.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
-        accumulator.insert(merging.get(i).token, i));
-      let order = |f: FrameLocation|
-        match nth.get(f.token) { Some(i) -> i * 1099511627776 + f.offset, None -> 0 - 1 };
-      let records = with_memo_store.keys.fold(
-        Map::new(),
-        |accumulator: Map<Int, Frame>, key: Bytes, c: MergedKey|
-          match c.from {
-            Some(f) -> accumulator.insert(order(f), { at: f, name: key, result: false }),
-            None -> accumulator,
-          },
-      );
-      let returned = all.reverse().fold(
-        { frames: records, met: Map::new(), dropped: 0, bytes: 0 },
-        |accumulator: { frames: Map<Int, Frame>, met: Map<Bytes, Bool>, dropped: Int, bytes: Int }, x: MergeInput|
-          segments::rows_folded(
-            x.results.len() / output_row_width(),
-            accumulator,
-            |a: { frames: Map<Int, Frame>, met: Map<Bytes, Bool>, dropped: Int, bytes: Int }, i: Int| {
-              let b = x.results.slice(i * output_row_width(), (i + 1) * output_row_width());
-              let name = b.slice(0, 32);
-              let size = segments::read_u32(b, 40);
-              if a.met.contains(name) { a } else if !wanted.contains(name) {
-                {
-                  ..a,
-                  met: a.met.insert(name, true),
-                  dropped: a.dropped + 1,
-                  bytes: a.bytes + size,
-                }
-              } else {
-                let f = { token: x.segment.token, offset: segments::read_u64(b, 32), size: size };
-                {
-                  ..a,
-                  met: a.met.insert(name, true),
-                  frames: a.frames.insert(order(f), { at: f, name: name, result: true }),
-                }
-              }
-            },
-          ),
-      );
-      let copied = copy_frames[r](
-        dir,
-        token,
-        returned.frames.fold(
-          {
-            out: segments::new_writer(),
-            token: b"",
-            start: 0,
-            end: 0,
-            waiting: [],
-            records: Map::new(),
-            results: Map::new(),
-          },
-          |c: FrameCopier, _: Int, f: Frame| {
-            let size = segments::framed_len(f.at.size);
-            let next = if c.waiting.len() > 0
-                && (f.at.token != c.token || f.at.offset != c.end
-                || c.end - c.start > merge_chunk_size()) { copy_frames[r](dir, token, c) }
-            else { c };
-            if next.waiting.len() == 0 {
-              {
-                ..next,
-                token: f.at.token,
-                start: f.at.offset,
-                end: f.at.offset + size,
-                waiting: [{ frame: f, at: f.at.offset }],
-              }
-            } else {
-              {
-                ..next,
-                end: next.end + size,
-                waiting: next.waiting.push({ frame: f, at: f.at.offset }),
-              }
-            }
-          },
-        ),
-      );
-      let seen_kept = with_memo_store.keys.fold(
-        if whole { Map::new() } else { seen },
-        |accumulator: Map<Bytes, Int>, _: Bytes, c: MergedKey|
-          accumulator.insert(c.query, match seen.get(c.query) { Some(at) -> at, None -> 0 }),
-      );
-      let key_rows = with_memo_store.keys.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, KeyRow>, key: Bytes, c: MergedKey| {
-          let lies = match c.from {
-            Some(f) -> match copied.records.get(key) {
-              Some(at) -> Some({ offset: at, size: f.size }),
-              None -> None,
-            },
-            None -> None,
-          };
-          accumulator.insert(key, {
-            row: {
-              ..c.row,
-              has_record: lies != None,
-              offset: match lies { Some(l) -> l.offset, None -> 0 },
-              size: match lies { Some(l) -> l.size, None -> 0 },
-            },
-            query: c.query,
-          })
-        },
-      );
-      let tables = tables_of(key_rows, seen_kept, copied.results);
-      match segments::finish[r](dir, schema(), token, copied.out, tables) {
+    memo_store.details(digest) -> match st.details.get(digest) {
+      Some(d) -> Some(d),
+      None -> match fact_store::result_of[r](st.db, digest) {
         None -> None,
-        Some(seg) -> match segments::replace_merged[r](dir, schema(), m, from, seg) {
-          Committed(_) ->
-            Some({
-              records: with_memo_store.dropped,
-              results: returned.dropped,
-              bytes: returned.bytes,
-            }),
-          _ -> {
-            fs.remove[r](segments::segment_path(dir, token));
-            None
+        Some(b) -> {
+          let d = undecoded(b, fact_details_bin());
+          st = { ..st, details: st.details.insert(digest, d) };
+          Some(d)
+        },
+      },
+    },
+    memo_store.output(digest) -> match st.outputs.get(digest) {
+      Some(o) -> Some(o),
+      None -> match st.transient.get(digest) {
+        Some(o) -> Some(o),
+        None -> match fact_store::result_of[r](st.db, result_key(digest)) {
+          Some(o) -> {
+            st = remembered_output(st, digest, o);
+            Some(o)
           },
+          None -> if !st.trusted { None } else {
+            let found = packs::output(st.pack, read, digest);
+            st = { ..st, pack: found.reading };
+            found.bytes
+          },
+        },
+      },
+    },
+    memo_store.sealed(key) -> if !st.trusted { None } else {
+      let found = sealed_lookup(st.pack, read, key);
+      st = { ..st, pack: found.reading };
+      match found.record {
+        None -> None,
+        Some(b) -> {
+          match pack_inline_of(b) {
+            Some(o) -> {
+              st = remembered_output(st, digest_of(Some(o)), o);
+            },
+            None -> (),
+          };
+          pack_digest_of(b)
         },
       }
+    },
+    memo_store.sealed_changed() -> st.pack_differs,
+    memo_store.dependents(key) -> fact_store::members[r](st.db, Dependents, key),
+    memo_store.inputs() ->
+      fact_store::entries_under[r](st.db, Inputs, b"").values().map(|b: Bytes|
+        undecoded(b, stored_input_bin())),
+    memo_store.facts_of(prefix) -> fact_store::entries_under[r](st.db, Facts, prefix).keys(),
+    memo_store.code(name) -> fact_store::value_of[r](st.db, Codes, code_key(name)),
+    memo_store.external(kind, at) -> {
+      let l = looked(st, kind, at);
+      st = l.open;
+      l.looked.value
+    },
+    memo_store.external_digest(kind, at) -> {
+      let l = looked(st, kind, at);
+      st = l.open;
+      l.looked.digest
+    },
+    memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
+    memo_store.times_marked(key) -> match st.waiting.marks.get(key) { Some(n) -> n, None -> 0 },
+    memo_store.next_out_of_date() -> first_waiting(st.waiting),
+    memo_store.put(key, fact, details, output, lasting) -> {
+      let persisted = lasting || inline_output(output) != None;
+      let kept = if persisted { stored_output[r](st, fact.output, output) }
+      else { { ..st, transient: st.transient.insert(fact.output, output) } };
+      st = {
+        ..kept,
+        details: kept.details.insert(fact.details, details),
+        db: fact_store::with_value(
+          fact_store::with_result[r](kept.db, fact.details, bin::encode(details, fact_details_bin())),
+          Facts,
+          key,
+          bin::encode(fact, stored_fact_bin()),
+        ),
+      };
+    },
+    memo_store.keep_output(digest, output, lasting) -> {
+      st = if lasting { stored_output[r](st, digest, output) }
+      else { { ..st, transient: st.transient.insert(digest, output) } };
+    },
+    memo_store.delete(key) -> {
+      st = {
+        ..st,
+        waiting: without_mark(st.waiting, key),
+        db: fact_store::without_value(st.db, Facts, key),
+      };
+    },
+    memo_store.add_dependent(key, dependent) -> {
+      st = { ..st, db: fact_store::add_member(st.db, Dependents, key, dependent) };
+    },
+    memo_store.remove_dependent(key, dependent) -> {
+      st = { ..st, db: fact_store::remove_member(st.db, Dependents, key, dependent) };
+    },
+    memo_store.put_input(input) -> {
+      let id = input_id(input);
+      let encoded = bin::encode(input, stored_input_bin());
+      if fact_store::value_of[r](st.db, Inputs, id) != Some(encoded) {
+        st = { ..st, db: fact_store::with_value(st.db, Inputs, id, encoded) };
+      };
+    },
+    memo_store.put_code(name, hash) -> {
+      st = { ..st, db: fact_store::with_value(st.db, Codes, code_key(name), hash) };
+    },
+    memo_store.mark_out_of_date(key, depth) -> {
+      st = { ..st, waiting: with_mark(st.waiting, key, depth) };
+    },
+    memo_store.settle(key) -> {
+      st = { ..st, waiting: without_mark(st.waiting, key) };
+    },
+    memo_store.log_change(query, input) -> {
+      st = { ..st, changes: st.changes.push({ query: query, input: input }) };
+    },
+    memo_store.running(id) -> {
+      let trusted = match st.pack.index {
+        Some(i) -> packs::is_trusted(i, id, world),
+        None -> false,
+      };
+      let pack_id = if trusted { id.concat(world).blake3() } else { b"" };
+      let was = fact_store::value_of[r](st.db, Codes, code_key(pack_id_name()));
+      st = {
+        ..st,
+        trusted: trusted,
+        pack_differs: was != Some(pack_id),
+        db: fact_store::with_value(st.db, Codes, code_key(pack_id_name()), pack_id),
+      };
+    },
+    return value -> {
+      fact_store::commit[r](fact_store::append_change(st.db, st.changes));
+      value
     },
   }
 }
@@ -649,414 +241,21 @@ pub fn with_memo_store<a, [r] | e>(
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> a / {fs.read[r], fs.write[r], abort.raise | e} = {
-  let run = segments::start_run[r](dir);
-  let manifest = segments::manifest[r](dir, schema());
-  let token = segments::segment_token(run, manifest.generation, 0);
-  let found = {
-    ..open_store(manifest, segments::run_start_ms[r](run)),
-    out: if run == None { segments::failed_writer() } else { segments::new_writer() },
-    pack: packs::open_reader(read),
-  };
-  let noted = |o: OpenStore, found: Option<Bytes>|
-    match found {
-      Some(b) -> match ((output_digest_of(b), inline_output_of(b))) {
-        (Some(d), Some(a)) -> { ..o, inlined: o.inlined.insert(d, a) },
-        _ -> o,
-      },
-      None -> o,
+) -> a / {fs.read[r], fs.write[r], abort.raise | e} =
+  with_recent_reads(|| {
+    let db = fact_store::open[r](dir);
+    let first = handle {
+      Some(over_database[r](db, read, world, look, work))
+    } with {
+      fact_damage.damaged(_) -> None,
     };
-  let packed_at = |o: OpenStore, key: Bytes|
-    match o.packed.get(key) {
-      Some(b) -> { open: o, bytes: b },
-      None -> {
-        let found = packs::record(o.pack, read, key);
-        let now = { ..o, pack: found.reading, packed: o.packed.insert(key, found.bytes) };
-        { open: noted(now, found.bytes), bytes: found.bytes }
-      },
+    let value = match first {
+      Some(v) -> v,
+      None -> fact_store::undamaged(|| over_database[r](fact_store::emptied(db), read, world, look, work)),
     };
-  let standing_at = |o: OpenStore, key: Bytes|
-    if !o.trusted || o.written_rows.contains(key) { { open: o, bytes: None } }
-    else { packed_at(o, key) };
-  let packed_result = |o: OpenStore, digest: Bytes| {
-    let found = packs::output(o.pack, read, digest);
-    { open: { ..o, pack: found.reading }, result: found.bytes }
-  };
-  let row_result = |o: OpenStore, key: Bytes|
-    match o.written_rows.get(key) {
-      Some(x) -> { open: o, held: Some(x.result) },
-      None -> {
-        let k = key_state[r](dir, o, key);
-        { open: k.open, held: match k.known { Some(kn) -> Some(kn.row.result), None -> None } }
-      },
-    };
-  let looked = |o: OpenStore, kind: Bytes, place: Bytes| {
-    let id = memo::location_id(kind, place);
-    match o.looked.get(id) {
-      Some(x) -> { open: o, looked: x },
-      None -> {
-        let value = look(kind, place);
-        let x = { value: value, digest: digest_of(value) };
-        { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
-      },
-    }
-  };
-  let own = |o0: OpenStore, key: Bytes| {
-    let h0 = row_result(o0, key);
-    match h0.held {
-      None -> { open: h0.open, bytes: None },
-      Some(result) -> {
-        let o = h0.open;
-        let lies = match match o.written_rows.get(key) { Some(x) -> x.frame, None -> None } {
-          Some(f) -> { open: o, at: Some({ token: token, offset: f.offset, size: f.size }) },
-          None -> frame_row[r](dir, o, key, result),
-        };
-        match lies.at {
-          None -> { open: lies.open, bytes: None },
-          Some(at) -> {
-            let name = at.token.concat(u64_le(at.offset));
-            match lies.open.read.get(name) {
-              Some(b) -> { open: lies.open, bytes: Some(b) },
-              None -> {
-                let framed = frame_of[r](dir, token, lies.open, at);
-                let now = noted(lies.open, framed);
-                match framed {
-                  Some(b) -> { open: { ..now, read: now.read.insert(name, b) }, bytes: Some(b) },
-                  None -> { open: { ..now, unread: now.unread.insert(result, true) }, bytes: None },
-                }
-              },
-            }
-          },
-        }
-      },
-    }
-  };
-  let inside = |o: OpenStore, digest: Bytes|
-    match o.inlined.get(digest) {
-      Some(a) -> { open: o, result: Some(a) },
-      None -> match o.named.get(digest) {
-        Some(key) -> {
-          let got = own(o, key);
-          { open: got.open, result: got.open.inlined.get(digest) }
-        },
-        None -> { open: o, result: None },
-      },
-    };
-  let append_record = |o0: OpenStore, key: Bytes, record: Record, inline: Option<Bytes>, longer: Option<Bytes>|
-    match packs::output_key(record.output) {
-      None -> o0,
-      Some(name) -> {
-        if key.len() != key_width() { panic("a memo key must be thirty-two bytes") };
-        let bytes = record_bytes(record, inline);
-        let f = segments::append_payload(o0.out, bytes);
-        let o1 = { ..o0, out: f.writing };
-        let o2 = match inline {
-          Some(a) -> { ..o1, inlined: o1.inlined.insert(record.output, a) },
-          None -> o1,
-        };
-        let o3 = match longer {
-          None -> o2,
-          Some(body) -> if o2.results.contains(name) { o2 } else {
-            let there = if o2.unread.contains(name) { { open: o2, at: None } }
-            else { output_row[r](dir, o2, name) };
-            let readable = match there.at {
-              Some(at) -> frame_of[r](dir, token, there.open, at) != None,
-              None -> false,
-            };
-            match if readable { there.at } else { None } {
-              Some(_) -> cache_output(there.open, name, body),
-              None -> {
-                let g = segments::append_payload(there.open.out, body);
-                {
-                  ..cache_output(there.open, name, body),
-                  out: g.writing,
-                  results: there.open.results.insert(name, location_bytes(g.at, body.len())),
-                }
-              },
-            }
-          },
-        };
-        {
-          ..o3,
-          out: segments::flush_when_full[r](dir, schema(), token, o3.out),
-          written_rows: o3.written_rows.insert(key, {
-            result: name,
-            query: record.query.blake3(),
-            frame: Some({ offset: f.at, size: bytes.len() }),
-          }),
-        }
-      },
-    };
-  let value = handle {
-    work()
-  } with {
-    var st = found,
-    memo_store.output_digest(key) -> {
-      let p = standing_at(st, key);
-      st = p.open;
-      match p.bytes {
-        Some(b) -> output_digest_of(b),
-        None -> {
-          let h = row_result(st, key);
-          st = h.open;
-          match h.held {
-            Some(result) -> {
-              let digest = output_digest_of_key(result);
-              st = { ..st, named: st.named.insert(digest, key) };
-              Some(digest)
-            },
-            None -> {
-              let q = packed_at(st, key);
-              st = q.open;
-              match q.bytes { Some(b) -> output_digest_of(b), None -> None }
-            },
-          }
-        },
-      }
-    },
-    memo_store.record(key) -> {
-      let p = standing_at(st, key);
-      st = p.open;
-      match p.bytes {
-        Some(b) -> record_from(b),
-        None -> {
-          let mine = own(st, key);
-          st = mine.open;
-          match mine.bytes {
-            Some(b) -> record_from(b),
-            None -> {
-              let h = row_result(st, key);
-              st = h.open;
-              match h.held {
-                Some(_) -> None,
-                None -> {
-                  let q = packed_at(st, key);
-                  st = q.open;
-                  match q.bytes { Some(b) -> record_from(b), None -> None }
-                },
-              }
-            },
-          }
-        },
-      }
-    },
-    memo_store.output(digest) -> {
-      let i = inside(st, digest);
-      st = i.open;
-      match i.result {
-        Some(a) -> Some(a),
-        None -> match st.transient.get(digest) {
-          Some(a) -> Some(a),
-          None -> match packs::output_key(digest) {
-            None -> None,
-            Some(name) -> match st.cached_outputs.get(name) {
-              Some(a) -> Some(a),
-              None -> {
-                let o = st;
-                let lies = match o.results.get(name) {
-                  Some(b) ->
-                    {
-                      open: o,
-                      at: Some({
-                        token: token,
-                        offset: segments::read_u64(b, 0),
-                        size: segments::read_u32(b, 8),
-                      }),
-                    },
-                  None -> if o.unread.contains(name) { { open: o, at: None } }
-                  else { output_row[r](dir, o, name) },
-                };
-                let found = match lies.at {
-                  Some(at) -> match frame_of[r](dir, token, lies.open, at) {
-                    Some(a) -> { open: lies.open, result: Some(a) },
-                    None ->
-                      packed_result(
-                        { ..lies.open, unread: lies.open.unread.insert(name, true) },
-                        digest,
-                      ),
-                  },
-                  None -> packed_result(lies.open, digest),
-                };
-                st = match found.result {
-                  Some(a) -> cache_output(found.open, name, a),
-                  None -> found.open,
-                };
-                found.result
-              },
-            },
-          },
-        },
-      }
-    },
-    memo_store.put(key, record, output, lasting) -> {
-      st = match inline_output(output) {
-        Some(a) -> append_record(st, key, record, Some(a), None),
-        None -> if lasting { append_record(st, key, record, None, Some(output)) } else {
-          let o = append_record(st, key, record, None, None);
-          { ..o, transient: o.transient.insert(record.output, output) }
-        },
-      };
-    },
-    memo_store.store_record(key, record) -> {
-      st = append_record(st, key, record, st.inlined.get(record.output), None);
-    },
-    memo_store.external(kind, place) -> {
-      let l = looked(st, kind, place);
-      st = l.open;
-      l.looked.value
-    },
-    memo_store.external_digest(kind, place) -> {
-      let l = looked(st, kind, place);
-      st = l.open;
-      l.looked.digest
-    },
-    memo_store.has_trusted_record(key) -> {
-      let p = standing_at(st, key);
-      st = p.open;
-      p.bytes != None
-    },
-    memo_store.pack_record(key) -> {
-      let h = row_result(st, key);
-      st = h.open;
-      match h.held {
-        None -> None,
-        Some(_) -> {
-          let p = packed_at(st, key);
-          st = p.open;
-          match p.bytes { Some(b) -> record_from(b), None -> None }
-        },
-      }
-    },
-    memo_store.running(id, queries) -> {
-      st = {
-        ..st,
-        own: queries.fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
-          own.insert(q.blake3(), true)),
-        trusted: match st.pack.index { Some(i) -> packs::is_trusted(i, id, world), None -> false },
-      };
-    },
-    return value -> {
-      match run { Some(path) -> commit[r](dir, path, token, st), None -> () };
-      value
-    },
-  };
-  segments::end_run[r](run);
-  value
-}
-
-fn record_bytes_at<[r]>(
-  dir: String,
-  o: OpenStore,
-  key: Bytes,
-) -> { open: OpenStore, bytes: Option<Bytes> } / {fs.read[r], abort.raise} = {
-  let k = key_state[r](dir, o, key);
-  match k.known {
-    None -> { open: k.open, bytes: None },
-    Some(known) -> {
-      let lies = frame_row[r](dir, k.open, key, known.row.result);
-      {
-        open: lies.open,
-        bytes: match lies.at {
-          Some(at) -> segments::payload[r](dir, at.token, at.offset, at.size),
-          None -> None,
-        },
-      }
-    },
-  }
-}
-
-type PackBuild = {
-  open: OpenStore,
-  writing: packs::PackWriter,
-  records: Map<Bytes, packs::Range>,
-  results: Map<Bytes, packs::Range>,
-  returned: Map<Bytes, Bytes>,
-}
-
-pub fn write_pack<[r]>(
-  from: String,
-  keys: List<Bytes>,
-  compress: (Bytes) -> Bytes / {abort.raise},
-  queries: Bytes,
-  files: Bytes,
-) -> { written: packs::PackFiles, records: Int } / {fs.read[r], abort.raise} = {
-  let laid = keys.fold(
-    {
-      open: open_store(segments::manifest[r](from, schema()), 0),
-      writing: packs::new_writer(),
-      records: Map::new(),
-      results: Map::new(),
-      returned: Map::new(),
-    },
-    |accumulator: PackBuild, key: Bytes| {
-      let k = record_bytes_at[r](from, accumulator.open, key);
-      let named = match k.bytes {
-        Some(b) -> match output_digest_of(b) {
-          Some(d) -> Some({ bytes: b, digest: d }),
-          None -> None,
-        },
-        None -> None,
-      };
-      match named {
-        None -> { ..accumulator, open: k.open },
-        Some(record) -> {
-          let longer = if inline_output_of(record.bytes) != None {
-            Some({ ..accumulator, open: k.open })
-          } else {
-            match packs::output_key(record.digest) {
-              None -> None,
-              Some(name) -> if accumulator.results.contains(name) {
-                Some({ ..accumulator, open: k.open })
-              } else {
-                let lies = output_row[r](from, k.open, name);
-                let body = match lies.at {
-                  Some(at) -> segments::payload[r](from, at.token, at.offset, at.size),
-                  None -> None,
-                };
-                match body {
-                  None -> None,
-                  Some(a) -> {
-                    let f = packs::append_frame(accumulator.writing, a, compress);
-                    Some({
-                      ..accumulator,
-                      open: lies.open,
-                      writing: f.writing,
-                      results: accumulator.results.insert(name, f.at),
-                    })
-                  },
-                }
-              },
-            }
-          };
-          match longer {
-            None -> { ..accumulator, open: k.open },
-            Some(had) -> {
-              let f = packs::append_frame(had.writing, record.bytes, compress);
-              {
-                ..had,
-                writing: f.writing,
-                records: had.records.insert(key, f.at),
-                returned: had.returned.insert(key, record.digest),
-              }
-            },
-          }
-        },
-      }
-    },
-  );
-  {
-    written: packs::finish(
-      laid.writing,
-      laid.records,
-      laid.results,
-      laid.returned,
-      compress,
-      queries,
-      files,
-    ),
-    records: laid.records.len(),
-  }
-}
+    fact_store::close[r](db);
+    value
+  })
 
 pub type Usage = {
   records: Int,
@@ -1069,462 +268,191 @@ pub type Usage = {
   bytes: Int,
 }
 
-type NewestRow = { result: Bytes, query: Bytes, frame: Int }
-
-pub fn usage<[r]>(dir: String, queries: List<Bytes>) -> Usage / {fs.read[r], abort.raise} = {
-  let m = segments::manifest[r](dir, schema());
-  let current = queries.fold(Map::new(), |accumulator: Map<Bytes, Bool>, q: Bytes|
-    accumulator.insert(q.blake3(), true));
-  let effects_in = |seg: Segment, table: Int|
-    match segments::table_rows[r](dir, seg, table) { Some(rows) -> rows, None -> b"" };
-  let read = m.segments.fold(
-    { newest: Map::new(), frames: 0, lengths: Map::new() },
-    |accumulator: { newest: Map<Bytes, NewestRow>, frames: Int, lengths: Map<Bytes, Int> }, seg: Segment| {
-      let qs = effects_in(seg, queries_table());
-      let rows = effects_in(seg, records_table());
-      let results = effects_in(seg, outputs_table());
-      let laid = segments::rows_folded(
-        rows.len() / record_width(),
-        { newest: accumulator.newest, frames: accumulator.frames },
-        |x: { newest: Map<Bytes, NewestRow>, frames: Int }, i: Int| {
-          let b = rows.slice(i * record_width(), (i + 1) * record_width());
-          let row = row_from(b);
-          let was = match x.newest.get(b.slice(0, 32)) { Some(n) -> n.frame, None -> 0 };
-          {
-            newest: x.newest.insert(b.slice(0, 32), {
-              result: row.result,
-              query: query_in(qs, row.query).query,
-              frame: if row.has_record { row.size } else { was },
-            }),
-            frames: x.frames + (if row.has_record { row.size } else { 0 }),
-          }
-        },
-      );
-      {
-        newest: laid.newest,
-        frames: laid.frames,
-        lengths: segments::rows_folded(
-          results.len() / output_row_width(),
-          accumulator.lengths,
-          |l: Map<Bytes, Int>, i: Int| {
-            let b = results.slice(i * output_row_width(), (i + 1) * output_row_width());
-            l.insert(b.slice(0, 32), segments::read_u32(b, 40))
-          },
-        ),
-      }
+fn live_results<[r]>(
+  db: Database,
+) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  fact_store::entries_under[r](db, Facts, b"").fold(
+    Map::new(),
+    |found: Map<Bytes, Bool>, _: Bytes, b: Bytes| {
+      let f = undecoded(b, stored_fact_bin());
+      found.insert(result_key(f.output), true).insert(f.details, true)
     },
-  );
-  let with_memo_store = read.newest.fold(
-    { results: Map::new(), named: Map::new(), frames: 0, foreign: 0 },
-    |accumulator: { results: Map<Bytes, Bool>, named: Map<Bytes, Bool>, frames: Int, foreign: Int }, _: Bytes, n: NewestRow|
-      if current.contains(n.query) {
-        {
-          ..accumulator,
-          results: accumulator.results.insert(n.result, true),
-          named: accumulator.named.insert(n.result, true),
-          frames: accumulator.frames + n.frame,
-        }
-      } else {
-        {
-          ..accumulator,
-          named: accumulator.named.insert(n.result, true),
-          foreign: accumulator.foreign + 1,
-        }
-      },
-  );
-  let results = read.lengths.fold(
-    { count: 0, bytes: 0, unread: 0, dropped: 0 },
-    |u: { count: Int, bytes: Int, unread: Int, dropped: Int }, name: Bytes, n: Int|
-      {
-        count: u.count + 1,
-        bytes: u.bytes + n,
-        unread: if with_memo_store.named.contains(name) { u.unread } else { u.unread + n },
-        dropped: if with_memo_store.results.contains(name) { u.dropped } else { u.dropped + n },
-      },
-  );
-  {
-    records: read.newest.len(),
-    results: results.count,
-    output_bytes: results.bytes,
-    unreferenced_bytes: results.unread,
-    foreign: with_memo_store.foreign,
-    reclaimable_bytes: results.dropped + read.frames - with_memo_store.frames,
-    segments: m.segments.len(),
-    bytes: m.segments.fold(0, |n: Int, seg: Segment| n + seg.size),
-  }
-}
+  )
+
+pub fn usage<[r]>(dir: String, queries: List<Bytes>) -> Usage / {fs.read[r], abort.raise} =
+  with_recent_reads(|| fact_store::undamaged(|| {
+    let db = fact_store::read_only[r](dir);
+    let size = fact_store::store_size(db);
+    let live = live_results[r](db);
+    {
+      records: fact_store::entries_under[r](db, Facts, b"").len(),
+      results: live.len(),
+      output_bytes: size.bytes,
+      unreferenced_bytes: 0,
+      foreign: 0,
+      reclaimable_bytes: 0,
+      segments: size.segments,
+      bytes: size.bytes,
+    }
+  }))
+
+pub type Compaction = { records: Int, results: Int, bytes: Int }
 
 pub fn compact<[r]>(
   dir: String,
   queries: List<Bytes>,
-) -> Compaction / {fs.read[r], fs.write[r], abort.raise} = {
-  let run = segments::start_run[r](dir);
-  let with_memo_store = queries.fold(Map::new(), |accumulator: Map<Bytes, Bool>, q: Bytes|
-    accumulator.insert(q.blake3(), true));
-  let done = match run {
-    None -> None,
-    Some(path) -> {
-      let m = segments::manifest[r](dir, schema());
-      let dropped = if m.segments.len() == 0 { None } else {
-        merge_segments[r](
-          dir,
-          m,
-          0,
-          segments::segment_token(run, m.generation, 0),
-          KeepOnly(with_memo_store),
-        )
-      };
-      segments::sweep[r](dir, schema(), path, retired_directories());
-      dropped
-    },
-  };
-  segments::end_run[r](run);
-  match done { Some(d) -> d, None -> { records: 0, results: 0, bytes: 0 } }
+) -> Compaction / {fs.read[r], fs.write[r], abort.raise} =
+  with_recent_reads(|| fact_store::undamaged(|| {
+    let db = fact_store::open[r](dir);
+    let done = fact_store::compact[r](db, live_results[r](db));
+    fact_store::close[r](db);
+    { records: 0, results: 0, bytes: done.bytes_before - done.bytes_after }
+  }))
+
+type PackBuild = {
+  writing: packs::PackWriter,
+  records: Map<Bytes, packs::Range>,
+  results: Map<Bytes, packs::Range>,
+  returned: Map<Bytes, Bytes>,
 }
+
+pub fn write_pack<[r]>(
+  from: String,
+  keys: List<Bytes>,
+  compress: (Bytes) -> Bytes / {abort.raise},
+  queries: Bytes,
+  files: Bytes,
+) -> { written: packs::PackFiles, records: Int } / {fs.read[r], abort.raise} =
+  with_recent_reads(|| fact_store::undamaged(|| {
+    let db = fact_store::read_only[r](from);
+    let laid = keys.fold(
+      { writing: packs::new_writer(), records: Map::new(), results: Map::new(), returned: Map::new() },
+      |built: PackBuild, key: Bytes|
+        match fact_store::value_of[r](db, Facts, key) {
+          None -> built,
+          Some(b) -> {
+            let f = undecoded(b, stored_fact_bin());
+            let output = fact_store::result_of[r](db, result_key(f.output));
+            let inline = match output { Some(o) -> inline_output(o), None -> None };
+            let with_output = match ((output, inline, packs::output_key(f.output))) {
+              (Some(o), None, Some(name)) -> if built.results.contains(name) { built } else {
+                let framed = packs::append_frame(built.writing, o, compress);
+                { ..built, writing: framed.writing, results: built.results.insert(name, framed.at) }
+              },
+              _ -> built,
+            };
+            let framed = packs::append_frame(
+              with_output.writing,
+              pack_record_bytes(f.output, inline),
+              compress,
+            );
+            {
+              ..with_output,
+              writing: framed.writing,
+              records: with_output.records.insert(pack_row_key(key), framed.at),
+              returned: with_output.returned.insert(pack_row_key(key), f.output),
+            }
+          },
+        },
+    );
+    {
+      written: packs::finish(
+        laid.writing,
+        laid.records,
+        laid.results,
+        laid.returned,
+        compress,
+        queries,
+        files,
+      ),
+      records: laid.records.len(),
+    }
+  }))
 
 fn quoted(input: Bytes) -> Bytes / {memo.read} =
   Bytes::concat_all([b"\"", memo.fetch(b"text", input), b"\""])
 
-fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query<| {}>> =
+fn test_queries() -> Map<Bytes, memo::Query<| {}>> =
   Map::new().insert(b"text", query(b"text", b"t1", memo::read_file)).insert(
     b"quoted",
     query(b"quoted", b"q1", quoted),
-  ).insert(
-    b"spare",
-    query(b"spare", spare, memo::read_file),
   )
 
-fn quoted_under<[r]>(
-  text: Bytes,
-  spare: Bytes,
-) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = test_queries(spare);
+fn quoted_over<[r]>(text: Bytes) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
+  let queries = test_queries();
   with_memo_store[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), || {
     let a = query_output(queries, start_run(queries), b"quoted", b"a");
     { output: a.output, ran: memo::executed_count(a.run) }
   })
 }
 
-fn quoted_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
-  quoted_under[r](text, b"").output
-
-fn run_named_query<[r]>(
-  text: Bytes,
-  name: Bytes,
-  lasting: Bool,
-) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = test_queries(b"").insert(b"text", {
-    ..query(b"text", b"t1", memo::read_file),
-    persistent: lasting,
-  });
-  with_memo_store[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), || {
-    let a = query_output(queries, start_run(queries), name, b"a");
-    { output: a.output, ran: memo::executed_count(a.run) }
-  })
-}
-
-fn stored(tree: fs::MemFs) -> List<String> / {abort.raise} =
+fn stored_names(tree: fs::MemFs) -> List<String> / {abort.raise} =
   match fs::listed_names(fs::mem_list(tree, "s")) { Some(names) -> names, None -> [] }
-
-fn segments_in(tree: fs::MemFs) -> List<String> / {abort.raise} =
-  stored(tree).filter(|name: String| name.starts_with("seg-"))
 
 test "a run interrupted after any number of writes leaves a store from which the next run returns what a run on a fresh store returns" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
-  assert_eq(first.value, b"\"four\"");
-  let whole = fs::on_mem[abs](first.tree, || quoted_over[abs](b"forty")).tree;
-  let writes = iterate(0, 1000, |n: Int| {
+  assert_eq(first.value.output, b"\"four\"");
+  iterate(0, 1000, |n: Int| {
     let died = fs::on_mem_failing[abs](first.tree, n, || quoted_over[abs](b"forty"));
-    assert_eq(fs::on_mem[abs](died.tree, || quoted_over[abs](b"forty")).value, b"\"forty\"");
-    if died.tree.files == whole.files { Stop(n) } else { Continue(n + 1) }
-  });
-  assert(writes > 0)
+    assert_eq(fs::on_mem[abs](died.tree, || quoted_over[abs](b"forty")).value.output, b"\"forty\"");
+    if fs::on_mem[abs](died.tree, || quoted_over[abs](b"forty")).value.ran == 0 { Stop(()) }
+    else { Continue(n + 1) }
+  })
 }
 
-test "a store is a manifest file and a few segment files, and a run that records nothing new writes no files" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", b""));
-  assert_eq(first.value.ran, 2);
-  assert_eq(stored(first.tree).len(), 2);
-  let again = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", b""));
-  assert_eq(again.value, { output: b"\"four\"", ran: 0 });
-  assert_eq(again.tree.files, first.tree.files);
-  let moved = fs::on_mem[abs](again.tree, || quoted_under[abs](b"forty", b""));
-  assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
-  assert_eq(stored(moved.tree).len(), 2);
-  assert_eq(fs::on_mem[abs](moved.tree, || quoted_under[abs](b"forty", b"")).value.ran, 0)
-}
-
-test "a store written under one set of queries returns its results to another set, and a run that only reads writes nothing" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", b"one"));
-  let other = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", b"two"));
-  assert_eq(other.value, { output: b"\"four\"", ran: 0 });
-  assert_eq(other.tree.files, first.tree.files);
-  let back = fs::on_mem[abs](other.tree, || quoted_under[abs](b"four", b"one"));
-  assert_eq(back.value.ran, 0);
-  assert_eq(back.tree.files, first.tree.files)
-}
-
-test "a run under a set of queries that is not yet in the store writes nothing until it runs a query" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", b"one"));
-  let queries = test_queries(b"two");
-  let idle = fs::on_mem[abs](first.tree, ||
-    with_memo_store[abs]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(b"four"), ||
-      memo::executed_count(start_run(queries))));
-  assert_eq(idle.value, 0);
-  assert_eq(idle.tree.files, first.tree.files)
-}
-
-test "a result recomputed after a file change under one set of queries is reused under the other sets" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", b"one"));
-  let other = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", b"two"));
-  let moved = fs::on_mem[abs](other.tree, || quoted_under[abs](b"forty", b"two"));
-  assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
-  let back = fs::on_mem[abs](moved.tree, || quoted_under[abs](b"forty", b"one"));
-  assert_eq(back.value, { output: b"\"forty\"", ran: 0 })
-}
-
-effect concurrent_run {
-  write first() -> Bool
-}
-
-test "two concurrent runs over an edited file leave a store that returns what a fresh store returns" {
-  let racing = |tree: fs::MemFs|
-    fs::on_mem[abs](tree, || {
-      let queries = test_queries(b"");
-      handle {
-        with_memo_store[abs](
-          "s",
-          packs::no_pack,
-          b"",
-          |_: Bytes, _: Bytes| {
-            if concurrent_run.first() {
-              quoted_over[abs](b"forty");
-              ()
-            };
-            Some(b"four")
-          },
-          || query_output(queries, start_run(queries), b"quoted", b"a").output,
-        )
-      } with {
-        var begun = false,
-        concurrent_run.first() -> {
-          let first = !begun;
-          begun = true;
-          first
-        },
-      }
-    });
+test "a run that finds no change runs no query and writes nothing but its own run directory" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
-  let raced = racing(first.tree);
-  assert_eq(raced.value, b"\"four\"");
-  let after = fs::on_mem[abs](raced.tree, || quoted_under[abs](b"forty", b""));
-  assert_eq(after.value.output, b"\"forty\"");
-  let resolved = fs::on_mem[abs](after.tree, || quoted_under[abs](b"forty", b""));
-  assert_eq(resolved.value, { output: b"\"forty\"", ran: 0 });
-  let cold = racing(fs::mem_of([]));
-  assert_eq(
-    fs::on_mem[abs](cold.tree, || quoted_under[abs](b"forty", b"")).value.output,
-    b"\"forty\"",
-  )
+  let again = fs::on_mem[abs](first.tree, || quoted_over[abs](b"four"));
+  assert_eq(again.value, { output: b"\"four\"", ran: 0 });
+  assert_eq(stored_names(again.tree), stored_names(first.tree))
 }
 
-test "a compaction leaves one segment containing the records of the queries it is given" {
-  let first = fs::on_mem[abs](fs::mem_of([{ path: "s/records/stale", body: b"old" }]), ||
-    quoted_over[abs](b"four"));
-  assert(!stored(first.tree).contains("records"));
+test "a query's digest and result survive a reopen, and an edit reruns what depends on it" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
   let moved = fs::on_mem[abs](first.tree, || quoted_over[abs](b"forty"));
-  let small = fs::on_mem[abs](moved.tree, || compact[abs]("s", [b"t1", b"q1"]));
-  assert_eq(small.value.records, 0);
-  assert_eq(segments_in(small.tree).len(), 1);
-  let after = fs::on_mem[abs](small.tree, || quoted_under[abs](b"forty", b""));
-  assert_eq(after.value, { output: b"\"forty\"", ran: 0 });
-  let less = fs::on_mem[abs](small.tree, || compact[abs]("s", [b"t1"]));
-  assert_eq(less.value.records, 2);
-  let cold = fs::on_mem[abs](less.tree, || quoted_under[abs](b"forty", b""));
-  assert_eq(cold.value, { output: b"\"forty\"", ran: 1 })
+  assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
+  assert_eq(fs::on_mem[abs](moved.tree, || quoted_over[abs](b"forty")).value.ran, 0)
 }
 
-fn quoted_tagged<[r]>(tag: Bytes) -> Int / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = Map::new().insert(
-    b"text",
-    query(b"text", b"t".concat(tag), memo::read_file),
-  ).insert(
-    b"quoted",
-    query(b"quoted", b"q".concat(tag), quoted),
-  );
-  with_memo_store[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(b"four"), ||
-    memo::executed_count(query_output(queries, start_run(queries), b"quoted", b"a").run))
-}
-
-test "compaction may delete records that another `ply`'s queries wrote to the store" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_tagged[abs](b"a"));
-  let own = fs::on_mem[abs](first.tree, || usage[abs]("s", [b"ta", b"qa"])).value;
-  let other = fs::on_mem[abs](first.tree, || usage[abs]("s", [b"tb", b"qb"])).value;
-  assert_eq([own.records, own.foreign, own.reclaimable_bytes], [2, 0, 0]);
-  assert_eq([other.records, other.foreign], [2, 2]);
-  assert(other.reclaimable_bytes > 0);
-  let compact = fs::on_mem[abs](first.tree, || compact[abs]("s", [b"tb", b"qb"]));
-  assert_eq(fs::on_mem[abs](compact.tree, || usage[abs]("s", [b"tb", b"qb"])).value.records, 0)
-}
-
-test "a store shared by several `ply`s contains the writing `ply`'s records and as many records from the most recent other `ply`s" {
-  let after = |tree: fs::MemFs, tag: Bytes| fs::on_mem[abs](tree, || quoted_tagged[abs](tag));
-  let four = [b"a", b"b", b"c", b"d"].fold(fs::mem_of([]), |tree: fs::MemFs, tag: Bytes| {
-    let ran = after(tree, tag);
-    assert_eq(ran.value, 2);
-    ran.tree
-  });
-  assert_eq(after(four, b"d").value, 0);
-  assert_eq(after(four, b"c").value, 0);
-  assert_eq(after(four, b"b").value, 2);
-  assert_eq(after(four, b"a").value, 2)
-}
-
-test "a large result is stored once, and a large result with corrupted stored bytes is recomputed once and then reused" {
-  let long = b"long ".repeat(1000);
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](long, b""));
-  assert_eq(first.value.ran, 2);
-  let name = match segments_in(first.tree) { [name] -> "s/" ++ name, _ -> "" };
-  let bytes = match fs::mem_read(first.tree, name) { Some(b) -> b, None -> b"" };
-  assert(bytes.len() > 10000 && bytes.len() < 14000);
+test "a stored value that fails its checksum makes the run start over from nothing" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
+  let segment = stored_names(first.tree).filter(|n: String| n.starts_with("seg-")).get(0);
   let torn = fs::on_mem[abs](first.tree, || {
-    fs.write_file[abs](
-      name,
-      Bytes::concat_all([
-        bytes.slice(0, 52),
-        b"\x00".repeat(10000),
-        bytes.slice(10052, bytes.len()),
-      ]),
-    );
-    quoted_under[abs](long, b"")
+    fs.write_file[abs]("s/" ++ segment, b"not a segment");
+    quoted_over[abs](b"four")
   });
-  assert_eq(torn.value.output, Bytes::concat_all([b"\"", long, b"\""]));
-  assert_eq(torn.value.ran, 2);
-  assert_eq(fs::on_mem[abs](torn.tree, || quoted_under[abs](long, b"")).value.ran, 0)
+  assert_eq(torn.value, { output: b"\"four\"", ran: 2 })
 }
 
-test "a query that does not cache its results writes none, and a later run that needs a result computes it again" {
+test "a compaction keeps every fact the snapshot uses" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
+  let moved = fs::on_mem[abs](first.tree, || quoted_over[abs](b"forty"));
+  let small = fs::on_mem[abs](moved.tree, || compact[abs]("s", []));
+  assert_eq(fs::on_mem[abs](small.tree, || quoted_over[abs](b"forty")).value, {
+    output: b"\"forty\"",
+    ran: 0,
+  })
+}
+
+test "a pack holds the facts of the keys it is built from, and a trusted run uses them with no query" {
+  let queries = test_queries();
   let long = b"long ".repeat(1000);
-  let first = fs::on_mem[abs](fs::mem_of([]), || run_named_query[abs](long, b"quoted", false));
-  assert_eq(first.value.ran, 2);
-  let name = match segments_in(first.tree) { [name] -> "s/" ++ name, _ -> "" };
-  let bytes = match fs::mem_read(first.tree, name) { Some(b) -> b, None -> b"" };
-  assert(bytes.len() > 5000 && bytes.len() < 10000);
-  let again = fs::on_mem[abs](first.tree, || run_named_query[abs](long, b"quoted", false));
-  assert_eq(again.value.ran, 0);
-  let text = fs::on_mem[abs](again.tree, || run_named_query[abs](long, b"text", false));
-  assert_eq(text.value.output, long);
-  assert_eq(text.value.ran, 1)
-}
-
-test "every large result is still reused, with no query run, after the store is rewritten as one segment" {
-  let queries = test_queries(b"");
-  let all = ||
+  let keys = [b"text", b"quoted"].map(|name: Bytes| memo::fact_key(name, b"a"));
+  let pack = fs::on_mem[abs](fs::mem_of([]), || {
+    quoted_over[abs](long);
+    write_pack[abs]("s", keys, packs::uncompressed, memo::queries_id(queries), b"files")
+  }).value;
+  assert_eq(pack.records, 2);
+  let used = fs::on_mem[abs](fs::mem_of([]), ||
     with_memo_store[abs](
       "s",
-      packs::no_pack,
-      b"",
-      |_: Bytes, at: Bytes| Some(b"long ".repeat(1000).concat(at)),
-      ||
-        memo::executed_count(
-          range(0, 12).fold(start_run(queries), |run: memo::Run, i: Int|
-            query_output(queries, run, b"quoted", Bytes::of_string(i.to_string())).run),
-        ),
-    );
-  let first = fs::on_mem[abs](fs::mem_of([]), || all());
-  assert_eq(first.value, 24);
-  let small = fs::on_mem[abs](first.tree, || compact[abs]("s", [b"t1", b"q1"]));
-  assert_eq(small.value, { records: 0, results: 0, bytes: 0 });
-  assert_eq(fs::on_mem[abs](small.tree, || all()).value, 0)
-}
-
-fn quoted_pack(
-  text: Bytes,
-  also: List<Bytes>,
-) -> { written: packs::PackFiles, records: Int } / {abort.raise} = {
-  let queries = test_queries(b"");
-  let keys = [b"text", b"quoted"].map(|name: Bytes|
-    match queries.get(name) { Some(q) -> memo::key_of(q, b"a"), None -> b"" });
-  fs::on_mem[abs](fs::mem_of([]), || {
-    quoted_over[abs](text);
-    write_pack[abs](
-      "s",
-      keys.concat(also),
-      packs::uncompressed,
-      memo::queries_id(queries),
+      |path: String, offset: Int, len: Int| packs::frame_in(Some(pack.written), path, offset, len),
       b"files",
-    )
-  }).value
-}
-
-fn quoted_below(
-  tree: fs::MemFs,
-  pack: packs::PackFiles,
-  files: Bytes,
-  text: Bytes,
-) -> fs::MemResult<{ output: Bytes, ran: Int }> / {abort.raise} = {
-  let queries = test_queries(b"");
-  fs::on_mem[abs](tree, ||
-    with_memo_store[abs](
-      "s",
-      |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len),
-      files,
-      |_: Bytes, _: Bytes| Some(text),
+      |_: Bytes, _: Bytes| None,
       || {
         let a = query_output(queries, start_run(queries), b"quoted", b"a");
         { output: a.output, ran: memo::executed_count(a.run) }
       },
-    ))
-}
-
-test "a pack contains the records of the queries it was built for and the results they refer to, and a run using the pack reuses them" {
-  let long = b"long ".repeat(1000);
-  let made = quoted_pack(long, [b"none".blake3()]);
-  assert_eq(made.records, 2);
-  let below = |files: Bytes, text: Bytes| quoted_below(fs::mem_of([]), made.written, files, text);
-  let quoted_long = Bytes::concat_all([b"\"", long, b"\""]);
-  let packed_run = below(b"files", long);
-  assert_eq(packed_run.value, { output: quoted_long, ran: 0 });
-  assert_eq(segments_in(packed_run.tree), []);
-  let checked = below(b"other files", long);
-  assert_eq(checked.value, { output: quoted_long, ran: 0 });
-  assert_eq(segments_in(checked.tree), []);
-  assert_eq(below(b"other files", b"four").value, { output: b"\"four\"", ran: 2 })
-}
-
-test "a result computed in a run whose pack was built from other files is recomputed when a file the result depends on changes" {
-  let pack = quoted_pack(b"long ".repeat(1000), []).written;
-  let first = quoted_below(fs::mem_of([]), pack, b"other files", b"four");
-  assert_eq(first.value, { output: b"\"four\"", ran: 2 });
-  let moved = quoted_below(first.tree, pack, b"other files", b"forty");
-  assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
-  assert_eq(quoted_below(moved.tree, pack, b"other files", b"forty").value.ran, 0)
-}
-
-fn quoting_all(input: Bytes) -> Bytes / {memo.read} =
-  range(0, input.len()).fold(b"", |accumulator: Bytes, i: Int|
-    accumulator.concat(memo.fetch(b"quoted", Bytes::of_string(i.to_string()))))
-
-test "a record with a summary is reused without reading any record of the queries it depends on, however many there are" {
-  let queries = test_queries(b"").insert(b"all", {
-    ..query(b"all", b"a1", quoting_all),
-    summarized: true,
-  });
-  let world = |_: Bytes, at: Bytes| Some(at);
-  let built = |files: Int|
-    fs::on_mem[abs](fs::mem_of([]), || {
-      with_memo_store[abs]("s", packs::no_pack, b"", world, ||
-        query_output(queries, start_run(queries), b"all", b"x".repeat(files)).output);
-      compact[abs]("s", [b"t1", b"q1", b"a1"])
-    }).tree;
-  let taken = |tree: fs::MemFs, files: Int|
-    fs::on_mem_counted[abs](tree, ||
-      with_memo_store[abs]("s", packs::no_pack, b"", world, ||
-        memo::executed_count(
-          query_output(queries, start_run(queries), b"all", b"x".repeat(files)).run,
-        )));
-  let few = taken(built(3), 3);
-  let many = taken(built(200), 200);
-  assert_eq([few.value, many.value], [0, 0]);
-  assert_eq(few.operations, many.operations)
+    ));
+  assert_eq(used.value, { output: Bytes::concat_all([b"\"", long, b"\""]), ran: 0 })
 }
