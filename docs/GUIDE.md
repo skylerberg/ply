@@ -737,7 +737,8 @@ local `let` is not generic, so `let f = |x| x;` used at two types is `E0201`. Ca
 against the signature, never against the body.
 
 The written effects are an upper bound: what the body performs must fit inside them (`E0302`, which
-shows the effects to write), and they may include more than the body needs.
+shows the effects to write). An effect the body never performs is the warning `W0614`, which shows
+the narrower signature. An `effect set` counts as performed when any of its members is.
 
 **Borrowed function parameters.** A function-typed parameter of a top-level `fn` is *borrowed*: the
 function may use it only until the call returns. It may call it, pass it to another borrowed

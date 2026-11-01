@@ -1529,6 +1529,7 @@ fn body_of_signature(
   let published = resolve_effects_in(checker, sig.published_effects);
   {
     effects: effects,
+    label_params: sig.label_params,
     recorded: None,
     count: None,
     params: sig.params.map(|ty: Type| resolve(checker, ty)),
@@ -1669,6 +1670,8 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
       Some(info) -> {
         let definition = definitions.get(slot);
         let count = counts.get(slot);
+        let performed = if raised_inside { info.performed.filter(|a: Effect| !is_abort(a)) }
+        else { info.performed };
         let counted = if c.module >= c.known.root { bodies.get(slot).written } else {
           {
             scaling: info.effects.fold([], |acc: List<Effect>, w: Effect|
@@ -1678,10 +1681,9 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
             repeats: count.repeats,
           }
         };
-        set_definition(c, {
+        set_definition(noted_unperformed(c, definition, bodies.get(slot), performed), {
           ..info,
-          performed: if raised_inside { info.performed.filter(|a: Effect| !is_abort(a)) }
-          else { info.performed },
+          performed: performed,
           scaling: counted.scaling,
           repeats: counted.repeats,
           ending: ending_of(slot),
@@ -1691,6 +1693,118 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
       },
     });
   { ..published, group_definitions: [] }
+}
+
+type WrittenEffects = { span: Span, bounded: Bool, effects: List<Effect> }
+
+fn written_entry(
+  checker: Checker,
+  body: ClosedBody,
+  entry: EffectExpression,
+) -> List<Effect> / {abort.raise} =
+  match convert_effect({ ..checker, label_params: body.label_params }, entry).entry {
+    Some(a) -> [resolve_effect(checker.substitution, a)],
+    None -> [],
+  }
+
+fn written_effects(
+  checker: Checker,
+  row: EffectsExpression,
+  body: ClosedBody,
+) -> List<WrittenEffects> / {abort.raise} = {
+  let sets = if row.aliases.len() == 0 { [] } else { named_sets(checker) };
+  let written_in_row = |a: EffectExpression|
+    a.span.start >= row.span.start && a.span.end <= row.span.end;
+  let from_set = |a: EffectExpression| row.aliases.any(|set: QName| set.span.start == a.span.start);
+  row.listed.filter(|a: EffectExpression| written_in_row(a) && !from_set(a)).map(
+    |a: EffectExpression|
+      { span: a.span, bounded: a.bounded, effects: written_entry(checker, body, a) },
+  ).concat(
+    row.aliases.map(|set: QName|
+      {
+        span: set.span,
+        bounded: false,
+        effects: sets.filter(|s: NamedSet| s.name == set.name.name).flat_map(
+          |s: NamedSet| s.listed,
+        ).concat(
+          row.listed.filter(|a: EffectExpression| a.span.start == set.span.start).flat_map(
+            |a: EffectExpression| written_entry(checker, body, a),
+          ),
+        ),
+      }),
+  )
+}
+
+fn narrowing_edits(
+  checker: Checker,
+  definition: FnDefinition,
+  row: EffectsExpression,
+  items: List<WrittenEffects>,
+  unused: List<WrittenEffects>,
+) -> Option<List<Edit>> / {abort.raise} = {
+  let spans = items.map(|item: WrittenEffects| item.span).sort_by(|a: Span, b: Span|
+    a.start < b.start);
+  let idle = |s: Span| unused.any(|item: WrittenEffects| item.span.start == s.start);
+  let removed = |text: Bytes|
+    { module: checker.module, start: row.span.start, end: row.span.end, text: text };
+  if unused.any(|item: WrittenEffects| item.bounded) { None } else if unused.len() < spans.len() {
+    Some(
+      range(0, spans.len()).filter(|i: Int| idle(spans.get(i))).map(|i: Int|
+        if range(i + 1, spans.len()).any(|k: Int| !idle(spans.get(k))) {
+          { ..removed(b""), start: spans.get(i).start, end: spans.get(i + 1).start }
+        } else { { ..removed(b""), start: spans.get(i - 1).end, end: spans.get(i).end } }),
+    )
+  } else {
+    match ((row.variable, definition.ret)) {
+      (Some(t), _) -> if row.variable_bounded { None } else { Some([removed(t.name)]) },
+      (None, Some(ret)) -> Some([{ ..removed(b""), start: type_span(ret).end }]),
+      (None, None) -> None,
+    }
+  }
+}
+
+fn noted_unperformed(
+  checker: Checker,
+  definition: FnDefinition,
+  body: ClosedBody,
+  performed: List<Effect>,
+) -> Checker / {abort.raise} = {
+  let parsed = checker.modules.get(checker.module);
+  match definition.effects {
+    None -> checker,
+    Some(row) -> if checker.module >= checker.known.root || derived_of(parsed, definition) != None
+        || schema_of(parsed.module, definition) != None { checker } else {
+      let items = written_effects(checker, row, body);
+      let unused = items.filter(|item: WrittenEffects|
+        item.effects.len() > 0 && !performed.any(|a: Effect| effects_cover(item.effects, a)));
+      if unused.len() == 0 { checker } else {
+        let warning: Diagnostic = {
+          code: b"W0614",
+          notes: 0,
+          labels: unused.map(|item: WrittenEffects|
+            label_at(checker.module, item.span, true, b"never performed")),
+          text: b"",
+          message: Bytes::concat_all([
+            b"`",
+            definition.name.name,
+            b"` declares effects its body never performs",
+          ]),
+          notes_text: [],
+          severity: b"warning",
+          fixes: [],
+        };
+        {
+          ..checker,
+          unperformed: checker.unperformed.push(
+            match narrowing_edits(checker, definition, row, items, unused) {
+              Some(edits) -> with_fix(warning, b"remove them from the effects", edits),
+              None -> warning,
+            },
+          ),
+        }
+      }
+    },
+  }
 }
 
 fn split_labels(scheme: Scheme, definition: FnDefinition, signature: Signature) -> Scheme = {
@@ -1840,13 +1954,13 @@ fn check_fn_body(
           d,
           hint_of(signature.params.get(i)),
         );
-        expect(
+        expect_or_widen(
           { ..o.checker, copied: false },
           expression_span(d),
           signature.params.get(i),
           o.ty,
           b"parameter default",
-        ).checker
+        )
       },
     });
   let pushed: Checker = { ..defaults, env: env_push(defaults.env) };
@@ -1929,7 +2043,7 @@ fn iteration(
   entry: Effect,
   over: Option<Span>,
   maybe: List<PendingIteration>,
-) -> Option<Span> / {abort.raise} =
+) -> Option<Span> =
   match maybe.fold(None, |found: Option<Span>, m: PendingIteration|
       match found {
         Some(_) -> found,
@@ -1992,7 +2106,7 @@ fn body_effect_count(
 
 fn is_abort(a: Effect) -> Bool = a.effect == b"abort" && a.op == Some(b"raise")
 
-fn raise_reason(checker: Checker, name: Bytes) -> RaiseReason / {abort.raise} =
+fn raise_reason(checker: Checker, name: Bytes) -> RaiseReason =
   if is_group_member(checker, name) { RaisingCall(name) } else {
     match checker.contracts.get(name) {
       Some(c) -> if c.raises { UnguardedBuiltin(name) } else { RaisingFunctionValue },
@@ -2005,7 +2119,7 @@ fn raise_reason(checker: Checker, name: Bytes) -> RaiseReason / {abort.raise} =
     }
   }
 
-fn raises_of(checker: Checker, start: Int) -> List<Raise> / {abort.raise} = {
+fn raises_of(checker: Checker, start: Int) -> List<Raise> = {
   let found = checker.performs.fold(
     { out: [], called: [] },
     |acc: { out: List<Raise>, called: List<Bytes> }, site: PerformSite|
@@ -3146,11 +3260,7 @@ fn shared_label(earlier: List<TestLabel>, later: TestLabel) -> Option<TestLabel>
       },
     })
 
-fn reject_shared_label(
-  checker: Checker,
-  later: TestLabel,
-  first: TestLabel,
-) -> Checker / {abort.raise} = {
+fn reject_shared_label(checker: Checker, later: TestLabel, first: TestLabel) -> Checker = {
   let over_one_table = first.form != None && later.form != None;
   report_error_at_and(
     checker,
