@@ -92,10 +92,8 @@ module.exports = grammar({
 
     function_definition: $ => seq(
       optional('pub'),
-      optional(choice(
-        seq(optional('transparent'), optional('reuse')),
-        'const',
-      )),
+      optional('transparent'),
+      optional('reuse'),
       'fn',
       field('name', choice($.identifier, $.qualified_name)),
       optional($.generic_parameters),

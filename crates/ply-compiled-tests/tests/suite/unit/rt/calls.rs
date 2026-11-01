@@ -1,18 +1,15 @@
-//! Reads of a pure nullary definition, as emitted code writes one: the first evaluates the
-//! definition and keeps its value for good through the type's keep root, and each later read
-//! returns that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
-//! roots here are written as emitted code writes them, over blocks laid out as it lays one.
+//! What emitted code asks of the runtime to read a constant: keep a copy for good, and end the run
+//! on a raise that left a constant's value. The scheduler's own blocks are here too.
 
 use crate::bare::{context_of, helper};
-use ply_compiled::emitted::KeepRoot;
 use ply_compiled::heap::{HEADER, IMMORTAL, Word};
-use ply_compiled::rt::{Ctx, FAILED, Tables};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use ply_compiled::rt::{Ctx, FAILED};
+use std::sync::atomic::Ordering;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
-type Memo = unsafe extern "C" fn(*mut Ctx, Word, KeepRoot) -> Word;
+type Keep = unsafe extern "C" fn(*mut Ctx, Word, Word);
+type ConstFailed = unsafe extern "C" fn(*mut Ctx);
 type Definition = unsafe extern "C" fn(*mut Ctx, *const Word) -> Word;
 
 /// A value of `m.Box`: a block of one word, the number it holds.
@@ -22,10 +19,6 @@ fn boxed(ctx: *mut Ctx, n: Word) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, BOX) };
     unsafe { *(w as *mut Word).byte_add(HEADER) = n };
     w
-}
-
-fn held(w: Word) -> Word {
-    unsafe { *(w as *const Word).byte_add(HEADER) }
 }
 
 fn count(w: Word) -> u32 {
@@ -39,22 +32,6 @@ fn let_go(ctx: *mut Ctx, w: Word) {
     }
 }
 
-/// `keep#m.Box`: the box copied onto the unit's persistent heap.
-unsafe extern "C" fn keep_box(ctx: *mut Ctx, w: Word) -> Word {
-    let kept = unsafe { helper::<Alloc>("rt_alloc_kept")(ctx, BOX) };
-    unsafe { *(kept as *mut Word).byte_add(HEADER) = held(w) };
-    kept
-}
-
-/// The keep root of a type whose values may not outlive their entry.
-unsafe extern "C" fn keeps_nothing(_ctx: *mut Ctx, _w: Word) -> Word {
-    0
-}
-
-fn read(ctx: *mut Ctx, keep: KeepRoot) -> Word {
-    unsafe { helper::<Memo>("rt_memo")(ctx, 0, keep) }
-}
-
 /// A context over a unit of the one definition `f`.
 fn defining(f: Definition) -> Ctx {
     let mut ctx = context_of(&[], vec![f as usize]);
@@ -62,145 +39,33 @@ fn defining(f: Definition) -> Ctx {
     ctx
 }
 
-static FORTY_TWOS: AtomicUsize = AtomicUsize::new(0);
+unsafe extern "C" fn nothing(_ctx: *mut Ctx, _args: *const Word) -> Word {
+    0
+}
 
-unsafe extern "C" fn forty_two(ctx: *mut Ctx, _args: *const Word) -> Word {
-    FORTY_TWOS.fetch_add(1, Ordering::SeqCst);
-    boxed(ctx, 42)
+fn kept_at(ctx: &Ctx, index: usize) -> i64 {
+    unsafe { (*ctx.constants.add(index)).load(Ordering::Acquire) }
 }
 
 #[test]
-fn the_first_read_evaluates_and_caches_and_each_later_one_returns_the_copy() {
-    let mut ctx = defining(forty_two);
+fn the_first_copy_kept_stays_for_every_later_read() {
+    let mut ctx = defining(nothing);
     let c: *mut Ctx = &mut ctx;
-    let first = read(c, keep_box);
-    assert_eq!(
-        (held(first), count(first)),
-        (42, 1),
-        "the evaluation's own value"
-    );
-    let second = read(c, keep_box);
-    let third = read(c, keep_box);
-    assert_eq!(FORTY_TWOS.load(Ordering::SeqCst), 1, "evaluated once");
-    assert_ne!(second, first);
-    assert_eq!((held(second), count(second)), (42, IMMORTAL));
-    assert_eq!(third, second, "every later read returns the one copy kept");
-    let_go(c, first);
-    assert_eq!(
-        ctx.heap.live(),
-        0,
-        "the copy is the unit's, not the entry's"
-    );
-    ctx.end();
-}
-
-static SEVENS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe extern "C" fn seven(ctx: *mut Ctx, _args: *const Word) -> Word {
-    SEVENS.fetch_add(1, Ordering::SeqCst);
-    boxed(ctx, 7)
-}
-
-#[test]
-fn a_value_its_keep_root_rejects_is_cached_nowhere_and_each_read_evaluates_it() {
-    let mut ctx = defining(seven);
-    let c: *mut Ctx = &mut ctx;
-    let first = read(c, keeps_nothing);
-    let second = read(c, keeps_nothing);
-    assert_eq!(SEVENS.load(Ordering::SeqCst), 2);
-    assert_eq!((count(first), count(second)), (1, 1));
-    assert_eq!(ctx.tables.memoized(0), None);
-    let_go(c, first);
-    let_go(c, second);
-    assert_eq!(ctx.heap.live(), 0);
-    ctx.end();
-}
-
-static NINES: AtomicUsize = AtomicUsize::new(0);
-
-/// Fails the first time it is evaluated, and returns a box of 9 after.
-unsafe extern "C" fn nine_after_a_failure(ctx: *mut Ctx, _args: *const Word) -> Word {
-    if NINES.fetch_add(1, Ordering::SeqCst) == 0 {
-        unsafe { (*ctx).failed = 1 };
-        return 0;
-    }
-    boxed(ctx, 9)
-}
-
-#[test]
-fn an_evaluation_that_fails_returns_0_caches_nothing_and_the_next_read_evaluates_again() {
-    let mut ctx = defining(nine_after_a_failure);
-    let c: *mut Ctx = &mut ctx;
-    assert_eq!(read(c, keep_box), 0);
-    assert_eq!(ctx.failed, 1, "the context as the evaluation left it");
-    assert_eq!(ctx.tables.memoized(0), None);
-    ctx.failed = 0;
-    let evaluated = read(c, keep_box);
-    let kept = read(c, keep_box);
-    assert_eq!(NINES.load(Ordering::SeqCst), 2);
-    assert_eq!((held(evaluated), count(evaluated)), (9, 1));
-    assert_eq!((held(kept), count(kept)), (9, IMMORTAL));
-    let_go(c, evaluated);
+    let keep = helper::<Keep>("rt_keep_constant");
+    unsafe { keep(c, 0, 11) };
+    unsafe { keep(c, 0, 22) };
+    assert_eq!(kept_at(&ctx, 0), 11);
     ctx.end();
 }
 
 #[test]
-fn a_definition_outside_the_code_table_fails_the_context() {
-    let mut ctx = defining(seven);
+fn a_copy_of_a_constant_outside_the_table_is_kept_nowhere() {
+    let mut ctx = defining(nothing);
     let c: *mut Ctx = &mut ctx;
-    assert_eq!(unsafe { helper::<Memo>("rt_memo")(c, 3, keep_box) }, 0);
-    let said = ctx.take_failure().expect("a diagnostic").message;
-    assert!(said.contains("definition 3 of a code table of 1"), "{said}");
-    ctx.end();
-}
-
-/// A unit's tables, shared with threads as a `parallel` block's branches share them.
-struct Shared(Arc<Tables>);
-unsafe impl Send for Shared {}
-
-impl Shared {
-    /// A context over the tables, on the thread that takes them.
-    fn context(self) -> Ctx {
-        Ctx::new(self.0)
-    }
-}
-
-unsafe extern "C" fn eleven(ctx: *mut Ctx, _args: *const Word) -> Word {
-    boxed(ctx, 11)
-}
-
-#[test]
-fn contexts_reading_one_definition_at_once_each_return_it_and_one_copy_is_cached() {
-    let mut ctx = defining(eleven);
-    let barrier = Arc::new(std::sync::Barrier::new(4));
-    let readers: Vec<_> = (0..4)
-        .map(|_| {
-            let tables = Shared(Arc::clone(&ctx.tables));
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                let mut mine = tables.context();
-                mine.begin();
-                let c: *mut Ctx = &mut mine;
-                barrier.wait();
-                let w = read(c, keep_box);
-                let returned = held(w);
-                let_go(c, w);
-                assert_eq!(mine.heap.live(), 0);
-                mine.end();
-                returned
-            })
-        })
-        .collect();
-    for reader in readers {
-        assert_eq!(reader.join().expect("a reader returns"), 11);
-    }
-    let kept = ctx.tables.memoized(0).expect("a copy was kept");
-    let c: *mut Ctx = &mut ctx;
-    assert_eq!(
-        read(c, keep_box),
-        kept,
-        "a later read returns the copy kept first"
-    );
+    let keep = helper::<Keep>("rt_keep_constant");
+    unsafe { keep(c, 3, 11) };
+    unsafe { keep(c, -1, 11) };
+    assert_eq!(kept_at(&ctx, 0), 0);
     ctx.end();
 }
 
@@ -236,32 +101,6 @@ fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
     ctx.end();
 }
 
-fn read_const(ctx: *mut Ctx) -> Word {
-    unsafe { helper::<Memo>("rt_const")(ctx, 0, keep_box) }
-}
-
-static TENS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe extern "C" fn ten(ctx: *mut Ctx, _args: *const Word) -> Word {
-    TENS.fetch_add(1, Ordering::SeqCst);
-    boxed(ctx, 10)
-}
-
-#[test]
-fn a_constant_is_evaluated_once_and_every_later_read_returns_the_copy() {
-    let mut ctx = defining(ten);
-    let c: *mut Ctx = &mut ctx;
-    let first = read_const(c);
-    let second = read_const(c);
-    let third = read_const(c);
-    assert_eq!(TENS.load(Ordering::SeqCst), 1, "evaluated once");
-    assert_eq!(held(first), 10);
-    assert_eq!((held(second), count(second)), (10, IMMORTAL));
-    assert_eq!(third, second);
-    let_go(c, first);
-    ctx.end();
-}
-
 /// A failure compiled code wrote, left pending as a raise of `abort.raise`.
 unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
     let raised: unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word) = helper("rt_failed");
@@ -276,9 +115,10 @@ unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
 
 #[test]
 fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
-    let mut ctx = defining(failing);
+    let mut ctx = defining(nothing);
     let c: *mut Ctx = &mut ctx;
-    assert_eq!(read_const(c), 0);
+    assert_eq!(unsafe { failing(c, std::ptr::null()) }, 0);
+    unsafe { helper::<ConstFailed>("rt_const_failed")(c) };
     assert_eq!(ctx.failed, FAILED, "a plain failure, no raise pending");
     let said = ctx.take_failure().expect("a diagnostic");
     assert!(
@@ -287,6 +127,16 @@ fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handle
             .any(|n| n.contains("a constant must return")),
         "{said:?}"
     );
-    assert_eq!(ctx.tables.memoized(0), None);
+    ctx.end();
+}
+
+#[test]
+fn a_failure_that_is_no_raise_stands_as_it_is() {
+    let mut ctx = defining(nothing);
+    let c: *mut Ctx = &mut ctx;
+    ctx.failed = FAILED;
+    unsafe { helper::<ConstFailed>("rt_const_failed")(c) };
+    assert_eq!(ctx.failed, FAILED);
+    ctx.failed = 0;
     ctx.end();
 }
