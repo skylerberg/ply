@@ -104,11 +104,11 @@ fn descent(stack: &Stack, counts: usize) -> Descent {
     }
 }
 
-fn start(sp: usize) {
+fn start(stack_pointer: usize) {
     PONG.with(|p| {
         *p.borrow_mut() = Some(Pong {
             main: 0,
-            task: sp,
+            task: stack_pointer,
             log: Vec::new(),
         })
     });
@@ -122,7 +122,7 @@ fn a_task_runs_on_its_own_stack_and_yields_back_in_order() {
     for _ in 0..4 {
         run_task();
         seen.push(with(|p| *p.log.last().unwrap()));
-        assert!(stack.holds(with(|p| p.task)));
+        assert!(stack.contains(with(|p| p.task)));
     }
     assert_eq!(seen, [10, 20, 30, 0]);
     PONG.with(|p| *p.borrow_mut() = None);
@@ -148,7 +148,7 @@ fn a_recursion_deeper_than_the_first_chunk_of_a_stack_extends_within_the_same_re
         "a frame lay above its caller's"
     );
     assert!(
-        frames.iter().all(|&f| stack.holds(f)),
+        frames.iter().all(|&f| stack.contains(f)),
         "a frame lay off the stack"
     );
     assert!(
@@ -157,7 +157,7 @@ fn a_recursion_deeper_than_the_first_chunk_of_a_stack_extends_within_the_same_re
     );
     assert!(stack.floor() < stack.top() - 2 * CHUNK + STACK_MARGIN);
     assert!(
-        stack.holds(stopped),
+        stack.contains(stopped),
         "the recursion stopped on its own stack"
     );
     assert!(frames.iter().all(|&f| (stopped..stack.top()).contains(&f)));
@@ -210,10 +210,10 @@ fn ten_thousand_stacks_can_be_in_use_at_once_and_are_all_returned_on_one_thread(
 }
 
 struct Grows {
-    ctx: *mut ply_compiled::rt::Ctx,
+    context: *mut ply_compiled::rt::Context,
     task: *const Stack,
     main: usize,
-    sp: usize,
+    stack_pointer: usize,
     floor_when_resumed: usize,
 }
 
@@ -221,12 +221,12 @@ extern "C" fn grow_then_stop(arg: usize) {
     let g = arg as *mut Grows;
     unsafe {
         let task = &*(*g).task;
-        (*(*g).ctx).stack_floor.store(task.enter(), Relaxed);
+        (*(*g).context).stack_floor.store(task.enter(), Relaxed);
         if task.extend() {
-            (*(*g).ctx).stack_floor.store(task.floor(), Relaxed);
+            (*(*g).context).stack_floor.store(task.floor(), Relaxed);
         }
-        switch_stack_preserving_context((*g).ctx, &raw mut (*g).sp, (*g).main);
-        (*g).floor_when_resumed = (*(*g).ctx).stack_floor.load(Relaxed);
+        switch_stack_preserving_context((*g).context, &raw mut (*g).stack_pointer, (*g).main);
+        (*g).floor_when_resumed = (*(*g).context).stack_floor.load(Relaxed);
         let mut spent = 0;
         switch(&mut spent, (*g).main);
     }
@@ -240,33 +240,33 @@ fn a_task_that_grew_its_stack_resumes_with_the_stack_limit_of_its_own_stack() {
         return;
     };
     let native = loaded.expect("the unit loads");
-    let mut ctx = native.context();
-    ctx.begin();
+    let mut context = native.context();
+    context.begin();
     let task = taken();
     let mut g = Grows {
-        ctx: &raw mut ctx,
+        context: &raw mut context,
         task: &task,
         main: 0,
-        sp: 0,
+        stack_pointer: 0,
         floor_when_resumed: 0,
     };
     let g = &raw mut g;
     unsafe {
         let first = task.prepare(grow_then_stop, g as usize);
-        switch_stack_preserving_context((*g).ctx, &raw mut (*g).main, first);
+        switch_stack_preserving_context((*g).context, &raw mut (*g).main, first);
         assert!(
-            !task.holds((*(*g).ctx).stack_floor.load(Relaxed)),
+            !task.contains((*(*g).context).stack_floor.load(Relaxed)),
             "the stack the task stopped to kept its floor"
         );
-        (*(*g).ctx)
+        (*(*g).context)
             .stack_floor
             .store(task.top() - CHUNK + STACK_MARGIN, Relaxed);
-        switch_stack_preserving_context((*g).ctx, &raw mut (*g).main, (*g).sp);
+        switch_stack_preserving_context((*g).context, &raw mut (*g).main, (*g).stack_pointer);
         assert!(
             task.floor() < task.top() - CHUNK + STACK_MARGIN,
             "the task never grew"
         );
         assert_eq!((*g).floor_when_resumed, task.floor());
     }
-    ctx.end();
+    context.end();
 }

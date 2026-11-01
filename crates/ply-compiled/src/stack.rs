@@ -82,7 +82,7 @@ impl Stack {
         self.0.top()
     }
 
-    pub fn holds(&self, address: usize) -> bool {
+    pub fn contains(&self, address: usize) -> bool {
         (self.0.base..self.top()).contains(&address)
     }
 
@@ -167,8 +167,8 @@ mod arch {
     }
 
     pub unsafe fn lay_out(top: usize, entry: usize, arg: usize) -> usize {
-        let sp = top - FRAME;
-        let frame = sp as *mut usize;
+        let stack_pointer = top - FRAME;
+        let frame = stack_pointer as *mut usize;
         unsafe {
             std::ptr::write_bytes(frame, 0, FRAME / 8);
             frame.write(arg);
@@ -177,7 +177,7 @@ mod arch {
                 .add(11)
                 .write(ply_stack_trampoline as unsafe extern "C" fn() as usize);
         }
-        sp
+        stack_pointer
     }
 }
 
@@ -216,8 +216,8 @@ mod arch {
     }
 
     pub unsafe fn lay_out(top: usize, entry: usize, arg: usize) -> usize {
-        let sp = top - FRAME;
-        let frame = sp as *mut usize;
+        let stack_pointer = top - FRAME;
+        let frame = stack_pointer as *mut usize;
         unsafe {
             std::ptr::write_bytes(frame, 0, FRAME / 8);
             frame.add(3).write(entry);
@@ -226,7 +226,7 @@ mod arch {
                 .add(6)
                 .write(ply_stack_trampoline as unsafe extern "C" fn() as usize);
         }
-        sp
+        stack_pointer
     }
 }
 

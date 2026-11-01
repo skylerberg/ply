@@ -16,30 +16,30 @@ fn every_declared_helper_has_an_address() {
 
 #[test]
 fn a_native_function_signature_is_derived_from_its_rust_function_type() {
-    use ply_compiled::emitted::{Handed, PlyType};
+    use ply_compiled::emitted::{OwnedWord, PlyType};
     use ply_compiled::heap::Word;
-    use ply_compiled::native::MachineType::{self, Addr, Handed as Moved, I64, Type, Words};
+    use ply_compiled::native::MachineType::{self, Address, I64, OwnedWord as Moved, Type, Words};
     use ply_compiled::native::{Native, Signature};
-    use ply_compiled::rt::Ctx;
+    use ply_compiled::rt::Context;
     let of = |params: &'static [MachineType], result| Signature { params, result };
     assert_eq!(
-        <unsafe extern "C" fn(*mut Ctx) as Native>::SIGNATURE,
+        <unsafe extern "C" fn(*mut Context) as Native>::SIGNATURE,
         of(&[], None)
     );
     assert_eq!(
-        <unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word as Native>::SIGNATURE,
+        <unsafe extern "C" fn(*mut Context, Word, *const Word) -> Word as Native>::SIGNATURE,
         of(&[MachineType::Word, Words], Some(MachineType::Word))
     );
     type NativeTakingType = unsafe extern "C" fn(
-        *mut Ctx,
-        ply_compiled::native::Addr,
+        *mut Context,
+        ply_compiled::native::Address,
         ply_compiled::native::I64,
-        Handed,
+        OwnedWord,
         *const PlyType,
     ) -> ply_compiled::native::I64;
     assert_eq!(
         <NativeTakingType as Native>::SIGNATURE,
-        of(&[Addr, I64, Moved, Type], Some(I64))
+        of(&[Address, I64, Moved, Type], Some(I64))
     );
 }
 
@@ -79,7 +79,7 @@ fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_run
         .expect("`?out_str`");
     assert_eq!(
         out_str.signature.params,
-        [MachineType::Addr, MachineType::I64]
+        [MachineType::Address, MachineType::I64]
     );
     assert_eq!(out_str.signature.result, None);
 }
@@ -87,7 +87,7 @@ fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_run
 #[test]
 fn the_text_the_runtime_describes_itself_with_lists_helpers_and_native_functions_and_struct_offsets_and_sizes_matching_the_rust_code()
  {
-    use ply_compiled::rt::Ctx;
+    use ply_compiled::rt::Context;
     let text = ply_compiled::c::described();
     assert_eq!(text.lines().next(), Some("ply runtime 1"));
     for line in [
@@ -113,13 +113,13 @@ fn the_text_the_runtime_describes_itself_with_lists_helpers_and_native_functions
     };
     assert_eq!(
         fact("PlyCtx.release_depth.at"),
-        std::mem::offset_of!(Ctx, release_depth)
+        std::mem::offset_of!(Context, release_depth)
     );
     assert_eq!(fact("PlyCtx.frames.bytes"), 8);
     assert_eq!(fact("PlyObj.bytes"), ply_compiled::heap::HEADER);
     assert_eq!(
         fact("PlyFnDesc.bytes"),
-        size_of::<ply_compiled::emitted::PlyFnDesc>()
+        size_of::<ply_compiled::emitted::PlyFunctionDescriptor>()
     );
     assert_eq!(fact("count.frame"), ply_compiled::heap::FRAME as usize);
     assert_eq!(
@@ -242,7 +242,7 @@ fn deep_calls() -> [units::Def; 1] {
 const DEEP: i64 = 20_000;
 
 struct Unknown {
-    ctx: *mut ply_compiled::rt::Ctx,
+    context: *mut ply_compiled::rt::Context,
     entry: ply_compiled::rt::Entry,
     args: [ply_compiled::heap::Word; 1],
     result: ply_compiled::heap::Word,
@@ -252,8 +252,8 @@ struct Unknown {
 extern "C" fn enter_from_an_unknown_stack(arg: usize) {
     let u = arg as *mut Unknown;
     unsafe {
-        (*u).result = ply_compiled::rt::on_known_stack((*u).ctx, || {
-            ((*u).entry)((*u).ctx, (*u).args.as_ptr())
+        (*u).result = ply_compiled::rt::on_known_stack((*u).context, || {
+            ((*u).entry)((*u).context, (*u).args.as_ptr())
         });
         let mut spent = 0;
         ply_compiled::stack::switch(&mut spent, (*u).main);
@@ -265,10 +265,10 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
     let native = loaded.expect("the unit loads");
-    let mut ctx = native.context();
-    ctx.begin();
+    let mut context = native.context();
+    context.begin();
     let mut u = Unknown {
-        ctx: &raw mut ctx,
+        context: &raw mut context,
         entry: native.entry("m.ladder").expect("`m.ladder` is taken"),
         args: [imm(DEEP)],
         result: 0,
@@ -276,14 +276,14 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     };
     let u = &raw mut u;
     let unknown = ply_compiled::stack::Stack::take().expect("the system maps a stack");
-    let sp = unknown.prepare(enter_from_an_unknown_stack, u as usize);
+    let stack_pointer = unknown.prepare(enter_from_an_unknown_stack, u as usize);
     let result = unsafe {
-        ply_compiled::stack::switch(&mut (*u).main, sp);
+        ply_compiled::stack::switch(&mut (*u).main, stack_pointer);
         (*u).result
     };
-    let (failed, grown) = (ctx.failed, ctx.grown);
-    let raised = ctx.take_failure().map(|d| d.message);
-    ctx.end();
+    let (failed, grown) = (context.failed, context.grown);
+    let raised = context.take_failure().map(|d| d.message);
+    context.end();
     Some((imm_value(result), grown, failed, raised))
 }
 
@@ -309,13 +309,16 @@ fn a_recursion_deeper_than_the_thread_stack_limit_fails_with_an_out_of_stack_err
             let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
             let native = loaded.expect("the unit loads");
             let entry = native.entry("m.ladder").expect("`m.ladder` is taken");
-            let mut ctx = native.context();
-            ctx.begin();
+            let mut context = native.context();
+            context.begin();
             let args = [imm(DEEP)];
-            let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
-            let failed = ctx.failed;
-            let raised = ctx.take_failure().map(|d| d.message).unwrap_or_default();
-            ctx.end();
+            let _ = unsafe { entry(&mut context, args.as_ptr()) };
+            let failed = context.failed;
+            let raised = context
+                .take_failure()
+                .map(|d| d.message)
+                .unwrap_or_default();
+            context.end();
             Some((failed, raised))
         })
         .expect("a thread starts")
@@ -347,13 +350,16 @@ fn a_loop_running_past_the_time_limit_stops_with_a_timed_out_failure_at_its_next
     };
     let native = loaded.expect("the unit loads");
     let entry = native.entry("m.forever").expect("`m.forever` is taken");
-    let mut ctx = native.context();
-    ctx.begin_with_time_limit(20);
+    let mut context = native.context();
+    context.begin_with_time_limit(20);
     let args = [imm(0)];
-    let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
-    let failed = ctx.failed;
-    let said = ctx.take_failure().map(|d| d.message).unwrap_or_default();
-    ctx.end();
+    let _ = unsafe { entry(&mut context, args.as_ptr()) };
+    let failed = context.failed;
+    let said = context
+        .take_failure()
+        .map(|d| d.message)
+        .unwrap_or_default();
+    context.end();
     assert_eq!(failed, ply_compiled::rt::FAILED_TIMED_OUT, "{said}");
     assert!(said.contains("timed out after 20 ms"), "{said}");
 }
@@ -369,12 +375,12 @@ fn a_time_limit_on_an_entry_that_already_ended_does_not_change_the_context_stack
     let Some(loaded) = native else {
         return;
     };
-    let mut ctx = loaded.expect("the unit loads").context();
-    ctx.begin_with_time_limit(1);
-    ctx.end();
-    ctx.stack_floor.store(7, Relaxed);
+    let mut context = loaded.expect("the unit loads").context();
+    context.begin_with_time_limit(1);
+    context.end();
+    context.stack_floor.store(7, Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(ctx.stack_floor.load(Relaxed), 7);
+    assert_eq!(context.stack_floor.load(Relaxed), 7);
 }
 
 #[test]

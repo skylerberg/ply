@@ -1,6 +1,6 @@
 use ply_host::os::*;
 
-fn said(program: &str, args: &[&str]) -> String {
+fn output_of(program: &str, args: &[&str]) -> String {
     let done = std::process::Command::new(program)
         .args(args)
         .output()
@@ -11,14 +11,14 @@ fn said(program: &str, args: &[&str]) -> String {
 #[cfg(unix)]
 #[test]
 fn the_process_and_machine_information_matches_what_the_operating_system_commands_report() {
-    assert_eq!(name().expect("uname returns"), said("uname", &["-sr"]));
+    assert_eq!(name().expect("uname returns"), output_of("uname", &["-sr"]));
     assert_eq!(
         hostname().expect("the kernel names the machine"),
-        said("uname", &["-n"])
+        output_of("uname", &["-n"])
     );
-    assert_eq!(uid().to_string(), said("id", &["-u"]));
+    assert_eq!(uid().to_string(), output_of("id", &["-u"]));
     if let Some(user) = user_name(uid()) {
-        assert_eq!(user, said("id", &["-un"]));
+        assert_eq!(user, output_of("id", &["-un"]));
     }
     assert_eq!(
         executable().expect("a test binary has a path"),

@@ -137,8 +137,8 @@ fn all_pairs() -> Vec<Pair> {
     ]
 }
 
-fn digest(src: &str) -> String {
-    format!("b3:{}", &blake3::hash(src.as_bytes()).to_hex()[..12])
+fn digest(source: &str) -> String {
+    format!("b3:{}", &blake3::hash(source.as_bytes()).to_hex()[..12])
 }
 
 #[test]

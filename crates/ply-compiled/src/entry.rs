@@ -1,7 +1,7 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_UNWOUND_TO_HANDLER, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, EntryBytes, FAILED, FAILED_UNWOUND_TO_HANDLER, borrowed};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
@@ -125,13 +125,13 @@ pub struct Usage {
     pub nanos: u64,
     pub host: bool,
     pub performs: u64,
-    pub held: Held,
+    pub retained: Retained,
     pub runtime_blocks: u64,
     pub live: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Held {
+pub struct Retained {
     pub native_objects: u64,
     pub scheduled: u64,
     pub task_stacks: u64,
@@ -170,7 +170,7 @@ pub fn enter(
         return Outcome::of(Ended::NoRoot);
     };
     let _named = (!run.label.is_empty()).then(|| RunningTest::named(&run.label));
-    let mut ctx = Box::new(opened.native.context());
+    let mut context = Box::new(opened.native.context());
     let own = (watch.as_ref())
         .filter(|w| w.recorded)
         .map(|_| Arc::new(Recorder::default()));
@@ -191,19 +191,19 @@ pub fn enter(
             None => made,
         };
         let runtime: Rc<dyn HostRuntime> = factory();
-        ctx.set_host(bound.binding(), Some(runtime), Some(factory));
+        context.set_host(bound.binding(), Some(runtime), Some(factory));
     }
-    ctx.re_executed = run.re_executed;
-    ctx.trace_performs(run.tested);
+    context.re_executed = run.re_executed;
+    context.trace_performs(run.tested);
     let (seed, steps) = run
         .seed
         .clone()
         .unwrap_or_else(|| (Seed::default(), ply_core::sim::DEFAULT_STEPS));
-    ctx.seed = seed;
-    ctx.sim_steps = steps.max(1);
+    context.seed = seed;
+    context.sim_steps = steps.max(1);
     let started = Instant::now();
     let entered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        entered(&mut ctx, entry, arguments, run, root)
+        entered(&mut context, entry, arguments, run, root)
     }));
     let nanos = if run.measure {
         elapsed_nanos(started)
@@ -215,18 +215,18 @@ pub fn enter(
             ended,
             usage: Usage {
                 nanos,
-                host: ctx.host_use.used_nondeterminism(),
+                host: context.host_use.used_nondeterminism(),
                 performs: last.performs,
-                held: last.held,
+                retained: last.retained,
                 runtime_blocks: last.runtime_blocks,
                 live: last.live,
             },
-            warnings: std::mem::take(&mut ctx.teardown),
+            warnings: std::mem::take(&mut context.teardown),
             interleaving: last.interleaving,
             trace: None,
         },
         Err(payload) => {
-            abandoned(ctx);
+            abandoned(context);
             Outcome::of(Ended::Panicked(panic_message(payload.as_ref())))
         }
     };
@@ -343,23 +343,23 @@ pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T>
 
 struct Last {
     performs: u64,
-    held: Held,
+    retained: Retained,
     interleaving: Option<Vec<u8>>,
     runtime_blocks: u64,
     live: u64,
 }
 
-fn abandoned(mut ctx: Box<Ctx>) {
-    if let Some(rt) = ctx.runtime.clone() {
-        let _ = rt.end_entry_point(ctx.id);
+fn abandoned(mut context: Box<Context>) {
+    if let Some(rt) = context.runtime.clone() {
+        let _ = rt.end_entry_point(context.id);
     }
-    if std::mem::take(&mut ctx.pooled) {
-        crate::parallel::workers_ended(ctx.id.0);
+    if std::mem::take(&mut context.pooled) {
+        crate::parallel::workers_ended(context.id.0);
     }
-    std::mem::forget(ctx);
+    std::mem::forget(context);
 }
 
-struct RestoreThreadOnDrop(*mut Ctx);
+struct RestoreThreadOnDrop(*mut Context);
 
 impl Drop for RestoreThreadOnDrop {
     fn drop(&mut self) {
@@ -368,58 +368,58 @@ impl Drop for RestoreThreadOnDrop {
 }
 
 fn entered(
-    ctx: &mut Ctx,
+    context: &mut Context,
     entry: crate::rt::Entry,
     arguments: Vec<u8>,
     run: &Run,
     root: &str,
 ) -> (Ended, Last) {
-    ctx.begin_with_time_limit(run.timeout_ms);
-    let giving_back = RestoreThreadOnDrop(std::ptr::from_mut(ctx));
-    ctx.open_entry_call(arguments);
-    let entering = std::ptr::from_mut(ctx);
+    context.begin_with_time_limit(run.timeout_ms);
+    let giving_back = RestoreThreadOnDrop(std::ptr::from_mut(context));
+    context.open_entry_call(arguments);
+    let entering = std::ptr::from_mut(context);
     let none: [i64; 0] = [];
     crate::rt::on_known_stack(entering, || unsafe { entry(entering, none.as_ptr()) });
-    if ctx.failed == crate::rt::FAILED_OUT_OF_STACK {
+    if context.failed == crate::rt::FAILED_OUT_OF_STACK {
         crate::rt::release_unused_stack_pages();
     }
-    let mut last = returned(ctx);
-    let ended = if ctx.failed != 0 {
-        failure(ctx)
+    let mut last = returned(context);
+    let ended = if context.failed != 0 {
+        failure(context)
     } else {
-        ended_with_result(ctx, root)
+        ended_with_result(context, root)
     };
     if run.tested && matches!(ended, Ended::Returned(_)) {
-        last.live = ctx.teardown_and_count_live() as u64;
+        last.live = context.teardown_and_count_live() as u64;
     }
-    last.runtime_blocks = ctx.heap.runtime_blocks() as u64;
-    ctx.end();
+    last.runtime_blocks = context.heap.runtime_blocks() as u64;
+    context.end();
     std::mem::forget(giving_back);
     (ended, last)
 }
 
-fn returned(ctx: &mut Ctx) -> Last {
-    let held = ctx.held_at_root.take().unwrap_or(Held {
-        native_objects: ctx.heap.natives() as u64,
+fn returned(context: &mut Context) -> Last {
+    let held = context.retained_at_root.take().unwrap_or(Retained {
+        native_objects: context.heap.natives() as u64,
         scheduled: 0,
         task_stacks: 0,
-        frame_tables: ctx.stack_slots() as u64,
+        frame_tables: context.stack_slots() as u64,
     });
-    if let Some(rt) = ctx.runtime.clone() {
-        let warned = rt.end_entry_point(ctx.id);
-        ctx.teardown.extend(warned);
+    if let Some(rt) = context.runtime.clone() {
+        let warned = rt.end_entry_point(context.id);
+        context.teardown.extend(warned);
     }
     Last {
-        performs: ctx.performed.len() as u64,
-        held,
-        interleaving: ctx.interleaving.take(),
+        performs: context.performed.len() as u64,
+        retained: held,
+        interleaving: context.interleaving.take(),
         runtime_blocks: 0,
         live: 0,
     }
 }
 
-fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
-    match crate::rt::close_entry_call(ctx) {
+fn ended_with_result(context: &mut Context, root: &str) -> Ended {
+    match crate::rt::close_entry_call(context) {
         Ok(EntryBytes::Bytes(bytes)) => Ended::Returned(bytes),
         Ok(EntryBytes::Function) => {
             Ended::NotReturnable("its result holds a function the program wrote")
@@ -428,27 +428,31 @@ fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
             let boundary = ply_core::Boundary::ReturnedFromEntry { name: root };
             Ended::Failed(ply_core::escape::rejected(&boundary, &escapee, Span::DUMMY))
         }
-        Ok(EntryBytes::Holding) => Ended::NotReturnable("its result holds a handle of its run"),
+        Ok(EntryBytes::RetainsHandle) => {
+            Ended::NotReturnable("its result holds a handle of its run")
+        }
         Err(reason) => Ended::Failed(crate::rt::err_marshalling(&reason)),
     }
 }
 
-fn failure(ctx: &mut Ctx) -> Ended {
-    let failed = ctx.take_failure().unwrap_or_else(|| match ctx.failed {
-        FAILED_UNWOUND_TO_HANDLER => Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            "a `handle` clause unwound past the compiled fragment's entry",
-        ),
-        FAILED => Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            "the compiled body failed without recording why",
-        )
-        .primary(ctx.site(), "the last site it reached"),
-        other => Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("the compiled body failed ({other}) without recording why"),
-        ),
-    });
+fn failure(context: &mut Context) -> Ended {
+    let failed = context
+        .take_failure()
+        .unwrap_or_else(|| match context.failed {
+            FAILED_UNWOUND_TO_HANDLER => Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                "a `handle` clause unwound past the compiled fragment's entry",
+            ),
+            FAILED => Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "the compiled body failed without recording why",
+            )
+            .primary(context.site(), "the last site it reached"),
+            other => Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the compiled body failed ({other}) without recording why"),
+            ),
+        });
     Ended::Failed(failed)
 }
 
@@ -545,7 +549,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
+unsafe extern "C" fn rt_unit_open(context: *mut Context, p: Address, n: I64) -> TakenBytes {
     let library = unsafe { borrowed(p, n) };
     let mut w = Writer::new();
     match std::str::from_utf8(library)
@@ -566,14 +570,14 @@ unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
             w.tag(1).str(&reason);
         }
     }
-    unsafe { &mut *ctx }.given(w.finish())
+    unsafe { &mut *context }.given(w.finish())
 }
 
-unsafe extern "C" fn rt_unit_close(_ctx: *mut Ctx, unit: I64) {
+unsafe extern "C" fn rt_unit_close(_context: *mut Context, unit: I64) {
     units().by.remove(&unit.0);
 }
 
-unsafe extern "C" fn rt_unit_report(_ctx: *mut Ctx, p: Addr, n: I64, to_stderr: I64) {
+unsafe extern "C" fn rt_unit_report(_context: *mut Context, p: Address, n: I64, to_stderr: I64) {
     let line = String::from_utf8_lossy(unsafe { borrowed(p, n) });
     let _ = if to_stderr.0 != 0 {
         writeln!(std::io::stderr(), "{line}")
@@ -582,8 +586,8 @@ unsafe extern "C" fn rt_unit_report(_ctx: *mut Ctx, p: Addr, n: I64, to_stderr: 
     };
 }
 
-unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+unsafe extern "C" fn rt_unit_bind(context: *mut Context, p: Address, n: I64) -> TakenBytes {
+    let c = unsafe { &mut *context };
     let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
@@ -608,18 +612,18 @@ unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
     c.given(w.finish())
 }
 
-unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> TakenBytes {
+unsafe extern "C" fn rt_unit_unbind(context: *mut Context, binding: I64) -> TakenBytes {
     let bound = bindings().by.remove(&binding.0);
     let reports = bound.map(|b| b.unbind()).unwrap_or_default();
     let mut w = Writer::new();
     w.list(reports.iter(), |w, (name, body)| {
         w.str(name).bytes(body);
     });
-    unsafe { &mut *ctx }.given(w.finish())
+    unsafe { &mut *context }.given(w.finish())
 }
 
-unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+unsafe extern "C" fn rt_unit_hosting(context: *mut Context, p: Address, n: I64) -> TakenBytes {
+    let c = unsafe { &mut *context };
     let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
@@ -632,13 +636,13 @@ unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenByt
 }
 
 unsafe extern "C" fn rt_unit_moved(
-    ctx: *mut Ctx,
-    gp: Addr,
+    context: *mut Context,
+    gp: Address,
     gn: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(grants) = read_or_fail(c, unsafe { borrowed(gp, gn) }, read_grants) else {
         return TakenBytes(0);
     };
@@ -660,16 +664,16 @@ unsafe extern "C" fn rt_unit_moved(
 
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn rt_unit_enter(
-    ctx: *mut Ctx,
+    context: *mut Context,
     unit: I64,
-    root_pointer: Addr,
+    root_pointer: Address,
     root_n: I64,
-    arguments_pointer: Addr,
+    arguments_pointer: Address,
     arguments_length: I64,
-    run_pointer: Addr,
+    run_pointer: Address,
     run_length: I64,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(asked) = read_or_fail(
         c,
         unsafe { borrowed(run_pointer, run_length) },
@@ -711,7 +715,7 @@ unsafe extern "C" fn rt_unit_enter(
     c.given(w.finish())
 }
 
-fn allowed(c: &mut Ctx, op: &str) -> bool {
+fn allowed(c: &mut Context, op: &str) -> bool {
     if c.binding.grants().allows("machine") {
         return true;
     }
@@ -728,7 +732,7 @@ fn allowed(c: &mut Ctx, op: &str) -> bool {
 }
 
 fn read_or_fail<T>(
-    c: &mut Ctx,
+    c: &mut Context,
     bytes: &[u8],
     read: impl FnOnce(&mut Reader<'_>) -> Result<T, String>,
 ) -> Option<T> {
@@ -748,14 +752,14 @@ pub fn read_grants(r: &mut Reader<'_>) -> Result<Grants, String> {
     })
 }
 
-struct Asked {
+struct EntryRequest {
     binding: i64,
     hosted: bool,
     observe: bool,
     run: Run,
 }
 
-fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
+fn read_run_options(r: &mut Reader<'_>) -> Result<EntryRequest, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
     let timeout_ms = r.count()?;
@@ -765,7 +769,7 @@ fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
     let measure = r.bool()?;
     let tested = r.bool()?;
     let label = r.str()?;
-    Ok(Asked {
+    Ok(EntryRequest {
         binding,
         hosted,
         observe,
@@ -819,10 +823,10 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
     w.count(u.nanos)
         .bool(u.host)
         .count(u.performs)
-        .count(u.held.native_objects)
-        .count(u.held.scheduled)
-        .count(u.held.task_stacks)
-        .count(u.held.frame_tables)
+        .count(u.retained.native_objects)
+        .count(u.retained.scheduled)
+        .count(u.retained.task_stacks)
+        .count(u.retained.frame_tables)
         .count(u.runtime_blocks)
         .count(u.live);
     w.list(outcome.warnings.iter(), |w, d| {

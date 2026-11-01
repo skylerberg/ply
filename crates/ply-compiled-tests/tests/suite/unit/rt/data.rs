@@ -2,30 +2,30 @@ use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
 use ply_compiled::heap::Word;
-use ply_compiled::rt::{Ctx, FAILED_PENDING_RAISE};
+use ply_compiled::rt::{Context, FAILED_PENDING_RAISE};
 use ply_core::{Diagnostic, codes};
 
-fn left(refuse: impl FnOnce(&mut Ctx)) -> Diagnostic {
-    let mut ctx = context_of(&[], Vec::new());
-    ctx.begin();
-    refuse(&mut ctx);
-    let d = ctx.take_failure().expect("a diagnostic");
-    ctx.failed = 0;
-    ctx.end();
+fn left(refuse: impl FnOnce(&mut Context)) -> Diagnostic {
+    let mut context = context_of(&[], Vec::new());
+    context.begin();
+    refuse(&mut context);
+    let d = context.take_failure().expect("a diagnostic");
+    context.failed = 0;
+    context.end();
     d
 }
 
-unsafe extern "C" fn read_text(ctx: *mut Ctx) -> Word {
-    let text: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_str"));
-    let taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word) =
+unsafe extern "C" fn read_text(context: *mut Context) -> Word {
+    let text: unsafe extern "C" fn(*mut Context) -> Word = helper(&builtin_helper_name("?in_str"));
+    let taken: unsafe extern "C" fn(*mut Context, *mut u8, Word) =
         helper(&builtin_helper_name("?taken"));
-    let n = unsafe { text(ctx) };
+    let n = unsafe { text(context) };
     let mut b = vec![0u8; n as usize];
-    unsafe { taken(ctx, b.as_mut_ptr(), n) };
+    unsafe { taken(context, b.as_mut_ptr(), n) };
     0
 }
 
-unsafe extern "C" fn unread(_ctx: *mut Ctx, _w: Word) -> Word {
+unsafe extern "C" fn unread(_context: *mut Context, _w: Word) -> Word {
     0
 }
 
@@ -39,12 +39,12 @@ static STRING_T: PlyType = PlyType {
     lift: read_text,
 };
 
-type Pending = unsafe extern "C" fn(*mut Ctx, *const PlyType, Word) -> Word;
+type Pending = unsafe extern "C" fn(*mut Context, *const PlyType, Word) -> Word;
 
-fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
-    let mut ctx = context_of(&["abort", "raise"], Vec::new());
-    ctx.begin();
-    let c: *mut Ctx = &mut ctx;
+fn failed_under_a_clause(refuse: impl FnOnce(*mut Context)) -> i64 {
+    let mut context = context_of(&["abort", "raise"], Vec::new());
+    context.begin();
+    let c: *mut Context = &mut context;
     let failed = unsafe {
         refuse(c);
         let failed = (*c).failed;
@@ -54,28 +54,28 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
         }
         failed
     };
-    let _ = ctx.take_failure();
-    ctx.failed = 0;
-    ctx.end();
+    let _ = context.take_failure();
+    context.failed = 0;
+    context.end();
     failed
 }
 
-type Failed = unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word);
+type Failed = unsafe extern "C" fn(*mut Context, Word, *const Word, Word, Word);
 
-fn failed(ctx: *mut Ctx, raises: Word, texts: &[&[u8]], notes: Word, shown: Word) {
+fn failed(context: *mut Context, raises: Word, texts: &[&[u8]], notes: Word, shown: Word) {
     let words: Vec<Word> = texts
         .iter()
         .flat_map(|t| [t.as_ptr() as Word, t.len() as Word])
         .collect();
-    unsafe { helper::<Failed>("rt_failed")(ctx, raises, words.as_ptr(), notes, shown) }
+    unsafe { helper::<Failed>("rt_failed")(context, raises, words.as_ptr(), notes, shown) }
 }
 
 #[test]
 fn a_failure_compiled_code_wrote_keeps_its_code_text_notes_and_values() {
     let shown = b"PLV1\x00";
-    let d = left(|ctx| {
+    let d = left(|context| {
         let texts: [&[u8]; 6] = [b"E0501", b"it failed", b"here", b"one", b"two", shown];
-        failed(ctx, 0, &texts, 2, 1);
+        failed(context, 0, &texts, 2, 1);
     });
     assert_eq!(d.code, codes::ASSERTION_FAILED);
     assert_eq!(d.message, "it failed");

@@ -1,10 +1,10 @@
 use super::prelude::{runtime_helpers, runtime_natives};
 use crate::blocks::{self, ActivePages, Page, Segment};
-use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
+use crate::emitted::{PlyFunctionDescriptor, PlyKept, PlyOp, PlyType};
 use crate::frames::PlyFrame;
-use crate::heap::{self, Alloc, Obj};
+use crate::heap::{self, Alloc, Object};
 use crate::native::{MachineType, Signature};
-use crate::rt::Ctx;
+use crate::rt::Context;
 use std::fmt::Write;
 use std::mem::{offset_of, size_of};
 
@@ -31,20 +31,20 @@ macro_rules! laid {
 
 fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
-    laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
-        frames, release_depth, release_waiting, target, entering_desc, entering_words,
+    laid!(out, Context as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
+        frames, release_depth, release_waiting, target, entering_descriptor, entering_words,
         recording, bridge, hosted, unserved, performed_root,
         performed_start, performed_end, task, alloc, constants);
-    laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
-    laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
+    laid!(out, Object as "PlyObj": rc, made_by_scheduler);
+    laid!(out, Page as "PlyPage": free, fresh, end, owner, remote_free_state, next, previous, block, live, class,
         listed, spare);
     laid!(out, ActivePages as "PlyFilling": pages, name, reused);
     laid!(out, Alloc as "PlyAlloc": blocks, count, slow);
-    laid!(out, PlyFrame as "PlyFrame": prev, each);
+    laid!(out, PlyFrame as "PlyFrame": previous, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
     laid!(out, PlyKept as "PlyKept": ty, equal, order);
-    laid!(out, PlyOp as "PlyOp": effect, op, answer, own, params_len, params, vars_len, vars);
-    laid!(out, PlyFnDesc as "PlyFnDesc": uniform, typed, convention, release, share, keep);
+    laid!(out, PlyOp as "PlyOp": effect, op, answer, own, params_len, params, variables_length, variables);
+    laid!(out, PlyFunctionDescriptor as "PlyFnDesc": uniform, typed, convention, release, share, keep);
     out.extend([
         ("alloc.segment", blocks::SEGMENT),
         ("alloc.page", blocks::PAGE),
@@ -68,7 +68,7 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("unwinding.words", crate::rt::UNWINDING_WORDS),
         ("instance.head", crate::detached::INSTANCE_HEADER_WORDS),
         ("instance.detached", crate::detached::INSTANCE_DETACHED),
-        ("instance.vars", crate::detached::INSTANCE_VARS),
+        ("instance.variables", crate::detached::INSTANCE_VARIABLES),
         ("record.closure", crate::detached::RECORD_CLOSURE),
         ("record.instance", crate::detached::RECORD_INSTANCE),
         ("record.string", crate::detached::RECORD_STRING),

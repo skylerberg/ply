@@ -492,14 +492,14 @@ pub fn fingerprint(leaf: &CertificateDer<'_>) -> String {
 struct Socket(Arc<TcpStream>);
 
 impl Read for Socket {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&*self.0).read(buf)
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(buffer)
     }
 }
 
 impl Write for Socket {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -586,19 +586,19 @@ pub fn plaintext_waiting(socket: &TcpStream) -> bool {
 }
 
 impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
-            Stream::Server(s) => s.read(buf),
-            Stream::Client(s) => s.read(buf),
+            Stream::Server(s) => s.read(buffer),
+            Stream::Client(s) => s.read(buffer),
         }
     }
 }
 
 impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         match self {
-            Stream::Server(s) => s.write(buf),
-            Stream::Client(s) => s.write(buf),
+            Stream::Server(s) => s.write(buffer),
+            Stream::Client(s) => s.write(buffer),
         }
     }
 

@@ -1,4 +1,4 @@
-pub fn told(text: std::io::Result<String>) -> Vec<u8> {
+pub fn text_or_error(text: std::io::Result<String>) -> Vec<u8> {
     match text {
         Ok(text) => [&[1u8][..], text.as_bytes()].concat(),
         Err(e) => [&[0u8][..], e.to_string().as_bytes()].concat(),

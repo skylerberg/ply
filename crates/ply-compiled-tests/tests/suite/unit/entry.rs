@@ -230,7 +230,7 @@ fn an_entry_inside_another_runs_on_a_context_of_its_own() {
     let Some(opened) = opened(dir.path()) else {
         return;
     };
-    let mut outer = crate::bare::context();
+    let mut outer = crate::bare::new_context();
     outer.begin();
     assert_eq!(int_returned(&opened, "m.double", &[8], &run()), Ok(16));
     assert_eq!(outer.heap.live(), 0);

@@ -1,6 +1,6 @@
 use crate::c::{MachineNative, runtime_native};
-use crate::native::{Addr, F64, I64};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, F64, I64};
+use crate::rt::{Context, borrowed};
 use ply_core::{Diagnostic, Span, codes};
 
 pub fn natives() -> Vec<MachineNative> {
@@ -15,12 +15,12 @@ pub fn natives() -> Vec<MachineNative> {
 
 macro_rules! float_functions {
     ($($name:literal => $f:ident = $($math:ident)::+ ($($a:ident),+);)+) => {
-        $(unsafe extern "C" fn $f(_ctx: *mut Ctx, $($a: F64),+) -> F64 {
+        $(unsafe extern "C" fn $f(_context: *mut Context, $($a: F64),+) -> F64 {
             F64(ply_core::float::bits($($math)::+($(f64::from_bits($a.0)),+)))
         })+
 
         fn float_natives() -> Vec<MachineNative> {
-            vec![$(runtime_native($name, $f as unsafe extern "C" fn(*mut Ctx, $(float_functions!(@f64 $a)),+) -> F64)),+]
+            vec![$(runtime_native($name, $f as unsafe extern "C" fn(*mut Context, $(float_functions!(@f64 $a)),+) -> F64)),+]
         }
     };
     (@f64 $a:ident) => { F64 };
@@ -53,7 +53,7 @@ fn err_machine(reason: &str) -> Diagnostic {
     .note("this is Ply's fault, not the program's")
 }
 
-impl Ctx {
+impl Context {
     pub(crate) fn text<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a str> {
         match std::str::from_utf8(bytes) {
             Ok(s) => Some(s),
@@ -65,7 +65,7 @@ impl Ctx {
     }
 }
 
-pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_blake3(context: *mut Context, p: Address, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { borrowed(p, n) });
-    unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
+    unsafe { &mut *context }.give(digest.as_bytes().to_vec())
 }

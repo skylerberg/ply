@@ -1,7 +1,7 @@
-use super::{Nondeterministic, asked, handed, waited, with_host_facilities};
+use super::{Nondeterministic, if_host_allowed, required_argument, waited, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use ply_core::sqlite::{Control, FUNCTIONS, Limits, Mode, Options, Scalar, run_on_image};
 use ply_host::native::{found, parts};
 use ply_host::sqlite::{SqliteHost, decode_limits, decode_scalars, encode_reply, root_of};
@@ -59,30 +59,30 @@ pub(super) fn natives() -> Vec<MachineNative> {
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_run(
-    ctx: *mut Ctx,
-    image_addr: Addr,
+    context: *mut Context,
+    image_address: Address,
     image_len: I64,
-    sql_addr: Addr,
+    sql_address: Address,
     sql_len: I64,
-    params_addr: Addr,
+    params_address: Address,
     params_len: I64,
     reads_only: I64,
     strict: I64,
-    limits_addr: Addr,
+    limits_address: Address,
     limits_len: I64,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some((sql, params, limits)) = statement(
         c,
         "sqlite_run",
-        unsafe { borrowed(sql_addr, sql_len) },
-        unsafe { borrowed(params_addr, params_len) },
-        unsafe { borrowed(limits_addr, limits_len) },
+        unsafe { borrowed(sql_address, sql_len) },
+        unsafe { borrowed(params_address, params_len) },
+        unsafe { borrowed(limits_address, limits_len) },
     ) else {
         return TakenBytes(0);
     };
     let (reply, left) = run_on_image(
-        unsafe { borrowed(image_addr, image_len) },
+        unsafe { borrowed(image_address, image_len) },
         &sql,
         &params,
         limits,
@@ -92,12 +92,12 @@ pub unsafe extern "C" fn rt_sqlite_run(
     c.given(parts(&[&found(left), &encode_reply(&reply)]))
 }
 
-pub unsafe extern "C" fn rt_sqlite_functions(ctx: *mut Ctx) -> TakenBytes {
+pub unsafe extern "C" fn rt_sqlite_functions(context: *mut Context) -> TakenBytes {
     let names: Vec<&[u8]> = FUNCTIONS.iter().map(|name| name.as_bytes()).collect();
-    unsafe { &mut *ctx }.given(parts(&names))
+    unsafe { &mut *context }.given(parts(&names))
 }
 
-fn rooted(c: &mut Ctx, label: &[u8], what: &'static str) -> Option<(Arc<SqliteHost>, PathBuf)> {
+fn rooted(c: &mut Context, label: &[u8], what: &'static str) -> Option<(Arc<SqliteHost>, PathBuf)> {
     let label = c.text(label)?;
     let span = c.site();
     let found = with_host_facilities(c, |facilities| {
@@ -114,36 +114,36 @@ fn rooted(c: &mut Ctx, label: &[u8], what: &'static str) -> Option<(Arc<SqliteHo
 }
 
 fn statement(
-    c: &mut Ctx,
+    c: &mut Context,
     native: &str,
     sql: &[u8],
     params: &[u8],
     limits: &[u8],
 ) -> Option<(String, Vec<Scalar>, Limits)> {
     let sql = c.text(sql)?.to_string();
-    let params = handed(c, native, "a statement's values", decode_scalars(params))?;
-    let limits = handed(c, native, "a statement's limits", decode_limits(limits))?;
+    let params = required_argument(c, native, "a statement's values", decode_scalars(params))?;
+    let limits = required_argument(c, native, "a statement's limits", decode_limits(limits))?;
     Some((sql, params, limits))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_open(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    path_at: Addr,
+    path_at: Address,
     path_n: I64,
     mode: I64,
     strict: I64,
     busy_ms: I64,
     statements: I64,
 ) -> I64 {
-    asked(
-        ctx,
+    if_host_allowed(
+        context,
         "sqlite_open",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let what = "`sqlite.open`";
             let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn rt_sqlite_open(
                 2 => Some(Mode::Create),
                 _ => None,
             };
-            let Some(mode) = handed(c, "sqlite_open", "a mode", mode) else {
+            let Some(mode) = required_argument(c, "sqlite_open", "a mode", mode) else {
                 return I64(0);
             };
             let options = Options {
@@ -174,17 +174,17 @@ pub unsafe extern "C" fn rt_sqlite_open(
 }
 
 pub unsafe extern "C" fn rt_sqlite_close(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(
-        ctx,
+    if_host_allowed(
+        context,
         "sqlite_close",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let what = "`sqlite.close`";
             let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
@@ -197,62 +197,68 @@ pub unsafe extern "C" fn rt_sqlite_close(
 
 #[allow(clippy::too_many_arguments)]
 fn ran(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
     what: &'static str,
-    label: (Addr, I64),
+    label: (Address, I64),
     conn: I64,
-    sql: (Addr, I64),
-    params: (Addr, I64),
-    limits: (Addr, I64),
+    sql: (Address, I64),
+    params: (Address, I64),
+    limits: (Address, I64),
     reads_only: bool,
     cursor: bool,
 ) -> I64 {
-    asked(ctx, native, Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label.0, label.1) }, what)
-        else {
-            return I64(0);
-        };
-        let Some((sql, params, limits)) = statement(
-            c,
-            native,
-            unsafe { borrowed(sql.0, sql.1) },
-            unsafe { borrowed(params.0, params.1) },
-            unsafe { borrowed(limits.0, limits.1) },
-        ) else {
-            return I64(0);
-        };
-        let job = if cursor {
-            sqlite_host.cursor(root, conn.0, sql, params, limits)
-        } else {
-            sqlite_host.run(root, conn.0, sql, params, limits, reads_only)
-        };
-        waited(c, native, what, Ok(job))
-    })
+    if_host_allowed(
+        context,
+        native,
+        Nondeterministic,
+        I64(0),
+        |c: &mut Context| {
+            let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label.0, label.1) }, what)
+            else {
+                return I64(0);
+            };
+            let Some((sql, params, limits)) = statement(
+                c,
+                native,
+                unsafe { borrowed(sql.0, sql.1) },
+                unsafe { borrowed(params.0, params.1) },
+                unsafe { borrowed(limits.0, limits.1) },
+            ) else {
+                return I64(0);
+            };
+            let job = if cursor {
+                sqlite_host.cursor(root, conn.0, sql, params, limits)
+            } else {
+                sqlite_host.run(root, conn.0, sql, params, limits, reads_only)
+            };
+            waited(c, native, what, Ok(job))
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_query(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    sql_addr: Addr,
+    sql_address: Address,
     sql_len: I64,
-    params_addr: Addr,
+    params_address: Address,
     params_len: I64,
-    limits_addr: Addr,
+    limits_address: Address,
     limits_len: I64,
 ) -> I64 {
     ran(
-        ctx,
+        context,
         "sqlite_query",
         "`sqlite.query`",
         (label_at, label_n),
         conn,
-        (sql_addr, sql_len),
-        (params_addr, params_len),
-        (limits_addr, limits_len),
+        (sql_address, sql_len),
+        (params_address, params_len),
+        (limits_address, limits_len),
         true,
         false,
     )
@@ -260,26 +266,26 @@ pub unsafe extern "C" fn rt_sqlite_query(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_execute(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    sql_addr: Addr,
+    sql_address: Address,
     sql_len: I64,
-    params_addr: Addr,
+    params_address: Address,
     params_len: I64,
-    limits_addr: Addr,
+    limits_address: Address,
     limits_len: I64,
 ) -> I64 {
     ran(
-        ctx,
+        context,
         "sqlite_execute",
         "`sqlite.execute`",
         (label_at, label_n),
         conn,
-        (sql_addr, sql_len),
-        (params_addr, params_len),
-        (limits_addr, limits_len),
+        (sql_address, sql_len),
+        (params_address, params_len),
+        (limits_address, limits_len),
         false,
         false,
     )
@@ -287,44 +293,44 @@ pub unsafe extern "C" fn rt_sqlite_execute(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_sqlite_cursor(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    sql_addr: Addr,
+    sql_address: Address,
     sql_len: I64,
-    params_addr: Addr,
+    params_address: Address,
     params_len: I64,
-    limits_addr: Addr,
+    limits_address: Address,
     limits_len: I64,
 ) -> I64 {
     ran(
-        ctx,
+        context,
         "sqlite_cursor",
         "`sqlite.cursor`",
         (label_at, label_n),
         conn,
-        (sql_addr, sql_len),
-        (params_addr, params_len),
-        (limits_addr, limits_len),
+        (sql_address, sql_len),
+        (params_address, params_len),
+        (limits_address, limits_len),
         true,
         true,
     )
 }
 
 pub unsafe extern "C" fn rt_sqlite_control(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
     step: I64,
 ) -> I64 {
-    asked(
-        ctx,
+    if_host_allowed(
+        context,
         "sqlite_control",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let what = "`sqlite.control`";
             let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
@@ -337,7 +343,8 @@ pub unsafe extern "C" fn rt_sqlite_control(
                 3 => Some(Control::Rollback),
                 _ => None,
             };
-            let Some(step) = handed(c, "sqlite_control", "a transaction's step", step) else {
+            let Some(step) = required_argument(c, "sqlite_control", "a transaction's step", step)
+            else {
                 return I64(0);
             };
             waited(
@@ -351,19 +358,19 @@ pub unsafe extern "C" fn rt_sqlite_control(
 }
 
 pub unsafe extern "C" fn rt_sqlite_backup(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    path_at: Addr,
+    path_at: Address,
     path_n: I64,
 ) -> I64 {
-    asked(
-        ctx,
+    if_host_allowed(
+        context,
         "sqlite_backup",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let what = "`sqlite.backup`";
             let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
@@ -379,18 +386,18 @@ pub unsafe extern "C" fn rt_sqlite_backup(
 }
 
 pub unsafe extern "C" fn rt_sqlite_fetch(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
     rows: I64,
 ) -> I64 {
-    asked(
-        ctx,
+    if_host_allowed(
+        context,
         "sqlite_fetch",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let what = "`sqlite.fetch`";
             let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {
@@ -407,17 +414,17 @@ pub unsafe extern "C" fn rt_sqlite_fetch(
 }
 
 pub unsafe extern "C" fn rt_sqlite_finish(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(
-        ctx,
+    if_host_allowed(
+        context,
         "sqlite_finish",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let what = "`sqlite.finish`";
             let Some((sqlite_host, root)) = rooted(c, unsafe { borrowed(label_at, label_n) }, what)
             else {

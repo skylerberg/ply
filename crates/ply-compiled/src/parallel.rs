@@ -1,7 +1,7 @@
 use crate::blocks::Blocks;
 use crate::emitted::Block;
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, PROGRAM_STACK, stack_floor};
+use crate::rt::{Context, PROGRAM_STACK, stack_floor};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -15,16 +15,18 @@ pub(crate) fn inherit_branch(machine: u64) {
     PARALLEL_ENTRY_ID.with(|of| of.set(machine));
 }
 
-fn call(ctx: *mut Ctx, f: Word) -> Word {
-    unsafe { Block::of(f).call(ctx, &[]) }
+fn call(context: *mut Context, f: Word) -> Word {
+    unsafe { Block::of(f).call(context, &[]) }
 }
 
-fn let_go(ctx: *mut Ctx, f: Word) {
-    unsafe { Block::of(f).release_function_if_last(ctx) }
+fn let_go(context: *mut Context, f: Word) {
+    unsafe { Block::of(f).release_function_if_last(context) }
 }
 
-fn share(ctx: *mut Ctx, branches: &[Word]) -> bool {
-    branches.iter().all(|f| unsafe { Block::of(*f).share(ctx) })
+fn share(context: *mut Context, branches: &[Word]) -> bool {
+    branches
+        .iter()
+        .all(|f| unsafe { Block::of(*f).share(context) })
 }
 
 thread_local! {
@@ -83,27 +85,27 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: bool) {
+pub(crate) unsafe fn run(context: *mut Context, slots: *mut Word, n: usize, allowed: bool) {
     let branches = unsafe { std::slice::from_raw_parts_mut(slots, n) };
-    let c = unsafe { &mut *ctx };
-    let words = (c.entering_desc, c.entering_words);
-    c.entering_desc = 0;
+    let c = unsafe { &mut *context };
+    let words = (c.entering_descriptor, c.entering_words);
+    c.entering_descriptor = 0;
     c.entering_words = 0;
     let nested = PARALLEL_ENTRY_ID.with(|of| of.get() != 0 && of.get() != c.id.0);
     let at_once = !nested && allowed && shared_only(words);
     match pool() {
-        Some(pool) if n >= 2 && at_once && share(ctx, branches) => unsafe {
-            in_parallel(ctx, pool, branches, words)
+        Some(pool) if n >= 2 && at_once && share(context, branches) => unsafe {
+            in_parallel(context, pool, branches, words)
         },
-        _ => unsafe { in_order(ctx, branches, words) },
+        _ => unsafe { in_order(context, branches, words) },
     }
 }
 
-fn shared_only((desc, words): (Word, Word)) -> bool {
-    if desc == 0 {
+fn shared_only((descriptor, words): (Word, Word)) -> bool {
+    if descriptor == 0 {
         return true;
     }
-    let n = unsafe { *(desc as *const Word) };
+    let n = unsafe { *(descriptor as *const Word) };
     (0..n).all(|i| {
         let object = unsafe { *(words as *const Word).add(i as usize) } as *const Word;
         let flags = unsafe { *object };
@@ -111,17 +113,17 @@ fn shared_only((desc, words): (Word, Word)) -> bool {
     })
 }
 
-unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
+unsafe fn in_order(context: *mut Context, branches: &mut [Word], words: (Word, Word)) {
     for i in 0..branches.len() {
         let closure = branches[i];
-        let c = unsafe { &mut *ctx };
-        (c.entering_desc, c.entering_words) = words;
-        let result = call(ctx, closure);
-        let_go(ctx, closure);
-        if unsafe { (*ctx).failed } != 0 {
+        let c = unsafe { &mut *context };
+        (c.entering_descriptor, c.entering_words) = words;
+        let result = call(context, closure);
+        let_go(context, closure);
+        if unsafe { (*context).failed } != 0 {
             branches[i] = 0;
             for rest in &mut branches[i + 1..] {
-                let_go(ctx, *rest);
+                let_go(context, *rest);
                 *rest = 0;
             }
             return;
@@ -131,12 +133,12 @@ unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
 }
 
 struct Branch {
-    ctx: Box<Ctx>,
+    context: Box<Context>,
     closure: Word,
     result: Word,
 }
 
-struct Unwatch(*mut Ctx);
+struct Unwatch(*mut Context);
 
 impl Drop for Unwatch {
     fn drop(&mut self) {
@@ -144,28 +146,28 @@ impl Drop for Unwatch {
     }
 }
 
-struct Handed(*mut Branch);
+struct BranchPointer(*mut Branch);
 
-unsafe impl Send for Handed {}
+unsafe impl Send for BranchPointer {}
 
-impl Handed {
+impl BranchPointer {
     unsafe fn run(self) {
         let branch = unsafe { &mut *self.0 };
-        let ctx: *mut Ctx = &mut *branch.ctx;
-        let c = unsafe { &mut *ctx };
+        let context: *mut Context = &mut *branch.context;
+        let c = unsafe { &mut *context };
         c.stack_floor.store(stack_floor(), Relaxed);
-        let _unwatch = Unwatch(ctx);
+        let _unwatch = Unwatch(context);
         c.watch();
         let branch_was = PARALLEL_ENTRY_ID.with(|of| of.replace(c.id.0));
         let own = worker_taken(c.id.0).map(|w| c.heap.swap_blocks(w));
         let heap_was = heap::swap_current(&mut c.heap);
         let site_was = heap::poison_freed::swap(&raw const c.site_root);
-        let running_was = crate::rt::swap_running(ctx);
-        branch.result = call(ctx, branch.closure);
+        let running_was = crate::rt::swap_running(context);
+        branch.result = call(context, branch.closure);
         if c.failed == crate::rt::FAILED_OUT_OF_STACK {
             crate::rt::release_unused_stack_pages();
         }
-        let_go(ctx, branch.closure);
+        let_go(context, branch.closure);
         c.runtime = None;
         crate::rt::swap_running(running_was);
         heap::poison_freed::swap(site_was);
@@ -178,20 +180,20 @@ impl Handed {
 }
 
 unsafe fn in_parallel(
-    ctx: *mut Ctx,
+    context: *mut Context,
     pool: &rayon::ThreadPool,
     branches: &mut [Word],
     words: (Word, Word),
 ) {
-    let parent = unsafe { &mut *ctx };
+    let parent = unsafe { &mut *context };
     parent.pooled = true;
     let mut runs: Vec<Branch> = branches
         .iter()
         .map(|&closure| {
-            let mut ctx = Box::new(parent.branch());
-            (ctx.entering_desc, ctx.entering_words) = words;
+            let mut context = Box::new(parent.branch());
+            (context.entering_descriptor, context.entering_words) = words;
             Branch {
-                ctx,
+                context,
                 closure,
                 result: 0,
             }
@@ -199,22 +201,24 @@ unsafe fn in_parallel(
         .collect();
     pool.in_place_scope(|scope| {
         for run in runs.iter_mut() {
-            let handed = Handed(run);
+            let handed = BranchPointer(run);
             scope.spawn(move |_| unsafe { handed.run() });
         }
     });
     let mut ended = false;
     for (slot, run) in branches.iter_mut().zip(runs) {
-        let Branch { ctx, result, .. } = run;
-        let mut ctx = *ctx;
+        let Branch {
+            context, result, ..
+        } = run;
+        let mut context = *context;
         if ended {
-            *slot = if ctx.failed == 0 { result } else { 0 };
-            parent.absorb(ctx);
+            *slot = if context.failed == 0 { result } else { 0 };
+            parent.absorb(context);
             continue;
         }
-        let failure = ctx.take_failure_to_merge();
+        let failure = context.take_failure_to_merge();
         *slot = if failure.is_some() { 0 } else { result };
-        parent.absorb(ctx);
+        parent.absorb(context);
         if let Some(f) = failure {
             parent.merge_concurrent_failure(f);
             ended = true;

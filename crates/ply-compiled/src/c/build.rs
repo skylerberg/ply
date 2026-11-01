@@ -4,7 +4,7 @@ use super::load::Library;
 use super::tables::root_id;
 use crate::heap::Heap;
 use crate::rt::Entry;
-use crate::rt::{Ctx, Root, Tables};
+use crate::rt::{Context, Root, Tables};
 use anyhow::{Result, bail};
 use ply_core::Symbol;
 use std::collections::HashMap;
@@ -50,8 +50,8 @@ impl Native {
         &self.tables
     }
 
-    pub fn context(&self) -> Ctx {
-        Ctx::new(self.tables.clone())
+    pub fn context(&self) -> Context {
+        Context::new(self.tables.clone())
     }
 }
 

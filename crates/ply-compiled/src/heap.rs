@@ -10,17 +10,17 @@ pub const FRAME: u32 = u32::MAX - 1;
 pub const SHARED: u32 = 1 << 31;
 
 #[repr(C, align(8))]
-pub struct Obj {
+pub struct Object {
     pub rc: u32,
     pub made_by_scheduler: bool,
 }
 
 pub const HEADER: usize = 8;
 
-const _: () = assert!(HEADER == std::mem::size_of::<Obj>());
+const _: () = assert!(HEADER == std::mem::size_of::<Object>());
 
 #[inline]
-fn count(o: *mut Obj) -> &'static std::sync::atomic::AtomicU32 {
+fn count(o: *mut Object) -> &'static std::sync::atomic::AtomicU32 {
     unsafe { std::sync::atomic::AtomicU32::from_ptr(&raw mut (*o).rc) }
 }
 
@@ -48,12 +48,12 @@ pub fn imm_value(w: Word) -> i64 {
 }
 
 #[inline]
-pub fn obj(w: Word) -> *mut Obj {
+pub fn object(w: Word) -> *mut Object {
     debug_assert!(is_object(w));
     if poisoning_enabled() {
         poison_freed::check(w);
     }
-    w as *mut Obj
+    w as *mut Object
 }
 
 #[inline]
@@ -73,9 +73,9 @@ pub fn delay() -> usize {
 }
 
 pub mod poison_freed {
-    use super::{IMMORTAL, Obj, Word, is_object};
+    use super::{IMMORTAL, Object, Word, is_object};
 
-    static POISONED: Obj = Obj {
+    static POISONED: Object = Object {
         rc: IMMORTAL,
         made_by_scheduler: false,
     };
@@ -102,7 +102,7 @@ pub mod poison_freed {
         }
         let reason = if w == word() {
             "a payload word poisoned when its block died"
-        } else if unsafe { (*(w as *const Obj)).rc } == 0 {
+        } else if unsafe { (*(w as *const Object)).rc } == 0 {
             "a block that has died"
         } else {
             return;
@@ -119,17 +119,17 @@ pub mod poison_freed {
 }
 
 #[inline]
-pub unsafe fn words(o: *mut Obj) -> *mut Word {
+pub unsafe fn words(o: *mut Object) -> *mut Word {
     unsafe { (o as *mut u8).add(HEADER) as *mut Word }
 }
 
 #[inline]
-pub unsafe fn word_at(o: *mut Obj, i: usize) -> Word {
+pub unsafe fn word_at(o: *mut Object, i: usize) -> Word {
     unsafe { *words(o).add(i) }
 }
 
 #[inline]
-pub unsafe fn set_word(o: *mut Obj, i: usize, w: Word) {
+pub unsafe fn set_word(o: *mut Object, i: usize, w: Word) {
     unsafe { *words(o).add(i) = w }
 }
 
@@ -144,7 +144,7 @@ static NATIVE_MARK: u8 = 0;
 const NATIVE_BYTES: usize = 8 * NATIVE_BOX_WORD + std::mem::size_of::<Box<dyn Native>>();
 
 pub trait Native: std::any::Any {
-    fn release(&mut self, ctx: *mut crate::rt::Ctx);
+    fn release(&mut self, context: *mut crate::rt::Context);
 
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
         None
@@ -152,33 +152,33 @@ pub trait Native: std::any::Any {
 }
 
 pub unsafe fn native_escapes(w: Word) -> Option<ply_core::escape::Handle> {
-    unsafe { (**native_slot(obj(w))).escapes() }
+    unsafe { (**native_slot(object(w))).escapes() }
 }
 
-unsafe fn native_slot(o: *mut Obj) -> *mut Box<dyn Native> {
+unsafe fn native_slot(o: *mut Object) -> *mut Box<dyn Native> {
     unsafe { words(o).add(NATIVE_BOX_WORD) as *mut Box<dyn Native> }
 }
 
 pub fn is_native(w: Word) -> bool {
-    is_object(w) && unsafe { word_at(obj(w), 0) } == &raw const NATIVE_MARK as Word
+    is_object(w) && unsafe { word_at(object(w), 0) } == &raw const NATIVE_MARK as Word
 }
 
 pub unsafe fn native_of<'a, T: Native>(w: Word) -> Option<&'a mut T> {
     if !is_native(w) {
         return None;
     }
-    let held: &'a mut dyn Native = unsafe { &mut **native_slot(obj(w)) };
+    let held: &'a mut dyn Native = unsafe { &mut **native_slot(object(w)) };
     (held as &mut dyn std::any::Any).downcast_mut::<T>()
 }
 
 pub struct Heap {
     blocks: Blocks,
     alloc: Box<Alloc>,
-    natives: Vec<*mut Obj>,
+    natives: Vec<*mut Object>,
     persistent: bool,
     runtime_blocks: usize,
     scheduling: bool,
-    deferred_frees: std::collections::VecDeque<(*mut Obj, usize)>,
+    deferred_frees: std::collections::VecDeque<(*mut Object, usize)>,
     poison_freed: bool,
     delay: usize,
 }
@@ -197,7 +197,7 @@ thread_local! {
 pub(crate) fn size_histogram_in(blocks: &Blocks) -> Vec<(usize, usize, usize)> {
     let mut tally: std::collections::BTreeMap<usize, (usize, usize)> = Default::default();
     blocks.each(|block, bytes| {
-        if unsafe { (*block.cast::<Obj>()).rc } == 0 {
+        if unsafe { (*block.cast::<Object>()).rc } == 0 {
             return;
         }
         let e = tally.entry(bytes - HEADER).or_insert((0, 0));
@@ -210,7 +210,7 @@ pub(crate) fn size_histogram_in(blocks: &Blocks) -> Vec<(usize, usize, usize)> {
 pub(crate) fn program_live_block_count_in(blocks: &Blocks) -> usize {
     let mut n = 0;
     blocks.each(|block, _| {
-        let o = block.cast::<Obj>();
+        let o = block.cast::<Object>();
         if unsafe { (*o).rc != 0 && !(*o).made_by_scheduler } {
             n += 1;
         }
@@ -250,7 +250,7 @@ pub fn swap_current(heap: *mut Heap) -> *mut Heap {
     CURRENT.with(|c| c.replace(heap))
 }
 
-unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, listed: bool) {
+unsafe fn give_back(o: *mut Object, heap: *mut Heap, object: usize, listed: bool) {
     unsafe {
         if heap.is_null() || !(*heap).blocks.owns(o.cast(), object) {
             if !listed {
@@ -281,7 +281,7 @@ unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, listed: bool) {
     }
 }
 
-pub(crate) unsafe fn free_sized(o: *mut Obj, heap: *mut Heap, payload: usize) {
+pub(crate) unsafe fn free_sized(o: *mut Object, heap: *mut Heap, payload: usize) {
     unsafe {
         let rc = (*o).rc;
         debug_assert!(rc == 1 || rc == SHARED, "{o:p} was freed with holders left");
@@ -294,7 +294,7 @@ pub(crate) unsafe fn free_sized(o: *mut Obj, heap: *mut Heap, payload: usize) {
 }
 
 #[cfg(debug_assertions)]
-unsafe fn assert_block_size(o: *mut Obj, heap: *mut Heap, object: usize) {
+unsafe fn assert_block_size(o: *mut Object, heap: *mut Heap, object: usize) {
     unsafe {
         if let Some(had) = heap.as_ref().and_then(|h| h.blocks.bytes_at(o.addr())) {
             assert_eq!(
@@ -306,17 +306,21 @@ unsafe fn assert_block_size(o: *mut Obj, heap: *mut Heap, object: usize) {
     }
 }
 
-pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap, ctx: *mut crate::rt::Ctx) {
+pub(crate) unsafe fn free_handle(
+    o: *mut Object,
+    heap: *mut Heap,
+    context: *mut crate::rt::Context,
+) {
     unsafe {
         debug_assert!((*o).rc == SHARED || (*o).rc == 1);
         let w = o as Word;
         let (payload, listed) = if is_native(w) {
             assert!(
-                !ctx.is_null(),
+                !context.is_null(),
                 "a native object was let go of outside any context"
             );
             let mut held = native_slot(o).read();
-            held.release(ctx);
+            held.release(context);
             drop(held);
             (NATIVE_BYTES, true)
         } else if crate::rt::scoped_id(w).is_some() {
@@ -329,11 +333,11 @@ pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap, ctx: *mut crate::
     }
 }
 
-pub(crate) unsafe fn count_of(o: *mut Obj) -> u32 {
+pub(crate) unsafe fn count_of(o: *mut Object) -> u32 {
     count(o).load(Relaxed)
 }
 
-pub(crate) unsafe fn last_of_shared(o: *mut Obj) -> bool {
+pub(crate) unsafe fn last_of_shared(o: *mut Object) -> bool {
     let last = count(o).fetch_sub(1, Release) == SHARED | 1;
     if last {
         std::sync::atomic::fence(Acquire);
@@ -345,12 +349,12 @@ pub fn release_handle(w: Word) {
     unsafe { released(w, CURRENT.with(|c| c.get()), std::ptr::null_mut()) }
 }
 
-pub fn release_object(ctx: *mut crate::rt::Ctx, w: Word) {
-    unsafe { released(w, &raw mut (*ctx).heap, ctx) }
+pub fn release_object(context: *mut crate::rt::Context, w: Word) {
+    unsafe { released(w, &raw mut (*context).heap, context) }
 }
 
-unsafe fn released(w: Word, heap: *mut Heap, ctx: *mut crate::rt::Ctx) {
-    let o = obj(w);
+unsafe fn released(w: Word, heap: *mut Heap, context: *mut crate::rt::Context) {
+    let o = object(w);
     let rc = count(o).load(Relaxed);
     let last = if rc == IMMORTAL {
         false
@@ -363,12 +367,12 @@ unsafe fn released(w: Word, heap: *mut Heap, ctx: *mut crate::rt::Ctx) {
         true
     };
     if last {
-        unsafe { free_handle(o, heap, ctx) }
+        unsafe { free_handle(o, heap, context) }
     }
 }
 
 pub fn inc_shared(w: Word) {
-    count(obj(w)).fetch_add(1, Relaxed);
+    count(object(w)).fetch_add(1, Relaxed);
 }
 
 impl Default for Heap {
@@ -442,8 +446,8 @@ impl Heap {
         self.blocks.live()
     }
 
-    pub fn held(&self) -> usize {
-        self.blocks.held()
+    pub fn retained_bytes(&self) -> usize {
+        self.blocks.retained_bytes()
     }
 
     pub fn runtime_blocks(&self) -> usize {
@@ -458,7 +462,7 @@ impl Heap {
         self.natives.len()
     }
 
-    unsafe fn unlist(&mut self, o: *mut Obj) {
+    unsafe fn unlist(&mut self, o: *mut Object) {
         let at = unsafe { word_at(o, NATIVES_INDEX_WORD) } as usize;
         debug_assert!(
             self.natives.get(at) == Some(&o),
@@ -484,11 +488,11 @@ impl Heap {
         (HEADER + payload_bytes.max(8) + 7) & !7
     }
 
-    pub(crate) fn raw_alloc(&mut self, payload_bytes: usize) -> *mut Obj {
+    pub(crate) fn raw_alloc(&mut self, payload_bytes: usize) -> *mut Object {
         let size = Heap::object_size(payload_bytes);
-        let p: *mut Obj = self.blocks.take(size).cast();
+        let p: *mut Object = self.blocks.take(size).cast();
         unsafe {
-            p.write(Obj {
+            p.write(Object {
                 rc: 1,
                 made_by_scheduler: self.scheduling,
             })

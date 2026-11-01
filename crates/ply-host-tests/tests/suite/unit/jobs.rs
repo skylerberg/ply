@@ -94,7 +94,7 @@ fn a_job_submitted_after_the_shutdown_drain_time_has_run_out_fails_with_a_drain_
 fn a_job_that_rejects_with_a_diagnostic_fails_the_run_with_that_diagnostic_s_code_and_message() {
     let runtime = ply_host::Host::new().runtime();
     let run = run_of(&*runtime).expect("a host made the runtime");
-    let ticket = jobs::refusing(
+    let ticket = jobs::queue_fallible(
         Work::Waiting,
         run,
         Span::DUMMY,

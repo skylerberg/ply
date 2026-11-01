@@ -15,11 +15,14 @@ const FIXED_GENERATOR: (&str, &str) = ("crypto.rs", "use ring::test::rand::Fixed
 
 #[test]
 fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-core/src");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-core/src");
     let mut files = Vec::new();
-    sources(&src, &mut files);
+    sources(&source, &mut files);
     files.sort();
-    assert!(files.len() > 5, "found no sources to check under {src:?}");
+    assert!(
+        files.len() > 5,
+        "found no sources to check under {source:?}"
+    );
 
     for path in files {
         if path

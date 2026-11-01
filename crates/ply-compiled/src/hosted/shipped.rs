@@ -1,8 +1,8 @@
 use super::{Deterministic, granted, text_at};
 use crate::c::{MachineNative, runtime_native};
 use crate::entry::{self, Opened};
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use ply_host::native::{found, int, parts};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,12 +69,12 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 fn shipping(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
-    result: impl FnOnce(&mut Ctx, &dyn Ships) -> TakenBytes,
+    result: impl FnOnce(&mut Context, &dyn Ships) -> TakenBytes,
 ) -> TakenBytes {
     granted(
-        ctx,
+        context,
         "shipped",
         native,
         Deterministic,
@@ -82,7 +82,7 @@ fn shipping(
         |c| match SHIPS.get() {
             Some(ships) => result(c, ships.as_ref()),
             None => {
-                super::handed(
+                super::required_argument(
                     c,
                     native,
                     "a binary that installed what it ships",
@@ -94,29 +94,35 @@ fn shipping(
     )
 }
 
-pub unsafe extern "C" fn rt_shipped_names(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_names", |c, ships| {
+pub unsafe extern "C" fn rt_shipped_names(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_names", |c, ships| {
         let names = ships.names();
         let names: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
         c.given(parts(&names))
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_module(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    shipping(ctx, "shipped_module", |c, ships| match text_at(c, p, n) {
-        Some(name) => c.given(found(ships.module(&name))),
-        None => TakenBytes(0),
+pub unsafe extern "C" fn rt_shipped_module(
+    context: *mut Context,
+    p: Address,
+    n: I64,
+) -> TakenBytes {
+    shipping(context, "shipped_module", |c, ships| {
+        match text_at(c, p, n) {
+            Some(name) => c.given(found(ships.module(&name))),
+            None => TakenBytes(0),
+        }
     })
 }
 
 pub unsafe extern "C" fn rt_shipped_answer(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     offset: I64,
     len: I64,
 ) -> TakenBytes {
-    shipping(ctx, "shipped_answer", |c, ships| {
+    shipping(context, "shipped_answer", |c, ships| {
         let Some(path) = text_at(c, p, n) else {
             return TakenBytes(0);
         };
@@ -128,20 +134,20 @@ pub unsafe extern "C" fn rt_shipped_answer(
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_digests(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_digests", |c, ships| {
+pub unsafe extern "C" fn rt_shipped_digests(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_digests", |c, ships| {
         c.given(ships.digests().into_bytes())
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_version(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_version", |c, _| {
+pub unsafe extern "C" fn rt_shipped_version(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_version", |c, _| {
         c.given(env!("CARGO_PKG_VERSION").as_bytes().to_vec())
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_binary_bytes(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_binary_bytes", |c, _| {
+pub unsafe extern "C" fn rt_shipped_binary_bytes(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_binary_bytes", |c, _| {
         let size = std::env::current_exe()
             .and_then(std::fs::metadata)
             .ok()
@@ -150,36 +156,36 @@ pub unsafe extern "C" fn rt_shipped_binary_bytes(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_stamps(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_stamps", |c, ships| {
+pub unsafe extern "C" fn rt_shipped_stamps(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_stamps", |c, ships| {
         c.given(ships.stamps().into_bytes())
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_described(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_described", |c, _| {
+pub unsafe extern "C" fn rt_shipped_described(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_described", |c, _| {
         c.given(crate::c::described().as_bytes().to_vec())
     })
 }
 
-pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_definitions", |c, ships| {
+pub unsafe extern "C" fn rt_shipped_definitions(context: *mut Context) -> TakenBytes {
+    shipping(context, "shipped_definitions", |c, ships| {
         c.given(ships.definitions().into_bytes())
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_shipped_entered(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    rp: Addr,
+    rp: Address,
     rn: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
     timeout_ms: I64,
 ) -> TakenBytes {
-    shipping(ctx, "shipped_entered", |c, _| {
+    shipping(context, "shipped_entered", |c, _| {
         let (Some(library), Some(root)) = (text_at(c, lp, ln), text_at(c, rp, rn)) else {
             return TakenBytes(0);
         };

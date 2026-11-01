@@ -1,5 +1,5 @@
 use crate::heap::Word;
-use crate::rt::Ctx;
+use crate::rt::Context;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineType {
@@ -7,10 +7,10 @@ pub enum MachineType {
     Words,
     I64,
     F64,
-    Addr,
+    Address,
     Out,
     Handle,
-    Handed,
+    OwnedWord,
     Block,
     Type,
     Op,
@@ -27,10 +27,10 @@ impl MachineType {
             MachineType::Words => "Words",
             MachineType::I64 => "I64",
             MachineType::F64 => "F64",
-            MachineType::Addr => "Addr",
+            MachineType::Address => "Addr",
             MachineType::Out => "Out",
             MachineType::Handle => "Handle",
-            MachineType::Handed => "Handed",
+            MachineType::OwnedWord => "Handed",
             MachineType::Block => "Block",
             MachineType::Type => "Type",
             MachineType::Op => "Op",
@@ -68,7 +68,7 @@ pub struct F64(pub u64);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Addr(pub *mut u8);
+pub struct Address(pub *mut u8);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,8 +98,8 @@ unsafe impl Taken for F64 {
     const MACHINE: MachineType = MachineType::F64;
 }
 
-unsafe impl Taken for Addr {
-    const MACHINE: MachineType = MachineType::Addr;
+unsafe impl Taken for Address {
+    const MACHINE: MachineType = MachineType::Address;
 }
 
 unsafe impl Taken for Out {
@@ -151,7 +151,7 @@ pub trait Native: Copy {
 
 macro_rules! natives_taking {
     ($($a:ident)*) => {
-        impl<R: Returned, $($a: Taken),*> Native for unsafe extern "C" fn(*mut Ctx $(, $a)*) -> R {
+        impl<R: Returned, $($a: Taken),*> Native for unsafe extern "C" fn(*mut Context $(, $a)*) -> R {
             const SIGNATURE: Signature = Signature {
                 params: &[$($a::MACHINE),*],
                 result: R::MACHINE,

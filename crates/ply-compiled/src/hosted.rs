@@ -14,14 +14,14 @@ mod trace;
 
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use crate::secret;
 use ply_core::host::Determinism::{self, Deterministic, Nondeterministic};
 use ply_core::host::{Pending, err_host_in_search, err_host_in_simulation};
 use ply_core::{Diagnostic, Resource, codes};
 use ply_host::jobs::{self, Failure, Job, Work};
-use ply_host::native::{found, parts, parts_of, told};
+use ply_host::native::{found, parts, parts_of, text_or_error};
 use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
@@ -109,7 +109,7 @@ pub fn natives() -> Vec<MachineNative> {
     natives
 }
 
-impl Ctx {
+impl Context {
     fn check_host_allowed(&mut self, native: &'static str, determinism: Determinism) -> bool {
         let operation = format!("the native `{native}`");
         let span = self.site();
@@ -132,7 +132,7 @@ impl Ctx {
         work: Work,
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
-        self.refusing(native, what, work, move || job().map_err(Failure::Said))
+        self.queued_fallible(native, what, work, move || job().map_err(Failure::Message))
     }
 
     fn queued(
@@ -143,11 +143,11 @@ impl Ctx {
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
         self.ticketed(native, what, work, false, move || {
-            job().map_err(Failure::Said)
+            job().map_err(Failure::Message)
         })
     }
 
-    fn refusing(
+    fn queued_fallible(
         &mut self,
         native: &'static str,
         what: &'static str,
@@ -172,7 +172,7 @@ impl Ctx {
             if here {
                 Ok(jobs::done_here(run, span, native, what, job))
             } else {
-                jobs::refusing(work, run, span, native, what, job)
+                jobs::queue_fallible(work, run, span, native, what, job)
             }
         });
         match submitted {
@@ -201,14 +201,14 @@ impl Ctx {
     }
 }
 
-fn asked<R>(
-    ctx: *mut Ctx,
+fn if_host_allowed<R>(
+    context: *mut Context,
     native: &'static str,
     determinism: Determinism,
     rejected: R,
-    result: impl FnOnce(&mut Ctx) -> R,
+    result: impl FnOnce(&mut Context) -> R,
 ) -> R {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     if c.check_host_allowed(native, determinism) {
         result(c)
     } else {
@@ -217,14 +217,14 @@ fn asked<R>(
 }
 
 fn granted<R>(
-    ctx: *mut Ctx,
+    context: *mut Context,
     family: &'static str,
     native: &'static str,
     determinism: Determinism,
     rejected: R,
-    result: impl FnOnce(&mut Ctx) -> R,
+    result: impl FnOnce(&mut Context) -> R,
 ) -> R {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     if !c.binding.grants().allows(family) {
         c.fail(
             Diagnostic::error(
@@ -237,10 +237,10 @@ fn granted<R>(
         );
         return rejected;
     }
-    asked(ctx, native, determinism, rejected, result)
+    if_host_allowed(context, native, determinism, rejected, result)
 }
 
-fn with_host_facilities<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
+fn with_host_facilities<R>(c: &mut Context, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
     let runtime = c.host_runtime();
     match ply_host::registry::facilities_of(&*runtime) {
         Some(facilities) => Some(read(facilities)),
@@ -254,7 +254,7 @@ fn with_host_facilities<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> 
     }
 }
 
-fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T> {
+fn required_argument<T>(c: &mut Context, native: &str, what: &str, read: Option<T>) -> Option<T> {
     if read.is_none() {
         c.fail(Diagnostic::error(
             codes::INTERNAL_ERROR,
@@ -264,7 +264,7 @@ fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T
     read
 }
 
-fn given(c: &mut Ctx, result: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
+fn given(c: &mut Context, result: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
     match result {
         Ok(bytes) => c.given(bytes),
         Err(d) => {
@@ -275,7 +275,7 @@ fn given(c: &mut Ctx, result: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
 }
 
 fn waited(
-    c: &mut Ctx,
+    c: &mut Context,
     native: &'static str,
     what: &'static str,
     job: Result<Job, Diagnostic>,
@@ -289,11 +289,11 @@ fn waited(
     }
 }
 
-fn text_at(c: &mut Ctx, p: Addr, n: I64) -> Option<String> {
+fn text_at(c: &mut Context, p: Address, n: I64) -> Option<String> {
     c.text(unsafe { borrowed(p, n) }).map(str::to_string)
 }
 
-fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
+fn texts_at(c: &mut Context, p: Address, n: I64) -> Option<Vec<String>> {
     let read = parts_of(unsafe { borrowed(p, n) }).and_then(|texts| {
         texts
             .into_iter()
@@ -309,16 +309,16 @@ fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
     read
 }
 
-fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
+fn done(c: &mut Context, done: Result<(), Diagnostic>) {
     if let Err(d) = done {
         c.fail(d);
     }
 }
 
-pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_job_wait(context: *mut Context, ticket: I64) -> TakenBytes {
+    let c = unsafe { &mut *context };
     match crate::tasks::waited(c, crate::tasks::REQUEST_JOB_RESULT, ticket.0) {
-        Some(true) => crate::tasks::take_ticket_bytes(ctx, ticket),
+        Some(true) => crate::tasks::take_ticket_bytes(context, ticket),
         Some(false) => TakenBytes(0),
         None => {
             let pending = Pending {
@@ -338,15 +338,15 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
 }
 
 pub unsafe extern "C" fn rt_observed(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    path_at: Addr,
+    path_at: Address,
     path_n: I64,
     kind: I64,
 ) {
     use ply_host::observe::Read;
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(recorder) = ply_host::observe::of(&*c.host_runtime()) else {
         return;
     };
@@ -366,7 +366,7 @@ pub unsafe extern "C" fn rt_observed(
         6 => return recorder.ran_program(),
         7 | 8 => return recorder.reached(path, kind.0 == 7),
         _ => {
-            handed(c, "observed", "a kind of read", None::<()>);
+            required_argument(c, "observed", "a kind of read", None::<()>);
             return;
         }
     };
@@ -383,26 +383,32 @@ pub unsafe extern "C" fn rt_observed(
     }
 }
 
-pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "certgen_issue", Nondeterministic, TakenBytes(0), |c| {
-        let said = match ply_host::certgen::issue(&[]) {
-            Ok(issued) => [
-                &[1u8][..],
-                &parts(&[
-                    issued.certificate.as_bytes(),
-                    issued.key.as_bytes(),
-                    &issued.der,
-                    issued.fingerprint.as_bytes(),
-                ]),
-            ]
-            .concat(),
-            Err(reason) => [&[0u8][..], reason.as_bytes()].concat(),
-        };
-        c.given(said)
-    })
+pub unsafe extern "C" fn rt_certgen_issue(context: *mut Context) -> TakenBytes {
+    if_host_allowed(
+        context,
+        "certgen_issue",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| {
+            let said = match ply_host::certgen::issue(&[]) {
+                Ok(issued) => [
+                    &[1u8][..],
+                    &parts(&[
+                        issued.certificate.as_bytes(),
+                        issued.key.as_bytes(),
+                        &issued.der,
+                        issued.fingerprint.as_bytes(),
+                    ]),
+                ]
+                .concat(),
+                Err(reason) => [&[0u8][..], reason.as_bytes()].concat(),
+            };
+            c.given(said)
+        },
+    )
 }
 
-fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
+fn configured(c: &mut Context, key: &str, secret: bool) -> Option<String> {
     let runtime = c.host_runtime();
     let value = ply_host::registry::facilities_of(&*runtime).and_then(|facilities| {
         let config = facilities.configuration();
@@ -423,28 +429,44 @@ fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
     value
 }
 
-pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    asked(ctx, "config_get", Nondeterministic, TakenBytes(0), |c| {
-        let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
-            return TakenBytes(0);
-        };
-        let value = configured(c, key, false);
-        c.given(found(value))
-    })
+pub unsafe extern "C" fn rt_config_get(context: *mut Context, p: Address, n: I64) -> TakenBytes {
+    if_host_allowed(
+        context,
+        "config_get",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| {
+            let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
+                return TakenBytes(0);
+            };
+            let value = configured(c, key, false);
+            c.given(found(value))
+        },
+    )
 }
 
-pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    asked(ctx, "config_secret_held", Nondeterministic, I64(0), |c| {
-        let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
-            return I64(0);
-        };
-        I64(i64::from(configured(c, key, true).is_some()))
-    })
+pub unsafe extern "C" fn rt_config_secret_held(context: *mut Context, p: Address, n: I64) -> I64 {
+    if_host_allowed(
+        context,
+        "config_secret_held",
+        Nondeterministic,
+        I64(0),
+        |c| {
+            let Some(key) = c.text(unsafe { borrowed(p, n) }) else {
+                return I64(0);
+            };
+            I64(i64::from(configured(c, key, true).is_some()))
+        },
+    )
 }
 
-pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> SecretHandle {
-    asked(
-        ctx,
+pub unsafe extern "C" fn rt_config_secret(
+    context: *mut Context,
+    p: Address,
+    n: I64,
+) -> SecretHandle {
+    if_host_allowed(
+        context,
         "config_secret",
         Nondeterministic,
         SecretHandle::of(0),
@@ -460,23 +482,25 @@ pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> Sec
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_kdf_argon2(
-    ctx: *mut Ctx,
-    variant_at: Addr,
+    context: *mut Context,
+    variant_at: Address,
     variant_len: I64,
     password: SecretHandle,
-    salt_at: Addr,
+    salt_at: Address,
     salt_len: I64,
     key: SecretHandle,
-    data_at: Addr,
+    data_at: Address,
     data_len: I64,
     memory: I64,
     passes: I64,
     lanes: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_argon2", Deterministic, I64(0), |c| {
-        let (Some(password), Some(key)) = (secret::held(c, &password), secret::held(c, &key))
-        else {
+    if_host_allowed(context, "kdf_argon2", Deterministic, I64(0), |c| {
+        let (Some(password), Some(key)) = (
+            secret::sealed_value(c, &password),
+            secret::sealed_value(c, &key),
+        ) else {
             return I64(0);
         };
         let Some(variant) = c.text(unsafe { borrowed(variant_at, variant_len) }) else {
@@ -499,17 +523,17 @@ pub unsafe extern "C" fn rt_kdf_argon2(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_kdf_scrypt(
-    ctx: *mut Ctx,
+    context: *mut Context,
     password: SecretHandle,
-    salt_at: Addr,
+    salt_at: Address,
     salt_len: I64,
     log_n: I64,
     r: I64,
     p: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_scrypt", Deterministic, I64(0), |c| {
-        let Some(password) = secret::held(c, &password) else {
+    if_host_allowed(context, "kdf_scrypt", Deterministic, I64(0), |c| {
+        let Some(password) = secret::sealed_value(c, &password) else {
             return I64(0);
         };
         let work = password::Work::scrypt(
@@ -525,14 +549,14 @@ pub unsafe extern "C" fn rt_kdf_scrypt(
 }
 
 pub unsafe extern "C" fn rt_kdf_bcrypt(
-    ctx: *mut Ctx,
+    context: *mut Context,
     password: SecretHandle,
-    salt_at: Addr,
+    salt_at: Address,
     salt_len: I64,
     cost: I64,
 ) -> I64 {
-    asked(ctx, "kdf_bcrypt", Deterministic, I64(0), |c| {
-        let Some(password) = secret::held(c, &password) else {
+    if_host_allowed(context, "kdf_bcrypt", Deterministic, I64(0), |c| {
+        let Some(password) = secret::sealed_value(c, &password) else {
             return I64(0);
         };
         let work = password::Work::bcrypt(
@@ -546,17 +570,17 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_kdf_pbkdf2(
-    ctx: *mut Ctx,
-    hash_at: Addr,
+    context: *mut Context,
+    hash_at: Address,
     hash_len: I64,
     password: SecretHandle,
-    salt_at: Addr,
+    salt_at: Address,
     salt_len: I64,
     iterations: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_pbkdf2", Deterministic, I64(0), |c| {
-        let Some(password) = secret::held(c, &password) else {
+    if_host_allowed(context, "kdf_pbkdf2", Deterministic, I64(0), |c| {
+        let Some(password) = secret::sealed_value(c, &password) else {
             return I64(0);
         };
         let Some(hash) = c.text(unsafe { borrowed(hash_at, hash_len) }) else {
@@ -573,68 +597,84 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
     })
 }
 
-pub unsafe extern "C" fn rt_os_system(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_system", Nondeterministic, TakenBytes(0), |c| {
+pub unsafe extern "C" fn rt_os_system(context: *mut Context) -> TakenBytes {
+    if_host_allowed(context, "os_system", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::OS.as_bytes().to_vec())
     })
 }
 
-pub unsafe extern "C" fn rt_os_machine(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_machine", Nondeterministic, TakenBytes(0), |c| {
-        c.given(std::env::consts::ARCH.as_bytes().to_vec())
+pub unsafe extern "C" fn rt_os_machine(context: *mut Context) -> TakenBytes {
+    if_host_allowed(
+        context,
+        "os_machine",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| c.given(std::env::consts::ARCH.as_bytes().to_vec()),
+    )
+}
+
+pub unsafe extern "C" fn rt_os_uname(context: *mut Context) -> TakenBytes {
+    if_host_allowed(context, "os_uname", Nondeterministic, TakenBytes(0), |c| {
+        c.given(text_or_error(ply_host::os::name()))
     })
 }
 
-pub unsafe extern "C" fn rt_os_uname(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_uname", Nondeterministic, TakenBytes(0), |c| {
-        c.given(told(ply_host::os::name()))
-    })
+pub unsafe extern "C" fn rt_os_hostname(context: *mut Context) -> TakenBytes {
+    if_host_allowed(
+        context,
+        "os_hostname",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| c.given(text_or_error(ply_host::os::hostname())),
+    )
 }
 
-pub unsafe extern "C" fn rt_os_hostname(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_hostname", Nondeterministic, TakenBytes(0), |c| {
-        c.given(told(ply_host::os::hostname()))
-    })
-}
-
-pub unsafe extern "C" fn rt_os_cpus(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_cpus", Nondeterministic, I64(0), |_| {
+pub unsafe extern "C" fn rt_os_cpus(context: *mut Context) -> I64 {
+    if_host_allowed(context, "os_cpus", Nondeterministic, I64(0), |_| {
         I64(ply_host::os::cpus())
     })
 }
 
-pub unsafe extern "C" fn rt_os_uid(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_uid", Nondeterministic, I64(0), |_| {
+pub unsafe extern "C" fn rt_os_uid(context: *mut Context) -> I64 {
+    if_host_allowed(context, "os_uid", Nondeterministic, I64(0), |_| {
         I64(ply_host::os::uid())
     })
 }
 
-pub unsafe extern "C" fn rt_os_user_name(ctx: *mut Ctx, id: I64) -> TakenBytes {
-    asked(ctx, "os_user_name", Nondeterministic, TakenBytes(0), |c| {
-        c.given(found(ply_host::os::user_name(id.0)))
-    })
+pub unsafe extern "C" fn rt_os_user_name(context: *mut Context, id: I64) -> TakenBytes {
+    if_host_allowed(
+        context,
+        "os_user_name",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| c.given(found(ply_host::os::user_name(id.0))),
+    )
 }
 
-pub unsafe extern "C" fn rt_os_pid(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_pid", Nondeterministic, I64(0), |_| {
+pub unsafe extern "C" fn rt_os_pid(context: *mut Context) -> I64 {
+    if_host_allowed(context, "os_pid", Nondeterministic, I64(0), |_| {
         I64(i64::from(std::process::id()))
     })
 }
 
-pub unsafe extern "C" fn rt_os_executable(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_executable", Nondeterministic, TakenBytes(0), |c| {
-        c.given(found(ply_host::os::executable()))
-    })
+pub unsafe extern "C" fn rt_os_executable(context: *mut Context) -> TakenBytes {
+    if_host_allowed(
+        context,
+        "os_executable",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| c.given(found(ply_host::os::executable())),
+    )
 }
 
-pub unsafe extern "C" fn rt_os_big_endian(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_big_endian", Nondeterministic, I64(0), |_| {
+pub unsafe extern "C" fn rt_os_big_endian(context: *mut Context) -> I64 {
+    if_host_allowed(context, "os_big_endian", Nondeterministic, I64(0), |_| {
         I64(i64::from(cfg!(target_endian = "big")))
     })
 }
 
-pub unsafe extern "C" fn rt_os_pointer_bits(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_pointer_bits", Nondeterministic, I64(0), |_| {
+pub unsafe extern "C" fn rt_os_pointer_bits(context: *mut Context) -> I64 {
+    if_host_allowed(context, "os_pointer_bits", Nondeterministic, I64(0), |_| {
         I64(i64::from(usize::BITS))
     })
 }

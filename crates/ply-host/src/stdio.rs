@@ -13,7 +13,7 @@ const OUT: i32 = libc::STDOUT_FILENO;
 const ERR: i32 = libc::STDERR_FILENO;
 
 static OUTPUT_BUFFER: Mutex<Output> = Mutex::new(Output {
-    held: Vec::new(),
+    pending: Vec::new(),
     gone: false,
     untold: false,
 });
@@ -33,7 +33,7 @@ pub fn reader_gone(e: &Error) -> bool {
 }
 
 struct Output {
-    held: Vec<u8>,
+    pending: Vec<u8>,
     gone: bool,
     untold: bool,
 }
@@ -43,15 +43,15 @@ impl Output {
         if self.gone {
             return Err(ErrorKind::BrokenPipe.into());
         }
-        let wrote = write_all(OUT, &self.held);
-        self.held.clear();
+        let wrote = write_all(OUT, &self.pending);
+        self.pending.clear();
         if wrote.as_ref().is_err_and(reader_gone) {
             self.gone = true;
         }
         wrote
     }
 
-    fn told(&mut self, wrote: Result<()>) -> Result<()> {
+    fn record_write_result(&mut self, wrote: Result<()>) -> Result<()> {
         if wrote.is_err() {
             self.untold = false;
         }
@@ -62,25 +62,25 @@ impl Output {
 pub fn write_out(bytes: &[u8]) -> Result<()> {
     let mut out = lock(&OUTPUT_BUFFER);
     if !out.gone {
-        out.held.extend_from_slice(bytes);
+        out.pending.extend_from_slice(bytes);
     }
-    let wrote = if out.gone || out.held.len() >= OUT_BUFFER_BYTES {
+    let wrote = if out.gone || out.pending.len() >= OUT_BUFFER_BYTES {
         out.written()
     } else {
         Ok(())
     };
-    out.told(wrote)
+    out.record_write_result(wrote)
 }
 
 pub fn flush_out() -> Result<()> {
     let mut out = lock(&OUTPUT_BUFFER);
     let wrote = out.written();
-    out.told(wrote)
+    out.record_write_result(wrote)
 }
 
 pub fn make_way() {
     let mut out = lock(&OUTPUT_BUFFER);
-    if !out.gone && !out.held.is_empty() && out.written().is_err_and(|e| reader_gone(&e)) {
+    if !out.gone && !out.pending.is_empty() && out.written().is_err_and(|e| reader_gone(&e)) {
         out.untold = true;
     }
 }
@@ -300,7 +300,7 @@ pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
     Ok(Some(std::mem::replace(&mut terminal.mode, mode)))
 }
 
-pub fn settle() -> bool {
+pub fn flush_output() -> bool {
     make_way();
     let untold = std::mem::take(&mut lock(&OUTPUT_BUFFER).untold);
     restore_terminal();

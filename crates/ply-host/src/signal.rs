@@ -39,20 +39,20 @@ impl ShutdownSignal {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Asked {
+pub enum WatchedSignal {
     Hangup,
     User1,
     User2,
     WindowChange,
 }
 
-impl Asked {
+impl WatchedSignal {
     pub fn name(self) -> &'static str {
         match self {
-            Asked::Hangup => "HUP",
-            Asked::User1 => "USR1",
-            Asked::User2 => "USR2",
-            Asked::WindowChange => "WINCH",
+            WatchedSignal::Hangup => "HUP",
+            WatchedSignal::User1 => "USR1",
+            WatchedSignal::User2 => "USR2",
+            WatchedSignal::WindowChange => "WINCH",
         }
     }
 }
@@ -114,7 +114,7 @@ pub struct Shutdown {
 static WATCHES: std::sync::LazyLock<[Watch; 4]> = std::sync::LazyLock::new(Default::default);
 
 impl Shutdown {
-    pub fn arrived(&self, which: Asked) -> std::io::Result<bool> {
+    pub fn arrived(&self, which: WatchedSignal) -> std::io::Result<bool> {
         let watch = &WATCHES[which as usize];
         let mut installed = lock(&watch.installed);
         if !*installed {
@@ -378,7 +378,7 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
 }
 
 #[cfg(unix)]
-fn watch_for(which: Asked, arrived: Arc<AtomicBool>) -> std::io::Result<()> {
+fn watch_for(which: WatchedSignal, arrived: Arc<AtomicBool>) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let (installed, told) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -396,10 +396,10 @@ fn watch_for(which: Asked, arrived: Arc<AtomicBool>) -> std::io::Result<()> {
             };
             runtime.block_on(async move {
                 let kind = match which {
-                    Asked::Hangup => SignalKind::hangup(),
-                    Asked::User1 => SignalKind::user_defined1(),
-                    Asked::User2 => SignalKind::user_defined2(),
-                    Asked::WindowChange => SignalKind::window_change(),
+                    WatchedSignal::Hangup => SignalKind::hangup(),
+                    WatchedSignal::User1 => SignalKind::user_defined1(),
+                    WatchedSignal::User2 => SignalKind::user_defined2(),
+                    WatchedSignal::WindowChange => SignalKind::window_change(),
                 };
                 let mut stream = match signal(kind) {
                     Ok(stream) => stream,
@@ -422,7 +422,7 @@ fn watch_for(which: Asked, arrived: Arc<AtomicBool>) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn watch_for(which: Asked, _: Arc<AtomicBool>) -> std::io::Result<()> {
+fn watch_for(which: WatchedSignal, _: Arc<AtomicBool>) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!("this platform has no SIG{}", which.name()),
@@ -440,7 +440,7 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
         );
     }
     shutdown.end_children();
-    crate::stdio::settle();
+    crate::stdio::flush_output();
     crate::observe::report_at_exit();
     std::process::exit(which.exit_code());
 }
@@ -448,7 +448,7 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
 #[cold]
 pub fn err_signal_watch_failed(
     what: &str,
-    which: Asked,
+    which: WatchedSignal,
     e: &std::io::Error,
     span: Span,
 ) -> Diagnostic {

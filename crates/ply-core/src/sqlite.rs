@@ -384,14 +384,14 @@ impl Engine {
             return;
         }
         self.guard.take_rejection_reason();
-        let mut stmt = match self.conn.prepare_cached(sql) {
-            Ok(stmt) => stmt,
+        let mut statement = match self.conn.prepare_cached(sql) {
+            Ok(statement) => statement,
             Err(e) => {
                 pager(Reply::failed(self.failure_of(e)));
                 return;
             }
         };
-        let wrote = !stmt.readonly();
+        let wrote = !statement.readonly();
         let bound = (|| {
             if reads_only && wrote {
                 return Err(Failure::new(
@@ -407,15 +407,16 @@ impl Engine {
                     "this statement writes, and the connection was opened to read",
                 ));
             }
-            if stmt.parameter_count() != params.len() {
+            if statement.parameter_count() != params.len() {
                 return Err(Failure::rejected(format!(
                     "the statement has {} placeholder(s) and was given {} parameter(s)",
-                    stmt.parameter_count(),
+                    statement.parameter_count(),
                     params.len()
                 )));
             }
             for (i, param) in params.iter().enumerate() {
-                stmt.raw_bind_parameter(i + 1, param)
+                statement
+                    .raw_bind_parameter(i + 1, param)
                     .map_err(|e| self.failure_of(e))?;
             }
             Ok(())
@@ -424,7 +425,7 @@ impl Engine {
             pager(Reply::failed(failure));
             return;
         }
-        let columns: Vec<String> = stmt
+        let columns: Vec<String> = statement
             .column_names()
             .into_iter()
             .map(str::to_string)
@@ -441,11 +442,11 @@ impl Engine {
             wrote,
             ..Reply::default()
         }) else {
-            drop(stmt);
+            drop(statement);
             self.close_savepoint(guarded, false);
             return;
         };
-        stmt.reset_status(StatementStatus::VmStep);
+        statement.reset_status(StatementStatus::VmStep);
         self.guard.steps.store(limits.steps, Ordering::Relaxed);
         self.guard.spent.store(false, Ordering::Relaxed);
         self.guard
@@ -453,8 +454,8 @@ impl Engine {
             .store(false, Ordering::Relaxed);
         unsafe { ffi::sqlite3_set_last_insert_rowid(self.conn.handle(), 0) };
         let changes_before = self.conn.total_changes();
-        let width = stmt.column_count();
-        let mut rows = stmt.raw_query();
+        let width = statement.column_count();
+        let mut rows = statement.raw_query();
         let mut seen = 0i64;
         let last = loop {
             let mut page = Vec::new();
@@ -495,14 +496,14 @@ impl Engine {
                 Some(next) => ask = next,
                 None => {
                     drop(rows);
-                    drop(stmt);
+                    drop(statement);
                     self.close_savepoint(guarded, false);
                     return;
                 }
             }
         };
         drop(rows);
-        drop(stmt);
+        drop(statement);
         let mut reply = Reply {
             wrote,
             ended: true,
@@ -627,11 +628,11 @@ impl Engine {
             return None;
         }
         let loose: rusqlite::Result<Option<String>> = self.internal(|conn| {
-            let mut stmt = conn.prepare(
+            let mut statement = conn.prepare(
                 "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' \
                  AND strict = 0 AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1",
             )?;
-            let mut rows = stmt.query([])?;
+            let mut rows = statement.query([])?;
             match rows.next()? {
                 Some(row) => row.get(0).map(Some),
                 None => Ok(None),
@@ -690,17 +691,20 @@ impl Engine {
                 Failure::rejected("the statement's text holds a NUL byte")
             }
             rusqlite::Error::SqlInputError {
-                error, msg, offset, ..
+                error,
+                msg: message,
+                offset,
+                ..
             } => {
                 let at = if offset >= 0 {
                     format!(" at byte {offset}")
                 } else {
                     String::new()
                 };
-                failure_from_sqlite_code(error, format!("{msg}{at}"), spent)
+                failure_from_sqlite_code(error, format!("{message}{at}"), spent)
             }
-            rusqlite::Error::SqliteFailure(error, msg) => {
-                failure_from_sqlite_code(error, msg.unwrap_or_default(), spent)
+            rusqlite::Error::SqliteFailure(error, message) => {
+                failure_from_sqlite_code(error, message.unwrap_or_default(), spent)
             }
             other => Failure::new("engine", "", other.to_string()),
         }
@@ -719,16 +723,16 @@ fn aborted(depth: u32) -> Failure {
 
 pub fn unopened(e: rusqlite::Error) -> Failure {
     let detail = match &e {
-        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.clone(),
+        rusqlite::Error::SqliteFailure(_, Some(message)) => message.clone(),
         other => other.to_string(),
     };
     Failure::new("unopened", "", detail)
 }
 
-fn failure_from_sqlite_code(error: ffi::Error, msg: String, spent: bool) -> Failure {
+fn failure_from_sqlite_code(error: ffi::Error, message: String, spent: bool) -> Failure {
     let extended = error.extended_code;
     match extended & 0xff {
-        ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED => Failure::new("busy", "", msg),
+        ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED => Failure::new("busy", "", message),
         ffi::SQLITE_CONSTRAINT => {
             let kind = match extended {
                 ffi::SQLITE_CONSTRAINT_UNIQUE
@@ -740,22 +744,22 @@ fn failure_from_sqlite_code(error: ffi::Error, msg: String, spent: bool) -> Fail
                 ffi::SQLITE_CONSTRAINT_DATATYPE => "datatype",
                 _ => "constraint",
             };
-            Failure::new(kind, constraint_named(&msg), msg)
+            Failure::new(kind, constraint_named(&message), message)
         }
         ffi::SQLITE_INTERRUPT if spent => Failure::new(
             "steps",
             "",
             "the statement ran past the steps its caller allowed",
         ),
-        ffi::SQLITE_AUTH => Failure::rejected(msg),
-        ffi::SQLITE_READONLY => Failure::new("read_only", "", msg),
-        ffi::SQLITE_TOOBIG => Failure::new("too_large", "value", msg),
-        ffi::SQLITE_ERROR => match msg.strip_prefix(REJECTED) {
+        ffi::SQLITE_AUTH => Failure::rejected(message),
+        ffi::SQLITE_READONLY => Failure::new("read_only", "", message),
+        ffi::SQLITE_TOOBIG => Failure::new("too_large", "value", message),
+        ffi::SQLITE_ERROR => match message.strip_prefix(REJECTED) {
             Some(reason) => Failure::rejected(reason),
-            None => Failure::new("statement", "", msg),
+            None => Failure::new("statement", "", message),
         },
-        ffi::SQLITE_RANGE | ffi::SQLITE_MISMATCH => Failure::new("statement", "", msg),
-        code => Failure::new("engine", code_name(code), msg),
+        ffi::SQLITE_RANGE | ffi::SQLITE_MISMATCH => Failure::new("statement", "", message),
+        code => Failure::new("engine", code_name(code), message),
     }
 }
 
@@ -774,9 +778,10 @@ fn code_name(code: i32) -> String {
     }
 }
 
-fn constraint_named(msg: &str) -> String {
-    msg.split_once("failed: ")
-        .or_else(|| msg.split_once(" column "))
+fn constraint_named(message: &str) -> String {
+    message
+        .split_once("failed: ")
+        .or_else(|| message.split_once(" column "))
         .map(|(_, name)| name.to_string())
         .unwrap_or_default()
 }
@@ -858,15 +863,15 @@ fn configure(
             FunctionFlags::SQLITE_UTF8
                 | FunctionFlags::SQLITE_DETERMINISTIC
                 | FunctionFlags::SQLITE_INNOCUOUS,
-            move |ctx| clocked(name, ctx),
+            move |context| clocked(name, context),
         )?;
     }
     let authorizing = Arc::clone(guard);
-    conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
         if authorizing.internal.load(Ordering::Relaxed) {
             return Authorization::Allow;
         }
-        match rejection(ctx.action) {
+        match rejection(context.action) {
             Some(reason) => authorizing.refuse(reason),
             None => Authorization::Allow,
         }
@@ -957,20 +962,20 @@ thread_local! {
     static EMPTY_DATE_FUNCTION_CONNECTION: Option<Connection> = Connection::open_in_memory().ok();
 }
 
-fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::types::Value> {
+fn clocked(name: &'static str, context: &Context<'_>) -> rusqlite::Result<rusqlite::types::Value> {
     let times = match name {
         "strftime" => 1..2,
         "timediff" => 0..2,
         _ => 0..1,
     };
     let refuse = |reason: String| Err(rusqlite::Error::UserFunctionError(reason.into()));
-    if ctx.len() < times.end {
+    if context.len() < times.end {
         return refuse(format!(
             "{REJECTED}`{name}` with no time reads the clock: bind the time as a parameter"
         ));
     }
-    let args: Vec<Scalar> = (0..ctx.len())
-        .map(|i| match ctx.get_raw(i) {
+    let args: Vec<Scalar> = (0..context.len())
+        .map(|i| match context.get_raw(i) {
             ValueRef::Null => Scalar::Null,
             ValueRef::Integer(n) => Scalar::Int(n),
             ValueRef::Real(x) => Scalar::Real(x),
@@ -998,8 +1003,8 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
             return refuse(format!("{REJECTED}`{name}` could not be evaluated"));
         };
         let holes: Vec<String> = (1..=args.len()).map(|i| format!("?{i}")).collect();
-        let mut stmt = conn.prepare_cached(&format!("SELECT {name}({})", holes.join(", ")))?;
-        stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))
+        let mut statement = conn.prepare_cached(&format!("SELECT {name}({})", holes.join(", ")))?;
+        statement.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))
     })
 }
 

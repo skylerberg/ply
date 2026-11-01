@@ -84,7 +84,7 @@ impl IntegerType {
         }
     }
 
-    pub fn holds(self, v: i128) -> bool {
+    pub fn contains(self, v: i128) -> bool {
         v >= self.min() && (v < 0 || v as u128 <= self.max())
     }
 

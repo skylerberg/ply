@@ -34,7 +34,7 @@ fn a_task_handle_returned_directly_from_an_entry_point_is_rejected_with_a_messag
         handle: Handle::Task,
         route: Vec::new(),
     };
-    assert_eq!(escapee.reached(), "");
+    assert_eq!(escapee.route_text(), "");
     let d = rejected(
         &Boundary::ReturnedFromEntry { name: "m.spawned" },
         &escapee,

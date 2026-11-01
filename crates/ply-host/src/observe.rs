@@ -177,7 +177,7 @@ impl Recorder {
     }
 
     pub fn configured(&self, key: &str, value: Option<&str>) {
-        settle(
+        record_digest(
             &mut self.observed().config,
             key.to_string(),
             configured_digest(value),
@@ -228,7 +228,7 @@ impl Recorder {
                 reads.viewed += 1;
             }
             for (line, digest) in lines {
-                settle(&mut o.viewed, line, digest);
+                record_digest(&mut o.viewed, line, digest);
             }
         }
     }
@@ -267,17 +267,17 @@ fn merge(into: &mut Observations, from: &Observations) {
         into.viewed += reads.viewed;
     }
     for (line, digest) in &from.viewed {
-        settle(&mut into.viewed, line.clone(), digest.clone());
+        record_digest(&mut into.viewed, line.clone(), digest.clone());
     }
     into.program |= from.program;
     for (line, digest) in &from.digested {
-        settle(&mut into.digested, line.clone(), digest.clone());
+        record_digest(&mut into.digested, line.clone(), digest.clone());
     }
     into.children.extend(from.children.iter().cloned());
     into.opaque.extend(from.opaque.iter().cloned());
 }
 
-fn settle(lines: &mut BTreeMap<String, String>, line: String, digest: String) {
+fn record_digest(lines: &mut BTreeMap<String, String>, line: String, digest: String) {
     lines
         .entry(line)
         .and_modify(|held| {
@@ -298,14 +298,14 @@ fn digested(o: &Observations, binary: &Binary<'_>) -> BTreeMap<String, String> {
     for (name, reads) in &o.shipped {
         if reads.read > reads.viewed {
             let digest = (binary.shipped)(name).unwrap_or_else(|| "none".to_string());
-            settle(&mut lines, format!("shipped\t{name}"), digest);
+            record_digest(&mut lines, format!("shipped\t{name}"), digest);
         }
     }
     for (line, digest) in &o.viewed {
-        settle(&mut lines, line.clone(), digest.clone());
+        record_digest(&mut lines, line.clone(), digest.clone());
     }
     if o.program {
-        settle(&mut lines, "program".to_string(), binary.program.clone());
+        record_digest(&mut lines, "program".to_string(), binary.program.clone());
     }
     lines
 }
@@ -353,15 +353,15 @@ fn merge_child_observations(o: &mut Observations) {
                 ["wrote", path] => {
                     o.writes.insert(PathBuf::from(path));
                 }
-                ["shipped", name, digest] => settle(
+                ["shipped", name, digest] => record_digest(
                     &mut o.digested,
                     format!("shipped\t{name}"),
                     digest.to_string(),
                 ),
                 ["program", digest] => {
-                    settle(&mut o.digested, "program".to_string(), digest.to_string())
+                    record_digest(&mut o.digested, "program".to_string(), digest.to_string())
                 }
-                [kind @ ("shipform" | "shipdef"), module, at, digest] => settle(
+                [kind @ ("shipform" | "shipdef"), module, at, digest] => record_digest(
                     &mut o.viewed,
                     format!("{kind}\t{module}\t{at}"),
                     digest.to_string(),

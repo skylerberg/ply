@@ -56,9 +56,9 @@ pub(crate) struct Page {
     pub(crate) fresh: *mut u8,
     pub(crate) end: *mut u8,
     pub(crate) owner: AtomicPtr<Returned>,
-    pub(crate) handing: AtomicU32,
+    pub(crate) remote_free_state: AtomicU32,
     pub(crate) next: *mut Page,
-    pub(crate) prev: *mut Page,
+    pub(crate) previous: *mut Page,
     pub(crate) block: u32,
     pub(crate) live: u32,
     pub(crate) class: u8,
@@ -68,7 +68,7 @@ pub(crate) struct Page {
 
 #[repr(C)]
 pub(crate) struct Segment {
-    held: usize,
+    retained_bytes: usize,
     pub(crate) pages: [Page; PAGES],
 }
 
@@ -130,12 +130,12 @@ unsafe fn owner(block: *mut u8, bytes: usize) -> &'static AtomicPtr<Returned> {
     }
 }
 
-unsafe fn handing(block: *mut u8, bytes: usize) -> &'static AtomicU32 {
+unsafe fn remote_free_state_of(block: *mut u8, bytes: usize) -> &'static AtomicU32 {
     unsafe {
         if bytes > SMALL {
             &*block.sub(LARGE_HEADER_BYTES - 8).cast()
         } else {
-            &(*page_of(block)).handing
+            &(*page_of(block)).remote_free_state
         }
     }
 }
@@ -152,10 +152,10 @@ fn large(bytes: usize) -> Layout {
 
 unsafe fn push(list: &mut *mut Page, page: *mut Page) {
     unsafe {
-        (*page).prev = null_mut();
+        (*page).previous = null_mut();
         (*page).next = *list;
         if !(*list).is_null() {
-            (**list).prev = page;
+            (**list).previous = page;
         }
         *list = page;
         (*page).listed = true;
@@ -168,10 +168,10 @@ unsafe fn push_after_head(list: &mut *mut Page, page: *mut Page) {
         return unsafe { push(list, page) };
     }
     unsafe {
-        (*page).prev = head;
+        (*page).previous = head;
         (*page).next = (*head).next;
         if !(*head).next.is_null() {
-            (*(*head).next).prev = page;
+            (*(*head).next).previous = page;
         }
         (*head).next = page;
         (*page).listed = true;
@@ -180,16 +180,16 @@ unsafe fn push_after_head(list: &mut *mut Page, page: *mut Page) {
 
 unsafe fn unlink(list: &mut *mut Page, page: *mut Page) {
     unsafe {
-        let (prev, next) = ((*page).prev, (*page).next);
-        if prev.is_null() {
+        let (previous, next) = ((*page).previous, (*page).next);
+        if previous.is_null() {
             *list = next;
         } else {
-            (*prev).next = next;
+            (*previous).next = next;
         }
         if !next.is_null() {
-            (*next).prev = prev;
+            (*next).previous = previous;
         }
-        (*page).prev = null_mut();
+        (*page).previous = null_mut();
         (*page).next = null_mut();
         (*page).listed = false;
     }
@@ -215,20 +215,20 @@ unsafe fn pop(page: *mut Page) -> *mut u8 {
 }
 
 pub unsafe fn free_block(block: *mut u8, bytes: usize) {
-    unsafe { Handing::begin(block, bytes).finish() }
+    unsafe { RemoteFree::begin(block, bytes).finish() }
 }
 
-pub struct Handing {
+pub struct RemoteFree {
     block: *mut u8,
     bytes: usize,
     heap: *const Returned,
 }
 
-impl Handing {
-    pub unsafe fn begin(block: *mut u8, bytes: usize) -> Handing {
+impl RemoteFree {
+    pub unsafe fn begin(block: *mut u8, bytes: usize) -> RemoteFree {
         unsafe {
-            handing(block, bytes).fetch_add(1, SeqCst);
-            Handing {
+            remote_free_state_of(block, bytes).fetch_add(1, SeqCst);
+            RemoteFree {
                 block,
                 bytes,
                 heap: owner(block, bytes).load(SeqCst),
@@ -258,9 +258,9 @@ impl Handing {
     }
 }
 
-impl Drop for Handing {
+impl Drop for RemoteFree {
     fn drop(&mut self) {
-        unsafe { handing(self.block, self.bytes).fetch_sub(1, Release) };
+        unsafe { remote_free_state_of(self.block, self.bytes).fetch_sub(1, Release) };
     }
 }
 
@@ -410,7 +410,7 @@ impl Blocks {
             (*page).block = size as u32;
             (*page).live = 0;
             (*page).class = class as u8;
-            (*segment_of(page)).held += 1;
+            (*segment_of(page)).retained_bytes += 1;
             page
         }
     }
@@ -456,8 +456,8 @@ impl Blocks {
             }
             self.recycle_empty_page(page);
             let segment = segment_of(page);
-            (*segment).held -= 1;
-            if (*segment).held > 0 || self.empty < 2 * PAGES {
+            (*segment).retained_bytes -= 1;
+            if (*segment).retained_bytes > 0 || self.empty < 2 * PAGES {
                 return;
             }
             for i in 0..PAGES {
@@ -493,7 +493,7 @@ impl Blocks {
         }
     }
 
-    pub fn holds(&self, address: usize) -> bool {
+    pub fn contains(&self, address: usize) -> bool {
         self.bytes_at(address).is_some()
     }
 
@@ -538,16 +538,16 @@ impl Blocks {
         }
     }
 
-    pub fn held(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         let pages: usize = self
             .segments
             .iter()
-            .map(|&address| unsafe { (*(address as *mut Segment)).held })
+            .map(|&address| unsafe { (*(address as *mut Segment)).retained_bytes })
             .sum();
         pages * PAGE + self.large.values().sum::<usize>()
     }
 
-    pub fn kept(&self) -> usize {
+    pub fn spare_bytes(&self) -> usize {
         self.spare_page_count * PAGE
     }
 
@@ -587,7 +587,7 @@ impl Blocks {
                         }
                     } else if (*page).block > 0 || (*page).spare {
                         if (*page).block > 0 {
-                            (*segment).held -= 1;
+                            (*segment).retained_bytes -= 1;
                         }
                         self.recycle_empty_page(page);
                     } else {
@@ -612,11 +612,11 @@ impl Blocks {
             for &address in &self.segments {
                 let segment = address as *mut Segment;
                 for i in 0..PAGES {
-                    waited(&(*segment).pages[i].handing);
+                    waited(&(*segment).pages[i].remote_free_state);
                 }
             }
             for (&address, &bytes) in &self.large {
-                waited(handing(address as *mut u8, bytes));
+                waited(remote_free_state_of(address as *mut u8, bytes));
             }
         }
     }

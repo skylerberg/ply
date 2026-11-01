@@ -1,6 +1,6 @@
 use super::*;
-use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
-use crate::native::{Addr, F64, I64, TakenBytes};
+use crate::emitted::{Block, Carried, Handle, OwnedWord, PlyType};
+use crate::native::{Address, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 use ply_core::{EscapedHandle, escape};
 
@@ -91,7 +91,7 @@ pub(crate) fn err_marshalling(reason: &str) -> Diagnostic {
     .note("this is Ply's fault, not the program's")
 }
 
-impl Ctx {
+impl Context {
     fn lowering(&mut self) -> Result<&mut Lowering, i64> {
         if !matches!(self.marshallings.last(), Some(Marshalling::Lowering(_))) {
             return Err(self.fail(err_marshalling("a value written with no lowering open")));
@@ -143,15 +143,15 @@ impl Ctx {
     }
 }
 
-pub(crate) unsafe fn borrowed<'a>(p: Addr, n: I64) -> &'a [u8] {
+pub(crate) unsafe fn borrowed<'a>(p: Address, n: I64) -> &'a [u8] {
     if n.0 <= 0 {
         return &[];
     }
     unsafe { std::slice::from_raw_parts(p.0, n.0 as usize) }
 }
 
-pub unsafe extern "C" fn rt_out_tag(ctx: *mut Ctx, t: I64) {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_out_tag(context: *mut Context, t: I64) {
+    let c = unsafe { &mut *context };
     match u8::try_from(t.0) {
         Ok(t @ (tag::UNIT | tag::FALSE | tag::TRUE)) => c.write(|l| l.w.tag(t)),
         _ => {
@@ -163,24 +163,24 @@ pub unsafe extern "C" fn rt_out_tag(ctx: *mut Ctx, t: I64) {
     }
 }
 
-pub unsafe extern "C" fn rt_out_int(ctx: *mut Ctx, v: I64) {
-    unsafe { &mut *ctx }.write(|l| l.w.int(v.0));
+pub unsafe extern "C" fn rt_out_int(context: *mut Context, v: I64) {
+    unsafe { &mut *context }.write(|l| l.w.int(v.0));
 }
 
-pub unsafe extern "C" fn rt_out_float(ctx: *mut Ctx, bits: F64) {
+pub unsafe extern "C" fn rt_out_float(context: *mut Context, bits: F64) {
     let canonical = ply_core::float::bits(f64::from_bits(bits.0));
-    unsafe { &mut *ctx }.write(|l| l.w.float(canonical));
+    unsafe { &mut *context }.write(|l| l.w.float(canonical));
 }
 
-pub unsafe extern "C" fn rt_out_decimal(ctx: *mut Ctx, lo: I64, hi: I64) {
+pub unsafe extern "C" fn rt_out_decimal(context: *mut Context, lo: I64, hi: I64) {
     let mut d = [0u8; 16];
     d[..8].copy_from_slice(&lo.0.to_le_bytes());
     d[8..].copy_from_slice(&hi.0.to_le_bytes());
-    unsafe { &mut *ctx }.write(|l| l.w.decimal(d));
+    unsafe { &mut *context }.write(|l| l.w.decimal(d));
 }
 
-pub unsafe extern "C" fn rt_out_fixed(ctx: *mut Ctx, width: I64, lo: I64, hi: I64) {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_out_fixed(context: *mut Context, width: I64, lo: I64, hi: I64) {
+    let c = unsafe { &mut *context };
     let Some(&ty) = usize::try_from(width.0)
         .ok()
         .and_then(|w| ply_core::INT_TYPES.get(w))
@@ -193,8 +193,8 @@ pub unsafe extern "C" fn rt_out_fixed(ctx: *mut Ctx, width: I64, lo: I64, hi: I6
     c.write(|l| l.w.fixed(ply_core::Fixed::new(ty, bits)));
 }
 
-pub unsafe extern "C" fn rt_out_char(ctx: *mut Ctx, c: I64) {
-    let cx = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_out_char(context: *mut Context, c: I64) {
+    let cx = unsafe { &mut *context };
     match u32::try_from(c.0).ok().and_then(char::from_u32) {
         Some(ch) => cx.write(|l| l.w.char(u32::from(ch))),
         None => {
@@ -203,24 +203,24 @@ pub unsafe extern "C" fn rt_out_char(ctx: *mut Ctx, c: I64) {
     }
 }
 
-pub unsafe extern "C" fn rt_out_str(ctx: *mut Ctx, p: Addr, n: I64) {
+pub unsafe extern "C" fn rt_out_str(context: *mut Context, p: Address, n: I64) {
     let s = unsafe { borrowed(p, n) };
-    unsafe { &mut *ctx }.write(|l| {
+    unsafe { &mut *context }.write(|l| {
         l.begin_shared_value();
         l.w.str(s);
     });
 }
 
-pub unsafe extern "C" fn rt_out_bytes(ctx: *mut Ctx, p: Addr, n: I64) {
+pub unsafe extern "C" fn rt_out_bytes(context: *mut Context, p: Address, n: I64) {
     let b = unsafe { borrowed(p, n) };
-    unsafe { &mut *ctx }.write(|l| {
+    unsafe { &mut *context }.write(|l| {
         l.begin_shared_value();
         l.w.bytes(b);
     });
 }
 
-pub unsafe extern "C" fn rt_out_count(ctx: *mut Ctx, t: I64, n: I64) {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_out_count(context: *mut Context, t: I64, n: I64) {
+    let c = unsafe { &mut *context };
     let (Ok(t @ (tag::LIST | tag::ARRAY | tag::MAP | tag::RECORD)), Ok(n)) =
         (u8::try_from(t.0), u64::try_from(n.0))
     else {
@@ -235,18 +235,18 @@ pub unsafe extern "C" fn rt_out_count(ctx: *mut Ctx, t: I64, n: I64) {
     });
 }
 
-pub unsafe extern "C" fn rt_out_ctor(ctx: *mut Ctx, name: Addr, len: I64, n: I64) {
+pub unsafe extern "C" fn rt_out_ctor(context: *mut Context, name: Address, len: I64, n: I64) {
     let name = unsafe { borrowed(name, len) };
-    unsafe { &mut *ctx }.write(|l| l.w.ctor(name, n.0.max(0) as u64));
+    unsafe { &mut *context }.write(|l| l.w.ctor(name, n.0.max(0) as u64));
 }
 
-pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
+pub unsafe extern "C" fn rt_out_name(context: *mut Context, p: Address, n: I64) {
     let name = unsafe { borrowed(p, n) };
-    unsafe { &mut *ctx }.write(|l| l.w.name(name));
+    unsafe { &mut *context }.write(|l| l.w.name(name));
 }
 
-pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_out_handle(context: *mut Context, h: Handle) {
+    let c = unsafe { &mut *context };
     let w = h.word();
     if c.showing() {
         let kind = if scoped_id(w).is_some() {
@@ -267,18 +267,18 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     c.write(Lowering::handle);
 }
 
-pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const PlyType) {
-    if unsafe { &*ctx }.showing() {
-        unsafe { ((*ty).lower)(ctx, w.word()) };
+pub unsafe extern "C" fn rt_out_carried(context: *mut Context, w: OwnedWord, ty: *const PlyType) {
+    if unsafe { &*context }.showing() {
+        unsafe { ((*ty).lower)(context, w.word()) };
         return;
     }
-    unsafe { &mut *ctx }.write(Lowering::handle);
+    unsafe { &mut *context }.write(Lowering::handle);
 }
 
-pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I64) {
+pub unsafe extern "C" fn rt_out_fun(context: *mut Context, f: OwnedWord, name: Address, len: I64) {
     let name = unsafe { borrowed(name, len) };
-    let leaves = !name.is_empty() || unsafe { Block::of(f.word()).share(ctx) };
-    unsafe { &mut *ctx }.write(|l| {
+    let leaves = !name.is_empty() || unsafe { Block::of(f.word()).share(context) };
+    unsafe { &mut *context }.write(|l| {
         if !leaves {
             l.resumes = true;
             l.w.fun(fun::RESUMPTION);
@@ -294,8 +294,8 @@ pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I
     });
 }
 
-pub unsafe extern "C" fn rt_out_again(ctx: *mut Ctx, w: Handed) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_out_again(context: *mut Context, w: OwnedWord) -> I64 {
+    let c = unsafe { &mut *context };
     let Ok(l) = c.lowering() else {
         return I64(0);
     };
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn rt_out_again(ctx: *mut Ctx, w: Handed) -> I64 {
         return I64(0);
     };
     let w = w.word();
-    if heap::is_object(w) && unsafe { heap::count_of(heap::obj(w)) } == heap::IMMORTAL {
+    if heap::is_object(w) && unsafe { heap::count_of(heap::object(w)) } == heap::IMMORTAL {
         s.next = None;
         return I64(0);
     }
@@ -319,8 +319,8 @@ pub unsafe extern "C" fn rt_out_again(ctx: *mut Ctx, w: Handed) -> I64 {
     }
 }
 
-pub unsafe extern "C" fn rt_in_tag(ctx: *mut Ctx) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| match l.r.byte()? {
+pub unsafe extern "C" fn rt_in_tag(context: *mut Context) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| match l.r.byte()? {
         t @ (tag::UNIT | tag::FALSE | tag::TRUE) => Ok(i64::from(t)),
         t => Err(format!(
             "a value tagged {t} where one that is its tag alone was read"
@@ -328,30 +328,30 @@ pub unsafe extern "C" fn rt_in_tag(ctx: *mut Ctx) -> I64 {
     }))
 }
 
-pub unsafe extern "C" fn rt_in_int(ctx: *mut Ctx) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_int(context: *mut Context) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| {
         l.r.expect(tag::INT)?;
         l.r.int()
     }))
 }
 
-pub unsafe extern "C" fn rt_in_float(ctx: *mut Ctx) -> F64 {
-    F64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_float(context: *mut Context) -> F64 {
+    F64(unsafe { &mut *context }.read(|l| {
         l.r.expect(tag::FLOAT)?;
         Ok(u64::from_le_bytes(l.r.array()?))
     }))
 }
 
-pub unsafe extern "C" fn rt_in_decimal(ctx: *mut Ctx) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_decimal(context: *mut Context) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| {
         l.r.expect(tag::DECIMAL)?;
         let d = u128::from_le_bytes(l.r.array()?);
         Ok(l.store_high_return_low(d))
     }))
 }
 
-pub unsafe extern "C" fn rt_in_fixed(ctx: *mut Ctx, width: I64) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_fixed(context: *mut Context, width: I64) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| {
         l.r.expect(tag::FIXED)?;
         let f = l.r.fixed()?;
         let at = ply_core::INT_TYPES.iter().position(|t| *t == f.ty);
@@ -362,23 +362,23 @@ pub unsafe extern "C" fn rt_in_fixed(ctx: *mut Ctx, width: I64) -> I64 {
     }))
 }
 
-pub unsafe extern "C" fn rt_in_high(ctx: *mut Ctx) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_high(context: *mut Context) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| {
         l.high
             .take()
             .ok_or_else(|| "a high word asked where no wide value was read".into())
     }))
 }
 
-pub unsafe extern "C" fn rt_in_char(ctx: *mut Ctx) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_char(context: *mut Context) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| {
         l.r.expect(tag::CHAR)?;
         Ok(i64::from(u32::from(l.r.char()?)))
     }))
 }
 
-pub unsafe extern "C" fn rt_in_str(ctx: *mut Ctx) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_in_str(context: *mut Context) -> I64 {
+    let c = unsafe { &mut *context };
     let s: Vec<u8> = c.read(|l| {
         l.r.expect(tag::STR)?;
         Ok(l.r.str()?.as_bytes().to_vec())
@@ -386,8 +386,8 @@ pub unsafe extern "C" fn rt_in_str(ctx: *mut Ctx) -> I64 {
     c.give(s)
 }
 
-pub unsafe extern "C" fn rt_in_bytes(ctx: *mut Ctx) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_in_bytes(context: *mut Context) -> I64 {
+    let c = unsafe { &mut *context };
     let b: Vec<u8> = c.read(|l| {
         l.r.expect(tag::BYTES)?;
         Ok(l.r.blob()?.to_vec())
@@ -395,8 +395,8 @@ pub unsafe extern "C" fn rt_in_bytes(ctx: *mut Ctx) -> I64 {
     c.give(b)
 }
 
-pub unsafe extern "C" fn rt_in_count(ctx: *mut Ctx, t: I64) -> I64 {
-    I64(unsafe { &mut *ctx }.read(|l| {
+pub unsafe extern "C" fn rt_in_count(context: *mut Context, t: I64) -> I64 {
+    I64(unsafe { &mut *context }.read(|l| {
         let t = u8::try_from(t.0).map_err(|_| format!("tag {}", t.0))?;
         if !matches!(
             t,
@@ -412,9 +412,9 @@ pub unsafe extern "C" fn rt_in_count(ctx: *mut Ctx, t: I64) -> I64 {
     }))
 }
 
-pub unsafe extern "C" fn rt_in_field(ctx: *mut Ctx, p: Addr, n: I64) {
+pub unsafe extern "C" fn rt_in_field(context: *mut Context, p: Address, n: I64) {
     let want = unsafe { borrowed(p, n) };
-    unsafe { &mut *ctx }.read(|l| {
+    unsafe { &mut *context }.read(|l| {
         let name = l.r.symbol()?;
         if name.as_bytes() != want {
             return Err(format!(
@@ -426,34 +426,34 @@ pub unsafe extern "C" fn rt_in_field(ctx: *mut Ctx, p: Addr, n: I64) {
     })
 }
 
-pub unsafe extern "C" fn rt_in_name_is(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_in_name_is(context: *mut Context, p: Address, n: I64) -> I64 {
     let want = unsafe { borrowed(p, n) };
-    I64(unsafe { &mut *ctx }.read(|l| match &l.name {
+    I64(unsafe { &mut *context }.read(|l| match &l.name {
         Some(name) => Ok(i64::from(name.as_bytes() == want)),
         None => Err("a constructor's name asked before one was read".into()),
     }))
 }
 
-pub unsafe extern "C" fn rt_never_lifted(ctx: *mut Ctx) {
-    unsafe { &mut *ctx }.fail(err_marshalling(
+pub unsafe extern "C" fn rt_never_lifted(context: *mut Context) {
+    unsafe { &mut *context }.fail(err_marshalling(
         "a value lifted through a descriptor that lifts none: the runtime lifts only a `String`",
     ));
 }
 
-pub unsafe extern "C" fn rt_never_shown(ctx: *mut Ctx) {
-    unsafe { &mut *ctx }.fail(err_marshalling(
+pub unsafe extern "C" fn rt_never_shown(context: *mut Context) {
+    unsafe { &mut *context }.fail(err_marshalling(
         "a value shown through a descriptor that does not lower it",
     ));
 }
 
-pub unsafe extern "C" fn rt_shown_open(ctx: *mut Ctx) {
-    unsafe { &mut *ctx }
+pub unsafe extern "C" fn rt_shown_open(context: *mut Context) {
+    unsafe { &mut *context }
         .marshallings
         .push(Marshalling::Lowering(Lowering::shown()));
 }
 
-pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_lower_close(context: *mut Context) -> I64 {
+    let c = unsafe { &mut *context };
     if c.lowering().is_err() {
         return I64(0);
     }
@@ -467,8 +467,8 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
     c.give(l.w.finish())
 }
 
-pub unsafe extern "C" fn rt_lift_close(ctx: *mut Ctx) {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_lift_close(context: *mut Context) {
+    let c = unsafe { &mut *context };
     if c.lifting().is_err() {
         return;
     }
@@ -477,8 +477,8 @@ pub unsafe extern "C" fn rt_lift_close(ctx: *mut Ctx) {
     }
 }
 
-pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_taken(context: *mut Context, dst: Address, n: I64) {
+    let c = unsafe { &mut *context };
     if usize::try_from(n.0).ok() != Some(c.taken.len()) {
         c.fail(err_marshalling(&format!(
             "{} bytes taken, of {} given",
@@ -491,7 +491,7 @@ pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
     c.taken.clear();
 }
 
-impl Ctx {
+impl Context {
     pub fn open_decoding(&mut self, bytes: Vec<u8>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
@@ -515,24 +515,24 @@ impl Ctx {
     }
 }
 
-pub(crate) fn shown(ctx: *mut Ctx, v: &Carried) -> Result<Vec<u8>, String> {
-    let l = lowering(ctx, Lowering::shown(), |ctx| unsafe {
-        (v.ty().lower)(ctx, v.word());
+pub(crate) fn shown(context: *mut Context, v: &Carried) -> Result<Vec<u8>, String> {
+    let l = lowering(context, Lowering::shown(), |context| unsafe {
+        (v.ty().lower)(context, v.word());
     })?;
     Ok(l.w.finish())
 }
 
 fn lowering(
-    ctx: *mut Ctx,
+    context: *mut Context,
     opened: Lowering,
-    write: impl FnOnce(*mut Ctx),
+    write: impl FnOnce(*mut Context),
 ) -> Result<Lowering, String> {
-    let depth = unsafe { &*ctx }.marshallings.len();
-    unsafe { &mut *ctx }
+    let depth = unsafe { &*context }.marshallings.len();
+    unsafe { &mut *context }
         .marshallings
         .push(Marshalling::Lowering(opened));
-    write(ctx);
-    let c = unsafe { &mut *ctx };
+    write(context);
+    let c = unsafe { &mut *context };
     if c.marshallings.len() != depth + 1 {
         c.marshallings.truncate(depth + 1);
         return Err("a lowering left a marshalling of its own open".into());
@@ -543,18 +543,18 @@ fn lowering(
     Ok(l)
 }
 
-pub(crate) fn decode_string(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {
+pub(crate) fn decode_string(context: *mut Context, s: &str, string: &PlyType) -> Option<OwnedWord> {
     let mut w = codec::Writer::new();
     w.str(s.as_bytes());
-    decode_bytes(ctx, w.finish(), string)
+    decode_bytes(context, w.finish(), string)
 }
 
-fn decode_bytes(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
-    let c = unsafe { &mut *ctx };
+fn decode_bytes(context: *mut Context, bytes: Vec<u8>, ty: &PlyType) -> Option<OwnedWord> {
+    let c = unsafe { &mut *context };
     let depth = c.marshallings.len();
     c.open_decoding(bytes);
-    let w = unsafe { (ty.lift)(ctx) };
-    let c = unsafe { &mut *ctx };
+    let w = unsafe { (ty.lift)(context) };
+    let c = unsafe { &mut *context };
     if c.marshallings.len() != depth + 1 {
         c.marshallings.truncate(depth + 1);
         c.fail(err_marshalling(
@@ -564,10 +564,10 @@ fn decode_bytes(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
     if let Err(reason) = c.close_decoding() {
         c.fail(err_marshalling(&reason));
     }
-    (c.failed == 0).then(|| <Handed as crate::native::Returned>::of(w))
+    (c.failed == 0).then(|| <OwnedWord as crate::native::Returned>::of(w))
 }
 
-impl Ctx {
+impl Context {
     pub(crate) fn open_entry_call(&mut self, bytes: Vec<u8>) {
         self.marshallings.push(Marshalling::Lowering(Lowering {
             writes_entry_result: true,
@@ -579,13 +579,13 @@ impl Ctx {
 
 pub(crate) enum EntryBytes {
     Bytes(Vec<u8>),
-    Holding,
+    RetainsHandle,
     Function,
     EscapingHandle(EscapedHandle),
 }
 
-pub(crate) fn close_entry_call(ctx: *mut Ctx) -> Result<EntryBytes, String> {
-    let l = pop_entry_result(ctx)?;
+pub(crate) fn close_entry_call(context: *mut Context) -> Result<EntryBytes, String> {
+    let l = pop_entry_result(context)?;
     let held = l.handles > 0;
     let bytes = l.w.finish();
     if let Some(handle) = l.escaping {
@@ -606,7 +606,7 @@ pub(crate) fn close_entry_call(ctx: *mut Ctx) -> Result<EntryBytes, String> {
         }));
     }
     if held || l.resumes {
-        return Ok(EntryBytes::Holding);
+        return Ok(EntryBytes::RetainsHandle);
     }
     Ok(EntryBytes::Bytes(bytes))
 }
@@ -711,8 +711,8 @@ fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String
     Ok(false)
 }
 
-fn pop_entry_result(ctx: *mut Ctx) -> Result<Lowering, String> {
-    let c = unsafe { &mut *ctx };
+fn pop_entry_result(context: *mut Context) -> Result<Lowering, String> {
+    let c = unsafe { &mut *context };
     let open = c.marshallings.len();
     if open != 1 {
         c.marshallings.clear();

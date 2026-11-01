@@ -1,5 +1,5 @@
-use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyOp, PlyType};
-use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_word, word_at};
+use crate::emitted::{Block, Carried, KeepRoot, OwnedWord, PlyOp, PlyType};
+use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, object, set_word, word_at};
 use crate::native::I64;
 use crate::stack::{Stack, switch};
 use ply_core::builtins::scoped_released;
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 mod budget;
 mod calls;
-mod ctx;
+mod context;
 mod data;
 mod effects;
 mod frames;
@@ -23,7 +23,7 @@ mod tables;
 
 pub use budget::*;
 pub use calls::*;
-pub use ctx::*;
+pub use context::*;
 pub use data::*;
 pub use effects::*;
 pub use frames::*;

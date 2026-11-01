@@ -1,120 +1,126 @@
 use super::*;
-use crate::native::Addr;
+use crate::native::Address;
 
 pub unsafe extern "C" fn rt_with_cleanup(
-    ctx: *mut Ctx,
+    context: *mut Context,
     acquire: Block,
     body: Block,
     cleanup: Block,
     held: *const PlyType,
     result: *const PlyType,
-) -> Handed {
-    use crate::frames::{Held, call_recording_slots};
-    let c = unsafe { &mut *ctx };
-    let words = (c.entering_desc, c.entering_words);
+) -> OwnedWord {
+    use crate::frames::{FrameObject, call_recording_slots};
+    let c = unsafe { &mut *context };
+    let words = (c.entering_descriptor, c.entering_words);
     let entering = move || {
-        let c = unsafe { &mut *ctx };
-        (c.entering_desc, c.entering_words) = words;
+        let c = unsafe { &mut *context };
+        (c.entering_descriptor, c.entering_words) = words;
     };
-    c.entering_desc = 0;
+    c.entering_descriptor = 0;
     c.entering_words = 0;
     let entered = crate::tasks::shielded(c, crate::tasks::BracketPhase::Acquire);
     let f = acquire.word();
     entering();
     let holding = [
-        Held::Closure(acquire),
-        Held::Closure(body),
-        Held::Closure(cleanup),
+        FrameObject::Closure(acquire),
+        FrameObject::Closure(body),
+        FrameObject::Closure(cleanup),
     ];
     let (acquired, back) =
-        unsafe { call_recording_slots(ctx, holding, || Block::of(f).call(ctx, &[])) };
+        unsafe { call_recording_slots(context, holding, || Block::of(f).call(context, &[])) };
     let [
-        Held::Closure(acquire),
-        Held::Closure(body),
-        Held::Closure(cleanup),
+        FrameObject::Closure(acquire),
+        FrameObject::Closure(body),
+        FrameObject::Closure(cleanup),
     ] = back
     else {
         unreachable!("a record gives back what it held");
     };
-    unsafe { acquire.release_function_if_last(ctx) };
-    let c = unsafe { &mut *ctx };
+    unsafe { acquire.release_function_if_last(context) };
+    let c = unsafe { &mut *context };
     let cancelled = crate::tasks::leave_bracket(c, entered);
     if c.failed != 0 {
         if cancelled {
             cancel_pending_failure(c);
         }
         unsafe {
-            cleanup.release_function_if_last(ctx);
-            body.release_function_if_last(ctx);
+            cleanup.release_function_if_last(context);
+            body.release_function_if_last(context);
         }
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
-    let held = unsafe { Carried::new(Handed::of(acquired), held) };
+    let held = unsafe { Carried::new(OwnedWord::of(acquired), held) };
     let (returned, body, cleanup, held) = if cancelled {
         c.failed = FAILED_CANCELLED;
         (None, body, cleanup, held)
     } else {
-        let given = held.dup(ctx).handed().word();
+        let given = held.dup(context).into_owned_word().word();
         let f = body.word();
         let holding = [
-            Held::Closure(body),
-            Held::Closure(cleanup),
-            Held::Carried(held),
+            FrameObject::Closure(body),
+            FrameObject::Closure(cleanup),
+            FrameObject::Carried(held),
         ];
         entering();
-        let (r, back) =
-            unsafe { call_recording_slots(ctx, holding, || Block::of(f).call(ctx, &[given])) };
+        let (r, back) = unsafe {
+            call_recording_slots(context, holding, || Block::of(f).call(context, &[given]))
+        };
         let [
-            Held::Closure(body),
-            Held::Closure(cleanup),
-            Held::Carried(held),
+            FrameObject::Closure(body),
+            FrameObject::Closure(cleanup),
+            FrameObject::Carried(held),
         ] = back
         else {
             unreachable!("a record gives back what it held");
         };
-        let r = unsafe { Carried::new(Handed::of(r), result) };
+        let r = unsafe { Carried::new(OwnedWord::of(r), result) };
         (Some(r), body, cleanup, held)
     };
-    unsafe { body.release_function_if_last(ctx) };
-    let c = unsafe { &mut *ctx };
+    unsafe { body.release_function_if_last(context) };
+    let c = unsafe { &mut *context };
     let ending = c.failed;
     let Some(aside) = Unwinding::suspend_failure(c) else {
-        held.release(ctx);
-        unsafe { cleanup.release_function_if_last(ctx) };
-        return Handed::of(0);
+        held.release(context);
+        unsafe { cleanup.release_function_if_last(context) };
+        return OwnedWord::of(0);
     };
     let returned = returned.filter(|_| ending == 0);
-    let (f, given) = (cleanup.word(), held.handed().word());
+    let (f, given) = (cleanup.word(), held.into_owned_word().word());
     let call = || {
         entering();
-        unsafe { Block::of(f).call(ctx, &[given]) }
+        unsafe { Block::of(f).call(context, &[given]) }
     };
     let (cleanup, returned) = match returned {
         Some(a) => {
             let (_, back) = unsafe {
-                call_recording_slots(ctx, [Held::Closure(cleanup), Held::Carried(a)], call)
+                call_recording_slots(
+                    context,
+                    [FrameObject::Closure(cleanup), FrameObject::Carried(a)],
+                    call,
+                )
             };
-            let [Held::Closure(cleanup), Held::Carried(a)] = back else {
+            let [FrameObject::Closure(cleanup), FrameObject::Carried(a)] = back else {
                 unreachable!("a record gives back what it held");
             };
             (cleanup, Some(a))
         }
         None => {
-            let (_, back) = unsafe { call_recording_slots(ctx, [Held::Closure(cleanup)], call) };
-            let [Held::Closure(cleanup)] = back else {
+            let (_, back) =
+                unsafe { call_recording_slots(context, [FrameObject::Closure(cleanup)], call) };
+            let [FrameObject::Closure(cleanup)] = back else {
                 unreachable!("a record gives back what it held");
             };
             (cleanup, None)
         }
     };
-    unsafe { cleanup.release_function_if_last(ctx) };
-    if !aside.resume_failure(unsafe { &mut *ctx }) {
+    unsafe { cleanup.release_function_if_last(context) };
+    if !aside.resume_failure(unsafe { &mut *context }) {
         if let Some(a) = returned {
-            a.release(ctx);
+            a.release(context);
         }
-        return Handed::of(0);
+        return OwnedWord::of(0);
     }
-    returned.map_or(Handed::of(0), Carried::handed)
+    returned.map_or(OwnedWord::of(0), Carried::into_owned_word)
 }
 
 #[repr(C)]
@@ -129,7 +135,7 @@ pub const UNWINDING_WORDS: usize = 16;
 const _: () = assert!(std::mem::size_of::<Unwinding>() <= 8 * UNWINDING_WORDS);
 
 impl Unwinding {
-    fn suspend_failure(c: &mut Ctx) -> Option<Unwinding> {
+    fn suspend_failure(c: &mut Context) -> Option<Unwinding> {
         let ending = c.failed;
         if ![
             0,
@@ -143,7 +149,7 @@ impl Unwinding {
         }
         let pending = c.pending.take().map(|raise| {
             let failure = c.diagnostic.take();
-            c.keep(Kept::Pending(raise, failure))
+            c.keep(SavedState::Pending(raise, failure))
         });
         c.failed = 0;
         let entered = crate::tasks::shielded(c, crate::tasks::BracketPhase::Release);
@@ -155,9 +161,9 @@ impl Unwinding {
         })
     }
 
-    fn resume_failure(self, c: &mut Ctx) -> bool {
+    fn resume_failure(self, c: &mut Context) -> bool {
         let pending = self.pending.map(|here| match c.pop_saved(here) {
-            Kept::Pending(raise, failure) => (raise, failure),
+            SavedState::Pending(raise, failure) => (raise, failure),
             _ => unreachable!("a release keeps the pending raise it runs during"),
         });
         let cancelled = crate::tasks::leave_bracket(c, self.entered);
@@ -182,8 +188,8 @@ impl Unwinding {
     }
 }
 
-pub unsafe extern "C" fn rt_unwind_hold(ctx: *mut Ctx, held: Word) -> Word {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_unwind_hold(context: *mut Context, held: Word) -> Word {
+    let c = unsafe { &mut *context };
     if c.failed == 0 {
         return 0;
     }
@@ -194,12 +200,12 @@ pub unsafe extern "C" fn rt_unwind_hold(ctx: *mut Ctx, held: Word) -> Word {
     1
 }
 
-pub unsafe extern "C" fn rt_unwind_resume(ctx: *mut Ctx, held: Word) {
+pub unsafe extern "C" fn rt_unwind_resume(context: *mut Context, held: Word) {
     let aside = unsafe { (held as usize as *mut Unwinding).read() };
-    aside.resume_failure(unsafe { &mut *ctx });
+    aside.resume_failure(unsafe { &mut *context });
 }
 
-fn cancel_pending_failure(c: &mut Ctx) {
+fn cancel_pending_failure(c: &mut Context) {
     if ![FAILED_UNWOUND_TO_HANDLER, FAILED_PENDING_RAISE].contains(&c.failed) {
         return;
     }
@@ -211,16 +217,16 @@ fn cancel_pending_failure(c: &mut Ctx) {
 }
 
 pub unsafe extern "C" fn rt_failed(
-    ctx: *mut Ctx,
+    context: *mut Context,
     raises: I64,
     texts: *const Word,
     notes: I64,
     shown: I64,
 ) {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let bytes = |at: usize| {
         let (address, count) = unsafe { (*texts.add(2 * at), *texts.add(2 * at + 1)) };
-        unsafe { borrowed(Addr(address as *mut u8), I64(count)) }
+        unsafe { borrowed(Address(address as *mut u8), I64(count)) }
     };
     let text = |at: usize| String::from_utf8_lossy(bytes(at)).into_owned();
     let (notes, shown) = (notes.0 as usize, shown.0 as usize);
@@ -238,4 +244,4 @@ pub unsafe extern "C" fn rt_failed(
     }
 }
 
-pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, _in_place: i64, _copied: i64) {}
+pub unsafe extern "C" fn rt_note_update(_context: *mut Context, _in_place: i64, _copied: i64) {}

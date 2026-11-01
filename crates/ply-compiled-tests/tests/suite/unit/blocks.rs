@@ -32,50 +32,54 @@ fn the_heap_reports_an_address_as_a_block_only_at_the_start_of_a_block_it_alloca
  {
     let mut b = Blocks::default();
     let block = b.take(48).addr();
-    assert!(b.holds(block));
-    assert!(!b.holds(block + 8), "the middle of a block");
-    assert!(!b.holds(block + 48), "a block not handed out yet");
+    assert!(b.contains(block));
+    assert!(!b.contains(block + 8), "the middle of a block");
+    assert!(!b.contains(block + 48), "a block not handed out yet");
     assert!(
-        !b.holds(block & !(4 * MEBIBYTE - 1)),
+        !b.contains(block & !(4 * MEBIBYTE - 1)),
         "the segment's own header"
     );
     let large = b.take(SMALL + 8).addr();
-    assert!(b.holds(large) && !b.holds(large + 8));
-    assert!(!Blocks::default().holds(block), "another heap's block");
+    assert!(b.contains(large) && !b.contains(large + 8));
+    assert!(!Blocks::default().contains(block), "another heap's block");
     b.reset();
-    assert!(!b.holds(block) && !b.holds(large));
+    assert!(!b.contains(block) && !b.contains(large));
 }
 
 #[test]
 fn a_block_larger_than_a_page_adds_its_exact_size_to_the_bytes_in_use_until_it_is_freed() {
     let mut b = Blocks::default();
     let block = b.take(3 * MEBIBYTE + 8);
-    assert_eq!(b.held(), 3 * MEBIBYTE + 8);
+    assert_eq!(b.retained_bytes(), 3 * MEBIBYTE + 8);
     unsafe {
         assert!(b.owns(block, 3 * MEBIBYTE + 8));
         b.give(block, 3 * MEBIBYTE + 8);
     }
-    assert_eq!(b.held(), 0);
+    assert_eq!(b.retained_bytes(), 0);
 }
 
 #[test]
 fn pages_emptied_by_blocks_of_one_size_are_reused_for_blocks_of_another_size() {
     let mut b = Blocks::default();
     let small: Vec<*mut u8> = (0..200_000).map(|_| b.take(32)).collect();
-    let peak = b.held();
+    let peak = b.retained_bytes();
     assert!(peak >= 200_000 * 32);
     for block in small {
         unsafe { b.give(block, 32) };
     }
     assert!(
-        b.held() < MEBIBYTE,
+        b.retained_bytes() < MEBIBYTE,
         "{} bytes held with nothing live",
-        b.held()
+        b.retained_bytes()
     );
     for _ in 0..(peak / 2 / 512) {
         b.take(512);
     }
-    assert!(b.held() <= peak, "{} bytes held past {peak}", b.held());
+    assert!(
+        b.retained_bytes() <= peak,
+        "{} bytes held past {peak}",
+        b.retained_bytes()
+    );
 }
 
 #[test]
@@ -92,7 +96,7 @@ fn segments_left_with_no_live_blocks_are_unmapped_and_the_heap_can_still_allocat
         b.mapped()
     );
     let again = b.take(1024);
-    assert!(b.holds(again.addr()));
+    assert!(b.contains(again.addr()));
 }
 
 #[test]
@@ -112,7 +116,7 @@ fn a_new_heap_reusing_a_segment_from_a_dropped_heap_contains_only_its_own_blocks
         taken.sort_unstable();
         walked.sort_unstable();
         assert_eq!(walked, taken);
-        assert_eq!(next.held(), 64 << 10);
+        assert_eq!(next.retained_bytes(), 64 << 10);
     }
 }
 
@@ -140,7 +144,7 @@ fn large_blocks_freed_by_another_thread_are_released_before_the_next_large_alloc
         });
     }
     b.take(MEBIBYTE);
-    assert_eq!(b.held(), MEBIBYTE);
+    assert_eq!(b.retained_bytes(), MEBIBYTE);
 }
 
 #[test]
@@ -150,7 +154,7 @@ fn adopting_a_heap_waits_for_another_thread_that_is_still_returning_a_block_to_t
     let mut branch = Blocks::default();
     let handed = branch.take(48);
     let rest: Vec<*mut u8> = (0..100).map(|_| branch.take(48)).collect();
-    let pending = unsafe { Handing::begin(handed, 48) };
+    let pending = unsafe { RemoteFree::begin(handed, 48) };
     let branch = Moved(branch);
     let (adopted, done) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
@@ -186,16 +190,20 @@ fn a_heap_that_adopts_another_heap_owns_and_can_free_every_block_of_the_adopted_
         assert!(!parent.owns(theirs[0], 48));
         parent.adopt(branch);
         assert!(parent.owns(theirs[0], 48) && parent.owns(big, SMALL + 8));
-        assert!(parent.holds(theirs[0].addr()) && parent.holds(big.addr()));
+        assert!(parent.contains(theirs[0].addr()) && parent.contains(big.addr()));
         for &block in &theirs {
             parent.give(block, 48);
         }
         parent.give(big, SMALL + 8);
         parent.give(mine, 48);
     }
-    assert!(parent.held() <= 2 * (64 << 10), "{} held", parent.held());
+    assert!(
+        parent.retained_bytes() <= 2 * (64 << 10),
+        "{} held",
+        parent.retained_bytes()
+    );
     let next: Vec<*mut u8> = (0..5_000).map(|_| parent.take(48)).collect();
-    assert!(next.iter().all(|block| parent.holds(block.addr())));
+    assert!(next.iter().all(|block| parent.contains(block.addr())));
 }
 
 #[test]
@@ -208,20 +216,20 @@ fn adopting_many_heaps_with_empty_pages_caps_the_empty_pages_retained_at_two_meb
             for &block in &blocks[1..] {
                 unsafe { branch.give(block, 1024) };
             }
-            assert!(branch.kept() > 0);
+            assert!(branch.spare_bytes() > 0);
             parent.adopt(branch);
             blocks[0]
         })
         .collect();
     assert!(
-        parent.kept() <= 2 * MEBIBYTE,
+        parent.spare_bytes() <= 2 * MEBIBYTE,
         "{} bytes kept",
-        parent.kept()
+        parent.spare_bytes()
     );
     assert!(
-        parent.held() <= live.len() * (64 << 10),
+        parent.retained_bytes() <= live.len() * (64 << 10),
         "{} bytes held",
-        parent.held()
+        parent.retained_bytes()
     );
     for block in live {
         unsafe { parent.give(block, 1024) };
@@ -249,7 +257,7 @@ fn an_adopted_segment_with_no_live_blocks_is_unmapped() {
         "{} bytes mapped",
         parent.mapped()
     );
-    assert_eq!(parent.held(), 0);
+    assert_eq!(parent.retained_bytes(), 0);
 }
 
 #[test]
@@ -260,9 +268,9 @@ fn a_reset_heap_has_no_bytes_in_use_maps_at_most_four_mebibytes_and_can_allocate
     }
     b.take(MEBIBYTE);
     b.reset();
-    assert_eq!(b.held(), 0);
+    assert_eq!(b.retained_bytes(), 0);
     assert!(b.mapped() <= 4 * MEBIBYTE);
     let block = b.take(256);
-    assert!(b.holds(block.addr()));
-    assert_eq!(b.held(), 64 << 10);
+    assert!(b.contains(block.addr()));
+    assert_eq!(b.retained_bytes(), 64 << 10);
 }

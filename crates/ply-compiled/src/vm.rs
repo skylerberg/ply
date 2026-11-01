@@ -1,10 +1,10 @@
 use std::ptr;
 
 unsafe extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mmap(address: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(address: *mut u8, len: usize) -> i32;
+    fn mprotect(address: *mut u8, len: usize, prot: i32) -> i32;
+    fn madvise(address: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 const PROT_NONE: i32 = 0;
@@ -61,8 +61,8 @@ pub unsafe fn reserve(len: usize) -> *mut u8 {
     p
 }
 
-pub unsafe fn commit(addr: *mut u8, len: usize) -> bool {
-    unsafe { mprotect(addr, len, PROT_READ | PROT_WRITE) == 0 }
+pub unsafe fn commit(address: *mut u8, len: usize) -> bool {
+    unsafe { mprotect(address, len, PROT_READ | PROT_WRITE) == 0 }
 }
 
 pub unsafe fn map_aligned(len: usize) -> *mut u8 {
@@ -83,10 +83,10 @@ pub unsafe fn map_aligned(len: usize) -> *mut u8 {
     }
 }
 
-pub unsafe fn unmap(addr: *mut u8, len: usize) {
-    unsafe { munmap(addr, len) };
+pub unsafe fn unmap(address: *mut u8, len: usize) {
+    unsafe { munmap(address, len) };
 }
 
-pub unsafe fn let_go(addr: *mut u8, len: usize) {
-    unsafe { madvise(addr, len, MADV_FREE) };
+pub unsafe fn let_go(address: *mut u8, len: usize) {
+    unsafe { madvise(address, len, MADV_FREE) };
 }

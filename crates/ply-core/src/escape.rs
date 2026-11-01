@@ -63,7 +63,7 @@ pub struct EscapedHandle {
 }
 
 impl EscapedHandle {
-    pub fn reached(&self) -> String {
+    pub fn route_text(&self) -> String {
         if self.route.is_empty() {
             return String::new();
         }
@@ -111,7 +111,7 @@ impl Boundary<'_> {
 pub fn rejected(boundary: &Boundary<'_>, escapee: &EscapedHandle, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::SCHEDULER_ESCAPE_AT_BOUNDARY,
-        boundary.headline(escapee.handle, &escapee.reached()),
+        boundary.headline(escapee.handle, &escapee.route_text()),
     )
     .primary(span, boundary.label())
     .note(escapee.handle.reason())

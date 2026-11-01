@@ -1,7 +1,7 @@
 mod children;
 
 pub(crate) use children::Children;
-pub use children::{Ended, Finished, Heard, Io, Output, Signal};
+pub use children::{Ended, Finished, Io, Output, OutputEvent, Signal};
 
 use crate::jobs::{Failure, FallibleJob, Job};
 use crate::native::found;
@@ -249,15 +249,15 @@ impl ProcessHost {
         self.whole && self.sink.is_uncaptured()
     }
 
-    pub fn settle(&self) {
-        if self.controls_stdio() && stdio::settle() {
+    pub fn flush_output(&self) {
+        if self.controls_stdio() && stdio::flush_output() {
             self.exit_on_broken_pipe();
         }
     }
 
     pub fn exit_on_broken_pipe(&self) -> ! {
         self.children.end_all();
-        stdio::settle();
+        stdio::flush_output();
         crate::observe::report_at_exit();
         std::process::exit(stdio::BROKEN_PIPE_STATUS);
     }
@@ -378,17 +378,17 @@ impl ProcessHost {
         let started = self.children.started(&launch, &self.sink);
         let program = program.to_path_buf();
         Ok(Box::new(move || {
-            let (_, child) = started.map_err(Failure::Said)?;
+            let (_, child) = started.map_err(Failure::Message)?;
             match child.wait(None) {
                 Ok(Some(exit)) => Ok(exit.flat()),
                 Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(
                     err_output_over_limit("spawn", &program, out, err, span),
                 )),
-                Err(ProcessError::Unreaped(reason)) => Err(Failure::Said(format!(
+                Err(ProcessError::Unreaped(reason)) => Err(Failure::Message(format!(
                     "`{}`'s ending could not be read: {reason}",
                     program.display()
                 ))),
-                Ok(None) | Err(ProcessError::Spent) => Err(Failure::Said(format!(
+                Ok(None) | Err(ProcessError::Spent) => Err(Failure::Message(format!(
                     "`{}` was waited on by something other than its spawn",
                     program.display()
                 ))),
@@ -529,7 +529,7 @@ fn rejected(
         ProcessError::TooMuch { out, err } => {
             Failure::Rejected(err_output_over_limit(op, child.program(), out, err, span))
         }
-        ProcessError::Unreaped(reason) => Failure::Said(format!(
+        ProcessError::Unreaped(reason) => Failure::Message(format!(
             "child {handle}'s ending could not be read: {reason}"
         )),
     }

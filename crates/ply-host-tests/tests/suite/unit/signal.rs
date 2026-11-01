@@ -273,7 +273,7 @@ fn send_user2() {
     assert!(sent.success());
 }
 
-fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
+fn arrives(shutdown: &Shutdown, which: WatchedSignal) -> bool {
     let until = Instant::now() + Duration::from_secs(10);
     while Instant::now() < until {
         if shutdown.arrived(which).expect("the handler is installed") {
@@ -289,19 +289,25 @@ fn arrived_reports_a_signal_as_received_once_however_many_times_it_was_sent() {
     let shutdown = Shutdown::new(Bounds::default());
     assert!(
         !shutdown
-            .arrived(Asked::User2)
+            .arrived(WatchedSignal::User2)
             .expect("the first ask installs the handler"),
         "nothing arrived before anybody asked"
     );
     send_user2();
-    assert!(arrives(&shutdown, Asked::User2), "one arrival is seen");
-    send_user2();
-    send_user2();
-    assert!(arrives(&shutdown, Asked::User2), "two arrivals are seen");
-    std::thread::sleep(Duration::from_millis(200));
-    let _ = shutdown.arrived(Asked::User2);
     assert!(
-        !shutdown.arrived(Asked::User2).expect("installed"),
+        arrives(&shutdown, WatchedSignal::User2),
+        "one arrival is seen"
+    );
+    send_user2();
+    send_user2();
+    assert!(
+        arrives(&shutdown, WatchedSignal::User2),
+        "two arrivals are seen"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = shutdown.arrived(WatchedSignal::User2);
+    assert!(
+        !shutdown.arrived(WatchedSignal::User2).expect("installed"),
         "arrivals are not counted: nothing is owed once an ask returned them"
     );
     assert!(

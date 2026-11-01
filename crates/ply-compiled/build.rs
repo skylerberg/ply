@@ -13,9 +13,9 @@ fn main() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
     for name in CRATES {
-        let src = crates.join(name).join("src");
-        println!("cargo:rerun-if-changed={}", src.display());
-        walk(&src, &mut files);
+        let source = crates.join(name).join("src");
+        println!("cargo:rerun-if-changed={}", source.display());
+        walk(&source, &mut files);
     }
     files.sort();
     let named = |path: &Path| {

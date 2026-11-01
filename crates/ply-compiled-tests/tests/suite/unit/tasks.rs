@@ -1,9 +1,9 @@
-use crate::bare::context;
-use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
+use crate::bare::new_context;
+use ply_compiled::emitted::{Block, Handle, OwnedWord, PlyFunctionDescriptor, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
-use ply_compiled::native::{Addr, I64, Returned};
+use ply_compiled::native::{Address, I64, Returned};
 use ply_compiled::rt::{
-    Ctx, FAILED_CANCELLED, FAILED_PENDING_RAISE, FAILED_UNWOUND_TO_HANDLER, rt_taken,
+    Context, FAILED_CANCELLED, FAILED_PENDING_RAISE, FAILED_UNWOUND_TO_HANDLER, rt_taken,
 };
 use ply_compiled::tasks::{
     self, Body, BracketPhase, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, RETURNED,
@@ -16,15 +16,15 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 thread_local! {
-    static HEARD: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static RECEIVED: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static RELEASED: Cell<usize> = const { Cell::new(0) };
 }
 
-fn heard() -> Vec<i64> {
-    HEARD.with(|h| std::mem::take(&mut *h.borrow_mut()))
+fn take_received() -> Vec<i64> {
+    RECEIVED.with(|h| std::mem::take(&mut *h.borrow_mut()))
 }
 
-fn asking(code: i64, n: i64) -> Message {
+fn request_message(code: i64, n: i64) -> Message {
     Message {
         code,
         numbers: [n, 0],
@@ -32,18 +32,19 @@ fn asking(code: i64, n: i64) -> Message {
     }
 }
 
-unsafe fn asks_twice(_ctx: *mut Ctx, scheduler: usize) {
+unsafe fn requests_twice(_context: *mut Context, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
-    let first = unsafe { tasks::switch_to_loop(scheduler, asking(1, 10)) };
-    let second = unsafe { tasks::switch_to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
-    HEARD.with(|h| h.borrow_mut().push(second.numbers[0]));
+    let first = unsafe { tasks::switch_to_loop(scheduler, request_message(1, 10)) };
+    let second =
+        unsafe { tasks::switch_to_loop(scheduler, request_message(2, first.numbers[0] + 1)) };
+    RECEIVED.with(|h| h.borrow_mut().push(second.numbers[0]));
 }
 
-unsafe fn released(_ctx: *mut Ctx, _arg: usize) {
+unsafe fn released(_context: *mut Context, _arg: usize) {
     RELEASED.with(|r| r.set(r.get() + 1));
 }
 
-fn body(run: unsafe fn(*mut Ctx, usize), scheduler: *mut Scheduler) -> Body {
+fn body(run: unsafe fn(*mut Context, usize), scheduler: *mut Scheduler) -> Body {
     Body {
         run,
         release: released,
@@ -53,17 +54,17 @@ fn body(run: unsafe fn(*mut Ctx, usize), scheduler: *mut Scheduler) -> Body {
 
 #[test]
 fn a_task_runs_on_its_own_stack_until_it_pauses_and_continues_from_there_when_resumed() {
-    let mut ctx = context();
-    let mut scheduler = Scheduler::open(&mut ctx, true);
+    let mut context = new_context();
+    let mut scheduler = Scheduler::open(&mut context, true);
     let r: *mut Scheduler = &mut *scheduler;
-    scheduler.start(1, body(asks_twice, r));
+    scheduler.start(1, body(requests_twice, r));
     let first = unsafe { tasks::resume(r, 1, Message::default()) };
     assert_eq!((first.code, first.numbers[0]), (1, 10));
-    let second = unsafe { tasks::resume(r, 1, asking(0, 41)) };
+    let second = unsafe { tasks::resume(r, 1, request_message(0, 41)) };
     assert_eq!((second.code, second.numbers[0]), (2, 42));
-    let end = unsafe { tasks::resume(r, 1, asking(0, 7)) };
+    let end = unsafe { tasks::resume(r, 1, request_message(0, 7)) };
     assert_eq!(end.code, FINISHED);
-    assert_eq!(heard(), [7]);
+    assert_eq!(take_received(), [7]);
     scheduler.free(1);
     assert_eq!(
         RELEASED.with(Cell::get),
@@ -75,40 +76,40 @@ fn a_task_runs_on_its_own_stack_until_it_pauses_and_continues_from_there_when_re
 
 #[test]
 fn tasks_take_turns_in_the_scheduler_loop_and_each_continues_where_it_paused() {
-    let mut ctx = context();
-    let mut scheduler = Scheduler::open(&mut ctx, false);
+    let mut context = new_context();
+    let mut scheduler = Scheduler::open(&mut context, false);
     let r: *mut Scheduler = &mut *scheduler;
-    scheduler.start(1, body(asks_twice, r));
-    scheduler.start(2, body(asks_twice, r));
+    scheduler.start(1, body(requests_twice, r));
+    scheduler.start(2, body(requests_twice, r));
     unsafe {
         assert_eq!(tasks::resume(r, 1, Message::default()).code, 1);
         assert_eq!(tasks::resume(r, 2, Message::default()).code, 1);
-        assert_eq!(tasks::resume(r, 2, asking(0, 100)).numbers[0], 101);
-        assert_eq!(tasks::resume(r, 1, asking(0, 200)).numbers[0], 201);
-        assert_eq!(tasks::resume(r, 1, asking(0, 1)).code, FINISHED);
-        assert_eq!(tasks::resume(r, 2, asking(0, 2)).code, FINISHED);
+        assert_eq!(tasks::resume(r, 2, request_message(0, 100)).numbers[0], 101);
+        assert_eq!(tasks::resume(r, 1, request_message(0, 200)).numbers[0], 201);
+        assert_eq!(tasks::resume(r, 1, request_message(0, 1)).code, FINISHED);
+        assert_eq!(tasks::resume(r, 2, request_message(0, 2)).code, FINISHED);
     }
-    assert_eq!(heard(), [1, 2]);
+    assert_eq!(take_received(), [1, 2]);
     drop(scheduler);
 }
 
-unsafe fn unwinds(ctx: *mut Ctx, _: usize) {
-    unsafe { (*ctx).failed = FAILED_CANCELLED };
+unsafe fn unwinds(context: *mut Context, _: usize) {
+    unsafe { (*context).failed = FAILED_CANCELLED };
 }
 
-unsafe fn raises(ctx: *mut Ctx, _: usize) {
-    unsafe { (*ctx).failed = FAILED_UNWOUND_TO_HANDLER };
+unsafe fn raises(context: *mut Context, _: usize) {
+    unsafe { (*context).failed = FAILED_UNWOUND_TO_HANDLER };
 }
 
-unsafe fn breaks(ctx: *mut Ctx, _: usize) {
-    unsafe { (*ctx).failed = 1 };
+unsafe fn breaks(context: *mut Context, _: usize) {
+    unsafe { (*context).failed = 1 };
 }
 
 #[test]
 fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_restore_recreates_the_failure()
  {
-    let mut ctx = context();
-    let c: *mut Ctx = &mut ctx;
+    let mut context = new_context();
+    let c: *mut Context = &mut context;
     let mut scheduler = Scheduler::open(c, true);
     let r: *mut Scheduler = &mut *scheduler;
     scheduler.start(1, body(unwinds, r));
@@ -134,18 +135,18 @@ fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_resto
     drop(scheduler);
 }
 
-unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
-    unsafe { tasks::switch_to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
+unsafe fn requests_once(_context: *mut Context, scheduler: usize) {
+    unsafe { tasks::switch_to_loop(scheduler as *mut Scheduler, request_message(1, 0)) };
 }
 
 #[test]
 fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_most_tasks_that_ran_at_once()
  {
-    let mut ctx = context();
-    let mut scheduler = Scheduler::open(&mut ctx, false);
+    let mut context = new_context();
+    let mut scheduler = Scheduler::open(&mut context, false);
     let r: *mut Scheduler = &mut *scheduler;
     for id in 1..=3 {
-        scheduler.start(id, body(asks_once, r));
+        scheduler.start(id, body(requests_once, r));
         unsafe { tasks::resume(r, id, Message::default()) };
     }
     assert_eq!(scheduler.stacks(), 3);
@@ -162,7 +163,7 @@ fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_mos
         "the stacks wait for the scheduler's next tasks"
     );
     for id in 4..=5 {
-        scheduler.start(id, body(asks_once, r));
+        scheduler.start(id, body(requests_once, r));
         unsafe { tasks::resume(r, id, Message::default()) };
     }
     assert_eq!(
@@ -180,30 +181,30 @@ fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_mos
 #[test]
 fn freeing_a_task_that_never_ran_releases_its_closure_and_dropping_the_scheduler_releases_the_rest()
 {
-    let mut ctx = context();
-    let mut scheduler = Scheduler::open(&mut ctx, true);
+    let mut context = new_context();
+    let mut scheduler = Scheduler::open(&mut context, true);
     let r: *mut Scheduler = &mut *scheduler;
     let before = RELEASED.with(Cell::get);
-    scheduler.start(1, body(asks_once, r));
-    scheduler.start(2, body(asks_once, r));
+    scheduler.start(1, body(requests_once, r));
+    scheduler.start(2, body(requests_once, r));
     scheduler.free(1);
     assert_eq!(RELEASED.with(Cell::get), before + 1);
     drop(scheduler);
     assert_eq!(RELEASED.with(Cell::get), before + 2);
 }
 
-unsafe fn acquires(_ctx: *mut Ctx, scheduler: usize) {
+unsafe fn acquires(_context: *mut Context, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
     let id = unsafe { (*scheduler).shield(BracketPhase::Acquire) }.expect("a task runs");
-    unsafe { tasks::switch_to_loop(scheduler, asking(1, 0)) };
+    unsafe { tasks::switch_to_loop(scheduler, request_message(1, 0)) };
     let lands = unsafe { (*scheduler).leave_phase(id, BracketPhase::Acquire) };
-    HEARD.with(|h| h.borrow_mut().push(i64::from(lands)));
+    RECEIVED.with(|h| h.borrow_mut().push(i64::from(lands)));
 }
 
 #[test]
 fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_the_acquire_ends() {
-    let mut ctx = context();
-    let mut scheduler = Scheduler::open(&mut ctx, true);
+    let mut context = new_context();
+    let mut scheduler = Scheduler::open(&mut context, true);
     let r: *mut Scheduler = &mut *scheduler;
     scheduler.start(1, body(acquires, r));
     unsafe { tasks::resume(r, 1, Message::default()) };
@@ -219,7 +220,7 @@ fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_t
         unsafe { tasks::resume(r, 1, Message::default()) }.code,
         FINISHED
     );
-    assert_eq!(heard(), [1]);
+    assert_eq!(take_received(), [1]);
     assert_eq!(scheduler.shields(1), Shields::default());
     drop(scheduler);
 }
@@ -227,32 +228,32 @@ fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_t
 #[test]
 fn failure_bytes_from_the_scheduler_decode_into_a_diagnostic_and_an_unknown_code_or_truncated_bytes_fail()
  {
-    let ctx = context();
+    let context = new_context();
     let bytes = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
-    let d = failure_of(&ctx, bytes).expect("it reads");
+    let d = failure_of(&context, bytes).expect("it reads");
     assert_eq!(d.code, codes::DEADLOCK);
     assert_eq!(d.message, "m");
     assert_eq!(d.labels.len(), 1);
     assert!(d.labels[0].primary);
     assert_eq!(d.labels[0].message, "t");
     assert_eq!(d.notes, ["n"]);
-    let unknown = failure_of(&ctx, b"\x02E1\x01m\x00\x00").expect_err("no such code");
+    let unknown = failure_of(&context, b"\x02E1\x01m\x00\x00").expect_err("no such code");
     assert!(unknown.contains("`E1`"), "{unknown}");
-    assert!(failure_of(&ctx, &bytes[..5]).is_err());
+    assert!(failure_of(&context, &bytes[..5]).is_err());
 }
 
-fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
+fn taken(context: &mut Context, n: i64) -> Vec<u8> {
     let mut out = vec![0u8; usize::try_from(n).expect("a count")];
-    unsafe { rt_taken(ctx, Addr(out.as_mut_ptr()), I64(n)) };
+    unsafe { rt_taken(context, Address(out.as_mut_ptr()), I64(n)) };
     out
 }
 
 #[test]
 fn waiting_on_watched_jobs_returns_when_one_finishes_and_reports_that_job_s_id_as_bytes() {
-    let mut ctx = context();
+    let mut context = new_context();
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
-    ctx.set_host(
+    context.set_host(
         Arc::new(ply_core::HostBinding::unbound()),
         Some(runtime),
         None,
@@ -272,43 +273,47 @@ fn waiting_on_watched_jobs_returns_when_one_finishes_and_reports_that_job_s_id_a
     let watched = submit(b"watched");
     let unwatched = submit(b"unwatched");
     assert_eq!(
-        unsafe { rt_ticket_watch(&mut ctx, I64(watched as i64)) }.0,
+        unsafe { rt_ticket_watch(&mut context, I64(watched as i64)) }.0,
         1
     );
-    assert_eq!(unsafe { rt_tickets_park(&mut ctx, I64(-1)) }.0, 1);
-    let n = unsafe { rt_tickets_answered(&mut ctx) };
-    assert_eq!(taken(&mut ctx, n.0), watched.to_le_bytes());
-    let n = take_ticket_bytes(&mut ctx, I64(watched as i64));
-    assert_eq!(taken(&mut ctx, n.0), b"watched");
-    let n = unsafe { rt_tickets_answered(&mut ctx) };
-    assert_eq!(taken(&mut ctx, n.0), b"", "a ticket taken is resolved once");
-    assert!(ctx.take_failure().is_none());
+    assert_eq!(unsafe { rt_tickets_park(&mut context, I64(-1)) }.0, 1);
+    let n = unsafe { rt_tickets_answered(&mut context) };
+    assert_eq!(taken(&mut context, n.0), watched.to_le_bytes());
+    let n = take_ticket_bytes(&mut context, I64(watched as i64));
+    assert_eq!(taken(&mut context, n.0), b"watched");
+    let n = unsafe { rt_tickets_answered(&mut context) };
+    assert_eq!(
+        taken(&mut context, n.0),
+        b"",
+        "a ticket taken is resolved once"
+    );
+    assert!(context.take_failure().is_none());
     assert_ne!(unwatched, watched, "each job has a ticket of its own");
-    let earlier = unsafe { rt_host_now(&mut ctx) }.0;
-    assert!(unsafe { rt_host_now(&mut ctx) }.0 >= earlier);
-    assert!(ctx.take_failure().is_none());
+    let earlier = unsafe { rt_host_now(&mut context) }.0;
+    assert!(unsafe { rt_host_now(&mut context) }.0 >= earlier);
+    assert!(context.take_failure().is_none());
 }
 
 #[test]
 fn watching_a_job_id_from_another_run_returns_0_and_sets_a_failure_on_the_context() {
-    let mut ctx = context();
-    ctx.set_host(
+    let mut context = new_context();
+    context.set_host(
         Arc::new(ply_core::HostBinding::unbound()),
         Some(ply_host::Host::new().runtime()),
         None,
     );
     assert_eq!(
-        unsafe { rt_ticket_watch(&mut ctx, I64(u32::MAX as i64)) }.0,
+        unsafe { rt_ticket_watch(&mut context, I64(u32::MAX as i64)) }.0,
         0
     );
-    assert!(ctx.take_failure().is_some());
+    assert!(context.take_failure().is_some());
 }
 
-unsafe extern "C" fn untouched(_ctx: *mut Ctx, _w: Word) -> Word {
+unsafe extern "C" fn untouched(_context: *mut Context, _w: Word) -> Word {
     0
 }
 
-unsafe extern "C" fn lifted(_ctx: *mut Ctx) -> Word {
+unsafe extern "C" fn lifted(_context: *mut Context) -> Word {
     0
 }
 
@@ -338,18 +343,18 @@ fn handle(w: Word) -> Handle {
     <Handle as Returned>::of(w)
 }
 
-fn handed(w: Word) -> Handed {
-    <Handed as Returned>::of(w)
+fn owned(w: Word) -> OwnedWord {
+    <OwnedWord as Returned>::of(w)
 }
 
-fn let_go(ctx: &mut Ctx, w: Word) {
-    heap::release_object(ctx, w);
+fn let_go(context: &mut Context, w: Word) {
+    heap::release_object(context, w);
 }
 
 #[test]
 fn the_effects_a_step_accessed_are_returned_encoded_as_bytes_and_then_cleared() {
-    let mut ctx = context();
-    ctx.accesses.push((
+    let mut context = new_context();
+    context.accesses.push((
         tasks::Access::Effect {
             effect: ply_core::Symbol::new("log"),
             resource: Some(ply_core::Symbol::new("x")),
@@ -357,34 +362,34 @@ fn the_effects_a_step_accessed_are_returned_encoded_as_bytes_and_then_cleared() 
         },
         [3, 1, 2],
     ));
-    ctx.accesses.push((
+    context.accesses.push((
         tasks::Access::ScopedValue {
             id: 9,
             write: false,
         },
         [0, 0, 0],
     ));
-    assert_eq!(unsafe { tasks::rt_footprint_held(&mut ctx) }.0, 2);
-    let n = unsafe { tasks::rt_footprint_taken(&mut ctx) };
+    assert_eq!(unsafe { tasks::rt_footprint_held(&mut context) }.0, 2);
+    let n = unsafe { tasks::rt_footprint_taken(&mut context) };
     assert_eq!(
-        taken(&mut ctx, n.0),
+        taken(&mut context, n.0),
         b"\x02\x00\x03log\x00\x01x\x01\x00\x06\x02\x04\x02\x12\x00\x00\x00\x00"
     );
-    assert_eq!(unsafe { tasks::rt_footprint_held(&mut ctx) }.0, 0);
-    let n = unsafe { tasks::rt_footprint_taken(&mut ctx) };
-    assert_eq!(taken(&mut ctx, n.0), b"\x00");
+    assert_eq!(unsafe { tasks::rt_footprint_held(&mut context) }.0, 0);
+    let n = unsafe { tasks::rt_footprint_taken(&mut context) };
+    assert_eq!(taken(&mut context, n.0), b"\x00");
 }
 
 #[test]
 fn a_value_saved_with_rt_keep_opens_as_its_saved_type_and_opening_it_as_another_type_sets_a_failure()
  {
-    let mut ctx = context();
-    let c: *mut Ctx = &mut ctx;
-    let k = word_of(unsafe { tasks::rt_keep(c, handed(42), &INTS) });
+    let mut context = new_context();
+    let c: *mut Context = &mut context;
+    let k = word_of(unsafe { tasks::rt_keep(c, owned(42), &INTS) });
     assert_eq!(word_of(unsafe { tasks::rt_open(c, handle(k), &INTS) }), 42);
-    assert!(ctx.take_failure().is_none());
+    assert!(context.take_failure().is_none());
     unsafe { tasks::rt_open(c, handle(k), &TEXTS) };
-    let d = ctx
+    let d = context
         .take_failure()
         .expect("a kept `Int` opened as a `String`");
     assert!(
@@ -392,8 +397,8 @@ fn a_value_saved_with_rt_keep_opens_as_its_saved_type_and_opening_it_as_another_
         "{}",
         d.message
     );
-    let_go(&mut ctx, k);
-    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
+    let_go(&mut context, k);
+    assert_eq!((context.heap.live(), context.heap.natives()), (0, 0));
 }
 
 thread_local! {
@@ -404,52 +409,54 @@ thread_local! {
 #[repr(C, align(8))]
 struct ImmortalClosure {
     rc: u32,
-    desc: &'static PlyFnDesc,
+    descriptor: &'static PlyFunctionDescriptor,
 }
 
-unsafe extern "C" fn kept_alone(_ctx: *mut Ctx, _f: Handed) -> Word {
+unsafe extern "C" fn ignores_value(_context: *mut Context, _f: OwnedWord) -> Word {
     0
 }
 
-const fn function(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word) -> PlyFnDesc {
-    PlyFnDesc {
+const fn function(
+    uniform: unsafe extern "C" fn(*mut Context, Word, *const Word) -> Word,
+) -> PlyFunctionDescriptor {
+    PlyFunctionDescriptor {
         uniform,
         typed: None,
         convention: 0,
-        release: kept_alone,
+        release: ignores_value,
         share: untouched,
         keep: untouched,
     }
 }
 
-unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
-    let c = unsafe { &mut *ctx };
+unsafe extern "C" fn results_five(context: *mut Context, _f: Word, _args: *const Word) -> Word {
+    let c = unsafe { &mut *context };
     let first = if c.entering_words == 0 {
         0
     } else {
         unsafe { *(c.entering_words as *const Word) }
     };
-    ENTERED.with(|e| e.borrow_mut().extend([c.entering_desc, first]));
-    c.entering_desc = 0;
+    ENTERED.with(|e| e.borrow_mut().extend([c.entering_descriptor, first]));
+    c.entering_descriptor = 0;
     c.entering_words = 0;
-    word_of(unsafe { tasks::rt_keep(ctx, handed(5), &INTS) })
+    word_of(unsafe { tasks::rt_keep(context, owned(5), &INTS) })
 }
 
-unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+unsafe extern "C" fn requests_three(context: *mut Context, _f: Word, _args: *const Word) -> Word {
     let s = STACKS.with(Cell::get);
-    unsafe { tasks::rt_task_yielded(ctx, handle(s), I64(3), I64(4), I64(5)) };
+    unsafe { tasks::rt_task_yielded(context, handle(s), I64(3), I64(4), I64(5)) };
     0
 }
 
-static FIVE: PlyFnDesc = function(results_five);
-static THREE: PlyFnDesc = function(asks_three);
+static FIVE: PlyFunctionDescriptor = function(results_five);
+static THREE: PlyFunctionDescriptor = function(requests_three);
 static RESULTS_FIVE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
-    desc: &FIVE,
+    descriptor: &FIVE,
 };
 static YIELDS_CODE_THREE_CLOSURE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
-    desc: &THREE,
+    descriptor: &THREE,
 };
 
 fn block(f: &'static ImmortalClosure) -> Block {
@@ -457,12 +464,12 @@ fn block(f: &'static ImmortalClosure) -> Block {
 }
 
 fn started(
-    ctx: &mut Ctx,
+    context: &mut Context,
     f: &'static ImmortalClosure,
     descriptor: &[Word],
     words: &mut [Word],
 ) -> (Word, Word) {
-    let c: *mut Ctx = ctx;
+    let c: *mut Context = context;
     let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1), I64(-1), I64(0), I64(0)) });
     let scheduler = unsafe { tasks::rt_stacks_region(c, handle(s)) };
     let t = word_of(unsafe { tasks::rt_task_made(c, scheduler) });
@@ -471,7 +478,7 @@ fn started(
     });
     words.iter_mut().for_each(|w| *w = 0);
     unsafe { tasks::rt_task_started(c, handle(s), I64(1), handle(b)) };
-    let_go(ctx, b);
+    let_go(context, b);
     STACKS.with(|x| x.set(s));
     (s, t)
 }
@@ -479,10 +486,10 @@ fn started(
 #[test]
 fn a_started_task_runs_its_body_with_its_descriptor_and_captured_values_and_stores_the_result_in_its_handle()
  {
-    let mut ctx = context();
-    let c: *mut Ctx = &mut ctx;
+    let mut context = new_context();
+    let c: *mut Context = &mut context;
     let descriptor = [1, 0, -1];
-    let (s, t) = started(&mut ctx, &RESULTS_FIVE, &descriptor, &mut [77]);
+    let (s, t) = started(&mut context, &RESULTS_FIVE, &descriptor, &mut [77]);
     assert_eq!(unsafe { tasks::rt_task_said(c, handle(t), I64(1)) }.0, 1);
     let ended = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     assert_eq!(ended.0, FINISHED);
@@ -499,24 +506,28 @@ fn a_started_task_runs_its_body_with_its_descriptor_and_captured_values_and_stor
         word_of(unsafe { tasks::rt_open(c, handle(result), &INTS) }),
         5
     );
-    let_go(&mut ctx, result);
+    let_go(&mut context, result);
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
-    let_go(&mut ctx, t);
-    let_go(&mut ctx, s);
-    assert!(ctx.take_failure().is_none());
-    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
+    let_go(&mut context, t);
+    let_go(&mut context, s);
+    assert!(context.take_failure().is_none());
+    assert_eq!((context.heap.live(), context.heap.natives()), (0, 0));
 }
 
 #[test]
 fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_span_and_can_be_resumed_to_unwind_or_fail()
  {
-    let mut ctx = context();
-    let c: *mut Ctx = &mut ctx;
-    (ctx.performed_root, ctx.performed_start, ctx.performed_end) = (9, 10, 11);
-    let (s, t) = started(&mut ctx, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
+    let mut context = new_context();
+    let c: *mut Context = &mut context;
+    (
+        context.performed_root,
+        context.performed_start,
+        context.performed_end,
+    ) = (9, 10, 11);
+    let (s, t) = started(&mut context, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
     let asked = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     assert_eq!(asked.0, 3);
-    let said = |f: unsafe extern "C" fn(*mut Ctx, Handle, I64) -> I64, i| unsafe { f(c, handle(s), I64(i)) }.0;
+    let said = |f: unsafe extern "C" fn(*mut Context, Handle, I64) -> I64, i| unsafe { f(c, handle(s), I64(i)) }.0;
     assert_eq!(
         (
             said(tasks::rt_asked_number, 0),
@@ -528,12 +539,12 @@ fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_sp
     assert_eq!(site, [9, 10, 11]);
     let ended = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(RESUME_UNWIND), I64(0)) };
     assert_eq!(ended.0, UNWOUND);
-    assert_eq!(ctx.failed, 0);
+    assert_eq!(context.failed, 0);
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
-    let_go(&mut ctx, t);
-    let_go(&mut ctx, s);
+    let_go(&mut context, t);
+    let_go(&mut context, s);
 
-    let (s, t) = started(&mut ctx, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
+    let (s, t) = started(&mut context, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
     unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     let failure = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
     let ended = unsafe {
@@ -541,21 +552,21 @@ fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_sp
             c,
             handle(s),
             I64(1),
-            Addr(failure.as_ptr() as *mut u8),
+            Address(failure.as_ptr() as *mut u8),
             I64(failure.len() as i64),
         )
     };
     assert_eq!(ended.0, RAISED);
-    let none = Addr(std::ptr::null_mut());
+    let none = Address(std::ptr::null_mut());
     assert_eq!(
         unsafe { tasks::rt_task_restored(c, handle(s), I64(1), none, I64(0)) }.0,
         1
     );
-    assert_eq!(ctx.failed, FAILED_PENDING_RAISE);
-    let d = ctx.take_failure().expect("the raise is put back");
+    assert_eq!(context.failed, FAILED_PENDING_RAISE);
+    let d = context.take_failure().expect("the raise is put back");
     assert_eq!(d.message, "m");
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
-    let_go(&mut ctx, t);
-    let_go(&mut ctx, s);
-    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
+    let_go(&mut context, t);
+    let_go(&mut context, s);
+    assert_eq!((context.heap.live(), context.heap.natives()), (0, 0));
 }

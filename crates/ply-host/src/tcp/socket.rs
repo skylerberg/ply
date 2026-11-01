@@ -416,7 +416,7 @@ impl TcpHost {
         let sockets = Arc::clone(&self.sockets);
         let label = label.to_string();
         Box::new(move || {
-            Ok(found(reach(&host, port, timeout).map(|stream| {
+            Ok(found(connect_to_host(&host, port, timeout).map(|stream| {
                 int(sockets.insert(Some(&label), Socket::Stream(Plain::Tcp(Arc::new(stream)))))
             })))
         })
@@ -431,7 +431,7 @@ impl TcpHost {
             let Ok(name) = ServerName::try_from(host.clone()) else {
                 return Ok(found(None::<[u8; 8]>));
             };
-            Ok(found(reach(&host, port, timeout).map(|stream| {
+            Ok(found(connect_to_host(&host, port, timeout).map(|stream| {
                 let session = tls::Session::connect(config, name, Arc::new(stream), handshakes);
                 int(sockets.insert(Some(&label), Socket::Tls(Arc::new(session))))
             })))
@@ -475,7 +475,7 @@ impl TcpHost {
         let sockets = Arc::clone(&self.sockets);
         let label = label.to_string();
         Ok(Box::new(move || {
-            Ok(wire::result(reach_unix(&path, timeout).map(|stream| {
+            Ok(wire::result(connect_unix(&path, timeout).map(|stream| {
                 let handle =
                     sockets.insert(Some(&label), Socket::Stream(Plain::Unix(Arc::new(stream))));
                 int(handle).to_vec()
@@ -924,7 +924,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
+fn connect_to_host(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
     use std::net::ToSocketAddrs;
     if !host.is_ascii() {
         return None;
@@ -932,7 +932,7 @@ fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
     let addrs = (host, port).to_socket_addrs().ok()?;
     let stream = addrs
         .into_iter()
-        .find_map(|addr| TcpStream::connect_timeout(&addr, timeout).ok())?;
+        .find_map(|address| TcpStream::connect_timeout(&address, timeout).ok())?;
     let _ = stream.set_nodelay(true);
     Some(stream)
 }
@@ -942,7 +942,7 @@ fn connect_tcp(
     options: &[SocketOption],
     timeout: Duration,
 ) -> Result<TcpStream, NetError> {
-    let address = to.socket_addr()?;
+    let address = to.socket_address()?;
     let rejection = |e: io::Error| NetError::of(&e);
     let socket = RawSocket::new(
         Domain::for_address(address),
@@ -961,7 +961,7 @@ fn connect_tcp(
 }
 
 #[cfg(unix)]
-fn reach_unix(path: &Path, timeout: Duration) -> Result<UnixStream, NetError> {
+fn connect_unix(path: &Path, timeout: Duration) -> Result<UnixStream, NetError> {
     let rejection = |e: io::Error| NetError::of(&e);
     let address = SockAddr::unix(path).map_err(rejection)?;
     let socket = RawSocket::new(Domain::UNIX, Type::STREAM, None).map_err(rejection)?;
@@ -982,7 +982,7 @@ fn no_unix_sockets() -> NetError {
 }
 
 fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, NetError> {
-    let address = to.socket_addr()?;
+    let address = to.socket_address()?;
     let rejection = |e: io::Error| NetError::of(&e);
     let socket = RawSocket::new(
         Domain::for_address(address),

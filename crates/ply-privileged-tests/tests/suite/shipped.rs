@@ -1,7 +1,7 @@
 use crate::pack::SHIPPED;
 use ply_privileged::shipped_modules;
 
-fn held(path: &str) -> &'static [u8] {
+fn shipped_bytes(path: &str) -> &'static [u8] {
     SHIPPED
         .iter()
         .find(|(p, _)| *p == path)
@@ -16,7 +16,7 @@ fn a_standard_library_module_in_the_binary_is_listed_by_its_dotted_module_name()
     assert!(names.iter().any(|n| n == "std.hash.legacy"), "{names:?}");
     assert_eq!(
         shipped_modules::source("std.hash.legacy").map(str::as_bytes),
-        Some(held("std/hash/legacy.ply"))
+        Some(shipped_bytes("std/hash/legacy.ply"))
     );
     assert!(
         !shipped_modules::data_names()
@@ -36,12 +36,12 @@ fn a_compiler_module_in_the_binary_is_listed_by_its_dotted_module_name() {
     );
     assert_eq!(
         shipped_modules::source("compiler.emit.roots").map(str::as_bytes),
-        Some(held("compiler/emit/roots.ply"))
+        Some(shipped_bytes("compiler/emit/roots.ply"))
     );
     assert_eq!(
         ply_privileged::shipped::module_digest("compiler.emit.roots"),
         Some(
-            blake3::hash(held("compiler/emit/roots.ply"))
+            blake3::hash(shipped_bytes("compiler/emit/roots.ply"))
                 .to_hex()
                 .to_string()
         )
@@ -52,7 +52,7 @@ fn a_compiler_module_in_the_binary_is_listed_by_its_dotted_module_name() {
 fn a_data_file_embedded_by_a_shipped_module_is_stored_under_its_path_and_is_not_listed_as_a_module()
 {
     let name = "std/oid/names.txt";
-    let bytes = held("std/oid/names.txt");
+    let bytes = shipped_bytes("std/oid/names.txt");
     assert!(shipped_modules::data_names().iter().any(|n| n == name));
     assert_eq!(shipped_modules::data(name), Some(bytes));
     assert_eq!(

@@ -1,7 +1,7 @@
-use super::{Nondeterministic, asked};
+use super::{Nondeterministic, if_host_allowed};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::I64;
-use crate::rt::Ctx;
+use crate::rt::Context;
 use std::time::Duration;
 
 pub(super) fn natives() -> Vec<MachineNative> {
@@ -23,7 +23,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-fn monotonic(c: &mut Ctx) -> I64 {
+fn monotonic(c: &mut Context) -> I64 {
     match c.host_runtime().now() {
         Ok(nanos) => I64(nanos),
         Err(d) => {
@@ -33,28 +33,34 @@ fn monotonic(c: &mut Ctx) -> I64 {
     }
 }
 
-pub unsafe extern "C" fn rt_time_now_ms(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "time_now_ms", Nondeterministic, I64(0), |_| {
+pub unsafe extern "C" fn rt_time_now_ms(context: *mut Context) -> I64 {
+    if_host_allowed(context, "time_now_ms", Nondeterministic, I64(0), |_| {
         I64(ply_host::time::wall_clock_ms())
     })
 }
 
-pub unsafe extern "C" fn rt_time_elapsed_ns(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "time_elapsed_ns", Nondeterministic, I64(0), monotonic)
+pub unsafe extern "C" fn rt_time_elapsed_ns(context: *mut Context) -> I64 {
+    if_host_allowed(
+        context,
+        "time_elapsed_ns",
+        Nondeterministic,
+        I64(0),
+        monotonic,
+    )
 }
 
-pub unsafe extern "C" fn rt_time_sleep_ms(ctx: *mut Ctx, ms: I64) {
-    asked(ctx, "time_sleep_ms", Nondeterministic, (), |_| {
+pub unsafe extern "C" fn rt_time_sleep_ms(context: *mut Context, ms: I64) {
+    if_host_allowed(context, "time_sleep_ms", Nondeterministic, (), |_| {
         std::thread::sleep(Duration::from_millis(u64::try_from(ms.0).unwrap_or(0)));
     });
 }
 
-pub unsafe extern "C" fn rt_clock_now(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "clock_now", Nondeterministic, I64(0), monotonic)
+pub unsafe extern "C" fn rt_clock_now(context: *mut Context) -> I64 {
+    if_host_allowed(context, "clock_now", Nondeterministic, I64(0), monotonic)
 }
 
-pub unsafe extern "C" fn rt_clock_sleep(ctx: *mut Ctx, nanos: I64) {
-    asked(ctx, "clock_sleep", Nondeterministic, (), |c| {
+pub unsafe extern "C" fn rt_clock_sleep(context: *mut Context, nanos: I64) {
+    if_host_allowed(context, "clock_sleep", Nondeterministic, (), |c| {
         if crate::tasks::waited(c, crate::tasks::REQUEST_SLEEP, nanos.0).is_none() {
             std::thread::sleep(Duration::from_nanos(u64::try_from(nanos.0).unwrap_or(0)));
         }
