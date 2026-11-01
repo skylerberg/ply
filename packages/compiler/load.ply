@@ -1,5 +1,5 @@
 import compiler.front.published (no_rows, dump_of)
-import compiler.front.rows (Dump, Rows, module_of, HashTableRow, DefinitionHashRow)
+import compiler.front.rows (Dump, Rows, module_of, HashTableRow, DefinitionHashRow, TestHashRow)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, view_dump)
 import compiler.front (ShippedInputs, analyse_pulling_std_with, checked_staged, dependencies_of,
                        shipped_inputs_of, load_with_shipped, viewed_text, embed_inputs_of,
@@ -1121,7 +1121,7 @@ test "a file `a.ply` sorts before the files in directory `a/`, as `ply` orders t
   }
 }
 
-fn manifest(name: String, dependencies: String) -> Bytes =
+pub fn manifest(name: String, dependencies: String) -> Bytes =
   Bytes::of_string(
     "import std.pkg (Manifest)\n\nfn package() -> Manifest = {\n  name: \"" ++ name
       ++ "\",\n  version: { major: 0, minor: 1, patch: 0 },\n  prefix: None,\n  runtime: { major: 0, minor: 16, patch: 0 },\n  dependencies: ["
@@ -1129,7 +1129,7 @@ fn manifest(name: String, dependencies: String) -> Bytes =
       ++ "],\n  entry: None,\n}\n",
   )
 
-fn path_dependency(name: String, path: String) -> String =
+pub fn path_dependency(name: String, path: String) -> String =
   "{ name: \"" ++ name ++ "\", prefix: None, min: { major: 0, minor: 1, patch: 0 }, source: Path(\""
     ++ path
     ++ "\") }"
@@ -1220,12 +1220,112 @@ test "a module can embed a file next to it: the loaded program records the file'
   }
 }
 
+test "an embed reads its path from the module's own directory, and a directory's files below it in path order, the hidden ones passed over" {
+  let tree = fs::mem_of([
+    { path: "p/data.txt", body: b"hi" },
+    { path: "p/sub/m.ply", body: b"" },
+    { path: "p/sub/files/b.txt", body: b"B" },
+    { path: "p/sub/files/a.txt", body: b"A" },
+    { path: "p/sub/files/deeper/c.txt", body: b"C" },
+    { path: "p/sub/files/.cache/d.txt", body: b"not read" },
+    { path: "p/sub/files/.hidden", body: b"not read" },
+  ]);
+  let read = |path: String, dir: Bool|
+    fs::on_mem[t](tree, || read_embed[t]("p/sub/m.ply", path, dir)).value;
+  assert_eq(read("../data.txt", false), Ok([{ name: b"", bytes: b"hi" }]));
+  assert_eq(
+    read("files", true),
+    Ok([
+      { name: b"a.txt", bytes: b"A" },
+      { name: b"b.txt", bytes: b"B" },
+      { name: b"deeper/c.txt", bytes: b"C" },
+    ]),
+  )
+}
+
+test "a name a module does not declare is rejected with every name the module exports" {
+  let files = [
+    {
+      path: "lib.ply",
+      name: "lib",
+      text: b"pub fn one() -> Int = 1\nfn hidden() -> Int = 2\npub fn two() -> Int = 3\n",
+    },
+    {
+      path: "app.ply",
+      name: "app",
+      text: b"import lib (sum)\nimport std.words (no_such_name)\nfn go() -> Int = 0\n",
+    },
+  ];
+  let checked = handle {
+    check_in_memory(files, Map::new())
+  } with {
+    shipped.names() -> ["std.words", "std.prelude"],
+    shipped.module(name) -> if name == "std.words" {
+      Some(b"pub fn count() -> Int = 2\nfn kept() -> Int = 3\npub fn first() -> Int = 1\n")
+    } else { prelude_named(name) },
+    shipped.report_view_used(view, pulled) -> (),
+  };
+  match checked {
+    Ok(_) -> panic("neither module declares the name its import selects"),
+    Err(u) ->
+      assert_eq(
+        u.diagnostics.filter(|d: Diagnostic| d.code == b"E0101").map(|d: Diagnostic| d.notes_text),
+        [[b"`lib` exports: `one`, `two`"], [b"`std.words` exports: `count`, `first`"]],
+      ),
+  }
+}
+
 fn definition_hash(d: Dump, name: Bytes) -> Option<Bytes> =
   d.hashes.fold(None, |accumulator: Option<Bytes>, f: HashTableRow|
     match f {
       DefinitionHashRow(r) -> if r.name == name { r.definition } else { accumulator },
       _ -> accumulator,
     })
+
+fn test_hash(d: Dump, key: Bytes) -> Option<Bytes> =
+  d.hashes.fold(None, |accumulator: Option<Bytes>, f: HashTableRow|
+    match f {
+      TestHashRow(r) -> if r.key == key { Some(r.hash) } else { accumulator },
+      _ -> accumulator,
+    })
+
+test "a shipped module is pulled only by a program that imports it, and moves no hash outside what reaches it" {
+  let plain = {
+    path: "m.ply",
+    name: "m",
+    text: b"pub fn total(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\npub fn label(n: Int) -> String = \"n=\" ++ n.to_string()\ntest \"nothing adds up to nothing\" { assert_eq(total([]), 0) }\n",
+  };
+  let user = {
+    path: "other.ply",
+    name: "other",
+    text: b"import std.words (count)\npub fn counted() -> Int = count()\n",
+  };
+  let over = |files: List<SourceFile>|
+    handle {
+      check_in_memory(files, Map::new())
+    } with {
+      shipped.names() -> ["std.words", "std.prelude"],
+      shipped.module(name) -> if name == "std.words" { Some(b"pub fn count() -> Int = 2\n") }
+      else { prelude_named(name) },
+      shipped.report_view_used(view, pulled) -> (),
+    };
+  match ((over([plain]), over([plain, user]))) {
+    (Ok(alone), Ok(beside)) -> {
+      let names = |l: LoadedAnalysis| l.files.map(|f: SourceFile| f.name);
+      assert(!names(alone).contains("std.words"), Some(String::join(names(alone), ", ")));
+      assert(names(beside).contains("std.words"), Some(String::join(names(beside), ", ")));
+      ["m.total", "m.label"].fold((), |u: Unit, name: String| {
+        let hash = |l: LoadedAnalysis| definition_hash(l.dump, Bytes::of_string(name));
+        assert(hash(alone) != None);
+        assert_eq(hash(beside), hash(alone))
+      });
+      let test_of = |l: LoadedAnalysis| test_hash(l.dump, b"m.nothing adds up to nothing");
+      assert(test_of(alone) != None);
+      assert_eq(test_of(beside), test_of(alone))
+    },
+    _ -> panic("both programs check"),
+  }
+}
 
 test "a program given in memory embeds the file its `embed` names by digest, with the same result as a program read from disk" {
   let digest = b"hello".blake3();
@@ -1327,6 +1427,81 @@ test "a standard library module that a program imports can embed a data file shi
   assert_eq(codes(over(None)), [b"E0146"])
 }
 
+fn loaded_over_words(
+  source: Bytes,
+  data: Option<Bytes>,
+) -> Result<LoadedProgram, List<Diagnostic>> / {abort.raise} = {
+  let tree = fs::mem_of([{ path: "p/m.ply", body: source }]);
+  handle {
+    forbid_derivers(|| load[t]("p"))
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> ["std.words", "std.prelude"],
+    shipped.module(name) -> if name == "std.words" { Some(words_over_data()) }
+    else if name == "std/words/list.txt" { data }
+    else { prelude_named(name) },
+    shipped.report_view_used(view, pulled) -> (),
+    shipped.runtime() -> bare_runtime(),
+    shipped.read_pack(path, offset, len) -> None,
+    shipped.definitions() -> listed_queries(),
+    shipped.stamps() -> "",
+  }
+}
+
+fn words_over_data() -> Bytes =
+  b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n\npub fn first() -> Int = 1\n"
+
+fn reaching_words() -> Bytes =
+  b"import std.words\n\npub fn named() -> Int = words::list().len()\n\npub fn plain() -> Int = words::first()\n\ntest \"named\" { assert(named() > 0) }\n"
+
+fn dump_of_load(r: Result<LoadedProgram, List<Diagnostic>>) -> Dump / {abort.raise} =
+  match r { Ok(l) -> l.front.dump, Err(diagnostics) -> panic(messages(diagnostics)) }
+
+test "editing a standard library data file changes the hash of exactly the definitions that depend on it" {
+  let before = dump_of_load(loaded_over_words(reaching_words(), Some(b"one\n")));
+  let after = dump_of_load(loaded_over_words(reaching_words(), Some(b"two\n")));
+  [b"std.words.list", b"m.named"].fold((), |u: Unit, name: Bytes|
+    assert(
+      definition_hash(before, name) != definition_hash(after, name),
+      Some(String::of_bytes_lossy(name)),
+    ));
+  [b"std.words.first", b"m.plain"].fold((), |u: Unit, name: Bytes| {
+    assert(definition_hash(before, name) != None, Some(String::of_bytes_lossy(name)));
+    assert_eq(definition_hash(before, name), definition_hash(after, name))
+  });
+  assert(test_hash(before, b"m.named") != test_hash(after, b"m.named"))
+}
+
+test "a program that uses nothing from a standard library module's data file has no definition whose hash changes when the file is edited" {
+  let idle = b"import std.words\n\npub fn plain() -> Int = words::first()\n";
+  let before = dump_of_load(loaded_over_words(idle, Some(b"one\n")));
+  assert(definition_hash(before, b"std.words.first") != None);
+  assert_eq(definition_hash(before, b"std.words.list"), None);
+  assert_eq(dump_of_load(loaded_over_words(idle, Some(b"two\n"))).hashes, before.hashes)
+}
+
+test "copying a shipped module and its data file into a project produces identical hashes" {
+  let shipped = dump_of_load(loaded_over_words(reaching_words(), Some(b"one\n")));
+  let copied = dump_of_load(
+    loaded_from([
+      { path: "p/mine.ply", body: words_over_data() },
+      { path: "p/words/list.txt", body: b"one\n" },
+      {
+        path: "p/m.ply",
+        body: Bytes::join(reaching_words().split(b"std.words"), b"mine as words"),
+      },
+    ]),
+  );
+  [b"list", b"first"].fold((), |u: Unit, name: Bytes| {
+    let hash = definition_hash(shipped, b"std.words.".concat(name));
+    assert(hash != None, Some(String::of_bytes_lossy(name)));
+    assert_eq(hash, definition_hash(copied, b"mine.".concat(name)))
+  });
+  assert_eq(definition_hash(shipped, b"m.named"), definition_hash(copied, b"m.named"))
+}
+
 test "a standard library module is loaded from its shipped source, and a module that imports it sees that source after `imported` is applied to it" {
   let whole = b"/// Two.\npub fn count() -> Int = 2\n\ntest \"two\" {\n  assert_eq(count(), 2)\n}\n";
   let tree = fs::mem_of([
@@ -1356,6 +1531,39 @@ test "a standard library module is loaded from its shipped source, and a module 
   }
 }
 
+test "a program's load reads no test or law of a shipped module, nor what only they reach" {
+  let counted = b"import std.laws (agrees)\n\n/// One more.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + 1\n\nfn twice(x: Int) -> Int = \"two\"\n\ntest \"more adds one\" {\n  assert_eq(more(twice(1)) 3)\n}\n\nlaw \"more is bump\" = agrees(more, bump)\n";
+  let tree = fs::mem_of([
+    {
+      path: "p/m.ply",
+      body: b"import std.counted\n\npub fn two_more(x: Int) -> Int = counted::more(counted::more(x))\n",
+    },
+  ]);
+  let loaded = handle {
+    forbid_derivers(|| load[t]("p"))
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> ["std.counted", "std.prelude"],
+    shipped.module(name) -> if name == "std.counted" { Some(counted) } else { prelude_named(name) },
+    shipped.report_view_used(view, pulled) -> (),
+    shipped.runtime() -> bare_runtime(),
+    shipped.read_pack(path, offset, len) -> None,
+    shipped.definitions() -> listed_queries(),
+    shipped.stamps() -> "",
+  };
+  match loaded {
+    Err(diagnostics) -> panic(messages(diagnostics)),
+    Ok(l) ->
+      assert_eq(l.front.files.map(|f: SourceFile| f.path), [
+        "p/m.ply",
+        "<std>/counted.ply",
+        "<std>/prelude.ply",
+      ]),
+  }
+}
+
 test "a law over an unconstrained type variable loads, and its body is lowered like a generic function body" {
   match loaded_from([
       {
@@ -1381,20 +1589,24 @@ test "a program that does not check is rejected with what the checker said" {
 }
 
 test "a root module whose name starts with a built-in package's prefix is rejected, including a module named exactly `std`" {
-  ["p/std.ply", "p/std/json.ply", "p/compiler.ply", "p/compiler/front.ply"].fold(
-    (),
-    |u: Unit, path: String|
-      assert(
-        codes(
-          loaded_from([{ path: path, body: b"pub fn f() -> Int = 1\n" }], ["std.list"]),
-        ).contains(
-          b"E0133",
-        ),
-        Some(path),
-      ),
-  );
-  assert_eq(
-    codes(loaded_from([{ path: "p/stdx.ply", body: b"pub fn f() -> Int = 1\n" }], ["std.list"])),
-    [],
-  )
+  let at = |path: String|
+    loaded_from([{ path: path, body: b"pub fn f() -> Int = 1\n" }], ["std.list"]);
+  ["p/std.ply", "p/compiler.ply"].fold((), |u: Unit, path: String|
+    assert(codes(at(path)).contains(b"E0133"), Some(path)));
+  assert_eq(codes(at("p/stdx.ply")), [])
+}
+
+test "the rejection of a built-in package's prefix names the module and points at its file" {
+  [
+    { path: "p/std/json.ply", module: "std.json" },
+    { path: "p/compiler/fmt.ply", module: "compiler.fmt" },
+  ].fold((), |u: Unit, c: { path: String, module: String }|
+    match loaded_from([{ path: c.path, body: b"pub fn f() -> Int = 1\n" }], ["std.list"]) {
+      Ok(_) -> panic("`" ++ c.path ++ "` is rejected"),
+      Err(diagnostics) -> {
+        assert_eq(diagnostics.map(|d: Diagnostic| d.code), [b"E0133"]);
+        assert(messages(diagnostics).contains(c.module), Some(messages(diagnostics)));
+        assert(diagnostics.get(0).labels != [], Some(c.path))
+      },
+    })
 }

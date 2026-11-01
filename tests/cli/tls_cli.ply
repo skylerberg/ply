@@ -1,86 +1,13 @@
-import spawning.harness (RunResult, write_program, write, working_directory, spawned, all_output,
-                         stdout, stderr, json_of, at, path, nth, str, int, json_text, value_of,
-                         WorkingDirectory, PlyProcess)
+import harness (spawned, PlyProcess)
+import support.harness (RunResult, write_program, write, working_directory, all_output, stdout,
+                        stderr, json_of, at, path, nth, str, int, json_text, value_of,
+                        WorkingDirectory)
 import std.certgen (certgen)
 import std.json (Str, Array)
 
 fn secure() -> String = String::of_bytes_lossy(embed("../programs/tls_cli/secure.ply"))
 
 fn upgrading() -> String = String::of_bytes_lossy(embed("../programs/tls_cli/upgrading.ply"))
-
-fn smtp_upgrading(go_ahead: String) -> String =
-  smtp_upgrade() ++ "\nfn go_ahead() -> Bytes = b\"" ++ go_ahead ++ "\"\n"
-
-fn smtp_upgrade() -> String =
-  \\import std.ip
-  \\import std.net
-  \\import std.net (net)
-  \\import std.random (entropy)
-  \\import std.sasl
-  \\import std.sasl (sasl)
-  \\import std.show (show)
-  \\import std.smtp
-  \\import std.smtp (smtp)
-  \\import std.task
-  \\
-  \\fn served(l: Int) -> Result<Unit, String> / {net.write[listener], net.write[conn]} = {
-  \\  let s = net.accept[listener](l);
-  \\  let say = |said: Bytes| net.send[conn](s, said, 5000);
-  \\  let _greeted = say(b"220 localhost ESMTP\r\n");
-  \\  let _hello = net.recv[conn](s, 512, 5000);
-  \\  let _offered = say(b"250-localhost\r\n250 STARTTLS\r\n");
-  \\  let _asked = net.recv[conn](s, 512, 5000);
-  \\  let _left = say(go_ahead());
-  \\  let secured = net.serve_tls[conn](s, "api", [], b"", 5000);
-  \\  let answer = match secured {
-  \\    Err(why) -> Err(net::error_message(why)),
-  \\    Ok(_) -> {
-  \\      let _again = net.recv[conn](s, 512, 5000);
-  \\      let _offered_again = say(b"250-localhost\r\n250 AUTH PLAIN\r\n");
-  \\      let auth = net.recv[conn](s, 512, 5000);
-  \\      let proved = auth == Some(b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n");
-  \\      let _verdict = say(if proved { b"235 2.7.0 Accepted\r\n" } else { b"535 5.7.8 No\r\n" });
-  \\      let _quit = net.recv[conn](s, 512, 5000);
-  \\      let _bye = say(b"221 bye\r\n");
-  \\      if proved { Ok(()) } else { Err("the credential was not the line it must be") }
-  \\    },
-  \\  };
-  \\  net.close[conn](s);
-  \\  answer
-  \\}
-  \\
-  \\fn main() -> Int / {net.read[listener], net.write[listener], net.write[conn], net.write[client], task.write, clock.read, entropy.next, abort.raise} = {
-  \\  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
-  \\    Ok(l) -> l,
-  \\    Err(why) -> panic("no listener: " ++ net::error_message(why)),
-  \\  };
-  \\  let port = match net.local_port[listener](l) { Some(p) -> p, None -> panic("no port") };
-  \\  let held = match try[sasl.fail] {
-  \\    sasl::password("tim", Secret::of_bytes(b"tanstaaftanstaaf"))
-  \\  } {
-  \\    Ok(k) -> k,
-  \\    Err(_) -> panic("the credential was rejected"),
-  \\  };
-  \\  let serving = task.spawn(|| served(l));
-  \\  let kept = try[smtp.fail] {
-  \\    let c = smtp::with_credential(
-  \\      smtp::config("client.example", { ..smtp::default_limits(), transcript: 40 }),
-  \\      held,
-  \\    );
-  \\    task::unbounded(||
-  \\      smtp::with_session[client]("localhost", port, c, |s: smtp::Session|
-  \\        smtp::transcript_text(smtp::transcript(s))))
-  \\  };
-  \\  let served_as = task.join(serving);
-  \\  net.close[listener](l);
-  \\  match kept {
-  \\    Ok(text) -> if served_as == Ok(())
-  \\        && text.contains("*: TLS\nC: EHLO client.example\nS: 250-localhost\nS: 250 AUTH PLAIN\nC: AUTH PLAIN ****\nS: 235 2.7.0 Accepted",
-  \\        ) { 0 }
-  \\    else { panic("the session was not secured and proved:\n" ++ text ++ "\n" ++ show(served_as)) },
-  \\    Err(why) -> panic("the client rejected: " ++ show(why)),
-  \\  }
-  \\}
 
 fn alpn_serving() -> String = String::of_bytes_lossy(embed("../programs/tls_cli/alpn_serving.ply"))
 
@@ -133,27 +60,6 @@ test/nondet "a run given a TLS credential and `--trust` for its certificate comp
       "the client's half: the peer's certificate is not trusted for that name",
     ),
     Some(all_output(untrusted)),
-  )
-}
-
-test/nondet "an SMTP client upgrades to TLS with STARTTLS and verifies the server's certificate, and fails if the certificate is untrusted or extra plaintext follows the STARTTLS reply" {
-  write_program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n"));
-  let api = credential("api");
-  let trusted = ["run", ".", "--tls", tls_flag_value("api", api), "--trust", api.cert];
-  let r = child(trusted);
-  assert(r.code == 0, Some(all_output(r)));
-  let untrusted = child(["run", ".", "--tls", tls_flag_value("api", api)]);
-  assert(
-    untrusted.code != 0
-      && all_output(untrusted).contains("the client rejected: HandshakeFailed(Untrusted)"),
-    Some(all_output(untrusted)),
-  );
-  write_program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n250 AUTH PLAIN\\r\\n"));
-  let again = credential("api");
-  let injected = child(["run", ".", "--tls", tls_flag_value("api", again), "--trust", again.cert]);
-  assert(
-    injected.code != 0 && all_output(injected).contains("the client rejected: Injected"),
-    Some(all_output(injected)),
   )
 }
 
@@ -256,14 +162,6 @@ test/nondet "a credential that does not load is E0430 naming the file" {
   let other = credential("other");
   let r = child(["run", ".", "--tls", tls_flag_value("api", { cert: api.cert, key: other.key })]);
   assert(all_output(r).contains("E0430"), Some(all_output(r)))
-}
-
-test/nondet "a malformed `--tls` argument fails with a message showing the expected `NAME=CERT.pem,KEY.pem` format, not a diagnostic code" {
-  write_program(secure());
-  let r = spawned(["run", ".", "--tls", "api"]);
-  assert(r.code != 0, Some(all_output(r)));
-  assert(stderr(r).contains("--tls NAME=CERT.pem,KEY.pem"), Some(stderr(r)));
-  assert(!stderr(r).contains("E0430"), Some(stderr(r)))
 }
 
 test/nondet "a run given no TLS credential fails with E0429 naming the credential it is missing" {

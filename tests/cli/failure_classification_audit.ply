@@ -1,6 +1,6 @@
-import spawning.harness (PlyProcess, spawned, RunResult, write_program, write, stdout, json_of, at,
-                         path, nth, items, first, str, int, json_text, assert_ok)
-import std.fs (fs)
+import harness (PlyProcess, spawned)
+import support.harness (RunResult, write_program, write, stdout, json_of, at, path, nth, items, str,
+                        int, json_text, assert_ok)
 import std.json
 import std.json (Json, Null)
 import std.string
@@ -9,136 +9,77 @@ import std.list
 fn test_run(flags: List<String>) -> RunResult / {PlyProcess, abort.raise} =
   spawned(["test", ".", "--json"].concat(flags))
 
-type SingleFailure = { failure: Json, status: String }
-
-fn sole_failure() -> SingleFailure / {PlyProcess, abort.raise} = {
-  let r = test_run([]);
-  let v = json_of(r);
-  assert(r.code == 1, Some("a run with one red test exits 1: " ++ json_text(v)));
-  let failures = items(at(v, "failures"));
-  assert(failures.len() == 1, Some("exactly one failure: " ++ json_text(v)));
-  { failure: first(failures), status: str(at(nth(at(v, "results"), 0), "status")) }
-}
-
-fn assert_program_error(s: SingleFailure, what: String) -> Unit / {abort.raise} = {
-  let f = json_text(s.failure);
-  assert(
-    at(s.failure, "internal_error") == json_false(),
-    Some(what ++ " is the program's behaviour, not a defect in Ply: " ++ f),
-  );
-  assert(
-    str(path(s.failure, ["diagnostic", "code"])) != "E0505",
-    Some(what ++ " must not carry the internal-error code: " ++ f),
-  );
-  assert(s.status == "failed", Some(what ++ " is a red test, not a panic: " ++ f))
-}
-
 fn json_false() -> Json = json::Bool(false)
 
-fn message_of(s: SingleFailure) -> String = str(path(s.failure, ["diagnostic", "message"]))
+fn named(list: Json, name: String) -> Json / {abort.raise} =
+  match items(list).filter(|entry: Json| str(at(entry, "name")) == name) {
+    [entry, ..] -> entry,
+    [] -> panic("no entry for `" ++ name ++ "` in " ++ json_text(list)),
+  }
 
-type Case = { what: String, source: String, needle: String }
+type Case = { name: String, needle: String }
 
 fn cases() -> List<Case> =
   [
-    {
-      what: "a runaway recursion",
-      source: "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n",
-      needle: "what the native stack holds",
-    },
-    {
-      what: "a runaway mutual recursion",
-      source: "fn spin(n: Int) -> Int / {diverges} = 1 + spun(n + 1)\nfn spun(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins across two definitions\" { assert_eq(spin(0), 0) }\n",
-      needle: "what the native stack holds",
-    },
-    {
-      what: "an integer overflow",
-      source: "fn grow(n: Int) -> Int = n * 4611686018427387904\ntest \"grows\" { assert_eq(grow(21), 42) }\n",
-      needle: "integer overflow",
-    },
-    {
-      what: "a division by zero",
-      source: "fn div(a: Int, b: Int) -> Int / {abort.raise} = a / b\ntest \"divides\" { assert_eq(div(1, 0), 0) }\n",
-      needle: "division by zero",
-    },
-    {
-      what: "a remainder by zero",
-      source: "fn rem(a: Int, b: Int) -> Int / {abort.raise} = a % b\ntest \"remainders\" { assert_eq(rem(1, 0), 0) }\n",
-      needle: "by zero",
-    },
-    {
-      what: "an explicit panic",
-      source: "fn boom(n: Int) -> Int / {abort.raise} = if n > 0 { panic(\"no\") } else { 0 }\ntest \"booms\" { assert_eq(boom(1), 0) }\n",
-      needle: "panic: no",
-    },
-    {
-      what: "a runaway range",
-      source: "fn big() -> List<Int> = range(0, 99999999)\ntest \"ranges\" { assert_eq(big().len(), 1) }\n",
-      needle: "exceeds the limit",
-    },
-    {
-      what: "a refutable `let` that did not match",
-      source: "type Shape = Circle(Int) | Tri(Int)\nfn radius(s: Shape) -> Int / {abort.raise} = { let Circle(r) = s; r }\ntest \"unwraps\" { assert_eq(radius(Tri(2)), 2) }\n",
-      needle: "did not match",
-    },
-    {
-      what: "a failing assert_eq",
-      source: "fn one() -> Int = 1\ntest \"equals\" { assert_eq(one(), 2) }\n",
-      needle: "assertion failed",
-    },
-    {
-      what: "a failing assert",
-      source: "fn no() -> Bool = false\ntest \"holds\" { assert(no()) }\n",
-      needle: "assertion failed",
-    },
-    {
-      what: "a failing assert carrying its message",
-      source: "fn no() -> Bool = false\ntest \"holds\" { assert(no(), Some(\"the balance must be positive\")) }\n",
-      needle: "assertion failed",
-    },
-    {
-      what: "a failing assert whose message was given by name",
-      source: "fn no() -> Bool = false\ntest \"holds\" { assert(no(), message: Some(\"by name\")) }\n",
-      needle: "assertion failed",
-    },
+    { name: "a runaway recursion", needle: "what the native stack holds" },
+    { name: "a runaway mutual recursion", needle: "what the native stack holds" },
+    { name: "an integer overflow", needle: "integer overflow" },
+    { name: "a division by zero", needle: "division by zero" },
+    { name: "a runaway range", needle: "exceeds the limit" },
+    { name: "a failing assertion", needle: "assertion failed" },
+    { name: "a runaway recursion in a nondet test", needle: "what the native stack holds" },
+    { name: "a task that runs out of stack", needle: "what the native stack holds" },
+    { name: "a runaway recursion in a clause body", needle: "what the native stack holds" },
+    { name: "an overflow in a clause body", needle: "integer overflow" },
   ]
 
-test/nondet "{c.what} is a program error" for c: Case in cases() {
-  write_program(c.source);
-  let s = sole_failure();
-  assert_program_error(s, c.what);
+test/nondet "every runtime failure is the program's, a red test at the call that failed" {
+  write_program(String::of_bytes_lossy(embed("../fixtures/lang/runtime_failures.ply")));
+  let r = test_run([]);
+  let v = json_of(r);
+  let failures = at(v, "failures");
+  assert(r.code == 1, Some("a run with a red test exits 1: " ++ json_text(v)));
+  assert(items(failures).len() == cases().len(), Some(json_text(v)));
+  cases().fold((), |u: Unit, c: Case| {
+    let failure = named(failures, c.name);
+    let d = at(failure, "diagnostic");
+    let f = json_text(failure);
+    assert(at(failure, "internal_error") == json_false(), Some(f));
+    assert(str(at(d, "code")) != "E0505", Some(f));
+    assert(str(at(named(at(v, "results"), c.name), "status")) == "failed", Some(f));
+    assert(str(at(d, "message")).contains(c.needle), Some(f))
+  });
   assert(
-    message_of(s).contains(c.needle),
-    Some("expected a message containing `" ++ c.needle ++ "`, got " ++ message_of(s)),
+    str(path(named(failures, "a runaway recursion"), ["diagnostic", "code"])) == "E0502",
+    Some(json_text(failures)),
+  );
+  ["a runaway recursion", "a task that runs out of stack"].fold((), |u: Unit, name: String|
+    assert(
+      str(at(nth(path(named(failures, name), ["diagnostic", "labels"]), 0), "snippet")).contains(
+        "spin(",
+      ),
+      Some(json_text(failures)),
+    ));
+  assert(
+    json_text(
+      path(named(failures, "a task that runs out of stack"), ["diagnostic", "notes"]),
+    ).contains(
+      "replay with seed",
+    ),
+    Some(json_text(failures)),
+  );
+  assert(items(at(v, "diffs")) == [], Some(json_text(v)));
+  assert(
+    items(failures).all(|failure: Json|
+      items(at(failure, "changes")).all(|x: Json| at(x, "change") == Null)),
+    Some("nothing was compared, so no change may be named: " ++ json_text(v)),
   )
 }
 
-test/nondet "a failure inside a handler clause body is still reported as a program error" {
-  [
-    { needle: "panic: seeded wrong", clause: "panic(\"seeded wrong\")" },
-    { needle: "division by zero", clause: "range(0, 4 / 0).len()" },
-    { needle: "what the native stack holds", clause: "spin(1)" },
-    { needle: "integer overflow", clause: "4611686018427387904 * 4" },
-  ].fold((), |u: Unit, c: { needle: String, clause: String }| {
-    write_program(
-      "effect db { read all[t]() -> List<Int> }\nfn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\nfn rows() -> List<Int> / {db.all[users]} = db.all[users]()\ntest \"counts\" {\n  handle { assert_eq(rows().len(), 2) } with {\n    db.all[users]() -> range(0, "
-        ++ c.clause
-        ++ "),\n  }\n}\n",
-    );
-    let s = sole_failure();
-    assert_program_error(s, c.needle);
-    assert(
-      message_of(s).contains(c.needle),
-      Some("expected `" ++ c.needle ++ "` from the clause body, got " ++ message_of(s)),
-    )
-  })
-}
-
-fn spin() -> String =
-  "fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n"
-
 test/nondet "a test run stopped by the timeout is reported as timed out, not as passed or failed" {
-  write_program(spin());
+  write_program(
+    "fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n",
+  );
   let r = test_run(["--timeout", "300"]);
   let v = json_of(r);
   assert(r.code == 1, Some("an unfinished run is not ok: " ++ json_text(v)));
@@ -155,50 +96,8 @@ test/nondet "a test run stopped by the timeout is reported as timed out, not as 
   assert(int(path(again, ["summary", "timed_out"])) == 1, Some(json_text(again)))
 }
 
-test/nondet "running out of stack is a program error, reported at the call that nested too deep" {
-  write_program(
-    "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n",
-  );
-  let failure = nth(at(json_of(test_run([])), "failures"), 0);
-  let d = at(failure, "diagnostic");
-  assert(at(failure, "internal_error") == json_false(), Some(json_text(failure)));
-  assert(str(at(d, "code")) == "E0502", Some(json_text(failure)));
-  assert(str(at(d, "message")).contains("what the native stack holds"), Some(json_text(failure)));
-  assert(str(at(nth(at(d, "labels"), 0), "snippet")).contains("spin("), Some(json_text(failure)))
-}
-
-test/nondet "a task that runs out of stack is reported at its call, with the seed that replays it" {
-  write_program(
-    "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(simulate { task.join(task.spawn(|| spin(0))) }, 0) }\n",
-  );
-  let failure = nth(at(json_of(test_run([])), "failures"), 0);
-  let d = at(failure, "diagnostic");
-  assert(str(at(d, "message")).contains("what the native stack holds"), Some(json_text(failure)));
-  assert(str(at(nth(at(d, "labels"), 0), "snippet")).contains("spin("), Some(json_text(failure)));
-  assert(json_text(at(d, "notes")).contains("replay with seed"), Some(json_text(failure)))
-}
-
 fn names_in(v: Json, of: List<String>) -> List<String> =
   items(path(v, of)).map(|x: Json| str(at(x, "name")))
-
-fn assert_listed_as_changed(edits: List<String>) -> Unit / {PlyProcess, abort.raise} = {
-  let v = json_of(test_run([]));
-  let failure = nth(at(v, "failures"), 0);
-  assert(at(failure, "internal_error") == json_false(), Some(json_text(failure)));
-  assert(names_in(failure, ["changes"]).take(edits.len()) == edits, Some(json_text(failure)));
-  assert(names_in(v, ["diffs"]) == edits, Some(json_text(v)));
-  assert(items(at(v, "diffs")).all(|d: Json| at(d, "diff") != Null), Some(json_text(v)))
-}
-
-fn recursion() -> String =
-  \\fn step(n: Int) -> Int / {diverges} = if n <= 0 { 0 } else { step(n - 1) + 0 }
-  \\
-  \\fn scale(a: Int, b: Int) -> Int = (a * b) + 0
-  \\
-  \\fn total(a: Int, b: Int) -> Int / {diverges} = scale(a, b) + step(3)
-  \\
-  \\test "total is scaled" { assert_eq(total(2, 3), 6) }
-  \\
 
 fn edited(text: String, edits: List<{ from: String, to: String }>) -> String / {abort.raise} =
   edits.fold(text, |t: String, e: { from: String, to: String }| {
@@ -206,76 +105,63 @@ fn edited(text: String, edits: List<{ from: String, to: String }>) -> String / {
     t.replace(e.from, e.to)
   })
 
-test/nondet "runaway recursion introduced by an edit is reported with the list of edited definitions" {
-  write_program(recursion());
-  assert_ok(spawned(["test", "."]));
-  write(
-    "m.ply",
-    edited(recursion(), [
-      { from: "step(n - 1)", to: "step(n + 1)" },
-      { from: "(a * b) + 0", to: "0 + (a * b)" },
-    ]),
+fn broken() -> List<{ test: String, edits: List<String> }> =
+  [
+    { test: "total is scaled", edits: ["m.scale", "m.step"] },
+    { test: "raised doubles", edits: ["m.grow", "m.level"] },
+    { test: "the picked shape has an area", edits: ["m.pick", "m.shift"] },
+  ]
+
+test/nondet "a failure an edit brings names the edits under it, and a sibling failure loses nothing" {
+  let program = String::of_bytes_lossy(
+    embed("../programs/failure_classification_audit/edited.ply"),
   );
-  assert_listed_as_changed(["m.scale", "m.step"])
-}
-
-fn overflow() -> String =
-  String::of_bytes_lossy(embed("../programs/failure_classification_audit/overflow.ply"))
-
-test/nondet "an overflow introduced by an edit is reported with the list of edited definitions" {
-  write_program(overflow());
+  write_program(program);
   assert_ok(spawned(["test", "."]));
   write(
     "m.ply",
-    edited(overflow(), [
+    edited(program, [
+      { from: "step(n - 1)", to: "step(n + 1)" },
+      { from: "a * b + 0", to: "0 + a * b" },
       { from: "n * 2", to: "n * 4611686018427387904" },
       { from: "(n + 0) * 1", to: "1 * (n + 0)" },
-    ]),
-  );
-  assert_listed_as_changed(["m.grow", "m.shift"])
-}
-
-fn matching() -> String =
-  \\type Shape = Circle(Int) | Square(Int) | Tri(Int)
-  \\
-  \\fn area(s: Shape) -> Int / {abort.raise} = { let Circle(r) = s; r * 3 }
-  \\
-  \\fn pick(n: Int) -> Shape = if n <= 0 { Circle(1) } else { Tri(n) }
-  \\
-  \\fn shift(n: Int) -> Int = n + 0
-  \\
-  \\fn report(n: Int) -> Int / {abort.raise} = area(pick(shift(n)))
-  \\
-  \\test "the picked shape has an area" { assert_eq(report(0), 3) }
-  \\
-
-test/nondet "a pattern that stops matching after an edit is reported with the list of edited definitions" {
-  write_program(matching());
-  assert_ok(spawned(["test", "."]));
-  write(
-    "m.ply",
-    edited(matching(), [
       { from: "if n <= 0 { Circle(1) }", to: "if n < 0 { Circle(1) }" },
       { from: "fn shift(n: Int) -> Int = n + 0", to: "fn shift(n: Int) -> Int = 0 + n" },
     ]),
   );
-  assert_listed_as_changed(["m.pick", "m.shift"])
+  let v = json_of(test_run([]));
+  let failures = at(v, "failures");
+  assert(items(failures).len() == 4, Some(json_text(v)));
+  assert(
+    items(failures).all(|failure: Json| at(failure, "internal_error") == json_false()),
+    Some(json_text(v)),
+  );
+  broken().fold((), |u: Unit, b: { test: String, edits: List<String> }|
+    assert(
+      names_in(named(failures, b.test), ["changes"]).take(b.edits.len()) == b.edits,
+      Some(json_text(v)),
+    ));
+  assert(
+    names_in(named(failures, "step bottoms out"), ["changes"]).contains("m.step"),
+    Some(json_text(v)),
+  );
+  assert(
+    names_in(v, ["diffs"]).sort()
+      == ["m.grow", "m.level", "m.pick", "m.scale", "m.shift", "m.step"],
+    Some(json_text(v)),
+  );
+  assert(items(at(v, "diffs")).all(|d: Json| at(d, "diff") != Null), Some(json_text(v)))
 }
 
-test/nondet "a match that stops being exhaustive fails to compile, so no test runs" {
-  let exhaustive =
+test/nondet "a match that is not exhaustive never reaches the runner" {
+  write_program(
     \\type Shape = Circle(Int) | Square(Int) | Tri(Int)
     \\
-    \\fn area(s: Shape) -> Int = match s { Circle(r) -> r * 3, Square(a) -> a * a, Tri(b) -> b }
+    \\fn area(s: Shape) -> Int = match s { Circle(r) -> r * 3, Square(a) -> a * a }
     \\
-    \\fn pick(n: Int) -> Shape = if n <= 0 { Circle(1) } else { Tri(n) }
+    \\test "a shape has an area" { assert_eq(area(Circle(1)), 3) }
     \\
-    \\test "the picked shape has an area" { assert_eq(area(pick(1)), 1) }
-    \\
-  ;
-  write_program(exhaustive);
-  assert_ok(spawned(["test", "."]));
-  write("m.ply", edited(exhaustive, [{ from: ", Tri(b) -> b", to: "" }]));
+  );
   let r = test_run([]);
   let v = json_of(r);
   assert(r.code == 2, Some(json_text(v)));
@@ -283,46 +169,6 @@ test/nondet "a match that stops being exhaustive fails to compile, so no test ru
   assert(
     at(v, "failures") == Null,
     Some("nothing ran, so there is nothing to classify: " ++ json_text(v)),
-  )
-}
-
-test/nondet "a runaway recursion does not change how a separate failing test is reported" {
-  let both = recursion() ++ "\ntest \"step bottoms out\" { assert_eq(step(3), 0) }\n";
-  write_program(both);
-  assert_ok(spawned(["test", "."]));
-  write(
-    "m.ply",
-    edited(both, [
-      { from: "step(n - 1)", to: "step(n + 1)" },
-      { from: "(a * b) + 0", to: "0 + (a * b)" },
-    ]),
-  );
-  let v = json_of(test_run([]));
-  let failures = items(at(v, "failures"));
-  assert(failures.len() == 2, Some(json_text(v)));
-  failures.fold((), |u: Unit, failure: Json| {
-    assert(at(failure, "internal_error") == json_false(), Some(json_text(failure)));
-    assert(names_in(failure, ["changes"]).contains("m.step"), Some(json_text(failure)))
-  });
-  assert(names_in(v, ["diffs"]) == ["m.scale", "m.step"], Some(json_text(v)))
-}
-
-test/nondet "a runtime limit hit in a `test/nondet` test is reported as a program error" {
-  write_program(
-    "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest/nondet \"spins\" { assert_eq(spin(0), 0) }\n",
-  );
-  assert_program_error(sole_failure(), "a runaway recursion in a nondet test")
-}
-
-test/nondet "a runtime limit hit on the first run reports no change, because no earlier run exists to compare with" {
-  write_program(
-    "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n",
-  );
-  let v = json_of(test_run([]));
-  assert(items(at(v, "diffs")) == [], Some(json_text(v)));
-  assert(
-    items(path(nth(at(v, "failures"), 0), ["changes"])).all(|x: Json| at(x, "change") == Null),
-    Some("nothing was compared, so no change may be named: " ++ json_text(v)),
   )
 }
 

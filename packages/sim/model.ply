@@ -1,7 +1,7 @@
 import plan (Seed, Plan, PartialOrderReduction, Once, Random, default_plan, once, root_seed, u64_le)
 import recording (Step, Interleaving, Passed, Failed, Access, EffectAccess, VariableAccess)
 import search (Exploration, SearchResult, Exact, EveryPair, Cost, explore, explore_under,
-               measure_reduction, backtracks, passed, InvalidRecording, Diverged)
+               measure_reduction, backtracks, passed, run_failure, InvalidRecording, Diverged)
 import std.list
 import std.map
 
@@ -12,6 +12,7 @@ type Operation =
   | Spawn(String, List<Operation>)
   | Join(Int)
   | Yield
+  | When(Int, Int, List<Operation>, List<Operation>)
 
 type ModelTask = {
   name: String,
@@ -23,9 +24,11 @@ type ModelTask = {
   clock: List<Int>,
 }
 
-type Model = { main: List<Operation>, expect: List<{ variable: Int, value: Int }> }
+type Model = { schedulers: List<List<Operation>>, expect: List<{ variable: Int, value: Int }> }
 
-fn program(main: List<Operation>) -> Model = { main: main, expect: [] }
+fn program(main: List<Operation>) -> Model = { schedulers: [main], expect: [] }
+
+fn schedulers(mains: List<List<Operation>>) -> Model = { schedulers: mains, expect: [] }
 
 fn expecting(model: Model, expected: List<{ variable: Int, value: Int }>) -> Model =
   { ..model, expect: expected }
@@ -109,26 +112,48 @@ type RunState = {
   capped: Bool,
 }
 
-fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
-  let main = {
+fn scheduler_ran(
+  st: RunState,
+  seed: Seed,
+  scheduler: Int,
+  main: List<Operation>,
+) -> RunState / {abort.raise} = {
+  let task = {
     name: "main",
-    operations: model.main,
+    operations: main,
     program_counter: 0,
     register: 0,
     children: [],
     blocked: None,
     clock: [0],
   };
-  let start = { tasks: [main], variables: Map::new(), counter: 0, steps: [], capped: false };
-  let end = iterate(start, max_steps() + 2, |st: RunState| {
-    let enabled = enabled_tasks(st.tasks);
-    if enabled.len() == 0 { Stop(st) }
-    else if st.steps.len() >= max_steps() { Stop({ ..st, capped: true }) }
-    else { Continue(take_step(st, seed, enabled)) }
-  });
+  iterate({ ..st, tasks: [task] }, max_steps() + 2, |s: RunState| {
+    let enabled = enabled_tasks(s.tasks);
+    if enabled.len() == 0 { Stop(s) }
+    else if s.steps.len() >= max_steps() { Stop({ ..s, capped: true }) }
+    else { Continue(take_step(s, seed, scheduler, enabled)) }
+  })
+}
+
+fn stuck(tasks: List<ModelTask>) -> Bool / {abort.raise} =
+  range(0, tasks.len()).fold(false, |b: Bool, t: Int| b || !finished(tasks, t))
+
+fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
+  let start = {
+    ran: { tasks: [], variables: Map::new(), counter: 0, steps: [], capped: false },
+    stuck: false,
+  };
+  let end = range(0, model.schedulers.len()).fold(
+    start,
+    |accumulator: { ran: RunState, stuck: Bool }, s: Int|
+      if accumulator.stuck || accumulator.ran.capped { accumulator } else {
+        let ran = scheduler_ran(accumulator.ran, seed, s, model.schedulers.get(s));
+        { ran: ran, stuck: stuck(ran.tasks) }
+      },
+  ).ran;
   if end.capped {
     { steps: end.steps, verdict: Failed("the model ran out of steps"), virtual_time: 0 }
-  } else if range(0, end.tasks.len()).fold(false, |b: Bool, t: Int| b || !finished(end.tasks, t)) {
+  } else if stuck(end.tasks) {
     { steps: end.steps, verdict: Failed("no task can make progress"), virtual_time: 0 }
   } else {
     let wrong = model.expect.filter(|e: { variable: Int, value: Int }|
@@ -149,7 +174,12 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
   }
 }
 
-fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.raise} = {
+fn take_step(
+  st: RunState,
+  seed: Seed,
+  scheduler: Int,
+  enabled: List<Int>,
+) -> RunState / {abort.raise} = {
   let point = st.steps.len();
   let drawn = match seed.path.at(point) {
     Some(fixed) -> { value: fixed, counter: st.counter },
@@ -212,6 +242,20 @@ fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.
       }
     },
     Yield -> { tasks: moved, variables: st.variables, accesses: [] },
+    When(v, n, matching, otherwise) -> {
+      let task = moved.get(t);
+      let branch = if st.variables.get_or(v, 0) == n { matching } else { otherwise };
+      {
+        tasks: moved.set(t, {
+          ..task,
+          operations: task.operations.take(task.program_counter).concat(branch).concat(
+            task.operations.drop(task.program_counter),
+          ),
+        }),
+        variables: st.variables,
+        accesses: [VariableAccess({ handler: 0, index: v, write: false })],
+      }
+    },
   };
   let woken = range(0, did.tasks.len()).fold(did.tasks, |ts: List<ModelTask>, i: Int|
     match ts.get(i).blocked {
@@ -223,7 +267,7 @@ fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.
     variables: did.variables,
     counter: drawn.counter,
     steps: st.steps.push({
-      scheduler: 0,
+      scheduler: scheduler,
       task: t,
       runnable: enabled,
       choice: chosen,
@@ -258,8 +302,10 @@ fn both_orders(model: Model, seeds: List<Seed>, a: Int, b: Int) -> Bool / {abort
 fn independent_tasks() -> Model =
   program([Spawn("a", [Load(1), Store(1)]), Spawn("b", [Load(2), Store(2)]), Join(0), Join(1)])
 
-fn lost_update() -> Model =
-  program([Spawn("a", [Load(1), Store(1)]), Spawn("b", [Load(1), Store(1)]), Join(0), Join(1)])
+fn racing() -> List<Operation> =
+  [Spawn("a", [Load(1), Store(1)]), Spawn("b", [Load(1), Store(1)]), Join(0), Join(1)]
+
+fn lost_update() -> Model = program(racing())
 
 test "tasks that never conflict explore exactly one interleaving" {
   let e = explore_model(
@@ -491,6 +537,17 @@ test "`once` runs only the interleaving that its seed describes, and `Random` mo
   assert_eq(r.exploration.explored, 3)
 }
 
+test "a seed decides which interleaving runs" {
+  let verdicts = range(0, 24).map(|root: Int|
+    passed(
+      explore_model(
+        expecting(lost_update(), [{ variable: 1, value: 2 }]),
+        once({ root: U64::of_int(root), path: [] }),
+      ),
+    ));
+  assert(verdicts.contains(true) && verdicts.contains(false), Some("every root ran alike"))
+}
+
 test "a recorded step for a task that was not runnable is an internal error, and a replay that differs from its recording is a divergence" {
   let bad = |seed: Seed|
     {
@@ -527,4 +584,52 @@ test "a recorded step for a task that was not runnable is an internal error, and
     },
     None -> panic("a divergence was accepted"),
   }
+}
+
+fn lost_from(e: SearchResult<String>, total: Int) -> Bool = {
+  let lost = "expected " ++ total.to_string() ++ " in variable #1, found ";
+  e.exploration.failure != None
+    && (match e.failure {
+      Some(f) -> match run_failure(f) {
+        Some(message) -> message.starts_with(lost) && message != lost ++ total.to_string(),
+        None -> false,
+      },
+      None -> false,
+    })
+}
+
+test "a race in an entry's first scheduler is found, whatever scheduler follows it" {
+  [
+    { model: schedulers([racing(), [Yield]]), total: 2 },
+    { model: schedulers([racing(), racing()]), total: 4 },
+  ].fold((), |_u: Unit, c: { model: Model, total: Int }| {
+    let m = expecting(c.model, [{ variable: 1, value: c.total }]);
+    let sampled = {
+      mode: Random,
+      roots: range(0, 64).map(|r: Int| U64::of_int(r)),
+      budget: 1,
+      steps: 100,
+      path: [],
+    };
+    assert(lost_from(explore_model(m, sampled), c.total));
+    assert(lost_from(explore_model(m, dpor(1024)), c.total))
+  })
+}
+
+fn shaped_by_a_race() -> Model = {
+  let noting = Spawn("noting", [Load(1), Store(2)]);
+  schedulers([racing(), [When(1, 2, [noting, noting, Join(0), Join(1)], [noting, Join(0)])]])
+}
+
+test "a replay is held to its recording up to its branch, past which a scheduler may take another shape" {
+  let e = explore_model(shaped_by_a_race(), dpor(1024));
+  assert(passed(e), Some("a program whose every interleaving passes was rejected"));
+  let second = e.seeds.map(|seed: Seed|
+    run(shaped_by_a_race(), seed).steps.filter(|st: Step| st.scheduler == 1).len());
+  assert(
+    second.any(|n: Int| n != second.get(0)),
+    Some(
+      "the search ran the second scheduler in one shape, so no replay strayed from its recording",
+    ),
+  )
 }

@@ -1,63 +1,7 @@
-import spawning.harness (RunResult, write_project, spawned, all_output, stderr, json_of, at, path,
-                         items, str, int, json_text, diagnostic_codes)
+import harness (spawned)
+import support.harness (RunResult, write_project, stderr, json_of, at, path, str, int, json_text)
 import std.json
 import std.json (Json)
-import std.string
-
-fn service() -> String =
-  \\import std.trace
-  \\import std.trace (trace)
-  \\
-  \\pub fn place_order(sku: String) -> Int / {trace.enter[orders], trace.exit[orders], trace.count[orders]} = {
-  \\  let span = trace.enter[orders]("place_order", Map::new());
-  \\  trace.count[orders]("orders_placed", 1, Map::new());
-  \\  trace.exit[orders](span, trace::Ok);
-  \\  1
-  \\}
-  \\
-  \\pub fn restock(sku: String) -> Int / {trace.event[items]} = {
-  \\  trace.event[items](trace::Info, "restocked", Map::new());
-  \\  2
-  \\}
-  \\
-  \\test "what place_order records is a claim a test can assert on" {
-  \\  let rs = handle {
-  \\    assert_eq(place_order("BOLT-1"), 1)
-  \\  } with {
-  \\    var s = trace::sink(),
-  \\    trace.enter[orders](n, fs) -> {
-  \\      let out = trace::enter_step(s, "orders", n, fs);
-  \\      s = out.sink;
-  \\      out.span
-  \\    },
-  \\    trace.exit[orders](sp, o) -> {
-  \\      let out = trace::exit_step(s, sp, o);
-  \\      s = out.sink;
-  \\      assert(out.ok)
-  \\    },
-  \\    trace.count[orders](n, d, fs) -> {
-  \\      s = trace::count_step(s, "orders", n, d, fs);
-  \\    },
-  \\    return u -> trace::drain(s),
-  \\  };
-  \\  assert_eq(rs.len(), 3);
-  \\  assert_eq(trace::counter_total(rs, "orders_placed"), 1);
-  \\  assert_eq(trace::on_channel(rs, "items").len(), 0)
-  \\}
-  \\
-  \\test "what restock records is recorded on its own channel" {
-  \\  let rs = handle {
-  \\    assert_eq(restock("BOLT-1"), 2)
-  \\  } with {
-  \\    var s = trace::sink(),
-  \\    trace.event[items](l, n, fs) -> {
-  \\      s = trace::event_step(s, "items", l, n, fs);
-  \\    },
-  \\    return u -> trace::drain(s),
-  \\  };
-  \\  assert_eq(trace::on_channel(rs, "items").len(), 1)
-  \\}
-  \\
 
 fn records_of(ran: RunResult) -> List<Json> / {abort.raise} =
   ran.err.filter(|l: String| l.starts_with("{")).map(|l: String|
@@ -65,65 +9,6 @@ fn records_of(ran: RunResult) -> List<Json> / {abort.raise} =
       Ok(j) -> j,
       Err(e) -> panic(json::error_to_string(e) ++ ": " ++ l),
     })
-
-test/nondet "a function's inferred effects list the trace channels it writes to" {
-  write_project([{ path: "m.ply", text: service() }]);
-  let text = String::join(all_output(spawned(["check", ".", "--types"])).words(), " ");
-  assert(
-    text.contains(
-      "place_order : (String) -> Int / {std.trace.trace.count[orders] bounded, std.trace.trace.enter[orders] bounded, std.trace.trace.exit[orders] bounded}",
-    ),
-    Some(text),
-  );
-  assert(
-    text.contains("restock : (String) -> Int / {std.trace.trace.event[items] bounded}"),
-    Some(text),
-  )
-}
-
-test/nondet "`test --explain` puts tests that trace the same channel in one group, because they cannot run together, and tests that trace different channels in separate groups" {
-  write_project([
-    {
-      path: "app.ply",
-      text:
-        \\import std.trace
-        \\import std.trace (trace)
-        \\
-        \\test/nondet "records on orders" {
-        \\  trace.event[orders](trace::Info, "a", Map::new())
-        \\}
-        \\
-        \\test/nondet "records on orders too" {
-        \\  trace.event[orders](trace::Info, "b", Map::new())
-        \\}
-        \\
-        \\test/nondet "records on items" {
-        \\  trace.event[items](trace::Info, "c", Map::new())
-        \\}
-        \\
-    },
-  ]);
-  let explained = json_of(spawned(["test", ".", "--explain", "--json"], []));
-  let selection = at(explained, "selection");
-  let group_of = |name: String|
-    match items(at(selection, "tests")).filter(|t: Json| str(at(t, "name")) == name) {
-      [t, ..] -> int(at(t, "group")),
-      [] -> panic("no test `" ++ name ++ "`: " ++ json_text(explained)),
-    };
-  assert(
-    group_of("records on orders") != group_of("records on orders too"),
-    Some(
-      "two tests recording on one channel conflict and are serialised: " ++ json_text(explained),
-    ),
-  );
-  assert(
-    group_of("records on orders") == group_of("records on items"),
-    Some(
-      "two channels do not conflict, so these two run beside each other: " ++ json_text(explained),
-    ),
-  );
-  assert(int(path(selection, ["parallelism", "groups"])) == 2, Some(json_text(explained)))
-}
 
 test/nondet "when two tasks open and close spans alternately, each span nests only inside spans of its own task" {
   write_project([
@@ -155,49 +40,6 @@ test/nondet "when two tasks open and close spans alternately, each span nests on
     records.filter(|record: Json| str(at(record, "outcome")) == "abandoned").len() == 0,
     Some("every span was closed by the task that opened it: " ++ stderr(r)),
   )
-}
-
-test/nondet "a deterministic test that uses a trace operation no handler covers fails with E0412" {
-  write_project([
-    {
-      path: "app.ply",
-      text:
-        \\import std.trace
-        \\import std.trace (trace)
-        \\
-        \\test "this cannot be deterministic" {
-        \\  trace.event[orders](trace::Info, "x", Map::new())
-        \\}
-        \\
-    },
-  ]);
-  let report = json_of(spawned(["test", ".", "--json"]));
-  assert(
-    diagnostic_codes(report).filter(|c: String| c == "E0412").len() > 0,
-    Some(json_text(report)),
-  )
-}
-
-test/nondet "a tracing test that uses a fake handler is deterministic, is cached on the second run and uses no real resources" {
-  write_project([{ path: "app.ply", text: service() }]);
-  let first = json_of(spawned(["test", ".", "--json"]));
-  assert(int(at(first, "exit_code")) == 0, Some(json_text(first)));
-  assert(int(path(first, ["summary", "passed"])) == 2, Some(json_text(first)));
-  assert(int(path(first, ["summary", "failed"])) == 0, Some(json_text(first)));
-  assert(
-    int(path(first, ["summary", "cached"])) == 0,
-    Some("a first run has nothing cached: " ++ json_text(first)),
-  );
-  assert(
-    !all_output(spawned(["test", "."])).contains("E0424"),
-    Some("a fake-backed test must not reach the boundary"),
-  );
-  let second = json_of(spawned(["test", ".", "--json"]));
-  assert(
-    int(path(second, ["summary", "cached"])) == 2,
-    Some("a trace-collecting test is a `det` test and re-runs never: " ++ json_text(second)),
-  );
-  assert(int(path(second, ["summary", "passed"])) == 0, Some(json_text(second)))
 }
 
 test/nondet "a trace line goes to stderr and leaves the JSON document on stdout intact" {

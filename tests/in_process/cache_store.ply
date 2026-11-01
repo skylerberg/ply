@@ -1,13 +1,53 @@
-import harness (scratch, on_disk, CliEffects, Shipped)
-import spawning.harness (write_program, write, all_output, stdout, stderr, json_of, at, path, nth,
-                         items, str, json_text)
+import harness (scratch, on_disk, on_disk_faked, passing_except, CliEffects, Shipped)
+import support.harness (RunResult, write_project, write_program, write, read, all_output, stdout,
+                        stderr, json_of, at, path, nth, items, str, int, bool, json_text, is_number)
 import std.bytes
+import std.fs (fs, listed_names, File)
 import std.json
 import std.json (Json)
 import std.string
 import std.list
 
 fn green() -> String = String::of_bytes_lossy(embed("../programs/cache_store/green.ply"))
+
+fn faked(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_faked(argv, passing_except([]))
+
+fn stats() -> Json / {CliEffects, Shipped, abort.raise, diverges} =
+  json_of(on_disk(["cache", "stats", ".", "--json"]))
+
+fn codes_of(warnings: Json) -> List<String> = items(warnings).map(|w: Json| str(at(w, "code")))
+
+fn tested_once() -> Unit / {CliEffects, Shipped, abort.raise, diverges} = {
+  write_program(green());
+  let r = faked(["test", "."]);
+  assert(r.code == 0, Some(all_output(r)))
+}
+
+fn store_files(prefix: String) -> List<String> / {fs.read[cwd]} =
+  List::filter(
+    match listed_names(fs.list_dir[cwd](".ply-cache")) { Some(names) -> names, None -> [] },
+    |name: String| name.starts_with(prefix),
+  ).map(|name: String| ".ply-cache/" ++ name)
+
+fn overwrite_manifest(text: String) -> Unit / {fs.read[cwd], fs.write[cwd], abort.raise} =
+  match store_files("manifest-") {
+    [file, ..] -> write(file, text),
+    [] -> panic("the run recorded no store"),
+  }
+
+fn mangle_the_store() -> Unit / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let segments = store_files("seg-");
+  if segments.len() == 0 { panic("the run recorded no store") };
+  segments.fold((), |_: Unit, file: String|
+    match fs.read_file[cwd](file) {
+      None -> panic("a segment of the store does not read"),
+      Some(b) -> if b.len() > 64 {
+        let mangled = b.slice(0, 64).concat(b.slice(64, b.len()).xor_byte(0x5a));
+        if !fs.write_file[cwd](file, mangled) { panic("could not mangle the store") }
+      },
+    })
+}
 
 fn inspect_report(what: String) -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   json_of(on_disk(["cache", "inspect", what, "--json"]))
@@ -71,5 +111,195 @@ test "cache inspect of an unknown name is E0101 and exits two" {
     let v = json_of(j);
     assert(at(v, "ok") == json::Bool(false), Some(json_text(v)));
     assert(str(at(nth(at(v, "diagnostics"), 0), "code")) == "E0101", Some(json_text(v)))
+  })
+}
+
+test "cache stats counts what a run recorded" {
+  scratch(|| {
+    write_program(green());
+    let empty = stdout(faked(["cache", "stats", "."]));
+    assert(empty.contains("0 cached results"), Some(empty));
+    assert(faked(["test", "."]).code == 0, None);
+    let v = stats();
+    assert(str(at(v, "command")) == "cache", Some(json_text(v)));
+    assert(str(at(v, "action")) == "stats", Some(json_text(v)));
+    assert(int(at(v, "entries")) >= 2, Some(json_text(v)));
+    assert(is_number(at(v, "format")), Some(json_text(v)))
+  })
+}
+
+test "cache clear makes the next run re-prove everything" {
+  scratch(|| {
+    tested_once();
+    assert(stdout(faked(["test", "."])).contains("selected 0 of 2"), None);
+    let r = faked(["cache", "clear", "."]);
+    assert(r.code == 0, Some(all_output(r)));
+    assert(stdout(r).contains("cleared"), Some(stdout(r)));
+    let text = stdout(faked(["test", "."]));
+    assert(text.contains("selected 2 of 2 (0 cached)"), Some(text))
+  })
+}
+
+test "a corrupt cache degrades to an empty one rather than crashing" {
+  scratch(|| {
+    tested_once();
+    overwrite_manifest("{ truncated");
+    let r = faked(["test", "."]);
+    assert(r.code == 0, Some(all_output(r)));
+    assert(stdout(r).contains("selected 2 of 2 (0 cached)"), Some(stdout(r)));
+    assert(stdout(r).contains("warning"), Some("the degradation must be reported:\n" ++ stdout(r)))
+  })
+}
+
+test "a damaged store is reported and the run goes on" {
+  scratch(|| {
+    tested_once();
+    mangle_the_store();
+    write("m.ply", green().replace("x * 2", "x * 3"));
+    let r = on_disk_faked(["test", "."], passing_except(["m.double doubles"]));
+    assert(r.code == 1, Some("the edit has to fail a test: " ++ all_output(r)));
+    assert(stdout(r).contains("corrupt"), Some("the damage must be named:\n" ++ stdout(r)));
+    mangle_the_store();
+    let v = json_of(faked(["test", ".", "--json"]));
+    assert(
+      codes_of(at(v, "warnings")).contains("W0602"),
+      Some("the machine artifact carries the same warning: " ++ json_text(at(v, "warnings"))),
+    )
+  })
+}
+
+test "`cache stats` prints how long the cache took to open, the number and size of its segment files, and the cached query result count" {
+  scratch(|| {
+    tested_once();
+    let text = stdout(faked(["cache", "stats", "."]));
+    assert(text.contains("opened in"), Some("the open cost is the claim:\n" ++ text));
+    assert(text.contains("segment"), Some("the store's files must be sized:\n" ++ text));
+    assert(text.contains("memo"), Some(text));
+    assert(text.contains("reclaimable"), Some(text));
+    let v = stats();
+    assert(is_number(at(v, "open_ms")), Some(json_text(v)));
+    assert(int(path(v, ["store", "segments"])) > 0, Some(json_text(v)));
+    assert(is_number(path(v, ["store", "data_bytes"])), Some(json_text(v)));
+    assert(int(path(v, ["memo", "records"])) >= 1, Some(json_text(v)));
+    assert(int(path(v, ["memo", "segments"])) >= 1, Some(json_text(v)));
+    assert(int(path(v, ["memo", "bytes"])) > 0, Some(json_text(v)));
+    assert(is_number(path(v, ["memo", "answers"])), Some(json_text(v)));
+    assert(int(path(v, ["history", "texts"])) > 0, Some(json_text(v)));
+    assert(path(v, ["store", "compact_suggested"]) == json::Bool(false), Some(json_text(v)))
+  })
+}
+
+test "cache compact preserves every cached result, so the next test run still finds all tests cached" {
+  scratch(|| {
+    write_project([
+      { path: "m.ply", text: green() },
+      { path: "gone.ply", text: "fn gone() -> Int = 9\n" },
+    ]);
+    assert(faked(["test", "."]).code == 0, None);
+    let records = int(path(stats(), ["memo", "records"]));
+    assert(fs.remove[cwd]("gone.ply"), None);
+    let r = faked(["cache", "compact", "."]);
+    assert(r.code == 0, Some(all_output(r)));
+    assert(stdout(r).contains("compacted"), Some(stdout(r)));
+    let v = stats();
+    assert(int(path(v, ["memo", "records"])) == records, Some(json_text(v)));
+    assert(int(at(v, "entries")) >= 2, Some(json_text(v)));
+    let text = stdout(faked(["test", "."]));
+    assert(
+      text.contains("selected 0 of 2 (2 cached)"),
+      Some("compaction must not cost a test:\n" ++ text),
+    )
+  })
+}
+
+test "`cache compact` merges cached query results into one segment file and deletes files that no cached result uses" {
+  scratch(|| {
+    tested_once();
+    assert(fs.create_dir[cwd](".ply-cache/memo/records"), None);
+    assert(fs.write_file[cwd](".ply-cache/memo/records/stray", b"a record as a file"), None);
+    let r = faked(["cache", "compact", "."]);
+    assert(r.code == 0, Some(all_output(r)));
+    let names = match listed_names(fs.list_dir[cwd](".ply-cache/memo")) {
+      Some(names) -> names,
+      None -> [],
+    };
+    assert_eq(names.filter(|name: String| name.starts_with("seg-")).len(), 1);
+    assert(!names.contains("records"), Some("records as files are no part of the store"));
+    let v = stats();
+    assert(int(path(v, ["memo", "segments"])) == 1, Some(json_text(v)));
+    let text = stdout(faked(["test", "."]));
+    assert(
+      text.contains("selected 0 of 2 (2 cached)"),
+      Some("compaction must not cost a test:\n" ++ text),
+    )
+  })
+}
+
+test "cache compact --json is one object" {
+  scratch(|| {
+    tested_once();
+    let v = json_of(faked(["cache", "compact", ".", "--json"]));
+    assert(str(at(v, "command")) == "cache", Some(json_text(v)));
+    assert(str(at(v, "action")) == "compact", Some(json_text(v)));
+    assert(bool(at(v, "ok")), Some(json_text(v)));
+    assert(int(at(v, "exit_code")) == 0, Some(json_text(v)));
+    assert(is_number(path(v, ["dropped", "texts"])), Some(json_text(v)));
+    assert(is_number(path(v, ["dropped", "records"])), Some(json_text(v)));
+    assert(is_number(at(v, "bytes_before")), Some(json_text(v)));
+    assert(is_number(at(v, "reclaimed_bytes")), Some(json_text(v)))
+  })
+}
+
+test "cache inspect reports a test and whether it is proven" {
+  scratch(|| {
+    write_program(green());
+    assert(faked(["check", "."]).code == 0, None);
+    let before = nth(at(inspect_report("double doubles"), "matches"), 0);
+    assert(str(at(before, "kind")) == "test", Some(json_text(before)));
+    assert(
+      str(at(before, "result")).contains(
+        "no passing result is cached for this version of the test",
+      ),
+      Some(json_text(before)),
+    );
+    assert(faked(["test", "."]).code == 0, None);
+    let after = nth(at(inspect_report("double doubles"), "matches"), 0);
+    assert(str(at(after, "result")).contains("passed"), Some(json_text(after)));
+    assert(path(after, ["interface", "nondet"]) == json::Bool(false), Some(json_text(after)))
+  })
+}
+
+test "cache stats warns with W0602 when the store manifest is corrupt" {
+  scratch(|| {
+    tested_once();
+    overwrite_manifest("PLYSEGS1 not really a manifest");
+    let v = stats();
+    assert(codes_of(at(v, "warnings")).contains("W0602"), Some(json_text(at(v, "warnings"))))
+  })
+}
+
+test "an unreadable cache file is reported once, not once per read" {
+  scratch(|| {
+    tested_once();
+    let names = match listed_names(fs.list_dir[cwd](".ply-cache")) {
+      Some(ns) -> ns,
+      None -> panic("the run left no cache"),
+    };
+    names.fold((), |u: Unit, name: String| {
+      let file = ".ply-cache/" ++ name;
+      if fs.kind[cwd](file) == File { write(file, "garbage") }
+    });
+    let r = faked(["test", ".", "--json"]);
+    let messages = items(at(json_of(r), "warnings")).map(|w: Json| str(at(w, "message")));
+    let listed = String::join(messages, "\n");
+    assert(
+      messages.filter(|m: String| m.contains("the store is unreadable")).len() == 1,
+      Some(listed),
+    );
+    assert(
+      messages.filter(|m: String| messages.filter(|n: String| n == m).len() > 1).len() == 0,
+      Some("a warning was repeated:\n" ++ listed),
+    );
+    assert(r.code == 0, Some(all_output(r)))
   })
 }

@@ -1,13 +1,12 @@
-import spawning.harness (PlyProcess, Source, write_program, write_project, write, spawned,
-                         all_output, stdout, stderr, json_of, at, path, nth, items, str, int, bool,
-                         json_text, code_of, diagnostic, not_ok, value_of)
-import compiler.store.plyx (Header, Section, SectionLocation, decode, encode, digest_of, domain,
-                            offset_digest, format_version)
-import std.bytes (u32_le)
+import harness (PlyProcess, spawned)
+import support.harness (Source, write_program, write_project, write, all_output, stdout, stderr,
+                        json_of, at, path, nth, items, str, int, bool, json_text, code_of,
+                        diagnostic, not_ok, value_of)
+import support.artifacts (NameRecord, names_of, parts_of, runnable_text, shipped_files)
+import compiler.store.plyx (format_version)
 import std.fs (fs)
-import std.gzip (try_gunzip)
 import std.json
-import std.json (Json, Null, Array, Str)
+import std.json (Json, Null, Str)
 import std.string
 import std.list
 
@@ -40,9 +39,6 @@ fn source() -> String =
 fn bytes_of(file: String) -> Bytes / {fs.read_file[cwd], abort.raise} =
   match fs.read_file[cwd](file) { Some(b) -> b, None -> panic("`" ++ file ++ "` was not written") }
 
-fn put(file: String, b: Bytes) -> Unit / {fs.write_file[cwd], abort.raise} =
-  if !fs.write_file[cwd](file, b) { panic("could not write `" ++ file ++ "`") }
-
 fn built_to(out: String) -> Bytes / {PlyProcess, abort.raise} = {
   let r = spawned(["build", ".", "-o", out]);
   assert(r.code == 0, Some(all_output(r)));
@@ -53,182 +49,6 @@ fn built() -> Bytes / {PlyProcess, abort.raise} = built_to("m.plyx")
 
 fn run_report(file: String) -> Json / {PlyProcess, abort.raise} =
   json_of(spawned(["run", file, "--json"]))
-
-fn write_and_run(file: String, b: Bytes) -> Json / {PlyProcess, fs.write_file[cwd], abort.raise} = {
-  put(file, b);
-  run_report(file)
-}
-
-type Parts = { head: Header, sections: List<Section> }
-
-fn parts_of(b: Bytes) -> Parts / {abort.raise} =
-  match decode(b) {
-    Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
-    Ok(o) ->
-      {
-        head: { frontend: o.frontend, runtime: o.runtime, entry: o.entry },
-        sections: o.sections.map(|p: SectionLocation|
-          { name: p.name, count: p.count, payload: b.slice(p.at, p.at + p.len) }),
-      },
-  }
-
-fn section_locations(b: Bytes) -> List<SectionLocation> / {abort.raise} =
-  match decode(b) {
-    Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
-    Ok(o) -> o.sections,
-  }
-
-fn sealed(parts: Parts) -> Bytes / {abort.raise} = {
-  let encoded = encode(parts.head, parts.sections);
-  match digest_of(domain(), encoded) {
-    None -> panic("a container this short carries no digest"),
-    Some(d) ->
-      Bytes::concat_all([
-        encoded.slice(0, offset_digest()),
-        d,
-        encoded.slice(offset_digest() + 32, encoded.len()),
-      ]),
-  }
-}
-
-fn section(parts: Parts, name: Bytes) -> Section / {abort.raise} =
-  match parts.sections.filter(|s: Section| s.name == name) {
-    [s, ..] -> s,
-    [] -> panic("the artifact carries no `" ++ String::of_bytes(name) ++ "` section"),
-  }
-
-fn with_section(parts: Parts, s: Section) -> Parts =
-  { ..parts, sections: parts.sections.map(|x: Section| if x.name == s.name { s } else { x }) }
-
-fn word(b: Bytes, i: Int) -> Int / {abort.raise} =
-  match b.u32_at(i) { Some(w) -> w, None -> panic("a record runs past its section") }
-
-type Body = { hash: Bytes, body: Bytes }
-
-fn bodies_of(parts: Parts) -> List<Body> / {abort.raise} = {
-  let s = section(parts, b"bodies");
-  let decoded = range(0, s.count).fold(
-    { at: 0, out: [] },
-    |accumulator: { at: Int, out: List<Body> }, _i: Int| {
-      let n = word(s.payload, accumulator.at + 32);
-      {
-        at: accumulator.at + 36 + n,
-        out: accumulator.out.push({
-          hash: s.payload.slice(accumulator.at, accumulator.at + 32),
-          body: s.payload.slice(accumulator.at + 36, accumulator.at + 36 + n),
-        }),
-      }
-    },
-  );
-  decoded.out
-}
-
-fn with_bodies(parts: Parts, bodies: List<Body>) -> Parts =
-  with_section(parts, {
-    name: b"bodies",
-    count: bodies.len(),
-    payload: Bytes::concat_all(
-      bodies.map(|b: Body| Bytes::concat_all([b.hash, u32_le(b.body.len()), b.body])),
-    ),
-  })
-
-type NameRecord = { name: String, hash: Bytes }
-
-fn names_of(parts: Parts) -> List<NameRecord> / {abort.raise} = {
-  let s = section(parts, b"names");
-  let strings = section(parts, b"strings").payload;
-  range(0, s.count).map(|i: Int| {
-    let off = word(s.payload, i * 40);
-    {
-      name: String::of_bytes(strings.slice(off, off + word(s.payload, i * 40 + 4))),
-      hash: s.payload.slice(i * 40 + 8, i * 40 + 40),
-    }
-  })
-}
-
-fn with_names(parts: Parts, names: List<NameRecord>) -> Parts = {
-  let encoded = names.fold(
-    { strings: b"", placed: Map::new(), records: [] },
-    |accumulator: { strings: Bytes, placed: Map<String, Int>, records: List<Bytes> }, named: NameRecord| {
-      let known = accumulator.placed.get(named.name);
-      let offset = match known { Some(o) -> o, None -> accumulator.strings.len() };
-      let text = Bytes::of_string(named.name);
-      {
-        strings: match known {
-          Some(_) -> accumulator.strings,
-          None -> accumulator.strings.concat(text),
-        },
-        placed: accumulator.placed.insert(named.name, offset),
-        records: accumulator.records.push(
-          Bytes::concat_all([u32_le(offset), u32_le(text.len()), named.hash]),
-        ),
-      }
-    },
-  );
-  with_section(
-    with_section(parts, {
-      name: b"names",
-      count: names.len(),
-      payload: Bytes::concat_all(encoded.records),
-    }),
-    { name: b"strings", count: encoded.strings.len(), payload: encoded.strings },
-  )
-}
-
-fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
-  let s = section(parts, b"closure");
-  let decoded = range(0, s.count).fold(
-    { at: 0, out: [] },
-    |accumulator: { at: Int, out: List<Source> }, _i: Int| {
-      let path_len = word(s.payload, accumulator.at);
-      let text_at = accumulator.at + 8 + path_len;
-      let text_len = word(s.payload, accumulator.at + 4 + path_len);
-      {
-        at: text_at + text_len,
-        out: accumulator.out.push({
-          path: String::of_bytes(
-            s.payload.slice(accumulator.at + 4, accumulator.at + 4 + path_len),
-          ),
-          text: String::of_bytes(s.payload.slice(text_at, text_at + text_len)),
-        }),
-      }
-    },
-  );
-  decoded.out
-}
-
-fn with_files(parts: Parts, files: List<Source>) -> Parts =
-  with_section(parts, {
-    name: b"closure",
-    count: files.len(),
-    payload: Bytes::concat_all(
-      files.map(|f: Source| {
-        let file = Bytes::of_string(f.path);
-        let text = Bytes::of_string(f.text);
-        Bytes::concat_all([u32_le(file.len()), file, u32_le(text.len()), text])
-      }),
-    ),
-  })
-
-fn runnable_text(parts: Parts) -> String / {abort.raise} =
-  String::of_bytes_lossy(section(parts, b"runnable").payload)
-    ++ (match try_gunzip(section(parts, b"unit").payload, 67108864) {
-      Ok(b) -> String::of_bytes_lossy(b),
-      Err(rejection) -> panic(f"the unit section does not unpack: {rejection}"),
-    })
-
-test/nondet "an artifact read back section by section and written again is the same bytes" {
-  write_program(source());
-  let b = built();
-  let p = parts_of(b);
-  assert(sealed(p) == b, Some("resealing moved the bytes"));
-  let rewritten = with_files(
-    with_names(with_bodies(p, bodies_of(p)), names_of(p)),
-    shipped_files(p),
-  );
-  assert(sealed(rewritten) == b, Some("a section read and written back moved the bytes"));
-  assert(bool(at(write_and_run("again.plyx", sealed(rewritten)), "ok")), None)
-}
 
 test/nondet "two builds of the same source in two different directories are byte-identical" {
   write_project([{ path: "cold/m.ply", text: source() }, { path: "warm/m.ply", text: source() }]);
@@ -242,14 +62,6 @@ test/nondet "two builds of the same source in two different directories are byte
   assert(cold == spawned(["build", "warm", "--digest"]).out, None);
   let digest = String::join(cold, "");
   assert(digest.starts_with("b3:") && digest.len() == 15, Some(digest))
-}
-
-test/nondet "ply build twice writes the same bytes" {
-  write_program(source());
-  let one = built_to("one.plyx");
-  let two = spawned(["build", ".", "-o", "two.plyx"], []);
-  assert(two.code == 0, Some(all_output(two)));
-  assert(one == bytes_of("two.plyx"), None)
 }
 
 test/nondet "an artifact contains no tests, no property laws and no definitions that `main` does not use" {
@@ -285,63 +97,24 @@ test/nondet "an artifact contains no tests, no property laws and no definitions 
 }
 
 test/nondet "an artifact omits the bytes of a data file that a standard library module embeds, when the program does not use that file" {
-  write_program("import std.oid\n\nfn main() -> Int = oid::arcs(oid::common_name()).len()\n");
-  let b = built();
-  let p = parts_of(b);
-  let names = names_of(p).map(|n: NameRecord| n.name);
-  assert(names.contains("std.oid.arcs"), Some(String::join(names, ", ")));
-  let shipped = [String::of_bytes_lossy(b), runnable_text(p)];
-  shipped.fold((), |u: Unit, text: String|
-    assert(!text.contains("id-kp-OCSPSigning"), Some("the file's bytes shipped")))
-}
-
-test/nondet "an artifact of a program that only compresses with brotli omits the decompressor and the dictionary" {
   write_program(
-    "import std.brotli\n\nfn main() -> Int / {abort.raise} =\n  brotli::compress(b\"some bytes, some bytes\", brotli::Fast).len()\n",
+    "import std.brotli\nimport std.oid\n\nfn main() -> Int / {abort.raise} =\n  oid::arcs(oid::common_name()).len() + brotli::compress(b\"some bytes, some bytes\", brotli::Fast).len()\n",
   );
   let b = built();
   let p = parts_of(b);
   let names = names_of(p).map(|n: NameRecord| n.name);
   let listed = String::join(names, ", ");
+  assert(names.contains("std.oid.arcs"), Some(listed));
   assert(names.contains("std.brotli.compress"), Some(listed));
   assert(
     !names.contains("std.brotli.words") && !names.contains("std.brotli.decompress")
       && !names.contains("std.brotli.commands"),
     Some("only what `compress` reaches: " ++ listed),
   );
-  [String::of_bytes_lossy(b), runnable_text(p)].fold((), |u: Unit, text: String|
-    assert(!text.contains("timedownlifeleftback"), Some("the dictionary's bytes shipped")))
-}
-
-test/nondet "every definition in an artifact is stored under the same hash that `ply hash` prints for it" {
-  write_program(source());
-  let report = json_of(spawned(["hash", ".", "--json"]));
-  let p = parts_of(built());
-  let names = names_of(p);
-  let bodies = bodies_of(p).map(|b: Body| b.hash.hex_of());
-  let checked = items(at(report, "definitions")).fold(0, |n: Int, e: Json|
-    match names.filter(|x: NameRecord| x.name == str(at(e, "name"))) {
-      [recorded, ..] -> {
-        assert(
-          recorded.hash.hex_of() == str(at(e, "hash")),
-          Some("`" ++ recorded.name ++ "` is recorded under a different hash"),
-        );
-        assert(
-          bodies.contains(recorded.hash.hex_of()),
-          Some("`" ++ recorded.name ++ "` has no body"),
-        );
-        n + 1
-      },
-      [] -> n,
-    });
-  assert(checked >= 4, Some("only " ++ checked.to_string() ++ " definitions were compared"))
-}
-
-test/nondet "an artifact runs to the same value as its source" {
-  write_program(source());
-  assert_eq(value_of(spawned(["run", "--json", "m.ply"])), "42");
-  let _ = built();
-  assert_eq(value_of(spawned(["run", "--json", "m.plyx"])), "42")
+  [String::of_bytes_lossy(b), runnable_text(p)].fold((), |u: Unit, text: String| {
+    assert(!text.contains("id-kp-OCSPSigning"), Some("the file's bytes shipped"));
+    assert(!text.contains("timedownlifeleftback"), Some("the dictionary's bytes shipped"))
+  })
 }
 
 test/nondet "a failure in an artifact carries no line number" {
@@ -360,199 +133,6 @@ test/nondet "a failure in an artifact carries no line number" {
   assert(path(nth(at(diagnostic(failed), "labels"), 0), ["start"]) == Null, Some(json_text(failed)))
 }
 
-test/nondet "an artifact whose embedded source files were altered or garbled is rejected with E0443" {
-  write_program(source());
-  let p = parts_of(built());
-  let files = shipped_files(p);
-  let altered = files.map(|f: Source| { ..f, text: f.text.replace("Blue(20)", "Blue(19)") });
-  assert(altered != files, Some("the closure spells the literal"));
-  let garbled = match files {
-    [f, ..rest] -> [{ ..f, text: "fn (" }].concat(rest),
-    [] -> panic("the closure is empty"),
-  };
-  [{ what: "altered", files: altered }, { what: "garbled", files: garbled }].fold(
-    (),
-    |u: Unit, c: { what: String, files: List<Source> }| {
-      let report = write_and_run("t.plyx", sealed(with_files(p, c.files)));
-      assert(
-        code_of(report) == "E0443",
-        Some(
-          "a closure that is not the program must not be believed (" ++ c.what ++ "): "
-            ++ json_text(report),
-        ),
-      )
-    },
-  )
-}
-
-test/nondet "an artifact whose compiled program section comes from a different artifact is rejected with E0443" {
-  write_program(source());
-  let p = parts_of(built());
-  write_program("fn main() -> Int = 7\n");
-  let other = parts_of(built_to("other.plyx"));
-  let report = write_and_run("t.plyx", sealed(with_section(p, section(other, b"runnable"))));
-  assert(code_of(report) == "E0443", Some(json_text(report)))
-}
-
-test/nondet "a flipped bit in a body is E0443 naming the definition" {
-  write_program(source());
-  let b = built();
-  let record = match section_locations(b).filter(|s: SectionLocation| s.name == b"bodies") {
-    [s, ..] -> s.at,
-    [] -> panic("the artifact carries no bodies"),
-  };
-  let flipped = Bytes::concat_all([
-    b.slice(0, record + 36),
-    byte_of_int(b.at(record + 36) ^ 0x40),
-    b.slice(record + 37, b.len()),
-  ]);
-  let report = write_and_run("bad.plyx", flipped);
-  assert(not_ok(report), Some(json_text(report)));
-  assert(code_of(report) == "E0443", Some(json_text(report)));
-  let message = str(at(diagnostic(report), "message"));
-  assert(message.contains("offset " ++ record.to_string()), Some(message));
-  let first = match bodies_of(parts_of(b)) {
-    [x, ..] -> x,
-    [] -> panic("the artifact carries no body"),
-  };
-  assert(message.contains(first.hash.hex_of().slice(0, 12)), Some(message))
-}
-
-test/nondet "every truncated prefix of an artifact is rejected with E0443, and the whole artifact runs" {
-  write_program(source());
-  let b = built();
-  let n = b.len();
-  [0, 1, 100, 187, 188, 200, n / 2, n - 1].fold((), |u: Unit, cut: Int| {
-    let report = write_and_run("t.plyx", b.slice(0, cut));
-    assert(code_of(report) == "E0443", Some("at " ++ cut.to_string() ++ ": " ++ json_text(report)))
-  });
-  assert(bool(at(write_and_run("t.plyx", b), "ok")), None)
-}
-
-test/nondet "removing a body is E0443" {
-  write_program(source());
-  let p = parts_of(built());
-  let victim = match names_of(p).filter(|named: NameRecord| named.name == "m.shade") {
-    [named, ..] -> named.hash,
-    [] -> panic("`shade` is in the closure"),
-  };
-  let without = sealed(
-    with_names(
-      with_bodies(p, bodies_of(p).filter(|b: Body| b.hash != victim)),
-      names_of(p).filter(|named: NameRecord| named.hash != victim),
-    ),
-  );
-  assert(
-    match decode(without) { Ok(_) -> true, Err(_) -> false },
-    Some("the container still verifies"),
-  );
-  let report = write_and_run("open.plyx", without);
-  assert(code_of(report) == "E0443", Some(json_text(report)))
-}
-
-test/nondet "another compiler or runtime is E0444 and not E0443" {
-  write_program(source());
-  let p = parts_of(built());
-  [
-    { what: "compiler", head: { ..p.head, frontend: byte_of_int(7).repeat(32) } },
-    { what: "runtime", head: { ..p.head, runtime: byte_of_int(7).repeat(32) } },
-  ].fold((), |u: Unit, c: { what: String, head: Header }| {
-    let report = write_and_run("old.plyx", sealed({ ..p, head: c.head }));
-    assert(code_of(report) == "E0444", Some("another " ++ c.what ++ ": " ++ json_text(report)))
-  })
-}
-
-test/nondet "a file that is not an artifact says so" {
-  write_program(source());
-  assert(code_of(write_and_run("junk.plyx", b"not a program at all")) == "E0443", None)
-}
-
-test/nondet "the digest is one line and agrees with the build" {
-  write_program(source());
-  let printed = spawned(["build", ".", "--digest"]).out;
-  assert(printed.len() == 1, Some(String::join(printed, "\n")));
-  let digest = String::join(printed, "").ascii_trim();
-  assert(digest.starts_with("b3:") && digest.len() == 15, Some(digest));
-  assert(!fs.exists[cwd]("m.plyx"), Some("`--digest` writes no file"));
-  let report = json_of(spawned(["build", ".", "-o", "m.plyx", "--json"]));
-  assert(str(at(report, "digest")) == digest, Some(json_text(report)))
-}
-
-test/nondet "the digest moves with the closure and with nothing else" {
-  write_program(source());
-  let before = built();
-  [
-    {
-      what: "an unreached definition",
-      edited: source().replace("fn unreached() -> Int = 99", "fn unreached() -> Int = 98"),
-    },
-    { what: "a new unreached type", edited: source() ++ "\ntype Spare = | Unused | Kept(Int)\n" },
-    {
-      what: "a test",
-      edited: source().replace("assert_eq(shade(Blue(7)), 7)", "assert_eq(shade(Blue(8)), 8)"),
-    },
-    { what: "a law", edited: source().replace("n >= 0 && n < 4", "n >= 0 && n < 5") },
-    { what: "a local's name", edited: source().replace("Blue(n) -> n", "Blue(k) -> k") },
-  ].fold((), |u: Unit, e: { what: String, edited: String }| {
-    assert(e.edited != source(), Some(e.what ++ ": the edit did not apply"));
-    write("m.ply", e.edited);
-    assert(built() == before, Some(e.what ++ " moved the artifact"))
-  });
-  write("m.ply", source().replace("Blue(21)", "Blue(22)"));
-  assert(digest_of(domain(), built()) != digest_of(domain(), before), None)
-}
-
-test/nondet "`build --diff` reports added, changed and dropped definitions, and every definition that depends on a changed one" {
-  write_program(source());
-  let _ = built_to("old.plyx");
-  write(
-    "m.ply",
-    source().replace("Red -> 0", "Red -> 1").replace(
-      "fn unreached() -> Int = 99",
-      "fn restock() -> Int = 1\nfn unreached() -> Int = 99",
-    ),
-  );
-  let report = json_of(spawned(["build", ".", "--diff", "old.plyx", "--json"]));
-  let changed = items(at(report, "changed")).map(str);
-  assert(changed.contains("m.shade"), Some(json_text(report)));
-  assert(
-    changed.contains("m.main"),
-    Some("changing a callee changes its caller: " ++ json_text(report)),
-  );
-  assert(items(at(report, "added")) == [], Some(json_text(report)));
-  assert(items(at(report, "dropped")) == [], Some(json_text(report)));
-  let reachable_names = items(at(report, "reached")).map(str);
-  changed.fold((), |u: Unit, name: String|
-    assert(reachable_names.contains(name), Some(name ++ " does not reach itself")));
-  assert(reachable_names.contains("m.main"), Some(json_text(report)));
-  assert(!reachable_names.contains("m.Colour"), Some("a type reaches no function"));
-  assert(int(at(report, "artifact_bytes")) > 0, Some(json_text(report)))
-}
-
-test/nondet "diff counts an addition and a removal" {
-  write_program("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
-  let _ = built_to("old.plyx");
-  write("m.ply", "fn other() -> Int = 2\nfn main() -> Int = other()\n");
-  let report = json_of(spawned(["build", ".", "--diff", "old.plyx", "--json"]));
-  assert(at(report, "added") == Array([Str("m.other")]), Some(json_text(report)));
-  assert(at(report, "dropped") == Array([Str("m.helper")]), Some(json_text(report)));
-  assert(at(report, "changed") == Array([Str("m.main")]), Some(json_text(report)))
-}
-
-test/nondet "a rename moves a name and no hash" {
-  write_program("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
-  let before = parts_of(built_to("old.plyx"));
-  write("m.ply", "fn assistant() -> Int = 1\nfn main() -> Int = assistant()\n");
-  let report = json_of(spawned(["build", ".", "--diff", "old.plyx", "--json"]));
-  assert(at(report, "added") == Array([Str("m.assistant")]), Some(json_text(report)));
-  assert(at(report, "dropped") == Array([Str("m.helper")]), Some(json_text(report)));
-  assert(at(report, "changed") == Array([]), Some(json_text(report)));
-  assert(
-    bodies_of(before) == bodies_of(parts_of(built_to("new.plyx"))),
-    Some("a rename may not move a body"),
-  )
-}
-
 fn runs_as_its_source() -> Json / {PlyProcess, abort.raise} = {
   let _ = built_to("app.plyx");
   let from_source = run_report(".");
@@ -562,35 +142,17 @@ fn runs_as_its_source() -> Json / {PlyProcess, abort.raise} = {
   at(from_artifact, "value")
 }
 
-test/nondet "two modules whose names end in the same word, such as `left.util` and `right.util`, are packaged and run correctly" {
+test/nondet "an artifact runs to the same value as its source" {
+  write_program(source());
+  assert_eq(value_of(spawned(["run", "--json", "m.ply"])), "42");
+  let _ = built();
+  assert_eq(value_of(spawned(["run", "--json", "m.plyx"])), "42")
+}
+
+test/nondet "what a closure holds of a program ships and runs as the program does" {
   write_project([
     { path: "left/util.ply", text: "pub fn one() -> Int = 1\n" },
     { path: "right/util.ply", text: "pub fn two() -> Int = 20\n" },
-    {
-      path: "m.ply",
-      text: "import left.util as l\nimport right.util as r\n\nfn main() -> Int = l::one() + r::two()\n",
-    },
-  ]);
-  assert(runs_as_its_source() == Str("21"), None);
-  let files = shipped_files(parts_of(bytes_of("app.plyx"))).map(|f: Source| f.path);
-  assert(files == ["left/util.ply", "m.ply", "right/util.ply"], Some(String::join(files, ", ")))
-}
-
-test/nondet "two definitions with identical bodies are both packaged in the artifact, and the artifact runs" {
-  write_program(
-    "fn one() -> Int = 1\nfn uno() -> Int = 1\nfn main() -> Int = one() + uno() * 10\n",
-  );
-  assert(runs_as_its_source() == Str("11"), None);
-  let names = names_of(parts_of(bytes_of("app.plyx")));
-  let hash = |name: String|
-    names.filter(|named: NameRecord| named.name == name).map(|named: NameRecord|
-      named.hash.hex_of());
-  assert(hash("m.one") != [], Some(String::join(names.map(|named: NameRecord| named.name), ", ")));
-  assert(hash("m.one") == hash("m.uno"), Some("one body, two names"))
-}
-
-test/nondet "an artifact omits a function named like an effect when the program never calls that function, and still runs" {
-  write_project([
     {
       path: "gz.ply",
       text:
@@ -606,42 +168,6 @@ test/nondet "an artifact omits a function named like an effect when the program 
         \\
     },
     {
-      path: "m.ply",
-      text:
-        \\import gz
-        \\import gz (gz)
-        \\
-        \\fn main() -> Int = {
-        \\  let got: Result<Int, Int> = try[gz.refused] { gz::read(1) };
-        \\  match got { Ok(n) -> n, Err(_) -> -1 }
-        \\}
-        \\
-    },
-  ]);
-  assert(runs_as_its_source() == Str("2"), None);
-  let p = parts_of(bytes_of("app.plyx"));
-  let names = names_of(p).map(|n: NameRecord| n.name);
-  let listed = String::join(names, ", ");
-  assert(names.contains("gz.read") && names.contains("gz.gz"), Some(listed));
-  assert(!names.contains("gz.written"), Some("the function `gz` calls it: " ++ listed));
-  assert_eq(names.filter(|n: String| n == "gz.gz").len(), 1);
-  let printed = String::join(shipped_files(p).map(|f: Source| f.text), "\n");
-  assert(!printed.contains("31"), Some(printed))
-}
-
-test/nondet "an artifact of a program that reads with std.gzip and handles its rejection builds and runs" {
-  write_program(String::of_bytes_lossy(embed("../programs/artifact/gzip_error.ply")));
-  assert(runs_as_its_source() == Str("0"), None);
-  let names = names_of(parts_of(bytes_of("app.plyx"))).map(|n: NameRecord| n.name);
-  assert(
-    names.contains("std.gzip.inflate") && !names.contains("std.gzip.deflate"),
-    Some(String::join(names, ", ")),
-  )
-}
-
-test/nondet "an artifact builds and runs when two modules define identical `Limits` types and a record literal is passed to one module's function" {
-  write_project([
-    {
       path: "a.ply",
       text: "pub type Limits = new { output: Int, window: Int }\n\npub fn fa(l: Limits) -> Int = l.output + l.window\n",
     },
@@ -654,14 +180,53 @@ test/nondet "an artifact builds and runs when two modules define identical `Limi
       text:
         \\import a
         \\import b
+        \\import gz
+        \\import gz (gz)
+        \\import left.util as l
+        \\import right.util as r
+        \\import std.gzip
+        \\import std.gzip (gzip)
+        \\
+        \\fn one() -> Int = 1
+        \\
+        \\fn uno() -> Int = 1
         \\
         \\fn roomy() -> b::Limits = { output: 1, window: 2 }
         \\
-        \\fn main() -> Int = b::fb(roomy()) + a::fa({ output: 3, window: 4 })
+        \\fn read_gz() -> Int = {
+        \\  let got: Result<Int, Int> = try[gz.refused] { gz::read(1) };
+        \\  match got { Ok(n) -> n, Err(_) -> -1 }
+        \\}
+        \\
+        \\fn inflated() -> Int / {abort.raise} = {
+        \\  let read: Result<Bytes, gzip::Error> = try[gzip.fail] { gzip::inflate(b"\x03\x00", 10) };
+        \\  match read { Ok(all) -> all.len(), Err(_) -> -1 }
+        \\}
+        \\
+        \\fn main() -> Int / {abort.raise} =
+        \\  l::one() + r::two() + one() + uno() * 10 + read_gz() * 100 + b::fb(roomy()) * 1000
+        \\    + a::fa({ output: 3, window: 4 }) * 1000 + inflated() * 100000
         \\
     },
   ]);
-  assert(runs_as_its_source() == Str("9"), None)
+  assert(runs_as_its_source() == Str("9232"), None);
+  let p = parts_of(bytes_of("app.plyx"));
+  let files = shipped_files(p).map(|f: Source| f.path);
+  let names = names_of(p);
+  let listed = String::join(names.map(|n: NameRecord| n.name), ", ");
+  assert(files.contains("left/util.ply") && files.contains("right/util.ply"), Some(listed));
+  let hash = |name: String|
+    names.filter(|named: NameRecord| named.name == name).map(|named: NameRecord|
+      named.hash.hex_of());
+  assert(hash("m.one") != [], Some(listed));
+  assert(hash("m.one") == hash("m.uno"), Some("one body, two names"));
+  let held = names.map(|n: NameRecord| n.name);
+  assert(held.contains("gz.read") && held.contains("gz.gz"), Some(listed));
+  assert(!held.contains("gz.written"), Some("the function `gz` calls it: " ++ listed));
+  assert_eq(held.filter(|n: String| n == "gz.gz").len(), 1);
+  let printed = String::join(shipped_files(p).map(|f: Source| f.text), "\n");
+  assert(!printed.contains("31"), Some(printed));
+  assert(held.contains("std.gzip.inflate") && !held.contains("std.gzip.deflate"), Some(listed))
 }
 
 test/nondet "the build prints the artifact's size beside the binary's" {
@@ -685,42 +250,6 @@ test/nondet "the build prints the artifact's size beside the binary's" {
   )
 }
 
-test/nondet "`--entry` selects which definition an artifact starts, and a build with several `main` definitions and no `--entry` fails" {
-  write_project([
-    { path: "a.ply", text: "fn main() -> Int = 1\n" },
-    { path: "b.ply", text: "fn main() -> Int = 2\n" },
-  ]);
-  assert(spawned(["build", "."]).code != 0, None);
-  let r = spawned(["build", ".", "--entry", "a.main", "-o", "a.plyx"]);
-  assert(r.code == 0, Some(all_output(r)));
-  assert(str(at(run_report("a.plyx"), "value")) == "1", None)
-}
-
-test/nondet "entry can name something other than main" {
-  write_program("fn serve() -> Int = 7\nfn main() -> Int = 1\n");
-  let report = json_of(spawned(["build", ".", "--entry", "serve", "-o", "s.plyx", "--json"]));
-  assert(str(at(report, "entry")) == "m.serve", Some(json_text(report)));
-  assert(str(at(run_report("s.plyx"), "value")) == "7", None)
-}
-
-test/nondet "the default output is named after the module" {
-  write_program(source());
-  assert(spawned(["build", "."]).code == 0, None);
-  assert(fs.exists[cwd]("m.plyx"), None)
-}
-
-test/nondet "a program that does not check produces no artifact" {
-  write_program("fn main() -> Int = true\n");
-  assert(spawned(["build", ".", "-o", "m.plyx"]).code == 2, None);
-  assert(!fs.exists[cwd]("m.plyx"), None)
-}
-
-test/nondet "the output directory is created" {
-  write_program(source());
-  assert(spawned(["build", ".", "-o", "dist/nested/m.plyx"]).code == 0, None);
-  assert(fs.exists[cwd]("dist/nested/m.plyx"), None)
-}
-
 fn service() -> String = String::of_bytes_lossy(embed("../programs/artifact/service.ply"))
 
 test/nondet "an artifact retains the names that host handlers are registered under, so its handlers still run" {
@@ -736,28 +265,6 @@ test/nondet "an artifact retains the names that host handlers are registered und
     ),
   );
   assert(at(from_artifact, "value") == at(from_source, "value"), Some(json_text(from_artifact)))
-}
-
-test/nondet "the artifact records the entry point's full name, such as `m.main`" {
-  write_program(source());
-  let report = json_of(spawned(["build", ".", "-o", "m.plyx", "--json"]));
-  assert(str(at(report, "entry")) == "m.main", Some(json_text(report)));
-  let p = parts_of(bytes_of("m.plyx"));
-  assert(
-    names_of(p).filter(|named: NameRecord| named.hash == p.head.entry).map(|named: NameRecord|
-        named.name)
-      == ["m.main"],
-    None,
-  );
-  assert(str(at(run_report("m.plyx"), "value")) == "42", None)
-}
-
-test/nondet "an entry point that takes an argument is rejected" {
-  write_program("fn serve(port: Int) -> Int = port\nfn main() -> Int = serve(1)\n");
-  let report = json_of(spawned(["build", ".", "--entry", "serve", "--json"]));
-  assert(not_ok(report), Some(json_text(report)));
-  assert(code_of(report) == "E0201", Some(json_text(report)));
-  assert(!fs.exists[cwd]("m.plyx"), None)
 }
 
 fn ready() -> String = String::of_bytes_lossy(embed("../programs/artifact/ready.ply"))
@@ -847,31 +354,7 @@ test/nondet "`build --config-schema` includes the schema in the artifact, which 
   assert(names.filter(|n: String| n.contains("test")).len() == 0, Some(String::join(names, ", ")))
 }
 
-test/nondet "a build schema that names nothing is rejected at build time" {
-  write_program(with_schema());
-  let out = spawned(["build", ".", "--config-schema", "m.absent", "-o", "x.plyx"]);
-  assert(out.code != 0, Some(all_output(out)));
-  assert(all_output(out).contains("E0440"), Some(all_output(out)));
-  assert(all_output(out).contains("this program has: m.spec"), Some(all_output(out)));
-  assert(!fs.exists[cwd]("x.plyx"), None)
-}
-
 fn needs_cc() -> String = String::of_bytes_lossy(embed("../programs/artifact/asks_for_cc.ply"))
-
-test/nondet "an artifact checks at run time whether the caller supplied the `--exec` command it would start" {
-  write_program(needs_cc());
-  let _ = built();
-  [{ exec: ["--exec", "cc=/bin/sh"], code: 7 }, { exec: [], code: 9 }].fold(
-    (),
-    |u: Unit, c: { exec: List<String>, code: Int }| {
-      let out = spawned(["run", "m.plyx"].concat(c.exec), []);
-      assert(
-        out.code == c.code,
-        Some("run with " ++ String::join(c.exec, " ") ++ ":\n" ++ stderr(out)),
-      )
-    },
-  )
-}
 
 fn spawns_cc() -> String =
   \\import std.process (process, exit_code)
@@ -885,7 +368,19 @@ fn spawns_cc() -> String =
   \\}
   \\
 
-test/nondet "an artifact starts the command the caller gave with `--exec`, and fails with E0456 when none was given" {
+test/nondet "an artifact asks whether its caller bound a label, starts what is bound, and rejects a label nothing bound" {
+  write_program(needs_cc());
+  let _ = built();
+  [{ exec: ["--exec", "cc=/bin/sh"], code: 7 }, { exec: [], code: 9 }].fold(
+    (),
+    |u: Unit, c: { exec: List<String>, code: Int }| {
+      let out = spawned(["run", "m.plyx"].concat(c.exec), []);
+      assert(
+        out.code == c.code,
+        Some("run with " ++ String::join(c.exec, " ") ++ ":\n" ++ stderr(out)),
+      )
+    },
+  );
   write_program(spawns_cc());
   let _ = built();
   let bound = spawned(["run", "m.plyx", "--exec", "cc=/bin/sh"], []);

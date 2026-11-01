@@ -1,0 +1,228 @@
+import harness (scratch, on_disk, on_disk_faked, passing_except, Shipped, CliEffects)
+import support.harness (RunResult, write, read, empty_working_directory, all_output, json_of, at,
+                        nth, str, bool, items, WorkingDirectory, assert_ok, exists)
+import compiler.front.rows (KnownDefinitionRow)
+import compiler.front.interface (Interface, ModuleInterface, interface_bin, envelope_of, enveloped)
+import compiler.front.exports (OwnerInterface)
+import registry.fake
+import registry.service
+import std.bin
+import std.fs
+import std.fs (fs, MemFs)
+import std.http
+import std.net (net)
+import std.string
+import std.list
+
+fn served(store: MemFs, request: Bytes) -> fake::InMemoryRun<Bytes> / {abort.raise} =
+  fake::run_in_memory(store, ||
+    fake::with_tokens(||
+      handle {
+        http::serve_connection[conn](1, http::default_limits(), service::handle_request)
+      } with {
+        var unread = request,
+        var wrote = b"",
+        net.peer_address[conn](c) -> None,
+        net.peer_certificate[conn](c) -> None,
+        net.recv[conn](c, most, timeout_ms) -> {
+          let taken = unread.slice(0, min(most, unread.len()));
+          unread = unread.slice(taken.len(), unread.len());
+          Some(taken)
+        },
+        net.send[conn](c, payload, timeout_ms) -> {
+          wrote = wrote.concat(payload);
+          Some(payload.len())
+        },
+        net.close[conn](c) -> (),
+        return u -> wrote,
+      }))
+
+fn over_registry<| e>(
+  body: () -> Unit / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry] | e},
+) -> Unit / {abort.raise | e} =
+  handle {
+    body()
+  } with {
+    var store = fs::mem_empty(),
+    var sent = b"",
+    var replied = b"",
+    net.connect[registry](host, port, timeout_ms) -> Some(1),
+    net.connect_tls[registry](host, port, timeout_ms) -> panic("this registry is plain HTTP"),
+    net.handshake[registry](c) -> panic("this registry is plain HTTP"),
+    net.send[registry](c, payload, timeout_ms) -> {
+      sent = sent.concat(payload);
+      Some(payload.len())
+    },
+    net.recv[registry](c, most, timeout_ms) -> {
+      if sent.len() > 0 {
+        let run = served(store, sent);
+        store = run.tree;
+        replied = run.value;
+        sent = b"";
+      };
+      let taken = replied.slice(0, min(most, replied.len()));
+      replied = replied.slice(taken.len(), replied.len());
+      Some(taken)
+    },
+    net.close[registry](c) -> (),
+  }
+
+fn with_registry(
+  with_token: Bool,
+  argv: List<String>,
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} = {
+  let named = [{ name: "PLY_REGISTRY", value: "http://127.0.0.1:1" }];
+  let vars = if with_token { named.push({ name: "PLY_REGISTRY_TOKEN", value: "t0k" }) }
+  else { named };
+  on_disk_faked(argv, passing_except([]), vars)
+}
+
+fn assert_rejected(ran: RunResult, code: String, words: String) -> Unit / {abort.raise} = {
+  assert(ran.code == 2, Some(all_output(ran)));
+  assert(all_output(ran).contains(code), Some(code ++ " is not in:\n" ++ all_output(ran)));
+  assert(all_output(ran).contains(words), Some("`" ++ words ++ "` is not in:\n" ++ all_output(ran)))
+}
+
+fn replace_in_file(p: String, from: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
+  match read(p) {
+    None -> panic("`" ++ p ++ "` reads"),
+    Some(text) -> match text.split_once(from) {
+      Some(parts) -> write(p, parts.head ++ to ++ parts.tail),
+      None -> panic("`" ++ p ++ "` the claim is now disproved `" ++ from ++ "`"),
+    },
+  }
+
+fn write_app() -> Unit / {WorkingDirectory, abort.raise} = {
+  write(
+    "app/ply.pkg",
+    "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"app\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [{name: \"orders\", prefix: None, min: {major: 0, minor: 1, patch: 0}, source: Registry}], entry: None}\n",
+  );
+  write("app/main.ply", "import orders.lib\nfn main() -> Int = lib::double(21)\n")
+}
+
+fn forge_interface(slot: String) -> Unit / {fs.read_file[cwd], fs.write_file[cwd], abort.raise} =
+  match fs.read_file[cwd](slot) {
+    None -> panic("`" ++ slot ++ "` reads"),
+    Some(bytes) -> match envelope_of(bytes) {
+      None -> panic("`" ++ slot ++ "` is framed"),
+      Some(e) -> match bin::decode(e.payload, interface_bin()) {
+        Err(_) -> panic("`" ++ slot ++ "` holds an interface"),
+        Ok(p) -> {
+          let forged_row = |r: KnownDefinitionRow|
+            if r.name == b"orders.lib.double" { { ..r, performed_effects: b"orders.lib.forged" } }
+            else { r };
+          let forged: Interface = {
+            modules: p.modules.map(|m: ModuleInterface|
+              {
+                ..m,
+                exports: {
+                  ..m.exports,
+                  entries: m.exports.entries.fold(
+                    Map::new(),
+                    |accumulator: Map<Bytes, OwnerInterface>, k: Bytes, en: OwnerInterface|
+                      accumulator.insert(k, { ..en, rows: en.rows.map(forged_row) }),
+                  ),
+                },
+              }),
+          };
+          if !fs.write_file[cwd](
+              slot,
+              enveloped({ ..e, payload: bin::encode(forged, interface_bin()) }),
+            ) { panic("`" ++ slot ++ "` was not written") }
+        },
+      },
+    },
+  }
+
+test "a published interface matches the one rebuilt from its source, and `check` rejects a tampered interface" {
+  scratch(||
+    over_registry(|| {
+      assert_ok(on_disk(["new", "orders", "--lib"]));
+      let out = with_registry(true, ["publish", "orders", "--json"]);
+      assert_ok(out);
+      let semantics = str(at(json_of(out), "semantics"));
+
+      write_app();
+      let resolved = with_registry(false, ["resolve", "app", "--json"]);
+      assert_ok(resolved);
+      assert(
+        bool(at(nth(at(json_of(resolved), "packages"), 0), "interface")),
+        Some(all_output(resolved)),
+      );
+      let slot = "app/.ply-cache/registry/orders/.interface/" ++ semantics;
+      assert(exists(slot), None);
+
+      assert_ok(on_disk(["check", "app", "--json"]));
+      assert_ok(on_disk(["check", "app", "--verify-dependencies"]));
+
+      forge_interface(slot);
+      assert_rejected(
+        on_disk(["check", "app", "--verify-dependencies"]),
+        "E0149",
+        "`orders.lib`'s exports",
+      )
+    }))
+}
+
+fn set_version(from: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
+  replace_in_file("orders/ply.pkg", "version: " ++ from, "version: " ++ to)
+
+test "`publish` rejects a version number too small for the changes, and `contracts` lists those changes" {
+  scratch(||
+    over_registry(|| {
+      assert_ok(on_disk(["new", "orders", "--lib"]));
+      assert_ok(with_registry(true, ["publish", "orders"]));
+
+      replace_in_file(
+        "orders/lib.ply",
+        "pub fn double(n: Int) -> Int = n * 2\n",
+        "pub fn double(n: Int) -> Int = n * 2\n\npub fn triple(n: Int) -> Int = n * 3\n",
+      );
+      set_version("{ major: 0, minor: 1, patch: 0 }", "{ major: 0, minor: 1, patch: 1 }");
+      assert_rejected(
+        with_registry(true, ["publish", "orders"]),
+        "E0150",
+        "adds `orders.lib.triple`",
+      );
+      set_version("{ major: 0, minor: 1, patch: 1 }", "{ major: 0, minor: 2, patch: 0 }");
+      assert_ok(with_registry(true, ["publish", "orders"]));
+
+      replace_in_file(
+        "orders/lib.ply",
+        "pub fn double(n: Int) -> Int = n * 2",
+        "pub fn double(n: Int) -> Int ensures result == n + n = n * 2",
+      );
+      set_version("{ major: 0, minor: 2, patch: 0 }", "{ major: 0, minor: 2, patch: 1 }");
+      assert_rejected(
+        with_registry(true, ["publish", "orders"]),
+        "E0150",
+        "changes what `orders.lib.double` promises",
+      );
+      set_version("{ major: 0, minor: 2, patch: 1 }", "{ major: 1, minor: 0, patch: 0 }");
+      assert_ok(with_registry(true, ["publish", "orders"]));
+
+      let listed = with_registry(false, ["contracts", "orders", "0.1.0", "1.0.0", "--json"]);
+      assert_ok(listed);
+      let j = json_of(listed);
+      assert_eq(items(at(j, "changed")).map(str), ["orders.lib.double"]);
+      assert_eq(items(at(j, "added")).map(str), ["orders.lib.triple"]);
+      assert_eq(str(at(j, "needs")), "major");
+      assert(bool(at(j, "kept")), Some(all_output(listed)))
+    }))
+}
+
+test "`publish` fails for a program, and for a library that depends on a package by local path" {
+  scratch(|| {
+    empty_working_directory();
+    assert_ok(on_disk(["new", "app"]));
+    assert_rejected(on_disk(["publish", "app"]), "E0145", "is a program");
+    assert_ok(on_disk(["new", "lib", "--lib"]));
+    assert_ok(on_disk(["new", "base", "--lib"]));
+    replace_in_file(
+      "lib/ply.pkg",
+      "dependencies: [],",
+      "dependencies: [{ name: \"base\", prefix: None, min: { major: 0, minor: 1, patch: 0 }, source: Path(\"../base\") }],",
+    );
+    assert_rejected(on_disk(["publish", "lib"]), "E0145", "the path `../base`")
+  })
+}

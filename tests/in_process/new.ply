@@ -1,7 +1,8 @@
-import harness (scratch, on_disk)
-import spawning.harness (write_project, write, read, stderr, json_of, at, items, str, int, bool,
-                         json_text)
+import harness (scratch, on_disk, on_disk_faked, passing_except, returned)
+import support.harness (write_project, write, read, all_output, stderr, stdout, json_of, at, items,
+                        own_modules, str, int, bool, json_text, value_of)
 import std.fs (fs)
+import std.value (VInt)
 
 fn written(path: String) -> String / {fs.read[cwd], fs.write[cwd], abort.raise} =
   match read(path) { Some(t) -> t, None -> panic("`" ++ path ++ "` was not written") }
@@ -47,5 +48,67 @@ test "a directory that is already there is never written into" {
     assert(stderr(r).contains("is already there"), Some(stderr(r)));
     assert_eq(written("demo/keep"), "mine\n");
     assert(!fs.exists[cwd]("demo/ply.pkg"), Some("the manifest was written into it"))
+  })
+}
+
+test "a package made by `ply new` passes `ply check` and `ply test` and is already formatted" {
+  scratch(|| {
+    write_project([]);
+    let made = on_disk(["new", "demo"]);
+    assert(made.code == 0, Some(stderr(made)));
+    assert_eq(
+      stdout(made),
+      "   created demo · ply.pkg, main.ply\n   next: cd demo && ply run .\n",
+    );
+    let manifest = written("demo/ply.pkg");
+    assert(manifest.contains("name: \"demo\""), Some(manifest));
+    assert(manifest.contains("runtime: { major: 0,"), Some(manifest));
+    let module = written("demo/main.ply");
+    assert(module.contains("fn main() -> Unit"), Some(module));
+    assert(module.contains("test \"the first test\""), Some(module));
+    let checked = json_of(on_disk(["check", "demo", "--json"]));
+    assert_eq(own_modules(checked), ["main"]);
+    let loaded = items(at(checked, "modules")).len();
+    [
+      { argv: ["check", "demo"], want: "checked " ++ loaded.to_string() ++ " modules" },
+      { argv: ["test", "demo"], want: "1 passed" },
+      { argv: ["fmt", "--check", "demo"], want: "" },
+    ].fold((), |u: Unit, step: { argv: List<String>, want: String }| {
+      let r = on_disk_faked(step.argv, passing_except([]));
+      assert(r.code == 0 && all_output(r).contains(step.want), Some(all_output(r)))
+    })
+  })
+}
+
+test "a library has no main and one public definition" {
+  scratch(|| {
+    write_project([]);
+    assert_eq(on_disk(["new", "core", "--lib"]).code, 0);
+    let module = written("core/lib.ply");
+    assert(module.contains("pub fn double"), Some(module));
+    assert(!module.contains("fn main"), Some(module));
+    assert_eq(on_disk_faked(["test", "core"], passing_except([])).code, 0);
+    let ran = on_disk_faked(["run", "core"], passing_except([]));
+    assert_eq(ran.code, 2);
+    assert(stderr(ran).contains("no `main` to run"), Some(stderr(ran)))
+  })
+}
+
+test "a project made by `ply new` has a manifest that accepts a dependency on a library made by `ply new --lib`" {
+  scratch(|| {
+    write_project([]);
+    assert_eq(on_disk(["new", "core", "--lib"]).code, 0);
+    assert_eq(on_disk(["new", "app"]).code, 0);
+    write(
+      "app/ply.pkg",
+      \\import std.pkg (Manifest)
+      \\fn package() -> Manifest = {name: "app", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [{name: "core", prefix: None, min: {major: 0, minor: 1, patch: 0}, source: Path("../core")}], entry: None}
+      \\
+    );
+    write("app/main.ply", "import core.lib\n\nfn main() -> Int = lib::double(21)\n");
+    assert_eq(
+      value_of(on_disk_faked(["run", "--json", "app"], |root: String| returned(VInt(42)))),
+      "42",
+    )
   })
 }

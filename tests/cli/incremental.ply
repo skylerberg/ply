@@ -1,89 +1,8 @@
-import spawning.harness (spawned_warm_agrees, spawned, write_project, write, read, all_output,
-                         stdout, stderr, json_of, at, path, items, str, int, json_text,
-                         WorkingDirectory, diagnostic_codes)
-import std.bytes
-import std.fs (fs, listed_names)
-import std.json (Json)
+import harness (Server, spawned_warm_agrees, spawned, start_server, wait_for_exit, completed_result)
+import support.harness (write_project, all_output, json_of, path, int, json_text, diagnostic_codes)
+import support.projects (edit, leaf)
 import std.string
-import std.map
 import std.list
-
-fn edit(name: String, from: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
-  match read(name) {
-    None -> panic("`" ++ name ++ "` reads"),
-    Some(text) -> {
-      assert(
-        text.contains(from),
-        Some("`" ++ from ++ "` is not in " ++ name ++ "; the fixture drifted"),
-      );
-      write(name, text.replace(from, to))
-    },
-  }
-
-fn leaf() -> String = "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
-
-fn query_run_count(runs: Map<String, Int>, query: String) -> Int = runs.get_or(query, 0)
-
-fn reuse_of(front: Json) -> { taken: Int, ran: Int, modules: Int } =
-  items(at(front, "queries")).fold(
-    { taken: 0, ran: 0, modules: 0 },
-    |accumulator: { taken: Int, ran: Int, modules: Int }, q: Json|
-      {
-        taken: accumulator.taken + int(at(q, "taken")),
-        ran: accumulator.ran + int(at(q, "run")),
-        modules: accumulator.modules
-          + (if str(at(q, "query")) == "module" { int(at(q, "run")) } else { 0 }),
-      },
-  )
-
-test/nondet "a report counts the work a load did: an unchanged project runs no function bodies, and an edit runs only the affected bodies" {
-  write_project([
-    { path: "leaf.ply", text: leaf() ++ "\ntest \"two is two\" { assert_eq(two(), 2) }\n" },
-    { path: "apart.ply", text: "pub fn three() -> Int = 3\n" },
-  ]);
-  let front = |args: List<String>| path(json_of(spawned(args)), ["front_end"]);
-  let checked = || reuse_of(front(["check", ".", "--json", "--explain"]));
-  let cold = checked();
-  assert(cold.ran > 0, Some("a store nothing was kept in runs every body"));
-  let warm = checked();
-  assert(
-    warm.ran == 0 && warm.taken > 0,
-    Some("an unchanged project takes every cached result and runs no body"),
-  );
-  edit("leaf.ply", "one() + one()", "one() + one() + 0");
-  let edited = checked();
-  assert(
-    edited.modules == 1 && edited.ran < cold.ran,
-    Some("the edited module is checked again, and `apart` is not"),
-  );
-  let tested = front(["test", ".", "--json"]);
-  assert_eq(reuse_of(tested).ran, 0);
-  assert_eq(int(at(tested, "lost")), 0)
-}
-
-test/nondet "a load that fails reports the work it did, and does no work for a module that imports the failed module" {
-  write_project([
-    { path: "lib.ply", text: "pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n" },
-    { path: "app.ply", text: "import lib\n\npub fn go() -> Int = lib::fine()\n" },
-  ]);
-  let cold = spawned(["check", ".", "--json", "--explain"]);
-  assert_eq(cold.code, 2);
-  let runs = items(path(json_of(cold), ["front_end", "queries"])).fold(
-    Map::new(),
-    |accumulator: Map<String, Int>, q: Json|
-      accumulator.insert(str(at(q, "query")), int(at(q, "run"))),
-  );
-  assert_eq(query_run_count(runs, "module"), 1);
-  assert_eq(query_run_count(runs, "group"), 0);
-  let shown = spawned(["check", ".", "--explain"]);
-  assert_eq(shown.code, 2);
-  assert(stdout(shown).contains("front-end time"), Some(all_output(shown)));
-  assert(stdout(shown).contains("module"), Some(all_output(shown)));
-  assert(stderr(shown).contains("unknown name `missing`"), Some(all_output(shown)));
-  let front = |args: List<String>| path(json_of(spawned(args)), ["front_end"]);
-  assert(items(at(front(["test", ".", "--json"]), "queries")).len() > 0);
-  assert(items(at(front(["prove", ".", "--json"]), "queries")).len() > 0)
-}
 
 fn store() -> String =
   \\import std.db
@@ -126,76 +45,38 @@ test/nondet "a warm `ply check` reports the same schema errors in a module's sto
   assert_eq(diagnostic_codes(spawned_warm_agrees("after the column is mended")), [])
 }
 
-fn assert_cache_empty(what: String) -> Unit / {fs.list_dir[cwd], abort.raise} =
+fn streaming() -> String = String::of_bytes_lossy(embed("../programs/incremental/streaming.ply"))
+
+test/nondet "a project that streams a file through `std.io` runs what it reaches, warm" {
+  write_project([{ path: "m.ply", text: streaming() }]);
+  let tested = || json_of(spawned(["test", ".", "--json"]));
+  let first_run = tested();
   assert(
-    List::filter(
-        match listed_names(fs.list_dir[cwd](".ply-cache")) { Some(names) -> names, None -> [] },
-        |name: String| name.starts_with("manifest-") || name.starts_with("seg-") || name == "memo",
-      ).len(
-      )
-      == 0,
-    Some(what ++ " recorded into the cache"),
+    int(path(first_run, ["summary", "failed"])) == 0
+      && int(path(first_run, ["summary", "passed"])) == 1,
+    Some(json_text(first_run)),
+  );
+  edit("m.ply", "65536", "4096");
+  let again = tested();
+  assert(
+    int(path(again, ["summary", "failed"])) == 0 && int(path(again, ["summary", "passed"])) == 1,
+    Some(json_text(again)),
   )
-
-fn one_test() -> Unit / {WorkingDirectory, abort.raise} =
-  write_project([
-    { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
-  ])
-
-test/nondet "`ply test --no-cache`, `ply hosts` and `ply build` write nothing to the cache" {
-  one_test();
-  let tested = spawned(["test", ".", "--no-cache"]);
-  assert(tested.code == 0, Some(all_output(tested)));
-  assert_cache_empty("`ply test --no-cache`");
-  let hosts = spawned(["hosts", "."]);
-  assert(hosts.code == 0, Some(all_output(hosts)));
-  assert_cache_empty("`ply hosts`");
-  let built = spawned(["build", ".", "--digest"]);
-  assert(built.code == 0, Some(all_output(built)));
-  assert_cache_empty("`ply build`")
 }
 
-test/nondet "a warm prove resolves every obligation from the cache" {
+test/nondet "two overlapping runs leave a cache that still agrees" {
   write_project([
-    {
-      path: "base.ply",
-      text:
-        \\pub fn one() -> Int = 1
-        \\
-        \\pub fn bump(x: Int) -> Int
-        \\  requires x < 100
-        \\  ensures result > x
-        \\= x + one()
-        \\
-    },
-    {
-      path: "app.ply",
-      text:
-        \\import base
-        \\
-        \\fn more(x: Int) -> Int
-        \\  requires x < 50
-        \\  ensures result > x
-        \\= base::bump(x)
-        \\
-    },
-    {
-      path: "side.ply",
-      text:
-        \\fn zero(x: Int) -> Int
-        \\  ensures result == 0
-        \\= x - x
-        \\
-    },
+    { path: "leaf.ply", text: leaf() },
+    { path: "apart.ply", text: "pub fn three() -> Int = 3\n" },
   ]);
-  let first_run = spawned(["prove", "."]);
-  assert(first_run.code == 0, Some(all_output(first_run)));
-  let r = spawned(["prove", ".", "--json"]);
-  assert(r.code == 0, Some(all_output(r)));
-  let v = json_of(r);
-  assert(items(at(v, "obligations")).len() == 3, Some(json_text(v)));
-  assert(
-    int(at(v, "cached")) == 3,
-    Some("every obligation is resolved from the cache: " ++ json_text(v)),
-  )
+  let one = start_server(["check", "."], [], 0);
+  let two = start_server(["check", "."], [], 0);
+  [one, two].fold((), |u: Unit, server: Server| {
+    let r = completed_result(wait_for_exit(server, 120000, "`ply check` never ended"));
+    assert(r.code == 0, Some(all_output(r)))
+  });
+  let _ = spawned_warm_agrees("after two overlapping runs");
+  edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 3");
+  let _ = spawned_warm_agrees("and an edit after them");
+  ()
 }

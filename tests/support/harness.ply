@@ -1,0 +1,275 @@
+import std.env (env)
+import std.bytes
+import std.config (config)
+import std.fs
+import std.fs (fs, Entry, File)
+import std.json
+import std.json (Json, Null, Number, Str, Array, Object)
+import std.list
+import std.net
+import std.net (net)
+import std.os
+import std.process (EnvironmentVariable)
+import std.path (segments)
+import std.string
+
+pub type RunResult = { out: List<String>, err: List<String>, code: Int }
+
+pub fn stdout(ran: RunResult) -> String = String::unlines(ran.out)
+
+pub fn stderr(ran: RunResult) -> String = String::unlines(ran.err)
+
+pub fn all_output(ran: RunResult) -> String = stdout(ran) ++ stderr(ran)
+
+pub fn assert_ok(ran: RunResult) -> Unit / {abort.raise} =
+  assert(ran.code == 0, Some(all_output(ran)))
+
+pub fn json_of(ran: RunResult) -> Json / {abort.raise} =
+  match json::parse_string(stdout(ran)) {
+    Ok(j) -> j,
+    Err(e) ->
+      panic(
+        "`--json` wrote no one document: " ++ json::error_to_string(e) ++ "\n" ++ all_output(ran),
+      ),
+  }
+
+pub fn value_of(ran: RunResult) -> String / {abort.raise} =
+  match json::get(json_of(ran), "value") {
+    Some(Str(v)) -> v,
+    _ -> panic("`main` returned no value: " ++ all_output(ran)),
+  }
+
+pub fn reused(ran: RunResult) -> Bool / {abort.raise} = {
+  let report = json_of(ran);
+  if at(report, "front_end") == Null {
+    panic("`--explain` said nothing about the load:\n" ++ all_output(ran))
+  } else { bool(path(report, ["front_end", "reused"])) }
+}
+
+pub fn at(j: Json, name: String) -> Json = match json::get(j, name) { Some(v) -> v, None -> Null }
+
+pub fn path(j: Json, names: List<String>) -> Json = names.fold(j, at)
+
+pub fn nth(j: Json, i: Int) -> Json =
+  match j { Array(xs) -> match xs.at(i) { Some(v) -> v, None -> Null }, _ -> Null }
+
+pub fn items(j: Json) -> List<Json> = match j { Array(xs) -> xs, _ -> [] }
+
+pub fn first(xs: List<Json>) -> Json = match xs.at(0) { Some(x) -> x, None -> Null }
+
+pub fn str(j: Json) -> String = match j { Str(s) -> s, _ -> "" }
+
+pub fn int(j: Json) -> Int =
+  match j { Number(d) -> match Int::of_decimal(d, Down) { Some(n) -> n, None -> -1 }, _ -> -1 }
+
+pub fn bool(j: Json) -> Bool = match j { json::Bool(b) -> b, _ -> false }
+
+pub fn json_text(j: Json) -> String / {abort.raise} = json::to_string(j)
+
+pub fn scratch_marker() -> String = ".ply-scratch"
+
+pub fn stage() -> String = ".ply-stage"
+
+pub fn reused_dir() -> String = stage() ++ "/reused"
+
+pub fn bodies_dir() -> String = ".ply-bodies"
+
+pub type Source = { path: String, text: String }
+
+pub fn empty_working_directory() -> Unit / {WorkingDirectory, abort.raise} =
+  match fs::listed_names(fs.list_dir[cwd](".")) {
+    None -> panic("the working directory cannot be listed"),
+    Some(names) -> if !names.contains(scratch_marker()) {
+      panic(
+        "`on_disk` empties the working directory, and this one holds no `" ++ scratch_marker()
+          ++ "`: start `ply test` in a scratch directory that holds one",
+      )
+    } else {
+      names.fold((), |u: Unit, name: String|
+        if name == scratch_marker() || name == stage() || fs.remove_tree[cwd](name) { u }
+        else { panic("could not empty the working directory of `" ++ name ++ "`") });
+      if fs.exists[cwd](reused_dir()) && !fs.remove_tree[cwd](reused_dir()) {
+        panic("could not empty `" ++ reused_dir() ++ "`")
+      }
+    },
+  }
+
+pub fn write(path: String, text: String) -> Unit / {WorkingDirectory, abort.raise} = {
+  let dir = parent(path);
+  if dir != "" && !fs.create_dir[cwd](dir) { panic("could not make `" ++ dir ++ "`") };
+  if !fs.write_file[cwd](path, Bytes::of_string(text)) { panic("could not write `" ++ path ++ "`") }
+}
+
+pub fn write_project(files: List<Source>) -> Unit / {WorkingDirectory, abort.raise} = {
+  empty_working_directory();
+  files.fold((), |u: Unit, source: Source| write(source.path, source.text))
+}
+
+pub fn write_program(text: String) -> Unit / {WorkingDirectory, abort.raise} =
+  write_project([{ path: "m.ply", text: text }])
+
+pub fn read(path: String) -> Option<String> / {WorkingDirectory, abort.raise} =
+  match fs.read_file[cwd](path) { Some(b) -> Some(String::of_bytes(b)), None -> None }
+
+pub fn working_directory() -> String / {fs.read[cwd], abort.raise} =
+  match fs.canonical[cwd](".") { Some(p) -> p, None -> panic("the working directory has no path") }
+
+pub fn repo() -> String / {Repo, abort.raise} =
+  match fs.canonical[repo](".") {
+    Some(p) -> p,
+    None -> panic("`--fs repo=PATH` names the repository"),
+  }
+
+pub fn repo_file(path: String) -> String / {Repo, abort.raise} =
+  match fs.read_file[repo](path) {
+    Some(b) -> String::of_bytes(b),
+    None -> panic("the repository holds no `" ++ path ++ "`"),
+  }
+
+fn is_hidden(rest: String) -> Bool =
+  rest.split("/").fold(false, |hit: Bool, s: String| hit || s.starts_with("."))
+
+pub fn sources_here() -> List<Source> / {WorkingDirectory, abort.raise} =
+  match fs.walk[cwd](".") {
+    Some(entries) ->
+      entries.fold([], |accumulator: List<Source>, e: Entry|
+        if e.kind != File || is_hidden(e.path) { accumulator } else {
+          match read(e.path) {
+            Some(t) -> accumulator.push({ path: e.path, text: t }),
+            None -> accumulator,
+          }
+        }),
+    None -> panic("the working directory walks"),
+  }
+
+pub fn cache_warning_codes() -> List<String> = ["W0601", "W0602", "W0603"]
+
+fn without(j: Json, keys: List<String>) -> Json =
+  match j {
+    Object(m) ->
+      Object(keys.fold(m, |accumulator: Map<String, Json>, k: String| accumulator.remove(k))),
+    other -> other,
+  }
+
+pub fn stable_report(v: Json) -> Json =
+  match without(v, ["root", "files", "front_end", "cost_pass"]) {
+    Object(m) ->
+      Object(
+        m.insert(
+          "modules",
+          Array(items(at(v, "modules")).map(|x: Json| without(x, ["file"]))),
+        ).insert(
+          "diagnostics",
+          Array(
+            items(at(v, "diagnostics")).filter(|d: Json|
+              !cache_warning_codes().contains(str(at(d, "code")))),
+          ),
+        ),
+      ),
+    other -> other,
+  }
+
+pub fn checking() -> List<String> = ["check", ".", "--explain", "--json"]
+
+pub fn agreeing(what: String, warm: Json, cold: Json) -> Json / {abort.raise} = {
+  assert(
+    warm == cold,
+    Some(
+      what
+        ++ ": a check through the memo store returned differently from one that started cold\nwarm: "
+        ++ json_text(warm)
+        ++ "\ncold: "
+        ++ json_text(cold),
+    ),
+  );
+  warm
+}
+
+pub fn own_modules(report: Json) -> List<String> =
+  items(at(report, "modules")).map(|m: Json| str(at(m, "name"))).filter(|name: String|
+    !["std", "compiler"].any(|root: String| name == root || name.starts_with(root ++ ".")))
+
+pub effect set WorkingDirectory = {fs.read[cwd], fs.write[cwd]}
+
+pub effect set Repo = {fs.read[repo]}
+
+pub effect set Network = {net.read[client], net.write[client], net.read[ports], net.write[ports]}
+
+fn inherited_variables() -> List<String> = ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "PLY_C_CACHE"]
+
+pub fn environment(
+  variables: List<EnvironmentVariable>,
+) -> List<EnvironmentVariable> / {config.get[env]} =
+  inherited_variables().fold(variables, |accumulator: List<EnvironmentVariable>, name: String|
+    if variables.any(|v: EnvironmentVariable| v.name == name) { accumulator } else {
+      match config.get[env](name) {
+        Some(v) -> accumulator.push({ name: name, value: v }),
+        None -> accumulator,
+      }
+    })
+
+pub fn send(c: Int, bytes: Bytes) -> Unit / {Network, abort.raise} =
+  if !net::send_all[client](c, bytes, 10000) { panic("the other end stopped taking what was sent") }
+
+pub fn variable_value(variables: List<EnvironmentVariable>, name: String) -> Option<String> =
+  variables.fold(None, |found: Option<String>, v: EnvironmentVariable|
+    match found { Some(_) -> found, None -> if v.name == name { Some(v.value) } else { None } })
+
+pub fn joined(dir: String, name: String) -> String = {
+  let d = segments(dir);
+  let n = segments(name);
+  d.concat(n).fold("", |accumulator: String, s: String|
+    if accumulator == "" { s } else { accumulator ++ "/" ++ s })
+}
+
+pub fn parent(p: String) -> String = {
+  let segs = segments(p);
+  range(0, segs.len() - 1).fold("", |accumulator: String, i: Int|
+    match segs.at(i) {
+      Some(s) -> if accumulator == "" { s } else { accumulator ++ "/" ++ s },
+      None -> accumulator,
+    })
+}
+
+pub fn manifest(name: String, dependencies: String) -> String =
+  "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+    ++ "\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
+    ++ dependencies
+    ++ "], entry: None}\n"
+
+pub fn not_ok(report: Json) -> Bool = at(report, "ok") == json::Bool(false)
+
+pub fn diagnostic_codes(v: Json) -> List<String> =
+  items(at(v, "diagnostics")).map(|d: Json| str(at(d, "code")))
+
+pub fn diagnostic(report: Json) -> Json = nth(at(report, "diagnostics"), 0)
+
+pub fn code_of(report: Json) -> String = str(at(diagnostic(report), "code"))
+
+pub fn selected(report: Json) -> List<String> =
+  items(path(report, ["selection", "tests"])).filter(|t: Json| bool(at(t, "selected"))).map(
+    |t: Json| str(at(t, "name")),
+  )
+
+pub fn failed(report: Json) -> List<String> =
+  items(at(report, "results")).filter(|r: Json| str(at(r, "status")) == "failed").map(|r: Json|
+    str(at(r, "name")))
+
+pub fn is_number(j: Json) -> Bool = match j { Number(_) -> true, _ -> false }
+
+pub fn dependency(name: String, at_path: String) -> String =
+  "{name: \"" ++ name ++ "\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\""
+    ++ at_path
+    ++ "\")}"
+
+pub fn exists(p: String) -> Bool / {fs.exists[cwd]} = fs.exists[cwd](p)
+
+test "a path's parent is all of it but its last segment" {
+  assert_eq(parent("a/b/c.ply"), "a/b");
+  assert_eq(parent("c.ply"), "")
+}
+
+test "a directory and a name join, a `.` adding nothing" {
+  assert_eq(joined("a/b", "c.ply"), "a/b/c.ply");
+  assert_eq(joined(".", "c.ply"), "c.ply")
+}

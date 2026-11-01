@@ -8,10 +8,10 @@ NEXTEST_SHARDS=2
 
 TAB=$'\t'
 
-CLI_PARTS=2
+CLI_PARTS=1
 IN_PROCESS_SUITE=tests/in_process
 RUNS_ALONE=(package-compiler package-in_process)
-NIGHTLY=(in-process:repository_audit in-process:copies in-process:edit_sessions cli-tests:edit_matrix std-tests:db_driver std-tests:pg_client)
+NIGHTLY=(cli-tests:repository_audit cli-tests:copies in-process:edit_sessions cli-tests:edit_matrix std-tests:db_driver std-tests:pg_client)
 RUNS_MARGIN=4
 HOST_PACKAGES=(ply-host-tests)
 
@@ -226,6 +226,10 @@ cmd_run_line() {
     cli-*)
       [[ -f "$root/$CLI_SUITE/${id#cli-}.ply" ]] || { echo "the CLI's suite has no module '${id#cli-}'" >&2; return 1; }
       printf '%s\t%s.\t\n' "$CLI_SUITE" "${id#cli-}"
+      ;;
+    in-process-*)
+      [[ -f "$root/$IN_PROCESS_SUITE/${id#in-process-}.ply" ]] || { echo "the in-process suite has no module '${id#in-process-}'" >&2; return 1; }
+      printf '%s\t%s.\t\n' "$IN_PROCESS_SUITE" "${id#in-process-}"
       ;;
     *)
       echo "no run named '$id'" >&2

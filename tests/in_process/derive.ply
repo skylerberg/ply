@@ -1,61 +1,84 @@
-import harness (in_memory, tree)
-import spawning.harness (all_output)
-import std.list
+import harness (in_memory, one_module_tree, tree, Hermetic, Shipped)
+import support.harness (RunResult, all_output)
 import std.string
 
-test "no route lets a float become a map key" {
+fn check_one(source: String) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory(one_module_tree(source), ["check"])
+
+test "a derived definition is exempt from the written-signature rule" {
+  let r = check_one(
+    "import std.bin\nimport std.json\npub type Box = {label: String, n: Int}\nderive json for Box\nderive bin for Box\n",
+  );
+  assert(
+    !all_output(r).contains("E0126"),
+    Some("a derived definition must not be asked for an annotation: " ++ all_output(r)),
+  );
+  assert(r.code == 0, Some("the project should check: " ++ all_output(r)))
+}
+
+test "`derive` reports one error for a field whose codec is not imported, and suggests the import to add" {
   let r = in_memory(
     tree([
       {
-        path: "n.ply",
-        text: "pub type Wrapper = W(Float)\npub type Recursive = Nil | Cons(Float, Recursive)\npub type Box<a> = { v: a }\npub type Alias = Float\n",
+        path: "kinds.ply",
+        text: "import std.bin\npub type Mode = | Read | Write\nderive bin for Mode\n",
       },
       {
         path: "m.ply",
-        text:
-          \\import n
-          \\fn a() -> Map<n::Wrapper, Int> = Map::new()
-          \\fn b() -> Map<n::Recursive, Int> = Map::new()
-          \\fn c() -> Map<n::Box<Float>, Int> = Map::new()
-          \\fn d() -> Map<n::Alias, Int> = Map::new()
-          \\fn e() -> Map<{x: Float}, Int> = Map::new()
-          \\fn f() -> Map<Option<Float>, Int> = Map::new()
-          \\fn g() -> Map<Map<n::Wrapper, Int>, Int> = Map::new()
-          \\fn keyed<k>(x: k) -> Map<k, Int> = Map::new().insert(x, 1)
-          \\fn h() -> Bool = { let _ = keyed(1.0); true }
-          \\fn needs<a>(x: a) -> Int where derivable(ord, a) = 1
-          \\fn i() -> Int = needs(1.0)
-          \\
+        text: "import std.bin\nimport kinds (Mode)\npub type Atom = { mode: Mode, n: Int }\nderive bin for Atom\n",
       },
     ]),
     ["check"],
   );
-  assert(r.code != 0, Some(all_output(r)));
+  assert(
+    all_output(r).count("E0206") == 1 && !all_output(r).contains("E0505"),
+    Some(all_output(r)),
+  );
+  assert(all_output(r).contains("add `import kinds (mode_bin)`"), Some(all_output(r)))
+}
+
+test "`derive json` is rejected for a function field, an unknown module and a duplicate derivation" {
   [
-    "`n.Wrapper`",
-    "`n.Recursive`",
-    "`{v: Float}`",
-    "`{x: Float}`",
-    "`Option<Float>`",
-    "`Map<n.Wrapper, Int>`",
-  ].fold((), |u: Unit, named: String|
+    {
+      code: "E0206",
+      source: "import std.json\npub type Order = { id: Int, on_complete: (Int) -> Unit }\nderive json for Order\n",
+    },
+    { code: "E0208", source: "import std.json\nimport n\nderive json for Thing\n" },
+    {
+      code: "E0105",
+      source: "import std.json\npub type Order = { id: Int }\nderive json for Order\nderive json for Order\n",
+    },
+  ].fold((), |u: Unit, c: { code: String, source: String }| {
+    let r = in_memory(
+      tree([
+        { path: "m.ply", text: c.source },
+        { path: "n.ply", text: "pub type Thing = { id: Int }\n" },
+      ]),
+      ["check"],
+    );
+    assert(r.code != 0, Some(c.source ++ "\n" ++ all_output(r)));
+    assert(all_output(r).contains(c.code), Some(c.source ++ "\n" ++ all_output(r)))
+  })
+}
+
+test "`derive bin` fails when `std.bin` is not imported, and when a field is a `Secret`" {
+  [
+    {
+      code: "E0207",
+      source: "pub type R = {x: Int}\nderive bin for R\n",
+      says: "`bin` is not a deriver",
+    },
+    {
+      code: "E0206",
+      source: "import std.bin\npub type R = {token: Secret}\nderive bin for R\n",
+      says: "a derived codec would write the credential into the bytes",
+    },
+  ].fold((), |u: Unit, c: { code: String, source: String, says: String }| {
+    let r = check_one(c.source);
+    assert(r.code != 0, Some(all_output(r)));
     assert(
-      all_output(r).contains(named),
-      Some("no rejection named " ++ named ++ ":\n" ++ all_output(r)),
-    ));
-  assert(
-    all_output(r).contains("--> m.ply:10:"),
-    Some(
-      "instantiating a parameter a `Map` is keyed by at `Float` must be rejected at the call site:\n"
-        ++ all_output(r),
-    ),
-  );
-  assert(
-    all_output(r).contains("`Float` cannot be derived for `ord`"),
-    Some(
-      "instantiating a `derivable(ord, a)` parameter at `Float` must be rejected at the call site:\n"
-        ++ all_output(r),
-    ),
-  );
-  assert(all_output(r).count("E0206") >= 9, Some("one rejection per route:\n" ++ all_output(r)))
+      all_output(r).contains(c.code) && all_output(r).contains(c.says),
+      Some(c.says ++ "\n" ++ all_output(r)),
+    )
+  })
 }

@@ -1,0 +1,605 @@
+import compiler.front.facts (Analysis, schemas_instantiated)
+import discharge (Batch, Interleaved, JudgePoints, Judgements, RunInterleaving, RuntimeReply,
+                  RuntimeRequest, WholeClaim, discharged)
+import goal (default_prove_budget)
+import obligation (Binding, Coverage, Definition, Ensures, NoWitness, DomainTooLarge, Open, Outcome,
+                   PointFailed, PointPassed, PointRejected, Proved, Refuted, UnhandledEffect,
+                   Unproved, Vacuous, certificate_summary, coverage, is_proved, laws_of,
+                   reason_summary)
+import prover_input (Obligation, ProverInputResult, prover_input_of, simulated, whole_of)
+import rules (ExhaustiveEnumeration, ExhaustiveInterleaving, GroundEvaluation, Rule)
+import sim.plan
+import sim.recording (Passed)
+import static_prover (Prover, claims_for, modules_of, prover_of, static_result)
+import std.list
+import std.string
+import std.value (Value, VCtor, VDecimal, VFixed, VInt, VList, render)
+
+type Program = { prover: Prover, built: ProverInputResult, analysis: Analysis }
+
+fn program(source: String) -> Program / {abort.raise} =
+  program_within(source, default_prove_budget())
+
+fn program_within(source: String, budget: Int) -> Program / {abort.raise} = {
+  let analysis = whole_of(Bytes::of_string(source));
+  let mine = |module: Bytes| module == b"m";
+  let built = prover_input_of(analysis, mine);
+  let claims = claims_for(analysis, modules_of(analysis, built.world.obligations), mine);
+  { prover: prover_of(claims, built.world, budget), built: built, analysis: analysis }
+}
+
+fn obligation_of(p: Program, owner: String) -> Obligation / {abort.raise} =
+  match p.built.world.obligations.filter(|o: Obligation| o.owner == owner) {
+    [o, ..] -> o,
+    [] -> panic("no obligation of " ++ owner),
+  }
+
+fn outcome<| e>(
+  p: Program,
+  owner: String,
+  ask: (RuntimeRequest) -> RuntimeReply / e,
+) -> Outcome / {abort.raise | e} = one_outcome(p, obligation_of(p, owner), ask)
+
+fn one_outcome<| e>(
+  p: Program,
+  o: Obligation,
+  ask: (RuntimeRequest) -> RuntimeReply / e,
+) -> Outcome / {abort.raise | e} =
+  match discharged(
+      [{ claim: 0, obligation: o, resolved: static_result(p.prover, o) }],
+      p.built.world,
+      plan::default_plan(),
+      ask,
+      |_claim: Int, _outcome: Outcome| (),
+    ) {
+    [only] -> only,
+    _ -> panic("checking one claim must return exactly one outcome"),
+  }
+
+fn never_run() -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
+  |ask: RuntimeRequest| panic("this claim runs nothing")
+
+fn compiled_as(
+  admits: keep (List<Value>) -> Bool / {abort.raise},
+  holds: keep (List<Value>) -> Bool / {abort.raise},
+) -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
+  |ask: RuntimeRequest|
+    match ask {
+      JudgePoints(batches) ->
+        Judgements(
+          batches.map(|b: Batch|
+            b.points.map(|point: List<Value>|
+              if !admits(point) { PointRejected }
+              else if b.mode != WholeClaim || holds(point) { PointPassed }
+              else { PointFailed })),
+        ),
+      RunInterleaving(_, _, _, _) -> panic("this claim reaches no simulation"),
+    }
+
+fn unguarded(
+  holds: keep (List<Value>) -> Bool / {abort.raise},
+) -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
+  compiled_as(|_point: List<Value>| true, holds)
+
+fn holding() -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
+  unguarded(|_point: List<Value>| true)
+
+fn is_open(o: Outcome) -> Bool = match o { Unproved(Open(_)) -> true, _ -> false }
+
+fn refuted_at(o: Outcome) -> List<Binding> / {abort.raise} =
+  match o { Refuted(c) -> c.bindings, _ -> panic("the claim was expected to be refuted") }
+
+fn values_of(bindings: List<Binding>) -> List<Value> = bindings.map(|b: Binding| b.value)
+
+fn int_of(point: List<Value>) -> Int / {abort.raise} =
+  match point { [VInt(n), ..] -> n, _ -> panic("an Int at the point") }
+
+fn list_of(point: List<Value>) -> List<Value> / {abort.raise} =
+  match point { [VList(xs), ..] -> xs, _ -> panic("a list at the point") }
+
+fn byte_of(point: List<Value>) -> U128 / {abort.raise} =
+  match point {
+    [VFixed(_, bits)] -> bits,
+    [VCtor(_, [VFixed(_, bits)])] -> bits,
+    _ -> panic("a byte at the point"),
+  }
+
+test "a refutation names a point the guard admits and the claim fails at" {
+  let p = program(
+    \\fn seen(amounts: List<Int>, amount: Int) -> Bool =
+    \\  match amounts {
+    \\    [x, ..rest] -> if x == amount { true } else { seen(rest, amount) },
+    \\    _ -> false,
+    \\  }
+    \\
+    \\fn settled_from(payments: List<Int>, kept: List<Int>) -> List<Int> =
+    \\  match payments {
+    \\    [p, ..rest] ->
+    \\      if seen(kept, p) { settled_from(rest, kept) } else { settled_from(rest, kept.push(p)) },
+    \\    _ -> kept,
+    \\  }
+    \\
+    \\fn settled(payments: List<Int>) -> List<Int> = settled_from(payments, [])
+    \\
+    \\law "`settled` returns a list as long as the payments it is given"
+    \\  forall (payments: List<Int>) where payments.len() > 0 {
+    \\    settled(payments).len() == payments.len()
+    \\  }
+    \\
+  );
+  let without_repeats = |xs: List<Value>|
+    xs.fold([], |distinct: List<Value>, x: Value|
+        if distinct.contains(x) { distinct } else { distinct.push(x) }).len(
+      )
+      == xs.len();
+  let o = outcome(
+    p,
+    "m.`settled` returns a list as long as the payments it is given",
+    compiled_as(|point: List<Value>| list_of(point).len() > 0, |point: List<Value>|
+      without_repeats(list_of(point))),
+  );
+  assert_eq(values_of(refuted_at(o)), [VList([VInt(0), VInt(0)])])
+}
+
+test "each postcondition is an obligation of its own" {
+  let p = program(
+    \\pub opaque type Posting = new { account: String, amount: Int }
+    \\
+    \\pub type Entry = { date: Int, memo: String, postings: List<Posting> }
+    \\
+    \\fn debit(account: String, amount: Int) -> Posting
+    \\  requires amount > 0
+    \\  ensures result.account == account
+    \\  ensures result.amount == amount
+    \\= { account: account, amount: amount }
+    \\
+    \\fn credit(account: String, amount: Int) -> Posting
+    \\  requires amount > 0
+    \\  ensures result.account == account
+    \\  ensures result.amount == -amount
+    \\= { account: account, amount: -amount }
+    \\
+    \\fn entry(date: Int, memo: String, postings: List<Posting>) -> Entry =
+    \\  { date: date, memo: memo, postings: postings }
+    \\
+    \\fn transfer(date: Int, memo: String, from: String, to: String, amount: Int) -> Entry
+    \\  requires amount > 0
+    \\  requires from != to
+    \\  ensures result.date == date
+    \\  ensures result.memo == memo
+    \\= entry(date, memo, [debit(to, amount), credit(from, amount)])
+    \\
+  );
+  let clauses = p.built.world.obligations.filter(|o: Obligation| o.owner == "m.transfer");
+  assert_eq(clauses.map(|o: Obligation| o.kind), [Ensures(0), Ensures(1)]);
+  assert_eq(clauses.map(|o: Obligation| is_proved(one_outcome(p, o, holding()))), [true, true])
+}
+
+test "a ground law is evaluated once, which proves it" {
+  let p = program(
+    \\fn stock() -> String = "abc"
+    \\
+    \\law "the stock is three deep" {
+    \\  stock().len() == 3
+    \\}
+    \\
+  );
+  match outcome(p, "m.the stock is three deep", unguarded(|_point: List<Value>| "abc".len() == 3)) {
+    Proved(c) -> assert_eq(c.rules, [GroundEvaluation]),
+    _ -> panic("not proved"),
+  }
+}
+
+test "a recursion with no induction to close it leaves a claim over unbounded data open" {
+  let p = program(
+    \\fn rev_onto(xs: List<Int>, accumulator: List<Int>) -> List<Int> =
+    \\  match xs {
+    \\    [x, ..rest] -> rev_onto(rest, accumulator.push(x)),
+    \\    _ -> accumulator,
+    \\  }
+    \\
+    \\fn rev(xs: List<Int>) -> List<Int> = rev_onto(xs, [])
+    \\
+    \\law "reverse is an involution"
+    \\  forall (xs: List<Int>) {
+    \\    rev(rev(xs)) == xs
+    \\  }
+    \\
+  );
+  assert(is_open(outcome(p, "m.reverse is an involution", holding())))
+}
+
+test "a term outside the fragment is refuted by a run, and never reasoned about" {
+  let p = program("law \"halving and doubling cancel\" forall (x: Int) { x / 2 * 2 == x }\n");
+  let o = outcome(
+    p,
+    "m.halving and doubling cancel",
+    unguarded(|point: List<Value>| int_of(point) / 2 * 2 == int_of(point)),
+  );
+  assert_eq(values_of(refuted_at(o)), [VInt(1)])
+}
+
+test "a law over functions nothing proves is open, and runs nothing" {
+  let p = program(
+    "law \"two functions agree\" forall (f: (Int) -> Int, g: (Int) -> Int, x: Int) { f(x) == g(x) }\n",
+  );
+  assert(is_open(outcome(p, "m.two functions agree", never_run())))
+}
+
+test "a proof over a type variable names the sort it left uninterpreted as the binder prints it" {
+  let p = program(
+    "fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\" forall (x: a) where identity(a) { pair(x) == x }\n",
+  );
+  match outcome(p, "m.identity is identity", never_run()) {
+    Proved(c) -> assert_eq(c.sorts, ["a"]),
+    _ -> panic("not proved"),
+  }
+}
+
+test "a spent budget leaves the claim open and says so" {
+  let source = "law \"one is below, equal to, or above the other\" forall (x: Int, y: Int) { (x < y) || (x == y) || (x > y) }\n";
+  let owner = "m.one is below, equal to, or above the other";
+  match outcome(program(source), owner, never_run()) {
+    Proved(c) -> assert(c.steps > 1),
+    _ -> panic("case analysis over the comparisons decides this when the budget allows"),
+  };
+  match outcome(program_within(source, 1), owner, holding()) {
+    Unproved(reason) -> assert_eq(reason_summary(reason), "no proof within the prover's budget"),
+    _ -> panic("a spent budget is inconclusive, and inconclusive is no proof"),
+  }
+}
+
+test "an ensures whose owner performs is unproved, and says no handler is there to run it" {
+  let p = program(
+    \\effect db {
+    \\  read get[r](k: Int) -> Int
+    \\}
+    \\
+    \\fn fetch(k: Int) -> Int / {db.read[main]} = db.get[main](k)
+    \\
+    \\fn difference(k: Int) -> Int / {db.read[main]}
+    \\  ensures result == 0
+    \\= fetch(k) - fetch(k)
+    \\
+  );
+  match outcome(p, "m.difference", never_run()) {
+    Unproved(UnhandledEffect(row)) -> {
+      assert_eq(row, Some("{m.db.read[main]}"));
+      assert(reason_summary(UnhandledEffect(row)).contains("no handler"))
+    },
+    _ -> panic("not left to a handler"),
+  }
+}
+
+test "a law quantifying over a type with no values is never proved" {
+  let p = program(
+    "type Bad = Wrap(Bad)\n\nlaw \"a claim about nothing\" forall (b: Bad) { b == b }\n",
+  );
+  assert_eq(outcome(p, "m.a claim about nothing", never_run()), Unproved(NoWitness))
+}
+
+test "a guard over a narrow window far from zero is decided over the values it admits" {
+  let p = program(
+    "law \"a narrow window\" forall (x: Int) where x > 1000000 && x < 1000010 { x > 0 }\n",
+  );
+  let o = outcome(
+    p,
+    "m.a narrow window",
+    compiled_as(
+      |point: List<Value>| int_of(point) > 1000000 && int_of(point) < 1000010,
+      |point: List<Value>| int_of(point) > 0,
+    ),
+  );
+  assert(is_proved(o))
+}
+
+test "a guard nothing shows empty is no vacuity: its claim is open" {
+  let p = program(
+    \\fn seen(xs: List<Int>, x: Int) -> Bool =
+    \\  match xs {
+    \\    [y, ..rest] -> if y == x { true } else { seen(rest, x) },
+    \\    _ -> false,
+    \\  }
+    \\
+    \\law "a narrow window" forall (xs: List<Int>, x: Int)
+    \\  where x > 1000000 && x < 1000010 { seen(xs.push(x), x) }
+    \\
+  );
+  let window = |point: List<Value>|
+    match point {
+      [_, VInt(x)] -> x > 1000000 && x < 1000010,
+      _ -> panic("a list and an Int at the point"),
+    };
+  assert(is_open(outcome(p, "m.a narrow window", compiled_as(window, |_p: List<Value>| true))))
+}
+
+test "a claim over a float is refuted at the float it fails at" {
+  let p = program("law \"from bits\" forall (n: Int) { Float::of_bits(n) == Float::of_bits(n) }\n");
+  let o = outcome(
+    p,
+    "m.from bits",
+    unguarded(|point: List<Value>| Float::of_bits(int_of(point)) == Float::of_bits(int_of(point))),
+  );
+  assert_eq(values_of(refuted_at(o)), [VInt(0 - 1)])
+}
+
+test "equal decimals printed apart refute a claim that they print alike" {
+  let p = program(
+    "law \"print alike\" forall (x: Decimal, y: Decimal) { !(x == y) || Decimal::to_string(x) == Decimal::to_string(y) }\n",
+  );
+  let o = outcome(
+    p,
+    "m.print alike",
+    unguarded(|point: List<Value>|
+      match point {
+        [VDecimal(x), VDecimal(y)] -> !(x == y) || Decimal::to_string(x) == Decimal::to_string(y),
+        _ -> panic("two decimals at the point"),
+      }),
+  );
+  assert(refuted_at(o) != [])
+}
+
+test "a law over a map that holds at every map tried is open, and never refuted" {
+  let p = program(
+    \\fn size(m: Map<String, Int>) -> Int = m.len()
+    \\
+    \\law "a map's key count is its length"
+    \\  forall (m: Map<String, Int>) {
+    \\    m.keys().len() == size(m)
+    \\  }
+    \\
+    \\law "inserting a key you already have does not grow the map"
+    \\  forall (m: Map<String, Int>, k: String, v: Int) where m.contains(k) {
+    \\    m.insert(k, v).len() == m.len()
+    \\  }
+    \\
+  );
+  assert(is_open(outcome(p, "m.a map's key count is its length", holding())));
+  assert(is_open(outcome(p, "m.inserting a key you already have does not grow the map", holding())))
+}
+
+test "a claim whose guard bounds its `Int` between two literals is checked at every value in that range" {
+  let over = |ends: String|
+    "fn ends_a_square(d: Int) -> Bool = " ++ ends
+      ++ "\n\nlaw \"a square's last digit\" forall (n: Int) where n >= 0 && n <= 40 { ends_a_square((n * n) % 10) }\n";
+  let ending_in = |digits: List<Int>|
+    unguarded(|point: List<Value>| digits.contains(int_of(point) * int_of(point) % 10));
+  match outcome(
+      program(over("d == 0 || d == 1 || d == 4 || d == 5 || d == 6 || d == 9")),
+      "m.a square's last digit",
+      ending_in([0, 1, 4, 5, 6, 9]),
+    ) {
+    Proved(c) -> {
+      assert(c.ran);
+      assert(certificate_summary(c).contains("41 points of Int 0..=40"))
+    },
+    _ -> panic("not proved"),
+  };
+  assert_eq(
+    values_of(
+      refuted_at(
+        outcome(
+          program(over("d == 0 || d == 1 || d == 4 || d == 5 || d == 6")),
+          "m.a square's last digit",
+          ending_in([0, 1, 4, 5, 6]),
+        ),
+      ),
+    ),
+    [VInt(3)],
+  )
+}
+
+test "a postcondition that raises at the boundary is not proved, and one whose domain stops short is" {
+  let p = program(
+    \\fn inc(x: Int) -> Int
+    \\  ensures result > x
+    \\= x + 1
+    \\
+    \\fn bounded(x: Int) -> Int
+    \\  requires x < 100
+    \\  ensures result > x
+    \\= x + 1
+    \\
+  );
+  assert(is_open(outcome(p, "m.inc", holding())));
+  assert(
+    is_proved(
+      outcome(
+        p,
+        "m.bounded",
+        compiled_as(|point: List<Value>| int_of(point) < 100, |_p: List<Value>| true),
+      ),
+    ),
+  )
+}
+
+test "a claim over a fixed-width integer is checked over every value of that width" {
+  let p = program(
+    \\fn low_bit(b: U8) -> Int
+    \\  requires Int::of_u8(b) > 300
+    \\  ensures result < 2
+    \\= Int::of_u8(b & 1u8)
+    \\
+    \\type Byte = | Byte(U8)
+    \\
+    \\law "no byte is seven" forall (b: U8) { Int::of_u8(b) != 7 }
+    \\
+    \\law "every byte fits" forall (b: U8) { Int::of_u8(b) < 256 }
+    \\
+    \\law "no Byte is seven" forall (b: Byte) { match b { Byte(x) -> Int::of_u8(x) != 7 } }
+    \\
+  );
+  let not_seven = unguarded(|point: List<Value>| byte_of(point) != 7u128);
+  let plain = refuted_at(outcome(p, "m.no byte is seven", not_seven));
+  assert_eq(plain.map(|b: Binding| (b.name, b.ty, render(b.value))), [("b", "U8", "7")]);
+  let wrapped = refuted_at(outcome(p, "m.no Byte is seven", not_seven));
+  assert_eq(wrapped.map(|b: Binding| (b.name, render(b.value))), [("b", "Byte(7)")]);
+  match outcome(p, "m.every byte fits", unguarded(|point: List<Value>| byte_of(point) < 256u128)) {
+    Proved(c) -> assert_eq(points_covered(c.rules), [256]),
+    _ -> panic("not proved"),
+  };
+  let above = compiled_as(|point: List<Value>| byte_of(point) > 300u128, |_p: List<Value>| true);
+  assert(match outcome(p, "m.low_bit", above) { Vacuous(_) -> true, _ -> false })
+}
+
+fn points_covered(rules: List<Rule>) -> List<Int> =
+  rules.fold([], |points: List<Int>, r: Rule|
+    match r { ExhaustiveEnumeration(e) -> points.push(e.points), _ -> points })
+
+test "an enumerated refutation is reported at the point that fails" {
+  let p = program(
+    \\type Day = Mon | Tue | Wed | Thu | Fri | Sat | Sun
+    \\
+    \\fn rank(d: Day) -> Int =
+    \\  match d { Mon -> 1, Tue -> 2, Wed -> 3, Thu -> 4, Fri -> 5, Sat -> 6, Sun -> 7 }
+    \\
+    \\law "every day is early" forall (d: Day) { rank(d) / 1 < 7 }
+    \\
+  );
+  let early = unguarded(|point: List<Value>|
+    match point { [VCtor(name, _)] -> name != "m.Sun", _ -> panic("a day at the point") });
+  assert_eq(
+    refuted_at(outcome(p, "m.every day is early", early)).map(|b: Binding| render(b.value)),
+    ["Sun"],
+  )
+}
+
+test "a claim that fails at a boundary value written in its own source is refuted with that value as the counterexample" {
+  let p = program("law \"the bound holds\" forall (n: Int) { n < 100 }\n");
+  let o = outcome(p, "m.the bound holds", unguarded(|point: List<Value>| int_of(point) < 100));
+  assert_eq(values_of(refuted_at(o)), [VInt(100)])
+}
+
+fn clamped(laws: String) -> String =
+  String::unlines([
+    "fn clamp(n: Int) -> Int = if n > 10 { 10 } else { n }",
+    "fn reverse(xs: List<Int>) -> List<Int> =",
+    "  match xs { [] -> [], [x, ..rest] -> reverse(rest).push(x) }",
+    laws,
+  ])
+
+fn coverage_of(p: Program) -> Coverage / {abort.raise} = {
+  let definitions = p.built.definitions.map(|d: Definition| d.name);
+  coverage(
+    definitions,
+    laws_of(definitions, p.built.laws),
+    p.built.world.obligations.map(|o: Obligation|
+      {
+        owner: o.owner,
+        kind: o.kind,
+        proved: is_proved(outcome(p, o.owner, holding())),
+        discharged: true,
+      }),
+  )
+}
+
+test "an instantiation comes to what its schema's body written out does, and names its schema" {
+  let written = program(
+    clamped(
+      \\law "clamp resolves" forall (x: Int) { clamp(clamp(x)) == clamp(x) }
+      \\
+      \\law "reverse twice" forall (x: List<Int>) { reverse(reverse(x)) == x }
+      \\
+      \\law "small values are fixed" forall (x: Int) where x > 0 && x < 10 { clamp(x) == x }
+      \\
+    ),
+  );
+  let made = program(
+    clamped(
+      \\law schema idempotent<a>(f: (a) -> a) forall (x: a) { f(f(x)) == f(x) }
+      \\
+      \\law schema involution<a>(f: (a) -> a) forall (x: a) { f(f(x)) == x }
+      \\
+      \\law schema fixed_within(f: (Int) -> Int, low: Int, high: Int)
+      \\  forall (x: Int) where x > low && x < high { f(x) == x }
+      \\
+      \\law "clamp resolves" = idempotent(clamp)
+      \\
+      \\law "reverse twice" = involution(reverse)
+      \\
+      \\law "small values are fixed" = fixed_within(clamp, 0, 10)
+      \\
+    ),
+  );
+  let compared = |label: String| {
+    let m = outcome(made, "m." ++ label, holding());
+    assert_eq(m, outcome(written, "m." ++ label, holding()));
+    assert_eq(
+      obligation_of(made, "m." ++ label).guards.len(),
+      obligation_of(written, "m." ++ label).guards.len(),
+    );
+    m
+  };
+  assert(is_proved(compared("clamp resolves")));
+  assert(is_open(compared("reverse twice")));
+  assert(is_proved(compared("small values are fixed")));
+  assert_eq(coverage_of(made), coverage_of(written));
+  let named = schemas_instantiated(made.analysis.modules);
+  assert_eq(named.get(b"m.clamp resolves"), Some(b"m.idempotent"));
+  assert_eq(named.get(b"m.reverse twice"), Some(b"m.involution"));
+  assert_eq(named.get(b"m.small values are fixed"), Some(b"m.fixed_within"));
+  assert_eq(schemas_instantiated(written.analysis.modules).len(), 0)
+}
+
+test "a refuted law schema instantiation reports the counterexample at the schema's `forall` variable and names the schema" {
+  let source = String::unlines([
+    "fn x(n: Int) -> Int = if n > 0 { 0 } else { n }",
+    "",
+    "law schema involution<a>(f: (a) -> a) forall (x: a) { f(f(x)) == x }",
+    "",
+    "law \"a clamp undoes itself\" = involution(x)",
+  ]);
+  let p = program(source);
+  let clamp = |n: Int| if n > 0 { 0 } else { n };
+  let o = outcome(
+    p,
+    "m.a clamp undoes itself",
+    unguarded(|point: List<Value>| clamp(clamp(int_of(point))) == int_of(point)),
+  );
+  assert_eq(refuted_at(o).map(|b: Binding| (b.name, b.ty)), [("x", "Int")]);
+  assert_eq(
+    Some(obligation_of(p, "m.a clamp undoes itself").at.start),
+    Bytes::of_string(source).index_of(b"law \"a clamp undoes itself\""),
+  )
+}
+
+fn one_interleaving() -> (RuntimeRequest) -> RuntimeReply =
+  |ask: RuntimeRequest|
+    match ask {
+      JudgePoints(batches) ->
+        Judgements(batches.map(|b: Batch| b.points.map(|_point: List<Value>| PointPassed))),
+      RunInterleaving(_, _, _, _) ->
+        Interleaved({
+          interleaving: { steps: [], verdict: Passed, virtual_time: 0 },
+          observed: true,
+        }),
+    }
+
+fn searched(binders: Bytes, first: Bytes) -> Outcome / {abort.raise} =
+  outcome(
+    program(String::of_bytes_lossy(simulated(binders, first))),
+    "m.two writers",
+    one_interleaving(),
+  )
+
+fn proved_over(o: Outcome) -> List<Int> / {abort.raise} =
+  match o {
+    Proved(c) -> {
+      assert(c.guard_satisfiable);
+      assert_eq(c.sorts, []);
+      assert(c.rules.any(|r: Rule| match r { ExhaustiveInterleaving(n) -> n > 0, _ -> false }));
+      points_covered(c.rules)
+    },
+    _ -> panic("not proved"),
+  }
+
+test "a concurrency law is proved only when both its domains were covered, and names both" {
+  assert_eq(proved_over(searched(b"", b"1")), []);
+  assert_eq(proved_over(searched(b"forall (flip: Bool)", b"if flip { 1 } else { 3 }")), [2]);
+  assert_eq(proved_over(searched(b"forall (u: Unit)", b"1")), [1])
+}
+
+test "a concurrency law over an `Int` is proved only when its guard bounds that `Int` to a finite range" {
+  assert_eq(searched(b"forall (n: Int) where n > 0", b"n"), Unproved(DomainTooLarge));
+  assert_eq(proved_over(searched(b"forall (n: Int) where n > 0 && n <= 3", b"n")), [3])
+}

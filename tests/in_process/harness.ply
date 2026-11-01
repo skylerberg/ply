@@ -1,10 +1,10 @@
-import spawning.harness (Repo, RunResult, Source, WorkingDirectory, agreeing, at, bodies_dir,
-                         checking, diagnostic, environment, exists, failed, first, int, items,
-                         joined, json_of, manifest, not_ok, own_modules, parent, path, read,
-                         repo_file, reused_dir, scratch_marker, send, sources_here, spawned,
-                         stable_report, str, variable_value, working_directory, write,
-                         write_project)
-import cli.ply (main)
+import support.harness (Repo, RunResult, Source, WorkingDirectory, agreeing, at, bodies_dir,
+                        checking, diagnostic, environment, exists, failed, first, int, items,
+                        joined, json_of, manifest, not_ok, own_modules, parent, path, read,
+                        repo_file, reused_dir, scratch_marker, send, sources_here, stable_report,
+                        str, variable_value, working_directory, write, write_project)
+import cli.ply (main, execute)
+import cli.units (emit)
 import cli.paths
 import cli.program (packages_of)
 import cli.sources
@@ -14,8 +14,11 @@ import compiler.front.pkg (SuppliedPackage)
 import compiler.checkout (ShippedFile, digests_of)
 import std.env (env)
 import compiler.unit
-import compiler.unit (shipped)
-import compiler.front.rows (ModuleSpan, module_of)
+import compiler.unit (UnitBody, shipped)
+import compiler.emit.keys (RootKey, RootName, root_name)
+import compiler.emit.output (no_tables)
+import compiler.front.rows (Dump, HashTableRow, ModuleSpan, TestHashRow, TestRow, module_of)
+import compiler.front.emitter_input (test_root_at)
 import compiler.load
 import compiler.check.resolve.tables (Diagnostic)
 import cli.diagnostic
@@ -41,25 +44,14 @@ import std.process (process, EnvironmentVariable, FakeProcess, captured, args_st
                     err_step, exit_step, with_input, line_step, Line)
 import std.term (term)
 import std.time (time)
-import std.value (Value)
+import std.value
+import std.value (Value, VInt, VList, VUnit)
 import std.path (join, normalize)
 import std.pkg (Dependency, Manifest, Path, ToolchainParts, Workspace)
 import std.string
 
 fn captured_result(c: FakeProcess) -> RunResult =
   { out: c.out, err: c.err, code: match c.code { Some(n) -> n, None -> 0 } }
-
-pub fn loads_here() -> Bool / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
-  match library_here() {
-    Err(_) -> false,
-    Ok(c) -> match entering::machine.open(c.library) {
-      Ok(o) -> {
-        entering::machine.close(o.unit);
-        true
-      },
-      Err(_) -> false,
-    },
-  }
 
 pub fn first_message(diagnostics: List<Diagnostic>) -> String =
   match diagnostics { [d, ..] -> String::of_bytes_lossy(d.message), [] -> "no diagnostic" }
@@ -141,16 +133,6 @@ pub fn call(
     Err(r) -> Err(diagnostic::shown(r)),
   }
 
-pub fn call_value(
-  l: LoadedProgram,
-  entry: String,
-  args: List<Value>,
-) -> Value / {entering::machine.enter, abort.raise} =
-  match call(l, entry, args) {
-    Ok(v) -> v,
-    Err(d) -> panic("`" ++ entry ++ "` returns: " ++ String::of_bytes_lossy(d.message)),
-  }
-
 pub fn workspace() -> Workspace / {Repo, abort.raise} =
   match pkg::check_workspace(Bytes::of_string(repo_file(library::workspace_file()))).workspace {
     Some(w) -> w,
@@ -170,12 +152,6 @@ fn manifest_at(dir: String) -> Manifest / {Repo, abort.raise} =
   }
 
 pub fn package_name(dir: String) -> String / {Repo, abort.raise} = manifest_at(dir).name
-
-pub fn package_dir(name: String) -> String / {Repo, abort.raise} =
-  match workspace().packages.filter(|dir: String| package_name(dir) == name) {
-    [dir, ..] -> dir,
-    [] -> panic("`ply.work` lists no package named `" ++ name ++ "`"),
-  }
 
 pub fn warm_check_report() -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   stable_report(json_of(on_disk(checking())))
@@ -403,13 +379,16 @@ pub fn shipped_dirs() -> List<String> / {Repo, abort.raise} = {
 }
 
 pub fn tree(files: List<Source>) -> MemFs / {abort.raise} =
-  files.fold(fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, source: Source| {
-    let at = "w/" ++ source.path;
-    fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, Bytes::of_string(source.text)).fs
-  })
+  files.fold(fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, source: Source|
+    with_file(t, source.path, source.text))
 
 pub fn one_module_tree(text: String) -> MemFs / {abort.raise} =
   tree([{ path: "m.ply", text: text }])
+
+pub fn with_file(t: MemFs, path: String, text: String) -> MemFs / {abort.raise} = {
+  let at = "w/" ++ path;
+  fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, Bytes::of_string(text)).fs
+}
 
 pub fn file_of(t: MemFs, path: String) -> Option<String> / {abort.raise} =
   match fs::mem_read(t, to_tree_path(path)) { Some(b) -> Some(String::of_bytes(b)), None -> None }
@@ -775,7 +754,7 @@ fn compiling() -> List<String> = ["attest", "build", "prove", "review", "run", "
 
 fn not_here(argv: List<String>, what: String) -> String =
   "`ply " ++ String::join(argv, " ") ++ "` " ++ what
-    ++ ": start it with `spawned`, in a `test/nondet` over the working directory"
+    ++ ": run it with `in_memory_faked`, or start it with `spawned` in `tests/cli`"
 
 fn compiles(argv: List<String>) -> Bool / {abort.raise} =
   match command_line::parse(surface(), argv) {
@@ -836,12 +815,13 @@ fn on_disk_with_overrides(
   stdin: Option<String>,
   overrides: List<Source>,
   only: Bool = false,
+  faked: Option<(String) -> entering::Termination> = None,
 ) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} = {
-  let rejecting = overrides.len() == 0;
+  let rejecting = overrides.len() == 0 && (match faked { Some(_) -> false, None -> true });
   if rejecting && compiles(argv) { panic(not_here(argv, "compiles the program")) };
   let pwd = working_directory();
   let ran = handle {
-    main()
+    match faked { Some(ended) -> main_compiling_nothing(ended), None -> main() }
   } with {
     var io = with_input(captured(with_default_path(argv)), input_lines(stdin)),
     process.args[proc]() -> args_step(io),
@@ -897,6 +877,121 @@ fn on_disk_with_overrides(
   };
   ran
 }
+
+fn main_compiling_nothing(
+  ended: (String) -> entering::Termination,
+) -> Unit / {CliEffects, Shipped, shipped.binary_size, env.variable, env.variables, env.working_directory, fs.list_dir[shipped], fs.read_file[shipped], process.args[proc], process.err[proc], process.exit[proc], process.line[proc], process.out[proc], term.is_terminal, abort.raise, diverges} =
+  handle {
+    match command_line::parse(surface(), process.args[proc]()) {
+      command_line::Run(parsed) ->
+        process.exit[proc](handle {
+          execute(parsed)
+        } with {
+          emit.unit(front, offered, entered) ->
+            Ok({
+              sources: [],
+              contents: {
+                bodies: faked_bodies(front.dump, offered),
+                requested: [],
+                named: Map::new(),
+              },
+            }),
+          emit.compiled(sources, profile) -> Ok("faked"),
+        }),
+      _ -> main(),
+    }
+  } with {
+    entering::machine.open(library) -> Ok({ unit: 1, root_count: 0, nanos: 0, threads: 1 }),
+    entering::machine.hosting(grants) -> entering::machine.hosting(entering::no_grants()),
+    entering::machine.bind(grants) -> entering::machine.bind(entering::no_grants()),
+    entering::machine.enter(unit, root, arguments, run) ->
+      {
+        ended: ended(faked_entry(root, arguments, run.label)),
+        exit: None,
+        usage: {
+          nanos: 0,
+          host: false,
+          performs: 0,
+          native_objects: 0,
+          scheduled: 0,
+          task_stacks: 0,
+          frame_tables: 0,
+          runtime_blocks: 0,
+          live: 0,
+        },
+        warnings: [],
+        interleaving: match run.seed {
+          Some(_) -> Some({ steps: [], virtual_time: 0 }),
+          None -> None,
+        },
+        trace: Some(b""),
+      },
+    entering::machine.close(unit) -> (),
+  }
+
+fn faked_entry(root: String, arguments: Bytes, label: String) -> String =
+  if label == "" { root } else {
+    match value::decode(arguments) {
+      Some(VList([VInt(position), ..])) -> label ++ "[" ++ position.to_string() ++ "]",
+      _ -> label,
+    }
+  }
+
+fn faked_bodies(dump: Dump, offered: List<RootKey>) -> List<UnitBody> / {abort.raise} = {
+  let hashed = dump.hashes.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, row: HashTableRow|
+    match row { TestHashRow(t) -> accumulator.insert(t.key, t.hash), _ -> accumulator });
+  let coded = dump.tests.fold(Map::new(), |accumulator: Map<RootName, Bytes>, t: TestRow|
+    match test_root_at(dump, t.index) {
+      Some(root) -> accumulator.insert(root_name(root), hashed.get(t.key).unwrap_or(b"")),
+      None -> accumulator,
+    });
+  offered.map(|root: RootKey|
+    {
+      name: root_name(root),
+      text: b"",
+      tables: no_tables(),
+      body: coded.get(root_name(root)).unwrap_or(b""),
+      size: 0,
+    })
+}
+
+pub fn on_disk_faked(
+  argv: List<String>,
+  ended: keep (String) -> entering::Termination,
+  vars: List<EnvironmentVariable> = [],
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, vars, None, [], false, Some(ended))
+
+pub fn in_memory_faked(
+  t: MemFs,
+  argv: List<String>,
+  ended: keep (String) -> entering::Termination,
+  shipped: List<Source> = [],
+  vars: List<EnvironmentVariable> = [],
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} = {
+  let o = over_tree(t, || on_disk_with_overrides(argv, vars, None, shipped, false, Some(ended)));
+  { ran: o.value, tree: o.tree }
+}
+
+pub fn returned_unit() -> entering::Termination = returned(VUnit)
+
+pub fn returned(v: Value) -> entering::Termination =
+  entering::Returned(match value::encode(v) { Some(b) -> b, None -> b"" })
+
+pub fn failed_assertion(message: String) -> entering::Termination =
+  entering::Failed({
+    code: "E0501",
+    severity: entering::Error,
+    message: message,
+    labels: [],
+    notes: [],
+    values: [],
+  })
+
+pub fn passing_except(failing: List<String>) -> (String) -> entering::Termination =
+  |name: String|
+    if failing.contains(name) { failed_assertion("the test says it failed") }
+    else { returned_unit() }
 
 pub fn cache_entry(name: String) -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {

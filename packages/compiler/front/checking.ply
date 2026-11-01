@@ -757,6 +757,22 @@ fn prelude_pack() -> Option<packs::PackFiles> / {abort.raise} = pack_of(shipped_
 pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
   packs::frame_in(prelude_pack(), path, offset, len)
 
+pub fn queried_packages(
+  store: MemoryStore,
+  root: OwnPackage,
+  dependencies: List<OwnPackage>,
+) -> { store: MemoryStore, run: Run, results: List<CheckedModule> } / {abort.raise} = {
+  let w = load_inputs_of(root, dependencies);
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    || query_alone(fresh_registry(), w),
+  );
+  { store: done.store, run: done.value.run, results: done.value.results }
+}
+
 fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
   load_inputs_of(
     {
@@ -954,8 +970,16 @@ test "a module's hashes read back as they were recorded" {
 fn embedding_queried(
   source_text: Bytes,
   files: Map<Bytes, Bytes>,
+) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} =
+  embedding_queried_over(empty_memory_store(), source_text, files, [])
+
+fn embedding_queried_over(
+  store: MemoryStore,
+  source_text: Bytes,
+  files: Map<Bytes, Bytes>,
+  others: List<Source>,
 ) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
-  let w = inputs_alone([{ name: b"m", source_text: source_text }]);
+  let w = inputs_alone([{ name: b"m", source_text: source_text }].concat(others));
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
     match files.get(want.path) {
@@ -963,7 +987,7 @@ fn embedding_queried(
       None -> Err(b"no file is there"),
     };
   let done = over_decoding(
-    empty_memory_store(),
+    store,
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
@@ -1012,6 +1036,30 @@ test "changing an embedded file's bytes changes the hash of the definition that 
   assert(fixed_hash(moved, b"m.b") != fixed_hash(first, b"m.b"));
   let same = over(b"one", b"one");
   assert_eq(fixed_hash(same, b"m.a"), fixed_hash(same, b"m.b"))
+}
+
+test "a check detects that a file a module embeds was deleted, even though no module source changed" {
+  let source_text = b"pub fn words() -> Bytes = embed(\"words.txt\")\n";
+  let others = [
+    { name: b"count", source_text: b"import m\npub fn count() -> Int = m::words().len()\n" },
+  ];
+  let present = embedding_queried_over(
+    empty_memory_store(),
+    source_text,
+    Map::new().insert(b"words.txt", b"one two\n"),
+    others,
+  );
+  assert_eq(rejected_first(present.results), []);
+  let gone = embedding_queried_over(present.store, source_text, Map::new(), others);
+  assert_eq(
+    gone.results,
+    embedding_queried_over(empty_memory_store(), source_text, Map::new(), others).results,
+  );
+  assert_eq(
+    rejected_first(gone.results).fold([], |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
+    [b"E0146"],
+  )
 }
 
 type CheckedSources = {
@@ -1305,6 +1353,23 @@ test "an import of a module that does not exist fails the importing module even 
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0106"],
   )
+}
+
+test "an import of a module that does not ship lists the ones that do, and points at the import" {
+  let f = check_sources(
+    empty_memory_store(),
+    [{ name: b"app", source_text: b"import std.nonesuch\nfn f() -> Int = 1\n" }],
+    [{ name: b"std.net", source_text: b"pub fn drain() -> Int = 1\n" }],
+  );
+  match f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
+      accumulator.concat(a.result.rejected)) {
+    [d] -> {
+      assert_eq(d.code, b"E0106");
+      assert(d.labels != []);
+      assert(d.notes_text.any(|note: Bytes| note.index_of(b"std.net") != None))
+    },
+    _ -> panic("one import is rejected"),
+  }
 }
 
 test "two imports that give the same module name fail their module even when neither is used" {

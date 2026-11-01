@@ -24,7 +24,8 @@ pg=$(postgres_bin)
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root")
-in_process_grants=("${cli_grants[@]}" --allow machine --allow shipped --allow toolchain)
+in_process_grants=(--timeout 900000 --json --exec "git=$(command -v git)"
+  --fs cwd=. --fs abs=/ --fs "repo=$root" --allow machine --allow shipped --allow toolchain)
 
 deadline=${PLY_CI_DEADLINE:-}
 STOPPED=124

@@ -43,8 +43,8 @@ These environment variables help when working on `ply` itself:
 | `packages/store` | what `ply` stores in `.ply-cache` between runs |
 | `packages/registry` | the package registry that `ply publish` and `ply resolve` talk to |
 | `tests/cli` | the tests of the `ply` command, each a process it starts |
-| `tests/in_process` | tests that call the compiler and the CLI in the test's own process |
-| `tests/spawning` | what those two suites share: starting `ply` and reading what it reports |
+| `tests/in_process` | tests that call the compiler and the CLI in the test's own process, starting no `ply` |
+| `tests/support` | what those two suites share: writing a project and reading what `ply` reports |
 | `tests/std` | standard library tests that read fixture files, which are stored in the same directory |
 | `examples/`, `tests/lang/`, `tests/programs/` | Ply programs that CI checks and tests; `tests/programs/` holds the programs the CLI's tests run |
 | `tests/fixtures/` | Ply programs that must fail to check, each with the error it must produce |

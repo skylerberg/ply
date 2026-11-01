@@ -1,0 +1,286 @@
+import compiler.syntax.expressions (Param, expression_span)
+import compiler.syntax.items (NumericDeriver, OrderingDeriver, ExternDefinition, ExternItem, Item,
+                              EnsuresClause, RequiresClause, SpecClause, SpecKind, parse)
+import compiler.syntax.type_syntax (TypeExpression, NamedTypeExpression, FunctionTypeExpression,
+                                    VariableTypeExpression)
+import harness (spawned)
+import support.harness (write_program, all_output, json_of, at, path, items, str, int)
+import std.json (Json)
+import std.list
+import std.string
+
+fn named(d: ExternDefinition) -> String / {abort.raise} =
+  "`" ++ String::of_bytes(d.name.name) ++ "`"
+
+fn type_arguments(d: ExternDefinition) -> List<String> / {abort.raise} =
+  match d.constraints {
+    [] -> if is_columns(d.return_type)
+        || d.params.any(|p: Param| match p.ty { Some(t) -> is_columns(t), None -> false }) {
+      ["{ x: Int }"]
+    } else { ["Int"] },
+    [c] -> match c.deriver {
+      NumericDeriver ->
+        ["Int", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "U128", "Float", "Decimal"],
+      OrderingDeriver -> ["Int"],
+      _ -> panic(named(d) ++ " states a clause under a constraint this test does not fill"),
+    },
+    _ -> panic(named(d) ++ " states a clause under more than one constraint"),
+  }
+
+fn is_columns(t: TypeExpression) -> Bool =
+  match t { NamedTypeExpression(c) -> c.name.name.name == b"Columns", _ -> false }
+
+fn type_text(t: TypeExpression, fill: String) -> String / {abort.raise} =
+  match t {
+    VariableTypeExpression(_) -> fill,
+    NamedTypeExpression(c) ->
+      String::of_bytes(c.name.name.name)
+        ++ (if c.args.len() == 0 { "" } else {
+          "<" ++ String::join(c.args.map(|a: TypeExpression| type_text(a, fill)), ", ") ++ ">"
+        }),
+    FunctionTypeExpression(f) ->
+      "(" ++ String::join(f.params.map(|p: TypeExpression| type_text(p, fill)), ", ") ++ ") -> "
+        ++ type_text(f.return_type, fill),
+    _ -> panic("a builtin that states a clause takes a type this test does not write"),
+  }
+
+fn values_for(ty: String) -> String / {abort.raise} = {
+  let lists = [
+    { ty: "Int", from: "ints()" },
+    { ty: "U8", from: "u8s()" },
+    { ty: "U16", from: "u16s()" },
+    { ty: "U32", from: "u32s()" },
+    { ty: "U64", from: "u64s()" },
+    { ty: "U128", from: "u128s()" },
+    { ty: "I8", from: "i8s()" },
+    { ty: "I16", from: "i16s()" },
+    { ty: "I32", from: "i32s()" },
+    { ty: "Char", from: "chars()" },
+    { ty: "Bytes", from: "buffers()" },
+    { ty: "String", from: "texts()" },
+    { ty: "List<Int>", from: "lists()" },
+    { ty: "Array<Int>", from: "arrays()" },
+    { ty: "{ x: Int }", from: "records()" },
+    { ty: "Columns<{ x: Int }>", from: "columns()" },
+    { ty: "Map<Int, Int>", from: "maps()" },
+    { ty: "Decimal", from: "decimals()" },
+    { ty: "Rounding", from: "modes()" },
+    { ty: "(Int) -> Bool", from: "predicates()" },
+  ];
+  match lists.filter(|l: { ty: String, from: String }| l.ty == ty) {
+    [l, ..] -> l.from,
+    [] -> panic("`drawing` lists no values of type `" ++ ty ++ "` for a builtin's parameter"),
+  }
+}
+
+fn value_lists() -> String =
+  \\import std.show (show)
+  \\
+  \\fn least() -> Int = 0 - 9223372036854775807 - 1
+  \\
+  \\fn ints() -> List<Int> =
+  \\  [
+  \\    least(), least() + 1, -4294967297, -4294967296, -2147483649, -2147483648, -32769, -32768,
+  \\    -129, -128, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 27, 28, 29, 127, 128, 255, 256, 32767, 32768,
+  \\    65535, 65536, 2147483647, 2147483648, 4294967295, 4294967296, 9223372036854775806,
+  \\    9223372036854775807,
+  \\  ]
+  \\
+  \\fn narrowed<a>(to: (Int) -> a / {abort.raise}) -> List<a> =
+  \\  ints().fold([], |accumulator: List<a>, n: Int|
+  \\    match try[abort.raise] { to(n) } { Ok(x) -> accumulator.push(x), Err(_) -> accumulator })
+  \\
+  \\fn u8s() -> List<U8> = narrowed(|n: Int| U8::of_int(n))
+  \\
+  \\fn u16s() -> List<U16> = narrowed(|n: Int| U16::of_int(n))
+  \\
+  \\fn u32s() -> List<U32> = narrowed(|n: Int| U32::of_int(n))
+  \\
+  \\fn u64s() -> List<U64> = narrowed(|n: Int| U64::of_int(n)).push(0xFFFF_FFFF_FFFF_FFFFu64)
+  \\
+  \\fn u128s() -> List<U128> =
+  \\  narrowed(|n: Int| U128::of_int(n)).push(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128)
+  \\
+  \\fn i8s() -> List<I8> = narrowed(|n: Int| I8::of_int(n))
+  \\
+  \\fn i16s() -> List<I16> = narrowed(|n: Int| I16::of_int(n))
+  \\
+  \\fn i32s() -> List<I32> = narrowed(|n: Int| I32::of_int(n))
+  \\
+  \\fn chars() -> List<Char> = ['\0', '\u{7f}', '\u{80}', '\u{d7ff}', '\u{e000}', '\u{10ffff}']
+  \\
+  \\fn buffers() -> List<Bytes> = [b"", b"a", b"ab c", b"\x00\xff abcde"]
+  \\
+  \\fn texts() -> List<String> = ["", "a", "a b", "\u{e9}", "a \u{e9} b c"]
+  \\
+  \\fn lists() -> List<List<Int>> = [[], [7], [7, 8, 9]]
+  \\
+  \\fn values() -> List<Int> = [7]
+  \\
+  \\fn arrays() -> List<Array<Int>> = lists().map(|xs: List<Int>| Array::of_list(xs))
+  \\
+  \\fn records() -> List<{ x: Int }> = [{ x: 7 }]
+  \\
+  \\fn columns() -> List<Columns<{ x: Int }>> =
+  \\  lists().map(|xs: List<Int>| Columns::of_list(xs.map(|x: Int| { x: x })))
+  \\
+  \\fn maps() -> List<Map<Int, Int>> =
+  \\  lists().map(|xs: List<Int>| xs.fold(Map::new(), |m: Map<Int, Int>, x: Int| m.insert(x, x)))
+  \\
+  \\fn modes() -> List<Rounding> = [HalfEven, HalfUp, Down, Up, Ceiling, Floor]
+  \\
+  \\fn predicates() -> List<(Int) -> Bool> = [|c: Int| c == 32, |c: Int| false]
+  \\
+  \\fn pointed(digits: String, s: Int) -> String / {abort.raise} = {
+  \\  let padded = range(digits.len(), s + 1).fold(digits, |t: String, i: Int| "0" ++ t);
+  \\  let whole = padded.len() - s;
+  \\  if s == 0 { padded } else {
+  \\    padded.slice(0, whole) ++ "." ++ padded.slice(whole, padded.len())
+  \\  }
+  \\}
+  \\
+  \\fn decimals() -> List<Decimal> / {abort.raise} =
+  \\  range(0, 29).fold([], |accumulator: List<Decimal>, s: Int|
+  \\    [pointed("79228162514264337593543950335", s), pointed("1", s), pointed("0", s)].fold(accumulator,
+  \\      |ds: List<Decimal>, text: String|
+  \\        match Decimal::of_string(text) {
+  \\          Some(d) -> ds.push(d).push(0m - d),
+  \\          None -> panic("`" ++ text ++ "` is a decimal"),
+  \\        },
+  \\    ))
+  \\
+  \\fn each<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
+  \\  xs.fold((), |u: Unit, x: a| f(x))
+  \\
+  \\fn calm(what: String, call: () -> Unit / {abort.raise}) -> Unit / {abort.raise} =
+  \\  match try[abort.raise] { call() } {
+  \\    Ok(_) -> (),
+  \\    Err(why) -> panic(what ++ " raised where its `requires` holds: " ++ why),
+  \\  }
+  \\
+  \\fn sure(what: String, call: () -> Bool / {abort.raise}) -> Unit / {abort.raise} =
+  \\  match try[abort.raise] { call() } {
+  \\    Ok(true) -> (),
+  \\    Ok(false) -> panic(what ++ " returned what its `ensures` rules out"),
+  \\    Err(_) -> (),
+  \\  }
+  \\
+  \\
+
+type TestParameter = { name: String, ty: String, from: String, shown: Bool }
+
+fn externs_with_clause(prelude: Bytes, kind: SpecKind) -> List<ExternDefinition> / {abort.raise} =
+  parse(prelude).node.items.fold([], |accumulator: List<ExternDefinition>, it: Item|
+    match it {
+      ExternItem(d) -> if d.spec.any(|c: SpecClause| c.kind == kind) { accumulator.push(d) }
+      else { accumulator },
+      _ -> accumulator,
+    })
+
+fn parameters(d: ExternDefinition, fill: String) -> List<TestParameter> / {abort.raise} =
+  d.params.map(|p: Param|
+    match p.ty {
+      Some(t) ->
+        {
+          name: String::of_bytes(p.name.name),
+          ty: type_text(t, fill),
+          from: match t {
+            VariableTypeExpression(_) -> if d.constraints.len() == 0 && fill == "Int" { "values()" }
+            else { values_for(fill) },
+            _ -> values_for(type_text(t, fill)),
+          },
+          shown: match t { FunctionTypeExpression(_) -> false, _ -> !is_columns(t) },
+        },
+      None -> panic(named(d) ++ " leaves a parameter's type out"),
+    })
+
+fn condition(prelude: Bytes, d: ExternDefinition, kind: SpecKind) -> String / {abort.raise} =
+  String::join(
+    d.spec.filter(|c: SpecClause| c.kind == kind).map(|c: SpecClause| {
+      let span = expression_span(c.expression);
+      let text = String::of_bytes(prelude.slice(span.start, span.end));
+      "(" ++ text.replace(" + ", " +| ").replace(" - ", " -| ") ++ ")"
+    }),
+    " && ",
+  )
+
+fn test_each_input(
+  d: ExternDefinition,
+  fill: String,
+  what: String,
+  inner: (String, String) -> String,
+) -> String / {abort.raise} = {
+  let name = String::of_bytes(d.name.name);
+  let params = parameters(d, fill);
+  let printed = "\"" ++ name ++ "(\" ++ "
+    ++ String::join(
+      params.map(|p: TestParameter| if p.shown { "show(" ++ p.name ++ ")" } else { "\"_\"" }),
+      " ++ \", \" ++ ",
+    )
+    ++ " ++ \")\"";
+  let call = name ++ "(" ++ String::join(params.map(|p: TestParameter| p.name), ", ") ++ ")";
+  let body = params.reverse().fold(inner(printed, call), |nested: String, p: TestParameter|
+    "each(" ++ p.from ++ ", |" ++ p.name ++ ": " ++ p.ty ++ "| " ++ nested ++ ")");
+  let at = if d.constraints.len() == 0 { "" } else { " at " ++ fill };
+  "test \"" ++ name ++ at ++ " " ++ what ++ "\" {\n  " ++ body ++ "\n}\n"
+}
+
+fn requires_test(prelude: Bytes, d: ExternDefinition, fill: String) -> String / {abort.raise} = {
+  let holds = condition(prelude, d, RequiresClause);
+  let return_type = type_text(d.return_type, fill);
+  test_each_input(
+    d,
+    fill,
+    "does not raise where its `requires` holds",
+    |printed: String, call: String|
+      "if " ++ holds ++ " {\n    calm(" ++ printed ++ ", || {\n      let answer: " ++ return_type
+        ++ " = "
+        ++ call
+        ++ ";\n      ()\n    })\n  }",
+  )
+}
+
+fn ensures_test(prelude: Bytes, d: ExternDefinition, fill: String) -> String / {abort.raise} = {
+  let ensured = condition(prelude, d, EnsuresClause);
+  let return_type = type_text(d.return_type, fill);
+  test_each_input(d, fill, "returns what its `ensures` says", |printed: String, call: String|
+    "sure(" ++ printed ++ ", || {\n    let result: " ++ return_type ++ " = " ++ call ++ ";\n    "
+      ++ ensured
+      ++ "\n  })")
+}
+
+fn array_limit(prelude: Bytes) -> String / {abort.raise} =
+  match externs_with_clause(prelude, RequiresClause).filter(|d: ExternDefinition|
+      d.name.name == b"Array::new") {
+    [d, ..] -> match parameters(d, "Int") {
+      [length, ..] ->
+        "test \"`Array::new`'s `requires` ends where the runtime refuses\" {\n  let holds = |"
+          ++ length.name
+          ++ ": Int| "
+          ++ condition(prelude, d, RequiresClause)
+          ++ ";\n  assert(holds(67108864) && !holds(67108865));\n  assert_eq(\n"
+          ++ "    try[abort.raise] { Array::new(67108865, 7).len() },\n"
+          ++ "    Err(\"`Array::new` of 67108865 elements is outside `0` to `67108864`\"),\n  )\n}\n",
+      [] -> panic("`Array::new` takes a length"),
+    },
+    [] -> panic("the prelude states a `requires` of `Array::new`"),
+  }
+
+test/nondet "every builtin with a `requires` or `ensures` contract keeps that contract when called with extreme argument values" {
+  let prelude = embed("../../packages/std/prelude.ply");
+  let tests = externs_with_clause(prelude, RequiresClause).flat_map(|d: ExternDefinition|
+    type_arguments(d).map(|fill: String| requires_test(prelude, d, fill))).concat(
+    externs_with_clause(prelude, EnsuresClause).flat_map(|d: ExternDefinition|
+      type_arguments(d).map(|fill: String| ensures_test(prelude, d, fill))),
+  ).push(
+    array_limit(prelude),
+  );
+  write_program(value_lists() ++ String::join(tests, "\n"));
+  let r = spawned(["test", ".", "--json"]);
+  let v = json_of(r);
+  let broken = items(at(v, "failures")).map(|f: Json|
+    str(at(f, "name")) ++ ": " ++ str(path(f, ["diagnostic", "message"])));
+  assert(broken == [], Some(String::join(broken, "\n")));
+  assert(r.code == 0, Some(all_output(r)));
+  assert_eq(int(path(v, ["summary", "passed"])), tests.len())
+}

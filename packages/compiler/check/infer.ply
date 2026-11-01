@@ -28,7 +28,8 @@ import compiler.expand.embed (inline_embeds_by_name)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.keys (test_owner, law_owner)
 import compiler.prelude_source
-import compiler.expand.derive (Expansion, expand_derives)
+import compiler.expand.derive (Expansion, expand_derives, DeriverRequest, DeriverResponse,
+                               Generated)
 import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
@@ -1469,6 +1470,31 @@ test "a definition may be generic over a resource label, and a call fills it" {
   })
 }
 
+test "an argument's effects are its call's, and a fold threads the effects of the function it is handed" {
+  let c = valid_module_checker(
+    b"effect log {\n  write note[out](line: String) -> Unit\n}\nfn quiet(xs: List<Int>) -> Option<Int> = xs.at(0)\nfn loud(xs: List<Int>) -> Option<Int> / {log.write[out]} =\n  xs.at({ log.note[out](\"asked\"); 0 })\nfn shout(m: Map<String, Int>) -> Int / {log.write[out]} =\n  m.fold(0, |acc, k, v| { log.note[out](k); acc + v })\n",
+  );
+  assert_eq(defined(c, b"m.quiet").effects, b"");
+  assert_eq(defined(c, b"m.loud").effects, b"m.log.write[out]");
+  assert_eq(defined(c, b"m.shout").effects, b"m.log.write[out]")
+}
+
+fn tracing() -> Bytes =
+  b"nondet effect trace {\n  write event[c](name: String) -> Unit\n  write enter[c](name: String) -> Int\n  write exit[c](span: Int) -> Unit\n  write count[c](name: String, delta: Int) -> Unit\n}\n"
+
+test "what a body performs names each channel it performs an operation on" {
+  let c = valid_module_checker(
+    tracing().concat(
+      b"fn place_order(sku: String) -> Int / {trace.write[orders]} = {\n  let span = trace.enter[orders](sku);\n  trace.count[orders](\"orders_placed\", 1);\n  trace.exit[orders](span);\n  1\n}\nfn restock(sku: String) -> Int / {trace.write[items]} = {\n  trace.event[items](sku);\n  2\n}\n",
+    ),
+  );
+  assert_eq(
+    defined(c, b"m.place_order").performed,
+    b"m.trace.count[orders],m.trace.enter[orders],m.trace.exit[orders]",
+  );
+  assert_eq(defined(c, b"m.restock").performed, b"m.trace.event[items]")
+}
+
 test "a call fills a function's generic resource label from its argument's effects when the call does not write the label" {
   let c = valid_module_checker(
     b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(f: () -> Unit / {net.send[l]}) -> Unit / {net.send[l]} = f()\nfn go(f: () -> Unit / {net.send[conn]}) -> Unit / {net.send[conn]} = relay(f)",
@@ -2127,6 +2153,79 @@ test "`Secret<Bytes>` cannot be compared, used as a `Map` key or hashed, just li
     b"fn f(s: Secret<Bytes>) -> Bytes = digest(s)\n",
   ].fold((), |u: Unit, source: Bytes|
     assert(check_codes(source).contains(b"E0206"), Some(String::of_bytes_lossy(source))))
+}
+
+fn displaying() -> Source =
+  {
+    name: b"std.show",
+    source_text: b"pub fn display<a>(x: a) -> String where derivable(show, a) = \"\"\n",
+  }
+
+test "interpolating a `Secret<Bytes>` or `Secret<String>` into a string is rejected" {
+  [b"Secret<Bytes>", b"Secret<String>"].fold((), |u: Unit, t: Bytes| {
+    let src = Bytes::concat_all([b"fn f(s: ", t, b") -> String = f\"{s}\"\n"]);
+    assert(
+      codes_across([displaying(), { name: b"m", source_text: src }]).contains(b"E0206"),
+      Some(String::of_bytes_lossy(src)),
+    )
+  })
+}
+
+test "a secret is no text, so a constructor of text rejects one" {
+  let diagnostics = source_diagnostics(
+    b"type Field = | FText(String)\nfn login(password: Secret<String>) -> Field = FText(password)\n",
+  );
+  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0201"]);
+  assert(
+    mode_effect_module(diagnostics).contains("Secret<String>"),
+    Some(mode_effect_module(diagnostics)),
+  )
+}
+
+fn mode_effect_module(diagnostics: List<Diagnostic>) -> String =
+  match diagnostics {
+    [] -> "",
+    [diagnostic, ..] ->
+      String::of_bytes_lossy(
+        Bytes::join(
+          [diagnostic.message].concat(diagnostic.labels.map(|label: Label| label.text)).concat(
+            diagnostic.notes_text,
+          ),
+          b" ",
+        ),
+      ),
+  }
+
+test "a record with an opaque record's field is no value of it, and only its module builds one" {
+  let uuid = {
+    name: b"std.uuid",
+    source_text: b"pub opaque type Uuid = new { octets: Bytes }\npub fn uuid_of_octets(octets: Bytes) -> Option<Uuid> = Some({ octets: octets })\npub fn uuid_render(u: Uuid) -> String = \"\"\n",
+  };
+  let rendering = |annotation: Bytes|
+    {
+      name: b"app",
+      source_text: Bytes::concat_all([
+        b"import std.uuid (Uuid, uuid_render)\npub fn shown(b: Bytes) -> String = {\n  let u",
+        annotation,
+        b" = { octets: b };\n  uuid_render(u)\n}\n",
+      ]),
+    };
+  let closed = errors_across([uuid, rendering(b": Uuid")]);
+  assert_eq(closed.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0220"]);
+  assert(mode_effect_module(closed).contains("uuid_of_octets"), Some(mode_effect_module(closed)));
+  let plain = errors_across([uuid, rendering(b"")]);
+  assert_eq(plain.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0201"]);
+  assert(mode_effect_module(plain).contains("std.uuid.Uuid"), Some(mode_effect_module(plain)));
+  assert_eq(
+    codes_across([
+      uuid,
+      {
+        name: b"app",
+        source_text: b"import std.uuid (uuid_of_octets, uuid_render)\npub fn shown(b: Bytes) -> Option<String> =\n  match uuid_of_octets(b) { Some(u) -> Some(uuid_render(u)), None -> None }\n",
+      },
+    ]),
+    [],
+  )
 }
 
 test "a clause may not handle a polymorphic operation with a type of its choosing" {
@@ -3161,6 +3260,34 @@ test "a clause for an operation discharges that operation's effect" {
       ),
     ),
     [b"E0305"],
+  )
+}
+
+test "a clause is unreachable only behind another for its own operation, which the warning names" {
+  let touch = b"fn touch() -> Bytes / {net.recv[conn]} = net.recv[conn](16)\n";
+  let three = source_diagnostics(
+    declaring_net_effect(
+      touch.concat(
+        b"fn g() -> Bytes / {} = handle { touch() } with {\n  net.recv[conn](n) -> b\"\",\n  net.send[conn](p) -> (),\n  net.close[conn]() -> (),\n}\n",
+      ),
+    ),
+  );
+  assert_eq(
+    three.filter(|diagnostic: Diagnostic|
+      diagnostic.code == b"E0105" || diagnostic.severity == b"error"),
+    [],
+  );
+  let twice = source_diagnostics(
+    declaring_net_effect(
+      touch.concat(
+        b"fn g() -> Bytes / {} = handle { touch() } with {\n  net.recv[conn](n) -> b\"\",\n  net.recv[conn](n) -> b\"x\",\n}\n",
+      ),
+    ),
+  );
+  assert_eq(twice.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0105"]);
+  assert(
+    twice.get(0).message.index_of(b"net.recv[conn]") != None,
+    Some(String::of_bytes_lossy(twice.get(0).message)),
   )
 }
 
@@ -4349,12 +4476,15 @@ test "a call instantiating a constrained parameter with a function is rejected a
   assert_eq(labelled_diagnostics(source), [[b"E0206", b"show", source.slice(0, 56)]])
 }
 
-fn errors_across(sources: List<Source>) -> List<Diagnostic> / {abort.raise} = {
+fn errors_across(
+  sources: List<Source>,
+  library: Option<(DeriverRequest) -> DeriverResponse / {abort.raise}> = None,
+) -> List<Diagnostic> / {abort.raise} = {
   let parsed = range(0, sources.len()).map(|i: Int| {
     let s = sources.get(i);
     let r = parse(s.source_text);
     let x = expand(r.node, r.parser.diagnostics);
-    let d: Expansion = expand_derives(i, s.name, x.module);
+    let d: Expansion = expand_derives(i, s.name, x.module, library: library);
     { name: s.name, module: d.module, derived: d.derived, diagnostics: d.diagnostics }
   });
   let early = parsed.fold([], |accumulator: List<Diagnostic>, p: ExpandedSource|
@@ -5830,6 +5960,21 @@ test "an operator on a type with a `numeric for` declaration calls the declared 
   assert_eq(check_codes(b"fn f<a>(x: a) -> a / {abort.raise} where integer(a) = x % x"), [])
 }
 
+test "a decimal is not divided by `/`, and the rejection says how to divide instead" {
+  let diagnostics = source_diagnostics(
+    b"pub fn unit(total: Decimal, count: Decimal) -> Decimal / {abort.raise} = total / count\n",
+  );
+  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0209"]);
+  assert(
+    mode_effect_module(diagnostics).contains("Decimal::div"),
+    Some(mode_effect_module(diagnostics)),
+  );
+  assert(
+    mode_effect_module(diagnostics).contains("prevent silent rounding"),
+    Some(mode_effect_module(diagnostics)),
+  )
+}
+
 test "a wrapping or saturating operator is its builtin, over a builtin integer type and no other" {
   assert_eq(check_codes(b"fn f(a: U8, b: U8) -> U8 = a +% b *| a -| b -% a *% b +| a"), []);
   assert_eq(check_codes(b"fn f(a: Int, b: Int) -> Int = a +| b *% a"), []);
@@ -6404,6 +6549,275 @@ test "an unresolved part of a `Map` key does not stop the checker from rejecting
     b"E0206",
   ]);
   assert_eq(check_codes(b"fn f() -> Int = Map::new().len()\n"), [])
+}
+
+test "a deterministic test that reaches a nondeterministic operation on a channel is rejected" {
+  assert_eq(
+    check_codes(
+      tracing().concat(
+        b"test \"this cannot be deterministic\" {\n  trace.event[orders](\"x\")\n}\n",
+      ),
+    ),
+    [b"E0412"],
+  )
+}
+
+fn needs_order() -> Bytes = b"fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n"
+
+test "a constraint nothing can satisfy is rejected at the boundary it crosses, however it travels" {
+  let needs = needs_order();
+  [
+    needs.concat(b"fn go() -> Int = needs(1.5)"),
+    b"fn needs<a>(xs: List<a>) -> Int where derivable(ord, a) = 1\nfn go() -> Int = needs([1.5])",
+    needs.concat(
+      b"fn apply(f: (Float) -> Int, x: Float) -> Int = f(x)\nfn go() -> Int = apply(needs, 1.5)",
+    ),
+    needs.concat(b"fn go() -> Int = { let f = |x: Float| needs(x); f(1.5) }"),
+    needs.concat(b"fn caller<a>(x: a) -> Int where derivable(eq, a) = needs(x)"),
+    Bytes::concat_all([
+      b"type Money = Cents(Float)\n",
+      needs,
+      b"fn go() -> Int = needs(Cents(1.5))",
+    ]),
+    Bytes::concat_all([
+      b"type Chain = Nil | Link(Float, Chain)\n",
+      needs,
+      b"fn go() -> Int = needs(Nil)",
+    ]),
+    Bytes::concat_all([b"type Box<a> = B(a)\n", needs, b"fn go() -> Int = needs(B(1.5))"]),
+    b"type Money = Cents(Float)\nfn inner<a>(x: a) -> Int where derivable(ord, a) = 1\nfn outer<a>(x: a) -> Int where derivable(ord, a) = inner(x)\nfn go() -> Int = outer(Cents(1.5))",
+  ].fold((), |u: Unit, src: Bytes|
+    assert(check_codes(src).contains(b"E0206"), Some(String::of_bytes_lossy(src))))
+}
+
+test "a constraint a call can satisfy is assumed inside the body" {
+  [
+    needs_order().concat(b"fn go() -> Int = needs(1)"),
+    b"fn keyed<k>(x: k) -> Map<k, Int> where derivable(ord, k) = Map::new().insert(x, 1)\nfn go() -> Int = keyed(\"a\").len()",
+    b"fn inner<a>(x: a) -> Int where derivable(ord, a) = 1\nfn outer<a>(x: a) -> Int where derivable(ord, a) = inner(x)\nfn go() -> Int = outer(1)",
+    Bytes::concat_all([
+      b"type Money = Cents(Decimal)\n",
+      needs_order(),
+      b"fn go() -> Int = needs(Cents(1.5m))",
+    ]),
+  ].fold((), |u: Unit, src: Bytes|
+    assert(check_codes(src) == [], Some(String::of_bytes_lossy(src))))
+}
+
+test "a map key the check infers is held to an order as a written one is" {
+  [
+    b"fn go() -> Int = Map::new().insert(1.5, 1).len()",
+    b"type Money = Cents(Float)\nfn go() -> Int = Map::new().insert(Cents(1.5), 1).len()",
+    b"fn go() -> Int = Map::of_entries([{key: 1.5, value: 1}]).len()",
+    b"fn go() -> Int = Map::new().insert({rate: 1.5}, 1).len()",
+    b"fn go() -> Int = Map::new().insert([1.5], 1).len()",
+  ].fold((), |u: Unit, src: Bytes|
+    assert(check_codes(src).contains(b"E0206"), Some(String::of_bytes_lossy(src))));
+  assert_eq(check_codes(b"fn go() -> Int = Map::new().insert(\"k\", 1.5).len()"), [])
+}
+
+test "an alias keyed by its parameter is rejected where a use names it at a key with no order" {
+  let alias = b"pub type Set<a> = Map<a, Unit>\n";
+  assert_eq(check_codes(alias.concat(b"pub fn size<a>(s: Set<a>) -> Int = s.len()")), []);
+  let diagnostics = source_diagnostics(
+    alias.concat(b"pub fn size(s: Set<Float>) -> Int = s.len()"),
+  );
+  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0206"]);
+  assert(
+    diagnostics.get(0).labels.get(0).start >= alias.len(),
+    Some(mode_effect_module(diagnostics)),
+  )
+}
+
+fn sets() -> Source =
+  {
+    name: b"std.set",
+    source_text: b"pub opaque type Set<a> = | Set(Map<a, Unit>)\npub fn Set::empty<a>() -> Set<a> = Set(Map::new())\npub fn Set::of_list<a>(xs: List<a>) -> Set<a> = Set(Map::new())\npub fn Set::min<a>(s: Set<a>) -> Option<a> = None\n",
+  }
+
+test "a set literal is `std.set`'s set, whose type carries its elements' order" {
+  let checked = |src: Bytes| codes_across([sets(), { name: b"m", source_text: src }]);
+  assert_eq(
+    checked(
+      b"import std.set\nimport std.set (Set)\npub fn least<a>(s: Set<a>) -> Option<a> = s.min()\npub fn two() -> Set<Int> = #[2, 1]\n",
+    ),
+    [],
+  );
+  assert(
+    checked(
+      b"import std.set\nimport std.set (Set)\npub fn floats() -> Set<Float> = Set::empty()\n",
+    ).contains(
+      b"E0206",
+    ),
+    None,
+  );
+  assert(checked(b"pub fn m() -> Map<Int, Unit> = #[1]\n").contains(b"E0201"), None)
+}
+
+fn game() -> Bytes = b"pub type Game<a> where derivable(eq, a) = { same: (a, a) -> Bool }\n"
+
+fn same_of_game() -> Bytes = b"pub fn same<a>(g: Game<a>, x: a, y: a) -> Bool = x == y\n"
+
+test "a type's `where` is assumed by a signature that names the type, and met by its callers" {
+  assert_eq(check_codes(game().concat(same_of_game())), []);
+  let rejected = source_diagnostics(
+    Bytes::concat_all([
+      game(),
+      same_of_game(),
+      b"fn go() -> Bool = same({ same: |f: (Int) -> Int, g: (Int) -> Int| true }, |a: Int| a, |b: Int| b)\n",
+    ]),
+  );
+  assert_eq(rejected.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0206"]);
+  assert(
+    mode_effect_module(rejected).contains("requires `derivable(eq, ·)`"),
+    Some(mode_effect_module(rejected)),
+  );
+  assert_eq(
+    check_codes(
+      game().concat(
+        b"pub fn same<a>(g: Game<a>, x: a, y: a) -> Bool where derivable(eq, a) = x == y\n",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a type's `where` is met wherever the type is named at a type that cannot meet it" {
+  [
+    game().concat(b"fn bad(g: Game<(Int) -> Int>) -> Int = 1\n"),
+    game().concat(
+      b"pub fn perfect<a>(same: keep (a, a) -> Bool) -> Game<a> = { same: same }\nfn go() -> Game<(Int) -> Int> = perfect(|x: Int, y: Int| x == y)\n",
+    ),
+  ].fold((), |u: Unit, src: Bytes|
+    assert(check_codes(src).contains(b"E0206"), Some(String::of_bytes_lossy(src))))
+}
+
+test "a declaration whose field names a constrained type at its parameter carries the constraint" {
+  let node = game().concat(b"pub opaque type Node<a> = | Node(Game<a>, List<Node<a>>)\n");
+  let find = b"pub fn find<a>(n: Node<a>, x: a, y: a) -> Bool = x == y\n";
+  assert_eq(check_codes(node.concat(find)), []);
+  assert(
+    check_codes(
+      Bytes::concat_all([
+        node,
+        find,
+        b"fn go() -> Bool = find(Node({ same: |f: (Int) -> Int, g: (Int) -> Int| true }, []), |a: Int| a, |b: Int| b)\n",
+      ]),
+    ).contains(
+      b"E0206",
+    ),
+    None,
+  );
+  assert_eq(
+    check_codes(
+      game().concat(
+        b"pub type Boxed<a> = new { game: Game<a> }\npub fn find<a>(b: Boxed<a>, x: a, y: a) -> Bool = x == y\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"pub opaque type Node<a> where derivable(eq, a) = | Node(List<Node<a>>, a)\npub fn has<a>(n: Node<a>, x: a) -> Bool = match n { Node(_, here) -> here == x }\n",
+    ),
+    [],
+  )
+}
+
+test "a `key` may need what its type's `where` states, and no more" {
+  let node = b"pub opaque type Node<a> where derivable(eq, a) = | Node(a, List<Node<a>>)\n";
+  assert_eq(
+    check_codes(
+      node.concat(
+        b"pub fn head<a>(n: Node<a>) -> a = match n { Node(x, _) -> x }\nkey for Node by head\n",
+      ),
+    ),
+    [],
+  );
+  assert(
+    check_codes(
+      node.concat(
+        b"pub fn head<a>(n: Node<a>) -> a where derivable(ord, a) = match n { Node(x, _) -> x }\nkey for Node by head\n",
+      ),
+    ).contains(
+      b"E0218",
+    ),
+    None,
+  )
+}
+
+test "a type's `where` names its own parameters, and no predicate" {
+  assert(check_codes(b"type X<a> where derivable(eq, b) = a").contains(b"E0102"), None);
+  assert(check_codes(b"type X<a> where numeric(a) = a").contains(b"E0102"), None)
+}
+
+test "no route lets a float become a map key" {
+  let src = b"import n\nfn a() -> Map<n::Wrapper, Int> = Map::new()\nfn b() -> Map<n::Recursive, Int> = Map::new()\nfn c() -> Map<n::Box<Float>, Int> = Map::new()\nfn d() -> Map<n::Alias, Int> = Map::new()\nfn e() -> Map<{x: Float}, Int> = Map::new()\nfn f() -> Map<Option<Float>, Int> = Map::new()\nfn g() -> Map<Map<n::Wrapper, Int>, Int> = Map::new()\nfn keyed<k>(x: k) -> Map<k, Int> = Map::new().insert(x, 1)\nfn h() -> Bool = { let _ = keyed(1.0); true }\nfn needs<a>(x: a) -> Int where derivable(ord, a) = 1\nfn i() -> Int = needs(1.0)\n";
+  let diagnostics = errors_across([
+    {
+      name: b"n",
+      source_text: b"pub type Wrapper = W(Float)\npub type Recursive = Nil | Cons(Float, Recursive)\npub type Box<a> = { v: a }\npub type Alias = Float\n",
+    },
+    { name: b"m", source_text: src },
+  ]);
+  let said = diagnostics.map(|diagnostic: Diagnostic| mode_effect_module([diagnostic]));
+  [
+    "`n.Wrapper`",
+    "`n.Recursive`",
+    "`{v: Float}`",
+    "`{x: Float}`",
+    "`Option<Float>`",
+    "`Map<n.Wrapper, Int>`",
+    "`Float` cannot be derived for `ord`",
+  ].fold((), |u: Unit, named: String|
+    assert(
+      said.any(|s: String| s.contains(named)),
+      Some(named ++ ": " ++ String::join(said, "\n")),
+    ));
+  let rejected_on = |line: Bytes| {
+    let start = src.index_of(line).unwrap_or(0);
+    let end = start + src.slice(start, src.len()).index_of(b"\n").unwrap_or(0);
+    diagnostics.any(|diagnostic: Diagnostic|
+      diagnostic.code == b"E0206"
+        && diagnostic.labels.any(|label: Label|
+          label.module == 1 && label.start >= start && label.start < end))
+  };
+  assert_eq(
+    [
+      b"fn a()",
+      b"fn b()",
+      b"fn c()",
+      b"fn d()",
+      b"fn e()",
+      b"fn f()",
+      b"fn g()",
+      b"fn h()",
+      b"fn i()",
+    ].filter(|line: Bytes| !rejected_on(line)),
+    [],
+  )
+}
+
+test "a derived body naming a codec its module does not import is rejected once, naming the import" {
+  let diagnostics = errors_across(
+    [
+      { name: b"lib.bin", source_text: b"pub fn derive(n: Int) -> Int = n\n" },
+      {
+        name: b"kinds",
+        source_text: b"pub type Mode = | Read | Write\npub fn mode_bin() -> Int = 1\n",
+      },
+      {
+        name: b"m",
+        source_text: b"import lib.bin as bin\nimport kinds (Mode)\npub type Atom = { mode: Mode, n: Int }\nderive bin for Atom\n",
+      },
+    ],
+    library: Some(|ask: DeriverRequest| Generated(b"pub fn atom_bin() -> Int = mode_bin() + 1")),
+  );
+  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0206"]);
+  assert(
+    mode_effect_module(diagnostics).contains("add `import kinds (mode_bin)`"),
+    Some(mode_effect_module(diagnostics)),
+  )
 }
 
 test "an effect operation with a `Map` key requires the key to be orderable at every call, and each handler may rely on it" {
@@ -7356,6 +7770,149 @@ test "a borrowed parameter is rejected when a lambda, `else`, scope, handler var
       { name: b"m", source_text: b"import marks\nfn f(g: (Int) -> Int) -> Int = marks\"a{g}b\"\n" },
     ]),
     [b"E0475"],
+  )
+}
+
+fn tagged(literal: Bytes) -> List<Source> =
+  [
+    { name: b"tag", source_text: literal },
+    { name: b"m", source_text: b"import tag\n\nfn main() -> Int = tag\"abc\"\n" },
+  ]
+
+fn rejection_type() -> Bytes = b"Result<Int, { message: String, offset: Int }>"
+
+fn returning_rejection(head: Bytes, rest: Bytes) -> Bytes =
+  Bytes::concat_all([head, b" -> ", rejection_type(), rest])
+
+test "a tagged literal performs nothing where it is written, whatever its parser could raise" {
+  assert_eq(
+    codes_across([
+      {
+        name: b"hex",
+        source_text: returning_rejection(
+          b"pub fn literal(text: String)",
+          b" / {abort.raise} = Ok(text.len())\n",
+        ),
+      },
+      { name: b"m", source_text: b"import hex\n\nfn main() -> Int = hex\"ff\" + hex\"0a\"\n" },
+    ]),
+    [],
+  )
+}
+
+test "a tag's `literal` is rejected where a literal calls it, unless a check can run it" {
+  let shaped = errors_across(tagged(b"pub fn literal(text: String) -> Option<Int> = Some(1)\n"));
+  assert_eq(shaped.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0152"]);
+  assert(
+    mode_effect_module(shaped).contains("(String) -> Option<Int>"),
+    Some(mode_effect_module(shaped)),
+  );
+  let performing = errors_across([
+    {
+      name: b"tag",
+      source_text: returning_rejection(
+        b"pub effect ticks { read now() -> Int }\n\npub fn literal(text: String)",
+        b" / {ticks.now} =\n  Ok(ticks.now())\n",
+      ),
+    },
+    {
+      name: b"m",
+      source_text: b"import tag\n\nfn main() -> Int / {tag::ticks.now} = tag\"abc\"\n",
+    },
+  ]);
+  assert_eq(performing.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0152"]);
+  assert(
+    mode_effect_module(performing).contains("performs `{tag.ticks.now}`"),
+    Some(mode_effect_module(performing)),
+  );
+  let generic = errors_across(
+    tagged(
+      b"pub fn literal<a>(text: String) -> Result<List<a>, { message: String, offset: Int }> = Ok([])\n",
+    ),
+  );
+  assert(
+    mode_effect_module(generic).contains("takes type parameters"),
+    Some(mode_effect_module(generic)),
+  );
+  assert_eq(
+    codes_across(
+      tagged(
+        returning_rejection(b"pub fn literal(text: String, strict: Bool = false)", b" = Ok(1)\n"),
+      ),
+    ),
+    [b"E0152"],
+  )
+}
+
+test "a tag must be an imported module, and that module must export a public function named `literal`" {
+  assert_eq(codes_across(tagged(b"pub fn other() -> Int = 1\n")), [b"E0101"]);
+  assert_eq(
+    codes_across(tagged(returning_rejection(b"fn literal(text: String)", b" = Ok(1)\n"))),
+    [b"E0107"],
+  );
+  assert_eq(codes_across([{ name: b"m", source_text: b"fn main() -> Int = tag\"abc\"\n" }]), [
+    b"E0106",
+  ])
+}
+
+fn counting(hole: Bytes) -> Source =
+  {
+    name: b"count",
+    source_text: Bytes::concat_all([
+      b"pub fn compile(parts: List<String>) -> Result<List<String>, { message: String, offset: Int, part: Int }> = Ok(parts)\n\npub fn fill(parts: List<String>, holes: List<",
+      hole,
+      b">) -> Int = parts.len() + holes.len()\n",
+    ]),
+  }
+
+test "a hole of another type than its tag takes is rejected at the hole" {
+  let src = b"import count\n\nfn main() -> Int = count\"a {1} b{\"two\"}\"\n";
+  let diagnostics = errors_across([counting(b"Int"), { name: b"m", source_text: src }]);
+  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0201"]);
+  let label = diagnostics.get(0).labels.get(0);
+  assert_eq(src.slice(label.start, label.end), b"\"two\"")
+}
+
+test "a tag used with embedded `{}` expressions must define `compile` taking `List<String>` and a non-generic, effect-free `fill` taking the compiled value and the expressions' values" {
+  let lone = |text: Bytes|
+    errors_across([
+      { name: b"count", source_text: text },
+      { name: b"m", source_text: b"import count\n\nfn main() -> Int = count\"a {1}\"\n" },
+    ]);
+  let codes = |text: Bytes| lone(text).map(|diagnostic: Diagnostic| diagnostic.code);
+  let compiling = b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\n";
+  assert_eq(codes(returning_rejection(b"pub fn literal(text: String)", b" = Ok(1)\n")), [b"E0101"]);
+  assert_eq(codes(compiling), [b"E0101"]);
+  let misfilled = lone(compiling.concat(b"pub fn fill(c: String, holes: List<Int>) -> Int = 1\n"));
+  assert_eq(misfilled.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0152"]);
+  assert(
+    mode_effect_module(misfilled).contains("`count::fill` has type"),
+    Some(mode_effect_module(misfilled)),
+  );
+  let unplaced = lone(
+    returning_rejection(b"pub fn compile(parts: List<String>)", b" = Ok(1)\n").concat(
+      b"pub fn fill(c: Int, holes: List<Int>) -> Int = c\n",
+    ),
+  );
+  assert_eq(unplaced.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0152"]);
+  assert(
+    mode_effect_module(unplaced).contains("`count::compile` has type"),
+    Some(mode_effect_module(unplaced)),
+  );
+  let performing = lone(
+    compiling.concat(
+      b"pub effect ticks { read now() -> Int }\npub fn fill(c: Int, holes: List<Int>) -> Int / {ticks.now} = ticks.now()\n",
+    ),
+  );
+  assert_eq(performing.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0152"]);
+  assert(
+    mode_effect_module(performing).contains("`count::fill` performs"),
+    Some(mode_effect_module(performing)),
+  );
+  let generic = lone(compiling.concat(b"pub fn fill<a>(c: Int, holes: List<a>) -> Int = c\n"));
+  assert(
+    mode_effect_module(generic).contains("takes type parameters"),
+    Some(mode_effect_module(generic)),
   )
 }
 

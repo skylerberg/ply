@@ -408,7 +408,10 @@ module.exports = grammar({
       $.with_scope_expression,
       $.simulate_expression,
       $.parallel_expression,
+      $.hole_expression,
     ),
+
+    hole_expression: _ => '???',
 
     qualified_name: $ => seq($.identifier, '::', $.identifier, optional(seq('::', $.identifier))),
 

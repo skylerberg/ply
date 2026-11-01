@@ -1,0 +1,62 @@
+import harness (Hermetic, Shipped, in_memory_faked, passing_except, tree)
+import support.harness (at, items, json_of, json_text, path)
+import std.fs
+import std.fs (Entry, Dir, MemFs)
+import std.json (Json)
+import std.list
+
+fn core() -> String = String::of_bytes_lossy(embed("../programs/cache_cli/core.ply"))
+
+fn shop() -> String =
+  \\import core
+  \\
+  \\fn total(items: List<core::Item>) -> Int =
+  \\  items.fold(0, |acc, i: core::Item| acc + core::price(i))
+  \\
+  \\fn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)
+  \\
+  \\test "a shelf adds up" {
+  \\  assert_eq(total([core::Book("b", 3), core::Note("n")]), 3)
+  \\}
+  \\
+
+fn shop_project() -> MemFs / {abort.raise} =
+  tree([
+    { path: "core.ply", text: core() },
+    { path: "shop.ply", text: shop() },
+    { path: "leaf.ply", text: "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n" },
+  ])
+
+fn test_hashes(extra: List<String>) -> List<String> / {Hermetic, Shipped, abort.raise, diverges} = {
+  let v = json_of(
+    in_memory_faked(shop_project(), ["test", ".", "--json"].concat(extra), passing_except([])).ran,
+  );
+  items(path(v, ["selection", "tests"])).map(|t: Json|
+    json_text(at(t, "key")) ++ " " ++ json_text(at(t, "hash")))
+}
+
+test "the worker count does not change test hashes" {
+  let one = test_hashes(["--jobs", "1"]);
+  assert(one != [], None);
+  assert_eq(one, test_hashes(["--jobs", "10"]));
+  assert_eq(one, test_hashes(["--no-cache"]))
+}
+
+test "a relative and an absolute path share one cache" {
+  let first = in_memory_faked(
+    shop_project(),
+    ["test", ".", "--filter", "nonexistent"],
+    passing_except([]),
+  );
+  let second = in_memory_faked(
+    first.tree,
+    ["test", "--filter", "nonexistent", "/w"],
+    passing_except([]),
+  );
+  assert(second.ran.code == 0, None);
+  let caches = match fs::mem_walk(second.tree, "w") {
+    Some(entries) -> entries.filter(|e: Entry| e.kind == Dir && e.path.ends_with(".ply-cache")),
+    None -> panic("the working directory walks"),
+  };
+  assert_eq(caches.len(), 1)
+}

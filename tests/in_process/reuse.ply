@@ -1,0 +1,195 @@
+import harness (CliEffects, Shipped, on_disk_faked, passing_except, scratch)
+import support.harness (RunResult, WorkingDirectory, all_output, assert_ok, at, dependency, int,
+                        json_of, json_text, manifest, nth, path, read, reused, stderr, str, write,
+                        write_program, write_project)
+import std.fs (fs, listed_names)
+import std.json (Null, Array, Str)
+import std.machine as entering
+import std.string
+import std.list
+
+fn run_at(
+  path: String,
+  args: List<String>,
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_faked(["run", path].concat(args), passing_except([]))
+
+fn run(args: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  run_at(".", args)
+
+fn explained(args: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  run(["--json", "--explain"].concat(args))
+
+fn explained_at(path: String) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  run_at(path, ["--json", "--explain"])
+
+fn answer() -> String = "fn main() -> Int = 42\n"
+
+fn raising(root: String) -> entering::Termination =
+  entering::Failed({
+    code: "E0501",
+    severity: entering::Error,
+    message: "boom",
+    labels: [{ site: Some({ root: root, start: 0, end: 2 }), primary: true, text: "raised here" }],
+    notes: [],
+    values: [],
+  })
+
+test "a second run of an unchanged package reuses the cached result of the first run" {
+  scratch(|| {
+    write_program(answer());
+    let first = explained([]);
+    assert(!reused(first), Some("a first run has nothing to reuse"));
+    let second = explained([]);
+    assert(reused(second), Some(all_output(second)))
+  })
+}
+
+test "a run that reuses the cached checked program prints the same JSON as the first run that built it" {
+  scratch(|| {
+    write_program(answer());
+    let built = run(["--json"]);
+    let again = run(["--json"]);
+    assert(reused(explained([])), None);
+    assert_eq(built, again);
+    let document = json_of(again);
+    assert(
+      at(document, "files") == Array([Str("m.ply"), Str("<std>/prelude.ply")]),
+      Some(json_text(document)),
+    );
+    assert(at(document, "front_end") == Null, Some(json_text(document)))
+  })
+}
+
+test "a panic in a run that reuses the cached checked program reports the same source location as the first run" {
+  scratch(|| {
+    write_program(
+      "fn boom() -> Int / {abort.raise} = panic(\"boom\")\n\nfn main() -> Int / {abort.raise} = boom() + 1\n",
+    );
+    let raised = |args: List<String>| on_disk_faked(["run", "."].concat(args), raising);
+    let built = raised([]);
+    let again = raised(["--json", "--explain"]);
+    assert(reused(again), None);
+    let after = raised([]);
+    assert(built.code == 1, Some(stderr(built)));
+    assert(stderr(built).contains("raised at m.ply:3:"), Some(stderr(built)));
+    assert_eq(built, after)
+  })
+}
+
+fn failed_line(text: String) -> Int / {CliEffects, Shipped, abort.raise, diverges} = {
+  write("m.ply", text);
+  let report = json_of(on_disk_faked(["run", "m.ply", "--json"], raising));
+  int(path(nth(at(nth(at(report, "diagnostics"), 0), "labels"), 0), ["start", "line"]))
+}
+
+test "a failure reports the definition's current line after the definition moves down in the file" {
+  scratch(|| {
+    write_project([]);
+    assert_eq(failed_line("\n\n\nfn main() -> Int / {abort.raise} = 1 / 0\n"), 4);
+    assert_eq(failed_line("fn main() -> Int / {abort.raise} = 1 / 0\n"), 1)
+  })
+}
+
+fn append_to(p: String, text: String) -> Unit / {WorkingDirectory, abort.raise} =
+  match read(p) { Some(body) -> write(p, body ++ text), None -> panic("`" ++ p ++ "` reads") }
+
+test "editing a module or a dependency runs the front end again, but an edit that changes no result does not" {
+  scratch(|| {
+    write_project([
+      { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
+      { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
+      { path: "lib/ply.pkg", text: manifest("lib", dependency("base", "../base")) },
+      {
+        path: "lib/answer.ply",
+        text: "import base.deep\npub fn answer() -> Int = deep::deep() + 35\n",
+      },
+      { path: "base/ply.pkg", text: manifest("base", "") },
+      { path: "base/deep.ply", text: "pub fn deep() -> Int = 7\n" },
+    ]);
+    let app = |expect_reused: Bool| {
+      let out = explained_at("app");
+      assert(reused(out) == expect_reused, Some(all_output(out)))
+    };
+    app(false);
+    app(true);
+    write("base/deep.ply", "pub fn deep() -> Int = 8\n");
+    app(false);
+    app(true);
+    append_to("lib/answer.ply", "\npub fn unused() -> Int = 0\n");
+    app(false);
+    app(true);
+    append_to("lib/ply.pkg", "// edited\n");
+    app(true);
+    append_to("app/ply.pkg", "// edited\n");
+    app(true);
+    write("app/main.ply", "import lib.answer\nfn main() -> Int = answer::answer() * 2\n");
+    app(false);
+    app(true)
+  })
+}
+
+test "a run that reuses the cached checked program still applies `--allow` and fails with E0459 like an uncached run" {
+  scratch(|| {
+    write_program(answer());
+    assert_ok(run([]));
+    let hit = explained(["--allow", "machine"]);
+    assert(reused(hit), None);
+    write_program(answer());
+    let miss = run(["--json", "--allow", "machine"]);
+    assert(miss.code == 2, Some(all_output(miss)));
+    assert_eq(hit.code, miss.code);
+    let rejection = |ran: RunResult| json_text(at(json_of(ran), "diagnostics"));
+    assert(rejection(miss).contains("E0459"), Some(rejection(miss)));
+    assert(
+      rejection(hit) == rejection(miss),
+      Some(
+        "the reused load was rejected otherwise:\n" ++ rejection(hit) ++ "\n---\n"
+          ++ rejection(miss),
+      ),
+    )
+  })
+}
+
+test "running a single file caches and reuses its result the same way running a package does" {
+  scratch(|| {
+    write_program(answer());
+    let first = explained_at("m.ply");
+    assert_ok(first);
+    assert(!reused(first), None);
+    assert(reused(explained_at("m.ply")), None)
+  })
+}
+
+test "a cached result that cannot be read is rebuilt and the cache entry is overwritten" {
+  scratch(|| {
+    write_program(answer());
+    let first = explained([]);
+    assert(!reused(first), Some(all_output(first)));
+    let key = str(path(json_of(first), ["front_end", "key"]));
+    let cut = |to: Int|
+      List::fold(
+        match listed_names(fs.list_dir[cwd](".ply-cache/memo")) {
+          Some(names) -> names,
+          None -> [],
+        },
+        0,
+        |n: Int, name: String|
+          if !name.starts_with("seg-") { n } else {
+            let entry = ".ply-cache/memo/" ++ name;
+            let whole = match fs.read_file[cwd](entry) { Some(b) -> b, None -> b"" };
+            if !fs.write_file[cwd](entry, whole.slice(0, min(to, whole.len()))) {
+              panic("a segment is torn")
+            };
+            n + 1
+          },
+      );
+    if cut(9) == 0 { panic("the run cached its result in no segment") };
+    assert(!reused(explained([])), None);
+    let after = explained([]);
+    assert(reused(after), Some(all_output(after)));
+    assert_eq(str(path(json_of(after), ["front_end", "key"])), key);
+    cut(0);
+    assert(!reused(explained([])), None)
+  })
+}

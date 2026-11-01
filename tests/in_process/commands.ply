@@ -1,10 +1,14 @@
-import harness (scratch, in_memory, on_disk, tree, one_module_tree, Hermetic, Shipped)
-import spawning.harness (Source, spawned, write_program, write_project, stdout, stderr, all_output,
-                         json_of, at, path, nth, items, str, int, bool, json_text, code_of,
-                         diagnostic, not_ok)
+import harness (scratch, in_memory, in_memory_faked, in_memory_with_tree, on_disk, passing_except,
+                returned, tree, one_module_tree, with_file, Hermetic, Shipped)
+import support.harness (Source, RunResult, write_program, stdout, stderr, all_output, json_of, at,
+                        path, nth, items, str, int, bool, json_text, code_of, diagnostic, not_ok)
+import std.fs
+import std.fs (Dir)
 import std.json
 import std.json (Json, Null, Array, Str)
+import std.machine as entering
 import std.string
+import std.value (VInt)
 
 fn green() -> String = String::of_bytes_lossy(embed("../programs/commands/green.ply"))
 
@@ -77,7 +81,7 @@ test "`check` fails with E0302 on a function that may not terminate and lacks `d
   assert(str(at(ending("m.wait"), "at")) == "m.ply:3:39", Some(json_text(v)))
 }
 
-test/nondet "`check --types` and `check --json` report why each function with `diverges` may not terminate, and which functions do terminate" {
+test "`check --types` and `check --json` report why each function with `diverges` may not terminate, and which functions do terminate" {
   let climb = "fn climb(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }\n";
   let v = json_of(in_memory(one_module_tree(climb), ["check", "--json"]));
   assert(!not_ok(v), Some(json_text(v)));
@@ -97,8 +101,12 @@ test/nondet "`check --types` and `check --json` report why each function with `d
     ),
     Some(json_text(d)),
   );
-  write_program(stall ++ "fn main() -> Int = stall(0)\n");
-  assert(spawned(["run", "."]).code == 2)
+  let run = in_memory_faked(
+    one_module_tree(stall ++ "fn main() -> Int = stall(0)\n"),
+    ["run", "."],
+    passing_except([]),
+  );
+  assert(run.ran.code == 2, Some(all_output(run.ran)))
 }
 
 fn lookups(handler: String) -> String =
@@ -197,7 +205,7 @@ test "check exits two on a type error and prints nothing on stdout" {
   assert(stderr(r).contains("E0201"), Some("expected a type mismatch, got:\n" ++ stderr(r)))
 }
 
-test/nondet "a test whose body ends on a value is a type error" {
+test "a test whose body ends on a value is a type error" {
   let t = one_module_tree("test \"t\" { 1 }\n");
   let r = in_memory(t, ["check"]);
   assert(r.code == 2, Some(all_output(r)));
@@ -208,8 +216,7 @@ test/nondet "a test whose body ends on a value is a type error" {
     "= fix: end the body with `()`",
   ].fold((), |u: Unit, s: String|
     assert(stderr(r).contains(s), Some("no " ++ s ++ " in:\n" ++ stderr(r))));
-  write_program("test \"t\" { 1 }\n");
-  let tested = spawned(["test", ".", "--json"]);
+  let tested = in_memory_faked(t, ["test", ".", "--json"], passing_except([])).ran;
   assert(tested.code == 2, Some(all_output(tested)));
   assert(code_of(json_of(tested)) == "E0201", Some(all_output(tested)))
 }
@@ -268,9 +275,8 @@ fn multi_module() -> List<Source> =
     { path: "src/t.ply", text: "import src.z (z)\ntest \"z is two\" { assert_eq(z(), 2) }\n" },
   ]
 
-test/nondet "calling a function generic over an effect label with too many labels fails with E0306" {
-  write_project(multi_module());
-  let r = spawned(["test", "."]);
+test "calling a function generic over an effect label with too many labels fails with E0306" {
+  let r = in_memory_faked(tree(multi_module()), ["test", "."], passing_except([])).ran;
   assert(r.code == 0, Some(all_output(r)));
   assert(stdout(r).contains("selected 1 of 1"), Some(stdout(r)));
   let v = json_of(in_memory(tree(multi_module()), ["check", "--json"]));
@@ -446,6 +452,145 @@ test "every subcommand responds to --help and exits zero" {
   })
 }
 
-test "an unknown subcommand is rejected" {
-  assert(in_memory(tree([]), ["frobnicate"]).code != 0, None)
+test "an unused definition warns without failing check or test" {
+  let t = one_module_tree(
+    "fn dead() -> Int = 1\npub fn live() -> Int = 2\ntest \"live is two\" { assert_eq(live(), 2) }\n",
+  );
+  let once = in_memory_with_tree(t, ["check", "."], [], None);
+  let twice = in_memory_with_tree(once.tree, ["check", "."], [], None);
+  let tested = in_memory_faked(twice.tree, ["test", "."], passing_except([]));
+  [once.ran, twice.ran, tested.ran].fold((), |u: Unit, r: RunResult| {
+    assert(r.code == 0, Some(all_output(r)));
+    assert(stdout(r).contains("warning: fn `m.dead` is never used"), Some(stdout(r)));
+    assert(!stdout(r).contains("`m.live`"), Some(stdout(r)))
+  });
+  let v = json_of(in_memory(t, ["check", ".", "--json"]));
+  assert(bool(at(v, "ok")), Some(json_text(v)));
+  let d = diagnostic(v);
+  assert(str(at(d, "code")) == "W0611", Some(json_text(v)));
+  assert(str(at(d, "severity")) == "warning", Some(json_text(v)));
+  assert(str(at(nth(at(d, "labels"), 0), "snippet")) == "dead", Some(json_text(v)))
+}
+
+test "a hole warns with what it must be and may do" {
+  let t = one_module_tree(
+    "pub fn pick(n: Int) -> Int = if n > 3 { 9 } else { ??? }\ntest \"a big n\" { assert_eq(pick(5), 9) }\n",
+  );
+  let once = in_memory_with_tree(t, ["check", "."], [], None);
+  let twice = in_memory_with_tree(once.tree, ["check", "."], [], None);
+  [once.ran, twice.ran].fold((), |u: Unit, r: RunResult| {
+    assert(r.code == 0, Some(all_output(r)));
+    assert(stdout(r).contains("Warning[W0613]: unfilled hole"), Some(stdout(r)));
+    assert(stdout(r).contains("expected `Int`"), Some(stdout(r)));
+    assert(
+      stdout(r).contains("the program raises `abort.raise` if it runs the hole"),
+      Some(stdout(r)),
+    )
+  });
+  let v = json_of(in_memory(t, ["check", ".", "--json"]));
+  assert(bool(at(v, "ok")), Some(json_text(v)));
+  let d = diagnostic(v);
+  assert(str(at(d, "code")) == "W0613", Some(json_text(v)));
+  assert(str(at(d, "severity")) == "warning", Some(json_text(v)));
+  assert(str(at(nth(at(d, "labels"), 0), "snippet")) == "???", Some(json_text(v)));
+  assert(
+    str(nth(at(d, "notes"), 1)).contains("in scope of that type: `n: Int`"),
+    Some(json_text(v)),
+  )
+}
+
+fn two_modules() -> List<Source> =
+  [
+    { path: "alpha.ply", text: "test \"shared\" { assert_eq(1, 1) }\n" },
+    { path: "beta.ply", text: "test \"shared\" { assert_eq(2, 3) }\n" },
+  ]
+
+test "two modules may label a test identically and the output says which is which" {
+  let r = in_memory_faked(tree(two_modules()), ["test", "."], passing_except(["beta.shared"])).ran;
+  assert(r.code == 1, Some(all_output(r)));
+  assert(stdout(r).contains("alpha.shared"), Some(stdout(r)));
+  assert(stdout(r).contains("beta.shared"), Some(stdout(r)))
+}
+
+test "filter accepts a module prefix" {
+  let v = json_of(
+    in_memory_faked(
+      tree(two_modules()),
+      ["test", ".", "--json", "--filter", "beta."],
+      passing_except([]),
+    ).ran,
+  );
+  assert(int(path(v, ["selection", "total"])) == 1, Some(json_text(v)));
+  assert(
+    str(at(nth(path(v, ["selection", "tests"]), 0), "key")) == "beta.shared",
+    Some(json_text(v)),
+  )
+}
+
+test "the cache directory is never parsed as source" {
+  let first = in_memory_faked(one_module_tree(green()), ["test", "."], passing_except([]));
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  assert(fs::mem_kind(first.tree, "w/.ply-cache") == Dir, None);
+  let r = in_memory_faked(
+    with_file(first.tree, ".ply-cache/decoy.ply", "!!! not ply !!!\n"),
+    ["test", "."],
+    passing_except([]),
+  ).ran;
+  assert(r.code == 0, Some(all_output(r)))
+}
+
+test "run without a main explains what to add" {
+  let r = in_memory_faked(
+    one_module_tree("fn f() -> Int = 1\n"),
+    ["run", "."],
+    passing_except([]),
+  ).ran;
+  assert(r.code == 2, Some(all_output(r)));
+  assert(stderr(r).contains("no `main` to run"), Some(stderr(r)));
+  assert(stderr(r).contains("fn main"), Some(stderr(r)))
+}
+
+fn main_of(module: String, n: Int) -> (String) -> entering::Termination =
+  |root: String|
+    if root.ends_with(module ++ ".main") { returned(VInt(n)) } else { passing_except([root])(root) }
+
+test "run finds the one main wherever it lives" {
+  let v = json_of(
+    in_memory_faked(
+      tree([
+        { path: "lib.ply", text: "pub fn answer() -> Int = 42\n" },
+        { path: "app.ply", text: "import lib\nfn main() -> Int = lib::answer()\n" },
+      ]),
+      ["run", ".", "--json"],
+      main_of("app", 42),
+    ).ran,
+  );
+  assert(bool(at(v, "ok")), Some(json_text(v)));
+  assert(str(at(v, "value")) == "42", Some(json_text(v)));
+  assert(str(at(v, "entry")) == "app.main", Some(json_text(v)));
+  assert(str(at(v, "module")) == "app", Some(json_text(v)))
+}
+
+test "two mains are reported rather than resolved by load order" {
+  let t = tree([
+    { path: "one.ply", text: "fn main() -> Int = 1\n" },
+    { path: "two.ply", text: "fn main() -> Int = 2\n" },
+  ]);
+  let r = in_memory_faked(t, ["run", ".", "--json"], main_of("two", 2)).ran;
+  assert(r.code == 2, Some(all_output(r)));
+  let v = json_of(r);
+  assert(code_of(v) == "E0112", Some(json_text(v)));
+  let notes = json_text(at(diagnostic(v), "notes"));
+  assert(notes.contains("one.ply") && notes.contains("two.ply"), Some(notes));
+  let picked = json_of(in_memory_faked(t, ["run", "two.ply", "--json"], main_of("two", 2)).ran);
+  assert(str(at(picked, "value")) == "2", Some(json_text(picked)));
+  assert(str(at(picked, "entry")) == "two.main", Some(json_text(picked)))
+}
+
+test "`run --seed 3:1` runs the program with the thread schedule that seed names, and `--seed 3:` fails with exit code 2" {
+  let t = one_module_tree(green());
+  let r = in_memory_faked(t, ["run", ".", "--json", "--seed", "3:1"], main_of("m", 42)).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  assert(str(at(json_of(r), "value")) == "42", Some(all_output(r)));
+  assert(in_memory_faked(t, ["run", ".", "--seed", "3:"], main_of("m", 42)).ran.code == 2, None)
 }

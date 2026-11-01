@@ -1,10 +1,69 @@
-import harness (scratch, on_disk)
-import spawning.harness (write_program, write, all_output, stderr)
-import std.process (EnvironmentVariable)
+import harness (Hermetic, RunWithTree, Shipped, in_memory_faked, one_module_tree, on_disk, returned,
+                passing_except, scratch, tree)
+import support.harness (RunResult, all_output, at, bool, int, items, json_of, json_text, path,
+                        stderr, stdout, str, write, write_program)
+import std.fs (MemFs)
+import std.json (Json)
+import std.machine as entering
+import std.process (EnvironmentVariable, environment_variable)
 import std.string
 import std.list
+import std.value (Value, VBool, VCtor, VList, VRecord, VStr)
 
 fn service() -> String = String::of_bytes_lossy(embed("../programs/config_cli/service.ply"))
+
+fn secret_main() -> String = String::of_bytes_lossy(embed("../programs/config_cli/secret_main.ply"))
+
+fn key_value(name: String, shape: String, required: Bool, default: Option<String>) -> Value =
+  VRecord([
+    {
+      name: "default",
+      value: match default { Some(d) -> VCtor("Some", [VStr(d)]), None -> VCtor("None", []) },
+    },
+    { name: "name", value: VStr(name) },
+    { name: "required", value: VBool(required) },
+    { name: "shape", value: VCtor("std.config." ++ shape, []) },
+  ])
+
+fn service_spec() -> List<Value> =
+  [
+    key_value("SERVICE_REGION", "SText", false, Some("us")),
+    key_value("SERVICE_PORT", "SInt", true, None),
+    key_value("SERVICE_API_KEY", "SSecret", true, None),
+  ]
+
+fn secret_spec() -> List<Value> = [key_value("SERVICE_API_KEY", "SSecret", true, None)]
+
+fn spec_of(keys: List<Value>) -> (String) -> entering::Termination =
+  |name: String|
+    if name == "m.spec" { returned(VRecord([{ name: "keys", value: VList(keys) }])) }
+    else { passing_except([])(name) }
+
+fn over_schema(
+  t: MemFs,
+  keys: List<Value>,
+  argv: List<String>,
+  vars: List<EnvironmentVariable>,
+) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_faked(t, argv, spec_of(keys), [], vars).ran
+
+fn hosts(
+  t: MemFs,
+  keys: List<Value>,
+  extra: List<String>,
+  vars: List<EnvironmentVariable>,
+) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
+  over_schema(t, keys, ["hosts", ".", "--json"].concat(extra), vars)
+
+fn key_of(report: Json, name: String) -> Json / {abort.raise} =
+  match items(path(report, ["configuration", "keys"])).filter(|k: Json|
+      str(at(k, "name")) == name) {
+    [k, ..] -> k,
+    [] -> panic("`" ++ name ++ "` is not in " ++ json_text(report)),
+  }
+
+fn service_region_key(ran: RunResult) -> Json / {abort.raise} =
+  key_of(json_of(ran), "SERVICE_REGION")
 
 test "a malformed config file is E0440 naming the file and line" {
   scratch(|| {
@@ -44,4 +103,180 @@ test "`--config-schema` naming a nonexistent definition fails with E0440 and lis
     assert(stderr(r).contains("E0440"), Some(stderr(r)));
     assert(stderr(r).contains("m.spec"), Some(stderr(r)))
   })
+}
+
+test "precedence is set, then file, then environment, then default" {
+  let t = tree([
+    { path: "m.ply", text: service() },
+    { path: "deploy.env", text: "SERVICE_REGION=file\n" },
+  ]);
+  let schema = ["--config-schema", "m.spec", "--set", "SERVICE_PORT=8137"];
+  let everything = [
+    environment_variable("SERVICE_REGION", "environment"),
+    environment_variable("SERVICE_API_KEY", "k"),
+  ];
+
+  let all = service_region_key(
+    hosts(
+      t,
+      service_spec(),
+      schema.concat(["--set", "SERVICE_REGION=set", "--config", "deploy.env"]),
+      everything,
+    ),
+  );
+  assert_eq(str(at(all, "value")), "set");
+  assert_eq(str(at(all, "source")), "--set");
+
+  let no_set = service_region_key(
+    hosts(t, service_spec(), schema.concat(["--config", "deploy.env"]), everything),
+  );
+  assert_eq(str(at(no_set, "value")), "file");
+  assert_eq(str(at(no_set, "source")), "deploy.env");
+
+  let no_files = service_region_key(hosts(t, service_spec(), schema, everything));
+  assert_eq(str(at(no_files, "value")), "environment");
+  assert_eq(str(at(no_files, "source")), "env");
+
+  let nothing = service_region_key(
+    hosts(t, service_spec(), schema, [environment_variable("SERVICE_API_KEY", "k")]),
+  );
+  assert_eq(str(at(nothing, "value")), "us");
+  assert_eq(str(at(nothing, "source")), "default")
+}
+
+test "a required key nothing supplies is E0441 at startup" {
+  let r = over_schema(
+    one_module_tree(service()),
+    service_spec(),
+    ["run", ".", "--explain", "--config-schema", "m.spec"],
+    [],
+  );
+  let text = stderr(r);
+  assert(r.code != 0, Some(text));
+  assert(text.contains("E0441"), Some(text));
+  assert(text.contains("SERVICE_PORT"), Some(text));
+  assert(text.contains("SERVICE_API_KEY"), Some(text));
+  assert(text.contains("environment variable"), Some(text));
+  assert(
+    !text.contains("binding host"),
+    Some("the rejection comes before anything is bound: " ++ text),
+  )
+}
+
+test "a value that is not of its shape is E0442 naming the source" {
+  let r = over_schema(
+    one_module_tree(service()),
+    service_spec(),
+    ["run", ".", "--config-schema", "m.spec", "--set", "SERVICE_PORT=eight"],
+    [environment_variable("SERVICE_API_KEY", "k")],
+  );
+  let text = stderr(r);
+  assert(r.code != 0, Some(text));
+  assert(text.contains("E0442"), Some(text));
+  assert(text.contains("SERVICE_PORT"), Some(text));
+  assert(text.contains("--set"), Some(text));
+  assert(text.contains("eight"), Some("a plain value is shown: " ++ text))
+}
+
+test "a malformed secret is E0442 and prints no value" {
+  let r = over_schema(
+    one_module_tree(service()),
+    service_spec(),
+    [
+      "run",
+      ".",
+      "--config-schema",
+      "m.spec",
+      "--set",
+      "SERVICE_PORT=8137",
+      "--set",
+      "SERVICE_API_KEY=",
+    ],
+    [],
+  );
+  let text = stderr(r);
+  assert(r.code != 0, Some(text));
+  assert(text.contains("E0442"), Some(text));
+  assert(text.contains("SERVICE_API_KEY"), Some(text));
+  assert(text.contains("not printed"), Some(text))
+}
+
+test "`--set` of a key the config schema does not declare warns, but an unrelated environment variable does not" {
+  let r = over_schema(
+    one_module_tree(service()),
+    service_spec(),
+    [
+      "hosts",
+      ".",
+      "--config-schema",
+      "m.spec",
+      "--set",
+      "SERVICE_PORT=8137",
+      "--set",
+      "SERVICE_PROT=8138",
+    ],
+    [
+      environment_variable("SERVICE_API_KEY", "k"),
+      environment_variable("AWS_PROFILE", "nothing to do with this program"),
+    ],
+  );
+  assert(r.code == 0, Some(stderr(r)));
+  assert(all_output(r).contains("W0607"), Some(all_output(r)));
+  assert(all_output(r).contains("SERVICE_PROT"), Some(all_output(r)));
+  assert(
+    !all_output(r).contains("AWS_PROFILE"),
+    Some("an environment name is not a typo somebody made in this run: " ++ all_output(r)),
+  )
+}
+
+test "the JSON report carries a secret's key and source and not its value" {
+  let r = hosts(one_module_tree(secret_main()), secret_spec(), ["--config-schema", "m.spec"], [
+    environment_variable("SERVICE_API_KEY", "correct-horse"),
+  ]);
+  let key = key_of(json_of(r), "SERVICE_API_KEY");
+  assert_eq(str(at(key, "value")), "****");
+  assert_eq(str(at(key, "source")), "env");
+  assert(bool(at(key, "secret")), Some(json_text(key)));
+  assert(!stdout(r).contains("correct-horse"), Some(stdout(r)))
+}
+
+test "a deterministic test that is given configuration passes, and its second run is a cache hit" {
+  let first = in_memory_faked(
+    one_module_tree(service()),
+    ["test", ".", "--json"],
+    passing_except([]),
+  );
+  let report = json_of(first.ran);
+  assert(bool(at(report, "ok")), Some(json_text(report)));
+  let second = json_of(
+    in_memory_faked(first.tree, ["test", ".", "--json"], passing_except([])).ran,
+  );
+  assert(bool(at(second, "ok")), Some(json_text(second)));
+  assert(
+    int(path(second, ["summary", "cached"])) == 1,
+    Some("the second run is a cache hit: " ++ json_text(second)),
+  );
+  assert(int(path(second, ["selection", "selected"])) == 0, Some(json_text(second)));
+  assert(int(path(second, ["selection", "same_code"])) == 0, Some(json_text(second)))
+}
+
+test "a deterministic test that reads configuration without a handler fails with E0412" {
+  let r = in_memory_faked(
+    one_module_tree(
+      \\import std.config
+      \\import std.config (config)
+      \\
+      \\pub fn region() -> Option<String> / {config.read[server]} =
+      \\  config.get[server]("SERVICE_REGION")
+      \\
+      \\test "reaches the environment" {
+      \\  assert_eq(region(), None)
+      \\}
+      \\
+    ),
+    ["test", "."],
+    passing_except([]),
+  ).ran;
+  assert(r.code != 0, Some(stderr(r)));
+  assert(stderr(r).contains("E0412"), Some(stderr(r)))
 }

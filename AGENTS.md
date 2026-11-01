@@ -120,17 +120,20 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   Then push, and run any slower checks while CI runs.
 - Each crate's Rust tests are in a separate `<crate>-tests` crate, so changing something `pub` can
   break crates you didn't touch.
-- The CLI's tests are the Ply package `tests/cli`. Each test starts `ply` as a process, and the suite
-  does not import the CLI, so it loads in seconds. A test belongs in this suite only if it needs a
-  real process: exit codes, streams, signals, a terminal, sockets, or a command that compiles and
-  runs a program. `.github/ci-ply.sh run cli-<module>` runs one test module with the same
-  permissions that CI gives it.
+- The CLI's tests are the Ply package `tests/cli`, the only suite that starts `ply`. The suite does
+  not import the CLI, so it loads in seconds. A test belongs in this suite only if it needs a real
+  process: exit codes, streams, signals, a terminal, sockets, or a program that must really compile
+  and run. `.github/ci-ply.sh run cli-<module>` runs one test module with the same permissions that
+  CI gives it.
 - `tests/in_process` calls the compiler and the CLI in the test's own process. Use it for tests that
   cannot go beside the code: a test that calls `main` would import the package it tests, and a
   fixture embedded from `packages/compiler` or `packages/cli` becomes a bootstrap input. This suite
   builds its compiler at `-O0`, so calling `main` costs as much as starting `ply`, and compiling a
   program costs far more. First try a test beside the function's code, or a program in `tests/lang`.
-  `.github/ci-ply.sh run package-in_process --filter <module>.` runs one module.
+  `in_memory_faked` runs a command with its compile step faked: what the command decides, stores and
+  reports is real, and the test states how each entry ended. A faked compile cannot show what a
+  program does. `.github/ci-ply.sh run in-process-<module>` runs one test module. `tests/support`
+  holds what the two suites share.
 - CI is defined in `.github/workflows/ci.yml`. `.github/ci-shards.sh` lists the Ply test runs in CI
   (each runs `ply test` on one package) and which job runs each one.
 - A pull request bootstraps a new `ply` only when it changes the runtime's Rust code, `ply.work`, the

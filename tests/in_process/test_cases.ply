@@ -1,7 +1,14 @@
-import harness (scratch, on_disk)
-import spawning.harness (write_program, json_of, at, path, items, str, int, bool)
+import harness (Hermetic, RunWithTree, Shipped, in_memory, in_memory_faked, on_disk,
+                one_module_tree, passing_except, returned_unit, scratch, tree, with_file)
+import support.harness (Source, all_output, at, bool, failed, int, items, json_of, json_text, path,
+                        selected, str, write_program)
+import compiler.emit.keys (TestCases, root_name, root_text, test_key)
+import std.fs (MemFs)
 import std.json (Json, Null)
+import std.machine as entering
 import std.string
+import std.value
+import std.value (VBytes, VList, VRecord, VStr)
 
 fn error_lines(report: Json) -> List<String> =
   items(at(report, "diagnostics")).filter(|d: Json| str(at(d, "severity")) == "error").map(
@@ -42,4 +49,380 @@ test "`ply check` rejects a table that performs an effect, is not a list, has th
       "E0206 11",
     ])
   })
+}
+
+fn vector_test_program(rows: String, double: String) -> String =
+  \\type Vector = { name: String, input: Int, want: Int }
+  \\
+    ++ "\nfn vectors() -> List<Vector> = ["
+    ++ rows
+    ++ "]\n\nfn double(n: Int) -> Int = "
+    ++ double
+    ++ "\n\n"
+    ++
+    \\test "doubles {v.name}" for v: Vector in vectors() {
+    \\  assert_eq(double(v.input), v.want)
+    \\}
+    \\
+    \\test "double of nothing is nothing" { assert_eq(double(0), 0) }
+    \\
+
+fn row(name: String, input: Int, want: Int) -> String =
+  "{ name: \"" ++ name ++ "\", input: " ++ input.to_string() ++ ", want: " ++ want.to_string()
+    ++ " }"
+
+fn two_rows() -> String = row("one", 1, 2) ++ ", " ++ row("two", 2, 4)
+
+type ListedCase = { label: String, identity: String }
+
+type Listing = { of: String, cases: List<ListedCase> }
+
+fn doubles(names: List<String>) -> Listing =
+  {
+    of: "doubles {v.name}",
+    cases: names.map(|name: String| { label: "doubles " ++ name, identity: name }),
+  }
+
+fn listing_returned(cases: List<ListedCase>) -> entering::Termination =
+  entering::Returned(
+    match value::encode(
+        VList(
+          cases.map(|c: ListedCase|
+            VRecord([
+              { name: "identity", value: VBytes(Bytes::of_string(c.identity)) },
+              { name: "label", value: VStr(c.label) },
+            ])),
+        ),
+      ) {
+      Some(b) -> b,
+      None -> b"",
+    },
+  )
+
+type Ending = (String) -> entering::Termination
+
+fn ending(listings: List<Listing>, failing: List<String>) -> Ending / {abort.raise} = {
+  let roots = listings.fold(Map::new(), |accumulator: Map<String, List<ListedCase>>, l: Listing|
+    accumulator.insert(
+      String::of_bytes_lossy(
+        root_text(root_name(TestCases(test_key(b"m", Bytes::of_string(l.of))))),
+      ),
+      l.cases,
+    ));
+  let otherwise = passing_except(failing);
+  |name: String|
+    match roots.get(name) { Some(cases) -> listing_returned(cases), None -> otherwise(name) }
+}
+
+fn run_over_cases(
+  t: MemFs,
+  listings: List<Listing>,
+  failing: List<String>,
+  flags: List<String> = [],
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_faked(t, ["test", ".", "--json"].concat(flags), ending(listings, failing))
+
+fn listed(report: Json) -> List<String> =
+  items(path(report, ["selection", "tests"])).map(|t: Json| str(at(t, "name")))
+
+fn entry(report: Json, name: String) -> Json =
+  match items(path(report, ["selection", "tests"])).filter(|t: Json| str(at(t, "name")) == name) {
+    [t, ..] -> t,
+    [] -> Null,
+  }
+
+fn failure_messages(report: Json) -> List<String> =
+  items(at(report, "failures")).map(|f: Json| str(path(f, ["diagnostic", "message"])))
+
+test "adding a case anywhere in a table runs only the new case, and the existing cases reuse their cached passes" {
+  let first = run_over_cases(
+    one_module_tree(vector_test_program(two_rows(), "n + n")),
+    [doubles(["one", "two"])],
+    [],
+  );
+  let report = json_of(
+    run_over_cases(
+      with_file(
+        first.tree,
+        "m.ply",
+        vector_test_program(
+          row("zero", 0, 0) ++ ", " ++ two_rows() ++ ", " ++ row("three", 3, 6),
+          "n + n",
+        ),
+      ),
+      [doubles(["zero", "one", "two", "three"])],
+      [],
+    ).ran,
+  );
+  assert_eq(selected(report), ["doubles zero", "doubles three"]);
+  assert_eq(int(path(report, ["summary", "cached"])), 3);
+  assert_eq(str(at(entry(report, "doubles one"), "reason")), "cached");
+  assert_eq(int(path(entry(report, "doubles one"), ["case", "at"])), 1)
+}
+
+test "rewriting a label or reordering a table does not change any case's cache key, but editing the test body changes every case's key" {
+  let first = run_over_cases(
+    one_module_tree(vector_test_program(two_rows(), "n + n")),
+    [doubles(["one", "two"])],
+    [],
+  );
+  let relabelled = vector_test_program(
+    row("two", 2, 4) ++ ", " ++ row("one", 1, 2),
+    "n + n",
+  ).replace(
+    "\"doubles {v.name}\"",
+    "\"{v.input} doubled is {v.want}\"",
+  );
+  let listing = {
+    of: "{v.input} doubled is {v.want}",
+    cases: [
+      { label: "2 doubled is 4", identity: "two" },
+      { label: "1 doubled is 2", identity: "one" },
+    ],
+  };
+  let moved = run_over_cases(with_file(first.tree, "m.ply", relabelled), [listing], []);
+  let report = json_of(moved.ran);
+  assert_eq(selected(report), []);
+  assert_eq(listed(report), ["2 doubled is 4", "1 doubled is 2", "double of nothing is nothing"]);
+  let edited = run_over_cases(
+    with_file(
+      moved.tree,
+      "m.ply",
+      relabelled.replace(
+        "assert_eq(double(v.input), v.want)",
+        "assert_eq(v.want, double(v.input))",
+      ),
+    ),
+    [listing],
+    [],
+  );
+  assert_eq(selected(json_of(edited.ran)), ["2 doubled is 4", "1 doubled is 2"])
+}
+
+test "every failing case is reported, each with its own failure, and the passing ones are recorded" {
+  let three = [doubles(["one", "two", "three"])];
+  let failing = ["m.doubles {v.name}[1]", "m.doubles {v.name}[2]"];
+  let ran = run_over_cases(
+    one_module_tree(vector_test_program(two_rows() ++ ", " ++ row("three", 3, 6), "n + n")),
+    three,
+    failing,
+  );
+  assert_eq(ran.ran.code, 1);
+  let report = json_of(ran.ran);
+  assert_eq(failed(report), ["doubles two", "doubles three"]);
+  assert_eq(items(at(report, "failures")).map(|f: Json| str(at(f, "name"))), [
+    "doubles two",
+    "doubles three",
+  ]);
+  assert_eq(selected(json_of(run_over_cases(ran.tree, three, failing).ran)), [
+    "doubles two",
+    "doubles three",
+  ])
+}
+
+test "`--filter` reads a case's label" {
+  let report = json_of(
+    run_over_cases(
+      one_module_tree(vector_test_program(two_rows() ++ ", " ++ row("three", 3, 6), "n + n")),
+      [doubles(["one", "two", "three"])],
+      [],
+      ["--filter", "doubles t"],
+    ).ran,
+  );
+  assert_eq(listed(report), ["doubles two", "doubles three"]);
+  assert_eq(int(path(report, ["selection", "filtered_out"])), 2)
+}
+
+fn rows(label: String) -> String =
+  \\type Row = { name: String, n: Int }
+  \\
+  \\fn none() -> List<Int> = []
+  \\
+  \\test "nothing {n}" for n: Int in none() { assert(n > 0) }
+  \\
+  \\test "twice {n}" for n: Int in [7, 7] { assert_eq(n, 7) }
+  \\
+    ++ "\ntest \""
+    ++ label
+    ++ "\" for r: Row in [{ name: \"a\", n: 1 }, { name: \"a\", n: 2 }] { assert(r.n > 0) }\n"
+
+test "an empty table produces no test, and a table whose cases have the same label fails the test and names that label" {
+  let nothing = { of: "nothing {n}", cases: [] };
+  let twice = {
+    of: "twice {n}",
+    cases: [{ label: "twice 7", identity: "7" }, { label: "twice 7", identity: "7" }],
+  };
+  let ran = run_over_cases(
+    one_module_tree(rows("row {r.name}")),
+    [
+      nothing,
+      twice,
+      {
+        of: "row {r.name}",
+        cases: [{ label: "row a", identity: "1" }, { label: "row a", identity: "2" }],
+      },
+    ],
+    [],
+  );
+  assert_eq(ran.ran.code, 1);
+  let report = json_of(ran.ran);
+  assert_eq(listed(report), ["twice {n}", "row {r.name}"]);
+  assert_eq(failed(report), ["twice {n}", "row {r.name}"]);
+  assert_eq(failure_messages(report), [
+    "the cases at positions 0 and 1 of the table have the same label, \"twice 7\"",
+    "the cases at positions 0 and 1 of the table have the same label, \"row a\"",
+  ]);
+  let again = json_of(
+    run_over_cases(
+      with_file(ran.tree, "m.ply", rows("row {r.name} of {r.n}")),
+      [
+        nothing,
+        twice,
+        {
+          of: "row {r.name} of {r.n}",
+          cases: [{ label: "row a of 1", identity: "1" }, { label: "row a of 2", identity: "2" }],
+        },
+      ],
+      [],
+    ).ran,
+  );
+  assert_eq(listed(again), ["twice {n}", "row a of 1", "row a of 2"]);
+  assert_eq(failed(again), ["twice {n}"]);
+  assert_eq(int(path(again, ["summary", "passed"])), 2)
+}
+
+fn shared(second: String) -> String =
+  "test \"holds {n}\" for n: Int in [1, 2] { assert(n > 0) }\n\ntest \"holds {n}\" for n: Int in "
+    ++ second
+    ++ " { assert(n > 1) }\n"
+
+fn holds(numbers: List<Int>) -> List<ListedCase> =
+  numbers.map(|n: Int| { label: "holds " ++ n.to_string(), identity: n.to_string() })
+
+test "two tests over tables can use the same label, but both tests fail if a case in each has the same label" {
+  let first = run_over_cases(
+    one_module_tree(shared("[3]")),
+    [{ of: "holds {n}", cases: holds([1, 2]) }, { of: "holds {n} (2)", cases: holds([3]) }],
+    [],
+  );
+  let report = json_of(first.ran);
+  assert_eq(listed(report), ["holds 1", "holds 2", "holds 3"]);
+  assert_eq(int(path(report, ["summary", "passed"])), 3);
+  assert_eq(str(path(entry(report, "holds 1"), ["case", "of"])), "m.holds {n}");
+  assert_eq(str(path(entry(report, "holds 3"), ["case", "of"])), "m.holds {n} (2)");
+  let clashed = json_of(
+    run_over_cases(
+      with_file(first.tree, "m.ply", shared("[2, 3]")),
+      [{ of: "holds {n}", cases: holds([1, 2]) }, { of: "holds {n} (2)", cases: holds([2, 3]) }],
+      [],
+    ).ran,
+  );
+  assert_eq(failed(clashed), ["holds {n}", "holds {n} (2)"]);
+  assert_eq(failure_messages(clashed), [
+    "the case at position 1 of the table has the label \"holds 2\", which a case of another test also has",
+    "the case at position 0 of the table has the label \"holds 2\", which a case of another test also has",
+  ])
+}
+
+test "a case's failure lists the definitions the case depends on, and does not list the table's definitions" {
+  let first = run_over_cases(
+    one_module_tree(vector_test_program(two_rows() ++ ", " ++ row("three", 3, 6), "n + n")),
+    [doubles(["one", "two", "three"])],
+    [],
+  );
+  let report = json_of(
+    run_over_cases(
+      with_file(
+        first.tree,
+        "m.ply",
+        vector_test_program(
+          row("zero", 0, 0) ++ ", " ++ two_rows() ++ ", " ++ row("three", 3, 6),
+          "if n > 2 { n + n + 1 } else { n + n }",
+        ),
+      ),
+      [doubles(["zero", "one", "two", "three"])],
+      ["m.doubles {v.name}[3]"],
+    ).ran,
+  );
+  assert_eq(failed(report), ["doubles three"]);
+  let failure = match items(at(report, "failures")) { [f, ..] -> f, [] -> Null };
+  assert_eq(items(at(failure, "changes")).map(|s: Json| str(at(s, "name"))), ["m.double"]);
+  assert_eq(items(at(report, "diffs")).map(|d: Json| str(at(d, "name"))), ["m.double"])
+}
+
+test "each seeded case is searched" {
+  let report = json_of(
+    run_over_cases(
+      one_module_tree(String::of_bytes_lossy(embed("../programs/test_cases/seeded_case.ply"))),
+      [
+        {
+          of: "joined {n}",
+          cases: [{ label: "joined 1", identity: "1" }, { label: "joined 2", identity: "2" }],
+        },
+      ],
+      [],
+    ).ran,
+  );
+  assert_eq(int(path(report, ["simulation", "simulated"])), 2)
+}
+
+test "a keyed type is a case's only where what it holds is data" {
+  let r = in_memory(
+    one_module_tree(
+      String::of_bytes_lossy(embed("../programs/test_cases/lengths.ply"))
+        ++
+        \\
+        \\type Named = | Named(String, () -> Int)
+        \\
+        \\key for Named by name_of
+        \\
+        \\fn name_of(n: Named) -> String = match n { Named(name, _) -> name }
+        \\
+        \\fn named() -> List<Named> = [Named("a", || 1), Named("a", || 2)]
+        \\
+        \\fn hashed() -> Bytes = digest(named())
+        \\
+        \\test "named {name_of(n)}" for n: Named in named() { assert(name_of(n) == "a") }
+        \\
+        ,
+    ),
+    ["check", "--json"],
+  );
+  let checked = json_of(r);
+  assert_eq(error_lines(checked), ["E0206 30"]);
+  assert(
+    json_text(checked).contains(
+      "does not replace the constraint on the type that declares the case",
+    ),
+    Some(json_text(checked)),
+  )
+}
+
+test "two cases that are equal under `==` but built differently stay separate tests, and one's cached pass is not reused for the other" {
+  let listings = [
+    {
+      of: "prints {d}",
+      cases: [{ label: "prints 1.5", identity: "1.5" }, { label: "prints 1.50", identity: "1.50" }],
+    },
+  ];
+  let failing = ["m.prints {d}[1]"];
+  let first = run_over_cases(
+    one_module_tree(
+      \\import std.show (show)
+      \\
+      \\test "prints {d}" for d: Decimal in [1.5m, 1.50m] { assert_eq(show(d), "1.5") }
+      \\
+    ),
+    listings,
+    failing,
+  );
+  assert_eq(first.ran.code, 1);
+  assert_eq(listed(json_of(first.ran)), ["prints 1.5", "prints 1.50"]);
+  assert_eq(failed(json_of(first.ran)), ["prints 1.50"]);
+  let second = run_over_cases(first.tree, listings, failing);
+  assert_eq(second.ran.code, 1);
+  let report = json_of(second.ran);
+  assert_eq(failed(report), ["prints 1.50"]);
+  assert_eq(selected(report), ["prints 1.50"]);
+  assert_eq(str(at(entry(report, "prints 1.5"), "reason")), "cached")
 }

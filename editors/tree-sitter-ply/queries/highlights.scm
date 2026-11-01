@@ -202,3 +202,5 @@
   ","
   ";"
 ] @punctuation.delimiter
+
+(hole_expression) @keyword

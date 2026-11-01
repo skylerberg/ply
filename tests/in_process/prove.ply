@@ -1,35 +1,343 @@
-import harness (scratch, on_disk)
-import spawning.harness (write_program, all_output)
+import harness (Hermetic, RunWithTree, Shipped, in_memory_faked, one_module_tree)
+import support.harness (all_output, at, bool, first, int, items, json_of, json_text, nth, path,
+                        stdout, str)
+import std.fs
+import std.fs (MemFs)
 import std.json
-import std.string
+import std.json (Json, Null, Object, Array, Str)
 import std.list
+import std.machine as entering
+import std.string
+import std.value
+import std.value (VBool)
 
-test "`check` rejects a law schema instantiation at its call site when the arguments or the quantified type do not fit" {
-  scratch(|| {
-    let over = |law: String|
-      "fn id(n: Int) -> Int = n\n\nfn held(t: Task<Int>) -> Task<Int> = t\n\nlaw schema same<a>(f: (a) -> a) forall (x: a) { f(x) == x }\n\n"
-        ++ law
-        ++ "\n";
-    let rejected = |law: String, code: String, at_text: String| {
-      write_program(over(law));
-      let r = on_disk(["check"]);
-      assert(r.code != 0, Some(all_output(r)));
-      assert(
-        all_output(r).contains("Error[" ++ code ++ "]") && all_output(r).contains(at_text),
-        Some(all_output(r)),
+fn unspecified() -> String =
+  "fn double(x: Int) -> Int = x * 2\n\nfn triple(x: Int) -> Int = x * 3\n\nfn main() -> Int = double(21)\n"
+
+fn specified() -> String =
+  \\fn one(x: Int) -> Int
+  \\  ensures result >= 0
+  \\= 1
+  \\
+  \\fn size_of(xs: List<Int>) -> Int
+  \\  ensures result >= 0
+  \\= xs.len()
+  \\
+  \\law "length is never negative"
+  \\  forall (xs: List<Int>) {
+  \\    size_of(xs) >= 0
+  \\  }
+  \\
+  \\law "a batch never holds more than one entry"
+  \\  forall (xs: List<Int>) {
+  \\    xs.len() <= 1
+  \\  }
+  \\
+
+fn returning(b: Bool) -> entering::Termination =
+  entering::Returned(match value::encode(VBool(b)) { Some(bytes) -> bytes, None -> b"" })
+
+fn holding(root: String) -> entering::Termination = returning(true)
+
+fn failing(root: String) -> entering::Termination =
+  returning(root.contains("#requires#") || root.ends_with(".guard"))
+
+fn run(t: MemFs, argv: List<String>) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_faked(t, argv, failing)
+
+fn prove_json(flags: List<String>) -> List<String> = ["prove", ".", "--json"].concat(flags)
+
+fn report(t: MemFs, flags: List<String>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
+  json_of(run(t, prove_json(flags)).ran)
+
+fn with_program(t: MemFs, text: String) -> MemFs / {abort.raise} =
+  fs::mem_write(t, "w/m.ply", Bytes::of_string(text)).fs
+
+fn null_keys(j: Json, keys: List<String>) -> Json =
+  match j {
+    Object(m) ->
+      Object(keys.fold(m, |accumulator: Map<String, Json>, k: String| accumulator.insert(k, Null))),
+    other -> other,
+  }
+
+fn stable_report(v: Json) -> Json = null_keys(v, ["duration_ms", "cached", "front_end"])
+
+fn definitions_seen(t: MemFs) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
+  at(json_of(run(t, ["cache", "stats", ".", "--json"]).ran), "definitions_seen")
+
+test "`prove` prints the coverage line first, then lists the definitions no proved claim covers" {
+  let r = run(one_module_tree(unspecified()), ["prove", "."]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  let first_line = match r.out.at(0) { Some(l) -> l, None -> "" };
+  assert(
+    first_line.contains("3 definitions") && first_line.contains("0 of them have a claim"),
+    Some("the coverage line has to be first: " ++ stdout(r)),
+  );
+  assert(
+    stdout(r).contains("3 definitions have no proved claim: m.double, m.main, m.triple"),
+    Some("uncovered definitions are a list to work through, not only a number: " ++ stdout(r)),
+  );
+  assert(stdout(r).contains("0 obligations"), Some(stdout(r)))
+}
+
+test "prove json is one object carrying the coverage block" {
+  let r = run(one_module_tree(unspecified()), prove_json([])).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  let v = json_of(r);
+  assert(int(at(v, "schema_version")) == 1, Some(json_text(v)));
+  assert(str(at(v, "command")) == "prove", Some(json_text(v)));
+  assert(bool(at(v, "ok")), Some(json_text(v)));
+  assert(int(path(v, ["coverage", "definitions"])) == 3, Some(json_text(v)));
+  assert(int(path(v, ["coverage", "covered"])) == 0, Some(json_text(v)));
+  assert(int(at(v, "specified")) == 0, Some(json_text(v)));
+  assert(items(path(v, ["coverage", "uncovered"])).len() == 3, Some(json_text(v)));
+  assert(int(path(v, ["plan", "prove_budget"])) > 0, Some(json_text(v)));
+  assert(items(at(v, "obligations")) == [], Some(json_text(v)))
+}
+
+test "prove json is byte-identical across runs and job counts" {
+  let one = run(one_module_tree(unspecified()), prove_json(["--jobs", "1"]));
+  assert(
+    null_keys(json_of(one.ran), ["duration_ms", "front_end"])
+      == null_keys(report(one.tree, ["--jobs", "16"]), ["duration_ms", "front_end"]),
+    None,
+  )
+}
+
+test "`prove` does not change the definition counts that `cache stats` reports" {
+  let t = one_module_tree(unspecified());
+  let before = definitions_seen(t);
+  assert(before != Null, None);
+  let proved = run(t, ["prove", "."]);
+  assert(proved.ran.code == 0, None);
+  assert(definitions_seen(proved.tree) == before, None)
+}
+
+test "prove json agrees across job counts over real obligations" {
+  let t = one_module_tree(specified());
+  let one = stable_report(report(t, ["--jobs", "1", "--no-cache"]));
+  let many = stable_report(report(t, ["--jobs", "16", "--no-cache"]));
+  assert(int(path(one, ["summary", "proved"])) == 3, Some(json_text(one)));
+  assert(int(path(one, ["summary", "refuted"])) == 1, Some(json_text(one)));
+  assert(one == many, None)
+}
+
+test "a cached run reports exactly what a fresh one does" {
+  let fresh = run(one_module_tree(specified()), prove_json(["--no-cache"]));
+  let populated = run(fresh.tree, prove_json([]));
+  let warm = report(populated.tree, []);
+  assert(int(at(warm, "cached")) > 0, Some("the second run has to have read something"));
+  assert(stable_report(json_of(fresh.ran)) == stable_report(warm), None)
+}
+
+test "a cached `prove` run reports the same results as an uncached run" {
+  let fresh = run(one_module_tree(specified()), prove_json(["--static-prover", "--no-cache"]));
+  let unasked = run(fresh.tree, prove_json([]));
+  let plain = json_of(unasked.ran);
+  assert(
+    items(at(plain, "obligations")).filter(|o: Json| at(o, "static_prover") != Null).len() == 0,
+    Some(json_text(plain)),
+  );
+  let warm_raw = report(unasked.tree, ["--static-prover"]);
+  assert(int(at(warm_raw, "cached")) > 0, Some("the second run has to have read something"));
+  let warm = stable_report(warm_raw);
+  assert(stable_report(json_of(fresh.ran)) == warm, None);
+  assert(
+    items(at(warm, "obligations")).filter(|o: Json|
+        str(path(o, ["static_prover", "decision"])) == "").len(
       )
-    };
-    rejected("law \"l\" = id(id)", "E0472", "`id` is not a law schema");
-    rejected(
-      "law \"l\" = same(id, id)",
-      "E0202",
-      "the schema `same` takes 1 argument, but 2 were supplied",
+      == 0,
+    Some("every claim here is one the static prover sees: " ++ json_text(warm)),
+  )
+}
+
+test "review reports everything as unreviewed until something is accepted" {
+  let r = run(one_module_tree(unspecified()), ["review", ".", "--changed"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  assert(stdout(r).contains("3 definitions"), Some(stdout(r)));
+  assert(stdout(r).contains("never reviewed"), Some(stdout(r)))
+}
+
+test "after `review --accept`, `review --changed` reports that no definition changed" {
+  let accepted = run(one_module_tree(unspecified()), ["review", ".", "--accept"]);
+  assert(accepted.ran.code == 0, Some(all_output(accepted.ran)));
+  assert(stdout(accepted.ran).contains("3 definitions accepted"), Some(stdout(accepted.ran)));
+  let r = run(accepted.tree, ["review", ".", "--changed"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  assert(
+    stdout(r).contains("no definition changed since the last accepted review"),
+    Some(stdout(r)),
+  )
+}
+
+test "after `review --accept` on a program with specified claims, `review --changed` reports that no definition changed" {
+  let accepted = run(one_module_tree(specified()), ["review", ".", "--accept"]);
+  assert(accepted.ran.code == 0, Some(all_output(accepted.ran)));
+  let r = run(accepted.tree, ["review", ".", "--changed"]).ran;
+  assert(
+    stdout(r).contains("no definition changed since the last accepted review"),
+    Some(stdout(r)),
+  )
+}
+
+test "`review --changed` flags a changed definition with no spec as unchecked, and says the run cannot show its behavior is unchanged" {
+  let accepted = run(one_module_tree(unspecified()), ["review", ".", "--accept"]);
+  let edited = with_program(accepted.tree, unspecified().replace("x * 2", "x + x"));
+  let r = run(edited, ["review", ".", "--changed"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  let text = stdout(r);
+  assert(text.contains("m.double · implementation changed · no spec"), Some(text));
+  assert(text.contains("read the implementation, line by line"), Some(text));
+  assert(
+    text.contains("have no proved claim, so this run cannot tell whether their behaviour changed"),
+    Some("the limit has to be visible at the point of use: " ++ text),
+  );
+  assert(
+    !text.contains("nothing changed"),
+    Some("an unspecified change is still a change: " ++ text),
+  )
+}
+
+test "`review --changed --json` lists each changed definition and whether a claim covers it" {
+  let accepted = run(one_module_tree(unspecified()), ["review", ".", "--accept"]);
+  let edited = with_program(accepted.tree, unspecified().replace("x * 3", "x + x + x"));
+  let v = json_of(run(edited, ["review", ".", "--changed", "--json"]).ran);
+  assert(str(at(v, "command")) == "review", Some(json_text(v)));
+  assert(int(at(v, "definitions")) == 3, Some(json_text(v)));
+  assert(int(at(v, "unspecified_changed")) == 1, Some(json_text(v)));
+  assert(int(at(v, "specified_changed")) == 0, Some(json_text(v)));
+  let changed = items(at(v, "changed"));
+  assert(changed.len() == 1, Some(json_text(v)));
+  assert(str(at(first(changed), "name")) == "m.triple", Some(json_text(v)));
+  assert(str(at(first(changed), "implementation")) == "changed", Some(json_text(v)));
+  assert(str(at(first(changed), "spec")) == "none", Some(json_text(v)));
+  assert(str(at(v, "headline")).contains("have no proved claim"), Some(json_text(v)))
+}
+
+test "a renamed definition is reported as never reviewed, because the review of its old name does not carry over" {
+  let accepted = run(one_module_tree(unspecified()), ["review", ".", "--accept"]);
+  let edited = with_program(accepted.tree, unspecified().replace("triple", "treble"));
+  let changed = items(
+    at(json_of(run(edited, ["review", ".", "--changed", "--json"]).ran), "changed"),
+  );
+  assert(changed.len() == 1, None);
+  assert(str(at(first(changed), "name")) == "m.treble", None);
+  assert(str(at(first(changed), "implementation")) == "never reviewed", None)
+}
+
+test "a changed definition whose claim is unproved is never reported as checked, and `review --changed` fails" {
+  let effectful =
+    \\effect db {
+    \\  read  get[r](key: Int) -> Int
+    \\  write put[r](key: Int, value: Int) -> Int
+    \\}
+    \\
+    \\fn stored(k: Int) -> Int / {db.read[rows]}
+    \\  ensures result >= 0
+    \\= db.get[rows](k)
+    \\
+  ;
+  let accepted = run(one_module_tree(effectful), ["review", ".", "--accept"]);
+  let edited = with_program(
+    accepted.tree,
+    effectful.replace("= db.get[rows](k)", "= db.get[rows](k) + 1"),
+  );
+  let r = run(edited, ["review", ".", "--changed"]).ran;
+  assert(r.code == 1, Some("a claim nothing proves fails the run: " ++ all_output(r)));
+  let text = stdout(r);
+  assert(text.contains("m.stored · implementation changed · spec unchanged"), Some(text));
+  assert(text.contains("unproved"), Some(text));
+  assert(
+    text.contains("have no proved claim: m.stored"),
+    Some("the definition a reader still has to read has to be named: " ++ text),
+  );
+  assert(
+    !text.contains("no changed definition has a spec"),
+    Some("nothing here established anything: " ++ text),
+  );
+  let v = json_of(run(edited, ["review", ".", "--changed", "--json"]).ran);
+  assert(!bool(at(v, "ok")), Some(json_text(v)));
+  assert(int(at(v, "undischarged")) == 1, Some(json_text(v)));
+  assert(int(at(v, "specified_changed")) == 0, Some(json_text(v)));
+  assert(int(at(v, "unspecified_changed")) == 1, Some(json_text(v)));
+  let change = nth(at(v, "changed"), 0);
+  assert(
+    !bool(at(change, "specified")) && at(change, "specified") != Null,
+    Some(json_text(change)),
+  );
+  assert(
+    str(at(change, "advice"))
+      == "no claim on this definition is proved: read the implementation, line by line",
+    Some(json_text(change)),
+  );
+  assert(int(path(v, ["coverage", "covered"])) == 0, Some(json_text(v)));
+  assert(path(v, ["coverage", "uncovered"]) == Array([Str("m.stored")]), Some(json_text(v)));
+  let obligation = nth(at(change, "obligations"), 0);
+  assert(str(at(obligation, "outcome")) == "unproved", Some(json_text(obligation)));
+  assert(str(at(obligation, "reason_kind")) == "unhandled_effect", Some(json_text(obligation)))
+}
+
+fn outcomes(v: Json) -> List<{ label: String, outcome: String }> =
+  items(at(v, "obligations")).map(|o: Json|
+    { label: str(at(o, "label")), outcome: str(at(o, "outcome")) })
+
+test "editing a definition that a proof depends on, directly or indirectly, makes the claim unproved again" {
+  let good =
+    \\fn leaf() -> Int = 1
+    \\
+    \\fn base() -> Int = leaf()
+    \\
+    \\fn shift(x: Int) -> Int
+    \\  requires x > 0 && x < 1000
+    \\  ensures result == x + 1
+    \\= x + base()
+    \\
+    \\law "shift agrees with base" forall (x: Int) where x > 0 && x < 1000
+    \\  { shift(x) == x + base() }
+    \\
+  ;
+  [
+    {
+      what: "the body",
+      from: "= x + base()\n",
+      to: "= x + base() + 1\n",
+      refuted: ["ensures", "law"],
+    },
+    {
+      what: "the spec",
+      from: "ensures result == x + 1",
+      to: "ensures result == x + 3",
+      refuted: ["ensures"],
+    },
+    {
+      what: "a transitive dependency",
+      from: "fn leaf() -> Int = 1",
+      to: "fn leaf() -> Int = 2",
+      refuted: ["ensures"],
+    },
+  ].fold((), |u: Unit, e: { what: String, from: String, to: String, refuted: List<String> }| {
+    let baseline = in_memory_faked(one_module_tree(good), prove_json([]), holding);
+    assert(
+      outcomes(json_of(baseline.ran)).filter(|o: { label: String, outcome: String }|
+          o.outcome != "proved").len(
+        )
+        == 0,
+      Some("the baseline is two proofs"),
     );
-    rejected("law \"l\" = same(Int::to_string)", "E0201", "m.ply:7:16");
-    rejected(
-      "law \"l\" = same(held)",
-      "E0418",
-      "the schema `same` binds `x`, which is a `Task<Int>` here",
-    )
+    let broken = good.replace(e.from, e.to);
+    assert(broken != good, Some("the edit to " ++ e.what ++ " matched nothing"));
+    let after = outcomes(report(with_program(baseline.tree, broken), []));
+    e.refuted.fold(u, |w: Unit, kind: String|
+      match after.filter(|o: { label: String, outcome: String }| o.label.contains(kind)) {
+        [found, ..] ->
+          assert(
+            found.outcome == "refuted",
+            Some(
+              "editing " ++ e.what ++ " left `" ++ found.label ++ "` cached as `" ++ found.outcome
+                ++ "`, which is a proof of something no longer true",
+            ),
+          ),
+        [] -> panic("no `" ++ kind ++ "` obligation after editing " ++ e.what),
+      })
   })
 }

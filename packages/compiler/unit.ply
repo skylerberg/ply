@@ -71,7 +71,7 @@ import compiler.syntax.parsing (no_module)
 import compiler.syntax.items (RequiresClause, EnsuresClause, spec_kind_text)
 import compiler.syntax.expressions (prelude_module)
 import compiler.emit.print.count_functions (identity_function, allocates)
-import std.list (positions)
+import std.list (positions, sorted_unique)
 import compiler.emit.print.constants (constant_read_fn, const_fn_read_fn)
 
 pub effect shipped {
@@ -498,14 +498,6 @@ pub fn results_by_name(rows: List<RootOutput>) -> Map<RootName, Output> =
       r.result.tables.members.fold(accumulator, |into: Map<RootName, Output>, m: RootKey|
         into.insert(root_name(m), r.result))
     })
-
-fn sorted_unique(xs: List<Bytes>) -> List<Bytes> =
-  xs.fold(Map::new(), |accumulator: Map<Bytes, Bool>, x: Bytes| accumulator.insert(x, true)).keys()
-
-fn sorted_unique_names(xs: List<RootName>) -> List<RootName> =
-  xs.fold(Map::new(), |accumulator: Map<RootName, Bool>, x: RootName|
-    accumulator.insert(x, true)).keys(
-  )
 
 pub type UnitBody = { name: RootName, text: Bytes, tables: Tables, body: Bytes, size: Int }
 
@@ -1050,7 +1042,7 @@ fn constants_defined(
   )
 
 fn reachable_names(name: RootName, tables: Tables) -> List<RootName> =
-  sorted_unique_names(
+  sorted_unique(
     tables.calls.map(root_name).concat(if tables.members.len() == 0 { [name] }
     else { tables.members.map(root_name) }),
   )
@@ -1191,7 +1183,7 @@ fn part_written<| e>(
   read: (Bytes) -> Option<Bytes> / e,
   source_cached: (String) -> Bool / e,
 ) -> { part: WrittenPart, records: List<Record> } / {abort.raise | e} = {
-  let prototypes = sorted_unique_names(
+  let prototypes = sorted_unique(
     p.group.fold([], |accumulator: List<RootName>, m: BodyHoles|
       accumulator.concat(reachable_names(m.body.name, m.body.tables))),
   ).map(|name: RootName|
@@ -1282,7 +1274,7 @@ pub fn produce<| e>(
       Some(o) -> o,
       None -> panic("every body in the compiled program must have been requested"),
     };
-  let names = sorted_unique_names(offered.map(|o: RequestedRoot| o.name));
+  let names = sorted_unique(offered.map(|o: RequestedRoot| o.name));
   let s = taken_bodies(results, stored, names);
   let machine = machine_called(s.bodies, machine_of);
   let published = |n: RootName|
@@ -1821,7 +1813,7 @@ fn body_digest(a: Output) -> Bytes / {abort.raise} = blake3(bin::encode(output_b
 
 type Stored = { cache_key: Bytes, body: Bytes, size: Int }
 
-fn callees_of(a: Output) -> List<RootName> = sorted_unique_names(a.tables.calls.map(root_name))
+fn callees_of(a: Output) -> List<RootName> = sorted_unique(a.tables.calls.map(root_name))
 
 fn cached_result_of(keys: Map<RootName, Bytes>, a: Output) -> CachedResult / {abort.raise} = {
   let s = summarised(a);
@@ -2691,7 +2683,7 @@ fn specialise_generic_calls<s>(
   w: EmissionProgress<s>,
   program: Constructors,
 ) -> { walk: EmissionProgress<s>, more: Map<RootName, RootKey> } / {abort.raise} = {
-  let names = sorted_unique_names(w.unresolved);
+  let names = sorted_unique(w.unresolved);
   let bodies = generic_bodies(w.results, w.keys, names);
   let needs = extended_needs(bodies, w.needs);
   let called = extended_called(bodies, w.called);
@@ -2814,7 +2806,7 @@ pub fn emitted<| e>(
         unbound: unbound(runtime.natives, called_externs(natives_called(produced.made), natives)),
         signature_mismatches: signature_mismatches(
           all.results,
-          sorted_unique_names(roots.map(root_name)),
+          sorted_unique(roots.map(root_name)),
         ),
       })
     }
@@ -4477,11 +4469,11 @@ test "a module's definitions are listed together, its specialisations are listed
   assert_eq(batch_key(Named(b"c.odd")), batch_key(Named(b"c.even")));
   assert(batch_key(at(b"c.h", [])) != batch_key(at(b"c.odd", [])), None);
   assert_eq(
-    sorted_unique_names(
+    sorted_unique(
       lists.fold([], |accumulator: List<RootName>, roots: List<RootKey>|
         accumulator.concat(roots.map(root_name))),
     ),
-    sorted_unique_names(missed.map(root_name)),
+    sorted_unique(missed.map(root_name)),
   );
   let together = |roots: List<RootKey>| sorted_unique(roots.map(batch_key));
   assert_eq(
@@ -6412,6 +6404,27 @@ test "reading a definition that has no parameters computes its value once and ca
 
 fn read_of(helper: Bytes) -> Bytes = helper.concat(b"(ctx, ply_part")
 
+test "a read of a definition taking a parameter or publishing an effect runs its body, where one of neither is read from the memo" {
+  let probes = [b"m.probe_constant", b"m.probe_parameterized", b"m.probe_over_declared"];
+  let k = unit_builder(
+    Bytes::concat_all([
+      b"effect store {\n  read peek() -> Int\n}\n",
+      b"fn constant() -> List<Int> = range(0, 20)\n",
+      b"fn parameterized(ignored: Int) -> List<Int> = range(0, 20)\n",
+      b"fn over_declared() -> List<Int> / {store.read} = range(0, 20)\n",
+      b"fn probe_constant() -> Int = constant().len() + constant().len()\n",
+      b"fn probe_parameterized() -> Int = parameterized(0).len() + parameterized(0).len()\n",
+      b"fn probe_over_declared() -> Int / {store.read} = over_declared().len() + over_declared().len()\n",
+    ]),
+  );
+  let text = unit_text(k.unit(probes.map(Named)).produced.parts);
+  assert_eq(
+    probes.map(|probe: Bytes|
+      defined_in(text, symbol_of(probe)).index_of(read_of(constant_read_fn())) != None),
+    [true, false, false],
+  )
+}
+
 test "a `const fn` is read through the check that no raise left it, and a plain definition is not" {
   let reads = |table: Bytes| {
     let k = unit_builder(Bytes::concat_all([table, b"fn read() -> Int = table().len()\n"]));
@@ -6627,7 +6640,7 @@ test "a build with an empty cache asks the code generator for each definition on
     assert_eq(cold.emitter.scoped.covered.keys(), walked_cold.program.read.keys());
     assert(cold.emitter.requested_roots.len() > 0, None);
     assert_eq(
-      sorted_unique_names(cold.emitter.requested_roots).len(),
+      sorted_unique(cold.emitter.requested_roots).len(),
       cold.emitter.requested_roots.len(),
     );
     assert_eq(cold.emitter_requests, cold.emitter.requested_roots.len());
@@ -6675,10 +6688,7 @@ test "a rebuild with a cache reads only the modules needed by the definitions th
     let read = program_of(warm.dump, warm.program.sources, missed).read.keys();
     assert(!read.contains(b"g") && !read.contains(b"k"), None);
     let emitter = warm.walk.emitter;
-    assert_eq(
-      sorted_unique_names(emitter.requested_roots),
-      sorted_unique_names(missed.map(root_name)),
-    );
+    assert_eq(sorted_unique(emitter.requested_roots), sorted_unique(missed.map(root_name)));
     assert_eq(emitter.scoped.covered.keys(), read);
     assert_eq(emitter.built, 1)
   })
@@ -6707,10 +6717,7 @@ test "a rebuild from a cache writes the same C as a build with an empty cache, b
   let warm = unit_on_tree(first.tree, edited).value;
   let cold = unit_on_tree(fs::mem_of([]), edited).value;
   assert(warm.cached > 0 && warm.emitter_requests < cold.emitter_requests, None);
-  assert_eq(
-    sorted_unique_names(warm.roots.map(root_name)),
-    sorted_unique_names(cold.roots.map(root_name)),
-  );
+  assert_eq(sorted_unique(warm.roots.map(root_name)), sorted_unique(cold.roots.map(root_name)));
   assert(unit_text(warm.produced.parts) == unit_text(cold.produced.parts), None)
 }
 
@@ -6819,4 +6826,61 @@ test "the effect requirements and called function parameters recorded for a buil
     );
     assert_eq(called.get(definition_root(b"g.apply")), Some([0]))
   })
+}
+
+fn program_codes(source_text: Bytes) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let user = [{ name: b"m", source_text: source_text }];
+  let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_in_order(dump, user),
+      Map::new(),
+      requested_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
+    Ok(e) ->
+      codes(e.produced.made).fold(Map::new(), |m: Map<Bytes, Bytes>, n: RootName, code: Bytes|
+        m.insert(root_text(n), code)),
+  }
+}
+
+fn test_code(codes_of_program: Map<Bytes, Bytes>, label: Bytes) -> Option<Bytes> / {abort.raise} =
+  codes_of_program.get(root_text(root_name(test_key(b"m", label))))
+
+test "a body the emitter folds to the one it replaced leaves a test's code, and another body moves it" {
+  let code = |body: Bytes|
+    test_code(
+      program_codes(
+        Bytes::concat_all([
+          b"fn a(_: Int) -> Int = ",
+          body,
+          b"\ntest \"a is one\" { assert_eq(a(0), 1) }\n",
+        ]),
+      ),
+      b"a is one",
+    );
+  assert(code(b"1") != None, None);
+  assert_eq(code(b"0 + 1"), code(b"1"));
+  assert(code(b"2") != code(b"1"), None)
+}
+
+fn length_program(plus: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"type Length = | Metres(Int) | Millimetres(Int)\n\nkey for Length by millimetres\n\nnumeric for Length by { add: plus, sub: plus, mul: plus, neg: back, of_int: metres }\n\nfn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n\nfn plus(a: Length, b: Length) -> Length = ",
+    plus,
+    b"\n\nfn back(a: Length) -> Length = a\n\nfn metres(n: Int) -> Length = Metres(n)\n\nfn lengths() -> List<Length> = [Metres(1), Millimetres(500)]\n\nfn total<a>(xs: List<a>) -> a\n  where numeric(a)\n= xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n\nfn same<a>(x: a, y: a) -> Bool\n  where derivable(eq, a)\n= x == y\n\ntest \"the lengths have a total\" { assert(same(total(lengths()), total(lengths()))) }\n\ntest \"a length is itself\" { assert(same(lengths(), lengths())) }\n",
+  ])
+
+test "an edit to a function a numeric names moves the code of a test that adds, and of no test that only holds the type" {
+  let before = program_codes(length_program(b"Millimetres(millimetres(a) + millimetres(b))"));
+  let after = program_codes(length_program(b"Millimetres(millimetres(b) + millimetres(a))"));
+  assert(
+    test_code(before, b"the lengths have a total") != test_code(after, b"the lengths have a total"),
+    None,
+  );
+  assert(test_code(before, b"a length is itself") != None, None);
+  assert_eq(test_code(before, b"a length is itself"), test_code(after, b"a length is itself"))
 }

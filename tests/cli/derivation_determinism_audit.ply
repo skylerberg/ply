@@ -1,139 +1,20 @@
-import spawning.harness (WorkingDirectory, Source, PlyProcess, write_project, all_output, spawned,
-                         spawned_in, succeeded, write)
+import harness (PlyProcess, spawned_in, succeeded)
+import support.harness (write_project, all_output, write)
 import std.string
 
 fn hashes_in(dir: String) -> String / {PlyProcess, abort.raise} =
   all_output(succeeded(spawned_in(dir, ["hash", "."], [])))
-
-fn hashes_here() -> String / {PlyProcess, abort.raise} = hashes_in("")
-
-fn hashes_of(files: List<Source>) -> String / {PlyProcess, WorkingDirectory, abort.raise} = {
-  write_project(files);
-  hashes_here()
-}
-
-fn alone(text: String) -> List<Source> = [{ path: "m.ply", text: text }]
-
-fn hash_of(text: String, name: String) -> String / {abort.raise} =
-  match text.split("\n").filter(|l: String|
-      match l.words().at(1) { Some(n) -> n == name, None -> false }) {
-    [line, ..] -> match line.words().at(0) { Some(h) -> h, None -> "" },
-    [] -> panic("no definition named `" ++ name ++ "` in:\n" ++ text),
-  }
 
 fn derived() -> String =
   String::of_bytes_lossy(embed("../programs/derivation_determinism_audit/derived.ply"))
 
 test/nondet "a derived program hashes identically in two runs and two directories" {
   write_project([{ path: "m.ply", text: derived() }]);
-  let first = hashes_here();
-  assert(first == hashes_here(), Some("two runs of one program produced two hash sets"));
+  let first = hashes_in("");
+  assert(first == hashes_in(""), Some("two runs of one program produced two hash sets"));
   write("elsewhere/m.ply", derived());
   assert(
     first == hashes_in("elsewhere"),
     Some("a project's hashes moved with the directory it sat in"),
   )
-}
-
-test/nondet "a generated definition's hash is the same whether `std.json` is imported plainly or with `as j`" {
-  let hashed = |form: String, deriver: String| {
-    let text = hashes_of(
-      alone(
-        form ++ "\npub type A = { x: Int, y: String }\npub type B = Left(Int) | Right(A)\nderive "
-          ++ deriver
-          ++ " for A\nderive "
-          ++ deriver
-          ++ " for B\n",
-      ),
-    );
-    [hash_of(text, "a_json"), hash_of(text, "b_json")]
-  };
-  assert(
-    hashed("import std.json", "json") == hashed("import std.json as j", "j"),
-    Some("binding `std.json` as `j` changed a generated definition's hash"),
-  )
-}
-
-test/nondet "renaming a type parameter does not move a generated hash" {
-  let with_params = |params: String, fst: String, snd: String|
-    "import std.json\npub type Pair<" ++ params ++ "> = { fst: " ++ fst ++ ", snd: " ++ snd
-      ++ " }\nderive json for Pair\n";
-  assert(
-    hash_of(hashes_of(alone(with_params("a, b", "a", "b"))), "pair_json")
-      == hash_of(hashes_of(alone(with_params("d, e", "d", "e"))), "pair_json"),
-    Some("a type parameter's name reached a generated definition's hash"),
-  )
-}
-
-fn fields_source(fields: String) -> String =
-  "import std.json\npub type A = { " ++ fields
-    ++ " }\nderive json for A\npub fn wire() -> String / {abort.raise} = String::of_bytes(json::encode_bytes({x: 1, y: \"hi\"}, a_json()))\ntest \"the wire\" { assert_eq(wire(), \"{\\\"x\\\":1,\\\"y\\\":\\\"hi\\\"}\") }\n"
-
-test/nondet "reordering two fields changes the generated codec's hash but not the JSON it writes" {
-  let declared = fields_source("x: Int, y: String");
-  let reordered = fields_source("y: String, x: Int");
-  assert(
-    hash_of(hashes_of(alone(declared)), "a_json") != hash_of(hashes_of(alone(reordered)), "a_json"),
-    Some("a field reorder changes the decoder's visiting order, so it has to move the hash"),
-  );
-  [declared, reordered].fold((), |u: Unit, source: String| {
-    write_project([{ path: "m.ply", text: source }]);
-    let r = spawned(["test", "."]);
-    assert(r.code == 0, Some("the wire is ascending by key either way:\n" ++ all_output(r)))
-  })
-}
-
-fn status_source(ty: String, codec: String, variant: String) -> String =
-  "import std.json\n\npub type Status = " ++ variant ++ " | Shipped(Int)\npub type " ++ ty
-    ++ " = { id: Int, status: Status }\nderive json for Status\nderive json for "
-    ++ ty
-    ++ "\n\nfn wire(o: "
-    ++ ty
-    ++ ") -> String / {abort.raise} = String::of_bytes(json::encode_bytes(o, "
-    ++ codec
-    ++ "()))\n\ntest \"an order encodes\" {\n  assert_eq(wire({id: 1, status: "
-    ++ variant
-    ++ "}), \"{\\\"id\\\":1,\\\"status\\\":\\\""
-    ++ variant
-    ++ "\\\"}\")\n}\n\ntest \"an unrelated arithmetic fact\" { assert_eq(1 + 1, 2) }\n"
-
-fn assert_tests_print(what: String, reason: String) -> Unit / {PlyProcess, abort.raise} = {
-  let r = spawned(["test", "."]);
-  assert(r.code == 0, Some(all_output(r)));
-  assert(all_output(r).contains(what), Some(reason ++ "\n" ++ all_output(r)))
-}
-
-test/nondet "renaming a derived type re-runs no tests, but renaming a variant re-runs the test that uses that variant" {
-  write_project([{ path: "m.ply", text: status_source("Order", "order_json", "Placed") }]);
-  assert_tests_print("selected 2 of 2 (0 cached)", "a first run runs both");
-  write("m.ply", status_source("Purchase", "purchase_json", "Placed"));
-  assert_tests_print("selected 0 of 2 (2 cached)", "renaming the derived type re-ran a test:");
-  write("m.ply", status_source("Purchase", "purchase_json", "Created"));
-  assert_tests_print(
-    "selected 1 of 2 (1 cached)",
-    "renaming a variant must re-run its test and no other:",
-  )
-}
-
-test/nondet "importing the standard library into a program does not change the hash of definitions that do not use it" {
-  let plain = {
-    path: "m.ply",
-    text: "pub fn total(xs: List<Int>) -> Int = xs.fold(0, |a, x| a + x)\npub fn label(n: Int) -> String = \"n=\" ++ n.to_string()\n",
-  };
-  let user = {
-    path: "other.ply",
-    text: "import std.json\npub type A = { x: Int }\nderive json for A\n",
-  };
-  let a = hashes_of([plain]);
-  let b = hashes_of([plain, user]);
-  assert(
-    !a.contains("std.json"),
-    Some("a program importing nothing from `std` loaded a shipped module:\n" ++ a),
-  );
-  assert(b.contains("std.json"), Some(b));
-  ["total", "label"].fold((), |u: Unit, name: String|
-    assert(
-      hash_of(a, name) == hash_of(b, name),
-      Some("`" ++ name ++ "` imports nothing from `std`, so loading the stdlib may not move it"),
-    ))
 }

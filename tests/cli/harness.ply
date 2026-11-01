@@ -1,0 +1,382 @@
+import support.harness (Network, RunResult, Source, WorkingDirectory, agreeing, all_output, at,
+                        checking, environment, exists, items, joined, json_of, path, read, send,
+                        sources_here, stable_report, stage, str, working_directory, write,
+                        write_program)
+import std.env (env)
+import std.bytes
+import std.config (config)
+import std.fs
+import std.fs (fs)
+import std.json
+import std.json (Json, Null, Str, Object)
+import std.list
+import std.net
+import std.net (net)
+import std.os
+import std.os (os)
+import std.process (process, EnvironmentVariable, CompletedProcess, Exited, Signalled, Keep, Lines,
+                    Discard, LineWritten, Signal, Kill, Terminate)
+import std.time (time)
+import std.string
+import std.text (shell_join)
+
+pub fn kept_path(name: String) -> String = stage() ++ "/" ++ name
+
+pub fn embedded_sources(
+  files: List<{ name: String, bytes: Bytes }>,
+  dir: String,
+) -> List<Source> / {abort.raise} =
+  files.map(|f: { name: String, bytes: Bytes }|
+    { path: joined(dir, f.name), text: String::of_bytes(f.bytes) })
+
+fn cold_dir() -> String = ".cold"
+
+pub fn spawned_from_scratch(
+  argv: List<String>,
+) -> RunResult / {PlyProcess, WorkingDirectory, abort.raise} = {
+  let sources = sources_here();
+  if fs.exists[cwd](cold_dir()) && !fs.remove_tree[cwd](cold_dir()) {
+    panic("could not empty `" ++ cold_dir() ++ "`")
+  };
+  sources.fold((), |u: Unit, source: Source| write(joined(cold_dir(), source.path), source.text));
+  let own = {
+    name: "PLY_C_STAGE",
+    value: working_directory() ++ "/" ++ cold_dir() ++ "/" ++ stage(),
+  };
+  spawned_in(cold_dir(), argv, [own])
+}
+
+pub fn spawned_warm_agrees(what: String) -> Json / {PlyProcess, WorkingDirectory, abort.raise} = {
+  let warm = stable_report(json_of(spawned(checking())));
+  let cold = stable_report(json_of(spawned_from_scratch(checking())));
+  agreeing(what, warm, cold)
+}
+
+pub effect set PlyProcess = {config.get[env], process.read[ply], process.write[ply], fs.read[cwd]}
+
+pub effect set Clock = {time.read, time.write}
+
+fn ply_environment(
+  variables: List<EnvironmentVariable>,
+) -> List<EnvironmentVariable> / {config.get[env], fs.read[cwd], abort.raise} =
+  if variables.any(|v: EnvironmentVariable| v.name == "PLY_C_STAGE") { environment(variables) }
+  else {
+    environment(variables).push({
+      name: "PLY_C_STAGE",
+      value: working_directory() ++ "/" ++ stage(),
+    })
+  }
+
+fn launch_arguments(argv: List<String>) -> List<String> = ["--color", "never"].concat(argv)
+
+pub fn spawned(
+  argv: List<String>,
+  variables: List<EnvironmentVariable> = [],
+) -> RunResult / {PlyProcess, abort.raise} = spawned_in("", argv, variables)
+
+pub fn spawned_in(
+  dir: String,
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+) -> RunResult / {PlyProcess, abort.raise} =
+  completed_result(process.spawn[ply](launch_arguments(argv), dir, ply_environment(variables)))
+
+pub fn spawned_together(argvs: List<List<String>>) -> List<RunResult> / {PlyProcess, abort.raise} = {
+  let children = argvs.map(|argv: List<String>|
+    match process.start[ply](launch_arguments(argv), "", ply_environment([]), {
+        input: false,
+        out: Keep,
+        err: Keep,
+      }) {
+      Ok(child) -> child,
+      Err(reason) -> panic("`ply` did not start: " ++ reason),
+    });
+  children.map(|child: Int|
+    match process.wait[ply](child, -1) {
+      Some(f) -> completed_result(f),
+      None -> panic("a wait with no timeout came back with nothing"),
+    })
+}
+
+pub fn completed_result(f: CompletedProcess) -> RunResult =
+  {
+    out: lines_of(f.out),
+    err: lines_of(f.err),
+    code: match f.ended { Exited(c) -> c, Signalled(s) -> 128 + s },
+  }
+
+pub type Server = { process_id: Int, port: Int }
+
+pub fn reserve_port() -> Int / {Network, abort.raise} = {
+  let l = net.listen[ports](0);
+  let port = match net.local_port[ports](l) {
+    Some(p) -> p,
+    None -> panic("a listener asked for port 0 was given none"),
+  };
+  net.close[ports](l);
+  port
+}
+
+pub fn start_server(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+  port: Int,
+) -> Server / {PlyProcess, abort.raise} =
+  match process.start[ply](launch_arguments(argv), "", ply_environment(variables), {
+      input: false,
+      out: Keep,
+      err: Keep,
+    }) {
+    Ok(child) -> { process_id: child, port: port },
+    Err(reason) -> panic("`ply` did not start: " ++ reason),
+  }
+
+pub fn start_streaming(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+) -> Server / {PlyProcess, abort.raise} = start_line_output(argv, variables, false)
+
+fn start_line_output(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+  input: Bool,
+) -> Server / {PlyProcess, abort.raise} =
+  match process.start[ply](launch_arguments(argv), "", ply_environment(variables), {
+      input: input,
+      out: Lines,
+      err: Discard,
+    }) {
+    Ok(child) -> { process_id: child, port: 0 },
+    Err(reason) -> panic("`ply` did not start: " ++ reason),
+  }
+
+pub fn next_line(server: Server, ms: Int) -> Option<String> / {PlyProcess} =
+  match process.output_line[ply](server.process_id, ms) {
+    LineWritten(line) -> Some(line),
+    _ -> None,
+  }
+
+pub fn spawned_reading(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+  input: String,
+) -> RunResult / {PlyProcess, abort.raise} =
+  completed_result(spawned_fed(argv, variables, Bytes::of_string(input)))
+
+pub fn spawned_fed(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+  input: Bytes,
+) -> CompletedProcess / {PlyProcess, abort.raise} =
+  match process.start[ply](launch_arguments(argv), "", ply_environment(variables), {
+      input: true,
+      out: Keep,
+      err: Keep,
+    }) {
+    Err(reason) -> panic("`ply` did not start: " ++ reason),
+    Ok(child) -> {
+      let _ = process.input[ply](child, input);
+      process.end_input[ply](child);
+      match process.wait[ply](child, -1) {
+        Some(f) -> f,
+        None -> panic("a wait with no timeout came back with nothing"),
+      }
+    },
+  }
+
+pub effect set Shell = {config.get[env], process.read[sh], process.write[sh], os.read, fs.read[cwd]}
+
+pub fn this_ply() -> String / {os.executable, abort.raise} =
+  match os.executable() { Some(path) -> path, None -> panic("this `ply` has no path") }
+
+fn shell_ply(argv: List<String>) -> String / {abort.raise} =
+  match shell_join(launch_arguments(argv)) {
+    Some(words) -> "\"$PLY\" " ++ words,
+    None -> panic("an argument no shell word spells"),
+  }
+
+fn shell_environment() -> List<EnvironmentVariable> / {config.get[env], fs.read[cwd], os.executable, abort.raise} =
+  ply_environment([]).push({ name: "PLY", value: this_ply() })
+
+pub fn spawned_into(argv: List<String>, reader: String) -> CompletedProcess / {Shell, abort.raise} =
+  process.spawn[sh](
+    ["-c", "{ " ++ shell_ply(argv) ++ "; echo \"status $?\" >&2; } | " ++ reader],
+    "",
+    shell_environment(),
+  )
+
+pub fn at_terminal(argv: List<String>) -> Option<Int> / {Shell, abort.raise} =
+  if process.spawn[sh](["-c", "command -v script >/dev/null 2>&1"], "", environment([])).ended
+      != Exited(0) { None } else {
+    let inside = "stty rows 24 columns 80 echo icanon; " ++ shell_ply(argv)
+      ++ "; echo \"after: $(stty -a | tr '\\n\\t;' '   ') \"";
+    let made = match os.family() {
+      os::Linux -> "script -qec \"$INSIDE\" /dev/null",
+      _ -> "script -q /dev/null sh -c \"$INSIDE\"",
+    };
+    match process.start[sh](
+        ["-c", made],
+        "",
+        shell_environment().push({ name: "INSIDE", value: inside }),
+        { input: true, out: Lines, err: Discard },
+      ) {
+      Ok(child) -> Some(child),
+      Err(reason) -> panic("`script` did not start: " ++ reason),
+    }
+  }
+
+fn listen_timeout_ms() -> Int = 300000
+
+pub fn connected<| e>(
+  server: Server,
+  ready: (Int) -> Bool / e,
+) -> Result<Int, String> / {diverges, PlyProcess, Network, Clock | e} =
+  connect_when_ready(server, time.elapsed_ms() + listen_timeout_ms(), listen_timeout_ms(), ready)
+
+fn connect_when_ready<| e>(
+  server: Server,
+  until: Int,
+  ms: Int,
+  ready: (Int) -> Bool / e,
+) -> Result<Int, String> / {PlyProcess, Network, Clock, diverges | e} =
+  match process.wait[ply](server.process_id, 0) {
+    Some(f) -> Err("`ply run` exited before listening:\n" ++ all_output(completed_result(f))),
+    None -> {
+      let probe = match net.connect[client]("127.0.0.1", server.port, 250) {
+        Some(c) -> if ready(c) { Some(c) } else {
+          net.close[client](c);
+          None
+        },
+        None -> None,
+      };
+      match probe {
+        Some(c) -> Ok(c),
+        None -> if time.elapsed_ms() >= until {
+          Err(
+            "nothing listening on 127.0.0.1:" ++ server.port.to_string() ++ " after "
+              ++ ms.to_string()
+              ++ "ms",
+          )
+        } else {
+          time.sleep_ms(25);
+          connect_when_ready(server, until, ms, ready)
+        },
+      }
+    },
+  }
+
+pub fn connection(server: Server) -> Int / {PlyProcess, Network, Clock, abort.raise, diverges} =
+  match connected(server, |_c: Int| true) {
+    Ok(c) -> c,
+    Err(reason) -> {
+      stop(server);
+      panic(reason)
+    },
+  }
+
+pub fn dial(port: Int, ms: Int) -> Option<Int> / {Network} =
+  net.connect[client]("127.0.0.1", port, ms)
+
+pub fn read_until_closed(c: Int, ms: Int) -> String / {Network, diverges} = {
+  let response = net::drain[client](c, b"", ms);
+  net.close[client](c);
+  String::of_bytes_lossy(response)
+}
+
+pub fn exchange(c: Int, request: Bytes) -> String / {Network, abort.raise, diverges} = {
+  send(c, request);
+  read_until_closed(c, 10000)
+}
+
+pub fn hang_up(c: Int) -> Unit / {Network} = net.close[client](c)
+
+pub fn signal_to(server: Server, sig: Signal) -> Unit / {PlyProcess, abort.raise} =
+  if !process.signal[ply](server.process_id, sig) { panic("the server had already ended") }
+
+pub fn wait_for_exit(
+  server: Server,
+  ms: Int,
+  reason: String,
+) -> CompletedProcess / {PlyProcess, abort.raise} =
+  match process.wait[ply](server.process_id, ms) {
+    Some(f) -> f,
+    None -> {
+      let _ = process.signal[ply](server.process_id, Kill);
+      match process.wait[ply](server.process_id, -1) {
+        Some(f) -> panic(reason ++ "\n" ++ all_output(completed_result(f))),
+        None -> panic(reason),
+      }
+    },
+  }
+
+pub fn assert_returned_cleanly(server: Server) -> Unit / {PlyProcess, abort.raise} = {
+  let f = wait_for_exit(
+    server,
+    30000,
+    "the server was still running 30s after every connection it was asked for; `serve` should have returned",
+  );
+  match f.ended {
+    Exited(c) -> if c != 0 {
+      panic(
+        "the server exited " ++ c.to_string() ++ " after returning:\n"
+          ++ all_output(completed_result(f)),
+      )
+    },
+    Signalled(n) ->
+      panic(
+        "the server was killed by signal " ++ n.to_string() ++ ":\n"
+          ++ all_output(completed_result(f)),
+      ),
+  }
+}
+
+pub fn stop(server: Server) -> Unit / {PlyProcess} = {
+  let _ = process.signal[ply](server.process_id, Terminate);
+  match process.wait[ply](server.process_id, 5000) {
+    Some(_) -> (),
+    None -> {
+      let _ = process.signal[ply](server.process_id, Kill);
+      let _ = process.wait[ply](server.process_id, -1);
+      ()
+    },
+  }
+}
+
+pub fn lines_of(b: Bytes) -> List<String> = {
+  let all = String::of_bytes_lossy(b).split("\n");
+  let n = all.len();
+  match all.at(n - 1) {
+    Some("") ->
+      range(0, n - 1).fold([], |accumulator: List<String>, i: Int|
+        match all.at(i) { Some(l) -> accumulator.push(l), None -> accumulator }),
+    _ -> all,
+  }
+}
+
+pub fn failure_codes(report: Json) -> List<String> =
+  items(at(report, "failures")).map(|f: Json| str(path(f, ["diagnostic", "code"])))
+
+pub fn test_report(flags: List<String>) -> Json / {PlyProcess, abort.raise} =
+  json_of(spawned(["test", ".", "--json"].concat(flags)))
+
+pub fn succeeded(ran: RunResult) -> RunResult / {abort.raise} = {
+  assert(ran.code == 0, Some(all_output(ran)));
+  ran
+}
+
+pub fn outcome_of(o: Json) -> String = str(at(o, "outcome"))
+
+pub fn rules_of(o: Json, tag: String) -> List<Json> =
+  items(path(o, ["certificate", "rules"])).fold([], |accumulator: List<Json>, rule: Json|
+    match rule {
+      Str(named) -> if named == tag { accumulator.push(Null) } else { accumulator },
+      Object(fields) -> match fields.get(tag) {
+        Some(f) -> accumulator.push(f),
+        None -> accumulator,
+      },
+      _ -> accumulator,
+    })
+
+test "a stream's lines hold no empty line after the newline that ends the last" {
+  assert_eq(lines_of(b"one\ntwo\n"), ["one", "two"])
+}

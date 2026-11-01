@@ -1,0 +1,188 @@
+import harness (Hermetic, RunWithTree, Shipped, in_memory_faked, one_module_tree, passing_except,
+                tree, with_file)
+import support.harness (Source, all_output, at, dependency, items, json_of, json_text, manifest,
+                        nth, stdout, str)
+import std.fs (MemFs)
+import std.json
+import std.json (Json)
+import std.string
+import std.list
+
+fn ledger() -> String =
+  \\fn normal_sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 1 }
+  \\
+  \\fn balance(a: Int, b: Int, c: Int) -> Int = (a + b) + c
+  \\
+  \\fn presented(a: Int, b: Int, c: Int) -> Int = balance(a, b, c) * normal_sign(a)
+  \\
+  \\test "balance never goes negative" { assert_eq(presented(1, 2, 3), 6) }
+  \\
+
+fn failing() -> List<String> = ["m.balance never goes negative"]
+
+fn both_edits(s: String) -> String =
+  s.replace("if n < 0 { 0 - 1 } else { 1 }", "if n < 0 { 0 - 1 } else { 0 - 1 }").replace(
+    "(a + b) + c",
+    "a + (b + c)",
+  )
+
+fn green_run(t: MemFs) -> MemFs / {Hermetic, Shipped, abort.raise, diverges} = {
+  let r = in_memory_faked(t, ["test", "."], passing_except([]));
+  assert(r.ran.code == 0, Some(all_output(r.ran)));
+  r.tree
+}
+
+fn passed_then(
+  source: String,
+  edited: String,
+) -> MemFs / {Hermetic, Shipped, abort.raise, diverges} = {
+  assert(edited != source, Some("the edit did not apply"));
+  with_file(green_run(one_module_tree(source)), "m.ply", edited)
+}
+
+fn failed_report(t: MemFs) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
+  json_of(in_memory_faked(t, ["test", ".", "--json"], passing_except(failing())).ran)
+
+fn names(xs: Json) -> List<String> = items(xs).map(|x: Json| str(at(x, "name")))
+
+test "a failure after two edits names both and shows how each one's text changed" {
+  let t = passed_then(ledger(), both_edits(ledger()));
+  let r = in_memory_faked(t, ["test", "."], passing_except(failing()));
+  assert(r.ran.code == 1, Some(all_output(r.ran)));
+  let text = stdout(r.ran);
+  assert(
+    text.contains("changes: m.balance (edited), m.normal_sign (edited), m.presented (derived)"),
+    Some(text),
+  );
+  assert(text.contains("changed since the failing tests last passed:"), Some(text));
+  assert(text.contains("m.normal_sign (edited)   m.ply:1:1"), Some(text));
+  assert(
+    text.contains("-fn normal_sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 1 }"),
+    Some(text),
+  );
+  assert(
+    text.contains("+fn normal_sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 0 - 1 }"),
+    Some(text),
+  );
+  assert(text.contains("+fn balance(a: Int, b: Int, c: Int) -> Int = a + (b + c)"), Some(text));
+  let v = failed_report(r.tree);
+  let failure = nth(at(v, "failures"), 0);
+  assert(
+    names(at(failure, "changes")) == ["m.balance", "m.normal_sign", "m.presented"],
+    Some(json_text(failure)),
+  );
+  assert(names(at(v, "diffs")) == ["m.balance", "m.normal_sign"], Some(json_text(v)));
+  assert(
+    str(at(nth(at(v, "diffs"), 1), "diff"))
+      == "--- m.normal_sign\n+++ m.normal_sign\n@@ -1 +1 @@\n-fn normal_sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 1 }\n+fn normal_sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 0 - 1 }\n",
+    Some(json_text(v)),
+  )
+}
+
+test "an edited test is the first change, and its diff is shown with the rest" {
+  let v = failed_report(
+    passed_then(
+      ledger(),
+      ledger().replace("presented(1, 2, 3), 6", "presented(1, 2, 3), 7").replace(
+        "(a + b) + c",
+        "a + (b + c)",
+      ),
+    ),
+  );
+  let first = nth(at(nth(at(v, "failures"), 0), "changes"), 0);
+  assert(str(at(first, "name")) == "m.balance never goes negative", Some(json_text(first)));
+  assert(at(first, "test") == json::Bool(true), Some(json_text(first)));
+  assert(
+    names(at(v, "diffs")) == ["m.balance never goes negative", "m.balance"],
+    Some(json_text(v)),
+  );
+  assert(
+    str(at(nth(at(v, "diffs"), 0), "diff")).contains(
+      "+test \"balance never goes negative\" { assert_eq(presented(1, 2, 3), 7) }",
+    ),
+    Some(json_text(v)),
+  )
+}
+
+test "a source file listed before the changed one does not make a change report entry point at the wrong function" {
+  let green = green_run(
+    tree([
+      { path: "m.ply", text: ledger() },
+      {
+        path: "a.ply",
+        text: String::of_bytes_lossy(embed("../programs/changes/earlier_file.ply")),
+      },
+    ]),
+  );
+  let v = failed_report(with_file(green, "m.ply", both_edits(ledger())));
+  let diffs = items(at(v, "diffs"));
+  assert(names(at(v, "diffs")) == ["m.balance", "m.normal_sign"], Some(json_text(v)));
+  assert(
+    diffs.all(|d: Json| {
+      let name = str(at(d, "name")).replace("m.", "");
+      str(at(d, "diff")).contains("-fn " ++ name ++ "(")
+        && str(at(d, "diff")).contains("+fn " ++ name ++ "(")
+    }),
+    Some(json_text(v)),
+  )
+}
+
+test "a removed definition is shown as it was, and an added one as it is" {
+  let before = String::of_bytes_lossy(embed("../programs/changes/removed_and_added.ply"));
+  let v = json_of(
+    in_memory_faked(
+      passed_then(
+        before,
+        before.replace("fn spare() -> Int = 1", "fn bump() -> Int = 2").replace(
+          "= spare()",
+          "= bump()",
+        ),
+      ),
+      ["test", ".", "--json"],
+      passing_except(["m.total"]),
+    ).ran,
+  );
+  assert(names(at(v, "diffs")) == ["m.bump", "m.spare", "m.total"], Some(json_text(v)));
+  let diff = |i: Int| str(at(nth(at(v, "diffs"), i), "diff"));
+  assert(
+    diff(0).contains("\n+fn bump() -> Int = 2") && !diff(0).contains("\n-fn"),
+    Some(json_text(v)),
+  );
+  assert(
+    diff(1).contains("\n-fn spare() -> Int = 1") && !diff(1).contains("\n+fn"),
+    Some(json_text(v)),
+  );
+  assert(at(nth(at(v, "diffs"), 1), "location") == json::Null, Some(json_text(v)))
+}
+
+fn two_packages(factor: String) -> List<Source> =
+  [
+    { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
+    {
+      path: "app/main.ply",
+      text: "import lib.sums\n\nfn total() -> Int = sums::scaled(2)\n\ntest \"total doubles\" { assert_eq(total(), 4) }\n",
+    },
+    { path: "lib/ply.pkg", text: manifest("lib", "") },
+    { path: "lib/sums.ply", text: "pub fn scaled(n: Int) -> Int = n * " ++ factor ++ "\n" },
+  ]
+
+test "a failure through a path dependency names the dependency's edit and shows its diff" {
+  let first = in_memory_faked(tree(two_packages("2")), ["test", "app"], passing_except([]));
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  let r = in_memory_faked(
+    with_file(first.tree, "lib/sums.ply", "pub fn scaled(n: Int) -> Int = n * 3\n"),
+    ["test", "app", "--json"],
+    passing_except(["main.total doubles"]),
+  ).ran;
+  assert(r.code == 1, Some(all_output(r)));
+  let v = json_of(r);
+  let failure = nth(at(v, "failures"), 0);
+  assert(names(at(failure, "changes")).contains("lib.sums.scaled"), Some(json_text(v)));
+  assert(names(at(v, "diffs")) == ["lib.sums.scaled"], Some(json_text(v)));
+  assert(
+    str(at(nth(at(v, "diffs"), 0), "diff")).contains(
+      "-pub fn scaled(n: Int) -> Int = n * 2\n+pub fn scaled(n: Int) -> Int = n * 3\n",
+    ),
+    Some(json_text(v)),
+  )
+}

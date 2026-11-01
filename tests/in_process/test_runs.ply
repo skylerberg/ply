@@ -1,11 +1,78 @@
-import harness (on_disk_shipping, Shipped)
-import spawning.harness (spawned, Source, write_program, stdout, path)
+import harness (Hermetic, RunWithTree, Shipped, failed_assertion, in_memory, in_memory_faked,
+                one_module_tree, passing_except, returned_unit, tree, with_file)
+import support.harness (Source, all_output, at, bool, code_of, int, is_number, items, json_of,
+                        json_text, not_ok, nth, path, stderr, stdout, str)
 import compiler.unit (shipped)
+import std.fs (MemFs)
 import std.json
+import std.json (Json, Array, Null, Number)
+import std.machine as entering
 import std.string
 import std.list
 
 fn green() -> String = String::of_bytes_lossy(embed("../programs/test_runs/green.ply"))
+
+fn red() -> String =
+  \\fn balance() -> Int = 0 - 5
+  \\
+  \\fn main() -> Int = balance()
+  \\
+  \\test "balance never goes negative" { assert_eq(balance(), 0) }
+  \\
+  \\test "this one is fine" { assert_eq(1 + 1, 2) }
+  \\
+
+fn red_ends(name: String) -> entering::Termination =
+  if name == "m.balance never goes negative" {
+    failed_assertion("assertion failed: expected 0, found -5")
+  } else { returned_unit() }
+
+fn tested(
+  t: MemFs,
+  flags: List<String>,
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_faked(t, ["test", "."].concat(flags), passing_except([]))
+
+fn json_run(
+  t: MemFs,
+  flags: List<String>,
+) -> { report: Json, tree: MemFs } / {Hermetic, Shipped, abort.raise, diverges} = {
+  let r = tested(t, ["--json"].concat(flags));
+  { report: json_of(r.ran), tree: r.tree }
+}
+
+fn printed_after_edit(
+  t: MemFs,
+  edit: (MemFs) -> MemFs / {abort.raise},
+) -> String / {Hermetic, Shipped, abort.raise, diverges} = {
+  let first = tested(t, []);
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  stdout(tested(edit(first.tree), []).ran)
+}
+
+fn report_after_edit(
+  t: MemFs,
+  edit: (MemFs) -> MemFs / {abort.raise},
+) -> Json / {Hermetic, Shipped, abort.raise, diverges} = {
+  let first = tested(t, []);
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  json_run(edit(first.tree), []).report
+}
+
+fn number(j: Json) -> Float = match j { Number(d) -> Float::of_decimal(d), _ -> -1.0 }
+
+fn selected_test(v: Json, name: String) -> Json / {abort.raise} =
+  match items(path(v, ["selection", "tests"])).filter(|t: Json| str(at(t, "name")) == name) {
+    [t, ..] -> t,
+    [] -> panic("no selected test `" ++ name ++ "`: " ++ json_text(v)),
+  }
+
+fn escape() -> String / {abort.raise} = String::of_bytes(b"\x1b")
+
+fn reused(v: Json) -> Bool = bool(path(v, ["front_end", "reused"]))
+
+fn result_names(v: Json) -> List<String> =
+  items(at(v, "results")).map(|r: Json| str(at(r, "name"))).sort()
 
 fn rehashed_definitions(names: List<String>, to: String) -> List<Source> / {Shipped, abort.raise} =
   [
@@ -22,31 +89,736 @@ fn rehashed_definitions(names: List<String>, to: String) -> List<Source> / {Ship
     },
   ]
 
-test/nondet "a compiler change that leaves a test's code alone re-runs nothing" {
-  write_program(green());
-  assert(spawned(["test", "."]).code == 0, None);
-  let deciding = stdout(
-    on_disk_shipping(["test"], rehashed_definitions(["tests.run.selected"], "a")),
+test "a compiler change that leaves a test's code alone re-runs nothing" {
+  let first = tested(one_module_tree(green()), []);
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  let deciding = in_memory_faked(
+    first.tree,
+    ["test"],
+    passing_except([]),
+    rehashed_definitions(["tests.run.selected"], "a"),
   );
   assert(
-    deciding.contains("selected 0 of 2 (2 cached, 2 by code)"),
-    Some("a pass was not found by the code its test ran:\n" ++ deciding),
+    stdout(deciding.ran).contains("selected 0 of 2 (2 cached, 2 by code)"),
+    Some("a pass was not found by the code its test ran:\n" ++ stdout(deciding.ran)),
   );
-  let refiled = stdout(
-    on_disk_shipping(
-      ["test"],
-      rehashed_definitions(["tests.run.selected", "tests.concluded.run_job"], "a"),
-    ),
+  let refiled = in_memory_faked(
+    deciding.tree,
+    ["test"],
+    passing_except([]),
+    rehashed_definitions(["tests.run.selected", "tests.concluded.run_job"], "a"),
   );
-  assert(refiled.contains("selected 0 of 2 (2 cached)"), Some(refiled));
-  let running = stdout(
-    on_disk_shipping(
-      ["test"],
-      rehashed_definitions(["tests.run.selected", "tests.concluded.run_job"], "b"),
-    ),
+  assert(stdout(refiled.ran).contains("selected 0 of 2 (2 cached)"), Some(stdout(refiled.ran)));
+  let running = in_memory_faked(
+    refiled.tree,
+    ["test"],
+    passing_except([]),
+    rehashed_definitions(["tests.run.selected", "tests.concluded.run_job"], "b"),
   );
   assert(
-    running.contains("selected 2 of 2 (0 cached)"),
-    Some("a change to what runs a test re-ran nothing:\n" ++ running),
+    stdout(running.ran).contains("selected 2 of 2 (0 cached)"),
+    Some("a change to what runs a test re-ran nothing:\n" ++ stdout(running.ran)),
   )
+}
+
+test "a pass found by its test's code is reported as that" {
+  let first = tested(one_module_tree(green()), []);
+  let v = json_of(
+    in_memory_faked(
+      first.tree,
+      ["test", ".", "--json"],
+      passing_except([]),
+      rehashed_definitions(["tests.run.selected"], "a"),
+    ).ran,
+  );
+  assert(int(path(v, ["selection", "selected"])) == 0, Some(json_text(v)));
+  assert(int(path(v, ["selection", "same_code"])) == 2, Some(json_text(v)));
+  assert(str(at(selected_test(v, "double doubles"), "reason")) == "same_code", Some(json_text(v)))
+}
+
+test "a second run selects nothing because the cache is exact" {
+  let first = tested(one_module_tree(green()), []);
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  assert(stdout(first.ran).contains("selected 2 of 2"), Some(stdout(first.ran)));
+  let again = tested(first.tree, []);
+  assert(again.ran.code == 0, Some(all_output(again.ran)));
+  assert(stdout(again.ran).contains("selected 0 of 2 (2 cached)"), Some(stdout(again.ran)));
+  assert(stdout(again.ran).contains("0 failed, 0 passed, 2 cached"), Some(stdout(again.ran)))
+}
+
+test "a passing run's result is reused by the next run over the same files without compiling the program again" {
+  let first = json_run(one_module_tree(green()), []);
+  let reusing = json_run(first.tree, []);
+  assert(
+    !reused(first.report) && int(path(first.report, ["summary", "passed"])) == 2,
+    Some(json_text(first.report)),
+  );
+  assert(reused(reusing.report), Some(json_text(reusing.report)));
+  assert(int(path(reusing.report, ["summary", "cached"])) == 2, Some(json_text(reusing.report)));
+  assert(int(path(reusing.report, ["summary", "passed"])) == 0, Some(json_text(reusing.report)));
+  let narrowed = json_run(reusing.tree, ["--filter", "double"]);
+  assert(!reused(narrowed.report), None);
+  assert(
+    !reused(
+      json_run(with_file(narrowed.tree, "m.ply", green() ++ "\nfn later() -> Int = 3\n"), [
+      ]).report,
+    ),
+    None,
+  )
+}
+
+test "changing an embedded file recompiles the program, and only the tests that depend on that file run again" {
+  let first = json_run(
+    tree([
+      {
+        path: "m.ply",
+        text: "fn data() -> Bytes = embed(\"data.txt\")\n\npub fn other() -> Bytes = embed(\"other.txt\")\n\ntest \"data reads\" { assert(data().len() > 0) }\n",
+      },
+      { path: "data.txt", text: "one" },
+      { path: "other.txt", text: "one" },
+    ]),
+    [],
+  );
+  let unreached = json_run(with_file(first.tree, "other.txt", "two"), []);
+  assert(!reused(unreached.report), Some(json_text(unreached.report)));
+  assert(
+    int(path(unreached.report, ["selection", "selected"])) == 0,
+    Some(json_text(unreached.report)),
+  );
+  let settled = json_run(unreached.tree, []);
+  assert(reused(settled.report), None);
+  let reached = json_run(with_file(settled.tree, "data.txt", "two"), []).report;
+  assert(!reused(reached), Some(json_text(reached)));
+  assert(int(path(reached, ["selection", "selected"])) == 1, Some(json_text(reached)))
+}
+
+test "a cached result prints what the run it was cached from printed" {
+  let first = tested(one_module_tree(green()), []);
+  let cached = tested(first.tree, []);
+  let again = tested(cached.tree, []);
+  assert(again.ran.code == 0, Some(all_output(again.ran)));
+  assert(stdout(again.ran) == stdout(cached.ran), Some(all_output(again.ran)))
+}
+
+test "renaming a definition re-runs nothing" {
+  let text = printed_after_edit(
+    one_module_tree("fn width() -> Int = 3\ntest \"width is three\" { assert_eq(width(), 3) }\n"),
+    |t: MemFs|
+      with_file(
+        t,
+        "m.ply",
+        "fn breadth() -> Int = 3\ntest \"width is three\" { assert_eq(breadth(), 3) }\n",
+      ),
+  );
+  assert(text.contains("selected 0 of 1 (1 cached)"), Some("a rename rebuilt something:\n" ++ text))
+}
+
+test "attaching a spec to a definition re-runs nothing" {
+  let halves = "test \"four halves to two\" { assert_eq(half(4), 2) }\n";
+  let text = printed_after_edit(
+    one_module_tree("fn half(n: Int) -> Int = n / 2\n" ++ halves),
+    |t: MemFs|
+      with_file(
+        t,
+        "m.ply",
+        "fn half(n: Int) -> Int\n  requires n >= 0\n  ensures result <= n\n= n / 2\n" ++ halves,
+      ),
+  );
+  assert(text.contains("selected 0 of 1 (1 cached)"), Some("a spec moved a hash:\n" ++ text))
+}
+
+test "editing a function body re-runs exactly the tests that depend on it" {
+  let tests = "test \"a is one\" { assert_eq(a(), 1) }\ntest \"b is two\" { assert_eq(b(), 2) }\n";
+  let v = report_after_edit(
+    one_module_tree("fn a() -> Int = 1\nfn b() -> Int = 2\n" ++ tests),
+    |t: MemFs| with_file(t, "m.ply", "fn a() -> Int = [1].len()\nfn b() -> Int = 2\n" ++ tests),
+  );
+  assert(int(path(v, ["selection", "selected"])) == 1, Some(json_text(v)));
+  assert(int(path(v, ["selection", "cached"])) == 1, Some(json_text(v)));
+  assert(
+    items(at(v, "results")).map(|r: Json| str(at(r, "name"))) == ["a is one"],
+    Some(json_text(v)),
+  )
+}
+
+fn length_program(plus: String, millimetres: String) -> String =
+  \\type Length = | Metres(Int) | Millimetres(Int)
+  \\
+  \\key for Length by millimetres
+  \\
+  \\numeric for Length by { add: plus, sub: plus, mul: plus, neg: back, of_int: metres }
+  \\
+    ++ "\nfn millimetres(l: Length) -> Int = "
+    ++ millimetres
+    ++ "\n\nfn plus(a: Length, b: Length) -> Length = "
+    ++ plus
+    ++
+    \\
+    \\
+    \\fn back(a: Length) -> Length = a
+    \\
+    \\fn metres(n: Int) -> Length = Metres(n)
+    \\
+    \\fn lengths() -> List<Length> = [Metres(1), Millimetres(500)]
+    \\
+    \\fn total<a>(xs: List<a>) -> a
+    \\  where numeric(a)
+    \\= xs.fold(numeric_of_int(0), |s: a, x: a| s + x)
+    \\
+    \\fn same<a>(x: a, y: a) -> Bool
+    \\  where derivable(eq, a)
+    \\= x == y
+    \\
+    \\fn double(n: Int) -> Int = n + n
+    \\
+    \\test "the lengths have a total" { assert(same(total(lengths()), total(lengths()))) }
+    \\
+    \\test "a length is itself" { assert(same(lengths(), lengths())) }
+    \\
+    \\test "double doubles" { assert_eq(double(2), 4) }
+    \\
+
+fn stated() -> String =
+  length_program(
+    "Millimetres(millimetres(a) + millimetres(b))",
+    "match l { Metres(n) -> n * 1000, Millimetres(n) -> n }",
+  )
+
+test "editing a function named in a `numeric` declaration re-runs a test that uses it only through `+` in a generic helper" {
+  let v = report_after_edit(one_module_tree(stated()), |t: MemFs|
+    with_file(
+      t,
+      "m.ply",
+      length_program(
+        "Millimetres(millimetres(b) + millimetres(a))",
+        "match l { Metres(n) -> n * 1000, Millimetres(n) -> n }",
+      ),
+    ));
+  assert(result_names(v).contains("the lengths have a total"), Some(json_text(v)));
+  assert(!result_names(v).contains("double doubles"), Some(json_text(v)))
+}
+
+test "editing a function named in a `key` declaration re-runs a test that uses it only through `==` in a generic helper" {
+  let v = report_after_edit(one_module_tree(stated()), |t: MemFs|
+    with_file(
+      t,
+      "m.ply",
+      length_program(
+        "Millimetres(millimetres(a) + millimetres(b))",
+        "match l { Metres(n) -> n * 500 * 2, Millimetres(n) -> n }",
+      ),
+    ));
+  assert_eq(result_names(v), ["a length is itself", "the lengths have a total"]);
+  assert(int(path(v, ["selection", "cached"])) == 1, Some(json_text(v)))
+}
+
+test "a red test re-runs until it goes green" {
+  let failed = in_memory_faked(one_module_tree(red()), ["test", "."], red_ends);
+  assert(failed.ran.code == 1, Some(all_output(failed.ran)));
+  let again = in_memory_faked(failed.tree, ["test", "."], red_ends);
+  assert(again.ran.code == 1, Some(all_output(again.ran)));
+  assert(
+    stdout(again.ran).contains("selected 1 of 2 (1 cached)"),
+    Some("a failure was cached:\n" ++ stdout(again.ran)),
+  );
+  let mended = tested(again.tree, []);
+  assert(mended.ran.code == 0, Some(all_output(mended.ran)));
+  assert(stdout(mended.ran).contains("selected 1 of 2 (1 cached)"), Some(stdout(mended.ran)))
+}
+
+test "--no-cache runs everything and records nothing" {
+  let first = tested(one_module_tree(green()), []);
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  let uncached = tested(first.tree, ["--no-cache"]);
+  let text = stdout(uncached.ran);
+  assert(text.contains("selected 2 of 2 (0 cached)"), Some(text));
+  assert(text.contains("neither read nor recorded"), Some(text));
+  let after = stdout(tested(uncached.tree, []).ran);
+  assert(
+    after.contains("selected 0 of 2 (2 cached)"),
+    Some("--no-cache disturbed the real cache:\n" ++ after),
+  )
+}
+
+test "moving a definition between modules re-runs nothing" {
+  let text = printed_after_edit(
+    tree([
+      {
+        path: "app.ply",
+        text: "fn one() -> Int = 1\nfn two() -> Int = one() + one()\ntest \"two is two\" { assert_eq(two(), 2) }\n",
+      },
+    ]),
+    |t: MemFs|
+      with_file(
+        with_file(t, "lib.ply", "pub fn one() -> Int = 1\n"),
+        "app.ply",
+        "import lib\nfn two() -> Int = lib::one() + lib::one()\ntest \"two is two\" { assert_eq(two(), 2) }\n",
+      ),
+  );
+  assert(
+    text.contains("selected 0 of 1 (1 cached)"),
+    Some("moving a definition rebuilt something:\n" ++ text),
+  )
+}
+
+test "an edit re-runs the tests that depend on it even when modules are loaded in a different order than they import each other" {
+  let importer = |body: String|
+    "import b\nfn one() -> Int = " ++ body ++ "\ntest \"a one\" { assert_eq(one(), 1) }\n";
+  let first = json_run(
+    tree([
+      { path: "a.ply", text: importer("b::zero() + 1") },
+      {
+        path: "b.ply",
+        text: "pub fn zero() -> Int = 0\ntest \"b zero\" { assert_eq(zero(), 0) }\n",
+      },
+    ]),
+    [],
+  );
+  assert(int(path(first.report, ["summary", "passed"])) == 2, Some(json_text(first.report)));
+  let again = json_run(with_file(first.tree, "a.ply", importer("1 + b::zero()")), []).report;
+  assert(int(path(again, ["selection", "selected"])) == 1, Some(json_text(again)));
+  assert(
+    items(at(again, "results")).map(|r: Json| str(at(r, "key"))) == ["a.a one"],
+    Some("the wrong test was re-run: " ++ json_text(again)),
+  )
+}
+
+test "one edited test is the only one selected" {
+  let text = printed_after_edit(
+    tree(
+      [
+        { path: "leaf.ply", text: "pub fn one() -> Int = 1\n" },
+        {
+          path: "used.ply",
+          text: "import leaf\npub fn two() -> Int = leaf::one() + 1\ntest \"two is two\" { assert_eq(two(), 2) }\n",
+        },
+      ].concat(
+        range(0, 4).map(|i: Int| {
+          let n = i.to_string();
+          {
+            path: "far" ++ n ++ ".ply",
+            text: "fn f" ++ n ++ "() -> Int = " ++ n ++ "\ntest \"far " ++ n ++ "\" { assert_eq(f"
+              ++ n
+              ++ "(), "
+              ++ n
+              ++ ") }\n",
+          }
+        }),
+      ),
+    ),
+    |t: MemFs|
+      with_file(
+        t,
+        "used.ply",
+        "import leaf\npub fn two() -> Int = leaf::one() + 1 + 0\ntest \"two is two\" { assert_eq(two(), 2) }\n",
+      ),
+  );
+  assert(text.contains("selected 1 of 5"), Some("one test must be selected:\n" ++ text))
+}
+
+test "the front end reports where its time went" {
+  let first = tested(
+    one_module_tree("fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n"),
+    [],
+  );
+  let phases = path(json_run(first.tree, []).report, ["front_end", "phases"]);
+  let parts = ["read", "front", "write_back"];
+  parts.concat(["total"]).fold((), |u: Unit, name: String|
+    assert(
+      is_number(at(phases, name)),
+      Some("`" ++ name ++ "` is missing from " ++ json_text(phases)),
+    ));
+  assert(
+    number(at(phases, "total"))
+      == parts.fold(0.0, |sum: Float, name: String| sum + number(at(phases, name))),
+    Some("the total must account for the parts: " ++ json_text(phases)),
+  );
+  assert(
+    stdout(in_memory(first.tree, ["check", ".", "--explain"])).contains("front-end time"),
+    Some("--explain must show the breakdown"),
+  )
+}
+
+test "json output carries no ansi escapes" {
+  let r = in_memory_faked(
+    one_module_tree(red()),
+    ["test", ".", "--json", "--color", "always"],
+    red_ends,
+  );
+  assert(
+    !stdout(r.ran).contains(escape()),
+    Some("--json must stay machine-readable under --color always"),
+  );
+  let _ = json_of(r.ran);
+  ()
+}
+
+test "a pipe gets ascii marks and a terminal would get glyphs" {
+  let piped = tested(one_module_tree(green()), []).ran;
+  assert(
+    piped.out.filter(|l: String|
+        l.ascii_trim().starts_with("ok ") && l.contains("double doubles")).len(
+      )
+      > 0,
+    Some(stdout(piped)),
+  );
+  assert(!stdout(piped).contains("✓"), Some(stdout(piped)));
+  assert(!stdout(piped).contains(escape()), Some(stdout(piped)));
+  let forced = stdout(tested(one_module_tree(green()), ["--color", "always"]).ran);
+  assert(forced.contains("✓"), Some(forced));
+  assert(forced.contains(escape()), Some(forced))
+}
+
+test "`ply test --json` reports schema version 8 and, for each failure, a ranked list of the definitions that may have caused it" {
+  let r = in_memory_faked(one_module_tree(red()), ["test", ".", "--json"], red_ends).ran;
+  assert(r.code == 1, Some(all_output(r)));
+  let v = json_of(r);
+  assert(int(at(v, "schema_version")) == 8, Some(json_text(v)));
+  let f = nth(at(v, "failures"), 0);
+  assert(str(at(f, "key")) == "m.balance never goes negative", Some(json_text(f)));
+  assert(str(at(f, "name")) == "balance never goes negative", Some(json_text(f)));
+  assert(str(at(f, "module")) == "m", Some(json_text(f)));
+  assert(str(at(f, "status")) == "failed", Some(json_text(f)));
+  assert(at(f, "nondet") == json::Bool(false), Some(json_text(f)));
+  assert(str(at(f, "test_hash")).len() == 64, Some(json_text(f)));
+  assert(str(path(f, ["diagnostic", "code"])) == "E0501", Some(json_text(f)));
+  let suspect = nth(at(f, "changes"), 0);
+  assert(str(at(suspect, "name")) == "m.balance", Some(json_text(f)));
+  assert(at(suspect, "test") == json::Bool(false), Some(json_text(f)));
+  assert(str(at(suspect, "hash")).len() == 64, Some(json_text(f)));
+  assert(at(suspect, "change") == Null, Some("nothing compared the two eras: " ++ json_text(f)));
+  assert(at(v, "diffs") == Array([]), Some(json_text(v)));
+  assert(path(f, ["outside_effects", "declared"]) == Array([]), Some(json_text(f)));
+  assert(at(f, "internal_error") == json::Bool(false), Some(json_text(f)));
+  assert(at(f, "replay") == Null, Some(json_text(f)));
+  assert(at(f, "race") == Null, Some(json_text(f)))
+}
+
+test "a test that has never passed lists the definitions it depends on and does not claim that anything changed since an earlier run" {
+  let r = in_memory_faked(one_module_tree(red()), ["test", "."], red_ends).ran;
+  assert(r.code == 1, Some(all_output(r)));
+  let text = stdout(r);
+  assert(text.contains("balance never goes negative"), Some(text));
+  assert(text.contains("assertion failed"), Some(text));
+  assert(text.contains("changes: m.balance"), Some(text));
+  assert(
+    !text.contains("changed since"),
+    Some("nothing was compared, so no change may be shown:\n" ++ text),
+  )
+}
+
+test "two runs over the same failing test produce identical JSON failure reports" {
+  let first = in_memory_faked(one_module_tree(red()), ["test", ".", "--json"], red_ends);
+  let second = in_memory_faked(first.tree, ["test", ".", "--json"], red_ends);
+  assert(
+    json_text(at(json_of(first.ran), "failures")) == json_text(at(json_of(second.ran), "failures")),
+    None,
+  )
+}
+
+test "a module with no tests is a clean run that says so" {
+  let r = tested(one_module_tree("fn f() -> Int = 1\n"), []).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  assert(stdout(r).contains("selected 0 of 0 (0 cached)"), Some(stdout(r)));
+  assert(stdout(r).contains("no `test` items"), Some(stdout(r)))
+}
+
+test "a `test` that uses a `nondet` effect, instead of `test/nondet`, is a compile error" {
+  let r = tested(
+    one_module_tree(
+      "nondet effect wall {\n  read now() -> Int\n}\ntest \"reads the clock\" { assert(wall.now() > 0) }\n",
+    ),
+    ["--json"],
+  ).ran;
+  assert(r.code == 2, Some(all_output(r)));
+  assert(code_of(json_of(r)) == "E0412", Some(all_output(r)))
+}
+
+test "filter narrows both the run and the denominator" {
+  let r = tested(one_module_tree(green()), ["--filter", "zero"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  let text = stdout(r);
+  assert(text.contains("selected 1 of 1 (0 cached)"), Some(text));
+  assert(text.contains("--filter skipped 1 test"), Some(text));
+  assert(text.contains("double of zero is zero"), Some(text));
+  assert(!text.contains("double doubles"), Some("the filtered-out test still ran:\n" ++ text))
+}
+
+test "a filter matching nothing says so rather than claiming success quietly" {
+  let r = tested(one_module_tree(green()), ["--filter", "nonexistent"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  assert(stdout(r).contains("selected 0 of 0"), Some(stdout(r)));
+  assert(stdout(r).contains("no test key contains a `--filter` substring"), Some(stdout(r)))
+}
+
+test "`--jobs` and `-j` set the number of parallel workers, and the run reports that number" {
+  let r = tested(one_module_tree(green()), ["--jobs", "1"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  assert(stdout(r).contains("1 worker"), Some(stdout(r)));
+  let v = json_run(one_module_tree(green()), ["-j", "3"]).report;
+  assert(int(at(v, "workers")) == 3, Some(json_text(v)))
+}
+
+test "`--explain` prints why each test runs or is skipped, and for each group of tests that can run in parallel, the effects its tests use" {
+  let first = tested(one_module_tree(green()), []);
+  assert(first.ran.code == 0, Some(all_output(first.ran)));
+  let text = stdout(tested(first.tree, ["--explain"]).ran);
+  assert(text.contains("skip"), Some("cached tests must be shown as skipped:\n" ++ text));
+  assert(text.contains("cached"), Some(text));
+  assert(text.contains("this exact hash already passed"), Some(text));
+  assert(text.contains("concurrency groups") || text.contains("selected 0 of 2"), Some(text));
+  let cold = stdout(tested(one_module_tree(green()), ["--explain"]).ran);
+  assert(cold.contains("run "), Some(cold));
+  assert(cold.contains("concurrency groups"), Some(cold));
+  assert(cold.contains("group 0 ·"), Some(cold));
+  assert(cold.contains("· {}"), Some("the group's defining effects are missing:\n" ++ cold));
+  assert(cold.contains("isolation: isolated"), Some(cold));
+  assert(cold.contains("tests are isolated"), Some(cold))
+}
+
+test "a run reports how many tests are isolated, meaning no other test can interfere with them" {
+  let text = stdout(tested(one_module_tree(green()), []).ran);
+  assert(text.contains("2 of 2 tests are isolated"), Some(text));
+  let v = json_run(
+    one_module_tree(
+      \\nondet effect db {
+      \\  write put[t](v: Int) -> Unit
+      \\}
+      \\effect memo {
+      \\  write keep[t](v: Int) -> Unit
+      \\}
+      \\fn store(v: Int) -> Int / {db.write[users]} = { db.put[users](v); v }
+      \\fn kept(v: Int) -> Int / {memo.write[users]} = { memo.keep[users](v); v }
+      \\test/nondet "writes" { assert_eq(store(1), 1) }
+      \\test "keeps" { assert_eq(kept(1), 1) }
+      \\test "pure" { assert_eq(1, 1) }
+      \\
+    ),
+    [],
+  ).report;
+  assert(int(path(v, ["selection", "isolated"])) == 2, Some(json_text(v)));
+  assert(int(path(v, ["selection", "parallelism", "total"])) == 3, Some(json_text(v)));
+  assert(int(path(v, ["selection", "parallelism", "shared"])) == 1, Some(json_text(v)));
+  let writes = selected_test(v, "writes");
+  assert(str(at(writes, "isolation")) == "shared", Some(json_text(writes)));
+  assert(str(nth(at(writes, "shared_effects"), 0)) == "m.db.write[users]", Some(json_text(writes)));
+  ["keeps", "pure"].fold((), |u: Unit, name: String| {
+    let free = selected_test(v, name);
+    assert(str(at(free, "isolation")) == "isolated", Some(json_text(free)));
+    assert(items(at(free, "shared_effects")) == [], Some(json_text(free)))
+  })
+}
+
+fn selection_adds_up(v: Json) -> Bool = {
+  let s = at(v, "selection");
+  int(at(s, "isolated")) + int(at(s, "shared")) + int(at(s, "host")) == int(at(s, "total"))
+}
+
+test "a suite where no test uses the host prints no host line and reports zero host operations" {
+  let v = json_run(one_module_tree(green()), []).report;
+  assert(int(path(v, ["hosts", "operations"])) == 0, Some(json_text(v)));
+  assert(str(path(v, ["hosts", "digest"])).starts_with("b3:"), Some(json_text(v)));
+  assert(int(path(v, ["selection", "host"])) == 0, Some(json_text(v)));
+  assert(selection_adds_up(v), Some(json_text(v)));
+  items(path(v, ["selection", "tests"])).fold((), |u: Unit, t: Json| {
+    assert(at(t, "host") == json::Bool(false), Some(json_text(t)));
+    assert(str(at(t, "isolation")) != "host", Some(json_text(t)))
+  });
+  let text = stdout(tested(one_module_tree(green()), ["--no-cache"]).ran);
+  assert(!text.contains("binding host"), Some(text))
+}
+
+test "a test summary reports how many tests use real resources such as the file system" {
+  let program = tree([
+    {
+      path: "m.ply",
+      text:
+        \\import std.fs (fs)
+        \\
+        \\test/nondet "reads its data" { assert(fs.read_file[cwd]("data.txt") != None) }
+        \\
+        \\test "adds" { assert_eq(1 + 1, 2) }
+        \\
+    },
+    { path: "data.txt", text: "one" },
+  ]);
+  let v = json_run(program, ["--no-cache", "--fs", "cwd=."]).report;
+  assert(bool(at(v, "ok")), Some(json_text(v)));
+  assert(int(path(v, ["selection", "host"])) == 1, Some(json_text(v)));
+  assert(selection_adds_up(v), Some(json_text(v)));
+  let bound = tested(program, ["--no-cache", "--fs", "cwd=."]).ran;
+  assert(bound.code == 0, Some(all_output(bound)));
+  assert(stdout(bound).contains("1 of 2 tests use the host"), Some(stdout(bound)));
+  assert(
+    stdout(bound).contains("each result is cached with what the test read from the host"),
+    Some(stdout(bound)),
+  );
+  assert(stdout(bound).contains("host: 1 operation"), Some(stdout(bound)))
+}
+
+test "passing `--exec` and `--fs` changes neither each selected test's hash nor the total number of selected tests" {
+  let program = one_module_tree(green());
+  assert(
+    stdout(in_memory(program, ["hash", ".", "--json"]))
+      == stdout(in_memory(program, ["hash", ".", "--json"])),
+    None,
+  );
+  let bare = json_run(program, ["--no-cache"]).report;
+  let bound = json_run(program, ["--no-cache", "--exec", "echo=/bin/echo", "--fs", "cwd=."]).report;
+  let hashes = |v: Json| items(path(v, ["selection", "tests"])).map(|t: Json| at(t, "hash"));
+  assert(hashes(bare) == hashes(bound), None);
+  assert(path(bare, ["selection", "total"]) == path(bound, ["selection", "total"]), None)
+}
+
+test "`ply test --allow` with a name the program does not declare fails with exit code 2 and E0459" {
+  let r = tested(one_module_tree(green()), ["--json", "--allow", "machine"]).ran;
+  assert(r.code == 2, Some(all_output(r)));
+  assert(code_of(json_of(r)) == "E0459", Some(all_output(r)))
+}
+
+test "the test report lists the search options, so two runs can be compared" {
+  let sim = path(json_run(one_module_tree(green()), []).report, ["options", "sim"]);
+  assert(str(at(sim, "mode")) == "dpor", Some(json_text(sim)));
+  assert(int(at(sim, "seeds")) == 1, Some(json_text(sim)));
+  assert(at(sim, "seed") == Null, Some(json_text(sim)));
+  assert(at(sim, "measure_reduction") == json::Bool(false), Some(json_text(sim)));
+  assert(is_number(at(sim, "budget")), Some(json_text(sim)));
+  assert(is_number(at(sim, "steps")), Some(json_text(sim)));
+  let random = path(
+    json_run(one_module_tree(green()), ["--sim", "random", "--seeds", "8"]).report,
+    ["options", "sim"],
+  );
+  assert(str(at(random, "mode")) == "random", Some(json_text(random)));
+  assert(int(at(random, "seeds")) == 8, Some(json_text(random)));
+  assert(int(at(random, "budget")) == 1, Some(json_text(random)))
+}
+
+fn joined() -> String = String::of_bytes_lossy(embed("../programs/test_runs/joined.ply"))
+
+test "`--measure-reduction` reports that a search without clock pruning explores at least as many interleavings as the pruned search" {
+  let v = json_run(one_module_tree(joined()), ["--no-cache", "--measure-reduction"]).report;
+  assert(int(path(v, ["summary", "passed"])) == 1, Some(json_text(v)));
+  let search = at(nth(at(v, "results"), 0), "simulation");
+  let pruned = int(at(search, "explored"));
+  assert(pruned >= 0, Some("a pruned count: " ++ json_text(v)));
+  assert(path(search, ["blind", "bounded"]) == json::Bool(false), Some(json_text(v)));
+  let blind = int(path(search, ["blind", "explored"]));
+  assert(
+    blind >= pruned,
+    Some(
+      blind.to_string() ++ " interleavings without the clocks against " ++ pruned.to_string()
+        ++ " with them: "
+        ++ json_text(v),
+    ),
+  );
+  assert(int(path(search, ["naive", "explored"])) >= 0, Some(json_text(v)));
+  let text = stdout(tested(one_module_tree(joined()), ["--no-cache", "--measure-reduction"]).ran);
+  assert(text.contains(" · blind " ++ blind.to_string() ++ " · naive "), Some(text));
+  let unmeasured = at(
+    nth(at(json_run(one_module_tree(joined()), ["--no-cache"]).report, "results"), 0),
+    "simulation",
+  );
+  assert(
+    at(unmeasured, "blind") == Null && at(unmeasured, "naive") == Null,
+    Some(json_text(unmeasured)),
+  )
+}
+
+fn sleeping_task_program() -> String =
+  \\test "a sleeper costs no wall clock" {
+  \\  simulate {
+  \\    let t = task.spawn(|| { clock.sleep(Duration(30000000000)); clock.now() });
+  \\    assert_eq(task.join(t), Instant(30000000000))
+  \\  }
+  \\}
+  \\
+
+test "a test that passed random simulation with 8 seeds is cached when run again with 4 seeds" {
+  let wide = json_run(one_module_tree(sleeping_task_program()), [
+    "--sim",
+    "random",
+    "--seeds",
+    "8",
+  ]);
+  assert(int(path(wide.report, ["summary", "passed"])) == 1, Some(json_text(wide.report)));
+  assert(
+    int(path(wide.report, ["simulation", "simulated"])) == 1,
+    Some("the test searched: " ++ json_text(wide.report)),
+  );
+  let narrow = json_run(wide.tree, ["--sim", "random", "--seeds", "4"]).report;
+  assert(int(path(narrow, ["selection", "selected"])) == 0, Some(json_text(narrow)));
+  assert(
+    str(at(nth(path(narrow, ["selection", "tests"]), 0), "reason")) == "cached",
+    Some(json_text(narrow)),
+  );
+  assert(
+    int(path(narrow, ["simulation", "simulated"])) == 0,
+    Some("no root was searched again: " ++ json_text(narrow)),
+  )
+}
+
+test "`--seed-range 5..7` simulates exactly seeds 5 and 6, and a reversed range fails with exit code 2" {
+  let ranged = json_run(one_module_tree(sleeping_task_program()), [
+    "--sim",
+    "random",
+    "--seed-range",
+    "5..7",
+  ]);
+  let v = ranged.report;
+  assert(int(path(v, ["summary", "passed"])) == 1, Some(json_text(v)));
+  assert(items(path(v, ["options", "sim", "roots"])).map(int) == [5, 6], Some(json_text(v)));
+  assert(int(path(v, ["options", "sim", "seeds"])) == 2, Some(json_text(v)));
+  let one = json_run(ranged.tree, ["--sim", "random", "--seed-range", "6..7"]).report;
+  assert(
+    str(at(nth(path(one, ["selection", "tests"]), 0), "reason")) == "cached",
+    Some(json_text(one)),
+  );
+  assert(int(path(one, ["simulation", "simulated"])) == 0, Some(json_text(one)));
+  assert(tested(ranged.tree, ["--seed-range", "7..5"]).ran.code == 2, None)
+}
+
+test "`--seed` runs exactly one schedule, and the JSON report shows mode `once` with the seed value that was given" {
+  let r = tested(one_module_tree(green()), ["--json", "--seed", "7:3.0.2"]).ran;
+  assert(r.code == 0, Some(all_output(r)));
+  let sim = path(json_of(r), ["options", "sim"]);
+  assert(str(at(sim, "mode")) == "once", Some(json_text(sim)));
+  assert(str(at(sim, "seed")) == "7:3.0.2", Some(json_text(sim)));
+  assert(int(at(sim, "seeds")) == 1, Some(json_text(sim)))
+}
+
+test "`--seed` with a malformed value such as `7:` or `seven` fails with exit code 2 before any test runs" {
+  ["7:", "seven", "7.3", "0x", "1_000"].fold((), |u: Unit, bad: String| {
+    let r = tested(one_module_tree(green()), ["--seed", bad]).ran;
+    assert(r.code == 2, Some("`" ++ bad ++ "` should not parse"));
+    assert(stderr(r).contains("is not a seed"), Some(stderr(r)))
+  })
+}
+
+test "`--seed` combined with `--sim`, `--seeds` or `--sim-budget` exits with code 2, as does `--sim-budget` with `--sim random`" {
+  [["--sim", "dpor"], ["--seeds", "4"], ["--sim-budget", "4"]].fold(
+    (),
+    |u: Unit, widening: List<String>| {
+      let argv = ["--seed", "7"].concat(widening);
+      assert(
+        tested(one_module_tree(green()), argv).ran.code == 2,
+        Some(String::join(argv, " ") ++ " should conflict"),
+      )
+    },
+  );
+  let r = tested(one_module_tree(green()), ["--sim", "random", "--sim-budget", "4"]).ran;
+  assert(r.code == 2, Some(all_output(r)));
+  assert(stderr(r).contains("--sim-budget"), Some(stderr(r)))
+}
+
+test "passing `--sim-budget` to a program with no simulated tests selects no tests and runs no simulations" {
+  let first = json_run(one_module_tree(green()), []);
+  assert(int(path(first.report, ["summary", "passed"])) == 2, None);
+  let v = json_run(first.tree, ["--sim-budget", "1024"]).report;
+  assert(
+    int(path(v, ["selection", "selected"])) == 0,
+    Some("nothing here reads a seed: " ++ json_text(v)),
+  );
+  assert(int(path(v, ["options", "sim", "budget"])) == 1024, Some(json_text(v)));
+  assert(int(path(v, ["simulation", "simulated"])) == 0, Some(json_text(v)));
+  assert(int(path(v, ["simulation", "interleavings"])) == 0, Some(json_text(v)))
 }

@@ -1,10 +1,8 @@
-import harness (scratch, in_memory, one_module_tree, tree, on_disk, warm_matches_cold, Hermetic,
-                Shipped, std_tree, std_data, on_disk_shipping, on_disk_shipping_only, over_tree,
-                with_prelude_shipped)
-import spawning.harness (WorkingDirectory, PlyProcess, spawned_warm_agrees, Source, write_project,
-                         write_program, write, all_output, stdout, json_of, at, path, nth, items,
-                         first, str, int, bool, json_text, spawned, assert_ok, diagnostic_codes,
-                         value_of)
+import harness (scratch, in_memory, tree, on_disk, warm_matches_cold, Hermetic, Shipped,
+                on_disk_shipping, on_disk_shipping_only, with_prelude_shipped)
+import support.harness (Source, write_project, write_program, write, all_output, stdout, json_of,
+                        at, items, first, str, bool, json_text, assert_ok, diagnostic_codes)
+import support.projects (checkout, nested_shipped, program_calling_shipped, two_shipped)
 import compiler.syntax.expressions (prelude_module)
 import std.fs (MemFs)
 import std.json (Json)
@@ -22,18 +20,6 @@ fn named(list: Json, name: String) -> Option<Json> =
   match items(list).filter(|d: Json| str(at(d, "name")) == name) { [d, ..] -> Some(d), [] -> None }
 
 fn has_named(list: Json, name: String) -> Bool = named(list, name) != None
-
-fn hash_of(report: Json, name: String) -> String / {abort.raise} =
-  match named(at(report, "definitions"), name) {
-    Some(d) -> str(at(d, "hash")),
-    None -> panic("`" ++ name ++ "` is not in the program: " ++ json_text(report)),
-  }
-
-fn hashed(t: MemFs) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
-  json_of(in_memory(t, ["hash", "--json"]))
-
-fn tests_hashed(report: Json) -> List<String> =
-  items(at(report, "tests")).map(|t: Json| str(at(t, "hash")))
 
 test "a project module can import std.net and it checks" {
   let report = checked(app(importer()));
@@ -60,20 +46,20 @@ test "a project module can import std.net and it checks" {
   }
 }
 
-test/nondet "importing `std.bigint` checks and tests cleanly, whether or not the program uses its operators and comparisons" {
-  write_program(
-    "import std.bigint\n\nfn main() -> Int = 1\n\ntest \"one\" { assert_eq(main(), 1) }\n",
-  );
-  let checked = on_disk(["check"]);
-  assert(checked.code == 0, Some(all_output(checked)));
-  let r = spawned(["test", "."]);
-  assert(r.code == 0 && all_output(r).contains("1 passed"), Some(all_output(r)));
-  write(
-    "m.ply",
-    "import std.bigint (BigInt)\n\nfn same(a: BigInt, b: BigInt) -> Bool = a + b == b + a\n\nfn main() -> Int = 1\n",
-  );
-  let used = on_disk(["check"]);
-  assert(used.code == 0, Some(all_output(used)))
+test "importing `std.bigint` checks and tests cleanly, whether or not the program uses its operators and comparisons" {
+  scratch(|| {
+    write_program(
+      "import std.bigint\n\nfn main() -> Int = 1\n\ntest \"one\" { assert_eq(main(), 1) }\n",
+    );
+    let checked = on_disk(["check"]);
+    assert(checked.code == 0, Some(all_output(checked)));
+    write(
+      "m.ply",
+      "import std.bigint (BigInt)\n\nfn same(a: BigInt, b: BigInt) -> Bool = a + b == b + a\n\nfn main() -> Int = 1\n",
+    );
+    let used = on_disk(["check"]);
+    assert(used.code == 0, Some(all_output(used)))
+  })
 }
 
 test "`ply hosts` lists the standard library's handler under its qualified effect name, and not for a program's own `time` effect" {
@@ -110,61 +96,6 @@ test "`ply hosts` lists the standard library's handler under its qualified effec
   })
 }
 
-test "a project file under std collides with the built-in package" {
-  let report = checked(tree([{ path: "std/json.ply", text: "pub fn parse() -> Int = 1\n" }]));
-  let diagnostics = items(at(report, "diagnostics"));
-  assert(diagnostics.len() == 1, Some(json_text(report)));
-  let d = first(diagnostics);
-  assert(str(at(d, "code")) == "E0133", Some(json_text(d)));
-  assert(str(at(d, "message")).contains("std.json"), Some(json_text(d)));
-  assert(
-    items(at(d, "labels")) != [],
-    Some("E0133 must point at the file it is about: " ++ json_text(d)),
-  )
-}
-
-test "a project file named `std.ply` conflicts with the built-in `std` package, but `stdlib.ply` does not" {
-  let report = checked(tree([{ path: "std.ply", text: "pub fn f() -> Int = 1\n" }]));
-  assert(
-    str(at(first(items(at(report, "diagnostics"))), "code")) == "E0133",
-    Some(json_text(report)),
-  );
-  let ok = in_memory(tree([{ path: "stdlib.ply", text: "pub fn f() -> Int = 1\n" }]), ["check"]);
-  assert(ok.code == 0, Some("`stdlib` is an ordinary module name: " ++ all_output(ok)))
-}
-
-test "importing a standard library module that does not exist fails with E0106 and lists the modules that do exist" {
-  let report = checked(app("import std.nonesuch\nfn f() -> Int = 1\n"));
-  let d = first(items(at(report, "diagnostics")));
-  assert(str(at(d, "code")) == "E0106", Some(json_text(d)));
-  assert(json_text(d).contains("std.net"), Some(json_text(d)));
-  assert(
-    items(at(d, "labels")) != [],
-    Some("the diagnostic must point at the import: " ++ json_text(d)),
-  )
-}
-
-fn rendering(u: String) -> String =
-  "import std.uuid (Uuid, uuid_render)\npub fn shown(b: Bytes) -> String / {abort.raise} = {\n  let u"
-    ++ u
-    ++ " = { octets: b };\n  uuid_render(u)\n}\n"
-
-fn checked_spawned(text: String) -> Json / {PlyProcess, WorkingDirectory, abort.raise} = {
-  write_project([{ path: "app.ply", text: text }]);
-  json_of(spawned(["check", ".", "--json"]))
-}
-
-test/nondet "a record containing a `Uuid` field is rejected where a `Uuid` is expected, and only `std.uuid` can create a `Uuid`" {
-  let closed = first(items(at(checked_spawned(rendering(": Uuid")), "diagnostics")));
-  assert(str(at(closed, "code")) == "E0220", Some(json_text(closed)));
-  assert(json_text(closed).contains("uuid_of_octets"), Some(json_text(closed)));
-  let d = first(items(at(checked_spawned(rendering("")), "diagnostics")));
-  assert(str(at(d, "code")) == "E0201", Some(json_text(d)));
-  assert(json_text(d).contains("std.uuid.Uuid"), Some(json_text(d)));
-  let built = "import std.uuid (uuid_of_octets, uuid_render)\npub fn shown(b: Bytes) -> Option<String> / {abort.raise} =\n  match uuid_of_octets(b) { Some(u) -> Some(uuid_render(u)), None -> None }\n";
-  assert_eq(items(at(checked_spawned(built), "diagnostics")), [])
-}
-
 test "a program importing nothing from std lists only `std.prelude` among its modules, with a `<std>/` file like any standard library module" {
   let report = checked(app("fn f() -> Int = 1\n"));
   let modules = items(at(report, "modules"));
@@ -197,46 +128,10 @@ fn implicitly_shipped(given_modules: List<Source>) -> List<String> / {abort.rais
   modules_of(with_prelude_shipped(given_modules)).filter(|m: String| !own.contains(m))
 }
 
-fn in_any(name: String, modules: List<String>) -> Bool =
-  modules.any(|m: String| name.starts_with(m ++ "."))
-
-fn mention_count(
-  sources: List<Source>,
-  more: List<String>,
-  words: List<String>,
-) -> Int / {abort.raise} =
-  sources.map(|s: Source| s.text).concat(more).fold(0, |n: Int, text: String|
-    words.fold(n, |k: Int, word: String| k + text.split(word).len() - 1))
-
-test "definitions in a standard library module have the same hashes as the same definitions in a project module" {
-  scratch(|| {
-    let shipped_text = match two_shipped().filter(|s: Source| s.path == "std.kept.ply") {
-      [s, ..] -> s.text,
-      [] -> panic("`two_shipped` ships `std.kept`"),
-    };
-    let caller = |module: String|
-      "import " ++ module ++ " (one)\n\npub fn two() -> Int = one() + one()\n";
-    let hashes = |files: List<Source>| {
-      write_project(files);
-      json_of(on_disk_shipping_only(["hash", "--json"], two_shipped()))
-    };
-    let shipped = hashes([{ path: "app.ply", text: caller("std.kept") }]);
-    let copied = hashes([
-      { path: "mine.ply", text: shipped_text },
-      { path: "app.ply", text: caller("mine") },
-    ]);
-    assert(
-      hash_of(shipped, "std.kept.one") == hash_of(copied, "mine.one"),
-      Some("a shipped definition must hash like a project one"),
-    );
-    assert_eq(hash_of(shipped, "app.two"), hash_of(copied, "app.two"))
-  })
-}
-
 test "the cache records a standard library module under the name `<std>/kept.ply`, and `ply cache compact` does not remove it" {
   scratch(|| {
     write_program(program_calling_shipped());
-    assert_ok(on_disk_shipping_only(["test"], two_shipped()));
+    assert_ok(on_disk_shipping_only(["check"], two_shipped()));
     let recorded = ||
       items(
         at(
@@ -301,100 +196,6 @@ test "`ply check` loads only the standard library definitions a program calls, a
   })
 }
 
-test "renaming a project definition that calls a standard library definition does not change any hash" {
-  let hashed_with = |text: String|
-    over_tree(one_module_tree(text), ||
-      json_of(on_disk_shipping_only(["hash", "--json"], two_shipped()))).value;
-  let before = hashed_with(program_calling_shipped());
-  let after = hashed_with(program_calling_shipped().replace("held", "upheld"));
-  assert(
-    hash_of(before, "m.held") == hash_of(after, "m.upheld"),
-    Some("renaming a definition changed its hash"),
-  );
-  assert_eq(hash_of(before, "std.kept.one"), hash_of(after, "std.kept.one"));
-  assert(tests_hashed(before) == tests_hashed(after), Some("a test re-runs"))
-}
-
-fn two_shipped() -> List<Source> =
-  [
-    {
-      path: "std.idle.ply",
-      text:
-        \\//! A module no program here imports, and the file beside it.
-        \\
-        \\/// Twice `n`.
-        \\pub fn twice(n: Int) -> Int requires n > -100 && n < 100 ensures result == n + n = n * 2
-        \\
-        \\/// What the file beside this module holds.
-        \\pub fn words() -> Bytes = embed("idle/words.txt")
-        \\
-        \\test "twice two is four" { assert_eq(twice(2), 4) }
-        \\
-        \\test "the words are the file's" { assert_eq(words(), b"one\n") }
-        \\
-        \\law "twice is a sum" forall (n: Int) where n > 0 && n < 9 { twice(n) == n + n }
-        \\
-    },
-    { path: "std/idle/words.txt", text: "one\n" },
-    {
-      path: "std.kept.ply",
-      text:
-        \\//! A module the program imports.
-        \\
-        \\/// One.
-        \\pub fn one() -> Int = 1
-        \\
-        \\test "one is one" { assert_eq(one(), 1) }
-        \\
-        \\law "one is the least of them" forall (n: Int) where n > 0 && n < 9 { one() <= n }
-        \\
-    },
-  ]
-
-fn program_calling_shipped() -> String =
-  \\import std.kept
-  \\
-  \\pub fn held(n: Int) -> Int requires n < 100 ensures result == n + 1 = {
-  \\  let _ = kept::one();
-  \\  n + 1
-  \\}
-  \\
-  \\test "mine" { assert_eq(held(1), 2) }
-  \\
-
-fn toolchain_work() -> String =
-  "import std.pkg (Workspace)\n\nfn workspace() -> Workspace = {\n  packages: [],\n  suites: [],\n  fixtures: [],\n  toolchain: Some({\n    std: \"lib/std\",\n    std_tests: \"tests/std\",\n    compiler: \"lib/compiler\",\n    cli: \"cli\",\n    entry: \"ply.main\",\n    cli_tests: \"tests/cli\",\n    runtime: \"ply-runtime\",\n  }),\n}\n"
-
-fn library_path(name: String) -> String / {abort.raise} =
-  if name.ends_with(".ply") { name.slice(0, name.len() - 4).replace(".", "/") ++ ".ply" }
-  else { name }
-
-fn checkout(std: List<Source>) -> List<Source> / {abort.raise} =
-  [{ path: "ply.work", text: toolchain_work() }].concat(
-    with_prelude_shipped(std).map(|s: Source|
-      { path: "lib/" ++ library_path(s.path), text: s.text }),
-  )
-
-test/nondet "testing a project does not run standard library tests, but testing the standard library checkout runs all of them" {
-  write_project(
-    checkout(two_shipped()).push({ path: "app/m.ply", text: program_calling_shipped() }),
-  );
-  let v = json_of(spawned(["test", "app", "--json"]));
-  assert(int(path(v, ["selection", "total"])) == 1, Some(json_text(v)));
-  assert(int(path(v, ["selection", "filtered_out"])) == 0, Some(json_text(v)));
-  let all = json_of(spawned(["test", "lib/std", "--json"]));
-  assert(int(at(all, "exit_code")) == 0, Some(json_text(all)));
-  let keys = items(path(all, ["selection", "tests"])).map(|t: Json| str(at(t, "key")));
-  assert_eq(keys.filter(|k: String| !in_any(k, implicitly_shipped(two_shipped()))).sort(), [
-    "std.idle.the words are the file's",
-    "std.idle.twice two is four",
-    "std.kept.one is one",
-  ]);
-  let again = json_of(spawned(["test", "lib/std", "--json"]));
-  assert(int(path(again, ["selection", "cached"])) == keys.len(), Some(json_text(again)));
-  assert(int(path(again, ["selection", "same_code"])) == 0, Some(json_text(again)))
-}
-
 fn alike_shipped() -> List<Source> =
   [
     {
@@ -439,41 +240,6 @@ fn alike_shipped() -> List<Source> =
     },
   ]
 
-test "a program importing same-named records and a same-named effect and function from standard library modules builds, and its built program runs correctly" {
-  scratch(|| {
-    write_program(
-      \\import std.za
-      \\import std.zb
-      \\import std.zb (zb)
-      \\
-      \\fn roomy() -> zb::Limits = { output: 1, window: 2 }
-      \\
-      \\fn main() -> Int = {
-      \\  let got: Result<Int, Int> = try[zb.refused] { zb::read(1) };
-      \\  let read = match got { Ok(n) -> n, Err(_) -> -1 };
-      \\  zb::fb(roomy()) + za::fa({ output: 3, window: 4 }) + read * 100
-      \\}
-      \\
-    );
-    assert_ok(on_disk_shipping_only(["build", ".", "-o", "app.plyx"], alike_shipped()));
-    let ran = json_of(on_disk_shipping_only(["run", "app.plyx", "--json"], alike_shipped()));
-    assert(str(at(ran, "value")) == "209", Some(json_text(ran)))
-  })
-}
-
-test "`ply run` ignores a `main` function defined in a standard library module and runs the project's own `main`" {
-  scratch(|| {
-    write_program("import std.entered\n\nfn main() -> Int = 1\n");
-    let r = on_disk_shipping_only(["run", "--json"], [
-      {
-        path: "std.entered.ply",
-        text: "//! A module with a `main` of its own.\n\n/// Not the program's entry.\npub fn main() -> Int = 7\n",
-      },
-    ]);
-    assert_eq(value_of(r), "1")
-  })
-}
-
 test "`ply std` lists each standard library module and data file, `--show` prints one by path, and `--digest` changes when a data file changes" {
   scratch(|| {
     let ply_std = |argv: List<String>, shipped: List<Source>|
@@ -503,76 +269,25 @@ test "`ply std` lists each standard library module and data file, `--show` print
   })
 }
 
-fn nested_shipped() -> List<Source> =
-  [
-    {
-      path: "std.kept.deep.ply",
-      text:
-        \\//! A module beneath another.
-        \\
-        \\import std.kept (one)
-        \\
-        \\/// One more than the module above's one.
-        \\pub fn two() -> Int = one() + 1
-        \\
-        \\/// What the file beneath this module holds.
-        \\pub fn words() -> Bytes = embed("deep/words.txt")
-        \\
-        \\test "two is two" { assert_eq(two(), 2) }
-        \\
-    },
-    { path: "std/kept/deep/words.txt", text: "deep\n" },
-    {
-      path: "std.kept.ply",
-      text:
-        \\//! A module with another beneath it.
-        \\
-        \\/// One.
-        \\pub fn one() -> Int = 1
-        \\
-        \\/// What the file beside the module beneath this one holds.
-        \\pub fn list() -> Bytes = embed("kept/list.txt")
-        \\
-    },
-    { path: "std/kept/list.txt", text: "one\n" },
-  ]
-
-test/nondet "a standard library module nested under another module is listed in name order, documented and runnable" {
-  write_program(
-    \\import std.kept (list)
-    \\import std.kept.deep (two, words)
-    \\
-    \\test "both" {
-    \\  assert_eq(two(), 2);
-    \\  assert_eq(list(), b"one\n");
-    \\  assert_eq(words(), b"deep\n")
-    \\}
-    \\
-  );
-  let listed = items(
-    at(json_of(on_disk_shipping_only(["std", "--json"], nested_shipped())), "modules"),
-  );
-  assert_eq(
-    listed.map(|m: Json| str(at(m, "module"))),
-    modules_of(with_prelude_shipped(nested_shipped())),
-  );
-  let given_modules = listed.filter(|m: Json|
-    !implicitly_shipped(nested_shipped()).contains(str(at(m, "module"))));
-  assert_eq(given_modules.map(|m: Json| items(at(m, "data")).map(|d: Json| str(at(d, "name")))), [
-    ["std/kept/list.txt"],
-    ["std/kept/deep/words.txt"],
-  ]);
-  let doc = on_disk_shipping_only(["doc", "std.kept.deep.two"], nested_shipped());
-  assert(doc.code == 0 && all_output(doc).contains("One more than"), Some(all_output(doc)));
-  let ran = json_of(on_disk_shipping_only(["test", "--json"], nested_shipped()));
-  assert(int(at(ran, "exit_code")) == 0, Some(json_text(ran)));
-  write_project(checkout(nested_shipped()));
-  let library = json_of(spawned(["test", "lib/std", "--json"]));
-  assert(int(at(library, "exit_code")) == 0, Some(json_text(library)));
-  let keys = items(path(library, ["selection", "tests"])).map(|t: Json| str(at(t, "key")));
-  assert_eq(keys.filter(|k: String| !in_any(k, implicitly_shipped(nested_shipped()))), [
-    "std.kept.deep.two is two",
-  ])
+test "a module beneath another ships under its place: listed in name order, and documented" {
+  scratch(|| {
+    let listed = items(
+      at(json_of(on_disk_shipping_only(["std", "--json"], nested_shipped())), "modules"),
+    );
+    assert_eq(
+      listed.map(|m: Json| str(at(m, "module"))),
+      modules_of(with_prelude_shipped(nested_shipped())),
+    );
+    let given_modules = listed.filter(|m: Json|
+      !implicitly_shipped(nested_shipped()).contains(str(at(m, "module"))));
+    assert_eq(
+      given_modules.map(|m: Json| items(at(m, "data")).map(|d: Json| str(at(d, "name")))),
+      [["std/kept/list.txt"], ["std/kept/deep/words.txt"]],
+    );
+    write_program("import std.kept.deep (two)\n\nfn main() -> Int = two()\n");
+    let doc = on_disk_shipping_only(["doc", "std.kept.deep.two"], nested_shipped());
+    assert(doc.code == 0 && all_output(doc).contains("One more than"), Some(all_output(doc)))
+  })
 }
 
 test "`ply doc` documents a nested standard library module such as `std.hash.legacy`, and a function that module exports" {
@@ -612,41 +327,17 @@ test "programs that use different functions of one standard library module share
   })
 }
 
-test/nondet "`ply prove` on a project skips the standard library's claims and laws, and `ply prove` on the standard library checkout proves all of them" {
-  write_project(
-    checkout(two_shipped()).push({ path: "app/m.ply", text: program_calling_shipped() }),
-  );
-  let mine = json_of(spawned(["prove", "app", "--json"]));
-  let all = json_of(spawned(["prove", "lib/std", "--json"]));
-  assert(int(at(mine, "exit_code")) == 0, Some(json_text(mine)));
-  assert(int(at(all, "exit_code")) == 0, Some(json_text(all)));
-  let owed = |v: Json, module: String|
-    items(at(v, "obligations")).filter(|o: Json|
-      str(at(o, "owner")).starts_with(module ++ ".")).len(
-    );
-  assert(owed(mine, "m") == 1 && owed(mine, "std") == 0, Some(json_text(mine)));
-  assert(owed(all, "m") == 0 && owed(all, "std.kept") == 1, Some(json_text(all)));
-  assert(owed(all, "std.idle") == 2, Some(json_text(all)));
-  assert(int(path(mine, ["coverage", "definitions"])) == 1, Some(json_text(mine)));
-  let coverage = at(all, "coverage");
-  let uncovered = items(at(coverage, "uncovered")).map(str);
-  assert_eq(uncovered.filter(|n: String| !in_any(n, implicitly_shipped(two_shipped()))), [
-    "std.idle.words",
-  ]);
-  write_project(checkout([]));
-  let alone = json_of(spawned(["prove", "lib/std", "--json"]));
-  assert(
-    int(at(coverage, "definitions")) == 3 + int(path(alone, ["coverage", "definitions"])),
-    Some(json_text(coverage) ++ "\n" ++ json_text(at(alone, "coverage"))),
-  )
-}
-
 test "`ply check` on a project reports no standard library warnings or definitions, but on the standard library checkout it reports all of them" {
   scratch(|| {
     let shipped = two_shipped().map(|s: Source|
       if s.path == "std.kept.ply" { { ..s, text: s.text ++ "\nfn stray(n: Int) -> Int = n\n" } }
       else { s });
-    write_project(checkout(shipped).push({ path: "app/m.ply", text: program_calling_shipped() }));
+    write_project(
+      checkout(with_prelude_shipped(shipped)).push({
+        path: "app/m.ply",
+        text: program_calling_shipped(),
+      }),
+    );
     let stray = |v: Json|
       items(at(v, "diagnostics")).filter(|d: Json|
         str(at(d, "code")) == "W0611" && str(at(d, "message")).contains("std.kept.stray")).len(
@@ -676,156 +367,6 @@ test "`ply check` on a project reports no standard library warnings or definitio
   })
 }
 
-fn proved_shipped() -> List<Source> =
-  [
-    {
-      path: "std.counted.ply",
-      text:
-        \\//! A module no program here imports.
-        \\
-        \\/// How many elements `xs` holds.
-        \\pub fn count(xs: List<Int>) -> Int ensures result >= 0 = xs.len()
-        \\
-        \\law "nothing counts as none" { count([]) == 0 }
-        \\
-    },
-    {
-      path: "std.kept.ply",
-      text:
-        \\//! A module the program imports.
-        \\
-        \\/// One.
-        \\pub fn one() -> Int = 1
-        \\
-        \\law "one is the least of them" forall (n: Int) where n > 0 && n < 9 { one() <= n }
-        \\
-    },
-  ]
-
-test/nondet "a second `ply prove` of the whole standard library takes every proof result from the cache, and a filtered `ply prove` does too" {
-  write_project(checkout(proved_shipped()));
-  let first = json_of(spawned(["prove", "lib/std", "--json"]));
-  let claims = int(path(first, ["summary", "obligations"]));
-  let imported = items(at(first, "obligations")).filter(|o: Json|
-    in_any(str(at(o, "owner")), implicitly_shipped(proved_shipped()))).len(
-  );
-  let stated = |sources: List<Source>| mention_count(sources, [], ["ensures ", "law \""]);
-  assert(
-    imported > 0 && claims == stated(proved_shipped()) + imported && int(at(first, "cached")) == 0,
-    Some(json_text(first)),
-  );
-  assert(int(path(first, ["summary", "proved"])) == claims, Some(json_text(first)));
-  let again = json_of(spawned(["prove", "lib/std", "--json"]));
-  assert(int(at(again, "cached")) == claims, Some(json_text(again)));
-  assert(items(at(again, "warnings")).len() == 0, Some(json_text(again)));
-  let share = json_of(spawned(["prove", "lib/std", "--json", "--filter", "std.counted."]));
-  let shared = stated(proved_shipped().filter(|s: Source| s.path == "std.counted.ply"));
-  assert(
-    int(path(share, ["summary", "obligations"])) == shared && int(at(share, "cached")) == shared,
-    Some(json_text(share)),
-  )
-}
-
-fn slugged(prefix: String) -> String =
-  "import std.kept\n\npub fn slug(s: String) -> String = String::concat(\"" ++ prefix
-    ++ "\", s)\n\npub fn hits(p: String) -> Bool = p == \"/items/bolt\" && kept::one() == 1\n\ntest \"the slug is an item's\" { assert_eq(hits(slug(\"bolt\")), true) }\n"
-
-test "a shipped definition the project never touched is not listed as a change" {
-  scratch(|| {
-    write_program(slugged("/items/"));
-    let first_run = on_disk_shipping_only(["test"], two_shipped());
-    assert(first_run.code == 0, Some(all_output(first_run)));
-    write("m.ply", slugged("/goods/"));
-    let v = json_of(on_disk_shipping_only(["test", "--json"], two_shipped()));
-    let failure = nth(at(v, "failures"), 0);
-    let suspects = items(at(failure, "changes")).map(|s: Json| str(at(s, "name")));
-    assert(suspects != [], Some("the edit has to be attributed to something: " ++ json_text(v)));
-    let shipped = suspects.filter(|n: String| n.starts_with("std."));
-    assert(
-      shipped == [],
-      Some(
-        "nothing under `std` moved, so nothing under `std` is a change: "
-          ++ String::join(shipped, ", "),
-      ),
-    );
-    assert(str(at(nth(at(failure, "changes"), 0), "name")) == "m.slug", Some(json_text(v)));
-    assert(
-      items(at(v, "diffs")).map(|d: Json| str(at(d, "name"))) == ["m.slug"],
-      Some(json_text(v)),
-    )
-  })
-}
-
-fn naming() -> String = String::of_bytes_lossy(embed("../programs/stdlib/naming.ply"))
-
-fn oid_names() -> Source / {abort.raise} =
-  match std_data().filter(|d: { name: String, bytes: Bytes }| d.name == "std/oid/names.txt") {
-    [d, ..] -> { path: d.name, text: String::of_bytes(d.bytes) },
-    [] -> panic("the standard library's tree holds no `oid/names.txt`"),
-  }
-
-test/nondet "a `ply` of its own reads the data file a shipped module embeds" {
-  write_program(naming());
-  assert_eq(value_of(spawned(["run", ".", "--json"], [])), "10");
-  let shown = spawned(["std", "--show", "std/oid/names.txt"], []);
-  assert(shown.code == 0 && stdout(shown) == oid_names().text, Some(all_output(shown)))
-}
-
-test/nondet "`ply check` gives the same result with a cache from an earlier run as without one, for a program using a standard library data file" {
-  write_project([{ path: "app.ply", text: naming() }]);
-  let _ = spawned_warm_agrees("cold");
-  let warm = spawned_warm_agrees("warm");
-  assert(has_named(at(warm, "definitions"), "std.oid.registry"), Some(json_text(warm)))
-}
-
-test "editing a standard library data file changes the hash of exactly the definitions that depend on it" {
-  let renamed = {
-    path: oid_names().path,
-    text: oid_names().text.replace("2.5.4.3 commonName", "2.5.4.3 cn"),
-  };
-  assert(renamed.text != oid_names().text, Some("the edit landed"));
-  let hashes = |shipped: List<Source>|
-    over_tree(app(naming()), || json_of(on_disk_shipping(["hash", "--json"], shipped))).value;
-  let before = hashes([]);
-  let after = hashes([renamed]);
-  ["std.oid.registry", "std.oid.name", "app.named", "app.main"].fold((), |u: Unit, name: String|
-    assert(hash_of(before, name) != hash_of(after, name), Some(name)));
-  ["std.oid.common_name", "std.oid.arcs", "app.plain"].fold((), |u: Unit, name: String|
-    assert(hash_of(before, name) == hash_of(after, name), Some(name)));
-  assert(tests_hashed(before) != tests_hashed(after), Some("the test that reads a name reruns"));
-  assert_eq(hashes([oid_names()]), before)
-}
-
-test "copying a shipped module and its data file into a project produces identical hashes" {
-  let source = match std_tree().filter(|f: { name: String, bytes: Bytes }| f.name == "oid.ply") {
-    [f, ..] -> String::of_bytes(f.bytes),
-    [] -> panic("the standard library's tree holds no `oid.ply`"),
-  };
-  let shipped = hashed(app(naming()));
-  let copied = hashed(
-    tree([
-      { path: "mine.ply", text: source },
-      { path: "oid/names.txt", text: oid_names().text },
-      { path: "app.ply", text: naming().replace("import std.oid", "import mine as oid") },
-    ]),
-  );
-  ["registry", "name", "common_name"].fold((), |u: Unit, name: String|
-    assert_eq(hash_of(shipped, "std.oid." ++ name), hash_of(copied, "mine." ++ name)));
-  assert_eq(hash_of(shipped, "app.named"), hash_of(copied, "app.named"))
-}
-
-test "a program that uses nothing from a standard library module's data file has no definition whose hash changes when the file is edited" {
-  let idle = "import std.oid\n\npub fn plain() -> Int = oid::arcs(oid::common_name()).len()\n";
-  let report = checked(app(idle));
-  assert(bool(at(report, "ok")), Some(json_text(report)));
-  assert(has_named(at(report, "definitions"), "std.oid.common_name"), Some(json_text(report)));
-  ["std.oid.registry", "std.oid.name", "std.oid.of_name"].fold((), |u: Unit, name: String|
-    assert(!has_named(at(report, "definitions"), name), Some(name)));
-  let hashes = |shipped: List<Source>|
-    over_tree(app(idle), || json_of(on_disk_shipping(["hash", "--json"], shipped))).value;
-  assert_eq(hashes([{ path: oid_names().path, text: "2.5.4.3 cn\n" }]), hashes([]))
-}
-
 fn words() -> Source =
   {
     path: "std.words.ply",
@@ -845,8 +386,6 @@ fn words() -> Source =
       \\
   }
 
-fn word_list(text: String) -> Source = { path: "std/words/list.txt", text: text }
-
 fn counting() -> String =
   \\import std.words
   \\
@@ -856,40 +395,6 @@ fn counting() -> String =
   \\  assert_eq(words::table(), words::computed())
   \\}
   \\
-
-test "a standard library module's `const fn` over its data file is evaluated the first time the file is read" {
-  let shipped = [words(), word_list("one\ntwo\nthree\n")];
-  scratch(|| {
-    write_program(counting());
-    assert_ok(on_disk_shipping(["check"], shipped));
-    assert_eq(value_of(on_disk_shipping(["run", "--json"], shipped)), "3");
-    let tested = json_of(on_disk_shipping(["test", "--json", "--no-cache"], shipped));
-    assert(int(path(tested, ["summary", "passed"])) == 1, Some(json_text(tested)))
-  });
-  scratch(|| {
-    write_program(counting());
-    let longer = on_disk_shipping(["run", "--json"], [
-      words(),
-      word_list("one\ntwo\nthree\nfour\n"),
-    ]);
-    assert_eq(value_of(longer), "4")
-  })
-}
-
-test "a program run with a cached standard library module builds its word table from the data file's current contents, not the cached ones" {
-  scratch(|| {
-    write_program(counting());
-    let ran = |list: String| on_disk_shipping(["run", "--json"], [words(), word_list(list)]);
-    assert_eq(value_of(ran("one\ntwo\nthree\n")), "3");
-    assert_eq(value_of(ran("one\ntwo\n")), "2");
-    let broken = ran("one\ntwo words\n");
-    assert(
-      broken.code == 1 && all_output(broken).contains("`two words` is two words"),
-      Some(all_output(broken)),
-    );
-    assert_eq(value_of(ran("one\ntwo\nthree\n")), "3")
-  })
-}
 
 test "a data file missing from the standard library is rejected as an error in the module that requests it" {
   scratch(|| {

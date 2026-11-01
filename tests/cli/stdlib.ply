@@ -1,4 +1,7 @@
-import spawning.harness (write_program, all_output, spawned, assert_ok, value_of)
+import harness (spawned)
+import support.harness (Source, write_program, write_project, all_output, stdout, assert_ok,
+                        value_of, json_of, at, path, items, str, int, json_text)
+import support.projects (checkout, nested_shipped, program_calling_shipped, two_shipped)
 import std.json (Json)
 import std.list
 import std.string
@@ -12,5 +15,157 @@ test/nondet "a program runs what a shipped module embedded, from the binary and 
   let tested = spawned(["test", "."]);
   assert(tested.code == 0 && all_output(tested).contains("1 passed"), Some(all_output(tested)));
   assert_ok(spawned(["build", ".", "-o", "m.plyx"]));
-  assert_eq(value_of(spawned(["run", "--json", "m.plyx"])), "10")
+  assert_eq(value_of(spawned(["run", "--json", "m.plyx"])), "10");
+  let shown = spawned(["std", "--show", "std/oid/names.txt"], []);
+  assert(
+    shown.code == 0 && stdout(shown) == String::of_bytes(embed("../../packages/std/oid/names.txt")),
+    Some(all_output(shown)),
+  )
+}
+
+test/nondet "a shipped module whose type states a key and its arithmetic runs where nothing of it is used" {
+  write_program(
+    "import std.bigint\n\nfn main() -> Int = 1\n\ntest \"one\" { assert_eq(main(), 1) }\n",
+  );
+  let r = spawned(["test", "."]);
+  assert(r.code == 0 && all_output(r).contains("1 passed"), Some(all_output(r)))
+}
+
+fn with_prelude(std: List<Source>) -> List<Source> =
+  std.push({
+    path: "std.prelude.ply",
+    text: String::of_bytes_lossy(embed("../../packages/std/prelude.ply")),
+  })
+
+fn is_prelude(name: String) -> Bool = name.starts_with("std.prelude.")
+
+fn mention_count(sources: List<Source>, words: List<String>) -> Int / {abort.raise} =
+  sources.fold(0, |n: Int, s: Source|
+    words.fold(n, |k: Int, word: String| k + s.text.split(word).len() - 1))
+
+test/nondet "testing a project does not run standard library tests, but testing the standard library checkout runs all of them" {
+  write_project(
+    checkout(with_prelude(two_shipped())).push({
+      path: "app/m.ply",
+      text: program_calling_shipped(),
+    }),
+  );
+  let v = json_of(spawned(["test", "app", "--json"]));
+  assert(int(path(v, ["selection", "total"])) == 1, Some(json_text(v)));
+  assert(int(path(v, ["selection", "filtered_out"])) == 0, Some(json_text(v)));
+  let all = json_of(spawned(["test", "lib/std", "--json"]));
+  assert(int(at(all, "exit_code")) == 0, Some(json_text(all)));
+  let keys = items(path(all, ["selection", "tests"])).map(|t: Json| str(at(t, "key")));
+  assert_eq(keys.filter(|k: String| !is_prelude(k)).sort(), [
+    "std.idle.the words are the file's",
+    "std.idle.twice two is four",
+    "std.kept.one is one",
+  ]);
+  let again = json_of(spawned(["test", "lib/std", "--json"]));
+  assert(int(path(again, ["selection", "cached"])) == keys.len(), Some(json_text(again)));
+  assert(int(path(again, ["selection", "same_code"])) == 0, Some(json_text(again)))
+}
+
+test/nondet "a module beneath another runs from its place, and the library's checkout runs its test" {
+  write_project(
+    checkout(with_prelude(nested_shipped())).push({
+      path: "app/m.ply",
+      text:
+        \\import std.kept (list)
+        \\import std.kept.deep (two, words)
+        \\
+        \\test "both" {
+        \\  assert_eq(two(), 2);
+        \\  assert_eq(list(), b"one\n");
+        \\  assert_eq(words(), b"deep\n")
+        \\}
+        \\
+    }),
+  );
+  let ran = json_of(spawned(["test", "app", "--json"]));
+  assert(int(at(ran, "exit_code")) == 0, Some(json_text(ran)));
+  let library = json_of(spawned(["test", "lib/std", "--json"]));
+  assert(int(at(library, "exit_code")) == 0, Some(json_text(library)));
+  let keys = items(path(library, ["selection", "tests"])).map(|t: Json| str(at(t, "key")));
+  assert_eq(keys.filter(|k: String| !is_prelude(k)), ["std.kept.deep.two is two"])
+}
+
+test/nondet "`ply prove` on a project skips the standard library's claims and laws, and `ply prove` on the standard library checkout proves all of them" {
+  write_project(
+    checkout(with_prelude(two_shipped())).push({
+      path: "app/m.ply",
+      text: program_calling_shipped(),
+    }),
+  );
+  let mine = json_of(spawned(["prove", "app", "--json"]));
+  let all = json_of(spawned(["prove", "lib/std", "--json"]));
+  assert(int(at(mine, "exit_code")) == 0, Some(json_text(mine)));
+  assert(int(at(all, "exit_code")) == 0, Some(json_text(all)));
+  let owed = |v: Json, module: String|
+    items(at(v, "obligations")).filter(|o: Json|
+      str(at(o, "owner")).starts_with(module ++ ".")).len(
+    );
+  assert(owed(mine, "m") == 1 && owed(mine, "std") == 0, Some(json_text(mine)));
+  assert(owed(all, "m") == 0 && owed(all, "std.kept") == 1, Some(json_text(all)));
+  assert(owed(all, "std.idle") == 2, Some(json_text(all)));
+  assert(int(path(mine, ["coverage", "definitions"])) == 1, Some(json_text(mine)));
+  let coverage = at(all, "coverage");
+  let uncovered = items(at(coverage, "uncovered")).map(str);
+  assert_eq(uncovered.filter(|n: String| !is_prelude(n)), ["std.idle.words"]);
+  write_project(checkout(with_prelude([])));
+  let alone = json_of(spawned(["prove", "lib/std", "--json"]));
+  assert(
+    int(at(coverage, "definitions")) == 3 + int(path(alone, ["coverage", "definitions"])),
+    Some(json_text(coverage) ++ "\n" ++ json_text(at(alone, "coverage"))),
+  )
+}
+
+fn proved_shipped() -> List<Source> =
+  [
+    {
+      path: "std.counted.ply",
+      text:
+        \\//! A module no program here imports.
+        \\
+        \\/// How many elements `xs` holds.
+        \\pub fn count(xs: List<Int>) -> Int ensures result >= 0 = xs.len()
+        \\
+        \\law "nothing counts as none" { count([]) == 0 }
+        \\
+    },
+    {
+      path: "std.kept.ply",
+      text:
+        \\//! A module the program imports.
+        \\
+        \\/// One.
+        \\pub fn one() -> Int = 1
+        \\
+        \\law "one is the least of them" forall (n: Int) where n > 0 && n < 9 { one() <= n }
+        \\
+    },
+  ]
+
+test/nondet "a second `ply prove` of the whole standard library takes every proof result from the cache, and a filtered `ply prove` does too" {
+  write_project(checkout(with_prelude(proved_shipped())));
+  let first = json_of(spawned(["prove", "lib/std", "--json"]));
+  let claims = int(path(first, ["summary", "obligations"]));
+  let imported = items(at(first, "obligations")).filter(|o: Json|
+    is_prelude(str(at(o, "owner")))).len(
+  );
+  let stated = |sources: List<Source>| mention_count(sources, ["ensures ", "law \""]);
+  assert(
+    imported > 0 && claims == stated(proved_shipped()) + imported && int(at(first, "cached")) == 0,
+    Some(json_text(first)),
+  );
+  assert(int(path(first, ["summary", "proved"])) == claims, Some(json_text(first)));
+  let again = json_of(spawned(["prove", "lib/std", "--json"]));
+  assert(int(at(again, "cached")) == claims, Some(json_text(again)));
+  assert(items(at(again, "warnings")).len() == 0, Some(json_text(again)));
+  let share = json_of(spawned(["prove", "lib/std", "--json", "--filter", "std.counted."]));
+  let shared = stated(proved_shipped().filter(|s: Source| s.path == "std.counted.ply"));
+  assert(
+    int(path(share, ["summary", "obligations"])) == shared && int(at(share, "cached")) == shared,
+    Some(json_text(share)),
+  )
 }

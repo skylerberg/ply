@@ -1,104 +1,13 @@
-import spawning.harness (PlyProcess, RunResult, Server, write_project, write_program, write, read,
-                         spawned, start_server, wait_for_exit, completed_result, all_output, stderr,
-                         json_of, at, path, str, bool, json_text, WorkingDirectory, assert_ok,
-                         dependency, manifest, value_of)
-import std.fs (fs, listed_names)
-import std.json (Null, Array, Str)
+import harness (PlyProcess, Server, completed_result, spawned, start_server, wait_for_exit)
+import support.harness (RunResult, assert_ok, reused, stderr, value_of, write_program)
 import std.string
 import std.list
 
-fn run_at(path: String, args: List<String>) -> RunResult / {PlyProcess, abort.raise} =
-  spawned(["run", path].concat(args))
-
-fn run(args: List<String>) -> RunResult / {PlyProcess, abort.raise} = run_at(".", args)
+fn run(args: List<String>) -> RunResult / {PlyProcess, abort.raise} =
+  spawned(["run", "."].concat(args))
 
 fn explained(args: List<String>) -> RunResult / {PlyProcess, abort.raise} =
   run(["--json", "--explain"].concat(args))
-
-fn explained_at(path: String) -> RunResult / {PlyProcess, abort.raise} =
-  run_at(path, ["--json", "--explain"])
-
-fn reused(ran: RunResult) -> Bool / {abort.raise} = {
-  let report = json_of(ran);
-  if at(report, "front_end") == Null {
-    panic("`--explain` said nothing about the load:\n" ++ all_output(ran))
-  } else { bool(path(report, ["front_end", "reused"])) }
-}
-
-test/nondet "a second run of an unchanged package reuses the cached result of the first run" {
-  write_program("fn main() -> Int = 42\n");
-  let first = explained([]);
-  assert(!reused(first), Some("a first run has nothing to reuse"));
-  let second = explained([]);
-  assert(reused(second), Some(all_output(second)));
-  assert_eq(value_of(first), "42");
-  assert_eq(value_of(second), "42")
-}
-
-test/nondet "a run that reuses the cached checked program prints the same JSON as the first run that built it" {
-  write_program("fn main() -> Int = 42\n");
-  let built = run(["--json"]);
-  let again = run(["--json"]);
-  assert(reused(explained([])), None);
-  assert_eq(built, again);
-  let document = json_of(again);
-  assert(
-    at(document, "files") == Array([Str("m.ply"), Str("<std>/prelude.ply")]),
-    Some(json_text(document)),
-  );
-  assert(str(at(document, "value")) == "42", Some(json_text(document)));
-  assert(at(document, "front_end") == Null, Some(json_text(document)))
-}
-
-test/nondet "a panic in a run that reuses the cached checked program reports the same source location as the first run" {
-  write_program(
-    "fn boom() -> Int / {abort.raise} = panic(\"boom\")\n\nfn main() -> Int / {abort.raise} = boom() + 1\n",
-  );
-  let built = run([]);
-  let again = explained([]);
-  assert(reused(again), None);
-  let after = run([]);
-  assert(built.code == 1, Some(stderr(built)));
-  assert(stderr(built).contains("raised at m.ply:1:"), Some(stderr(built)));
-  assert_eq(built, after)
-}
-
-fn append_to(p: String, text: String) -> Unit / {WorkingDirectory, abort.raise} =
-  match read(p) { Some(body) -> write(p, body ++ text), None -> panic("`" ++ p ++ "` reads") }
-
-test/nondet "editing a module or a dependency runs the front end again, but an edit that changes no result does not" {
-  write_project([
-    { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
-    { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
-    { path: "lib/ply.pkg", text: manifest("lib", dependency("base", "../base")) },
-    {
-      path: "lib/answer.ply",
-      text: "import base.deep\npub fn answer() -> Int = deep::deep() + 35\n",
-    },
-    { path: "base/ply.pkg", text: manifest("base", "") },
-    { path: "base/deep.ply", text: "pub fn deep() -> Int = 7\n" },
-  ]);
-  let app = |expect_reused: Bool, value_is: String| {
-    let out = explained_at("app");
-    assert(reused(out) == expect_reused, Some(all_output(out)));
-    assert_eq(value_of(out), value_is)
-  };
-  app(false, "42");
-  app(true, "42");
-  write("base/deep.ply", "pub fn deep() -> Int = 8\n");
-  app(false, "43");
-  app(true, "43");
-  append_to("lib/answer.ply", "\npub fn unused() -> Int = 0\n");
-  app(false, "43");
-  app(true, "43");
-  append_to("lib/ply.pkg", "// edited\n");
-  app(true, "43");
-  append_to("app/ply.pkg", "// edited\n");
-  app(true, "43");
-  write("app/main.ply", "import lib.answer\nfn main() -> Int = answer::answer() * 2\n");
-  app(false, "86");
-  app(true, "86")
-}
 
 fn schemas() -> String = String::of_bytes_lossy(embed("../programs/reuse/schemas.ply"))
 
@@ -119,35 +28,6 @@ test/nondet "a run with a different config schema does not reuse the cached resu
   assert(stderr(absent).contains("E0440"), Some(stderr(absent)))
 }
 
-test/nondet "a run that reuses the cached checked program still applies `--allow` and fails with E0459 like an uncached run" {
-  write_program("fn main() -> Int = 42\n");
-  assert_ok(run([]));
-  let hit = explained(["--allow", "machine"]);
-  assert(reused(hit), None);
-  write_program("fn main() -> Int = 42\n");
-  let miss = run(["--json", "--allow", "machine"]);
-  assert(miss.code == 2, Some(all_output(miss)));
-  assert_eq(hit.code, miss.code);
-  let rejection = |ran: RunResult| json_text(at(json_of(ran), "diagnostics"));
-  assert(rejection(miss).contains("E0459"), Some(rejection(miss)));
-  assert(
-    rejection(hit) == rejection(miss),
-    Some(
-      "the reused load was rejected otherwise:\n" ++ rejection(hit) ++ "\n---\n" ++ rejection(miss),
-    ),
-  )
-}
-
-test/nondet "running a single file caches and reuses its result the same way running a package does" {
-  write_program("fn main() -> Int = 42\n");
-  let first = explained_at("m.ply");
-  assert_ok(first);
-  assert(!reused(first), None);
-  let second = explained_at("m.ply");
-  assert(reused(second), None);
-  assert_eq(value_of(second), "42")
-}
-
 test/nondet "two runs of one package at once both run it" {
   write_program("fn main() -> Int = 42\n");
   let one = start_server(["run", ".", "--json"], [], 0);
@@ -157,34 +37,4 @@ test/nondet "two runs of one package at once both run it" {
     assert_eq(value_of(out), "42")
   });
   assert(reused(explained([])), None)
-}
-
-test/nondet "a cached result that cannot be read is rebuilt and the cache entry is overwritten" {
-  write_program("fn main() -> Int = 42\n");
-  let first = explained([]);
-  assert(!reused(first), Some(all_output(first)));
-  let key = str(path(json_of(first), ["front_end", "key"]));
-  let cut = |to: Int|
-    List::fold(
-      match listed_names(fs.list_dir[cwd](".ply-cache/memo")) { Some(names) -> names, None -> [] },
-      0,
-      |n: Int, name: String|
-        if !name.starts_with("seg-") { n } else {
-          let entry = ".ply-cache/memo/" ++ name;
-          let whole = match fs.read_file[cwd](entry) { Some(b) -> b, None -> b"" };
-          if !fs.write_file[cwd](entry, whole.slice(0, min(to, whole.len()))) {
-            panic("a segment is torn")
-          };
-          n + 1
-        },
-    );
-  if cut(9) == 0 { panic("the run cached its result in no segment") };
-  let torn = explained([]);
-  assert(!reused(torn), Some(all_output(torn)));
-  assert_eq(value_of(torn), "42");
-  let after = explained([]);
-  assert(reused(after), Some(all_output(after)));
-  assert_eq(str(path(json_of(after), ["front_end", "key"])), key);
-  cut(0);
-  assert(!reused(explained([])), None)
 }

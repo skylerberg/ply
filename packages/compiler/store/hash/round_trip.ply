@@ -1,13 +1,17 @@
 import compiler.syntax.items (Item, TypeItem, SumBody, VariantDefinition, parse)
-import compiler.check.resolve.tables (Source)
+import compiler.syntax.expressions (prelude_module)
+import compiler.check.resolve.tables (Source, Diagnostic)
+import compiler.front.diagnostics (parse_all)
+import compiler.front.published (analyse)
+import compiler.front.emitter_input (Analysed, Rejected)
 import std.value
 import std.value (Value, VCtor, VList, VRecord, Field, reflect)
 import std.list
 import std.option
 import std.bytes
 import std.string
-import compiler.store.hash (index_sources, hash_index, checked_body)
-import compiler.store.hash.forms (HashOutput, by_name)
+import compiler.store.hash (index_sources, hash_index, checked_body, body_key)
+import compiler.store.hash.forms (HashOutput, ClosureEntry, build_closure, by_name)
 import compiler.store.hash.printer (Printed, Unprintable, print_bodies, stored_forms)
 import compiler.store.hash.stored (Stored)
 
@@ -125,6 +129,101 @@ test "printing every definition and test of the example programs and hashing the
     ),
   );
   assert_eq(p.reprinted.tests.values().sort(), p.out.tests.values().sort())
+}
+
+fn codes_of(diagnostics: List<Diagnostic>) -> String =
+  String::of_bytes_lossy(
+    Bytes::join(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), b", "),
+  )
+
+fn checked_again(
+  sources: List<Source>,
+) -> { before: Map<Bytes, Bytes>, after: Map<Bytes, Bytes> } / {abort.raise} =
+  match analyse(parse_all(sources)) {
+    Rejected(diagnostics) -> panic("the program failed to check: " ++ codes_of(diagnostics)),
+    Analysed(w) -> {
+      let named = w.hashes.definitions.concat(w.hashes.declarations);
+      match print_bodies(
+          w.hashes.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
+          named.map(|x: { name: Bytes, hash: Bytes }| { name: x.name, hash: x.hash, public: true }),
+          [],
+          [prelude_module()],
+        ) {
+        Unprintable(reason) -> panic(String::of_bytes(reason.message)),
+        Printed(ms) -> {
+          let printed = ms.map(|m: { module: Bytes, text: Bytes }|
+            { name: m.module, source_text: m.text });
+          match analyse(parse_all(printed)) {
+            Rejected(diagnostics) ->
+              panic(
+                "the printed program checks: " ++ codes_of(diagnostics) ++ "\n"
+                  ++ String::of_bytes_lossy(
+                    Bytes::join(printed.map(|s: Source| s.source_text), b"\n"),
+                  ),
+              ),
+            Analysed(again) ->
+              {
+                before: by_name(named),
+                after: by_name(again.hashes.definitions.concat(again.hashes.declarations)),
+              },
+          }
+        },
+      }
+    },
+  }
+
+test "a program in forms its print takes care over checks again, each definition under its own hash" {
+  let p = checked_again([
+    { name: b"alternatives", source_text: embed("examples/alternatives.txt") },
+    { name: b"promises", source_text: embed("examples/promises.txt") },
+    { name: b"scopes", source_text: embed("examples/scopes.txt") },
+    { name: b"lib.shapes", source_text: embed("examples/shapes.txt") },
+    { name: b"app", source_text: embed("examples/shapes_app.txt") },
+  ]);
+  assert(p.before.len() > 0);
+  assert_eq(p.after, p.before)
+}
+
+test "a closure that reaches an effect and not the function of its name prints as a program that checks" {
+  let sources = [
+    {
+      name: b"zb",
+      source_text: b"pub effect zb {\n  raise refused(at: Int)\n}\n\nfn written(x: Int) -> Int = x * 31 + 7\n\npub fn zb(x: Int) -> Int = written(x)\n\npub fn read(x: Int) -> Int / {zb.refused} = if x < 0 { zb.refused(x) } else { x + 1 }\n",
+    },
+    {
+      name: b"app",
+      source_text: b"import zb\nimport zb (zb)\n\npub fn main() -> Int = match try[zb.refused] { zb::read(1) } { Ok(n) -> n, Err(_) -> 0 }\n",
+    },
+  ];
+  match analyse(parse_all(sources)) {
+    Rejected(diagnostics) -> panic("the program failed to check: " ++ codes_of(diagnostics)),
+    Analysed(w) -> {
+      let closure = build_closure(w.hashes, [b"app.main"]);
+      assert(!closure.any(|x: ClosureEntry| x.name == b"zb.written"));
+      let reached = closure.map(|x: ClosureEntry| x.hash);
+      match print_bodies(
+          w.hashes.bodies.filter(|b: { name: Bytes, body: Bytes }|
+            match body_key(b.body) { Some(key) -> reached.contains(key), None -> false }).map(
+            |b: { name: Bytes, body: Bytes }| b.body,
+          ),
+          closure.map(|x: ClosureEntry| { name: x.name, hash: x.hash, public: true }),
+          [],
+          [prelude_module()],
+          closure.map(|x: ClosureEntry|
+            { name: x.name, hash: x.hash, names: x.refs.map(|i: Int| closure.get(i).name) }),
+        ) {
+        Unprintable(reason) -> panic(String::of_bytes(reason.message)),
+        Printed(ms) -> match analyse(
+            parse_all(
+              ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, source_text: m.text }),
+            ),
+          ) {
+          Rejected(diagnostics) -> panic("the printed closure checks: " ++ codes_of(diagnostics)),
+          Analysed(_) -> (),
+        },
+      }
+    },
+  }
 }
 
 test "the example programs produce every kind of stored definition that can be printed as text" {

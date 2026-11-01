@@ -1,30 +1,17 @@
-import harness (scratch, loads_here, on_disk, warm_matches_cold, module_reuse, module_reuse_at,
-                in_memory, tree, CliEffects, Shipped, cache_entry)
-import spawning.harness (spawned, Server, write_project, write, read, start_server, wait_for_exit,
-                         completed_result, all_output, stderr, json_of, at, path, items, first, str,
-                         int, bool, json_text, sources_here, stable_report, WorkingDirectory,
-                         diagnostic_codes, manifest, own_modules)
+import harness (scratch, on_disk, on_disk_faked, passing_except, returned, warm_matches_cold,
+                module_reuse, module_reuse_at, in_memory, tree, CliEffects, Shipped, cache_entry)
+import support.harness (RunResult, assert_ok, dependency, write_project, write, read, all_output,
+                        stderr, stdout, json_of, at, path, items, first, str, int, bool, json_text,
+                        sources_here, stable_report, WorkingDirectory, diagnostic_codes, manifest,
+                        own_modules)
+import support.projects (edit, leaf, packaged_project)
 import std.bytes
 import std.fs (fs, listed_names)
 import std.json (Json)
 import std.string
+import std.value (VBool)
 import std.map
 import std.list
-
-fn edit(name: String, from: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
-  match read(name) {
-    None -> panic("`" ++ name ++ "` reads"),
-    Some(text) -> {
-      assert(
-        text.contains(from),
-        Some("`" ++ from ++ "` is not in " ++ name ++ "; the fixture drifted"),
-      );
-      write(name, text.replace(from, to))
-    },
-  }
-
-fn remove_file(name: String) -> Unit / {fs.remove[cwd], abort.raise} =
-  assert(fs.remove[cwd](name), Some("`" ++ name ++ "` is removed"))
 
 fn core() -> String = String::of_bytes_lossy(embed("../programs/incremental/core.ply"))
 
@@ -42,8 +29,6 @@ fn shop_module_source() -> String =
   \\  assert_eq(total([core::Book("b", 3), core::Note("n")]), 3)
   \\}
   \\
-
-fn leaf() -> String = "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
 
 fn shop_project() -> Unit / {WorkingDirectory, abort.raise} =
   write_project([
@@ -73,65 +58,64 @@ test "a second check reuses every module's cached result, and after an edit it c
   })
 }
 
-fn query_runs() -> Map<String, Int> / {CliEffects, Shipped, abort.raise, diverges} =
-  query_runs_at(".")
+fn reuse_of(front: Json) -> { taken: Int, ran: Int, modules: Int } =
+  items(at(front, "queries")).fold(
+    { taken: 0, ran: 0, modules: 0 },
+    |accumulator: { taken: Int, ran: Int, modules: Int }, q: Json|
+      {
+        taken: accumulator.taken + int(at(q, "taken")),
+        ran: accumulator.ran + int(at(q, "run")),
+        modules: accumulator.modules
+          + (if str(at(q, "query")) == "module" { int(at(q, "run")) } else { 0 }),
+      },
+  )
 
-fn query_runs_at(dir: String) -> Map<String, Int> / {CliEffects, Shipped, abort.raise, diverges} =
-  items(
-    path(json_of(on_disk(["check", dir, "--json", "--explain"])), ["front_end", "queries"]),
-  ).fold(Map::new(), |accumulator: Map<String, Int>, q: Json|
-    accumulator.insert(str(at(q, "query")), int(at(q, "run"))))
-
-fn query_run_count(runs: Map<String, Int>, query: String) -> Int = runs.get_or(query, 0)
-
-fn chained(n: Int) -> String =
-  range(1, n).fold("pub fn f0() -> Int = 0\n", |text: String, i: Int|
-    text ++ "pub fn f" ++ i.to_string() ++ "() -> Int = f" ++ Int::to_string(i - 1) ++ "() + 1\n")
-
-test "a check after `cache compact`, and a check after an edit, recompute no result the cache already contains" {
+test "a report counts the work a load did: an unchanged project runs no function bodies, and an edit runs only the affected bodies" {
   scratch(|| {
-    write_project([{ path: "long.ply", text: chained(120) }, { path: "leaf.ply", text: leaf() }]);
-    assert(query_run_count(query_runs(), "group") > 0, Some("a cold store checks"));
-    let all = |runs: Map<String, Int>| runs.fold(0, |n: Int, _: String, k: Int| n + k);
-    assert_eq(all(query_runs()), 0);
-    let r = on_disk(["cache", "compact"]);
-    assert(r.code == 0, Some(all_output(r)));
-    assert_eq(all(query_runs()), 0);
+    write_project([
+      { path: "leaf.ply", text: leaf() ++ "\ntest \"two is two\" { assert_eq(two(), 2) }\n" },
+      { path: "apart.ply", text: "pub fn three() -> Int = 3\n" },
+    ]);
+    let checked = ||
+      reuse_of(path(json_of(on_disk(["check", ".", "--json", "--explain"])), ["front_end"]));
+    let cold = checked();
+    assert(cold.ran > 0, Some("a store nothing was kept in runs every body"));
+    let warm = checked();
+    assert(
+      warm.ran == 0 && warm.taken > 0,
+      Some("an unchanged project takes every cached result and runs no body"),
+    );
     edit("leaf.ply", "one() + one()", "one() + one() + 0");
-    assert(query_run_count(query_runs(), "group") > 0, Some("the edited group is checked"));
-    assert_eq(all(query_runs()), 0)
+    let edited = checked();
+    assert(
+      edited.modules == 1 && edited.ran < cold.ran,
+      Some("the edited module is checked again, and `apart` is not"),
+    )
   })
 }
 
-test "editing a function body rechecks only that function, and changing its signature also rechecks the functions that call it" {
+test "a load that fails reports the work it did, and does no work for a module that imports the failed module" {
   scratch(|| {
-    shop_project();
-    let _ = module_reuse();
-    assert_eq(query_run_count(query_runs(), "group"), 0);
-    edit("core.ply", "Book(_, p) -> p,", "Book(_, p) -> p + 0,");
-    let body = query_runs();
-    assert(
-      query_run_count(body, "group") == 1 && query_run_count(body, "module") == 1,
-      Some("a body edit checks its group and puts its module together again: " ++ runs_text(body)),
+    write_project([
+      { path: "lib.ply", text: "pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n" },
+      { path: "app.ply", text: "import lib\n\npub fn go() -> Int = lib::fine()\n" },
+    ]);
+    let cold = on_disk(["check", ".", "--json", "--explain"]);
+    assert_eq(cold.code, 2);
+    let runs = items(path(json_of(cold), ["front_end", "queries"])).fold(
+      Map::new(),
+      |accumulator: Map<String, Int>, q: Json|
+        accumulator.insert(str(at(q, "query")), int(at(q, "run"))),
     );
-    edit(
-      "core.ply",
-      "pub fn price(i: Item) -> Money =",
-      "pub fn price(i: Item, off: Int = 0) -> Money =",
-    );
-    let signature = query_runs();
-    assert(
-      query_run_count(signature, "group") == 3,
-      Some("`price`, and the two groups that name it, are checked: " ++ runs_text(signature)),
-    );
-    let _ = warm_matches_cold("after the edits");
-    ()
+    assert_eq(runs.get_or("module", 0), 1);
+    assert_eq(runs.get_or("group", 0), 0);
+    let shown = on_disk(["check", ".", "--explain"]);
+    assert_eq(shown.code, 2);
+    assert(stdout(shown).contains("front-end time"), Some(all_output(shown)));
+    assert(stdout(shown).contains("module"), Some(all_output(shown)));
+    assert(stderr(shown).contains("unknown name `missing`"), Some(all_output(shown)))
   })
 }
-
-fn runs_text(runs: Map<String, Int>) -> String =
-  runs.fold("", |accumulator: String, q: String, n: Int|
-    accumulator ++ q ++ "=" ++ n.to_string() ++ " ")
 
 fn cost_pass() -> { walked: Int, lowered: Int } / {CliEffects, Shipped, abort.raise, diverges} = {
   let c = path(json_of(on_disk(["check", "--json", "--explain", "--costs"])), ["cost_pass"]);
@@ -163,101 +147,6 @@ test "an edit reruns the cost analysis only on bodies whose analysis result chan
     let apart = cost_pass();
     assert(apart.walked == 1 && apart.lowered == 1, Some("`solo` is walked, and nothing reads it"));
     ()
-  })
-}
-
-fn module_runs() -> { ran: Int, pulled: Bool } / {CliEffects, Shipped, abort.raise, diverges} = {
-  let v = json_of(on_disk(["check", "--json", "--explain", "--types"]));
-  {
-    ran: items(path(v, ["front_end", "queries"])).fold(0, |n: Int, q: Json|
-      if str(at(q, "query")) == "module" { n + int(at(q, "run")) } else { n }),
-    pulled: items(at(v, "modules")).map(|m: Json| str(at(m, "name"))).contains("std.list"),
-  }
-}
-
-test "a load adds the bundled standard library modules that its cached modules import, and a warm load recomputes none of them" {
-  scratch(|| {
-    write_project([
-      { path: "a.ply", text: "pub fn one() -> Int = 1\n" },
-      { path: "b.ply", text: "import a\n\npub fn two() -> Int = a::one() + 1\n" },
-    ]);
-    let cold = module_runs();
-    assert(cold.ran == 2 && !cold.pulled, Some("a cold load checks every module and pulls none"));
-    assert_eq(module_runs().ran, 0);
-    edit(
-      "b.ply",
-      "import a\n\npub fn two() -> Int = a::one() + 1\n",
-      "import a\nimport std.list\n\npub fn two() -> Int = match [a::one()].first() { Some(n) -> n + 1, None -> 0 }\n",
-    );
-    let moved = module_runs();
-    assert(
-      moved.ran == 1 && moved.pulled,
-      Some("the edited module is checked again and pulls `std.list`, whose result ships"),
-    );
-    assert_eq(module_runs().ran, 0);
-    ()
-  })
-}
-
-fn looping(above: String, between: String) -> String =
-  above ++ "fn spin(n: Int) -> Int / {diverges} = hop(n + 1)\n" ++ between
-    ++ "fn hop(n: Int) -> Int / {diverges} = spin(n)\n\npub fn wait(n: Int) -> Int / {diverges} = spin(n)\n"
-
-test "a warning on a function that may not return still points to the correct call after edits move the module's functions within the file" {
-  scratch(|| {
-    write_project([{ path: "m.ply", text: looping("", "") }]);
-    let _ = module_reuse();
-    write("m.ply", looping("pub fn aside() -> Int = 3\n\n", "\npub fn apart() -> Int = 4\n\n"));
-    let moved = module_reuse();
-    assert(moved.checked == 1, Some("the moved module is checked again"));
-    let _ = warm_matches_cold("after the definitions moved");
-    ()
-  })
-}
-
-test "a warm check reports the same warnings as a cold check for a module whose source did not change" {
-  scratch(|| {
-    shop_project();
-    let cold = warm_matches_cold("cold");
-    assert(
-      items(at(cold, "diagnostics")).filter(|d: Json| str(at(d, "code")) == "W0611").len() == 2,
-      Some(json_text(cold)),
-    );
-    edit("leaf.ply", "one() + one()", "one() + one() + 0");
-    let _ = warm_matches_cold("after an edit nothing reaches");
-    edit("core.ply", "Note(_) -> 0", "Note(_) -> 0 + 0");
-    let _ = warm_matches_cold("after an edit `shop` reaches");
-    ()
-  })
-}
-
-test "a check detects that a file a module embeds was deleted, even though no module source changed" {
-  scratch(|| {
-    write_project([
-      { path: "words.ply", text: "pub fn words() -> Bytes = embed(\"words.txt\")\n" },
-      { path: "count.ply", text: "import words\npub fn count() -> Int = words::words().len()\n" },
-      { path: "words.txt", text: "one two\n" },
-    ]);
-    let _ = warm_matches_cold("cold");
-    remove_file("words.txt");
-    let result = warm_matches_cold("the embedded file is gone");
-    assert(int(at(result, "exit_code")) != 0, Some(json_text(result)))
-  })
-}
-
-test "a warm check of a function with a `decreases` clause gives the same result as a cold check" {
-  scratch(|| {
-    write_project([
-      { path: "step.ply", text: "pub fn down(n: Int) -> Int = n - 1\n" },
-      {
-        path: "walk.ply",
-        text: "import step\n\npub fn walk(n: Int) -> Int decreases n = if n <= 0 { 0 } else { walk(step::down(n)) }\n",
-      },
-    ]);
-    let _ = warm_matches_cold("cold");
-    edit("walk.ply", "{ 0 }", "{ 0 + 0 }");
-    let result = warm_matches_cold("after an edit to the definition that states the measure");
-    assert(int(at(result, "exit_code")) == 0, Some(json_text(result)))
   })
 }
 
@@ -323,28 +212,6 @@ test "a check that cannot record its result still succeeds, and reports that it 
   })
 }
 
-fn scope_program(body: String) -> String =
-  "effect io { write close(n: Int) -> Unit }\n\npub fn aside() -> Int = 7\n\npub fn used(n: Int) -> Int / {io.close} = {\n  let got = with_scope[file](n, |x: Int| io.close(x)) { h -> "
-    ++ body
-    ++ " };\n  0\n}\n"
-
-test "a warm check of an edited `with_scope` body rejects a scoped value that escapes, as a cold check does" {
-  scratch(|| {
-    write_project([{ path: "m.ply", text: scope_program("h.get() + 1") }]);
-    let unchanged_report = warm_matches_cold("cold");
-    assert(int(at(unchanged_report, "exit_code")) == 0, Some(json_text(unchanged_report)));
-    let _ = warm_matches_cold("warm");
-    edit("m.ply", "h.get() + 1", "{ let k = || h.get(); k() }");
-    let inside = warm_matches_cold("after an edit that keeps the scoped value inside");
-    assert(int(at(inside, "exit_code")) == 0, Some(json_text(inside)));
-    edit("m.ply", "{ let k = || h.get(); k() }", "|| h.get()");
-    let escaped = warm_matches_cold("after an edit that lets it out");
-    assert_eq(diagnostic_codes(escaped), ["E0446"]);
-    edit("m.ply", "pub fn aside() -> Int = 7", "pub fn aside() -> Int = 8");
-    assert_eq(diagnostic_codes(warm_matches_cold("after an edit beside the escape")), ["E0446"])
-  })
-}
-
 test "a project that imports `std.fs` and opens no file checks, cold and warm" {
   scratch(|| {
     write_project([
@@ -362,83 +229,14 @@ test "a project that imports `std.fs` and opens no file checks, cold and warm" {
 
 fn streaming() -> String = String::of_bytes_lossy(embed("../programs/incremental/streaming.ply"))
 
-test/nondet "a project that streams a file through `std.io` checks and runs correctly, cold and warm" {
-  write_project([{ path: "m.ply", text: streaming() }]);
-  let cold = warm_matches_cold("cold");
-  assert(int(at(cold, "exit_code")) == 0, Some(json_text(cold)));
-  let query_runs = json_of(spawned(["test", ".", "--json"]));
-  assert(
-    int(path(query_runs, ["summary", "failed"])) == 0
-      && int(path(query_runs, ["summary", "passed"])) == 1,
-    Some(json_text(query_runs)),
-  );
-  edit("m.ply", "65536", "4096");
-  let warm = warm_matches_cold("after an edit to the reader's chunk");
-  assert(int(at(warm, "exit_code")) == 0, Some(json_text(warm)));
-  let again = json_of(spawned(["test", ".", "--json"]));
-  assert(
-    int(path(again, ["summary", "failed"])) == 0 && int(path(again, ["summary", "passed"])) == 1,
-    Some(json_text(again)),
-  )
-}
-
-test "a whole editing session agrees at every step" {
+test "a project that streams a file through `std.io` checks, cold and warm" {
   scratch(|| {
-    shop_project();
-    let _ = warm_matches_cold("step 0");
-    let _ = warm_matches_cold("step 0, warm");
-    edit("leaf.ply", "one() + one()", "one() + 1");
-    let _ = warm_matches_cold("step 1: body");
-    edit("core.ply", "pub fn label(", "pub fn title(");
-    let _ = warm_matches_cold("step 2: rename");
-    edit("core.ply", "Money", "Cost");
-    let _ = warm_matches_cold("step 3: rename a type");
-    write("extra.ply", "import leaf\npub fn four() -> Int = leaf::two() + 2\n");
-    let _ = warm_matches_cold("step 4: add a file");
-    edit("extra.ply", "leaf::two() + 2", "leaf::two() + 3");
-    let _ = warm_matches_cold("step 5: edit the new file");
-    remove_file("extra.ply");
-    let _ = warm_matches_cold("step 6: delete it again");
-    edit("core.ply", "effect db", "effect ledger");
-    edit("shop.ply", "core::db.", "core::ledger.");
-    let _ = warm_matches_cold("step 7: rename an effect");
-    ()
-  })
-}
-
-test "a warm check rejects a module that constructs a type directly after the type is made opaque" {
-  scratch(|| {
-    write_project([
-      {
-        path: "dates.ply",
-        text: "pub type Date = new { day: Int }\n\npub fn first() -> Date = { day: 1 }\n\npub fn day(d: Date) -> Int = d.day\n",
-      },
-      {
-        path: "app.ply",
-        text: "import dates\n\nfn pick() -> Int = dates::day({ day: 2 })\n\nfn read() -> Int = dates::first().day\n\nfn main() -> Int = pick() + read()\n",
-      },
-    ]);
-    let open = warm_matches_cold("open");
-    assert_eq(diagnostic_codes(open), []);
-    edit("dates.ply", "pub type Date", "pub opaque type Date");
-    assert_eq(diagnostic_codes(warm_matches_cold("closed")), ["E0220"]);
-    edit("dates.ply", "pub opaque type Date", "pub type Date");
-    assert(warm_matches_cold("open again") == open, Some("an undone edit lands where it began"))
-  })
-}
-
-test "deleting a file is reported rather than skipped past" {
-  scratch(|| {
-    shop_project();
-    write("extra.ply", "import leaf\npub fn three() -> Int = leaf::two()\n");
-    let _ = warm_matches_cold("cold");
-    remove_file("leaf.ply");
-    let result = warm_matches_cold("a dangling import");
-    assert(int(at(result, "exit_code")) == 2, Some(json_text(result)));
-    assert(
-      items(at(result, "diagnostics")).filter(|d: Json| str(at(d, "code")) == "E0106").len() > 0,
-      Some(json_text(result)),
-    )
+    write_project([{ path: "m.ply", text: streaming() }]);
+    let cold = warm_matches_cold("cold");
+    assert(int(at(cold, "exit_code")) == 0, Some(json_text(cold)));
+    edit("m.ply", "65536", "4096");
+    let warm = warm_matches_cold("after an edit to the reader's chunk");
+    assert(int(at(warm, "exit_code")) == 0, Some(json_text(warm)))
   })
 }
 
@@ -534,66 +332,9 @@ test "a single-file run does not spoil the whole project run after it" {
   })
 }
 
-test/nondet "two overlapping runs leave a cache that still agrees" {
-  shop_project();
-  let one = start_server(["check", "."], [], 0);
-  let two = start_server(["check", "."], [], 0);
-  [one, two].fold((), |u: Unit, server: Server| {
-    let r = completed_result(wait_for_exit(server, 120000, "`ply check` never ended"));
-    assert(r.code == 0, Some(all_output(r)))
-  });
-  let _ = warm_matches_cold("after two overlapping runs");
-  edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 3");
-  let _ = warm_matches_cold("and an edit after them");
-  ()
-}
-
-fn assert_cache_empty(what: String) -> Unit / {fs.list_dir[cwd], abort.raise} =
-  assert(
-    List::filter(
-        match listed_names(fs.list_dir[cwd](".ply-cache")) { Some(names) -> names, None -> [] },
-        |name: String| name.starts_with("manifest-") || name.starts_with("seg-") || name == "memo",
-      ).len(
-      )
-      == 0,
-    Some(what ++ " recorded into the cache"),
-  )
-
-fn one_test() -> Unit / {WorkingDirectory, abort.raise} =
-  write_project([
-    { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
-  ])
-
-test/nondet "a program that loads another program does not write to the cache" {
-  one_test();
-  assert(loads_here(), Some("the program loads"));
-  assert_cache_empty("a program's own load")
-}
-
 fn lib_dependency(at_path: String) -> String =
   "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"" ++ at_path
     ++ "\")}"
-
-test "moving a dependency's package directory with its manifest unchanged causes no recheck, and an edit to it rechecks only the affected modules" {
-  scratch(|| {
-    write_project([
-      { path: "app/ply.pkg", text: manifest("app", lib_dependency("../lib")) },
-      { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
-      { path: "lib/ply.pkg", text: manifest("lib", "") },
-      { path: "lib/answer.ply", text: "pub fn answer() -> Int = 42\n" },
-    ]);
-    let r = on_disk(["check", "app"]);
-    assert(r.code == 0, Some(stderr(r)));
-    assert(fs.create_dir[cwd]("vendor"), None);
-    assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
-    write("app/ply.pkg", manifest("app", lib_dependency("../vendor/lib")));
-    assert(module_reuse_at("app").checked == 0, Some("a moved package checks nothing again"));
-    write("vendor/lib/answer.ply", "pub fn answer() -> Int = 40 + 2\n");
-    assert(module_reuse_at("app").checked == 1, Some("the edit is checked, and nothing else"));
-    write("vendor/lib/answer.ply", "pub fn answer() -> Int = 43\n");
-    assert(module_reuse_at("app").checked == 2, Some("the edit and its caller are checked"))
-  })
-}
 
 test "a `reuse fn` that fails its check is rejected with E0127 on both the first and the second run" {
   scratch(|| {
@@ -645,44 +386,6 @@ test/nondet "a cached load of a project and the standard library modules it impo
   assert(!fs.exists[cwd](".ply-cache/memo"), Some("clearing the cache discards the memo store"))
 }
 
-fn packaged_project() -> Unit / {WorkingDirectory, abort.raise} =
-  write_project([
-    { path: "app/ply.pkg", text: manifest("app", lib_dependency("../lib")) },
-    {
-      path: "app/main.ply",
-      text:
-        \\import lib.answer
-        \\import lib.more
-        \\
-        \\pub fn main() -> Int = answer::answer() + more::more(1)
-        \\
-        \\pub fn kept(x: Int) -> Int
-        \\  ensures result == x
-        \\= {
-        \\  let _ = answer::answer();
-        \\  x
-        \\}
-        \\
-        \\test "main answers" { assert(main() > 0) }
-        \\
-    },
-    { path: "lib/ply.pkg", text: manifest("lib", "") },
-    { path: "lib/answer.ply", text: "pub fn answer() -> Int = 42\n\nfn helper() -> Int = 0\n" },
-    {
-      path: "lib/more.ply",
-      text:
-        \\import answer
-        \\
-        \\pub fn more(x: Int) -> Int
-        \\  requires x < 100
-        \\  ensures result > x
-        \\= x + answer::answer()
-        \\
-    },
-  ])
-
-fn owners(v: Json) -> List<String> = items(at(v, "obligations")).map(|o: Json| str(at(o, "owner")))
-
 test/nondet "a cached load of a project with a dependency gives the same results as a load from source, before and after an edit" {
   packaged_project();
   let check = ["check", "app", "--explain", "--json"];
@@ -699,48 +402,10 @@ test/nondet "a cached load of a project with a dependency gives the same results
   assert(module_reuse_at("app").checked == 0, Some("every module is treated as unchanged"));
   assert(!diagnostic_codes(json_of(on_disk(["check", "app", "--json"]))).contains("W0611"), None);
   assert(diagnostic_codes(json_of(on_disk(["check", "lib", "--json"]))).contains("W0611"), None);
-  assert(spawned(["prove", "app"]).code == 0, None);
-  assert(spawned(["test", "app"]).code == 0, None);
   edit("lib/answer.ply", "= 42", "= {\n  let _ = helper();\n  42\n}");
   assert(module_reuse_at("app").checked == 1, Some("only the edited module is checked"));
-  let proved = json_of(spawned(["prove", "app", "--json"]));
-  assert(int(at(proved, "cached")) == 1, Some(json_text(proved)));
-  assert(
-    int(path(json_of(spawned(["test", "app", "--json"])), ["selection", "cached"])) == 0,
-    None,
-  );
   agrees("after the dependency moved");
-  agrees("and again");
-  assert_eq(owners(json_of(spawned(["prove", "app", "--json"]))), ["main.kept"]);
-  assert_eq(owners(json_of(spawned(["prove", "lib", "--json"]))), ["more.more"]);
-  let both = items(at(json_of(spawned(["prove", "app", "--workspace", "--json"])), "packages"));
-  assert_eq(both.map(|p: Json| str(at(p, "root"))), ["lib", "app"]);
-  assert_eq(both.map(|p: Json| owners(at(p, "answer"))), [["more.more"], ["main.kept"]])
-}
-
-fn outcomes(v: Json) -> List<String> =
-  items(at(v, "obligations")).map(|o: Json| str(at(o, "outcome")))
-
-test/nondet "a proof through another package's `transparent fn` is checked and proved again when that function's body changes" {
-  write_project([
-    { path: "app/ply.pkg", text: manifest("app", lib_dependency("../lib")) },
-    {
-      path: "app/main.ply",
-      text: "import lib.same\n\npub fn kept(x: Int) -> Int\n  ensures result == x\n= same::same(x)\n",
-    },
-    { path: "lib/ply.pkg", text: manifest("lib", "") },
-    { path: "lib/same.ply", text: "pub transparent fn same(x: Int) -> Int = x\n" },
-  ]);
-  assert_eq(outcomes(json_of(spawned(["prove", "app", "--json"]))), ["proved"]);
-  assert(module_reuse_at("app").checked == 0, Some("a warm load checks nothing"));
-  edit("lib/same.ply", "= x", "= x + 0");
-  assert(
-    query_run_count(query_runs_at("app"), "group") == 2,
-    Some("the edit and its dependent are checked"),
-  );
-  let again = json_of(spawned(["prove", "app", "--json"]));
-  assert(int(at(again, "cached")) == 0, Some(json_text(again)));
-  assert_eq(outcomes(again), ["proved"])
+  agrees("and again")
 }
 
 test "a `reuse fn` passes its check using another package's `returns fresh` clause, and fails with E0127 once the clause is removed" {
@@ -763,5 +428,185 @@ test "a `reuse fn` passes its check using another package's `returns fresh` clau
     edit("lib/lists.ply", "  returns fresh\n", "");
     let rejected = json_of(on_disk(["check", "app", "--json"]));
     assert(diagnostic_codes(rejected).contains("E0127"), Some(json_text(rejected)))
+  })
+}
+
+fn faked(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_faked(argv, passing_except([]))
+
+fn bodies_run(front: Json) -> Int =
+  items(at(front, "queries")).fold(0, |n: Int, q: Json| n + int(at(q, "run")))
+
+test "a `ply test` takes every result a `ply check` before it kept" {
+  scratch(|| {
+    write_project([
+      { path: "leaf.ply", text: leaf() ++ "\ntest \"two is two\" { assert_eq(two(), 2) }\n" },
+      { path: "apart.ply", text: "pub fn three() -> Int = 3\n" },
+    ]);
+    assert_ok(faked(["check", ".", "--explain"]));
+    let tested = path(json_of(faked(["test", ".", "--json"])), ["front_end"]);
+    assert_eq(bodies_run(tested), 0);
+    assert_eq(int(at(tested, "lost")), 0)
+  })
+}
+
+test "a load that rejects says what it took and ran under the commands that compile" {
+  scratch(|| {
+    write_project([
+      { path: "lib.ply", text: "pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n" },
+      { path: "app.ply", text: "import lib\n\npub fn go() -> Int = lib::fine()\n" },
+    ]);
+    let front = |args: List<String>| path(json_of(faked(args)), ["front_end"]);
+    assert(items(at(front(["test", ".", "--json"]), "queries")).len() > 0);
+    assert(items(at(front(["prove", ".", "--json"]), "queries")).len() > 0)
+  })
+}
+
+fn assert_cache_empty(what: String) -> Unit / {fs.list_dir[cwd], abort.raise} =
+  assert(
+    List::filter(
+        match listed_names(fs.list_dir[cwd](".ply-cache")) { Some(names) -> names, None -> [] },
+        |name: String| name.starts_with("manifest-") || name.starts_with("seg-") || name == "memo",
+      ).len(
+      )
+      == 0,
+    Some(what ++ " recorded into the cache"),
+  )
+
+test "`ply test --no-cache`, `ply hosts` and `ply build` write nothing to the cache" {
+  scratch(|| {
+    write_project([
+      { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
+    ]);
+    let tested = faked(["test", ".", "--no-cache"]);
+    assert(tested.code == 0, Some(all_output(tested)));
+    assert_cache_empty("`ply test --no-cache`");
+    let hosts = faked(["hosts", "."]);
+    assert(hosts.code == 0, Some(all_output(hosts)));
+    assert_cache_empty("`ply hosts`");
+    let built = faked(["build", ".", "--digest"]);
+    assert(built.code == 0, Some(all_output(built)));
+    assert_cache_empty("`ply build`")
+  })
+}
+
+test "a warm prove resolves every obligation from the cache" {
+  scratch(|| {
+    write_project([
+      {
+        path: "base.ply",
+        text:
+          \\pub fn one() -> Int = 1
+          \\
+          \\pub fn bump(x: Int) -> Int
+          \\  requires x < 100
+          \\  ensures result > x
+          \\= x + one()
+          \\
+      },
+      {
+        path: "app.ply",
+        text:
+          \\import base
+          \\
+          \\fn more(x: Int) -> Int
+          \\  requires x < 50
+          \\  ensures result > x
+          \\= base::bump(x)
+          \\
+      },
+      {
+        path: "side.ply",
+        text:
+          \\fn zero(x: Int) -> Int
+          \\  ensures result == 0
+          \\= x - x
+          \\
+      },
+    ]);
+    let proved = |args: List<String>|
+      on_disk_faked(["prove", "."].concat(args), |name: String| returned(VBool(true)));
+    let first_run = proved([]);
+    assert(first_run.code == 0, Some(all_output(first_run)));
+    let r = proved(["--json"]);
+    assert(r.code == 0, Some(all_output(r)));
+    let v = json_of(r);
+    assert(items(at(v, "obligations")).len() == 3, Some(json_text(v)));
+    assert(
+      int(at(v, "cached")) == 3,
+      Some("every obligation is resolved from the cache: " ++ json_text(v)),
+    )
+  })
+}
+
+fn owners(v: Json) -> List<String> = items(at(v, "obligations")).map(|o: Json| str(at(o, "owner")))
+
+test "a dependency's body moved leaves its proof standing, and its test runs again" {
+  scratch(|| {
+    packaged_project();
+    assert(faked(["prove", "app"]).code == 0, None);
+    assert(faked(["test", "app"]).code == 0, None);
+    edit("lib/answer.ply", "= 42", "= {\n  let _ = helper();\n  42\n}");
+    let proved = json_of(faked(["prove", "app", "--json"]));
+    assert(int(at(proved, "cached")) == 1, Some(json_text(proved)));
+    assert(
+      int(path(json_of(faked(["test", "app", "--json"])), ["selection", "cached"])) == 0,
+      None,
+    );
+    assert_eq(owners(json_of(faked(["prove", "app", "--json"]))), ["main.kept"]);
+    assert_eq(owners(json_of(faked(["prove", "lib", "--json"]))), ["more.more"]);
+    let both = items(at(json_of(faked(["prove", "app", "--workspace", "--json"])), "packages"));
+    assert_eq(both.map(|p: Json| str(at(p, "root"))), ["lib", "app"]);
+    assert_eq(both.map(|p: Json| owners(at(p, "answer"))), [["more.more"], ["main.kept"]])
+  })
+}
+
+fn outcomes(v: Json) -> List<String> =
+  items(at(v, "obligations")).map(|o: Json| str(at(o, "outcome")))
+
+test "a dependent proves through a transparent definition, and is proved again when its body moves" {
+  scratch(|| {
+    write_project([
+      { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
+      {
+        path: "app/main.ply",
+        text: "import lib.same\n\npub fn kept(x: Int) -> Int\n  ensures result == x\n= same::same(x)\n",
+      },
+      { path: "lib/ply.pkg", text: manifest("lib", "") },
+      { path: "lib/same.ply", text: "pub transparent fn same(x: Int) -> Int = x\n" },
+    ]);
+    assert_eq(outcomes(json_of(faked(["prove", "app", "--json"]))), ["proved"]);
+    edit("lib/same.ply", "= x", "= x + 0");
+    let again = json_of(faked(["prove", "app", "--json"]));
+    assert(int(at(again, "cached")) == 0, Some(json_text(again)));
+    assert_eq(outcomes(again), ["proved"])
+  })
+}
+
+test "`test` still succeeds when the cache cannot be written, and it reports a warning naming the failed write" {
+  scratch(|| {
+    write_project([
+      { path: "m.ply", text: "pub fn f() -> Int = 1\n\ntest \"one\" {\n  assert_eq(f(), 1)\n}\n" },
+    ]);
+    assert(faked(["test", "."]).code == 0, None);
+    let manifest = match List::filter(
+        match listed_names(fs.list_dir[cwd](".ply-cache")) { Some(names) -> names, None -> [] },
+        |name: String| name.starts_with("manifest-"),
+      ) {
+      [name, ..] -> ".ply-cache/" ++ name,
+      [] -> panic("the run recorded no store"),
+    };
+    if !(fs.remove[cwd](manifest) && fs.create_dir[cwd](manifest)) {
+      panic("the blocking directory is made")
+    };
+    let r = faked(["test", ".", "--json"]);
+    assert(r.code == 0, Some("an unwritable cache never fails a run: " ++ all_output(r)));
+    let warnings = items(at(json_of(r), "warnings")).filter(|d: Json|
+      str(at(d, "code")) == "W0601").map(|d: Json| str(at(d, "message")));
+    assert(
+      warnings.filter(|m: String| m.contains("the store's manifest could not be written")).len()
+        > 0,
+      Some("the failing write has to be named: " ++ all_output(r)),
+    )
   })
 }
