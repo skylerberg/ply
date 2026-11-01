@@ -6,6 +6,7 @@
 ; does by the line a node starts on.
 [
   (function_definition)
+  (const_declaration)
   (extern_function)
   (type_definition)
   (effect_definition)
