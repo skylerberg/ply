@@ -70,7 +70,7 @@ import std.time (time)
 import compiler.syntax.parsing (no_module)
 import compiler.syntax.items (RequiresClause, EnsuresClause, spec_kind_text)
 import compiler.syntax.expressions (prelude_module)
-import compiler.emit.print.count_functions (identity_fn)
+import compiler.emit.print.count_functions (identity_fn, allocates)
 import std.list (positions)
 import compiler.emit.print.constants (constant_read_fn, const_fn_read_fn)
 
@@ -6251,14 +6251,54 @@ test "a `const fn` is read through the check that no raise left it, and a plain 
   assert_eq(plain.get(0), 0)
 }
 
-test "a read of a definition whose body is a literal of its type is the literal" {
+test "a read of a definition whose body is data made of literals is that data, with no allocation" {
   let text = |source: Bytes|
     unit_text(unit_builder(source).unit([Named(b"m.read")]).produced.parts);
   let reads = |source: Bytes, helper: Bytes| text(source).index_of(read_of(helper)) != None;
+  let read_body = |unit: Bytes| {
+    let at = match unit.index_of(symbol_of(b"m.read").concat(b"(PlyCtx *ctx, int64_t p0) {")) {
+      Some(i) -> i,
+      None -> panic("the unit defines m.read"),
+    };
+    let body = unit.slice(at, unit.len());
+    body.slice(0, match body.index_of(b"\n}\n") { Some(i) -> i, None -> body.len() })
+  };
   let int = text(b"fn kept() -> Int = 300\nfn read(n: Int) -> Int = n + kept()\n");
   assert(int.index_of(b"INT64_C(300)") != None, None);
   assert(int.index_of(read_of(constant_read_fn())) == None, None);
   assert(int.index_of(b"ply_m_kept_") == None, None);
+  let wide = text(
+    b"type W = { a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Bytes }\nfn kept() -> W = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: b\"abc\" }\nfn read(n: Int) -> Int = n + kept().i\n",
+  );
+  assert(wide.index_of(read_of(constant_read_fn())) == None, None);
+  assert(wide.index_of(b"ply_m_kept_") == None, None);
+  assert(!allocates(read_body(wide)), None);
+  let boxed = text(
+    b"type T = | Off | Pair(Int, Option<Bytes>)\nfn kept() -> T = Pair(7, Some(b\"abc\"))\nfn read(n: Int) -> Int = match kept() { Pair(k, _) -> k + n, Off -> n }\n",
+  );
+  assert(boxed.index_of(read_of(constant_read_fn())) == None, None);
+  assert(!allocates(read_body(boxed)), None);
+  assert(
+    !reads(
+      b"type R = { a: Option<Int>, b: Bool }\nfn kept() -> R = { a: None, b: true }\nfn read(n: Int) -> Int = if kept().b { n } else { 0 }\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    reads(
+      b"fn kept() -> List<Int> = [1, 2]\nfn read(n: Int) -> Int = n + kept().len()\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
+  assert(
+    reads(
+      b"type T = | Make(Int)\nfn kept() -> { make: (Int) -> T } = { make: Make }\nfn read(n: Int) -> T = (kept().make)(n)\n",
+      constant_read_fn(),
+    ),
+    None,
+  );
   assert(
     !reads(
       b"fn kept() -> Bytes = b\"abc\"\nfn read(n: Int) -> Int = n + kept().len()\n",

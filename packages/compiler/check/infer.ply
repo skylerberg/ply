@@ -33,7 +33,9 @@ import std.bytes (ascii_of_int)
 import std.option
 import std.string
 import compiler.check.borrowing (ParameterMode, parameter_mode)
-import compiler.check.typed (TypedExpression, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
+import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralEmbedded)
+import compiler.check.typed (ConstantData, LiteralData, constant_data_bin, data_of, TypedLiteral,
+                             TypedExpression, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
                              ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
                              typed_body_bin, typed_expression_nodes, part_key, TypedRead,
                              TypedUpdate, WholeBody, TypedParam, NumericWitness, ConcreteWitness,
@@ -221,23 +223,43 @@ fn with_owner(facts: BodyFacts, module: Int, owner: Bytes) -> BodyFacts =
     bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
   }
 
-fn facts_format() -> Int = 7
+fn facts_format() -> Int = 8
+
+type FactsHead = { value: Option<ConstantData> }
+
+derive bin for FactsHead
+
+pub fn whole_body_data(facts: BodyFacts) -> Option<ConstantData> =
+  match facts.bodies.find(|b: TypedBody<Bytes>| b.part == WholeBody) {
+    Some(b) -> data_of(b.body, facts.types),
+    None -> None,
+  }
 
 pub fn encode_facts(facts: BodyFacts) -> Bytes / {abort.raise} =
-  byte_of_int(facts_format()).concat(
+  Bytes::concat_all([
+    byte_of_int(facts_format()),
+    bin::encode({ value: whole_body_data(facts) }, facts_head_bin()),
     bin::encode(with_owner({ ..facts, types: Map::new() }, 0, b""), body_facts_bin()),
-  )
+  ])
+
+fn facts_head(recorded: Bytes) -> Option<bin::Taken<FactsHead>> / {abort.raise} =
+  if recorded.len() == 0 || recorded.at(0) != facts_format() { None }
+  else { match facts_head_bin().take(recorded, 1) { Ok(t) -> Some(t), Err(_) -> None } }
+
+pub fn recorded_data(recorded: Bytes) -> Option<ConstantData> / {abort.raise} =
+  match facts_head(recorded) { Some(t) -> t.value.value, None -> None }
 
 pub fn decode_facts(
   recorded: Bytes,
   module: Int,
   owner: Bytes,
 ) -> Option<BodyFacts> / {abort.raise} =
-  if recorded.len() == 0 || recorded.at(0) != facts_format() { None } else {
-    match bin::decode(recorded.slice(1, recorded.len()), body_facts_bin()) {
+  match facts_head(recorded) {
+    None -> None,
+    Some(t) -> match bin::decode(recorded.slice(t.at, recorded.len()), body_facts_bin()) {
       Ok(f) -> Some(with_owner(f, module, owner)),
       Err(_) -> None,
-    }
+    },
   }
 
 fn restore_owners(checker: Checker) -> Checker / {abort.raise} =
@@ -1604,6 +1626,27 @@ test "a callback may perform less than its parameter's effects permit, and nothi
     b"effect ctl { write run(k: () -> Unit / {a.x, a.z}) -> Unit }\nfn go() -> Unit / {ctl.write} = ctl.run(|| a.x())",
   );
   assert_eq(check_codes(handed), [])
+}
+
+test "recorded facts hold a body's data ahead of the body, and decode as they were encoded" {
+  let of_literal = |l: SourceLiteral| {
+    let body = {
+      owner: b"m.kept",
+      module: 0,
+      part: WholeBody,
+      params: [],
+      body: { node: TypedLiteral(l), span: dummy_span(), ty: b"", releases: [] },
+    };
+    encode_facts({ ..no_body_facts(), bodies: [body] })
+  };
+  let literal = LiteralInt(300);
+  assert_eq(recorded_data(of_literal(literal)), Some(LiteralData(literal)));
+  assert_eq(recorded_data(of_literal(LiteralEmbedded(b"digest", 1))), None);
+  assert_eq(recorded_data(encode_facts(no_body_facts())), None);
+  let decoded = |recorded: Bytes|
+    decode_facts(recorded, 0, b"m.kept").map(|f: BodyFacts| f.bodies.len());
+  assert_eq(decoded(of_literal(literal)), Some(1));
+  assert_eq(decoded(encode_facts(no_body_facts())), Some(0))
 }
 
 test "a claim may pass a pure callback to a function generic over its effects" {
