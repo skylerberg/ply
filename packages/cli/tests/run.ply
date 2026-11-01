@@ -1,4 +1,4 @@
-import compiler.load (Derives, LoadedAnalysis)
+import compiler.load (Derives)
 import args (Flags, matches_filters, style_of)
 import units
 import units (emit)
@@ -16,8 +16,7 @@ import std.time (time)
 import config_schema
 import configuration
 import machine
-import compiler.front.facts (CheckedProgram, is_shipped_module)
-import compiler.front.emitter_input (TestRunScope)
+import compiler.front.facts (CheckedProgram, ProgramListing)
 import compiler.unit (shipped)
 import compiler.check.infer.checker (EffectInfo, TestInfo, prelude_effects)
 import compiler.check.resolve.tables (Diagnostic)
@@ -26,8 +25,13 @@ import compiler.syntax.type_syntax
 import compiler.syntax.type_syntax (WriteMode)
 import diagnostic (SourceText, shown)
 import paths
-import program (TimedLoad, loaded_analysis, modules_of, own_diagnostics, timed_over,
-                timed_uncached_over, unchanged, program_view)
+import program (Session, TimedLoad, embeds_of, loaded_analysis, modules_of, no_loaded_analysis,
+                places_of, program_view, session_over, timed_of, timed_over, unchanged)
+import module_queries (ModuleResults, module_results)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules)
+import compiler.store.memo (memo)
 import report (CommandOutput, indent, ok_code, rejected, reuse_members, with_front_end)
 import sources (Embed, File, Project, load_resolved)
 import std.process (process)
@@ -56,77 +60,91 @@ import tests.cases (Scope, scope_of, over_cases, list_cases, scope_for_listing, 
                     search_of, sim_json)
 import semantics (semantics)
 
-pub type Iteration = { result: CommandOutput, cached_load: Option<TimedLoad>, embeds: List<Embed> }
+pub type TestReading = { listing: ProgramListing, later: Option<ModuleResults> }
+
+pub type Iteration = {
+  result: CommandOutput,
+  opened: Option<Session<TestReading>>,
+  embeds: List<Embed>,
+}
 
 pub fn run(
   flags: Flags,
   options: Options,
-) -> CommandOutput / {semantics.cached, shipped.read_pack, process.out[proc], process.err[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used, toolchain.reuse_dir} =
+) -> CommandOutput / {semantics.cached, shipped.read_pack, process.out[proc], process.err[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, toolchain.reuse_dir} =
   run_once(flags, options, None).result
 
-fn load_or_reuse(
+fn test_reading(
   flags: Flags,
-  cached_load: Option<TimedLoad>,
-  project: Project,
-  started: Int,
-) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_view_used} = {
-  let reused = match cached_load {
-    Some(t) -> if unchanged(project, t.program) { Some(t) } else { None },
-    None -> None,
-  };
-  match reused {
-    Some(t) -> { ..t, read_ms: 0, front_end_ms: 0, store_ms: 0 },
-    None -> if flags.no_cache {
-      timed_uncached_over(flags.paths, project, started, flags.verify_dependencies)
-    } else { timed_over(flags.paths, project, started, flags.verify_dependencies) },
+  modules: Modules,
+  read: ProgramSummary,
+) -> TestReading / {memo.read, abort.raise} =
+  {
+    listing: view::listed(modules),
+    later: if read.checked_later || flags.no_cache { Some(module_results(modules.own)) }
+    else { None },
   }
-}
 
 pub fn run_once(
   flags: Flags,
   options: Options,
-  cached_load: Option<TimedLoad>,
-) -> Iteration / {semantics.cached, shipped.read_pack, process.out[proc], process.err[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used, toolchain.reuse_dir} = {
+  before: Option<Session<TestReading>>,
+) -> Iteration / {semantics.cached, shipped.read_pack, process.out[proc], process.err[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, toolchain.reuse_dir} = {
   let s: Style = style_of(flags);
   let begun = time.elapsed_us();
   process.err[proc](indent() ++ "checking the program");
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
-  run_loaded_program(flags, options, s, load_or_reuse(flags, cached_load, project, started), begun)
+  let reused = match before {
+    Some(t) -> if unchanged(project, t.project, embeds_of(t, t.value.listing.embeds)) { Some(t) }
+    else { None },
+    None -> None,
+  };
+  let opened = match reused {
+    Some(t) -> Ok({ ..t, phases: { read_ms: 0, front_end_ms: 0, store_ms: 0 } }),
+    None ->
+      session_over(
+        flags.paths,
+        project,
+        started,
+        flags.verify_dependencies,
+        flags.no_cache,
+        |modules: Modules, read: ProgramSummary| test_reading(flags, modules, read),
+      ),
+  };
+  match opened {
+    Err(r) ->
+      {
+        result: with_front_end(
+          rejected(s, "test", r.diagnostics, r.places),
+          reuse_members(r.tallies, r.missing_results),
+        ),
+        opened: None,
+        embeds: [],
+      },
+    Ok(t) -> tests_of_session(flags, options, s, t, begun),
+  }
 }
 
-fn run_loaded_program(
+fn tests_of_session(
   flags: Flags,
   options: Options,
   s: Style,
-  t: TimedLoad,
+  t: Session<TestReading>,
   begun: Int,
-) -> Iteration / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, shipped.read_pack, Derives, abort.raise, evaluation.verdicts, evaluation.statements} =
-  match program_view(t.program) {
+) -> Iteration / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, shipped.read_pack, toolchain.reuse_dir, Derives, abort.raise, evaluation.verdicts, evaluation.statements} = {
+  let embeds = embeds_of(t, t.value.listing.embeds);
+  let places = places_of(t);
+  match config_schema::schema_error(
+      t.value.listing.checked.definitions,
+      options.machine.config.schema,
+    ) {
+    Some(d) ->
+      { result: unbound(s, { diagnostics: [d], places: places }), opened: None, embeds: embeds },
     None ->
-      {
-        result: with_front_end(
-          rejected(s, "test", t.program.diagnostics, t.program.source_texts),
-          reuse_members(t.program.tallies, t.program.missing_results),
-        ),
-        cached_load: None,
-        embeds: t.program.embeds,
-      },
-    Some(w) -> match config_schema::schema_error(w, options.machine.config.schema) {
-      Some(d) ->
-        {
-          result: unbound(s, { diagnostics: [d], places: t.program.source_texts }),
-          cached_load: None,
-          embeds: t.program.embeds,
-        },
-      None ->
-        {
-          result: tests_over(flags, s, options, t, w, begun),
-          cached_load: Some(t),
-          embeds: t.program.embeds,
-        },
-    },
+      { result: tests_over(flags, s, options, t, places, begun), opened: Some(t), embeds: embeds },
   }
+}
 
 pub fn file_stamps(
   rs: List<paths::ResolvedPath>,
@@ -148,7 +166,7 @@ fn stamp_part(n: Option<Int>) -> String = match n { Some(x) -> x.to_string(), No
 fn root_of(rs: List<paths::ResolvedPath>) -> String =
   match rs.at(0) { None -> ".", Some(r) -> r.machine }
 
-pub fn rows_of(analysis: CheckedProgram) -> List<Row> =
+pub fn rows_of(analysis: ProgramListing) -> List<Row> =
   range(0, analysis.checked.tests.len()).fold([], |accumulator: List<Row>, i: Int|
     match test_at(analysis, i) {
       None -> accumulator,
@@ -166,14 +184,14 @@ pub fn rows_of(analysis: CheckedProgram) -> List<Row> =
 
 fn is_write_mode(m: type_syntax::Mode) -> Bool = match m { WriteMode -> true, _ -> false }
 
-pub fn declared_effects(analysis: CheckedProgram) -> Map<Bytes, Bool> =
+pub fn declared_effects(analysis: ProgramListing) -> Map<Bytes, Bool> =
   prelude_effects().concat(analysis.checked.effects).fold(
     Map::new(),
     |accumulator: Map<Bytes, Bool>, e: EffectInfo| accumulator.insert(e.name, e.nondet),
   )
 
 pub fn case_view(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   declared: Map<Bytes, Bool>,
   i: Int,
   test_info: TestInfo,
@@ -218,14 +236,16 @@ fn named_modules(paths: List<paths::ResolvedPath>, files: List<File>) -> Option<
 
 fn program_of(
   options: Options,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
+  t: Session<TestReading>,
+  places: List<SourceText>,
+  analysis: ProgramListing,
   entries: List<Entry>,
   root: String,
   scope: Scope,
   opened: List<Diagnostic>,
   recorded_under: Option<String>,
   unit: TestUnit,
+  loaded_from_cache: Bool,
 ) -> Program / {abort.raise} = {
   let declared = declared_effects(analysis);
   let cases = scope.visible.fold([], |accumulator: List<Case>, i: Int|
@@ -240,23 +260,39 @@ fn program_of(
     root: root,
     cache_stamp: recorded_under,
     unit: unit,
-    files: timed.program.source_texts.map(|place: SourceText| place.path),
-    places: timed.program.source_texts,
-    modules: modules_of(timed.program, analysis.frame).map(|m: { name: String, path: String }|
+    files: places.map(|place: SourceText| place.path),
+    places: places,
+    modules: modules_of(places, analysis.outlines).map(|m: { name: String, path: String }|
       { name: m.name, file: m.path }),
-    loaded_from_cache: timed.cached,
-    reused_members: reuse_members(timed.program.tallies, timed.program.missing_results),
+    loaded_from_cache: loaded_from_cache,
+    reused_members: reuse_members(t.tallies, t.missing_results),
     phases: {
-      read_us: timed.read_ms * 1000,
-      front_end_us: timed.front_end_ms * 1000,
-      write_back_us: timed.store_ms * 1000,
+      read_us: t.phases.read_ms * 1000,
+      front_end_us: t.phases.front_end_ms * 1000,
+      write_back_us: t.phases.store_ms * 1000,
     },
     declared: scope.visible.len() + scope.filtered_out,
     cases: cases,
     positions: placed_cases(cases),
     filtered_out: scope.filtered_out,
-    warnings: opened.concat(own_diagnostics(timed.program.diagnostics, analysis.frame)),
+    warnings: opened.concat(t.warnings),
     options: object([]),
+  }
+}
+
+type CodeLoad = { timed: TimedLoad, view: CheckedProgram }
+
+fn code_load(
+  t: Session<TestReading>,
+  later: Option<TimedLoad>,
+) -> CodeLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
+  let timed = match later {
+    Some(x) -> x,
+    None -> timed_over(t.paths, t.project, time.elapsed_ms(), false),
+  };
+  match program_view(timed.program) {
+    Some(view) -> { timed: timed, view: view },
+    None -> panic("a program that checked did not load for code generation"),
   }
 }
 
@@ -264,38 +300,49 @@ fn tests_over(
   flags: Flags,
   style: Style,
   options: Options,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
+  t: Session<TestReading>,
+  places: List<SourceText>,
   begun: Int,
-) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, Derives, abort.raise} = {
+) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, toolchain.reuse_dir, Derives, abort.raise} = {
   let loaded_at = time.elapsed_us();
-  let unkept = reuse_violations(timed.program, analysis.frame);
-  let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, analysis.frame) };
+  let later = match t.value.later {
+    Some(checked) -> Some(timed_of(t, checked, false, flags.no_cache)),
+    None -> None,
+  };
+  let broken = match later {
+    None -> [],
+    Some(timed) -> match timed.program.frame {
+      None -> timed.program.diagnostics,
+      Some(frame) -> {
+        let unkept = reuse_violations(timed.program, frame);
+        if unkept.len() > 0 { unkept } else { evaluation_errors(timed, frame) }
+      },
+    },
+  };
   let promised_at = time.elapsed_us();
   let spent = { ..no_time_spent(), before_us: begun, promises_us: promised_at - loaded_at };
-  if broken.len() > 0 { rejected(style, "test", broken, timed.program.source_texts) }
-  else { selected(flags, style, options, timed, analysis, spent) }
+  if broken.len() > 0 { rejected(style, "test", broken, places) }
+  else { selected(flags, style, options, t, places, later, spent) }
 }
 
 fn selected(
   flags: Flags,
   style: Style,
   options: Options,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
+  t: Session<TestReading>,
+  places: List<SourceText>,
+  later: Option<TimedLoad>,
   spent: TimeSpent,
-) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, Derives, abort.raise} = {
+) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, toolchain.reuse_dir, Derives, abort.raise} = {
+  let analysis = t.value.listing;
   let configuring = time.elapsed_us();
   let testing = tester::start_run(options);
   results::with_result_cache(results::store_for(flags.paths, flags.no_cache), || {
     let opened = if flags.no_cache { [] } else { result_cache.open_warnings() };
-    let hashed = hashed_by_kind(analysis);
-    let listing_requests = over_cases(
-      analysis,
-      flags.filters,
-      named_modules(flags.paths, timed.program.files),
-    ).map(|i: Int|
-      { test: i, hash: listing_hash(analysis, timed.program.source_texts, hashed, i) });
+    let cased = over_cases(analysis, flags.filters, named_modules(flags.paths, t.project.files));
+    let hashed = if cased.len() == 0 { Map::new() } else { hashed_by_kind(analysis) };
+    let listing_requests = cased.map(|i: Int|
+      { test: i, hash: listing_hash(analysis, places, hashed, i) });
     let place = listings_at(flags.paths);
     let stamp = Bytes::of_string(shipped_stamps().runtime_digest);
     let cached_listings = if flags.no_cache { Map::new() } else if place.label == "cwd" {
@@ -305,19 +352,23 @@ fn selected(
       !cached_listings.contains(a.test));
     let to_list = unkept.map(|a: case_listings::ListingRequest| a.test);
     let handoff_start = time.elapsed_us();
-    let whole = if options.machine.config.schema != None { Some(loaded_analysis(timed, analysis)) }
-    else { None };
-    let analysis_for = |within: TestRunScope|
-      match whole { Some(front) -> front, None -> loaded_analysis(timed, analysis, Some(within)) };
-    let lister = if to_list.len() == 0 { None } else {
-      let within = scope_for_listing(analysis, to_list);
-      Some({ front: analysis_for(within), reach: within.owners })
+    let schema = options.machine.config.schema != None;
+    let built = if schema || to_list.len() > 0 { Some(code_load(t, later)) } else { None };
+    let lister = match built {
+      Some(c) -> if to_list.len() == 0 { None } else {
+        let within = scope_for_listing(analysis, to_list);
+        Some({
+          front: if schema { loaded_analysis(c.timed, c.view) }
+          else { loaded_analysis(c.timed, c.view, Some(within)) },
+          reach: within.owners,
+        })
+      },
+      None -> None,
     };
     let listing = time.elapsed_us();
     if to_list.len() > 0 { process.err[proc](indent() ++ "listing the test cases") };
     match list_cases(testing, lister, to_list) {
-      Err(diagnostics) ->
-        unbound(style, { diagnostics: diagnostics, places: timed.program.source_texts }),
+      Err(diagnostics) -> unbound(style, { diagnostics: diagnostics, places: places }),
       Ok(found) -> {
         if flags.no_cache { () } else if place.label == "cwd" {
           case_listings::cache_listings[cwd](place.dir, stamp, unkept, found)
@@ -331,9 +382,10 @@ fn selected(
           flags,
           style,
           testing,
-          timed,
+          t,
+          places,
           expand_cases(analysis, cases),
-          analysis_for,
+          match built { Some(c) -> Some(c.timed), None -> later },
           opened,
           { ..spent, store_us: handoff_start - configuring, handoff_us: listing - handoff_start },
           listing,
@@ -343,9 +395,9 @@ fn selected(
   })
 }
 
-fn hashed_by_kind(analysis: CheckedProgram) -> Map<Bytes, Bytes> =
-  analysis.frame.hashes.declarations.fold(
-    analysis.frame.hashes.definitions.fold(
+fn hashed_by_kind(analysis: ProgramListing) -> Map<Bytes, Bytes> =
+  analysis.hashes.declarations.fold(
+    analysis.hashes.definitions.fold(
       Map::new(),
       |accumulator: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
         accumulator.insert(b"fn ".concat(d.name), d.hash),
@@ -355,7 +407,7 @@ fn hashed_by_kind(analysis: CheckedProgram) -> Map<Bytes, Bytes> =
   )
 
 fn listing_hash(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   places: List<SourceText>,
   hashed: Map<Bytes, Bytes>,
   i: Int,
@@ -369,11 +421,11 @@ fn listing_hash(
         } else { b"" },
         None -> b"",
       };
-      let r = analysis.frame.hashes.refs;
+      let r = analysis.hashes.refs;
       blake3(
         Bytes::concat_all(
           List::fold(
-            match analysis.frame.hashes.test_refs.get(t.key) { Some(xs) -> xs, None -> [] },
+            match analysis.hashes.test_refs.get(t.key) { Some(xs) -> xs, None -> [] },
             [text],
             |accumulator: List<Bytes>, v: Int| {
               let key = Bytes::concat(
@@ -398,13 +450,14 @@ fn decided_run(
   flags: Flags,
   style: Style,
   testing: TestRun,
-  timed: TimedLoad,
+  t: Session<TestReading>,
+  places: List<SourceText>,
   over: ExpandedTests,
-  analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
+  loaded: Option<TimedLoad>,
   opened: List<Diagnostic>,
   spent: TimeSpent,
   listing: Int,
-) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.working_directory, env.variables, MachineAccess, result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing, emit.unit, emit.compiled, shipped.read_pack, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], Derives, abort.raise} = {
+) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, env.working_directory, env.variables, MachineAccess, result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing, emit.unit, emit.compiled, shipped.read_pack, toolchain.reuse_dir, entropy.next, time.now_ms, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], fs.kind[cwd], fs.kind[abs], Derives, abort.raise} = {
   let options = testing.options;
   let analysis = over.analysis;
   let selecting = time.elapsed_us();
@@ -412,12 +465,13 @@ fn decided_run(
     analysis,
     flags.filters,
     options.shard,
-    named_modules(flags.paths, timed.program.files),
+    named_modules(flags.paths, t.project.files),
   );
   let recorded_under = if flags.no_cache { None } else { Some(shipped_stamps().runtime_digest) };
   let p = program_of(
     options,
-    timed,
+    t,
+    places,
     analysis,
     over.entries,
     root_of(flags.paths),
@@ -425,21 +479,26 @@ fn decided_run(
     opened,
     recorded_under,
     tester::empty_test_unit(testing),
+    !flags.no_cache,
   );
   let searching = machine::sim_plan_of(options.sim);
   let search = search_of(searching);
-  let load_or_reuse = views::loaded_texts(timed.program.shipping, timed.program.prune_unreached);
-  let supplied = configuration::supplied(options.machine.config);
-  let first = decide(
-    cases_of(rows_of(analysis), search, flags.no_cache, options, supplied, load_or_reuse),
-  );
+  let shipped_texts = Map::new();
+  let reckoned = cases_of(rows_of(analysis), search, flags.no_cache, shipped_texts);
+  let first = decide(reckoned.cases);
   let building = time.elapsed_us();
   let visible = set_of(scope.visible);
   let running = to_run(first).filter(|i: Int| visible.contains(i));
   let within = run_within(over, running);
-  let scoped_analysis = analysis_for(within);
+  let schema = options.machine.config.schema != None;
+  let runs_code = schema || running.len() > 0;
+  let scoped_analysis = if !runs_code { no_loaded_analysis() } else {
+    let c = code_load(t, loaded);
+    if schema { loaded_analysis(c.timed, c.view) }
+    else { loaded_analysis(c.timed, c.view, Some(within)) }
+  };
   let unit_at = time.elapsed_us();
-  process.err[proc](indent() ++ "building the tests");
+  if runs_code { process.err[proc](indent() ++ "building the tests") };
   let emitted = run_unit(
     scoped_analysis,
     over,
@@ -455,11 +514,7 @@ fn decided_run(
         else { code_keys(first, codes_of(scoped_analysis, e, over.entries), search) },
         None -> Map::new(),
       };
-      let returned = by_code(
-        first,
-        passed_by_code(first, keyed, load_or_reuse, options, supplied),
-        search,
-      );
+      let returned = by_code(first, passed_by_code(first, keyed, shipped_texts), search);
       let decisions = returned.decisions;
       let classes = classes_of(p, to_run(decisions).filter(|i: Int| visible.contains(i)));
       let decided = run_decision_of(
@@ -494,11 +549,13 @@ fn decided_run(
           match configuration::resolve_configuration(options.machine.config, |name: String|
               schema_of(made_unit, name)) {
             Err(diagnostics) -> rejected(diagnostics),
-            Ok(r) -> match tester::bind_test_run(
-                testing,
-                scoped_analysis.dump,
-                configuration::run_configuration(r.configuration),
-              ) {
+            Ok(r) -> match if !runs_code { Ok(testing) } else {
+                tester::bind_test_run(
+                  testing,
+                  scoped_analysis.dump,
+                  configuration::run_configuration(r.configuration),
+                )
+              } {
               Err(diagnostics) -> rejected(diagnostics),
               Ok(bound_testing) -> {
                 let bound = time.elapsed_us();
@@ -507,14 +564,14 @@ fn decided_run(
                   style,
                   options,
                   { ..p, unit: { ..made_unit, testing: bound_testing } },
-                  timed,
+                  t.value.listing.modules,
                   analysis,
                   over.run_analysis,
                   scope,
                   decisions,
                   decided,
                   keyed,
-                  returned.written_passes,
+                  returned.written_passes.concat(reckoned.rolled),
                   searching,
                   r.warnings,
                   {

@@ -1,12 +1,13 @@
 import compiler.front.published (no_rows)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
-import compiler.front.facts (CheckedProgram)
+import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.rows (ModuleSpan, OutlinedType, OutlineItem, location_span)
 import compiler.store.hash.forms (ItemKeyed, no_cached_hashes, reach)
 import compiler.check.infer.checker (DefinitionInfo, EffectInfo, Location, TestInfo)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.syntax.fmt (line_end, line_start)
-import program (Program, front_end, sources_of)
+import program (front_end, sources_of)
+import diagnostic (SourceText)
 import std.diff
 import testing.delta (Added, Change, ChangeKind, Declaration, Delta, DefinitionKey, Derived, Edited,
                       Removed, Value, classify, kind_word)
@@ -18,7 +19,7 @@ import std.option
 import proof.prover_input (every)
 
 pub type Tree = {
-  whole: CheckedProgram,
+  whole: ProgramListing,
   sources: List<Source>,
   places: Locations,
   definitions: Map<String, String>,
@@ -29,23 +30,23 @@ fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> / {abo
   xs.fold(Map::new(), |accumulator: Map<String, String>, x: { name: Bytes, hash: Bytes }|
     accumulator.insert(String::of_bytes_lossy(x.name), x.hash.hex_of()))
 
-pub fn program_of(program: Program, analysis: CheckedProgram) -> Tree / {abort.raise} =
-  tree_of(sources_of(program, analysis.frame), analysis)
+pub fn program_of(places: List<SourceText>, analysis: ProgramListing) -> Tree / {abort.raise} =
+  tree_of(sources_of(places, analysis.outlines), analysis)
 
-pub fn tree_of(sources: List<Source>, analysis: CheckedProgram) -> Tree / {abort.raise} =
+pub fn tree_of(sources: List<Source>, analysis: ProgramListing) -> Tree / {abort.raise} =
   {
     whole: analysis,
     sources: sources,
     places: places_of(analysis),
-    definitions: by_name(analysis.frame.hashes.definitions),
-    declarations: by_name(analysis.frame.hashes.declarations),
+    definitions: by_name(analysis.hashes.definitions),
+    declarations: by_name(analysis.hashes.declarations),
   }
 
 fn closed(
   t: Tree,
   key: String,
 ) -> { functions: List<String>, declarations: List<String> } / {abort.raise} = {
-  let reachable = reach(t.whole.frame.hashes, [ItemKeyed(Bytes::of_string(key))]);
+  let reachable = reach(t.whole.hashes, [ItemKeyed(Bytes::of_string(key))]);
   {
     functions: reachable.functions.keys().map(String::of_bytes_lossy),
     declarations: reachable.declarations.keys().map(String::of_bytes_lossy),
@@ -115,7 +116,7 @@ pub type Locations = {
   tests: Map<Bytes, Location>,
 }
 
-fn places_of(analysis: CheckedProgram) -> Locations / {abort.raise} = {
+fn places_of(analysis: ProgramListing) -> Locations / {abort.raise} = {
   let effects = analysis.checked.effects.fold(
     Map::new(),
     |accumulator: Map<Bytes, Location>, e: EffectInfo| accumulator.insert(e.name, e.at),
@@ -125,10 +126,10 @@ fn places_of(analysis: CheckedProgram) -> Locations / {abort.raise} = {
       Map::new(),
       |accumulator: Map<Bytes, Location>, d: DefinitionInfo| accumulator.insert(d.name, d.at),
     ),
-    declarations: range(0, analysis.frame.outlines.len()).fold(
+    declarations: range(0, analysis.outlines.len()).fold(
       effects,
       |accumulator: Map<Bytes, Location>, i: Int| {
-        let o = analysis.frame.outlines.get(i);
+        let o = analysis.outlines.get(i);
         o.items.fold(accumulator, |into: Map<Bytes, Location>, item: OutlineItem|
           match item {
             OutlinedType(t) -> into.insert(qualify(o.name, t.name), { module: i, span: t.span }),
@@ -167,13 +168,13 @@ fn text_at(pull_request: Tree, at: Option<Location>) -> Option<Bytes> / {abort.r
   match at { Some(l) -> lines_at(pull_request.sources, l), None -> None }
 
 pub fn texts_of(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   sources: List<Source>,
   wanted: List<Bytes>,
 ) -> List<{ hash: Bytes, text: Bytes }> / {abort.raise} = {
   let wanted_hashes = wanted.fold(Map::new(), |m: Map<Bytes, Bool>, h: Bytes| m.insert(h, true));
   let p = places_of(analysis);
-  let h = analysis.frame.hashes;
+  let h = analysis.hashes;
   let placed = |at: Map<Bytes, Location>, xs: List<{ name: Bytes, hash: Bytes }>|
     xs.map(|x: { name: Bytes, hash: Bytes }| { hash: x.hash, at: at.get(x.name) });
   placed(p.values, h.definitions).concat(placed(p.declarations, h.declarations)).concat(
@@ -272,19 +273,19 @@ fn tree_of_source(source: String) -> Tree / {abort.raise} = {
     [],
   );
   match loaded.out {
-    Analysed(w) -> tree_of(sources, checked_program_of(w)),
+    Analysed(w) -> tree_of(sources, listing_of(checked_program_of(w))),
     Rejected(_) -> panic("the test fixture failed to check"),
   }
 }
 
 fn hash_of_test(t: Tree, key: String) -> Option<String> / {abort.raise} =
-  match t.whole.frame.hashes.tests.get(Bytes::of_string(key)) {
+  match t.whole.hashes.tests.get(Bytes::of_string(key)) {
     Some(h) -> Some(h.hex_of()),
     None -> None,
   }
 
 fn last_passed_hashes(t: Tree, key: String) -> LastPass / {abort.raise} = {
-  let h = t.whole.frame.hashes;
+  let h = t.whole.hashes;
   let reachable = reach(h, [ItemKeyed(Bytes::of_string(key))]);
   let hashed = |names: Map<Bytes, Bool>, of: List<{ name: Bytes, hash: Bytes }>| {
     let by = of.fold(Map::new(), |m: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
@@ -307,7 +308,7 @@ fn over(
   key: String,
   recorded: (Bytes) -> Bool,
 ) -> { delta: Delta, diffs: List<ChangeDiff> } / {abort.raise} = {
-  let hashes = before.whole.frame.hashes;
+  let hashes = before.whole.hashes;
   let all = hashes.definitions.concat(hashes.declarations).map(
     |x: { name: Bytes, hash: Bytes }| x.hash,
   ).concat(
@@ -495,7 +496,7 @@ test "when the store has no earlier source text for a definition, it is reported
 test "a recorded text is the whole lines of a definition, a type, an effect and a test" {
   let source = "effect db {\n  read get(key: Int) -> Int\n}\ntype Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s { Dot -> 1, Line(n) -> n }\ntest \"sized\" { assert_eq(size(Dot), 1) }\n";
   let t = tree_of_source(source);
-  let hashes = t.whole.frame.hashes;
+  let hashes = t.whole.hashes;
   let wanted = hashes.definitions.concat(hashes.declarations).filter(
     |x: { name: Bytes, hash: Bytes }| x.name == b"size" || x.name == b"Shape" || x.name == b"db",
   ).map(|x: { name: Bytes, hash: Bytes }| x.hash).concat(

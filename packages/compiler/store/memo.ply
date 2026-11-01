@@ -8,13 +8,13 @@ pub effect memo {
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
   read fetch(query: Bytes, input: Bytes) -> Bytes
   read output_digest(query: Bytes, input: Bytes) -> Bytes
-  read stored_output(digest: Bytes) -> Option<Bytes>
-  read is_cached(query: Bytes, input: Bytes) -> Bool
-  read provide(query: Bytes, input: Bytes, output: Bytes) -> Unit
-  read written_by(query: Bytes, input: Bytes) -> Option<Bytes>
-  read offer_as(by: Bytes, query: Bytes, input: Bytes, output: Bytes) -> Unit
-  read offered() -> Option<Bytes>
-  read recording(on: Bool) -> Unit
+  write stored_output(digest: Bytes) -> Option<Bytes>
+  write is_cached(query: Bytes, input: Bytes) -> Bool
+  write provide(query: Bytes, input: Bytes, output: Bytes) -> Unit
+  write written_by(query: Bytes, input: Bytes) -> Option<Bytes>
+  write offer_as(by: Bytes, query: Bytes, input: Bytes, output: Bytes) -> Unit
+  write offered() -> Option<Bytes>
+  write recording(on: Bool) -> Unit
 }
 
 pub type Dependency =
@@ -50,7 +50,7 @@ pub type Product = { kind: Bytes, after: List<Bytes> }
 pub type Query<| e> = {
   name: Bytes,
   hash: Bytes,
-  body: (Bytes) -> Bytes / {memo.read, abort.raise | e},
+  body: (Bytes) -> Bytes / {memo.read, memo.write, abort.raise | e},
   persistent: Bool,
   product: Option<Product>,
 }
@@ -319,10 +319,30 @@ pub fn in_session_of<| e>(
   name: Bytes,
   input: Bytes,
 ) -> Bytes / {memo_store.read, memo_store.write, abort.raise | e} =
-  in_session(queries, |run: Run| {
-    let a = query_output(queries, run, name, input);
-    { run: a.run, value: a.output }
-  })
+  in_session(queries, |run: Run| reading(queries, run, || memo.fetch(name, input)))
+
+pub fn reading<a | e>(
+  queries: Map<Bytes, Query<| e>>,
+  run: Run,
+  body: () -> a / {memo.read, abort.raise | e},
+) -> { run: Run, value: a } / {memo_store.read, memo_store.write, abort.raise | e} =
+  handle {
+    body()
+  } with {
+    var at = run,
+    memo.external(kind, place) -> memo_store.external(kind, place),
+    memo.fetch(name, input) -> {
+      let a = query_output(queries, at, name, input);
+      at = a.run;
+      a.output
+    },
+    memo.output_digest(name, input) -> {
+      let a = query_output(queries, at, name, input);
+      at = a.run;
+      digest_of(Some(a.output))
+    },
+    return value -> { run: at, value: value },
+  }
 
 fn updated_run<| e>(
   queries: Map<Bytes, Query<| e>>,
@@ -1482,7 +1502,7 @@ pub fn pack_memory_store<| e>(
 pub fn query(
   name: Bytes,
   hash: Bytes,
-  body: keep (Bytes) -> Bytes / {memo.read, abort.raise},
+  body: keep (Bytes) -> Bytes / {memo.read, memo.write, abort.raise},
 ) -> Query<| {}> = { name: name, hash: hash, body: body, persistent: true, product: None }
 
 pub fn read_file(input: Bytes) -> Bytes / {memo.read} =
@@ -1562,20 +1582,42 @@ test "a result made again that differs from its record is rejected" {
   )
 }
 
-test "a run reads each input once, even if the input changes later in the run" {
-  let reads = with_memory_store(
-    empty_memory_store(),
-    packs::no_pack,
-    b"",
-    |_: Bytes, at: Bytes| Some(at),
-    || {
-      let first = memo_store.external(b"file", b"a");
-      let digest = memo_store.external_digest(b"file", b"a");
-      { same: first == memo_store.external(b"file", b"a"), digest: digest }
+effect looking {
+  write looked_at(at: Bytes) -> Unit
+}
+
+fn doubled_length(input: Bytes) -> Bytes / {memo.read} =
+  read_file(input).concat(memo.fetch(b"length", input))
+
+fn input_looks(
+  store: MemoryStore,
+  input: Bytes,
+) -> { store: MemoryStore, looks: List<Bytes> } / {abort.raise} = {
+  let q = lengths(b"h1").insert(b"doubled", query(b"doubled", b"d1", doubled_length));
+  handle {
+    with_memory_store(
+      store,
+      packs::no_pack,
+      b"",
+      |_: Bytes, at: Bytes| {
+        looking.looked_at(at);
+        Some(at)
+      },
+      || in_session_of(q, b"doubled", input),
+    ).store
+  } with {
+    var looks: List<Bytes> = [],
+    looking.looked_at(at) -> {
+      looks = looks.push(at);
     },
-  );
-  assert(reads.value.same);
-  assert_eq(reads.value.digest, digest_of(Some(b"a")))
+    return kept -> { store: kept, looks: looks },
+  }
+}
+
+test "a run reads each input once, in the update and in every query that reads it" {
+  let first = input_looks(empty_memory_store(), b"a");
+  assert_eq(first.looks, [b"a"]);
+  assert_eq(input_looks(first.store, b"a").looks, [b"a"])
 }
 
 test "a run with no changed input runs no query" {
@@ -1612,14 +1654,14 @@ test "a query whose code changed runs again, and its dependents stop there if it
   assert_eq(fetched_in(lengths(b"h2"), moved.world, b"label", b"a").ran, [])
 }
 
-fn split_lines(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+fn split_lines(input: Bytes) -> Bytes / {memo.read, memo.write, abort.raise} = {
   let lines = read_file(input).split(b"\n");
   range(0, lines.len()).fold((), |_: Unit, i: Int|
     memo.provide(b"line", input.concat(Bytes::of_string(i.to_string())), lines.get(i)));
   Bytes::of_string(lines.len().to_string())
 }
 
-fn line_of(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+fn line_of(input: Bytes) -> Bytes / {memo.read, memo.write, abort.raise} =
   match memo.written_by(b"split", input.slice(0, 1)) { Some(o) -> o, None -> b"no line" }
 
 fn line_shouted(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"line", input).concat(b"!")

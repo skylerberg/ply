@@ -3,8 +3,8 @@ import std.fs (fs)
 import std.path (strip_root)
 import compiler.cc (toolchain)
 import compiler.store.memo
-import compiler.store.memo (Run, QueryStats, reachable_keys, missing_count, query_output,
-                            in_session, in_session_of, query_stats, executed_for)
+import compiler.store.memo (memo, Run, QueryStats, reachable_keys, missing_count, reading,
+                            in_session, query_stats)
 import compiler.store.memo_files
 import compiler.store.packs
 import compiler.unit (shipped, pack_frame)
@@ -13,13 +13,12 @@ import compiler.front.checking (CheckedModule, PackageFile, OwnPackage, LoadInpu
                                 lookup_input, nothing_derived, rejected_first, registry,
                                 check_shipped_modules, shipped_queries, wanted_all, load_inputs_of,
                                 package_location_in)
-import compiler.front.checking.world (CheckQuery, RunEffects, ModuleKey, with_decode_cache, decoded,
+import compiler.front.checking.world (CheckQuery, RunEffects, with_decode_cache, decoded,
                                       module_key_bin)
-import compiler.front.checking.groups (GroupKey, ProgramSummary, declarers_input, group_key_bin,
-                                       program_summary_bin, program_summary_query, symbol_query)
+import compiler.front.checking.groups (GroupKey, group_key_bin)
 import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_bin,
-                                         body_program_query, cost_walk_query, measure_entry_bin,
-                                         measures_query, module_costs_query)
+                                         body_program_query, measure_entry_bin, measures_query,
+                                         module_costs_query)
 import compiler.emit.costs (Report, report_bin)
 import compiler.load (Derives, derivation_response)
 import compiler.front.pages (Pages)
@@ -123,20 +122,18 @@ fn embedded_inputs(
       },
   )
 
-fn own_embeds(
+pub fn own_embeds(
   project: Project,
   w: LoadInputs,
-  results: List<CheckedModule>,
+  embeds: List<ModuleEmbed>,
 ) -> List<Embed> / {abort.raise} =
-  results.fold([], |accumulator: List<Embed>, a: CheckedModule|
-    match package_location_in(w, a.module) {
+  embeds.fold([], |accumulator: List<Embed>, e: ModuleEmbed|
+    match package_location_in(w, e.module) {
       None -> accumulator,
-      Some(p) ->
-        a.result.shape.embeds.fold(accumulator, |es: List<Embed>, e: ModuleEmbed|
-          match embed_of(project, p.package, p.relative, request_of_key(e.key), e.read) {
-            Some(x) -> es.push(x),
-            None -> es,
-          }),
+      Some(p) -> match embed_of(project, p.package, p.relative, request_of_key(e.key), e.read) {
+        Some(x) -> accumulator.push(x),
+        None -> accumulator,
+      },
     })
 
 fn shipped_data(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
@@ -171,198 +168,164 @@ pub fn nothing() -> QueryResults =
     missing_results: 0,
   }
 
-type ModuleResults = {
+pub type ModuleResults = {
   results: List<CheckedModule>,
   pulled: List<Bytes>,
   shipped_wants: Map<Bytes, ShippedWants>,
   modules: List<ModuleHashes>,
 }
 
-fn query_modules(
-  qs: Map<Bytes, CheckQuery>,
-  own: List<Bytes>,
-  run: Run,
-) -> { run: Run, value: ModuleResults } / {RunEffects, abort.raise} = {
-  let all = query_load(qs, own, [], false, run);
-  let results = all.value.results;
-  let pulled = all.value.pulled;
-  let wanted = wanted_all(qs, pulled, false, all.run);
-  let fixed = if rejected_first(results).len() > 0 { { run: wanted.run, value: [] } }
-  else { hashed_all(qs, own, pulled, false, wanted.run) };
+pub fn module_results(own: List<Bytes>) -> ModuleResults / {memo.read, abort.raise} = {
+  let all = query_load(own, [], false);
   {
-    run: fixed.run,
-    value: { results: results, pulled: pulled, shipped_wants: wanted.value, modules: fixed.value },
+    results: all.results,
+    pulled: all.pulled,
+    shipped_wants: wanted_all(all.pulled, false),
+    modules: if rejected_first(all.results).len() > 0 { [] }
+    else { hashed_all(own, all.pulled, false) },
   }
 }
 
-fn queried_of(
-  project: Project,
-  w: LoadInputs,
-  done: { run: Run, value: ModuleResults },
+pub type Opened<a> = {
+  inputs: LoadInputs,
+  value: a,
   seen: Map<Bytes, Bytes>,
-) -> QueryResults / {fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  tallies: List<QueryStats>,
+  missing_results: Int,
+}
+
+fn opened_from<a>(
+  w: LoadInputs,
+  done: { value: { value: a, tallies: List<QueryStats>, missing_results: Int }, seen: Map<Bytes, Bytes> },
+) -> Opened<a> =
   {
-    results: done.value.results,
-    pulled: done.value.pulled,
-    wants: done.value.shipped_wants,
-    modules: done.value.modules,
-    embeds: own_embeds(project, w, done.value.results),
-    inputs: embedded_inputs(project, w, done.value.results, seen),
-    tallies: query_stats(done.run),
-    missing_results: missing_count(done.run),
+    inputs: w,
+    value: done.value.value,
+    seen: done.seen,
+    tallies: done.value.tallies,
+    missing_results: done.value.missing_results,
   }
 
-pub fn query_through_store<[r]>(
-  dir: String,
-  project: Project,
-) -> QueryResults / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  let ran = recording_embeds(||
-    memo_files::with_memo_store[r](
-      dir,
-      pack_frame,
-      shipped_files(),
-      |kind: Bytes, at: Bytes|
-        read_project_input(
-          w,
-          |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
-          kind,
-          at,
-        ),
-      ||
-        with_decode_cache(||
-          in_session(qs, |run: Run| {
-            let q = query_modules(qs, w.own, run);
-            { run: q.run, value: q }
-          })),
-    ));
-  queried_of(project, w, ran.value, ran.seen)
-}
-
-pub fn over_project_store<a, [r]>(
-  dir: String,
-  project: Project,
-  work: (Map<Bytes, CheckQuery>, LoadInputs) -> a / {RunEffects, abort.raise},
-) -> a / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  memo_files::with_memo_store[r](
-    dir,
-    pack_frame,
-    shipped_files(),
-    |kind: Bytes, at: Bytes|
-      read_project_input(
-        w,
-        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-        kind,
-        at,
-      ),
-    || with_decode_cache(|| work(qs, w)),
-  )
-}
-
-pub fn over_temporary_store<a>(
-  project: Project,
-  work: (Map<Bytes, CheckQuery>, LoadInputs) -> a / {RunEffects, abort.raise},
-) -> a / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  memo::with_temporary_store(
-    pack_frame,
-    shipped_files(),
-    |kind: Bytes, at: Bytes|
-      read_project_input(
-        w,
-        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-        kind,
-        at,
-      ),
-    || with_decode_cache(|| work(qs, w)),
-  )
-}
-
-pub type PromiseFacts = { costs: List<Report>, measures: List<MeasureEntry>, walked: Int }
-
-fn root_keys(modules: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  modules.map(|m: Bytes|
-    bin::encode({ module: m, shipped: false, tested: false }, module_key_bin()))
-
-fn outputs_of(
+fn read_session<a>(
   qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  name: Bytes,
-  inputs: List<Bytes>,
-) -> { run: Run, value: List<Bytes> } / {RunEffects, abort.raise} =
-  inputs.fold(
-    { run: run, value: [] },
-    |accumulator: { run: Run, value: List<Bytes> }, input: Bytes| {
-      let a = query_output(qs, accumulator.run, name, input);
-      { run: a.run, value: accumulator.value.push(a.output) }
-    },
-  )
-
-pub fn promise_facts(
-  qs: Map<Bytes, CheckQuery>,
-  modules: List<Bytes>,
-  costs: Bool,
-  measures: Bool,
-) -> PromiseFacts / {RunEffects, abort.raise} =
+  w: LoadInputs,
+  work: (LoadInputs) -> a / {memo.read, abort.raise},
+) -> { value: a, tallies: List<QueryStats>, missing_results: Int } / {RunEffects, abort.raise} =
   in_session(qs, |run: Run| {
-    let inputs = root_keys(modules);
-    let costed = outputs_of(qs, run, module_costs_query(), if costs { inputs } else { [] });
-    let listed = outputs_of(qs, costed.run, measures_query(), if measures { inputs } else { [] });
+    let done = reading(qs, run, || work(w));
     {
-      run: listed.run,
+      run: done.run,
       value: {
-        costs: costed.value.map(|b: Bytes| decoded(b, report_bin(), "a module's costs")),
-        measures: listed.value.fold([], |accumulator: List<MeasureEntry>, b: Bytes|
-          accumulator.concat(
-            decoded(b, bin::list_bin(measure_entry_bin()), "a module's measures"),
-          )),
-        walked: executed_for(listed.run, cost_walk_query()).len(),
+        value: done.value,
+        tallies: query_stats(done.run),
+        missing_results: missing_count(done.run),
       },
     }
   })
 
-pub fn body_programs(
-  qs: Map<Bytes, CheckQuery>,
-  units: List<GroupKey>,
-) -> List<BodyProgram> / {RunEffects, abort.raise} =
-  in_session(qs, |run: Run|
-    outputs_of(
-      qs,
-      run,
-      body_program_query(),
-      units.map(|u: GroupKey| bin::encode(u, group_key_bin())),
-    )).map(|b: Bytes| decoded(b, body_program_bin(), "a body program"))
-
-pub fn checked_summary<[r]>(
+pub fn stored_session<a, [r]>(
   dir: String,
   project: Project,
-) -> ProgramSummary / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
-  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, w: LoadInputs|
+  work: (LoadInputs) -> a / {memo.read, abort.raise},
+) -> Opened<a> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+  let qs = running_queries();
+  let w = query_inputs(project);
+  opened_from(
+    w,
+    recording_embeds(||
+      memo_files::with_memo_store[r](
+        dir,
+        pack_frame,
+        shipped_files(),
+        |kind: Bytes, at: Bytes|
+          read_project_input(
+            w,
+            |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
+            kind,
+            at,
+          ),
+        || with_decode_cache(|| read_session(qs, w, work)),
+      )),
+  )
+}
+
+pub type PromiseFacts = { costs: List<Report>, measures: List<MeasureEntry> }
+
+pub fn promise_facts(
+  modules: List<Bytes>,
+  costs: Bool,
+  measures: Bool,
+) -> PromiseFacts / {memo.read, abort.raise} = {
+  let inputs = modules.map(|m: Bytes|
+    bin::encode({ module: m, shipped: false, tested: false }, module_key_bin()));
+  {
+    costs: (if costs { inputs } else { [] }).map(|i: Bytes|
+      decoded(memo.fetch(module_costs_query(), i), report_bin(), "a module's costs")),
+    measures: (if measures { inputs } else { [] }).fold(
+      [],
+      |found: List<MeasureEntry>, i: Bytes|
+        found.concat(
+          decoded(
+            memo.fetch(measures_query(), i),
+            bin::list_bin(measure_entry_bin()),
+            "a module's measures",
+          ),
+        ),
+    ),
+  }
+}
+
+pub fn body_programs(units: List<GroupKey>) -> List<BodyProgram> / {memo.read, abort.raise} =
+  units.map(|u: GroupKey|
     decoded(
-      in_session_of(
-        qs,
-        program_summary_query(),
-        bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
-      ),
-      program_summary_bin(),
-      "the program's summary",
+      memo.fetch(body_program_query(), bin::encode(u, group_key_bin())),
+      body_program_bin(),
+      "a body program",
     ))
 
-pub fn declarers<[r]>(
-  dir: String,
+pub fn temporary_session<a>(
   project: Project,
-  name: Bytes,
-) -> List<Bytes> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
-  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, w: LoadInputs|
-    decoded(
-      in_session_of(qs, symbol_query(), declarers_input(name)),
-      bin::list_bin(bin::bytes_bin()),
-      "the modules that declare a name",
-    ))
+  work: (LoadInputs) -> a / {memo.read, abort.raise},
+) -> Opened<a> / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+  let qs = running_queries();
+  let w = query_inputs(project);
+  opened_from(
+    w,
+    recording_embeds(||
+      memo::with_temporary_store(
+        pack_frame,
+        shipped_files(),
+        |kind: Bytes, at: Bytes|
+          read_project_input(
+            w,
+            |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
+            kind,
+            at,
+          ),
+        || with_decode_cache(|| read_session(qs, w, work)),
+      )),
+  )
+}
+
+pub fn results_of(
+  project: Project,
+  opened: Opened<ModuleResults>,
+) -> QueryResults / {fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  {
+    results: opened.value.results,
+    pulled: opened.value.pulled,
+    wants: opened.value.shipped_wants,
+    modules: opened.value.modules,
+    embeds: own_embeds(
+      project,
+      opened.inputs,
+      opened.value.results.fold([], |accumulator: List<ModuleEmbed>, a: CheckedModule|
+        accumulator.concat(a.result.shape.embeds.map(|e: ModuleEmbed| { ..e, module: a.module }))),
+    ),
+    inputs: embedded_inputs(project, opened.inputs, opened.value.results, opened.seen),
+    tallies: opened.tallies,
+    missing_results: opened.missing_results,
+  }
 
 pub fn shipped_results<[r]>(
   store_dir: String,
@@ -390,10 +353,10 @@ pub fn shipped_results<[r]>(
     ||
       with_decode_cache(||
         in_session(qs, |run: Run| {
-          let all = check_shipped_modules(qs, shipped, run);
+          let all = reading(qs, run, || check_shipped_modules(shipped));
           {
             run: all.run,
-            value: { keys: reachable_keys(qs, wanted, all.run), rejected: all.rejected },
+            value: { keys: reachable_keys(qs, wanted, all.run), rejected: all.value },
           }
         })),
   )
@@ -414,42 +377,8 @@ pub fn write_shipped_pack<[r]>(
 fn shipped_files() -> Bytes / {fs.read_file[shipped]} =
   match fs.read_file[shipped]("digests") { Some(b) -> b, None -> b"" }
 
-pub fn query_uncached(
-  project: Project,
-) -> QueryResults / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  let ran = recording_embeds(||
-    memo::with_temporary_store(
-      pack_frame,
-      shipped_files(),
-      |kind: Bytes, at: Bytes|
-        read_project_input(
-          w,
-          |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
-          kind,
-          at,
-        ),
-      ||
-        with_decode_cache(||
-          in_session(qs, |run: Run| {
-            let q = query_modules(qs, w.own, run);
-            { run: q.run, value: q }
-          })),
-    ));
-  queried_of(project, w, ran.value, ran.seen)
-}
-
-pub fn doc_pages<[r]>(
-  dir: String,
-  project: Project,
-  modules: List<ModuleKey>,
-) -> List<Pages> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
-  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
-    in_session(qs, |run: Run| documented_all(qs, modules, run)))
-
 fn query_shipped<a>(
-  query: (Map<Bytes, CheckQuery>, Run) -> { run: Run, value: a } / {RunEffects, abort.raise},
+  query: () -> a / {memo.read, abort.raise},
 ) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
@@ -467,18 +396,18 @@ fn query_shipped<a>(
         kind,
         at,
       ),
-    || with_decode_cache(|| in_session(qs, |run: Run| query(qs, run))),
+    || with_decode_cache(|| in_session(qs, |run: Run| reading(qs, run, query))),
   )
 }
 
 pub fn shipped_doc_pages(
   modules: List<Bytes>,
 ) -> List<Pages> / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} =
-  query_shipped(|qs: Map<Bytes, CheckQuery>, run: Run|
-    documented_all(qs, modules.map(|m: Bytes| { module: m, shipped: true, tested: false }), run))
+  query_shipped(||
+    documented_all(modules.map(|m: Bytes| { module: m, shipped: true, tested: false })))
 
 pub fn shipped_declarations() -> Map<Bytes, List<Bytes>> / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} =
-  query_shipped(|qs: Map<Bytes, CheckQuery>, run: Run| declaring_in(qs, b"std", run))
+  query_shipped(|| declaring_in(b"std"))
 
 pub fn current_hashes() -> Map<Bytes, Bool> / {fs.read_file[shipped], abort.raise} =
   running_queries().fold(Map::new(), |accumulator: Map<Bytes, Bool>, _: Bytes, q: CheckQuery|

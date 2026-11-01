@@ -1,5 +1,6 @@
 import compiler.emit.costs (Report, Costed, Site, ReturnMismatch, placed_span, report_of)
-import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_checked)
+import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_checked,
+                                         cost_walk_query)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.exports (InRoot)
 import compiler.front.facts (Frame)
@@ -10,15 +11,14 @@ import compiler.check.resolve.tables (Source, Diagnostic, error_at, error_at_and
 import compiler.syntax.parsing (Span, no_module, dummy_span, span_between)
 import compiler.unit (identity_of, shipped)
 import compiler.store.records (record_store, with_record_store)
-import compiler.front.checking.world (CheckQuery)
 import compiler.load (Derives)
 import diagnostic (SourceText, position_of)
 import compiler.cc (toolchain)
 import program (Program, ProgramPlace, in_program_store)
-import module_queries (PromiseFacts, promise_facts, body_programs)
+import module_queries (promise_facts, body_programs)
 import compiler.front.checking (LoadInputs, fresh_registry, inputs_alone, lookup_input_alone,
                                 over_decoding, prelude_files, prelude_frames)
-import compiler.store.memo (empty_memory_store)
+import compiler.store.memo (QueryStats, Run, empty_memory_store, in_session, reading)
 import proof.static_prover (UnprovedMeasure, unproved_measures)
 import report (indent)
 import std.term (Style, bold, dim, red, green, yellow, plain)
@@ -52,13 +52,15 @@ pub fn has_promises(program: Program, frame: Frame) -> Bool =
 pub fn has_measures(program: Program, frame: Frame) -> Bool =
   functions_asking(program, frame, |f: FunctionOutline| f.measured)
 
+pub fn no_promises() -> Promises = { report: None, walked: 0, unproved: [] }
+
 pub fn promises_of(
   program: Program,
   frame: Frame,
   costs: Bool,
 ) -> Promises / {cost_checker.report, abort.raise} = {
   let measures = has_measures(program, frame);
-  if !costs && !measures { { report: None, walked: 0, unproved: [] } }
+  if !costs && !measures { no_promises() }
   else { cost_checker.report({ place: program.place, costs: costs, measures: measures }) }
 }
 
@@ -178,8 +180,8 @@ fn measures_settled(
     });
     let open = known.filter(|k: KnownVerdict| k.failures == None);
     let proved = if open.len() == 0 { [] } else {
-      in_program_store(place, |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
-        body_programs(qs, open.map(|k: KnownVerdict| k.entry.unit))).map(
+      in_program_store(place, |_: LoadInputs|
+        body_programs(open.map(|k: KnownVerdict| k.entry.unit))).value.map(
         measure_failures,
       )
     };
@@ -224,18 +226,17 @@ pub fn with_cost_cache<a | e>(
   } with {
     cost_checker.report(ask) -> {
       let modules = ask.place.project.sources.map(|s: Source| s.name);
-      let facts: PromiseFacts = in_program_store(
-        ask.place,
-        |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
-          promise_facts(qs, modules, ask.costs, ask.measures),
-      );
+      let opened = in_program_store(ask.place, |_: LoadInputs|
+        promise_facts(modules, ask.costs, ask.measures));
+      let facts = opened.value;
       {
         report: if !ask.costs { None } else {
           Some(
             report_of(range(0, facts.costs.len()).map(|i: Int| at_module(i, facts.costs.get(i)))),
           )
         },
-        walked: facts.walked,
+        walked: opened.tallies.fold(0, |n: Int, t: QueryStats|
+          if t.query == cost_walk_query() { n + t.ran } else { n }),
         unproved: if facts.measures.len() == 0 { [] }
         else { measures_settled(ask.place, modules, facts.measures) },
       }
@@ -429,10 +430,12 @@ fn failures_over(sources: List<Source>) -> List<MeasureFailure> / {abort.raise} 
     prelude_frames,
     prelude_files(),
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || {
-      let listed = promise_facts(qs, sources.map(|s: Source| s.name), false, true);
-      body_programs(qs, listed.measures.map(|e: MeasureEntry| e.unit))
-    },
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let listed = promise_facts(sources.map(|s: Source| s.name), false, true);
+          body_programs(listed.measures.map(|e: MeasureEntry| e.unit))
+        })),
   ).value.fold([], |accumulator: List<MeasureFailure>, p: BodyProgram|
     accumulator.concat(measure_failures(p)))
 }

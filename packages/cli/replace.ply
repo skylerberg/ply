@@ -7,16 +7,18 @@ import args (Flags, no_flags, style_of)
 import paths
 import paths (RootedPath, displayed, write_file)
 import diagnostic (all_to_json, all_to_text, errors_of, errors_text)
-import program (Program, load_program, reanalysed, no_program, program_view)
-import compiler.load (Derives, report_viewed)
+import program (places_of, session, session_over)
+import compiler.load (Derives)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules)
+import compiler.front.checking.groups (ProgramSummary)
+import diagnostic (SourceText)
 import compiler.unit (shipped)
 import report (CommandOutput, schema_version, ok_code, compile_error, rejected)
 import show (DefinitionSource, locate)
-import sources (File)
+import sources (File, Project)
 import std.term (Style, plain)
-import compiler.front.facts (CheckedProgram)
-import compiler.front (PulledAnalysis)
-import compiler.front.emitter_input (Rejected, Analysed)
+import compiler.front.facts (ProgramListing)
 import compiler.syntax.fmt (replace_item)
 import compiler.store.hash.forms (HashOutput, by_name)
 import compiler.store.hash (no_hashes)
@@ -145,48 +147,55 @@ pub fn difference(before: HashOutput, after: HashOutput, name: String) -> Option
   }
 }
 
-fn replaced_sources(program: Program, at: Int, text: Bytes) -> List<Source> =
-  range(0, program.files.len()).map(|i: Int|
-    match program.files.at(i) {
-      None -> { name: b"", source_text: b"" },
-      Some(f) ->
-        { name: Bytes::of_string(f.module), source_text: if i == at { text } else { f.text } },
-    })
+type Replacing = {
+  paths: List<paths::ResolvedPath>,
+  project: Project,
+  places: List<SourceText>,
+  before: HashOutput,
+}
+
+fn with_file_text(project: Project, at: Int, text: Bytes) -> Project / {abort.raise} =
+  {
+    ..project,
+    files: range(0, project.files.len()).map(|i: Int|
+      if i == at { { ..project.files.get(i), text: text } } else { project.files.get(i) }),
+    sources: range(0, project.sources.len()).map(|i: Int|
+      if i == at { { ..project.sources.get(i), source_text: text } }
+      else { project.sources.get(i) }),
+  }
 
 fn still_the_same(
-  program: Program,
-  analysis: CheckedProgram,
+  at: Replacing,
   shown: DefinitionSource,
   text: Bytes,
-) -> Option<Diagnostic> / {abort.raise, shipped.report_view_used} = {
-  let before: HashOutput = analysis.frame.hashes;
-  let out: PulledAnalysis = reanalysed(
-    program,
-    analysis.frame,
-    replaced_sources(program, shown.at.module, text),
-    Bytes::of_string(shown.name),
-  );
-  report_viewed(out.shipped_views, false);
-  match out.out {
-    Rejected(ds) ->
+) -> Option<Diagnostic> / {shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise} =
+  match session_over(
+      at.paths,
+      with_file_text(at.project, shown.at.module, text),
+      time.elapsed_ms(),
+      false,
+      false,
+      |m: Modules, _: ProgramSummary| view::listed(m).hashes,
+    ) {
+    Err(r) ->
       Some(
         not_the_same(
           shown,
-          "with `" ++ shown.name ++ "` replaced, the program does not check: " ++ errors_text(ds),
+          "with `" ++ shown.name ++ "` replaced, the program does not check: "
+            ++ errors_text(r.diagnostics),
         ),
       ),
-    Analysed(after) -> match difference(before, after.hashes, shown.name) {
+    Ok(after) -> match difference(at.before, after.value, shown.name) {
       None -> None,
       Some(message) -> Some(not_the_same(shown, message)),
     },
   }
-}
 
-fn file_of(program: Program, shown: DefinitionSource) -> Option<File> =
-  program.files.at(shown.at.module)
+fn file_of(project: Project, shown: DefinitionSource) -> Option<File> =
+  project.files.at(shown.at.module)
 
 fn output_lines(
-  p: Program,
+  p: Project,
   flags: Flags,
   shown: Option<DefinitionSource>,
   changed: Bool,
@@ -210,13 +219,14 @@ fn file_json(shown: Option<DefinitionSource>) -> Json =
 pub fn replace_output(
   style: Style,
   flags: Flags,
-  program: Program,
+  project: Project,
+  places: List<SourceText>,
   shown: Option<DefinitionSource>,
   changed: Bool,
   diagnostics: List<Diagnostic>,
 ) -> CommandOutput / {abort.raise} = {
   let code = if diagnostics.len() == 0 { ok_code() } else { compile_error() };
-  let lines = if diagnostics.len() > 0 { [] } else { output_lines(program, flags, shown, changed) };
+  let lines = if diagnostics.len() > 0 { [] } else { output_lines(project, flags, shown, changed) };
   {
     json: object([
       { key: "command", value: Str("replace") },
@@ -226,57 +236,65 @@ pub fn replace_output(
       { key: "name", value: name_json(shown) },
       { key: "file", value: file_json(shown) },
       { key: "changed", value: Bool(changed) },
-      { key: "diagnostics", value: all_to_json(diagnostics, program.source_texts) },
+      { key: "diagnostics", value: all_to_json(diagnostics, places) },
     ]),
     lines: lines,
-    errs: all_to_text(style, diagnostics, program.source_texts),
+    errs: all_to_text(style, diagnostics, places),
     code: code,
   }
 }
 
+fn opened_output(
+  style: Style,
+  flags: Flags,
+  at: Replacing,
+  shown: Option<DefinitionSource>,
+  changed: Bool,
+  diagnostics: List<Diagnostic>,
+) -> CommandOutput / {abort.raise} =
+  replace_output(style, flags, at.project, at.places, shown, changed, diagnostics)
+
 fn stopped(
   style: Style,
   flags: Flags,
-  program: Program,
+  at: Replacing,
   shown: DefinitionSource,
   diagnostic: Diagnostic,
 ) -> CommandOutput / {abort.raise} =
-  replace_output(style, flags, program, Some(shown), false, [diagnostic])
+  opened_output(style, flags, at, Some(shown), false, [diagnostic])
 
 fn written(
   style: Style,
   flags: Flags,
-  program: Program,
+  at: Replacing,
   shown: DefinitionSource,
   file: File,
   text: Bytes,
 ) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], abort.raise} =
-  if flags.check { replace_output(style, flags, program, Some(shown), true, []) }
-  else if write_file(file.at, text) { replace_output(style, flags, program, Some(shown), true, []) }
-  else { stopped(style, flags, program, shown, unwritable(displayed(file.at))) }
+  if flags.check { opened_output(style, flags, at, Some(shown), true, []) }
+  else if write_file(file.at, text) { opened_output(style, flags, at, Some(shown), true, []) }
+  else { stopped(style, flags, at, shown, unwritable(displayed(file.at))) }
 
 fn replaced(
   style: Style,
   flags: Flags,
-  program: Program,
-  analysis: CheckedProgram,
+  at: Replacing,
   shown: DefinitionSource,
   file: File,
   read_replacement: String,
-) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], abort.raise, shipped.report_view_used} =
+) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise} =
   match replace_item(
       shown.text,
       Bytes::of_string(shown.unqualified_name),
       Bytes::of_string(read_replacement),
     ) {
     Err(reason) ->
-      stopped(style, flags, program, shown, not_one_item(shown, String::of_bytes_lossy(reason))),
-    Ok(text) -> if text == shown.text {
-      replace_output(style, flags, program, Some(shown), false, [])
-    } else {
-      match still_the_same(program, analysis, shown, text) {
-        Some(d) -> stopped(style, flags, program, shown, d),
-        None -> written(style, flags, program, shown, file, text),
+      stopped(style, flags, at, shown, not_one_item(shown, String::of_bytes_lossy(reason))),
+    Ok(text) -> if text == shown.text { opened_output(style, flags, at, Some(shown), false, []) }
+    else {
+      match still_the_same(at, shown, text) {
+        Some(d) -> stopped(style, flags, at, shown, d),
+        None -> written(style, flags, at, shown, file, text),
       }
     },
   }
@@ -284,16 +302,15 @@ fn replaced(
 fn rewritten(
   style: Style,
   flags: Flags,
-  program: Program,
-  analysis: CheckedProgram,
+  at: Replacing,
   shown: DefinitionSource,
-) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], edit.replacement_text[replace], abort.raise, shipped.report_view_used} =
-  match file_of(program, shown) {
+) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], edit.replacement_text[replace], shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise} =
+  match file_of(at.project, shown) {
     None ->
       stopped(
         style,
         flags,
-        program,
+        at,
         shown,
         not_the_same(
           shown,
@@ -301,22 +318,29 @@ fn rewritten(
         ),
       ),
     Some(file) -> match edit.replacement_text[replace](flags.out) {
-      Err(reason) -> stopped(style, flags, program, shown, unreadable(reason)),
-      Ok(read_replacement) ->
-        replaced(style, flags, program, analysis, shown, file, read_replacement),
+      Err(reason) -> stopped(style, flags, at, shown, unreadable(reason)),
+      Ok(read_replacement) -> replaced(style, flags, at, shown, file, read_replacement),
     },
   }
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], edit.replacement_text[replace], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], edit.replacement_text[replace], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let s = style_of(flags);
-  match program_view(loaded) {
-    None -> rejected(s, "replace", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> match locate(loaded, w, flags.query) {
-      Err(d) -> replace_output(s, flags, loaded, None, false, [d]),
-      Ok(shown) -> rewritten(s, flags, loaded, w, shown),
+  match session(flags.paths, flags.verify_dependencies, false, |m: Modules, _: ProgramSummary|
+      view::listed(m)) {
+    Err(r) -> rejected(s, "replace", r.diagnostics, r.places),
+    Ok(opened) -> {
+      let at = {
+        paths: opened.paths,
+        project: opened.project,
+        places: places_of(opened),
+        before: opened.value.hashes,
+      };
+      match locate(at.places, opened.value, flags.query) {
+        Err(d) -> opened_output(s, flags, at, None, false, [d]),
+        Ok(shown) -> rewritten(s, flags, at, shown),
+      }
     },
   }
 }
@@ -350,7 +374,18 @@ fn flags_of(check: Bool) -> Flags = { ..no_flags(), check: check }
 fn a_file(rooted: RootedPath) -> File =
   { path: "m.ply", module: "m", text: example_definition().text, at: rooted }
 
-fn a_program(rooted: RootedPath) -> Program = { ..no_program(), files: [a_file(rooted)] }
+fn a_replacing(rooted: RootedPath) -> Replacing =
+  { paths: [], project: a_program(rooted), places: [], before: no_hashes() }
+
+fn a_program(rooted: RootedPath) -> Project =
+  {
+    files: [a_file(rooted)],
+    sources: [],
+    diagnostics: [],
+    manifest: None,
+    packages: [],
+    root_key: "",
+  }
 
 test "`difference` returns `None` when two programs differ only in the definition `m.two`" {
   assert_eq(difference(two_definitions(b"bb"), two_definitions(b"cc"), "m.two"), None)
@@ -420,7 +455,7 @@ test "a replacement is written to the same path, through the same file system ha
     written(
       plain(),
       flags_of(false),
-      a_program(at),
+      a_replacing(at),
       example_definition(),
       a_file(at),
       b"fn two() -> Int = 1 + 1\n",
@@ -438,6 +473,7 @@ test "a rejection exits 2, writes no line, and renders the diagnostic to the err
     plain(),
     flags_of(false),
     a_program({ label: "cwd", path: "m.ply" }),
+    [],
     Some(example_definition()),
     false,
     [not_the_same(example_definition(), "the replacement of `m.two` adds `m.twice`")],

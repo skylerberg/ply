@@ -33,7 +33,7 @@ import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (CalleeFacts, LoweredBatch, LoweredUnit, UnitCode, UnitSummary, RootSummary,
                       WholeLowering, unit_code_bin, unit_summary_bin, no_callee_facts, with_callee,
-                      unit_lowered, program_batch, part_rule, types_keyed, part_library)
+                      unit_lowered, program_batch, types_keyed, part_library)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
 
@@ -144,48 +144,38 @@ fn roots_of_item(
 fn is_test_root(k: RootKey) -> Bool =
   match k { Test(_) -> true, TestCases(_) -> true, Law(_) -> true, _ -> false }
 
-type SizedGroup = { group: GroupKey, roots: List<RootKey>, size: Int }
+type RootedGroup = { group: GroupKey, roots: List<RootKey> }
 
-type Chunking = { out: List<GroupRoots>, label: Bytes, bytes: Int }
+type Chunking = { out: List<GroupRoots>, label: Bytes, groups: Int }
 
-fn source_rule_bits() -> Int = 4
+fn chunk_rule_bits() -> Int = 4
 
-fn source_share() -> Int = 16
+fn fewest_groups_in_a_chunk() -> Int = 32
 
-fn chunked(module: Bytes, groups: List<SizedGroup>) -> List<GroupRoots> / {abort.raise} = {
-  let rule = part_rule();
-  let least = rule.min / source_share();
-  let most = rule.max / source_share();
-  groups.fold({ out: [], label: b"", bytes: 0 }, |accumulator: Chunking, g: SizedGroup| {
+fn most_groups_in_a_chunk() -> Int = 256
+
+fn chunked(module: Bytes, groups: List<RootedGroup>) -> List<GroupRoots> / {abort.raise} =
+  groups.fold({ out: [], label: b"", groups: 0 }, |accumulator: Chunking, g: RootedGroup| {
     let first = g.group.owners.at_or(0, b"");
-    let picked = root_id(qualify(module, first)) & (1 << source_rule_bits()) - 1 == 0;
-    let opens = accumulator.label == b"" || (accumulator.bytes >= least && picked)
-      || accumulator.bytes + g.size > most;
+    let picked = root_id(qualify(module, first)) & (1 << chunk_rule_bits()) - 1 == 0;
+    let opens = accumulator.label == b""
+      || (accumulator.groups >= fewest_groups_in_a_chunk() && picked)
+      || accumulator.groups >= most_groups_in_a_chunk();
     let label = if opens { first } else { accumulator.label };
     {
       out: accumulator.out.push({ group: g.group, roots: g.roots, chunk: label }),
       label: label,
-      bytes: if opens { g.size } else { accumulator.bytes + g.size },
+      groups: if opens { 1 } else { accumulator.groups + 1 },
     }
   }).out
-}
 
-type OwnerPlaces = { at: Map<Bytes, Int>, sizes: Map<Bytes, Int> }
+fn owner_places(read: OwnersResult) -> Map<Bytes, Int> =
+  read.owners.fold(Map::new(), |at: Map<Bytes, Int>, o: Bytes| at.insert(o, at.len()))
 
-fn owner_places(read: OwnersResult) -> OwnerPlaces =
-  read.owners.fold(
-    { at: Map::new(), sizes: Map::new() },
-    |accumulator: OwnerPlaces, o: { owner: Bytes, facts: Bytes, starts: List<Int> }|
-      {
-        at: accumulator.at.insert(o.owner, accumulator.at.len()),
-        sizes: accumulator.sizes.insert(o.owner, o.facts.len()),
-      },
-  )
+fn placed_first(places: Map<Bytes, Int>, g: RootedGroup) -> Int =
+  match places.get(g.group.owners.at_or(0, b"")) { Some(i) -> i, None -> 0 }
 
-fn placed_first(places: OwnerPlaces, g: SizedGroup) -> Int =
-  match places.at.get(g.group.owners.at_or(0, b"")) { Some(i) -> i, None -> 0 }
-
-pub fn module_units_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+pub fn module_units_result(input: Bytes) -> Bytes / {memo.read, memo.write, abort.raise} = {
   let named = decoded(input, module_key_bin(), "a module's name");
   let read = owners_result_of(named);
   let by_owner = read.shape.outline.items.fold(
@@ -194,24 +184,17 @@ pub fn module_units_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
       roots_of_item(named.module, read, into, item),
   );
   let places = owner_places(read);
-  let sized = module_groups(named, read).fold(
+  let rooted = module_groups(named, read).fold(
     [],
-    |accumulator: List<SizedGroup>, g: GroupKey| {
+    |accumulator: List<RootedGroup>, g: GroupKey| {
       let roots = g.owners.fold([], |rs: List<RootKey>, o: Bytes|
         rs.concat(match by_owner.get(o) { Some(ks) -> ks, None -> [] }));
-      if roots.len() == 0 { accumulator } else {
-        accumulator.push({
-          group: g,
-          roots: roots,
-          size: g.owners.fold(0, |n: Int, o: Bytes|
-            n + (match places.sizes.get(o) { Some(k) -> k, None -> 0 })),
-        })
-      }
+      if roots.len() == 0 { accumulator } else { accumulator.push({ group: g, roots: roots }) }
     },
-  ).sort_by(|a: SizedGroup, b: SizedGroup| placed_first(places, a) <= placed_first(places, b));
-  let tests = |g: SizedGroup| g.roots.any(is_test_root);
-  let groups = chunked(named.module, sized.filter(|g: SizedGroup| !tests(g))).concat(
-    chunked(named.module, sized.filter(tests)),
+  ).sort_by(|a: RootedGroup, b: RootedGroup| placed_first(places, a) <= placed_first(places, b));
+  let tests = |g: RootedGroup| g.roots.any(is_test_root);
+  let groups = chunked(named.module, rooted.filter(|g: RootedGroup| !tests(g))).concat(
+    chunked(named.module, rooted.filter(tests)),
   );
   groups.fold((), |_: Unit, g: GroupRoots|
     g.roots.fold((), |_: Unit, k: RootKey|
@@ -223,7 +206,7 @@ pub fn module_units_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   bin::encode({ groups: groups, stated: read.stated }, module_units_bin())
 }
 
-pub fn root_unit_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+pub fn root_unit_result(input: Bytes) -> Bytes / {memo.read, memo.write, abort.raise} = {
   let at = decoded(input, root_at_bin(), "a root's key");
   let named = module_key_in(module_of(at.key), at.tested);
   match memo.written_by(module_units_query(), bin::encode(named, module_key_bin())) {
@@ -571,7 +554,7 @@ pub fn code_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   bin::encode(made.code, unit_code_bin())
 }
 
-pub fn summary_result(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+pub fn summary_result(input: Bytes) -> Bytes / {memo.read, memo.write, abort.raise} =
   match memo.written_by(code_query(), input) {
     Some(o) -> o,
     None -> panic("a unit of code published no summary"),
