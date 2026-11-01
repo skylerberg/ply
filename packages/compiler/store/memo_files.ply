@@ -23,6 +23,7 @@ type StoreRun = {
   outputs_size: Int,
   details: Map<Bytes, FactDetails>,
   transient: Map<Bytes, Bytes>,
+  dependent_counts: Map<Bytes, Int>,
   pack: packs::PackReader,
   trusted: Bool,
   pack_differs: Bool,
@@ -52,6 +53,9 @@ fn undecoded<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {fact_damage.damag
     Ok(value) -> value,
     Err(_) -> fact_damage.damaged("a stored fact does not decode"),
   }
+
+fn moved_count(counts: Map<Bytes, Int>, key: Bytes, by: Int) -> Map<Bytes, Int> =
+  match counts.get(key) { Some(n) -> counts.insert(key, n + by), None -> counts }
 
 fn remembered_output(o: StoreRun, digest: Bytes, output: Bytes) -> StoreRun =
   if o.outputs.contains(digest) || o.outputs_size + output.len() > max_cached_size() { o } else {
@@ -107,6 +111,7 @@ fn over_database<a, [r], [s] | e>(
       outputs_size: 0,
       details: Map::new(),
       transient: Map::new(),
+      dependent_counts: Map::new(),
       pack: packs::open_reader(read),
       trusted: false,
       pack_differs: false,
@@ -164,6 +169,14 @@ fn over_database<a, [r], [s] | e>(
     },
     memo_store.sealed_changed() -> st.pack_differs,
     memo_store.dependents(key) -> fact_store::members[r](st.db, Dependents, key),
+    memo_store.has_dependents(key) -> {
+      let count = match st.dependent_counts.get(key) {
+        Some(n) -> n,
+        None -> fact_store::members[r](st.db, Dependents, key).len(),
+      };
+      st = { ..st, dependent_counts: st.dependent_counts.insert(key, count) };
+      count > 0
+    },
     memo_store.inputs() ->
       fact_store::entries_under[r](st.db, Inputs, b"").values().map(|b: Bytes|
         undecoded(b, stored_input_bin())),
@@ -231,10 +244,18 @@ fn over_database<a, [r], [s] | e>(
       };
     },
     memo_store.add_dependent(key, dependent) -> {
-      st = { ..st, db: fact_store::add_member(st.db, Dependents, key, dependent) };
+      st = {
+        ..st,
+        dependent_counts: moved_count(st.dependent_counts, key, 1),
+        db: fact_store::add_member(st.db, Dependents, key, dependent),
+      };
     },
     memo_store.remove_dependent(key, dependent) -> {
-      st = { ..st, db: fact_store::remove_member(st.db, Dependents, key, dependent) };
+      st = {
+        ..st,
+        dependent_counts: moved_count(st.dependent_counts, key, -1),
+        db: fact_store::remove_member(st.db, Dependents, key, dependent),
+      };
     },
     memo_store.put_input(input) -> {
       let id = input_id(input);

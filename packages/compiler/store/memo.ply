@@ -168,6 +168,7 @@ pub effect memo_store {
   read sealed(key: Bytes) -> Option<Bytes>
   read sealed_changed() -> Bool
   read dependents(key: Bytes) -> List<Bytes>
+  read has_dependents(key: Bytes) -> Bool
   read inputs() -> List<StoredInput>
   read facts_of(prefix: Bytes) -> List<Bytes>
   read code(name: Bytes) -> Option<Bytes>
@@ -229,8 +230,10 @@ fn dependency_ids(reads: List<Dependency>) -> Map<Bytes, Bool> / {abort.raise} =
   reads.fold(Map::new(), |ids: Map<Bytes, Bool>, r: Dependency| ids.insert(dependency_id(r), true))
 
 fn unused(id: Bytes) -> Bool / {memo_store.read} =
-  memo_store.dependents(id).len() == 0
-    && (match memo_store.fact(id) { Some(f) -> f.written_by == b"", None -> false })
+  match memo_store.fact(id) {
+    Some(f) -> f.written_by == b"" && !memo_store.has_dependents(id),
+    None -> false,
+  }
 
 fn deleted_one(key: Bytes) -> List<Bytes> / {memo_store.read, memo_store.write, abort.raise} =
   match memo_store.fact(key) {
@@ -254,8 +257,15 @@ fn deleted_one(key: Bytes) -> List<Bytes> / {memo_store.read, memo_store.write, 
   }
 
 fn deleted_all(keys: List<Bytes>) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
-  iterate(keys, 1099511627776, |work: List<Bytes>|
-    match work { [] -> Stop(()), [key, ..rest] -> Continue(rest.concat(deleted_one(key))) })
+  iterate({ work: keys, next: 0 }, 1099511627776, |left: { work: List<Bytes>, next: Int }|
+    match left.work.at(left.next) {
+      None -> Stop(()),
+      Some(key) ->
+        Continue({
+          work: deleted_one(key).fold(left.work, |all: List<Bytes>, id: Bytes| all.push(id)),
+          next: left.next + 1,
+        }),
+    })
 
 fn deleted(key: Bytes) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
   deleted_all([key])
@@ -960,19 +970,23 @@ pub fn reachable_keys<| e>(
         ExternalDependency(_, _, _) -> keys,
       });
   iterate(
-    { seen: Map::new(), work: query_keys(run.requested_dependencies), keys: [] },
-    100000000,
-    |x: { seen: Map<Bytes, Bool>, work: List<Bytes>, keys: List<Bytes> }|
-      match x.work {
-        [] -> Stop(x.keys),
-        [key, ..rest] -> if x.seen.contains(key) { Continue({ ..x, work: rest }) } else {
+    { seen: Map::new(), work: query_keys(run.requested_dependencies), next: 0, keys: [] },
+    1099511627776,
+    |x: { seen: Map<Bytes, Bool>, work: List<Bytes>, next: Int, keys: List<Bytes> }|
+      match x.work.at(x.next) {
+        None -> Stop(x.keys),
+        Some(key) -> if x.seen.contains(key) { Continue({ ..x, next: x.next + 1 }) } else {
           let seen = x.seen.insert(key, true);
           match details_before(memo_store.fact(key)) {
-            None -> Continue({ ..x, seen: seen, work: rest }),
+            None -> Continue({ ..x, seen: seen, next: x.next + 1 }),
             Some(d) ->
               Continue({
                 seen: seen,
-                work: rest.concat(query_keys(d.reads)).concat(d.wrote),
+                work: query_keys(d.reads).concat(d.wrote).fold(
+                  x.work,
+                  |all: List<Bytes>, read: Bytes| all.push(read),
+                ),
+                next: x.next + 1,
                 keys: if wanted.contains(d.query) { x.keys.push(key) } else { x.keys },
               }),
           }
@@ -1166,6 +1180,7 @@ pub fn with_memory_store<a | e>(
       }
     },
     memo_store.sealed_changed() -> pack_differs,
+    memo_store.has_dependents(key) -> store.dependents.contains(key),
     memo_store.dependents(key) -> match store.dependents.get(key) {
       Some(m) -> m.keys(),
       None -> [],
