@@ -6,12 +6,27 @@ impl Ctx {
     /// The scheduler's own work begins, where it had not: the blocks it makes are not the
     /// program's. Returns whether it had.
     pub(crate) fn scheduler_entered(&mut self) -> bool {
-        self.heap.set_scheduling(true)
+        let was = self.heap.set_scheduling(true);
+        self.filling_changed();
+        was
     }
 
     /// The program's own work runs again, where the scheduler's ran.
     pub(crate) fn program_entered(&mut self) {
         self.heap.set_scheduling(false);
+        self.filling_changed();
+    }
+
+    /// `blocks` in place of the blocks this context's heap takes from, which it returns.
+    pub(crate) fn swap_blocks(&mut self, blocks: crate::blocks::Blocks) -> crate::blocks::Blocks {
+        let was = self.heap.swap_blocks(blocks);
+        self.filling_changed();
+        was
+    }
+
+    /// Points compiled code at the pages this context's heap now hands it.
+    fn filling_changed(&mut self) {
+        self.filling = self.heap.filling();
     }
 }
 

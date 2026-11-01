@@ -21,7 +21,8 @@ pub const FRAME: u32 = u32::MAX - 1;
 pub const SHARED: u32 = 1 << 31;
 
 /// A block's header: its count, in the low half of the word before its payload, and whether the
-/// scheduler's own work made it, which emitted code clears on a block it takes itself.
+/// scheduler's own work made it, which emitted code clears as it writes the header of a block it
+/// takes itself.
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
@@ -240,9 +241,9 @@ pub struct Heap {
     delay: usize,
 }
 
-/// What compiled code reads and writes of a heap to take a block of at most
-/// [`blocks::WORD_CLASSES`] words, and give one back, without calling the runtime, laid out as
-/// `compiler.emit.abi` declares `PlyAlloc`. Any other block goes through the runtime.
+/// What the release's compiled code reads of a heap to take a block of at most
+/// [`blocks::WORD_CLASSES`] words, and give one back, without calling the runtime, laid out as the
+/// release's compiler declares `PlyAlloc`. Any other block goes through the runtime.
 #[repr(C)]
 pub struct Alloc {
     /// The pages of the heap's blocks being filled, by class.
@@ -487,9 +488,20 @@ impl Heap {
         }
     }
 
-    /// What compiled code takes blocks from and gives them back to, wherever this heap moves.
+    /// What the release's compiled code takes blocks from and gives them back to, wherever this
+    /// heap moves.
     pub(crate) fn alloc(&mut self) -> *mut Alloc {
         &raw mut *self.alloc
+    }
+
+    /// The pages compiled code takes small blocks from: this heap's, or none while every block
+    /// goes through the runtime.
+    pub(crate) fn filling(&mut self) -> *mut Filling {
+        if self.alloc.slow == 0 {
+            self.blocks.filling()
+        } else {
+            blocks::no_filling()
+        }
     }
 
     /// The scheduler's own work begins, where `on`, or the program's runs again: whether the

@@ -7,7 +7,7 @@ use super::prelude::{machine_natives, own_helpers};
 use crate::blocks::{self, Filling, Page, Segment};
 use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
 use crate::frames::PlyFrame;
-use crate::heap::{self, Alloc, Obj};
+use crate::heap::{self, Alloc, Obj, Word};
 use crate::native::{Machine, Signature};
 use crate::rt::Ctx;
 use std::fmt::Write;
@@ -44,7 +44,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
     laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
         frames, release_depth, release_waiting, target, entering_desc, entering_words,
-        recording, bridge, hosted, unserved, performed_root,
+        recording, bridge, filling, unserved, performed_root,
         performed_start, performed_end, task, alloc, constants);
     laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
     laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
@@ -57,6 +57,9 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, PlyOp as "PlyOp": effect, op, answer, own, params_len, params, vars_len, vars);
     laid!(out, PlyFnDesc as "PlyFnDesc": uniform, typed, convention, release, share, keep);
     out.extend([
+        // The release's compiler declares this word under the name it had.
+        ("PlyCtx.hosted.at", offset_of!(Ctx, filling)),
+        ("PlyCtx.hosted.bytes", size_of::<Word>()),
         ("alloc.segment", blocks::SEGMENT),
         ("alloc.page", blocks::PAGE),
         ("alloc.pages_at", offset_of!(Segment, pages)),

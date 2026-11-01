@@ -16,8 +16,10 @@ pub struct Ctx {
     /// The lowest address a compiled frame may begin at. The watchdog raises it past every frame
     /// once the entry's clock runs out ([`watched`]).
     pub stack_floor: std::sync::atomic::AtomicUsize,
-    /// The site the body last stored, before a call or on the branch of an operation that fails,
-    /// as bytes from its root's start; the root is `-1` until one is.
+    /// The site the program's own code last stored, on the branch of an operation that fails or
+    /// before a call of code that stores none, as bytes from its root's start, or on the way into
+    /// [`rt_stack_more`], with no extent, naming its whole definition; the root is `-1` until one
+    /// is.
     pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
@@ -50,8 +52,9 @@ pub struct Ctx {
     /// The evidence object of every effect for code that holds no word handling one
     /// ([`BRIDGE`]).
     pub bridge: Word,
-    /// A word no code reads, where the release's compiler lays the context out with one.
-    pub hosted: Word,
+    /// The pages compiled code takes a small block from and gives one back to without calling the
+    /// runtime ([`Heap::filling`]): set again whenever that changes ([`Ctx::filling_changed`]).
+    pub(crate) filling: *mut crate::blocks::Filling,
     /// What an entry hands its root for an effect nothing handles ([`UNSERVED`]).
     pub unserved: Word,
     /// Where the perform a clause handles stood, as the site fields hold one, which compiled code
@@ -62,8 +65,8 @@ pub struct Ctx {
     /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
     /// which only that task may leave.
     pub task: i64,
-    /// What compiled code takes a small block from the heap by, and gives one back to, without
-    /// calling the runtime: the heap's own, wherever the heap moves.
+    /// What the release's compiled code reaches [`Ctx::filling`] through: the heap's own, wherever
+    /// the heap moves.
     pub alloc: *mut crate::heap::Alloc,
     /// The unit's kept constants ([`Tables::memo`]), which compiled code reads without calling the
     /// runtime.
@@ -196,6 +199,7 @@ impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
         let mut heap = Heap::new();
         let alloc = heap.alloc();
+        let filling = heap.filling();
         let constants = tables.memo.as_ptr();
         Ctx {
             failed: 0,
@@ -211,7 +215,7 @@ impl Ctx {
             entering_words: 0,
             recording: 0,
             bridge: object_word(&BRIDGE),
-            hosted: 0,
+            filling,
             unserved: object_word(&UNSERVED),
             performed_root: -1,
             performed_start: 0,
@@ -352,7 +356,7 @@ impl Ctx {
         self.unwatch();
         self.failed = 0;
         self.grown = 0;
-        self.heap.set_scheduling(false);
+        self.program_entered();
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)

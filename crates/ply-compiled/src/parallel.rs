@@ -195,7 +195,7 @@ impl Handed {
         let _unwatch = Unwatch(ctx);
         c.watch();
         let branch_was = BRANCH_OF.with(|of| of.replace(c.id.0));
-        let own = worker_taken(c.id.0).map(|w| c.heap.swap_blocks(w));
+        let own = worker_taken(c.id.0).map(|w| c.swap_blocks(w));
         let heap_was = heap::swap_current(&mut c.heap);
         let site_was = heap::poison::swap(&raw const c.site_root);
         let running_was = crate::rt::swap_running(ctx);
@@ -210,7 +210,7 @@ impl Handed {
         heap::poison::swap(site_was);
         heap::swap_current(heap_was);
         if let Some(own) = own {
-            worker_returned(c.id.0, c.heap.swap_blocks(own));
+            worker_returned(c.id.0, c.swap_blocks(own));
         }
         BRANCH_OF.with(|of| of.set(branch_was));
     }
