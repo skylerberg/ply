@@ -66,7 +66,7 @@ fn a_block_is_allocated_by_its_bytes_and_given_back_at_them() {
     let mut ctx = context();
     let w = alloc(&mut ctx, sized(4));
     assert_eq!(count(w), 1);
-    assert_eq!(ctx.heap.allocated(), 1);
+    assert_eq!(ctx.heap.live(), 1);
     free(&mut ctx, w, sized(4));
     assert_eq!(count(w), 0);
     assert_eq!(ctx.heap.live(), 0);
@@ -75,7 +75,6 @@ fn a_block_is_allocated_by_its_bytes_and_given_back_at_them() {
         w,
         "the next block of its size took the freed one's"
     );
-    assert_eq!(ctx.heap.recycled(), 1);
 }
 
 #[test]
@@ -119,7 +118,7 @@ fn a_kept_block_is_immortal_and_outlives_the_entry_that_made_it() {
     let w = unsafe { kept(&mut ctx, 32) };
     unsafe { *(w as *mut Word).byte_add(HEADER) = 42 };
     assert_eq!(count(w), IMMORTAL);
-    assert_eq!(ctx.heap.allocated(), 0, "the entry's own heap made it");
+    assert_eq!(ctx.heap.live(), 0, "the entry's own heap made it");
     ctx.end();
     let held = unsafe { *(w as *const Word).byte_add(HEADER) };
     assert_eq!((count(w), held), (IMMORTAL, 42));

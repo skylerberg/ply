@@ -1,0 +1,388 @@
+import compiler.load (Derives)
+import compiler.cc (toolchain)
+import compiler.unit (shipped)
+import std.random (entropy)
+import std.time (time)
+import builder (builder)
+import args (Flags, style_of)
+import library (read, workspace_error, workspace_file, workspace_root)
+import paths
+import std.path (join)
+import program (Program, load_program, location_of, own_laws, own_tests, program_view)
+import report (CommandOutput, schema_version, ok_code, indent, count_of, rejected, reported)
+import std.env (env)
+import std.term (Style, bold, dim)
+import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
+import compiler.front.facts (CheckedProgram, Frame)
+import compiler.front.published (analyse)
+import compiler.front.diagnostics (parse_all)
+import compiler.front.rows (Outline, OutlineItem, OutlinedEffect, OutlinedFunction, OutlinedType)
+import compiler.check.infer.checker (LawInfo, Location, TestInfo)
+import compiler.check.resolve.tables (Diagnostic, Source, qualify)
+import compiler.store.hash (is_discarded_name)
+import compiler.store.hash.forms (DeclarationNamed, FunctionNamed, ItemKeyed, ReachableNames,
+                                  Subject, used_from)
+import std.fs (fs)
+import std.json (Json, Null, Str, Bool, Number, Array, object)
+import std.pkg (Suite, Workspace)
+import std.string
+
+pub type Kind = | FunctionKind | TypeKind | EffectKind
+
+type Written = { name: Bytes, kind: Kind, at: Location, public: Bool, entry: Bool, held: Bool }
+
+pub type Listed = { name: Bytes, kind: Kind, location: Option<String> }
+
+pub type Unused = { definitions: Int, never_used: List<Listed>, only_tests: List<Listed> }
+
+pub type Walk = { written: List<Listed>, running: ReachableNames, testing: ReachableNames }
+
+fn written_in(outline: Outline, module: Int) -> List<Written> =
+  outline.items.fold([], |acc: List<Written>, item: OutlineItem|
+    match item {
+      OutlinedFunction(f) -> {
+        let name = qualify(outline.name, f.name);
+        acc.push({
+          name: name,
+          kind: FunctionKind,
+          at: { module: module, span: f.name_span },
+          public: f.public,
+          entry: f.name == b"main",
+          held: f.generated || is_discarded_name(f.name) || outline.schemas.contains(name),
+        })
+      },
+      OutlinedType(t) ->
+        acc.push({
+          name: qualify(outline.name, t.name),
+          kind: TypeKind,
+          at: { module: module, span: t.span },
+          public: t.public,
+          entry: false,
+          held: is_discarded_name(t.name),
+        }),
+      OutlinedEffect(e) ->
+        acc.push({
+          name: qualify(outline.name, e.name),
+          kind: EffectKind,
+          at: { module: module, span: e.span },
+          public: e.public,
+          entry: false,
+          held: is_discarded_name(e.name),
+        }),
+      _ -> acc,
+    })
+
+fn written_in_root_package(frame: Frame) -> List<Written> / {abort.raise} =
+  range(0, frame.outlines.len()).filter(|i: Int| frame.module_packages.at(i) == Some(0)).flat_map(
+    |i: Int| written_in(frame.outlines.get(i), i),
+  )
+
+fn subject_of(w: Written) -> Subject =
+  match w.kind {
+    FunctionKind -> FunctionNamed(w.name),
+    TypeKind -> DeclarationNamed(w.name),
+    EffectKind -> DeclarationNamed(w.name),
+  }
+
+fn reached(names: ReachableNames, name: Bytes, kind: Kind) -> Bool =
+  match kind {
+    FunctionKind -> names.functions.contains(name),
+    TypeKind -> names.declarations.contains(name),
+    EffectKind -> names.declarations.contains(name),
+  }
+
+fn with_name(names: ReachableNames, name: Bytes, kind: Kind) -> ReachableNames =
+  match kind {
+    FunctionKind -> { ..names, functions: names.functions.insert(name, true) },
+    TypeKind -> { ..names, declarations: names.declarations.insert(name, true) },
+    EffectKind -> { ..names, declarations: names.declarations.insert(name, true) },
+  }
+
+fn importers_root(frame: Frame) -> Option<Bytes> =
+  match frame.manifest {
+    None -> None,
+    Some(m) -> Some(Bytes::of_string(match m.prefix { Some(p) -> p, None -> m.name })),
+  }
+
+fn as_imported(root: Option<Bytes>, name: Bytes) -> Bytes / {abort.raise} =
+  match root { Some(r) -> qualify(r, name), None -> name }
+
+fn walk_of(
+  frame: Frame,
+  tests: List<TestInfo>,
+  laws: List<LawInfo>,
+  public_is_used: Bool,
+  root: Option<Bytes>,
+  located: (Location) -> Option<String> / {abort.raise},
+) -> Walk / {abort.raise} = {
+  let written = written_in_root_package(frame);
+  let offers = public_is_used && !written.any(|w: Written| w.entry);
+  let roots = written.filter(|w: Written| w.entry || w.held || (offers && w.public)).map(
+    subject_of,
+  );
+  let checks = tests.map(|t: TestInfo| ItemKeyed(t.key)).concat(
+    laws.map(|l: LawInfo| ItemKeyed(l.key)),
+  );
+  let imported = |names: ReachableNames|
+    written.filter(|w: Written| reached(names, w.name, w.kind)).fold(
+      names,
+      |acc: ReachableNames, w: Written| with_name(acc, as_imported(root, w.name), w.kind),
+    );
+  {
+    written: written.map(|w: Written|
+      { name: as_imported(root, w.name), kind: w.kind, location: located(w.at) }),
+    running: imported(used_from(frame.hashes, roots)),
+    testing: imported(used_from(frame.hashes, roots.concat(checks))),
+  }
+}
+
+fn judged(written: List<Listed>, running: ReachableNames, testing: ReachableNames) -> Unused =
+  {
+    definitions: written.len(),
+    never_used: written.filter(|w: Listed| !reached(testing, w.name, w.kind)),
+    only_tests: written.filter(|w: Listed|
+      reached(testing, w.name, w.kind) && !reached(running, w.name, w.kind)),
+  }
+
+fn joined(a: ReachableNames, b: ReachableNames) -> ReachableNames =
+  { functions: a.functions.merge(b.functions), declarations: a.declarations.merge(b.declarations) }
+
+pub fn across_packages(listed: List<Walk>, reading: List<Walk>) -> Unused / {abort.raise} = {
+  let nothing = { functions: Map::new(), declarations: Map::new() };
+  let all = listed.concat(reading);
+  judged(
+    listed.flat_map(|walk: Walk| walk.written),
+    all.fold(nothing, |acc: ReachableNames, walk: Walk| joined(acc, walk.running)),
+    all.fold(nothing, |acc: ReachableNames, walk: Walk| joined(acc, walk.testing)),
+  )
+}
+
+fn kind_text(kind: Kind) -> String =
+  match kind { FunctionKind -> "fn", TypeKind -> "type", EffectKind -> "effect" }
+
+fn group_lines(style: Style, title: String, group: List<Listed>) -> List<String> / {abort.raise} =
+  if group.len() == 0 { [] } else {
+    [""].push(indent() ++ bold(style, title ++ ": " ++ count_of(group.len(), "definition"))).concat(
+      group.map(|w: Listed|
+        indent() ++ indent() ++ String::of_bytes_lossy(w.name) ++ "  "
+          ++ dim(style, match w.location { Some(text) -> text, None -> "" })),
+    )
+  }
+
+fn listed_json(w: Listed) -> Json =
+  object([
+    { key: "name", value: Str(String::of_bytes_lossy(w.name)) },
+    { key: "kind", value: Str(kind_text(w.kind)) },
+    { key: "location", value: match w.location { Some(text) -> Str(text), None -> Null } },
+  ])
+
+fn unused_output(style: Style, found: Unused) -> CommandOutput / {abort.raise} =
+  {
+    json: object([
+      { key: "command", value: Str("unused") },
+      { key: "schema_version", value: Number(Decimal::of_int(schema_version())) },
+      { key: "ok", value: Bool(true) },
+      { key: "exit_code", value: Number(Decimal::of_int(ok_code())) },
+      { key: "definitions", value: Number(Decimal::of_int(found.definitions)) },
+      { key: "never_used", value: Array(found.never_used.map(listed_json)) },
+      { key: "only_tests", value: Array(found.only_tests.map(listed_json)) },
+    ]),
+    lines: group_lines(style, "never used", found.never_used).concat(
+      group_lines(style, "only tests use", found.only_tests),
+    ).concat(["", indent() ++ count_of(found.definitions, "definition") ++ " checked"]),
+    errs: [],
+    code: ok_code(),
+  }
+
+fn walked_package(
+  flags: Flags,
+  paths: List<paths::ResolvedPath>,
+  public_is_used: Bool,
+) -> Result<Walk, CommandOutput> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} = {
+  let loaded: Program = load_program(paths, flags.verify_dependencies);
+  match program_view(loaded) {
+    None -> Err(rejected(style_of(flags), "unused", loaded.diagnostics, loaded.source_texts)),
+    Some(w) ->
+      Ok(
+        walk_of(
+          w.frame,
+          own_tests(loaded, w),
+          own_laws(loaded, w),
+          public_is_used,
+          if public_is_used { None } else { importers_root(w.frame) },
+          |at: Location| location_of(loaded, at),
+        ),
+      ),
+  }
+}
+
+fn walked_each(
+  flags: Flags,
+  root: String,
+  dirs: List<String>,
+) -> Result<List<Walk>, CommandOutput> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
+  dirs.fold(Ok([]), |acc: Result<List<Walk>, CommandOutput>, dir: String|
+    match acc {
+      Err(rejected_load) -> Err(rejected_load),
+      Ok(walks) -> match walked_package(flags, [paths::resolve(join(root, dir))], false) {
+        Err(rejected_load) -> Err(rejected_load),
+        Ok(walk) -> Ok(walks.push(walk)),
+      },
+    })
+
+fn listed_packages(w: Workspace) -> List<String> =
+  (match w.toolchain { Some(t) -> [t.compiler, t.cli], None -> [] }).concat(w.packages)
+
+fn reading_packages(w: Workspace) -> List<String> =
+  (match w.toolchain { Some(t) -> [t.std_tests, t.cli_tests], None -> [] }).concat(
+    w.suites.map(|s: Suite| s.dir),
+  )
+
+fn over_workspace(
+  flags: Flags,
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} = {
+  let s = style_of(flags);
+  let dir = match flags.paths.at(0) { Some(r) -> r.absolute, None -> env.working_directory() };
+  match workspace_root(dir) {
+    None -> {
+      let missing = workspace_error(
+        "no `" ++ workspace_file() ++ "` in `" ++ dir ++ "` or any directory above it",
+        b"no workspace to read",
+      );
+      reported(s, "unused", missing.diagnostics, missing.places)
+    },
+    Some(root) -> match read(root) {
+      Err(unread) -> reported(s, "unused", unread.diagnostics, unread.places),
+      Ok(w) -> match walked_each(flags, root, listed_packages(w)) {
+        Err(rejected_load) -> rejected_load,
+        Ok(listed) -> match walked_each(flags, root, reading_packages(w)) {
+          Err(rejected_load) -> rejected_load,
+          Ok(reading) -> unused_output(s, across_packages(listed, reading)),
+        },
+      },
+    },
+  }
+}
+
+pub fn run(
+  flags: Flags,
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
+  if flags.workspace { over_workspace(flags) } else {
+    match walked_package(flags, flags.paths, true) {
+      Err(rejected_load) -> rejected_load,
+      Ok(walk) -> unused_output(style_of(flags), judged(walk.written, walk.running, walk.testing)),
+    }
+  }
+
+fn analysed(sources: List<Source>) -> CheckedProgram / {abort.raise} =
+  match analyse(parse_all(sources)) {
+    Analysed(w) -> checked_program_of(w),
+    Rejected(rejected) ->
+      panic(
+        "the fixture checks: "
+          ++ String::join(rejected.map(|d: Diagnostic| String::of_bytes_lossy(d.message)), "; "),
+      ),
+  }
+
+fn walk_in(
+  sources: List<Source>,
+  public_is_used: Bool,
+  root: Option<Bytes>,
+) -> Walk / {abort.raise} = {
+  let analysis = analysed(sources);
+  walk_of(
+    analysis.frame,
+    analysis.checked.tests,
+    analysis.checked.laws,
+    public_is_used,
+    root,
+    |at: Location| None,
+  )
+}
+
+fn found_in(src: String) -> Unused / {abort.raise} = {
+  let walk = walk_in([{ name: b"m", src: Bytes::of_string(src) }], true, None);
+  judged(walk.written, walk.running, walk.testing)
+}
+
+fn names(group: List<Listed>) -> List<Bytes> = group.map(|w: Listed| w.name)
+
+test "in a program, a `pub` definition nothing reaches is never used" {
+  let found = found_in(
+    "pub fn main() -> Unit = kept()\nfn kept() -> Unit = ()\npub fn gone() -> Int = 1\n",
+  );
+  assert_eq(names(found.never_used), [b"m.gone"]);
+  assert_eq(found.only_tests, [])
+}
+
+test "what only a test or a law reaches is set apart from what `main` reaches" {
+  let found = found_in(
+    "pub fn main() -> Unit = ()\npub fn tested() -> Int = 1\npub fn lawful() -> Int = 2\ntest \"t\" { assert_eq(tested(), 1) }\nlaw \"l\" forall (n: Int) { lawful() == 2 }\n",
+  );
+  assert_eq(names(found.only_tests), [b"m.tested", b"m.lawful"]);
+  assert_eq(found.never_used, [])
+}
+
+test "in a library every `pub` definition is used, so only what it leaves behind is reported" {
+  let found = found_in(
+    "pub fn offered() -> Int = 1\nfn helper() -> Int = 2\nfn stray() -> Int = 3\ntest \"h\" { assert_eq(helper(), 2) }\n",
+  );
+  assert_eq(names(found.never_used), [b"m.stray"]);
+  assert_eq(names(found.only_tests), [b"m.helper"])
+}
+
+test "a name that opts out, and a type or an effect nothing names, are judged the same way" {
+  let found = found_in(
+    "pub fn main() -> Unit = ()\nfn _kept() -> Int = 1\npub type Shape = { size: Int }\npub effect log { write emit(Bytes) -> Unit }\n",
+  );
+  assert_eq(names(found.never_used), [b"m.Shape", b"m.log"])
+}
+
+test "a definition reached only through a `requires` clause is used" {
+  let found = found_in(
+    "pub fn main() -> Unit = guarded(1)\nfn positive(n: Int) -> Bool = n > 0\nfn guarded(n: Int) -> Unit\n  requires positive(n)\n= ()\n",
+  );
+  assert_eq(found.never_used, [])
+}
+
+fn shapes(name: Bytes, extra: Bytes) -> Source =
+  {
+    name: name,
+    src: Bytes::concat_all([b"pub fn kept() -> Int = 1\npub fn gone() -> Int = 2\n", extra]),
+  }
+
+fn a_program_using_kept() -> Source =
+  { name: b"app", src: b"import lib.shapes\npub fn main() -> Int = shapes::kept()\n" }
+
+fn the_library(extra: Bytes) -> Walk / {abort.raise} =
+  walk_in([shapes(b"shapes", extra)], false, Some(b"lib"))
+
+test "across a workspace, a library goes by the name its importers use" {
+  let program = walk_in([shapes(b"lib.shapes", b""), a_program_using_kept()], false, None);
+  let found = across_packages([the_library(b"")], [program]);
+  assert_eq(names(found.never_used), [b"lib.shapes.gone"]);
+  assert_eq(found.only_tests, [])
+}
+
+test "across a workspace, a library's own `main` does not hide what other packages use" {
+  let with_entry = b"pub fn main() -> Int = 0\n";
+  let program = walk_in([shapes(b"lib.shapes", with_entry), a_program_using_kept()], false, None);
+  assert_eq(names(across_packages([the_library(with_entry)], [program]).never_used), [
+    b"lib.shapes.gone",
+  ])
+}
+
+test "across a workspace, what only tests use is reported, wherever those tests live" {
+  let own_test = b"test \"own\" { assert_eq(gone(), 2) }\n";
+  let suite = walk_in(
+    [
+      shapes(b"lib.shapes", own_test),
+      { name: b"suite", src: b"import lib.shapes\ntest \"t\" { assert_eq(shapes::kept(), 1) }\n" },
+    ],
+    false,
+    None,
+  );
+  let found = across_packages([the_library(own_test)], [suite]);
+  assert_eq(names(found.only_tests), [b"lib.shapes.kept", b"lib.shapes.gone"]);
+  assert_eq(found.never_used, [])
+}

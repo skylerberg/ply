@@ -5,11 +5,6 @@
 use ply_compiled::c::descriptor::Descriptor;
 use std::ffi::{c_char, c_int};
 
-/// Counts what the entry allocates; nothing but the entry is counted, and only when
-/// `--count-allocations` asked for it.
-#[global_allocator]
-static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
-
 /// The exit code of a run that panicked in the runtime, which no program asks for.
 const PANICKED: c_int = 101;
 
@@ -62,17 +57,9 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
             return 1;
         }
     };
-    let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    // The launcher's own flags, taken out before the program parses the line.
-    let count = match ply_launcher::count::flag(&mut argv) {
-        Ok(count) => count,
-        Err(reason) => {
-            eprintln!("ply: {reason}");
-            return 2;
-        }
-    };
+    let argv: Vec<String> = std::env::args().skip(1).collect();
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let launched = ply_launcher::run(program, &root, argv, count);
+    let launched = ply_launcher::run(program, &root, argv);
     for warning in launched.warnings {
         eprintln!("{warning}");
     }
