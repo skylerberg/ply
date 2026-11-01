@@ -41,23 +41,18 @@ pub type Database = {
   token: Bytes,
   writing: SegmentWriter,
   written_results: Map<Bytes, Bytes>,
-  written_past: Map<Bytes, Bytes>,
   log_floor: Int,
 }
 
-fn schema() -> Bytes = b"ply fact database 3".blake3()
+fn schema() -> Bytes = b"ply fact database 4".blake3()
 
 fn nodes_table() -> Int = 1
 
 fn changes_table() -> Int = 2
 
-fn cursors_table() -> Int = 3
-
 fn snapshots_table() -> Int = 4
 
 fn results_table() -> Int = 5
-
-fn past_table() -> Int = 6
 
 fn key_width(table: Int) -> Int = if table == changes_table() { 8 } else { 32 }
 
@@ -207,7 +202,6 @@ fn fresh_database(dir: String, manifest: Manifest) -> Database =
     token: b"",
     writing: segments::new_writer(),
     written_results: Map::new(),
-    written_past: Map::new(),
     log_floor: 0,
   }
 
@@ -371,69 +365,6 @@ pub fn result_of<[r]>(
     },
   }
 
-pub fn with_shared_past<[r]>(
-  db: Database,
-  key: Bytes,
-  value: Bytes,
-) -> Database / {fs.write[r], abort.raise} = {
-  let placed = segments::append_payload(db.writing, value);
-  {
-    ..db,
-    writing: segments::flush_when_full[r](db.dir, schema(), db.token, placed.writing),
-    written_past: db.written_past.insert(
-      key.blake3(),
-      u64_le(placed.at).concat(u32_le(value.len())),
-    ),
-  }
-}
-
-pub fn shared_past<[r]>(
-  db: Database,
-  key: Bytes,
-) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match db.written_past.get(key.blake3()) {
-    None -> table_value[r](db, past_table(), key.blake3()),
-    Some(place) -> {
-      let at = segments::read_u64(place, 0);
-      match segments::pending_payload(db.writing, at) {
-        Some(bytes) -> Some(bytes),
-        None -> segments::payload[r](db.dir, db.token, at, segments::read_u32(place, 8)),
-      }
-    },
-  }
-
-pub fn commit_shared<[r]>(
-  db: Database,
-  live_results: (List<Bytes>) -> Map<Bytes, Bool> / {abort.raise},
-) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  if db.written_results.len() + db.written_past.len() > 0 {
-    match segments::finish[r](db.dir, schema(), db.token, db.writing, [
-        segments::table(results_table(), db.written_results, |_: Bytes, rest: Bytes| Some(rest)),
-        segments::table(past_table(), db.written_past, |_: Bytes, rest: Bytes| Some(rest)),
-      ]) {
-      None -> (),
-      Some(seg) -> match if db.starts_over {
-          segments::replace_merged[r](
-            db.dir,
-            schema(),
-            segments::manifest[r](db.dir, schema()),
-            0,
-            seg,
-            true,
-          )
-        } else { segments::commit[r](db.dir, schema(), seg, durable: true) } {
-        Committed(m) -> {
-          let merged = { ..fresh_database(db.dir, m), run: db.run };
-          merge_tail[r](merged, |current: Database|
-            live_results(
-              stored_values[r](current, located_rows[r](current, m.segments, past_table())),
-            ))
-        },
-        _ -> (),
-      },
-    }
-  }
-
 pub fn with_log_floor(db: Database, floor: Int) -> Database = { ..db, log_floor: floor }
 
 pub fn append_change(db: Database, changes: List<Bytes>) -> Database / {abort.raise} = {
@@ -461,20 +392,6 @@ pub fn changes_after<[r]>(
   })
 
 pub fn log_end(db: Database) -> Int = db.log_end
-
-pub type StoredProduct = { at: Int, value: Bytes }
-
-pub fn stored_product<[r]>(
-  db: Database,
-  product: String,
-) -> Option<StoredProduct> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match table_value[r](db, cursors_table(), Bytes::of_string(product).blake3()) {
-    Some(bytes) -> match bytes.u64_at(0) {
-      Some(at) -> Some({ at: at, value: bytes.slice(8, bytes.len()) }),
-      None -> fact_damage.damaged("a stored product has no log position"),
-    },
-    None -> None,
-  }
 
 type RowDraft = { writing: SegmentWriter, rows: Map<Bytes, Bytes> }
 
@@ -528,13 +445,6 @@ fn finished_segment<[r]>(
 }
 
 fn tokens(listed: List<Segment>) -> List<Bytes> = listed.map(|seg: Segment| seg.token)
-
-fn only_cursors_since(before: Manifest, now: Manifest) -> Bool = {
-  let count = before.segments.len();
-  tokens(now.segments.take(count)) == tokens(before.segments)
-    && now.segments.drop(count).all(|seg: Segment|
-      seg.parts.all(|part: segments::TableEntry| part.table == cursors_table()))
-}
 
 type Rewrite = { snapshot: Snapshot, fresh: Map<Bytes, Bytes> }
 
@@ -630,7 +540,7 @@ pub fn commit<[r]>(
       None -> WriteFailed,
       Some(seg) -> {
         let now = segments::manifest[r](db.dir, schema());
-        let installed = if only_cursors_since(db.manifest, now) {
+        let installed = if tokens(now.segments) == tokens(db.manifest.segments) {
           segments::replace_merged[r](
             db.dir,
             schema(),
@@ -682,7 +592,7 @@ fn located_rows<[r]>(
     })
   })
 
-fn all_tables() -> List<Int> = range(1, 7)
+fn all_tables() -> List<Int> = [nodes_table(), changes_table(), snapshots_table(), results_table()]
 
 type Rewriting = { writing: SegmentWriter, tables: List<segments::Table> }
 
@@ -693,36 +603,43 @@ type Chunk = { token: Bytes, start: Int, end: Int, rows: List<RowToCopy> }
 fn copy_chunk_size() -> Int = 16777216
 
 fn chunks_in_file_order(located: Map<Bytes, Located>) -> List<Chunk> = {
-  let files = located.fold(Map::new(), |found: Map<Bytes, Int>, _: Bytes, at: Located|
-    if found.contains(at.token) { found } else { found.insert(at.token, found.len()) });
-  let ordered = located.fold(Map::new(), |by: Map<Int, RowToCopy>, key: Bytes, at: Located|
-    by.insert(
-      (match files.get(at.token) { Some(i) -> i, None -> 0 }) * 1099511627776 + at.offset,
-      { key: key, at: at },
-    ));
-  ordered.fold([], |chunks: List<Chunk>, _: Int, row: RowToCopy| {
-    let size = segments::framed_len(row.at.size);
-    match chunks.at(chunks.len() - 1) {
-      Some(last) -> if last.token == row.at.token && last.end == row.at.offset
-          && last.end - last.start < copy_chunk_size() {
-        chunks.set(chunks.len() - 1, { ..last, end: last.end + size, rows: last.rows.push(row) })
-      } else {
-        chunks.push({
-          token: row.at.token,
-          start: row.at.offset,
-          end: row.at.offset + size,
-          rows: [row],
-        })
-      },
-      None ->
-        chunks.push({
-          token: row.at.token,
-          start: row.at.offset,
-          end: row.at.offset + size,
-          rows: [row],
+  let by_file = located.fold(
+    Map::new(),
+    |files: Map<Bytes, Map<Int, RowToCopy>>, key: Bytes, at: Located|
+      files.insert(
+        at.token,
+        (match files.get(at.token) { Some(rows) -> rows, None -> Map::new() }).insert(at.offset, {
+          key: key,
+          at: at,
         }),
-    }
-  })
+      ),
+  );
+  by_file.fold([], |chunks: List<Chunk>, _: Bytes, rows: Map<Int, RowToCopy>|
+    rows.fold(chunks, |sofar: List<Chunk>, _: Int, row: RowToCopy| chunk_with(sofar, row)))
+}
+
+fn chunk_with(chunks: List<Chunk>, row: RowToCopy) -> List<Chunk> = {
+  let size = segments::framed_len(row.at.size);
+  match chunks.at(chunks.len() - 1) {
+    Some(last) -> if last.token == row.at.token && last.end == row.at.offset
+        && last.end - last.start < copy_chunk_size() {
+      chunks.set(chunks.len() - 1, { ..last, end: last.end + size, rows: last.rows.push(row) })
+    } else {
+      chunks.push({
+        token: row.at.token,
+        start: row.at.offset,
+        end: row.at.offset + size,
+        rows: [row],
+      })
+    },
+    None ->
+      chunks.push({
+        token: row.at.token,
+        start: row.at.offset,
+        end: row.at.offset + size,
+        rows: [row],
+      }),
+  }
 }
 
 fn chunk_bytes<[r]>(
@@ -737,21 +654,6 @@ fn chunk_bytes<[r]>(
     Some(bytes) -> bytes,
     None -> fact_damage.damaged("a segment is shorter than its table says"),
   }
-
-fn stored_values<[r]>(
-  db: Database,
-  located: Map<Bytes, Located>,
-) -> List<Bytes> / {fs.read[r], fact_damage.damaged, abort.raise} =
-  chunks_in_file_order(located).fold([], |values: List<Bytes>, chunk: Chunk| {
-    let bytes = chunk_bytes[r](db, chunk);
-    chunk.rows.fold(values, |found: List<Bytes>, row: RowToCopy| {
-      let from = row.at.offset - chunk.start;
-      match segments::unframed(bytes.slice(from, from + segments::framed_len(row.at.size))) {
-        Some(value) -> found.push(value),
-        None -> found,
-      }
-    })
-  })
 
 fn table_copied<[r]>(
   db: Database,
@@ -843,36 +745,6 @@ fn merge_tail<[r]>(
   match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run), None -> () }
 }
 
-pub fn store_product<[r]>(
-  db: Database,
-  product: String,
-  stored: StoredProduct,
-) -> CommitResult / {fs.read[r], fs.write[r], abort.raise} =
-  match segments::start_run[r](db.dir) {
-    None -> WriteFailed,
-    Some(run) -> {
-      let token = segments::segment_token(Some(run), db.manifest.generation, 2);
-      let result = match finished_segment[r](
-          db,
-          token,
-          segments::new_writer(),
-          Map::new().insert(
-            cursors_table(),
-            Map::new().insert(
-              Bytes::of_string(product).blake3(),
-              u64_le(stored.at).concat(stored.value),
-            ),
-          ),
-          Map::new(),
-        ) {
-        None -> WriteFailed,
-        Some(seg) -> segments::commit[r](db.dir, schema(), seg, durable: true),
-      };
-      segments::end_run[r](Some(run));
-      result
-    },
-  }
-
 fn tree_nodes<[r]>(
   db: Database,
   roots: List<TreeRoot>,
@@ -931,6 +803,16 @@ pub fn compact<[r]>(
     bytes_after: if done { store_bytes(after) } else { store_bytes(m) },
   }
 }
+
+pub fn unreferenced_bytes<[r]>(
+  db: Database,
+  live_results: Map<Bytes, Bool>,
+) -> Int / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  located_rows[r](db, db.manifest.segments, results_table()).fold(
+    0,
+    |bytes: Int, key: Bytes, at: Located|
+      if live_results.contains(key) { bytes } else { bytes + at.size },
+  )
 
 pub fn store_size(db: Database) -> { segments: Int, bytes: Int } =
   { segments: db.manifest.segments.len(), bytes: store_bytes(db.manifest) }
@@ -1051,29 +933,6 @@ test "reading the log returns the entries after an offset" {
     in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
   assert_eq(log_stored(tree, 0).map(|e: LogEntry| e.offset), [1, 2]);
   assert_eq(log_stored(tree, 1).map(|e: LogEntry| e.changes), [[sample_change("second")]])
-}
-
-test "each kind of product keeps its own position and value" {
-  let tree = after_first(fs::mem_of([]));
-  let stored = fs::on_mem[abs](tree, ||
-    in_store[abs](|db: Database| {
-      store_product[abs](db, "tests", { at: 1, value: b"passed" });
-      ()
-    })).tree;
-  let at = fs::on_mem[abs](stored, ||
-    in_store[abs](|db: Database|
-      [stored_product[abs](db, "tests"), stored_product[abs](db, "proofs")]));
-  assert_eq(at.value, [Some({ at: 1, value: b"passed" }), None])
-}
-
-test "a product stored while an edit runs does not fail the edit's commit" {
-  let raced = fs::on_mem[abs](after_first(fs::mem_of([])), ||
-    in_store[abs](|db: Database| {
-      store_product[abs](db, "tests", { at: 1, value: b"" });
-      commit[abs](second_edit(db), no_results)
-    }));
-  assert(match raced.value { Committed(_) -> true, _ -> false });
-  assert_eq(value_stored(raced.tree, key_of("second")), Some(b"two"))
 }
 
 test "a run that started from an older snapshot cannot commit, so a snapshot never mixes two edits" {

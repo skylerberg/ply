@@ -4,7 +4,8 @@ import std.bytes
 import std.list
 import compiler.store.memo
 import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, empty_memory_store,
-                            executed_count, executed_for, restored_for, start_run, query_stats)
+                            executed_count, executed_for, restored_for, in_session, in_session_of,
+                            products_behind, query_stats)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -37,8 +38,8 @@ import compiler.front.checking.groups (GroupKey, owner_key_bin, group_key_bin, o
                                        owners_query, cycles_query, group_query,
                                        owner_interface_query, signatures_query, typed_query,
                                        group_hash_query, owner_facts, always_entire, imports_of,
-                                       whole_query, GroupCheck, owners_check, current, current_unit,
-                                       group_of, group_hash_inputs, hashes_query, tables_of_result,
+                                       GroupCheck, owners_check, current, current_unit, group_of,
+                                       group_hash_inputs, hashes_query, tables_of_result,
                                        sorted_bytes, program_summary_query, signature_query,
                                        group_interface_query, shown_query)
 import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
@@ -91,10 +92,7 @@ fn fresh_digest(
         prelude_frames,
         prelude_files(),
         |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-        ||
-          memo::digest_of(
-            Some(memo::query_output(qs, start_run(qs), record.query, record.input).output),
-          ),
+        || memo::digest_of(Some(in_session_of(qs, record.query, record.input))),
       ).value,
     )
   } with {
@@ -102,17 +100,10 @@ fn fresh_digest(
   }
 }
 
-fn checked_two_ways(query: Bytes) -> Bool =
-  [
-    group_query(),
-    signatures_query(),
-    signature_query(),
-    group_interface_query(),
-    shown_query(),
-    owner_interface_query(),
-    owner_interfaces_query(),
-  ].contains(
-    query,
+fn reads_of_fact(record: memo::FactRecord) -> List<Bytes> / {abort.raise} =
+  sorted_bytes(
+    record.reads.map(|r: memo::Dependency| bin::encode(r, memo::dependency_bin())),
+  ).unique(
   )
 
 fn facts_differing(
@@ -121,20 +112,24 @@ fn facts_differing(
   sources: List<Source>,
 ) -> List<Bytes> / {abort.raise} = {
   let stored = memo::fact_records(fresh);
-  let products_behind = warm.cursor < warm.log.len();
-  let off = memo::fact_records(warm).fold(
-    [],
-    |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
-      if products_behind && product_queries().contains(record.query) { found } else {
-        match stored.get(key) {
-          Some(same) -> if same.output == record.output || checked_two_ways(record.query) { found }
-          else { found.push(record.query) },
-          None -> if fresh_digest(sources, fresh, record) == Some(record.output) { found }
-          else { found.push(record.query) },
-        }
-      },
-  );
-  off.unique()
+  let held = memo::fact_records(warm);
+  let behind = products_behind(warm);
+  let product = |record: memo::FactRecord| behind && product_queries().contains(record.query);
+  let off = held.fold([], |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
+    if product(record) { found } else {
+      match stored.get(key) {
+        Some(same) -> if same.output == record.output
+            && reads_of_fact(same) == reads_of_fact(record) { found }
+        else { found.push(record.query) },
+        None -> if fresh_digest(sources, fresh, record) == Some(record.output) { found }
+        else { found.push(record.query) },
+      }
+    });
+  stored.fold(off, |found: List<Bytes>, key: Bytes, record: memo::FactRecord|
+    if held.contains(key) || product(record)
+        || fresh_digest(sources, warm, record) == Some(record.output) { found }
+    else { found.push(b"missing ".concat(record.query)) }).unique(
+  )
 }
 
 type EditSession = {
@@ -231,7 +226,7 @@ fn pulled(
           if ran.contains(g) || back.contains(g) {
             accumulator.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
           } else { accumulator }),
-        mismatches: if stale == [] { None } else {
+        mismatches: if needless == [] && stale == [] { None } else {
           Some(
             Bytes::concat_all([
               b": ran ",
@@ -344,18 +339,18 @@ fn inputs_over(
         hash: b"group inputs",
         body: group_inputs_hash,
         persistent: true,
-        product: false,
+        product: None,
       }).insert(b"hash inputs", {
         name: b"hash inputs",
         hash: b"hash inputs",
         body: hash_inputs_result,
         persistent: true,
-        product: false,
+        product: None,
       });
-      let cycles = cycles_among(qs, start_run(qs), w.own);
-      if cycles.rejected.len() > 0 { None } else {
-        Some(
-          w.own.fold(
+      in_session(qs, |run: Run| {
+        let cycles = cycles_among(qs, run, w.own);
+        if cycles.rejected.len() > 0 { { run: cycles.run, value: None } } else {
+          let probed = w.own.fold(
             { run: cycles.run, out: Map::new() },
             |accumulator: { run: Run, out: Map<Bytes, Bytes> }, m: Bytes| {
               let named = bin::encode(
@@ -397,9 +392,10 @@ fn inputs_over(
                 },
               )
             },
-          ).out,
-        )
-      }
+          );
+          { run: probed.run, value: Some(probed.out) }
+        }
+      })
     },
   ).value
 }
@@ -1485,13 +1481,18 @@ fn load_with_analysis(
       lookup_input(w, text_of, text_of, || names, reject_embed, nothing_derived, kind, at),
     || {
       let qs = fresh_registry();
-      let all = query_load(qs, w.own, if tested { names } else { [] }, tested, start_run(qs));
-      let fixed = hashed_all(qs, w.own, all.value.pulled, tested, all.run);
-      {
-        results: all.value.results,
-        pulled: all.value.pulled,
-        fixing: joined_cached_hashes(fixed.value),
-      }
+      in_session(qs, |run: Run| {
+        let all = query_load(qs, w.own, if tested { names } else { [] }, tested, run);
+        let fixed = hashed_all(qs, w.own, all.value.pulled, tested, all.run);
+        {
+          run: fixed.run,
+          value: {
+            results: all.value.results,
+            pulled: all.value.pulled,
+            fixing: joined_cached_hashes(fixed.value),
+          },
+        }
+      })
     },
   ).value;
   let loaded = assembled_load(
@@ -2179,22 +2180,9 @@ test "an edit that affects one definition in a module rechecks that definition a
   assert_eq(more.results, queried_over(empty_memory_store(), widened).results)
 }
 
-fn checked_whole_in(store: MemoryStore, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
-  memo::fact_records(store).fold(false, |found: Bool, _: Bytes, r: memo::FactRecord|
-    found
-      || (r.query == hash
-      && r.input == bin::encode({ module: module, shipped: false, tested: false }, module_key_bin())
-      && r.reads.fold(false, |any: Bool, read: memo::Dependency|
-        any
-          || (match read {
-            memo::QueryDependency(name, _, _) -> name == owner_interfaces_query(),
-            memo::ExternalDependency(_, _, _) -> false,
-          }))))
-
 test "when only the query that assembles a module's result changes, it reruns but the module's definitions are not rechecked" {
   let sources = lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n");
   let cold = queried_over(empty_memory_store(), sources);
-  assert(checked_whole_in(cold.store, module_query(), b"app"));
   let anew = b"module, defined anew";
   let qs = fresh_registry().fold(
     Map::new(),
@@ -2204,8 +2192,7 @@ test "when only the query that assembles a module's result changes, it reruns bu
   let warm = queried_under(qs, cold.store, sources);
   assert(modules_ran(warm.run, module_query()).contains(b"app"));
   assert(modules_ran(warm.run, module_query()).contains(b"lib"));
-  assert_eq(groups_ran(warm.run, group_query()).filter(|g: GroupKey| !g.shipped), []);
-  assert(!checked_whole_in(warm.store, anew, b"app"));
+  assert_eq(groups_ran(warm.run, group_query()), []);
   assert_eq(warm.results, cold.results)
 }
 
@@ -2218,25 +2205,7 @@ fn shared_base_sources(lib: Bytes) -> List<Source> =
     },
   ]
 
-fn reads_own_groups(store: MemoryStore) -> Bool / {abort.raise} =
-  memo::fact_records(store).fold(false, |found: Bool, _: Bytes, r: memo::FactRecord|
-    found
-      || (r.query == whole_query()
-      && {
-        let module = decoded(r.input, module_key_bin(), "a module's name").module;
-        r.reads.fold(false, |own: Bool, read: memo::Dependency|
-          own
-            || (match read {
-              memo::QueryDependency(name, input, _) ->
-                (name == owner_interface_query()
-                  && decoded(input, owner_key_bin(), "an owner's name").module == module)
-                  || (name == group_query()
-                  && decoded(input, group_key_bin(), "a group's names").module == module),
-              memo::ExternalDependency(_, _, _) -> false,
-            }))
-      }))
-
-test "a whole-module check requested by one definition does not read the results of the module's other definitions" {
+test "an edit to a signature checks again only the groups that read it" {
   let cold = queried_over(
     empty_memory_store(),
     shared_base_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
@@ -2247,7 +2216,6 @@ test "a whole-module check requested by one definition does not read the results
   assert(ran.contains(group_in(b"app", [b"go"])));
   assert(ran.contains(group_in(b"app", [b"again"])));
   assert(!ran.contains(group_in(b"app", [b"aside"])));
-  assert(!reads_own_groups(warm.store));
   assert_eq(warm.results, queried_over(empty_memory_store(), widened).results)
 }
 
@@ -2386,7 +2354,7 @@ test "import cycles and self-imports are rejected with the same errors whether c
   )
 }
 
-test "a module that fails to check causes no check of the modules that import it, nor of its definitions one by one" {
+test "a body error stays where it is written, and modules that import it are checked against its signatures" {
   let sources = [
     {
       name: b"lib",
@@ -2404,15 +2372,14 @@ test "a module that fails to check causes no check of the modules that import it
     b"aside",
     b"lib",
   ]);
-  assert_eq(modules_ran(cold.run, module_query()), [b"aside", b"lib"]);
-  assert_eq(groups_ran(cold.run, group_query()), []);
+  assert_eq(modules_ran(cold.run, module_query()), [b"app", b"aside", b"lib", b"top"]);
   let mended = with_module(
     with_module(sources, b"lib", b"pub fn broken() -> Int = 3\n\npub fn fine() -> Int = 1\n"),
     b"aside",
     b"pub fn alone() -> Int = 4\n\npub fn other() -> Int = 2\n",
   );
   let warm = queried_over(cold.store, mended);
-  assert_eq(modules_ran(warm.run, module_query()), [b"app", b"aside", b"lib", b"top"]);
+  assert_eq(modules_ran(warm.run, module_query()), [b"aside", b"lib"]);
   assert_eq(
     outcome_summary(warm.outcome),
     outcome_summary(queried_over(empty_memory_store(), mended).outcome),
@@ -2430,18 +2397,22 @@ fn summary_run(
     prelude_frames,
     prelude_files(),
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || {
-      let a = memo::query_output(
-        qs,
-        start_run(qs),
-        program_summary_query(),
-        bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
-      );
-      query_stats(a.run).fold([], |ran: List<Bytes>, t: QueryStats|
-        if t.ran > 0 {
-          ran.push(Bytes::concat_all([t.query, b" ", Bytes::of_string(t.ran.to_string())]))
-        } else { ran })
-    },
+    ||
+      in_session(qs, |run: Run| {
+        let a = memo::query_output(
+          qs,
+          run,
+          program_summary_query(),
+          bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
+        );
+        {
+          run: a.run,
+          value: query_stats(a.run).fold([], |ran: List<Bytes>, t: QueryStats|
+            if t.ran > 0 {
+              ran.push(Bytes::concat_all([t.query, b" ", Bytes::of_string(t.ran.to_string())]))
+            } else { ran }),
+        }
+      }),
   );
   { store: done.store, ran: done.value }
 }

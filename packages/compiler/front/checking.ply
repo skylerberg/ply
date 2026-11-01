@@ -6,7 +6,7 @@ import std.fs
 import std.fs (fs)
 import compiler.store.memo
 import compiler.store.memo (memo, memo_store, MemoryStore, Run, query_output, empty_memory_store,
-                            with_memory_store, executed_count, executed_for, start_run)
+                            with_memory_store, executed_count, executed_for, in_session, Product)
 import compiler.store.memo_files
 import compiler.store.packs
 import compiler.unit (definition_hash)
@@ -44,12 +44,11 @@ import compiler.front.checking.groups (group_key_bin, owners_result_bin, group_h
                                        visible_modules_query, wanted_files_query, group_query,
                                        owner_interface_query, shown_query, signatures_query,
                                        signature_query, group_interface_query, typed_query,
-                                       group_hash_query, names_query, whole_query,
-                                       header_text_query, header_query, exported_query,
-                                       hashes_query, documented_query, declaring_query,
-                                       declaring_bin, queries, tables_of_result, group_forms_query,
-                                       module_summary_query, value_call_modules_query,
-                                       declared_query, owner_hash_query)
+                                       group_hash_query, names_query, header_text_query,
+                                       header_query, exported_query, hashes_query, documented_query,
+                                       declaring_query, declaring_bin, queries, tables_of_result,
+                                       group_forms_query, module_summary_query,
+                                       value_call_modules_query, declared_query, owner_hash_query)
 
 pub type PackageFile = { module: Bytes, text: Bytes }
 
@@ -188,7 +187,7 @@ pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, CheckQuery> 
         },
         body: q.body,
         persistent: !digest_only_queries().contains(q.name),
-        product: product_queries().contains(q.name),
+        product: product_of(q.name),
       }),
   )
 
@@ -201,7 +200,7 @@ pub fn fresh_registry() -> Map<Bytes, CheckQuery> =
         hash: q.name,
         body: q.body,
         persistent: true,
-        product: product_queries().contains(q.name),
+        product: product_of(q.name),
       }),
   )
 
@@ -271,8 +270,8 @@ pub fn query_load(
             run: a.run,
             returned: accumulator.returned.insert(n.module, a.returned),
             written: accumulator.written.insert(n.module, a.returned.result.shape.written),
-            stopped: if a.returned.result.rejected.len() == 0 { accumulator.stopped }
-            else { accumulator.stopped.insert(n.module, true) },
+            stopped: if a.returned.result.unreadable { accumulator.stopped.insert(n.module, true) }
+            else { accumulator.stopped },
           }
         }
       },
@@ -334,7 +333,6 @@ pub fn shipped_queries() -> List<Bytes> =
     names_query(),
     declared_query(),
     published_query(),
-    whole_query(),
     signatures_query(),
     typed_query(),
     calls_query(),
@@ -349,6 +347,12 @@ pub fn shipped_queries() -> List<Bytes> =
     documented_query(),
     declaring_query(),
   ]
+
+fn product_of(name: Bytes) -> Option<Product> =
+  if [documented_query(), declaring_query()].contains(name) {
+    Some({ kind: b"docs", after: [b"hashes"] })
+  } else if product_queries().contains(name) { Some({ kind: b"hashes", after: [] }) }
+  else { None }
 
 pub fn product_queries() -> List<Bytes> =
   [
@@ -792,13 +796,25 @@ fn query_alone(
   qs: Map<Bytes, CheckQuery>,
   w: LoadInputs,
 ) -> { run: Run, results: List<CheckedModule>, fixing: CachedHashes } / {RunEffects, abort.raise} = {
-  let all = query_load(qs, w.own, [], false, start_run(qs));
-  if rejected_first(all.value.results).len() > 0 {
-    { run: all.run, results: all.value.results, fixing: no_cached_hashes() }
-  } else {
-    let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
-    { run: fixed.run, results: all.value.results, fixing: joined_cached_hashes(fixed.value) }
-  }
+  in_session(qs, |run: Run| {
+    let all = query_load(qs, w.own, [], false, run);
+    if rejected_first(all.value.results).len() > 0 {
+      {
+        run: all.run,
+        value: { run: all.run, results: all.value.results, fixing: no_cached_hashes() },
+      }
+    } else {
+      let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
+      {
+        run: fixed.run,
+        value: {
+          run: fixed.run,
+          results: all.value.results,
+          fixing: joined_cached_hashes(fixed.value),
+        },
+      }
+    }
+  })
 }
 
 pub fn outcome_of(
@@ -840,21 +856,19 @@ fn queried_in(
       hash: if nth % 2 == 1 { b"odd" } else { b"even" },
       body: |input: Bytes| input,
       persistent: true,
-      product: false,
+      product: None,
     })
   };
   let done = fs::on_mem[abs](tree, ||
     handle {
-      memo_files::with_memo_store[abs, abs](
+      memo_files::with_memo_store[abs](
         "s",
-        "shared",
         prelude_frames,
         prelude_files(),
         |kind: Bytes, at: Bytes| {
           if raced.is_first_lookup() {
-            memo_files::with_memo_store[abs, abs](
+            memo_files::with_memo_store[abs](
               "s",
-              "shared",
               prelude_frames,
               prelude_files(),
               |k: Bytes, a: Bytes| lookup_input_alone(w, k, a),
@@ -1056,14 +1070,19 @@ pub fn check_with_pack(
       |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at, derived: derived),
       || {
         let qs = fresh_registry();
-        let all = query_load(qs, w.own, [], false, start_run(qs));
-        let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
-        {
-          run: fixed.run,
-          results: all.value.results,
-          fixing: joined_cached_hashes(fixed.value),
-          warnings: root_warnings(all.value.results, sources.len()),
-        }
+        in_session(qs, |run: Run| {
+          let all = query_load(qs, w.own, [], false, run);
+          let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
+          {
+            run: fixed.run,
+            value: {
+              run: fixed.run,
+              results: all.value.results,
+              fixing: joined_cached_hashes(fixed.value),
+              warnings: root_warnings(all.value.results, sources.len()),
+            },
+          }
+        })
       },
     );
     {
@@ -1160,11 +1179,14 @@ fn shipped_store_results(
     |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
     || {
       let qs = fresh_registry();
-      check_shipped_modules(
-        qs,
-        with_prelude_source(shipped).map(|s: Source| s.name),
-        start_run(qs),
-      ).rejected
+      in_session(qs, |run: Run| {
+        let checked = check_shipped_modules(
+          qs,
+          with_prelude_source(shipped).map(|s: Source| s.name),
+          run,
+        );
+        { run: checked.run, value: checked.rejected }
+      })
     },
   )
 }

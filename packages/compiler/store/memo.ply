@@ -14,6 +14,7 @@ pub effect memo {
   read written_by(query: Bytes, input: Bytes) -> Option<Bytes>
   read offer_as(by: Bytes, query: Bytes, input: Bytes, output: Bytes) -> Unit
   read offered() -> Option<Bytes>
+  read recording(on: Bool) -> Unit
 }
 
 pub type Dependency =
@@ -44,12 +45,14 @@ derive bin for FactDetails
 
 derive bin for StoredInput
 
+pub type Product = { kind: Bytes, after: List<Bytes> }
+
 pub type Query<| e> = {
   name: Bytes,
   hash: Bytes,
   body: (Bytes) -> Bytes / {memo.read, abort.raise | e},
   persistent: Bool,
-  product: Bool,
+  product: Option<Product>,
 }
 
 type Step = { query: Bytes, input: Bytes }
@@ -71,7 +74,7 @@ pub type Run = {
   offers: Map<Bytes, Offer>,
   runs: Map<Bytes, Int>,
   lost: Map<Bytes, Int>,
-  caught_up: Bool,
+  caught_up: Map<Bytes, Bool>,
 }
 
 fn new_run() -> Run =
@@ -88,7 +91,7 @@ fn new_run() -> Run =
     offers: Map::new(),
     runs: Map::new(),
     lost: Map::new(),
-    caught_up: false,
+    caught_up: Map::new(),
   }
 
 pub fn missing_count(run: Run) -> Int = run.lost.fold(0, |n: Int, _: Bytes, k: Int| n + k)
@@ -180,7 +183,7 @@ pub effect memo_store {
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
   read is_out_of_date(key: Bytes) -> Bool
   read next_out_of_date() -> Option<Waited>
-  read past(key: Bytes) -> List<StoredFact>
+  read past(key: Bytes) -> Option<StoredFact>
   write put(key: Bytes, fact: StoredFact, details: FactDetails, output: Bytes, lasting: Bool) -> Unit
   write keep_output(digest: Bytes, output: Bytes, lasting: Bool) -> Unit
   write keep_past(key: Bytes, fact: StoredFact) -> Unit
@@ -194,11 +197,11 @@ pub effect memo_store {
   write settle(key: Bytes) -> Unit
   write log_change(key: Bytes) -> Unit
   write note_edit() -> Unit
-  read defers(key: Bytes) -> Bool
-  write defer_products(prefixes: Map<Bytes, Bool>) -> Unit
-  write push_products(pushing: Bool) -> Unit
-  read logged_changes() -> List<Bytes>
-  write log_read() -> Unit
+  read deferred_kind(key: Bytes) -> Option<Bytes>
+  write defer_products(kinds: Map<Bytes, Bytes>) -> Unit
+  write push_products(kind: Bytes) -> Unit
+  read logged_changes(kind: Bytes) -> List<Bytes>
+  write log_read(kind: Bytes) -> Unit
   write running(id: Bytes) -> Unit
 }
 
@@ -217,7 +220,7 @@ fn marked(key: Bytes) -> Unit / {memo_store.read, memo_store.write} =
 
 fn marked_dependents(key: Bytes) -> Unit / {memo_store.read, memo_store.write} = {
   let deferred = memo_store.dependents(key).fold(false, |any: Bool, d: Bytes|
-    if memo_store.defers(d) { true } else {
+    if memo_store.deferred_kind(d) != None { true } else {
       marked(d);
       any
     });
@@ -248,6 +251,7 @@ fn deleted_one(key: Bytes) -> List<Bytes> / {memo_store.read, memo_store.write, 
     Some(f) -> {
       marked_dependents(key);
       let before = memo_store.details(f.details);
+      memo_store.keep_past(key, f);
       memo_store.delete(key);
       match before {
         None -> [],
@@ -301,13 +305,32 @@ fn reads_in(details: Option<FactDetails>) -> List<Dependency> =
 fn wrote_in(details: Option<FactDetails>) -> List<Bytes> =
   match details { Some(d) -> d.wrote.map(|w: WrittenFact| w.key), None -> [] }
 
-pub fn start_run<| e>(
+pub fn in_session<a | e>(
+  queries: Map<Bytes, Query<| e>>,
+  work: (Run) -> { run: Run, value: a } / {memo_store.read, memo_store.write, abort.raise | e},
+) -> a / {memo_store.read, memo_store.write, abort.raise | e} = {
+  let done = work(updated_run(queries));
+  recomputed(queries, done.run);
+  done.value
+}
+
+pub fn in_session_of<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  name: Bytes,
+  input: Bytes,
+) -> Bytes / {memo_store.read, memo_store.write, abort.raise | e} =
+  in_session(queries, |run: Run| {
+    let a = query_output(queries, run, name, input);
+    { run: a.run, value: a.output }
+  })
+
+fn updated_run<| e>(
   queries: Map<Bytes, Query<| e>>,
 ) -> Run / {memo_store.read, memo_store.write, abort.raise | e} = {
   memo_store.running(queries_id(queries));
   memo_store.defer_products(
-    queries.fold(Map::new(), |found: Map<Bytes, Bool>, name: Bytes, q: Query<| e>|
-      if q.product { found.insert(query_prefix(name), true) } else { found }),
+    queries.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes, q: Query<| e>|
+      match q.product { Some(p) -> found.insert(query_prefix(name), p.kind), None -> found }),
   );
   marked_for_new_code(queries);
   marked_for_new_inputs();
@@ -321,7 +344,7 @@ fn marked_for_new_code<| e>(
     if memo_store.code(name) != Some(q.hash) {
       memo_store.note_edit();
       let stale = memo_store.facts_of(query_prefix(name));
-      if q.product { deleted_all(stale) }
+      if q.product != None { deleted_all(stale) }
       else { stale.fold((), |_: Unit, key: Bytes| marked(key)) };
       memo_store.put_code(name, q.hash)
     })
@@ -360,8 +383,10 @@ fn recomputed<| e>(
     })
 
 fn waits_for_earlier_version(next: Waited) -> Bool / {memo_store.read, memo_store.write} = {
-  let deepest = memo_store.past(next.key).fold(next.depth, |depth: Int, f: StoredFact|
-    max(depth, f.depth));
+  let deepest = match memo_store.past(next.key) {
+    Some(f) -> max(next.depth, f.depth),
+    None -> next.depth,
+  };
   if deepest > next.depth { memo_store.mark_out_of_date(next.key, deepest) };
   deepest > next.depth
 }
@@ -407,20 +432,33 @@ fn recompute<| e>(
     },
   }
 
-fn products_caught_up<| e>(
+fn kind_caught_up<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
+  kind: Bytes,
 ) -> Run / {memo_store.read, memo_store.write, abort.raise | e} =
-  if run.caught_up { run } else {
-    memo_store.logged_changes().fold((), |_: Unit, key: Bytes| {
-      if memo_store.defers(key) { marked(key) };
-      memo_store.dependents(key).fold((), |_: Unit, d: Bytes| if memo_store.defers(d) { marked(d) })
+  if run.caught_up.contains(kind) { run } else {
+    let of_kind = |key: Bytes| memo_store.deferred_kind(key) == Some(kind);
+    memo_store.logged_changes(kind).fold((), |_: Unit, key: Bytes| {
+      if of_kind(key) { marked(key) };
+      memo_store.dependents(key).fold((), |_: Unit, d: Bytes| if of_kind(d) { marked(d) })
     });
-    memo_store.push_products(true);
-    let done = recomputed(queries, { ..run, caught_up: true });
-    memo_store.log_read();
+    memo_store.push_products(kind);
+    let done = recomputed(queries, { ..run, caught_up: run.caught_up.insert(kind, true) });
+    memo_store.log_read(kind);
     done
   }
+
+fn product_caught_up<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  run: Run,
+  product: Product,
+) -> Run / {memo_store.read, memo_store.write, abort.raise | e} =
+  kind_caught_up(
+    queries,
+    product.after.fold(run, |r: Run, kind: Bytes| kind_caught_up(queries, r, kind)),
+    product.kind,
+  )
 
 pub fn query_output<| e>(
   queries: Map<Bytes, Query<| e>>,
@@ -429,7 +467,7 @@ pub fn query_output<| e>(
   input: Bytes,
 ) -> QueryResult / {memo_store.read, memo_store.write, abort.raise | e} = {
   let q = query_of(queries, name);
-  let ready = if q.product { products_caught_up(queries, run) } else { run };
+  let ready = match q.product { Some(p) -> product_caught_up(queries, run, p), None -> run };
   let a = fetched(queries, ready, q, key_of(q, input), input, 100000);
   {
     run: {
@@ -456,6 +494,12 @@ fn fetched<| e>(
       Some(o) -> { run: s.run, output: o, at: s.at },
       None -> {
         let e = run_opened(queries, s.run, q, key, input, false, left - 1);
+        if e.at.digest != s.at.digest {
+          panic(
+            "the query `" ++ String::of_bytes_lossy(q.name)
+              ++ "` returned a different result when run again after its stored result was lost: its body reads data that is not part of its input",
+          )
+        };
         {
           run: {
             ..e.run,
@@ -632,7 +676,7 @@ fn product_unchanged<| e>(
   key: Bytes,
   left: Int,
 ) -> { run: Run, at: Option<Settled> } / {memo_store.read, memo_store.write, abort.raise | e} =
-  match if q.product { memo_store.fact(key) } else { None } {
+  match if q.product != None { memo_store.fact(key) } else { None } {
     None -> { run: run, at: None },
     Some(f) -> {
       let held = reads_still_hold(queries, run, reads_in(memo_store.details(f.details)), left - 1);
@@ -675,9 +719,16 @@ fn written_version<| e>(
   writer: Bytes,
   written: WrittenFact,
 ) -> Option<StoredFact> / {memo_store.read} = {
-  let current = match memo_store.fact(written.key) { Some(f) -> [f], None -> [] };
-  current.concat(memo_store.past(written.key)).find(|f: StoredFact|
-    f.written_by == writer && f.output == written.output && version_usable(queries, f))
+  [memo_store.fact(written.key), memo_store.past(written.key)].fold(
+    None,
+    |found: Option<StoredFact>, version: Option<StoredFact>|
+      match ((found, version)) {
+        (None, Some(f)) -> if f.written_by == writer && f.output == written.output
+            && version_usable(queries, f) { Some(f) }
+        else { None },
+        _ -> found,
+      },
+  )
 }
 
 fn written_versions<| e>(
@@ -760,14 +811,10 @@ fn restored<| e>(
   left: Int,
 ) -> { run: Run, at: Option<Settled> } / {memo_store.read, memo_store.write, abort.raise | e} =
   if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
-    memo_store.past(key).fold(
-      { run: run, at: None },
-      |sofar: { run: Run, at: Option<Settled> }, past: StoredFact|
-        match sofar.at {
-          Some(_) -> sofar,
-          None -> restored_from(queries, sofar.run, q, key, past, left - 1),
-        },
-    )
+    match memo_store.past(key) {
+      None -> { run: run, at: None },
+      Some(earlier) -> restored_from(queries, run, q, key, earlier, left - 1),
+    }
   }
 
 fn report_cycle<a>(run: Run, step: Step) -> a / {abort.raise} =
@@ -784,6 +831,7 @@ type Execution = {
   external_reads: Map<Bytes, Bool>,
   depth: Int,
   wrote: List<WrittenFact>,
+  recording: Bool,
 }
 
 fn offer_valid(run: Run, o: Offer) -> Bool = run.runs.get(o.from) == Some(o.nth)
@@ -903,13 +951,14 @@ fn execute<| e>(
       external_reads: Map::new(),
       depth: 0,
       wrote: [],
+      recording: true,
     };
     let world = |s: Execution, kind: Bytes, at: Bytes| {
       let found = memo_store.external(kind, at);
       let d = memo_store.external_digest(kind, at);
       let seen = location_id(kind, at).concat(d);
       {
-        st: if s.external_reads.contains(seen) { s } else {
+        st: if !s.recording || s.external_reads.contains(seen) { s } else {
           memo_store.put_input({ kind: kind, at: at, digest: d });
           {
             ..s,
@@ -920,20 +969,21 @@ fn execute<| e>(
         found: found,
       }
     };
-    let used = |s: Execution, name: Bytes, query_input: Bytes, at: Settled| {
-      if at.sealed {
-        memo_store.put_input({
-          kind: sealed_kind(),
-          at: fact_key(name, query_input),
-          digest: at.digest,
-        })
+    let used = |s: Execution, name: Bytes, query_input: Bytes, at: Settled|
+      if !s.recording { s } else {
+        if at.sealed {
+          memo_store.put_input({
+            kind: sealed_kind(),
+            at: fact_key(name, query_input),
+            digest: at.digest,
+          })
+        };
+        {
+          ..s,
+          reads: s.reads.push(QueryDependency(name, query_input, at.digest)),
+          depth: max(s.depth, at.depth),
+        }
       };
-      {
-        ..s,
-        reads: s.reads.push(QueryDependency(name, query_input, at.digest)),
-        depth: max(s.depth, at.depth),
-      }
-    };
     let ran = handle {
       (q.body)(input)
     } with {
@@ -994,6 +1044,9 @@ fn execute<| e>(
             }),
           },
         };
+      },
+      memo.recording(on) -> {
+        st = { ..st, recording: on };
       },
       memo.offered() -> match st.run.offers.get(key) {
         None -> None,
@@ -1060,17 +1113,23 @@ pub fn reachable_keys<| e>(
 pub type Waiting = {
   depths: Map<Bytes, Int>,
   order: Map<Bytes, Bool>,
-  products: Map<Bytes, Bool>,
-  pushing: Bool,
+  products: Map<Bytes, Bytes>,
+  pushing: Map<Bytes, Bool>,
 }
 
 pub type Waited = { key: Bytes, depth: Int }
 
 pub fn nothing_waiting() -> Waiting =
-  { depths: Map::new(), order: Map::new(), products: Map::new(), pushing: false }
+  { depths: Map::new(), order: Map::new(), products: Map::new(), pushing: Map::new() }
 
-pub fn defers(w: Waiting, key: Bytes) -> Bool / {abort.raise} =
-  !w.pushing && w.products.contains(key.slice(0, 4))
+pub fn deferred_kind(w: Waiting, key: Bytes) -> Option<Bytes> / {abort.raise} =
+  match w.products.get(key.slice(0, 4)) {
+    Some(kind) -> if w.pushing.contains(kind) { None } else { Some(kind) },
+    None -> None,
+  }
+
+pub fn nothing_left_waiting(w: Waiting) -> Unit / {abort.raise} =
+  if w.depths.len() > 0 { panic("a run reached its commit with facts still out of date") }
 
 fn waiting_name(depth: Int, key: Bytes) -> Bytes = u64_be(depth).concat(key)
 
@@ -1146,7 +1205,7 @@ pub type MemoryStore = {
   inputs: Map<Bytes, StoredInput>,
   codes: Map<Bytes, Bytes>,
   log: List<Bytes>,
-  cursor: Int,
+  cursors: Map<Bytes, Int>,
   edits: Int,
   pack_id: Bytes,
 }
@@ -1161,10 +1220,13 @@ pub fn empty_memory_store() -> MemoryStore =
     inputs: Map::new(),
     codes: Map::new(),
     log: [],
-    cursor: 0,
+    cursors: Map::new(),
     edits: 0,
     pack_id: b"",
   }
+
+pub fn products_behind(store: MemoryStore) -> Bool =
+  store.cursors.any(|_: Bytes, at: Int| at < store.log.len())
 
 pub type FactRecord = { query: Bytes, input: Bytes, reads: List<Dependency>, output: Bytes }
 
@@ -1265,7 +1327,7 @@ pub fn with_memory_store<a | e>(
       l.looked.digest
     },
     memo_store.is_out_of_date(key) -> running.waiting.depths.contains(key),
-    memo_store.past(key) -> match store.past.get(key) { Some(f) -> [f], None -> [] },
+    memo_store.past(key) -> store.past.get(key),
     memo_store.keep_past(key, fact) -> {
       store = { ..store, past: store.past.insert(key, fact) };
     },
@@ -1331,16 +1393,22 @@ pub fn with_memory_store<a | e>(
       };
       edit_noted = true;
     },
-    memo_store.defers(key) -> defers(running.waiting, key),
-    memo_store.defer_products(prefixes) -> {
-      running = { ..running, waiting: { ..running.waiting, products: prefixes } };
+    memo_store.deferred_kind(key) -> deferred_kind(running.waiting, key),
+    memo_store.defer_products(kinds) -> {
+      running = { ..running, waiting: { ..running.waiting, products: kinds } };
     },
-    memo_store.push_products(pushing) -> {
-      running = { ..running, waiting: { ..running.waiting, pushing: pushing } };
+    memo_store.push_products(kind) -> {
+      running = {
+        ..running,
+        waiting: { ..running.waiting, pushing: running.waiting.pushing.insert(kind, true) },
+      };
     },
-    memo_store.logged_changes() -> store.log.drop(store.cursor),
-    memo_store.log_read() -> {
-      store = { ..store, cursor: store.log.len() };
+    memo_store.logged_changes(kind) -> match store.cursors.get(kind) {
+      Some(at) -> store.log.drop(at),
+      None -> [],
+    },
+    memo_store.log_read(kind) -> {
+      store = { ..store, cursors: store.cursors.insert(kind, store.log.len()) };
     },
     memo_store.running(id) -> {
       let trusted = match running.pack.index {
@@ -1352,7 +1420,10 @@ pub fn with_memory_store<a | e>(
       store = { ..store, pack_id: pack_id };
       running = { ..running, trusted: trusted };
     },
-    return value -> { store: store, value: value },
+    return value -> {
+      nothing_left_waiting(running.waiting);
+      { store: store, value: value }
+    },
   }
 }
 
@@ -1412,7 +1483,7 @@ pub fn query(
   name: Bytes,
   hash: Bytes,
   body: keep (Bytes) -> Bytes / {memo.read, abort.raise},
-) -> Query<| {}> = { name: name, hash: hash, body: body, persistent: true, product: false }
+) -> Query<| {}> = { name: name, hash: hash, body: body, persistent: true, product: None }
 
 pub fn read_file(input: Bytes) -> Bytes / {memo.read} =
   match memo.external(b"file", input) { Some(text) -> text, None -> b"" }
@@ -1442,10 +1513,11 @@ fn fetched_in(
     packs::no_pack,
     b"",
     |_: Bytes, at: Bytes| w.files.get(at),
-    || {
-      let a = query_output(queries, start_run(queries), name, input);
-      { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) }
-    },
+    ||
+      in_session(queries, |run: Run| {
+        let a = query_output(queries, run, name, input);
+        { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
+      }),
   );
   { output: done.value.output, ran: done.value.ran, world: { ..w, store: done.store } }
 }
@@ -1469,27 +1541,41 @@ test "a key marked again at another depth moves in the queue and leaves it when 
   assert_eq(first_waiting(without_mark(moved, b"k")), None)
 }
 
-fn checked_as_a_whole(input: Bytes) -> Bytes / {memo.read} = {
-  memo.offer_as(b"whole", b"part", input, b"from the whole");
-  memo.fetch(b"part", input)
+test "a result made again that differs from its record is rejected" {
+  let q = lengths(b"h1");
+  let first = fetched_in(q, four(), b"length", b"a");
+  let unrecorded = Map::new().insert(
+    b"length",
+    query(b"length", b"h1", |input: Bytes| {
+      let _ = memo.external(b"file", input);
+      b"other"
+    }),
+  );
+  let lost = { ..first.world, store: { ..first.world.store, outputs: Map::new() } };
+  assert_eq(
+    handle {
+      Some(fetched_in(unrecorded, lost, b"length", b"a").output)
+    } with {
+      abort.raise(_) -> None,
+    },
+    None,
+  )
 }
 
-fn checked_alone(input: Bytes) -> Bytes / {memo.read} =
-  match memo.offered() { Some(offer) -> offer, None -> b"alone" }
-
-test "a result lost from the store is computed again, and a different result replaces it" {
-  let q = Map::new().insert(b"whole", query(b"whole", b"w1", checked_as_a_whole)).insert(
-    b"part",
-    query(b"part", b"p1", checked_alone),
+test "a run reads each input once, even if the input changes later in the run" {
+  let reads = with_memory_store(
+    empty_memory_store(),
+    packs::no_pack,
+    b"",
+    |_: Bytes, at: Bytes| Some(at),
+    || {
+      let first = memo_store.external(b"file", b"a");
+      let digest = memo_store.external_digest(b"file", b"a");
+      { same: first == memo_store.external(b"file", b"a"), digest: digest }
+    },
   );
-  let first = fetched_in(q, four(), b"whole", b"a");
-  assert_eq(first.output, b"from the whole");
-  let store = first.world.store;
-  let lost = {
-    ..first.world,
-    store: { ..store, outputs: store.outputs.remove(digest_of(Some(first.output))) },
-  };
-  assert_eq(fetched_in(q, lost, b"part", b"a").output, b"alone")
+  assert(reads.value.same);
+  assert_eq(reads.value.digest, digest_of(Some(b"a")))
 }
 
 test "a run with no changed input runs no query" {
@@ -1669,8 +1755,10 @@ test "a query that asks for its own result fails after an edit as it fails in a 
 
 fn cascading(input: Bytes) -> Bytes / {memo.read} = blake3(memo.fetch(b"length", input))
 
+fn hash_kind() -> Option<Product> = Some({ kind: b"hash", after: [] })
+
 fn product_queries() -> Map<Bytes, Query<| {}>> =
-  lengths(b"h1").insert(b"hash", { ..query(b"hash", b"p1", cascading), product: true })
+  lengths(b"h1").insert(b"hash", { ..query(b"hash", b"p1", cascading), product: hash_kind() })
 
 test "an edit leaves a product alone until a command asks for it, and then updates it from the log" {
   let q = product_queries();
@@ -1683,10 +1771,30 @@ test "an edit leaves a product alone until a command asks for it, and then updat
   assert_eq(fetched_in(q, later.world, b"hash", b"a").ran, [])
 }
 
+fn doc_of(input: Bytes) -> Bytes / {memo.read} = b"doc ".concat(memo.fetch(b"length", input))
+
+fn two_kinds() -> Map<Bytes, Query<| {}>> =
+  product_queries().insert(b"doc", {
+    ..query(b"doc", b"d1", doc_of),
+    product: Some({ kind: b"doc", after: [] }),
+  })
+
+test "each kind of product catches up by itself, so asking for one leaves the other behind" {
+  let q = two_kinds();
+  let hashed = fetched_in(q, four(), b"hash", b"a");
+  let both = fetched_in(q, hashed.world, b"doc", b"a");
+  let moved = fetched_in(q, edited(both.world, b"a", b"forty"), b"hash", b"a");
+  assert_eq(moved.ran, [b"length", b"hash"]);
+  assert_eq(fetched_in(q, moved.world, b"doc", b"a").ran, [b"doc"])
+}
+
 test "a product whose code changed runs when a command asks for it" {
   let labelled = fetched_in(product_queries(), four(), b"label", b"a");
   let first = fetched_in(product_queries(), labelled.world, b"hash", b"a");
-  let q = lengths(b"h1").insert(b"hash", { ..query(b"hash", b"p2", cascading), product: true });
+  let q = lengths(b"h1").insert(b"hash", {
+    ..query(b"hash", b"p2", cascading),
+    product: hash_kind(),
+  });
   assert_eq(fetched_in(q, first.world, b"length", b"a").ran, []);
   assert_eq(fetched_in(q, first.world, b"hash", b"a").ran, [b"hash"])
 }
@@ -1754,10 +1862,11 @@ test "a fact in a trusted pack is used as it is, and a project records what it u
     read,
     b"files",
     |_: Bytes, _: Bytes| None,
-    || {
-      let a = query_output(q, start_run(q), b"label", b"a");
-      { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) }
-    },
+    ||
+      in_session(q, |run: Run| {
+        let a = query_output(q, run, b"label", b"a");
+        { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
+      }),
   );
   assert_eq(done.value, { output: b"long 4", ran: [b"label"] });
   assert_eq(done.store.inputs.values().map(|i: StoredInput| i.kind), [b"sealed"])
@@ -1774,7 +1883,7 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
   let newer = pack_of(world_of([{ at: b"a", text: b"forty" }]), b"new");
   let run_with = |store: MemoryStore, read: (String, Int, Int) -> Option<Bytes> / {abort.raise}, files: Bytes|
     with_memory_store(store, read, files, |_: Bytes, _: Bytes| None, ||
-      query_output(q, start_run(q), b"label", b"a").output);
+      in_session_of(q, b"label", b"a"));
   let first = run_with(empty_memory_store(), older, b"old");
   assert_eq(first.value, b"long 4");
   assert_eq(run_with(first.store, newer, b"new").value, b"long 5")
