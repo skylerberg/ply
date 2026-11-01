@@ -232,6 +232,8 @@ store_dirs() {
 
 # shellcheck disable=SC2100
 stores=ply-c-cache/bodies
+# shellcheck disable=SC2100
+facts=ply-c-cache/facts
 
 kept_answers() {
   local dir=$1 store
@@ -346,7 +348,9 @@ case "${1:-}" in
       [ -d "$dir/.ply-cache" ] && kept+=("${dir#"$root"/}/.ply-cache")
     done
     [ "${#kept[@]}" -gt 0 ] || { echo "this job has no store"; exit 0; }
-    tar -cf - -C "$root" "${kept[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
+    results=()
+    [ -d "$caches/$facts" ] && results=(-C "$caches" "$facts")
+    tar -cf - -C "$root" "${kept[@]}" "${results[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
     echo "packed ${#kept[@]} stores, $(du -sh "$file" | cut -f1): ${kept[*]}"
     ;;
   unpack)
@@ -364,6 +368,11 @@ case "${1:-}" in
         mv "$store" "$there" || exit 1
         laid=$((laid + 1))
       done < <(find "$dir/unpacked" -type d -name .ply-cache -prune)
+      if [ -d "$dir/unpacked/$facts" ]; then
+        rm -rf "${caches:?}/$facts"
+        mkdir -p "$(dirname "$caches/$facts")"
+        mv "$dir/unpacked/$facts" "$caches/$facts" || exit 1
+      fi
       echo "$name came back from run $run: $laid stores"
       echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     else
