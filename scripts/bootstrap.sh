@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/bootstrap.sh [--release]: this checkout's `ply`, at `target/debug/ply` or with `--release`
-# at `target/release/ply`. Cargo builds the runtime's library, and `ply bootstrap` links the rest,
+# at `target/release/ply`. Cargo builds the runtime's library, and `bootstrap-with.sh` links the rest,
 # run by the `ply` already there or, where there is none, by the last release (`stage0.sh`), which
 # drives the first bootstrap only: the script then runs once more, so the toolchain it made —
 # which checks far faster than the release — drives, as CI's two bootstraps have it. A stage0 too
@@ -37,10 +37,12 @@ if [ ! -x "$ply" ]; then
   fi
 fi
 # The cargo package `ply.work` names the runtime.
-runtime=$("$ply" work "$root" | awk '$1 == "runtime" { print $2 }')
+work=$("$ply" work "$root")
+runtime=$(awk '$1 == "runtime" { print $2 }' <<< "$work")
+library="$root/target/$dir/$(awk '$1 == "library" { print $2 }' <<< "$work")"
 cargo build --locked --quiet --manifest-path "$root/Cargo.toml" -p "$runtime" ${cargo[@]+"${cargo[@]}"}
-"$ply" bootstrap "$root" --profile "$profile" --out "$out" >&2
+"$root/scripts/bootstrap-with.sh" "$ply" "$profile" "$library" "$out" >&2
 if [ "$driving" = stage0 ]; then
-  "$out" bootstrap "$root" --profile "$profile" --out "$out" >&2
+  "$root/scripts/bootstrap-with.sh" "$out" "$profile" "$library" "$out" >&2
 fi
 echo "$out"

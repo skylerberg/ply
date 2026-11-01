@@ -3,7 +3,9 @@
 //! with the command line, its pack's shipped modules and its environment granted.
 
 use ply_compiled::c::descriptor::Descriptor;
+use ply_compiled::entry::{self, Opened};
 use std::ffi::{c_char, c_int};
+use std::io::Write;
 
 /// The exit code of a run that panicked in the runtime, which no program asks for.
 const PANICKED: c_int = 101;
@@ -20,6 +22,55 @@ pub extern "C" fn ply_runtime_described() -> *const c_char {
                 .expect("a description holds no NUL")
         })
         .as_ptr()
+}
+
+/// Enters a compiled unit for a program that runs on another runtime, as a bootstrap does, and
+/// returns the exit code. The command line, `LIBRARY ROOT ARGUMENTS TIMEOUT_MS`, names the root of
+/// the unit in LIBRARY and a file holding the PLV1 list it reads. What the root returns goes to
+/// standard output; exit 1 says it returned nothing, and standard error says why.
+#[unsafe(no_mangle)]
+pub extern "C" fn ply_unit_entered() -> c_int {
+    std::panic::catch_unwind(unit_entered).unwrap_or(PANICKED)
+}
+
+fn unit_entered() -> c_int {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let [library, root, arguments, timeout_ms] = argv.as_slice() else {
+        eprintln!("ply: a unit is entered with LIBRARY ROOT ARGUMENTS TIMEOUT_MS");
+        return 2;
+    };
+    let arguments = match std::fs::read(arguments) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            eprintln!("ply: `{arguments}` cannot be read: {reason}");
+            return 2;
+        }
+    };
+    let opened = match Opened::open(std::path::Path::new(library)) {
+        Ok(opened) => opened,
+        Err(reason) => {
+            eprintln!("ply: `{library}` does not load: {reason}");
+            return 2;
+        }
+    };
+    let timeout_ms = timeout_ms.parse().unwrap_or(0);
+    match entry::run_to_result(&opened, root, arguments, timeout_ms) {
+        Ok(bytes) => {
+            // Entered from C, nothing flushes this at exit as Rust's own `main` would.
+            let mut out = std::io::stdout();
+            match out.write_all(&bytes).and_then(|()| out.flush()) {
+                Ok(()) => 0,
+                Err(reason) => {
+                    eprintln!("ply: what `{root}` returned could not be written: {reason}");
+                    2
+                }
+            }
+        }
+        Err(reason) => {
+            eprintln!("ply: `{root}` returned nothing: {reason}");
+            1
+        }
+    }
 }
 
 /// Runs the linked program, whose unit lays `unit` out, and returns its exit code. The command

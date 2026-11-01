@@ -1,15 +1,14 @@
 import compiler.cc
 import compiler.cc (compilers, memory, toolchain, Memory, LiveObjects, WrittenPart)
-import compiler.load (CheckedProgram, LoadedAnalysis, SourceFile, check_results, checked_program,
-                      entry_hash_of, every_root, read_packages)
+import compiler.load (CheckedProgram, SourceFile, check_results, checked_program, entry_hash_of,
+                      entry_roots, read_packages)
 import compiler.front.published (entry_header)
-import compiler.store.hash.forms (HashOutput, FunctionNamed, reach)
 import compiler.check.resolve.tables (Diagnostic, Label)
 import compiler.unit (Emission, LevelTally, shipped, shipped_runtime, results_store, emitted,
                       emitter_identity, unit_parts, cache_parts, program_key, programs_dir,
                       read_cached_file, write_cached_file)
 import compiler.store.records (Record, record_store, with_record_store)
-import compiler.emit.keys (RootKey, Named, test_key)
+import compiler.emit.keys (RootKey, Named)
 import std.bytes (u64_le)
 import std.fs (fs)
 import std.list
@@ -17,9 +16,6 @@ import std.process (process)
 import std.random (entropy)
 import std.time (time)
 import std.path (strip_root)
-
-fn usage() -> String =
-  "the builder takes ROOT ENTRY FRONT SOURCES MEMO KEPT PHASES: the program's package at the absolute path ROOT, the definition it enters, where its front end and the manifest of its C, which is cached in the toolchain's cache, are written, where what its modules returned is cached between builds (nothing cached: an empty MEMO), `kept` to cache the emitter's results in the toolchain's cache (else `fresh`), and `phases` to say what each step took (else `quiet`)"
 
 fn line_column(text: Bytes, at: Int) -> String / {abort.raise} = {
   let before = text.slice(0, if at > text.len() { text.len() } else { at });
@@ -57,6 +53,13 @@ fn ms(from: Int, to: Int) -> String = Int::to_string(to - from) ++ "ms"
 
 fn mb(bytes: Int) -> String = Int::to_string(bytes / 1000000) ++ "MB"
 
+pub fn timed(
+  phases: Bool,
+  step: String,
+  since: Int,
+) -> Unit / {process.err[proc], time.elapsed_ms} =
+  if phases { process.err[proc]("phases: " ++ step ++ " " ++ ms(since, time.elapsed_ms())) }
+
 fn memory_report(m: Memory) -> String = mb(m.live) ++ " live, " ++ mb(m.reserved) ++ " held"
 
 fn census_report(entry: String, live: List<LiveObjects>) -> List<String> =
@@ -76,17 +79,18 @@ pub fn level_report(entry: String, r: LevelTally) -> String =
     ++ " steps, "
     ++ ms(r.began, r.ended)
 
-type BuildOutput = { front: Bytes, sources: Bytes }
+pub type Built = { front: Bytes, sources: List<cc::Source> }
 
-fn encoded_output(made: BuildOutput) -> Bytes =
-  Bytes::concat_all([u64_le(made.front.len()), made.front, made.sources])
+fn encoded_output(made: Built) -> Bytes =
+  Bytes::concat_all([u64_le(made.front.len()), made.front, cc::manifest(made.sources)])
 
-fn decoded_output(bytes: Bytes) -> Option<BuildOutput> / {toolchain.read, abort.raise} =
+fn decoded_output(bytes: Bytes) -> Option<Built> / {toolchain.read, abort.raise} =
   match bytes.u64_at(0) {
     Some(n) -> if 8 + n > bytes.len() { None } else {
-      let made = { front: bytes.slice(8, 8 + n), sources: bytes.slice(8 + n, bytes.len()) };
-      match cc::parse_manifest(made.sources) {
-        Some(sources) -> if cc::sources_cached(sources) { Some(made) } else { None },
+      match cc::parse_manifest(bytes.slice(8 + n, bytes.len())) {
+        Some(sources) -> if cc::sources_cached(sources) {
+          Some({ front: bytes.slice(8, 8 + n), sources: sources })
+        } else { None },
         None -> None,
       }
     },
@@ -95,28 +99,13 @@ fn decoded_output(bytes: Bytes) -> Option<BuildOutput> / {toolchain.read, abort.
 
 pub effect set Builds = {shipped.read_pack, shipped.names, shipped.module, shipped.digests, shipped.report_view_used, shipped.definitions, shipped.stamps, shipped.runtime, shipped.run_root, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, memory.read, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
 
-fn write_output(
-  made: BuildOutput,
-  definitions_path: String,
-  sources: String,
-) -> Int / {fs.write[abs], process.err[proc], abort.raise} =
-  if fs.write_file[abs](strip_root(definitions_path), made.front)
-      && fs.write_file[abs](strip_root(sources), made.sources) { 0 } else {
-    process.err[proc](
-      "what was built could not be written to `" ++ definitions_path ++ "` and `" ++ sources ++ "`",
-    );
-    2
-  }
-
 pub fn build_program(
   root: String,
   entry: String,
-  definitions_path: String,
-  sources: String,
   memo: String,
   cache_results: Bool,
   phases: Bool,
-) -> Int / {Builds} = {
+) -> Option<Built> / {Builds} = {
   let started = time.elapsed_ms();
   let definitions = shipped.definitions();
   let cache = toolchain.cache();
@@ -124,7 +113,7 @@ pub fn build_program(
   match read_packages[abs](strip_root(root)) {
     Err(u) -> {
       report_diagnostics(u.diagnostics, u.files);
-      1
+      None
     },
     Ok(p) -> {
       let store = if memo == "" { "" } else { strip_root(memo) };
@@ -142,29 +131,28 @@ pub fn build_program(
       };
       match cached {
         Some(made) -> {
-          let wrote = write_output(made, definitions_path, sources);
           if phases {
             process.err[proc](
               "phases: " ++ entry ++ " responded " ++ ms(started, reading)
                 ++ ", and enters what a program already built does",
             )
           };
-          wrote
+          Some(made)
         },
         None -> match checked_program[abs](p, check_results[abs, abs](p, store), false) {
           Err(u) -> {
             report_diagnostics(u.diagnostics, u.files);
-            1
+            None
           },
           Ok(checked) -> match entry_header(checked.front.dump, Bytes::of_string(entry)) {
             None -> {
               process.err[proc]("the program defines no `" ++ entry ++ "` to enter");
-              1
+              None
             },
             Some(carried) -> {
               let f = checked.front;
               let checking = time.elapsed_ms();
-              let offered = build_roots(checked.front, checked.hashes, Bytes::of_string(entry));
+              let offered = entry_roots(checked.front, checked.hashes, [Bytes::of_string(entry)]);
               let places = if phases {
                 Some({
                   now: || time.elapsed_ms(),
@@ -213,12 +201,9 @@ pub fn build_program(
                 Ok(parts) -> match cache_parts(parts) {
                   Err(reason) -> report_failure(CompileFailed(reason), f.files),
                   Ok(part_sources) -> {
-                    let made = { front: carried, sources: cc::manifest(part_sources) };
-                    let wrote = write_output(made, definitions_path, sources);
+                    let made = { front: carried, sources: part_sources };
                     match key {
-                      Some(k) -> if wrote == 0 {
-                        write_cached_file[abs](programs, k, encoded_output(made))
-                      },
+                      Some(k) -> write_cached_file[abs](programs, k, encoded_output(made)),
                       None -> (),
                     };
                     if phases {
@@ -236,7 +221,7 @@ pub fn build_program(
                           ++ " parts taken back",
                       )
                     };
-                    wrote
+                    Some(made)
                   },
                 },
               }
@@ -248,26 +233,21 @@ pub fn build_program(
   }
 }
 
-pub fn build_roots(
-  definitions_path: LoadedAnalysis,
-  hashes: HashOutput,
-  entry: Bytes,
-) -> List<RootKey> / {abort.raise} =
-  reached_roots(
-    every_root(definitions_path),
-    reach(hashes, [FunctionNamed(entry)]).functions,
-    entry,
-  )
-
-fn reached_roots(every: List<RootKey>, reached: Map<Bytes, Bool>, entry: Bytes) -> List<RootKey> =
-  every.filter(|k: RootKey| match k { Named(n) -> reached.contains(n) || n == entry, _ -> false })
-
-test "a build offers what its entry reaches, never a test, law or clause" {
-  let every = [Named(b"m.main"), Named(b"m.helper"), Named(b"m.unused"), test_key(b"m", b"t")];
-  assert_eq(reached_roots(every, Map::new().insert(b"m.helper", true), b"m.main"), [
-    Named(b"m.main"),
-    Named(b"m.helper"),
-  ])
+test "a step's time prints when it finishes if phases are on, and not otherwise" {
+  let told = |phases: Bool|
+    handle {
+      timed(phases, "built `ply`", 10)
+    } with {
+      var lines: List<String> = [],
+      process.err[proc](line) -> {
+        lines = lines.push(line);
+        ()
+      },
+      time.elapsed_ms() -> 35,
+      return _done -> lines,
+    };
+  assert_eq(told(true), ["phases: built `ply` 25ms"]);
+  assert_eq(told(false), [])
 }
 
 type BuildFailure = | UnitRejected(List<Diagnostic>) | CompileFailed(String)
@@ -275,17 +255,13 @@ type BuildFailure = | UnitRejected(List<Diagnostic>) | CompileFailed(String)
 fn report_failure(
   s: BuildFailure,
   files: List<SourceFile>,
-) -> Int / {process.err[proc], abort.raise} =
+) -> Option<Built> / {process.err[proc], abort.raise} = {
   match s {
-    UnitRejected(diagnostics) -> {
-      report_diagnostics(diagnostics, files);
-      1
-    },
-    CompileFailed(reason) -> {
-      process.err[proc](reason);
-      2
-    },
-  }
+    UnitRejected(diagnostics) -> report_diagnostics(diagnostics, files),
+    CompileFailed(reason) -> process.err[proc](reason),
+  };
+  None
+}
 
 fn emit_unit<| e>(
   checked: CheckedProgram,
@@ -310,23 +286,3 @@ fn emit_unit<| e>(
     holds,
   )
 }
-
-pub fn main() -> Unit / {Builds, process.args[proc], process.exit[proc]} =
-  match process.args[proc]() {
-    [root, entry, definitions_path, sources, memo, cache_results, phases] ->
-      process.exit[proc](
-        build_program(
-          root,
-          entry,
-          definitions_path,
-          sources,
-          memo,
-          cache_results == "kept",
-          phases == "phases",
-        ),
-      ),
-    _ -> {
-      process.err[proc](usage());
-      process.exit[proc](2)
-    },
-  }

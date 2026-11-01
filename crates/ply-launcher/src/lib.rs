@@ -74,7 +74,7 @@ pub fn install_own_pack() -> Result<(), String> {
             Ok(())
         }
         None => Err(format!(
-            "`{}` carries no pack: a native program is linked with one, as `ply bootstrap` links `ply`",
+            "`{}` carries no pack: a native program is linked with one, as a bootstrap links `ply`",
             binary.display()
         )),
     }
