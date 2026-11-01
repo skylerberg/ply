@@ -46,6 +46,26 @@ pub unsafe extern "C" fn rt_hold_taken(ctx: *mut Ctx, h: crate::emitted::Handle)
     )
 }
 
+/// The entry's next scoped value's number.
+pub unsafe extern "C" fn rt_scoped_number(ctx: *mut Ctx) -> crate::native::I64 {
+    let c = unsafe { &mut *ctx };
+    c.scoped_made += 1;
+    crate::native::I64(c.scoped_made as i64)
+}
+
+/// Notes for a simulation that the running step read scoped value `id`, or let it go where `write`
+/// is not 0.
+pub unsafe extern "C" fn rt_scoped_touched(
+    ctx: *mut Ctx,
+    id: crate::native::I64,
+    write: crate::native::I64,
+) {
+    unsafe { &mut *ctx }.touched(crate::tasks::Touched::ScopedValue {
+        id: id.0 as u64,
+        write: write.0 != 0,
+    });
+}
+
 /// The object of scoped value `h`, a read of it (`mode`) noted for a simulation; none where it
 /// has let go, or is no scoped value, which fails the entry.
 fn live_scoped_object(

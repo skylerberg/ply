@@ -116,6 +116,8 @@ machine! {
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
+    "?scoped_number" => rt_scoped_number() -> I64;
+    "?scoped_touched" => rt_scoped_touched(I64, I64);
 }
 
 /// The natives over machine data: marshalling's and the rest of this table's, then strings' and
