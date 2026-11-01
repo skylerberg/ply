@@ -3,9 +3,9 @@ import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo
-import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, empty_memory_store,
-                            executed_count, executed_for, restored_for, in_session, in_session_of,
-                            products_behind, query_stats)
+import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, reading,
+                            empty_memory_store, executed_count, executed_for, restored_for,
+                            in_session, in_session_of, products_behind, query_stats)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -25,7 +25,8 @@ import compiler.front.diagnostics (parse_all, with_prelude_source)
 import compiler.syntax.expressions (prelude_module)
 import compiler.expand.embed (EmbedFile, embed_file)
 import compiler.check.resolve.tables (Source, Diagnostic, backticked)
-import compiler.check.infer.checker (TestInfo)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo)
+import compiler.front.checking.view
 import compiler.store.hash.forms (CachedNode, CachedHashes, hash_input_bin, cached_node_bin,
                                   joined_cached_hashes)
 import compiler.store.hash (body_key, checked_body)
@@ -136,6 +137,8 @@ type EditSession = {
   store: MemoryStore,
   checks: Map<Bytes, Bytes>,
   hashes: Map<Bytes, Bytes>,
+  checks_before: Map<Bytes, Bytes>,
+  hashes_before: Map<Bytes, Bytes>,
   references: Map<Bytes, Reference>,
   off: List<Bytes>,
 }
@@ -146,6 +149,8 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       store: empty_memory_store(),
       checks: Map::new(),
       hashes: Map::new(),
+      checks_before: Map::new(),
+      hashes_before: Map::new(),
       references: Map::new(),
       off: [],
     },
@@ -167,13 +172,18 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
             PublicationSummary(_) -> false,
           },
         });
-      let checked = pulled(warm.run, group_query(), s.checks, r.group_inputs);
-      let hashed = pulled(warm.run, group_hash_query(), s.hashes, r.hash_inputs);
+      let checked = pulled(warm.run, group_query(), s.checks, s.checks_before, r.group_inputs);
+      let hashed = pulled(warm.run, group_hash_query(), s.hashes, s.hashes_before, r.hash_inputs);
       let wrong_facts = facts_differing(warm.store, r.store, step.sources);
       {
         store: warm.store,
         checks: checked.made,
         hashes: hashed.made,
+        checks_before: match r.group_inputs { Some(m) -> m, None -> Map::new() },
+        hashes_before: match ((r.whole, r.hash_inputs)) {
+          (PublicationSummary(_), Some(m)) -> m,
+          _ -> Map::new(),
+        },
         references: s.references.insert(key, r),
         off: if !agrees {
           s.off.push(Bytes::concat_all([step.what, hash_differences(warm.fixing, r.fixing)]))
@@ -196,6 +206,7 @@ fn pulled(
   run: Run,
   query: Bytes,
   made: Map<Bytes, Bytes>,
+  before: Map<Bytes, Bytes>,
   now: Option<Map<Bytes, Bytes>>,
 ) -> { made: Map<Bytes, Bytes>, mismatches: Option<Bytes> } / {abort.raise} =
   match now {
@@ -215,7 +226,10 @@ fn pulled(
       );
       let groups = reads.keys();
       let moved = |g: Bytes| made.get(g) != reads.get(g);
-      let needless = sorted_bytes(groups.filter(|g: Bytes| ran.contains(g) && !moved(g)));
+      let needless = sorted_bytes(
+        groups.filter(|g: Bytes|
+          ran.contains(g) && before.contains(g) && before.get(g) == reads.get(g)),
+      );
       let stale = sorted_bytes(
         groups.filter(|g: Bytes|
           run.resolved.contains(memo::key_of(q, g)) && !ran.contains(g) && !back.contains(g)
@@ -348,8 +362,8 @@ fn inputs_over(
         product: None,
       });
       in_session(qs, |run: Run| {
-        let cycles = cycles_among(qs, run, w.own);
-        if cycles.rejected.len() > 0 { { run: cycles.run, value: None } } else {
+        let cycles = reading(qs, run, || cycles_among(w.own));
+        if cycles.value.len() > 0 { { run: cycles.run, value: None } } else {
           let probed = w.own.fold(
             { run: cycles.run, out: Map::new() },
             |accumulator: { run: Run, out: Map<Bytes, Bytes> }, m: Bytes| {
@@ -1481,18 +1495,15 @@ fn load_with_analysis(
       lookup_input(w, text_of, text_of, || names, reject_embed, nothing_derived, kind, at),
     || {
       let qs = fresh_registry();
-      in_session(qs, |run: Run| {
-        let all = query_load(qs, w.own, if tested { names } else { [] }, tested, run);
-        let fixed = hashed_all(qs, w.own, all.value.pulled, tested, all.run);
-        {
-          run: fixed.run,
-          value: {
-            results: all.value.results,
-            pulled: all.value.pulled,
-            fixing: joined_cached_hashes(fixed.value),
-          },
-        }
-      })
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let all = query_load(w.own, if tested { names } else { [] }, tested);
+          {
+            results: all.results,
+            pulled: all.pulled,
+            fixing: joined_cached_hashes(hashed_all(w.own, all.pulled, tested)),
+          }
+        }))
     },
   ).value;
   let loaded = assembled_load(
@@ -2192,7 +2203,7 @@ test "when only the query that assembles a module's result changes, it reruns bu
   let warm = queried_under(qs, cold.store, sources);
   assert(modules_ran(warm.run, module_query()).contains(b"app"));
   assert(modules_ran(warm.run, module_query()).contains(b"lib"));
-  assert_eq(groups_ran(warm.run, group_query()), []);
+  assert_eq(groups_ran(warm.run, group_query()).filter(|g: GroupKey| !g.shipped), []);
   assert_eq(warm.results, cold.results)
 }
 
@@ -2453,6 +2464,125 @@ test "a body edit with an unchanged interface runs the same queries at two progr
     summary_run(cold.store, module_chain(size, b"n * 4")).ran
   };
   assert_eq(edit_at(3), edit_at(9))
+}
+
+fn wide_module(size: Int, body: Bytes) -> List<Source> =
+  [
+    {
+      name: b"wide",
+      source_text: range(1, size).fold(
+        Bytes::concat_all([b"pub fn f0(n: Int) -> Int = ", body, b"\n"]),
+        |text: Bytes, i: Int|
+          Bytes::concat_all([
+            text,
+            b"\npub fn f",
+            Bytes::of_string(i.to_string()),
+            b"(n: Int) -> Int = n + 1\n",
+          ]),
+      ),
+    },
+  ]
+
+test "a body edit runs the same queries however many definitions its module has" {
+  let edit_at = |size: Int| {
+    let cold = summary_run(empty_memory_store(), wide_module(size, b"n * 3"));
+    summary_run(cold.store, wide_module(size, b"n * 4")).ran
+  };
+  assert_eq(edit_at(4), edit_at(40))
+}
+
+fn beside_a_comment(size: Int, comment: Bytes) -> List<Source> =
+  module_chain(size, b"n + 1").map(|source: Source|
+    if source.name != b"m0" { source } else {
+      {
+        ..source,
+        source_text: Bytes::concat_all([
+          source.source_text,
+          b"\n",
+          comment,
+          b"\npub fn apart(n: Int) -> Int = n - 1\n\ntest \"apart\" { assert_eq(apart(1), 0) }\n",
+        ]),
+      }
+    })
+
+test "a comment between definitions runs nothing beyond parsing that file, at any program size" {
+  let edit_at = |size: Int| {
+    let cold = summary_run(empty_memory_store(), beside_a_comment(size, b""));
+    summary_run(cold.store, beside_a_comment(size, b"// Below this line is apart.\n\n\n")).ran
+  };
+  assert_eq(edit_at(3), [b"header text 1", b"imports 1", b"owners 1"]);
+  assert_eq(edit_at(9), edit_at(3))
+}
+
+fn apart_position(
+  store: MemoryStore,
+  comment: Bytes,
+) -> { store: MemoryStore, at: Int } / {abort.raise} = {
+  let w = inputs_alone(beside_a_comment(2, comment));
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, ||
+          view::listed({ root: w.own.len(), own: w.own, pulled: view::summary(w.own).pulled }))),
+  );
+  {
+    store: done.store,
+    at: done.value.checked.definitions.fold(0, |found: Int, d: DefinitionInfo|
+      if d.name == b"m0.apart" { d.at.span.start } else { found }),
+  }
+}
+
+fn reported_by_view(
+  sources: List<Source>,
+) -> { rejected: List<Bytes>, warned: List<Bytes> } / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  over_decoding(
+    empty_memory_store(),
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let read = view::summary(w.own);
+          {
+            rejected: view::rejections(w.own, read).map(|d: Diagnostic| d.code),
+            warned: view::warnings(w.own, read).map(|d: Diagnostic| d.message),
+          }
+        })),
+  ).value
+}
+
+test "the view reports errors in the module that has them, and warnings as a load reports them" {
+  let broken = [
+    { name: b"lib", source_text: b"pub fn f() -> Int = missing()\n" },
+    { name: b"app", source_text: b"import lib\npub fn g() -> Int = lib::f()\n" },
+  ];
+  assert_eq(reported_by_view(broken).rejected, [b"E0101"]);
+  let ringed = [
+    { name: b"a", source_text: b"import b\npub fn f() -> Int = b::g()\n" },
+    { name: b"b", source_text: b"import a\npub fn g() -> Int = a::f()\n" },
+  ];
+  assert_eq(reported_by_view(ringed).rejected, [b"E0109"]);
+  let spare = [{ name: b"m", source_text: b"pub fn main() -> Int = 1\n\nfn spare() -> Int = 2\n" }];
+  let warned = reported_by_view(spare).warned;
+  assert(warned.len() > 0);
+  assert_eq(
+    warned,
+    check_sources(empty_memory_store(), spare, []).warnings.map(|d: Diagnostic| d.message),
+  )
+}
+
+test "a listing read after a comment shows the positions the comment moved" {
+  let before = apart_position(empty_memory_store(), b"");
+  let after = apart_position(before.store, b"// A comment.\n");
+  assert_eq(after.at, before.at + b"// A comment.\n".len())
 }
 
 test "a command with no changes runs no query" {

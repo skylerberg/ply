@@ -1730,32 +1730,22 @@ snapshots=snapshots` (§14.1).
 
 A test must be deterministic. After the test's own handlers have handled effects, the test must not
 have a `nondet` effect left. If it does, the error is an error (`E0412`). To fix it, handle that
-effect, or write `test/nondet "label" { .. }`. A `test/nondet` is cached like any test. However, the
-values it reads from the clock or the network are not part of the cache key, so a change in those
-values does not make the test run again (§10.3).
+effect, or write `test/nondet "label" { .. }`. A `test/nondet` runs every time, because its effects
+can write (§10.3).
 
 A test is not a process, so it has no standard streams: a test that prints is an error (`E0424`)
 unless it handles the console itself. A test may start the programs `--exec` grants (§14.1).
 
 ### 10.3 Which tests run
 
-`ply test` runs a test only when no passing result is recorded for it. A passing result is recorded
-under two keys. The first key is the test's hash, which covers everything the test depends on but
+`ply test` runs a `test/nondet` every time. It runs any other test only when no passing result is
+recorded for it. A passing result is recorded under two keys. The first key is the test's hash, which covers everything the test depends on but
 not names, comments or formatting. The second key is the compiled code the test ran. If an edit or a
 new `ply` compiles the test to the same code, the hash changes but the code does not, so the
 recorded pass still applies and `ply test` does not run the test.
 
-A pass also records what the test read from outside the program, and stays valid only while that
-is unchanged:
-
-- each file and directory it read under a file system root;
-- each standard library function, type and effect it used;
-- everything read by each `ply` process it started;
-- for a test that used the host (the real machine, through the real handlers, rather than handlers
-  the test supplies), the permissions the test ran with (§14.1).
-
-The following do not count as inputs: values supplied by the test's own handlers, files the test
-wrote and then read, the clock, and the network.
+A pass also records each standard library function, type and effect the test used, and stays valid
+only while those are unchanged.
 
 | flag | meaning |
 | --- | --- |

@@ -5,15 +5,19 @@ import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import program (Program, Tables, load_program, definitions_in_order, tables_of, location_of,
-                resolve_definition, unknown_definition, own_tests, own_laws, transitive_callers,
-                direct_callers, program_view)
+import program (Tables, definitions_in_order, tables_of, location_of, places_of, resolve_definition,
+                session, unknown_definition, own_tests, own_laws, transitive_callers,
+                direct_callers)
+import diagnostic (SourceText)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules)
+import compiler.front.checking.groups (ProgramSummary)
 import paths
 import std.bin
 import std.string
 import report (CommandOutput, schema_version, ok_code, indent, count_of, rejected, reported)
 import std.term (Style, bold)
-import compiler.front.facts (CheckedProgram)
+import compiler.front.facts (ProgramListing)
 import compiler.store.hash (no_hashes, no_refs)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo)
 import std.fs (fs)
@@ -28,21 +32,17 @@ type Index = {
   laws: Map<Bytes, LawInfo>,
 }
 
-fn indexed(program: Program, analysis: CheckedProgram) -> Index =
+fn indexed(analysis: ProgramListing) -> Index =
   {
     definitions: analysis.checked.definitions.fold(
       Map::new(),
       |accumulator: Map<Bytes, DefinitionInfo>, definition_info: DefinitionInfo|
         accumulator.insert(definition_info.name, definition_info),
     ),
-    tests: own_tests(program, analysis).fold(
-      Map::new(),
-      |accumulator: Map<Bytes, TestInfo>, x: TestInfo| accumulator.insert(x.key, x),
-    ),
-    laws: own_laws(program, analysis).fold(
-      Map::new(),
-      |accumulator: Map<Bytes, LawInfo>, x: LawInfo| accumulator.insert(x.key, x),
-    ),
+    tests: own_tests(analysis).fold(Map::new(), |accumulator: Map<Bytes, TestInfo>, x: TestInfo|
+      accumulator.insert(x.key, x)),
+    laws: own_laws(analysis).fold(Map::new(), |accumulator: Map<Bytes, LawInfo>, x: LawInfo|
+      accumulator.insert(x.key, x)),
   }
 
 fn sorted_into(ix: Index, keys: List<Bytes>) -> Group =
@@ -104,41 +104,44 @@ fn text_lines(style: Style, stored: StoredCallers) -> List<String> / {abort.rais
     ]),
   )
 
-fn definition_json(program: Program, definition_info: DefinitionInfo) -> Json / {abort.raise} =
+fn definition_json(
+  places: List<SourceText>,
+  definition_info: DefinitionInfo,
+) -> Json / {abort.raise} =
   object([
     { key: "name", value: Str(String::of_bytes_lossy(definition_info.name)) },
-    { key: "location", value: string_or_null(location_of(program, definition_info.at)) },
+    { key: "location", value: string_or_null(location_of(places, definition_info.at)) },
   ])
 
-fn test_json(program: Program, test_info: TestInfo) -> Json / {abort.raise} =
+fn test_json(places: List<SourceText>, test_info: TestInfo) -> Json / {abort.raise} =
   object([
     { key: "index", value: Number(Decimal::of_int(test_info.index)) },
     { key: "key", value: Str(String::of_bytes_lossy(test_info.key)) },
     { key: "name", value: Str(String::of_bytes_lossy(test_info.name)) },
     { key: "module", value: Str(String::of_bytes_lossy(test_info.module)) },
-    { key: "location", value: string_or_null(location_of(program, test_info.at)) },
+    { key: "location", value: string_or_null(location_of(places, test_info.at)) },
   ])
 
-fn law_json(program: Program, law_info: LawInfo) -> Json / {abort.raise} =
+fn law_json(places: List<SourceText>, law_info: LawInfo) -> Json / {abort.raise} =
   object([
     { key: "index", value: Number(Decimal::of_int(law_info.index)) },
     { key: "key", value: Str(String::of_bytes_lossy(law_info.key)) },
     { key: "name", value: Str(String::of_bytes_lossy(law_info.name)) },
     { key: "module", value: Str(String::of_bytes_lossy(law_info.module)) },
-    { key: "location", value: string_or_null(location_of(program, law_info.at)) },
+    { key: "location", value: string_or_null(location_of(places, law_info.at)) },
   ])
 
-fn group_json(program: Program, group: Group) -> Json / {abort.raise} =
+fn group_json(places: List<SourceText>, group: Group) -> Json / {abort.raise} =
   object([
     {
       key: "definitions",
       value: Array(
         group.definitions.map(|definition_info: DefinitionInfo|
-          definition_json(program, definition_info)),
+          definition_json(places, definition_info)),
       ),
     },
-    { key: "tests", value: Array(group.tests.map(|x: TestInfo| test_json(program, x))) },
-    { key: "laws", value: Array(group.laws.map(|x: LawInfo| law_json(program, x))) },
+    { key: "tests", value: Array(group.tests.map(|x: TestInfo| test_json(places, x))) },
+    { key: "laws", value: Array(group.laws.map(|x: LawInfo| law_json(places, x))) },
   ])
 
 fn stored_callers(
@@ -150,7 +153,7 @@ fn stored_callers(
 
 fn callers_output(
   style: Style,
-  program: Program,
+  places: List<SourceText>,
   definition_info: DefinitionInfo,
   direct: Group,
   transitive: Group,
@@ -166,11 +169,11 @@ fn callers_output(
         value: object([
           { key: "name", value: Str(String::of_bytes_lossy(definition_info.name)) },
           { key: "module", value: Str(String::of_bytes_lossy(definition_info.module)) },
-          { key: "location", value: string_or_null(location_of(program, definition_info.at)) },
+          { key: "location", value: string_or_null(location_of(places, definition_info.at)) },
         ]),
       },
-      { key: "direct", value: group_json(program, direct) },
-      { key: "transitive", value: group_json(program, transitive) },
+      { key: "direct", value: group_json(places, direct) },
+      { key: "transitive", value: group_json(places, transitive) },
       { key: "diagnostics", value: Array([]) },
     ]),
     lines: text_lines(style, stored_callers(definition_info, direct, transitive)),
@@ -179,12 +182,11 @@ fn callers_output(
   }
 
 fn found_callers(
-  program: Program,
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   definition_info: DefinitionInfo,
 ) -> { direct: Group, transitive: Group } / {abort.raise} = {
-  let tables: Tables = tables_of(analysis.frame.hashes);
-  let ix: Index = indexed(program, analysis);
+  let tables: Tables = tables_of(analysis.hashes);
+  let ix: Index = indexed(analysis);
   {
     direct: sorted_into(ix, direct_callers(tables, definition_info.name)),
     transitive: sorted_into(ix, transitive_callers(tables, definition_info.name)),
@@ -193,18 +195,21 @@ fn found_callers(
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let s = style_of(flags);
-  match program_view(loaded) {
-    None -> rejected(s, "callers", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> match resolve_definition(definitions_in_order(w), flags.query) {
-      Err(names) ->
-        reported(s, "callers", [unknown_definition(flags.query, names)], loaded.source_texts),
-      Ok(d) -> {
-        let found = found_callers(loaded, w, d);
-        callers_output(s, loaded, d, found.direct, found.transitive)
-      },
+  match session(flags.paths, flags.verify_dependencies, false, |m: Modules, _: ProgramSummary|
+      view::listed(m)) {
+    Err(r) -> rejected(s, "callers", r.diagnostics, r.places),
+    Ok(opened) -> {
+      let w = opened.value;
+      let places = places_of(opened);
+      match resolve_definition(definitions_in_order(w), flags.query) {
+        Err(names) -> reported(s, "callers", [unknown_definition(flags.query, names)], places),
+        Ok(d) -> {
+          let found = found_callers(w, d);
+          callers_output(s, places, d, found.direct, found.transitive)
+        },
+      }
     },
   }
 }

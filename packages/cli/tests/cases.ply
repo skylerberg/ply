@@ -10,15 +10,16 @@ import machine
 import compiler.front.published (no_rows)
 import compiler.front.emitter_input (Analysed, Rejected, TestRunScope, checked_program_of,
                                      test_root_at)
-import compiler.front.facts (CheckedProgram, test_label_spans)
+import compiler.front.facts (ProgramListing, listing_of, test_label_spans)
 import compiler.front (analyse_pulling_std_with)
 import compiler.unit (codes, shipped)
-import compiler.store.hash.forms (ItemKeyed, Subject, reachable_by_tests, reachable_functions)
+import compiler.store.hash.forms (ItemKeyed, ModuleHashes, Subject, reachable_by_tests,
+                                  reachable_functions)
 import compiler.check.infer.checker (TestInfo, Location)
 import compiler.emit.keys (RootKey, Named, TestCases, Clause, RootName, root_name)
 import compiler.check.resolve.tables (Diagnostic, Label, Source, qualify)
 import diagnostic (RuntimeDiagnostic, diagnostic_of, shown)
-import program (TimedLoad, sources_of)
+import program (sources_of)
 import results
 import report (CommandOutput, printed)
 import compiler.syntax.items (is_shipped)
@@ -48,29 +49,14 @@ import tests.concluded (entry_of, JobResult, job_of, run_class, hashes_of, concl
 
 pub type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
-fn root_modules(analysis: CheckedProgram) -> Map<String, Bool> =
-  range(0, analysis.frame.outlines.len()).fold(
-    Map::new(),
-    |accumulator: Map<String, Bool>, i: Int|
-      match ((analysis.frame.outlines.at(i), analysis.frame.module_packages.at(i))) {
-        (Some(o), Some(pkg)) -> if pkg == 0 {
-          accumulator.insert(String::of_bytes_lossy(o.name), true)
-        } else { accumulator },
-        _ -> accumulator,
-      },
-  )
-
 pub fn scope_of(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   filters: List<String>,
   shard: Option<surface::Shard>,
   named: Option<List<String>>,
 ) -> Scope / {abort.raise} = {
-  let packaged = analysis.frame.packages.len() > 0;
-  let root = root_modules(analysis);
-  let loaded = module_names(analysis.frame.order);
-  let in_scope = |t: TestInfo|
-    if packaged { root.contains(String::of_bytes_lossy(t.module)) } else { !is_shipped(t.module) };
+  let loaded = module_names(analysis.order);
+  let in_scope = |t: TestInfo| t.at.module < analysis.root;
   let matches = |t: TestInfo|
     matches_filters(
         filters,
@@ -105,11 +91,11 @@ fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
   }
 
 pub fn over_cases(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   filters: List<String>,
   named: Option<List<String>>,
 ) -> List<Int> / {abort.raise} = {
-  let loaded = module_names(analysis.frame.order);
+  let loaded = module_names(analysis.order);
   scope_of(analysis, [], None, named).visible.filter(|i: Int|
     match test_at(analysis, i) {
       Some(t) -> t.cases && could_match_filters(filters, loaded, String::of_bytes_lossy(t.module)),
@@ -155,13 +141,13 @@ pub fn list_cases(
   }
 
 pub fn scope_for_listing(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   listing: List<Int>,
 ) -> TestRunScope / {abort.raise} = {
   let keys = listing.fold([], |accumulator: List<Bytes>, i: Int|
     match test_at(analysis, i) { Some(t) -> accumulator.push(t.key), None -> accumulator });
   {
-    owners: reachable_by_tests(analysis.frame.hashes, keys),
+    owners: reachable_by_tests(analysis.hashes, keys),
     tests: Map::of_entries(keys.map(|k: Bytes| { key: k, value: true })),
   }
 }
@@ -176,9 +162,9 @@ pub fn run_within(over: ExpandedTests, running: List<Int>) -> TestRunScope / {ab
       }),
   }
 
-fn reachable_from(analysis: CheckedProgram, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
+fn reachable_from(analysis: ProgramListing, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
   reachable_functions(
-    analysis.frame.hashes,
+    analysis.hashes,
     tests.fold([], |accumulator: List<Subject>, i: Int|
       match test_at(analysis, i) {
         Some(t) -> accumulator.push(ItemKeyed(t.key)),
@@ -222,8 +208,8 @@ pub fn run_unit(
   }
 
 pub type ExpandedTests = {
-  analysis: CheckedProgram,
-  run_analysis: CheckedProgram,
+  analysis: ProgramListing,
+  run_analysis: ProgramListing,
   entries: List<Entry>,
 }
 
@@ -390,11 +376,11 @@ fn places(at: List<Int>) -> String =
   }
 
 pub fn expand_cases(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   listings: Map<Int, Result<List<ListedCase>, ListingFailure>>,
 ) -> ExpandedTests / {abort.raise} = {
   let tests = analysis.checked.tests;
-  let cases = distinct_labels(tests, test_label_spans(analysis.frame.outlines), listings);
+  let cases = distinct_labels(tests, test_label_spans(analysis.outlines), listings);
   let plain = range(0, tests.len()).map(|i: Int|
     entry_of(i, match tests.at(i) { Some(t) -> t.key, None -> b"" }));
   if cases.len() == 0 { { analysis: analysis, run_analysis: analysis, entries: plain } } else {
@@ -403,13 +389,13 @@ pub fn expand_cases(
         tests: [],
         hashes: Map::new(),
         entries: [],
-        starts: analysis.frame.hashes.refs.items,
-        runs: analysis.frame.hashes.refs.items,
+        starts: analysis.hashes.refs.items,
+        runs: analysis.hashes.refs.items,
       },
       |accumulator: ExpansionState, i: Int|
         match ((tests.at(i), plain.at(i))) {
           (Some(t), Some(whole)) -> {
-            let hash = analysis.frame.hashes.tests.get(t.key);
+            let hash = analysis.hashes.tests.get(t.key);
             match cases.get(i) {
               Some(Ok(listing)) ->
                 range(0, listing.len()).fold(accumulator, |a: ExpansionState, k: Int|
@@ -432,12 +418,8 @@ pub fn expand_cases(
                           ..whole,
                           case: Some({ at: k, identity: c.identity }),
                         }),
-                        starts: add_starts(
-                          a.starts,
-                          key,
-                          analysis.frame.hashes.refs.items.get(t.key),
-                        ),
-                        runs: add_starts(a.runs, key, analysis.frame.hashes.refs.cases.get(t.key)),
+                        starts: add_starts(a.starts, key, analysis.hashes.refs.items.get(t.key)),
+                        runs: add_starts(a.runs, key, analysis.hashes.refs.cases.get(t.key)),
                       }
                     },
                   }),
@@ -461,13 +443,11 @@ pub fn expand_cases(
     );
     let with_starts = |starts: Map<Bytes, List<Int>>|
       {
-        frame: {
-          ..analysis.frame,
-          hashes: {
-            ..analysis.frame.hashes,
-            tests: walked.hashes,
-            refs: { ..analysis.frame.hashes.refs, items: starts },
-          },
+        ..analysis,
+        hashes: {
+          ..analysis.hashes,
+          tests: walked.hashes,
+          refs: { ..analysis.hashes.refs, items: starts },
         },
         checked: { ..analysis.checked, tests: walked.tests },
       };
@@ -505,9 +485,7 @@ pub fn passed_by_code(
   decisions: List<Decision>,
   keyed: Map<Int, Bytes>,
   loaded: Map<Bytes, Bytes>,
-  options: Options,
-  supplied: machine::RunConfiguration,
-) -> Map<Int, Bytes> / {result_cache.code_passes, entering::machine.changed_read, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+) -> Map<Int, Bytes> / {result_cache.code_passes, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let queries = code_keys_to_query(decisions, keyed);
   let results = if queries.len() == 0 { [] }
   else { result_cache.code_passes(queries.map(|a: { index: Int, key: Bytes }| a.key)) };
@@ -515,7 +493,7 @@ pub fn passed_by_code(
     views::read_shipped_text(loaded, m));
   range(0, queries.len()).fold(Map::new(), |accumulator: Map<Int, Bytes>, i: Int|
     match results.at(i) {
-      Some(Some(trace)) -> if pass_status(now, Some(trace), options, supplied) == Some(Passing) {
+      Some(Some(trace)) -> if pass_status(now, Some(trace)) == Some(Passing) {
         accumulator.insert(queries.at_or(i, { index: 0 - 1, key: b"" }).index, trace)
       } else { accumulator },
       _ -> accumulator,
@@ -538,9 +516,9 @@ pub fn concluded_run(
   style: Style,
   options: Options,
   program: Program,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
-  run_analysis: CheckedProgram,
+  modules: List<ModuleHashes>,
+  analysis: ProgramListing,
+  run_analysis: ProgramListing,
   scope: Scope,
   decisions: List<Decision>,
   decided: RunDecision,
@@ -577,12 +555,17 @@ pub fn concluded_run(
     ran
   });
   let elapsed = time.elapsed_us() - started;
-  let h = hashes_of(run_analysis, results::snapshot_digest_of(timed.program.modules));
+  let h = hashes_of(run_analysis, results::snapshot_digest_of(modules));
   let running = set_of(decided.runs);
   let by_test = done.fold(Map::new(), |accumulator: Map<Int, JobResult>, d: JobResult|
     accumulator.insert(d.test, d));
+  let concluding = conclude_tests(analysis, program);
+  let failed = concluding.filter(|t: conclude::Test|
+    match by_test.get(t.index) { Some(d) -> d.failure != None, None -> false }).map(
+    |t: conclude::Test| t.key,
+  );
   let c: Conclusion<RuntimeDiagnostic> = conclude::conclude_run(
-    conclude_tests(analysis, program),
+    concluding,
     h,
     {
       groups: decided.classes.map(|group: Group| group.tests),
@@ -597,16 +580,11 @@ pub fn concluded_run(
         accumulator.insert(d.case.index, d.reason)),
       out_of_scope: scope.out,
     },
-    if flags.no_cache { Map::new() } else { seen_of(h) },
+    if flags.no_cache { Map::new() } else { seen_of(h, failed) },
     done.map(conclusion_of),
   );
   let cache_warnings = if flags.no_cache { [] } else {
-    store_history(
-      analysis,
-      sources_of(timed.program, analysis.frame),
-      timed.program.modules,
-      c.store_update,
-    );
+    store_history(analysis, sources_of(program.places, analysis.outlines), modules, c.store_update);
     store_warnings(
       result_cache.store_filing({
         ..c.store_update,
@@ -620,9 +598,9 @@ pub fn concluded_run(
     ..run_report_of(options, program, analysis, h, decided, hosted, c, by_test, elapsed, configured.concat(cache_warnings)),
     handshakes: tester::unbind(program.unit.testing),
   };
-  let found = diagnosed_all(flags.no_cache, timed, run_analysis, c, r.failures);
+  let found = diagnosed_all(flags.no_cache, program.places, run_analysis, c, r.failures);
   let lazily = if flags.no_cache { [] } else { result_cache.open_warnings() };
-  let concluding = time.elapsed_us() - started - elapsed;
+  let conclude_time = time.elapsed_us() - started - elapsed;
   test_output(
     style,
     flags,
@@ -630,7 +608,7 @@ pub fn concluded_run(
     {
       ..r,
       warnings: r.warnings.concat(lazily),
-      spent: { ..spent, tests_us: elapsed, conclude_us: concluding },
+      spent: { ..spent, tests_us: elapsed, conclude_us: conclude_time },
     },
     found.faults,
     found.diffs,
@@ -705,7 +683,7 @@ test "a run selects the tests of the module it was started on, even a library's,
   };
   let keys = |user: List<Source>, shipped: List<Source>| {
     let w = match analyse_pulling_std_with(user, shipped, no_rows(), cut_unused: false).out {
-      Analysed(w) -> checked_program_of(w),
+      Analysed(w) -> listing_of(checked_program_of(w)),
       Rejected(_) -> panic("the fixture program was rejected by the checker"),
     };
     scope_of(w, [], None, None).visible.map(|i: Int|

@@ -4,7 +4,7 @@ import std.fs (fs, mem_empty)
 import std.hash (blake3)
 import compiler.prelude_source
 import machine
-import compiler.front.facts (CheckedProgram)
+import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.rows (Outline)
 import compiler.unit (shipped)
 import compiler.store.hash.forms (ModuleHashes, ItemKeyed, by_name, reach)
@@ -18,9 +18,8 @@ import store.tables
 import store.fake (run_in_memory)
 import compiler.check.resolve.tables (Diagnostic, Label, Source)
 import compiler.check.types
-import diagnostic (RuntimeDiagnostic, diagnostic_of, with_notes)
+import diagnostic (RuntimeDiagnostic, SourceText, diagnostic_of, with_notes)
 import coverage (coverage)
-import program (TimedLoad)
 import std.json (Bool)
 import tester
 import tester (result_cache, ExecutionResult, InterleavingFailure, BindingReport, LastPass, Options,
@@ -35,7 +34,7 @@ import testing.conclude
 import testing.delta (Delta)
 import testing.diagnose (changes_of)
 import testing.select
-import testing.select (StoredResult, Moved, Row, Search, Passing, keyed_per_root, digest_of,
+import testing.select (StoredResult, Moved, Pass, Row, Search, Passing, keyed_per_root, digest_of,
                        pass_keys_by_test, key_of, pending_roots, seed_keys)
 import std.bytes
 import sim.plan
@@ -52,10 +51,10 @@ import tests.report (Entry, RunDecision, cached_count, Program, Cost, SearchSumm
                      finished_line, display_name_at, Failed, Fault, RunReport, no_time_spent,
                      case_of, test_at, canonical)
 
-pub fn test_hash_at(analysis: CheckedProgram, i: Int) -> Option<Bytes> =
-  match test_at(analysis, i) { Some(t) -> analysis.frame.hashes.tests.get(t.key), None -> None }
+pub fn test_hash_at(analysis: ProgramListing, i: Int) -> Option<Bytes> =
+  match test_at(analysis, i) { Some(t) -> analysis.hashes.tests.get(t.key), None -> None }
 
-pub fn hash_at(analysis: CheckedProgram, i: Int) -> Option<String> / {abort.raise} =
+pub fn hash_at(analysis: ProgramListing, i: Int) -> Option<String> / {abort.raise} =
   match test_hash_at(analysis, i) { Some(h) -> Some(h.hex_of()), None -> None }
 
 pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
@@ -283,18 +282,18 @@ fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abor
     },
   }
 
-pub fn hashes_of(analysis: CheckedProgram, era: Bytes) -> Hashes =
+pub fn hashes_of(analysis: ProgramListing, era: Bytes) -> Hashes =
   {
-    definitions: by_name(analysis.frame.hashes.definitions),
-    declarations: by_name(analysis.frame.hashes.declarations),
+    definitions: by_name(analysis.hashes.definitions),
+    declarations: by_name(analysis.hashes.declarations),
     era: era,
     closure: |keys: List<Bytes>| {
-      let reachable = reach(analysis.frame.hashes, keys.map(|k: Bytes| ItemKeyed(k)));
+      let reachable = reach(analysis.hashes, keys.map(|k: Bytes| ItemKeyed(k)));
       { functions: reachable.functions.keys(), declarations: reachable.declarations.keys() }
     },
   }
 
-pub fn conclude_tests(analysis: CheckedProgram, program: Program) -> List<conclude::Test> =
+pub fn conclude_tests(analysis: ProgramListing, program: Program) -> List<conclude::Test> =
   range(0, analysis.checked.tests.len()).fold([], |accumulator: List<conclude::Test>, i: Int|
     match test_at(analysis, i) {
       Some(t) -> {
@@ -311,15 +310,20 @@ pub fn conclude_tests(analysis: CheckedProgram, program: Program) -> List<conclu
       None -> accumulator,
     })
 
-pub fn seen_of(h: Hashes) -> Map<Bytes, Bool> / {result_cache.known} = {
-  let hashes = h.definitions.values();
-  let results = result_cache.known(hashes);
-  range(0, hashes.len()).fold(Map::new(), |accumulator: Map<Bytes, Bool>, i: Int|
-    match ((hashes.at(i), results.at(i))) {
-      (Some(hash), Some(known)) -> accumulator.insert(hash, known),
-      _ -> accumulator,
-    })
-}
+pub fn seen_of(
+  h: Hashes,
+  failed: List<Bytes>,
+) -> Map<Bytes, Bool> / {result_cache.known, abort.raise} =
+  if failed.len() == 0 { Map::new() } else {
+    let hashes = (h.closure)(failed).functions.fold([], |found: List<Bytes>, name: Bytes|
+      match h.definitions.get(name) { Some(hash) -> found.push(hash), None -> found });
+    let results = result_cache.known(hashes);
+    range(0, hashes.len()).fold(Map::new(), |accumulator: Map<Bytes, Bool>, i: Int|
+      match ((hashes.at(i), results.at(i))) {
+        (Some(hash), Some(known)) -> accumulator.insert(hash, known),
+        _ -> accumulator,
+      })
+  }
 
 pub fn conclusion_of(done: JobResult) -> conclude::TestResult<RuntimeDiagnostic> =
   {
@@ -388,7 +392,7 @@ fn site_of(x: search::RaceSite) -> Site =
     at: if x.span.module == no_module() { None } else { Some(x.span) },
   }
 
-pub fn job_outcome(analysis: CheckedProgram, done: JobResult) -> Outcome / {abort.raise} =
+pub fn job_outcome(analysis: ProgramListing, done: JobResult) -> Outcome / {abort.raise} =
   {
     index: done.test,
     name: match test_at(analysis, done.test) {
@@ -405,7 +409,7 @@ pub fn job_outcome(analysis: CheckedProgram, done: JobResult) -> Outcome / {abor
   }
 
 fn outcome_of(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   done: Map<Int, JobResult>,
   outcome: conclude::Outcome<RuntimeDiagnostic>,
 ) -> Outcome / {abort.raise} = {
@@ -430,7 +434,7 @@ fn outcome_of(
 }
 
 fn failed_of(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   h: Hashes,
   done: Map<Int, JobResult>,
   failed: conclude::TestFailure<RuntimeDiagnostic>,
@@ -477,7 +481,7 @@ fn failed_of(
 }
 
 fn escapes_of(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   c: Conclusion<RuntimeDiagnostic>,
   done: Map<Int, JobResult>,
 ) -> List<Diagnostic> = {
@@ -548,7 +552,7 @@ fn notice_of(n: conclude::Notice) -> Diagnostic =
 pub fn run_report_of(
   options: Options,
   program: Program,
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   h: Hashes,
   decided: RunDecision,
   hosted: BindingReport,
@@ -601,22 +605,68 @@ pub fn run_report_of(
   }
 }
 
+type ModuleRollup = { key: Bytes, at: List<Int> }
+
+fn module_rollups(
+  rows: List<Row>,
+  keys: List<Option<Bytes>>,
+  search: Search,
+) -> List<ModuleRollup> / {abort.raise} =
+  List::group_by(
+    range(0, rows.len()).filter(|i: Int|
+      keys.at_or(i, None) != None && !rows.get(i).nondet && !keyed_per_root(rows.get(i), search)),
+    |i: Int| rows.get(i).module,
+  ).values(
+  ).map(|at: List<Int>|
+    {
+      key: blake3(
+        Bytes::concat_all(
+          at.map(|i: Int| keys.at_or(i, None).unwrap_or(b"")).push(b"a module's tests"),
+        ),
+      ),
+      at: at,
+    })
+
+pub type DecidedCases = { cases: List<select::Case>, rolled: List<Pass> }
+
+test "a module's rollup covers its plain tests, leaves out `test/nondet`, and moves with any identity" {
+  let row = |name: String, module: String, always: Bool|
+    { ..no_row(), name: name, module: module, hash: Some(b"h"), nondet: always };
+  let rows = [row("a", "m", false), row("b", "m", false), row("c", "n", true)];
+  let search = { mode: "", roots: [], budget: 0, steps: 0, path: [] };
+  let rollups_of = |keys: List<Option<Bytes>>| module_rollups(rows, keys, search);
+  let keys = [Some(b"one"), Some(b"two"), Some(b"three")];
+  assert_eq(rollups_of(keys).map(|m: ModuleRollup| m.at), [[0, 1]]);
+  assert(
+    rollups_of(keys).map(|m: ModuleRollup| m.key)
+      != rollups_of([Some(b"one"), Some(b"moved"), Some(b"three")]).map(|m: ModuleRollup| m.key),
+  )
+}
+
 pub fn cases_of(
   rows: List<Row>,
   search: Search,
   bypassed: Bool,
-  options: Options,
-  supplied: machine::RunConfiguration,
   loaded: Map<Bytes, Bytes>,
-) -> List<select::Case> / {result_cache.passes, entering::machine.changed_read, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+) -> DecidedCases / {result_cache.passes, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let ask = |keys: List<Bytes>|
     if bypassed { keys.map(|k: Bytes| None) } else { result_cache.passes(keys) };
   let digest = digest_of(search);
   let keys = rows.map(|r: Row| key_of(r, digest));
-  let recorded = ask(
-    keys.fold([], |accumulator: List<Bytes>, k: Option<Bytes>|
-      match k { Some(key) -> accumulator.push(key), None -> accumulator }),
-  );
+  let rollups = module_rollups(rows, keys, search);
+  let rollup_passes = ask(rollups.map(|m: ModuleRollup| m.key));
+  let whole = range(0, rollups.len()).fold(Map::new(), |found: Map<Int, Bool>, k: Int|
+    if rollup_passes.at_or(k, None) == None { found } else {
+      rollups.get(k).at.fold(found, |in_whole: Map<Int, Bool>, i: Int| in_whole.insert(i, true))
+    });
+  let keyed = range(0, rows.len()).filter(|i: Int| keys.at_or(i, None) != None);
+  let asked = keyed.filter(|i: Int| !whole.contains(i));
+  let answers = ask(asked.map(|i: Int| keys.at_or(i, None).unwrap_or(b"")));
+  let answered = range(0, asked.len()).fold(Map::new(), |found: Map<Int, Option<Bytes>>, k: Int|
+    found.insert(asked.get(k), answers.at_or(k, None)));
+  let trace_of = |i: Int|
+    if whole.contains(i) { Some(b"") } else { answered.get(i).unwrap_or(None) };
+  let recorded = keyed.map(trace_of);
   let rooted = rows.map(|r: Row|
     match r.hash {
       Some(h) -> if keyed_per_root(r, search) { Some(seed_keys(h, search.roots, [])) }
@@ -634,7 +684,7 @@ pub fn cases_of(
     ),
     |m: Bytes| views::read_shipped_text(loaded, m),
   );
-  let results = recorded.map(|trace: Option<Bytes>| pass_status(now, trace, options, supplied));
+  let results = recorded.map(|trace: Option<Bytes>| pass_status(now, trace));
   let stored_results = keys.fold(
     { at: 0, out: [] },
     |st: { at: Int, out: List<Option<StoredResult>> }, k: Option<Bytes>|
@@ -646,43 +696,35 @@ pub fn cases_of(
   let pending_seed_roots = seeded.map(|o: Option<List<Option<Bytes>>>|
     match o {
       Some(xs) ->
-        Some(
-          pending_roots(
-            search.roots,
-            xs.map(|trace: Option<Bytes>| pass_status(now, trace, options, supplied)),
-          ),
-        ),
+        Some(pending_roots(search.roots, xs.map(|trace: Option<Bytes>| pass_status(now, trace)))),
       None -> None,
     });
-  range(0, rows.len()).map(|i: Int|
-    select::case_of(
-      rows.at_or(i, no_row()),
-      keys.at_or(i, None),
-      stored_results.at_or(i, None),
-      pending_seed_roots.at_or(i, None),
-    ))
+  {
+    cases: range(0, rows.len()).map(|i: Int|
+      select::case_of(
+        rows.at_or(i, no_row()),
+        keys.at_or(i, None),
+        stored_results.at_or(i, None),
+        pending_seed_roots.at_or(i, None),
+      )),
+    rolled: rollups.filter(|m: ModuleRollup|
+      m.at.any(|i: Int| !whole.contains(i)) && m.at.all(|i: Int| trace_of(i) == Some(b""))).map(
+      |m: ModuleRollup| { key: m.key, trace: b"" },
+    ),
+  }
 }
 
 pub fn traces_of(passes: List<Option<Bytes>>) -> List<Bytes> =
   passes.fold([], |accumulator: List<Bytes>, h: Option<Bytes>|
     match h { Some(trace) -> accumulator.push(trace), None -> accumulator })
 
-pub fn pass_status(
-  now: views::ShippedState,
-  stored_trace: Option<Bytes>,
-  options: Options,
-  supplied: machine::RunConfiguration,
-) -> Option<StoredResult> / {entering::machine.changed_read} =
+pub fn pass_status(now: views::ShippedState, stored_trace: Option<Bytes>) -> Option<StoredResult> =
   match stored_trace {
     None -> None,
     Some(trace) -> if trace == b"" { Some(Passing) } else {
-      let split = views::split(trace);
-      match tester::stale_read(options, supplied, split.rest) {
+      match views::stale_view(now, views::split(trace).shipped_views) {
+        None -> Some(Passing),
         Some(what) -> Some(Moved(what)),
-        None -> match views::stale_view(now, split.shipped_views) {
-          None -> Some(Passing),
-          Some(what) -> Some(Moved(what)),
-        },
       }
     },
   }
@@ -692,8 +734,8 @@ fn no_row() -> Row =
 
 pub fn diagnosed_all(
   bypassed: Bool,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
+  places: List<SourceText>,
+  analysis: ProgramListing,
   c: Conclusion<RuntimeDiagnostic>,
   failures: List<Failed>,
 ) -> { faults: List<Fault>, diffs: List<ChangeDiff> } / {result_cache.baselines, result_cache.texts, abort.raise} = {
@@ -703,7 +745,7 @@ pub fn diagnosed_all(
   if records.all(|r: Option<LastPass>| r == None) {
     { faults: failures.map(|f: Failed| fault_of(f, None)), diffs: [] }
   } else {
-    let tree = changes::program_of(timed.program, analysis);
+    let tree = changes::program_of(places, analysis);
     let sides = range(0, failures.len()).map(|i: Int|
       match ((failures.at(i), records.at(i))) {
         (Some(f), Some(Some(record))) -> Some(compared(tree, f.key, f.test_hash, record)),
@@ -750,7 +792,7 @@ pub fn replay_of(seed: String, name: String) -> Option<String> =
   shell_join(["ply", "test", "--seed", seed, "--filter", name])
 
 pub fn store_history(
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   sources: List<Source>,
   modules: List<ModuleHashes>,
   filing: conclude::Filing,
@@ -814,7 +856,7 @@ test "a search stopped early shows its count as `>= N`, and the reduction ratio 
 
 fn loaded_from(
   files: List<{ path: String, body: Bytes }>,
-) -> { modules: List<ModuleHashes>, whole: CheckedProgram, sources: List<Source> } / {abort.raise} = {
+) -> { modules: List<ModuleHashes>, whole: ProgramListing, sources: List<Source> } / {abort.raise} = {
   let tree = fs::mem_of(files);
   let listed = Bytes::concat_all(
     queries().map(
@@ -827,7 +869,7 @@ fn loaded_from(
       Err(_) -> panic("the program is read"),
       Ok(p) -> match analyse_in_memory(p.main_package.files, Map::new()).out {
         Analysed(w) -> {
-          let whole = checked_program_of(w);
+          let whole = listing_of(checked_program_of(w));
           let texts = files.fold(
             Map::new(),
             |m: Map<Bytes, Bytes>, f: { path: String, body: Bytes }|
@@ -836,7 +878,7 @@ fn loaded_from(
           {
             modules: forbid_derivers(|| fresh_check_results[t](p)).modules,
             whole: whole,
-            sources: whole.frame.outlines.map(|o: Outline|
+            sources: whole.outlines.map(|o: Outline|
               { name: o.name, source_text: texts.get(o.name).unwrap_or(b"") }),
           }
         },
@@ -858,7 +900,7 @@ fn loaded_from(
 }
 
 fn store_passing(
-  program: { modules: List<ModuleHashes>, whole: CheckedProgram, sources: List<Source> },
+  program: { modules: List<ModuleHashes>, whole: ProgramListing, sources: List<Source> },
 ) -> Unit / {fs.read[mem], fs.write[mem], abort.raise} = {
   let view = program.whole;
   let tests = range(0, view.checked.tests.len()).fold(

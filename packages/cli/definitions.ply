@@ -1,15 +1,17 @@
 import compiler.load (Derives)
 import compiler.front (viewed_text)
-import compiler.front.facts (is_shipped_module)
 import compiler.unit (shipped)
 import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, matches_filters, module_names, no_flags, style_of)
 import compiler.cc (toolchain)
-import program (Program, Tables, TimedLoad, definitions_in_order, tables_of, location_of, place_of,
-                hash_of, own_hash_of, dependencies_of, specialization_count, short_of, timed_load,
-                no_program, program_view)
+import program (Tables, definitions_in_order, tables_of, location_of, place_of, places_of, hash_of,
+                own_hash_of, dependencies_of, session, specialization_count, short_of)
+import diagnostic (SourceText)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules)
+import compiler.front.checking.groups (ProgramSummary)
 import report (CommandOutput, schema_version, ok_code, count_of, indent, rejected)
 import std.term (Style, bold, dim)
 import compiler.store.hash.forms (FunctionNamed)
@@ -42,11 +44,11 @@ fn is_listed(
       String::of_bytes_lossy(definition_info.name),
     )
 
-fn file_of(p: Program, definition_info: DefinitionInfo) -> Json =
-  match place_of(p, definition_info.at) { Some(place) -> Str(place.path), None -> Null }
+fn file_of(places: List<SourceText>, definition_info: DefinitionInfo) -> Json =
+  match place_of(places, definition_info.at) { Some(place) -> Str(place.path), None -> Null }
 
 fn definition_json(
-  program: Program,
+  places: List<SourceText>,
   tables: Tables,
   definition_info: DefinitionInfo,
 ) -> Json / {abort.raise} =
@@ -54,8 +56,8 @@ fn definition_json(
     { key: "name", value: Str(String::of_bytes_lossy(definition_info.name)) },
     { key: "module", value: Str(String::of_bytes_lossy(definition_info.module)) },
     { key: "simple_name", value: Str(String::of_bytes_lossy(definition_info.simple_name)) },
-    { key: "location", value: string_or_null(location_of(program, definition_info.at)) },
-    { key: "file", value: file_of(program, definition_info) },
+    { key: "location", value: string_or_null(location_of(places, definition_info.at)) },
+    { key: "file", value: file_of(places, definition_info) },
     { key: "start", value: Number(Decimal::of_int(definition_info.at.span.start)) },
     { key: "end", value: Number(Decimal::of_int(definition_info.at.span.end)) },
     { key: "hash", value: string_or_null(hash_of(tables, definition_info.name)) },
@@ -78,12 +80,15 @@ fn definition_json(
 fn short_or_blank(tables: Tables, definition_info: DefinitionInfo) -> String / {abort.raise} =
   match hash_of(tables, definition_info.name) { Some(h) -> short_of(h), None -> "" }
 
-fn location_or_blank(p: Program, definition_info: DefinitionInfo) -> String / {abort.raise} =
-  match location_of(p, definition_info.at) { Some(l) -> l, None -> "" }
+fn location_or_blank(
+  places: List<SourceText>,
+  definition_info: DefinitionInfo,
+) -> String / {abort.raise} =
+  match location_of(places, definition_info.at) { Some(l) -> l, None -> "" }
 
 fn text_lines(
   style: Style,
-  program: Program,
+  places: List<SourceText>,
   tables: Tables,
   definitions: List<DefinitionInfo>,
 ) -> List<String> / {abort.raise} =
@@ -92,7 +97,7 @@ fn text_lines(
       indent() ++ dim(style, short_or_blank(tables, definition_info)) ++ "  "
         ++ bold(style, String::of_bytes_lossy(definition_info.name))
         ++ "  "
-        ++ dim(style, location_or_blank(program, definition_info)),
+        ++ dim(style, location_or_blank(places, definition_info)),
     ).push(
       indent() ++ indent() ++ scheme_of(definition_info) ++ " / "
         ++ listed_effects_text(definition_info.effects),
@@ -100,7 +105,7 @@ fn text_lines(
 
 fn definitions_output(
   style: Style,
-  program: Program,
+  places: List<SourceText>,
   tables: Tables,
   definitions: List<DefinitionInfo>,
 ) -> CommandOutput / {abort.raise} =
@@ -114,12 +119,12 @@ fn definitions_output(
         key: "definitions",
         value: Array(
           definitions.map(|definition_info: DefinitionInfo|
-            definition_json(program, tables, definition_info)),
+            definition_json(places, tables, definition_info)),
         ),
       },
       { key: "diagnostics", value: Array([]) },
     ]),
-    lines: text_lines(style, program, tables, definitions).push("").push(
+    lines: text_lines(style, places, tables, definitions).push("").push(
       indent() ++ count_of(definitions.len(), "definition"),
     ),
     errs: [],
@@ -128,28 +133,21 @@ fn definitions_output(
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
-  let loaded: Program = t.program;
-  match program_view(loaded) {
-    None -> rejected(style_of(flags), "definitions", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> {
-      let modules = module_names(w.frame.order);
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match session(flags.paths, flags.verify_dependencies, false, |m: Modules, _: ProgramSummary|
+      view::listed(m)) {
+    Err(r) -> rejected(style_of(flags), "definitions", r.diagnostics, r.places),
+    Ok(opened) -> {
+      let w = opened.value;
       definitions_output(
         style_of(flags),
-        loaded,
-        tables_of(w.frame.hashes),
+        places_of(opened),
+        tables_of(w.hashes),
         definitions_in_order(w).filter(|definition_info: DefinitionInfo|
-          is_listed(
-            flags,
-            modules,
-            |i: Int| is_shipped_module(w.frame.packages, w.frame.module_packages, i),
-            definition_info,
-          )),
+          is_listed(flags, module_names(w.order), |i: Int| i >= w.own, definition_info)),
       )
     },
   }
-}
 
 fn monomorphic_definition(name: Bytes, module: Bytes, simple: Bytes) -> DefinitionInfo =
   {
@@ -208,10 +206,7 @@ test "a definition with no effects and no type variables prints as `() -> Int` w
 }
 
 test "a definitions listing starts and ends with a blank line, and its last line is the definition count" {
-  let p: Program = {
-    ..no_program(),
-    source_texts: [{ path: "m.ply", text: b"fn two() -> Int = 1\n" }],
-  };
+  let p = [{ path: "m.ply", text: b"fn two() -> Int = 1\n" }];
   let tables: Tables = {
     definitions: Map::new(),
     own: Map::new(),

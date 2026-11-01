@@ -1,0 +1,92 @@
+import std.bin
+import std.list
+import compiler.store.memo (memo)
+import compiler.front.facts (ProgramListing, decode_tables, program_listing)
+import compiler.front.rows (Outline)
+import compiler.front.pages (Pages)
+import compiler.front.checking (CheckedModule, cycles_among, documented_all, hashed_all, module_of,
+                                rejected_first)
+import compiler.front.checking.groups (ModuleListing, ProgramSummary, declarers_input,
+                                       module_listing_bin, module_listing_query, owners_result_of,
+                                       program_summary_bin, program_summary_query, symbol_query)
+import compiler.front.checking.world (ModuleKey, decoded, module_key_bin)
+import compiler.check.resolve.tables (Diagnostic, Label)
+
+pub type Modules = { root: Int, own: List<Bytes>, pulled: List<Bytes> }
+
+fn own_key(module: Bytes) -> ModuleKey = { module: module, shipped: false, tested: false }
+
+fn pulled_key(module: Bytes) -> ModuleKey = { module: module, shipped: true, tested: false }
+
+pub fn keys_of(modules: Modules) -> List<ModuleKey> =
+  modules.own.map(own_key).concat(modules.pulled.map(pulled_key))
+
+pub fn summary(own: List<Bytes>) -> ProgramSummary / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(program_summary_query(), bin::encode(own, bin::list_bin(bin::bytes_bin()))),
+    program_summary_bin(),
+    "the program's summary",
+  )
+
+fn placed_at(diagnostics: List<Diagnostic>, slot: Int) -> List<Diagnostic> =
+  diagnostics.map(|d: Diagnostic| { ..d, labels: d.labels.map(|l: Label| { ..l, module: slot }) })
+
+fn slots_of(names: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
+  range(0, names.len()).fold(Map::new(), |slots: Map<Bytes, Int>, i: Int|
+    slots.insert(names.get(i), i))
+
+pub fn rejections(
+  own: List<Bytes>,
+  read: ProgramSummary,
+) -> List<Diagnostic> / {memo.read, abort.raise} = {
+  let slots = slots_of(own.concat(read.pulled));
+  let keys = own.map(own_key).concat(read.pulled.map(pulled_key));
+  let flagged = keys.filter(|k: ModuleKey| read.rejected.contains(k.module));
+  rejected_first(if read.cycle { cycles_among(own) } else { flagged.map(module_of) }).fold(
+    [],
+    |found: List<Diagnostic>, a: CheckedModule|
+      found.concat(
+        placed_at(a.result.rejected, match slots.get(a.module) { Some(i) -> i, None -> 0 }),
+      ),
+  )
+}
+
+fn listing_of(key: ModuleKey) -> ModuleListing / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(module_listing_query(), bin::encode(key, module_key_bin())),
+    module_listing_bin(),
+    "a module's listing",
+  )
+
+pub fn warnings(
+  root: List<Bytes>,
+  read: ProgramSummary,
+) -> List<Diagnostic> / {memo.read, abort.raise} =
+  range(0, root.len()).fold([], |found: List<Diagnostic>, i: Int|
+    if read.warned.contains(root.get(i)) {
+      found.concat(placed_at(listing_of(own_key(root.get(i))).warnings, i))
+    } else { found })
+
+pub fn outlines(modules: Modules) -> List<Outline> / {memo.read, abort.raise} =
+  keys_of(modules).map(|k: ModuleKey| owners_result_of(k).shape.outline)
+
+pub fn listed(modules: Modules) -> ProgramListing / {memo.read, abort.raise} = {
+  let listings = keys_of(modules).map(listing_of);
+  program_listing(
+    modules.root,
+    modules.own.len(),
+    listings.map(|l: ModuleListing| l.shape),
+    listings.map(|l: ModuleListing| decode_tables(l.tables)),
+    hashed_all(modules.own, modules.pulled, false),
+    modules.pulled.fold(Map::new(), |names: Map<Bytes, Bool>, m: Bytes| names.insert(m, true)),
+  )
+}
+
+pub fn declarers(name: Bytes) -> List<Bytes> / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(symbol_query(), declarers_input(name)),
+    bin::list_bin(bin::bytes_bin()),
+    "the modules that declare a name",
+  )
+
+pub fn pages(keys: List<ModuleKey>) -> List<Pages> / {memo.read, abort.raise} = documented_all(keys)

@@ -27,7 +27,8 @@ import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFunct
                                   DenotesConstructor, DenotesNothing, qualified_effect_name,
                                   qualified_type_name)
 import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reachable_functions, Subject,
-                                  FunctionNamed, DeclarationNamed, ItemKeyed, hashes_from_cache)
+                                  FunctionNamed, DeclarationNamed, ItemKeyed, hashes_from_cache,
+                                  ModuleHashes, joined_cached_hashes)
 import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
 import compiler.check.typed (TypedBody)
@@ -905,21 +906,9 @@ pub fn framed_program(
 ) -> { frame: Frame, reads: TableReads, views: List<ShippedModuleSummary> } / {abort.raise} = {
   let untested = |s: ModuleShape| !tested && !shipped.contains(s.outline.name);
   let read = shapes.map(|s: ModuleShape| if untested(s) { untested_shape(s) } else { s });
-  let cutting = prune_unreachable
-    && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
-  let whole = hashes_from_cache(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
-  let reach = if cutting {
-    reachable_shipped_functions(
-      read,
-      whole,
-      shipped.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes, _: Bytes| m.insert(n, true)),
-    )
-  } else { Map::new() };
-  let cut = |s: ModuleShape| cutting && shipped.contains(s.outline.name);
-  let merged = merged_shapes(
-    read.map(|s: ModuleShape| if cut(s) { cut_shape(s, reach) } else { s }),
-  );
-  let hashes = hashes_from_cache(skeleton_of_outlines(merged.outlines), fixing);
+  let cut = shapes_cut(read, fixing, shipped_names(shipped), prune_unreachable);
+  let merged = cut.merged;
+  let hashes = cut.hashes;
   {
     frame: {
       outlines: merged.outlines,
@@ -945,10 +934,102 @@ pub fn framed_program(
     },
     reads: {
       reads: shapes.map(|s: ModuleShape|
-        { outline: s.outline, untested: untested(s), trimmed: cut(s) }),
-      reachable: reach,
+        { outline: s.outline, untested: untested(s), trimmed: (cut.is_cut)(s) }),
+      reachable: cut.reachable,
     },
-    views: if cutting { views_read(read, whole, reach, shipped) } else { [] },
+    views: if cut.cutting { views_read(read, cut.whole, cut.reachable, shipped) } else { [] },
+  }
+}
+
+fn shipped_names(shipped: Map<Bytes, Bytes>) -> Map<Bytes, Bool> =
+  shipped.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes, _: Bytes| m.insert(n, true))
+
+type CutShapes = {
+  cutting: Bool,
+  whole: HashOutput,
+  reachable: Map<Bytes, Bool>,
+  is_cut: (ModuleShape) -> Bool,
+  merged: MergedShapes,
+  hashes: HashOutput,
+}
+
+fn shapes_cut(
+  read: List<ModuleShape>,
+  fixing: CachedHashes,
+  shipped: Map<Bytes, Bool>,
+  prune_unreachable: Bool,
+) -> CutShapes / {abort.raise} = {
+  let cutting = prune_unreachable
+    && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
+  let whole = hashes_from_cache(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
+  let reach = if cutting { reachable_shipped_functions(read, whole, shipped) } else { Map::new() };
+  let is_cut = |s: ModuleShape| cutting && shipped.contains(s.outline.name);
+  let merged = merged_shapes(
+    read.map(|s: ModuleShape| if is_cut(s) { cut_shape(s, reach) } else { s }),
+  );
+  {
+    cutting: cutting,
+    whole: whole,
+    reachable: reach,
+    is_cut: is_cut,
+    merged: merged,
+    hashes: hashes_from_cache(skeleton_of_outlines(merged.outlines), fixing),
+  }
+}
+
+pub type ProgramListing = {
+  root: Int,
+  own: Int,
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  imports: List<List<Bytes>>,
+  hashes: HashOutput,
+  modules: List<ModuleHashes>,
+  embeds: List<ModuleEmbed>,
+  checked: CheckOutput,
+}
+
+pub fn listing_of(view: CheckedProgram) -> ProgramListing = {
+  let written = view.frame.outlines.filter(|o: Outline| !is_shipped(o.name)).len();
+  {
+    root: if view.frame.packages.len() == 0 { written }
+    else { view.frame.module_packages.filter(|k: Int| k == 0).len() },
+    own: written,
+    outlines: view.frame.outlines,
+    order: view.frame.order,
+    imports: view.frame.imports,
+    hashes: view.frame.hashes,
+    modules: [],
+    embeds: view.frame.embeds,
+    checked: view.checked,
+  }
+}
+
+pub fn program_listing(
+  root: Int,
+  own: Int,
+  shapes: List<ModuleShape>,
+  tables: List<ModuleTables>,
+  modules: List<ModuleHashes>,
+  pulled: Map<Bytes, Bool>,
+) -> ProgramListing / {abort.raise} = {
+  let cut = shapes_cut(shapes, joined_cached_hashes(modules), pulled, true);
+  let reads = {
+    reads: shapes.map(|s: ModuleShape|
+      { outline: s.outline, untested: false, trimmed: (cut.is_cut)(s) }),
+    reachable: cut.reachable,
+  };
+  {
+    root: root,
+    own: own,
+    outlines: cut.merged.outlines,
+    order: cut.merged.order,
+    imports: cut.merged.imports,
+    hashes: cut.hashes,
+    modules: modules,
+    embeds: shapes.fold([], |accumulator: List<ModuleEmbed>, s: ModuleShape|
+      accumulator.concat(s.embeds)),
+    checked: checked_tables(cut.merged.outlines, cut.merged.order, reads, tables),
   }
 }
 
@@ -956,7 +1037,15 @@ pub fn checked_program_over(
   frame: Frame,
   reads: TableReads,
   tables: List<ModuleTables>,
-) -> CheckedProgram / {abort.raise} = {
+) -> CheckedProgram / {abort.raise} =
+  { frame: frame, checked: checked_tables(frame.outlines, frame.order, reads, tables) }
+
+fn checked_tables(
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  reads: TableReads,
+  tables: List<ModuleTables>,
+) -> CheckOutput / {abort.raise} = {
   let placed = range(0, tables.len()).fold(
     { out: [], tests: 0, laws: 0 },
     |accumulator: { out: List<ModuleTables>, tests: Int, laws: Int }, k: Int| {
@@ -971,7 +1060,7 @@ pub fn checked_program_over(
       }
     },
   ).out;
-  { frame: frame, checked: merged_tables(prelude_tables(), frame.outlines, frame.order, placed) }
+  merged_tables(prelude_tables(), outlines, order, placed)
 }
 
 pub fn assembled_program(
@@ -1077,9 +1166,17 @@ fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {ab
   post_order(edges).map(|i: Int| names.get(i))
 }
 
-fn merged_shapes(
-  shapes: List<ModuleShape>,
-) -> { outlines: List<Outline>, order: List<Bytes>, imports: List<List<Bytes>>, unimported: List<List<Bytes>>, tagged: List<TaggedSite>, statements: List<StatementSite>, consts: List<TypedConst> } / {abort.raise} = {
+type MergedShapes = {
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  imports: List<List<Bytes>>,
+  unimported: List<List<Bytes>>,
+  tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  consts: List<TypedConst>,
+}
+
+fn merged_shapes(shapes: List<ModuleShape>) -> MergedShapes / {abort.raise} = {
   let placed = range(0, shapes.len()).map(|k: Int| moved_shape(shapes.get(k), 0, k));
   let imports = placed.map(|s: ModuleShape| s.imports);
   {

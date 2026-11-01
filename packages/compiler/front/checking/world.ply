@@ -3,9 +3,8 @@ import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo (memo, memo_store, Query)
-import compiler.front.exports (OwnerInterface, Hashes, ModuleOrigin, InRoot, InPackage,
-                               ShippedModule, CheckInputs, owner_interface_bin, hashes_bin,
-                               module_origin_bin)
+import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, InPackage, ShippedModule,
+                               CheckInputs, owner_interface_bin, module_origin_bin)
 import compiler.front (EmbedRecord, module_embeds_wanted, shipped_wants_of, embed_record_bin)
 import compiler.front.published (no_rows, encode_rows)
 import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_shape_bin,
@@ -23,7 +22,7 @@ import compiler.front.pkg (PackageSources, ValidatedPackages, validated_packages
                            location_placeholder, package_sources_bin)
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, diagnostic_bin, path_span,
                                       source_bin)
-import compiler.syntax.parsing (Span, ParseStart, span_bin, start)
+import compiler.syntax.parsing (Span, ParseStart, ParseOutput, span_bin, start)
 import compiler.syntax.lexer (Token)
 import compiler.store.hash.forms (CachedHashes, cached_hashes_bin)
 
@@ -77,8 +76,8 @@ pub fn derived_kind() -> Bytes = b"derived"
 
 pub fn own_modules_kind() -> Bytes = b"own modules"
 
-fn derived_read(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} =
-  match memo.external(derived_kind(), bin::encode(ask, deriver_request_bin())) {
+fn derived_read(at: Bytes) -> DeriverResponse / {memo.read, abort.raise} =
+  match memo.external(derived_kind(), at) {
     Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
     None ->
       Failed({
@@ -103,9 +102,9 @@ pub effect decode_cache {
   write cache_imported_text(digest: Bytes, text: Bytes) -> Unit
 }
 
-pub type ParsedText = { lexed: ParseStart, raw: Module, given: ParsedSource }
+pub type ParsedText = { lexed: ParseStart, raw: Module, given: ParsedSource, asked: List<Bytes> }
 
-pub effect set QueryEffects = {memo.read, decode_cache.read, decode_cache.write}
+pub effect set QueryEffects = {memo.read, memo.write, decode_cache.read, decode_cache.write}
 
 pub effect set RunEffects = {memo_store.read, memo_store.write, decode_cache.read, decode_cache.write}
 
@@ -142,23 +141,78 @@ pub fn with_decode_cache<a | e>(
     },
   }
 
+test "a second read of a parsed text reads the same derivations again" {
+  let source = {
+    name: b"m",
+    source_text: b"import sizes\n\npub type T = | A\n\nderive sizes for T\n",
+  };
+  let kinds = handle {
+    with_decode_cache(|| {
+      read_once(source);
+      read_once(source);
+      ()
+    })
+  } with {
+    var read: List<Bytes> = [],
+    memo.external(kind, at) -> {
+      read = read.push(at);
+      None
+    },
+    memo.fetch(query, input) -> b"",
+    memo.output_digest(query, input) -> b"",
+    return done -> read,
+  };
+  assert(kinds.len() > 0);
+  assert_eq(kinds.take(kinds.len() / 2), kinds.drop(kinds.len() / 2))
+}
+
 pub fn text_key(source: Source) -> Bytes =
   Bytes::concat_all([source.name, b"\x00", blake3(source.source_text)])
+
+effect derivations {
+  write asked(at: Bytes) -> Unit
+}
+
+fn expanded(
+  source: Source,
+  parsed: ParseOutput<Module>,
+) -> { given: ParsedSource, asked: List<Bytes> } / {memo.read, abort.raise} =
+  handle {
+    parse_from(
+      0,
+      source,
+      parsed,
+      library: Some(|ask: DeriverRequest| {
+        let at = bin::encode(ask, deriver_request_bin());
+        derivations.asked(at);
+        derived_read(at)
+      }),
+    )
+  } with {
+    var asked: List<Bytes> = [],
+    derivations.asked(at) -> {
+      asked = asked.push(at);
+    },
+    return given -> { given: given, asked: asked },
+  }
 
 pub fn read_once(
   source: Source,
 ) -> ParsedText / {memo.read, decode_cache.read, decode_cache.write, abort.raise} = {
   let key = text_key(source);
   match decode_cache.text_read(key) {
-    Some(r) -> r,
+    Some(r) -> {
+      r.asked.fold((), |_: Unit, at: Bytes| {
+        memo.external(derived_kind(), at);
+        ()
+      });
+      r
+    },
     None -> {
       let lexed = start(source.source_text);
       let parsed = parse_started(lexed);
-      let r = {
-        lexed: lexed,
-        raw: parsed.node,
-        given: parse_from(0, source, parsed, library: Some(derived_read)),
-      };
+      let made = expanded(source, parsed);
+      let r = { lexed: lexed, raw: parsed.node, given: made.given, asked: made.asked };
       decode_cache.cache_text_read(key, r);
       r
     },
@@ -498,12 +552,7 @@ pub fn absent(module: Bytes) -> ModuleResult / {abort.raise} =
     tables: encode_tables(no_module_tables()),
   }
 
-pub type HashResult = {
-  hashes: Hashes,
-  owners: Map<Bytes, List<Bytes>>,
-  fixing: CachedHashes,
-  record: Bytes,
-}
+pub type HashResult = { fixing: CachedHashes, record: Bytes }
 
 derive bin for HashResult
 

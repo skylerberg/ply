@@ -1,9 +1,9 @@
 import harness (scratch, loads_here, on_disk, warm_matches_cold, module_reuse, module_reuse_at,
-                in_memory, tree, CliEffects, Shipped, cache_entry)
-import spawning.harness (spawned, Server, write_project, write, read, start_server, wait_for_exit,
-                         completed_result, all_output, stderr, json_of, at, path, items, first, str,
-                         int, bool, json_text, sources_here, stable_report, WorkingDirectory,
-                         diagnostic_codes, manifest, own_modules)
+                in_memory, over_tree, tree, CliEffects, Shipped, WithTree, cache_entry)
+import spawning.harness (spawned, RunResult, Server, write_project, write, read, start_server,
+                         wait_for_exit, completed_result, all_output, stderr, json_of, at, path,
+                         items, first, str, int, bool, json_text, sources_here, stable_report,
+                         WorkingDirectory, diagnostic_codes, manifest, own_modules)
 import std.bytes
 import std.fs (fs, listed_names)
 import std.json (Json)
@@ -88,6 +88,16 @@ fn chained(n: Int) -> String =
   range(1, n).fold("pub fn f0() -> Int = 0\n", |text: String, i: Int|
     text ++ "pub fn f" ++ i.to_string() ++ "() -> Int = f" ++ Int::to_string(i - 1) ++ "() + 1\n")
 
+test "a run reads each source file once" {
+  let reads_of_leaf = |w: WithTree<RunResult>|
+    w.reads.fold(0, |n: Int, path: String, reads: Int|
+      if path.ends_with("leaf.ply") { n + reads } else { n });
+  let first = over_tree(tree([{ path: "leaf.ply", text: leaf() }]), || on_disk(["check", "."]));
+  assert_eq(first.value.code, 0);
+  assert_eq(reads_of_leaf(first), 1);
+  assert_eq(reads_of_leaf(over_tree(first.tree, || on_disk(["check", "."]))), 1)
+}
+
 test "a check after `cache compact`, and a check after an edit, recompute no result the cache already contains" {
   scratch(|| {
     write_project([{ path: "long.ply", text: chained(120) }, { path: "leaf.ply", text: leaf() }]);
@@ -111,7 +121,7 @@ test "editing a function body rechecks only that function, and changing its sign
     edit("core.ply", "Book(_, p) -> p,", "Book(_, p) -> p + 0,");
     let body = query_runs();
     assert(
-      query_run_count(body, "group") == 1 && query_run_count(body, "module") == 1,
+      query_run_count(body, "group") == 1 && query_run_count(body, "module listing") == 1,
       Some("a body edit checks its group and puts its module together again: " ++ runs_text(body)),
     );
     edit(
@@ -170,7 +180,7 @@ fn module_runs() -> { ran: Int, pulled: Bool } / {CliEffects, Shipped, abort.rai
   let v = json_of(on_disk(["check", "--json", "--explain", "--types"]));
   {
     ran: items(path(v, ["front_end", "queries"])).fold(0, |n: Int, q: Json|
-      if str(at(q, "query")) == "module" { n + int(at(q, "run")) } else { n }),
+      if str(at(q, "query")) == "module listing" { n + int(at(q, "run")) } else { n }),
     pulled: items(at(v, "modules")).map(|m: Json| str(at(m, "name"))).contains("std.list"),
   }
 }
@@ -553,11 +563,20 @@ test "moving a dependency's package directory with its manifest unchanged causes
     assert(fs.create_dir[cwd]("vendor"), None);
     assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
     write("app/ply.pkg", manifest("app", lib_dependency("../vendor/lib")));
-    assert(module_reuse_at("app").checked == 0, Some("a moved package checks nothing again"));
+    assert(
+      query_run_count(query_runs_at("app"), "group") == 0,
+      Some("a moved package checks nothing again"),
+    );
     write("vendor/lib/answer.ply", "pub fn answer() -> Int = 40 + 2\n");
-    assert(module_reuse_at("app").checked == 1, Some("the edit is checked, and nothing else"));
+    assert(
+      query_run_count(query_runs_at("app"), "group") == 1,
+      Some("the edit is checked, and nothing else"),
+    );
     write("vendor/lib/answer.ply", "pub fn answer() -> Int = 43\n");
-    assert(module_reuse_at("app").checked == 2, Some("the edit and its caller are checked"))
+    assert(
+      query_run_count(query_runs_at("app"), "group") == 2,
+      Some("the edit and its caller are checked"),
+    )
   })
 }
 
@@ -698,7 +717,7 @@ test/nondet "a proof through another package's `transparent fn` is checked and p
     { path: "lib/same.ply", text: "pub transparent fn same(x: Int) -> Int = x\n" },
   ]);
   assert_eq(outcomes(json_of(spawned(["prove", "app", "--json"]))), ["proved"]);
-  assert(module_reuse_at("app").checked == 0, Some("a warm load checks nothing"));
+  assert(query_run_count(query_runs_at("app"), "group") == 0, Some("a warm load checks nothing"));
   edit("lib/same.ply", "= x", "= x + 0");
   assert(
     query_run_count(query_runs_at("app"), "group") == 2,

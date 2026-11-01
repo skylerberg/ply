@@ -8,9 +8,14 @@ import update_costs (costs_of, cost_checker, has_promises, report_reuse_violatio
                      unresolved)
 import literals (evaluation, evaluation_errors)
 import diagnostic (SourceText, all_to_json, to_text)
-import program (Program, TimedLoad, ModuleReport, timed_load, module_reports, definitions_in_order,
-                own_tests, location_of, whole_of, no_program, program_view, clean_summary)
+import program (Phases, Refusal, Session, TimedLoad, ModuleReport, module_reports,
+                definitions_in_order, own_tests, location_of, places_of, session, timed_of,
+                whole_of)
+import module_queries (ModuleResults, module_results)
 import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules)
+import compiler.store.memo (memo)
 import compiler.cc (toolchain)
 import compiler.store.hash.encoding (hex)
 import report (CommandOutput, ok_code, count_of, indent, rejected, reuse_members, warning_lines,
@@ -21,7 +26,7 @@ import signature
 import std.term (Style, bold, dim, green, plain)
 import compiler.emit.costs (Report, Costing)
 import compiler.check.termination (Terminates, TerminatesByDecreases, Diverges, Site)
-import compiler.front.facts (CheckedProgram, Frame, written_functions_of, tests_of)
+import compiler.front.facts (ProgramListing)
 import compiler.front.rows (Outline)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, EffectInfo, OperationInfo, Location,
                                      Raise, RequirementNotShown, UnguardedBuiltin, RaisingCall)
@@ -90,7 +95,7 @@ fn longest_first(phases: List<Phase>) -> List<Phase> =
     before.push(p).concat(accumulator.filter(|q: Phase| q.ms < p.ms))
   })
 
-fn phase_lines(style: Style, timed: TimedLoad) -> List<String> = {
+fn phase_lines(style: Style, timed: Phases) -> List<String> = {
   let total = timed.read_ms + timed.front_end_ms + timed.store_ms;
   let rows = longest_first([
     { label: "read", ms: timed.read_ms },
@@ -105,7 +110,7 @@ fn phase_lines(style: Style, timed: TimedLoad) -> List<String> = {
   ])
 }
 
-fn phases_json(timed: TimedLoad) -> Json =
+fn phases_json(timed: Phases) -> Json =
   object([
     { key: "read", value: int(timed.read_ms) },
     { key: "front", value: int(timed.front_end_ms) },
@@ -117,9 +122,9 @@ fn count_line(label: String, n: Int, noun: String = "definition") -> String / {a
   nested_indent() ++ label.pad_right(11, " ") ++ " " ++ n.to_string().pad_left(8, " ") ++ " "
     ++ plural(n, noun)
 
-fn tally_lines(style: Style, program: Program) -> List<String> =
+fn tally_lines(style: Style, tallies: List<QueryStats>) -> List<String> =
   ["", indent() ++ bold(style, "memo")].concat(
-    program.tallies.map(|t: QueryStats|
+    tallies.map(|t: QueryStats|
       nested_indent() ++ String::of_bytes_lossy(t.query).pad_right(11, " ") ++ " "
         ++ t.took.to_string().pad_left(8, " ")
         ++ " taken "
@@ -207,7 +212,7 @@ fn provenance_in(
 fn definition_block(
   style: Style,
   explain: Bool,
-  program: Program,
+  places: List<SourceText>,
   schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
   width: Int,
@@ -219,13 +224,13 @@ fn definition_block(
     width,
     String::of_bytes_lossy(definition_info.simple_name),
     definition_info,
-    divergence_location(program, located, definition_info),
+    divergence_location(places, located, definition_info),
   ).fold(lines, |accumulator: List<String>, l: String| accumulator.push(nested_indent() ++ l));
   if !explain { definition_lines } else {
     provenance_lines(provenance_in(schemas, definition_info), types_indent()).concat(
       definition_info.raises.map(|r: Raise|
         "  raises"
-          ++ (match raise_location(program, definition_info, r) {
+          ++ (match raise_location(places, definition_info, r) {
             Some(p) -> " at " ++ p,
             None -> "",
           })
@@ -237,23 +242,27 @@ fn definition_block(
 }
 
 fn raise_location(
-  program: Program,
+  places: List<SourceText>,
   definition_info: DefinitionInfo,
   r: Raise,
 ) -> Option<String> / {abort.raise} = {
   let start = definition_info.at.span.start;
-  location_of(program, {
+  location_of(places, {
     module: definition_info.at.module,
     span: span_between(start + r.span.start, start + r.span.end),
   })
 }
 
-fn raise_json(program: Program, definition_info: DefinitionInfo, r: Raise) -> Json / {abort.raise} = {
+fn raise_json(
+  places: List<SourceText>,
+  definition_info: DefinitionInfo,
+  r: Raise,
+) -> Json / {abort.raise} = {
   let named = |name: Bytes| Str(String::of_bytes_lossy(name));
   let members: List<Member> = [
     {
       key: "at",
-      value: match raise_location(program, definition_info, r) { Some(p) -> Str(p), None -> Null },
+      value: match raise_location(places, definition_info, r) { Some(p) -> Str(p), None -> Null },
     },
     { key: "kind", value: Str(raise_kind(r.reason)) },
     { key: "why", value: Str(raise_text(r.reason)) },
@@ -278,14 +287,14 @@ fn locations(definitions: List<DefinitionInfo>) -> Map<Bytes, Location> =
   )
 
 fn call_location(
-  program: Program,
+  places: List<SourceText>,
   located: Map<Bytes, Location>,
   site: Site,
 ) -> Option<String> / {abort.raise} =
   match located.get(site.caller) {
     Some(caller) -> {
       let start = caller.span.start;
-      location_of(program, {
+      location_of(places, {
         module: caller.module,
         span: span_between(start + site.span.start, start + site.span.end),
       })
@@ -294,11 +303,11 @@ fn call_location(
   }
 
 fn divergence_location(
-  program: Program,
+  places: List<SourceText>,
   located: Map<Bytes, Location>,
   definition_info: DefinitionInfo,
 ) -> Option<String> / {abort.raise} =
-  match definition_info.ending { Diverges(d) -> call_location(program, located, d.at), _ -> None }
+  match definition_info.ending { Diverges(d) -> call_location(places, located, d.at), _ -> None }
 
 fn test_line(style: Style, test_info: TestInfo) -> String / {abort.raise} = {
   let kind = if test_info.nondet { "test/nondet" } else { "test" };
@@ -310,8 +319,8 @@ fn test_line(style: Style, test_info: TestInfo) -> String / {abort.raise} = {
 fn module_block(
   style: Style,
   explain: Bool,
-  program: Program,
-  analysis: CheckedProgram,
+  places: List<SourceText>,
+  analysis: ProgramListing,
   schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
   definitions: List<DefinitionInfo>,
@@ -338,7 +347,7 @@ fn module_block(
     definition_block(
       style,
       explain,
-      program,
+      places,
       schemas,
       located,
       width,
@@ -352,21 +361,21 @@ fn module_block(
 }
 
 fn module_effect_sets(
-  view: CheckedProgram,
+  view: ProgramListing,
   mo: ModuleReport,
   definitions: List<DefinitionInfo>,
 ) -> List<SetLine> / {abort.raise} =
-  match view.frame.outlines.at(mo.index) { None -> [], Some(o) -> effect_sets(o.sets, definitions) }
+  match view.outlines.at(mo.index) { None -> [], Some(o) -> effect_sets(o.sets, definitions) }
 
-fn schemas_of(view: CheckedProgram) -> Map<Bytes, Bool> =
-  view.frame.outlines.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: Outline|
+fn schemas_of(view: ProgramListing) -> Map<Bytes, Bool> =
+  view.outlines.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: Outline|
     o.schemas.fold(accumulator, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)))
 
 fn type_lines(
   style: Style,
   explain: Bool,
-  program: Program,
-  analysis: CheckedProgram,
+  places: List<SourceText>,
+  analysis: ProgramListing,
   views: List<ModuleReport>,
   definitions: List<DefinitionInfo>,
   tests: List<TestInfo>,
@@ -377,7 +386,7 @@ fn type_lines(
     module_block(
       style,
       explain,
-      program,
+      places,
       analysis,
       schemas,
       located,
@@ -397,7 +406,7 @@ fn set_json(v: SetLine) -> Json =
 
 fn module_json(
   explain: Bool,
-  analysis: CheckedProgram,
+  analysis: ProgramListing,
   definitions: List<DefinitionInfo>,
   mo: ModuleReport,
 ) -> Json / {abort.raise} = {
@@ -419,7 +428,7 @@ fn module_json(
 }
 
 fn provenance_fields(
-  program: Program,
+  places: List<SourceText>,
   schemas: Map<Bytes, Bool>,
   definition_info: DefinitionInfo,
 ) -> List<Member> / {abort.raise} =
@@ -442,12 +451,12 @@ fn provenance_fields(
     },
     {
       key: "raises",
-      value: Array(definition_info.raises.map(|r: Raise| raise_json(program, definition_info, r))),
+      value: Array(definition_info.raises.map(|r: Raise| raise_json(places, definition_info, r))),
     },
   ]
 
 fn definition_json(
-  program: Program,
+  places: List<SourceText>,
   explain: Bool,
   schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
@@ -463,10 +472,10 @@ fn definition_json(
     { key: "effects", value: Array(json_strings(effect_texts(definition_info.effects))) },
     { key: "scaling", value: Array(json_strings(effect_texts(definition_info.scaling))) },
     { key: "repeats", value: Array(definition_info.repeats.map(|i: Int| int(i))) },
-    { key: "ending", value: ending_json(program, located, definition_info) },
+    { key: "ending", value: ending_json(places, located, definition_info) },
   ];
   let fields: List<Member> = if !explain { named } else {
-    provenance_fields(program, schemas, definition_info).fold(
+    provenance_fields(places, schemas, definition_info).fold(
       named,
       |accumulator: List<Member>, f: Member| accumulator.push(f),
     )
@@ -475,7 +484,7 @@ fn definition_json(
 }
 
 fn ending_json(
-  program: Program,
+  places: List<SourceText>,
   located: Map<Bytes, Location>,
   definition_info: DefinitionInfo,
 ) -> Json / {abort.raise} =
@@ -491,7 +500,7 @@ fn ending_json(
         },
         {
           key: "at",
-          value: match divergence_location(program, located, definition_info) {
+          value: match divergence_location(places, located, definition_info) {
             Some(p) -> Str(p),
             None -> Null,
           },
@@ -500,7 +509,7 @@ fn ending_json(
           key: "loop",
           value: Array(
             d.loop.map(|site: Site|
-              match call_location(program, located, site) { Some(p) -> Str(p), None -> Null }),
+              match call_location(places, located, site) { Some(p) -> Str(p), None -> Null }),
           ),
         },
       ]),
@@ -538,19 +547,28 @@ fn effect_json(effect_info: EffectInfo) -> Json / {abort.raise} =
     { key: "operations", value: Array(effect_info.operations.map(operation_json)) },
   ])
 
+type Reported = {
+  summary: ProgramSummary,
+  places: List<SourceText>,
+  phases: Phases,
+  tallies: List<QueryStats>,
+  missing_results: Int,
+  listing: Option<ProgramListing>,
+  warnings: List<Diagnostic>,
+}
+
 fn document(
   flags: Flags,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
+  reported: Reported,
+  analysis: ProgramListing,
   views: List<ModuleReport>,
   definitions: List<DefinitionInfo>,
-  warnings: List<Diagnostic>,
   pass: Option<Costing>,
 ) -> Json / {abort.raise} = {
-  let p: Program = timed.program;
   let located = locations(definitions);
   let schemas = schemas_of(analysis);
-  let hashes = analysis.frame.hashes.definitions.fold(
+  let places = reported.places;
+  let hashes = analysis.hashes.definitions.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
       accumulator.insert(d.name, d.hash),
@@ -560,10 +578,7 @@ fn document(
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: int(ok_code()) },
     { key: "root", value: Str(flags.root) },
-    {
-      key: "files",
-      value: Array(json_strings(p.source_texts.map(|place: SourceText| place.path))),
-    },
+    { key: "files", value: Array(json_strings(places.map(|place: SourceText| place.path))) },
     {
       key: "modules",
       value: Array(
@@ -575,7 +590,7 @@ fn document(
       value: Array(
         definitions.map(|definition_info: DefinitionInfo|
           definition_json(
-            p,
+            places,
             flags.explain,
             schemas,
             located,
@@ -587,29 +602,23 @@ fn document(
     {
       key: "tests",
       value: Array(
-        own_tests(p, analysis).map(|t: TestInfo|
-          test_json(match analysis.frame.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" }, t)),
+        own_tests(analysis).map(|t: TestInfo|
+          test_json(match analysis.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" }, t)),
       ),
     },
     { key: "effects", value: Array(analysis.checked.effects.map(effect_json)) },
     {
       key: "front_end",
       value: object(
-        [{ key: "phases", value: phases_json(timed) }].concat(
-          reuse_members(timed.program.tallies, timed.program.missing_results),
+        [{ key: "phases", value: phases_json(reported.phases) }].concat(
+          reuse_members(reported.tallies, reported.missing_results),
         ),
       ),
     },
     { key: "cost_pass", value: cost_json(pass) },
-    { key: "diagnostics", value: all_to_json(warnings, p.source_texts) },
+    { key: "diagnostics", value: all_to_json(reported.warnings, places) },
   ])
 }
-
-fn summary(style: Style, program: Program, frame: Frame) -> String / {abort.raise} =
-  indent() ++ green(style, "checked") ++ " " ++ count_of(frame.outlines.len(), "module") ++ ", "
-    ++ count_of(written_functions_of(frame), "definition")
-    ++ ", "
-    ++ count_of(tests_of(frame, program.files.len()), "test")
 
 fn with_cost_report(
   style: Style,
@@ -623,48 +632,48 @@ fn with_cost_report(
 fn check_output(
   style: Style,
   flags: Flags,
-  timed: TimedLoad,
-  frame: Frame,
+  reported: Reported,
   pass: Option<Costing>,
-  warnings: List<Diagnostic>,
 ) -> CommandOutput / {abort.raise} = {
+  let warnings = reported.warnings;
   let holes = warnings.filter(|d: Diagnostic| d.code == b"W0613");
-  let head = [summary(style, timed.program, frame)].concat(
+  let head = [summary_line(style, reported.summary)].concat(
     warning_lines(style, warnings.filter(|d: Diagnostic| d.code != b"W0613")),
   ).concat(
-    holes.flat_map(|d: Diagnostic| to_text(style, d, timed.program.source_texts)),
+    holes.flat_map(|d: Diagnostic| to_text(style, d, reported.places)),
   );
   let explained = if flags.explain {
-    head.concat(phase_lines(style, timed)).concat(tally_lines(style, timed.program)).concat(
+    head.concat(phase_lines(style, reported.phases)).concat(
+      tally_lines(style, reported.tallies),
+    ).concat(
       cost_lines(style, pass),
     )
   } else { head };
-  let read = if flags.types || flags.json { program_view(timed.program) } else { None };
-  let listed = |v: CheckedProgram|
+  let listed = |v: ProgramListing|
     {
-      views: module_reports(timed.program, frame),
+      views: module_reports(reported.places, v.outlines),
       definitions: definitions_in_order(v),
-      tests: own_tests(timed.program, v),
+      tests: own_tests(v),
     };
-  let typed = match read {
+  let typed = match reported.listing {
     Some(v) -> if !flags.types { explained } else {
       let l = listed(v);
       explained.concat(
-        type_lines(style, flags.explain, timed.program, v, l.views, l.definitions, l.tests),
+        type_lines(style, flags.explain, reported.places, v, l.views, l.definitions, l.tests),
       )
     },
     None -> explained,
   };
   {
-    json: match read {
+    json: match reported.listing {
       Some(v) -> if !flags.json { object([]) } else {
         let l = listed(v);
-        document(flags, timed, v, l.views, l.definitions, warnings, pass)
+        document(flags, reported, v, l.views, l.definitions, pass)
       },
       None -> object([]),
     },
     lines: match pass {
-      Some(c) -> with_cost_report(style, flags, timed.program.source_texts, c.report, typed),
+      Some(c) -> with_cost_report(style, flags, reported.places, c.report, typed),
       None -> typed,
     },
     errs: [],
@@ -672,49 +681,52 @@ fn check_output(
   }
 }
 
-fn checked(
+fn with_later_checks(
   style: Style,
   flags: Flags,
+  reported: Reported,
   timed: TimedLoad,
-  frame: Frame,
-) -> CommandOutput / {cost_checker.report, evaluation.verdicts, evaluation.statements, abort.raise} = {
-  let promised = has_promises(timed.program, frame);
-  let pass = if !promised && !flags.costs { Ok(None) } else {
-    match whole_of(timed.program) {
-      Ok(w) -> Ok(Some(costs_of(timed.program, w))),
-      Err(diagnostics) -> Err(diagnostics),
-    }
-  };
-  let unkept = match pass {
-    Err(diagnostics) -> diagnostics,
-    Ok(None) -> [],
-    Ok(Some(c)) -> if !c.report.ok { [unresolved()] }
-    else if promised { report_reuse_violations(c.report) }
-    else { [] },
-  };
-  let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, frame) };
-  if broken.len() > 0 { rejected(style, "check", broken, timed.program.source_texts) } else {
-    check_output(
-      style,
-      flags,
-      timed,
-      frame,
-      match pass { Ok(p) -> p, Err(_) -> None },
-      timed.program.diagnostics,
-    )
+) -> CommandOutput / {cost_checker.report, evaluation.verdicts, evaluation.statements, abort.raise} =
+  match timed.program.frame {
+    None ->
+      refused_output(flags, {
+        diagnostics: timed.program.diagnostics,
+        places: timed.program.source_texts,
+        tallies: reported.tallies,
+        missing_results: reported.missing_results,
+        phases: reported.phases,
+      }),
+    Some(frame) -> {
+      let promised = has_promises(timed.program, frame);
+      let pass = if !promised && !flags.costs { Ok(None) } else {
+        match whole_of(timed.program) {
+          Ok(w) -> Ok(Some(costs_of(timed.program, w))),
+          Err(diagnostics) -> Err(diagnostics),
+        }
+      };
+      let unkept = match pass {
+        Err(diagnostics) -> diagnostics,
+        Ok(None) -> [],
+        Ok(Some(c)) -> if !c.report.ok { [unresolved()] }
+        else if promised { report_reuse_violations(c.report) }
+        else { [] },
+      };
+      let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, frame) };
+      if broken.len() > 0 { rejected(style, "check", broken, timed.program.source_texts) }
+      else { check_output(style, flags, reported, match pass { Ok(p) -> p, Err(_) -> None }) }
+    },
   }
-}
 
-fn rejected_load(flags: Flags, timed: TimedLoad) -> CommandOutput / {abort.raise} = {
+fn refused_output(flags: Flags, r: Refusal) -> CommandOutput / {abort.raise} = {
   let style = style_of(flags);
   let output = with_front_end(
-    rejected(style, "check", timed.program.diagnostics, timed.program.source_texts),
-    [{ key: "phases", value: phases_json(timed) }].concat(
-      reuse_members(timed.program.tallies, timed.program.missing_results),
+    rejected(style, "check", r.diagnostics, r.places),
+    [{ key: "phases", value: phases_json(r.phases) }].concat(
+      reuse_members(r.tallies, r.missing_results),
     ),
   );
   if !flags.explain { output }
-  else { { ..output, lines: phase_lines(style, timed).concat(tally_lines(style, timed.program)) } }
+  else { { ..output, lines: phase_lines(style, r.phases).concat(tally_lines(style, r.tallies)) } }
 }
 
 fn summary_line(style: Style, summary: ProgramSummary) -> String / {abort.raise} =
@@ -723,30 +735,50 @@ fn summary_line(style: Style, summary: ProgramSummary) -> String / {abort.raise}
     ++ ", "
     ++ count_of(summary.tests, "test")
 
-fn only_summary_wanted(flags: Flags) -> Bool =
-  !flags.json && !flags.types && !flags.costs && !flags.explain && !flags.verify_dependencies
-    && !flags.no_cache
+type CheckReading = { listing: Option<ProgramListing>, later: Option<ModuleResults> }
+
+fn check_reading(
+  flags: Flags,
+  modules: Modules,
+  read: ProgramSummary,
+) -> CheckReading / {memo.read, abort.raise} =
+  {
+    listing: if flags.types || flags.json { Some(view::listed(modules)) } else { None },
+    later: if read.checked_later || flags.costs { Some(module_results(modules.own)) } else { None },
+  }
+
+fn reported_of(s: Session<CheckReading>) -> Reported / {fs.read_file[shipped]} =
+  {
+    summary: s.summary,
+    places: if s.warnings.len() > 0 || s.value.listing != None || s.value.later != None {
+      places_of(s)
+    } else { [] },
+    phases: s.phases,
+    tallies: s.tallies,
+    missing_results: s.missing_results,
+    listing: s.value.listing,
+    warnings: s.warnings,
+  }
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  match if only_summary_wanted(flags) { clean_summary(flags.paths) } else { None } {
-    Some(summary) ->
-      {
-        json: object([]),
-        lines: [summary_line(style_of(flags), summary)],
-        errs: [],
-        code: ok_code(),
-      },
-    None -> {
-      let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
-      match t.program.frame {
-        None -> rejected_load(flags, t),
-        Some(f) -> checked(style_of(flags), flags, t, f),
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} =
+  match session(
+      flags.paths,
+      flags.verify_dependencies,
+      flags.no_cache,
+      |modules: Modules, read: ProgramSummary| check_reading(flags, modules, read),
+    ) {
+    Err(r) -> refused_output(flags, r),
+    Ok(s) -> {
+      let reported = reported_of(s);
+      match s.value.later {
+        None -> check_output(style_of(flags), flags, reported, None),
+        Some(checked) ->
+          with_later_checks(style_of(flags), flags, reported, timed_of(s, checked, false)),
       }
     },
   }
-}
 
 test "`percent_text` prints a share to one decimal place and prints 0.0% instead of dividing when the total time is zero" {
   assert_eq(percent_text(984, 1000), " 98.4%");
@@ -755,13 +787,7 @@ test "`percent_text` prints a share to one decimal place and prints 0.0% instead
 }
 
 test "phase lines list the longest phase first, and the total is the sum of the read, front-end and write-back times" {
-  let lines = phase_lines(plain(), {
-    program: no_program(),
-    read_ms: 2,
-    front_end_ms: 90,
-    store_ms: 8,
-    cached: true,
-  });
+  let lines = phase_lines(plain(), { read_ms: 2, front_end_ms: 90, store_ms: 8 });
   assert_eq(lines, [
     "",
     "   front-end time",
