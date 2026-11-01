@@ -1058,8 +1058,7 @@ pub(crate) fn unshielded(c: &mut Ctx, entered: Option<Bracketed>) -> bool {
 
 // --- The entry's trail -----------------------------------------------------------------------
 
-/// What a seeded step touched, as `std.internal.trail`'s `Access` holds it: an effect in a mode,
-/// its resource where it names one, or a scoped value.
+/// What a seeded step touched: an effect, its resource where it names one, or a scoped value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Touched {
     Effect {
@@ -1140,7 +1139,8 @@ pub unsafe extern "C" fn rt_footprint_held(ctx: *mut Ctx) -> I64 {
 }
 
 /// What the running seeded step touched since this was last asked, each access beside where it was
-/// made, as `std.internal.trail` reads a `List<Touch>`; what it held is let go.
+/// made: `list(row)`, `row := string effect, option(string) resource, bool write, int scoped, int
+/// root, int start, int end`, `scoped` 0 for an effect. What it held is let go.
 pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let touched = std::mem::take(&mut c.accesses);
@@ -1152,15 +1152,18 @@ pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
                 resource,
                 write,
             } => {
-                w.tag(0).str(effect.as_str());
-                match resource {
-                    Some(r) => w.tag(0).str(r.as_str()),
-                    None => w.tag(2),
-                };
-                w.tag(u64::from(*write)).tag(0);
+                w.str(effect.as_str())
+                    .option(resource.as_ref(), |w, r| {
+                        w.str(r.as_str());
+                    })
+                    .bool(*write)
+                    .int(0);
             }
             Touched::ScopedValue { id, write } => {
-                w.tag(2).count(*id).tag(u64::from(*write));
+                w.str("")
+                    .option(None::<&ply_core::Symbol>, |_, _| {})
+                    .bool(*write)
+                    .count(*id);
             }
         }
         w.int(site[0]).int(site[1]).int(site[2]);

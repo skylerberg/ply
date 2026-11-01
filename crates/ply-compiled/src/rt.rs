@@ -6,7 +6,7 @@ use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_wor
 use crate::native::I64;
 use crate::stack::{Stack, switch};
 use ply_core::builtins::scoped_released;
-use ply_core::{Diagnostic, Effect, Mode, Resource, Span, Symbol, codes};
+use ply_core::{Diagnostic, Mode, Span, Symbol, codes};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicI64;

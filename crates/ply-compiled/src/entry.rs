@@ -494,7 +494,7 @@ fn returned(ctx: &mut Ctx) -> Last {
         ctx.teardown.extend(warned);
     }
     Last {
-        performs: ctx.performed.len() as u64,
+        performs: ctx.performed,
         held,
         interleaving: ctx.interleaving.take(),
         runtime_blocks: 0,

@@ -177,8 +177,7 @@ unsafe fn at_entry(
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
     if unhandled {
-        let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
-        recorded(c, &effect, &name, resource.as_ref(), mode);
+        recorded(c, &effect, resource.as_ref(), mode.0 != 0);
     }
     let_go(ctx, args, described);
     let c = unsafe { &mut *ctx };
@@ -217,23 +216,15 @@ fn raised_of(args: &[Word], described: &PlyOp) -> Raised {
     )
 }
 
-/// A perform of `effect.op` on `resource` in `mode` noted where this entry's performs are read: in
-/// its trace, and as a scheduler's step access.
-fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>, mode: Mode) {
-    let performed = Effect::operation(
-        effect.clone(),
-        resource
-            .cloned()
-            .map_or(Resource::Singleton, Resource::Named),
-        mode,
-        op.clone(),
-    );
+/// A perform of `effect` on `resource` noted where this entry's performs are read: in its count, and
+/// as a scheduler's step access.
+fn recorded(c: &mut Ctx, effect: &Symbol, resource: Option<&Symbol>, write: bool) {
     c.touched(crate::tasks::Touched::Effect {
         effect: effect.clone(),
         resource: resource.cloned(),
-        write: mode == Mode::Write,
+        write,
     });
-    c.performed.push(performed);
+    c.performed += 1;
 }
 
 /// Notes a perform of the operation `op` describes, on the field-table entry `resource` (negative
@@ -241,10 +232,9 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
 /// handed. Compiled code calls it only while [`Ctx::recording`] is armed.
 pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource: I64, mode: I64) {
     let c = unsafe { &mut *ctx };
-    let (effect, name) = named_op(c, unsafe { &*op });
+    let (effect, _) = named_op(c, unsafe { &*op });
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
-    let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
-    recorded(c, &effect, &name, resource.as_ref(), mode);
+    recorded(c, &effect, resource.as_ref(), mode.0 != 0);
 }
 
 /// Rejects a clause leaving an instance another task opened, the operation `op` describes performed

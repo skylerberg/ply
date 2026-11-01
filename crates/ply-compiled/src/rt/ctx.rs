@@ -80,8 +80,8 @@ pub struct Ctx {
     /// Indices of `stacks` a finished production task gave back, which nothing names any longer.
     pub(super) free_stacks: Vec<usize>,
     pub(crate) current: usize,
-    /// Every effect a compiled `perform` performed since the entry began, for the machine's trace.
-    pub performed: Vec<Effect>,
+    /// How many compiled `perform`s ran since the entry began, for the machine's trace.
+    pub performed: u64,
     /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
@@ -232,7 +232,7 @@ impl Ctx {
             stacks: vec![Vec::new()],
             free_stacks: Vec::new(),
             current: 0,
-            performed: Vec::new(),
+            performed: 0,
             detached: Vec::new(),
             starting_detached: None,
             entry: 0,
@@ -322,7 +322,7 @@ impl Ctx {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.pooled |= branch.pooled;
         self.grown += branch.grown;
-        self.performed.append(&mut branch.performed);
+        self.performed += branch.performed;
         self.host_use.absorb(&branch.host_use);
         self.teardown.append(&mut branch.teardown);
     }
@@ -371,7 +371,7 @@ impl Ctx {
         self.stacks.push(Vec::new());
         self.free_stacks.clear();
         self.current = 0;
-        self.performed.clear();
+        self.performed = 0;
         self.starting_detached = None;
         self.entered_sims = 0;
         self.schedulers.clear();
@@ -640,12 +640,6 @@ impl Ctx {
     /// opened, made where the body last stored a site; nothing where no such step runs, and nothing
     /// of a `task` or `clock` operation.
     pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
-        // The scheduler orders what its own operations touch itself.
-        if let crate::tasks::Touched::Effect { effect, .. } = &touched
-            && matches!(effect.as_str(), "task" | "clock")
-        {
-            return;
-        }
         let stepping =
             (self.schedulers.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
         if stepping {

@@ -14,7 +14,6 @@ use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
 use ply_compiled::rt::{BRIDGE, Ctx, FAILED_TARGET};
-use ply_core::{Effect, Mode, Resource};
 use std::cell::Cell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -179,15 +178,7 @@ fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go
     let d = ctx.take_failure().expect("nothing handles `m.ask`");
     assert!(d.message.contains("m.ask"), "{}", d.message);
     assert_eq!(ctx.heap.live(), 0, "the argument was not let go");
-    assert_eq!(
-        ctx.performed,
-        [Effect::operation(
-            "m",
-            Resource::Singleton,
-            Mode::Read,
-            "ask"
-        )]
-    );
+    assert_eq!(ctx.performed, 1);
     ctx.end();
 }
 
