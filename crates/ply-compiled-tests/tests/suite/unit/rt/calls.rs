@@ -281,7 +281,7 @@ fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handle
     assert!(
         said.notes
             .iter()
-            .any(|n| n.contains("`const fn` must return")),
+            .any(|n| n.contains("a constant must return")),
         "{said:?}"
     );
     assert_eq!(ctx.tables.memoized(0), None);
