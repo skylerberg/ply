@@ -20,18 +20,13 @@ pub unsafe extern "C" fn rt_scheduler_left(ctx: *mut Ctx, was: Word) {
     }
 }
 
-pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
-    if let Some(w) = memoized(unsafe { &*ctx }, index) {
-        return Handed::of(w);
+pub unsafe extern "C" fn rt_keep_constant(ctx: *mut Ctx, index: I64, kept: Word) {
+    if let Ok(index) = usize::try_from(index.0) {
+        unsafe { &*ctx }.tables.keep(index, kept);
     }
-    unsafe { evaluated(ctx, index, keep) }
 }
 
-pub unsafe extern "C" fn rt_const(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
-    if let Some(w) = memoized(unsafe { &*ctx }, index) {
-        return Handed::of(w);
-    }
-    let w = unsafe { evaluated(ctx, index, keep) };
+pub unsafe extern "C" fn rt_const_failed(ctx: *mut Ctx) {
     let c = unsafe { &mut *ctx };
     if c.failed == FAILED_PENDING_RAISE {
         if let Some(p) = c.pending.take() {
@@ -45,6 +40,21 @@ pub unsafe extern "C" fn rt_const(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> 
             )
         });
     }
+}
+
+pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
+    if let Some(w) = memoized(unsafe { &*ctx }, index) {
+        return Handed::of(w);
+    }
+    unsafe { evaluated(ctx, index, keep) }
+}
+
+pub unsafe extern "C" fn rt_const(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
+    if let Some(w) = memoized(unsafe { &*ctx }, index) {
+        return Handed::of(w);
+    }
+    let w = unsafe { evaluated(ctx, index, keep) };
+    unsafe { rt_const_failed(ctx) };
     w
 }
 

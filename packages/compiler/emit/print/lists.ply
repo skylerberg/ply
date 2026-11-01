@@ -1,9 +1,10 @@
 import std.bytes (ascii_of_int)
 import compiler.check.types (Type, encode_type)
 import compiler.emit.layout (container_layouts, header_bytes, head_field, list_head, node_head,
-                             head_words)
-import compiler.emit.typed_ir (AsWord)
+                             head_words, minimum_list_capacity)
 import compiler.emit.release (ListOf, WordAt, Object, block_contents)
+import compiler.emit.typed_ir (AsWord)
+import compiler.emit.print.count_functions (free_function)
 import compiler.emit.print.ownership (dup_of)
 import compiler.emit.print.text (word_slot, Printing, temp, line, unsupported)
 
@@ -13,23 +14,14 @@ fn field(x: Bytes, f: Bytes) -> Bytes = head_field(list_head(), x, f)
 
 fn node_field(x: Bytes, f: Bytes) -> Bytes = head_field(node_head(), x, f)
 
-fn node_word(x: Bytes, k: Bytes) -> Bytes =
-  word_slot(x, Bytes::concat_all([ascii_of_int(container_layouts().trie.first), b" + ", k]))
-
 fn int_field(x: Bytes, f: Bytes) -> Bytes = Bytes::concat_all([b"(int64_t)", field(x, f)])
 
-fn trie_bits() -> Int =
-  range(0, 63).fold(0, |b: Int, k: Int|
-    if 1 << k == container_layouts().trie.width { k } else { b })
+fn items_at() -> Bytes = ascii_of_int(container_layouts().list.items)
 
-fn tail_from(xs: Bytes) -> Bytes =
-  Bytes::concat_all([
-    int_field(xs, b"start"),
-    b" + ",
-    int_field(xs, b"len"),
-    b" - ",
-    int_field(xs, b"tail_len"),
-  ])
+pub fn owner_of(x: Bytes) -> Bytes = word_slot(x, ascii_of_int(container_layouts().list.owner))
+
+fn empty_bytes() -> Bytes = ascii_of_int(header_bytes() + 8 * container_layouts().list.items)
+
 pub fn item_read(
   printing: Printing,
   depth: Int,
@@ -56,26 +48,20 @@ pub fn item_read(
     ]),
   )
 
-pub fn leaf_read(printing: Printing, depth: Int, into: Bytes, xs: Bytes, j: Bytes) -> Printing =
-  line(
-    printing,
-    depth,
-    Bytes::concat_all([into, b" = ", list_leaf_function(), b"(", xs, b", ", j, b");"]),
-  )
-
 pub fn item_function() -> Bytes = b"ply_list_item"
-
-pub fn list_leaf_function() -> Bytes = b"ply_list_leaf"
 
 pub fn empty_list_function() -> Bytes = b"ply_list_room"
 
 pub fn node_function() -> Bytes = b"ply_node"
 
+pub fn writable_list_fn() -> Bytes = b"ply_list_writable"
+
+pub fn opened_list_fn() -> Bytes = b"ply_list_opened"
+
+fn view_fn() -> Bytes = b"ply_list_view"
+
 pub fn empty_list_allocation(room: Bytes, stride: Int) -> Bytes =
   Bytes::concat_all([empty_list_function(), b"(ctx, ", room, b", ", ascii_of_int(stride), b")"])
-
-pub fn trie_node_allocation(kind: Int, stride: Int) -> Bytes =
-  node_allocation(kind, container_layouts().trie.width * stride)
 
 pub fn node_allocation(kind: Int, words: Int) -> Bytes =
   Bytes::concat_all([
@@ -87,30 +73,27 @@ pub fn node_allocation(kind: Int, words: Int) -> Bytes =
     b")",
   ])
 
-fn allocation_helpers() -> Bytes = {
-  let l = container_layouts().list;
+fn allocation_helpers() -> Bytes =
   Bytes::concat_all([
     b"static inline Word ",
     empty_list_function(),
     b"(PlyCtx *ctx, int64_t room, int64_t stride) {\n",
-    b"  if (room < 1) room = 1; if (room > ",
-    ascii_of_int(container_layouts().trie.width),
-    b") room = ",
-    ascii_of_int(container_layouts().trie.width),
-    b";\n",
+    b"  if (room < 1) room = 1;\n",
     b"  Word xs = ply_alloc(ctx, ",
-    ascii_of_int(header_bytes() + 8 * l.tail),
+    empty_bytes(),
     b" + 8 * room * stride);\n",
     b"  ",
     field(b"xs", b"len"),
     b" = 0; ",
-    field(b"xs", b"start"),
-    b" = 0; ",
-    field(b"xs", b"tail_len"),
+    field(b"xs", b"claimed"),
     b" = 0; ",
     field(b"xs", b"room"),
     b" = (uint32_t)room; ",
-    word_slot(b"xs", ascii_of_int(l.root)),
+    field(b"xs", b"first"),
+    b" = ",
+    items_at(),
+    b"; ",
+    owner_of(b"xs"),
     b" = 0;\n",
     b"  return xs;\n",
     b"}\n",
@@ -130,70 +113,136 @@ fn allocation_helpers() -> Bytes = {
     b"  return n;\n",
     b"}\n",
   ])
+
+fn grown_list() -> Bytes = {
+  let least = ascii_of_int(minimum_list_capacity());
+  Bytes::concat_all([
+    b"  if (",
+    field(b"xs", b"len"),
+    b" == ",
+    field(b"xs", b"room"),
+    b") {\n",
+    b"    int64_t n = ",
+    int_field(b"xs", b"len"),
+    b"; int64_t room = 2 * n > ",
+    least,
+    b" ? 2 * n : ",
+    least,
+    b"; if (room > UINT32_MAX) room = UINT32_MAX;\n",
+    b"    Word grown = ",
+    empty_list_function(),
+    b"(ctx, room, stride);\n",
+    b"    memcpy(&",
+    word_slot(b"grown", items_at()),
+    b", &",
+    word_slot(b"xs", items_at()),
+    b", (size_t)(n * stride) * sizeof(Word));\n",
+    b"    ",
+    field(b"grown", b"len"),
+    b" = (uint32_t)n; ",
+    field(b"grown", b"claimed"),
+    b" = (uint32_t)n;\n",
+    b"    ",
+    free_function(),
+    b"(ctx, xs, ",
+    empty_bytes(),
+    b" + 8 * ",
+    int_field(b"xs", b"room"),
+    b" * stride);\n",
+    b"    xs = grown;\n",
+    b"  }\n",
+  ])
 }
 
-pub fn list_helpers() -> Bytes = {
-  let l = container_layouts().list;
-  let width = ascii_of_int(container_layouts().trie.width);
-  let mask = ascii_of_int(container_layouts().trie.width - 1);
-  let bits = ascii_of_int(trie_bits());
-  let walked = Bytes::concat_all([
-    b"int64_t s = 0; while ((INT64_C(",
-    width,
-    b") << s) < h) s += ",
-    bits,
-    b"; for (; s > 0; s -= ",
-    bits,
-    b") n = ",
-    node_word(b"n", Bytes::concat_all([b"((p >> s) & ", mask, b")"])),
-    b";",
-  ]);
+pub fn list_helpers() -> Bytes =
   Bytes::concat_all([
     b"static inline Word *",
     item_function(),
     b"(Word xs, int64_t i, int64_t stride) {\n",
-    b"  int64_t p = ",
-    int_field(b"xs", b"start"),
-    b" + i; int64_t h = ",
-    tail_from(b"xs"),
-    b";\n",
-    b"  if (p >= h) return &",
-    word_slot(b"xs", Bytes::concat_all([ascii_of_int(l.tail), b" + (p - h) * stride"])),
-    b";\n",
-    b"  Word n = ",
-    word_slot(b"xs", ascii_of_int(l.root)),
-    b"; ",
-    walked,
-    b"\n",
     b"  return &",
-    node_word(b"n", Bytes::concat_all([b"(p & ", mask, b") * stride"])),
+    word_slot(b"xs", Bytes::concat_all([field(b"xs", b"first"), b" + i * stride"])),
     b";\n",
-    b"}\n",
-    b"static inline Word ",
-    list_leaf_function(),
-    b"(Word xs, int64_t j) {\n",
-    b"  int64_t h = ",
-    tail_from(b"xs"),
-    b"; int64_t first = ",
-    int_field(b"xs", b"start"),
-    b" / ",
-    width,
-    b"; Word n = ",
-    word_slot(b"xs", ascii_of_int(l.root)),
-    b";\n",
-    b"  if (n == 0 || j < 0 || j >= h / ",
-    width,
-    b" - first) return 0;\n",
-    b"  int64_t p = (first + j) * ",
-    width,
-    b"; ",
-    walked,
-    b"\n",
-    b"  return n;\n",
     b"}\n",
     allocation_helpers(),
+    b"static inline int ",
+    writable_list_fn(),
+    b"(Word xs) {\n",
+    b"  Word o = ",
+    owner_of(b"xs"),
+    b";\n",
+    b"  return ply_obj(xs)->rc == 1 && (!o || ply_obj(o)->rc == 1);\n",
+    b"}\n",
+    b"static inline Word ",
+    view_fn(),
+    b"(PlyCtx *ctx, Word xs, Word owner, int64_t k, int64_t stride) {\n",
+    b"  Word v = ply_alloc(ctx, ",
+    empty_bytes(),
+    b");\n",
+    b"  int64_t n = ",
+    int_field(b"xs", b"len"),
+    b" - k;\n",
+    b"  ",
+    field(b"v", b"len"),
+    b" = (uint32_t)n; ",
+    field(b"v", b"room"),
+    b" = 0; ",
+    field(b"v", b"claimed"),
+    b" = 0;\n",
+    b"  ",
+    field(b"v", b"first"),
+    b" = (xs - v) / 8 + ",
+    field(b"xs", b"first"),
+    b" + k * stride;\n",
+    b"  ",
+    owner_of(b"v"),
+    b" = owner;\n",
+    b"  return v;\n",
+    b"}\n",
+    b"static inline Word ",
+    opened_list_fn(),
+    b"(PlyCtx *ctx, Word xs, PlyDrop copy, int64_t stride) {\n",
+    b"  Word o = ",
+    owner_of(b"xs"),
+    b";\n",
+    b"  Word b = o ? o : xs;\n",
+    b"  int64_t end = (xs - b) / 8 + ",
+    field(b"xs", b"first"),
+    b" - ",
+    items_at(),
+    b" + ",
+    int_field(b"xs", b"len"),
+    b" * stride;\n",
+    b"  if (end == ",
+    int_field(b"b", b"claimed"),
+    b" * stride && ",
+    field(b"b", b"claimed"),
+    b" < ",
+    field(b"b", b"room"),
+    b" && ",
+    b"ply_obj(xs)->rc < UINT32_C(0x80000000) && ply_obj(b)->rc < UINT32_C(0x80000000)) {\n",
+    b"    ",
+    field(b"b", b"claimed"),
+    b" += 1;\n",
+    b"    if (o && ply_obj(xs)->rc == 1) return xs;\n",
+    b"    Word v = ",
+    view_fn(),
+    b"(ctx, xs, b, 0, stride);\n",
+    b"    if (o) { ply_obj(o)->rc += 1; ply_obj(xs)->rc -= 1; }\n",
+    b"    return v;\n",
+    b"  }\n",
+    b"  if (o || ply_obj(xs)->rc != 1 || ",
+    field(b"xs", b"claimed"),
+    b" != ",
+    field(b"xs", b"len"),
+    b") xs = copy(ctx, xs);\n",
+    grown_list(),
+    b"  ",
+    field(b"xs", b"claimed"),
+    b" += 1;\n",
+    b"  return xs;\n",
+    b"}\n",
   ])
-}
+
 pub fn list_rest(
   printing: Printing,
   depth: Int,
@@ -208,21 +257,34 @@ pub fn list_rest(
     _ -> unsupported(b"taking the rest of a value that is not a list", encode_type(ty)),
   };
   let st = list_contents.stride;
-  let node_dup = |x: Bytes|
-    dup_of([WordAt({ at: 0, masked: false, how: Object(list_contents.node) })], [x]);
-  let f = temp(printing);
-  let h = temp(f.printing);
-  let m = temp(h.printing);
+  let m = temp(printing);
   let j = temp(m.printing);
   let w = temp(j.printing);
+  let o = temp(w.printing);
   let at = |x: Bytes, at: Bytes, s: Int|
-    word_slot(x, if st == 1 { Bytes::concat_all([ascii_of_int(l.tail), b" + ", at]) }
-    else { Bytes::concat_all([ascii_of_int(l.tail + s), b" + (", at, b") * ", ascii_of_int(st)]) });
+    word_slot(x, if st == 1 { Bytes::concat_all([ascii_of_int(l.items), b" + ", at]) } else {
+      Bytes::concat_all([ascii_of_int(l.items + s), b" + (", at, b") * ", ascii_of_int(st)])
+    });
   let ws = if st == 1 { [w.name] }
   else { range(0, st).map(|s: Int| Bytes::concat_all([w.name, b"_", ascii_of_int(s)])) };
-  let copied = |from: Bytes|
+  let from = Bytes::concat_all([b"(", k, b") + ", j.name]);
+  line(
+    o.printing,
+    depth,
     Bytes::concat_all([
-      b"for (int64_t ",
+      b"if (ply_obj(",
+      xs,
+      b")->rc == PLY_RC_FRAME) { int64_t ",
+      m.name,
+      b" = ",
+      int_field(xs, b"len"),
+      b" - (",
+      k,
+      b"); ",
+      into,
+      b" = ",
+      empty_list_allocation(m.name, st),
+      b"; for (int64_t ",
       j.name,
       b" = 0; ",
       j.name,
@@ -233,7 +295,7 @@ pub fn list_rest(
       b"++) { ",
       Bytes::concat_all(
         range(0, st).map(|s: Int|
-          Bytes::concat_all([b"Word ", ws.get(s), b" = ", at(xs, from.concat(j.name), s), b"; "])),
+          Bytes::concat_all([b"Word ", ws.get(s), b" = ", at(xs, from, s), b"; "])),
       ),
       spaced(dup_of(list_contents.item, ws)),
       Bytes::concat_all(
@@ -241,68 +303,37 @@ pub fn list_rest(
           Bytes::concat_all([at(into, j.name, s), b" = ", ws.get(s), b"; "])),
       ),
       b"} ",
-    ]);
-  line(
-    w.printing,
-    depth,
-    Bytes::concat_all([
-      b"{ int64_t ",
-      f.name,
-      b" = ",
-      int_field(xs, b"start"),
-      b" + (",
-      k,
-      b"); int64_t ",
-      h.name,
-      b" = ",
-      tail_from(xs),
-      b"; int64_t ",
-      m.name,
-      b"; if (",
-      f.name,
-      b" >= ",
-      h.name,
-      b") { ",
-      m.name,
-      b" = ",
-      int_field(xs, b"len"),
-      b" - (",
-      k,
-      b"); ",
-      into,
-      b" = ",
-      empty_list_allocation(m.name, st),
-      b"; ",
-      copied(Bytes::concat_all([f.name, b" - ", h.name, b" + "])),
-      b"} else { ",
-      m.name,
-      b" = ",
-      int_field(xs, b"tail_len"),
-      b"; ",
-      into,
-      b" = ",
-      empty_list_allocation(int_field(xs, b"room"), st),
-      b"; ",
-      word_slot(into, ascii_of_int(l.root)),
-      b" = ",
-      word_slot(xs, ascii_of_int(l.root)),
-      b"; ",
-      spaced(node_dup(word_slot(into, ascii_of_int(l.root)))),
-      copied(b""),
-      field(into, b"start"),
-      b" = (uint32_t)",
-      f.name,
-      b"; } ",
-      field(into, b"tail_len"),
-      b" = (uint32_t)",
-      m.name,
-      b"; ",
       field(into, b"len"),
-      b" = (uint32_t)(",
-      int_field(xs, b"len"),
-      b" - (",
+      b" = (uint32_t)",
+      m.name,
+      b"; ",
+      field(into, b"claimed"),
+      b" = (uint32_t)",
+      m.name,
+      b"; } else { Word ",
+      o.name,
+      b" = ",
+      owner_of(xs),
+      b" ? ",
+      owner_of(xs),
+      b" : ",
+      xs,
+      b"; ",
+      spaced(
+        dup_of([WordAt({ at: 0, masked: false, how: Object(list_contents.whole) })], [o.name]),
+      ),
+      into,
+      b" = ",
+      view_fn(),
+      b"(ctx, ",
+      xs,
+      b", ",
+      o.name,
+      b", ",
       k,
-      b")); }",
+      b", ",
+      ascii_of_int(st),
+      b"); }",
     ]),
   )
 }
@@ -324,7 +355,7 @@ pub fn stack_list_of_items(
       b"Word ",
       at,
       b"[PLY_HEADER / 8 + ",
-      ascii_of_int(l.tail + n * stride),
+      ascii_of_int(l.items + n * stride),
       b"]; ((PlyObj *)",
       at,
       b")->rc = PLY_RC_FRAME; Word ",
@@ -336,23 +367,25 @@ pub fn stack_list_of_items(
       b" = ",
       ascii_of_int(n),
       b"; ",
-      field(into, b"start"),
-      b" = 0; ",
-      field(into, b"tail_len"),
-      b" = ",
-      ascii_of_int(n),
-      b"; ",
       field(into, b"room"),
       b" = ",
       ascii_of_int(n),
       b"; ",
-      word_slot(into, ascii_of_int(l.root)),
+      field(into, b"claimed"),
+      b" = ",
+      ascii_of_int(n),
+      b"; ",
+      field(into, b"first"),
+      b" = ",
+      ascii_of_int(l.items),
+      b"; ",
+      owner_of(into),
       b" = 0;",
       Bytes::concat_all(
         range(0, n * stride).map(|k: Int|
           Bytes::concat_all([
             b" ",
-            word_slot(into, ascii_of_int(l.tail + k)),
+            word_slot(into, ascii_of_int(l.items + k)),
             b" = ",
             match items.at(k / stride) {
               Some(x) -> match x.at(k % stride) { Some(w) -> w, None -> b"0" },
@@ -373,82 +406,36 @@ pub fn list_of_items(
   stride: Int,
 ) -> Printing / {abort.raise} = {
   let l = container_layouts().list;
-  let width = container_layouts().trie.width;
   let n = items.len();
-  let trie_length = if n <= width { 0 } else { n / width * width };
-  let set = |b: Bytes, from: Int, xs: List<Bytes>|
-    Bytes::concat_all(
-      range(0, xs.len()).map(|k: Int|
-        Bytes::concat_all([
-          word_slot(b, ascii_of_int(from + k)),
-          b" = ",
-          match xs.at(k) { Some(x) -> x, None -> b"0" },
-          b"; ",
-        ])),
-    );
-  let words_of = |xs: List<List<Bytes>>, s: Int|
-    xs.fold([], |accumulator: List<Bytes>, x: List<Bytes>|
-      accumulator.concat(range(0, s).map(|j: Int| match x.at(j) { Some(w) -> w, None -> b"0" })));
-  let node = |q: Printing, kind: Int, xs: List<List<Bytes>>, s: Int| {
-    let t = temp(q);
-    {
-      printing: line(
-        t.printing,
-        depth,
-        Bytes::concat_all([
-          b"Word ",
-          t.name,
-          b" = ",
-          trie_node_allocation(kind, s),
-          b"; ",
-          set(t.name, container_layouts().trie.first, words_of(xs, s)),
-          node_field(t.name, b"len"),
-          b" = ",
-          ascii_of_int(xs.len()),
-          b";",
-        ]),
-      ),
-      name: t.name,
-    }
-  };
-  let grouped = |q: Printing, kind: Int, xs: List<List<Bytes>>, s: Int|
-    range(0, (xs.len() + width - 1) / width).fold(
-      { printing: q, names: [] },
-      |accumulator: { printing: Printing, names: List<Bytes> }, k: Int| {
-        let made = node(accumulator.printing, kind, xs.drop(k * width).take(width), s);
-        { printing: made.printing, names: accumulator.names.push(made.name) }
-      },
-    );
-  let raised = iterate(
-    grouped(printing, container_layouts().trie.leaf, items.take(trie_length), stride),
-    n + 1,
-    |s: { printing: Printing, names: List<Bytes> }|
-      if s.names.len() <= 1 { Stop(s) } else {
-        Continue(
-          grouped(s.printing, container_layouts().trie.branch, s.names.map(|x: Bytes| [x]), 1),
-        )
-      },
-  );
-  let root = match raised.names { [r] -> r, _ -> b"0" };
+  let words_of = items.fold([], |accumulator: List<Bytes>, x: List<Bytes>|
+    accumulator.concat(
+      range(0, stride).map(|j: Int| match x.at(j) { Some(w) -> w, None -> b"0" }),
+    ));
   line(
-    raised.printing,
+    printing,
     depth,
     Bytes::concat_all([
       b"Word ",
       into,
       b" = ",
-      empty_list_allocation(ascii_of_int(if trie_length == 0 { n } else { width }), stride),
+      empty_list_allocation(ascii_of_int(n), stride),
       b"; ",
-      if trie_length == 0 { b"" }
-      else { Bytes::concat_all([word_slot(into, ascii_of_int(l.root)), b" = ", root, b"; "]) },
-      set(into, l.tail, words_of(items.drop(trie_length), stride)),
+      Bytes::concat_all(
+        range(0, words_of.len()).map(|k: Int|
+          Bytes::concat_all([
+            word_slot(into, ascii_of_int(l.items + k)),
+            b" = ",
+            words_of.get(k),
+            b"; ",
+          ])),
+      ),
       field(into, b"len"),
       b" = ",
       ascii_of_int(n),
       b"; ",
-      field(into, b"tail_len"),
+      field(into, b"claimed"),
       b" = ",
-      ascii_of_int(n - trie_length),
+      ascii_of_int(n),
       b";",
     ]),
   )

@@ -17,7 +17,6 @@ pub mod limit;
 pub use expr::{BinOp, render_float};
 
 pub use intty::{Fixed, INT_TYPES, IntegerType};
-pub mod rc;
 pub mod sim;
 mod span;
 pub mod sqlite;
@@ -29,7 +28,6 @@ pub use escape::{Boundary, EscapedHandle, Handle};
 pub use host::{
     Determinism, HostBinding, HostRuntime, HostUse, Pending, RuntimeFactory, ShutdownReport,
 };
-pub use rc::RcStats;
 pub use rust_decimal::Decimal;
 pub use sim::{Seed, SimId, TaskId};
 pub use span::{

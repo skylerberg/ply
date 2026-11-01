@@ -176,6 +176,7 @@ pub struct Heap {
     alloc: Box<Alloc>,
     natives: Vec<*mut Obj>,
     persistent: bool,
+    runtime_blocks: usize,
     scheduling: bool,
     deferred_frees: std::collections::VecDeque<(*mut Obj, usize)>,
     poison_freed: bool,
@@ -390,6 +391,7 @@ impl Heap {
             alloc,
             natives: Vec::new(),
             persistent: false,
+            runtime_blocks: 0,
             scheduling: false,
             deferred_frees: std::collections::VecDeque::new(),
             poison_freed,
@@ -413,6 +415,7 @@ impl Heap {
             self.natives.push(o);
         }
         self.deferred_frees.extend(other.deferred_frees.drain(..));
+        self.runtime_blocks += other.runtime_blocks;
     }
 
     pub(crate) fn swap_blocks(&mut self, blocks: Blocks) -> Blocks {
@@ -441,6 +444,10 @@ impl Heap {
 
     pub fn held(&self) -> usize {
         self.blocks.held()
+    }
+
+    pub fn runtime_blocks(&self) -> usize {
+        self.runtime_blocks
     }
 
     pub(crate) fn program_live_block_count(&self) -> usize {
@@ -486,6 +493,9 @@ impl Heap {
                 made_by_scheduler: self.scheduling,
             })
         };
+        if !self.scheduling {
+            self.runtime_blocks += 1;
+        }
         p
     }
 
@@ -506,6 +516,7 @@ impl Heap {
         }
         self.drop_natives();
         self.blocks.reset();
+        self.runtime_blocks = 0;
         self.deferred_frees.clear();
     }
 }

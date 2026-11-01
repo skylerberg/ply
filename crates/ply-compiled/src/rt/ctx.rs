@@ -27,6 +27,7 @@ pub struct Ctx {
     pub performed_end: i64,
     pub task: i64,
     pub alloc: *mut crate::heap::Alloc,
+    pub constants: *const AtomicI64,
     pub(super) deadline: Option<std::time::Instant>,
     pub heap: Heap,
     pub tables: Arc<Tables>,
@@ -113,6 +114,7 @@ impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
         let mut heap = Heap::new();
         let alloc = heap.alloc();
+        let constants = tables.memo.as_ptr();
         Ctx {
             failed: 0,
             stack_floor: std::sync::atomic::AtomicUsize::new(0),
@@ -134,6 +136,7 @@ impl Ctx {
             performed_end: 0,
             task: 0,
             alloc,
+            constants,
             grown: 0,
             deadline: None,
             time_budget_ms: 0,

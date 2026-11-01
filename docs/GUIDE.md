@@ -1105,9 +1105,11 @@ cannot show to return, `ply check --types` prints the reason.
 ### 6.10 Updates in place
 
 Values never change, but an update reuses memory when nothing else can see the old value.
-`xs.push(x)` appends in place when the caller has the only reference to `xs`. Otherwise it copies
-only the nodes along one path of the tree that stores the list, not the whole list. `List::set`,
-`Array::set`, `Map::insert`, `++` and record updates work the same way.
+`xs.push(x)` appends in place when the caller has the only reference to `xs`. When something else
+refers to `xs`, it takes the next free slot and shares the items, and it copies the list only if
+another push already took that slot. `List::set`, `Array::set` and record updates copy whenever
+something else refers to the value, and `Map::insert` copies one path of the map's tree. A rest,
+`[x, ..rest]`, shares its list instead of copying it.
 
 An update copies when something else still refers to the value:
 

@@ -2,19 +2,18 @@ import std.list
 import compiler.syntax.parsing (Span, dummy_span)
 import compiler.emit.code (Code, CodeApply, NBuiltin)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
-                             Field, int_type, bool_type, unit_type, option_type, record_fields)
+                             Field, int_type, bool_type, unit_type, option_type, record_fields,
+                             list_type)
 import compiler.check.known (option_item, map_name, array_type, columns_type, some_constructor,
                              none_constructor)
 import compiler.check.resolve.tables (qualify)
-import compiler.emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt,
-                             NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap,
-                             ChildSwap, TailStart, Spill, NewBranch, MapRoot, NodeCount, MapHeight,
-                             NodeKey, NodeValue, NodeKid, ChildMaxKey, KidSize, NewLeaf,
-                             NewMapBranch, PairPut, PairSet, PairTake, LeafSplit, BranchSplit,
-                             KidOut, KidRestore, KidPut, KidDrop, MapSwap, Recast, Pointer,
-                             PointerSum, CaseLayout, Inline, classes, words, intrinsic_named)
+import compiler.emit.layout (Intrinsic, OfMap, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue,
+                             NodeKid, ChildMaxKey, KidSize, NewLeaf, NewMapBranch, PairPut, PairSet,
+                             PairTake, LeafSplit, BranchSplit, KidOut, KidRestore, KidPut, KidDrop,
+                             MapSwap, Recast, Pointer, PointerSum, CaseLayout, Inline, classes,
+                             words, intrinsic_named)
 import compiler.emit.representations (Definition, has_variables, layout_variables, numeric_sum,
-                                      pointer_layout)
+                                      pointer_layout, type_variables)
 import compiler.emit.output (Layout)
 import compiler.emit.roots (builtin_helper, generated_builtin)
 import compiler.emit.release (released_variables)
@@ -29,8 +28,8 @@ import compiler.emit.lower.evidence (function_value_evidence, builtin_effects)
 import compiler.emit.typed_ir.containers (ContainerOperation, NodeIntrinsic, Length, ArrayLength,
                                           InBounds, ArrayNew, ArraySet, ArrayOfList, ArrayGet,
                                           ColumnsNew, ColumnsSet, ColumnsOfList, ColumnsGet,
-                                          ColumnField, ColumnOf, ItemAt, Rest, LeafOf, WithCapacity,
-                                          Position, Element)
+                                          ColumnField, ListInBounds, ListPush, ListSet, ColumnOf,
+                                          ItemAt, Rest, WithCapacity, Position, Element)
 import compiler.emit.lower.module_context (imported_target, qualified, from_import, module_import,
                                            builtin_call_types)
 import compiler.emit.lower.representation (representation_of, layout_leaves)
@@ -76,7 +75,7 @@ fn typed_builtin(
         ),
       Some(return_type) -> intrinsic_call(context, st, intrinsic, args, return_type, at),
     },
-    None -> match resolved(context, name) {
+    None -> match if list_written_in_place(name) { Some(name) } else { resolved(context, name) } {
       None ->
         unreachable(b"an imported name that is neither a definition nor a builtin: ".concat(name)),
       Some(b) -> if b == b"assert_eq" { asserted(context, st, args, at) }
@@ -374,19 +373,6 @@ fn container_builtin_call(
     read_in_place(st, Length, args, int_type(), AsInt, at)
   } else if name == b"Array::len" && args.len() == 1 {
     read_in_place(st, ArrayLength, args, int_type(), AsInt, at)
-  } else if name == b"ListNode::leaf_of" && args.len() == 2 {
-    match f.return_type {
-      Some(return_type) -> if pointer_option(context, return_type) {
-        represented_as(
-          read_in_place(st, LeafOf, args, return_type, AsWord, at),
-          representation_of(context.setting, return_type),
-          at,
-        )
-      } else {
-        unreachable(b"a read of a list node's leaf does not return an `Option` of one pointer")
-      },
-      None -> unreachable(b"a read of a list node's leaf has no type recorded by type checking"),
-    }
   } else if name == b"List::with_capacity" && args.len() == 1 {
     match ((f.return_type, args)) {
       (Some(return_type), [n]) -> empty_list_with_capacity(context, st, return_type, n, at),
@@ -408,30 +394,134 @@ fn container_builtin_call(
   } else if name == b"Bytes::position" { bytes_position(context, st, args, callee, at) }
   else if name == b"bracket" || name == b"?hold_bracket" {
     bracketed(context, st, args, callee, at)
-  } else if name.starts_with(b"Array::") || name.starts_with(b"Columns::") {
-    match f.args.at(0) {
-      None ->
-        unreachable(b"an array builtin has no type recorded by the type checker: ".concat(name)),
-      Some(t) -> match if name.starts_with(b"Array::") {
-          match element_of(context, t) { Some(e) -> Some([e]), None -> None }
-        } else { columns_of(context, t) } {
-        None -> if has_open_layout(t) {
-          open_layout_builtin(context, note_element_layout(st, t), name, args, f, at)
-        } else {
-          unreachable(
-            b"an array builtin has elements with a memory layout the compiler cannot generate code for: ".concat(
-              name,
-            ),
-          )
-        },
-        Some(es) -> if name.starts_with(b"Array::") {
-          array_builtin_call(context, note_block_layout(st, t), name, args, t, es, f, at)
-        } else {
-          columns_builtin_call(context, note_block_layout(st, t), name, args, t, es, f, at)
-        },
+  } else if name.starts_with(b"Array::") || name.starts_with(b"Columns::")
+      || list_written_in_place(name) { laid_out_builtin(context, st, name, args, f, at) }
+  else if name.starts_with(b"ListNode::") { retired_list_call(context, st, name, args, callee, at) }
+  else { runtime_builtin_call(context, st, name, args, f, callee, at) }
+
+fn retired_list_call(
+  context: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  callee: Code,
+  at: Span,
+) -> LoweredValue / {abort.raise} =
+  match builtin_call_types(context.setting, Some(read_typed(callee)), name) {
+    Some(t) -> left_to_callers(context, st, name, args, t, at),
+    None -> unreachable(b"a retired list extern at no type the checker recorded: ".concat(name)),
+  }
+
+fn list_written_in_place(name: Bytes) -> Bool =
+  [b"List::at", b"List::push", b"List::set"].contains(name)
+
+pub fn list_pushed(
+  context: Context,
+  st: Lowering,
+  out: Arg,
+  x: Arg,
+  list: Type,
+  at: Span,
+) -> LoweredValue / {abort.raise} =
+  match list {
+    NamedType(c) ->
+      laid_out_builtin(
+        context,
+        st,
+        b"List::push",
+        [out, x],
+        { return_type: Some(list), args: c.args },
+        at,
+      ),
+    _ -> unreachable(b"a push onto what is no list"),
+  }
+
+fn laid_out_builtin(
+  context: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  f: BuiltinCallTypes,
+  at: Span,
+) -> LoweredValue / {abort.raise} =
+  match f.args.at(0) {
+    None -> unreachable(b"a container's builtin at no type the checker recorded: ".concat(name)),
+    Some(t) -> match if name.starts_with(b"Columns::") { columns_of(context, t) }
+      else { match element_of(context, t) { Some(e) -> Some([e]), None -> None } } {
+      None -> if has_variables(t) {
+        open_layout_builtin(context, layouts_needed(st, t), name, args, f, at)
+      } else {
+        unreachable(b"a container's elements laid out no way the emitter knows: ".concat(name))
       },
-    }
-  } else { runtime_builtin_call(context, st, name, args, f, callee, at) }
+      Some(es) -> if name.starts_with(b"Array::") {
+        array_builtin_call(context, note_block_layout(st, t), name, args, t, es, f, at)
+      } else if name.starts_with(b"List::") {
+        list_builtin_call(context, note_block_layout(st, t), name, args, t, es, f, at)
+      } else { columns_builtin_call(context, note_block_layout(st, t), name, args, t, es, f, at) },
+    },
+  }
+
+fn layouts_needed(st: Lowering, t: Type) -> Lowering =
+  type_variables(t).fold(st, |accumulator: Lowering, v: Int|
+    with_need(accumulator, { var: v, reads: Layout }))
+
+fn list_builtin_call(
+  context: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  ty: Type,
+  es: List<Element>,
+  f: BuiltinCallTypes,
+  at: Span,
+) -> LoweredValue / {abort.raise} =
+  match es.at(0) {
+    None -> unreachable(b"a list whose items lay out as nothing"),
+    Some(e) -> {
+      let held = representation_of(context.setting, ty);
+      let list = list_type(ty);
+      if name == b"List::at" {
+        found_at(
+          context,
+          st,
+          args,
+          ty,
+          return_type_or(f, option_type(ty)),
+          ListInBounds,
+          ItemAt,
+          false,
+          None,
+          at,
+        )
+      } else if name == b"List::push" {
+        container_called(
+          context,
+          st,
+          ListPush(e),
+          args,
+          [AsWord, held],
+          [true, true],
+          true,
+          false,
+          list,
+          at,
+        )
+      } else if name == b"List::set" {
+        container_called(
+          context,
+          st,
+          ListSet(e),
+          args,
+          [AsWord, AsInt, held],
+          [true, false, true],
+          true,
+          true,
+          list,
+          at,
+        )
+      } else { unreachable(b"a list's builtin no emitted code writes: ".concat(name)) }
+    },
+  }
 
 fn open_layout_builtin(
   context: Context,
@@ -656,10 +746,6 @@ pub fn intrinsic_call(
     } else {
       let object = match args.at(0) { Some(a) -> type_of(a), None -> ty };
       let laid_types = match intrinsic {
-        OfList(_) -> if items.read { [ty] }
-        else if items.at.len() > 0 || intrinsic == OfList(Spill) {
-          match object { NamedType(c) -> c.args.take(1), _ -> [] }
-        } else { [] },
         OfMap(_) -> match object {
           NamedType(c) -> if c.name == map_name() { [] } else { c.args },
           _ -> [],
@@ -687,8 +773,7 @@ pub fn intrinsic_call(
             },
           },
       );
-      let copies = l.operands.at(0) == Some(Consumed) && intrinsic != OfList(TailStart)
-        && intrinsic != Recast;
+      let copies = l.operands.at(0) == Some(Consumed) && intrinsic != Recast;
       let returned = bound_as(
         if copies {
           match args.at(0) {
@@ -730,12 +815,6 @@ type IntrinsicItems = { read: Bool, at: List<Int> }
 
 fn intrinsic_items(intrinsic: Intrinsic) -> IntrinsicItems =
   match intrinsic {
-    OfList(TailAt) -> { read: true, at: [] },
-    OfList(LeafAt) -> { read: true, at: [] },
-    OfList(TailPush) -> { read: false, at: [1] },
-    OfList(TailStart) -> { read: false, at: [1] },
-    OfList(TailSet) -> { read: false, at: [2] },
-    OfList(LeafSet) -> { read: false, at: [2] },
     OfMap(NodeKey) -> { read: true, at: [] },
     OfMap(NodeValue) -> { read: true, at: [] },
     OfMap(ChildMaxKey) -> { read: true, at: [] },
@@ -755,21 +834,6 @@ fn intrinsic_shape(intrinsic: Intrinsic) -> IntrinsicShape = {
     { operands: operands, result: Plain(AsWord), owned: true };
   let record = |operands: List<Operand>| { operands: operands, result: Fields, owned: true };
   match intrinsic {
-    OfList(ListStart) -> read([Read], AsInt),
-    OfList(TailLen) -> read([Read], AsInt),
-    OfList(NodeLen) -> read([Read], AsInt),
-    OfList(ListRoot) -> read([Read], AsWord),
-    OfList(TailAt) -> item,
-    OfList(LeafAt) -> item,
-    OfList(KidAt) -> read([Read, Index], AsWord),
-    OfList(TailPush) -> written([Consumed, Consumed]),
-    OfList(TailStart) -> written([Consumed, Consumed]),
-    OfList(TailSet) -> written([Consumed, Index, Consumed]),
-    OfList(LeafSet) -> written([Consumed, Index, Consumed]),
-    OfList(NewBranch) -> made,
-    OfList(RootSwap) -> record([Consumed, ConsumedOption]),
-    OfList(ChildSwap) -> record([Consumed, Index, ConsumedOption]),
-    OfList(Spill) -> record([Consumed]),
     OfMap(MapRoot) -> read([Read], AsWord),
     OfMap(NodeCount) -> read([Read], AsInt),
     OfMap(MapHeight) -> read([Read], AsInt),
@@ -827,7 +891,18 @@ fn array_builtin_call(
       let representation = representation_of(context.setting, ty);
       let array = array_type(ty);
       if name == b"Array::at" {
-        found_at(context, st, args, ty, return_type_or(f, option_type(ty)), ArrayGet(e), None, at)
+        found_at(
+          context,
+          st,
+          args,
+          ty,
+          return_type_or(f, option_type(ty)),
+          InBounds,
+          ArrayGet(e),
+          true,
+          None,
+          at,
+        )
       } else if name == b"Array::new" {
         container_called(
           context,
@@ -836,6 +911,7 @@ fn array_builtin_call(
           args,
           [AsInt, representation],
           [false, true],
+          true,
           true,
           array,
           at,
@@ -849,11 +925,12 @@ fn array_builtin_call(
           [AsWord, AsInt, representation],
           [true, false, true],
           true,
+          true,
           array,
           at,
         )
       } else if name == b"Array::of_list" {
-        container_called(context, st, ArrayOfList(e), args, [AsWord], [true], true, array, at)
+        container_called(context, st, ArrayOfList(e), args, [AsWord], [true], true, true, array, at)
       } else if name == b"Array::get" {
         container_called(
           context,
@@ -863,6 +940,7 @@ fn array_builtin_call(
           [AsWord, AsInt],
           [false, false],
           false,
+          true,
           ty,
           at,
         )
@@ -904,7 +982,9 @@ fn columns_builtin_call(
       args,
       ty,
       return_type_or(f, option_type(ty)),
+      InBounds,
       ColumnsGet(es),
+      true,
       Some(first),
       at,
     )
@@ -916,6 +996,7 @@ fn columns_builtin_call(
       args,
       [AsInt, representation],
       [false, true],
+      true,
       true,
       columns,
       at,
@@ -929,11 +1010,23 @@ fn columns_builtin_call(
       [AsWord, AsInt, representation],
       [true, false, true],
       true,
+      true,
       columns,
       at,
     )
   } else if name == b"Columns::of_list" {
-    container_called(context, st, ColumnsOfList(es), args, [AsWord], [true], true, columns, at)
+    container_called(
+      context,
+      st,
+      ColumnsOfList(es),
+      args,
+      [AsWord],
+      [true],
+      true,
+      true,
+      columns,
+      at,
+    )
   } else if name == b"Columns::get" {
     container_called(
       context,
@@ -943,6 +1036,7 @@ fn columns_builtin_call(
       [AsWord, AsInt],
       [false, false],
       false,
+      true,
       ty,
       at,
     )
@@ -960,6 +1054,7 @@ fn container_called(
   reps: List<Representation>,
   takes: List<Bool>,
   owned: Bool,
+  fails: Bool,
   result: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
@@ -984,7 +1079,7 @@ fn container_called(
       OperationCall({
         operation: OfContainers(container_operation),
         args: operands.args,
-        uses: { takes: takes, owned: owned, fails: true, suspends: false },
+        uses: { takes: takes, owned: owned, fails: fails, suspends: false },
       }),
       at,
     )
@@ -996,7 +1091,9 @@ fn found_at(
   args: List<Arg>,
   item: Type,
   result: Type,
+  inside_test: ContainerOperation,
   get: ContainerOperation,
+  fails: Bool,
   column: Option<Type>,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
@@ -1013,7 +1110,7 @@ fn found_at(
         bool_type(),
         AsBool,
         OperationCall({
-          operation: OfContainers(InBounds),
+          operation: OfContainers(inside_test),
           args: [tested.arg, iw.arg],
           uses: { takes: [false, false], owned: false, fails: false, suspends: false },
         }),
@@ -1026,7 +1123,7 @@ fn found_at(
         OperationCall({
           operation: OfContainers(get),
           args: [xw.arg, iw.arg],
-          uses: { takes: [false, false], owned: false, fails: true, suspends: false },
+          uses: { takes: [false, false], owned: false, fails: fails, suspends: false },
         }),
         at,
       );

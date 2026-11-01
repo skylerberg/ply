@@ -266,9 +266,10 @@ pub enum Rejected {
     SecretDecode,
     SecretEncode,
     SecretRsaJwk,
+    ListSet,
 }
 
-pub const REJECTED: [Rejected; 26] = [
+pub const REJECTED: [Rejected; 27] = [
     Rejected::ArrayNew,
     Rejected::ColumnsNew,
     Rejected::ArrayOfList,
@@ -295,6 +296,7 @@ pub const REJECTED: [Rejected; 26] = [
     Rejected::SecretDecode,
     Rejected::SecretEncode,
     Rejected::SecretRsaJwk,
+    Rejected::ListSet,
 ];
 
 impl Rejected {
@@ -326,6 +328,7 @@ impl Rejected {
             Rejected::SecretDecode => "Secret::decode",
             Rejected::SecretEncode => "Secret::encode",
             Rejected::SecretRsaJwk => "Secret::rsa_jwk",
+            Rejected::ListSet => "List::set",
         }
     }
 
@@ -377,9 +380,11 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
         | Rejected::ColumnsNew
         | Rejected::ArrayOfList
         | Rejected::ColumnsOfList => said::array_length(site, name, a.0),
-        Rejected::ArrayGet | Rejected::ArraySet | Rejected::ColumnsGet | Rejected::ColumnsSet => {
-            said::out_of_range(site, name, a.0, len(b), "elements")
-        }
+        Rejected::ArrayGet
+        | Rejected::ArraySet
+        | Rejected::ColumnsGet
+        | Rejected::ColumnsSet
+        | Rejected::ListSet => said::out_of_range(site, name, a.0, len(b), "elements"),
         Rejected::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
         Rejected::BytesU32Le => {
             said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes")
@@ -479,6 +484,4 @@ pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     ctx.fail(d);
 }
 
-pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, in_place: i64, copied: i64) {
-    ply_core::rc::record_update(in_place != 0, copied as usize, Span::DUMMY);
-}
+pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, _in_place: i64, _copied: i64) {}

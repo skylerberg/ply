@@ -7,15 +7,12 @@ import compiler.check.known (array_type, columns_type)
 import compiler.emit.representations (layout_of, pointer_layout, known_layout, no_constructors)
 import compiler.emit.c (int_literal)
 import compiler.emit.typing (unknown_type)
-import compiler.emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt,
-                             NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap,
-                             ChildSwap, TailStart, Spill, NewBranch, MapRoot, NodeCount, MapHeight,
-                             NodeKey, NodeValue, NodeKid, ChildMaxKey, KidSize, NewLeaf,
-                             NewMapBranch, PairPut, PairSet, PairTake, LeafSplit, BranchSplit,
-                             KidOut, KidRestore, KidPut, KidDrop, MapSwap, Recast,
-                             container_layouts, header_bytes, words, raw_sum, head_field,
-                             head_words, length_head, text_head, list_head, node_head, map_head,
-                             array_head)
+import compiler.emit.layout (Intrinsic, OfMap, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue,
+                             NodeKid, ChildMaxKey, KidSize, NewLeaf, NewMapBranch, PairPut, PairSet,
+                             PairTake, LeafSplit, BranchSplit, KidOut, KidRestore, KidPut, KidDrop,
+                             MapSwap, Recast, container_layouts, header_bytes, words, raw_sum,
+                             head_field, head_words, length_head, text_head, list_head, node_head,
+                             map_head, array_head)
 import compiler.emit.keys (Root, Copy)
 import compiler.emit.output (CallAt)
 import compiler.emit.release (field_types, root_of, layout_parts, form_parts)
@@ -26,13 +23,13 @@ import compiler.emit.typed_ir (local_var, reps_of, Representation, AsInt, AsBool
                                ListAllocation, OperationSignature, Convention, OwnedParam,
                                OwnedResult, is_refcounted, variable_text, allocation_text,
                                operand_representation, is_boxed, base_allocation)
-import compiler.emit.layout (BranchLayout, branch_layout, rejection, minimum_list_capacity,
-                             array_limit)
+import compiler.emit.layout (BranchLayout, branch_layout, rejection, array_limit)
 import compiler.emit.typed_ir.containers (ContainerOperation, NodeIntrinsic, Length, ArrayLength,
                                           InBounds, ArrayNew, ArraySet, ArrayOfList, ArrayGet,
                                           ColumnsNew, ColumnsSet, ColumnsOfList, ColumnsGet,
-                                          ColumnField, ColumnOf, ItemAt, Rest, LeafOf, WithCapacity,
-                                          Position, CopyOut, Retain, Element)
+                                          ColumnField, ColumnOf, ListInBounds, ItemAt, ListPush,
+                                          ListSet, Rest, WithCapacity, Position, CopyOut, Retain,
+                                          Element)
 import compiler.emit.print.text (operand, word_slot, Printing, InstructionContext, empty_printing,
                                  line, pad, pieces, temp, named, name_of, arg_text, assigned,
                                  source_position, fails_when, check, zero, part_names, unsupported,
@@ -44,12 +41,11 @@ import compiler.emit.print.value_printing (c_type, c_types, as_word, word_as, wo
                                            values_read, layout_dups, layout_retain_at)
 import compiler.emit.print.ownership (Fragment, released, duped, parts_released, dup_of,
                                       fragment_line)
-import compiler.emit.print.lists (item_read, leaf_read, list_rest, list_of_items,
-                                  empty_list_allocation, trie_node_allocation, node_allocation,
-                                  stack_list_of_items)
+import compiler.emit.print.lists (item_read, list_rest, list_of_items, empty_list_allocation,
+                                  node_allocation, stack_list_of_items, item_function,
+                                  writable_list_fn, opened_list_fn)
 import compiler.emit.print.strings (taken_printed, bytes_of)
 import compiler.emit.print.calling (typed_callee, typed_convention, convention_of)
-import compiler.emit.print.unit_header (writable_function)
 import compiler.emit.print.count_functions (allocates, duplicate_function, release_function,
                                             free_function, call_text, call_start, calls, counts_any)
 
@@ -166,6 +162,21 @@ pub fn container_operation(
           c_type(v.representation),
           Bytes::concat_all([b"(uint64_t)", index, b" < (uint64_t)", array_len(object)]),
         ),
+      ListInBounds ->
+        assigned(
+          printing,
+          p.depth,
+          v,
+          c_type(v.representation),
+          Bytes::concat_all([
+            b"(uint64_t)",
+            index,
+            b" < (uint64_t)",
+            head_field(length_head(), object, b"len"),
+          ]),
+        ),
+      ListPush(e) -> list_pushed(p, printing, v, e, args),
+      ListSet(e) -> list_set(p, printing, v, e, args),
       NodeIntrinsic(i) -> intrinsic_printed(p, printing, v, i, args),
       Retain -> retained_printed(p, printing, v, object),
       ArrayNew(e) -> array_new(p, printing, v, e, args),
@@ -195,27 +206,26 @@ pub fn container_operation(
           values_read(|j: Int| slot_at(w.name, j), c_values_of(v.representation)),
         )
       },
-      LeafOf -> {
-        let n = named(printing, v);
-        leaf_read(
-          line(
-            n.printing,
-            p.depth,
-            Bytes::concat_all([c_type(v.representation), b" ", n.name, b";"]),
-          ),
-          p.depth,
-          n.name,
-          object,
-          index,
-        )
-      },
       WithCapacity ->
         assigned(
           printing,
           p.depth,
           v,
           c_type(v.representation),
-          empty_list_allocation(object, item_element(printing, element_type(v.ty)).stride),
+          empty_list_allocation(
+            Bytes::concat_all([
+              b"(",
+              object,
+              b" < ",
+              ascii_of_int(array_limit()),
+              b" ? ",
+              object,
+              b" : ",
+              ascii_of_int(array_limit()),
+              b")",
+            ]),
+            item_element(printing, element_type(v.ty)).stride,
+          ),
         ),
       Rest -> {
         let n = named(printing, v);
@@ -302,15 +312,6 @@ fn strided_set(
 pub fn item_slots(object: Bytes, from: Int, k: Bytes, e: Element) -> List<Bytes> =
   range(0, e.stride).map(|j: Int| item_slot(object, from, k, e, j))
 
-fn item_values(object: Bytes, from: Int, k: Bytes, e: Element, r: Representation) -> List<Bytes> =
-  values_read(|j: Int| item_slot(object, from, k, e, j), c_values_of(r))
-
-fn item_set(printing: Printing, object: Bytes, from: Int, k: Bytes, e: Element, x: Arg) -> Bytes =
-  strided_set(printing, object, from, k, e.stride, e, x)
-
-fn item_words(n: Bytes, e: Element) -> Bytes =
-  if e.stride == 1 { n } else { Bytes::concat_all([n, b" * ", ascii_of_int(e.stride)]) }
-
 fn intrinsic_printed(
   p: InstructionContext,
   printing: Printing,
@@ -323,18 +324,15 @@ fn intrinsic_printed(
   let i = operand(printing, args, 1);
   let raw = |e: Bytes| assigned(printing, p.depth, v, c_type(v.representation), e);
   let read = |slot: Bytes| raw(word_as(slot, v.representation));
-  let lh = |w: Bytes, f: Bytes| head_field(list_head(), w, f);
   let nh = |w: Bytes, f: Bytes| head_field(node_head(), w, f);
   let int_of = |field: Bytes| raw(Bytes::concat_all([b"(int64_t)", field]));
-  let first = laid.trie.first;
+  let first = laid.tree.first;
   let made = |kind: Int, words: Int|
     assigned(printing, p.depth, v, c_type(v.representation), node_allocation(kind, words));
   let assigned_printing = assigned(printing, p.depth, v, c_type(v.representation), o);
   let a = name_of(assigned_printing, v);
   let at = |k: Bytes| word_slot(a, k);
-  let written = |text: Bytes| line(assigned_printing, p.depth, text);
-  let owned = |copied: Option<Bytes>|
-    copy_unless_unique(assigned_printing, p.depth, a, operand_type(args, 0), copied);
+  let owned = || copy_unless_unique(assigned_printing, p.depth, a, operand_type(args, 0));
   let shifted = |from: Bytes, n: Bytes, by: Bytes|
     Bytes::concat_all([
       b"memmove(&",
@@ -377,133 +375,8 @@ fn intrinsic_printed(
       parts_released(set, layout_parts(printing.constructors, ty, e.layout, 0), olds.names),
     )
   };
-  let item = || item_element(printing, element_type(node));
-  let item_replaced = |q: Printing, from: Int, k: Bytes, x: Arg| {
-    let e = item();
-    replaced(q, from, k, e.stride, e, element_type(node), x)
-  };
   let pl = || pair_layout(printing, if args.len() == 0 { v.ty } else { node });
-  let pairs = || Some(Bytes::concat_all([ascii_of_int(pl().pair), b" * (int64_t)", nh(a, b"len")]));
   match intrinsic {
-    OfList(ListStart) -> int_of(lh(o, b"start")),
-    OfList(TailLen) -> int_of(lh(o, b"tail_len")),
-    OfList(NodeLen) -> int_of(nh(o, b"len")),
-    OfList(ListRoot) -> raw(word_slot(o, ascii_of_int(laid.list.root))),
-    OfList(TailAt) ->
-      parts_declared(
-        p,
-        printing,
-        v,
-        item_values(o, laid.list.tail, i, item_element(printing, v.ty), v.representation),
-      ),
-    OfList(LeafAt) ->
-      parts_declared(
-        p,
-        printing,
-        v,
-        item_values(o, first, i, item_element(printing, v.ty), v.representation),
-      ),
-    OfList(KidAt) -> read(word_slot(o, offset_by(first, i))),
-    OfList(NewBranch) ->
-      assigned(
-        printing,
-        p.depth,
-        v,
-        c_type(v.representation),
-        trie_node_allocation(laid.trie.branch, 1),
-      ),
-    OfList(TailPush) -> {
-      let e = item();
-      let g = temp(assigned_printing);
-      let opened = line(
-        g.printing,
-        p.depth,
-        Bytes::concat_all([
-          b"{ int in_place = ply_obj(",
-          a,
-          b")->rc == 1; int64_t n = (int64_t)",
-          lh(a, b"tail_len"),
-          b";",
-        ]),
-      );
-      let copy = copied(opened, p.depth + 1, a, operand_type(args, 0));
-      let moved = Bytes::concat_all([
-        b"if (n == (int64_t)",
-        lh(a, b"room"),
-        b") { Word ",
-        g.name,
-        b" = ",
-        empty_list_allocation(
-          Bytes::concat_all([
-            b"(2 * n > ",
-            ascii_of_int(minimum_list_capacity()),
-            b" ? 2 * n : ",
-            ascii_of_int(minimum_list_capacity()),
-            b")",
-          ]),
-          e.stride,
-        ),
-        b"; ",
-        word_slot(g.name, ascii_of_int(laid.list.root)),
-        b" = ",
-        word_slot(a, ascii_of_int(laid.list.root)),
-        b"; ",
-        Bytes::concat_all(
-          [b"start", b"len", b"tail_len"].map(|f: Bytes|
-            Bytes::concat_all([lh(g.name, f), b" = ", lh(a, f), b"; "])),
-        ),
-        b"memcpy(&",
-        word_slot(g.name, ascii_of_int(laid.list.tail)),
-        b", &",
-        word_slot(a, ascii_of_int(laid.list.tail)),
-        b", (size_t)",
-        item_words(b"n", e),
-        b" * sizeof(Word)); ",
-        call_text(free_function(), [
-          b"ctx",
-          a,
-          ascii_of_int(header_bytes() + 8 * laid.list.tail).concat(b" + 8 * ").concat(
-            item_words(b"n", e),
-          ),
-        ]),
-        b"; ",
-        a,
-        b" = ",
-        g.name,
-        b"; }",
-      ]);
-      let grown = line(
-        line(copy, p.depth + 1, moved),
-        p.depth + 1,
-        b"rt_note_update_p(ctx, in_place, in_place ? 0 : n); }",
-      );
-      line(
-        grown,
-        p.depth,
-        Bytes::concat_all([
-          item_set(printing, a, laid.list.tail, lh(a, b"tail_len"), e, operand_arg(args, 1)),
-          b" ",
-          lh(a, b"tail_len"),
-          b" += 1; ",
-          lh(a, b"len"),
-          b" += 1;",
-        ]),
-      )
-    },
-    OfList(TailStart) ->
-      written(
-        Bytes::concat_all([
-          item_set(printing, a, laid.list.tail, b"0", item(), operand_arg(args, 1)),
-          b" ",
-          lh(a, b"tail_len"),
-          b" = 1; ",
-          lh(a, b"len"),
-          b" += 1;",
-        ]),
-      ),
-    OfList(TailSet) ->
-      item_replaced(owned(Some(lh(a, b"tail_len"))), laid.list.tail, i, operand_arg(args, 2)),
-    OfList(LeafSet) -> item_replaced(owned(Some(nh(a, b"len"))), first, i, operand_arg(args, 2)),
     OfMap(MapRoot) -> raw(word_slot(o, ascii_of_int(laid.map.root))),
     OfMap(MapHeight) -> int_of(head_field(map_head(), o, b"height")),
     OfMap(NodeCount) -> int_of(nh(o, b"len")),
@@ -538,7 +411,7 @@ fn intrinsic_printed(
       let l = pl();
       let ps = ascii_of_int(l.pair);
       line(
-        owned(pairs()),
+        owned(),
         p.depth,
         Bytes::concat_all([
           shifted(
@@ -558,7 +431,7 @@ fn intrinsic_printed(
     OfMap(PairSet) -> {
       let l = pl();
       let keyed = replaced(
-        owned(pairs()),
+        owned(),
         first,
         i,
         l.pair,
@@ -579,7 +452,7 @@ fn intrinsic_printed(
     OfMap(KidRestore) -> {
       let l = pl();
       let maxed = replaced(
-        owned(None),
+        owned(),
         l.branch.keys,
         i,
         l.key.stride,
@@ -607,7 +480,7 @@ fn intrinsic_printed(
       let ks = l.key.stride;
       let n = after(b"");
       line(
-        owned(None),
+        owned(),
         p.depth,
         Bytes::concat_all([
           shifted(offset_by(first, i), n, b"1"),
@@ -637,10 +510,7 @@ fn intrinsic_printed(
       let ks = l.key.stride;
       let n = after(b" - 1");
       let next = index.concat(b" + 1");
-      let kid = fragment_line(
-        p.depth,
-        released(owned(None), node, AsWord, [at(offset_by(first, i))]),
-      );
+      let kid = fragment_line(p.depth, released(owned(), node, AsWord, [at(offset_by(first, i))]));
       let key = fragment_line(
         p.depth,
         parts_released(
@@ -685,10 +555,9 @@ fn record_printed(
   let a = container_temp.name;
   let i = operand(printing, args, 1);
   let index = Bytes::concat_all([b"(", i, b")"]);
-  let lh = |f: Bytes| head_field(list_head(), a, f);
   let nh = |w: Bytes, f: Bytes| head_field(node_head(), w, f);
   let at = |k: Bytes| word_slot(a, k);
-  let first = laid.trie.first;
+  let first = laid.tree.first;
   let pairs = || pair_layout(printing, operand_type(args, 0));
   let started = copy_unless_unique(
     line(
@@ -699,12 +568,6 @@ fn record_printed(
     d,
     a,
     operand_type(args, 0),
-    match operation {
-      OfList(Spill) -> Some(lh(b"tail_len")),
-      OfMap(PairTake) ->
-        Some(Bytes::concat_all([ascii_of_int(pairs().pair), b" * (int64_t)", nh(a, b"len")])),
-      _ -> None,
-    },
   );
   let whole = |name: Bytes, word: Bytes| { name: name, words: [word], item: false };
   let took = |text: (Bytes) -> Bytes, fields: (Bytes) -> List<ResultField>| {
@@ -756,66 +619,6 @@ fn record_printed(
       |r: Bytes| [whole(b"left", a), whole(b"right", r)],
     );
   match operation {
-    OfList(RootSwap) -> {
-      let root = at(ascii_of_int(laid.list.root));
-      took(
-        |old: Bytes| Bytes::concat_all([b"Word ", old, b" = ", root, b"; ", root, b" = ", i, b";"]),
-        |old: Bytes| [whole(b"list", a), whole(b"old", old)],
-      )
-    },
-    OfList(ChildSwap) ->
-      took(
-        |old: Bytes|
-          Bytes::concat_all([
-            b"Word ",
-            old,
-            b" = 0; if (",
-            i,
-            b" < (int64_t)",
-            nh(a, b"len"),
-            b") ",
-            old,
-            b" = ",
-            at(offset_by(first, i)),
-            b"; else ",
-            nh(a, b"len"),
-            b" = (uint32_t)(",
-            i,
-            b") + 1; ",
-            at(offset_by(first, i)),
-            b" = ",
-            operand(printing, args, 2),
-            b";",
-          ]),
-        |old: Bytes| [whole(b"node", a), whole(b"old", old)],
-      ),
-    OfList(Spill) -> {
-      let width = ascii_of_int(laid.trie.width);
-      let e = item_element(printing, element_type(operand_type(args, 0)));
-      took(
-        |leaf: Bytes|
-          Bytes::concat_all([
-            b"Word ",
-            leaf,
-            b" = ",
-            trie_node_allocation(laid.trie.leaf, e.stride),
-            b"; memcpy(&",
-            word_slot(leaf, ascii_of_int(first)),
-            b", &",
-            at(ascii_of_int(laid.list.tail)),
-            b", ",
-            item_words(width, e),
-            b" * sizeof(Word)); ",
-            nh(leaf, b"len"),
-            b" = ",
-            width,
-            b"; ",
-            lh(b"tail_len"),
-            b" = 0;",
-          ]),
-        |leaf: Bytes| [whole(b"leaf", leaf), whole(b"list", a)],
-      )
-    },
     OfMap(PairTake) -> {
       let l = pairs();
       let ps = ascii_of_int(l.pair);
@@ -977,36 +780,14 @@ fn fields_set(
 fn offset_by(from: Int, at: Bytes) -> Bytes =
   Bytes::concat_all([ascii_of_int(from), b" + (", at, b")"])
 
-fn copy_unless_unique(
-  printing: Printing,
-  depth: Int,
-  a: Bytes,
-  ty: Type,
-  counted: Option<Bytes>,
-) -> Printing = {
+fn copy_unless_unique(printing: Printing, depth: Int, a: Bytes, ty: Type) -> Printing = {
   let c = copy_called(printing, a, ty);
-  match counted {
-    None ->
-      pieces(
-        c.printing,
-        [Text(Bytes::concat_all([pad(depth), b"if (ply_obj(", a, b")->rc != 1) "]))].concat(
-          c.out,
-        ).push(
-          Text(b"\n"),
-        ),
-      ),
-    Some(n) ->
-      pieces(c.printing, [
-        Text(Bytes::concat_all([pad(depth), a, b" = ", writable_function(), b"(ctx, ", a, b", "])),
-        Hole(Symbol(Root(root_of(Copy, ty)))),
-        Text(Bytes::concat_all([b", ", n, b");\n"])),
-      ]),
-  }
-}
-
-fn copied(printing: Printing, depth: Int, a: Bytes, ty: Type) -> Printing = {
-  let c = copy_called(printing, a, ty);
-  pieces(c.printing, [Text(pad(depth).concat(b"if (!in_place) "))].concat(c.out).push(Text(b"\n")))
+  pieces(
+    c.printing,
+    [Text(Bytes::concat_all([pad(depth), b"if (ply_obj(", a, b")->rc != 1) "]))].concat(c.out).push(
+      Text(b"\n"),
+    ),
+  )
 }
 
 fn copy_called(printing: Printing, a: Bytes, ty: Type) -> { printing: Printing, out: List<Piece> } = {
@@ -1158,17 +939,15 @@ fn array_writable(
     element_slots(c.name, j.name, e),
   );
   let old = released(j.printing, ty, AsWord, [a]);
-  let copied = pieces(
+  pieces(
     old.printing,
     [
       Text(
         Bytes::concat_all([
           pad(depth),
-          b"int in_place = ply_obj(",
+          b"if (ply_obj(",
           a,
-          b")->rc == 1;\n",
-          pad(depth),
-          b"if (!in_place) { Word ",
+          b")->rc != 1) { Word ",
           c.name,
           b" = ply_alloc(ctx, ",
           array_bytes(n, e),
@@ -1190,12 +969,152 @@ fn array_writable(
     ).push(
       Text(Bytes::concat_all([b" ", a, b" = ", c.name, b"; }\n"])),
     ),
-  );
-  line(
-    copied,
-    depth,
-    Bytes::concat_all([b"rt_note_update_p(ctx, in_place, in_place ? 0 : ", n, b");"]),
   )
+}
+
+fn item_written(w: Bytes, e: Element, ws: List<Bytes>) -> Bytes =
+  Bytes::join(
+    range(0, e.stride).map(|j: Int|
+      Bytes::concat_all([
+        slot_at(w, j),
+        b" = ",
+        match ws.at(j) { Some(x) -> x, None -> b"0" },
+        b";",
+      ])),
+    b" ",
+  )
+
+fn item_pointer(a: Bytes, i: Bytes, e: Element) -> Bytes =
+  Bytes::concat_all([item_function(), b"(", a, b", ", i, b", ", ascii_of_int(e.stride), b")"])
+
+fn list_pushed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Variable,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let d = p.depth;
+  let held = assigned(printing, d, v, c_type(v.representation), operand(printing, args, 0));
+  let a = name_of(held, v);
+  let c = copy_called(held, a, v.ty);
+  let lh = |f: Bytes| head_field(list_head(), a, f);
+  let opened = pieces(c.printing, [
+    Text(
+      Bytes::concat_all([
+        pad(d),
+        b"if (ply_obj(",
+        a,
+        b")->rc != 1 || ",
+        lh(b"len"),
+        b" != ",
+        lh(b"claimed"),
+        b" || ",
+        lh(b"len"),
+        b" == ",
+        lh(b"room"),
+        b") ",
+        a,
+        b" = ",
+        opened_list_fn(),
+        b"(ctx, ",
+        a,
+        b", ",
+      ]),
+    ),
+    Hole(Symbol(Root(root_of(Copy, v.ty)))),
+    Text(
+      Bytes::concat_all([b", ", ascii_of_int(e.stride), b"); else ", lh(b"claimed"), b" += 1;\n"]),
+    ),
+  ]);
+  let w = temp(opened);
+  let x = operand_arg(args, 1);
+  line(
+    w.printing,
+    d,
+    Bytes::concat_all([
+      b"{ Word *",
+      w.name,
+      b" = ",
+      item_pointer(a, Bytes::concat_all([b"(int64_t)", lh(b"len")]), e),
+      b"; ",
+      item_written(
+        w.name,
+        e,
+        values_as_words(arg_parts(printing, x), c_values_of(operand_representation(x))),
+      ),
+      b" ",
+      lh(b"len"),
+      b" += 1; }",
+    ]),
+  )
+}
+
+fn list_set(
+  p: InstructionContext,
+  printing: Printing,
+  v: Variable,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let ty = element_type(v.ty);
+  let i = operand(printing, args, 1);
+  let x = operand_arg(args, 2);
+  let xs = arg_parts(printing, x);
+  let r = operand_representation(x);
+  let d = p.depth;
+  let started = assigned(printing, d, v, c_type(v.representation), operand(printing, args, 0));
+  let a = name_of(started, v);
+  let n = temp(started);
+  let opened = line(
+    line(
+      n.printing,
+      d,
+      Bytes::concat_all([
+        b"int64_t ",
+        n.name,
+        b" = (int64_t)",
+        head_field(length_head(), a, b"len"),
+        b";",
+      ]),
+    ),
+    d,
+    Bytes::concat_all([b"if ((uint64_t)", i, b" >= (uint64_t)", n.name, b") {"]),
+  );
+  let x_go = fragment_line(d + 1, released(opened, ty, r, xs));
+  let raising = rejected(
+    fragment_line(d + 1, released(x_go, v.ty, AsWord, [a])),
+    b"List::set",
+    i,
+    n.name,
+  );
+  let raised = failure_inside(p, raising.printing, Bytes::concat_all([a, b" = 0; ", raising.text]));
+  let c = copy_called(line(raised, d, b"} else {"), a, v.ty);
+  let writable = pieces(
+    c.printing,
+    [Text(Bytes::concat_all([pad(d + 1), b"if (!", writable_list_fn(), b"(", a, b")) "]))].concat(
+      c.out,
+    ).push(
+      Text(b"\n"),
+    ),
+  );
+  let w = temp(writable);
+  let located = line(
+    w.printing,
+    d + 1,
+    Bytes::concat_all([b"Word *", w.name, b" = ", item_pointer(a, i, e), b";"]),
+  );
+  let replaced = parts_released(
+    located,
+    layout_parts(printing.constructors, ty, e.layout, 0),
+    range(0, e.stride).map(|j: Int| slot_at(w.name, j)),
+  );
+  let written = line(
+    fragment_line(d + 1, replaced),
+    d + 1,
+    item_written(w.name, e, values_as_words(xs, c_values_of(r))),
+  );
+  check(p, line(written, d, b"}"))
 }
 
 fn array_of_list(
@@ -1904,7 +1823,7 @@ test "a length stores no site, and a failing index stores one on the branch that
   )
 }
 
-test "a list literal's generated C writes the items that fit into the list header's inline tail buffer" {
+test "a list literal is laid out by the emitted code, its items in the block its room asks for" {
   let made_of = |item: Type, args: List<Arg>|
     pieces_text(
       list_printed(
@@ -1916,24 +1835,23 @@ test "a list literal's generated C writes the items that fit into the list heade
     );
   let made = |args: List<Arg>| made_of(string_type(), args);
   let laid = container_layouts().list;
-  let tail = |k: Int| Bytes::concat_all([b"[", ascii_of_int(laid.tail + k), b"] = "]);
+  let item = |k: Int| Bytes::concat_all([b"[", ascii_of_int(laid.items + k), b"] = "]);
   let two = made([VariableOperand(local_var(0, string_type(), AsWord)), ZeroOperand(AsWord)]);
   let has = |text: Bytes, t: Bytes|
     assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   has(two, b"ply_list_room(ctx, 2, 1)");
-  has(two, tail(0).concat(b"p0;"));
-  has(two, tail(1).concat(b"0;"));
-  has(two, b"))->tail_len = 2;");
+  has(two, item(0).concat(b"p0;"));
+  has(two, item(1).concat(b"0;"));
+  has(two, b"))->len = 2;");
   assert_eq(made([]).index_of(b")["), None);
   let decimal_list_text = made_of(decimal_type(), [ZeroOperand(AsDecimal)]);
   has(decimal_list_text, b"ply_list_room(ctx, 1, 2)");
-  has(decimal_list_text, tail(1).concat(b"("));
+  has(decimal_list_text, item(1).concat(b"("));
   [made([]), two].fold((), |_: Unit, text: Bytes| assert_eq(text.index_of(b"ctx->failed"), None))
 }
 
-test "a list literal larger than the inline item buffer puts each full group of items in a tree node under a branch node and the leftover items in the buffer" {
-  let width = container_layouts().trie.width;
-  let n = 2 * width + 3;
+test "a list literal of any length is one block, its items in a run" {
+  let n = 70;
   let text = pieces_text(
     list_printed(
       at_top(),
@@ -1942,29 +1860,15 @@ test "a list literal larger than the inline item buffer puts each full group of 
       { made: ListAllocation(n), args: range(0, n).map(IntOperand), reuse: None },
     ).out,
   );
-  let count = |t: Bytes|
-    range(0, text.len()).fold(0, |c: Int, i: Int|
-      if text.slice(i, text.len()).starts_with(t) { c + 1 } else { c });
-  assert_eq(
-    count(
-      Bytes::concat_all([b"ply_node(ctx, ", ascii_of_int(container_layouts().trie.leaf), b", "]),
-    ),
-    2,
-  );
-  assert_eq(
-    count(
-      Bytes::concat_all([b"ply_node(ctx, ", ascii_of_int(container_layouts().trie.branch), b", "]),
-    ),
-    1,
-  );
-  let laid = container_layouts().list;
+  let items = container_layouts().list.items;
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(b"->len = 2;");
-  has(Bytes::concat_all([b"[", ascii_of_int(laid.root), b"] = t"]));
-  has(b"))->tail_len = 3;")
+  has(empty_list_allocation(b"70", 1));
+  has(Bytes::concat_all([b"[", ascii_of_int(items + n - 1), b"] = "]));
+  has(b"))->len = 70;");
+  assert_eq(text.index_of(b"ply_node("), None)
 }
 
-test "reading a list item is a direct memory read, and taking the rest of the list shares the same trie, with no runtime call for either" {
+test "a list's item is read where it lies and its rest shares its list, neither through the runtime" {
   let operation_text = |c: ContainerOperation, item: Type, into: Variable|
     pieces_text(
       container_operation(
@@ -2048,7 +1952,6 @@ test "an array of records stores each record's words inline in the array, and a 
   let text = pieces_text(printing.out);
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   has(b") * 2); memcpy(ply_words(");
-  has(b"rt_note_update_p(ctx, in_place, in_place ? 0 : ");
   has(call_start(release_function(), [b"ctx", b"ply_words(t1)[(p1) * 2 + 1]"]));
   has(b"ply_words(t1)[(p1) * 2 + 2] = ply_f64_bits(");
   has(b"ply_refused(ctx, 5, p1, ")

@@ -34,7 +34,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
         frames, release_depth, release_waiting, target, entering_desc, entering_words,
         recording, bridge, hosted, unserved, performed_root,
-        performed_start, performed_end, task, alloc);
+        performed_start, performed_end, task, alloc, constants);
     laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
     laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
         listed, spare);
