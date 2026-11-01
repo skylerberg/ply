@@ -124,14 +124,15 @@ and flag.
 `ply` stores results in `.ply-cache/` at the project root: checked modules, test results, proofs,
 saved baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is
 always safe, and `ply cache clear` empties it. A run that crashes, or that races another run, can
-make a later run redo work, but never gives a wrong result.
+make a later run redo work, but never gives a wrong result. Checkouts also share a per-user cache of
+results, so a new checkout of the same code reuses the work of another one.
 
 A definition's hash is a fingerprint of the definition and of everything it depends on. It does not
 cover the definition's comments, formatting or name. So a rename or a comment edit reruns no test.
-If you edit a function's body and leave its signature unchanged, `ply` rechecks that function and
-every function that calls it, directly or through other callers. A `ply` reuses a cached result only
-if it would compute exactly that result itself. It recomputes results that a different `ply` cached
-(`W0603`).
+If you edit a function's body and leave its signature unchanged, `ply` rechecks that function, and
+its callers only if what they can see of it changed, such as whether it returns. A `ply` reuses a
+cached result only if it would compute exactly that result itself. It recomputes results that a
+different `ply` cached (`W0603`).
 
 `PLY_CACHE_UPSTREAM=DIR` adds a second cache that several checkouts or machines share. Test results
 and proofs found there are used, and new ones are written there. `PLY_CACHE_UPSTREAM_READONLY=1`
