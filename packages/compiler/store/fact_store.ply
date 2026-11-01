@@ -5,6 +5,7 @@ import std.bytes (u32_le, u64_le, u64_be)
 import std.bytes
 import std.list
 import std.show (show)
+import std.zstd
 import compiler.store.segments
 import compiler.store.segments (CommitResult, Committed, LockHeld, Manifest, Segment, SegmentWriter,
                                 StoreChanged, WriteFailed)
@@ -44,7 +45,7 @@ pub type Database = {
   log_floor: Int,
 }
 
-fn schema() -> Bytes = b"ply fact database 4".blake3()
+fn schema() -> Bytes = b"ply fact database 5".blake3()
 
 fn nodes_table() -> Int = 1
 
@@ -331,6 +332,26 @@ pub fn add_member(db: Database, tree: Tree, key: Bytes, member: Bytes) -> Databa
 pub fn remove_member(db: Database, tree: Tree, key: Bytes, member: Bytes) -> Database =
   without_value(db, tree, key.concat(member))
 
+fn smallest_compressed_result() -> Int = 64
+
+fn stored_result(plain: Bytes) -> Bytes / {abort.raise} = {
+  let packed = if plain.len() < smallest_compressed_result() { plain }
+  else { zstd::compress(plain, zstd::Fast) };
+  if packed.len() < plain.len() { b"\x01".concat(packed) } else { b"\x00".concat(plain) }
+}
+
+fn result_limits() -> zstd::Limits = { output: 1099511627776, window: 1099511627776 }
+
+fn plain_result(stored: Bytes) -> Bytes / {fact_damage.damaged, abort.raise} = {
+  let body = stored.slice(1, stored.len());
+  if stored.at(0) == 0 { body } else {
+    match zstd::try_decompress(body, result_limits()) {
+      Ok(plain) -> plain,
+      Err(_) -> fact_damage.damaged("a stored result does not decompress"),
+    }
+  }
+}
+
 pub fn with_result<[r]>(
   db: Database,
   digest: Bytes,
@@ -339,13 +360,14 @@ pub fn with_result<[r]>(
   if db.written_results.contains(digest) || stored_row[r](db, results_table(), digest) != None {
     db
   } else {
-    let placed = segments::append_payload(db.writing, bytes);
+    let stored = stored_result(bytes);
+    let placed = segments::append_payload(db.writing, stored);
     {
       ..db,
       writing: segments::flush_when_full[r](db.dir, schema(), db.token, placed.writing),
       written_results: db.written_results.insert(
         digest,
-        u64_le(placed.at).concat(u32_le(bytes.len())),
+        u64_le(placed.at).concat(u32_le(stored.len())),
       ),
     }
   }
@@ -354,14 +376,29 @@ pub fn result_of<[r]>(
   db: Database,
   digest: Bytes,
 ) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match match db.written_results.get(digest) {
+      None -> table_value[r](db, results_table(), digest),
+      Some(place) -> {
+        let at = segments::read_u64(place, 0);
+        match segments::pending_payload(db.writing, at) {
+          Some(bytes) -> Some(bytes),
+          None -> segments::payload[r](db.dir, db.token, at, segments::read_u32(place, 8)),
+        }
+      },
+    } {
+    Some(stored) -> Some(plain_result(stored)),
+    None -> None,
+  }
+
+pub fn stored_result_size<[r]>(
+  db: Database,
+  digest: Bytes,
+) -> Int / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   match db.written_results.get(digest) {
-    None -> table_value[r](db, results_table(), digest),
-    Some(place) -> {
-      let at = segments::read_u64(place, 0);
-      match segments::pending_payload(db.writing, at) {
-        Some(bytes) -> Some(bytes),
-        None -> segments::payload[r](db.dir, db.token, at, segments::read_u32(place, 8)),
-      }
+    Some(place) -> segments::read_u32(place, 8),
+    None -> match stored_row[r](db, results_table(), digest) {
+      Some(found) -> segments::read_u32(found.row, key_width(results_table()) + 8),
+      None -> 0,
     },
   }
 
@@ -926,6 +963,25 @@ test "a result is found by its digest in the run that wrote it and after a commi
   let read = fs::on_mem[abs](written.tree, ||
     in_store[abs](|db: Database| result_of[abs](db, digest)));
   assert_eq(read.value, Some(b"value"))
+}
+
+test "a large result takes less room than its bytes, and a small one stays readable" {
+  let large = key_of("large");
+  let small = key_of("small");
+  let text = Bytes::concat_all(range(0, 4000).map(|i: Int| Bytes::of_string((i % 7).to_string())));
+  let written = fs::on_mem[abs](fs::mem_of([]), ||
+    in_store[abs](|db: Database|
+      committed[abs](with_result[abs](with_result[abs](db, large, text), small, b"x"))));
+  let read = fs::on_mem[abs](written.tree, ||
+    in_store[abs](|db: Database|
+      {
+        large: result_of[abs](db, large),
+        small: result_of[abs](db, small),
+        size: stored_result_size[abs](db, large),
+      })).value;
+  assert_eq(read.large, Some(text));
+  assert_eq(read.small, Some(b"x"));
+  assert(read.size < text.len())
 }
 
 test "reading the log returns the entries after an offset" {

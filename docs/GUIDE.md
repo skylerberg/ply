@@ -121,14 +121,17 @@ and flag.
 
 ### 1.5 The cache
 
-`ply` stores results in `.ply-cache/` at the project root: checked modules, test results, proofs,
-saved baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is
-always safe, and `ply cache clear` empties it. A run that crashes, or that races another run, can
-make a later run redo work, but never gives a wrong result. Checkouts also share a per-user cache of
-results, so a new checkout of the same code reuses the work of another one. If nothing changed since
-a run that succeeded, `ply check`, `ply test`, `ply run`, `ply build`, `ply prove`, `ply review`,
-`ply callers` and `ply unused` load no program: they report the stored result or start the stored
-library.
+`ply` stores its work in `.ply-cache/` at the project root: a database of checked modules, saved
+baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is always
+safe, and `ply cache clear` empties it. A run that crashes, or that races another run, can make a
+later run redo work, but never gives a wrong result.
+
+Each project has its own database. `ply cache copy CHECKOUT` starts a new checkout with the database
+of another one. Compiled code, test passes and proofs are stored once per user under the content
+they came from, so every checkout reuses them with no copying.
+
+A command updates the database for the files that changed, then reads its answer from the database.
+So the work follows the edit, not the size of the program, and no command keeps a result of its own.
 
 A definition's hash is a fingerprint of the definition and of everything it depends on. It does not
 cover the definition's comments, formatting or name. So a rename or a comment edit reruns no test.
@@ -2526,6 +2529,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply contracts NAME FROM TO` | what changed in the public interface between two published versions |
 | `ply keygen PATH` | writes an Ed25519 key pair |
 | `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
+| `ply cache copy CHECKOUT [path]` | copies another checkout's database into this project |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |
 

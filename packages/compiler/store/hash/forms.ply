@@ -1070,20 +1070,8 @@ pub fn hash_all(
     accumulator.insert(v, f.hash));
   let keyed = key_components(over, pinned, cached);
   let hashes = keyed.hashes;
-  let check_keys = check_key_components(over, cached, hashes);
-  let contracts = range(0, shapes.nodes.len()).fold(
-    Map::new(),
-    |accumulator: Map<Int, Bytes>, v: Int|
-      if shapes.nodes.get(v).declaration { accumulator } else {
-        let fixed_contract = match cached.get(v) { Some(f) -> f.contract, None -> b"" };
-        accumulator.insert(v, if fixed_contract.len() > 0 { fixed_contract } else {
-          match check_keys.contracts.get(v) {
-            Some(c) -> c,
-            None -> contract_of(over, cached, hashes, v),
-          }
-        })
-      },
-  );
+  let contracts = contracts_of(over, cached, hashes);
+  let checks = check_key_components(over, contracts, cached, hashes);
   let tests = shapes.tests.fold(
     { hashes: [], bodies: [], texts: [], refs: [], runs: [], listings: [] },
     |accumulator: TestHashes, t: HashItem|
@@ -1153,8 +1141,8 @@ pub fn hash_all(
           computed_spec_hashes(
             over,
             hashes,
-            reference_keys(over, cached, hashes, check_keys, v).view,
-            check_keys.checks,
+            reference_keys(over, contracts, hashes, checks, v),
+            checks,
             accumulator,
             v,
             first.get(v).references,
@@ -1178,7 +1166,7 @@ pub fn hash_all(
       specs: stated.specs,
       spec_texts: stated.spec_texts,
       contracts: contracts,
-      checks: check_keys.checks,
+      checks: checks,
       spec_checks: stated.spec_checks,
       enumerations: range(0, shapes.nodes.len()).map(|v: Int| {
         let ci = g.scc.component_of.get(v);
@@ -1196,134 +1184,124 @@ pub fn hash_all(
   }
 }
 
-fn contract_domain() -> Bytes = b"ply.contract.1"
+fn contract_domain() -> Bytes = b"ply.contract.2"
 
-pub fn contract_of(
+fn form_bytes(over: HashContext, form: Template, view: Map<Int, Bytes>) -> Bytes / {abort.raise} =
+  filled_item(over, form, view, false).bytes
+
+fn contract_of(
   over: HashContext,
-  cached: Map<Int, CachedNode>,
-  hashes: Map<Int, Bytes>,
+  stored: Bytes,
+  hash: Bytes,
+  view: Map<Int, Bytes>,
+  bodies: Bytes,
   v: Int,
-) -> Bytes / {abort.raise} = {
-  let shape = over.shapes.nodes.get(v);
-  let hash = match hashes.get(v) { Some(h) -> h, None -> b"" };
-  if shape.declaration { hash } else {
-    match shape.form {
-      None -> match cached.get(v) { Some(f) -> f.contract, None -> hash },
+) -> Bytes / {abort.raise} =
+  if stored.len() > 0 { stored } else {
+    match over.shapes.nodes.get(v).form {
+      None -> hash,
       Some(form) -> {
-        let signature = match form.signature {
-          Some(s) -> filled_item(over, s, hashes, false).bytes,
-          None -> b"",
-        };
-        let clauses = form.clauses.map(|clause: ClauseForm|
-          filled_item(over, clause.form, hashes, false).bytes);
-        let body = if form.transparent { b"transparent".concat(hash) } else { b"" };
+        let signature = match form.signature { Some(s) -> form_bytes(over, s, view), None -> b"" };
+        let clauses = form.clauses.map(|clause: ClauseForm| form_bytes(over, clause.form, view));
+        let body = if form.transparent { b"transparent".concat(bodies) } else { b"" };
         blake3(Bytes::concat_all([contract_domain(), signature, Bytes::concat_all(clauses), body]))
       },
     }
   }
+
+fn transparent_bodies(
+  over: HashContext,
+  members: List<Int>,
+  view: Map<Int, Bytes>,
+) -> Bytes / {abort.raise} = {
+  let forms = members.fold(Map::new(), |found: Map<Bytes, Bytes>, v: Int|
+    match over.shapes.nodes.get(v).form {
+      Some(form) -> if form.transparent {
+        found.insert(over.names.get(v), form_bytes(over, form.form, view))
+      } else { found },
+      None -> found,
+    });
+  Bytes::concat_all(forms.values())
 }
 
-type CheckKeys = { checks: Map<Int, Bytes>, contracts: Map<Int, Bytes> }
+type ContractWalk = { view: Map<Int, Bytes>, contracts: Map<Int, Bytes> }
 
-type Viewed = { check_keys: CheckKeys, view: Map<Int, Bytes> }
-
-fn reference_keys(
+pub fn contracts_of(
   over: HashContext,
   cached: Map<Int, CachedNode>,
   hashes: Map<Int, Bytes>,
-  check_keys: CheckKeys,
+) -> Map<Int, Bytes> / {abort.raise} =
+  over.graph.components.fold(
+    { view: hashes, contracts: Map::new() },
+    |walk: ContractWalk, component: List<Int>| {
+      let functions = component.filter(|v: Int| !over.shapes.nodes.get(v).declaration);
+      let inside = functions.fold(walk.view, |view: Map<Int, Bytes>, v: Int|
+        view.insert(v, over.names.get(v)));
+      let bodies = transparent_bodies(over, functions, inside);
+      let hash_of = |v: Int| match hashes.get(v) { Some(h) -> h, None -> b"" };
+      let with_declarations = component.filter(|v: Int| over.shapes.nodes.get(v).declaration).fold(
+        walk,
+        |done: ContractWalk, v: Int| { ..done, contracts: done.contracts.insert(v, hash_of(v)) },
+      );
+      functions.fold(with_declarations, |done: ContractWalk, v: Int| {
+        let stored = match cached.get(v) { Some(f) -> f.contract, None -> b"" };
+        let contract = contract_of(over, stored, hash_of(v), inside, bodies, v);
+        { view: done.view.insert(v, contract), contracts: done.contracts.insert(v, contract) }
+      })
+    },
+  ).contracts
+
+fn reference_keys(
+  over: HashContext,
+  contracts: Map<Int, Bytes>,
+  hashes: Map<Int, Bytes>,
+  checks: Map<Int, Bytes>,
   v: Int,
-) -> Viewed / {abort.raise} = {
+) -> Map<Int, Bytes> / {abort.raise} = {
   let own = over.shapes.nodes.get(v).package;
-  over.graph.edges.get(v).fold(
-    { check_keys: check_keys, view: Map::new() },
-    |accumulator: Viewed, r: Int|
-      if over.shapes.nodes.get(r).package != own {
-        match accumulator.check_keys.contracts.get(r) {
-          Some(c) -> { ..accumulator, view: accumulator.view.insert(r, c) },
-          None -> {
-            let c = contract_of(over, cached, hashes, r);
-            {
-              check_keys: {
-                ..accumulator.check_keys,
-                contracts: accumulator.check_keys.contracts.insert(r, c),
-              },
-              view: accumulator.view.insert(r, c),
-            }
-          },
-        }
-      } else {
-        match accumulator.check_keys.checks.get(r) {
-          Some(x) -> { ..accumulator, view: accumulator.view.insert(r, x) },
-          None -> match hashes.get(r) {
-            Some(x) -> { ..accumulator, view: accumulator.view.insert(r, x) },
-            None -> accumulator,
-          },
-        }
-      },
-  )
+  over.graph.edges.get(v).fold(Map::new(), |view: Map<Int, Bytes>, r: Int| {
+    let key = if over.shapes.nodes.get(r).package != own { contracts.get(r) }
+    else { match checks.get(r) { Some(x) -> Some(x), None -> hashes.get(r) } };
+    match key { Some(k) -> view.insert(r, k), None -> view }
+  })
 }
 
 fn check_key_components(
   over: HashContext,
+  contracts: Map<Int, Bytes>,
   cached: Map<Int, CachedNode>,
   hashes: Map<Int, Bytes>,
-) -> CheckKeys / {abort.raise} =
-  range(0, over.graph.components.len()).fold(
-    { checks: Map::new(), contracts: Map::new() },
-    |accumulator: CheckKeys, ci: Int| {
-      let component = over.graph.components.get(ci);
-      let keep = |keys: CheckKeys|
-        component.fold(keys, |k: CheckKeys, v: Int|
-          match hashes.get(v) { Some(h) -> { ..k, checks: k.checks.insert(v, h) }, None -> k });
-      if component.fold(true, |all: Bool, v: Int|
-          all && (cached.contains(v) || has_no_form(over.shapes.nodes.get(v)))) {
-        component.fold(accumulator, |k: CheckKeys, v: Int|
-          match cached.get(v) {
-            Some(f) -> { ..k, checks: k.checks.insert(v, f.check) },
-            None -> k,
-          })
+) -> Map<Int, Bytes> / {abort.raise} =
+  range(0, over.graph.components.len()).fold(Map::new(), |checks: Map<Int, Bytes>, ci: Int| {
+    let component = over.graph.components.get(ci);
+    if component.fold(true, |all: Bool, v: Int|
+        all && (cached.contains(v) || has_no_form(over.shapes.nodes.get(v)))) {
+      component.fold(checks, |keys: Map<Int, Bytes>, v: Int|
+        match cached.get(v) { Some(f) -> keys.insert(v, f.check), None -> keys })
+    } else {
+      let view = component.fold(Map::new(), |gathered: Map<Int, Bytes>, v: Int|
+        reference_keys(over, contracts, hashes, checks, v).fold(
+          gathered,
+          |m: Map<Int, Bytes>, r: Int, k: Bytes|
+            if over.graph.scc.component_of.get(r) == ci { m } else { m.insert(r, k) },
+        ));
+      if view.fold(true, |all: Bool, r: Int, k: Bytes| all && hashes.get(r) == Some(k)) {
+        component.fold(checks, |keys: Map<Int, Bytes>, v: Int|
+          match hashes.get(v) { Some(h) -> keys.insert(v, h), None -> keys })
       } else {
-        let gathered = component.fold(
-          { check_keys: accumulator, view: Map::new() },
-          |a: Viewed, v: Int| {
-            let x = reference_keys(over, cached, hashes, a.check_keys, v);
-            {
-              check_keys: x.check_keys,
-              view: x.view.fold(a.view, |m: Map<Int, Bytes>, r: Int, k: Bytes|
-                if over.graph.scc.component_of.get(r) == ci { m } else { m.insert(r, k) }),
-            }
-          },
-        );
-        if gathered.view.fold(true, |all: Bool, r: Int, k: Bytes| all && hashes.get(r) == Some(k)) {
-          keep(gathered.check_keys)
+        let effects = positions(over.graph.scc.orders.get(ci));
+        if is_cyclic(component, over.graph.edges) {
+          hash_component(over, component, view, effects).members.fold(
+            checks,
+            |keys: Map<Int, Bytes>, m: { node: Int, hash: Bytes }| keys.insert(m.node, m.hash),
+          )
         } else {
-          let effects = positions(over.graph.scc.orders.get(ci));
-          if is_cyclic(component, over.graph.edges) {
-            let refined: Refinement = hash_component(over, component, gathered.view, effects);
-            refined.members.fold(
-              gathered.check_keys,
-              |keys: CheckKeys, m: { node: Int, hash: Bytes }|
-                { ..keys, checks: keys.checks.insert(m.node, m.hash) },
-            )
-          } else {
-            let v = component.get(0);
-            let encoding = filled_under(
-              over,
-              form_of(over, v),
-              gathered.view,
-              effects,
-              false,
-            ).bytes;
-            {
-              ..gathered.check_keys,
-              checks: gathered.check_keys.checks.insert(v, blake3(encoding)),
-            }
-          }
+          let v = component.get(0);
+          checks.insert(v, blake3(filled_under(over, form_of(over, v), view, effects, false).bytes))
         }
       }
-    },
-  )
+    }
+  })
 
 fn cached_spec_hashes(accumulator: SpecHashes, name: Bytes, fixed: CachedNode) -> SpecHashes = {
   let owned: SpecHashes = match fixed.own {
