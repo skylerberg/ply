@@ -692,13 +692,12 @@ type Chunk = { token: Bytes, start: Int, end: Int, rows: List<RowToCopy> }
 
 fn copy_chunk_size() -> Int = 16777216
 
-fn chunks_in_file_order(
-  located: Map<Bytes, Located>,
-  order: Map<Bytes, Int>,
-) -> List<Chunk> / {abort.raise} = {
+fn chunks_in_file_order(located: Map<Bytes, Located>) -> List<Chunk> / {abort.raise} = {
+  let files = located.fold(Map::new(), |found: Map<Bytes, Int>, _: Bytes, at: Located|
+    if found.contains(at.token) { found } else { found.insert(at.token, found.len()) });
   let ordered = located.fold(Map::new(), |by: Map<Int, RowToCopy>, key: Bytes, at: Located|
     by.insert(
-      (match order.get(at.token) { Some(i) -> i, None -> 0 }) * 1099511627776 + at.offset,
+      (match files.get(at.token) { Some(i) -> i, None -> 0 }) * 1099511627776 + at.offset,
       { key: key, at: at },
     ));
   ordered.fold([], |chunks: List<Chunk>, _: Int, row: RowToCopy| {
@@ -743,7 +742,7 @@ fn stored_values<[r]>(
   db: Database,
   located: Map<Bytes, Located>,
 ) -> List<Bytes> / {fs.read[r], fact_damage.damaged, abort.raise} =
-  chunks_in_file_order(located, Map::new()).fold([], |values: List<Bytes>, chunk: Chunk| {
+  chunks_in_file_order(located).fold([], |values: List<Bytes>, chunk: Chunk| {
     let bytes = chunk_bytes[r](db, chunk);
     chunk.rows.fold(values, |found: List<Bytes>, row: RowToCopy| {
       let from = row.at.offset - chunk.start;
@@ -760,9 +759,8 @@ fn table_copied<[r]>(
   draft: Rewriting,
   table: Int,
   located: Map<Bytes, Located>,
-  order: Map<Bytes, Int>,
 ) -> Rewriting / {fs.read[r], fs.write[r], fact_damage.damaged, abort.raise} = {
-  let copied = chunks_in_file_order(located, order).fold(
+  let copied = chunks_in_file_order(located).fold(
     { writing: draft.writing, rows: Map::new() },
     |sofar: RowDraft, chunk: Chunk| {
       let put = segments::append_frames(sofar.writing, chunk_bytes[r](db, chunk));
@@ -792,8 +790,6 @@ fn rewritten_segments<[r]>(
   stored: (Int, Bytes) -> Bool / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
 ) -> Bool / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
   let merging = m.segments.drop(from);
-  let order = range(0, merging.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
-    found.insert(merging.get(i).token, i));
   let draft = all_tables().fold(
     { writing: segments::new_writer(), tables: [] },
     |sofar: Rewriting, table: Int|
@@ -807,7 +803,6 @@ fn rewritten_segments<[r]>(
           |found: Map<Bytes, Located>, key: Bytes, at: Located|
             if stored(table, key) { found.insert(key, at) } else { found },
         ),
-        order,
       ),
   );
   match segments::finish[r](db.dir, schema(), token, draft.writing, draft.tables) {
@@ -1023,6 +1018,19 @@ test "a member removed in a later snapshot stays removed, and one added later is
   assert_eq(dependents_stored(tree), [key_of("other reader")]);
   assert_eq(value_stored(tree, key_of("first")), None);
   assert_eq(value_stored(tree, key_of("second")), Some(b"two"))
+}
+
+test "rows at one offset of two files are both listed" {
+  let located = Map::new().insert(b"first", { token: b"one", offset: 20, size: 4 }).insert(
+    b"second",
+    { token: b"two", offset: 20, size: 4 },
+  );
+  assert_eq(
+    chunks_in_file_order(located).flat_map(|chunk: Chunk|
+      chunk.rows.map(|row: RowToCopy| row.key)).sort(
+    ),
+    [b"first", b"second"],
+  )
 }
 
 test "a result is found by its digest in the run that wrote it and after a commit" {
