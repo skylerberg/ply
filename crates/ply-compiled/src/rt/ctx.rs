@@ -65,6 +65,9 @@ pub struct Ctx {
     /// What compiled code takes a small block from the heap by, and gives one back to, without
     /// calling the runtime: the heap's own, wherever the heap moves.
     pub alloc: *mut crate::heap::Alloc,
+    /// The unit's kept constants ([`Tables::memo`]), which compiled code reads without calling the
+    /// runtime.
+    pub constants: *const AtomicI64,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub heap: Heap,
@@ -193,6 +196,7 @@ impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
         let mut heap = Heap::new();
         let alloc = heap.alloc();
+        let constants = tables.memo.as_ptr();
         Ctx {
             failed: 0,
             stack_floor: std::sync::atomic::AtomicUsize::new(0),
@@ -214,6 +218,7 @@ impl Ctx {
             performed_end: 0,
             task: 0,
             alloc,
+            constants,
             grown: 0,
             deadline: None,
             time_budget_ms: 0,

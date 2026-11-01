@@ -1,14 +1,14 @@
-import compiler.check.types (Type, NamedType, FunctionType, VariableType, RecordType, NominalType,
-                             Field, record_fields, field_get, encode_type, int_type, unit_type,
-                             no_effects, label_type, is_label_or_effects, string_type, list_type,
-                             option_type, map_type, secret_type, bool_type, float_type,
+import compiler.check.types (named_type, Type, NamedType, FunctionType, VariableType, RecordType,
+                             NominalType, Field, record_fields, field_get, encode_type, int_type,
+                             unit_type, no_effects, label_type, is_label_or_effects, string_type,
+                             list_type, option_type, map_type, secret_type, bool_type, float_type,
                              decimal_type)
 import compiler.check.known
-import compiler.check.known (list_node_name, list_node_type, map_node_type, task_name,
-                             builtin_channel_name, secret_name, string_name, bytes_name, list_name,
-                             map_name, array_name, columns_name, scoped_name, option_name,
-                             none_constructor, some_constructor, array_type, columns_type,
-                             task_type, chan_type, scoped_type, width_type)
+import compiler.check.known (map_node_type, task_name, builtin_channel_name, secret_name,
+                             string_name, bytes_name, list_name, map_name, array_name, columns_name,
+                             scoped_name, option_name, none_constructor, some_constructor,
+                             array_type, columns_type, task_type, chan_type, scoped_type,
+                             width_type)
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (dummy_span)
 import compiler.emit.layout (ValueLayout, PlainWords, RecordFields, SumCases, InlineRecord,
@@ -20,7 +20,8 @@ import compiler.emit.layout (ValueLayout, PlainWords, RecordFields, SumCases, In
 import compiler.emit.abi (scoped_layout)
 import compiler.emit.evidence (is_evidence)
 import compiler.emit.representations
-import compiler.emit.representations (Constructors, SumConstructor, constructors_of)
+import compiler.emit.representations (applied, ints_joined, Constructors, SumConstructor,
+                                      constructors_of)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Generated, Drop, Dup, Copy, Share, Keep, generated_key)
 import compiler.emit.typed_ir (param_ownerships, param_borrowed, Var, Representation, AsWord, AsInt,
@@ -55,8 +56,7 @@ pub type BlockContents =
   | WordBlock({ parts: List<BlockPart>, words: Int })
   | ScopedContents(BlockPart)
   | BytesBlock
-  | ListOf({ node: RootKey, item: List<Part>, stride: Int })
-  | ListNodeOf({ node: RootKey, item: List<Part>, stride: Int })
+  | ListOf({ whole: RootKey, item: List<Part>, stride: Int })
   | MapOf(RootKey)
   | MapNodeOf({ node: RootKey, key: List<Part>, value: List<Part>, key_words: Int, value_words: Int })
   | ArrayOf({ element: List<Part>, stride: Int })
@@ -134,7 +134,7 @@ fn cases_of(
 fn args_at(cases: List<{ name: Bytes, args: List<Type> }>, k: Int) -> List<Type> =
   match cases.at(k) { Some(c) -> c.args, None -> [] }
 
-fn field_types(ty: Type) -> List<Type> =
+pub fn field_types(ty: Type) -> List<Type> =
   match record_fields(ty) { Some(fs) -> fs.map(|f: Field| f.ty), None -> [] }
 
 fn pointer(
@@ -174,7 +174,6 @@ fn is_emitted_block(name: Bytes) -> Bool =
     string_name(),
     bytes_name(),
     list_name(),
-    list_node_name(),
     map_name(),
     known::map_node_name(),
     array_name(),
@@ -196,16 +195,14 @@ pub fn released_variables(ty: Type) -> List<Int> =
         {
           at: acc.at + 1,
           vs: if representations::is_scope_label(c, acc.at) { acc.vs }
-          else { joined(acc.vs, released_variables(a)) },
+          else { ints_joined(acc.vs, released_variables(a)) },
         }).vs
     },
-    RecordType(fs) -> fs.fold([], |acc: List<Int>, f: Field| joined(acc, released_variables(f.ty))),
+    RecordType(fs) ->
+      fs.fold([], |acc: List<Int>, f: Field| ints_joined(acc, released_variables(f.ty))),
     NominalType(x) ->
-      x.fields.fold([], |acc: List<Int>, f: Field| joined(acc, released_variables(f.ty))),
+      x.fields.fold([], |acc: List<Int>, f: Field| ints_joined(acc, released_variables(f.ty))),
   }
-
-fn joined(a: List<Int>, b: List<Int>) -> List<Int> =
-  b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
 
 pub fn release_needs(f: Fn) -> Fn =
   { ..f, links: { ..f.links, needs: fn_needs(signature_needs(f.links.needs, f), f) } }
@@ -588,9 +585,7 @@ fn named_contents(
   let element = |t: Type| layout_parts(constructors, t, lies(t), 0);
   let stride = |t: Type| max(1, words(lies(t)));
   if name == string_name() || name == bytes_name() { BytesBlock } else if name == list_name() {
-    ListOf({ node: drop_of(list_node_type(arg(0))), item: element(arg(0)), stride: stride(arg(0)) })
-  } else if name == list_node_name() {
-    ListNodeOf({ node: drop_of(ty), item: element(arg(0)), stride: stride(arg(0)) })
+    ListOf({ whole: drop_of(ty), item: element(arg(0)), stride: stride(arg(0)) })
   } else if name == map_name() { MapOf(drop_of(map_node_type(arg(0), arg(1)))) }
   else if name == known::map_node_name() {
     MapNodeOf({
@@ -655,7 +650,6 @@ fn contents_reach(constructors: Constructors, o: BlockContents) -> Reach / {abor
       b.parts.fold(none, |acc: Reach, h: BlockPart|
         merge_reach(acc, parts_reach(stored_parts(constructors, h)))),
     ListOf(l) -> parts_reach(l.item),
-    ListNodeOf(n) -> parts_reach(n.item),
     MapOf(k) -> root(k),
     MapNodeOf(m) -> merge_reach(parts_reach(m.key), parts_reach(m.value)),
     ArrayOf(a) -> parts_reach(a.element),
@@ -1199,10 +1193,6 @@ pub fn counted_through(
 fn counts_in(parts: List<Part>) -> Int =
   parts.fold(0, |n: Int, p: Part| n + (match p { WordAt(_) -> 1, ByCase(_) -> 2 }))
 
-fn named(n: Bytes) -> Type = NamedType({ name: n, args: [] })
-
-fn applied(n: Bytes, args: List<Type>) -> Type = NamedType({ name: n, args: args })
-
 fn raw() -> WordClass = RawRange({ lo: 0, hi: 1 })
 
 fn object(ty: Type, at: Int) -> Part = WordAt({ at: at, masked: false, how: Object(drop_of(ty)) })
@@ -1217,24 +1207,23 @@ fn table() -> Constructors =
       { name: some_constructor(), index: 1, fields: [VariableType(0)], params: [0] },
     ]).insert(b"m.L", [
       { name: b"m.Nil", index: 0, fields: [], params: [] },
-      { name: b"m.Cons", index: 1, fields: [int_type(), named(b"m.L")], params: [] },
+      { name: b"m.Cons", index: 1, fields: [int_type(), named_type(b"m.L")], params: [] },
     ]).insert(b"m.E", [
       { name: b"m.Num", index: 0, fields: [int_type()], params: [] },
-      { name: b"m.Add", index: 1, fields: [named(b"m.E"), named(b"m.E")], params: [] },
+      { name: b"m.Add", index: 1, fields: [named_type(b"m.E"), named_type(b"m.E")], params: [] },
       { name: b"m.Name", index: 2, fields: [string_type()], params: [] },
-    ]).insert(b"m.A", [{ name: b"m.A", index: 0, fields: [named(b"m.B")], params: [] }]).insert(
-      b"m.B",
-      [
-        { name: b"m.Stop", index: 0, fields: [], params: [] },
-        { name: b"m.More", index: 1, fields: [named(b"m.A")], params: [] },
-      ],
-    ).insert(b"m.R", [
+    ]).insert(b"m.A", [
+      { name: b"m.A", index: 0, fields: [named_type(b"m.B")], params: [] },
+    ]).insert(b"m.B", [
+      { name: b"m.Stop", index: 0, fields: [], params: [] },
+      { name: b"m.More", index: 1, fields: [named_type(b"m.A")], params: [] },
+    ]).insert(b"m.R", [
       { name: b"m.Done", index: 0, fields: [], params: [] },
       { name: b"m.Text", index: 1, fields: [string_type()], params: [] },
     ]).insert(b"m.T", [
       { name: b"m.Hello", index: 0, fields: [], params: [] },
       { name: b"m.Bye", index: 1, fields: [], params: [] },
-      { name: b"m.Respond", index: 2, fields: [named(b"m.R")], params: [] },
+      { name: b"m.Respond", index: 2, fields: [named_type(b"m.R")], params: [] },
     ]).insert(b"m.Hue", [
       { name: b"m.Red", index: 0, fields: [], params: [] },
       { name: b"m.Blue", index: 1, fields: [], params: [] },
@@ -1260,7 +1249,7 @@ fn unkeepable_constructors() -> Constructors = {
       {
         name: b"m.Deep",
         index: 0,
-        fields: [NamedType({ name: b"m.Pair", args: [int_type(), named(b"m.Job")] })],
+        fields: [NamedType({ name: b"m.Pair", args: [int_type(), named_type(b"m.Job")] })],
         params: [],
       },
     ]).insert(b"m.Loop", [
@@ -1268,7 +1257,7 @@ fn unkeepable_constructors() -> Constructors = {
       {
         name: b"m.Again",
         index: 1,
-        fields: [named(b"m.Loop"), scoped_type(label_type(b"r"), int_type())],
+        fields: [named_type(b"m.Loop"), scoped_type(label_type(b"r"), int_type())],
         params: [],
       },
     ]).insert(b"m.Act", [
@@ -1312,22 +1301,25 @@ test "a block reaching a handle, a scoped value or a function value at any depth
     array_type(RecordType([{ name: b"s", ty: secret_type(string_type()) }])),
     columns_type(RecordType([{ name: b"f", ty: fun }, { name: b"n", ty: int_type() }])),
     option_type(option_type(task_type(int_type()))),
-    named(b"m.Job"),
+    named_type(b"m.Job"),
     con(b"m.Pair", [chan, string_type()]),
     con(b"m.Pair", [int_type(), list_type(chan)]),
-    named(b"m.Deep"),
-    named(b"m.Loop"),
-    named(b"m.Act"),
+    named_type(b"m.Deep"),
+    named_type(b"m.Loop"),
+    named_type(b"m.Act"),
     scoped_type(label_type(b"r"), int_type()),
-    RecordType([{ name: b"a", ty: named(b"m.E") }, { name: b"b", ty: list_type(named(b"m.Job")) }]),
+    RecordType([
+      { name: b"a", ty: named_type(b"m.E") },
+      { name: b"b", ty: list_type(named_type(b"m.Job")) },
+    ]),
   ];
   let kept = [
     string_type(),
     list_type(int_type()),
     columns_type(RecordType([{ name: b"n", ty: int_type() }])),
     option_type(string_type()),
-    named(b"m.E"),
-    named(b"m.A"),
+    named_type(b"m.E"),
+    named_type(b"m.A"),
     con(b"m.Pair", [int_type(), string_type()]),
     con(b"m.Ghost", [chan]),
   ];
@@ -1478,16 +1470,16 @@ fn point_laid() -> ValueLayout =
 
 fn laid_for(ty: Type) -> ValueLayout / {abort.raise} =
   if ty == point() { point_laid() }
-  else if ty == named(b"m.L") { SumCases(list_laid()) }
-  else if ty == named(b"m.E") { SumCases(expression_laid()) }
+  else if ty == named_type(b"m.L") { SumCases(list_laid()) }
+  else if ty == named_type(b"m.E") { SumCases(expression_laid()) }
   else if ty == option_type(string_type()) { SumCases(maybe_laid()) }
-  else if ty == named(b"m.A") { SumCases(alone_laid()) }
-  else if ty == named(b"m.B") { SumCases(mixed_sum_layout()) }
-  else if ty == named(b"m.R") { SumCases(reply_layout()) }
-  else if ty == named(b"m.T") { SumCases(todo_laid()) }
-  else if ty == named(b"m.Hue") { SumCases(two_nullary_layout()) }
-  else if ty == option_type(named(b"m.R")) { SumCases(maybe_of(reply_layout())) }
-  else if ty == option_type(named(b"m.Hue")) { SumCases(maybe_of(two_nullary_layout())) }
+  else if ty == named_type(b"m.A") { SumCases(alone_laid()) }
+  else if ty == named_type(b"m.B") { SumCases(mixed_sum_layout()) }
+  else if ty == named_type(b"m.R") { SumCases(reply_layout()) }
+  else if ty == named_type(b"m.T") { SumCases(todo_laid()) }
+  else if ty == named_type(b"m.Hue") { SumCases(two_nullary_layout()) }
+  else if ty == option_type(named_type(b"m.R")) { SumCases(maybe_of(reply_layout())) }
+  else if ty == option_type(named_type(b"m.Hue")) { SumCases(maybe_of(two_nullary_layout())) }
   else if ty == int_type() || ty == bool_type() { PlainWords([raw()]) }
   else if ty == float_type() { PlainWords([raw()]) }
   else if ty == width_type({ bits: 128, signed: false }) || ty == decimal_type() {
@@ -1498,7 +1490,7 @@ fn form_for(ty: Type) -> WordForm / {abort.raise} =
   if ty == int_type() || ty == bool_type() || ty == float_type() { Bits }
   else if ty == width_type({ bits: 128, signed: false }) || ty == decimal_type() { RuntimeBox }
   else if ty == point() { Box(3) }
-  else if ty == named(b"m.E") { Box(2) }
+  else if ty == named_type(b"m.E") { Box(2) }
   else { Itself }
 
 fn generated_here(k: RootKey) -> Fn / {abort.raise} = generated_with(table(), k, laid_for, form_for)
@@ -1534,13 +1526,13 @@ test "a record counts its pointers at their words, a record held in it at its ow
     } with {
       abort.raise(m) -> Bytes::of_string(m),
     };
-  assert(said(named(b"m.Opaque")).contains(unknown_pointer()), None);
+  assert(said(named_type(b"m.Opaque")).contains(unknown_pointer()), None);
   assert(said(representations::word_type()).contains(b"only a key no build makes"), None)
 }
 
 test "a sum of one word goes to its own drop root, but as its payload where one case lays a pointer alone" {
   let maybe = option_type(string_type());
-  let l = named(b"m.L");
+  let l = named_type(b"m.L");
   let sum_word = |root: Type| [WordAt({ at: 0, masked: false, how: SumWord(drop_of(root)) })];
   assert_eq(layout_parts(table(), maybe, SumCases(maybe_laid()), 0), [object(string_type(), 0)]);
   assert_eq(
@@ -1555,7 +1547,7 @@ test "a sum of one word goes to its own drop root, but as its payload where one 
 }
 
 test "a wider sum is let go of by its case, a boxed case at its box's own root" {
-  let e = named(b"m.E");
+  let e = named_type(b"m.E");
   let by_case = ByCase({
     at: 0,
     sum: expression_laid(),
@@ -1655,7 +1647,7 @@ test "a flat record's leaves count by their fields' types" {
 }
 
 test "a box a case is held in alone is a sum of one word whose one case is that one, boxed at it" {
-  let e = named(b"m.E");
+  let e = named_type(b"m.E");
   let rep = boxed_case_rep(table(), e, expression_laid(), 1);
   assert_eq(
     rep,
@@ -1736,18 +1728,18 @@ test "a box's drop root opens it, binding its counted words, and lets go of each
       returned: OwnedResult,
     });
     let d = dropping(f.body);
-    assert_eq(d.opened.map(|v: Var| v.ty), [named(b"String"), applied(b"List", [int_type()])]);
+    assert_eq(d.opened.map(|v: Var| v.ty), [named_type(b"String"), applied(b"List", [int_type()])]);
     assert_eq(d.decremented, d.opened)
   }
 }
 
 test "a sum whose one case is boxed at its word is that box, opened as it is" {
   {
-    let f = generated_here(drop_of(named(b"m.A")));
+    let f = generated_here(drop_of(named_type(b"m.A")));
     match arm_of(f, 0) {
       Some(a) -> {
         let d = dropping(a.body);
-        assert_eq(d.opened.map(|v: Var| v.ty), [named(b"m.B")]);
+        assert_eq(d.opened.map(|v: Var| v.ty), [named_type(b"m.B")]);
         assert_eq(d.decremented, d.opened)
       },
       None -> assert(false, None),
@@ -1756,7 +1748,7 @@ test "a sum whose one case is boxed at its word is that box, opened as it is" {
 }
 
 test "a sum of one word whose case lays a sum of one word in place lets go of it by that sum's own case" {
-  let reply = named(b"m.R");
+  let reply = named_type(b"m.R");
   let by_its_case = |b: Block|
     b.any(|i: Inst|
       match i {
@@ -1767,7 +1759,7 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
             ).opened.any(|v: Var| v.ty == string_type()),
         _ -> false,
       });
-  let todo = named(b"m.T");
+  let todo = named_type(b"m.T");
   assert_eq(todo_laid().classes.len(), 1);
   {
     let f = generated_here(drop_of(todo));
@@ -1785,7 +1777,7 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
     let f = generated_here(drop_of(applied(b"Option", [reply])));
     match arm_of(f, 1) { Some(a) -> assert(by_its_case(a.body), None), None -> assert(false, None) }
   };
-  let hues = option_type(named(b"m.Hue"));
+  let hues = option_type(named_type(b"m.Hue"));
   assert_eq(case_blocks(table(), hues, maybe_of(two_nullary_layout())), []);
   assert_eq(
     case_blocks(table(), todo, todo_laid()).map(
@@ -1797,7 +1789,7 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
 }
 
 test "a boxed case's drop root holds its sums whole, and a sum of its type there is no chain to loop on" {
-  let e = named(b"m.E");
+  let e = named_type(b"m.E");
   let boxed = match boxed_case_rep(table(), e, expression_laid(), 1) {
     Some(r) -> r,
     None -> AsWord,
@@ -1829,18 +1821,8 @@ test "a container's drop root opens it whole, and its opening names its parts' r
   let opened = |ty: Type| contents_with(table(), ty, AsWord, laid_for, form_for);
   assert_eq(
     opened(list),
-    ListOf({
-      node: drop_of(list_node_type(string_type())),
-      item: [object(string_type(), 0)],
-      stride: 1,
-    }),
+    ListOf({ whole: drop_of(list), item: [object(string_type(), 0)], stride: 1 }),
   );
-  let node = list_node_type(string_type());
-  assert_eq(
-    opened(node),
-    ListNodeOf({ node: drop_of(node), item: [object(string_type(), 0)], stride: 1 }),
-  );
-  assert_eq(layout_parts(table(), node, PlainWords([Pointer]), 0), [object(node, 0)]);
   let pairs = map_node_type(int_type(), string_type());
   assert_eq(layout_parts(table(), pairs, PlainWords([Pointer]), 0), [object(pairs, 0)]);
   assert_eq(
@@ -1854,13 +1836,13 @@ test "a container's drop root opens it whole, and its opening names its parts' r
   assert_eq(opened(decimal_type()), ScalarBox(2));
   assert_eq(opened(width_type({ bits: 128, signed: false })), ScalarBox(2));
   assert_eq(
-    opened(named(b"m.E")),
+    opened(named_type(b"m.E")),
     WordBlock({
       parts: [
         {
           at: 0,
-          ty: named(b"m.E"),
-          representation: sum_rep(table(), named(b"m.E"), expression_laid()),
+          ty: named_type(b"m.E"),
+          representation: sum_rep(table(), named_type(b"m.E"), expression_laid()),
         },
       ],
       words: 2,
@@ -1898,27 +1880,8 @@ test "a word a block holds is its type's word form, a function's or a continuati
   }
 }
 
-test "a program's own `ListNode` is its own type, released as its declaration lays it, not as the prelude's node" {
-  let own = named(b"m.ListNode");
-  let declared = constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(b"m.ListNode", [
-      { name: b"m.Node", index: 0, fields: [string_type()], params: [] },
-      { name: b"m.End", index: 1, fields: [], params: [] },
-    ]),
-  );
-  assert_eq(
-    match block_contents(declared, own, AsWord) { ListNodeOf(_) -> true, _ -> false },
-    false,
-  );
-  assert_eq(layout_parts(declared, own, PlainWords([Pointer]), 0), [object(own, 0)]);
-  assert(drop_of(own) != drop_of(applied(list_node_name(), [])), None)
-}
-
 test "a list's drop root, read off the layout module's own layout, loops on its tail" {
-  let l = named(b"m.L");
+  let l = named_type(b"m.L");
   {
     let f = generated(table(), drop_of(l));
     match f.body {
@@ -1942,7 +1905,7 @@ test "a list's drop root, read off the layout module's own layout, loops on its 
 }
 
 test "a wide sum laid by the layout module is let go of by case, its boxed case at that case's root" {
-  let e = named(b"m.E");
+  let e = named_type(b"m.E");
   match representations::layout_of(table(), e) {
     SumCases(s) -> {
       assert(s.classes.len() > 1, None);
@@ -1974,9 +1937,9 @@ test "a wide sum laid by the layout module is let go of by case, its boxed case 
 }
 
 test "copy, share and keep roots walk a block, a sum of one word through its word, a boxed case its box" {
-  let node = list_node_type(string_type());
-  let l = named(b"m.L");
-  let e = named(b"m.E");
+  let node = map_node_type(int_type(), string_type());
+  let l = named_type(b"m.L");
+  let e = named_type(b"m.E");
   let walk = |f: Fn|
     f.body.fold(
       None,
@@ -2023,7 +1986,7 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
 }
 
 test "a dup root counts its word form once more and returns it; a release root lets go of it" {
-  let k = |op: keys::TypeOp| generated_key(op, named(b"String"), b"m");
+  let k = |op: keys::TypeOp| generated_key(op, named_type(b"String"), b"m");
   {
     let f = generated_here(k(Dup));
     let o = f.params.get(0);

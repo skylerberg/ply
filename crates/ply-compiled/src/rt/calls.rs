@@ -28,14 +28,40 @@ pub unsafe extern "C" fn rt_scheduler_left(ctx: *mut Ctx, was: Word) {
     }
 }
 
-/// A read of the pure nullary definition at `index` in the unit's code table, which emitted code
-/// writes for a plain definition's read: its value's word form. The first read evaluates the
-/// definition and hands `keep`, the `keep#T` root of its type, the value, whose immortal copy the
-/// unit then keeps for good; each later read returns that copy. A value `keep` returns 0 for, one
-/// that may not outlive its entry, is kept nowhere, and each read evaluates the definition again.
-/// Where the evaluation fails or raises, this returns 0 with the context as the evaluation left it,
-/// and keeps nothing. Contexts reading one definition at once, on `parallel` branches or other
-/// threads, may each evaluate it; the first copy kept is the one every later read returns.
+/// Keeps `kept`, an immortal copy, as the constant at code-table `index`. Only the first copy kept
+/// stays, so emitted code on any thread reads one value for good.
+pub unsafe extern "C" fn rt_keep_constant(ctx: *mut Ctx, index: I64, kept: Word) {
+    if let Ok(index) = usize::try_from(index.0) {
+        unsafe { &*ctx }.tables.keep(index, kept);
+    }
+}
+
+/// Ends the run on a raise that left a `const fn`'s body, so no handler around the read takes it:
+/// the definition's effects say it raises nothing. Any other failure stands as it is.
+pub unsafe extern "C" fn rt_const_failed(ctx: *mut Ctx) {
+    let c = unsafe { &mut *ctx };
+    if c.failed == FAILED_PENDING {
+        if let Some(p) = c.pending.take() {
+            p.release();
+        }
+        c.failed = FAILED;
+        c.diagnostic = c.diagnostic.take().map(|d| {
+            d.note(
+                "a `const fn` must return a value: a raise that leaves its body ends the run, \
+                 and no handler around the read can catch it",
+            )
+        });
+    }
+}
+
+/// A read of the pure nullary definition at `index` in the unit's code table, for code the release
+/// compiled: its value's word form. The first read evaluates the definition and hands `keep`, the
+/// `keep#T` root of its type, the value, whose immortal copy the unit then keeps for good; each
+/// later read returns that copy. A value `keep` returns 0 for, one that may not outlive its entry,
+/// is kept nowhere, and each read evaluates the definition again. Where the evaluation fails or
+/// raises, this returns 0 with the context as the evaluation left it, and keeps nothing. Contexts
+/// reading one definition at once, on `parallel` branches or other threads, may each evaluate it;
+/// the first copy kept is the one every later read returns.
 pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
     if let Some(w) = memoized(unsafe { &*ctx }, index) {
         return Handed::of(w);
@@ -51,19 +77,7 @@ pub unsafe extern "C" fn rt_const(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> 
         return Handed::of(w);
     }
     let w = unsafe { evaluated(ctx, index, keep) };
-    let c = unsafe { &mut *ctx };
-    if c.failed == FAILED_PENDING {
-        if let Some(p) = c.pending.take() {
-            p.release();
-        }
-        c.failed = FAILED;
-        c.diagnostic = c.diagnostic.take().map(|d| {
-            d.note(
-                "a `const fn` must return a value: a raise that leaves its body ends the run, \
-                 and no handler around the read can catch it",
-            )
-        });
-    }
+    unsafe { rt_const_failed(ctx) };
     w
 }
 

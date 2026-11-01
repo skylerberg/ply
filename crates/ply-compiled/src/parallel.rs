@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 
-/// The machine whose branch this thread runs, or 0: what a thread started to run on its behalf is to
-/// [`inherit_branch`].
+/// Returns the machine whose `parallel` branch this thread is running, or 0 if it is running none.
 pub(crate) fn thread_branch() -> u64 {
     BRANCH_OF.with(Cell::get)
 }
 
-/// Counts this thread as running a branch of `machine`, as the thread that started it and waits for
-/// it does: a block here must not wait for the pool thread that waits for this one.
+/// Marks this thread as running a `parallel` branch of `machine`. A thread that runs a test takes
+/// this from the pool thread waiting for it, so the test's own `parallel` blocks run in order and
+/// never wait for that pool thread.
 pub(crate) fn inherit_branch(machine: u64) {
     BRANCH_OF.with(|of| of.set(machine));
 }
@@ -128,8 +128,8 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     }
 }
 
-/// Whether any thread may perform through every word of the effects whose descriptor and words are
-/// `words`: where one may not, what handles it is reached only from the thread that holds it.
+/// Returns whether another thread may call every evidence object in `words`, the descriptor and
+/// array a `parallel` block hands its branches.
 fn shared_only((desc, words): (Word, Word)) -> bool {
     if desc == 0 {
         return true;

@@ -262,7 +262,5 @@ pub unsafe extern "C" fn rt_failed(
     }
 }
 
-/// A write of one element the emitted code made: in place, or into a copy of `copied` elements.
-pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, in_place: i64, copied: i64) {
-    ply_core::rc::note_update_of(in_place != 0, copied as usize, Span::DUMMY);
-}
+/// Does nothing: the release's emitter still calls it in the builder it makes.
+pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, _in_place: i64, _copied: i64) {}
