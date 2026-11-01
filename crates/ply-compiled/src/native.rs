@@ -46,7 +46,6 @@ impl MachineType {
 pub struct Signature {
     pub params: &'static [MachineType],
     pub result: Option<MachineType>,
-    pub raises: bool,
 }
 
 impl Signature {
@@ -58,10 +57,6 @@ impl Signature {
         self.result.is_some()
     }
 }
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Raises(pub ());
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,35 +108,23 @@ unsafe impl Taken for Out {
 
 pub unsafe trait Returned {
     const MACHINE: Option<MachineType>;
-    const RAISES: bool;
     fn of(w: Word) -> Self;
 }
 
 unsafe impl Returned for () {
     const MACHINE: Option<MachineType> = None;
-    const RAISES: bool = false;
     fn of(_: Word) -> Self {}
 }
 
 unsafe impl Returned for Word {
     const MACHINE: Option<MachineType> = Some(MachineType::Word);
-    const RAISES: bool = false;
     fn of(w: Word) -> Self {
         w
     }
 }
 
-unsafe impl Returned for Raises {
-    const MACHINE: Option<MachineType> = None;
-    const RAISES: bool = true;
-    fn of(_: Word) -> Self {
-        Raises(())
-    }
-}
-
 unsafe impl Returned for I64 {
     const MACHINE: Option<MachineType> = Some(MachineType::I64);
-    const RAISES: bool = false;
     fn of(w: Word) -> Self {
         I64(w)
     }
@@ -149,7 +132,6 @@ unsafe impl Returned for I64 {
 
 unsafe impl Returned for F64 {
     const MACHINE: Option<MachineType> = Some(MachineType::F64);
-    const RAISES: bool = false;
     fn of(w: Word) -> Self {
         F64(w as u64)
     }
@@ -157,7 +139,6 @@ unsafe impl Returned for F64 {
 
 unsafe impl Returned for TakenBytes {
     const MACHINE: Option<MachineType> = Some(MachineType::Taken);
-    const RAISES: bool = false;
     fn of(w: Word) -> Self {
         TakenBytes(w)
     }
@@ -174,7 +155,6 @@ macro_rules! natives_taking {
             const SIGNATURE: Signature = Signature {
                 params: &[$($a::MACHINE),*],
                 result: R::MACHINE,
-                raises: R::RAISES,
             };
             fn address(self) -> *const () {
                 self as *const ()

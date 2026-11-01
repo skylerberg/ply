@@ -78,7 +78,7 @@ fn facts() -> Vec<(&'static str, usize)> {
 
 fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
     let result = s.result.map_or("-", MachineType::name);
-    let _ = write!(out, "{kind} {name} {} {result}", u8::from(s.raises));
+    let _ = write!(out, "{kind} {name} 0 {result}");
     for p in s.params {
         let _ = write!(out, " {}", p.name());
     }

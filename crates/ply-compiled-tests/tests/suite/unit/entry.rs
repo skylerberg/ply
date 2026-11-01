@@ -1,7 +1,8 @@
 use crate::units::{self, Def, def, int_entry, lifting, native};
-use ply_compiled::entry::{self, Ended, Opened, Run};
+use ply_compiled::entry::{self, Ended, Opened, Run, overdue_lines};
 use ply_core::codec::{Reader, Writer, tag};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub fn string_read() -> String {
     format!(
@@ -68,9 +69,8 @@ pub fn encoded_defs() -> Vec<Def> {
             "m.fail#entered",
             0,
             &format!(
-                "{}  {}(ctx, 21, (Word)(intptr_t)buf, n, 0, 0);\n  return 0;",
+                "{}  Word texts[] = {{ (Word)(intptr_t)\"E0501\", 5, (Word)(intptr_t)\"assertion failed: condition is false\", 36, (Word)(intptr_t)\"here\", 4, (Word)(intptr_t)buf, n }};\n  rt_failed_p(ctx, 1, (Word)(intptr_t)texts, 1, 0);\n  return 0;",
                 lifting(&string_read()),
-                native("?refused_text"),
             ),
         ),
         def("m.helper", 1, "  return p0;"),
@@ -307,4 +307,18 @@ fn an_exported_function_that_returns_a_task_fails_with_a_diagnostic_naming_the_t
         }
         _ => panic!("the boundary did not reject the task"),
     }
+}
+
+#[test]
+fn the_heartbeat_names_only_tests_past_its_interval_longest_first() {
+    let now = Instant::now();
+    let tests = [
+        ("quick".to_string(), now - Duration::from_secs(5)),
+        ("slow".to_string(), now - Duration::from_secs(40)),
+        ("slowest".to_string(), now - Duration::from_secs(95)),
+    ];
+    assert_eq!(
+        overdue_lines(&tests, now, Duration::from_secs(30)),
+        ["   running for 95s: slowest", "   running for 40s: slow"]
+    );
 }

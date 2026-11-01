@@ -7,13 +7,6 @@ use ring::test::rand::FixedSliceRandom;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-#[cold]
-pub fn misuse(span: Span, what: &str, reason: String) -> Diagnostic {
-    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what}: {reason}"))
-        .primary(span, "called here")
-        .note("`std.crypto` and `std.hash` name what the runtime takes; they are the callers these builtins are for")
-}
-
 fn within(c: u8, lo: u8, hi: u8) -> i32 {
     let c = i32::from(c);
     ((i32::from(lo) - 1 - c) & (c - i32::from(hi) - 1)) >> 31

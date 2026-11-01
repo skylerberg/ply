@@ -8,9 +8,10 @@ NEXTEST_SHARDS=2
 
 TAB=$'\t'
 
-CLI_PARTS=4
-RUNS_ALONE=(package-compiler)
-NIGHTLY=(cli-tests:repository_audit cli-tests:copies cli-tests:edit_sessions std-tests:db_driver std-tests:pg_client)
+CLI_PARTS=2
+IN_PROCESS_SUITE=tests/in_process
+RUNS_ALONE=(package-compiler package-in_process)
+NIGHTLY=(in-process:repository_audit in-process:copies in-process:edit_sessions cli-tests:edit_matrix std-tests:db_driver std-tests:pg_client)
 RUNS_MARGIN=4
 HOST_PACKAGES=(ply-host-tests)
 
@@ -65,7 +66,10 @@ workspace() {
   for dir in $(role fixtures); do FIXTURE_SOURCES+=("$dir"); done
 }
 
-role() { awk -v r="$1" '$1 == r { print $2 }' <<< "$WORK"; }
+role() {
+  if [[ $1 == in-process ]]; then printf '%s\n' "$IN_PROCESS_SUITE"; return; fi
+  awk -v r="$1" '$1 == r { print $2 }' <<< "$WORK"
+}
 
 cmd_ply_trees() {
   {
@@ -208,7 +212,11 @@ cmd_run_line() {
       ;;
     package-*)
       path=$(package_path "${id#package-}") || { echo "no package suite named '${id#package-}'" >&2; return 1; }
-      printf '%s\t\t\n' "$path"
+      if [[ $path == "$IN_PROCESS_SUITE" ]]; then
+        printf '%s\t%s\t\n' "$path" "$(suite_filters in-process "$path")"
+      else
+        printf '%s\t\t\n' "$path"
+      fi
       ;;
     laws-*)
       path=$(proofs_path "${id#laws-}") || { echo "no package's proofs named '${id#laws-}'" >&2; return 1; }
@@ -921,14 +929,20 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  local module keys outside
-  keys=$(package_keys "$CLI_SUITE")
-  for module in $(modules_of "$CLI_SUITE"); do
-    outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
-    if [[ -n $outside ]]; then
-      echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $CLI_SUITE/$module.ply, so the module's filter picks that test too" >&2
-      failures=$((failures + 1))
-    fi
+  if ! grep -qxF -- "$IN_PROCESS_SUITE" <<< "$(role suite)"; then
+    echo "FAIL: ply.work lists no suite at $IN_PROCESS_SUITE, which IN_PROCESS_SUITE names" >&2
+    failures=$((failures + 1))
+  fi
+  local module keys outside suite
+  for suite in "$CLI_SUITE" "$IN_PROCESS_SUITE"; do
+    keys=$(package_keys "$suite")
+    for module in $(modules_of "$suite"); do
+      outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
+      if [[ -n $outside ]]; then
+        echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $suite/$module.ply, so the module's filter picks that test too" >&2
+        failures=$((failures + 1))
+      fi
+    done
   done
   local file claimed
   while IFS= read -r file; do
@@ -1053,8 +1067,9 @@ case "${1:-}" in
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) nightly_of "${2:?a role}" | paste -sd ' ' - ;;
+  in-process-suite) printf '%s\n' "$IN_PROCESS_SUITE" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules|in-process-suite}" >&2
     exit 2
     ;;
 esac

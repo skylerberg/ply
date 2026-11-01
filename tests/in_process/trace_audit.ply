@@ -1,0 +1,114 @@
+import harness (scratch, in_memory, one_module_tree, on_disk)
+import spawning.harness (write_project, json_of, at, path, items, str, json_text, diagnostic_codes)
+import std.json
+import std.json (Json, Bool)
+import std.string
+
+fn service() -> String =
+  \\import std.trace
+  \\import std.trace (trace)
+  \\
+  \\pub fn place_order(sku: String) -> Int / {trace.enter[orders], trace.exit[orders], trace.count[orders]} = {
+  \\  let span = trace.enter[orders]("place_order", Map::new());
+  \\  trace.count[orders]("orders_placed", 1, Map::new());
+  \\  trace.exit[orders](span, trace::Ok);
+  \\  1
+  \\}
+  \\
+  \\pub fn restock(sku: String) -> Int / {trace.event[items]} = {
+  \\  trace.event[items](trace::Info, "restocked", Map::new());
+  \\  2
+  \\}
+  \\
+  \\test "what place_order records is a claim a test can assert on" {
+  \\  let rs = handle {
+  \\    assert_eq(place_order("BOLT-1"), 1)
+  \\  } with {
+  \\    var s = trace::sink(),
+  \\    trace.enter[orders](n, fs) -> {
+  \\      let out = trace::enter_step(s, "orders", n, fs);
+  \\      s = out.sink;
+  \\      out.span
+  \\    },
+  \\    trace.exit[orders](span, o) -> {
+  \\      let out = trace::exit_step(s, span, o);
+  \\      s = out.sink;
+  \\      assert(out.ok)
+  \\    },
+  \\    trace.count[orders](n, d, fs) -> {
+  \\      s = trace::count_step(s, "orders", n, d, fs);
+  \\    },
+  \\    return u -> trace::drain(s),
+  \\  };
+  \\  assert_eq(rs.len(), 3);
+  \\  assert_eq(trace::counter_total(rs, "orders_placed"), 1);
+  \\  assert_eq(trace::on_channel(rs, "items").len(), 0)
+  \\}
+  \\
+  \\test "what restock records is recorded on its own channel" {
+  \\  let rs = handle {
+  \\    assert_eq(restock("BOLT-1"), 2)
+  \\  } with {
+  \\    var s = trace::sink(),
+  \\    trace.event[items](l, n, fs) -> {
+  \\      s = trace::event_step(s, "items", l, n, fs);
+  \\    },
+  \\    return u -> trace::drain(s),
+  \\  };
+  \\  assert_eq(trace::on_channel(rs, "items").len(), 1)
+  \\}
+  \\
+
+fn leaking() -> String =
+  \\import std.trace
+  \\import std.trace (StringField, trace)
+  \\
+  \\pub fn login(user: String, password: Secret<String>) -> Unit / {trace.event[auth]} =
+  \\  trace.event[auth](trace::Info, "login", #{"user": StringField(user), "password": StringField(password)})
+  \\
+
+test "a program that traces a `Secret` value fails to check with E0201, because `Secret` is not a valid trace field" {
+  let report = json_of(in_memory(one_module_tree(leaking()), ["check", "--json"]));
+  assert_eq(diagnostic_codes(report), ["E0201"]);
+  assert(json_text(report).contains("Secret<String>"), Some(json_text(report)))
+}
+
+test "`ply hosts` lists the trace handler for each channel and names the output the run uses" {
+  scratch(|| {
+    write_project([{ path: "app.ply", text: service() }]);
+    let listing = json_of(on_disk(["hosts", "--trace", "off", "--json"]));
+    let traced = items(at(listing, "hosts")).filter(|r: Json|
+      str(at(r, "effect")) == "std.trace.trace");
+    assert(
+      traced != [],
+      Some("the sink is a member of the trusted computing base: " ++ json_text(listing)),
+    );
+    assert(
+      traced.filter(|r: Json| str(at(r, "handler")) != "std.trace.host_handler").len() == 0,
+      Some("every channel is served by the module's host handler: " ++ json_text(listing)),
+    );
+    assert(
+      str(path(listing, ["observability", "sink"])) == "ply_host::trace::discard",
+      Some("`--trace off` is a listed sink, not an empty registry: " ++ json_text(listing)),
+    );
+    let traced_effects = traced.map(|r: Json| str(at(r, "triple")));
+    let has = |a: String| traced_effects.filter(|x: String| x == a).len() > 0;
+    assert(
+      has("std.trace.trace.count[orders]") && has("std.trace.trace.event[items]")
+        && !has("std.trace.trace.count[items]"),
+      Some(
+        "the listing expands to the channels the program uses: "
+          ++ String::join(traced_effects, ", "),
+      ),
+    );
+    assert(
+      traced.filter(|r: Json|
+          at(r, "deterministic") != Bool(false) || str(at(r, "linearity")) != "at_most_once"
+            || at(r, "blocking") != Bool(false)).len(
+        )
+        == 0,
+      Some(json_text(listing)),
+    );
+    assert(traced.len() == 4, Some(json_text(listing)))
+  })
+}

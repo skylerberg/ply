@@ -1,0 +1,61 @@
+import harness (Shipped, LoadedProgram, call, load_program, scratch, unload_program)
+import spawning.harness (WorkingDirectory, write_project)
+import cli.machine (default_options)
+import std.machine as entering
+import std.value (VInt)
+
+effect set MachineAccess = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
+
+fn parked() -> String = String::of_bytes_lossy(embed("../programs/scheduler_boundary/parked.ply"))
+
+fn load_continuation_program() -> LoadedProgram / {WorkingDirectory, Shipped, MachineAccess, abort.raise} = {
+  write_project([{ path: "inner.ply", text: parked() }]);
+  load_program(default_options())
+}
+
+fn raised_error(
+  l: LoadedProgram,
+  name: String,
+) -> { code: Bytes, message: String } / {MachineAccess, abort.raise} =
+  match call(l, name, []) {
+    Ok(_) -> panic("`" ++ name ++ "` returned"),
+    Err(d) -> { code: d.code, message: String::of_bytes_lossy(d.message) },
+  }
+
+test "an entry function that returns a suspended computation fails with E0449 on each call, and no call resumes another call's" {
+  scratch(|| {
+    let l = load_continuation_program();
+    range(0, 2).fold((), |u: Unit, i: Int| {
+      let d = raised_error(l, "suspended");
+      assert_eq(d.code, b"E0449");
+      assert(d.message.contains("`inner.suspended` returned a continuation"), Some(d.message));
+      assert(d.message.contains("Resumable`'s argument 1"), Some(d.message))
+    });
+    let resumed = range(0, 2).map(|n: Int| call(l, "add_resumed_result", [VInt(n)]));
+    let _ = unload_program(l);
+    assert(
+      match resumed { [Ok(VInt(41)), Ok(VInt(42))] -> true, _ -> false },
+      Some("an entry resumed a continuation another entry parked"),
+    )
+  })
+}
+
+test "an entry function that returns a `Task` fails with E0449, the same error as returning a suspended computation" {
+  scratch(|| {
+    let l = load_continuation_program();
+    let d = raised_error(l, "spawned");
+    let _ = unload_program(l);
+    assert_eq(d.code, b"E0449");
+    assert(d.message.contains("`inner.spawned` returned a `Task`"), Some(d.message))
+  })
+}
+
+test "joining a `Task` that belongs to another scheduler fails with E0413 instead of returning a result from that scheduler" {
+  scratch(|| {
+    let l = load_continuation_program();
+    let d = raised_error(l, "join_spawned_task");
+    let _ = unload_program(l);
+    assert_eq(d.code, b"E0413");
+    assert(d.message.contains("another scheduler"), Some(d.message))
+  })
+}

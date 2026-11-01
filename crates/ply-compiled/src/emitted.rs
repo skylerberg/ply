@@ -300,7 +300,6 @@ unsafe impl Taken for *const Handed {
 
 unsafe impl Returned for Block {
     const MACHINE: Option<MachineType> = Some(MachineType::Block);
-    const RAISES: bool = false;
     fn of(w: Word) -> Block {
         Block(w)
     }
@@ -308,7 +307,6 @@ unsafe impl Returned for Block {
 
 unsafe impl Returned for Handed {
     const MACHINE: Option<MachineType> = Some(MachineType::Handed);
-    const RAISES: bool = false;
     fn of(w: Word) -> Handed {
         Handed(w)
     }
@@ -316,7 +314,6 @@ unsafe impl Returned for Handed {
 
 unsafe impl Returned for Handle {
     const MACHINE: Option<MachineType> = Some(MachineType::Handle);
-    const RAISES: bool = false;
     fn of(w: Word) -> Handle {
         Handle(w)
     }
@@ -324,7 +321,6 @@ unsafe impl Returned for Handle {
 
 unsafe impl Returned for SecretHandle {
     const MACHINE: Option<MachineType> = Some(MachineType::Secret);
-    const RAISES: bool = false;
     fn of(w: Word) -> SecretHandle {
         SecretHandle(w)
     }

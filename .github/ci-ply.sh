@@ -4,7 +4,10 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
-work() { "$ply" work "$root" | awk -v r="$1" '$1 == r { print $2 }'; }
+work() {
+  if [[ $1 == in-process ]]; then "$shards" in-process-suite; return; fi
+  "$ply" work "$root" | awk -v r="$1" '$1 == r { print $2 }'
+}
 TAB=$'\t'
 caches=/tmp
 mark=$caches/ply-c-runs.mark
@@ -20,8 +23,8 @@ pg=$(postgres_bin)
 
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
-  --fs cwd=. --fs abs=/ --fs "repo=$root"
-  --allow machine --allow shipped --allow toolchain)
+  --fs cwd=. --fs abs=/ --fs "repo=$root")
+in_process_grants=("${cli_grants[@]}" --allow machine --allow shipped --allow toolchain)
 
 deadline=${PLY_CI_DEADLINE:-}
 STOPPED=124
@@ -58,10 +61,12 @@ unreported() {
 tested() {
   local path=$1 status=0 dir
   shift
-  if [[ $path == "$(work cli-tests)" ]]; then
+  if [[ $path == "$(work cli-tests)" || $path == "$(work in-process)" ]]; then
+    local -a grants=("${cli_grants[@]}")
+    [[ $path == "$(work in-process)" ]] && grants=("${in_process_grants[@]}")
     dir=$(mktemp -d)
     touch "$dir/.ply-scratch"
-    (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
+    (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${grants[@]}") || status=$?
     rm -rf "$dir"
   elif [[ $path == "$(work std)" || $path == "$(work std-tests)" ]]; then
     dir=$caches/ply-std-scratch

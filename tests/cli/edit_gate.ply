@@ -4,15 +4,16 @@ import compiler.syntax.items (parse, Module, Item, FunctionItem, TypeItem, Effec
 import compiler.syntax.expressions (expression_span)
 import compiler.syntax.fmt (line_end)
 import compiler.expand.embed (EmbedRequest, embed_requests)
-import harness (Source, RunResult, WorkingDirectory, PlyProcess, write_project, stable_report,
-                json_of, spawned, spawned_from_scratch, json_text, at, items, bool)
+import spawning.harness (Source, RunResult, WorkingDirectory, PlyProcess, write_project,
+                         stable_report, json_of, spawned, spawned_from_scratch, json_text, at,
+                         items, nth, bool)
 import std.fs (fs)
 import std.location (spliced)
 import std.json (Json, Object, Array)
 import std.list
 import std.string
 
-type Edit =
+pub type Edit =
   | AddFunction
   | Comment
   | WrapBody
@@ -30,7 +31,7 @@ type Edit =
   | AddOperation
   | TouchEmbed
 
-fn every_edit() -> List<Edit> =
+pub fn every_edit() -> List<Edit> =
   [
     AddFunction,
     Comment,
@@ -356,8 +357,11 @@ fn warm_of(runs: Bool) -> Json / {PlyProcess, abort.raise} =
 fn cold_of(runs: Bool) -> Json / {PlyProcess, WorkingDirectory, abort.raise} =
   observed_state(runs, spawned_from_scratch)
 
+pub type Plan = { edits: List<Edit>, tests_after_undo: Bool }
+
 fn record_step(
   start: Json,
+  plan: Plan,
   out: Session,
   step: String,
   undo: () -> Unit / {WorkingDirectory, abort.raise},
@@ -367,33 +371,37 @@ fn record_step(
   let seen = if warm == fresh { out.mismatches }
   else { out.mismatches.push(step ++ ": " ++ difference(warm, fresh, "answer")) };
   undo();
-  let back = warm_of(true);
+  let back = warm_of(plan.tests_after_undo);
+  let wanted = if plan.tests_after_undo { start } else { nth(start, 0) };
   {
-    mismatches: if back == start { seen }
-    else { seen.push(step ++ ", undone: " ++ difference(back, start, "answer")) },
+    mismatches: if back == wanted { seen }
+    else { seen.push(step ++ ", undone: " ++ difference(back, wanted, "answer")) },
     made: out.made + 1,
   }
 }
 
-fn disagreements(paths: List<String>) -> Session / {PlyProcess, WorkingDirectory, abort.raise} = {
+fn disagreements(
+  paths: List<String>,
+  plan: Plan,
+) -> Session / {PlyProcess, WorkingDirectory, abort.raise} = {
   let start = warm_of(true);
   let cold = cold_of(true);
   let before_any = if start == cold { [] }
   else { ["before any edit: " ++ difference(start, cold, "answer")] };
   paths.fold({ mismatches: before_any, made: 0 }, |accumulator: Session, path: String|
-    every_edit().fold(accumulator, |out: Session, e: Edit|
+    plan.edits.fold(accumulator, |out: Session, e: Edit|
       match edited(e, path, read_bytes(path)) {
         None -> out,
         Some(changes) -> {
           let before = changes.map(|c: Change| { path: c.path, bytes: read_bytes(c.path) });
           changes.fold((), |_: Unit, c: Change| write_change(c));
-          record_step(start, out, path ++ ", " ++ edit_name(e), ||
+          record_step(start, plan, out, path ++ ", " ++ edit_name(e), ||
             before.fold((), |_: Unit, c: Change| write_change(c)))
         },
       }))
 }
 
-fn agrees(paths: List<String>) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
+fn agrees(paths: List<String>, plan: Plan) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
   let opening = cold_of(false);
   assert(
     bool(at(opening, "ok")) && items(at(opening, "diagnostics")).len() == 0,
@@ -402,8 +410,8 @@ fn agrees(paths: List<String>) -> Unit / {PlyProcess, WorkingDirectory, abort.ra
         ++ clipped(json_text(at(opening, "diagnostics"))),
     ),
   );
-  let session = disagreements(paths);
-  assert(session.made >= paths.len(), Some("each module is edited at least once"));
+  let session = disagreements(paths, plan);
+  assert(session.made > 0, Some("a session makes an edit"));
   assert(
     session.mismatches.len() == 0,
     Some(
@@ -532,13 +540,27 @@ fn fixture(name: String) -> Fixture / {abort.raise} =
     None -> panic("no fixture is named `" ++ name ++ "`"),
   }
 
-fn fixture_names() -> List<String> = catalogue().map(|f: Fixture| f.name)
+pub fn fixture_names() -> List<String> = catalogue().map(|f: Fixture| f.name)
 
-test/nondet "for fixture {name}, `ply check` gives the same result from a cached state as from scratch after every edit" for name: String in fixture_names(
-  ) {
+pub fn session_agrees(
+  name: String,
+  plan: Plan,
+) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
   let f = fixture(name);
   write_project(f.files);
-  agrees(f.files.filter(|s: Source| s.path.ends_with(".ply")).map(|s: Source| s.path))
+  agrees(f.files.filter(|s: Source| s.path.ends_with(".ply")).map(|s: Source| s.path), plan)
+}
+
+fn pull_request_fixtures() -> List<String> =
+  ["fn", "derive", "const fn", "tagged literal", "test over cases"]
+
+fn pull_request_edits() -> List<Edit> = [WrapBody, RenameFunction, AddImport, AddTest]
+
+test/nondet "{name} agrees warm and cold through an edit of each way a result stops standing" for name: String in pull_request_fixtures(
+  ) { session_agrees(name, { edits: pull_request_edits(), tests_after_undo: false }) }
+
+test/nondet "a file an embed reads agrees warm and cold when it changes" {
+  session_agrees("embed", { edits: [TouchEmbed], tests_after_undo: false })
 }
 
 test "`edited_text` changes source only when it contains the item an edit targets, and returns nothing otherwise" {

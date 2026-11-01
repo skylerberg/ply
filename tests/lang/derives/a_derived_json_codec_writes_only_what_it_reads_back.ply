@@ -1,0 +1,136 @@
+
+import std.json
+
+type Edge = { i: Int, d: Decimal }
+
+type Text = { s: String, b: Bytes }
+
+type Ratio = { f: Float }
+
+type Tree = | Leaf | Node(Tree, Tree)
+
+type Noted = { id: Int, note: Option<String> }
+
+derive json for Edge
+derive json for Text
+derive json for Ratio
+derive json for Tree
+derive json for Noted
+
+fn read_edge(doc: String) -> String / {abort.raise} =
+  match json::decode_bytes(Bytes::of_string(doc), edge_json()) {
+    Ok(e) -> e.i.to_string() ++ " " ++ e.d.to_string(),
+    Err(x) -> json::error_to_string(x),
+  }
+
+fn edge(i: Int, d: Decimal) -> String / {abort.raise} =
+  read_edge(String::of_bytes(json::encode_bytes({ i: i, d: d }, edge_json())))
+
+test "an Int at both ends of its range survives the wire" {
+  assert_eq(edge(9223372036854775807, 0m), "9223372036854775807 0");
+  assert_eq(edge(-9223372036854775807 - 1, 0m), "-9223372036854775808 0")
+}
+
+test "a Decimal at its bounds survives the wire, and its scale with it" {
+  assert_eq(edge(0, 79228162514264337593543950335m), "0 79228162514264337593543950335");
+  assert_eq(edge(0, 0.0000000000000000000000000001m), "0 0.0000000000000000000000000001");
+  assert_eq(edge(0, 1.500m), "0 1.500")
+}
+
+test "a number the wire format can hold but a field cannot is rejected, with its location" {
+  assert_eq(
+    read_edge("{\"i\":1e100,\"d\":0}"),
+    "$: `1e100` is outside `Decimal`'s range or needs more than 28 significant digits (at byte 5)",
+  );
+  assert_eq(read_edge("{\"i\":1.5,\"d\":0}"), "$.i: expected a whole number, found `1.5`")
+}
+
+fn text_wire(s: String, b: Bytes) -> String / {abort.raise} =
+  String::of_bytes(json::encode_bytes({ s: s, b: b }, text_json()))
+
+fn text_round(s: String, b: Bytes) -> Bool / {abort.raise} =
+  match json::decode_bytes(json::encode_bytes({ s: s, b: b }, text_json()), text_json()) {
+    Ok(t) -> t.s == s && t.b == b,
+    Err(_) -> false,
+  }
+
+test "text and bytes containing control and non-ASCII characters round-trip through a derived codec" {
+  assert(text_round("", b""));
+  assert_eq(text_wire("", b""), "{\"b\":\"\",\"s\":\"\"}");
+  assert(text_round("é\u{1F600}", b""));
+  assert_eq(text_wire("é\u{1F600}", b""), "{\"b\":\"\",\"s\":\"é\u{1F600}\"}");
+  assert(text_round("a\u{1}b\n\t\"q\\", b""));
+  assert_eq(text_wire("a\u{1}b\n\t\"q\\", b""), "{\"b\":\"\",\"s\":\"a\\u0001b\\n\\t\\\"q\\\\\"}");
+  assert(text_round("", b"\x00\x01\x7f\xfe\xff"));
+  assert_eq(text_wire("", b"\x00\xff\x7f"), "{\"b\":\"AP9/\",\"s\":\"\"}")
+}
+
+fn ratio_wire(f: Float) -> String / {abort.raise} =
+  String::of_bytes(json::encode_bytes({ f: f }, ratio_json()))
+
+fn ratio_round(f: Float) -> Bool / {abort.raise} =
+  match json::decode_bytes(json::encode_bytes({ f: f }, ratio_json()), ratio_json()) {
+    Ok(g) -> g.f == f,
+    Err(_) -> false,
+  }
+
+fn ratio_refused(f: Float) -> String =
+  match try[abort.raise] { ratio_wire(f) } { Ok(doc) -> "wrote " ++ doc, Err(m) -> m }
+
+test "a float field writes the floats a Decimal can represent, and rejects the rest with the reason" {
+  assert(ratio_round(0.1));
+  assert(ratio_round(3.141592653589793));
+  assert(ratio_round(-0.0));
+  assert_eq(ratio_wire(-0.0), "{\"f\":0}");
+  assert(
+    ratio_refused(1.0e-30).contains(
+      "a Float that is outside `Decimal`'s range has no JSON encoding",
+    ),
+  );
+  assert(
+    ratio_refused(1.0e300).contains(
+      "a Float that is outside `Decimal`'s range has no JSON encoding",
+    ),
+  );
+  assert(ratio_refused(0.0 / 0.0).contains("a Float that is NaN has no JSON encoding"));
+  assert(ratio_refused(1.0 / 0.0).contains("a Float that is Infinity has no JSON encoding"))
+}
+
+fn leaning(n: Int) -> Tree = if n <= 0 { Leaf } else { Node(leaning(n - 1), Leaf) }
+
+fn depth(t: Tree) -> Int = match t { Leaf -> 0, Node(l, _) -> 1 + depth(l) }
+
+fn through_the_wire(n: Int) -> String / {abort.raise} =
+  match json::decode_bytes(json::encode_bytes(leaning(n), tree_json()), tree_json()) {
+    Ok(t) -> depth(t).to_string(),
+    Err(e) -> "ERR " ++ json::error_to_string(e),
+  }
+
+test "a recursive codec writes what parse reads back, and rejects at the encoder past the bound" {
+  assert_eq(
+    match tree_json().decode(tree_json().encode(leaning(100))) { Ok(t) -> depth(t), Err(_) -> -1 },
+    100,
+  );
+  assert_eq(through_the_wire(60), "60");
+  assert_eq(through_the_wire(64), "64");
+  assert(match try[abort.raise] { through_the_wire(100) } {
+    Ok(_) -> false,
+    Err(m) ->
+      m.contains(
+        "a JSON value nested deeper than 128 levels cannot be written, because `parse` would reject the result",
+      ),
+  })
+}
+
+fn noted(doc: String) -> String / {abort.raise} =
+  match json::decode_bytes(Bytes::of_string(doc), noted_json()) {
+    Ok(v) -> "ok " ++ String::of_bytes(json::encode_bytes(v, noted_json())),
+    Err(e) -> "ERR " ++ json::error_to_string(e),
+  }
+
+test "an optional field is still required on the wire, an unknown one ignored and a repeat the last" {
+  assert_eq(noted("{\"id\":1}"), "ERR $.note: this field is missing");
+  assert_eq(noted("{\"id\":1,\"note\":null}"), "ok {\"id\":1,\"note\":null}");
+  assert_eq(noted("{\"id\":1,\"note\":null,\"added_later\":5}"), "ok {\"id\":1,\"note\":null}");
+  assert_eq(noted("{\"id\":1,\"id\":2,\"note\":null}"), "ok {\"id\":2,\"note\":null}")
+}

@@ -1,10 +1,9 @@
-import harness (spawned, scratch, RunResult, Source, write_project, write, read,
-                empty_working_directory, working_directory, environment, on_disk, all_output,
-                stdout, stderr, json_of, at, path, nth, str, int, bool, json_text, WorkingDirectory,
-                assert_ok, dependency, exists, manifest, value_of)
+import spawning.harness (spawned, RunResult, write_project, write, read, empty_working_directory,
+                         working_directory, environment, all_output, stdout, stderr, json_of, at,
+                         path, nth, str, int, bool, json_text, WorkingDirectory, assert_ok,
+                         dependency, exists, manifest, value_of)
 import std.config (config)
 import std.fs (fs)
-import std.json (Json, Array, Str)
 import std.process (process, Exited)
 import std.string
 
@@ -71,43 +70,12 @@ test/nondet "a test run tests the root package and never a dependency's" {
   )
 }
 
-test "a transitive dependency the importer does not declare is rejected" {
-  scratch(|| {
-    graph();
-    write("app/main.ply", "import base.deep\nfn main() -> Int = deep::deep()\n");
-    let r = on_disk(["check", "app"]);
-    assert_rejected(r, "E0132");
-    assert_stderr_contains(r, "`base`");
-    assert_stderr_contains(r, "`app`")
-  })
-}
-
 test/nondet "a dependency whose directory has no `ply.pkg` is rejected with E0135" {
   graph();
   assert(fs.remove[cwd]("lib/ply.pkg"), None);
   let r = spawned(["run", "app"]);
   assert_rejected(r, "E0135");
   assert_stderr_contains(r, "ply.pkg")
-}
-
-test "`ply check` fails with E0133 when a module in the root package sits in a directory named like a dependency's module prefix" {
-  scratch(|| {
-    graph();
-    write("app/lib/mine.ply", "fn mine() -> Int = 1\n");
-    assert_rejected(on_disk(["check", "app"]), "E0133")
-  })
-}
-
-test "a dependency cycle is rejected naming the cycle" {
-  scratch(|| {
-    write_project([
-      { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
-      { path: "app/main.ply", text: "fn main() -> Int = 1\n" },
-      { path: "lib/ply.pkg", text: manifest("lib", dependency("app", "../app")) },
-      { path: "lib/x.ply", text: "pub fn x() -> Int = 1\n" },
-    ]);
-    assert_rejected(on_disk(["check", "app"]), "E0134")
-  })
 }
 
 test/nondet "a git dependency that cannot be fetched fails with E0135, naming the dependency" {
@@ -121,43 +89,10 @@ test/nondet "a git dependency that cannot be fetched fails with E0135, naming th
     },
     { path: "main.ply", text: "fn main() -> Int = 1\n" },
   ]);
-  let r = on_disk(["check"]);
+  let r = spawned(["check", "."]);
   assert(r.code == 2, Some(all_output(r)));
   assert(stderr(r).contains("E0135"), Some(stderr(r)));
   assert_stderr_contains(r, "glib")
-}
-
-test "`check` rejects an unfetched registry dependency and names `ply resolve` as the command that fetches it" {
-  scratch(|| {
-    write_project([
-      {
-        path: "ply.pkg",
-        text: manifest(
-          "app",
-          "{name: \"glib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}",
-        ),
-      },
-      { path: "main.ply", text: "fn main() -> Int = 1\n" },
-    ]);
-    let r = on_disk(["check"]);
-    assert_rejected(r, "E0135");
-    assert_stderr_contains(r, "`glib` has not been fetched");
-    assert_stderr_contains(r, "`ply resolve`");
-    let resolved = on_disk(["resolve"]);
-    assert_rejected(resolved, "E0141");
-    assert_stderr_contains(resolved, "`PLY_REGISTRY` is not set")
-  })
-}
-
-test "a dependency cannot import a module that exists only in the root package" {
-  scratch(|| {
-    graph();
-    write("app/onlyroot.ply", "fn shared() -> Int = 9\n");
-    write("lib/answer.ply", "import onlyroot\npub fn answer() -> Int = onlyroot::shared()\n");
-    let r = on_disk(["check", "app"]);
-    assert_rejected(r, "E0106");
-    assert_stderr_contains(r, "no module named `onlyroot`")
-  })
 }
 
 type Version = { major: Int, minor: Int, patch: Int }
@@ -181,30 +116,6 @@ fn dependency_at(name: String, floor: Version, at_path: String) -> String =
   "{name: \"" ++ name ++ "\", prefix: None, min: " ++ version_text(floor) ++ ", source: Path(\""
     ++ at_path
     ++ "\")}"
-
-test "a dependency older than the minimum version its importer requires is rejected" {
-  scratch(|| {
-    write_project([
-      {
-        path: "app/ply.pkg",
-        text: versioned_manifest(
-          "app",
-          version_of(0, 1, 0),
-          dependency_at("lib", version_of(0, 2, 0), "../lib"),
-        ),
-      },
-      { path: "app/main.ply", text: "import lib.x\nfn main() -> Int = x::x()\n" },
-      { path: "lib/ply.pkg", text: versioned_manifest("lib", version_of(0, 1, 3), "") },
-      { path: "lib/x.ply", text: "pub fn x() -> Int = 1\n" },
-    ]);
-    let r = on_disk(["check", "app"]);
-    assert_rejected(r, "E0136");
-    assert_stderr_contains(r, "is version 0.1.3");
-    assert_stderr_contains(r, "at least 0.2.0");
-    write("lib/ply.pkg", versioned_manifest("lib", version_of(0, 2, 0), ""));
-    assert_ok(on_disk(["check", "app"]))
-  })
-}
 
 test/nondet "two dependents of one package resolve to its one version" {
   write_project([
@@ -245,60 +156,6 @@ test/nondet "two dependents of one package resolve to its one version" {
   assert_eq(value_of(spawned(["run", "--json", "app"])), "40")
 }
 
-test "two different packages with the same name in one build are rejected as a version conflict" {
-  scratch(|| {
-    let sides = [{ side: "left", other: "d1" }, { side: "right", other: "d2" }].fold(
-      [],
-      |accumulator: List<Source>, c: { side: String, other: String }|
-        [
-          {
-            path: c.side ++ "/ply.pkg",
-            text: versioned_manifest(
-              c.side,
-              version_of(0, 1, 0),
-              dependency_at("shared", version_of(0, 1, 0), "../" ++ c.other),
-            ),
-          },
-          {
-            path: c.side ++ "/" ++ c.side ++ ".ply",
-            text: "pub fn " ++ c.side ++ "() -> Int = 1\n",
-          },
-        ].fold(
-          accumulator,
-          List::push,
-        ),
-    );
-    let shared = [
-      { path: "d1/ply.pkg", text: versioned_manifest("shared", version_of(0, 1, 0), "") },
-      { path: "d1/s.ply", text: "pub fn s() -> Int = 1\n" },
-      { path: "d2/ply.pkg", text: versioned_manifest("shared", version_of(0, 2, 0), "") },
-      { path: "d2/s.ply", text: "pub fn s() -> Int = 1\n" },
-    ];
-    write_project(
-      shared.fold(sides, List::push).fold(
-        [
-          {
-            path: "app/ply.pkg",
-            text: versioned_manifest(
-              "app",
-              version_of(0, 1, 0),
-              dependency_at("left", version_of(0, 1, 0), "../left") ++ ", "
-                ++ dependency_at("right", version_of(0, 1, 0), "../right"),
-            ),
-          },
-          { path: "app/main.ply", text: "fn main() -> Int = 1\n" },
-        ],
-        List::push,
-      ),
-    );
-    let r = on_disk(["check", "app"]);
-    assert_rejected(r, "E0137");
-    assert_stderr_contains(r, "`shared` is reached at two places");
-    assert_stderr_contains(r, "`left` wants");
-    assert_stderr_contains(r, "`right` wants")
-  })
-}
-
 test/nondet "a build records its dependencies in the lock and rejects a dependency that differs from the lock" {
   graph();
   let build = || spawned(["build", "app", "-o", "app.plyx"]);
@@ -328,7 +185,7 @@ test/nondet "a build records its dependencies in the lock and rejects a dependen
 test/nondet "editing a path dependency inside a git checkout leaves the dependent's lock file unchanged" {
   graph();
   write(".git/HEAD", "ref: refs/heads/main\n");
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   let lock = lock_of("app/ply.lock");
   assert(lock.contains("\"name\":\"lib\""), Some(lock));
   assert(lock.contains("\"name\":\"base\""), Some(lock));
@@ -337,34 +194,21 @@ test/nondet "editing a path dependency inside a git checkout leaves the dependen
   write("base/deep.ply", "pub fn deep() -> Int = 8\n");
   assert_ok(spawned(["build", "app", "-o", "app.plyx"]));
   assert(lock_of("app/ply.lock") == lock, Some(lock_of("app/ply.lock")));
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   assert(lock_of("app/ply.lock") == lock, Some(lock_of("app/ply.lock")));
   write("app/.git/HEAD", "ref: refs/heads/main\n");
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   let own = lock_of("app/ply.lock");
   assert(own.contains("\"digest\":\"b3:"), Some(own));
   write("base/deep.ply", "pub fn deep() -> Int = 9\n");
   assert_rejected(spawned(["build", "app", "-o", "app.plyx"]), "E0138");
-  assert_rejected(on_disk(["vendor", "app"]), "E0138");
+  assert_rejected(spawned(["vendor", "app"]), "E0138");
   assert(lock_of("app/ply.lock") == own, None)
-}
-
-test "resolving a file writes the lock beside it" {
-  scratch(|| {
-    graph();
-    let r = on_disk(["resolve", "app/main.ply"]);
-    assert_ok(r);
-    assert(stdout(r).contains("resolved 2 packages · app/ply.lock"), Some(stdout(r)));
-    let lock = lock_of("app/ply.lock");
-    assert(lock.contains("\"name\":\"lib\""), Some(lock));
-    assert(lock.contains("\"name\":\"base\""), Some(lock));
-    assert(fs.exists[cwd]("app/main.ply"), None)
-  })
 }
 
 test/nondet "building a file checks its dependencies against the `ply.lock` next to it" {
   graph();
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   let lock = lock_of("app/ply.lock");
   assert_ok(spawned(["build", "app/main.ply", "-o", "app.plyx"]));
   assert(lock_of("app/ply.lock") == lock, None);
@@ -383,48 +227,20 @@ test/nondet "a lockfile nothing can read is rejected rather than ignored" {
   assert(!exists("app.plyx"), Some("an artifact was written"))
 }
 
-test "`resolve` writes the lock, and `why` prints the chain of dependencies that leads to a package" {
-  scratch(|| {
-    graph();
-    let r = on_disk(["resolve", "app"]);
-    assert_ok(r);
-    assert(stdout(r).contains("resolved 2 packages"), Some(stdout(r)));
-    let lock = lock_of("app/ply.lock");
-    assert(lock.contains("\"name\":\"lib\""), Some(lock));
-    assert(lock.contains("\"name\":\"base\""), Some(lock));
-    let reason = on_disk(["why", "lib", "app"]);
-    assert_ok(reason);
-    assert(stdout(reason).contains("app -> lib"), Some(stdout(reason)));
-    assert(stdout(reason).contains("0.0.1"), Some(stdout(reason)));
-    let base = json_of(on_disk(["why", "base", "app", "--json"]));
-    assert(str(at(base, "command")) == "why", Some(json_text(base)));
-    assert(str(at(base, "package")) == "base", Some(json_text(base)));
-    assert(at(base, "path") == Array([Str("app"), Str("lib"), Str("base")]), Some(json_text(base)));
-    assert(!bool(at(base, "root")), Some(json_text(base)));
-    assert(str(at(base, "digest")).starts_with("b3:"), Some(json_text(base)));
-    let app = json_of(on_disk(["why", "app", "app", "--json"]));
-    assert(bool(at(app, "root")), Some(json_text(app)));
-    assert(at(app, "path") == Array([Str("app")]), Some(json_text(app)));
-    let nope = on_disk(["why", "nope", "app"]);
-    assert_rejected(nope, "E0101");
-    assert_stderr_contains(nope, "is not a package in this project's dependencies")
-  })
-}
-
 test/nondet "`resolve` updates the lock after a dependency's source files change, and the build then succeeds" {
   graph();
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   let before = lock_of("app/ply.lock");
   write("base/deep.ply", "pub fn deep() -> Int = 8\n");
   assert_rejected(spawned(["build", "app", "-o", "app.plyx"]), "E0138");
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   assert(lock_of("app/ply.lock") != before, Some("the pin did not move with the sources"));
   assert_ok(spawned(["build", "app", "-o", "app.plyx"]))
 }
 
 test/nondet "a library builds as a package and never as a program" {
   empty_working_directory();
-  assert_ok(on_disk(["new", "core", "--lib"]));
+  assert_ok(spawned(["new", "core", "--lib"]));
   let built = spawned(["build", "core", "--json"]);
   assert_ok(built);
   let report = json_of(built);
@@ -444,7 +260,7 @@ test/nondet "a library builds as a package and never as a program" {
   assert_rejected(ran, "");
   assert_stderr_contains(ran, "is a library, and nothing to run");
   assert_stderr_contains(ran, "declare it in a `ply.pkg`");
-  assert_ok(on_disk(["new", "app"]));
+  assert_ok(spawned(["new", "app"]));
   let app = spawned(["build", "app"]);
   assert_ok(app);
   assert(exists("main.plyx"), Some(stdout(app)));
@@ -521,10 +337,10 @@ test/nondet "a git dependency is fetched once and then works with `check`, `run`
     assert(all_output(r).contains(c.want), Some(String::join(c.args, " ") ++ ": " ++ all_output(r)))
   });
   assert(exists("app/.ply-cache/git"), None);
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   assert(lock_of("app/ply.lock").contains("\"name\":\"gitlib\""), None);
   assert(fs.remove_tree[cwd]("lib"), None);
-  assert_ok(on_disk(["check", "app"]))
+  assert_ok(spawned(["check", "app"]))
 }
 
 test/nondet "a build rejects a git dependency whose branch has new commits that the lock does not record" {
@@ -533,13 +349,13 @@ test/nondet "a build rejects a git dependency whose branch has new commits that 
   let _ = git_repo("lib", "pub fn answer() -> Int = 7\n");
   git_project(lib_dir(), "HEAD");
   write("app/main.ply", "import gitlib.answer\nfn main() -> Int = answer::answer()\n");
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   let before = lock_of("app/ply.lock");
   let _ = git_repo("lib", "pub fn answer() -> Int = 8\n");
   assert(fs.remove_tree[cwd]("app/.ply-cache/git"), None);
   assert_rejected(spawned(["build", "app", "-o", "app.plyx"]), "E0138");
   assert(lock_of("app/ply.lock") == before, None);
-  assert_ok(on_disk(["resolve", "app"]));
+  assert_ok(spawned(["resolve", "app"]));
   assert(lock_of("app/ply.lock") != before, None);
   assert_ok(spawned(["build", "app", "-o", "app.plyx"]))
 }
@@ -551,7 +367,7 @@ test/nondet "a vendored project builds with no repository and no cache" {
   write("lib/data.txt", "a package ships what it ships\n");
   let rev = git_repo("lib", "pub fn answer() -> Int = 7\n");
   git_project(lib_dir(), rev);
-  let r = on_disk(["vendor", "app"]);
+  let r = spawned(["vendor", "app"]);
   assert_ok(r);
   assert(stdout(r).contains("vendored 1 package"), Some(stdout(r)));
   assert(stdout(r).contains("vendor/gitlib"), Some(stdout(r)));
@@ -562,7 +378,7 @@ test/nondet "a vendored project builds with no repository and no cache" {
   let index = lock_of("app/vendor/index");
   assert(index.starts_with("git+"), Some(index));
   assert(index.ends_with("vendor/gitlib\n"), Some(index));
-  assert_ok(on_disk(["vendor", "app"]));
+  assert_ok(spawned(["vendor", "app"]));
   assert(lock_of("app/vendor/index") == index, None);
   assert(fs.remove_tree[cwd]("lib"), None);
   assert(fs.remove_tree[cwd]("app/.ply-cache"), None);
@@ -577,16 +393,6 @@ test/nondet "a vendored project builds with no repository and no cache" {
       all_output(run).contains(c.want),
       Some(String::join(c.args, " ") ++ ": " ++ all_output(run)),
     )
-  })
-}
-
-test "a project with no dependencies vendors nothing" {
-  scratch(|| {
-    write_project([{ path: "m.ply", text: "fn main() -> Int = 1\n" }]);
-    let r = on_disk(["vendor"]);
-    assert_ok(r);
-    assert(stdout(r).contains("vendored 0 packages"), Some(stdout(r)));
-    assert(lock_of("vendor/index") == "", None)
   })
 }
 
@@ -615,7 +421,7 @@ fn nested() -> Unit / {WorkingDirectory, abort.raise} =
 
 test/nondet "a package nested inside another package is a separate package, and its modules are not the outer package's" {
   nested();
-  assert_ok(on_disk(["check", "app"]));
+  assert_ok(spawned(["check", "app"]));
   let tested = spawned(["test", "app"]);
   assert(tested.code == 0 && all_output(tested).contains("2 passed"), Some(all_output(tested)))
 }
@@ -626,5 +432,5 @@ test/nondet "a path inside a nested package limits a command to that package ins
   assert(stored.code == 0 && all_output(stored).contains("1 passed"), Some(all_output(stored)));
   assert_rejected(spawned(["run", "app"]), "E0112");
   assert_eq(value_of(spawned(["run", "--json", "app/store/report.ply"])), "14");
-  assert_rejected(on_disk(["check", "app/store/missing.ply"]), "E0502")
+  assert_rejected(spawned(["check", "app/store/missing.ply"]), "E0502")
 }

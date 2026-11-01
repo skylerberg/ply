@@ -7,9 +7,11 @@ use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
 use ply_host::observe::Recorder;
 use std::collections::HashMap;
+use std::io::Write;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 pub struct Opened {
     native: Native,
@@ -94,6 +96,7 @@ pub struct Run {
     pub re_executed: bool,
     pub measure: bool,
     pub tested: bool,
+    pub label: String,
 }
 
 impl Run {
@@ -104,6 +107,7 @@ impl Run {
             re_executed: false,
             measure: false,
             tested: false,
+            label: String::new(),
         }
     }
 }
@@ -165,6 +169,7 @@ pub fn enter(
     let Some(entry) = opened.native.entered(root) else {
         return Outcome::of(Ended::NoRoot);
     };
+    let _named = (!run.label.is_empty()).then(|| RunningTest::named(&run.label));
     let mut ctx = Box::new(opened.native.context());
     let own = (watch.as_ref())
         .filter(|w| w.recorded)
@@ -232,6 +237,71 @@ pub fn enter(
         outcome.trace = w.by.traced(&own, outcome.usage.host);
     }
     outcome
+}
+
+const HEARTBEAT: Duration = Duration::from_secs(30);
+
+struct RunningTest {
+    token: u64,
+}
+
+fn running_tests() -> &'static Mutex<HashMap<u64, (String, Instant)>> {
+    static RUNNING: OnceLock<Mutex<HashMap<u64, (String, Instant)>>> = OnceLock::new();
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("ply-heartbeat".into())
+            .spawn(heartbeat);
+    });
+    RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn heartbeat() {
+    loop {
+        std::thread::sleep(HEARTBEAT);
+        let running = running_tests()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let tests: Vec<(String, Instant)> = running.values().cloned().collect();
+        drop(running);
+        for line in overdue_lines(&tests, Instant::now(), HEARTBEAT) {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+    }
+}
+
+pub fn overdue_lines(tests: &[(String, Instant)], now: Instant, after: Duration) -> Vec<String> {
+    let mut overdue: Vec<(Duration, &str)> = tests
+        .iter()
+        .map(|(name, started)| (now.saturating_duration_since(*started), name.as_str()))
+        .filter(|(ran, _)| *ran >= after)
+        .collect();
+    overdue.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    overdue
+        .into_iter()
+        .map(|(ran, name)| format!("   running for {}s: {name}", ran.as_secs()))
+        .collect()
+}
+
+impl RunningTest {
+    fn named(name: &str) -> RunningTest {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        running_tests()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(token, (name.to_string(), Instant::now()));
+        RunningTest { token }
+    }
+}
+
+impl Drop for RunningTest {
+    fn drop(&mut self) {
+        running_tests()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.token);
+    }
 }
 
 pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T> {
@@ -389,6 +459,10 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
         ),
         runtime_native("unit_close", rt_unit_close as unsafe extern "C" fn(_, _)),
         runtime_native(
+            "unit_report",
+            rt_unit_report as unsafe extern "C" fn(_, _, _, _),
+        ),
+        runtime_native(
             "unit_bind",
             rt_unit_bind as unsafe extern "C" fn(_, _, _) -> _,
         ),
@@ -475,6 +549,15 @@ unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
 
 unsafe extern "C" fn rt_unit_close(_ctx: *mut Ctx, unit: I64) {
     units().by.remove(&unit.0);
+}
+
+unsafe extern "C" fn rt_unit_report(_ctx: *mut Ctx, p: Addr, n: I64, to_stderr: I64) {
+    let line = String::from_utf8_lossy(unsafe { borrowed(p, n) });
+    let _ = if to_stderr.0 != 0 {
+        writeln!(std::io::stderr(), "{line}")
+    } else {
+        writeln!(std::io::stdout(), "{line}")
+    };
 }
 
 unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
@@ -659,6 +742,7 @@ fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
     let observe = r.bool()?;
     let measure = r.bool()?;
     let tested = r.bool()?;
+    let label = r.str()?;
     Ok(Asked {
         binding,
         hosted,
@@ -669,6 +753,7 @@ fn read_run_options(r: &mut Reader<'_>) -> Result<Asked, String> {
             re_executed,
             measure,
             tested,
+            label,
         },
     })
 }

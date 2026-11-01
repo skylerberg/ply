@@ -1,7 +1,7 @@
-import harness (scratch, RunResult, write_project, in_memory, one_module_tree, on_disk, spawned,
-                all_output, stderr, json_of, at, path, items, str, int, json_text, diagnostic_codes)
+import spawning.harness (RunResult, write_project, spawned, all_output, stderr, json_of, at, path,
+                         items, str, int, json_text, diagnostic_codes)
 import std.json
-import std.json (Json, Bool)
+import std.json (Json)
 import std.string
 
 fn service() -> String =
@@ -68,7 +68,7 @@ fn records_of(ran: RunResult) -> List<Json> / {abort.raise} =
 
 test/nondet "a function's inferred effects list the trace channels it writes to" {
   write_project([{ path: "m.ply", text: service() }]);
-  let text = String::join(all_output(spawned(["check", "--types"])).words(), " ");
+  let text = String::join(all_output(spawned(["check", ".", "--types"])).words(), " ");
   assert(
     text.contains(
       "place_order : (String) -> Int / {std.trace.trace.count[orders] bounded, std.trace.trace.enter[orders] bounded, std.trace.trace.exit[orders] bounded}",
@@ -103,7 +103,7 @@ test/nondet "`test --explain` puts tests that trace the same channel in one grou
         \\
     },
   ]);
-  let explained = json_of(spawned(["test", "--explain", "--json"], []));
+  let explained = json_of(spawned(["test", ".", "--explain", "--json"], []));
   let selection = at(explained, "selection");
   let group_of = |name: String|
     match items(at(selection, "tests")).filter(|t: Json| str(at(t, "name")) == name) {
@@ -132,7 +132,7 @@ test/nondet "when two tasks open and close spans alternately, each span nests on
       text: String::of_bytes_lossy(embed("../programs/trace_audit/interleaved_spans.ply")),
     },
   ]);
-  let r = spawned(["run", "--trace", "json"], []);
+  let r = spawned(["run", ".", "--trace", "json"], []);
   let records = records_of(r);
   assert(records.len() == 8, Some("two spans per task, entered and exited: " ++ stderr(r)));
   let name_of = |id: Json|
@@ -171,30 +171,16 @@ test/nondet "a deterministic test that uses a trace operation no handler covers 
         \\
     },
   ]);
-  let report = json_of(spawned(["test", "--json"]));
+  let report = json_of(spawned(["test", ".", "--json"]));
   assert(
     diagnostic_codes(report).filter(|c: String| c == "E0412").len() > 0,
     Some(json_text(report)),
   )
 }
 
-fn leaking() -> String =
-  \\import std.trace
-  \\import std.trace (StringField, trace)
-  \\
-  \\pub fn login(user: String, password: Secret<String>) -> Unit / {trace.event[auth]} =
-  \\  trace.event[auth](trace::Info, "login", #{"user": StringField(user), "password": StringField(password)})
-  \\
-
-test "a program that traces a `Secret` value fails to check with E0201, because `Secret` is not a valid trace field" {
-  let report = json_of(in_memory(one_module_tree(leaking()), ["check", "--json"]));
-  assert_eq(diagnostic_codes(report), ["E0201"]);
-  assert(json_text(report).contains("Secret<String>"), Some(json_text(report)))
-}
-
 test/nondet "a tracing test that uses a fake handler is deterministic, is cached on the second run and uses no real resources" {
   write_project([{ path: "app.ply", text: service() }]);
-  let first = json_of(spawned(["test", "--json"]));
+  let first = json_of(spawned(["test", ".", "--json"]));
   assert(int(at(first, "exit_code")) == 0, Some(json_text(first)));
   assert(int(path(first, ["summary", "passed"])) == 2, Some(json_text(first)));
   assert(int(path(first, ["summary", "failed"])) == 0, Some(json_text(first)));
@@ -203,55 +189,15 @@ test/nondet "a tracing test that uses a fake handler is deterministic, is cached
     Some("a first run has nothing cached: " ++ json_text(first)),
   );
   assert(
-    !all_output(spawned(["test"])).contains("E0424"),
+    !all_output(spawned(["test", "."])).contains("E0424"),
     Some("a fake-backed test must not reach the boundary"),
   );
-  let second = json_of(spawned(["test", "--json"]));
+  let second = json_of(spawned(["test", ".", "--json"]));
   assert(
     int(path(second, ["summary", "cached"])) == 2,
     Some("a trace-collecting test is a `det` test and re-runs never: " ++ json_text(second)),
   );
   assert(int(path(second, ["summary", "passed"])) == 0, Some(json_text(second)))
-}
-
-test "`ply hosts` lists the trace handler for each channel and names the output the run uses" {
-  scratch(|| {
-    write_project([{ path: "app.ply", text: service() }]);
-    let listing = json_of(on_disk(["hosts", "--trace", "off", "--json"]));
-    let traced = items(at(listing, "hosts")).filter(|r: Json|
-      str(at(r, "effect")) == "std.trace.trace");
-    assert(
-      traced != [],
-      Some("the sink is a member of the trusted computing base: " ++ json_text(listing)),
-    );
-    assert(
-      traced.filter(|r: Json| str(at(r, "handler")) != "std.trace.host_handler").len() == 0,
-      Some("every channel is served by the module's host handler: " ++ json_text(listing)),
-    );
-    assert(
-      str(path(listing, ["observability", "sink"])) == "ply_host::trace::discard",
-      Some("`--trace off` is a listed sink, not an empty registry: " ++ json_text(listing)),
-    );
-    let traced_effects = traced.map(|r: Json| str(at(r, "triple")));
-    let has = |a: String| traced_effects.filter(|x: String| x == a).len() > 0;
-    assert(
-      has("std.trace.trace.count[orders]") && has("std.trace.trace.event[items]")
-        && !has("std.trace.trace.count[items]"),
-      Some(
-        "the listing expands to the channels the program uses: "
-          ++ String::join(traced_effects, ", "),
-      ),
-    );
-    assert(
-      traced.filter(|r: Json|
-          at(r, "deterministic") != Bool(false) || str(at(r, "linearity")) != "at_most_once"
-            || at(r, "blocking") != Bool(false)).len(
-        )
-        == 0,
-      Some(json_text(listing)),
-    );
-    assert(traced.len() == 4, Some(json_text(listing)))
-  })
 }
 
 test/nondet "a trace line goes to stderr and leaves the JSON document on stdout intact" {
@@ -272,7 +218,7 @@ test/nondet "a trace line goes to stderr and leaves the JSON document on stdout 
         \\
     },
   ]);
-  let r = spawned(["run", "--trace", "json", "--json"], []);
+  let r = spawned(["run", ".", "--trace", "json", "--json"], []);
   let document = json_of(r);
   assert(int(at(document, "exit_code")) == 0, Some(json_text(document)));
   let lines = records_of(r);

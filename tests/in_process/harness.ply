@@ -1,0 +1,905 @@
+import spawning.harness (Repo, RunResult, Source, WorkingDirectory, agreeing, at, bodies_dir,
+                         checking, diagnostic, environment, exists, failed, first, int, items,
+                         joined, json_of, manifest, not_ok, own_modules, parent, path, read,
+                         repo_file, reused_dir, scratch_marker, send, sources_here, spawned,
+                         stable_report, str, variable_value, working_directory, write,
+                         write_project)
+import cli.ply (main)
+import cli.paths
+import cli.program (packages_of)
+import cli.sources
+import cli.vcs
+import compiler.front.pkg
+import compiler.front.pkg (SuppliedPackage)
+import cli.library (ShippedFile, digests_of)
+import std.env (env)
+import compiler.unit
+import compiler.unit (shipped)
+import compiler.front.rows (ModuleSpan, module_of)
+import compiler.load
+import compiler.check.resolve.tables (Diagnostic)
+import cli.diagnostic
+import cli.machine
+import cli.machine (Options, empty_configuration)
+import cli.surface (spec)
+import cli.library
+import std.machine as entering
+import compiler.cc
+import compiler.cc (compilers, toolchain)
+import std.bytes
+import std.cli as command_line
+import std.fs
+import std.fs (fs, MemFs, Entry, File, ScanEntry)
+import std.json
+import std.json (Json)
+import std.list
+import std.net
+import std.net (net)
+import std.os
+import std.random (entropy)
+import std.process (process, EnvironmentVariable, FakeProcess, captured, args_step, out_step,
+                    err_step, exit_step, with_input, line_step, Line)
+import std.term (term)
+import std.time (time)
+import std.value (Value)
+import std.path (join, normalize)
+import std.pkg (Dependency, Manifest, Path, ToolchainParts, Workspace)
+import std.string
+
+fn captured_result(c: FakeProcess) -> RunResult =
+  { out: c.out, err: c.err, code: match c.code { Some(n) -> n, None -> 0 } }
+
+pub fn loads_here() -> Bool / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
+  match library_here() {
+    Err(_) -> false,
+    Ok(c) -> match entering::machine.open(c.library) {
+      Ok(o) -> {
+        entering::machine.close(o.unit);
+        true
+      },
+      Err(_) -> false,
+    },
+  }
+
+pub fn first_message(diagnostics: List<Diagnostic>) -> String =
+  match diagnostics { [d, ..] -> String::of_bytes_lossy(d.message), [] -> "no diagnostic" }
+
+pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {WorkingDirectory, Shipped, abort.raise} =
+  match library_here() { Err(reason) -> panic(reason), Ok(c) -> c }
+
+fn library_here() -> Result<{ front: load::LoadedAnalysis, library: String }, String> / {WorkingDirectory, Shipped, abort.raise} =
+  match load::load[cwd](".") {
+    Err(diagnostics) -> Err("the program loads: " ++ first_message(diagnostics)),
+    Ok(l) -> match match unit::cache_parts(l.parts) {
+        Err(reason) -> Err(reason),
+        Ok(sources) -> cc::library[cc](cc::development(), sources),
+      } {
+      Err(reason) -> Err("the program compiles: " ++ reason),
+      Ok(library) -> Ok({ front: l.front, library: library }),
+    },
+  }
+
+pub type LoadedProgram = {
+  unit_handle: Int,
+  roots: Map<Bytes, ModuleSpan>,
+  binding_handle: Int,
+  options: Options,
+}
+
+pub fn load_program(
+  options: Options,
+) -> LoadedProgram / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.bind, abort.raise} = {
+  let c = compiled_here();
+  match entering::machine.open(c.library) {
+    Err(reason) -> panic("the program's unit opens: " ++ reason),
+    Ok(o) -> match entering::machine.bind(
+        machine::run_grants(options, empty_configuration(), machine::PlatformDefault, false),
+      ) {
+      Err(not_ok) ->
+        panic(
+          "the program binds: "
+            ++ first_message(not_ok.map(|f: entering::Failure| machine::unplaced(f))),
+        ),
+      Ok(binding) ->
+        {
+          unit_handle: o.unit,
+          roots: machine::roots_of(c.front.dump),
+          binding_handle: binding,
+          options: options,
+        },
+    },
+  }
+}
+
+pub fn unload_program(
+  l: LoadedProgram,
+) -> List<entering::Report> / {entering::machine.unbind, entering::machine.close} = {
+  let reports = entering::machine.unbind(l.binding_handle);
+  entering::machine.close(l.unit_handle);
+  reports
+}
+
+pub fn enter(
+  l: LoadedProgram,
+  entry: String,
+  args: List<Value>,
+) -> entering::Outcome / {entering::machine.enter} =
+  entering::machine.enter(l.unit_handle, "inner." ++ entry, machine::arguments_of(args), {
+    ..entering::unbounded(),
+    binding: l.binding_handle,
+    hosted: true,
+    timeout_ms: l.options.timeout,
+  })
+
+pub fn call(
+  l: LoadedProgram,
+  entry: String,
+  args: List<Value>,
+) -> Result<Value, Diagnostic> / {entering::machine.enter, abort.raise} =
+  match machine::result_of(enter(l, entry, args), l.roots, "inner." ++ entry) {
+    Ok(v) -> Ok(v),
+    Err(r) -> Err(diagnostic::shown(r)),
+  }
+
+pub fn call_value(
+  l: LoadedProgram,
+  entry: String,
+  args: List<Value>,
+) -> Value / {entering::machine.enter, abort.raise} =
+  match call(l, entry, args) {
+    Ok(v) -> v,
+    Err(d) -> panic("`" ++ entry ++ "` returns: " ++ String::of_bytes_lossy(d.message)),
+  }
+
+pub fn workspace() -> Workspace / {Repo, abort.raise} =
+  match pkg::check_workspace(Bytes::of_string(repo_file(library::workspace_file()))).workspace {
+    Some(w) -> w,
+    None -> panic("the repository's `" ++ library::workspace_file() ++ "` checks"),
+  }
+
+pub fn toolchain_parts() -> ToolchainParts / {Repo, abort.raise} =
+  match workspace().toolchain {
+    Some(t) -> t,
+    None -> panic("the repository's `" ++ library::workspace_file() ++ "` names the toolchain"),
+  }
+
+fn manifest_at(dir: String) -> Manifest / {Repo, abort.raise} =
+  match pkg::check_manifest(Bytes::of_string(repo_file(dir ++ "/ply.pkg"))).manifest {
+    Some(m) -> m,
+    None -> panic("`" ++ dir ++ "/ply.pkg` checks"),
+  }
+
+pub fn package_name(dir: String) -> String / {Repo, abort.raise} = manifest_at(dir).name
+
+pub fn package_dir(name: String) -> String / {Repo, abort.raise} =
+  match workspace().packages.filter(|dir: String| package_name(dir) == name) {
+    [dir, ..] -> dir,
+    [] -> panic("`ply.work` lists no package named `" ++ name ++ "`"),
+  }
+
+pub fn warm_check_report() -> Json / {CliEffects, Shipped, abort.raise, diverges} =
+  stable_report(json_of(on_disk(checking())))
+
+pub fn cold_check_report() -> Json / {Hermetic, Shipped, WorkingDirectory, abort.raise, diverges} =
+  stable_report(json_of(in_memory(tree(sources_here()), checking())))
+
+pub fn warm_matches_cold(
+  what: String,
+) -> Json / {CliEffects, Hermetic, Shipped, abort.raise, diverges} = {
+  let warm = warm_check_report();
+  let cold = cold_check_report();
+  agreeing(what, warm, cold)
+}
+
+pub type ModuleReuse = { cached: Int, checked: Int, shipped: Int }
+
+pub fn module_reuse() -> ModuleReuse / {CliEffects, Shipped, abort.raise, diverges} =
+  module_reuse_at(".")
+
+pub fn module_reuse_at(dir: String) -> ModuleReuse / {CliEffects, Shipped, abort.raise, diverges} = {
+  let report = json_of(on_disk(["check", dir, "--json", "--explain"]));
+  let shipped = items(at(report, "modules")).len() - own_modules(report).len();
+  items(path(report, ["front_end", "queries"])).fold(
+    { cached: 0, checked: 0, shipped: shipped },
+    |accumulator: ModuleReuse, q: Json|
+      if str(at(q, "query")) == "module" {
+        { ..accumulator, cached: int(at(q, "taken")), checked: int(at(q, "run")) }
+      } else { accumulator },
+  )
+}
+
+pub type Package = { prefix: String, dependencies: List<String> }
+
+pub type PackageClosure = { packages: List<Package>, dirs: List<String> }
+
+pub fn manifest_closure(dir: String) -> PackageClosure / {CliEffects, abort.raise, diverges} = {
+  let pwd = working_directory();
+  handle {
+    let write_project = vcs::fetching(|| sources::load_resolved([paths::resolve(dir)]));
+    let packages = packages_of(write_project);
+    let resolved = pkg::closure(
+      packages,
+      write_project.files.map(|file: sources::File| Bytes::of_string(file.module)),
+    );
+    {
+      packages: resolved.packages.map(|p: pkg::Package|
+        { prefix: String::of_bytes(p.prefix), dependencies: p.dependencies.map(String::of_bytes) }),
+      dirs: packages.supplied.fold(
+        [String::of_bytes(packages.root)],
+        |accumulator: List<String>, s: SuppliedPackage| accumulator.push(String::of_bytes(s.root)),
+      ),
+    }
+  } with {
+    env.working_directory() -> pwd,
+    env.variables() -> [],
+  }
+}
+
+fn shipped_listing_with(overrides: List<Source>) -> Option<List<fs::Listed>> / {Shipped} =
+  Some(
+    overrides.fold(
+      shipped.names().map(|n: String| n ++ ".ply"),
+      |names: List<String>, source: Source|
+        if !source.path.ends_with(".ply") || source.path.contains("/")
+            || names.contains(source.path) { names }
+        else { names.push(source.path) },
+    ).map(
+      listed_file,
+    ),
+  )
+
+fn listed_file(name: String) -> fs::Listed = { name: name, kind: File }
+
+fn digests_with_overrides(overrides: List<Source>, own: Bytes) -> Bytes / {abort.raise} = {
+  let listed = own.split(b"\n").fold(Map::new(), |accumulator: Map<Bytes, Bytes>, line: Bytes|
+    match line.index_of(b" ") {
+      Some(at) -> accumulator.insert(line.slice(0, at), line),
+      None -> accumulator,
+    });
+  let over = overrides.fold(listed, |accumulator: Map<Bytes, Bytes>, source: Source| {
+    let name = Bytes::of_string(source.path);
+    let digest = Bytes::of_string(source.text).blake3().hex_of();
+    accumulator.insert(name, Bytes::concat_all([name, b" ", Bytes::of_string(digest)]))
+  });
+  Bytes::concat_all(over.values().map(|line: Bytes| line.concat(b"\n")))
+}
+
+pub fn shipped_sources() -> List<Source> / {Shipped, abort.raise} =
+  shipped.names().map(|n: String|
+    {
+      path: n ++ ".ply",
+      text: match shipped.module(n) { Some(b) -> String::of_bytes(b), None -> "" },
+    })
+
+fn shipped_file(name: String) -> Option<Bytes> / {Shipped, abort.raise} =
+  if name == "stamps" { Some(Bytes::of_string(shipped.stamps())) }
+  else if name == "definitions" { Some(shipped.definitions()) }
+  else if name == "digests" { Some(shipped.digests()) }
+  else if name.ends_with(".ply") { shipped.module(name.slice(0, name.len() - 4)) }
+  else if name.contains("/") { shipped.module(name) }
+  else { None }
+
+pub fn module_in(prefix: String, file: String) -> String / {abort.raise} =
+  match module_of(file) {
+    Ok(name) -> prefix ++ name,
+    Err(reason) -> panic("`" ++ file ++ "` cannot be a module: " ++ reason),
+  }
+
+fn file_in(prefix: String, name: String) -> String / {abort.raise} =
+  String::join(name.slice(prefix.len(), name.len()).split("."), "/") ++ ".ply"
+
+pub fn std_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../packages/std")
+
+pub type ShippedModule = { module: String, source: Bytes }
+
+pub fn std_modules() -> List<ShippedModule> / {abort.raise} =
+  std_tree().fold([], |accumulator: List<ShippedModule>, f: { name: String, bytes: Bytes }|
+    if !f.name.ends_with(".ply") { accumulator }
+    else { accumulator.push({ module: module_in("std.", f.name), source: f.bytes }) })
+
+pub fn compiler_tree() -> List<{ name: String, bytes: Bytes }> =
+  embed_dir("../../packages/compiler")
+
+pub fn compiler_modules() -> List<ShippedModule> / {abort.raise} =
+  compiler_tree().fold([], |accumulator: List<ShippedModule>, f: { name: String, bytes: Bytes }|
+    if !f.name.ends_with(".ply") { accumulator }
+    else { accumulator.push({ module: module_in("compiler.", f.name), source: f.bytes }) })
+
+fn tree_of(
+  name: String,
+) -> Option<{ file: String, files: List<{ name: String, bytes: Bytes }> }> / {abort.raise} =
+  if name.starts_with("std.") { Some({ file: file_in("std.", name), files: std_tree() }) }
+  else if name.starts_with("compiler.") {
+    Some({ file: file_in("compiler.", name), files: compiler_tree() })
+  } else { None }
+
+pub fn prelude_file() -> Bytes = embed("../../packages/std/prelude.ply")
+
+fn tree_module(name: String) -> Option<Bytes> / {abort.raise} =
+  match tree_of(name) {
+    None -> None,
+    Some(t) -> match t.files.filter(|f: { name: String, bytes: Bytes }| f.name == t.file) {
+      [f, ..] -> Some(f.bytes),
+      [] -> None,
+    },
+  }
+
+pub fn std_data() -> List<{ name: String, bytes: Bytes }> =
+  std_tree().filter(|f: { name: String, bytes: Bytes }| !f.name.ends_with(".ply")).map(
+    |f: { name: String, bytes: Bytes }| { name: "std/" ++ f.name, bytes: f.bytes },
+  )
+
+pub fn is_compiler_module(name: String) -> Bool = name.starts_with("compiler.")
+
+pub fn shipped_drift() -> List<String> / {Shipped, abort.raise} = {
+  let named = shipped.names().filter(|n: String| is_compiler_module(n ++ ".ply"));
+  let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
+    files.filter(|f: { name: String, bytes: Bytes }| f.name.ends_with(".ply")).map(
+      |f: { name: String, bytes: Bytes }| module_in(prefix, f.name) ++ ".ply",
+    );
+  let tree_modules = modules("std.", std_tree()).concat(
+    modules("compiler.", compiler_tree()),
+  ).filter(
+    is_compiler_module,
+  );
+  named.filter(|n: String| shipped.module(n) != tree_module(n)).concat(
+    tree_modules.filter(|h: String| named.filter(|n: String| n ++ ".ply" == h).len() == 0),
+  ).concat(
+    std_data().filter(|d: { name: String, bytes: Bytes }|
+      is_compiler_module(d.name) && shipped.module(d.name) != Some(d.bytes)).map(
+      |d: { name: String, bytes: Bytes }| d.name,
+    ),
+  )
+}
+
+pub fn tree_digests() -> Bytes / {abort.raise} = {
+  let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
+    files.fold([], |accumulator: List<ShippedFile>, f: { name: String, bytes: Bytes }|
+      if f.name.ends_with(".ply") {
+        accumulator.push({
+          name: module_in(prefix, f.name) ++ ".ply",
+          path: f.name,
+          bytes: f.bytes,
+        })
+      } else { accumulator });
+  digests_of(
+    modules("std.", std_tree()).concat(modules("compiler.", compiler_tree())).concat(
+      std_data().map(|d: { name: String, bytes: Bytes }|
+        { name: d.name, path: d.name, bytes: d.bytes }),
+    ).filter(|s: ShippedFile| is_compiler_module(s.name)),
+  )
+}
+
+pub fn compiler_digests(digests: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    digests.split(b"\n").filter(|line: Bytes|
+      match line.index_of(b" ") {
+        Some(at) -> is_compiler_module(String::of_bytes(line.slice(0, at))),
+        None -> false,
+      }).map(|line: Bytes| line.concat(b"\n")),
+  )
+
+pub fn version() -> String / {Shipped} = shipped.version()
+
+fn path_dependencies(dir: String) -> List<String> / {Repo, abort.raise} =
+  manifest_at(dir).dependencies.fold([], |accumulator: List<String>, d: Dependency|
+    match d.source { Path(p) -> accumulator.push(normalize(join(dir, p))), _ -> accumulator })
+
+pub fn program_packages() -> List<String> / {Repo, abort.raise} =
+  iterate(
+    { todo: [toolchain_parts().cli], seen: [] },
+    64,
+    |s: { todo: List<String>, seen: List<String> }|
+      match s.todo {
+        [] -> Stop(s.seen),
+        [dir, ..rest] -> if s.seen.contains(dir) { Continue({ ..s, todo: rest }) }
+        else { Continue({ todo: rest.concat(path_dependencies(dir)), seen: s.seen.push(dir) }) },
+      },
+  )
+
+pub fn shipped_dirs() -> List<String> / {Repo, abort.raise} = {
+  let t = toolchain_parts();
+  [t.std, t.compiler].concat(program_packages())
+}
+
+pub fn tree(files: List<Source>) -> MemFs / {abort.raise} =
+  files.fold(fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, source: Source| {
+    let at = "w/" ++ source.path;
+    fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, Bytes::of_string(source.text)).fs
+  })
+
+pub fn one_module_tree(text: String) -> MemFs / {abort.raise} =
+  tree([{ path: "m.ply", text: text }])
+
+pub fn file_of(t: MemFs, path: String) -> Option<String> / {abort.raise} =
+  match fs::mem_read(t, to_tree_path(path)) { Some(b) -> Some(String::of_bytes(b)), None -> None }
+
+pub type RunWithTree = { ran: RunResult, tree: MemFs }
+
+pub fn in_memory(
+  t: MemFs,
+  argv: List<String>,
+) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_with_tree(t, argv, [], None).ran
+
+pub fn in_memory_with_tree(
+  t: MemFs,
+  argv: List<String>,
+  environment: List<EnvironmentVariable>,
+  stdin: Option<String>,
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} = {
+  let o = over_tree(t, || on_disk_with(argv, environment, stdin));
+  { ran: o.value, tree: o.tree }
+}
+
+pub effect set CliEffects = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], entering::machine.read, entering::machine.write, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
+
+pub effect set Hermetic = {entering::hermetic_machine.read, entering::hermetic_machine.write}
+
+pub effect set Shipped = {shipped.module, shipped.read_pack, shipped.digests, shipped.names, shipped.report_view_used, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.run_root}
+
+pub type WithTree<a> = { value: a, tree: MemFs }
+
+pub fn over_tree<a | e>(
+  t: MemFs,
+  body: () -> a / {CliEffects | e},
+) -> WithTree<a> / {abort.raise, Hermetic | e} =
+  handle {
+    body()
+  } with {
+    var disk = t,
+    var drawn = 0,
+    fs.kind[cwd](p) -> fs::mem_kind(disk, to_tree_path(p)),
+    fs.kind[abs](p) -> fs::mem_kind(disk, p),
+    fs.resolved_kind[cwd](p) -> fs::mem_resolved_kind(disk, to_tree_path(p)),
+    fs.resolved_kind[abs](p) -> fs::mem_resolved_kind(disk, p),
+    fs.list_dir[cwd](p) -> fs::mem_list(disk, to_tree_path(p)),
+    fs.list_dir[abs](p) -> fs::mem_list(disk, p),
+    fs.read_file[cwd](p) -> fs::mem_read(disk, to_tree_path(p)),
+    fs.read_file[abs](p) -> fs::mem_read(disk, p),
+    fs.file_size[cwd](p) -> fs::mem_size(disk, to_tree_path(p)),
+    fs.file_size[abs](p) -> fs::mem_size(disk, p),
+    fs.modified_ms[cwd](p) -> fs::mem_modified(disk, to_tree_path(p)),
+    fs.modified_ms[abs](p) -> fs::mem_modified(disk, p),
+    fs.write_file[cwd](p, body) -> {
+      let w = fs::mem_write(disk, to_tree_path(p), body);
+      disk = w.fs;
+      w.ok
+    },
+    fs.write_file[abs](p, body) -> {
+      let w = fs::mem_write(disk, p, body);
+      disk = w.fs;
+      w.ok
+    },
+    fs.write_secret[cwd](p, before, secret, encoding, after) -> {
+      let w = fs::mem_write_secret(disk, to_tree_path(p), {
+        before: before,
+        secret: secret,
+        encoding: encoding,
+        after: after,
+      });
+      disk = w.fs;
+      w.ok
+    },
+    fs.write_secret[abs](p, before, secret, encoding, after) -> {
+      let w = fs::mem_write_secret(disk, p, {
+        before: before,
+        secret: secret,
+        encoding: encoding,
+        after: after,
+      });
+      disk = w.fs;
+      w.ok
+    },
+    fs.read_secret[cwd](p, before, encoding, after) ->
+      fs::mem_read_secret(disk, to_tree_path(p), before, encoding, after),
+    fs.read_secret[abs](p, before, encoding, after) ->
+      fs::mem_read_secret(disk, p, before, encoding, after),
+    fs.create_dir[cwd](p) -> {
+      let w = fs::mem_create_dir(disk, to_tree_path(p));
+      disk = w.fs;
+      w.ok
+    },
+    fs.create_dir[abs](p) -> {
+      let w = fs::mem_create_dir(disk, p);
+      disk = w.fs;
+      w.ok
+    },
+    fs.remove[cwd](p) -> {
+      let w = fs::mem_remove(disk, to_tree_path(p));
+      disk = w.fs;
+      w.ok
+    },
+    fs.remove[abs](p) -> {
+      let w = fs::mem_remove(disk, p);
+      disk = w.fs;
+      w.ok
+    },
+    fs.rename[cwd](from, to) -> {
+      let w = fs::mem_rename(disk, to_tree_path(from), to_tree_path(to));
+      disk = w.fs;
+      w.ok
+    },
+    fs.rename[abs](from, to) -> {
+      let w = fs::mem_rename(disk, from, to);
+      disk = w.fs;
+      w.ok
+    },
+    fs.read_at[cwd](p, at, n) -> fs::mem_read_at(disk, to_tree_path(p), at, n),
+    fs.read_at[abs](p, at, n) -> fs::mem_read_at(disk, p, at, n),
+    fs.exists[cwd](p) -> fs::mem_exists(disk, to_tree_path(p)),
+    fs.exists[abs](p) -> fs::mem_exists(disk, p),
+    fs.canonical[cwd](p) -> fs::mem_canonical(disk, "", to_tree_path(p)),
+    fs.canonical[abs](p) -> fs::mem_canonical(disk, "", p),
+    fs.mode[cwd](p) -> fs::mem_mode(disk, to_tree_path(p)),
+    fs.mode[abs](p) -> fs::mem_mode(disk, p),
+    fs.read_link[cwd](p) -> fs::mem_read_link(disk, to_tree_path(p)),
+    fs.read_link[abs](p) -> fs::mem_read_link(disk, p),
+    fs.walk[cwd](p) -> match fs::mem_walk(disk, to_tree_path(p)) {
+      Some(es) -> Some(es.map(|e: Entry| { ..e, path: from_tree_path(e.path) })),
+      None -> None,
+    },
+    fs.walk[abs](p) -> fs::mem_walk(disk, p),
+    fs.append[cwd](p, body) -> {
+      let a = fs::mem_append(disk, to_tree_path(p), body);
+      disk = a.fs;
+      a.at
+    },
+    fs.append[abs](p, body) -> {
+      let a = fs::mem_append(disk, p, body);
+      disk = a.fs;
+      a.at
+    },
+    fs.sync[cwd](p) -> {
+      let w = fs::mem_sync(disk, to_tree_path(p));
+      disk = w.fs;
+      w.ok
+    },
+    fs.sync[abs](p) -> {
+      let w = fs::mem_sync(disk, p);
+      disk = w.fs;
+      w.ok
+    },
+    fs.lock[cwd](p) -> {
+      let w = fs::mem_lock(disk, to_tree_path(p));
+      disk = w.fs;
+      w.ok
+    },
+    fs.lock[abs](p) -> {
+      let w = fs::mem_lock(disk, p);
+      disk = w.fs;
+      w.ok
+    },
+    fs.unlock[cwd](p) -> {
+      let w = fs::mem_unlock(disk, to_tree_path(p));
+      disk = w.fs;
+      w.ok
+    },
+    fs.unlock[abs](p) -> {
+      let w = fs::mem_unlock(disk, p);
+      disk = w.fs;
+      w.ok
+    },
+    fs.copy[cwd](from, to) -> {
+      let w = fs::mem_copy(disk, to_tree_path(from), to_tree_path(to));
+      disk = w.fs;
+      w.ok
+    },
+    fs.copy[abs](from, to) -> {
+      let w = fs::mem_copy(disk, from, to);
+      disk = w.fs;
+      w.ok
+    },
+    fs.remove_tree[cwd](p) -> {
+      let w = fs::mem_remove_tree(disk, to_tree_path(p));
+      disk = w.fs;
+      w.ok
+    },
+    fs.remove_tree[abs](p) -> {
+      let w = fs::mem_remove_tree(disk, p);
+      disk = w.fs;
+      w.ok
+    },
+    fs.temp_dir[cwd](dir, prefix) -> {
+      let m = fs::mem_temp_dir(disk, to_tree_path(dir), prefix);
+      disk = m.fs;
+      match m.path { Some(p) -> Some(from_tree_path(p)), None -> None }
+    },
+    fs.temp_dir[abs](dir, prefix) -> {
+      let m = fs::mem_temp_dir(disk, dir, prefix);
+      disk = m.fs;
+      m.path
+    },
+    fs.set_mode[cwd](p, m) -> {
+      let w = fs::mem_set_mode(disk, to_tree_path(p), m);
+      disk = w.fs;
+      w.ok
+    },
+    fs.set_mode[abs](p, m) -> {
+      let w = fs::mem_set_mode(disk, p, m);
+      disk = w.fs;
+      w.ok
+    },
+    fs.symlink[cwd](p, to) -> {
+      let w = fs::mem_symlink(disk, to_tree_path(p), to);
+      disk = w.fs;
+      w.ok
+    },
+    fs.symlink[abs](p, to) -> {
+      let w = fs::mem_symlink(disk, p, to);
+      disk = w.fs;
+      w.ok
+    },
+    fs.set_modified[cwd](p, ms) -> {
+      let w = fs::mem_set_modified(disk, to_tree_path(p), ms);
+      disk = w.fs;
+      w.ok
+    },
+    fs.set_modified[abs](p, ms) -> {
+      let w = fs::mem_set_modified(disk, p, ms);
+      disk = w.fs;
+      w.ok
+    },
+    fs.open[cwd](p, how) -> {
+      let o = fs::mem_open(disk, to_tree_path(p), how);
+      disk = o.fs;
+      o.file
+    },
+    fs.open[abs](p, how) -> {
+      let o = fs::mem_open(disk, p, how);
+      disk = o.fs;
+      o.file
+    },
+    fs.read_chunk[cwd](file, max) -> {
+      let c = fs::mem_read_chunk(disk, file, max);
+      disk = c.fs;
+      c.bytes
+    },
+    fs.read_chunk[abs](file, max) -> {
+      let c = fs::mem_read_chunk(disk, file, max);
+      disk = c.fs;
+      c.bytes
+    },
+    fs.write_chunk[cwd](file, body) -> {
+      let w = fs::mem_write_chunk(disk, file, body);
+      disk = w.fs;
+      w.ok
+    },
+    fs.write_chunk[abs](file, body) -> {
+      let w = fs::mem_write_chunk(disk, file, body);
+      disk = w.fs;
+      w.ok
+    },
+    fs.close[cwd](file) -> {
+      let w = fs::mem_close(disk, file);
+      disk = w.fs;
+      w.ok
+    },
+    fs.close[abs](file) -> {
+      let w = fs::mem_close(disk, file);
+      disk = w.fs;
+      w.ok
+    },
+    fs.stat[cwd](p) -> fs::mem_stat(disk, to_tree_path(p)),
+    fs.stat[abs](p) -> fs::mem_stat(disk, p),
+    fs.scan[cwd](p, deep) -> match fs::mem_scan(disk, to_tree_path(p), deep) {
+      Some(seen) -> Some(seen.map(|s: ScanEntry| { ..s, path: from_tree_path(s.path) })),
+      None -> None,
+    },
+    fs.scan[abs](p, deep) -> fs::mem_scan(disk, p, deep),
+    fs.space[cwd](p) -> fs::mem_space(disk, to_tree_path(p)),
+    fs.space[abs](p) -> fs::mem_space(disk, p),
+    fs.link[cwd](p, to) -> {
+      let l = fs::mem_link(disk, to_tree_path(p), to_tree_path(to));
+      disk = l.fs;
+      l.done
+    },
+    fs.link[abs](p, to) -> {
+      let l = fs::mem_link(disk, p, to);
+      disk = l.fs;
+      l.done
+    },
+    entropy.next() -> {
+      let n = drawn;
+      drawn = n + 1;
+      n
+    },
+    entropy.secret(size) -> {
+      let n = drawn;
+      drawn = n + 1;
+      Secret::of_bytes(Bytes::concat_all(range(0, size).map(|i: Int| byte_of_int(n + i & 255))))
+    },
+    time.now_ms() -> 0,
+    time.elapsed_ms() -> 0,
+    time.elapsed_us() -> 0,
+    time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
+    process.bound[git]() -> false,
+    process.spawn[git](args, dir, variables) -> panic(unavailable_in_memory("`git`")),
+    entering::machine.open(library) -> entering::hermetic_machine.open(library),
+    entering::machine.bind(grants) -> entering::hermetic_machine.bind(grants),
+    entering::machine.enter(unit, root, arguments, run) ->
+      entering::hermetic_machine.enter(unit, root, arguments, run),
+    entering::machine.report(line, to_stderr) -> (),
+    entering::machine.changed_read(grants, trace) ->
+      entering::hermetic_machine.changed_read(grants, trace),
+    entering::machine.hosting(grants) -> entering::hermetic_machine.hosting(grants),
+    entering::machine.unbind(binding) -> entering::hermetic_machine.unbind(binding),
+    entering::machine.close(unit) -> entering::hermetic_machine.close(unit),
+    net.connect[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.connect_tls[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.handshake[registry](_) -> panic(unavailable_in_memory("a registry")),
+    net.send[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.recv[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.close[registry](_) -> panic(unavailable_in_memory("a registry")),
+    return value -> { value: value, tree: disk },
+  }
+
+pub fn scratch<| e>(body: () -> Unit / {CliEffects | e}) -> Unit / {abort.raise, Hermetic | e} =
+  over_tree(tree([{ path: scratch_marker(), text: "" }]), body).value
+
+fn unavailable_in_memory(what: String) -> String =
+  "a run in memory reaches no " ++ what ++ "; run this test against the disk, as `test/nondet`"
+
+fn to_tree_path(p: String) -> String / {abort.raise} = joined("w", p)
+
+fn from_tree_path(p: String) -> String / {abort.raise} =
+  if p == "w" { "." } else if p.starts_with("w/") { p.slice(2, p.len()) } else { p }
+
+fn input_lines(stdin: Option<String>) -> List<String> / {abort.raise} =
+  match stdin {
+    None -> [],
+    Some(text) -> {
+      let lines = text.split("\n");
+      let last = lines.len() - 1;
+      if lines.at(last) == Some("") {
+        range(0, last).fold([], |accumulator: List<String>, i: Int|
+          match lines.at(i) { Some(l) -> accumulator.push(l), None -> accumulator })
+      } else { lines }
+    },
+  }
+
+fn declared_command(root: command_line::Command, path: List<String>) -> Option<command_line::Body> =
+  path.fold(Some(command_line::body(root)), |at: Option<command_line::Body>, word: String|
+    match at {
+      None -> None,
+      Some(node) -> match node.subs.filter(|c: command_line::Command|
+          command_line::body(c).name == word) {
+        [c, ..] -> Some(command_line::body(c)),
+        [] -> None,
+      },
+    })
+
+fn surface() -> command_line::Spec = spec("0.0.0-test")
+
+fn compiling() -> List<String> = ["attest", "bootstrap", "build", "prove", "review", "run", "test"]
+
+fn not_here(argv: List<String>, what: String) -> String =
+  "`ply " ++ String::join(argv, " ") ++ "` " ++ what
+    ++ ": start it with `spawned`, in a `test/nondet` over the working directory"
+
+fn compiles(argv: List<String>) -> Bool / {abort.raise} =
+  match command_line::parse(surface(), argv) {
+    command_line::Run(p) -> match p.path { [word, ..] -> compiling().contains(word), [] -> false },
+    _ -> false,
+  }
+
+fn with_default_path(argv: List<String>) -> List<String> / {abort.raise} = {
+  let surface = surface();
+  let left_off = match command_line::parse(surface, argv) {
+    command_line::Run(p) -> match declared_command(surface.root, p.path) {
+      None -> false,
+      Some(node) -> match node.positionals.at(node.positionals.len() - 1) {
+        Some(last) ->
+          !last.required && last.default == "" && p.positionals.len() < node.positionals.len(),
+        None -> false,
+      },
+    },
+    _ -> false,
+  };
+  if !left_off { argv } else {
+    match argv.find_index(|word: String| word == "--") {
+      Some(i) -> argv.take(i).concat(["."]).concat(argv.drop(i)),
+      None -> argv.push("."),
+    }
+  }
+}
+
+pub fn on_disk(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with(argv, [], None)
+
+pub fn on_disk_with(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+  stdin: Option<String>,
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, variables, stdin, [])
+
+pub fn on_disk_shipping(
+  argv: List<String>,
+  shipped: List<Source>,
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, [], None, shipped)
+
+pub fn on_disk_shipping_only(
+  argv: List<String>,
+  shipped: List<Source>,
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, [], None, with_prelude_shipped(shipped), true)
+
+pub fn with_prelude_shipped(modules: List<Source>) -> List<Source> / {abort.raise} =
+  if modules.any(|s: Source| s.path == "std.prelude.ply") { modules }
+  else { modules.push({ path: "std.prelude.ply", text: String::of_bytes(prelude_file()) }) }
+
+fn on_disk_with_overrides(
+  argv: List<String>,
+  variables: List<EnvironmentVariable>,
+  stdin: Option<String>,
+  overrides: List<Source>,
+  only: Bool = false,
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} = {
+  let rejecting = overrides.len() == 0;
+  if rejecting && compiles(argv) { panic(not_here(argv, "compiles the program")) };
+  let pwd = working_directory();
+  let ran = handle {
+    main()
+  } with {
+    var io = with_input(captured(with_default_path(argv)), input_lines(stdin)),
+    process.args[proc]() -> args_step(io),
+    process.out[proc](line) -> {
+      io = out_step(io, line);
+    },
+    process.err[proc](line) -> {
+      io = err_step(io, line);
+    },
+    entering::machine.report(line, to_stderr) -> {
+      io = if to_stderr { err_step(io, line) } else { out_step(io, line) };
+    },
+    process.exit[proc](code) resume k -> captured_result(exit_step(io, code)),
+    env.variable(name) -> variable_value(variables, name),
+    env.variables() -> variables,
+    term.is_terminal(_) -> false,
+    entering::machine.open(library) -> if rejecting {
+      panic(not_here(argv, "compiled the program to run it"))
+    } else { entering::machine.open(library) },
+    shipped.version() -> version(),
+    shipped.binary_size() -> None,
+    env.working_directory() -> pwd,
+    toolchain.reuse_dir() -> pwd ++ "/" ++ reused_dir(),
+    toolchain.bodies_dir() -> pwd ++ "/" ++ bodies_dir(),
+    process.line[proc]() -> {
+      let read: Line = line_step(io);
+      io = read.captured;
+      read.line
+    },
+    fs.list_dir[shipped](_) -> if only {
+      Some(
+        overrides.filter(|source: Source| !source.path.contains("/")).map(|source: Source|
+          listed_file(source.path)),
+      )
+    } else { shipped_listing_with(overrides) },
+    fs.read_file[shipped](name) -> match overrides.filter(|source: Source| source.path == name) {
+      [source, ..] -> Some(Bytes::of_string(source.text)),
+      [] -> if name == "digests" && overrides.len() > 0 {
+        Some(digests_with_overrides(overrides, if only { b"" } else { shipped.digests() }))
+      } else { shipped_file(name) },
+    },
+    shipped.names() -> if only {
+      overrides.filter(|source: Source|
+        source.path.ends_with(".ply") && !source.path.contains("/")).map(|source: Source|
+        source.path.slice(0, source.path.len() - 4))
+    } else { shipped.names() },
+    shipped.module(name) -> match overrides.filter(|source: Source|
+        source.path == name ++ ".ply" || source.path == name) {
+      [source, ..] -> if only { Some(Bytes::of_string(source.text)) } else { shipped.module(name) },
+      [] -> if only { None } else { shipped.module(name) },
+    },
+    return u -> captured_result(io),
+  };
+  ran
+}
+
+pub fn cache_entry(name: String) -> Json / {CliEffects, Shipped, abort.raise, diverges} =
+  match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {
+    [m, ..] -> m,
+    [] -> panic("the cache holds no `" ++ name ++ "`"),
+  }

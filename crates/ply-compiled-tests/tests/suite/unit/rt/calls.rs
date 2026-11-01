@@ -1,5 +1,4 @@
 use crate::bare::{context_of, helper};
-use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::KeepRoot;
 use ply_compiled::heap::{HEADER, IMMORTAL, Word};
 use ply_compiled::rt::{Ctx, FAILED, Tables};
@@ -251,9 +250,13 @@ fn a_constant_is_evaluated_once_and_every_later_read_returns_the_copy() {
 }
 
 unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
-    let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
-        helper(&builtin_helper_name("?refused"));
-    unsafe { rejected(ctx, 8, 5, 2, 0) };
+    let raised: unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word) = helper("rt_failed");
+    let texts = [b"E0502".as_slice(), b"it failed", b"here"];
+    let words: Vec<Word> = texts
+        .iter()
+        .flat_map(|t| [t.as_ptr() as Word, t.len() as Word])
+        .collect();
+    unsafe { raised(ctx, 1, words.as_ptr(), 0, 0) };
     0
 }
 
