@@ -134,6 +134,7 @@ tests_of() {
   local -a picked=()
   shift
   placed "$id" || return 2
+  [[ " $* " == *" --filter "* ]] && picked=()
   out=$(mktemp)
   started=$(now_ms)
   tested "$path" ${picked[@]+"${picked[@]}"} ${part:+--shard "$part"} "$@" > "$out" || status=$?
