@@ -5,8 +5,9 @@ import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import program (Program, load_program, definitions_in_order, place_of, resolve_definition,
-                unknown_definition, program_view)
+import program (Program, clean_program, declarers_in, load_program, definitions_in_order, place_of,
+                resolve_definition, unknown_definition, program_view)
+import sources (DependencyPackage, File, Project)
 import report (CommandOutput, schema_version, ok_code, rejected, reported)
 import compiler.front.facts (CheckedProgram)
 import compiler.front.rows (OutlineItem, OutlinedType)
@@ -171,19 +172,71 @@ pub fn show_output(shown: DefinitionSource) -> CommandOutput / {abort.raise} = {
   }
 }
 
-pub fn run(
+fn own_file(project: Project, module: String) -> Option<File> =
+  project.files.concat(project.packages.flat_map(|p: DependencyPackage| p.files)).filter(
+    |f: File| f.module == module,
+  ).at(
+    0,
+  )
+
+fn named_in(query: String) -> { module: String, simple: String } / {abort.raise} = {
+  let parts = query.split(".");
+  let last = parts.len() - 1;
+  { module: String::join(parts.take(last), "."), simple: parts.at_or(last, query) }
+}
+
+fn found_by_name(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
-  let s = style_of(flags);
-  match program_view(loaded) {
-    None -> rejected(s, "show", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> match locate(loaded, w, flags.query) {
-      Err(d) -> reported(s, "show", [d], loaded.source_texts),
-      Ok(shown) -> show_output(shown),
+) -> Option<DefinitionSource> / {time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let named = named_in(flags.query);
+  match ((
+      if flags.verify_dependencies { None } else { clean_program(flags.paths) },
+      flags.paths.at(0),
+    )) {
+    (Some(clean), Some(r)) -> match declarers_in(r, clean.project, Bytes::of_string(named.simple)) {
+      [only] -> {
+        let module = String::of_bytes_lossy(only);
+        match if named.module == "" || named.module == module { own_file(clean.project, module) }
+          else { None } {
+          None -> None,
+          Some(file) -> match item_range(file.text, Bytes::of_string(named.simple)) {
+            Err(_) -> None,
+            Ok(r) ->
+              Some({
+                name: module ++ "." ++ named.simple,
+                unqualified_name: named.simple,
+                at: { module: no_module(), span: dummy_span() },
+                path: file.path,
+                text: file.text,
+                start: r.start,
+                end: r.end,
+              }),
+          },
+        }
+      },
+      _ -> None,
     },
+    _ -> None,
   }
 }
+
+pub fn run(
+  flags: Flags,
+) -> CommandOutput / {time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} =
+  match found_by_name(flags) {
+    Some(shown) -> show_output(shown),
+    None -> {
+      let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
+      let s = style_of(flags);
+      match program_view(loaded) {
+        None -> rejected(s, "show", loaded.diagnostics, loaded.source_texts),
+        Some(w) -> match locate(loaded, w, flags.query) {
+          Err(d) -> reported(s, "show", [d], loaded.source_texts),
+          Ok(shown) -> show_output(shown),
+        },
+      }
+    },
+  }
 
 fn a_file() -> Bytes =
   b"// The base.\nfn one() -> Int = 1\n\n// Doubles the base.\npub fn two() -> Int = one() + one()  // twice\n"

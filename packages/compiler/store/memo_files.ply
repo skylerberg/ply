@@ -13,6 +13,7 @@ import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, defer
                             start_run, stored_fact_bin, stored_input_bin, with_mark, without_mark)
 import compiler.store.packs
 import compiler.store.segments
+import compiler.store.segments (Committed)
 
 type StoreRun = {
   db: Database,
@@ -74,6 +75,8 @@ fn results_of_facts(values: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} =
       Err(_) -> found,
     })
 
+pub type Logged<a> = { value: a, log_position: Option<Int> }
+
 fn over_database<a, [r], [s] | e>(
   database: Database,
   shared: Database,
@@ -81,7 +84,7 @@ fn over_database<a, [r], [s] | e>(
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> a / {fs.read[r], fs.write[r], fs.read[s], fs.write[s], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e} = {
+) -> Logged<a> / {fs.read[r], fs.write[r], fs.read[s], fs.write[s], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e} = {
   let looked = |o: StoreRun, kind: Bytes, at: Bytes| {
     let id = location_id(kind, at);
     match o.looked.get(id) {
@@ -301,10 +304,12 @@ fn over_database<a, [r], [s] | e>(
     },
     return value -> {
       fact_store::commit_shared[s](st.shared, results_of_facts);
-      fact_store::commit[r](
+      let logged = if st.edited || st.changes.len() > 0 {
+        fact_store::append_change(st.db, st.changes)
+      } else { st.db };
+      let committed = fact_store::commit[r](
         fact_store::with_log_floor(
-          if st.edited || st.changes.len() > 0 { fact_store::append_change(st.db, st.changes) }
-          else { st.db },
+          logged,
           match fact_store::value_of[r](st.db, Codes, code_key(cursor_name())) {
             Some(b) -> undecoded(b, bin::int_bin()),
             None -> 0,
@@ -312,19 +317,25 @@ fn over_database<a, [r], [s] | e>(
         ),
         |_: Database| Map::new(),
       );
-      value
+      {
+        value: value,
+        log_position: match committed {
+          Committed(_) -> Some(fact_store::log_end(logged)),
+          _ -> None,
+        },
+      }
     },
   }
 }
 
-pub fn with_memo_store<a, [r], [s] | e>(
+pub fn with_logged_store<a, [r], [s] | e>(
   dir: String,
   shared_dir: String,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> a / {fs.read[r], fs.write[r], fs.read[s], fs.write[s], abort.raise | e} =
+) -> Logged<a> / {fs.read[r], fs.write[r], fs.read[s], fs.write[s], abort.raise | e} =
   with_recent_reads(|| {
     let db = fact_store::open[r](dir);
     let shared = fact_store::open[s](shared_dir);
@@ -351,34 +362,39 @@ pub fn with_memo_store<a, [r], [s] | e>(
     value
   })
 
-pub fn product_is_current<[r]>(dir: String, product: String) -> Bool / {fs.read[r], abort.raise} =
+pub fn with_memo_store<a, [r], [s] | e>(
+  dir: String,
+  shared_dir: String,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> a / {fs.read[r], fs.write[r], fs.read[s], fs.write[s], abort.raise | e} =
+  with_logged_store[r, s](dir, shared_dir, read, world, look, work).value
+
+pub fn current_product<[r]>(
+  dir: String,
+  product: String,
+) -> Option<Bytes> / {fs.read[r], abort.raise} =
   with_recent_reads(||
-    fact_store::undamaged(|| {
+    handle {
       let db = fact_store::read_only[r](dir);
-      fact_store::cursor[r](db, product) == fact_store::log_end(db)
-    }))
+      match fact_store::kept_product[r](db, product) {
+        Some(kept) -> if kept.at == fact_store::log_end(db) { Some(kept.value) } else { None },
+        None -> None,
+      }
+    } with {
+      fact_damage.damaged(_) -> None,
+    })
 
-pub fn product_value<[r]>(dir: String, product: String) -> Int / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    fact_store::undamaged(|| fact_store::cursor[r](fact_store::read_only[r](dir), product)))
-
-pub fn product_set_value<[r]>(
+pub fn keep_product<[r]>(
   dir: String,
   product: String,
-  value: Int,
+  at: Int,
+  value: Bytes,
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
   with_recent_reads(|| {
-    fact_store::move_cursor[r](fact_store::read_only[r](dir), product, value);
-    ()
-  })
-
-pub fn product_read_log<[r]>(
-  dir: String,
-  product: String,
-) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
-  with_recent_reads(|| {
-    let db = fact_store::read_only[r](dir);
-    fact_store::move_cursor[r](db, product, fact_store::log_end(db));
+    fact_store::keep_product[r](fact_store::read_only[r](dir), product, { at: at, value: value });
     ()
   })
 
@@ -504,6 +520,35 @@ fn test_queries() -> Map<Bytes, memo::Query<| {}>> =
     b"quoted",
     query(b"quoted", b"q1", quoted),
   )
+
+test "a kept product is current until an edit, and a run reports the position it committed" {
+  let queries = test_queries();
+  let quoted_at = |text: Bytes|
+    with_logged_store[abs, abs](
+      "s",
+      "shared",
+      packs::no_pack,
+      b"",
+      |_: Bytes, _: Bytes| Some(text),
+      || query_output(queries, start_run(queries), b"quoted", b"a").output,
+    ).log_position;
+  let done = fs::on_mem[abs](fs::mem_of([]), || {
+    let built = match quoted_at(b"one") { Some(at) -> at, None -> panic("the run committed") };
+    keep_product[abs]("s", "a built program", built, b"library");
+    let unedited = current_product[abs]("s", "a built program");
+    quoted_at(b"one");
+    let same_text = current_product[abs]("s", "a built program");
+    quoted_at(b"two");
+    {
+      unedited: unedited,
+      same_text: same_text,
+      edited: current_product[abs]("s", "a built program"),
+    }
+  });
+  assert_eq(done.value.unedited, Some(b"library"));
+  assert_eq(done.value.same_text, Some(b"library"));
+  assert_eq(done.value.edited, None)
+}
 
 fn quoted_over<[r]>(
   text: Bytes,

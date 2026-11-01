@@ -125,7 +125,9 @@ and flag.
 saved baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is
 always safe, and `ply cache clear` empties it. A run that crashes, or that races another run, can
 make a later run redo work, but never gives a wrong result. Checkouts also share a per-user cache of
-results, so a new checkout of the same code reuses the work of another one.
+results, so a new checkout of the same code reuses the work of another one. If nothing changed since
+a run that succeeded, `ply check`, `ply test`, `ply run`, `ply build` and `ply prove` load no program:
+they report the stored result or start the stored library.
 
 A definition's hash is a fingerprint of the definition and of everything it depends on. It does not
 cover the definition's comments, formatting or name. So a rename or a comment edit reruns no test.

@@ -14,7 +14,8 @@ import compiler.front.checking (CheckedModule, PackageFile, OwnPackage, LoadInpu
                                 check_shipped_modules, shipped_queries, wanted_all, load_inputs_of,
                                 package_location_in)
 import compiler.front.checking.world (CheckQuery, RunEffects, ModuleKey, with_decode_cache, decoded)
-import compiler.front.checking.groups (ProgramSummary, program_summary_bin, program_summary_query)
+import compiler.front.checking.groups (ProgramSummary, declarers_input, program_summary_bin,
+                                       program_summary_query, symbol_query)
 import compiler.load (Derives, derivation_response)
 import compiler.front.pages (Pages)
 import compiler.front (ShippedWants, embed_inputs_of, shipped_bytes)
@@ -154,6 +155,7 @@ pub type QueryResults = {
   inputs: Result<Map<Bytes, Bytes>, List<Diagnostic>>,
   tallies: List<QueryStats>,
   missing_results: Int,
+  log_position: Option<Int>,
 }
 
 pub fn nothing() -> QueryResults =
@@ -166,6 +168,7 @@ pub fn nothing() -> QueryResults =
     inputs: Ok(Map::new()),
     tallies: [],
     missing_results: 0,
+    log_position: None,
   }
 
 type ModuleResults = {
@@ -207,6 +210,7 @@ fn queried_of(
     inputs: embedded_inputs(project, w, done.value.results, seen),
     tallies: query_stats(done.run),
     missing_results: missing_count(done.run),
+    log_position: None,
   }
 
 pub fn query_through_store<[r]>(
@@ -216,7 +220,7 @@ pub fn query_through_store<[r]>(
   let qs = running_queries();
   let w = query_inputs(project);
   let ran = recording_embeds(||
-    memo_files::with_memo_store[r, abs](
+    memo_files::with_logged_store[r, abs](
       dir,
       shared_store(),
       pack_frame,
@@ -230,13 +234,14 @@ pub fn query_through_store<[r]>(
         ),
       || with_decode_cache(|| query_modules(qs, w.own, start_run(qs))),
     ));
-  queried_of(project, w, ran.value, ran.seen)
+  { ..queried_of(project, w, ran.value.value, ran.seen), log_position: ran.value.log_position }
 }
 
-pub fn checked_summary<[r]>(
+fn over_project_store<a, [r]>(
   dir: String,
   project: Project,
-) -> ProgramSummary / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+  work: (Map<Bytes, CheckQuery>, LoadInputs) -> a / {RunEffects, abort.raise},
+) -> a / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
   memo_files::with_memo_store[r, abs](
@@ -251,20 +256,37 @@ pub fn checked_summary<[r]>(
         kind,
         at,
       ),
-    ||
-      with_decode_cache(||
-        decoded(
-          query_output(
-            qs,
-            start_run(qs),
-            program_summary_query(),
-            bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
-          ).output,
-          program_summary_bin(),
-          "the program's summary",
-        )),
+    || with_decode_cache(|| work(qs, w)),
   )
 }
+
+pub fn checked_summary<[r]>(
+  dir: String,
+  project: Project,
+) -> ProgramSummary / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
+  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, w: LoadInputs|
+    decoded(
+      query_output(
+        qs,
+        start_run(qs),
+        program_summary_query(),
+        bin::encode(w.own, bin::list_bin(bin::bytes_bin())),
+      ).output,
+      program_summary_bin(),
+      "the program's summary",
+    ))
+
+pub fn declarers<[r]>(
+  dir: String,
+  project: Project,
+  name: Bytes,
+) -> List<Bytes> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
+  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, w: LoadInputs|
+    decoded(
+      query_output(qs, start_run(qs), symbol_query(), declarers_input(name)).output,
+      bin::list_bin(bin::bytes_bin()),
+      "the modules that declare a name",
+    ))
 
 pub fn shipped_results<[r]>(
   store_dir: String,
@@ -339,24 +361,9 @@ pub fn doc_pages<[r]>(
   dir: String,
   project: Project,
   modules: List<ModuleKey>,
-) -> List<Pages> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let qs = running_queries();
-  let w = query_inputs(project);
-  memo_files::with_memo_store[r, abs](
-    dir,
-    shared_store(),
-    pack_frame,
-    shipped_files(),
-    |kind: Bytes, at: Bytes|
-      read_project_input(
-        w,
-        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-        kind,
-        at,
-      ),
-    || with_decode_cache(|| documented_all(qs, modules, start_run(qs)).value),
-  )
-}
+) -> List<Pages> / {fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
+  over_project_store[r](dir, project, |qs: Map<Bytes, CheckQuery>, _: LoadInputs|
+    documented_all(qs, modules, start_run(qs)).value)
 
 fn query_shipped<a>(
   query: (Map<Bytes, CheckQuery>, Run) -> a / {RunEffects, abort.raise},

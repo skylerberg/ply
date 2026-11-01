@@ -462,13 +462,18 @@ pub fn changes_after<[r]>(
 
 pub fn log_end(db: Database) -> Int = db.log_end
 
-pub fn cursor<[r]>(
+pub type KeptProduct = { at: Int, value: Bytes }
+
+pub fn kept_product<[r]>(
   db: Database,
   product: String,
-) -> Int / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+) -> Option<KeptProduct> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   match table_value[r](db, cursors_table(), Bytes::of_string(product).blake3()) {
-    Some(bytes) -> decoded(bytes, bin::int_bin()),
-    None -> 0,
+    Some(bytes) -> match bytes.u64_at(0) {
+      Some(at) -> Some({ at: at, value: bytes.slice(8, bytes.len()) }),
+      None -> fact_damage.damaged("a kept product has no log position"),
+    },
+    None -> None,
   }
 
 type RowDraft = { writing: SegmentWriter, rows: Map<Bytes, Bytes> }
@@ -843,10 +848,10 @@ fn merge_tail<[r]>(
   match db.run { Some(run) -> segments::sweep[r](db.dir, schema(), run, []), None -> () }
 }
 
-pub fn move_cursor<[r]>(
+pub fn keep_product<[r]>(
   db: Database,
   product: String,
-  offset: Int,
+  kept: KeptProduct,
 ) -> CommitResult / {fs.read[r], fs.write[r], abort.raise} =
   match segments::start_run[r](db.dir) {
     None -> WriteFailed,
@@ -860,7 +865,7 @@ pub fn move_cursor<[r]>(
             cursors_table(),
             Map::new().insert(
               Bytes::of_string(product).blake3(),
-              bin::encode(offset, bin::int_bin()),
+              u64_le(kept.at).concat(kept.value),
             ),
           ),
           Map::new(),
@@ -1035,22 +1040,23 @@ test "reading the log returns the entries after an offset" {
   assert_eq(log_stored(tree, 1).map(|e: LogEntry| e.changes), [[sample_change("second")]])
 }
 
-test "two kinds of product read the log at independent cursors" {
+test "each kind of product keeps its own position and value" {
   let tree = after_first(fs::mem_of([]));
-  let moved = fs::on_mem[abs](tree, ||
+  let kept = fs::on_mem[abs](tree, ||
     in_store[abs](|db: Database| {
-      move_cursor[abs](db, "tests", 1);
+      keep_product[abs](db, "tests", { at: 1, value: b"passed" });
       ()
     })).tree;
-  let at = fs::on_mem[abs](moved, ||
-    in_store[abs](|db: Database| [cursor[abs](db, "tests"), cursor[abs](db, "proofs")]));
-  assert_eq(at.value, [1, 0])
+  let at = fs::on_mem[abs](kept, ||
+    in_store[abs](|db: Database|
+      [kept_product[abs](db, "tests"), kept_product[abs](db, "proofs")]));
+  assert_eq(at.value, [Some({ at: 1, value: b"passed" }), None])
 }
 
-test "a product that moves its cursor while an edit runs does not fail the edit's commit" {
+test "a product kept while an edit runs does not fail the edit's commit" {
   let raced = fs::on_mem[abs](after_first(fs::mem_of([])), ||
     in_store[abs](|db: Database| {
-      move_cursor[abs](db, "tests", 1);
+      keep_product[abs](db, "tests", { at: 1, value: b"" });
       commit[abs](second_edit(db), no_results)
     }));
   assert(match raced.value { Committed(_) -> true, _ -> false });

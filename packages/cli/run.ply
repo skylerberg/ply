@@ -12,12 +12,15 @@ import compiler.check.resolve.tables (Diagnostic, Label)
 import diagnostic (SourceText, RuntimeDiagnostic, Position, runtime_diagnostic_json, shown,
                    position_of, to_json, all_to_json, all_to_text)
 import entries
-import entry (Main, Module, entry_point)
+import entry (Main, Module, entry_point, main_bin, module_bin)
 import compiler.cc
 import compiler.cc (toolchain)
+import compiler.store.hash.encoding (hex)
+import sources (Project, File, DependencyPackage, shipped_text)
 import std.env (env)
 import paths
-import program (TimedLoad, loaded_analysis, timed_load, program_view)
+import program (TimedLoad, loaded_analysis, timed_load, program_view, product_unchanged,
+                keep_product_at)
 import builder (builder)
 import units
 import units (emit)
@@ -34,12 +37,12 @@ import std.signed (decode_signed, trusted_signer)
 import std.list
 import compiler.store.plyx (digest_of, digest_text, domain, library_domain)
 import compiler.check.resolve.tables (error_at)
-import compiler.unit (shipped)
+import compiler.unit (shipped, shipped_runtime, program_key)
 import artifact_builder
 import hosts (filesystem_json, transport_json)
 import host_listing
 import host_listing (HostSettings, Listing, RejectionCount)
-import entries (Runnable)
+import entries (Runnable, runnable_bin)
 import machine
 import machine (Artifact, RunConfiguration, Deployed, BindingSummary, RunOutcome, MachineAccess,
                 Options, Program, Project, ProgramFiles, Rejection, Signals, StopReport, Target,
@@ -777,10 +780,108 @@ fn signer_rejection(
 
 fn is_artifact(path: String) -> Bool = path.ends_with(".plyx") || path.ends_with(".plyz")
 
+fn built_product(
+  flags: Flags,
+  options: Options,
+) -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "built "
+    ++ String::of_bytes_lossy(
+      hex(
+        program_key(
+          Bytes::of_string(
+            String::join(
+              [
+                options.profile.name,
+                match options.config.schema { Some(s) -> s, None -> "" },
+              ].concat(
+                flags.paths.map(|r: paths::ResolvedPath| r.display),
+              ),
+              "\n",
+            ),
+          ),
+          shipped_runtime(),
+          shipped.definitions(),
+        ),
+      ),
+    )
+
+fn may_reuse_library(flags: Flags) -> Bool =
+  !flags.no_cache && !flags.explain && !flags.verify_dependencies
+
+type KeptPlace = { path: String, module: String }
+
+type KeptRun = {
+  library: String,
+  root: String,
+  places: List<KeptPlace>,
+  mains: List<Main>,
+  modules: List<Module>,
+  runnable: Runnable,
+}
+
+derive bin for KeptPlace
+
+derive bin for KeptRun
+
+fn kept_target(kept: KeptRun, project: Project) -> Target / {fs.read_file[shipped], abort.raise} = {
+  let own = project.files.concat(project.packages.flat_map(|p: DependencyPackage| p.files)).fold(
+    Map::new(),
+    |texts: Map<String, Bytes>, f: File| texts.insert(f.module, f.text),
+  );
+  program_of(
+    {
+      root: kept.root,
+      files: kept.places.map(|p: KeptPlace| p.path),
+      places: kept.places.map(|p: KeptPlace|
+        {
+          path: p.path,
+          text: match own.get(p.module) {
+            Some(text) -> text,
+            None -> match shipped_text(Bytes::of_string(p.module)) {
+              Some(text) -> text,
+              None -> b"",
+            },
+          },
+        }),
+    },
+    kept.mains,
+    kept.modules,
+  )
+}
+
+fn kept_run_of(value: Bytes) -> Option<KeptRun> / {abort.raise} =
+  match bin::decode(value, kept_run_bin()) { Ok(kept) -> Some(kept), Err(_) -> None }
+
 fn run_sources(
   style: Style,
   flags: Flags,
   options: Options,
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let product = built_product(flags, options);
+  let current = if may_reuse_library(flags) { product_unchanged(flags.paths, product) }
+  else { None };
+  let reopened = match current {
+    None -> None,
+    Some(c) -> match kept_run_of(c.value) {
+      None -> None,
+      Some(kept) -> match entering::machine.open(kept.library) {
+        Err(_) -> None,
+        Ok(unit) ->
+          Some({ target: kept_target(kept, c.clean.project), unit: unit, runnable: kept.runnable }),
+      },
+    },
+  };
+  match reopened {
+    Some(t) -> run_loaded(style, flags, options, Ok(t), None),
+    None -> built_sources(style, flags, options, product),
+  }
+}
+
+fn built_sources(
+  style: Style,
+  flags: Flags,
+  options: Options,
+  product: String,
 ) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let t: TimedLoad = timed_load(flags.paths, flags.verify_dependencies);
   match program_view(t.program) {
@@ -795,7 +896,7 @@ fn run_sources(
         unbound(style, { diagnostics: [d], places: t.program.source_texts, artifact: None }),
       None -> match reuse_violations(t.program, w.frame) {
         [] -> match evaluation_errors(t, w.frame) {
-          [] -> loaded_built(style, flags, options, t, w),
+          [] -> loaded_built(style, flags, options, t, w, product),
           rejected ->
             load_error_output(style, {
               diagnostics: rejected,
@@ -820,6 +921,7 @@ fn loaded_built(
   options: Options,
   timed: TimedLoad,
   view: CheckedProgram,
+  product: String,
 ) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, MachineAccess, process.err[proc], env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, fs.write[abs], Derives, abort.raise} = {
   let load_started_ms = time.elapsed_ms();
   let front = loaded_analysis(timed, view);
@@ -856,7 +958,27 @@ fn loaded_built(
         Err(diagnostics) -> rejected(diagnostics),
         Ok(library) -> match entering::machine.open(library) {
           Err(reason) -> rejected([machine::unit_load_error(reason)]),
-          Ok(unit) -> Ok({ target: target, unit: unit, runnable: runnable }),
+          Ok(unit) -> {
+            if may_reuse_library(flags) {
+              keep_product_at(
+                flags.paths,
+                timed.program.log_position,
+                product,
+                bin::encode(
+                  {
+                    library: library,
+                    root: machine::project_root(root_of(flags).machine),
+                    places: front.files.map(|f: SourceFile| { path: f.path, module: f.name }),
+                    mains: offered.mains,
+                    modules: offered.modules,
+                    runnable: runnable,
+                  },
+                  kept_run_bin(),
+                ),
+              )
+            };
+            Ok({ target: target, unit: unit, runnable: runnable })
+          },
         },
       };
       run_loaded(style, flags, options, loaded, Some(timing()))

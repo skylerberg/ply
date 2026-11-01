@@ -22,6 +22,7 @@ import compiler.store.hash
 import compiler.store.hash.forms (HashOutput, NodeRef, FunctionNamed, Subject, CachedHashes,
                                   ModuleHashes, no_cached_hashes, joined_cached_hashes)
 import compiler.store.hash.encoding (hex)
+import std.bin
 import std.hash (blake3)
 import compiler.syntax.items (Item, FunctionItem, parse)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, Location)
@@ -70,6 +71,7 @@ pub type Program = {
   shipped_views: List<ShippedModuleSummary>,
   tallies: List<QueryStats>,
   missing_results: Int,
+  log_position: Option<Int>,
 }
 
 pub type ModuleView = { name: String, path: String }
@@ -130,6 +132,7 @@ fn failed_program(
     shipped_views: [],
     tallies: [],
     missing_results: 0,
+    log_position: None,
   }
 
 pub fn no_program() -> Program =
@@ -152,6 +155,7 @@ pub fn no_program() -> Program =
     shipped_views: [],
     tallies: [],
     missing_results: 0,
+    log_position: None,
   }
 
 pub fn packages_of(project: Project) -> PackageSources =
@@ -316,6 +320,7 @@ fn analysed(
     shipped_views: loaded.views,
     tallies: [],
     missing_results: 0,
+    log_position: None,
   };
   let owned = project.sources.fold(Map::new(), |accumulator: Map<Bytes, Bool>, source: Source|
     accumulator.insert(source.name, true));
@@ -543,6 +548,7 @@ fn assembled(
     ..assembled_from(project, shipping, paths, q, true),
     tallies: q.tallies,
     missing_results: q.missing_results,
+    log_position: q.log_position,
   }
 
 fn assembled_from(
@@ -683,18 +689,40 @@ pub fn doc_pages(
     _ -> [],
   }
 
-pub fn clean_summary(
+fn store_of(resolved: paths::ResolvedPath) -> String =
+  paths::in_root(resolved, ".ply-cache/memo").path
+
+fn current_product_in(
+  resolved: paths::ResolvedPath,
+  product: String,
+) -> Option<Bytes> / {fs.read[cwd], fs.read[abs], abort.raise} =
+  if resolved.label == "cwd" { memo_files::current_product[cwd](store_of(resolved), product) }
+  else { memo_files::current_product[abs](store_of(resolved), product) }
+
+pub fn keep_product_at(
   paths: List<paths::ResolvedPath>,
-) -> Option<ProgramSummary> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  log_position: Option<Int>,
+  product: String,
+  value: Bytes,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+  match ((paths.at(0), log_position)) {
+    (Some(r), Some(at)) -> if r.label == "cwd" {
+      memo_files::keep_product[cwd](store_of(r), product, at, value)
+    } else { memo_files::keep_product[abs](store_of(r), product, at, value) },
+    _ -> (),
+  }
+
+pub type CleanProgram = { summary: ProgramSummary, project: Project }
+
+pub fn clean_program(
+  paths: List<paths::ResolvedPath>,
+) -> Option<CleanProgram> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
   match ((usable(project), paths.at(0))) {
     (true, Some(r)) -> {
-      let dir = paths::in_root(r, ".ply-cache/memo").path;
-      let summary = if r.label == "cwd" { module_queries::checked_summary[cwd](dir, project) }
-      else { module_queries::checked_summary[abs](dir, project) };
-      let current = !summary.checked_later
-        || (if r.label == "cwd" { memo_files::product_is_current[cwd](dir, "later checks") }
-        else { memo_files::product_is_current[abs](dir, "later checks") });
+      let summary = if r.label == "cwd" {
+        module_queries::checked_summary[cwd](store_of(r), project)
+      } else { module_queries::checked_summary[abs](store_of(r), project) };
       let layout_fine = packages_rejected(
           packages_of(project),
           project.sources.map(|s: Source| s.name),
@@ -703,68 +731,87 @@ pub fn clean_summary(
         ).len(
         )
         == 0;
-      if summary.clean && current && layout_fine { Some(summary) } else { None }
+      if summary.clean && layout_fine { Some({ summary: summary, project: project }) } else { None }
     },
     _ -> None,
   }
 }
 
-pub fn later_checks_passed(
+pub fn declarers_in(
+  resolved: paths::ResolvedPath,
+  project: Project,
+  name: Bytes,
+) -> List<Bytes> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  if resolved.label == "cwd" { module_queries::declarers[cwd](store_of(resolved), project, name) }
+  else { module_queries::declarers[abs](store_of(resolved), project, name) }
+
+fn later_checks() -> String = "later checks"
+
+pub fn clean_summary(
   paths: List<paths::ResolvedPath>,
-) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
-  match paths.at(0) {
-    None -> (),
-    Some(r) -> {
-      let dir = paths::in_root(r, ".ply-cache/memo").path;
-      if r.label == "cwd" { memo_files::product_read_log[cwd](dir, "later checks") }
-      else { memo_files::product_read_log[abs](dir, "later checks") }
-    },
+) -> Option<ProgramSummary> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match clean_program(paths) {
+    None -> None,
+    Some(clean) -> if !clean.summary.checked_later
+        || (match paths.at(0) {
+          Some(r) -> current_product_in(r, later_checks()) != None,
+          None -> false,
+        }) { Some(clean.summary) }
+    else { None },
   }
 
-fn tests_cursor(selection: String) -> String / {abort.raise} =
+pub fn later_checks_passed(
+  paths: List<paths::ResolvedPath>,
+  log_position: Option<Int>,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+  keep_product_at(paths, log_position, later_checks(), b"")
+
+pub type CurrentProduct = { value: Bytes, clean: CleanProgram }
+
+pub fn product_unchanged(
+  paths: List<paths::ResolvedPath>,
+  product: String,
+) -> Option<CurrentProduct> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match ((clean_program(paths), paths.at(0))) {
+    (Some(clean), Some(r)) -> match current_product_in(r, product) {
+      Some(value) -> Some({ value: value, clean: clean }),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn tests_product(selection: String) -> String / {abort.raise} =
   "tests passed " ++ String::of_bytes_lossy(hex(blake3(Bytes::of_string(selection))))
 
 pub fn passed_unchanged(
   paths: List<paths::ResolvedPath>,
   selection: String,
 ) -> Option<Int> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
-  match clean_summary(paths) {
+  match product_unchanged(paths, tests_product(selection)) {
     None -> None,
-    Some(summary) -> match paths.at(0) {
-      None -> None,
-      Some(r) -> {
-        let dir = paths::in_root(r, ".ply-cache/memo").path;
-        let cursor = tests_cursor(selection);
-        let current = if r.label == "cwd" { memo_files::product_is_current[cwd](dir, cursor) }
-        else { memo_files::product_is_current[abs](dir, cursor) };
-        let count = if r.label == "cwd" { memo_files::product_value[cwd](dir, cursor ++ " count") }
-        else { memo_files::product_value[abs](dir, cursor ++ " count") };
-        if current && count == summary.tests { Some(count) } else { None }
-      },
+    Some(kept) -> {
+      let tests = kept.clean.summary.tests;
+      match bin::decode(kept.value, bin::int_bin()) {
+        Ok(count) -> if count == tests { Some(tests) } else { None },
+        Err(_) -> None,
+      }
     },
   }
 
 pub fn record_passed(
   paths: List<paths::ResolvedPath>,
+  log_position: Option<Int>,
   selection: String,
   count: Int,
-) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
-  match paths.at(0) {
-    None -> (),
-    Some(r) -> {
-      let dir = paths::in_root(r, ".ply-cache/memo").path;
-      let cursor = tests_cursor(selection);
-      if r.label == "cwd" {
-        memo_files::product_read_log[cwd](dir, cursor);
-        memo_files::product_read_log[cwd](dir, "later checks");
-        memo_files::product_set_value[cwd](dir, cursor ++ " count", count)
-      } else {
-        memo_files::product_read_log[abs](dir, cursor);
-        memo_files::product_read_log[abs](dir, "later checks");
-        memo_files::product_set_value[abs](dir, cursor ++ " count", count)
-      }
-    },
-  }
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} = {
+  keep_product_at(
+    paths,
+    log_position,
+    tests_product(selection),
+    bin::encode(count, bin::int_bin()),
+  );
+  later_checks_passed(paths, log_position)
+}
 
 fn check_modules_uncached(
   project: Project,
