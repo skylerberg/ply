@@ -3,7 +3,7 @@ use super::*;
 pub(super) static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[repr(C)]
-pub struct Ctx {
+pub struct Context {
     pub failed: i64,
     pub(crate) entry: u64,
     pub stack_floor: std::sync::atomic::AtomicUsize,
@@ -16,7 +16,7 @@ pub struct Ctx {
     pub release_depth: i64,
     pub release_waiting: i64,
     pub target: Word,
-    pub entering_desc: Word,
+    pub entering_descriptor: Word,
     pub entering_words: Word,
     pub recording: i64,
     pub bridge: Word,
@@ -63,7 +63,7 @@ pub struct Ctx {
     pub(crate) continuations_died: Vec<(usize, usize)>,
     pub(crate) marshallings: Vec<Marshalling>,
     pub(crate) taken: Vec<u8>,
-    pub(super) outer_running: *mut Ctx,
+    pub(super) outer_running: *mut Context,
 }
 
 pub(crate) struct BranchFailure {
@@ -90,10 +90,10 @@ impl Unhandled {
 }
 
 thread_local! {
-    static RUNNING: std::cell::Cell<*mut Ctx> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static RUNNING: std::cell::Cell<*mut Context> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
-pub(crate) fn running() -> *mut Ctx {
+pub(crate) fn running() -> *mut Context {
     let c = RUNNING.with(std::cell::Cell::get);
     debug_assert!(
         !c.is_null(),
@@ -102,20 +102,20 @@ pub(crate) fn running() -> *mut Ctx {
     c
 }
 
-pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
+pub(crate) fn swap_running(c: *mut Context) -> *mut Context {
     RUNNING.with(|r| r.replace(c))
 }
 
-pub fn with_running<T>(f: impl FnOnce(&Ctx) -> T) -> Option<T> {
+pub fn with_running<T>(f: impl FnOnce(&Context) -> T) -> Option<T> {
     unsafe { RUNNING.with(std::cell::Cell::get).as_ref() }.map(f)
 }
 
-impl Ctx {
-    pub fn new(tables: Arc<Tables>) -> Ctx {
+impl Context {
+    pub fn new(tables: Arc<Tables>) -> Context {
         let mut heap = Heap::new();
         let alloc = heap.alloc();
         let constants = tables.memo.as_ptr();
-        Ctx {
+        Context {
             failed: 0,
             stack_floor: std::sync::atomic::AtomicUsize::new(0),
             site_root: -1,
@@ -125,7 +125,7 @@ impl Ctx {
             release_depth: 0,
             release_waiting: 0,
             target: 0,
-            entering_desc: 0,
+            entering_descriptor: 0,
             entering_words: 0,
             recording: 0,
             bridge: object_word(&NO_HANDLER_OBJECT),
@@ -191,8 +191,8 @@ impl Ctx {
             .expect("a runtime frame finds what it kept when its call returns")
     }
 
-    pub(crate) fn branch(&self) -> Ctx {
-        let mut b = Ctx::new(Arc::clone(&self.tables));
+    pub(crate) fn branch(&self) -> Context {
+        let mut b = Context::new(Arc::clone(&self.tables));
         b.deadline = self.deadline;
         b.time_budget_ms = self.time_budget_ms;
         b.entry = self.entry;
@@ -218,7 +218,7 @@ impl Ctx {
         self.refresh_recording_flag();
     }
 
-    pub(crate) fn absorb(&mut self, mut branch: Ctx) {
+    pub(crate) fn absorb(&mut self, mut branch: Context) {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.pooled |= branch.pooled;
         self.grown += branch.grown;
@@ -279,7 +279,7 @@ impl Ctx {
         self.release_depth = 0;
         self.release_waiting = 0;
         self.target = 0;
-        self.entering_desc = 0;
+        self.entering_descriptor = 0;
         self.entering_words = 0;
         self.refresh_recording_flag();
         self.release_later.clear();

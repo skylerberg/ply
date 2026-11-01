@@ -1,7 +1,7 @@
 mod children;
 
 pub(crate) use children::Children;
-pub use children::{Ended, Finished, OutputEvent, Io, Output, Signal};
+pub use children::{Ended, Finished, Io, Output, OutputEvent, Signal};
 
 use crate::jobs::{Failure, FallibleJob, Job};
 use crate::native::found;

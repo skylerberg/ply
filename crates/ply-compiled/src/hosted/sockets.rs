@@ -1,8 +1,10 @@
-use super::{Nondeterministic, if_host_allowed, done, given, required_argument, waited, with_host_facilities};
+use super::{
+    Nondeterministic, done, given, if_host_allowed, required_argument, waited, with_host_facilities,
+};
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use crate::secret;
 use ply_core::Diagnostic;
 use ply_host::native::parts_of;
@@ -151,7 +153,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-fn labelled<'a>(c: &mut Ctx, label: &'a [u8]) -> Option<(Arc<TcpHost>, &'a str)> {
+fn labelled<'a>(c: &mut Context, label: &'a [u8]) -> Option<(Arc<TcpHost>, &'a str)> {
     let label = c.text(label)?;
     let net = with_host_facilities(c, |facilities| Arc::clone(facilities.sockets()))?;
     Some((net, label))
@@ -180,17 +182,17 @@ fn texts(flat: &[u8]) -> Option<Vec<String>> {
 }
 
 pub unsafe extern "C" fn rt_net_listen(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     at: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_listen",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -209,19 +211,19 @@ pub unsafe extern "C" fn rt_net_listen(
 }
 
 pub unsafe extern "C" fn rt_net_listen_tls(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     at: I64,
-    credential_at: Addr,
+    credential_at: Address,
     credential_n: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_listen_tls",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -243,20 +245,20 @@ pub unsafe extern "C" fn rt_net_listen_tls(
 }
 
 pub unsafe extern "C" fn rt_net_listen_on(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    endpoint_at: Addr,
+    endpoint_at: Address,
     endpoint_n: I64,
-    options_at: Addr,
+    options_at: Address,
     options_n: I64,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "net_listen_on",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
@@ -274,20 +276,20 @@ pub unsafe extern "C" fn rt_net_listen_on(
 }
 
 pub unsafe extern "C" fn rt_net_listen_unix(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    root_at: Addr,
+    root_at: Address,
     root_n: I64,
-    path_at: Addr,
+    path_at: Address,
     path_n: I64,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "net_listen_unix",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
@@ -304,20 +306,20 @@ pub unsafe extern "C" fn rt_net_listen_unix(
 }
 
 pub unsafe extern "C" fn rt_net_connect(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    host_at: Addr,
+    host_at: Address,
     host_n: I64,
     at: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_connect",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -337,20 +339,20 @@ pub unsafe extern "C" fn rt_net_connect(
 }
 
 pub unsafe extern "C" fn rt_net_connect_tls(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    host_at: Addr,
+    host_at: Address,
     host_n: I64,
     at: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_connect_tls",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -371,21 +373,21 @@ pub unsafe extern "C" fn rt_net_connect_tls(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_connect_to(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    endpoint_at: Addr,
+    endpoint_at: Address,
     endpoint_n: I64,
-    options_at: Addr,
+    options_at: Address,
     options_n: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_connect_to",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -406,21 +408,21 @@ pub unsafe extern "C" fn rt_net_connect_to(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_connect_unix(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    root_at: Addr,
+    root_at: Address,
     root_n: I64,
-    path_at: Addr,
+    path_at: Address,
     path_n: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_connect_unix",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -430,7 +432,8 @@ pub unsafe extern "C" fn rt_net_connect_unix(
             ) else {
                 return I64(0);
             };
-            let Some(timeout) = required_argument(c, "net_connect_unix", "a deadline", deadline(timeout_ms))
+            let Some(timeout) =
+                required_argument(c, "net_connect_unix", "a deadline", deadline(timeout_ms))
             else {
                 return I64(0);
             };
@@ -441,17 +444,17 @@ pub unsafe extern "C" fn rt_net_connect_unix(
 }
 
 pub unsafe extern "C" fn rt_net_handshake(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_handshake",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -463,23 +466,23 @@ pub unsafe extern "C" fn rt_net_handshake(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_start_tls(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    name_at: Addr,
+    name_at: Address,
     name_n: I64,
-    alpn_at: Addr,
+    alpn_at: Address,
     alpn_n: I64,
     unread: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_start_tls",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -498,23 +501,23 @@ pub unsafe extern "C" fn rt_net_start_tls(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_serve_tls(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    credential_at: Addr,
+    credential_at: Address,
     credential_n: I64,
-    alpn_at: Addr,
+    alpn_at: Address,
     alpn_n: I64,
     unread: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_serve_tls",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -532,9 +535,9 @@ pub unsafe extern "C" fn rt_net_serve_tls(
 }
 
 fn upgrade(
-    c: &mut Ctx,
+    c: &mut Context,
     native: &str,
-    alpn_at: Addr,
+    alpn_at: Address,
     alpn_n: I64,
     unread: I64,
     timeout_ms: I64,
@@ -560,17 +563,17 @@ fn upgrade(
 }
 
 pub unsafe extern "C" fn rt_net_accept(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     listener: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_accept",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -581,71 +584,86 @@ pub unsafe extern "C" fn rt_net_accept(
 }
 
 pub unsafe extern "C" fn rt_net_recv(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
     max: I64,
     timeout_ms: I64,
 ) -> I64 {
-    if_host_allowed(ctx, "net_recv", Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let (Some(max), Some(timeout)) = (
-            required_argument(c, "net_recv", "a byte count", count(max)),
-            required_argument(c, "net_recv", "a deadline", deadline(timeout_ms)),
-        ) else {
-            return I64(0);
-        };
-        let job = net.recv(label, conn.0, max.min(MAX_RECV), timeout, c.site());
-        waited(c, "net_recv", "`net.recv`", job)
-    })
+    if_host_allowed(
+        context,
+        "net_recv",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Context| {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let (Some(max), Some(timeout)) = (
+                required_argument(c, "net_recv", "a byte count", count(max)),
+                required_argument(c, "net_recv", "a deadline", deadline(timeout_ms)),
+            ) else {
+                return I64(0);
+            };
+            let job = net.recv(label, conn.0, max.min(MAX_RECV), timeout, c.site());
+            waited(c, "net_recv", "`net.recv`", job)
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_net_send(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
-    payload_at: Addr,
+    payload_at: Address,
     payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
-    if_host_allowed(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(timeout) = required_argument(c, "net_send", "a deadline", deadline(timeout_ms)) else {
-            return I64(0);
-        };
-        let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
-        let job = net.send(label, conn.0, payload, timeout, c.site());
-        waited(c, "net_send", "`net.send`", job)
-    })
+    if_host_allowed(
+        context,
+        "net_send",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Context| {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(timeout) =
+                required_argument(c, "net_send", "a deadline", deadline(timeout_ms))
+            else {
+                return I64(0);
+            };
+            let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
+            let job = net.send(label, conn.0, payload, timeout, c.site());
+            waited(c, "net_send", "`net.send`", job)
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_net_send_secret(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
     framed: SecretHandle,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_send_secret",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let Some(framed) = secret::sealed_value(c, &framed) else {
                 return I64(0);
             };
-            let Some(timeout) = required_argument(c, "net_send_secret", "a deadline", deadline(timeout_ms))
+            let Some(timeout) =
+                required_argument(c, "net_send_secret", "a deadline", deadline(timeout_ms))
             else {
                 return I64(0);
             };
@@ -656,17 +674,17 @@ pub unsafe extern "C" fn rt_net_send_secret(
 }
 
 pub unsafe extern "C" fn rt_net_close_write(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) {
     if_host_allowed(
-        ctx,
+        context,
         "net_close_write",
         Nondeterministic,
         (),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return;
             };
@@ -676,37 +694,48 @@ pub unsafe extern "C" fn rt_net_close_write(
     );
 }
 
-pub unsafe extern "C" fn rt_net_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
-    if_host_allowed(ctx, "net_close", Nondeterministic, (), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
-            return;
-        };
-        let closed = net.close(label, socket.0, c.site());
-        done(c, closed);
-    });
+pub unsafe extern "C" fn rt_net_close(
+    context: *mut Context,
+    label_at: Address,
+    label_n: I64,
+    socket: I64,
+) {
+    if_host_allowed(
+        context,
+        "net_close",
+        Nondeterministic,
+        (),
+        |c: &mut Context| {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
+                return;
+            };
+            let closed = net.close(label, socket.0, c.site());
+            done(c, closed);
+        },
+    );
 }
 
 pub unsafe extern "C" fn rt_net_set_option(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
-    option_addr: Addr,
+    option_address: Address,
     option_len: I64,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "net_set_option",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             set_option(
                 c,
                 "net_set_option",
                 label_at,
                 label_n,
                 socket,
-                option_addr,
+                option_address,
                 option_len,
                 false,
             )
@@ -716,19 +745,19 @@ pub unsafe extern "C" fn rt_net_set_option(
 
 #[allow(clippy::too_many_arguments)]
 fn set_option(
-    c: &mut Ctx,
+    c: &mut Context,
     native: &str,
-    label_at: Addr,
+    label_at: Address,
     label_n: I64,
     socket: I64,
-    option_addr: Addr,
+    option_address: Address,
     option_len: I64,
     datagram: bool,
 ) -> TakenBytes {
     let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
         return TakenBytes(0);
     };
-    let option = SocketOption::read(unsafe { borrowed(option_addr, option_len) });
+    let option = SocketOption::read(unsafe { borrowed(option_address, option_len) });
     let Some(option) = required_argument(c, native, "a socket option", option) else {
         return TakenBytes(0);
     };
@@ -752,17 +781,17 @@ fn register_datagram_when_requested(
 }
 
 pub unsafe extern "C" fn rt_net_local_port(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "net_local_port",
         Nondeterministic,
         I64(-1),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(-1);
             };
@@ -780,20 +809,20 @@ pub unsafe extern "C" fn rt_net_local_port(
 type SocketInfoReader = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
 
 fn described(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
-    label_at: Addr,
+    label_at: Address,
     label_n: I64,
     socket: I64,
     datagram: bool,
     read: SocketInfoReader,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         native,
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
@@ -806,13 +835,13 @@ fn described(
 }
 
 pub unsafe extern "C" fn rt_net_local_address(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "net_local_address",
         label_at,
         label_n,
@@ -823,13 +852,13 @@ pub unsafe extern "C" fn rt_net_local_address(
 }
 
 pub unsafe extern "C" fn rt_net_peer_address(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "net_peer_address",
         label_at,
         label_n,
@@ -840,13 +869,13 @@ pub unsafe extern "C" fn rt_net_peer_address(
 }
 
 pub unsafe extern "C" fn rt_net_peer_credentials(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "net_peer_credentials",
         label_at,
         label_n,
@@ -857,13 +886,13 @@ pub unsafe extern "C" fn rt_net_peer_credentials(
 }
 
 pub unsafe extern "C" fn rt_net_peer_certificate(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "net_peer_certificate",
         label_at,
         label_n,
@@ -874,13 +903,13 @@ pub unsafe extern "C" fn rt_net_peer_certificate(
 }
 
 pub unsafe extern "C" fn rt_net_protocol(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     conn: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "net_protocol",
         label_at,
         label_n,
@@ -891,13 +920,13 @@ pub unsafe extern "C" fn rt_net_protocol(
 }
 
 pub unsafe extern "C" fn rt_net_options(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "net_options",
         label_at,
         label_n,
@@ -908,20 +937,20 @@ pub unsafe extern "C" fn rt_net_options(
 }
 
 pub unsafe extern "C" fn rt_udp_bind(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
-    endpoint_at: Addr,
+    endpoint_at: Address,
     endpoint_n: I64,
-    options_at: Addr,
+    options_at: Address,
     options_n: I64,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "udp_bind",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
@@ -939,19 +968,19 @@ pub unsafe extern "C" fn rt_udp_bind(
 }
 
 pub unsafe extern "C" fn rt_udp_connect(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
-    endpoint_at: Addr,
+    endpoint_at: Address,
     endpoint_n: I64,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "udp_connect",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
@@ -967,22 +996,22 @@ pub unsafe extern "C" fn rt_udp_connect(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_udp_send_to(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
-    endpoint_at: Addr,
+    endpoint_at: Address,
     endpoint_n: I64,
-    payload_at: Addr,
+    payload_at: Address,
     payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "udp_send_to",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -1001,41 +1030,49 @@ pub unsafe extern "C" fn rt_udp_send_to(
 }
 
 pub unsafe extern "C" fn rt_udp_send(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
-    payload_at: Addr,
+    payload_at: Address,
     payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
-    if_host_allowed(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(timeout) = required_argument(c, "udp_send", "a deadline", deadline(timeout_ms)) else {
-            return I64(0);
-        };
-        let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
-        let job = ply_host::udp::send(&net, label, socket.0, payload, timeout, c.site());
-        waited(c, "udp_send", "`udp.send`", job)
-    })
+    if_host_allowed(
+        context,
+        "udp_send",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Context| {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(timeout) =
+                required_argument(c, "udp_send", "a deadline", deadline(timeout_ms))
+            else {
+                return I64(0);
+            };
+            let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
+            let job = ply_host::udp::send(&net, label, socket.0, payload, timeout, c.site());
+            waited(c, "udp_send", "`udp.send`", job)
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_udp_recv_from(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
     max: I64,
     timeout_ms: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "udp_recv_from",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
@@ -1052,26 +1089,26 @@ pub unsafe extern "C" fn rt_udp_recv_from(
 }
 
 pub unsafe extern "C" fn rt_udp_set_option(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
-    option_addr: Addr,
+    option_address: Address,
     option_len: I64,
 ) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "udp_set_option",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             set_option(
                 c,
                 "udp_set_option",
                 label_at,
                 label_n,
                 socket,
-                option_addr,
+                option_address,
                 option_len,
                 true,
             )
@@ -1079,26 +1116,37 @@ pub unsafe extern "C" fn rt_udp_set_option(
     )
 }
 
-pub unsafe extern "C" fn rt_udp_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
-    if_host_allowed(ctx, "udp_close", Nondeterministic, (), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
-            return;
-        };
-        let span = c.site();
-        let closed = register_datagram_when_requested(&net, label, socket, true, span)
-            .and_then(|()| net.close(label, socket.0, span));
-        done(c, closed);
-    });
+pub unsafe extern "C" fn rt_udp_close(
+    context: *mut Context,
+    label_at: Address,
+    label_n: I64,
+    socket: I64,
+) {
+    if_host_allowed(
+        context,
+        "udp_close",
+        Nondeterministic,
+        (),
+        |c: &mut Context| {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
+                return;
+            };
+            let span = c.site();
+            let closed = register_datagram_when_requested(&net, label, socket, true, span)
+                .and_then(|()| net.close(label, socket.0, span));
+            done(c, closed);
+        },
+    );
 }
 
 pub unsafe extern "C" fn rt_udp_local_address(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "udp_local_address",
         label_at,
         label_n,
@@ -1109,13 +1157,13 @@ pub unsafe extern "C" fn rt_udp_local_address(
 }
 
 pub unsafe extern "C" fn rt_udp_options(
-    ctx: *mut Ctx,
-    label_at: Addr,
+    context: *mut Context,
+    label_at: Address,
     label_n: I64,
     socket: I64,
 ) -> TakenBytes {
     described(
-        ctx,
+        context,
         "udp_options",
         label_at,
         label_n,

@@ -294,10 +294,16 @@ fn arrived_reports_a_signal_as_received_once_however_many_times_it_was_sent() {
         "nothing arrived before anybody asked"
     );
     send_user2();
-    assert!(arrives(&shutdown, WatchedSignal::User2), "one arrival is seen");
+    assert!(
+        arrives(&shutdown, WatchedSignal::User2),
+        "one arrival is seen"
+    );
     send_user2();
     send_user2();
-    assert!(arrives(&shutdown, WatchedSignal::User2), "two arrivals are seen");
+    assert!(
+        arrives(&shutdown, WatchedSignal::User2),
+        "two arrivals are seen"
+    );
     std::thread::sleep(Duration::from_millis(200));
     let _ = shutdown.arrived(WatchedSignal::User2);
     assert!(

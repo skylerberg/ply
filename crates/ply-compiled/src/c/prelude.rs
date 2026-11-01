@@ -1,7 +1,7 @@
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Signature};
-use crate::rt::Ctx;
+use crate::native::{Address, F64, I64, Native, Signature};
+use crate::rt::Context;
 
 #[derive(Clone, Copy)]
 pub struct Helper {
@@ -41,7 +41,7 @@ macro_rules! machine {
     ($($name:literal => $f:ident($($t:ty),*) $(-> $r:ty)?;)*) => {
         fn runtime_native_table() -> Vec<MachineNative> {
             vec![$({
-                let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = crate::rt::$f;
+                let f: unsafe extern "C" fn(*mut Context $(, $t)*) $(-> $r)? = crate::rt::$f;
                 let helper = Box::leak(builtin_helper_name($name).into_boxed_str());
                 MachineNative {
                     name: $name,
@@ -73,14 +73,14 @@ machine! {
     "?out_decimal" => rt_out_decimal(I64, I64);
     "?out_fixed" => rt_out_fixed(I64, I64, I64);
     "?out_char" => rt_out_char(I64);
-    "?out_str" => rt_out_str(Addr, I64);
-    "?out_bytes" => rt_out_bytes(Addr, I64);
+    "?out_str" => rt_out_str(Address, I64);
+    "?out_bytes" => rt_out_bytes(Address, I64);
     "?out_count" => rt_out_count(I64, I64);
-    "?out_ctor" => rt_out_ctor(Addr, I64, I64);
-    "?out_name" => rt_out_name(Addr, I64);
+    "?out_ctor" => rt_out_ctor(Address, I64, I64);
+    "?out_name" => rt_out_name(Address, I64);
     "?out_handle" => rt_out_handle(Handle);
     "?out_carried" => rt_out_carried(Handed, *const PlyType);
-    "?out_fun" => rt_out_fun(Handed, Addr, I64);
+    "?out_fun" => rt_out_fun(Handed, Address, I64);
     "?out_again" => rt_out_again(Handed) -> I64;
     "?in_tag" => rt_in_tag() -> I64;
     "?in_int" => rt_in_int() -> I64;
@@ -92,12 +92,12 @@ machine! {
     "?in_str" => rt_in_str() -> I64;
     "?in_bytes" => rt_in_bytes() -> I64;
     "?in_count" => rt_in_count(I64) -> I64;
-    "?in_field" => rt_in_field(Addr, I64);
-    "?in_name_is" => rt_in_name_is(Addr, I64) -> I64;
+    "?in_field" => rt_in_field(Address, I64);
+    "?in_name_is" => rt_in_name_is(Address, I64) -> I64;
     "?shown_open" => rt_shown_open();
     "?lower_close" => rt_lower_close() -> I64;
     "?lift_close" => rt_lift_close();
-    "?taken" => rt_taken(Addr, I64);
+    "?taken" => rt_taken(Address, I64);
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
@@ -129,7 +129,7 @@ macro_rules! helpers {
     ($($f:ident($($p:ident $(: $t:ty)?),*) $(-> $r:ty)?;)*) => {
         fn own() -> Vec<Helper> {
             vec![$({
-                let f: unsafe extern "C" fn(*mut Ctx $(, taken!($p $(: $t)?))*) $(-> $r)? =
+                let f: unsafe extern "C" fn(*mut Context $(, taken!($p $(: $t)?))*) $(-> $r)? =
                     crate::rt::$f;
                 Helper::of(stringify!($f), f)
             }),*]
@@ -196,10 +196,10 @@ macro_rules! never_called {
     ($($name:literal($($t:ty),*) $(-> $r:ty)?;)*) => {
         fn never_called() -> Vec<Helper> {
             vec![$({
-                unsafe extern "C" fn never(_: *mut Ctx $(, _: $t)*) $(-> $r)? {
+                unsafe extern "C" fn never(_: *mut Context $(, _: $t)*) $(-> $r)? {
                     unreachable!(concat!($name, " is bound and never called"))
                 }
-                let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = never;
+                let f: unsafe extern "C" fn(*mut Context $(, $t)*) $(-> $r)? = never;
                 Helper::of($name, f)
             }),*]
         }
@@ -208,10 +208,10 @@ macro_rules! never_called {
 
 never_called! {
     "builtin_elaborated_refused"(I64, I64, I64, I64);
-    "builtin_elaborated_refused_text"(I64, Addr, I64, Addr, I64);
-    "builtin_elaborated_assert_failed"(Addr, I64, Addr, I64);
+    "builtin_elaborated_refused_text"(I64, Address, I64, Address, I64);
+    "builtin_elaborated_assert_failed"(Address, I64, Address, I64);
     "builtin_elaborated_scalar_encoded"(I64, I64, I64, I64) -> I64;
-    "builtin_elaborated_text_encoded"(I64, Addr, I64) -> I64;
+    "builtin_elaborated_text_encoded"(I64, Address, I64) -> I64;
     "builtin_elaborated_functions_compared"() -> I64;
 }
 

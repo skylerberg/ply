@@ -1,8 +1,8 @@
 use super::{Nondeterministic, if_host_allowed, required_argument, text_at, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
-use crate::native::{Addr, I64};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64};
+use crate::rt::{Context, borrowed};
 use crate::secret;
 use ply_core::crypto::Framing;
 use ply_host::fs::{Op, OpenFileAction, Opening, Second};
@@ -10,14 +10,14 @@ use ply_host::jobs::Work;
 use std::sync::Arc;
 
 fn start_file_job(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
     op: Op,
-    (lp, ln): (Addr, I64),
-    (pp, pn): (Addr, I64),
-    second: impl FnOnce(&mut Ctx) -> Option<Second>,
+    (lp, ln): (Address, I64),
+    (pp, pn): (Address, I64),
+    second: impl FnOnce(&mut Context) -> Option<Second>,
 ) -> I64 {
-    if_host_allowed(ctx, native, Nondeterministic, I64(0), |c| {
+    if_host_allowed(context, native, Nondeterministic, I64(0), |c| {
         let (Some(label), Some(path)) = (text_at(c, lp, ln), text_at(c, pp, pn)) else {
             return I64(0);
         };
@@ -39,14 +39,14 @@ fn start_file_job(
 }
 
 fn on_file(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
-    lp: Addr,
+    lp: Address,
     ln: I64,
     file: I64,
     chunk: OpenFileAction,
 ) -> I64 {
-    if_host_allowed(ctx, native, Nondeterministic, I64(0), |c| {
+    if_host_allowed(context, native, Nondeterministic, I64(0), |c| {
         let Some(label) = text_at(c, lp, ln) else {
             return I64(0);
         };
@@ -73,8 +73,8 @@ macro_rules! on_paths {
     ($($native:ident = $name:literal => $op:ident),+ $(,)?) => {
         $(
             #[doc = concat!("The ticket of `", $name, "` on the path at `pp` under the root the label at `lp` names.")]
-            pub unsafe extern "C" fn $native(ctx: *mut Ctx, lp: Addr, ln: I64, pp: Addr, pn: I64) -> I64 {
-                start_file_job(ctx, $name, Op::$op, (lp, ln), (pp, pn), |_| Some(Second::None))
+            pub unsafe extern "C" fn $native(context: *mut Context, lp: Address, ln: I64, pp: Address, pn: I64) -> I64 {
+                start_file_job(context, $name, Op::$op, (lp, ln), (pp, pn), |_| Some(Second::None))
             }
         )+
 
@@ -186,86 +186,96 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 pub unsafe extern "C" fn rt_fs_rename(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_rename", Op::Rename, (lp, ln), (pp, pn), |c| {
+    start_file_job(context, "fs_rename", Op::Rename, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Path)
     })
 }
 
 pub unsafe extern "C" fn rt_fs_copy(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_copy", Op::Copy, (lp, ln), (pp, pn), |c| {
+    start_file_job(context, "fs_copy", Op::Copy, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Path)
     })
 }
 
 pub unsafe extern "C" fn rt_fs_link(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_link", Op::Link, (lp, ln), (pp, pn), |c| {
+    start_file_job(context, "fs_link", Op::Link, (lp, ln), (pp, pn), |c| {
         text_at(c, tp, tn).map(Second::Path)
     })
 }
 
 pub unsafe extern "C" fn rt_fs_symlink(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_symlink", Op::Symlink, (lp, ln), (pp, pn), |c| {
-        text_at(c, tp, tn).map(Second::Target)
-    })
+    start_file_job(
+        context,
+        "fs_symlink",
+        Op::Symlink,
+        (lp, ln),
+        (pp, pn),
+        |c| text_at(c, tp, tn).map(Second::Target),
+    )
 }
 
 pub unsafe extern "C" fn rt_fs_temp_dir(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    xp: Addr,
+    xp: Address,
     xn: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_temp_dir", Op::TempDir, (lp, ln), (pp, pn), |c| {
-        text_at(c, xp, xn).map(Second::Name)
-    })
+    start_file_job(
+        context,
+        "fs_temp_dir",
+        Op::TempDir,
+        (lp, ln),
+        (pp, pn),
+        |c| text_at(c, xp, xn).map(Second::Name),
+    )
 }
 
 pub unsafe extern "C" fn rt_fs_write_file(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
 ) -> I64 {
     start_file_job(
-        ctx,
+        context,
         "fs_write_file",
         Op::WriteFile,
         (lp, ln),
@@ -275,60 +285,74 @@ pub unsafe extern "C" fn rt_fs_write_file(
 }
 
 pub unsafe extern "C" fn rt_fs_append(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_append", Op::Append, (lp, ln), (pp, pn), |_| {
+    start_file_job(context, "fs_append", Op::Append, (lp, ln), (pp, pn), |_| {
         Some(Second::Body(unsafe { borrowed(bp, bn) }.to_vec()))
     })
 }
 
 pub unsafe extern "C" fn rt_fs_read_at(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
     offset: I64,
     len: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_read_at", Op::ReadAt, (lp, ln), (pp, pn), |_| {
-        Some(Second::Range {
-            offset: offset.0,
-            len: len.0,
-        })
-    })
+    start_file_job(
+        context,
+        "fs_read_at",
+        Op::ReadAt,
+        (lp, ln),
+        (pp, pn),
+        |_| {
+            Some(Second::Range {
+                offset: offset.0,
+                len: len.0,
+            })
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_fs_set_mode(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
     bits: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_set_mode", Op::SetMode, (lp, ln), (pp, pn), |c| {
-        let bits = u32::try_from(bits.0).ok().filter(|bits| *bits <= 0o777);
-        required_argument(c, "fs_set_mode", "a mode", bits).map(Second::Mode)
-    })
+    start_file_job(
+        context,
+        "fs_set_mode",
+        Op::SetMode,
+        (lp, ln),
+        (pp, pn),
+        |c| {
+            let bits = u32::try_from(bits.0).ok().filter(|bits| *bits <= 0o777);
+            required_argument(c, "fs_set_mode", "a mode", bits).map(Second::Mode)
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_fs_set_modified(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
     ms: I64,
 ) -> I64 {
     start_file_job(
-        ctx,
+        context,
         "fs_set_modified",
         Op::SetModified,
         (lp, ln),
@@ -338,41 +362,41 @@ pub unsafe extern "C" fn rt_fs_set_modified(
 }
 
 pub unsafe extern "C" fn rt_fs_scan(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
     deep: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_scan", Op::Scan, (lp, ln), (pp, pn), |_| {
+    start_file_job(context, "fs_scan", Op::Scan, (lp, ln), (pp, pn), |_| {
         Some(Second::Deep(deep.0 != 0))
     })
 }
 
 pub unsafe extern "C" fn rt_fs_open(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
     how: I64,
 ) -> I64 {
-    start_file_job(ctx, "fs_open", Op::Open, (lp, ln), (pp, pn), |c| {
+    start_file_job(context, "fs_open", Op::Open, (lp, ln), (pp, pn), |c| {
         required_argument(c, "fs_open", "an opening", Opening::of(how.0)).map(Second::Opening)
     })
 }
 
 pub unsafe extern "C" fn rt_fs_read_chunk(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
     file: I64,
     max: I64,
 ) -> I64 {
     let max = u64::try_from(max.0).unwrap_or(0);
     on_file(
-        ctx,
+        context,
         "fs_read_chunk",
         lp,
         ln,
@@ -382,16 +406,16 @@ pub unsafe extern "C" fn rt_fs_read_chunk(
 }
 
 pub unsafe extern "C" fn rt_fs_write_chunk(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
     file: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
 ) -> I64 {
     let body = unsafe { borrowed(bp, bn) }.to_vec();
     on_file(
-        ctx,
+        context,
         "fs_write_chunk",
         lp,
         ln,
@@ -400,27 +424,32 @@ pub unsafe extern "C" fn rt_fs_write_chunk(
     )
 }
 
-pub unsafe extern "C" fn rt_fs_close(ctx: *mut Ctx, lp: Addr, ln: I64, file: I64) -> I64 {
-    on_file(ctx, "fs_close", lp, ln, file, OpenFileAction::Close)
+pub unsafe extern "C" fn rt_fs_close(
+    context: *mut Context,
+    lp: Address,
+    ln: I64,
+    file: I64,
+) -> I64 {
+    on_file(context, "fs_close", lp, ln, file, OpenFileAction::Close)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_fs_write_secret(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
     secret: SecretHandle,
-    ep: Addr,
+    ep: Address,
     en: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
 ) -> I64 {
     start_file_job(
-        ctx,
+        context,
         "fs_write_secret",
         Op::WriteSecret,
         (lp, ln),
@@ -439,20 +468,20 @@ pub unsafe extern "C" fn rt_fs_write_secret(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_fs_read_secret(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    pp: Addr,
+    pp: Address,
     pn: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
-    ep: Addr,
+    ep: Address,
     en: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
 ) -> I64 {
     start_file_job(
-        ctx,
+        context,
         "fs_read_secret",
         Op::ReadSecret,
         (lp, ln),
@@ -474,9 +503,9 @@ pub unsafe extern "C" fn rt_fs_read_secret(
     )
 }
 
-pub unsafe extern "C" fn rt_fs_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
+pub unsafe extern "C" fn rt_fs_secret_taken(context: *mut Context, number: I64) -> SecretHandle {
     if_host_allowed(
-        ctx,
+        context,
         "fs_secret_taken",
         Nondeterministic,
         SecretHandle::of(0),

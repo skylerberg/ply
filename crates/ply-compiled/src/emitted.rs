@@ -1,13 +1,13 @@
-use crate::heap::{self, HEADER, Heap, IMMORTAL, Obj, SHARED, Word};
+use crate::heap::{self, HEADER, Heap, IMMORTAL, Object, SHARED, Word};
 use crate::native::{MachineType, Returned, Taken};
-use crate::rt::Ctx;
+use crate::rt::Context;
 
 #[repr(transparent)]
 pub struct Block(Word);
 
 impl Block {
-    fn obj(&self) -> *mut Obj {
-        self.0 as *mut Obj
+    fn object(&self) -> *mut Object {
+        self.0 as *mut Object
     }
 
     pub fn alloc(heap: &mut Heap, bytes: Word) -> Block {
@@ -21,11 +21,11 @@ impl Block {
     }
 
     pub unsafe fn free(self, heap: *mut Heap, bytes: Word) {
-        unsafe { heap::free_sized(self.obj(), heap, payload(bytes)) }
+        unsafe { heap::free_sized(self.object(), heap, payload(bytes)) }
     }
 
     pub unsafe fn last_of_shared(self) -> bool {
-        let o = self.obj();
+        let o = self.object();
         debug_assert!(
             matches!(unsafe { heap::count_of(o) }, rc if rc > SHARED && rc < heap::FRAME),
             "{self:?} was let go of as shared, and its count is not"
@@ -33,12 +33,12 @@ impl Block {
         unsafe { heap::last_of_shared(o) }
     }
 
-    pub unsafe fn free_handle(self, ctx: *mut Ctx) {
-        unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap, ctx) }
+    pub unsafe fn free_handle(self, context: *mut Context) {
+        unsafe { heap::free_handle(self.object(), &raw mut (*context).heap, context) }
     }
 
     pub fn dup(&self) {
-        let o = self.obj();
+        let o = self.object();
         let rc = unsafe { heap::count_of(o) };
         if rc < SHARED {
             unsafe { (*o).rc = rc + 1 };
@@ -48,7 +48,7 @@ impl Block {
     }
 
     pub unsafe fn last(&self) -> bool {
-        let o = self.obj();
+        let o = self.object();
         match unsafe { heap::count_of(o) } {
             rc if rc >= heap::FRAME => false,
             rc if rc >= SHARED => unsafe { heap::last_of_shared(o) },
@@ -63,12 +63,12 @@ impl Block {
         }
     }
 
-    pub unsafe fn release_function(self, ctx: *mut Ctx) {
-        unsafe { (self.desc().release)(ctx, Handed(self.0)) };
+    pub unsafe fn release_function(self, context: *mut Context) {
+        unsafe { (self.descriptor().release)(context, Handed(self.0)) };
     }
 
-    unsafe fn desc(&self) -> &'static PlyFnDesc {
-        unsafe { &**(self.0 as *const *const PlyFnDesc).byte_add(HEADER) }
+    unsafe fn descriptor(&self) -> &'static PlyFunctionDescriptor {
+        unsafe { &**(self.0 as *const *const PlyFunctionDescriptor).byte_add(HEADER) }
     }
 }
 
@@ -129,10 +129,10 @@ pub struct PlyType {
     pub identity: u64,
     pub spelled: *const u8,
     pub spelled_len: u32,
-    pub inc: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    pub dec: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    pub lower: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    pub lift: unsafe extern "C" fn(*mut Ctx) -> Word,
+    pub inc: unsafe extern "C" fn(*mut Context, Word) -> Word,
+    pub dec: unsafe extern "C" fn(*mut Context, Word) -> Word,
+    pub lower: unsafe extern "C" fn(*mut Context, Word) -> Word,
+    pub lift: unsafe extern "C" fn(*mut Context) -> Word,
 }
 
 unsafe impl Sync for PlyType {}
@@ -140,8 +140,8 @@ unsafe impl Sync for PlyType {}
 #[repr(C)]
 pub struct PlyKept {
     pub ty: *const PlyType,
-    pub equal: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
-    pub order: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
+    pub equal: Option<unsafe extern "C" fn(*mut Context, Word, Word) -> Word>,
+    pub order: Option<unsafe extern "C" fn(*mut Context, Word, Word) -> Word>,
 }
 
 unsafe impl Sync for PlyKept {}
@@ -154,8 +154,8 @@ pub struct PlyOp {
     pub own: u64,
     pub params_len: i64,
     pub params: *const *const PlyType,
-    pub vars_len: i64,
-    pub vars: *const *const PlyType,
+    pub variables_length: i64,
+    pub variables: *const *const PlyType,
 }
 
 unsafe impl Sync for PlyOp {}
@@ -165,8 +165,8 @@ impl PlyOp {
         unsafe { types(self.params, self.params_len) }
     }
 
-    pub fn vars(&self) -> &[&'static PlyType] {
-        unsafe { types(self.vars, self.vars_len) }
+    pub fn variables(&self) -> &[&'static PlyType] {
+        unsafe { types(self.variables, self.variables_length) }
     }
 
     pub fn result(&self) -> &'static PlyType {
@@ -186,18 +186,18 @@ unsafe fn types<'a>(at: *const *const PlyType, n: i64) -> &'a [&'static PlyType]
 }
 
 impl Block {
-    pub unsafe fn call(&self, ctx: *mut Ctx, args: &[Word]) -> Word {
-        unsafe { (self.desc().uniform)(ctx, self.0, args.as_ptr()) }
+    pub unsafe fn call(&self, context: *mut Context, args: &[Word]) -> Word {
+        unsafe { (self.descriptor().uniform)(context, self.0, args.as_ptr()) }
     }
 
-    pub unsafe fn share(&self, ctx: *mut Ctx) -> bool {
-        unsafe { (self.desc().share)(ctx, self.0) != 0 }
+    pub unsafe fn share(&self, context: *mut Context) -> bool {
+        unsafe { (self.descriptor().share)(context, self.0) != 0 }
     }
 
-    pub unsafe fn release_function_if_last(self, ctx: *mut Ctx) {
+    pub unsafe fn release_function_if_last(self, context: *mut Context) {
         unsafe {
             if self.last() {
-                self.release_function(ctx);
+                self.release_function(context);
             }
         }
     }
@@ -234,16 +234,16 @@ impl Carried {
         self.word
     }
 
-    pub fn dup(&self, ctx: *mut Ctx) -> Carried {
-        unsafe { (self.ty.inc)(ctx, self.word) };
+    pub fn dup(&self, context: *mut Context) -> Carried {
+        unsafe { (self.ty.inc)(context, self.word) };
         Carried {
             word: self.word,
             ty: self.ty,
         }
     }
 
-    pub fn release(self, ctx: *mut Ctx) {
-        unsafe { (self.ty.dec)(ctx, self.word) };
+    pub fn release(self, context: *mut Context) {
+        unsafe { (self.ty.dec)(context, self.word) };
     }
 
     pub fn handed(self) -> Handed {
@@ -251,21 +251,21 @@ impl Carried {
     }
 }
 
-pub type DropRoot = unsafe extern "C" fn(*mut Ctx, Handed) -> Word;
+pub type DropRoot = unsafe extern "C" fn(*mut Context, Handed) -> Word;
 
-pub type KeepRoot = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
+pub type KeepRoot = unsafe extern "C" fn(*mut Context, Word) -> Word;
 
 #[repr(C)]
-pub struct PlyFnDesc {
-    pub uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word,
+pub struct PlyFunctionDescriptor {
+    pub uniform: unsafe extern "C" fn(*mut Context, Word, *const Word) -> Word,
     pub typed: Option<unsafe extern "C" fn()>,
     pub convention: Word,
     pub release: DropRoot,
-    pub share: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    pub keep: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
+    pub share: unsafe extern "C" fn(*mut Context, Word) -> Word,
+    pub keep: unsafe extern "C" fn(*mut Context, Word) -> Word,
 }
 
-unsafe impl Sync for PlyFnDesc {}
+unsafe impl Sync for PlyFunctionDescriptor {}
 
 unsafe impl Taken for Block {
     const MACHINE: MachineType = MachineType::Block;

@@ -541,7 +541,10 @@ fn lines_can_be_read_one_at_a_time_and_wait_returns_the_lines_not_yet_read() {
         "",
         wired(false, Output::Lines, Output::Keep),
     );
-    assert_eq!(heard(&host, child, 10_000), OutputEvent::Line("one".to_string()));
+    assert_eq!(
+        heard(&host, child, 10_000),
+        OutputEvent::Line("one".to_string())
+    );
     assert_eq!(
         heard(&host, child, 10_000),
         OutputEvent::Line("two".to_string()),
@@ -567,7 +570,10 @@ fn reading_a_line_from_a_child_that_is_silent_times_out_then_returns_the_line_wh
         wired(false, Output::Lines, Output::Discard),
     );
     assert_eq!(heard(&host, child, 50), OutputEvent::Quiet);
-    assert_eq!(heard(&host, child, -1), OutputEvent::Line("late".to_string()));
+    assert_eq!(
+        heard(&host, child, -1),
+        OutputEvent::Line("late".to_string())
+    );
     assert_eq!(heard(&host, child, -1), OutputEvent::Closed);
     assert_eq!(
         heard(&host, child, 0),
@@ -590,7 +596,10 @@ fn lines_from_stdout_and_stderr_are_read_in_the_order_printed_and_wait_returns_l
         "",
         wired(false, Output::Lines, Output::Lines),
     );
-    assert_eq!(heard(&host, read, 10_000), OutputEvent::Line("first".to_string()));
+    assert_eq!(
+        heard(&host, read, 10_000),
+        OutputEvent::Line("first".to_string())
+    );
     assert_eq!(
         heard(&host, read, 10_000),
         OutputEvent::Line("second".to_string())

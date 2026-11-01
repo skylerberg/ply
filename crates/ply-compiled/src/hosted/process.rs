@@ -1,7 +1,9 @@
-use super::{Determinism, Nondeterministic, if_host_allowed, text_at, texts_at, with_host_facilities};
+use super::{
+    Determinism, Nondeterministic, if_host_allowed, text_at, texts_at, with_host_facilities,
+};
 use crate::c::{MachineNative, runtime_native};
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use ply_core::{Diagnostic, codes};
 use ply_host::jobs::Work;
 use ply_host::native::{int, parts_of};
@@ -75,15 +77,15 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 fn hosted<R: Copy>(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
     op: &'static str,
     determinism: Determinism,
     reach: OperationTarget,
     rejected: R,
-    result: impl FnOnce(&mut Ctx, &ProcessHost) -> Result<R, Diagnostic>,
+    result: impl FnOnce(&mut Context, &ProcessHost) -> Result<R, Diagnostic>,
 ) -> R {
-    if_host_allowed(ctx, native, determinism, rejected, |c| {
+    if_host_allowed(context, native, determinism, rejected, |c| {
         let Some(found) = with_host_facilities(c, |facilities| facilities.process().cloned())
         else {
             return rejected;
@@ -107,7 +109,7 @@ fn stream_of(number: I64) -> Stream {
     }
 }
 
-fn environment_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<(String, String)>> {
+fn environment_at(c: &mut Context, p: Address, n: I64) -> Option<Vec<(String, String)>> {
     let texts = texts_at(c, p, n)?;
     if texts.len() % 2 != 0 {
         c.fail(Diagnostic::error(
@@ -129,10 +131,10 @@ fn environment_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<(String, String)>>
     Some(env)
 }
 
-pub unsafe extern "C" fn rt_process_args(ctx: *mut Ctx) -> TakenBytes {
+pub unsafe extern "C" fn rt_process_args(context: *mut Context) -> TakenBytes {
     let none = TakenBytes(0);
     hosted(
-        ctx,
+        context,
         "process_args",
         "args",
         Nondeterministic,
@@ -146,9 +148,9 @@ pub unsafe extern "C" fn rt_process_args(ctx: *mut Ctx) -> TakenBytes {
     )
 }
 
-pub unsafe extern "C" fn rt_process_bound(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_process_bound(context: *mut Context, p: Address, n: I64) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_bound",
         "bound",
         Nondeterministic,
@@ -158,13 +160,13 @@ pub unsafe extern "C" fn rt_process_bound(ctx: *mut Ctx, p: Addr, n: I64) -> I64
     )
 }
 
-pub unsafe extern "C" fn rt_process_line(ctx: *mut Ctx, stream: I64, p: Addr, n: I64) {
+pub unsafe extern "C" fn rt_process_line(context: *mut Context, stream: I64, p: Address, n: I64) {
     let op = match stream_of(stream) {
         Stream::Out => "out",
         Stream::Err => "err",
     };
     hosted(
-        ctx,
+        context,
         "process_line",
         op,
         Nondeterministic,
@@ -177,13 +179,18 @@ pub unsafe extern "C" fn rt_process_line(ctx: *mut Ctx, stream: I64, p: Addr, n:
     )
 }
 
-pub unsafe extern "C" fn rt_process_write(ctx: *mut Ctx, stream: I64, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_process_write(
+    context: *mut Context,
+    stream: I64,
+    p: Address,
+    n: I64,
+) -> I64 {
     let op = match stream_of(stream) {
         Stream::Out => "out_bytes",
         Stream::Err => "err_bytes",
     };
     hosted(
-        ctx,
+        context,
         "process_write",
         op,
         Nondeterministic,
@@ -200,9 +207,9 @@ pub unsafe extern "C" fn rt_process_write(ctx: *mut Ctx, stream: I64, p: Addr, n
     )
 }
 
-pub unsafe extern "C" fn rt_process_flush(ctx: *mut Ctx) -> I64 {
+pub unsafe extern "C" fn rt_process_flush(context: *mut Context) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_flush",
         "flush",
         Nondeterministic,
@@ -212,9 +219,9 @@ pub unsafe extern "C" fn rt_process_flush(ctx: *mut Ctx) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_process_read_line(ctx: *mut Ctx) -> I64 {
+pub unsafe extern "C" fn rt_process_read_line(context: *mut Context) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_read_line",
         "line",
         Nondeterministic,
@@ -227,18 +234,21 @@ pub unsafe extern "C" fn rt_process_read_line(ctx: *mut Ctx) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_process_read(ctx: *mut Ctx, max: I64) -> I64 {
+pub unsafe extern "C" fn rt_process_read(context: *mut Context, max: I64) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_read",
         "in_bytes",
         Nondeterministic,
         OperationTarget::OwnProcess,
         I64(0),
         |c, host| {
-            let Some(max) =
-                super::required_argument(c, "process_read", "a length", usize::try_from(max.0).ok())
-            else {
+            let Some(max) = super::required_argument(
+                c,
+                "process_read",
+                "a length",
+                usize::try_from(max.0).ok(),
+            ) else {
                 return Ok(I64(0));
             };
             let job = host.read(max, c.site())?;
@@ -247,9 +257,9 @@ pub unsafe extern "C" fn rt_process_read(ctx: *mut Ctx, max: I64) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_process_exit(ctx: *mut Ctx, code: I64) {
+pub unsafe extern "C" fn rt_process_exit(context: *mut Context, code: I64) {
     hosted(
-        ctx,
+        context,
         "process_exit",
         "exit",
         Nondeterministic,
@@ -271,18 +281,18 @@ pub unsafe extern "C" fn rt_process_exit(ctx: *mut Ctx, code: I64) {
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_process_spawn(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
-    dp: Addr,
+    dp: Address,
     dn: I64,
-    ep: Addr,
+    ep: Address,
     en: I64,
 ) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_spawn",
         "spawn",
         Nondeterministic,
@@ -321,20 +331,20 @@ fn parse_stdio(wiring: &[u8]) -> Option<Io> {
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_process_start(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
-    dp: Addr,
+    dp: Address,
     dn: I64,
-    ep: Addr,
+    ep: Address,
     en: I64,
-    wp: Addr,
+    wp: Address,
     wn: I64,
 ) -> TakenBytes {
     hosted(
-        ctx,
+        context,
         "process_start",
         "start",
         Nondeterministic,
@@ -372,14 +382,14 @@ pub unsafe extern "C" fn rt_process_start(
 }
 
 pub unsafe extern "C" fn rt_process_wait(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
     child: I64,
     timeout_ms: I64,
 ) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_wait",
         "wait",
         Nondeterministic,
@@ -396,14 +406,14 @@ pub unsafe extern "C" fn rt_process_wait(
 }
 
 pub unsafe extern "C" fn rt_process_signal(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
     child: I64,
     signal: I64,
 ) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_signal",
         "signal",
         Nondeterministic,
@@ -427,15 +437,15 @@ pub unsafe extern "C" fn rt_process_signal(
 }
 
 pub unsafe extern "C" fn rt_process_input(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
     child: I64,
-    p: Addr,
+    p: Address,
     n: I64,
 ) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_input",
         "input",
         Nondeterministic,
@@ -452,9 +462,14 @@ pub unsafe extern "C" fn rt_process_input(
     )
 }
 
-pub unsafe extern "C" fn rt_process_end_input(ctx: *mut Ctx, lp: Addr, ln: I64, child: I64) {
+pub unsafe extern "C" fn rt_process_end_input(
+    context: *mut Context,
+    lp: Address,
+    ln: I64,
+    child: I64,
+) {
     hosted(
-        ctx,
+        context,
         "process_end_input",
         "end_input",
         Nondeterministic,
@@ -468,14 +483,14 @@ pub unsafe extern "C" fn rt_process_end_input(ctx: *mut Ctx, lp: Addr, ln: I64, 
 }
 
 pub unsafe extern "C" fn rt_process_output_line(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
     child: I64,
     timeout_ms: I64,
 ) -> I64 {
     hosted(
-        ctx,
+        context,
         "process_output_line",
         "output_line",
         Nondeterministic,

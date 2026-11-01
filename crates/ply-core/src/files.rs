@@ -16,10 +16,10 @@ pub fn temp_beside(path: &Path) -> PathBuf {
 }
 
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = temp_beside(path);
-    let landed = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let temporary = temp_beside(path);
+    let landed = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
     if landed.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&temporary);
     }
     landed
 }

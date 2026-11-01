@@ -932,7 +932,7 @@ fn connect_to_host(host: &str, port: u16, timeout: Duration) -> Option<TcpStream
     let addrs = (host, port).to_socket_addrs().ok()?;
     let stream = addrs
         .into_iter()
-        .find_map(|addr| TcpStream::connect_timeout(&addr, timeout).ok())?;
+        .find_map(|address| TcpStream::connect_timeout(&address, timeout).ok())?;
     let _ = stream.set_nodelay(true);
     Some(stream)
 }
@@ -942,7 +942,7 @@ fn connect_tcp(
     options: &[SocketOption],
     timeout: Duration,
 ) -> Result<TcpStream, NetError> {
-    let address = to.socket_addr()?;
+    let address = to.socket_address()?;
     let rejection = |e: io::Error| NetError::of(&e);
     let socket = RawSocket::new(
         Domain::for_address(address),
@@ -982,7 +982,7 @@ fn no_unix_sockets() -> NetError {
 }
 
 fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, NetError> {
-    let address = to.socket_addr()?;
+    let address = to.socket_address()?;
     let rejection = |e: io::Error| NetError::of(&e);
     let socket = RawSocket::new(
         Domain::for_address(address),

@@ -58,7 +58,7 @@ pub(crate) struct Page {
     pub(crate) owner: AtomicPtr<Returned>,
     pub(crate) remote_free_state: AtomicU32,
     pub(crate) next: *mut Page,
-    pub(crate) prev: *mut Page,
+    pub(crate) previous: *mut Page,
     pub(crate) block: u32,
     pub(crate) live: u32,
     pub(crate) class: u8,
@@ -152,10 +152,10 @@ fn large(bytes: usize) -> Layout {
 
 unsafe fn push(list: &mut *mut Page, page: *mut Page) {
     unsafe {
-        (*page).prev = null_mut();
+        (*page).previous = null_mut();
         (*page).next = *list;
         if !(*list).is_null() {
-            (**list).prev = page;
+            (**list).previous = page;
         }
         *list = page;
         (*page).listed = true;
@@ -168,10 +168,10 @@ unsafe fn push_after_head(list: &mut *mut Page, page: *mut Page) {
         return unsafe { push(list, page) };
     }
     unsafe {
-        (*page).prev = head;
+        (*page).previous = head;
         (*page).next = (*head).next;
         if !(*head).next.is_null() {
-            (*(*head).next).prev = page;
+            (*(*head).next).previous = page;
         }
         (*head).next = page;
         (*page).listed = true;
@@ -180,16 +180,16 @@ unsafe fn push_after_head(list: &mut *mut Page, page: *mut Page) {
 
 unsafe fn unlink(list: &mut *mut Page, page: *mut Page) {
     unsafe {
-        let (prev, next) = ((*page).prev, (*page).next);
-        if prev.is_null() {
+        let (previous, next) = ((*page).previous, (*page).next);
+        if previous.is_null() {
             *list = next;
         } else {
-            (*prev).next = next;
+            (*previous).next = next;
         }
         if !next.is_null() {
-            (*next).prev = prev;
+            (*next).previous = previous;
         }
-        (*page).prev = null_mut();
+        (*page).previous = null_mut();
         (*page).next = null_mut();
         (*page).listed = false;
     }

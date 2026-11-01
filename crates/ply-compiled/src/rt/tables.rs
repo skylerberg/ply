@@ -4,7 +4,7 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
+pub type Entry = unsafe extern "C" fn(*mut Context, *const i64) -> i64;
 
 pub struct Tables {
     pub fields: Vec<Symbol>,

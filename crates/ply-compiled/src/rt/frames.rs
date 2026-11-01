@@ -18,8 +18,8 @@ pub(super) fn is_abort(effect: &str, op: &str) -> bool {
     effect == "abort" && op == "raise"
 }
 
-pub(crate) fn call_fun(ctx: *mut Ctx, f: Word, args: &[Word]) -> Word {
-    unsafe { Block::of(f).call(ctx, args) }
+pub(crate) fn call_fun(context: *mut Context, f: Word, args: &[Word]) -> Word {
+    unsafe { Block::of(f).call(context, args) }
 }
 
 pub(crate) fn release_fun(f: Word) {
@@ -42,13 +42,15 @@ impl SavedState {
     }
 }
 
-pub(crate) fn call_clause(ctx: *mut Ctx, clause: Word, args: Vec<Word>) -> Word {
-    let c = unsafe { &mut *ctx };
+pub(crate) fn call_clause(context: *mut Context, clause: Word, args: Vec<Word>) -> Word {
+    let c = unsafe { &mut *context };
     let at = args.as_ptr();
     let n = args.len();
     let here = c.keep(SavedState::Args(args));
-    let r = call_fun(ctx, clause, unsafe { std::slice::from_raw_parts(at, n) });
-    unsafe { &mut *ctx }.pop_saved(here).release();
+    let r = call_fun(context, clause, unsafe {
+        std::slice::from_raw_parts(at, n)
+    });
+    unsafe { &mut *context }.pop_saved(here).release();
     r
 }
 
@@ -56,8 +58,8 @@ pub(crate) struct Raised(pub(crate) Vec<Carried>);
 
 impl Raised {
     pub(crate) fn release(self) {
-        let ctx = running();
-        self.0.into_iter().for_each(|v| v.release(ctx));
+        let context = running();
+        self.0.into_iter().for_each(|v| v.release(context));
     }
 
     pub(crate) fn handed(self) -> Vec<Word> {

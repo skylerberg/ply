@@ -3,10 +3,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
+pub unsafe extern "C" fn rt_stack_more(context: *mut Context) -> Word {
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     if c.out_of_time() {
         return 0;
     }
@@ -29,41 +29,41 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     0
 }
 
-pub unsafe fn switch_stack_preserving_context(ctx: *mut Ctx, from: *mut usize, to: usize) {
-    let (frames, task) = unsafe { ((*ctx).frames, (*ctx).task) };
+pub unsafe fn switch_stack_preserving_context(context: *mut Context, from: *mut usize, to: usize) {
+    let (frames, task) = unsafe { ((*context).frames, (*context).task) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
         ply_core::limit::set_active_stack(running);
-        (*ctx).frames = frames;
-        (*ctx).task = task;
-        (*ctx).stack_floor.store(stack_floor(), Relaxed);
+        (*context).frames = frames;
+        (*context).task = task;
+        (*context).stack_floor.store(stack_floor(), Relaxed);
     }
 }
 
-pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
+pub fn on_known_stack<F: FnOnce() -> Word>(context: *mut Context, call: F) -> Word {
     if let Some(floor) = floor_here() {
-        unsafe { (*ctx).stack_floor.store(floor, Relaxed) };
+        unsafe { (*context).stack_floor.store(floor, Relaxed) };
         return call();
     }
     let Some(stack) = Stack::take() else {
-        return fail_out_of_stack(unsafe { &mut *ctx });
+        return fail_out_of_stack(unsafe { &mut *context });
     };
     let mut hop = Hop {
-        ctx,
+        context,
         stack: &stack,
         call: Some(call),
         result: 0,
         back: 0,
     };
     let handover = &raw mut hop;
-    let sp = stack.prepare(run_on_new_stack::<F>, handover as usize);
-    unsafe { switch_stack_preserving_context(ctx, &raw mut (*handover).back, sp) };
+    let stack_pointer = stack.prepare(run_on_new_stack::<F>, handover as usize);
+    unsafe { switch_stack_preserving_context(context, &raw mut (*handover).back, stack_pointer) };
     unsafe { (*handover).result }
 }
 
 struct Hop<'a, F> {
-    ctx: *mut Ctx,
+    context: *mut Context,
     stack: &'a Stack,
     call: Option<F>,
     result: Word,
@@ -73,10 +73,10 @@ struct Hop<'a, F> {
 extern "C" fn run_on_new_stack<F: FnOnce() -> Word>(arg: usize) {
     let hop = arg as *mut Hop<'_, F>;
     let call = unsafe {
-        (*(*hop).ctx)
+        (*(*hop).context)
             .stack_floor
             .store((*hop).stack.enter(), Relaxed);
-        (*(*hop).ctx).frames = std::ptr::null_mut();
+        (*(*hop).context).frames = std::ptr::null_mut();
         (*hop).call.take().expect("a hop runs its call once")
     };
     let result = call();
@@ -89,7 +89,7 @@ extern "C" fn run_on_new_stack<F: FnOnce() -> Word>(arg: usize) {
     std::process::abort();
 }
 
-pub(crate) fn fail_out_of_stack(c: &mut Ctx) -> Word {
+pub(crate) fn fail_out_of_stack(c: &mut Context) -> Word {
     let d = error("the system would map no further stack").note(
         "each live task, and each `handle` body whose clause resumes off the tail, holds one until it ends",
     );
@@ -223,30 +223,30 @@ pub(super) fn stack_of_this_thread() -> (usize, usize) {
 #[cfg(target_os = "linux")]
 pub(super) fn stack_of_this_thread() -> (usize, usize) {
     #[repr(C, align(8))]
-    struct Attr([u8; 64]);
+    struct Attribute([u8; 64]);
     unsafe extern "C" {
         fn pthread_self() -> usize;
-        fn pthread_getattr_np(thread: usize, attr: *mut Attr) -> i32;
+        fn pthread_getattr_np(thread: usize, attribute: *mut Attribute) -> i32;
         fn pthread_attr_getstack(
-            attr: *const Attr,
-            addr: *mut *mut std::ffi::c_void,
+            attribute: *const Attribute,
+            address: *mut *mut std::ffi::c_void,
             size: *mut usize,
         ) -> i32;
-        fn pthread_attr_destroy(attr: *mut Attr) -> i32;
+        fn pthread_attr_destroy(attribute: *mut Attribute) -> i32;
     }
-    let mut attr = Attr([0; 64]);
-    let mut addr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut attribute = Attribute([0; 64]);
+    let mut address: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut size = 0usize;
     let bottom = unsafe {
-        if pthread_getattr_np(pthread_self(), &mut attr) != 0 {
+        if pthread_getattr_np(pthread_self(), &mut attribute) != 0 {
             return fallback_stack();
         }
-        let ok = pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
-        pthread_attr_destroy(&mut attr);
+        let ok = pthread_attr_getstack(&attribute, &mut address, &mut size) == 0;
+        pthread_attr_destroy(&mut attribute);
         if !ok {
             return fallback_stack();
         }
-        addr as usize
+        address as usize
     };
     (bottom, bottom.saturating_add(size))
 }

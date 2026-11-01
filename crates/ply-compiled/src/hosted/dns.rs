@@ -1,7 +1,7 @@
 use super::{Nondeterministic, if_host_allowed};
 use crate::c::{MachineNative, runtime_native};
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use ply_core::{Diagnostic, codes};
 use ply_host::jobs::Work;
 use ply_host::native::found;
@@ -23,13 +23,13 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-pub unsafe extern "C" fn rt_dns_lookup(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_dns_lookup(context: *mut Context, p: Address, n: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "dns_lookup",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some(name) = c.text(unsafe { borrowed(p, n) }) else {
                 return I64(0);
             };
@@ -41,13 +41,13 @@ pub unsafe extern "C" fn rt_dns_lookup(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_dns_reverse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_dns_reverse(context: *mut Context, p: Address, n: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "dns_reverse",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some(address) = ply_host::dns::ip_address_from_bytes(unsafe { borrowed(p, n) })
             else {
                 c.fail(Diagnostic::error(
@@ -63,13 +63,13 @@ pub unsafe extern "C" fn rt_dns_reverse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_dns_configuration(ctx: *mut Ctx) -> TakenBytes {
+pub unsafe extern "C" fn rt_dns_configuration(context: *mut Context) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "dns_configuration",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let text = std::fs::read(ply_host::dns::RESOLVER_CONFIGURATION).ok();
             c.given(found(text))
         },

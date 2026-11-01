@@ -281,12 +281,12 @@ pub fn entered(
     let entry = native
         .entry(name)
         .unwrap_or_else(|| panic!("the unit does not take `{name}`"));
-    let mut ctx = native.context();
-    ctx.begin();
-    let result = unsafe { entry(&mut ctx, args.as_ptr()) };
-    let failed = ctx.failed;
-    let raised = ctx.take_failure().map(|d| d.message);
-    ctx.end();
+    let mut context = native.context();
+    context.begin();
+    let result = unsafe { entry(&mut context, args.as_ptr()) };
+    let failed = context.failed;
+    let raised = context.take_failure().map(|d| d.message);
+    context.end();
     if failed == 0 {
         Ok(result)
     } else {

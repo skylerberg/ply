@@ -89,7 +89,7 @@ impl Endpoint {
         }
     }
 
-    pub fn socket_addr(&self) -> Result<SocketAddr, NetError> {
+    pub fn socket_address(&self) -> Result<SocketAddr, NetError> {
         match (self.ip, &self.zone) {
             (IpAddr::V4(ip), _) => Ok(SocketAddr::V4(SocketAddrV4::new(ip, self.port))),
             (IpAddr::V6(ip), None) => Ok(SocketAddr::V6(SocketAddrV6::new(ip, self.port, 0, 0))),

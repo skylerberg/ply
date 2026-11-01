@@ -1,7 +1,7 @@
-use super::{Nondeterministic, if_host_allowed, done, required_argument, with_host_facilities};
+use super::{Nondeterministic, done, if_host_allowed, required_argument, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
-use crate::native::{Addr, I64};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64};
+use crate::rt::{Context, borrowed};
 use ply_core::Decimal;
 use ply_host::trace::{
     Field, Level, Outcome, Owner, RecordKind, Trace, fields_read, spans::err_unbalanced,
@@ -40,12 +40,12 @@ fn level_of(n: I64) -> Option<Level> {
     }
 }
 
-fn traced(c: &mut Ctx) -> Option<(Arc<Trace>, Owner)> {
+fn traced(c: &mut Context) -> Option<(Arc<Trace>, Owner)> {
     let trace = with_host_facilities(c, |facilities| Arc::clone(facilities.tracing()))?;
     Some((trace, (c.id, crate::tasks::running_unseeded_task(c))))
 }
 
-fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Field)>> {
+fn fields(c: &mut Context, native: &str, at: Address, n: I64) -> Option<Vec<(String, Field)>> {
     required_argument(
         c,
         native,
@@ -54,14 +54,15 @@ fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Fi
     )
 }
 
-pub unsafe extern "C" fn rt_trace_wants(ctx: *mut Ctx, level: I64) -> I64 {
+pub unsafe extern "C" fn rt_trace_wants(context: *mut Context, level: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "trace_wants",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
-            let Some(level) = required_argument(c, "trace_wants", "a level", level_of(level)) else {
+        |c: &mut Context| {
+            let Some(level) = required_argument(c, "trace_wants", "a level", level_of(level))
+            else {
                 return I64(0);
             };
             let wants = with_host_facilities(c, |facilities| facilities.tracing().wants(level));
@@ -72,83 +73,90 @@ pub unsafe extern "C" fn rt_trace_wants(ctx: *mut Ctx, level: I64) -> I64 {
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_trace_record(
-    ctx: *mut Ctx,
+    context: *mut Context,
     kind: I64,
-    channel_addr: Addr,
+    channel_address: Address,
     channel_len: I64,
     level: I64,
-    name_at: Addr,
+    name_at: Address,
     name_n: I64,
     amount: I64,
-    value_addr: Addr,
+    value_address: Address,
     value_len: I64,
-    fields_addr: Addr,
+    fields_address: Address,
     fields_len: I64,
 ) {
-    if_host_allowed(ctx, "trace_record", Nondeterministic, (), |c: &mut Ctx| {
-        let kind = match kind.0 {
-            0 => Some(RecordKind::Event),
-            1 => Some(RecordKind::Count),
-            2 => Some(RecordKind::Gauge),
-            3 => Some(RecordKind::Time),
-            _ => None,
-        };
-        let (Some(kind), Some(level)) = (
-            required_argument(c, "trace_record", "a record's kind", kind),
-            required_argument(c, "trace_record", "a level", level_of(level)),
-        ) else {
-            return;
-        };
-        let (Some(channel), Some(name), Some(value)) = (
-            c.text(unsafe { borrowed(channel_addr, channel_len) }),
-            c.text(unsafe { borrowed(name_at, name_n) }),
-            c.text(unsafe { borrowed(value_addr, value_len) }),
-        ) else {
-            return;
-        };
-        let value = match kind {
-            RecordKind::Gauge => {
-                let read = Decimal::from_str(value).ok();
-                let Some(value) = required_argument(c, "trace_record", "a gauge's value", read) else {
-                    return;
-                };
-                Some(value)
-            }
-            _ => None,
-        };
-        let amount = matches!(kind, RecordKind::Count | RecordKind::Time).then_some(amount.0);
-        let Some(fields) = fields(c, "trace_record", fields_addr, fields_len) else {
-            return;
-        };
-        let Some((trace, owner)) = traced(c) else {
-            return;
-        };
-        trace.record(owner, kind, level, channel, name, amount, value, &fields);
-    });
+    if_host_allowed(
+        context,
+        "trace_record",
+        Nondeterministic,
+        (),
+        |c: &mut Context| {
+            let kind = match kind.0 {
+                0 => Some(RecordKind::Event),
+                1 => Some(RecordKind::Count),
+                2 => Some(RecordKind::Gauge),
+                3 => Some(RecordKind::Time),
+                _ => None,
+            };
+            let (Some(kind), Some(level)) = (
+                required_argument(c, "trace_record", "a record's kind", kind),
+                required_argument(c, "trace_record", "a level", level_of(level)),
+            ) else {
+                return;
+            };
+            let (Some(channel), Some(name), Some(value)) = (
+                c.text(unsafe { borrowed(channel_address, channel_len) }),
+                c.text(unsafe { borrowed(name_at, name_n) }),
+                c.text(unsafe { borrowed(value_address, value_len) }),
+            ) else {
+                return;
+            };
+            let value = match kind {
+                RecordKind::Gauge => {
+                    let read = Decimal::from_str(value).ok();
+                    let Some(value) = required_argument(c, "trace_record", "a gauge's value", read)
+                    else {
+                        return;
+                    };
+                    Some(value)
+                }
+                _ => None,
+            };
+            let amount = matches!(kind, RecordKind::Count | RecordKind::Time).then_some(amount.0);
+            let Some(fields) = fields(c, "trace_record", fields_address, fields_len) else {
+                return;
+            };
+            let Some((trace, owner)) = traced(c) else {
+                return;
+            };
+            trace.record(owner, kind, level, channel, name, amount, value, &fields);
+        },
+    );
 }
 
 pub unsafe extern "C" fn rt_trace_enter(
-    ctx: *mut Ctx,
-    channel_addr: Addr,
+    context: *mut Context,
+    channel_address: Address,
     channel_len: I64,
-    name_at: Addr,
+    name_at: Address,
     name_n: I64,
-    fields_addr: Addr,
+    fields_address: Address,
     fields_len: I64,
 ) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "trace_enter",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let (Some(channel), Some(name)) = (
-                c.text(unsafe { borrowed(channel_addr, channel_len) }),
+                c.text(unsafe { borrowed(channel_address, channel_len) }),
                 c.text(unsafe { borrowed(name_at, name_n) }),
             ) else {
                 return I64(0);
             };
-            let Some(fields) = fields(c, "trace_enter", fields_addr, fields_len) else {
+            let Some(fields) = fields(c, "trace_enter", fields_address, fields_len) else {
                 return I64(0);
             };
             let Some((trace, owner)) = traced(c) else {
@@ -160,37 +168,43 @@ pub unsafe extern "C" fn rt_trace_enter(
 }
 
 pub unsafe extern "C" fn rt_trace_exit(
-    ctx: *mut Ctx,
-    channel_addr: Addr,
+    context: *mut Context,
+    channel_address: Address,
     channel_len: I64,
     id: I64,
     outcome: I64,
-    reason_addr: Addr,
+    reason_address: Address,
     reason_len: I64,
 ) {
-    if_host_allowed(ctx, "trace_exit", Nondeterministic, (), |c: &mut Ctx| {
-        let (Some(channel), Some(reason)) = (
-            c.text(unsafe { borrowed(channel_addr, channel_len) }),
-            c.text(unsafe { borrowed(reason_addr, reason_len) }),
-        ) else {
-            return;
-        };
-        let outcome = match outcome.0 {
-            0 => Some(Outcome::Ok),
-            1 => Some(Outcome::Failed(reason.to_string())),
-            2 => Some(Outcome::Abandoned),
-            _ => None,
-        };
-        let Some(outcome) = required_argument(c, "trace_exit", "an outcome", outcome) else {
-            return;
-        };
-        let Some((trace, owner)) = traced(c) else {
-            return;
-        };
-        let span = c.site();
-        let closed = trace
-            .exit(owner, channel, id.0, outcome)
-            .map_err(|reason| err_unbalanced(span, "`trace.exit`", id.0, &reason));
-        done(c, closed);
-    });
+    if_host_allowed(
+        context,
+        "trace_exit",
+        Nondeterministic,
+        (),
+        |c: &mut Context| {
+            let (Some(channel), Some(reason)) = (
+                c.text(unsafe { borrowed(channel_address, channel_len) }),
+                c.text(unsafe { borrowed(reason_address, reason_len) }),
+            ) else {
+                return;
+            };
+            let outcome = match outcome.0 {
+                0 => Some(Outcome::Ok),
+                1 => Some(Outcome::Failed(reason.to_string())),
+                2 => Some(Outcome::Abandoned),
+                _ => None,
+            };
+            let Some(outcome) = required_argument(c, "trace_exit", "an outcome", outcome) else {
+                return;
+            };
+            let Some((trace, owner)) = traced(c) else {
+                return;
+            };
+            let span = c.site();
+            let closed = trace
+                .exit(owner, channel, id.0, outcome)
+                .map_err(|reason| err_unbalanced(span, "`trace.exit`", id.0, &reason));
+            done(c, closed);
+        },
+    );
 }

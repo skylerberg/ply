@@ -1,7 +1,7 @@
 use super::{Nondeterministic, if_host_allowed, required_argument, with_host_facilities};
 use crate::c::{MachineNative, runtime_native};
 use crate::native::I64;
-use crate::rt::Ctx;
+use crate::rt::Context;
 use ply_host::signal::{WatchedSignal, err_signal_watch_failed};
 
 pub(super) fn natives() -> Vec<MachineNative> {
@@ -21,13 +21,13 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-pub unsafe extern "C" fn rt_signal_stopping(ctx: *mut Ctx) -> I64 {
+pub unsafe extern "C" fn rt_signal_stopping(context: *mut Context) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "signal_stopping",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let stopping = with_host_facilities(c, |facilities| {
                 facilities.stop().is_some_and(|stop| stop.stopping())
             });
@@ -36,13 +36,13 @@ pub unsafe extern "C" fn rt_signal_stopping(ctx: *mut Ctx) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
+pub unsafe extern "C" fn rt_signal_deadline_ms(context: *mut Context) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "signal_deadline_ms",
         Nondeterministic,
         I64(-1),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let left = with_host_facilities(c, |facilities| {
                 facilities.stop().map_or(-1, |stop| stop.deadline_ms())
             });
@@ -51,13 +51,13 @@ pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_signal_arrived(ctx: *mut Ctx, which: I64) -> I64 {
+pub unsafe extern "C" fn rt_signal_arrived(context: *mut Context, which: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "signal_arrived",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let (asked, what) = match which.0 {
                 0 => (Some(WatchedSignal::Hangup), "`signal.hangup`"),
                 1 => (Some(WatchedSignal::User1), "`signal.user1`"),

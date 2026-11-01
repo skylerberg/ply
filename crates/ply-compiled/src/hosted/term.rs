@@ -2,7 +2,7 @@ use super::{Nondeterministic, if_host_allowed, required_argument, waited, with_h
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{I64, TakenBytes};
-use crate::rt::Ctx;
+use crate::rt::Context;
 use crate::secret;
 use ply_core::{Diagnostic, Span, codes};
 use ply_host::jobs::Job;
@@ -52,13 +52,13 @@ fn mode_number(mode: Mode) -> i64 {
     }
 }
 
-pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 {
+pub unsafe extern "C" fn rt_term_is_terminal(context: *mut Context, stream: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "term_is_terminal",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let stream = match stream.0 {
                 0 => Some(Standard::In),
                 1 => Some(Standard::Out),
@@ -73,13 +73,13 @@ pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 
     )
 }
 
-pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
+pub unsafe extern "C" fn rt_term_size(context: *mut Context) -> TakenBytes {
     if_host_allowed(
-        ctx,
+        context,
         "term_size",
         Nondeterministic,
         TakenBytes(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let size = stdio::terminal_size()
                 .map(|(columns, rows)| [int(i64::from(columns)), int(i64::from(rows))].concat());
             c.given(found(size))
@@ -87,13 +87,13 @@ pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
     )
 }
 
-pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
+pub unsafe extern "C" fn rt_term_mode(context: *mut Context, mode: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "term_mode",
         Nondeterministic,
         I64(-1),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some(mode) = required_argument(c, "term_mode", "a mode", mode_of(mode.0)) else {
                 return I64(-1);
             };
@@ -109,14 +109,16 @@ pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64) -> I64 {
+pub unsafe extern "C" fn rt_term_input(context: *mut Context, max: I64, timeout_ms: I64) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "term_input",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
-            let Some(max) = required_argument(c, "term_input", "a length", usize::try_from(max.0).ok()) else {
+        |c: &mut Context| {
+            let Some(max) =
+                required_argument(c, "term_input", "a length", usize::try_from(max.0).ok())
+            else {
                 return I64(0);
             };
             let deadline = u64::try_from(timeout_ms.0)
@@ -131,20 +133,21 @@ pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64)
     )
 }
 
-pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
+pub unsafe extern "C" fn rt_term_secret_line(context: *mut Context) -> I64 {
     if_host_allowed(
-        ctx,
+        context,
         "term_secret_line",
         Nondeterministic,
         I64(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let Some(run) = with_host_facilities(c, |facilities| Arc::downgrade(facilities.run()))
             else {
                 return I64(0);
             };
             let job: Job = Box::new(move || match stdio::read_secret_line() {
                 Ok(Some(mut line)) => {
-                    let kept = ply_host::pool::SecretBytes::new(std::mem::take(&mut *line).into_bytes());
+                    let kept =
+                        ply_host::pool::SecretBytes::new(std::mem::take(&mut *line).into_bytes());
                     Ok(found(run.upgrade().map(|run| int(run.store_secret(kept)))))
                 }
                 Ok(None) => Ok(found(None::<[u8; 8]>)),
@@ -155,13 +158,13 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
     )
 }
 
-pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
+pub unsafe extern "C" fn rt_term_secret_taken(context: *mut Context, number: I64) -> SecretHandle {
     if_host_allowed(
-        ctx,
+        context,
         "term_secret_taken",
         Nondeterministic,
         SecretHandle::of(0),
-        |c: &mut Ctx| {
+        |c: &mut Context| {
             let line =
                 with_host_facilities(c, |facilities| facilities.run().remove_secret(number.0))
                     .flatten();

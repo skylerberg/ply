@@ -1,7 +1,7 @@
 use super::{Determinism, Deterministic, Nondeterministic, granted, text_at, texts_at};
 use crate::c::{MachineNative, runtime_native};
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use ply_core::{Diagnostic, codes};
 use ply_host::jobs::Work;
 use ply_host::native::{found, int, parts};
@@ -79,13 +79,13 @@ pub(super) fn natives() -> Vec<MachineNative> {
 }
 
 fn run_if_toolchain_allowed<R>(
-    ctx: *mut Ctx,
+    context: *mut Context,
     native: &'static str,
     determinism: Determinism,
     rejected: R,
-    result: impl FnOnce(&mut Ctx) -> R,
+    result: impl FnOnce(&mut Context) -> R,
 ) -> R {
-    granted(ctx, "toolchain", native, determinism, rejected, result)
+    granted(context, "toolchain", native, determinism, rejected, result)
 }
 
 pub fn compiler_path(label: &str) -> Option<PathBuf> {
@@ -156,7 +156,7 @@ fn libraries() -> &'static [&'static str] {
     }
 }
 
-fn below(c: &mut Ctx, path: &str) -> Option<PathBuf> {
+fn below(c: &mut Context, path: &str) -> Option<PathBuf> {
     let relative = Path::new(path);
     if relative.as_os_str().is_empty()
         || !relative
@@ -177,7 +177,7 @@ fn below(c: &mut Ctx, path: &str) -> Option<PathBuf> {
     Some(crate::c::cache_dir().join(relative))
 }
 
-fn cache_path_from_text(c: &mut Ctx, p: Addr, n: I64) -> Option<PathBuf> {
+fn cache_path_from_text(c: &mut Context, p: Address, n: I64) -> Option<PathBuf> {
     let path = text_at(c, p, n)?;
     below(c, &path)
 }
@@ -186,58 +186,68 @@ fn landed(target: &Path, bytes: &[u8]) -> bool {
     let Some(parent) = target.parent() else {
         return false;
     };
-    let tmp = ply_core::files::temp_beside(target);
+    let temporary = ply_core::files::temp_beside(target);
     let ok = std::fs::create_dir_all(parent).is_ok()
-        && std::fs::write(&tmp, bytes).is_ok()
-        && std::fs::rename(&tmp, target).is_ok();
+        && std::fs::write(&temporary, bytes).is_ok()
+        && std::fs::rename(&temporary, target).is_ok();
     if !ok {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&temporary);
     }
     ok
 }
 
-pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "compilers_found", Deterministic, TakenBytes(0), |c| {
-        let Some(label) = text_at(c, p, n) else {
-            return TakenBytes(0);
-        };
-        let Some(path) = compiler_path(&label) else {
-            return c.given(found(None::<Vec<u8>>));
-        };
-        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
-        let stamp = std::fs::metadata(&resolved)
-            .ok()
-            .map(|m| {
-                let modified = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
-                format!("{}:{modified}", m.len())
-            })
-            .unwrap_or_default();
-        let shown = resolved.display().to_string();
-        let identity = format!("{shown}\0{stamp}");
-        let support = tinycc_library_flags(&resolved);
-        let support: Vec<&[u8]> = support.iter().map(|s| s.as_bytes()).collect();
-        let flags = parts(&support);
-        c.given(found(Some(parts(&[
-            shown.as_bytes(),
-            identity.as_bytes(),
-            flags.as_slice(),
-        ]))))
-    })
+pub unsafe extern "C" fn rt_compilers_found(
+    context: *mut Context,
+    p: Address,
+    n: I64,
+) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "compilers_found",
+        Deterministic,
+        TakenBytes(0),
+        |c| {
+            let Some(label) = text_at(c, p, n) else {
+                return TakenBytes(0);
+            };
+            let Some(path) = compiler_path(&label) else {
+                return c.given(found(None::<Vec<u8>>));
+            };
+            let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+            let stamp = std::fs::metadata(&resolved)
+                .ok()
+                .map(|m| {
+                    let modified = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs());
+                    format!("{}:{modified}", m.len())
+                })
+                .unwrap_or_default();
+            let shown = resolved.display().to_string();
+            let identity = format!("{shown}\0{stamp}");
+            let support = tinycc_library_flags(&resolved);
+            let support: Vec<&[u8]> = support.iter().map(|s| s.as_bytes()).collect();
+            let flags = parts(&support);
+            c.given(found(Some(parts(&[
+                shown.as_bytes(),
+                identity.as_bytes(),
+                flags.as_slice(),
+            ]))))
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_compilers_started(
-    ctx: *mut Ctx,
-    lp: Addr,
+    context: *mut Context,
+    lp: Address,
     ln: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
 ) -> TakenBytes {
     run_if_toolchain_allowed(
-        ctx,
+        context,
         "compilers_started",
         Deterministic,
         TakenBytes(0),
@@ -275,27 +285,41 @@ pub unsafe extern "C" fn rt_compilers_started(
     )
 }
 
-pub unsafe extern "C" fn rt_toolchain_cache(ctx: *mut Ctx) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "toolchain_cache", Deterministic, TakenBytes(0), |c| {
-        c.given(crate::c::cache_dir().display().to_string().into_bytes())
-    })
+pub unsafe extern "C" fn rt_toolchain_cache(context: *mut Context) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "toolchain_cache",
+        Deterministic,
+        TakenBytes(0),
+        |c| c.given(crate::c::cache_dir().display().to_string().into_bytes()),
+    )
 }
 
-pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "toolchain_reused", Deterministic, TakenBytes(0), |c| {
-        let dir = crate::c::stage::stage_dir(crate::c::sweep::REUSED);
-        c.given(dir.display().to_string().into_bytes())
-    })
+pub unsafe extern "C" fn rt_toolchain_reused(context: *mut Context) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "toolchain_reused",
+        Deterministic,
+        TakenBytes(0),
+        |c| {
+            let dir = crate::c::stage::stage_dir(crate::c::sweep::REUSED);
+            c.given(dir.display().to_string().into_bytes())
+        },
+    )
 }
 
-pub unsafe extern "C" fn rt_toolchain_bodies(ctx: *mut Ctx) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
-        c.given(crate::c::bodies_dir().display().to_string().into_bytes())
-    })
+pub unsafe extern "C" fn rt_toolchain_bodies(context: *mut Context) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "toolchain_bodies",
+        Deterministic,
+        TakenBytes(0),
+        |c| c.given(crate::c::bodies_dir().display().to_string().into_bytes()),
+    )
 }
 
-pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    run_if_toolchain_allowed(ctx, "toolchain_holds", Deterministic, I64(0), |c| {
+pub unsafe extern "C" fn rt_toolchain_holds(context: *mut Context, p: Address, n: I64) -> I64 {
+    run_if_toolchain_allowed(context, "toolchain_holds", Deterministic, I64(0), |c| {
         let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
@@ -307,23 +331,33 @@ pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I
     })
 }
 
-pub unsafe extern "C" fn rt_toolchain_held(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "toolchain_held", Deterministic, TakenBytes(0), |c| {
-        let Some(at) = cache_path_from_text(c, p, n) else {
-            return TakenBytes(0);
-        };
-        c.given(found(std::fs::read(&at).ok()))
-    })
+pub unsafe extern "C" fn rt_toolchain_held(
+    context: *mut Context,
+    p: Address,
+    n: I64,
+) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "toolchain_held",
+        Deterministic,
+        TakenBytes(0),
+        |c| {
+            let Some(at) = cache_path_from_text(c, p, n) else {
+                return TakenBytes(0);
+            };
+            c.given(found(std::fs::read(&at).ok()))
+        },
+    )
 }
 
 pub unsafe extern "C" fn rt_toolchain_written(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
 ) -> I64 {
-    run_if_toolchain_allowed(ctx, "toolchain_written", Deterministic, I64(0), |c| {
+    run_if_toolchain_allowed(context, "toolchain_written", Deterministic, I64(0), |c| {
         let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
@@ -332,13 +366,13 @@ pub unsafe extern "C" fn rt_toolchain_written(
 }
 
 pub unsafe extern "C" fn rt_toolchain_moved(
-    ctx: *mut Ctx,
-    fp: Addr,
+    context: *mut Context,
+    fp: Address,
     source_path_length: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> I64 {
-    run_if_toolchain_allowed(ctx, "toolchain_moved", Deterministic, I64(0), |c| {
+    run_if_toolchain_allowed(context, "toolchain_moved", Deterministic, I64(0), |c| {
         let (Some(from), Some(to)) = (
             cache_path_from_text(c, fp, source_path_length),
             cache_path_from_text(c, tp, tn),
@@ -355,14 +389,14 @@ pub unsafe extern "C" fn rt_toolchain_moved(
 }
 
 pub unsafe extern "C" fn rt_toolchain_appended(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
-    bp: Addr,
+    bp: Address,
     bn: I64,
 ) -> I64 {
     use std::io::Write;
-    run_if_toolchain_allowed(ctx, "toolchain_appended", Deterministic, I64(0), |c| {
+    run_if_toolchain_allowed(context, "toolchain_appended", Deterministic, I64(0), |c| {
         let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
@@ -375,9 +409,9 @@ pub unsafe extern "C" fn rt_toolchain_appended(
     })
 }
 
-pub unsafe extern "C" fn rt_toolchain_scratch(ctx: *mut Ctx) -> TakenBytes {
+pub unsafe extern "C" fn rt_toolchain_scratch(context: *mut Context) -> TakenBytes {
     run_if_toolchain_allowed(
-        ctx,
+        context,
         "toolchain_scratch",
         Deterministic,
         TakenBytes(0),
@@ -401,17 +435,17 @@ pub unsafe extern "C" fn rt_toolchain_scratch(ctx: *mut Ctx) -> TakenBytes {
     )
 }
 
-pub unsafe extern "C" fn rt_toolchain_cleared(ctx: *mut Ctx, p: Addr, n: I64) {
-    run_if_toolchain_allowed(ctx, "toolchain_cleared", Deterministic, (), |c| {
+pub unsafe extern "C" fn rt_toolchain_cleared(context: *mut Context, p: Address, n: I64) {
+    run_if_toolchain_allowed(context, "toolchain_cleared", Deterministic, (), |c| {
         if let Some(at) = cache_path_from_text(c, p, n) {
             let _ = std::fs::remove_dir_all(at);
         }
     });
 }
 
-pub unsafe extern "C" fn rt_toolchain_libraries(ctx: *mut Ctx) -> TakenBytes {
+pub unsafe extern "C" fn rt_toolchain_libraries(context: *mut Context) -> TakenBytes {
     run_if_toolchain_allowed(
-        ctx,
+        context,
         "toolchain_libraries",
         Deterministic,
         TakenBytes(0),
@@ -423,13 +457,13 @@ pub unsafe extern "C" fn rt_toolchain_libraries(ctx: *mut Ctx) -> TakenBytes {
 }
 
 pub unsafe extern "C" fn rt_toolchain_ran(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
 ) -> I64 {
-    run_if_toolchain_allowed(ctx, "toolchain_ran", Deterministic, I64(0), |c| {
+    run_if_toolchain_allowed(context, "toolchain_ran", Deterministic, I64(0), |c| {
         let (Some(program), Some(args)) = (cache_path_from_text(c, p, n), texts_at(c, ap, an))
         else {
             return I64(0);
@@ -463,28 +497,40 @@ pub unsafe extern "C" fn rt_toolchain_ran(
     })
 }
 
-pub unsafe extern "C" fn rt_memory_heap(ctx: *mut Ctx) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "memory_heap", Nondeterministic, TakenBytes(0), |c| {
-        let (live, held) = (c.live_bytes() as i64, c.retained_bytes() as i64);
-        c.given(parts(&[&int(live)[..], &int(held)[..]]))
-    })
+pub unsafe extern "C" fn rt_memory_heap(context: *mut Context) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "memory_heap",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| {
+            let (live, held) = (c.live_bytes() as i64, c.retained_bytes() as i64);
+            c.given(parts(&[&int(live)[..], &int(held)[..]]))
+        },
+    )
 }
 
-pub unsafe extern "C" fn rt_memory_census(ctx: *mut Ctx) -> TakenBytes {
-    run_if_toolchain_allowed(ctx, "memory_census", Nondeterministic, TakenBytes(0), |c| {
-        let each: Vec<Vec<u8>> = c
-            .census()
-            .into_iter()
-            .map(|(size, objects, bytes)| {
-                let what = format!("blocks of {size} bytes past the header");
-                parts(&[
-                    what.as_bytes(),
-                    &int(objects as i64)[..],
-                    &int(bytes as i64)[..],
-                ])
-            })
-            .collect();
-        let each: Vec<&[u8]> = each.iter().map(Vec::as_slice).collect();
-        c.given(parts(&each))
-    })
+pub unsafe extern "C" fn rt_memory_census(context: *mut Context) -> TakenBytes {
+    run_if_toolchain_allowed(
+        context,
+        "memory_census",
+        Nondeterministic,
+        TakenBytes(0),
+        |c| {
+            let each: Vec<Vec<u8>> = c
+                .census()
+                .into_iter()
+                .map(|(size, objects, bytes)| {
+                    let what = format!("blocks of {size} bytes past the header");
+                    parts(&[
+                        what.as_bytes(),
+                        &int(objects as i64)[..],
+                        &int(bytes as i64)[..],
+                    ])
+                })
+                .collect();
+            let each: Vec<&[u8]> = each.iter().map(Vec::as_slice).collect();
+            c.given(parts(&each))
+        },
+    )
 }

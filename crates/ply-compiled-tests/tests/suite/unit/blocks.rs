@@ -75,7 +75,11 @@ fn pages_emptied_by_blocks_of_one_size_are_reused_for_blocks_of_another_size() {
     for _ in 0..(peak / 2 / 512) {
         b.take(512);
     }
-    assert!(b.retained_bytes() <= peak, "{} bytes held past {peak}", b.retained_bytes());
+    assert!(
+        b.retained_bytes() <= peak,
+        "{} bytes held past {peak}",
+        b.retained_bytes()
+    );
 }
 
 #[test]
@@ -193,7 +197,11 @@ fn a_heap_that_adopts_another_heap_owns_and_can_free_every_block_of_the_adopted_
         parent.give(big, SMALL + 8);
         parent.give(mine, 48);
     }
-    assert!(parent.retained_bytes() <= 2 * (64 << 10), "{} held", parent.retained_bytes());
+    assert!(
+        parent.retained_bytes() <= 2 * (64 << 10),
+        "{} held",
+        parent.retained_bytes()
+    );
     let next: Vec<*mut u8> = (0..5_000).map(|_| parent.take(48)).collect();
     assert!(next.iter().all(|block| parent.contains(block.addr())));
 }

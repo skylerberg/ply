@@ -1,8 +1,8 @@
-use crate::emitted::{Block, Handed, PlyFnDesc, PlyType};
+use crate::emitted::{Block, Handed, PlyFunctionDescriptor, PlyType};
 use crate::frames::{self, PlyFrame};
 use crate::heap::{HEADER, Word};
 use crate::rt::{
-    Ctx, SavedState, call_clause, call_fun, fail_out_of_stack, release_fun,
+    Context, SavedState, call_clause, call_fun, fail_out_of_stack, release_fun,
     switch_stack_preserving_context,
 };
 use crate::stack::{Stack, switch};
@@ -11,7 +11,7 @@ use ply_core::{Diagnostic, codes};
 pub struct Detached {
     stack: Option<Stack>,
     stack_index: usize,
-    sp: usize,
+    stack_pointer: usize,
     saved_current: usize,
     head: *mut PlyFrame,
     caller_stack_pointer: usize,
@@ -29,7 +29,7 @@ pub struct Detached {
 
 pub const INSTANCE_HEADER_WORDS: usize = 7;
 pub const INSTANCE_DETACHED: usize = 4;
-pub const INSTANCE_VARS: usize = 5;
+pub const INSTANCE_VARIABLES: usize = 5;
 
 pub const RECORD_CLOSURE: usize = 0;
 pub const RECORD_INSTANCE: usize = 1;
@@ -41,8 +41,14 @@ const FORWARDS_COUNT: usize = 3;
 const FORWARDS_WORDS: usize = 4;
 const FORWARDS_TARGETS: usize = 5;
 
-type MapFunction =
-    unsafe extern "C" fn(*mut Ctx, *const Word, *const Word, *const Word, *const Word, *mut Word);
+type MapFunction = unsafe extern "C" fn(
+    *mut Context,
+    *const Word,
+    *const Word,
+    *const Word,
+    *const Word,
+    *mut Word,
+);
 
 fn forwards_words(block: Word) -> *mut Word {
     unsafe { (block as *mut Word).byte_add(HEADER) }
@@ -53,9 +59,9 @@ fn forwards_bytes(block: Word) -> Word {
     HEADER as Word + 8 * words
 }
 
-fn retargeted(ctx: *mut Ctx, id: usize) {
-    let c = unsafe { &mut *ctx };
-    let site = std::mem::take(&mut c.entering_desc);
+fn retargeted(context: *mut Context, id: usize) {
+    let c = unsafe { &mut *context };
+    let site = std::mem::take(&mut c.entering_descriptor);
     let words = std::mem::take(&mut c.entering_words);
     let task = c.task;
     let Some(block) = c.detached[id].forwards else {
@@ -73,7 +79,7 @@ fn retargeted(ctx: *mut Ctx, id: usize) {
     let mapped: MapFunction = unsafe { std::mem::transmute(*b.add(FORWARDS_MAP_FUNCTION)) };
     unsafe {
         mapped(
-            ctx,
+            context,
             *b.add(FORWARDS_DESCRIPTOR) as *const Word,
             targets.add(2 * m),
             site as *const Word,
@@ -101,7 +107,7 @@ fn assign_forwarded_task(block: Word, task: i64) {
 }
 
 struct Capture {
-    vars: Vec<(Word, Word)>,
+    variables: Vec<(Word, Word)>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -119,13 +125,13 @@ enum Stopped {
 }
 
 pub(crate) unsafe fn open_detached(
-    ctx: *mut Ctx,
+    context: *mut Context,
     body: Word,
     forwards: Option<Word>,
     instance: Word,
 ) -> Word {
-    drain(ctx);
-    let c = unsafe { &mut *ctx };
+    drain(context);
+    let c = unsafe { &mut *context };
     let Some(stack) = Stack::take() else {
         release_fun(body);
         if let Some(block) = forwards {
@@ -144,11 +150,11 @@ pub(crate) unsafe fn open_detached(
     if let Some(block) = forwards {
         assign_forwarded_task(block, c.task);
     }
-    let sp = stack.prepare(entry, ctx as usize);
+    let stack_pointer = stack.prepare(entry, context as usize);
     c.detached.push(Detached {
         stack: Some(stack),
         stack_index,
-        sp,
+        stack_pointer,
         saved_current: stack_index,
         head: std::ptr::null_mut(),
         caller_stack_pointer: 0,
@@ -163,85 +169,85 @@ pub(crate) unsafe fn open_detached(
         live: None,
         instance: Some(instance),
     });
-    unsafe { resume(ctx, id, None, None) }
+    unsafe { resume(context, id, None, None) }
 }
 
 fn instance_head(block: Word) -> *mut Word {
     unsafe { (block as *mut Word).byte_add(HEADER) }
 }
 
-fn instance_vars(block: Word) -> (*mut Word, usize) {
+fn instance_variables(block: Word) -> (*mut Word, usize) {
     let head = instance_head(block);
     let (place, count) = unsafe {
         (
-            *head.add(INSTANCE_VARS) as usize,
-            *head.add(INSTANCE_VARS + 1) as usize,
+            *head.add(INSTANCE_VARIABLES) as usize,
+            *head.add(INSTANCE_VARIABLES + 1) as usize,
         )
     };
     (unsafe { head.add(INSTANCE_HEADER_WORDS + place) }, count)
 }
 
-fn copy_instance_vars(ctx: *mut Ctx, block: Word) -> Vec<Word> {
-    let (vars, count) = instance_vars(block);
+fn copy_instance_variables(context: *mut Context, block: Word) -> Vec<Word> {
+    let (variables, count) = instance_variables(block);
     (0..count)
         .map(|j| unsafe {
-            let (v, ty) = (*vars.add(2 * j), *vars.add(2 * j + 1));
+            let (v, ty) = (*variables.add(2 * j), *variables.add(2 * j + 1));
             if ty != 0 {
-                ((*(ty as *const PlyType)).inc)(ctx, v);
+                ((*(ty as *const PlyType)).inc)(context, v);
             }
             v
         })
         .collect()
 }
 
-fn vars_put(ctx: *mut Ctx, block: Word, values: Vec<Word>) {
-    let (vars, _) = instance_vars(block);
+fn variables_put(context: *mut Context, block: Word, values: Vec<Word>) {
+    let (variables, _) = instance_variables(block);
     for (j, v) in values.into_iter().enumerate() {
         unsafe {
-            let (old, ty) = (*vars.add(2 * j), *vars.add(2 * j + 1));
+            let (old, ty) = (*variables.add(2 * j), *variables.add(2 * j + 1));
             if ty != 0 {
-                ((*(ty as *const PlyType)).dec)(ctx, old);
+                ((*(ty as *const PlyType)).dec)(context, old);
             }
-            vars.add(2 * j).write(v);
+            variables.add(2 * j).write(v);
         }
     }
 }
 
-fn vars_typed(ctx: *mut Ctx, block: Word) -> Vec<(Word, Word)> {
-    let (vars, count) = instance_vars(block);
+fn variables_typed(context: *mut Context, block: Word) -> Vec<(Word, Word)> {
+    let (variables, count) = instance_variables(block);
     (0..count)
         .map(|j| unsafe {
-            let (v, ty) = (*vars.add(2 * j), *vars.add(2 * j + 1));
+            let (v, ty) = (*variables.add(2 * j), *variables.add(2 * j + 1));
             if ty != 0 {
-                ((*(ty as *const PlyType)).inc)(ctx, v);
+                ((*(ty as *const PlyType)).inc)(context, v);
             }
             (v, ty)
         })
         .collect()
 }
 
-fn retain_vars(ctx: *mut Ctx, values: &[(Word, Word)]) -> Vec<Word> {
+fn retain_variables(context: *mut Context, values: &[(Word, Word)]) -> Vec<Word> {
     values
         .iter()
         .map(|&(v, ty)| {
             if ty != 0 {
-                unsafe { ((*(ty as *const PlyType)).inc)(ctx, v) };
+                unsafe { ((*(ty as *const PlyType)).inc)(context, v) };
             }
             v
         })
         .collect()
 }
 
-fn release_vars(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
+fn release_variables(context: *mut Context, values: Vec<(Word, Word)>) {
     for (v, ty) in values {
         if ty != 0 {
-            unsafe { ((*(ty as *const PlyType)).dec)(ctx, v) };
+            unsafe { ((*(ty as *const PlyType)).dec)(context, v) };
         }
     }
 }
 
 pub(crate) unsafe fn stop_detached(
-    ctx: *mut Ctx,
+    context: *mut Context,
     record: *const Word,
     args: Vec<Word>,
     resource: i64,
@@ -256,29 +262,29 @@ pub(crate) unsafe fn stop_detached(
     let id = unsafe { *instance.sub(INSTANCE_HEADER_WORDS).add(INSTANCE_DETACHED) } as usize;
     let mut bound = args;
     if string != 0 {
-        let c = unsafe { &*ctx };
+        let c = unsafe { &*context };
         let label = usize::try_from(resource)
             .ok()
             .and_then(|i| c.tables.fields.get(i))
             .cloned();
         if let Some(label) = label {
             bound.push(crate::rt::label_word(
-                ctx,
+                context,
                 unsafe { &*(string as *const PlyType) },
                 &label,
             ));
         }
     }
-    unsafe { stopped(ctx, id, closure, bound) }
+    unsafe { stopped(context, id, closure, bound) }
 }
 
 pub(crate) unsafe fn resume(
-    ctx: *mut Ctx,
+    context: *mut Context,
     id: usize,
     capture: Option<usize>,
     result: Option<Word>,
 ) -> Word {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let d = &mut c.detached[id];
     match (&d.state, capture) {
         (State::Fresh, _) => {}
@@ -294,51 +300,54 @@ pub(crate) unsafe fn resume(
             return c.fail(dg);
         }
     }
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let instance = c.detached[id].instance;
-    let mut clause_vars = None;
+    let mut clause_variables = None;
     if let (Some(block), Some(k)) = (instance, capture) {
         if clause_running(c, id) {
-            clause_vars = Some(copy_instance_vars(ctx, block));
+            clause_variables = Some(copy_instance_variables(context, block));
         } else {
-            let stop_counts = retain_vars(ctx, &unsafe { &*ctx }.detached[id].captures[k].vars);
-            vars_put(ctx, block, stop_counts);
+            let stop_counts = retain_variables(
+                context,
+                &unsafe { &*context }.detached[id].captures[k].variables,
+            );
+            variables_put(context, block, stop_counts);
         }
     }
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let d = &mut c.detached[id];
     if let Some(a) = result {
         d.result = a;
     }
     d.resumer_stack_index = c.current;
     d.state = State::Running;
-    let (current, sp) = (d.saved_current, d.sp);
+    let (current, stack_pointer) = (d.saved_current, d.stack_pointer);
     c.current = current;
     if d.state == State::Running && d.starting.is_some() {
         c.starting_detached = Some(id);
     }
     let from = &mut c.detached[id].caller_stack_pointer as *mut usize;
-    unsafe { switch_stack_preserving_context(ctx, from, sp) };
+    unsafe { switch_stack_preserving_context(context, from, stack_pointer) };
 
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let d = &mut c.detached[id];
     c.current = d.resumer_stack_index;
     let r = match d.request.take() {
         Some(Stopped::Performed { closure, mut args }) => {
             d.state = State::Suspended;
-            let k = new_capture(ctx, id);
+            let k = new_capture(context, id);
             if let Some(block) = instance {
-                let kept = vars_typed(ctx, block);
-                unsafe { &mut *ctx }.detached[id].captures[k].vars = kept;
+                let kept = variables_typed(context, block);
+                unsafe { &mut *context }.detached[id].captures[k].variables = kept;
             }
-            let c = unsafe { &mut *ctx };
+            let c = unsafe { &mut *context };
             args.push(token(c, id, k));
             let here = c.keep(SavedState::Clause(id));
-            let r = call_clause(ctx, closure, args);
-            let c = unsafe { &mut *ctx };
+            let r = call_clause(context, closure, args);
+            let c = unsafe { &mut *context };
             c.pop_saved(here);
             release_if_finished(c, id);
-            drain(ctx);
+            drain(context);
             r
         }
         Some(Stopped::Finished(v)) => {
@@ -358,13 +367,13 @@ pub(crate) unsafe fn resume(
             c.fail(dg)
         }
     };
-    if let (Some(block), Some(values)) = (instance, clause_vars) {
-        vars_put(ctx, block, values);
+    if let (Some(block), Some(values)) = (instance, clause_variables) {
+        variables_put(context, block, values);
     }
     r
 }
 
-fn release_if_finished(c: &mut Ctx, id: usize) {
+fn release_if_finished(c: &mut Context, id: usize) {
     let running = clause_running(c, id);
     let d = &mut c.detached[id];
     if d.state == State::Done
@@ -376,20 +385,21 @@ fn release_if_finished(c: &mut Ctx, id: usize) {
     }
 }
 
-fn clause_running(c: &Ctx, id: usize) -> bool {
-    c.stacks
-        .iter()
-        .any(|s| s.iter().any(|k| matches!(k, SavedState::Clause(i) if *i == id)))
+fn clause_running(c: &Context, id: usize) -> bool {
+    c.stacks.iter().any(|s| {
+        s.iter()
+            .any(|k| matches!(k, SavedState::Clause(i) if *i == id))
+    })
 }
 
-fn finish(c: &mut Ctx, id: usize) {
+fn finish(c: &mut Context, id: usize) {
     let d = &mut c.detached[id];
     d.state = State::Done;
     d.live = None;
     give_back(c, id);
 }
 
-fn give_back(c: &mut Ctx, id: usize) {
+fn give_back(c: &mut Context, id: usize) {
     let d = &mut c.detached[id];
     d.stack = None;
     let body = std::mem::take(&mut d.body);
@@ -402,32 +412,34 @@ fn give_back(c: &mut Ctx, id: usize) {
     release_if_finished(c, id);
 }
 
-fn new_capture(ctx: *mut Ctx, id: usize) -> usize {
-    let d = &mut unsafe { &mut *ctx }.detached[id];
-    d.captures.push(Capture { vars: Vec::new() });
+fn new_capture(context: *mut Context, id: usize) -> usize {
+    let d = &mut unsafe { &mut *context }.detached[id];
+    d.captures.push(Capture {
+        variables: Vec::new(),
+    });
     let k = d.captures.len() - 1;
     d.live = Some(k);
     k
 }
 
-unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>) -> Word {
-    let c = unsafe { &mut *ctx };
+unsafe fn stopped(context: *mut Context, id: usize, closure: Word, args: Vec<Word>) -> Word {
+    let c = unsafe { &mut *context };
     let head = c.frames;
     let d = &mut c.detached[id];
     d.request = Some(Stopped::Performed { closure, args });
     d.saved_current = c.current;
     d.head = head;
     let to = d.caller_stack_pointer;
-    let from = &mut d.sp as *mut usize;
-    unsafe { switch_stack_preserving_context(ctx, from, to) };
-    let c = unsafe { &mut *ctx };
+    let from = &mut d.stack_pointer as *mut usize;
+    unsafe { switch_stack_preserving_context(context, from, to) };
+    let c = unsafe { &mut *context };
     std::mem::take(&mut c.detached[id].result)
 }
 
 extern "C" fn entry(arg: usize) {
-    let ctx = arg as *mut Ctx;
+    let context = arg as *mut Context;
     let (id, body) = {
-        let c = unsafe { &mut *ctx };
+        let c = unsafe { &mut *context };
         let id = c
             .starting_detached
             .take()
@@ -443,8 +455,8 @@ extern "C" fn entry(arg: usize) {
         c.frames = frames::base();
         (id, body)
     };
-    let r = call_fun(ctx, body, &[]);
-    let c = unsafe { &mut *ctx };
+    let r = call_fun(context, body, &[]);
+    let c = unsafe { &mut *context };
     let d = &mut c.detached[id];
     d.request = Some(if c.failed != 0 {
         Stopped::Failed
@@ -453,12 +465,12 @@ extern "C" fn entry(arg: usize) {
     });
     d.saved_current = c.current;
     let to = d.caller_stack_pointer;
-    let from = &mut d.sp as *mut usize;
+    let from = &mut d.stack_pointer as *mut usize;
     unsafe { switch(&mut *from, to) };
     std::process::abort();
 }
 
-fn token(c: &mut Ctx, id: usize, capture: usize) -> Word {
+fn token(c: &mut Context, id: usize, capture: usize) -> Word {
     let packed = ((id << 32) | capture) as Word;
     let entry = c.entry as Word;
     let block = Block::alloc(&mut c.heap, TOKEN_BYTES).word();
@@ -473,7 +485,7 @@ fn token(c: &mut Ctx, id: usize, capture: usize) -> Word {
 
 const TOKEN_BYTES: Word = (HEADER + 3 * size_of::<Word>()) as Word;
 
-static TOKEN: PlyFnDesc = PlyFnDesc {
+static TOKEN: PlyFunctionDescriptor = PlyFunctionDescriptor {
     uniform: token_resumed,
     typed: None,
     convention: 0,
@@ -487,23 +499,23 @@ unsafe fn token_words(k: Word) -> (i64, i64) {
     unsafe { (*words.add(1), *words.add(2)) }
 }
 
-unsafe extern "C" fn token_resumed(ctx: *mut Ctx, k: Word, args: *const Word) -> Word {
+unsafe extern "C" fn token_resumed(context: *mut Context, k: Word, args: *const Word) -> Word {
     let (packed, entry) = unsafe { token_words(k) };
     let (id, capture) = unpacked(packed);
     let v = unsafe { *args };
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     if !capture_exists(c, entry, id, capture) {
         return c.fail(err_stale_continuation());
     }
-    retargeted(ctx, id);
-    unsafe { resume(ctx, id, Some(capture), Some(v)) }
+    retargeted(context, id);
+    unsafe { resume(context, id, Some(capture), Some(v)) }
 }
 
-unsafe extern "C" fn token_released(ctx: *mut Ctx, k: Handed) -> Word {
+unsafe extern "C" fn token_released(context: *mut Context, k: Handed) -> Word {
     let k = k.word();
     let (packed, entry) = unsafe { token_words(k) };
     let (id, capture) = unpacked(packed);
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     if capture_exists(c, entry, id, capture) {
         c.continuations_died.push((id, capture));
     }
@@ -511,7 +523,7 @@ unsafe extern "C" fn token_released(ctx: *mut Ctx, k: Handed) -> Word {
     0
 }
 
-unsafe extern "C" fn inert_continuation(_ctx: *mut Ctx, _k: Word) -> Word {
+unsafe extern "C" fn inert_continuation(_context: *mut Context, _k: Word) -> Word {
     0
 }
 
@@ -520,44 +532,44 @@ fn unpacked(packed: i64) -> (usize, usize) {
     (packed >> 32, packed & 0xffff_ffff)
 }
 
-fn capture_exists(c: &Ctx, entry: i64, id: usize, k: usize) -> bool {
+fn capture_exists(c: &Context, entry: i64, id: usize, k: usize) -> bool {
     entry == c.entry as i64 && c.detached.get(id).is_some_and(|d| k < d.captures.len())
 }
 
-pub(crate) fn drain(ctx: *mut Ctx) {
-    while let Some((id, k)) = unsafe { (*ctx).continuations_died.pop() } {
-        drop_stop(ctx, id, k);
+pub(crate) fn drain(context: *mut Context) {
+    while let Some((id, k)) = unsafe { (*context).continuations_died.pop() } {
+        drop_stop(context, id, k);
     }
 }
 
-fn drop_stop(ctx: *mut Ctx, id: usize, k: usize) {
-    let d = &mut unsafe { &mut *ctx }.detached[id];
-    let vars = std::mem::take(&mut d.captures[k].vars);
+fn drop_stop(context: *mut Context, id: usize, k: usize) {
+    let d = &mut unsafe { &mut *context }.detached[id];
+    let variables = std::mem::take(&mut d.captures[k].variables);
     let waiting = d.state == State::Suspended && d.live == Some(k);
-    release_vars(ctx, vars);
+    release_variables(context, variables);
     if waiting {
-        abandon(ctx, id);
+        abandon(context, id);
     }
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     if c.detached[id].state == State::Done {
         give_back(c, id);
     }
 }
 
-fn abandon(ctx: *mut Ctx, id: usize) {
-    let d = &mut unsafe { &mut *ctx }.detached[id];
+fn abandon(context: *mut Context, id: usize) {
+    let d = &mut unsafe { &mut *context }.detached[id];
     d.state = State::Done;
     d.live = None;
     let (head, own) = (
         std::mem::replace(&mut d.head, std::ptr::null_mut()),
         d.stack_index,
     );
-    unsafe { frames::release_frames(ctx, head) };
-    release_stack(ctx, own);
+    unsafe { frames::release_frames(context, head) };
+    release_stack(context, own);
 }
 
-fn release_stack(ctx: *mut Ctx, own: usize) {
-    if let Some(s) = unsafe { &mut *ctx }.stacks.get_mut(own) {
+fn release_stack(context: *mut Context, own: usize) {
+    if let Some(s) = unsafe { &mut *context }.stacks.get_mut(own) {
         release_saved_states(std::mem::take(s));
     }
 }
@@ -566,12 +578,12 @@ fn release_saved_states(kept: Vec<SavedState>) {
     kept.into_iter().for_each(SavedState::release);
 }
 
-pub(crate) fn teardown(ctx: *mut Ctx) {
-    drain(ctx);
-    let bodies = unsafe { &*ctx }.detached.len();
+pub(crate) fn teardown(context: *mut Context) {
+    drain(context);
+    let bodies = unsafe { &*context }.detached.len();
     for id in (0..bodies).rev() {
         let (suspended, done, own) = {
-            let d = &unsafe { &*ctx }.detached[id];
+            let d = &unsafe { &*context }.detached[id];
             (
                 d.state == State::Suspended,
                 d.state == State::Done,
@@ -579,15 +591,16 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
             )
         };
         if suspended {
-            abandon(ctx, id);
+            abandon(context, id);
         } else if !done {
-            release_stack(ctx, own);
+            release_stack(context, own);
         }
-        for k in 0..unsafe { &*ctx }.detached[id].captures.len() {
-            let vars = std::mem::take(&mut unsafe { &mut *ctx }.detached[id].captures[k].vars);
-            release_vars(ctx, vars);
+        for k in 0..unsafe { &*context }.detached[id].captures.len() {
+            let variables =
+                std::mem::take(&mut unsafe { &mut *context }.detached[id].captures[k].variables);
+            release_variables(context, variables);
         }
-        let c = unsafe { &mut *ctx };
+        let c = unsafe { &mut *context };
         let d = &mut c.detached[id];
         d.state = State::Done;
         d.live = None;
@@ -596,7 +609,7 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
             release_fun(block);
         }
     }
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     c.continuations_died.clear();
     c.detached.clear();
 }

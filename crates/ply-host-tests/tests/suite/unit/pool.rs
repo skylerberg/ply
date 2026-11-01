@@ -1,6 +1,6 @@
 use ply_core::host::MachineId;
 use ply_core::{Diagnostic, Pending, Span, codes};
-use ply_host::pool::{JobOutput, SecretBytes, MAX_BLOCKING_OPERATIONS, Pool, Run, WakeCounter};
+use ply_host::pool::{JobOutput, MAX_BLOCKING_OPERATIONS, Pool, Run, SecretBytes, WakeCounter};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -23,7 +23,7 @@ pub fn connect(
 ) -> Result<Vec<u8>, Diagnostic> {
     let socket = net.datagram(handle, label, span)?;
     let connected = to
-        .socket_addr()
+        .socket_address()
         .and_then(|to| socket.connect(to).map_err(|e| NetError::of(&e)));
     Ok(wire::result(connected.map(|()| Vec::new())))
 }
@@ -41,7 +41,7 @@ pub fn send_to(
     Ok(Box::new(move || {
         let _ = socket.set_write_timeout(Some(timeout));
         let sent = to
-            .socket_addr()
+            .socket_address()
             .and_then(|to| socket.send_to(&payload, to).map_err(|e| NetError::of(&e)));
         Ok(wire::result(sent.map(|n| int(n as i64).to_vec())))
     }))
@@ -104,7 +104,7 @@ fn received(socket: &UdpSocket, max: usize) -> Result<Vec<u8>, NetError> {
 }
 
 fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<UdpSocket, NetError> {
-    let address = to.socket_addr()?;
+    let address = to.socket_address()?;
     let rejection = |e: std::io::Error| NetError::of(&e);
     let socket = Socket::new(
         Domain::for_address(address),

@@ -1,8 +1,8 @@
 use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::heap;
-use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::native::{Address, I64, TakenBytes};
+use crate::rt::{Context, borrowed};
 use ply_core::crypto::{self, EncodingSupport};
 use ply_core::{Diagnostic, Span, codes};
 use zeroize::Zeroizing;
@@ -132,18 +132,18 @@ impl Sealed {
 }
 
 impl heap::Native for Sealed {
-    fn release(&mut self, _ctx: *mut Ctx) {}
+    fn release(&mut self, _context: *mut Context) {}
 }
 
-pub(crate) fn sealed(c: &mut Ctx, text: bool, bytes: Zeroizing<Vec<u8>>) -> SecretHandle {
+pub(crate) fn sealed(c: &mut Context, text: bool, bytes: Zeroizing<Vec<u8>>) -> SecretHandle {
     SecretHandle::of(c.heap.native(Box::new(Sealed { text, bytes })))
 }
 
-fn sealed_bytes(c: &mut Ctx, bytes: Zeroizing<Vec<u8>>) -> SecretHandle {
+fn sealed_bytes(c: &mut Context, bytes: Zeroizing<Vec<u8>>) -> SecretHandle {
     sealed(c, false, bytes)
 }
 
-pub(crate) fn sealed_value<'a>(c: &mut Ctx, s: &SecretHandle) -> Option<&'a Sealed> {
+pub(crate) fn sealed_value<'a>(c: &mut Context, s: &SecretHandle) -> Option<&'a Sealed> {
     match unsafe { heap::native_of::<Sealed>(s.word()) } {
         Some(held) => Some(held),
         None => {
@@ -164,7 +164,7 @@ fn err_secret(reason: &str) -> Diagnostic {
     .note("this is Ply's fault, not the program's")
 }
 
-unsafe fn name<'a>(p: Addr, n: I64) -> &'a str {
+unsafe fn name<'a>(p: Address, n: I64) -> &'a str {
     std::str::from_utf8(unsafe { borrowed(p, n) }).unwrap_or("")
 }
 
@@ -175,15 +175,20 @@ fn found(bytes: Option<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-fn optional_bytes_handle(c: &mut Ctx, bytes: Option<Vec<u8>>) -> I64 {
+fn optional_bytes_handle(c: &mut Context, bytes: Option<Vec<u8>>) -> I64 {
     match bytes {
         Some(bytes) => c.give(bytes),
         None => I64(-1),
     }
 }
 
-pub unsafe extern "C" fn rt_secret_of(ctx: *mut Ctx, p: Addr, n: I64, text: I64) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_secret_of(
+    context: *mut Context,
+    p: Address,
+    n: I64,
+    text: I64,
+) -> SecretHandle {
+    let c = unsafe { &mut *context };
     let bytes = unsafe { borrowed(p, n) };
     if text.0 != 0 && c.text(bytes).is_none() {
         return SecretHandle::of(0);
@@ -192,12 +197,12 @@ pub unsafe extern "C" fn rt_secret_of(ctx: *mut Ctx, p: Addr, n: I64, text: I64)
 }
 
 pub unsafe extern "C" fn rt_secret_verify(
-    ctx: *mut Ctx,
+    context: *mut Context,
     stored: SecretHandle,
-    p: Addr,
+    p: Address,
     n: I64,
 ) -> I64 {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &stored) else {
         return I64(0);
     };
@@ -208,8 +213,12 @@ pub unsafe extern "C" fn rt_secret_verify(
     I64(i64::from(same))
 }
 
-pub unsafe extern "C" fn rt_secret_equal(ctx: *mut Ctx, a: SecretHandle, b: SecretHandle) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_secret_equal(
+    context: *mut Context,
+    a: SecretHandle,
+    b: SecretHandle,
+) -> I64 {
+    let c = unsafe { &mut *context };
     let (Some(x), Some(y)) = (sealed_value(c, &a), sealed_value(c, &b)) else {
         return I64(0);
     };
@@ -217,13 +226,13 @@ pub unsafe extern "C" fn rt_secret_equal(ctx: *mut Ctx, a: SecretHandle, b: Secr
     I64(i64::from(same))
 }
 
-pub unsafe extern "C" fn rt_secret_len(ctx: *mut Ctx, s: SecretHandle) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_secret_len(context: *mut Context, s: SecretHandle) -> I64 {
+    let c = unsafe { &mut *context };
     I64(sealed_value(c, &s).map_or(0, |held| held.bytes.len() as i64))
 }
 
-pub unsafe extern "C" fn rt_secret_bytes(ctx: *mut Ctx, s: SecretHandle) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_secret_bytes(context: *mut Context, s: SecretHandle) -> SecretHandle {
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &s) else {
         return SecretHandle::of(0);
     };
@@ -231,11 +240,11 @@ pub unsafe extern "C" fn rt_secret_bytes(ctx: *mut Ctx, s: SecretHandle) -> Secr
 }
 
 pub unsafe extern "C" fn rt_secret_concat(
-    ctx: *mut Ctx,
+    context: *mut Context,
     a: SecretHandle,
     b: SecretHandle,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let (Some(x), Some(y)) = (sealed_value(c, &a), sealed_value(c, &b)) else {
         return SecretHandle::of(0);
     };
@@ -245,19 +254,19 @@ pub unsafe extern "C" fn rt_secret_concat(
     sealed_bytes(c, out)
 }
 
-pub unsafe extern "C" fn rt_secret_encodes(_ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_secret_encodes(_context: *mut Context, p: Address, n: I64) -> I64 {
     I64(i64::from(
         crypto::encoding(unsafe { name(p, n) }) == EncodingSupport::WritesAndReads,
     ))
 }
 
 pub unsafe extern "C" fn rt_secret_encoded(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     bytes: SecretHandle,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &bytes) else {
         return SecretHandle::of(0);
     };
@@ -266,12 +275,12 @@ pub unsafe extern "C" fn rt_secret_encoded(
 }
 
 pub unsafe extern "C" fn rt_secret_decodes(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     text: SecretHandle,
 ) -> I64 {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let name = unsafe { name(p, n) };
     if crypto::encoding(name) == EncodingSupport::Neither {
         return I64(-2);
@@ -287,12 +296,12 @@ pub unsafe extern "C" fn rt_secret_decodes(
 }
 
 pub unsafe extern "C" fn rt_secret_decoded(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     text: SecretHandle,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &text) else {
         return SecretHandle::of(0);
     };
@@ -300,8 +309,8 @@ pub unsafe extern "C" fn rt_secret_decoded(
     sealed_bytes(c, bytes)
 }
 
-pub unsafe extern "C" fn rt_secret_key_scheme(ctx: *mut Ctx, der: SecretHandle) -> I64 {
-    let c = unsafe { &mut *ctx };
+pub unsafe extern "C" fn rt_secret_key_scheme(context: *mut Context, der: SecretHandle) -> I64 {
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &der) else {
         return I64(-1);
     };
@@ -310,12 +319,12 @@ pub unsafe extern "C" fn rt_secret_key_scheme(ctx: *mut Ctx, der: SecretHandle) 
 }
 
 pub unsafe extern "C" fn rt_secret_key(
-    ctx: *mut Ctx,
+    context: *mut Context,
     der: SecretHandle,
-    p: Addr,
+    p: Address,
     n: I64,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &der) else {
         return SecretHandle::of(0);
     };
@@ -324,14 +333,14 @@ pub unsafe extern "C" fn rt_secret_key(
 }
 
 pub unsafe extern "C" fn rt_secret_rsa_jwk(
-    ctx: *mut Ctx,
-    np: Addr,
+    context: *mut Context,
+    np: Address,
     nn: I64,
-    ep: Addr,
+    ep: Address,
     en: I64,
     texts: SecretHandle,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &texts) else {
         return SecretHandle::of(0);
     };
@@ -349,14 +358,14 @@ pub unsafe extern "C" fn rt_secret_rsa_jwk(
 }
 
 pub unsafe extern "C" fn rt_secret_hmac(
-    ctx: *mut Ctx,
-    hp: Addr,
+    context: *mut Context,
+    hp: Address,
     hn: I64,
     key: SecretHandle,
-    mp: Addr,
+    mp: Address,
     mn: I64,
 ) -> I64 {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return I64(-1);
     };
@@ -366,25 +375,25 @@ pub unsafe extern "C" fn rt_secret_hmac(
 }
 
 pub unsafe extern "C" fn rt_secret_hkdf_extract(
-    ctx: *mut Ctx,
-    hp: Addr,
+    context: *mut Context,
+    hp: Address,
     hn: I64,
-    sp: Addr,
+    stack_pointer: Address,
     sn: I64,
     key: SecretHandle,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return SecretHandle::of(0);
     };
-    let salt = unsafe { borrowed(sp, sn) };
+    let salt = unsafe { borrowed(stack_pointer, sn) };
     let prk = crypto::hkdf_extract(unsafe { name(hp, hn) }, salt, &held.bytes);
     sealed_bytes(c, prk.unwrap_or_default())
 }
 
 pub unsafe extern "C" fn rt_secret_hkdf_expands(
-    _ctx: *mut Ctx,
-    hp: Addr,
+    _context: *mut Context,
+    hp: Address,
     hn: I64,
     length: I64,
 ) -> I64 {
@@ -394,15 +403,15 @@ pub unsafe extern "C" fn rt_secret_hkdf_expands(
 }
 
 pub unsafe extern "C" fn rt_secret_hkdf_expand(
-    ctx: *mut Ctx,
-    hp: Addr,
+    context: *mut Context,
+    hp: Address,
     hn: I64,
     key: SecretHandle,
-    ip: Addr,
+    ip: Address,
     info_byte_count: I64,
     length: I64,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return SecretHandle::of(0);
     };
@@ -413,43 +422,43 @@ pub unsafe extern "C" fn rt_secret_hkdf_expand(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_secret_pbkdf2(
-    ctx: *mut Ctx,
-    hp: Addr,
+    context: *mut Context,
+    hp: Address,
     hn: I64,
     password: SecretHandle,
-    sp: Addr,
+    stack_pointer: Address,
     sn: I64,
     iterations: I64,
     length: I64,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &password) else {
         return SecretHandle::of(0);
     };
-    let salt = unsafe { borrowed(sp, sn) };
+    let salt = unsafe { borrowed(stack_pointer, sn) };
     let hash = unsafe { name(hp, hn) };
     let key = crypto::pbkdf2(hash, &held.bytes, salt, iterations.0, length.0);
     sealed_bytes(c, key.unwrap_or_default())
 }
 
-pub unsafe extern "C" fn rt_crypto_nonce_length(_ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_crypto_nonce_length(_context: *mut Context, p: Address, n: I64) -> I64 {
     I64(crypto::nonce_length(unsafe { name(p, n) }).map_or(0, |n| n as i64))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_crypto_sealed(
-    ctx: *mut Ctx,
-    cp: Addr,
+    context: *mut Context,
+    cp: Address,
     cn: I64,
     key: SecretHandle,
-    np: Addr,
+    np: Address,
     nn: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
-    tp: Addr,
+    tp: Address,
     tn: I64,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return TakenBytes(0);
     };
@@ -462,35 +471,40 @@ pub unsafe extern "C" fn rt_crypto_sealed(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_crypto_opened(
-    ctx: *mut Ctx,
-    cp: Addr,
+    context: *mut Context,
+    cp: Address,
     cn: I64,
     key: SecretHandle,
-    np: Addr,
+    np: Address,
     nn: I64,
-    ap: Addr,
+    ap: Address,
     an: I64,
-    sp: Addr,
+    stack_pointer: Address,
     sn: I64,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return TakenBytes(0);
     };
-    let (nonce, associated, sealed) =
-        unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(sp, sn)) };
+    let (nonce, associated, sealed) = unsafe {
+        (
+            borrowed(np, nn),
+            borrowed(ap, an),
+            borrowed(stack_pointer, sn),
+        )
+    };
     let cipher = unsafe { name(cp, cn) };
     let opened = crypto::open(cipher, &held.bytes, nonce, associated, sealed);
     c.given(opened.map_or_else(|_| Vec::new(), found))
 }
 
 pub unsafe extern "C" fn rt_crypto_public_key(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     key: SecretHandle,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return TakenBytes(0);
     };
@@ -499,14 +513,14 @@ pub unsafe extern "C" fn rt_crypto_public_key(
 }
 
 pub unsafe extern "C" fn rt_crypto_signature(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     key: SecretHandle,
-    mp: Addr,
+    mp: Address,
     mn: I64,
 ) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return TakenBytes(0);
     };
@@ -517,37 +531,42 @@ pub unsafe extern "C" fn rt_crypto_signature(
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_crypto_verified(
-    _ctx: *mut Ctx,
-    p: Addr,
+    _context: *mut Context,
+    p: Address,
     n: I64,
-    kp: Addr,
+    kp: Address,
     kn: I64,
-    mp: Addr,
+    mp: Address,
     mn: I64,
-    sp: Addr,
+    stack_pointer: Address,
     sn: I64,
 ) -> I64 {
-    let (public, message, signature) =
-        unsafe { (borrowed(kp, kn), borrowed(mp, mn), borrowed(sp, sn)) };
+    let (public, message, signature) = unsafe {
+        (
+            borrowed(kp, kn),
+            borrowed(mp, mn),
+            borrowed(stack_pointer, sn),
+        )
+    };
     match crypto::verify(unsafe { name(p, n) }, public, message, signature) {
         Ok(holds) => I64(i64::from(holds)),
         Err(_) => I64(-1),
     }
 }
 
-pub unsafe extern "C" fn rt_crypto_agrees(_ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+pub unsafe extern "C" fn rt_crypto_agrees(_context: *mut Context, p: Address, n: I64) -> I64 {
     I64(i64::from(crypto::agrees(unsafe { name(p, n) })))
 }
 
 pub unsafe extern "C" fn rt_crypto_agreed(
-    ctx: *mut Ctx,
-    p: Addr,
+    context: *mut Context,
+    p: Address,
     n: I64,
     key: SecretHandle,
-    pp: Addr,
+    pp: Address,
     pn: I64,
 ) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
+    let c = unsafe { &mut *context };
     let Some(held) = sealed_value(c, &key) else {
         return SecretHandle::of(0);
     };

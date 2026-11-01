@@ -125,8 +125,9 @@ impl SqliteHost {
                     _ => None,
                 }
             };
-            let closed = handle
-                .is_some_and(|handle| send_request(&handle.commands, WorkerRequest::Close).is_some());
+            let closed = handle.is_some_and(|handle| {
+                send_request(&handle.commands, WorkerRequest::Close).is_some()
+            });
             Ok(vec![u8::from(closed)])
         })
     }
@@ -322,7 +323,12 @@ fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option
 
 fn send_request(commands: &Sender<Command>, ask: WorkerRequest) -> Option<Response> {
     let (result, returned) = channel();
-    commands.send(Command { request: ask, result }).ok()?;
+    commands
+        .send(Command {
+            request: ask,
+            result,
+        })
+        .ok()?;
     returned.recv().ok()
 }
 
@@ -439,7 +445,11 @@ fn opened(
 fn serve(mut engine: Engine, commands: Receiver<Command>) {
     let mut folded = false;
     let mut next: Option<Command> = None;
-    while let Some(Command { request: ask, result }) = next.take().or_else(|| commands.recv().ok()) {
+    while let Some(Command {
+        request: ask,
+        result,
+    }) = next.take().or_else(|| commands.recv().ok())
+    {
         let said = match ask {
             WorkerRequest::Close => {
                 drop(engine);
