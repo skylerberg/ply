@@ -179,7 +179,7 @@ pub effect memo_store {
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
   read is_out_of_date(key: Bytes) -> Bool
-  read next_out_of_date() -> Option<Bytes>
+  read next_out_of_date() -> Option<Waited>
   read past(key: Bytes) -> List<StoredFact>
   write put(key: Bytes, fact: StoredFact, details: FactDetails, output: Bytes, lasting: Bool) -> Unit
   write keep_output(digest: Bytes, output: Bytes, lasting: Bool) -> Unit
@@ -355,8 +355,16 @@ fn recomputed<| e>(
   iterate(run, 1099511627776, |r: Run|
     match memo_store.next_out_of_date() {
       None -> Stop(r),
-      Some(key) -> Continue(recompute(queries, r, key)),
+      Some(next) ->
+        Continue(if waits_for_earlier_version(next) { r } else { recompute(queries, r, next.key) }),
     })
+
+fn waits_for_earlier_version(next: Waited) -> Bool / {memo_store.read, memo_store.write} = {
+  let deepest = memo_store.past(next.key).fold(next.depth, |depth: Int, f: StoredFact|
+    max(depth, f.depth));
+  if deepest > next.depth { memo_store.mark_out_of_date(next.key, deepest) };
+  deepest > next.depth
+}
 
 fn recompute<| e>(
   queries: Map<Bytes, Query<| e>>,
@@ -448,12 +456,6 @@ fn fetched<| e>(
       Some(o) -> { run: s.run, output: o, at: s.at },
       None -> {
         let e = run_opened(queries, s.run, q, key, input, false, left - 1);
-        if e.at.digest != s.at.digest {
-          panic(
-            "the query `" ++ String::of_bytes_lossy(q.name)
-              ++ "` returned a different result when run again after its cached result was lost: its body reads data that is not part of its input",
-          )
-        };
         {
           run: {
             ..e.run,
@@ -659,7 +661,7 @@ fn inputs_recorded(
 fn version_usable<| e>(
   queries: Map<Bytes, Query<| e>>,
   fact: StoredFact,
-) -> Bool / {memo_store.read, abort.raise} =
+) -> Bool / {memo_store.read} =
   match details_before(Some(fact)) {
     None -> false,
     Some(d) -> match queries.get(d.query) {
@@ -672,7 +674,7 @@ fn written_version<| e>(
   queries: Map<Bytes, Query<| e>>,
   writer: Bytes,
   written: WrittenFact,
-) -> Option<StoredFact> / {memo_store.read, abort.raise} = {
+) -> Option<StoredFact> / {memo_store.read} = {
   let current = match memo_store.fact(written.key) { Some(f) -> [f], None -> [] };
   current.concat(memo_store.past(written.key)).find(|f: StoredFact|
     f.written_by == writer && f.output == written.output && version_usable(queries, f))
@@ -682,7 +684,7 @@ fn written_versions<| e>(
   queries: Map<Bytes, Query<| e>>,
   writer: Bytes,
   wrote: List<WrittenFact>,
-) -> Option<List<{ key: Bytes, fact: StoredFact }>> / {memo_store.read, abort.raise} =
+) -> Option<List<{ key: Bytes, fact: StoredFact }>> / {memo_store.read} =
   wrote.fold(
     Some([]),
     |found: Option<List<{ key: Bytes, fact: StoredFact }>>, written: WrittenFact|
@@ -695,10 +697,7 @@ fn written_versions<| e>(
       },
   )
 
-fn replaced_fact(
-  key: Bytes,
-  fact: StoredFact,
-) -> Unit / {memo_store.read, memo_store.write, abort.raise} = {
+fn replaced_fact(key: Bytes, fact: StoredFact) -> Unit / {memo_store.read, memo_store.write} = {
   match memo_store.fact(key) {
     Some(f) -> {
       if f.output != fact.output { marked_dependents(key) };
@@ -1065,6 +1064,8 @@ pub type Waiting = {
   pushing: Bool,
 }
 
+pub type Waited = { key: Bytes, depth: Int }
+
 pub fn nothing_waiting() -> Waiting =
   { depths: Map::new(), order: Map::new(), products: Map::new(), pushing: false }
 
@@ -1073,15 +1074,14 @@ pub fn defers(w: Waiting, key: Bytes) -> Bool / {abort.raise} =
 
 fn waiting_name(depth: Int, key: Bytes) -> Bytes = u64_be(depth).concat(key)
 
-pub fn with_mark(w: Waiting, key: Bytes, depth: Int) -> Waiting =
+pub fn with_mark(w: Waiting, key: Bytes, depth: Int) -> Waiting = {
+  let unmarked = without_mark(w, key);
   {
-    ..w,
-    depths: w.depths.insert(key, depth),
-    order: w.order.insert(
-      waiting_name(match w.depths.get(key) { Some(d) -> d, None -> depth }, key),
-      true,
-    ),
+    ..unmarked,
+    depths: unmarked.depths.insert(key, depth),
+    order: unmarked.order.insert(waiting_name(depth, key), true),
   }
+}
 
 pub fn without_mark(w: Waiting, key: Bytes) -> Waiting =
   match w.depths.get(key) {
@@ -1089,9 +1089,12 @@ pub fn without_mark(w: Waiting, key: Bytes) -> Waiting =
     Some(d) -> { ..w, depths: w.depths.remove(key), order: w.order.remove(waiting_name(d, key)) },
   }
 
-pub fn first_waiting(w: Waiting) -> Option<Bytes> / {abort.raise} =
+pub fn first_waiting(w: Waiting) -> Option<Waited> / {abort.raise} =
   match w.order.range(None, true, None, true, 1) {
-    [first, ..] -> Some(first.key.slice(8, first.key.len())),
+    [first, ..] -> {
+      let key = first.key.slice(8, first.key.len());
+      Some({ key: key, depth: match w.depths.get(key) { Some(d) -> d, None -> 0 } })
+    },
     [] -> None,
   }
 
@@ -1459,6 +1462,35 @@ fn lengths(length_code: Bytes) -> Map<Bytes, Query<| {}>> =
   )
 
 fn four() -> TestWorld = world_of([{ at: b"a", text: b"four" }])
+
+test "a key marked again at another depth moves in the queue and leaves it when it settles" {
+  let moved = with_mark(with_mark(nothing_waiting(), b"k", 1), b"k", 5);
+  assert_eq(first_waiting(moved), Some({ key: b"k", depth: 5 }));
+  assert_eq(first_waiting(without_mark(moved, b"k")), None)
+}
+
+fn checked_as_a_whole(input: Bytes) -> Bytes / {memo.read} = {
+  memo.offer_as(b"whole", b"part", input, b"from the whole");
+  memo.fetch(b"part", input)
+}
+
+fn checked_alone(input: Bytes) -> Bytes / {memo.read} =
+  match memo.offered() { Some(offer) -> offer, None -> b"alone" }
+
+test "a result lost from the store is computed again, and a different result replaces it" {
+  let q = Map::new().insert(b"whole", query(b"whole", b"w1", checked_as_a_whole)).insert(
+    b"part",
+    query(b"part", b"p1", checked_alone),
+  );
+  let first = fetched_in(q, four(), b"whole", b"a");
+  assert_eq(first.output, b"from the whole");
+  let store = first.world.store;
+  let lost = {
+    ..first.world,
+    store: { ..store, outputs: store.outputs.remove(digest_of(Some(first.output))) },
+  };
+  assert_eq(fetched_in(q, lost, b"part", b"a").output, b"alone")
+}
 
 test "a run with no changed input runs no query" {
   let q = lengths(b"h1");

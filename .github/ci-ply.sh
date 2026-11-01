@@ -107,10 +107,6 @@ summed() {
 
 answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) query results reused, \([.front_end.queries[].run] | add // 0) computed and \(.front_end.lost // 0) lost" else "" end)'
 
-lost() {
-  jq -s -e 'any(.[]; (.front_end.lost // 0) > 0)' "$1" > /dev/null 2>&1
-}
-
 spent() {
   jq -r --argjson wall "$2" '
     def s(ms): (ms / 1000 | floor | tostring) + "s";
@@ -158,10 +154,6 @@ tests_of() {
     echo "the run $id selected no test" >&2
     status=1
   fi
-  if lost "$out"; then
-    echo "the run $id ran bodies again whose results a store had cached and lost" >&2
-    status=1
-  fi
   if [ "$status" -ne 0 ]; then
     red "$out"
     rm -f "$out"
@@ -194,10 +186,6 @@ proofs_of() {
   echo "proved: $all claims, $cached from the cache, the rest proved in $((discharging / 1000))s of the $((($(now_ms) - started) / 1000))s that the prove took$(jq -r "$answers" "$out" 2>/dev/null)"
   if [ "$all" -eq 0 ]; then
     echo "the run $id proved no claim" >&2
-    status=1
-  fi
-  if lost "$out"; then
-    echo "the run $id ran bodies again whose results a store had cached and lost" >&2
     status=1
   fi
   if [ "$status" -ne 0 ]; then
