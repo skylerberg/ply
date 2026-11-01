@@ -126,8 +126,9 @@ saved baselines for `ply review` and fetched dependencies. Add it to `.gitignore
 always safe, and `ply cache clear` empties it. A run that crashes, or that races another run, can
 make a later run redo work, but never gives a wrong result. Checkouts also share a per-user cache of
 results, so a new checkout of the same code reuses the work of another one. If nothing changed since
-a run that succeeded, `ply check`, `ply test`, `ply run`, `ply build` and `ply prove` load no program:
-they report the stored result or start the stored library.
+a run that succeeded, `ply check`, `ply test`, `ply run`, `ply build`, `ply prove`, `ply review`,
+`ply callers` and `ply unused` load no program: they report the stored result or start the stored
+library.
 
 A definition's hash is a fingerprint of the definition and of everything it depends on. It does not
 cover the definition's comments, formatting or name. So a rename or a comment edit reruns no test.
@@ -2530,9 +2531,8 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 
 ### 17.4 Reusing results
 
-`ply check`, `ply test`, `ply run` and `ply definitions` load the program on every run. They check
-again only what depends on a change. `ply build`, `ply hosts` and `--no-cache` always check from
-scratch.
+After a change, commands check again only what depends on it. `ply hosts`, `ply publish` and
+`--no-cache` always check from scratch.
 
 ### 17.5 Compiling
 

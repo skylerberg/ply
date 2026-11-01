@@ -1,6 +1,7 @@
 import compiler.load (Derives)
 import compiler.cc (toolchain)
-import compiler.unit (shipped)
+import compiler.unit (shipped, product_key)
+import std.bin
 import std.random (entropy)
 import std.time (time)
 import builder (builder)
@@ -8,7 +9,8 @@ import args (Flags, style_of)
 import library (read, workspace_error, workspace_file, workspace_root)
 import paths
 import std.path (join)
-import program (Program, load_program, location_of, own_laws, own_tests, program_view)
+import program (Program, load_program, location_of, own_laws, own_tests, program_view,
+                product_unchanged, store_product_at)
 import report (CommandOutput, schema_version, ok_code, indent, count_of, rejected, reported)
 import std.env (env)
 import std.term (Style, bold, dim)
@@ -34,6 +36,12 @@ type Written = { name: Bytes, kind: Kind, at: Location, public: Bool, entry: Boo
 pub type Listed = { name: Bytes, kind: Kind, location: Option<String> }
 
 pub type Unused = { definitions: Int, never_used: List<Listed>, only_tests: List<Listed> }
+
+derive bin for Kind
+
+derive bin for Listed
+
+derive bin for Unused
 
 pub type Walk = { written: List<Listed>, running: ReachableNames, testing: ReachableNames }
 
@@ -198,12 +206,11 @@ fn unused_output(style: Style, found: Unused) -> CommandOutput / {abort.raise} =
     code: ok_code(),
   }
 
-fn walked_package(
+fn walked(
   flags: Flags,
-  paths: List<paths::ResolvedPath>,
+  loaded: Program,
   public_is_used: Bool,
-) -> Result<Walk, CommandOutput> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} = {
-  let loaded: Program = load_program(paths, flags.verify_dependencies);
+) -> Result<Walk, CommandOutput> / {abort.raise} =
   match program_view(loaded) {
     None -> Err(rejected(style_of(flags), "unused", loaded.diagnostics, loaded.source_texts)),
     Some(w) ->
@@ -218,7 +225,13 @@ fn walked_package(
         ),
       ),
   }
-}
+
+fn walked_package(
+  flags: Flags,
+  paths: List<paths::ResolvedPath>,
+  public_is_used: Bool,
+) -> Result<Walk, CommandOutput> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
+  walked(flags, load_program(paths, flags.verify_dependencies), public_is_used)
 
 fn walked_each(
   flags: Flags,
@@ -268,17 +281,54 @@ fn over_workspace(
   }
 }
 
+fn unused_product(flags: Flags) -> String / {shipped.runtime, shipped.definitions, abort.raise} =
+  "unused "
+    ++ String::of_bytes_lossy(
+      product_key(
+        Bytes::of_string(String::join(flags.paths.map(|r: paths::ResolvedPath| r.display), "\n")),
+      ),
+    )
+
+fn may_reuse_unused(flags: Flags) -> Bool = !flags.workspace && !flags.verify_dependencies
+
+fn unused_from_sources(
+  flags: Flags,
+  product: String,
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} = {
+  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
+  match walked(flags, loaded, true) {
+    Err(rejected_load) -> rejected_load,
+    Ok(walk) -> {
+      let found = unused_definitions(walk.written, walk.running, walk.testing);
+      if may_reuse_unused(flags) {
+        store_product_at(
+          flags.paths,
+          loaded.log_position,
+          product,
+          bin::encode(found, unused_bin()),
+        )
+      };
+      unused_output(style_of(flags), found)
+    },
+  }
+}
+
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
+) -> CommandOutput / {time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
   if flags.workspace { over_workspace(flags) } else {
-    match walked_package(flags, flags.paths, true) {
-      Err(rejected_load) -> rejected_load,
-      Ok(walk) ->
-        unused_output(
-          style_of(flags),
-          unused_definitions(walk.written, walk.running, walk.testing),
-        ),
+    let product = unused_product(flags);
+    let stored = match if may_reuse_unused(flags) { product_unchanged(flags.paths, product) }
+      else { None } {
+      None -> None,
+      Some(c) -> match bin::decode(c.value, unused_bin()) {
+        Ok(found) -> Some(found),
+        Err(_) -> None,
+      },
+    };
+    match stored {
+      Some(found) -> unused_output(style_of(flags), found),
+      None -> unused_from_sources(flags, product),
     }
   }
 
