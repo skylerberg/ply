@@ -15,9 +15,9 @@ that work. The compiler is written in Ply and compiles to C.
 scripts/bootstrap.sh --release
 ```
 
-This builds `target/release/ply`: cargo builds the runtime library, then `ply bootstrap` builds the
-rest. A fresh checkout downloads the latest release (`scripts/stage0.sh`) to run the first
-bootstrap. After an edit to Ply sources alone, cargo has nothing to rebuild.
+This builds `target/release/ply`: cargo builds the runtime library, then `packages/bootstrap`
+builds the rest. A fresh checkout downloads the latest release (`scripts/stage0.sh`) to run the
+first bootstrap. After an edit to Ply sources alone, cargo has nothing to rebuild.
 
 These environment variables help when working on `ply` itself:
 
@@ -36,6 +36,7 @@ These environment variables help when working on `ply` itself:
 | `packages/std` | the standard library; `prelude.ply` declares the builtins |
 | `packages/compiler` | the compiler, with one directory per phase (`syntax/`, `expand/`, `check/`, `front/`, `store/`, `emit/`); `build.main`, the entry point of the *builder* (the program that compiles the CLI to C); and `cc.ply` and `native.ply`, which run the C compiler and linker |
 | `packages/cli` | the `ply` command |
+| `packages/bootstrap` | the code that builds a new `ply` from a checkout, which runs inside the running `ply` |
 | `packages/testing` | test results, and the diagnosis of a failing test, which reports what differs between a passing run and the failing one |
 | `packages/proof` | the prover behind `ply prove` |
 | `packages/sim` | the search behind `simulate`, which runs the same program under many different orders of its concurrent tasks |

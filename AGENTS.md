@@ -12,13 +12,14 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   - `packages/std`: the standard library.
   - `packages/cli`: the command-line program.
   - `crates/ply-runtime`: the runtime, a static library that cargo builds.
-- `ply bootstrap` builds a new `ply` from a checkout in two steps. First, the `ply` you run compiles
-  the checkout's compiler into a program called the *builder*. Then the builder compiles the CLI to
-  C, and that C is linked with the runtime library.
-- `scripts/bootstrap.sh` does a full rebuild: cargo builds the runtime, and then the `ply` in
-  `target/` runs `ply bootstrap`. A fresh checkout has no `ply` yet, so for the first bootstrap the
-  script downloads the latest release (`scripts/stage0.sh`). Set `PLY_C_PHASES=1` to print how long
-  each step took.
+- `packages/bootstrap` builds a new `ply` from a checkout. The running `ply` compiles that package
+  and the checkout's compiler, and runs them inside itself on its own runtime, the way `ply run`
+  runs a program. They compile the CLI to C for the checkout's runtime, and that C is linked with
+  the runtime library. So C from one version of Ply is never linked with the Rust of another.
+- `scripts/bootstrap-with.sh` runs that bootstrap with a `ply` you name. `scripts/bootstrap.sh` does
+  a full rebuild: cargo builds the runtime, and then the `ply` in `target/` runs the bootstrap. A
+  fresh checkout has no `ply` yet, so for the first bootstrap the script downloads the latest
+  release (`scripts/stage0.sh`). Set `PLY_C_PHASES=1` to print how long each step took.
 - You need to build a new `ply` only when your edit changes what `ply` itself does. Inside a
   checkout, `ply` reads the `std.*` and `compiler.*` modules from the checkout's sources. So to
   check and test an edit to the compiler or the standard library, run `scripts/iterate.sh <package>
@@ -133,7 +134,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - CI is defined in `.github/workflows/ci.yml`. `.github/ci-shards.sh` lists the Ply test runs in CI
   (each runs `ply test` on one package) and which job runs each one.
 - A pull request bootstraps a new `ply` only when it changes the runtime's Rust code, `ply.work`, the
-  compiler, the CLI, a package listed in their manifests, or a file outside those packages that one
+  bootstrap, the compiler, the CLI, a package listed in their manifests, or a file outside those packages that one
   of them embeds. `std.prelude` is an example of such a file: the checker reads the builtins from
   its text (`compiler.prelude_source`). Other pull requests run their tests with the newest `ply`
   built on main, and that `ply` reads the rest of the standard library from the checkout's sources.
@@ -143,15 +144,16 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   standard library. The CLI's test suite tests the CLI. The programs those tests check and run use
   the standard library built into the `ply` binary, which is main's library when the pull request
   doesn't bootstrap.
-- CI bootstraps twice. First, the latest release builds the pull request's builder, and the builder
-  builds a new `ply`. Then that new `ply` builds itself again, reusing the first builder unless the
-  code that produces the builder changed. Because the release compiles the builder:
-  - The compiler, `std.prelude` and the standard library modules that the compiler imports (`grep
-    -rh '^import std' packages/compiler`, and the modules those import) can't use a language
-    feature added in the same pull request. The rest of `packages/std` can.
-  - The builder's command-line arguments, the way the runtime describes itself to the compiler, and
-    the layout of the data appended to a `ply` binary can change only in ways the release still
-    understands.
+- CI bootstraps twice. First, the latest release runs the pull request's bootstrap. Then the new
+  `ply` runs it again. The release compiles that code and runs it on its own runtime, so:
+  - The bootstrap, the compiler, `std.prelude` and the standard library modules they import (`grep
+    -rh '^import std' packages/bootstrap packages/compiler`, and the modules those import) can't use
+    a language feature or call a native function added in the same pull request. The rest of
+    `packages/std` can.
+  - `scripts/bootstrap-with.sh` can use only what the release's `ply hash` and `ply run` accept.
+  - Nothing else needs a step for the release. A runtime helper, a layout field, the way the runtime
+    describes itself and the layout of the data appended to a `ply` binary can all change in one
+    pull request.
 - A file under `packages/std` that isn't a `.ply` file is data that a standard library module embeds
   by its path (`embed("oid/names.txt")` in `oid.ply`). Every `ply` binary includes these files, so
   put test fixtures in `tests/std` instead.

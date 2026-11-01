@@ -34,6 +34,7 @@ ACTIONS=(
 )
 
 TOOLCHAIN_WORKSPACE=ply.work
+TOOLCHAIN_BOOTSTRAP=packages/bootstrap
 
 
 WORK=
@@ -477,7 +478,7 @@ cmd_c_compiler() {
 toolchain_inputs() {
   local scope=${1:-all} all prev dir rel file target
   all=$({
-    printf '%s\n' "$TOOLCHAIN_WORKSPACE"
+    printf '%s\n' "$TOOLCHAIN_WORKSPACE" "$TOOLCHAIN_BOOTSTRAP"
     [[ $scope == core ]] || role std
     role compiler
     role cli

@@ -27,10 +27,12 @@ if [ ! -x "$ply" ]; then
     fi
   fi
 fi
-runtime=$("$ply" work "$root" | awk '$1 == "runtime" { print $2 }')
+work=$("$ply" work "$root")
+runtime=$(awk '$1 == "runtime" { print $2 }' <<< "$work")
+library="$root/target/$dir/$(awk '$1 == "library" { print $2 }' <<< "$work")"
 cargo build --locked --quiet --manifest-path "$root/Cargo.toml" -p "$runtime" ${cargo[@]+"${cargo[@]}"}
-"$ply" bootstrap "$root" --profile "$profile" --out "$out" >&2
+"$root/scripts/bootstrap-with.sh" "$ply" "$profile" "$library" "$out" >&2
 if [ "$driving" = stage0 ]; then
-  "$out" bootstrap "$root" --profile "$profile" --out "$out" >&2
+  "$root/scripts/bootstrap-with.sh" "$out" "$profile" "$library" "$out" >&2
 fi
 echo "$out"

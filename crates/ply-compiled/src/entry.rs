@@ -239,6 +239,28 @@ pub fn enter(
     outcome
 }
 
+pub fn run_to_result(
+    opened: &Opened,
+    root: &str,
+    arguments: Vec<u8>,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, String> {
+    let run = Run {
+        timeout_ms,
+        ..Run::unbounded()
+    };
+    on_program_thread(
+        || match enter(opened, root, arguments, &run, None, None).ended {
+            Ended::Returned(bytes) => Ok(bytes),
+            Ended::Failed(diagnostic) => Err(diagnostic.to_string()),
+            Ended::Panicked(said) => Err(said),
+            Ended::NoRoot => Err(format!("the unit is entered at no root `{root}`")),
+            Ended::NotReturnable(reason) => Err(reason.to_string()),
+        },
+    )
+    .unwrap_or_else(|| Err(format!("`{root}` could not be given a thread")))
+}
+
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
 struct RunningTest {

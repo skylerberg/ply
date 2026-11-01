@@ -2502,7 +2502,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown, and `--digest` |
 | `ply doc NAME [path]` | for a definition: its signature, doc comment, clauses (the separate cases of its body), location, hash and the laws (the properties declared about it) that use it. For a type: its fields or variants and its functions. For an effect: its operations. For a module: its exports. |
-| `ply std` | the standard library's modules. `--show [NAME]` prints a module's source; `--digest`. `--answers DIR` and `--answering` are options that only `ply bootstrap` passes to `ply std`; do not use them yourself. |
+| `ply std` | the standard library's modules. `--show [NAME]` prints a module's source; `--digest`. `--answers DIR` and `--answering` are options that only the bootstrap passes to `ply std`; do not use them yourself. |
 | `ply explain CODE` | what a diagnostic code means; `--all` lists every code |
 | `ply fmt [paths]` | formats files in place; `--check` changes nothing and exits 1 if a file would change; `--json` needs `--check` |
 | `ply rename --map FILE [paths]` | renames definitions, variables, fields, operations and modules (§17.6) |
@@ -2523,7 +2523,6 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |
-| `ply bootstrap [checkout]` | builds `ply` from a checkout of this repository. `--profile development\|release` chooses the build profile, `--runtime LIBRARY` links the runtime library at `LIBRARY` instead of the one the checkout builds, `--out PATH` sets where the new `ply` is written, and `--identity` builds a `ply` that is identical to the one doing the build |
 
 ### 17.4 Reusing results
 
