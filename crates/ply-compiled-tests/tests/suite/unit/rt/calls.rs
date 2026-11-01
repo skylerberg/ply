@@ -218,14 +218,14 @@ fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
         helper::<Left>("rt_scheduler_left"),
     );
     let mine = boxed(c, 1);
-    let before = ctx.heap.allocated();
+    let before = ctx.live();
     let outer = unsafe { entered(c) };
     let inner = unsafe { entered(c) };
     let theirs = boxed(c, 2);
     unsafe { left(c, inner) };
     let nested = boxed(c, 3);
     assert_eq!(
-        ctx.heap.allocated(),
+        ctx.live(),
         before,
         "a nested entry leaves the scheduler running"
     );

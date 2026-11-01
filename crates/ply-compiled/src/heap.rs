@@ -228,8 +228,8 @@ pub struct Heap {
     /// The native objects whose contents the end drops, each block's [`LISTED_AT`] its index here.
     natives: Vec<*mut Obj>,
     persistent: bool,
-    /// Whether the scheduler's own work runs: the blocks it makes are its own, and neither the
-    /// program's counts nor its live blocks count them.
+    /// Whether the scheduler's own work runs: the program's live blocks do not count the blocks it
+    /// makes.
     scheduling: bool,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
@@ -244,7 +244,7 @@ pub struct Heap {
 pub struct Alloc {
     /// The pages of the heap's blocks being filled, by class.
     pub(crate) blocks: *mut Filling,
-    /// Blocks the program allocated since the last reset.
+    /// A word no code reads, where the release's compiler lays this struct out with one.
     pub(crate) count: usize,
     /// Nonzero while every block goes through the runtime: while the scheduler's own work runs, and
     /// under `PLY_HEAP_POISON` or `PLY_HEAP_DELAY`, which the runtime alone keeps.
@@ -503,7 +503,6 @@ impl Heap {
             self.natives.push(o);
         }
         self.delayed.extend(other.delayed.drain(..));
-        self.alloc.count += other.alloc.count;
     }
 
     /// `blocks` in place of the blocks this heap takes from, which it returns.
@@ -542,19 +541,9 @@ impl Heap {
         self.blocks.held()
     }
 
-    /// Blocks allocated since the last reset.
-    pub fn allocated(&self) -> usize {
-        self.alloc.count
-    }
-
     /// How many live blocks the program made, the scheduler's own not among them.
     pub(crate) fn program_live(&self) -> usize {
         program_live_in(&self.blocks)
-    }
-
-    /// Allocations that took a dead block rather than fresh memory.
-    pub fn recycled(&self) -> usize {
-        self.blocks.reused()
     }
 
     /// How many native objects the table lists: what a leak of them grows.
@@ -603,9 +592,6 @@ impl Heap {
                 made_by_scheduler: self.scheduling,
             })
         };
-        if !self.scheduling {
-            self.alloc.count += 1;
-        }
         p
     }
 
@@ -628,7 +614,6 @@ impl Heap {
         }
         self.drop_natives();
         self.blocks.reset();
-        self.alloc.count = 0;
         self.delayed.clear();
     }
 }

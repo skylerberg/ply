@@ -983,8 +983,11 @@ whenever that cannot change the result. The checker allows a block only when no 
 another reads or writes (`E0309`, §7.2), so a block is as deterministic as its branches.
 
 - If several branches fail, the leftmost failure is the block's.
-- Branches whose operations could go to a `handle` around the block, or to a `simulate` block,
-  run one after another, with the same result.
+- Branches may perform operations that a `handle` around the block handles, and still run at the
+  same time, when that `handle` has no `var` and each clause reached returns without `resume`,
+  captures nothing and performs only through handlers of the same kind. Host handlers are written
+  this way. Under any other `handle`, or under a `simulate` block, the branches run one after
+  another, with the same result.
 - A branch may not spawn a task or open a `simulate` block (`E0309`), and may not use `?`.
 
 `std.parallel` splits a list across nested blocks.
@@ -2312,6 +2315,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply hash [path]` | each definition's hash; `--dependencies` adds what each refers to |
 | `ply definitions [path]` | every definition: location, hash, signature, effects and references; `--filter` |
 | `ply callers DEF [path]` | what refers to a definition, and every definition, test and law that depends on it |
+| `ply unused [path]` | `--workspace`, `--json`: definitions nothing uses, and those only tests and laws use; in a package with `main`, `pub` does not count as a use, and a leading `_` opts a name out. Under `--workspace`, every package `ply.work` names is judged together, except the standard library |
 | `ply resolve [path]` | writes `ply.lock`, downloading registry dependencies |
 | `ply vendor [path]` | copies dependencies into `vendor/` |
 | `ply why NAME [path]` | why a package is a dependency |
@@ -2398,15 +2402,6 @@ what would change without writing.
 its byte range. `ply replace NAME --with FILE` replaces exactly that range with a formatted
 definition of the same kind and name, leaving the rest of the file alone. It writes nothing unless
 the program still checks and no other definition's name or hash changes (`E0128`).
-
-### 17.8 Measuring allocation
-
-The runtime of every Ply program, `ply` included, reads these flags and removes them before the
-program sees its arguments:
-
-- `--count-allocations=PATH` writes how many objects and bytes the program allocated.
-- `--count-allocation-sites=PATH` also writes where allocations came from, sampled.
-- `--count-allocation-sites-exact=PATH` records every allocation's site: exact, and slower.
 
 ## 18. Diagnostics
 

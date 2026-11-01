@@ -17,6 +17,8 @@
 #                                each path a bootstrap reads Ply from, one a line,
 #                                which the toolchain key hashes; with `core`, of
 #                                the standard library only what the rest embeds
+#   ci-shards.sh c-compiler      the C compiler a bootstrap compiles with, which the
+#                                toolchain key hashes: `clang`, or `cc` in a cold run
 #   ci-shards.sh work ROLE       each path `ply.work` gives ROLE (`ply work`), one a
 #                                line
 #   ci-shards.sh store-paths     where the runs keep their stores, one pattern a
@@ -75,8 +77,8 @@ CLI_PARTS=4
 RUNS_ALONE=(package-compiler)
 # Modules no pull request runs, which the `nightly` job does, as `role:module` with the role
 # `ply.work` gives their suite: minutes each, the repository audit checking packages cold and the copies
-# audit listing every one, or against a postgres they start.
-NIGHTLY=(cli-tests:repository_audit cli-tests:copies std-tests:db_driver std-tests:pg_client)
+# audit listing every one, or against a postgres they start, or random edit sessions drawn anew each day.
+NIGHTLY=(cli-tests:repository_audit cli-tests:copies cli-tests:edit_sessions std-tests:db_driver std-tests:pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
@@ -612,6 +614,12 @@ lexical() {
 # of those names by path, and theirs. With `core`, all of these but the library's tree, and with them
 # each file they embed from outside themselves, as the compiler embeds the prelude whose text the
 # checker reads builtins from.
+# Clang compiles a bootstrap's C faster. A cold run keeps `cc`, which is what `ply` runs for most
+# Linux users, so a bug that only gcc shows still fails a run.
+cmd_c_compiler() {
+  if [[ ${PLY_CI_COLD:-} == true ]]; then echo cc; else echo clang; fi
+}
+
 toolchain_inputs() {
   local scope=${1:-all} all prev dir rel file target
   all=$({
@@ -1190,6 +1198,7 @@ case "${1:-}" in
     cmd_actions
     ;;
   toolchain-inputs) toolchain_inputs "${2:-all}" ;;
+  c-compiler) cmd_c_compiler ;;
   work) role "${2:?a role}" ;;
   store-paths) cmd_store_paths ;;
   ply-trees) cmd_ply_trees ;;
@@ -1204,7 +1213,7 @@ case "${1:-}" in
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) nightly_of "${2:?a role}" | paste -sd ' ' - ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2
     ;;
 esac

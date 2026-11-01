@@ -239,13 +239,12 @@ unsafe fn unlink(list: &mut *mut Page, page: *mut Page) {
 
 /// A block the page has on hand, or null: a dead one first, then one never handed out.
 #[inline]
-unsafe fn pop(page: *mut Page, reused: &mut usize) -> *mut u8 {
+unsafe fn pop(page: *mut Page) -> *mut u8 {
     unsafe {
         let block = (*page).free;
         if !block.is_null() {
             (*page).free = *link(block);
             (*page).live += 1;
-            *reused += 1;
             return block;
         }
         let block = (*page).fresh;
@@ -325,7 +324,7 @@ pub(crate) struct Filling {
     pub(crate) pages: [*mut Page; CLASSES],
     /// The heap's name, which each page it owns holds as its owner.
     pub(crate) name: *const Returned,
-    /// Blocks handed out that had held an object before.
+    /// A word no code reads, where the release's compiler lays this struct out with one.
     pub(crate) reused: usize,
 }
 
@@ -398,7 +397,7 @@ impl Blocks {
             let class = class_of(bytes);
             let page = self.filling.pages[class];
             if !page.is_null() {
-                let block = pop(page, &mut self.filling.reused);
+                let block = pop(page);
                 if !block.is_null() {
                     return block;
                 }
@@ -421,7 +420,7 @@ impl Blocks {
                     push(&mut self.filling.pages[class], page);
                     continue;
                 }
-                let block = pop(page, &mut self.filling.reused);
+                let block = pop(page);
                 if !block.is_null() {
                     return block;
                 }
@@ -657,11 +656,6 @@ impl Blocks {
         self.segments.len() * SEGMENT
     }
 
-    /// Blocks handed out that had held an object before.
-    pub fn reused(&self) -> usize {
-        self.filling.reused
-    }
-
     /// Takes over everything `other` holds: its blocks are this heap's from here on, and its pages
     /// with no live block are kept, let go or given back as this heap's own would be.
     pub fn adopt(&mut self, mut other: Blocks) {
@@ -701,7 +695,6 @@ impl Blocks {
             other.quiet();
             self.segments.append(&mut other.segments);
             self.large.append(&mut other.large);
-            self.filling.reused += other.filling.reused;
             self.regain(other.name());
         }
     }
@@ -738,7 +731,6 @@ impl Blocks {
             });
             *self.returned = Returned::default();
             self.filling.pages = [null_mut(); CLASSES];
-            self.filling.reused = 0;
             self.spare = null_mut();
             self.spares = 0;
             self.clean = null_mut();

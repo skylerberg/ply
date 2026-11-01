@@ -3,8 +3,8 @@ import compiler.emit.layout (MachineStruct, MachineField, head_structs, text_hea
                              tag_bits, header_bytes, frame_count)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Machine, natives, machine_structs, object_struct, context_struct,
-                          release_depth, failed_target, failed_pending, heap_instance_layout,
-                          unwinding_words)
+                          release_depth, failed_target, failed_pending, evidence_one_slot,
+                          evidence_shared, heap_instance_layout, unwinding_words)
 import compiler.emit.typed_ir.handling (raise_offset, task_offset)
 import compiler.emit.roots (builtin_helper)
 import compiler.cc (runtime_part_mark)
@@ -23,6 +23,8 @@ import compiler.emit.print.ownership (walk_helpers, persistent_copy_fn, fresh_bl
                                       mark_shared_fn)
 import compiler.emit.print.wide (wide_helpers)
 import compiler.emit.print.decimal (decimal_helpers)
+import compiler.emit.print.failures (failures_declared, failures_defined)
+import compiler.emit.print.encoded (encoders_declared, encoders_defined)
 
 pub fn unit_header() -> Bytes / {abort.raise} =
   Bytes::concat_all([
@@ -152,6 +154,8 @@ fn header_part() -> Bytes =
   Bytes::concat_all([
     b"\n",
     structs(),
+    failures_declared(),
+    encoders_declared(),
     helpers(),
     wide_helpers(),
     decimal_helpers(),
@@ -171,11 +175,16 @@ fn entries_defined() -> Bytes =
     ascii_of_int(failed_target()),
     b"\n#define PLY_FAILED_PENDING ",
     ascii_of_int(failed_pending()),
+    b"\n#define PLY_EVIDENCE_ONE_SLOT ",
+    ascii_of_int(evidence_one_slot()),
+    b"\n#define PLY_EVIDENCE_SHARED ",
+    ascii_of_int(evidence_shared()),
     b"\n",
     b"typedef Word (*PlyEntry)(PlyCtx *, Word, Word, Word, Word, Word);\n",
+    b"static inline Word ply_evidence_flags(Word w) { return *(const Word *)(intptr_t)w; }\n",
     b"static inline const Word *ply_slot(Word w, int64_t k) {\n",
     b"  const Word *o = (const Word *)(intptr_t)w;\n",
-    b"  return o + 1 + 2 * (o[0] ? 0 : k);\n",
+    b"  return o + 1 + 2 * (o[0] & PLY_EVIDENCE_ONE_SLOT ? 0 : k);\n",
     b"}\n",
     b"static inline Word ply_perform(PlyCtx *ctx, Word w, int64_t k, Word op, Word mode, Word res, Word args) {\n",
     b"  const Word *s = ply_slot(w, k);\n",
@@ -384,7 +393,7 @@ fn byte_texts_declared() -> Bytes =
     b"(PlyCtx *ctx, int64_t b) { (void)ctx; return (Word)(intptr_t)&ply_byte_texts[b]; }\n",
   ])
 
-fn tail_part() -> Bytes =
+fn tail_part() -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"const PlyByteText ply_byte_texts[256] = {\n",
     Bytes::concat_all(
@@ -396,6 +405,8 @@ fn tail_part() -> Bytes =
         ])),
     ),
     b"};\n",
+    failures_defined(),
+    encoders_defined(),
   ])
 
 fn shared_sequences() -> Bytes =
@@ -564,13 +575,12 @@ fn allocation() -> Bytes = {
     b"    unsigned char *b = 0;\n",
     b"    if (p && p->free) { b = p->free; p->free = *(unsigned char **)(b + ",
     link,
-    b"); f->reused += 1; }\n",
+    b"); }\n",
     b"    else if (p && (uint64_t)(p->end - p->fresh) >= p->block) { b = p->fresh; p->fresh = b + p->block; }\n",
     b"    if (b) {\n",
     b"      p->live += 1;\n",
     b"      ((PlyObj *)b)->rc = 1;\n",
     b"      ((PlyObj *)b)->made_by_scheduler = 0;\n",
-    b"      a->count += 1;\n",
     b"      return (Word)(intptr_t)b;\n",
     b"    }\n",
     b"  }\n",
@@ -611,6 +621,14 @@ fn allocation() -> Bytes = {
     b"  ",
     call_text(runtime_free_fn(), [b"ctx", b"o", b"bytes"]),
     b";\n",
+    b"}\n",
+    b"static inline Word ply_two_words(PlyCtx *ctx, Word lo, Word hi) {\n",
+    b"  Word o = ",
+    call_text(alloc_fn(), [b"ctx", b"PLY_HEADER + 16"]),
+    b";\n",
+    b"  ply_words(o)[0] = lo;\n",
+    b"  ply_words(o)[1] = hi;\n",
+    b"  return o;\n",
     b"}\n",
   ])
 }
@@ -735,9 +753,8 @@ test "a small block is taken from its class's page and given back to its page in
   let free = body(free_fn());
   assert(calls(alloc, alloc_block_fn()) && calls(free, runtime_free_fn()), None);
   assert(
-    [b"f->pages[size >> 3]", b"a->count += 1;", b"made_by_scheduler = 0;", b"!a->slow"].all(
-      |part: Bytes| alloc.index_of(part) != None,
-    ),
+    [b"f->pages[size >> 3]", b"made_by_scheduler = 0;", b"!a->slow"].all(|part: Bytes|
+      alloc.index_of(part) != None),
     Some(String::of_bytes_lossy(alloc)),
   );
   assert(

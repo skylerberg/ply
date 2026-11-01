@@ -249,12 +249,7 @@ impl Launched {
 }
 
 /// Enter the program on the command's own big-stack thread, granted every family.
-pub fn run(
-    program: Program,
-    root: &Path,
-    argv: Vec<String>,
-    count: Option<crate::count::Asked>,
-) -> Launched {
+pub fn run(program: Program, root: &Path, argv: Vec<String>) -> Launched {
     ply_compiled::c::sweep::once();
     ply_privileged::binder::install();
     let definitions = program.definitions;
@@ -272,26 +267,7 @@ pub fn run(
     let work = std::thread::Builder::new()
         .name("ply".to_string())
         .stack_size(ply_compiled::rt::PROGRAM_STACK)
-        .spawn(move || {
-            let launch = || entered(&entry, &grants);
-            match count {
-                Some(asked) => {
-                    let (launched, counted, sites) =
-                        crate::count::window_sampled(launch, asked.every());
-                    // The entry's result stands: the run happened, and a count that could not
-                    // be written is reported rather than replacing what the program did.
-                    if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
-                    {
-                        eprintln!(
-                            "the allocation count could not be written to {}: {e}",
-                            asked.path.display()
-                        );
-                    }
-                    launched
-                }
-                None => launch(),
-            }
-        });
+        .spawn(move || entered(&entry, &grants));
     match work {
         Ok(thread) => match thread.join() {
             Ok(launched) => {
@@ -379,4 +355,3 @@ fn placed(d: &Diagnostic, opened: &Opened) -> String {
 }
 
 pub mod code;
-pub mod count;
