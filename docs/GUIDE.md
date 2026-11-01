@@ -2326,7 +2326,6 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |
-| `ply bootstrap [checkout]` | builds `ply` from a checkout of this repository: `--profile development\|release`, `--runtime LIBRARY`, `--out PATH`, `--identity` |
 
 ### 17.4 Reusing results
 

@@ -325,6 +325,30 @@ pub fn enter(
     outcome
 }
 
+/// What `root` of `opened` returns for `arguments`, the PLV1 list it reads, within `timeout_ms` of
+/// wall clock, or why it returned nothing a run can hold.
+pub fn run_to_result(
+    opened: &Opened,
+    root: &str,
+    arguments: Vec<u8>,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, String> {
+    let run = Run {
+        timeout_ms,
+        ..Run::unbounded()
+    };
+    on_program_thread(
+        || match enter(opened, root, arguments, &run, None, None).ended {
+            Ended::Returned(bytes) => Ok(bytes),
+            Ended::Failed(diagnostic) => Err(diagnostic.to_string()),
+            Ended::Panicked(said) => Err(said),
+            Ended::NoRoot => Err(format!("the unit is entered at no root `{root}`")),
+            Ended::NotReturnable(reason) => Err(reason.to_string()),
+        },
+    )
+    .unwrap_or_else(|| Err(format!("`{root}` could not be given a thread")))
+}
+
 /// What `enter` returns, run on a thread of its own with a program's stack, so how deeply an entry
 /// may nest does not hang on what its caller left of its own stack: `None` where no thread could be
 /// made or the work unwound.

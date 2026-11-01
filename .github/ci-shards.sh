@@ -10,7 +10,7 @@
 #                                run is one a later run reads and no job needs,
 #                                every action a workflow uses is one listed with
 #                                the cache entries it saves, and every file the
-#                                trees `ply bootstrap` reads embed is in one
+#                                trees a bootstrap reads embed is in one
 #   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads,
 #                                of what `supersede` deletes and of the actions
 #   ci-shards.sh toolchain-inputs [core]
@@ -118,6 +118,8 @@ ACTIONS=(
 
 # The file that says where a bootstrap reads a checkout's parts (`toolchain_inputs`).
 TOOLCHAIN_WORKSPACE=ply.work
+# The package that builds `ply`, which no part of `ply` imports.
+TOOLCHAIN_BOOTSTRAP=packages/bootstrap
 
 
 # What `ply work` prints of this checkout's `ply.work`, a role and a path a line, read once by the
@@ -623,7 +625,7 @@ cmd_c_compiler() {
 toolchain_inputs() {
   local scope=${1:-all} all prev dir rel file target
   all=$({
-    printf '%s\n' "$TOOLCHAIN_WORKSPACE"
+    printf '%s\n' "$TOOLCHAIN_WORKSPACE" "$TOOLCHAIN_BOOTSTRAP"
     [[ $scope == core ]] || role std
     role compiler
     role cli

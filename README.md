@@ -15,9 +15,9 @@ that work. The compiler is written in Ply and compiles to C.
 scripts/bootstrap.sh --release
 ```
 
-This builds `target/release/ply`: cargo builds the runtime library, then `ply bootstrap` builds the
-rest. A fresh checkout downloads the latest release (`scripts/stage0.sh`) to run the first
-bootstrap. After an edit to Ply sources alone, cargo has nothing to rebuild.
+This builds `target/release/ply`: cargo builds the runtime library, then `packages/bootstrap`
+builds the rest. A fresh checkout downloads the latest release (`scripts/stage0.sh`) to run the
+first bootstrap. After an edit to Ply sources alone, cargo has nothing to rebuild.
 
 These environment variables help when working on `ply` itself:
 
@@ -34,8 +34,9 @@ These environment variables help when working on `ply` itself:
 | --- | --- |
 | `ply.work` | where each package is, and which packages make up `ply`; `ply work` prints it |
 | `packages/std` | the standard library; `prelude.ply` declares the builtins |
-| `packages/compiler` | the compiler, a directory per phase (`syntax/`, `expand/`, `check/`, `front/`, `store/`, `emit/`), the builder's entry point (`build.main`), and the code that runs the C compiler and linker (`cc.ply`, `native.ply`) |
+| `packages/compiler` | the compiler, a directory per phase (`syntax/`, `expand/`, `check/`, `front/`, `store/`, `emit/`), what builds a program (`build.build_program`), and the code that runs the C compiler and linker (`cc.ply`, `native.ply`) |
 | `packages/cli` | the `ply` command |
+| `packages/bootstrap` | what builds a new `ply` from a checkout, run inside the running `ply` |
 | `packages/testing` | test results, and the diagnosis of a failure: what changed under the failing test |
 | `packages/proof` | the prover behind `ply prove` |
 | `packages/sim` | the search over task interleavings behind `simulate` |
