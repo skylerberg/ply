@@ -1,42 +1,21 @@
-//! A Ply program that reaches a real socket.
-
-// --- The boundary -----------------------------------------------------------
-
-// The declaration `ply_host::tcp` registers against, imported rather than copied.
 import std.net (net, send_all)
-// Twice: the selective import binds the effect, and the plain one the module `config::` names.
 import std.config
 import std.config (config)
 
-// --- Requests ---------------------------------------------------------------
-
 type Request = { method: Bytes, target: Bytes, version: Bytes }
 
-type Parsed =
-  | Complete(Request)
-  /// The head has not ended.
-  | Incomplete
-  /// The reason, in a sentence.
-  | Malformed(String)
+type Parsed = | Complete(Request) | Incomplete | Malformed(String)
 
-/// The most head this endpoint will hold.
 fn max_head() -> Int = 2048
 
-// Every scan here is a native byte builtin, and that is the whole of W2's change to this file.
-
-/// The index of the first byte of `set` at or after `from`, or `hay.len()` when there is none.
 fn index_of(hay: Bytes, set: Bytes, from: Int) -> Int / {abort.raise} =
   hay.scan_until(from, set, hay.len())
 
-/// The index just past the first CRLF CRLF, or -1 while the head is unfinished.
 fn head_end(head: Bytes) -> Int =
   match head.index_of(b"\r\n\r\n") { Some(at) -> at + 4, None -> -1 }
 
-/// A complement scan: it stops at the first byte that is *not* in the class, so a method of only
-/// uppercase letters is one where it ran to the end.
 fn all_upper(b: Bytes) -> Bool = b.scan(0, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ", b.len()) == b.len()
 
-/// Bytes throughout, never `String`.
 fn parse(head: Bytes) -> Parsed / {abort.raise} = {
   if head_end(head) < 0 { Incomplete } else {
     let lf = index_of(head, b"\n", 0);
@@ -45,17 +24,21 @@ fn parse(head: Bytes) -> Parsed / {abort.raise} = {
   }
 }
 
-/// Absent is the line's length rather than `-1`, so each start below is already in `0..=len` and
-/// `Bytes::scan_until` never has to reject one.
 fn request_line(line: Bytes) -> Parsed / {abort.raise} = {
   let len = line.len();
-  let sp1 = index_of(line, b" ", 0);
-  if sp1 >= len { Malformed("a request line is `METHOD TARGET VERSION`") } else {
-    let sp2 = index_of(line, b" ", sp1 + 1);
-    if sp2 >= len { Malformed("a request line is `METHOD TARGET VERSION`") }
-    else if index_of(line, b" ", sp2 + 1) < len {
-      Malformed("a request line holds exactly two spaces")
-    } else { parts(line.slice(0, sp1), line.slice(sp1 + 1, sp2), line.slice(sp2 + 1, len)) }
+  let first_space = index_of(line, b" ", 0);
+  if first_space >= len { Malformed("a request line is `METHOD TARGET VERSION`") } else {
+    let second_space = index_of(line, b" ", first_space + 1);
+    if second_space >= len { Malformed("a request line is `METHOD TARGET VERSION`") }
+    else if index_of(line, b" ", second_space + 1) < len {
+      Malformed("a request line must contain exactly two spaces")
+    } else {
+      parts(
+        line.slice(0, first_space),
+        line.slice(first_space + 1, second_space),
+        line.slice(second_space + 1, len),
+      )
+    }
   }
 }
 
@@ -68,9 +51,6 @@ fn parts(method: Bytes, target: Bytes, version: Bytes) -> Parsed =
     Malformed("the version must be HTTP/1.1 or HTTP/1.0")
   } else { Complete({ method: method, target: target, version: version }) }
 
-// --- Responses --------------------------------------------------------------
-
-/// `Content-Length` counts bytes, and a client reads it to know where the body ends.
 fn response(status: String, body: String) -> Bytes =
   Bytes::of_string(
     "HTTP/1.1 " ++ status ++ "\r\n" ++ "Content-Type: text/plain; charset=utf-8\r\n"
@@ -84,7 +64,6 @@ fn response(status: String, body: String) -> Bytes =
 
 fn greeting() -> String = "hello from ply\n"
 
-/// The endpoint, in one pure function: bytes in, bytes out.
 fn result(head: Bytes) -> Bytes / {abort.raise} =
   match parse(head) {
     Complete(_) -> response("200 OK", greeting()),
@@ -92,16 +71,10 @@ fn result(head: Bytes) -> Bytes / {abort.raise} =
     Malformed(reason) -> response("400 Bad Request", reason ++ "\n"),
   }
 
-// --- The server -------------------------------------------------------------
-
-/// How many chunks the endpoint will take before it gives up on a head that never ends.
 fn max_chunks() -> Int = 16
 
-/// Written down rather than defaulted, because `timeout_ms <= 0` is a runtime error and a caller
-/// that wants no deadline has to write a large number where a reader can see it.
 fn deadline_ms() -> Int = 5000
 
-/// Read until the head ends, the peer stops talking, or one of those two bounds is reached.
 fn read_head(c: Int, so_far: Bytes, chunks_left: Int) -> Bytes / {net.recv[conn]} =
   if chunks_left <= 0 || head_end(so_far) >= 0 || so_far.len() >= max_head() { so_far } else {
     match net.recv[conn](c, max_head(), deadline_ms()) {
@@ -111,14 +84,12 @@ fn read_head(c: Int, so_far: Bytes, chunks_left: Int) -> Bytes / {net.recv[conn]
     }
   }
 
-/// One connection, start to finish.
 fn serve_one(c: Int) -> Unit / {net.close[conn], net.recv[conn], net.send[conn], abort.raise} = {
   let response = result(read_head(c, b"", max_chunks()));
   send_all[conn](c, response, deadline_ms());
   net.close[conn](c)
 }
 
-/// Accept `count` connections, respond to each, and stop.
 fn serve(
   server: Int,
   count: Int,
@@ -128,8 +99,6 @@ fn serve(
     1 + serve(server, count - 1)
   }
 
-/// The listener is closed rather than left to the process exiting, so the port is released at a
-/// point in the program rather than at a point in the runtime.
 fn listen_and_serve(
   port: Int,
   count: Int,
@@ -140,14 +109,10 @@ fn listen_and_serve(
   served
 }
 
-// --- The settings -----------------------------------------------------------
-
-/// Settings rather than definitions, so a run chooses them: `--set HELLO_PORT=8081`.
 fn port() -> Int / {config.get[server], abort.raise} = setting("HELLO_PORT", 8080)
 
 fn connections() -> Int / {config.get[server], abort.raise} = setting("HELLO_CONNECTIONS", 64)
 
-/// Unset, a setting keeps its default; one that is not a whole number stops the run.
 fn setting(key: String, unset: Int) -> Int / {config.get[server], abort.raise} =
   match config.get[server](key) {
     None -> unset,
@@ -157,20 +122,14 @@ fn setting(key: String, unset: Int) -> Int / {config.get[server], abort.raise} =
     },
   }
 
-/// Digits and nothing else: neither a port nor a number of connections is negative.
 fn whole(text: String) -> Option<Int> = {
   let b = Bytes::of_string(text);
   if b.len() == 0 || b.scan(0, b"0123456789", b.len()) < b.len() { None }
   else { match Decimal::of_string(text) { Some(d) -> Int::of_decimal(d, Down), None -> None } }
 }
 
-// --- The entry point --------------------------------------------------------
-
-/// One of the three `main`s under `examples/`: this one, `service.ply`'s and `shout.ply`'s.
 fn main() -> Int / {config.get[server], net.close[conn], net.recv[conn], net.send[conn], net.accept[listener], net.close[listener], net.listen[listener], abort.raise} =
   listen_and_serve(port(), connections())
-
-// --- The simulated socket ---------------------------------------------------
 
 fn first_chunk(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -> b"" }
 
@@ -189,8 +148,6 @@ fn reason(head: Bytes) -> String / {abort.raise} =
     Complete(_) -> "complete",
   }
 
-// --- Tests: the parser ------------------------------------------------------
-
 test "a well-formed request line is split into its three parts" {
   assert_eq(parse(get_root()), Complete({ method: b"GET", target: b"/", version: b"HTTP/1.1" }));
   assert_eq(
@@ -199,7 +156,7 @@ test "a well-formed request line is split into its three parts" {
   )
 }
 
-test "a head is incomplete until CRLF CRLF, whatever has arrived so far" {
+test "a request head is incomplete until a blank line (CRLF CRLF) arrives, however much else has arrived" {
   assert_eq(head_end(b""), -1);
   assert_eq(head_end(b"GET / HTTP/1.1\r\n"), -1);
   assert_eq(head_end(b"GET / HTTP/1.1\r\n\r"), -1);
@@ -213,9 +170,12 @@ test "a head ends at the first blank line and not at a later one" {
   assert_eq(parse(two), Complete({ method: b"GET", target: b"/", version: b"HTTP/1.1" }))
 }
 
-test "every way of malforming a request line names itself" {
+test "each kind of malformed request line gives its own error message" {
   assert_eq(reason(b"GET /\r\n\r\n"), "a request line is `METHOD TARGET VERSION`");
-  assert_eq(reason(b"GET / HTTP/1.1 extra\r\n\r\n"), "a request line holds exactly two spaces");
+  assert_eq(
+    reason(b"GET / HTTP/1.1 extra\r\n\r\n"),
+    "a request line must contain exactly two spaces",
+  );
   assert_eq(reason(b" / HTTP/1.1\r\n\r\n"), "a method is one or more uppercase ASCII letters");
   assert_eq(reason(b"get / HTTP/1.1\r\n\r\n"), "a method is one or more uppercase ASCII letters");
   assert_eq(
@@ -231,8 +191,6 @@ test "every way of malforming a request line names itself" {
   assert_eq(reason(b"GET / HTTP/1.1\n\r\n\r\n"), "the request line must end with CRLF")
 }
 
-// The peer chooses the bytes, so the parser has to survive every one of them rather than the ones a
-// test author would think to write.
 test "a target that is not UTF-8 is rejected rather than decoded" {
   assert_eq(
     reason(b"GET \xff\xfe HTTP/1.1\r\n\r\n"),
@@ -251,7 +209,7 @@ test "an empty head and a head of blank lines are both rejected" {
   assert_eq(reason(b"\r\n\r\n\r\n"), "a request line is `METHOD TARGET VERSION`")
 }
 
-test "the response to a request with a body comes from its head alone" {
+test "a request with a body is complete once its head has arrived, and the body is not needed" {
   let posted = b"POST /orders HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
   assert_eq(head_end(posted), 44);
   assert_eq(reason(posted), "complete")
@@ -265,19 +223,16 @@ test "a response declares the byte length of its body, not its character count" 
     ),
   );
 
-  // Three characters, six bytes, and a client reads the second number.
   assert_eq(Bytes::of_string("ééé").len(), 6);
   assert_eq(response("200 OK", "ééé").len(), response("200 OK", "abcdef").len())
 }
 
-test "a good head gets a 200 response and every bad one a 400" {
+test "a valid request head gets a 200 response and each invalid request head gets a 400 response" {
   assert_eq(result(get_root()), ok());
   assert_eq(result(b"GET / HTTP/1.1\r\n"), bad("the request head never ended"));
   assert_eq(result(b"GET / HTTP/9\r\n\r\n"), bad("the version must be HTTP/1.1 or HTTP/1.0"));
   assert_eq(result(b""), bad("the request head never ended"))
 }
-
-// --- Tests: the server, over the simulated socket ---------------------------
 
 test "the simulated socket responds to a well-formed request with the fixed 200" {
   let outbox = handle {
@@ -303,8 +258,6 @@ test "the simulated socket responds to a well-formed request with the fixed 200"
   assert_eq(outbox, [ok()])
 }
 
-// The case a single `recv` would have passed and a real network would have failed: the head arrives
-// in three pieces, one of them splitting the version token, and the terminator only in the last.
 test "a request split across packets is read to its terminator" {
   let got = handle {
     serve_one(3)
@@ -352,7 +305,6 @@ test "a malformed request gets a 400 response and the connection is closed" {
   assert_eq(got.closed, 1)
 }
 
-// A peer that opens a connection and goes away.
 test "a peer that says nothing gets a 400 rather than a hung thread" {
   let outbox = handle {
     serve_one(3)
@@ -374,8 +326,6 @@ test "a peer that says nothing gets a 400 rather than a hung thread" {
   assert_eq(outbox, [bad("the request head never ended")])
 }
 
-// The bound has to hold against a peer that never stops and never finishes, because W1 cannot
-// cancel one.
 test "a head that never ends stops after `max_chunks` and gets a 400 response" {
   let got = handle {
     serve_one(3)
@@ -429,9 +379,7 @@ test "serving no connections opens a listener and touches no socket" {
   }
 }
 
-// --- Tests: the settings ----------------------------------------------------
-
-test "the settings choose the port and the count, and an unset one keeps its default" {
+test "settings choose the port and the connection count, and an unset setting uses its default" {
   let given = config::values(
     [{ key: "HELLO_PORT", value: "8081" }, { key: "HELLO_CONNECTIONS", value: "1" }],
     [],

@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# scripts/bootstrap-with.sh DRIVER PROFILE LIBRARY OUT: builds this checkout's `ply` at OUT by running
-# the checkout's bootstrap inside the `ply` DRIVER, on DRIVER's own runtime, so the checkout's
-# compiler writes `ply`'s C for the runtime's library at LIBRARY. A program cannot ask what it is made
-# of, so `ply hash` lists that for it; `ply run` then reuses the front end `ply hash` ran. All DRIVER
-# needs is `hash` and `run`.
 set -euo pipefail
 if [ $# -ne 4 ]; then
   echo "usage: scripts/bootstrap-with.sh DRIVER PROFILE LIBRARY OUT" >&2

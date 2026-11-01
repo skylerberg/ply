@@ -17,7 +17,7 @@ import compiler.emit.keys (RootKey, Named, Generated, Law, Clause, Order, Reflec
 import compiler.emit.pieces (Piece, Hole, ConstructorTag, FieldName, LambdaEntry, pieces_text,
                              body_text, own_symbol)
 import compiler.emit.typed_ir
-import compiler.emit.typed_ir (Fn, Lambda, Closure)
+import compiler.emit.typed_ir (Function, Lambda, Closure)
 import compiler.emit.evidence (declared_arity)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticStruct, RawWord, EntryWord,
                                        named_by_content, entries_of)
@@ -26,7 +26,7 @@ import compiler.emit.lower.module_context (ModuleContext, Root, param_type)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.release (release_needs)
 import compiler.emit.verify (ownership_fault)
-import compiler.emit.print (printed_fn)
+import compiler.emit.print (printed_function)
 import compiler.emit.print.text (PrintOutput)
 import compiler.emit.print.value_printing (signature_types)
 
@@ -44,18 +44,21 @@ pub fn root_at(s: ModuleContext, key: RootKey, base: Int, ps: List<EmitParam>, c
 fn root_result_type(here: List<Definition>, key: RootKey) -> Type = {
   let own = unspecialised(key);
   let args = key_types(key);
-  here.fold(generated_result_type(key), |acc: Type, d: Definition|
-    if d.root != own { acc } else {
+  here.fold(generated_result_type(key), |accumulator: Type, d: Definition|
+    if d.root != own { accumulator } else {
       match d.scheme {
-        Some(sc) -> match sc.ty { FunctionType(f) -> substituted_fully(f.ret, args), _ -> acc },
-        None -> acc,
+        Some(scheme) -> match scheme.ty {
+          FunctionType(f) -> substituted_fully(f.return_type, args),
+          _ -> accumulator,
+        },
+        None -> accumulator,
       }
     })
 }
 
 fn generated_result_type(key: RootKey) -> Type =
   match key {
-    Generated(w, _) -> match w.op {
+    Generated(w, _) -> match w.operation {
       keys::Equal -> bool_type(),
       Order -> ordering_type(),
       NumericFunction(_) -> w.ty,
@@ -79,24 +82,28 @@ pub fn naming<a>(name: Bytes, run: () -> a / {abort.raise}) -> a / {abort.raise}
       panic(String::of_bytes_lossy(Bytes::concat_all([b"Ply failed making `", name, b"`: "])) ++ m),
   }
 
-pub fn emitted_of(f: Fn, constructors: Constructors) -> EmittedRoot / {abort.raise} = {
+pub fn emitted_of(f: Function, constructors: Constructors) -> EmittedRoot / {abort.raise} = {
   let full = root_name(f.key);
   naming(root_text(full), || {
     let counted = built_form(f);
     if needs_specialisation(counted.links.needs) { deferred_to_callers(full, counted) } else {
       match ownership_fault(counted) {
         Some(fault) ->
-          panic(String::of_bytes_lossy(b"its typed form fails its check: ".concat(fault))),
+          panic(
+            String::of_bytes_lossy(
+              b"the typed form of the function fails the ownership check: ".concat(fault),
+            ),
+          ),
         None -> {
-          let pr = printed_fn(counted, constructors);
+          let printed = printed_function(counted, constructors);
           {
             name: full,
             text: body_text(
               counted.key,
               counted.members.map(|m: typed_ir::Member| m.key),
-              pr.pieces,
+              printed.pieces,
             ),
-            tables: ir_tables(counted, pr, constructors.stated),
+            tables: ir_tables(counted, printed, constructors.stated),
           }
         },
       }
@@ -104,7 +111,7 @@ pub fn emitted_of(f: Fn, constructors: Constructors) -> EmittedRoot / {abort.rai
   })
 }
 
-fn deferred_to_callers(full: RootName, f: Fn) -> EmittedRoot =
+fn deferred_to_callers(full: RootName, f: Function) -> EmittedRoot =
   {
     name: full,
     text: b"",
@@ -121,13 +128,17 @@ fn deferred_to_callers(full: RootName, f: Fn) -> EmittedRoot =
     },
   }
 
-pub fn with_refcounts(f: Fn) -> Fn =
+pub fn with_refcounts(f: Function) -> Function =
   if f.kind == typed_ir::Plain { f } else { insert_reference_counts(f) }
 
-pub fn built_form(f: Fn) -> Fn = release_needs(with_refcounts(f))
+pub fn built_form(f: Function) -> Function = release_needs(with_refcounts(f))
 
-fn ir_tables(f: Fn, pr: PrintOutput, stated: Map<Bytes, Bool>) -> Tables / {abort.raise} = {
-  let held = if f.members.len() == 0 {
+fn ir_tables(
+  f: Function,
+  printed: PrintOutput,
+  stated: Map<Bytes, Bool>,
+) -> Tables / {abort.raise} = {
+  let signatures = if f.members.len() == 0 {
     [{ key: f.key, arity: declared_arity(f.params), head: signature_types(f.convention) }]
   } else {
     f.members.map(|m: typed_ir::Member|
@@ -135,49 +146,53 @@ fn ir_tables(f: Fn, pr: PrintOutput, stated: Map<Bytes, Bool>) -> Tables / {abor
   };
   let statics = statics_named(f, []);
   {
-    fields: pr.fields,
-    lambdas: pr.lambdas.map(pieces_text),
-    calls: statics.fold(pr.calls, |acc: List<RootKey>, d: StaticDefinition|
-      entries_of(d).fold(acc, |a: List<RootKey>, k: RootKey|
+    fields: printed.fields,
+    lambdas: printed.lambdas.map(pieces_text),
+    calls: statics.fold(printed.calls, |accumulator: List<RootKey>, d: StaticDefinition|
+      entries_of(d).fold(accumulator, |a: List<RootKey>, k: RootKey|
         if a.contains(k) { a } else { a.push(k) })),
     generics: {
       calls: f.links.generics,
       needs: f.links.needs,
-      expects: pr.expects,
+      expects: printed.expects,
       called_parameters: f.links.called,
       passes: f.links.forwarded_parameters,
     },
-    performs: pr.performs,
-    handles: pr.handles,
+    performs: printed.performs,
+    handles: printed.handles,
     members: f.members.map(|m: typed_ir::Member| m.key),
-    defined: held.map(|h: { key: RootKey, arity: Int, head: Prototype }|
+    defined: signatures.map(|h: { key: RootKey, arity: Int, head: Prototype }|
       { entered: has_entry(h.key, h.arity, stated), head: h.head }),
     statics: statics,
     handings: [],
     assumed: [],
     group: [],
-    shared: pr.shared,
-    natives: pr.natives,
-    keyed: keyed_in(pr.pieces),
+    shared: printed.shared,
+    natives: printed.natives,
+    keyed: keyed_in(printed.pieces),
   }
 }
 
 fn keyed_in(pieces: List<Piece>) -> List<Keyed> =
-  pieces.fold([], |acc: List<Keyed>, p: Piece| {
+  pieces.fold([], |accumulator: List<Keyed>, p: Piece| {
     let keyed = match p {
       Hole(ConstructorTag(name)) -> Some(KeyedTag(name)),
       Hole(FieldName(i)) -> Some(KeyedField(i)),
       Hole(LambdaEntry(i)) -> Some(KeyedEntry(i)),
       _ -> None,
     };
-    match keyed { Some(k) -> if acc.contains(k) { acc } else { acc.push(k) }, None -> acc }
+    match keyed {
+      Some(k) -> if accumulator.contains(k) { accumulator } else { accumulator.push(k) },
+      None -> accumulator,
+    }
   })
 
-fn statics_named(f: Fn, held: List<StaticDefinition>) -> List<StaticDefinition> =
+fn statics_named(f: Function, known_statics: List<StaticDefinition>) -> List<StaticDefinition> =
   f.lambdas.fold(
-    f.statics.fold(held, |acc: List<StaticDefinition>, d: StaticDefinition|
-      if acc.contains(d) { acc } else { acc.push(d) }),
-    |acc: List<StaticDefinition>, l: Lambda| match l { Closure(c) -> statics_named(c.body, acc) },
+    f.statics.fold(known_statics, |accumulator: List<StaticDefinition>, d: StaticDefinition|
+      if accumulator.contains(d) { accumulator } else { accumulator.push(d) }),
+    |accumulator: List<StaticDefinition>, l: Lambda|
+      match l { Closure(c) -> statics_named(c.body, accumulator) },
   )
 
 pub fn root_from_code(
@@ -187,7 +202,8 @@ pub fn root_from_code(
   ps: List<EmitParam>,
   code: Code,
   performs: Effects = { listed: [], variable: None },
-) -> Fn / {abort.raise} = root_lowered(s, { ..root_at(s, key, base, ps, code), performs: performs })
+) -> Function / {abort.raise} =
+  root_lowered(s, { ..root_at(s, key, base, ps, code), performs: performs })
 
 fn empty_module_context() -> ModuleContext =
   {
@@ -205,7 +221,7 @@ fn empty_module_context() -> ModuleContext =
 fn literal_code(l: SourceLiteral) -> Code =
   { node: CodeLiteral(l), span: dummy_span(), ty: int_type() }
 
-test "a root is defined under its symbol, with the entry the runtime calls it through" {
+test "a root is emitted with an `_entry` function that the runtime calls, and is recorded as defined with that entry" {
   let e = emitted_of(
     root_from_code(empty_module_context(), 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
     no_constructors(),
@@ -220,9 +236,9 @@ test "a root is defined under its symbol, with the entry the runtime calls it th
   )
 }
 
-test "a root whose function a static holds is among the calls of the body naming the static" {
+test "a function that a static's type-descriptor entry points to is listed among the calls of the function body that uses the static" {
   let dup = Named(b"m.dup#T");
-  let held = named_by_content(
+  let type_descriptor = named_by_content(
     StaticStruct({
       of: b"PlyType",
       fields: [
@@ -237,12 +253,12 @@ test "a root whose function a static holds is among the calls of the body naming
     }),
   );
   let f = root_from_code(empty_module_context(), 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
-  let counted = { ..insert_reference_counts(f), statics: [held] };
-  let t = ir_tables(counted, printed_fn(counted, no_constructors()), Map::new());
+  let counted = { ..insert_reference_counts(f), statics: [type_descriptor] };
+  let t = ir_tables(counted, printed_function(counted, no_constructors()), Map::new());
   assert(t.calls.contains(dup))
 }
 
-test "a form letting go of a value of its type variable is resolved by its callers: no C, its needs in its tables" {
+test "a release function for a type-variable value emits no C and records which layouts its callers must supply" {
   let p = { id: 0, ty: VariableType(0), representation: typed_ir::AsWord };
   let f = {
     key: Named(b"m.dropping"),

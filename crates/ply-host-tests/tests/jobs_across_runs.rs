@@ -1,7 +1,3 @@
-//! A native's ticket waited on through the process's pools, which every runtime of the process
-//! shares: what one run left behind, and how a job ended, decide nothing for another's wait. A
-//! binary of its own, since each test here leaves the process's pools holding what it left.
-
 use ply_core::Span;
 use ply_core::host::HostRuntime;
 use ply_host::jobs::{self, Work};
@@ -19,8 +15,6 @@ fn submitted(
     jobs::submit(work, run, Span::DUMMY, "test", what, job).expect("a thread is had")
 }
 
-/// What a run leaves when it ends with a task waiting on a hash, as one that failed or cancelled
-/// that task does: a finished job it watched and never took.
 fn abandon_a_finished_job() {
     let gone = unbound()();
     let (ran, heard) = mpsc::channel();
@@ -34,10 +28,9 @@ fn abandon_a_finished_job() {
     heard.recv().expect("the job ran");
 }
 
-/// A later run waiting on its own hash is woken by that hash, however long it takes, whatever an
-/// earlier run of the process left in the pool.
 #[test]
-fn a_run_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
+fn a_run_still_waits_for_its_own_job_when_an_earlier_run_ended_without_reading_its_finished_job_result()
+ {
     abandon_a_finished_job();
     let rt = unbound()();
     let ticket = submitted(&*rt, Work::Computing, "a hash", || {
@@ -56,8 +49,6 @@ fn a_run_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
     );
 }
 
-/// A job of the waiting pool that panics fails the run waiting on it, as one of the computing
-/// pool does, rather than leaving it waiting for ever.
 #[test]
 fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
     let (returned, heard) = mpsc::channel();
@@ -79,9 +70,8 @@ fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
     }
 }
 
-/// A run's token is its own: another run of the same host neither collects it nor may wait on it.
 #[test]
-fn one_runs_token_is_none_of_anothers() {
+fn a_run_cannot_watch_or_read_the_result_of_a_job_that_a_different_run_submitted() {
     let factory = unbound();
     let (mine, theirs) = (factory(), factory());
     let ticket = submitted(&*mine, Work::Waiting, "a lookup", || Ok(b"mine".to_vec()));

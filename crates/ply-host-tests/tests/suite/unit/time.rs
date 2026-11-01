@@ -4,7 +4,6 @@ use std::time::Duration;
 #[test]
 fn the_wall_clock_reads_milliseconds_since_the_epoch() {
     let now = wall_clock_ms();
-    // After 2020 and before 2100: a clock outside that is one this run cannot stamp with.
     assert!(now > 1_577_836_800_000, "{now}");
     assert!(now < 4_102_444_800_000, "{now}");
 }

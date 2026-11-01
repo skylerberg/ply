@@ -1,10 +1,10 @@
 import compiler.syntax.parsing (Span, Identifier)
 import compiler.syntax.type_syntax (mode_text)
-import compiler.syntax.items (Item, Deriver, EqDeriver, OrdDeriver, HashDeriver, DeriveOrigin,
+import compiler.syntax.items (Item, Deriver, EqDeriver, OrderingDeriver, HashDeriver, DeriveOrigin,
                               InstanceItem, InstanceDefinition, KeyInstance, ShowInstance,
                               InvariantInstance, HostInstance, instance_text, NumericItem,
-                              NumericDefinition, NumericOp, numeric_ops, numeric_by, TypeItem,
-                              FunctionItem, is_pub, InstanceKind, ReleaseInstance)
+                              NumericDefinition, NumericOperation, numeric_operations, numeric_by,
+                              TypeItem, FunctionItem, is_pub, InstanceKind, ReleaseInstance)
 import compiler.syntax.expressions (Expression, Param, expression_span)
 import compiler.check.types (backticked_text, Resource, ResourceVariable, AnyResource, Effect,
                              Effects, Type, VariableType, NamedType, FunctionType, RecordType,
@@ -17,8 +17,9 @@ import compiler.check.known (name_of, scoped_name, task_name, builtin_channel_na
 import compiler.check.resolve.tables (ParsedModule, Resolution, Diagnostic, Label, qualify,
                                       error_with_labels, error_at, label_at)
 import compiler.expand.rewrite.shared (bare_names_read)
-import compiler.check.infer.derivability (DeriveRejection, HoldsFunction, HoldsHandle, HoldsFloat,
-                                          Unconstrained, HoldsSecret, HoldsNative, float_reason)
+import compiler.check.infer.derivability (DeriveRejection, ContainsFunction, ContainsHandle,
+                                          ContainsFloat, Unconstrained, ContainsSecret,
+                                          ContainsNative, float_reason)
 import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
@@ -32,10 +33,11 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      empty_cache, ReuseBodies, Checker, report, report_error_at,
                                      report_error_at_and, report_error_with_labels,
                                      deriver_description, resolve, resolve_effects_in, seed_effect,
-                                     definition_of, channel_ops, install_prelude, mode_eq, Blocker,
-                                     AlgebraicShape, Shapes, find_adt, derivable)
+                                     definition_of, channel_operations, install_prelude, mode_eq,
+                                     Blocker, AlgebraicShape, Shapes, find_adt, derivable)
 import compiler.check.infer.names (simple_name_of)
-import compiler.check.infer.declarations (is_scheduler_handle, task_op, effects_include_brand)
+import compiler.check.infer.declarations (is_scheduler_handle, task_operation,
+                                          effects_include_brand)
 import compiler.check.infer.expression (as_written, numeric_of)
 import compiler.check.infer.definitions (algebraic_shapes, is_key)
 import compiler.check.infer.host_handlers (hosted_effects, checked_host_handler)
@@ -50,18 +52,19 @@ fn reason_notes_for_key(
   blocker: Bytes,
 ) -> List<Bytes> =
   match w {
-    HoldsFloat -> [float_reason(deriver)],
-    HoldsFunction -> [b"a function has no order and no content to hash"],
-    HoldsHandle ->
+    ContainsFloat -> [float_reason(deriver)],
+    ContainsFunction ->
+      [b"a function cannot be ordered (compared with `<` or `>`) and has no content to hash"],
+    ContainsHandle ->
       [
         Bytes::concat_all([
           b"a `",
           name_of(b.ty),
-          b"` names a location rather than a value, so it has no order",
+          b"` is a reference to a storage location rather than a value, so its values cannot be compared with `<` or `>`",
         ]),
       ],
-    HoldsSecret -> secret_rejection_notes(deriver),
-    HoldsNative -> native_notes(blocker, deriver),
+    ContainsSecret -> secret_rejection_notes(deriver),
+    ContainsNative -> native_notes(blocker, deriver),
     Unconstrained(_) -> [],
   }
 
@@ -101,7 +104,7 @@ fn report_unfit_instance(
           Bytes::concat_all([
             b"a `show` takes one `",
             definition.target.name,
-            b"` and returns the `String` that `show` and an interpolated string write",
+            b"` and returns the `String` that `show` and string interpolation produce",
           ]),
         InvariantInstance ->
           Bytes::concat_all([
@@ -114,7 +117,7 @@ fn report_unfit_instance(
           Bytes::concat_all([
             b"a `release` takes one `",
             definition.target.name,
-            b"`, `keep`, and lets it go where nothing consumed it",
+            b"`, marked `keep`, and runs when a value of that type is discarded without being used",
           ]),
       },
     ],
@@ -143,7 +146,7 @@ fn check_release(
         Bytes::concat_all([b"`", definition.target.name, b"` is not a type this module declares"]),
         b"declared in another module, or not at all",
         [
-          b"a `release` may only name a type its own module declares, so that one function lets every value of it go",
+          b"a `release` may only name a type declared in its own module, so that a single function releases every value of that type",
         ],
       ),
     Some(declaration) -> match declaration.declared {
@@ -157,7 +160,7 @@ fn check_release(
             definition.target.name,
             b"` is an alias, which states no `release`",
           ]),
-          b"an alias is the type it names, so a `release` for one would make every value of that type a resource",
+          b"an alias is the type it names, so a `release` for an alias would make every value of the aliased type a resource",
         ),
       DeclaredExtern ->
         not_a_sum(
@@ -169,7 +172,7 @@ fn check_release(
             definition.target.name,
             b"` is an `extern type`, which states no `release`",
           ]),
-          b"the toolchain lays out its values and lets them go",
+          b"the toolchain controls how its values are stored and frees them itself",
         ),
       DeclaredRecord(_) ->
         not_a_sum(
@@ -181,7 +184,7 @@ fn check_release(
             definition.target.name,
             b"` is a record, which states no `release`",
           ]),
-          b"a resource is an opaque sum, whose constructors only its module builds and takes apart",
+          b"a resource is an `opaque` sum type, so only its own module can create its values and match on them",
         ),
       _ -> if declaration.opaque == None {
         report_error_at_and(
@@ -197,7 +200,7 @@ fn check_release(
           { module: declaration.owner, span: declaration.span },
           b"declared here",
           [
-            b"a resource is built, matched and read only by its own module, or another module could copy what it holds or take it apart without letting it go",
+            b"only the declaring module may build, match on or read a resource; another module could otherwise copy it or take it apart without releasing it",
             Bytes::concat_all([b"write `opaque type ", definition.target.name, b"`"]),
           ],
         )
@@ -253,16 +256,16 @@ fn check_release_signature(
           ascii_of_int(sig.params.len()),
           b" parameters",
         ]),
-        b"it is handed the value alone",
+        b"a `release` is called with the value as its only argument",
       )
-    } else if sig.kept != [0] {
+    } else if sig.keep_parameters != [0] {
       report_unfit_instance(
         checker,
         definition,
         f,
         b"this function borrows the value",
         Bytes::concat_all([
-          b"a release takes the value it lets go: write its parameter `keep ",
+          b"a `release` takes ownership of the value it releases: write its parameter `keep ",
           type_text(sig.params.get(0)),
           b"`",
         ]),
@@ -283,13 +286,13 @@ fn check_release_signature(
               b"` there is",
             ]),
           ),
-        Some(own) -> if sig.ret != unit_type() {
+        Some(own) -> if sig.return_type != unit_type() {
           report_unfit_instance(
             checker,
             definition,
             f,
-            Bytes::concat_all([b"this function returns `", type_text(sig.ret), b"`"]),
-            b"a release is run where a value is let go, and nothing reads what it returns",
+            Bytes::concat_all([b"this function returns `", type_text(sig.return_type), b"`"]),
+            b"a `release` runs when a value is discarded, and nothing uses its return value",
           )
         } else {
           {
@@ -300,7 +303,7 @@ fn check_release_signature(
               by: f.name,
               params: own.params,
               effect_params: own.effect_params,
-              results: sig.ret,
+              results: sig.return_type,
               at: { module: checker.module, span: definition.span },
             }),
           }
@@ -319,8 +322,8 @@ fn released_params(ty: Type, type_name: Bytes) -> Option<OwnParams> = {
   match args {
     None -> None,
     Some(xs) ->
-      xs.fold(Some({ params: [], effect_params: [] }), |acc: Option<OwnParams>, a: Type|
-        match acc {
+      xs.fold(Some({ params: [], effect_params: [] }), |accumulator: Option<OwnParams>, a: Type|
+        match accumulator {
           None -> None,
           Some(own) -> match arg_effects(a) {
             Some(effects) -> match effects.variable {
@@ -378,12 +381,12 @@ fn check_declared_instance(
               definition.target.name,
               b"` is not a sum, and ",
               one,
-              b" is for one",
+              b" can only be stated for a sum",
             ]),
             Bytes::concat_all([
               b"an alias is the type it names, so ",
               one,
-              b" for one would be for every value of that type",
+              b" for an alias would apply to every value of the named type",
             ]),
           ),
         DeclaredRecord(_) ->
@@ -394,15 +397,15 @@ fn check_declared_instance(
             Bytes::concat_all([
               b"`",
               definition.target.name,
-              b"` is a `new` record, which cannot state ",
+              b"` is a `new` record, which cannot have ",
               one,
               b" yet",
             ]),
             match definition.kind {
               InvariantInstance ->
-                b"the prover reads an invariant where a constructor of the type is applied, and a `new` record has none: a record literal builds it",
+                b"the prover checks an invariant wherever a constructor of the type is applied, and a `new` record has no constructor: it is built with a record literal",
               _ ->
-                b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
+                b"a `new` record is stored as a plain record without its type name, so a value cannot tell which type it belongs to when it is compared or shown",
             },
           ),
         DeclaredExtern ->
@@ -419,8 +422,9 @@ fn check_declared_instance(
             ]),
             match definition.kind {
               InvariantInstance ->
-                b"the toolchain makes its values, and no constructor of the program builds one",
-              _ -> b"the toolchain lays out its values, and nothing compares or shows one",
+                b"the toolchain creates its values, and no constructor in the program builds a value of this type",
+              _ ->
+                b"the toolchain decides how its values are stored, so nothing in the program can compare or show them",
             },
           ),
         DeclaredSum -> match instance_of(checker.instances, type_name, definition.kind) {
@@ -456,7 +460,10 @@ fn check_declared_instance(
                     definition.function.name,
                     b"` is not a function this module declares",
                   ]),
-                  Bytes::concat_all([one, b" names a function of its type's own module"]),
+                  Bytes::concat_all([
+                    one,
+                    b" must name a function declared in the same module as its type",
+                  ]),
                   [],
                 ),
               Some(f) -> check_instance_signature(checker, definition, type_name, f),
@@ -496,7 +503,7 @@ fn reject_public_invariant(
     { module: declaration.owner, span: declaration.span },
     b"declared here",
     [
-      b"a value another module makes would not be bound by it: only a constructor applied in the type's own module is an obligation, and every value of the type assumes the invariant",
+      b"a value another module makes would not be checked against it: the prover checks the invariant only where a constructor is applied in the type's own module, and every other use of the type assumes the invariant holds",
       Bytes::concat_all([
         b"declare it `opaque`, as `pub opaque type ",
         definition.target.name,
@@ -518,7 +525,7 @@ fn invariant_defaults(checker: Checker, x: InstanceInfo) -> Checker / {abort.rai
               None -> cc,
               Some(d) -> match bare_names_read(d).find(|n: Bytes| constructors.contains(n)) {
                 None -> cc,
-                Some(ctor) -> reject_default_constructor(cc, x, ctor, d),
+                Some(constructor_name) -> reject_default_constructor(cc, x, constructor_name, d),
               },
             }),
         _ -> c,
@@ -529,7 +536,7 @@ fn invariant_defaults(checker: Checker, x: InstanceInfo) -> Checker / {abort.rai
 fn reject_default_constructor(
   checker: Checker,
   x: InstanceInfo,
-  ctor: Bytes,
+  constructor_name: Bytes,
   default: Expression,
 ) -> Checker / {abort.raise} = {
   let simple = simple_name_of(x.type_name);
@@ -542,14 +549,14 @@ fn reject_default_constructor(
       simple,
       b"`, which states an invariant",
     ]),
-    Bytes::concat_all([b"this names `", ctor, b"`"]),
+    Bytes::concat_all([b"this names `", constructor_name, b"`"]),
     x.at,
     b"the invariant is stated here",
     [
       Bytes::concat_all([
         b"every call that omits the argument fills the default in, so the caller would build a `",
         simple,
-        b"` outside the definitions bound by its invariant",
+        b"` without checking its invariant",
       ]),
       Bytes::concat_all([
         b"drop the default, and pass each call a `",
@@ -611,8 +618,8 @@ fn check_instance_signature(
         checker,
         definition,
         f,
-        b"this function binds a resource label",
-        b"it is called with the value alone, and a value does not carry the label its type was given, so a type that binds a label states no `key`, `show` or `invariant`",
+        b"this function has a resource label as a type parameter",
+        b"it is called with the value alone, and a value does not record its type's resource label, so a type with a resource label parameter cannot declare `key`, `show` or `invariant`",
       )
     } else {
       match own_params(sig.params.get(0), type_name) {
@@ -642,9 +649,9 @@ fn check_instance_signature(
             ]),
             match definition.kind {
               InvariantInstance ->
-                b"it is read of each value alone, so no call meets a constraint: its signature may need only what the type itself carries, the order a `Map` key asks of what it holds or a constraint the type's `where` states",
+                b"it is called with each value alone, so no caller can satisfy an extra constraint; the signature may require only what the type itself requires, the ordering a `Map` key needs from the types it contains, or a constraint in the type's `where` clause",
               _ ->
-                b"it is called with the value alone, wherever two are compared or one is shown, so no call meets a constraint: its signature may need only what the type itself carries, the order a `Map` key asks of what it holds or a constraint the type's `where` states",
+                b"it is called with only the values being compared or shown, so no caller can satisfy an extra constraint; the signature may require only what the type itself requires, the ordering a `Map` key needs from the types it contains, or a constraint in the type's `where` clause",
             },
           )
         } else if !is_pure(sig.effects) {
@@ -655,36 +662,39 @@ fn check_instance_signature(
             Bytes::concat_all([b"this function's effects are `", effects_text(sig.effects), b"`"]),
             match definition.kind {
               InvariantInstance ->
-                b"an invariant is a fact of every value, so it performs nothing, cannot raise and always returns",
+                b"an invariant is a fact about every value, so the function must have no effects, must not raise an error and must always return a value",
               _ ->
-                b"`==`, `compare` and `show` perform nothing, cannot raise and always return, so the function they read through does the same",
+                b"`==`, `compare` and `show` have no effects, cannot raise an error and always return a value, so the function they call must do the same",
             },
           )
         } else if !result_over_own_params(
-            free_variables(checker.substitution, sig.ret, { types: [], effect_variables: [] }),
+            free_variables(checker.substitution, sig.return_type, {
+              types: [],
+              effect_variables: [],
+            }),
             own,
           ) {
           report_unfit_instance(
             checker,
             definition,
             f,
-            Bytes::concat_all([b"this function returns `", type_text(sig.ret), b"`"]),
-            b"what it returns is over the type's own parameters and no others",
+            Bytes::concat_all([b"this function returns `", type_text(sig.return_type), b"`"]),
+            b"the return type may use only the type parameters of the type being declared, and no others",
           )
-        } else if definition.kind == ShowInstance && sig.ret != string_type() {
+        } else if definition.kind == ShowInstance && sig.return_type != string_type() {
           report_unfit_instance(
             checker,
             definition,
             f,
-            Bytes::concat_all([b"this function returns `", type_text(sig.ret), b"`"]),
+            Bytes::concat_all([b"this function returns `", type_text(sig.return_type), b"`"]),
             b"what is shown is text",
           )
-        } else if definition.kind == InvariantInstance && sig.ret != bool_type() {
+        } else if definition.kind == InvariantInstance && sig.return_type != bool_type() {
           report_unfit_instance(
             checker,
             definition,
             f,
-            Bytes::concat_all([b"this function returns `", type_text(sig.ret), b"`"]),
+            Bytes::concat_all([b"this function returns `", type_text(sig.return_type), b"`"]),
             b"an invariant returns `Bool`: whether a value is one the type may contain",
           )
         } else {
@@ -696,7 +706,7 @@ fn check_instance_signature(
               by: f.name,
               params: own.params,
               effect_params: own.effect_params,
-              results: sig.ret,
+              results: sig.return_type,
               at: { module: checker.module, span: definition.span },
             }),
           }
@@ -714,14 +724,14 @@ fn constrained_beyond_type(
 ) -> Bool =
   if f.constraints.len() == 0 { false } else {
     let positions = match checker.ordered_parameters.get(type_name) { Some(ps) -> ps, None -> [] };
-    let carried = positions.fold([], |acc: List<Int>, j: Int|
-      match own.params.at(j) { Some(v) -> acc.push(v), None -> acc });
+    let carried = positions.fold([], |accumulator: List<Int>, j: Int|
+      match own.params.at(j) { Some(v) -> accumulator.push(v), None -> accumulator });
     let stated = match checker.stated.get(type_name) { Some(cs) -> cs, None -> [] };
     f.constraints.any(|c: DefinitionConstraint|
       match f.scheme.type_variables.at(c.param) {
         None -> true,
         Some(v) ->
-          !(c.deriver == OrdDeriver && carried.contains(v))
+          !(c.deriver == OrderingDeriver && carried.contains(v))
             && !stated.any(|s: DefinitionConstraint|
               s.deriver == c.deriver
                 && (match own.params.at(s.param) { Some(w) -> w == v, None -> false })),
@@ -759,10 +769,10 @@ pub fn collect_instances(checker: Checker, parsed: ParsedModule) -> Checker =
               ..c,
               numeric_types: c.numeric_types.push({
                 type_name: type_name,
-                ctor: c.constructors.fold(b"", |found: Bytes, k: ConstructorInfo|
+                constructor: c.constructors.fold(b"", |found: Bytes, k: ConstructorInfo|
                   if found.len() == 0 && k.type_name == type_name { k.name } else { found }),
-                functions: numeric_ops().map(|op: Bytes|
-                  match numeric_by(definition, op) {
+                functions: numeric_operations().map(|operation: Bytes|
+                  match numeric_by(definition, operation) {
                     Some(by) -> qualify(parsed.name, by.name),
                     None -> b"",
                   }),
@@ -799,8 +809,8 @@ fn check_numeric(
           checker,
           definition.target,
           declaration,
-          named(b"` is not a sum, and a `numeric` is for one"),
-          b"an alias is the type it names, so a `numeric` for one would be for every value of that type",
+          named(b"` is not a sum, and a `numeric` must be a sum"),
+          b"an alias is the type it names, so a `numeric` for an alias would apply to every value of the aliased type",
         ),
       DeclaredRecord(_) ->
         not_a_sum(
@@ -808,7 +818,7 @@ fn check_numeric(
           definition.target,
           declaration,
           named(b"` is a `new` record, which cannot state a `numeric` yet"),
-          b"a `new` record runs as the record it is written as, so nothing in a value says which type's arithmetic an operator over it is",
+          b"a `new` record has the same representation as the record it wraps, so a value does not show which type's arithmetic an operator should use",
         ),
       DeclaredExtern ->
         not_a_sum(
@@ -830,7 +840,7 @@ fn check_numeric(
           { module: declaration.owner, span: declaration.span },
           b"declared here",
           [
-            b"an operator calls the type's functions with its values alone, and `numeric_of_int` with none: nothing there says what a parameter is, or fills a constraint on one",
+            b"an operator calls the type's functions with only the values, and calls `numeric_of_int` with no type arguments, so the call cannot supply a type parameter or a constraint for the function",
           ],
         )
       } else {
@@ -849,7 +859,7 @@ fn check_numeric(
           } else {
             let listed: Checker = check_numeric_operations(checker, definition);
             if listed.diagnostics.len() > checker.diagnostics.len() { listed } else {
-              definition.operations.fold(listed, |c: Checker, x: NumericOp|
+              definition.operations.fold(listed, |c: Checker, x: NumericOperation|
                 check_numeric_signature(c, m, definition, type_name, x))
             }
           },
@@ -867,28 +877,29 @@ fn check_numeric_operations(
   let reason = b"a `numeric` names a function for each of `add`, `sub`, `mul`, `neg` and `of_int`, once: `+`, binary `-`, `*`, unary `-`, and what `numeric_of_int` calls";
   let named = range(0, definition.operations.len()).fold(checker, |c: Checker, i: Int| {
     let x = definition.operations.get(i);
-    if !numeric_ops().contains(x.op.name) {
+    if !numeric_operations().contains(x.operation.name) {
       report_error_at(
         c,
         b"E0215",
-        x.op.span,
-        Bytes::concat_all([b"`", x.op.name, b"` is no operation a `numeric` states"]),
-        b"not one of the five",
+        x.operation.span,
+        Bytes::concat_all([b"`", x.operation.name, b"` is no operation a `numeric` states"]),
+        b"a `numeric` names only `add`, `sub`, `mul`, `neg` and `of_int`",
         [reason],
       )
     } else if range(0, i).fold(false, |seen: Bool, j: Int|
-        seen || definition.operations.get(j).op.name == x.op.name) {
+        seen || definition.operations.get(j).operation.name == x.operation.name) {
       report_error_at(
         c,
         b"E0215",
-        x.op.span,
-        Bytes::concat_all([b"this `numeric` names `", x.op.name, b"` twice"]),
+        x.operation.span,
+        Bytes::concat_all([b"this `numeric` names `", x.operation.name, b"` twice"]),
         b"named again here",
         [reason],
       )
     } else { c }
   });
-  let missing = numeric_ops().filter(|op: Bytes| numeric_by(definition, op) == None);
+  let missing = numeric_operations().filter(|operation: Bytes|
+    numeric_by(definition, operation) == None);
   if missing.len() == 0 { named } else {
     report_error_at(
       named,
@@ -909,7 +920,7 @@ fn check_numeric_signature(
   m: ParsedModule,
   definition: NumericDefinition,
   type_name: Bytes,
-  x: NumericOp,
+  x: NumericOperation,
 ) -> Checker / {abort.raise} =
   match definition_of(checker, qualify(m.name, x.by.name)) {
     None ->
@@ -918,13 +929,13 @@ fn check_numeric_signature(
         b"E0101",
         x.by.span,
         Bytes::concat_all([b"`", x.by.name, b"` is not a function this module declares"]),
-        b"a `numeric` names functions of its type's own module",
+        b"a `numeric` must name functions declared in the same module as its type",
         [],
       ),
     Some(f) -> {
       let own = named_type(type_name);
-      let takes = if x.op.name == b"of_int" { [int_type()] }
-      else if x.op.name == b"neg" { [own] }
+      let takes = if x.operation.name == b"of_int" { [int_type()] }
+      else if x.operation.name == b"neg" { [own] }
       else { [own, own] };
       let report_unfit_instance = |reason: Bytes, note: Bytes|
         report_error_with_labels(
@@ -934,7 +945,7 @@ fn check_numeric_signature(
             b"`",
             x.by.name,
             b"` cannot be the `",
-            x.op.name,
+            x.operation.name,
             b"` of `",
             definition.target.name,
             b"`",
@@ -947,14 +958,14 @@ fn check_numeric_signature(
             note,
             Bytes::concat_all([
               b"`",
-              x.op.name,
+              x.operation.name,
               b"` is `",
               type_text(
                 FunctionType({
-                  kept: [],
+                  keep_parameters: [],
                   once: false,
                   params: takes,
-                  ret: own,
+                  return_type: own,
                   effects: no_effects(),
                 }),
               ),
@@ -967,22 +978,22 @@ fn check_numeric_signature(
             || f.scheme.effect_variables.len() > 0
             || f.scheme.label_variables.len() > 0 {
           report_unfit_instance(
-            b"this function binds a parameter of its own",
-            b"an operator calls it with the values alone, so no call fills a type, effects, a label or a constraint",
+            b"this function declares a type, effects, a label or a constraint as a parameter of its own",
+            b"an operator calls it with only the values, so the call cannot supply a type, effects, a label or a constraint",
           )
-        } else if sig.params != takes || sig.ret != own {
+        } else if sig.params != takes || sig.return_type != own {
           report_unfit_instance(
             Bytes::concat_all([
               b"this function is `",
               type_text(resolve(checker, f.scheme.ty)),
               b"`",
             ]),
-            b"an operator takes and returns the type it is at",
+            b"an operator takes and returns values of the `numeric` type itself",
           )
         } else if !is_pure(sig.effects) {
           report_unfit_instance(
             Bytes::concat_all([b"this function's effects are `", effects_text(sig.effects), b"`"]),
-            b"an operator at a number performs nothing, cannot raise and always returns, as `+` does at `Int`, so `a + b` adds no effects where the type is this one",
+            b"an operator on a number type performs no effects, cannot raise and always returns, as `+` does on `Int`, so `a + b` must not add effects",
           )
         } else { checker },
         _ -> checker,
@@ -997,8 +1008,8 @@ fn first_key_loop(
   path: List<Bytes>,
   room: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
-  types.fold(None, |acc: Option<List<Bytes>>, ty: Type|
-    match acc { Some(_) -> acc, None -> key_loop(ty, instances, adts, path, room) })
+  types.fold(None, |accumulator: Option<List<Bytes>>, ty: Type|
+    match accumulator { Some(_) -> accumulator, None -> key_loop(ty, instances, adts, path, room) })
 
 fn key_loop(
   ty: Type,
@@ -1059,7 +1070,7 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
   if stated.instances.len() == 0 { { ..stated, module: checker.module } } else {
     let adts = algebraic_shapes(stated);
     let shapes = deriver_shapes(stated.instances, adts);
-    let judged: Checker = stated.instances.fold(stated, |c: Checker, x: InstanceInfo|
+    let checked: Checker = stated.instances.fold(stated, |c: Checker, x: InstanceInfo|
       if !is_key(x.kind) { c } else {
         let simple = simple_name_of(x.type_name);
         match key_loop(x.results, stated.instances, adts, [x.type_name], adts.len() + 1) {
@@ -1080,7 +1091,7 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
                 Bytes::concat_all([b"this key returns `", type_text(x.results), b"`"]),
                 [
                   Bytes::concat_all([
-                    b"comparing two of them reads ",
+                    b"comparing two values of this type would compare ",
                     Bytes::join(
                       path.map(|n: Bytes| backticked_text(simple_name_of(n))),
                       b", then ",
@@ -1092,7 +1103,7 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
               ),
             ),
           None ->
-            [OrdDeriver, HashDeriver].fold(c, |cc: Checker, deriver: Deriver|
+            [OrderingDeriver, HashDeriver].fold(c, |cc: Checker, deriver: Deriver|
               if cc.diagnostics.len() > c.diagnostics.len() { cc } else {
                 match derivable(deriver, x.results, shapes_for(shapes, deriver), x.params) {
                   None -> cc,
@@ -1115,7 +1126,7 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
                         ]),
                         Bytes::concat_all([b"this key returns `", type_text(x.results), b"`"]),
                         reason_notes_for_key(blocked.reason, deriver, blocked, blocker).push(
-                          b"one key decides `==`, `compare`, `digest` and a `Map`'s order, so what it returns is ordered and hashed",
+                          b"the key decides `==`, `compare`, `digest` and the order of a `Map`, so the type it returns must be ordered and hashable",
                         ),
                       ),
                     )
@@ -1124,34 +1135,43 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
               }),
         }
       });
-    { ..judged, module: checker.module }
+    { ..checked, module: checker.module }
   }
 }
 
 pub fn blame_deriver_errors(checker: Checker) -> Checker / {abort.raise} = {
-  let spans = range(0, checker.modules.len()).fold([], |acc: List<LabelLocation>, i: Int|
-    checker.modules.get(i).derived.fold(acc, |places: List<LabelLocation>, d: DeriveOrigin|
-      places.push({ module: i, start: d.span.start, end: d.span.end })));
+  let spans = range(0, checker.modules.len()).fold(
+    [],
+    |accumulator: List<LabelLocation>, i: Int|
+      checker.modules.get(i).derived.fold(
+        accumulator,
+        |places: List<LabelLocation>, d: DeriveOrigin|
+          places.push({ module: i, start: d.span.start, end: d.span.end }),
+      ),
+  );
   let derived_at = |d: Diagnostic|
-    match d.labels.fold(None, |acc: Option<Label>, l: Label|
-        match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } }) {
+    match d.labels.fold(None, |accumulator: Option<Label>, l: Label|
+        match accumulator {
+          Some(_) -> accumulator,
+          None -> if l.primary { Some(l) } else { None },
+        }) {
       Some(p) -> {
         let at = { module: p.module, start: p.start, end: p.end };
         if spans.contains(at) { Some(at) } else { None }
       },
       None -> None,
     };
-  let unseen = checker.diagnostics.fold([], |acc: List<LabelLocation>, d: Diagnostic|
-    if d.code != b"E0206" { acc }
-    else { match derived_at(d) { Some(at) -> acc.push(at), None -> acc } });
+  let unseen = checker.diagnostics.fold([], |accumulator: List<LabelLocation>, d: Diagnostic|
+    if d.code != b"E0206" { accumulator }
+    else { match derived_at(d) { Some(at) -> accumulator.push(at), None -> accumulator } });
   {
     ..checker,
-    diagnostics: checker.diagnostics.fold([], |acc: List<Diagnostic>, d: Diagnostic|
+    diagnostics: checker.diagnostics.fold([], |accumulator: List<Diagnostic>, d: Diagnostic|
       match derived_at(d) {
-        None -> acc.push(d),
-        Some(at) -> if d.code == b"E0206" { acc.push(d) }
-        else if unseen.contains(at) { acc }
-        else { acc.push(blamed_on_deriver(d)) },
+        None -> accumulator.push(d),
+        Some(at) -> if d.code == b"E0206" { accumulator.push(d) }
+        else if unseen.contains(at) { accumulator }
+        else { accumulator.push(blamed_on_deriver(d)) },
       }),
   }
 }
@@ -1164,7 +1184,7 @@ fn blamed_on_deriver(d: Diagnostic) -> Diagnostic =
     notes: d.notes + 2,
     labels: d.labels,
     text: d.text,
-    message: b"a definition the deriver wrote does not typecheck",
+    message: b"a generated definition does not typecheck",
     notes_text: push_front_bytes(b"it fails with: ".concat(d.message), d.notes_text).push(
       b"a deriver writes definitions that check; this is a fault in the deriver's module",
     ),
@@ -1172,25 +1192,26 @@ fn blamed_on_deriver(d: Diagnostic) -> Diagnostic =
     fixes: d.fixes,
   }
 
-fn contains_fn(t: Type) -> Bool =
+fn contains_function(t: Type) -> Bool =
   match t {
     FunctionType(_) -> !is_label_or_effects(t),
-    NamedType(c) -> c.args.fold(false, |b: Bool, a: Type| b || contains_fn(a)),
-    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || contains_fn(field.ty)),
-    NominalType(n) -> n.fields.fold(false, |b: Bool, field: Field| b || contains_fn(field.ty)),
+    NamedType(c) -> c.args.fold(false, |b: Bool, a: Type| b || contains_function(a)),
+    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || contains_function(field.ty)),
+    NominalType(n) ->
+      n.fields.fold(false, |b: Bool, field: Field| b || contains_function(field.ty)),
     VariableType(_) -> false,
   }
 
 fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> =
-  xs.fold([x], |acc: List<Bytes>, y: Bytes| acc.push(y))
+  xs.fold([x], |accumulator: List<Bytes>, y: Bytes| accumulator.push(y))
 
 type NativeReach = { native_types: Map<Bytes, Bool>, uses: Map<Bytes, List<Int>> }
 
 fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
   let uses = shapes.fold(
     Map::new(),
-    |acc: Map<Bytes, List<Int>>, name: Bytes, shape: AlgebraicShape|
-      acc.insert(
+    |accumulator: Map<Bytes, List<Int>>, name: Bytes, shape: AlgebraicShape|
+      accumulator.insert(
         name,
         range(0, shape.params.len()).filter(|i: Int|
           shape.fields.any(|f: Type| occurs_type(shape.params.get(i), f))),
@@ -1198,32 +1219,36 @@ fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
   );
   let natives = shapes.fold(
     Map::new(),
-    |acc: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
-      if shape.native { acc.insert(name, true) } else { acc },
+    |accumulator: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+      if shape.native { accumulator.insert(name, true) } else { accumulator },
   );
-  let held = iterate(natives, shapes.len() + 1, |found: Map<Bytes, Bool>| {
-    let next = shapes.fold(found, |acc: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
-      if acc.contains(name) { acc }
-      else if shape.fields.any(|f: Type| reaches_native({ native_types: acc, uses: uses }, f)) {
-        acc.insert(name, true)
-      } else { acc });
+  let native_types = iterate(natives, shapes.len() + 1, |found: Map<Bytes, Bool>| {
+    let next = shapes.fold(
+      found,
+      |accumulator: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+        if accumulator.contains(name) { accumulator }
+        else if shape.fields.any(|f: Type|
+            contains_native_type({ native_types: accumulator, uses: uses }, f)) {
+          accumulator.insert(name, true)
+        } else { accumulator },
+    );
     if next.len() == found.len() { Stop(next) } else { Continue(next) }
   });
-  { native_types: held, uses: uses }
+  { native_types: native_types, uses: uses }
 }
 
-fn reaches_native(reach: NativeReach, ty: Type) -> Bool / {abort.raise} =
+fn contains_native_type(reach: NativeReach, ty: Type) -> Bool / {abort.raise} =
   match ty {
     NamedType(c) ->
       reach.native_types.contains(c.name)
         || (match reach.uses.get(c.name) {
           Some(at) ->
             at.any(|i: Int|
-              match c.args.at(i) { Some(a) -> reaches_native(reach, a), None -> false }),
-          None -> c.args.any(|a: Type| reaches_native(reach, a)),
+              match c.args.at(i) { Some(a) -> contains_native_type(reach, a), None -> false }),
+          None -> c.args.any(|a: Type| contains_native_type(reach, a)),
         }),
-    RecordType(fs) -> fs.any(|f: Field| reaches_native(reach, f.ty)),
-    NominalType(n) -> n.fields.any(|f: Field| reaches_native(reach, f.ty)),
+    RecordType(fs) -> fs.any(|f: Field| contains_native_type(reach, f.ty)),
+    NominalType(n) -> n.fields.any(|f: Field| contains_native_type(reach, f.ty)),
     FunctionType(_) -> false,
     VariableType(_) -> false,
   }
@@ -1236,7 +1261,7 @@ pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
     { ..checker, comparisons: [] },
     |c: Checker, site: { module: Int, span: Span, ty: Type }| {
       let resolved = resolve(c, site.ty);
-      if contains_fn(resolved) {
+      if contains_function(resolved) {
         report(
           c,
           error_at(
@@ -1258,11 +1283,11 @@ pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
             b"a scoped value cannot be compared for equality",
             Bytes::concat_all([b"both sides have type `", type_text(resolved), b"`"]),
             [
-              b"a scoped value is a key to what its scope will release, not a value: compare what `Scoped::get` reads of each instead",
+              b"a scoped value refers to a value its scope will release, and is not the value itself: compare the results of `Scoped::get` on each instead",
             ],
           ),
         )
-      } else if reaches_native(reach, resolved) {
+      } else if contains_native_type(reach, resolved) {
         report(
           c,
           error_at(
@@ -1311,9 +1336,9 @@ type Rejection = {
 fn parallel_rejection(rows: List<Branch>) -> Option<Rejection> / {abort.raise} = {
   let seed = seed_effect();
   let performing = |pick: (Effect) -> Bool|
-    rows.fold(None, |acc: Option<{ branch: Branch, entry: Effect }>, b: Branch|
-      match acc {
-        Some(_) -> acc,
+    rows.fold(None, |accumulator: Option<{ branch: Branch, entry: Effect }>, b: Branch|
+      match accumulator {
+        Some(_) -> accumulator,
         None -> match b.effects.listed.filter(pick) {
           [entry, ..] -> Some({ branch: b, entry: entry }),
           [] -> None,
@@ -1336,7 +1361,7 @@ fn parallel_rejection(rows: List<Branch>) -> Option<Rejection> / {abort.raise} =
       one(
         p,
         b"a `parallel` branch may not start a `simulate` simulation",
-        b"a simulation's schedule is drawn from its entry's seed, in the order its simulations start, which branches running at once do not have",
+        b"a simulation chooses its schedule from a seed, and the result depends on the order in which simulations start; branches running at the same time start in no fixed order",
       ),
     None -> match performing(|entry: Effect| entry.effect == b"task") {
       Some(p) ->
@@ -1347,8 +1372,8 @@ fn parallel_rejection(rows: List<Branch>) -> Option<Rejection> / {abort.raise} =
         ),
       None -> {
         let n = rows.len();
-        let found = range(0, n).fold(None, |acc: Option<Clash>, j: Int|
-          range(0, j).fold(acc, |inner: Option<Clash>, i: Int|
+        let found = range(0, n).fold(None, |accumulator: Option<Clash>, j: Int|
+          range(0, j).fold(accumulator, |inner: Option<Clash>, i: Int|
             match inner { Some(_) -> inner, None -> clash(rows.get(i), rows.get(j)) }));
         match found {
           None -> None,
@@ -1368,8 +1393,8 @@ fn parallel_rejection(rows: List<Branch>) -> Option<Rejection> / {abort.raise} =
                 },
               ],
               notes: [
-                b"branches run at once, so two of them may not perform operations of one effect on one resource where either is a `write`",
-                b"bind the branches with `let` in the order they must run, or move what they share out of the block",
+                b"branches run at the same time, so two branches may not use the same resource through the same effect if either branch performs a `write`",
+                b"bind the branches with `let` in the order they must run, or move the shared resource out of the block",
               ],
             }),
         }
@@ -1387,8 +1412,8 @@ fn may_alias(a: Resource, b: Resource) -> Bool =
     || (match b { ResourceVariable(_) -> true, AnyResource -> true, _ -> false })
 
 fn clash(x: Branch, y: Branch) -> Option<Clash> / {abort.raise} = {
-  let effects = x.effects.listed.fold(None, |acc: Option<Clash>, a: Effect|
-    y.effects.listed.fold(acc, |inner: Option<Clash>, b: Effect|
+  let effects = x.effects.listed.fold(None, |accumulator: Option<Clash>, a: Effect|
+    y.effects.listed.fold(accumulator, |inner: Option<Clash>, b: Effect|
       match inner {
         Some(_) -> inner,
         None -> if effects_conflict({ ..a, resource: b.resource }, b)
@@ -1436,14 +1461,14 @@ fn scheduler_key_text(ty: Type) -> SchedulerKeyText =
     {
       noun: b"task",
       created_verb: b"spawned",
-      explanation: b"a `Task` is a key into the scheduler that spawned it, and this simulation's scheduler numbers its own tasks, so the key names one of them or none",
+      explanation: b"a `Task` identifies a task in the scheduler that spawned it, and this simulation's scheduler numbers its own tasks, so the `Task` would identify a different task or none",
       suggestion: b"`join` the task inside the simulation and return its value instead",
     }
   } else {
     {
       noun: b"channel",
       created_verb: b"made",
-      explanation: b"a `Chan` is a key into the scheduler that made it, and this simulation's scheduler numbers its own channels, so the key names one of them or none",
+      explanation: b"a `Chan` identifies a channel in the scheduler that made it, and this simulation's scheduler numbers its own channels, so the `Chan` would identify a different channel or none",
       suggestion: b"receive from the channel inside the simulation and return what it received instead",
     }
   }
@@ -1457,10 +1482,10 @@ fn contains_type_named(t: Type, name: Bytes) -> Bool =
       n.fields.fold(false, |b: Bool, f: Field| b || contains_type_named(f.ty, name)),
     FunctionType(f) ->
       List::fold(
-        if name == task_name() { [b"join", b"await", b"cancel"] } else { channel_ops() },
-        f.params.fold(contains_type_named(f.ret, name), |b: Bool, p: Type|
+        if name == task_name() { [b"join", b"await", b"cancel"] } else { channel_operations() },
+        f.params.fold(contains_type_named(f.return_type, name), |b: Bool, p: Type|
           b || contains_type_named(p, name)),
-        |b: Bool, op: Bytes| b || effects_cover(f.effects.listed, task_op(op)),
+        |b: Bool, operation: Bytes| b || effects_cover(f.effects.listed, task_operation(operation)),
       ),
     VariableType(_) -> false,
   }
@@ -1520,9 +1545,9 @@ fn check_simulation_exits(checker: Checker, site: Simulation) -> Checker / {abor
   if !brand_in(ty, Tasks) { checker } else {
     let k = scheduler_key_text(ty);
     let key = if k.noun == b"task" {
-      b"a `Task` is a key into the simulation's scheduler, and the scheduler ends with the simulation"
+      b"a `Task` identifies a task in the simulation's scheduler, and the scheduler ends with the simulation"
     } else {
-      b"a `Chan` is a key into the simulation's scheduler, and the scheduler ends with the simulation"
+      b"a `Chan` identifies a channel in the simulation's scheduler, and the scheduler ends with the simulation"
     };
     let fix = k.suggestion;
     report_error_with_labels(
@@ -1533,7 +1558,7 @@ fn check_simulation_exits(checker: Checker, site: Simulation) -> Checker / {abor
       if carries_brand_in_effects(ty, Tasks) {
         [
           key,
-          b"the closure's effects still include a `task` operation or `sim.read`, so calling it after the simulation reaches a scheduler that has ended",
+          b"the closure's effects still include a `task` operation or `sim.read`, so calling the closure after the simulation ends would use a scheduler that no longer exists",
           fix,
         ]
       } else { [key, fix] },
@@ -1553,9 +1578,9 @@ fn exit_labels(
 }
 
 fn check_nested_simulation(checker: Checker, site: Simulation, sites: List<Simulation>) -> Checker = {
-  let inner = sites.fold(None, |acc: Option<Simulation>, other: Simulation|
-    match acc {
-      Some(_) -> acc,
+  let inner = sites.fold(None, |accumulator: Option<Simulation>, other: Simulation|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> if other.module == site.module && other.span != site.span
           && encloses(site.body_span, other.span) { Some(other) }
       else { None },
@@ -1565,11 +1590,11 @@ fn check_nested_simulation(checker: Checker, site: Simulation, sites: List<Simul
     site.module,
     site.span,
     true,
-    b"this simulation's body reaches `sim.read`",
+    b"this simulation's body performs `sim.read`, directly or through a function it calls",
   );
   let tail = [
-    b"two schedulers means two notions of `runnable`, and a task in the inner simulation blocking the outer one",
-    b"move the inner simulation out, or drop it and let the outer one schedule",
+    b"two schedulers would each decide which tasks are `runnable`, and a task in the inner simulation could block the outer simulation",
+    b"move the inner simulation out of the outer simulation, or remove the inner simulation and let the outer simulation schedule the tasks",
   ];
   match inner {
     Some(o) ->
@@ -1577,7 +1602,7 @@ fn check_nested_simulation(checker: Checker, site: Simulation, sites: List<Simul
         checker,
         b"E0416",
         message,
-        [primary, label_at(o.module, o.span, false, b"the simulation it reaches is here")],
+        [primary, label_at(o.module, o.span, false, b"the inner simulation is here")],
         tail,
       ),
     None ->
@@ -1608,7 +1633,7 @@ fn brand_in(t: Type, brand: ScopedValueKind) -> Bool / {abort.raise} =
     FunctionType(f) ->
       effects_include_brand(f.effects, brand)
         || f.params.fold(false, |b: Bool, p: Type| b || brand_in(p, brand))
-        || brand_in(f.ret, brand),
+        || brand_in(f.return_type, brand),
     RecordType(fs) -> fs.fold(false, |b: Bool, f: Field| b || brand_in(f.ty, brand)),
     NominalType(n) -> n.fields.fold(false, |b: Bool, f: Field| b || brand_in(f.ty, brand)),
   }
@@ -1620,7 +1645,7 @@ fn carries_brand_in_effects(t: Type, brand: ScopedValueKind) -> Bool =
     FunctionType(f) ->
       effects_include_brand(f.effects, brand)
         || f.params.fold(false, |b: Bool, p: Type| b || carries_brand_in_effects(p, brand))
-        || carries_brand_in_effects(f.ret, brand),
+        || carries_brand_in_effects(f.return_type, brand),
     RecordType(fs) ->
       fs.fold(false, |b: Bool, f: Field| b || carries_brand_in_effects(f.ty, brand)),
     NominalType(n) ->
@@ -1644,15 +1669,15 @@ fn check_scope_exits(checker: Checker, site: ScopeSite) -> Checker / {abort.rais
       exit_labels(site.module, site.exits, site.body_span, ty),
       if carries_brand_in_effects(ty, scope_brand(site)) {
         [
-          b"the closure's effects still include `scoped.read`, so calling it after the scope reads a value the scope has released",
+          b"the closure's effects still include `scoped.read`, so calling the closure after the scope ends reads a value that no longer exists",
           b"call the closure inside the scope and return its result instead",
         ]
       } else {
         [
           Bytes::concat_all([
-            b"the scope releases its value at its `}`, so the scoped value names nothing after it",
+            b"the scope ends at its `}`, and the scoped value cannot be used after that",
           ]),
-          b"read the value inside the scope and return what the body made of it instead",
+          b"use the value inside the scope and return a result computed from it instead",
         ]
       },
     )
@@ -1664,8 +1689,8 @@ fn opens_here_text(n: Bytes) -> Bytes =
 
 fn outliving_task_notes() -> List<Bytes> =
   [
-    b"the scheduler that runs the task was installed outside the scope, so the task can still be running when the scope has released its value",
-    b"a `join` inside the scope is not enough: nothing in the types says the task was joined, and a task nobody joins runs on after the scope's `}`",
+    b"the task is run by a scheduler that is installed outside the scope, so the task can still be running after the scope ends",
+    b"a `join` inside the scope is not enough, because the types do not record that the task was joined, and a task that is never joined continues to run after the scope's `}`",
   ]
 
 fn check_scope_spawns(checker: Checker, site: ScopeSite) -> Checker / {abort.raise} =
@@ -1698,12 +1723,15 @@ fn check_scope_spawns(checker: Checker, site: ScopeSite) -> Checker / {abort.rai
     } else {
       match enclosing_branded_clause(c, ty, s.enclosing_clauses, scope_brand(site)) {
         None -> c,
-        Some(cl) -> {
-          let op = backticked_text(
+        Some(enclosing_clause) -> {
+          let operation = backticked_text(
             Bytes::concat_all([
-              as_written({ ..c, module: site.module }, cl.op.effect),
+              as_written({ ..c, module: site.module }, enclosing_clause.operation.effect),
               b".",
-              match cl.op.op { Some(o) -> o, None -> mode_text(cl.op.mode) },
+              match enclosing_clause.operation.operation {
+                Some(o) -> o,
+                None -> mode_text(enclosing_clause.operation.mode),
+              },
             ]),
           );
           report_error_with_labels(
@@ -1712,7 +1740,7 @@ fn check_scope_spawns(checker: Checker, site: ScopeSite) -> Checker / {abort.rai
             Bytes::concat_all([
               b"a value of scope `",
               site.name,
-              b"` reaches another task through a handler around its spawn",
+              b"` is passed to another task by a handler that wraps the task's `task.spawn`",
             ]),
             [
               label_at(
@@ -1721,27 +1749,31 @@ fn check_scope_spawns(checker: Checker, site: ScopeSite) -> Checker / {abort.rai
                 true,
                 Bytes::concat_all([
                   b"this task performs ",
-                  op,
+                  operation,
                   b", which a handler around the spawn handles",
                 ]),
               ),
               label_at(
                 site.module,
-                cl.span,
+                enclosing_clause.span,
                 false,
-                Bytes::concat_all([b"this clause handles it, and reaches `", site.name, b"`"]),
+                Bytes::concat_all([
+                  b"this clause handles the operation, and a value of scope `",
+                  site.name,
+                  b"` is passed to it",
+                ]),
               ),
               label_at(site.module, site.span, false, opens_here_text(site.name)),
             ],
             [
-              b"a task performs against the handlers around its `task.spawn`, so the clause runs on the task's behalf, whenever the task runs",
+              b"the handlers around the task's `task.spawn` handle the task's operations, so this clause runs each time the task performs the operation",
             ].concat(
               outliving_task_notes().push(
                 Bytes::concat_all([
                   b"start the simulation inside `with_scope[",
                   site.name,
                   b"]`, or handle ",
-                  op,
+                  operation,
                   b" without touching `",
                   site.name,
                   b"`",
@@ -1760,21 +1792,23 @@ fn enclosing_branded_clause(
   around: List<ClauseSite>,
   brand: ScopedValueKind,
 ) -> Option<ClauseSite> / {abort.raise} =
-  around.fold(None, |acc: Option<ClauseSite>, cl: ClauseSite|
-    match acc {
-      Some(_) -> acc,
-      None -> if may_perform(task, cl.op) && brand_in(resolve(checker, cl.ty), brand) { Some(cl) }
+  around.fold(None, |accumulator: Option<ClauseSite>, clause: ClauseSite|
+    match accumulator {
+      Some(_) -> accumulator,
+      None -> if may_perform(task, clause.operation)
+          && brand_in(resolve(checker, clause.ty), brand) { Some(clause) }
       else { None },
     })
 
-fn may_perform(task: Type, op: Effect) -> Bool =
+fn may_perform(task: Type, operation: Effect) -> Bool =
   match task {
     FunctionType(f) ->
       f.effects.variable != None
         || f.effects.listed.fold(false, |b: Bool, a: Effect|
           b
-            || (a.effect == op.effect
-            && (a.op == op.op || (a.op == None && mode_eq(a.mode, op.mode))))),
+            || (a.effect == operation.effect
+            && (a.operation == operation.operation
+            || (a.operation == None && mode_eq(a.mode, operation.mode))))),
     _ -> true,
   }
 
@@ -1785,13 +1819,13 @@ fn check_scope_handoffs(checker: Checker, site: ScopeSite) -> Checker / {abort.r
       let n = site.name;
       let carries = if carries_brand_in_effects(ty, scope_brand(site)) {
         [
-          b"the closure's effects still include `scoped.read`, so whoever handles the operation can read a value the scope has released",
+          b"the closure's effects still include `scoped.read`, so whoever handles the operation can read a value after its scope has ended",
         ]
       } else { [] };
       report_error_with_labels(
         c,
         b"E0446",
-        Bytes::concat_all([b"a value of scope `", n, b"` is handed to `", h.op, b"`"]),
+        Bytes::concat_all([b"a value of scope `", n, b"` is passed to `", h.operation, b"`"]),
         [
           label_at(
             site.module,
@@ -1804,13 +1838,13 @@ fn check_scope_handoffs(checker: Checker, site: ScopeSite) -> Checker / {abort.r
         carries.concat([
           Bytes::concat_all([
             b"`",
-            h.op,
+            h.operation,
             b"` is declared outside every scope, so its type cannot say the value belongs to `",
             n,
-            b"`, and the handler \xe2\x80\x94 which may be installed anywhere, and may outlive the scope \xe2\x80\x94 receives it at a type variable that mentions no scope at all",
+            b"`, and a handler can be installed anywhere and can outlive the scope, so the handler receives the value as a type variable that names no scope",
           ]),
           Bytes::concat_all([
-            b"read the value inside the scope and perform the operation with something that does not mention `",
+            b"read the value inside the scope and perform the operation with a value that does not belong to `",
             n,
             b"`",
           ]),
@@ -1939,5 +1973,5 @@ pub fn new_checker(
     alias_constraints: [],
     declaring_type: b"",
     copied: false,
-    assignable: { vars: [], assignment_forbidden_in: None, frame: 0 },
+    assignable: { variables: [], assignment_forbidden_in: None, frame: 0 },
   })

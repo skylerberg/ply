@@ -1,7 +1,3 @@
-//! The capability a program enters another program with, end to end in this process: the program
-//! `compiler.load` reads and `compiler.cc` compiles is opened, bound as options grant it, and its
-//! definitions entered, with how each entry ended and what it used.
-
 import harness (Shipped, LoadedProgram, enter, load_program, scratch, unload_program)
 import spawning.harness (WorkingDirectory, write_project, write)
 import cli.machine
@@ -13,11 +9,8 @@ import std.fs (fs)
 import std.machine as entering
 import std.value (Value, VInt)
 
-/// The capability's operations a test performs.
 effect set MachineAccess = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
 
-/// How one entry ended: the code it chose, its result or what it raised, what it ended with, and
-/// what it used.
 type EntryResult = {
   exit: Option<Int>,
   result: Result<Value, RuntimeDiagnostic>,
@@ -39,7 +32,6 @@ fn entry_result(
   }
 }
 
-/// How `inner.main` of the module `inner` ended, entered under `options`.
 fn main_of(
   inner: String,
   options: Options,
@@ -51,7 +43,6 @@ fn main_of(
   ended
 }
 
-/// Bound with a trace sink that writes nothing; the trace facility closes what an entry leaves open.
 fn traced_quietly() -> Options = { ..default_options(), trace: { sink: "off", level: "info" } }
 
 fn leaves_a_span() -> String =
@@ -72,7 +63,7 @@ fn warns_of_the_open_span(warnings: List<Diagnostic>) -> Unit / {abort.raise} =
 fn code_of(result: Result<Value, RuntimeDiagnostic>) -> Bytes =
   match result { Ok(_) -> b"", Err(r) -> r.diagnostic.code }
 
-test "a program opens, binds and enters a program, which returns its value" {
+test "a program can load another program and run its `main`, which returns the program's value" {
   scratch(|| {
     let ended = main_of("fn main() -> Int = 40 + 2\n", default_options());
     assert_eq(ended.result, Ok(VInt(42)));
@@ -83,14 +74,13 @@ test "a program opens, binds and enters a program, which returns its value" {
 fn exit_code_program() -> String =
   "import std.process (process)\n\nfn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)\n"
 
-test/nondet "a nested program may choose the exit code, where the binding grants the process" {
+test/nondet "a nested program can choose the process exit code when the caller allows it" {
   let ended = main_of(exit_code_program(), default_options());
   assert_eq(ended.exit, Some(7));
   assert_eq(code_of(ended.result), b"")
 }
 
-// A raise is a diagnostic value; the outer program does not unwind through it.
-test "a nested raise is a value, not an unwind" {
+test "a panic in a nested program is returned as an error value with E0502 and does not stop the caller" {
   scratch(|| {
     let ended = main_of(
       "fn main() -> Int / {abort.raise} = panic(\"the inner program's own bug\")\n",
@@ -110,7 +100,7 @@ test "a nested raise is a value, not an unwind" {
   })
 }
 
-test/nondet "an entry that left a span open returns W0609 beside its value" {
+test/nondet "an entry point that ends with a trace span still open returns its value together with warning W0609" {
   write_project([{ path: "inner.ply", text: leaves_a_span() }]);
   let l = load_program(traced_quietly());
   let ended = entry_result(l, "main", []);
@@ -119,7 +109,7 @@ test/nondet "an entry that left a span open returns W0609 beside its value" {
   warns_of_the_open_span(ended.warnings)
 }
 
-test "an edited program's unit enters the new program, and opening one files nothing" {
+test "loading an edited program runs the new code, and loading a program writes no `.ply-cache`" {
   scratch(|| {
     write_project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
     let first = load_program(default_options());
@@ -131,7 +121,6 @@ test "an edited program's unit enters the new program, and opening one files not
     write("inner.ply", "fn main() -> Int = 2\n");
     let again = load_program(default_options());
     assert_eq(entry_result(again, "main", []).result, Ok(VInt(2)));
-    // The first unit stays as it was opened until it is closed.
     assert_eq(entry_result(first, "main", []).result, Ok(VInt(1)));
     let _ = unload_program(first);
     let _ = unload_program(again);
@@ -139,7 +128,7 @@ test "an edited program's unit enters the new program, and opening one files not
   })
 }
 
-test "a call enters a definition with its arguments, and says what it raised" {
+test "calling a definition of a loaded program with arguments returns its result, or the error it raised" {
   scratch(|| {
     write_project([
       {
@@ -163,7 +152,7 @@ test "a call enters a definition with its arguments, and says what it raised" {
   })
 }
 
-test "a memo returns what its body did, and a call of a name never defined is declined" {
+test "a memoized definition returns the same value on repeat calls, and calling an undefined name does not return a value" {
   scratch(|| {
     write_project([
       {
@@ -183,12 +172,9 @@ test "a memo returns what its body did, and a call of a name never defined is de
   })
 }
 
-/// Per round, a task nobody joins and one the root joins, each opening a scope of its own; a task
-/// per round that is let go; and a scoped value per round.
 fn task_spawning_program() -> String =
   String::of_bytes_lossy(embed("../programs/machine_family/churning.ply"))
 
-/// How `name(n)` ended, and what the run held when its root returned.
 fn churn_result(
   name: String,
   n: Int,
@@ -200,8 +186,7 @@ fn churn_result(
   ended
 }
 
-// A server spawns per connection for as long as it runs, so its tables must follow the live tasks.
-test/nondet "a production scheduler keeps its tables to the tasks still live" {
+test/nondet "after many tasks finish, the scheduler's task list, task stacks and frame tables stay small instead of growing with each task" {
   let h = churn_result("spawn_and_join", 200);
   assert_eq(h.result, Ok(VInt(200 * 201 / 2)));
   assert(
@@ -218,8 +203,7 @@ test/nondet "a production scheduler keeps its tables to the tasks still live" {
   )
 }
 
-// A spawn's handle is a bridge, which a server makes per request.
-test/nondet "a production scheduler that drops its task handles gives their native objects back" {
+test/nondet "after many task handles are dropped, the scheduler frees their native objects, so the count stays small" {
   let h = churn_result("fired", 10000);
   assert_eq(h.result, Ok(VInt(10000 * 9999 / 2)));
   assert(

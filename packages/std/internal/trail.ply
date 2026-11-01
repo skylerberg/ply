@@ -1,26 +1,11 @@
-//! The random source of a seeded schedule and what the schedule records: an entry's seed, the two
-//! streams its root expands into, each scheduling point a scheduler takes with what the following
-//! step accessed, and the interleaving an entry's outcome carries, encoded as `std.machine` reads
-//! it.
-//!
-//! A stream is BLAKE3 in counter mode. Block `n` of a root's stream is the digest of the stream's
-//! name, the root, the stream's tag and `n`. Each is eight bytes little-endian, except the tag,
-//! which is one byte. A draw is a block's first eight bytes. The scheduler's choices use tag 0,
-//! and `random`'s draws use tag 1, which is also the stream `std.random`'s `rand` reads. These
-//! never change, so every seed a failure has printed still replays.
-
 import std.bin
 import std.bytes (u64_le)
 import std.list
 
-// --- Streams ------------------------------------------------------------------
-
-/// The two streams a seed's root expands into.
 pub type Domain = | Choices | Draws
 
 fn tag_of(d: Domain) -> Int = match d { Choices -> 0, Draws -> 1 }
 
-/// Block `counter` of `root`'s stream in `domain`.
 fn block(root: U64, domain: Domain, counter: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"ply.sim.stream.1",
@@ -30,24 +15,18 @@ fn block(root: U64, domain: Domain, counter: Int) -> Bytes / {abort.raise} =
   ]).blake3(
   )
 
-/// Draw `counter` of `domain`'s stream: the block's first eight bytes, least significant first.
 fn draw_word(root: U64, domain: Domain, counter: Int) -> U64 / {abort.raise} = {
   let b = block(root, domain, counter);
   U64::of_int(Int::of_u32(b.u32_le(0))) | U64::of_int(Int::of_u32(b.u32_le(4))) << 32
 }
 
-/// Draw `counter` of `root`'s stream in `domain`, with its 64 bits read as a signed `Int`.
 pub fn draw(root: U64, domain: Domain, counter: Int) -> Int / {abort.raise} =
   to_signed(draw_word(root, domain, counter))
 
-/// `n`'s 64 bits read as a signed `Int`, with the top bit as the sign.
 pub fn to_signed(n: U64) -> Int / {abort.raise} =
   if n < 9223372036854775808u64 { Int::of_u64(n) }
   else { Int::of_u64(n - 9223372036854775808u64) +% (-9223372036854775807 - 1) }
 
-/// A draw uniform over `0..n`, and the counter after it. A draw at or above the largest multiple
-/// of `n` below 2^64 is discarded, and the next one is used. When `n` is 1 or less, returns 0 and
-/// advances the counter by one without drawing.
 pub fn below(
   root: U64,
   domain: Domain,
@@ -57,7 +36,6 @@ pub fn below(
   if n <= 1 { { value: 0, counter: counter + 1 } } else {
     let bound = U64::of_int(n);
     let limit = 18446744073709551615u64 / bound * bound;
-    // Each draw is accepted with probability over one half, so 64 rejections in a row never happen.
     iterate(counter, 64, |at: Int| {
       let x = draw_word(root, domain, at);
       if x < limit { Stop({ value: Int::of_u64(x % bound), counter: at + 1 }) }
@@ -65,18 +43,13 @@ pub fn below(
     })
   }
 
-// --- Seeds --------------------------------------------------------------------
-
-/// A root, and the choices for the first scheduling points, used before the root's stream decides.
 pub type Seed = { root: U64, path: List<Int> }
 
-/// The seed as a failure prints it for replay: the root, then `:` and the path's choices separated
-/// by `.` if the path is not empty.
 pub fn seed_text(s: Seed) -> String / {abort.raise} =
-  range(0, s.path.len()).fold(u64_text(s.root), |acc: String, i: Int|
+  range(0, s.path.len()).fold(u64_text(s.root), |accumulator: String, i: Int|
     match s.path.at(i) {
-      Some(c) -> acc ++ (if i == 0 { ":" } else { "." }) ++ c.to_string(),
-      None -> acc,
+      Some(c) -> accumulator ++ (if i == 0 { ":" } else { "." }) ++ c.to_string(),
+      None -> accumulator,
     })
 
 fn u64_text(n: U64) -> String / {abort.raise} = {
@@ -86,9 +59,6 @@ fn u64_text(n: U64) -> String / {abort.raise} = {
   else { U128::to_string(U128::of_int(high) * 4294967296u128 + U128::of_int(low)) }
 }
 
-/// How far an entry's schedulers have progressed through their seed: the scheduling points they
-/// have taken, how far each stream has drawn, and the virtual time the last finished scheduler
-/// used. `budget` is the most scheduling points the entry may take.
 pub type Trail = {
   seed: Seed,
   budget: Int,
@@ -98,17 +68,11 @@ pub type Trail = {
   virtual_time: Int,
 }
 
-/// Default scheduling points per interleaving.
 pub fn default_budget() -> Int = 100000
 
-/// An entry's trail before its first scheduler opens.
 pub fn trail(seed: Seed, budget: Int) -> Trail =
   { seed: seed, budget: max(budget, 1), points: 0, choices: 0, draws: 0, virtual_time: 0 }
 
-/// The choice at the trail's next point among `enabled` tasks, which is at least one, and the
-/// choices stream's counter after it. The choice comes from the seed's path while it lasts, then
-/// from a draw. A path choice at or above `enabled` means a replay did not reproduce the schedule
-/// it recorded.
 pub fn choose(t: Trail, enabled: Int) -> { choice: Int, choices: Int } / {abort.raise} =
   match if t.points < t.seed.path.len() { t.seed.path.at(t.points) } else { None } {
     Some(c) -> { choice: c, choices: t.choices },
@@ -118,41 +82,26 @@ pub fn choose(t: Trail, enabled: Int) -> { choice: Int, choices: Int } / {abort.
     },
   }
 
-/// The next draw of `random`, which uses up one draw.
 pub fn next_draw(t: Trail) -> Int / {abort.raise} = draw(t.seed.root, Draws, t.draws)
 
-/// A draw of `random` below `n`, which is at least 1, and the draws counter after it.
 pub fn draw_below(t: Trail, n: Int) -> { value: Int, counter: Int } / {abort.raise} =
   below(t.seed.root, Draws, t.draws, n)
 
-// --- Steps --------------------------------------------------------------------
-
-/// A position in the source where a task was, as the runtime stores a site: the root's id and
-/// offsets from its start. The root is -1 for no position.
 pub type Site = { root: Int, start: Int, end: Int }
 
-/// No position.
 pub fn nowhere() -> Site = { root: -1, start: 0, end: 0 }
 
 derive bin for Site
 
-/// What an effect names: one label, a label the definition is generic over (by its place), the
-/// singleton, or every label.
 pub type Resource = | Named(String) | Variable(Int) | Singleton | Every
 
-/// How an effect is accessed: read, written, or raised.
 pub type Mode = | Read | Write | Raise
 
-/// What a step accessed: an effect (its name, resource, mode, and the operation if it names
-/// one), a handler's variable (its `handle`, its index there, the mode), or a scoped value (its
-/// number among the entry's scoped values, the mode). Accesses are in runtime order, so a step
-/// always lists its accesses in the same order.
 pub type Access =
   | Effect(String, Resource, Mode, Option<String>)
   | Var(Int, Int, Mode)
   | ScopedValue(Int, Mode)
 
-/// Whether two accesses conflict: they access the same thing, and at least one writes it.
 pub fn conflicts(a: Access, b: Access) -> Bool =
   match ((a, b)) {
     (Effect(e, r, m, _), Effect(f, s, n, _)) -> e == f && r == s && (m == Write || n == Write),
@@ -161,22 +110,17 @@ pub fn conflicts(a: Access, b: Access) -> Bool =
     _ -> false,
   }
 
-/// What a cancel writes and every step of the cancelled task reads.
 pub fn liveness(task: Int, mode: Mode) -> Access =
   Effect("task.alive", Named("@" ++ task.to_string()), mode, None)
 
-/// What a task's last step writes, and what a cancel that ends a join on the task writes.
 pub fn end_access(task: Int) -> Access =
   Effect("task.end", Named("@" ++ task.to_string()), Write, None)
 
-/// What every operation on a channel writes.
 pub fn channel_access(chan: Int) -> Access =
   Effect("task.chan", Named("#" ++ chan.to_string()), Write, None)
 
-/// What creating a channel writes, since the order of two creations decides each channel's id.
 pub fn new_channel_access() -> Access = Effect("task.chan", Named("new"), Write, None)
 
-/// `xs` with `a` added, keeping each access once and in order.
 pub fn with_access(xs: List<Access>, a: Access) -> List<Access> =
   if xs.len() == 0 { xs.push(a) } else {
     match xs.index_of(a) {
@@ -188,10 +132,6 @@ pub fn with_access(xs: List<Access>, a: Access) -> List<Access> =
     }
   }
 
-/// One scheduling point: the scheduler and task it resumed, every task it could have resumed in the
-/// order a choice indexes them, which one it chose, what the following step accessed, where that
-/// step first accessed something or else gave up control, and the task's vector clock. The clock
-/// records, for each task, which of its earlier steps this task had observed.
 pub type Step = {
   scheduler: Int,
   task: Int,
@@ -202,8 +142,6 @@ pub type Step = {
   vector_clock: List<Int>,
 }
 
-/// Whether `later`'s task had observed `earlier`'s step, through the spawns, joins and channels
-/// between them.
 pub fn happens_before(earlier: Step, later: Step) -> Bool =
   if earlier.vector_clock.len() == 0 || later.vector_clock.len() == 0 { false } else {
     let mine = match earlier.vector_clock.at(earlier.task) { Some(n) -> n, None -> 0 };
@@ -211,31 +149,22 @@ pub fn happens_before(earlier: Step, later: Step) -> Bool =
     mine > 0 && theirs >= mine
   }
 
-// --- What an outcome carries ----------------------------------------------------
-
-/// A site as an outcome reports it: the definition it is in, and the root and offsets of its span
-/// there. These are `None` where the runtime knows no root.
 pub type Location = { definition: Option<String>, site: Option<NamedSite> }
 
-/// A span in a root's definition: the root's name and offsets from its start.
 pub type NamedSite = { root: String, start: Int, end: Int }
 
 type EncodedAccess =
-  | EffectAccess({ effect: String, resource: Option<String>, write: Bool, op: Option<String> })
+  | EffectAccess({ effect: String, resource: Option<String>, write: Bool, operation: Option<String> })
   | VariableAccess({ handler: Int, index: Int, write: Bool })
   | ScopedAccess({ id: Int, write: Bool })
 
 derive bin for NamedSite
 derive bin for EncodedAccess
 
-/// The steps an entry's schedulers took, encoded as an interleaving stores them: how many, and
-/// their bytes.
 pub type EncodedSteps = { count: Int, bytes: Bytes }
 
-/// No encoded steps.
 pub fn no_steps() -> EncodedSteps = { count: 0, bytes: b"" }
 
-/// `w` followed by `steps`, with each site located by `locate`, which is called once per site.
 pub fn encode_steps<| e>(
   w: EncodedSteps,
   steps: List<Step>,
@@ -243,20 +172,21 @@ pub fn encode_steps<| e>(
 ) -> EncodedSteps / {abort.raise | e} = {
   let out = steps.fold(
     { bytes: w.bytes, last: nowhere(), place: no_location(), sites: Map::new() },
-    |acc: StepEncoding, s: Step|
+    |accumulator: StepEncoding, s: Step|
       match s.site {
-        None -> { ..acc, bytes: step_put(acc.bytes, s, no_location()) },
-        Some(site) -> if site == acc.last { { ..acc, bytes: step_put(acc.bytes, s, acc.place) } }
-        else {
-          let p = match acc.sites.get(site) {
+        None -> { ..accumulator, bytes: step_put(accumulator.bytes, s, no_location()) },
+        Some(site) -> if site == accumulator.last {
+          { ..accumulator, bytes: step_put(accumulator.bytes, s, accumulator.place) }
+        } else {
+          let p = match accumulator.sites.get(site) {
             Some(known) -> known,
             None -> bin::encode(locate(site), location_bin()),
           };
           {
-            bytes: step_put(acc.bytes, s, p),
+            bytes: step_put(accumulator.bytes, s, p),
             last: site,
             place: p,
-            sites: acc.sites.insert(site, p),
+            sites: accumulator.sites.insert(site, p),
           }
         },
       },
@@ -264,16 +194,11 @@ pub fn encode_steps<| e>(
   { count: w.count + steps.len(), bytes: out.bytes }
 }
 
-/// The state of encoding steps: the bytes so far, the last step's site and its encoded location,
-/// and every site located so far.
 type StepEncoding = { bytes: Bytes, last: Site, place: Bytes, sites: Map<Site, Bytes> }
 
-/// The encoding of a step with no location.
 fn no_location() -> Bytes / {abort.raise} =
   bin::encode({ definition: None, site: None }, location_bin())
 
-/// `w` followed by `s`, encoded as `std.machine`'s `Step` reads it: its scheduler, its task, the
-/// enabled tasks, its choice, its accesses, its encoded location `place`, and its clock.
 fn step_put(w: Bytes, s: Step, place: Bytes) -> Bytes / {abort.raise} = {
   let head = int_put(ints_put(int_put(int_put(w, s.scheduler), s.task), s.runnable), s.choice);
   let touched = if s.accesses.len() == 0 { head ++ byte_of_int(0) }
@@ -281,29 +206,25 @@ fn step_put(w: Bytes, s: Step, place: Bytes) -> Bytes / {abort.raise} = {
   ints_put(touched ++ place, s.vector_clock)
 }
 
-/// `w` followed by `n`, encoded as `bin::put_int` does.
 fn int_put(w: Bytes, n: Int) -> Bytes / {abort.raise} = count_put(w, n << 1 ^ n >> 63)
 
 fn ints_put(w: Bytes, xs: List<Int>) -> Bytes / {abort.raise} =
   xs.fold(count_put(w, xs.len()), |b: Bytes, n: Int| int_put(b, n))
 
-/// `w` followed by `n`, encoded as `bin::put_varint` does, with a one-byte value written directly.
 fn count_put(w: Bytes, n: Int) -> Bytes / {abort.raise} =
   if n >= 0 && n < 128 { w ++ byte_of_int(n) } else { bin::put_varint(w, n) }
 
-/// The interleaving an outcome carries: the steps in `w`, then the virtual time the last scheduler
-/// used.
 pub fn interleaving_of(w: EncodedSteps, virtual_time: Int) -> Bytes / {abort.raise} =
   bin::put_int(bin::put_varint(b"", w.count) ++ w.bytes, virtual_time)
 
 fn encode_access(a: Access) -> EncodedAccess =
   match a {
-    Effect(named, resource, mode, op) ->
+    Effect(named, resource, mode, operation) ->
       EffectAccess({
         effect: named,
         resource: resource_text(resource),
         write: mode == Write,
-        op: op,
+        operation: operation,
       }),
     Var(handler, index, mode) ->
       VariableAccess({ handler: handler, index: index, write: mode == Write }),
@@ -318,13 +239,8 @@ fn resource_text(r: Resource) -> Option<String> =
     Singleton -> None,
   }
 
-// --- What the runtime stores of a trail ----------------------------------------------
-
-/// What an entry's schedulers pass on to the next scheduler: the trail, and every step they took,
-/// encoded.
 pub type SavedTrail = { trail: Trail, written: EncodedSteps }
 
-/// What a seeded step accessed, and where the access was made, as the runtime writes it.
 pub type Touch = { access: Access, at: Site }
 
 derive bin for Seed
@@ -337,35 +253,28 @@ derive bin for SavedTrail
 derive bin for Touch
 derive bin for Location
 
-/// `l` encoded as the runtime stores it between an entry's schedulers.
 pub fn encode_saved_trail(l: SavedTrail) -> Bytes / {abort.raise} =
   bin::encode(l, saved_trail_bin())
 
-/// Decodes what the runtime stored, or `None` before the entry's first scheduler.
 pub fn decode_saved_trail(bytes: Bytes) -> Option<SavedTrail> / {abort.raise} =
   if bytes.len() == 0 { None } else { Some(read(bytes, saved_trail_bin())) }
 
-/// What the running step accessed, as the runtime wrote it, without the `task` and `clock`
-/// operations it performed. The scheduler orders those itself, so they are not part of the
-/// effects.
 pub fn touches_of(bytes: Bytes) -> List<Touch> / {abort.raise} =
   read(bytes, bin::list_bin(touch_bin())).filter(|t: Touch|
     match t.access { Effect(e, _, _, _) -> e != "task" && e != "clock", _ -> true })
 
-/// Decodes a site's location as the runtime wrote it.
 pub fn location_of(bytes: Bytes) -> Location / {abort.raise} = read(bytes, location_bin())
 
-/// Decodes what the runtime wrote. The runtime always writes complete data, so bytes that do not
-/// decode are a bug in Ply.
 fn read<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {abort.raise} =
   match bin::decode(bytes, codec) {
     Ok(x) -> x,
-    Err(e) -> panic("the runtime's trail does not read: " ++ bin::error_to_string(e)),
+    Err(e) ->
+      panic(
+        "the data the runtime recorded about the program's effects cannot be decoded: "
+          ++ bin::error_to_string(e),
+      ),
   }
 
-// --- Tests --------------------------------------------------------------------
-
-// Computed outside Ply with the runtime's BLAKE3; printed seeds replay only if these never change.
 test "the streams draw fixed values, so printed seeds replay" {
   assert_eq(
     block(0u64, Choices, 0).hex_of(),
@@ -386,30 +295,28 @@ test "the streams draw fixed values, so printed seeds replay" {
   ])
 }
 
-test "a draw below a bound discards draws past the bound's last multiple, with fixed results" {
+test "`below` rejects random draws above the bound's largest multiple, and returns the same values for the same seed number" {
   let bounds = [2, 3, 1, 5, 2, 7, 1, 4];
   let drew = |root: U64|
-    bounds.fold({ out: [], counter: 0 }, |acc: { out: List<Int>, counter: Int }, n: Int| {
-      let d = below(root, Choices, acc.counter, n);
-      { out: acc.out.push(d.value), counter: d.counter }
+    bounds.fold({ out: [], counter: 0 }, |accumulator: { out: List<Int>, counter: Int }, n: Int| {
+      let d = below(root, Choices, accumulator.counter, n);
+      { out: accumulator.out.push(d.value), counter: d.counter }
     });
   assert_eq(drew(0u64), { out: [1, 1, 0, 4, 1, 0, 0, 2], counter: 8 });
   assert_eq(drew(7u64), { out: [1, 2, 0, 0, 1, 4, 0, 0], counter: 8 })
 }
 
-test "a seed prints its root and then its path" {
+test "`seed_text` prints a seed as its number, then a colon and its list of choices joined by dots if the list is not empty" {
   assert_eq(seed_text({ root: 7u64, path: [] }), "7");
   assert_eq(seed_text({ root: 0u64, path: [1, 0, 2] }), "0:1.0.2");
   assert_eq(seed_text({ root: 18446744073709551615u64, path: [3] }), "18446744073709551615:3")
 }
 
-test "the seed's path chooses while it lasts, and the stream after it" {
+test "`choose` returns the seed's recorded choices in order, then draws from the seed's random numbers once they run out" {
   let t = trail({ root: 0u64, path: [1, 0] }, 10);
   assert_eq(choose(t, 3), { choice: 1, choices: 0 });
   assert_eq(choose({ ..t, points: 1 }, 3), { choice: 0, choices: 0 });
-  // Past the path the stream decides: root 0's first draw below 2 is 1.
   assert_eq(choose({ ..t, points: 2 }, 2), { choice: 1, choices: 1 });
-  // One enabled task still uses up a draw, so later points draw the same values.
   assert_eq(choose({ ..t, points: 2 }, 1), { choice: 0, choices: 1 });
   assert_eq(choose(trail({ root: 0u64, path: [5] }, 10), 3), { choice: 5, choices: 0 })
 }
@@ -417,17 +324,16 @@ test "the seed's path chooses while it lasts, and the stream after it" {
 test "a step lists each access once, in the order the runtime ordered them" {
   let a = liveness(2, Write);
   let b = channel_access(1);
-  let held = ScopedValue(4, Read);
-  let both = with_access(with_access(with_access([], held), a), b);
-  assert_eq(both, [a, b, held]);
+  let scoped_access = ScopedValue(4, Read);
+  let both = with_access(with_access(with_access([], scoped_access), a), b);
+  assert_eq(both, [a, b, scoped_access]);
   assert_eq(with_access(both, a), both);
   assert(conflicts(a, liveness(2, Read)));
   assert(!conflicts(liveness(2, Read), liveness(2, Read)));
   assert(!conflicts(a, b))
 }
 
-// The bytes `ply-compiled`'s `rt_footprint_taken` and `rt_site_placed` write, also checked there.
-test "the runtime's effect and site encodings decode here, without task and clock operations" {
+test "the trail decoders read the runtime's encoded accesses and source locations, ignore task and clock accesses, and a saved trail encodes and decodes back to itself" {
   assert_eq(touches_of(b"\x02\x00\x03log\x00\x01x\x01\x00\x06\x02\x04\x02\x12\x00\x00\x00\x00"), [
     { access: Effect("log", Named("x"), Write, None), at: { root: 3, start: 1, end: 2 } },
     { access: ScopedValue(9, Read), at: { root: 0, start: 0, end: 0 } },
@@ -458,7 +364,7 @@ test "the runtime's effect and site encodings decode here, without task and cloc
   assert_eq(decode_saved_trail(b""), None)
 }
 
-test "a step happened before another when the other's clock has seen it" {
+test "`happens_before` is true when the later step's vector clock includes the earlier step" {
   let step = |task: Int, stamp: List<Int>|
     {
       scheduler: 0,

@@ -1,7 +1,3 @@
-//! A program's own process under `ply run`: its arguments, streams, input and exit code, the
-//! children it starts, and that none of them outlives the run. What a program writes goes to the
-//! process's own streams, so every run here is one.
-
 import spawning.harness (Server, write_program, spawned, spawned_reading, spawned_fed, spawned_into,
                          this_ply, start_streaming, next_line, signal_to, wait_for_exit,
                          environment, all_output, stdout, stderr, json_of, at, str, int, bool,
@@ -49,7 +45,7 @@ test/nondet "a line read past the end of input is None" {
   assert(stdout(r).contains("end of input"), Some(stdout(r)))
 }
 
-test/nondet "under json the object is alone on stdout and the lines go to stderr" {
+test/nondet "with `--json`, `run` prints only the JSON result on stdout and sends the program's output lines to stderr" {
   write_program(source());
   let r = spawned(["run", "m.ply", "--json", "--", "x"], []);
   assert(r.code == 3, Some(all_output(r)));
@@ -62,7 +58,7 @@ test/nondet "under json the object is alone on stdout and the lines go to stderr
   assert(stderr(r).contains("leaving"), Some(stderr(r)))
 }
 
-test/nondet "an exit code the shell could not carry is a runtime error" {
+test/nondet "`process.exit` with a code outside 0 to 125 is a runtime error" {
   write_program(
     "import std.process (process)\n\nfn main() -> Unit / {process.write[proc]} = process.exit[proc](300)\n",
   );
@@ -72,7 +68,7 @@ test/nondet "an exit code the shell could not carry is a runtime error" {
   assert(stderr(r).contains("0 to 125"), Some(stderr(r)))
 }
 
-test/nondet "ply test withholds the process" {
+test/nondet "`ply test` rejects `process.out` because tests cannot write to the real process" {
   write_program(
     \\import std.process (process)
     \\
@@ -94,7 +90,7 @@ test/nondet "ply test withholds the process" {
   )
 }
 
-test/nondet "a run that never exits reports its value under json" {
+test/nondet "a run that returns without calling `process.exit` reports its return value under `--json`" {
   write_program(
     "import std.process (process)\n\nfn main() -> Int / {process.read[proc]} = process.args[proc]().len()\n",
   );
@@ -104,12 +100,11 @@ test/nondet "a run that never exits reports its value under json" {
   assert(str(at(v, "value")) == "2", Some(json_text(v)))
 }
 
-/// Says, for two labels, whether the run bound a program to each; it starts neither.
-fn asks_what_is_bound() -> String =
+fn queries_what_is_bound() -> String =
   String::of_bytes_lossy(embed("../programs/process_cli/asks_what_is_bound.ply"))
 
-test/nondet "bound returns from the exec table the run was given" {
-  write_program(asks_what_is_bound());
+test/nondet "a program sees a command as available only when `--exec` gave it that command" {
+  write_program(queries_what_is_bound());
   [{ exec: ["--exec", "sh=/bin/sh"], sh: "sh is bound" }, { exec: [], sh: "sh is not bound" }].fold(
     (),
     |u: Unit, c: { exec: List<String>, sh: String }| {
@@ -122,7 +117,6 @@ test/nondet "bound returns from the exec table the run was given" {
   )
 }
 
-/// Starts a child that says its pid and sleeps, says that pid, then ends as `ENDING` says.
 fn leaves_a_child() -> String =
   \\import std.process
   \\import std.process (process)
@@ -131,7 +125,7 @@ fn leaves_a_child() -> String =
   \\  let started = process.start[sh](
   \\    ["-c", "echo $$; exec sleep 600"],
   \\    "",
-  \\    [process::var("PATH", "/usr/bin:/bin")],
+  \\    [process::environment_variable("PATH", "/usr/bin:/bin")],
   \\    { input: false, out: process::Lines, err: process::Discard },
   \\  );
   \\  match started {
@@ -147,7 +141,6 @@ fn leaves_a_child() -> String =
   \\}
   \\
 
-/// The same program asking whether it is stopping first, so its run drains on a stop.
 fn stopping_program() -> String =
   leaves_a_child().replace(
     "import std.process (process)\n",
@@ -165,7 +158,6 @@ fn leaving(ending: String) -> Unit / {WorkingDirectory, abort.raise} =
 fn pid_in(line: String) -> Option<String> / {abort.raise} =
   if line.starts_with("pid ") { Some(line.slice(4, line.len()).trim()) } else { None }
 
-/// Whether any process has this pid, as `kill -0` asks.
 fn alive(pid: String) -> Bool / {config.get[env], process.spawn[sh]} =
   match process.spawn[sh](["-c", "kill -0 " ++ pid ++ " 2>/dev/null"], "", environment([])).ended {
     Exited(c) -> c == 0,
@@ -193,15 +185,12 @@ test/nondet "a child still running when the run ends does not outlive it" {
   })
 }
 
-/// The pid the run's child said, read as the run writes it.
 fn printed_pid(server: Server) -> String / {PlyProcess, abort.raise, diverges} =
   match next_line(server, 300000) {
     Some(line) -> match pid_in(line) { Some(pid) -> pid, None -> printed_pid(server) },
     None -> panic("the run never said the child's pid"),
   }
 
-/// A run of `source` waiting on its child, stopped from outside: how the run ended, and the
-/// child's pid.
 type StoppedRun = { code: Int, pid: String }
 
 fn stop_run(
@@ -221,8 +210,7 @@ fn stop_run(
   { code: match f.ended { Exited(c) -> c, Signalled(_) -> -1 }, pid: pid }
 }
 
-// Nothing of it drains, so the stop is the end: its children go, and the code is the signal's.
-test/nondet "a run that starts a child and drains nothing ends the child and exits at the first stop" {
+test/nondet "`ply run` of a program that leaves a child process running kills the child and exits 143 when it gets SIGTERM" {
   let s = stop_run(leaves_a_child(), [], 1);
   assert(s.code == 143, Some("a `SIGTERM` ending the run at once exits 143"));
   assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the run"))
@@ -234,7 +222,7 @@ test/nondet "a second signal ends the children before the run exits" {
   assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the second signal"))
 }
 
-test/nondet "a drain that runs out of time ends the children with the run" {
+test/nondet "when `--drain-ms` time runs out while `ply run` waits for child processes, it kills them and exits with status 3" {
   let s = stop_run(stopping_program(), ["--drain-ms", "200"], 1);
   assert(s.code == 3, Some("an expired drain exits 3"));
   assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the drain"))
@@ -242,7 +230,6 @@ test/nondet "a drain that runs out of time ends the children with the run" {
 
 fn exit_of(f: CompletedProcess) -> Int = match f.ended { Exited(c) -> c, Signalled(n) -> 128 + n }
 
-/// `cat`: standard input to standard output through `std.io`, then an exit.
 fn cat() -> String =
   \\import std.io
   \\import std.io (io)
@@ -258,8 +245,6 @@ fn cat() -> String =
   \\}
   \\
 
-/// Every byte there is, over and over: more than standard output's buffer holds, with a NUL,
-/// newlines and bytes that are no UTF-8 among them.
 fn every_byte() -> Bytes / {abort.raise} =
   Bytes::concat_all(range(0, 256).map(byte_of_int)).repeat(300)
 
@@ -297,14 +282,13 @@ test/nondet "under json the bytes a program writes go to stderr, where its lines
 
 fn prompts() -> String = String::of_bytes_lossy(embed("../programs/process_cli/prompts.ply"))
 
-test/nondet "a prompt and its response share a line, and bytes read after a line start where it ended" {
+test/nondet "a prompt and the typed response appear on one line, and the program can keep reading input after that line" {
   write_program(prompts());
   let r = spawned_reading(["run", "m.ply"], [], "ada\r\nrest of it");
   assert(r.code == 0, Some(all_output(r)));
   assert(stdout(r).contains("name: hello ada, and 10 bytes follow"), Some(stdout(r)))
 }
 
-/// Writes part of a line and never flushes it, then ends as `ENDING` says.
 fn half_a_line() -> String =
   \\import std.process
   \\import std.process (process, pipe)
@@ -331,7 +315,6 @@ test/nondet "what a program wrote and never flushed is written however it ends" 
   })
 }
 
-/// A program that writes far more than `head -1` reads, as `WRITES` writes it.
 fn writes_into_head() -> String =
   \\import std.process
   \\import std.process (process, pipe)
@@ -367,13 +350,10 @@ fn results_the_pipe() -> String =
   \\    }
   \\  }
 
-/// What `ply run m.ply` leaves when the reader of its output takes one line and goes, as `head -1`
-/// does: that line, and on stderr what the run said and then `status` and the code it exited with.
-/// The reader is a shell's own `read`, which takes a line and not a byte past it.
 fn pipe_to_reader() -> CompletedProcess / {Shell, abort.raise} =
   spawned_into(["run", "m.ply"], "{ read a; echo \"$a\"; }")
 
-test/nondet "a program writing into a pipe whose reader left exits quietly, as a closed pipe ends one" {
+test/nondet "a program writing to a pipe whose reader has exited stops quietly with status 141, like any program on a closed pipe" {
   [
     { writes: "lines(200000)", first: b"line 200000\n" },
     { writes: "bytes(200000)", first: b"0123456789abcdef\n" },
@@ -397,14 +377,11 @@ test/nondet "a program that handles the closed pipe goes on, and ends as it choo
   assert(err.contains("status 7"), Some(err))
 }
 
-/// Asks about each signal once, says it is ready, then says which arrive until it is stopped.
 fn listens() -> String = String::of_bytes_lossy(embed("../programs/process_cli/listens.ply"))
 
-/// Says it is ready and waits, asking about no signal.
-fn asks_nothing() -> String =
+fn queries_nothing() -> String =
   String::of_bytes_lossy(embed("../programs/process_cli/asks_nothing.ply"))
 
-/// The run's lines up to the one that is `wanted`, or the test fails with what came instead.
 fn wait_for_line(run: Server, wanted: String, tries: Int) -> Unit / {PlyProcess, abort.raise} =
   if tries <= 0 { panic("the run never said `" ++ wanted ++ "`") } else {
     match next_line(run, 120000) {
@@ -421,14 +398,14 @@ test/nondet "a program that asked about a signal is told when it arrives, and go
   let run = start_streaming(["run", "m.ply"], []);
   wait_for_line(run, "ready", 20);
   [
-    { signal: Hangup, said: "got hangup" },
-    { signal: User1, said: "got user1" },
-    { signal: User2, said: "got user2" },
-    { signal: WindowChange, said: "got resized" },
-    { signal: Hangup, said: "got hangup" },
-  ].fold((), |u: Unit, c: { signal: Signal, said: String }| {
+    { signal: Hangup, messages: "got hangup" },
+    { signal: User1, messages: "got user1" },
+    { signal: User2, messages: "got user2" },
+    { signal: WindowChange, messages: "got resized" },
+    { signal: Hangup, messages: "got hangup" },
+  ].fold((), |u: Unit, c: { signal: Signal, messages: String }| {
     signal_to(run, c.signal);
-    wait_for_line(run, c.said, 1)
+    wait_for_line(run, c.messages, 1)
   });
   signal_to(run, Terminate);
   let f = wait_for_exit(run, 60000, "the run was still going a minute after it was asked to stop");
@@ -438,8 +415,8 @@ test/nondet "a program that asked about a signal is told when it arrives, and go
   )
 }
 
-test/nondet "a hangup nobody asked about ends the process, as the platform has it" {
-  write_program(asks_nothing());
+test/nondet "a program with no SIGHUP handler is killed by SIGHUP, as the operating system does by default" {
+  write_program(queries_nothing());
   let run = start_streaming(["run", "m.ply"], []);
   wait_for_line(run, "ready", 20);
   signal_to(run, Hangup);
@@ -447,9 +424,8 @@ test/nondet "a hangup nobody asked about ends the process, as the platform has i
   assert(f.ended == Signalled(1), Some("ended as " ++ exit_of(f).to_string()))
 }
 
-// Its root neither performs `signal` nor accepts a connection, so its run has no drain to begin.
-test/nondet "a run that listens for no stop ends at once when it is stopped" {
-  write_program(asks_nothing());
+test/nondet "a run that never checks for a stop signal is killed immediately by `SIGTERM`" {
+  write_program(queries_nothing());
   let run = start_streaming(["run", "m.ply"], []);
   wait_for_line(run, "ready", 20);
   signal_to(run, Terminate);
@@ -460,11 +436,10 @@ test/nondet "a run that listens for no stop ends at once when it is stopped" {
 fn describes_the_machine() -> String =
   String::of_bytes_lossy(embed("../programs/process_cli/describes_the_machine.ply"))
 
-/// One line a shell command writes, without its ending.
 fn shell_output(command: String) -> String / {process.spawn[sh], config.get[env]} =
   String::of_bytes_lossy(process.spawn[sh](["-c", command], "", environment([])).out).ascii_trim()
 
-test/nondet "a program is told the machine it runs on, as the system's own tools tell it" {
+test/nondet "`std.os` reports the same family, name, architecture, host, user and executable as the system's `uname` and `id` commands" {
   write_program(describes_the_machine());
   let r = spawned(["run", "m.ply"], []);
   assert(r.code == 0, Some(all_output(r)));
@@ -489,8 +464,7 @@ test/nondet "a program is told the machine it runs on, as the system's own tools
   has("pointer " ++ shell_output("getconf LONG_BIT"))
 }
 
-// `std.os` declares its host handler, so a program reads the machine it runs on with no grant.
-test/nondet "a program reads the machine it runs on with no flag, through the host handler std.os declares" {
+test/nondet "a program can call `std.os` read operations without any `--exec` or other permission flag" {
   write_program(
     "import std.os (os)\n\nfn main() -> Int / {os.read} = if os.cpus() >= 1 && os.pid() > 1 && os.executable() != None { 7 } else { 3 }\n",
   );
@@ -499,7 +473,7 @@ test/nondet "a program reads the machine it runs on with no flag, through the ho
   assert_eq(str(at(json_of(r), "value")), "7")
 }
 
-test/nondet "ply test withholds the streams as bytes" {
+test/nondet "`ply test` rejects `process.out_bytes` and `process.in_bytes` because tests cannot use the real process streams" {
   [
     {
       program: "import std.process (process)\n\ntest/nondet \"asks\" {\n  assert(process.out_bytes[proc](b\"x\"))\n}\n",
@@ -521,9 +495,7 @@ test/nondet "ply test withholds the streams as bytes" {
   })
 }
 
-// The console is open to a test as to any run: the streams of one spawned here are pipes, and a
-// test's run listens for no stop, so it hears no signal.
-test/nondet "a test asks the terminal and the signals through their host handlers" {
+test/nondet "inside `ply test`, terminal and signal operations return stand-in values such as no size and no signal" {
   write_program(
     "import std.process (Stdin, Stdout, Stderr)\nimport std.signal (signal)\nimport std.term (term, Raw)\n\ntest/nondet \"asks\" {\n  assert(term.size() == None);\n  assert(!term.is_terminal(Stdin) && !term.is_terminal(Stdout) && !term.is_terminal(Stderr));\n  assert(term.mode(Raw) == None);\n  assert(!signal.hangup())\n}\n",
   );

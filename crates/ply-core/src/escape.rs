@@ -1,9 +1,5 @@
-//! Escape enforcement at the boundaries the brand cannot see.
-
 use crate::{Diagnostic, Span, codes};
 
-/// What may not cross a boundary: a continuation, which no type records as one, and a task or a
-/// channel, which only the scheduler that made it can hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
     Continuation,
@@ -12,7 +8,6 @@ pub enum Handle {
 }
 
 impl Handle {
-    /// A continuation has no type of its own to name: its type is a function's.
     fn noun(self) -> &'static str {
         match self {
             Handle::Continuation => "a continuation",
@@ -34,7 +29,6 @@ impl Handle {
         }
     }
 
-    /// Why no type rejected it before the boundary did.
     fn unseen(self) -> &'static str {
         match self {
             Handle::Continuation => {
@@ -48,7 +42,6 @@ impl Handle {
         }
     }
 
-    /// What the program does instead, at an entry's result.
     fn instead(self) -> &'static str {
         match self {
             Handle::Continuation => {
@@ -64,13 +57,12 @@ impl Handle {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Escapee {
+pub struct EscapedHandle {
     pub handle: Handle,
-    /// Outermost first, e.g. `["item 2", "`Just`'s argument 1"]`.
     pub route: Vec<String>,
 }
 
-impl Escapee {
+impl EscapedHandle {
     pub fn reached(&self) -> String {
         if self.route.is_empty() {
             return String::new();
@@ -81,26 +73,26 @@ impl Escapee {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary<'a> {
-    EntryResult { name: &'a str },
+    ReturnedFromEntry { name: &'a str },
 }
 
 impl Boundary<'_> {
     fn headline(&self, handle: Handle, reached: &str) -> String {
         let what = handle.noun();
         match self {
-            Boundary::EntryResult { name } => format!("`{name}` returned {what}{reached}"),
+            Boundary::ReturnedFromEntry { name } => format!("`{name}` returned {what}{reached}"),
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
-            Boundary::EntryResult { .. } => "returned here",
+            Boundary::ReturnedFromEntry { .. } => "returned here",
         }
     }
 
     fn outlives(&self) -> &'static str {
         match self {
-            Boundary::EntryResult { .. } => {
+            Boundary::ReturnedFromEntry { .. } => {
                 "an entry point's result goes to its caller, which keeps it after the entry has \
                  ended and closed every scheduler it opened"
             }
@@ -109,15 +101,14 @@ impl Boundary<'_> {
 
     fn remedy(&self, handle: Handle) -> &'static str {
         match self {
-            Boundary::EntryResult { .. } => handle.instead(),
+            Boundary::ReturnedFromEntry { .. } => handle.instead(),
         }
     }
 }
 
-/// `escapee` rejected at `boundary`.
 #[cold]
 #[inline(never)]
-pub fn rejected(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {
+pub fn rejected(boundary: &Boundary<'_>, escapee: &EscapedHandle, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::SCHEDULER_ESCAPE_AT_BOUNDARY,
         boundary.headline(escapee.handle, &escapee.reached()),

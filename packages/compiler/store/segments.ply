@@ -73,14 +73,14 @@ fn table_entries_from(
   b: Bytes,
   at: Int,
   end_run: Int,
-  acc: List<TableEntry>,
+  accumulator: List<TableEntry>,
 ) -> Decoded<List<TableEntry>> / {abort.raise} =
-  if end_run <= 0 { { value: acc, at: at } } else {
+  if end_run <= 0 { { value: accumulator, at: at } } else {
     table_entries_from(
       b,
       at + 32,
       end_run - 1,
-      acc.push({
+      accumulator.push({
         table: read_u32(b, at),
         width: read_u32(b, at + 4),
         count: read_u64(b, at + 8),
@@ -94,15 +94,15 @@ fn segments_from(
   b: Bytes,
   at: Int,
   end_run: Int,
-  acc: List<Segment>,
+  accumulator: List<Segment>,
 ) -> List<Segment> / {abort.raise} =
-  if end_run <= 0 { acc } else {
+  if end_run <= 0 { accumulator } else {
     let parts = table_entries_from(b, at + 28, read_u32(b, at + 24), []);
     segments_from(
       b,
       parts.at,
       end_run - 1,
-      acc.push({
+      accumulator.push({
         token: b.slice(at, at + 8),
         at: read_u64(b, at + 8),
         size: read_u64(b, at + 16),
@@ -197,8 +197,11 @@ pub fn read_range<[r]>(
   }
 
 fn find_table(parts: List<TableEntry>, table: Int) -> Option<TableEntry> =
-  parts.fold(None, |acc: Option<TableEntry>, p: TableEntry|
-    match acc { Some(_) -> acc, None -> if p.table == table { Some(p) } else { None } })
+  parts.fold(None, |accumulator: Option<TableEntry>, p: TableEntry|
+    match accumulator {
+      Some(_) -> accumulator,
+      None -> if p.table == table { Some(p) } else { None },
+    })
 
 pub fn table_rows<[r]>(
   dir: String,
@@ -361,13 +364,15 @@ pub fn table<v>(
 ) -> Table / {abort.raise} = {
   let built = table_rows.fold(
     { width: 0, rows: [] },
-    |acc: { width: Int, rows: List<Bytes> }, key: Bytes, value: v|
+    |accumulator: { width: Int, rows: List<Bytes> }, key: Bytes, value: v|
       match row(key, value) {
-        None -> acc,
+        None -> accumulator,
         Some(rest) -> {
           let width = key.len() + rest.len();
-          if acc.width != 0 && acc.width != width { panic("the rows of a table are one width") };
-          { width: width, rows: acc.rows.push(key).push(rest) }
+          if accumulator.width != 0 && accumulator.width != width {
+            panic("the rows of a table are one width")
+          };
+          { width: width, rows: accumulator.rows.push(key).push(rest) }
         },
       },
   );
@@ -383,18 +388,18 @@ pub fn finish<[r]>(
 ) -> Option<Segment> / {fs.write[r], abort.raise} = {
   let built = tables.fold(
     { at: w.end, parts: [], bytes: [] },
-    |acc: { at: Int, parts: List<TableEntry>, bytes: List<Bytes> }, t: Table|
-      if t.rows.len() == 0 { acc } else {
+    |accumulator: { at: Int, parts: List<TableEntry>, bytes: List<Bytes> }, t: Table|
+      if t.rows.len() == 0 { accumulator } else {
         {
-          at: acc.at + t.rows.len(),
-          parts: acc.parts.push({
+          at: accumulator.at + t.rows.len(),
+          parts: accumulator.parts.push({
             table: t.table,
             width: t.width,
             count: t.rows.len() / t.width,
-            offset: acc.at,
+            offset: accumulator.at,
             sum: checksum(t.rows),
           }),
-          bytes: acc.bytes.push(t.rows),
+          bytes: accumulator.bytes.push(t.rows),
         }
       },
   );
@@ -412,10 +417,11 @@ fn replace_manifest<[r]>(
   durable: Bool,
 ) -> Bool / {fs.write[r], abort.raise} = {
   let path = dir ++ "/" ++ manifest_name(schema);
-  let tmp = path ++ "." ++ token.hex_of() ++ ".tmp";
-  (!durable || fs.sync[r](segment_path(dir, token))) && fs.write_file[r](tmp, manifest_bytes(m))
-    && (!durable || fs.sync[r](tmp))
-    && fs.rename[r](tmp, path)
+  let temporary_path = path ++ "." ++ token.hex_of() ++ ".tmp";
+  (!durable || fs.sync[r](segment_path(dir, token)))
+    && fs.write_file[r](temporary_path, manifest_bytes(m))
+    && (!durable || fs.sync[r](temporary_path))
+    && fs.rename[r](temporary_path, path)
     && (!durable || fs.sync[r](dir))
 }
 
@@ -539,11 +545,11 @@ fn write_test_segment<[r]>(
   fs.create_dir[r](dir);
   let placed = pairs.fold(
     { writing: new_writer(), rows: Map::new() },
-    |acc: { writing: SegmentWriter, rows: Map<Bytes, Bytes> }, p: { key: Bytes, value: Bytes }| {
-      let f = append_payload(acc.writing, p.value);
+    |accumulator: { writing: SegmentWriter, rows: Map<Bytes, Bytes> }, p: { key: Bytes, value: Bytes }| {
+      let f = append_payload(accumulator.writing, p.value);
       {
         writing: f.writing,
-        rows: acc.rows.insert(p.key, u64_le(f.at).concat(u32_le(p.value.len()))),
+        rows: accumulator.rows.insert(p.key, u64_le(f.at).concat(u32_le(p.value.len()))),
       }
     },
   );
@@ -551,7 +557,7 @@ fn write_test_segment<[r]>(
       table(1, placed.rows, |_: Bytes, at: Bytes| Some(at)),
     ]) {
     Some(seg) -> seg,
-    None -> panic("the test's file system rejected a segment"),
+    None -> panic("the test's file system could not write the stored file segment"),
   }
 }
 
@@ -563,9 +569,9 @@ fn write_segment<[r]>(
 
 fn lookup<[r]>(dir: String, key: Bytes) -> Option<Bytes> / {fs.read[r], abort.raise} = {
   let m = manifest[r](dir, test_shapes());
-  range(0, m.segments.len()).fold(None, |acc: Option<Bytes>, i: Int|
-    match acc {
-      Some(_) -> acc,
+  range(0, m.segments.len()).fold(None, |accumulator: Option<Bytes>, i: Int|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> {
         let seg = m.segments.get(m.segments.len() - 1 - i);
         match table_rows[r](dir, seg, 1) {
@@ -585,7 +591,7 @@ fn committed_manifest(c: CommitResult) -> Manifest =
 fn names_in(tree: fs::MemFs, dir: String) -> List<String> / {abort.raise} =
   match fs::listed_names(fs::mem_list(tree, dir)) { Some(names) -> names, None -> [] }
 
-test "what a segment holds is read back through the manifest, the newest segment first" {
+test "`lookup` reads segment values through the manifest, newest segment first" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let first = write_segment[abs]("s", b"token--1", [
       { key: b"a".blake3(), value: b"one" },
@@ -608,7 +614,7 @@ test "what a segment holds is read back through the manifest, the newest segment
   assert_eq(names_in(run.tree, "s").len(), 3)
 }
 
-test "a commit made over a manifest another run replaced names both segments" {
+test "committing a segment after another run committed one gives a manifest that lists both segments" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     let b = write_segment[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
@@ -621,7 +627,7 @@ test "a commit made over a manifest another run replaced names both segments" {
   assert_eq([run.value.a, run.value.b], [Some(b"one"), Some(b"two")])
 }
 
-test "a manifest or a table that does not verify reads as none, never as part of one" {
+test "a manifest or table that fails verification is treated as missing, never partly read" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let seg = write_segment[abs]("s", b"token--1", [{ key: b"a".blake3(), value: b"one" }]);
     let m = committed_manifest(commit[abs]("s", test_shapes(), seg));
@@ -645,7 +651,7 @@ test "a manifest or a table that does not verify reads as none, never as part of
   assert_eq(run.value.cut, empty_manifest())
 }
 
-test "a store keeping other shapes in the same directory has a manifest of its own" {
+test "a store with a different set of query shapes in the same directory starts with an empty manifest" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let seg = write_segment[abs]("s", b"token--1", [{ key: b"a".blake3(), value: b"one" }]);
     commit[abs]("s", test_shapes(), seg);
@@ -654,7 +660,7 @@ test "a store keeping other shapes in the same directory has a manifest of its o
   assert_eq(run.value, empty_manifest())
 }
 
-test "a merge lands only where no run committed while it worked, and replaces what it merged" {
+test "a merge replaces its merged segments only if no other run committed meanwhile, and otherwise reports `StoreChanged`" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     let m1 = committed_manifest(commit[abs]("s", test_shapes(), a));
@@ -682,7 +688,7 @@ test "a merge lands only where no run committed while it worked, and replaces wh
 
 fn sized(size: Int) -> Segment = { token: b"", at: 0, size: size, parts: [] }
 
-test "the newest segments are due as one while each is at most twice what follows it" {
+test "`merge_start` returns where to start merging: the newest run of segments in which each is at most twice the size of the next older segment" {
   let due = |sizes: List<Int>| merge_start({ generation: 0, segments: sizes.map(sized) });
   assert_eq(due([]), 0 - 1);
   assert_eq(due([400]), 0);
@@ -693,7 +699,7 @@ test "the newest segments are due as one while each is at most twice what follow
   assert_eq(due([400, 150, 80]), 0)
 }
 
-test "a sweep removes what no manifest names, and nothing while another run is there" {
+test "a sweep deletes files that no manifest lists, but deletes nothing while another run is active" {
   let made = fs::on_mem[abs](fs::mem_of([{ path: "s/records/of-a", body: b"old" }]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     commit[abs]("s", test_shapes(), a);
@@ -711,9 +717,9 @@ test "a sweep removes what no manifest names, and nothing while another run is t
     sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, ["records"]);
     end_run[abs](run)
   });
-  let kept = names_in(held_back.tree, "s");
-  assert(!kept.contains("records"));
-  assert(kept.contains(seg(b"token--b")) && kept.contains(seg(b"token--o")));
+  let remaining_names = names_in(held_back.tree, "s");
+  assert(!remaining_names.contains("records"));
+  assert(remaining_names.contains(seg(b"token--b")) && remaining_names.contains(seg(b"token--o")));
   let alone = fs::on_mem[abs](held_back.tree, || {
     fs.remove[abs](other);
     let run = start_run[abs]("s");
@@ -723,7 +729,7 @@ test "a sweep removes what no manifest names, and nothing while another run is t
   assert_eq(names_in(alone.tree, "s"), [manifest_name(test_shapes()), seg(b"token--a")])
 }
 
-test "a sweep leaves the segments of a store of other shapes while its manifest is in use" {
+test "a sweep keeps the segments of another store in the same directory when that store has its own committed manifest" {
   let other = b"other shapes".blake3();
   let made = fs::on_mem[abs](fs::mem_of([]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
@@ -737,9 +743,12 @@ test "a sweep leaves the segments of a store of other shapes while its manifest 
     sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, []);
     end_run[abs](run)
   });
-  let kept = names_in(made.tree, "s");
-  assert(kept.contains(segment_name(b"token--o")) && kept.contains(manifest_name(other)));
-  assert(!kept.contains(segment_name(b"token--b")));
+  let remaining_names = names_in(made.tree, "s");
+  assert(
+    remaining_names.contains(segment_name(b"token--o"))
+      && remaining_names.contains(manifest_name(other)),
+  );
+  assert(!remaining_names.contains(segment_name(b"token--b")));
   let later = fs::on_mem[abs](made.tree, || {
     let run = start_run[abs]("s");
     let path = match run { Some(p) -> p, None -> "" };
@@ -754,7 +763,7 @@ pub fn rows_folded<a | e>(count: Int, init: a, f: (a, Int) -> a / e) -> a / {abo
   iterate({ at: 0, value: init }, count + 1, |s: { at: Int, value: a }|
     if s.at >= count { Stop(s.value) } else { Continue({ at: s.at + 1, value: f(s.value, s.at) }) })
 
-test "rows are folded once each, in order" {
+test "`rows_folded` visits each row index exactly once, in order" {
   assert_eq(rows_folded(3, [], |seen: List<Int>, i: Int| seen.push(i)), [0, 1, 2]);
   assert_eq(rows_folded(0, [7], |seen: List<Int>, i: Int| seen.push(i)), [7])
 }

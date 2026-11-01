@@ -1,10 +1,6 @@
-//! The host effect boundary: what a run is granted, how much of the host it asked, the runtime a
-//! machine waits on the host through, and the rejections of an operation that reaches it.
-
 use crate::{Diagnostic, Span, Symbol, codes};
 use std::fmt;
 
-/// Whether a handler may serve an effect the program did not declare `nondet`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Determinism {
     Deterministic,
@@ -34,7 +30,6 @@ impl fmt::Display for MachineId {
     }
 }
 
-/// Opaque to `ply-core`: minted and polled by a [`HostRuntime`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Pending {
     pub token: u64,
@@ -47,41 +42,29 @@ impl fmt::Display for Pending {
     }
 }
 
-/// Makes a reactor for the thread that calls it: one belongs to its thread, and a machine, a test
-/// worker or a `parallel` branch each drive their own.
 pub type RuntimeFactory = std::sync::Arc<dyn Fn() -> std::rc::Rc<dyn HostRuntime> + Send + Sync>;
 
 pub trait HostRuntime {
-    /// Waits until at least one ticket the run watches is resolved.
     fn park(&self) -> Result<(), Diagnostic>;
 
-    /// What the natives of the host handlers reach the machine through: the run's sockets, its
-    /// configuration and the rest the host made, which only the crate that made them names. `None`
-    /// for a runtime that holds none.
     fn facilities(&self) -> Option<&dyn std::any::Any> {
         None
     }
 
-    /// Nanoseconds the host's monotonic clock reads, which `clock.now` returns and the run's
-    /// scheduler's sleeps are deadlines on; only the difference of two readings means anything.
     fn now(&self) -> Result<i64, Diagnostic> {
         Err(err_no_clock("read the clock"))
     }
 
-    /// Waits until a watched ticket is resolved or the clock reads `deadline`, whichever is first.
     fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
         let _ = deadline;
         Err(err_no_clock("wait on the clock"))
     }
 
-    /// Called on every exit path from an entry point, before the machine resets; returns what its
-    /// ending warns of.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
         let _ = machine;
         Vec::new()
     }
 
-    /// Called when the run's scheduler lets go of `task`, whose id nothing will name again.
     fn end_task(&self, machine: MachineId, task: crate::sim::TaskId) {
         let _ = (machine, task);
     }
@@ -94,13 +77,10 @@ pub trait HostRuntime {
         None
     }
 
-    /// Called once, after the last entry point, before the process exits.
     fn shutdown(&self) -> ShutdownReport {
         ShutdownReport::default()
     }
 
-    /// Called with a raise no clause handles, before the entry fails with it: a host whose own
-    /// the raise is may end the run its way here and never return.
     fn unhandled(&self, effect: &Symbol, op: &Symbol) {
         let _ = (effect, op);
     }
@@ -108,39 +88,31 @@ pub trait HostRuntime {
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct ShutdownReport {
-    /// Spans left open when their task or entry point ended: the sum of what each `W0609` counted.
     pub spans_left_open: usize,
 }
 
-/// A run's grants; the default, [`HostBinding::unbound`], is a run granted nothing.
 #[derive(Debug, Default)]
 pub struct HostBinding {
-    /// Whether a run's grants made it.
     granted: bool,
     grants: Grants,
 }
 
-/// What a run is granted, as named entries, each a list of fields: the natives of the host handlers
-/// read the ones they serve (`fs NAME PATH`, `exec NAME PATH`, `allow FAMILY`, `argv ARG..`, ...).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
     pub entries: Vec<(String, Vec<String>)>,
 }
 
 impl Grants {
-    /// The fields of each entry named `name`, in order.
     pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [String]> + 'a {
         (self.entries.iter())
             .filter(move |(n, _)| n == name)
             .map(|(_, fields)| fields.as_slice())
     }
 
-    /// Whether an entry is named `name`.
     pub fn has(&self, name: &str) -> bool {
         self.named(name).next().is_some()
     }
 
-    /// The grants with one entry more.
     pub fn with(mut self, name: &str, fields: &[&str]) -> Grants {
         self.entries.push((
             name.to_string(),
@@ -149,7 +121,6 @@ impl Grants {
         self
     }
 
-    /// Whether `allow` names the family `family`.
     pub fn allows(&self, family: &str) -> bool {
         self.named("allow")
             .any(|fields| fields.first().is_some_and(|f| f == family))
@@ -157,12 +128,10 @@ impl Grants {
 }
 
 impl HostBinding {
-    /// What a context entered with no binding has: a run granted nothing.
     pub fn unbound() -> HostBinding {
         HostBinding::default()
     }
 
-    /// The binding of a run granted `grants`, which the natives read.
     pub fn granted(grants: Grants) -> HostBinding {
         HostBinding {
             granted: true,
@@ -170,28 +139,22 @@ impl HostBinding {
         }
     }
 
-    /// Whether a run's grants made this binding.
     pub fn is_granted(&self) -> bool {
         self.granted
     }
 
-    /// What the run this binding serves is granted.
     pub fn grants(&self) -> &Grants {
         &self.grants
     }
 }
 
-/// A `parallel` block's branches share one binding, so it must stay `Send + Sync`.
 const _: fn() = || {
     fn shareable<T: Send + Sync>() {}
     shareable::<HostBinding>();
 };
 
-/// How much of the host a run asked: every operation and native that returned, and how many
-/// of those may return something else when a run asks again.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HostUse {
-    /// Every host operation that returned, `Repeatable` ones included.
     pub operations: u64,
     pub nondeterministic: u64,
 }
@@ -201,7 +164,7 @@ impl HostUse {
         self.operations == 0
     }
 
-    pub fn acted(&self) -> bool {
+    pub fn used_nondeterminism(&self) -> bool {
         self.nondeterministic > 0
     }
 
@@ -265,11 +228,9 @@ fn err_no_clock(what: &str) -> Diagnostic {
     .note("`clock.now` reads the clock a run's `HostRuntime` keeps, and a production scheduler's sleeps are deadlines on it, so a runtime that keeps none handles neither")
 }
 
-/// An operation of an effect that no handler of the program, no host handler and no host family
-/// handles, rejected at the entry that performed it.
 #[cold]
 #[inline(never)]
-pub fn err_unserved(span: Span, operation: &str) -> Diagnostic {
+pub fn err_unhandled_operation(span: Span, operation: &str) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_UNBOUND,
         format!("`{operation}` reached the host boundary, and nothing serves it"),
@@ -280,7 +241,7 @@ pub fn err_unserved(span: Span, operation: &str) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-pub fn err_withheld(
+pub fn err_unbound_operation(
     span: Span,
     operation: &str,
     effect: &Symbol,

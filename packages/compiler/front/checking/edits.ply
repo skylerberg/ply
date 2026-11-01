@@ -69,7 +69,9 @@ fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
 }
 
 fn sources_key(sources: List<Source>) -> Bytes =
-  Bytes::concat_all(sources.map(|s: Source| Bytes::concat_all([s.name, b"\x00", s.src, b"\x00"])))
+  Bytes::concat_all(
+    sources.map(|s: Source| Bytes::concat_all([s.name, b"\x00", s.source_text, b"\x00"])),
+  )
 
 type EditSession = {
   store: MemoryStore,
@@ -139,12 +141,16 @@ fn pulled(
     Some(reads) -> {
       let q = match fresh_registry().get(query) {
         Some(x) -> x,
-        None -> panic("the registry holds the query"),
+        None -> panic("no query with this name exists in the compiler's list of queries"),
       };
-      let ran = executed_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
-        acc.insert(k, true));
-      let back = restored_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
-        acc.insert(k, true));
+      let ran = executed_for(run, query).fold(
+        Map::new(),
+        |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
+      );
+      let back = restored_for(run, query).fold(
+        Map::new(),
+        |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
+      );
       let groups = reads.keys();
       let moved = |g: Bytes| made.get(g) != reads.get(g);
       let needless = sorted_bytes(groups.filter(|g: Bytes| ran.contains(g) && !moved(g)));
@@ -154,10 +160,10 @@ fn pulled(
             && moved(g)),
       );
       {
-        made: groups.fold(made, |acc: Map<Bytes, Bytes>, g: Bytes|
+        made: groups.fold(made, |accumulator: Map<Bytes, Bytes>, g: Bytes|
           if ran.contains(g) || back.contains(g) {
-            acc.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
-          } else { acc }),
+            accumulator.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
+          } else { accumulator }),
         mismatches: if needless == [] && stale == [] { None } else {
           Some(
             Bytes::concat_all([
@@ -165,7 +171,7 @@ fn pulled(
               groups_shown(needless),
               b" though its reads had not changed; reused ",
               groups_shown(stale),
-              b" though they had",
+              b" though their inputs had changed",
             ]),
           )
         },
@@ -184,35 +190,36 @@ fn groups_shown(groups: List<Bytes>) -> Bytes / {abort.raise} =
 
 fn hash_differences(warm: CachedHashes, fresh: CachedHashes) -> Bytes = {
   let by = |f: CachedHashes|
-    f.nodes.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: CachedNode| acc.insert(x.name, x.hash));
+    f.nodes.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, x: CachedNode|
+      accumulator.insert(x.name, x.hash));
   let w = by(warm);
   let c = by(fresh);
   let names = sorted_bytes(
-    w.fold(c, |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes| acc.insert(k, v)).keys(),
+    w.fold(c, |accumulator: Map<Bytes, Bytes>, k: Bytes, v: Bytes| accumulator.insert(k, v)).keys(),
   );
   let apart = names.filter(|n: Bytes| w.get(n) != c.get(n));
   if apart.len() == 0 { b"" }
   else { Bytes::concat_all([b" (hashes of ", Bytes::join(apart, b", "), b")"]) }
 }
 
-fn group_check_of(asked: GroupKey, published: Bool) -> GroupCheck / {QueryEffects, abort.raise} = {
-  let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
+fn group_check_of(group: GroupKey, published: Bool) -> GroupCheck / {QueryEffects, abort.raise} = {
+  let named = { module: group.module, shipped: group.shipped, tested: group.tested };
   owners_check(
     named,
-    asked.owners.map(|o: Bytes| owner_facts(named, o)),
-    imports_of(asked),
+    group.owners.map(|o: Bytes| owner_facts(named, o)),
+    imports_of(group),
     published,
     always_entire,
   )
 }
 
 fn group_inputs_hash(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
-  let asked = decoded(input, group_key_bin(), "a group's names");
-  if !current(asked) { b"" } else {
+  let group = decoded(input, group_key_bin(), "a group's names");
+  if !current(group) { b"" } else {
     let of = |c: GroupCheck| {
-      let source = group_source_from(asked.module, c.reads, c.imported, c.needed);
+      let source = group_source_from(group.module, c.reads, c.imported, c.needed);
       Bytes::concat_all([
-        bin::encode(source.source.src, bin::bytes_bin()),
+        bin::encode(source.source.source_text, bin::bytes_bin()),
         bin::encode(source.derived, bin::list_bin(derivation_bin())),
         bin::encode(
           source.dependencies,
@@ -224,18 +231,18 @@ fn group_inputs_hash(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         bin::encode(c.places, bin::map_bin(bin::bytes_bin(), module_origin_bin())),
       ])
     };
-    let rejected = group_of(asked).rejected.len() > 0;
+    let rejected = group_of(group).rejected.len() > 0;
     blake3(
-      of(group_check_of(asked, false)).concat(if rejected { of(group_check_of(asked, true)) }
+      of(group_check_of(group, false)).concat(if rejected { of(group_check_of(group, true)) }
       else { b"" }),
     )
   }
 }
 
 fn hash_inputs_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let asked = decoded(input, group_key_bin(), "a group's names");
-  if !current_unit(asked) { b"" } else {
-    let h = group_hash_inputs(asked);
+  let group = decoded(input, group_key_bin(), "a group's names");
+  if !current_unit(group) { b"" } else {
+    let h = group_hash_inputs(group);
     blake3(
       Bytes::concat_all([
         bin::encode(h.forms, hash_input_bin()),
@@ -252,7 +259,11 @@ fn inputs_over(
   probe: Bytes,
 ) -> Option<Map<Bytes, Bytes>> / {abort.raise} = {
   let w = load_inputs_of(
-    { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
+    {
+      root: b"",
+      manifest: None,
+      files: sources.map(|s: Source| { module: s.name, text: s.source_text }),
+    },
     [],
   );
   over_decoding(
@@ -279,14 +290,14 @@ fn inputs_over(
         Some(
           w.own.fold(
             { run: cycles.run, out: Map::new() },
-            |acc: { run: Run, out: Map<Bytes, Bytes> }, m: Bytes| {
+            |accumulator: { run: Run, out: Map<Bytes, Bytes> }, m: Bytes| {
               let named = bin::encode(
                 { module: m, shipped: false, tested: false },
                 module_key_bin(),
               );
-              let o = query_output(qs, acc.run, owners_query(), named);
+              let o = query_output(qs, accumulator.run, owners_query(), named);
               decoded(o.output, owners_result_bin(), "a module's owners").groups.fold(
-                { run: o.run, out: acc.out },
+                { run: o.run, out: accumulator.out },
                 |a: { run: Run, out: Map<Bytes, Bytes> }, g: List<Bytes>| {
                   let unit = bin::encode(
                     { module: m, shipped: false, tested: false, owners: g },
@@ -335,12 +346,15 @@ fn edited(
   to: Bytes,
 ) -> List<Source> / {abort.raise} =
   sources.map(|source: Source|
-    if source.name != name { source } else if source.src.index_of(from) == None {
-      panic("the fixture drifted: the text to edit is not there")
-    } else { { name: source.name, src: Bytes::join(source.src.split(from), to) } })
+    if source.name != name { source } else if source.source_text.index_of(from) == None {
+      panic("the test sources changed: the text to edit is not in the module")
+    } else { { name: source.name, source_text: Bytes::join(source.source_text.split(from), to) } })
 
-fn with_module(sources: List<Source>, name: Bytes, src: Bytes) -> List<Source> =
-  sources.filter(|source: Source| source.name != name).push({ name: name, src: src })
+fn with_module(sources: List<Source>, name: Bytes, source_text: Bytes) -> List<Source> =
+  sources.filter(|source: Source| source.name != name).push({
+    name: name,
+    source_text: source_text,
+  })
 
 fn without(sources: List<Source>, name: Bytes) -> List<Source> =
   sources.filter(|source: Source| source.name != name)
@@ -460,12 +474,12 @@ fn rendered(on: List<Change>) -> List<Source> = {
     if on.contains(change) { sources } else { [] };
   [
     [
-      { name: b"core", src: core_module_source(on) },
-      { name: b"shop", src: shop_module_source(on) },
+      { name: b"core", source_text: core_module_source(on) },
+      { name: b"shop", source_text: shop_module_source(on) },
     ],
-    if on.contains(LeafDeleted) { [] } else { [{ name: b"leaf", src: leaf }] },
-    present(ExtraAdded, [{ name: b"extra", src: shop_extra(on) }]),
-    present(DuplicateAdded, [{ name: b"twin", src: leaf }]),
+    if on.contains(LeafDeleted) { [] } else { [{ name: b"leaf", source_text: leaf }] },
+    present(ExtraAdded, [{ name: b"extra", source_text: shop_extra(on) }]),
+    present(DuplicateAdded, [{ name: b"twin", source_text: leaf }]),
   ].flatten(
   )
 }
@@ -476,8 +490,9 @@ fn steps_from_edits(edits: List<List<Change>>) -> List<Step> =
   edits.fold(
     { on: [], steps: [step(b"cold", unedited_sources())] },
     |s: { on: List<Change>, steps: List<Step> }, edit: List<Change>| {
-      let on = edit.fold(s.on, |acc: List<Change>, c: Change|
-        if acc.contains(c) { acc.filter(|d: Change| d != c) } else { acc.push(c) });
+      let on = edit.fold(s.on, |accumulator: List<Change>, c: Change|
+        if accumulator.contains(c) { accumulator.filter(|d: Change| d != c) }
+        else { accumulator.push(c) });
       {
         on: on,
         steps: s.steps.push(step(Bytes::of_string(s.steps.len().to_string()), rendered(on))),
@@ -519,11 +534,11 @@ fn reworked() -> { steps: List<Step>, last: List<Source> } / {abort.raise} = {
   }
 }
 
-test "the result through the store matches the fresh one through edits to bodies, signatures, `pub` and imports" {
+test "reusing cached results matches checking from scratch after edits to bodies, signatures, `pub` and imports" {
   assert_eq(disagreements(reworked().steps), [])
 }
 
-test "the result through the store matches the fresh one through a file added, edited around and deleted, and renames" {
+test "reusing cached results matches checking from scratch after a file is added, edited and deleted, and after renames" {
   let s6 = reworked().last;
   let s8 = with_module(s6, b"extra", b"import leaf\npub fn four() -> Int = leaf::two(2) + 2\n");
   let s9 = edited(s8, b"extra", b"+ 2\n", b"+ 3\n");
@@ -563,15 +578,15 @@ test "the result through the store matches the fresh one through a file added, e
   )
 }
 
-test "a group whose member now calls another sibling resolves through the store as fresh" {
-  let src = Bytes::concat_all([
+test "reusing cached results matches checking from scratch when a group member starts calling another member of its group" {
+  let source_text = Bytes::concat_all([
     b"pub fn even(n: Int) -> Bool = if n <= 0 { here() } else { odd(n - 1) }\n",
     b"pub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n",
     b"fn here() -> Bool = true\n",
     b"fn there() -> Bool = 1 > 0\n",
     b"pub fn other(n: Int) -> Int = n + 1\n",
   ]);
-  let s0 = [{ name: b"cycle", src: src }];
+  let s0 = [{ name: b"cycle", source_text: source_text }];
   let s1 = edited(s0, b"cycle", b"{ here() }", b"{ there() }");
   let s2 = edited(s1, b"cycle", b"{ false }", b"{ here() }");
   assert_eq(
@@ -585,7 +600,7 @@ test "a group whose member now calls another sibling resolves through the store 
   )
 }
 
-test "moving, removing and re-signing definitions leaves the result through the store matching the fresh one" {
+test "reusing cached results matches checking from scratch after definitions are moved between modules, removed or given new signatures" {
   let s0 = unedited_sources();
   let twice = b"pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n";
   let moved = edited(
@@ -634,9 +649,9 @@ test "moving, removing and re-signing definitions leaves the result through the 
   )
 }
 
-test "names shared, declarations alike and tests edited leave the result through the store matching the fresh one" {
+test "checking with cached results matches checking from scratch when modules have identical definitions, similar effects or edited tests" {
   let peel = b"pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
-  let shared = [{ name: b"a", src: peel }, { name: b"b", src: peel }];
+  let shared = [{ name: b"a", source_text: peel }, { name: b"b", source_text: peel }];
   let look = b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[t]} = db.get[t](k)\n";
   let pick = |m: Bytes|
     Bytes::concat_all([
@@ -647,20 +662,20 @@ test "names shared, declarations alike and tests edited leave the result through
       b"::db.get[t](j) -> j, }\n",
     ]);
   let alike = [
-    { name: b"x", src: look },
-    { name: b"y", src: look },
-    { name: b"z", src: b"pub fn plain() -> Int = 7\n" },
-    { name: b"w", src: pick(b"x") },
+    { name: b"x", source_text: look },
+    { name: b"y", source_text: look },
+    { name: b"z", source_text: b"pub fn plain() -> Int = 7\n" },
+    { name: b"w", source_text: pick(b"x") },
   ];
   let alias = [
-    { name: b"alias", src: b"pub type Cents = Int\npub fn zero() -> Cents = 0\n" },
-    { name: b"user", src: b"import alias\nfn take() -> alias::Cents = alias::zero()\n" },
-    { name: b"lone", src: b"fn lone() -> Int = 1\n" },
+    { name: b"alias", source_text: b"pub type Cents = Int\npub fn zero() -> Cents = 0\n" },
+    { name: b"user", source_text: b"import alias\nfn take() -> alias::Cents = alias::zero()\n" },
+    { name: b"lone", source_text: b"fn lone() -> Int = 1\n" },
   ];
   let tested = b"fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
   let palette = b"pub type Color = Red | Green\npub fn paint(what: String, shade: Color = Red) -> String =\n  match shade {\n    Red -> what.concat(\" red\"),\n    Green -> what.concat(\" green\"),\n  }\n";
   let wall = b"import palette\npub fn wall() -> String = palette::paint(\"wall\")\npub fn given() -> String = palette::paint(\"wall\", palette::Green)\ntest \"the default crosses the module boundary\" {\n  assert_eq(wall(), \"wall red\")\n}\n";
-  let painted = [{ name: b"palette", src: palette }, { name: b"wall", src: wall }];
+  let painted = [{ name: b"palette", source_text: palette }, { name: b"wall", source_text: wall }];
   assert_eq(
     disagreements([
       step(b"two definitions sharing a hash", shared),
@@ -675,12 +690,12 @@ test "names shared, declarations alike and tests edited leave the result through
       step(b"a type alias", alias),
       step(b"warm", alias),
       step(b"an unrelated edit", with_module(alias, b"lone", b"fn lone() -> Int = 2\n")),
-      step(b"a test", [{ name: b"m", src: tested }]),
+      step(b"a test", [{ name: b"m", source_text: tested }]),
       step(b"a test added", [
-        { name: b"m", src: tested.concat(b"test \"twice\" { assert_eq(f() + f(), 2) }\n") },
+        { name: b"m", source_text: tested.concat(b"test \"twice\" { assert_eq(f() + f(), 2) }\n") },
       ]),
       step(b"a test with a body already present", [
-        { name: b"m", src: tested.concat(b"test \"still one\" { assert_eq(f(), 1) }\n") },
+        { name: b"m", source_text: tested.concat(b"test \"still one\" { assert_eq(f(), 1) }\n") },
       ]),
       step(b"a cross-module default", painted),
       step(
@@ -707,20 +722,20 @@ fn effect_user_module(module: Bytes) -> Bytes =
 
 fn effect_declaration() -> Bytes = b"pub effect db { read get[r](key: Int) -> Int }\n"
 
-test "a structurally identical effect appearing, renamed or deleted leaves the result through the store matching the fresh one" {
+test "reusing cached results matches checking from scratch when an effect identical in structure to another is added, renamed or deleted" {
   let one = [
-    { name: b"x", src: effect_declaration() },
-    { name: b"p", src: effect_user_module(b"x") },
+    { name: b"x", source_text: effect_declaration() },
+    { name: b"p", source_text: effect_user_module(b"x") },
   ];
   let duplicates = [
-    { name: b"a", src: effect_declaration() },
-    { name: b"x", src: effect_declaration() },
-    { name: b"p", src: effect_user_module(b"a") },
+    { name: b"a", source_text: effect_declaration() },
+    { name: b"x", source_text: effect_declaration() },
+    { name: b"p", source_text: effect_user_module(b"a") },
   ];
   let survivors = [
-    { name: b"a", src: effect_declaration() },
-    { name: b"x", src: effect_declaration() },
-    { name: b"p", src: effect_user_module(b"x") },
+    { name: b"a", source_text: effect_declaration() },
+    { name: b"x", source_text: effect_declaration() },
+    { name: b"p", source_text: effect_user_module(b"x") },
   ];
   assert_eq(
     disagreements([
@@ -739,12 +754,12 @@ test "a structurally identical effect appearing, renamed or deleted leaves the r
   )
 }
 
-test "reordering, relabelling and re-exporting leave the result through the store matching the fresh one" {
-  let ops = |first: Bytes, second: Bytes|
+test "checking with cached results matches checking from scratch after effect operations are reordered, tests are relabelled and exports change" {
+  let effect_operations = |first: Bytes, second: Bytes|
     [
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub effect db {\n  ",
           first,
           b"\n  ",
@@ -755,12 +770,12 @@ test "reordering, relabelling and re-exporting leave the result through the stor
     ];
   let get = b"read get[r](key: Int) -> Int";
   let put = b"write put[r](key: Int, value: String) -> Unit";
-  let variants = |body: Bytes| [{ name: b"m", src: b"pub type T =\n".concat(body) }];
+  let variants = |body: Bytes| [{ name: b"m", source_text: b"pub type T =\n".concat(body) }];
   let labelled = |label: Bytes|
     [
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"fn f() -> Int = 1\ntest \"",
           label,
           b"\" { assert_eq(f(), 1) }\n",
@@ -768,13 +783,13 @@ test "reordering, relabelling and re-exporting leave the result through the stor
       },
     ];
   let exported = [
-    { name: b"a", src: b"pub fn one() -> Int = 1\n" },
-    { name: b"b", src: b"import a\nfn two() -> Int = a::one() + a::one()\n" },
+    { name: b"a", source_text: b"pub fn one() -> Int = 1\n" },
+    { name: b"b", source_text: b"import a\nfn two() -> Int = a::one() + a::one()\n" },
   ];
   assert_eq(
     disagreements([
-      step(b"operations", ops(get, put)),
-      step(b"the operations reordered", ops(put, get)),
+      step(b"operations", effect_operations(get, put)),
+      step(b"the operations reordered", effect_operations(put, get)),
       step(b"variants", variants(b"  | A(Int)\n  | B(String)\n")),
       step(b"the variants reordered", variants(b"  | B(String)\n  | A(Int)\n")),
       step(b"a test", labelled(b"f is one")),
@@ -792,13 +807,13 @@ test "reordering, relabelling and re-exporting leave the result through the stor
   )
 }
 
-test "an opaque type's module edited and undone leaves the result through the store matching the fresh one" {
+test "reusing cached results matches checking from scratch after the module of an opaque type is edited and the edit is undone" {
   let lib = b"pub opaque type Count = new { n: Int }\n\npub fn zero() -> Count = { n: 0 }\n\npub fn next(c: Count) -> Count = { n: c.n + 1 }\n\npub fn value(c: Count) -> Int = c.n\n";
   let s0 = [
-    { name: b"lib", src: lib },
+    { name: b"lib", source_text: lib },
     {
       name: b"app",
-      src: b"import lib\n\npub fn two() -> Int = lib::value(lib::next(lib::next(lib::zero())))\n\ntest \"two steps\" {\n  assert_eq(two(), 2)\n}\n",
+      source_text: b"import lib\n\npub fn two() -> Int = lib::value(lib::next(lib::next(lib::zero())))\n\ntest \"two steps\" {\n  assert_eq(two(), 2)\n}\n",
     },
   ];
   let at = |what: Bytes, text: Bytes|
@@ -843,15 +858,15 @@ test "an opaque type's module edited and undone leaves the result through the st
   )
 }
 
-test "a test labelled as the function it tests hashes apart from it, through a rejection and back" {
+test "a test named like the function it tests gets its own hash, and reused results match a fresh check across a rejected edit and its undo" {
   let s0 = [
     {
       name: b"lib",
-      src: b"pub effect log {\n  write emit(Bytes) -> Unit\n  read peek() -> Int\n}\n\npub fn say(b: Bytes) -> Unit / {log.write} = log.emit(b)\n",
+      source_text: b"pub effect log {\n  write emit(Bytes) -> Unit\n  read peek() -> Int\n}\n\npub fn say(b: Bytes) -> Unit / {log.write} = log.emit(b)\n",
     },
     {
       name: b"app",
-      src: b"import lib\n\npub fn said() -> Int =\n  handle {\n    lib::say(b\"a\");\n    2\n  } with {\n    lib::log.emit(_) -> (),\n  }\n\ntest \"said\" {\n  assert_eq(said(), 2)\n}\n",
+      source_text: b"import lib\n\npub fn said() -> Int =\n  handle {\n    lib::say(b\"a\");\n    2\n  } with {\n    lib::log.emit(_) -> (),\n  }\n\ntest \"said\" {\n  assert_eq(said(), 2)\n}\n",
     },
   ];
   assert_eq(
@@ -864,7 +879,7 @@ test "a test labelled as the function it tests hashes apart from it, through a r
   )
 }
 
-test "edits undone, a module renamed and an imported module deleted leave the result through the store matching the fresh one" {
+test "reusing cached results matches checking from scratch after undone edits, a renamed module and a deleted imported module" {
   let s0 = unedited_sources();
   let leaf2 = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n";
   assert_eq(
@@ -893,7 +908,7 @@ test "edits undone, a module renamed and an imported module deleted leave the re
   )
 }
 
-test "a comment, an alias, a module emptied and a nested one leave the result through the store matching the fresh one" {
+test "reusing cached results matches checking from scratch after a comment, an import alias, an emptied module and a dotted module name" {
   let s0 = unedited_sources();
   let aliased = edited(
     edited(s0, b"shop", b"import core", b"import core as c"),
@@ -911,12 +926,12 @@ test "a comment, an alias, a module emptied and a nested one leave the result th
       step(b"which gained a definition", with_module(s0, b"empty", b"pub fn now() -> Int = 1\n")),
       step(b"and went away", s0),
       step(b"a nested module beside a flat one", [
-        { name: b"a", src: b"pub fn x() -> Int = 1\n" },
-        { name: b"a.b", src: b"pub fn y() -> Int = 2\n" },
+        { name: b"a", source_text: b"pub fn x() -> Int = 1\n" },
+        { name: b"a.b", source_text: b"pub fn y() -> Int = 2\n" },
       ]),
       step(b"the nested module changed", [
-        { name: b"a", src: b"pub fn x() -> Int = 1\n" },
-        { name: b"a.b", src: b"pub fn y() -> Int = 3\n" },
+        { name: b"a", source_text: b"pub fn x() -> Int = 1\n" },
+        { name: b"a.b", source_text: b"pub fn y() -> Int = 3\n" },
       ]),
     ]),
     [],
@@ -928,14 +943,14 @@ test "a module fixed after it was rejected beside a renamed import gives the sam
   assert(off.len() == 0, Some(String::of_bytes_lossy(Bytes::join(off, b"; "))))
 }
 
-test "a leaf deleted beside an error, moved twice and deleted again gives the same result as a fresh check" {
+test "checking with cached results matches checking from scratch after deleting module `leaf` while another module has an error, then moving `twice`, then deleting `leaf` again" {
   let off = disagreements(
     steps_from_edits([[LeafDeleted, LeafError], [TwiceMoved, LeafDeleted], [LeafError]]),
   );
   assert(off.len() == 0, Some(String::of_bytes_lossy(Bytes::join(off, b"; "))))
 }
 
-test "an effect renamed beside a test, a type renamed as a definition moves, then renamed back gives the same result as a fresh check" {
+test "checking with cached results matches checking from scratch after renaming an effect and adding a test, then renaming a type and moving `twice`, then renaming the type back" {
   let off = disagreements(
     steps_from_edits([
       [EffectRenamed, TestAdded],
@@ -983,7 +998,7 @@ test "a session of renames, an error fixed and a duplicate added gives the same 
   assert(off.len() == 0, Some(String::of_bytes_lossy(Bytes::join(off, b"; "))))
 }
 
-test "a core body edited, then renamed beside a test added, gives the same result as a fresh check" {
+test "checking with cached results matches checking from scratch after editing a body in module `core`, then renaming module `core` and adding a test" {
   let off = disagreements(steps_from_edits([[CoreBody], [CoreRenamed, TestAdded]]));
   assert(off.len() == 0, Some(String::of_bytes_lossy(Bytes::join(off, b"; "))))
 }
@@ -1059,19 +1074,19 @@ fn chain_lib(label: Bytes) -> Bytes =
     b"]} = base(n) + 1\n",
   ])
 
-test "effects that change under a caller leave the result through the store matching the fresh one" {
+test "reusing cached results matches checking from scratch when a function's effects change beneath a caller that was already checked" {
   let before = [
-    { name: b"lib", src: chain_lib(b"a") },
+    { name: b"lib", source_text: chain_lib(b"a") },
     {
       name: b"top",
-      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[a]} = lib::mid(n) + 1\n",
+      source_text: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[a]} = lib::mid(n) + 1\n",
     },
   ];
   let after = [
-    { name: b"lib", src: chain_lib(b"b") },
+    { name: b"lib", source_text: chain_lib(b"b") },
     {
       name: b"top",
-      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
+      source_text: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
     },
   ];
   assert_eq(
@@ -1082,43 +1097,46 @@ test "effects that change under a caller leave the result through the store matc
     [],
   );
   let stale = [
-    { name: b"lib", src: chain_lib(b"a") },
+    { name: b"lib", source_text: chain_lib(b"a") },
     {
       name: b"top",
-      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.note[a]} = lib::mid(n) + 1\n",
+      source_text: b"import lib\npub fn top(n: Int) -> Int / {lib::log.note[a]} = lib::mid(n) + 1\n",
     },
   ];
   let moved = with_module(stale, b"lib", chain_lib(b"b"));
   assert_eq(disagreements([step(b"cold", stale), step(b"the callee's effects moved", moved)]), []);
-  let kept = queried_over(queried_over(empty_memory_store(), stale).store, moved);
-  assert(match kept.outcome { Rejected(_) -> true, Analysed(_) -> false })
+  let warm = queried_over(queried_over(empty_memory_store(), stale).store, moved);
+  assert(match warm.outcome { Rejected(_) -> true, Analysed(_) -> false })
 }
 
 test "`keep` written on an imported function, or dropped, leaves the result through the store matching the fresh one" {
   let lib = |param: Bytes|
-    { name: b"lib", src: Bytes::concat_all([b"pub fn hold(h: ", param, b") -> Int = h(0)\n"]) };
+    {
+      name: b"lib",
+      source_text: Bytes::concat_all([b"pub fn hold(h: ", param, b") -> Int = h(0)\n"]),
+    };
   let app = {
     name: b"app",
-    src: b"import lib\npub fn go(g: (Int) -> Int) -> Int = lib::hold(g)\n",
+    source_text: b"import lib\npub fn go(g: (Int) -> Int) -> Int = lib::hold(g)\n",
   };
   let borrowed = [lib(b"(Int) -> Int"), app];
-  let kept = [lib(b"keep (Int) -> Int"), app];
+  let with_keep = [lib(b"keep (Int) -> Int"), app];
   assert_eq(
     disagreements([
       step(b"cold", borrowed),
-      step(b"keep written", kept),
+      step(b"keep written", with_keep),
       step(b"keep dropped", borrowed),
     ]),
     [],
   );
-  let warm = queried_over(queried_over(empty_memory_store(), borrowed).store, kept);
+  let warm = queried_over(queried_over(empty_memory_store(), borrowed).store, with_keep);
   assert(match warm.outcome { Rejected(_) -> true, Analysed(_) -> false })
 }
 
-test "an unused selectively imported name deleted is rejected through the store as it is fresh" {
+test "deleting an unused function that another module imports by name is rejected, with cached results as with checking from scratch" {
   let s0 = [
-    { name: b"lib", src: b"pub fn used() -> Int = 1\npub fn spare() -> Int = 2\n" },
-    { name: b"app", src: b"import lib (used, spare)\nfn go() -> Int = used()\n" },
+    { name: b"lib", source_text: b"pub fn used() -> Int = 1\npub fn spare() -> Int = 2\n" },
+    { name: b"app", source_text: b"import lib (used, spare)\nfn go() -> Int = used()\n" },
   ];
   let gone = with_module(s0, b"lib", b"pub fn used() -> Int = 1\n");
   assert_eq(
@@ -1129,17 +1147,18 @@ test "an unused selectively imported name deleted is rejected through the store 
     Analysed(_) -> panic("an import of a deleted name checked"),
     Rejected(ds) ->
       assert(
-        ds.fold(false, |acc: Bool, diagnostic: Diagnostic| acc || diagnostic.code == b"E0101"),
+        ds.fold(false, |accumulator: Bool, diagnostic: Diagnostic|
+          accumulator || diagnostic.code == b"E0101"),
       ),
   }
 }
 
-test "a narrowed annotation and a relabelled resource leave the result through the store matching the fresh one" {
+test "checking with cached results matches checking from scratch after narrowing an effect annotation and renaming an effect's resource variable" {
   let narrowing = |row: Bytes|
     [
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / ",
           row,
           b" = db.get[a](k)\n",
@@ -1150,7 +1169,7 @@ test "a narrowed annotation and a relabelled resource leave the result through t
     [
       {
         name: b"m",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[",
           label,
           b"]} = db.get[",
@@ -1160,7 +1179,7 @@ test "a narrowed annotation and a relabelled resource leave the result through t
       },
       {
         name: b"u",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"import m\nfn use_it() -> Int / {m::db.read[",
           label,
           b"]} = m::look(1)\n",
@@ -1171,7 +1190,7 @@ test "a narrowed annotation and a relabelled resource leave the result through t
     [
       {
         name: b"a",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub type ",
           ty,
           b" = | Mk(Int)\npub fn mk() -> ",
@@ -1181,9 +1200,9 @@ test "a narrowed annotation and a relabelled resource leave the result through t
       },
       {
         name: b"b",
-        src: Bytes::concat_all([b"import a\npub fn get() -> a::", ty, b" = a::mk()\n"]),
+        source_text: Bytes::concat_all([b"import a\npub fn get() -> a::", ty, b" = a::mk()\n"]),
       },
-      { name: b"c", src: b"import b\npub fn top() -> Bool = { b::get(); true }\n" },
+      { name: b"c", source_text: b"import b\npub fn top() -> Bool = { b::get(); true }\n" },
     ];
   assert_eq(
     disagreements([
@@ -1198,15 +1217,15 @@ test "a narrowed annotation and a relabelled resource leave the result through t
   )
 }
 
-test "the order a result publishes in is the same through the store as fresh" {
+test "the order of a result's definitions, effects and types is the same with cached results as with checking from scratch" {
   let s0 = [
     {
       name: b"app",
-      src: b"import lib\npub effect audit { write note[log](m: Int) -> Unit }\npub type Wrapped = | Wrap(Int) | Empty\nfn second() -> Int = lib::base()\nfn first() -> Int = second()\n",
+      source_text: b"import lib\npub effect audit { write note[log](m: Int) -> Unit }\npub type Wrapped = | Wrap(Int) | Empty\nfn second() -> Int = lib::base()\nfn first() -> Int = second()\n",
     },
     {
       name: b"lib",
-      src: b"pub effect db { read get[t](k: Int) -> Int }\npub type Row = | Cell(Int)\npub fn base() -> Int = 1\n",
+      source_text: b"pub effect db { read get[t](k: Int) -> Int }\npub type Row = | Cell(Int)\npub fn base() -> Int = 1\n",
     },
   ];
   assert_eq(disagreements([step(b"cold", s0), step(b"warm", s0)]), [])
@@ -1214,28 +1233,32 @@ test "the order a result publishes in is the same through the store as fresh" {
 
 fn effect_sources(extra: List<Source>) -> List<Source> =
   extra.concat([
-    { name: b"core", src: b"pub effect db {\n  read get[r](key: Int) -> Int\n}\n" },
+    { name: b"core", source_text: b"pub effect db {\n  read get[r](key: Int) -> Int\n}\n" },
     {
       name: b"shop",
-      src: b"import core\npub fn touch(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"touch is handled\" {\n  assert_eq(handle touch(1) with { core::db.get[cart](k) -> k + 1, }, 2)\n}\n",
+      source_text: b"import core\npub fn touch(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"touch is handled\" {\n  assert_eq(handle touch(1) with { core::db.get[cart](k) -> k + 1, }, 2)\n}\n",
     },
   ])
 
 fn seeded_agrees(before: List<Source>, after: List<Source>) -> Bool / {abort.raise} =
   disagreements([step(b"before", before), step(b"after", after)]) == []
 
-test "adding a look-alike effect keeps the result through the store matching the fresh one" {
-  let alike = [{ name: b"aaa", src: b"pub effect alpha {\n  read get[r](key: Int) -> Int\n}\n" }];
+test "checking with cached results matches checking from scratch after adding an effect with the same operation signature as an existing one" {
+  let alike = [
+    { name: b"aaa", source_text: b"pub effect alpha {\n  read get[r](key: Int) -> Int\n}\n" },
+  ];
   assert(seeded_agrees(effect_sources([]), effect_sources([])));
   assert(seeded_agrees(effect_sources([]), effect_sources(alike)))
 }
 
-test "adding an unrelated effect keeps the result through the store matching the fresh one" {
-  let other = [{ name: b"aaa", src: b"pub effect alpha {\n  write put(key: Int) -> Int\n}\n" }];
+test "adding an unrelated effect leaves cached results matching checking from scratch" {
+  let other = [
+    { name: b"aaa", source_text: b"pub effect alpha {\n  write put(key: Int) -> Int\n}\n" },
+  ];
   assert(seeded_agrees(effect_sources([]), effect_sources(other)))
 }
 
-test "what a module query is asked reads back as it was asked" {
+test "module keys, interface keys, embeddings and package locations in cache queries decode to the values that were encoded" {
   gen::check4(
     module_keys(),
     interface_keys(),
@@ -1270,15 +1293,15 @@ fn hashed_fixture() -> List<Source> =
   [
     {
       name: b"base",
-      src: b"pub effect tick { write beat() -> Unit }\npub opaque type Coin = new { cents: Int }\npub fn coin(n: Int) -> Coin = { cents: n }\npub fn cents(c: Coin) -> Int = c.cents\npub fn even(n: Int) -> Bool / { tick.write } = if n <= 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n <= 0 { false } else { even(n - 1) }\nfn spare() -> Int = 3\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\nlaw \"halving shrinks\" forall (n: Int) where n >= 0 { half(n) <= n }\npub fn width(b: Bytes) -> Int\n  cost b.len()\n= b.len()\n",
+      source_text: b"pub effect tick { write beat() -> Unit }\npub opaque type Coin = new { cents: Int }\npub fn coin(n: Int) -> Coin = { cents: n }\npub fn cents(c: Coin) -> Int = c.cents\npub fn even(n: Int) -> Bool / { tick.write } = if n <= 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n <= 0 { false } else { even(n - 1) }\nfn spare() -> Int = 3\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\nlaw \"halving shrinks\" forall (n: Int) where n >= 0 { half(n) <= n }\npub fn width(b: Bytes) -> Int\n  cost b.len()\n= b.len()\n",
     },
     {
       name: b"app",
-      src: b"import base\npub fn worth(n: Int) -> Int = base::cents(base::coin(base::half(n)))\ntest \"worth\" { assert_eq(worth(4), 2) }\n",
+      source_text: b"import base\npub fn worth(n: Int) -> Int = base::cents(base::coin(base::half(n)))\ntest \"worth\" { assert_eq(worth(4), 2) }\n",
     },
   ]
 
-test "a program hashed from its modules' results hashes as it does hashed whole, and warns alike" {
+test "a program hashed from its modules' results has the same hashes and warnings as the program hashed in one pass" {
   [unedited_sources(), hashed_fixture()].fold((), |u: Unit, sources: List<Source>| {
     let fixed = check_sources(empty_memory_store(), sources, []);
     let whole = load_with_shipped(sources, []);
@@ -1300,19 +1323,19 @@ test "a program hashed from its modules' results hashes as it does hashed whole,
   })
 }
 
-test "a program's tables made from its modules' results are the tables of its check whole" {
+test "assembling a program from per-module check results gives the same definitions, tests and effects as checking the whole program at once" {
   [unedited_sources(), hashed_fixture(), faceted(), faceted().reverse()].fold(
     (),
     |u: Unit, sources: List<Source>| {
       let fixed = check_sources(empty_memory_store(), sources, []);
       match analyse_pulling_std_with(sources, [], no_rows()).out {
-        Rejected(_) -> panic("the fixture checks"),
+        Rejected(_) -> panic("the fixture program was rejected by the checker"),
         Analysed(w) -> {
           let returned = assembled_program(
             fixed.results.map(|a: CheckedModule| facts_of_result(a.result)),
             fixed.cached_hashes,
-            with_prelude_source([]).fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-              acc.insert(s.name, s.src)),
+            with_prelude_source([]).fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
+              accumulator.insert(s.name, s.source_text)),
             true,
             true,
             w.warnings,
@@ -1358,13 +1381,13 @@ fn shipped_import_sources() -> { user: List<Source>, shipped: List<Source> } =
     user: [
       {
         name: b"main",
-        src: b"import std.shapes\nimport std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1) + shapes\"two\"\npub fn named(t: Tag) -> String = \"{t}\"\npub fn ranked(t: Tag) -> Int = t.rank(more: 2)\ntest \"sized\" { assert_eq(size(0 - 3), 3) }\n",
+        source_text: b"import std.shapes\nimport std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1) + shapes\"two\"\npub fn named(t: Tag) -> String = \"{t}\"\npub fn ranked(t: Tag) -> Int = t.rank(more: 2)\ntest \"sized\" { assert_eq(size(0 - 3), 3) }\n",
       },
     ],
     shipped: [
       {
         name: b"std.shapes",
-        src: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn Tag::rank(t: Tag, by: Int = 1, more: Int = 0) -> Int = match t { A -> by, B -> by + more }\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = if text == \"two\" { Ok(2) } else { Err({ message: \"not two\", offset: 0 }) }\ntest \"shipped\" { let t = A; assert_eq(far(origin()), t.rank(by: 0)) }\n",
+        source_text: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn Tag::rank(t: Tag, by: Int = 1, more: Int = 0) -> Int = match t { A -> by, B -> by + more }\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = if text == \"two\" { Ok(2) } else { Err({ message: \"not two\", offset: 0 }) }\ntest \"shipped\" { let t = A; assert_eq(far(origin()), t.rank(by: 0)) }\n",
       },
     ],
   }
@@ -1372,15 +1395,19 @@ fn shipped_import_sources() -> { user: List<Source>, shipped: List<Source> } =
 fn load_with_analysis(
   f: { user: List<Source>, shipped: List<Source> },
   tested: Bool,
-  reached: Bool,
+  used_only: Bool,
 ) -> { loaded: AssembledLoad, assembled: CheckedProgram, whole: Analysis } / {abort.raise} = {
   let w = load_inputs_of(
-    { root: b"", manifest: None, files: f.user.map(|s: Source| { module: s.name, text: s.src }) },
+    {
+      root: b"",
+      manifest: None,
+      files: f.user.map(|s: Source| { module: s.name, text: s.source_text }),
+    },
     [],
   );
   let shipped = with_prelude_source(f.shipped);
-  let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
+  let texts = shipped.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
+    accumulator.insert(s.name, s.source_text));
   let text_of = |name: Bytes| texts.get(name);
   let names = shipped.map(|s: Source| s.name);
   let done = over_decoding(
@@ -1403,38 +1430,41 @@ fn load_with_analysis(
   let loaded = assembled_load(
     f.user.map(|s: Source| s.name),
     { root: b"", manifest: None, supplied: [] },
-    done.results.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
-      acc.insert(a.module, a.result.shape)),
+    done.results.fold(Map::new(), |accumulator: Map<Bytes, ModuleShape>, a: CheckedModule|
+      accumulator.insert(a.module, a.result.shape)),
     done.fixing,
     done.pulled,
     names,
     texts,
     true,
-    reached,
+    used_only,
     root_warnings(done.results, f.user.len()),
   );
-  match analyse_pulling_std_with(f.user, f.shipped, no_rows(), reached: reached).out {
-    Rejected(_) -> panic("the fixture checks"),
+  match analyse_pulling_std_with(f.user, f.shipped, no_rows(), cut_unused: used_only).out {
+    Rejected(_) -> panic("the test program fails to check"),
     Analysed(whole) ->
       {
         loaded: loaded,
         assembled: checked_program_from_results(
           loaded.frame,
           loaded.reads,
-          done.results.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
-            acc.insert(a.module, a.result)),
+          done.results.fold(
+            Map::new(),
+            |accumulator: Map<Bytes, ModuleResult>, a: CheckedModule|
+              accumulator.insert(a.module, a.result),
+          ),
         ),
         whole: whole,
       },
   }
 }
 
-test "a program assembled from its modules' results, a shipped module's among them, is the program checked whole" {
+test "a program assembled from its modules' results, including a shipped module's, equals the program checked all at once" {
   let f = shipped_import_sources();
-  [{ tested: false, reached: true }, { tested: true, reached: false }].fold(
+  [{ tested: false, reachable: true }, { tested: true, reachable: false }].fold(
     (),
-    |u: Unit, mode: { tested: Bool, reached: Bool }| {
-      let x = load_with_analysis(f, mode.tested, mode.reached);
+    |u: Unit, mode: { tested: Bool, reachable: Bool }| {
+      let x = load_with_analysis(f, mode.tested, mode.reachable);
       let loaded = x.loaded;
       let assembled = x.assembled;
       let view = checked_program_of(x.whole);
@@ -1447,7 +1477,7 @@ test "a program assembled from its modules' results, a shipped module's among th
       assert_eq(assembled.checked.definitions, view.checked.definitions);
       assert_eq(assembled.checked.facts, view.checked.facts);
       assert_eq(assembled.checked, view.checked);
-      match load_with_shipped(f.user, f.shipped, reached: mode.reached).hashed {
+      match load_with_shipped(f.user, f.shipped, cut_unused: mode.reachable).hashed {
         Ok(h) ->
           assert(
             checked_body(body_named(h.hashes.bodies, b"main.ranked"), Map::new())
@@ -1469,19 +1499,19 @@ fn reading_unimported() -> { user: List<Source>, shipped: List<Source> } =
     user: [
       {
         name: b"main",
-        src: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
+        source_text: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
       },
     ],
     shipped: [
       {
         name: b"std.list",
-        src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+        source_text: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
       },
-      { name: b"std.internal.schedule", src: b"pub fn idle() -> Int = 0\n" },
+      { name: b"std.internal.schedule", source_text: b"pub fn idle() -> Int = 0\n" },
     ],
   }
 
-test "a module's result names the home and the scheduler it reads with no import, as its program checked whole does" {
+test "a module's result lists `std.list` and the scheduler module as used without an import, the same as a whole-program check" {
   let x = load_with_analysis(reading_unimported(), false, true);
   assert_eq(x.loaded.frame.unimported.at(0), Some([b"std.list", b"std.internal.schedule"]));
   assert_eq(x.loaded.frame.unimported, checked_program_of(x.whole).frame.unimported);
@@ -1491,17 +1521,17 @@ test "a module's result names the home and the scheduler it reads with no import
 fn body_named(bodies: List<{ name: Bytes, body: Bytes }>, name: Bytes) -> Bytes / {abort.raise} =
   match bodies.find(|b: { name: Bytes, body: Bytes }| b.name == name) {
     Some(b) -> b.body,
-    None -> panic("no body is stored of " ++ String::of_bytes_lossy(name)),
+    None -> panic("no body found for " ++ String::of_bytes_lossy(name)),
   }
 
-test "a body that calls on a value stores what its check found, read whole or computed module by module" {
+test "a function body that calls a method on a value records the same check results whether the program is checked whole or module by module" {
   [
     {
       names: false,
       sources: [
         {
           name: b"m",
-          src: b"pub type T = | T(Int)\nfn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn f(t: T) -> Int = t.size()\n",
+          source_text: b"pub type T = | T(Int)\nfn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn f(t: T) -> Int = t.size()\n",
         },
       ],
     },
@@ -1510,9 +1540,12 @@ test "a body that calls on a value stores what its check found, read whole or co
       sources: [
         {
           name: b"low",
-          src: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
+          source_text: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
         },
-        { name: b"m", src: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n" },
+        {
+          name: b"m",
+          source_text: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n",
+        },
       ],
     },
     {
@@ -1520,16 +1553,16 @@ test "a body that calls on a value stores what its check found, read whole or co
       sources: [
         {
           name: b"m",
-          src: b"pub fn f(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\n",
+          source_text: b"pub fn f(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\n",
         },
       ],
     },
   ].fold((), |u: Unit, fixture: { names: Bool, sources: List<Source> }| {
     let returned = check_sources(empty_memory_store(), fixture.sources, [
-    ]).cached_hashes.nodes.fold(b"", |acc: Bytes, x: CachedNode|
-      if x.name == b"m.f" { x.body } else { acc });
+    ]).cached_hashes.nodes.fold(b"", |accumulator: Bytes, x: CachedNode|
+      if x.name == b"m.f" { x.body } else { accumulator });
     match analyse_pulling_std_with(fixture.sources, [], no_rows()).out {
-      Rejected(_) -> panic("the fixture checks"),
+      Rejected(_) -> panic("the fixture program was rejected by the checker"),
       Analysed(w) -> assert_eq(body_named(w.hashes.bodies, b"m.f"), returned),
     };
     match load_with_shipped(fixture.sources, []).hashed {
@@ -1565,7 +1598,7 @@ fn paired(base: Bytes, step: Bytes) -> List<Source> =
   [
     {
       name: b"lib",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub fn even(n: Int) -> Bool = if n <= 0 { ",
         base,
         b" } else { odd(n - 1) }\n\npub fn odd(",
@@ -1582,12 +1615,12 @@ fn paired(base: Bytes, step: Bytes) -> List<Source> =
 fn owners_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
   executed_for(run, name).map(|b: Bytes| decoded(b, owner_key_bin(), "an owner's name").owner)
 
-test "a group that failed and is fixed checks nothing again, each record reused" {
+test "after a failing edit is reverted, checking again reruns no checks and reuses every cached result" {
   let source = |body: Bytes|
     [
       {
         name: b"lib",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub fn base(n: Int) -> Int = ",
           body,
           b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
@@ -1606,12 +1639,12 @@ test "a group that failed and is fixed checks nothing again, each record reused"
   assert_eq(groups_ran(mended.run, group_query()), [])
 }
 
-test "a unit whose group fails is hashed without asking its own members' hashes" {
+test "when a set of definitions fails to check, its hash is computed without the hash of each definition in it" {
   let keyed = |name: Bytes, statement: Bytes, more: Bytes|
     [
       {
         name: b"lib",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub type Tag =\n  | Tag(Int)",
           more,
           b"\n\npub fn ",
@@ -1623,7 +1656,7 @@ test "a unit whose group fails is hashed without asking its own members' hashes"
       },
       {
         name: b"app",
-        src: b"import lib\n\npub fn same(a: lib::Tag, b: lib::Tag) -> Bool = a == b\n",
+        source_text: b"import lib\n\npub fn same(a: lib::Tag, b: lib::Tag) -> Bool = a == b\n",
       },
     ];
   let fixture = keyed(b"tag_key", b"key for Tag by tag_key", b"");
@@ -1644,7 +1677,7 @@ test "a unit whose group fails is hashed without asking its own members' hashes"
   )
 }
 
-test "a body edited in a unit of owners that call one another walks that owner alone, and the unit is resolved again" {
+test "editing one function body in mutually recursive functions rechecks only that body, but redoes the shared signature analysis for all of them" {
   let before = paired(b"true", b"n");
   let cold = queried_over(empty_memory_store(), before);
   assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
@@ -1669,7 +1702,7 @@ fn recursive_types_sources(more: Bytes) -> List<Source> =
   [
     {
       name: b"lib",
-      src: range(0, 80).fold(
+      source_text: range(0, 80).fold(
         Bytes::concat_all([
           b"pub type Step = | Step(Int)",
           more,
@@ -1677,9 +1710,9 @@ fn recursive_types_sources(more: Bytes) -> List<Source> =
           b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1, made(n)) }\n\n",
           b"pub fn odd(n: Int, _c: Count) -> Bool = if n <= 0 { false } else { even(n - 1) }\n",
         ]),
-        |src: Bytes, i: Int|
+        |text: Bytes, i: Int|
           Bytes::concat_all([
-            src,
+            text,
             b"\npub fn pad",
             Bytes::of_string(i.to_string()),
             b"() -> Int = 0\n",
@@ -1688,7 +1721,7 @@ fn recursive_types_sources(more: Bytes) -> List<Source> =
     },
   ]
 
-test "a walk taken from a check of its whole module is made again when what a sibling's signature reaches moves" {
+test "a function body checked as part of a whole-module check is rechecked when a sibling definition's signature changes" {
   let before = recursive_types_sources(b"");
   let cold = queried_over(empty_memory_store(), before);
   assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
@@ -1700,18 +1733,18 @@ test "a walk taken from a check of its whole module is made again when what a si
 
 fn derive_sources(more: Bytes) -> List<Source> =
   [
-    { name: b"sizes", src: b"pub fn derive(declaration: Bytes) -> Bytes = declaration\n" },
+    { name: b"sizes", source_text: b"pub fn derive(declaration: Bytes) -> Bytes = declaration\n" },
     {
       name: b"lib",
-      src: range(0, 40).fold(
+      source_text: range(0, 40).fold(
         Bytes::concat_all([
           b"import sizes\n\npub type Tree = | Branch(List<Grove>)",
           more,
           b"\n\npub type Grove = | Grove(List<Tree>)\n\nderive sizes for Tree\n\nderive sizes for Grove\n",
         ]),
-        |src: Bytes, i: Int|
+        |text: Bytes, i: Int|
           Bytes::concat_all([
-            src,
+            text,
             b"\npub fn pad",
             Bytes::of_string(i.to_string()),
             b"() -> Int = 0\n",
@@ -1745,7 +1778,7 @@ fn sized(at: Bytes) -> Option<Bytes> / {abort.raise} =
     },
   }
 
-test "owners whose derivations' declaration moved walk what their deriver wrote anew" {
+test "changing a type that other types derive functions from rechecks the generated code of each deriving type" {
   let cold = check_sources(empty_memory_store(), derive_sources(b""), [], derived: sized);
   let after = derive_sources(b" | Twig(List<Grove>)");
   let warm = check_sources(cold.store, after, [], derived: sized);
@@ -1758,7 +1791,7 @@ fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
   [
     {
       name: b"lib",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"pub type Stack = | Stack(List<Int>)\n\npub type Queue = | Queue(List<Int>, List<Int>)\n\n",
         b"pub fn Stack::len(s: Stack) -> Int = match s { Stack(xs) -> ",
         stack,
@@ -1769,7 +1802,7 @@ fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
     },
   ]
 
-test "owners that only mention one another are a unit of groups: a body edited walks its owner, resolves its group and signs nothing" {
+test "editing a body in definitions that are not mutually recursive rechecks only that definition and recomputes no signatures" {
   let before = stack_queue_sources(b"xs.len()", b"f.len()");
   let cold = queried_over(empty_memory_store(), before);
   assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
@@ -1813,9 +1846,12 @@ test "a signature edit checks the definitions that read it again, and no other" 
 
 fn shaped(shapes: Bytes, app: Bytes) -> List<Source> =
   [
-    { name: b"shapes", src: shapes },
-    { name: b"made", src: b"import shapes (Shape, Square)\npub fn made() -> Shape = Square(2)\n" },
-    { name: b"app", src: app },
+    { name: b"shapes", source_text: shapes },
+    {
+      name: b"made",
+      source_text: b"import shapes (Shape, Square)\npub fn made() -> Shape = Square(2)\n",
+    },
+    { name: b"app", source_text: app },
   ]
 
 fn shapes_source() -> Bytes =
@@ -1827,7 +1863,7 @@ fn grown_source() -> Bytes =
 fn sized_source() -> Bytes =
   b"import made\npub fn size() -> Int = made::made().area()\n\npub fn two() -> Int = [made::made(), made::made()].len()\n"
 
-test "a function added to a type checks itself alone, and one re-signed the definitions that call it on a value" {
+test "adding a function to a type checks only that function, and changing a signature also rechecks the definitions that call it on a value" {
   let cold = queried_over(empty_memory_store(), shaped(shapes_source(), sized_source()));
   let added = queried_over(
     cold.store,
@@ -1849,7 +1885,7 @@ test "a function added to a type checks itself alone, and one re-signed the defi
   assert(match warm.outcome { Analysed(_) -> true, Rejected(_) -> false })
 }
 
-test "a call on a value leaves the result through the store matching the fresh one as its type's functions come, change and go" {
+test "after each edit to a type's functions, a call on a value gives the same result as a check from scratch" {
   let s0 = shaped(shapes_source(), sized_source());
   let s1 = edited(s0, b"shapes", b"Square(n) -> n * n", b"Square(n) -> n * n + 0");
   let s2 = edited(
@@ -1890,22 +1926,27 @@ test "a call on a value leaves the result through the store matching the fresh o
 fn rejected_over(user: List<Source>, shipped: List<Source>) -> List<Bytes> / {abort.raise} =
   check_sources(empty_memory_store(), user, shipped).results.fold(
     [],
-    |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.rejected.map(|d: Diagnostic| d.message)),
+    |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.message)),
   )
 
-test "a module a language type's home module imports names the type's functions and reads no home module" {
+test "a module can call a function of a built-in type, such as `Bytes`, when it imports the type's defining module but not that module's own imports" {
   assert_eq(
     rejected_over(
-      [{ name: b"main", src: b"import std.bytes\npub fn main(b: Bytes) -> Bytes = b.twice()\n" }],
+      [
+        {
+          name: b"main",
+          source_text: b"import std.bytes\npub fn main(b: Bytes) -> Bytes = b.twice()\n",
+        },
+      ],
       [
         {
           name: b"std.bytes",
-          src: b"import std.radix\npub fn Bytes::twice(b: Bytes) -> Bytes = radix::joined(b, b)\n",
+          source_text: b"import std.radix\npub fn Bytes::twice(b: Bytes) -> Bytes = radix::joined(b, b)\n",
         },
         {
           name: b"std.radix",
-          src: b"pub fn joined(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
+          source_text: b"pub fn joined(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
         },
       ],
     ),
@@ -1919,17 +1960,17 @@ test "a transparent function read from another module calls what its own module 
       [
         {
           name: b"main",
-          src: b"import std.picks\npub fn main(xs: List<Int>) -> Option<Int> = picks::pick(xs)\n",
+          source_text: b"import std.picks\npub fn main(xs: List<Int>) -> Option<Int> = picks::pick(xs)\n",
         },
       ],
       [
         {
           name: b"std.list",
-          src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
+          source_text: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
         },
         {
           name: b"std.picks",
-          src: b"import std.list\npub transparent fn pick(xs: List<Int>) -> Option<Int> = xs.second()\n",
+          source_text: b"import std.list\npub transparent fn pick(xs: List<Int>) -> Option<Int> = xs.second()\n",
         },
       ],
     ),
@@ -1937,19 +1978,24 @@ test "a transparent function read from another module calls what its own module 
   )
 }
 
-test "a call on a value reads a home module through any import of it, or none" {
+test "a call on a value finds a built-in type's function however its defining module is imported, or when it is not imported" {
   let shipped = [
     {
       name: b"std.bytes",
-      src: b"pub fn Bytes::twice(b: Bytes) -> Bytes = b.concat(b)\n\npub fn other(b: Bytes) -> Bytes = b\n",
+      source_text: b"pub fn Bytes::twice(b: Bytes) -> Bytes = b.concat(b)\n\npub fn other(b: Bytes) -> Bytes = b\n",
     },
     {
       name: b"std.through",
-      src: b"import std.bytes\n\npub fn same(b: Bytes) -> Bytes = b.twice()\n",
+      source_text: b"import std.bytes\n\npub fn same(b: Bytes) -> Bytes = b.twice()\n",
     },
   ];
   let main = |imports: Bytes|
-    [{ name: b"main", src: imports.concat(b"pub fn main(b: Bytes) -> Bytes = b.twice()\n") }];
+    [
+      {
+        name: b"main",
+        source_text: imports.concat(b"pub fn main(b: Bytes) -> Bytes = b.twice()\n"),
+      },
+    ];
   assert_eq(rejected_over(main(b"import std.bytes\n"), shipped), []);
   assert_eq(rejected_over(main(b"import std.bytes (other)\n"), shipped), []);
   assert_eq(rejected_over(main(b"import std.bytes as held\n"), shipped), []);
@@ -1957,19 +2003,19 @@ test "a call on a value reads a home module through any import of it, or none" {
   assert_eq(rejected_over(main(b""), shipped), [])
 }
 
-test "a group checked against entries reads what a function it calls on a value resolved, though its text names nothing of that function's module" {
+test "a definition checked against cached interfaces still finds a function it calls on a value, though its source never names that function's module" {
   assert_eq(
     rejected_over(
       [
         {
           name: b"main",
-          src: b"import std.list\npub fn total(xs: List<Int>) -> Int =\n  match xs.rest() { Some(t) -> 1 + total(t), None -> 0 }\n",
+          source_text: b"import std.list\npub fn total(xs: List<Int>) -> Int =\n  match xs.rest() { Some(t) -> 1 + total(t), None -> 0 }\n",
         },
       ],
       [
         {
           name: b"std.list",
-          src: b"pub fn List::rest<a>(xs: List<a>) -> Option<List<a>> =\n  match xs { [] -> None, [_, ..tail] -> Some(tail) }\n",
+          source_text: b"pub fn List::rest<a>(xs: List<a>) -> Option<List<a>> =\n  match xs { [] -> None, [_, ..tail] -> Some(tail) }\n",
         },
       ],
     ),
@@ -1977,37 +2023,37 @@ test "a group checked against entries reads what a function it calls on a value 
   )
 }
 
-test "a shipped module is read as itself among the modules that stand in for what it reads" {
+test "a standard library module is checked from its source, not from a cached interface, when its imports are supplied as cached interfaces" {
   assert_eq(
     rejected_over(
       [
         {
           name: b"main",
-          src: b"import std.words (words)\npub fn main() -> Int = words(\"a\").len()\n",
+          source_text: b"import std.words (words)\npub fn main() -> Int = words(\"a\").len()\n",
         },
       ],
       [
         {
           name: b"std.words",
-          src: b"import std.parts\n\npub fn words(s: String) -> List<String> = words_from(s)\n\nfn words_from(s: String) -> List<String> = parts::split(s)\n",
+          source_text: b"import std.parts\n\npub fn words(s: String) -> List<String> = words_from(s)\n\nfn words_from(s: String) -> List<String> = parts::split(s)\n",
         },
-        { name: b"std.parts", src: b"pub fn split(s: String) -> List<String> = [s]\n" },
+        { name: b"std.parts", source_text: b"pub fn split(s: String) -> List<String> = [s]\n" },
       ],
     ),
     [],
   )
 }
 
-test "a language type's function is found in a module that names a constructor as the type is named" {
+test "a built-in type's function is found in a module that also defines a constructor with the type's name" {
   assert_eq(
     rejected_over(
       [
         {
           name: b"main",
-          src: b"import std.float\n\npub type Value = | Float(Float) | Text(String)\n\npub fn main() -> Value = Float(Float::least())\n",
+          source_text: b"import std.float\n\npub type Value = | Float(Float) | Text(String)\n\npub fn main() -> Value = Float(Float::least())\n",
         },
       ],
-      [{ name: b"std.float", src: b"pub fn Float::least() -> Float = 0.0\n" }],
+      [{ name: b"std.float", source_text: b"pub fn Float::least() -> Float = 0.0\n" }],
     ),
     [],
   )
@@ -2020,14 +2066,14 @@ fn tables_of(
 
 fn lib_app_sources(lib: Bytes) -> List<Source> =
   [
-    { name: b"lib", src: lib },
+    { name: b"lib", source_text: lib },
     {
       name: b"app",
-      src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n",
+      source_text: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n",
     },
   ]
 
-test "the groups a signature edit moves in one module are checked again, and no other" {
+test "editing a function's signature rechecks that function and the definitions that call it, and no other definitions" {
   let cold = queried_over(
     empty_memory_store(),
     lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
@@ -2061,9 +2107,9 @@ fn read_whole_module(store: MemoryStore, g: GroupKey) -> Bool / {abort.raise} =
             memo::QueryDependency(_, _, _) -> false,
           }))))
 
-test "an edit that moves one group of a module checks it alone, and one that moves more checks the module once" {
+test "an edit that affects one definition in a module rechecks that definition alone, and an edit that affects several checks the whole module once" {
   let app = b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 2\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n";
-  let over = |lib: Bytes| [{ name: b"lib", src: lib }, { name: b"app", src: app }];
+  let over = |lib: Bytes| [{ name: b"lib", source_text: lib }, { name: b"app", source_text: app }];
   let cold = queried_over(
     empty_memory_store(),
     lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
@@ -2092,15 +2138,15 @@ fn checked_whole_in(store: MemoryStore, hash: Bytes, module: Bytes) -> Bool / {a
             memo::ExternalDependency(_, _, _) -> false,
           }))))
 
-test "where only what puts a module together is defined anew, its groups stand and it is not checked again" {
+test "when only the query that assembles a module's result changes, it reruns but the module's definitions are not rechecked" {
   let sources = lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n");
   let cold = queried_over(empty_memory_store(), sources);
   assert(checked_whole_in(cold.store, module_query(), b"app"));
   let anew = b"module, defined anew";
   let qs = fresh_registry().fold(
     Map::new(),
-    |acc: Map<Bytes, CheckQuery>, n: Bytes, q: CheckQuery|
-      acc.insert(n, if n == module_query() { { ..q, hash: anew } } else { q }),
+    |accumulator: Map<Bytes, CheckQuery>, n: Bytes, q: CheckQuery|
+      accumulator.insert(n, if n == module_query() { { ..q, hash: anew } } else { q }),
   );
   let warm = queried_under(qs, cold.store, sources);
   assert(modules_ran(warm.run, module_query()).contains(b"app"));
@@ -2112,10 +2158,10 @@ test "where only what puts a module together is defined anew, its groups stand a
 
 fn shared_base_sources(lib: Bytes) -> List<Source> =
   [
-    { name: b"lib", src: lib },
+    { name: b"lib", source_text: lib },
     {
       name: b"app",
-      src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + base()\n\npub fn again(n: Int) -> Int = lib::step(n) * 2 + base()\n\npub fn base() -> Int = 1\n\npub fn aside() -> Int = 7\n",
+      source_text: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + base()\n\npub fn again(n: Int) -> Int = lib::step(n) * 2 + base()\n\npub fn base() -> Int = 1\n\npub fn aside() -> Int = 7\n",
     },
   ]
 
@@ -2137,7 +2183,7 @@ fn reads_own_groups(store: MemoryStore) -> Bool / {abort.raise} =
             }))
       }))
 
-test "a check of a module whole that a group asks for reads nothing of the module's groups" {
+test "a whole-module check requested by one definition does not read the results of the module's other definitions" {
   let cold = queried_over(
     empty_memory_store(),
     shared_base_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
@@ -2156,11 +2202,11 @@ fn stale_group_sources(inner: Bytes, first: Bytes, go: Bytes) -> List<Source> =
   [
     {
       name: b"lib",
-      src: Bytes::concat_all([inner, b"\n\npub fn step(n: Int) -> Int = inner(n) + 1\n"]),
+      source_text: Bytes::concat_all([inner, b"\n\npub fn step(n: Int) -> Int = inner(n) + 1\n"]),
     },
     {
       name: b"zed",
-      src: Bytes::concat_all([
+      source_text: Bytes::concat_all([
         b"import lib\nfn seed() -> Int = 1\n\nfn sprout() -> Int = seed() + 1\n\n",
         first,
         b"\n\nfn shown(n: Int) -> Int = lib::step(n)\n\n",
@@ -2170,7 +2216,7 @@ fn stale_group_sources(inner: Bytes, first: Bytes, go: Bytes) -> List<Source> =
     },
   ]
 
-test "a group that goes stale while its module's others are checked is checked after them" {
+test "a definition whose cached result becomes outdated while other definitions in its module are checked is checked after them" {
   let before = stale_group_sources(
     b"fn inner(n: Int) -> Int = n + 1",
     b"pub fn first() -> Int = sprout() + 1",
@@ -2186,17 +2232,17 @@ test "a group that goes stale while its module's others are checked is checked a
   assert_eq(warm.results, queried_over(empty_memory_store(), after).results)
 }
 
-test "a test edited beside a definition it calls returns what a fresh check returns" {
+test "editing a test and a definition it calls gives the same results as checking the edited module from scratch" {
   let before = [
     {
       name: b"m",
-      src: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = n + 1\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 5) }\n",
+      source_text: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = n + 1\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 5) }\n",
     },
   ];
   let after = [
     {
       name: b"m",
-      src: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = 1 + n\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 9) }\n",
+      source_text: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = 1 + n\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 9) }\n",
     },
   ];
   let warm = queried_over(queried_over(empty_memory_store(), before).store, after);
@@ -2204,7 +2250,7 @@ test "a test edited beside a definition it calls returns what a fresh check retu
   assert_eq(warm.results, queried_over(empty_memory_store(), after).results)
 }
 
-test "groups an edit breaks together each say why, as a fresh check says" {
+test "when an edit breaks several definitions, each reports the same error as a check from scratch" {
   let cold = queried_over(
     empty_memory_store(),
     lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
@@ -2245,18 +2291,18 @@ test "a body edit hashes the definitions that call it again, and no other" {
   assert_eq(warm.cached_hashes, check_sources(empty_memory_store(), edited, []).cached_hashes)
 }
 
-test "a definition added to a shipped module checks and hashes no module that imports it again" {
+test "adding a definition to a standard library module neither rechecks nor rehashes the modules that import it" {
   let user = [
     {
       name: b"main",
-      src: b"import std.shapes\npub fn main() -> Int = shapes::far(shapes::origin())\n",
+      source_text: b"import std.shapes\npub fn main() -> Int = shapes::far(shapes::origin())\n",
     },
   ];
   let shapes = |more: Bytes|
     [
       {
         name: b"std.shapes",
-        src: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int = p.x + p.y\n".concat(
+        source_text: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int = p.x + p.y\n".concat(
           more,
         ),
       },
@@ -2269,21 +2315,21 @@ test "a definition added to a shipped module checks and hashes no module that im
   assert_eq(warm.cached_hashes, check_sources(empty_memory_store(), user, added).cached_hashes)
 }
 
-test "a load over a pack it does not trust checks no shipped module the pack still has results for" {
+test "loading with a cached standard library result that is not trusted rechecks no standard library module the cache has results for" {
   let user = [
     {
       name: b"main",
-      src: b"import std.a (two)\npub fn main() -> Int = two()\n\npub fn more() -> Int = two() + 1\n",
+      source_text: b"import std.a (two)\npub fn main() -> Int = two()\n\npub fn more() -> Int = two() + 1\n",
     },
   ];
   let shipped = |aside: Bytes|
     [
       {
         name: b"std.a",
-        src: b"import std.b (one)\n\npub fn two() -> Int = one() + one()\n\npub fn three() -> Int = two() + one()\n",
+        source_text: b"import std.b (one)\n\npub fn two() -> Int = one() + one()\n\npub fn three() -> Int = two() + one()\n",
       },
-      { name: b"std.b", src: b"pub fn one() -> Int = 1\n\npub fn none() -> Int = 0\n" },
-      { name: b"std.aside", src: aside },
+      { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n\npub fn none() -> Int = 0\n" },
+      { name: b"std.aside", source_text: aside },
     ];
   let packed = pack_of(shipped_store(shipped(b"pub fn spare() -> Int = 3\n")));
   let moved = shipped(b"pub fn spare() -> Int = 4\n");
@@ -2297,13 +2343,13 @@ test "a load over a pack it does not trust checks no shipped module the pack sti
   assert_eq(load.results, check_sources(empty_memory_store(), user, moved).results)
 }
 
-test "modules that import one another in a cycle are rejected through the store as they are fresh" {
+test "import cycles and self-imports are rejected with the same errors whether checked from scratch or from the cache" {
   let cycle = [
-    { name: b"a", src: b"import b\npub fn a() -> Int = b::b()\n" },
-    { name: b"b", src: b"import a\npub fn b() -> Int = a::a()\n" },
-    { name: b"c", src: b"import a\npub fn c() -> Int = a::a()\n" },
+    { name: b"a", source_text: b"import b\npub fn a() -> Int = b::b()\n" },
+    { name: b"b", source_text: b"import a\npub fn b() -> Int = a::a()\n" },
+    { name: b"c", source_text: b"import a\npub fn c() -> Int = a::a()\n" },
   ];
-  let itself = [{ name: b"me", src: b"import me\npub fn f() -> Int = 1\n" }];
+  let itself = [{ name: b"me", source_text: b"import me\npub fn f() -> Int = 1\n" }];
   assert_eq(
     disagreements([
       step(b"a cycle", cycle),
@@ -2315,12 +2361,18 @@ test "modules that import one another in a cycle are rejected through the store 
   )
 }
 
-test "a load that fails checks no module that imports a failed one, and no group of a module whose whole check fails" {
+test "a module that fails to check causes no check of the modules that import it, nor of its definitions one by one" {
   let sources = [
-    { name: b"lib", src: b"pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n" },
-    { name: b"app", src: b"import lib\npub fn go() -> Int = lib::fine()\n" },
-    { name: b"top", src: b"import app\npub fn main() -> Int = app::go()\n" },
-    { name: b"aside", src: b"pub fn alone() -> Int = nothing()\n\npub fn other() -> Int = 2\n" },
+    {
+      name: b"lib",
+      source_text: b"pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n",
+    },
+    { name: b"app", source_text: b"import lib\npub fn go() -> Int = lib::fine()\n" },
+    { name: b"top", source_text: b"import app\npub fn main() -> Int = app::go()\n" },
+    {
+      name: b"aside",
+      source_text: b"pub fn alone() -> Int = nothing()\n\npub fn other() -> Int = 2\n",
+    },
   ];
   let cold = queried_over(empty_memory_store(), sources);
   assert_eq(sorted_bytes(rejected_first(cold.results).map(|a: CheckedModule| a.module)), [

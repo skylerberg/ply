@@ -1,6 +1,6 @@
 use ply_core::codec::{FORMAT, Reader, Writer, fun, tag};
 use ply_core::float::bits;
-use ply_core::{Decimal, Fixed, IntTy};
+use ply_core::{Decimal, Fixed, IntegerType};
 
 fn read(bytes: &[u8]) -> Reader<&[u8]> {
     Reader::new(bytes).expect("bytes that open with the format")
@@ -12,22 +12,21 @@ fn written(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
     w.finish()
 }
 
-/// `body` past the format, as no writer would write it.
 fn with(body: &[u8]) -> Vec<u8> {
     [&FORMAT[..], body].concat()
 }
 
 #[test]
-fn every_part_the_writer_writes_reads_back_as_it_was_written() {
+fn every_kind_of_value_the_codec_writes_is_read_back_unchanged() {
     let ints = [0, 1, -1, 63, -64, 64, i64::MIN, i64::MAX];
     let decimal = Decimal::new(-12345, 3);
     let fixed = [
-        Fixed::new(IntTy::U8, 255),
-        Fixed::new(IntTy::I8, -5i128 as u128),
-        Fixed::new(IntTy::I64, i128::from(i64::MIN) as u128),
-        Fixed::new(IntTy::U64, u128::from(u64::MAX)),
-        Fixed::new(IntTy::I128, i128::MIN as u128),
-        Fixed::new(IntTy::U128, u128::MAX),
+        Fixed::new(IntegerType::U8, 255),
+        Fixed::new(IntegerType::I8, -5i128 as u128),
+        Fixed::new(IntegerType::I64, i128::from(i64::MIN) as u128),
+        Fixed::new(IntegerType::U64, u128::from(u64::MAX)),
+        Fixed::new(IntegerType::I128, i128::MIN as u128),
+        Fixed::new(IntegerType::U128, u128::MAX),
     ];
     let bytes = written(|w| {
         w.count(tag::LIST, 3);
@@ -90,7 +89,7 @@ fn every_part_the_writer_writes_reads_back_as_it_was_written() {
     r.expect(tag::FUN).unwrap();
     assert_eq!(r.byte().unwrap(), fun::PROJECT);
     assert_eq!((r.varint().unwrap(), r.varint().unwrap()), (2, 1));
-    r.expect(tag::AGAIN).unwrap();
+    r.expect(tag::BACK_REFERENCE).unwrap();
     assert_eq!(r.varint().unwrap(), 4);
     r.end().unwrap();
 }
@@ -104,7 +103,7 @@ fn an_int_takes_as_many_bytes_as_its_magnitude_needs_whatever_its_sign() {
 }
 
 #[test]
-fn a_name_repeated_in_every_row_is_written_once_and_read_back_by_its_number() {
+fn a_field_name_repeated_in_every_row_is_written_once_and_later_rows_refer_to_it_by_index() {
     let rows = |n: u64| {
         written(|w| {
             w.count(tag::LIST, n);
@@ -136,7 +135,8 @@ fn a_name_repeated_in_every_row_is_written_once_and_read_back_by_its_number() {
 }
 
 #[test]
-fn bytes_that_do_not_hold_what_is_read_are_rejected() {
+fn the_reader_rejects_empty_input_a_wrong_header_truncated_data_trailing_bytes_and_oversized_counts()
+ {
     assert!(Reader::new(&b""[..]).is_err());
     assert!(Reader::new(&b"PLV2"[..]).is_err());
     assert!(read(FORMAT).byte().unwrap_err().contains("ends early"));
@@ -184,7 +184,7 @@ fn bytes_that_do_not_hold_what_is_read_are_rejected() {
 }
 
 #[test]
-fn a_name_read_by_a_number_it_was_not_given_is_rejected() {
+fn reading_a_name_reference_to_an_index_that_was_never_defined_is_rejected() {
     let bytes = written(|w| {
         w.name(b"first");
         w.varint(2);

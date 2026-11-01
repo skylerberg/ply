@@ -1,31 +1,34 @@
-//! Streams: bytes read and written a chunk at a time, through a scoped value released when its
-//! scope ends.
+//! Streams: bytes read and written a chunk at a time, through a scoped value that is released when
+//! its scope ends.
 //!
 //! A `Source` is where bytes come from and a `Sink` is where they go. Each is a pair of functions,
 //! so a file, a socket and a pipe are all read by the same `read`, `fold_lines` and `copy`. Open a
 //! stream with `with_scope` over `reading`, `writing` or `appending`, and release it with
-//! `close_source` or `close_sink`, which closes it however the scope ends. The stream is
-//! read or written through the scoped value, which cannot leave the scope.
+//! `close_source` or `close_sink`, which closes it however the scope ends. The stream is read or
+//! written through the scoped value, which cannot leave the scope.
 //!
 //! A read returns at most the number of bytes requested, and costs no more than that, however much
 //! the source has. A result shorter than requested is not the end; an empty result is. Every loop
-//! here is given the most bytes it may read in total, and raises `io.too_long` past them, so none
-//! runs without a bound.
+//! here takes the most bytes it may read in total, and raises `io.too_long` past that limit, so
+//! none runs without a bound.
 //!
 //! `chunks` and `lines` turn a source into a `std.seq` sequence, for `seq::map`, `seq::filter` and
-//! the rest. Each pull is one read. The sequence's effects say it reads a scoped value, so it is
-//! consumed inside the scope that opened the source, and its consumer's budget is the bound. A
-//! decoder with its own state is a step function passed to `seq::unfold` over `read` or `fill`.
+//! the rest. Each pull is one read. The sequence's effects say it reads a scoped value, so it must
+//! be consumed inside the scope that opened the source. The sequence itself has no limit on length:
+//! the code that consumes it must stop after a bounded number of items. A decoder with its own
+//! state is a step function passed to `seq::unfold` over `read` or `fill`.
 //!
-//! Code written against a root runs unchanged over `std.fs`'s in-memory fake (`fs::on_mem`). With
-//! `fs::mem_short_reads`, the fake gives the short reads that a file on disk rarely gives.
+//! File functions take a file system label such as `[l]`, which names a directory the program is
+//! given access to with `--fs NAME=PATH`. Code written for any such label runs unchanged over
+//! `std.fs`'s in-memory fake (`fs::on_mem`). With `fs::mem_short_reads`, the fake gives the short
+//! reads that a file on disk rarely gives.
 //!
 //! `stdin`, `stdout` and `stderr` are the process's own streams, as a source and two sinks. So a
 //! filter is `copy(from, to, ..)`, and a line reader is `fold_lines` over standard input, each
 //! under `with_scope` like any stream. These streams belong to the process and outlive every scope.
 //! Closing standard output flushes its buffer, and closing the other two does nothing. A write
-//! whose reader has gone away raises `std.process`'s `pipe.broken`, and never returns `false`.
-//! Code written against them runs unchanged over `std.process`'s fake (`process::over`).
+//! whose reader has gone away raises `std.process`'s `pipe.broken`, and never returns `false`. Code
+//! written against them runs unchanged over `std.process`'s fake (`process::over`).
 
 import std.fs
 import std.fs (fs, files, FileError, ToRead, ToWrite, ToAppend)
@@ -131,17 +134,18 @@ pub fn stderr<[p]>() -> Sink<| {process.err_bytes[p], pipe.broken}> =
     close: || (),
   }
 
-/// Runs `body` to write the file at `path` under the root `l` through a sink, replacing the file
-/// completely or not at all, as `fs::write_atomic` does for bytes in memory. What `body` writes
-/// goes to a temporary file beside the path. Once `body` returns, the temporary file is renamed
-/// over the path, so a file of any size is replaced using the memory of one chunk. If a raise
-/// unwinds through `body`, or its task is cancelled, the temporary file is removed and the path
-/// keeps its old contents. `durability` and `mode` are as for `fs::commit_atomic`.
+/// Runs `body` to write the file at `path` through a sink, replacing the file completely or not at
+/// all, as `fs::write_atomic` does for bytes in memory. The path is inside the directory that the
+/// file system label `l` names. What `body` writes goes to a temporary file beside the path. Once
+/// `body` returns, the temporary file is renamed over the path, so a file of any size is replaced
+/// using the memory of one chunk. If a raise unwinds through `body`, or its task is cancelled, the
+/// temporary file is removed and the path still has its old contents. `durability` and `mode` are
+/// as for `fs::commit_atomic`.
 ///
-/// The sink is passed to `body` as a value, which a scoped value opened here could not be. Its
-/// `close` does nothing. `body` writes through its `push`, or opens its own scope on it,
-/// `with_scope[out](sink, close_sink) { .. }`, to write with `write` and `copy`. Once `body` has
-/// returned, the sink accepts nothing more.
+/// The sink is passed to `body` as a plain `Sink` value, not as a `Scoped` value, and closing it
+/// does nothing. `body` can call the sink's `push` directly. To use `write` and `copy`, which take
+/// a `Scoped` sink, `body` wraps the sink itself with `with_scope[out](sink, close_sink) { .. }`.
+/// Once `body` has returned, the sink accepts nothing more.
 pub fn replacing<a, [l] | e>(
   path: String,
   durability: fs::Durability,
@@ -149,14 +153,13 @@ pub fn replacing<a, [l] | e>(
   body: (Sink<| {fs.write_chunk[l]}>) -> a / e,
 ) -> a / {fs.open[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.fail, entropy.next, abort.raise | e} =
   with_scope[pending](fs::begin_atomic[l](path), |p: fs::Pending|
-    fs::abandon_atomic[l](p)) { held -> {
-    let p = held.get();
+    fs::abandon_atomic[l](p)) { pending_scope -> {
+    let p = pending_scope.get();
     let value = body(non_closing_sink[l](p.file));
     fs::commit_atomic[l](p, mode, durability);
     value
   } }
 
-/// A sink on a descriptor that something else closes.
 fn non_closing_sink<[l]>(file: Int) -> Sink<| {fs.write_chunk[l]}> =
   { push: |bytes: Bytes| fs.write_chunk[l](file, bytes), close: || () }
 
@@ -178,9 +181,9 @@ pub fn write<[r] | e>(
 ) -> Unit / {scoped.read[r], io.write_failed | e} =
   if sink.get().push(bytes) { () } else { io.write_failed() }
 
-/// Folds `f` over each chunk the source gives until it ends. No chunk is longer than `chunk`
-/// bytes, which must be at least one. Reads at most `limit` bytes in total, and keeps one chunk in
-/// memory at a time.
+/// Folds `f` over each chunk of the source until the source ends, and returns the result. No chunk
+/// is longer than `chunk` bytes, which must be at least one. Reads at most `limit` bytes in total,
+/// raising `io.too_long` if the source has more, and has only one chunk in memory at a time.
 pub fn fold_chunks<a, [r] | e>(
   source: Scoped<Source<| e>, [r]>,
   chunk: Int,
@@ -188,20 +191,19 @@ pub fn fold_chunks<a, [r] | e>(
   init: a,
   f: (a, Bytes) -> a / e,
 ) -> a / {scoped.read[r], io.too_long, abort.raise | e} =
-  iterate({ acc: init, read: 0 }, max_reads(chunk, limit), |s: { acc: a, read: Int }| {
-    let bytes = next_chunk(source, chunk, limit, s.read);
-    if bytes.len() == 0 { Stop(s.acc) }
-    else { Continue({ acc: f(s.acc, bytes), read: s.read + bytes.len() }) }
-  })
+  iterate(
+    { accumulator: init, read: 0 },
+    max_reads(chunk, limit),
+    |s: { accumulator: a, read: Int }| {
+      let bytes = next_chunk(source, chunk, limit, s.read);
+      if bytes.len() == 0 { Stop(s.accumulator) }
+      else { Continue({ accumulator: f(s.accumulator, bytes), read: s.read + bytes.len() }) }
+    },
+  )
 
-/// The most reads a loop over a source may make: one for each byte it may read, one to find the
-/// end, and one to find a byte too many.
 fn max_reads(chunk: Int, limit: Int) -> Int / {abort.raise} =
   if chunk < 1 { panic("a chunk is at least one byte") } else { max(limit, 0) + 2 }
 
-/// The next chunk for a reader that has read `so_far` of its `limit` bytes, or empty at the
-/// source's end. It requests one byte past the limit, to tell a source that has more apart from
-/// one that ends there.
 fn next_chunk<[r] | e>(
   source: Scoped<Source<| e>, [r]>,
   chunk: Int,
@@ -253,21 +255,21 @@ pub fn fold_lines<a, [r] | e>(
   f: (a, Bytes) -> a / e,
 ) -> a / {scoped.read[r], io.too_long, abort.raise | e} = {
   let ended = iterate(
-    { acc: init, pending: b"", read: 0 },
+    { accumulator: init, pending: b"", read: 0 },
     max_reads(chunk, limit),
-    |s: { acc: a, pending: Bytes, read: Int }| {
+    |s: { accumulator: a, pending: Bytes, read: Int }| {
       let bytes = next_chunk(source, chunk, limit, s.read);
       if bytes.len() == 0 { Stop(s) } else {
         let split = split_lines(s.pending, bytes);
         Continue({
-          acc: split.lines.fold(s.acc, f),
+          accumulator: split.lines.fold(s.accumulator, f),
           pending: split.pending,
           read: s.read + bytes.len(),
         })
       }
     },
   );
-  if ended.pending.len() == 0 { ended.acc } else { f(ended.acc, ended.pending) }
+  if ended.pending.len() == 0 { ended.accumulator } else { f(ended.accumulator, ended.pending) }
 }
 
 /// Copies what is left in the source into the sink, `chunk` bytes at a time, using the memory of
@@ -301,10 +303,10 @@ pub fn fill<[r] | e>(
       }),
   )
 
-/// The chunks of a source as a sequence, each at most `size` bytes, ending where the source does.
-/// A pull is one read, so a consumer with a budget of `b` reads at most `b + 1` chunks. The
-/// sequence reads the source as it is pulled. Pulling it again from the start continues from the
-/// source's current position.
+/// Returns the chunks of a source as a sequence, each at most `size` bytes, ending where the source
+/// does. Each step of the sequence makes one read, so a consumer allowed `b` items makes at most `b
+/// + 1` reads. The sequence reads the source as it is consumed. Consuming the sequence a second
+/// time continues from the source's current position, not from the beginning of the source.
 pub fn chunks<[r] | e>(
   source: Scoped<Source<| e>, [r]>,
   size: Int,
@@ -340,7 +342,6 @@ pub fn lines<[r] | e>(
 
 type Halves = { head: List<Int>, tail: List<Int> }
 
-/// A text of `a`s and newlines, one byte for each of `picks`.
 fn parity_bytes(picks: List<Int>) -> Bytes =
   Bytes::concat_all(picks.map(|p: Int| if p % 2 == 0 { b"\n" } else { b"a" }))
 
@@ -355,7 +356,6 @@ fn split_whole(h: Halves) -> { lines: List<Bytes>, rest: Bytes } / {abort.raise}
   { lines: one.lines, rest: one.pending }
 }
 
-/// A generator of `Halves` for tests.
 fn halves_generator() -> gen::Gen<Halves> =
   gen::map2(
     gen::list(gen::any_int()),
@@ -370,7 +370,6 @@ test "the lines of a text are the same wherever a chunk ends" {
 fn tree() -> fs::MemFs / {abort.raise} =
   fs::mem_of([{ path: "notes/poem.txt", body: b"one\ntwo\nthree" }, { path: "empty", body: b"" }])
 
-/// Each line of the file at `path` under `data`, read `chunk` bytes at a time.
 fn lines_of(
   path: String,
   chunk: Int,
@@ -433,7 +432,7 @@ test "a source with more bytes than its reader may read fails, and is still clos
   assert_eq(over.tree.opened.len(), 0)
 }
 
-test "a source pulled after its scope closed it raises, and does not look ended" {
+test "reading from a source after its scope closed it raises an error instead of reporting end of input" {
   let over = fs::on_mem[data](tree(), || {
     let escaped = with_scope[file](
       reading[data]("notes/poem.txt"),
@@ -463,7 +462,7 @@ test "a file that does not open reports why, and nothing is left open" {
   assert_eq(over.tree.opened.len(), 0)
 }
 
-test "a written file contains its chunks in order, and an appended file keeps what came before" {
+test "writing a file stores its chunks in order, and appending adds to the existing contents or creates the file" {
   let over = fs::on_mem[data](tree(), || {
     with_scope[out](
       writing[data]("notes/poem.txt"),
@@ -511,7 +510,7 @@ test "a reader still closes its file when a raise unwinds through it" {
   assert_eq(over.tree.opened.len(), 0)
 }
 
-test "a fill reads until it has all it requested, however short the reads, or less at the end" {
+test "`fill` keeps reading until it has the requested number of bytes despite short reads, and returns fewer only at the end of the file" {
   let over = fs::on_mem[data](fs::mem_short_reads(tree(), 2), ||
     with_scope[file](
       reading[data]("notes/poem.txt"),
@@ -530,7 +529,7 @@ test "the chunks of a source are a sequence that ends where the source does" {
   assert_eq(over.tree.opened.len(), 0)
 }
 
-test "the lines of a source are one sequence whatever the chunk and whatever short reads it gives: {c}" for c: { chunk: Int, short: Int } in [
+test "`lines` returns the same lines for every chunk size and short-read size in {c}" for c: { chunk: Int, short: Int } in [
     { chunk: 1, short: 0 },
     { chunk: 4, short: 0 },
     { chunk: 5, short: 0 },
@@ -546,7 +545,7 @@ test "the lines of a source are one sequence whatever the chunk and whatever sho
   assert_eq(read.value, [b"one", b"two", b"three"])
 }
 
-test "a sequence over a source reads as it is pulled, and a budget of one pull reads two chunks" {
+test "`chunks` reads a chunk only when the sequence is consumed, and taking one chunk then one more reads two chunks in total" {
   let over = fs::on_mem[data](tree(), ||
     with_scope[file](
       reading[data]("notes/poem.txt"),
@@ -558,12 +557,10 @@ test "a sequence over a source reads as it is pulled, and a budget of one pull r
       { first: first, spent: spent, left: read(source, 100) }
     } });
   assert_eq(over.value.first, [b"one\n"]);
-  // The pull past the budget read `thre` to learn the sequence had not ended.
   assert_eq(over.value.spent, Err(1));
   assert_eq(over.value.left, b"e")
 }
 
-/// `cat`: standard input to standard output, `chunk` bytes at a time.
 fn cat(
   chunk: Int,
 ) -> Int / {process.in_bytes[proc], process.out_bytes[proc], process.flush[proc], pipe.broken, io.too_long, io.write_failed, abort.raise} =
@@ -589,7 +586,7 @@ test "standard input is copied to standard output byte for byte, whatever the re
   assert_eq(process::written_to(ran.captured, Stderr), b"")
 }
 
-test "the lines of standard input are read as a file's are" {
+test "reading lines from standard input gives the same lines as reading them from a file" {
   let typed = process::with_chunks(process::captured([]), [b"one\ntw", b"o\n", b"three"]);
   let ran = process::over[proc](typed, ||
     with_scope[input](
@@ -601,7 +598,7 @@ test "the lines of standard input are read as a file's are" {
   assert_eq(ran.value, Some([b"one", b"two", b"three"]))
 }
 
-test "standard error gets exactly what is written, and closing standard output flushes it" {
+test "standard error receives exactly the bytes written to it, and closing standard output flushes the bytes written to standard output" {
   let ran = process::over[proc](process::captured([]), || {
     with_scope[errors](stderr[proc](), close_sink) { sink -> write(sink, b"\x00warn") };
     with_scope[output](stdout[proc](), close_sink) { sink -> write(sink, b"half a line") }
@@ -620,7 +617,7 @@ test "standard error gets exactly what is written, and closing standard output f
   assert_eq(closed.value, Some([Err(Stdout), Err(Stdout)]))
 }
 
-test "a replaced file keeps its old contents until the body returns, and then has every chunk" {
+test "`replacing` leaves the old file contents in place until the function passed to it returns, and then the file contains every written chunk" {
   let over = fs::on_mem[data](tree(), ||
     with_rand(rand(0), ||
       replacing[data](

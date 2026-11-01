@@ -1,11 +1,3 @@
-//! `std.x509` against what real sites served. Under `x509/chains` a file is one site's reply, the
-//! leaf and then what came with it in the order it came, as the wire had them at `capture_time()`;
-//! under `x509/roots` are the roots those end at, out of one system's store, each named by the
-//! first eight bytes of its fingerprint. A shipped module embeds no file, so these stand here.
-//!
-//! No site's key is held, so what a leaf is made to sign below is signed by a key made here: the
-//! verifier rejects it before any signature is looked at, which is the point.
-
 import std.bytes
 import std.crypto
 import std.crypto (Sha256, Sha384, Sha512)
@@ -26,7 +18,6 @@ fn chain_files() -> List<File> = embed_dir("x509/chains")
 
 fn root_files() -> List<File> = embed_dir("x509/roots")
 
-/// When the chains were served: each is verified as of then, whatever the day the test runs.
 fn capture_time() -> Instant / {abort.raise} =
   match date::parse_rfc3339("2026-10-06T14:54:16+00:00") {
     Some(t) -> match date::instant(t) { Some(i) -> i, None -> panic("an instant") },
@@ -57,14 +48,12 @@ fn chain_from_file(file: String) -> Chain / {abort.raise} =
     [] -> panic(f"no chain {file}"),
   }
 
-/// A host, or an address where the text is one.
 fn identity(who: String) -> x509::Identity / {abort.raise} =
   match ip::parse(who) { Ok(address) -> x509::IpAddress(address), Err(_) -> x509::Host(who) }
 
 fn digest_text(d: crypto::Digest) -> String =
   match d { Sha256 -> "SHA-256", Sha384 -> "SHA-384", Sha512 -> "SHA-512" }
 
-/// A certificate's key and how the certificate is signed.
 fn key_and_signature(c: Certificate) -> String = {
   let key = match x509::info(c).key {
     x509::RsaKey(public) -> match crypto::rsa_modulus_bits(public) {
@@ -87,7 +76,6 @@ fn key_and_signature(c: Certificate) -> String = {
   f"{key}, {signed}"
 }
 
-/// A site: its file, who it was asked for, and a name it is not for.
 type Site = { file: String, host: String, wrong_host: String }
 
 fn sites() -> List<Site> =
@@ -107,7 +95,6 @@ fn sites() -> List<Site> =
     { file: "ip-google-dns.pem", host: "8.8.8.8", wrong_host: "8.8.8.9" },
   ]
 
-/// A site's chain under one root alone: the path it verifies by, each certificate's `key_and_signature`.
 type ExpectedPath = { file: String, who: String, root: String, path: List<String> }
 
 fn expected_paths() -> List<ExpectedPath> =
@@ -285,7 +272,7 @@ fn verify_chain(
     Err(failure) -> Err({ leaf: failure.certificate == leaf, reason: failure.reason }),
   }
 
-test "{w.file} verifies for {w.who} to the root {w.root} alone, as of its capture" for w: ExpectedPath in expected_paths(
+test "certificate chain file {w.file} verifies for host {w.who} against only the root {w.root}, at the time the chain was recorded" for w: ExpectedPath in expected_paths(
   ) {
   let s = chain_from_file(w.file);
   let anchor = roots().filter(|r: Certificate| root_name(r) == w.root);
@@ -303,14 +290,13 @@ test "{w.file} verifies for {w.who} to the root {w.root} alone, as of its captur
 fn forger() -> crypto::SigningKey / {abort.raise} =
   match crypto::ed25519_signing(Secret::of_bytes(b"\x07".repeat(32))) {
     Some(key) -> key,
-    None -> panic("thirty-two bytes are a seed"),
+    None -> panic("an Ed25519 signing key can be made from any 32 bytes, so this cannot fail"),
   }
 
 fn named_subject(name: String) -> List<x509::Attribute> = [{ id: oid::common_name(), value: name }]
 
-/// A certificate for `bank.example` that says `leaf` issued it, over `leaf`'s own validity.
 fn forged(leaf: Certificate) -> Certificate / {abort.raise} = {
-  let asked = {
+  let request = {
     ..x509::draft(),
     subject: named_subject("bank.example"),
     alt_names: [x509::Dns("bank.example")],
@@ -319,7 +305,7 @@ fn forged(leaf: Certificate) -> Certificate / {abort.raise} = {
   };
   let made = try {
     x509::certificate(
-      asked,
+      request,
       crypto::verifying_key(forger()),
       b"\x01",
       x509::info(leaf).not_before,
@@ -331,7 +317,7 @@ fn forged(leaf: Certificate) -> Certificate / {abort.raise} = {
   match made { Ok(c) -> c, Err(rejection) -> panic(show(rejection)) }
 }
 
-test "{s.file} verifies for {s.host}, and is rejected once expired, for {s.wrong_host}, without its issuer, and as a CA" for s: Site in sites(
+test "`verify_chain` accepts {s.file} for {s.host} and fails once it expires, for {s.wrong_host}, without the issuer, or when the leaf is a CA" for s: Site in sites(
   ) {
   let c = chain_from_file(s.file);
   let anchors = roots();
@@ -373,7 +359,7 @@ test "{s.file} verifies for {s.host}, and is rejected once expired, for {s.wrong
   }
 }
 
-test "an address a certificate names is matched as an address, and never as a host written like one" {
+test "a certificate that names an IP address matches that address, but never matches the same text given as a hostname" {
   let cloudflare = chain_from_file("ip-cloudflare-dns.pem");
   let google = chain_from_file("ip-google-dns.pem");
   let anchors = roots();
@@ -388,7 +374,7 @@ test "an address a certificate names is matched as an address, and never as a ho
   )
 }
 
-test "a host in another script is the A-labels its certificate names, and a wildcard is one label of them" {
+test "a certificate matches a hostname with non-ASCII characters through its punycode name, and a wildcard covers exactly one label of that name" {
   let muenchen = chain_from_file("idn-muenchen.pem").leaf;
   let buecher = chain_from_file("idn-buecher.pem").leaf;
   assert_eq(x509::alt_names(muenchen), [
@@ -415,7 +401,7 @@ fn read_failures(files: List<File>) -> List<ReadFailure> / {abort.raise} =
       Err(reason) -> [{ name: f.name, reason: reason }],
     })
 
-test "what was served reads to the letter of RFC 5280, and every root but the one numbered zero" {
+test "every served certificate and every root parses under strict RFC 5280 rules, except the root with serial number zero, which fails" {
   assert_eq(read_failures(chain_files()), []);
   assert_eq(read_failures(root_files()), [
     { name: "568d6905a2c88708.pem", reason: x509::BadSerial },
@@ -428,7 +414,7 @@ test "what was served reads to the letter of RFC 5280, and every root but the on
   )
 }
 
-test "every chain is a site here, and every root is one a chain ends at" {
+test "each chain file matches exactly one test site, and each root file is the root that some expected chain ends in" {
   assert_eq(chain_files().map(|f: File| f.name), sites().map(|s: Site| s.file).sort());
   assert_eq(
     expected_paths().map(|w: ExpectedPath| w.file).sort().unique(),

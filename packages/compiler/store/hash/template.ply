@@ -18,15 +18,15 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, Param, MatchArm, HandleClause,
-                                    ReturnClause, HandlerVar, RecordLiteralField,
+                                    ReturnClause, HandlerStateVariable, RecordLiteralField,
                                     TaggedLiteralExpression, Hole, tagged_parser, tagged_filler,
                                     NamedArg, prelude_module)
 import compiler.syntax.items (FnDefinition, TypeDefinition, AliasBody, SumBody, VariantDefinition,
-                              EffectDefinition, OpDefinition, TestDefinition, LawDefinition, Binder,
-                              Constraint, RequiresClause, EnsuresClause, CostClause, SpaceClause,
-                              SpecClause, schema_of, ReturnsFresh, ReturnsParam, NominalBody,
-                              ExternBody, InstanceDefinition, HostInstance, numeric_ops, numeric_by,
-                              member_of, member_name)
+                              EffectDefinition, OperationDefinition, TestDefinition, LawDefinition,
+                              Binder, Constraint, RequiresClause, EnsuresClause, CostClause,
+                              SpaceClause, SpecClause, schema_of, ReturnsFresh, ReturnsParam,
+                              NominalBody, ExternBody, InstanceDefinition, HostInstance,
+                              numeric_operations, numeric_by, member_of, member_name)
 import compiler.check.resolve.bindings (item_locals, body_binders)
 import compiler.syntax.items (FunctionItem, TestItem, LawItem, result_name)
 import compiler.check.member (CallsFunction)
@@ -201,19 +201,19 @@ fn bind(encoder: Encoder, name: Identifier) -> Encoder =
 fn bind_all(encoder: Encoder, names: List<Identifier>) -> Encoder = names.fold(encoder, bind)
 
 fn bound_at(values: List<PositionedBinder>, binder: Int) -> Option<Int> / {abort.raise} =
-  range(0, values.len()).fold(None, |acc: Option<Int>, i: Int|
-    if values.get(i).binder == binder { Some(i) } else { acc })
+  range(0, values.len()).fold(None, |accumulator: Option<Int>, i: Int|
+    if values.get(i).binder == binder { Some(i) } else { accumulator })
 
-fn local_read(encoder: Encoder, qname: QName) -> Option<Int> / {abort.raise} =
-  if !is_bare(qname) { None } else {
-    match encoder.locals.get(qname.name.span.site) {
+fn local_read(encoder: Encoder, qualified_name: QName) -> Option<Int> / {abort.raise} =
+  if !is_bare(qualified_name) { None } else {
+    match encoder.locals.get(qualified_name.name.span.site) {
       Some(b) -> bound_at(encoder.values, b),
       None -> None,
     }
   }
 
-fn read(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} =
-  match local_read(encoder, qname) {
+fn read(encoder: Encoder, qualified_name: QName) -> Encoder / {abort.raise} =
+  match local_read(encoder, qualified_name) {
     Some(i) -> { ..encoder, reads: encoder.reads.push(i) },
     None -> encoder,
   }
@@ -266,12 +266,15 @@ fn module_name(encoder: Encoder) -> Bytes =
   match encoder.index.modules.at(encoder.module) { Some(found) -> found.name, None -> b"" }
 
 fn emitted_call_nodes(encoder: Encoder, called: List<Bytes>) -> List<Int> =
-  called.fold([], |acc: List<Int>, name: Bytes|
-    match encoder.index.written.get(name) { Some(node) -> acc.push(node), None -> acc })
+  called.fold([], |accumulator: List<Int>, name: Bytes|
+    match encoder.index.written.get(name) {
+      Some(node) -> accumulator.push(node),
+      None -> accumulator,
+    })
 
-fn value_of(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
-  let value = resolved(encoder, qname);
-  match container_of(qname) {
+fn value_of(encoder: Encoder, qualified_name: QName) -> TemplateValue / {abort.raise} = {
+  let value = resolved(encoder, qualified_name);
+  match container_of(qualified_name) {
     Some(container) ->
       {
         ..value,
@@ -283,55 +286,68 @@ fn value_of(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
   }
 }
 
-fn container_of(qname: QName) -> Option<Bytes> / {abort.raise} = {
-  let of_member = match member_of(qname.name.name) {
+fn container_of(qualified_name: QName) -> Option<Bytes> / {abort.raise} = {
+  let of_member = match member_of(qualified_name.name.name) {
     Some(member) -> if container_named(member.of) { Some(member.of) } else { None },
     None -> None,
   };
-  match qualifier(qname) {
+  match qualifier(qualified_name) {
     Some(qualified) -> if container_named(qualified) { Some(qualified) } else { of_member },
     None -> of_member,
   }
 }
 
-fn resolved(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
-  let local = local_read(encoder, qname);
+fn resolved(encoder: Encoder, qualified_name: QName) -> TemplateValue / {abort.raise} = {
+  let local = local_read(encoder, qualified_name);
   match local {
     Some(i) -> { named: Local(encoder.values.get(i).position), written: [] },
-    None -> match value_target(encoder.index, encoder.module, qname) {
+    None -> match value_target(encoder.index, encoder.module, qualified_name) {
       Some(FnTarget(node)) -> { named: Defined(node), written: [] },
       Some(ConstructorTarget(constructor)) ->
         { named: Constructed(constructor.owner, constructor.name), written: [] },
       None -> {
-        let called = emitted_call_nodes(encoder, emitted_calls_for(qname.name.name));
-        match qualifier(qname) {
+        let called = emitted_call_nodes(encoder, emitted_calls_for(qualified_name.name.name));
+        match qualifier(qualified_name) {
           Some(qualified) -> if starts_upper(qualified)
               && encoder.index.scopes.get(encoder.module).modules.get(qualified) == None {
             {
-              named: Unbound({ module: None, name: member_name(qualified, qname.name.name) }),
+              named: Unbound({
+                module: None,
+                name: member_name(qualified, qualified_name.name.name),
+              }),
               written: match type_target(encoder.index, encoder.module, None, qualified) {
                 Some(of) -> [of],
                 None -> [],
               },
             }
           } else {
-            { named: Unbound({ module: Some(qualified), name: qname.name.name }), written: called }
+            {
+              named: Unbound({ module: Some(qualified), name: qualified_name.name.name }),
+              written: called,
+            }
           },
-          None -> { named: Unbound({ module: None, name: qname.name.name }), written: called },
+          None ->
+            { named: Unbound({ module: None, name: qualified_name.name.name }), written: called },
         }
       },
     },
   }
 }
 
-fn constructor_named(encoder: Encoder, qname: QName) -> Named<Int, BinderPosition> / {abort.raise} =
-  match constructor_target(encoder.index, encoder.module, qname) {
+fn constructor_named(
+  encoder: Encoder,
+  qualified_name: QName,
+) -> Named<Int, BinderPosition> / {abort.raise} =
+  match constructor_target(encoder.index, encoder.module, qualified_name) {
     Some(ConstructorTarget(constructor)) -> Constructed(constructor.owner, constructor.name),
-    _ -> Unbound({ module: qualifier(qname), name: qname.name.name }),
+    _ -> Unbound({ module: qualifier(qualified_name), name: qualified_name.name.name }),
   }
 
-fn effect_of(encoder: Encoder, qname: QName) -> EffectReference<Int, EffectSlot> / {abort.raise} =
-  match effect_target(encoder.index, encoder.module, qname) {
+fn effect_of(
+  encoder: Encoder,
+  qualified_name: QName,
+) -> EffectReference<Int, EffectSlot> / {abort.raise} =
+  match effect_target(encoder.index, encoder.module, qualified_name) {
     Some(node) ->
       Declared(node, {
         node: node,
@@ -340,17 +356,20 @@ fn effect_of(encoder: Encoder, qname: QName) -> EffectReference<Int, EffectSlot>
           None -> b"",
         },
       }),
-    None -> EffectUnbound({ module: qualifier(qname), name: qname.name.name }),
+    None -> EffectUnbound({ module: qualifier(qualified_name), name: qualified_name.name.name }),
   }
 
-fn label_of(encoder: Encoder, ident: Identifier) -> Label / {abort.raise} =
-  match last_index_of(encoder.label_params, ident.name) {
+fn label_of(encoder: Encoder, identifier: Identifier) -> Label / {abort.raise} =
+  match last_index_of(encoder.label_params, identifier.name) {
     Some(level) -> LabelParameter(level),
-    None -> LabelName(ident.name),
+    None -> LabelName(identifier.name),
   }
 
-fn optional_label(encoder: Encoder, ident: Option<Identifier>) -> Option<Label> / {abort.raise} =
-  match ident { None -> None, Some(present) -> Some(label_of(encoder, present)) }
+fn optional_label(
+  encoder: Encoder,
+  identifier: Option<Identifier>,
+) -> Option<Label> / {abort.raise} =
+  match identifier { None -> None, Some(present) -> Some(label_of(encoder, present)) }
 
 fn clause_label(clause: HandleClause) -> Option<Identifier> =
   match clause.label_binder {
@@ -427,9 +446,9 @@ pub fn type_template(encoder: Encoder, written: TypeExpression) -> TemplateType 
     FunctionTypeExpression(function) ->
       Function(
         types(encoder, function.params),
-        type_template(encoder, function.ret),
+        type_template(encoder, function.return_type),
         optional_effects(encoder, function.effects),
-        function.kept,
+        function.keep_indices,
         function.once,
       ),
     RecordTypeExpression(record) ->
@@ -493,7 +512,7 @@ fn encoded_effect(
 ) -> Effect<Int, EffectSlot> / {abort.raise} = {
   let performed = effect_of(encoder, written.effect_name);
   let label = optional_label(encoder, effect_label(written));
-  match written.op {
+  match written.operation {
     None -> Moded(performed, written.mode, label, written.bounded),
     Some(operation) -> OfOperation(performed, operation.name, label, written.bounded),
   }
@@ -528,7 +547,7 @@ fn literal(written: SourceLiteral) -> Literal / {abort.raise} =
     },
     LiteralChar(value) -> CharLiteral(value),
     LiteralUnit -> UnitLiteral,
-    LiteralInvalid -> panic("a placeholder literal reached the hasher"),
+    LiteralInvalid -> panic("cannot hash a literal that failed to parse"),
   }
 
 fn pattern(encoder: Encoder, written: Pattern) -> Built<TemplatePattern> / {abort.raise} =
@@ -539,10 +558,13 @@ fn patterns(
   written: List<Pattern>,
   again: Option<Int>,
 ) -> Built<List<TemplatePattern>> / {abort.raise} =
-  written.fold({ encoder: encoder, form: [] }, |acc: Built<List<TemplatePattern>>, each: Pattern| {
-    let built = pattern_in(acc.encoder, each, again);
-    { encoder: built.encoder, form: acc.form.push(built.form) }
-  })
+  written.fold(
+    { encoder: encoder, form: [] },
+    |accumulator: Built<List<TemplatePattern>>, each: Pattern| {
+      let built = pattern_in(accumulator.encoder, each, again);
+      { encoder: built.encoder, form: accumulator.form.push(built.form) }
+    },
+  )
 
 fn pattern_in(
   encoder: Encoder,
@@ -581,11 +603,11 @@ fn pattern_in(
     PatternRecord(record) -> {
       let fields = record.fields.fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<PatternField<Int, BinderPosition>>>, field: { name: Identifier, pattern: Pattern }| {
-          let built = pattern_in(acc.encoder, field.pattern, again);
+        |accumulator: Built<List<PatternField<Int, BinderPosition>>>, field: { name: Identifier, pattern: Pattern }| {
+          let built = pattern_in(accumulator.encoder, field.pattern, again);
           {
             encoder: built.encoder,
-            form: acc.form.push({ name: field.name.name, pattern: built.form }),
+            form: accumulator.form.push({ name: field.name.name, pattern: built.form }),
           }
         },
       );
@@ -605,16 +627,18 @@ fn pattern_in(
       let later = match again { Some(_) -> again, None -> Some(encoder.values.len()) };
       let built = range(0, alternatives.alternatives.len()).fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<TemplatePattern>>, i: Int| {
-          let alternative = pattern_in(acc.encoder, alternatives.alternatives.get(i), if i == 0 {
-            again
-          } else { later });
-          { encoder: alternative.encoder, form: acc.form.push(alternative.form) }
+        |accumulator: Built<List<TemplatePattern>>, i: Int| {
+          let alternative = pattern_in(
+            accumulator.encoder,
+            alternatives.alternatives.get(i),
+            if i == 0 { again } else { later },
+          );
+          { encoder: alternative.encoder, form: accumulator.form.push(alternative.form) }
         },
       );
       { encoder: built.encoder, form: OrPattern(built.form) }
     },
-    PatternInvalid(_) -> panic("a placeholder pattern reached the hasher"),
+    PatternInvalid(_) -> panic("cannot hash a pattern that failed to parse"),
   }
 
 fn expressions(
@@ -623,9 +647,9 @@ fn expressions(
 ) -> Built<List<TemplateExpression>> / {abort.raise} =
   written.fold(
     { encoder: encoder, form: [] },
-    |acc: Built<List<TemplateExpression>>, each: Expression| {
-      let built = expression(acc.encoder, each);
-      { encoder: built.encoder, form: acc.form.push(built.form) }
+    |accumulator: Built<List<TemplateExpression>>, each: Expression| {
+      let built = expression(accumulator.encoder, each);
+      { encoder: built.encoder, form: accumulator.form.push(built.form) }
     },
   )
 
@@ -647,9 +671,12 @@ fn fields(
 ) -> Built<List<TemplateField>> / {abort.raise} =
   written.fold(
     { encoder: encoder, form: [] },
-    |acc: Built<List<TemplateField>>, field: RecordLiteralField| {
-      let built = expression(acc.encoder, field.value);
-      { encoder: built.encoder, form: acc.form.push({ name: field.name.name, value: built.form }) }
+    |accumulator: Built<List<TemplateField>>, field: RecordLiteralField| {
+      let built = expression(accumulator.encoder, field.value);
+      {
+        encoder: built.encoder,
+        form: accumulator.form.push({ name: field.name.name, value: built.form }),
+      }
     },
   )
 
@@ -680,10 +707,10 @@ fn callees(
       let index = encoder.index;
       let found = index.scopes.get(encoder.module).visible_modules.fold(
         [],
-        |acc: List<Int>, seen: Int|
+        |accumulator: List<Int>, seen: Int|
           match index.items.get(seen).members.get(name.name) {
-            Some(nodes) -> acc.concat(nodes),
-            None -> acc,
+            Some(nodes) -> accumulator.concat(nodes),
+            None -> accumulator,
           },
       ).sort_by(|first: Int, second: Int|
         match compare_values(index.nodes.get(first).name, index.nodes.get(second).name) {
@@ -696,11 +723,11 @@ fn callees(
 }
 
 pub fn called_at(sites: List<MemberSite>) -> Map<CallSite, Choice> =
-  sites.fold(Map::new(), |acc: Map<CallSite, Choice>, site: MemberSite|
+  sites.fold(Map::new(), |accumulator: Map<CallSite, Choice>, site: MemberSite|
     match site.callee {
       CallsFunction(_) ->
-        acc.insert({ owner: site.owner, site: site.site }, { targets: site.named }),
-      _ -> acc,
+        accumulator.insert({ owner: site.owner, site: site.site }, { targets: site.named }),
+      _ -> accumulator,
     })
 
 pub fn choice_at(chose: Map<CallSite, Choice>, site: CallSite) -> Choice =
@@ -718,11 +745,11 @@ fn on_value(
   let passed = expressions(encoder, arguments);
   let given = named.fold(
     { encoder: passed.encoder, form: [] },
-    |acc: Built<List<TemplateField>>, argument: NamedArg| {
-      let built = expression(acc.encoder, argument.value);
+    |accumulator: Built<List<TemplateField>>, argument: NamedArg| {
+      let built = expression(accumulator.encoder, argument.value);
       {
         encoder: built.encoder,
-        form: acc.form.push({ name: argument.name.name, value: built.form }),
+        form: accumulator.form.push({ name: argument.name.name, value: built.form }),
       }
     },
   );
@@ -754,16 +781,16 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
     NameExpression(variable) ->
       { encoder: read(encoder, variable.name), form: Variable(value_of(encoder, variable.name)) },
     BinaryExpression(binary) -> {
-      let left = expression(encoder, binary.lhs);
-      let right = expression(left.encoder, binary.rhs);
-      let called = if emitted_code().operators.contains(binary.op) {
+      let left = expression(encoder, binary.left_operand);
+      let right = expression(left.encoder, binary.right_operand);
+      let called = if emitted_code().operators.contains(binary.operation) {
         emitted_call_nodes(encoder, emitted_code().calls)
       } else { [] };
-      { encoder: right.encoder, form: Binary(binary.op, left.form, right.form, called) }
+      { encoder: right.encoder, form: Binary(binary.operation, left.form, right.form, called) }
     },
     UnaryExpression(unary) -> {
       let operand = expression(encoder, unary.operand);
-      { encoder: operand.encoder, form: Unary(unary.op, operand.form) }
+      { encoder: operand.encoder, form: Unary(unary.operation, operand.form) }
     },
     LambdaExpression(lambda) -> {
       let annotations = lambda.params.map(|parameter: Param| optional_type(encoder, parameter.ty));
@@ -809,13 +836,17 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
       let scrutinee = expression(encoder, matched.scrutinee);
       let arms = matched.arms.fold(
         { encoder: scrutinee.encoder, form: [] },
-        |acc: Built<List<Arm<Int, EffectSlot, BinderPosition, Note>>>, arm: MatchArm| {
-          let bound = pattern(acc.encoder, arm.pattern);
+        |accumulator: Built<List<Arm<Int, EffectSlot, BinderPosition, Note>>>, arm: MatchArm| {
+          let bound = pattern(accumulator.encoder, arm.pattern);
           let guard = optional_expression(bound.encoder, arm.guard);
           let body = expression(guard.encoder, arm.body);
           {
-            encoder: close_scope(body.encoder, acc.encoder),
-            form: acc.form.push({ pattern: bound.form, guard: guard.form, body: body.form }),
+            encoder: close_scope(body.encoder, accumulator.encoder),
+            form: accumulator.form.push({
+              pattern: bound.form,
+              guard: guard.form,
+              body: body.form,
+            }),
           }
         },
       );
@@ -846,7 +877,7 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
           encoder: arguments.encoder,
           form: Perform(
             effect_of(encoder, perform.effect_name),
-            perform.op.name,
+            perform.operation.name,
             optional_label(encoder, perform.resource),
             arguments.form,
           ),
@@ -857,33 +888,33 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
           { ..encoder, reads: encoder.reads.push(i) },
           Variable({ named: Local(encoder.values.get(i).position), written: [] }),
           perform.span,
-          perform.op,
+          perform.operation,
           match perform.resource { Some(resource) -> [resource], None -> [] },
           perform.args,
           [],
         ),
     },
     HandleExpression(handler) -> {
-      let variables = handler.vars.fold(
+      let variables = handler.handler_variables.fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<stored::HandlerVariable<Int, EffectSlot, BinderPosition, Note>>>, variable: HandlerVar| {
-          let first = expression(acc.encoder, variable.init);
+        |accumulator: Built<List<stored::HandlerVariable<Int, EffectSlot, BinderPosition, Note>>>, variable: HandlerStateVariable| {
+          let first = expression(accumulator.encoder, variable.init);
           {
             encoder: bind(first.encoder, variable.name),
-            form: acc.form.push({
-              annotation: optional_type(acc.encoder, variable.ty),
+            form: accumulator.form.push({
+              annotation: optional_type(accumulator.encoder, variable.ty),
               first: first.form,
             }),
           }
         },
       );
       let body = expression(close_scope(variables.encoder, encoder), handler.body);
-      let held = bind_all(
+      let clause_encoder = bind_all(
         close_scope(body.encoder, encoder),
-        handler.vars.map(|variable: HandlerVar| variable.name),
+        handler.handler_variables.map(|variable: HandlerStateVariable| variable.name),
       );
-      let clauses = handled_clauses(held, handler.clauses);
-      let returned = match handler.ret {
+      let clauses = handled_clauses(clause_encoder, handler.clauses);
+      let returned = match handler.return_clause {
         None -> { encoder: clauses.encoder, form: None },
         Some(clause) -> {
           let built = expression(bind(clauses.encoder, clause.binder), clause.body);
@@ -922,9 +953,12 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
     } else {
       let holes = tagged.holes.fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<FilledHole<Int, EffectSlot, BinderPosition, Note>>>, hole: Hole| {
-          let built = expression(acc.encoder, hole.value);
-          { encoder: built.encoder, form: acc.form.push({ value: built.form, text: hole.text }) }
+        |accumulator: Built<List<FilledHole<Int, EffectSlot, BinderPosition, Note>>>, hole: Hole| {
+          let built = expression(accumulator.encoder, hole.value);
+          {
+            encoder: built.encoder,
+            form: accumulator.form.push({ value: built.form, text: hole.text }),
+          }
         },
       );
       {
@@ -937,7 +971,7 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
         ),
       }
     },
-    InvalidExpression(_) -> panic("a placeholder reached the hasher"),
+    InvalidExpression(_) -> panic("cannot hash an expression that failed to parse"),
     TryBlockExpression(tried) -> {
       let body = expression(encoder, tried.body);
       {
@@ -946,7 +980,10 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
           match tried.raise {
             None -> None,
             Some(raised) ->
-              Some({ effect: effect_of(encoder, raised.effect_name), operation: raised.op.name }),
+              Some({
+                effect: effect_of(encoder, raised.effect_name),
+                operation: raised.operation.name,
+              }),
           },
           body.form,
         ),
@@ -960,19 +997,19 @@ fn handled_clauses(
 ) -> Built<List<HandlerClause<Int, EffectSlot, BinderPosition, Note>>> / {abort.raise} =
   clauses.fold(
     { encoder: encoder, form: [] },
-    |acc: Built<List<HandlerClause<Int, EffectSlot, BinderPosition, Note>>>, clause: HandleClause| {
-      let bound = bind_all(acc.encoder, clause.params);
+    |accumulator: Built<List<HandlerClause<Int, EffectSlot, BinderPosition, Note>>>, clause: HandleClause| {
+      let bound = bind_all(accumulator.encoder, clause.params);
       let resumed = match clause.resume {
         None -> bound,
         Some(continuation) -> bind(bound, continuation),
       };
       let body = expression(resumed, clause.body);
       {
-        encoder: close_scope(body.encoder, acc.encoder),
-        form: acc.form.push({
-          effect: effect_of(acc.encoder, clause.effect_name),
-          operation: clause.op.name,
-          label: optional_label(acc.encoder, clause_label(clause)),
+        encoder: close_scope(body.encoder, accumulator.encoder),
+        form: accumulator.form.push({
+          effect: effect_of(accumulator.encoder, clause.effect_name),
+          operation: clause.operation.name,
+          label: optional_label(accumulator.encoder, clause_label(clause)),
           parameters: clause.params.len(),
           resumes: clause.resume != None,
           body: body.form,
@@ -1037,14 +1074,14 @@ fn reads_run(encoder: Encoder, members: List<Statement>) -> Bool / {abort.raise}
   let from = encoder.values.len();
   members.fold(
     { encoder: encoder, read: false },
-    |acc: { encoder: Encoder, read: Bool }, member: Statement| {
-      let bound = acc.encoder.values.len();
-      let before = acc.encoder.reads.len();
-      let built = statement(acc.encoder, member);
+    |accumulator: { encoder: Encoder, read: Bool }, member: Statement| {
+      let bound = accumulator.encoder.values.len();
+      let before = accumulator.encoder.reads.len();
+      let built = statement(accumulator.encoder, member);
       let reads = range(before, built.encoder.reads.len()).map(|i: Int| built.encoder.reads.get(i));
       {
         encoder: built.encoder,
-        read: acc.read || reads.any(|place: Int| place >= from && place < bound),
+        read: accumulator.read || reads.any(|place: Int| place >= from && place < bound),
       }
     },
   ).read
@@ -1060,10 +1097,10 @@ fn unordered_run_entry(
   let start = encoder.values.len();
   let members = range(from, to).fold(
     { encoder: { ..encoder, runs: id + 1 }, statements: [], binders: [], bound: [] },
-    |acc: { encoder: Encoder, statements: List<TemplateStatement>, binders: List<Int>, bound: List<PositionedBinder> }, i: Int| {
+    |accumulator: { encoder: Encoder, statements: List<TemplateStatement>, binders: List<Int>, bound: List<PositionedBinder> }, i: Int| {
       let inner = statement(
         {
-          ..acc.encoder,
+          ..accumulator.encoder,
           values: encoder.values,
           scope: { run: id, member: i - from, within: start },
         },
@@ -1073,9 +1110,9 @@ fn unordered_run_entry(
         inner.encoder.values.get(place));
       {
         encoder: { ..inner.encoder, values: encoder.values, scope: encoder.scope },
-        statements: acc.statements.push(inner.form),
-        binders: acc.binders.push(bound.len()),
-        bound: acc.bound.concat(bound),
+        statements: accumulator.statements.push(inner.form),
+        binders: accumulator.binders.push(bound.len()),
+        bound: accumulator.bound.concat(bound),
       }
     },
   );
@@ -1137,23 +1174,28 @@ fn with_generics(
 ) -> Encoder =
   {
     ..encoder,
-    type_params: encoder.type_params.concat(types.map(|ident: Identifier| ident.name)),
-    effect_params: encoder.effect_params.concat(rows.map(|ident: Identifier| ident.name)),
-    label_params: encoder.label_params.concat(labels.map(|ident: Identifier| ident.name)),
+    type_params: encoder.type_params.concat(types.map(|identifier: Identifier| identifier.name)),
+    effect_params: encoder.effect_params.concat(rows.map(|identifier: Identifier| identifier.name)),
+    label_params: encoder.label_params.concat(labels.map(|identifier: Identifier| identifier.name)),
   }
 
 fn generics_of(
   types: List<Identifier>,
   rows: List<Identifier>,
   labels: List<Identifier>,
-  kept: List<Identifier>,
+  retained_types: List<Identifier>,
 ) -> Generics =
-  { types: types.len(), effects: rows.len(), labels: labels.len(), kept: levels_of(types, kept) }
+  {
+    types: types.len(),
+    effects: rows.len(),
+    labels: labels.len(),
+    retained_types: levels_of(types, retained_types),
+  }
 
 fn levels_of(names: List<Identifier>, marked: List<Identifier>) -> List<Int> = {
-  let held = marked.map(|ident: Identifier| ident.name);
+  let marked_names = marked.map(|identifier: Identifier| identifier.name);
   range(0, names.len()).filter(|i: Int|
-    match names.at(i) { Some(n) -> held.contains(n.name), None -> false })
+    match names.at(i) { Some(n) -> marked_names.contains(n.name), None -> false })
 }
 
 fn constraints(
@@ -1161,26 +1203,27 @@ fn constraints(
   written: List<Constraint>,
 ) -> List<ParameterConstraint> / {abort.raise} =
   sorted_by_key(
-    written.fold([], |acc: List<ParameterConstraint>, constraint: Constraint|
+    written.fold([], |accumulator: List<ParameterConstraint>, constraint: Constraint|
       match last_index_of(encoder.type_params, constraint.param.name) {
-        Some(level) -> acc.push({ level: level, deriver: constraint.deriver }),
-        None -> acc,
+        Some(level) -> accumulator.push({ level: level, deriver: constraint.deriver }),
+        None -> accumulator,
       }).map(|constrained: ParameterConstraint|
       { key: bin::encode(constrained, parameter_constraint_bin()), tie: b"", value: constrained }),
-  ).fold([], |acc: List<ParameterConstraint>, constrained: ParameterConstraint|
-    if acc.last() == Some(constrained) { acc } else { acc.push(constrained) })
+  ).fold([], |accumulator: List<ParameterConstraint>, constrained: ParameterConstraint|
+    if accumulator.last() == Some(constrained) { accumulator }
+    else { accumulator.push(constrained) })
 
 fn identities(encoder: Encoder, definition: FnDefinition) -> List<Int> / {abort.raise} =
   match schema_of(encoder.index.modules.get(encoder.module).module, definition) {
     None -> [],
     Some(schema) -> {
-      let levels = schema.identities.fold([], |acc: List<Int>, ident: Identifier|
-        match last_index_of(encoder.type_params, ident.name) {
-          Some(level) -> acc.push(level),
-          None -> acc,
+      let levels = schema.identities.fold([], |accumulator: List<Int>, identifier: Identifier|
+        match last_index_of(encoder.type_params, identifier.name) {
+          Some(level) -> accumulator.push(level),
+          None -> accumulator,
         });
-      levels.sort().fold([], |acc: List<Int>, level: Int|
-        if acc.last() == Some(level) { acc } else { acc.push(level) })
+      levels.sort().fold([], |accumulator: List<Int>, level: Int|
+        if accumulator.last() == Some(level) { accumulator } else { accumulator.push(level) })
     },
   }
 
@@ -1190,8 +1233,8 @@ fn returning(definition: FnDefinition) -> Returning / {abort.raise} =
     Some(ReturnsFresh(_)) -> Fresh,
     Some(ReturnsParam(returned)) ->
       ParameterReturned(
-        range(0, definition.params.len()).fold(0, |acc: Int, i: Int|
-          if definition.params.get(i).name.name == returned.name { i } else { acc }),
+        range(0, definition.params.len()).fold(0, |accumulator: Int, i: Int|
+          if definition.params.get(i).name.name == returned.name { i } else { accumulator }),
       ),
   }
 
@@ -1203,12 +1246,12 @@ fn function_form(
   let generic = with_generics(encoder, generics.types, generics.effects, generics.labels);
   let parameters = definition.params.fold(
     { encoder: generic, form: [] },
-    |acc: Built<List<stored::Parameter<Int, EffectSlot, BinderPosition, Note>>>, parameter: Param| {
-      let default_value = optional_expression(acc.encoder, parameter.default);
+    |accumulator: Built<List<stored::Parameter<Int, EffectSlot, BinderPosition, Note>>>, parameter: Param| {
+      let default_value = optional_expression(accumulator.encoder, parameter.default);
       {
         encoder: default_value.encoder,
-        form: acc.form.push({
-          kept: parameter.keep,
+        form: accumulator.form.push({
+          retained: parameter.keep,
           spaced: parameter.space != None,
           annotation: optional_type(generic, parameter.ty),
           default: default_value.form,
@@ -1223,9 +1266,14 @@ fn function_form(
   let measure = optional_expression(bound, definition.decreases);
   let body = expression(measure.encoder, definition.body);
   {
-    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
+    generics: generics_of(
+      generics.types,
+      generics.effects,
+      generics.labels,
+      generics.retained_types,
+    ),
     parameters: parameters.form,
-    returned: optional_type(generic, definition.ret),
+    returned: optional_type(generic, definition.return_type),
     effects: optional_effects(generic, definition.effects),
     constraints: constraints(generic, definition.constraints),
     identities: identities(generic, definition),
@@ -1245,7 +1293,12 @@ fn type_form(
   let unqualified = |name: Identifier| { module: None, name: name, span: name.span };
   let items = inner.index.items.get(inner.module);
   {
-    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
+    generics: generics_of(
+      generics.types,
+      generics.effects,
+      generics.labels,
+      generics.retained_types,
+    ),
     has_effect_generics: generics.effects.len() > 0 || generics.labels.len() > 0,
     constraints: constraints(inner, definition.constraints),
     body: match definition.body {
@@ -1271,12 +1324,18 @@ fn type_form(
     numerics: match items.numerics.get(definition.name.name) {
       None -> [],
       Some(arithmetic) ->
-        numeric_ops().fold([], |acc: List<Numeric<Int, BinderPosition>>, operation: Bytes|
-          match numeric_by(arithmetic, operation) {
-            None -> acc,
-            Some(function) ->
-              acc.push({ operator: operation, function: value_of(inner, unqualified(function)) }),
-          }),
+        numeric_operations().fold(
+          [],
+          |accumulator: List<Numeric<Int, BinderPosition>>, operation: Bytes|
+            match numeric_by(arithmetic, operation) {
+              None -> accumulator,
+              Some(function) ->
+                accumulator.push({
+                  operator: operation,
+                  function: value_of(inner, unqualified(function)),
+                }),
+            },
+        ),
     },
   }
 }
@@ -1289,7 +1348,8 @@ fn effect_form(
     name: definition.name.name,
     nondet: definition.is_nondet,
     operations: by_name(
-      definition.operations.map(|operation: OpDefinition| operation_form(encoder, operation)),
+      definition.operations.map(|operation: OperationDefinition|
+        operation_form(encoder, operation)),
       |operation: Operation<Int, EffectSlot>| operation.name,
     ),
     host_function: match encoder.index.items.get(encoder.module).instances.get(
@@ -1312,12 +1372,12 @@ fn effect_form(
 
 fn operation_form(
   encoder: Encoder,
-  operation: OpDefinition,
+  operation: OperationDefinition,
 ) -> Operation<Int, EffectSlot> / {abort.raise} = {
   let inner = {
     ..encoder,
     type_params: encoder.type_params.concat(
-      operation.type_params.map(|ident: Identifier| ident.name),
+      operation.type_params.map(|identifier: Identifier| identifier.name),
     ),
   };
   let own = encoder.type_params.len();
@@ -1329,8 +1389,8 @@ fn operation_form(
     resource: operation.resource_param,
     types: operation.type_params.len(),
     parameters: types(inner, operation.params).map(carried),
-    kept: operation.kept,
-    returned: carried(type_template(inner, operation.ret)),
+    retained_parameters: operation.keep_indices,
+    returned: carried(type_template(inner, operation.return_type)),
   }
 }
 
@@ -1352,12 +1412,12 @@ fn with_marshalling_calls(t: TemplateType, own: Int, written: List<Int>) -> Temp
         labels,
         rows,
       ),
-    Function(params, ret, encoded_effects, kept, once) ->
+    Function(params, return_type, encoded_effects, retained_generics, once) ->
       Function(
         params.map(|p: TemplateType| with_marshalling_calls(p, own, written)),
-        with_marshalling_calls(ret, own, written),
+        with_marshalling_calls(return_type, own, written),
         encoded_effects,
-        kept,
+        retained_generics,
         once,
       ),
     Fields(fields) ->
@@ -1395,9 +1455,10 @@ fn law_form(
   let guard = optional_expression(bound, definition.guard);
   {
     binders: definition.binders.map(|binder: Binder| type_template(encoder, binder.ty)),
-    identities: definition.identities.map(|ident: Identifier| ident.name).sort().fold(
+    identities: definition.identities.map(|identifier: Identifier| identifier.name).sort().fold(
       [],
-      |acc: List<Bytes>, name: Bytes| if acc.last() == Some(name) { acc } else { acc.push(name) },
+      |accumulator: List<Bytes>, name: Bytes|
+        if accumulator.last() == Some(name) { accumulator } else { accumulator.push(name) },
     ),
     guard: guard.form,
     body: expression(guard.encoder, definition.body).form,
@@ -1417,8 +1478,8 @@ fn spec_form(
   let named = |names: List<Option<Identifier>>| {
     let places = range(0, names.len()).filter(|i: Int| names.get(i) != None);
     {
-      encoder: places.fold(bound, |acc: Encoder, i: Int|
-        match names.get(i) { Some(name) -> bind(acc, name), None -> acc }),
+      encoder: places.fold(bound, |accumulator: Encoder, i: Int|
+        match names.get(i) { Some(name) -> bind(accumulator, name), None -> accumulator }),
       form: Some(places),
     }
   };
@@ -1436,7 +1497,12 @@ fn spec_form(
   };
   {
     kind: clause.kind,
-    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
+    generics: generics_of(
+      generics.types,
+      generics.effects,
+      generics.labels,
+      generics.retained_types,
+    ),
     parameters: owner.params.len(),
     names: scoped.form,
     body: expression(scoped.encoder, clause.expression).form,
@@ -1458,7 +1524,7 @@ pub fn is_pure(written: Expression) -> Bool =
     LiteralExpression(_) -> true,
     TaggedLiteralExpression(tagged) -> tagged.holes.len() == 0,
     NameExpression(_) -> true,
-    BinaryExpression(binary) -> is_pure(binary.lhs) && is_pure(binary.rhs),
+    BinaryExpression(binary) -> is_pure(binary.left_operand) && is_pure(binary.right_operand),
     UnaryExpression(unary) -> is_pure(unary.operand),
     LambdaExpression(lambda) -> is_pure(lambda.body),
     IfExpression(conditional) ->
@@ -1466,12 +1532,12 @@ pub fn is_pure(written: Expression) -> Bool =
         && is_pure(conditional.else_branch),
     MatchExpression(matched) ->
       is_pure(matched.scrutinee)
-        && matched.arms.fold(true, |acc: Bool, arm: MatchArm|
-          acc && is_pure(arm.body)
+        && matched.arms.fold(true, |accumulator: Bool, arm: MatchArm|
+          accumulator && is_pure(arm.body)
             && (match arm.guard { Some(guard) -> is_pure(guard), None -> true })),
     BlockExpression(written_block) ->
-      written_block.statements.fold(true, |acc: Bool, statement: Statement|
-          acc
+      written_block.statements.fold(true, |accumulator: Bool, statement: Statement|
+          accumulator
             && (match statement {
               LetStatement(binding) -> is_pure(binding.value),
               LetElseStatement(binding) -> is_pure(binding.value) && is_pure(binding.fallback),
@@ -1488,7 +1554,7 @@ pub fn is_pure(written: Expression) -> Bool =
   }
 
 fn all_pure(written: List<Expression>) -> Bool =
-  written.fold(true, |acc: Bool, each: Expression| acc && is_pure(each))
+  written.fold(true, |accumulator: Bool, each: Expression| accumulator && is_pure(each))
 
 pub fn renumbered(
   template: Template,

@@ -1,27 +1,29 @@
-//! The client side of SASL (RFC 4422): PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER and XOAUTH2.
+//! Implements the client side of SASL (RFC 4422) for PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER and
+//! XOAUTH2.
 //!
-//! A mechanism is an exchange of byte strings that a protocol frames: SMTP's `AUTH` in lines of
-//! base64, postgres in messages of its own. `begin` returns the client's first message, and
-//! `respond` returns its reply to each server message. `is_authenticated` reports whether the server may now
-//! treat the exchange as a success. Under SCRAM that is only once the server has also proved it
-//! knows the password. Nothing here reads a socket, a clock or the host's entropy: the nonce SCRAM
-//! needs is an argument, and so is the most work a server may request.
+//! A mechanism is an exchange of byte strings that a protocol wraps in its own framing: SMTP's
+//! `AUTH` uses lines of base64, and postgres uses its own messages. `begin` returns the client's
+//! first message, and `respond` returns the client's reply to each server message.
+//! `is_authenticated` reports whether the server may now treat the exchange as a success. Under
+//! SCRAM that is true only after the server has also proved that it knows the password. Nothing
+//! here reads a socket, a clock or the host's entropy: the nonce that SCRAM needs and the largest
+//! iteration count a server may request are arguments.
 //!
-//! A `Credential` is built here and never written out: `show` writes its user and stars, and an
-//! `Exchange` or a `Response` shows nothing of its contents. A password or token is a
-//! `Secret<Bytes>` from the moment it is given, as `std.config` returns one, and is never a plain
-//! value here. SCRAM stretches and keys the password in the runtime without revealing it, and the
-//! mechanisms that send the credential itself put it into their messages as a secret. So every
-//! `Response` is secret, and `secret_bytes` is the only way to get at it: a protocol frames it and writes
-//! it to a connection with `std.net`'s `send_secret`, as SMTP sends it in base64 on an `AUTH` line.
-//! `reveals` reports whether a mechanism sends the credential itself. A protocol allows that only
-//! on a connection no one else can read. A name and a password are taken as their UTF-8 bytes.
-//! RFC 4013's preparation is not applied, so only ASCII ones are sure to match what a server
-//! stored.
+//! A `Credential` is built here and never written out. `show` prints its user and `***` in place of
+//! the secret, and `show` of an `Exchange` or a `Response` prints nothing of their contents. A
+//! password or token is a `Secret<Bytes>` from the moment it is passed in, as `std.config` returns
+//! one, and never a plain value. SCRAM derives its keys from the password in the runtime without
+//! revealing it, and the mechanisms that send the credential itself put it into their messages as a
+//! secret. So every `Response` is secret, and `secret_bytes` is the only way to read it: a protocol
+//! frames those bytes and writes them to a connection with `std.net`'s `send_secret`, as SMTP does
+//! in base64 on an `AUTH` line. `reveals` reports whether a mechanism sends the credential itself;
+//! a protocol should allow that only on a connection that no one else can read. A name and a
+//! password are used as their UTF-8 bytes. SASLprep (RFC 4013) is not applied, so only ASCII names
+//! and passwords are certain to match what a server stored.
 //!
-//! `begin` and `respond` use no channel binding. A protocol that knows its channel builds the SCRAM
-//! messages itself with `scram_first`, `scram_final` and a `ChannelBinding`, as postgres binds a
-//! TLS connection to the server's certificate under SCRAM-SHA-256-PLUS.
+//! `begin` and `respond` use no channel binding. A protocol that has a channel to bind builds the
+//! SCRAM messages itself with `scram_first`, `scram_final` and a `ChannelBinding`, as postgres does
+//! to bind a TLS connection to the server's certificate under SCRAM-SHA-256-PLUS.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes
@@ -31,8 +33,6 @@ import std.list
 import std.show (show)
 import std.string
 import std.gen
-
-// --- Mechanisms ---------------------------------------------------------------
 
 /// One way a client proves who it is.
 pub type Mechanism =
@@ -63,16 +63,14 @@ pub fn mechanism_name(m: Mechanism) -> String =
     XOAuth2 -> "XOAUTH2",
   }
 
-/// The mechanism named `offered`, matched ignoring case; `None` for one this module does not
-/// support.
+/// Returns the mechanism whose registered name equals `offered`, ignoring case, or `None` if this
+/// module does not support it.
 pub fn mechanism_named(offered: String) -> Option<Mechanism> =
   mechanisms().find(|m: Mechanism| mechanism_name(m).eq_ignore_ascii_case(offered))
 
 /// Whether a mechanism sends the credential itself, so that anyone who reads the connection learns
 /// it. True for every mechanism but SCRAM.
 pub fn reveals(m: Mechanism) -> Bool = m != ScramSha256
-
-// --- Errors -------------------------------------------------------------------
 
 /// Why an exchange cannot continue.
 pub type Error =
@@ -98,8 +96,6 @@ pub effect sasl {
   raise fail(reason: Error)
 }
 
-// --- Credentials --------------------------------------------------------------
-
 /// What a client proves its identity with: a name and a password, or a name and a bearer token.
 /// The password and the token are secret.
 pub opaque type Credential = | Password(String, Secret<Bytes>) | Token(String, Secret<Bytes>)
@@ -112,10 +108,10 @@ fn credential_text(c: Credential) -> String =
     Token(user, _) -> "bearer(" ++ show(user) ++ ", ****)",
   }
 
-/// The name `user` with its password's UTF-8 bytes, as a secret like the one `std.config` returns.
-/// Raises `sasl.fail(BadCredential)` for an empty name or password, or a control character in the
-/// name. The password's contents are not read, so one containing a NUL, which PLAIN's message
-/// cannot carry, is rejected by the server rather than here.
+/// Returns a password `Credential` for `user`, with the password as a secret. Raises
+/// `sasl.fail(BadCredential)` if `user` is empty or contains a control character, or if the
+/// password is empty. The password's bytes are not otherwise checked, so the server, not this
+/// function, rejects a password that contains a NUL byte, which PLAIN cannot send.
 pub fn password(user: String, secret: Secret<Bytes>) -> Credential / {sasl.fail} =
   if !is_name(user) || secret.is_empty() { sasl.fail(BadCredential) }
   else { Password(user, secret) }
@@ -141,8 +137,6 @@ pub fn supports(c: Credential, m: Mechanism) -> Bool =
     Password(_, _) -> m == Plain || m == Login || m == ScramSha256,
     Token(_, _) -> m == OAuthBearer || m == XOAuth2,
   }
-
-// --- An exchange --------------------------------------------------------------
 
 /// What an exchange starts with besides the credential.
 pub type Options = new {
@@ -181,7 +175,6 @@ fn response_text(r: Response) -> String = "Response(****)"
 /// `send_secret`.
 pub fn secret_bytes(r: Response) -> Secret<Bytes> = match r { Response(bytes) -> bytes }
 
-/// A response that contains nothing secret.
 fn plain_response(bytes: Bytes) -> Response = Response(Secret::of_bytes(bytes))
 
 /// A started exchange: its state, and the client's first message, sent before the server sends
@@ -231,9 +224,10 @@ pub fn respond(x: Exchange, challenge: Bytes) -> ExchangeStep / {sasl.fail, abor
       let secret_bytes = String::of_bytes(challenge);
       match scram_challenge(secret_bytes) {
         None -> sasl.fail(BadChallenge),
-        Some(asked) -> if asked.iterations > most { sasl.fail(TooManyIterations(asked.iterations)) }
-        else {
-          match scram_final(Unbound, secret, bare, secret_bytes, asked) {
+        Some(parsed_challenge) -> if parsed_challenge.iterations > most {
+          sasl.fail(TooManyIterations(parsed_challenge.iterations))
+        } else {
+          match scram_final(Unbound, secret, bare, secret_bytes, parsed_challenge) {
             None -> sasl.fail(BadChallenge),
             Some(proof) ->
               {
@@ -255,8 +249,9 @@ pub fn respond(x: Exchange, challenge: Bytes) -> ExchangeStep / {sasl.fail, abor
       },
   }
 
-/// Whether the server may now treat the exchange as a success. A client that trusts a server's
-/// success message before this is `true` has skipped the checks the mechanism requires.
+/// Returns whether the exchange has authenticated the client. A client must not treat the server's
+/// success message as final while this returns `false`, because the mechanism's required checks
+/// have not finished.
 pub fn is_authenticated(x: Exchange) -> Bool =
   match x { Finished(ok) -> ok, BearerSent(_) -> true, _ -> false }
 
@@ -264,18 +259,12 @@ fn is_nonce(nonce: String) -> Bool =
   nonce != ""
     && nonce.chars().all(|c: Char| Int::of_char(c) > 32 && Int::of_char(c) < 127 && c != ',')
 
-// --- Where a secret goes into a message ----------------------------------------
-
-/// `secret` with plain bytes on either side, still secret.
 fn between(before: Bytes, secret: Secret<Bytes>, after: Bytes) -> Secret<Bytes> =
   Secret::of_bytes(before).concat(secret).concat(Secret::of_bytes(after))
 
-/// PLAIN's one message (RFC 4616): no identity to act as, the name, the password.
 fn plain_message(user: String, secret: Secret<Bytes>) -> Secret<Bytes> =
   between(Bytes::concat_all([b"\x00", Bytes::of_string(user), b"\x00"]), secret, b"")
 
-/// A token mechanism's only message: RFC 7628's, which names the user in a GS2 header and the
-/// server next to the token, or XOAUTH2's.
 fn bearer_message(m: Mechanism, user: String, token: Secret<Bytes>, s: Options) -> Secret<Bytes> = {
   let named = if m == OAuthBearer {
     "n,a=" ++ scram_name(user) ++ ",\u{1}host=" ++ s.host ++ "\u{1}port=" ++ s.port.to_string()
@@ -284,23 +273,18 @@ fn bearer_message(m: Mechanism, user: String, token: Secret<Bytes>, s: Options) 
   between(Bytes::of_string(named), token, b"\x01\x01")
 }
 
-// --- SCRAM-SHA-256 ------------------------------------------------------------
-
-// RFC 5802's exchange with RFC 7677's SHA-256: the client proves it knows the password without
-// sending it, and then the server proves it knows the verifier. Four messages.
-
-/// What a SCRAM exchange is bound to (RFC 5802 §6). `Unbound` (`n`): nothing, on a channel with no
-/// binding to offer. `Unoffered` (`y`): nothing, because the client supports binding but the
-/// server offered none; a server that did offer one can then tell the offer was stripped in
-/// transit. `ServerEndPoint` (`p`): the channel, by RFC 5929's `tls-server-end-point` data, the
-/// hash of the server's certificate, under the mechanism's `-PLUS` name.
+/// The channel binding of a SCRAM exchange (RFC 5802 §6), which ties the authentication to the
+/// connection it runs over. `Unbound` (GS2 flag `n`) means the client has no binding to offer.
+/// `Unoffered` (`y`) means the client supports binding but the server offered none, so a server
+/// that did offer one can detect that the offer was removed in transit. `ServerEndPoint` (`p`)
+/// binds to the hash of the server's certificate (RFC 5929 `tls-server-end-point`) and requires the
+/// mechanism's `-PLUS` name.
 pub type ChannelBinding = | Unbound | Unoffered | ServerEndPoint(Bytes)
 
 /// The GS2 header that starts the first message of a SCRAM exchange under `b`.
 pub fn gs2_header(b: ChannelBinding) -> String =
   match b { Unbound -> "n,,", Unoffered -> "y,,", ServerEndPoint(_) -> "p=tls-server-end-point,," }
 
-/// The final message's `c=` value: the GS2 header and the binding's data, in base64.
 fn channel_text(b: ChannelBinding) -> String / {abort.raise} =
   base64_encode(
     Bytes::of_string(gs2_header(b)).concat(match b { ServerEndPoint(data) -> data, _ -> b"" }),
@@ -316,26 +300,27 @@ pub fn scram_first_bare(user: String, nonce: String) -> String =
   "n=" ++ scram_name(user) ++ ",r=" ++ nonce
 
 fn scram_name(user: String) -> String =
-  range(0, user.len()).fold("", |acc: String, i: Int| {
+  range(0, user.len()).fold("", |accumulator: String, i: Int| {
     let c = user.slice(i, i + 1);
-    if c == "=" { acc ++ "=3D" } else if c == "," { acc ++ "=2C" } else { acc ++ c }
+    if c == "=" { accumulator ++ "=3D" }
+    else if c == "," { accumulator ++ "=2C" }
+    else { accumulator ++ c }
   })
 
-/// One `name=value` out of a comma-separated message, or `None` when it is not there.
 fn scram_attribute(secret_bytes: String, attribute: String) -> Option<String> / {abort.raise} =
-  secret_bytes.split(",").fold(None, |acc: Option<String>, part: String|
-    match acc {
+  secret_bytes.split(",").fold(None, |accumulator: Option<String>, part: String|
+    match accumulator {
       Some(found) -> Some(found),
       None -> if part.starts_with(attribute ++ "=") {
         Some(part.slice(attribute.len() + 1, part.len()))
       } else { None },
     })
 
-/// A decimal count, or `None` rather than a default when the text is not one.
 fn count_of(digits: String) -> Option<Int> / {abort.raise} =
   if digits.starts_with("-") { None } else { Bytes::of_string(digits).int_of_ascii() }
 
-/// `r`, `s` and `i` out of the server's first message; the salt is base64 there.
+/// The fields of the server's first SCRAM message: `nonce` is its `r` field, `salt` is its `s`
+/// field decoded from base64, and `iterations` is its `i` field.
 pub type Challenge = { nonce: String, salt: Bytes, iterations: Int }
 
 /// The nonce, salt and iteration count from the server's first SCRAM message. `None` for a message
@@ -366,14 +351,15 @@ pub fn scram_challenge(server_first: String) -> Option<Challenge> / {abort.raise
 /// prove itself with next.
 pub type Proof = { reply: String, expected: Bytes }
 
-/// The client's last message and the signature the server must match, from the password's UTF-8
-/// bytes, which the runtime stretches and keys without revealing them. `None` if the challenge's
-/// nonce does not start with the client's own, which a server that received the first message
-/// always echoes. `b` is the binding the first message's header named.
+/// Returns the client's final SCRAM message and the signature the server must send back, computed
+/// from the password's UTF-8 bytes. The password is never exposed: the runtime derives the keys
+/// from it as secrets. Returns `None` if the challenge's nonce does not begin with the client's own
+/// nonce, which any server that received the first message does. `b` is the channel binding that
+/// the first message's header declared.
 ///
-/// Both sides sign the client's bare message, the server's first message, and the final message
-/// without its proof, joined by commas. The final message carries the binding, so a proof made
-/// over one channel proves nothing over another.
+/// Both sides sign the client's bare first message, the server's first message and the final
+/// message without its proof, joined by commas. The final message includes the binding, so a proof
+/// made over one channel is not valid over another.
 pub fn scram_final(
   b: ChannelBinding,
   password: Secret<Bytes>,
@@ -406,8 +392,6 @@ pub fn scram_verify(server_final: String, expected: Bytes) -> Bool / {abort.rais
     },
   }
 
-// --- Tests --------------------------------------------------------------------
-
 fn setting(nonce: String) -> Options =
   { nonce: nonce, max_iterations: 100000, host: "server.example.com", port: 587 }
 
@@ -428,7 +412,6 @@ fn first_of(b: Result<ExchangeStart, Error>) -> Option<Secret<Bytes>> =
     Err(_) -> None,
   }
 
-/// Whether a response is exactly `bytes`. A response is compared whole, as any secret is.
 fn says(r: Response, bytes: Bytes) -> Bool = secret_bytes(r) == Secret::of_bytes(bytes)
 
 fn respond_all(
@@ -476,7 +459,6 @@ test "LOGIN waits for prompts, and sends the name and then the password" {
   assert_eq(respond_all(started, [b"Username:", b"Password:", b"Again:"]), Err(BadChallenge))
 }
 
-// RFC 7628 §4.1's SMTP exchange, and §4.3's failure.
 test "OAUTHBEARER sends RFC 7628's message, and replies to a rejection with one byte" {
   let started = begun(OAuthBearer, token(), setting("unused"));
   assert(
@@ -497,21 +479,20 @@ test "OAUTHBEARER sends RFC 7628's message, and replies to a rejection with one 
   }
 }
 
-/// The bytes a base64 text encodes, as a secret to compare with a response.
 fn sealed_base64(text: String) -> Secret<Bytes> / {abort.raise} =
   match base64_decode(text) {
     Some(bytes) -> Secret::of_bytes(bytes),
-    None -> panic("a test's base64 does not read"),
+    None -> panic("the test's base64 text cannot be decoded"),
   }
 
 test "XOAUTH2 sends the user and the token, and replies to a rejection with nothing" {
-  let held = try {
+  let credential = try {
     bearer(
       "someuser@example.com",
       Secret::of_bytes(b"ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg"),
     )
   };
-  let started = begun(XOAuth2, held, setting("unused"));
+  let started = begun(XOAuth2, credential, setting("unused"));
   assert(
     first_of(started)
       == Some(
@@ -529,7 +510,6 @@ test "XOAUTH2 sends the user and the token, and replies to a rejection with noth
   }
 }
 
-// RFC 7677's worked example; any mistake in deriving the keys changes the proof.
 test "SCRAM matches RFC 7677's worked example" {
   let first_bare = scram_first_bare("user", "rOprNGfwEbeRWgbNEkqO");
   assert_eq(first_bare, "n=user,r=rOprNGfwEbeRWgbNEkqO");
@@ -549,7 +529,6 @@ test "SCRAM matches RFC 7677's worked example" {
           assert(scram_verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", proof.expected));
           assert(!scram_verify("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", proof.expected));
           assert(!scram_verify("e=other", proof.expected));
-          // Both sides sign the bound channel, so binding one changes the proof.
           match scram_final(
               ServerEndPoint(b"\x01\x02"),
               Secret::of_bytes(b"pencil"),
@@ -627,11 +606,10 @@ test "a SCRAM server must echo the client's nonce, stay within the iteration lim
   assert_eq(begun(ScramSha256, pencil_password_credential(), setting("")), Err(BadNonce))
 }
 
-/// A password read from configuration as text, made secret as `std.config` does.
 fn configured_pencil() -> Result<Credential, Error> =
   try { password("user", Secret::of_string("pencil").bytes()) }
 
-test "a secret password made from text works under each mechanism as its bytes do" {
+test "a password credential built from text behaves like one built from bytes in SCRAM, PLAIN and the other mechanisms" {
   let proofs = [pencil_password_credential(), configured_pencil()].map(
     |c: Result<Credential, Error>|
       result_map_response(
@@ -660,14 +638,14 @@ test "a secret password made from text works under each mechanism as its bytes d
 fn result_map_response(a: Result<ExchangeStep, Error>) -> Result<Bool, Error> =
   match a { Ok(done) -> Ok(is_authenticated(done.exchange)), Err(reason) -> Err(reason) }
 
-test "a scram user name escapes what separates fields" {
+test "SCRAM escapes `=` and `,` in a user name so they cannot be mistaken for field separators" {
   assert_eq(scram_first_bare("a=b,c", "n"), "n=a=3Db=2Cc,r=n");
   assert_eq(scram_first(Unbound, "user", "n1"), "n,,n=user,r=n1");
   assert_eq(scram_first(Unoffered, "user", "n1"), "y,,n=user,r=n1");
   assert_eq(scram_first(ServerEndPoint(b"h"), "user", "n1"), "p=tls-server-end-point,,n=user,r=n1")
 }
 
-test "a malformed challenge is rejected rather than defaulted" {
+test "`scram_challenge` returns `None` for a malformed challenge instead of substituting default values" {
   assert_eq(scram_challenge("r=abc,s=!!,i=1"), None);
   assert_eq(scram_challenge("r=abc,s=AAAA,i=x"), None);
   assert_eq(scram_challenge("r=abc,s=AAAA,i=0"), None);
@@ -676,12 +654,10 @@ test "a malformed challenge is rejected rather than defaulted" {
   assert_eq(scram_challenge("m=x,r=abc,s=AAAA,i=1"), None)
 }
 
-/// A constructor's result, given as the user of the credential it made. A case cannot contain the
-/// credential itself, since cases are hashed, and a hash of a secret lets an attacker test guesses.
 type CredentialCase = { what: String, user: Result<String, Error>, expect: Option<String> }
 
 fn credential_user(c: Result<Credential, Error>) -> Result<String, Error> =
-  match c { Ok(held) -> Ok(user_of(held)), Err(reason) -> Err(reason) }
+  match c { Ok(credential) -> Ok(user_of(credential)), Err(reason) -> Err(reason) }
 
 fn credential_cases() -> List<CredentialCase> =
   [
@@ -715,7 +691,6 @@ fn credential_cases() -> List<CredentialCase> =
       user: credential_user(try { password("ti\rm", Secret::of_bytes(b"x")) }),
       expect: None,
     },
-    // A secret password is not read, so the server, not this module, rejects a NUL in it.
     {
       what: "a password that holds NUL",
       user: credential_user(try { password("tim", Secret::of_bytes(b"a\x00b")) }),
@@ -750,7 +725,8 @@ fn credential_cases() -> List<CredentialCase> =
     },
   ]
 
-test "a credential is made from {m.what}, or rejected" for m: CredentialCase in credential_cases() {
+test "a SASL user name built from {m.what} is accepted, or rejected with `BadCredential`" for m: CredentialCase in credential_cases(
+  ) {
   assert_eq(
     match m.user {
       Ok(user) -> Some(user),
@@ -760,7 +736,7 @@ test "a credential is made from {m.what}, or rejected" for m: CredentialCase in 
   )
 }
 
-test "a mechanism takes the credential that is its kind, and no other" {
+test "starting a mechanism with a credential of the wrong kind fails with `WrongCredential`" {
   assert_eq(begun(Plain, token(), setting("n")), Err(WrongCredential));
   assert_eq(begun(Login, token(), setting("n")), Err(WrongCredential));
   assert_eq(begun(ScramSha256, token(), setting("n")), Err(WrongCredential));
@@ -782,7 +758,7 @@ fn result_is_begun(b: Result<ExchangeStart, Error>) -> Bool =
 law "a mechanism is found by the name a server offers it under" =
   round_trip(mechanism_name, mechanism_named)
 
-test "a mechanism is found by its name in any case, and only SCRAM never sends the credential" {
+test "`mechanism_named` finds a SASL mechanism by name in any case, and `ScramSha256` is the only mechanism for which `reveals` is false" {
   assert_eq(mechanisms().len(), 5);
   assert_eq(mechanism_named("scram-sha-256"), Some(ScramSha256));
   assert_eq(mechanism_named("Plain"), Some(Plain));
@@ -792,13 +768,13 @@ test "a mechanism is found by its name in any case, and only SCRAM never sends t
 }
 
 test "nothing shows a credential's secret, in the credential or in an exchange that contains it" {
-  let held = tim_password_credential();
-  assert_eq(show(held), "Ok(password(\"tim\", ****))");
+  let credential = tim_password_credential();
+  assert_eq(show(credential), "Ok(password(\"tim\", ****))");
   assert_eq(show(token()), "Ok(bearer(\"user@example.com\", ****))");
   let exchanges = [
-    begun(Plain, held, setting("n")),
-    begun(Login, held, setting("n")),
-    begun(ScramSha256, held, setting("n")),
+    begun(Plain, credential, setting("n")),
+    begun(Login, credential, setting("n")),
+    begun(ScramSha256, credential, setting("n")),
     begun(OAuthBearer, token(), setting("n")),
   ];
   assert(
@@ -810,13 +786,15 @@ test "nothing shows a credential's secret, in the credential or in an exchange t
       !show(b).contains("tanstaaf") && !show(b).contains("vF9dft")),
   );
   assert_eq(
-    show(begun(Plain, held, setting("n"))),
+    show(begun(Plain, credential, setting("n"))),
     "Ok({exchange: Exchange(****), first: Some(Response(****))})",
   );
-  assert(!show(respond_all(begun(Login, held, setting("n")), [b"Username:"])).contains("tanstaaf"))
+  assert(
+    !show(respond_all(begun(Login, credential, setting("n")), [b"Username:"])).contains("tanstaaf"),
+  )
 }
 
-test "what a credential shows is its user alone, whatever its secret" {
+test "`show` of a password credential contains only the user name and is the same whatever the secret" {
   gen::check3(
     gen::text(),
     gen::text(),
@@ -833,8 +811,6 @@ test "what a credential shows is its user alone, whatever its secret" {
   )
 }
 
-/// How a server that stores only a password's verifier checks a client's proof. Returns the
-/// signature the server proves itself with, or `None` if the proof does not match the password.
 fn server_signature(
   secret: String,
   salt: Bytes,
@@ -852,7 +828,7 @@ fn server_signature(
   }
 }
 
-test "a server that stores a password's verifier accepts the client's proof, and the client accepts that server's" {
+test "a server that stores a password's verifier accepts the client's SCRAM proof, and the client accepts the server's signature" {
   gen::check4(
     gen::text(),
     gen::bytes(),

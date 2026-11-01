@@ -1,8 +1,3 @@
-//! What `std.process`'s host handler asks the host through its natives: the arguments, the two
-//! output streams, standard input, the exit code, and the programs a run may start, to completion
-//! or beside it. Each result that is structured is flat: a child's ending as [`Finished::flat`]
-//! writes it, a line heard as [`Heard::flat`] does.
-
 mod children;
 
 pub(crate) use children::Children;
@@ -19,18 +14,13 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// The effect, by the program-wide name a rejection names its module by.
 const EFFECT: &str = "std.process.process";
 
-/// What serves the effect, for a rejection to name.
-const SERVED_BY: &str = "std.process::host_process";
+const HANDLER_FUNCTION: &str = "std.process::host_process";
 
-/// The effect whose raise says a standard stream's reader went away, and that raise.
 pub const PIPE_EFFECT: &str = "std.process.pipe";
 pub const PIPE_BROKEN: &str = "broken";
 
-/// What one captured stream holds: a spawn's whole stream, or what a child's `Keep` stream took
-/// and its `Lines` stream holds unread.
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,10 +30,7 @@ pub enum Stream {
 }
 
 pub enum OutputSink {
-    /// The process's own streams; `out` is where `process.out` goes, since `--json` reserves stdout.
-    Real {
-        out: Stream,
-    },
+    Real { out: Stream },
     Captured(Mutex<Vec<(Stream, Vec<u8>)>>),
 }
 
@@ -52,13 +39,10 @@ impl OutputSink {
         OutputSink::Captured(Mutex::new(Vec::new()))
     }
 
-    /// Whether what is written leaves the process, where a reader can go away.
-    fn is_real(&self) -> bool {
+    fn is_uncaptured(&self) -> bool {
         matches!(self, OutputSink::Real { .. })
     }
 
-    /// Standard output is buffered only where it is the process's own: redirected onto standard
-    /// error it is written as that stream is, at once.
     fn write(&self, stream: Stream, bytes: &[u8]) -> std::io::Result<()> {
         match self {
             OutputSink::Real { out } => match (stream, out) {
@@ -72,7 +56,6 @@ impl OutputSink {
         }
     }
 
-    /// One line, and with it everything its stream's buffer held.
     pub(crate) fn line(&self, stream: Stream, text: &str) -> std::io::Result<()> {
         let mut line = Vec::with_capacity(text.len() + 1);
         line.extend_from_slice(text.as_bytes());
@@ -84,8 +67,6 @@ impl OutputSink {
         }
     }
 
-    /// Writes what the program's standard output holds back, which is nothing where it is
-    /// redirected onto standard error or captured.
     fn flush(&self) -> std::io::Result<()> {
         match self {
             OutputSink::Real { out: Stream::Out } => stdio::flush_out(),
@@ -93,15 +74,13 @@ impl OutputSink {
         }
     }
 
-    /// Writes what standard output holds back ahead of something else that writes the stream.
     fn make_way(&self) {
-        if self.is_real() {
+        if self.is_uncaptured() {
             stdio::make_way();
         }
     }
 }
 
-/// One `--exec NAME=PATH`, as the argument was written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecSpec {
     pub name: String,
@@ -138,7 +117,6 @@ fn malformed(text: &str, reason: &str) -> String {
     format!("`{text}` is not an executable: {reason}; write `--exec NAME=PATH`")
 }
 
-/// What `--exec NAME=PATH` bound, resolved once: the only programs this run can start.
 #[derive(Clone, Debug, Default)]
 pub struct Executables {
     bound: BTreeMap<String, PathBuf>,
@@ -188,7 +166,6 @@ impl Executables {
         Ok(())
     }
 
-    /// The program bound to `label`.
     pub fn named(&self, label: &str) -> Option<&Path> {
         self.bound.get(label).map(PathBuf::as_path)
     }
@@ -215,23 +192,18 @@ fn is_executable(_: &Path) -> bool {
     true
 }
 
-/// What an operation of `process` reaches: the run's own process, or a program `--exec` binds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Reach {
-    Own,
+pub enum OperationTarget {
+    OwnProcess,
     Executable,
 }
 
 pub struct ProcessHost {
     argv: Vec<String>,
-    /// Shared with the drains that forward an inheriting child's lines to a captured sink.
     sink: Arc<OutputSink>,
     exit: Mutex<Option<i32>>,
-    /// The programs `--exec NAME=PATH` bound; a label outside them is `E0456`.
     executables: Executables,
-    /// Held nowhere else, so the children go when the host does.
     children: Arc<Children>,
-    /// Whether the run is a process of its own; one that is not only starts other programs.
     whole: bool,
 }
 
@@ -247,9 +219,6 @@ impl ProcessHost {
         }
     }
 
-    /// A host for a run that is not itself a process, such as a test: it starts and drives the
-    /// programs `executables` binds, and its own arguments, streams, input and exit code stay
-    /// withheld.
     pub fn spawning(executables: Executables) -> ProcessHost {
         ProcessHost {
             whole: false,
@@ -265,13 +234,10 @@ impl ProcessHost {
         }
     }
 
-    /// The code the first `process.exit` asked for.
     pub fn requested_exit(&self) -> Option<i32> {
         *lock(&self.exit)
     }
 
-    /// Every write a captured sink took, in order, a line with its newline; a real sink keeps
-    /// nothing.
     pub fn captured(&self) -> Vec<(Stream, Vec<u8>)> {
         match &*self.sink {
             OutputSink::Captured(writes) => lock(writes).clone(),
@@ -279,34 +245,26 @@ impl ProcessHost {
         }
     }
 
-    /// Whether this host is the run's own process, and its streams the process's own.
-    fn owns_the_streams(&self) -> bool {
-        self.whole && self.sink.is_real()
+    fn controls_stdio(&self) -> bool {
+        self.whole && self.sink.is_uncaptured()
     }
 
-    /// Leaves the process's streams as a program that ended leaves them: standard output's
-    /// buffer written and the terminal as it was found. A buffer whose reader has gone ends the
-    /// process as [`ProcessHost::end_of_broken_pipe`] does.
     pub fn settle(&self) {
-        if self.owns_the_streams() && stdio::settle() {
-            self.end_of_broken_pipe();
+        if self.controls_stdio() && stdio::settle() {
+            self.exit_on_broken_pipe();
         }
     }
 
-    /// Ends the process where it stands, as a closed pipe ends one that did not ask to be told:
-    /// nothing more is written, and the status is the one a shell reports for `SIGPIPE`.
-    pub fn end_of_broken_pipe(&self) -> ! {
+    pub fn exit_on_broken_pipe(&self) -> ! {
         self.children.end_all();
         stdio::settle();
-        crate::observe::exiting();
+        crate::observe::report_at_exit();
         std::process::exit(stdio::BROKEN_PIPE_STATUS);
     }
 
-    /// What this host makes of a raise no clause handled: an unhandled `pipe.broken` ends the
-    /// process as the closed pipe would have.
     pub fn unhandled(&self, effect: &Symbol, op: &Symbol) {
-        if self.owns_the_streams() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
-            self.end_of_broken_pipe();
+        if self.controls_stdio() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
+            self.exit_on_broken_pipe();
         }
     }
 
@@ -314,39 +272,27 @@ impl ProcessHost {
         &self.children
     }
 
-    /// Kills and reaps every child `start` or `spawn` launched that is still running.
     pub fn end_children(&self) {
         self.children.end_all();
     }
 
-    /// The run's own process, which a host that is not one withholds.
     fn own(&self, op: &'static str, span: Span) -> Result<(), Diagnostic> {
         if self.whole {
             Ok(())
         } else {
-            Err(withheld(op, Reach::Own, span))
+            Err(withheld(op, OperationTarget::OwnProcess, span))
         }
     }
 
-    /// The arguments the run was given.
-    ///
-    /// # Errors
-    /// The host is not the run's own process.
     pub fn args(&self, span: Span) -> Result<&[String], Diagnostic> {
         self.own("args", span)?;
         Ok(&self.argv)
     }
 
-    /// Whether the run bound a program to `label`.
     pub fn bound(&self, label: &str) -> bool {
         self.executables.named(label).is_some()
     }
 
-    /// `text` and a line ending written to `stream`. A stream whose reader has gone ends the
-    /// process, since a line returns nothing its writer could be told by.
-    ///
-    /// # Errors
-    /// The host is not the run's own process, or the stream rejected the write.
     pub fn line(&self, stream: Stream, text: &str, span: Span) -> Result<(), Diagnostic> {
         let op = match stream {
             Stream::Out => "out",
@@ -355,15 +301,11 @@ impl ProcessHost {
         self.own(op, span)?;
         match self.sink.line(stream, text) {
             Ok(()) => Ok(()),
-            Err(e) if stdio::reader_gone(&e) => self.end_of_broken_pipe(),
+            Err(e) if stdio::reader_gone(&e) => self.exit_on_broken_pipe(),
             Err(e) => Err(err_write(op, &e, span)),
         }
     }
 
-    /// Whether `bytes` reached `stream`: `false` once its reader has gone away.
-    ///
-    /// # Errors
-    /// The host is not the run's own process, or the stream rejected the write.
     pub fn write(&self, stream: Stream, bytes: &[u8], span: Span) -> Result<bool, Diagnostic> {
         let op = match stream {
             Stream::Out => "out_bytes",
@@ -373,19 +315,11 @@ impl ProcessHost {
         taken(op, self.sink.write(stream, bytes), span)
     }
 
-    /// Whether what standard output's buffer held reached it: `false` once its reader has gone.
-    ///
-    /// # Errors
-    /// The host is not the run's own process, or the stream rejected the write.
     pub fn flush(&self, span: Span) -> Result<bool, Diagnostic> {
         self.own("flush", span)?;
         taken("flush", self.sink.flush(), span)
     }
 
-    /// The job of one line of standard input without its ending, found: none at the end of input.
-    ///
-    /// # Errors
-    /// The host is not the run's own process.
     pub fn read_line(&self, span: Span) -> Result<Job, Diagnostic> {
         self.own("line", span)?;
         Ok(Box::new(|| match stdio::read_line() {
@@ -394,10 +328,6 @@ impl ProcessHost {
         }))
     }
 
-    /// The job of what comes next on standard input, at most `max` bytes.
-    ///
-    /// # Errors
-    /// The host is not the run's own process.
     pub fn read(&self, max: usize, span: Span) -> Result<Job, Diagnostic> {
         self.own("in_bytes", span)?;
         Ok(Box::new(move || {
@@ -405,7 +335,6 @@ impl ProcessHost {
         }))
     }
 
-    /// What ends the run with `code`, the first code asked for being the one kept.
     pub fn exit(&self, code: i32, span: Span) -> Diagnostic {
         if let Err(withheld) = self.own("exit", span) {
             return withheld;
@@ -423,13 +352,6 @@ impl ProcessHost {
             .ok_or_else(|| unbound(op, label, span))
     }
 
-    /// The job of the program `label` names run to its end with empty input, in `dir` (the run's
-    /// own where empty) under the whole environment `env`: how it ended and both its streams, as
-    /// [`Finished::flat`] writes them. It is started now and held with the started children, so a
-    /// stop or a teardown ends it as it ends them.
-    ///
-    /// # Errors
-    /// No program is bound to `label`.
     pub fn spawn(
         &self,
         label: &str,
@@ -459,9 +381,9 @@ impl ProcessHost {
             let (_, child) = started.map_err(Failure::Said)?;
             match child.wait(None) {
                 Ok(Some(exit)) => Ok(exit.flat()),
-                Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(too_much(
-                    "spawn", &program, out, err, span,
-                ))),
+                Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(
+                    err_output_over_limit("spawn", &program, out, err, span),
+                )),
                 Err(ProcessError::Unreaped(reason)) => Err(Failure::Said(format!(
                     "`{}`'s ending could not be read: {reason}",
                     program.display()
@@ -474,11 +396,6 @@ impl ProcessHost {
         }))
     }
 
-    /// A child of the program `label` names, started beside the program and wired as `io` says:
-    /// its handle, or why it could not start.
-    ///
-    /// # Errors
-    /// No program is bound to `label`.
     pub fn start(
         &self,
         label: &str,
@@ -489,7 +406,6 @@ impl ProcessHost {
         span: Span,
     ) -> Result<Result<i64, String>, Diagnostic> {
         let program = self.program("start", label, span)?;
-        // What the program wrote before the child comes before what the child writes.
         if io.out == Output::Inherit || io.err == Output::Inherit {
             self.sink.make_way();
         }
@@ -505,7 +421,6 @@ impl ProcessHost {
         Ok(self.children.start(&launch, &self.sink))
     }
 
-    /// The child `handle` names, where `op` under `label` may reach it.
     fn child(
         &self,
         op: &'static str,
@@ -519,11 +434,6 @@ impl ProcessHost {
             .map_err(|reason| unusable(op, handle, &at, reason, span))
     }
 
-    /// The job of how the child ended and what its streams hold, found once it has: none while it
-    /// runs past `timeout_ms`, which waits for as long as it takes where negative.
-    ///
-    /// # Errors
-    /// The handle names no child `label` may reach.
     pub fn wait(
         &self,
         label: &str,
@@ -539,10 +449,6 @@ impl ProcessHost {
         }))
     }
 
-    /// Whether `signal` reached the child: `false` where it had already ended.
-    ///
-    /// # Errors
-    /// The handle names no child `label` may reach, or the signal could not be delivered.
     pub fn signal(
         &self,
         label: &str,
@@ -555,11 +461,6 @@ impl ProcessHost {
             .map_err(|e| undelivered(handle, signal, &e, span))
     }
 
-    /// The job of `bytes` written to the child's input: byte 1 where every byte was, 0 once its
-    /// input is closed or it has ended.
-    ///
-    /// # Errors
-    /// The handle names no child `label` may reach.
     pub fn input(
         &self,
         label: &str,
@@ -571,20 +472,11 @@ impl ProcessHost {
         Ok(Box::new(move || Ok(vec![u8::from(child.input(&bytes))])))
     }
 
-    /// The child's input closed.
-    ///
-    /// # Errors
-    /// The handle names no child `label` may reach.
     pub fn end_input(&self, label: &str, handle: i64, span: Span) -> Result<(), Diagnostic> {
         self.child("end_input", label, handle, span)?.end_input();
         Ok(())
     }
 
-    /// The job of the next line any of the child's `Lines` streams wrote, as [`Heard::flat`]
-    /// writes it, waiting at most `timeout_ms` as [`ProcessHost::wait`] does.
-    ///
-    /// # Errors
-    /// The handle names no child `label` may reach.
     pub fn output_line(
         &self,
         label: &str,
@@ -601,29 +493,25 @@ impl ProcessHost {
     }
 }
 
-/// Where an operation about the run's own process is served, for a rejection to say.
-const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
+const RUN_ONLY_HINT: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
-/// Where an operation on a program `--exec` binds is served.
-const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
+const EXEC_LABEL_HINT: &str = "for a label `--exec` binds to a program";
 
-/// `process.<op>` rejected in a run whose host serves none of what `reach` names.
 #[cold]
-pub fn withheld(op: &'static str, reach: Reach, span: Span) -> Diagnostic {
+pub fn withheld(op: &'static str, reach: OperationTarget, span: Span) -> Diagnostic {
     let served = match reach {
-        Reach::Own => ONLY_A_RUN,
-        Reach::Executable => AN_EXECUTABLE,
+        OperationTarget::OwnProcess => RUN_ONLY_HINT,
+        OperationTarget::Executable => EXEC_LABEL_HINT,
     };
-    ply_core::host::err_withheld(
+    ply_core::host::err_unbound_operation(
         span,
         &format!("process.{op}"),
         &Symbol::new(EFFECT),
-        SERVED_BY,
+        HANDLER_FUNCTION,
         served,
     )
 }
 
-/// A negative timeout waits for as long as it takes, and so does one no clock can reach.
 fn deadline(ms: i64) -> Option<Instant> {
     let ms = u64::try_from(ms).ok()?;
     Instant::now().checked_add(Duration::from_millis(ms))
@@ -639,7 +527,7 @@ fn rejected(
     match rejection {
         ProcessError::Spent => Failure::Rejected(raced(op, handle, span)),
         ProcessError::TooMuch { out, err } => {
-            Failure::Rejected(too_much(op, child.program(), out, err, span))
+            Failure::Rejected(err_output_over_limit(op, child.program(), out, err, span))
         }
         ProcessError::Unreaped(reason) => Failure::Said(format!(
             "child {handle}'s ending could not be read: {reason}"
@@ -647,8 +535,6 @@ fn rejected(
     }
 }
 
-/// Whether a write of bytes reached its stream: `false` once the stream's reader has gone away,
-/// which the program is told rather than ended by.
 fn taken(op: &'static str, wrote: std::io::Result<()>, span: Span) -> Result<bool, Diagnostic> {
     match wrote {
         Ok(()) => Ok(true),
@@ -657,7 +543,6 @@ fn taken(op: &'static str, wrote: std::io::Result<()>, span: Span) -> Result<boo
     }
 }
 
-/// The whole environment is `env`, and `""` is the run's own directory.
 fn command(program: &Path, args: &[String], dir: &str, env: &[(String, String)]) -> Command {
     let mut command = Command::new(program);
     command.args(args).env_clear();
@@ -685,7 +570,13 @@ pub fn unbound(op: &str, label: &str, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn too_much(op: &str, program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
+fn err_output_over_limit(
+    op: &str,
+    program: &Path,
+    out: usize,
+    err: usize,
+    span: Span,
+) -> Diagnostic {
     Diagnostic::error(
         codes::PROCESS_OUTPUT_TOO_LARGE,
         format!(
@@ -718,7 +609,7 @@ fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) 
         )
         .primary(span, "this handle is spent")
         .note("`process.wait` hands a child back once it has ended, and its handle names nothing after that"),
-        Unusable::Elsewhere(started) => Diagnostic::error(
+        Unusable::StartedUnderOtherLabel(started) => Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!(
                 "child {handle} was started as `process.start{started}` and is used as `process.{op}{at}`"
@@ -729,7 +620,6 @@ fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) 
     }
 }
 
-/// Another `process.wait` on the same child returned while this one was waiting.
 #[cold]
 fn raced(op: &str, handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -749,7 +639,6 @@ fn undelivered(handle: i64, signal: Signal, e: &std::io::Error, span: Span) -> D
     .primary(span, "the host could not signal this child")
 }
 
-/// The unwinding the machine does on any diagnostic is what makes `exit` end the program.
 #[cold]
 fn exit_requested(code: i32, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -770,7 +659,6 @@ fn err_write(op: &str, e: &std::io::Error, span: Span) -> Diagnostic {
     .note("the descriptor is closed, or what it is open on took nothing")
 }
 
-/// The guarded state has no invariant a panicking caller can break, so recovering is correct.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

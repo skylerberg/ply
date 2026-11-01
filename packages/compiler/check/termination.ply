@@ -11,8 +11,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
-                                    AssignmentStatement, HandlerVar, Param, NamedArg, MatchArm,
-                                    HandleClause, RecordLiteralField, expression_span,
+                                    AssignmentStatement, HandlerStateVariable, Param, NamedArg,
+                                    MatchArm, HandleClause, RecordLiteralField, expression_span,
                                     TaggedLiteralExpression, TaggedLiteral, Hole, tagged_parser,
                                     tagged_filler)
 import compiler.syntax.items (FnDefinition)
@@ -47,7 +47,7 @@ pub type Place = { parameter_index: Int, path: List<Bytes> }
 pub type Base =
   | PlaceBase(Place)
   | LengthBase({ name: Bytes, of: Place })
-  | QuotientBase({ of: Base, by: Int, op: Bytes })
+  | QuotientBase({ of: Base, by: Int, operator: Bytes })
   | RemainderBase({ by: Base })
 
 pub type Linear = { base: Option<Base>, k: Int }
@@ -132,11 +132,11 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   let seen = range(0, g.definitions.len()).map(|i: Int|
     walk_definition({ group: g, current: i, depth: 0, results: results }, g.definitions.get(i)));
   let calls = seen.map(|x: Findings| x.calls);
-  let stating = g.definitions.fold(false, |acc: Bool, d: FnDefinition|
-    acc || (match d.decreases { Some(_) -> true, None -> false }));
-  let lost = range(0, seen.len()).fold(None, |acc: Option<Site>, i: Int|
-    match acc {
-      Some(_) -> acc,
+  let stating = g.definitions.fold(false, |accumulator: Bool, d: FnDefinition|
+    accumulator || (match d.decreases { Some(_) -> true, None -> false }));
+  let lost = range(0, seen.len()).fold(None, |accumulator: Option<Site>, i: Int|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> match seen.get(i).too_deep_at { Some(span) -> Some(site(g, i, span)), None -> None },
     });
   let own = match lost {
@@ -215,32 +215,35 @@ fn find_non_decreasing_loop(
     calls,
     range(0, g.definitions.len()).map(|i: Int| measures_of(g, i, calls.get(i), stated)),
   );
-  let graphs = range(0, g.definitions.len()).fold([], |acc: List<Graph>, i: Int|
-    calls.get(i).fold(acc, |gs: List<Graph>, c: Call|
+  let graphs = range(0, g.definitions.len()).fold([], |accumulator: List<Graph>, i: Int|
+    calls.get(i).fold(accumulator, |gs: List<Graph>, c: Call|
       add_graph(gs, call_graph(g, measures, i, c))));
   search_loops(g.definitions.len(), prune_graphs(measures, graphs))
 }
 
 fn prune_graphs(measures: List<List<Measure>>, graphs: List<Graph>) -> List<Graph> / {abort.raise} = {
-  let starts = measures.fold([0], |acc: List<Int>, ms: List<Measure>|
-    acc.push(acc.at_or(acc.len() - 1, 0) + ms.len()));
+  let starts = measures.fold([0], |accumulator: List<Int>, ms: List<Measure>|
+    accumulator.push(accumulator.at_or(accumulator.len() - 1, 0) + ms.len()));
   let node = |member: Int, m: Int| starts.at_or(member, 0) + m;
-  let edges = graphs.fold([], |acc: List<graph::Edge>, x: Graph|
-    x.arcs.fold(acc, |es: List<graph::Edge>, r: Arc|
+  let edges = graphs.fold([], |accumulator: List<graph::Edge>, x: Graph|
+    x.arcs.fold(accumulator, |es: List<graph::Edge>, r: Arc|
       es.push({ from: node(x.from, r.a), target: node(x.to, r.b) })));
   let total = starts.at_or(starts.len() - 1, 0);
   let parts = graph::components(graph::of_edges(total, edges));
   let component = range(0, parts.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int|
-    parts.get(i).fold(m, |acc: Map<Int, Int>, v: Int| acc.insert(v, i)));
+    parts.get(i).fold(m, |accumulator: Map<Int, Int>, v: Int| accumulator.insert(v, i)));
   let inside = |x: Graph, r: Arc|
     component.get(node(x.from, r.a)) == component.get(node(x.to, r.b));
   let shrinking = graphs.fold(Map::new(), |m: Map<Int, Bool>, x: Graph|
-    x.arcs.fold(m, |acc: Map<Int, Bool>, r: Arc|
+    x.arcs.fold(m, |accumulator: Map<Int, Bool>, r: Arc|
       if r.strict && inside(x, r) {
-        match component.get(node(x.from, r.a)) { Some(c) -> acc.insert(c, true), None -> acc }
-      } else { acc }));
-  graphs.fold([], |acc: List<Graph>, x: Graph|
-    add_graph(acc, {
+        match component.get(node(x.from, r.a)) {
+          Some(c) -> accumulator.insert(c, true),
+          None -> accumulator,
+        }
+      } else { accumulator }));
+  graphs.fold([], |accumulator: List<Graph>, x: Graph|
+    add_graph(accumulator, {
       ..x,
       arcs: x.arcs.filter(|r: Arc|
         inside(x, r)
@@ -254,7 +257,7 @@ fn prune_graphs(measures: List<List<Measure>>, graphs: List<Graph>) -> List<Grap
 fn idempotent(x: Graph) -> Bool / {abort.raise} = same_arcs(composed(x, x).arcs, x.arcs)
 
 fn shrinks(x: Graph) -> Bool =
-  x.arcs.fold(false, |acc: Bool, r: Arc| acc || (r.strict && r.a == r.b))
+  x.arcs.fold(false, |accumulator: Bool, r: Arc| accumulator || (r.strict && r.a == r.b))
 
 type GraphClosure = {
   buckets: Map<Int, List<Graph>>,
@@ -276,8 +279,8 @@ fn search_loops(n: Int, calls: List<Graph>) -> Option<NonDecreasingLoop> / {abor
         Stop(Some({ at: c.queue.get(0).calls.get(0), loop: [] }))
       } else {
         let x = c.queue.get(c.next);
-        let grown = from.get(x.to).fold(c, |acc: GraphClosure, y: Graph|
-          enqueue(acc, n, composed(x, y)));
+        let grown = from.get(x.to).fold(c, |accumulator: GraphClosure, y: Graph|
+          enqueue(accumulator, n, composed(x, y)));
         Continue({ ..grown, next: c.next + 1 })
       },
     })
@@ -317,11 +320,11 @@ fn composed(x: Graph, y: Graph) -> Graph / {abort.raise} =
   {
     from: x.from,
     to: y.to,
-    arcs: x.arcs.fold([], |acc: List<Arc>, r: Arc|
-      y.arcs.fold(acc, |a: List<Arc>, s: Arc|
+    arcs: x.arcs.fold([], |accumulator: List<Arc>, r: Arc|
+      y.arcs.fold(accumulator, |a: List<Arc>, s: Arc|
         if r.b != s.a { a }
         else { with_arc(a, { a: r.a, b: s.b, strict: r.strict || s.strict }) })),
-    calls: y.calls.fold(x.calls, |acc: List<Site>, s: Site| acc.push(s)),
+    calls: y.calls.fold(x.calls, |accumulator: List<Site>, s: Site| accumulator.push(s)),
   }
 
 fn with_arc(xs: List<Arc>, r: Arc) -> List<Arc> / {abort.raise} =
@@ -342,9 +345,9 @@ fn measures_of(
 ) -> List<Measure> / {abort.raise} = {
   let sized = range(0, g.definitions.get(member).params.len()).fold(
     [],
-    |acc: List<Measure>, i: Int| {
+    |accumulator: List<Measure>, i: Int| {
       let p = { parameter_index: i, path: [] };
-      let size = acc.push(SizeMeasure(p));
+      let size = accumulator.push(SizeMeasure(p));
       if place_is_collection(g, member, p) { size.push(ElementMeasure(p)) } else { size }
     },
   );
@@ -352,10 +355,10 @@ fn measures_of(
     Some(_) -> if stated { sized.push(StatedMeasure) } else { sized },
     None -> sized,
   };
-  let deep = calls.fold(params, |acc: List<Measure>, c: Call|
-    c.args.fold(acc, |a: List<Measure>, t: Term| deeper_places(a, t)));
-  calls.fold(deep, |acc: List<Measure>, c: Call|
-    c.facts.fold(acc, |a: List<Measure>, f: Fact| with_difference(a, f.hi.base, f.lo.base)))
+  let deep = calls.fold(params, |accumulator: List<Measure>, c: Call|
+    c.args.fold(accumulator, |a: List<Measure>, t: Term| deeper_places(a, t)));
+  calls.fold(deep, |accumulator: List<Measure>, c: Call|
+    c.facts.fold(accumulator, |a: List<Measure>, f: Fact| with_difference(a, f.hi.base, f.lo.base)))
 }
 
 fn with_difference(xs: List<Measure>, hi: Option<Base>, lo: Option<Base>) -> List<Measure> =
@@ -372,10 +375,10 @@ fn propagate_measures(
   calls: List<List<Call>>,
   ms: List<List<Measure>>,
 ) -> List<List<Measure>> / {abort.raise} =
-  range(0, ms.len()).fold(ms, |acc: List<List<Measure>>, _: Int|
-    range(0, acc.len()).map(|i: Int|
-      calls.get(i).fold(acc.get(i), |mine: List<Measure>, c: Call|
-        acc.get(c.callee).fold(mine, |m: List<Measure>, x: Measure|
+  range(0, ms.len()).fold(ms, |accumulator: List<List<Measure>>, _: Int|
+    range(0, accumulator.len()).map(|i: Int|
+      calls.get(i).fold(accumulator.get(i), |mine: List<Measure>, c: Call|
+        accumulator.get(c.callee).fold(mine, |m: List<Measure>, x: Measure|
           match measure_at_call(c, x) {
             DifferenceValue(v) -> match v.hi {
               Some(hi) -> match v.lo {
@@ -397,21 +400,23 @@ fn field_place(l: Linear) -> Option<Place> =
     _ -> None,
   }
 
-fn deeper_places(acc: List<Measure>, t: Term) -> List<Measure> =
+fn deeper_places(accumulator: List<Measure>, t: Term) -> List<Measure> =
   match t {
     Exactly(l) -> match field_place(l) {
-      Some(p) -> with_measure(acc, SizeMeasure(p)),
-      None -> acc,
+      Some(p) -> with_measure(accumulator, SizeMeasure(p)),
+      None -> accumulator,
     },
-    Wrapped(x) -> deeper_places(acc, x),
-    Below(p) -> if p.path.len() == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
-    Inside(p) -> if p.path.len() == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
+    Wrapped(x) -> deeper_places(accumulator, x),
+    Below(p) -> if p.path.len() == 0 { accumulator }
+    else { with_measure(accumulator, SizeMeasure(p)) },
+    Inside(p) -> if p.path.len() == 0 { accumulator }
+    else { with_measure(accumulator, SizeMeasure(p)) },
     RecordTerm(r) -> {
-      let based = match r.base { Some(b) -> deeper_places(acc, b), None -> acc };
+      let based = match r.base { Some(b) -> deeper_places(accumulator, b), None -> accumulator };
       r.fields.fold(based, |a: List<Measure>, f: { name: Bytes, term: Term }|
         deeper_places(a, f.term))
     },
-    _ -> acc,
+    _ -> accumulator,
   }
 
 fn with_measure(xs: List<Measure>, m: Measure) -> List<Measure> =
@@ -428,9 +433,9 @@ fn call_graph(
   {
     from: member,
     to: c.callee,
-    arcs: range(0, theirs.len()).fold([], |acc: List<Arc>, j: Int| {
+    arcs: range(0, theirs.len()).fold([], |accumulator: List<Arc>, j: Int| {
       let value = measure_at_call(c, theirs.get(j));
-      range(0, mine.len()).fold(acc, |a: List<Arc>, i: Int|
+      range(0, mine.len()).fold(accumulator, |a: List<Arc>, i: Int|
         match relation(g, member, c, mine.get(i), value) {
           None -> a,
           Some(strict) -> with_arc(a, { a: i, b: j, strict: strict }),
@@ -697,8 +702,8 @@ fn place_type(g: Group, member: Int, p: Place) -> Option<Type> / {abort.raise} =
   match g.params.get(member).at(p.parameter_index) {
     None -> None,
     Some(t) ->
-      p.path.fold(Some(t), |acc: Option<Type>, f: Bytes|
-        match acc {
+      p.path.fold(Some(t), |accumulator: Option<Type>, f: Bytes|
+        match accumulator {
           Some(t) -> match record_fields(t) { Some(fs) -> field_type(fs, f), None -> None },
           None -> None,
         }),
@@ -818,13 +823,13 @@ fn element(context: MemberContext, scope: Scope, list: Expression) -> Term / {ab
 
 fn collection_of_items(ts: List<Term>) -> Term =
   if ts.len() == 0 { NoParts } else {
-    let widest = ts.fold(None, |acc: Option<Place>, t: Term|
+    let widest = ts.fold(None, |accumulator: Option<Place>, t: Term|
       match part_place(t) {
-        Some(p) -> match acc {
-          Some(q) -> if within(q, p) { Some(p) } else { acc },
+        Some(p) -> match accumulator {
+          Some(q) -> if within(q, p) { Some(p) } else { accumulator },
           None -> Some(p),
         },
-        None -> acc,
+        None -> accumulator,
       });
     match widest {
       Some(p) -> if ts.fold(true, |ok: Bool, x: Term| ok && part_of(x, p)) { PartsOf(p) }
@@ -853,14 +858,14 @@ fn with_part(xs: Term, x: Term) -> Term =
   }
 
 fn parts_of_places(places: List<Place>) -> Term = {
-  let widest = places.fold([], |acc: List<Place>, p: Place|
-    match acc.find(|q: Place| q.parameter_index == p.parameter_index) {
+  let widest = places.fold([], |accumulator: List<Place>, p: Place|
+    match accumulator.find(|q: Place| q.parameter_index == p.parameter_index) {
       Some(q) ->
-        acc.map(|r: Place|
+        accumulator.map(|r: Place|
           if r.parameter_index == p.parameter_index {
             { parameter_index: p.parameter_index, path: common_prefix(q.path, p.path) }
           } else { r }),
-      None -> acc.push(p),
+      None -> accumulator.push(p),
     });
   match widest {
     [] -> NoParts,
@@ -985,44 +990,45 @@ fn term_of_expression(context: MemberContext, scope: Scope, e: Expression) -> Te
       },
     },
     FieldExpression(f) -> project(term_of_expression(context, scope, f.base), f.field.name),
-    BinaryExpression(b) -> if b.op == b"add" {
+    BinaryExpression(b) -> if b.operation == b"add" {
       offset(
         context,
-        term_of_expression(context, scope, b.lhs),
-        term_of_expression(context, scope, b.rhs),
+        term_of_expression(context, scope, b.left_operand),
+        term_of_expression(context, scope, b.right_operand),
       )
-    } else if b.op == b"sub" {
-      match term_of_expression(context, scope, b.rhs) {
+    } else if b.operation == b"sub" {
+      match term_of_expression(context, scope, b.right_operand) {
         Exactly(r) -> match r.base {
           None -> match checked_neg(r.k) {
-            Some(k) -> shifted(context, term_of_expression(context, scope, b.lhs), k),
+            Some(k) -> shifted(context, term_of_expression(context, scope, b.left_operand), k),
             None -> UnknownTerm,
           },
           Some(_) -> UnknownTerm,
         },
         _ -> UnknownTerm,
       }
-    } else if b.op == b"div" {
+    } else if b.operation == b"div" {
       quotient(
         context,
-        term_of_expression(context, scope, b.lhs),
-        term_of_expression(context, scope, b.rhs),
-        b.op,
+        term_of_expression(context, scope, b.left_operand),
+        term_of_expression(context, scope, b.right_operand),
+        b.operation,
       )
-    } else if b.op == b"shr" || b.op == b"ushr" {
-      match term_of_expression(context, scope, b.rhs) {
+    } else if b.operation == b"shr" || b.operation == b"ushr" {
+      match term_of_expression(context, scope, b.right_operand) {
         Exactly(r) -> if r.base == None && r.k >= 1 && r.k <= 62 {
           quotient(
             context,
-            term_of_expression(context, scope, b.lhs),
+            term_of_expression(context, scope, b.left_operand),
             Exactly({ base: None, k: pow(2, r.k) }),
-            b.op,
+            b.operation,
           )
         } else { UnknownTerm },
         _ -> UnknownTerm,
       }
-    } else if b.op == b"rem" { remainder(context, term_of_expression(context, scope, b.rhs)) }
-    else { UnknownTerm },
+    } else if b.operation == b"rem" {
+      remainder(context, term_of_expression(context, scope, b.right_operand))
+    } else { UnknownTerm },
     RecordExpression(r) ->
       RecordTerm({ base: None, fields: field_terms(context, scope, r.fields) }),
     ListExpression(l) ->
@@ -1061,12 +1067,13 @@ fn block_scope(
 ) -> { s: Scope, falls: Option<Term> } / {abort.raise} =
   statements.fold(
     { s: scope, falls: None },
-    |acc: { s: Scope, falls: Option<Term> }, x: Statement|
+    |accumulator: { s: Scope, falls: Option<Term> }, x: Statement|
       {
-        s: statement_scope(context, acc.s, x),
+        s: statement_scope(context, accumulator.s, x),
         falls: match x {
-          LetElseStatement(l) -> joined(acc.falls, result_term(context, acc.s, l.fallback)),
-          _ -> acc.falls,
+          LetElseStatement(l) ->
+            joined(accumulator.falls, result_term(context, accumulator.s, l.fallback)),
+          _ -> accumulator.falls,
         },
       },
   )
@@ -1098,13 +1105,13 @@ fn shifted(context: MemberContext, t: Term, k: Int) -> Term / {abort.raise} =
     _ -> UnknownTerm,
   }
 
-fn quotient(context: MemberContext, a: Term, b: Term, op: Bytes) -> Term / {abort.raise} =
+fn quotient(context: MemberContext, a: Term, b: Term, operator: Bytes) -> Term / {abort.raise} =
   match a {
     Exactly(l) -> match l.base {
       Some(x) -> if l.k != 0 || !integer(context, l) { UnknownTerm } else {
         match b {
           Exactly(r) -> if r.base == None && r.k >= 2 {
-            Exactly({ base: Some(QuotientBase({ of: x, by: r.k, op: op })), k: 0 })
+            Exactly({ base: Some(QuotientBase({ of: x, by: r.k, operator: operator })), k: 0 })
           } else { UnknownTerm },
           _ -> UnknownTerm,
         }
@@ -1229,8 +1236,11 @@ fn term_at_call(context: MemberContext, t: Term, args: List<Term>) -> Term / {ab
     SameLength(p) -> same_length(along(argument_term(args, p.parameter_index), p.path)),
     UnknownTerm -> UnknownTerm,
     PartsOfAny(ps) ->
-      ps.fold(NoParts, |acc: Term, p: Place|
-        join(acc, collection_of_parts(along(argument_term(args, p.parameter_index), p.path)))),
+      ps.fold(NoParts, |accumulator: Term, p: Place|
+        join(
+          accumulator,
+          collection_of_parts(along(argument_term(args, p.parameter_index), p.path)),
+        )),
   }
 
 fn same_length(t: Term) -> Term =
@@ -1299,10 +1309,10 @@ fn branches_of_match(
   m: { span: Span, scrutinee: Expression, arms: List<MatchArm> },
 ) -> Option<Term> / {abort.raise} = {
   let t = term_of_expression(context, scope, m.scrutinee);
-  m.arms.fold(None, |acc: Option<Term>, arm: MatchArm| {
+  m.arms.fold(None, |accumulator: Option<Term>, arm: MatchArm| {
     let inside = bind(scope, arm.pattern, t);
     joined(
-      acc,
+      accumulator,
       result_term(
         context,
         match arm.guard { Some(g) -> assume(context, inside, g, true), None -> inside },
@@ -1356,8 +1366,8 @@ fn record_join(
   if a.base != b.base { UnknownTerm } else {
     let named = b.fields.fold(
       a.fields.map(|f: { name: Bytes, term: Term }| f.name),
-      |acc: List<Bytes>, f: { name: Bytes, term: Term }|
-        if acc.contains(f.name) { acc } else { acc.push(f.name) },
+      |accumulator: List<Bytes>, f: { name: Bytes, term: Term }|
+        if accumulator.contains(f.name) { accumulator } else { accumulator.push(f.name) },
     );
     RecordTerm({
       base: a.base,
@@ -1410,12 +1420,12 @@ fn joined_parts(a: Term, b: Term) -> Term =
 fn common_prefix(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
   range(0, a.len()).fold(
     { same: true, out: [] },
-    |acc: { same: Bool, out: List<Bytes> }, i: Int|
-      if !acc.same { acc } else {
+    |accumulator: { same: Bool, out: List<Bytes> }, i: Int|
+      if !accumulator.same { accumulator } else {
         match a.at(i) {
-          None -> acc,
-          Some(x) -> if b.at(i) == Some(x) { { same: true, out: acc.out.push(x) } }
-          else { { same: false, out: acc.out } },
+          None -> accumulator,
+          Some(x) -> if b.at(i) == Some(x) { { same: true, out: accumulator.out.push(x) } }
+          else { { same: false, out: accumulator.out } },
         }
       },
   ).out
@@ -1464,7 +1474,7 @@ fn known(scope: Scope, binder: Int, t: Term) -> Scope =
   { ..scope, locals: scope.locals.insert(binder, KnownTerm(t)) }
 
 fn unknown_params(s: Scope, ps: List<Param>) -> Scope =
-  ps.fold(s, |sc: Scope, p: Param| bound(sc, p.name, UnknownTerm))
+  ps.fold(s, |scope: Scope, p: Param| bound(scope, p.name, UnknownTerm))
 
 fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
   match p {
@@ -1472,12 +1482,12 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
     PatternVariable(v) -> bound(s, v.name, t),
     PatternLiteral(_) -> s,
     PatternRange(_) -> s,
-    PatternConstructor(k) -> k.args.fold(s, |sc: Scope, x: Pattern| bind(sc, x, below(t))),
+    PatternConstructor(k) -> k.args.fold(s, |scope: Scope, x: Pattern| bind(scope, x, below(t))),
     PatternRecord(r) ->
-      r.fields.fold(s, |sc: Scope, f: { name: Identifier, pattern: Pattern }|
-        bind(sc, f.pattern, project(t, f.name.name))),
+      r.fields.fold(s, |scope: Scope, f: { name: Identifier, pattern: Pattern }|
+        bind(scope, f.pattern, project(t, f.name.name))),
     PatternList(l) -> {
-      let items = l.items.fold(s, |sc: Scope, x: Pattern| bind(sc, x, below(t)));
+      let items = l.items.fold(s, |scope: Scope, x: Pattern| bind(scope, x, below(t)));
       match l.rest {
         Some(r) -> bind(items, r, if l.items.len() > 0 { tail(t) } else { t }),
         None -> items,
@@ -1488,14 +1498,15 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
       [first, ..others] -> {
         let one = bind(s, first, t);
         let names = binder_names(first);
-        others.fold(one, |sc: Scope, alt: Pattern| {
+        others.fold(one, |scope: Scope, alt: Pattern| {
           let other = bind(s, alt, t);
           let theirs = binder_names(alt);
-          names.fold(sc, |acc: Scope, n: Identifier|
+          names.fold(scope, |accumulator: Scope, n: Identifier|
             match theirs.find(|m: Identifier| m.name == n.name) {
-              Some(m) -> if acc.locals.get(n.span.site) == other.locals.get(m.span.site) { acc }
-              else { bound(acc, n, UnknownTerm) },
-              None -> bound(acc, n, UnknownTerm),
+              Some(m) -> if accumulator.locals.get(n.span.site) == other.locals.get(m.span.site) {
+                accumulator
+              } else { bound(accumulator, n, UnknownTerm) },
+              None -> bound(accumulator, n, UnknownTerm),
             })
         })
       },
@@ -1534,20 +1545,26 @@ fn assume(
   truth: Bool,
 ) -> Scope / {abort.raise} =
   match e {
-    UnaryExpression(u) -> if u.op == b"not" { assume(context, scope, u.operand, !truth) }
+    UnaryExpression(u) -> if u.operation == b"not" { assume(context, scope, u.operand, !truth) }
     else { scope },
-    BinaryExpression(b) -> if b.op == b"and" {
-      if truth { assume(context, assume(context, scope, b.lhs, true), b.rhs, true) } else { scope }
-    } else if b.op == b"or" {
-      if truth { scope }
-      else { assume(context, assume(context, scope, b.lhs, false), b.rhs, false) }
+    BinaryExpression(b) -> if b.operation == b"and" {
+      if truth {
+        assume(context, assume(context, scope, b.left_operand, true), b.right_operand, true)
+      } else { scope }
+    } else if b.operation == b"or" {
+      if truth { scope } else {
+        assume(context, assume(context, scope, b.left_operand, false), b.right_operand, false)
+      }
     } else {
-      match linear_of_expression(context, scope, b.lhs) {
+      match linear_of_expression(context, scope, b.left_operand) {
         None -> scope,
-        Some(l) -> match linear_of_expression(context, scope, b.rhs) {
+        Some(l) -> match linear_of_expression(context, scope, b.right_operand) {
           None -> scope,
           Some(r) ->
-            { ..scope, facts: append_facts(scope.facts, comparison_facts(b.op, l, r, truth)) },
+            {
+              ..scope,
+              facts: append_facts(scope.facts, comparison_facts(b.operation, l, r, truth)),
+            },
         },
       }
     },
@@ -1617,24 +1634,24 @@ fn irrefutable(p: Pattern) -> Bool =
   }
 
 fn append_facts(a: List<Fact>, b: List<Fact>) -> List<Fact> =
-  b.fold(a, |acc: List<Fact>, f: Fact| acc.push(f))
+  b.fold(a, |accumulator: List<Fact>, f: Fact| accumulator.push(f))
 
-fn comparison_facts(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
+fn comparison_facts(operator: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
   let lt = |a: Linear, b: Linear| { lo: a, hi: b, strict: true };
   let le = |a: Linear, b: Linear| { lo: a, hi: b, strict: false };
   if truth {
-    if op == b"lt" { [lt(l, r)] }
-    else if op == b"le" { [le(l, r)] }
-    else if op == b"gt" { [lt(r, l)] }
-    else if op == b"ge" { [le(r, l)] }
-    else if op == b"eq" { [le(l, r), le(r, l)] }
+    if operator == b"lt" { [lt(l, r)] }
+    else if operator == b"le" { [le(l, r)] }
+    else if operator == b"gt" { [lt(r, l)] }
+    else if operator == b"ge" { [le(r, l)] }
+    else if operator == b"eq" { [le(l, r), le(r, l)] }
     else { [] }
   } else {
-    if op == b"lt" { [le(r, l)] }
-    else if op == b"le" { [lt(r, l)] }
-    else if op == b"gt" { [le(l, r)] }
-    else if op == b"ge" { [lt(l, r)] }
-    else if op == b"ne" { [le(l, r), le(r, l)] }
+    if operator == b"lt" { [le(r, l)] }
+    else if operator == b"le" { [lt(r, l)] }
+    else if operator == b"gt" { [le(l, r)] }
+    else if operator == b"ge" { [lt(l, r)] }
+    else if operator == b"ne" { [le(l, r), le(r, l)] }
     else { [] }
   }
 }
@@ -1643,7 +1660,8 @@ fn walk_definition(context: MemberContext, definition: FnDefinition) -> Findings
   let s = entry_scope(context, definition);
   let defaults = definition.params.fold(
     { calls: [], uses: [], outside: [], too_deep_at: None },
-    |acc: Findings, p: Param| match p.default { Some(d) -> walk(context, s, acc, d), None -> acc },
+    |accumulator: Findings, p: Param|
+      match p.default { Some(d) -> walk(context, s, accumulator, d), None -> accumulator },
   );
   walk(context, s, defaults, definition.body)
 }
@@ -1654,9 +1672,9 @@ fn summary(context: MemberContext, x: Findings) -> Summary / {abort.raise} = {
     names: definition.params.map(|p: Param| p.name.name),
     params: range(0, definition.params.len()).map(|i: Int|
       if !function_param(context.group, context.current, i) { NotCalled } else {
-        let own = x.uses.fold(CalledWith([]), |acc: ParamUsage, u: Use|
-          if u.param != i { acc } else {
-            match acc {
+        let own = x.uses.fold(CalledWith([]), |accumulator: ParamUsage, u: Use|
+          if u.param != i { accumulator } else {
+            match accumulator {
               CalledWith(cs) -> match u.args { Some(a) -> CalledWith(cs.push(a)), None -> Escapes },
               other -> other,
             }
@@ -1692,8 +1710,8 @@ fn recursive_calls(
       { known: calls, k: 0 },
       max_recursion_rounds() + 2,
       |st: { known: List<List<Term>>, k: Int }| {
-        let next = selves.fold(st.known, |acc: List<List<Term>>, c: Call|
-          st.known.fold(acc, |grown: List<List<Term>>, call: List<Term>|
+        let next = selves.fold(st.known, |accumulator: List<List<Term>>, c: Call|
+          st.known.fold(accumulator, |grown: List<List<Term>>, call: List<Term>|
             with_call(grown, call.map(|t: Term| term_at_call(context, t, c.args)))));
         if next.len() == st.known.len() { Stop(CalledWith(st.known)) }
         else if st.k >= max_recursion_rounds() { Stop(CalledWith(with_call(next, unknown))) }
@@ -1707,12 +1725,14 @@ fn max_recursion_rounds() -> Int = 6
 fn with_call(xs: List<List<Term>>, call: List<Term>) -> List<List<Term>> =
   if xs.fold(false, |found: Bool, x: List<Term>| found || x == call) { xs } else { xs.push(call) }
 
-fn add_call(acc: Findings, x: Call) -> Findings = { ..acc, calls: acc.calls.push(x) }
+fn add_call(accumulator: Findings, x: Call) -> Findings =
+  { ..accumulator, calls: accumulator.calls.push(x) }
 
-fn add_use(acc: Findings, u: Use) -> Findings = { ..acc, uses: acc.uses.push(u) }
+fn add_use(accumulator: Findings, u: Use) -> Findings =
+  { ..accumulator, uses: accumulator.uses.push(u) }
 
-fn add_external_call(acc: Findings, name: Bytes, span: Span) -> Findings =
-  { ..acc, outside: acc.outside.push({ name: name, span: span }) }
+fn add_external_call(accumulator: Findings, name: Bytes, span: Span) -> Findings =
+  { ..accumulator, outside: accumulator.outside.push({ name: name, span: span }) }
 
 fn callee_of(context: MemberContext, scope: Scope, q: QName) -> Callee / {abort.raise} =
   match q.module {
@@ -1742,59 +1762,77 @@ fn local_of(context: MemberContext, s: Scope, q: QName) -> Option<Local> =
 fn walk(
   context: MemberContext,
   s: Scope,
-  acc: Findings,
+  accumulator: Findings,
   e: Expression,
 ) -> Findings / {abort.raise} =
   match e {
-    LiteralExpression(_) -> acc,
-    HoleExpression(_) -> acc,
+    LiteralExpression(_) -> accumulator,
+    HoleExpression(_) -> accumulator,
     NameExpression(v) -> match local_of(context, s, v.name) {
-      Some(FunctionParam(i)) -> add_use(acc, { param: i, args: None }),
-      Some(LetLambda(f)) -> lambda_escapes(context, s, acc, f),
-      Some(KnownTerm(_)) -> acc,
+      Some(FunctionParam(i)) -> add_use(accumulator, { param: i, args: None }),
+      Some(LetLambda(f)) -> lambda_escapes(context, s, accumulator, f),
+      Some(KnownTerm(_)) -> accumulator,
       None ->
         walk_implicit_calls(
           context,
           s,
           match callee_of(context, s, v.name) {
-            GroupMember(t) -> add_call(acc, { callee: t, args: [], facts: [], span: v.span }),
-            DefinedCallee(n) -> add_external_call(acc, n, v.span),
-            _ -> acc,
+            GroupMember(t) ->
+              add_call(accumulator, { callee: t, args: [], facts: [], span: v.span }),
+            DefinedCallee(n) -> add_external_call(accumulator, n, v.span),
+            _ -> accumulator,
           },
           v.span,
           [],
         ),
     },
-    BinaryExpression(b) -> if b.op == b"and" {
-      walk(context, assume(context, s, b.lhs, true), walk(context, s, acc, b.lhs), b.rhs)
-    } else if b.op == b"or" {
-      walk(context, assume(context, s, b.lhs, false), walk(context, s, acc, b.lhs), b.rhs)
+    BinaryExpression(b) -> if b.operation == b"and" {
+      walk(
+        context,
+        assume(context, s, b.left_operand, true),
+        walk(context, s, accumulator, b.left_operand),
+        b.right_operand,
+      )
+    } else if b.operation == b"or" {
+      walk(
+        context,
+        assume(context, s, b.left_operand, false),
+        walk(context, s, accumulator, b.left_operand),
+        b.right_operand,
+      )
     } else {
       walk_implicit_calls(
         context,
         s,
-        walk(context, s, walk(context, s, acc, b.lhs), b.rhs),
+        walk(context, s, walk(context, s, accumulator, b.left_operand), b.right_operand),
         expression_span(e),
-        [term_of_expression(context, s, b.lhs), term_of_expression(context, s, b.rhs)],
+        [
+          term_of_expression(context, s, b.left_operand),
+          term_of_expression(context, s, b.right_operand),
+        ],
       )
     },
     UnaryExpression(u) ->
-      walk_implicit_calls(context, s, walk(context, s, acc, u.operand), expression_span(e), [
-        term_of_expression(context, s, u.operand),
-      ]),
-    LambdaExpression(l) -> walk(context, unknown_params(s, l.params), acc, l.body),
+      walk_implicit_calls(
+        context,
+        s,
+        walk(context, s, accumulator, u.operand),
+        expression_span(e),
+        [term_of_expression(context, s, u.operand)],
+      ),
+    LambdaExpression(l) -> walk(context, unknown_params(s, l.params), accumulator, l.body),
     CallExpression(a) -> {
       let add_call = walk_implicit_calls(
         context,
         s,
-        walk_call(context, s, acc, a.function, a.args, a.named, a.span),
+        walk_call(context, s, accumulator, a.function, a.args, a.named, a.span),
         expression_span(a.function),
         [],
       );
       add_call
     },
     IfExpression(i) -> {
-      let cond = walk(context, s, acc, i.cond);
+      let cond = walk(context, s, accumulator, i.cond);
       walk(
         context,
         assume(context, s, i.cond, false),
@@ -1805,7 +1843,7 @@ fn walk(
     MatchExpression(m) -> {
       let t = term_of_expression(context, s, m.scrutinee);
       let walked = m.arms.fold(
-        { seen: walk(context, s, acc, m.scrutinee), failed: [] },
+        { seen: walk(context, s, accumulator, m.scrutinee), failed: [] },
         |a: { seen: Findings, failed: List<Fact> }, arm: MatchArm| {
           let inside = pattern_facts(
             context,
@@ -1836,35 +1874,39 @@ fn walk(
       walked.seen
     },
     BlockExpression(b) -> {
-      let r = walk_statements(context, s, acc, b.statements);
-      match b.tail { Some(t) -> walk(context, r.s, r.acc, t), None -> r.acc }
+      let r = walk_statements(context, s, accumulator, b.statements);
+      match b.tail { Some(t) -> walk(context, r.s, r.accumulator, t), None -> r.accumulator }
     },
     RecordExpression(r) ->
-      r.fields.fold(acc, |a: Findings, f: RecordLiteralField| walk(context, s, a, f.value)),
+      r.fields.fold(accumulator, |a: Findings, f: RecordLiteralField| walk(context, s, a, f.value)),
     RecordUpdateExpression(r) ->
-      r.fields.fold(walk(context, s, acc, r.base), |a: Findings, f: RecordLiteralField|
+      r.fields.fold(walk(context, s, accumulator, r.base), |a: Findings, f: RecordLiteralField|
         walk(context, s, a, f.value)),
-    PropagateExpression(t) -> walk(context, s, acc, t.operand),
-    FieldExpression(f) -> walk(context, s, acc, f.base),
-    ListExpression(l) -> l.items.fold(acc, |a: Findings, x: Expression| walk(context, s, a, x)),
-    PerformExpression(p) -> p.args.fold(acc, |a: Findings, x: Expression| walk(context, s, a, x)),
+    PropagateExpression(t) -> walk(context, s, accumulator, t.operand),
+    FieldExpression(f) -> walk(context, s, accumulator, f.base),
+    ListExpression(l) ->
+      l.items.fold(accumulator, |a: Findings, x: Expression| walk(context, s, a, x)),
+    PerformExpression(p) ->
+      p.args.fold(accumulator, |a: Findings, x: Expression| walk(context, s, a, x)),
     HandleExpression(h) -> {
-      let inits = h.vars.fold(
-        { seen: acc, scope: s },
-        |a: { seen: Findings, scope: Scope }, v: HandlerVar|
+      let inits = h.handler_variables.fold(
+        { seen: accumulator, scope: s },
+        |a: { seen: Findings, scope: Scope }, v: HandlerStateVariable|
           {
             seen: walk(context, a.scope, a.seen, v.init),
             scope: bound(a.scope, v.name, UnknownTerm),
           },
       );
       let body = walk(context, s, inits.seen, h.body);
-      let held = h.vars.fold(s, |sc: Scope, v: HandlerVar| bound(sc, v.name, UnknownTerm));
-      let returned = match h.ret {
-        Some(r) -> walk(context, bound(held, r.binder, UnknownTerm), body, r.body),
+      let handler_scope = h.handler_variables.fold(s, |scope: Scope, v: HandlerStateVariable|
+        bound(scope, v.name, UnknownTerm));
+      let returned = match h.return_clause {
+        Some(r) -> walk(context, bound(handler_scope, r.binder, UnknownTerm), body, r.body),
         None -> body,
       };
       h.clauses.fold(returned, |a: Findings, k: HandleClause| {
-        let params = k.params.fold(held, |sc: Scope, p: Identifier| bound(sc, p, UnknownTerm));
+        let params = k.params.fold(handler_scope, |scope: Scope, p: Identifier|
+          bound(scope, p, UnknownTerm));
         let resumed = match k.resume { Some(r) -> bound(params, r, UnknownTerm), None -> params };
         walk(context, resumed, a, k.body)
       })
@@ -1873,31 +1915,32 @@ fn walk(
       walk(
         context,
         bound(s, w.binder, UnknownTerm),
-        walk(context, s, walk(context, s, acc, w.acquire), w.release),
+        walk(context, s, walk(context, s, accumulator, w.acquire), w.release),
         w.body,
       ),
-    SimulateExpression(x) -> walk(context, s, acc, x.body),
+    SimulateExpression(x) -> walk(context, s, accumulator, x.body),
     ParallelExpression(p) ->
-      p.branches.fold(acc, |a: Findings, x: Expression| walk(context, s, a, x)),
+      p.branches.fold(accumulator, |a: Findings, x: Expression| walk(context, s, a, x)),
     TaggedLiteralExpression(t) -> {
-      let held = t.holes.fold(acc, |a: Findings, h: Hole| walk(context, s, a, h.value));
-      let parsed = walk_tagged_call(context, s, held, t, tagged_parser(t));
+      let hole_findings = t.holes.fold(accumulator, |a: Findings, h: Hole|
+        walk(context, s, a, h.value));
+      let parsed = walk_tagged_call(context, s, hole_findings, t, tagged_parser(t));
       if t.holes.len() == 0 { parsed }
       else { walk_tagged_call(context, s, parsed, t, tagged_filler(t)) }
     },
-    InvalidExpression(_) -> acc,
-    TryBlockExpression(t) -> walk(context, s, acc, t.body),
+    InvalidExpression(_) -> accumulator,
+    TryBlockExpression(t) -> walk(context, s, accumulator, t.body),
   }
 
 fn walk_implicit_calls(
   context: MemberContext,
   s: Scope,
-  acc: Findings,
+  accumulator: Findings,
   span: Span,
   operands: List<Term>,
 ) -> Findings / {abort.raise} =
   context.group.implicit_callees(context.current, span).fold(
-    acc,
+    accumulator,
     |seen: Findings, callee: Callee|
       match callee {
         GroupMember(m) -> {
@@ -1916,89 +1959,109 @@ fn walk_implicit_calls(
 fn walk_tagged_call(
   context: MemberContext,
   s: Scope,
-  acc: Findings,
+  accumulator: Findings,
   t: TaggedLiteral,
   callee: QName,
 ) -> Findings / {abort.raise} =
   match callee_of(context, s, callee) {
     GroupMember(m) ->
-      add_call(acc, {
+      add_call(accumulator, {
         callee: m,
         args: context.group.definitions.get(m).params.map(|_: Param| UnknownTerm),
         facts: s.facts,
         span: t.span,
       }),
-    DefinedCallee(n) -> add_external_call(acc, n, t.tag.span),
-    _ -> acc,
+    DefinedCallee(n) -> add_external_call(accumulator, n, t.tag.span),
+    _ -> accumulator,
   }
 
 fn walk_statements(
   context: MemberContext,
   scope: Scope,
-  acc: Findings,
+  accumulator: Findings,
   statements: List<Statement>,
-) -> { s: Scope, acc: Findings } / {abort.raise} =
-  statements.fold({ s: scope, acc: acc }, |st: { s: Scope, acc: Findings }, x: Statement|
-    match x {
-      LetStatement(l) -> match l.pattern {
-        PatternVariable(_) -> match l.value {
-          LambdaExpression(_) -> { s: statement_scope(context, st.s, x), acc: st.acc },
-          _ -> { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
+) -> { s: Scope, accumulator: Findings } / {abort.raise} =
+  statements.fold(
+    { s: scope, accumulator: accumulator },
+    |st: { s: Scope, accumulator: Findings }, x: Statement|
+      match x {
+        LetStatement(l) -> match l.pattern {
+          PatternVariable(_) -> match l.value {
+            LambdaExpression(_) ->
+              { s: statement_scope(context, st.s, x), accumulator: st.accumulator },
+            _ ->
+              {
+                s: statement_scope(context, st.s, x),
+                accumulator: walk(context, st.s, st.accumulator, l.value),
+              },
+          },
+          _ ->
+            {
+              s: statement_scope(context, st.s, x),
+              accumulator: walk(context, st.s, st.accumulator, l.value),
+            },
         },
-        _ -> { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
+        LetElseStatement(l) ->
+          {
+            s: statement_scope(context, st.s, x),
+            accumulator: walk(
+              context,
+              st.s,
+              walk(context, st.s, st.accumulator, l.value),
+              l.fallback,
+            ),
+          },
+        ExpressionStatement(y) -> { s: st.s, accumulator: walk(context, st.s, st.accumulator, y) },
+        AssignmentStatement(y) ->
+          {
+            s: statement_scope(context, st.s, x),
+            accumulator: walk(context, st.s, st.accumulator, y.value),
+          },
       },
-      LetElseStatement(l) ->
-        {
-          s: statement_scope(context, st.s, x),
-          acc: walk(context, st.s, walk(context, st.s, st.acc, l.value), l.fallback),
-        },
-      ExpressionStatement(y) -> { s: st.s, acc: walk(context, st.s, st.acc, y) },
-      AssignmentStatement(y) ->
-        { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, y.value) },
-    })
+  )
 
 fn max_inline_depth() -> Int = 8
 
 fn walk_inlined_lambda(
   context: MemberContext,
   s: Scope,
-  acc: Findings,
+  accumulator: Findings,
   f: { params: List<Param>, body: Expression, locals: Map<Int, Local> },
   args: List<Term>,
 ) -> Findings / {abort.raise} =
-  if context.depth >= max_inline_depth() { too_deep(acc, f.body) } else {
+  if context.depth >= max_inline_depth() { too_deep(accumulator, f.body) } else {
     let inside = range(0, f.params.len()).fold(
       { locals: f.locals, facts: s.facts },
-      |sc: Scope, i: Int| bound(sc, f.params.get(i).name, argument_term(args, i)),
+      |scope: Scope, i: Int| bound(scope, f.params.get(i).name, argument_term(args, i)),
     );
-    walk({ ..context, depth: context.depth + 1 }, inside, acc, f.body)
+    walk({ ..context, depth: context.depth + 1 }, inside, accumulator, f.body)
   }
 
 fn lambda_escapes(
   context: MemberContext,
   scope: Scope,
-  acc: Findings,
+  accumulator: Findings,
   f: { params: List<Param>, body: Expression, locals: Map<Int, Local> },
 ) -> Findings / {abort.raise} =
-  if context.depth >= max_inline_depth() { too_deep(acc, f.body) } else {
+  if context.depth >= max_inline_depth() { too_deep(accumulator, f.body) } else {
     walk(
       { ..context, depth: context.depth + 1 },
       unknown_params({ locals: f.locals, facts: scope.facts }, f.params),
-      acc,
+      accumulator,
       f.body,
     )
   }
 
-fn too_deep(acc: Findings, body: Expression) -> Findings =
-  match acc.too_deep_at {
-    Some(_) -> acc,
-    None -> { ..acc, too_deep_at: Some(expression_span(body)) },
+fn too_deep(accumulator: Findings, body: Expression) -> Findings =
+  match accumulator.too_deep_at {
+    Some(_) -> accumulator,
+    None -> { ..accumulator, too_deep_at: Some(expression_span(body)) },
   }
 
 fn walk_call(
   context: MemberContext,
   scope: Scope,
-  acc: Findings,
+  accumulator: Findings,
   function: Expression,
   args: List<Expression>,
   named: List<NamedArg>,
@@ -2035,48 +2098,58 @@ fn walk_call(
         walk_inlined_lambda(
           context,
           scope,
-          walk_args(acc),
+          walk_args(accumulator),
           f,
           args.map(|x: Expression| term_of_expression(context, scope, x)),
         ),
       Some(FunctionParam(i)) ->
-        add_use(walk_args(acc), {
+        add_use(walk_args(accumulator), {
           param: i,
           args: Some(args.map(|x: Expression| term_of_expression(context, scope, x))),
         }),
-      Some(KnownTerm(_)) -> walk_args(acc),
+      Some(KnownTerm(_)) -> walk_args(accumulator),
       None -> match callee_of(context, scope, v.name) {
         GroupMember(t) ->
-          add_call(if t == context.current { walk_recursion(acc) } else { walk_args(acc) }, {
-            callee: t,
-            args: arguments(context, scope, t, args, named),
-            facts: scope.facts,
-            span: span,
-          }),
+          add_call(
+            if t == context.current { walk_recursion(accumulator) } else { walk_args(accumulator) },
+            {
+              callee: t,
+              args: arguments(context, scope, t, args, named),
+              facts: scope.facts,
+              span: span,
+            },
+          ),
         BuiltinCallee(name) -> match prelude_callback_use(name) {
-          Some(it) -> walk_iterating_call(context, scope, acc, args, named, it),
-          None -> walk_args(acc),
+          Some(it) -> walk_iterating_call(context, scope, accumulator, args, named, it),
+          None -> walk_args(accumulator),
         },
         DefinedCallee(n) -> match callback_use(n) {
           Some(it) ->
-            walk_iterating_call(context, scope, add_external_call(acc, n, v.span), args, named, it),
+            walk_iterating_call(
+              context,
+              scope,
+              add_external_call(accumulator, n, v.span),
+              args,
+              named,
+              it,
+            ),
           None -> match context.group.summary_of(n) {
             Some(sum) ->
               walk_summarized_call(
                 context,
                 scope,
-                add_external_call(acc, n, v.span),
+                add_external_call(accumulator, n, v.span),
                 sum,
                 args,
                 named,
               ),
-            None -> walk_args(add_external_call(acc, n, v.span)),
+            None -> walk_args(add_external_call(accumulator, n, v.span)),
           },
         },
-        _ -> walk_args(acc),
+        _ -> walk_args(accumulator),
       },
     },
-    _ -> walk(context, scope, walk_args(acc), function),
+    _ -> walk(context, scope, walk_args(accumulator), function),
   }
 }
 
@@ -2114,7 +2187,7 @@ fn actual_arguments(
 fn walk_summarized_call(
   context: MemberContext,
   scope: Scope,
-  acc: Findings,
+  accumulator: Findings,
   sum: Summary,
   args: List<Expression>,
   named: List<NamedArg>,
@@ -2132,7 +2205,7 @@ fn walk_summarized_call(
         ),
       _ -> walk(context, scope, seen, x),
     };
-  let positional = range(0, args.len()).fold(acc, |seen: Findings, i: Int|
+  let positional = range(0, args.len()).fold(accumulator, |seen: Findings, i: Int|
     at_param(i, seen, args.get(i)));
   named.fold(positional, |seen: Findings, n: NamedArg|
     match index_of(sum.names, n.name.name) {
@@ -2148,35 +2221,38 @@ fn index_of(xs: List<Bytes>, x: Bytes) -> Option<Int> / {abort.raise} =
 fn walk_passed_function(
   context: MemberContext,
   s: Scope,
-  acc: Findings,
+  accumulator: Findings,
   x: Expression,
   calls: List<List<Term>>,
 ) -> Findings / {abort.raise} =
   match x {
     LambdaExpression(l) ->
-      calls.fold(acc, |seen: Findings, call: List<Term>| {
-        let inside = range(0, l.params.len()).fold(s, |sc: Scope, j: Int|
-          bound(sc, l.params.get(j).name, argument_term(call, j)));
+      calls.fold(accumulator, |seen: Findings, call: List<Term>| {
+        let inside = range(0, l.params.len()).fold(s, |scope: Scope, j: Int|
+          bound(scope, l.params.get(j).name, argument_term(call, j)));
         walk(context, inside, seen, l.body)
       }),
     NameExpression(v) -> match local_of(context, s, v.name) {
       Some(LetLambda(f)) ->
-        calls.fold(acc, |seen: Findings, call: List<Term>|
+        calls.fold(accumulator, |seen: Findings, call: List<Term>|
           walk_inlined_lambda(context, s, seen, f, call)),
       Some(FunctionParam(i)) ->
-        calls.fold(acc, |seen: Findings, call: List<Term>|
+        calls.fold(accumulator, |seen: Findings, call: List<Term>|
           add_use(seen, { param: i, args: Some(call) })),
-      Some(KnownTerm(_)) -> acc,
+      Some(KnownTerm(_)) -> accumulator,
       None -> match callee_of(context, s, v.name) {
         GroupMember(t) ->
-          calls.fold(acc, |seen: Findings, call: List<Term>|
+          calls.fold(accumulator, |seen: Findings, call: List<Term>|
             add_call(seen, { callee: t, args: call, facts: s.facts, span: v.span })),
-        _ -> walk(context, s, acc, x),
+        _ -> walk(context, s, accumulator, x),
       },
     },
     BlockExpression(b) -> {
-      let r = walk_statements(context, s, acc, b.statements);
-      match b.tail { Some(t) -> walk_passed_function(context, r.s, r.acc, t, calls), None -> r.acc }
+      let r = walk_statements(context, s, accumulator, b.statements);
+      match b.tail {
+        Some(t) -> walk_passed_function(context, r.s, r.accumulator, t, calls),
+        None -> r.accumulator,
+      }
     },
     IfExpression(i) ->
       walk_passed_function(
@@ -2185,7 +2261,7 @@ fn walk_passed_function(
         walk_passed_function(
           context,
           assume(context, s, i.cond, true),
-          walk(context, s, acc, i.cond),
+          walk(context, s, accumulator, i.cond),
           i.then_branch,
           calls,
         ),
@@ -2194,7 +2270,7 @@ fn walk_passed_function(
       ),
     MatchExpression(m) -> {
       let t = term_of_expression(context, s, m.scrutinee);
-      m.arms.fold(walk(context, s, acc, m.scrutinee), |seen: Findings, arm: MatchArm| {
+      m.arms.fold(walk(context, s, accumulator, m.scrutinee), |seen: Findings, arm: MatchArm| {
         let inside = bind(s, arm.pattern, t);
         match arm.guard {
           None -> walk_passed_function(context, inside, seen, arm.body, calls),
@@ -2209,18 +2285,19 @@ fn walk_passed_function(
         }
       })
     },
-    _ -> walk(context, s, acc, x),
+    _ -> walk(context, s, accumulator, x),
   }
 
 fn walk_iterating_call(
   context: MemberContext,
   scope: Scope,
-  acc: Findings,
+  accumulator: Findings,
   args: List<Expression>,
   named: List<NamedArg>,
   it: CallbackUse,
 ) -> Findings / {abort.raise} = {
-  let others = named.fold(acc, |seen: Findings, n: NamedArg| walk(context, scope, seen, n.value));
+  let others = named.fold(accumulator, |seen: Findings, n: NamedArg|
+    walk(context, scope, seen, n.value));
   let element = match iterated_argument(it, args) {
     Some(x) -> element(context, scope, x),
     None -> UnknownTerm,

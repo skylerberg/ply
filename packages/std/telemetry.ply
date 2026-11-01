@@ -1,28 +1,29 @@
-//! What a traced program shares with whatever exports its telemetry: the span a piece of code runs
-//! in, how a trace passes through `std.http`, how a new trace is sampled, and the names
-//! OpenTelemetry gives things.
+//! Shares tracing information between a traced program and whatever exports its telemetry. It
+//! covers the span that code runs in, how a trace passes through `std.http`, how a new trace is
+//! sampled, and the names OpenTelemetry gives things.
 //!
-//! The span a function runs in is whatever the handlers around it return for `tracing.current`,
-//! and nothing else. `in_span` opens a span and returns its body's result. A task spawned inside
-//! sees that span, because a task performs its effects against the handlers around its spawn. Two
-//! requests served at once never see each other's spans. Nothing here is ambient and nothing is on
-//! by default: a program installs an exporter (`std.otlp`'s `exporting`), or `traced` when it only
-//! wants its spans identified in what `std.trace` already writes.
+//! The span a function runs in is the value that the nearest enclosing handler returns for
+//! `tracing.current`. `in_span` opens a span and returns its body's result. A task spawned inside a
+//! span sees that span, because a task performs its effects against the handlers around the place
+//! it was spawned. Two requests served at once never see each other's spans. No span is active
+//! unless a handler provides one, and nothing is traced by default. A program installs an exporter
+//! (`exporting` in `std.otlp`), or `traced` when it only wants span ids added to what `std.trace`
+//! already writes.
 //!
 //! A span is still a `std.trace` span. `in_span`, `serve_traced` and `in_client_span` perform
 //! `trace.enter` and `trace.exit` on the channel they are given. They write the span's ids into its
-//! fields under the names that `trace_id_field` and the functions beside it return. So any `trace`
-//! handler can tell spans apart, and an exporter reads the ids back with `identity`.
+//! fields under the names that `trace_id_field` and the similar functions in this module return. So
+//! any `trace` handler can tell spans apart, and an exporter reads the ids back with `identity`.
 //!
-//! A span's parent is the `traceparent` a request arrived with, or else the span around the call.
-//! With neither, the span starts a trace, and `tracing.sampler` decides whether that trace is
-//! recorded. Every span below inherits the decision of the span above it, in this process or in
-//! the one that called it. A `Ratio` decides from the trace id, so every service records the same
-//! traces.
+//! A span's parent is the `traceparent` that its request arrived with, or else the span around the
+//! call. If there is neither, the span starts a new trace, and `tracing.sampler` decides whether to
+//! record that trace. Every span below it inherits the decision of the span above it, in this
+//! process or in the process that called it. A `Ratio` decides from the trace id, so every service
+//! records the same traces.
 //!
-//! `trace.exit` carries no fields. Data known only when a span ends, such as a response's status,
-//! goes to `tracing.annotate`. An exporter handles it by adding the data to the span, and `traced`
-//! by dropping it.
+//! `trace.exit` carries no fields. Data that is known only when a span ends, such as a response's
+//! status, goes to `tracing.annotate`. An exporter handles it by adding the data to the span, and
+//! `traced` ignores it.
 
 import std.http
 import std.http (ClientError, Headers, Request, Response)
@@ -33,13 +34,11 @@ import std.traceparent
 import std.traceparent (Context, SpanId, TraceId, Traceparent)
 import std.gen
 
-// --- The span around a caller -------------------------------------------------
-
 /// How this process decides whether to record a trace that starts in it.
 pub type Sampler =
-  /// Every trace.
+  /// Records every trace.
   | AlwaysOn
-  /// No trace.
+  /// Records no trace.
   | AlwaysOff
   /// A share of all traces, the first number out of the second. Every process picks the same
   /// traces: `Ratio(1, 100)` records the traces whose ids fall in one hundredth of their range.
@@ -48,10 +47,12 @@ pub type Sampler =
 /// Which side of a call a span is on.
 pub type Kind = | Internal | Server | Client | Producer | Consumer
 
-/// The span a caller runs in, as the handlers around it report.
+/// Reports the span the caller is running in and how new traces are sampled. A handler around the
+/// caller, such as an exporter or `traced`, returns these values.
 pub effect tracing {
-  /// The context of the innermost span around the caller: its trace, its own id as the
-  /// parent a callee would name, and its flags. `None` outside every span.
+  /// Returns the context of the innermost span around the caller, or `None` outside every span. A
+  /// span started under this context uses its trace and flags, and names this span's id as its
+  /// parent.
   read current() -> Option<Context>
   /// How a trace that starts here is sampled.
   read sampler() -> Sampler
@@ -59,12 +60,12 @@ pub effect tracing {
   write annotate(span: SpanId, fields: Fields) -> Unit
 }
 
-/// Every operation `tracing` declares, for effects that pass them all on.
+/// The set of every operation of `tracing`, for an effect row that must allow all of them.
 pub effect set Tracing = {tracing.current, tracing.sampler, tracing.annotate}
 
-/// Runs `body` at the root of its traces, with no span around it. Each trace it starts is sampled
-/// by `sampler`, and its annotations are dropped. An exporter handles the same operations and keeps
-/// the annotations; this is for a program that has no exporter.
+/// Runs `body` outside any span, as the root of the traces it starts. Each new trace is sampled by
+/// `sampler`, and `tracing.annotate` calls are discarded. Use it in a program with no exporter; an
+/// exporter handles the same operations but records the annotations.
 pub fn traced<a | e>(sampler: Sampler, body: () -> a / {Tracing | e}) -> a / e =
   handle {
     body()
@@ -74,11 +75,11 @@ pub fn traced<a | e>(sampler: Sampler, body: () -> a / {Tracing | e}) -> a / e =
     tracing.annotate(span, fields) -> (),
   }
 
-/// Whether `sampler` records the trace `id`. A `Ratio` reads the id's last seven bytes as a number
-/// below `2^56`; a trace id made with the `random` flag has those bytes drawn at random. It records
-/// the trace when that number is at or above the count of values the ratio rejects. This is the
-/// rule of OpenTelemetry's consistent sampling, so a higher ratio records every trace a lower one
-/// does.
+/// Returns whether `sampler` records the trace `id`. For `Ratio`, the last seven bytes of the id
+/// form a number below `2^56`, and the trace is recorded when that number is at least
+/// `sampling_threshold`. A trace id made with the `random` flag has those bytes chosen at random.
+/// This is OpenTelemetry's consistent sampling, so every trace a lower ratio records is also
+/// recorded by a higher ratio.
 pub fn should_sample(sampler: Sampler, id: TraceId) -> Bool / {abort.raise} =
   match sampler {
     AlwaysOn -> true,
@@ -88,20 +89,18 @@ pub fn should_sample(sampler: Sampler, id: TraceId) -> Bool / {abort.raise} =
     else { randomness(id) >= sampling_threshold(part, parts) },
   }
 
-/// The last seven bytes of a trace id, most significant first.
 fn randomness(id: TraceId) -> Int / {abort.raise} = {
   let raw = traceparent::trace_id_bytes(id);
-  range(9, 16).fold(0, |acc: Int, i: Int| acc << 8 | raw.at(i))
+  range(9, 16).fold(0, |accumulator: Int, i: Int| accumulator << 8 | raw.at(i))
 }
 
-/// How many of the `2^56` values a ratio rejects, rounded down.
 fn sampling_threshold(part: Int, parts: Int) -> Int / {abort.raise} =
   Int::of_i128(72057594037927936i128 * I128::of_int(parts - part) / I128::of_int(parts))
 
-/// The context of a span that starts under `parent` with the id `span`. It takes the parent's
-/// trace, state and sampling decision. With no parent it starts the trace `fresh`, recorded if
-/// `sampler` decides so, and marked `random` because every byte of the ids this library makes is
-/// random.
+/// Returns the context of a span with id `span` that starts under `parent`. With a parent, the span
+/// joins the parent's trace, copies its `tracestate`, and keeps its sampling decision. With no
+/// parent, it starts the trace `fresh`, sets the sampled flag when `sampler` chooses to record it,
+/// and always sets the `random` flag because this library makes every id byte at random.
 pub fn start(
   parent: Option<Context>,
   sampler: Sampler,
@@ -131,8 +130,6 @@ pub fn begin(parent: Option<Context>, sampler: Sampler) -> Context / {entropy.ne
       start(None, sampler, fresh, traceparent::new_span_id())
     },
   }
-
-// --- A span's identity, in its fields ------------------------------------------
 
 /// The field a span's trace id is written under: 32 hex digits.
 pub fn trace_id_field() -> String = "trace_id"
@@ -263,8 +260,6 @@ fn kind_at(fields: Fields) -> Kind =
     _ -> Internal,
   }
 
-// --- Spans --------------------------------------------------------------------
-
 /// Runs `body` in a span named `name` on the channel the call names, and returns its result. The
 /// span is a child of the span around the call, or the start of a trace. It is closed `Ok` when
 /// `body` returns, and `Failed` when it does not: on a raise, a cancelled task, or a handler clause
@@ -325,13 +320,10 @@ fn run_in_span<a, [c] | e>(
   }
 }
 
-/// Whether a span's body got as far as closing the span itself. The span's release step reads it.
 effect span_end {
   write end() -> Unit
   read ended() -> Bool
 }
-
-// --- Across std.http ------------------------------------------------------------
 
 /// The context `request` arrived with, or `None` when it starts a trace: `traceparent::incoming`
 /// applied to its `traceparent` and `tracestate` fields.
@@ -371,11 +363,11 @@ pub fn serve_traced<[c] | e, s>(
     request_fields(request),
     extract(request),
     |_: Context| {
-      let res = app(request);
-      annotate(status_fields(res.status, 500));
-      res
+      let response = app(request);
+      annotate(status_fields(response.status, 500));
+      response
     },
-    |res: Response<| s>| status_outcome(res.status, 500),
+    |response: Response<| s>| status_outcome(response.status, 500),
   )
 
 /// Runs `send` on `request` in a client span named for its method, and returns its result. `send`
@@ -393,14 +385,14 @@ pub fn in_client_span<[c] | e>(
     |context: Context| {
       let result = send({ ..request, headers: with_context(request.headers, context) });
       match result {
-        Ok(res) -> annotate(status_fields(res.status, 400)),
+        Ok(response) -> annotate(status_fields(response.status, 400)),
         Err(error) -> annotate(#{error_type(): StringField(client_error_name(error))}),
       };
       result
     },
     |result: Result<Response<| {}>, ClientError>|
       match result {
-        Ok(res) -> status_outcome(res.status, 400),
+        Ok(response) -> status_outcome(response.status, 400),
         Err(error) -> trace::Failed(client_error_name(error)),
       },
   )
@@ -449,7 +441,6 @@ fn request_fields(request: Request) -> Fields = {
   }
 }
 
-/// An authority's host and port: `example.org:8080`, `[::1]:8080`, or a host alone.
 type Authority = { host: String, port: Option<Int> }
 
 fn authority_of(authority: String) -> Authority =
@@ -466,16 +457,14 @@ fn split_authority(raw: Bytes) -> Authority / {abort.raise} = {
   if digits {
     {
       host: String::of_bytes_lossy(raw.slice(0, colon)),
-      port: range(colon + 1, n).fold(Some(0), |acc: Option<Int>, i: Int|
-        match acc {
+      port: range(colon + 1, n).fold(Some(0), |accumulator: Option<Int>, i: Int|
+        match accumulator {
           Some(v) -> if v > 65535 { None } else { Some(v * 10 + raw.at(i) - b'0') },
           None -> None,
         }),
     }
   } else { { host: String::of_bytes_lossy(raw), port: None } }
 }
-
-// --- Histograms ---------------------------------------------------------------
 
 /// The default upper bounds, in seconds, for counting durations: the ones OpenTelemetry recommends
 /// for a request's duration, from five milliseconds to ten seconds.
@@ -495,8 +484,6 @@ pub fn add_to_buckets(bounds: List<Float>, counts: List<Int>, x: Float) -> List<
   range(0, bounds.len() + 1).map(|i: Int|
     (match counts.at(i) { Some(n) -> n, None -> 0 }) + (if i == at { 1 } else { 0 }))
 }
-
-// --- Names --------------------------------------------------------------------
 
 /// `service.name`: the resource attribute every exporter is given.
 pub fn service_name() -> String = "service.name"
@@ -561,11 +548,8 @@ pub fn user_agent_original() -> String = "user_agent.original"
 /// `error.type`.
 pub fn error_type() -> String = "error.type"
 
-// --- Tests ------------------------------------------------------------------
-
 type Collected<a> = { value: a, records: List<trace::Record> }
 
-/// Runs `body`, collecting every `trace` operation it performs, with `entropy` drawn from a seed.
 fn collect_records<a | e>(
   seed: Int,
   body: () -> a / {trace.enter[*], trace.exit[*], trace.event[*], entropy.next, entropy.below | e},
@@ -593,7 +577,7 @@ fn entered(should_sample: List<trace::Record>) -> List<trace::Record> =
   should_sample.filter(|r: trace::Record| r.kind == trace::Enter)
 
 fn id_of(r: trace::Record) -> Identity / {abort.raise} =
-  match identity(r.fields) { Some(id) -> id, None -> panic("a span with no identity") }
+  match identity(r.fields) { Some(id) -> id, None -> panic("a span record has no id fields") }
 
 fn trace_hex(context: Context) -> String = traceparent::trace_id_hex(context.parent.trace_id)
 
@@ -621,7 +605,6 @@ test "a span inside a span is its child, in its trace, with its sampling decisio
       assert_eq(down.context.parent.flags, up.context.parent.flags);
       assert_eq(down.kind, Client);
       assert_eq(up.kind, Internal);
-      // The body sees the innermost span, and its own fields are left as written.
       assert_eq(ran.value, Some(down.context));
       assert_eq(attributes(outer.fields), #{"n": IntField(1)})
     },
@@ -629,7 +612,7 @@ test "a span inside a span is its child, in its trace, with its sampling decisio
   }
 }
 
-test "a trace that is not recorded stays unrecorded below its first span" {
+test "when a trace is not sampled, spans nested inside its first span are not sampled either" {
   let ran = collect_records(2, ||
     traced(AlwaysOff, ||
       in_span[work]("outer", Internal, Map::new(), ||
@@ -654,14 +637,13 @@ test "a span closes Ok when its body returns and Failed when it does not" {
   )
 }
 
-/// The trace id a `traceparent` of these 32 digits names.
 fn id(hex: String) -> TraceId / {abort.raise} =
   match traceparent::parse("00-" ++ hex ++ "-00f067aa0ba902b7-01") {
     Ok(parent) -> parent.trace_id,
     Err(_) -> panic("a trace id"),
   }
 
-test "a ratio decides from the last seven bytes of the trace id" {
+test "`should_sample` with a `Ratio` decides whether to record a trace from the last seven bytes of its trace id" {
   let low = id("4bf92f3577b34da6a300000000000001");
   let middle = id("4bf92f3577b34da6a380000000000000");
   let high = id("4bf92f3577b34da6a3ffffffffffffff");
@@ -678,7 +660,7 @@ test "a ratio decides from the last seven bytes of the trace id" {
   assert(!should_sample(AlwaysOff, high))
 }
 
-test "a higher ratio records every trace a lower one does" {
+test "`should_sample` with a higher `Ratio` samples every trace that a lower `Ratio` samples" {
   gen::check4(
     traceparent::trace_ids(),
     gen::any_int(),
@@ -697,7 +679,7 @@ test "a higher ratio records every trace a lower one does" {
   )
 }
 
-test "a span's identity reads back from its fields" {
+test "`identity` returns the context, parent span and kind given to `with_identity`, and `attributes` still returns the attributes passed in" {
   gen::check3(
     traceparent::traceparents(),
     gen::option_of(traceparent::span_ids()),
@@ -712,7 +694,7 @@ test "a span's identity reads back from its fields" {
   )
 }
 
-test "a served request continues the trace it arrived with, and records what the request was" {
+test "`serve_traced` continues the trace from the request's `traceparent` header and records the request method and path" {
   let request = get("/orders/7?full=1");
   let traceparent_request = {
     ..request,
@@ -740,7 +722,6 @@ test "a served request continues the trace it arrived with, and records what the
       assert_eq(span.channel, "web");
       assert_eq(who.kind, Server);
       assert_eq(who.parent, traceparent::span_id_of_hex("00f067aa0ba902b7"));
-      // The caller recorded its span, so this one is recorded whatever the local sampler decides.
       assert(traceparent::sampled(who.context.parent));
       assert_eq(traceparent::render_state(who.context.state), "rojo=1");
       assert_eq(
@@ -765,7 +746,6 @@ test "a served request continues the trace it arrived with, and records what the
 
 type Annotation = { span: String, fields: Fields }
 
-/// Runs `body` under a root that keeps its annotations, as an exporter does.
 fn keep_annotations<a | e>(
   body: () -> a / {Tracing | e},
 ) -> { value: a, notes: List<Annotation> } / e =
@@ -782,7 +762,7 @@ fn keep_annotations<a | e>(
     return value -> { value: value, notes: notes },
   }
 
-test "a sent request names its client span to the server and records the response status on it" {
+test "`in_client_span` sends its span's identity in the request's `traceparent` header and records the response status on the span" {
   let ran = collect_records(5, ||
     keep_annotations(||
       in_span[work]("checkout", Internal, Map::new(), ||
@@ -796,12 +776,12 @@ test "a sent request names its client span to the server and records the respons
           result
         }))));
   match ((entered(ran.records), ran.value.value)) {
-    ([outer, client], Ok(res)) -> {
+    ([outer, client], Ok(response)) -> {
       let who = id_of(client);
       assert_eq(who.kind, Client);
       assert_eq(who.parent, Some(id_of(outer).context.parent.parent_id));
       assert_eq(
-        String::of_bytes(http::whole_bytes(res.body)),
+        String::of_bytes(http::whole_bytes(response.body)),
         traceparent::render(who.context.parent),
       );
       assert_eq(ran.value.notes, [
@@ -815,7 +795,6 @@ test "a sent request names its client span to the server and records the respons
   }
 }
 
-/// What a request's handler saw of the span around it.
 effect sightings {
   write record(request: String, trace: String) -> Unit
 }
@@ -823,8 +802,6 @@ effect sightings {
 fn record_sighting(who: String) -> Unit / {tracing.current, sightings.record} =
   sightings.record(who, match tracing.current() { Some(c) -> trace_hex(c), None -> "none" })
 
-/// A handler that records the span around it, yields to every other task, sends a request on,
-/// yields again and records the span once more.
 fn relayed<| e>(
   who: String,
   request: Request,
@@ -839,7 +816,7 @@ fn relayed<| e>(
   });
   task.yield();
   record_sighting(who);
-  http::response(match result { Ok(res) -> res.status, Err(_) -> 502 }, b"")
+  http::response(match result { Ok(response) -> response.status, Err(_) -> 502 }, b"")
 }
 
 fn traceparent_request(parent: String) -> Request / {abort.raise} = {
@@ -887,7 +864,7 @@ test "two requests served at once each see their own span, whatever order they r
   ])
 }
 
-test "a task spawned inside a span runs in that span, and one spawned outside it in none" {
+test "a task spawned inside a span runs in that span, and a task spawned outside any span runs in no span" {
   let seen = handle {
     traced(AlwaysOn, ||
       simulate {

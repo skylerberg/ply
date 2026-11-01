@@ -20,7 +20,7 @@ pub fn unit_name() -> Bytes = name_of(unit_type())
 pub fn list_name() -> Bytes = name_of(list_type(unit_type()))
 pub fn option_name() -> Bytes = name_of(option_type(unit_type()))
 pub fn map_name() -> Bytes = name_of(map_type(unit_type(), unit_type()))
-pub fn iter_name() -> Bytes = name_of(iter_type(unit_type(), unit_type()))
+pub fn iterator_name() -> Bytes = name_of(iter_type(unit_type(), unit_type()))
 pub fn secret_name() -> Bytes = name_of(secret_type(unit_type()))
 pub fn char_name() -> Bytes = b"Char"
 pub fn ordering_name() -> Bytes = b"Ordering"
@@ -82,7 +82,7 @@ pub fn builtin_types() -> List<{ name: Bytes, arity: Int }> =
     { name: result_name(), arity: 2 },
     { name: ordering_name(), arity: 0 },
     { name: rounding_name(), arity: 0 },
-    { name: iter_name(), arity: 2 },
+    { name: iterator_name(), arity: 2 },
     { name: instant_name(), arity: 0 },
     { name: duration_name(), arity: 0 },
   ])
@@ -143,7 +143,7 @@ pub fn builtin_sums() -> List<BuiltinSum> =
       ],
     },
     {
-      name: iter_name(),
+      name: iterator_name(),
       params: [b"s", b"r"],
       variants: [
         { name: continue_constructor(), fields: [b"s"] },
@@ -163,9 +163,9 @@ pub fn builtin_sums() -> List<BuiltinSum> =
   ]
 
 pub fn builtin_constructor_at(name: Bytes) -> Option<{ sum: Bytes, case: Int }> =
-  builtin_sums().fold(None, |acc: Option<{ sum: Bytes, case: Int }>, s: BuiltinSum|
-    match acc {
-      Some(_) -> acc,
+  builtin_sums().fold(None, |accumulator: Option<{ sum: Bytes, case: Int }>, s: BuiltinSum|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> match range(0, s.variants.len()).find(|i: Int|
           match s.variants.at(i) { Some(v) -> v.name == name, None -> false }) {
         Some(i) -> Some({ sum: s.name, case: i }),
@@ -181,8 +181,8 @@ pub fn array_type(element: Type) -> Type = applied_type(array_name(), element)
 
 pub fn columns_type(row: Type) -> Type = applied_type(columns_name(), row)
 
-pub fn scoped_type(label: Type, held: Type) -> Type =
-  NamedType({ name: scoped_name(), args: [label, held] })
+pub fn scoped_type(label: Type, contents: Type) -> Type =
+  NamedType({ name: scoped_name(), args: [label, contents] })
 pub fn task_type(result: Type) -> Type = applied_type(task_name(), result)
 pub fn chan_type(item: Type) -> Type = applied_type(builtin_channel_name(), item)
 pub fn result_type(ok: Type, error: Type) -> Type =
@@ -238,18 +238,21 @@ pub fn map_node_parts(ty: Type) -> Option<{ key: Type, value: Type }> =
 pub fn result_parts(ty: Type) -> Option<{ ok: Type, error: Type }> =
   match args_named(ty, result_name()) { [o, e] -> Some({ ok: o, error: e }), _ -> None }
 
-pub fn iter_parts(ty: Type) -> Option<{ state: Type, result: Type }> =
-  match args_named(ty, iter_name()) { [s, r] -> Some({ state: s, result: r }), _ -> None }
+pub fn iterator_parts(ty: Type) -> Option<{ state: Type, result: Type }> =
+  match args_named(ty, iterator_name()) { [s, r] -> Some({ state: s, result: r }), _ -> None }
 
 pub fn mentions_secret(ty: Type) -> Bool =
   match ty {
     NamedType(c) ->
-      c.name == secret_name() || c.args.fold(false, |acc: Bool, a: Type| acc || mentions_secret(a)),
+      c.name == secret_name()
+        || c.args.fold(false, |accumulator: Bool, a: Type| accumulator || mentions_secret(a)),
     FunctionType(f) ->
-      f.params.fold(false, |acc: Bool, p: Type| acc || mentions_secret(p))
-        || mentions_secret(f.ret),
-    RecordType(fs) -> fs.fold(false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
-    NominalType(n) -> n.fields.fold(false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+      f.params.fold(false, |accumulator: Bool, p: Type| accumulator || mentions_secret(p))
+        || mentions_secret(f.return_type),
+    RecordType(fs) ->
+      fs.fold(false, |accumulator: Bool, f: Field| accumulator || mentions_secret(f.ty)),
+    NominalType(n) ->
+      n.fields.fold(false, |accumulator: Bool, f: Field| accumulator || mentions_secret(f.ty)),
     VariableType(_) -> false,
   }
 
@@ -293,17 +296,17 @@ fn arity_declared(declared: List<{ name: Bytes, arity: Int }>, name: Bytes) -> O
 fn prelude_externs() -> List<{ name: Bytes, arity: Int }> / {abort.raise} =
   parse(prelude_source::text()).node.items.fold(
     [],
-    |acc: List<{ name: Bytes, arity: Int }>, item: Item|
+    |accumulator: List<{ name: Bytes, arity: Int }>, item: Item|
       match item {
         TypeItem(d) -> match d.body {
-          ExternBody -> acc.push({ name: d.name.name, arity: d.generics.types.len() }),
-          _ -> acc,
+          ExternBody -> accumulator.push({ name: d.name.name, arity: d.generics.types.len() }),
+          _ -> accumulator,
         },
-        _ -> acc,
+        _ -> accumulator,
       },
   )
 
-test "each type built is one the checker or the prelude declares, at the arity it is built at" {
+test "every type the compiler constructs is declared by the checker or the prelude, with the number of arguments it is constructed with" {
   let prelude = prelude_externs().map(|e: { name: Bytes, arity: Int }|
     { name: prelude_type_name(e.name), arity: e.arity });
   let declared = builtin_types().concat(prelude);
@@ -316,7 +319,7 @@ test "each type built is one the checker or the prelude declares, at the arity i
   assert_eq(undeclared.map(type_text), [])
 }
 
-test "each recogniser returns the parts its constructor built" {
+test "each type accessor, such as `list_item`, returns the components its type constructor was given" {
   let a = int_type();
   let b = string_type();
   let l = label_type(b"l");
@@ -331,7 +334,7 @@ test "each recogniser returns the parts its constructor built" {
   assert_eq(map_parts(map_type(a, b)), Some({ key: a, value: b }));
   assert_eq(map_node_parts(map_node_type(a, b)), Some({ key: a, value: b }));
   assert_eq(result_parts(result_type(a, b)), Some({ ok: a, error: b }));
-  assert_eq(iter_parts(iter_type(a, b)), Some({ state: a, result: b }));
+  assert_eq(iterator_parts(iter_type(a, b)), Some({ state: a, result: b }));
   assert_eq(list_item(array_type(a)), None);
   assert(is_char(char_type()) && !is_char(list_type(char_type())), None);
   assert_eq(
@@ -341,7 +344,7 @@ test "each recogniser returns the parts its constructor built" {
   )
 }
 
-test "the containers check/types.ply unifies covariantly and prints are the ones built here" {
+test "every container type built by the constructors is treated as covariant by `check/types.ply`, and a scoped type prints starting with `Scoped<Int, [`" {
   let a = int_type();
   let hold = scoped_type(label_type(b"l"), a);
   let containers = [

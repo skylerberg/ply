@@ -1,10 +1,6 @@
-//! The trusted computing base, as one list.
-
-// A line for each family, here and wherever else they are listed, in alphabetical order: two
-// families added at once then touch different lines.
 use crate::config;
 use crate::fs;
-use crate::pool::{Bell, Run, err_nothing_outstanding};
+use crate::pool::{Run, WakeCounter, err_nothing_outstanding};
 use crate::process;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::sqlite;
@@ -17,22 +13,13 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub struct Host {
-    /// Rung as a result is recorded with any run of this host, and by a stop, so a park waits on
-    /// every pool and the stop at once.
-    bell: Arc<Bell>,
-    /// The run's configuration, read once before this `Host` existed and immutable thereafter.
+    bell: Arc<WakeCounter>,
     config: Arc<config::Snapshot>,
-    /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on; empty if none.
     fs: Arc<fs::FsHost>,
     net: Arc<tcp::TcpHost>,
-    /// The arguments and streams `ply run` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
-    /// The stop flag and the phase machine, when this run listens for a signal.
     shutdown: Option<Arc<Shutdown>>,
-    /// The database connections open under `fs`'s roots.
     sqlite: Arc<sqlite::SqliteHost>,
-    /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
-    /// scheduler's sleeps are deadlines on.
     time: Arc<time::TimeHost>,
     trace: Arc<trace::Trace>,
 }
@@ -50,7 +37,7 @@ impl Host {
 
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
         Host {
-            bell: Arc::new(Bell::default()),
+            bell: Arc::new(WakeCounter::default()),
             config: Arc::new(config::Snapshot::unopened()),
             fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
             net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
@@ -112,8 +99,6 @@ impl Host {
         self.net.credentials()
     }
 
-    /// One per machine, each a run of its own: the pools are shared, but every operation is the
-    /// run's that submitted it.
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
         Rc::new(Facilities {
             run: Run::new(Arc::clone(&self.bell)),
@@ -134,7 +119,7 @@ impl Host {
 
     pub fn stopping_on(self, shutdown: Arc<Shutdown>) -> Host {
         shutdown.attach_net(Arc::clone(&self.net) as Arc<dyn signal::Accepting>);
-        shutdown.attach_bell(&self.bell);
+        shutdown.attach_notifier(&self.bell);
         if let Some(process) = &self.process {
             shutdown.attach_children(process.children());
         }
@@ -149,24 +134,15 @@ impl Host {
     }
 }
 
-/// A runtime factory for a run no host was bound for: every runtime it makes, a `parallel`
-/// branch's among them, is over one host of its own, made when the first runtime is.
 pub fn unbound() -> RuntimeFactory {
     let host: Arc<OnceLock<Host>> = Arc::default();
     Arc::new(move || host.get_or_init(Host::new).runtime())
 }
 
-/// The facilities `runtime` grants the natives, where a host made it.
 pub fn facilities_of(runtime: &dyn HostRuntime) -> Option<&Facilities> {
     runtime.facilities()?.downcast_ref()
 }
 
-/// The bytes a native's job returned for `pending`, the thread waiting for them until the drain
-/// deadline says the run is out of time. A wait begun past the deadline ends the run however soon
-/// its job would return, so a loop of quick waits still stops there.
-///
-/// # Errors
-/// The job failed, the drain ran out, or no host made `runtime`.
 pub fn job_bytes(runtime: &dyn HostRuntime, pending: &Pending) -> Result<Vec<u8>, Diagnostic> {
     let facilities = facilities_of(runtime).ok_or_else(err_no_host)?;
     let step = facilities.shutdown.as_ref().map(|_| signal::DRAIN_POLL);
@@ -180,10 +156,6 @@ pub fn job_bytes(runtime: &dyn HostRuntime, pending: &Pending) -> Result<Vec<u8>
     }
 }
 
-/// The run `runtime` is, which an operation it asks for is submitted for.
-///
-/// # Errors
-/// No host made the runtime, so it holds no run.
 pub fn run_of(runtime: &dyn HostRuntime) -> Result<&Arc<Run>, Diagnostic> {
     facilities_of(runtime)
         .map(Facilities::run)
@@ -199,66 +171,51 @@ fn err_no_host() -> Diagnostic {
     .note("this is Ply's fault: report it with the program that produced it")
 }
 
-/// The runtime: one run's operations, and what it grants the natives.
 pub struct Facilities {
     run: Arc<Run>,
-    /// The run's configuration, which `config`'s natives read.
     config: Arc<config::Snapshot>,
-    /// The roots `--fs` bound, which a database lies under.
     fs: Arc<fs::FsHost>,
-    /// The sockets, for the connections a drain that ran out of time abandoned.
     net: Arc<tcp::TcpHost>,
-    /// The run's own process, for its children and its streams at the end.
     process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
-    /// The database connections, for those an entry point left open.
     sqlite: Arc<sqlite::SqliteHost>,
     time: Arc<time::TimeHost>,
 }
 
 impl Facilities {
-    /// The run's configuration, read once before the run began.
     pub fn configuration(&self) -> &config::Snapshot {
         &self.config
     }
 
-    /// The run's sockets, `std.net`'s and `std.udp`'s alike.
     pub fn sockets(&self) -> &Arc<tcp::TcpHost> {
         &self.net
     }
 
-    /// The run's operations, which every operation it asks for is submitted for.
     pub fn run(&self) -> &Arc<Run> {
         &self.run
     }
 
-    /// The roots `--fs` bound, each by its label.
     pub fn roots(&self) -> &fs::Roots {
         self.fs.roots()
     }
 
-    /// The files under the roots, and the locks and descriptors the run holds of them.
     pub fn files(&self) -> &Arc<fs::FsHost> {
         &self.fs
     }
 
-    /// The database connections the run holds open.
-    pub fn databases(&self) -> &Arc<sqlite::SqliteHost> {
+    pub fn sqlite_host(&self) -> &Arc<sqlite::SqliteHost> {
         &self.sqlite
     }
 
-    /// The run's own process and the programs it may start, where it was granted either.
     pub fn process(&self) -> Option<&Arc<process::ProcessHost>> {
         self.process.as_ref()
     }
 
-    /// The stop the run listens for, where it listens for one.
     pub fn stop(&self) -> Option<&Arc<Shutdown>> {
         self.shutdown.as_ref()
     }
 
-    /// The run's trace and the sink it writes to.
     pub fn tracing(&self) -> &Arc<trace::Trace> {
         &self.trace
     }
@@ -269,11 +226,9 @@ impl HostRuntime for Facilities {
         Some(self)
     }
 
-    /// Ends at a stop too, which an idle service sees no other way.
     fn park(&self) -> Result<(), Diagnostic> {
         let stopped = self.stopping();
         let stop = || self.stopping() != stopped;
-        // A drain parks in bounded steps, so its deadline is seen.
         if stopped {
             let bound = signal::DRAIN_POLL;
             self.run.park(Some(bound), &stop);
@@ -296,7 +251,6 @@ impl HostRuntime for Facilities {
         };
         let mut bound = std::time::Duration::from_nanos(left);
         let stopped = self.stopping();
-        // A drain parks in bounded steps, so its deadline is seen while every task sleeps.
         if stopped {
             bound = bound.min(signal::DRAIN_POLL);
         }
@@ -319,18 +273,12 @@ impl HostRuntime for Facilities {
         ))
     }
 
-    /// The run's own teardown, in a pinned order: the drain deadline governs scheduling and the
-    /// socket pool, so nothing here waits on it.
     fn shutdown(&self) -> ShutdownReport {
-        // However the run ended, it leaves no child running.
         if let Some(process) = &self.process {
             process.end_children();
         }
-        // The sink flushes before the run's own state is gone.
         self.trace.flush();
-        // `term.mode` serves every run, whatever process it was granted.
         crate::stdio::restore_terminal();
-        // Last, since a buffer whose reader has gone ends the process here.
         if let Some(process) = &self.process {
             process.settle();
         }
@@ -345,15 +293,12 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Closes the spans this entry point left open, and warns of them, and the database
-    /// connections it left open, and drops the secrets it read and did not take.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
         self.run.drop_secrets();
         self.sqlite.end_machine(machine);
         self.trace.end_entry_point(machine).into_iter().collect()
     }
 
-    /// Closes the spans the retired task left open.
     fn end_task(&self, machine: MachineId, task: TaskId) {
         self.trace.end_task(machine, task);
     }

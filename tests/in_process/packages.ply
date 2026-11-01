@@ -1,6 +1,3 @@
-//! Packages: path, git and registry dependencies, the judgments over a closure, `ply.lock` and what
-//! it holds a build to, `ply reason`, `ply vendor`, and a library built as a package.
-
 import harness (scratch, on_disk)
 import spawning.harness (RunResult, Source, write_project, write, read, all_output, stdout, stderr,
                          json_of, at, path, str, bool, json_text, WorkingDirectory, assert_ok,
@@ -9,7 +6,6 @@ import std.fs (fs)
 import std.json (Array, Str)
 import std.string
 
-/// app -> lib -> base, with lib using base and a sibling of its own.
 fn graph() -> Unit / {WorkingDirectory, abort.raise} =
   write_project([
     { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
@@ -49,7 +45,7 @@ test "a transitive dependency the importer does not declare is rejected" {
   })
 }
 
-test "a root module may not squat on a dependency's prefix" {
+test "`ply check` fails with E0133 when a module in the root package sits in a directory named like a dependency's module prefix" {
   scratch(|| {
     graph();
     write("app/lib/mine.ply", "fn mine() -> Int = 1\n");
@@ -69,8 +65,7 @@ test "a dependency cycle is rejected naming the cycle" {
   })
 }
 
-// A registry dependency is read from the project's cache, and only `ply resolve` fills it.
-test "a registry dependency nothing fetched says what fetches it" {
+test "`check` rejects an unfetched registry dependency and names `ply resolve` as the command that fetches it" {
   scratch(|| {
     write_project([
       {
@@ -86,18 +81,15 @@ test "a registry dependency nothing fetched says what fetches it" {
     assert_rejected(r, "E0135");
     assert_stderr_contains(r, "`glib` has not been fetched");
     assert_stderr_contains(r, "`ply resolve`");
-    // Resolving needs a registry to ask, and says which variable names it.
     let resolved = on_disk(["resolve"]);
     assert_rejected(resolved, "E0141");
     assert_stderr_contains(resolved, "`PLY_REGISTRY` is not set")
   })
 }
 
-test "a dependency may not reach back into the root package" {
+test "a dependency cannot import a module that exists only in the root package" {
   scratch(|| {
     graph();
-    // `onlyroot` exists only in the root package. A bare import inside a dependency names that
-    // package's own modules and nothing else, so the import finds no module.
     write("app/onlyroot.ply", "fn shared() -> Int = 9\n");
     write("lib/answer.ply", "import onlyroot\npub fn answer() -> Int = onlyroot::shared()\n");
     let r = on_disk(["check", "app"]);
@@ -116,9 +108,6 @@ fn version_text(x: Version) -> String =
     ++ x.patch.to_string()
     ++ "}"
 
-/// `manifest` with a version of its own and a dependency carrying a floor, for the version
-/// judgments. Two manifests asking different floors of one package is legal; two places holding one
-/// package is not.
 fn versioned_manifest(name: String, version: Version, dependencies: String) -> String =
   "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name ++ "\", version: "
     ++ version_text(version)
@@ -131,7 +120,7 @@ fn dependency_at(name: String, floor: Version, at_path: String) -> String =
     ++ at_path
     ++ "\")}"
 
-test "a dependency below the floor its importer asks for is rejected" {
+test "a dependency older than the minimum version its importer requires is rejected" {
   scratch(|| {
     write_project([
       {
@@ -150,17 +139,16 @@ test "a dependency below the floor its importer asks for is rejected" {
     assert_rejected(r, "E0136");
     assert_stderr_contains(r, "is version 0.1.3");
     assert_stderr_contains(r, "at least 0.2.0");
-    // The floor is a floor: the same tree with the dependency at or above it checks.
     write("lib/ply.pkg", versioned_manifest("lib", version_of(0, 2, 0), ""));
     assert_ok(on_disk(["check", "app"]))
   })
 }
 
-test "one package of one name at two places has no version to pick" {
+test "two different packages with the same name in one build are rejected as a version conflict" {
   scratch(|| {
     let sides = [{ side: "left", other: "d1" }, { side: "right", other: "d2" }].fold(
       [],
-      |acc: List<Source>, c: { side: String, other: String }|
+      |accumulator: List<Source>, c: { side: String, other: String }|
         [
           {
             path: c.side ++ "/ply.pkg",
@@ -175,7 +163,7 @@ test "one package of one name at two places has no version to pick" {
             text: "pub fn " ++ c.side ++ "() -> Int = 1\n",
           },
         ].fold(
-          acc,
+          accumulator,
           List::push,
         ),
     );
@@ -210,8 +198,6 @@ test "one package of one name at two places has no version to pick" {
   })
 }
 
-// A file argument's package is its directory: resolving the file pins what that directory's
-// manifest declares, in the lock beside it.
 test "resolving a file writes the lock beside it" {
   scratch(|| {
     graph();
@@ -225,9 +211,7 @@ test "resolving a file writes the lock beside it" {
   })
 }
 
-// `ply resolve` is how a lockfile is written deliberately, after a dependency changed or in a fresh
-// checkout, and `ply reason` says how a package got here.
-test "resolve writes the lock and why names the path to a package" {
+test "`resolve` writes the lock, and `why` prints the chain of dependencies that leads to a package" {
   scratch(|| {
     graph();
     let r = on_disk(["resolve", "app"]);
@@ -236,7 +220,6 @@ test "resolve writes the lock and why names the path to a package" {
     let lock = lock_of("app/ply.lock");
     assert(lock.contains("\"name\":\"lib\""), Some(lock));
     assert(lock.contains("\"name\":\"base\""), Some(lock));
-    // Why: the root's own module reaches `lib`, and `lib`'s reaches `base`.
     let reason = on_disk(["why", "lib", "app"]);
     assert_ok(reason);
     assert(stdout(reason).contains("app -> lib"), Some(stdout(reason)));
@@ -247,14 +230,12 @@ test "resolve writes the lock and why names the path to a package" {
     assert(at(base, "path") == Array([Str("app"), Str("lib"), Str("base")]), Some(json_text(base)));
     assert(!bool(at(base, "root")), Some(json_text(base)));
     assert(str(at(base, "digest")).starts_with("b3:"), Some(json_text(base)));
-    // The root package is what reaches, so its path is itself.
     let app = json_of(on_disk(["why", "app", "app", "--json"]));
     assert(bool(at(app, "root")), Some(json_text(app)));
     assert(at(app, "path") == Array([Str("app")]), Some(json_text(app)));
-    // A name nothing declares is a query that found nothing, not a build failure.
     let nope = on_disk(["why", "nope", "app"]);
     assert_rejected(nope, "E0101");
-    assert_stderr_contains(nope, "is not a package in this closure")
+    assert_stderr_contains(nope, "is not a package in this project's dependencies")
   })
 }
 

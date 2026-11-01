@@ -1,17 +1,3 @@
-//! SQLite databases under the roots `--fs` binds, which `std.sqlite`'s host handler opens and asks
-//! through its natives, each operation a job for the process's waiting pool.
-//!
-//! A connection is a thread that owns its engine and takes one operation at a time, so a
-//! statement waiting on another connection's lock holds no scheduler, and a fold's statement
-//! stays open between its pages without leaving that thread.
-//!
-//! What the natives hand and return is flat. A value is its kind's byte, 0 for null, 1 an integer,
-//! 2 a float and 3 text, each number in eight bytes, the most significant first, and 4 bytes,
-//! then its bytes; a statement's values are parts. Limits are five integers. A failure is parts of
-//! its kind, its name and its detail. A reply is parts: the columns, the rows, each parts of its
-//! values, byte 1 where the statement could have written, the rows it changed, the row id it last
-//! inserted, and its failure found.
-
 use crate::fs::{Roots, confine};
 use crate::jobs::Job;
 use crate::native::{found, int, int_of, parts, parts_of};
@@ -25,14 +11,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// The connections one run holds open at once.
 pub const MAX_CONNECTIONS: usize = 64;
 
-/// What the engine keeps beside a database file.
 const SIDE_FILES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-/// What a connection's thread is asked.
-enum Ask {
+enum WorkerRequest {
     Run {
         sql: String,
         params: Vec<Scalar>,
@@ -57,26 +40,22 @@ enum Response {
 }
 
 struct Command {
-    ask: Ask,
+    ask: WorkerRequest,
     result: Sender<Response>,
 }
 
-/// A connection a run holds open, under the root it was opened under.
 struct Handle {
     root: PathBuf,
     machine: MachineId,
     commands: Sender<Command>,
 }
 
-/// The connections a run holds open, each under the number `sqlite.open` returned. A number is
-/// never returned twice, so one that was closed names nothing afterwards.
 #[derive(Default)]
 struct Connections {
     last: i64,
     open: BTreeMap<i64, Handle>,
 }
 
-/// The connections a run holds open.
 #[derive(Default)]
 pub struct SqliteHost {
     connections: Arc<Mutex<Connections>>,
@@ -87,7 +66,6 @@ impl SqliteHost {
         SqliteHost::default()
     }
 
-    /// Closes every connection `machine` opened and did not close.
     pub fn end_machine(&self, machine: MachineId) {
         let left: Vec<Handle> = {
             let mut held = lock(&self.connections);
@@ -102,15 +80,10 @@ impl SqliteHost {
                 .collect()
         };
         for handle in left {
-            asked(&handle.commands, Ask::Close);
+            asked(&handle.commands, WorkerRequest::Close);
         }
     }
 
-    /// The database at `path` under `root`, opened as `mode` and `options` say on a thread of its
-    /// own: byte 1 and the connection's number, or byte 0 and why it did not open.
-    ///
-    /// # Errors
-    /// `path` leaves `root`.
     pub fn open(
         &self,
         root: PathBuf,
@@ -127,7 +100,7 @@ impl SqliteHost {
                 Some(target) => {
                     match opened(&connections, &root, &target, &path, mode, options, machine) {
                         Ok(id) => [&[1u8][..], &int(id)].concat(),
-                        Err(failure) => [&[0u8][..], &failure_written(&failure)].concat(),
+                        Err(failure) => [&[0u8][..], &encode_failure(&failure)].concat(),
                     }
                 }
                 None => {
@@ -136,14 +109,12 @@ impl SqliteHost {
                         "",
                         format!("`{path}` passes through a symbolic link"),
                     );
-                    [&[0u8][..], &failure_written(&failure)].concat()
+                    [&[0u8][..], &encode_failure(&failure)].concat()
                 }
             })
         }))
     }
 
-    /// Closes a connection, rolling back what it left open: byte 1, or byte 0 for a number that
-    /// names none under `root`.
     pub fn close(&self, root: PathBuf, id: i64) -> Job {
         let connections = Arc::clone(&self.connections);
         Box::new(move || {
@@ -154,12 +125,12 @@ impl SqliteHost {
                     _ => None,
                 }
             };
-            let closed = handle.is_some_and(|handle| asked(&handle.commands, Ask::Close).is_some());
+            let closed = handle
+                .is_some_and(|handle| asked(&handle.commands, WorkerRequest::Close).is_some());
             Ok(vec![u8::from(closed)])
         })
     }
 
-    /// A statement run on a connection, reading only where `reads_only` says: its reply.
     pub fn run(
         &self,
         root: PathBuf,
@@ -169,10 +140,10 @@ impl SqliteHost {
         limits: Limits,
         reads_only: bool,
     ) -> Job {
-        self.replying(
+        self.reply_job(
             root,
             id,
-            Ask::Run {
+            WorkerRequest::Run {
                 sql,
                 params,
                 limits,
@@ -181,12 +152,10 @@ impl SqliteHost {
         )
     }
 
-    /// A step of a connection's transaction: its reply.
     pub fn control(&self, root: PathBuf, id: i64, step: Control) -> Job {
-        self.replying(root, id, Ask::Control(step))
+        self.reply_job(root, id, WorkerRequest::Control(step))
     }
 
-    /// A statement that only reads, opened to be fetched a page at a time: its reply.
     pub fn cursor(
         &self,
         root: PathBuf,
@@ -195,10 +164,10 @@ impl SqliteHost {
         params: Vec<Scalar>,
         limits: Limits,
     ) -> Job {
-        self.replying(
+        self.reply_job(
             root,
             id,
-            Ask::Cursor {
+            WorkerRequest::Cursor {
                 sql,
                 params,
                 limits,
@@ -206,26 +175,19 @@ impl SqliteHost {
         )
     }
 
-    /// The next `rows` rows of the connection's open statement: its reply.
     pub fn fetch(&self, root: PathBuf, id: i64, rows: i64) -> Job {
-        self.replying(root, id, Ask::Fetch(rows))
+        self.reply_job(root, id, WorkerRequest::Fetch(rows))
     }
 
-    /// Ends the connection's open statement: byte 1, or byte 0 where none is open.
     pub fn finish(&self, root: PathBuf, id: i64) -> Job {
         let connections = Arc::clone(&self.connections);
         Box::new(move || {
             let done = commands_of(&connections, &root, id)
-                .and_then(|commands| asked(&commands, Ask::Finish));
+                .and_then(|commands| asked(&commands, WorkerRequest::Finish));
             Ok(vec![u8::from(matches!(done, Some(Response::Done(true))))])
         })
     }
 
-    /// A compacted copy of the database written to `path` under `root`, which holds nothing yet:
-    /// its reply.
-    ///
-    /// # Errors
-    /// `path` leaves `root`.
     pub fn backup(
         &self,
         root: PathBuf,
@@ -238,7 +200,7 @@ impl SqliteHost {
         Ok(Box::new(move || {
             let reply = match to {
                 Some(to) if std::fs::symlink_metadata(&to).is_err() => {
-                    reply_of(&connections, &root, id, Ask::Backup(to))
+                    reply_of(&connections, &root, id, WorkerRequest::Backup(to))
                 }
                 _ => Reply::failed(Failure::new(
                     "exists",
@@ -246,20 +208,16 @@ impl SqliteHost {
                     format!("`{path}` is there already, and a backup writes a new file"),
                 )),
             };
-            Ok(reply_written(&reply))
+            Ok(encode_reply(&reply))
         }))
     }
 
-    fn replying(&self, root: PathBuf, id: i64, ask: Ask) -> Job {
+    fn reply_job(&self, root: PathBuf, id: i64, ask: WorkerRequest) -> Job {
         let connections = Arc::clone(&self.connections);
-        Box::new(move || Ok(reply_written(&reply_of(&connections, &root, id, ask))))
+        Box::new(move || Ok(encode_reply(&reply_of(&connections, &root, id, ask))))
     }
 }
 
-/// Where the databases labelled `label` lie: the root `--fs` bound to that name.
-///
-/// # Errors
-/// No root is bound to it.
 pub fn root_of(roots: &Roots, label: &str, what: &str, span: Span) -> Result<PathBuf, Diagnostic> {
     match roots.get(&Resource::Named(Symbol::new(label))) {
         Some(root) => Ok(root.to_path_buf()),
@@ -267,8 +225,7 @@ pub fn root_of(roots: &Roots, label: &str, what: &str, span: Span) -> Result<Pat
     }
 }
 
-/// The values `flat` writes as parts; `None` for bytes that write none.
-pub fn scalars_read(flat: &[u8]) -> Option<Vec<Scalar>> {
+pub fn decode_scalars(flat: &[u8]) -> Option<Vec<Scalar>> {
     parts_of(flat)?
         .into_iter()
         .map(|scalar| {
@@ -288,8 +245,7 @@ pub fn scalars_read(flat: &[u8]) -> Option<Vec<Scalar>> {
         .collect()
 }
 
-/// The limits `flat` writes, five integers; `None` for bytes that write none.
-pub fn limits_read(flat: &[u8]) -> Option<Limits> {
+pub fn decode_limits(flat: &[u8]) -> Option<Limits> {
     if flat.len() != 40 {
         return None;
     }
@@ -303,7 +259,7 @@ pub fn limits_read(flat: &[u8]) -> Option<Limits> {
     })
 }
 
-fn scalar_written(scalar: &Scalar) -> Vec<u8> {
+fn encode_scalar(scalar: &Scalar) -> Vec<u8> {
     match scalar {
         Scalar::Null => vec![0],
         Scalar::Int(n) => [&[1u8][..], &int(*n)].concat(),
@@ -313,7 +269,7 @@ fn scalar_written(scalar: &Scalar) -> Vec<u8> {
     }
 }
 
-fn failure_written(failure: &Failure) -> Vec<u8> {
+fn encode_failure(failure: &Failure) -> Vec<u8> {
     parts(&[
         failure.kind.as_bytes(),
         failure.name.as_bytes(),
@@ -321,7 +277,7 @@ fn failure_written(failure: &Failure) -> Vec<u8> {
     ])
 }
 
-pub fn reply_written(reply: &Reply) -> Vec<u8> {
+pub fn encode_reply(reply: &Reply) -> Vec<u8> {
     let listed = |each: Vec<Vec<u8>>| {
         let slices: Vec<&[u8]> = each.iter().map(Vec::as_slice).collect();
         parts(&slices)
@@ -337,10 +293,10 @@ pub fn reply_written(reply: &Reply) -> Vec<u8> {
         reply
             .rows
             .iter()
-            .map(|row| listed(row.iter().map(scalar_written).collect()))
+            .map(|row| listed(row.iter().map(encode_scalar).collect()))
             .collect(),
     );
-    let failure = found(reply.failure.as_ref().map(failure_written));
+    let failure = found(reply.failure.as_ref().map(encode_failure));
     parts(&[
         &columns,
         &rows,
@@ -351,15 +307,11 @@ pub fn reply_written(reply: &Reply) -> Vec<u8> {
     ])
 }
 
-/// Where `path` lies under `root`: `None` where a link along it leads anywhere but where it is
-/// spelled, which a database's path may not, and where it leads nowhere.
 fn placed(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
     let spelled = root.join(path);
     Ok(confine(root, path, span)?.filter(|target| *target == spelled))
 }
 
-/// The connection `id` names under `root`. One another root opened is not open under this one,
-/// and returns as a number that names nothing does.
 fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option<Sender<Command>> {
     lock(connections)
         .open
@@ -368,14 +320,13 @@ fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option
         .map(|handle| handle.commands.clone())
 }
 
-/// What a connection's thread returns for `ask`; `None` when the thread is gone.
-fn asked(commands: &Sender<Command>, ask: Ask) -> Option<Response> {
+fn asked(commands: &Sender<Command>, ask: WorkerRequest) -> Option<Response> {
     let (result, returned) = channel();
     commands.send(Command { ask, result }).ok()?;
     returned.recv().ok()
 }
 
-fn reply_of(connections: &Mutex<Connections>, root: &Path, id: i64, ask: Ask) -> Reply {
+fn reply_of(connections: &Mutex<Connections>, root: &Path, id: i64, ask: WorkerRequest) -> Reply {
     match commands_of(connections, root, id).and_then(|commands| asked(&commands, ask)) {
         Some(Response::Reply(reply)) => reply,
         _ => Reply::failed(Failure::new(
@@ -386,9 +337,6 @@ fn reply_of(connections: &Mutex<Connections>, root: &Path, id: i64, ask: Ask) ->
     }
 }
 
-/// The file at `path`, which its caller has confined, opened as `mode` says and handed to the
-/// engine. No part of the path may be a symbolic link, and a statement waits `options.busy_ms`
-/// on another connection's lock.
 fn connect(path: &Path, mode: Mode, options: Options) -> Result<Engine, Failure> {
     let access = match mode {
         Mode::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -401,7 +349,6 @@ fn connect(path: &Path, mode: Mode, options: Options) -> Result<Engine, Failure>
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
     let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(|e| {
         let mut failure = unopened(e);
-        // Where a root lies on this machine is not the program's to read.
         if let Some(words) = failure
             .detail
             .strip_suffix(&format!(": {}", path.display()))
@@ -417,8 +364,6 @@ fn connect(path: &Path, mode: Mode, options: Options) -> Result<Engine, Failure>
     Engine::file(conn, mode, options)
 }
 
-/// The database at `target`, `path` under `root`, opened on a thread of its own: its connection's
-/// number.
 fn opened(
     connections: &Mutex<Connections>,
     root: &Path,
@@ -433,8 +378,6 @@ fn opened(
         name.push(suffix);
         PathBuf::from(name)
     };
-    // The engine opens these by name and follows a link, which would carry its writes wherever
-    // the link leads.
     for suffix in SIDE_FILES {
         if std::fs::symlink_metadata(beside(suffix)).is_ok_and(|meta| meta.is_symlink()) {
             return Err(Failure::new(
@@ -493,34 +436,32 @@ fn opened(
     Ok(id)
 }
 
-/// A connection's thread: one operation at a time until it is closed or its run lets go of it.
 fn serve(mut engine: Engine, commands: Receiver<Command>) {
-    // Whether a fold's statement ran to its end and has not been finished.
     let mut folded = false;
     let mut next: Option<Command> = None;
     while let Some(Command { ask, result }) = next.take().or_else(|| commands.recv().ok()) {
         let said = match ask {
-            Ask::Close => {
+            WorkerRequest::Close => {
                 drop(engine);
                 let _ = result.send(Response::Done(true));
                 return;
             }
-            Ask::Run {
+            WorkerRequest::Run {
                 sql,
                 params,
                 limits,
                 reads_only,
             } => Response::Reply(engine.run(&sql, &params, limits, reads_only)),
-            Ask::Control(step) => Response::Reply(engine.control(step)),
-            Ask::Backup(to) => Response::Reply(engine.backup(&to)),
-            Ask::Fetch(_) if folded => Response::Reply(Reply::default()),
-            Ask::Fetch(_) => Response::Reply(Reply::failed(Failure::new(
+            WorkerRequest::Control(step) => Response::Reply(engine.control(step)),
+            WorkerRequest::Backup(to) => Response::Reply(engine.backup(&to)),
+            WorkerRequest::Fetch(_) if folded => Response::Reply(Reply::default()),
+            WorkerRequest::Fetch(_) => Response::Reply(Reply::failed(Failure::new(
                 "closed",
                 "",
                 "no fold is open on this connection",
             ))),
-            Ask::Finish => Response::Done(std::mem::take(&mut folded)),
-            Ask::Cursor {
+            WorkerRequest::Finish => Response::Done(std::mem::take(&mut folded)),
+            WorkerRequest::Cursor {
                 sql,
                 params,
                 limits,
@@ -528,9 +469,8 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                 let mut waiting = Some(result);
                 let mut opened = false;
                 let mut finished = false;
-                engine.paged(&sql, &params, limits, true, |page| {
+                engine.run_in_pages(&sql, &params, limits, true, |page| {
                     let over = page.ended;
-                    // A statement that did not open leaves no fold to finish.
                     finished = !opened && page.failure.is_some();
                     opened = true;
                     if let Some(to) = waiting.take() {
@@ -543,21 +483,21 @@ fn serve(mut engine: Engine, commands: Receiver<Command>) {
                         match commands.recv() {
                             Err(_) => return None,
                             Ok(Command {
-                                ask: Ask::Fetch(rows),
+                                ask: WorkerRequest::Fetch(rows),
                                 result,
                             }) => {
                                 waiting = Some(result);
                                 return Some(rows.max(0));
                             }
                             Ok(Command {
-                                ask: Ask::Finish,
+                                ask: WorkerRequest::Finish,
                                 result,
                             }) => {
                                 finished = true;
                                 let _ = result.send(Response::Done(true));
                                 return None;
                             }
-                            Ok(close @ Command { ask: Ask::Close, .. }) => {
+                            Ok(close @ Command { ask: WorkerRequest::Close, .. }) => {
                                 finished = true;
                                 next = Some(close);
                                 return None;

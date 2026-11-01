@@ -1,24 +1,21 @@
 use crate::bare::context;
+use crate::unit::ignored_test_command;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{
-    HEADER, Heap, Native, Obj, Word, enter, leave, native_of, poison, poisoning, release_object,
-    word_at,
+    HEADER, Heap, Native, Obj, Word, enter, leave, native_of, poison_freed, poisoning_enabled,
+    release_object, word_at,
 };
 use ply_compiled::rt::Ctx;
 use std::sync::Arc;
 
-/// A block of `payload` bytes past its header, from `h`: its word, which a `Block` is.
 fn block(h: &mut Heap, payload: usize) -> Word {
     unsafe { std::mem::transmute::<Block, Word>(Block::alloc(h, (HEADER + payload) as Word)) }
 }
 
-/// Gives back the block `w` of `payload` bytes past its header to `h`, the heap the entry runs on.
 fn freed(h: &mut Heap, w: Word, payload: usize) {
     unsafe { std::mem::transmute::<Word, Block>(w).free(h, (HEADER + payload) as Word) }
 }
 
-/// What a native object holds in these tests: text, whose count of holders says how many native
-/// objects holding it are not yet dropped.
 pub(super) struct Holding(pub(super) Arc<str>);
 
 impl Native for Holding {
@@ -29,14 +26,13 @@ fn holding(text: &str) -> Box<dyn Native> {
     Box::new(Holding(Arc::from(text)))
 }
 
-/// The text the native object `w` holds.
 fn held_by(w: Word) -> Arc<str> {
     let held = unsafe { native_of::<Holding>(w) }.expect("a native object holding text");
     Arc::clone(&held.0)
 }
 
 #[test]
-fn an_ended_entry_gives_back_what_it_held() {
+fn ending_a_heap_frees_all_its_memory_and_lets_it_allocate_again() {
     let mut h = Heap::new();
     block(&mut h, 8);
     block(&mut h, 200 << 20);
@@ -47,9 +43,8 @@ fn an_ended_entry_gives_back_what_it_held() {
     assert_eq!(h.live(), 1, "an ended heap allocates afresh");
 }
 
-/// A block is its size rounded up by an eighth at most, and a page ends short of one more.
 #[test]
-fn a_heap_holds_little_more_than_its_blocks_take() {
+fn a_heap_reserves_little_more_memory_than_its_blocks_need() {
     let mut h = Heap::new();
     for _ in 0..4096 {
         block(&mut h, 4096);
@@ -61,9 +56,8 @@ fn a_heap_holds_little_more_than_its_blocks_take() {
     assert_eq!(big.held(), (1 << 20) + HEADER);
 }
 
-/// What blocks of one size held serves blocks of another once every block beside them is given back.
 #[test]
-fn memory_one_size_gave_up_serves_another() {
+fn memory_freed_from_blocks_of_one_size_is_reused_for_blocks_of_another_size() {
     let mut h = Heap::new();
     enter(&mut h);
     let small: Vec<Word> = (0..100_000).map(|_| block(&mut h, 8)).collect();
@@ -98,7 +92,7 @@ fn a_block_given_back_is_reused_by_the_next_of_its_size_within_an_entry() {
 }
 
 #[test]
-fn a_dead_native_objects_block_is_the_next_native_objects() {
+fn the_block_of_a_freed_native_object_is_reused_for_the_next_native_object() {
     let mut ctx = context();
     let first = ctx.heap.native(holding("first"));
     release_object(&raw mut ctx, first);
@@ -111,9 +105,8 @@ fn a_dead_native_objects_block_is_the_next_native_objects() {
     assert_eq!(ctx.heap.natives(), 1);
 }
 
-/// The end drops what the table lists, so a block listed twice would drop what it holds twice.
 #[test]
-fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
+fn the_heap_lists_each_live_native_object_once_and_ending_the_heap_frees_each_native_object_once() {
     let mut ctx = context();
     let held: Arc<str> = Arc::from("held");
     let words: Vec<Word> = (0..8)
@@ -144,14 +137,12 @@ fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
         assert!(Arc::ptr_eq(&held_by(words[i]), &held));
     }
 
-    // Out of listing order, so removals move entries into the holes they leave.
     for w in [reused[1], words[6], reused[3], words[1], reused[0]] {
         release_object(&raw mut ctx, w);
     }
     assert_eq!(ctx.heap.natives(), 3);
     assert_eq!(Arc::strong_count(&held), 3);
 
-    // Let go under another context, the block cannot go back to its heap, so it stays listed, dead.
     let mut other = context();
     release_object(&raw mut other, words[5]);
     assert_eq!(ctx.heap.natives(), 3);
@@ -165,24 +156,16 @@ fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
     );
 }
 
-/// Derived, because a filter naming no test runs nothing and exits 0, which reads as a pass.
-fn own_test_name(leaf: &str) -> String {
-    match module_path!().split_once("::") {
-        Some((_binary, module)) => format!("{module}::{leaf}"),
-        None => leaf.to_string(),
-    }
-}
-
-/// `PLY_HEAP_POISON` is read once per process, so the poisoned heap runs in a process of its own.
 #[test]
-fn under_poisoning_a_stale_word_that_reaches_a_reused_native_object_block_is_caught() {
-    let name = own_test_name("a_stale_word_meets_a_reused_native_object_block_poisoned");
-    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
-        .env("PLY_HEAP_POISON", "1")
-        .env_remove("PLY_HEAP_DELAY")
-        .output()
-        .expect("the test binary runs");
+fn with_heap_poisoning_on_using_a_freed_native_object_pointer_after_its_block_is_reused_is_detected()
+ {
+    let out = ignored_test_command(
+        using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poison_values,
+    )
+    .env("PLY_HEAP_POISON", "1")
+    .env_remove("PLY_HEAP_DELAY")
+    .output()
+    .expect("the test binary runs");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -191,15 +174,15 @@ fn under_poisoning_a_stale_word_that_reaches_a_reused_native_object_block_is_cau
     );
     assert!(
         stdout.contains("1 passed"),
-        "the child ran no test matching `{name}`, and a filter that matches nothing exits 0:\n{stdout}"
+        "the child ran no test, and a filter that matches nothing exits 0:\n{stdout}"
     );
 }
 
 #[test]
 #[ignore = "run under `PLY_HEAP_POISON` by the test above"]
 #[should_panic(expected = "a stale read: a block that has died")]
-fn a_stale_word_meets_a_reused_native_object_block_poisoned() {
-    assert!(poisoning(), "`PLY_HEAP_POISON` is not set");
+fn using_a_pointer_to_a_freed_native_object_finds_its_block_overwritten_with_poison_values() {
+    assert!(poisoning_enabled(), "`PLY_HEAP_POISON` is not set");
     let mut ctx = context();
     let stale = ctx.heap.native(holding("first"));
     release_object(&raw mut ctx, stale);
@@ -213,15 +196,14 @@ fn a_stale_word_meets_a_reused_native_object_block_poisoned() {
     let payload = unsafe { word_at(stale as *mut Obj, 1) };
     assert_eq!(
         payload,
-        poison::word(),
+        poison_freed::word(),
         "the dead native object's payload was not poisoned"
     );
     held_by(stale);
 }
 
-/// A block another heap gave out goes back to it, not to the heap of the entry running.
 #[test]
-fn a_block_dying_under_another_heap_goes_back_to_its_own() {
+fn a_block_freed_while_another_heap_is_active_returns_to_the_heap_that_allocated_it() {
     let mut outer = Heap::new();
     let mut inner = Heap::new();
     let made = block(&mut outer, 16);
@@ -239,10 +221,9 @@ fn a_block_dying_under_another_heap_goes_back_to_its_own() {
     outer.end();
 }
 
-/// A branch's blocks are the parent's once it adopts the branch's heap, and the parent keeps
-/// bumping where it was; the branch's native objects join the parent's table after its own.
 #[test]
-fn an_adopted_heap_keeps_its_blocks_and_its_native_objects() {
+fn merging_a_branch_heap_into_a_parent_heap_moves_the_branch_blocks_and_native_objects_into_the_parent()
+ {
     let mut ctx = context();
     block(&mut ctx.heap, 8);
     let own = ctx.heap.native(holding("the parent's"));
@@ -266,7 +247,7 @@ fn an_adopted_heap_keeps_its_blocks_and_its_native_objects() {
 }
 
 #[test]
-fn a_census_tells_blocks_by_the_bytes_past_their_header_most_bytes_first() {
+fn the_heap_census_groups_live_blocks_by_their_size_and_lists_the_group_with_most_bytes_first() {
     let mut h = Heap::new();
     enter(&mut h);
     for _ in 0..3 {
@@ -281,7 +262,7 @@ fn a_census_tells_blocks_by_the_bytes_past_their_header_most_bytes_first() {
 }
 
 #[test]
-fn live_bytes_are_the_blocks_live_values_take_and_a_block_given_back_leaves_them() {
+fn live_bytes_count_the_blocks_of_live_values_and_drop_a_block_once_it_is_freed() {
     let mut h = Heap::new();
     enter(&mut h);
     assert_eq!(h.live_bytes(), 0);

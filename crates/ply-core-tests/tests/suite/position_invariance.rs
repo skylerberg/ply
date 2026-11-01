@@ -1,11 +1,9 @@
-/// One shape, written the two ways.
 struct Pair {
     name: &'static str,
     canonical: &'static str,
     pessimal: &'static str,
 }
 
-/// The members differ only in parameter order: the growing argument moves and nothing else does.
 const CALL_ARG_CANONICAL: &str = r#"
 fn go(i: Int, acc: List<Int>) -> List<Int> =
   if i >= 200 { acc } else { go(i + 1, push(acc, i)) }
@@ -15,7 +13,7 @@ test "the growing argument is last in the call" {
 }
 "#;
 
-const CALL_ARG_PESSIMAL: &str = r#"
+const CALL_ARG_WORST_CASE: &str = r#"
 fn go(acc: List<Int>, i: Int) -> List<Int> =
   if i >= 200 { acc } else { go(push(acc, i), i + 1) }
 
@@ -34,7 +32,7 @@ test "the growing field is last in its literal" {
 }
 "#;
 
-const RECORD_FIELD_PESSIMAL: &str = r#"
+const RECORD_FIELD_WORST_CASE: &str = r#"
 fn go(i: Int, s: {k: Int, out: List<Int>}) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go(i + 1, {out: push(s.out, i), k: s.k + 1}) }
 
@@ -44,8 +42,7 @@ test "the growing field is first in its literal" {
 }
 "#;
 
-/// Field last, record first: the position rule compounds at every enclosing node.
-const COMPOUNDING_PESSIMAL: &str = r#"
+const GROWING_LAST_FIELD_PROGRAM: &str = r#"
 fn go(s: {k: Int, out: List<Int>}, i: Int) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go({k: s.k + 1, out: push(s.out, i)}, i + 1) }
 
@@ -55,7 +52,6 @@ test "the growing field is last and its record is first in the call" {
 }
 "#;
 
-/// The members differ only in how `xs` arrives: a statement binder here, a parameter there.
 const PARAM_VS_LET_CANONICAL: &str = r#"
 fn probe(n: Int) -> Int = {
   let xs = range(0, n);
@@ -72,7 +68,7 @@ test "the accumulator arrives as a let binding" {
 }
 "#;
 
-const PARAM_VS_LET_PESSIMAL: &str = r#"
+const PARAM_VS_LET_WORST_CASE: &str = r#"
 fn inner(xs: List<Int>) -> Int = {
   let t = push(xs, 1);
   let u = 7;
@@ -99,7 +95,7 @@ test "a fold accumulator appended in last position" {
 }
 "#;
 
-const FOLD_CLOSURE_PESSIMAL: &str = r#"
+const FOLD_CLOSURE_WORST_CASE: &str = r#"
 fn keep_first(a: List<Int>, i: Int) -> List<Int> = a
 
 fn build() -> List<Int> = fold(range(0, 200), [], |acc, x| keep_first(push(acc, x), x))
@@ -116,27 +112,27 @@ fn all_pairs() -> Vec<Pair> {
         Pair {
             name: "call argument",
             canonical: CALL_ARG_CANONICAL,
-            pessimal: CALL_ARG_PESSIMAL,
+            pessimal: CALL_ARG_WORST_CASE,
         },
         Pair {
             name: "record field",
             canonical: RECORD_FIELD_CANONICAL,
-            pessimal: RECORD_FIELD_PESSIMAL,
+            pessimal: RECORD_FIELD_WORST_CASE,
         },
         Pair {
             name: "compounding: field last, record first",
             canonical: RECORD_FIELD_CANONICAL,
-            pessimal: COMPOUNDING_PESSIMAL,
+            pessimal: GROWING_LAST_FIELD_PROGRAM,
         },
         Pair {
             name: "let binding against parameter",
             canonical: PARAM_VS_LET_CANONICAL,
-            pessimal: PARAM_VS_LET_PESSIMAL,
+            pessimal: PARAM_VS_LET_WORST_CASE,
         },
         Pair {
             name: "fold closure accumulator",
             canonical: FOLD_CLOSURE_CANONICAL,
-            pessimal: FOLD_CLOSURE_PESSIMAL,
+            pessimal: FOLD_CLOSURE_WORST_CASE,
         },
     ]
 }
@@ -146,7 +142,7 @@ fn digest(src: &str) -> String {
 }
 
 #[test]
-fn the_pairs_are_the_five_shapes_they_say_they_are() {
+fn in_each_pair_the_two_programs_differ_and_no_two_pairs_share_the_same_worst_case_program() {
     let pairs = all_pairs();
     assert_eq!(pairs.len(), EXPECTED_PAIRS, "a pair was lost or gained");
 
@@ -181,7 +177,6 @@ fn the_pairs_are_the_five_shapes_they_say_they_are() {
         .map(|(p, d)| (p.name, d.0.as_str(), d.1.as_str()))
         .collect();
 
-    // The second and third rows share a canonical digest on purpose: only the outer node moved.
     let expected: [(&str, &str, &str); EXPECTED_PAIRS] = [
         ("call argument", "b3:2a168234d2a1", "b3:dc587bf7bfb2"),
         ("record field", "b3:031f75989bca", "b3:a52314fd4b69"),

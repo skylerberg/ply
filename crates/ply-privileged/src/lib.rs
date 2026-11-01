@@ -1,7 +1,3 @@
-//! The families this runtime serves itself, and the binding a program entered from Ply runs under:
-//! what a host may grant by name, the shipped modules, and the binder `std.machine`'s natives bind
-//! with.
-
 pub mod binder;
 pub mod hosts;
 pub mod policy;

@@ -5,9 +5,10 @@ import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, Name
                                     EffectExpression, ReadMode, mode_text)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               EffectSetItem, Cases, SumBody, AliasBody, VariantDefinition,
-                              SpecClause, Binder, EffectSetDefinition, OpDefinition, LawDefinition,
-                              SchemaInstance, SchemaDefinition, SchemaIdentity, schema_named,
-                              schema_guard_name, law_type_variables, NominalBody, ExternBody)
+                              SpecClause, Binder, EffectSetDefinition, OperationDefinition,
+                              LawDefinition, SchemaInstance, SchemaDefinition, SchemaIdentity,
+                              schema_named, schema_guard_name, law_type_variables, NominalBody,
+                              ExternBody)
 import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
                                     UnaryExpression, LambdaExpression, CallExpression, IfExpression,
                                     MatchExpression, BlockExpression, RecordExpression,
@@ -17,7 +18,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, Param, NamedArg, MatchArm, HandleClause,
-                                    HandlerVar, RecordLiteralField, TaggedLiteralExpression, Hole)
+                                    HandlerStateVariable, RecordLiteralField,
+                                    TaggedLiteralExpression, Hole)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
                                  PatternRange, PatternConstructor, PatternRecord, PatternList,
                                  PatternOr, PatternInvalid)
@@ -55,15 +57,15 @@ fn set_table(modules: List<ParsedModule>) -> SetTable / {abort.raise} =
     |table: SetTable, m: Int|
       modules.get(m).module.items.fold(
         { ..table, by_module: table.by_module.push(Map::new()) },
-        |acc: SetTable, item: Item|
+        |accumulator: SetTable, item: Item|
           match item {
             EffectSetItem(d) -> {
-              let mine = acc.by_module.get(m);
+              let mine = accumulator.by_module.get(m);
               match mine.get(d.name.name) {
                 Some(first) ->
                   {
-                    ..acc,
-                    diagnostics: acc.diagnostics.push(
+                    ..accumulator,
+                    diagnostics: accumulator.diagnostics.push(
                       error_at_and(
                         b"E0105",
                         m,
@@ -71,7 +73,7 @@ fn set_table(modules: List<ParsedModule>) -> SetTable / {abort.raise} =
                         Bytes::concat_all([b"duplicate effect set `", d.name.name, b"`"]),
                         b"redefined here",
                         m,
-                        acc.nodes.get(first).definition.name.span,
+                        accumulator.nodes.get(first).definition.name.span,
                         b"first defined here",
                         [b"rename one of them; every effect set in a module needs a distinct name"],
                       ),
@@ -79,9 +81,12 @@ fn set_table(modules: List<ParsedModule>) -> SetTable / {abort.raise} =
                   },
                 None ->
                   {
-                    ..acc,
-                    by_module: acc.by_module.set(m, mine.insert(d.name.name, acc.nodes.len())),
-                    nodes: acc.nodes.push({
+                    ..accumulator,
+                    by_module: accumulator.by_module.set(
+                      m,
+                      mine.insert(d.name.name, accumulator.nodes.len()),
+                    ),
+                    nodes: accumulator.nodes.push({
                       definition: d,
                       module: m,
                       includes: [],
@@ -91,14 +96,14 @@ fn set_table(modules: List<ParsedModule>) -> SetTable / {abort.raise} =
                   },
               }
             },
-            _ -> acc,
+            _ -> accumulator,
           },
       ),
   )
 
-fn unknown_set(resolved: Resolution, m: Int, qname: QName) -> Diagnostic / {abort.raise} = {
+fn unknown_set(resolved: Resolution, m: Int, qualified_name: QName) -> Diagnostic / {abort.raise} = {
   let scope = resolved.scopes.get(m);
-  let n = qname.name.name;
+  let n = qualified_name.name.name;
   let effect_notes = match lookup(scope.bound, EffectSpace, n) {
     Some(_) ->
       [
@@ -111,52 +116,53 @@ fn unknown_set(resolved: Resolution, m: Int, qname: QName) -> Diagnostic / {abor
           n,
           b".write[..]`",
         ]),
-        b"a whole effect is every resource label anywhere in the program, so naming one would let an unrelated module change these effects and therefore this definition's hash",
+        b"a whole effect includes every resource label of that effect in the program, so naming it here would let a change in an unrelated module change this set's effects and this definition's hash",
       ],
     None -> [],
   };
   let named = scope.bound.sets.map(|binding: Binding| binding.name);
   let known = if named.len() == 0 {
-    b"this module names no `effect set`: declare one, or import one by name from the module that declares it `pub`"
+    b"this module names no `effect set`: declare one, or import a `pub` effect set by name from another module"
   } else { b"the sets this module names: ".concat(backticked(named, b", ")) };
   error_at(
     b"E0114",
     m,
-    qname.span,
+    qualified_name.span,
     Bytes::concat_all([b"no `effect set` named `", n, b"` here"]),
     b"neither declared nor imported here",
     effect_notes.push(known),
   )
 }
 
-fn is_diverges_name(qname: QName) -> Bool = qname.module == None && qname.name.name == b"diverges"
+fn is_diverges_name(qualified_name: QName) -> Bool =
+  qualified_name.module == None && qualified_name.name.name == b"diverges"
 
-fn diverges_expression(qname: QName) -> EffectExpression =
+fn diverges_expression(qualified_name: QName) -> EffectExpression =
   {
-    effect_name: qname,
+    effect_name: qualified_name,
     mode: ReadMode,
-    op: None,
+    operation: None,
     resource: None,
     resource_wildcard: false,
     bounded: false,
-    span: qname.span,
+    span: qualified_name.span,
   }
 
 fn set_named(
   resolved: Resolution,
   table: SetTable,
   m: Int,
-  qname: QName,
+  qualified_name: QName,
 ) -> Result<Int, Diagnostic> / {abort.raise} = {
   let scope = resolved.scopes.get(m);
-  let name = qname.name.name;
-  match qname.module {
+  let name = qualified_name.name.name;
+  match qualified_name.module {
     None -> match lookup(scope.bound, SetSpace, name) {
       Some(b) -> match table.by_module.get(b.owner).get(name) {
         Some(id) -> Ok(id),
-        None -> Err(unknown_set(resolved, m, qname)),
+        None -> Err(unknown_set(resolved, m, qualified_name)),
       },
-      None -> Err(unknown_set(resolved, m, qname)),
+      None -> Err(unknown_set(resolved, m, qualified_name)),
     },
     Some(binder) -> match find_module_binding(scope.modules, binder.name) {
       None ->
@@ -164,7 +170,7 @@ fn set_named(
           error_at(
             b"E0114",
             m,
-            qname.span,
+            qualified_name.span,
             Bytes::concat_all([b"no module is imported as `", binder.name, b"`"]),
             b"not a module imported by this file",
             [b"import the module that declares the set, or import the set by name"],
@@ -180,7 +186,7 @@ fn set_named(
               error_at(
                 b"E0114",
                 m,
-                qname.span,
+                qualified_name.span,
                 Bytes::concat_all([
                   b"module `",
                   module,
@@ -200,11 +206,13 @@ fn set_named(
             )
           },
           Some(d) -> if !d.public && mb.target != m {
-            Err(private_name_error(m, qname.span, mb.target, d.span, SetSpace, name, module))
+            Err(
+              private_name_error(m, qualified_name.span, mb.target, d.span, SetSpace, name, module),
+            )
           } else {
             match table.by_module.get(mb.target).get(name) {
               Some(id) -> Ok(id),
-              None -> Err(unknown_set(resolved, m, qname)),
+              None -> Err(unknown_set(resolved, m, qualified_name)),
             }
           },
         }
@@ -214,20 +222,20 @@ fn set_named(
 }
 
 fn set_includes(resolved: Resolution, table: SetTable) -> SetTable / {abort.raise} =
-  range(0, table.nodes.len()).fold(table, |acc: SetTable, id: Int| {
-    let node = acc.nodes.get(id);
+  range(0, table.nodes.len()).fold(table, |accumulator: SetTable, id: Int| {
+    let node = accumulator.nodes.get(id);
     let walked = node.definition.includes.fold(
-      { diagnostics: acc.diagnostics, xs: [] },
-      |w: { diagnostics: List<Diagnostic>, xs: List<Option<Int>> }, qname: QName|
-        match set_named(resolved, acc, node.module, qname) {
+      { diagnostics: accumulator.diagnostics, xs: [] },
+      |w: { diagnostics: List<Diagnostic>, xs: List<Option<Int>> }, qualified_name: QName|
+        match set_named(resolved, accumulator, node.module, qualified_name) {
           Ok(i) -> { ..w, xs: w.xs.push(Some(i)) },
           Err(d) -> { diagnostics: w.diagnostics.push(d), xs: w.xs.push(None) },
         },
     );
     {
-      ..acc,
+      ..accumulator,
       diagnostics: walked.diagnostics,
-      nodes: acc.nodes.set(id, { ..node, includes: walked.xs }),
+      nodes: accumulator.nodes.set(id, { ..node, includes: walked.xs }),
     }
   })
 
@@ -240,7 +248,8 @@ type SetSearch = {
 
 fn set_cycles(table: SetTable) -> SetTable / {abort.raise} = {
   let n = table.nodes.len();
-  let steps = table.nodes.fold(0, |acc: Int, node: SetNode| acc + node.includes.len());
+  let steps = table.nodes.fold(0, |accumulator: Int, node: SetNode|
+    accumulator + node.includes.len());
   let start: SetSearch = {
     visit_state: range(0, n).map(|i: Int| 0),
     path: [],
@@ -331,7 +340,7 @@ fn set_cycle(table: SetTable, cycle: List<Int>) -> Diagnostic / {abort.raise} = 
     ),
     [
       b"the cycle is ".concat(backticked(names, b" -> ")),
-      b"expansion is a fixed point, and a cycle has none: break it by inlining the effects one of these sets needs",
+      b"an effect set cannot include itself through a cycle of sets: break the cycle by writing the effects directly in one of the sets on the cycle",
     ],
   )
 }
@@ -339,22 +348,22 @@ fn set_cycle(table: SetTable, cycle: List<Int>) -> Diagnostic / {abort.raise} = 
 fn effect_owner(
   resolved: Resolution,
   home: Int,
-  qname: QName,
+  qualified_name: QName,
 ) -> Option<{ target: Int, name: Bytes }> / {abort.raise} = {
   let scope = resolved.scopes.get(home);
-  match qname.module {
+  match qualified_name.module {
     Some(b) -> match find_module_binding(scope.modules, b.name) {
       Some(mb) -> match lookup_declared(
           resolved.declarations.get(mb.target),
           EffectSpace,
-          qname.name.name,
+          qualified_name.name.name,
         ) {
-        Some(_) -> Some({ target: mb.target, name: qname.name.name }),
+        Some(_) -> Some({ target: mb.target, name: qualified_name.name.name }),
         None -> None,
       },
       None -> None,
     },
-    None -> match lookup(scope.bound, EffectSpace, qname.name.name) {
+    None -> match lookup(scope.bound, EffectSpace, qualified_name.name.name) {
       Some(b) -> Some({ target: b.owner, name: b.name }),
       None -> None,
     },
@@ -375,7 +384,7 @@ fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise} = {
     b" ",
     mode_text(a.mode),
     b" ",
-    match a.op { Some(o) -> o.name, None -> b"" },
+    match a.operation { Some(o) -> o.name, None -> b"" },
     b" ",
     if a.resource_wildcard { b"*" } else { match a.resource { Some(x) -> x.name, None -> b"" } },
   ])
@@ -385,24 +394,29 @@ type KeyedMember = { key: Bytes, member: Member }
 
 fn insert_keyed(sorted: List<KeyedMember>, k: KeyedMember) -> List<KeyedMember> / {abort.raise} = {
   let n = sorted.len();
-  let i = range(0, n).fold(n, |acc: Int, j: Int|
-    if acc < n { acc } else if compare(k.key, sorted.get(j).key) == Less { j } else { acc });
-  sorted.drop(i).fold(sorted.take(i).push(k), |acc: List<KeyedMember>, x: KeyedMember| acc.push(x))
+  let i = range(0, n).fold(n, |accumulator: Int, j: Int|
+    if accumulator < n { accumulator }
+    else if compare(k.key, sorted.get(j).key) == Less { j }
+    else { accumulator });
+  sorted.drop(i).fold(sorted.take(i).push(k), |accumulator: List<KeyedMember>, x: KeyedMember|
+    accumulator.push(x))
 }
 
 fn canonical_members(resolved: Resolution, xs: List<Member>) -> List<Member> / {abort.raise} = {
-  let sorted = xs.fold([], |acc: List<KeyedMember>, member: Member|
-    insert_keyed(acc, { key: member_key(resolved, member), member: member }));
-  sorted.fold([], |acc: List<KeyedMember>, keyed: KeyedMember|
-    if acc.len() > 0 && acc.get(acc.len() - 1).key == keyed.key { acc }
-    else { acc.push(keyed) }).map(|keyed: KeyedMember| keyed.member)
+  let sorted = xs.fold([], |accumulator: List<KeyedMember>, member: Member|
+    insert_keyed(accumulator, { key: member_key(resolved, member), member: member }));
+  sorted.fold([], |accumulator: List<KeyedMember>, keyed: KeyedMember|
+    if accumulator.len() > 0 && accumulator.get(accumulator.len() - 1).key == keyed.key {
+      accumulator
+    } else { accumulator.push(keyed) }).map(|keyed: KeyedMember| keyed.member)
 }
 
 type SetWork = { t: SetTable, done: List<Bool>, work: List<{ node: Int, visited: Bool }> }
 
 fn set_expand_all(resolved: Resolution, table: SetTable) -> SetTable / {abort.raise} = {
   let n = table.nodes.len();
-  let steps = table.nodes.fold(0, |acc: Int, node: SetNode| acc + node.includes.len());
+  let steps = table.nodes.fold(0, |accumulator: Int, node: SetNode|
+    accumulator + node.includes.len());
   let start: SetWork = { t: table, done: range(0, n).map(|i: Int| false), work: [] };
   let finished = range(0, n).fold(start, |x: SetWork, root: Int|
     if x.done.get(root) || x.t.nodes.get(root).cyclic { x } else {
@@ -431,11 +445,12 @@ fn set_expand_step(resolved: Resolution, x: SetWork) -> SetWork / {abort.raise} 
   } else {
     let own = node.definition.listed.map(|entry: EffectExpression|
       { entry: entry, defining_module: node.module });
-    let all = node.includes.fold(own, |acc: List<Member>, e: Option<Int>|
+    let all = node.includes.fold(own, |accumulator: List<Member>, e: Option<Int>|
       match e {
         Some(i) ->
-          x.t.nodes.get(i).members.fold(acc, |ms: List<Member>, member: Member| ms.push(member)),
-        None -> acc,
+          x.t.nodes.get(i).members.fold(accumulator, |ms: List<Member>, member: Member|
+            ms.push(member)),
+        None -> accumulator,
       });
     {
       ..x,
@@ -460,7 +475,10 @@ fn effect_with_span(entry: EffectExpression, span: Span) -> EffectExpression =
       span: span,
     },
     mode: entry.mode,
-    op: match entry.op { Some(o) -> Some({ name: o.name, span: span }), None -> None },
+    operation: match entry.operation {
+      Some(o) -> Some({ name: o.name, span: span }),
+      None -> None,
+    },
     resource: match entry.resource { Some(x) -> Some({ name: x.name, span: span }), None -> None },
     resource_wildcard: entry.resource_wildcard,
     bounded: entry.bounded,
@@ -509,7 +527,7 @@ type EffectsExpander = {
   resolved: Resolution,
   table: SetTable,
   module: Int,
-  reached: List<ModuleBinding>,
+  bindings: List<ModuleBinding>,
   diagnostics: List<Diagnostic>,
   rows: Int,
 }
@@ -525,7 +543,10 @@ fn without_node_ids(a: EffectExpression) -> EffectExpression =
       name: { ..a.effect_name.name, span: { ..a.effect_name.name.span, site: 0 } },
       span: { ..a.effect_name.span, site: 0 },
     },
-    op: match a.op { Some(o) -> Some({ ..o, span: { ..o.span, site: 0 } }), None -> None },
+    operation: match a.operation {
+      Some(o) -> Some({ ..o, span: { ..o.span, site: 0 } }),
+      None -> None,
+    },
   }
 
 type ExpandedEffects = { expander: EffectsExpander, r: EffectsExpression }
@@ -537,30 +558,41 @@ fn expand_effects(
   if effects.aliases.len() == 0 { { expander: expander, r: effects } } else {
     let o = effects.aliases.fold(
       { expander: expander, listed: effects.listed },
-      |acc: { expander: EffectsExpander, listed: List<EffectExpression> }, qname: QName|
-        if is_diverges_name(qname) {
-          { ..acc, listed: acc.listed.push(without_node_ids(diverges_expression(qname))) }
+      |accumulator: { expander: EffectsExpander, listed: List<EffectExpression> }, qualified_name: QName|
+        if is_diverges_name(qualified_name) {
+          {
+            ..accumulator,
+            listed: accumulator.listed.push(without_node_ids(diverges_expression(qualified_name))),
+          }
         } else {
-          match set_named(acc.expander.resolved, acc.expander.table, acc.expander.module, qname) {
+          match set_named(
+              accumulator.expander.resolved,
+              accumulator.expander.table,
+              accumulator.expander.module,
+              qualified_name,
+            ) {
             Err(d) ->
               {
-                ..acc,
-                expander: { ..acc.expander, diagnostics: acc.expander.diagnostics.push(d) },
+                ..accumulator,
+                expander: {
+                  ..accumulator.expander,
+                  diagnostics: accumulator.expander.diagnostics.push(d),
+                },
               },
             Ok(id) ->
-              acc.expander.table.nodes.get(id).members.fold(
-                acc,
+              accumulator.expander.table.nodes.get(id).members.fold(
+                accumulator,
                 |a: { expander: EffectsExpander, listed: List<EffectExpression> }, member: Member| {
                   let u = localize_member(
                     a.expander.resolved,
                     a.expander.module,
                     member,
-                    qname.span,
+                    qualified_name.span,
                   );
                   {
                     expander: {
                       ..a.expander,
-                      reached: add_binding_once(a.expander.reached, u.bind),
+                      bindings: add_binding_once(a.expander.bindings, u.bind),
                     },
                     listed: a.listed.push(without_node_ids(u.entry)),
                   }
@@ -591,13 +623,13 @@ fn expand_module_sets(
     resolved: resolved,
     table: table,
     module: m,
-    reached: [],
+    bindings: [],
     diagnostics: [],
     rows: 0,
   };
   let walked = parsed.module.items.fold(
     { expander: start, items: [] },
-    |acc: { expander: EffectsExpander, items: List<Item> }, item: Item|
+    |accumulator: { expander: EffectsExpander, items: List<Item> }, item: Item|
       match item {
         EffectSetItem(d) -> match table.by_module.get(m).get(d.name.name) {
           Some(id) -> if table.nodes.get(id).definition.span == d.span {
@@ -605,25 +637,25 @@ fn expand_module_sets(
               localize_member(resolved, m, member, d.name.span));
             {
               expander: {
-                ..acc.expander,
-                reached: us.fold(
-                  acc.expander.reached,
+                ..accumulator.expander,
+                bindings: us.fold(
+                  accumulator.expander.bindings,
                   |bindings: List<ModuleBinding>, u: LocalizedEffect|
                     add_binding_once(bindings, u.bind),
                 ),
               },
-              items: acc.items.push(
+              items: accumulator.items.push(
                 EffectSetItem({ ..d, expansion: us.map(|u: LocalizedEffect| u.entry) }),
               ),
             }
-          } else { { ..acc, items: acc.items.push(item) } },
-          None -> { ..acc, items: acc.items.push(item) },
+          } else { { ..accumulator, items: accumulator.items.push(item) } },
+          None -> { ..accumulator, items: accumulator.items.push(item) },
         },
         _ -> {
-          let o = expand_effects_in_item(acc.expander, item);
+          let o = expand_effects_in_item(accumulator.expander, item);
           {
             expander: o.expander,
-            items: acc.items.push(if o.expander.rows == acc.expander.rows { o.it }
+            items: accumulator.items.push(if o.expander.rows == accumulator.expander.rows { o.it }
             else { numbered_missing(o.it) }),
           }
         },
@@ -660,9 +692,9 @@ fn expand_effects_in_type(
       let o = expand_effects_in_types(expander, c.args);
       let rows = c.effect_arguments.fold(
         { expander: o.expander, rs: [] },
-        |acc: { expander: EffectsExpander, rs: List<EffectsExpression> }, effects: EffectsExpression| {
-          let r = expand_effects(acc.expander, effects);
-          { expander: r.expander, rs: acc.rs.push(r.r) }
+        |accumulator: { expander: EffectsExpander, rs: List<EffectsExpression> }, effects: EffectsExpression| {
+          let r = expand_effects(accumulator.expander, effects);
+          { expander: r.expander, rs: accumulator.rs.push(r.r) }
         },
       );
       {
@@ -672,19 +704,19 @@ fn expand_effects_in_type(
     },
     FunctionTypeExpression(ft) -> {
       let ps = expand_effects_in_types(expander, ft.params);
-      let r = expand_effects_in_type(ps.expander, ft.ret);
+      let r = expand_effects_in_type(ps.expander, ft.return_type);
       let e = expand_optional_effects(r.expander, ft.effects);
       {
         expander: e.expander,
-        t: FunctionTypeExpression({ ..ft, params: ps.ts, ret: r.t, effects: e.r }),
+        t: FunctionTypeExpression({ ..ft, params: ps.ts, return_type: r.t, effects: e.r }),
       }
     },
     RecordTypeExpression(r) -> {
       let fs = r.fields.fold(
         { expander: expander, fs: [] },
-        |acc: { expander: EffectsExpander, fs: List<{ name: Identifier, ty: TypeExpression }> }, fd: { name: Identifier, ty: TypeExpression }| {
-          let o = expand_effects_in_type(acc.expander, fd.ty);
-          { expander: o.expander, fs: acc.fs.push({ name: fd.name, ty: o.t }) }
+        |accumulator: { expander: EffectsExpander, fs: List<{ name: Identifier, ty: TypeExpression }> }, fd: { name: Identifier, ty: TypeExpression }| {
+          let o = expand_effects_in_type(accumulator.expander, fd.ty);
+          { expander: o.expander, fs: accumulator.fs.push({ name: fd.name, ty: o.t }) }
         },
       );
       { expander: fs.expander, t: RecordTypeExpression({ span: r.span, fields: fs.fs }) }
@@ -698,9 +730,9 @@ fn expand_effects_in_types(
 ) -> { expander: EffectsExpander, ts: List<TypeExpression> } / {abort.raise} =
   types.fold(
     { expander: expander, ts: [] },
-    |acc: { expander: EffectsExpander, ts: List<TypeExpression> }, ty: TypeExpression| {
-      let o = expand_effects_in_type(acc.expander, ty);
-      { expander: o.expander, ts: acc.ts.push(o.t) }
+    |accumulator: { expander: EffectsExpander, ts: List<TypeExpression> }, ty: TypeExpression| {
+      let o = expand_effects_in_type(accumulator.expander, ty);
+      { expander: o.expander, ts: accumulator.ts.push(o.t) }
     },
   )
 
@@ -722,9 +754,9 @@ fn expand_effects_in_parameters(
 ) -> { expander: EffectsExpander, ps: List<Param> } / {abort.raise} =
   params.fold(
     { expander: expander, ps: [] },
-    |acc: { expander: EffectsExpander, ps: List<Param> }, param: Param| {
-      let o = expand_effects_in_optional_type(acc.expander, param.ty);
-      { expander: o.expander, ps: acc.ps.push({ ..param, ty: o.t }) }
+    |accumulator: { expander: EffectsExpander, ps: List<Param> }, param: Param| {
+      let o = expand_effects_in_optional_type(accumulator.expander, param.ty);
+      { expander: o.expander, ps: accumulator.ps.push({ ..param, ty: o.t }) }
     },
   )
 
@@ -734,9 +766,9 @@ fn expand_effects_in_expressions(
 ) -> { expander: EffectsExpander, xs: List<Expression> } / {abort.raise} =
   expressions.fold(
     { expander: expander, xs: [] },
-    |acc: { expander: EffectsExpander, xs: List<Expression> }, expression: Expression| {
-      let o = expand_effects_in_expression(acc.expander, expression);
-      { expander: o.expander, xs: acc.xs.push(o.e) }
+    |accumulator: { expander: EffectsExpander, xs: List<Expression> }, expression: Expression| {
+      let o = expand_effects_in_expression(accumulator.expander, expression);
+      { expander: o.expander, xs: accumulator.xs.push(o.e) }
     },
   )
 
@@ -746,9 +778,9 @@ fn expand_effects_in_fields(
 ) -> { expander: EffectsExpander, fs: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { expander: expander, fs: [] },
-    |acc: { expander: EffectsExpander, fs: List<RecordLiteralField> }, field: RecordLiteralField| {
-      let o = expand_effects_in_expression(acc.expander, field.value);
-      { expander: o.expander, fs: acc.fs.push({ name: field.name, value: o.e }) }
+    |accumulator: { expander: EffectsExpander, fs: List<RecordLiteralField> }, field: RecordLiteralField| {
+      let o = expand_effects_in_expression(accumulator.expander, field.value);
+      { expander: o.expander, fs: accumulator.fs.push({ name: field.name, value: o.e }) }
     },
   )
 
@@ -770,20 +802,36 @@ fn expand_effects_in_expression(
 ) -> { expander: EffectsExpander, e: Expression } / {abort.raise} =
   match expression {
     BinaryExpression(b) -> {
-      let l = expand_effects_in_expression(expander, b.lhs);
-      let r = expand_effects_in_expression(l.expander, b.rhs);
-      { expander: r.expander, e: BinaryExpression({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+      let l = expand_effects_in_expression(expander, b.left_operand);
+      let r = expand_effects_in_expression(l.expander, b.right_operand);
+      {
+        expander: r.expander,
+        e: BinaryExpression({
+          span: b.span,
+          operation: b.operation,
+          left_operand: l.e,
+          right_operand: r.e,
+        }),
+      }
     },
     UnaryExpression(u) -> {
       let o = expand_effects_in_expression(expander, u.operand);
-      { expander: o.expander, e: UnaryExpression({ span: u.span, op: u.op, operand: o.e }) }
+      {
+        expander: o.expander,
+        e: UnaryExpression({ span: u.span, operation: u.operation, operand: o.e }),
+      }
     },
     LambdaExpression(l) -> {
       let ps = expand_effects_in_parameters(expander, l.params);
       let b = expand_effects_in_expression(ps.expander, l.body);
       {
         expander: b.expander,
-        e: LambdaExpression({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }),
+        e: LambdaExpression({
+          span: l.span,
+          body: b.e,
+          params: ps.ps,
+          return_clause: l.return_clause,
+        }),
       }
     },
     CallExpression(a) -> {
@@ -791,9 +839,12 @@ fn expand_effects_in_expression(
       let args = expand_effects_in_expressions(callee.expander, a.args);
       let named = a.named.fold(
         { expander: args.expander, ns: [] },
-        |acc: { expander: EffectsExpander, ns: List<NamedArg> }, arg: NamedArg| {
-          let o = expand_effects_in_expression(acc.expander, arg.value);
-          { expander: o.expander, ns: acc.ns.push({ name: arg.name, value: o.e, span: arg.span }) }
+        |accumulator: { expander: EffectsExpander, ns: List<NamedArg> }, arg: NamedArg| {
+          let o = expand_effects_in_expression(accumulator.expander, arg.value);
+          {
+            expander: o.expander,
+            ns: accumulator.ns.push({ name: arg.name, value: o.e, span: arg.span }),
+          }
         },
       );
       {
@@ -817,45 +868,50 @@ fn expand_effects_in_expression(
       }
     },
     MatchExpression(m) -> {
-      let sc = expand_effects_in_expression(expander, m.scrutinee);
+      let scrutinee = expand_effects_in_expression(expander, m.scrutinee);
       let arms = m.arms.fold(
-        { expander: sc.expander, arms: [] },
-        |acc: { expander: EffectsExpander, arms: List<MatchArm> }, arm: MatchArm| {
-          let g = expand_effects_in_optional_expression(acc.expander, arm.guard);
+        { expander: scrutinee.expander, arms: [] },
+        |accumulator: { expander: EffectsExpander, arms: List<MatchArm> }, arm: MatchArm| {
+          let g = expand_effects_in_optional_expression(accumulator.expander, arm.guard);
           let b = expand_effects_in_expression(g.expander, arm.body);
           {
             expander: b.expander,
-            arms: acc.arms.push({ pattern: arm.pattern, guard: g.e, body: b.e, span: arm.span }),
+            arms: accumulator.arms.push({
+              pattern: arm.pattern,
+              guard: g.e,
+              body: b.e,
+              span: arm.span,
+            }),
           }
         },
       );
       {
         expander: arms.expander,
-        e: MatchExpression({ span: m.span, scrutinee: sc.e, arms: arms.arms }),
+        e: MatchExpression({ span: m.span, scrutinee: scrutinee.e, arms: arms.arms }),
       }
     },
     BlockExpression(b) -> {
       let statements = b.statements.fold(
         { expander: expander, ss: [] },
-        |acc: { expander: EffectsExpander, ss: List<Statement> }, stmt: Statement|
-          match stmt {
+        |accumulator: { expander: EffectsExpander, ss: List<Statement> }, statement: Statement|
+          match statement {
             LetStatement(l) -> {
-              let t = expand_effects_in_optional_type(acc.expander, l.ty);
+              let t = expand_effects_in_optional_type(accumulator.expander, l.ty);
               let v = expand_effects_in_expression(t.expander, l.value);
               {
                 expander: v.expander,
-                ss: acc.ss.push(
+                ss: accumulator.ss.push(
                   LetStatement({ span: l.span, pattern: l.pattern, ty: t.t, value: v.e }),
                 ),
               }
             },
             LetElseStatement(l) -> {
-              let t = expand_effects_in_optional_type(acc.expander, l.ty);
+              let t = expand_effects_in_optional_type(accumulator.expander, l.ty);
               let v = expand_effects_in_expression(t.expander, l.value);
               let fb = expand_effects_in_expression(v.expander, l.fallback);
               {
                 expander: fb.expander,
-                ss: acc.ss.push(
+                ss: accumulator.ss.push(
                   LetElseStatement({
                     span: l.span,
                     pattern: l.pattern,
@@ -867,19 +923,22 @@ fn expand_effects_in_expression(
               }
             },
             ExpressionStatement(x) -> {
-              let o = expand_effects_in_expression(acc.expander, x);
-              { expander: o.expander, ss: acc.ss.push(ExpressionStatement(o.e)) }
+              let o = expand_effects_in_expression(accumulator.expander, x);
+              { expander: o.expander, ss: accumulator.ss.push(ExpressionStatement(o.e)) }
             },
             AssignmentStatement(x) -> {
-              let o = expand_effects_in_expression(acc.expander, x.value);
-              { expander: o.expander, ss: acc.ss.push(AssignmentStatement({ ..x, value: o.e })) }
+              let o = expand_effects_in_expression(accumulator.expander, x.value);
+              {
+                expander: o.expander,
+                ss: accumulator.ss.push(AssignmentStatement({ ..x, value: o.e })),
+              }
             },
           },
       );
-      let tl = expand_effects_in_optional_expression(statements.expander, b.tail);
+      let tail = expand_effects_in_optional_expression(statements.expander, b.tail);
       {
-        expander: tl.expander,
-        e: BlockExpression({ span: b.span, tail: tl.e, statements: statements.ss }),
+        expander: tail.expander,
+        e: BlockExpression({ span: b.span, tail: tail.e, statements: statements.ss }),
       }
     },
     RecordExpression(r) -> {
@@ -910,31 +969,31 @@ fn expand_effects_in_expression(
         e: PerformExpression({
           span: p.span,
           effect_name: p.effect_name,
-          op: p.op,
+          operation: p.operation,
           resource: p.resource,
           args: o.xs,
         }),
       }
     },
     HandleExpression(h) -> {
-      let vs = h.vars.fold(
+      let vs = h.handler_variables.fold(
         { expander: expander, vs: [] },
-        |acc: { expander: EffectsExpander, vs: List<HandlerVar> }, v: HandlerVar| {
-          let t = expand_effects_in_optional_type(acc.expander, v.ty);
+        |accumulator: { expander: EffectsExpander, vs: List<HandlerStateVariable> }, v: HandlerStateVariable| {
+          let t = expand_effects_in_optional_type(accumulator.expander, v.ty);
           let i = expand_effects_in_expression(t.expander, v.init);
-          { expander: i.expander, vs: acc.vs.push({ ..v, ty: t.t, init: i.e }) }
+          { expander: i.expander, vs: accumulator.vs.push({ ..v, ty: t.t, init: i.e }) }
         },
       );
       let b = expand_effects_in_expression(vs.expander, h.body);
       let cs = h.clauses.fold(
         { expander: b.expander, classes: [] },
-        |acc: { expander: EffectsExpander, classes: List<HandleClause> }, c: HandleClause| {
-          let o = expand_effects_in_expression(acc.expander, c.body);
+        |accumulator: { expander: EffectsExpander, classes: List<HandleClause> }, c: HandleClause| {
+          let o = expand_effects_in_expression(accumulator.expander, c.body);
           {
             expander: o.expander,
-            classes: acc.classes.push({
+            classes: accumulator.classes.push({
               effect_name: c.effect_name,
-              op: c.op,
+              operation: c.operation,
               resource: c.resource,
               wildcard_label: c.wildcard_label,
               label_binder: c.label_binder,
@@ -946,11 +1005,14 @@ fn expand_effects_in_expression(
           }
         },
       );
-      let r = match h.ret {
+      let r = match h.return_clause {
         None -> { expander: cs.expander, r: None },
-        Some(rc) -> {
-          let o = expand_effects_in_expression(cs.expander, rc.body);
-          { expander: o.expander, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
+        Some(return_clause) -> {
+          let o = expand_effects_in_expression(cs.expander, return_clause.body);
+          {
+            expander: o.expander,
+            r: Some({ binder: return_clause.binder, body: o.e, span: return_clause.span }),
+          }
         },
       };
       {
@@ -958,9 +1020,9 @@ fn expand_effects_in_expression(
         e: HandleExpression({
           span: h.span,
           body: b.e,
-          ret: r.r,
+          return_clause: r.r,
           clauses: cs.classes,
-          vars: vs.vs,
+          handler_variables: vs.vs,
         }),
       }
     },
@@ -988,9 +1050,9 @@ fn expand_effects_in_expression(
     TaggedLiteralExpression(t) -> {
       let filled = t.holes.fold(
         { expander: expander, holes: [] },
-        |acc: { expander: EffectsExpander, holes: List<Hole> }, h: Hole| {
-          let o = expand_effects_in_expression(acc.expander, h.value);
-          { expander: o.expander, holes: acc.holes.push({ ..h, value: o.e }) }
+        |accumulator: { expander: EffectsExpander, holes: List<Hole> }, h: Hole| {
+          let o = expand_effects_in_expression(accumulator.expander, h.value);
+          { expander: o.expander, holes: accumulator.holes.push({ ..h, value: o.e }) }
         },
       );
       { expander: filled.expander, e: TaggedLiteralExpression({ ..t, holes: filled.holes }) }
@@ -1005,15 +1067,15 @@ fn expand_effects_in_item(
   match item {
     FunctionItem(d) -> {
       let ps = expand_effects_in_parameters(expander, d.params);
-      let r = expand_effects_in_optional_type(ps.expander, d.ret);
+      let r = expand_effects_in_optional_type(ps.expander, d.return_type);
       let ef = expand_optional_effects(r.expander, d.effects);
       let spec = d.spec.fold(
         { expander: ef.expander, xs: [] },
-        |acc: { expander: EffectsExpander, xs: List<SpecClause> }, clause: SpecClause| {
-          let o = expand_effects_in_expression(acc.expander, clause.expression);
+        |accumulator: { expander: EffectsExpander, xs: List<SpecClause> }, clause: SpecClause| {
+          let o = expand_effects_in_expression(accumulator.expander, clause.expression);
           {
             expander: o.expander,
-            xs: acc.xs.push({ kind: clause.kind, expression: o.e, span: clause.span }),
+            xs: accumulator.xs.push({ kind: clause.kind, expression: o.e, span: clause.span }),
           }
         },
       );
@@ -1032,7 +1094,7 @@ fn expand_effects_in_item(
           name: d.name,
           generics: d.generics,
           params: ps.ps,
-          ret: r.t,
+          return_type: r.t,
           effects: ef.r,
           constraints: d.constraints,
           spec: spec.xs,
@@ -1060,27 +1122,31 @@ fn expand_effects_in_item(
       SumBody(vs) -> {
         let out = vs.fold(
           { expander: expander, vs: [] },
-          |acc: { expander: EffectsExpander, vs: List<VariantDefinition> }, variant: VariantDefinition| {
-            let o = expand_effects_in_types(acc.expander, variant.fields);
-            { expander: o.expander, vs: acc.vs.push({ ..variant, fields: o.ts }) }
+          |accumulator: { expander: EffectsExpander, vs: List<VariantDefinition> }, variant: VariantDefinition| {
+            let o = expand_effects_in_types(accumulator.expander, variant.fields);
+            { expander: o.expander, vs: accumulator.vs.push({ ..variant, fields: o.ts }) }
           },
         );
         { expander: out.expander, it: TypeItem({ ..d, body: SumBody(out.vs) }) }
       },
     },
     EffectItem(d) -> {
-      let ops = d.operations.fold(
+      let operations = d.operations.fold(
         { expander: expander, operations: [] },
-        |acc: { expander: EffectsExpander, operations: List<OpDefinition> }, op: OpDefinition| {
-          let ps = expand_effects_in_types(acc.expander, op.params);
-          let r = expand_effects_in_type(ps.expander, op.ret);
+        |accumulator: { expander: EffectsExpander, operations: List<OperationDefinition> }, operation: OperationDefinition| {
+          let ps = expand_effects_in_types(accumulator.expander, operation.params);
+          let r = expand_effects_in_type(ps.expander, operation.return_type);
           {
             expander: r.expander,
-            operations: acc.operations.push({ ..op, params: ps.ts, ret: r.t }),
+            operations: accumulator.operations.push({
+              ..operation,
+              params: ps.ts,
+              return_type: r.t,
+            }),
           }
         },
       );
-      { expander: ops.expander, it: EffectItem({ ..d, operations: ops.operations }) }
+      { expander: operations.expander, it: EffectItem({ ..d, operations: operations.operations }) }
     },
     TestItem(d) -> {
       let ranged: { expander: EffectsExpander, cases: Option<Cases> } = match d.cases {
@@ -1101,11 +1167,11 @@ fn expand_effects_in_item(
     LawItem(d) -> {
       let bs = d.binders.fold(
         { expander: expander, binders: [] },
-        |acc: { expander: EffectsExpander, binders: List<Binder> }, b: Binder| {
-          let o = expand_effects_in_type(acc.expander, b.ty);
+        |accumulator: { expander: EffectsExpander, binders: List<Binder> }, b: Binder| {
+          let o = expand_effects_in_type(accumulator.expander, b.ty);
           {
             expander: o.expander,
-            binders: acc.binders.push({ name: b.name, ty: o.t, span: b.span }),
+            binders: accumulator.binders.push({ name: b.name, ty: o.t, span: b.span }),
           }
         },
       );
@@ -1133,10 +1199,10 @@ fn fresh_name(
 fn schema_identities(schema: SchemaDefinition) -> List<SchemaIdentity> = {
   let written = law_type_variables(schema.params.concat(schema.binders));
   let arguments = schema.generics.types.filter(|g: Identifier| written.contains(g.name));
-  schema.identities.fold([], |acc: List<SchemaIdentity>, ident: Identifier|
-    match arguments.find_index(|g: Identifier| g.name == ident.name) {
-      Some(position) -> acc.push({ name: ident.name, position: position }),
-      None -> acc,
+  schema.identities.fold([], |accumulator: List<SchemaIdentity>, identity: Identifier|
+    match arguments.find_index(|g: Identifier| g.name == identity.name) {
+      Some(position) -> accumulator.push({ name: identity.name, position: position }),
+      None -> accumulator,
     })
 }
 
@@ -1172,7 +1238,7 @@ fn instantiate_law(
                 b.span,
                 b"declared here",
                 [
-                  b"a schema is declared `law schema name(f: (A) -> B) forall (x: A) { .. }`, and a law over a definition that is not one writes its own binders and body",
+                  b"a schema is declared `law schema name(f: (A) -> B) forall (x: A) { .. }`; a law over something that is not a schema must write its own variables and body",
                 ],
               ),
             ),
@@ -1213,9 +1279,14 @@ fn instantiate_law(
           let schema_at = { ..i.schema.span, site: 0 };
           let through = { name: implicit_binder(home.name), span: schema_at };
           let end = span_between(i.span.end, i.span.end);
-          let names = schema.binders.fold([], |acc: List<Bytes>, binder: Binder|
-            acc.push(
-              fresh_name(binder.name.name, args, acc, i.span.end - i.span.start + acc.len() + 2),
+          let names = schema.binders.fold([], |accumulator: List<Bytes>, binder: Binder|
+            accumulator.push(
+              fresh_name(
+                binder.name.name,
+                args,
+                accumulator,
+                i.span.end - i.span.start + accumulator.len() + 2,
+              ),
             ));
           let given = args.concat(
             names.map(|n: Bytes|
@@ -1283,11 +1354,12 @@ pub fn instantiate_laws(
 ) -> LawInstantiation / {abort.raise} =
   range(0, modules.len()).fold(
     { resolution: r, modules: [], diagnostics: [] },
-    |acc: LawInstantiation, m: Int| {
+    |accumulator: LawInstantiation, m: Int| {
       let mod: ParsedModule = modules.get(m);
-      if !has_schema_law(mod.module) { { ..acc, modules: acc.modules.push(mod) } } else {
+      if !has_schema_law(mod.module) { { ..accumulator, modules: accumulator.modules.push(mod) } }
+      else {
         let walked = mod.module.items.fold(
-          { r: acc.resolution, items: [], diagnostics: acc.diagnostics },
+          { r: accumulator.resolution, items: [], diagnostics: accumulator.diagnostics },
           |w: { r: Resolution, items: List<Item>, diagnostics: List<Diagnostic> }, item: Item|
             match item {
               LawItem(d) -> match d.of {
@@ -1306,7 +1378,10 @@ pub fn instantiate_laws(
         );
         {
           resolution: walked.r,
-          modules: acc.modules.push({ ..mod, module: { ..mod.module, items: walked.items } }),
+          modules: accumulator.modules.push({
+            ..mod,
+            module: { ..mod.module, items: walked.items },
+          }),
           diagnostics: walked.diagnostics,
         }
       }
@@ -1323,16 +1398,16 @@ pub fn expand_sets(r: Resolution, modules: List<ParsedModule>) -> SetExpansion /
   let t = set_expand_all(r, set_cycles(set_includes(r, set_table(modules))));
   range(0, modules.len()).fold(
     { resolution: r, modules: [], diagnostics: t.diagnostics },
-    |acc: SetExpansion, m: Int| {
+    |accumulator: SetExpansion, m: Int| {
       let o = expand_module_sets(r, t, m, modules.get(m));
       {
-        resolution: o.expander.reached.fold(
-          acc.resolution,
+        resolution: o.expander.bindings.fold(
+          accumulator.resolution,
           |rr: Resolution, binding: ModuleBinding|
             add_module_binding(rr, m, binding.binder, binding.target),
         ),
-        modules: acc.modules.push(o.module),
-        diagnostics: concat_diagnostics(acc.diagnostics, o.expander.diagnostics),
+        modules: accumulator.modules.push(o.module),
+        diagnostics: concat_diagnostics(accumulator.diagnostics, o.expander.diagnostics),
       }
     },
   )
@@ -1359,4 +1434,4 @@ pub fn add_module_binding(
 }
 
 pub fn concat_diagnostics(a: List<Diagnostic>, b: List<Diagnostic>) -> List<Diagnostic> =
-  b.fold(a, |acc: List<Diagnostic>, diagnostic: Diagnostic| acc.push(diagnostic))
+  b.fold(a, |accumulator: List<Diagnostic>, diagnostic: Diagnostic| accumulator.push(diagnostic))

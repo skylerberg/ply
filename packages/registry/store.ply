@@ -1,18 +1,3 @@
-//! The registry's tree, under the root `--fs store=DIR` binds: a directory per package holding its
-//! `index.json`, and a directory per version holding the archive, the line naming its digest, and
-//! the interface its publisher cut under each semantics.
-//!
-//!   <name>/index.json
-//!   <name>/<version>/package.plyz
-//!   <name>/<version>/package.plyz.b3
-//!   <name>/<version>/interface/<semantics>
-//!   <name>/<version>/attestation/<semantics>
-//!   .attest/<name>@<version>                 a version published since an attester last ran
-//!
-//! Every write goes through here, and a version is published by the index write that lists it: an
-//! archive the index does not list is one a publish did not finish, and the next publish of that
-//! version writes over it.
-
 import std.fs
 import std.fs (fs)
 import std.json (decode_bytes, error_to_string, to_bytes)
@@ -38,32 +23,25 @@ fn attestation_dir(name: String, version: String) -> String =
 pub fn attestation_path(name: String, version: String, semantics: String) -> String =
   attestation_dir(name, version) ++ "/" ++ semantics
 
-/// Beside the index, so a lock never needs a directory of its own; no route reads it.
 fn lock_path(name: String) -> String = name ++ "/index.lock"
 
-/// A file as the static layout serves it, or `None` for one that is not there.
 pub fn served_file(path: String) -> Option<Bytes> / {fs.read_file[store]} =
   fs.read_file[store](path)
 
-/// The package's index: `None` for a name nothing was published under, `Err` for an index that does
-/// not read, which a write must not paper over with a fresh one.
 pub fn read_index(
   name: String,
 ) -> Result<Option<Index>, String> / {fs.read_file[store], abort.raise} =
   match fs.read_file[store](index_path(name)) {
     None -> Ok(None),
     Some(bytes) -> match decode_bytes(bytes, index_json()) {
-      Err(e) -> Err("`" ++ index_path(name) ++ "` does not read: " ++ error_to_string(e)),
+      Err(e) -> Err("`" ++ index_path(name) ++ "` cannot be decoded: " ++ error_to_string(e)),
       Ok(x) -> Ok(Some(x)),
     },
   }
 
-/// The index with one more version, newest last: publication order, which is what a reader of
-/// the index can rely on, whatever the version numbers say.
 pub fn append_release(index: Index, release: Release) -> Index =
   { ..index, versions: index.versions.push(release) }
 
-/// The index with one version yanked, every other field of every version as it was.
 pub fn yank_release(index: Index, version: Version) -> Index =
   {
     ..index,
@@ -71,17 +49,13 @@ pub fn yank_release(index: Index, version: Version) -> Index =
       if release.version == version { { ..release, yanked: true } } else { release }),
   }
 
-// --- Writing ------------------------------------------------------------------------
-
 pub type StoreError = | Busy | Unreadable(String) | WriteFailed(String) | Exists | Absent
 
-/// Written beside its place and renamed into it, so a reader sees the old file or the new one.
 fn replace_file(path: String, body: Bytes) -> Bool / {fs.write_file[store], fs.rename[store]} = {
   let staged = path ++ ".tmp";
   fs.write_file[store](staged, body) && fs.rename[store](staged, path)
 }
 
-/// One writer of a package at a time, whichever process it is.
 fn with_lock<a | e>(
   name: String,
   f: () -> Result<a, StoreError> / e,
@@ -93,9 +67,6 @@ fn with_lock<a | e>(
     result
   }
 
-/// A version published: the archive and its digest line written, then the index that lists it.
-/// A version the index already lists is rejected unless it is these bytes again, which is the
-/// publish it already holds: a version never changes. `fresh` says whether this one wrote it.
 pub fn save_release(
   name: String,
   release: Release,
@@ -129,8 +100,6 @@ pub fn save_release(
     }
   })
 
-/// The interface of a published version under one semantics. It is a function of the archive and
-/// the semantics, so the same bytes again are the one it holds and other bytes are rejected.
 pub fn save_interface(
   name: String,
   v: Version,
@@ -157,8 +126,6 @@ pub fn save_interface(
       },
     })
 
-/// A published version's attestation under one semantics. A later one stands in for an earlier: an
-/// attester's run of the same version again is its newer word.
 pub fn save_attestation(
   name: String,
   v: Version,
@@ -182,11 +149,8 @@ pub fn save_attestation(
       },
     })
 
-// --- Versions waiting for an attester ---------------------------------------------------
-
 fn pending_dir() -> String = ".attest"
 
-/// A version marked for the attester, which the accept loop starts on it in its turn.
 pub fn mark_pending(
   name: String,
   version: String,
@@ -196,22 +160,20 @@ pub fn mark_pending(
 
 pub type Pending = { name: String, version: String }
 
-/// Every version waiting for the attester, in the order the directory lists them.
 pub fn pending() -> List<Pending> / {fs.list_dir[store]} =
   match fs::listed_names(fs.list_dir[store](pending_dir())) {
     None -> [],
     Some(names) ->
-      names.fold([], |acc: List<Pending>, n: String|
+      names.fold([], |accumulator: List<Pending>, n: String|
         match n.split("@") {
-          [name, version] -> acc.push({ name: name, version: version }),
-          _ -> acc,
+          [name, version] -> accumulator.push({ name: name, version: version }),
+          _ -> accumulator,
         }),
   }
 
 pub fn unmark_pending(p: Pending) -> Bool / {fs.remove[store]} =
   fs.remove[store](pending_dir() ++ "/" ++ p.name ++ "@" ++ p.version)
 
-/// A version yanked. Yanking one already yanked is the same result, and the archive is untouched.
 pub fn yank(
   name: String,
   version: Version,
@@ -229,8 +191,6 @@ pub fn yank(
         },
       },
     })
-
-// --- Tests ------------------------------------------------------------------
 
 fn a_release(version: String) -> Release / {abort.raise} =
   {
@@ -265,7 +225,7 @@ test "a publish writes the archive and its digest line, and the index lists it n
   }
 }
 
-test "a version is published once: the same bytes again are what it stores, other bytes are rejected" {
+test "a version is published once: publishing the same bytes again succeeds without change, and different bytes are rejected" {
   let run = fake::run_in_memory(fs::mem_empty(), || {
     let first = save_release("orders", a_release("0.2.0"), b"two");
     let same = save_release("orders", a_release("0.2.0"), b"two");
@@ -283,7 +243,7 @@ test "a version is published once: the same bytes again are what it stores, othe
   assert_eq(fs::mem_read(run.tree, "orders/0.2.0/package.plyz"), Some(b"two"))
 }
 
-test "an interface is kept beside a published version, once per semantics" {
+test "`save_interface` fails for an unpublished version, and a second save under the same language-rules hash is not stored again" {
   let run = fake::run_in_memory(fs::mem_empty(), || {
     let unpublished = save_interface(
       "orders",
@@ -326,7 +286,7 @@ test "an interface is kept beside a published version, once per semantics" {
   assert_eq(fs::mem_read(run.tree, "orders/0.2.0/interface/s2"), Some(b"later"))
 }
 
-test "a yank sets one field and keeps the archive; a version never published cannot be yanked" {
+test "yanking marks a version as yanked in the index and leaves its archive in place, and an unpublished version cannot be yanked" {
   let run = fake::run_in_memory(fs::mem_empty(), || {
     save_release("orders", a_release("0.1.0"), b"one");
     save_release("orders", a_release("0.2.0"), b"two");

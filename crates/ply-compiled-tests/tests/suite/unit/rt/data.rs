@@ -1,14 +1,10 @@
-//! What a failure compiled code wrote leaves in the context: raised where it says so, which
-//! `abort.raise` handles, and failing the run otherwise.
-
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
 use ply_compiled::heap::Word;
-use ply_compiled::rt::{Ctx, FAILED_PENDING};
+use ply_compiled::rt::{Ctx, FAILED_PENDING_RAISE};
 use ply_core::{Diagnostic, codes};
 
-/// The diagnostic `refuse` leaves in a fresh context.
 fn left(refuse: impl FnOnce(&mut Ctx)) -> Diagnostic {
     let mut ctx = context_of(&[], Vec::new());
     ctx.begin();
@@ -19,7 +15,6 @@ fn left(refuse: impl FnOnce(&mut Ctx)) -> Diagnostic {
     d
 }
 
-/// A `String` read and dropped: what the runtime lifts its message through.
 unsafe extern "C" fn read_text(ctx: *mut Ctx) -> Word {
     let text: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_str"));
     let taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word) =
@@ -46,8 +41,6 @@ static STRING_T: PlyType = PlyType {
 
 type Pending = unsafe extern "C" fn(*mut Ctx, *const PlyType, Word) -> Word;
 
-/// How the context failed once `refuse` ran, a raise it left pending taken as code holding a clause
-/// for `abort.raise` takes it.
 fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
@@ -55,7 +48,7 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
     let failed = unsafe {
         refuse(c);
         let failed = (*c).failed;
-        if failed == FAILED_PENDING {
+        if failed == FAILED_PENDING_RAISE {
             helper::<Pending>("rt_pending_raised")(c, &STRING_T, 0);
             assert_eq!((*c).failed, 0, "the clause handled the raise");
         }
@@ -69,7 +62,6 @@ fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
 
 type Failed = unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word);
 
-/// `rt_failed` of `texts`, the last `notes` and `shown` of which are notes and then values.
 fn failed(ctx: *mut Ctx, raises: Word, texts: &[&[u8]], notes: Word, shown: Word) {
     let words: Vec<Word> = texts
         .iter()
@@ -97,7 +89,7 @@ fn a_failure_compiled_code_wrote_raises_only_where_it_says_to() {
     let texts: [&[u8]; 3] = [b"E0502", b"it failed", b"here"];
     assert_eq!(
         failed_under_a_clause(|c| failed(c, 1, &texts, 0, 0)),
-        FAILED_PENDING
+        FAILED_PENDING_RAISE
     );
     assert_eq!(failed_under_a_clause(|c| failed(c, 0, &texts, 0, 0)), 1);
 }

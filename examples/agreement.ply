@@ -1,12 +1,8 @@
-//! The agreement claim: for any run of operations, `std.db`'s in-memory fake and postgres produce
-//! the same results. `main` checks it over drawn runs against whatever database the run borrows.
 import std.db
 import std.gen
 import std.sql
 import std.db (db)
 import std.gen (Gen)
-
-// --- The fixture ------------------------------------------------------------
 
 pub fn fixture() -> sql::Schema = { tables: [part(), bin()] }
 
@@ -25,8 +21,6 @@ pub fn part() -> sql::Table =
     checks: [{ name: "part_price_check", expression: "price >= 0" }],
   }
 
-/// `id` is supplied by the operation rather than defaulted from a sequence, and that is a decision
-/// about the *claim* rather than about the schema.
 pub fn bin() -> sql::Table =
   {
     name: "bin",
@@ -43,34 +37,29 @@ pub fn bin() -> sql::Table =
     checks: [{ name: "bin_qty_check", expression: "qty >= 0" }],
   }
 
-// --- What is generated ------------------------------------------------------
-
-pub type Op =
+pub type Operation =
   | Insert(Values)
-  | Update(UpdateOp)
-  | Delete(DeleteOp)
-  | Select(SelectOp)
+  | Update(UpdateOperation)
+  | Delete(DeleteOperation)
+  | Select(SelectOperation)
   | Count(Which)
   | Begin(db::Isolation)
   | Commit
   | Abort
 
-/// The fixture's two tables and every column of either, as constructors rather than as strings.
 pub type Which = | Part | Bin
 
 pub type Col = | CSku | CPrice | CTag | CNumber | CId | CQty
 
-/// The four parameter shapes the fixture's columns take.
-pub type Val = | VText(String) | VNum(Decimal) | VInt(Int) | VNull
+pub type Value = | VText(String) | VNum(Decimal) | VInt(Int) | VNull
 
-/// A whole row of either table, in column order.
 pub type Values =
-  | PartVals(String, Decimal, Option<String>, Option<Int>)
-  | BinVals(Int, Option<String>, Option<Int>)
+  | PartValues(String, Decimal, Option<String>, Option<Int>)
+  | BinValues(Int, Option<String>, Option<Int>)
 
-pub type UpdateOp = { table: Which, column: Col, to: Val, where_col: Col, eq: Val }
-pub type DeleteOp = { table: Which, where_col: Col, eq: Val }
-pub type SelectOp = { table: Which, order_by: Col, limit: Int }
+pub type UpdateOperation = { table: Which, column: Col, to: Value, where_col: Col, eq: Value }
+pub type DeleteOperation = { table: Which, where_col: Col, eq: Value }
+pub type SelectOperation = { table: Which, order_by: Col, limit: Int }
 
 pub fn table_name(w: Which) -> String = match w { Part -> "part", Bin -> "bin" }
 
@@ -84,7 +73,7 @@ pub fn col_name(c: Col) -> String =
     CQty -> "qty",
   }
 
-pub fn val_param(v: Val) -> sql::Param =
+pub fn value_parameter(v: Value) -> sql::Param =
   match v {
     VText(s) -> sql::TextParameter(s),
     VNum(d) -> sql::NumericParameter(d),
@@ -99,17 +88,17 @@ fn opt_int(o: Option<Int>) -> sql::Param =
   match o { None -> sql::NullParameter, Some(n) -> sql::IntParameter(n) }
 
 pub fn values_table(v: Values) -> Which =
-  match v { PartVals(_, _, _, _) -> Part, BinVals(_, _, _) -> Bin }
+  match v { PartValues(_, _, _, _) -> Part, BinValues(_, _, _) -> Bin }
 
 pub fn values_params(v: Values) -> List<sql::Param> =
   match v {
-    PartVals(sku, price, tag, n) ->
+    PartValues(sku, price, tag, n) ->
       [sql::TextParameter(sku), sql::NumericParameter(price), opt_text(tag), opt_int(n)],
-    BinVals(id, sku, qty) -> [sql::IntParameter(id), opt_text(sku), opt_int(qty)],
+    BinValues(id, sku, qty) -> [sql::IntParameter(id), opt_text(sku), opt_int(qty)],
   }
 
-pub fn op_table(op: Op) -> Which =
-  match op {
+pub fn operation_table(operation: Operation) -> Which =
+  match operation {
     Insert(v) -> values_table(v),
     Update(o) -> o.table,
     Delete(o) -> o.table,
@@ -120,16 +109,15 @@ pub fn op_table(op: Op) -> Which =
     Abort -> Part,
   }
 
-pub type Rendered = { stmt: sql::Statement, params: List<sql::Param> }
+pub type Rendered = { statement: sql::Statement, params: List<sql::Param> }
 
-/// One text, called once per op, handed to **both** sides unchanged.
-pub fn render(fx: sql::Schema, op: Op) -> Rendered =
-  match op {
+pub fn render(fx: sql::Schema, operation: Operation) -> Rendered =
+  match operation {
     Insert(v) -> {
       let table = table_name(values_table(v));
       let params = values_params(v);
       {
-        stmt: sql::stmt(
+        statement: sql::statement_of(
           "insert into " ++ table ++ " (" ++ commas(column_names(fx, table)) ++ ") values ("
             ++ commas(placeholders(params.len(), 1))
             ++ ")",
@@ -139,23 +127,23 @@ pub fn render(fx: sql::Schema, op: Op) -> Rendered =
     },
     Update(o) ->
       {
-        stmt: sql::stmt(
+        statement: sql::statement_of(
           "update " ++ table_name(o.table) ++ " set " ++ col_name(o.column) ++ " = $1 where "
             ++ col_name(o.where_col)
             ++ " = $2",
         ),
-        params: [val_param(o.to), val_param(o.eq)],
+        params: [value_parameter(o.to), value_parameter(o.eq)],
       },
     Delete(o) ->
       {
-        stmt: sql::stmt(
+        statement: sql::statement_of(
           "delete from " ++ table_name(o.table) ++ " where " ++ col_name(o.where_col) ++ " = $1",
         ),
-        params: [val_param(o.eq)],
+        params: [value_parameter(o.eq)],
       },
     Select(o) ->
       {
-        stmt: sql::stmt(
+        statement: sql::statement_of(
           "select " ++ commas(column_names(fx, table_name(o.table))) ++ " from "
             ++ table_name(o.table)
             ++ " order by "
@@ -165,21 +153,21 @@ pub fn render(fx: sql::Schema, op: Op) -> Rendered =
         ),
         params: [],
       },
-    Count(w) -> { stmt: sql::stmt("select count(*) from " ++ table_name(w)), params: [] },
-    Begin(_) -> { stmt: sql::stmt(""), params: [] },
-    Commit -> { stmt: sql::stmt(""), params: [] },
-    Abort -> { stmt: sql::stmt(""), params: [] },
+    Count(w) ->
+      { statement: sql::statement_of("select count(*) from " ++ table_name(w)), params: [] },
+    Begin(_) -> { statement: sql::statement_of(""), params: [] },
+    Commit -> { statement: sql::statement_of(""), params: [] },
+    Abort -> { statement: sql::statement_of(""), params: [] },
   }
 
-/// The generated key, and the primary key after it.
-fn order_clause(fx: sql::Schema, o: SelectOp) -> String =
+fn order_clause(fx: sql::Schema, o: SelectOperation) -> String =
   commas(concat_keys([col_name(o.order_by)], primary_key(fx, table_name(o.table))))
 
 fn primary_key(fx: sql::Schema, name: String) -> List<String> =
   match find_table(fx.tables, name) { None -> [], Some(t) -> t.primary_key }
 
 fn concat_keys(a: List<String>, b: List<String>) -> List<String> =
-  b.fold(a, |acc: List<String>, x: String| acc.push(x))
+  b.fold(a, |accumulator: List<String>, x: String| accumulator.push(x))
 
 fn column_names(fx: sql::Schema, name: String) -> List<String> =
   match find_table(fx.tables, name) {
@@ -196,17 +184,16 @@ fn placeholders(n: Int, from: Int) -> List<String> =
 type Joined = { started: Bool, out: String }
 
 fn commas(xs: List<String>) -> String =
-  xs.fold({ started: false, out: "" }, |acc: Joined, x: String|
-    if acc.started { { started: true, out: acc.out ++ ", " ++ x } }
+  xs.fold({ started: false, out: "" }, |accumulator: Joined, x: String|
+    if accumulator.started { { started: true, out: accumulator.out ++ ", " ++ x } }
     else { { started: true, out: x } }).out
 
-// --- The domain -------------------------------------------------------------
+pub fn well_formed(fx: sql::Schema, operations: List<Operation>) -> Bool =
+  balanced(operations, 0)
+    && operations.fold(true, |accumulator: Bool, o: Operation| accumulator && typed(fx, o))
 
-pub fn well_formed(fx: sql::Schema, ops: List<Op>) -> Bool =
-  balanced(ops, 0) && ops.fold(true, |acc: Bool, o: Op| acc && typed(fx, o))
-
-fn balanced(ops: List<Op>, depth: Int) -> Bool =
-  match ops {
+fn balanced(operations: List<Operation>, depth: Int) -> Bool =
+  match operations {
     [] -> depth == 0,
     [h, ..t] -> match h {
       Begin(_) -> depth < db::max_savepoints() && balanced(t, depth + 1),
@@ -216,16 +203,12 @@ fn balanced(ops: List<Op>, depth: Int) -> Bool =
     },
   }
 
-/// What the *type* cannot say: that a column belongs to the table the same operation names, and that
-/// a value fits the column it is compared or assigned to.
-fn typed(fx: sql::Schema, op: Op) -> Bool =
-  match op {
+fn typed(fx: sql::Schema, operation: Operation) -> Bool =
+  match operation {
     Insert(_) -> true,
     Update(o) ->
       fits_column(fx, o.table, o.column, o.to) && fits_column(fx, o.table, o.where_col, o.eq),
     Delete(o) -> fits_column(fx, o.table, o.where_col, o.eq),
-    // A generated `ORDER BY` may name any column of the table, because `render` appends the primary
-    // key.
     Select(o) ->
       has_column(fx, o.table, o.order_by) && o.limit >= 0
         && primary_key(fx, table_name(o.table)).len() > 0,
@@ -235,12 +218,12 @@ fn typed(fx: sql::Schema, op: Op) -> Bool =
     Abort -> true,
   }
 
-fn fits_column(fx: sql::Schema, table: Which, column: Col, v: Val) -> Bool =
+fn fits_column(fx: sql::Schema, table: Which, column: Col, v: Value) -> Bool =
   match find_table(fx.tables, table_name(table)) {
     None -> false,
     Some(t) -> match find_column(t.columns, col_name(column)) {
       None -> false,
-      Some(c) -> param_fits(c, val_param(v)),
+      Some(c) -> param_fits(c, value_parameter(v)),
     },
   }
 
@@ -253,8 +236,6 @@ fn has_column(fx: sql::Schema, table: Which, column: Col) -> Bool =
 fn find_column(cs: List<sql::Column>, n: String) -> Option<sql::Column> =
   match cs { [] -> None, [h, ..t] -> if h.name == n { Some(h) } else { find_column(t, n) } }
 
-/// A `NULL` fits any column: whether it is rejected is the not-null constraint's business and the
-/// claim very much does have an opinion about that.
 fn param_fits(c: sql::Column, v: sql::Param) -> Bool =
   match v {
     sql::NullParameter -> true,
@@ -272,83 +253,83 @@ fn param_fits(c: sql::Column, v: sql::Param) -> Bool =
     sql::ArrayParameter(_) -> match c.ty { sql::TArray(_) -> true, _ -> false },
   }
 
-// --- The two sides ----------------------------------------------------------
-
 type Replay = { db: db::MemDb, out: List<sql::QueryResult> }
 
-pub fn replay_memory(fx: sql::Schema, ops: List<Op>) -> List<sql::QueryResult> / {abort.raise} =
-  ops.fold({ db: db::open(fx), out: [] }, |acc: Replay, o: Op| memory_step(fx, acc, o)).out
+pub fn replay_memory(
+  fx: sql::Schema,
+  operations: List<Operation>,
+) -> List<sql::QueryResult> / {abort.raise} =
+  operations.fold({ db: db::open(fx), out: [] }, |accumulator: Replay, o: Operation|
+    memory_step(fx, accumulator, o)).out
 
-fn memory_step(fx: sql::Schema, acc: Replay, op: Op) -> Replay / {abort.raise} =
-  match op {
+fn memory_step(
+  fx: sql::Schema,
+  accumulator: Replay,
+  operation: Operation,
+) -> Replay / {abort.raise} =
+  match operation {
     Begin(level) -> {
-      let r = db::begin_step(acc.db, level, db::ReadWrite);
-      { db: r.db, out: acc.out.push(r.out) }
+      let r = db::begin_step(accumulator.db, level, db::ReadWrite);
+      { db: r.db, out: accumulator.out.push(r.out) }
     },
     Commit -> {
-      let r = db::commit_step(acc.db);
-      { db: r.db, out: acc.out.push(r.out) }
+      let r = db::commit_step(accumulator.db);
+      { db: r.db, out: accumulator.out.push(r.out) }
     },
     Abort -> {
-      let r = db::abort_step(acc.db);
-      { db: r.db, out: acc.out.push(r.out) }
+      let r = db::abort_step(accumulator.db);
+      { db: r.db, out: accumulator.out.push(r.out) }
     },
     _ -> {
-      let rendered = render(fx, op);
-      let r = db::step(acc.db, rendered.stmt, rendered.params);
-      { db: r.db, out: acc.out.push(r.out) }
+      let rendered = render(fx, operation);
+      let r = db::step(accumulator.db, rendered.statement, rendered.params);
+      { db: r.db, out: accumulator.out.push(r.out) }
     },
   }
 
-/// The other side of the claim.
 pub fn replay_live(
-  ops: List<Op>,
+  operations: List<Operation>,
 ) -> List<sql::QueryResult> / {db.write, db.read[part], db.write[part], db.read[bin], db.write[bin]} = {
   reset_live();
-  ops.fold([], |acc: List<sql::QueryResult>, o: Op| acc.push(live_step(o)))
+  operations.fold([], |accumulator: List<sql::QueryResult>, o: Operation|
+    accumulator.push(live_step(o)))
 }
 
-/// The live side starts where `db::open(fixture())` starts, and it has to be said out loud because
-/// the database design does not say it: `replay_memory` builds a fresh `MemDb` per case and postgres does
-/// not forget between them, so without this the claim fails at the second case by rows the first
-/// one committed — a divergence that is an artefact of the harness rather than a defect in either
-/// side.
 fn reset_live() -> Unit / {db.write[part], db.write[bin]} = {
-  db.execute[bin](sql::stmt("delete from bin"), []);
-  db.execute[part](sql::stmt("delete from part"), []);
+  db.execute[bin](sql::statement_of("delete from bin"), []);
+  db.execute[part](sql::statement_of("delete from part"), []);
   ()
 }
 
 fn live_step(
-  op: Op,
+  operation: Operation,
 ) -> sql::QueryResult / {db.write, db.read[part], db.write[part], db.read[bin], db.write[bin]} =
-  match op {
+  match operation {
     Begin(level) -> db.begin(level, db::ReadWrite),
     Commit -> db.commit(),
     Abort -> db.abort(),
-    Insert(v) -> live_write(values_table(v), render(fixture(), op)),
-    Update(o) -> live_write(o.table, render(fixture(), op)),
-    Delete(o) -> live_write(o.table, render(fixture(), op)),
-    Select(o) -> live_read(o.table, render(fixture(), op)),
-    Count(w) -> live_read(w, render(fixture(), op)),
+    Insert(v) -> live_write(values_table(v), render(fixture(), operation)),
+    Update(o) -> live_write(o.table, render(fixture(), operation)),
+    Delete(o) -> live_write(o.table, render(fixture(), operation)),
+    Select(o) -> live_read(o.table, render(fixture(), operation)),
+    Count(w) -> live_read(w, render(fixture(), operation)),
   }
 
 fn live_write(table: Which, r: Rendered) -> sql::QueryResult / {db.write[part], db.write[bin]} =
   match table {
-    Part -> db.execute[part](r.stmt, r.params),
-    Bin -> db.execute[bin](r.stmt, r.params),
+    Part -> db.execute[part](r.statement, r.params),
+    Bin -> db.execute[bin](r.statement, r.params),
   }
 
 fn live_read(table: Which, r: Rendered) -> sql::QueryResult / {db.read[part], db.read[bin]} =
-  match table { Part -> db.query[part](r.stmt, r.params), Bin -> db.query[bin](r.stmt, r.params) }
-
-// --- The comparison ---------------------------------------------------------
+  match table {
+    Part -> db.query[part](r.statement, r.params),
+    Bin -> db.query[bin](r.statement, r.params),
+  }
 
 pub fn agree(memory: List<sql::QueryResult>, live: List<sql::QueryResult>) -> Bool =
   match first_difference(memory, live, 0) { None -> true, Some(_) -> false }
 
-/// The index of the first difference, because a divergence at op 3 makes ops 4..n meaningless and a
-/// counterexample that reported all of them would bury the one that matters.
 pub fn first_difference(
   memory: List<sql::QueryResult>,
   live: List<sql::QueryResult>,
@@ -382,8 +363,8 @@ type Entry = { key: String, value: sql::Datum }
 
 fn row_agrees(x: sql::Row, y: sql::Row) -> Bool =
   x.len() == y.len()
-    && x.entries().fold(true, |acc: Bool, e: Entry|
-      acc && (match y.get(e.key) { None -> false, Some(v) -> datum_agrees(e.value, v) }))
+    && x.entries().fold(true, |accumulator: Bool, e: Entry|
+      accumulator && (match y.get(e.key) { None -> false, Some(v) -> datum_agrees(e.value, v) }))
 
 fn datum_agrees(a: sql::Datum, b: sql::Datum) -> Bool =
   match a {
@@ -394,28 +375,24 @@ fn datum_agrees(a: sql::Datum, b: sql::Datum) -> Bool =
     _ -> a == b,
   }
 
-// --- What is drawn ----------------------------------------------------------
-
-/// A column of either table beside a value its type takes.
-type ColumnValue = { table: Which, column: Col, value: Val }
+type ColumnValue = { table: Which, column: Col, value: Value }
 
 fn texts() -> Gen<String> = gen::elements(["a", "B", "b", ""])
 
 fn counts() -> Gen<Int> = gen::int_between(-2, 9)
 
-/// A negative price is rejected by the table's check, and both sides have to say so.
 fn prices() -> Gen<Decimal> = gen::elements([0m, 1m, 1.5m, 2.2500m, -1m])
 
 fn column_value() -> Gen<ColumnValue> = {
-  let at = |table: Which, column: Col, values: Gen<Val>|
-    gen::map(gen::one_of([values, gen::constant(VNull)]), |v: Val|
+  let at = |table: Which, column: Col, values: Gen<Value>|
+    gen::map(gen::one_of([values, gen::constant(VNull)]), |v: Value|
       { table: table, column: column, value: v });
   let text = gen::map(texts(), |s: String| VText(s));
   let int = gen::map(counts(), |n: Int| VInt(n));
-  let num = gen::map(prices(), |d: Decimal| VNum(d));
+  let number = gen::map(prices(), |d: Decimal| VNum(d));
   gen::one_of([
     at(Part, CSku, text),
-    at(Part, CPrice, num),
+    at(Part, CPrice, number),
     at(Part, CTag, text),
     at(Part, CNumber, int),
     at(Bin, CId, int),
@@ -424,7 +401,7 @@ fn column_value() -> Gen<ColumnValue> = {
   ])
 }
 
-fn ops() -> Gen<Op> =
+fn operations() -> Gen<Operation> =
   gen::one_of([
     gen::map4(
       texts(),
@@ -432,13 +409,13 @@ fn ops() -> Gen<Op> =
       gen::option_of(texts()),
       gen::option_of(counts()),
       |sku: String, price: Decimal, tag: Option<String>, n: Option<Int>|
-        Insert(PartVals(sku, price, tag, n)),
+        Insert(PartValues(sku, price, tag, n)),
     ),
     gen::map3(
       counts(),
       gen::option_of(texts()),
       gen::option_of(counts()),
-      |id: Int, sku: Option<String>, qty: Option<Int>| Insert(BinVals(id, sku, qty)),
+      |id: Int, sku: Option<String>, qty: Option<Int>| Insert(BinValues(id, sku, qty)),
     ),
     gen::map2(column_value(), column_value(), |set: ColumnValue, at: ColumnValue|
       Update({
@@ -461,64 +438,62 @@ fn ops() -> Gen<Op> =
     gen::constant(Abort),
   ])
 
-/// `ops` with each `Commit` and `Abort` that closes nothing dropped, and what is left open
-/// committed.
-fn closed(ops: List<Op>) -> List<Op> = {
-  let walked = ops.fold({ depth: 0, out: [] }, |acc: { depth: Int, out: List<Op> }, o: Op|
-    match o {
-      Begin(_) -> if acc.depth < db::max_savepoints() {
-        { depth: acc.depth + 1, out: acc.out.push(o) }
-      } else { acc },
-      Commit -> if acc.depth > 0 { { depth: acc.depth - 1, out: acc.out.push(o) } } else { acc },
-      Abort -> if acc.depth > 0 { { depth: acc.depth - 1, out: acc.out.push(o) } } else { acc },
-      _ -> { ..acc, out: acc.out.push(o) },
-    });
-  range(0, walked.depth).fold(walked.out, |out: List<Op>, _i: Int| out.push(Commit))
+fn closed(operations: List<Operation>) -> List<Operation> = {
+  let walked = operations.fold(
+    { depth: 0, out: [] },
+    |accumulator: { depth: Int, out: List<Operation> }, o: Operation|
+      match o {
+        Begin(_) -> if accumulator.depth < db::max_savepoints() {
+          { depth: accumulator.depth + 1, out: accumulator.out.push(o) }
+        } else { accumulator },
+        Commit -> if accumulator.depth > 0 {
+          { depth: accumulator.depth - 1, out: accumulator.out.push(o) }
+        } else { accumulator },
+        Abort -> if accumulator.depth > 0 {
+          { depth: accumulator.depth - 1, out: accumulator.out.push(o) }
+        } else { accumulator },
+        _ -> { ..accumulator, out: accumulator.out.push(o) },
+      },
+  );
+  range(0, walked.depth).fold(walked.out, |out: List<Operation>, _i: Int| out.push(Commit))
 }
 
-/// Runs the claim has an opinion about: every operation typed, and every transaction closed.
-pub fn runs() -> Gen<List<Op>> =
-  gen::map(gen::list_of(ops(), 12), |drawn: List<Op>|
-    closed(drawn.filter(|o: Op| typed(fixture(), o))))
+pub fn runs() -> Gen<List<Operation>> =
+  gen::map(gen::list_of(operations(), 12), |drawn: List<Operation>|
+    closed(drawn.filter(|o: Operation| typed(fixture(), o))))
 
-// --- The claim --------------------------------------------------------------
-
-/// The claim, checked only by a run that borrows a database: over drawn runs the fake returns what
-/// the database does. It raises at the least run the two differ on.
 pub fn main() -> Unit / {db.write, db.read[part], db.write[part], db.read[bin], db.write[bin], abort.raise} =
-  gen::check(runs(), |ops: List<Op>| agree(replay_memory(fixture(), ops), replay_live(ops)))
+  gen::check(runs(), |operations: List<Operation>|
+    agree(replay_memory(fixture(), operations), replay_live(operations)))
 
-// --- What a hermetic run can check ------------------------------------------
-
-test "every drawn run is one the claim has an opinion about" {
-  gen::check(runs(), |ops: List<Op>| well_formed(fixture(), ops))
+test "every generated sequence of operations passes the `well_formed` check" {
+  gen::check(runs(), |operations: List<Operation>| well_formed(fixture(), operations))
 }
 
 test "a replay returns exactly one result per operation" {
-  gen::check(runs(), |ops: List<Op>| replay_memory(fixture(), ops).len() == ops.len())
+  gen::check(runs(), |operations: List<Operation>|
+    replay_memory(fixture(), operations).len() == operations.len())
 }
 
-test "agreement is reflexive, which is the weakest thing that must hold" {
-  gen::check(runs(), |ops: List<Op>| {
-    let results = replay_memory(fixture(), ops);
+test "`agree` is reflexive: any list of results agrees with itself and has no first difference" {
+  gen::check(runs(), |operations: List<Operation>| {
+    let results = replay_memory(fixture(), operations);
     agree(results, results) && first_difference(results, results, 0) == None
   })
 }
 
-// --- Recorded transcripts ---------------------------------------------------
-
-pub fn collation_ops() -> List<Op> =
+pub fn collation_operations() -> List<Operation> =
   [
-    Insert(PartVals("B", 1m, None, None)),
-    Insert(PartVals("a", 1m, None, None)),
+    Insert(PartValues("B", 1m, None, None)),
+    Insert(PartValues("a", 1m, None, None)),
     Select({ table: Part, order_by: CSku, limit: 10 }),
   ]
 
-pub fn aborted_ops() -> List<Op> =
+pub fn aborted_operations() -> List<Operation> =
   [
     Begin(db::ReadCommitted),
-    Insert(PartVals("a", 1m, None, None)),
-    Insert(PartVals("a", 2m, None, None)),
+    Insert(PartValues("a", 1m, None, None)),
+    Insert(PartValues("a", 2m, None, None)),
     Count(Part),
     Commit,
     Count(Part),
@@ -535,7 +510,6 @@ fn row4(sku: String, price: Decimal) -> sql::Row =
 fn counted(n: Int) -> sql::QueryResult =
   sql::Rows([Map::of_entries([{ key: "count", value: sql::IntDatum(n) }])])
 
-/// Under `C` collation `"B"` sorts before `"a"`, because `B` is 0x42 and `a` is 0x61.
 pub fn collation_transcript() -> List<sql::QueryResult> =
   [sql::Count(1), sql::Count(1), sql::Rows([row4("B", 1.0000m), row4("a", 1.0000m)])]
 
@@ -545,53 +519,44 @@ pub fn aborted_transcript() -> List<sql::QueryResult> =
     sql::Count(1),
     sql::Failed({ code: "23505", constraint: "part_pkey", detail: "" }),
     sql::Failed({ code: "25P02", constraint: "", detail: "" }),
-    // The `COMMIT`.
     sql::Failed({ code: "25P02", constraint: "", detail: "" }),
     counted(0),
   ]
 
-// --- Tests ------------------------------------------------------------------
-
-test "render puts one statement and its parameters on both sides" {
-  let r = render(fixture(), Insert(PartVals("a", 1m, None, None)));
-  assert_eq(r.stmt.sql, "insert into part (sku, price, tag, n) values ($1, $2, $3, $4)");
+test "`render` turns each operation into one SQL statement with its parameter list" {
+  let r = render(fixture(), Insert(PartValues("a", 1m, None, None)));
+  assert_eq(r.statement.sql, "insert into part (sku, price, tag, n) values ($1, $2, $3, $4)");
   assert_eq(r.params.len(), 4);
   assert_eq(
-    render(fixture(), Select({ table: Part, order_by: CSku, limit: 3 })).stmt.sql,
+    render(fixture(), Select({ table: Part, order_by: CSku, limit: 3 })).statement.sql,
     "select sku, price, tag, n from part order by sku, sku limit 3",
   );
-  assert_eq(render(fixture(), Count(Bin)).stmt.sql, "select count(*) from bin");
+  assert_eq(render(fixture(), Count(Bin)).statement.sql, "select count(*) from bin");
   assert_eq(
     render(
       fixture(),
       Update({ table: Part, column: CNumber, to: VInt(1), where_col: CSku, eq: VText("a") }),
-    ).stmt.sql,
+    ).statement.sql,
     "update part set n = $1 where sku = $2",
   );
   assert_eq(
-    render(fixture(), Delete({ table: Part, where_col: CSku, eq: VText("a") })).stmt.sql,
+    render(fixture(), Delete({ table: Part, where_col: CSku, eq: VText("a") })).statement.sql,
     "delete from part where sku = $1",
   )
 }
 
-// The property the positional comparison rests on: every generated `ORDER BY` ends with the table's
-// primary key, so no generated order has a tie and neither side is free to choose between equal
-// rows.
 test "every generated select orders by a key with no ties" {
   assert_eq(
-    render(fixture(), Select({ table: Part, order_by: CNumber, limit: 1 })).stmt.sql,
+    render(fixture(), Select({ table: Part, order_by: CNumber, limit: 1 })).statement.sql,
     "select sku, price, tag, n from part order by n, sku limit 1",
   );
   assert_eq(
-    render(fixture(), Select({ table: Bin, order_by: CQty, limit: 4 })).stmt.sql,
+    render(fixture(), Select({ table: Bin, order_by: CQty, limit: 4 })).statement.sql,
     "select id, sku, qty from bin order by qty, id limit 4",
   );
-  // And a `Select` over a table with no primary key is outside the domain rather than compared on
-  // an order neither side promises.
   assert(!well_formed({ tables: [keyless()] }, [Select({ table: Part, order_by: CSku, limit: 1 })]))
 }
 
-/// The fixture's `part`, stripped of its key.
 fn keyless() -> sql::Table =
   {
     name: "part",
@@ -602,55 +567,51 @@ fn keyless() -> sql::Table =
     checks: [],
   }
 
-test "well_formed rejects what the claim has no opinion about" {
-  assert(well_formed(fixture(), collation_ops()));
-  assert(well_formed(fixture(), aborted_ops()));
-  // an unbalanced scope stack
+test "`well_formed` rejects unbalanced transactions, too-deep nesting, mistyped values and columns of the wrong table" {
+  assert(well_formed(fixture(), collation_operations()));
+  assert(well_formed(fixture(), aborted_operations()));
   assert(!well_formed(fixture(), [Commit]));
   assert(!well_formed(fixture(), [Begin(db::ReadCommitted)]));
   assert(!well_formed(fixture(), [Begin(db::ReadCommitted), Commit, Abort]));
-  // a nesting deeper than the driver's savepoint bound
   assert(!well_formed(fixture(), deep(db::max_savepoints() + 1)));
-  // a value whose type does not match the column it is assigned to
   assert(
     !well_formed(fixture(), [
       Update({ table: Part, column: CNumber, to: VText("x"), where_col: CSku, eq: VText("a") }),
     ]),
   );
-  // a column of the *other* table, which is the one thing the type cannot say
   assert(!well_formed(fixture(), [Select({ table: Part, order_by: CQty, limit: 1 })]));
   assert(!well_formed(fixture(), [Delete({ table: Bin, where_col: CPrice, eq: VNum(1m) })]));
   assert(!well_formed(fixture(), [Select({ table: Part, order_by: CSku, limit: -1 })]));
-  // and an `Insert` is well-typed by construction, which is the point of `Values` carrying the
-  // table rather than naming it.
-  assert(well_formed(fixture(), [Insert(BinVals(1, Some("a"), None))]))
+  assert(well_formed(fixture(), [Insert(BinValues(1, Some("a"), None))]))
 }
 
-fn deep(n: Int) -> List<Op> = if n <= 0 { [] } else { balanced_pair(deep(n - 1)) }
+fn deep(n: Int) -> List<Operation> = if n <= 0 { [] } else { balanced_pair(deep(n - 1)) }
 
-fn balanced_pair(inner: List<Op>) -> List<Op> =
-  inner.fold([Begin(db::ReadCommitted)], |acc: List<Op>, o: Op| acc.push(o)).push(Commit)
+fn balanced_pair(inner: List<Operation>) -> List<Operation> =
+  inner.fold([Begin(db::ReadCommitted)], |accumulator: List<Operation>, o: Operation|
+    accumulator.push(o)).push(
+    Commit,
+  )
 
 test "the fake reproduces a transcript recorded from postgres" {
-  assert(agree(replay_memory(fixture(), collation_ops()), collation_transcript()));
-  assert(agree(replay_memory(fixture(), aborted_ops()), aborted_transcript()))
+  assert(agree(replay_memory(fixture(), collation_operations()), collation_transcript()));
+  assert(agree(replay_memory(fixture(), aborted_operations()), aborted_transcript()))
 }
 
-// the database design: a claim that cannot fail is decoration.
-test "a non-C collation is a refutation at the select and nowhere earlier" {
+test "replaying collation operations in memory differs from Postgres results only at the select, not before it" {
   let injected = [
     sql::Count(1),
     sql::Count(1),
     sql::Rows([row4("a", 1.0000m), row4("B", 1.0000m)]),
   ];
-  assert(!agree(replay_memory(fixture(), collation_ops()), injected));
-  assert_eq(first_difference(replay_memory(fixture(), collation_ops()), injected, 0), Some(2))
+  assert(!agree(replay_memory(fixture(), collation_operations()), injected));
+  assert_eq(
+    first_difference(replay_memory(fixture(), collation_operations()), injected, 0),
+    Some(2),
+  )
 }
 
-// The second injection: a fake without the failed-transaction state returns the `count` after a
-// failed statement instead of `25P02`, which is the omission that makes a suite pass and production
-// fail.
-test "a missing failed-transaction state is a refutation at the count" {
+test "results that lack the failed-transaction error after a duplicate key differ from the replay at the later count" {
   let injected = [
     sql::Count(0),
     sql::Count(1),
@@ -659,11 +620,10 @@ test "a missing failed-transaction state is a refutation at the count" {
     sql::Failed({ code: "25P02", constraint: "", detail: "" }),
     counted(0),
   ];
-  assert(!agree(replay_memory(fixture(), aborted_ops()), injected));
-  assert_eq(first_difference(replay_memory(fixture(), aborted_ops()), injected, 0), Some(3))
+  assert(!agree(replay_memory(fixture(), aborted_operations()), injected));
+  assert_eq(first_difference(replay_memory(fixture(), aborted_operations()), injected, 0), Some(3))
 }
 
-// `detail` is postgres's prose and nothing compares it.
 test "a failure compares its code and its constraint and never its message" {
   let a = sql::Failed({ code: "23505", constraint: "part_pkey", detail: "Key (sku)=(a) exists." });
   let b = sql::Failed({ code: "23505", constraint: "part_pkey", detail: "" });
@@ -674,10 +634,7 @@ test "a failure compares its code and its constraint and never its message" {
   assert(!results_agree(a, d))
 }
 
-// Ply's `==` on `Decimal` is by value, so `1.00m == 1.0000m` — and a comparison that used it would
-// accept the fake keeping a literal's scale where postgres returns the column's, which is the database design
-// §6.3's own worked counterexample.
-test "a numeric compares by its digits, because that is what its scale means" {
+test "numeric results with different scales, such as 1.00 and 1.0000, are not treated as agreeing" {
   assert(1.00m == 1.0000m);
   assert(
     !results_agree(
@@ -693,11 +650,9 @@ test "a numeric compares by its digits, because that is what its scale means" {
   )
 }
 
-// The domain the claim ranges over, which is the number the database design's argument turns on:
-// "the fake agrees" is a statement about the reach of the runs drawn and nothing else.
-test "the domain the claim ranges over contains statements" {
-  assert(well_formed(fixture(), [Insert(PartVals("a", 1m, Some("t"), Some(1)))]));
-  assert(well_formed(fixture(), [Insert(BinVals(1, Some("a"), Some(2)))]));
+test "`well_formed` accepts operations of every kind, and each one renders to SQL" {
+  assert(well_formed(fixture(), [Insert(PartValues("a", 1m, Some("t"), Some(1)))]));
+  assert(well_formed(fixture(), [Insert(BinValues(1, Some("a"), Some(2)))]));
   assert(
     well_formed(fixture(), [
       Update({ table: Part, column: CPrice, to: VNum(2m), where_col: CSku, eq: VText("a") }),
@@ -706,13 +661,13 @@ test "the domain the claim ranges over contains statements" {
   assert(well_formed(fixture(), [Delete({ table: Bin, where_col: CId, eq: VInt(1) })]));
   assert(well_formed(fixture(), [Select({ table: Bin, order_by: CQty, limit: 3 })]));
   assert(well_formed(fixture(), [Count(Bin)]));
-  // And every one of them renders to a statement the driver's scanner admits, which is the other
-  // half of "both sides execute the rendered SQL".
-  assert(render(fixture(), Insert(BinVals(1, None, None))).stmt.sql.contains("insert into bin"));
-  assert(render(fixture(), Count(Bin)).stmt.sql.contains("count(*) from bin"))
+  assert(
+    render(fixture(), Insert(BinValues(1, None, None))).statement.sql.contains("insert into bin"),
+  );
+  assert(render(fixture(), Count(Bin)).statement.sql.contains("count(*) from bin"))
 }
 
-test "a difference in length is a difference at the shorter end" {
+test "`first_difference` reports the index where the shorter list ends when the lists differ in length" {
   assert_eq(first_difference([sql::Count(1)], [], 0), Some(0));
   assert_eq(first_difference([], [sql::Count(1)], 0), Some(0));
   assert_eq(first_difference([sql::Count(1)], [sql::Count(1), sql::Count(2)], 0), Some(1))

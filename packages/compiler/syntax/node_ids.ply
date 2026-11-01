@@ -4,8 +4,8 @@ import compiler.syntax.parsing (Span, Identifier, QName, node_id_base, synthetic
 import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, SchemaItem, ExternItem,
                               TypeItem, EffectItem, DeriveItem, InstanceItem, NumericItem,
                               EffectSetItem, FnDefinition, Binder, SpecClause, ReturnsParam,
-                              AliasBody, SumBody, NominalBody, VariantDefinition, OpDefinition,
-                              NumericOp, parse)
+                              AliasBody, SumBody, NominalBody, VariantDefinition,
+                              OperationDefinition, NumericOperation, parse)
 import compiler.syntax.type_syntax (TypeExpression, NamedTypeExpression, FunctionTypeExpression,
                                     RecordTypeExpression, EffectsExpression, EffectExpression)
 import compiler.expand.rewrite.shared (expressions_matching)
@@ -18,7 +18,7 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     TaggedLiteralExpression, InvalidExpression, HoleExpression,
                                     TryBlockExpression, Statement, LetStatement, LetElseStatement,
                                     ExpressionStatement, AssignmentStatement, Param, NamedArg,
-                                    MatchArm, HandleClause, ReturnClause, HandlerVar,
+                                    MatchArm, HandleClause, ReturnClause, HandlerStateVariable,
                                     RecordLiteralField, Hole, expression_span)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
                                  PatternRange, PatternConstructor, PatternRecord, PatternList,
@@ -61,8 +61,9 @@ fn last_site(item: Item) -> Int / {abort.raise} =
   }
 
 fn within(out: { item: Item, n: Int }) -> Item / {abort.raise} =
-  if out.n >= node_id_base() { panic("an item of more nodes than its sites can number") }
-  else { out.item }
+  if out.n >= node_id_base() {
+    panic("an item is too large: it has more syntax tree nodes than can be given ids")
+  } else { out.item }
 
 fn numbering<| e>(
   mark: (Span, Int) -> Span / e,
@@ -87,9 +88,16 @@ fn numbering<| e>(
         SumBody(vs) -> {
           let o = vs.fold(
             { vs: [], n: n + 1 },
-            |acc: { vs: List<VariantDefinition>, n: Int }, v: VariantDefinition| {
-              let fs = number_types(mark, v.fields, acc.n + 1);
-              { vs: acc.vs.push({ ..v, name: named(mark, v.name, acc.n), fields: fs.ts }), n: fs.n }
+            |accumulator: { vs: List<VariantDefinition>, n: Int }, v: VariantDefinition| {
+              let fs = number_types(mark, v.fields, accumulator.n + 1);
+              {
+                vs: accumulator.vs.push({
+                  ..v,
+                  name: named(mark, v.name, accumulator.n),
+                  fields: fs.ts,
+                }),
+                n: fs.n,
+              }
             },
           );
           { b: SumBody(o.vs), n: o.n }
@@ -99,18 +107,18 @@ fn numbering<| e>(
       { item: TypeItem({ ..d, name: named(mark, d.name, n), body: body.b }), n: body.n }
     },
     EffectItem(d) -> {
-      let ops = d.operations.fold(
+      let numbered_operations = d.operations.fold(
         { operations: [], n: n + 1 },
-        |acc: { operations: List<OpDefinition>, n: Int }, op: OpDefinition| {
-          let ps = number_types(mark, op.params, acc.n + 1);
-          let r = number_type(mark, op.ret, ps.n);
-          let documented = idents(mark, op.param_names, r.n);
+        |accumulator: { operations: List<OperationDefinition>, n: Int }, operation: OperationDefinition| {
+          let ps = number_types(mark, operation.params, accumulator.n + 1);
+          let r = number_type(mark, operation.return_type, ps.n);
+          let documented = idents(mark, operation.param_names, r.n);
           {
-            operations: acc.operations.push({
-              ..op,
-              name: named(mark, op.name, acc.n),
+            operations: accumulator.operations.push({
+              ..operation,
+              name: named(mark, operation.name, accumulator.n),
               params: ps.ts,
-              ret: r.t,
+              return_type: r.t,
               param_names: documented.names,
             }),
             n: documented.n,
@@ -118,8 +126,12 @@ fn numbering<| e>(
         },
       );
       {
-        item: EffectItem({ ..d, name: named(mark, d.name, n), operations: ops.operations }),
-        n: ops.n,
+        item: EffectItem({
+          ..d,
+          name: named(mark, d.name, n),
+          operations: numbered_operations.operations,
+        }),
+        n: numbered_operations.n,
       }
     },
     DeriveItem(d) -> { item: DeriveItem({ ..d, target: named(mark, d.target, n) }), n: n + 1 },
@@ -133,15 +145,15 @@ fn numbering<| e>(
         n: n + 2,
       },
     NumericItem(d) -> {
-      let ops = idents(mark, d.operations.map(|x: NumericOp| x.by), n + 1);
+      let numbered_by_names = idents(mark, d.operations.map(|x: NumericOperation| x.by), n + 1);
       {
         item: NumericItem({
           ..d,
           target: named(mark, d.target, n),
           operations: range(0, d.operations.len()).map(|i: Int|
-            { ..d.operations.get(i), by: ops.names.get(i) }),
+            { ..d.operations.get(i), by: numbered_by_names.names.get(i) }),
         }),
-        n: ops.n,
+        n: numbered_by_names.n,
       }
     },
     EffectSetItem(d) -> {
@@ -200,19 +212,19 @@ fn numbering<| e>(
     },
     ExternItem(d) -> {
       let ps: NumberedParameters = number_parameters(mark, d.params, n + 1);
-      let r = number_type(mark, d.ret, ps.n);
+      let r = number_type(mark, d.return_type, ps.n);
       let e = number_optional_effects(mark, d.effects, r.n);
-      let sp = number_clauses(mark, d.spec, e.n);
+      let numbered_clauses = number_clauses(mark, d.spec, e.n);
       {
         item: ExternItem({
           ..d,
           name: named(mark, d.name, n),
           params: ps.ps,
-          ret: r.t,
+          return_type: r.t,
           effects: e.r,
-          spec: sp.classes,
+          spec: numbered_clauses.classes,
         }),
-        n: sp.n,
+        n: numbered_clauses.n,
       }
     },
   }
@@ -238,11 +250,11 @@ fn number_function<| e>(
   n: Int,
 ) -> { d: FnDefinition, n: Int } / e = {
   let ps: NumberedParameters = number_parameters(mark, d.params, n + 1);
-  let r = number_maybe_type(mark, d.ret, ps.n);
+  let r = number_maybe_type(mark, d.return_type, ps.n);
   let e = number_optional_effects(mark, d.effects, r.n);
   let b: NumberedExpression = number_expression(mark, d.body, e.n);
-  let sp = number_clauses(mark, d.spec, b.n);
-  let m: { e: Option<Expression>, n: Int } = number_optional(mark, d.decreases, sp.n);
+  let numbered_clauses = number_clauses(mark, d.spec, b.n);
+  let m: { e: Option<Expression>, n: Int } = number_optional(mark, d.decreases, numbered_clauses.n);
   let returns = match d.returns {
     Some(ReturnsParam(p)) -> Some(ReturnsParam(named(mark, p, m.n))),
     r -> r,
@@ -252,10 +264,10 @@ fn number_function<| e>(
       ..d,
       name: named(mark, d.name, n),
       params: ps.ps,
-      ret: r.t,
+      return_type: r.t,
       effects: e.r,
       body: b.e,
-      spec: sp.classes,
+      spec: numbered_clauses.classes,
       decreases: m.e,
       returns: returns,
     },
@@ -268,16 +280,16 @@ fn number_parameters<| e>(
   ps: List<Param>,
   n: Int,
 ) -> NumberedParameters / e =
-  ps.fold({ ps: [], n: n }, |acc: NumberedParameters, p: Param| {
-    let ty = number_maybe_type(mark, p.ty, acc.n + 1);
+  ps.fold({ ps: [], n: n }, |accumulator: NumberedParameters, p: Param| {
+    let ty = number_maybe_type(mark, p.ty, accumulator.n + 1);
     let cost = maybe_named(mark, p.cost, ty.n);
     let space = maybe_named(mark, p.space, cost.n);
     let d: { e: Option<Expression>, n: Int } = number_optional(mark, p.default, space.n);
     {
-      ps: acc.ps.push({
+      ps: accumulator.ps.push({
         ..p,
-        name: named(mark, p.name, acc.n),
-        span: mark(p.span, acc.n),
+        name: named(mark, p.name, accumulator.n),
+        span: mark(p.span, accumulator.n),
         ty: ty.t,
         cost: cost.name,
         space: space.name,
@@ -295,8 +307,11 @@ fn idents<| e>(
   names: List<Identifier>,
   n: Int,
 ) -> { names: List<Identifier>, n: Int } / e =
-  names.fold({ names: [], n: n }, |acc: { names: List<Identifier>, n: Int }, name: Identifier|
-    { names: acc.names.push(named(mark, name, acc.n)), n: acc.n + 1 })
+  names.fold(
+    { names: [], n: n },
+    |accumulator: { names: List<Identifier>, n: Int }, name: Identifier|
+      { names: accumulator.names.push(named(mark, name, accumulator.n)), n: accumulator.n + 1 },
+  )
 
 fn maybe_named<| e>(
   mark: (Span, Int) -> Span / e,
@@ -313,23 +328,33 @@ fn number_clauses<| e>(
   cs: List<SpecClause>,
   n: Int,
 ) -> { classes: List<SpecClause>, n: Int } / e =
-  cs.fold({ classes: [], n: n }, |acc: { classes: List<SpecClause>, n: Int }, c: SpecClause| {
-    let o: NumberedExpression = number_expression(mark, c.expression, acc.n + 1);
-    { classes: acc.classes.push({ ..c, span: mark(c.span, acc.n), expression: o.e }), n: o.n }
-  })
+  cs.fold(
+    { classes: [], n: n },
+    |accumulator: { classes: List<SpecClause>, n: Int }, c: SpecClause| {
+      let o: NumberedExpression = number_expression(mark, c.expression, accumulator.n + 1);
+      {
+        classes: accumulator.classes.push({
+          ..c,
+          span: mark(c.span, accumulator.n),
+          expression: o.e,
+        }),
+        n: o.n,
+      }
+    },
+  )
 
 fn number_binders<| e>(
   mark: (Span, Int) -> Span / e,
   bs: List<Binder>,
   n: Int,
 ) -> { bs: List<Binder>, n: Int } / e =
-  bs.fold({ bs: [], n: n }, |acc: { bs: List<Binder>, n: Int }, b: Binder| {
-    let t = number_type(mark, b.ty, acc.n + 1);
+  bs.fold({ bs: [], n: n }, |accumulator: { bs: List<Binder>, n: Int }, b: Binder| {
+    let t = number_type(mark, b.ty, accumulator.n + 1);
     {
-      bs: acc.bs.push({
+      bs: accumulator.bs.push({
         ..b,
-        span: mark(b.span, acc.n),
-        name: named(mark, b.name, acc.n),
+        span: mark(b.span, accumulator.n),
+        name: named(mark, b.name, accumulator.n),
         ty: t.t,
       }),
       n: t.n,
@@ -358,9 +383,9 @@ fn number_type<| e>(
       let args = number_types(mark, c.args, q.n);
       let rows = c.effect_arguments.fold(
         { rs: [], n: args.n },
-        |acc: { rs: List<EffectsExpression>, n: Int }, r: EffectsExpression| {
-          let o = numbered_expression_effects(mark, r, acc.n);
-          { rs: acc.rs.push(o.r), n: o.n }
+        |accumulator: { rs: List<EffectsExpression>, n: Int }, r: EffectsExpression| {
+          let o = numbered_expression_effects(mark, r, accumulator.n);
+          { rs: accumulator.rs.push(o.r), n: o.n }
         },
       );
       {
@@ -370,16 +395,16 @@ fn number_type<| e>(
     },
     FunctionTypeExpression(f) -> {
       let ps = number_types(mark, f.params, n);
-      let r = number_type(mark, f.ret, ps.n);
+      let r = number_type(mark, f.return_type, ps.n);
       let e = number_optional_effects(mark, f.effects, r.n);
-      { t: FunctionTypeExpression({ ..f, params: ps.ts, ret: r.t, effects: e.r }), n: e.n }
+      { t: FunctionTypeExpression({ ..f, params: ps.ts, return_type: r.t, effects: e.r }), n: e.n }
     },
     RecordTypeExpression(r) -> {
       let fs = r.fields.fold(
         { fs: [], n: n },
-        |acc: { fs: List<{ name: Identifier, ty: TypeExpression }>, n: Int }, f: { name: Identifier, ty: TypeExpression }| {
-          let o = number_type(mark, f.ty, acc.n);
-          { fs: acc.fs.push({ name: f.name, ty: o.t }), n: o.n }
+        |accumulator: { fs: List<{ name: Identifier, ty: TypeExpression }>, n: Int }, f: { name: Identifier, ty: TypeExpression }| {
+          let o = number_type(mark, f.ty, accumulator.n);
+          { fs: accumulator.fs.push({ name: f.name, ty: o.t }), n: o.n }
         },
       );
       { t: RecordTypeExpression({ ..r, fields: fs.fs }), n: fs.n }
@@ -392,10 +417,13 @@ fn number_types<| e>(
   ts: List<TypeExpression>,
   n: Int,
 ) -> { ts: List<TypeExpression>, n: Int } / e =
-  ts.fold({ ts: [], n: n }, |acc: { ts: List<TypeExpression>, n: Int }, t: TypeExpression| {
-    let o = number_type(mark, t, acc.n);
-    { ts: acc.ts.push(o.t), n: o.n }
-  })
+  ts.fold(
+    { ts: [], n: n },
+    |accumulator: { ts: List<TypeExpression>, n: Int }, t: TypeExpression| {
+      let o = number_type(mark, t, accumulator.n);
+      { ts: accumulator.ts.push(o.t), n: o.n }
+    },
+  )
 
 fn number_maybe_type<| e>(
   mark: (Span, Int) -> Span / e,
@@ -417,10 +445,13 @@ fn number_effects<| e>(
 ) -> { xs: List<EffectExpression>, n: Int } / e =
   effects.fold(
     { xs: [], n: n },
-    |acc: { xs: List<EffectExpression>, n: Int }, a: EffectExpression| {
-      let e = number_qualified_name(mark, a.effect_name, acc.n);
-      let op = maybe_named(mark, a.op, e.n);
-      { xs: acc.xs.push({ ..a, effect_name: e.q, op: op.name }), n: op.n }
+    |accumulator: { xs: List<EffectExpression>, n: Int }, a: EffectExpression| {
+      let e = number_qualified_name(mark, a.effect_name, accumulator.n);
+      let operation_name = maybe_named(mark, a.operation, e.n);
+      {
+        xs: accumulator.xs.push({ ..a, effect_name: e.q, operation: operation_name.name }),
+        n: operation_name.n,
+      }
     },
   )
 
@@ -429,9 +460,9 @@ fn number_qnames<| e>(
   qs: List<QName>,
   n: Int,
 ) -> { qs: List<QName>, n: Int } / e =
-  qs.fold({ qs: [], n: n }, |acc: { qs: List<QName>, n: Int }, q: QName| {
-    let o = number_qualified_name(mark, q, acc.n);
-    { qs: acc.qs.push(o.q), n: o.n }
+  qs.fold({ qs: [], n: n }, |accumulator: { qs: List<QName>, n: Int }, q: QName| {
+    let o = number_qualified_name(mark, q, accumulator.n);
+    { qs: accumulator.qs.push(o.q), n: o.n }
   })
 
 fn numbered_expression_effects<| e>(
@@ -476,9 +507,9 @@ fn number_expression<| e>(
   n: Int,
 ) -> NumberedExpression / e = {
   let each = |xs: List<Expression>, from: Int|
-    xs.fold({ es: [], n: from }, |acc: NumberedExpressions, x: Expression| {
-      let o: NumberedExpression = number_expression(mark, x, acc.n);
-      { es: acc.es.push(o.e), n: o.n }
+    xs.fold({ es: [], n: from }, |accumulator: NumberedExpressions, x: Expression| {
+      let o: NumberedExpression = number_expression(mark, x, accumulator.n);
+      { es: accumulator.es.push(o.e), n: o.n }
     });
   let opt = |x: Option<Expression>, from: Int|
     match x {
@@ -491,9 +522,9 @@ fn number_expression<| e>(
   let fields = |fs: List<RecordLiteralField>, from: Int|
     fs.fold(
       { fs: [], n: from },
-      |acc: { fs: List<RecordLiteralField>, n: Int }, f: RecordLiteralField| {
-        let v: NumberedExpression = number_expression(mark, f.value, acc.n);
-        { fs: acc.fs.push({ ..f, value: v.e }), n: v.n }
+      |accumulator: { fs: List<RecordLiteralField>, n: Int }, f: RecordLiteralField| {
+        let v: NumberedExpression = number_expression(mark, f.value, accumulator.n);
+        { fs: accumulator.fs.push({ ..f, value: v.e }), n: v.n }
       },
     );
   match e {
@@ -511,9 +542,12 @@ fn number_expression<| e>(
     InvalidExpression(b) -> { e: InvalidExpression({ span: mark(b.span, n) }), n: n + 1 },
     HoleExpression(h) -> { e: HoleExpression({ ..h, span: mark(h.span, n) }), n: n + 1 },
     BinaryExpression(b) -> {
-      let l: NumberedExpression = number_expression(mark, b.lhs, n + 1);
-      let r: NumberedExpression = number_expression(mark, b.rhs, l.n);
-      { e: BinaryExpression({ ..b, span: mark(b.span, n), lhs: l.e, rhs: r.e }), n: r.n }
+      let l: NumberedExpression = number_expression(mark, b.left_operand, n + 1);
+      let r: NumberedExpression = number_expression(mark, b.right_operand, l.n);
+      {
+        e: BinaryExpression({ ..b, span: mark(b.span, n), left_operand: l.e, right_operand: r.e }),
+        n: r.n,
+      }
     },
     UnaryExpression(u) -> {
       let o: NumberedExpression = number_expression(mark, u.operand, n + 1);
@@ -521,18 +555,26 @@ fn number_expression<| e>(
     },
     LambdaExpression(l) -> {
       let ps: NumberedParameters = number_parameters(mark, l.params, n + 1);
-      let r = number_maybe_type(mark, l.ret, ps.n);
+      let r = number_maybe_type(mark, l.return_clause, ps.n);
       let b: NumberedExpression = number_expression(mark, l.body, r.n);
-      { e: LambdaExpression({ span: mark(l.span, n), params: ps.ps, ret: r.t, body: b.e }), n: b.n }
+      {
+        e: LambdaExpression({
+          span: mark(l.span, n),
+          params: ps.ps,
+          return_clause: r.t,
+          body: b.e,
+        }),
+        n: b.n,
+      }
     },
     CallExpression(a) -> {
       let f: NumberedExpression = number_expression(mark, a.function, n + 1);
       let xs: NumberedExpressions = each(a.args, f.n);
       let ns = a.named.fold(
         { ns: [], n: xs.n },
-        |acc: { ns: List<NamedArg>, n: Int }, arg: NamedArg| {
-          let o: NumberedExpression = number_expression(mark, arg.value, acc.n);
-          { ns: acc.ns.push({ ..arg, value: o.e }), n: o.n }
+        |accumulator: { ns: List<NamedArg>, n: Int }, arg: NamedArg| {
+          let o: NumberedExpression = number_expression(mark, arg.value, accumulator.n);
+          { ns: accumulator.ns.push({ ..arg, value: o.e }), n: o.n }
         },
       );
       {
@@ -550,40 +592,43 @@ fn number_expression<| e>(
       }
     },
     MatchExpression(m) -> {
-      let sc: NumberedExpression = number_expression(mark, m.scrutinee, n + 1);
+      let scrutinee: NumberedExpression = number_expression(mark, m.scrutinee, n + 1);
       let arms = m.arms.fold(
-        { arms: [], n: sc.n },
-        |acc: { arms: List<MatchArm>, n: Int }, arm: MatchArm| {
-          let pt: NumberedPattern = number_pattern(mark, arm.pattern, acc.n + 1);
+        { arms: [], n: scrutinee.n },
+        |accumulator: { arms: List<MatchArm>, n: Int }, arm: MatchArm| {
+          let pt: NumberedPattern = number_pattern(mark, arm.pattern, accumulator.n + 1);
           let g: { e: Option<Expression>, n: Int } = opt(arm.guard, pt.n);
           let b: NumberedExpression = number_expression(mark, arm.body, g.n);
           {
-            arms: acc.arms.push({
+            arms: accumulator.arms.push({
               pattern: pt.p,
               guard: g.e,
               body: b.e,
-              span: mark(arm.span, acc.n),
+              span: mark(arm.span, accumulator.n),
             }),
             n: b.n,
           }
         },
       );
-      { e: MatchExpression({ span: mark(m.span, n), scrutinee: sc.e, arms: arms.arms }), n: arms.n }
+      {
+        e: MatchExpression({ span: mark(m.span, n), scrutinee: scrutinee.e, arms: arms.arms }),
+        n: arms.n,
+      }
     },
     BlockExpression(b) -> {
       let st = b.statements.fold(
         { statements: [], n: n + 1 },
-        |acc: { statements: List<Statement>, n: Int }, stmt: Statement|
-          match stmt {
+        |accumulator: { statements: List<Statement>, n: Int }, statement: Statement|
+          match statement {
             LetStatement(l) -> {
-              let pt: NumberedPattern = number_pattern(mark, l.pattern, acc.n + 1);
+              let pt: NumberedPattern = number_pattern(mark, l.pattern, accumulator.n + 1);
               let ty = number_maybe_type(mark, l.ty, pt.n);
               let v: NumberedExpression = number_expression(mark, l.value, ty.n);
               {
-                statements: acc.statements.push(
+                statements: accumulator.statements.push(
                   LetStatement({
                     ..l,
-                    span: mark(l.span, acc.n),
+                    span: mark(l.span, accumulator.n),
                     pattern: pt.p,
                     ty: ty.t,
                     value: v.e,
@@ -593,15 +638,15 @@ fn number_expression<| e>(
               }
             },
             LetElseStatement(l) -> {
-              let pt: NumberedPattern = number_pattern(mark, l.pattern, acc.n + 1);
+              let pt: NumberedPattern = number_pattern(mark, l.pattern, accumulator.n + 1);
               let ty = number_maybe_type(mark, l.ty, pt.n);
               let v: NumberedExpression = number_expression(mark, l.value, ty.n);
               let fb: NumberedExpression = number_expression(mark, l.fallback, v.n);
               {
-                statements: acc.statements.push(
+                statements: accumulator.statements.push(
                   LetElseStatement({
                     ..l,
-                    span: mark(l.span, acc.n),
+                    span: mark(l.span, accumulator.n),
                     pattern: pt.p,
                     ty: ty.t,
                     value: v.e,
@@ -612,16 +657,16 @@ fn number_expression<| e>(
               }
             },
             ExpressionStatement(x) -> {
-              let o: NumberedExpression = number_expression(mark, x, acc.n);
-              { statements: acc.statements.push(ExpressionStatement(o.e)), n: o.n }
+              let o: NumberedExpression = number_expression(mark, x, accumulator.n);
+              { statements: accumulator.statements.push(ExpressionStatement(o.e)), n: o.n }
             },
             AssignmentStatement(x) -> {
-              let v: NumberedExpression = number_expression(mark, x.value, acc.n + 1);
+              let v: NumberedExpression = number_expression(mark, x.value, accumulator.n + 1);
               {
-                statements: acc.statements.push(
+                statements: accumulator.statements.push(
                   AssignmentStatement({
-                    span: mark(x.span, acc.n),
-                    name: named(mark, x.name, acc.n),
+                    span: mark(x.span, accumulator.n),
+                    name: named(mark, x.name, accumulator.n),
                     value: v.e,
                   }),
                 ),
@@ -669,22 +714,22 @@ fn number_expression<| e>(
             module: m.name,
             name: named(mark, p.effect_name.name, n),
           },
-          op: named(mark, p.op, m.n),
+          operation: named(mark, p.operation, m.n),
           args: xs.es,
         }),
         n: xs.n,
       }
     },
     HandleExpression(h) -> {
-      let vs = h.vars.fold(
+      let vs = h.handler_variables.fold(
         { vs: [], n: n + 1 },
-        |acc: { vs: List<HandlerVar>, n: Int }, v: HandlerVar| {
-          let ty = number_maybe_type(mark, v.ty, acc.n + 2);
+        |accumulator: { vs: List<HandlerStateVariable>, n: Int }, v: HandlerStateVariable| {
+          let ty = number_maybe_type(mark, v.ty, accumulator.n + 2);
           let o: NumberedExpression = number_expression(mark, v.init, ty.n);
           {
-            vs: acc.vs.push({
-              span: mark(v.span, acc.n),
-              name: named(mark, v.name, acc.n + 1),
+            vs: accumulator.vs.push({
+              span: mark(v.span, accumulator.n),
+              name: named(mark, v.name, accumulator.n + 1),
               ty: ty.t,
               init: o.e,
             }),
@@ -695,18 +740,18 @@ fn number_expression<| e>(
       let body: NumberedExpression = number_expression(mark, h.body, vs.n);
       let cs = h.clauses.fold(
         { classes: [], n: body.n },
-        |acc: { classes: List<HandleClause>, n: Int }, c: HandleClause| {
-          let eff = number_qualified_name(mark, c.effect_name, acc.n + 1);
+        |accumulator: { classes: List<HandleClause>, n: Int }, c: HandleClause| {
+          let eff = number_qualified_name(mark, c.effect_name, accumulator.n + 1);
           let ps = idents(mark, c.params, eff.n + 1);
           let label = maybe_named(mark, c.label_binder, ps.n);
           let resume = maybe_named(mark, c.resume, label.n);
           let o: NumberedExpression = number_expression(mark, c.body, resume.n);
           {
-            classes: acc.classes.push({
+            classes: accumulator.classes.push({
               ..c,
-              span: mark(c.span, acc.n),
+              span: mark(c.span, accumulator.n),
               effect_name: eff.q,
-              op: named(mark, c.op, eff.n),
+              operation: named(mark, c.operation, eff.n),
               params: ps.names,
               label_binder: label.name,
               resume: resume.name,
@@ -716,7 +761,7 @@ fn number_expression<| e>(
           }
         },
       );
-      let ret: { r: Option<ReturnClause>, n: Int } = match h.ret {
+      let return_clause: { r: Option<ReturnClause>, n: Int } = match h.return_clause {
         Some(r) -> {
           let o: NumberedExpression = number_expression(mark, r.body, cs.n + 2);
           {
@@ -735,11 +780,11 @@ fn number_expression<| e>(
         e: HandleExpression({
           span: mark(h.span, n),
           body: body.e,
-          ret: ret.r,
+          return_clause: return_clause.r,
           clauses: cs.classes,
-          vars: vs.vs,
+          handler_variables: vs.vs,
         }),
-        n: ret.n,
+        n: return_clause.n,
       }
     },
     WithScopeExpression(w) -> {
@@ -770,7 +815,10 @@ fn number_expression<| e>(
       let raised = match t.raise {
         Some(r) -> {
           let eff = number_qualified_name(mark, r.effect_name, n + 1);
-          { r: Some({ effect_name: eff.q, op: named(mark, r.op, eff.n) }), n: eff.n + 1 }
+          {
+            r: Some({ effect_name: eff.q, operation: named(mark, r.operation, eff.n) }),
+            n: eff.n + 1,
+          }
         },
         None -> { r: None, n: n + 1 },
       };
@@ -778,10 +826,16 @@ fn number_expression<| e>(
       { e: TryBlockExpression({ span: mark(t.span, n), raise: raised.r, body: b.e }), n: b.n }
     },
     TaggedLiteralExpression(t) -> {
-      let hs = t.holes.fold({ hs: [], n: n + 3 }, |acc: { hs: List<Hole>, n: Int }, h: Hole| {
-        let o: NumberedExpression = number_expression(mark, h.value, acc.n + 1);
-        { hs: acc.hs.push({ ..h, quoted: mark(h.quoted, acc.n), value: o.e }), n: o.n }
-      });
+      let hs = t.holes.fold(
+        { hs: [], n: n + 3 },
+        |accumulator: { hs: List<Hole>, n: Int }, h: Hole| {
+          let o: NumberedExpression = number_expression(mark, h.value, accumulator.n + 1);
+          {
+            hs: accumulator.hs.push({ ..h, quoted: mark(h.quoted, accumulator.n), value: o.e }),
+            n: o.n,
+          }
+        },
+      );
       {
         e: TaggedLiteralExpression({
           ..t,
@@ -796,8 +850,8 @@ fn number_expression<| e>(
   }
 }
 
-fn node_ids_of(src: Bytes, name: Bytes) -> List<Int> / {abort.raise} = {
-  let m = numbered_module(parse(src).node);
+fn node_ids_of(source: Bytes, name: Bytes) -> List<Int> / {abort.raise} = {
+  let m = numbered_module(parse(source).node);
   expressions_matching(
     { ..m, items: m.items.filter(|item: Item| item_named(item, name)) },
     |_: Expression| true,
@@ -807,7 +861,7 @@ fn node_ids_of(src: Bytes, name: Bytes) -> List<Int> / {abort.raise} = {
 fn item_named(item: Item, name: Bytes) -> Bool =
   match item { FunctionItem(d) -> d.name.name == name, TestItem(t) -> t.name == name, _ -> false }
 
-test "an item's sites are its own: an edit to another item, or a cut of its module, moves none" {
+test "an item's node ids are nonzero and unique, and do not change when another item is edited or the rest of the module is removed" {
   let g = b"fn g(y: Int) -> Int = if y > 0 { y } else { 0 - y }\n";
   let before = node_ids_of(Bytes::concat_all([b"fn f(x: Int) -> Int = x + 1\n", g]), b"g");
   assert(before.len() > 4);
@@ -818,9 +872,9 @@ test "an item's sites are its own: an edit to another item, or a cut of its modu
   assert_eq(node_ids_of(g, b"g"), before)
 }
 
-test "a minted site is no numbered one, nor one another node or role mints" {
-  let src = b"fn f(xs: List<Int>, d: Int = 3) -> Int = match xs { [x, ..] -> try { x + d }, [] -> d }\n";
-  let m = numbered_module(parse(src).node);
+test "`synthetic_span` returns ids that differ from every parsed node's id and from each other, for every role" {
+  let source = b"fn f(xs: List<Int>, d: Int = 3) -> Int = match xs { [x, ..] -> try { x + d }, [] -> d }\n";
+  let m = numbered_module(parse(source).node);
   let spans = expressions_matching(m, |_: Expression| true).map(expression_span);
   let numbered = spans.map(|s: Span| s.site);
   let roles = [role_try_return(), role_detached(), role_try_arg(3), role_member_default(2) + 5];
@@ -832,9 +886,9 @@ test "a minted site is no numbered one, nor one another node or role mints" {
 
 fn number_pattern<| e>(mark: (Span, Int) -> Span / e, p: Pattern, n: Int) -> NumberedPattern / e = {
   let each = |ps: List<Pattern>, from: Int|
-    ps.fold({ ps: [], n: from }, |acc: { ps: List<Pattern>, n: Int }, x: Pattern| {
-      let o: NumberedPattern = number_pattern(mark, x, acc.n);
-      { ps: acc.ps.push(o.p), n: o.n }
+    ps.fold({ ps: [], n: from }, |accumulator: { ps: List<Pattern>, n: Int }, x: Pattern| {
+      let o: NumberedPattern = number_pattern(mark, x, accumulator.n);
+      { ps: accumulator.ps.push(o.p), n: o.n }
     });
   match p {
     PatternWildcard(w) -> { p: PatternWildcard({ span: mark(w.span, n) }), n: n + 1 },
@@ -850,9 +904,9 @@ fn number_pattern<| e>(mark: (Span, Int) -> Span / e, p: Pattern, n: Int) -> Num
     PatternRecord(r) -> {
       let fs = r.fields.fold(
         { fs: [], n: n + 1 },
-        |acc: { fs: List<{ name: Identifier, pattern: Pattern }>, n: Int }, f: { name: Identifier, pattern: Pattern }| {
-          let o: NumberedPattern = number_pattern(mark, f.pattern, acc.n);
-          { fs: acc.fs.push({ name: f.name, pattern: o.p }), n: o.n }
+        |accumulator: { fs: List<{ name: Identifier, pattern: Pattern }>, n: Int }, f: { name: Identifier, pattern: Pattern }| {
+          let o: NumberedPattern = number_pattern(mark, f.pattern, accumulator.n);
+          { fs: accumulator.fs.push({ name: f.name, pattern: o.p }), n: o.n }
         },
       );
       { p: PatternRecord({ ..r, span: mark(r.span, n), fields: fs.fs }), n: fs.n }

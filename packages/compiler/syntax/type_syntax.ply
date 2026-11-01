@@ -6,13 +6,14 @@ import compiler.syntax.parsing (tuple_field_name, Span, Identifier, QName, Input
                                 span_at, previous_span, at_token, at_eof, at_identifier_text,
                                 starts_upper, advance, bump, eat, expect, expect_close,
                                 expect_identifier, expect_field_name, report_duplicate_fields,
-                                expect_gt, with_no_brace, too_deep, qname, comma_list, parsed_or,
-                                failed, token_lparen, token_rparen, token_lbrace, token_rbrace,
-                                token_lbracket, token_rbracket, token_comma, token_colon, token_dot,
-                                token_arrow, token_lt, token_gt, token_ge, token_pipe, token_slash,
-                                token_star, dump_node, dump_count, dump_presence, dump_payload,
-                                dump_word, dump_list, dump_opt, dump_identifier,
-                                dump_qualified_name, dump_diagnostics, start, is_bare)
+                                expect_gt, with_no_brace, too_deep, qualified_name, comma_list,
+                                parsed_or, failed, token_lparen, token_rparen, token_lbrace,
+                                token_rbrace, token_lbracket, token_rbracket, token_comma,
+                                token_colon, token_dot, token_arrow, token_lt, token_gt, token_ge,
+                                token_pipe, token_slash, token_star, dump_node, dump_count,
+                                dump_presence, dump_payload, dump_word, dump_list, dump_opt,
+                                dump_identifier, dump_qualified_name, dump_diagnostics, start,
+                                is_bare)
 import compiler.syntax.lexer (TokenKind, Identifier, Punctuation)
 import std.bytes
 import std.bin
@@ -20,7 +21,7 @@ import std.bin
 pub type TypeExpression =
   | VariableTypeExpression(Identifier)
   | NamedTypeExpression({ span: Span, name: QName, args: List<TypeExpression>, labels: List<Identifier>, effect_arguments: List<EffectsExpression> })
-  | FunctionTypeExpression({ span: Span, params: List<TypeExpression>, kept: List<Int>, once: Bool, ret: TypeExpression, effects: Option<EffectsExpression> })
+  | FunctionTypeExpression({ span: Span, params: List<TypeExpression>, keep_indices: List<Int>, once: Bool, return_type: TypeExpression, effects: Option<EffectsExpression> })
   | RecordTypeExpression({ span: Span, fields: List<{ name: Identifier, ty: TypeExpression }> })
   | UnitTypeExpression({ span: Span })
   | InvalidTypeExpression({ span: Span })
@@ -35,7 +36,7 @@ derive bin for TypeExpression
 pub type EffectExpression = {
   effect_name: QName,
   mode: Mode,
-  op: Option<Identifier>,
+  operation: Option<Identifier>,
   resource: Option<Identifier>,
   resource_wildcard: Bool,
   bounded: Bool,
@@ -56,7 +57,7 @@ pub type Generics = {
   types: List<Identifier>,
   effects: List<Identifier>,
   labels: List<Identifier>,
-  kept: List<Identifier>,
+  retained_types: List<Identifier>,
 }
 
 pub fn type_span(ty: TypeExpression) -> Span =
@@ -78,14 +79,14 @@ pub fn no_effect_expression() -> EffectExpression =
   {
     effect_name: no_qualified_name(),
     mode: InvalidMode,
-    op: None,
+    operation: None,
     resource: None,
     resource_wildcard: false,
     bounded: false,
     span: dummy_span(),
   }
 
-pub fn no_generics() -> Generics = { types: [], effects: [], labels: [], kept: [] }
+pub fn no_generics() -> Generics = { types: [], effects: [], labels: [], retained_types: [] }
 
 pub fn is_generic(generics: Generics) -> Bool =
   generics.types.len() > 0 || generics.effects.len() > 0 || generics.labels.len() > 0
@@ -93,8 +94,8 @@ pub fn is_generic(generics: Generics) -> Bool =
 pub fn angled(types: List<Bytes>, labels: List<Bytes>, rows: List<Bytes>) -> Bytes =
   if types.len() == 0 && labels.len() == 0 && rows.len() == 0 { b"" } else {
     let ts = Bytes::join(
-      labels.fold(types, |acc: List<Bytes>, label: Bytes|
-        acc.push(Bytes::concat_all([b"[", label, b"]"]))),
+      labels.fold(types, |accumulator: List<Bytes>, label: Bytes|
+        accumulator.push(Bytes::concat_all([b"[", label, b"]"]))),
       b", ",
     );
     let rs = Bytes::join(rows, b", ");
@@ -105,7 +106,7 @@ pub fn angled(types: List<Bytes>, labels: List<Bytes>, rows: List<Bytes>) -> Byt
 
 pub fn generics_text(generics: Generics) -> Bytes =
   angled(
-    prefix_marked(generics.types, generics.kept, b"keep "),
+    prefix_marked(generics.types, generics.retained_types, b"keep "),
     identifier_names(generics.labels),
     identifier_names(generics.effects),
   )
@@ -116,12 +117,12 @@ fn prefix_marked(
   word: Bytes,
 ) -> List<Bytes> = {
   let names = identifier_names(prefix_marked);
-  idents.map(|ident: Identifier|
-    if names.contains(ident.name) { word.concat(ident.name) } else { ident.name })
+  idents.map(|identifier: Identifier|
+    if names.contains(identifier.name) { word.concat(identifier.name) } else { identifier.name })
 }
 
 pub fn identifier_names(idents: List<Identifier>) -> List<Bytes> =
-  idents.map(|ident: Identifier| ident.name)
+  idents.map(|identifier: Identifier| identifier.name)
 
 pub fn mode(input: Input, parser: Parser) -> Result<ParseOutput<Mode>, Parser> / {abort.raise} =
   if at_identifier_text(input, parser, b"read") {
@@ -208,25 +209,30 @@ fn type_paren(
 ) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   if at_token(input, o.parser, token_rparen()) {
-    let cl = advance(input, o.parser);
-    let ar = eat(input, cl.parser, token_arrow());
-    if ar.ok { fn_type(input, ar.parser, [], [], span) }
-    else { Ok({ parser: ar.parser, node: UnitTypeExpression({ span: span_to(o.node, cl.node) }) }) }
+    let closing_paren = advance(input, o.parser);
+    let ar = eat(input, closing_paren.parser, token_arrow());
+    if ar.ok { function_type(input, ar.parser, [], [], span) } else {
+      Ok({
+        parser: ar.parser,
+        node: UnitTypeExpression({ span: span_to(o.node, closing_paren.node) }),
+      })
+    }
   } else {
     let items = comma_list(input, o.parser, token_rparen(), paren_item)?;
     let ps = {
       parser: items.parser,
       node: items.node.map(|i: { keep: Bool, ty: TypeExpression }| i.ty),
     };
-    let kept = range(0, items.node.len()).filter(|i: Int| items.node.get(i).keep);
-    let cl = expect_close(input, ps.parser, token_rparen(), o.node, b"`)`")?;
-    let ar = eat(input, cl.parser, token_arrow());
-    if ar.ok { fn_type(input, ar.parser, ps.node, kept, span) } else if kept.len() > 0 {
+    let keep_indices = range(0, items.node.len()).filter(|i: Int| items.node.get(i).keep);
+    let closing_paren = expect_close(input, ps.parser, token_rparen(), o.node, b"`)`")?;
+    let ar = eat(input, closing_paren.parser, token_arrow());
+    if ar.ok { function_type(input, ar.parser, ps.node, keep_indices, span) }
+    else if keep_indices.len() > 0 {
       Err(
         expected_at(
           ar.parser,
-          type_span(ps.node.get(kept.get(0))),
-          b"`->` after a list whose items are written `keep`, which only a function type's parameters may be",
+          type_span(ps.node.get(keep_indices.get(0))),
+          b"`->` cannot follow a list containing `keep` items; only the parameters of a function type can be marked `keep`",
         ),
       )
     } else {
@@ -236,7 +242,7 @@ fn type_paren(
           Ok({
             parser: ar.parser,
             node: RecordTypeExpression({
-              span: span_to(o.node, cl.node),
+              span: span_to(o.node, closing_paren.node),
               fields: range(0, items.len()).map(
                 |i: Int| -> { name: Identifier, ty: TypeExpression } {
                   match items.at(i) {
@@ -262,13 +268,19 @@ fn type_record(
 ) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: fs } = comma_list(input, o.parser, token_rbrace(), type_field)?;
-  let { parser, node: cl } = expect_close(input, parser, token_rbrace(), o.node, b"`}`")?;
+  let { parser, node: closing_brace } = expect_close(
+    input,
+    parser,
+    token_rbrace(),
+    o.node,
+    b"`}`",
+  )?;
   Ok({
     parser: report_duplicate_fields(
       parser,
       fs.map(|f: { name: Identifier, ty: TypeExpression }| f.name),
     ),
-    node: RecordTypeExpression({ span: span_to(o.node, cl), fields: fs }),
+    node: RecordTypeExpression({ span: span_to(o.node, closing_brace), fields: fs }),
   })
 }
 
@@ -277,7 +289,7 @@ fn type_named(
   parser: Parser,
   span: Span,
 ) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
-  let q = qname(input, parser, b"a type")?;
+  let q = qualified_name(input, parser, b"a type")?;
   if at_token(input, q.parser, token_lt()) {
     let o = advance(input, q.parser);
     let { parser, node: args } = type_args(input, o.parser)?;
@@ -285,11 +297,11 @@ fn type_named(
     let parsed_effects = if pi.ok { effects_arguments(input, pi.parser) }
     else { Ok({ parser: pi.parser, node: [] }) };
     let { parser, node: rows } = parsed_effects?;
-    let cl = expect_gt(input, parser, b"`>` to close the type arguments")?;
+    let closing_angle = expect_gt(input, parser, b"`>` to close the type arguments")?;
     Ok({
-      parser: cl.parser,
+      parser: closing_angle.parser,
       node: NamedTypeExpression({
-        span: span_to(span, cl.node),
+        span: span_to(span, closing_angle.node),
         name: q.node,
         args: args.types,
         labels: args.labels,
@@ -311,7 +323,7 @@ type ArgOut = { types: List<TypeExpression>, labels: List<Identifier> }
 fn type_args(input: Input, parser: Parser) -> Result<ParseOutput<ArgOut>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, types: [], labels: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: ArgAccumulator|
       if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
           || at_token(input, s.parser, token_pipe())
@@ -322,8 +334,10 @@ fn type_args(input: Input, parser: Parser) -> Result<ParseOutput<ArgOut>, Parser
           Err(q) -> Stop(Err(q)),
           Ok(n) -> {
             let e = eat(input, n.parser, token_comma());
-            let ls = n.node.fold(s.labels, |acc: List<Identifier>, ident: Identifier|
-              acc.push(ident));
+            let ls = n.node.fold(
+              s.labels,
+              |accumulator: List<Identifier>, identifier: Identifier| accumulator.push(identifier),
+            );
             if e.ok { Continue({ parser: e.parser, types: s.types, labels: ls }) }
             else { Stop(Ok({ parser: e.parser, node: { types: s.types, labels: ls } })) }
           },
@@ -353,7 +367,7 @@ fn effects_arguments(
 ) -> Result<ParseOutput<List<EffectsExpression>>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, out: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: EffectsListAccumulator|
       if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
           || at_eof(input, s.parser) { Stop(Ok({ parser: s.parser, node: s.out })) } else {
@@ -368,11 +382,11 @@ fn effects_arguments(
       },
   )
 
-fn fn_type(
+fn function_type(
   input: Input,
   parser: Parser,
   params: List<TypeExpression>,
-  kept: List<Int>,
+  keep_indices: List<Int>,
   span: Span,
 ) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let { parser, node: r } = ty(input, parser)?;
@@ -383,9 +397,9 @@ fn fn_type(
       node: FunctionTypeExpression({
         span: span_to(span, type_span(r)),
         params: params,
-        kept: kept,
+        keep_indices: keep_indices,
         once: false,
-        ret: r,
+        return_type: r,
         effects: None,
       }),
     })
@@ -396,9 +410,9 @@ fn fn_type(
       node: FunctionTypeExpression({
         span: span_to(span, e.span),
         params: params,
-        kept: kept,
+        keep_indices: keep_indices,
         once: false,
-        ret: r,
+        return_type: r,
         effects: Some(e),
       }),
     })
@@ -451,9 +465,9 @@ fn effects_braced(
   let parsed_variable = if pi.ok {
     expect_identifier(input, pi.parser, b"an effect variable after `|`")
   } else { Ok({ parser: pi.parser, node: no_identifier() }) };
-  let { parser, node: tl } = parsed_variable?;
+  let { parser, node: effect_variable } = parsed_variable?;
   let b = if pi.ok { bounded_word(input, parser) } else { { parser: parser, node: false } };
-  let { parser, node: cl } = expect_close(
+  let { parser, node: close_span } = expect_close(
     input,
     b.parser,
     token_rbrace(),
@@ -465,9 +479,9 @@ fn effects_braced(
     node: {
       listed: ms.listed,
       aliases: ms.aliases,
-      variable: if pi.ok { Some(tl) } else { None },
+      variable: if pi.ok { Some(effect_variable) } else { None },
       variable_bounded: b.node,
-      span: span_to(span, cl),
+      span: span_to(span, close_span),
     },
   })
 }
@@ -484,7 +498,7 @@ fn effects_members(
 ) -> Result<ParseOutput<EffectsOut>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, aliases: [], listed: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: EffectsAccumulator|
       if at_token(input, s.parser, token_rbrace()) || at_token(input, s.parser, token_pipe()) {
         Stop(Ok({ parser: s.parser, node: { aliases: s.aliases, listed: s.listed } }))
@@ -520,7 +534,11 @@ pub fn effects_member(
   input: Input,
   parser: Parser,
 ) -> Result<ParseOutput<EffectsMember>, Parser> / {abort.raise} = {
-  let { parser, node: q } = qname(input, parser, b"an effect, or the name of an `effect set`")?;
+  let { parser, node: q } = qualified_name(
+    input,
+    parser,
+    b"an effect, or the name of an `effect set`",
+  )?;
   if !at_token(input, parser, token_dot()) { Ok({ parser: parser, node: EffectSetMember(q) }) }
   else {
     let { parser, node: a } = effect_rest(input, bump(input, parser), q)?;
@@ -531,18 +549,18 @@ pub fn effects_member(
 pub fn effect_rest(
   input: Input,
   parser: Parser,
-  qname: QName,
+  qualified_name: QName,
 ) -> Result<ParseOutput<EffectExpression>, Parser> / {abort.raise} = {
   let { parser, node: a } = effect_access(input, parser)?;
   let { parser, node: r } = effect_resource(input, parser)?;
-  let span = span_to(qname.span, previous_span(input, parser));
+  let span = span_to(qualified_name.span, previous_span(input, parser));
   let b = bounded_word(input, parser);
   Ok({
     parser: b.parser,
     node: {
-      effect_name: qname,
+      effect_name: qualified_name,
       mode: a.mode,
-      op: a.op,
+      operation: a.operation,
       resource: r.name,
       resource_wildcard: r.resource_wildcard,
       bounded: b.node,
@@ -551,7 +569,7 @@ pub fn effect_rest(
   })
 }
 
-type Access = { mode: Mode, op: Option<Identifier> }
+type Access = { mode: Mode, operation: Option<Identifier> }
 
 fn effect_access(
   input: Input,
@@ -560,7 +578,10 @@ fn effect_access(
   match token_kind(input, parser) {
     Identifier(name) -> if name != b"read" && name != b"write" {
       let a = advance(input, parser);
-      Ok({ parser: a.parser, node: { mode: WriteMode, op: Some({ name: name, span: a.node }) } })
+      Ok({
+        parser: a.parser,
+        node: { mode: WriteMode, operation: Some({ name: name, span: a.node }) },
+      })
     } else { mode_access(input, parser) },
     _ -> mode_access(input, parser),
   }
@@ -571,7 +592,7 @@ fn mode_access(
 ) -> Result<ParseOutput<Access>, Parser> / {abort.raise} =
   match mode(input, parser) {
     Err(q) -> Err(q),
-    Ok(m) -> Ok({ parser: m.parser, node: { mode: m.node, op: None } }),
+    Ok(m) -> Ok({ parser: m.parser, node: { mode: m.node, operation: None } }),
   }
 
 type EffectResource = { resource_wildcard: Bool, name: Option<Identifier> }
@@ -603,10 +624,14 @@ type PartialGenericParams = {
   parser: Parser,
   types: List<Identifier>,
   labels: List<Identifier>,
-  kept: List<Identifier>,
+  retained: List<Identifier>,
 }
 
-type GenericParams = { types: List<Identifier>, labels: List<Identifier>, kept: List<Identifier> }
+type GenericParams = {
+  types: List<Identifier>,
+  labels: List<Identifier>,
+  retained: List<Identifier>,
+}
 
 type EffectParamsAccumulator = { parser: Parser, names: List<Identifier> }
 
@@ -621,7 +646,10 @@ pub fn generics(
   else { Ok({ parser: pi.parser, node: [] }) };
   let { parser, node: es } = opt_es?;
   let { parser, .. } = expect_gt(input, parser, b"`>` to close the type parameter list")?;
-  Ok({ parser: parser, node: { types: ts.types, effects: es, labels: ts.labels, kept: ts.kept } })
+  Ok({
+    parser: parser,
+    node: { types: ts.types, effects: es, labels: ts.labels, retained_types: ts.retained },
+  })
 }
 
 fn parse_marker(input: Input, parser: Parser, word: Bytes) -> ParseOutput<Bool> =
@@ -635,12 +663,17 @@ fn generic_params(
   parser: Parser,
 ) -> Result<ParseOutput<GenericParams>, Parser> / {abort.raise} =
   iterate(
-    { parser: parser, types: [], labels: [], kept: [] },
-    input.token_count - parser.pos + 1,
+    { parser: parser, types: [], labels: [], retained: [] },
+    input.token_count - parser.position + 1,
     |s: PartialGenericParams|
       if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
           || at_token(input, s.parser, token_pipe()) {
-        Stop(Ok({ parser: s.parser, node: { types: s.types, labels: s.labels, kept: s.kept } }))
+        Stop(
+          Ok({
+            parser: s.parser,
+            node: { types: s.types, labels: s.labels, retained: s.retained },
+          }),
+        )
       } else if at_eof(input, s.parser) {
         Stop(Err(error_here(input, s.parser, b"`>` to close the type parameter list")))
       } else if at_token(input, s.parser, token_lbracket()) {
@@ -648,11 +681,18 @@ fn generic_params(
           Err(q) -> Stop(Err(q)),
           Ok(n) -> {
             let e = eat(input, n.parser, token_comma());
-            let ls = n.node.fold(s.labels, |acc: List<Identifier>, ident: Identifier|
-              acc.push(ident));
+            let ls = n.node.fold(
+              s.labels,
+              |accumulator: List<Identifier>, identifier: Identifier| accumulator.push(identifier),
+            );
             let next = { ..s, parser: e.parser, labels: ls };
             if e.ok { Continue(next) } else {
-              Stop(Ok({ parser: e.parser, node: { types: s.types, labels: ls, kept: s.kept } }))
+              Stop(
+                Ok({
+                  parser: e.parser,
+                  node: { types: s.types, labels: ls, retained: s.retained },
+                }),
+              )
             }
           },
         }
@@ -662,11 +702,17 @@ fn generic_params(
           Err(q) -> Stop(Err(q)),
           Ok(n) -> {
             let e = eat(input, n.parser, token_comma());
-            let kept = if k.node { s.kept.push(n.node) } else { s.kept };
+            let retained = if k.node { s.retained.push(n.node) } else { s.retained };
             let types = s.types.push(n.node);
-            if e.ok { Continue({ parser: e.parser, types: types, labels: s.labels, kept: kept }) }
-            else {
-              Stop(Ok({ parser: e.parser, node: { types: types, labels: s.labels, kept: kept } }))
+            if e.ok {
+              Continue({ parser: e.parser, types: types, labels: s.labels, retained: retained })
+            } else {
+              Stop(
+                Ok({
+                  parser: e.parser,
+                  node: { types: types, labels: s.labels, retained: retained },
+                }),
+              )
             }
           },
         }
@@ -695,7 +741,7 @@ fn effect_params(
 ) -> Result<ParseOutput<List<Identifier>>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, names: [] },
-    input.token_count - parser.pos + 1,
+    input.token_count - parser.position + 1,
     |s: EffectParamsAccumulator|
       if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge()) {
         Stop(Ok({ parser: s.parser, node: s.names }))
@@ -735,9 +781,9 @@ pub fn dump_type(ty: TypeExpression) -> Bytes / {abort.raise} =
         dump_node(x.span, b"tfn"),
         if x.once { dump_word(b"once") } else { b"" },
         dump_list(x.params, dump_type),
-        if x.kept.len() == 0 { b"" }
-        else { dump_word(b"keep").concat(dump_list(x.kept, dump_count)) },
-        dump_type(x.ret),
+        if x.keep_indices.len() == 0 { b"" }
+        else { dump_word(b"keep").concat(dump_list(x.keep_indices, dump_count)) },
+        dump_type(x.return_type),
         dump_opt(x.effects, dump_effects_expression),
       ]),
     RecordTypeExpression(x) ->
@@ -763,7 +809,7 @@ pub fn dump_effect_expression(entry: EffectExpression) -> Bytes / {abort.raise} 
     dump_node(entry.span, b"atm"),
     dump_qualified_name(entry.effect_name),
     dump_mode(entry.mode),
-    match entry.op { Some(op) -> dump_identifier(op), None -> b"" },
+    match entry.operation { Some(operation) -> dump_identifier(operation), None -> b"" },
     dump_opt(entry.resource, dump_identifier),
     if entry.bounded { dump_word(b"bounded") } else { b"" },
   ])
@@ -782,18 +828,18 @@ pub fn dump_generics(generics: Generics) -> Bytes / {abort.raise} =
     dump_list(generics.types, dump_identifier),
     dump_list(generics.effects, dump_identifier),
     dump_list(generics.labels, dump_identifier),
-    if generics.kept.len() == 0 { b"" }
-    else { dump_word(b"keep").concat(dump_list(generics.kept, dump_identifier)) },
+    if generics.retained_types.len() == 0 { b"" }
+    else { dump_word(b"keep").concat(dump_list(generics.retained_types, dump_identifier)) },
   ])
 
-pub fn dump_type_of(src: Bytes) -> String / {abort.raise} = {
-  let s = start(src);
+pub fn dump_type_of(source: Bytes) -> String / {abort.raise} = {
+  let s = start(source);
   let r = parsed_or(ty(s.input, s.parser), no_type());
   String::of_bytes(dump_type(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
 
-pub fn dump_generics_of(src: Bytes) -> String / {abort.raise} = {
-  let s = start(src);
+pub fn dump_generics_of(source: Bytes) -> String / {abort.raise} = {
+  let s = start(source);
   let r = parsed_or(generics(s.input, s.parser), no_generics());
   String::of_bytes(dump_generics(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
@@ -838,7 +884,7 @@ test "a `>=` closing a type argument list is split into `>` and `=`" {
   )
 }
 
-test "a type's label arguments are bracketed among its type arguments, and its effects follow `|`" {
+test "a type's `<...>` arguments may include label arguments in square brackets, and its effects come after `|`" {
   assert_eq(
     dump_type_of(b"T<a | e>"),
     "0:8:tcon;0:1:qname;?0;0:1:ident;@54;#1;2:3:tvar;2:3:ident;@61;%over;#0;#1;6:7:row;#0;#0;?1;6:7:ident;@65;#0;",
@@ -863,7 +909,7 @@ test "a type's label arguments are bracketed among its type arguments, and its e
   )
 }
 
-test "an effects argument ends at the `>` that closes its type, a nested one and a split `>=` alike" {
+test "a type's effects argument ends at its closing `>`, including inside a nested type, and `T<a | e>=` parses like `T<a | e>`" {
   assert_eq(
     dump_type_of(b"Map<K, T<a | e>>"),
     "0:16:tcon;0:3:qname;?0;0:3:ident;@4d6170;#2;4:5:tcon;4:5:qname;?0;4:5:ident;@4b;#0;"
@@ -872,13 +918,13 @@ test "an effects argument ends at the `>` that closes its type, a nested one and
   assert_eq(dump_type_of(b"T<a | e>="), dump_type_of(b"T<a | e>"))
 }
 
-test "an effects argument is a list of effects and a label argument a name, and neither closes without its `>`" {
+test "an invalid effect, an invalid label argument, or a missing closing `>` reports one diagnostic" {
   assert_eq(dump_type_of(b"T<a | 3>"), "0:0:tbad;#1;!E0001:6:7:1:0;=6:7:1;");
   assert_eq(dump_type_of(b"T<[*]>"), "0:0:tbad;#1;!E0001:3:4:1:0;=3:4:1;");
   assert_eq(dump_type_of(b"T<a | e"), "0:0:tbad;#1;!E0001:7:7:1:0;=7:7:1;")
 }
 
-test "a parenthesised type keeps the inner node's own span" {
+test "a parenthesised type has the span of the inner type, without the parentheses" {
   assert_eq(dump_type_of(b"(a)"), "1:2:tvar;1:2:ident;@61;#0;")
 }
 
@@ -914,7 +960,7 @@ test "an effect list separates the sets it names from the effects it writes" {
   )
 }
 
-test "a module-qualified type keeps both halves" {
+test "a module-qualified type such as `m::T` parses into both its module name and its type name" {
   assert_eq(dump_type_of(b"m::T"), "0:4:tcon;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@54;#0;#0;")
 }
 
@@ -925,11 +971,11 @@ test "a parenthesised list that is not a parameter list is a tuple type" {
   )
 }
 
-test "an unclosed delimiter labels the opener as well as the offending token" {
+test "an unclosed `(` in a type reports one error that points at both the unexpected token and the `(`" {
   assert_eq(dump_type_of(b"("), "0:0:tbad;#1;!E0001:1:1:2:0;=1:1:1;=0:1:0;")
 }
 
-test "a token that cannot start a type is one diagnostic and no more" {
+test "a token that cannot start a type, such as `<` or `}`, reports exactly one error" {
   assert_eq(dump_type_of(b"<"), "0:0:tbad;#1;!E0001:0:1:1:0;=0:1:1;");
   assert_eq(dump_type_of(b"{x: }"), "0:0:tbad;#1;!E0001:4:5:1:0;=4:5:1;")
 }
@@ -944,7 +990,7 @@ test "a type parameter list, with and without effect parameters" {
   )
 }
 
-test "a bracketed name in the type parameter list binds a label" {
+test "a bracketed name such as `[l]` in a type parameter list is parsed as a label name, separate from type and effect names" {
   assert_eq(dump_generics_of(b"<[l]>"), "%gen;#0;#0;#1;2:3:ident;@6c;#0;");
   assert_eq(
     dump_generics_of(b"<a, [l] | e>"),
@@ -954,13 +1000,13 @@ test "a bracketed name in the type parameter list binds a label" {
   assert_eq(dump_generics_of(b"<[l], [k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;7:8:ident;@6b;#0;")
 }
 
-test "either half of a type parameter list may be empty" {
+test "a type parameter list may leave out its type names or its effect names, and one missing its `>` is an error" {
   assert_eq(dump_generics_of(b"<|e>"), "%gen;#0;#1;2:3:ident;@65;#0;#0;");
   assert_eq(dump_generics_of(b"<>"), "%gen;#0;#0;#0;#0;");
   assert_eq(dump_generics_of(b"<a"), "%gen;#0;#0;#0;#1;!E0001:2:2:1:0;=2:2:1;")
 }
 
-test "an unclosed record type labels its opening brace; a `<` has no opener to label" {
+test "an unclosed `{` in a record type reports an error at the `{` too, but an unclosed `<` reports only the error at the end" {
   assert_eq(dump_type_of(b"{x: Int"), "0:0:tbad;#1;!E0001:7:7:2:0;=7:7:1;=0:1:0;");
   assert_eq(dump_type_of(b"List<a"), "0:0:tbad;#1;!E0001:6:6:1:0;=6:6:1;")
 }

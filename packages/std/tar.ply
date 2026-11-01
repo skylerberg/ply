@@ -1,52 +1,60 @@
-//! Tar archives: read, written and planned for extraction as values, and packed from and extracted
-//! onto a root of `std.fs`.
+//! Tar archives: reads, writes and plans the extraction of them as values, and packs a directory
+//! tree into one and extracts one onto a directory, using a root of `std.fs`. A root is a `std.fs`
+//! value that limits file access to one directory and everything beneath it.
 //!
-//! `read` turns an archive's bytes into its entries, each a header and its data. It reads POSIX
-//! ustar, pax extended headers (long and non-ASCII paths, large sizes and owners, times finer than
-//! a second), GNU tar's long name and long link members and its base-256 numbers, and the old v7
-//! form. It accepts a header's checksum summed either way, with bytes signed or unsigned. A reader
-//! takes its `Limits` as an argument: how many entries, how many bytes of data in total and in one
-//! entry, and how long a path may be. It rejects, reporting why and at which header, a checksum
-//! that does not match, a number field that is not a number, a malformed extended record, a name
-//! that is not UTF-8, and an archive that ends inside an entry. A device, a FIFO and any type flag
-//! this module has no name for are kept as their headers describe them. A sparse file is kept as a
+//! `read` turns an archive's bytes into entries, each a header and its data. It understands POSIX
+//! ustar, pax extended headers (long and non-ASCII paths, large sizes and owner ids, times finer
+//! than a second), GNU tar's long name and long link members and base-256 numbers, and the old v7
+//! format. It accepts a header checksum computed with signed or unsigned bytes.
+//!
+//! `read` takes `Limits`: the most entries, the most bytes of data in total and in one entry, and
+//! the longest path. It rejects an archive, reporting the reason and the header's offset, when a
+//! checksum does not match, a number field is not a number, an extended record is malformed, a name
+//! is not UTF-8, or the archive ends inside an entry. A device, a FIFO and any type flag this
+//! module has no name for are read as their headers describe them. A sparse file is read as a
 //! `Sparse` entry whose data is the stored form, not expanded.
 //!
-//! `read`, and `members`, which lists an archive without its data, are built on `step`. It reads
-//! one member's header from the bytes seen so far and reports where its data lies and where the
-//! next member starts, or how many bytes it needs first. A driver that has only part of an archive
-//! calls it as bytes arrive.
+//! `read`, and `members`, which lists an archive without its data, are built on `step`. `step`
+//! reads one member's header from the bytes seen so far and returns where the member's data lies
+//! and where the next member starts, or how many bytes it needs first. A caller that has only part
+//! of an archive calls `step` again as more bytes arrive.
 //!
-//! `write` emits ustar, with a pax header before an entry only where ustar cannot express it. It
-//! writes nothing its input does not contain: no clock, no user and no order of its own, so equal
-//! entries give equal bytes. `file`, `directory`, `symlink` and `hard_link` make entries owned by
-//! nobody and modified at the epoch unless told otherwise.
+//! `write` emits ustar, with a pax header before an entry only where ustar cannot express it. Equal
+//! entries give equal bytes, because `write` adds no clock, user or order of its own. `file`,
+//! `directory`, `symlink` and `hard_link` make entries owned by nobody and modified at the epoch
+//! unless told otherwise.
 //!
-//! An entry's path is whatever the archive says, and an archive may say `../../etc/passwd`.
-//! Checking one touches no file system: `plan` returns the operations that extract a list of
-//! entries beneath a root, each on a path checked to stay there, or the entry that may not be
-//! extracted and why. It rejects an absolute path, a path that climbs out of the root, an entry
-//! beneath a symbolic link or a file the archive itself made, a symbolic link that points out of
-//! the root or through another link, a hard link to anything but a file the archive made earlier,
-//! an entry that replaces an earlier one with a different kind of thing, and devices, FIFOs and
-//! sparse files. A path's segments are what lies between `/`. For all of these checks, paths are
-//! compared in Unicode lower case, so an archive cannot use a case-folding file system to pass
-//! through a link; Unicode normalization is not folded. A later file replaces an earlier one at its
-//! path, and every operation's mode is permission bits only.
+//! An entry's path is whatever the archive says, and an archive may say `../../etc/passwd`. `plan`
+//! touches no file system. It returns the operations that extract a list of entries beneath a root,
+//! each on a path checked to stay inside the root, or the entry that may not be extracted and why.
+//! It rejects: - an absolute path, or a path that climbs out of the root; - an entry beneath a
+//! symbolic link or beneath a file the archive itself made; - a symbolic link that points out of
+//! the root or through another link; - a hard link to anything but a file the archive made earlier;
+//! - an entry that replaces an earlier one with a different kind of thing; - devices, FIFOs and
+//! sparse files.
+//!
+//! A path's segments are what lies between `/`. These checks compare paths in Unicode lower case,
+//! so an archive cannot pass through a link by exploiting a case-folding file system; Unicode
+//! normalization is not folded. A later file replaces an earlier one at the same path, and every
+//! operation's mode is permission bits only.
 //!
 //! `extract` carries out a plan beneath a directory of a root. `unpack` reads an archive from a
-//! file and extracts it, checking every member before it writes any, and keeping no more of the
-//! archive in memory than a window. A plan knows what the archive made, but not what the directory
-//! already contained or what another program does to it meanwhile, so each operation checks first.
-//! The directory it writes in must be one the host reaches through no link and under the name the
-//! plan gave it, and whatever is at its own path must be something it may replace. A file is always
-//! created new, and only where nothing is, so nothing is written through a link or into another
-//! name of a file. What remains is the moment between a check and the write after it: a program
-//! that can write in the directory can put a link there in that moment. The write then lands where
-//! the link leads, which the root's own confinement still keeps inside the root. `pack` writes the
-//! archive of a tree into a sink a chunk of a file at a time. Its entries are in the order of their
-//! names and, unless told to keep them, without the times and modes that differ from one checkout
-//! to the next.
+//! file and extracts it. It checks every member before it writes any, and it holds no more of the
+//! archive in memory than a window.
+//!
+//! A plan knows what the archive made, but not what the directory already contained or what another
+//! program changes meanwhile, so each operation checks first. The directory it writes in must be
+//! reached through no link and under the name the plan gave it, and whatever is already at the path
+//! must be something the operation may replace. A file is always created new, and only where
+//! nothing exists, so nothing is written through a link or into another name of the same file.
+//!
+//! One race remains: between a check and the write after it, a program that can write in the
+//! directory can put a link there. The write then lands where the link leads, but the root still
+//! keeps that inside the root.
+//!
+//! `pack` writes the archive of a tree into a sink, one chunk of a file at a time. Its entries are
+//! sorted by name. Unless told to keep them, it omits the times and modes that differ from one
+//! checkout to the next.
 
 import std.bytes (ascii_of_int)
 import std.fs
@@ -62,8 +70,6 @@ import std.time (nanos_at)
 import std.unicode
 import std.gen
 
-// --- Entries --------------------------------------------------------------------
-
 /// What an entry is.
 pub type Kind =
   | File
@@ -75,19 +81,21 @@ pub type Kind =
   | CharDevice
   | BlockDevice
   | Fifo
-  /// A sparse file as GNU tar stores one. Its data is the stored form, not expanded: the file's
-  /// bytes without its holes, preceded in the pax form by a map.
+  /// A sparse file as GNU tar stores it, without its holes. The entry's data is the stored bytes,
+  /// not expanded to the file's full size. In the pax sparse format, the data starts with a map of
+  /// which parts of the file are stored.
   | Sparse
-  /// Any other type flag, which this contains.
+  /// Any other type flag. The `Int` is the flag's byte value.
   | Other(Int)
 
 /// One record of a pax extended header.
 pub type Record = new { keyword: String, value: Bytes }
 
-/// What an archive records about one member, apart from its data.
+/// The metadata of an archive member: everything except its data.
 pub type Header = new {
-  /// As the archive writes it, without a directory's trailing `/`. Only `plan` makes it safe to
-  /// use.
+  /// The member's path exactly as the archive stores it, without a directory's trailing `/`. It is
+  /// untrusted: it may be absolute or climb out of the extraction root. `plan` checks it before
+  /// anything is extracted.
   path: String,
   kind: Kind,
   /// The permission, set-id and sticky bits.
@@ -103,8 +111,9 @@ pub type Header = new {
   /// A device's numbers; zero for any other kind.
   major: Int,
   minor: Int,
-  /// The pax records in effect that no field above stores, in the order of their keywords: access
-  /// and change times, extended attributes, a vendor's own.
+  /// The pax extended records that apply to this member and that no field above stores, sorted by
+  /// keyword. Examples are access and change times, extended attributes and vendor-specific
+  /// records.
   extended: List<Record>,
 }
 
@@ -144,23 +153,23 @@ pub fn symlink(path: String, target: String, modified: Instant = Instant(0)) -> 
 pub fn hard_link(path: String, target: String, modified: Instant = Instant(0)) -> Entry =
   { header: header(path, HardLink, 420, modified, target), data: b"" }
 
-// --- Errors ---------------------------------------------------------------------
-
 /// Why a reader rejected an archive, or a writer an entry.
 pub type ErrorKind =
   /// The archive ends inside a header or an entry's data.
   | Truncated
-  /// A header whose checksum is neither sum of its bytes.
+  /// A header whose stored checksum equals neither the sum of its bytes as unsigned values nor the
+  /// sum as signed values.
   | BadChecksum
-  /// A header field that is not a number, or a number its field cannot hold: a negative size, a
-  /// time beyond an `Instant`'s range, a mode above `07777`.
+  /// A header field that is not a number, or a number outside the range its field can store: a
+  /// negative size, a time outside an `Instant`'s range, or a mode above `07777`.
   | BadNumber
-  /// An extended header that is not records of `length keyword=value`, a record whose value
-  /// its keyword cannot take, or a record a writer leaves to a header's own fields.
+  /// An extended header that is not made of `length keyword=value` records, a record whose value is
+  /// invalid for its keyword, or, when writing, a record whose keyword is one that a `Header` field
+  /// already stores.
   | BadRecord
   /// A path, a link or an owner's name that is not UTF-8.
   | NotUtf8
-  /// A block of zeros followed by something other than a second.
+  /// A block of zeros that is not followed by a second block of zeros. An archive ends with two.
   | BadEnd
   /// More entries than the reader's limit.
   | TooMany
@@ -170,12 +179,13 @@ pub type ErrorKind =
   | TooMuch
   /// A path or a link longer than the reader's limit.
   | TooLong
-  /// A path, a link or an owner's name a header cannot hold: one with a NUL, an empty path, a
-  /// path that ends in `/`.
+  /// A path, a link or an owner's name that cannot be written to a header: one containing a NUL, an
+  /// empty path, or a path that ends in `/`.
   | BadName
   /// Data on an entry of a kind that has none.
   | StrayData
-  /// A kind that is not written: `Sparse`, or an `Other` whose flag reads as something else.
+  /// A kind that cannot be written: `Sparse`, or an `Other` whose type flag is the flag of another
+  /// kind.
   | BadKind
 
 /// A reading error, and the offset of the header it is about.
@@ -192,30 +202,33 @@ pub type UnsafeReason =
   | Absolute
   /// A path that climbs out of the root it is extracted under.
   | Escapes
-  /// A path that passes through a symbolic link an earlier entry made, or a link made where an
-  /// earlier link's target passes.
+  /// A path that passes through a symbolic link that an earlier entry created. Also a link created
+  /// at a location that an earlier link's target passes through.
   | ThroughLink
-  /// A path beneath something an earlier entry made a file.
+  /// A path inside a location that an earlier entry created as a regular file, so the file would
+  /// have to be a directory.
   | BeneathFile
-  /// An entry where an earlier one made another kind of thing: a link over a directory, a
-  /// directory over a file.
+  /// An entry that replaces an earlier entry of a different kind at the same path, such as a link
+  /// replacing a directory or a directory replacing a file.
   | Replaces
   /// A symbolic link whose target is absolute or climbs out of the root, or a hard link whose
   /// target does.
   | LinkEscapes
-  /// A hard link to something no earlier entry made a file.
+  /// A hard link whose target is not a regular file that an earlier entry created.
   | LinkMissing
-  /// A device, a FIFO, a sparse file or a type flag with no name: nothing a plan makes.
+  /// A kind that extraction does not create: a device, a FIFO, a sparse file, or an entry whose
+  /// type flag is not a known kind.
   | Special
-  /// A path or a link with a `\`, which some systems read as a `/` and others as a letter of a
-  /// name. A tar archive's names are Unix names, so no plan here rejects one; `std.zip`'s does.
+  /// A path or a link containing a `\`, which some systems treat as a `/` and others as an ordinary
+  /// name character. Tar names are Unix names, so `std.tar` does not reject a `\` in a name;
+  /// `std.zip` does.
   | Backslash
-  /// A path or a link with a segment that opens with a letter and a `:`, which some systems read as
-  /// a drive. `std.zip`'s plan rejects it, as it does a backslash.
+  /// A path or a link with a segment that starts with a letter followed by `:`, which some systems
+  /// treat as a drive. `std.zip` rejects this, as it rejects a `\`, but `std.tar` does not.
   | Drive
 
-/// An entry a plan rejected: its index among the entries, its path as the archive writes it, and
-/// why.
+/// An entry that may not be extracted: its index among the entries, its path as written in the
+/// archive, and the reason.
 pub type UnsafeEntry = new { index: Int, path: String, reason: UnsafeReason }
 
 /// The effects this module raises when it rejects its input.
@@ -230,17 +243,11 @@ pub effect tar {
 
 fn fail<a>(at: Int, reason: ErrorKind) -> a / {tar.fail} = tar.fail({ at: at, reason: reason })
 
-// --- Header fields --------------------------------------------------------------
-
-/// A field's bytes up to its first NUL.
 fn text(header_block: Bytes, from: Int, width: Int) -> Bytes / {abort.raise} = {
   let field = header_block.slice(from, from + width);
   field.slice(0, field.skip_until(0, b"\x00"))
 }
 
-/// The number in a field: octal digits between spaces and NULs, or, after a first byte with its
-/// high bit set, the big-endian two's complement GNU tar writes where the digits do not reach.
-/// `None` for anything else and for a number past an `Int`.
 fn number(header_block: Bytes, from: Int, width: Int) -> Option<Int> / {abort.raise} = {
   let field = header_block.slice(from, from + width);
   if field.at(0) >= 0x80 { twos_complement_number(field) } else {
@@ -263,7 +270,6 @@ fn twos_complement_number(field: Bytes) -> Option<Int> / {abort.raise} = {
   magnitude.map(|n: Int| if negative { -1 - n } else { n })
 }
 
-/// Sizes at or above this are rejected: nothing in memory is that large, and offsets stay `Int`s.
 fn size_ceiling() -> Int = 0x1000_0000_0000_0000
 
 fn field_number(
@@ -277,8 +283,6 @@ fn field_number(
     None -> fail(at, BadNumber),
   }
 
-/// A block's bytes summed with its checksum field read as spaces, each byte unsigned and each
-/// signed: the standard's sum, and the one some historical writers stored.
 fn sums(header_block: Bytes) -> { unsigned: Int, signed: Int } / {abort.raise} =
   range(0, 512).fold({ unsigned: 0, signed: 0 }, |sum: { unsigned: Int, signed: Int }, i: Int| {
     let byte = if i >= 148 && i < 156 { 0x20 } else { header_block.at(i) };
@@ -288,16 +292,8 @@ fn sums(header_block: Bytes) -> { unsigned: Int, signed: Int } / {abort.raise} =
     }
   })
 
-/// Which layout a header block has past its link name.
-type Format =
-  /// The v7 form: nothing there.
-  | Old
-  /// POSIX: owner names, device numbers, and a prefix for the name.
-  | Ustar
-  /// GNU's: owner names and device numbers, and times and a sparse map where the prefix would be.
-  | Gnu
+type Format = | Old | Ustar | Gnu
 
-/// One header block's fields as written.
 type RawHeader = {
   name: Bytes,
   mode: Int,
@@ -355,7 +351,6 @@ fn kind_of(flag: Int, stored: Bytes) -> Kind =
   else if flag == 83 { Sparse }
   else { Other(flag) }
 
-/// The type flag a kind is written under, or `None` for one that is not written.
 fn flag_of(kind: Kind) -> Option<Int> =
   match kind {
     File -> Some(48),
@@ -371,27 +366,20 @@ fn flag_of(kind: Kind) -> Option<Int> =
     else { Some(flag) },
   }
 
-/// Whether a member under this flag describes the member after it: a pax header for the next
-/// member or for all that follow, or GNU's long name or long link.
 fn describes_next(flag: Int) -> Bool = flag == 120 || flag == 103 || flag == 76 || flag == 75
 
 fn has_data(kind: Kind) -> Bool = match kind { File | Sparse | Other(_) -> true, _ -> false }
 
 fn padded(size: Int) -> Int = (size + 511) / 512 * 512
 
-/// How much of a directory's `stored` name is the name: all but its trailing slashes, and at least
-/// one byte. `n` is the name's length.
+/// Returns the length of the first `n` bytes of `stored` after removing trailing slashes, but never
+/// less than 1.
 pub fn slash_trimmed_length(stored: Bytes, n: Int) -> Int / {abort.raise} =
   if n > 1 && stored.at(n - 1) == 0x2F { slash_trimmed_length(stored, n - 1) } else { n }
 
-// --- Extended headers -----------------------------------------------------------
-
-/// The keywords that a header's own fields store, which `extended` never contains.
 fn header_keywords() -> List<String> =
   ["path", "linkpath", "size", "uid", "gid", "uname", "gname", "mtime"]
 
-/// The records in an extended header's `data`. Each is `length keyword=value` and a newline, with
-/// the decimal length counting all of it, so a value may contain any byte.
 fn records(at: Int, data: Bytes) -> List<Record> / {tar.fail, abort.raise} =
   records_from(at, data, 0, [], data.len())
 
@@ -399,10 +387,10 @@ fn records_from(
   at: Int,
   data: Bytes,
   i: Int,
-  acc: List<Record>,
+  accumulator: List<Record>,
   span: Int,
 ) -> List<Record> / {tar.fail, abort.raise} =
-  if i >= data.len() || span <= 0 { acc } else {
+  if i >= data.len() || span <= 0 { accumulator } else {
     let digits = data.skip(i, b"0123456789");
     match data.slice(i, digits).int_of_ascii() {
       None -> fail(at, BadRecord),
@@ -418,7 +406,7 @@ fn records_from(
             at,
             data,
             i + length,
-            acc.push({
+            accumulator.push({
               keyword: String::of_bytes(keyword),
               value: body.slice(keyword.len() + 1, body.len()),
             }),
@@ -436,13 +424,9 @@ fn record_bytes(keyword: String, value: Bytes) -> Bytes = {
   ascii_of_int(whole).concat(body)
 }
 
-/// `pax_records` with each of `more` applied on top, a later record of a keyword replacing an
-/// earlier one.
 fn with_records(pax_records: Map<String, Bytes>, more: List<Record>) -> Map<String, Bytes> =
   more.fold(pax_records, |m: Map<String, Bytes>, r: Record| m.insert(r.keyword, r.value))
 
-/// The instant a pax time names: decimal seconds, a sign before them and a fraction after them
-/// allowed, read to the nanosecond.
 fn instant_of(text: Bytes) -> Option<Instant> / {abort.raise} = {
   let n = text.len();
   let negative = n > 0 && text.at(0) == 0x2D;
@@ -458,23 +442,19 @@ fn instant_of(text: Bytes) -> Option<Instant> / {abort.raise} = {
   }
 }
 
-/// A time as a pax record writes it: seconds, and a fraction where there is one.
 fn instant_text(nanos: Int) -> Bytes / {abort.raise} = {
   let size = if nanos < 0 { 0 - nanos } else { nanos };
   let fraction = Bytes::of_string(Int::to_string(1000000000 + size % 1000000000));
-  let kept = zero_trimmed_length(fraction, 10);
+  let trimmed_length = zero_trimmed_length(fraction, 10);
   Bytes::concat_all([
     if nanos < 0 { b"-" } else { b"" },
     ascii_of_int(size / 1000000000),
-    if kept == 1 { b"" } else { b".".concat(fraction.slice(1, kept)) },
+    if trimmed_length == 1 { b"" } else { b".".concat(fraction.slice(1, trimmed_length)) },
   ])
 }
 
-/// How much of `digits` is left without its trailing zeros, its first digit kept.
 fn zero_trimmed_length(digits: Bytes, n: Int) -> Int / {abort.raise} =
   if n > 1 && digits.at(n - 1) == 0x30 { zero_trimmed_length(digits, n - 1) } else { n }
-
-// --- Reading: one member at a time ----------------------------------------------
 
 /// What a reader accepts: `entries` members, `total` bytes of data in all, `size` bytes in one, and
 /// `path` bytes in a path or a link. The data of a member that only describes the next, an extended
@@ -497,15 +477,17 @@ pub type Step =
   | Next(Member)
   /// The two blocks of zeros that end an archive.
   | End
-  /// The bytes seen end before the next member's header does, counting the extended headers before
-  /// it. With this many bytes in all, a step can make progress.
+  /// The bytes seen so far end before the next member's header is complete, counting any extended
+  /// headers before it. The `Int` is the total number of bytes, counted from the start of the
+  /// archive, that `seen` must contain before `step` can make progress.
   | NeedMore(Int)
 
-/// What the members before a header recorded about it.
 type Pending = { path: Option<Bytes>, link: Option<Bytes>, local: Map<String, Bytes> }
 
-/// The member at `from` in `seen`, the bytes of an archive from its start as far as they have
-/// arrived. Offsets, the cursor's and the member's, count from the start of `seen`.
+/// Reads the member that starts at `from` in `seen`, the archive bytes received so far. Returns
+/// `Next` with the member, `End` at the closing zero blocks, or `NeedMore` with the length `seen`
+/// must reach before the member can be read. Fails with `tar.fail` on a malformed archive. Offsets
+/// count from the start of `seen`.
 pub fn step(seen: Bytes, from: Cursor, limits: Limits) -> Step / {tar.fail, abort.raise} =
   read_member_header(
     seen,
@@ -515,8 +497,6 @@ pub fn step(seen: Bytes, from: Cursor, limits: Limits) -> Step / {tar.fail, abor
     (seen.len() - from.at) / 512 + 1,
   )
 
-/// A member is at least one block, so `span`, the number of blocks, bounds the headers that
-/// describe the member after them.
 fn read_member_header(
   seen: Bytes,
   c: Cursor,
@@ -562,8 +542,6 @@ fn read_member_header(
     }
   }
 
-/// Where an old GNU sparse member's data begins: past the blocks that continue its map. `None`
-/// where the bytes seen end first.
 fn past_map(seen: Bytes, at: Int, continued: Bool, span: Int) -> Option<Int> / {abort.raise} =
   if !continued { Some(at) }
   else if span <= 0 || seen.len() - at < 512 { None }
@@ -578,8 +556,6 @@ fn decimal(at: Int, text: Bytes) -> Int / {tar.fail, abort.raise} =
     None -> fail(at, BadRecord),
   }
 
-/// The member whose header `h` is at the cursor, with the values from the extended headers in
-/// effect and the members before it applied over its own fields.
 fn finish_member(
   seen: Bytes,
   c: Cursor,
@@ -587,11 +563,10 @@ fn finish_member(
   pending: Pending,
   h: RawHeader,
 ) -> Step / {tar.fail, abort.raise} = {
-  // An empty value resets a keyword to what the header says.
   let pax_records = c.global.merge(pending.local).fold(
     Map::new(),
-    |kept: Map<String, Bytes>, keyword: String, value: Bytes|
-      if value.len() == 0 { kept } else { kept.insert(keyword, value) },
+    |non_empty_records: Map<String, Bytes>, keyword: String, value: Bytes|
+      if value.len() == 0 { non_empty_records } else { non_empty_records.insert(keyword, value) },
   );
   let stored = match pending.path {
     Some(long) -> long,
@@ -664,8 +639,6 @@ fn finish_member(
   }
 }
 
-// --- Reading: a whole archive ---------------------------------------------------
-
 /// Every member of `archive`, its header and where its data lies, without the data: a listing.
 /// An archive may end at its last member without the blocks of zeros that should follow.
 pub fn members(archive: Bytes, limits: Limits) -> List<Member> / {tar.fail, abort.raise} =
@@ -675,16 +648,16 @@ fn collect_members(
   archive: Bytes,
   c: Cursor,
   limits: Limits,
-  acc: List<Member>,
+  accumulator: List<Member>,
   span: Int,
 ) -> List<Member> / {tar.fail, abort.raise} =
-  if span <= 0 { acc } else {
+  if span <= 0 { accumulator } else {
     match step(archive, c, limits) {
-      End -> acc,
-      NeedMore(_) -> if archive.skip(c.at, b"\x00") >= archive.len() { acc }
+      End -> accumulator,
+      NeedMore(_) -> if archive.skip(c.at, b"\x00") >= archive.len() { accumulator }
       else { fail(c.at, Truncated) },
       Next(m) -> if m.size > archive.len() - m.data { fail(c.at, Truncated) }
-      else { collect_members(archive, m.next, limits, acc.push(m), span - 1) },
+      else { collect_members(archive, m.next, limits, accumulator.push(m), span - 1) },
     }
   }
 
@@ -698,9 +671,6 @@ pub fn read(archive: Bytes, limits: Limits) -> List<Entry> / {tar.fail, abort.ra
 pub fn decode(archive: Bytes, limits: Limits) -> Result<List<Entry>, Error> / {abort.raise} =
   try { read(archive, limits) }
 
-// --- Writing --------------------------------------------------------------------
-
-/// What a header block is written from.
 type HeaderFields = {
   name: Bytes,
   mode: Int,
@@ -717,7 +687,6 @@ type HeaderFields = {
   prefix: Bytes,
 }
 
-/// `n` in `digits` octal digits and a NUL.
 fn octal(n: Int, digits: Int) -> Bytes =
   Bytes::concat_all(
     range(0, digits).map(|i: Int| byte_of_int(48 + (n >> 3 * (digits - 1 - i) & 7))),
@@ -755,16 +724,12 @@ fn header_block(b: HeaderFields) -> Bytes / {abort.raise} = {
 
 fn ascii(text: Bytes) -> Bool = text.position(0, |byte: Int| byte >= 0x80) == None
 
-/// What a header field stores of a text that a pax record contains in full: its first `width`
-/// bytes, with each byte outside ASCII as `_`.
 fn shortened(text: Bytes, width: Int) -> Bytes =
   Bytes::concat_all(
     range(0, min(width, text.len())).map(|i: Int|
       if text.at(i) >= 0x80 { b"_" } else { text.slice(i, i + 1) }),
   )
 
-/// Where to split `stored` into ustar's prefix and name: the last `/` that leaves at most 155 bytes
-/// before it and between 1 and 100 after it. `None` when no split does.
 fn prefix_split(stored: Bytes) -> Option<Int> = {
   let n = stored.len();
   range(max(1, n - 101), min(n - 1, 156)).fold(None, |found: Option<Int>, i: Int|
@@ -774,12 +739,9 @@ fn prefix_split(stored: Bytes) -> Option<Int> = {
 fn unwritable<a>(index: Int, reason: ErrorKind) -> a / {tar.unwritable} =
   tar.unwritable({ index: index, reason: reason })
 
-/// The largest numbers that seven and eleven octal digits can write.
 fn max_octal_field() -> Int = 0x1F_FFFF
 fn eleven_digits() -> Int = 0x1_FFFF_FFFF
 
-/// Why no header can be written for an entry with this header and `size` bytes of data, if none
-/// can.
 fn header_error(h: Header, size: Int) -> Option<ErrorKind> = {
   let nul = |text: String| text.contains("\0");
   let device = h.kind == CharDevice || h.kind == BlockDevice;
@@ -800,7 +762,6 @@ fn header_error(h: Header, size: Int) -> Option<ErrorKind> = {
   else { None }
 }
 
-/// One entry as it appears in an archive: its headers, and its data padded to a whole block.
 fn member_bytes(index: Int, e: Entry) -> Bytes / {tar.unwritable, abort.raise} = {
   let size = e.data.len();
   Bytes::concat_all([
@@ -810,8 +771,6 @@ fn member_bytes(index: Int, e: Entry) -> Bytes / {tar.unwritable, abort.raise} =
   ])
 }
 
-/// What comes before the `size` bytes of an entry's data in an archive: a pax header where ustar's
-/// fields cannot express `h`, then the entry's own header.
 fn header_bytes(index: Int, h: Header, size: Int) -> Bytes / {tar.unwritable, abort.raise} =
   match header_error(h, size) {
     Some(reason) -> unwritable(index, reason),
@@ -904,13 +863,11 @@ pub fn write(entries: List<Entry>) -> Bytes / {tar.unwritable, abort.raise} =
 pub fn encode(entries: List<Entry>) -> Result<Bytes, WriteError> / {abort.raise} =
   try { write(entries) }
 
-// --- Extraction -----------------------------------------------------------------
-
 /// One step of an extraction. Every path is relative to the root the caller extracts under:
 /// segments with `/` between them, none of them empty, `.` or `..`.
 pub type Operation =
-  /// Make the directory at the path, with the mode, or set the mode of the one there. A plan
-  /// makes a directory before anything beneath it.
+  /// Makes the directory at the path with the mode. If a directory already exists there, sets its
+  /// mode instead. A plan makes a directory before anything inside it.
   | MakeDirectory(String, Int)
   /// Write the file at the path, with the mode and the data, in place of any file there.
   | WriteFile(String, Int, Bytes)
@@ -919,23 +876,14 @@ pub type Operation =
   /// Make the first path another name for the file at the second.
   | MakeHardLink(String, String)
 
-/// What the entries so far made at a path.
-type PlannedPath =
-  | PlannedDirectory
-  | PlannedFile
-  | PlannedLink
-  /// Nothing yet, but a symbolic link's target passes through it as a directory.
-  | LinkTraversed
+type PlannedPath = | PlannedDirectory | PlannedFile | PlannedLink | LinkTraversed
 
-/// A plan's progress: what is at each path, with paths compared ignoring case; the directories
-/// already made, as written; and the operations so far.
 type Plan = {
   made: Map<String, PlannedPath>,
   directories: Map<String, Unit>,
   steps: List<Operation>,
 }
 
-/// The entry a plan is checking.
 type EntryPath = { index: Int, path: String }
 
 fn danger<a>(entry: EntryPath, reason: UnsafeReason) -> a / {tar.unsafe} =
@@ -945,9 +893,6 @@ fn joined(segments: List<String>) -> String = String::join(segments, "/")
 
 fn folded(segments: List<String>) -> String = unicode::lowercase(joined(segments))
 
-/// The directory `text` leads to from `from`, segment by segment: an empty segment and `.` stay,
-/// `..` climbs, and `climbing` is the danger to report for climbing past the root. No directory on
-/// the way may be one the archive made a link or a file; `passed` collects them.
 fn resolve_path(
   entry: EntryPath,
   made: Map<String, PlannedPath>,
@@ -972,13 +917,11 @@ fn resolve_path(
       },
   )
 
-/// The segments an entry's path names beneath the root, none for the root itself.
 fn entry_segments(entry: EntryPath, made: Map<String, PlannedPath>) -> List<String> / {tar.unsafe} =
   if entry.path == "" || entry.path.contains("\0") { danger(entry, NoName) }
   else if entry.path.starts_with("/") { danger(entry, Absolute) }
   else { resolve_path(entry, made, entry.path, [], Escapes).at }
 
-/// `p` with every directory above `at` made that is not made yet.
 fn with_parents(p: Plan, at: List<String>) -> Plan =
   range(1, at.len()).fold(p, |so_far: Plan, depth: Int| {
     let parent_path = at.take(depth);
@@ -990,7 +933,6 @@ fn with_parents(p: Plan, at: List<String>) -> Plan =
     }
   })
 
-/// Whether an entry may make `next` where the entries before it left `now`.
 fn may_replace(now: Option<PlannedPath>, next: PlannedPath) -> Bool =
   match now {
     None -> true,
@@ -1000,7 +942,6 @@ fn may_replace(now: Option<PlannedPath>, next: PlannedPath) -> Bool =
     Some(PlannedLink) -> false,
   }
 
-/// `p` after the entry `e`, the `index`th.
 fn plan_entry(p: Plan, index: Int, e: Entry) -> Plan / {tar.unsafe} = {
   let h = e.header;
   let entry = { index: index, path: h.path };
@@ -1082,16 +1023,14 @@ pub fn safe_path(path: String) -> Result<String, UnsafeReason> =
     Err(rejected) -> Err(rejected.reason),
   }
 
-// --- Extraction onto a file system ----------------------------------------------
-
 /// What became of one operation of a plan.
 pub type OperationOutcome =
   /// It was carried out.
   | Extracted
-  /// The file system does not contain what the plan made, and nothing was written: `ThroughLink`
-  /// where a directory above the path is reached through a link, or under another name than the
-  /// plan gave it; `Replaces` where the path contains something the operation may not replace;
-  /// `LinkMissing` where a hard link's target is not a file.
+  /// The operation was skipped and nothing was written, because the file system differs from what
+  /// the plan assumed. The reason is `ThroughLink` when a directory above the path is a link or has
+  /// a different real path than the plan gave, `Replaces` when the path holds something the
+  /// operation may not replace, and `LinkMissing` when a hard link's target is not a file.
   | Barred(UnsafeReason)
   /// The file system failed to do it.
   | Failed(FileError)
@@ -1099,13 +1038,8 @@ pub type OperationOutcome =
 /// An operation's path beneath the directory extracted into, and what became of it.
 pub type ExtractionResult = new { path: String, outcome: OperationOutcome }
 
-/// What a directory waits to be given until everything beneath it is made: its mode, its time if
-/// the archive gave one, and which operation made it.
 type PendingDirectory = { index: Int, mode: Int, modified: Option<Instant> }
 
-/// An extraction under way: the directory it extracts into, and that directory's own path as the
-/// host reaches it; what became of each operation so far; the links to make once everything else
-/// is; and the directories that wait.
 type Extraction = {
   into: String,
   base: Option<String>,
@@ -1114,11 +1048,9 @@ type Extraction = {
   dirs: Map<String, PendingDirectory>,
 }
 
-/// The path under its root of what `path` names beneath `into`.
 fn full_path(into: String, path: String) -> String =
   if into == "" { path } else if path == "" { into } else { into ++ "/" ++ path }
 
-/// The directory a plan's path is in: none for a path of one segment.
 fn parent_path(path: String) -> String = {
   let named = path.split("/");
   joined(named.take(named.len() - 1))
@@ -1129,8 +1061,6 @@ fn begin_extraction<[l]>(into: String) -> Extraction / {fs.canonical[l]} = {
   { into: at, base: fs.canonical[l](at), outcomes: Map::new(), links: [], dirs: Map::new() }
 }
 
-/// Why nothing may be written in `dir`, a directory beneath the extraction's, if that is so: it is
-/// not there, or the host reaches it through a link or under another name than the plan's.
 fn check_directory<[l]>(
   x: Extraction,
   dir: String,
@@ -1158,8 +1088,6 @@ fn record_outcome(
   { ..x, outcomes: x.outcomes.insert(index, apply_operation) }
 }
 
-/// Why a new file cannot be created at `full`, if that is so. A file already there is removed, and
-/// anything else is in the way.
 fn clear_path<[l]>(full: String) -> Option<OperationOutcome> / {fs.stat[l], fs.remove[l]} =
   match fs.stat[l](full) {
     None -> None,
@@ -1168,8 +1096,6 @@ fn clear_path<[l]>(full: String) -> Option<OperationOutcome> / {fs.stat[l], fs.r
     else { Some(Failed(fs::Other(0, "remove"))) },
   }
 
-/// A descriptor on a new file at a plan's `path`, accessible to its owner only and replacing a file
-/// that was there; or the outcome that prevents it.
 fn open_new_file<[l]>(
   x: Extraction,
   path: String,
@@ -1187,7 +1113,6 @@ fn open_new_file<[l]>(
   }
 }
 
-/// Closes the descriptor `open_new_file` returned, if it returned one.
 fn close_new_file<[l]>(opened: Result<Int, OperationOutcome>) -> Unit / {fs.close[l]} =
   match opened {
     Ok(file) -> {
@@ -1197,8 +1122,6 @@ fn close_new_file<[l]>(opened: Result<Int, OperationOutcome>) -> Unit / {fs.clos
     Err(_) -> (),
   }
 
-/// What became of a plan's file once its bytes are written. If every write succeeded, it is given
-/// its time and its mode; if not, it is removed.
 fn finish_file<[l]>(
   x: Extraction,
   path: String,
@@ -1215,15 +1138,12 @@ fn finish_file<[l]>(
   else { Extracted }
 }
 
-/// Stamps `full` with a time to the millisecond, the epoch for one before it; nothing for none.
 fn set_time<[l]>(full: String, modified: Option<Instant>) -> Bool / {fs.set_modified[l]} =
   match modified {
     None -> true,
     Some(at) -> fs.set_modified[l](full, max(nanos_at(at) / 1000000, 0)),
   }
 
-/// What became of a hard link: `path` made another name for the file at `target`, replacing a file
-/// that was there.
 fn make_hard_link<[l]>(
   x: Extraction,
   path: String,
@@ -1253,8 +1173,6 @@ fn make_hard_link<[l]>(
   }
 }
 
-/// The extraction once the directory at a plan's `path` is made, or found there: it waits for
-/// its mode and time until everything beneath it is made.
 fn make_directory<[l]>(
   x: Extraction,
   index: Int,
@@ -1276,15 +1194,13 @@ fn make_directory<[l]>(
   }
 }
 
-/// The extraction after one operation of its plan: a directory is made and waits for its mode, a
-/// file is written whole, a hard link is made, and a symbolic link waits for everything else.
 fn apply_operation<[l]>(
   x: Extraction,
   index: Int,
-  op: Operation,
+  operation: Operation,
   modified: Option<Instant>,
 ) -> Extraction / {fs.canonical[l], fs.stat[l], fs.create_dir[l], fs.remove[l], fs.open[l], fs.write_chunk[l], fs.close[l], fs.link[l], fs.set_mode[l], fs.set_modified[l]} =
-  match op {
+  match operation {
     MakeDirectory(path, mode) -> make_directory[l](x, index, path, mode, modified),
     WriteFile(path, mode, data) ->
       record_outcome(
@@ -1307,8 +1223,6 @@ fn apply_operation<[l]>(
       record_outcome(x, index, path, make_hard_link[l](x, path, target)),
   }
 
-/// What became of every operation, once the links are made and each directory has its time and
-/// its mode, the deepest first.
 fn finish_extraction<[l]>(
   x: Extraction,
 ) -> List<ExtractionResult> / {fs.canonical[l], fs.stat[l], fs.symlink[l], fs.set_mode[l], fs.set_modified[l]} = {
@@ -1344,16 +1258,16 @@ fn finish_extraction<[l]>(
   resolved.outcomes.values()
 }
 
-/// Carries out a plan beneath the directory `into` under the root `l`, or the root itself for an
-/// empty path, and returns what became of each operation, in the plan's order. Each operation
-/// checks before it writes. A directory above its path that the host reaches through a link, or
-/// under another name than the plan's, bars it (`ThroughLink`), and so does anything at its path
-/// that it may not replace (`Replaces`). An operation that is barred or fails writes nothing, and
-/// the rest go on. A file is created accessible to its owner only, replacing a file that was there
-/// and never writing through one, and is given its mode once it is written. A hard link is made at
-/// its place in the plan, since a later file may take its target's name. Symbolic links are made
-/// after everything else, and a directory is given its mode after everything beneath it. A plan
-/// contains no times, so what it makes is dated when it is made.
+/// Carries out a plan beneath the directory `into` under the root `l`, and returns the outcome of
+/// each operation in the plan's order. An empty `into` means the root itself. Each operation checks
+/// before it writes. It is blocked with `ThroughLink` if a directory above its path is a link or is
+/// reached under a different name than the plan used, and with `Replaces` if something at its path
+/// may not be replaced. A blocked or failed operation writes nothing, and the remaining operations
+/// still run. A file is created accessible to its owner only, replaces any file already there
+/// without writing through it, and has its mode set after it is written. A hard link is made at its
+/// place in the plan, because a later file may take its target's name. Symbolic links are made
+/// after all other operations, and a directory's mode is set after everything beneath it. A plan
+/// contains no times, so everything it makes is dated when it is made.
 pub fn extract<[l]>(
   steps: List<Operation>,
   into: String,
@@ -1366,26 +1280,8 @@ pub fn extract<[l]>(
   finish_extraction[l](done).map(|c: ExtractionResult| c.outcome)
 }
 
-// --- Reading an archive a window at a time ----------------------------------------
+type Event = | Began(Header, Int) | Piece(Bytes) | Closed | Finished | Idle
 
-/// What one read step produced.
-type Event =
-  /// A member's header, and how many bytes of data follow it.
-  | Began(Header, Int)
-  /// Some of the member's data, in order.
-  | Piece(Bytes)
-  /// The member's data is all read.
-  | Closed
-  /// The archive has ended.
-  | Finished
-  /// Nothing to report: bytes were read, or skipped.
-  | Idle
-
-/// A reader's position in an archive it keeps a window of: the bytes in the window, which begin at
-/// the next header or inside a member's data, and how many bytes came before them; the cursor,
-/// whose offset is unused, since every header is read from the start of the window; how much of the
-/// member's data and of the zeros after it is still to come; and whether a member has begun and not
-/// yet closed.
 type ReaderState = { seen: Bytes, before: Int, cursor: Cursor, data: Int, pad: Int, open: Bool }
 
 type ReadStep = { reading: ReaderState, event: Event }
@@ -1393,19 +1289,13 @@ type ReadStep = { reading: ReaderState, event: Event }
 fn initial_reader() -> ReaderState =
   { seen: b"", before: 0, cursor: start(), data: 0, pad: 0, open: false }
 
-/// The most bytes a reader keeps at once. The headers before a member must fit, including an
-/// extended header and a long name, so it is at least eight blocks.
 fn window_size(window: Int) -> Int = max(window, 4096)
 
-/// How many read steps a reader within `limits` can take before its archive ends.
 fn max_reads(limits: Limits, window: Int) -> Int = {
   let bytes = limits.total +| (limits.entries +| 1) *| (window_size(window) +| 1024) +| 1024;
   bytes *| 3 +| limits.entries +| 16
 }
 
-/// Reads one step from `r`: at most one read of the source, of no more than the window, or one step
-/// through the bytes in the window. An archive whose headers before one member are longer than the
-/// window is rejected as `TooLarge`, and offsets in an error count from the archive's start.
 fn read_next<[r] | e>(
   r: ReaderState,
   source: Scoped<Source<| e>, [r]>,
@@ -1479,12 +1369,9 @@ fn read_next<[r] | e>(
 
 fn empty_plan() -> Plan = { made: Map::new(), directories: Map::new(), steps: [] }
 
-/// The plan after a member with this header, containing only that member's operations.
 fn plan_member(p: Plan, index: Int, h: Header) -> Plan / {tar.unsafe} =
   plan_entry({ ..p, steps: [] }, index, { header: h, data: b"" })
 
-/// Reads only an archive's headers and checks each member as `plan` does. Returns how many members
-/// it has, or raises for the first member that is invalid or may not be extracted.
 fn check_archive<[r] | e>(
   source: Scoped<Source<| e>, [r]>,
   limits: Limits,
@@ -1508,8 +1395,6 @@ fn check_archive<[r] | e>(
     },
   )
 
-/// An unpacking under way: its reader's position, the plan so far, how many members and
-/// operations came before, and the extraction.
 type UnpackState = {
   reading: ReaderState,
   plan: Plan,
@@ -1518,8 +1403,6 @@ type UnpackState = {
   extraction: Extraction,
 }
 
-/// Reads a file member's data to its end and writes it through `opened`, when that is a descriptor.
-/// Returns the reader's state afterwards, and whether every write succeeded.
 fn write_member_data<[l], [r] | e>(
   r: ReaderState,
   source: Scoped<Source<| e>, [r]>,
@@ -1545,8 +1428,6 @@ fn write_member_data<[l], [r] | e>(
     },
   )
 
-/// The unpacking after the member whose header `h` the reader has just read: its operations are
-/// carried out, a file's data read from the source and written as it comes.
 fn unpack_member<[l], [r] | e>(
   s: UnpackState,
   r: ReaderState,
@@ -1617,19 +1498,19 @@ fn unpack_source<[l], [r] | e>(
     },
   )
 
-/// Extracts the archive in the file at `archive` under the root `a` beneath the directory `into`
-/// under the root `l`. Returns what became of each operation, in order, as `extract` does for a
-/// plan. The archive is read twice. The first pass checks every member as `read` and `plan` do, and
+/// Extracts the archive in the file at `archive` under the root `a` into the directory `into` under
+/// the root `l`, and returns the outcome of each operation in order, as `extract` does for a plan.
+/// The archive is read twice. The first pass checks every member as `read` and `plan` do, and
 /// raises `tar.fail` or `tar.unsafe` for the first member that is invalid or may not be extracted,
-/// before anything is written: an archive with one such member extracts nothing. The second pass
-/// carries out each member as it is read. A file's data is written as it arrives, and the file is
-/// given its mode and the time in its header (to the millisecond, and the epoch for a time before
-/// it).
+/// before anything is written, so such an archive extracts nothing. The second pass carries out
+/// each member as it is read: a file's data is written as it arrives, and then the file's mode and
+/// the time in its header are set. The time is cut off to the millisecond, and a header time before
+/// the epoch is set to the epoch.
 ///
-/// It keeps at most `window` bytes of the archive at once, and at least 4096. A file of any size
-/// passes through in pieces no larger than that, and an archive whose headers before one member are
-/// longer than that is rejected as `TooLarge`. Besides the window it keeps the names of what it has
-/// made, and nothing else of the archive.
+/// The call buffers at most `window` bytes of the archive at once, and at least 4096. A file of any
+/// size passes through in pieces no larger than that, and an archive whose headers before one
+/// member are longer than that is rejected as `TooLarge`. Besides the window, the call stores only
+/// the names of what it has made.
 pub fn unpack<[a], [l]>(
   archive: String,
   into: String,
@@ -1646,35 +1527,32 @@ pub fn unpack<[a], [l]>(
   ) { source -> unpack_source[l](source, into, limits, window) }
 }
 
-// --- Packing a tree ---------------------------------------------------------------
-
 /// How a tree is packed.
 pub type PackOptions = new {
-  /// Whether each file's and directory's entry keeps the time from its file system. An archive that
-  /// must be identical wherever its tree is checked out uses the epoch for all of them. A link's
-  /// entry always does, since no root sets a link's time.
+  /// Whether each file's and directory's entry records the modification time from its file system.
+  /// If false, every entry uses the epoch, so an archive is identical wherever its tree is checked
+  /// out. A link's entry always uses the epoch, because no root can set a link's time.
   times: Bool,
-  /// Whether each entry keeps its mode as it is. Otherwise a directory, and a file its owner may
-  /// execute, is `rwxr-xr-x`, and any other file is `rw-r--r--`.
+  /// Whether each entry records its mode unchanged. If false, a directory and a file its owner may
+  /// execute are `rwxr-xr-x`, and any other file is `rw-r--r--`.
   modes: Bool,
   /// The most entries (`TooMany`).
   entries: Int,
   /// The most bytes of files in all (`TooMuch`).
   bytes: Int,
-  /// The most bytes of a file kept in memory at once.
+  /// The most bytes of a file read into memory at once.
   chunk: Int,
 }
 
-/// Options for a pack within these bounds that keeps each entry's mode and no times. A tree then
-/// gives the same archive whenever and wherever it is packed, as long as its modes are the same.
+/// Returns pack options with the limits `entries`, `bytes` and `chunk`, that record each entry's
+/// mode and no times. The same tree then gives the same archive whenever and wherever it is packed,
+/// as long as its modes are the same.
 pub fn pack_options(entries: Int, bytes: Int, chunk: Int) -> PackOptions =
   { times: false, modes: true, entries: entries, bytes: bytes, chunk: chunk }
 
 /// What a pack wrote: how many entries, and how many bytes of archive.
 pub type PackResult = new { entries: Int, bytes: Int }
 
-/// The names a pack writes and what each is, from the paths it was given beneath `top`: each
-/// path's own entry, and for a directory every entry beneath it.
 fn gather_paths<[l]>(
   top: String,
   paths: List<String>,
@@ -1699,8 +1577,6 @@ fn gather_paths<[l]>(
     }
   })
 
-/// The header of the entry `name` for what is at `full`. A file that already has an earlier name in
-/// the archive becomes a hard link to `first`.
 fn header_of<[l]>(
   full: String,
   name: String,
@@ -1725,8 +1601,6 @@ fn header_of<[l]>(
   }
 }
 
-/// The `size` bytes of the file at `full` written into the sink a chunk at a time, and zeros
-/// after them to a whole block. A file that ends before them was changed while it was packed.
 fn copy_file_data<[l], [r] | e>(
   full: String,
   size: Int,
@@ -1748,8 +1622,6 @@ fn copy_file_data<[l], [r] | e>(
     io::write(to, b"\x00".repeat(padded(size) - size))
   } }
 
-/// A pack under way: how many entries and bytes of archive are written, how many bytes of files,
-/// and the archive name of the first name of each file that has several.
 type PackState = {
   index: Int,
   bytes: Int,
@@ -1808,14 +1680,11 @@ pub fn pack<[l], [r] | e>(
   { entries: done.index, bytes: done.bytes + 1024 }
 }
 
-// --- Properties -----------------------------------------------------------------
-
 fn generous_limits() -> Limits = limits_of(1000, 100000000, 100000000, 4096)
 
 fn limits_of(entries: Int, byte_sum: Int, size: Int, path: Int) -> Limits =
   { entries: entries, total: byte_sum, size: size, path: path }
 
-/// Paths that stretch a header: short, split across the prefix, past any split, outside ASCII.
 fn sample_paths() -> List<String> =
   [
     "a",
@@ -1831,8 +1700,6 @@ fn sample_paths() -> List<String> =
 fn sample_path(pick: Int) -> String =
   match sample_paths().at(pick & 7) { Some(path) -> path, None -> "a" }
 
-/// An entry a test draws from the bits of `pick`: its kind, path, mode, owner and time. Each is
-/// drawn from values a header stores in its own fields and values that need a pax record.
 fn generated_entry(pick: Int, data: Bytes) -> Entry = {
   let kind = pick >> 3 & 7;
   let made = if kind == 0 { directory(sample_path(pick)) }
@@ -1862,8 +1729,6 @@ test "what is written reads back as the entries it was written from" {
   })
 }
 
-/// Path segments a plan must see through: names, names that differ by case, and the ones that
-/// stay or climb.
 fn segments() -> List<String> =
   ["a", "b", "c", "d", "A", "B", "x", "y", "z", "a", "b", ".", "..", "", "c", "x"]
 
@@ -1872,7 +1737,6 @@ fn segment(pick: Int) -> String = match segments().at(pick & 15) { Some(name) ->
 fn winding(pick: Int) -> String =
   (if pick & 0x3F00 == 0 { "/" } else { "" }) ++ segment(pick) ++ "/" ++ segment(pick >> 4)
 
-/// An entry a test draws to try a plan: a file, a directory or a link on a winding path.
 fn tricky(pick: Int) -> Entry = {
   let kind = pick >> 14 & 7;
   if kind == 0 { directory(winding(pick)) }
@@ -1887,12 +1751,9 @@ fn target_of(step: Operation) -> String =
       path,
   }
 
-/// Whether a path is one a plan may name: relative, with no empty, `.` or `..` segment.
 fn inside(path: String) -> Bool =
   path.split("/").all(|name: String| name != "" && name != "." && name != "..")
 
-/// Whether the target of a link made at `path` stays beneath the root however it winds. It counts
-/// depth alone, which is all that matters for a path through real directories.
 fn stays_inside(path: String, text: String) -> Bool =
   !text.starts_with("/")
     && text.split("/").fold(path.split("/").len() - 1, |depth: Int, name: String|
@@ -1901,11 +1762,10 @@ fn stays_inside(path: String, text: String) -> Bool =
       else { depth + 1 })
     >= 0
 
-/// Whether `path` lies beneath `parent_path`, ignoring case.
 fn beneath(path: String, parent_path: String) -> Bool =
   unicode::lowercase(path).starts_with(unicode::lowercase(parent_path) ++ "/")
 
-test "a plan names only paths inside the root, through no link it makes, and its links stay inside" {
+test "`plan` only creates paths inside the root, never through a link it creates, and every link it creates points inside the root" {
   gen::check(gen::list(gen::any_int()), |picks: List<Int>| {
     match plan(picks.map(tricky)) {
       Err(_) -> true,
@@ -1923,7 +1783,7 @@ test "a plan names only paths inside the root, through no link it makes, and its
   })
 }
 
-test "a safe path is safe again, and is itself" {
+test "`safe_path` returns an already safe path unchanged, and the result stays inside the root" {
   gen::check(gen::any_int(), |pick: Int| {
     match safe_path(winding(pick) ++ "/" ++ winding(pick >> 20)) {
       Ok(path) -> safe_path(path) == Ok(path) && (path == "." || inside(path)),
@@ -1932,10 +1792,6 @@ test "a safe path is safe again, and is itself" {
   })
 }
 
-// --- Tests ----------------------------------------------------------------------
-
-/// `header_block` with `bytes` written over it at `at` and its checksum recomputed, with each byte
-/// signed when `signed` is true.
 fn altered(header_block: Bytes, at: Int, bytes: Bytes, signed: Bool) -> Bytes / {abort.raise} = {
   let changed = Bytes::concat_all([
     header_block.slice(0, at),
@@ -1952,8 +1808,6 @@ fn altered(header_block: Bytes, at: Int, bytes: Bytes, signed: Bool) -> Bytes / 
   ])
 }
 
-/// The member a header of type `flag` over `data` describes, in an archive before `e`: an
-/// extended header's records, or a GNU long name.
 fn with_meta_member(flag: Bytes, data: Bytes, e: Entry) -> Bytes / {tar.unwritable, abort.raise} = {
   let over = altered(write([file("PaxHeader", data)]), 156, flag, false);
   over.slice(0, over.len() - 1024).concat(write([e]))
@@ -1962,14 +1816,13 @@ fn with_meta_member(flag: Bytes, data: Bytes, e: Entry) -> Bytes / {tar.unwritab
 fn rejection(archive: Bytes, limits: Limits) -> Option<Error> / {abort.raise} =
   match decode(archive, limits) { Ok(_) -> None, Err(rejected) -> Some(rejected) }
 
-/// What a writer returns for two entries when it rejects the second.
 fn second_entry_error(reason: ErrorKind) -> Result<Bytes, WriteError> =
   Err({ index: 1, reason: reason })
 
 fn paths(archive: Bytes) -> List<String> / {tar.fail, abort.raise} =
   members(archive, generous_limits()).map(|m: Member| m.header.path)
 
-test "an archive of one file is its header, its data to a block, and two blocks of zeros" {
+test "an archive of one file is its header, its data padded to a 512-byte block, and two blocks of zeros" {
   let archive = write([file("hello.txt", b"hi\n")]);
   assert_eq(archive.len(), 2048);
   assert_eq(archive.slice(0, 10), b"hello.txt\x00");
@@ -2015,7 +1868,7 @@ test "the entry makers set no owner and the epoch as the time unless told otherw
   assert_eq(write([made, directory("d")]), write([file("a", b"x"), directory("d")]))
 }
 
-test "a number field is octal between spaces and NULs, or GNU's base 256" {
+test "a header number field is read as octal padded with spaces or NUL bytes, or as GNU's base-256 binary form" {
   assert_eq(number(b"0000644\x00", 0, 8), Some(420));
   assert_eq(number(b"000644 \x00", 0, 8), Some(420));
   assert_eq(number(b"   644 \x00", 0, 8), Some(420));
@@ -2040,7 +1893,7 @@ test "a number field is octal between spaces and NULs, or GNU's base 256" {
   assert_eq(number(b"\x80\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00", 0, 12), None)
 }
 
-test "a header's checksum is accepted summed either way, and no other" {
+test "a header's checksum is accepted when computed with signed or with unsigned bytes, and rejected otherwise" {
   let archive = write([file("ab", b"")]);
   let unsigned = altered(archive, 0, b"\xc3\xa9", false);
   let signed = altered(archive, 0, b"\xc3\xa9", true);
@@ -2072,7 +1925,7 @@ test "a header's checksum is accepted summed either way, and no other" {
   )
 }
 
-test "an archive that stops short is truncated, and one that only lacks its end is read" {
+test "an archive cut off in the middle of an entry is rejected as truncated, but an archive missing only its final zero blocks is read in full" {
   let archive = write([file("a", b"0123456789"), file("b", b"")]);
   assert_eq(archive.len(), 2560);
   assert_eq(paths(archive.slice(0, 1536)), ["a", "b"]);
@@ -2096,7 +1949,7 @@ test "an archive that stops short is truncated, and one that only lacks its end 
   assert_eq(paths(archive.concat(b"anything after the end is not the archive's")), ["a", "b"])
 }
 
-test "a reader keeps to the entries, the sizes and the path length it was given" {
+test "reading an archive is rejected when it exceeds the given limit on entries, total size, file size or path length" {
   let archive = write([file("one", b"12345"), file("two/long-name", b"123"), directory("d")]);
   assert_eq(rejection(archive, limits_of(3, 8, 5, 13)), None);
   assert_eq(rejection(archive, limits_of(2, 8, 5, 13)), Some({ at: 2048, reason: TooMany }));
@@ -2106,7 +1959,6 @@ test "a reader keeps to the entries, the sizes and the path length it was given"
   let make_hard_link = write([symlink("l", "a-long-target")]);
   assert_eq(rejection(make_hard_link, limits_of(1, 0, 0, 13)), None);
   assert_eq(rejection(make_hard_link, limits_of(1, 0, 0, 12)), Some({ at: 0, reason: TooLong }));
-  // An extended header is data too: its 13 bytes count against the size limits like any entry's.
   let timed = write([file("t", b"", modified: Instant(1500000000))]);
   assert_eq(rejection(timed, limits_of(1, 13, 13, 1)), None);
   assert_eq(rejection(timed, limits_of(1, 13, 12, 1)), Some({ at: 0, reason: TooLarge }));
@@ -2116,7 +1968,7 @@ test "a reader keeps to the entries, the sizes and the path length it was given"
   assert_eq(rejection(later, limits_of(2, 17, 13, 1)), Some({ at: 1024, reason: TooMuch }))
 }
 
-test "a step returns one member from the bytes so far, or how many bytes it needs" {
+test "`step` returns the next archive entry from the bytes read so far, or how many more bytes it needs" {
   let archive = write([
     file("first", b"0123456789"),
     file("caf\u{e9}", b"abc", modified: Instant(1500000000)),
@@ -2127,7 +1979,6 @@ test "a step returns one member from the bytes so far, or how many bytes it need
   let first = match stepped(512, start()) { Next(m) -> m, _ -> panic("a header is a member") };
   assert_eq((first.header.path, first.data, first.size), ("first", 512, 10));
   assert_eq(first.next, { at: 1024, entries: 1, bytes: 10, global: Map::new() });
-  // The second member's header is three blocks: a pax header, its records, and its own.
   assert_eq(stepped(1024, first.next), NeedMore(1536));
   assert_eq(stepped(1536, first.next), NeedMore(1563));
   assert_eq(stepped(1563, first.next), NeedMore(2560));
@@ -2154,7 +2005,7 @@ test "a step returns one member from the bytes so far, or how many bytes it need
   assert_eq(members(archive, generous_limits()).map(|m: Member| m.data), [512, 2560])
 }
 
-test "a path past a header's fields is split at a slash, or carried by a pax record" {
+test "a path too long for a header's name fields is split at a slash, or stored in a pax extended header record" {
   let name = |n: Int| String::of_bytes(b"n".repeat(n));
   let fits = name(100);
   let split = name(155) ++ "/" ++ name(100);
@@ -2234,7 +2085,7 @@ test "a pax record contains what a ustar header cannot express, and nothing else
   assert_eq(read(write([full, plain]), generous_limits()), [full, plain])
 }
 
-test "an extended header that is not records is rejected, and a global one stays in effect until replaced" {
+test "an extended header whose records are malformed is rejected, and a global extended header applies until another replaces it" {
   let read_over = |records: Bytes|
     rejection(with_meta_member(b"x", records, file("a", b"")), generous_limits());
   assert_eq(read_over(b"13 mtime=1.5\n"), None);
@@ -2280,10 +2131,9 @@ test "an extended header that is not records is rejected, and a global one stays
   )
 }
 
-test "a sparse member is kept as stored, and no later member is misread because of it" {
+test "a GNU sparse entry is read with its stored data and no hole filling, and the entries after it are still read correctly" {
   let stored = file("holes", b"data");
   let old = write([stored, file("after", b"")]);
-  // GNU's own magic, type S, and a map that continues for one block more, then a second.
   let gnu = altered(
     altered(altered(old, 257, b"ustar  \x00", false), 156, b"S", false),
     482,
@@ -2308,7 +2158,6 @@ test "a sparse member is kept as stored, and no later member is misread because 
     },
     (1536, 4),
   );
-  // Without the flag that continues it, a sparse member's data follows its header.
   assert_eq(
     read(altered(gnu, 482, b"\x00", false), generous_limits()).map(|e: Entry|
       (e.header.kind, e.data)),
@@ -2417,7 +2266,7 @@ fn unsafe_at(
   reason: UnsafeReason,
 ) -> Result<List<Operation>, UnsafeEntry> = Err({ index: index, path: path, reason: reason })
 
-test "a plan makes each directory before what is beneath it, and keeps permission bits alone" {
+test "a plan creates each directory before the paths inside it, and strips setuid, setgid and sticky bits from modes" {
   let entries = [
     file("a/b/one.txt", b"1", mode: 2541),
     directory("a", mode: 448),
@@ -2451,7 +2300,7 @@ test "a plan makes each directory before what is beneath it, and keeps permissio
   assert_eq(plan([]), Ok([]))
 }
 
-test "a plan rejects a path that leaves the root, by its start or by climbing" {
+test "a plan rejects a path that leaves the root, either because it is absolute or because `..` segments climb out of it" {
   let after = |path: String| plan([file("ok", b""), file(path, b"")]);
   assert_eq(after(""), unsafe_at(1, "", NoName));
   assert_eq(after("a\0b"), unsafe_at(1, "a\0b", NoName));
@@ -2466,7 +2315,7 @@ test "a plan rejects a path that leaves the root, by its start or by climbing" {
   assert_eq(after("a/../x"), Ok([WriteFile("ok", 420, b""), WriteFile("x", 420, b"")]))
 }
 
-test "a plan passes through no link the archive made, and replaces nothing with another kind" {
+test "a plan rejects a path through a link the archive created, and an entry that would replace an entry of another kind" {
   assert_eq(
     plan([symlink("way", "elsewhere"), file("way/planted", b"")]),
     unsafe_at(1, "way/planted", ThroughLink),
@@ -2475,7 +2324,6 @@ test "a plan passes through no link the archive made, and replaces nothing with 
     plan([symlink("Way", "elsewhere"), file("way/planted", b"")]),
     unsafe_at(1, "way/planted", ThroughLink),
   );
-  // A file system that folds case folds it outside ASCII too.
   assert_eq(
     plan([symlink("Été", "elsewhere"), file("été/planted", b"")]),
     unsafe_at(1, "été/planted", ThroughLink),
@@ -2498,7 +2346,6 @@ test "a plan passes through no link the archive made, and replaces nothing with 
     plan([file("f", b""), file("x", b""), file("f/..", b"")]),
     unsafe_at(2, "f/..", BeneathFile),
   );
-  // Two files whose names differ by case are two files, or one replaced, as the file system has it.
   assert_eq(
     plan([file("Readme", b"1"), file("README", b"2"), directory("Docs"), directory("docs")]),
     Ok([
@@ -2533,7 +2380,6 @@ test "a plan makes no link that points out of the root or through another link" 
     Ok([MakeDirectory("d", 493), MakeSymlink("d/l", "../d/../x")]),
   );
   assert_eq(plan([symlink("a", "d"), symlink("b", "a/..")]), unsafe_at(1, "b", ThroughLink));
-  // The link that would let an earlier link's `..` escape is the one rejected.
   assert_eq(plan([symlink("b", "a/.."), symlink("a", ".")]), unsafe_at(1, "a", ThroughLink));
   assert_eq(plan([symlink("b", "a/.."), symlink("A", ".")]), unsafe_at(1, "A", ThroughLink));
   assert_eq(
@@ -2578,7 +2424,7 @@ test "a hard link is to a file the archive made before it" {
   )
 }
 
-test "a plan makes no device, FIFO or kind without a name" {
+test "a plan rejects character devices, block devices, FIFOs, sparse entries and entries of unknown kinds" {
   let plain = file("node", b"");
   assert_eq(
     [CharDevice, BlockDevice, Fifo, Sparse, Other(86)].map(|kind: Kind|
@@ -2587,7 +2433,7 @@ test "a plan makes no device, FIFO or kind without a name" {
   )
 }
 
-test "a path alone is checked as a plan checks an archive's first entry" {
+test "`safe_path` normalizes a valid path, and rejects an empty, absolute or escaping path" {
   assert_eq(["a/b", "./a//b/", "a/b/../c", "a/../b", ".", "a/..", "a/./.."].map(safe_path), [
     Ok("a/b"),
     Ok("a/b"),
@@ -2608,7 +2454,7 @@ test "a path alone is checked as a plan checks an archive's first entry" {
   ])
 }
 
-test "the everyday kinds, an owner and a time a header holds read back from one block each" {
+test "`read` returns the entries `write` wrote: files, directories, links, owners and times, with one 512-byte header each" {
   let owned = file("d/f", b"x", modified: Instant(1704164645000000000));
   let entries = [
     directory("d", modified: Instant(8589934591000000000)),
@@ -2632,7 +2478,6 @@ test "a header's fields are read at their positions, however a writer padded the
     { at: 116, field: b"5 \x00\x00\x00\x00\x00\x00" },
     { at: 124, field: b"3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" },
     { at: 136, field: b"13 \x00\x00\x00\x00\x00\x00\x00\x00\x00" },
-    // A file is not a device, so the bytes where a device's numbers would be are not read.
     { at: 329, field: b"no digit" },
   ].fold(archive, |so_far: Bytes, change: { at: Int, field: Bytes }|
     altered(so_far, change.at, change.field, false));
@@ -2640,14 +2485,12 @@ test "a header's fields are read at their positions, however a writer padded the
   assert_eq(read(padded_left, generous_limits()), [
     { ..made, header: { ..made.header, uid: 7, gid: 5 } },
   ]);
-  // The type flags a regular file has had: NUL in the old form, `0`, and `7` for a contiguous one.
   assert_eq(
     [b"\x00", b"0", b"7"].map(|flag: Bytes|
       read(altered(archive, 156, flag, false), generous_limits()).map(|e: Entry|
         (e.header.kind, e.data))),
     [[(File, b"abc")], [(File, b"abc")], [(File, b"abc")]],
   );
-  // GNU's magic changes where a name's prefix is read, and nothing else of a plain file.
   assert_eq(read(altered(archive, 257, b"ustar  \x00", false), generous_limits()), [
     file("ab", b"abc"),
   ]);
@@ -2657,7 +2500,7 @@ test "a header's fields are read at their positions, however a writer padded the
   assert_eq(paths(altered(folder, 0, b"/\x00\x00", false)), ["/"])
 }
 
-test "a long name and a long link each name the member after them" {
+test "a long-name or long-link block replaces the name or link target of the entry that follows it" {
   let named = with_meta_member(b"L", b"a/long/name\x00", file("short", b"x"));
   assert_eq(read(named, generous_limits()), [file("a/long/name", b"x")]);
   let make_hard_link = with_meta_member(b"K", b"a/long/target\x00", symlink("l", "t"));
@@ -2670,8 +2513,6 @@ test "a long name and a long link each name the member after them" {
   assert_eq(rejection(both, limits_of(1, 25, 14, 13)), Some({ at: 1024, reason: TooMuch }))
 }
 
-/// A tree to pack: files of two modes, a directory in a directory and an empty one, each with a
-/// time of its own, a link, and a file with two names.
 fn sample_file_system() -> fs::MemFs / {abort.raise} = {
   let files = fs::mem_of([
     { path: "src/a.txt", body: b"alpha" },
@@ -2698,9 +2539,6 @@ fn sample_file_system() -> fs::MemFs / {abort.raise} = {
   ).fs
 }
 
-/// What a tree contains beneath `dir`, one entry per line: its path there, its kind, a file's bytes
-/// or a link's target, its mode bits, how many names it has, and its time in milliseconds when
-/// `timed` is true.
 fn describe_tree(tree: fs::MemFs, dir: String, timed: Bool) -> List<String> / {abort.raise} =
   match fs::mem_scan(tree, dir, true) {
     None -> ["no " ++ dir],
@@ -2728,7 +2566,6 @@ fn keep_all_options(chunk: Int) -> PackOptions =
 fn plain_options() -> PackOptions =
   { times: false, modes: false, entries: 100, bytes: 100000, chunk: 64 }
 
-/// Packs what `paths` name beneath `src` into the file `a.tar` of the same root.
 fn packed_to_file(
   paths: List<String>,
   options: PackOptions,
@@ -2741,7 +2578,7 @@ fn packed_to_file(
 fn path_outcomes(apply_operation: List<ExtractionResult>) -> List<(String, OperationOutcome)> =
   apply_operation.map(|c: ExtractionResult| (c.path, c.outcome))
 
-test "a tree packed and unpacked through a root is the tree, its modes, times and links included: {c}" for c: { chunk: Int, window: Int, short: Int } in [
+test "a directory tree packed into a tar file and unpacked again equals the original, including modes, times and links: {c}" for c: { chunk: Int, window: Int, short: Int } in [
     { chunk: 64, window: 8192, short: 0 },
     { chunk: 3, window: 4096, short: 0 },
     { chunk: 64, window: 4096, short: 7 },
@@ -2778,7 +2615,7 @@ test "a tree packed and unpacked through a root is the tree, its modes, times an
   assert_eq(over.tree.opened.len(), 0)
 }
 
-test "a pack without times and modes is the archive `write` makes of the same entries, whenever it is packed" {
+test "packing without times and modes produces the same archive as `write` of the same entries, for any path order or file time" {
   let archived = |tree: fs::MemFs, paths: List<String>, options: PackOptions|
     fs::mem_read(fs::on_mem[d](tree, || packed_to_file(paths, options)).tree, "a.tar");
   let archive = |tree: fs::MemFs, paths: List<String>| archived(tree, paths, plain_options());
@@ -2816,7 +2653,6 @@ test "a pack without times and modes is the archive `write` makes of the same en
   )
 }
 
-/// What a pack of `paths` beneath `src` raised, in words, or `packed` when it raised nothing.
 fn pack_rejected(
   paths: List<String>,
   options: PackOptions,
@@ -2842,7 +2678,7 @@ fn pack_rejected(
     }
   }).value
 
-test "a pack keeps to its bounds, and reports a requested path that is not there" {
+test "packing fails when it exceeds the entry or byte limit, and reports a requested path that does not exist" {
   let bounded = |entries: Int, bytes: Int| -> PackOptions {
     { ..plain_options(), entries: entries, bytes: bytes }
   };
@@ -2853,9 +2689,12 @@ test "a pack keeps to its bounds, and reports a requested path that is not there
 }
 
 fn planned_steps(entries: List<Entry>) -> List<Operation> / {abort.raise} =
-  match plan(entries) { Ok(steps) -> steps, Err(_) -> panic("the entries are safe to extract") }
+  match plan(entries) {
+    Ok(steps) -> steps,
+    Err(_) -> panic("planning failed for entries that the test expects to be safe to extract"),
+  }
 
-test "a plan is carried out beneath a directory: its links last, and a directory's mode after what is in it" {
+test "extracting entries into a directory creates links last and sets a directory's mode after its contents" {
   let steps = planned_steps([
     symlink("l", "d/f.txt"),
     directory("d", mode: 320),
@@ -2877,7 +2716,7 @@ test "a plan is carried out beneath a directory: its links last, and a directory
   assert_eq(fs::mem_write(over.tree, "out/d/new", b"x").ok, false)
 }
 
-test "an operation writes nothing where the directory above it is reached through a link, or its path contains something it may not replace" {
+test "extraction writes nothing when a parent directory is a symlink or the path would replace an existing file, directory or link" {
   let files = fs::mem_of([
     { path: "elsewhere/secret", body: b"kept" },
     { path: "out/held/deep", body: b"d" },
@@ -2923,8 +2762,6 @@ test "an operation writes nothing where the directory above it is reached throug
   assert_eq(fs::mem_kind(nowhere.tree, "absent"), fs::Missing)
 }
 
-/// What unpacking `archive` into `out`, over a root that contains both, raised or carried out, and
-/// the tree afterwards.
 fn unpack_tried(
   archive: Bytes,
   window: Int,
@@ -2939,7 +2776,6 @@ fn unpack_tried(
     rejected
   })
 
-/// Each entry's path, and where one that links points.
 fn paths_of(entries: List<Entry>) -> String =
   String::join(
     entries.map(|e: Entry|
@@ -2974,7 +2810,7 @@ test "an archive with a member that may not be extracted extracts nothing, where
   assert_eq(over.tree.opened.len(), 0)
 }
 
-test "an archive that is cut short, or whose headers do not fit the window, extracts nothing" {
+test "extracting a truncated archive, or one with a header larger than the read buffer, creates no files" {
   let whole = write([file("ok", b"1"), file("big", b"b".repeat(2000))]);
   let prefix_split = unpack_tried(whole.slice(0, 2048), 4096);
   assert_eq(
@@ -2993,28 +2829,26 @@ test "an archive that is cut short, or whose headers do not fit the window, extr
   assert_eq(match wide.value { Ok(Ok(apply_operation)) -> apply_operation.len(), _ -> 0 }, 2)
 }
 
-/// Runs `go` over the root `d`, and returns the longest chunk it requested to read and the longest
-/// it wrote there.
 fn measured<a>(
   go: () -> a / {fs.read[d], fs.write[d], io.fail, io.closed, tar.fail, tar.unsafe, abort.raise},
-) -> { value: a, asked: Int, wrote: Int } / {fs.read[d], fs.write[d], io.fail, io.closed, tar.fail, tar.unsafe, abort.raise} =
+) -> { value: a, requested: Int, wrote: Int } / {fs.read[d], fs.write[d], io.fail, io.closed, tar.fail, tar.unsafe, abort.raise} =
   handle {
     go()
   } with {
-    var asked = 0,
+    var largest_read = 0,
     var wrote = 0,
     fs.read_chunk[d](file, most) -> {
-      asked = max(asked, most);
+      largest_read = max(largest_read, most);
       fs.read_chunk[d](file, most)
     },
     fs.write_chunk[d](file, body) -> {
       wrote = max(wrote, body.len());
       fs.write_chunk[d](file, body)
     },
-    return value -> { value: value, asked: asked, wrote: wrote },
+    return value -> { value: value, requested: largest_read, wrote: wrote },
   }
 
-test "a file larger than the window is unpacked in pieces no longer than the window" {
+test "unpacking a file larger than the read buffer reads and writes it in pieces no larger than the buffer" {
   let body = b"0123456789".repeat(2000);
   let archive = write([directory("d"), file("d/large", body), file("small", b"s")]);
   let tree = fs::mem_create_dir(fs::mem_of([{ path: "a.tar", body: archive }]), "out").fs;
@@ -3023,17 +2857,16 @@ test "a file larger than the window is unpacked in pieces no longer than the win
   assert_eq(over.value.value.len(), 3);
   assert_eq(fs::mem_read(over.tree, "out/d/large"), Some(body));
   assert_eq(fs::mem_read(over.tree, "out/small"), Some(b"s"));
-  assert_eq(over.value.asked, 4096);
+  assert_eq(over.value.requested, 4096);
   assert_eq(over.value.wrote, 4096);
   assert(body.len() > 4 * 4096)
 }
 
-/// How many bytes a test's sink was pushed at once.
 effect pushed {
   write push(bytes: Int) -> Unit
 }
 
-test "a file larger than a chunk is packed in pushes no longer than a header's blocks" {
+test "packing a file larger than the chunk size sends it to the sink in several smaller writes whose total is the archive size" {
   let body = b"0123456789".repeat(2000);
   let tree = fs::mem_of([{ path: "src/large", body: body }]);
   let over = fs::on_mem[d](tree, ||

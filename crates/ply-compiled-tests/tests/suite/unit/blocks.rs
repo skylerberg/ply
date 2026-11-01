@@ -1,11 +1,11 @@
 use ply_compiled::blocks::*;
 
-const MIB: usize = 1 << 20;
+const MEBIBYTE: usize = 1 << 20;
 
 #[test]
-fn a_class_holds_every_size_it_is_given_within_an_eighth() {
+fn a_block_allocated_for_a_size_is_at_least_that_size_and_at_most_an_eighth_larger() {
     for bytes in (24..=SMALL).step_by(8) {
-        let block = block_of(class_of(bytes));
+        let block = class_block_bytes(class_of(bytes));
         assert!(block >= bytes, "{bytes} bytes got a block of {block}");
         assert!(
             block - bytes <= bytes / 8,
@@ -16,7 +16,8 @@ fn a_class_holds_every_size_it_is_given_within_an_eighth() {
 }
 
 #[test]
-fn a_dead_block_is_the_next_of_its_class_and_of_no_other() {
+fn a_freed_block_is_reused_by_the_next_allocation_of_the_same_size_class_but_not_of_a_different_class()
+ {
     let mut b = Blocks::default();
     let first = b.take(48);
     let other = b.take(64);
@@ -27,13 +28,17 @@ fn a_dead_block_is_the_next_of_its_class_and_of_no_other() {
 }
 
 #[test]
-fn only_where_a_block_begins_is_held() {
+fn the_heap_reports_an_address_as_a_block_only_at_the_start_of_a_block_it_allocated_and_not_after_reset()
+ {
     let mut b = Blocks::default();
     let block = b.take(48).addr();
     assert!(b.holds(block));
     assert!(!b.holds(block + 8), "the middle of a block");
     assert!(!b.holds(block + 48), "a block not handed out yet");
-    assert!(!b.holds(block & !(4 * MIB - 1)), "the segment's own header");
+    assert!(
+        !b.holds(block & !(4 * MEBIBYTE - 1)),
+        "the segment's own header"
+    );
     let large = b.take(SMALL + 8).addr();
     assert!(b.holds(large) && !b.holds(large + 8));
     assert!(!Blocks::default().holds(block), "another heap's block");
@@ -42,20 +47,19 @@ fn only_where_a_block_begins_is_held() {
 }
 
 #[test]
-fn a_block_past_a_pages_sizes_is_held_at_its_size_until_it_is_given_back() {
+fn a_block_larger_than_a_page_adds_its_exact_size_to_the_bytes_in_use_until_it_is_freed() {
     let mut b = Blocks::default();
-    let block = b.take(3 * MIB + 8);
-    assert_eq!(b.held(), 3 * MIB + 8);
+    let block = b.take(3 * MEBIBYTE + 8);
+    assert_eq!(b.held(), 3 * MEBIBYTE + 8);
     unsafe {
-        assert!(b.owns(block, 3 * MIB + 8));
-        b.give(block, 3 * MIB + 8);
+        assert!(b.owns(block, 3 * MEBIBYTE + 8));
+        b.give(block, 3 * MEBIBYTE + 8);
     }
     assert_eq!(b.held(), 0);
 }
 
-/// Blocks of one size, all given back, leave their pages to whatever size is asked for next.
 #[test]
-fn pages_one_size_emptied_serve_another() {
+fn pages_emptied_by_blocks_of_one_size_are_reused_for_blocks_of_another_size() {
     let mut b = Blocks::default();
     let small: Vec<*mut u8> = (0..200_000).map(|_| b.take(32)).collect();
     let peak = b.held();
@@ -63,7 +67,11 @@ fn pages_one_size_emptied_serve_another() {
     for block in small {
         unsafe { b.give(block, 32) };
     }
-    assert!(b.held() < MIB, "{} bytes held with nothing live", b.held());
+    assert!(
+        b.held() < MEBIBYTE,
+        "{} bytes held with nothing live",
+        b.held()
+    );
     for _ in 0..(peak / 2 / 512) {
         b.take(512);
     }
@@ -71,15 +79,15 @@ fn pages_one_size_emptied_serve_another() {
 }
 
 #[test]
-fn segments_left_with_no_block_go_back() {
+fn segments_left_with_no_live_blocks_are_unmapped_and_the_heap_can_still_allocate() {
     let mut b = Blocks::default();
-    let blocks: Vec<*mut u8> = (0..64 * MIB / 1024).map(|_| b.take(1024)).collect();
-    assert!(b.mapped() >= 64 * MIB);
+    let blocks: Vec<*mut u8> = (0..64 * MEBIBYTE / 1024).map(|_| b.take(1024)).collect();
+    assert!(b.mapped() >= 64 * MEBIBYTE);
     for block in blocks {
         unsafe { b.give(block, 1024) };
     }
     assert!(
-        b.mapped() <= 12 * MIB,
+        b.mapped() <= 12 * MEBIBYTE,
         "{} bytes mapped with nothing live",
         b.mapped()
     );
@@ -87,9 +95,8 @@ fn segments_left_with_no_block_go_back() {
     assert!(b.holds(again.addr()));
 }
 
-/// A heap that takes a segment an ended heap held walks only its own blocks there.
 #[test]
-fn a_segment_an_ended_heap_held_holds_none_of_its_blocks() {
+fn a_new_heap_reusing_a_segment_from_a_dropped_heap_contains_only_its_own_blocks() {
     let mut first = Blocks::default();
     for class in 1..=64 {
         for _ in 0..1_000 {
@@ -109,40 +116,35 @@ fn a_segment_an_ended_heap_held_holds_none_of_its_blocks() {
     }
 }
 
-/// A block handed back off its heap's thread is the heap's to hand out once it looks for one.
 #[test]
-fn a_block_another_thread_hands_back_is_handed_out_again() {
+fn a_block_freed_by_another_thread_is_allocated_again_by_the_heap_that_owns_it() {
     let mut b = Blocks::default();
     let first = b.take(48);
     let rest: Vec<*mut u8> = (0..10_000).map(|_| b.take(48)).collect();
     let handed = first.addr();
     std::thread::scope(|s| {
-        s.spawn(move || unsafe { hand_back(handed as *mut u8, 48) });
+        s.spawn(move || unsafe { free_block(handed as *mut u8, 48) });
     });
     let again: Vec<*mut u8> = (0..100_000).map(|_| b.take(48)).collect();
     assert!(again.contains(&first));
     drop(rest);
 }
 
-/// A heap that takes only blocks past a page's sizes still takes up the ones handed back to it.
 #[test]
-fn a_large_block_another_thread_hands_back_is_given_up_before_the_next() {
+fn large_blocks_freed_by_another_thread_are_released_before_the_next_large_allocation() {
     let mut b = Blocks::default();
     for _ in 0..64 {
-        let handed = b.take(MIB).addr();
+        let handed = b.take(MEBIBYTE).addr();
         std::thread::scope(|s| {
-            s.spawn(move || unsafe { hand_back(handed as *mut u8, MIB) });
+            s.spawn(move || unsafe { free_block(handed as *mut u8, MEBIBYTE) });
         });
     }
-    b.take(MIB);
-    assert_eq!(b.held(), MIB);
+    b.take(MEBIBYTE);
+    assert_eq!(b.held(), MEBIBYTE);
 }
 
-/// A block another thread is handing back keeps the heap it read as its owner until it is pushed:
-/// an adopter of that heap goes on only once the block is on the list it drains, so neither the
-/// heap the push lands in nor the block is lost.
 #[test]
-fn an_adopter_waits_for_a_block_being_handed_back_to_the_heap_it_adopts() {
+fn adopting_a_heap_waits_for_another_thread_that_is_still_returning_a_block_to_that_heap() {
     struct Moved(Blocks);
     unsafe impl Send for Moved {}
     let mut branch = Blocks::default();
@@ -174,7 +176,7 @@ fn an_adopter_waits_for_a_block_being_handed_back_to_the_heap_it_adopts() {
 }
 
 #[test]
-fn an_adopted_heaps_blocks_are_the_adopters() {
+fn a_heap_that_adopts_another_heap_owns_and_can_free_every_block_of_the_adopted_heap() {
     let mut parent = Blocks::default();
     let mine = parent.take(48);
     let mut branch = Blocks::default();
@@ -196,9 +198,8 @@ fn an_adopted_heaps_blocks_are_the_adopters() {
     assert!(next.iter().all(|block| parent.holds(block.addr())));
 }
 
-/// Branches that each emptied all but one page cost their adopter those pages and no more.
 #[test]
-fn an_adopter_keeps_no_more_emptied_pages_than_of_its_own() {
+fn adopting_many_heaps_with_empty_pages_caps_the_empty_pages_retained_at_two_mebibytes() {
     let mut parent = Blocks::default();
     let live: Vec<*mut u8> = (0..100)
         .map(|_| {
@@ -212,7 +213,11 @@ fn an_adopter_keeps_no_more_emptied_pages_than_of_its_own() {
             blocks[0]
         })
         .collect();
-    assert!(parent.kept() <= 2 * MIB, "{} bytes kept", parent.kept());
+    assert!(
+        parent.kept() <= 2 * MEBIBYTE,
+        "{} bytes kept",
+        parent.kept()
+    );
     assert!(
         parent.held() <= live.len() * (64 << 10),
         "{} bytes held",
@@ -222,14 +227,14 @@ fn an_adopter_keeps_no_more_emptied_pages_than_of_its_own() {
         unsafe { parent.give(block, 1024) };
     }
     assert!(
-        parent.mapped() <= 8 * MIB,
+        parent.mapped() <= 8 * MEBIBYTE,
         "{} bytes mapped",
         parent.mapped()
     );
 }
 
 #[test]
-fn an_adopted_segment_with_no_live_block_goes_back() {
+fn an_adopted_segment_with_no_live_blocks_is_unmapped() {
     let mut parent = Blocks::default();
     for _ in 0..100 {
         let mut branch = Blocks::default();
@@ -240,7 +245,7 @@ fn an_adopted_segment_with_no_live_block_goes_back() {
         parent.adopt(branch);
     }
     assert!(
-        parent.mapped() <= 4 * MIB,
+        parent.mapped() <= 4 * MEBIBYTE,
         "{} bytes mapped",
         parent.mapped()
     );
@@ -248,15 +253,15 @@ fn an_adopted_segment_with_no_live_block_goes_back() {
 }
 
 #[test]
-fn a_reset_heap_holds_nothing_and_hands_out_afresh() {
+fn a_reset_heap_has_no_bytes_in_use_maps_at_most_four_mebibytes_and_can_allocate_again() {
     let mut b = Blocks::default();
     for _ in 0..100_000 {
         b.take(256);
     }
-    b.take(MIB);
+    b.take(MEBIBYTE);
     b.reset();
     assert_eq!(b.held(), 0);
-    assert!(b.mapped() <= 4 * MIB);
+    assert!(b.mapped() <= 4 * MEBIBYTE);
     let block = b.take(256);
     assert!(b.holds(block.addr()));
     assert_eq!(b.held(), 64 << 10);

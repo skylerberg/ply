@@ -1,24 +1,28 @@
-//! PEM, the text format that certificates and keys travel in, as RFC 7468 defines it.
+//! Reads and writes PEM, the text format that certificates and keys are stored in, as RFC 7468
+//! defines it.
 //!
-//! A block is a `-----BEGIN label-----` line, bytes in base64, and the `-----END label-----` line
-//! with the same label. `read` returns every block of a text in order, and treats whatever lies
-//! outside them as the explanatory text a bundle carries. Inside a block it follows the RFC's
-//! standard grammar. It accepts lines of any length, any of the three line endings, blanks at a
-//! line's end and empty lines before the data, and nothing else. The lines together must be
-//! canonical base64 as `std.base64` reads it, the two labels must match, and a line that starts
-//! like a boundary must be one. `write` emits the strict form: 64 columns and nothing extra.
+//! A block is a `-----BEGIN label-----` line, base64 data, and a `-----END label-----` line with
+//! the same label. `read` returns every block in the text, in order, and ignores any text outside
+//! the blocks, such as the notes a certificate bundle contains. Inside a block, `read` accepts
+//! lines of any length, any of the three line endings, blanks at the end of a line, and empty lines
+//! before the data. It rejects everything else. The lines together must be canonical base64, as
+//! `std.base64` reads it. The `BEGIN` and `END` labels must match. A line that looks like a `BEGIN`
+//! or `END` line must be a valid one. `write` produces the strict form: 64 columns and nothing
+//! extra.
 //!
-//! RFC 7468 permits no headers. The `Name: value` lines that legacy PEM (RFC 1421) put above the
-//! data are still read and written, since keys written that way still occur. The exception is the
-//! header that marks a block as encrypted, which is rejected with the reason `explain` gives.
+//! RFC 7468 allows no headers. The `Name: value` lines that legacy PEM (RFC 1421) puts above the
+//! data are still read and written, because keys in that form still exist. A header that marks a
+//! block as encrypted is rejected with the `Encrypted` error; `explain` returns the message that
+//! describes it.
 //!
-//! A private key is returned sealed: its bytes, the DER that a `PRIVATE KEY` block carries, inside
-//! a `Secret`. A `Key` can be compared and passed to functions that take a secret, such as
-//! `std.crypto`'s private key readers. It cannot be shown, encoded or written out again. The caller
-//! is responsible for discarding the text it was read from.
+//! A private key is returned as a `Key`: the DER bytes of a `PRIVATE KEY` block, wrapped in a
+//! `Secret`. A `Key` can be compared and passed to functions that take a secret, such as the
+//! private key readers in `std.crypto`. It cannot be shown, encoded or written out again. The
+//! caller must discard the text the key was read from.
 //!
-//! `read` and `write` raise `pem.fail` with the line and the reason; `decode` and `encode`
-//! return the same error as an `Err`. A reader takes the most bytes of text it will read.
+//! `read` and `write` raise `pem.fail` with the line number and the reason. `decode` and `encode`
+//! return the same error as an `Err`. A reader has a maximum text length; text longer than that is
+//! rejected with `TooLong`.
 
 import std.base64 (base64_decode_secret, base64_encode)
 import std.bytes
@@ -45,7 +49,8 @@ pub type Label =
   | PrivateKey
   /// `ENCRYPTED PRIVATE KEY`: a PKCS #8 private key under a password.
   | EncryptedPrivateKey
-  /// `ATTRIBUTE CERTIFICATE`: an attribute certificate.
+  /// `ATTRIBUTE CERTIFICATE`: an X.509 attribute certificate, which binds attributes such as roles
+  /// to a holder.
   | AttributeCertificate
   /// `PUBLIC KEY`: a public key with its algorithm.
   | PublicKey
@@ -72,7 +77,7 @@ pub type Key = new { label: Label, headers: List<Header>, cache_key: Secret<Byte
 /// One block of a parsed text: a `Block`, or a `Key` when the label is a private key's.
 pub type Item = | Open(Block) | Sealed(Key)
 
-/// Why a text is not PEM, or a block cannot be written as it.
+/// The reason a text is not valid PEM, or a block cannot be written as PEM.
 pub type ErrorKind =
   /// The text is longer than the limit the reader was given.
   | TooLong
@@ -157,24 +162,24 @@ pub fn seal(block: Block) -> Key =
 pub fn item(block: Block) -> Item =
   if is_private(block.label) { Sealed(seal(block)) } else { Open(block) }
 
-/// A sentence for each reason, for a message to a person.
+/// Returns a sentence describing `reason`, for showing to a person.
 pub fn explain(reason: ErrorKind) -> String =
   match reason {
-    TooLong -> "the text is longer than the limit the reader was given",
-    BadBoundary -> "a line opens as a BEGIN or END boundary and is not one",
-    Unopened -> "an END line stands where no block is open",
-    Unclosed -> "a block has no END line of its own",
-    Mismatched -> "an END line's label is not its BEGIN line's",
+    TooLong -> "the text is longer than the limit given to the reader",
+    BadBoundary -> "a line starts like a BEGIN or END line but is not a valid one",
+    Unopened -> "an END line appears where no block is open",
+    Unclosed -> "a block has no matching END line",
+    Mismatched -> "an END line has a different label than its BEGIN line",
     BadHeader ->
-      "a header is a name, a colon and a value on one line, and an empty line ends the headers",
+      "a header must be a name, a colon and a value on one line, and an empty line ends the headers",
     Encrypted ->
-      "the block is encrypted the legacy way, under a key made from its password with MD5: "
-        ++ "decrypt it with the tool that wrote it, and keep the key as PKCS #8, "
+      "the block holds a private key encrypted with a legacy method, which derives the encryption key from a password using MD5: "
+        ++ "decrypt the private key with the tool that encrypted it, then save it again in PKCS #8 format, "
         ++ "whose label is ENCRYPTED PRIVATE KEY",
-    BadData -> "a line of a block's data holds base64 characters only, and none is empty",
-    NotCanonical -> "a block's data lines together are not canonical padded base64",
+    BadData -> "each line of a block's data must be non-empty and contain only base64 characters",
+    NotCanonical -> "a block's data lines together are not valid base64 with correct `=` padding",
     BadLabel ->
-      "a label is printable ASCII, with a space or a hyphen only between two other characters",
+      "a label must be printable ASCII, and a space or hyphen must not be the first or last character of the label",
   }
 
 /// Every block of `text`, in order, with private keys sealed. A text of more than `limit` bytes is
@@ -187,14 +192,13 @@ pub fn read(text: String, limit: Int) -> List<Item> / {pem.fail, abort.raise} = 
   }
 }
 
-/// The lines of `text`, ended by CRLF, CR or LF. What follows the last line ending is a line only
-/// when it is not empty.
 fn rows_of(text: Bytes) -> List<Bytes> = {
   let rows = text.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n");
   if rows.at(rows.len() - 1) == Some(b"") { rows.take(rows.len() - 1) } else { rows }
 }
 
-/// Every block of `text`, or the line where it stops being PEM and why.
+/// Returns every block of `text` in order. When `text` is not valid PEM, returns an `Error` with
+/// the line where it stops being PEM and the reason.
 pub fn decode(text: String, limit: Int) -> Result<List<Item>, Error> / {abort.raise} =
   try { read(text, limit) }
 
@@ -226,11 +230,8 @@ pub fn encode(block: Block) -> Result<String, Error> / {abort.raise} = try { wri
 fn fail<a>(line: Int, reason: ErrorKind) -> a / {pem.fail} =
   pem.fail({ line: line, reason: reason })
 
-/// A reader's state: the blocks read so far, the last line read, and the block it is in.
 type ReadState = { items: List<Item>, line: Int, block: Option<OpenBlock> }
 
-/// A block being read: its label and `-----BEGIN` line, what may come next, and what has been read
-/// so far. `first` is the line its data began on.
 type OpenBlock = {
   label: String,
   line: Int,
@@ -240,8 +241,6 @@ type OpenBlock = {
   first: Int,
 }
 
-/// What a block's next line may be: a header, an empty line or data; a header or the empty line
-/// that ends them; an empty line or data; or data.
 type Stage = | Start | Headed | Gap | Data
 
 fn step(w: ReadState, raw: Bytes) -> ReadState / {pem.fail, abort.raise} = {
@@ -270,7 +269,6 @@ fn open_block(label: String, line: Int) -> OpenBlock =
 pub fn trimmed_length(row: Bytes, n: Int) -> Int / {abort.raise} =
   if n > 0 && (row.at(n - 1) == 32 || row.at(n - 1) == 9) { trimmed_length(row, n - 1) } else { n }
 
-/// The label of a boundary line whose opening is its first `lead` bytes.
 fn label_in(row: Bytes, lead: Int, line: Int) -> String / {pem.fail, abort.raise} = {
   let end = row.len() - 5;
   if end < lead || !row.ends_with(b"-----") || !is_label(row.slice(lead, end)) {
@@ -278,7 +276,6 @@ fn label_in(row: Bytes, lead: Int, line: Int) -> String / {pem.fail, abort.raise
   } else { String::of_bytes(row.slice(lead, end)) }
 }
 
-/// RFC 7468's `label`: printable ASCII, a space or a hyphen only between two other characters.
 fn is_label(text: Bytes) -> Bool =
   range(0, text.len()).fold(true, |ok: Bool, i: Int| {
     let c = text.at(i);
@@ -318,11 +315,9 @@ fn header(o: OpenBlock, row: Bytes, line: Int) -> OpenBlock / {pem.fail, abort.r
   }
 }
 
-/// A header's name: printable ASCII with no space in it, and no colon.
 fn is_name(name: Bytes) -> Bool =
   name.len() > 0 && name.position(0, |c: Int| c < 33 || c > 126 || c == 58) == None
 
-/// RFC 1421's `Proc-Type: 4,ENCRYPTED`, which OpenSSL's legacy key files carry.
 fn is_encryption_header(name: Bytes, value: Bytes) -> Bool =
   name == b"Proc-Type" && value.contains(b"ENCRYPTED")
 
@@ -332,7 +327,6 @@ fn data(o: OpenBlock, row: Bytes, line: Int) -> OpenBlock / {pem.fail} =
     { ..o, stage: Data, data: o.data.push(row), first: if o.first == 0 { line } else { o.first } }
   }
 
-/// What a data line is made of: base64's letters, and its padding.
 fn data_bytes() -> Bytes = radix::base64().symbols.concat(b"=")
 
 fn closed(o: OpenBlock, label: String, line: Int) -> Item / {pem.fail, abort.raise} =
@@ -344,8 +338,6 @@ fn closed(o: OpenBlock, label: String, line: Int) -> Item / {pem.fail, abort.rai
     }
   }
 
-/// The line that contains character `at` of a block's joined data, or the last line when `at` is
-/// one past the end.
 fn line_of(o: OpenBlock, at: Int) -> Int =
   min(
     o.first + o.data.len() - 1,
@@ -355,7 +347,6 @@ fn line_of(o: OpenBlock, at: Int) -> Int =
       else { { line: s.line + 1, left: s.left - row.len() } }).line,
   )
 
-/// A header written as its line. Fails unless a reader here would read it back unchanged.
 fn header_line(h: Header, line: Int) -> String / {pem.fail} = {
   let name = Bytes::of_string(h.name);
   let value = Bytes::of_string(h.value);
@@ -364,14 +355,10 @@ fn header_line(h: Header, line: Int) -> String / {pem.fail} = {
   else { h.name ++ ": " ++ h.value }
 }
 
-/// A header's value as it can be written: no control character, and no space at either end.
 fn is_value(value: Bytes) -> Bool =
   value.position(0, |c: Int| c < 32 || c == 127) == None && !value.starts_with(b" ")
     && !value.ends_with(b" ")
 
-// --- Tests ------------------------------------------------------------------
-
-/// Every label this module names, and one it does not.
 fn labels() -> List<Label> =
   [
     Certificate,
@@ -388,7 +375,6 @@ fn labels() -> List<Label> =
     Other("TRUSTED CERTIFICATE"),
   ]
 
-/// A block of one of `labels`, with a header for every second one.
 fn sample(c: { kind: Int, data: Bytes }) -> Block =
   {
     label: labels().at_or((c.kind % 12 + 12) % 12, Certificate),
@@ -396,7 +382,7 @@ fn sample(c: { kind: Int, data: Bytes }) -> Block =
     data: c.data,
   }
 
-test "what was written reads back as the block, or as its sealed key" {
+test "`decode` of `write` output returns the same block, except a private key comes back as a `Sealed` value" {
   gen::check(
     gen::map2(gen::any_int(), gen::bytes(), |kind: Int, data: Bytes| { kind: kind, data: data }),
     |x: { kind: Int, data: Bytes }|
@@ -408,7 +394,6 @@ test "what was written reads back as the block, or as its sealed key" {
   )
 }
 
-/// Whether `data` is one DER sequence and nothing after it: its header's length is what follows.
 fn der_whole(data: Bytes) -> Bool = {
   let n = data.len();
   if n < 2 || data.at(0) != 0x30 { false } else {
@@ -420,16 +405,13 @@ fn der_whole(data: Bytes) -> Bool = {
   }
 }
 
-/// The base64 of a text's single block: its lines that are not boundaries, joined.
 fn letters(text: String) -> String =
   text.split("\n").fold("", |all: String, row: String|
     if row.starts_with("-----") { all } else { all ++ row })
 
-/// One figure of RFC 7468: its number, the label it shows, how many bytes its data decodes to by
-/// another decoder's count, and its text as printed.
 type Rfc7468Example = { figure: Int, label: String, size: Int, text: String }
 
-test "RFC 7468 figure {c.figure}, {c.label}, reads and writes back" for c: Rfc7468Example in rfc7468_examples(
+test "`read` parses the RFC 7468 example figure {c.figure} ({c.label}), and `write` reproduces the text of a public block" for c: Rfc7468Example in rfc7468_examples(
   ) {
   match read(c.text, 4096) {
     [Open(b)] -> {
@@ -449,7 +431,7 @@ test "RFC 7468 figure {c.figure}, {c.label}, reads and writes back" for c: Rfc74
   }
 }
 
-test "a named label is read as its constructor, which a match distinguishes from any other" {
+test "`label_of` turns each known label text into its own constructor, and only `TRUSTED CERTIFICATE` becomes `Other`" {
   assert_eq(
     labels().filter(|l: Label| match label_of(label_text(l)) { Other(_) -> true, _ -> false }),
     [Other("TRUSTED CERTIFICATE")],
@@ -489,7 +471,7 @@ test "labels with the same text are equal, however each was built" {
   assert_eq(f"{Crl} and {Other("OPENSSH PRIVATE KEY")}", "X509 CRL and OPENSSH PRIVATE KEY")
 }
 
-test "a private key is any label ending in PRIVATE KEY, except one already under a password" {
+test "`is_private` is true for any label ending in PRIVATE KEY except ENCRYPTED PRIVATE KEY" {
   assert_eq(labels().filter(is_private), [PrivateKey, RsaPrivateKey, EcPrivateKey]);
   assert(is_private(Other("OPENSSH PRIVATE KEY")));
   assert(is_private(Other("PRIVATE KEY")));
@@ -576,7 +558,7 @@ test "a bundle is every block in order, whatever is written between them" {
 fn result_len(r: Result<List<Item>, Error>) -> Int =
   match r { Ok(items) -> items.len(), Err(_) -> -1 }
 
-test "a sealed key is the key a reader returns, and equal keys compare equal" {
+test "`decode` returns a private key as `Sealed(seal(block))`, and equal sealed keys compare equal" {
   let block: Block = { label: PrivateKey, headers: [], data: b"foobar" };
   assert(decode(write(block), 4096) == Ok([Sealed(seal(block))]));
   assert(seal(block) == seal(block));
@@ -588,7 +570,7 @@ test "a sealed key is the key a reader returns, and equal keys compare equal" {
   )
 }
 
-test "data is written at 64 columns, and headers above it with an empty line after" {
+test "`write` wraps data at 64 columns and puts headers before the data, followed by an empty line" {
   assert_eq(
     write({ label: PublicKey, headers: [], data: b"\x00".repeat(49) }),
     \\-----BEGIN PUBLIC KEY-----
@@ -785,7 +767,8 @@ fn rejected() -> List<Rejected> =
     },
   ]
 
-test "{c.name} is rejected" for c: Rejected in rejected() {
+test "`decode` fails on the malformed PEM text {c.name} with the expected line and reason" for c: Rejected in rejected(
+  ) {
   assert_eq(decode(c.text, 4096), Err({ line: c.line, reason: c.reason }));
   assert(explain(c.reason).len() > 0)
 }
@@ -839,8 +822,6 @@ test "a block no reader here would read back is not written" {
   )
 }
 
-/// RFC 7468's examples: the figures of sections 5 to 13, and of appendix A, whose labels a
-/// reader distinguishes from the ones they resemble.
 fn rfc7468_examples() -> List<Rfc7468Example> =
   [
     {

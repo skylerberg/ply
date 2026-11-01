@@ -11,8 +11,9 @@ import compiler.check.known (array_name, bool_name, bytes_name, char_name, colum
                              some_constructor, string_name, unit_name, ordering_type)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
                              Field, Scheme, Effects, Effect, int_type, bytes_type, bool_type,
-                             unit_type, string_type, float_type, list_type, option_type, fn_type,
-                             monomorphic, no_effects, open_effects, arg_effects, fields_sorted)
+                             unit_type, string_type, float_type, list_type, option_type,
+                             function_type, monomorphic, no_effects, open_effects, arg_effects,
+                             fields_sorted)
 import compiler.emit.typing (unknown_type)
 import std.list
 import std.list (zip)
@@ -20,12 +21,12 @@ import compiler.syntax.patterns (LiteralChar)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (BoolKind, BoxedKind, IntKind, width_named)
 import compiler.emit.keys
-import compiler.emit.keys (name_in_module, RootKey, Generated, TypeOp, Reflect, Show, Digest,
-                           ContainerWalk, Lower, Lift, Keeping, Opening, root_name, root_text,
-                           op_name)
+import compiler.emit.keys (name_in_module, RootKey, Generated, TypeOperation, Reflect, Show, Digest,
+                           ContainerWalk, Lower, Lift, Wrapping, Opening, root_name, root_text,
+                           operation_name)
 import compiler.emit.representations (Constructors, SumConstructor, OpenShape, Definition,
-                                      EmitParam, at_args, kind_of, runtime_object, holds_resource,
-                                      constructor_fields_at, release_effects)
+                                      EmitParam, at_args, kind_of, runtime_object,
+                                      contains_resource, constructor_fields_at, release_effects)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.marks (marked_type, marked_key, without_marks, dynamic_form, has_marks)
 import compiler.store.hash.template (emitted_code)
@@ -39,7 +40,7 @@ import compiler.emit.writing (unspanned_code, prelude_call, placed, int_code, bo
 fn is_key_value(t: Type) -> Bool =
   match t { RecordType(fs) -> fs.map(|f: Field| f.name) == [b"key", b"value"], _ -> false }
 
-fn walk_ops() -> List<Bytes> =
+fn walk_operations() -> List<Bytes> =
   [b"equal", b"equal_from", b"ordered", b"ordered_from"].concat(gathering_walks())
 
 fn gathering_walks() -> List<Bytes> =
@@ -55,50 +56,58 @@ fn gathering_walks() -> List<Bytes> =
 fn marshal_loops() -> List<Bytes> =
   [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"]
 
-pub fn container_op_generated(op: Bytes) -> Bool =
-  walk_ops().contains(op) || marshal_loops().contains(op) || dynamic_loops().contains(op)
-    || strings_root(op)
+pub fn container_operation_generated(operation: Bytes) -> Bool =
+  walk_operations().contains(operation) || marshal_loops().contains(operation)
+    || dynamic_loops().contains(operation)
+    || strings_root(operation)
 
-pub fn container_reads_argument(op: Bytes, k: Int) -> Bool =
-  if gathering_walks().contains(op) { k != 1 }
-  else if dynamic_loops().contains(op) { k != 1 } else {
-    walk_ops().contains(op) || op == b"lower_items" || op == b"lower_entries"
-      || op == b"let_go_items"
+pub fn container_reads_argument(operation: Bytes, k: Int) -> Bool =
+  if gathering_walks().contains(operation) { k != 1 }
+  else if dynamic_loops().contains(operation) { k != 1 } else {
+    walk_operations().contains(operation) || operation == b"lower_items"
+      || operation == b"lower_entries"
+      || operation == b"let_go_items"
   }
 
 pub fn container_definitions(module: Bytes, t: Type) -> List<Definition> / {abort.raise} =
-  [Reflect, Show, Digest].concat(walk_ops().map(ContainerWalk)).map(|written_op: TypeOp| {
-    let op = op_name(written_op);
-    let root = keys::generated_key(written_op, t, module);
-    let typed = container_signature(op, t);
-    {
-      name: name_in_module(module, root_text(root_name(root))),
-      ret: Some(if typed.ret == bool_type() { BoolKind } else { BoxedKind }),
-      return_type: OpenShape([]),
-      pure: true,
-      constant: false,
-      value: None,
-      arity: typed.params.len(),
-      scheme: Some(monomorphic(fn_type(typed.params, typed.ret, no_effects()))),
-      witnesses: 0,
-      borrowed: [],
-      root: root,
-    }
-  })
+  [Reflect, Show, Digest].concat(walk_operations().map(ContainerWalk)).map(
+    |written_op: TypeOperation| {
+      let operation = operation_name(written_op);
+      let root = keys::generated_key(written_op, t, module);
+      let typed = container_signature(operation, t);
+      {
+        name: name_in_module(module, root_text(root_name(root))),
+        return_kind: Some(if typed.result_type == bool_type() { BoolKind } else { BoxedKind }),
+        return_type: OpenShape([]),
+        pure: true,
+        constant: false,
+        value: None,
+        arity: typed.params.len(),
+        scheme: Some(monomorphic(function_type(typed.params, typed.result_type, no_effects()))),
+        witnesses: 0,
+        borrowed: [],
+        root: root,
+      }
+    },
+  )
 
-fn container_signature(op: Bytes, t: Type) -> { params: List<Type>, ret: Type } = {
+fn container_signature(operation: Bytes, t: Type) -> { params: List<Type>, result_type: Type } = {
   let value = value_type();
   let entries = list_type(RecordType([{ name: b"key", ty: value }, { name: b"value", ty: value }]));
-  let gathered = |l: Type| { params: [t, l, int_type()], ret: l };
-  if op == b"equal" { { params: [t, t], ret: bool_type() } }
-  else if op == b"ordered" { { params: [t, t], ret: ordering_type() } }
-  else if op == b"equal_from" { { params: [t, t, int_type()], ret: bool_type() } }
-  else if op == b"ordered_from" { { params: [t, t, int_type()], ret: ordering_type() } }
-  else if op == b"reflect_from" || op == b"shown_from" { gathered(list_type(value)) }
-  else if op == b"digest_from" || op == b"digest_entries_from" { gathered(list_type(bytes_type())) }
-  else if op == b"reflect_entries_from" || op == b"shown_entries_from" { gathered(entries) }
-  else if op == b"digest" { { params: [t], ret: bytes_type() } }
-  else { { params: [t], ret: value } }
+  let gathered = |l: Type| { params: [t, l, int_type()], result_type: l };
+  if operation == b"equal" { { params: [t, t], result_type: bool_type() } }
+  else if operation == b"ordered" { { params: [t, t], result_type: ordering_type() } }
+  else if operation == b"equal_from" { { params: [t, t, int_type()], result_type: bool_type() } }
+  else if operation == b"ordered_from" {
+    { params: [t, t, int_type()], result_type: ordering_type() }
+  } else if operation == b"reflect_from" || operation == b"shown_from" {
+    gathered(list_type(value))
+  } else if operation == b"digest_from" || operation == b"digest_entries_from" {
+    gathered(list_type(bytes_type()))
+  } else if operation == b"reflect_entries_from" || operation == b"shown_entries_from" {
+    gathered(entries)
+  } else if operation == b"digest" { { params: [t], result_type: bytes_type() } }
+  else { { params: [t], result_type: value } }
 }
 
 pub type GeneratedRoot = {
@@ -111,14 +120,14 @@ pub type GeneratedRoot = {
 pub fn container_code(
   module: Bytes,
   constructors: Constructors,
-  op: Bytes,
+  operation: Bytes,
   t: Type,
 ) -> GeneratedRoot / {abort.raise} =
-  if strings_root(op) {
-    let s = strings_code(module, op, t);
+  if strings_root(operation) {
+    let s = strings_code(module, operation, t);
     { params: s.params, code: s.code, definitions: s.here, performs: no_effects() }
   } else {
-    let e = container_walk_code(module, constructors, op, t);
+    let e = container_walk_code(module, constructors, operation, t);
     let word = |n: Bytes|
       { name: n, kind: BoxedKind, ty: kind_of(t).ty, of: Some(t), lambda: None };
     let index = {
@@ -129,8 +138,8 @@ pub fn container_code(
       lambda: None,
     };
     {
-      params: if op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
-      else if op == b"equal" || op == b"ordered" { [word(b"a"), word(b"b")] }
+      params: if operation.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
+      else if operation == b"equal" || operation == b"ordered" { [word(b"a"), word(b"b")] }
       else { [word(b"a")] },
       code: e.code,
       definitions: e.here,
@@ -141,7 +150,7 @@ pub fn container_code(
 fn container_walk_code(
   module: Bytes,
   constructors: Constructors,
-  op: Bytes,
+  operation: Bytes,
   t: Type,
 ) -> { code: Code, here: List<Definition> } / {abort.raise} = {
   let args = match t { NamedType(c) -> c.args, _ -> [] };
@@ -169,10 +178,12 @@ fn container_walk_code(
     container_definitions(module, t).concat(container_definitions(module, walked))
   } else { container_definitions(module, t) };
   let entry_of_values = RecordType([{ name: b"key", ty: value }, { name: b"value", ty: value }]);
-  let gathered_item = if op == b"digest_from" || op == b"digest_entries_from" { bytes_type() }
-  else if op == b"reflect_entries_from" || op == b"shown_entries_from" { entry_of_values }
-  else { value };
-  let typed = container_signature(op, t);
+  let gathered_item = if operation == b"digest_from" || operation == b"digest_entries_from" {
+    bytes_type()
+  } else if operation == b"reflect_entries_from" || operation == b"shown_entries_from" {
+    entry_of_values
+  } else { value };
+  let typed = container_signature(operation, t);
   let param = |i: Int| match typed.params.at(i) { Some(p) -> p, None -> t };
   let a = slot_code(b"a", 0, param(0));
   let b = slot_code(b"b", 1, param(1));
@@ -182,7 +193,7 @@ fn container_walk_code(
   let next = binary_of(b"add", i, int_code(1));
   let looped = |name: Bytes, operands: List<Code>| {
     let key = keys::generated_key(ContainerWalk(name), walked, module);
-    call_of(module, key, operands, container_signature(name, walked).ret)
+    call_of(module, key, operands, container_signature(name, walked).result_type)
   };
   let length = |c: Code, over: List<Type>|
     builtin_call(
@@ -253,24 +264,29 @@ fn container_walk_code(
       ),
     )
   };
-  let body = if kind == b"" && op == b"equal" {
+  let body = if kind == b"" && operation == b"equal" {
     fields_of.fold(
       { code: bool_code(true), first: true },
-      |acc: { code: Code, first: Bool }, f: Field| {
+      |accumulator: { code: Code, first: Bool }, f: Field| {
         let read = |c: Code| field_code(c, f.name, f.ty);
         let eq = binary_of(b"eq", read(a), read(b));
-        { code: if acc.first { eq } else { binary_of(b"and", acc.code, eq) }, first: false }
+        {
+          code: if accumulator.first { eq } else { binary_of(b"and", accumulator.code, eq) },
+          first: false,
+        }
       },
     ).code
   } else if kind == result_name() {
     let arm = |pattern: CodePattern, body2: Code| { pattern: pattern, guard: None, body: body2 };
-    let one = |ctor: Bytes, slot: Int, held: Type|
-      prelude_pattern(ctor, [binder(if slot == 3 { b"x" } else { b"y" }, slot, held)]);
-    let other = |ctor: Bytes| prelude_pattern(ctor, [CodeWildcardPattern]);
+    let one = |constructor: Bytes, slot: Int, payload_type: Type|
+      prelude_pattern(constructor, [
+        binder(if slot == 3 { b"x" } else { b"y" }, slot, payload_type),
+      ]);
+    let other = |constructor: Bytes| prelude_pattern(constructor, [CodeWildcardPattern]);
     let ok = match args.at(0) { Some(o) -> o, None -> unknown_type() };
-    let xs = |held: Type| slot_code(b"x", 3, held);
-    let ys = |held: Type| slot_code(b"y", 4, held);
-    if op == b"equal" {
+    let xs = |payload_type: Type| slot_code(b"x", 3, payload_type);
+    let ys = |payload_type: Type| slot_code(b"y", 4, payload_type);
+    if operation == b"equal" {
       match_code(
         a,
         [
@@ -332,7 +348,7 @@ fn container_walk_code(
         ordering_type(),
       )
     }
-  } else if kind == option_name() && op == b"equal" {
+  } else if kind == option_name() && operation == b"equal" {
     let arm = |pattern: CodePattern, body2: Code| { pattern: pattern, guard: None, body: body2 };
     let none = prelude_pattern(none_constructor(), []);
     match_code(
@@ -395,15 +411,15 @@ fn container_walk_code(
       ],
       ordering_type(),
     )
-  } else if op == b"equal" {
+  } else if operation == b"equal" {
     if_code(
       binary_of(b"eq", length(a, args), length(b, args)),
       looped(b"equal_from", [walked_of(a), walked_of(b), int_code(0)]),
       bool_code(false),
     )
-  } else if op == b"ordered" {
+  } else if operation == b"ordered" {
     identical_shortcut(looped(b"ordered_from", [walked_of(a), walked_of(b), int_code(0)]), t)
-  } else if op == b"equal_from" {
+  } else if operation == b"equal_from" {
     match_at(
       a,
       b"x",
@@ -417,7 +433,7 @@ fn container_walk_code(
       ),
       bool_code(true),
     )
-  } else if op == b"ordered_from" {
+  } else if operation == b"ordered_from" {
     match_at(
       a,
       b"x",
@@ -437,20 +453,21 @@ fn container_walk_code(
         prelude_made(equal_constructor(), [], ordering_type()),
       ),
     )
-  } else if op == b"reflect_from" || op == b"shown_from" {
-    let name = if op == b"reflect_from" { b"?reflect" } else { b"?shown" };
-    gathered(op, |out: Code| push(out, part(name, x)))
-  } else if op == b"digest_from" { gathered(op, |out: Code| push(out, part(b"?encoded", x))) }
-  else if op == b"reflect_entries_from" || op == b"shown_entries_from" {
-    let name = if op == b"reflect_entries_from" { b"?reflect" } else { b"?shown" };
-    gathered(op, |out: Code| push(out, entry(name)))
-  } else if op == b"digest_entries_from" {
-    gathered(op, |out: Code|
+  } else if operation == b"reflect_from" || operation == b"shown_from" {
+    let name = if operation == b"reflect_from" { b"?reflect" } else { b"?shown" };
+    gathered(operation, |out: Code| push(out, part(name, x)))
+  } else if operation == b"digest_from" {
+    gathered(operation, |out: Code| push(out, part(b"?encoded", x)))
+  } else if operation == b"reflect_entries_from" || operation == b"shown_entries_from" {
+    let name = if operation == b"reflect_entries_from" { b"?reflect" } else { b"?shown" };
+    gathered(operation, |out: Code| push(out, entry(name)))
+  } else if operation == b"digest_entries_from" {
+    gathered(operation, |out: Code|
       push(
         push(out, part(b"?encoded", field_code(x, b"key", field(b"key")))),
         part(b"?encoded", field_code(x, b"value", field(b"value"))),
       ))
-  } else if op == b"digest" {
+  } else if operation == b"digest" {
     let tag = if kind == map_name() { 11 }
     else if kind == array_name() || kind == columns_name() { 10 }
     else { 9 };
@@ -471,7 +488,7 @@ fn container_walk_code(
       ),
     ])
   } else {
-    let reflecting = op == b"reflect";
+    let reflecting = operation == b"reflect";
     let made = if kind == map_name() { b"std.value.VMap" }
     else if kind == array_name() || kind == columns_name() { b"std.value.VArray" }
     else { b"std.value.VList" };
@@ -490,11 +507,11 @@ fn container_walk_code(
   { code: body, here: here }
 }
 
-pub type InstanceFn = {
+pub type InstanceFunction = {
   full: Bytes,
   args: List<Type>,
   fn_type: Type,
-  ret: Type,
+  return_type: Type,
   effect_arguments: List<Effects>,
 }
 
@@ -503,14 +520,14 @@ pub fn key_instance(
   here: List<Definition>,
   items: List<Item>,
   ty: Type,
-) -> Option<InstanceFn> =
+) -> Option<InstanceFunction> =
   instance_for(module, here, ty, |c: Bytes|
-    items.fold(None, |acc: Option<Bytes>, item: Item|
+    items.fold(None, |accumulator: Option<Bytes>, item: Item|
       match item {
         InstanceItem(d) -> if d.kind == KeyInstance && qualify(module, d.target.name) == c {
           Some(d.function.name)
-        } else { acc },
-        _ -> acc,
+        } else { accumulator },
+        _ -> accumulator,
       }))
 
 pub fn numeric_instance(
@@ -518,15 +535,15 @@ pub fn numeric_instance(
   here: List<Definition>,
   items: List<Item>,
   ty: Type,
-  op: Bytes,
-) -> Option<InstanceFn> =
+  operation: Bytes,
+) -> Option<InstanceFunction> =
   instance_for(module, here, ty, |c: Bytes|
-    items.fold(None, |acc: Option<Bytes>, item: Item|
+    items.fold(None, |accumulator: Option<Bytes>, item: Item|
       match item {
         NumericItem(d) -> if qualify(module, d.target.name) == c {
-          match numeric_by(d, op) { Some(by) -> Some(by.name), None -> acc }
-        } else { acc },
-        _ -> acc,
+          match numeric_by(d, operation) { Some(by) -> Some(by.name), None -> accumulator }
+        } else { accumulator },
+        _ -> accumulator,
       }))
 
 fn instance_for(
@@ -534,19 +551,19 @@ fn instance_for(
   here: List<Definition>,
   ty: Type,
   named: (Bytes) -> Option<Bytes>,
-) -> Option<InstanceFn> =
+) -> Option<InstanceFunction> =
   match ty {
     NamedType(c) -> match named(c.name) {
       None -> None,
       Some(f) -> match here.fold(None, |s: Option<Scheme>, h: Definition|
           if h.name == f { h.scheme } else { s }) {
-        Some(sc) -> match sc.ty {
+        Some(scheme) -> match scheme.ty {
           FunctionType(fn_type) -> {
-            let at_type = fn_type.params.push(fn_type.ret).fold(
+            let at_type = fn_type.params.push(fn_type.return_type).fold(
               None,
-              |acc: Option<List<Type>>, t: Type|
-                match acc {
-                  Some(_) -> acc,
+              |accumulator: Option<List<Type>>, t: Type|
+                match accumulator {
+                  Some(_) -> accumulator,
                   None -> match t {
                     NamedType(p) -> if p.name == c.name { Some(p.args) } else { None },
                     _ -> None,
@@ -554,12 +571,12 @@ fn instance_for(
                 },
             );
             let written = match at_type { Some(xs) -> xs, None -> [] };
-            let args = sc.type_variables.map(|v: Int|
+            let args = scheme.type_variables.map(|v: Int|
               range(0, written.len()).fold(unknown_type(), |found: Type, i: Int|
                 if written.at(i) == Some(VariableType(v)) {
                   match c.args.at(i) { Some(t) -> t, None -> found }
                 } else { found }));
-            let effect_arguments = sc.effect_variables.map(|v: Int|
+            let effect_arguments = scheme.effect_variables.map(|v: Int|
               range(0, written.len()).fold(no_effects(), |found: Effects, i: Int|
                 match ((written.at(i), c.args.at(i))) {
                   (Some(w), Some(given)) -> if arg_effects(w) == Some(open_effects(v)) {
@@ -570,8 +587,8 @@ fn instance_for(
             Some({
               full: qualify(module, f),
               args: args,
-              fn_type: at_args(sc.ty, sc.type_variables, args),
-              ret: at_args(fn_type.ret, sc.type_variables, args),
+              fn_type: at_args(scheme.ty, scheme.type_variables, args),
+              return_type: at_args(fn_type.return_type, scheme.type_variables, args),
               effect_arguments: effect_arguments,
             })
           },
@@ -583,17 +600,17 @@ fn instance_for(
     _ -> None,
   }
 
-fn stated_call(s: InstanceFn, args: List<Code>) -> Code =
+fn stated_call(s: InstanceFunction, args: List<Code>) -> Code =
   applied(
     unspanned_code(
       NDefinition({ full: s.full, args: s.args, effect_arguments: s.effect_arguments, labels: [] }),
       s.fn_type,
     ),
     args,
-    s.ret,
+    s.return_type,
   )
 
-pub fn instance_code(s: InstanceFn, params: List<Type>) -> Code =
+pub fn instance_code(s: InstanceFunction, params: List<Type>) -> Code =
   stated_call(
     s,
     range(0, params.len()).map(|i: Int|
@@ -603,7 +620,7 @@ pub fn instance_code(s: InstanceFn, params: List<Type>) -> Code =
       })),
   )
 
-pub fn key_comparison_code(k: InstanceFn, eq: Bool, ty: Type) -> Code = {
+pub fn key_comparison_code(k: InstanceFunction, eq: Bool, ty: Type) -> Code = {
   let ordered = compare_call(
     stated_call(k, [slot_code(b"a", 0, ty)]),
     stated_call(k, [slot_code(b"b", 1, ty)]),
@@ -685,11 +702,11 @@ pub fn ordering_code(ty: Type, cs: List<SumConstructor>) -> Code = {
   let equal = prelude_made(equal_constructor(), [], ordering_type());
   let walked = cs.fold(
     { arms: [], slot: 4 },
-    |acc: { arms: List<CodeArm>, slot: Int }, c: SumConstructor| {
-      let xs = bound_from(acc.slot, b"x", c.fields);
-      let ys = bound_from(acc.slot + xs.len(), b"y", c.fields);
+    |accumulator: { arms: List<CodeArm>, slot: Int }, c: SumConstructor| {
+      let xs = bound_from(accumulator.slot, b"x", c.fields);
+      let ys = bound_from(accumulator.slot + xs.len(), b"y", c.fields);
       let orders = bound_from(
-        acc.slot + 2 * xs.len(),
+        accumulator.slot + 2 * xs.len(),
         b"o",
         c.fields.map(|_: Type| ordering_type()),
       );
@@ -725,7 +742,7 @@ pub fn ordering_code(ty: Type, cs: List<SumConstructor>) -> Code = {
         ordering_type(),
       );
       {
-        arms: acc.arms.push({
+        arms: accumulator.arms.push({
           pattern: CodeConstructorPattern({
             sum: sum,
             name: c.name,
@@ -735,7 +752,7 @@ pub fn ordering_code(ty: Type, cs: List<SumConstructor>) -> Code = {
           guard: None,
           body: inner,
         }),
-        slot: acc.slot + 3 * xs.len(),
+        slot: accumulator.slot + 3 * xs.len(),
       }
     },
   );
@@ -799,8 +816,8 @@ pub fn digest_code(
   match fields_of {
     Some(fs) ->
       joined(
-        fs.fold([bytes_code(counted(12, fs.len()))], |acc: List<Code>, f: Field|
-          acc.concat([bytes_code(blob(13, f.name)), part(field_code(a, f.name, f.ty))])),
+        fs.fold([bytes_code(counted(12, fs.len()))], |accumulator: List<Code>, f: Field|
+          accumulator.concat([bytes_code(blob(13, f.name)), part(field_code(a, f.name, f.ty))])),
       ),
     None -> match ty {
       NamedType(c) -> match constructors.sums.get(c.name) {
@@ -812,17 +829,21 @@ pub fn digest_code(
               a,
               cs.fold(
                 { arms: [], slot: 1 },
-                |acc: { arms: List<CodeArm>, slot: Int }, sc: SumConstructor| {
-                  let xs = bound_from(acc.slot, b"x", constructor_fields_at(sc, c.args));
-                  let dot = range(0, sc.name.len()).fold(0 - 1, |d: Int, i: Int|
-                    if sc.name.at(i) == 46 { i } else { d });
-                  let simple = sc.name.slice(dot + 1, sc.name.len());
+                |accumulator: { arms: List<CodeArm>, slot: Int }, sum_constructor: SumConstructor| {
+                  let xs = bound_from(
+                    accumulator.slot,
+                    b"x",
+                    constructor_fields_at(sum_constructor, c.args),
+                  );
+                  let dot = range(0, sum_constructor.name.len()).fold(0 - 1, |d: Int, i: Int|
+                    if sum_constructor.name.at(i) == 46 { i } else { d });
+                  let simple = sum_constructor.name.slice(dot + 1, sum_constructor.name.len());
                   {
-                    arms: acc.arms.push({
+                    arms: accumulator.arms.push({
                       pattern: CodeConstructorPattern({
                         sum: c.name,
-                        name: sc.name,
-                        case: sc.index,
+                        name: sum_constructor.name,
+                        case: sum_constructor.index,
                         args: xs.map(bound_pattern),
                       }),
                       guard: None,
@@ -832,7 +853,7 @@ pub fn digest_code(
                         ),
                       ),
                     }),
-                    slot: acc.slot + xs.len(),
+                    slot: accumulator.slot + xs.len(),
                   }
                 },
               ).arms,
@@ -888,12 +909,12 @@ pub fn reflection_code(
         Some(cs) -> {
           let stated = if !shown { None } else {
             instance_for(module, here, ty, |n: Bytes|
-              items.fold(None, |acc: Option<Bytes>, item: Item|
+              items.fold(None, |accumulator: Option<Bytes>, item: Item|
                 match item {
                   InstanceItem(d) -> if d.kind == ShowInstance
                       && qualify(module, d.target.name) == n { Some(d.function.name) }
-                  else { acc },
-                  _ -> acc,
+                  else { accumulator },
+                  _ -> accumulator,
                 }))
           };
           match stated {
@@ -903,26 +924,30 @@ pub fn reflection_code(
                 a,
                 cs.fold(
                   { arms: [], slot: 1 },
-                  |acc: { arms: List<CodeArm>, slot: Int }, sc: SumConstructor| {
-                    let xs = bound_from(acc.slot, b"x", constructor_fields_at(sc, c.args));
+                  |accumulator: { arms: List<CodeArm>, slot: Int }, sum_constructor: SumConstructor| {
+                    let xs = bound_from(
+                      accumulator.slot,
+                      b"x",
+                      constructor_fields_at(sum_constructor, c.args),
+                    );
                     {
-                      arms: acc.arms.push({
+                      arms: accumulator.arms.push({
                         pattern: CodeConstructorPattern({
                           sum: c.name,
-                          name: sc.name,
-                          case: sc.index,
+                          name: sum_constructor.name,
+                          case: sum_constructor.index,
                           args: xs.map(bound_pattern),
                         }),
                         guard: None,
                         body: value_made(constructors, b"std.value.VCtor", [
-                          string_code(sc.name),
+                          string_code(sum_constructor.name),
                           unspanned_code(
                             CodeList({ items: xs.map(|x: Bound| part(bound_read(x))) }),
                             list_type(value),
                           ),
                         ]),
                       }),
-                      slot: acc.slot + xs.len(),
+                      slot: accumulator.slot + xs.len(),
                     }
                   },
                 ).arms,
@@ -953,7 +978,7 @@ pub fn release_resource_code(
     Some(fs) ->
       {
         code: sequence(
-          fs.filter(|f: Field| holds_resource(constructors, f.ty)).map(|f: Field|
+          fs.filter(|f: Field| contains_resource(constructors, f.ty)).map(|f: Field|
             let_go(field_code(a, f.name, f.ty))),
         ),
         here: [],
@@ -991,23 +1016,28 @@ pub fn release_resource_code(
                   a,
                   cs.fold(
                     { arms: [], slot: 1 },
-                    |acc: { arms: List<CodeArm>, slot: Int }, sc: SumConstructor| {
-                      let xs = bound_from(acc.slot, b"x", constructor_fields_at(sc, c.args));
-                      let held = xs.filter(|x: Bound| holds_resource(constructors, x.ty));
+                    |accumulator: { arms: List<CodeArm>, slot: Int }, sum_constructor: SumConstructor| {
+                      let xs = bound_from(
+                        accumulator.slot,
+                        b"x",
+                        constructor_fields_at(sum_constructor, c.args),
+                      );
+                      let resource_payloads = xs.filter(|x: Bound|
+                        contains_resource(constructors, x.ty));
                       {
-                        arms: acc.arms.push({
+                        arms: accumulator.arms.push({
                           pattern: CodeConstructorPattern({
                             sum: c.name,
-                            name: sc.name,
-                            case: sc.index,
+                            name: sum_constructor.name,
+                            case: sum_constructor.index,
                             args: xs.map(|x: Bound|
-                              if holds_resource(constructors, x.ty) { bound_pattern(x) }
+                              if contains_resource(constructors, x.ty) { bound_pattern(x) }
                               else { CodeWildcardPattern }),
                           }),
                           guard: None,
-                          body: sequence(held.map(|x: Bound| let_go(bound_read(x)))),
+                          body: sequence(resource_payloads.map(|x: Bound| let_go(bound_read(x)))),
                         }),
-                        slot: acc.slot + xs.len(),
+                        slot: accumulator.slot + xs.len(),
                       }
                     },
                   ).arms,
@@ -1065,11 +1095,11 @@ pub fn release_items_code(
 
 fn let_go(x: Code) -> Code = builtin_call(b"?let_go", [], [x], unit_type())
 
-pub fn is_marshal_op(op: TypeOp) -> Bool =
-  match op {
+pub fn is_marshal_operation(operation: TypeOperation) -> Bool =
+  match operation {
     Lower -> true,
     Lift -> true,
-    Keeping -> true,
+    Wrapping -> true,
     Opening -> true,
     ContainerWalk(c) -> marshal_loops().contains(c) || dynamic_loops().contains(c),
     _ -> false,
@@ -1083,7 +1113,7 @@ pub fn marshal_root(
   match key {
     Generated(w, _) -> {
       let marked = marked_type(w.ty, w.marks);
-      match w.op {
+      match w.operation {
         Lower ->
           generated_root(
             module,
@@ -1093,7 +1123,7 @@ pub fn marshal_root(
             lowering_code(module, constructors, marked),
           ),
         Lift -> generated_root(module, key, [], w.ty, lifting_code(module, constructors, marked)),
-        Keeping ->
+        Wrapping ->
           generated_root(
             module,
             key,
@@ -1112,19 +1142,28 @@ pub fn marshal_root(
         ContainerWalk(c) -> match if dynamic_loops().contains(c) { dynamic_loop(module, c, marked) }
           else { marshal_loop(module, c, w.ty, marked) } {
           Some(r) -> r,
-          None -> internal_error(b"a root no marshalling runs"),
+          None ->
+            internal_error(
+              b"no code to convert values between the program and the runtime can be generated for this root type",
+            ),
         },
-        _ -> internal_error(b"a root no marshalling runs"),
+        _ ->
+          internal_error(
+            b"no code to convert values between the program and the runtime can be generated for this root type",
+          ),
       }
     },
-    _ -> internal_error(b"a root no marshalling runs"),
+    _ ->
+      internal_error(
+        b"no code to convert values between the program and the runtime can be generated for this root type",
+      ),
   }
 
 fn dynamic_loops() -> List<Bytes> =
   [b"keeping_items", b"opening_items", b"keeping_entries", b"opening_entries"]
 
-fn dynamic_side(ty: Type, kept: Bool) -> Type / {abort.raise} =
-  if kept { dynamic_form(ty) } else { without_marks(ty) }
+fn dynamic_side(ty: Type, retained: Bool) -> Type / {abort.raise} =
+  if retained { dynamic_form(ty) } else { without_marks(ty) }
 
 fn wrap_handles(x: Code, ty: Type, keeping: Bool) -> Code / {abort.raise} =
   if !has_marks(ty) { x } else {
@@ -1198,35 +1237,44 @@ fn dynamic_code(
         ],
       }
     } else if runtime_object(c.name) {
-      internal_error(b"a value of a runtime object an operation's own type parameter stands in")
+      internal_error(
+        b"cannot convert a value of a runtime-managed type, even when that type is only an operation's type argument",
+      )
     } else {
       match constructors.sums.get(c.name) {
-        None -> internal_error(b"a kept marshalling of a type no root writes: ".concat(c.name)),
+        None ->
+          internal_error(
+            b"no constructors are known for the type being converted: ".concat(c.name),
+          ),
         Some(cs) -> {
           let arms = cs.fold(
             { arms: [], slot: 1 },
-            |acc: { arms: List<CodeArm>, slot: Int }, sc: SumConstructor| {
-              let args = constructor_fields_at(sc, c.args);
-              let xs = bound_from(acc.slot, b"x", args.map(|t: Type| dynamic_side(t, !keeping)));
+            |accumulator: { arms: List<CodeArm>, slot: Int }, sum_constructor: SumConstructor| {
+              let args = constructor_fields_at(sum_constructor, c.args);
+              let xs = bound_from(
+                accumulator.slot,
+                b"x",
+                args.map(|t: Type| dynamic_side(t, !keeping)),
+              );
               {
-                arms: acc.arms.push({
+                arms: accumulator.arms.push({
                   pattern: CodeConstructorPattern({
                     sum: c.name,
-                    name: sc.name,
-                    case: sc.index,
+                    name: sum_constructor.name,
+                    case: sum_constructor.index,
                     args: xs.map(bound_pattern),
                   }),
                   guard: None,
                   body: constructor_made(
                     c.name,
-                    sc.name,
-                    sc.index,
+                    sum_constructor.name,
+                    sum_constructor.index,
                     zip(xs, args).map(|p: { first: Bound, second: Type }|
                       wrap_handles(bound_read(p.first), p.second, keeping)),
                     into,
                   ),
                 }),
-                slot: acc.slot + xs.len(),
+                slot: accumulator.slot + xs.len(),
               }
             },
           );
@@ -1236,8 +1284,8 @@ fn dynamic_code(
     },
     RecordType(fs) -> dynamic_record(a, fs, into, keeping),
     NominalType(x) -> dynamic_record(a, x.fields, into, keeping),
-    FunctionType(f) -> dynamic_function(f.params, f.ret, from, into, keeping),
-    VariableType(_) -> internal_error(b"a kept marshalling at a type variable"),
+    FunctionType(f) -> dynamic_function(f.params, f.return_type, from, into, keeping),
+    VariableType(_) -> internal_error(b"cannot convert a value whose type is a type variable"),
   }
 }
 
@@ -1263,7 +1311,7 @@ fn dynamic_record(
 
 fn dynamic_function(
   params: List<Type>,
-  ret: Type,
+  return_type: Type,
   from: Type,
   into: Type,
   keeping: Bool,
@@ -1275,18 +1323,25 @@ fn dynamic_function(
       params.get(j),
       !keeping,
     ));
-  let called = applied(slot_code(b"f", n, from), args, dynamic_side(ret, !keeping));
+  let called = applied(slot_code(b"f", n, from), args, dynamic_side(return_type, !keeping));
   let ty = match into {
     FunctionType(g) -> g,
-    _ -> { params: params, kept: [], once: false, ret: ret, effects: no_effects() },
+    _ ->
+      {
+        params: params,
+        keep_parameters: [],
+        once: false,
+        return_type: return_type,
+        effects: no_effects(),
+      },
   };
   {
     code: unspanned_code(
       CodeLambda({
         params: n,
         size: n + 1,
-        captures: [{ src: 0, destination: n }],
-        body: wrap_handles(called, ret, keeping),
+        captures: [{ source: 0, destination: n }],
+        body: wrap_handles(called, return_type, keeping),
         at: placed(0),
         ty: ty,
         effects: no_effects(),
@@ -1297,47 +1352,53 @@ fn dynamic_function(
   }
 }
 
-fn dynamic_loop(module: Bytes, op: Bytes, over: Type) -> Option<GeneratedRoot> / {abort.raise} = {
-  let keeping = op.starts_with(b"keeping");
-  let key = marked_key(ContainerWalk(op), over, module);
-  let from = dynamic_side(over, !keeping);
+fn dynamic_loop(
+  module: Bytes,
+  operation: Bytes,
+  over: Type,
+) -> Option<GeneratedRoot> / {abort.raise} = {
+  let wrapping = operation.starts_with(b"keeping");
+  let key = marked_key(ContainerWalk(operation), over, module);
+  let from = dynamic_side(over, !wrapping);
   let a = slot_code(b"a", 0, from);
   let i = slot_code(b"i", 2, int_type());
   match item_of(over) {
     None -> None,
     Some(item) -> {
       let container = match over { NamedType(c) -> c.name, _ -> list_name() };
-      let held = dynamic_side(item, !keeping);
+      let item_side = dynamic_side(item, !wrapping);
       let got = if container == list_name() {
-        prelude_call(b"List::at", [held], [a, i], option_type(held))
-      } else { builtin_call(container.concat(b"::at"), [held], [a, i], option_type(held)) };
-      let x = slot_code(b"x", 3, held);
-      let body = if op.ends_with(b"entries") {
+        prelude_call(b"List::at", [item_side], [a, i], option_type(item_side))
+      } else {
+        builtin_call(container.concat(b"::at"), [item_side], [a, i], option_type(item_side))
+      };
+      let x = slot_code(b"x", 3, item_side);
+      let body = if operation.ends_with(b"entries") {
         let key_type = field_of(item, b"key");
         let value_type = field_of(item, b"value");
         let k = wrap_handles(
-          field_code(x, b"key", dynamic_side(key_type, !keeping)),
+          field_code(x, b"key", dynamic_side(key_type, !wrapping)),
           key_type,
-          keeping,
+          wrapping,
         );
         let v = wrap_handles(
-          field_code(x, b"value", dynamic_side(value_type, !keeping)),
+          field_code(x, b"value", dynamic_side(value_type, !wrapping)),
           value_type,
-          keeping,
+          wrapping,
         );
-        let both = [dynamic_side(key_type, keeping), dynamic_side(value_type, keeping)];
+        let both = [dynamic_side(key_type, wrapping), dynamic_side(value_type, wrapping)];
         let into = NamedType({ name: map_name(), args: both });
         {
           code: prelude_call(b"Map::insert", both, [slot_code(b"out", 1, into), k, v], into),
           into: into,
         }
       } else {
-        let into = dynamic_side(list_type(item), keeping);
+        let into = dynamic_side(list_type(item), wrapping);
         {
           code: prelude_call(
             b"List::push",
-            [dynamic_side(item, keeping)],
-            [slot_code(b"out", 1, into), wrap_handles(x, item, keeping)],
+            [dynamic_side(item, wrapping)],
+            [slot_code(b"out", 1, into), wrap_handles(x, item, wrapping)],
             into,
           ),
           into: into,
@@ -1350,7 +1411,7 @@ fn dynamic_loop(module: Bytes, op: Bytes, over: Type) -> Option<GeneratedRoot> /
             got,
             b"x",
             3,
-            held,
+            item_side,
             call_of(module, key, [a, body.code, binary_of(b"add", i, int_code(1))], body.into),
             out,
           ),
@@ -1365,14 +1426,14 @@ fn internal_error<a>(reason: Bytes) -> a / {abort.raise} = panic(String::of_byte
 
 fn marshal_loop(
   module: Bytes,
-  op: Bytes,
+  operation: Bytes,
   t: Type,
   marked: Type,
 ) -> Option<GeneratedRoot> / {abort.raise} = {
-  let key = marked_key(ContainerWalk(op), marked, module);
+  let key = marked_key(ContainerWalk(operation), marked, module);
   match item_of(marked) {
     None -> None,
-    Some(item) -> if op == b"lower_items" {
+    Some(item) -> if operation == b"lower_items" {
       Some(
         generated_root(
           module,
@@ -1382,7 +1443,7 @@ fn marshal_loop(
           items_lowered(module, key, t, marked, item),
         ),
       )
-    } else if op == b"lower_entries" {
+    } else if operation == b"lower_entries" {
       Some(
         generated_root(
           module,
@@ -1392,9 +1453,9 @@ fn marshal_loop(
           entries_lowered(module, key, t, item),
         ),
       )
-    } else if op == b"lift_items" {
+    } else if operation == b"lift_items" {
       Some(generated_root(module, key, [t, int_type()], t, items_lifted(module, key, t, item)))
-    } else if op == b"lift_entries" {
+    } else if operation == b"lift_entries" {
       Some(generated_root(module, key, [t, int_type()], t, entries_lifted(module, key, t, marked)))
     } else { None },
   }
@@ -1415,8 +1476,8 @@ pub fn runtime_entry_code(
   let key = keys::EntryPoint(root);
   let read = range(0, params.len()).fold(
     [CodeDo({ code: native_call(b"?in_count", [int_code(tag_list())], int_type()) })],
-    |acc: List<CodeStatement>, i: Int|
-      acc.push(
+    |accumulator: List<CodeStatement>, i: Int|
+      accumulator.push(
         CodeLet({
           name: b"p".concat(ascii_of_int(i)),
           slot: i,
@@ -1434,7 +1495,7 @@ pub fn runtime_entry_code(
         effect_arguments: rows,
         labels: [],
       }),
-      fn_type(params, result, { listed: effects.listed, variable: None }),
+      function_type(params, result, { listed: effects.listed, variable: None }),
     ),
     reads,
     result,
@@ -1444,7 +1505,13 @@ pub fn runtime_entry_code(
     { code: direct, listed: effects.listed, n: 0 },
     |inner: { code: Code, listed: List<Effect>, n: Int }, host: { call: Bytes, effect: Bytes, adds: List<Effect> }| {
       let performs = { listed: inner.listed, variable: None };
-      let lambda_type = { params: [], kept: [], once: false, ret: result, effects: no_effects() };
+      let lambda_type = {
+        params: [],
+        keep_parameters: [],
+        once: false,
+        return_type: result,
+        effects: no_effects(),
+      };
       let left = inner.listed.filter(|a: Effect| a.effect != host.effect);
       let leaves = { listed: left, variable: None };
       {
@@ -1456,14 +1523,14 @@ pub fn runtime_entry_code(
               effect_arguments: [leaves],
               labels: [],
             }),
-            fn_type([FunctionType({ ..lambda_type, effects: performs })], result, leaves),
+            function_type([FunctionType({ ..lambda_type, effects: performs })], result, leaves),
           ),
           [
             unspanned_code(
               CodeLambda({
                 params: 0,
                 size: params.len(),
-                captures: range(0, params.len()).map(|i: Int| { src: i, destination: i }),
+                captures: range(0, params.len()).map(|i: Int| { source: i, destination: i }),
                 body: inner.code,
                 at: placed(inner.n),
                 ty: lambda_type,
@@ -1474,8 +1541,8 @@ pub fn runtime_entry_code(
           ],
           result,
         ),
-        listed: host.adds.fold(left, |acc: List<Effect>, a: Effect|
-          if acc.contains(a) { acc } else { acc.push(a) }),
+        listed: host.adds.fold(left, |accumulator: List<Effect>, a: Effect|
+          if accumulator.contains(a) { accumulator } else { accumulator.push(a) }),
         n: inner.n + 1,
       }
     },
@@ -1496,13 +1563,13 @@ pub fn called_definition(
 ) -> Definition / {abort.raise} =
   {
     name: name_in_module(module, root_text(root_name(root))),
-    ret: Some(kind_of(result).kind),
+    return_kind: Some(kind_of(result).kind),
     return_type: OpenShape([]),
     pure: pure,
     constant: false,
     value: None,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, result, effects))),
+    scheme: Some(monomorphic(function_type(params, result, effects))),
     witnesses: 0,
     borrowed: [],
     root: root,
@@ -1513,8 +1580,8 @@ fn lowering_code(
   constructors: Constructors,
   ty: Type,
 ) -> { code: Code, here: List<Definition> } / {abort.raise} = {
-  let held = without_marks(ty);
-  let a = slot_code(b"a", 0, held);
+  let unmarked = without_marks(ty);
+  let a = slot_code(b"a", 0, unmarked);
   let out = |name: Bytes, args: List<Code>| native_call(name, args, unit_type());
   let alone = |c: Code| { code: c, here: [] };
   let shared = |parts: List<Code>|
@@ -1523,10 +1590,10 @@ fn lowering_code(
       sequence(parts),
       unit_code(),
     );
-  let args_at = match held { NamedType(c) -> c.args, _ -> [] };
+  let args_at = match unmarked { NamedType(c) -> c.args, _ -> [] };
   match ty {
     NamedType(c) -> if c.name == b"^" && c.args.len() == 1 {
-      alone(builtin_call(b"?out_carried", [held], [a], unit_type()))
+      alone(builtin_call(b"?out_carried", [unmarked], [a], unit_type()))
     } else if c.args.len() == 0 && c.name == unit_name() {
       alone(out(b"?out_tag", [int_code(tag_unit())]))
     } else if c.args.len() == 0 && c.name == bool_name() {
@@ -1552,7 +1619,7 @@ fn lowering_code(
           ]),
           call_of(module, items, [a, int_code(0)], unit_type()),
         ]),
-        here: [definition_of(module, items, [held, int_type()], unit_type())],
+        here: [definition_of(module, items, [unmarked, int_type()], unit_type())],
       }
     } else if (c.name == array_name() || c.name == columns_name()) && c.args.len() == 1 {
       let items = marked_key(ContainerWalk(b"lower_items"), ty, module);
@@ -1564,7 +1631,7 @@ fn lowering_code(
           ]),
           call_of(module, items, [a, int_code(0)], unit_type()),
         ]),
-        here: [definition_of(module, items, [held, int_type()], unit_type())],
+        here: [definition_of(module, items, [unmarked, int_type()], unit_type())],
       }
     } else if c.name == map_name() && c.args.len() == 2 {
       let entries = list_type(
@@ -1588,30 +1655,35 @@ fn lowering_code(
       }
     } else {
       match constructors.sums.get(c.name) {
-        None -> internal_error(b"marshalling of a type no root writes: ".concat(c.name)),
+        None ->
+          internal_error(
+            b"no constructors are known for the type being converted: ".concat(c.name),
+          ),
         Some(cs) -> {
           let arms = cs.fold(
             { arms: [], slot: 1 },
-            |acc: { arms: List<CodeArm>, slot: Int }, sc: SumConstructor| {
-              let args = constructor_fields_at(sc, c.args);
-              let xs = bound_from(acc.slot, b"x", args.map(without_marks));
+            |accumulator: { arms: List<CodeArm>, slot: Int }, constructor: SumConstructor| {
+              let args = constructor_fields_at(constructor, c.args);
+              let xs = bound_from(accumulator.slot, b"x", args.map(without_marks));
               {
-                arms: acc.arms.push({
+                arms: accumulator.arms.push({
                   pattern: CodeConstructorPattern({
                     sum: c.name,
-                    name: sc.name,
-                    case: sc.index,
+                    name: constructor.name,
+                    case: constructor.index,
                     args: xs.map(bound_pattern),
                   }),
                   guard: None,
                   body: sequence(
-                    [out(b"?out_ctor", [bytes_code(sc.name), int_code(args.len())])].concat(
+                    [
+                      out(b"?out_ctor", [bytes_code(constructor.name), int_code(args.len())]),
+                    ].concat(
                       zip(xs, args).map(|p: { first: Bound, second: Type }|
                         builtin_call(b"?lower", [p.second], [bound_read(p.first)], unit_type())),
                     ),
                   ),
                 }),
-                slot: acc.slot + xs.len(),
+                slot: accumulator.slot + xs.len(),
               }
             },
           );
@@ -1635,8 +1707,8 @@ fn record_lowered(
     code: sequence(
       fs.fold(
         [native_call(b"?out_count", [int_code(tag_record()), int_code(fs.len())], unit_type())],
-        |acc: List<Code>, f: Field|
-          acc.push(native_call(b"?out_name", [bytes_code(f.name)], unit_type())).push(
+        |accumulator: List<Code>, f: Field|
+          accumulator.push(native_call(b"?out_name", [bytes_code(f.name)], unit_type())).push(
             builtin_call(
               b"?lower",
               [f.ty],
@@ -1655,15 +1727,17 @@ fn lifting_code(
   constructors: Constructors,
   ty: Type,
 ) -> { code: Code, here: List<Definition> } / {abort.raise} = {
-  let held = without_marks(ty);
-  let args_at = match held { NamedType(c) -> c.args, _ -> [] };
+  let unmarked = without_marks(ty);
+  let args_at = match unmarked { NamedType(c) -> c.args, _ -> [] };
   let alone = |c: Code| { code: c, here: [] };
-  let read_as = |name: Bytes| alone(builtin_call(name, [held], [], held));
+  let read_as = |name: Bytes| alone(builtin_call(name, [unmarked], [], unmarked));
   let tag = native_call(b"?in_tag", [], int_type());
   let counted = |t: Int| native_call(b"?in_count", [int_code(t)], int_type());
   match ty {
     NamedType(c) -> if (c.name == b"^" && c.args.len() == 1) || runtime_object(c.name) {
-      internal_error(b"a lifting of a value the runtime keeps, which `crosses` rejects")
+      internal_error(
+        b"cannot read a value of a runtime-managed type into the program; the `crosses` check should have rejected this type",
+      )
     } else if c.args.len() == 0 && c.name == unit_name() { alone(sequence([tag, unit_code()])) }
     else if c.args.len() == 0 && c.name == bool_name() {
       alone(binary_of(b"eq", tag, int_code(tag_true())))
@@ -1697,10 +1771,10 @@ fn lifting_code(
         code: call_of(
           module,
           items,
-          [unspanned_code(CodeList({ items: [] }), held), counted(tag_list())],
-          held,
+          [unspanned_code(CodeList({ items: [] }), unmarked), counted(tag_list())],
+          unmarked,
         ),
-        here: [definition_of(module, items, [held, int_type()], held)],
+        here: [definition_of(module, items, [unmarked, int_type()], unmarked)],
       }
     } else if (c.name == array_name() || c.name == columns_name()) && c.args.len() == 1 {
       let listed = list_type(c.args.get(0));
@@ -1720,7 +1794,7 @@ fn lifting_code(
               without_marks(listed),
             ),
           ],
-          held,
+          unmarked,
         ),
         here: [
           definition_of(module, items, [without_marks(listed), int_type()], without_marks(listed)),
@@ -1732,25 +1806,28 @@ fn lifting_code(
         code: call_of(
           module,
           each,
-          [builtin_call(b"Map::new", args_at, [], held), counted(tag_map())],
-          held,
+          [builtin_call(b"Map::new", args_at, [], unmarked), counted(tag_map())],
+          unmarked,
         ),
-        here: [definition_of(module, each, [held, int_type()], held)],
+        here: [definition_of(module, each, [unmarked, int_type()], unmarked)],
       }
     } else {
       match constructors.sums.get(c.name) {
-        None -> internal_error(b"marshalling of a type no root reads: ".concat(c.name)),
+        None ->
+          internal_error(
+            b"no constructors are known for the type being read into the program: ".concat(c.name),
+          ),
         Some(cs) -> {
-          let made = cs.map(|sc: SumConstructor| {
-            let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
+          let made = cs.map(|constructor: SumConstructor| {
+            let args = constructor.fields.map(|f: Type| at_args(f, constructor.params, c.args));
             {
-              name: sc.name,
+              name: constructor.name,
               code: constructor_made(
                 c.name,
-                sc.name,
-                sc.index,
+                constructor.name,
+                constructor.index,
                 args.map(|t: Type| builtin_call(b"?lift", [t], [], without_marks(t))),
-                held,
+                unmarked,
               ),
             }
           });
@@ -1773,8 +1850,8 @@ fn lifting_code(
         },
       }
     },
-    RecordType(fs) -> record_lifted(held, fs),
-    NominalType(x) -> record_lifted(held, x.fields),
+    RecordType(fs) -> record_lifted(unmarked, fs),
+    NominalType(x) -> record_lifted(unmarked, x.fields),
     FunctionType(_) -> internal_error(b"a function marshalled back from the runtime"),
     VariableType(_) -> internal_error(b"marshalling at a type variable"),
   }
@@ -1866,7 +1943,7 @@ fn items_lowered(
         here: [],
       }
     },
-    _ -> internal_error(b"a loop over items of no container"),
+    _ -> internal_error(b"a loop over items was requested for a type that is not a container"),
   }
 }
 
@@ -1909,18 +1986,18 @@ fn items_lifted(
   t: Type,
   item: Type,
 ) -> { code: Code, here: List<Definition> } / {abort.raise} = {
-  let acc = slot_code(b"acc", 0, t);
+  let accumulator = slot_code(b"acc", 0, t);
   let n = slot_code(b"n", 1, int_type());
   let pushed = prelude_call(
     b"List::push",
     [without_marks(item)],
-    [acc, builtin_call(b"?lift", [item], [], without_marks(item))],
+    [accumulator, builtin_call(b"?lift", [item], [], without_marks(item))],
     t,
   );
   {
     code: if_code(
       binary_of(b"eq", n, int_code(0)),
-      acc,
+      accumulator,
       call_of(module, key, [pushed, binary_of(b"sub", n, int_code(1))], t),
     ),
     here: [],
@@ -1965,7 +2042,8 @@ fn item_of(ty: Type) -> Option<Type> =
 fn field_of(ty: Type, name: Bytes) -> Type =
   match ty {
     RecordType(fs) ->
-      fs.fold(unknown_type(), |acc: Type, f: Field| if f.name == name { f.ty } else { acc }),
+      fs.fold(unknown_type(), |accumulator: Type, f: Field|
+        if f.name == name { f.ty } else { accumulator }),
     _ -> unknown_type(),
   }
 
@@ -1979,14 +2057,14 @@ pub type MarshalledSums = {
 
 pub fn marshalled_sums(
   sums: Map<Bytes, List<SumConstructor>>,
-  holds: (Bytes) -> Bool,
+  is_defined: (Bytes) -> Bool,
 ) -> MarshalledSums = {
   let c = {
     sums: sums,
     unwritten: [],
     unread: [],
-    marshals_containers: emitted_code().calls.all(holds),
-    lifts: emitted_code().insert_calls.all(holds),
+    marshals_containers: emitted_code().calls.all(is_defined),
+    lifts: emitted_code().insert_calls.all(is_defined),
   };
   { ..c, unwritten: unmarshallable_sums(c, false), unread: unmarshallable_sums(c, true) }
 }
@@ -1999,11 +2077,15 @@ fn unmarshallable_sums(c: MarshalledSums, back: Bool) -> List<Bytes> =
     { bad: [], done: false },
     |st: { bad: List<Bytes>, done: Bool }, _: Int|
       if st.done { st } else {
-        let more = c.sums.fold(st.bad, |acc: List<Bytes>, name: Bytes, cs: List<SumConstructor>|
-          if acc.contains(name)
-              || cs.all(|sc: SumConstructor|
-                sc.fields.all(|f: Type| is_marshallable_part(c, st.bad, f, true, back))) { acc }
-          else { acc.push(name) });
+        let more = c.sums.fold(
+          st.bad,
+          |accumulator: List<Bytes>, name: Bytes, cs: List<SumConstructor>|
+            if accumulator.contains(name)
+                || cs.all(|constructor: SumConstructor|
+                  constructor.fields.all(|f: Type|
+                    is_marshallable_part(c, st.bad, f, true, back))) { accumulator }
+            else { accumulator.push(name) },
+        );
         { bad: more, done: more.len() == st.bad.len() }
       },
   ).bad
@@ -2040,14 +2122,14 @@ fn is_marshallable_part(
       else if (k.name == list_name() || k.name == array_name()) && k.args.len() == 1 {
         c.marshals_containers && parts
       } else if k.name == columns_name() && k.args.len() == 1 {
-        c.marshals_containers && parts && k.args.all(|a: Type| holds_records(a, open))
+        c.marshals_containers && parts && k.args.all(|a: Type| has_record_fields(a, open))
       } else if k.name == map_name() && k.args.len() == 2 {
         c.marshals_containers && (!back || c.lifts) && parts
       } else { c.sums.contains(k.name) && !bad.contains(k.name) && parts }
     },
   }
 
-fn holds_records(t: Type, open: Bool) -> Bool =
+fn has_record_fields(t: Type, open: Bool) -> Bool =
   match t {
     RecordType(fs) -> fs.len() > 0,
     NominalType(x) -> x.fields.len() > 0,
@@ -2076,7 +2158,7 @@ fn generated_root(
 
 fn param_name(key: RootKey, i: Int) -> Bytes =
   match key {
-    Generated(w, _) -> match w.op {
+    Generated(w, _) -> match w.operation {
       ContainerWalk(c) -> if dynamic_loops().contains(c) {
         match i { 0 -> b"a", 1 -> b"out", _ -> b"i" }
       } else if i == 1 { if c.starts_with(b"lift") { b"n" } else { b"i" } }
@@ -2098,13 +2180,13 @@ fn definition_of(
 ) -> Definition / {abort.raise} =
   {
     name: name_in_module(module, root_text(root_name(key))),
-    ret: Some(kind_of(result).kind),
+    return_kind: Some(kind_of(result).kind),
     return_type: OpenShape([]),
     pure: effects.listed.len() == 0,
     constant: false,
     value: None,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, result, effects))),
+    scheme: Some(monomorphic(function_type(params, result, effects))),
     witnesses: 0,
     borrowed: [],
     root: key,
@@ -2113,7 +2195,12 @@ fn definition_of(
 fn qualified_root(module: Bytes, key: RootKey) -> Bytes / {abort.raise} =
   qualify(module, name_in_module(module, root_text(root_name(key))))
 
-fn call_of(module: Bytes, key: RootKey, args: List<Code>, ret: Type) -> Code / {abort.raise} =
+fn call_of(
+  module: Bytes,
+  key: RootKey,
+  args: List<Code>,
+  return_type: Type,
+) -> Code / {abort.raise} =
   applied(
     unspanned_code(
       NDefinition({
@@ -2122,10 +2209,10 @@ fn call_of(module: Bytes, key: RootKey, args: List<Code>, ret: Type) -> Code / {
         effect_arguments: [],
         labels: [],
       }),
-      fn_type(args.map(|a: Code| a.ty), ret, no_effects()),
+      function_type(args.map(|a: Code| a.ty), return_type, no_effects()),
     ),
     args,
-    ret,
+    return_type,
   )
 
 fn tag_unit() -> Int = 0

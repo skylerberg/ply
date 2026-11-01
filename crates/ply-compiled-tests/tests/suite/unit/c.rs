@@ -7,7 +7,6 @@ use ply_compiled::c::{builtin_helper_name, helpers};
 use ply_compiled::heap::{imm, imm_value};
 use std::sync::atomic::Ordering::Relaxed;
 
-/// A declaration with no address is a null call at run time: a crash rather than a decline.
 #[test]
 fn every_declared_helper_has_an_address() {
     for h in helpers() {
@@ -15,25 +14,23 @@ fn every_declared_helper_has_an_address() {
     }
 }
 
-/// What the runtime reports of a native is read off the type of the function it binds: the words
-/// past the context, whether it returns, and whether what it returns may be a raise.
 #[test]
-fn a_natives_signature_is_its_functions_type() {
+fn a_native_function_signature_is_derived_from_its_rust_function_type() {
     use ply_compiled::emitted::{Handed, PlyType};
     use ply_compiled::heap::Word;
-    use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
+    use ply_compiled::native::MachineType::{self, Addr, Handed as Moved, I64, Type, Words};
     use ply_compiled::native::{Native, Signature};
     use ply_compiled::rt::Ctx;
-    let of = |params: &'static [Machine], result| Signature { params, result };
+    let of = |params: &'static [MachineType], result| Signature { params, result };
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx) as Native>::SIGNATURE,
         of(&[], None)
     );
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word as Native>::SIGNATURE,
-        of(&[Machine::Word, Words], Some(Machine::Word))
+        of(&[MachineType::Word, Words], Some(MachineType::Word))
     );
-    type Typed = unsafe extern "C" fn(
+    type NativeTakingType = unsafe extern "C" fn(
         *mut Ctx,
         ply_compiled::native::Addr,
         ply_compiled::native::I64,
@@ -41,19 +38,17 @@ fn a_natives_signature_is_its_functions_type() {
         *const PlyType,
     ) -> ply_compiled::native::I64;
     assert_eq!(
-        <Typed as Native>::SIGNATURE,
+        <NativeTakingType as Native>::SIGNATURE,
         of(&[Addr, I64, Moved, Type], Some(I64))
     );
 }
 
-/// A native over machine data is bound as a builtin's helper is, under the name the compiler or a
-/// shipped module's `extern fn` gives it, which no other native has, at the
-/// words and kinds its function takes.
 #[test]
-fn every_native_over_machine_data_has_a_helper_of_its_own() {
-    use ply_compiled::c::machine_natives;
-    use ply_compiled::native::Machine;
-    let machine = machine_natives();
+fn each_native_function_that_takes_raw_addresses_or_integers_has_exactly_one_runtime_helper_with_the_same_signature()
+ {
+    use ply_compiled::c::runtime_natives;
+    use ply_compiled::native::MachineType;
+    let machine = runtime_natives();
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
     let declared: Vec<&str> = ply_compiled::hosted::natives()
         .iter()
@@ -73,7 +68,7 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
         assert_eq!(found.len(), 1, "`{name}`");
         assert_eq!(found[0].signature, n.signature, "`{name}`");
         assert!(
-            !n.signature.params.contains(&Machine::Word),
+            !n.signature.params.contains(&MachineType::Word),
             "`{}` takes a uniform word",
             n.name
         );
@@ -82,15 +77,16 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
         .iter()
         .find(|n| n.name == "?out_str")
         .expect("`?out_str`");
-    assert_eq!(out_str.signature.params, [Machine::Addr, Machine::I64]);
+    assert_eq!(
+        out_str.signature.params,
+        [MachineType::Addr, MachineType::I64]
+    );
     assert_eq!(out_str.signature.result, None);
 }
 
-/// What the runtime says of itself to a compiler is read off its own functions and structs: each
-/// helper of its own and each native with what its function's type takes and returns, and where it
-/// lays out what emitted code reads in place.
 #[test]
-fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
+fn the_text_the_runtime_describes_itself_with_lists_helpers_and_native_functions_and_struct_offsets_and_sizes_matching_the_rust_code()
+ {
     use ply_compiled::rt::Ctx;
     let text = ply_compiled::c::described();
     assert_eq!(text.lines().next(), Some("ply runtime 1"));
@@ -103,7 +99,7 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     ] {
         assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
     }
-    let own = ply_compiled::c::own_helpers();
+    let own = ply_compiled::c::runtime_helpers();
     let helpers = text.lines().filter(|l| l.starts_with("helper ")).count();
     assert_eq!(helpers, own.len());
     assert!(own.iter().all(|h| !h.name.starts_with("builtin_")));
@@ -132,9 +128,8 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     );
 }
 
-/// A unit binds the helpers it records by name, in its own order, each to this runtime's own.
 #[test]
-fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
+fn helpers_recorded_in_a_unit_export_table_bind_by_name_to_the_runtime_helper_addresses() {
     let mut exports = units::exports_of(&[]);
     exports.helpers.reverse();
     let read = ply_compiled::c::Exports::decode(&exports.encode()).expect("the table reads back");
@@ -149,10 +144,8 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A table reads as a unit writes one: its helpers, constants, modules, pools and entered roots,
-/// in that order.
 #[test]
-fn a_units_table_reads_as_a_unit_writes_it() {
+fn an_exports_table_decodes_to_the_values_a_unit_wrote_and_encodes_back_to_the_same_text() {
     let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nfields 1\nop\nentered m.main\n";
     let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
@@ -162,10 +155,9 @@ fn a_units_table_reads_as_a_unit_writes_it() {
     assert_eq!(read.encode(), said);
 }
 
-/// The last release's units list what their emitter rejected after their modules: that table reads
-/// as the same table without the list, since the release's builder runs on this runtime.
 #[test]
-fn a_table_listing_rejections_reads_as_one_without_them() {
+fn decoding_an_exports_table_drops_its_list_of_functions_that_were_not_compiled_so_encoding_omits_it()
+ {
     let listed = "helpers 0\nconstants 0\nmodules 3\nrefused 1\nm.f\nwhy\nfields 1\nop\n\
                   entered m.main\n";
     let bare = "helpers 0\nconstants 0\nmodules 3\nfields 1\nop\nentered m.main\n";
@@ -173,10 +165,9 @@ fn a_table_listing_rejections_reads_as_one_without_them() {
     assert_eq!(read.encode(), bare);
 }
 
-/// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
-/// another shape, rejects the unit by name rather than binding it to nothing.
 #[test]
-fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_rejected_by_name() {
+fn a_unit_that_records_a_helper_the_runtime_lacks_or_with_a_different_argument_count_fails_to_bind_and_the_error_message_names_the_helper()
+ {
     let mut retired = units::exports_of(&[]);
     retired.helpers.push(HelperShape {
         name: "rt_retired".to_string(),
@@ -213,7 +204,7 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_rejected_by_
 }
 
 #[test]
-fn a_unit_compiles_loads_binds_and_returns() {
+fn a_compiled_unit_loads_binds_its_helpers_and_returns_the_right_result_when_called() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let probe = def(
         "m.probe",
@@ -230,11 +221,8 @@ fn a_unit_compiles_loads_binds_and_returns() {
     assert_eq!(imm_value(result), 42);
 }
 
-/// The prologue a body opens with: room asked for on the stack it runs on where its frame lies below
-/// the floor.
 const PROLOGUE: &str = "  { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
-/// `ladder(n)` is `n` calls deep, none of them a tail call, each frame a kilobyte and more.
 fn deep_calls() -> [units::Def; 1] {
     let ladder = units::symbol("m.ladder");
     [def(
@@ -251,11 +239,8 @@ fn deep_calls() -> [units::Def; 1] {
     )]
 }
 
-/// Twenty megabytes of frames and more: past a stack's first two chunks.
 const DEEP: i64 = 20_000;
 
-/// An entry begun where a Rust recursion grew onto a stacker segment, or anywhere else the runtime
-/// does not know.
 struct Unknown {
     ctx: *mut ply_compiled::rt::Ctx,
     entry: ply_compiled::rt::Entry,
@@ -276,8 +261,6 @@ extern "C" fn enter_from_an_unknown_stack(arg: usize) {
     std::process::abort();
 }
 
-/// `m.ladder(DEEP)` begun on a stack unknown to the runtime: what it returned, the chunks it grew
-/// by, and how it failed.
 fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
@@ -304,11 +287,8 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     Some((imm_value(result), grown, failed, raised))
 }
 
-/// A recursion past a stack's first chunk makes the stack writable further down and returns on
-/// it, so a program nests as deeply as its stack's reservation holds. An entry begun where the
-/// runtime knows no stack is given one of its own.
 #[test]
-fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
+fn a_recursion_deeper_than_the_first_stack_chunk_grows_the_stack_in_place_and_returns() {
     let Some((result, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
         return;
     };
@@ -320,10 +300,8 @@ fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_returns() {
     );
 }
 
-/// A thread's own stack is reserved whole and cannot be made larger: a recursion past its floor
-/// fails, and never runs into its guard.
 #[test]
-fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
+fn a_recursion_deeper_than_the_thread_stack_limit_fails_with_an_out_of_stack_error() {
     let ran = std::thread::Builder::new()
         .stack_size(4 << 20)
         .spawn(|| {
@@ -354,12 +332,10 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
     assert!(raised.contains("what the native stack holds"), "{raised}");
 }
 
-/// A loop's restart probes the floor as a prologue does, reading it anew each pass.
 const RESTART: &str = "  ply_loop: { char probe; if ((uintptr_t)&probe < (uintptr_t)*(volatile int64_t *)&ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
-/// A loop that makes no call ends at its restart once its clock runs out.
 #[test]
-fn a_loop_past_its_clock_ends_at_its_next_restart() {
+fn a_loop_running_past_the_time_limit_stops_with_a_timed_out_failure_at_its_next_loop_restart() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let forever = def(
         "m.forever",
@@ -372,7 +348,7 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
     let native = loaded.expect("the unit loads");
     let entry = native.entry("m.forever").expect("`m.forever` is taken");
     let mut ctx = native.context();
-    ctx.begin_bounded(20);
+    ctx.begin_with_time_limit(20);
     let args = [imm(0)];
     let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
@@ -382,10 +358,9 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
     assert!(said.contains("timed out after 20 ms"), "{said}");
 }
 
-/// The watchdog writes to a context only while its entry runs, since the context may be reused or
-/// freed after.
 #[test]
-fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
+fn a_time_limit_on_an_entry_that_already_ended_does_not_change_the_context_stack_floor_value_later()
+{
     let native = units::opened(
         tempfile::tempdir().expect("a scratch directory").path(),
         &[],
@@ -395,16 +370,16 @@ fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
         return;
     };
     let mut ctx = loaded.expect("the unit loads").context();
-    ctx.begin_bounded(1);
+    ctx.begin_with_time_limit(1);
     ctx.end();
     ctx.stack_floor.store(7, Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(ctx.stack_floor.load(Relaxed), 7);
 }
 
-/// A unit says each constant with its row of the code table.
 #[test]
-fn a_unit_says_its_constants_slots() {
+fn decoding_an_exports_table_reads_a_number_of_slots_for_each_constant_and_fails_if_a_constant_has_none()
+ {
     let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nfields 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
@@ -415,10 +390,9 @@ fn a_unit_says_its_constants_slots() {
     );
 }
 
-/// A unit entered encoded names each root it is entered at on a line of its own after its tables,
-/// among lines a runtime that does not know them reads as nothing.
 #[test]
-fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
+fn decoding_an_exports_table_reads_the_entered_function_lines_after_the_other_sections_and_ignores_unknown_lines_after_them()
+ {
     let tables = "helpers 0\nconstants 0\nmodules 0\nfields 0\n";
     let said = format!("{tables}entered m.main\nentered m.run\n");
     let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");

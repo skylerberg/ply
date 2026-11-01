@@ -6,7 +6,7 @@ fn path(p: &str) -> Option<PathBuf> {
 }
 
 #[test]
-fn a_named_directory_is_the_one_cached_in() {
+fn an_explicitly_named_directory_is_used_as_the_cache_root() {
     assert_eq!(
         cache_root_for(
             "stage",
@@ -21,7 +21,7 @@ fn a_named_directory_is_the_one_cached_in() {
 }
 
 #[test]
-fn what_a_run_caches_is_stored_under_the_users_caches() {
+fn the_cache_root_defaults_to_the_platform_cache_directory_of_the_user() {
     assert_eq!(
         cache_root_for(
             "stage",
@@ -50,9 +50,8 @@ fn what_a_run_caches_is_stored_under_the_users_caches() {
     );
 }
 
-/// The specification of `XDG_CACHE_HOME` has a relative path ignored.
 #[test]
-fn a_relative_cache_home_is_not_one() {
+fn a_relative_cache_home_directory_is_ignored_and_the_default_cache_root_is_used() {
     assert_eq!(
         cache_root_for(
             "stage",

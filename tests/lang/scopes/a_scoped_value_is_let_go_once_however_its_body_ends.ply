@@ -1,8 +1,3 @@
-//! `with_scope[r](acquire, release) { h -> body }` gives `body` what `acquire` returned as `h`,
-//! then `release` on that, once, however `body` ends: by returning, by a raise or a clause that does
-//! not resume unwinding through it, or by a cancel. Nothing is released when `acquire` did not
-//! return.
-
 import std.value (VInt, reflect)
 
 effect log {
@@ -24,7 +19,6 @@ fn opened(name: String) -> String / {log.note} = {
 
 fn closed(name: String) -> Unit / {log.note} = log.note("close " ++ name)
 
-/// What `go` noted, in order.
 fn noted<| e>(go: () -> Unit / {log.note | e}) -> List<String> / e =
   handle {
     go()
@@ -36,7 +30,7 @@ fn noted<| e>(go: () -> Unit / {log.note | e}) -> List<String> / e =
     return u -> seen,
   }
 
-test "release runs after a body that returns, and the body's result is the scope's" {
+test "release runs after a body that returns, and the scope returns the body's result" {
   let seen = noted(|| {
     let n = with_scope[file](
       opened("a"),
@@ -50,7 +44,7 @@ test "release runs after a body that returns, and the body's result is the scope
   assert_eq(seen, ["open a", "use a", "close a"])
 }
 
-test "release runs when a clause that does not resume unwinds through the body" {
+test "release runs when a handler clause that does not resume unwinds through the body" {
   let seen = noted(|| {
     let returned = handle {
       with_scope[file](
@@ -101,7 +95,7 @@ test "nothing is released when the acquire raised" {
   assert_eq(seen, [])
 }
 
-test "holds nest, and the inner one is let go first" {
+test "nested scopes release in reverse order, so the inner scoped value is released first" {
   let seen = noted(||
     handle {
       with_scope[outer](
@@ -131,7 +125,7 @@ test "release runs with the handlers around the scope, not those inside its body
   assert_eq(seen, ["open a", "close a"])
 }
 
-test "a release that raises replaces what was unwinding" {
+test "a release that raises replaces the raise already unwinding through the body" {
   let returned: Result<Int, String> = try {
     with_scope[file](1, |n: Int| door.shut("release")) { h -> {
       door.shut("body");
@@ -141,7 +135,7 @@ test "a release that raises replaces what was unwinding" {
   assert_eq(returned, Err("release"))
 }
 
-test "a cancelled task lets go of what it holds, in every interleaving" {
+test "a cancelled task releases its scoped value, in every scheduling order" {
   let seen = noted(||
     simulate {
       let t = task.spawn(||
@@ -161,12 +155,12 @@ test "a cancelled task lets go of what it holds, in every interleaving" {
 }
 
 fn with_token(tokens: Chan<Unit>) -> Unit / {task.write} =
-  with_scope[token](task.recv(tokens), |held: Option<Unit>| {
+  with_scope[token](task.recv(tokens), |acquired: Option<Unit>| {
     task.send(tokens, ());
     ()
   }) { h -> task.yield() }
 
-test "a cancel takes no result from a scoped value's acquire, so the token it took goes back, in every interleaving" {
+test "a cancel during a scoped value's acquire puts back the token the acquire took from a channel, in every scheduling order" {
   simulate {
     let tokens = task.channel(1);
     assert(task.send(tokens, ()));
@@ -177,12 +171,12 @@ test "a cancel takes no result from a scoped value's acquire, so the token it to
   }
 }
 
-test "a cancel lets go of a wait a scoped value's acquire stands in, and nothing is released" {
+test "a cancel during a scoped value's acquire abandons the acquire's wait on a channel, and nothing is released" {
   let seen = noted(||
     simulate {
       let never: Chan<String> = task.channel(0);
       let t = task.spawn(||
-        with_scope[file](task.recv(never), |held: Option<String>| closed("a")) { h -> () });
+        with_scope[file](task.recv(never), |acquired: Option<String>| closed("a")) { h -> () });
       clock.sleep(Duration(1));
       assert(task.cancel(t));
       assert_eq(task.await(t), None)
@@ -190,7 +184,7 @@ test "a cancel lets go of a wait a scoped value's acquire stands in, and nothing
   assert_eq(seen, [])
 }
 
-test "a cancel does not stop a scoped value's release: it lands when the release returns" {
+test "a cancel does not interrupt a scoped value's release, and takes effect after the release finishes" {
   let seen = noted(||
     simulate {
       let gate = task.channel(0);
@@ -211,9 +205,9 @@ test "a cancel does not stop a scoped value's release: it lands when the release
 
 fn doubled<[r]>(h: Scoped<Int, [r]>) -> Int / {scoped.read[r]} = h.get() * 2
 
-test "a scoped value is read by the functions and the closures its scope hands it to" {
+test "a scoped value can be read by the functions and closures that its scope passes it to" {
   let total = with_scope[n](21, |x: Int| ()) { h ->
-    [1, 2, 3].fold(doubled(h), |acc: Int, i: Int| acc + i * h.get())
+    [1, 2, 3].fold(doubled(h), |accumulator: Int, i: Int| accumulator + i * h.get())
   };
   assert_eq(total, 42 + 6 * 21)
 }
@@ -229,7 +223,7 @@ test "a simulation inside a scoped value's scope shares the scoped value" {
   assert_eq(both, 61)
 }
 
-test "the release is written outside the scoped value's binder, so a name they share is the one around" {
+test "the release code sits outside the scoped value's binding, so a variable there with the binding's name refers to the outer variable" {
   let h = "outer";
   let seen = noted(||
     with_scope[file](opened("a"), |name: String|
@@ -237,7 +231,7 @@ test "the release is written outside the scoped value's binder, so a name they s
   assert_eq(seen, ["open a", "use a", "close a beside outer"])
 }
 
-test "a scoped value never reflects as what it holds" {
+test "`reflect` on a scoped value returns `VHold`, never the reflection of the value inside it" {
   let seen = with_scope[n](42, |x: Int| ()) { h ->
     match reflect(h) { VInt(_) -> "what it holds", _ -> "the hold" }
   };
@@ -251,9 +245,7 @@ effect released {
 fn fail_at_depth(depth: Int) -> Int / {door.shut} =
   if depth <= 0 { door.shut("deep") } else { 1 + fail_at_depth(depth - 1) }
 
-// Each raise leaves fifty calls deep, so a raise that kept the depth it unwound through would end
-// this entry at the call ceiling within a few hundred turns.
-test "a scoped value raised through from deep in its body and caught, turn after turn in one entry, is let go every time" {
+test "a scoped value is released every time a raise from deep in its body is caught, repeated many times in one loop" {
   let turns = 300000;
   let let_go = handle {
     iterate(0, turns + 1, |turn: Int|

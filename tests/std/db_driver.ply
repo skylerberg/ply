@@ -1,7 +1,3 @@
-//! `std.db`'s driver against a real server: the `db` effect served in Ply over `std.pg`, which
-//! leaves the host only the network and entropy, with its pool, transactions, TLS, notifications and
-//! copies. `postgres` says what the run binds.
-
 import postgres
 import postgres (Cluster, Wire, plain_url)
 import std.certgen (certgen)
@@ -14,9 +10,9 @@ import std.result
 import std.seq
 import std.seq (Seq, seq)
 import std.sql
-import std.sql (stmt, IntParameter, TextParameter, NullParameter, BytesParameter, ArrayParameter,
-                NumericParameter, IntDatum, TextDatum, QueryResult, Rows, Count, Failed, Row,
-                DbError)
+import std.sql (statement_of, IntParameter, TextParameter, NullParameter, BytesParameter,
+                ArrayParameter, NumericParameter, IntDatum, TextDatum, QueryResult, Rows, Count,
+                Failed, Row, DbError)
 import std.string
 import std.time (millis)
 
@@ -39,7 +35,6 @@ fn create_items_table(c: Cluster) -> Unit / {postgres::Postgres, abort.raise} = 
   ()
 }
 
-/// A table of counters, one row per id, each starting at zero.
 fn create_ledger_table(c: Cluster, ids: List<Int>) -> Unit / {postgres::Postgres, abort.raise} = {
   let _ = postgres::psql(c, "create table ledger (id int4 primary key, n int4 not null)");
   ids.fold((), |u: Unit, id: Int| {
@@ -48,10 +43,6 @@ fn create_ledger_table(c: Cluster, ids: List<Int>) -> Unit / {postgres::Postgres
   })
 }
 
-// --- Served from a server ---------------------------------------------------
-
-/// The id an insert returned and the name a query then read back, over `url`, with `password`
-/// given beside it as `config.secret` returns one.
 fn inserted(
   url: String,
   password: Option<Secret<Bytes>>,
@@ -63,7 +54,7 @@ fn inserted(
       password: password,
       body: || {
         match db.returning[items](
-            stmt("insert into items (id, name) values ($1, $2) returning id"),
+            statement_of("insert into items (id, name) values ($1, $2) returning id"),
             [IntParameter(7), TextParameter("seven")],
           ) {
           Failed(e) -> Err(e.detail),
@@ -72,7 +63,7 @@ fn inserted(
             [] -> Err("no row came back from the insert"),
             [row, ..] -> match row.get("id") {
               Some(IntDatum(n)) -> match db.query[items](
-                  stmt("select name from items where id = $1"),
+                  statement_of("select name from items where id = $1"),
                   [IntParameter(7)],
                 ) {
                 Failed(e) -> Err(e.detail),
@@ -87,7 +78,6 @@ fn inserted(
     ),
   )
 
-// `db.execute` carries statements, not a schema, so the table is made before the driver runs.
 test/nondet "the db effect is served from a real server" {
   if postgres::available() {
     let c = postgres::scram("pencil");
@@ -98,8 +88,6 @@ test/nondet "the db effect is served from a real server" {
   }
 }
 
-// The password, sealed where it is read (the connection string, or settings beside it), sent in
-// the clear-text message a `password` cluster asks for.
 test/nondet "the db effect sends a password in the clear when asked, from the url or from settings" {
   if postgres::available() {
     let c = postgres::clear_text("p@ss:w");
@@ -125,19 +113,17 @@ fn shown_count(row: Row) -> String =
     _ -> "not a count",
   }
 
-/// How many items there are once a transaction has inserted one, through `begin` and `commit` on
-/// the same connection.
 fn commit_one(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   Result::flatten(
     with_server(url, 4, || {
       match transaction(ReadCommitted, ReadWrite, || {
-          db.execute[items](stmt("insert into items (id, name) values ($1, $2)"), [
+          db.execute[items](statement_of("insert into items (id, name) values ($1, $2)"), [
             IntParameter(8),
             TextParameter("eight"),
           ])
         }) {
         Err(roll) -> Err(roll.reason),
-        Ok(_) -> match db.query[items](stmt("select count(*) as n from items"), []) {
+        Ok(_) -> match db.query[items](statement_of("select count(*) as n from items"), []) {
           Failed(e) -> Err(e.detail),
           Count(_) -> Err("a count where rows were due"),
           Rows(rows) -> match rows { [row, ..] -> Ok(shown_count(row)), [] -> Err("no row") },
@@ -164,29 +150,28 @@ fn setting(row: Row) -> String =
     _ -> "not a setting",
   }
 
-/// The two timeouts as the server holds them for the session, which the connection string set.
 fn timeouts(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   Result::flatten(
     with_server(url, 1, || {
       match db.query[pg_settings](
-          stmt(
+          statement_of(
             "select name, setting from pg_settings where name = 'statement_timeout' or name = 'idle_in_transaction_session_timeout' order by name",
           ),
           [],
         ) {
         Failed(e) -> Err(e.detail),
         Count(_) -> Err("a count where rows were due"),
-        Rows(rows) -> Ok(rows.fold("", |acc: String, row: Row| acc ++ setting(row) ++ ";")),
+        Rows(rows) ->
+          Ok(rows.fold("", |accumulator: String, row: Row| accumulator ++ setting(row) ++ ";")),
       }
     }),
   )
 
-/// What ended a statement that runs far past the timeout the connection string set.
 fn overrun(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   Result::flatten(
     with_server(url, 1, || {
       match db.query[pg_class](
-          stmt("select count(*) as n from pg_class a, pg_class b, pg_class c, pg_class d"),
+          statement_of("select count(*) as n from pg_class a, pg_class b, pg_class c, pg_class d"),
           [],
         ) {
         Failed(e) -> Ok(failure(e)),
@@ -214,7 +199,7 @@ test/nondet "a connection string's timeouts bound every statement on the server"
 }
 
 fn bump(id: Int, by: Int) -> QueryResult / {db.execute[ledger]} =
-  db.execute[ledger](stmt("update ledger set n = n + $2 where id = $1"), [
+  db.execute[ledger](statement_of("update ledger set n = n + $2 where id = $1"), [
     IntParameter(id),
     IntParameter(by),
   ])
@@ -222,8 +207,6 @@ fn bump(id: Int, by: Int) -> QueryResult / {db.execute[ledger]} =
 fn ended(out: Result<Unit, Rollback>) -> String =
   match out { Ok(_) -> "committed", Err(rolled) -> rolled.reason }
 
-/// Two tasks in transactions at once on one pool, over one row: each holds a connection of its
-/// own, so the one that rolls back undoes only its own write, whichever takes the row first.
 fn two_at_once(
   url: String,
 ) -> Result<String, String> / {Wire, task.spawn, task.join, abort.raise, diverges} =
@@ -245,7 +228,7 @@ fn two_at_once(
     task.join(result_text) ++ " " ++ task.join(undone)
   })
 
-test/nondet "two tasks in transactions at once each hold a connection of their own" {
+test/nondet "two tasks running transactions at once each use their own connection" {
   if postgres::available() {
     let c = postgres::scram("pencil");
     create_ledger_table(c, [1]);
@@ -257,9 +240,6 @@ test/nondet "two tasks in transactions at once each hold a connection of their o
   }
 }
 
-/// Two serializable transactions writing one row: the one that writes second is rejected with
-/// 40001, and run again from its `begin` it goes through. The other runs on a pool of its own,
-/// inside the first attempt.
 fn serialized(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   with_server(url, 1, || contended(url, 3, ""))
 
@@ -269,7 +249,7 @@ fn contended(
   seen: String,
 ) -> String / {db.query[ledger], db.execute[ledger], db.abort, db.begin, db.commit, Wire, abort.raise, diverges} =
   match transaction(Serializable, ReadWrite, || {
-      db.query[ledger](stmt("select n from ledger where id = $1"), [IntParameter(1)]);
+      db.query[ledger](statement_of("select n from ledger where id = $1"), [IntParameter(1)]);
       if seen == "" {
         with_server(url, 1, || transaction(Serializable, ReadWrite, || bump(1, 10)));
         ()
@@ -297,8 +277,6 @@ test/nondet "a serialization failure is 40001 and the retried transaction commit
   }
 }
 
-/// Two tasks, each on a pool of its own, taking two rows in opposite orders: the server breaks the
-/// deadlock by rejecting one with 40P01, and the other commits once that one has rolled back.
 fn deadlocked(url: String) -> String / {Wire, task.spawn, task.join, abort.raise, diverges} = {
   let a = task.spawn(|| marshalling(url, 1, 2));
   let b = task.spawn(|| marshalling(url, 2, 1));
@@ -318,11 +296,12 @@ fn marshalling(url: String, first: Int, second: Int) -> String / {Wire, abort.ra
     Ok(text) -> text,
   }
 
-/// Until both transactions have written, when each holds a transaction id of its own.
 fn both_written(left: Int) -> Unit / {db.query[pg_locks]} =
   if left <= 0 { () } else {
     match db.query[pg_locks](
-        stmt("select count(*) as n from pg_locks where locktype = 'transactionid' and granted"),
+        statement_of(
+          "select count(*) as n from pg_locks where locktype = 'transactionid' and granted",
+        ),
         [],
       ) {
       Rows([row, ..]) -> match row.get("n") {
@@ -333,7 +312,7 @@ fn both_written(left: Int) -> Unit / {db.query[pg_locks]} =
     }
   }
 
-test/nondet "a deadlock is 40P01 and the transaction left standing commits" {
+test/nondet "a deadlock fails one transaction with 40P01 and the other transaction commits" {
   if postgres::available() {
     let c = postgres::scram("pencil");
     create_ledger_table(c, [1, 2]);
@@ -348,13 +327,13 @@ test/nondet "a deadlock is 40P01 and the transaction left standing commits" {
   }
 }
 
-// --- TLS --------------------------------------------------------------------
-
-/// How many of the server's sessions are encrypted, asked over a connection `url` secures.
 fn encrypted(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   Result::flatten(
     with_server(url, 1, ||
-      match db.query[pg_stat_ssl](stmt("select count(*) as n from pg_stat_ssl where ssl"), []) {
+      match db.query[pg_stat_ssl](
+          statement_of("select count(*) as n from pg_stat_ssl where ssl"),
+          [],
+        ) {
         Failed(e) -> Err(failure(e)),
         Count(_) -> Err("a count where rows were due"),
         Rows(rows) -> Ok(number(rows)),
@@ -373,7 +352,6 @@ test/nondet "a secured connection is encrypted and verified for its host" {
     let plaintext = encrypted(postgres::url(c, "localhost", "sslmode=disable"));
     postgres::stop(c);
     assert_eq(modes, [Ok("1"), Ok("1"), Ok("1")]);
-    // A plaintext connection to a server that offers TLS stays plaintext.
     assert_eq(plaintext, Ok("0"))
   }
 }
@@ -404,9 +382,7 @@ test/nondet "a server that will not speak TLS is not spoken to in plaintext" {
   }
 }
 
-// Direct negotiation is postgres 17's: an older server reads the handshake as a start-up it does not
-// understand and hangs up, which is rejected rather than retried in plaintext.
-test/nondet "direct negotiation secures the connection without asking first" {
+test/nondet "a Postgres connection with `sslnegotiation=direct` starts TLS immediately without a plaintext request first" {
   if postgres::available() {
     let c = postgres::scram_with_tls("pencil", postgres::trusted());
     let r = encrypted(postgres::url(c, "localhost", "sslmode=verify-full&sslnegotiation=direct"));
@@ -415,8 +391,6 @@ test/nondet "direct negotiation secures the connection without asking first" {
     else { assert(connection_failure(r, ""), None) }
   }
 }
-
-// --- Notifications ----------------------------------------------------------
 
 fn shown(n: Notice) -> String =
   match n {
@@ -429,8 +403,6 @@ fn shown(n: Notice) -> String =
 fn result_text(r: Result<String, Rollback>) -> String =
   match r { Ok(s) -> s, Err(rolled) -> rolled.reason }
 
-/// A notification is heard once its transaction commits, once however often it was sent there,
-/// never when the transaction rolls back, at once outside one, and not once its channel is let go.
 fn notices(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   with_server(url, 2, || {
     db.listen[jobs]();
@@ -460,39 +432,38 @@ fn notices(url: String) -> Result<String, String> / {Wire, abort.raise, diverges
     String::join([inside, committed, once, rolled, none, at_once, after], " ")
   })
 
-test/nondet "a notification is heard when its transaction commits and never when it rolls back" {
+test/nondet "a Postgres notification is received only when its transaction commits, never when it rolls back" {
   if postgres::available() {
     let c = postgres::scram("pencil");
-    let heard = notices(plain_url(c));
+    let received = notices(plain_url(c));
     postgres::stop(c);
-    assert_eq(heard, Ok("quiet jobs:one quiet undone quiet jobs:three quiet"))
+    assert_eq(received, Ok("quiet jobs:one quiet undone quiet jobs:three quiet"))
   }
 }
 
-/// Until it has heard `want` things other than quiet, each written down as it is heard.
-fn heard_until(
+fn collect_notifications(
   want: Int,
   left: Int,
-  acc: List<String>,
+  accumulator: List<String>,
 ) -> String / {db.next_notification, db.execute[heard]} =
-  if acc.len() >= want || left <= 0 { String::join(acc, ",") } else {
+  if accumulator.len() >= want || left <= 0 { String::join(accumulator, ",") } else {
     match db.next_notification(1000) {
-      Quiet -> heard_until(want, left - 1, acc),
+      Quiet -> collect_notifications(want, left - 1, accumulator),
       n -> {
-        db.execute[heard](stmt("insert into heard (what) values ($1)"), [TextParameter(shown(n))]);
-        heard_until(want, left - 1, acc.push(shown(n)))
+        db.execute[heard](statement_of("insert into heard (what) values ($1)"), [
+          TextParameter(shown(n)),
+        ]);
+        collect_notifications(want, left - 1, accumulator.push(shown(n)))
       },
     }
   }
 
-/// What a listener heard before its connection was ended, that it reconnected, and after.
 fn reconnects(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   with_server(url, 1, || {
     db.listen[jobs]();
-    heard_until(3, 30, [])
+    collect_notifications(3, 30, [])
   })
 
-/// Until `ready` returns `true`, asking every tenth of a second for at most `tries` of them.
 fn wait_until<| e>(
   what: String,
   tries: Int,
@@ -504,30 +475,28 @@ fn wait_until<| e>(
     wait_until(what, tries - 1, ready)
   }
 
-test/nondet "a listener whose connection is ended listens again and says so" {
+test/nondet "a listener whose connection is terminated reconnects, listens again and reports that it did" {
   if postgres::available() {
     let c = postgres::scram("pencil");
     let _ = postgres::psql(c, "create table heard (what text)");
     let listener = task.spawn(|| reconnects(plain_url(c)));
     let listening = "select count(*) from pg_stat_activity where query = 'listen \"jobs\"'";
-    let heard = |what: String|
+    let is_recorded = |what: String|
       postgres::psql(c, "select count(*) from heard where what = '" ++ what ++ "'") == "1";
     wait_until("the listener to listen", 100, || postgres::psql(c, listening) == "1");
     let _ = postgres::psql(c, "select pg_notify('jobs', 'first')");
-    wait_until("the first to be heard", 100, || heard("jobs:first"));
+    wait_until("the first to be heard", 100, || is_recorded("jobs:first"));
     let _ = postgres::psql(
       c,
       "select pg_terminate_backend(pid) from pg_stat_activity where query = 'listen \"jobs\"'",
     );
-    wait_until("the listener to reconnect", 100, || heard("reconnected"));
+    wait_until("the listener to reconnect", 100, || is_recorded("reconnected"));
     let _ = postgres::psql(c, "select pg_notify('jobs', 'second')");
-    let said = task.join(listener);
+    let notifications = task.join(listener);
     postgres::stop(c);
-    assert_eq(said, Ok("jobs:first,reconnected,jobs:second"))
+    assert_eq(notifications, Ok("jobs:first,reconnected,jobs:second"))
   }
 }
-
-// --- Copies -----------------------------------------------------------------
 
 fn sample() -> List<List<sql::Param>> =
   [
@@ -557,17 +526,16 @@ fn sample() -> List<List<sql::Param>> =
 fn named(id: Int, name: String) -> List<sql::Param> =
   [IntParameter(id), TextParameter(name), NullParameter, NullParameter, NullParameter]
 
-fn all() -> sql::Statement = stmt("select id, name, data, tags, price from items order by id")
+fn all() -> sql::Statement =
+  statement_of("select id, name, data, tags, price from items order by id")
 
 fn counted() -> String / {db.query[items]} =
-  match db.query[items](stmt("select count(*) as n from items"), []) {
+  match db.query[items](statement_of("select count(*) as n from items"), []) {
     Rows(rows) -> number(rows),
     Failed(e) -> failure(e),
     Count(_) -> "a count",
   }
 
-/// What a copy of `rows` into `create_items_table` returned: how many rows the server took, the SQLSTATE that
-/// rejected it, or the budget its rows ran past.
 fn copied_in<| e>(
   rows: Seq<List<sql::Param> | e>,
   chunk: Int,
@@ -581,8 +549,6 @@ fn copied_in<| e>(
     Err(spent) -> "spent " ++ spent.to_string(),
   }
 
-/// Rows copied in and out: what each copy returned, whether the rows copied out are the rows a
-/// query returns, and what a failed copy, an abandoned one and a rolled back one each left behind.
 fn copies(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
   with_server(url, 2, || {
     let into = copied_in(seq::of_list(sample()), 2, 100);
@@ -609,7 +575,7 @@ fn copies(url: String) -> Result<String, String> / {Wire, abort.raise, diverges}
     );
     let after_rolled = counted();
     let broken = match copy_from[items](
-        stmt("select 1 / (id - 2) as x from items order by id"),
+        statement_of("select 1 / (id - 2) as x from items order by id"),
         1,
         |rows: Seq<Row | {db.copy_take[items]}>| try[seq.spent] { seq::to_list(rows, 100).len() },
       ) {

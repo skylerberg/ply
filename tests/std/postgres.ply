@@ -1,39 +1,24 @@
-//! A postgres cluster of a test's own, for the tests of `std.db` and `std.pg` against a real server:
-//! initialised under the root `scratch`, which a launch empties first, served on a port nothing
-//! held, reached over TCP with its superuser's password, and stopped when the test is done. The run
-//! binds `initdb`, `postgres` and `psql` with `--exec`; a run that binds none skips these tests,
-//! except under CI, which promises a postgres. A run that binds them also gives the root
-//! `certificate` that `trusted` reads.
-
 import scratch
 import std.config (config)
 import std.fs (fs)
 import std.list
 import std.net (net)
-import std.process (process, CompletedProcess, Var, exit_code, Discard, Interrupt, Keep)
+import std.process (process, CompletedProcess, EnvironmentVariable, exit_code, Discard, Interrupt,
+                    Keep)
 import std.random (entropy)
 import std.string
 import std.time (millis)
 
-/// The programs a cluster is made, served and asked with, and the clock its start is waited on.
 pub effect set Postgres = {process.read[initdb], process.write[initdb], process.read[postgres], process.write[postgres], process.read[psql], process.write[psql], config.get[env], clock.read, clock.write}
 
-/// What starting a cluster performs: `Postgres`, its files under the root `scratch`, and the
-/// listener that finds it a free port.
 pub effect set Launch = {Postgres, fs.read[scratch], fs.write[scratch], net.read[ports], net.write[ports]}
 
-/// What a client of the cluster performs: its connections, under the label `link`, and the nonces
-/// it draws.
 pub effect set Wire = {net.read[link], net.write[link], entropy.next}
 
-/// A running cluster: its port, the server's child, and its superuser's password.
 pub type Cluster = { port: Int, server: Int, password: String }
 
-/// A certificate and its private key, PEM-encoded.
 pub type Credential = { certificate: String, key: String }
 
-/// Whether this run can start a cluster. CI promises one, so there a run without one fails rather
-/// than skips.
 pub fn available() -> Bool / {Postgres, abort.raise} = {
   let found = process.bound[initdb]() && process.bound[postgres]() && process.bound[psql]();
   if !found && config.get[env]("CI") != None {
@@ -42,8 +27,6 @@ pub fn available() -> Bool / {Postgres, abort.raise} = {
   found
 }
 
-/// The credential for `localhost` this run trusts: under the root `certificate`, `localhost.pem`,
-/// which `--trust` names and which holds no other name, and its key, `localhost.key`.
 pub fn trusted() -> Credential / {fs.read[certificate], abort.raise} =
   { certificate: given("localhost.pem"), key: given("localhost.key") }
 
@@ -53,23 +36,18 @@ fn given(path: String) -> String / {fs.read[certificate], abort.raise} =
     None -> panic("the root `certificate` holds no `" ++ path ++ "`"),
   }
 
-/// TCP connections prove `password` by SCRAM.
 pub fn scram(password: String) -> Cluster / {Launch, abort.raise, diverges} =
   launch("scram-sha-256", password, None)
 
-/// TCP connections send `password` in the clear, which `password` authentication asks for.
 pub fn clear_text(password: String) -> Cluster / {Launch, abort.raise, diverges} =
   launch("password", password, None)
 
-/// [`scram`]'s cluster, speaking TLS with `credential` as well as plaintext, so a client's `sslmode`
-/// decides which.
 pub fn scram_with_tls(
   password: String,
   credential: Credential,
 ) -> Cluster / {Launch, abort.raise, diverges} = launch("scram-sha-256", password, Some(credential))
 
-/// A server without a locale starts threads on macOS before it forks, and will not.
-fn c_locale() -> List<Var> = [{ name: "LC_ALL", value: "C" }]
+fn c_locale() -> List<EnvironmentVariable> = [{ name: "LC_ALL", value: "C" }]
 
 fn output_or_fail(f: CompletedProcess) -> String / {abort.raise} =
   if exit_code(f) == Some(0) { String::of_bytes_lossy(f.out) }
@@ -116,7 +94,6 @@ fn launch(
     Some(credential) -> {
       written("data/server.crt", credential.certificate);
       written("data/server.key", credential.key);
-      // Postgres rejects a key that anyone but its owner can read.
       let none = { read: false, write: false, execute: false };
       if !fs.set_mode[scratch]("data/server.key", {
           owner: { read: true, write: true, execute: false },
@@ -158,19 +135,19 @@ fn launch(
     None -> (),
     Some(reason) -> {
       let _ = process.signal[postgres](server, Interrupt);
-      let said = match process.wait[postgres](server, 10000) {
+      let error_output = match process.wait[postgres](server, 10000) {
         Some(f) -> String::of_bytes_lossy(f.err),
         None -> "",
       };
-      panic("postgres did not become ready within thirty seconds: " ++ reason ++ "\n" ++ said)
+      panic(
+        "postgres did not become ready within thirty seconds: " ++ reason ++ "\n" ++ error_output,
+      )
     },
   };
   let _ = run_psql(cluster, "postgres", "create database ply");
   cluster
 }
 
-/// A port nothing listened on a moment ago. Every test that takes one writes `ports`, so no two
-/// run at once and none is handed a port another holds.
 fn reserve() -> Int / {net.read[ports], net.write[ports], abort.raise} = {
   let l = net.listen[ports](0);
   let port = match net.local_port[ports](l) {
@@ -181,7 +158,6 @@ fn reserve() -> Int / {net.read[ports], net.write[ports], abort.raise} = {
   port
 }
 
-/// Why the cluster did not respond within `tries` tenths of a second, if it did not.
 fn wait_until_ready(c: Cluster, tries: Int, last: String) -> Option<String> / {Postgres, diverges} =
   if tries <= 0 { Some(last) } else {
     let f = spawned_psql(c, "postgres", "select 1");
@@ -217,20 +193,17 @@ fn spawned_psql(c: Cluster, database: String, sql: String) -> CompletedProcess /
 fn run_psql(c: Cluster, database: String, sql: String) -> String / {Postgres, abort.raise} =
   output_or_fail(spawned_psql(c, database, sql)).trim()
 
-/// What `sql` printed in the database `ply`, trimmed; a statement that fails fails the test.
 pub fn psql(c: Cluster, sql: String) -> String / {Postgres, abort.raise} = run_psql(c, "ply", sql)
 
-/// Stops the server the fast way, which ends its sessions and frees its shared memory.
 pub fn stop(c: Cluster) -> Unit / {Postgres} = {
   let _ = process.signal[postgres](c.server, Interrupt);
   let _ = process.wait[postgres](c.server, 10000);
   ()
 }
 
-/// The major version of the postgres the run bound.
 pub fn major_version() -> Int / {Postgres, abort.raise} = {
-  let said = String::of_bytes_lossy(process.spawn[postgres](["--version"], "", []).out);
-  said.split(" ").fold(0, |found: Int, word: String|
+  let version_output = String::of_bytes_lossy(process.spawn[postgres](["--version"], "", []).out);
+  version_output.split(" ").fold(0, |found: Int, word: String|
     if found > 0 { found } else {
       match String::int_of_string(match word.split(".") { [major, ..] -> major, [] -> "" }) {
         Some(n) -> n,
@@ -239,9 +212,7 @@ pub fn major_version() -> Int / {Postgres, abort.raise} = {
     })
 }
 
-/// `postgres://ply:<password>@<host>:<port>/ply?<query>`, the password as given.
 pub fn url(c: Cluster, host: String, query: String) -> String =
   "postgres://ply:" ++ c.password ++ "@" ++ host ++ ":" ++ c.port.to_string() ++ "/ply?" ++ query
 
-/// [`url`] over `127.0.0.1` in plaintext.
 pub fn plain_url(c: Cluster) -> String = url(c, "127.0.0.1", "sslmode=disable")

@@ -1,11 +1,10 @@
-//! The package manifest as typed data.
+//! The types for the package manifest: a `ply.pkg` file, a `ply.work` file, the dependencies a
+//! lockfile pins, a registry's index, and the results of running a published version's archive (an
+//! attestation).
 //!
-//! The types for a `ply.pkg` file, a `ply.work` file, the dependencies a lockfile pins, a
-//! registry's index, and an attester's findings about a version.
-//!
-//! A `ply.pkg` file is one literal of `Manifest`, and a `ply.work` file is one literal of
-//! `Workspace`. Each is checked by the same rule as a parameter default (`E0129`–`E0131` when it
-//! breaks the rule). Every manifest type derives `json`.
+//! A `ply.pkg` file is one `fn package` returning a `Manifest`, and a `ply.work` file is one `fn
+//! workspace` returning a `Workspace`. The body must be a plain value, not code; breaking this rule
+//! is `E0129`–`E0131`. Every manifest type derives `json`.
 
 import std.bin
 import std.bytes
@@ -18,8 +17,9 @@ pub type Version = { major: Int, minor: Int, patch: Int }
 /// revision, or the registry, whose address is the dependency's name and version and nothing else.
 pub type Source = | Path(String) | Git(String, String) | Registry
 
-/// `min` is a floor, not a pin: resolution picks the highest version the closure requires, and
-/// the lockfile records what it picked.
+/// The lowest acceptable version of the dependency, not an exact version. Resolution picks the
+/// highest version that any package in the dependency tree requires, and the lockfile records the
+/// version it picked.
 pub type Dependency = { name: String, prefix: Option<String>, min: Version, source: Source }
 
 /// A package's manifest.
@@ -51,8 +51,8 @@ pub type Workspace = {
   /// The packages of tests and examples. `ply test` runs them like any package, but they are not
   /// part of any package's code.
   suites: List<Suite>,
-  /// Directories of Ply sources that belong to no package: inputs that tests read, left exactly as
-  /// written.
+  /// Directories of Ply sources that belong to no package, such as inputs that tests read. `ply
+  /// fmt` and `ply rename` do not change these files.
   fixtures: List<String>,
   /// Where `ply`'s own parts are, in the repository that builds `ply`; `None` in any other.
   toolchain: Option<ToolchainParts>,
@@ -96,11 +96,13 @@ pub fn prefix_of(m: Manifest) -> String = match m.prefix { None -> m.name, Some(
 /// The definition `ply build` starts from: its `entry`, else `main`.
 pub fn entry_of(m: Manifest) -> String = match m.entry { None -> "main", Some(e) -> e }
 
-/// The version dotted, `1.4.0`.
+/// Returns the version as text in the form `1.4.0`.
 pub fn render_version(version: Version) -> String =
   version.major.to_string() ++ "." ++ version.minor.to_string() ++ "." ++ version.patch.to_string()
 
-/// The inverse of `render_version`: three counts, dot-joined, each digits with no leading zero.
+/// Parses text such as `1.4.0` into a version, and returns `None` unless the text is exactly three
+/// whole numbers separated by dots. Each number has no sign and no leading zero, except that `0`
+/// itself is allowed.
 pub fn parse_version(text: String) -> Option<Version> / {abort.raise} =
   match text.split(".") {
     [a, b, c] -> match count_of(a) {
@@ -116,7 +118,6 @@ pub fn parse_version(text: String) -> Option<Version> / {abort.raise} =
     _ -> None,
   }
 
-/// Nine digits at most, so a count never nears the top of an `Int`.
 fn count_of(text: String) -> Option<Int> / {abort.raise} = {
   let bs = Bytes::of_string(text);
   let n = bs.len();
@@ -124,12 +125,8 @@ fn count_of(text: String) -> Option<Int> / {abort.raise} = {
   else { bs.int_of_ascii() }
 }
 
-// --- A registry's index ------------------------------------------------------
-// `GET /<name>/index.json` returns every published version of one package, newest last. The index
-// is advisory: a digest in it is checked against the archive it names before anything is used.
-
-/// One published version: the digest of its `.plyz`, whether its publisher yanked it, and the
-/// toolchain its manifest declares.
+/// One published version of a package: its version, the digest of its `.plyz` archive file, whether
+/// the publisher withdrew it (yanked it), and the toolchain version its manifest declares.
 pub type Release = { version: Version, digest: String, yanked: Bool, runtime: Version }
 
 /// A registry's `index.json`: every published release of one package, newest last.
@@ -143,9 +140,11 @@ pub fn release_at(index: Index, version: Version) -> Option<Release> =
       None -> if release.version == version { Some(release) } else { None },
     })
 
-/// What an attester's `ply` found when it ran a published version's archive under the named
-/// semantics: whether it checks, whether it keeps every `reuse fn` and `returns` promise it makes,
-/// its test results, and how many of its claims are proved, refuted, or neither.
+/// The results of checking one published version of a package. An attester is a party that runs the
+/// package's archive with its own `ply` and reports the outcome. The record names the archive, the
+/// semantics and the builder used. It says whether the package checks, whether its contracts
+/// (`reuse fn` and `returns` promises) hold, how many tests passed and failed, and how many claims
+/// were proved, refuted or left unproved.
 pub type Attestation = {
   name: String,
   version: Version,
@@ -162,13 +161,12 @@ derive bin for Version
 
 derive bin for Attestation
 
-/// Whether the version passed everything it was run for: it checks, it keeps its promises, no test
-/// failed, and every claim it makes is proved.
+/// Returns whether the version passed every check: it checks, its contracts hold, no test failed,
+/// and no claim is refuted or unproved.
 pub fn attested(a: Attestation) -> Bool =
   a.checked && a.contracts_hold && a.tests.failed == 0 && a.proofs.refuted == 0
     && a.proofs.unproved == 0
 
-/// A version in JSON is its rendered text, as a lockfile and a URL write it.
 fn version_text_json() -> json::JsonCodec<Version> =
   {
     encode: |v: Version| json::string_json().encode(render_version(v)),
@@ -182,7 +180,7 @@ fn version_text_json() -> json::JsonCodec<Version> =
       },
   }
 
-/// One release as the index writes it, its versions as dotted text.
+/// Encodes and decodes a release in JSON, with its version as a string such as `"0.1.0"`.
 pub fn release_json() -> json::JsonCodec<Release> =
   {
     encode: |release: Release|
@@ -227,7 +225,7 @@ pub fn index_json() -> json::JsonCodec<Index> =
       },
   }
 
-test "an index returns the release of a version it lists, and none for one it does not" {
+test "`release_at` returns the release for a version the index lists, and none for a version it does not list" {
   let v = |minor: Int| { major: 1, minor: minor, patch: 0 };
   let release = { version: v(2), digest: "b3:00", yanked: false, runtime: v(0) };
   let index = { name: "lib", versions: [{ ..release, version: v(1) }, release] };
@@ -235,7 +233,7 @@ test "an index returns the release of a version it lists, and none for one it do
   assert_eq(release_at(index, v(3)), None)
 }
 
-test "a version renders dotted" {
+test "`render_version` prints a version as dot-separated numbers" {
   assert_eq(render_version({ major: 1, minor: 23, patch: 4 }), "1.23.4")
 }
 
@@ -315,7 +313,7 @@ test "a version orders major, then minor, then patch" {
   assert_eq(compare({ major: 1, minor: 2, patch: 3 }, { major: 1, minor: 2, patch: 3 }), Equal)
 }
 
-test "a version parses from the text it renders as, and nothing looser" {
+test "`parse_version` accepts the text `render_version` prints, and rejects every other format" {
   assert_eq(parse_version("1.23.4"), Some({ major: 1, minor: 23, patch: 4 }));
   assert_eq(parse_version("0.0.0"), Some({ major: 0, minor: 0, patch: 0 }));
   assert_eq(
@@ -353,7 +351,7 @@ test "an index round-trips through the document a registry serves, versions in o
   assert_eq(json::decode_string(text, index_json()), Ok(x))
 }
 
-test "an index whose version is not a version names where it is" {
+test "decoding an index whose version text is not a version fails with an error giving the path of that field" {
   let text = "{\"name\":\"orders\",\"versions\":[{\"digest\":\"b3:ab\",\"runtime\":{\"major\":0,\"minor\":1,\"patch\":0},\"version\":\"latest\",\"yanked\":false}]}";
   match json::decode_string(text, index_json()) {
     Ok(_) -> panic("`latest` is not a version"),

@@ -18,13 +18,20 @@ pub type SplitTrace = { rest: Bytes, shipped_views: TraceViews }
 pub fn split(trace: Bytes) -> SplitTrace = {
   let parted = trace.split(b"\n").fold(
     { rest: [], forms: [], definitions: [] },
-    |acc: { rest: List<Bytes>, forms: List<Form>, definitions: List<ViewedFunction> }, line: Bytes|
+    |accumulator: { rest: List<Bytes>, forms: List<Form>, definitions: List<ViewedFunction> }, line: Bytes|
       match line.split(b"\t") {
         [b"shipform", module, text, form] ->
-          { ..acc, forms: acc.forms.push({ module: module, text: text, form: form }) },
+          {
+            ..accumulator,
+            forms: accumulator.forms.push({ module: module, text: text, form: form }),
+          },
         [b"shipdef", module, name, hash] ->
-          { ..acc, definitions: acc.definitions.push({ module: module, name: name, hash: hash }) },
-        _ -> if line.len() == 0 { acc } else { { ..acc, rest: acc.rest.push(line).push(b"\n") } },
+          {
+            ..accumulator,
+            definitions: accumulator.definitions.push({ module: module, name: name, hash: hash }),
+          },
+        _ -> if line.len() == 0 { accumulator }
+        else { { ..accumulator, rest: accumulator.rest.push(line).push(b"\n") } },
       },
   );
   {
@@ -41,12 +48,18 @@ pub fn shipped_state_of<| e>(
   viewed: List<TraceViews>,
   read: (Bytes) -> Option<Bytes> / e,
 ) -> ShippedState / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise | e} = {
-  let named = viewed.fold(Map::new(), |acc: Map<Bytes, Bool>, v: TraceViews|
-    v.forms.fold(acc, |a: Map<Bytes, Bool>, f: Form| a.insert(f.module, true)));
-  let texts = named.fold(Map::new(), |acc: Map<Bytes, Option<Bytes>>, module: Bytes, b: Bool|
-    acc.insert(module, match read(module) { Some(text) -> Some(hex(blake3(text))), None -> None }));
-  let stale_view = viewed.fold(Map::new(), |acc: Map<Bytes, Bool>, v: TraceViews|
-    v.forms.fold(acc, |a: Map<Bytes, Bool>, f: Form|
+  let named = viewed.fold(Map::new(), |accumulator: Map<Bytes, Bool>, v: TraceViews|
+    v.forms.fold(accumulator, |a: Map<Bytes, Bool>, f: Form| a.insert(f.module, true)));
+  let texts = named.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Option<Bytes>>, module: Bytes, b: Bool|
+      accumulator.insert(module, match read(module) {
+        Some(text) -> Some(hex(blake3(text))),
+        None -> None,
+      }),
+  );
+  let stale_view = viewed.fold(Map::new(), |accumulator: Map<Bytes, Bool>, v: TraceViews|
+    v.forms.fold(accumulator, |a: Map<Bytes, Bool>, f: Form|
       match texts.get(f.module) {
         Some(Some(now)) -> if now == f.text { a } else { a.insert(f.module, true) },
         _ -> a,
@@ -64,30 +77,35 @@ pub fn shipped_state_of<| e>(
         Err(_) -> None,
         Ok(views) ->
           Some(
-            views.fold(Map::new(), |acc: Map<Bytes, WholeModule>, v: ShippedModuleSummary|
-              acc.insert(v.module, {
-                form: v.form,
-                hashes: v.definitions.fold(
-                  Map::new(),
-                  |h: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }| h.insert(d.name, d.hash),
-                ),
-              })),
+            views.fold(
+              Map::new(),
+              |accumulator: Map<Bytes, WholeModule>, v: ShippedModuleSummary|
+                accumulator.insert(v.module, {
+                  form: v.form,
+                  hashes: v.definitions.fold(
+                    Map::new(),
+                    |h: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
+                      h.insert(d.name, d.hash),
+                  ),
+                }),
+            ),
           ),
       },
     }
   }
 }
 
-pub fn loaded_texts(shipping: ShippedInputs, reached: Bool) -> Map<Bytes, Bytes> =
-  if !reached { Map::new() } else {
-    shipping.sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source| acc.insert(s.name, s.src))
+pub fn loaded_texts(shipping: ShippedInputs, prune_unreached: Bool) -> Map<Bytes, Bytes> =
+  if !prune_unreached { Map::new() } else {
+    shipping.sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
+      accumulator.insert(s.name, s.source_text))
   }
 
 pub fn read_shipped_text(
-  held: Map<Bytes, Bytes>,
+  loaded: Map<Bytes, Bytes>,
   name: Bytes,
 ) -> Option<Bytes> / {fs.read_file[shipped], abort.raise} =
-  match held.get(name) {
+  match loaded.get(name) {
     Some(text) -> Some(text),
     None -> match shipped_text(name) { Some(text) -> Some(imported(text)), None -> None },
   }
@@ -96,37 +114,41 @@ pub fn views_in(traces: List<Bytes>) -> List<TraceViews> =
   traces.map(|t: Bytes| split(t).shipped_views)
 
 pub fn stale_view(now: ShippedState, viewed: TraceViews) -> Option<String> = {
-  let module = |m: Bytes| Some("the shipped module `" ++ String::of_bytes_lossy(m) ++ "`");
-  let held = viewed.forms.fold(
+  let module = |m: Bytes|
+    Some("the bundled module `" ++ String::of_bytes_lossy(m) ++ "` has changed");
+  let form_scan = viewed.forms.fold(
     { reason: None, same: Map::new(), read: Map::new() },
-    |acc: { reason: Option<String>, same: Map<Bytes, Bool>, read: Map<Bytes, WholeModule> }, f: Form|
-      if acc.reason != None { acc } else {
+    |accumulator: { reason: Option<String>, same: Map<Bytes, Bool>, read: Map<Bytes, WholeModule> }, f: Form|
+      if accumulator.reason != None { accumulator } else {
         match now.texts.get(f.module) {
-          Some(Some(text)) -> if text == f.text { { ..acc, same: acc.same.insert(f.module, true) } }
-          else {
+          Some(Some(text)) -> if text == f.text {
+            { ..accumulator, same: accumulator.same.insert(f.module, true) }
+          } else {
             match match now.whole { Some(whole) -> whole.get(f.module), None -> None } {
-              Some(w) -> if w.form == f.form { { ..acc, read: acc.read.insert(f.module, w) } }
-              else { { ..acc, reason: module(f.module) } },
-              None -> { ..acc, reason: module(f.module) },
+              Some(w) -> if w.form == f.form {
+                { ..accumulator, read: accumulator.read.insert(f.module, w) }
+              } else { { ..accumulator, reason: module(f.module) } },
+              None -> { ..accumulator, reason: module(f.module) },
             }
           },
-          _ -> { ..acc, reason: module(f.module) },
+          _ -> { ..accumulator, reason: module(f.module) },
         }
       },
   );
-  if held.reason != None { held.reason } else {
-    viewed.definitions.fold(None, |acc: Option<String>, d: ViewedFunction|
-      if acc != None { acc } else {
-        match held.read.get(d.module) {
-          Some(w) -> if w.hashes.get(d.name) == Some(d.hash) { None }
-          else { Some("the shipped definition `" ++ String::of_bytes_lossy(d.name) ++ "`") },
-          None -> if held.same.contains(d.module) { None } else { module(d.module) },
+  if form_scan.reason != None { form_scan.reason } else {
+    viewed.definitions.fold(None, |accumulator: Option<String>, d: ViewedFunction|
+      if accumulator != None { accumulator } else {
+        match form_scan.read.get(d.module) {
+          Some(w) -> if w.hashes.get(d.name) == Some(d.hash) { None } else {
+            Some("the bundled definition `" ++ String::of_bytes_lossy(d.name) ++ "` has changed")
+          },
+          None -> if form_scan.same.contains(d.module) { None } else { module(d.module) },
         }
       })
   }
 }
 
-test "a trace's views are split from the reads the recorder holds" {
+test "`split` separates the `shipform` and `shipdef` lines of a recorded trace from its other lines" {
   let s = split(
     b"file\tcwd\ta.ply\t\tabc\nshipform\tstd.list\tt1\tf1\nshipdef\tstd.list\tstd.list.take\th1\nshipped\t\td0\n",
   );
@@ -137,7 +159,7 @@ test "a trace's views are split from the reads the recorder holds" {
   ])
 }
 
-test "a view stands while its text does, and otherwise while its form and functions do" {
+test "`stale_view` accepts a recorded module view if the module text is unchanged, or else if its form and definition hashes are unchanged" {
   let viewed = {
     forms: [{ module: b"std.list", text: b"t1", form: b"f1" }],
     definitions: [{ module: b"std.list", name: b"std.list.take", hash: b"h1" }],
@@ -164,25 +186,25 @@ test "a view stands while its text does, and otherwise while its form and functi
       { texts: texts(Some(b"t2")), whole: whole(b"f1", [{ name: b"std.list.take", hash: b"h2" }]) },
       viewed,
     ),
-    Some("the shipped definition `std.list.take`"),
+    Some("the bundled definition `std.list.take` has changed"),
   );
   assert_eq(
     stale_view(
       { texts: texts(Some(b"t2")), whole: whole(b"f2", [{ name: b"std.list.take", hash: b"h1" }]) },
       viewed,
     ),
-    Some("the shipped module `std.list`"),
+    Some("the bundled module `std.list` has changed"),
   );
   assert_eq(
     stale_view({ texts: texts(None), whole: Some(Map::new()) }, viewed),
-    Some("the shipped module `std.list`"),
+    Some("the bundled module `std.list` has changed"),
   );
   assert_eq(
     stale_view({ texts: texts(Some(b"t2")), whole: None }, viewed),
-    Some("the shipped module `std.list`"),
+    Some("the bundled module `std.list` has changed"),
   );
   assert_eq(
     stale_view({ texts: texts(Some(b"t1")), whole: None }, { ..viewed, forms: [] }),
-    Some("the shipped module `std.list`"),
+    Some("the bundled module `std.list` has changed"),
   )
 }

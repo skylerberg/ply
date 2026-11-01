@@ -14,8 +14,6 @@ fn listen(host: &TcpHost, port: u16) -> i64 {
         .expect("a loopback port")
 }
 
-/// What a listener's next `accept` returns once it does, its job waiting on a thread of its own as
-/// a run's would.
 fn accepting(host: &TcpHost, listener: i64) -> mpsc::Receiver<i64> {
     let job = host
         .accept(LISTENER, listener, Span::DUMMY)
@@ -52,7 +50,6 @@ fn until_stopped_accepting(shutdown: &Arc<Shutdown>) {
     );
 }
 
-/// `-1` rather than `None` because every call site compares it against a duration.
 #[test]
 fn a_running_service_has_no_deadline() {
     let shutdown = Shutdown::new(Bounds::default());
@@ -62,13 +59,11 @@ fn a_running_service_has_no_deadline() {
     assert!(shutdown.elapsed().is_none());
 }
 
-/// The drain starts when accept stops, not when the signal arrived.
 #[test]
-fn the_lead_is_not_charged_to_the_drain() {
+fn the_delay_before_accepting_stops_is_not_counted_against_the_shutdown_grace_period() {
     let shutdown = Shutdown::new(bounds(150, 5_000));
     assert!(shutdown.request(ShutdownSignal::Terminate));
     assert!(shutdown.stopping(), "the flag is set before anything else");
-    // Still leading: nothing has stopped accepting and the drain has not begun.
     assert!(!shutdown.drain_expired());
     assert!(
         shutdown.deadline_ms() > 5_000,
@@ -89,7 +84,7 @@ fn the_lead_is_not_charged_to_the_drain() {
 }
 
 #[test]
-fn a_drain_that_runs_out_says_so() {
+fn a_shutdown_grace_period_that_runs_out_reports_expired_and_has_zero_time_left() {
     let shutdown = Shutdown::new(bounds(0, 30));
     assert!(shutdown.request(ShutdownSignal::Interrupt));
     until_stopped_accepting(&shutdown);
@@ -105,7 +100,6 @@ fn a_drain_that_runs_out_says_so() {
     );
 }
 
-/// A second signal means a person has decided to stop waiting.
 #[test]
 fn a_second_signal_is_rejected_rather_than_started_again() {
     let shutdown = Shutdown::new(bounds(0, 5_000));
@@ -147,13 +141,11 @@ fn accept_returns_zero_once_the_run_has_stopped_accepting() {
         0,
         "a listener the drain closed returns 0, which is what ends a sequential accept loop"
     );
-    // And again, because a program that loops until zero may ask twice.
     assert_eq!(accepted(&host, listener), 0);
 }
 
-/// Programs close the listener after their accept loop returns, so the handle survives the drain.
 #[test]
-fn the_program_can_still_close_a_listener_the_drain_closed() {
+fn closing_a_listener_that_shutdown_already_closed_succeeds() {
     let host = Arc::new(TcpHost::new());
     let listener = listen(&host, 0);
     let shutdown = Shutdown::new(bounds(0, 5_000));
@@ -166,11 +158,10 @@ fn the_program_can_still_close_a_listener_the_drain_closed() {
 }
 
 #[test]
-fn a_parked_accept_returns_when_the_run_stops_accepting() {
+fn a_blocked_accept_returns_when_the_run_stops_accepting_connections() {
     let host = Arc::new(TcpHost::new());
     let listener = listen(&host, 0);
 
-    // Parked, with nothing connecting: exactly an idle service.
     let result = accepting(&host, listener);
     assert_eq!(
         host.accepts_in_flight(),
@@ -229,7 +220,6 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     if let Ok(stream) = &mut client {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut buffer = [0u8; 16];
-        // End of stream or a reset.
         let read = stream.read(&mut buffer);
         assert!(
             matches!(&read, Ok(0) | Err(_)),
@@ -244,7 +234,6 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     );
 }
 
-/// A second signal, a `Drop` and an explicit teardown can all reach it.
 #[test]
 fn stopping_twice_closes_the_listeners_once() {
     let host = TcpHost::new();
@@ -258,9 +247,8 @@ fn stopping_twice_closes_the_listeners_once() {
     );
 }
 
-/// The drain dials the addresses after closing them, so they must outlive the sockets.
 #[test]
-fn the_drain_can_still_name_a_listener_it_closed() {
+fn after_accepting_stops_the_host_still_lists_the_address_of_the_listener_it_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let wanted = listener.local_addr().expect("a bound address");
     drop(listener);
@@ -277,8 +265,6 @@ fn the_drain_can_still_name_a_listener_it_closed() {
     );
 }
 
-/// `SIGUSR2` sent to this process, which is safe once an ask has installed its handler. The
-/// shell's own `kill` sends it, which every system has.
 fn send_user2() {
     let sent = std::process::Command::new("/bin/sh")
         .args(["-c", &format!("kill -USR2 {}", std::process::id())])
@@ -299,7 +285,7 @@ fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
 }
 
 #[test]
-fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
+fn arrived_reports_a_signal_as_received_once_however_many_times_it_was_sent() {
     let shutdown = Shutdown::new(Bounds::default());
     assert!(
         !shutdown
@@ -313,7 +299,6 @@ fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
     send_user2();
     assert!(arrives(&shutdown, Asked::User2), "two arrivals are seen");
     std::thread::sleep(Duration::from_millis(200));
-    // The second of the two may have landed after the ask that saw the first.
     let _ = shutdown.arrived(Asked::User2);
     assert!(
         !shutdown.arrived(Asked::User2).expect("installed"),

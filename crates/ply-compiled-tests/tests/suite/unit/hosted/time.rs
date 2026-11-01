@@ -15,11 +15,14 @@ fn the_clocks_read_the_system_and_the_run() {
     let second = unsafe { rt_time_elapsed_ns(&mut ctx) }.0;
     assert!(second >= first, "{second} went back from {first}");
     assert!(ctx.take_failure().is_none());
-    assert!(ctx.take_host_use().acted(), "a reading asks the machine");
+    assert!(
+        ctx.take_host_usage().used_nondeterminism(),
+        "a reading asks the machine"
+    );
 }
 
 #[test]
-fn a_wait_parks_the_asking_thread() {
+fn sleeping_blocks_the_calling_thread_for_at_least_the_requested_time() {
     let mut ctx = context();
     hosted(&mut ctx);
     let before = unsafe { rt_time_elapsed_ns(&mut ctx) }.0;
@@ -28,10 +31,9 @@ fn a_wait_parks_the_asking_thread() {
     assert!(ctx.take_failure().is_none());
 }
 
-/// `clock` reads the run's monotonic clock, the one `std.time` reads, and outside a task of the
-/// run's scheduler its sleep waits the thread, a span at or below zero not at all.
 #[test]
-fn the_language_clock_reads_the_run_and_its_sleep_waits_the_thread_outside_a_task() {
+fn the_clock_in_a_ply_program_moves_forward_by_the_sleep_time_and_a_negative_sleep_does_not_move_the_clock_backward()
+ {
     let mut ctx = context();
     hosted(&mut ctx);
     let before = unsafe { rt_clock_now(&mut ctx) }.0;
@@ -46,5 +48,8 @@ fn the_language_clock_reads_the_run_and_its_sleep_waits_the_thread_outside_a_tas
     unsafe { rt_clock_sleep(&mut ctx, I64(-5_000_000_000)) };
     assert!(unsafe { rt_clock_now(&mut ctx) }.0 < slept + 5_000_000_000);
     assert!(ctx.take_failure().is_none());
-    assert!(ctx.take_host_use().acted(), "a reading asks the machine");
+    assert!(
+        ctx.take_host_usage().used_nondeterminism(),
+        "a reading asks the machine"
+    );
 }

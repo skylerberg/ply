@@ -1,29 +1,31 @@
-//! A 128-bit identifier: its canonical text, what its bits record about how it was made, and the
-//! RFC 9562 versions a program can create for itself.
+//! A 128-bit identifier (UUID) with its canonical text, the information its bits record about how
+//! it was made, and the RFC 9562 versions a program can create itself.
 //!
-//! The value is the sixteen octets, and only this module builds one, so every `Uuid` has exactly
+//! A `Uuid` is sixteen octets, and only this module builds one, so every `Uuid` has exactly
 //! sixteen. Two identifiers compare by their octets, and the first octet that differs decides.
-//! This is the order of their texts and the order a `Map` keeps them in. Parsing and rendering are
-//! pure and total: a string that is not in canonical form returns `None` rather than raising. For
-//! a shorter text, apply `std.radix` to the `octets`, with any alphabet.
+//! Their canonical texts sort in the same order, and so does a `Map` of them. Parsing and rendering
+//! never raise: a string that is not in canonical form parses to `None`. To get a shorter text,
+//! pass the `octets` to `std.radix` with any alphabet.
 //!
-//! Version 4 is random and carries no information. Version 5 is a function of a namespace and a
-//! name, so two programs create the same identifier for one thing without communicating. Version
-//! 7 starts with the millisecond it was made in, so identifiers sort in the order they were made,
-//! which suits a database key. It also reveals to anyone who sees it when it was made. `uuid_v4`
-//! and `uuid_v7` draw from `std.random`'s `entropy`, and `uuid_v7` reads `std.time`'s clock, so a
-//! test fixes both by handling them. `uuid_v7_at` makes the same identifier with the time and the
-//! random draws as arguments.
+//! Version 4 is random and carries no information. Version 5 is computed from a namespace and a
+//! name, so two programs create the same identifier for the same name without communicating.
+//! Version 7 starts with the millisecond in which it was made, so identifiers sort in the order
+//! they were made, which suits a database key. Anyone who sees a version 7 identifier can also read
+//! when it was made. `uuid_v4` and `uuid_v7` draw random numbers from the `entropy` effect of
+//! `std.random`, and `uuid_v7` reads the clock of `std.time`. A test makes them repeatable by
+//! handling those effects with fixed values. `uuid_v7_at` makes the same identifier from a time and
+//! random numbers passed as arguments.
 //!
-//! Two version 7 identifiers made in the same millisecond have no defined order, and a clock set
-//! back makes earlier ones. `uuid_v7_after(previous)` returns one that sorts after `previous`,
-//! whatever the clock did in between. It is RFC 9562 §6.2's first method: a counter in the twelve
-//! bits after the version. The counter is drawn fresh in a new millisecond, is one more than
-//! `previous`'s in the same or an earlier millisecond, and carries into the next millisecond when
-//! it runs out. The clock here reads whole milliseconds, so there is nothing finer to put in those
-//! bits, which would be the third method. The sixty-two bits after the variant stay random in every
-//! identifier, so one made after another still cannot be guessed from it. The state is the last
-//! identifier made, and the caller keeps it.
+//! Two version 7 identifiers made in the same millisecond have no defined order, and after the
+//! clock is set back, new identifiers sort before ones made earlier. `uuid_v7_after(previous)`
+//! returns an identifier that sorts after `previous`, whatever the clock did in between. It puts a
+//! counter in the twelve bits after the version. In a new millisecond the counter starts at a
+//! random number. In the same millisecond as `previous`, or an earlier one, the counter is
+//! `previous`'s counter plus one. When the counter overflows, the identifier moves to the next
+//! millisecond. RFC 9562 §6.2 also allows those twelve bits to hold a finer time fraction, but the
+//! clock reads whole milliseconds, so there is nothing finer to store. The sixty-two bits after the
+//! variant stay random in every identifier, so an identifier cannot be guessed from the one before
+//! it. The caller stores the last identifier made and passes it as `previous` next time.
 
 import std.bytes
 import std.bytes (u16_be, u64_be)
@@ -93,7 +95,6 @@ pub fn uuid_parse(text: String) -> Option<Uuid> / {abort.raise} =
   if text.len() != 36 { None }
   else if text.slice(8, 9) != "-" || text.slice(13, 14) != "-" || text.slice(18, 19) != "-"
       || text.slice(23, 24) != "-" { None } else {
-    // `Bytes::of_hex` reads lower case only, and RFC 9562 says a reader accepts either.
     let h = String::ascii_lower(
       text.slice(0, 8) ++ text.slice(9, 13) ++ text.slice(14, 18) ++ text.slice(19, 23)
         ++ text.slice(24, 36),
@@ -102,7 +103,7 @@ pub fn uuid_parse(text: String) -> Option<Uuid> / {abort.raise} =
   }
 
 /// Checks a `uuid"..."` literal. Returns the `Uuid` the canonical text represents, or an error at
-/// the first character that keeps it from being one.
+/// the first character that makes the text not canonical.
 pub fn literal(text: String) -> Result<Uuid, { message: String, offset: Int }> / {abort.raise} =
   match uuid_parse(text) {
     Some(u) -> Ok(u),
@@ -120,7 +121,6 @@ pub fn literal(text: String) -> Result<Uuid, { message: String, offset: Int }> /
 
 fn hyphen_at(i: Int) -> Bool = i == 8 || i == 13 || i == 18 || i == 23
 
-/// Whether the character at `i` is what the canonical form has there.
 fn is_canonical_at(text: String, i: Int) -> Bool / {abort.raise} = {
   let c = text.slice(i, i + 1);
   if hyphen_at(i) { c == "-" } else { is_hex(c.ascii_lower()) }
@@ -131,8 +131,6 @@ fn is_hex(text: String) -> Bool =
     ok && hex_digits().contains(text.slice(i, i + 1)))
 
 fn hex_digits() -> String = "0123456789abcdef"
-
-// --- What an identifier records ---------------------------------------------
 
 /// The layout `u`'s bits follow.
 pub fn uuid_variant(u: Uuid) -> UuidVariant / {abort.raise} = {
@@ -149,11 +147,12 @@ pub fn uuid_variant(u: Uuid) -> UuidVariant / {abort.raise} = {
 pub fn uuid_version(u: Uuid) -> Option<Int> / {abort.raise} =
   match uuid_variant(u) { Rfc -> Some(u.octets.at(6) >> 4), _ -> None }
 
-/// When `u` records it was made: a version 7's millisecond, or a version 1's or 6's count of
-/// 100 ns intervals since 1582-10-15. It is returned as an `Instant` of nanoseconds since
-/// 1970-01-01T00:00:00Z, the form `std.date` writes. `None` for any other version, which records
-/// no time, and for a time past what an `Instant` can represent, in 2262. It is what the maker's
-/// clock read, or what the maker chose to write.
+/// Returns the time at which `u` says it was made, as an `Instant` (nanoseconds since
+/// 1970-01-01T00:00:00Z). A version 7 identifier stores a millisecond count since 1970. A version 1
+/// or 6 identifier stores a count of 100 ns intervals since 1582-10-15. Returns `None` for any
+/// other version, which stores no time, and for a time after the year 2262, which an `Instant`
+/// cannot represent. The time is whatever the maker wrote, so it is not proof of when the
+/// identifier was made.
 pub fn uuid_time(u: Uuid) -> Option<Instant> / {abort.raise} =
   match uuid_version(u) {
     Some(7) -> instant_of(field(u, 0, 6), 1000000),
@@ -162,18 +161,14 @@ pub fn uuid_time(u: Uuid) -> Option<Instant> / {abort.raise} =
     _ -> None,
   }
 
-/// The time `ticks` intervals of 100 ns after 1582-10-15. That date is 0x01B21DD213814000
-/// intervals before 1970.
 fn since_1582(ticks: Int) -> Option<Instant> = instant_of(ticks - 0x01B2_1DD2_1381_4000, 100)
 
 fn instant_of(count: Int, nanoseconds: Int) -> Option<Instant> =
   checked_mul(count, nanoseconds).map(|n: Int| Instant(n))
 
-/// The whole number that `u`'s octets from `from` up to `to` represent, most significant first.
 fn field(u: Uuid, from: Int, to: Int) -> Int / {abort.raise} =
   range(from, to).fold(0, |n: Int, i: Int| n << 8 | u.octets.at(i))
 
-/// `raw`'s sixteen octets with `version` and `variant` written over the bits that record them.
 fn with_version_and_variant(
   raw: Bytes,
   version: Int,
@@ -185,27 +180,23 @@ fn with_version_and_variant(
       raw.slice(0, 6),
       byte_of_int(raw.at(6) & 0x0F | version << 4),
       raw.slice(7, 8),
-      byte_of_int(raw.at(8) & lead.kept | lead.set),
+      byte_of_int(raw.at(8) & lead.retained | lead.set),
       raw.slice(9, 16),
     ]),
   }
 }
 
-/// The bits of the ninth octet a variant leaves to the identifier, and the ones it sets.
-fn variant_bits(v: UuidVariant) -> { kept: Int, set: Int } =
+fn variant_bits(v: UuidVariant) -> { retained: Int, set: Int } =
   match v {
-    Ncs -> { kept: 0x7F, set: 0x00 },
-    Rfc -> { kept: 0x3F, set: 0x80 },
-    Microsoft -> { kept: 0x1F, set: 0xC0 },
-    Future -> { kept: 0x1F, set: 0xE0 },
+    Ncs -> { retained: 0x7F, set: 0x00 },
+    Rfc -> { retained: 0x3F, set: 0x80 },
+    Microsoft -> { retained: 0x1F, set: 0xC0 },
+    Future -> { retained: 0x1F, set: 0xE0 },
   }
-
-// --- Version 4 --------------------------------------------------------------
 
 /// A version 4 identifier: sixteen random octets with the version and variant written over six
 /// of their bits.
 pub fn uuid_v4() -> Uuid / {entropy.next bounded, abort.raise} = {
-  // A draw has sixty-three bits, so the sixteen octets come from the low octets of three draws.
   let raw = Bytes::concat_all([
     low_octets(entropy.next(), 6),
     low_octets(entropy.next(), 6),
@@ -215,8 +206,6 @@ pub fn uuid_v4() -> Uuid / {entropy.next bounded, abort.raise} = {
 }
 
 fn low_octets(n: Int, count: Int) -> Bytes / {abort.raise} = u64_be(n).slice(8 - count, 8)
-
-// --- Version 5 --------------------------------------------------------------
 
 /// The namespace of fully qualified domain names (RFC 9562 §6.6).
 pub fn uuid_namespace_dns() -> Uuid =
@@ -234,41 +223,40 @@ pub fn uuid_namespace_oid() -> Uuid =
 pub fn uuid_namespace_x500() -> Uuid =
   { octets: b"\x6b\xa7\xb8\x14\x9d\xad\x11\xd1\x80\xb4\x00\xc0\x4f\xd4\x30\xc8" }
 
-/// The version 5 identifier of `name` in `namespace`: the SHA-1 of the namespace's octets followed
-/// by the name's, cut to sixteen octets, with the version and variant written over (RFC 9562
-/// §5.5).
+/// Returns the version 5 identifier of `name` in `namespace` (RFC 9562 §5.5): the first sixteen
+/// octets of the SHA-1 of the namespace's octets followed by the name's, with the version and
+/// variant bits set.
 ///
-/// A namespace and a name give the same identifier on every machine, so it can be recomputed from
-/// the name alone. A text name is passed as its UTF-8. SHA-1 is no longer collision resistant:
-/// whoever picks the names can make two that share an identifier. It only tells apart names that
-/// no adversary chooses.
+/// The same namespace and name give the same identifier on every machine. Pass a text name as its
+/// UTF-8 bytes. SHA-1 is no longer collision resistant, so someone who chooses the names can make
+/// two different names with the same identifier. Use this only when no attacker chooses the names.
 pub fn uuid_v5(namespace: Uuid, name: Bytes) -> Uuid / {abort.raise} =
   with_version_and_variant(sha1(namespace.octets.concat(name)).slice(0, 16), 5, Rfc)
 
-// --- Version 7 --------------------------------------------------------------
-
-/// A version 7 identifier: the current millisecond from the clock, then random bits (RFC 9562
-/// §5.7).
+/// Returns a version 7 identifier: the current millisecond from the clock, then random bits (RFC
+/// 9562 §5.7).
 ///
-/// One made in a later millisecond sorts after one made in an earlier one. Two made in the same
-/// millisecond have no defined order, and a clock set back makes earlier ones. `uuid_v7_after`
-/// makes identifiers that are always in order. Anyone who sees the identifier can read when it
-/// was made (`uuid_time`).
+/// An identifier made in a later millisecond sorts after one made in an earlier millisecond. Two
+/// made in the same millisecond have no defined order. If the clock is set back, identifiers made
+/// later can sort before earlier ones. `uuid_v7_after` always returns identifiers in order. Anyone
+/// with the identifier can read the time it was made with `uuid_time`.
 pub fn uuid_v7() -> Uuid / {time.now_ms bounded, entropy.next bounded, abort.raise} = {
   let ms = time.now_ms();
   let rand_a = entropy.next();
   v7_of(clamped_ms(ms), rand_a, entropy.next())
 }
 
-/// A version 7 identifier that sorts after `previous`, the last one the caller made. When the
-/// clock has passed `previous`'s millisecond, it is `uuid_v7`. Otherwise it is in that millisecond
-/// with a counter one higher, or in the next millisecond when the counter has run out. So a clock
-/// that stands still or steps back never makes an identifier out of order, and a burst of more
-/// than a few thousand in one millisecond runs ahead of the clock.
+/// Returns a version 7 identifier that sorts after `previous`, the last identifier the caller made.
 ///
-/// `previous` may be any identifier, of this version or not. Returns `None` only when no version
-/// 7 identifier can follow it: its first six octets are the last millisecond that forty-eight
-/// bits can count, in the year 10889, and its next two are `0x7FFF` or more.
+/// If the clock is past `previous`'s millisecond, this behaves like `uuid_v7`. Otherwise the result
+/// uses `previous`'s millisecond with its counter increased by one, or the next millisecond if the
+/// counter is at its maximum. So a clock that stands still or moves backward never produces an
+/// identifier out of order. A burst of more than a few thousand identifiers in one millisecond
+/// makes the identifiers' time run ahead of the clock.
+///
+/// `previous` may be any identifier, of any version. Returns `None` only when no version 7
+/// identifier can sort after it: that is when `previous` has the largest millisecond that 48 bits
+/// can hold (in the year 10889) and its seventh and eighth octets are `0x7FFF` or more.
 pub fn uuid_v7_after(
   previous: Uuid,
 ) -> Option<Uuid> / {time.now_ms bounded, entropy.next bounded, abort.raise} = {
@@ -295,7 +283,6 @@ pub fn uuid_v7_after_at(
 
 fn v7_after(previous: Uuid, now: Int, rand_a: Int, rand_b: Int) -> Option<Uuid> / {abort.raise} = {
   let last = field(previous, 0, 6);
-  // The version and the counter of a version 7. Anything below `0x7000` sorts before every one.
   let version_and_counter = field(previous, 6, 8);
   if now > last { Some(v7_of(now, rand_a, rand_b)) }
   else if version_and_counter < 0x7000 { Some(v7_of(last, rand_a, rand_b)) }
@@ -311,20 +298,14 @@ fn v7_of(ms: Int, rand_a: Int, rand_b: Int) -> Uuid / {abort.raise} =
     Rfc,
   )
 
-/// The last millisecond that forty-eight bits can count.
 fn last_ms() -> Int = 0xFFFF_FFFF_FFFF
 
-/// The millisecond a version 7 writes for the clock reading `ms`. A time before 1970 counts as
-/// 1970, and one past `last_ms` as `last_ms`.
 fn clamped_ms(ms: Int) -> Int = min(max(ms, 0), last_ms())
 
 fn ms_of(at: Instant) -> Int = clamped_ms(nanos_at(at) / 1000000)
 
-// --- Tests ------------------------------------------------------------------
-
 fn parsed(text: String) -> Uuid / {abort.raise} = uuid_parse(text).expect(text)
 
-/// Generates any `V7Input`.
 fn v7_inputs() -> gen::Gen<V7Input> =
   gen::map3(
     gen::map(gen::any_int(), |n: Int| Instant(n)),
@@ -337,7 +318,7 @@ test "a UUID's text parses back to the same UUID" {
   gen::check(uuid_gen(), |x: Uuid| round_trip(uuid_render, uuid_parse, x))
 }
 
-test "a UUID has a version exactly under the RFC's variant, and a time only as version 1, 6 or 7" {
+test "a UUID has a version only when its variant is RFC, and has a time only when its version is 1, 6 or 7" {
   gen::check(uuid_gen(), |u: Uuid| {
     (if uuid_variant(u) == Rfc { uuid_version(u) != None } else { uuid_version(u) == None })
       && (uuid_time(u) == None || [Some(1), Some(6), Some(7)].contains(uuid_version(u)))
@@ -346,7 +327,7 @@ test "a UUID has a version exactly under the RFC's variant, and a time only as v
 
 type V7Input = { at: Instant, rand_a: Int, rand_b: Int }
 
-test "version 7 UUIDs made in turn sort in order as the clock stands still, moves on or runs back" {
+test "version 7 UUIDs made one after another sort in increasing order, whether the clock stays the same, advances or goes backwards" {
   gen::check2(v7_inputs(), gen::list(v7_inputs()), |first: V7Input, rest: List<V7Input>| {
     rest.fold(
       { last: uuid_v7_at(first.at, first.rand_a, first.rand_b), ordered: true },
@@ -368,7 +349,6 @@ test "render is the canonical lowercase form and parse is its inverse" {
   let u: Uuid = { octets: Bytes::of_hex("0190f5e2c3a74b6d8e1f2a3b4c5d6e7f") };
   assert_eq(uuid_render(u), "0190f5e2-c3a7-4b6d-8e1f-2a3b4c5d6e7f");
   assert_eq(uuid_parse("0190f5e2-c3a7-4b6d-8e1f-2a3b4c5d6e7f"), Some(u));
-  // A reader accepts upper case; a writer never produces it.
   assert_eq(uuid_parse("0190F5E2-C3A7-4B6D-8E1F-2A3B4C5D6E7F"), Some(u))
 }
 
@@ -377,14 +357,13 @@ test "parse rejects anything that is not 8-4-4-4-12 hex" {
   assert_eq(uuid_parse("0190f5e2-c3a7-4b6d-8e1f-2a3b4c5d6e7"), None);
   assert_eq(uuid_parse("0190f5e2-c3a7-4b6d-8e1f-2a3b4c5d6e7g"), None);
   assert_eq(uuid_parse("0190f5e2c3a7-4b6d-8e1f-2a3b-4c5d6e7f"), None);
-  // Each hyphen is required, even when a hex digit takes its place.
   assert_eq(uuid_parse("0190f5e20c3a7-4b6d-8e1f-2a3b4c5d6e7f"), None);
   assert_eq(uuid_parse("0190f5e2-c3a704b6d-8e1f-2a3b4c5d6e7f"), None);
   assert_eq(uuid_parse("0190f5e2-c3a7-4b6d08e1f-2a3b4c5d6e7f"), None);
   assert_eq(uuid_parse("0190f5e2-c3a7-4b6d-8e1f02a3b4c5d6e7f"), None)
 }
 
-test "a literal's check returns the UUID, or the character that keeps the text from being one" {
+test "`literal` returns the UUID for valid text, and an error with a message and offset for text that is not a UUID" {
   assert_eq(
     literal("0190f5e2-c3a7-4b6d-8e1f-2a3b4c5d6e7f"),
     Ok({ octets: Bytes::of_hex("0190f5e2c3a74b6d8e1f2a3b4c5d6e7f") }),
@@ -433,7 +412,6 @@ test "the nil and max UUIDs are all zeros and all ones, of no version" {
 
 type VariantCase = { ninth: String, variant: UuidVariant }
 
-/// The smallest and the largest ninth octet of each variant.
 fn variant_cases() -> List<VariantCase> =
   [
     { ninth: "00", variant: Ncs },
@@ -446,7 +424,8 @@ fn variant_cases() -> List<VariantCase> =
     { ninth: "ff", variant: Future },
   ]
 
-test "a ninth octet of {c.ninth} is the {c.variant} variant" for c: VariantCase in variant_cases() {
+test "a UUID whose ninth octet is {c.ninth} has the {c.variant} variant" for c: VariantCase in variant_cases(
+  ) {
   let u = parsed("0190f5e2-c3a7-7b6d-" ++ c.ninth ++ "1f-2a3b4c5d6e7f");
   assert_eq(uuid_variant(u), c.variant);
   assert_eq(uuid_version(u), if c.variant == Rfc { Some(7) } else { None })
@@ -454,8 +433,6 @@ test "a ninth octet of {c.ninth} is the {c.variant} variant" for c: VariantCase 
 
 type Example = { section: String, text: String, version: Int, made_ms: Option<Int> }
 
-/// The examples of RFC 9562's appendices A and B, as it writes them: each example, its version,
-/// and for those that record a time, the millisecond they were made in, 2022-02-22T19:22:22Z.
 fn rfc_examples() -> List<Example> =
   [
     {
@@ -492,7 +469,6 @@ test "RFC 9562's example {c.section} is of version {c.version}" for c: Example i
 
 type Namespace = { name: String, namespace: Uuid, text: String }
 
-/// RFC 9562's table 3.
 fn rfc_namespaces() -> List<Namespace> =
   [
     { name: "DNS", namespace: uuid_namespace_dns(), text: "6ba7b810-9dad-11d1-80b4-00c04fd430c8" },
@@ -511,7 +487,6 @@ test "the {c.name} namespace is the one RFC 9562 registers" for c: Namespace in 
 
 type NameCase = { namespace: Uuid, name: String, id: String }
 
-/// RFC 9562's appendix A.4 first, then what Python's `uuid.uuid5` returns.
 fn name_cases() -> List<NameCase> =
   [
     {
@@ -548,17 +523,15 @@ fn name_cases() -> List<NameCase> =
     { namespace: uuid_nil(), name: "x", id: "f3e951bb-a80b-5e6c-a038-a56ee0caa25d" },
   ]
 
-test "the version 5 UUID of \"{c.name}\" in {uuid_render(c.namespace)}" for c: NameCase in name_cases(
+test "`uuid_v5` of `{c.name}` in the namespace {uuid_render(c.namespace)} returns the expected UUID" for c: NameCase in name_cases(
   ) { assert_eq(uuid_render(uuid_v5(c.namespace, Bytes::of_string(c.name))), c.id) }
 
 test "v4 overwrites the version and variant bits and nothing else" {
   let zeros = handle { uuid_v4() } with { entropy.next() -> 0 };
   assert_eq(uuid_render(zeros), "00000000-0000-4000-8000-000000000000");
-  // Every bit of each draw is set here, and so is every bit of the UUID that comes from a draw.
   let ones = handle { uuid_v4() } with { entropy.next() -> 0x7FFF_FFFF_FFFF_FFFF };
   assert_eq(uuid_render(ones), "ffffffff-ffff-4fff-bfff-ffffffffffff");
   assert_eq(uuid_version(ones), Some(4));
-  // Three draws: the low six octets of the first two and the low four of the third.
   let counted = handle { uuid_v4() } with { entropy.next() -> 0x0102_0304_0506_0708 };
   assert_eq(uuid_render(counted), "03040506-0708-4304-8506-070805060708")
 }
@@ -567,13 +540,11 @@ test "RFC 9562's version 7 example is its millisecond followed by its random fie
   let made = at_millis(1645557742000);
   let u = uuid_v7_at(made, 0xCC3, 0x18C4_DC0C_0C07_398F);
   assert_eq(u, parsed("017F22E2-79B0-7CC3-98C4-DC0C0C07398F"));
-  // Only the low twelve and the low sixty-two bits of the draws are read.
   assert_eq(uuid_v7_at(made, 0x7FFF_FFFF_FFFF_FCC3, 0x58C4_DC0C_0C07_398F), u);
-  // Any time inside the millisecond gives that millisecond.
   assert_eq(uuid_v7_at(Instant(1645557742000999999), 0xCC3, 0x18C4_DC0C_0C07_398F), u)
 }
 
-test "v7 is the clock's millisecond and two draws, so handling both fixes its value" {
+test "`uuid_v7` is built from the clock's millisecond and two random draws, so fixed clock and random values give a fixed UUID" {
   let u = handle {
     uuid_v7()
   } with {
@@ -584,7 +555,7 @@ test "v7 is the clock's millisecond and two draws, so handling both fixes its va
   assert_eq(uuid_time(u), Some(at_millis(1645557742000)))
 }
 
-test "a time before 1970 is written as 1970, and one past 48 bits as the last millisecond" {
+test "`uuid_v7_at` writes a time before 1970 as 1970, and a time beyond 48 bits as the last millisecond that fits" {
   assert_eq(uuid_time(uuid_v7_at(Instant(0 - 1), 0, 0)), Some(Instant(0)));
   assert_eq(
     uuid_render(uuid_v7_at(Instant(0 - 5000000000), 1, 2)),
@@ -601,7 +572,7 @@ test "a time before 1970 is written as 1970, and one past 48 bits as the last mi
   assert_eq(uuid_render(early), "00000000-0000-7000-8000-000000000000")
 }
 
-test "a UUID made after another is in its millisecond with the counter one higher until the clock passes it" {
+test "a version 7 UUID made after another adds one to the previous counter while the clock is not ahead of the previous millisecond" {
   let first = uuid_v7_at(at_millis(1000), 0x123, 5);
   assert_eq(uuid_render(first), "00000000-03e8-7123-8000-000000000005");
   let same = uuid_v7_after_at(first, at_millis(1000), 0xABC, 6);
@@ -610,12 +581,11 @@ test "a UUID made after another is in its millisecond with the counter one highe
   assert_eq(back.map(uuid_render), Some("00000000-03e8-7124-8000-000000000007"));
   let on = uuid_v7_after_at(first, at_millis(1001), 0xABC, 8);
   assert_eq(on.map(uuid_render), Some("00000000-03e9-7abc-8000-000000000008"));
-  // A counter of zero is still a counter: the next UUID's counter is one, whatever was drawn.
   let zero = uuid_v7_after_at(uuid_v7_at(at_millis(1000), 0, 5), at_millis(1000), 0, 0);
   assert_eq(zero.map(uuid_render), Some("00000000-03e8-7001-8000-000000000000"))
 }
 
-test "a spent counter carries into the next millisecond, and a UUID of a lower version is passed in its own" {
+test "`uuid_v7_after_at` moves to the next millisecond when the previous counter is at its maximum, and restarts the counter from zero when the previous UUID is not version 7" {
   let spent = uuid_v7_at(at_millis(1000), 0xFFF, 5);
   let carried = uuid_v7_after_at(spent, at_millis(1000), 0xABC, 6);
   assert_eq(carried.map(uuid_render), Some("00000000-03e9-7abc-8000-000000000006"));
@@ -627,7 +597,7 @@ test "a spent counter carries into the next millisecond, and a UUID of a lower v
   assert_eq(past.map(uuid_render), Some("00000000-03e9-7abc-8000-000000000006"))
 }
 
-test "nothing follows the last counter of the last millisecond" {
+test "`uuid_v7_after_at` returns `None` when the previous UUID has the maximum timestamp and the maximum counter, so no later version 7 UUID exists" {
   let nearly = parsed("ffffffff-ffff-7ffe-8000-000000000000");
   assert_eq(
     uuid_v7_after_at(nearly, at_millis(0), 0, 9).map(uuid_render),
@@ -657,7 +627,6 @@ test "v7 made after another under a clock that stands still comes out in order" 
 }
 
 test "a map keyed by version 7 UUIDs lists them in the order they were made" {
-  // Eight per millisecond, from a counter two below its limit, so some carry past the clock.
   let made = range(1, 24).fold(
     [uuid_v7_at(at_millis(1645557742000), 0xFFE, 1)],
     |us: List<Uuid>, i: Int|
@@ -668,12 +637,12 @@ test "a map keyed by version 7 UUIDs lists them in the order they were made" {
       },
   );
   assert_eq(made.len(), 24);
-  let kept = range(0, 24).fold(Map::new(), |m: Map<Uuid, Int>, i: Int| {
+  let entries = range(0, 24).fold(Map::new(), |m: Map<Uuid, Int>, i: Int| {
     let place = i * 7 % 24;
     match made.at(place) { Some(u) -> m.insert(u, place), None -> m }
   });
-  assert_eq(kept.keys(), made);
-  assert_eq(kept.values(), range(0, 24))
+  assert_eq(entries.keys(), made);
+  assert_eq(entries.values(), range(0, 24))
 }
 
 test "the generator draws the nil and max UUIDs, every variant and every version" {
@@ -685,11 +654,9 @@ test "the generator draws the nil and max UUIDs, every variant and every version
   assert_eq(drawn.len(), 400);
   assert(drawn.contains(uuid_nil()));
   assert(drawn.contains(uuid_max()));
-  // The nil UUID is of one variant and the max of another, so they are set aside.
   let variants = drawn.filter(|u: Uuid| u != uuid_nil() && u != uuid_max()).map(uuid_variant);
   assert_eq([Ncs, Rfc, Microsoft, Future].filter(|v: UuidVariant| !variants.contains(v)), []);
   let versions = drawn.map(uuid_version);
   assert_eq(range(0, 16).filter(|v: Int| !versions.contains(Some(v))), []);
-  // The simplest draw, which a counterexample shrinks toward, is the nil UUID.
   assert_eq(gen::sample(uuid_gen(), 0, b"", 0, Some([])).value, Some(uuid_nil()))
 }

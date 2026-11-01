@@ -31,9 +31,8 @@ pub type Entry = { key: Value, value: Value }
 /// A map entry.
 pub fn entry(key: Value, value: Value) -> Entry = { key: key, value: value }
 
-// --- Writing ----------------------------------------------------------------
-
-/// The shortest encoding of `v`.
+/// Returns the MessagePack encoding of `v`, using the shortest form for each integer and each
+/// length. Raises when a length does not fit in 32 bits.
 pub fn msgpack_encode(v: Value) -> Bytes / {abort.raise} =
   match v {
     Nil -> byte_of_int(0xC0),
@@ -54,7 +53,6 @@ pub fn msgpack_encode(v: Value) -> Bytes / {abort.raise} =
 
 fn with_head(head: Bytes, body: Bytes) -> Bytes = head.concat(body)
 
-/// Integers, shortest first: positive fixint, negative fixint, then int8/16/32/64.
 fn int_bytes(n: Int) -> Bytes =
   if n >= 0 && n <= 127 { byte_of_int(n) }
   else if n >= 0 - 32 && n < 0 { byte_of_int(0xE0 | n & 0x1F) }
@@ -83,8 +81,6 @@ fn map_head(n: Int) -> Bytes / {abort.raise} =
   if n <= 15 { byte_of_int(0x80 | n) }
   else if n <= 65535 { byte_of_int(0xDE).concat(u16_be(n)) }
   else { byte_of_int(0xDF).concat(u32_be(n)) }
-
-// --- Reading ----------------------------------------------------------------
 
 /// Why the reader rejected its input. `Truncated` is an input that ends before a value does.
 /// `TooDeep` is a value nested deeper than 64 levels. `Unsupported` is a tag outside this subset,
@@ -117,11 +113,8 @@ fn fail<a>(at: Int, reason: ErrorKind) -> a / {msgpack.fail} =
 /// A decoded value, and the offset just after it.
 pub type ReadResult = { value: Value, at: Int }
 
-/// How deep a value may nest. Without a limit, a hostile input could make the recursive reader
-/// overflow the stack. 64 is deeper than any real message and well within the stack.
 fn max_depth() -> Int = 64
 
-/// `depth_left` is how many more levels a value may nest. Each nested level uses one.
 fn read_at(data: Bytes, at: Int, depth_left: Int) -> ReadResult / {msgpack.fail, abort.raise} =
   if depth_left < 0 { fail(at, TooDeep) }
   else if at < 0 || at >= data.len() { fail(at, Truncated) } else {
@@ -131,11 +124,7 @@ fn read_at(data: Bytes, at: Int, depth_left: Int) -> ReadResult / {msgpack.fail,
     else if tag >= 0x80 && tag <= 0x8F { read_map(data, at + 1, tag & 0x0F, depth_left - 1) }
     else if tag >= 0x90 && tag <= 0x9F { read_array(data, at + 1, tag & 0x0F, depth_left - 1) }
     else if tag >= 0xA0 && tag <= 0xBF { read_text(data, at + 1, tag & 0x1F) }
-    else {
-      // A `match` keeps twenty-odd tags at one level, since each nested `else if` deepens the
-      // emitter's recursion.
-      read_tagged(data, at, tag, depth_left - 1)
-    }
+    else { read_tagged(data, at, tag, depth_left - 1) }
   }
 
 fn read_tagged(
@@ -167,19 +156,15 @@ fn read_tagged(
     0xDD -> read_length(data, at + 1, 4, ArrayKind, depth_left),
     0xDE -> read_length(data, at + 1, 2, MapKind, depth_left),
     0xDF -> read_length(data, at + 1, 4, MapKind, depth_left),
-    // `float32`, the extension types, the reserved `0xc1`, and everything above `0xdf`.
     _ -> fail(at, Unsupported(tag)),
   }
 
 fn read_float(data: Bytes, at: Int) -> ReadResult / {msgpack.fail} =
   { value: Float(Float::of_bits(big_endian_int(read_bytes(data, at + 1, 8)))), at: at + 9 }
 
-/// Eight bytes are already an `Int` in two's complement, so no sign extension is needed.
 fn read_int64(data: Bytes, at: Int) -> ReadResult / {msgpack.fail} =
   { value: Int(big_endian_int(read_bytes(data, at + 1, 8))), at: at + 9 }
 
-/// A `uint64` with its top bit set does not fit an `Int`, and returning the wrapped bits would
-/// give a wrong value.
 fn read_uint64(data: Bytes, at: Int) -> ReadResult / {msgpack.fail, abort.raise} = {
   let eight = read_bytes(data, at + 1, 8);
   if eight.at(0) & 0x80 != 0 { fail(at, TooWide) }
@@ -198,12 +183,8 @@ fn read_signed(
     at: at + 1 + width,
   }
 
-/// The kind of payload a length-prefixed tag introduces.
 type PayloadKind = | BinaryKind | TextKind | ArrayKind | MapKind
 
-/// Reads one length-prefixed value. The length is checked against the remaining bytes *before* the
-/// reader visits its elements, so a header that claims four billion elements fails as truncated
-/// instead of looping four billion times.
 fn read_length(
   data: Bytes,
   at: Int,
@@ -220,7 +201,6 @@ fn read_length(
   else { read_map(data, from, n, depth_left) }
 }
 
-/// Reads a `uint8`, `uint16` or `uint32`, which always fit an `Int`.
 fn read_unsigned(data: Bytes, at: Int, width: Int, after: Int) -> ReadResult / {msgpack.fail} =
   { value: Int(big_endian_int(read_bytes(data, at + 1, width))), at: at + after }
 
@@ -248,11 +228,11 @@ fn read_values(
   at: Int,
   n: Int,
   depth_left: Int,
-  acc: List<Value>,
+  accumulator: List<Value>,
 ) -> { items: List<Value>, at: Int } / {msgpack.fail, abort.raise} =
-  if n <= 0 { { items: acc, at: at } } else {
+  if n <= 0 { { items: accumulator, at: at } } else {
     let read = read_at(data, at, depth_left);
-    read_values(data, read.at, n - 1, depth_left, acc.push(read.value))
+    read_values(data, read.at, n - 1, depth_left, accumulator.push(read.value))
   }
 
 fn read_map(
@@ -270,9 +250,9 @@ fn read_entries(
   at: Int,
   n: Int,
   depth_left: Int,
-  acc: List<Entry>,
+  accumulator: List<Entry>,
 ) -> { fields: List<Entry>, at: Int } / {msgpack.fail, abort.raise} =
-  if n <= 0 { { fields: acc, at: at } } else {
+  if n <= 0 { { fields: accumulator, at: at } } else {
     let key = read_at(data, at, depth_left);
     let value = read_at(data, key.at, depth_left);
     read_entries(
@@ -280,20 +260,16 @@ fn read_entries(
       value.at,
       n - 1,
       depth_left,
-      acc.push({ key: key.value, value: value.value }),
+      accumulator.push({ key: key.value, value: value.value }),
     )
   }
 
-/// Reads `data` as a big-endian integer. Eight bytes fill an `Int`, so their top bit is its sign.
 fn big_endian_int(data: Bytes) -> Int =
-  range(0, data.len()).fold(0, |acc: Int, i: Int| acc << 8 | data.at(i))
+  range(0, data.len()).fold(0, |accumulator: Int, i: Int| accumulator << 8 | data.at(i))
 
-/// Sign-extends an integer narrower than an `Int` from its own high bit.
 fn sign_extend(n: Int, high: Int, span: Int) -> Int = if n >= high { n - span } else { n }
 
-// --- Tests ------------------------------------------------------------------
-
-test "the shortest signed encoding of each width, and each reads back" {
+test "`msgpack_encode` writes each integer in the fewest bytes its value allows, and `msgpack_decode` returns the original values for integers, floats, text and binary" {
   assert_eq(msgpack_encode(Nil), Bytes::of_hex("c0"));
   assert_eq(msgpack_encode(Boolean(false)), Bytes::of_hex("c2"));
   assert_eq(msgpack_encode(Boolean(true)), Bytes::of_hex("c3"));
@@ -323,14 +299,12 @@ test "text, binary, arrays and maps round-trip, and two concatenated values are 
   assert_eq(msgpack_decode(two), Err({ at: 1, reason: Trailing }))
 }
 
-test "a reader accepts the unsigned widths and rejects what this subset does not include" {
+test "`msgpack_decode` accepts unsigned integer widths and rejects MessagePack types that the library does not support" {
   assert_eq(msgpack_decode(Bytes::of_hex("cc80")), Ok(Int(128)));
   assert_eq(msgpack_decode(Bytes::of_hex("cd0100")), Ok(Int(256)));
   assert_eq(msgpack_decode(Bytes::of_hex("ce00010000")), Ok(Int(65536)));
   let rejected = |hex: String, at: Int, reason: ErrorKind|
     assert_eq(msgpack_decode(Bytes::of_hex(hex)), Err({ at: at, reason: reason }));
-  // float32, an extension type, the reserved byte, a truncated string, a length past the end, a
-  // `uint64` too large for an Int, a truncated array, text that is not UTF-8, and nothing at all.
   rejected("ca3fc00000", 0, Unsupported(0xCA));
   rejected("c70102ff", 0, Unsupported(0xC7));
   rejected("c1", 0, Unsupported(0xC1));
@@ -349,7 +323,7 @@ test "a value nested past the depth limit is rejected at the byte where the limi
   assert_eq(msgpack_decode(nested(65)), Err({ at: 65, reason: TooDeep }))
 }
 
-test "the raising reader raises the error the other returns, and a task may perform it" {
+test "`msgpack_read` raises the same error that `msgpack_decode` returns, and it can run inside a spawned task" {
   assert_eq(try { msgpack_read(Bytes::of_hex("c1")) }, Err({ at: 0, reason: Unsupported(0xC1) }));
   let read = simulate {
     let t = task.spawn(|| try { msgpack_read(Bytes::of_hex("9201")) });

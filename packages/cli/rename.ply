@@ -16,14 +16,15 @@ import compiler.check.resolve.tables (Source, Declaration, Namespace, declaratio
                                       describe_namespace)
 import compiler.check.resolve.bindings (Reference, Member, Local, FieldName)
 import compiler.syntax.lexer (lex, Token)
-import rename.lines (Moved, MemberLine, Renames, keyword_rejection, renamed, renames_of, shown)
+import rename.lines (LocalLine, Moved, MemberLine, Renames, keyword_rejection, only_locals, renamed,
+                     renames_of, shown)
 import rename.strings (Mention, mentions_in, module_mentions, qualified_edits)
 import rename.programs (Entry, Library, Loaded, Read, DeclaredRecord, DefinitionKey, libraries_of,
                         loads_of)
 import rename.edits (Edit, Edited, ModuleMove, SharedName, applied, comment_edits, edited_of,
-                     shared_names, split_names, SplitName, moved_name, unqualified_name,
-                     qualified_renames, record_clashes, renaming_of, renames_derived, uses_renamed,
-                     with_derived, Renaming)
+                     local_binders, shared_names, split_names, SplitName, moved_name,
+                     unqualified_name, qualified_renames, record_clashes, renaming_of,
+                     renames_derived, uses_renamed, with_derived, Renaming)
 import rename.verify (Checked, Renamed, retargeted_calls, verified)
 import program (ParsedSources)
 
@@ -42,17 +43,17 @@ fn nothing_planned() -> Plan =
   { changes: [], mentions: [], shared: [], split: [], derived: Map::new(), rejections: [] }
 
 fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.raise} = {
-  let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
-    acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
+  let reads = loads.fold([], |accumulator: List<{ load: Loaded, read: Read }>, l: Loaded|
+    accumulator.concat(l.reads.map(|r: Read| { load: l, read: r })));
   let by_path = reads.fold(
     Map::new(),
-    |acc: Map<String, { load: Loaded, read: Read }>, x: { load: Loaded, read: Read }|
-      acc.insert(displayed(x.read.file.at), x),
+    |accumulator: Map<String, { load: Loaded, read: Read }>, x: { load: Loaded, read: Read }|
+      accumulator.insert(displayed(x.read.file.at), x),
   );
   let fields_written = reads.fold(
     Map::new(),
-    |acc: Map<Bytes, Bool>, x: { load: Loaded, read: Read }|
-      x.read.entries.fold(acc, |into: Map<Bytes, Bool>, e: Entry|
+    |accumulator: Map<Bytes, Bool>, x: { load: Loaded, read: Read }|
+      x.read.entries.fold(accumulator, |into: Map<Bytes, Bool>, e: Entry|
         e.names.members.fold(into, |found: Map<Bytes, Bool>, m: Member|
           match m.kind { FieldName(_) -> found.insert(m.name, true), _ -> found })),
   );
@@ -64,21 +65,24 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
       || x.read.entries.any(|e: Entry|
         e.names.references.any(|r: Reference|
           r.name == name && (match r.target { Local(_) -> true, _ -> false })));
-  renames.defined.fold([], |acc: List<Failure>, old: Bytes, files: Map<String, Bytes>|
-    files.fold(acc, |found: List<Failure>, file: String, _: Bytes|
-      match by_path.get(file) {
-        None -> found.push(missing(file)),
-        Some(x) -> if declares(x, old) { found }
-        else { found.push({ path: file, reason: "binds no " ++ shown(old) }) },
-      })).concat(
-    renames.members.fold([], |acc: List<Failure>, m: MemberLine|
+  renames.defined.fold(
+    [],
+    |accumulator: List<Failure>, old: Bytes, files: Map<String, Bytes>|
+      files.fold(accumulator, |found: List<Failure>, file: String, _: Bytes|
+        match by_path.get(file) {
+          None -> found.push(missing(file)),
+          Some(x) -> if declares(x, old) { found }
+          else { found.push({ path: file, reason: "binds no " ++ shown(old) }) },
+        }),
+  ).concat(
+    renames.members.fold([], |accumulator: List<Failure>, m: MemberLine|
       match by_path.get(m.file) {
-        None -> acc.push(missing(m.file)),
+        None -> accumulator.push(missing(m.file)),
         Some(x) -> if x.read.effects.any(|e: { name: Bytes, operations: List<Bytes> }|
               e.name == m.of && e.operations.contains(m.member))
             || x.read.records.any(|d: DeclaredRecord|
-              d.name == m.of && d.fields.contains(m.member)) { acc } else {
-          acc.push({
+              d.name == m.of && d.fields.contains(m.member)) { accumulator } else {
+          accumulator.push({
             path: m.file,
             reason: "declares no effect operation or record field "
               ++ shown(Bytes::concat_all([m.of, b".", m.member])),
@@ -86,26 +90,37 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
         },
       }),
   ).concat(
-    renames.modules.fold([], |acc: List<Failure>, m: Moved|
+    renames.modules.fold([], |accumulator: List<Failure>, m: Moved|
       if by_path.keys().any(|f: String|
-          f == m.path || (m.path.ends_with("/") && f.starts_with(m.path))) { acc }
-      else { acc.push(missing(m.path)) }),
+          f == m.path || (m.path.ends_with("/") && f.starts_with(m.path))) { accumulator }
+      else { accumulator.push(missing(m.path)) }),
   ).concat(
     renames.fields.keys().filter(|old: Bytes| !fields_written.contains(old)).map(|old: Bytes|
       { path: "", reason: "no record in the files being renamed has a field " ++ shown(old) }),
+  ).concat(
+    renames.locals.fold([], |accumulator: List<Failure>, line: LocalLine|
+      match by_path.get(line.file) {
+        None -> accumulator.push(missing(line.file)),
+        Some(x) -> if local_binders(x.read, line).len() > 0 { accumulator } else {
+          accumulator.push({
+            path: line.file ++ ":" ++ line.line.to_string(),
+            reason: "declares no local " ++ shown(line.old),
+          })
+        },
+      }),
   )
 }
 
 fn plan_of(
-  rn: Renaming,
+  renaming: Renaming,
   loads: List<Loaded>,
 ) -> Plan / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.read[abs], Derives, abort.raise, diverges} = {
-  let renames = rn.renames;
-  let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
-    acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
-  let edited = reads.map(|x: { load: Loaded, read: Read }| edited_of(rn, x.load, x.read));
+  let renames = renaming.renames;
+  let reads = loads.fold([], |accumulator: List<{ load: Loaded, read: Read }>, l: Loaded|
+    accumulator.concat(l.reads.map(|r: Read| { load: l, read: r })));
+  let edited = reads.map(|x: { load: Loaded, read: Read }| edited_of(renaming, x.load, x.read));
   let lexed = reads.map(|x: { load: Loaded, read: Read }| lex(x.read.file.text));
-  let qualified = qualified_renames(rn, reads.map(|x: { load: Loaded, read: Read }| x.read));
+  let qualified = qualified_renames(renaming, reads.map(|x: { load: Loaded, read: Read }| x.read));
   let strings = range(0, reads.len()).map(|i: Int|
     qualified_edits(reads.get(i).read.file.text, lexed.get(i).tokens, qualified));
   let changes = range(0, reads.len()).map(|i: Int| {
@@ -119,98 +134,122 @@ fn plan_of(
       at: r.file.at,
       text: text,
       changed: text != r.file.text,
-      to: rn.modules.get(absolute(rn.pwd, r.file.at)).map(|m: ModuleMove| m.to),
+      to: renaming.modules.get(absolute(renaming.pwd, r.file.at)).map(|m: ModuleMove| m.to),
     }
   });
-  let moved_names = reads.fold([], |acc: List<Bytes>, x: { load: Loaded, read: Read }|
-    if rn.modules.contains(absolute(rn.pwd, x.read.file.at)) { acc.push(x.read.name) }
-    else { acc });
-  let qualifiers = rn.modules.values().fold(Map::new(), |acc: Map<Bytes, Bool>, m: ModuleMove|
-    match m.before.at(m.before.len() - 1) { Some(last) -> acc.insert(last, true), None -> acc });
-  let olds = edited.fold(Map::new(), |acc: Map<Bytes, Bool>, e: Edited|
-    e.renamed.fold(acc, |into: Map<Bytes, Bool>, old: Bytes, _: List<Bytes>|
+  let moved_names = reads.fold([], |accumulator: List<Bytes>, x: { load: Loaded, read: Read }|
+    if renaming.modules.contains(absolute(renaming.pwd, x.read.file.at)) {
+      accumulator.push(x.read.name)
+    } else { accumulator });
+  let qualifiers = renaming.modules.values().fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bool>, m: ModuleMove|
+      match m.before.at(m.before.len() - 1) {
+        Some(last) -> accumulator.insert(last, true),
+        None -> accumulator,
+      },
+  );
+  let olds = edited.fold(Map::new(), |accumulator: Map<Bytes, Bool>, e: Edited|
+    e.renamed.fold(accumulator, |into: Map<Bytes, Bool>, old: Bytes, _: List<Bytes>|
       if qualifiers.contains(old) { into } else { into.insert(old, true) }));
-  let words = olds.fold(Map::new(), |acc: Map<Bytes, Bool>, old: Bytes, _: Bool|
-    if renames.words || renames.names.contains(old) { acc.insert(old, true) } else { acc });
-  let names = edited.fold(Map::new(), |acc: Map<Bytes, Bool>, e: Edited|
-    e.edits.fold(acc, |into: Map<Bytes, Bool>, x: Edit|
+  let words = olds.fold(Map::new(), |accumulator: Map<Bytes, Bool>, old: Bytes, _: Bool|
+    if renames.words || renames.names.contains(old) { accumulator.insert(old, true) }
+    else { accumulator });
+  let names = edited.fold(Map::new(), |accumulator: Map<Bytes, Bool>, e: Edited|
+    e.edits.fold(accumulator, |into: Map<Bytes, Bool>, x: Edit|
       x.names.fold(into, |n: Map<Bytes, Bool>, name: Bytes| n.insert(name, true))));
-  let named = names.keys().fold([], |acc: List<Failure>, name: Bytes|
-    match keyword_rejection(name) { Some(f) -> acc.push(f), None -> acc });
-  let targets = changes.fold(Map::new(), |acc: Map<String, List<String>>, change: Change|
-    match change.to {
-      Some(to) ->
-        acc.insert(displayed(to), acc.get(displayed(to)).unwrap_or([]).push(displayed(change.at))),
-      None -> acc,
-    });
-  let crowded = targets.fold([], |acc: List<Failure>, target: String, from: List<String>|
-    if from.len() > 1 {
-      acc.push({ path: target, reason: String::join(from, " and ") ++ " would both be moved here" })
-    } else { acc });
-  let taken = changes.fold([], |acc: List<Failure>, change: Change|
+  let named = names.keys().fold([], |accumulator: List<Failure>, name: Bytes|
+    match keyword_rejection(name) { Some(f) -> accumulator.push(f), None -> accumulator });
+  let targets = changes.fold(
+    Map::new(),
+    |accumulator: Map<String, List<String>>, change: Change|
+      match change.to {
+        Some(to) ->
+          accumulator.insert(
+            displayed(to),
+            accumulator.get(displayed(to)).unwrap_or([]).push(displayed(change.at)),
+          ),
+        None -> accumulator,
+      },
+  );
+  let crowded = targets.fold(
+    [],
+    |accumulator: List<Failure>, target: String, from: List<String>|
+      if from.len() > 1 {
+        accumulator.push({
+          path: target,
+          reason: String::join(from, " and ") ++ " would both be moved here",
+        })
+      } else { accumulator },
+  );
+  let taken = changes.fold([], |accumulator: List<Failure>, change: Change|
     match change.to {
       Some(to) -> if kind(to) != Missing {
-        acc.push({
+        accumulator.push({
           path: displayed(to),
           reason: displayed(change.at) ++ " would be moved here, but this file already exists",
         })
-      } else { acc },
-      None -> acc,
+      } else { accumulator },
+      None -> accumulator,
     });
-  let rejections = rn.rejections.concat(unmatched(renames, loads)).concat(named).concat(
-    edited.fold([], |acc: List<Failure>, e: Edited| acc.concat(e.failures)),
+  let rejections = renaming.rejections.concat(unmatched(renames, loads)).concat(named).concat(
+    edited.fold([], |accumulator: List<Failure>, e: Edited| accumulator.concat(e.failures)),
   ).concat(
     crowded,
   ).concat(
     taken,
   ).concat(
-    retargeted_calls(rn, loads),
+    retargeted_calls(renaming, loads),
   ).concat(
-    record_clashes(rn, loads),
+    record_clashes(renaming, loads),
   ).concat(
-    loads.fold([], |acc: List<Failure>, l: Loaded|
-      l.unrenamed.fold(acc, |found: List<Failure>, r: Read|
-        if !uses_renamed(rn, l, r) { found } else {
+    loads.fold([], |accumulator: List<Failure>, l: Loaded|
+      l.unrenamed.fold(accumulator, |found: List<Failure>, r: Read|
+        if !uses_renamed(renaming, l, r) { found } else {
           found.push({
             path: displayed(r.file.at),
-            reason: "uses a name the renames change, but is not under the paths",
+            reason: "uses a name that the rename changes, but this file is not in the paths given on the command line",
           })
         })),
   );
-  let texts = range(0, reads.len()).fold(Map::new(), |acc: Map<String, Bytes>, i: Int|
-    acc.insert(absolute(rn.pwd, reads.get(i).read.file.at), changes.get(i).text));
-  let library = range(0, reads.len()).fold(Map::new(), |acc: Map<Bytes, Source>, i: Int| {
+  let texts = range(0, reads.len()).fold(Map::new(), |accumulator: Map<String, Bytes>, i: Int|
+    accumulator.insert(absolute(renaming.pwd, reads.get(i).read.file.at), changes.get(i).text));
+  let library = range(0, reads.len()).fold(Map::new(), |accumulator: Map<Bytes, Source>, i: Int| {
     let r = reads.get(i).read;
-    acc.insert(r.name, {
-      name: moved_name(r.name, rn.modules.get(absolute(rn.pwd, r.file.at))),
-      src: changes.get(i).text,
+    accumulator.insert(r.name, {
+      name: moved_name(r.name, renaming.modules.get(absolute(renaming.pwd, r.file.at))),
+      source_text: changes.get(i).text,
     })
   });
   let checked: Checked = if rejections.len() > 0 { { failures: rejections, derived: Map::new() } }
   else {
     let renamed = changes.fold(
-      { pwd: rn.pwd, texts: Map::new(), gone: Map::new() },
-      |acc: Renamed, change: Change|
+      { pwd: renaming.pwd, texts: Map::new(), gone: Map::new() },
+      |accumulator: Renamed, change: Change|
         match change.to {
           Some(to) ->
             {
-              ..acc,
-              texts: acc.texts.insert(absolute(rn.pwd, to), change.text),
-              gone: acc.gone.insert(absolute(rn.pwd, change.at), true),
+              ..accumulator,
+              texts: accumulator.texts.insert(absolute(renaming.pwd, to), change.text),
+              gone: accumulator.gone.insert(absolute(renaming.pwd, change.at), true),
             },
-          None -> if !change.changed { acc }
-          else { { ..acc, texts: acc.texts.insert(absolute(rn.pwd, change.at), change.text) } },
+          None -> if !change.changed { accumulator } else {
+            {
+              ..accumulator,
+              texts: accumulator.texts.insert(absolute(renaming.pwd, change.at), change.text),
+            }
+          },
         },
     );
     loads.fold(
       { checked: { failures: [], derived: Map::new() }, parses: Map::new() },
-      |acc: { checked: Checked, parses: ParsedSources }, l: Loaded| {
-        let v = verified(rn, l, library, texts, renamed, acc.parses);
+      |accumulator: { checked: Checked, parses: ParsedSources }, l: Loaded| {
+        let v = verified(renaming, l, library, texts, renamed, accumulator.parses);
         {
           checked: {
-            failures: acc.checked.failures.concat(v.checked.failures),
+            failures: accumulator.checked.failures.concat(v.checked.failures),
             derived: v.checked.derived.fold(
-              acc.checked.derived,
+              accumulator.checked.derived,
               |m: Map<DefinitionKey, Bytes>, key: DefinitionKey, new: Bytes| m.insert(key, new),
             ),
           },
@@ -221,14 +260,16 @@ fn plan_of(
   };
   {
     changes: changes.filter(|change: Change| change.changed || change.to != None),
-    shared: shared_names(rn, loads),
-    split: split_names(rn, loads),
-    mentions: range(0, reads.len()).fold([], |acc: List<Mention>, i: Int| {
+    shared: shared_names(renaming, loads),
+    split: split_names(renaming, loads),
+    mentions: range(0, reads.len()).fold([], |accumulator: List<Mention>, i: Int| {
       let r = reads.get(i).read;
       let rewritten = strings.get(i);
       let tokens = lexed.get(i).tokens.filter(|t: Token|
         !rewritten.any(|s: Edit| s.start > t.start && s.end < t.end));
-      acc.concat(mentions_in(displayed(r.file.at), r.file.text, tokens, olds, words)).concat(
+      accumulator.concat(
+        mentions_in(displayed(r.file.at), r.file.text, tokens, olds, words),
+      ).concat(
         module_mentions(displayed(r.file.at), r.file.text, tokens, moved_names),
       )
     }),
@@ -243,10 +284,10 @@ fn planned(
   loads: List<Loaded>,
   libraries: List<Library>,
 ) -> Plan / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.read[abs], Derives, abort.raise, diverges} = {
-  let rn = renaming_of(pwd, renames, loads, libraries);
-  let first = plan_of(rn, loads);
-  if renames_derived(rn, first.derived) { first }
-  else { plan_of(with_derived(rn, first.derived), loads) }
+  let renaming = renaming_of(pwd, renames, loads, libraries);
+  let first = plan_of(renaming, loads);
+  if renames_derived(renaming, first.derived) { first }
+  else { plan_of(with_derived(renaming, first.derived), loads) }
 }
 
 fn saved(
@@ -324,8 +365,9 @@ fn command_output(plan: Plan, failures: List<Failure>, check: Bool) -> CommandOu
   let verb = if check { "would rename in " } else { "renamed in " };
   {
     json: json_report(plan, failures, code),
-    lines: plan.changes.fold([], |acc: List<String>, change: Change| {
-      let renamed_in = if change.changed { acc.push(verb ++ displayed(change.at)) } else { acc };
+    lines: plan.changes.fold([], |accumulator: List<String>, change: Change| {
+      let renamed_in = if change.changed { accumulator.push(verb ++ displayed(change.at)) }
+      else { accumulator };
       match change.to {
         Some(to) ->
           renamed_in.push(
@@ -358,7 +400,7 @@ fn command_output(plan: Plan, failures: List<Failure>, check: Bool) -> CommandOu
           ++ shown(s.old)
           ++ " of "
           ++ shown(s.sum)
-          ++ ", which only shares its name"),
+          ++ ", which is a different item that only has the same name"),
     ),
     code: code,
   }
@@ -380,7 +422,7 @@ pub fn run(
           let given = if flags.paths.len() == 0 { [here()] } else { flags.paths };
           let pwd = env.working_directory();
           let libraries = libraries_of(given);
-          let loading = loads_of(given, pwd);
+          let loading = loads_of(given, pwd, !only_locals(renames));
           if loading.failures.len() > 0 {
             command_output(nothing_planned(), loading.failures, false)
           } else {
@@ -391,8 +433,8 @@ pub fn run(
             } else {
               command_output(
                 plan,
-                plan.changes.fold([], |acc: List<Failure>, change: Change|
-                  match saved(change) { Some(f) -> acc.push(f), None -> acc }),
+                plan.changes.fold([], |accumulator: List<Failure>, change: Change|
+                  match saved(change) { Some(f) -> accumulator.push(f), None -> accumulator }),
                 false,
               )
             }

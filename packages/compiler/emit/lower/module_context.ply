@@ -4,7 +4,8 @@ import compiler.syntax.parsing (Identifier, Span, prelude_binder)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, RaiseMode, InvalidMode, mode_text)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
                              Field, Scheme, Effects, Effect, int_type, bool_type, float_type,
-                             decimal_type, bytes_type, fn_type, no_effects, unit_type, list_type)
+                             decimal_type, bytes_type, function_type, no_effects, unit_type,
+                             list_type)
 import compiler.check.known (ordering_name, less_constructor, equal_constructor)
 import compiler.emit.typing (SiteType, SiteAnnotations, annotations_of, no_annotations, site_type,
                              unknown_type, body_at)
@@ -19,14 +20,14 @@ import compiler.check.typed
 import compiler.check.typed (TypedBody, TypedParam, BodyPart, WholeBody, TestRun, part_key,
                              body_retyped, ConstantData)
 import compiler.check.infer (BodyFacts, item_owner, facts_by_owner)
-import compiler.check.infer.checker (MemberSite, Builtin, builtins, EffectInfo, OpInfo)
+import compiler.check.infer.checker (MemberSite, Builtin, builtins, EffectInfo, OperationInfo)
 import compiler.check.infer.definitions (MachineCall, machine_calls, parsed_natives)
 import compiler.front.facts (Analysis)
 import compiler.front.emitter_input (InferredFacts, inferred_facts_bin, constructors_read)
 import compiler.front.rows (Rows, KnownDefinitionRow, constant_values, ConstructorRow, EffectRow,
-                            OpRow)
+                            OperationRow)
 import compiler.front.published (facts_read, rows_of, inferred_facts)
-import compiler.emit.code (Code, lower_fn, with_labels)
+import compiler.emit.code (Code, lower_function, with_labels)
 import compiler.emit.representations (Definition, Imported, Constructors, SumConstructor, OpenShape,
                                       EffectName, EffectOperation, EmitParam, constructors_of,
                                       constructor_sums, sig_of, definition_entry, type_variables,
@@ -60,8 +61,8 @@ pub fn module_context_in(
   a: Analysis,
   module: Bytes,
 ) -> Result<{ setting: ModuleContext, roots: List<Root> }, Bytes> / {abort.raise} =
-  match range(0, a.modules.len()).fold(None, |acc: Option<Int>, k: Int|
-      if a.modules.get(k).name == module { Some(k) } else { acc }) {
+  match range(0, a.modules.len()).fold(None, |accumulator: Option<Int>, k: Int|
+      if a.modules.get(k).name == module { Some(k) } else { accumulator }) {
     None -> Err(b"no such module"),
     Some(i) -> match module_contexts_in(
         a,
@@ -105,16 +106,18 @@ pub fn module_contexts_in<b | e>(
     Err(reason) -> Err(reason),
     Ok(facts) -> {
       let expanded = modules;
-      let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+      let pure = facts.pure.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
+        accumulator.insert(n, true));
       let schemes = rows.definitions.fold(
         Map::new(),
-        |acc: Map<Bytes, Scheme>, row: KnownDefinitionRow| acc.insert(row.name, row.scheme),
+        |accumulator: Map<Bytes, Scheme>, row: KnownDefinitionRow|
+          accumulator.insert(row.name, row.scheme),
       );
       let values = constant_values(rows);
       let by_name = expanded.fold(
         Map::new(),
-        |acc: Map<Bytes, List<Definition>>, m: ParsedModule|
-          acc.insert(m.name, definitions_in(m.name, m.module, pure, schemes, values)),
+        |accumulator: Map<Bytes, List<Definition>>, m: ParsedModule|
+          accumulator.insert(m.name, definitions_in(m.name, m.module, pure, schemes, values)),
       );
       let definitions_of = |path: Bytes| match by_name.get(path) { Some(ds) -> ds, None -> [] };
       let read = constructors_read(a.checked);
@@ -158,14 +161,19 @@ pub fn module_contexts_in<b | e>(
               effects: effects,
               release_build: false,
             },
-            m.module.items.fold([], |acc: List<ItemRoot>, item: Item| {
+            m.module.items.fold([], |accumulator: List<ItemRoot>, item: Item| {
               let recorded = recorded_annotations(owned, item_owner(m.name, item));
               match item {
                 FunctionItem(definition) ->
-                  acc.push({ item: item, root: root_of(m.name, schemes, recorded, definition) }),
-                TestItem(t) -> acc.push({ item: item, root: test_root(m.name, recorded, t) }),
-                LawItem(l) -> acc.push({ item: item, root: law_root_of(m.name, recorded, l) }),
-                _ -> acc,
+                  accumulator.push({
+                    item: item,
+                    root: root_of(m.name, schemes, recorded, definition),
+                  }),
+                TestItem(t) ->
+                  accumulator.push({ item: item, root: test_root(m.name, recorded, t) }),
+                LawItem(l) ->
+                  accumulator.push({ item: item, root: law_root_of(m.name, recorded, l) }),
+                _ -> accumulator,
               }
             }),
           )
@@ -195,7 +203,7 @@ pub fn resolved_at(
         ty: |t: Type, u: Unit| { ty: substituted(t, args), state: u },
         effects: |r: Effects| r,
         entry: |a: Effect| a,
-        span: |sp: Span| sp,
+        span: |span: Span| span,
       }).out
     },
   }
@@ -203,8 +211,14 @@ pub fn resolved_at(
 pub fn root_params(b: TypedBody<Type>, labels: List<Bytes>) -> List<EmitParam> =
   with_labels(
     b.params.map(|q: TypedParam<Type>| {
-      let held = kind_of(q.ty);
-      { name: q.name, kind: held.kind, ty: held.ty, of: Some(q.ty), lambda: None }
+      let parameter_kind = kind_of(q.ty);
+      {
+        name: q.name,
+        kind: parameter_kind.kind,
+        ty: parameter_kind.ty,
+        of: Some(q.ty),
+        lambda: None,
+      }
     }),
     labels.map(|n: Bytes| { name: n, kind: IntKind, ty: OpenShape([]), of: None, lambda: None }),
   )
@@ -214,7 +228,7 @@ pub fn body_code(
   labels: List<Bytes>,
   recorded: SiteAnnotations,
 ) -> Code / {abort.raise} = {
-  let l = lower_fn(b.params, labels, b.body);
+  let l = lower_function(b.params, labels, b.body);
   match l.failed.at(0) { Some(reason) -> unlowered(reason), None -> l.code }
 }
 
@@ -230,7 +244,7 @@ pub fn root_body(
 }
 
 fn unlowered<a>(reason: Bytes) -> a / {abort.raise} =
-  panic(String::of_bytes_lossy(b"a checked body does not lower: ".concat(reason)))
+  panic(String::of_bytes_lossy(b"a checked body cannot be compiled: ".concat(reason)))
 
 fn body_root(
   key: RootKey,
@@ -278,7 +292,7 @@ fn root_of(
     WholeBody,
     definition.span.start,
     definition.generics.labels.map(|i: Identifier| i.name),
-    match sig_of(schemes, full) { Some(s) -> s.ret, None -> unknown_type() },
+    match sig_of(schemes, full) { Some(s) -> s.result_type, None -> unknown_type() },
   )
 }
 
@@ -304,9 +318,9 @@ pub fn constructor_named(s: ModuleContext, written: Bytes) -> Option<Bytes> =
     },
     None -> match known_constructor(s, qualify(s.module, written)) {
       Some(own) -> Some(own),
-      None -> match s.imports.fold(None, |acc: Option<Bytes>, imp: Imported|
-          match acc {
-            Some(_) -> acc,
+      None -> match s.imports.fold(None, |accumulator: Option<Bytes>, imp: Imported|
+          match accumulator {
+            Some(_) -> accumulator,
             None -> if !imp.whole && imp.name == written {
               known_constructor(s, qualify(imp.module, written))
             } else { None },
@@ -348,7 +362,7 @@ fn known_constructor(s: ModuleContext, name: Bytes) -> Option<Bytes> =
 pub fn declared_schemes() -> Map<Bytes, Scheme> / {abort.raise} =
   builtins().fold(Map::new(), |m: Map<Bytes, Scheme>, b: Builtin| m.insert(b.name, b.scheme))
 
-pub type CallTypes = { params: List<Type>, ret: Type }
+pub type CallTypes = { params: List<Type>, result_type: Type }
 
 pub fn builtin_call_types(
   s: ModuleContext,
@@ -358,7 +372,7 @@ pub fn builtin_call_types(
   match recorded {
     None -> declared_call_types(s, name, []),
     Some(t) -> match t.ty {
-      FunctionType(f) -> Some({ params: f.params, ret: f.ret }),
+      FunctionType(f) -> Some({ params: f.params, result_type: f.return_type }),
       _ -> declared_call_types(s, name, t.args),
     },
   }
@@ -366,18 +380,21 @@ pub fn builtin_call_types(
 pub fn declared_call_types(s: ModuleContext, name: Bytes, args: List<Type>) -> Option<CallTypes> =
   match s.declared.get(name) {
     None -> None,
-    Some(sc) -> if sc.type_variables.len() > 0 && args.len() != sc.type_variables.len() { None }
-    else {
-      let by = range(0, sc.type_variables.len()).fold(Map::new(), |m: Map<Int, Type>, i: Int|
-        match sc.type_variables.at(i) {
-          Some(v) -> match args.at(i) { Some(t) -> m.insert(v, t), None -> m },
-          None -> m,
-        });
-      match sc.ty {
+    Some(scheme) -> if scheme.type_variables.len() > 0
+        && args.len() != scheme.type_variables.len() { None } else {
+      let by = range(0, scheme.type_variables.len()).fold(
+        Map::new(),
+        |m: Map<Int, Type>, i: Int|
+          match scheme.type_variables.at(i) {
+            Some(v) -> match args.at(i) { Some(t) -> m.insert(v, t), None -> m },
+            None -> m,
+          },
+      );
+      match scheme.ty {
         FunctionType(f) ->
           Some({
             params: f.params.map(|p: Type| instantiated(p, by)),
-            ret: instantiated(f.ret, by),
+            result_type: instantiated(f.return_type, by),
           }),
         _ -> None,
       }
@@ -392,7 +409,7 @@ fn instantiated(ty: Type, by: Map<Int, Type>) -> Type =
       FunctionType({
         ..f,
         params: f.params.map(|p: Type| instantiated(p, by)),
-        ret: instantiated(f.ret, by),
+        return_type: instantiated(f.return_type, by),
       }),
     RecordType(fs) -> RecordType(fs.map(|f: Field| { ..f, ty: instantiated(f.ty, by) })),
     NominalType(x) ->
@@ -427,8 +444,8 @@ pub fn imported_target(
   }
 
 pub fn from_import(xs: List<Imported>, name: Bytes) -> Option<Imported> =
-  xs.fold(None, |acc: Option<Imported>, i: Imported|
-    if !i.whole && i.name == name { Some(i) } else { acc })
+  xs.fold(None, |accumulator: Option<Imported>, i: Imported|
+    if !i.whole && i.name == name { Some(i) } else { accumulator })
 
 pub fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
   match name.index_of(b"::") {
@@ -453,18 +470,18 @@ pub fn definitions_in(
   schemes: Map<Bytes, Scheme>,
   values: Map<Bytes, ConstantData>,
 ) -> List<Definition> =
-  m.items.fold([], |acc: List<Definition>, item: Item|
+  m.items.fold([], |accumulator: List<Definition>, item: Item|
     match item {
-      FunctionItem(d) -> acc.push(definition_entry(module, d, pure, schemes, values)),
-      _ -> acc,
+      FunctionItem(d) -> accumulator.push(definition_entry(module, d, pure, schemes, values)),
+      _ -> accumulator,
     })
 
 pub fn declared_effects(resolved: Resolution, operations: Operations) -> List<EffectName> =
-  range(0, resolved.declared.len()).fold([], |acc: List<EffectName>, j: Int|
+  range(0, resolved.declared.len()).fold([], |accumulator: List<EffectName>, j: Int|
     match resolved.declared.at(j) {
-      None -> acc,
+      None -> accumulator,
       Some(theirs) ->
-        theirs.effects.fold(acc, |a: List<EffectName>, b: Binding|
+        theirs.effects.fold(accumulator, |a: List<EffectName>, b: Binding|
           a.push({
             global: b.qualified,
             operations: match operations.get(b.qualified) { Some(xs) -> xs, None -> [] },
@@ -473,33 +490,33 @@ pub fn declared_effects(resolved: Resolution, operations: Operations) -> List<Ef
 
 pub type Operations = Map<Bytes, List<EffectOperation>>
 
-pub fn op_mode_of(o: OpInfo) -> EffectOperation =
+pub fn effect_operation_of(o: OperationInfo) -> EffectOperation =
   {
     name: o.name,
     mode: o.mode,
     params: o.params,
-    ret: o.ret,
-    own: own_type_parameters(o.scheme, o.params, o.ret),
+    return_type: o.return_type,
+    own: own_type_parameters(o.scheme, o.params, o.return_type),
   }
 
-fn own_type_parameters(scheme: Option<Scheme>, params: List<Type>, ret: Type) -> List<Int> =
+fn own_type_parameters(scheme: Option<Scheme>, params: List<Type>, result: Type) -> List<Int> =
   match scheme {
     Some(s) -> s.type_variables,
     None ->
-      params.push(ret).fold([], |acc: List<Int>, t: Type|
-        type_variables(t).fold(acc, |a: List<Int>, v: Int|
+      params.push(result).fold([], |accumulator: List<Int>, t: Type|
+        type_variables(t).fold(accumulator, |a: List<Int>, v: Int|
           if a.contains(v) { a } else { a.push(v) })),
   }
 
 pub fn checked_operations(effects: List<EffectInfo>) -> Operations =
-  effects.fold(Map::new(), |acc: Operations, e: EffectInfo|
-    acc.insert(e.name, e.operations.map(op_mode_of)))
+  effects.fold(Map::new(), |accumulator: Operations, e: EffectInfo|
+    accumulator.insert(e.name, e.operations.map(effect_operation_of)))
 
 pub fn published_operations(effects: List<EffectRow>) -> Operations =
-  effects.fold(Map::new(), |acc: Operations, e: EffectRow|
-    acc.insert(
+  effects.fold(Map::new(), |accumulator: Operations, e: EffectRow|
+    accumulator.insert(
       e.name,
-      e.operations.map(|o: OpRow|
+      e.operations.map(|o: OperationRow|
         {
           name: o.name,
           mode: match [ReadMode, WriteMode, RaiseMode].find(|m: Mode| mode_text(m) == o.mode) {
@@ -507,8 +524,8 @@ pub fn published_operations(effects: List<EffectRow>) -> Operations =
             None -> InvalidMode,
           },
           params: o.params,
-          ret: o.ret,
-          own: own_type_parameters(o.scheme, o.params, o.ret),
+          return_type: o.return_type,
+          own: own_type_parameters(o.scheme, o.params, o.return_type),
         }),
     ))
 
@@ -520,29 +537,37 @@ pub fn resolved_imports(
   definitions_of: (Bytes) -> List<Definition>,
   members: List<MemberSite>,
 ) -> List<Imported> / {abort.raise} = {
-  let written = range(0, x_module.imports.len()).fold([], |acc: List<Imported>, j: Int| {
-    let im = x_module.imports.get(j);
+  let written = range(0, x_module.imports.len()).fold([], |accumulator: List<Imported>, j: Int| {
+    let import_item = x_module.imports.get(j);
     let full = match resolved.imports.get(index).at(j) {
       Some(t) -> modules.get(t).name,
-      None -> bytes_join_dots(im.path.map(|i: Identifier| i.name)),
+      None -> bytes_join_dots(import_item.path.map(|i: Identifier| i.name)),
     };
-    match im.kind {
+    match import_item.kind {
       SelectedNames(ns) ->
-        ns.fold(acc, |a: List<Imported>, n: Identifier|
+        ns.fold(accumulator, |a: List<Imported>, n: Identifier|
           a.push({ name: n.name, module: full, definitions: definitions_of(full), whole: false })),
       WholeModule ->
-        acc.push({
-          name: match im.path.at(im.path.len() - 1) { Some(i) -> i.name, None -> b"" },
+        accumulator.push({
+          name: match import_item.path.at(import_item.path.len() - 1) {
+            Some(i) -> i.name,
+            None -> b"",
+          },
           module: full,
           definitions: definitions_of(full),
           whole: true,
         }),
       ModuleAlias(a2) ->
         implicitly_imported_by(a2.name).fold(
-          acc.push({ name: a2.name, module: full, definitions: definitions_of(full), whole: true }),
+          accumulator.push({
+            name: a2.name,
+            module: full,
+            definitions: definitions_of(full),
+            whole: true,
+          }),
           |a: List<Imported>, n: Bytes|
             match resolved.scopes.at(index) {
-              Some(sc) -> match lookup(sc.bound, ValueSpace, n) {
+              Some(module_scope) -> match lookup(module_scope.bound, ValueSpace, n) {
                 Some(b) -> if b.qualified != qualify(full, n) { a } else {
                   a.push({ name: n, module: full, definitions: definitions_of(full), whole: false })
                 },
@@ -553,11 +578,11 @@ pub fn resolved_imports(
         ),
     }
   });
-  let through = members.fold(written, |acc: List<Imported>, m: MemberSite|
+  let through = members.fold(written, |accumulator: List<Imported>, m: MemberSite|
     List::concat(
       match method_binder_module(m.qualifier) { Some(home) -> [home], None -> [] },
       m.imported_modules,
-    ).fold(acc, |a: List<Imported>, home: Bytes|
+    ).fold(accumulator, |a: List<Imported>, home: Bytes|
       match module_import(a, method_binder(home)) {
         Some(_) -> a,
         None ->
@@ -571,12 +596,12 @@ pub fn resolved_imports(
   match resolved.scopes.at(index) {
     None -> through,
     Some(scope) ->
-      scope.modules.fold(through, |acc: List<Imported>, mb: ModuleBinding|
-        match module_import(acc, mb.binder) {
-          Some(_) -> acc,
+      scope.modules.fold(through, |accumulator: List<Imported>, mb: ModuleBinding|
+        match module_import(accumulator, mb.binder) {
+          Some(_) -> accumulator,
           None -> {
             let full = modules.get(mb.target).name;
-            acc.push({
+            accumulator.push({
               name: mb.binder,
               module: full,
               definitions: definitions_of(full),
@@ -588,8 +613,8 @@ pub fn resolved_imports(
 }
 
 pub fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
-  xs.fold(None, |acc: Option<Imported>, i: Imported|
-    if i.whole && i.name == binder { Some(i) } else { acc })
+  xs.fold(None, |accumulator: Option<Imported>, i: Imported|
+    if i.whole && i.name == binder { Some(i) } else { accumulator })
 
 fn constructor_module_context(imports: List<Imported>, names: List<Bytes>) -> ModuleContext =
   {
@@ -615,7 +640,7 @@ fn constructor_module_context(imports: List<Imported>, names: List<Bytes>) -> Mo
 test "a builtin is typed by what the checker recorded where it called it, else by its declared scheme at the recorded type arguments" {
   let s = { ..constructor_module_context([], []), declared: declared_schemes() };
   let ints = list_type(int_type());
-  let len = Some({ params: [ints], ret: int_type() });
+  let len = Some({ params: [ints], result_type: int_type() });
   assert_eq(declared_call_types(s, b"List::len", [int_type()]), len);
   assert_eq(declared_call_types(s, b"List::len", []), None);
   assert_eq(declared_call_types(s, b"m.nothing", []), None);
@@ -623,14 +648,14 @@ test "a builtin is typed by what the checker recorded where it called it, else b
     builtin_call_types(s, Some(site_type(unknown_type(), [int_type()])), b"List::len"),
     len,
   );
-  let checked = fn_type([bytes_type()], int_type(), no_effects());
+  let checked = function_type([bytes_type()], int_type(), no_effects());
   assert_eq(
     builtin_call_types(s, Some(site_type(checked, [int_type()])), b"List::len"),
-    Some({ params: [bytes_type()], ret: int_type() }),
+    Some({ params: [bytes_type()], result_type: int_type() }),
   )
 }
 
-test "a bare constructor is the module's own, else an import's, else the prelude's; one through the prelude's binder is the prelude's alone" {
+test "a bare constructor name resolves to the module's own, else an import's, else the prelude's; a prelude-qualified name resolves only to the prelude's" {
   let names = [b"Less", b"Equal", b"lib.Equal", b"m.Box"];
   let by_name = { name: b"Equal", module: b"lib", definitions: [], whole: false };
   let whole = { name: b"lib", module: b"lib", definitions: [], whole: true };

@@ -313,8 +313,8 @@ fn encoded_unit() -> Bytes = match value::encode(VUnit) { Some(b) -> b, None -> 
 fn decoded_cases(bytes: Bytes) -> Option<List<ListedCase>> =
   match value::decode(bytes) {
     Some(VList(items)) ->
-      items.fold(Some([]), |acc: Option<List<ListedCase>>, item: Value|
-        match ((acc, item)) {
+      items.fold(Some([]), |accumulator: Option<List<ListedCase>>, item: Value|
+        match ((accumulator, item)) {
           (Some(xs), VRecord(fields)) -> match ((
               field_named(fields, "label"),
               field_named(fields, "identity"),
@@ -370,7 +370,7 @@ pub effect result_cache {
   write store_filing(filing: Filing) -> StoreResult
 }
 
-pub type LastPass = { test: Bytes, reached: ReachableHashes }
+pub type LastPass = { test: Bytes, reachable: ReachableHashes }
 
 pub type Usage = {
   duration_us: Int,
@@ -423,11 +423,15 @@ pub fn no_usage() -> Usage =
 pub fn joined_trace(a: Option<Bytes>, b: Option<Bytes>) -> Option<Bytes> =
   match ((a, b)) {
     (Some(x), Some(y)) -> if x == y { Some(x) } else {
-      let held = |m: Map<String, Bool>, t: Bytes|
+      let add_lines = |m: Map<String, Bool>, t: Bytes|
         String::of_bytes_lossy(t).split("\n").fold(m, |n: Map<String, Bool>, line: String|
           if line == "" { n } else { n.insert(line, true) });
-      let lines = held(held(Map::new(), x), y);
-      Some(Bytes::of_string(lines.keys().fold("", |acc: String, line: String| acc ++ line ++ "\n")))
+      let lines = add_lines(add_lines(Map::new(), x), y);
+      Some(
+        Bytes::of_string(
+          lines.keys().fold("", |accumulator: String, line: String| accumulator ++ line ++ "\n"),
+        ),
+      )
     },
     _ -> None,
   }
@@ -438,8 +442,10 @@ pub fn sum_usage(a: Usage, b: Usage) -> Usage =
     used_host: a.used_host || b.used_host,
     entries: a.entries + b.entries,
     performs: a.performs + b.performs,
-    teardown: b.teardown.fold(a.teardown, |acc: List<Diagnostic>, diagnostic: Diagnostic|
-      acc.push(diagnostic)),
+    teardown: b.teardown.fold(
+      a.teardown,
+      |accumulator: List<Diagnostic>, diagnostic: Diagnostic| accumulator.push(diagnostic),
+    ),
   }
 
 fn internal_error(message: String, labels: List<Label>, notes: List<String>) -> RuntimeDiagnostic =
@@ -447,21 +453,22 @@ fn internal_error(message: String, labels: List<Label>, notes: List<String>) -> 
 
 fn nothing_built() -> RuntimeDiagnostic =
   internal_error(
-    "a test was run in a unit built to run nothing, so no backend was compiled for it",
+    "a test was run, but the program was built without any code for running tests",
     [],
-    ["this is Ply's fault: the run named no test to run and the program ran one anyway"],
+    ["this is Ply's fault: the run named no test, yet the program ran a test anyway"],
   )
 
 fn no_test(index: Int, tests: Int) -> RuntimeDiagnostic =
   internal_error(
-    "no test at index " ++ index.to_string() ++ "; the program defines " ++ tests.to_string(),
+    "no test at index " ++ index.to_string() ++ "; the number of tests in the program is "
+      ++ tests.to_string(),
     [],
     ["this is Ply's fault, not the program's"],
   )
 
 fn not_compiled(root: String) -> RuntimeDiagnostic =
-  internal_error("the unit is entered at no `" ++ root ++ "`", [], [
-    "a unit holds every root it is offered, so this is the seam rather than the body",
+  internal_error("the compiled program has no entry point `" ++ root ++ "`", [], [
+    "a compiled program contains every entry point it is asked for, so this is a bug in Ply's test runner, not in the test",
     "this is Ply's fault, not the program's",
   ])
 
@@ -481,7 +488,8 @@ fn unexpected_result(root: String, bytes: Bytes) -> RuntimeDiagnostic =
   }
 
 fn leaked(unit: TestUnit, index: Int, n: Int) -> RuntimeDiagnostic = {
-  let left = n.to_string() ++ (if n == 1 { " object" } else { " objects" }) ++ " live as it ended";
+  let left = n.to_string() ++ (if n == 1 { " object" } else { " objects" })
+    ++ " not freed by the end of the test";
   match unit.tests.at(index) {
     Some(t) ->
       internal_error(
@@ -492,11 +500,11 @@ fn leaked(unit: TestUnit, index: Int, n: Int) -> RuntimeDiagnostic = {
             start: t.at.start,
             end: t.at.end,
             primary: true,
-            text: b"what this test made was not all let go",
+            text: b"this test did not free everything it created",
           },
         ],
         [
-          "Ply lets go of every value once nothing holds it, so a value left live leaked",
+          "Ply frees every value once nothing refers to it, so a value that was not freed is a leak",
           "this is Ply's fault, not the program's",
         ],
       ),
@@ -526,13 +534,13 @@ fn panicked(unit: TestUnit, index: Int, message: String) -> RuntimeDiagnostic =
     None -> internal_error("test " ++ index.to_string() ++ " panicked: " ++ message, [], []),
   }
 
-test "two runs' traces join into every line either read, in a trace's order" {
+test "`joined_trace` merges the trace lines of two runs, sorted and without duplicates, and gives `None` if either trace is missing" {
   assert_eq(joined_trace(Some(b"b\ty\n"), Some(b"a\tx\nb\ty\n")), Some(b"a\tx\nb\ty\n"));
   assert_eq(joined_trace(Some(b""), Some(b"")), Some(b""));
   assert_eq(joined_trace(Some(b"a\tx\n"), None), None)
 }
 
-test "a run is abandoned by its clock, panics by Ply's defect, and fails by the program's" {
+test "`status_of` maps a timeout diagnostic to `timed_out`, internal-error diagnostics to `panicked`, and program errors to `failed`" {
   let d = |code: String| diagnostic_of("error", code, "x", [], []);
   assert_eq(status_of(d("W0612")), "timed_out");
   assert_eq(status_of(d("E0505")), "panicked");
@@ -540,7 +548,7 @@ test "a run is abandoned by its clock, panics by Ply's defect, and fails by the 
   assert_eq(status_of(d("E0502")), "failed")
 }
 
-test "a test borrows its roots, its programs and no command line" {
+test "a test gets the `--allow` and `--fs` permissions from its command line, but no program arguments" {
   let o = options_from(parsed(["test", "--allow", "machine", "--fs", "cwd=."])).machine;
   let borrowed = grants_of(o, machine::empty_configuration());
   assert(borrowed.spawning);
@@ -569,7 +577,7 @@ fn returned_leaving(live: Int) -> entering::Outcome =
     trace: None,
   }
 
-test "a test that returned but left objects of its own live is an internal error, saying how many" {
+test "a test that returns while still leaving objects allocated is reported as an internal error that gives the number of leaked objects" {
   let unit = empty_test_unit(start_run(options_from(parsed(["test"]))));
   assert_eq(failure_of(unit, returned_leaving(0), "m.t", 0), None);
   match failure_of(unit, returned_leaving(2), "m.t", 0) {
@@ -579,7 +587,9 @@ test "a test that returned but left objects of its own live is an internal error
         "E0505",
       ]);
       assert(
-        String::of_bytes_lossy(f.failure.diagnostic.message).contains("left 2 objects live"),
+        String::of_bytes_lossy(f.failure.diagnostic.message).contains(
+          "left 2 objects not freed by the end of the test",
+        ),
         None,
       )
     },
@@ -587,7 +597,7 @@ test "a test that returned but left objects of its own live is an internal error
   }
 }
 
-test "a listing's result reads as its cases, and anything else as none" {
+test "`decoded_cases` returns the cases from a test-listing result, and `None` for any other value" {
   let listed = VList([
     VRecord([
       { name: "identity", value: VBytes(b"one") },

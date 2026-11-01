@@ -1,14 +1,9 @@
-//! Runs the compiler's and the CLI's own code in the test's process: `in_memory` over a tree held
-//! as a value, `on_disk` over the working directory, and `load_program` for a program a test
-//! enters. Each is slower per command than a spawned `ply`, whose compiler is an optimized build,
-//! but runs alongside other tests and is cached until the code it reaches moves. `on_disk` and
-//! `in_memory` reject a command that compiles the program, which `tests/cli` starts as a process.
-
 import spawning.harness (Repo, RunResult, Source, WorkingDirectory, agreeing, at, bodies_dir,
                          checking, diagnostic, environment, exists, failed, first, int, items,
                          joined, json_of, manifest, not_ok, own_modules, parent, path, read,
                          repo_file, reused_dir, scratch_marker, send, sources_here, spawned,
-                         stable_report, str, var_of, working_directory, write, write_project)
+                         stable_report, str, variable_value, working_directory, write,
+                         write_project)
 import cli.ply (main)
 import cli.paths
 import cli.program (packages_of)
@@ -42,8 +37,8 @@ import std.net
 import std.net (net)
 import std.os
 import std.random (entropy)
-import std.process (process, Var, FakeProcess, captured, args_step, out_step, err_step, exit_step,
-                    with_input, line_step, Line)
+import std.process (process, EnvironmentVariable, FakeProcess, captured, args_step, out_step,
+                    err_step, exit_step, with_input, line_step, Line)
 import std.term (term)
 import std.time (time)
 import std.value (Value)
@@ -54,7 +49,6 @@ import std.string
 fn captured_result(c: FakeProcess) -> RunResult =
   { out: c.out, err: c.err, code: match c.code { Some(n) -> n, None -> 0 } }
 
-/// Whether the program in the working directory compiles and its unit opens.
 pub fn loads_here() -> Bool / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
   match library_here() {
     Err(_) -> false,
@@ -67,16 +61,12 @@ pub fn loads_here() -> Bool / {WorkingDirectory, Shipped, entering::machine.open
     },
   }
 
-/// What the first of `diagnostics` says, for a test that stops where a step it relies on failed.
 pub fn first_message(diagnostics: List<Diagnostic>) -> String =
   match diagnostics { [d, ..] -> String::of_bytes_lossy(d.message), [] -> "no diagnostic" }
 
-/// The library the program in the working directory compiles to, and its front end.
 pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {WorkingDirectory, Shipped, abort.raise} =
   match library_here() { Err(reason) -> panic(reason), Ok(c) -> c }
 
-/// The library the program in the working directory compiles to under the development profile, its
-/// unit's C stored in the toolchain's cache, and its front end; or why it did not load or compile.
 fn library_here() -> Result<{ front: load::LoadedAnalysis, library: String }, String> / {WorkingDirectory, Shipped, abort.raise} =
   match load::load[cwd](".") {
     Err(diagnostics) -> Err("the program loads: " ++ first_message(diagnostics)),
@@ -89,8 +79,6 @@ fn library_here() -> Result<{ front: load::LoadedAnalysis, library: String }, St
     },
   }
 
-/// The program in the working directory compiled, its unit opened, and the binding `options` grant
-/// it: what a test enters the program's definitions on.
 pub type LoadedProgram = {
   unit_handle: Int,
   roots: Map<Bytes, ModuleSpan>,
@@ -98,7 +86,6 @@ pub type LoadedProgram = {
   options: Options,
 }
 
-/// The program in the working directory, bound as `options` grant it.
 pub fn load_program(
   options: Options,
 ) -> LoadedProgram / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.bind, abort.raise} = {
@@ -124,7 +111,6 @@ pub fn load_program(
   }
 }
 
-/// The binding torn down and the unit closed, as a test that is done with them leaves them.
 pub fn unload_program(
   l: LoadedProgram,
 ) -> List<entering::Report> / {entering::machine.unbind, entering::machine.close} = {
@@ -133,8 +119,6 @@ pub fn unload_program(
   reports
 }
 
-/// `inner.<entry>` entered at `args` under the binding, bounded as the options say: how it ended
-/// and what it used.
 pub fn enter(
   l: LoadedProgram,
   entry: String,
@@ -147,7 +131,6 @@ pub fn enter(
     timeout_ms: l.options.timeout,
   })
 
-/// What `inner.<entry>` returned, or what it raised.
 pub fn call(
   l: LoadedProgram,
   entry: String,
@@ -158,7 +141,6 @@ pub fn call(
     Err(r) -> Err(diagnostic::shown(r)),
   }
 
-/// [`call`], where a raise is the test's failure.
 pub fn call_value(
   l: LoadedProgram,
   entry: String,
@@ -169,48 +151,38 @@ pub fn call_value(
     Err(d) -> panic("`" ++ entry ++ "` returns: " ++ String::of_bytes_lossy(d.message)),
   }
 
-/// What the repository's `ply.work` states: where each of its packages lies.
 pub fn workspace() -> Workspace / {Repo, abort.raise} =
   match pkg::check_workspace(Bytes::of_string(repo_file(library::workspace_file()))).workspace {
     Some(w) -> w,
     None -> panic("the repository's `" ++ library::workspace_file() ++ "` checks"),
   }
 
-/// Where the repository's `ply.work` places `ply`'s parts, each directory below the repository.
 pub fn toolchain_parts() -> ToolchainParts / {Repo, abort.raise} =
   match workspace().toolchain {
     Some(t) -> t,
     None -> panic("the repository's `" ++ library::workspace_file() ++ "` names the toolchain"),
   }
 
-/// The `ply.pkg` of the repository's package at `dir`.
 fn manifest_at(dir: String) -> Manifest / {Repo, abort.raise} =
   match pkg::check_manifest(Bytes::of_string(repo_file(dir ++ "/ply.pkg"))).manifest {
     Some(m) -> m,
     None -> panic("`" ++ dir ++ "/ply.pkg` checks"),
   }
 
-/// The name the package at `dir`, below the repository, gives itself.
 pub fn package_name(dir: String) -> String / {Repo, abort.raise} = manifest_at(dir).name
 
-/// The directory below the repository of the package `ply.work` lists whose `ply.pkg` names it
-/// `name`.
 pub fn package_dir(name: String) -> String / {Repo, abort.raise} =
   match workspace().packages.filter(|dir: String| package_name(dir) == name) {
     [dir, ..] -> dir,
     [] -> panic("`ply.work` lists no package named `" ++ name ++ "`"),
   }
 
-/// The working directory's program checked as it stands, through its memo store.
 pub fn warm_check_report() -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   stable_report(json_of(on_disk(checking())))
 
-/// The same sources checked from nothing: in memory, beside no cache.
 pub fn cold_check_report() -> Json / {Hermetic, Shipped, WorkingDirectory, abort.raise, diverges} =
   stable_report(json_of(in_memory(tree(sources_here()), checking())))
 
-/// A check through the memo store returns what a cold check of the same sources does. The warm run
-/// goes first, so the store it reads is the one the last step left.
 pub fn warm_matches_cold(
   what: String,
 ) -> Json / {CliEffects, Hermetic, Shipped, abort.raise, diverges} = {
@@ -219,35 +191,27 @@ pub fn warm_matches_cold(
   agreeing(what, warm, cold)
 }
 
-/// How many modules a check took as the memo store cached them, how many it checked again, and how
-/// many of the modules it loaded ship with the toolchain, which supplies them.
 pub type ModuleReuse = { cached: Int, checked: Int, shipped: Int }
 
 pub fn module_reuse() -> ModuleReuse / {CliEffects, Shipped, abort.raise, diverges} =
   module_reuse_at(".")
 
-/// The same of the project at `dir`.
 pub fn module_reuse_at(dir: String) -> ModuleReuse / {CliEffects, Shipped, abort.raise, diverges} = {
   let report = json_of(on_disk(["check", dir, "--json", "--explain"]));
   let shipped = items(at(report, "modules")).len() - own_modules(report).len();
   items(path(report, ["front_end", "queries"])).fold(
     { cached: 0, checked: 0, shipped: shipped },
-    |acc: ModuleReuse, q: Json|
+    |accumulator: ModuleReuse, q: Json|
       if str(at(q, "query")) == "module" {
-        { ..acc, cached: int(at(q, "taken")), checked: int(at(q, "run")) }
-      } else { acc },
+        { ..accumulator, cached: int(at(q, "taken")), checked: int(at(q, "run")) }
+      } else { accumulator },
   )
 }
 
-/// A package as its manifest declares it: its prefix and the prefixes it depends on.
 pub type Package = { prefix: String, dependencies: List<String> }
 
-/// The package closure of a directory, the root first, and the directory each package of it was
-/// read from, the root's first.
 pub type PackageClosure = { packages: List<Package>, dirs: List<String> }
 
-/// `dir`'s packages as `ply` walks them and the compiler's manifest rules resolve them, no module
-/// checked.
 pub fn manifest_closure(dir: String) -> PackageClosure / {CliEffects, abort.raise, diverges} = {
   let pwd = working_directory();
   handle {
@@ -262,7 +226,7 @@ pub fn manifest_closure(dir: String) -> PackageClosure / {CliEffects, abort.rais
         { prefix: String::of_bytes(p.prefix), dependencies: p.dependencies.map(String::of_bytes) }),
       dirs: packages.supplied.fold(
         [String::of_bytes(packages.root)],
-        |acc: List<String>, s: SuppliedPackage| acc.push(String::of_bytes(s.root)),
+        |accumulator: List<String>, s: SuppliedPackage| accumulator.push(String::of_bytes(s.root)),
       ),
     }
   } with {
@@ -271,8 +235,6 @@ pub fn manifest_closure(dir: String) -> PackageClosure / {CliEffects, abort.rais
   }
 }
 
-/// The shipped modules as the launcher lays them out, one flat directory of `<dotted name>.ply`,
-/// with each module of `overrides` this binary does not ship among them.
 fn shipped_listing_with(overrides: List<Source>) -> Option<List<fs::Listed>> / {Shipped} =
   Some(
     overrides.fold(
@@ -288,20 +250,20 @@ fn shipped_listing_with(overrides: List<Source>) -> Option<List<fs::Listed>> / {
 
 fn listed_file(name: String) -> fs::Listed = { name: name, kind: File }
 
-/// The shipped files `own` lists (`digests`) with `overrides` in their place: each by its name, a
-/// space and its digest in hex, a line each, ascending.
 fn digests_with_overrides(overrides: List<Source>, own: Bytes) -> Bytes / {abort.raise} = {
-  let listed = own.split(b"\n").fold(Map::new(), |acc: Map<Bytes, Bytes>, line: Bytes|
-    match line.index_of(b" ") { Some(at) -> acc.insert(line.slice(0, at), line), None -> acc });
-  let over = overrides.fold(listed, |acc: Map<Bytes, Bytes>, source: Source| {
+  let listed = own.split(b"\n").fold(Map::new(), |accumulator: Map<Bytes, Bytes>, line: Bytes|
+    match line.index_of(b" ") {
+      Some(at) -> accumulator.insert(line.slice(0, at), line),
+      None -> accumulator,
+    });
+  let over = overrides.fold(listed, |accumulator: Map<Bytes, Bytes>, source: Source| {
     let name = Bytes::of_string(source.path);
     let digest = Bytes::of_string(source.text).blake3().hex_of();
-    acc.insert(name, Bytes::concat_all([name, b" ", Bytes::of_string(digest)]))
+    accumulator.insert(name, Bytes::concat_all([name, b" ", Bytes::of_string(digest)]))
   });
   Bytes::concat_all(over.values().map(|line: Bytes| line.concat(b"\n")))
 }
 
-/// Every shipped module, by the name it is stored under.
 pub fn shipped_sources() -> List<Source> / {Shipped, abort.raise} =
   shipped.names().map(|n: String|
     {
@@ -309,9 +271,6 @@ pub fn shipped_sources() -> List<Source> / {Shipped, abort.raise} =
       text: match shipped.module(n) { Some(b) -> String::of_bytes(b), None -> "" },
     })
 
-/// This binary's stamps, its program's definitions and its shipped files' digests, so a store made
-/// in process and one a spawned `ply` files agree; a module as `<name>.ply`; and a data file one
-/// embeds, which lies below them under its own name.
 fn shipped_file(name: String) -> Option<Bytes> / {Shipped, abort.raise} =
   if name == "stamps" { Some(Bytes::of_string(shipped.stamps())) }
   else if name == "definitions" { Some(shipped.definitions()) }
@@ -320,40 +279,31 @@ fn shipped_file(name: String) -> Option<Bytes> / {Shipped, abort.raise} =
   else if name.contains("/") { shipped.module(name) }
   else { None }
 
-/// The module a `.ply` file of a tree is under `prefix`, named by its place there: `hash/legacy.ply`
-/// of the standard library's tree is `std.hash.legacy`.
 pub fn module_in(prefix: String, file: String) -> String / {abort.raise} =
   match module_of(file) {
     Ok(name) -> prefix ++ name,
     Err(reason) -> panic("`" ++ file ++ "` cannot be a module: " ++ reason),
   }
 
-/// The file of a tree that holds the module `name` below `prefix`, the inverse of `module_in`.
 fn file_in(prefix: String, name: String) -> String / {abort.raise} =
   String::join(name.slice(prefix.len(), name.len()).split("."), "/") ++ ".ply"
 
-/// The trees the shipped modules are built from, which `shipped_drift` holds the binary to.
 pub fn std_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../packages/std")
 
-/// A standard library module under its name in a program.
-pub type ShippedModule = { module: String, src: Bytes }
+pub type ShippedModule = { module: String, source: Bytes }
 
-/// Each module of the standard library's tree: a table whose cases each read one module, so an
-/// edit of one moves no other's.
 pub fn std_modules() -> List<ShippedModule> / {abort.raise} =
-  std_tree().fold([], |acc: List<ShippedModule>, f: { name: String, bytes: Bytes }|
-    if !f.name.ends_with(".ply") { acc }
-    else { acc.push({ module: module_in("std.", f.name), src: f.bytes }) })
+  std_tree().fold([], |accumulator: List<ShippedModule>, f: { name: String, bytes: Bytes }|
+    if !f.name.ends_with(".ply") { accumulator }
+    else { accumulator.push({ module: module_in("std.", f.name), source: f.bytes }) })
 
-/// The compiler's tree, which `ply` ships beside the standard library's.
 pub fn compiler_tree() -> List<{ name: String, bytes: Bytes }> =
   embed_dir("../../packages/compiler")
 
-/// Each module of the compiler's tree, which `ply` ships beside the standard library.
 pub fn compiler_modules() -> List<ShippedModule> / {abort.raise} =
-  compiler_tree().fold([], |acc: List<ShippedModule>, f: { name: String, bytes: Bytes }|
-    if !f.name.ends_with(".ply") { acc }
-    else { acc.push({ module: module_in("compiler.", f.name), src: f.bytes }) })
+  compiler_tree().fold([], |accumulator: List<ShippedModule>, f: { name: String, bytes: Bytes }|
+    if !f.name.ends_with(".ply") { accumulator }
+    else { accumulator.push({ module: module_in("compiler.", f.name), source: f.bytes }) })
 
 fn tree_of(
   name: String,
@@ -363,7 +313,6 @@ fn tree_of(
     Some({ file: file_in("compiler.", name), files: compiler_tree() })
   } else { None }
 
-/// The prelude's text, `std.prelude` as the standard library's tree holds it.
 pub fn prelude_file() -> Bytes = embed("../../packages/std/prelude.ply")
 
 fn tree_module(name: String) -> Option<Bytes> / {abort.raise} =
@@ -375,32 +324,26 @@ fn tree_module(name: String) -> Option<Bytes> / {abort.raise} =
     },
   }
 
-/// The data files the standard library's tree holds for its modules to embed, each by the name the
-/// shipped modules hold it under: every file of the tree that is no module.
 pub fn std_data() -> List<{ name: String, bytes: Bytes }> =
   std_tree().filter(|f: { name: String, bytes: Bytes }| !f.name.ends_with(".ply")).map(
     |f: { name: String, bytes: Bytes }| { name: "std/" ++ f.name, bytes: f.bytes },
   )
 
-/// Whether the binary must ship the file it names `name` (`<module>.ply`, or `std/<path>` for a data
-/// file) as the trees hold it: each of the compiler's, as CI's toolchain key holds them. A pull
-/// request that changes only the library runs on a binary main bootstrapped, which ships the library
-/// as main held it, all but what the compiler embeds of it.
 pub fn is_compiler_module(name: String) -> Bool = name.starts_with("compiler.")
 
-/// Each module or data file of those `is_compiler_module` names that the binary ships other than as its
-/// tree holds it, and each such module a tree holds that the binary lacks.
 pub fn shipped_drift() -> List<String> / {Shipped, abort.raise} = {
   let named = shipped.names().filter(|n: String| is_compiler_module(n ++ ".ply"));
   let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
     files.filter(|f: { name: String, bytes: Bytes }| f.name.ends_with(".ply")).map(
       |f: { name: String, bytes: Bytes }| module_in(prefix, f.name) ++ ".ply",
     );
-  let held = modules("std.", std_tree()).concat(modules("compiler.", compiler_tree())).filter(
+  let tree_modules = modules("std.", std_tree()).concat(
+    modules("compiler.", compiler_tree()),
+  ).filter(
     is_compiler_module,
   );
   named.filter(|n: String| shipped.module(n) != tree_module(n)).concat(
-    held.filter(|h: String| named.filter(|n: String| n ++ ".ply" == h).len() == 0),
+    tree_modules.filter(|h: String| named.filter(|n: String| n ++ ".ply" == h).len() == 0),
   ).concat(
     std_data().filter(|d: { name: String, bytes: Bytes }|
       is_compiler_module(d.name) && shipped.module(d.name) != Some(d.bytes)).map(
@@ -409,14 +352,16 @@ pub fn shipped_drift() -> List<String> / {Shipped, abort.raise} = {
   )
 }
 
-/// What a bootstrap lists of the files `is_compiler_module` names as the trees hold them, as a binary
-/// that ships them lists its shipped files (`digests`).
 pub fn tree_digests() -> Bytes / {abort.raise} = {
   let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
-    files.fold([], |acc: List<ShippedFile>, f: { name: String, bytes: Bytes }|
+    files.fold([], |accumulator: List<ShippedFile>, f: { name: String, bytes: Bytes }|
       if f.name.ends_with(".ply") {
-        acc.push({ name: module_in(prefix, f.name) ++ ".ply", path: f.name, bytes: f.bytes })
-      } else { acc });
+        accumulator.push({
+          name: module_in(prefix, f.name) ++ ".ply",
+          path: f.name,
+          bytes: f.bytes,
+        })
+      } else { accumulator });
   digests_of(
     modules("std.", std_tree()).concat(modules("compiler.", compiler_tree())).concat(
       std_data().map(|d: { name: String, bytes: Bytes }|
@@ -425,7 +370,6 @@ pub fn tree_digests() -> Bytes / {abort.raise} = {
   )
 }
 
-/// The lines of a binary's shipped digests (`digests`) for the files `is_compiler_module` names.
 pub fn compiler_digests(digests: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all(
     digests.split(b"\n").filter(|line: Bytes|
@@ -437,13 +381,10 @@ pub fn compiler_digests(digests: Bytes) -> Bytes / {abort.raise} =
 
 pub fn version() -> String / {Shipped} = shipped.version()
 
-/// The packages below the repository that the `ply.pkg` at `dir` names by a path.
 fn path_dependencies(dir: String) -> List<String> / {Repo, abort.raise} =
-  manifest_at(dir).dependencies.fold([], |acc: List<String>, d: Dependency|
-    match d.source { Path(p) -> acc.push(normalize(join(dir, p))), _ -> acc })
+  manifest_at(dir).dependencies.fold([], |accumulator: List<String>, d: Dependency|
+    match d.source { Path(p) -> accumulator.push(normalize(join(dir, p))), _ -> accumulator })
 
-/// The packages the `ply` program run in this process is built from, beside the shipped modules it
-/// is handed: the program's own and each its `ply.pkg` reaches by a path, below the repository.
 pub fn program_packages() -> List<String> / {Repo, abort.raise} =
   iterate(
     { todo: [toolchain_parts().cli], seen: [] },
@@ -456,60 +397,49 @@ pub fn program_packages() -> List<String> / {Repo, abort.raise} =
       },
   )
 
-/// Every tree a `ply` binary ships: the shipped modules' and the program's.
 pub fn shipped_dirs() -> List<String> / {Repo, abort.raise} = {
   let t = toolchain_parts();
   [t.std, t.compiler].concat(program_packages())
 }
 
-/// A tree whose working directory holds `files`. Its root is the filesystem's and the working
-/// directory is `/w`, so a test can place a file beside the project as well as in it.
 pub fn tree(files: List<Source>) -> MemFs / {abort.raise} =
   files.fold(fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, source: Source| {
     let at = "w/" ++ source.path;
     fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, Bytes::of_string(source.text)).fs
   })
 
-/// A tree whose working directory holds one module, `m.ply`.
 pub fn one_module_tree(text: String) -> MemFs / {abort.raise} =
   tree([{ path: "m.ply", text: text }])
 
-/// What a file under a tree's working directory holds, as text.
 pub fn file_of(t: MemFs, path: String) -> Option<String> / {abort.raise} =
   match fs::mem_read(t, to_tree_path(path)) { Some(b) -> Some(String::of_bytes(b)), None -> None }
 
-/// What a run in memory said, and the tree it left.
 pub type RunWithTree = { ran: RunResult, tree: MemFs }
 
-/// `ply` over `t`, nothing leaving the tree: its result is a function of the tree and the line.
 pub fn in_memory(
   t: MemFs,
   argv: List<String>,
 ) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
   in_memory_with_tree(t, argv, [], None).ran
 
-/// `stdin` is what `ply replace` reads when no `--with` names a file.
 pub fn in_memory_with_tree(
   t: MemFs,
   argv: List<String>,
-  vars: List<Var>,
+  environment: List<EnvironmentVariable>,
   stdin: Option<String>,
 ) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} = {
-  let o = over_tree(t, || on_disk_with(argv, vars, stdin));
+  let o = over_tree(t, || on_disk_with(argv, environment, stdin));
   { ran: o.value, tree: o.tree }
 }
 
-/// Written out, so an operation `main` gains and `over_tree` misses is a type error, not a disk read.
 pub effect set CliEffects = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], entering::machine.read, entering::machine.write, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
 
 pub effect set Hermetic = {entering::hermetic_machine.read, entering::hermetic_machine.write}
 
-/// Where a run reads the shipped modules, which the harness stores in memory and on disk alike.
 pub effect set Shipped = {shipped.module, shipped.read_pack, shipped.digests, shipped.names, shipped.report_view_used, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.run_root}
 
 pub type WithTree<a> = { value: a, tree: MemFs }
 
-/// `body` over `t`: clock stopped, entropy counted, families handled by their hermetic halves.
 pub fn over_tree<a | e>(
   t: MemFs,
   body: () -> a / {CliEffects | e},
@@ -784,7 +714,7 @@ pub fn over_tree<a | e>(
     time.elapsed_us() -> 0,
     time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
     process.bound[git]() -> false,
-    process.spawn[git](args, dir, vars) -> panic(unavailable_in_memory("`git`")),
+    process.spawn[git](args, dir, variables) -> panic(unavailable_in_memory("`git`")),
     entering::machine.open(library) -> entering::hermetic_machine.open(library),
     entering::machine.bind(grants) -> entering::hermetic_machine.bind(grants),
     entering::machine.enter(unit, root, arguments, run) ->
@@ -804,22 +734,17 @@ pub fn over_tree<a | e>(
     return value -> { value: value, tree: disk },
   }
 
-/// A test's working directory held in memory for its whole body, holding the scratch marker.
 pub fn scratch<| e>(body: () -> Unit / {CliEffects | e}) -> Unit / {abort.raise, Hermetic | e} =
   over_tree(tree([{ path: scratch_marker(), text: "" }]), body).value
 
 fn unavailable_in_memory(what: String) -> String =
   "a run in memory reaches no " ++ what ++ "; run this test against the disk, as `test/nondet`"
 
-/// A working-directory path as the tree spells it, and one the tree spelled as the working
-/// directory's.
 fn to_tree_path(p: String) -> String = joined("w", p)
 
 fn from_tree_path(p: String) -> String / {abort.raise} =
   if p == "w" { "." } else if p.starts_with("w/") { p.slice(2, p.len()) } else { p }
 
-/// The lines a test's standard input holds, as a console hands them over: empty when it hands in
-/// none, and a last line is one whether or not a newline ends it.
 fn input_lines(stdin: Option<String>) -> List<String> =
   match stdin {
     None -> [],
@@ -827,13 +752,12 @@ fn input_lines(stdin: Option<String>) -> List<String> =
       let lines = text.split("\n");
       let last = lines.len() - 1;
       if lines.at(last) == Some("") {
-        range(0, last).fold([], |acc: List<String>, i: Int|
-          match lines.at(i) { Some(l) -> acc.push(l), None -> acc })
+        range(0, last).fold([], |accumulator: List<String>, i: Int|
+          match lines.at(i) { Some(l) -> accumulator.push(l), None -> accumulator })
       } else { lines }
     },
   }
 
-/// The command `path` names, as the surface declares it.
 fn declared_command(root: command_line::Command, path: List<String>) -> Option<command_line::Body> =
   path.fold(Some(command_line::body(root)), |at: Option<command_line::Body>, word: String|
     match at {
@@ -847,25 +771,18 @@ fn declared_command(root: command_line::Command, path: List<String>) -> Option<c
 
 fn surface() -> command_line::Spec = spec("0.0.0-test")
 
-/// The commands that compile the program they are handed. A test starts these as a process: in this
-/// one, each would compile with the suite's own copy of the compiler and cache no emitter output.
 fn compiling() -> List<String> = ["attest", "build", "prove", "review", "run", "test"]
 
-/// Why `ply ARGV` may not run in this process, as a test failure says it.
 fn not_here(argv: List<String>, what: String) -> String =
   "`ply " ++ String::join(argv, " ") ++ "` " ++ what
     ++ ": start it with `spawned`, in a `test/nondet` over the working directory"
 
-/// Whether `argv` runs a command that compiles the program.
 fn compiles(argv: List<String>) -> Bool / {abort.raise} =
   match command_line::parse(surface(), argv) {
     command_line::Run(p) -> match p.path { [word, ..] -> compiling().contains(word), [] -> false },
     _ -> false,
   }
 
-/// `argv` naming the working directory where it leaves its path off. A test's tree is a directory
-/// of modules that no package holds: a program when a line names it, and nothing to find when one
-/// does not.
 fn with_default_path(argv: List<String>) -> List<String> / {abort.raise} = {
   let surface = surface();
   let left_off = match command_line::parse(surface, argv) {
@@ -887,49 +804,35 @@ fn with_default_path(argv: List<String>) -> List<String> / {abort.raise} = {
   }
 }
 
-/// `ply` in the working directory, bound as the launcher binds it: `cwd` and `abs` are the run's
-/// own roots and every family a command drives a machine with is granted by `--allow`. The streams,
-/// the environment, the text `ply replace` reads and the shipped modules are the harness's. The
-/// command is this suite's own copy of the CLI, which rejects a command that compiles the program:
-/// that runs under `spawned`.
 pub fn on_disk(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
   on_disk_with(argv, [], None)
 
-/// `stdin` is what `ply replace` reads when no `--with` names a file.
 pub fn on_disk_with(
   argv: List<String>,
-  vars: List<Var>,
+  variables: List<EnvironmentVariable>,
   stdin: Option<String>,
 ) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
-  on_disk_with_overrides(argv, vars, stdin, [])
+  on_disk_with_overrides(argv, variables, stdin, [])
 
-/// `ply` handed shipped modules in which each of `shipped`, named as stored, stands in for the
-/// module or data file this binary ships, or is one more: what a compiler that shipped those would
-/// have run. A module is stored as `<name>.ply` and a data file under its own name. No built `ply`
-/// ships them, so this runs any command, one that compiles the program included.
 pub fn on_disk_shipping(
   argv: List<String>,
   shipped: List<Source>,
 ) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
   on_disk_with_overrides(argv, [], None, shipped)
 
-/// `ply` handed `shipped` as every module it ships and every data file one of them embeds, beside
-/// `std.prelude`, which every module imports: what a compiler that shipped those and no other
-/// would have run, so a run over all of them costs what they cost.
 pub fn on_disk_shipping_only(
   argv: List<String>,
   shipped: List<Source>,
 ) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
   on_disk_with_overrides(argv, [], None, with_prelude_shipped(shipped), true)
 
-/// `modules` with the toolchain's `std.prelude` past them where they hold none.
 pub fn with_prelude_shipped(modules: List<Source>) -> List<Source> / {abort.raise} =
   if modules.any(|s: Source| s.path == "std.prelude.ply") { modules }
   else { modules.push({ path: "std.prelude.ply", text: String::of_bytes(prelude_file()) }) }
 
 fn on_disk_with_overrides(
   argv: List<String>,
-  vars: List<Var>,
+  variables: List<EnvironmentVariable>,
   stdin: Option<String>,
   overrides: List<Source>,
   only: Bool = false,
@@ -952,16 +855,13 @@ fn on_disk_with_overrides(
       io = if to_stderr { err_step(io, line) } else { out_step(io, line) };
     },
     process.exit[proc](code) resume k -> captured_result(exit_step(io, code)),
-    env.variable(name) -> var_of(vars, name),
-    env.variables() -> vars,
+    env.variable(name) -> variable_value(variables, name),
+    env.variables() -> variables,
     term.is_terminal(_) -> false,
-    // A check compiles what it evaluates, too: a literal's parser or a statement. A library deriver
-    // is compiled once into the toolchain's cache, wherever it runs, so it is no exception.
     entering::machine.open(library) -> if rejecting {
       panic(not_here(argv, "compiled the program to run it"))
     } else { entering::machine.open(library) },
     shipped.version() -> version(),
-    // No binary is measured: which one runs a test is no part of what it asserts.
     shipped.binary_size() -> None,
     env.working_directory() -> pwd,
     toolchain.reuse_dir() -> pwd ++ "/" ++ reused_dir(),
@@ -983,7 +883,6 @@ fn on_disk_with_overrides(
         Some(digests_with_overrides(overrides, if only { b"" } else { shipped.digests() }))
       } else { shipped_file(name) },
     },
-    // What a build checks its printed closure against is asked of the binary by name.
     shipped.names() -> if only {
       overrides.filter(|source: Source|
         source.path.ends_with(".ply") && !source.path.contains("/")).map(|source: Source|

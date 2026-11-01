@@ -1,5 +1,3 @@
-//! The process's pools a native's job runs on, each job its run's.
-
 use ply_core::{HostRuntime, Pending, Span, codes};
 use ply_host::jobs::{self, Work};
 use ply_host::registry::{facilities_of, job_bytes, run_of, unbound};
@@ -21,10 +19,9 @@ fn submitted(
     jobs::submit(work, run, Span::DUMMY, "test", what, job).expect("a thread is had")
 }
 
-/// A run no host was bound for waits on its natives' jobs through a host of its own, and a bound
-/// host's runtime waits on its own the same way.
 #[test]
-fn a_jobs_ticket_is_resolved_through_an_unbound_runtime_and_a_hosts() {
+fn a_submitted_job_returns_its_result_on_a_runtime_made_by_a_factory_and_on_a_runtime_made_by_a_host()
+ {
     let unbound = unbound()();
     for work in [Work::Computing, Work::Waiting] {
         let ticket = submitted(&*unbound, work, "a test job", || Ok(b"answered".to_vec()));
@@ -35,9 +32,9 @@ fn a_jobs_ticket_is_resolved_through_an_unbound_runtime_and_a_hosts() {
     assert_eq!(returned(&*host, &ticket), [1, 2, 3]);
 }
 
-/// The run's scheduler waits on a ticket it watches and takes its result once it is resolved.
 #[test]
-fn a_watched_ticket_is_returned_to_the_run_that_watched_it() {
+fn a_finished_job_is_listed_as_returned_by_the_run_that_watches_it_and_the_run_can_then_take_its_result()
+ {
     let runtime = ply_host::Host::new().runtime();
     let ticket = submitted(&*runtime, Work::Waiting, "a test job", || {
         Ok(b"late".to_vec())
@@ -54,9 +51,8 @@ fn a_watched_ticket_is_returned_to_the_run_that_watched_it() {
     );
 }
 
-/// A job that returns why it failed fails the run that waits on it, naming what asked.
 #[test]
-fn a_failed_job_is_a_diagnostic_naming_what_asked_for_it() {
+fn a_failed_job_returns_a_diagnostic_naming_the_operation_that_submitted_it() {
     let runtime = ply_host::Host::new().runtime();
     let ticket = submitted(&*runtime, Work::Computing, "`kdf.argon2`", || {
         Err("no memory to be had".to_string())
@@ -69,10 +65,8 @@ fn a_failed_job_is_a_diagnostic_naming_what_asked_for_it() {
     );
 }
 
-/// A wait begun past the drain deadline ends the run though its job returns at once, so a serve
-/// loop of quick reads still stops there.
 #[test]
-fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_returns() {
+fn a_job_submitted_after_the_shutdown_drain_time_has_run_out_fails_with_a_drain_incomplete_error() {
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
         drain: Duration::from_millis(30),
@@ -96,9 +90,8 @@ fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_returns() {
     assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
 }
 
-/// A job's rejection of its own fails the run as it stands, its code kept.
 #[test]
-fn a_jobs_own_rejection_fails_the_run_with_its_code() {
+fn a_job_that_rejects_with_a_diagnostic_fails_the_run_with_that_diagnostic_s_code_and_message() {
     let runtime = ply_host::Host::new().runtime();
     let run = run_of(&*runtime).expect("a host made the runtime");
     let ticket = jobs::refusing(
@@ -120,10 +113,9 @@ fn a_jobs_own_rejection_fails_the_run_with_its_code() {
     assert_eq!(rejected.message, "too much");
 }
 
-/// Every runtime one unbound factory makes, as each `parallel` branch makes its own, is over the
-/// one host: a socket a branch opens is in the table the run reads.
 #[test]
-fn an_unbound_factorys_runtimes_share_one_host() {
+fn runtimes_made_by_one_factory_use_the_same_sockets_and_runtimes_made_by_another_factory_use_different_sockets()
+ {
     let factory = unbound();
     let (first, second) = (factory(), factory());
     let sockets = |runtime: &dyn HostRuntime| {
@@ -135,10 +127,9 @@ fn an_unbound_factorys_runtimes_share_one_host() {
     assert_ne!(sockets(&*first), sockets(&*other));
 }
 
-/// A job done here runs on the asking thread and is resolved before its ticket is waited on; one
-/// that panics is resolved as one that failed.
 #[test]
-fn a_job_done_here_runs_on_the_asking_thread_and_is_resolved_at_once() {
+fn done_here_runs_a_job_on_the_calling_thread_and_its_result_is_available_at_once_even_if_the_job_panics()
+ {
     let runtime = ply_host::Host::new().runtime();
     let run = run_of(&*runtime).expect("a host made the runtime");
     let asking = std::thread::current().id();

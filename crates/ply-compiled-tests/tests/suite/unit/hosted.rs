@@ -16,7 +16,6 @@ use ply_host::pool::Kept;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The bytes a native left taken, `n` of them, copied out as emitted code copies them.
 fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
     let mut out = vec![0u8; usize::try_from(n).expect("a count")];
     unsafe { rt_taken(ctx, Addr(out.as_mut_ptr()), I64(n)) };
@@ -28,20 +27,19 @@ fn addr(bytes: &[u8]) -> (Addr, I64) {
 }
 
 #[test]
-fn a_native_that_asks_the_machine_leaves_the_run_having_read_it() {
+fn a_native_function_that_reads_the_operating_system_marks_the_run_as_not_repeatable() {
     let mut ctx = context();
-    assert!(!ctx.take_host_use().acted());
+    assert!(!ctx.take_host_usage().used_nondeterminism());
     let cpus = unsafe { rt_os_cpus(&mut ctx) };
     assert!(cpus.0 >= 1);
     assert!(ctx.take_failure().is_none());
-    let used = ctx.take_host_use();
+    let used = ctx.take_host_usage();
     assert!(
-        used.acted(),
+        used.used_nondeterminism(),
         "a read of the machine left the run hermetic: {used:?}"
     );
 }
 
-/// The ticket of `job`, submitted for `ctx`'s run as a native submits one.
 fn submitted(
     ctx: &mut Ctx,
     work: Work,
@@ -54,7 +52,6 @@ fn submitted(
     I64(ticket.token as i64)
 }
 
-/// `ctx` over a runtime of a host that holds nothing: no stop, no roots, no process.
 fn hosted(ctx: &mut Ctx) -> Rc<dyn HostRuntime> {
     let runtime = ply_host::Host::new().runtime();
     ctx.set_host(
@@ -65,19 +62,18 @@ fn hosted(ctx: &mut Ctx) -> Rc<dyn HostRuntime> {
     runtime
 }
 
-/// A line read for a `Secret` is kept by the run that asked: the second native takes it from that
-/// run, and one whose entry point ended between the two natives is gone.
 #[test]
-fn a_secret_line_is_taken_from_its_run_and_none_outlives_the_entry_point() {
+fn reading_a_secret_line_removes_it_from_the_run_and_ending_the_entry_point_deletes_unread_secret_lines()
+ {
     let mut ctx = context();
     let runtime = hosted(&mut ctx);
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
-    let kept = run.keep_secret(Kept::new(b"hunter2".to_vec()));
+    let kept = run.store_secret(Kept::new(b"hunter2".to_vec()));
     let secret = unsafe { rt_term_secret_taken(&mut ctx, I64(kept)) };
     assert!(ctx.take_failure().is_none());
     assert_eq!(unsafe { rt_secret_len(&mut ctx, secret) }.0, 7);
 
-    let left = run.keep_secret(Kept::new(b"hunter3".to_vec()));
+    let left = run.store_secret(Kept::new(b"hunter3".to_vec()));
     let _ = runtime.end_entry_point(MachineId::next());
     unsafe { rt_term_secret_taken(&mut ctx, I64(left)) };
     assert!(
@@ -86,16 +82,12 @@ fn a_secret_line_is_taken_from_its_run_and_none_outlives_the_entry_point() {
     );
 }
 
-/// A run handed no stop hears no signal: its ask returns `false` and installs no handler, so the
-/// platform's handling stays for every other run of the process, a `ctrl-C` on `ply test` among
-/// them.
 #[test]
-fn a_run_that_listens_for_no_stop_installs_no_signal_handler() {
+fn a_run_that_does_not_handle_stop_signals_installs_no_signal_handler() {
     let mut ctx = context();
     let _runtime = hosted(&mut ctx);
     assert_eq!(unsafe { rt_signal_arrived(&mut ctx, I64(1)) }.0, 0);
     assert!(ctx.take_failure().is_none());
-    // SAFETY: with no action handed, the call only writes `found`.
     let found = unsafe {
         let mut found: libc::sigaction = std::mem::zeroed();
         assert_eq!(
@@ -111,10 +103,9 @@ fn a_run_that_listens_for_no_stop_installs_no_signal_handler() {
     );
 }
 
-/// What a host handler read goes into its run's record under the root its label names, once the run
-/// is observed; a label no root is bound to, and a run nobody observes, record nothing.
 #[test]
-fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
+fn a_file_read_through_the_real_file_handler_is_recorded_in_the_run_trace_with_its_root_directory_name()
+ {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.db"), b"data").unwrap();
     let spec = ply_host::fs::RootSpec {
@@ -142,7 +133,6 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
     note(&mut ctx, b"app", b"made.db", 4);
     note(&mut ctx, b"app", b"made.db", 0);
     assert!(ctx.take_failure().is_none());
-    // Where the root lies with its links resolved, as a binding passes it borrowed.
     let borrowed = [("app".to_string(), dir.path().canonicalize().unwrap())];
     let shipped = |_: &str| None;
     let config = std::collections::BTreeMap::new();
@@ -163,10 +153,8 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
     assert_eq!(read, ["file\tapp\ta.db\t"], "{trace}");
 }
 
-/// What a host handler read of the binary goes into its run's record without a root: a shipped
-/// module by its name and the program the launcher entered, each digested by the binary.
 #[test]
-fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {
+fn reading_the_program_binary_through_the_real_handler_is_recorded_in_the_run_trace() {
     let runtime = ply_host::Host::new().runtime();
     let mut ctx = context();
     ctx.set_host(
@@ -198,9 +186,8 @@ fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {
     assert!(trace.contains("program\tentered"), "{trace}");
 }
 
-/// Outside a production scheduler the thread waits for a job, and is handed its bytes.
 #[test]
-fn a_jobs_bytes_come_back_through_job_wait() {
+fn waiting_for_a_job_returns_the_bytes_the_job_computed() {
     let mut ctx = context();
     let ticket = submitted(&mut ctx, Work::Computing, "a test job", || {
         Ok(b"computed".to_vec())
@@ -210,7 +197,6 @@ fn a_jobs_bytes_come_back_through_job_wait() {
     assert_eq!(taken(&mut ctx, n.0), b"computed");
 }
 
-/// A job that failed fails the run, naming what asked for it.
 #[test]
 fn a_failed_job_fails_the_run_that_waits_on_it() {
     let mut ctx = context();
@@ -226,11 +212,9 @@ fn a_failed_job_fails_the_run_that_waits_on_it() {
     );
 }
 
-/// A hash is computed off the program's thread and is a function of what it was handed, so the
-/// run is recorded as having asked the host and read nothing of it; one past its bounds is rejected
-/// before any job starts, saying which number and nothing of the password.
 #[test]
-fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_rejected() {
+fn a_bcrypt_hash_job_returns_the_known_hash_without_using_the_operating_system_and_rejects_a_cost_of_31()
+ {
     let mut ctx = context();
     let (password_at, password_len) = addr(b"");
     let secret = unsafe { rt_secret_of(&mut ctx, password_at, password_len, I64(0)) };
@@ -242,7 +226,6 @@ fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_rejected
     let ticket = unsafe { rt_kdf_bcrypt(&mut ctx, secret, salt_at, salt_len, I64(6)) };
     assert!(ctx.take_failure().is_none());
     let n = unsafe { rt_job_wait(&mut ctx, ticket) };
-    // jBCrypt's tag of the empty password under that salt at cost 6.
     let tag: Vec<u8> = (0..23)
         .map(|i| {
             u8::from_str_radix(
@@ -253,9 +236,12 @@ fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_rejected
         })
         .collect();
     assert_eq!(taken(&mut ctx, n.0), tag);
-    let used = ctx.take_host_use();
+    let used = ctx.take_host_usage();
     assert_eq!(used.operations, 1);
-    assert!(!used.acted(), "a hash read the machine: {used:?}");
+    assert!(
+        !used.used_nondeterminism(),
+        "a hash read the machine: {used:?}"
+    );
 
     let (other_at, other_len) = addr(b"correct horse");
     let other = unsafe { rt_secret_of(&mut ctx, other_at, other_len, I64(0)) };

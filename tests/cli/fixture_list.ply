@@ -1,8 +1,3 @@
-//! Every program under `tests/fixtures` is listed here with the errors `ply check` rejects it with,
-//! and checked before anything runs it for what it is for: one that exists to fail is rejected
-//! with exactly those errors, and every other one checks clean. A fixture a change to the language
-//! breaks fails as itself, rather than as the outcome some other test is waiting for.
-
 import spawning.harness (PlyProcess, Source, write_project, spawned, stdout, stderr, json_of,
                          selected, failed, at, path, items, first, str, int, bool, json_text)
 import std.json
@@ -111,34 +106,32 @@ fn fixture_entries() -> List<FixtureEntry> =
     { name: "vacuous_law", rejected: [] },
   ]
 
-/// Embedded, so a test reading them is cached until a fixture changes.
 fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("../fixtures")
 
-/// The fixture `name`, a file or a directory, as a project of its own.
 fn fixture_sources(name: String) -> List<Source> / {abort.raise} = {
   let file = name ++ ".ply";
   let dir = name ++ "/";
-  fixtures().fold([], |acc: List<Source>, f: { name: String, bytes: Bytes }|
-    if f.name == file { acc.push({ path: file, text: String::of_bytes(f.bytes) }) }
+  fixtures().fold([], |accumulator: List<Source>, f: { name: String, bytes: Bytes }|
+    if f.name == file { accumulator.push({ path: file, text: String::of_bytes(f.bytes) }) }
     else if f.name.starts_with(dir) {
-      acc.push({ path: f.name.slice(dir.len(), f.name.len()), text: String::of_bytes(f.bytes) })
-    } else { acc })
+      accumulator.push({
+        path: f.name.slice(dir.len(), f.name.len()),
+        text: String::of_bytes(f.bytes),
+      })
+    } else { accumulator })
 }
 
 fn listing(errors: List<Json>) -> String =
-  errors.fold("", |acc: String, d: Json| {
+  errors.fold("", |accumulator: String, d: Json| {
     let at_line = match items(at(d, "labels")).filter(|l: Json| bool(at(l, "primary"))) {
       [l, ..] -> " at " ++ str(at(l, "file")) ++ ":" ++ int(path(l, ["start", "line"])).to_string(),
       [] -> "",
     };
-    acc ++ "  " ++ str(at(d, "code")) ++ " " ++ str(at(d, "message")) ++ at_line ++ "\n"
+    accumulator ++ "  " ++ str(at(d, "code")) ++ " " ++ str(at(d, "message")) ++ at_line ++ "\n"
   })
 
-/// The fixtures whose check compiles and enters part of what they reach, which only a `ply` of their
-/// own may do.
 fn entering() -> List<String> = ["drain_incomplete", "span_abandoned", "span_unbalanced"]
 
-/// Why the fixture does not check as listed, or `""` when it does, by what `ply check --json` said.
 fn listing_mismatch(f: FixtureEntry, result: Json) -> String = {
   let errors = items(at(result, "diagnostics")).filter(|d: Json| str(at(d, "severity")) == "error");
   let found = errors.map(|d: Json| str(at(d, "code"))).sort();
@@ -154,22 +147,25 @@ fn listing_mismatch(f: FixtureEntry, result: Json) -> String = {
   }
 }
 
-test/nondet "{f.name} checks as listed through a ply of its own" for f: FixtureEntry in fixture_entries(
+test/nondet "checking fixture {f.name} in a separate `ply` process gives the diagnostics the fixture list expects" for f: FixtureEntry in fixture_entries(
   ).filter(|f: FixtureEntry| entering().contains(f.name)) {
   write_project(fixture_sources(f.name));
   let m = listing_mismatch(f, json_of(spawned(["check", ".", "--json"])));
   assert(m == "", Some(m))
 }
 
-// A fixture listed nowhere is one a change can break with nothing failing.
 test "every fixture is listed" {
-  let present = fixtures().fold([], |acc: List<String>, f: { name: String, bytes: Bytes }| {
-    let n = match f.name.split_once("/") {
-      Some(p) -> p.head,
-      None -> if f.name.ends_with(".ply") { f.name.slice(0, f.name.len() - 4) } else { "" },
-    };
-    if n == "" || acc.filter(|m: String| m == n).len() > 0 { acc } else { acc.push(n) }
-  });
+  let present = fixtures().fold(
+    [],
+    |accumulator: List<String>, f: { name: String, bytes: Bytes }| {
+      let n = match f.name.split_once("/") {
+        Some(p) -> p.head,
+        None -> if f.name.ends_with(".ply") { f.name.slice(0, f.name.len() - 4) } else { "" },
+      };
+      if n == "" || accumulator.filter(|m: String| m == n).len() > 0 { accumulator }
+      else { accumulator.push(n) }
+    },
+  );
   let names = fixture_entries().map(|f: FixtureEntry| f.name);
   let unlisted = present.filter(|n: String| names.filter(|m: String| m == n).len() == 0);
   let gone = names.filter(|n: String| present.filter(|m: String| m == n).len() == 0);
@@ -188,14 +184,10 @@ test "every fixture is listed" {
   )
 }
 
-// Run as its header says, `span_abandoned.ply` returns with two spans still open; the run closes
-// them `Abandoned`, warns of both innermost first on stderr, and still exits 0, since a warning is
-// no failure.
-test/nondet "a run warns of the spans its entry left open and exits zero" {
+test/nondet "`ply run` warns about trace spans never closed when the entry point ends, and still exits with code zero" {
   write_project(fixture_sources("span_abandoned"));
   let run = ["run", "--trace", "json"];
   let warning = "2 spans were still open when their task or the entry point ended: `reserving` on `orders`, `order` on `orders`";
-  // The trace goes to the process's own error stream, which only a process has.
   let r = spawned(run.push("span_abandoned.ply"), []);
   assert(r.code == 0, Some(stderr(r)));
   assert(r.out == [], Some("stdout is the program's, and it wrote nothing: " ++ stdout(r)));
@@ -205,12 +197,12 @@ test/nondet "a run warns of the spans its entry left open and exits zero" {
   );
   let closed = r.err.filter(|l: String| l.starts_with("{")).fold(
     [],
-    |acc: List<String>, l: String|
+    |accumulator: List<String>, l: String|
       match json::parse_string(l) {
         Ok(record) -> if str(at(record, "outcome")) == "abandoned" {
-          acc.push(str(at(record, "name")))
-        } else { acc },
-        Err(_) -> acc,
+          accumulator.push(str(at(record, "name")))
+        } else { accumulator },
+        Err(_) -> accumulator,
       },
   );
   assert(closed == ["reserving", "order"], Some(stderr(r)));
@@ -236,7 +228,6 @@ fn only_failure(report: Json) -> Json / {abort.raise} =
     _ -> panic("expected exactly one failing test: " ++ json_text(report)),
   }
 
-/// The byte range of `text` in the fixture `name`, which writes it once.
 type Span = { start: Int, end: Int }
 
 fn span_of(name: String, text: String) -> Span / {abort.raise} = {
@@ -254,8 +245,6 @@ fn span_of(name: String, text: String) -> Span / {abort.raise} = {
   }
 }
 
-// `channel_race.ply`'s receiver counts on the first sender spawned being heard first; the search
-// sends the second one first, and the race it reports is the two sends, each where it was performed.
 test/nondet "the search finds the channel race between two senders" {
   write_project(fixture_sources("channel_race"));
   let searched = test_report([]);
@@ -293,10 +282,7 @@ test/nondet "the search finds the channel race between two senders" {
   )
 }
 
-// `cancel_race.ply` cancels a receiver as it is spawned and counts on the cancel coming first. A
-// run in which it does holds no step of the receiver to reorder, so the search has to give the
-// cancelled task one: from every root it reaches the run where the receive is handled first.
-test/nondet "the search finds the cancel that comes after the task it stops has run, from every root" {
+test/nondet "`ply test` seed search fails on the cancel race, where a cancel runs after its target task finished, from each of six seeds" {
   write_project(fixture_sources("cancel_race"));
   range(0, 6).fold((), |u: Unit, root: Int| {
     let roots = root.to_string() ++ ".." ++ Int::to_string(root + 1);
@@ -313,10 +299,6 @@ test/nondet "the search finds the cancel that comes after the task it stops has 
   })
 }
 
-// Run end to end, `bank_race.ply`'s two transfers pass; the search moves one's balance check ahead
-// of the other's debit, so both pass a check only one should. The failure names the two sides of
-// that reordering, each at the perform in `transfer` that made its access, and the seed it prints
-// replays it.
 test/nondet "the search finds the bank race and its seed replays it" {
   write_project(fixture_sources("bank_race"));
   let searched = test_report([]);
@@ -386,13 +368,10 @@ test/nondet "the search finds the bank race and its seed replays it" {
   )
 }
 
-// `case_of_a_keyed_type.ply`'s two lengths are equal by their key and built differently, and its
-// body passes the first and fails the second. A second run stands on the first's pass and still
-// runs and fails the second: one case's pass is never another's.
-test/nondet "a case of a keyed type keeps its failure beside the pass of a case equal to it" {
+test/nondet "on a second `ply test` run, a failing case runs again and a passing case with an equal value is cached" {
   write_project(fixture_sources("case_of_a_keyed_type"));
-  let in_metres = "Metres(2) is in metres";
-  let in_millimetres = "Millimetres(2000) is in metres";
+  let in_metres = "`in_metres` returns true for Metres(2), a `Length` given in either metres or millimetres";
+  let in_millimetres = "`in_metres` returns true for Millimetres(2000), a `Length` given in either metres or millimetres";
   let first = json_of(spawned(["test", ".", "--json"]));
   assert(failed(first) == [in_millimetres], Some(json_text(first)));
   assert(selected(first) == [in_metres, in_millimetres], Some(json_text(first)));
