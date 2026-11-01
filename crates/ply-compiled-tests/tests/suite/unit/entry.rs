@@ -76,10 +76,9 @@ pub fn encoded_defs() -> Vec<Def> {
             "m.fail#entered",
             0,
             &format!(
-                // An `assert` failing with its message, numbered as `REJECTED` numbers it.
-                "{}  {}(ctx, 21, (Word)(intptr_t)buf, n, 0, 0);\n  return 0;",
+                // Raised with the message it read as a note.
+                "{}  Word texts[] = {{ (Word)(intptr_t)\"E0501\", 5, (Word)(intptr_t)\"assertion failed: condition is false\", 36, (Word)(intptr_t)\"here\", 4, (Word)(intptr_t)buf, n }};\n  rt_failed_p(ctx, 1, (Word)(intptr_t)texts, 1, 0);\n  return 0;",
                 lifting(&string_read()),
-                native("?refused_text"),
             ),
         ),
         def("m.helper", 1, "  return p0;"),

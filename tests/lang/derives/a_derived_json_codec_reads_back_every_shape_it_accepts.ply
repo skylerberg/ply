@@ -1,0 +1,146 @@
+//! `derive json` over every shape it accepts: what a derived codec writes of a drawn value reads back
+//! as that value, and a document printed from what it parsed to is the same bytes.
+
+import std.gen
+import std.gen (Gen)
+import std.json
+
+type Colour = | Red | Green | Blue
+
+type Shape = | Blank | Circle(Decimal) | Rect(Decimal, Decimal) | Poly(List<Decimal>)
+
+type Tree = | Leaf | Node(Tree, Tree)
+
+type Leafy = {
+  name: String,
+  raw: Bytes,
+  weight: Decimal,
+  count: Int,
+  flag: Bool,
+  nothing: Unit,
+  tags: List<String>,
+  maybe: Option<Int>,
+}
+
+type Deep = {
+  by_name: Map<String, Shape>,
+  by_num: Map<Int, List<Colour>>,
+  by_bytes: Map<Bytes, Tree>,
+  leaf: Leafy,
+  inner: List<Leafy>,
+  results: List<Result<Int, String>>,
+  tree: Tree,
+}
+
+type Reading = { ratio: Float }
+
+derive json for Colour
+derive json for Shape
+derive json for Tree
+derive json for Leafy
+derive json for Deep
+derive json for Reading
+
+fn round(d: Deep) -> Bool / {abort.raise} =
+  match json::decode_bytes(json::encode_bytes(d, deep_json()), deep_json()) {
+    Ok(e) -> e == d,
+    Err(_) -> false,
+  }
+
+// The direction that catches a print that is not canonical.
+fn reprint(j: json::Json) -> Bool / {abort.raise} =
+  match json::parse(json::to_bytes(j)) {
+    Ok(k) -> json::to_bytes(k) == json::to_bytes(j),
+    Err(_) -> false,
+  }
+
+fn shapes() -> Gen<Shape> =
+  gen::one_of([
+    gen::constant(Blank),
+    gen::map(gen::decimal(), |r: Decimal| Circle(r)),
+    gen::map2(gen::decimal(), gen::decimal(), |w: Decimal, h: Decimal| Rect(w, h)),
+    gen::map(gen::list_of(gen::decimal(), 3), |ps: List<Decimal>| Poly(ps)),
+  ])
+
+fn trees(depth: Int) -> Gen<Tree> =
+  if depth <= 0 { gen::constant(Leaf) } else {
+    gen::one_of([
+      gen::constant(Leaf),
+      gen::map2(trees(depth - 1), trees(depth - 1), |l: Tree, r: Tree| Node(l, r)),
+    ])
+  }
+
+fn leafies() -> Gen<Leafy> =
+  gen::map2(
+    gen::map4(
+      gen::text(),
+      gen::bytes(),
+      gen::decimal(),
+      gen::any_int(),
+      |name: String, raw: Bytes, weight: Decimal, count: Int| (name, raw, weight, count),
+    ),
+    gen::map3(
+      gen::bool(),
+      gen::list_of(gen::text(), 3),
+      gen::option_of(gen::any_int()),
+      |flag: Bool, tags: List<String>, maybe: Option<Int>| (flag, tags, maybe),
+    ),
+    |a: (String, Bytes, Decimal, Int), b: (Bool, List<String>, Option<Int>)|
+      {
+        name: a._0,
+        raw: a._1,
+        weight: a._2,
+        count: a._3,
+        flag: b._0,
+        nothing: (),
+        tags: b._1,
+        maybe: b._2,
+      },
+  )
+
+fn deeps() -> Gen<Deep> =
+  gen::map2(
+    gen::map4(
+      gen::map_of(gen::text(), shapes()),
+      gen::map_of(gen::any_int(), gen::list_of(gen::elements([Red, Green, Blue]), 3)),
+      gen::map_of(gen::bytes(), trees(3)),
+      leafies(),
+      |by_name: Map<String, Shape>, by_num: Map<Int, List<Colour>>, by_bytes: Map<Bytes, Tree>, leaf: Leafy|
+        (by_name, by_num, by_bytes, leaf),
+    ),
+    gen::map3(
+      gen::list_of(leafies(), 2),
+      gen::list_of(gen::result_of(gen::any_int(), gen::text()), 3),
+      trees(3),
+      |inner: List<Leafy>, results: List<Result<Int, String>>, tree: Tree| (inner, results, tree),
+    ),
+    |a: (Map<String, Shape>, Map<Int, List<Colour>>, Map<Bytes, Tree>, Leafy), b: (List<Leafy>, List<Result<Int, String>>, Tree)|
+      {
+        by_name: a._0,
+        by_num: a._1,
+        by_bytes: a._2,
+        leaf: a._3,
+        inner: b._0,
+        results: b._1,
+        tree: b._2,
+      },
+  )
+
+test "a derived codec round-trips a drawn value of every shape through the wire" {
+  gen::check(deeps(), round)
+}
+
+test "printing a parsed document reproduces it" { gen::check(json::jsons(), reprint) }
+
+fn encodable(f: Float) -> Bool = match Decimal::of_float(f) { Some(_) -> true, None -> false }
+
+fn read_back(r: Reading) -> Bool / {abort.raise} =
+  match json::decode_bytes(json::encode_bytes(r, reading_json()), reading_json()) {
+    Ok(s) -> s == r,
+    Err(_) -> false,
+  }
+
+// Over the floats JSON can write; the ones it cannot are rejected at the encoder.
+test "a float field round-trips over every value it encodes" {
+  gen::check(gen::float(), |f: Float| !encodable(f) || read_back({ ratio: f }))
+}

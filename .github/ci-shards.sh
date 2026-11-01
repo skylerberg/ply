@@ -42,6 +42,9 @@
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
 #                                sources job holds to `ply fmt --check`
+#   ci-shards.sh in-process-suite
+#                                the suite that calls the compiler and the CLI in
+#                                its own process
 #   ci-shards.sh nightly-modules ROLE
 #                                the modules of the suite ROLE no pull request runs, on one line,
 #                                which the nightly job hands `ci-ply.sh nightly`
@@ -71,14 +74,18 @@ TAB=$'\t'
 # `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
 # another. A change to the compiler runs every test again, and each part must finish all of its
 # tests within its job's deadline.
-CLI_PARTS=4
+CLI_PARTS=2
+# The suite that calls the compiler and the CLI in its own process, which `ply.work` lists among its
+# suites. `ci-ply.sh` gives it the CLI suite's grants.
+IN_PROCESS_SUITE=tests/in_process
 # A package's own tests and proofs share one job, `packages`, in turn: each loads little. These take
 # a job of their own instead: the compiler's own tests take every core.
-RUNS_ALONE=(package-compiler)
+RUNS_ALONE=(package-compiler package-in_process)
 # Modules no pull request runs, which the `nightly` job does, as `role:module` with the role
 # `ply.work` gives their suite: minutes each, the repository audit checking packages cold and the copies
-# audit listing every one, or against a postgres they start, or random edit sessions drawn anew each day.
-NIGHTLY=(cli-tests:repository_audit cli-tests:copies cli-tests:edit_sessions std-tests:db_driver std-tests:pg_client)
+# audit listing every one, or against a postgres they start, or random edit sessions drawn anew each
+# day, or every edit over every fixture of the edit gate. `in-process` names `IN_PROCESS_SUITE`.
+NIGHTLY=(in-process:repository_audit in-process:copies in-process:edit_sessions cli-tests:edit_matrix std-tests:db_driver std-tests:pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
@@ -166,7 +173,10 @@ workspace() {
 }
 
 # Each path `ply.work` gives ROLE, one a line.
-role() { awk -v r="$1" '$1 == r { print $2 }' <<< "$WORK"; }
+role() {
+  if [[ $1 == in-process ]]; then printf '%s\n' "$IN_PROCESS_SUITE"; return; fi
+  awk -v r="$1" '$1 == r { print $2 }' <<< "$WORK"
+}
 
 # Every tree of Ply sources `ply.work` places, one a line.
 cmd_ply_trees() {
@@ -328,7 +338,11 @@ cmd_run_line() {
       ;;
     package-*)
       path=$(package_path "${id#package-}") || { echo "no package suite named '${id#package-}'" >&2; return 1; }
-      printf '%s\t\t\n' "$path"
+      if [[ $path == "$IN_PROCESS_SUITE" ]]; then
+        printf '%s\t%s\t\n' "$path" "$(suite_filters in-process "$path")"
+      else
+        printf '%s\t\t\n' "$path"
+      fi
       ;;
     laws-*)
       path=$(proofs_path "${id#laws-}") || { echo "no package's proofs named '${id#laws-}'" >&2; return 1; }
@@ -1072,15 +1086,21 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  if ! grep -qxF -- "$IN_PROCESS_SUITE" <<< "$(role suite)"; then
+    echo "FAIL: ply.work lists no suite at $IN_PROCESS_SUITE, which IN_PROCESS_SUITE names" >&2
+    failures=$((failures + 1))
+  fi
   # A module's tests are picked out by `<module>.`, which no test of another module may hold.
-  local module keys outside
-  keys=$(package_keys "$CLI_SUITE")
-  for module in $(modules_of "$CLI_SUITE"); do
-    outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
-    if [[ -n $outside ]]; then
-      echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $CLI_SUITE/$module.ply, so the module's filter picks that test too" >&2
-      failures=$((failures + 1))
-    fi
+  local module keys outside suite
+  for suite in "$CLI_SUITE" "$IN_PROCESS_SUITE"; do
+    keys=$(package_keys "$suite")
+    for module in $(modules_of "$suite"); do
+      outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
+      if [[ -n $outside ]]; then
+        echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $suite/$module.ply, so the module's filter picks that test too" >&2
+        failures=$((failures + 1))
+      fi
+    done
   done
   local file claimed
   while IFS= read -r file; do
@@ -1214,8 +1234,9 @@ case "${1:-}" in
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) nightly_of "${2:?a role}" | paste -sd ' ' - ;;
+  in-process-suite) printf '%s\n' "$IN_PROCESS_SUITE" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules|in-process-suite}" >&2
     exit 2
     ;;
 esac

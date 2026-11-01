@@ -72,11 +72,21 @@ static STRING_T: PlyType = PlyType {
     lift: text_lift,
 };
 
-/// `Bytes::at` given index 5 of 2 bytes, left pending, numbered as `REJECTED` numbers it.
-fn rejected(ctx: &mut Ctx) {
-    let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
-        helper(&builtin_helper_name("?refused"));
-    unsafe { rejected(ctx, 8, 5, 2, 0) };
+/// A failure compiled code wrote and raised, with the text `note`, left pending.
+fn failed(ctx: &mut Ctx, code: &[u8], message: &[u8], note: &[u8]) {
+    let raised: unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word) = helper("rt_failed");
+    let label = b"here";
+    let words = [
+        code.as_ptr() as Word,
+        code.len() as Word,
+        message.as_ptr() as Word,
+        message.len() as Word,
+        label.as_ptr() as Word,
+        label.len() as Word,
+        note.as_ptr() as Word,
+        note.len() as Word,
+    ];
+    unsafe { raised(ctx, 1, words.as_ptr(), 1, 0) };
 }
 
 /// Through the bridge, which handles no raise, the entry fails as the runtime left it failing:
@@ -107,7 +117,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
 fn a_rejection_raised_on_through_the_bridge_keeps_its_note() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
-    rejected(&mut ctx);
+    failed(&mut ctx, b"E0502", b"it failed", b"why it failed");
     raised_on_keeps(&mut ctx);
 }
 
@@ -116,20 +126,7 @@ fn a_rejection_raised_on_through_the_bridge_keeps_its_note() {
 fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
-    let said = "the sides differ";
-    // `assert` with a message, numbered as `REJECTED` numbers it.
-    let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word, Word) =
-        helper(&builtin_helper_name("?refused_text"));
-    unsafe {
-        rejected(
-            &mut ctx,
-            21,
-            said.as_ptr() as Word,
-            said.len() as Word,
-            0,
-            0,
-        )
-    };
+    failed(&mut ctx, b"E0501", b"assertion failed", b"the sides differ");
     assert_eq!(ctx.diagnostic.as_ref().map(|d| d.code), Some("E0501"));
     raised_on_keeps(&mut ctx);
 }
@@ -139,7 +136,7 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
 fn a_clause_is_handed_the_message_of_a_raise_left_pending() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
-    rejected(&mut ctx);
+    failed(&mut ctx, b"E0502", b"it failed", b"why it failed");
     let message = unsafe { helper::<Pending>("rt_pending_raised")(&mut ctx, &STRING_T, 0) };
     assert_eq!(ctx.failed, 0, "the message was handed over");
     assert_ne!(message, 0, "the message is a `String`");

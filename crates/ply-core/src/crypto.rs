@@ -17,14 +17,6 @@ use ring::test::rand::FixedSliceRandom;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-/// The runtime error of the operation `what` handed what it takes no part of, `reason` saying what.
-#[cold]
-pub fn misuse(span: Span, what: &str, reason: String) -> Diagnostic {
-    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what}: {reason}"))
-        .primary(span, "called here")
-        .note("`std.crypto` and `std.hash` name what the runtime takes; they are the callers these builtins are for")
-}
-
 // --- Text encodings of a credential ---------------------------------------------------------
 
 /// All ones when `lo <= c <= hi` and zero otherwise, by arithmetic alone: a decoder that branched
