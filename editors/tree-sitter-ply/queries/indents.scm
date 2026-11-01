@@ -1,5 +1,6 @@
 [
   (function_definition)
+  (const_declaration)
   (extern_function)
   (type_definition)
   (effect_definition)

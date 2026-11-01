@@ -64,6 +64,7 @@ module.exports = grammar({
 
     _item: $ => choice(
       $.function_definition,
+      $.const_declaration,
       $.extern_function,
       $.extern_type,
       $.type_definition,
@@ -94,6 +95,16 @@ module.exports = grammar({
       optional(seq('->', field('return_type', $._type), optional($.effects_annotation))),
       repeat($._spec_clause),
       optional(seq('=', field('body', $._expression))),
+    ),
+
+    const_declaration: $ => seq(
+      optional('pub'),
+      'const',
+      field('name', $.identifier),
+      ':',
+      field('type', $._type),
+      '=',
+      field('value', $._expression),
     ),
 
     extern_function: $ => seq(

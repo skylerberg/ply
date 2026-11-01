@@ -270,7 +270,7 @@ fn an_effect_raised_inside_a_constant_fails_the_run_with_an_error_that_no_handle
     assert!(
         said.notes
             .iter()
-            .any(|n| n.contains("`const fn` must return")),
+            .any(|n| n.contains("a constant must return")),
         "{said:?}"
     );
     assert_eq!(ctx.tables.memoized(0), None);

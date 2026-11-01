@@ -465,8 +465,8 @@ A top-level `fn` must write the type of every parameter, its return type, and it
 any. Leaving out a type is an error (`E0126`), which shows the type the compiler inferred. A
 parameter the body does not use may be written `_`.
 
-**Defaults.** A parameter with a default may be left out of a call. A default must be a constant: a
-literal, or a constructor, record or list of literals (`E0121`). On a `pub fn`, a default may not
+**Defaults.** A parameter with a default may be left out of a call. A default must be a literal, a
+`const` (§4.5), or a constructor, record or list of those (`E0121`). On a `pub fn`, a default may not
 use anything its module does not export (`E0122`).
 
 **Functions of a type.** `fn Stack::size(s: Stack) -> Int` declares the function `size` of the type
@@ -478,7 +478,7 @@ functions for any other type is an error (`E0217`).
 
 **Modifiers.** `reuse fn` promises that every list update in the body happens in place (§6.10).
 `transparent fn` lets the proofs of other packages read the function's body, so that they can reason
-about what the function does (§11). `const fn` is a value computed once (§4.5).
+about what the function does (§11).
 
 **The entry point** is `main`, of any type and effects. A program with no `main` is an error
 (`E0101`), and a program with several is an error (`E0112`). To choose which file's `main` runs,
@@ -553,21 +553,28 @@ hand so that decoding checks those rules. To hide the contents of a value from e
 ```ply
 type Status = { code: Int, reason: String }
 
-const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
+pub const max_redirects: Int = 5
+const statuses: Array<Status> = parsed(embed("status_codes.csv"))
+
+fn allowed(hops: Int) -> Bool = hops <= max_redirects
 ```
 
-A `const fn` is computed the first time a run reads it. Later reads in the same process return the
-same value. Use it to parse a data file once.
+A `const` names a value. Its type is required, and it is read by name, with no parentheses. Another
+module imports it like a function and reads it as `http::max_redirects`, or as `max_redirects` after
+`import http (max_redirects)`.
 
-- It takes no parameters, type parameters or effects.
-- Its body may raise and do nothing else, and it must terminate. Its value must be plain data: it
-  may not be a function, a `Task`, a `Chan` or a `Secret`. A `const fn` with any of these as its
-  value is an error (`E0156`).
-- A raise in the body ends the run, even when a handler surrounds the code that reads the constant.
-  To test a `const fn`, test the value it returns.
+A `const` is computed the first time a run reads it. Later reads in the same process return the same
+value. Use it to parse a data file once.
 
-A `const fn` of type `std.sql.Schema` is a database schema. The SQL statements of its module, and of
+- Its value may raise and do nothing else, and must terminate. It must be data: no function, `Task`,
+  `Chan` or `Secret`. Anything else is `E0156`.
+- A raise in the value ends the run, whatever handlers surround the read. Test what it returns.
+- A local variable, a parameter or a pattern variable of the same name hides it.
+
+A `const` of type `std.sql.Schema` is a database schema. The SQL statements of its module, and of
 every module that imports it, are checked against it before the program runs (§14.8).
+
+`const fn name() -> Type = value` declares the same constant, read with a call: `name()`.
 
 A plain function with no parameters that performs nothing is also computed only once per process.
 

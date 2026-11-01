@@ -78,6 +78,7 @@
 ] @boolean
 
 (function_definition name: (identifier) @function)
+(const_declaration name: (identifier) @constant)
 (extern_function name: (identifier) @function)
 
 (type_definition name: (identifier) @type)
