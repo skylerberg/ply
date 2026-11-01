@@ -1,0 +1,282 @@
+import compiler.front.emitter_input (Analysed, Rejected)
+import compiler.front.facts (Analysis, CheckedProgram, Frame, ModuleShape, assembled_load)
+import compiler.front.interface (blank_cuts)
+import compiler.front.rows (Cut, ModuleDerivations, Outline, OutlineItem, OutlinedFunction,
+                            OutlinedLaw, Rows)
+import compiler.front.published (no_rows)
+import compiler.front.checking (CheckedModule, checked_program_from_results, fresh_registry,
+                                queried_results, rows_of_result)
+import compiler.front.checking.world (ModuleResult)
+import compiler.check.resolve.tables (Source, Diagnostic, ParsedModule, qualify)
+import compiler.check.types (tables_joined)
+import compiler.store.hash.forms (FunctionNamed, ItemKeyed, Subject, joined_cached_hashes,
+                                  reachable_functions)
+import compiler.check.infer.checker (DefinitionInfo)
+import claims (OwnClaims)
+import program (Program, front_end, module_derivations, no_program)
+import proof.obligation (Definition)
+import proof.prover_input (Obligation, defined, invariants_of, prover_input_of)
+import proof.static_prover (claims_for, diagnosis_of, modules_of, prover_of)
+import proof.decide (Proved)
+import proof.goal (default_prove_budget)
+import sources (Embed)
+import std.list
+import compiler.store.memo (empty_memory_store)
+
+pub type ClaimView = { analysis: Analysis, definitions: List<Definition> }
+
+fn claims_in_outline(o: Outline) -> List<Subject> =
+  o.items.fold([], |found: List<Subject>, item: OutlineItem|
+    match item {
+      OutlinedFunction(f) -> if f.spec.len() == 0 { found }
+      else { found.push(FunctionNamed(qualify(o.name, f.name))) },
+      OutlinedLaw(l) -> found.push(ItemKeyed(qualify(o.name, l.name))),
+      _ -> found,
+    })
+
+fn every_function(o: Outline) -> List<Subject> =
+  o.items.fold([], |found: List<Subject>, item: OutlineItem|
+    match item {
+      OutlinedFunction(f) -> found.push(FunctionNamed(qualify(o.name, f.name))),
+      _ -> found,
+    })
+
+fn imported_closure(frame: Frame, start: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
+  let imports = range(0, frame.outlines.len()).fold(
+    Map::new(),
+    |found: Map<Bytes, List<Bytes>>, i: Int|
+      found.insert(frame.outlines.get(i).name, frame.imports.at_or(i, [])),
+  );
+  iterate(
+    { seen: Map::new(), work: start },
+    1000000,
+    |s: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
+      match s.work {
+        [] -> Stop(s.seen),
+        [m, ..rest] -> if s.seen.contains(m) { Continue({ ..s, work: rest }) } else {
+          Continue({
+            seen: s.seen.insert(m, true),
+            work: rest.concat(match imports.get(m) { Some(ms) -> ms, None -> [] }),
+          })
+        },
+      },
+  )
+}
+
+fn without_unreached_bodies(
+  s: Source,
+  outlines: Map<Bytes, Outline>,
+  reached: Map<Bytes, Bool>,
+) -> Source / {abort.raise} =
+  match outlines.get(s.name) {
+    None -> s,
+    Some(o) ->
+      {
+        ..s,
+        source_text: blank_cuts(
+          s.source_text,
+          o.cuts.filter(|c: Cut| c.name.len() > 0 && !reached.contains(c.name)),
+        ),
+      },
+  }
+
+fn rows_outside(program: Program, dropped: Map<Bytes, Bool>) -> Rows / {abort.raise} =
+  program.returned.fold(no_rows(), |accumulator: Rows, name: Bytes, a: ModuleResult|
+    if dropped.contains(name) { accumulator } else {
+      let rows = rows_of_result(a);
+      {
+        definitions: accumulator.definitions.concat(rows.definitions),
+        tests: accumulator.tests.concat(rows.tests),
+        types: tables_joined(accumulator.types, rows.types),
+      }
+    })
+
+pub fn claim_view(
+  program: Program,
+  v: CheckedProgram,
+) -> Result<ClaimView, List<Diagnostic>> / {abort.raise} = {
+  let frame = v.frame;
+  let own = frame.outlines.take(program.files.len());
+  let stated = own.fold([], |found: List<Subject>, o: Outline| found.concat(claims_in_outline(o)));
+  let subjects = if invariants_of(v.checked.instances).len() == 0 { stated }
+  else { own.fold(stated, |found: List<Subject>, o: Outline| found.concat(every_function(o))) };
+  let bearing = own.filter(|o: Outline|
+    claims_in_outline(o).len() > 0 || o.schemas.len() > 0 || subjects.len() > stated.len()).map(
+    |o: Outline| o.name,
+  );
+  let kept = imported_closure(frame, if bearing.len() > 0 { bearing }
+  else { program.sources.map(|s: Source| s.name).take(1) });
+  let reached = reachable_functions(frame.hashes, subjects);
+  let outlines = own.fold(Map::new(), |found: Map<Bytes, Outline>, o: Outline|
+    found.insert(o.name, o));
+  let dropped = program.sources.fold(Map::new(), |found: Map<Bytes, Bool>, s: Source|
+    if kept.contains(s.name) { found } else { found.insert(s.name, true) });
+  match front_end(
+      program.sources.map(|s: Source|
+        if kept.contains(s.name) { without_unreached_bodies(s, outlines, reached) }
+        else { { ..s, source_text: b"" } }),
+      program.shipping,
+      rows_outside(program, dropped),
+      program.packages,
+      program.embeds.filter(|e: Embed| !dropped.contains(e.embedded.module)),
+      program.prune_unreached,
+      joined_cached_hashes(program.modules),
+      module_derivations(program).filter(|m: ModuleDerivations| !dropped.contains(m.module)),
+    ).out {
+    Rejected(ds) -> Err(ds),
+    Analysed(w) ->
+      Ok({
+        analysis: { ..w, warnings: frame.warnings },
+        definitions: defined(
+          v.checked.definitions.filter(|d: DefinitionInfo| dropped.contains(d.module)),
+          frame.hashes,
+        ),
+      }),
+  }
+}
+
+pub fn with_every_definition(mine: OwnClaims, view: ClaimView, v: CheckedProgram) -> OwnClaims = {
+  let listed = mine.definitions.concat(view.definitions).fold(
+    Map::new(),
+    |found: Map<String, Definition>, d: Definition| found.insert(d.name, d),
+  );
+  {
+    ..mine,
+    definitions: v.checked.definitions.fold(
+      [],
+      |accumulator: List<Definition>, d: DefinitionInfo|
+        match listed.get(String::of_bytes_lossy(d.name)) {
+          Some(x) -> accumulator.push(x),
+          None -> accumulator,
+        },
+    ),
+  }
+}
+
+fn program_over(
+  sources: List<Source>,
+) -> { program: Program, view: CheckedProgram } / {abort.raise} = {
+  let done = queried_results(fresh_registry(), empty_memory_store(), sources);
+  let names = sources.map(|s: Source| s.name);
+  let packages = { root: b"", manifest: None, supplied: [] };
+  let loaded = assembled_load(
+    names,
+    packages,
+    done.results.fold(Map::new(), |found: Map<Bytes, ModuleShape>, a: CheckedModule|
+      found.insert(a.module, a.result.shape)),
+    done.fixing,
+    done.results.drop(sources.len()).map(|a: CheckedModule| a.module),
+    [],
+    Map::new(),
+    true,
+    false,
+    [],
+  );
+  let returned = done.results.fold(
+    Map::new(),
+    |found: Map<Bytes, ModuleResult>, a: CheckedModule| found.insert(a.module, a.result),
+  );
+  {
+    program: {
+      ..no_program(),
+      files: sources.map(|s: Source|
+        {
+          path: String::of_bytes_lossy(s.name),
+          module: String::of_bytes_lossy(s.name),
+          text: s.source_text,
+          at: { label: "cwd", path: String::of_bytes_lossy(s.name) },
+        }),
+      sources: sources,
+      source_texts: sources.map(|s: Source|
+        { path: String::of_bytes_lossy(s.name), text: s.source_text }),
+      frame: Some(loaded.frame),
+      returned: returned,
+      reads: loaded.reads,
+      packages: packages,
+      modules: [{ record: b"", cached: done.fixing }],
+      prune_unreached: false,
+    },
+    view: checked_program_from_results(loaded.frame, loaded.reads, returned),
+  }
+}
+
+fn claimed_sources() -> List<Source> =
+  [
+    {
+      name: b"app",
+      source_text: b"import lib (quad, twice)\n\npub fn four(n: Int) -> Int requires n > 0 && n < 1000 ensures result == quad(n) = twice(twice(n))\n\npub fn apart(n: Int) -> Int = n + 1\n\nlaw \"twice doubles\" forall (n: Int) where n > 0 && n < 1000 { twice(n) == n + n }\n",
+    },
+    {
+      name: b"lib",
+      source_text: b"pub fn twice(n: Int) -> Int = n + n\n\npub fn quad(n: Int) -> Int = n + n + n + n\n",
+    },
+    { name: b"other", source_text: b"pub fn unrelated(n: Int) -> Int = n * 3\n" },
+  ]
+
+fn claim_keys(w: Analysis) -> List<String> / {abort.raise} =
+  prover_input_of(w, |m: Bytes| true).world.obligations.map(|o: Obligation| o.key)
+
+fn proved_claims(w: Analysis) -> List<String> / {abort.raise} = {
+  let owned = |m: Bytes| [b"app", b"lib", b"other"].contains(m);
+  let world = prover_input_of(w, owned).world;
+  let p = prover_of(
+    claims_for(w, modules_of(w, world.obligations), owned),
+    world,
+    default_prove_budget(),
+  );
+  world.obligations.filter(|o: Obligation|
+    match diagnosis_of(p, o) {
+      Some(d) -> match d.decision { Proved(_) -> true, _ -> false },
+      None -> false,
+    }).map(|o: Obligation| o.owner)
+}
+
+test "a claim view holds the claims of the whole program under the same keys, and no module they do not reach" {
+  let loaded = program_over(claimed_sources());
+  let whole = match front_end(
+      loaded.program.sources,
+      loaded.program.shipping,
+      rows_outside(loaded.program, Map::new()),
+      loaded.program.packages,
+      [],
+      false,
+      joined_cached_hashes(loaded.program.modules),
+      [],
+    ).out {
+    Analysed(w) -> w,
+    Rejected(_) -> panic("the fixture program was rejected by the checker"),
+  };
+  match claim_view(loaded.program, loaded.view) {
+    Err(_) -> panic("the claim view of a checked program was rejected"),
+    Ok(v) -> {
+      assert(
+        v.analysis.modules.all(|m: ParsedModule| m.name != b"other" || m.module.items.len() == 0),
+      );
+      assert_eq(claim_keys(v.analysis), claim_keys(whole));
+      assert(proved_claims(whole).contains("app.four"));
+      assert_eq(proved_claims(v.analysis), proved_claims(whole));
+      assert_eq(v.definitions.map(|d: Definition| d.name), ["other.unrelated"]);
+      assert_eq(v.analysis.modules.map(|m: ParsedModule| m.name).take(3), [
+        b"app",
+        b"lib",
+        b"other",
+      ])
+    },
+  }
+}
+
+test "a body that no claim reaches is blanked in place, and a body that a claim reaches is kept" {
+  let source = claimed_sources().get(0);
+  let outlines = program_over(claimed_sources()).view.frame.outlines.fold(
+    Map::new(),
+    |found: Map<Bytes, Outline>, o: Outline| found.insert(o.name, o),
+  );
+  let viewed = without_unreached_bodies(
+    source,
+    outlines,
+    Map::new().insert(b"app.four", true),
+  ).source_text;
+  assert(viewed.index_of(b"twice(twice(n))") != None);
+  assert(viewed.index_of(b"= n + 1") == None);
+  assert_eq(viewed.len(), source.source_text.len())
+}

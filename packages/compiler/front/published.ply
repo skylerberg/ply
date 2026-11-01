@@ -1258,6 +1258,26 @@ fn law_claim(
   })
 }
 
+fn signature_claim(
+  module: Bytes,
+  definition: FnDefinition,
+  ends: Bool,
+  stated: Bool,
+) -> Claim / {abort.raise} =
+  ClaimDefinition({
+    name: qualify(module, definition.name.name),
+    ends: ends,
+    stated: stated,
+    params: definition.params.len(),
+    cost_parameters: range(0, definition.params.len()).filter(|i: Int|
+      definition.params.get(i).cost != None),
+    spaced: range(0, definition.params.len()).filter(|i: Int|
+      definition.params.get(i).space != None),
+    body: None,
+    spec: [],
+    measure: None,
+  })
+
 fn claims_of_modules(
   modules: List<ParsedModule>,
   bodies: List<TypedBody<Type>>,
@@ -1265,6 +1285,7 @@ fn claims_of_modules(
   opaque: (Bytes) -> Bool,
   ends: Map<Bytes, Bool>,
   stated: Map<Bytes, Bool>,
+  roots: Option<Map<Bytes, Bool>> = None,
 ) -> List<Claim> / {abort.raise} = {
   let modelled = prover_modelled();
   let resolved = resolved_by_owner(
@@ -1276,7 +1297,7 @@ fn claims_of_modules(
       match item {
         FunctionItem(d) -> {
           let name = qualify(m.name, d.name.name);
-          a.push(
+          a.push(if wants(roots, name) {
             definition_claim(
               resolved,
               i,
@@ -1285,15 +1306,17 @@ fn claims_of_modules(
               opaque(m.name),
               ends.contains(name),
               stated.contains(name),
-            ),
-          )
+            )
+          } else { signature_claim(m.name, d, ends.contains(name), stated.contains(name)) })
         },
         TypeItem(d) -> match d.body {
           SumBody(vs) ->
             a.push(ClaimSum({ name: qualify(m.name, d.name.name), variants: vs.len() })),
           _ -> a,
         },
-        LawItem(d) -> a.push(law_claim(modules, resolved, i, m.name, d)),
+        LawItem(d) -> if wants(roots, law_owner(m.name, d.name)) {
+          a.push(law_claim(modules, resolved, i, m.name, d))
+        } else { a },
         _ -> a,
       })
   })
@@ -1341,15 +1364,36 @@ pub fn claims(
   }
 }
 
+pub fn checked_bodies(analysis: Analysis) -> LoweringTargets / {abort.raise} = {
+  let rows = rows_of(analysis);
+  let functions = rows.definitions.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bool>, row: KnownDefinitionRow|
+      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name, true) },
+  );
+  let tests = rows.tests.fold(functions, |accumulator: Map<Bytes, Bool>, row: KnownTestRow|
+    if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner, true) });
+  {
+    roots: inferred_facts(analysis).law_facts.fold(
+      tests,
+      |accumulator: Map<Bytes, Bool>, l: { owner: Bytes, facts: BodyFacts }|
+        accumulator.insert(l.owner, true),
+    ),
+    modules: analysis.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
+      accumulator.insert(m.name, true)),
+  }
+}
+
 pub fn claims_in(
   analysis: Analysis,
   wanted: List<Int>,
   owned: (Bytes) -> Bool = |m: Bytes| true,
+  targets: Option<LoweringTargets> = None,
 ) -> List<Claim> / {abort.raise} = {
   let bodies = match facts_read(
       rows_of(analysis),
       inferred_facts(analysis),
-      None,
+      targets,
       analysis.modules,
     ) {
     Ok(facts) -> bodies_read(facts.bodies, facts.types),
@@ -1362,6 +1406,7 @@ pub fn claims_in(
     |m: Bytes| !owned(m),
     terminating_definitions(analysis.checked.definitions),
     measured_definitions(analysis.checked.definitions),
+    match targets { Some(t) -> Some(t.roots), None -> None },
   )
 }
 
