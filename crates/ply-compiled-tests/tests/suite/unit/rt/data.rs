@@ -182,7 +182,7 @@ fn a_failure_compiled_code_wrote_raises_only_where_it_says_to() {
     let texts: [&[u8]; 3] = [b"E0502", b"it failed", b"here"];
     assert_eq!(
         failed_under_a_clause(|c| failed(c, 1, &texts, 0, 0)),
-        FAILED_PENDING
+        FAILED_PENDING_RAISE
     );
     assert_eq!(failed_under_a_clause(|c| failed(c, 0, &texts, 0, 0)), 1);
 }
