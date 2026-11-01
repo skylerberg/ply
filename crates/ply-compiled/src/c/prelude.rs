@@ -209,6 +209,31 @@ helpers! {
     rt_never_shown();
 }
 
+macro_rules! never_called {
+    ($($name:literal($($t:ty),*) $(-> $r:ty)?;)*) => {
+        /// The names a unit from the release's compiler binds and never calls, which
+        /// [`Exports::bound`](super::Exports::bound) needs to find here.
+        fn never_called() -> Vec<Helper> {
+            vec![$({
+                unsafe extern "C" fn never(_: *mut Ctx $(, _: $t)*) $(-> $r)? {
+                    unreachable!(concat!($name, " is bound and never called"))
+                }
+                let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = never;
+                Helper::of($name, f)
+            }),*]
+        }
+    };
+}
+
+never_called! {
+    "builtin_elaborated_refused"(I64, I64, I64, I64);
+    "builtin_elaborated_refused_text"(I64, Addr, I64, Addr, I64);
+    "builtin_elaborated_assert_failed"(Addr, I64, Addr, I64);
+    "builtin_elaborated_scalar_encoded"(I64, I64, I64, I64) -> I64;
+    "builtin_elaborated_text_encoded"(I64, Addr, I64) -> I64;
+    "builtin_elaborated_functions_compared"() -> I64;
+}
+
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
 /// no C name holds one, and a function of a type is its type in lower case, `_` and its name.
 pub fn builtin_helper_name(builtin: &str) -> String {
@@ -219,17 +244,22 @@ pub fn builtin_helper_name(builtin: &str) -> String {
     }
 }
 
-/// Every helper a unit may bind: the runtime's own, then a native over machine data.
+/// Every helper a unit may bind: the runtime's own, those it binds and never calls, then a native
+/// over machine data.
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let machine = machine_natives().iter().map(|n| n.helper);
-        own().into_iter().chain(machine).collect()
+        own()
+            .into_iter()
+            .chain(never_called())
+            .chain(machine)
+            .collect()
     })
 }
 
 /// The runtime's own helpers, which are no native's.
 pub fn own_helpers() -> &'static [Helper] {
     let all = helpers();
-    &all[..all.len() - machine_natives().len()]
+    &all[..all.len() - machine_natives().len() - never_called().len()]
 }
