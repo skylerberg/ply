@@ -154,7 +154,6 @@ fn a_rejected_argument_raises_a_catchable_effect_for_array_get_bytes_at_and_stri
 
 type Failed = unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word);
 
-/// `rt_failed` of `texts`, the last `notes` and `shown` of which are notes and then values.
 fn failed(ctx: *mut Ctx, raises: Word, texts: &[&[u8]], notes: Word, shown: Word) {
     let words: Vec<Word> = texts
         .iter()
