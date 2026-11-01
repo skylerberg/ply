@@ -415,16 +415,10 @@ pub fn commit_shared<[r]>(
       Some(seg) -> match segments::commit[r](db.dir, schema(), seg, durable: true) {
         Committed(m) -> {
           let merged = { ..fresh_database(db.dir, m), run: db.run };
-          merge_tail[r](merged, |current: Database| {
-            let located = located_rows[r](current, m.segments, past_table());
+          merge_tail[r](merged, |current: Database|
             live_results(
-              located.values().fold([], |values: List<Bytes>, at: Located|
-                match segments::payload[r](current.dir, at.token, at.offset, at.size) {
-                  Some(bytes) -> values.push(bytes),
-                  None -> values,
-                }),
-            )
-          })
+              stored_values[r](current, located_rows[r](current, m.segments, past_table())),
+            ))
         },
         _ -> (),
       },
@@ -678,26 +672,95 @@ fn all_tables() -> List<Int> = range(1, 7)
 
 type Rewriting = { writing: SegmentWriter, tables: List<segments::Table> }
 
+type RowToCopy = { key: Bytes, at: Located }
+
+type Chunk = { token: Bytes, start: Int, end: Int, rows: List<RowToCopy> }
+
+fn copy_chunk_size() -> Int = 16777216
+
+fn chunks_in_file_order(
+  located: Map<Bytes, Located>,
+  order: Map<Bytes, Int>,
+) -> List<Chunk> / {abort.raise} = {
+  let ordered = located.fold(Map::new(), |by: Map<Int, RowToCopy>, key: Bytes, at: Located|
+    by.insert(
+      (match order.get(at.token) { Some(i) -> i, None -> 0 }) * 1099511627776 + at.offset,
+      { key: key, at: at },
+    ));
+  ordered.fold([], |chunks: List<Chunk>, _: Int, row: RowToCopy| {
+    let size = segments::framed_len(row.at.size);
+    match chunks.at(chunks.len() - 1) {
+      Some(last) -> if last.token == row.at.token && last.end == row.at.offset
+          && last.end - last.start < copy_chunk_size() {
+        chunks.set(chunks.len() - 1, { ..last, end: last.end + size, rows: last.rows.push(row) })
+      } else {
+        chunks.push({
+          token: row.at.token,
+          start: row.at.offset,
+          end: row.at.offset + size,
+          rows: [row],
+        })
+      },
+      None ->
+        chunks.push({
+          token: row.at.token,
+          start: row.at.offset,
+          end: row.at.offset + size,
+          rows: [row],
+        }),
+    }
+  })
+}
+
+fn chunk_bytes<[r]>(
+  db: Database,
+  chunk: Chunk,
+) -> Bytes / {fs.read[r], fact_damage.damaged, abort.raise} =
+  match segments::read_range[r](
+      segments::segment_path(db.dir, chunk.token),
+      chunk.start,
+      chunk.end - chunk.start,
+    ) {
+    Some(bytes) -> bytes,
+    None -> fact_damage.damaged("a segment is shorter than its table says"),
+  }
+
+fn stored_values<[r]>(
+  db: Database,
+  located: Map<Bytes, Located>,
+) -> List<Bytes> / {fs.read[r], fact_damage.damaged, abort.raise} =
+  chunks_in_file_order(located, Map::new()).fold([], |values: List<Bytes>, chunk: Chunk| {
+    let bytes = chunk_bytes[r](db, chunk);
+    chunk.rows.fold(values, |found: List<Bytes>, row: RowToCopy| {
+      let from = row.at.offset - chunk.start;
+      match segments::unframed(bytes.slice(from, from + segments::framed_len(row.at.size))) {
+        Some(value) -> found.push(value),
+        None -> found,
+      }
+    })
+  })
+
 fn table_copied<[r]>(
   db: Database,
   token: Bytes,
   draft: Rewriting,
   table: Int,
   located: Map<Bytes, Located>,
+  order: Map<Bytes, Int>,
 ) -> Rewriting / {fs.read[r], fs.write[r], fact_damage.damaged, abort.raise} = {
-  let copied = located.fold(
+  let copied = chunks_in_file_order(located, order).fold(
     { writing: draft.writing, rows: Map::new() },
-    |rows: RowDraft, key: Bytes, at: Located|
-      match segments::payload[r](db.dir, at.token, at.offset, at.size) {
-        None -> fact_damage.damaged("a stored value does not match its checksum"),
-        Some(bytes) -> {
-          let placed = segments::append_payload(rows.writing, bytes);
-          {
-            writing: segments::flush_when_full[r](db.dir, schema(), token, placed.writing),
-            rows: rows.rows.insert(key, u64_le(placed.at).concat(u32_le(bytes.len()))),
-          }
-        },
-      },
+    |sofar: RowDraft, chunk: Chunk| {
+      let put = segments::append_frames(sofar.writing, chunk_bytes[r](db, chunk));
+      {
+        writing: segments::flush_when_full[r](db.dir, schema(), token, put.writing),
+        rows: chunk.rows.fold(sofar.rows, |rows: Map<Bytes, Bytes>, row: RowToCopy|
+          rows.insert(
+            row.key,
+            u64_le(put.at + row.at.offset - chunk.start).concat(u32_le(row.at.size)),
+          )),
+      }
+    },
   );
   {
     writing: copied.writing,
@@ -715,6 +778,8 @@ fn rewritten_segments<[r]>(
   kept: (Int, Bytes) -> Bool / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
 ) -> Bool / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
   let merging = m.segments.drop(from);
+  let order = range(0, merging.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
+    found.insert(merging.get(i).token, i));
   let draft = all_tables().fold(
     { writing: segments::new_writer(), tables: [] },
     |sofar: Rewriting, table: Int|
@@ -728,6 +793,7 @@ fn rewritten_segments<[r]>(
           |found: Map<Bytes, Located>, key: Bytes, at: Located|
             if kept(table, key) { found.insert(key, at) } else { found },
         ),
+        order,
       ),
   );
   match segments::finish[r](db.dir, schema(), token, draft.writing, draft.tables) {
