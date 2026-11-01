@@ -370,7 +370,7 @@ fn recompute<| e>(
           run
         } else {
           let attempt = handle {
-            Some(run_opened(queries, run, q, key, d.input, 100000).run)
+            Some(run_opened(queries, run, q, key, d.input, true, 100000).run)
           } with {
             abort.raise(_) -> None,
           };
@@ -434,7 +434,7 @@ fn fetched<| e>(
     match memo_store.output(s.at.digest) {
       Some(o) -> { run: s.run, output: o, at: s.at },
       None -> {
-        let e = run_opened(queries, s.run, q, key, input, left - 1);
+        let e = run_opened(queries, s.run, q, key, input, false, left - 1);
         if e.at.digest != s.at.digest {
           panic(
             "the query `" ++ String::of_bytes_lossy(q.name)
@@ -472,13 +472,14 @@ fn settled<| e>(
 ) -> { run: Run, at: Settled } / {memo_store.read, memo_store.write, abort.raise | e} =
   if left <= 0 { panic(String::of_bytes_lossy(too_deep())) }
   else if run.open.contains(key) { report_cycle(run, { query: q.name, input: input }) }
-  else if memo_store.is_out_of_date(key) { run_opened(queries, run, q, key, input, left) } else {
+  else if memo_store.is_out_of_date(key) { run_opened(queries, run, q, key, input, true, left) }
+  else {
     match run.resolved.get(key) {
       Some(at) -> { run: run, at: at },
       None -> match memo_store.sealed(key) {
         Some(digest) -> remembered(run, q.name, key, { digest: digest, depth: 0, sealed: true }),
         None -> match memo_store.fact(key) {
-          None -> run_opened(queries, run, q, key, input, left),
+          None -> run_opened(queries, run, q, key, input, true, left),
           Some(f) -> if f.written_by != b"" && memo_store.is_out_of_date(f.written_by) {
             settled(
               queries,
@@ -546,6 +547,7 @@ fn run_opened<| e>(
   q: Query<| e>,
   key: Bytes,
   input: Bytes,
+  may_restore: Bool,
   left: Int,
 ) -> { run: Run, at: Settled } / {memo_store.read, memo_store.write, abort.raise | e} = {
   let step = { query: q.name, input: input };
@@ -561,10 +563,12 @@ fn run_opened<| e>(
       },
       trail: run.trail.push(step),
     };
-    let unchanged = product_unchanged(queries, opened, q, key, left - 1);
+    let unchanged = if may_restore { product_unchanged(queries, opened, q, key, left - 1) }
+    else { { run: opened, at: None } };
     let earlier = match unchanged.at {
       Some(_) -> unchanged,
-      None -> restored(queries, unchanged.run, q, key, left - 1),
+      None -> if may_restore { restored(queries, unchanged.run, q, key, left - 1) }
+      else { unchanged },
     };
     let done = match earlier.at {
       Some(at) -> { run: earlier.run, at: at },
@@ -1581,6 +1585,22 @@ test "a query with two paths to a change runs once, after both paths" {
 }
 
 fn shout_text(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"text", input).concat(b"!")
+
+test "a result that is not kept is computed again, even when an earlier version of its fact would hold" {
+  let long = b"long ".repeat(1000);
+  let longer = b"longer ".repeat(1000);
+  let q = Map::new().insert(b"text", {
+    ..query(b"text", b"t1", read_file),
+    persistent: false,
+  }).insert(
+    b"shout",
+    query(b"shout", b"o1", shout_text),
+  );
+  let first = asked(q, world_of([{ at: b"a", text: long }]), b"shout", b"a");
+  let moved = asked(q, edited(first.world, b"a", longer), b"shout", b"a");
+  let undone = asked(q, edited(moved.world, b"a", long), b"shout", b"a");
+  assert_eq(undone.output, long.concat(b"!"))
+}
 
 test "a large result of a query that does not keep its results is computed again when needed" {
   let long = b"long ".repeat(1000);
